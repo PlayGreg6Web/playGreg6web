@@ -1,3 +1,4 @@
+mod awc;
 mod rpf9;
 mod scan;
 mod xvd;
@@ -11,6 +12,9 @@ use std::process::ExitCode;
 use rpf9::{
     BootsetEntry, DEFAULT_BOOTSET_HEAD_BYTES, inspect_rpf_file, json_escape, render_bootset_json,
     write_bootset,
+};
+use awc::{
+    DEFAULT_MAX_LISTED_STREAMS, dir_format_human, dir_to_json, inspect_awc_dir, inspect_awc_file,
 };
 use scan::{is_file_complete, resolve_env_key, resolve_game_dir_from_env, scan_directory};
 use xvd::inspect_xvd_file;
@@ -246,6 +250,9 @@ fn print_usage() {
     eprintln!("  playgta6-manifest scan (--dir <game-dir> | --from-env) [--json]");
     eprintln!("  playgta6-manifest inspect-rpf <file.rpf>");
     eprintln!("  playgta6-manifest xvd <file.xvd|file.xvc> [--json]");
+    eprintln!(
+        "  playgta6-manifest awc (<file.awc> | --dir <game-dir> | --from-env) [--json] [--max-streams {DEFAULT_MAX_LISTED_STREAMS}]"
+    );
     eprintln!("Falls back to GTA6_GAME_DIR and GTA6_DATA_DIR from env or .env.");
 }
 
@@ -274,6 +281,13 @@ enum Command {
         dir: Option<PathBuf>,
         from_env: bool,
         json: bool,
+    },
+    Awc {
+        path: Option<PathBuf>,
+        dir: Option<PathBuf>,
+        from_env: bool,
+        json: bool,
+        max_streams: usize,
     },
 }
 
@@ -424,8 +438,60 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             };
             Ok(Command::Xvd { path, json })
         }
+        Some("awc") => parse_awc_args(&args[1..]),
         _ => parse_manifest_flags(args, 0),
     }
+}
+
+fn parse_awc_args(args: &[String]) -> Result<Command, String> {
+    const USAGE: &str =
+        "Usage: playgta6-manifest awc (<file.awc> | --dir <game-dir> | --from-env) [--json] [--max-streams N]";
+    let mut path: Option<PathBuf> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut from_env = false;
+    let mut json = false;
+    let mut max_streams = DEFAULT_MAX_LISTED_STREAMS;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--from-env" => from_env = true,
+            "--dir" => {
+                i += 1;
+                let v = args.get(i).ok_or("Missing value for --dir")?;
+                dir = Some(PathBuf::from(v));
+            }
+            "--max-streams" => {
+                i += 1;
+                let v = args.get(i).ok_or("Missing value for --max-streams")?;
+                max_streams = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid --max-streams value: {v}"))?;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("Unknown argument for awc: {other}"));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(format!("Unexpected extra argument for awc: {other}"));
+                }
+                path = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+    let modes = usize::from(path.is_some()) + usize::from(dir.is_some()) + usize::from(from_env);
+    if modes != 1 {
+        return Err(USAGE.to_string());
+    }
+    Ok(Command::Awc {
+        path,
+        dir,
+        from_env,
+        json,
+        max_streams,
+    })
 }
 
 fn default_data_path(file_name: &str) -> PathBuf {
@@ -435,6 +501,45 @@ fn default_data_path(file_name: &str) -> PathBuf {
 
 fn resolve_game_dir(cli_game_dir: Option<PathBuf>) -> Option<PathBuf> {
     cli_game_dir.or_else(resolve_game_dir_from_env)
+}
+
+fn run_awc(path: Option<PathBuf>, dir: Option<PathBuf>, json: bool, max_streams: usize) -> ExitCode {
+    if let Some(path) = path {
+        return match inspect_awc_file(&path) {
+            Ok(report) => {
+                if json {
+                    print!("{}", report.to_json(max_streams));
+                } else {
+                    print!("{}", report.format_human(max_streams));
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("AWC inspection failed: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let Some(target_dir) = resolve_game_dir(dir) else {
+        eprintln!(
+            "Error: --dir <path> or --from-env (with GTA6_GAME_DIR in env or .env) is required."
+        );
+        return ExitCode::FAILURE;
+    };
+    match inspect_awc_dir(&target_dir) {
+        Ok(results) => {
+            if json {
+                print!("{}", dir_to_json(&results, max_streams));
+            } else {
+                print!("{}", dir_format_human(&results));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("AWC directory scan failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -549,6 +654,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Awc {
+            path,
+            dir,
+            from_env: _,
+            json,
+            max_streams,
+        } => run_awc(path, dir, json, max_streams),
         Command::Xvd { path, json } => match inspect_xvd_file(&path) {
             Ok(report) => {
                 if json {
@@ -809,6 +921,50 @@ mod tests {
                 json: true,
             }
         );
+
+        let sv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(
+            parse_args(&sv(&["awc", "a.awc", "--json", "--max-streams", "5"])).unwrap(),
+            Command::Awc {
+                path: Some(PathBuf::from("a.awc")),
+                dir: None,
+                from_env: false,
+                json: true,
+                max_streams: 5,
+            }
+        );
+        assert_eq!(
+            parse_args(&sv(&["awc", "--from-env"])).unwrap(),
+            Command::Awc {
+                path: None,
+                dir: None,
+                from_env: true,
+                json: false,
+                max_streams: DEFAULT_MAX_LISTED_STREAMS,
+            }
+        );
+        assert_eq!(
+            parse_args(&sv(&["awc", "--dir", "C:/game"])).unwrap(),
+            Command::Awc {
+                path: None,
+                dir: Some(PathBuf::from("C:/game")),
+                from_env: false,
+                json: false,
+                max_streams: DEFAULT_MAX_LISTED_STREAMS,
+            }
+        );
+        for bad in [
+            vec!["awc"],
+            vec!["awc", "a.awc", "b.awc"],
+            vec!["awc", "a.awc", "--dir", "x"],
+            vec!["awc", "--dir"],
+            vec!["awc", "a.awc", "--max-streams"],
+            vec!["awc", "a.awc", "--max-streams", "x"],
+            vec!["awc", "a.awc", "--bogus"],
+            vec!["awc", "--dir", "x", "--from-env"],
+        ] {
+            assert!(parse_args(&sv(&bad)).is_err(), "{bad:?}");
+        }
 
         let bad_xvd_missing: Vec<String> = vec!["xvd".to_string()];
         assert!(parse_args(&bad_xvd_missing).is_err());
