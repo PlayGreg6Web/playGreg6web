@@ -18,6 +18,10 @@ use playgta6_shaders::pack::{
     SHADER_INDEX_ABI_VERSION, ShaderIndexEntry, read_pack, render_blocker_report_md,
     render_shader_index_json, write_pack_with_layout,
 };
+use playgta6_shaders::reflect::{
+    LAYOUT_MANIFEST_FILE_NAME, ReflectError, RegisterConvention, build_layout_manifest,
+    parse_pipeline_list, reflect_spirv_bytes,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -42,6 +46,14 @@ enum Command {
         target_path: PathBuf,
         json: bool,
     },
+    Reflect {
+        spirv_dir: PathBuf,
+        out_dir: PathBuf,
+        pipelines_path: Option<PathBuf>,
+        convention: RegisterConvention,
+        no_sanitize: bool,
+        no_lower: bool,
+    },
 }
 
 fn print_usage() {
@@ -55,6 +67,9 @@ fn print_usage() {
     );
     eprintln!("  playgta6-shaders inspect-pack <file.wgsl.pack>");
     eprintln!("  playgta6-shaders inspect-dxbc <path-or-dir> [--json]");
+    eprintln!(
+        "  playgta6-shaders reflect --spirv <dir> --out <dir> [--pipelines <list.txt>] [--register-shift <b|t|u|s>=<n>]... [--no-sanitize] [--no-lower]"
+    );
     eprintln!();
     eprintln!(
         "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> Naga lower -> WGSL -> .wgsl.pack"
@@ -211,8 +226,51 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
             Ok(Command::InspectDxbc { target_path, json })
         }
+        "reflect" => {
+            let mut spirv_dir: Option<PathBuf> = None;
+            let mut out_dir: Option<PathBuf> = None;
+            let mut pipelines_path: Option<PathBuf> = None;
+            let mut convention = RegisterConvention::default();
+            let mut no_sanitize = false;
+            let mut no_lower = false;
+
+            let mut i = 1;
+            while i < args.len() {
+                let flag = args[i].as_str();
+                match flag {
+                    "--spirv" | "--out" | "--pipelines" | "--register-shift" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| format!("missing value for {flag}"))?;
+                        match flag {
+                            "--spirv" => spirv_dir = Some(PathBuf::from(val)),
+                            "--out" => out_dir = Some(PathBuf::from(val)),
+                            "--pipelines" => pipelines_path = Some(PathBuf::from(val)),
+                            _ => convention.set_shift_arg(val)?,
+                        }
+                    }
+                    "--no-sanitize" => no_sanitize = true,
+                    "--no-lower" => no_lower = true,
+                    unknown => {
+                        return Err(format!("unknown option for reflect: {unknown}"));
+                    }
+                }
+                i += 1;
+            }
+
+            Ok(Command::Reflect {
+                spirv_dir: spirv_dir
+                    .ok_or_else(|| "missing required option --spirv <dir>".to_string())?,
+                out_dir: out_dir.ok_or_else(|| "missing required option --out <dir>".to_string())?,
+                pipelines_path,
+                convention,
+                no_sanitize,
+                no_lower,
+            })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', or 'inspect-dxbc')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', or 'reflect')"
         )),
     }
 }
@@ -611,6 +669,77 @@ fn run_inspect_dxbc(target_path: &Path, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn run_reflect(
+    spirv_dir: &Path,
+    out_dir: &Path,
+    pipelines_path: Option<&Path>,
+    convention: &RegisterConvention,
+    options: ConvertOptions,
+) -> Result<(), String> {
+    let spv_files = collect_spv_files(spirv_dir)?;
+    let pipelines = match pipelines_path {
+        Some(path) => {
+            let text = fs::read_to_string(path).map_err(|err| {
+                format!("failed to read pipeline list {}: {err}", path.display())
+            })?;
+            parse_pipeline_list(&text)
+                .map_err(|err| format!("invalid pipeline list {}: {err}", path.display()))?
+        }
+        None => Vec::new(),
+    };
+
+    let mut shaders = Vec::with_capacity(spv_files.len());
+    let mut failed = 0usize;
+    for path in &spv_files {
+        let bytes = fs::read(path)
+            .map_err(|err| format!("failed to read SPIR-V file {}: {err}", path.display()))?;
+        match reflect_spirv_bytes(&bytes, &options, convention) {
+            Ok(shader) => shaders.push(shader),
+            // Conversion failures are already reported by `convert --report`.
+            Err(ReflectError::Conversion(_)) => failed += 1,
+            Err(err) => return Err(format!("failed to reflect {}: {err}", path.display())),
+        }
+    }
+
+    let manifest = build_layout_manifest(&shaders, &pipelines, convention)
+        .map_err(|err| format!("failed to build layout manifest: {err}"))?;
+    fs::create_dir_all(out_dir).map_err(|err| {
+        format!(
+            "failed to create output directory {}: {err}",
+            out_dir.display()
+        )
+    })?;
+    let manifest_dest = out_dir.join(LAYOUT_MANIFEST_FILE_NAME);
+    fs::write(&manifest_dest, manifest.render_json().as_bytes()).map_err(|err| {
+        format!(
+            "failed to write layout manifest {}: {err}",
+            manifest_dest.display()
+        )
+    })?;
+
+    let incomplete = manifest
+        .shaders
+        .values()
+        .filter(|record| !record.entry.layout_complete())
+        .count();
+    let over_limit = manifest
+        .shaders
+        .values()
+        .filter(|record| !record.limit_violations.is_empty())
+        .count();
+    println!(
+        "Reflected {}/{} SPIR-V files ({} unique shaders, {failed} not convertible; {} bind group layouts, {} pipeline layouts, {} pipelines; {incomplete} need lowering, {over_limit} exceed WebGPU limits); manifest: {}",
+        spv_files.len() - failed,
+        spv_files.len(),
+        manifest.shaders.len(),
+        manifest.bind_group_layouts.len(),
+        manifest.pipeline_layouts.len(),
+        manifest.pipelines.len(),
+        manifest_dest.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args) {
@@ -675,6 +804,36 @@ fn main() -> ExitCode {
         },
         Ok(Command::InspectDxbc { target_path, json }) => {
             match run_inspect_dxbc(&target_path, json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Ok(Command::Reflect {
+            spirv_dir,
+            out_dir,
+            pipelines_path,
+            convention,
+            no_sanitize,
+            no_lower,
+        }) => {
+            let mut options = if no_sanitize {
+                ConvertOptions::without_sanitization()
+            } else {
+                ConvertOptions::default()
+            };
+            if no_lower {
+                options = options.without_lowering();
+            }
+            match run_reflect(
+                &spirv_dir,
+                &out_dir,
+                pipelines_path.as_deref(),
+                &convention,
+                options,
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -931,6 +1090,147 @@ mod tests {
         let dir_json = format_inspect_dxbc(&dxbc_dir, true).unwrap();
         assert!(dir_json.contains("\"total\": 2"));
         assert!(dir_json.contains("\"error\":"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_parses_reflect_arguments() {
+        let args: Vec<String> = [
+            "reflect",
+            "--spirv",
+            "in_spv",
+            "--out",
+            "out_wgsl",
+            "--pipelines",
+            "pipelines.txt",
+            "--register-shift",
+            "t=1000",
+            "--register-shift",
+            "s=2000",
+            "--no-lower",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let convention = RegisterConvention {
+            shift_t: 1000,
+            shift_s: 2000,
+            ..RegisterConvention::default()
+        };
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Command::Reflect {
+                spirv_dir: PathBuf::from("in_spv"),
+                out_dir: PathBuf::from("out_wgsl"),
+                pipelines_path: Some(PathBuf::from("pipelines.txt")),
+                convention,
+                no_sanitize: false,
+                no_lower: true,
+            }
+        );
+        assert!(parse_args(&["reflect".to_string(), "--spirv".to_string(), "x".to_string()]).is_err());
+        assert!(parse_args(&args[..8]).unwrap_err().contains("--register-shift"));
+        let mut bad_shift = args.clone();
+        bad_shift[8] = "q=1".to_string();
+        assert!(parse_args(&bad_shift).is_err());
+    }
+
+    /// Compute shader (`LocalSize 8 4 1`) storing into a `StorageBuffer` runtime array at
+    /// `DescriptorSet 1` / `Binding 2`.
+    fn build_storage_buffer_compute_spv() -> Vec<u8> {
+        // %1 void, %2 fn, %3 u32, %4 u32[], %5 struct, %6/%7 StorageBuffer pointers, %8 buffer,
+        // %9/%10 constants 0/7, %11 main, %12 label, %13 element pointer.
+        let words: Vec<u32> = vec![
+            0x0723_0203, 0x0001_0300, 0, 14, 0, // header (bound 14)
+            (2 << 16) | 17, 1, // OpCapability Shader
+            (3 << 16) | 14, 0, 1, // OpMemoryModel Logical GLSL450
+            (5 << 16) | 15, 5, 11, u32::from_le_bytes(*b"main"), 0, // OpEntryPoint GLCompute %11 "main"
+            (6 << 16) | 16, 11, 17, 8, 4, 1, // OpExecutionMode %11 LocalSize 8 4 1
+            (4 << 16) | 71, 4, 6, 4, // OpDecorate %4 ArrayStride 4
+            (5 << 16) | 72, 5, 0, 35, 0, // OpMemberDecorate %5 0 Offset 0
+            (3 << 16) | 71, 5, 2, // OpDecorate %5 Block
+            (4 << 16) | 71, 8, 34, 1, // OpDecorate %8 DescriptorSet 1
+            (4 << 16) | 71, 8, 33, 2, // OpDecorate %8 Binding 2
+            (2 << 16) | 19, 1, // %1 = OpTypeVoid
+            (3 << 16) | 33, 2, 1, // %2 = OpTypeFunction %1
+            (4 << 16) | 21, 3, 32, 0, // %3 = OpTypeInt 32 0
+            (3 << 16) | 29, 4, 3, // %4 = OpTypeRuntimeArray %3
+            (3 << 16) | 30, 5, 4, // %5 = OpTypeStruct %4
+            (4 << 16) | 32, 6, 12, 5, // %6 = OpTypePointer StorageBuffer %5
+            (4 << 16) | 32, 7, 12, 3, // %7 = OpTypePointer StorageBuffer %3
+            (4 << 16) | 59, 6, 8, 12, // %8 = OpVariable %6 StorageBuffer
+            (4 << 16) | 43, 3, 9, 0, // %9 = OpConstant %3 0
+            (4 << 16) | 43, 3, 10, 7, // %10 = OpConstant %3 7
+            (5 << 16) | 54, 1, 11, 0, 2, // %11 = OpFunction %1 None %2
+            (2 << 16) | 248, 12, // %12 = OpLabel
+            (6 << 16) | 65, 7, 13, 8, 9, 9, // %13 = OpAccessChain %7 %8 %9 %9
+            (3 << 16) | 62, 13, 10, // OpStore %13 %10
+            (1 << 16) | 253, // OpReturn
+            (1 << 16) | 56, // OpFunctionEnd
+        ];
+        words_to_bytes(&words)
+    }
+
+    #[test]
+    fn end_to_end_reflect_writes_layout_manifest_next_to_shader_index() {
+        use playgta6_shaders::convert::fnv1a_64;
+
+        let root = make_temp_dir("playgta6_shaders_reflect");
+        let spirv_dir = root.join("spirv");
+        let out_dir = root.join("out");
+        let pipelines = root.join("pipelines.txt");
+        fs::create_dir_all(spirv_dir.join("nested")).unwrap();
+
+        let storage = build_storage_buffer_compute_spv();
+        let storage_key = format_shader_hash(fnv1a_64(&storage));
+        fs::write(spirv_dir.join("nested/cs_storage.spv"), &storage).unwrap();
+        fs::write(spirv_dir.join("cs_float_ctrl.spv"), build_float_controls_spv()).unwrap();
+        fs::write(spirv_dir.join("broken.spv"), b"not-spirv").unwrap();
+        fs::write(&pipelines, format!("# compute pipelines\n{storage_key}\n")).unwrap();
+
+        run_convert(&spirv_dir, &out_dir, None, None, ConvertOptions::default())
+            .expect("convert should succeed");
+        let mut convention = RegisterConvention::default();
+        convention.set_shift_arg("u=1").unwrap();
+        let reflect = |pipelines_path: &Path| {
+            run_reflect(
+                &spirv_dir,
+                &out_dir,
+                Some(pipelines_path),
+                &convention,
+                ConvertOptions::default(),
+            )
+        };
+        reflect(&pipelines).expect("reflect should succeed");
+
+        let index = fs::read_to_string(out_dir.join("shader-index.json")).unwrap();
+        let manifest_path = out_dir.join(LAYOUT_MANIFEST_FILE_NAME);
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        assert!(index.contains(&storage_key));
+        assert!(manifest.starts_with("{\n  \"schema_version\": 1,\n"));
+        assert!(manifest.contains(&format!("\"{storage_key}\": {{\n      \"stage\": \"compute\"")));
+        assert!(manifest.contains(
+            r#"{"binding":2,"visibility":4,"buffer":{"type":"storage","hasDynamicOffset":false,"minBindingSize":4}}"#
+        ));
+        // Binding 2 with `-fvk-u-shift 1` -> register u1, space 1.
+        assert!(manifest.contains(
+            r#""register":{"class":"u","index":1,"space":1},"spirv":{"set":1,"binding":2}"#
+        ));
+        assert!(manifest.contains("\"workgroup_size\": [8, 4, 1]"));
+        assert!(manifest.contains("\"shifts\":{\"b\":0,\"t\":0,\"u\":1,\"s\":0}"));
+        assert!(manifest.contains(&format!(
+            "\"{storage_key}\": {{\n      \"stages\": {{\"compute\":\"{storage_key}\"}}"
+        )));
+        // Both convertible shaders are listed; the broken file is skipped.
+        assert_eq!(manifest.matches("\"entry_point\": \"main\"").count(), 2);
+
+        // Re-running is byte-identical.
+        reflect(&pipelines).unwrap();
+        assert_eq!(fs::read_to_string(&manifest_path).unwrap(), manifest);
+
+        fs::write(&pipelines, "0x1234\n").unwrap();
+        assert!(reflect(&pipelines).unwrap_err().contains("unknown shader"));
 
         let _ = fs::remove_dir_all(&root);
     }

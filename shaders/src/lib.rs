@@ -3,3 +3,4 @@ pub mod convert;
 pub mod dxbc;
 pub mod lower;
 pub mod pack;
+pub mod reflect;
