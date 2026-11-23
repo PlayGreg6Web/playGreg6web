@@ -4221,6 +4221,14 @@ pub const D3D_MAX_MESH_OUTPUT_PRIMITIVES: u32 = 256;
 /// D3D12 limit on mesh/amplification threads per group.
 pub const D3D_MAX_MESH_THREADS: u32 = 128;
 
+// Indirect-argument layouts follow the WebGPU spec and match `web/workers/indirect_draw.js`
+// (`wgslStructSource` / `wgslArrayStride`): same field order, snake_case names and strides
+// (16 / 20 / 12 bytes, `instance_count` at byte offset 4). The only difference is that
+// `{prefix}DrawIndexedIndirectArgs.index_count` is declared `atomic<u32>` because the mesh
+// lowering allocates indices with `atomicAdd`; `atomic<u32>` has the same size, alignment and
+// offset as `u32`, so the buffer bytes are identical. The lowering emits a single record (not an
+// array), at buffer offset 0.
+
 /// `drawIndirect` arguments: `vertexCount, instanceCount, firstVertex, firstInstance`.
 pub const DRAW_INDIRECT_ARGS_BYTES: u32 = 16;
 /// `drawIndexedIndirect` arguments: `indexCount, instanceCount, firstIndex, baseVertex (i32),
@@ -4867,9 +4875,9 @@ fn {p}sphere_in_frustum(sphere: vec4<f32>, planes: array<vec4<f32>, 6>) -> bool 
             out,
             "
 struct {p}DispatchIndirectArgs {{
-    group_count_x: u32,
-    group_count_y: u32,
-    group_count_z: u32,
+    x: u32,
+    y: u32,
+    z: u32,
 }}
 
 struct {p}MeshTaskQueue {{
@@ -7255,9 +7263,13 @@ fn main(@builtin(local_invocation_index) li: u32) {
             (offsets(primitive), primitive.size)
         );
         assert_eq!(
-            struct_layout(&module, "pg6m_DrawIndexedIndirectArgs").1,
-            DRAW_INDEXED_INDIRECT_ARGS_BYTES
+            struct_layout(&module, "pg6m_DrawIndexedIndirectArgs"),
+            (vec![0, 4, 8, 12, 16], DRAW_INDEXED_INDIRECT_ARGS_BYTES)
         );
+        // Field names/order shared with web/workers/indirect_draw.js.
+        assert!(source.contains(
+            "index_count: atomic<u32>,\n    instance_count: u32,\n    first_index: u32,\n    base_vertex: i32,\n    first_instance: u32,"
+        ));
 
         assert_eq!(
             layout.vertex.vertex_formats(),
@@ -7461,6 +7473,11 @@ fn finalize() {
 "#,
         );
         let module = validate_wgsl_baseline(&source);
+        assert_eq!(
+            struct_layout(&module, "pg6m_DispatchIndirectArgs"),
+            (vec![0, 4, 8], DISPATCH_INDIRECT_ARGS_BYTES)
+        );
+        assert!(source.contains("x: u32,\n    y: u32,\n    z: u32,"));
         let memory = Memory::new(&module);
         run_compute(&module, &memory, "task_main", [3, 1, 1]);
         run_compute(&module, &memory, "finalize", [1, 1, 1]);
