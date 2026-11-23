@@ -15,6 +15,7 @@ add_library(playgta6_core STATIC
     os/xgameruntime.cpp
     os/xbox_offline.cpp
     os/win32_loader.cpp
+    os/shim_exports.cpp
     gpu/cmd_encoder.cpp
     gpu/pso_cache.cpp
     gpu/descriptor_heap.cpp
@@ -66,6 +67,10 @@ else()
     add_executable(test_win32_loader ../tests/test_win32_loader.cpp)
     target_link_libraries(test_win32_loader PRIVATE playgta6_core)
     add_test(NAME playgta6_win32_loader_tests COMMAND test_win32_loader)
+
+    add_executable(test_shim_exports ../tests/test_shim_exports.cpp)
+    target_link_libraries(test_shim_exports PRIVATE playgta6_core)
+    add_test(NAME playgta6_shim_exports_tests COMMAND test_shim_exports)
 
     add_executable(test_pso_cache ../tests/test_pso_cache.cpp)
     target_link_libraries(test_pso_cache PRIVATE playgta6_core)
