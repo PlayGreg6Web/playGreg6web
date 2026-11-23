@@ -6,6 +6,7 @@
 //! - [`Edge::TailCall`] targets are entries of other discovered functions.
 //! - A block with no instructions marks an address that could not be decoded; its
 //!   [`BasicBlock::diagnostics`] say why and its terminator is [`Terminator::Invalid`].
+//! - Every [`Function::resume_targets`] address is the start of a block of the function.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -238,6 +239,11 @@ pub struct Function {
     pub blocks: BTreeMap<u64, BasicBlock>,
     /// Entries of functions reached through direct calls.
     pub callees: BTreeSet<u64>,
+    /// Block starts where execution can resume after an exception unwind or `longjmp`
+    /// (`RtlRestoreContext` continuing at an arbitrary `rip` inside this function): C++ catch
+    /// continuations, SEH `__except` bodies, the return sites of `setjmp`-family calls and
+    /// address-taken code inside the function (see [`crate::eh`] and [`crate::discover`]).
+    pub resume_targets: BTreeSet<u64>,
 }
 
 impl Function {

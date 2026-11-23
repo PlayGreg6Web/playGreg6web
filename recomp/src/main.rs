@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use playgta6_recomp::code_image::CodeImage;
 use playgta6_recomp::discover::discover;
+use playgta6_recomp::eh::EhMetadata;
 use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
 use playgta6_recomp::pdata::ExceptionDirectory;
 use playgta6_recomp::pe;
@@ -534,6 +535,14 @@ fn run_discover(args: &DiscoverArgs) -> Result<(), String> {
         );
     }
     pdata.seed(&mut image);
+    let eh = EhMetadata::from_pe(&pe, &bytes, &pdata);
+    if let Some(first) = eh.diagnostics.first() {
+        eprintln!(
+            "Warning: {} EH metadata diagnostic(s), first: {first}",
+            eh.diagnostics.len()
+        );
+    }
+    eh.seed(&mut image);
     let summary = render_summary_json(&image, &discover(&image));
 
     match &args.json_out {

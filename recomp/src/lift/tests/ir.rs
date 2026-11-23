@@ -526,6 +526,7 @@ fn function(entry: u64, blocks: Vec<cfg::BasicBlock>) -> cfg::Function {
         entry,
         blocks: blocks.into_iter().map(|b| (b.start, b)).collect(),
         callees: Default::default(),
+        resume_targets: Default::default(),
     }
 }
 

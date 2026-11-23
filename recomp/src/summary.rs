@@ -58,7 +58,11 @@ pub fn render_summary_json(image: &CodeImage<'_>, analysis: &Analysis) -> String
     // `jmp reg` / `jmp [computed]` sites left unresolved (blocks shared by several functions are
     // counted once).
     let mut unresolved_jumps = BTreeSet::new();
+    let mut resume_targets = 0;
+    let mut resume_functions = 0;
     for function in analysis.functions.values() {
+        resume_targets += function.resume_targets.len();
+        resume_functions += usize::from(!function.resume_targets.is_empty());
         block_count += function.blocks.len();
         instruction_count += function.instruction_count();
         diagnostic_count += function.diagnostics().count();
@@ -96,6 +100,24 @@ pub fn render_summary_json(image: &CodeImage<'_>, analysis: &Analysis) -> String
         "  \"jump_tables\": {{\"resolved\": {}, \"unresolved\": {}}},",
         analysis.jump_tables.len(),
         unresolved_jumps.len()
+    );
+    let eh = &image.eh.stats;
+    let _ = writeln!(
+        out,
+        "  \"eh\": {{\"c_specific\": {}, \"cxx3\": {}, \"cxx4\": {}, \"gs_check\": {}, \
+         \"unknown_handler\": {}, \"parsed\": {}, \"funclets\": {}, \"metadata_resume_targets\": {}, \
+         \"diagnostics\": {}, \"setjmp_slots\": {}, \"resume_targets\": {resume_targets}, \
+         \"functions_with_resume_targets\": {resume_functions}}},",
+        eh.c_specific,
+        eh.cxx3,
+        eh.cxx4,
+        eh.gs_check,
+        eh.unknown,
+        eh.parsed,
+        eh.funclets,
+        eh.resume_targets,
+        eh.diagnostics,
+        image.eh.setjmp_slots.len(),
     );
 
     out.push_str("  \"edges\": {");
@@ -191,6 +213,10 @@ mod tests {
                 "  \"diagnostic_count\": 0,\n",
                 "  \"pdata\": {\"functions\": 0, \"ranges\": 0},\n",
                 "  \"jump_tables\": {\"resolved\": 0, \"unresolved\": 0},\n",
+                "  \"eh\": {\"c_specific\": 0, \"cxx3\": 0, \"cxx4\": 0, \"gs_check\": 0, ",
+                "\"unknown_handler\": 0, \"parsed\": 0, \"funclets\": 0, \"metadata_resume_targets\": 0, ",
+                "\"diagnostics\": 0, \"setjmp_slots\": 0, \"resume_targets\": 0, ",
+                "\"functions_with_resume_targets\": 0},\n",
                 "  \"edges\": {\"fallthrough\": 0, \"taken\": 0, \"jump\": 0, \"tail_call\": 0, ",
                 "\"indirect_jump\": 1, \"return\": 1, \"jump_table\": 0},\n",
                 "  \"relocations\": {\"call_target\": 1, \"branch_target\": 0, \"rip_data\": 0, ",

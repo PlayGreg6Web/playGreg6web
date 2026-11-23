@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use playgta6_recomp::cfg::Terminator;
 use playgta6_recomp::code_image::CodeImage;
 use playgta6_recomp::discover::discover;
+use playgta6_recomp::eh::EhMetadata;
 use playgta6_recomp::lift::compile::{compile_to_wasm64_object, find_llvm_tool};
 use playgta6_recomp::lift::lift_module;
 use playgta6_recomp::pdata::ExceptionDirectory;
@@ -109,6 +110,7 @@ pub fn run_lift(args: &LiftArgs) -> Result<String, String> {
     let mut image = CodeImage::from_pe(&pe, &bytes);
     let pdata = ExceptionDirectory::from_pe(&pe, &bytes);
     pdata.seed(&mut image);
+    EhMetadata::from_pe(&pe, &bytes, &pdata).seed(&mut image);
     image.entry_points.extend(&args.entries);
     image.entry_points.sort_unstable();
     image.entry_points.dedup();

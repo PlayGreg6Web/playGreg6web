@@ -4,6 +4,7 @@
 pub mod cfg;
 pub mod code_image;
 pub mod discover;
+pub mod eh;
 pub mod image;
 mod jump_table;
 pub mod lift;

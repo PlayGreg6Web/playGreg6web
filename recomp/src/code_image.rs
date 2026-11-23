@@ -4,6 +4,7 @@
 //! [`CodeImage::from_pe`] maps a parsed [`Pe64`] onto them.
 
 use crate::cfg::DiagnosticKind;
+use crate::eh::EhSeeds;
 use crate::pdata::FunctionTable;
 use crate::pe::{IMAGE_SCN_MEM_EXECUTE, Pe64};
 
@@ -83,6 +84,9 @@ pub struct CodeImage<'a> {
     /// Exact function extents (from `.pdata`, see [`crate::pdata::ExceptionDirectory::seed`]);
     /// empty when unknown. Jump-table targets must stay inside the jump's function.
     pub function_table: FunctionTable,
+    /// Exception-handling seeds (resume targets, `setjmp` slots; see
+    /// [`crate::eh::EhMetadata::seed`]); empty when unknown.
+    pub eh: EhSeeds,
 }
 
 impl<'a> CodeImage<'a> {
@@ -103,6 +107,7 @@ impl<'a> CodeImage<'a> {
             entry_points,
             no_return: Vec::new(),
             function_table: FunctionTable::default(),
+            eh: EhSeeds::default(),
         }
     }
 

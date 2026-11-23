@@ -19,6 +19,18 @@
 //! 2. Each function collects the blocks reachable from its entry through intra-function edges.
 //!    Edges into another function's entry are reclassified as [`Edge::TailCall`].
 //!
+//! Resume targets (where `RtlRestoreContext` / `longjmp` continue inside a function, see
+//! [`Function::resume_targets`]) are block leaders from three sources: the EH metadata seeds in
+//! [`CodeImage::eh`] (catch continuations and `__except` bodies, each with its owning function;
+//! the owner's membership walk starts from them as well, since they are often reachable only
+//! through the unwinder), the instruction after a call through a `setjmp`-family IAT slot (or a
+//! direct call to an import thunk of one), and, when `.pdata` function extents are known,
+//! every address-taken interior code address: a RIP-relative `lea` of a non-entry address
+//! inside a `.pdata` function (e.g. the continuation an FH3 or FH4 catch funclet returns in
+//! `rax`), owned by that function. Interior addresses that fall inside a decoded instruction
+//! are ignored. The `setjmp`-thunk and `lea` sources need the complete block map, so they run
+//! after each jump-table fixpoint and the worklist runs again until nothing new is found.
+//!
 //! Both phases are iterative (no recursion proportional to code size). Block splitting is
 //! `O(log n + block length)` and the per-instruction hot path does no heap formatting. Each
 //! jump-table round costs one `O(blocks)` predecessor pass.
@@ -31,7 +43,7 @@ use crate::cfg::{
     BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, JumpTable,
     Terminator,
 };
-use crate::code_image::CodeImage;
+use crate::code_image::{CodeImage, Region};
 use crate::jump_table::{self, Step};
 use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
 
@@ -87,8 +99,17 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
     for &entry in &image.entry_points {
         state.add_function(entry);
     }
+    for &(owner, target) in &image.eh.resume_targets {
+        state.add_resume_target(owner, target);
+    }
     state.run();
-    while state.resolve_jump_tables() {
+    loop {
+        while state.resolve_jump_tables() {
+            state.run();
+        }
+        if !state.add_late_resume_targets() {
+            break;
+        }
         state.run();
     }
     state.verify_jump_tables();
@@ -141,6 +162,12 @@ struct Discovery<'i, 'a> {
     /// `jmp reg` sites decoded since the last jump-table round.
     pending_jumps: BTreeSet<u64>,
     jump_tables: BTreeMap<u64, JumpTable>,
+    /// `setjmp`-family IAT slots ([`CodeImage::eh`]).
+    setjmp_slots: HashSet<u64>,
+    /// Resume targets with their owning function: `(owner entry, target)`.
+    resume_roots: BTreeSet<(u64, u64)>,
+    /// Return sites of `setjmp`-family calls (owned by every function containing the block).
+    return_sites: BTreeSet<u64>,
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
@@ -154,7 +181,87 @@ impl<'i, 'a> Discovery<'i, 'a> {
             entries: BTreeSet::new(),
             pending_jumps: BTreeSet::new(),
             jump_tables: BTreeMap::new(),
+            setjmp_slots: image.eh.setjmp_slots.iter().copied().collect(),
+            resume_roots: BTreeSet::new(),
+            return_sites: BTreeSet::new(),
         }
+    }
+
+    /// Records `target` as a resume target of `owner` (ignored when it is another function's
+    /// entry). Returns whether it was new.
+    fn add_resume_target(&mut self, owner: u64, target: u64) -> bool {
+        if target != owner && self.entries.contains(&target) {
+            return false;
+        }
+        self.add_leader(target);
+        self.resume_roots.insert((owner, target))
+    }
+
+    /// Records the return site of a `setjmp`-family call. Returns whether it was new.
+    fn add_return_site(&mut self, va: u64) -> bool {
+        self.add_leader(va);
+        self.return_sites.insert(va)
+    }
+
+    /// Whether the block at `va` is an import thunk `jmp [rip+slot]` of a `setjmp`-family slot.
+    fn is_setjmp_thunk(&self, va: u64) -> bool {
+        self.blocks.get(&va).is_some_and(|block| {
+            block.instructions.len() == 1
+                && matches!(block.successors[..], [Edge::IndirectJump { slot: Some(slot) }]
+                    if self.setjmp_slots.contains(&slot))
+        })
+    }
+
+    /// Resume targets that need the complete block map: return sites of direct calls to
+    /// `setjmp` thunks and address-taken interior code (see the module docs). Returns whether
+    /// anything new was found.
+    fn add_late_resume_targets(&mut self) -> bool {
+        let table = &self.image.function_table;
+        if table.is_empty() && self.setjmp_slots.is_empty() {
+            return false;
+        }
+        let mut sites = Vec::new();
+        let mut interior = Vec::new();
+        for block in self.blocks.values() {
+            for call in &block.calls {
+                if let CallTarget::Direct(target) = call.target
+                    && self.is_setjmp_thunk(target)
+                    && let Ok(index) = block
+                        .instructions
+                        .binary_search_by_key(&call.site, Instruction::ip)
+                {
+                    sites.push(block.instructions[index].next_ip());
+                }
+            }
+            if table.is_empty() {
+                continue;
+            }
+            for instr in &block.instructions {
+                if instr.mnemonic() != Mnemonic::Lea || !instr.is_ip_rel_memory_operand() {
+                    continue;
+                }
+                let target = instr.ip_rel_memory_address();
+                if self.entries.contains(&target)
+                    || self.image.region_of(target) != Region::Code
+                    || matches!(self.locate(target), Decoded::InsideInstruction)
+                {
+                    continue;
+                }
+                if let Some(owner) = table.function_at(target)
+                    && self.entries.contains(&owner)
+                {
+                    interior.push((owner, target));
+                }
+            }
+        }
+        let mut progress = false;
+        for site in sites {
+            progress |= self.add_return_site(site);
+        }
+        for (owner, target) in interior {
+            progress |= self.add_resume_target(owner, target);
+        }
+        progress
     }
 
     fn add_leader(&mut self, va: u64) {
@@ -367,6 +474,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     site: ip,
                     target: CallTarget::Indirect { slot },
                 });
+                if slot.is_some_and(|s| self.setjmp_slots.contains(&s)) {
+                    let next = instr.next_ip();
+                    self.add_return_site(next);
+                    *stop_at = (*stop_at).min(next);
+                }
                 slot.filter(|s| self.no_return.contains(s))
                     .map(|_| Terminator::NoReturnCall)
             }
@@ -546,6 +658,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// Phase 2: assign blocks to functions and classify tail calls.
     fn into_functions(mut self) -> BTreeMap<u64, Function> {
         let entries: Vec<u64> = self.entries.iter().copied().collect();
+        let mut roots: HashMap<u64, Vec<u64>> = HashMap::new();
+        // A target that became another function's entry after it was recorded is that
+        // function's entry, not a resume target.
+        for &(owner, target) in &self.resume_roots {
+            if target == owner || !self.entries.contains(&target) {
+                roots.entry(owner).or_default().push(target);
+            }
+        }
 
         // Membership: blocks reachable from each entry through intra-function edges.
         let mut members: Vec<Vec<u64>> = Vec::with_capacity(entries.len());
@@ -555,6 +675,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
         for &entry in &entries {
             seen.clear();
             stack.push(entry);
+            stack.extend(roots.get(&entry).into_iter().flatten().rev());
             let mut list = Vec::new();
             while let Some(va) = stack.pop() {
                 if !seen.insert(va) {
@@ -585,6 +706,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 entry,
                 blocks: BTreeMap::new(),
                 callees: BTreeSet::new(),
+                resume_targets: BTreeSet::new(),
             };
             for va in list {
                 let remaining = refcount.get_mut(&va).map(|count| {
@@ -616,6 +738,12 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
                 function.blocks.insert(va, block);
             }
+            let owned = roots.get(&entry).into_iter().flatten();
+            function.resume_targets = owned
+                .chain(self.return_sites.iter())
+                .copied()
+                .filter(|va| function.blocks.contains_key(va))
+                .collect();
             functions.insert(entry, function);
         }
         functions
@@ -1322,6 +1450,126 @@ mod tests {
         assert_eq!(block_starts(f), [0x10, 0x15, 0x21]);
         assert_eq!(f.calls().count(), 1);
         assert_eq!(forward.relocations.len(), 5);
+    }
+
+    fn analyze_eh(
+        code: &[u8],
+        entries: &[u64],
+        eh: crate::eh::EhSeeds,
+        table: crate::pdata::FunctionTable,
+    ) -> Analysis {
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, code, true),
+                CodeSection::new(DATA, &DATA_BYTES, false),
+            ],
+            entries.iter().map(|e| TEXT + e).collect(),
+        );
+        image.eh = eh;
+        image.function_table = table;
+        discover(&image)
+    }
+
+    fn resume_offsets(function: &Function) -> Vec<u64> {
+        function.resume_targets.iter().map(|va| va - TEXT).collect()
+    }
+
+    #[test]
+    fn eh_resume_targets_split_blocks_and_root_the_owner() {
+        let code = [
+            0x48, 0x83, 0xec, 0x28, // 0: sub rsp, 0x28
+            0xe8, 0x17, 0x00, 0x00, 0x00, // 4: call 0x20
+            0x90, // 9: nop          <- resume target (splits the block)
+            0x48, 0x83, 0xc4, 0x28, // a: add rsp, 0x28
+            0xc3, // e: ret
+            0xcc, // f: padding
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 10: mov eax, 1 <- reachable only by unwinding
+            0xeb, 0xf3, // 15: jmp 0xa
+            0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // 17: padding
+            0xc3, // 20: ret
+        ];
+        let eh = crate::eh::EhSeeds {
+            resume_targets: vec![
+                (TEXT, TEXT + 0x9),
+                (TEXT, TEXT + 0x10),
+                // Another function's entry is never a resume target.
+                (TEXT, TEXT + 0x20),
+            ],
+            ..Default::default()
+        };
+        let analysis = analyze_eh(&code, &[0], eh, Default::default());
+        let f = func(&analysis, 0);
+        assert_eq!(block_starts(f), [0x0, 0x9, 0xa, 0x10]);
+        assert_eq!(resume_offsets(f), [0x9, 0x10]);
+        assert_eq!(block(f, 0x0).successors, [Edge::Fallthrough(TEXT + 0x9)]);
+        assert_eq!(block(f, 0x10).successors, [Edge::Jump(TEXT + 0xa)]);
+        assert!(func(&analysis, 0x20).resume_targets.is_empty());
+
+        // Without the seeds, the unwinder-only block does not exist.
+        let plain = analyze(&code, &[0]);
+        assert_eq!(block_starts(func(&plain, 0)), [0x0]);
+        assert!(func(&plain, 0).resume_targets.is_empty());
+    }
+
+    #[test]
+    fn setjmp_return_sites_are_resume_targets() {
+        let slot_call = (DATA as i64 - (TEXT as i64 + 6)) as i32;
+        let slot_jump = (DATA as i64 - (TEXT as i64 + 0x26)) as i32;
+        let code = [
+            &[0xff, 0x15][..],
+            &slot_call.to_le_bytes(), // 0: call [rip+x] -> DATA (setjmp slot)
+            &[0x85, 0xc0],            // 6: test eax, eax   <- return site
+            &[0xe8, 0x13, 0x00, 0x00, 0x00], // 8: call 0x20 (setjmp import thunk)
+            &[0xc3],                  // d: ret             <- return site
+            &[0xcc; 0x12],            // e: padding
+            &[0xff, 0x25],
+            &slot_jump.to_le_bytes(), // 20: jmp [rip+x] -> DATA
+        ]
+        .concat();
+        let eh = crate::eh::EhSeeds {
+            setjmp_slots: vec![DATA],
+            ..Default::default()
+        };
+        let analysis = analyze_eh(&code, &[0], eh, Default::default());
+        let f = func(&analysis, 0);
+        assert_eq!(block_starts(f), [0x0, 0x6, 0xd]);
+        assert_eq!(resume_offsets(f), [0x6, 0xd]);
+        assert_eq!(block(f, 0x0).successors, [Edge::Fallthrough(TEXT + 0x6)]);
+        assert!(func(&analysis, 0x20).resume_targets.is_empty());
+    }
+
+    #[test]
+    fn address_taken_interior_code_is_a_resume_target_of_its_pdata_function() {
+        let lea = |reg: u8, at: u64, target: u64| {
+            let disp = (target as i64 - (at as i64 + 7)) as i32;
+            [&[0x48, 0x8d, reg][..], &disp.to_le_bytes()].concat()
+        };
+        let code = [
+            lea(0x05, 0x0, 0x1c),   // 0: lea rax, [B+4]  (interior instruction boundary)
+            lea(0x0d, 0x7, 0x1d),   // 7: lea rcx, [B+5]  (inside an instruction: ignored)
+            lea(0x15, 0xe, 0x18),   // e: lea rdx, [B]    (function entry: ignored)
+            vec![0xc3, 0xcc, 0xcc], // 15: ret
+            vec![0x90, 0x90, 0x90, 0x90], // 18: B: nop x4
+            vec![0xb8, 0x02, 0x00, 0x00, 0x00], // 1c: mov eax, 2
+            vec![0xc3],             // 21: ret
+        ]
+        .concat();
+        let range = |start: u64, end: u64| crate::pdata::FunctionRange {
+            start: TEXT + start,
+            end: TEXT + end,
+            function: TEXT + start,
+        };
+        let table = crate::pdata::FunctionTable::new(vec![range(0, 0x18), range(0x18, 0x22)]);
+        let analysis = analyze_eh(&code, &[0, 0x18], Default::default(), table);
+        let b = func(&analysis, 0x18);
+        assert_eq!(block_starts(b), [0x18, 0x1c]);
+        assert_eq!(resume_offsets(b), [0x1c]);
+        assert!(func(&analysis, 0).resume_targets.is_empty());
+
+        // Without .pdata extents the owner is unknown: nothing is added.
+        let analysis = analyze(&code, &[0, 0x18]);
+        assert_eq!(block_starts(func(&analysis, 0x18)), [0x18]);
     }
 
     #[test]
