@@ -1,7 +1,15 @@
 'use strict';
 
 // Main runtime coordinator worker (keeps the browser DOM thread completely free).
+if (typeof importScripts === 'function') {
+  importScripts('./workers/userdata.js');
+}
+
 const progress = new BroadcastChannel('game-progress');
+
+const userdataApi =
+  (typeof globalThis !== 'undefined' && globalThis.PlayGta6Userdata) || null;
+const userdataStore = userdataApi ? new userdataApi.UserdataStore() : null;
 
 let gpuWorker = null;
 let ioWorker = null;
@@ -36,6 +44,76 @@ function encodeTestFramePacket(r, g, b, a) {
   return buf;
 }
 
+function createRuntimeModuleOptions() {
+  const preRun = [
+    (mod) => {
+      if (!userdataStore || !mod || !mod.FS) return;
+      const useRunDep =
+        typeof mod.addRunDependency === 'function' &&
+        typeof mod.removeRunDependency === 'function';
+      if (useRunDep) {
+        mod.addRunDependency('userdata-restore');
+      }
+      userdataStore
+        .restoreAll(mod.FS, { timeoutMs: 8000 })
+        .then((res) => {
+          if (res.timedOut) {
+            report(`userdata restore timed out (continuing boot): ${res.error}`);
+          } else if (res.error) {
+            report(`userdata restore skipped: ${res.error}`);
+          } else {
+            report(`userdata restored (${res.restored} files)`);
+          }
+        })
+        .catch((err) => {
+          report(`userdata restore warning: ${err}`);
+        })
+        .finally(() => {
+          if (useRunDep) {
+            mod.removeRunDependency('userdata-restore');
+          }
+        });
+    },
+  ];
+
+  return {
+    locateFile: (p) => `./dist/${p}`,
+    preRun,
+    hostCallbacks: {
+      log: (msg) => report(`[wasm] ${msg}`),
+      wgpuSubmit: (bytes) => {
+        const copy = bytes.slice().buffer;
+        gpuWorker.postMessage({ cmdBuffer: copy }, [copy]);
+      },
+      userdataRestore: (fsAdapter, opts) => {
+        if (!userdataStore) {
+          return Promise.resolve({
+            restored: 0,
+            skipped: 0,
+            timedOut: false,
+            error: 'userdata store unavailable',
+          });
+        }
+        return userdataStore.restoreAll(fsAdapter, opts);
+      },
+      userdataSave: (path, bytes, mtime) => {
+        if (!userdataStore) return Promise.resolve(null);
+        return userdataStore.saveFile(path, bytes, mtime).catch((err) => {
+          report(`userdata save warning (${path}): ${err}`);
+          return null;
+        });
+      },
+      userdataDelete: (path) => {
+        if (!userdataStore) return Promise.resolve(null);
+        return userdataStore.deleteFile(path).catch((err) => {
+          report(`userdata delete warning (${path}): ${err}`);
+          return null;
+        });
+      },
+    },
+  };
+}
+
 async function tryBootWasmRuntime() {
   try {
     const head = await fetch('./dist/runtime.js', { method: 'HEAD' });
@@ -48,16 +126,7 @@ async function tryBootWasmRuntime() {
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
     importScripts('./dist/runtime.js');
     if (typeof self.createRuntimeModule === 'function') {
-      await self.createRuntimeModule({
-        locateFile: (p) => `./dist/${p}`,
-        hostCallbacks: {
-          log: (msg) => report(`[wasm] ${msg}`),
-          wgpuSubmit: (bytes) => {
-            const copy = bytes.slice().buffer;
-            gpuWorker.postMessage({ cmdBuffer: copy }, [copy]);
-          },
-        },
-      });
+      await self.createRuntimeModule(createRuntimeModuleOptions());
     }
   } catch (err) {
     progress.postMessage({ error: `runtime boot: ${err}` });
