@@ -91,13 +91,13 @@ pub const SEAM_FILE: &str = "pg6_guest_seam.h";
 pub const MANIFEST_FILE: &str = "pg6_import_manifest.json";
 
 /// Byte offset of the 16 GPRs in the default seam's guest state (lifter layout).
-pub const SEAM_GPR_OFFSET: u64 = 0;
+pub const SEAM_GPR_OFFSET: u64 = crate::lift::STATE_GPR_OFFSET;
 /// Byte offset of `xmm0..xmm15` in the default seam's guest state (lifter layout).
-pub const SEAM_XMM_OFFSET: u64 = 160;
+pub const SEAM_XMM_OFFSET: u64 = crate::lift::STATE_XMM_OFFSET;
 /// Distance between two XMM registers in the default seam's guest state.
-pub const SEAM_XMM_STRIDE: u64 = 16;
+pub const SEAM_XMM_STRIDE: u64 = crate::lift::STATE_XMM_STRIDE;
 /// Offset of the fifth argument from `rsp` at callee entry: return address + shadow space.
-pub const STACK_ARG_OFFSET: u64 = 40;
+pub const STACK_ARG_OFFSET: u64 = crate::lift::CALLEE_STACK_ARG_OFFSET;
 
 /// Win64 integer argument registers as x86 register numbers (`rcx rdx r8 r9`).
 const ARG_GPRS: [u8; 4] = [1, 2, 8, 9];

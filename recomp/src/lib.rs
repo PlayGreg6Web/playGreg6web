@@ -6,6 +6,7 @@ pub mod code_image;
 pub mod discover;
 pub mod image;
 mod jump_table;
+pub mod lift;
 pub mod pdata;
 pub mod pe;
 pub mod reloc;

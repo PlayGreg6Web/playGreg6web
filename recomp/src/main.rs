@@ -1,3 +1,4 @@
+mod lift_cmd;
 mod report;
 
 use std::env;
@@ -58,6 +59,7 @@ enum Command {
     Discover(DiscoverArgs),
     PackImage(PackImageArgs),
     Stubs(StubsArgs),
+    Lift(lift_cmd::LiftArgs),
 }
 
 fn print_usage() {
@@ -71,6 +73,7 @@ fn print_usage() {
     eprintln!(
         "  playgta6-recomp stubs <pe-path> --shims <header>... --out <dir> [--include-root <dir>]"
     );
+    eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
@@ -83,6 +86,9 @@ fn print_usage() {
     eprintln!("  --shims <header>...    stubs: runtime headers declaring the extern \"C\" shims");
     eprintln!("  --out <dir>            stubs: write import thunks, seam header and manifest");
     eprintln!("  --include-root <dir>   stubs: spell generated #includes relative to <dir>");
+    eprintln!("  --out <dir>            lift: write lifted.ll (and lifted.o) derived from game code; use gitignored work/");
+    eprintln!("  --entry <va>           lift: extra function entry point (hex VA), repeatable");
+    eprintln!("  --emit-obj             lift: also compile a wasm64 object with llc/clang");
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
@@ -98,8 +104,11 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "discover" => parse_discover_args(&args[1..]),
         "pack-image" => parse_pack_image_args(&args[1..]),
         "stubs" => parse_stubs_args(&args[1..]),
+        "lift" => {
+            lift_cmd::parse_lift_args(&args[1..]).map(|a| a.map_or(Command::Help, Command::Lift))
+        }
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image' or 'stubs'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs' or 'lift'. Run with --help for usage."
         )),
     }
 }
@@ -664,6 +673,16 @@ fn main() -> ExitCode {
         },
         Ok(Command::Stubs(stubs_args)) => match run_stubs(&stubs_args) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::Lift(lift_args)) => match lift_cmd::run_lift(&lift_args) {
+            Ok(summary) => {
+                print!("{summary}");
+                ExitCode::SUCCESS
+            }
             Err(err) => {
                 eprintln!("Error: {err}");
                 ExitCode::FAILURE
