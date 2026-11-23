@@ -16,6 +16,7 @@ add_library(playgta6_core STATIC
     os/xbox_offline.cpp
     os/win32_loader.cpp
     gpu/cmd_encoder.cpp
+    gpu/pso_cache.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -64,4 +65,8 @@ else()
     add_executable(test_win32_loader ../tests/test_win32_loader.cpp)
     target_link_libraries(test_win32_loader PRIVATE playgta6_core)
     add_test(NAME playgta6_win32_loader_tests COMMAND test_win32_loader)
+
+    add_executable(test_pso_cache ../tests/test_pso_cache.cpp)
+    target_link_libraries(test_pso_cache PRIVATE playgta6_core)
+    add_test(NAME playgta6_pso_cache_tests COMMAND test_pso_cache)
 endif()
