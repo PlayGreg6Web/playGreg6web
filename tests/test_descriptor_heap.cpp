@@ -1,0 +1,1797 @@
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+#include "gpu/descriptor_heap.h"
+
+namespace {
+
+int g_failures = 0;
+
+void check_impl(bool cond, const char* expr, int line) {
+    if (!cond) {
+        std::fprintf(stderr, "FAIL [test_descriptor_heap.cpp:%d]: %s\n", line, expr);
+        ++g_failures;
+    }
+}
+
+#define CHECK(expr) check_impl(static_cast<bool>(expr), #expr, __LINE__)
+
+using namespace playgta6::gpu::d3d12_state;
+
+DescriptorHeap* make_heap(DescriptorHeapRegistry& reg, DescriptorHeapType type, uint32_t n, bool shader_visible) {
+    DescriptorHeapDesc desc;
+    desc.type = type;
+    desc.num_descriptors = n;
+    desc.flags = shader_visible ? DescriptorHeapFlags::ShaderVisible : DescriptorHeapFlags::None;
+    DescriptorHeap* heap = nullptr;
+    CHECK(reg.create_heap(desc, &heap) == Status::Ok);
+    CHECK(heap != nullptr);
+    return heap;
+}
+
+CpuDescriptorHandle cpu_at(const DescriptorHeap* heap, uint32_t index) {
+    return CpuDescriptorHandle{heap->cpu_start().ptr + static_cast<uint64_t>(index) * heap->increment()};
+}
+
+GpuDescriptorHandle gpu_at(const DescriptorHeap* heap, uint32_t index) {
+    return GpuDescriptorHandle{heap->gpu_start().ptr + static_cast<uint64_t>(index) * heap->increment()};
+}
+
+ViewDesc texture2d_srv(uint32_t first_mip = 0, uint32_t mip_levels = 1) {
+    ViewDesc d;
+    d.format = 28;  // DXGI_FORMAT_R8G8B8A8_UNORM
+    d.dimension = ViewDimension::Texture2D;
+    d.first_mip = first_mip;
+    d.mip_levels = mip_levels;
+    return d;
+}
+
+// Fake GPU VA space for the bind-group tests: buffer 70 at 0x10000 (64 KiB),
+// buffer 80 at 0x100000 (128 KiB).
+bool test_resolver(void* user, uint64_t va, GpuVaResolution* out) {
+    auto* calls = static_cast<int*>(user);
+    if (calls != nullptr) {
+        ++*calls;
+    }
+    if (va >= 0x10000 && va < 0x20000) {
+        *out = GpuVaResolution{70, va - 0x10000, 0x10000};
+        return true;
+    }
+    if (va >= 0x100000 && va < 0x120000) {
+        *out = GpuVaResolution{80, va - 0x100000, 0x20000};
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 1. Heap creation and handle arithmetic
+// ---------------------------------------------------------------------------
+
+void test_heap_creation_and_handles() {
+    DescriptorHeapRegistry reg;
+    CHECK(descriptor_handle_increment_size(DescriptorHeapType::CbvSrvUav) == 32);
+    CHECK(descriptor_handle_increment_size(DescriptorHeapType::Sampler) == 16);
+    CHECK(descriptor_handle_increment_size(DescriptorHeapType::Rtv) == 32);
+    CHECK(descriptor_handle_increment_size(DescriptorHeapType::Dsv) == 32);
+
+    DescriptorHeap* bad = reinterpret_cast<DescriptorHeap*>(1);
+    DescriptorHeapDesc d;
+    d.num_descriptors = 0;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    CHECK(bad == nullptr);
+    d.num_descriptors = 4;
+    d.type = DescriptorHeapType::Rtv;
+    d.flags = DescriptorHeapFlags::ShaderVisible;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    d.type = DescriptorHeapType::Dsv;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    d.type = DescriptorHeapType::Sampler;
+    d.num_descriptors = kMaxShaderVisibleSamplers + 1;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    d.type = static_cast<DescriptorHeapType>(7);
+    d.num_descriptors = 4;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    d.type = DescriptorHeapType::CbvSrvUav;
+    d.flags = 0x10;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    d.flags = 0;
+    d.num_descriptors = kMaxDescriptorsPerHeap + 1;
+    CHECK(reg.create_heap(d, &bad) == Status::InvalidArgument);
+    CHECK(reg.create_heap(d, nullptr) == Status::InvalidArgument);
+    CHECK(reg.heap_count() == 0);
+
+    DescriptorHeap* cbv = make_heap(reg, DescriptorHeapType::CbvSrvUav, 100, true);
+    DescriptorHeap* staging = make_heap(reg, DescriptorHeapType::CbvSrvUav, 100, false);
+    DescriptorHeap* rtv = make_heap(reg, DescriptorHeapType::Rtv, 8, false);
+    CHECK(reg.heap_count() == 3);
+    CHECK(cbv->capacity() == 100);
+    CHECK(cbv->shader_visible());
+    CHECK(!staging->shader_visible());
+    CHECK(cbv->cpu_start().ptr != 0);
+    CHECK(cbv->gpu_start().ptr != 0);
+    CHECK(staging->gpu_start().ptr == 0);  // non-shader-visible: no GPU handle
+    CHECK(cbv->cpu_start().ptr != staging->cpu_start().ptr);
+    CHECK(cbv->cpu_start().ptr != cbv->gpu_start().ptr);
+
+    // Raw pointer arithmetic round-trips to (heap, index).
+    for (uint32_t i : {0u, 1u, 50u, 99u}) {
+        ResolvedDescriptor r;
+        CHECK(reg.resolve_cpu(cpu_at(cbv, i), &r) == Status::Ok);
+        CHECK(r.heap == cbv && r.index == i);
+        CHECK(reg.resolve_gpu(gpu_at(cbv, i), &r) == Status::Ok);
+        CHECK(r.heap == cbv && r.index == i);
+        CHECK(cbv->cpu_handle(i).ptr == cpu_at(cbv, i).ptr);
+        CHECK(cbv->gpu_handle(i).ptr == gpu_at(cbv, i).ptr);
+    }
+    ResolvedDescriptor r;
+    CHECK(reg.resolve_cpu(cpu_at(rtv, 7), &r) == Status::Ok && r.heap == rtv && r.index == 7);
+
+    // Validation of bad handles.
+    CHECK(reg.resolve_cpu(cpu_at(cbv, 100), &r) == Status::HandleOutOfRange);
+    CHECK(reg.resolve_cpu(CpuDescriptorHandle{cbv->cpu_start().ptr + 1}, &r) == Status::MisalignedHandle);
+    CHECK(reg.resolve_cpu(CpuDescriptorHandle{cbv->cpu_start().ptr + 16}, &r) == Status::MisalignedHandle);
+    CHECK(reg.resolve_cpu(CpuDescriptorHandle{cbv->gpu_start().ptr}, &r) == Status::InvalidHandle);
+    CHECK(reg.resolve_gpu(GpuDescriptorHandle{cbv->cpu_start().ptr}, &r) == Status::InvalidHandle);
+    CHECK(reg.resolve_cpu(CpuDescriptorHandle{0}, &r) == Status::InvalidHandle);
+    CHECK(reg.resolve_cpu(CpuDescriptorHandle{0x00007ff612345678ull}, &r) == Status::InvalidHandle);
+    CHECK(reg.resolve_cpu(CpuDescriptorHandle{0x4000ffff00000000ull}, &r) == Status::StaleHandle);
+    // Underflow below the heap start wraps into another heap id: never resolves to this heap.
+    const Status under = reg.resolve_cpu(CpuDescriptorHandle{cbv->cpu_start().ptr - 32}, &r);
+    CHECK(under != Status::Ok || r.heap != cbv);
+
+    // Destroyed heap handles become stale; slot reuse does not revive them.
+    const CpuDescriptorHandle old_cpu = staging->cpu_start();
+    const uint32_t old_serial = staging->serial();
+    reg.destroy_heap(staging);
+    CHECK(reg.heap_count() == 2);
+    CHECK(reg.resolve_cpu(old_cpu, &r) == Status::StaleHandle);
+    DescriptorHeap* reused = make_heap(reg, DescriptorHeapType::CbvSrvUav, 100, false);
+    CHECK((reused->serial() & 0xffffu) == (old_serial & 0xffffu));
+    CHECK(reused->serial() != old_serial);
+    CHECK(reg.resolve_cpu(old_cpu, &r) == Status::StaleHandle);
+    CHECK(reg.resolve_cpu(reused->cpu_start(), &r) == Status::Ok && r.heap == reused);
+    reg.destroy_heap(reused);
+    reg.destroy_heap(reused);  // double destroy is ignored
+    reg.destroy_heap(nullptr);
+    CHECK(reg.heap_count() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Descriptor writes
+// ---------------------------------------------------------------------------
+
+void test_descriptor_writes() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 16, false);
+    DescriptorHeap* samplers = make_heap(reg, DescriptorHeapType::Sampler, 4, false);
+    DescriptorHeap* rtvs = make_heap(reg, DescriptorHeapType::Rtv, 4, false);
+    DescriptorHeap* dsvs = make_heap(reg, DescriptorHeapType::Dsv, 4, false);
+
+    CHECK(heap->view(0)->kind == DescriptorKind::Empty);
+    CHECK(heap->generation() == 0);
+
+    ConstantBufferViewDesc cbv{0x10100, 512};
+    CHECK(reg.create_constant_buffer_view(&cbv, cpu_at(heap, 0)) == Status::Ok);
+    CHECK(heap->view(0)->kind == DescriptorKind::Cbv);
+    CHECK(heap->view(0)->first_element_or_address == 0x10100);
+    CHECK(heap->view(0)->num_elements_or_size == 512);
+    ConstantBufferViewDesc bad_cbv{0x10100, 100};
+    CHECK(reg.create_constant_buffer_view(&bad_cbv, cpu_at(heap, 1)) == Status::InvalidArgument);
+    bad_cbv = ConstantBufferViewDesc{0x10001, 256};
+    CHECK(reg.create_constant_buffer_view(&bad_cbv, cpu_at(heap, 1)) == Status::InvalidArgument);
+    CHECK(heap->view(1)->kind == DescriptorKind::Empty);
+    CHECK(reg.create_constant_buffer_view(nullptr, cpu_at(heap, 1)) == Status::Ok);  // null CBV
+    CHECK(heap->view(1)->kind == DescriptorKind::Cbv && heap->view(1)->first_element_or_address == 0);
+
+    ViewDesc srv = texture2d_srv(2, 3);
+    CHECK(reg.create_shader_resource_view(42, &srv, cpu_at(heap, 2)) == Status::Ok);
+    const ViewDescriptor* v = heap->view(2);
+    CHECK(v->kind == DescriptorKind::Srv && v->resource_id == 42 && v->format == 28);
+    CHECK(v->dimension == ViewDimension::Texture2D && v->first_mip == 2 && v->mip_levels == 3);
+    CHECK(v->component_mapping == kDefaultShader4ComponentMapping);
+
+    CHECK(reg.create_shader_resource_view(43, nullptr, cpu_at(heap, 3)) == Status::Ok);  // default view
+    CHECK(heap->view(3)->dimension == ViewDimension::Unknown && heap->view(3)->mip_levels == 0xffff);
+    CHECK(reg.create_shader_resource_view(0, nullptr, cpu_at(heap, 4)) == Status::InvalidArgument);
+    CHECK(reg.create_shader_resource_view(0, &srv, cpu_at(heap, 4)) == Status::Ok);  // null SRV
+    CHECK(heap->view(4)->kind == DescriptorKind::Srv && heap->view(4)->resource_id == 0);
+    ViewDesc bad_dim = srv;
+    bad_dim.dimension = 99;
+    CHECK(reg.create_shader_resource_view(42, &bad_dim, cpu_at(heap, 5)) == Status::InvalidArgument);
+
+    ViewDesc uav;
+    uav.dimension = ViewDimension::Buffer;
+    uav.first_element = 16;
+    uav.num_elements = 64;
+    uav.structure_byte_stride = 16;
+    uav.counter_offset_in_bytes = 4096;
+    CHECK(reg.create_unordered_access_view(50, 51, &uav, cpu_at(heap, 5)) == Status::Ok);
+    v = heap->view(5);
+    CHECK(v->kind == DescriptorKind::Uav && v->resource_id == 50 && v->counter_resource_id == 51);
+    CHECK(v->first_element_or_address == 16 && v->num_elements_or_size == 64 && v->structure_byte_stride == 16);
+    CHECK(v->counter_offset_in_bytes == 4096 && v->component_mapping == 0);
+
+    SamplerDesc s;
+    s.filter = 0x55;  // anisotropic
+    s.max_anisotropy = 8;
+    s.address_u = 3;
+    CHECK(reg.create_sampler(s, cpu_at(samplers, 1)) == Status::Ok);
+    CHECK(samplers->sampler(1)->kind == DescriptorKind::Sampler);
+    CHECK(samplers->sampler(1)->desc.max_anisotropy == 8 && samplers->sampler(1)->desc.address_u == 3);
+    CHECK(samplers->view(0) == nullptr);
+    CHECK(heap->sampler(0) == nullptr);
+
+    ViewDesc rtv_desc;
+    rtv_desc.dimension = ViewDimension::Texture2DArray;
+    rtv_desc.first_mip = 1;
+    rtv_desc.first_array_slice = 2;
+    rtv_desc.array_size = 3;
+    CHECK(reg.create_render_target_view(60, &rtv_desc, cpu_at(rtvs, 0)) == Status::Ok);
+    CHECK(rtvs->view(0)->kind == DescriptorKind::Rtv && rtvs->view(0)->first_array_slice == 2);
+    CHECK(rtvs->view(0)->mip_levels == 1);
+    ViewDesc dsv_desc;
+    dsv_desc.dimension = DsvDimension::Texture2D;
+    dsv_desc.flags = DsvFlags::ReadOnlyDepth;
+    CHECK(reg.create_depth_stencil_view(61, &dsv_desc, cpu_at(dsvs, 3)) == Status::Ok);
+    CHECK(dsvs->view(3)->kind == DescriptorKind::Dsv && dsvs->view(3)->flags == DsvFlags::ReadOnlyDepth);
+
+    // Heap type checks.
+    CHECK(reg.create_shader_resource_view(42, &srv, cpu_at(samplers, 0)) == Status::WrongHeapType);
+    CHECK(reg.create_sampler(s, cpu_at(heap, 0)) == Status::WrongHeapType);
+    CHECK(reg.create_render_target_view(60, &rtv_desc, cpu_at(heap, 0)) == Status::WrongHeapType);
+    CHECK(reg.create_depth_stencil_view(61, &dsv_desc, cpu_at(rtvs, 0)) == Status::WrongHeapType);
+    CHECK(reg.create_shader_resource_view(42, &srv, cpu_at(heap, 16)) == Status::HandleOutOfRange);
+    CHECK(reg.create_shader_resource_view(42, &srv, CpuDescriptorHandle{0}) == Status::InvalidHandle);
+
+    // Generation bumps only when content changes.
+    const uint64_t g0 = heap->generation();
+    const uint64_t slot_g = heap->slot_generation(2);
+    CHECK(slot_g > 0 && slot_g <= g0);
+    CHECK(reg.create_shader_resource_view(42, &srv, cpu_at(heap, 2)) == Status::Ok);
+    CHECK(heap->generation() == g0);
+    CHECK(heap->slot_generation(2) == slot_g);
+    srv.mip_levels = 4;
+    CHECK(reg.create_shader_resource_view(42, &srv, cpu_at(heap, 2)) == Status::Ok);
+    CHECK(heap->generation() == g0 + 1);
+    CHECK(heap->slot_generation(2) == g0 + 1);
+}
+
+// ---------------------------------------------------------------------------
+// 3. CopyDescriptorsSimple / CopyDescriptors
+// ---------------------------------------------------------------------------
+
+void fill_srvs(DescriptorHeapRegistry& reg, DescriptorHeap* heap, uint32_t first, uint32_t count, uint32_t id_base) {
+    ViewDesc srv = texture2d_srv();
+    for (uint32_t i = 0; i < count; ++i) {
+        CHECK(reg.create_shader_resource_view(id_base + i, &srv, cpu_at(heap, first + i)) == Status::Ok);
+    }
+}
+
+void test_copy_descriptors_simple() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* src = make_heap(reg, DescriptorHeapType::CbvSrvUav, 32, false);
+    DescriptorHeap* dst = make_heap(reg, DescriptorHeapType::CbvSrvUav, 32, true);
+    DescriptorHeap* samp = make_heap(reg, DescriptorHeapType::Sampler, 8, false);
+    fill_srvs(reg, src, 0, 10, 100);
+
+    CHECK(reg.copy_descriptors_simple(4, cpu_at(dst, 20), cpu_at(src, 3), DescriptorHeapType::CbvSrvUav) == Status::Ok);
+    for (uint32_t i = 0; i < 4; ++i) {
+        CHECK(dst->view(20 + i)->resource_id == 103 + i);
+    }
+    CHECK(dst->view(24)->kind == DescriptorKind::Empty);
+    CHECK(reg.copy_descriptors_simple(0, CpuDescriptorHandle{0}, CpuDescriptorHandle{0}, DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(reg.copy_descriptors_simple(4, cpu_at(dst, 30), cpu_at(src, 0), DescriptorHeapType::CbvSrvUav) ==
+          Status::HandleOutOfRange);
+    CHECK(reg.copy_descriptors_simple(1, cpu_at(dst, 0), cpu_at(src, 0), DescriptorHeapType::Sampler) ==
+          Status::WrongHeapType);
+    CHECK(reg.copy_descriptors_simple(1, cpu_at(samp, 0), cpu_at(src, 0), DescriptorHeapType::Sampler) ==
+          Status::WrongHeapType);
+    CHECK(reg.copy_descriptors_simple(1, cpu_at(dst, 0), CpuDescriptorHandle{dst->gpu_start().ptr},
+                                      DescriptorHeapType::CbvSrvUav) == Status::InvalidHandle);
+
+    // Overlapping copies inside one heap behave like memmove (forward and backward).
+    CHECK(reg.copy_descriptors_simple(6, cpu_at(src, 2), cpu_at(src, 0), DescriptorHeapType::CbvSrvUav) == Status::Ok);
+    const uint32_t expected_fwd[10] = {100, 101, 100, 101, 102, 103, 104, 105, 108, 109};
+    for (uint32_t i = 0; i < 10; ++i) {
+        CHECK(src->view(i)->resource_id == expected_fwd[i]);
+    }
+    fill_srvs(reg, src, 0, 10, 100);
+    CHECK(reg.copy_descriptors_simple(6, cpu_at(src, 0), cpu_at(src, 2), DescriptorHeapType::CbvSrvUav) == Status::Ok);
+    const uint32_t expected_back[10] = {102, 103, 104, 105, 106, 107, 106, 107, 108, 109};
+    for (uint32_t i = 0; i < 10; ++i) {
+        CHECK(src->view(i)->resource_id == expected_back[i]);
+    }
+    // Self copy is a no-op.
+    const uint64_t gen = src->generation();
+    CHECK(reg.copy_descriptors_simple(5, cpu_at(src, 0), cpu_at(src, 0), DescriptorHeapType::CbvSrvUav) == Status::Ok);
+    CHECK(src->generation() == gen);
+
+    // Sampler copies.
+    SamplerDesc s;
+    s.max_anisotropy = 4;
+    CHECK(reg.create_sampler(s, cpu_at(samp, 0)) == Status::Ok);
+    CHECK(reg.copy_descriptors_simple(1, cpu_at(samp, 5), cpu_at(samp, 0), DescriptorHeapType::Sampler) == Status::Ok);
+    CHECK(samp->sampler(5)->kind == DescriptorKind::Sampler && samp->sampler(5)->desc.max_anisotropy == 4);
+}
+
+void test_copy_descriptors_multi_range() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* a = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, false);
+    DescriptorHeap* b = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, false);
+    DescriptorHeap* gpu = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, true);
+    fill_srvs(reg, a, 0, 8, 200);
+    fill_srvs(reg, b, 0, 8, 300);
+
+    // dst: [gpu 0..3), [gpu 10..12)   src: [a 1], [b 4..8)
+    const CpuDescriptorHandle dsts[2] = {cpu_at(gpu, 0), cpu_at(gpu, 10)};
+    const uint32_t dst_sizes[2] = {3, 2};
+    const CpuDescriptorHandle srcs[2] = {cpu_at(a, 1), cpu_at(b, 4)};
+    const uint32_t src_sizes[2] = {1, 4};
+    CHECK(reg.copy_descriptors(2, dsts, dst_sizes, 2, srcs, src_sizes, DescriptorHeapType::CbvSrvUav) == Status::Ok);
+    CHECK(gpu->view(0)->resource_id == 201);
+    CHECK(gpu->view(1)->resource_id == 304);
+    CHECK(gpu->view(2)->resource_id == 305);
+    CHECK(gpu->view(10)->resource_id == 306);
+    CHECK(gpu->view(11)->resource_id == 307);
+    CHECK(gpu->view(3)->kind == DescriptorKind::Empty);
+
+    // Null size arrays mean one descriptor per range.
+    const CpuDescriptorHandle singles_dst[3] = {cpu_at(gpu, 40), cpu_at(gpu, 45), cpu_at(gpu, 50)};
+    const CpuDescriptorHandle singles_src[3] = {cpu_at(a, 7), cpu_at(b, 0), cpu_at(a, 0)};
+    CHECK(reg.copy_descriptors(3, singles_dst, nullptr, 3, singles_src, nullptr, DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(gpu->view(40)->resource_id == 207 && gpu->view(45)->resource_id == 300 && gpu->view(50)->resource_id == 200);
+
+    // Zero-sized ranges are skipped (their handles are not validated).
+    const CpuDescriptorHandle with_empty_dst[2] = {CpuDescriptorHandle{0}, cpu_at(gpu, 60)};
+    const uint32_t with_empty_sizes[2] = {0, 1};
+    CHECK(reg.copy_descriptors(2, with_empty_dst, with_empty_sizes, 1, srcs, nullptr, DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(gpu->view(60)->resource_id == 201);
+
+    // Count mismatch / validation is atomic: nothing written on failure.
+    const uint64_t gen = gpu->generation();
+    const uint32_t too_many[2] = {3, 3};
+    CHECK(reg.copy_descriptors(2, dsts, too_many, 2, srcs, src_sizes, DescriptorHeapType::CbvSrvUav) ==
+          Status::CountMismatch);
+    const CpuDescriptorHandle bad_srcs[2] = {cpu_at(a, 1), cpu_at(b, 62)};
+    CHECK(reg.copy_descriptors(2, dsts, dst_sizes, 2, bad_srcs, src_sizes, DescriptorHeapType::CbvSrvUav) ==
+          Status::HandleOutOfRange);
+    CHECK(gpu->generation() == gen);
+    CHECK(reg.copy_descriptors(1, nullptr, nullptr, 1, srcs, nullptr, DescriptorHeapType::CbvSrvUav) ==
+          Status::InvalidArgument);
+
+    // Overlapping multi-range copy: rotate a[0..4) left by one using the same heap.
+    // Result must equal "read all sources first, then write".
+    fill_srvs(reg, a, 0, 8, 200);
+    const CpuDescriptorHandle rot_dst[1] = {cpu_at(a, 0)};
+    const uint32_t rot_dst_size[1] = {4};
+    const CpuDescriptorHandle rot_src[2] = {cpu_at(a, 1), cpu_at(a, 0)};
+    const uint32_t rot_src_size[2] = {3, 1};
+    CHECK(reg.copy_descriptors(1, rot_dst, rot_dst_size, 2, rot_src, rot_src_size, DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(a->view(0)->resource_id == 201);
+    CHECK(a->view(1)->resource_id == 202);
+    CHECK(a->view(2)->resource_id == 203);
+    CHECK(a->view(3)->resource_id == 200);
+    CHECK(a->view(4)->resource_id == 204);
+
+    // Sampler multi-range.
+    DescriptorHeap* s0 = make_heap(reg, DescriptorHeapType::Sampler, 8, false);
+    DescriptorHeap* s1 = make_heap(reg, DescriptorHeapType::Sampler, 8, true);
+    for (uint32_t i = 0; i < 4; ++i) {
+        SamplerDesc sd;
+        sd.max_anisotropy = i + 1;
+        CHECK(reg.create_sampler(sd, cpu_at(s0, i)) == Status::Ok);
+    }
+    const CpuDescriptorHandle sdst[1] = {cpu_at(s1, 2)};
+    const uint32_t sdst_size[1] = {4};
+    const CpuDescriptorHandle ssrc[2] = {cpu_at(s0, 2), cpu_at(s0, 0)};
+    const uint32_t ssrc_size[2] = {2, 2};
+    CHECK(reg.copy_descriptors(1, sdst, sdst_size, 2, ssrc, ssrc_size, DescriptorHeapType::Sampler) == Status::Ok);
+    CHECK(s1->sampler(2)->desc.max_anisotropy == 3 && s1->sampler(3)->desc.max_anisotropy == 4);
+    CHECK(s1->sampler(4)->desc.max_anisotropy == 1 && s1->sampler(5)->desc.max_anisotropy == 2);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Generation / dirty tracking on a large heap
+// ---------------------------------------------------------------------------
+
+void test_generation_tracking() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 1u << 20, true);
+    CHECK(!heap->range_changed_since(0, heap->capacity(), 0));
+
+    const uint64_t g0 = heap->generation();
+    fill_srvs(reg, heap, 130, 1, 1);
+    CHECK(heap->generation() == g0 + 1);
+    CHECK(heap->range_changed_since(130, 1, g0));
+    CHECK(heap->range_changed_since(129, 2, g0));
+    CHECK(heap->range_changed_since(128, 64, g0));  // whole block
+    CHECK(heap->range_changed_since(0, 1u << 20, g0));
+    CHECK(!heap->range_changed_since(131, 10, g0));  // same block, after the slot
+    CHECK(!heap->range_changed_since(64, 66, g0));   // same block, before the slot
+    CHECK(!heap->range_changed_since(0, 128, g0));
+    CHECK(!heap->range_changed_since(130, 1, heap->generation()));
+    CHECK(!heap->range_changed_since(130, 0, g0));
+    CHECK(!heap->range_changed_since(1u << 20, 5, g0));
+    CHECK(heap->range_changed_since(100, 0xffffffffu, g0));  // count clamped to capacity
+
+    // Writes elsewhere do not invalidate an unrelated range.
+    const uint64_t g1 = heap->generation();
+    fill_srvs(reg, heap, 900000, 3, 7);
+    CHECK(heap->range_changed_since(899990, 20, g1));
+    CHECK(!heap->range_changed_since(0, 899999, g1));
+    CHECK(!heap->range_changed_since(900003, 1000, g1));
+
+    // Rewriting identical content is not a change.
+    const uint64_t g2 = heap->generation();
+    fill_srvs(reg, heap, 900000, 3, 7);
+    CHECK(heap->generation() == g2);
+    CHECK(!heap->range_changed_since(900000, 3, g2));
+
+    // Copies stamp destinations only.
+    CHECK(reg.copy_descriptors_simple(2, cpu_at(heap, 5000), cpu_at(heap, 900000), DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(heap->range_changed_since(5000, 2, g2));
+    CHECK(!heap->range_changed_since(900000, 3, g2));
+}
+
+// ---------------------------------------------------------------------------
+// 5. Root signatures
+// ---------------------------------------------------------------------------
+
+DescriptorRangeDesc range(DescriptorRangeType type, uint32_t count, uint32_t base, uint32_t space = 0,
+                          uint32_t offset = kDescriptorRangeOffsetAppend) {
+    DescriptorRangeDesc r;
+    r.range_type = type;
+    r.num_descriptors = count;
+    r.base_shader_register = base;
+    r.register_space = space;
+    r.offset_in_descriptors_from_table_start = offset;
+    return r;
+}
+
+RootParameterDesc table(std::vector<DescriptorRangeDesc> ranges, ShaderVisibility vis = ShaderVisibility::All) {
+    RootParameterDesc p;
+    p.parameter_type = RootParameterType::DescriptorTable;
+    p.shader_visibility = vis;
+    p.ranges = std::move(ranges);
+    return p;
+}
+
+RootParameterDesc root_view(RootParameterType type, uint32_t reg, uint32_t space = 0,
+                            ShaderVisibility vis = ShaderVisibility::All) {
+    RootParameterDesc p;
+    p.parameter_type = type;
+    p.shader_register = reg;
+    p.register_space = space;
+    p.shader_visibility = vis;
+    return p;
+}
+
+RootParameterDesc constants(uint32_t reg, uint32_t count, uint32_t space = 0) {
+    RootParameterDesc p;
+    p.parameter_type = RootParameterType::Constants32Bit;
+    p.shader_register = reg;
+    p.register_space = space;
+    p.num_32bit_values = count;
+    return p;
+}
+
+StaticSamplerDesc static_sampler(uint32_t reg, uint32_t border = 0) {
+    StaticSamplerDesc s;
+    s.shader_register = reg;
+    s.border_color = border;
+    s.address_u = 4;
+    return s;
+}
+
+// Representative signature used by several tests:
+//  p0: table { CBV b0-b1, SRV t0-t3 (append), UAV u0 @ offset 10 }
+//  p1: sampler table { s0-s1 } (pixel)
+//  p2: root constants b2 (4 dwords)
+//  p3: root CBV b3
+//  p4: root SRV t10 (pixel)
+//  p5: table { SRV t0.. unbounded, space 1 }
+//  static samplers s4 (opaque white border), s5
+RootSignatureDesc representative_desc() {
+    RootSignatureDesc d;
+    d.version = RootSignatureVersion::V1_1;
+    d.flags = RootSignatureFlags::AllowInputAssemblerInputLayout;
+    d.parameters.push_back(table({range(DescriptorRangeType::Cbv, 2, 0), range(DescriptorRangeType::Srv, 4, 0),
+                                  range(DescriptorRangeType::Uav, 1, 0, 0, 10)}));
+    d.parameters.push_back(table({range(DescriptorRangeType::Sampler, 2, 0)}, ShaderVisibility::Pixel));
+    d.parameters.push_back(constants(2, 4));
+    d.parameters.push_back(root_view(RootParameterType::Cbv, 3));
+    d.parameters.push_back(root_view(RootParameterType::Srv, 10, 0, ShaderVisibility::Pixel));
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, kUnboundedDescriptorCount, 0, 1)}));
+    d.static_samplers.push_back(static_sampler(4, 2));
+    d.static_samplers.push_back(static_sampler(5));
+    return d;
+}
+
+void test_root_signature_model() {
+    RootSignature rs;
+    const RootSignatureError err = RootSignature::build(representative_desc(), &rs);
+    CHECK(err.ok());
+    CHECK(rs.parameter_count() == 6);
+    CHECK(rs.cost_dwords() == 1 + 1 + 4 + 2 + 2 + 1);
+    CHECK(rs.total_constant_dwords() == 4);
+
+    const RootSignature::ParameterInfo& p0 = rs.parameter(0);
+    CHECK(p0.type == RootParameterType::DescriptorTable);
+    CHECK(p0.table_heap_type == DescriptorHeapType::CbvSrvUav);
+    CHECK(p0.table_extent == 11);  // UAV at offset 10
+    CHECK(!p0.table_unbounded);
+    CHECK(p0.first_slot == 0 && p0.slot_count == 3);
+    CHECK(rs.parameter(1).table_heap_type == DescriptorHeapType::Sampler);
+    CHECK(rs.parameter(1).table_extent == 2);
+    CHECK(rs.parameter(2).constants_offset == 0 && rs.parameter(2).num_32bit_values == 4);
+    CHECK(rs.parameter(5).table_unbounded && rs.parameter(5).table_extent == 0);
+
+    // Slot order: parameters in declaration order (one slot per range), then static samplers.
+    const BindingLayout& L = rs.layout();
+    CHECK(L.slots.size() == 3 + 1 + 1 + 1 + 1 + 1 + 2);
+    CHECK(L.slots[0].kind == DescriptorRangeType::Cbv && L.slots[0].table_offset == 0);
+    CHECK(L.slots[0].descriptor_count == 2 && L.slots[0].source == SlotSource::DescriptorTable);
+    CHECK(L.slots[1].kind == DescriptorRangeType::Srv && L.slots[1].table_offset == 2);  // OFFSET_APPEND
+    CHECK(L.slots[2].kind == DescriptorRangeType::Uav && L.slots[2].table_offset == 10);
+    CHECK(L.slots[2].range_index == 2 && L.slots[2].root_parameter_index == 0);
+    CHECK(L.slots[3].kind == DescriptorRangeType::Sampler && L.slots[3].visibility == ShaderVisibility::Pixel);
+    CHECK(L.slots[4].source == SlotSource::RootConstants && L.slots[4].kind == DescriptorRangeType::Cbv);
+    CHECK(L.slots[4].num_32bit_values == 4 && L.slots[4].base_register == 2);
+    CHECK(L.slots[5].source == SlotSource::RootDescriptor && L.slots[5].kind == DescriptorRangeType::Cbv);
+    CHECK(L.slots[6].source == SlotSource::RootDescriptor && L.slots[6].kind == DescriptorRangeType::Srv);
+    CHECK(L.slots[7].unbounded && L.slots[7].register_space == 1 && L.slots[7].table_offset == 0);
+    CHECK(L.slots[8].source == SlotSource::StaticSampler && L.slots[8].root_parameter_index == 0);
+    CHECK(L.slots[9].source == SlotSource::StaticSampler && L.slots[9].base_register == 5);
+    CHECK(L.has_unbounded_ranges);
+
+    // Register lookups (the S6 join key) -> slot + descriptor offset in the table.
+    uint32_t offset = 77;
+    const uint32_t vf = WebGpuStage::Vertex | WebGpuStage::Fragment;
+    CHECK(L.find(DescriptorRangeType::Srv, 0, 3, vf, &offset) == &L.slots[1] && offset == 5);
+    CHECK(L.find(DescriptorRangeType::Cbv, 0, 1, vf, &offset) == &L.slots[0] && offset == 1);
+    CHECK(L.find(DescriptorRangeType::Cbv, 0, 2, vf, &offset) == &L.slots[4] && offset == 0);
+    CHECK(L.find(DescriptorRangeType::Sampler, 0, 1, WebGpuStage::Fragment, &offset) == &L.slots[3] && offset == 1);
+    CHECK(L.find(DescriptorRangeType::Sampler, 0, 1, WebGpuStage::Vertex, &offset) == nullptr);  // pixel only
+    CHECK(L.find(DescriptorRangeType::Sampler, 0, 1, WebGpuStage::Compute, &offset) == &L.slots[3]);
+    CHECK(L.find(DescriptorRangeType::Sampler, 0, 5, vf, &offset) == &L.slots[9] && offset == 0);
+    CHECK(L.find(DescriptorRangeType::Srv, 1, 5000, vf, &offset) == &L.slots[7] && offset == 5000);  // unbounded
+    CHECK(L.find(DescriptorRangeType::Srv, 0, 4, vf, &offset) == nullptr);
+    CHECK(L.find(DescriptorRangeType::Uav, 0, 0, vf, &offset) == &L.slots[2] && offset == 10);
+    CHECK(L.find(DescriptorRangeType::Srv, 0, 10, WebGpuStage::Fragment, nullptr) == &L.slots[6]);
+    CHECK(L.find(DescriptorRangeType::Srv, 0, 10, WebGpuStage::Vertex, nullptr) == nullptr);
+
+    CHECK(webgpu_stage_mask(ShaderVisibility::All) == 7u);
+    CHECK(webgpu_stage_mask(ShaderVisibility::Pixel) == WebGpuStage::Fragment);
+    CHECK(webgpu_stage_mask(ShaderVisibility::Mesh) == WebGpuStage::Compute);
+    CHECK(webgpu_stage_mask(ShaderVisibility::Geometry) == 0u);
+
+    // Version 1.0 normalizes flags to "everything volatile".
+    RootSignatureDesc v10 = representative_desc();
+    v10.version = RootSignatureVersion::V1_0;
+    RootSignature rs10;
+    CHECK(RootSignature::build(v10, &rs10).ok());
+    CHECK(rs10.desc().parameters[0].ranges[0].flags ==
+          (DescriptorRangeFlags::DescriptorsVolatile | DescriptorRangeFlags::DataVolatile));
+    CHECK(rs10.desc().parameters[1].ranges[0].flags == DescriptorRangeFlags::DescriptorsVolatile);
+    CHECK(rs10.desc().parameters[3].flags == RootDescriptorFlags::DataVolatile);
+    CHECK(rs10.hash() != rs.hash());
+
+    // Empty signature.
+    RootSignature empty;
+    CHECK(RootSignature::build(RootSignatureDesc{}, &empty).ok());
+    CHECK(empty.parameter_count() == 0 && empty.layout().slots.empty());
+}
+
+void expect_build_error(const RootSignatureDesc& d, Status status, uint32_t param, uint32_t range_index, int line) {
+    RootSignature rs;
+    const RootSignatureError err = RootSignature::build(d, &rs);
+    check_impl(err.status == status, status_name(status), line);
+    check_impl(err.parameter_index == param, "parameter_index", line);
+    check_impl(err.range_index == range_index, "range_index", line);
+}
+
+void test_root_signature_validation() {
+    RootSignatureDesc d;
+    d.parameters.push_back(table({}));
+    expect_build_error(d, Status::EmptyDescriptorTable, 0, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, 0, 0)}));
+    expect_build_error(d, Status::ZeroDescriptorRange, 0, 0, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(constants(0, 1));
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, 1, 0), range(DescriptorRangeType::Sampler, 1, 0)}));
+    expect_build_error(d, Status::MixedSamplerTable, 1, 1, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, kUnboundedDescriptorCount, 0),
+                                  range(DescriptorRangeType::Srv, 1, 0, 1)}));
+    expect_build_error(d, Status::AppendAfterUnboundedRange, 0, 1, __LINE__);
+    // ...but an explicit offset after an unbounded range is fine.
+    d.parameters[0].ranges[1].offset_in_descriptors_from_table_start = 0;
+    expect_build_error(d, Status::Ok, kNoIndex, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(static_cast<DescriptorRangeType>(9), 1, 0)}));
+    expect_build_error(d, Status::InvalidRangeType, 0, 0, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, 4, 0, 0, 0xfffffffe)}));
+    expect_build_error(d, Status::DescriptorOffsetOverflow, 0, 0, __LINE__);
+
+    // Register overlap with overlapping visibility.
+    d = RootSignatureDesc{};
+    d.parameters.push_back(root_view(RootParameterType::Cbv, 0));
+    d.parameters.push_back(table({range(DescriptorRangeType::Cbv, 4, 0)}, ShaderVisibility::Pixel));
+    expect_build_error(d, Status::RegisterOverlap, 1, 0, __LINE__);
+    // Disjoint visibility is allowed.
+    d.parameters[0].shader_visibility = ShaderVisibility::Vertex;
+    expect_build_error(d, Status::Ok, kNoIndex, kNoIndex, __LINE__);
+    // Different register class or space is allowed.
+    d = RootSignatureDesc{};
+    d.parameters.push_back(root_view(RootParameterType::Cbv, 0));
+    d.parameters.push_back(root_view(RootParameterType::Srv, 0));
+    d.parameters.push_back(root_view(RootParameterType::Cbv, 0, 1));
+    expect_build_error(d, Status::Ok, kNoIndex, kNoIndex, __LINE__);
+    // Unbounded range overlaps everything above its base.
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, kUnboundedDescriptorCount, 10)}));
+    d.parameters.push_back(root_view(RootParameterType::Srv, 1000));
+    expect_build_error(d, Status::RegisterOverlap, 1, kNoIndex, __LINE__);
+    // Static sampler overlapping a sampler table.
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(DescriptorRangeType::Sampler, 2, 0)}));
+    d.static_samplers.push_back(static_sampler(1));
+    expect_build_error(d, Status::RegisterOverlap, kNoIndex, 0, __LINE__);
+
+    // Size limit: 64 DWORDs.
+    d = RootSignatureDesc{};
+    d.parameters.push_back(constants(0, 63));
+    d.parameters.push_back(root_view(RootParameterType::Cbv, 1));
+    expect_build_error(d, Status::RootSignatureTooLarge, 1, kNoIndex, __LINE__);
+    d.parameters.pop_back();
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, 1, 0)}));
+    expect_build_error(d, Status::Ok, kNoIndex, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(constants(0, 0));
+    expect_build_error(d, Status::InvalidArgument, 0, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(root_view(static_cast<RootParameterType>(7), 0));
+    expect_build_error(d, Status::InvalidParameterType, 0, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.parameters.push_back(root_view(RootParameterType::Cbv, 0, 0, static_cast<ShaderVisibility>(8)));
+    expect_build_error(d, Status::InvalidShaderVisibility, 0, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.version = static_cast<RootSignatureVersion>(4);
+    expect_build_error(d, Status::UnsupportedVersion, kNoIndex, kNoIndex, __LINE__);
+
+    d = RootSignatureDesc{};
+    d.static_samplers.resize(kMaxStaticSamplers + 1);
+    expect_build_error(d, Status::TooManyStaticSamplers, kNoIndex, kNoIndex, __LINE__);
+
+    // Large tables are fine (WebGPU limits are checked per bind group layout, by S6).
+    d = RootSignatureDesc{};
+    d.parameters.push_back(table({range(DescriptorRangeType::Srv, 2000, 0)}));
+    RootSignature big;
+    CHECK(RootSignature::build(d, &big).ok());
+    CHECK(big.parameter(0).table_extent == 2000);
+    CHECK(RootSignature::build(d, nullptr).status == Status::InvalidArgument);
+}
+
+void test_root_signature_hash() {
+    RootSignature a;
+    RootSignature b;
+    CHECK(RootSignature::build(representative_desc(), &a).ok());
+    CHECK(RootSignature::build(representative_desc(), &b).ok());
+    CHECK(a.hash() == b.hash());
+    CHECK(a.hash() != 0);
+
+    // OFFSET_APPEND and the equivalent explicit offsets hash identically.
+    RootSignatureDesc explicit_offsets = representative_desc();
+    explicit_offsets.parameters[0].ranges[0].offset_in_descriptors_from_table_start = 0;
+    explicit_offsets.parameters[0].ranges[1].offset_in_descriptors_from_table_start = 2;
+    RootSignature c;
+    CHECK(RootSignature::build(explicit_offsets, &c).ok());
+    CHECK(c.hash() == a.hash());
+
+    // Any semantic change changes the hash.
+    RootSignatureDesc changed = representative_desc();
+    changed.parameters[3].shader_register = 4;
+    RootSignature e;
+    CHECK(RootSignature::build(changed, &e).ok());
+    CHECK(e.hash() != a.hash());
+    changed = representative_desc();
+    changed.static_samplers[1].max_lod = 4.0f;
+    CHECK(RootSignature::build(changed, &e).ok());
+    CHECK(e.hash() != a.hash());
+    changed = representative_desc();
+    changed.parameters[1].shader_visibility = ShaderVisibility::All;
+    CHECK(RootSignature::build(changed, &e).ok());
+    CHECK(e.hash() != a.hash());
+
+    // Golden value: the hash is a persistent cache key, it must not drift
+    // across compilers, platforms or refactors.
+    RootSignatureDesc tiny;
+    tiny.parameters.push_back(root_view(RootParameterType::Cbv, 0));
+    RootSignature t;
+    CHECK(RootSignature::build(tiny, &t).ok());
+    if (t.hash() != 0xb6ef5345f09444c3ull) {
+        std::fprintf(stderr, "golden root signature hash = 0x%016llx\n", static_cast<unsigned long long>(t.hash()));
+    }
+    CHECK(t.hash() == 0xb6ef5345f09444c3ull);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Root signature blob parsing
+// ---------------------------------------------------------------------------
+
+void put_u32(std::vector<uint8_t>& v, uint32_t x) {
+    for (int i = 0; i < 4; ++i) {
+        v.push_back(static_cast<uint8_t>(x >> (8 * i)));
+    }
+}
+
+std::vector<uint8_t> wrap_dxbc(const std::vector<uint8_t>& rts0, bool include_other_part) {
+    std::vector<uint8_t> out;
+    put_u32(out, 0x43425844u);  // "DXBC"
+    for (int i = 0; i < 4; ++i) {
+        put_u32(out, 0);  // digest
+    }
+    put_u32(out, 1);  // u16 major = 1, u16 minor = 0
+    const uint32_t part_count = include_other_part ? 2 : 1;
+    const size_t total_at = out.size();
+    put_u32(out, 0);
+    put_u32(out, part_count);
+    const size_t offsets_at = out.size();
+    for (uint32_t i = 0; i < part_count; ++i) {
+        put_u32(out, 0);
+    }
+    auto patch = [&](size_t at, uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out[at + i] = static_cast<uint8_t>(v >> (8 * i));
+        }
+    };
+    uint32_t idx = 0;
+    if (include_other_part) {
+        patch(offsets_at, static_cast<uint32_t>(out.size()));
+        put_u32(out, 0x4e475349u);  // "ISGN"
+        put_u32(out, 8);
+        put_u32(out, 0);
+        put_u32(out, 8);
+        idx = 1;
+    }
+    patch(offsets_at + 4 * idx, static_cast<uint32_t>(out.size()));
+    put_u32(out, 0x30535452u);  // "RTS0"
+    put_u32(out, static_cast<uint32_t>(rts0.size()));
+    out.insert(out.end(), rts0.begin(), rts0.end());
+    patch(total_at, static_cast<uint32_t>(out.size()));
+    return out;
+}
+
+void test_root_signature_blob_roundtrip() {
+    for (RootSignatureVersion version :
+         {RootSignatureVersion::V1_0, RootSignatureVersion::V1_1, RootSignatureVersion::V1_2}) {
+        RootSignatureDesc d = representative_desc();
+        d.version = version;
+        d.parameters[3].flags = RootDescriptorFlags::DataStatic;
+        d.static_samplers[0].flags = 0x1;  // only kept for 1.2
+        RootSignature direct;
+        CHECK(RootSignature::build(d, &direct).ok());
+
+        const std::vector<uint8_t> blob = serialize_root_signature(d);
+        const uint32_t sampler_bytes = version == RootSignatureVersion::V1_2 ? 56u : 52u;
+        CHECK(blob.size() > 24 + 6 * 12 + 2 * sampler_bytes);
+        RootSignatureDesc parsed;
+        CHECK(parse_root_signature_blob(blob.data(), blob.size(), &parsed).ok());
+        CHECK(parsed.version == version);
+        CHECK(parsed.parameters.size() == 6 && parsed.static_samplers.size() == 2);
+        CHECK(parsed.flags == RootSignatureFlags::AllowInputAssemblerInputLayout);
+        CHECK(parsed.parameters[0].ranges.size() == 3);
+        CHECK(parsed.parameters[0].ranges[2].offset_in_descriptors_from_table_start == 10);
+        CHECK(parsed.parameters[5].ranges[0].num_descriptors == kUnboundedDescriptorCount);
+        CHECK(parsed.parameters[2].num_32bit_values == 4);
+        CHECK(parsed.static_samplers[0].border_color == 2 && parsed.static_samplers[0].address_u == 4);
+        CHECK(parsed.static_samplers[0].flags == (version == RootSignatureVersion::V1_2 ? 0x1u : 0u));
+        CHECK(parsed.parameters[3].flags == (version == RootSignatureVersion::V1_0 ? 0u : RootDescriptorFlags::DataStatic));
+        RootSignature from_blob;
+        CHECK(RootSignature::build(parsed, &from_blob).ok());
+        CHECK(from_blob.hash() == direct.hash());
+
+        // Same blob inside a DXBC container (as passed to CreateRootSignature).
+        RootSignatureDesc from_container;
+        const std::vector<uint8_t> dxbc = wrap_dxbc(blob, true);
+        CHECK(parse_root_signature_blob(dxbc.data(), dxbc.size(), &from_container).ok());
+        RootSignature rs_container;
+        CHECK(RootSignature::build(from_container, &rs_container).ok());
+        CHECK(rs_container.hash() == direct.hash());
+    }
+}
+
+void test_root_signature_blob_known_layout() {
+    // Hand-assembled version 1.0 blob following the public RTS0 layout:
+    // header {version, numParams, paramsOffset, numStaticSamplers, samplersOffset, flags}
+    // param {type, visibility, payloadOffset}; table {numRanges, rangesOffset};
+    // 1.0 range {type, count, baseRegister, space, offset}; root constants {reg, space, count}.
+    std::vector<uint8_t> b;
+    put_u32(b, 1);     // version 1.0
+    put_u32(b, 2);     // two parameters
+    put_u32(b, 24);    // parameters at 24
+    put_u32(b, 0);     // no static samplers
+    put_u32(b, 88);    // (empty) static sampler array at the end
+    put_u32(b, 0x1);   // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+    put_u32(b, 0);     // p0: descriptor table
+    put_u32(b, 5);     // pixel
+    put_u32(b, 48);    // payload
+    put_u32(b, 1);     // p1: 32-bit constants
+    put_u32(b, 0);     // all
+    put_u32(b, 76);    // payload
+    put_u32(b, 1);     // @48: one range
+    put_u32(b, 56);    // ranges at 56
+    put_u32(b, 0);     // @56: SRV
+    put_u32(b, 3);     // three descriptors
+    put_u32(b, 4);     // t4
+    put_u32(b, 2);     // space2
+    put_u32(b, 0xffffffffu);  // append
+    put_u32(b, 7);     // @76: b7
+    put_u32(b, 0);
+    put_u32(b, 2);     // two dwords
+    CHECK(b.size() == 88);
+    RootSignatureDesc d;
+    CHECK(parse_root_signature_blob(b.data(), b.size(), &d).ok());
+    CHECK(d.version == RootSignatureVersion::V1_0 && d.flags == 1);
+    CHECK(d.parameters.size() == 2);
+    CHECK(d.parameters[0].shader_visibility == ShaderVisibility::Pixel);
+    CHECK(d.parameters[0].ranges.size() == 1);
+    CHECK(d.parameters[0].ranges[0].range_type == DescriptorRangeType::Srv);
+    CHECK(d.parameters[0].ranges[0].num_descriptors == 3);
+    CHECK(d.parameters[0].ranges[0].base_shader_register == 4);
+    CHECK(d.parameters[0].ranges[0].register_space == 2);
+    CHECK(d.parameters[1].parameter_type == RootParameterType::Constants32Bit);
+    CHECK(d.parameters[1].shader_register == 7 && d.parameters[1].num_32bit_values == 2);
+    RootSignature rs;
+    CHECK(RootSignature::build(d, &rs).ok());
+    CHECK(rs.cost_dwords() == 3);
+    // The serializer reproduces exactly this layout.
+    CHECK(serialize_root_signature(d) == b);
+}
+
+void test_root_signature_blob_malformed() {
+    RootSignatureDesc out;
+    const std::vector<uint8_t> good = serialize_root_signature(representative_desc());
+
+    CHECK(parse_root_signature_blob(nullptr, 0, &out).status == Status::BlobTruncated);
+    CHECK(parse_root_signature_blob(nullptr, 10, &out).status == Status::InvalidArgument);
+    CHECK(parse_root_signature_blob(good.data(), good.size(), nullptr).status == Status::InvalidArgument);
+    CHECK(parse_root_signature_blob(good.data(), 3, &out).status == Status::BlobTruncated);
+    CHECK(parse_root_signature_blob(good.data(), 20, &out).status == Status::BlobTruncated);
+
+    std::vector<uint8_t> bad = good;
+    bad[0] = 9;  // version 9 / not DXBC
+    CHECK(parse_root_signature_blob(bad.data(), bad.size(), &out).status == Status::BlobBadMagic);
+
+    bad = good;
+    bad[10] = 0xf0;  // parameters offset far out of bounds
+    RootSignatureError e = parse_root_signature_blob(bad.data(), bad.size(), &out);
+    CHECK(e.status == Status::BlobOffsetOutOfBounds && e.byte_offset == 8);
+
+    bad = good;
+    bad[4] = 0xff;  // 255 parameters: array would run past the end
+    bad[5] = 0xff;
+    CHECK(parse_root_signature_blob(bad.data(), bad.size(), &out).status == Status::BlobOffsetOutOfBounds);
+
+    bad = good;
+    bad[24] = 9;  // parameter 0 type
+    e = parse_root_signature_blob(bad.data(), bad.size(), &out);
+    CHECK(e.status == Status::InvalidParameterType && e.parameter_index == 0 && e.byte_offset == 24);
+
+    bad = good;
+    bad[24 + 8] = 0xf0;  // parameter 0 payload offset
+    bad[24 + 9] = 0xff;
+    e = parse_root_signature_blob(bad.data(), bad.size(), &out);
+    CHECK(e.status == Status::BlobOffsetOutOfBounds && e.parameter_index == 0);
+
+    bad = good;
+    bad[12] = 0xff;  // static sampler count
+    CHECK(parse_root_signature_blob(bad.data(), bad.size(), &out).status == Status::BlobOffsetOutOfBounds);
+
+    // Every strict prefix fails (all bytes are referenced) and never crashes.
+    for (size_t n = 0; n < good.size(); ++n) {
+        CHECK(!parse_root_signature_blob(good.data(), n, &out).ok());
+    }
+
+    // DXBC containers.
+    std::vector<uint8_t> dxbc_no_rts0 = wrap_dxbc(good, true);
+    dxbc_no_rts0[dxbc_no_rts0.size() - good.size() - 8] = 'X';  // rename RTS0 part
+    CHECK(parse_root_signature_blob(dxbc_no_rts0.data(), dxbc_no_rts0.size(), &out).status ==
+          Status::BlobMissingRootSignaturePart);
+    std::vector<uint8_t> dxbc = wrap_dxbc(good, false);
+    dxbc[32] = 0xff;  // part offset out of bounds
+    dxbc[33] = 0xff;
+    CHECK(parse_root_signature_blob(dxbc.data(), dxbc.size(), &out).status == Status::BlobOffsetOutOfBounds);
+    dxbc = wrap_dxbc(good, false);
+    CHECK(parse_root_signature_blob(dxbc.data(), dxbc.size() - 1, &out).status == Status::BlobOffsetOutOfBounds);
+    dxbc = wrap_dxbc(good, false);
+    dxbc[28] = 0xff;  // part count
+    CHECK(parse_root_signature_blob(dxbc.data(), dxbc.size(), &out).status == Status::BlobOffsetOutOfBounds);
+    CHECK(parse_root_signature_blob(dxbc.data(), 30, &out).status == Status::BlobTruncated);
+
+    // Deterministic byte-flip fuzzing: must never crash; parsed results must
+    // still go through RootSignature::build validation without crashing.
+    uint32_t seed = 0x12345678u;
+    for (int iter = 0; iter < 4000; ++iter) {
+        std::vector<uint8_t> f = (iter & 1) ? good : wrap_dxbc(good, true);
+        for (int k = 0; k < 3; ++k) {
+            seed = seed * 1664525u + 1013904223u;
+            f[(seed >> 8) % f.size()] = static_cast<uint8_t>(seed >> 24);
+        }
+        RootSignatureDesc fd;
+        if (parse_root_signature_blob(f.data(), f.size(), &fd).ok()) {
+            RootSignature rs;
+            (void)RootSignature::build(fd, &rs);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Root argument state
+// ---------------------------------------------------------------------------
+
+void test_root_arguments() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* cbv = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, true);
+    DescriptorHeap* cbv2 = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, true);
+    DescriptorHeap* smp = make_heap(reg, DescriptorHeapType::Sampler, 16, true);
+    DescriptorHeap* cpu_only = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, false);
+    DescriptorHeap* rtv = make_heap(reg, DescriptorHeapType::Rtv, 4, false);
+    RootSignature rs;
+    CHECK(RootSignature::build(representative_desc(), &rs).ok());
+    RootSignature other;
+    RootSignatureDesc od;
+    od.parameters.push_back(root_view(RootParameterType::Uav, 0));
+    CHECK(RootSignature::build(od, &other).ok());
+
+    RootArgumentState st;
+    const BindPoint G = BindPoint::Graphics;
+    const BindPoint C = BindPoint::Compute;
+
+    // SetDescriptorHeaps validation.
+    DescriptorHeap* heaps[2] = {cbv, smp};
+    DescriptorHeap* two_cbv[2] = {cbv, cbv2};
+    DescriptorHeap* non_sv[1] = {cpu_only};
+    DescriptorHeap* rtv_list[1] = {rtv};
+    CHECK(st.set_descriptor_heaps(2, two_cbv) == Status::InvalidArgument);
+    CHECK(st.set_descriptor_heaps(1, non_sv) == Status::HeapNotShaderVisible);
+    CHECK(st.set_descriptor_heaps(1, rtv_list) == Status::WrongHeapType);
+    CHECK(st.set_descriptor_heaps(3, heaps) == Status::InvalidArgument);
+    CHECK(st.set_descriptor_heaps(2, heaps) == Status::Ok);
+    CHECK(st.bound_heap(DescriptorHeapType::CbvSrvUav) == cbv);
+    CHECK(st.bound_heap(DescriptorHeapType::Sampler) == smp);
+
+    // Arguments before a root signature.
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 0)) == Status::RootSignatureNotSet);
+    CHECK(st.set_root_signature(G, nullptr) == Status::InvalidArgument);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    CHECK(st.root_signature(G) == &rs);
+    CHECK(st.root_signature(C) == nullptr);
+    CHECK(st.dirty_parameters(G) == 0x3f);
+    CHECK(st.unset_parameters(G) == 0x3f);
+    st.clear_dirty(G);
+    CHECK(st.dirty_parameters(G) == 0);
+
+    // Descriptor tables.
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 8)) == Status::Ok);
+    CHECK(st.argument(G, 0).heap == cbv && st.argument(G, 0).base_index == 8 && st.argument(G, 0).is_set);
+    CHECK(st.dirty_parameters(G) == 0x1);
+    st.clear_dirty(G);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 8)) == Status::Ok);  // same value: not dirty
+    CHECK(st.dirty_parameters(G) == 0);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 53)) == Status::Ok);  // 53 + 11 == 64 fits
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 54)) == Status::HandleOutOfRange);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 64)) == Status::HandleOutOfRange);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv2, 0)) == Status::HeapNotBound);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(smp, 0)) == Status::WrongHeapType);
+    CHECK(st.set_descriptor_table(G, 1, gpu_at(cbv, 0)) == Status::WrongHeapType);
+    CHECK(st.set_descriptor_table(G, 0, GpuDescriptorHandle{cbv->cpu_start().ptr}) == Status::InvalidHandle);
+    CHECK(st.set_descriptor_table(G, 0, GpuDescriptorHandle{cbv->gpu_start().ptr + 8}) == Status::MisalignedHandle);
+    CHECK(st.set_descriptor_table(G, 0, GpuDescriptorHandle{0}) == Status::InvalidHandle);
+    CHECK(st.set_descriptor_table(G, 2, gpu_at(cbv, 0)) == Status::RootParameterTypeMismatch);
+    CHECK(st.set_descriptor_table(G, 6, gpu_at(cbv, 0)) == Status::InvalidRootParameterIndex);
+    CHECK(st.set_descriptor_table(G, 1, gpu_at(smp, 14)) == Status::Ok);
+    CHECK(st.set_descriptor_table(G, 1, gpu_at(smp, 15)) == Status::HandleOutOfRange);
+    // Unbounded table: only the base must be in range.
+    CHECK(st.set_descriptor_table(G, 5, gpu_at(cbv, 63)) == Status::Ok);
+
+    // Root views.
+    st.clear_dirty(G);
+    CHECK(st.set_root_view(G, 3, RootParameterType::Cbv, 0x10000) == Status::Ok);
+    CHECK(st.argument(G, 3).gpu_address == 0x10000);
+    CHECK(st.dirty_parameters(G) == (1ull << 3));
+    CHECK(st.set_root_view(G, 3, RootParameterType::Srv, 0x10000) == Status::RootParameterTypeMismatch);
+    CHECK(st.set_root_view(G, 0, RootParameterType::Cbv, 0x10000) == Status::RootParameterTypeMismatch);
+    CHECK(st.set_root_view(G, 3, RootParameterType::DescriptorTable, 0) == Status::InvalidArgument);
+    CHECK(st.set_root_view(G, 4, RootParameterType::Srv, 0x100000) == Status::Ok);
+
+    // Root constants.
+    st.clear_dirty(G);
+    const uint32_t vals[4] = {1, 2, 3, 4};
+    CHECK(st.set_root_constants(G, 2, 4, vals, 0) == Status::Ok);
+    CHECK(st.dirty_parameters(G) == (1ull << 2));
+    std::span<const uint32_t> c = st.root_constants(G, 2);
+    CHECK(c.size() == 4 && c[0] == 1 && c[3] == 4);
+    st.clear_dirty(G);
+    CHECK(st.set_root_constant(G, 2, 3, 2) == Status::Ok);  // unchanged value
+    CHECK(st.dirty_parameters(G) == 0);
+    CHECK(st.set_root_constant(G, 2, 9, 3) == Status::Ok);
+    CHECK(st.dirty_parameters(G) == (1ull << 2));
+    CHECK(st.root_constants(G, 2)[3] == 9);
+    CHECK(st.set_root_constants(G, 2, 2, vals, 3) == Status::ConstantsOutOfRange);
+    CHECK(st.set_root_constants(G, 2, 1, nullptr, 0) == Status::InvalidArgument);
+    CHECK(st.set_root_constant(G, 3, 1, 0) == Status::RootParameterTypeMismatch);
+    CHECK(st.root_constants(G, 3).empty());
+    CHECK(st.unset_parameters(G) == 0);
+
+    // Compute bind point is independent.
+    CHECK(st.set_root_signature(C, &other) == Status::Ok);
+    CHECK(st.unset_parameters(C) == 0x1);
+    CHECK(st.set_root_view(C, 0, RootParameterType::Uav, 0x100000) == Status::Ok);
+    CHECK(st.unset_parameters(C) == 0);
+    CHECK(st.unset_parameters(G) == 0);
+
+    // Re-setting the same signature keeps arguments; a different one clears them.
+    st.clear_dirty(G);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    CHECK(st.dirty_parameters(G) == 0 && st.argument(G, 3).is_set);
+    CHECK(st.set_root_signature(G, &other) == Status::Ok);
+    CHECK(st.dirty_parameters(G) == 0x1 && st.unset_parameters(G) == 0x1);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    CHECK(!st.argument(G, 3).is_set && st.unset_parameters(G) == 0x3f);
+
+    // Changing a descriptor heap clears tables that pointed into the old one.
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 0)) == Status::Ok);
+    CHECK(st.set_descriptor_table(G, 1, gpu_at(smp, 0)) == Status::Ok);
+    CHECK(st.set_root_view(G, 3, RootParameterType::Cbv, 0x10000) == Status::Ok);
+    st.clear_dirty(G);
+    DescriptorHeap* swap[2] = {smp, cbv2};
+    CHECK(st.set_descriptor_heaps(2, swap) == Status::Ok);
+    CHECK(!st.argument(G, 0).is_set);
+    CHECK(st.argument(G, 1).is_set);  // sampler heap unchanged
+    CHECK(st.argument(G, 3).is_set);
+    CHECK(st.dirty_parameters(G) == 0x1);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv, 0)) == Status::HeapNotBound);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(cbv2, 0)) == Status::Ok);
+
+    st.reset();
+    CHECK(st.root_signature(G) == nullptr && st.bound_heap(DescriptorHeapType::CbvSrvUav) == nullptr);
+    CHECK(!st.argument(G, 0).is_set);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Bind group compilation & caching
+// ---------------------------------------------------------------------------
+
+ShaderBinding sb(uint32_t binding, DescriptorRangeType cls, uint32_t reg, uint32_t space = 0) {
+    ShaderBinding b;
+    b.binding = binding;
+    b.register_class = cls;
+    b.shader_register = reg;
+    b.register_space = space;
+    return b;
+}
+
+void test_bind_group_plan() {
+    RootSignature rs;
+    CHECK(RootSignature::build(representative_desc(), &rs).ok());
+    const uint32_t vf = WebGpuStage::Vertex | WebGpuStage::Fragment;
+
+    // Shader-owned binding numbers in arbitrary order, as S6 reflects them.
+    const ShaderBinding group0[] = {
+        sb(7, DescriptorRangeType::Uav, 0),      // table p0, offset 10
+        sb(0, DescriptorRangeType::Cbv, 0),      // table p0, offset 0
+        sb(3, DescriptorRangeType::Srv, 2),      // table p0, offset 4
+        sb(9, DescriptorRangeType::Srv, 42, 1),  // unbounded table p5, offset 42
+        sb(12, DescriptorRangeType::Srv, 9),     // no slot -> unresolved
+    };
+    const BindGroupPlan plan = BindGroupPlan::build(rs, group0, vf);
+    CHECK(plan.signature_hash() == rs.hash());
+    CHECK(plan.entries().size() == 5);
+    CHECK(plan.unresolved_count() == 1);
+    CHECK(plan.parameter_mask() == ((1ull << 0) | (1ull << 5)));
+    const std::vector<PlanEntry>& e = plan.entries();
+    CHECK(e[0].binding == 0 && e[0].source == PlanSource::DescriptorTable && e[0].table_offset == 0);
+    CHECK(e[1].binding == 3 && e[1].table_offset == 4 && e[1].root_parameter_index == 0);
+    CHECK(e[2].binding == 7 && e[2].table_offset == 10 && e[2].register_class == DescriptorRangeType::Uav);
+    CHECK(e[3].binding == 9 && e[3].root_parameter_index == 5 && e[3].table_offset == 42);
+    CHECK(e[4].binding == 12 && e[4].source == PlanSource::Unresolved);
+    CHECK(plan.table_windows().size() == 2);
+    CHECK(plan.table_windows()[0].parameter_index == 0 && plan.table_windows()[0].first_offset == 0);
+    CHECK(plan.table_windows()[0].count == 11);
+    CHECK(plan.table_windows()[1].parameter_index == 5 && plan.table_windows()[1].first_offset == 42);
+    CHECK(plan.table_windows()[1].count == 1);
+
+    // Same join -> same hash; different bindings -> different hash.
+    CHECK(BindGroupPlan::build(rs, group0, vf).hash() == plan.hash());
+    const ShaderBinding other[] = {sb(1, DescriptorRangeType::Cbv, 0)};
+    CHECK(BindGroupPlan::build(rs, other, vf).hash() != plan.hash());
+
+    // Root constants (S6 root_constants: true), root views, static samplers, visibility.
+    ShaderBinding pc;
+    pc.binding = 4;
+    pc.root_constants = true;
+    const ShaderBinding group1[] = {pc, sb(0, DescriptorRangeType::Cbv, 3), sb(1, DescriptorRangeType::Srv, 10),
+                                    sb(2, DescriptorRangeType::Sampler, 4), sb(3, DescriptorRangeType::Sampler, 1)};
+    const BindGroupPlan frag = BindGroupPlan::build(rs, group1, WebGpuStage::Fragment);
+    CHECK(frag.unresolved_count() == 0);
+    CHECK(frag.entries()[0].source == PlanSource::RootDescriptor && frag.entries()[0].root_parameter_index == 3);
+    CHECK(frag.entries()[1].source == PlanSource::RootDescriptor && frag.entries()[1].root_parameter_index == 4);
+    CHECK(frag.entries()[2].source == PlanSource::StaticSampler && frag.entries()[2].root_parameter_index == 0);
+    CHECK(frag.entries()[3].source == PlanSource::DescriptorTable && frag.entries()[3].root_parameter_index == 1);
+    CHECK(frag.entries()[4].source == PlanSource::RootConstants && frag.entries()[4].root_parameter_index == 2);
+    CHECK(frag.parameter_mask() == ((1ull << 1) | (1ull << 2) | (1ull << 3) | (1ull << 4)));
+    // Vertex stage cannot see the pixel-only root SRV and sampler table.
+    const BindGroupPlan vert = BindGroupPlan::build(rs, group1, WebGpuStage::Vertex);
+    CHECK(vert.unresolved_count() == 2);
+    // Compute ignores visibility.
+    CHECK(BindGroupPlan::build(rs, group1, WebGpuStage::Compute).unresolved_count() == 0);
+
+    // Root constants by register (b2) resolve to the same parameter.
+    const ShaderBinding by_reg[] = {sb(0, DescriptorRangeType::Cbv, 2)};
+    const BindGroupPlan rc = BindGroupPlan::build(rs, by_reg, vf);
+    CHECK(rc.entries()[0].source == PlanSource::RootConstants && rc.entries()[0].root_parameter_index == 2);
+
+    // Empty layout.
+    const BindGroupPlan empty = BindGroupPlan::build(rs, std::span<const ShaderBinding>{}, vf);
+    CHECK(empty.entries().empty() && empty.parameter_mask() == 0);
+}
+
+void test_bind_group_cache() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 256, true);
+    DescriptorHeap* smp = make_heap(reg, DescriptorHeapType::Sampler, 16, true);
+    RootSignature rs;
+    CHECK(RootSignature::build(representative_desc(), &rs).ok());
+    const uint32_t vf = WebGpuStage::Vertex | WebGpuStage::Fragment;
+
+    // Table p0 at index 100: CBV b0,b1 (100,101), SRV t0-t3 (102..105), UAV u0 (110).
+    ConstantBufferViewDesc cb{0x10200, 256};
+    CHECK(reg.create_constant_buffer_view(&cb, cpu_at(heap, 100)) == Status::Ok);
+    ConstantBufferViewDesc cb_unknown{0x900000, 256};
+    CHECK(reg.create_constant_buffer_view(&cb_unknown, cpu_at(heap, 101)) == Status::Ok);
+    fill_srvs(reg, heap, 102, 3, 500);  // 105 stays empty
+    ViewDesc uav;
+    uav.dimension = ViewDimension::Buffer;
+    uav.first_element = 4;
+    uav.num_elements = 10;
+    uav.structure_byte_stride = 16;
+    CHECK(reg.create_unordered_access_view(600, 0, &uav, cpu_at(heap, 110)) == Status::Ok);
+    SamplerDesc sd;
+    sd.max_anisotropy = 16;
+    CHECK(reg.create_sampler(sd, cpu_at(smp, 3)) == Status::Ok);
+    CHECK(reg.create_sampler(sd, cpu_at(smp, 4)) == Status::Ok);
+    // Bindless table p5 at index 200 (space1, unbounded): t7 -> 207.
+    fill_srvs(reg, heap, 207, 1, 800);
+
+    // S6-style layouts: group 0 = table resources, group 1 = samplers, group 2 = root data.
+    const ShaderBinding g0_bindings[] = {
+        sb(0, DescriptorRangeType::Cbv, 0), sb(1, DescriptorRangeType::Cbv, 1),
+        sb(2, DescriptorRangeType::Srv, 0), sb(3, DescriptorRangeType::Srv, 1),
+        sb(4, DescriptorRangeType::Srv, 2), sb(5, DescriptorRangeType::Srv, 3),
+        sb(6, DescriptorRangeType::Uav, 0), sb(7, DescriptorRangeType::Srv, 7, 1),
+    };
+    const ShaderBinding g1_bindings[] = {
+        sb(0, DescriptorRangeType::Sampler, 0), sb(1, DescriptorRangeType::Sampler, 1),
+        sb(2, DescriptorRangeType::Sampler, 4), sb(3, DescriptorRangeType::Sampler, 5),
+    };
+    ShaderBinding pc;
+    pc.binding = 0;
+    pc.root_constants = true;
+    const ShaderBinding g2_bindings[] = {pc, sb(1, DescriptorRangeType::Cbv, 3), sb(2, DescriptorRangeType::Srv, 10)};
+    const BindGroupPlan plan0 = BindGroupPlan::build(rs, g0_bindings, vf);
+    const BindGroupPlan plan1 = BindGroupPlan::build(rs, g1_bindings, WebGpuStage::Fragment);
+    const BindGroupPlan plan2 = BindGroupPlan::build(rs, g2_bindings, WebGpuStage::Fragment);
+    CHECK(plan0.unresolved_count() == 0 && plan1.unresolved_count() == 0 && plan2.unresolved_count() == 0);
+
+    RootArgumentState st;
+    BindGroupCache cache;
+    const BindPoint G = BindPoint::Graphics;
+    int resolver_calls = 0;
+
+    CHECK(cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls).status == Status::RootSignatureNotSet);
+    DescriptorHeap* heaps[2] = {heap, smp};
+    CHECK(st.set_descriptor_heaps(2, heaps) == Status::Ok);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    CHECK(cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls).status == Status::RootArgumentNotSet);
+
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(heap, 100)) == Status::Ok);
+    CHECK(st.set_descriptor_table(G, 1, gpu_at(smp, 3)) == Status::Ok);
+    const uint32_t k[4] = {0, 0, 0, 0};
+    CHECK(st.set_root_constants(G, 2, 4, k, 0) == Status::Ok);
+    CHECK(st.set_root_view(G, 3, RootParameterType::Cbv, 0x10100) == Status::Ok);
+    CHECK(st.set_root_view(G, 4, RootParameterType::Srv, 0x100040) == Status::Ok);
+    CHECK(st.set_descriptor_table(G, 5, gpu_at(heap, 200)) == Status::Ok);
+    CHECK((st.dirty_parameters(G) & plan0.parameter_mask()) != 0);
+
+    // Group 0.
+    BindGroupLookup g0 = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(g0.status == Status::Ok && g0.rebuilt && g0.bind_group != nullptr && g0.retired_gpu_id == 0);
+    const std::vector<BindGroupEntry>& e = g0.bind_group->entries;
+    CHECK(e.size() == 8);
+    CHECK(e[0].binding == 0 && e[0].kind == BindResourceKind::Buffer && e[0].resource_id == 70);
+    CHECK(e[0].offset == 0x200 && e[0].size == 256);
+    CHECK(e[1].kind == BindResourceKind::Null);  // unresolvable CBV address
+    CHECK(e[2].binding == 2 && e[2].kind == BindResourceKind::TextureView && e[2].resource_id == 500);
+    CHECK(e[4].resource_id == 502);
+    CHECK(e[5].binding == 5 && e[5].kind == BindResourceKind::Null);  // never written
+    CHECK(e[6].binding == 6 && e[6].kind == BindResourceKind::Buffer && e[6].resource_id == 600);
+    CHECK(e[6].offset == 64 && e[6].size == 160);
+    CHECK(e[6].view.kind == DescriptorKind::Uav);
+    CHECK(e[7].binding == 7 && e[7].kind == BindResourceKind::TextureView && e[7].resource_id == 800);
+    CHECK(g0.bind_group->null_entries == 2);
+    g0.bind_group->gpu_id = 1000;
+
+    // Second lookup hits without touching the resolver.
+    const int calls_after_build = resolver_calls;
+    BindGroupLookup hit = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(hit.status == Status::Ok && !hit.rebuilt && hit.bind_group == g0.bind_group);
+    CHECK(hit.bind_group->gpu_id == 1000);
+    CHECK(resolver_calls == calls_after_build);
+    CHECK(cache.hits() == 1 && cache.misses() == 1);
+
+    // Writes outside the descriptors the plan reads do not invalidate; identical rewrites neither.
+    fill_srvs(reg, heap, 150, 4, 900);
+    fill_srvs(reg, heap, 102, 3, 500);
+    fill_srvs(reg, heap, 206, 1, 950);  // bindless neighbour of t7
+    fill_srvs(reg, heap, 208, 1, 951);
+    CHECK(!cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls).rebuilt);
+
+    // A changed descriptor the plan reads forces a rebuild in place.
+    fill_srvs(reg, heap, 105, 1, 777);
+    BindGroupLookup rebuilt = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(rebuilt.rebuilt && rebuilt.retired_gpu_id == 1000 && rebuilt.bind_group == g0.bind_group);
+    CHECK(rebuilt.bind_group->gpu_id == 0);
+    CHECK(rebuilt.bind_group->entries[5].kind == BindResourceKind::TextureView);
+    CHECK(rebuilt.bind_group->entries[5].resource_id == 777);
+    CHECK(rebuilt.bind_group->null_entries == 1);
+    rebuilt.bind_group->gpu_id = 1001;
+    fill_srvs(reg, heap, 207, 1, 801);  // bindless slot itself
+    BindGroupLookup bindless = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(bindless.rebuilt && bindless.retired_gpu_id == 1001);
+    CHECK(bindless.bind_group->entries[7].resource_id == 801);
+    bindless.bind_group->gpu_id = 1002;
+
+    // Different table base / layout key -> different cache entries.
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(heap, 0)) == Status::Ok);
+    BindGroupLookup moved = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(moved.rebuilt && moved.bind_group != g0.bind_group && moved.retired_gpu_id == 0);
+    CHECK(moved.bind_group->null_entries == 7);
+    CHECK(st.set_descriptor_table(G, 0, gpu_at(heap, 100)) == Status::Ok);
+    BindGroupLookup back = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(!back.rebuilt && back.bind_group->gpu_id == 1002);
+    CHECK(cache.get_or_build(st, G, plan0, 2, test_resolver, &resolver_calls).rebuilt);
+
+    // Group 1: sampler table + static samplers.
+    BindGroupLookup g1 = cache.get_or_build(st, G, plan1, 1, test_resolver, &resolver_calls);
+    CHECK(g1.status == Status::Ok && g1.bind_group->entries.size() == 4);
+    CHECK(g1.bind_group->entries[0].kind == BindResourceKind::Sampler);
+    CHECK(g1.bind_group->entries[0].sampler.max_anisotropy == 16);
+    CHECK(g1.bind_group->entries[2].binding == 2 && g1.bind_group->entries[2].kind == BindResourceKind::Sampler);
+    CHECK(g1.bind_group->entries[2].sampler.address_u == 4);
+    CHECK(g1.bind_group->entries[2].sampler.border_color[0] == 1.0f);  // opaque white
+    CHECK(g1.bind_group->entries[2].sampler.border_color[3] == 1.0f);
+    CHECK(g1.bind_group->entries[3].sampler.border_color[3] == 0.0f);  // transparent black
+    SamplerDesc sd2;
+    sd2.max_anisotropy = 2;
+    CHECK(reg.create_sampler(sd2, cpu_at(smp, 4)) == Status::Ok);
+    BindGroupLookup g1b = cache.get_or_build(st, G, plan1, 1, test_resolver, &resolver_calls);
+    CHECK(g1b.rebuilt && g1b.bind_group->entries[1].sampler.max_anisotropy == 2);
+
+    // Group 2: root constants, root CBV, root SRV.
+    BindGroupLookup g2 = cache.get_or_build(st, G, plan2, 1, test_resolver, &resolver_calls);
+    CHECK(g2.status == Status::Ok && g2.bind_group->entries.size() == 3);
+    const std::vector<BindGroupEntry>& r = g2.bind_group->entries;
+    CHECK(r[0].kind == BindResourceKind::RootConstants && r[0].size == 16 && r[0].root_parameter_index == 2);
+    CHECK(r[1].kind == BindResourceKind::Buffer && r[1].resource_id == 70 && r[1].offset == 0x100);
+    CHECK(r[1].size == 0x10000 - 0x100);  // clamped to the end of the buffer (< 64 KiB)
+    CHECK(r[2].kind == BindResourceKind::Buffer && r[2].resource_id == 80 && r[2].offset == 0x40 && r[2].size == 0);
+    // Root constant values are not part of the key.
+    const uint32_t k2[4] = {5, 6, 7, 8};
+    CHECK(st.set_root_constants(G, 2, 4, k2, 0) == Status::Ok);
+    CHECK(!cache.get_or_build(st, G, plan2, 1, test_resolver, &resolver_calls).rebuilt);
+    // Root view address changes are.
+    CHECK(st.set_root_view(G, 3, RootParameterType::Cbv, 0x100000) == Status::Ok);
+    BindGroupLookup g2b = cache.get_or_build(st, G, plan2, 1, test_resolver, &resolver_calls);
+    CHECK(g2b.rebuilt && g2b.bind_group->entries[1].resource_id == 80);
+    CHECK(g2b.bind_group->entries[1].size == kMaxUniformBindingSize);
+
+    // Unresolved bindings compile to Null entries.
+    const ShaderBinding missing[] = {sb(0, DescriptorRangeType::Srv, 0), sb(1, DescriptorRangeType::Uav, 5)};
+    const BindGroupPlan partial = BindGroupPlan::build(rs, missing, vf);
+    BindGroupLookup part = cache.get_or_build(st, G, partial, 1, test_resolver, &resolver_calls);
+    CHECK(part.status == Status::Ok && part.bind_group->entries.size() == 2);
+    CHECK(part.bind_group->entries[1].kind == BindResourceKind::Null && part.bind_group->null_entries == 1);
+
+    // A plan built for another signature is rejected; an empty plan yields no bind group.
+    RootSignature only_root;
+    RootSignatureDesc od;
+    od.parameters.push_back(root_view(RootParameterType::Cbv, 0));
+    CHECK(RootSignature::build(od, &only_root).ok());
+    CHECK(st.set_root_signature(BindPoint::Compute, &only_root) == Status::Ok);
+    CHECK(cache.get_or_build(st, BindPoint::Compute, plan0, 1, test_resolver, nullptr).status ==
+          Status::InvalidArgument);
+    const BindGroupPlan none_plan =
+        BindGroupPlan::build(only_root, std::span<const ShaderBinding>{}, WebGpuStage::Compute);
+    BindGroupLookup none = cache.get_or_build(st, BindPoint::Compute, none_plan, 1, test_resolver, nullptr);
+    CHECK(none.status == Status::Ok && none.bind_group == nullptr);
+
+    // A CBV descriptor in an SRV range is a mismatch -> Null.
+    CHECK(reg.create_constant_buffer_view(&cb, cpu_at(heap, 102)) == Status::Ok);
+    BindGroupLookup mismatch = cache.get_or_build(st, G, plan0, 1, test_resolver, &resolver_calls);
+    CHECK(mismatch.rebuilt && mismatch.bind_group->entries[2].kind == BindResourceKind::Null);
+
+    g2b.bind_group->gpu_id = 2000;
+    std::vector<uint32_t> retired;
+    const size_t entries = cache.size();
+    CHECK(entries >= 6);
+    cache.clear(&retired);
+    CHECK(cache.size() == 0);
+    CHECK(retired.size() == 1 && retired[0] == 2000);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Resource state tracking
+// ---------------------------------------------------------------------------
+
+bool has_diag(const std::vector<StateDiagnostic>& diags, StateDiagnosticCode code, uint32_t id, uint32_t sub) {
+    for (const StateDiagnostic& d : diags) {
+        if (d.code == code && d.resource_id == id && d.subresource == sub) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_state_tracker_basic() {
+    ResourceStateRegistry reg;
+    ResourceStateDesc tex;
+    tex.subresource_count = 6;  // 3 mips x 2 slices
+    tex.initial_state = ResourceStates::Common;
+    CHECK(reg.register_resource(1, tex) == Status::Ok);
+    CHECK(reg.register_resource(1, tex) == Status::ResourceAlreadyRegistered);
+    CHECK(reg.register_resource(0, tex) == Status::InvalidArgument);
+    ResourceStateDesc zero;
+    zero.subresource_count = 0;
+    CHECK(reg.register_resource(9, zero) == Status::InvalidArgument);
+    CHECK(reg.contains(1) && !reg.contains(9));
+    CHECK(reg.state(1, kAllSubresources) == ResourceStates::Common);
+    CHECK(reg.state(1, 6) == kStateUnknown);
+    CHECK(reg.state(77, 0) == kStateUnknown);
+
+    CommandListStateTracker list(&reg);
+    const ResourceBarrier to_rt = ResourceBarrier::transition(1, ResourceStates::Common, ResourceStates::RenderTarget);
+    list.resource_barrier(1, &to_rt);
+    CHECK(list.state(1, kAllSubresources) == ResourceStates::RenderTarget);
+    CHECK(list.state(1, 3) == ResourceStates::RenderTarget);
+    CHECK(list.expected_initial_state(1, 0) == ResourceStates::Common);
+    CHECK(list.diagnostics().empty());
+    CHECK(list.is_uniform(1));
+
+    const ResourceBarrier to_srv =
+        ResourceBarrier::transition(1, ResourceStates::RenderTarget, ResourceStates::PixelShaderResource);
+    list.resource_barrier(1, &to_srv);
+    CHECK(list.state(1, kAllSubresources) == ResourceStates::PixelShaderResource);
+
+    // Before-state mismatch: reported, never fatal, state still follows the barrier.
+    const ResourceBarrier wrong =
+        ResourceBarrier::transition(1, ResourceStates::RenderTarget, ResourceStates::CopySource);
+    list.resource_barrier(1, &wrong);
+    CHECK(list.diagnostics().size() == 1);
+    const StateDiagnostic& d = list.diagnostics()[0];
+    CHECK(d.code == StateDiagnosticCode::BeforeStateMismatch && d.resource_id == 1);
+    CHECK(d.expected_state == ResourceStates::PixelShaderResource && d.actual_state == ResourceStates::RenderTarget);
+    CHECK(d.barrier_index == 0);
+    CHECK(list.state(1, 0) == ResourceStates::CopySource);
+
+    // Other diagnostics.
+    const ResourceBarrier batch[6] = {
+        ResourceBarrier::transition(1, ResourceStates::CopySource, ResourceStates::CopySource),
+        ResourceBarrier::transition(1, ResourceStates::CopySource, ResourceStates::RenderTarget | ResourceStates::CopyDest),
+        ResourceBarrier::transition(1, ResourceStates::Common, ResourceStates::CopyDest, 6),
+        ResourceBarrier::transition(55, ResourceStates::Common, ResourceStates::CopyDest),
+        ResourceBarrier::transition(1, 0, 0, kAllSubresources, 3),
+        ResourceBarrier{static_cast<ResourceBarrierType>(9)},
+    };
+    list.resource_barrier(6, batch);
+    const std::vector<StateDiagnostic>& diags = list.diagnostics();
+    CHECK(has_diag(diags, StateDiagnosticCode::RedundantTransition, 1, kAllSubresources));
+    CHECK(has_diag(diags, StateDiagnosticCode::InvalidStateCombination, 1, kAllSubresources));
+    CHECK(has_diag(diags, StateDiagnosticCode::SubresourceOutOfRange, 1, 6));
+    CHECK(has_diag(diags, StateDiagnosticCode::UnknownResource, 55, kAllSubresources));
+    CHECK(has_diag(diags, StateDiagnosticCode::InvalidBarrierFlags, 1, kAllSubresources));
+    bool saw_type = false;
+    for (const StateDiagnostic& x : diags) {
+        saw_type = saw_type || (x.code == StateDiagnosticCode::InvalidBarrierType && x.barrier_index == 5);
+    }
+    CHECK(saw_type);
+    CHECK(std::strcmp(state_diagnostic_name(StateDiagnosticCode::BeforeStateMismatch), "BeforeStateMismatch") == 0);
+
+    // UAV and aliasing barriers.
+    const ResourceBarrier misc[3] = {ResourceBarrier::uav(1), ResourceBarrier::uav(0), ResourceBarrier::aliasing(0, 1)};
+    list.resource_barrier(3, misc);
+    CHECK(list.uav_barrier_count() == 2 && list.aliasing_barrier_count() == 1);
+
+    list.reset();
+    CHECK(list.diagnostics().empty() && list.state(1, 0) == kStateUnknown && list.uav_barrier_count() == 0);
+    list.resource_barrier(1, nullptr);
+}
+
+void test_state_tracker_subresources_and_split() {
+    ResourceStateRegistry reg;
+    ResourceStateDesc tex;
+    tex.subresource_count = 4;
+    CHECK(reg.register_resource(2, tex) == Status::Ok);
+    CommandListStateTracker list(&reg);
+
+    // Per-subresource divergence.
+    const ResourceBarrier all_srv =
+        ResourceBarrier::transition(2, ResourceStates::Common, ResourceStates::PixelShaderResource);
+    list.resource_barrier(1, &all_srv);
+    const ResourceBarrier mip1_rt =
+        ResourceBarrier::transition(2, ResourceStates::PixelShaderResource, ResourceStates::RenderTarget, 1);
+    list.resource_barrier(1, &mip1_rt);
+    CHECK(!list.is_uniform(2));
+    CHECK(list.state(2, 0) == ResourceStates::PixelShaderResource);
+    CHECK(list.state(2, 1) == ResourceStates::RenderTarget);
+    CHECK(list.state(2, kAllSubresources) == kStateUnknown);
+    CHECK(list.expected_initial_state(2, 1) == ResourceStates::Common);
+
+    // An ALL transition validates each subresource individually.
+    const ResourceBarrier all_copy =
+        ResourceBarrier::transition(2, ResourceStates::PixelShaderResource, ResourceStates::CopySource);
+    list.resource_barrier(1, &all_copy);
+    CHECK(list.diagnostics().size() == 1);
+    CHECK(has_diag(list.diagnostics(), StateDiagnosticCode::BeforeStateMismatch, 2, 1));
+    // ...and collapses back to the uniform fast path once states agree.
+    CHECK(list.is_uniform(2));
+    CHECK(list.state(2, kAllSubresources) == ResourceStates::CopySource);
+
+    // Per-subresource transitions that converge also collapse.
+    const ResourceBarrier per_sub[4] = {
+        ResourceBarrier::transition(2, ResourceStates::CopySource, ResourceStates::CopyDest, 0),
+        ResourceBarrier::transition(2, ResourceStates::CopySource, ResourceStates::CopyDest, 1),
+        ResourceBarrier::transition(2, ResourceStates::CopySource, ResourceStates::CopyDest, 2),
+        ResourceBarrier::transition(2, ResourceStates::CopySource, ResourceStates::CopyDest, 3),
+    };
+    list.resource_barrier(3, per_sub);
+    CHECK(!list.is_uniform(2));
+    list.resource_barrier(1, &per_sub[3]);
+    CHECK(list.is_uniform(2));
+    CHECK(list.state(2, kAllSubresources) == ResourceStates::CopyDest);
+    CHECK(list.diagnostics().size() == 1);
+
+    // Split barriers.
+    list.reset();
+    const ResourceBarrier begin = ResourceBarrier::transition(
+        2, ResourceStates::RenderTarget, ResourceStates::PixelShaderResource, 0, ResourceBarrierFlags::BeginOnly);
+    const ResourceBarrier end = ResourceBarrier::transition(
+        2, ResourceStates::RenderTarget, ResourceStates::PixelShaderResource, 0, ResourceBarrierFlags::EndOnly);
+    list.resource_barrier(1, &begin);
+    CHECK(list.in_split_barrier(2, 0));
+    CHECK(!list.in_split_barrier(2, 1));
+    CHECK(list.state(2, 0) == ResourceStates::RenderTarget);
+    CHECK(list.expected_initial_state(2, 0) == ResourceStates::RenderTarget);
+    list.note_access(2, 0, ResourceStates::PixelShaderResource);  // use during split
+    CHECK(has_diag(list.diagnostics(), StateDiagnosticCode::UseDuringSplitBarrier, 2, 0));
+    list.resource_barrier(1, &end);
+    CHECK(!list.in_split_barrier(2, 0));
+    CHECK(list.state(2, 0) == ResourceStates::PixelShaderResource);
+    CHECK(list.diagnostics().size() == 1);
+
+    // END without BEGIN on a known state, mismatched END, double BEGIN.
+    list.resource_barrier(1, &end);
+    CHECK(has_diag(list.diagnostics(), StateDiagnosticCode::SplitBarrierWithoutBegin, 2, 0));
+    const ResourceBarrier begin2 = ResourceBarrier::transition(
+        2, ResourceStates::PixelShaderResource, ResourceStates::CopySource, 0, ResourceBarrierFlags::BeginOnly);
+    list.resource_barrier(1, &begin2);
+    list.resource_barrier(1, &begin2);
+    CHECK(has_diag(list.diagnostics(), StateDiagnosticCode::SplitBarrierAlreadyBegun, 2, 0));
+    const ResourceBarrier wrong_end = ResourceBarrier::transition(
+        2, ResourceStates::CopySource, ResourceStates::CopyDest, 0, ResourceBarrierFlags::EndOnly);
+    list.resource_barrier(1, &wrong_end);
+    CHECK(has_diag(list.diagnostics(), StateDiagnosticCode::SplitBarrierMismatch, 2, 0));
+    CHECK(list.state(2, 0) == ResourceStates::CopyDest);
+
+    // A regular transition while a split is in flight.
+    list.reset();
+    list.resource_barrier(1, &begin);
+    const ResourceBarrier during = ResourceBarrier::transition(
+        2, ResourceStates::PixelShaderResource, ResourceStates::CopySource, 0);
+    list.resource_barrier(1, &during);
+    CHECK(has_diag(list.diagnostics(), StateDiagnosticCode::UseDuringSplitBarrier, 2, 0));
+    CHECK(list.state(2, 0) == ResourceStates::CopySource);
+}
+
+void test_state_tracker_execute() {
+    ResourceStateRegistry reg;
+    ResourceStateDesc tex;
+    tex.subresource_count = 4;
+    CHECK(reg.register_resource(3, tex) == Status::Ok);
+    ResourceStateDesc buf;
+    buf.implicit_promotion = true;
+    CHECK(reg.register_resource(4, buf) == Status::Ok);
+    ResourceStateDesc tex2;
+    CHECK(reg.register_resource(5, tex2) == Status::Ok);
+
+    // List A: texture 3 COMMON -> RT on mip 2 only, buffer used as COPY_DEST via promotion.
+    CommandListStateTracker a(&reg);
+    const ResourceBarrier rt2 = ResourceBarrier::transition(3, ResourceStates::Common, ResourceStates::RenderTarget, 2);
+    a.resource_barrier(1, &rt2);
+    a.note_access(4, kAllSubresources, ResourceStates::CopyDest);
+    a.note_access(4, kAllSubresources, ResourceStates::CopyDest);
+    CHECK(a.diagnostics().empty());
+    std::vector<StateDiagnostic> diags;
+    reg.execute(a, &diags);
+    CHECK(diags.empty());
+    CHECK(reg.state(3, 2) == ResourceStates::RenderTarget);
+    CHECK(reg.state(3, 0) == ResourceStates::Common);
+    CHECK(reg.state(3, kAllSubresources) == kStateUnknown);  // diverged
+    CHECK(reg.state(4, 0) == ResourceStates::Common);         // buffer decayed
+
+    // List B recorded independently expects mip 2 in PIXEL_SHADER_RESOURCE: mismatch at execute.
+    CommandListStateTracker b(&reg);
+    const ResourceBarrier wrong = ResourceBarrier::transition(
+        3, ResourceStates::PixelShaderResource, ResourceStates::CopySource, 2);
+    b.resource_barrier(1, &wrong);
+    CHECK(b.diagnostics().empty());  // unknown locally: nothing to compare against yet
+    CHECK(b.expected_initial_state(3, 2) == ResourceStates::PixelShaderResource);
+    reg.execute(b, &diags);
+    CHECK(diags.size() == 1);
+    CHECK(diags[0].code == StateDiagnosticCode::ExecuteStateMismatch && diags[0].resource_id == 3);
+    CHECK(diags[0].subresource == 2 && diags[0].expected_state == ResourceStates::PixelShaderResource);
+    CHECK(diags[0].actual_state == ResourceStates::RenderTarget);
+    CHECK(reg.state(3, 2) == ResourceStates::CopySource);  // committed anyway
+
+    // List C brings everything back to COMMON: the global state collapses to uniform.
+    CommandListStateTracker c(&reg);
+    const ResourceBarrier back = ResourceBarrier::transition(3, ResourceStates::CopySource, ResourceStates::Common, 2);
+    c.resource_barrier(1, &back);
+    diags.clear();
+    reg.execute(c, &diags);
+    CHECK(diags.empty());
+    CHECK(reg.state(3, kAllSubresources) == ResourceStates::Common);
+
+    // Texture read access from COMMON is an implicit promotion (no diagnostic) and decays.
+    CommandListStateTracker d(&reg);
+    d.note_access(5, 0, ResourceStates::PixelShaderResource);
+    reg.execute(d, &diags);
+    CHECK(diags.empty());
+    CHECK(reg.state(5, 0) == ResourceStates::Common);
+    // ...but a render-target access from COMMON is not promotable.
+    CommandListStateTracker e(&reg);
+    e.note_access(5, 0, ResourceStates::RenderTarget);
+    reg.execute(e, &diags);
+    CHECK(diags.size() == 1 && diags[0].code == StateDiagnosticCode::ExecuteStateMismatch);
+    diags.clear();
+    // Access checks against known local state.
+    CommandListStateTracker f(&reg);
+    const ResourceBarrier to_rt = ResourceBarrier::transition(5, ResourceStates::RenderTarget, ResourceStates::RenderTarget);
+    f.resource_barrier(1, &to_rt);
+    f.note_access(5, 0, ResourceStates::PixelShaderResource);
+    CHECK(has_diag(f.diagnostics(), StateDiagnosticCode::AccessStateMismatch, 5, 0));
+    f.note_access(5, 3, ResourceStates::RenderTarget);
+    CHECK(has_diag(f.diagnostics(), StateDiagnosticCode::SubresourceOutOfRange, 5, 3));
+
+    // Split barrier begun in one list and ended in the next.
+    CommandListStateTracker g(&reg);
+    const ResourceBarrier begin = ResourceBarrier::transition(
+        3, ResourceStates::Common, ResourceStates::CopyDest, kAllSubresources, ResourceBarrierFlags::BeginOnly);
+    g.resource_barrier(1, &begin);
+    reg.execute(g, &diags);
+    CHECK(diags.empty());
+    CHECK(reg.state(3, kAllSubresources) == ResourceStates::CopyDest);
+    CommandListStateTracker h(&reg);
+    const ResourceBarrier end = ResourceBarrier::transition(
+        3, ResourceStates::Common, ResourceStates::CopyDest, kAllSubresources, ResourceBarrierFlags::EndOnly);
+    h.resource_barrier(1, &end);
+    CHECK(h.diagnostics().empty());
+    reg.execute(h, &diags);
+    CHECK(diags.empty());
+
+    // Unregistered between record and execute.
+    CommandListStateTracker i(&reg);
+    i.note_access(5, 0, ResourceStates::Common);
+    reg.unregister_resource(5);
+    reg.execute(i, &diags);
+    CHECK(diags.size() == 1 && diags[0].code == StateDiagnosticCode::UnknownResource);
+    CHECK(!reg.contains(5));
+
+    // Null registry: everything is unknown, nothing crashes.
+    CommandListStateTracker orphan(nullptr);
+    orphan.note_access(1, 0, ResourceStates::Common);
+    CHECK(orphan.diagnostics().size() == 1);
+}
+
+void test_state_tracker_diagnostic_cap() {
+    ResourceStateRegistry reg;
+    ResourceStateDesc tex;
+    CHECK(reg.register_resource(1, tex) == Status::Ok);
+    CommandListStateTracker list(&reg);
+    const ResourceBarrier bad = ResourceBarrier::transition(1, ResourceStates::CopyDest, ResourceStates::CopyDest);
+    for (size_t i = 0; i < CommandListStateTracker::kMaxDiagnostics + 10; ++i) {
+        list.resource_barrier(1, &bad);
+    }
+    CHECK(list.diagnostics().size() == CommandListStateTracker::kMaxDiagnostics);
+    CHECK(list.dropped_diagnostics() == 10);
+}
+
+// ---------------------------------------------------------------------------
+// 10. WebGPU read/write conflict query
+// ---------------------------------------------------------------------------
+
+void test_usage_scope_conflicts() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 8, false);
+    DescriptorHeap* rtvs = make_heap(reg, DescriptorHeapType::Rtv, 4, false);
+    DescriptorHeap* dsvs = make_heap(reg, DescriptorHeapType::Dsv, 4, false);
+
+    ViewDesc srv_mip0 = texture2d_srv(0, 1);
+    ViewDesc srv_mip1 = texture2d_srv(1, 1);
+    ViewDesc srv_all = texture2d_srv(0, 0xffff);
+    CHECK(reg.create_shader_resource_view(10, &srv_mip0, cpu_at(heap, 0)) == Status::Ok);
+    CHECK(reg.create_shader_resource_view(10, &srv_mip1, cpu_at(heap, 1)) == Status::Ok);
+    CHECK(reg.create_shader_resource_view(10, &srv_all, cpu_at(heap, 2)) == Status::Ok);
+    ViewDesc rtv;
+    rtv.dimension = ViewDimension::Texture2D;
+    CHECK(reg.create_render_target_view(10, &rtv, cpu_at(rtvs, 0)) == Status::Ok);
+    ViewDesc dsv;
+    dsv.dimension = DsvDimension::Texture2D;
+    dsv.flags = DsvFlags::ReadOnlyDepth;
+    CHECK(reg.create_depth_stencil_view(20, &dsv, cpu_at(dsvs, 0)) == Status::Ok);
+    dsv.flags = 0;
+    CHECK(reg.create_depth_stencil_view(20, &dsv, cpu_at(dsvs, 1)) == Status::Ok);
+    ViewDesc depth_srv = texture2d_srv();
+    CHECK(reg.create_shader_resource_view(20, &depth_srv, cpu_at(heap, 3)) == Status::Ok);
+
+    CHECK(view_usage(*heap->view(0)) == ResourceUsage::Sampled);
+    CHECK(view_usage(*rtvs->view(0)) == ResourceUsage::RenderTarget);
+    CHECK(view_usage(*dsvs->view(0)) == ResourceUsage::DepthStencilRead);
+    CHECK(view_usage(*dsvs->view(1)) == ResourceUsage::DepthStencilWrite);
+    const SubresourceRange r0 = view_subresource_range(*heap->view(1));
+    CHECK(r0.first_mip == 1 && r0.mip_count == 1 && r0.first_slice == 0 && r0.slice_count == 1);
+    CHECK(view_subresource_range(*heap->view(2)).mip_count == kAllMips);
+
+    auto add_view = [](UsageScope& scope, const ViewDescriptor* v) {
+        scope.add(v->resource_id, view_subresource_range(*v), view_usage(*v));
+    };
+    UsageScope scope;
+    std::vector<UsageConflict> conflicts;
+
+    // Sampling mip 1 while rendering to mip 0: allowed.
+    add_view(scope, heap->view(1));
+    add_view(scope, rtvs->view(0));
+    CHECK(scope.find_conflicts(&conflicts) == 0);
+    // Sampling the whole chain while rendering to mip 0: conflict.
+    add_view(scope, heap->view(2));
+    CHECK(scope.find_conflicts(&conflicts) == 1);
+    CHECK(conflicts.size() == 1 && conflicts[0].resource_id == 10);
+    CHECK(conflicts[0].first == ResourceUsage::RenderTarget && conflicts[0].second == ResourceUsage::Sampled);
+    CHECK(conflicts[0].first_index == 1 && conflicts[0].second_index == 2);
+
+    // Read-only depth + sampling the depth texture: allowed; writable depth: conflict.
+    scope.clear();
+    conflicts.clear();
+    add_view(scope, dsvs->view(0));
+    add_view(scope, heap->view(3));
+    CHECK(scope.find_conflicts(&conflicts) == 0);
+    add_view(scope, dsvs->view(1));
+    CHECK(scope.find_conflicts(&conflicts) == 2);  // write vs read-only DSV, write vs SRV
+
+    // Storage writes may alias each other; storage write + sampled may not.
+    scope.clear();
+    SubresourceRange all;
+    scope.add(30, all, ResourceUsage::StorageWrite);
+    scope.add(30, all, ResourceUsage::StorageWrite);
+    scope.add(31, all, ResourceUsage::Sampled);
+    CHECK(scope.find_conflicts(nullptr) == 0);
+    scope.add(30, all, ResourceUsage::StorageRead);
+    CHECK(scope.find_conflicts(nullptr) == 2);
+
+    // Disjoint array slices never conflict.
+    scope.clear();
+    SubresourceRange slice0;
+    slice0.first_slice = 0;
+    slice0.slice_count = 1;
+    SubresourceRange slice1 = slice0;
+    slice1.first_slice = 1;
+    scope.add(40, slice0, ResourceUsage::RenderTarget);
+    scope.add(40, slice1, ResourceUsage::Sampled);
+    CHECK(scope.find_conflicts(nullptr) == 0);
+    scope.add(40, slice0, ResourceUsage::RenderTarget);  // same attachment twice
+    CHECK(scope.find_conflicts(nullptr) == 1);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Threading contract smoke test
+// ---------------------------------------------------------------------------
+
+void test_concurrent_disjoint_writes() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 4096, true);
+    constexpr uint32_t kThreads = 4;
+    constexpr uint32_t kPerThread = 1024;
+    std::vector<std::thread> threads;
+    for (uint32_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&reg, heap, t] {
+            ViewDesc srv = texture2d_srv();
+            for (uint32_t i = 0; i < kPerThread; ++i) {
+                const uint32_t index = t * kPerThread + i;
+                reg.create_shader_resource_view(index + 1, &srv, cpu_at(heap, index));
+            }
+            // Create and destroy scratch heaps concurrently with resolution.
+            for (int k = 0; k < 16; ++k) {
+                DescriptorHeapDesc d;
+                d.num_descriptors = 8;
+                DescriptorHeap* scratch = nullptr;
+                if (reg.create_heap(d, &scratch) == Status::Ok) {
+                    reg.destroy_heap(scratch);
+                }
+            }
+        });
+    }
+    for (std::thread& t : threads) {
+        t.join();
+    }
+    CHECK(heap->generation() == kThreads * kPerThread);
+    bool all_ok = true;
+    for (uint32_t i = 0; i < kThreads * kPerThread; ++i) {
+        all_ok = all_ok && heap->view(i)->resource_id == i + 1;
+    }
+    CHECK(all_ok);
+    CHECK(heap->range_changed_since(0, kThreads * kPerThread, 0));
+    CHECK(!heap->range_changed_since(0, kThreads * kPerThread, heap->generation()));
+    CHECK(reg.heap_count() == 1);
+}
+
+}  // namespace
+
+int main() {
+    test_heap_creation_and_handles();
+    test_descriptor_writes();
+    test_copy_descriptors_simple();
+    test_copy_descriptors_multi_range();
+    test_generation_tracking();
+    test_root_signature_model();
+    test_root_signature_validation();
+    test_root_signature_hash();
+    test_root_signature_blob_roundtrip();
+    test_root_signature_blob_known_layout();
+    test_root_signature_blob_malformed();
+    test_root_arguments();
+    test_bind_group_plan();
+    test_bind_group_cache();
+    test_state_tracker_basic();
+    test_state_tracker_subresources_and_split();
+    test_state_tracker_execute();
+    test_state_tracker_diagnostic_cap();
+    test_usage_scope_conflicts();
+    test_concurrent_disjoint_writes();
+
+    if (g_failures != 0) {
+        std::fprintf(stderr, "test_descriptor_heap failed with %d failure(s)\n", g_failures);
+        return 1;
+    }
+    std::printf("All descriptor_heap_tests passed.\n");
+    return 0;
+}

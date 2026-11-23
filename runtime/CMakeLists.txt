@@ -17,6 +17,7 @@ add_library(playgta6_core STATIC
     os/win32_loader.cpp
     gpu/cmd_encoder.cpp
     gpu/pso_cache.cpp
+    gpu/descriptor_heap.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -69,4 +70,8 @@ else()
     add_executable(test_pso_cache ../tests/test_pso_cache.cpp)
     target_link_libraries(test_pso_cache PRIVATE playgta6_core)
     add_test(NAME playgta6_pso_cache_tests COMMAND test_pso_cache)
+
+    add_executable(test_descriptor_heap ../tests/test_descriptor_heap.cpp)
+    target_link_libraries(test_descriptor_heap PRIVATE playgta6_core)
+    add_test(NAME descriptor_heap_tests COMMAND test_descriptor_heap)
 endif()
