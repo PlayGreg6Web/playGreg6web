@@ -21,6 +21,21 @@ use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 #[path = "simd/mod.rs"]
 pub(super) mod simd;
 
+// Integer instruction families beyond the core set (child modules so they can use the private
+// lifter primitives; the files live next to this one).
+#[path = "atomics.rs"]
+mod atomics;
+#[path = "bit_ops.rs"]
+mod bit_ops;
+#[path = "integer.rs"]
+mod integer;
+#[path = "string_ops.rs"]
+mod string_ops;
+
+pub(super) use atomics::CMPXCHG16B_IR;
+pub(super) use bit_ops::{PDEP_IR, PEXT_IR};
+pub(super) use integer::CRC32C_IR;
+
 const GPR_NAMES: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
     "r14", "r15",
@@ -928,6 +943,10 @@ impl FunctionLifter<'_> {
         if simd::is_simd(ins) {
             return self.lift_simd(ins);
         }
+        // String, bit, atomic and miscellaneous integer instructions (incl. every `lock` form).
+        if let Some(result) = self.lift_integer(ins) {
+            return result;
+        }
         match ins.mnemonic() {
             M::Nop | M::Pause | M::Endbr64 => {}
             M::Mov => {
@@ -1105,9 +1124,19 @@ impl FunctionLifter<'_> {
 
     fn alu(&mut self, ins: &Instruction, op: Alu) -> R<()> {
         let bits = self.op_bits(ins, 0)?;
-        let t = ty(bits);
         let a = self.read_op(ins, 0, bits)?;
         let b = self.read_op(ins, 1, bits)?;
+        let r = self.alu_value(op, &a, &b, bits);
+        if !matches!(op, Alu::Cmp | Alu::Test) {
+            self.write_op(ins, 0, &r, bits)?;
+        }
+        Ok(())
+    }
+
+    /// Computes `a <op> b` (reading CF for `adc`/`sbb`), sets every flag the operation defines
+    /// and returns the result. Also used with the old value of an atomic read-modify-write.
+    fn alu_value(&mut self, op: Alu, a: &str, b: &str, bits: u32) -> String {
+        let t = ty(bits);
         let r = match op {
             Alu::Add | Alu::Adc => {
                 let (r, cf) = if matches!(op, Alu::Add) {
@@ -1131,7 +1160,7 @@ impl FunctionLifter<'_> {
                 let y = self.val(&format!("xor {t} {b}, {r}"));
                 let xy = self.val(&format!("and {t} {x}, {y}"));
                 let of = self.msb(&xy, bits);
-                let af = self.aux_flag(&a, &b, &r, bits);
+                let af = self.aux_flag(a, b, &r, bits);
                 self.set_flag(Flag::Cf, &cf);
                 self.set_flag(Flag::Of, &of);
                 self.set_flag(Flag::Af, &af);
@@ -1159,7 +1188,7 @@ impl FunctionLifter<'_> {
                 let y = self.val(&format!("xor {t} {a}, {r}"));
                 let xy = self.val(&format!("and {t} {x}, {y}"));
                 let of = self.msb(&xy, bits);
-                let af = self.aux_flag(&a, &b, &r, bits);
+                let af = self.aux_flag(a, b, &r, bits);
                 self.set_flag(Flag::Cf, &cf);
                 self.set_flag(Flag::Of, &of);
                 self.set_flag(Flag::Af, &af);
@@ -1179,29 +1208,31 @@ impl FunctionLifter<'_> {
             }
         };
         self.set_zsp(&r, bits);
-        if !matches!(op, Alu::Cmp | Alu::Test) {
-            self.write_op(ins, 0, &r, bits)?;
-        }
-        Ok(())
+        r
     }
 
     fn unary(&mut self, ins: &Instruction) -> R<()> {
         let bits = self.op_bits(ins, 0)?;
+        let a = self.read_op(ins, 0, bits)?;
+        let r = self.unary_value(ins.mnemonic(), &a, bits);
+        self.write_op(ins, 0, &r, bits)
+    }
+
+    /// Computes `inc`/`dec`/`neg`/`not` of `a`, sets the flags the operation defines and returns
+    /// the result. Also used with the old value of an atomic read-modify-write.
+    fn unary_value(&mut self, mnemonic: Mnemonic, a: &str, bits: u32) -> String {
         let t = ty(bits);
         let min = imm(1u64 << (bits - 1), bits);
-        let a = self.read_op(ins, 0, bits)?;
-        let r = match ins.mnemonic() {
+        let r = match mnemonic {
             Mnemonic::Not => {
                 // `not` does not modify any flag.
-                let r = self.val(&format!("xor {t} {a}, -1"));
-                self.write_op(ins, 0, &r, bits)?;
-                return Ok(());
+                return self.val(&format!("xor {t} {a}, -1"));
             }
             Mnemonic::Inc => {
                 // CF is preserved by inc/dec.
                 let r = self.val(&format!("add {t} {a}, 1"));
                 let of = self.val(&format!("icmp eq {t} {r}, {min}"));
-                let af = self.aux_flag(&a, "1", &r, bits);
+                let af = self.aux_flag(a, "1", &r, bits);
                 self.set_flag(Flag::Of, &of);
                 self.set_flag(Flag::Af, &af);
                 r
@@ -1209,7 +1240,7 @@ impl FunctionLifter<'_> {
             Mnemonic::Dec => {
                 let r = self.val(&format!("sub {t} {a}, 1"));
                 let of = self.val(&format!("icmp eq {t} {a}, {min}"));
-                let af = self.aux_flag(&a, "1", &r, bits);
+                let af = self.aux_flag(a, "1", &r, bits);
                 self.set_flag(Flag::Of, &of);
                 self.set_flag(Flag::Af, &af);
                 r
@@ -1219,7 +1250,7 @@ impl FunctionLifter<'_> {
                 let r = self.val(&format!("sub {t} 0, {a}"));
                 let cf = self.val(&format!("icmp ne {t} {a}, 0"));
                 let of = self.val(&format!("icmp eq {t} {a}, {min}"));
-                let af = self.aux_flag("0", &a, &r, bits);
+                let af = self.aux_flag("0", a, &r, bits);
                 self.set_flag(Flag::Cf, &cf);
                 self.set_flag(Flag::Of, &of);
                 self.set_flag(Flag::Af, &af);
@@ -1227,7 +1258,7 @@ impl FunctionLifter<'_> {
             }
         };
         self.set_zsp(&r, bits);
-        self.write_op(ins, 0, &r, bits)
+        r
     }
 
     /// Shifts and rotates. The count is masked to 5 bits (6 for 64-bit operands); a masked count
@@ -1664,13 +1695,12 @@ impl FunctionLifter<'_> {
     /// `jcc`: the condition comes from the instruction, the targets from the `[taken, not taken]`
     /// successor edges (either may be a tail call into another function).
     fn branch(&mut self, block: &cfg::BasicBlock, ins: &Instruction) -> R<()> {
-        if !ins.is_jcc_short_or_near() {
-            return unsupported(format!(
-                "conditional branch {:?} is not supported yet",
-                ins.mnemonic()
-            ));
-        }
-        let c = self.condition(ins.condition_code())?;
+        let c = if ins.is_jcc_short_or_near() {
+            self.condition(ins.condition_code())?
+        } else {
+            // `loop*` / `jrcxz` / `jecxz` (anything else is reported as unsupported).
+            self.counter_branch_condition(ins)?
+        };
         let taken = self.successor(block, block.successors.first())?;
         let not_taken = self.successor(block, block.successors.get(1))?;
         self.emit(&format!("br i1 {c}, label %{taken}, label %{not_taken}"));
@@ -1679,12 +1709,16 @@ impl FunctionLifter<'_> {
 }
 
 /// `{lo, hi} = a * b` (unsigned 64x64 -> 128) built from 32-bit halves, so no `i128` multiply
-/// (and therefore no compiler-rt libcall) is needed on wasm64.
+/// (and therefore no compiler-rt libcall) is needed on wasm64. The empty inline-asm copy of
+/// `a`'s high half hides the pattern from LLVM's multiply-high recognition (LLVM 20+), which
+/// would otherwise turn a high-half-only use (`mul` for a division by a constant, `mulx` with
+/// equal destinations) back into an `i128` multiply, i.e. a `__multi3` import.
 pub(super) const UMUL128_IR: &str = "\
 define internal { i64, i64 } @__playgta6_umul128(i64 %a, i64 %b) {
 entry:
   %a0 = and i64 %a, 4294967295
-  %a1 = lshr i64 %a, 32
+  %a1.raw = lshr i64 %a, 32
+  %a1 = call i64 asm \"\", \"=r,0\"(i64 %a1.raw)
   %b0 = and i64 %b, 4294967295
   %b1 = lshr i64 %b, 32
   %p00 = mul i64 %a0, %b0

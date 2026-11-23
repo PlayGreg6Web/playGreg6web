@@ -61,7 +61,34 @@ const imports = {
     __playgta6_trap(state, va) {
       throw new Error(`trap at ${hex(va)}`);
     },
+    // Deterministic stand-ins for the runtime-chosen instructions: they read and write the
+    // guest GPRs in the state block like the real runtime helpers (32-bit results zero-extended).
+    __playgta6_cpuid(state) {
+      const leaf = getReg32(state, 0);
+      const subleaf = getReg32(state, 1);
+      setRegs(state, [[0, leaf ^ 0x11111111], [3, subleaf ^ 0x22222222], [1, 0x33333333], [2, 0x44444444]]);
+    },
+    __playgta6_rdtsc(state) {
+      tsc += 0x1_0000_0001n;
+      setRegs(state, [[0, Number(tsc & 0xFFFFFFFFn)], [2, Number(tsc >> 32n)]]);
+    },
+    __playgta6_rdtscp(state) {
+      tsc += 0x1_0000_0001n;
+      setRegs(state, [[0, Number(tsc & 0xFFFFFFFFn)], [2, Number(tsc >> 32n)], [1, 7]]);
+    },
+    __playgta6_xgetbv(state) {
+      if (getReg32(state, 1) !== 0) throw new Error('xgetbv: #GP');
+      setRegs(state, [[0, 7], [2, 0]]);
+    },
   },
+};
+
+let tsc = 0x1_0000_0000n;
+const gprAddr = (state, i) => Number(state) + spec.gprOffset + i * 8;
+const getReg32 = (state, i) => view().getUint32(gprAddr(state, i), true);
+const setRegs = (state, pairs) => {
+  const v = view();
+  for (const [i, value] of pairs) v.setBigUint64(gprAddr(state, i), BigInt(value >>> 0), true);
 };
 
 instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(wasmPath)), imports);

@@ -9,6 +9,13 @@
 //! Code is always optimised at `-O2` so that the per-register `alloca`s become SSA values:
 //! `clang` does this itself; for `llc` a sibling `opt` (same directory) runs the middle-end first
 //! when present.
+//!
+//! No target-feature flags are passed: a module that needs wasm features (atomics for `lock`
+//! instructions, bulk memory for `rep movs`/`rep stos`) names them in its own
+//! `"target-features"` function attribute (see [`super::LIFTED_FUNCTION_ATTRIBUTES`] and
+//! [`super::ATOMICS_TARGET_FEATURES`]), so `llc`,
+//! `opt` and `clang` all see the same requirement and other modules compile unchanged. Objects
+//! with atomics must be linked with `wasm-ld --shared-memory`.
 
 use std::env;
 use std::fmt;

@@ -32,20 +32,20 @@ pub(super) const RCX: usize = 1;
 pub(super) const RDX: usize = 2;
 pub(super) const RBX: usize = 3;
 pub(super) const RSP: usize = 4;
-const RBP: usize = 5;
+pub(super) const RBP: usize = 5;
 pub(super) const RSI: usize = 6;
-const RDI: usize = 7;
-const R8: usize = 8;
-const R9: usize = 9;
-const R10: usize = 10;
-const R11: usize = 11;
+pub(super) const RDI: usize = 7;
+pub(super) const R8: usize = 8;
+pub(super) const R9: usize = 9;
+pub(super) const R10: usize = 10;
+pub(super) const R11: usize = 11;
 
 /// Guest memory map used by the harness (all inside the 8 MiB linear memory).
 pub(super) const STATE_ADDR: u64 = 0x10_0000;
 pub(super) const DATA_ADDR: u64 = 0x18_0000;
 pub(super) const STACK_TOP: u64 = 0x1F_0000;
 pub(super) const CODE_BASE: u64 = 0x30_0000;
-const MEMORY_BYTES: u64 = 8 << 20;
+pub(super) const MEMORY_BYTES: u64 = 8 << 20;
 /// Host-implemented function in `runner.js`: `rax = rcx * 10 + rdx`.
 const HOST_MUL10_ADD: u64 = 0x7FFE_0000;
 
@@ -149,7 +149,7 @@ fn probe_exec(dir: &Path, obj: &Path) -> Result<Exec, String> {
     let mut failures = Vec::new();
     let mut linker = None;
     for candidate in candidates {
-        match link(&candidate, obj, &["probe".to_string()], &wasm) {
+        match link(&candidate, obj, &["probe".to_string()], &wasm, &[]) {
             Ok(()) => {
                 linker = Some(candidate);
                 break;
@@ -228,13 +228,20 @@ fn linker_candidates() -> Vec<Linker> {
     out
 }
 
-fn link(linker: &Linker, obj: &Path, exports: &[String], wasm: &Path) -> Result<(), String> {
+fn link(
+    linker: &Linker,
+    obj: &Path,
+    exports: &[String],
+    wasm: &Path,
+    extra: &[String],
+) -> Result<(), String> {
     let mut cmd = Command::new(&linker.program);
     if linker.flavor {
         cmd.args(["-flavor", "wasm"]);
     }
     cmd.args(["-mwasm64", "--no-entry", "--allow-undefined"])
-        .arg(format!("--initial-memory={MEMORY_BYTES}"));
+        .arg(format!("--initial-memory={MEMORY_BYTES}"))
+        .args(extra);
     for name in exports {
         cmd.arg(format!("--export={name}"));
     }
@@ -315,20 +322,42 @@ pub(super) struct Built {
     wasm: PathBuf,
 }
 
-/// Lifts, compiles and links `functions`, exporting every lifted function.
+/// Linker arguments for a module with atomics (wasm-ld requires a shared memory for them).
+pub(super) fn shared_memory_link_args() -> Vec<String> {
+    vec![
+        "--shared-memory".to_string(),
+        format!("--max-memory={MEMORY_BYTES}"),
+    ]
+}
+
+/// Lifts, compiles and links `functions`, exporting every lifted function. Modules with atomic
+/// instructions are linked against a shared memory.
 pub(super) fn build<'a>(
     label: &str,
     functions: impl IntoIterator<Item = &'a cfg::Function>,
 ) -> Built {
+    build_with(label, functions, &[])
+}
+
+/// [`build`] with extra linker arguments.
+pub(super) fn build_with<'a>(
+    label: &str,
+    functions: impl IntoIterator<Item = &'a cfg::Function>,
+    extra: &[String],
+) -> Built {
     let tools = tools();
     let module = lift_module(functions).expect("lifts");
+    let mut extra = extra.to_vec();
+    if module.requires_shared_memory() && !extra.iter().any(|a| a == "--shared-memory") {
+        extra.extend(shared_memory_link_args());
+    }
     let dir = TempDir::new(label);
     let llvm = tools.llvm.as_ref().expect("probed LLVM tool");
     let obj = compile(&dir.0, &module.ir, llvm);
     let exec = tools.exec.as_ref().expect("probed linker and node");
     let wasm = dir.0.join("module.wasm");
     let exports: Vec<String> = module.functions.iter().map(|f| f.symbol.clone()).collect();
-    if let Err(err) = link(&exec.linker, &obj, &exports, &wasm) {
+    if let Err(err) = link(&exec.linker, &obj, &exports, &wasm, &extra) {
         panic!("linking lifted module failed: {err}");
     }
     Built { dir, wasm }
@@ -370,12 +399,12 @@ impl Case {
         self
     }
 
-    fn mem(mut self, addr: u64, bytes: &[u8]) -> Self {
+    pub fn mem(mut self, addr: u64, bytes: &[u8]) -> Self {
         self.mem.push((addr, bytes.to_vec()));
         self
     }
 
-    fn read(mut self, addr: u64, len: usize) -> Self {
+    pub fn read(mut self, addr: u64, len: usize) -> Self {
         self.read.push((addr, len));
         self
     }
@@ -493,6 +522,93 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
         .collect();
     assert_eq!(outcomes.len(), cases.len(), "runner output:\n{stdout}");
     outcomes
+}
+
+/// Runs a custom node script (written next to the module) with `args` after the module path.
+pub(super) fn run_script(built: &Built, name: &str, script: &str, args: &[String]) -> String {
+    let path = built.dir.0.join(name);
+    fs::write(&path, script).expect("write script");
+    let exec = tools().exec.as_ref().expect("probed node");
+    let output = Command::new(&exec.node)
+        .args(&exec.node_flags)
+        .arg(&path)
+        .arg(&built.wasm)
+        .args(args)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "node {name} failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf-8 output")
+}
+
+const PROBE_ATOMICS_LL: &str = "\
+target triple = \"wasm64-unknown-unknown\"
+
+define void @probe(ptr %p) #0 {
+entry:
+  %v = atomicrmw add ptr %p, i64 1 seq_cst, align 8
+  ret void
+}
+
+attributes #0 = { \"target-features\"=\"+atomics,+bulk-memory\" }
+";
+
+/// Whether modules with atomics can be compiled, linked against a shared memory and run (a
+/// capability probe like the one for plain modules; skips with a note otherwise).
+pub(super) fn shared_memory_or_skip(test: &str) -> bool {
+    static SHARED: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = SHARED.get_or_init(|| {
+        let tools = tools();
+        let llvm = tools.llvm.as_ref().map_err(Clone::clone)?;
+        let exec = tools.exec.as_ref().map_err(Clone::clone)?;
+        let dir = TempDir::new("probe_shared");
+        let ll = dir.0.join("probe.ll");
+        let obj = dir.0.join("probe.o");
+        let wasm = dir.0.join("probe.wasm");
+        fs::write(&ll, PROBE_ATOMICS_LL).map_err(|e| e.to_string())?;
+        compile_to_wasm64_object(llvm, &ll, &obj).map_err(|e| {
+            format!(
+                "{} cannot compile wasm64 atomics: {}",
+                llvm.path().display(),
+                first_line(&e.to_string())
+            )
+        })?;
+        link(
+            &exec.linker,
+            &obj,
+            &["probe".to_string()],
+            &wasm,
+            &shared_memory_link_args(),
+        )
+        .map_err(|e| format!("cannot link a shared wasm64 memory: {}", first_line(&e)))?;
+        let script = dir.0.join("probe.js");
+        fs::write(&script, PROBE_JS).map_err(|e| e.to_string())?;
+        let ran = Command::new(&exec.node)
+            .args(&exec.node_flags)
+            .arg(&script)
+            .arg(&wasm)
+            .output()
+            .is_ok_and(|o| o.status.success() && o.stdout == b"42");
+        if ran {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} cannot run a wasm64 module with a shared memory",
+                exec.node.display()
+            ))
+        }
+    });
+    match result {
+        Ok(()) => true,
+        Err(reason) => {
+            println!("SKIP {test}: {reason}");
+            false
+        }
+    }
 }
 
 fn run_ok(built: &Built, cases: &[Case]) -> Vec<Outcome> {
@@ -1056,17 +1172,22 @@ fn traps_reach_the_runtime_helpers() {
         a.idiv(rcx)?;
         a.ret()
     });
-    // cpuid only runs when ecx != 0
+    // an unsupported instruction (port I/O) only runs when ecx != 0
     let guarded = asm_function(CODE_BASE + 0x200, |a| {
         let mut skip = a.create_label();
         a.test(ecx, ecx)?;
         a.jz(skip)?;
-        a.cpuid()?;
+        a.in_(eax, dx)?;
         a.set_label(&mut skip)?;
         a.mov(eax, 7)?;
         a.ret()
     });
-    let cpuid_va = guarded.blocks.values().nth(1).expect("cpuid block").start;
+    let unsupported_va = guarded
+        .blocks
+        .values()
+        .nth(1)
+        .expect("unsupported block")
+        .start;
     let built = build("traps", &[div, idiv, guarded]);
     let cases = [
         // 128-bit dividend: 2^64 / 3
@@ -1103,7 +1224,7 @@ fn traps_reach_the_runtime_helpers() {
     assert_eq!(o[5].regs[RAX], 7);
     assert_eq!(
         o[6].error,
-        format!("unimplemented instruction at {cpuid_va:#x}")
+        format!("unimplemented instruction at {unsupported_va:#x}")
     );
 }
 

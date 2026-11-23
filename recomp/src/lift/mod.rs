@@ -41,7 +41,48 @@
 //! # Flags
 //! `CF PF AF ZF SF OF` are individual `i1` slots computed exactly for every supported instruction.
 //! Flags the architecture leaves *undefined* for an instruction keep their previous value. `DF`
-//! is assumed clear (string instructions are not supported yet).
+//! has no slot: it is read from and written to the state byte directly (`cld`/`std`/`popfq`
+//! write it; string instructions and `pushfq` read it). `pushfq` reports bit 1 and IF set and
+//! TF/AC/ID/system flags clear; `popfq` loads the six arithmetic flags and DF and ignores the
+//! rest (no single-stepping or alignment checks).
+//!
+//! # Supported instructions
+//! Moves and extensions, `lea`, the ALU (`add adc sub sbb cmp and or xor test inc dec neg not`),
+//! shifts and rotates (`shl shr sar rol ror rcl rcr shld shrd`, BMI2 `shlx shrx sarx rorx`),
+//! multiply/divide (`mul imul div idiv mulx`), `setcc`/`cmovcc`, `cbw`..`cqo`, `push`/`pop`,
+//! `pushfq`/`popfq`, `lahf`/`sahf`, `clc stc cmc cld std`, `enter` (nesting level 0) / `leave`,
+//! `xchg`, `xadd`, `cmpxchg`, `cmpxchg8b`, `cmpxchg16b`, every `lock` form (see Atomics), bit
+//! instructions (`bt bts btr btc bsf bsr tzcnt lzcnt popcnt bswap`, BMI1 `andn blsi blsr blsmsk
+//! bextr`, BMI2 `bzhi pdep pext`), string instructions (`movs stos lods cmps scas` with
+//! `rep`/`repe`/`repne`, both DF directions; see `string_ops`), `movbe`, `xlat`, `adcx`/`adox`,
+//! `crc32` (CRC-32C), AMD `clzero`, the runtime-provided `cpuid rdtsc rdtscp xgetbv`, fences
+//! (`mfence lfence sfence` -> `fence seq_cst`), and no-op hints (`nop` forms, `pause`,
+//! `endbr64`, `prefetch*`, `clflush*`, `clwb`, `cldemote`, `monitorx`, `mwaitx`). Control flow:
+//! `jmp`, `jcc`, `loop`/`loope`/`loopne`, `jrcxz`/`jecxz`, `call`, `ret`.
+//!
+//! Choices for architecturally undefined results: `bsf`/`bsr` with a zero source leave the whole
+//! destination register unchanged; `bswap r16` writes 0; for `cmpxchg` with a register
+//! destination the destination is not written on failure and the accumulator not on success
+//! (both as measured on hardware); `shld`/`shrd r16` with a count of 17..31 shift the 32-bit
+//! concatenation; OF after multi-bit shifts/rotates uses the count-1 formula.
+//!
+//! # Atomics
+//! Every `lock`-prefixed instruction and `xchg` with memory lowers to an LLVM `atomicrmw` or
+//! `cmpxchg` (a `cmpxchg` loop for `lock neg`) with `seq_cst` ordering and natural alignment, and
+//! the flags are computed from the old value; fences become `fence seq_cst`. wasm atomics trap on
+//! misaligned addresses, so a misaligned locked access traps instead of being split. `lock
+//! cmpxchg16b` has no 16-byte wasm atomic and runs under a spinlock from a table shared by all
+//! linked modules ([`CMPXCHG16B_LOCKS`]): it is atomic against every other `cmpxchg16b`, its
+//! halves are accessed with 8-byte atomics, but it is not atomic against plain or 8-byte locked
+//! stores to the same 16 bytes made concurrently. A module with atomics appends
+//! [`ATOMICS_TARGET_FEATURES`] to the `#0` target features of every definition and must be
+//! linked with `--shared-memory` ([`LiftedModule::requires_shared_memory`]); modules without
+//! atomics keep exactly [`LIFTED_FUNCTION_ATTRIBUTES`] (a module using the bulk `rep movs`/`rep
+//! stos` paths appends [`BULK_MEMORY_TARGET_FEATURES`] so `memmove`/`memset` lower to
+//! `memory.copy`/`memory.fill` instead of libcalls).
+//! Plain `mov` loads and stores stay non-atomic wasm accesses: code that relies on x86-TSO
+//! ordering of *plain* accesses (e.g. releasing a lock with a plain store) is not guaranteed to
+//! be ordered on weakly ordered hosts.
 //!
 //! # Guest memory
 //! Guest virtual addresses are 64-bit and map 1:1 onto wasm64 linear memory (`inttoptr`). All
@@ -86,7 +127,21 @@
 //!   at `va` (division by zero or quotient overflow).
 //! - `void __playgta6_trap(ptr state, i64 va)` (noreturn): guest execution reached a trap: the
 //!   trap instruction at `va`, undecodable/unmapped code at `va`, a direct call into non-code
-//!   memory at `va`, or the instruction after a call that was assumed never to return.
+//!   memory at `va`, the instruction after a call that was assumed never to return, or a
+//!   `cmpxchg16b` at `va` whose operand is not 16-byte aligned (#GP).
+//!
+//! Instructions whose results the runtime chooses call a helper that is declared only by modules
+//! using it. The lifted code stores all its registers and flags to the state before the call and
+//! reloads them after it; the helper reads and writes the state's GPRs and must leave every other
+//! part of the state (flags included) unchanged. 32-bit results are stored zero-extended.
+//! - `void __playgta6_cpuid(ptr state)` ([`HELPER_CPUID`]): leaf `EAX`, sub-leaf `ECX`; writes
+//!   `EAX EBX ECX EDX`. The reported features must not claim more than the lifter supports.
+//! - `void __playgta6_rdtsc(ptr state)` ([`HELPER_RDTSC`]): writes the 64-bit time-stamp counter
+//!   to `EDX:EAX` (monotonic per thread).
+//! - `void __playgta6_rdtscp(ptr state)` ([`HELPER_RDTSCP`]): as `rdtsc`, plus `ECX` =
+//!   `IA32_TSC_AUX` (processor id).
+//! - `void __playgta6_xgetbv(ptr state)` ([`HELPER_XGETBV`]): writes `XCR[ECX]` to `EDX:EAX`; for
+//!   an `ECX` without an XCR it raises #GP (does not return).
 //!
 //! # Unsupported instructions
 //! Unsupported instructions (or unsupported operand forms) are never mis-lifted: the lifter emits
@@ -114,6 +169,12 @@ pub const WASM64_DATALAYOUT: &str =
 /// scalarised. Consumers must run the module on an engine with wasm SIMD (every engine with
 /// memory64 has it).
 pub const LIFTED_FUNCTION_ATTRIBUTES: &str = "\"target-features\"=\"+simd128\"";
+
+/// [`LIFTED_FUNCTION_ATTRIBUTES`] with extra target features appended.
+fn module_attributes(extra: &str) -> String {
+    let base = LIFTED_FUNCTION_ATTRIBUTES.trim_end_matches('"');
+    format!("{base},{extra}\"")
+}
 
 /// Name of the guest CPU state type in the emitted IR.
 pub const GUEST_STATE_TYPE: &str = "%playgta6.GuestState";
@@ -155,6 +216,25 @@ pub const HELPER_UNIMPLEMENTED: &str = "__playgta6_unimplemented";
 pub const HELPER_DIVIDE_ERROR: &str = "__playgta6_divide_error";
 /// Runtime trap for guest traps, invalid code and non-returning calls: `void (ptr state, i64 va)`.
 pub const HELPER_TRAP: &str = "__playgta6_trap";
+/// Runtime `cpuid`: `void (ptr state)` (see the module docs for the contract).
+pub const HELPER_CPUID: &str = "__playgta6_cpuid";
+/// Runtime `rdtsc`: `void (ptr state)` (see the module docs for the contract).
+pub const HELPER_RDTSC: &str = "__playgta6_rdtsc";
+/// Runtime `rdtscp`: `void (ptr state)` (see the module docs for the contract).
+pub const HELPER_RDTSCP: &str = "__playgta6_rdtscp";
+/// Runtime `xgetbv`: `void (ptr state)` (see the module docs for the contract).
+pub const HELPER_XGETBV: &str = "__playgta6_xgetbv";
+
+/// Target features of a module that contains atomic instructions (`lock`, `xchg [mem]`,
+/// fences): real wasm atomics on a shared memory. Such a module must be linked with
+/// `--shared-memory` (wasm-ld rejects it otherwise). These features are appended to
+/// [`LIFTED_FUNCTION_ATTRIBUTES`] only for such modules; other modules compile unchanged.
+pub const ATOMICS_TARGET_FEATURES: &str = "+atomics,+bulk-memory";
+/// Target features of a module that uses `llvm.memmove`/`llvm.memset` (fast `rep movs`/`rep stos`)
+/// but no atomics: `memory.copy`/`memory.fill` instead of `memmove`/`memset` libcalls.
+pub const BULK_MEMORY_TARGET_FEATURES: &str = "+bulk-memory";
+/// Shared lock table of the `cmpxchg16b` fallback (one definition across all linked modules).
+pub const CMPXCHG16B_LOCKS: &str = "__playgta6_cmpxchg16b_locks";
 
 /// Symbol name of the lifted function for the guest address `va` (e.g. `sub_140001000`).
 pub fn function_symbol(va: u64) -> String {
@@ -241,6 +321,13 @@ pub struct LiftedFunction {
     support: BTreeSet<Support>,
 }
 
+impl LiftedFunction {
+    /// Whether the function contains atomic instructions (its module needs a shared memory).
+    pub fn uses_atomics(&self) -> bool {
+        self.support.contains(&Support::Atomics)
+    }
+}
+
 /// Module-level declarations or internal helper definitions a lifted function relies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Support {
@@ -252,6 +339,49 @@ enum Support {
     Sdiv128,
     /// An intrinsic used by lifted SSE/AVX code.
     Simd(function::simd::Decl),
+    /// `llvm.{cttz,ctlz,ctpop,bswap}.iN` (never `Ctpop` at 8 bits: that is [`Support::Ctpop8`]).
+    BitIntrinsic(BitIntrinsic, u32),
+    /// `llvm.memmove` (needs `+bulk-memory`, otherwise wasm lowers it to a `memmove` libcall).
+    Memmove,
+    /// `llvm.memset` (needs `+bulk-memory`, otherwise wasm lowers it to a `memset` libcall).
+    Memset,
+    /// Atomic instructions or fences: the module is compiled with [`ATOMICS_TARGET_FEATURES`].
+    Atomics,
+    /// The internal `cmpxchg16b` helper and the shared lock table it uses.
+    Cmpxchg16b,
+    Pdep,
+    Pext,
+    Crc32c,
+    Helper(RuntimeHelper),
+}
+
+/// LLVM bit-manipulation intrinsics used by the lifter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BitIntrinsic {
+    Cttz,
+    Ctlz,
+    Ctpop,
+    Bswap,
+}
+
+/// Optional runtime helpers, declared only by modules that use them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RuntimeHelper {
+    Cpuid,
+    Rdtsc,
+    Rdtscp,
+    Xgetbv,
+}
+
+impl RuntimeHelper {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Cpuid => HELPER_CPUID,
+            Self::Rdtsc => HELPER_RDTSC,
+            Self::Rdtscp => HELPER_RDTSCP,
+            Self::Xgetbv => HELPER_XGETBV,
+        }
+    }
 }
 
 /// A complete lifted module.
@@ -261,6 +391,14 @@ pub struct LiftedModule {
     pub ir: String,
     /// Per-function results, sorted by entry address.
     pub functions: Vec<LiftedFunction>,
+}
+
+impl LiftedModule {
+    /// Whether the module is compiled with [`ATOMICS_TARGET_FEATURES`] and must therefore be
+    /// linked against a shared memory (`wasm-ld --shared-memory`).
+    pub fn requires_shared_memory(&self) -> bool {
+        self.functions.iter().any(LiftedFunction::uses_atomics)
+    }
 }
 
 /// Lifts a single function. The result is a fragment; use [`emit_module`] to get a full module.
@@ -356,7 +494,30 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
                 );
             }
             Support::Simd(decl) => out.push_str(&decl.declaration()),
-            Support::Umul128 | Support::Udiv128 | Support::Sdiv128 => {}
+            Support::BitIntrinsic(kind, bits) => {
+                let (name, flag) = match kind {
+                    BitIntrinsic::Cttz => ("cttz", ", i1"),
+                    BitIntrinsic::Ctlz => ("ctlz", ", i1"),
+                    BitIntrinsic::Ctpop => ("ctpop", ""),
+                    BitIntrinsic::Bswap => ("bswap", ""),
+                };
+                let _ = writeln!(out, "declare i{bits} @llvm.{name}.i{bits}(i{bits}{flag})");
+            }
+            Support::Memmove => {
+                out.push_str("declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)\n");
+            }
+            Support::Memset => out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"),
+            Support::Helper(helper) => {
+                let _ = writeln!(out, "declare void @{}(ptr)", helper.symbol());
+            }
+            Support::Umul128
+            | Support::Udiv128
+            | Support::Sdiv128
+            | Support::Atomics
+            | Support::Cmpxchg16b
+            | Support::Pdep
+            | Support::Pext
+            | Support::Crc32c => {}
         }
     }
     for item in &support {
@@ -364,6 +525,10 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
             Support::Umul128 => function::UMUL128_IR,
             Support::Udiv128 => function::UDIV128_IR,
             Support::Sdiv128 => function::SDIV128_IR,
+            Support::Cmpxchg16b => function::CMPXCHG16B_IR,
+            Support::Pdep => function::PDEP_IR,
+            Support::Pext => function::PEXT_IR,
+            Support::Crc32c => function::CRC32C_IR,
             _ => continue,
         };
         out.push('\n');
@@ -373,8 +538,34 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
         out.push('\n');
         out.push_str(&func.ir);
     }
+    // Target features are a function attribute in LLVM IR. Every definition gets `#0`: the
+    // lifted functions already name it, internal helpers are tagged here (the wasm backend unifies
+    // the features per module anyway). Atomics and bulk memory are added only when used.
+    let extra = if support.contains(&Support::Atomics) {
+        Some(ATOMICS_TARGET_FEATURES)
+    } else if support.contains(&Support::Memmove) || support.contains(&Support::Memset) {
+        Some(BULK_MEMORY_TARGET_FEATURES)
+    } else {
+        None
+    };
+    let attributes = match extra {
+        None => LIFTED_FUNCTION_ATTRIBUTES.to_string(),
+        Some(extra) => {
+            let mut tagged = String::with_capacity(out.len() + 64);
+            for line in out.lines() {
+                tagged.push_str(line);
+                if line.starts_with("define ") && line.ends_with(") {") {
+                    tagged.truncate(tagged.len() - 2);
+                    tagged.push_str(" #0 {");
+                }
+                tagged.push('\n');
+            }
+            out = tagged;
+            module_attributes(extra)
+        }
+    };
     out.push('\n');
-    let _ = writeln!(out, "attributes #0 = {{ {LIFTED_FUNCTION_ATTRIBUTES} }}");
+    let _ = writeln!(out, "attributes #0 = {{ {attributes} }}");
     Ok(out)
 }
 

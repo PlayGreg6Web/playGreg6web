@@ -407,7 +407,7 @@ fn unsupported_instructions_trap_and_are_reported() {
         let mut skip = a.create_label();
         a.test(ecx, ecx)?;
         a.jz(skip)?;
-        a.cpuid()?;
+        a.in_(eax, dx)?;
         a.mov(eax, 1)?;
         a.set_label(&mut skip)?;
         a.fld(dword_ptr(rax))?;
@@ -416,37 +416,37 @@ fn unsupported_instructions_trap_and_are_reported() {
     let module = lift_module([&func]).expect("lifts despite unsupported instructions");
     let report = &module.functions[0].unsupported;
     assert_eq!(report.len(), 2, "{report:?}");
-    assert_eq!(report[0].instruction, "cpuid");
-    assert_eq!(report[0].mnemonic, "cpuid");
-    assert!(report[0].reason.contains("Cpuid"), "{:?}", report[0]);
+    assert_eq!(report[0].instruction, "in eax,dx");
+    assert_eq!(report[0].mnemonic, "in");
+    assert!(report[0].reason.contains("In"), "{:?}", report[0]);
     assert_eq!(report[1].mnemonic, "fld");
     assert!(
         report[1].instruction.starts_with("fld st,dword ptr"),
         "{:?}",
         report[1]
     );
-    let cpuid_va = report[0].address;
-    let trap =
-        format!("call void @{HELPER_UNIMPLEMENTED}(ptr %state, i64 {cpuid_va})\n  unreachable");
+    let in_va = report[0].address;
+    let trap = format!("call void @{HELPER_UNIMPLEMENTED}(ptr %state, i64 {in_va})\n  unreachable");
     assert!(module.ir.contains(&trap), "{}", module.ir);
     // The instruction after the trap in the same block is not lifted.
-    let body = block_text(&module.ir, &format!("bb_{cpuid_va:X}"));
+    let body = block_text(&module.ir, &format!("bb_{in_va:X}"));
     assert!(!body.contains("store i64 1,"), "{body}");
 }
 
 #[test]
 fn unsupported_conditional_branches_trap() {
-    // loop rel8 is a conditional branch R2 understands but the lifter does not support yet.
-    let func = asm_function(0x1000, |a| {
-        let mut top = a.create_label();
-        a.set_label(&mut top)?;
-        a.inc(eax)?;
-        a.loop_(top)?;
-        a.ret()
-    });
+    // `addr32 loop` (ECX counter) is a conditional branch R2 understands but the lifter does not
+    // support: inc eax ; addr32 loop 0x1000 ; ret
+    let bytes = [0xFF, 0xC0, 0x67, 0xE2, 0xFB, 0xC3];
+    let func = Program::new().bytes(0x1000, &bytes).function(0x1000);
     let lifted = lift_function(&func).expect("lifts");
     assert_eq!(lifted.unsupported.len(), 1, "{:?}", lifted.unsupported);
     assert_eq!(lifted.unsupported[0].mnemonic, "loop");
+    assert!(
+        lifted.unsupported[0].reason.contains("32-bit address size"),
+        "{:?}",
+        lifted.unsupported[0]
+    );
 }
 
 #[test]
