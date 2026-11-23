@@ -32,6 +32,7 @@ add_library(playgta6_core STATIC
     gpu/descriptor_heap.cpp
     gpu/state_bridge.cpp
     guest/guest_runtime.cpp
+    guest/guest_exceptions.cpp
     guest/com_bridge.cpp
     guest/guest_callbacks.cpp
     guest/cpu_helpers.cpp
@@ -150,6 +151,10 @@ else()
     add_executable(test_guest_runtime ../tests/test_guest_runtime.cpp)
     target_link_libraries(test_guest_runtime PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_runtime_tests COMMAND test_guest_runtime)
+
+    add_executable(test_guest_exceptions ../tests/test_guest_exceptions.cpp)
+    target_link_libraries(test_guest_exceptions PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_exceptions_tests COMMAND test_guest_exceptions)
 
     add_executable(test_com_bridge ../tests/test_com_bridge.cpp)
     target_link_libraries(test_com_bridge PRIVATE playgta6_core)

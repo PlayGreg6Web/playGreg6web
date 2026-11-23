@@ -201,6 +201,12 @@ const char* fault_kind_name(FaultKind kind) {
             return "guest stack not writable";
         case FaultKind::GeneralProtection:
             return "general protection fault (#GP)";
+        case FaultKind::UnhandledException:
+            return "unhandled guest exception";
+        case FaultKind::UnknownResumeTarget:
+            return "context restore to an unknown resume target";
+        case FaultKind::UnwindFailed:
+            return "guest unwind failed";
     }
     return "unknown fault";
 }
@@ -378,6 +384,18 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size) {
         case FaultKind::GeneralProtection:
             out.append(" (xgetbv with invalid XCR index 0x%" PRIx64 ")", info.detail);
             break;
+        case FaultKind::UnhandledException:
+            out.append(" (exception code 0x%08" PRIx64 ")", info.detail);
+            break;
+        case FaultKind::UnknownResumeTarget:
+            out.append(" (restored rsp 0x%016" PRIx64
+                       "; no active guest frame resumes there: not a resume target of the function "
+                       "owning that frame, or the frame is not on this thread's guest stack)",
+                       info.detail);
+            break;
+        case FaultKind::UnwindFailed:
+            out.append(" (target frame 0x%016" PRIx64 ")", info.detail);
+            break;
         default:
             break;
     }
@@ -442,10 +460,37 @@ void destroy_guest_thread(os::VirtualMemoryArena& arena, GuestThread& thread) {
     thread = GuestThread{};
 }
 
+namespace {
+
+thread_local const GuestCallBoundary* t_innermost_call = nullptr;
+
+// Links a call_guest activation into the thread's boundary chain for its lifetime.
+struct BoundaryScope {
+    GuestCallBoundary boundary;
+    explicit BoundaryScope(const GuestCallBoundary& b) : boundary(b) { t_innermost_call = &boundary; }
+    ~BoundaryScope() { t_innermost_call = boundary.outer; }
+    BoundaryScope(const BoundaryScope&) = delete;
+    BoundaryScope& operator=(const BoundaryScope&) = delete;
+};
+
+}  // namespace
+
+const GuestCallBoundary* innermost_guest_call() {
+    return t_innermost_call;
+}
+
 uint64_t call_guest(os::VirtualMemoryArena& arena,
                     GuestState& state,
                     uint64_t va,
                     std::span<const uint64_t> args) {
+    return call_guest_tagged(arena, state, va, args, nullptr);
+}
+
+uint64_t call_guest_tagged(os::VirtualMemoryArena& arena,
+                           GuestState& state,
+                           uint64_t va,
+                           std::span<const uint64_t> args,
+                           const void* tag) {
     static constexpr uint32_t kArgRegs[4] = {GuestReg::Rcx, GuestReg::Rdx, GuestReg::R8,
                                              GuestReg::R9};
     const uint64_t saved_rsp = state.gpr[GuestReg::Rsp];
@@ -476,7 +521,19 @@ uint64_t call_guest(os::VirtualMemoryArena& arena,
     }
     state.gpr[GuestReg::Rsp] = entry_rsp;
 
-    __playgta6_indirect_call(&state, va);
+    {
+        const BoundaryScope scope(GuestCallBoundary{t_innermost_call, entry_rsp, saved_rsp, tag});
+        __playgta6_indirect_call(&state, va);
+        if (state.unwind_pending != 0) {
+            // A context restore is propagating. It belongs to an enclosing guest frame only if its
+            // rsp lies above this activation's frame and an enclosing activation exists.
+            if (state.gpr[GuestReg::Rsp] <= entry_rsp || scope.boundary.outer == nullptr) {
+                raise_fault(FaultKind::UnknownResumeTarget, &state, state.resume_rip,
+                            state.gpr[GuestReg::Rsp]);
+            }
+            return state.gpr[GuestReg::Rax];
+        }
+    }
 
     if (state.gpr[GuestReg::Rsp] != entry_rsp + 8) {
         raise_fault(FaultKind::StackImbalance, &state, va, state.gpr[GuestReg::Rsp]);
@@ -538,6 +595,11 @@ PG6_GUEST_HELPER void __playgta6_indirect_call(GuestState* state, uint64_t targe
 
 PG6_GUEST_HELPER void __playgta6_trap(GuestState* state, uint64_t va) {
     state->rip = va;
+    if (state->unwind_pending != 0) {
+        // The activation owning the restored rsp has no block at the resume rip.
+        guest::raise_fault(guest::FaultKind::UnknownResumeTarget, state, state->resume_rip,
+                           state->gpr[playgta6::GuestReg::Rsp]);
+    }
     guest::raise_fault(guest::FaultKind::Trap, state, va);
 }
 

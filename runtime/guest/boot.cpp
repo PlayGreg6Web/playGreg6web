@@ -579,6 +579,14 @@ const char* fault_kind_id(FaultKind kind) {
             return "stack_imbalance";
         case FaultKind::BadStack:
             return "bad_stack";
+        case FaultKind::UnhandledException:
+            return "unhandled_exception";
+        case FaultKind::UnknownResumeTarget:
+            return "unknown_resume_target";
+        case FaultKind::UnwindFailed:
+            return "unwind_failed";
+        default:
+            break;
     }
     return "unknown";
 }

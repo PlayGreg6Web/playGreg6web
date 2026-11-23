@@ -54,10 +54,23 @@
 // Emscripten build that is a wasm trap (`RuntimeError: Aborted`) that reaches the JS loader's
 // abort handler. A custom handler must not return (throw, longjmp or terminate); if it does
 // return, the default handler runs. Unwinding out of the handler skips the rest of the faulting
-// guest call (call_guest does not restore rsp in that case); the runtime keeps no destructible
-// objects alive across guest code, so a C++ exception thrown by the handler unwinds cleanly
+// guest call (call_guest does not restore rsp in that case); the only object with a destructor
+// the runtime keeps alive across guest code is call_guest's boundary record (it unlinks itself),
+// so a C++ exception thrown by the handler unwinds cleanly
 // through the extern "C" helper frames (tested with MSVC /EHsc x64, GCC, and Emscripten wasm64
 // with -fexceptions; Emscripten builds without exception support abort on throw instead).
+//
+// Context restores (guest exceptions, longjmp)
+// ---------------------------------------------
+// guest/guest_exceptions.h continues execution at an arbitrary guest rip by setting
+// GuestState::unwind_pending (see docs/wasm_abi.md): every lifted activation returns until the
+// one owning the restored rsp resumes. call_guest takes part: when the guest code it called
+// returns with unwind_pending set, it returns at once without touching rsp, and its caller must
+// do the same (check unwind_pending after every call_guest that can run guest code). A restored
+// rsp at or below call_guest's entry frame means no activation inside claimed the target, and a
+// restore that leaves the outermost call_guest of a thread has no target at all; both raise
+// UnknownResumeTarget. Every call_guest activation is recorded as a GuestCallBoundary so the
+// unwinder can walk guest frames across the host frames between two guest activations.
 //
 // Guest memory
 // ------------
@@ -124,6 +137,9 @@ enum class FaultKind : uint32_t {
     StackImbalance = 5,  // va = call_guest entry; detail = rsp after return (expected rsp + 8)
     BadStack = 6,        // va = call_guest entry; detail = stack address that is not writable
     GeneralProtection = 7,  // #GP from a CPU helper (xgetbv): va = rip; detail = bad XCR index
+    UnhandledException = 8,   // va = exception address; detail = exception code
+    UnknownResumeTarget = 9,  // va = resume rip; detail = restored rsp
+    UnwindFailed = 10,        // va = target ip (0 if none); detail = target frame
 };
 
 const char* fault_kind_name(FaultKind kind);
@@ -216,6 +232,25 @@ uint64_t call_guest(os::VirtualMemoryArena& arena,
                     GuestState& state,
                     uint64_t va,
                     std::span<const uint64_t> args = {});
+
+// One call_guest activation of this thread. The guest frames it runs sit below `sentinel_rsp`
+// (where kGuestReturnSentinel is stored); the host code that called call_guest had `caller_rsp`.
+struct GuestCallBoundary {
+    const GuestCallBoundary* outer;  // enclosing activation of this thread, or nullptr
+    uint64_t sentinel_rsp;
+    uint64_t caller_rsp;
+    const void* tag;  // set by the caller of call_guest_tagged (nullptr for call_guest)
+};
+
+// Innermost call_guest activation of the calling thread (nullptr outside guest code).
+const GuestCallBoundary* innermost_guest_call();
+
+// call_guest that records `tag` in its GuestCallBoundary (for the exception dispatcher).
+uint64_t call_guest_tagged(os::VirtualMemoryArena& arena,
+                           GuestState& state,
+                           uint64_t va,
+                           std::span<const uint64_t> args,
+                           const void* tag);
 
 template <typename... Args>
 uint64_t call_guest_args(os::VirtualMemoryArena& arena, GuestState& state, uint64_t va, Args... args) {
