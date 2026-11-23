@@ -37,6 +37,10 @@
 // the shim's C signature, translate guest VAs to host pointers, and put the result back in RAX.
 // Until then the address is a lookup key for that dispatcher and callable from host code only.
 //
+// register_all_shim_exports() also registers the xgameruntime.dll provider exports
+// (xgameruntime_provider.h: QueryApiImpl, InitializeApiImpl*, XErrorReport, UninitializeApiImpl),
+// which are guest-callable thunks rather than host C-ABI shims and so are not table entries.
+//
 // Uncertain placements: XGameRuntimeIsInitialized is not a documented GDK export (the shim backs
 // runtime-internal state checks) and is published under xgameruntime.dll only so no shim is
 // hidden. The XSAPI module name carries a toolset version in the GDK (141 here); the unversioned

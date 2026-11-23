@@ -326,6 +326,19 @@ void XTaskQueueCloseHandle(XTaskQueueHandle queue) {
     release_task_queue(queue);
 }
 
+HResult XTaskQueueDuplicateHandle(XTaskQueueHandle queue, XTaskQueueHandle* duplicated_handle) {
+    if (duplicated_handle == nullptr) {
+        return E_POINTER_HR;
+    }
+    *duplicated_handle = nullptr;
+    if (queue == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    retain_task_queue(queue);
+    *duplicated_handle = queue;
+    return S_OK_HR;
+}
+
 HResult XTaskQueueSubmitCallback(XTaskQueueHandle queue,
                                  XTaskQueuePort port,
                                  void* callback_context,
@@ -687,6 +700,11 @@ Pg6HResult pg6_gdk_xtask_queue_create(uint32_t work_mode,
 
 void pg6_gdk_xtask_queue_close_handle(Pg6XTaskQueueHandle queue) {
     playgta6::os::gdk::XTaskQueueCloseHandle(queue);
+}
+
+Pg6HResult pg6_gdk_xtask_queue_duplicate_handle(Pg6XTaskQueueHandle queue,
+                                                Pg6XTaskQueueHandle* duplicated_handle) {
+    return playgta6::os::gdk::XTaskQueueDuplicateHandle(queue, duplicated_handle);
 }
 
 Pg6HResult pg6_gdk_xtask_queue_submit_callback(Pg6XTaskQueueHandle queue,

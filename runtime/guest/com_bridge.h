@@ -461,6 +461,12 @@ public:
         }
     }
     T* get() const { return ptr_; }
+    // Gives up ownership of the reference without releasing it (the caller now owns it).
+    T* release_ownership() {
+        T* p = ptr_;
+        ptr_ = nullptr;
+        return p;
+    }
     T* operator->() const { return ptr_; }
     T& operator*() const { return *ptr_; }
     explicit operator bool() const { return ptr_ != nullptr; }

@@ -8,6 +8,7 @@
 #include "os/win32_sync.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
+#include "os/xgameruntime_provider.h"
 
 namespace {
 
@@ -115,6 +116,7 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(XGR, "XGameRuntimeIsInitialized", pg6_gdk_xgame_runtime_is_initialized) \
     E(XGR, "XTaskQueueCreate", pg6_gdk_xtask_queue_create) \
     E(XGR, "XTaskQueueCloseHandle", pg6_gdk_xtask_queue_close_handle) \
+    E(XGR, "XTaskQueueDuplicateHandle", pg6_gdk_xtask_queue_duplicate_handle) \
     E(XGR, "XTaskQueueSubmitCallback", pg6_gdk_xtask_queue_submit_callback) \
     E(XGR, "XTaskQueueDispatch", pg6_gdk_xtask_queue_dispatch) \
     E(XGR, "XTaskQueueTerminate", pg6_gdk_xtask_queue_terminate) \
@@ -341,7 +343,11 @@ namespace playgta6::os::win32 {
 size_t register_all_shim_exports() {
     static std::once_flag once;
     static size_t registered = 0;
-    std::call_once(once, [] { registered = register_all_once(); });
+    std::call_once(once, [] {
+        registered = register_all_once();
+        // Guest-callable QueryApiImpl / InitializeApiImpl* / XErrorReport / UninitializeApiImpl.
+        gdk::provider::register_xgameruntime_provider();
+    });
     return registered;
 }
 

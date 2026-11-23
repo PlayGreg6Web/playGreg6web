@@ -53,6 +53,13 @@
 //                                (merge sort on an index array, so an inconsistent guest
 //                                comparator cannot make the host read out of bounds)
 //   _initterm, _initterm_e       call the guest function-pointer table [first, last)
+//   GetProcAddress               reads the name (or MAKEINTRESOURCE ordinal: HIWORD == 0) from
+//                                guest memory, resolves it in the O7 module registry and returns
+//                                the export's guest-callable synthetic address
+//                                (guest_callable_for_proc). Exports registered only as host
+//                                functions (no guest thunk) are not callable by guest code: they
+//                                return NULL with ERROR_PROC_NOT_FOUND and a diagnostic instead of
+//                                a host function pointer.
 
 namespace playgta6::guest::callbacks {
 
@@ -113,5 +120,6 @@ void pg6_gthunk_qsort(void* state);
 void pg6_gthunk_bsearch(void* state);
 void pg6_gthunk_initterm(void* state);
 void pg6_gthunk_initterm_e(void* state);
+void pg6_gthunk_get_proc_address(void* state);
 
 }  // extern "C"

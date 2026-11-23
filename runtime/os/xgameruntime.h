@@ -72,11 +72,12 @@ inline constexpr bool failed(HResult hr) {
 inline constexpr uint64_t kOfflineUserXuid = 0x0009000000000001ULL;
 inline constexpr const char* kOfflineUserGamertag = "OfflinePlayer";
 
-// XTaskQueue enums matching Xbox GDK XTaskQueue.h.
+// XTaskQueue enums matching Xbox GDK XTaskQueue.h (Manual is 0 there; guest code passes the raw
+// values, e.g. through the xgameruntime.dll provider).
 enum class XTaskQueueDispatchMode : uint32_t {
-    ThreadPool = 0,
-    SerializedThreadPool = 1,
-    Manual = 2,
+    Manual = 0,
+    ThreadPool = 1,
+    SerializedThreadPool = 2,
     Immediate = 3,
 };
 
@@ -130,6 +131,9 @@ HResult XTaskQueueCreate(XTaskQueueDispatchMode work_mode,
                          XTaskQueueHandle* queue);
 
 void XTaskQueueCloseHandle(XTaskQueueHandle queue);
+
+// Adds a reference: *duplicated_handle is the same queue and needs its own XTaskQueueCloseHandle.
+HResult XTaskQueueDuplicateHandle(XTaskQueueHandle queue, XTaskQueueHandle* duplicated_handle);
 
 HResult XTaskQueueSubmitCallback(XTaskQueueHandle queue,
                                  XTaskQueuePort port,
@@ -191,6 +195,8 @@ Pg6HResult pg6_gdk_xtask_queue_create(uint32_t work_mode,
                                       uint32_t completion_mode,
                                       Pg6XTaskQueueHandle* queue);
 void pg6_gdk_xtask_queue_close_handle(Pg6XTaskQueueHandle queue);
+Pg6HResult pg6_gdk_xtask_queue_duplicate_handle(Pg6XTaskQueueHandle queue,
+                                                Pg6XTaskQueueHandle* duplicated_handle);
 Pg6HResult pg6_gdk_xtask_queue_submit_callback(Pg6XTaskQueueHandle queue,
                                                uint32_t port,
                                                void* callback_context,

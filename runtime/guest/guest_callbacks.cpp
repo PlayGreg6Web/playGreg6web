@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
+#include "os/win32_loader.h"
 
 namespace playgta6::guest::callbacks {
 
@@ -407,6 +409,43 @@ int32_t initterm_e_impl(CallContext& ctx, uint64_t first, uint64_t last) {
     return 0;
 }
 
+uint64_t get_proc_address_impl(uint64_t module, uint64_t name_or_ordinal) {
+    namespace win32 = playgta6::os::win32;
+    std::string name;
+    uint64_t proc = 0;
+    if ((name_or_ordinal >> 16) == 0) {
+        name = "#" + std::to_string(name_or_ordinal);
+        proc = win32::GetProcAddressByOrdinal(module, static_cast<uint32_t>(name_or_ordinal));
+    } else {
+        // Read the NUL-terminated ASCII name from guest memory (bounded).
+        for (uint64_t i = 0; i < 1024; ++i) {
+            char c = 0;
+            if (!com::read_guest(name_or_ordinal + i, &c, 1)) {
+                com::detail::log_bad_pointer("GetProcAddress name", name_or_ordinal);
+                win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            if (c == 0) {
+                break;
+            }
+            name.push_back(c);
+        }
+        proc = win32::GetProcAddressByName(module, name);
+    }
+    if (proc == 0) {
+        return 0;  // GetProcAddressBy* set the last error
+    }
+    const uint64_t callable = guest_callable_for_proc(proc);
+    if (callable == 0) {
+        com::detail::diagnostic(
+            ("guest callbacks: GetProcAddress(" + hex(module) + ", " + name +
+             ") found a host-only export with no guest-callable entry")
+                .c_str());
+        win32::SetLastError(win32::ERROR_PROC_NOT_FOUND);
+    }
+    return callable;
+}
+
 }  // namespace
 
 }  // namespace playgta6::guest::callbacks
@@ -442,6 +481,10 @@ void pg6_gthunk_initterm(void* state) {
 
 void pg6_gthunk_initterm_e(void* state) {
     gcom::function_thunk<&cb::initterm_e_impl>()(state);
+}
+
+void pg6_gthunk_get_proc_address(void* state) {
+    gcom::function_thunk<&cb::get_proc_address_impl>()(state);
 }
 
 }  // extern "C"

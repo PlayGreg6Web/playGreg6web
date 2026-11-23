@@ -15,6 +15,7 @@
 #include "guest/guest_runtime.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/win32_loader.h"
 #include "os/win32_sync.h"
 #include "os/xgameruntime.h"
 
@@ -929,7 +930,7 @@ void test_task_queue_trampolines() {
     // Manual queue dispatched from a host thread with no bound guest state: a guest thread is
     // created lazily for it.
     Pg6XTaskQueueHandle queue = nullptr;
-    CHECK(pg6_gdk_xtask_queue_create(2, 2, &queue) == 0);
+    CHECK(pg6_gdk_xtask_queue_create(0, 0, &queue) == 0);  // Manual
     const uint64_t q = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(queue));
     g_record_calls = 0;
     CHECK(as_hr(fx.dcall(submit, {I(q), I(0), I(0xC0FFEE), I(kGuestRecord)})) == 0);
@@ -954,7 +955,7 @@ void test_task_queue_trampolines() {
     pg6_gdk_xtask_queue_close_handle(queue);
 
     // Thread-pool queue: the guest callback runs on a worker thread.
-    CHECK(pg6_gdk_xtask_queue_create(0, 0, &queue) == 0);
+    CHECK(pg6_gdk_xtask_queue_create(1, 1, &queue) == 0);  // ThreadPool
     g_record_calls = 0;
     g_record_thread = std::thread::id{};
     CHECK(as_hr(fx.dcall(submit, {I(reinterpret_cast<uintptr_t>(queue)), I(0), I(0x5150), I(kGuestRecord)})) == 0);
@@ -1052,6 +1053,41 @@ void test_async_shadow() {
     CHECK(cbk::async_shadow_begin(0) == nullptr);
 }
 
+void host_only_export() {}
+
+void guest_thunk_export(void* state) {
+    gpr(static_cast<GuestState*>(state), GuestReg::Rax) = 0x600D;
+    ret(static_cast<GuestState*>(state));
+}
+
+void test_get_proc_address_thunk() {
+    Fixture fx;
+    namespace win32 = playgta6::os::win32;
+    const uint64_t proc = win32::proc_address(&guest_thunk_export);
+    CHECK(win32::register_export("o16_test_module.dll", "GuestEntry", 7, proc));
+    CHECK(win32::register_export("o16_test_module.dll", "HostOnly", 0, win32::proc_address(&host_only_export)));
+    const uint64_t synthetic = register_host_callable(&guest_thunk_export, "GuestEntry", proc);
+    const uint64_t module = win32::GetModuleHandleA("o16_test_module.dll");
+    CHECK(module != 0);
+    const uint64_t gpa = register_host_callable(&pg6_gthunk_get_proc_address, "GetProcAddress");
+    const char name[] = "GuestEntry";
+    const uint64_t name_va = com::guest_alloc(sizeof(name));
+    CHECK(com::write_guest(name_va, name, sizeof(name)));
+    CHECK(fx.dcall(gpa, {I(module), I(name_va)}) == synthetic);
+    CHECK(fx.dcall(gpa, {I(module), I(7)}) == synthetic);  // MAKEINTRESOURCE ordinal
+    CHECK(call_guest(fx.arena, fx.state(), synthetic) == 0x600D);
+    const char host_only[] = "HostOnly";
+    CHECK(com::write_guest(name_va, host_only, sizeof(host_only)));
+    com::clear_diagnostics();
+    CHECK(fx.dcall(gpa, {I(module), I(name_va)}) == 0);
+    CHECK(pg6_win32_get_last_error() == win32::ERROR_PROC_NOT_FOUND);
+    CHECK(diag_contains("host-only export"));
+    const char missing[] = "Missing";
+    CHECK(com::write_guest(name_va, missing, sizeof(missing)));
+    CHECK(fx.dcall(gpa, {I(module), I(name_va)}) == 0);
+    CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
+}
+
 }  // namespace
 
 int main() {
@@ -1068,6 +1104,7 @@ int main() {
     test_create_thread_trampoline();
     test_crt_callbacks();
     test_async_shadow();
+    test_get_proc_address_thunk();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_com_bridge: %d failure(s)\n", g_failures);
         return 1;

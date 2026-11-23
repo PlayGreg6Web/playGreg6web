@@ -35,6 +35,7 @@ add_library(playgta6_core STATIC
     guest/guest_callbacks.cpp
     guest/cpu_helpers.cpp
     guest/boot.cpp
+    os/xgameruntime_provider.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -144,6 +145,7 @@ else()
     add_executable(test_com_bridge ../tests/test_com_bridge.cpp)
     target_link_libraries(test_com_bridge PRIVATE playgta6_core)
     add_test(NAME playgta6_com_bridge_tests COMMAND test_com_bridge)
+
     add_executable(test_cpu_helpers ../tests/test_cpu_helpers.cpp)
     target_link_libraries(test_cpu_helpers PRIVATE playgta6_core)
     add_test(NAME playgta6_cpu_helpers_tests COMMAND test_cpu_helpers)
@@ -155,4 +157,8 @@ else()
     add_executable(test_winsock_ordinals ../tests/test_winsock_ordinals.cpp)
     target_link_libraries(test_winsock_ordinals PRIVATE playgta6_core)
     add_test(NAME playgta6_winsock_ordinals_tests COMMAND test_winsock_ordinals)
+
+    add_executable(test_xgameruntime_provider ../tests/test_xgameruntime_provider.cpp)
+    target_link_libraries(test_xgameruntime_provider PRIVATE playgta6_core)
+    add_test(NAME playgta6_xgameruntime_provider_tests COMMAND test_xgameruntime_provider)
 endif()

@@ -36,7 +36,7 @@ Pg6ProcAddress by_name(Pg6Handle module, const char* name) {
 
 void test_registration_idempotent() {
     const size_t first = pg6_loader_register_all_shim_exports();
-    CHECK(first == 281);
+    CHECK(first == 282);
     CHECK(register_all_shim_exports() == first);
     CHECK(pg6_loader_register_all_shim_exports() == first);
 
@@ -80,7 +80,7 @@ void test_table_counts_and_lookup() {
     CHECK(per_module["ADVAPI32.dll"] == 10);
     CHECK(per_module["WS2_32.dll"] == 24);
     CHECK(per_module["WINHTTP.dll"] == 15);
-    CHECK(per_module["xgameruntime.dll"] == 39);
+    CHECK(per_module["xgameruntime.dll"] == 40);
     CHECK(per_module["Microsoft.Xbox.Services.141.GDK.C.Thunks.dll"] == 21);
     CHECK(per_module["bcrypt.dll"] == 3);
     CHECK(per_module["USER32.dll"] == 7);
