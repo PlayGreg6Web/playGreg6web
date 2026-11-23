@@ -54,6 +54,36 @@ const BUFFER_USAGE = Object.freeze({
 
 const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
 
+function resolveGpuRingBuffer(injectedCtor) {
+  if (typeof injectedCtor === 'function') {
+    return injectedCtor;
+  }
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6GpuRing &&
+    typeof globalThis.PlayGta6GpuRing.GpuRingBuffer === 'function'
+  ) {
+    return globalThis.PlayGta6GpuRing.GpuRingBuffer;
+  }
+  if (typeof importScripts === 'function') {
+    importScripts('./gpu_ring.js');
+    if (
+      typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6GpuRing &&
+      typeof globalThis.PlayGta6GpuRing.GpuRingBuffer === 'function'
+    ) {
+      return globalThis.PlayGta6GpuRing.GpuRingBuffer;
+    }
+  }
+  if (typeof require === 'function') {
+    const mod = require('./gpu_ring.js');
+    if (mod && typeof mod.GpuRingBuffer === 'function') {
+      return mod.GpuRingBuffer;
+    }
+  }
+  throw new Error('GpuRingBuffer unavailable; load ./gpu_ring.js or inject GpuRingBuffer');
+}
+
 class WgpuCommandProcessor {
   constructor(device, ctx, options = {}) {
     this.device = device;
@@ -63,6 +93,8 @@ class WgpuCommandProcessor {
     this.shaderModules = new Map();
     this.pipelines = new Map();
     this.frameCount = 0;
+    this.ring = null;
+    this._GpuRingBuffer = typeof options.GpuRingBuffer === 'function' ? options.GpuRingBuffer : null;
     this._decoder = new TextDecoder('utf-8');
     this._resetFrameState();
   }
@@ -213,18 +245,55 @@ class WgpuCommandProcessor {
     this._resetFrameState();
   }
 
-  execute(input) {
+  attachRing(ringOrSab, options = {}) {
+    if (ringOrSab && typeof ringOrSab.drainTo === 'function') {
+      this.ring = ringOrSab;
+      return this.ring;
+    }
+    const RingCtor = resolveGpuRingBuffer(options.GpuRingBuffer || this._GpuRingBuffer);
+    const ctorOptions = {};
+    if (options.byteOffset !== undefined) {
+      ctorOptions.byteOffset = options.byteOffset;
+    }
+    if (options.initialize !== undefined) {
+      ctorOptions.initialize = options.initialize;
+    }
+    if (options.capacityBytes !== undefined) {
+      ctorOptions.capacityBytes = options.capacityBytes;
+    }
+    this.ring = new RingCtor(ringOrSab, ctorOptions);
+    return this.ring;
+  }
+
+  drainRing() {
+    if (!this.ring || !this.device || !this.ctx) {
+      return { frameCount: this.frameCount, presents: 0, bytesDrained: 0 };
+    }
+    let presents = 0;
+    const bytesDrained = this.ring.drainTo((bytes) => {
+      const result = this.executeCommandBuffer(bytes);
+      presents += result.presents;
+    });
+    return { frameCount: this.frameCount, presents, bytesDrained };
+  }
+
+  executeCommandBuffer(input) {
     if (!this.device || !this.ctx) {
       return { frameCount: this.frameCount, presents: 0 };
     }
 
     let view;
-    if (input instanceof ArrayBuffer) {
+    if (
+      input instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer)
+    ) {
       view = new DataView(input);
     } else if (ArrayBuffer.isView(input)) {
       view = new DataView(input.buffer, input.byteOffset, input.byteLength);
     } else {
-      throw new TypeError('WgpuCommandProcessor.execute expects an ArrayBuffer or ArrayBufferView');
+      throw new TypeError(
+        'WgpuCommandProcessor.executeCommandBuffer expects an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView'
+      );
     }
 
     let offset = 0;
@@ -319,10 +388,133 @@ class WgpuCommandProcessor {
 
     return { frameCount: this.frameCount, presents };
   }
+
+  execute(input) {
+    return this.executeCommandBuffer(input);
+  }
+}
+
+function createWgpuWorkerHandler(options = {}) {
+  const postMessage =
+    typeof options.postMessage === 'function' ? options.postMessage : () => {};
+  const injectedRingCtor =
+    typeof options.GpuRingBuffer === 'function' ? options.GpuRingBuffer : null;
+  let canvas = options.canvas || null;
+  let processor = options.processor || null;
+  let attachedRing = processor && processor.ring ? processor.ring : null;
+
+  async function defaultInitGpu(offscreen, width, height) {
+    canvas = offscreen;
+    canvas.width = width;
+    canvas.height = height;
+
+    if (typeof navigator === 'undefined' || !navigator.gpu) {
+      postMessage({ error: 'navigator.gpu unavailable in worker' });
+      return null;
+    }
+
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) {
+      postMessage({ error: 'no WebGPU adapter available' });
+      return null;
+    }
+
+    const device = await adapter.requestDevice();
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    const ctx = canvas.getContext('webgpu');
+    ctx.configure({ device, format, alphaMode: 'opaque' });
+    processor = new WgpuCommandProcessor(device, ctx, {
+      format,
+      GpuRingBuffer: injectedRingCtor,
+    });
+    if (attachedRing) {
+      processor.attachRing(attachedRing);
+    }
+
+    const info = adapter.info
+      ? `${adapter.info.vendor || 'gpu'} ${adapter.info.architecture || ''}`.trim()
+      : 'WebGPU';
+    postMessage({ ready: true, adapter: info });
+    return processor;
+  }
+
+  const initGpu = typeof options.initGpu === 'function' ? options.initGpu : defaultInitGpu;
+
+  function attachRingFromMessage(msg) {
+    const ringSource = msg.ring || msg.ringSab;
+    if (!ringSource) {
+      throw new Error('attachRing requires ringSab or ring');
+    }
+    const RingCtor =
+      ringSource && typeof ringSource.drainTo === 'function'
+        ? null
+        : resolveGpuRingBuffer(msg.GpuRingBuffer || injectedRingCtor);
+    attachedRing = RingCtor
+      ? new RingCtor(ringSource, { byteOffset: msg.byteOffset || 0 })
+      : ringSource;
+    if (processor) {
+      processor.attachRing(attachedRing);
+    }
+    postMessage({
+      ringAttached: true,
+      capacityBytes: attachedRing.capacityBytes,
+    });
+    return attachedRing;
+  }
+
+  async function handleMessage(msg) {
+    const payload = msg || {};
+    try {
+      if (payload.init && payload.canvas) {
+        const created = await initGpu(
+          payload.canvas,
+          payload.width || 1280,
+          payload.height || 720
+        );
+        if (created && created !== processor) {
+          processor = created;
+        }
+        if (payload.ringSab || payload.ring) {
+          attachRingFromMessage(payload);
+        } else if (attachedRing && processor) {
+          processor.attachRing(attachedRing);
+        }
+      } else if (payload.resize && canvas) {
+        canvas.width = Math.max(1, payload.width | 0);
+        canvas.height = Math.max(1, payload.height | 0);
+      } else if (payload.attachRing) {
+        attachRingFromMessage(payload);
+      } else if (payload.drainRing && processor) {
+        const result = processor.drainRing();
+        if (result.presents > 0) {
+          postMessage({ frame: result.frameCount });
+        }
+      } else if (payload.cmdBuffer && processor) {
+        const result = processor.executeCommandBuffer(payload.cmdBuffer);
+        if (result.presents > 0) {
+          postMessage({ frame: result.frameCount });
+        }
+      }
+    } catch (err) {
+      postMessage({ error: String(err) });
+    }
+  }
+
+  return {
+    handleMessage,
+    get processor() {
+      return processor;
+    },
+    get ring() {
+      return attachedRing;
+    },
+  };
 }
 
 const exportedApi = {
   WgpuCommandProcessor,
+  createWgpuWorkerHandler,
+  resolveGpuRingBuffer,
   OPCODES,
   SHADER_STAGE,
   PRIMITIVE_TOPOLOGY,
@@ -338,51 +530,10 @@ if (typeof module !== 'undefined' && module.exports) {
 }
 
 if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
-  let canvas = null;
-  let processor = null;
-
-  async function initGpu(offscreen, width, height) {
-    canvas = offscreen;
-    canvas.width = width;
-    canvas.height = height;
-
-    if (!navigator.gpu) {
-      self.postMessage({ error: 'navigator.gpu unavailable in worker' });
-      return;
-    }
-
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-    if (!adapter) {
-      self.postMessage({ error: 'no WebGPU adapter available' });
-      return;
-    }
-
-    const device = await adapter.requestDevice();
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    const ctx = canvas.getContext('webgpu');
-    ctx.configure({ device, format, alphaMode: 'opaque' });
-    processor = new WgpuCommandProcessor(device, ctx, { format });
-
-    const info = adapter.info ? `${adapter.info.vendor || 'gpu'} ${adapter.info.architecture || ''}`.trim() : 'WebGPU';
-    self.postMessage({ ready: true, adapter: info });
-  }
-
+  const workerHandler = createWgpuWorkerHandler({
+    postMessage: (data) => self.postMessage(data),
+  });
   self.onmessage = async (ev) => {
-    const msg = ev.data || {};
-    try {
-      if (msg.init && msg.canvas) {
-        await initGpu(msg.canvas, msg.width || 1280, msg.height || 720);
-      } else if (msg.resize && canvas) {
-        canvas.width = Math.max(1, msg.width | 0);
-        canvas.height = Math.max(1, msg.height | 0);
-      } else if (msg.cmdBuffer && processor) {
-        const result = processor.execute(msg.cmdBuffer);
-        if (result.presents > 0) {
-          self.postMessage({ frame: result.frameCount });
-        }
-      }
-    } catch (err) {
-      self.postMessage({ error: String(err) });
-    }
+    await workerHandler.handleMessage(ev ? ev.data : null);
   };
 }
