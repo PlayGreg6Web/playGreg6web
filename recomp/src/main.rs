@@ -1,4 +1,5 @@
 mod lift_cmd;
+mod program_cmd;
 mod report;
 
 use std::env;
@@ -73,6 +74,7 @@ enum Command {
     Stubs(StubsArgs),
     Lift(lift_cmd::LiftArgs),
     Build(BuildArgs),
+    BuildProgram(program_cmd::ProgramArgs),
 }
 
 fn print_usage() {
@@ -90,6 +92,7 @@ fn print_usage() {
     eprintln!(
         "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]"
     );
+    eprintln!("{}", program_cmd::USAGE);
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
@@ -115,6 +118,9 @@ fn print_usage() {
     eprintln!("  --jobs N               build: worker threads for lifting/compiling (default: CPU count; output is identical)");
     eprintln!("  --shard-size N         build: maximum functions per lifted shard (default {})", pipeline::DEFAULT_SHARD_SIZE);
     eprintln!("  --shard-instructions N build: maximum instructions per lifted shard (default {})", pipeline::DEFAULT_SHARD_INSTRUCTIONS);
+    for line in program_cmd::OPTIONS {
+        eprintln!("{line}");
+    }
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
@@ -134,8 +140,10 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
             lift_cmd::parse_lift_args(&args[1..]).map(|a| a.map_or(Command::Help, Command::Lift))
         }
         "build" => parse_build_args(&args[1..]),
+        "build-program" => program_cmd::parse_program_args(&args[1..])
+            .map(|a| a.map_or(Command::Help, Command::BuildProgram)),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift' or 'build'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'build' or 'build-program'. Run with --help for usage."
         )),
     }
 }
@@ -893,6 +901,16 @@ fn main() -> ExitCode {
             }
         },
         Ok(Command::Build(build_args)) => match run_build(&build_args) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::BuildProgram(program_args)) => match program_cmd::run_program(&program_args) {
             Ok(report) => {
                 print!("{report}");
                 ExitCode::SUCCESS

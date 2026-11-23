@@ -641,6 +641,11 @@ pub fn check_import_slots(pe: &Pe64, plan: &BridgePlan, analysis: &Analysis) -> 
             .slot_rva
             .is_some_and(|rva| referenced.contains(&(base + u64::from(rva))));
         match (&import.resolution, used) {
+            // Bound to another guest module by a program build: as good as bound.
+            (_, true) if import.guest.is_some() => {}
+            (_, false) if import.guest.is_some() => {
+                check.unreferenced.push((import.label(), true));
+            }
             (Resolution::Unresolved(why), true) => {
                 check
                     .referenced_unresolved

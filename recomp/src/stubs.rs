@@ -101,6 +101,9 @@ pub const SOURCE_FILE: &str = "pg6_import_thunks.cpp";
 pub const SEAM_FILE: &str = "pg6_guest_seam.h";
 /// Machine-readable binding manifest.
 pub const MANIFEST_FILE: &str = "pg6_import_manifest.json";
+/// Runtime header declaring `Pg6ImportSlotBinding`, included by namespaced bridges
+/// ([`render_bridge_namespaced`]).
+pub const GUEST_RUNTIME_INCLUDE: &str = "guest/guest_runtime.h";
 
 /// Byte offset of the 16 GPRs in the default seam's guest state (lifter layout).
 pub const SEAM_GPR_OFFSET: u64 = crate::lift::STATE_GPR_OFFSET;
@@ -1082,6 +1085,17 @@ pub enum Resolution {
     Unresolved(Unresolved),
 }
 
+/// The export of another guest module an import is bound to by a program build
+/// (`pipeline::program`): the IAT slot is pre-filled with `va` in the guest image, so the import
+/// needs no thunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestTarget {
+    /// Build module name of the exporting guest module.
+    pub module: String,
+    /// Guest VA of the exported function or data.
+    pub va: u64,
+}
+
 /// One import with its IAT slot and binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportBinding {
@@ -1092,7 +1106,11 @@ pub struct ImportBinding {
     /// RVA of the 8-byte IAT slot, `None` when the descriptor has no IAT.
     pub slot_rva: Option<u32>,
     pub delay_load: bool,
+    /// Host shim binding (meaningless while `guest` is set).
     pub resolution: Resolution,
+    /// Set when a program build binds the import to another guest module; such an import gets
+    /// no thunk and no slot table entry and counts as neither bound nor unresolved.
+    pub guest: Option<GuestTarget>,
 }
 
 impl ImportBinding {
@@ -1111,8 +1129,19 @@ impl ImportBinding {
         }
     }
 
+    #[cfg(test)]
     fn thunk_name(&self) -> String {
-        format!("pg6_import_{}", self.index)
+        Names::default().thunk(self.index)
+    }
+
+    /// Bound to a host shim (and not to a guest module).
+    fn host_bound(&self) -> bool {
+        self.guest.is_none() && self.bound_shim().is_some()
+    }
+
+    /// Gets a thunk and a slot table entry.
+    fn tabled(&self) -> bool {
+        self.slot_rva.is_some() && self.guest.is_none()
     }
 }
 
@@ -1125,21 +1154,39 @@ pub struct BridgePlan {
 
 impl BridgePlan {
     pub fn bound_count(&self) -> usize {
-        self.imports
-            .iter()
-            .filter(|b| b.bound_shim().is_some())
-            .count()
+        self.imports.iter().filter(|b| b.host_bound()).count()
     }
 
     pub fn unresolved_count(&self) -> usize {
-        self.imports.len() - self.bound_count()
+        self.imports.len() - self.bound_count() - self.guest_count()
     }
 
-    /// Per-DLL `(dll, bound, unresolved)`, sorted. Spellings of one DLL (case, `.dll` suffix)
-    /// are merged under the first spelling seen.
+    /// Imports bound to another guest module ([`ImportBinding::guest`]).
+    pub fn guest_count(&self) -> usize {
+        self.imports.iter().filter(|b| b.guest.is_some()).count()
+    }
+
+    /// Binds the import whose IAT slot is at `slot_rva` to a guest module's export. Returns
+    /// false when no import uses that slot.
+    pub fn bind_guest(&mut self, slot_rva: u32, target: GuestTarget) -> bool {
+        match self
+            .imports
+            .iter_mut()
+            .find(|b| b.slot_rva == Some(slot_rva))
+        {
+            Some(import) => {
+                import.guest = Some(target);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Per-DLL `(dll, bound, unresolved)` over the imports not bound to a guest module, sorted.
+    /// Spellings of one DLL (case, `.dll` suffix) are merged under the first spelling seen.
     pub fn coverage_by_dll(&self) -> Vec<(String, usize, usize)> {
         let mut by_dll: BTreeMap<String, (String, usize, usize)> = BTreeMap::new();
-        for import in &self.imports {
+        for import in self.imports.iter().filter(|i| i.guest.is_none()) {
             let entry = by_dll
                 .entry(dll_key(&import.dll))
                 .or_insert_with(|| (import.dll.clone(), 0, 0));
@@ -1253,10 +1300,29 @@ pub fn plan_bridge(pe: &Pe64, catalogue: &Catalogue) -> BridgePlan {
                 slot_rva,
                 delay_load,
                 resolution: index.resolve(dll, symbol),
+                guest: None,
             });
         }
     }
     BridgePlan { imports }
+}
+
+/// Resolves `(dll, symbol)` pairs against a catalogue the way [`plan_bridge`] does, e.g. for an
+/// import whose guest export forwards to a runtime DLL.
+pub struct ShimResolver<'a> {
+    index: ShimIndex<'a>,
+}
+
+impl<'a> ShimResolver<'a> {
+    pub fn new(catalogue: &'a Catalogue) -> Self {
+        Self {
+            index: ShimIndex::new(catalogue),
+        }
+    }
+
+    pub fn resolve(&self, dll: &str, symbol: &ImportedSymbol) -> Resolution {
+        self.index.resolve(dll, symbol)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1294,11 +1360,67 @@ impl BridgeOutput {
 
 /// Render the thunk header/source, default seam and manifest for `plan`.
 pub fn render_bridge(plan: &BridgePlan, catalogue: &Catalogue) -> BridgeOutput {
+    render_bridge_with(plan, catalogue, Names::default())
+}
+
+/// [`render_bridge`] for one module of a multi-module program: every generated global name
+/// carries the module name, so the bridges of several modules link into one program.
+///
+/// | Default name | Namespaced name |
+/// | :--- | :--- |
+/// | `pg6_import_<n>` (thunk) | `pg6_import_<ns>_<n>` |
+/// | `pg6_import_thunks`, `pg6_import_thunk_count` | `pg6_import_thunks_<ns>`, `pg6_import_thunk_count_<ns>` |
+/// | `pg6_find_import_thunk` | `pg6_find_import_thunk_<ns>` |
+///
+/// The header guards its shared type definitions (`PG6_IMPORT_THUNK_TYPES_DEFINED`) so several
+/// modules' headers can be included together. The source additionally defines the C-ABI slot
+/// table the runtime program loader binds (`runtime/guest/guest_runtime.h`):
+/// `extern "C" const Pg6ImportSlotBinding* const pg6_import_slots_<ns>` (sorted by slot RVA,
+/// null when empty) and `extern "C" const size_t pg6_import_slot_count_<ns>`. Imports bound to a
+/// guest module ([`ImportBinding::guest`]) get no thunk and no entry, and the manifest records
+/// them with `"status": "guest"`.
+pub fn render_bridge_namespaced(
+    plan: &BridgePlan,
+    catalogue: &Catalogue,
+    namespace: &str,
+) -> BridgeOutput {
+    render_bridge_with(
+        plan,
+        catalogue,
+        Names {
+            ns: Some(namespace),
+        },
+    )
+}
+
+fn render_bridge_with(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> BridgeOutput {
     BridgeOutput {
-        header: render_header(),
-        source: render_source(plan, catalogue),
+        header: render_header(names),
+        source: render_source(plan, catalogue, names),
         seam: render_seam(),
-        manifest: render_manifest(plan, catalogue),
+        manifest: render_manifest(plan, catalogue, names),
+    }
+}
+
+/// Generated global names, optionally suffixed with a module namespace.
+#[derive(Debug, Clone, Copy, Default)]
+struct Names<'a> {
+    ns: Option<&'a str>,
+}
+
+impl Names<'_> {
+    fn global(&self, base: &str) -> String {
+        match self.ns {
+            Some(ns) => format!("{base}_{ns}"),
+            None => base.to_string(),
+        }
+    }
+
+    fn thunk(&self, index: usize) -> String {
+        match self.ns {
+            Some(ns) => format!("pg6_import_{ns}_{index}"),
+            None => format!("pg6_import_{index}"),
+        }
     }
 }
 
@@ -1355,17 +1477,7 @@ fn json_str(s: &str) -> String {
     out
 }
 
-fn render_header() -> String {
-    "\
-// Generated by playgta6-recomp stubs. Do not edit.
-//
-// Import thunks: one per IAT slot of the recompiled image, called with the guest CPU state
-// after the guest pushed its return address (see pg6_guest_seam.h).
-#pragma once
-
-#include <cstddef>
-#include <cstdint>
-
+const HEADER_TYPES: &str = "\
 using Pg6ImportThunkFn = void (*)(void* state);
 
 inline constexpr uint32_t kPg6ImportBound = 1u;      // thunk calls a runtime shim
@@ -1381,15 +1493,54 @@ struct Pg6ImportThunk {
     const char* shim;  // null when unresolved
     Pg6ImportThunkFn thunk;
 };
+";
 
+fn render_header(names: Names<'_>) -> String {
+    let mut out = String::new();
+    match names.ns {
+        None => out.push_str("// Generated by playgta6-recomp stubs. Do not edit.\n"),
+        Some(ns) => {
+            let _ = writeln!(
+                out,
+                "// Generated by playgta6-recomp stubs for module {ns}. Do not edit."
+            );
+        }
+    }
+    out.push_str(
+        "//
+// Import thunks: one per IAT slot of the recompiled image, called with the guest CPU state
+// after the guest pushed its return address (see pg6_guest_seam.h).
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+",
+    );
+    if names.ns.is_some() {
+        out.push_str(
+            "#ifndef PG6_IMPORT_THUNK_TYPES_DEFINED\n#define PG6_IMPORT_THUNK_TYPES_DEFINED\n",
+        );
+        out.push_str(HEADER_TYPES);
+        out.push_str("#endif\n");
+    } else {
+        out.push_str(HEADER_TYPES);
+    }
+    let _ = write!(
+        out,
+        "
 // All thunks with an IAT slot, sorted by slot_rva.
-extern const Pg6ImportThunk* const pg6_import_thunks;
-extern const std::size_t pg6_import_thunk_count;
+extern const Pg6ImportThunk* const {thunks};
+extern const std::size_t {count};
 
 // Thunk bound to the IAT slot at `slot_rva`, or null.
-const Pg6ImportThunk* pg6_find_import_thunk(uint32_t slot_rva);
-"
-    .to_string()
+const Pg6ImportThunk* {find}(uint32_t slot_rva);
+",
+        thunks = names.global("pg6_import_thunks"),
+        count = names.global("pg6_import_thunk_count"),
+        find = names.global("pg6_find_import_thunk"),
+    );
+    out
 }
 
 fn render_seam() -> String {
@@ -1567,8 +1718,8 @@ fn arg_expr(i: usize, ty: &CType) -> String {
     }
 }
 
-fn render_bound_thunk(out: &mut String, import: &ImportBinding, shim: &ShimDecl) {
-    let _ = writeln!(out, "void {}(void* state) {{", import.thunk_name());
+fn render_bound_thunk(out: &mut String, thunk: &str, shim: &ShimDecl) {
+    let _ = writeln!(out, "void {thunk}(void* state) {{");
     if is_guest_state_thunk(shim) {
         // Marshals its own arguments and pops the return address itself.
         let _ = writeln!(out, "    {}(state);", shim.name);
@@ -1621,16 +1772,30 @@ fn slot_text(slot_rva: Option<u32>) -> String {
     slot_rva.map_or_else(|| "none".to_string(), |s| format!("0x{s:x}"))
 }
 
-fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
+fn render_source(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> String {
     let mut out = String::new();
-    out.push_str("// Generated by playgta6-recomp stubs. Do not edit.\n");
-    let _ = writeln!(
+    match names.ns {
+        None => out.push_str("// Generated by playgta6-recomp stubs. Do not edit.\n"),
+        Some(ns) => {
+            let _ = writeln!(
+                out,
+                "// Generated by playgta6-recomp stubs for module {ns}. Do not edit."
+            );
+        }
+    }
+    let _ = write!(
         out,
-        "// {} imports: {} bound, {} unresolved.",
+        "// {} imports: {} bound, {} unresolved",
         plan.imports.len(),
         plan.bound_count(),
         plan.unresolved_count()
     );
+    match plan.guest_count() {
+        0 => out.push_str(".\n"),
+        guest => {
+            let _ = writeln!(out, ", {guest} bound to guest modules.");
+        }
+    }
     let _ = writeln!(out, "#include \"{HEADER_FILE}\"");
     out.push('\n');
     for system in ["atomic", "cstddef", "cstdint", "cstring", "type_traits"] {
@@ -1640,13 +1805,16 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
     out.push_str("#ifdef PG6_GUEST_SEAM_HEADER\n#include PG6_GUEST_SEAM_HEADER\n#else\n");
     let _ = writeln!(out, "#include \"{SEAM_FILE}\"\n#endif");
 
-    let includes: BTreeSet<&str> = plan
+    let mut includes: BTreeSet<&str> = plan
         .imports
         .iter()
-        .filter(|i| i.slot_rva.is_some())
+        .filter(|i| i.tabled())
         .filter_map(|i| catalogue.get(i.bound_shim()?))
         .map(|s| s.include.as_str())
         .collect();
+    if names.ns.is_some() {
+        includes.insert(GUEST_RUNTIME_INCLUDE);
+    }
     if !includes.is_empty() {
         out.push('\n');
         for include in includes {
@@ -1656,13 +1824,10 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
     out.push('\n');
     out.push_str(SOURCE_HELPERS);
 
-    let tabled: Vec<&ImportBinding> = plan
-        .imports
-        .iter()
-        .filter(|i| i.slot_rva.is_some())
-        .collect();
+    let tabled: Vec<&ImportBinding> = plan.imports.iter().filter(|i| i.tabled()).collect();
     for import in &tabled {
         let slot = slot_text(import.slot_rva);
+        let thunk = names.thunk(import.index);
         match (
             &import.resolution,
             import.bound_shim().and_then(|s| catalogue.get(s)),
@@ -1674,7 +1839,7 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
                     comment_text(&import.label()),
                     shim.name
                 );
-                render_bound_thunk(&mut out, import, shim);
+                render_bound_thunk(&mut out, &thunk, shim);
             }
             (resolution, _) => {
                 let reason = match resolution {
@@ -1690,7 +1855,7 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
                     "unresolved import {} (slot {slot}): {reason}",
                     import.label()
                 );
-                let _ = writeln!(out, "void {}(void* state) {{", import.thunk_name());
+                let _ = writeln!(out, "void {thunk}(void* state) {{");
                 out.push_str("    static std::atomic<bool> logged{false};\n");
                 let _ = writeln!(
                     out,
@@ -1705,9 +1870,26 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
 
     let mut sorted = tabled;
     sorted.sort_by_key(|i| (i.slot_rva, i.index));
+    let thunks = names.global("pg6_import_thunks");
+    let count = names.global("pg6_import_thunk_count");
+    let find = names.global("pg6_find_import_thunk");
+    if names.ns.is_some() && !sorted.is_empty() {
+        // The C-ABI slot table of the runtime program loader (one entry per slot, sorted).
+        out.push_str("const Pg6ImportSlotBinding kSlots[] = {\n");
+        for import in &sorted {
+            let _ = writeln!(
+                out,
+                "    {{0x{:08x}u, &{}}},",
+                import.slot_rva.unwrap_or(0),
+                names.thunk(import.index)
+            );
+        }
+        out.push_str("};\n\n");
+    }
     if sorted.is_empty() {
-        out.push_str(
-            "}  // namespace\n\nconst Pg6ImportThunk* const pg6_import_thunks = nullptr;\n",
+        let _ = writeln!(
+            out,
+            "}}  // namespace\n\nconst Pg6ImportThunk* const {thunks} = nullptr;"
         );
     } else {
         out.push_str("const Pg6ImportThunk kThunks[] = {\n");
@@ -1739,53 +1921,74 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue) -> String {
                 "    {{0x{:08x}u, {flags}, {ordinal}u, {}, {symbol}, {shim}, &{}}},",
                 import.slot_rva.unwrap_or(0),
                 cpp_str(&import.dll),
-                import.thunk_name()
+                names.thunk(import.index)
             );
         }
-        out.push_str(
-            "};\n\n}  // namespace\n\nconst Pg6ImportThunk* const pg6_import_thunks = kThunks;\n",
+        let _ = writeln!(
+            out,
+            "}};\n\n}}  // namespace\n\nconst Pg6ImportThunk* const {thunks} = kThunks;"
         );
     }
-    let _ = writeln!(
-        out,
-        "const std::size_t pg6_import_thunk_count = {};",
-        sorted.len()
-    );
-    out.push_str(
-        "
-const Pg6ImportThunk* pg6_find_import_thunk(uint32_t slot_rva) {
-    std::size_t lo = 0;
-    std::size_t hi = pg6_import_thunk_count;
-    while (lo < hi) {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        if (pg6_import_thunks[mid].slot_rva < slot_rva) {
-            lo = mid + 1;
+    let _ = writeln!(out, "const std::size_t {count} = {};", sorted.len());
+    if names.ns.is_some() {
+        let slots = names.global("pg6_import_slots");
+        let slot_count = names.global("pg6_import_slot_count");
+        let table = if sorted.is_empty() {
+            "nullptr"
         } else {
+            "kSlots"
+        };
+        let _ = writeln!(
+            out,
+            "extern \"C\" const Pg6ImportSlotBinding* const {slots} = {table};\n\
+             extern \"C\" const std::size_t {slot_count} = {};",
+            sorted.len()
+        );
+    }
+    let _ = write!(
+        out,
+        "
+const Pg6ImportThunk* {find}(uint32_t slot_rva) {{
+    std::size_t lo = 0;
+    std::size_t hi = {count};
+    while (lo < hi) {{
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if ({thunks}[mid].slot_rva < slot_rva) {{
+            lo = mid + 1;
+        }} else {{
             hi = mid;
-        }
-    }
-    if (lo < pg6_import_thunk_count && pg6_import_thunks[lo].slot_rva == slot_rva) {
-        return &pg6_import_thunks[lo];
-    }
+        }}
+    }}
+    if (lo < {count} && {thunks}[lo].slot_rva == slot_rva) {{
+        return &{thunks}[lo];
+    }}
     return nullptr;
-}
-",
+}}
+"
     );
     out
 }
 
-fn render_manifest(plan: &BridgePlan, catalogue: &Catalogue) -> String {
+fn render_manifest(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> String {
     let mut out = String::new();
     out.push_str("{\n  \"format\": \"playgta6-import-bridge\",\n  \"version\": 1,\n");
+    if let Some(ns) = names.ns {
+        let _ = writeln!(out, "  \"namespace\": {},", json_str(ns));
+    }
     let _ = writeln!(
         out,
         "  \"catalogue\": {{\"headers\": {}, \"shims\": {}}},",
         catalogue.header_count,
         catalogue.len()
     );
+    let guest = if names.ns.is_some() {
+        format!(", \"guest\": {}", plan.guest_count())
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "  \"summary\": {{\"imports\": {}, \"bound\": {}, \"unresolved\": {}}},",
+        "  \"summary\": {{\"imports\": {}, \"bound\": {}, \"unresolved\": {}{guest}}},",
         plan.imports.len(),
         plan.bound_count(),
         plan.unresolved_count()
@@ -1811,8 +2014,8 @@ fn render_manifest(plan: &BridgePlan, catalogue: &Catalogue) -> String {
         let slot = import
             .slot_rva
             .map_or_else(|| "null".to_string(), |s| format!("\"0x{s:x}\""));
-        let thunk = if import.slot_rva.is_some() {
-            json_str(&import.thunk_name())
+        let thunk = if import.tabled() {
+            json_str(&names.thunk(import.index))
         } else {
             "null".to_string()
         };
@@ -1824,6 +2027,15 @@ fn render_manifest(plan: &BridgePlan, catalogue: &Catalogue) -> String {
             json_str(&import.dll),
             import.delay_load
         );
+        if let Some(target) = &import.guest {
+            let _ = write!(
+                out,
+                "\"status\": \"guest\", \"module\": {}, \"target\": \"0x{:x}\"}}",
+                json_str(&target.module),
+                target.va
+            );
+            continue;
+        }
         match &import.resolution {
             Resolution::Bound { shim } => {
                 let decl = catalogue.get(shim);
@@ -1889,7 +2101,7 @@ pub fn render_coverage(plan: &BridgePlan, catalogue: &Catalogue) -> String {
     let unresolved: Vec<&ImportBinding> = plan
         .imports
         .iter()
-        .filter(|i| i.bound_shim().is_none())
+        .filter(|i| i.guest.is_none() && i.bound_shim().is_none())
         .collect();
     if !unresolved.is_empty() {
         out.push_str("Unresolved:\n");

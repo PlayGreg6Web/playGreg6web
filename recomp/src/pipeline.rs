@@ -47,10 +47,10 @@
 //! directory, and the registration table symbols carry the module name, so the executable and
 //! the DLLs it ships with can be built side by side under one `--out` and linked into one
 //! program. Lifted functions are named by guest VA (`sub_<VA>`), which stays unique as long as
-//! every module is placed at a distinct base; a multi-module driver therefore has to assign
-//! non-overlapping load bases (many DLLs share the default preferred base) and rebase before
-//! lifting, and has to prefix the import bridge's `pg6_import_<n>` thunks per module. Resolving
-//! one module's imports to another module's exports belongs in the stubs plan.
+//! every module is placed at a distinct base. [`program`] (`playgta6-recomp build-program`) is
+//! that multi-module driver: it assigns non-overlapping bases, rebases before lifting, binds one
+//! module's imports to another's exports and builds every module through [`run_module`] with a
+//! [`ModuleLink`] (pre-filled IAT slots, namespaced import bridge).
 //!
 //! # Determinism
 //! The same input bytes and options give byte-identical files and manifest, independent of
@@ -102,7 +102,8 @@
 //! `reason`], `unreferenced` [`import`, `bound`]}), `lift` (`functions`, `instructions`,
 //! `unsupported_instructions`, `unsupported_by_mnemonic`, `shards` [`index`, `first`, `last`,
 //! `functions`, `instructions`, `ll`, `obj`], `registration` {`table_symbol`, `count_symbol`,
-//! `register_function`, `entry_type`, `count`, `ll`, `obj`}), `imports` (`total`, `bound`, `unresolved`, `by_dll`
+//! `register_function`, `entry_type`, `count`, `ll`, `obj`}), `imports` (`total`, `bound`,
+//! `guest` (bound to another guest module by a program build), `unresolved`, `by_dll`
 //! [`dll`, `bound`, `unresolved`], `catalogue` {`headers`, `shims`, `diagnostics`}),
 //! `diagnostics` (totals: `pdata`, `discovery`, `image`, `catalogue`,
 //! `unsupported_instructions`), and `files` [`path`, `size`, `fnv1a64`] for every output file
@@ -112,6 +113,7 @@
 //! counts are per unique block. Hashes are 64-bit FNV-1a (the [`image::fnv1a_64`] parameters).
 
 mod hygiene;
+pub mod program;
 pub mod refine;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -264,6 +266,22 @@ impl PipelineOptions {
     }
 }
 
+/// What a program build ([`program`]) adds to one module's build. The default (nothing) is a
+/// plain single-module build.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleLink {
+    /// IAT slot RVA -> export of another guest module. The slot is pre-filled with the export's
+    /// guest VA in the packed guest image (`image/guest.pgim`) and the import gets no thunk
+    /// ([`stubs::BridgePlan::bind_guest`]).
+    pub guest_imports: BTreeMap<u32, stubs::GuestTarget>,
+    /// IAT slot RVA -> `(dll, symbol)` the import bridge resolves instead of the import's own
+    /// name (an import of a guest module's export that forwards to a runtime DLL).
+    pub host_redirects: BTreeMap<u32, (String, crate::pe::ImportedSymbol)>,
+    /// Module namespace of the import bridge ([`stubs::render_bridge_namespaced`]); `None`
+    /// keeps the single-module names.
+    pub bridge_namespace: Option<String>,
+}
+
 /// Whether `name` is a valid module name (see [`PipelineOptions::module`]).
 pub fn is_valid_module_name(name: &str) -> bool {
     !name.is_empty()
@@ -405,6 +423,61 @@ pub fn plan_imports(
     let catalogue = Catalogue::scan(&loaded);
     let plan = stubs::plan_bridge(pe, &catalogue);
     Ok((includes, catalogue, plan))
+}
+
+/// A copy of `file` whose IAT slots at the RVAs in `guest_imports` hold their export's guest VA
+/// (little-endian `u64`), or `None` when there is nothing to pre-fill. Every slot must be an IAT
+/// slot of `pe` backed by file bytes.
+pub fn prefill_iat(
+    pe: &Pe64,
+    file: &[u8],
+    guest_imports: &BTreeMap<u32, stubs::GuestTarget>,
+) -> Result<Option<Vec<u8>>, PipelineError> {
+    if guest_imports.is_empty() {
+        return Ok(None);
+    }
+    let mut bytes = file.to_vec();
+    for (&slot, target) in guest_imports {
+        let offset = pe
+            .rva_to_file_offset(slot)
+            .filter(|&o| pe.rva_to_file_offset(slot + 7) == Some(o + 7))
+            .ok_or_else(|| {
+                PipelineError::Options(format!(
+                    "IAT slot 0x{slot:x} is not backed by file bytes and cannot be pre-filled"
+                ))
+            })?;
+        bytes[offset..offset + 8].copy_from_slice(&target.va.to_le_bytes());
+    }
+    Ok(Some(bytes))
+}
+
+/// Applies a program build's bindings to the import bridge plan.
+fn apply_link(
+    plan: &mut BridgePlan,
+    catalogue: &Catalogue,
+    link: &ModuleLink,
+) -> Result<(), PipelineError> {
+    for (&slot, target) in &link.guest_imports {
+        if !plan.bind_guest(slot, target.clone()) {
+            return Err(PipelineError::Options(format!(
+                "no import uses IAT slot 0x{slot:x}"
+            )));
+        }
+    }
+    if !link.host_redirects.is_empty() {
+        let resolver = stubs::ShimResolver::new(catalogue);
+        for (&slot, (dll, symbol)) in &link.host_redirects {
+            let import = plan
+                .imports
+                .iter_mut()
+                .find(|i| i.slot_rva == Some(slot))
+                .ok_or_else(|| {
+                    PipelineError::Options(format!("no import uses IAT slot 0x{slot:x}"))
+                })?;
+            import.resolution = resolver.resolve(dll, symbol);
+        }
+    }
+    Ok(())
 }
 
 /// The runtime's shim headers of the checkout containing `start` (or one of its ancestors):
@@ -930,6 +1003,8 @@ impl ImageStats {
 pub struct ImportStats {
     pub total: usize,
     pub bound: usize,
+    /// Bound to another guest module by a program build ([`ModuleLink::guest_imports`]).
+    pub guest: usize,
     pub unresolved: usize,
     /// `(dll, bound, unresolved)`, sorted.
     pub by_dll: Vec<(String, usize, usize)>,
@@ -979,6 +1054,8 @@ pub struct PipelineReport {
     pub image_options: ImageOptions,
     /// Every output file except the manifest, sorted by path.
     pub files: Vec<OutputFile>,
+    /// Entry VA of every lifted function (sorted; the registration table's entries).
+    pub function_entries: Vec<u64>,
     pub report: String,
     pub manifest: String,
 }
@@ -999,6 +1076,12 @@ pub fn run_with_progress(
     options: &PipelineOptions,
     progress: &mut dyn FnMut(&str),
 ) -> Result<PipelineReport, PipelineError> {
+    check_options(options)?;
+    let input = load_input(&options.pe_path)?;
+    run_module(options, &input, &ModuleLink::default(), progress)
+}
+
+fn check_options(options: &PipelineOptions) -> Result<(), PipelineError> {
     if options.jobs == 0 {
         return Err(PipelineError::Options("--jobs must be at least 1".into()));
     }
@@ -1014,8 +1097,21 @@ pub fn run_with_progress(
         )));
     }
     check_output_dir(&options.out_dir).map_err(PipelineError::OutputDir)?;
+    Ok(())
+}
 
-    let input = load_input(&options.pe_path)?;
+/// [`run_with_progress`] on input bytes already read (and, for a program build, already rebased
+/// to the module's assigned base), with `link` applied: guest-bound IAT slots are pre-filled in
+/// the guest image and left out of the import bridge, redirected imports are resolved under
+/// their forwarded name, and the bridge is rendered in `link.bridge_namespace`.
+/// `options.pe_path` only names the input in messages.
+pub fn run_module(
+    options: &PipelineOptions,
+    input: &Input,
+    link: &ModuleLink,
+    progress: &mut dyn FnMut(&str),
+) -> Result<PipelineReport, PipelineError> {
+    check_options(options)?;
     let pe = Pe64::parse(&input.bytes).map_err(|e| {
         PipelineError::Parse(format!(
             "failed to parse PE64 '{}': {e}",
@@ -1023,16 +1119,19 @@ pub fn run_with_progress(
         ))
     })?;
     progress("parse");
+    let prefilled = prefill_iat(&pe, &input.bytes, &link.guest_imports)?;
+    let image_bytes = prefilled.as_deref().unwrap_or(&input.bytes);
     let guest =
-        image::build_guest_image(&pe, &input.bytes, options.image).map_err(PipelineError::Image)?;
+        image::build_guest_image(&pe, image_bytes, options.image).map_err(PipelineError::Image)?;
     progress("image");
     let tool = if options.emit_obj {
         Some(find_llvm_tool().ok_or(PipelineError::NoLlvmTool)?)
     } else {
         None
     };
-    let (includes, catalogue, plan) =
+    let (includes, catalogue, mut plan) =
         plan_imports(&pe, &options.shim_headers, options.include_root.as_deref())?;
+    apply_link(&mut plan, &catalogue, link)?;
 
     let mut seeded = seed(&pe, &input.bytes);
     seeded
@@ -1112,7 +1211,10 @@ pub fn run_with_progress(
     drop(analysis);
 
     // Import bridge.
-    let bridge = stubs::render_bridge(&plan, &catalogue);
+    let bridge = match &link.bridge_namespace {
+        Some(ns) => stubs::render_bridge_namespaced(&plan, &catalogue, ns),
+        None => stubs::render_bridge(&plan, &catalogue),
+    };
     let mut files = Vec::new();
     for (name, text) in [
         (stubs::HEADER_FILE, &bridge.header),
@@ -1130,6 +1232,7 @@ pub fn run_with_progress(
     let imports = ImportStats {
         total: plan.imports.len(),
         bound: plan.bound_count(),
+        guest: plan.guest_count(),
         unresolved: plan.unresolved_count(),
         by_dll: plan.coverage_by_dll(),
         headers: includes,
@@ -1185,6 +1288,7 @@ pub fn run_with_progress(
         emit_obj: options.emit_obj,
         image_options: options.image,
         files: Vec::new(),
+        function_entries: entries,
         report: String::new(),
         manifest: String::new(),
     };
@@ -1292,9 +1396,14 @@ pub fn render_report(r: &PipelineReport) -> String {
     }
 
     let _ = writeln!(out);
+    let guest = if r.imports.guest > 0 {
+        format!(", {} bound to guest modules", r.imports.guest)
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
-        "imports: {} total, {} bound, {} unresolved ({} from {})",
+        "imports: {} total, {} bound, {} unresolved{guest} ({} from {})",
         r.imports.total,
         r.imports.bound,
         r.imports.unresolved,
@@ -1862,6 +1971,7 @@ pub fn render_manifest(r: &PipelineReport) -> String {
     let imports = obj([
         ("total", num(r.imports.total)),
         ("bound", num(r.imports.bound)),
+        ("guest", num(r.imports.guest)),
         ("unresolved", num(r.imports.unresolved)),
         (
             "by_dll",
