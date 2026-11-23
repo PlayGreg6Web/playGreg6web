@@ -18,17 +18,17 @@
 // harmless. Every ISA level is an explicit switch in `CpuFeatures`; the defaults below follow
 // recomp/src/lift on main:
 //
-//   set:   SSE SSE2 SSE3 (float/move/convert forms lifted), CMPXCHG16B, MOVBE, POPCNT, LZCNT
-//          (ABM), BMI1, BMI2, ADX, CLFLUSH/CLFLUSHOPT/CLWB, CLZERO, PREFETCHW, LAHF/SAHF,
-//          RDTSCP (+ invariant TSC), TSC, CMPXCHG8B, CMOV, NX, long mode.
-//   clear: x87/FPU, MMX, FXSR (x87/MMX/fxsave trap in the lifter); SSSE3, SSE4.1, SSE4.2,
-//          AES, PCLMULQDQ, SHA (integer SIMD / string compare / crypto are not lifted: only
-//          the float subset of SSE4.1 is, so the SSE4.1 bit stays clear until pmulld, ptest,
-//          pmovsx etc. are); XSAVE/OSXSAVE; AVX, AVX2, FMA, F16C (256-bit forms and FMA
-//          trap); RDRAND, RDSEED, FSGSBASE, SYSCALL.
+//   set:   SSE SSE2 SSE3 SSSE3 SSE4.1 SSE4.2 (legacy and VEX float and integer SIMD lifted),
+//          AVX, AVX2, FMA, F16C with XSAVE/OSXSAVE (256-bit forms lifted; the guest state has
+//          the YMM upper halves), AES, PCLMULQDQ, CMPXCHG16B, MOVBE, POPCNT, LZCNT (ABM),
+//          BMI1, BMI2, ADX, CLFLUSH/CLFLUSHOPT/CLWB, CLZERO, PREFETCHW, LAHF/SAHF, RDTSCP
+//          (+ invariant TSC), TSC, CMPXCHG8B, CMOV, NX, long mode.
+//   clear: x87/FPU, MMX, FXSR (x87/MMX/fxsave trap in the lifter); SHA, RDRAND, RDSEED,
+//          FSGSBASE, SYSCALL.
 //
-// When R8's AVX work lands (256-bit forms, FMA, F16C, integer SIMD), flip the matching switches
-// here (`ssse3`, `sse41`, `sse42`, then `avx`, `avx2`, `fma`, `f16c`) and nothing else:
+// Known gap inside an advertised level: the SSE4.2 string compares (pcmpistri and friends) still
+// trap in the lifter, while the SSE4.2 bit must be set for a coherent AVX-class CPU. The xsave
+// family of instructions is not lifted either; OSXSAVE only tells software to trust xgetbv.
 // `avx` implies `xsave`, which makes cpuid report XSAVE/OSXSAVE and leaf 0xD, and makes xgetbv
 // report XCR0 bits 1-2 (SSE, AVX state), all derived from the same switch.
 namespace playgta6::guest {
@@ -48,9 +48,9 @@ struct CpuFeatures {
     bool sse = true;
     bool sse2 = true;
     bool sse3 = true;
-    bool ssse3 = false;
-    bool sse41 = false;
-    bool sse42 = false;  // includes the crc32 instruction (lifted) and pcmpXstrX (not lifted)
+    bool ssse3 = true;
+    bool sse41 = true;
+    bool sse42 = true;  // includes the crc32 instruction (lifted) and pcmpXstrX (not lifted; traps)
     // Integer extensions.
     bool popcnt = true;
     bool lzcnt = true;  // ABM (leaf 0x80000001 ECX[5])
@@ -67,9 +67,9 @@ struct CpuFeatures {
     bool clflushopt = true;
     bool clwb = true;
     bool clzero = true;
-    // Crypto / random: not lifted.
-    bool aes = false;
-    bool pclmul = false;
+    // Crypto / random: AES-NI and PCLMULQDQ are lifted; SHA and the RNG instructions are not.
+    bool aes = true;
+    bool pclmul = true;
     bool sha = false;
     bool rdrand = false;
     bool rdseed = false;
@@ -78,11 +78,11 @@ struct CpuFeatures {
     bool rdtscp = true;
     bool invariant_tsc = true;
     // Extended state. `avx` implies `xsave`; `avx2`, `fma`, `f16c` are dropped without `avx`.
-    bool xsave = false;
-    bool avx = false;
-    bool avx2 = false;
-    bool fma = false;
-    bool f16c = false;
+    bool xsave = true;
+    bool avx = true;
+    bool avx2 = true;
+    bool fma = true;
+    bool f16c = true;
 };
 
 class VirtualCpu {

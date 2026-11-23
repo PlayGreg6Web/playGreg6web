@@ -139,10 +139,10 @@ void test_leaf1() {
     CHECK(has(r.edx, 25) && has(r.edx, 26));                                    // SSE SSE2
     CHECK(!has(r.edx, 0) && !has(r.edx, 23) && !has(r.edx, 24));  // FPU MMX FXSR not lifted
     CHECK(has(r.ecx, 0) && has(r.ecx, 13) && has(r.ecx, 22) && has(r.ecx, 23));  // SSE3 CX16 MOVBE POPCNT
-    CHECK(!has(r.ecx, 9) && !has(r.ecx, 19) && !has(r.ecx, 20));  // SSSE3 SSE4.1 SSE4.2
-    CHECK(!has(r.ecx, 26) && !has(r.ecx, 27) && !has(r.ecx, 28));  // XSAVE OSXSAVE AVX
-    CHECK(!has(r.ecx, 12) && !has(r.ecx, 29) && !has(r.ecx, 30));  // FMA F16C RDRAND
-    CHECK(!has(r.ecx, 25) && !has(r.ecx, 1));                      // AES PCLMUL
+    CHECK(has(r.ecx, 9) && has(r.ecx, 19) && has(r.ecx, 20));     // SSSE3 SSE4.1 SSE4.2
+    CHECK(has(r.ecx, 26) && has(r.ecx, 27) && has(r.ecx, 28));    // XSAVE OSXSAVE AVX
+    CHECK(has(r.ecx, 12) && has(r.ecx, 29) && !has(r.ecx, 30));   // FMA F16C, no RDRAND
+    CHECK(has(r.ecx, 25) && has(r.ecx, 1));                       // AES PCLMUL
     CHECK(!has(r.ecx, 31));                                        // hypervisor
 }
 
@@ -152,7 +152,7 @@ void test_leaf7() {
     CHECK(r.eax == 0);
     CHECK(has(r.ebx, 3) && has(r.ebx, 8) && has(r.ebx, 19));    // BMI1 BMI2 ADX
     CHECK(has(r.ebx, 23) && has(r.ebx, 24));                    // CLFLUSHOPT CLWB
-    CHECK(!has(r.ebx, 5) && !has(r.ebx, 18) && !has(r.ebx, 29));  // AVX2 RDSEED SHA
+    CHECK(has(r.ebx, 5) && !has(r.ebx, 18) && !has(r.ebx, 29));   // AVX2, no RDSEED / SHA
     CHECK(!has(r.ebx, 0) && !has(r.ebx, 7));                    // FSGSBASE SMEP
     CHECK(r.ecx == 0 && r.edx == 0);
     const CpuidResult s1 = cpuid(7, 1);
@@ -164,6 +164,8 @@ void test_leaf7() {
 void test_leaf_d() {
     reset_virtual_cpu();
     // Without XSAVE the whole leaf is empty.
+    virtual_cpu().features.avx = false;
+    virtual_cpu().features.xsave = false;
     CpuidResult r = cpuid(0xD, 0);
     CHECK(r.eax == 0 && r.ebx == 0 && r.ecx == 0 && r.edx == 0);
 
@@ -182,6 +184,7 @@ void test_leaf_d() {
     CHECK(256 == sizeof(GuestState::ymm_hi));
 
     reset_virtual_cpu();
+    virtual_cpu().features.avx = false;
     virtual_cpu().features.xsave = true;  // XSAVE without AVX
     r = cpuid(0xD, 0);
     CHECK(r.eax == 3 && r.ebx == 576 && r.ecx == 576);
@@ -259,7 +262,12 @@ void test_zero_extension_and_preservation() {
 
 void test_feature_override() {
     reset_virtual_cpu();
-    CHECK(!has(cpuid(1).ecx, 20));
+    virtual_cpu().features.ssse3 = false;
+    virtual_cpu().features.sse41 = false;
+    virtual_cpu().features.sse42 = false;
+    virtual_cpu().features.avx = false;
+    virtual_cpu().features.xsave = false;
+    CHECK(!has(cpuid(1).ecx, 9) && !has(cpuid(1).ecx, 20));
     virtual_cpu().features.ssse3 = true;
     virtual_cpu().features.sse41 = true;
     virtual_cpu().features.sse42 = true;
@@ -291,7 +299,13 @@ void test_feature_override() {
     CHECK((cpuid(0x80000008).ecx & 0xFFFF) == 0);
     CHECK(virtual_cpu().check_consistency());
     reset_virtual_cpu();
-    CHECK(!has(cpuid(1).ecx, 28));
+    // Clearing AVX drops everything that depends on it.
+    virtual_cpu().features.avx = false;
+    virtual_cpu().features.xsave = false;
+    CHECK(!has(cpuid(1).ecx, 28) && !has(cpuid(1).ecx, 12) && !has(cpuid(1).ecx, 29));
+    CHECK(!has(cpuid(7).ebx, 5));
+    reset_virtual_cpu();
+    CHECK(has(cpuid(1).ecx, 28));
 }
 
 void test_consistency_all_switches() {
@@ -359,13 +373,13 @@ void test_xgetbv() {
     GuestState s = make_state();
     s.gpr[GuestReg::Rcx] = 0;
     __playgta6_xgetbv(&s);
-    CHECK(s.gpr[GuestReg::Rax] == 3 && s.gpr[GuestReg::Rdx] == 0);  // x87 | SSE
+    CHECK(s.gpr[GuestReg::Rax] == 7 && s.gpr[GuestReg::Rdx] == 0);  // x87 | SSE | AVX
 
-    virtual_cpu().features.avx = true;
+    virtual_cpu().features.avx = false;
     s = make_state();
     s.gpr[GuestReg::Rcx] = 0;
     __playgta6_xgetbv(&s);
-    CHECK(s.gpr[GuestReg::Rax] == 7 && s.gpr[GuestReg::Rdx] == 0);
+    CHECK(s.gpr[GuestReg::Rax] == 3 && s.gpr[GuestReg::Rdx] == 0);  // x87 | SSE
     reset_virtual_cpu();
 }
 
