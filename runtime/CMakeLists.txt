@@ -24,6 +24,7 @@ add_library(playgta6_core STATIC
     gpu/cmd_encoder.cpp
     gpu/pso_cache.cpp
     gpu/descriptor_heap.cpp
+    guest/guest_runtime.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -48,6 +49,12 @@ if(EMSCRIPTEN)
         -sENVIRONMENT=worker
         -sERROR_ON_UNDEFINED_SYMBOLS=0
         -lexports.js
+        # Pull the lifted-code helpers (guest/guest_runtime.cpp, EMSCRIPTEN_KEEPALIVE) out of the
+        # static library even before recompiled code references them.
+        -Wl,--undefined=__playgta6_indirect_call
+        -Wl,--undefined=__playgta6_trap
+        -Wl,--undefined=__playgta6_unimplemented
+        -Wl,--undefined=__playgta6_divide_error
     )
 else()
     find_package(Threads REQUIRED)
@@ -105,4 +112,8 @@ else()
     add_executable(test_ucrt_bridge ../tests/test_ucrt_bridge.cpp)
     target_link_libraries(test_ucrt_bridge PRIVATE playgta6_core)
     add_test(NAME playgta6_ucrt_bridge_tests COMMAND test_ucrt_bridge)
+
+    add_executable(test_guest_runtime ../tests/test_guest_runtime.cpp)
+    target_link_libraries(test_guest_runtime PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_runtime_tests COMMAND test_guest_runtime)
 endif()
