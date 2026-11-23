@@ -46,6 +46,21 @@ enum class GpuOpcode : uint16_t {
     CreateComputePipeline = 19,
     SetComputePipeline = 20,
     DispatchCompute = 21,
+    // v2 (docs/gpu_commands.md "Opcodes (v2)"): explicit layouts, pipeline keys, render passes and
+    // dynamic state. Additive only; every v1 opcode and payload above keeps its meaning.
+    CreateBindGroupLayout = 22,
+    CreatePipelineLayout = 23,
+    CreateRenderPipeline2 = 24,
+    CreateComputePipeline2 = 25,
+    BeginRenderPass = 26,
+    EndRenderPass = 27,
+    SetViewport = 28,
+    SetScissorRect = 29,
+    SetBlendConstant = 30,
+    SetStencilReference = 31,
+    CreateBindGroup2 = 32,
+    SetBindGroup2 = 33,
+    CreateSampler2 = 34,
 };
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
@@ -367,6 +382,404 @@ inline constexpr uint32_t DF = 6;
 
 // A lifted guest function (`sub_<VA>`).
 using LiftedFn = void (*)(GuestState* state);
+
+// =====================================================================================================
+// Packet ABI v2 (opcodes 22..34). See docs/gpu_commands.md "Opcodes (v2)".
+//
+// Byte-sized enum fields below that are documented as "WebGPU enum codes" (texture format, vertex
+// format, blend factor/operation, compare function, stencil operation, cull mode, front face, index
+// format, vertex step mode) use the code tables in docs/gpu_commands.md, which are the numbering of
+// the playgta6::gpu::pso::Wgpu* enums in runtime/gpu/pso_cache.h. Primitive topology codes are
+// GpuPrimitiveTopology.
+// =====================================================================================================
+
+// Texture id that names the canvas texture of the current frame (getCurrentTexture()).
+inline constexpr uint32_t kGpuSwapchainTextureId = 0xFFFFFFFFu;
+
+inline constexpr uint32_t kGpuMaxColorAttachments = 8;
+inline constexpr uint32_t kGpuMaxVertexBuffers = 8;
+inline constexpr uint32_t kGpuMaxVertexAttributes = 16;
+
+enum class GpuLoadOp : uint8_t {
+    Undefined = 0,  // only for depth/stencil aspects that are read-only or absent
+    Load = 1,
+    Clear = 2,
+};
+
+enum class GpuStoreOp : uint8_t {
+    Undefined = 0,  // only for depth/stencil aspects that are read-only or absent
+    Store = 1,
+    Discard = 2,
+};
+
+enum class GpuTextureAspect : uint8_t {
+    All = 0,
+    DepthOnly = 1,
+    StencilOnly = 2,
+};
+
+// GPUTextureViewDimension; Undefined = WebGPU default for the texture.
+enum class GpuTextureViewDimension : uint8_t {
+    Undefined = 0,
+    Dim1D = 1,
+    Dim2D = 2,
+    Dim2DArray = 3,
+    Cube = 4,
+    CubeArray = 5,
+    Dim3D = 6,
+};
+
+// Which GPUBindGroupLayoutEntry member a GpuBindGroupLayoutEntry describes.
+enum class GpuBindingLayoutType : uint8_t {
+    Buffer = 0,
+    Sampler = 1,
+    Texture = 2,
+    StorageTexture = 3,
+};
+
+enum class GpuBufferBindingType : uint8_t {
+    Uniform = 0,
+    Storage = 1,
+    ReadOnlyStorage = 2,
+};
+
+enum class GpuSamplerBindingType : uint8_t {
+    Filtering = 0,
+    NonFiltering = 1,
+    Comparison = 2,
+};
+
+enum class GpuTextureSampleType : uint8_t {
+    Float = 0,
+    UnfilterableFloat = 1,
+    Depth = 2,
+    Sint = 3,
+    Uint = 4,
+};
+
+enum class GpuStorageTextureAccess : uint8_t {
+    WriteOnly = 0,
+    ReadOnly = 1,
+    ReadWrite = 2,
+};
+
+// GPUShaderStage bits for GpuBindGroupLayoutEntry::visibility.
+namespace GpuShaderStageBits {
+inline constexpr uint32_t Vertex = 0x1u;
+inline constexpr uint32_t Fragment = 0x2u;
+inline constexpr uint32_t Compute = 0x4u;
+}  // namespace GpuShaderStageBits
+
+namespace GpuBindGroupLayoutEntryFlags {
+inline constexpr uint8_t HasDynamicOffset = 0x1u;  // buffer entries
+inline constexpr uint8_t Multisampled = 0x2u;      // texture entries
+}  // namespace GpuBindGroupLayoutEntryFlags
+
+namespace GpuLayoutFlags {
+// The object is the one layout-manifest.json lists under `content_id`; the packet carries no entries.
+inline constexpr uint32_t ManifestReference = 0x1u;
+}  // namespace GpuLayoutFlags
+
+// GPUTextureViewDescriptor subset used by render pass attachments and bind group entries.
+struct GpuTextureViewDesc {
+    uint8_t format;             // WebGPU texture format code; 0 = the texture's format
+    uint8_t dimension;          // GpuTextureViewDimension
+    uint8_t aspect;             // GpuTextureAspect
+    uint8_t reserved;
+    uint16_t base_mip_level;
+    uint16_t mip_level_count;   // 0 = all remaining mips
+    uint32_t base_array_layer;
+    uint32_t array_layer_count; // 0 = all remaining layers
+};
+static_assert(sizeof(GpuTextureViewDesc) == 16, "GpuTextureViewDesc layout must stay 16 bytes");
+
+// One GPUBindGroupLayoutEntry (same shape as an S6 layout-manifest.json entry).
+struct GpuBindGroupLayoutEntry {
+    uint32_t binding;
+    uint32_t visibility;        // GpuShaderStageBits
+    uint8_t type;               // GpuBindingLayoutType
+    uint8_t binding_type;       // GpuBufferBindingType / GpuSamplerBindingType / GpuTextureSampleType /
+                                // GpuStorageTextureAccess, selected by `type`
+    uint8_t view_dimension;     // texture / storageTexture: GpuTextureViewDimension (Undefined = "2d")
+    uint8_t flags;              // GpuBindGroupLayoutEntryFlags
+    uint8_t storage_format;     // storageTexture: WebGPU texture format code
+    uint8_t reserved[3];
+    uint64_t min_binding_size;  // buffer: minBindingSize (0 = none)
+};
+static_assert(sizeof(GpuBindGroupLayoutEntry) == 24, "GpuBindGroupLayoutEntry layout must stay 24 bytes");
+static_assert(offsetof(GpuBindGroupLayoutEntry, min_binding_size) == 16);
+
+// Followed immediately by `entry_count` packed GpuBindGroupLayoutEntry structs.
+struct GpuCreateBindGroupLayoutPayload {
+    uint32_t id;
+    uint32_t entry_count;
+    uint32_t flags;        // GpuLayoutFlags
+    uint32_t reserved;
+    uint64_t content_id;   // S6 layout-manifest.json bind group layout id (0 = none)
+};
+static_assert(sizeof(GpuCreateBindGroupLayoutPayload) == 24, "GpuCreateBindGroupLayoutPayload layout must stay 24 bytes");
+
+// Followed immediately by `bind_group_layout_count` u32 bind group layout ids (group 0..n-1;
+// 0 = empty layout).
+struct GpuCreatePipelineLayoutPayload {
+    uint32_t id;
+    uint32_t bind_group_layout_count;
+    uint32_t flags;        // GpuLayoutFlags
+    uint32_t reserved;
+    uint64_t content_id;   // S6 layout-manifest.json pipeline layout id (0 = none)
+};
+static_assert(sizeof(GpuCreatePipelineLayoutPayload) == 24, "GpuCreatePipelineLayoutPayload layout must stay 24 bytes");
+
+// ---- Render pipeline key: byte-for-byte playgta6::gpu::pso::GraphicsPipelineKey (376 bytes). ----
+
+struct GpuBlendComponentKey {
+    uint8_t operation;   // blend operation code
+    uint8_t src_factor;  // blend factor code
+    uint8_t dst_factor;
+    uint8_t reserved;
+};
+static_assert(sizeof(GpuBlendComponentKey) == 4);
+
+struct GpuColorTargetKey {
+    uint8_t format;         // texture format code; 0 = null target (hole), all other fields 0
+    uint8_t blend_enabled;  // 0 = GPUColorTargetState.blend omitted
+    uint8_t write_mask;     // GPUColorWrite bits
+    uint8_t reserved;
+    GpuBlendComponentKey color;
+    GpuBlendComponentKey alpha;
+};
+static_assert(sizeof(GpuColorTargetKey) == 12);
+
+struct GpuStencilFaceKey {
+    uint8_t compare;        // compare function code
+    uint8_t fail_op;        // stencil operation code
+    uint8_t depth_fail_op;
+    uint8_t pass_op;
+};
+static_assert(sizeof(GpuStencilFaceKey) == 4);
+
+struct GpuDepthStencilKey {
+    uint8_t format;               // texture format code; 0 = no depthStencil state, all other fields 0
+    uint8_t depth_write_enabled;
+    uint8_t depth_compare;        // compare function code (0 = undefined)
+    uint8_t reserved;
+    GpuStencilFaceKey stencil_front;
+    GpuStencilFaceKey stencil_back;
+    uint32_t stencil_read_mask;
+    uint32_t stencil_write_mask;
+    int32_t depth_bias;
+    uint32_t depth_bias_slope_scale_bits;  // IEEE-754 f32 bits
+    uint32_t depth_bias_clamp_bits;        // IEEE-754 f32 bits
+};
+static_assert(sizeof(GpuDepthStencilKey) == 32);
+
+struct GpuPrimitiveKey {
+    uint8_t topology;            // GpuPrimitiveTopology
+    uint8_t strip_index_format;  // index format code (0 = undefined)
+    uint8_t front_face;          // front face code
+    uint8_t cull_mode;           // cull mode code
+    uint8_t unclipped_depth;
+    uint8_t reserved[3];
+};
+static_assert(sizeof(GpuPrimitiveKey) == 8);
+
+struct GpuMultisampleKey {
+    uint32_t count;  // 1 or 4
+    uint32_t mask;
+    uint8_t alpha_to_coverage_enabled;
+    uint8_t reserved[3];
+};
+static_assert(sizeof(GpuMultisampleKey) == 12);
+
+struct GpuVertexBufferKey {
+    uint32_t array_stride;
+    uint8_t step_mode;        // vertex step mode code; 0 = unused slot (null buffer layout)
+    uint8_t attribute_count;  // attributes of this buffer (consecutive in vertex_attributes)
+    uint8_t reserved[2];
+};
+static_assert(sizeof(GpuVertexBufferKey) == 8);
+
+struct GpuVertexAttributeKey {
+    uint32_t offset;
+    uint8_t format;           // vertex format code
+    uint8_t shader_location;
+    uint8_t buffer_index;
+    uint8_t reserved;
+};
+static_assert(sizeof(GpuVertexAttributeKey) == 8);
+
+struct GpuRenderPipelineKey {
+    uint64_t vs_shader;           // shader identity (informational; modules travel as ids)
+    uint64_t ps_shader;           // 0 = no pixel shader
+    uint32_t root_signature_id;   // informational
+    uint32_t color_target_count;  // highest non-null target + 1
+    GpuColorTargetKey color_targets[kGpuMaxColorAttachments];
+    GpuDepthStencilKey depth_stencil;
+    GpuPrimitiveKey primitive;
+    GpuMultisampleKey multisample;
+    uint32_t vertex_buffer_count;     // highest used slot + 1
+    uint32_t vertex_attribute_count;  // sorted by (buffer_index, shader_location)
+    GpuVertexBufferKey vertex_buffers[kGpuMaxVertexBuffers];
+    GpuVertexAttributeKey vertex_attributes[kGpuMaxVertexAttributes];
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuRenderPipelineKey) == 376, "GpuRenderPipelineKey layout must stay 376 bytes");
+static_assert(offsetof(GpuRenderPipelineKey, color_targets) == 24);
+static_assert(offsetof(GpuRenderPipelineKey, depth_stencil) == 120);
+static_assert(offsetof(GpuRenderPipelineKey, primitive) == 152);
+static_assert(offsetof(GpuRenderPipelineKey, multisample) == 160);
+static_assert(offsetof(GpuRenderPipelineKey, vertex_buffer_count) == 172);
+static_assert(offsetof(GpuRenderPipelineKey, vertex_attribute_count) == 176);
+static_assert(offsetof(GpuRenderPipelineKey, vertex_buffers) == 180);
+static_assert(offsetof(GpuRenderPipelineKey, vertex_attributes) == 244);
+static_assert(offsetof(GpuRenderPipelineKey, reserved) == 372);
+
+struct GpuCreateRenderPipeline2Payload {
+    uint32_t id;
+    uint32_t vs_module_id;        // CreateShaderModule id (entry point vs_main)
+    uint32_t fs_module_id;        // CreateShaderModule id (entry point fs_main); 0 = none
+    uint32_t pipeline_layout_id;  // CreatePipelineLayout id; 0 = layout "auto"
+    GpuRenderPipelineKey key;
+};
+static_assert(sizeof(GpuCreateRenderPipeline2Payload) == 392, "GpuCreateRenderPipeline2Payload layout must stay 392 bytes");
+static_assert(offsetof(GpuCreateRenderPipeline2Payload, key) == 16);
+
+// Byte-for-byte playgta6::gpu::pso::ComputePipelineKey (16 bytes).
+struct GpuComputePipelineKey {
+    uint64_t cs_shader;           // shader identity (informational)
+    uint32_t root_signature_id;   // informational
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuComputePipelineKey) == 16);
+
+struct GpuCreateComputePipeline2Payload {
+    uint32_t id;
+    uint32_t cs_module_id;        // CreateShaderModule id (entry point cs_main)
+    uint32_t pipeline_layout_id;  // 0 = layout "auto"
+    uint32_t reserved;
+    GpuComputePipelineKey key;
+};
+static_assert(sizeof(GpuCreateComputePipeline2Payload) == 32, "GpuCreateComputePipeline2Payload layout must stay 32 bytes");
+
+// ---- Render passes ----
+
+struct GpuRenderPassColorAttachment {
+    uint32_t texture_id;  // 0 = no attachment at this index; kGpuSwapchainTextureId = canvas
+    uint8_t load_op;      // GpuLoadOp (Load or Clear)
+    uint8_t store_op;     // GpuStoreOp (Store or Discard)
+    uint16_t reserved;
+    GpuTextureViewDesc view;
+    float clear_value[4];  // RGBA, used when load_op == Clear
+};
+static_assert(sizeof(GpuRenderPassColorAttachment) == 40, "GpuRenderPassColorAttachment layout must stay 40 bytes");
+
+struct GpuRenderPassDepthStencilAttachment {
+    uint32_t texture_id;  // 0 = no depth-stencil attachment
+    uint8_t depth_load_op;     // GpuLoadOp; Undefined when depth is read-only or absent
+    uint8_t depth_store_op;    // GpuStoreOp; Undefined when depth is read-only or absent
+    uint8_t stencil_load_op;   // GpuLoadOp; Undefined when stencil is read-only or absent
+    uint8_t stencil_store_op;  // GpuStoreOp; Undefined when stencil is read-only or absent
+    GpuTextureViewDesc view;
+    float depth_clear_value;
+    uint32_t stencil_clear_value;
+    uint8_t depth_read_only;
+    uint8_t stencil_read_only;
+    uint16_t reserved0;
+    uint32_t reserved1;
+};
+static_assert(sizeof(GpuRenderPassDepthStencilAttachment) == 40, "GpuRenderPassDepthStencilAttachment layout must stay 40 bytes");
+
+struct GpuBeginRenderPassPayload {
+    uint32_t color_count;  // 0..kGpuMaxColorAttachments; entries >= color_count are ignored
+    uint32_t reserved;
+    GpuRenderPassColorAttachment color[kGpuMaxColorAttachments];
+    GpuRenderPassDepthStencilAttachment depth_stencil;
+};
+static_assert(sizeof(GpuBeginRenderPassPayload) == 368, "GpuBeginRenderPassPayload layout must stay 368 bytes");
+static_assert(offsetof(GpuBeginRenderPassPayload, depth_stencil) == 328);
+
+// ---- Dynamic render pass state ----
+
+struct GpuSetViewportPayload {
+    float x;
+    float y;
+    float width;
+    float height;
+    float min_depth;
+    float max_depth;
+};
+static_assert(sizeof(GpuSetViewportPayload) == 24, "GpuSetViewportPayload layout must stay 24 bytes");
+
+struct GpuSetScissorRectPayload {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+};
+static_assert(sizeof(GpuSetScissorRectPayload) == 16, "GpuSetScissorRectPayload layout must stay 16 bytes");
+
+struct GpuSetBlendConstantPayload {
+    float r;
+    float g;
+    float b;
+    float a;
+};
+static_assert(sizeof(GpuSetBlendConstantPayload) == 16, "GpuSetBlendConstantPayload layout must stay 16 bytes");
+
+struct GpuSetStencilReferencePayload {
+    uint32_t reference;
+};
+static_assert(sizeof(GpuSetStencilReferencePayload) == 4, "GpuSetStencilReferencePayload layout must stay 4 bytes");
+
+// ---- Bind groups against explicit layouts ----
+
+// GpuBindGroupEntry (v1, first 32 bytes) + a texture view descriptor for TextureView entries.
+struct GpuBindGroupEntry2 {
+    uint32_t binding;
+    uint32_t resource_type;  // GpuBindResourceType
+    uint32_t resource_id;    // 0 = null binding (the worker binds a zero resource matching the layout)
+    uint32_t reserved;
+    uint64_t offset;         // Buffer
+    uint64_t size;           // Buffer; 0 = to the end of the buffer
+    GpuTextureViewDesc view; // TextureView; all-zero = default view
+};
+static_assert(sizeof(GpuBindGroupEntry2) == 48, "GpuBindGroupEntry2 layout must stay 48 bytes");
+static_assert(offsetof(GpuBindGroupEntry2, view) == 32);
+
+// Followed immediately by `entry_count` packed GpuBindGroupEntry2 structs.
+struct GpuCreateBindGroup2Payload {
+    uint32_t id;
+    uint32_t layout_id;  // CreateBindGroupLayout id
+    uint32_t entry_count;
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuCreateBindGroup2Payload) == 16, "GpuCreateBindGroup2Payload layout must stay 16 bytes");
+
+// Followed immediately by `dynamic_offset_count` u32 dynamic offsets (layout binding order).
+struct GpuSetBindGroup2Payload {
+    uint32_t group_index;
+    uint32_t bind_group_id;
+    uint32_t dynamic_offset_count;
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuSetBindGroup2Payload) == 16, "GpuSetBindGroup2Payload layout must stay 16 bytes");
+
+struct GpuCreateSampler2Payload {
+    uint32_t id;
+    uint8_t address_u;       // GpuAddressMode
+    uint8_t address_v;
+    uint8_t address_w;
+    uint8_t mag_filter;      // GpuFilterMode
+    uint8_t min_filter;
+    uint8_t mipmap_filter;
+    uint8_t compare;         // compare function code; 0 = not a comparison sampler
+    uint8_t reserved0;
+    uint16_t max_anisotropy; // >= 1
+    uint16_t reserved1;
+    float lod_min_clamp;
+    float lod_max_clamp;
+};
+static_assert(sizeof(GpuCreateSampler2Payload) == 24, "GpuCreateSampler2Payload layout must stay 24 bytes");
 
 }  // namespace playgta6
 

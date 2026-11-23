@@ -12,8 +12,151 @@
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_xs.h"
 #include "gpu/gpu_ring.h"
+#include "gpu/pso_cache.h"
 
 namespace {
+
+// ---- Packet ABI v2: the render/compute pipeline keys travel verbatim, so the ABI structs must stay
+// byte-for-byte identical to pso::GraphicsPipelineKey / pso::ComputePipelineKey. ----
+namespace abi_v2_parity {
+using playgta6::GpuRenderPipelineKey;
+using PsoKey = playgta6::gpu::pso::GraphicsPipelineKey;
+
+#define PG6_SAME_OFFSET(AbiType, PsoType, field) \
+    static_assert(offsetof(AbiType, field) == offsetof(PsoType, field), #AbiType "::" #field " offset drift")
+
+static_assert(sizeof(GpuRenderPipelineKey) == sizeof(PsoKey));
+static_assert(alignof(GpuRenderPipelineKey) == alignof(PsoKey));
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, vs_shader);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, ps_shader);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, root_signature_id);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, color_target_count);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, color_targets);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, depth_stencil);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, primitive);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, multisample);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, vertex_buffer_count);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, vertex_attribute_count);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, vertex_buffers);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, vertex_attributes);
+PG6_SAME_OFFSET(GpuRenderPipelineKey, PsoKey, reserved);
+
+using AbiColor = playgta6::GpuColorTargetKey;
+using PsoColor = playgta6::gpu::pso::ColorTargetKey;
+static_assert(sizeof(AbiColor) == sizeof(PsoColor));
+PG6_SAME_OFFSET(AbiColor, PsoColor, format);
+PG6_SAME_OFFSET(AbiColor, PsoColor, blend_enabled);
+PG6_SAME_OFFSET(AbiColor, PsoColor, write_mask);
+PG6_SAME_OFFSET(AbiColor, PsoColor, color);
+PG6_SAME_OFFSET(AbiColor, PsoColor, alpha);
+
+using AbiBlend = playgta6::GpuBlendComponentKey;
+using PsoBlend = playgta6::gpu::pso::BlendComponentKey;
+static_assert(sizeof(AbiBlend) == sizeof(PsoBlend));
+PG6_SAME_OFFSET(AbiBlend, PsoBlend, operation);
+PG6_SAME_OFFSET(AbiBlend, PsoBlend, src_factor);
+PG6_SAME_OFFSET(AbiBlend, PsoBlend, dst_factor);
+
+using AbiDs = playgta6::GpuDepthStencilKey;
+using PsoDs = playgta6::gpu::pso::DepthStencilKey;
+static_assert(sizeof(AbiDs) == sizeof(PsoDs));
+PG6_SAME_OFFSET(AbiDs, PsoDs, format);
+PG6_SAME_OFFSET(AbiDs, PsoDs, depth_write_enabled);
+PG6_SAME_OFFSET(AbiDs, PsoDs, depth_compare);
+PG6_SAME_OFFSET(AbiDs, PsoDs, stencil_front);
+PG6_SAME_OFFSET(AbiDs, PsoDs, stencil_back);
+PG6_SAME_OFFSET(AbiDs, PsoDs, stencil_read_mask);
+PG6_SAME_OFFSET(AbiDs, PsoDs, stencil_write_mask);
+PG6_SAME_OFFSET(AbiDs, PsoDs, depth_bias);
+PG6_SAME_OFFSET(AbiDs, PsoDs, depth_bias_slope_scale_bits);
+PG6_SAME_OFFSET(AbiDs, PsoDs, depth_bias_clamp_bits);
+
+using AbiStencil = playgta6::GpuStencilFaceKey;
+using PsoStencil = playgta6::gpu::pso::StencilFaceKey;
+static_assert(sizeof(AbiStencil) == sizeof(PsoStencil));
+PG6_SAME_OFFSET(AbiStencil, PsoStencil, compare);
+PG6_SAME_OFFSET(AbiStencil, PsoStencil, fail_op);
+PG6_SAME_OFFSET(AbiStencil, PsoStencil, depth_fail_op);
+PG6_SAME_OFFSET(AbiStencil, PsoStencil, pass_op);
+
+using AbiPrim = playgta6::GpuPrimitiveKey;
+using PsoPrim = playgta6::gpu::pso::PrimitiveKey;
+static_assert(sizeof(AbiPrim) == sizeof(PsoPrim));
+PG6_SAME_OFFSET(AbiPrim, PsoPrim, topology);
+PG6_SAME_OFFSET(AbiPrim, PsoPrim, strip_index_format);
+PG6_SAME_OFFSET(AbiPrim, PsoPrim, front_face);
+PG6_SAME_OFFSET(AbiPrim, PsoPrim, cull_mode);
+PG6_SAME_OFFSET(AbiPrim, PsoPrim, unclipped_depth);
+
+using AbiMs = playgta6::GpuMultisampleKey;
+using PsoMs = playgta6::gpu::pso::MultisampleKey;
+static_assert(sizeof(AbiMs) == sizeof(PsoMs));
+PG6_SAME_OFFSET(AbiMs, PsoMs, count);
+PG6_SAME_OFFSET(AbiMs, PsoMs, mask);
+PG6_SAME_OFFSET(AbiMs, PsoMs, alpha_to_coverage_enabled);
+
+using AbiVb = playgta6::GpuVertexBufferKey;
+using PsoVb = playgta6::gpu::pso::VertexBufferKey;
+static_assert(sizeof(AbiVb) == sizeof(PsoVb));
+PG6_SAME_OFFSET(AbiVb, PsoVb, array_stride);
+PG6_SAME_OFFSET(AbiVb, PsoVb, step_mode);
+PG6_SAME_OFFSET(AbiVb, PsoVb, attribute_count);
+
+using AbiAttr = playgta6::GpuVertexAttributeKey;
+using PsoAttr = playgta6::gpu::pso::VertexAttributeKey;
+static_assert(sizeof(AbiAttr) == sizeof(PsoAttr));
+PG6_SAME_OFFSET(AbiAttr, PsoAttr, offset);
+PG6_SAME_OFFSET(AbiAttr, PsoAttr, format);
+PG6_SAME_OFFSET(AbiAttr, PsoAttr, shader_location);
+PG6_SAME_OFFSET(AbiAttr, PsoAttr, buffer_index);
+
+using AbiCompute = playgta6::GpuComputePipelineKey;
+using PsoCompute = playgta6::gpu::pso::ComputePipelineKey;
+static_assert(sizeof(AbiCompute) == sizeof(PsoCompute));
+PG6_SAME_OFFSET(AbiCompute, PsoCompute, cs_shader);
+PG6_SAME_OFFSET(AbiCompute, PsoCompute, root_signature_id);
+PG6_SAME_OFFSET(AbiCompute, PsoCompute, reserved);
+
+#undef PG6_SAME_OFFSET
+
+// Packet-level enums share the pso numbering.
+namespace pso = playgta6::gpu::pso;
+static_assert(static_cast<uint8_t>(playgta6::GpuLoadOp::Undefined) == static_cast<uint8_t>(pso::WgpuLoadOp::Undefined));
+static_assert(static_cast<uint8_t>(playgta6::GpuLoadOp::Load) == static_cast<uint8_t>(pso::WgpuLoadOp::Load));
+static_assert(static_cast<uint8_t>(playgta6::GpuLoadOp::Clear) == static_cast<uint8_t>(pso::WgpuLoadOp::Clear));
+static_assert(static_cast<uint8_t>(playgta6::GpuStoreOp::Undefined) == static_cast<uint8_t>(pso::WgpuStoreOp::Undefined));
+static_assert(static_cast<uint8_t>(playgta6::GpuStoreOp::Store) == static_cast<uint8_t>(pso::WgpuStoreOp::Store));
+static_assert(static_cast<uint8_t>(playgta6::GpuStoreOp::Discard) == static_cast<uint8_t>(pso::WgpuStoreOp::Discard));
+static_assert(static_cast<uint8_t>(playgta6::GpuTextureAspect::All) == static_cast<uint8_t>(pso::WgpuTextureAspect::All));
+static_assert(static_cast<uint8_t>(playgta6::GpuTextureAspect::DepthOnly) == static_cast<uint8_t>(pso::WgpuTextureAspect::DepthOnly));
+static_assert(static_cast<uint8_t>(playgta6::GpuTextureAspect::StencilOnly) == static_cast<uint8_t>(pso::WgpuTextureAspect::StencilOnly));
+static_assert(playgta6::kGpuMaxColorAttachments == pso::kMaxColorTargets);
+static_assert(playgta6::kGpuMaxVertexBuffers == pso::kMaxVertexBuffers);
+static_assert(playgta6::kGpuMaxVertexAttributes == pso::kMaxVertexAttributes);
+
+// docs/gpu_commands.md freezes the pso enum numbering ("WebGPU enum codes"): pin each table's end
+// and a few anchors so a reordering in pso_cache.h fails here instead of silently on the wire.
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Rgba8Unorm) == 22);
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Bgra8Unorm) == 27);
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Rgba16Float) == 40);
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Depth24PlusStencil8) == 47);
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Depth32Float) == 48);
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Bc7RgbaUnormSrgb) == 63);
+static_assert(static_cast<int>(pso::WgpuTextureFormat::Count) == 64);
+static_assert(static_cast<int>(pso::WgpuVertexFormat::Float32x3) == 30);
+static_assert(static_cast<int>(pso::WgpuVertexFormat::Unorm8x4Bgra) == 41);
+static_assert(static_cast<int>(pso::WgpuVertexFormat::Count) == 42);
+static_assert(static_cast<int>(pso::WgpuBlendFactor::OneMinusSrcAlpha) == 5);
+static_assert(static_cast<int>(pso::WgpuBlendFactor::Count) == 17);
+static_assert(static_cast<int>(pso::WgpuBlendOperation::Count) == 5);
+static_assert(static_cast<int>(pso::WgpuCompareFunction::LessEqual) == 4);
+static_assert(static_cast<int>(pso::WgpuCompareFunction::Count) == 9);
+static_assert(static_cast<int>(pso::WgpuStencilOperation::Count) == 8);
+static_assert(static_cast<int>(pso::WgpuCullMode::Back) == 2);
+static_assert(static_cast<int>(pso::WgpuFrontFace::Cw) == 1);
+static_assert(static_cast<int>(pso::WgpuIndexFormat::Uint32) == 2);
+static_assert(static_cast<int>(pso::WgpuVertexStepMode::Instance) == 2);
+}  // namespace abi_v2_parity
 
 #define CHECK(cond)                                                                         \
     do {                                                                                    \
@@ -779,6 +922,138 @@ void test_d3d12_xs_compute_and_textured_indexed_draw() {
     CHECK(draw_idx.first_index == 0u && draw_idx.base_vertex == -1 && draw_idx.first_instance == 0u);
 }
 
+void test_v2_opcodes_and_payload_layouts() {
+    using namespace playgta6;
+
+    // v1 numbering is untouched; v2 appends 22..34.
+    CHECK(static_cast<uint16_t>(GpuOpcode::DispatchCompute) == 21);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateBindGroupLayout) == 22);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreatePipelineLayout) == 23);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateRenderPipeline2) == 24);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateComputePipeline2) == 25);
+    CHECK(static_cast<uint16_t>(GpuOpcode::BeginRenderPass) == 26);
+    CHECK(static_cast<uint16_t>(GpuOpcode::EndRenderPass) == 27);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetViewport) == 28);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetScissorRect) == 29);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetBlendConstant) == 30);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetStencilReference) == 31);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateBindGroup2) == 32);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetBindGroup2) == 33);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateSampler2) == 34);
+
+    CHECK(sizeof(GpuTextureViewDesc) == 16);
+    CHECK(sizeof(GpuBindGroupLayoutEntry) == 24);
+    CHECK(sizeof(GpuCreateBindGroupLayoutPayload) == 24);
+    CHECK(sizeof(GpuCreatePipelineLayoutPayload) == 24);
+    CHECK(sizeof(GpuRenderPipelineKey) == 376);
+    CHECK(sizeof(GpuCreateRenderPipeline2Payload) == 392);
+    CHECK(sizeof(GpuComputePipelineKey) == 16);
+    CHECK(sizeof(GpuCreateComputePipeline2Payload) == 32);
+    CHECK(sizeof(GpuRenderPassColorAttachment) == 40);
+    CHECK(sizeof(GpuRenderPassDepthStencilAttachment) == 40);
+    CHECK(sizeof(GpuBeginRenderPassPayload) == 368);
+    CHECK(sizeof(GpuSetViewportPayload) == 24);
+    CHECK(sizeof(GpuSetScissorRectPayload) == 16);
+    CHECK(sizeof(GpuSetBlendConstantPayload) == 16);
+    CHECK(sizeof(GpuSetStencilReferencePayload) == 4);
+    CHECK(sizeof(GpuBindGroupEntry2) == 48);
+    CHECK(sizeof(GpuCreateBindGroup2Payload) == 16);
+    CHECK(sizeof(GpuSetBindGroup2Payload) == 16);
+    CHECK(sizeof(GpuCreateSampler2Payload) == 24);
+
+    // Field offsets documented in docs/gpu_commands.md.
+    CHECK(offsetof(GpuTextureViewDesc, base_mip_level) == 4);
+    CHECK(offsetof(GpuTextureViewDesc, mip_level_count) == 6);
+    CHECK(offsetof(GpuTextureViewDesc, base_array_layer) == 8);
+    CHECK(offsetof(GpuTextureViewDesc, array_layer_count) == 12);
+    CHECK(offsetof(GpuBindGroupLayoutEntry, type) == 8);
+    CHECK(offsetof(GpuBindGroupLayoutEntry, binding_type) == 9);
+    CHECK(offsetof(GpuBindGroupLayoutEntry, view_dimension) == 10);
+    CHECK(offsetof(GpuBindGroupLayoutEntry, flags) == 11);
+    CHECK(offsetof(GpuBindGroupLayoutEntry, storage_format) == 12);
+    CHECK(offsetof(GpuCreateBindGroupLayoutPayload, content_id) == 16);
+    CHECK(offsetof(GpuCreatePipelineLayoutPayload, content_id) == 16);
+    CHECK(offsetof(GpuCreateComputePipeline2Payload, key) == 16);
+    CHECK(offsetof(GpuRenderPassColorAttachment, load_op) == 4);
+    CHECK(offsetof(GpuRenderPassColorAttachment, store_op) == 5);
+    CHECK(offsetof(GpuRenderPassColorAttachment, view) == 8);
+    CHECK(offsetof(GpuRenderPassColorAttachment, clear_value) == 24);
+    CHECK(offsetof(GpuRenderPassDepthStencilAttachment, stencil_store_op) == 7);
+    CHECK(offsetof(GpuRenderPassDepthStencilAttachment, view) == 8);
+    CHECK(offsetof(GpuRenderPassDepthStencilAttachment, depth_clear_value) == 24);
+    CHECK(offsetof(GpuRenderPassDepthStencilAttachment, stencil_clear_value) == 28);
+    CHECK(offsetof(GpuRenderPassDepthStencilAttachment, depth_read_only) == 32);
+    CHECK(offsetof(GpuRenderPassDepthStencilAttachment, stencil_read_only) == 33);
+    CHECK(offsetof(GpuBeginRenderPassPayload, color) == 8);
+    CHECK(offsetof(GpuBeginRenderPassPayload, depth_stencil) == 328);
+    CHECK(offsetof(GpuCreateSampler2Payload, compare) == 10);
+    CHECK(offsetof(GpuCreateSampler2Payload, max_anisotropy) == 12);
+    CHECK(offsetof(GpuCreateSampler2Payload, lod_min_clamp) == 16);
+    CHECK(offsetof(GpuCreateSampler2Payload, lod_max_clamp) == 20);
+
+    // GpuBindGroupEntry2 starts with the exact v1 entry.
+    CHECK(offsetof(GpuBindGroupEntry2, binding) == offsetof(GpuBindGroupEntry, binding));
+    CHECK(offsetof(GpuBindGroupEntry2, resource_type) == offsetof(GpuBindGroupEntry, resource_type));
+    CHECK(offsetof(GpuBindGroupEntry2, resource_id) == offsetof(GpuBindGroupEntry, resource_id));
+    CHECK(offsetof(GpuBindGroupEntry2, offset) == offsetof(GpuBindGroupEntry, offset));
+    CHECK(offsetof(GpuBindGroupEntry2, size) == offsetof(GpuBindGroupEntry, size));
+    CHECK(offsetof(GpuBindGroupEntry2, view) == sizeof(GpuBindGroupEntry));
+
+    CHECK(kGpuSwapchainTextureId == 0xFFFFFFFFu);
+    CHECK(static_cast<uint8_t>(GpuTextureViewDimension::Dim2DArray) == 3);
+    CHECK(static_cast<uint8_t>(GpuTextureViewDimension::Dim3D) == 6);
+    CHECK(static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) == 3);
+    CHECK(static_cast<uint8_t>(GpuTextureSampleType::Uint) == 4);
+
+    // A G7 key copies verbatim into the packet and reads back field by field.
+    namespace pso = gpu::pso;
+    pso::D3D12GraphicsPsoDesc desc{};
+    desc.vs = 0x1111;
+    desc.ps = 0x2222;
+    desc.root_signature_id = 7;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    desc.DSVFormat = pso::DxgiFormat::D32_FLOAT;
+    desc.BlendState.RenderTarget[0].BlendEnable = true;
+    desc.BlendState.RenderTarget[0].SrcBlend = pso::D3D12Blend::SrcAlpha;
+    desc.BlendState.RenderTarget[0].DestBlend = pso::D3D12Blend::InvSrcAlpha;
+    const pso::D3D12InputElementDesc elements[] = {
+        {"POSITION", 0, pso::DxgiFormat::R32G32B32_FLOAT, 0, 0, pso::D3D12InputClassification::PerVertexData, 0},
+    };
+    desc.pInputElementDescs = elements;
+    desc.NumInputElements = 1;
+    const pso::GraphicsKeyResult result = pso::make_graphics_pipeline_key(desc);
+    CHECK(!pso::is_fatal(result.diagnostics));
+
+    GpuCreateRenderPipeline2Payload payload{};
+    payload.id = 40;
+    payload.vs_module_id = 41;
+    payload.fs_module_id = 42;
+    payload.pipeline_layout_id = 43;
+    static_assert(sizeof(payload.key) == sizeof(result.key));
+    std::memcpy(&payload.key, &result.key, sizeof(payload.key));
+
+    const GpuRenderPipelineKey& key = payload.key;
+    CHECK(key.vs_shader == 0x1111 && key.ps_shader == 0x2222 && key.root_signature_id == 7);
+    CHECK(key.color_target_count == 1);
+    CHECK(key.color_targets[0].format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm));
+    CHECK(key.color_targets[0].blend_enabled == 1);
+    CHECK(key.color_targets[0].write_mask == 0xF);
+    CHECK(key.color_targets[0].color.src_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::SrcAlpha));
+    CHECK(key.color_targets[0].color.dst_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::OneMinusSrcAlpha));
+    CHECK(key.depth_stencil.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth32Float));
+    CHECK(key.depth_stencil.depth_write_enabled == 1);
+    CHECK(key.depth_stencil.depth_compare == static_cast<uint8_t>(pso::WgpuCompareFunction::Less));
+    CHECK(key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList));
+    CHECK(key.primitive.cull_mode == static_cast<uint8_t>(pso::WgpuCullMode::Back));
+    CHECK(key.multisample.count == 1);
+    CHECK(key.vertex_buffer_count == 1 && key.vertex_attribute_count == 1);
+    CHECK(key.vertex_buffers[0].array_stride == 12);
+    CHECK(key.vertex_buffers[0].step_mode == static_cast<uint8_t>(pso::WgpuVertexStepMode::Vertex));
+    CHECK(key.vertex_attributes[0].format == static_cast<uint8_t>(pso::WgpuVertexFormat::Float32x3));
+    CHECK(std::memcmp(reinterpret_cast<const uint8_t*>(&payload) + 16, &result.key, 376) == 0);
+}
+
 }  // namespace
 
 void test_guest_state_layout() {
@@ -831,5 +1106,6 @@ int main() {
     test_gpu_ring_command_encoder_roundtrip();
     test_g5_abi_struct_sizes_and_encoder_roundtrip();
     test_d3d12_xs_compute_and_textured_indexed_draw();
+    test_v2_opcodes_and_payload_layouts();
     return 0;
 }

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Binary GPU command stream disassembler and frame trace inspector for playgta6web.
 
-Matches the frozen ABI v1 packet layout in `runtime/abi/playgta6_abi.h` and
-`docs/gpu_commands.md` (opcodes 0..21 plus forward-compatible handling of
-unknown/future opcodes >= 22).
+Matches the packet layout in `runtime/abi/playgta6_abi.h` and
+`docs/gpu_commands.md` (v1 opcodes 0..21, v2 opcodes 22..34, plus forward-compatible
+handling of unknown/future opcodes >= 35).
 
 Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
@@ -51,6 +51,39 @@ CREATE_COMPUTE_PIPELINE_STRUCT = struct.Struct("<IIII")  # 16 bytes
 SET_COMPUTE_PIPELINE_STRUCT = struct.Struct("<I")  # 4 bytes
 DISPATCH_COMPUTE_STRUCT = struct.Struct("<III")  # 12 bytes
 
+# Packet ABI v2 (opcodes 22..34).
+TEXTURE_VIEW_DESC_STRUCT = struct.Struct("<BBBBHHII")  # 16 bytes
+BIND_GROUP_LAYOUT_ENTRY_STRUCT = struct.Struct("<IIBBBBB3xQ")  # 24 bytes
+CREATE_BIND_GROUP_LAYOUT_STRUCT = struct.Struct("<IIIIQ")  # 24 bytes + entry_count * 24
+CREATE_PIPELINE_LAYOUT_STRUCT = struct.Struct("<IIIIQ")  # 24 bytes + count * 4
+RENDER_PIPELINE_KEY_SIZE = 376
+CREATE_RENDER_PIPELINE2_HEAD_STRUCT = struct.Struct("<IIII")  # 16 bytes + 376-byte key
+CREATE_RENDER_PIPELINE2_SIZE = CREATE_RENDER_PIPELINE2_HEAD_STRUCT.size + RENDER_PIPELINE_KEY_SIZE
+KEY_HEAD_STRUCT = struct.Struct("<QQII")  # vs_shader, ps_shader, root_signature_id, color_target_count
+KEY_COLOR_TARGET_STRUCT = struct.Struct("<BBBxBBBxBBBx")  # 12 bytes
+KEY_DEPTH_STENCIL_STRUCT = struct.Struct("<BBBxBBBBBBBBIIiII")  # 32 bytes
+KEY_PRIMITIVE_STRUCT = struct.Struct("<BBBBB3x")  # 8 bytes
+KEY_MULTISAMPLE_STRUCT = struct.Struct("<IIB3x")  # 12 bytes
+KEY_COUNTS_STRUCT = struct.Struct("<II")
+KEY_VERTEX_BUFFER_STRUCT = struct.Struct("<IBB2x")  # 8 bytes
+KEY_VERTEX_ATTRIBUTE_STRUCT = struct.Struct("<IBBBx")  # 8 bytes
+CREATE_COMPUTE_PIPELINE2_STRUCT = struct.Struct("<IIIIQII")  # 32 bytes
+RENDER_PASS_COLOR_ATTACHMENT_STRUCT = struct.Struct("<IBBH16sffff")  # 40 bytes
+RENDER_PASS_DEPTH_STENCIL_STRUCT = struct.Struct("<IBBBB16sfIBBHI")  # 40 bytes
+BEGIN_RENDER_PASS_HEAD_STRUCT = struct.Struct("<II")
+BEGIN_RENDER_PASS_SIZE = 368
+SET_VIEWPORT_STRUCT = struct.Struct("<ffffff")  # 24 bytes
+SET_SCISSOR_RECT_STRUCT = struct.Struct("<IIII")  # 16 bytes
+SET_BLEND_CONSTANT_STRUCT = struct.Struct("<ffff")  # 16 bytes
+SET_STENCIL_REFERENCE_STRUCT = struct.Struct("<I")  # 4 bytes
+BIND_GROUP_ENTRY2_STRUCT = struct.Struct("<IIIIQQ16s")  # 48 bytes
+CREATE_BIND_GROUP2_STRUCT = struct.Struct("<IIII")  # 16 bytes + entry_count * 48
+SET_BIND_GROUP2_STRUCT = struct.Struct("<IIII")  # 16 bytes + count * 4
+CREATE_SAMPLER2_STRUCT = struct.Struct("<IBBBBBBBxHxxff")  # 24 bytes
+
+SWAPCHAIN_TEXTURE_ID = 0xFFFFFFFF
+MANIFEST_REFERENCE_FLAG = 0x1
+
 DEFAULT_PREVIEW_BYTES = 16
 
 FNV1A_64_OFFSET_BASIS = 0xCBF29CE484222325
@@ -83,6 +116,19 @@ class GpuOpcode(IntEnum):
     CreateComputePipeline = 19
     SetComputePipeline = 20
     DispatchCompute = 21
+    CreateBindGroupLayout = 22
+    CreatePipelineLayout = 23
+    CreateRenderPipeline2 = 24
+    CreateComputePipeline2 = 25
+    BeginRenderPass = 26
+    EndRenderPass = 27
+    SetViewport = 28
+    SetScissorRect = 29
+    SetBlendConstant = 30
+    SetStencilReference = 31
+    CreateBindGroup2 = 32
+    SetBindGroup2 = 33
+    CreateSampler2 = 34
 
 
 class GpuTextureFormat(IntEnum):
@@ -227,6 +273,61 @@ for _bit, _name in TEXTURE_USAGE_FLAGS:
     TEXTURE_USAGE_KNOWN_MASK |= _bit
 
 OPCODE_NAMES: dict[int, str] = {op.value: op.name for op in GpuOpcode}
+
+# v2 "WebGPU enum codes" (docs/gpu_commands.md; numbering of pso::Wgpu* in runtime/gpu/pso_cache.h).
+WGPU_TEXTURE_FORMAT_NAMES: tuple[str, ...] = (
+    "undefined", "r8unorm", "r8snorm", "r8uint", "r8sint", "r16unorm", "r16snorm", "r16uint",
+    "r16sint", "r16float", "rg8unorm", "rg8snorm", "rg8uint", "rg8sint", "r32uint", "r32sint",
+    "r32float", "rg16unorm", "rg16snorm", "rg16uint", "rg16sint", "rg16float", "rgba8unorm",
+    "rgba8unorm-srgb", "rgba8snorm", "rgba8uint", "rgba8sint", "bgra8unorm", "bgra8unorm-srgb",
+    "rgb9e5ufloat", "rgb10a2uint", "rgb10a2unorm", "rg11b10ufloat", "rg32uint", "rg32sint",
+    "rg32float", "rgba16unorm", "rgba16snorm", "rgba16uint", "rgba16sint", "rgba16float",
+    "rgba32uint", "rgba32sint", "rgba32float", "stencil8", "depth16unorm", "depth24plus",
+    "depth24plus-stencil8", "depth32float", "depth32float-stencil8", "bc1-rgba-unorm",
+    "bc1-rgba-unorm-srgb", "bc2-rgba-unorm", "bc2-rgba-unorm-srgb", "bc3-rgba-unorm",
+    "bc3-rgba-unorm-srgb", "bc4-r-unorm", "bc4-r-snorm", "bc5-rg-unorm", "bc5-rg-snorm",
+    "bc6h-rgb-ufloat", "bc6h-rgb-float", "bc7-rgba-unorm", "bc7-rgba-unorm-srgb",
+)
+WGPU_VERTEX_FORMAT_NAMES: tuple[str, ...] = (
+    "undefined", "uint8", "uint8x2", "uint8x4", "sint8", "sint8x2", "sint8x4", "unorm8",
+    "unorm8x2", "unorm8x4", "snorm8", "snorm8x2", "snorm8x4", "uint16", "uint16x2", "uint16x4",
+    "sint16", "sint16x2", "sint16x4", "unorm16", "unorm16x2", "unorm16x4", "snorm16",
+    "snorm16x2", "snorm16x4", "float16", "float16x2", "float16x4", "float32", "float32x2",
+    "float32x3", "float32x4", "uint32", "uint32x2", "uint32x3", "uint32x4", "sint32",
+    "sint32x2", "sint32x3", "sint32x4", "unorm10-10-10-2", "unorm8x4-bgra",
+)
+WGPU_BLEND_FACTOR_NAMES: tuple[str, ...] = (
+    "zero", "one", "src", "one-minus-src", "src-alpha", "one-minus-src-alpha", "dst",
+    "one-minus-dst", "dst-alpha", "one-minus-dst-alpha", "src-alpha-saturated", "constant",
+    "one-minus-constant", "src1", "one-minus-src1", "src1-alpha", "one-minus-src1-alpha",
+)
+WGPU_BLEND_OPERATION_NAMES: tuple[str, ...] = ("add", "subtract", "reverse-subtract", "min", "max")
+WGPU_COMPARE_FUNCTION_NAMES: tuple[str, ...] = (
+    "undefined", "never", "less", "equal", "less-equal", "greater", "not-equal",
+    "greater-equal", "always",
+)
+WGPU_STENCIL_OPERATION_NAMES: tuple[str, ...] = (
+    "keep", "zero", "replace", "invert", "increment-clamp", "decrement-clamp",
+    "increment-wrap", "decrement-wrap",
+)
+WGPU_CULL_MODE_NAMES: tuple[str, ...] = ("none", "front", "back")
+WGPU_FRONT_FACE_NAMES: tuple[str, ...] = ("ccw", "cw")
+WGPU_INDEX_FORMAT_NAMES: tuple[str, ...] = ("undefined", "uint16", "uint32")
+WGPU_VERTEX_STEP_MODE_NAMES: tuple[str, ...] = ("unused", "vertex", "instance")
+WGPU_LOAD_OP_NAMES: tuple[str, ...] = ("undefined", "load", "clear")
+WGPU_STORE_OP_NAMES: tuple[str, ...] = ("undefined", "store", "discard")
+WGPU_TEXTURE_ASPECT_NAMES: tuple[str, ...] = ("all", "depth-only", "stencil-only")
+WGPU_VIEW_DIMENSION_NAMES: tuple[str, ...] = (
+    "undefined", "1d", "2d", "2d-array", "cube", "cube-array", "3d",
+)
+BINDING_LAYOUT_TYPE_NAMES: tuple[str, ...] = ("buffer", "sampler", "texture", "storageTexture")
+BINDING_SUBTYPE_NAMES: dict[int, tuple[str, ...]] = {
+    0: ("uniform", "storage", "read-only-storage"),
+    1: ("filtering", "non-filtering", "comparison"),
+    2: ("float", "unfilterable-float", "depth", "sint", "uint"),
+    3: ("write-only", "read-only", "read-write"),
+}
+SHADER_STAGE_BITS: tuple[tuple[int, str], ...] = ((0x1, "VERTEX"), (0x2, "FRAGMENT"), (0x4, "COMPUTE"))
 
 
 def fnv1a_64(data: bytes | bytearray | memoryview) -> int:
@@ -490,7 +591,11 @@ class DecodedTrace:
 
     @property
     def bind_groups_created(self) -> int:
-        return sum(1 for p in self.packets if p.opcode == GpuOpcode.CreateBindGroup and p.valid)
+        return sum(
+            1
+            for p in self.packets
+            if p.opcode in (GpuOpcode.CreateBindGroup, GpuOpcode.CreateBindGroup2) and p.valid
+        )
 
     @property
     def unknown_opcode_count(self) -> int:
@@ -915,6 +1020,225 @@ def encode_dispatch_compute(
     )
 
 
+def encode_texture_view_desc(
+    texture_format: int = 0,
+    dimension: int = 0,
+    aspect: int = 0,
+    base_mip_level: int = 0,
+    mip_level_count: int = 0,
+    base_array_layer: int = 0,
+    array_layer_count: int = 0,
+) -> bytes:
+    """Encode a 16-byte GpuTextureViewDesc (all zero = default view)."""
+    return TEXTURE_VIEW_DESC_STRUCT.pack(
+        texture_format, dimension, aspect, 0,
+        base_mip_level, mip_level_count, base_array_layer, array_layer_count,
+    )
+
+
+def encode_create_bind_group_layout(
+    layout_id: int,
+    entries: Sequence[Sequence[int]],
+    *,
+    content_id: int = 0,
+    flags: int = 0,
+    packet_flags: int = 0,
+) -> bytes:
+    """Encode CreateBindGroupLayout. Each entry is (binding, visibility, type, binding_type
+    [, view_dimension, entry_flags, storage_format, min_binding_size])."""
+    body = bytearray(
+        CREATE_BIND_GROUP_LAYOUT_STRUCT.pack(layout_id, len(entries), flags, 0, content_id)
+    )
+    for entry in entries:
+        padded = tuple(entry) + (0,) * (8 - len(entry))
+        body += BIND_GROUP_LAYOUT_ENTRY_STRUCT.pack(*padded)
+    return encode_packet(GpuOpcode.CreateBindGroupLayout, body, packet_flags)
+
+
+def encode_create_pipeline_layout(
+    layout_id: int,
+    bind_group_layout_ids: Sequence[int],
+    *,
+    content_id: int = 0,
+    flags: int = 0,
+    packet_flags: int = 0,
+) -> bytes:
+    """Encode CreatePipelineLayout (group i uses bind_group_layout_ids[i]; 0 = empty layout)."""
+    body = CREATE_PIPELINE_LAYOUT_STRUCT.pack(
+        layout_id, len(bind_group_layout_ids), flags, 0, content_id
+    ) + struct.pack(f"<{len(bind_group_layout_ids)}I", *bind_group_layout_ids)
+    return encode_packet(GpuOpcode.CreatePipelineLayout, body, packet_flags)
+
+
+def encode_create_render_pipeline2(
+    pipeline_id: int,
+    vs_module_id: int,
+    fs_module_id: int,
+    pipeline_layout_id: int,
+    key: bytes | bytearray,
+    flags: int = 0,
+) -> bytes:
+    """Encode CreateRenderPipeline2 with a raw 376-byte GpuRenderPipelineKey."""
+    if len(key) != RENDER_PIPELINE_KEY_SIZE:
+        raise ValueError(
+            f"render pipeline key must be {RENDER_PIPELINE_KEY_SIZE} bytes, got {len(key)}"
+        )
+    head = CREATE_RENDER_PIPELINE2_HEAD_STRUCT.pack(
+        pipeline_id, vs_module_id, fs_module_id, pipeline_layout_id
+    )
+    return encode_packet(GpuOpcode.CreateRenderPipeline2, head + bytes(key), flags)
+
+
+def encode_create_compute_pipeline2(
+    pipeline_id: int,
+    cs_module_id: int,
+    pipeline_layout_id: int,
+    cs_shader: int = 0,
+    root_signature_id: int = 0,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.CreateComputePipeline2,
+        CREATE_COMPUTE_PIPELINE2_STRUCT.pack(
+            pipeline_id, cs_module_id, pipeline_layout_id, 0, cs_shader, root_signature_id, 0
+        ),
+        flags,
+    )
+
+
+def encode_begin_render_pass(
+    colors: Sequence[dict[str, Any] | None],
+    depth_stencil: dict[str, Any] | None = None,
+    flags: int = 0,
+) -> bytes:
+    """Encode BeginRenderPass.
+
+    Color dicts: texture_id, load_op, store_op[, clear_value, view]. The depth-stencil dict:
+    texture_id[, depth_load_op, depth_store_op, stencil_load_op, stencil_store_op,
+    depth_clear_value, stencil_clear_value, depth_read_only, stencil_read_only, view].
+    """
+    if len(colors) > 8:
+        raise ValueError("at most 8 color attachments")
+    body = bytearray(BEGIN_RENDER_PASS_HEAD_STRUCT.pack(len(colors), 0))
+    zero_view = encode_texture_view_desc()
+    for i in range(8):
+        c = colors[i] if i < len(colors) else None
+        if c is None:
+            body += bytes(RENDER_PASS_COLOR_ATTACHMENT_STRUCT.size)
+            continue
+        r, g, b, a = c.get("clear_value", (0.0, 0.0, 0.0, 0.0))
+        body += RENDER_PASS_COLOR_ATTACHMENT_STRUCT.pack(
+            c["texture_id"], c["load_op"], c["store_op"], 0, c.get("view", zero_view), r, g, b, a
+        )
+    if depth_stencil is None:
+        body += bytes(RENDER_PASS_DEPTH_STENCIL_STRUCT.size)
+    else:
+        ds = depth_stencil
+        body += RENDER_PASS_DEPTH_STENCIL_STRUCT.pack(
+            ds["texture_id"],
+            ds.get("depth_load_op", 0),
+            ds.get("depth_store_op", 0),
+            ds.get("stencil_load_op", 0),
+            ds.get("stencil_store_op", 0),
+            ds.get("view", zero_view),
+            ds.get("depth_clear_value", 1.0),
+            ds.get("stencil_clear_value", 0),
+            int(bool(ds.get("depth_read_only", False))),
+            int(bool(ds.get("stencil_read_only", False))),
+            0,
+            0,
+        )
+    return encode_packet(GpuOpcode.BeginRenderPass, body, flags)
+
+
+def encode_end_render_pass(flags: int = 0) -> bytes:
+    return encode_packet(GpuOpcode.EndRenderPass, b"", flags)
+
+
+def encode_set_viewport(
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    min_depth: float = 0.0,
+    max_depth: float = 1.0,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetViewport,
+        SET_VIEWPORT_STRUCT.pack(x, y, width, height, min_depth, max_depth),
+        flags,
+    )
+
+
+def encode_set_scissor_rect(x: int, y: int, width: int, height: int, flags: int = 0) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetScissorRect, SET_SCISSOR_RECT_STRUCT.pack(x, y, width, height), flags
+    )
+
+
+def encode_set_blend_constant(r: float, g: float, b: float, a: float, flags: int = 0) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetBlendConstant, SET_BLEND_CONSTANT_STRUCT.pack(r, g, b, a), flags
+    )
+
+
+def encode_set_stencil_reference(reference: int, flags: int = 0) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetStencilReference, SET_STENCIL_REFERENCE_STRUCT.pack(reference), flags
+    )
+
+
+def encode_create_bind_group2(
+    bind_group_id: int,
+    layout_id: int,
+    entries: Sequence[Sequence[Any]],
+    flags: int = 0,
+) -> bytes:
+    """Encode CreateBindGroup2. Each entry is (binding, resource_type, resource_id
+    [, offset, size, view_bytes])."""
+    body = bytearray(CREATE_BIND_GROUP2_STRUCT.pack(bind_group_id, layout_id, len(entries), 0))
+    for entry in entries:
+        binding, rtype, rid = entry[0], int(entry[1]), entry[2]
+        e_offset = entry[3] if len(entry) > 3 else 0
+        e_size = entry[4] if len(entry) > 4 else 0
+        view = entry[5] if len(entry) > 5 else encode_texture_view_desc()
+        body += BIND_GROUP_ENTRY2_STRUCT.pack(binding, rtype, rid, 0, e_offset, e_size, view)
+    return encode_packet(GpuOpcode.CreateBindGroup2, body, flags)
+
+
+def encode_set_bind_group2(
+    group_index: int,
+    bind_group_id: int,
+    dynamic_offsets: Sequence[int] = (),
+    flags: int = 0,
+) -> bytes:
+    body = SET_BIND_GROUP2_STRUCT.pack(
+        group_index, bind_group_id, len(dynamic_offsets), 0
+    ) + struct.pack(f"<{len(dynamic_offsets)}I", *dynamic_offsets)
+    return encode_packet(GpuOpcode.SetBindGroup2, body, flags)
+
+
+def encode_create_sampler2(
+    sampler_id: int,
+    address: tuple[int, int, int] = (0, 0, 0),
+    filters: tuple[int, int, int] = (1, 1, 1),
+    compare: int = 0,
+    max_anisotropy: int = 1,
+    lod_min_clamp: float = 0.0,
+    lod_max_clamp: float = 32.0,
+    flags: int = 0,
+) -> bytes:
+    """Encode CreateSampler2 (address = (u, v, w), filters = (mag, min, mipmap))."""
+    return encode_packet(
+        GpuOpcode.CreateSampler2,
+        CREATE_SAMPLER2_STRUCT.pack(
+            sampler_id, *address, *filters, compare, max_anisotropy, lod_min_clamp, lod_max_clamp
+        ),
+        flags,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Decoding & frame grouping
 # ---------------------------------------------------------------------------
@@ -976,7 +1300,7 @@ def _decode_known_payload(
     preview_bytes: int,
     diagnostics: list[TraceDiagnostic],
 ) -> tuple[dict[str, Any], bool]:
-    """Decode payload for a known opcode (0..21). Returns (fields, valid)."""
+    """Decode payload for a known opcode (0..34). Returns (fields, valid)."""
     payload_len = len(payload)
     name = opcode.name
 
@@ -1906,7 +2230,510 @@ def _decode_known_payload(
             fields["trailing_bytes"] = payload_len - DISPATCH_COMPUTE_STRUCT.size
         return fields, True
 
+    if opcode >= GpuOpcode.CreateBindGroupLayout:
+        return _decode_v2_payload(
+            opcode=opcode,
+            payload=payload,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+
     raise AssertionError(f"Unhandled known opcode: {opcode}")
+
+
+# ---------------------------------------------------------------------------
+# Packet ABI v2 decoding (opcodes 22..34)
+# ---------------------------------------------------------------------------
+
+
+class _V2Context:
+    """Shared diagnostics plumbing for one v2 packet."""
+
+    def __init__(
+        self,
+        name: str,
+        offset: int,
+        packet_index: int,
+        strict: bool,
+        diagnostics: list[TraceDiagnostic],
+    ) -> None:
+        self.name = name
+        self.offset = offset
+        self.packet_index = packet_index
+        self.strict = strict
+        self.diagnostics = diagnostics
+
+    def warn(self, code: str, message: str) -> None:
+        self.diagnostics.append(
+            TraceDiagnostic(
+                severity=_warn_severity(self.strict),
+                code=code,
+                offset=self.offset,
+                packet_index=self.packet_index,
+                message=f"{self.name}: {message}",
+            )
+        )
+
+    def error(self, code: str, message: str) -> None:
+        self.diagnostics.append(
+            TraceDiagnostic(
+                severity="error",
+                code=code,
+                offset=self.offset,
+                packet_index=self.packet_index,
+                message=f"{self.name}: {message}",
+            )
+        )
+
+    def code(self, table: Sequence[str], value: int, what: str) -> str:
+        """Name for an enum code; unknown codes produce an `unknown_enum_code` diagnostic."""
+        if 0 <= value < len(table):
+            return table[value]
+        self.warn("unknown_enum_code", f"unknown {what} code {value}")
+        return f"Unknown({value})"
+
+    def fixed(self, payload_len: int, size: int) -> tuple[bool, bool]:
+        return _check_fixed_size(
+            opcode_name=self.name,
+            expected_size=size,
+            payload_bytes=payload_len,
+            offset=self.offset,
+            packet_index=self.packet_index,
+            strict=self.strict,
+            diagnostics=self.diagnostics,
+        )
+
+    def tail(self, payload_len: int, head_size: int, count: int, stride: int) -> tuple[int, bool, int]:
+        """Validate `head + count * stride`; returns (decodable_count, valid, trailing_bytes)."""
+        expected = head_size + count * stride
+        available = payload_len - head_size
+        if expected > payload_len:
+            self.error(
+                "variable_payload_truncated",
+                f"declares {count} element(s) ({count * stride} byte(s)) but only "
+                f"{available} byte(s) are present",
+            )
+            return available // stride, False, 0
+        if expected < payload_len:
+            self.warn(
+                "payload_size_mismatch",
+                f"expects {expected} payload byte(s), got {payload_len}",
+            )
+        return count, True, payload_len - expected
+
+
+def _f32_from_bits(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _decode_view_desc(ctx: _V2Context, raw: bytes | memoryview) -> dict[str, Any]:
+    fmt, dim, aspect, _reserved, base_mip, mip_count, base_layer, layer_count = (
+        TEXTURE_VIEW_DESC_STRUCT.unpack(bytes(raw))
+    )
+    return {
+        "format": ctx.code(WGPU_TEXTURE_FORMAT_NAMES, fmt, "texture format"),
+        "dimension": ctx.code(WGPU_VIEW_DIMENSION_NAMES, dim, "view dimension"),
+        "aspect": ctx.code(WGPU_TEXTURE_ASPECT_NAMES, aspect, "texture aspect"),
+        "base_mip_level": base_mip,
+        "mip_level_count": mip_count,
+        "base_array_layer": base_layer,
+        "array_layer_count": layer_count,
+    }
+
+
+def _decode_render_pipeline_key(ctx: _V2Context, key: bytes) -> dict[str, Any]:
+    vs_shader, ps_shader, root_signature_id, color_target_count = KEY_HEAD_STRUCT.unpack_from(key, 0)
+    if color_target_count > 8:
+        ctx.error("invalid_count", f"color_target_count {color_target_count} > 8")
+    color_targets: list[dict[str, Any] | None] = []
+    for i in range(min(color_target_count, 8)):
+        (fmt, blend_enabled, write_mask, c_op, c_src, c_dst, a_op, a_src, a_dst) = (
+            KEY_COLOR_TARGET_STRUCT.unpack_from(key, 24 + 12 * i)
+        )
+        if fmt == 0:
+            color_targets.append(None)
+            continue
+        target: dict[str, Any] = {
+            "format": ctx.code(WGPU_TEXTURE_FORMAT_NAMES, fmt, "texture format"),
+            "write_mask": write_mask,
+        }
+        if blend_enabled:
+            target["blend"] = {
+                "color": {
+                    "operation": ctx.code(WGPU_BLEND_OPERATION_NAMES, c_op, "blend operation"),
+                    "src_factor": ctx.code(WGPU_BLEND_FACTOR_NAMES, c_src, "blend factor"),
+                    "dst_factor": ctx.code(WGPU_BLEND_FACTOR_NAMES, c_dst, "blend factor"),
+                },
+                "alpha": {
+                    "operation": ctx.code(WGPU_BLEND_OPERATION_NAMES, a_op, "blend operation"),
+                    "src_factor": ctx.code(WGPU_BLEND_FACTOR_NAMES, a_src, "blend factor"),
+                    "dst_factor": ctx.code(WGPU_BLEND_FACTOR_NAMES, a_dst, "blend factor"),
+                },
+            }
+        color_targets.append(target)
+
+    (
+        ds_format, depth_write, depth_compare,
+        f_cmp, f_fail, f_dfail, f_pass, b_cmp, b_fail, b_dfail, b_pass,
+        read_mask, write_mask_ds, depth_bias, slope_bits, clamp_bits,
+    ) = KEY_DEPTH_STENCIL_STRUCT.unpack_from(key, 120)
+    depth_stencil: dict[str, Any] | None = None
+    if ds_format != 0:
+
+        def face(cmp: int, fail: int, dfail: int, pss: int) -> dict[str, str]:
+            return {
+                "compare": ctx.code(WGPU_COMPARE_FUNCTION_NAMES, cmp, "compare function"),
+                "fail_op": ctx.code(WGPU_STENCIL_OPERATION_NAMES, fail, "stencil operation"),
+                "depth_fail_op": ctx.code(WGPU_STENCIL_OPERATION_NAMES, dfail, "stencil operation"),
+                "pass_op": ctx.code(WGPU_STENCIL_OPERATION_NAMES, pss, "stencil operation"),
+            }
+
+        depth_stencil = {
+            "format": ctx.code(WGPU_TEXTURE_FORMAT_NAMES, ds_format, "texture format"),
+            "depth_write_enabled": bool(depth_write),
+            "depth_compare": ctx.code(WGPU_COMPARE_FUNCTION_NAMES, depth_compare, "compare function"),
+            "stencil_front": face(f_cmp, f_fail, f_dfail, f_pass),
+            "stencil_back": face(b_cmp, b_fail, b_dfail, b_pass),
+            "stencil_read_mask": read_mask,
+            "stencil_write_mask": write_mask_ds,
+            "depth_bias": depth_bias,
+            "depth_bias_slope_scale": _f32_from_bits(slope_bits),
+            "depth_bias_clamp": _f32_from_bits(clamp_bits),
+        }
+
+    topology, strip_index_format, front_face, cull_mode, unclipped_depth = (
+        KEY_PRIMITIVE_STRUCT.unpack_from(key, 152)
+    )
+    count, mask, alpha_to_coverage = KEY_MULTISAMPLE_STRUCT.unpack_from(key, 160)
+    vertex_buffer_count, vertex_attribute_count = KEY_COUNTS_STRUCT.unpack_from(key, 172)
+    if vertex_buffer_count > 8 or vertex_attribute_count > 16:
+        ctx.error(
+            "invalid_count",
+            f"vertex_buffer_count {vertex_buffer_count} / vertex_attribute_count "
+            f"{vertex_attribute_count} exceed 8 / 16",
+        )
+    attributes = []
+    for i in range(min(vertex_attribute_count, 16)):
+        attr_offset, attr_format, location, buffer_index = KEY_VERTEX_ATTRIBUTE_STRUCT.unpack_from(
+            key, 244 + 8 * i
+        )
+        attributes.append(
+            {
+                "offset": attr_offset,
+                "format": ctx.code(WGPU_VERTEX_FORMAT_NAMES, attr_format, "vertex format"),
+                "shader_location": location,
+                "buffer_index": buffer_index,
+            }
+        )
+    vertex_buffers: list[dict[str, Any] | None] = []
+    for i in range(min(vertex_buffer_count, 8)):
+        stride, step_mode, attribute_count = KEY_VERTEX_BUFFER_STRUCT.unpack_from(key, 180 + 8 * i)
+        if step_mode == 0:
+            vertex_buffers.append(None)
+            continue
+        vertex_buffers.append(
+            {
+                "array_stride": stride,
+                "step_mode": ctx.code(WGPU_VERTEX_STEP_MODE_NAMES, step_mode, "vertex step mode"),
+                "attributes": [a for a in attributes if a["buffer_index"] == i],
+            }
+        )
+
+    return {
+        "vs_shader": f"0x{vs_shader:016x}",
+        "ps_shader": f"0x{ps_shader:016x}",
+        "root_signature_id": root_signature_id,
+        "color_target_count": color_target_count,
+        "color_targets": color_targets,
+        "depth_stencil": depth_stencil,
+        "primitive": {
+            "topology": ctx.code(tuple(TOPOLOGY_WEBGPU_NAMES.values()), topology, "topology"),
+            "strip_index_format": ctx.code(WGPU_INDEX_FORMAT_NAMES, strip_index_format, "index format"),
+            "front_face": ctx.code(WGPU_FRONT_FACE_NAMES, front_face, "front face"),
+            "cull_mode": ctx.code(WGPU_CULL_MODE_NAMES, cull_mode, "cull mode"),
+            "unclipped_depth": bool(unclipped_depth),
+        },
+        "multisample": {
+            "count": count,
+            "mask": mask,
+            "alpha_to_coverage_enabled": bool(alpha_to_coverage),
+        },
+        "vertex_buffer_count": vertex_buffer_count,
+        "vertex_attribute_count": vertex_attribute_count,
+        "vertex_buffers": vertex_buffers,
+        "key_fnv1a64": f"0x{fnv1a_64(key):016x}",
+    }
+
+
+def _decode_v2_payload(
+    *,
+    opcode: GpuOpcode,
+    payload: memoryview,
+    offset: int,
+    packet_index: int,
+    strict: bool,
+    diagnostics: list[TraceDiagnostic],
+) -> tuple[dict[str, Any], bool]:
+    """Decode payload for a v2 opcode (22..34). Returns (fields, valid)."""
+    ctx = _V2Context(opcode.name, offset, packet_index, strict, diagnostics)
+    payload_len = len(payload)
+
+    def too_short(size: int) -> tuple[dict[str, Any], bool]:
+        ctx.error("payload_too_short", f"expects at least {size} payload byte(s), got {payload_len}")
+        return {"expected_min_bytes": size, "actual_bytes": payload_len}, False
+
+    def fixed_fields(size: int) -> tuple[bool, dict[str, Any]]:
+        can_decode, exact = ctx.fixed(payload_len, size)
+        extra: dict[str, Any] = {}
+        if not can_decode:
+            extra = {"expected_bytes": size, "actual_bytes": payload_len}
+        elif not exact:
+            extra = {"trailing_bytes": payload_len - size}
+        return can_decode, extra
+
+    if opcode in (GpuOpcode.CreateBindGroupLayout, GpuOpcode.CreatePipelineLayout):
+        head = CREATE_BIND_GROUP_LAYOUT_STRUCT
+        if payload_len < head.size:
+            return too_short(head.size)
+        res_id, count, flags, _reserved, content_id = head.unpack_from(payload, 0)
+        manifest_ref = bool(flags & MANIFEST_REFERENCE_FLAG)
+        if manifest_ref and count:
+            ctx.warn("manifest_reference_with_entries", f"ManifestReference with {count} element(s)")
+        fields: dict[str, Any] = {
+            "id": res_id,
+            "flags": flags,
+            "manifest_reference": manifest_ref,
+            "content_id": f"0x{content_id:016x}",
+        }
+        if opcode == GpuOpcode.CreatePipelineLayout:
+            n, valid, trailing = ctx.tail(payload_len, head.size, count, 4)
+            fields["bind_group_layout_count"] = count
+            fields["bind_group_layout_ids"] = list(
+                struct.unpack_from(f"<{n}I", payload, head.size)
+            )
+        else:
+            stride = BIND_GROUP_LAYOUT_ENTRY_STRUCT.size
+            n, valid, trailing = ctx.tail(payload_len, head.size, count, stride)
+            entries = []
+            for i in range(n):
+                (binding, visibility, ltype, subtype, view_dim, eflags, storage_format, min_size) = (
+                    BIND_GROUP_LAYOUT_ENTRY_STRUCT.unpack_from(payload, head.size + i * stride)
+                )
+                entry: dict[str, Any] = {
+                    "binding": binding,
+                    "visibility": visibility,
+                    "visibility_names": [n_ for bit, n_ in SHADER_STAGE_BITS if visibility & bit],
+                    "type": ctx.code(BINDING_LAYOUT_TYPE_NAMES, ltype, "binding layout type"),
+                    "binding_type": ctx.code(
+                        BINDING_SUBTYPE_NAMES.get(ltype, ()), subtype, "binding type"
+                    ),
+                }
+                if ltype in (2, 3):
+                    entry["view_dimension"] = ctx.code(
+                        WGPU_VIEW_DIMENSION_NAMES, view_dim, "view dimension"
+                    )
+                if ltype == 0:
+                    entry["has_dynamic_offset"] = bool(eflags & 0x1)
+                    entry["min_binding_size"] = min_size
+                if ltype == 2:
+                    entry["multisampled"] = bool(eflags & 0x2)
+                if ltype == 3:
+                    entry["storage_format"] = ctx.code(
+                        WGPU_TEXTURE_FORMAT_NAMES, storage_format, "texture format"
+                    )
+                entries.append(entry)
+            fields["entry_count"] = count
+            fields["entries"] = entries
+        if trailing:
+            fields["trailing_bytes"] = trailing
+        return fields, valid
+
+    if opcode == GpuOpcode.CreateRenderPipeline2:
+        can_decode, extra = fixed_fields(CREATE_RENDER_PIPELINE2_SIZE)
+        if not can_decode:
+            return extra, False
+        res_id, vs_id, fs_id, layout_id = CREATE_RENDER_PIPELINE2_HEAD_STRUCT.unpack_from(payload, 0)
+        key = bytes(payload[16:CREATE_RENDER_PIPELINE2_SIZE])
+        return {
+            "id": res_id,
+            "vs_module_id": vs_id,
+            "fs_module_id": fs_id,
+            "pipeline_layout_id": layout_id,
+            "key": _decode_render_pipeline_key(ctx, key),
+            **extra,
+        }, True
+
+    if opcode == GpuOpcode.CreateComputePipeline2:
+        can_decode, extra = fixed_fields(CREATE_COMPUTE_PIPELINE2_STRUCT.size)
+        if not can_decode:
+            return extra, False
+        res_id, cs_id, layout_id, _r, cs_shader, root_sig, _r2 = (
+            CREATE_COMPUTE_PIPELINE2_STRUCT.unpack_from(payload, 0)
+        )
+        return {
+            "id": res_id,
+            "cs_module_id": cs_id,
+            "pipeline_layout_id": layout_id,
+            "cs_shader": f"0x{cs_shader:016x}",
+            "root_signature_id": root_sig,
+            **extra,
+        }, True
+
+    if opcode == GpuOpcode.BeginRenderPass:
+        can_decode, extra = fixed_fields(BEGIN_RENDER_PASS_SIZE)
+        if not can_decode:
+            return extra, False
+        color_count, _reserved = BEGIN_RENDER_PASS_HEAD_STRUCT.unpack_from(payload, 0)
+        valid = True
+        if color_count > 8:
+            ctx.error("invalid_count", f"color_count {color_count} > 8")
+            valid = False
+        colors: list[dict[str, Any] | None] = []
+        for i in range(min(color_count, 8)):
+            (tex, load_op, store_op, _r, view, r, g, b, a) = (
+                RENDER_PASS_COLOR_ATTACHMENT_STRUCT.unpack_from(payload, 8 + 40 * i)
+            )
+            if tex == 0:
+                colors.append(None)
+                continue
+            colors.append(
+                {
+                    "texture_id": tex,
+                    "swapchain": tex == SWAPCHAIN_TEXTURE_ID,
+                    "load_op": ctx.code(WGPU_LOAD_OP_NAMES, load_op, "load op"),
+                    "store_op": ctx.code(WGPU_STORE_OP_NAMES, store_op, "store op"),
+                    "clear_value": [r, g, b, a],
+                    "view": _decode_view_desc(ctx, view),
+                }
+            )
+        (
+            ds_tex, d_load, d_store, s_load, s_store, ds_view, depth_clear, stencil_clear,
+            depth_ro, stencil_ro, _r0, _r1,
+        ) = RENDER_PASS_DEPTH_STENCIL_STRUCT.unpack_from(payload, 328)
+        depth_stencil: dict[str, Any] | None = None
+        if ds_tex != 0:
+            depth_stencil = {
+                "texture_id": ds_tex,
+                "depth_load_op": ctx.code(WGPU_LOAD_OP_NAMES, d_load, "load op"),
+                "depth_store_op": ctx.code(WGPU_STORE_OP_NAMES, d_store, "store op"),
+                "stencil_load_op": ctx.code(WGPU_LOAD_OP_NAMES, s_load, "load op"),
+                "stencil_store_op": ctx.code(WGPU_STORE_OP_NAMES, s_store, "store op"),
+                "depth_clear_value": depth_clear,
+                "stencil_clear_value": stencil_clear,
+                "depth_read_only": bool(depth_ro),
+                "stencil_read_only": bool(stencil_ro),
+                "view": _decode_view_desc(ctx, ds_view),
+            }
+        return {
+            "color_count": color_count,
+            "color_attachments": colors,
+            "depth_stencil": depth_stencil,
+            **extra,
+        }, valid
+
+    if opcode == GpuOpcode.EndRenderPass:
+        can_decode, extra = fixed_fields(0)
+        return extra, can_decode
+
+    simple: dict[GpuOpcode, tuple[struct.Struct, tuple[str, ...]]] = {
+        GpuOpcode.SetViewport: (
+            SET_VIEWPORT_STRUCT,
+            ("x", "y", "width", "height", "min_depth", "max_depth"),
+        ),
+        GpuOpcode.SetScissorRect: (SET_SCISSOR_RECT_STRUCT, ("x", "y", "width", "height")),
+        GpuOpcode.SetBlendConstant: (SET_BLEND_CONSTANT_STRUCT, ("r", "g", "b", "a")),
+        GpuOpcode.SetStencilReference: (SET_STENCIL_REFERENCE_STRUCT, ("reference",)),
+    }
+    if opcode in simple:
+        layout, names = simple[opcode]
+        can_decode, extra = fixed_fields(layout.size)
+        if not can_decode:
+            return extra, False
+        values = layout.unpack_from(payload, 0)
+        for field_name, value in zip(names, values):
+            if isinstance(value, float) and not math.isfinite(value):
+                ctx.warn("non_finite_float", f"{field_name} is non-finite ({value})")
+        return {**dict(zip(names, values)), **extra}, True
+
+    if opcode == GpuOpcode.CreateBindGroup2:
+        head = CREATE_BIND_GROUP2_STRUCT
+        if payload_len < head.size:
+            return too_short(head.size)
+        res_id, layout_id, entry_count, _reserved = head.unpack_from(payload, 0)
+        stride = BIND_GROUP_ENTRY2_STRUCT.size
+        n, valid, trailing = ctx.tail(payload_len, head.size, entry_count, stride)
+        entries = []
+        for i in range(n):
+            binding, rtype, rid, _r, e_offset, e_size, view = BIND_GROUP_ENTRY2_STRUCT.unpack_from(
+                payload, head.size + i * stride
+            )
+            rtype_name, rtype_known = decode_bind_resource_type(rtype)
+            if not rtype_known:
+                ctx.warn("unknown_bind_resource_type", f"entry[{i}] has resource_type={rtype}")
+            entry = {
+                "binding": binding,
+                "resource_type": rtype,
+                "resource_type_name": rtype_name,
+                "resource_id": rid,
+                "null_binding": rid == 0,
+                "offset": e_offset,
+                "size": e_size,
+            }
+            if rtype == GpuBindResourceType.TextureView:
+                entry["view"] = _decode_view_desc(ctx, view)
+            entries.append(entry)
+        fields = {
+            "id": res_id,
+            "layout_id": layout_id,
+            "entry_count": entry_count,
+            "entries": entries,
+        }
+        if trailing:
+            fields["trailing_bytes"] = trailing
+        return fields, valid
+
+    if opcode == GpuOpcode.SetBindGroup2:
+        head = SET_BIND_GROUP2_STRUCT
+        if payload_len < head.size:
+            return too_short(head.size)
+        group_index, bind_group_id, count, _reserved = head.unpack_from(payload, 0)
+        n, valid, trailing = ctx.tail(payload_len, head.size, count, 4)
+        fields = {
+            "group_index": group_index,
+            "bind_group_id": bind_group_id,
+            "dynamic_offsets": list(struct.unpack_from(f"<{n}I", payload, head.size)),
+        }
+        if trailing:
+            fields["trailing_bytes"] = trailing
+        return fields, valid
+
+    if opcode == GpuOpcode.CreateSampler2:
+        can_decode, extra = fixed_fields(CREATE_SAMPLER2_STRUCT.size)
+        if not can_decode:
+            return extra, False
+        (res_id, au, av, aw, mag, min_f, mip, compare, aniso, lod_min, lod_max) = (
+            CREATE_SAMPLER2_STRUCT.unpack_from(payload, 0)
+        )
+        addr_names = tuple(ADDRESS_MODE_WEBGPU_NAMES.values())
+        filter_names = tuple(FILTER_MODE_WEBGPU_NAMES.values())
+        return {
+            "id": res_id,
+            "address_u": ctx.code(addr_names, au, "address mode"),
+            "address_v": ctx.code(addr_names, av, "address mode"),
+            "address_w": ctx.code(addr_names, aw, "address mode"),
+            "mag_filter": ctx.code(filter_names, mag, "filter mode"),
+            "min_filter": ctx.code(filter_names, min_f, "filter mode"),
+            "mipmap_filter": ctx.code(filter_names, mip, "filter mode"),
+            "compare": ctx.code(WGPU_COMPARE_FUNCTION_NAMES, compare, "compare function"),
+            "max_anisotropy": aniso,
+            "lod_min_clamp": lod_min,
+            "lod_max_clamp": lod_max,
+            **extra,
+        }, True
+
+    raise AssertionError(f"Unhandled v2 opcode: {opcode}")
 
 
 def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
@@ -1929,6 +2756,7 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
         GpuOpcode.SetIndexBuffer,
         GpuOpcode.Draw,
         GpuOpcode.DrawIndexed,
+        GpuOpcode.BeginRenderPass,
     }
     compute_pass_opcodes = {
         GpuOpcode.SetComputePipeline,
@@ -1961,7 +2789,7 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
                 compute_dispatches += 1
             elif pkt.opcode == GpuOpcode.CreateTexture:
                 textures_created += 1
-            elif pkt.opcode == GpuOpcode.CreateBindGroup:
+            elif pkt.opcode in (GpuOpcode.CreateBindGroup, GpuOpcode.CreateBindGroup2):
                 bind_groups_created += 1
 
             if pkt.opcode in compute_pass_opcodes:
@@ -1970,6 +2798,8 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
                     active_pass = "compute"
             elif pkt.opcode in render_pass_opcodes:
                 active_pass = "render"
+            elif pkt.opcode == GpuOpcode.EndRenderPass:
+                active_pass = None
         frames.append(
             FrameSummary(
                 frame_index=len(frames),
@@ -2253,6 +3083,127 @@ def _format_packet_fields(pkt: DecodedPacket) -> str:
         return f"pipeline_id={f['pipeline_id']}"
     if op == GpuOpcode.DispatchCompute:
         return f"workgroups=({f['workgroup_x']}, {f['workgroup_y']}, {f['workgroup_z']})"
+    if op >= GpuOpcode.CreateBindGroupLayout:
+        return _format_v2_fields(op, f)
+    return " ".join(f"{k}={v}" for k, v in f.items())
+
+
+def _format_view(view: dict[str, Any]) -> str:
+    parts = []
+    if view["format"] != "undefined":
+        parts.append(view["format"])
+    if view["dimension"] != "undefined":
+        parts.append(view["dimension"])
+    if view["aspect"] != "all":
+        parts.append(view["aspect"])
+    if view["base_mip_level"] or view["mip_level_count"]:
+        parts.append(f"mip={view['base_mip_level']}+{view['mip_level_count'] or 'all'}")
+    if view["base_array_layer"] or view["array_layer_count"]:
+        parts.append(f"layer={view['base_array_layer']}+{view['array_layer_count'] or 'all'}")
+    return f"<{','.join(parts)}>" if parts else ""
+
+
+def _format_v2_fields(op: int, f: dict[str, Any]) -> str:
+    if op in (GpuOpcode.CreateBindGroupLayout, GpuOpcode.CreatePipelineLayout):
+        base = f"id={f['id']} content={f['content_id']}"
+        if f["manifest_reference"]:
+            return base + " manifest-ref"
+        if op == GpuOpcode.CreatePipelineLayout:
+            return base + f" groups={f['bind_group_layout_ids']}"
+        entries = []
+        for e in f["entries"]:
+            stages = "|".join(e["visibility_names"]) or "NONE"
+            extra = ""
+            if e.get("has_dynamic_offset"):
+                extra += ",dynamic"
+            if "view_dimension" in e and e["view_dimension"] != "undefined":
+                extra += f",{e['view_dimension']}"
+            if "storage_format" in e:
+                extra += f",{e['storage_format']}"
+            entries.append(f"@{e['binding']}:{e['type']}({e['binding_type']}{extra})[{stages}]")
+        return base + f" entries={f['entry_count']} [{', '.join(entries)}]"
+    if op == GpuOpcode.CreateRenderPipeline2:
+        k = f["key"]
+        targets = ",".join(t["format"] if t else "null" for t in k["color_targets"])
+        ds = k["depth_stencil"]["format"] if k["depth_stencil"] else "none"
+        return (
+            f"id={f['id']} vs={f['vs_module_id']} fs={f['fs_module_id']} "
+            f"layout={f['pipeline_layout_id']} topology={k['primitive']['topology']} "
+            f"targets=[{targets}] depth={ds} samples={k['multisample']['count']} "
+            f"vbufs={k['vertex_buffer_count']} attrs={k['vertex_attribute_count']} "
+            f"key={k['key_fnv1a64']}"
+        )
+    if op == GpuOpcode.CreateComputePipeline2:
+        return f"id={f['id']} cs={f['cs_module_id']} layout={f['pipeline_layout_id']}"
+    if op == GpuOpcode.BeginRenderPass:
+        parts = []
+        for i, c in enumerate(f["color_attachments"]):
+            if c is None:
+                parts.append(f"c{i}=null")
+                continue
+            tex = "swapchain" if c["swapchain"] else f"#{c['texture_id']}"
+            load = c["load_op"]
+            if load == "clear":
+                load += "(" + ",".join(f"{v:.3g}" for v in c["clear_value"]) + ")"
+            parts.append(f"c{i}={tex}{_format_view(c['view'])} {load}/{c['store_op']}")
+        ds = f["depth_stencil"]
+        if ds is not None:
+            depth = f"{ds['depth_load_op']}/{ds['depth_store_op']}"
+            if ds["depth_load_op"] == "clear":
+                depth += f"({ds['depth_clear_value']:.3g})"
+            stencil = f"{ds['stencil_load_op']}/{ds['stencil_store_op']}"
+            if ds["stencil_load_op"] == "clear":
+                stencil += f"({ds['stencil_clear_value']})"
+            ro = ""
+            if ds["depth_read_only"] or ds["stencil_read_only"]:
+                ro = " ro=" + "".join(
+                    flag
+                    for flag, on in (("D", ds["depth_read_only"]), ("S", ds["stencil_read_only"]))
+                    if on
+                )
+            parts.append(
+                f"ds=#{ds['texture_id']}{_format_view(ds['view'])} depth={depth} stencil={stencil}{ro}"
+            )
+        return f"colors={f['color_count']} " + " ".join(parts)
+    if op == GpuOpcode.EndRenderPass:
+        return f"trailing_bytes={f['trailing_bytes']}" if "trailing_bytes" in f else ""
+    if op == GpuOpcode.SetViewport:
+        return (
+            f"rect=({f['x']:g},{f['y']:g} {f['width']:g}x{f['height']:g}) "
+            f"depth=[{f['min_depth']:g},{f['max_depth']:g}]"
+        )
+    if op == GpuOpcode.SetScissorRect:
+        return f"rect=({f['x']},{f['y']} {f['width']}x{f['height']})"
+    if op == GpuOpcode.SetBlendConstant:
+        return f"rgba=({f['r']:.4f}, {f['g']:.4f}, {f['b']:.4f}, {f['a']:.4f})"
+    if op == GpuOpcode.SetStencilReference:
+        return f"reference={f['reference']}"
+    if op == GpuOpcode.CreateBindGroup2:
+        entries = []
+        for e in f["entries"]:
+            res = "null" if e["null_binding"] else f"#{e['resource_id']}"
+            base = f"@{e['binding']}:{e['resource_type_name']}({res})"
+            if e["resource_type"] == GpuBindResourceType.Buffer and (e["offset"] or e["size"]):
+                base += f"[{e['offset']}:{e['size'] or 'end'}]"
+            if "view" in e:
+                base += _format_view(e["view"])
+            entries.append(base)
+        return (
+            f"id={f['id']} layout={f['layout_id']} entries={f['entry_count']} "
+            f"[{', '.join(entries)}]"
+        )
+    if op == GpuOpcode.SetBindGroup2:
+        return (
+            f"group={f['group_index']} bind_group_id={f['bind_group_id']} "
+            f"dynamic_offsets={f['dynamic_offsets']}"
+        )
+    if op == GpuOpcode.CreateSampler2:
+        cmp = f" compare={f['compare']}" if f["compare"] != "undefined" else ""
+        return (
+            f"id={f['id']} addr=({f['address_u']},{f['address_v']},{f['address_w']}) "
+            f"filter=(mag={f['mag_filter']},min={f['min_filter']},mip={f['mipmap_filter']}) "
+            f"aniso={f['max_anisotropy']} lod=[{f['lod_min_clamp']:g},{f['lod_max_clamp']:g}]{cmp}"
+        )
     return " ".join(f"{k}={v}" for k, v in f.items())
 
 
@@ -2369,7 +3320,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help=(
-            "Fail with non-zero exit code on unknown opcodes (>= 22), "
+            "Fail with non-zero exit code on unknown opcodes (>= 35), "
             "size mismatches, or malformed/truncated packets."
         ),
     )

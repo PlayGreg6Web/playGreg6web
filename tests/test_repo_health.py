@@ -49,16 +49,16 @@ class TestRepoHealthRealRepo(unittest.TestCase):
         checks = report["checks"]
         gpu = checks["gpu_opcode_parity"]
         self.assertTrue(gpu["ok"])
-        self.assertEqual(gpu["opcode_count"], 22)
+        self.assertEqual(gpu["opcode_count"], 35)
         self.assertEqual(gpu["min_opcode"], 0)
-        self.assertEqual(gpu["max_opcode"], 21)
+        self.assertEqual(gpu["max_opcode"], 34)
         for target_rel in (
             repo_health.GPU_TRACE_PY_REL,
             repo_health.WGPU_WORKER_JS_REL,
             repo_health.SMOKE_SCENE_JS_REL,
         ):
             self.assertTrue(gpu["targets"][target_rel]["ok"])
-            self.assertEqual(gpu["targets"][target_rel]["count"], 22)
+            self.assertEqual(gpu["targets"][target_rel]["count"], 35)
 
         inp = checks["input_state_parity"]
         self.assertTrue(inp["ok"])
