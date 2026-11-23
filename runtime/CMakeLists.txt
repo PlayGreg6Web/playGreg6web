@@ -32,6 +32,7 @@ add_library(playgta6_core STATIC
     guest/guest_runtime.cpp
     guest/com_bridge.cpp
     guest/guest_callbacks.cpp
+    guest/cpu_helpers.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -62,6 +63,10 @@ if(EMSCRIPTEN)
         -Wl,--undefined=__playgta6_trap
         -Wl,--undefined=__playgta6_unimplemented
         -Wl,--undefined=__playgta6_divide_error
+        -Wl,--undefined=__playgta6_cpuid
+        -Wl,--undefined=__playgta6_rdtsc
+        -Wl,--undefined=__playgta6_rdtscp
+        -Wl,--undefined=__playgta6_xgetbv
     )
 else()
     find_package(Threads REQUIRED)
@@ -137,4 +142,7 @@ else()
     add_executable(test_com_bridge ../tests/test_com_bridge.cpp)
     target_link_libraries(test_com_bridge PRIVATE playgta6_core)
     add_test(NAME playgta6_com_bridge_tests COMMAND test_com_bridge)
+    add_executable(test_cpu_helpers ../tests/test_cpu_helpers.cpp)
+    target_link_libraries(test_cpu_helpers PRIVATE playgta6_core)
+    add_test(NAME playgta6_cpu_helpers_tests COMMAND test_cpu_helpers)
 endif()

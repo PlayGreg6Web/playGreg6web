@@ -197,6 +197,8 @@ const char* fault_kind_name(FaultKind kind) {
             return "stack imbalance after guest call";
         case FaultKind::BadStack:
             return "guest stack not writable";
+        case FaultKind::GeneralProtection:
+            return "general protection fault (#GP)";
     }
     return "unknown fault";
 }
@@ -370,6 +372,9 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size) {
             break;
         case FaultKind::BadStack:
             out.append(" (stack address 0x%016" PRIx64 ")", info.detail);
+            break;
+        case FaultKind::GeneralProtection:
+            out.append(" (xgetbv with invalid XCR index 0x%" PRIx64 ")", info.detail);
             break;
         default:
             break;

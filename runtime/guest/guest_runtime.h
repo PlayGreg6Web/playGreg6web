@@ -121,6 +121,7 @@ enum class FaultKind : uint32_t {
     UnknownTarget = 4,   // va = target; detail = nearest lifted entry below it (0 if none)
     StackImbalance = 5,  // va = call_guest entry; detail = rsp after return (expected rsp + 8)
     BadStack = 6,        // va = call_guest entry; detail = stack address that is not writable
+    GeneralProtection = 7,  // #GP from a CPU helper (xgetbv): va = rip; detail = bad XCR index
 };
 
 const char* fault_kind_name(FaultKind kind);
