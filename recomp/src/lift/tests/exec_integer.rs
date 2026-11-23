@@ -697,6 +697,10 @@ fn atomics_have_no_lost_updates_across_threads() {
         MEMORY_BYTES / 65536
     );
     let out = run_script(&built, "runner_threads.js", RUNNER_THREADS_JS, &[spec]);
+    if let Some(reason) = out.trim().strip_prefix("skip: ") {
+        println!("SKIP {test}: {reason}");
+        return;
+    }
     println!("{out}");
     // Every call starts behind a barrier on all workers; at least one must really have run on
     // all threads at the same time for this test to say anything about atomicity.

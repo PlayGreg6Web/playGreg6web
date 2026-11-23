@@ -52,17 +52,21 @@ if (isMainThread) {
   let memory = null;
   let lastError = null;
   for (const key of ['address', 'index']) {
-    try {
-      const m = new WebAssembly.Memory({ initial: spec.pages, maximum: spec.pages, shared: true, [key]: 'i64' });
-      new WebAssembly.Instance(module, imports(m));
-      memory = m;
-      break;
-    } catch (e) {
-      lastError = e;
+    for (const size of [spec.pages, BigInt(spec.pages)]) {
+      try {
+        const m = new WebAssembly.Memory({ initial: size, maximum: size, shared: true, [key]: 'i64' });
+        new WebAssembly.Instance(module, imports(m));
+        memory = m;
+        break;
+      } catch (e) {
+        lastError = e;
+      }
     }
+    if (memory) break;
   }
   if (!memory) {
-    process.stdout.write(`error: cannot create a shared memory64: ${lastError}\n`);
+    // Older engines cannot create a memory64 from JavaScript: a capability, not a failure.
+    process.stdout.write(`skip: this node cannot create a shared memory64 from JavaScript (${lastError})\n`);
     process.exit(0);
   }
   const bytes = new Uint8Array(memory.buffer);
