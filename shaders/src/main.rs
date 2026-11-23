@@ -4,8 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use playgta6_shaders::compat::render_compat_audit_report_md;
 use playgta6_shaders::convert::{
-    ConvertedShader, ShaderStage, convert_spirv_bytes, format_shader_hash, format_wgsl_filename,
+    ConvertOptions, ConvertedShader, ShaderStage, audit_spirv_file,
+    convert_spirv_bytes_with_options, format_shader_hash, format_wgsl_filename,
 };
 use playgta6_shaders::pack::{
     BlockerReportInput, FailedShaderRecord, PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry,
@@ -21,6 +23,12 @@ enum Command {
         out_dir: PathBuf,
         pack_path: Option<PathBuf>,
         report_path: Option<PathBuf>,
+        no_sanitize: bool,
+    },
+    Audit {
+        spirv_dir: PathBuf,
+        report_path: Option<PathBuf>,
+        no_sanitize: bool,
     },
     InspectPack {
         pack_path: PathBuf,
@@ -31,12 +39,15 @@ fn print_usage() {
     eprintln!("playgta6-shaders (ABI v{SHADER_INDEX_ABI_VERSION})");
     eprintln!("Usage:");
     eprintln!(
-        "  playgta6-shaders convert --spirv <dir> --out <dir> [--pack <file.wgsl.pack>] [--report <blockers.md>]"
+        "  playgta6-shaders convert --spirv <dir> --out <dir> [--pack <file.wgsl.pack>] [--report <blockers.md>] [--no-sanitize]"
+    );
+    eprintln!(
+        "  playgta6-shaders audit --spirv <dir> [--report <audit.md>] [--no-sanitize]"
     );
     eprintln!("  playgta6-shaders inspect-pack <file.wgsl.pack>");
     eprintln!();
     eprintln!(
-        "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> WGSL (naga) -> .wgsl.pack"
+        "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> WGSL (naga) -> .wgsl.pack"
     );
 }
 
@@ -51,6 +62,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut out_dir: Option<PathBuf> = None;
             let mut pack_path: Option<PathBuf> = None;
             let mut report_path: Option<PathBuf> = None;
+            let mut no_sanitize = false;
 
             let mut i = 1;
             while i < args.len() {
@@ -83,6 +95,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                             .ok_or_else(|| "missing value for --report".to_string())?;
                         report_path = Some(PathBuf::from(val));
                     }
+                    "--no-sanitize" => {
+                        no_sanitize = true;
+                    }
                     unknown => {
                         return Err(format!("unknown option for convert: {unknown}"));
                     }
@@ -100,6 +115,48 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 out_dir,
                 pack_path,
                 report_path,
+                no_sanitize,
+            })
+        }
+        "audit" => {
+            let mut spirv_dir: Option<PathBuf> = None;
+            let mut report_path: Option<PathBuf> = None;
+            let mut no_sanitize = false;
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--spirv" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --spirv".to_string())?;
+                        spirv_dir = Some(PathBuf::from(val));
+                    }
+                    "--report" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --report".to_string())?;
+                        report_path = Some(PathBuf::from(val));
+                    }
+                    "--no-sanitize" => {
+                        no_sanitize = true;
+                    }
+                    unknown => {
+                        return Err(format!("unknown option for audit: {unknown}"));
+                    }
+                }
+                i += 1;
+            }
+
+            let spirv_dir =
+                spirv_dir.ok_or_else(|| "missing required option --spirv <dir>".to_string())?;
+
+            Ok(Command::Audit {
+                spirv_dir,
+                report_path,
+                no_sanitize,
             })
         }
         "inspect-pack" => {
@@ -113,7 +170,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             })
         }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert' or 'inspect-pack')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', or 'inspect-pack')"
         )),
     }
 }
@@ -160,6 +217,7 @@ fn run_convert(
     out_dir: &Path,
     pack_path: Option<&Path>,
     report_path: Option<&Path>,
+    options: ConvertOptions,
 ) -> Result<(), String> {
     let spv_files = collect_spv_files(spirv_dir)?;
     fs::create_dir_all(out_dir).map_err(|err| {
@@ -171,6 +229,8 @@ fn run_convert(
 
     let mut converted_by_hash: BTreeMap<u64, ConvertedShader> = BTreeMap::new();
     let mut converted_file_count = 0usize;
+    let mut sanitized_file_count = 0usize;
+    let mut rewritten_instruction_count = 0usize;
     let mut failures: Vec<FailedShaderRecord> = Vec::new();
 
     for path in &spv_files {
@@ -178,9 +238,13 @@ fn run_convert(
         let bytes = fs::read(path)
             .map_err(|err| format!("failed to read SPIR-V file {}: {err}", path.display()))?;
 
-        match convert_spirv_bytes(&bytes) {
+        match convert_spirv_bytes_with_options(&bytes, &options) {
             Ok(shader) => {
                 converted_file_count += 1;
+                if shader.audit.rewritten_instructions > 0 {
+                    sanitized_file_count += 1;
+                    rewritten_instruction_count += shader.audit.rewritten_instructions;
+                }
                 converted_by_hash.entry(shader.hash).or_insert(shader);
             }
             Err(error) => {
@@ -299,7 +363,7 @@ fn run_convert(
     }
 
     println!(
-        "Converted {converted_file_count}/{} SPIR-V files ({} unique shaders: vertex={vertex_count}, fragment={fragment_count}, compute={compute_count}); index: {}",
+        "Converted {converted_file_count}/{} SPIR-V files ({} unique shaders: vertex={vertex_count}, fragment={fragment_count}, compute={compute_count}; sanitized={sanitized_file_count} files / {rewritten_instruction_count} instructions); index: {}",
         spv_files.len(),
         converted_by_hash.len(),
         index_dest.display()
@@ -309,6 +373,67 @@ fn run_convert(
     }
     if let Some(report_dest) = report_path {
         println!("Wrote blocker report: {}", report_dest.display());
+    }
+
+    Ok(())
+}
+
+fn run_audit(
+    spirv_dir: &Path,
+    report_path: Option<&Path>,
+    options: ConvertOptions,
+) -> Result<(), String> {
+    let spv_files = collect_spv_files(spirv_dir)?;
+    let mut records = Vec::with_capacity(spv_files.len());
+
+    for path in &spv_files {
+        let rel_path = normalize_rel_path(path, spirv_dir);
+        let bytes = fs::read(path)
+            .map_err(|err| format!("failed to read SPIR-V file {}: {err}", path.display()))?;
+        records.push(audit_spirv_file(&rel_path, &bytes, &options));
+    }
+
+    let lowered_ok = records.iter().filter(|r| r.lowered_to_wgsl).count();
+    let rewritten_files = records
+        .iter()
+        .filter(|r| r.audit.rewritten_instructions > 0)
+        .count();
+    let rewritten_insts: usize = records.iter().map(|r| r.audit.rewritten_instructions).sum();
+    let blocker_files = records
+        .iter()
+        .filter(|r| r.audit.has_blockers() || r.stream_error.is_some() || !r.lowered_to_wgsl)
+        .count();
+    let warning_files = records
+        .iter()
+        .filter(|r| r.audit.warning_count() > 0)
+        .count();
+
+    let report_md = render_compat_audit_report_md(&records);
+    if let Some(report_dest) = report_path {
+        if let Some(parent) = report_dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create audit report directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(report_dest, report_md.as_bytes()).map_err(|err| {
+            format!(
+                "failed to write audit report {}: {err}",
+                report_dest.display()
+            )
+        })?;
+    }
+
+    println!(
+        "Audited {} SPIR-V files: lowered={lowered_ok}, rewritten={rewritten_files} ({rewritten_insts} instructions), blockers={blocker_files}, warnings={warning_files}",
+        records.len()
+    );
+    if let Some(report_dest) = report_path {
+        println!("Wrote compatibility audit report: {}", report_dest.display());
     }
 
     Ok(())
@@ -375,18 +500,45 @@ fn main() -> ExitCode {
             out_dir,
             pack_path,
             report_path,
-        }) => match run_convert(
-            &spirv_dir,
-            &out_dir,
-            pack_path.as_deref(),
-            report_path.as_deref(),
-        ) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("error: {err}");
-                ExitCode::FAILURE
+            no_sanitize,
+        }) => {
+            let options = if no_sanitize {
+                ConvertOptions::without_sanitization()
+            } else {
+                ConvertOptions::default()
+            };
+            match run_convert(
+                &spirv_dir,
+                &out_dir,
+                pack_path.as_deref(),
+                report_path.as_deref(),
+                options,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
+        Ok(Command::Audit {
+            spirv_dir,
+            report_path,
+            no_sanitize,
+        }) => {
+            let options = if no_sanitize {
+                ConvertOptions::without_sanitization()
+            } else {
+                ConvertOptions::default()
+            };
+            match run_audit(&spirv_dir, report_path.as_deref(), options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::InspectPack { pack_path }) => match run_inspect_pack(&pack_path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -418,8 +570,55 @@ mod tests {
         dir
     }
 
+    fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn encode_spirv_string_words(s: &str) -> Vec<u32> {
+        let mut raw = s.as_bytes().to_vec();
+        raw.push(0);
+        while !raw.len().is_multiple_of(4) {
+            raw.push(0);
+        }
+        raw.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn build_float_controls_spv() -> Vec<u8> {
+        let ext_words = encode_spirv_string_words("SPV_KHR_float_controls");
+        let mut words: Vec<u32> = vec![
+            0x0723_0203, // magic
+            0x0001_0300, // SPIR-V 1.3
+            0,           // generator
+            5,           // bound
+            0,           // schema
+            (2 << 16) | 17, 1,    // OpCapability Shader
+            (2 << 16) | 17, 4466, // OpCapability SignedZeroInfNanPreserve
+        ];
+        words.push((((1 + ext_words.len()) as u32) << 16) | 10);
+        words.extend_from_slice(&ext_words);
+        words.extend_from_slice(&[
+            (3 << 16) | 14, 0, 1, // OpMemoryModel Logical GLSL450
+            (5 << 16) | 15, 5, 3, u32::from_le_bytes(*b"main"), 0, // OpEntryPoint GLCompute %3 "main"
+            (6 << 16) | 16, 3, 17, 1, 1, 1, // OpExecutionMode %3 LocalSize 1 1 1
+            (4 << 16) | 16, 3, 4461, 32, // OpExecutionMode %3 SignedZeroInfNanPreserve 32
+            (2 << 16) | 19, 1, // %1 = OpTypeVoid
+            (3 << 16) | 33, 2, 1, // %2 = OpTypeFunction %1
+            (5 << 16) | 54, 1, 3, 0, 2, // %3 = OpFunction %1 None %2
+            (2 << 16) | 248, 4, // %4 = OpLabel
+            (1 << 16) | 253, // OpReturn
+            (1 << 16) | 56, // OpFunctionEnd
+        ]);
+        words_to_bytes(&words)
+    }
+
     #[test]
-    fn cli_parses_convert_and_inspect_pack_arguments() {
+    fn cli_parses_convert_audit_and_inspect_pack_arguments() {
         let cmd = parse_args(&[
             "convert".to_string(),
             "--spirv".to_string(),
@@ -430,6 +629,7 @@ mod tests {
             "out_wgsl/all.wgsl.pack".to_string(),
             "--report".to_string(),
             "out_wgsl/blockers.md".to_string(),
+            "--no-sanitize".to_string(),
         ])
         .unwrap();
 
@@ -440,6 +640,24 @@ mod tests {
                 out_dir: PathBuf::from("out_wgsl"),
                 pack_path: Some(PathBuf::from("out_wgsl/all.wgsl.pack")),
                 report_path: Some(PathBuf::from("out_wgsl/blockers.md")),
+                no_sanitize: true,
+            }
+        );
+
+        let audit = parse_args(&[
+            "audit".to_string(),
+            "--spirv".to_string(),
+            "in_spv".to_string(),
+            "--report".to_string(),
+            "out_wgsl/audit.md".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            audit,
+            Command::Audit {
+                spirv_dir: PathBuf::from("in_spv"),
+                report_path: Some(PathBuf::from("out_wgsl/audit.md")),
+                no_sanitize: false,
             }
         );
 
@@ -456,51 +674,37 @@ mod tests {
         );
 
         assert!(parse_args(&["convert".to_string(), "--spirv".to_string(), "x".to_string()]).is_err());
+        assert!(parse_args(&["audit".to_string()]).is_err());
         assert!(parse_args(&["inspect-pack".to_string()]).is_err());
     }
 
     #[test]
-    fn end_to_end_convert_pack_and_inspect_temp_dir() {
+    fn end_to_end_convert_pack_inspect_and_audit_temp_dir() {
         let root = make_temp_dir("playgta6_shaders_e2e");
         let spirv_dir = root.join("spirv");
         let out_dir = root.join("out");
+        let out_no_san = root.join("out_no_san");
         let pack_file = out_dir.join("bundle.wgsl.pack");
         let report_file = out_dir.join("blockers.md");
+        let no_san_report = out_no_san.join("blockers.md");
+        let audit_report = root.join("audit.md");
         fs::create_dir_all(&spirv_dir).unwrap();
 
-        // Write a minimal valid compute SPIR-V module and one corrupt SPIR-V file.
-        let mut compute_words: Vec<u32> = vec![
-            0x0723_0203, // magic
-            0x0001_0300, // SPIR-V 1.3
-            0,           // generator
-            5,           // bound
-            0,           // schema
-            (2 << 16) | 17, 1, // OpCapability Shader
-            (3 << 16) | 14, 0, 1, // OpMemoryModel Logical GLSL450
-            (5 << 16) | 15, 5, 3, u32::from_le_bytes(*b"main"), 0, // OpEntryPoint GLCompute %3 "main"
-            (6 << 16) | 16, 3, 17, 1, 1, 1, // OpExecutionMode %3 LocalSize 1 1 1
-            (2 << 16) | 19, 1, // %1 = OpTypeVoid
-            (3 << 16) | 33, 2, 1, // %2 = OpTypeFunction %1
-            (5 << 16) | 54, 1, 3, 0, 2, // %3 = OpFunction %1 None %2
-            (2 << 16) | 248, 4, // %4 = OpLabel
-            (1 << 16) | 253, // OpReturn
-            (1 << 16) | 56, // OpFunctionEnd
-        ];
-        let mut compute_bytes = Vec::with_capacity(compute_words.len() * 4);
-        for w in compute_words.drain(..) {
-            compute_bytes.extend_from_slice(&w.to_le_bytes());
-        }
-
-        fs::write(spirv_dir.join("cs_test.spv"), &compute_bytes).unwrap();
+        // Minimal compute shader with SPV_KHR_float_controls + SignedZeroInfNanPreserve
+        // plus one corrupt file.
+        let float_ctrl_bytes = build_float_controls_spv();
+        fs::write(spirv_dir.join("cs_float_ctrl.spv"), &float_ctrl_bytes).unwrap();
         fs::write(spirv_dir.join("broken.spv"), b"not-spirv").unwrap();
 
+        // 1. Default convert sanitizes float controls -> succeeds for cs_float_ctrl.spv.
         run_convert(
             &spirv_dir,
             &out_dir,
             Some(&pack_file),
             Some(&report_file),
+            ConvertOptions::default(),
         )
-        .expect("batch conversion should succeed");
+        .expect("batch conversion with sanitization should succeed");
 
         let pack_bytes = fs::read(&pack_file).unwrap();
         let decoded = read_pack(&pack_bytes).unwrap();
@@ -515,6 +719,27 @@ mod tests {
         let report_text = fs::read_to_string(&report_file).unwrap();
         assert!(report_text.contains("InvalidSpirvHeader"));
         assert!(report_text.contains("broken.spv"));
+
+        // 2. --no-sanitize convert fails cs_float_ctrl.spv because SPV_KHR_float_controls is unstripped.
+        run_convert(
+            &spirv_dir,
+            &out_no_san,
+            None,
+            Some(&no_san_report),
+            ConvertOptions::without_sanitization(),
+        )
+        .expect("batch conversion without sanitization should finish and report failures");
+        let no_san_text = fs::read_to_string(&no_san_report).unwrap();
+        assert!(no_san_text.contains("cs_float_ctrl.spv"));
+
+        // 3. audit subcommand writes Markdown compatibility report with rewrite counts.
+        run_audit(&spirv_dir, Some(&audit_report), ConvertOptions::default())
+            .expect("audit subcommand should succeed");
+        let audit_text = fs::read_to_string(&audit_report).unwrap();
+        assert!(audit_text.contains("# SPIR-V WebGPU Compatibility Audit Report"));
+        assert!(audit_text.contains("FloatControlsStripped"));
+        assert!(audit_text.contains("cs_float_ctrl.spv"));
+        assert!(audit_text.contains("broken.spv"));
 
         run_inspect_pack(&pack_file).expect("inspect-pack should succeed");
 

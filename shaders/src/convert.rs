@@ -4,6 +4,11 @@ use naga::back::wgsl;
 use naga::front::spv;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
+use crate::compat::{
+    CompatAudit, SanitizeOptions, ShaderAuditRecord, SpirvStreamError, audit_naga_module,
+    sanitize_spirv_bytes,
+};
+
 /// SPIR-V little-endian magic number (`0x07230203`).
 pub const SPIRV_MAGIC: u32 = 0x0723_0203;
 
@@ -51,6 +56,42 @@ impl fmt::Display for ShaderStage {
     }
 }
 
+/// Options controlling SPIR-V compatibility pre-passes and Naga WebGPU limit auditing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvertOptions {
+    pub strip_float_controls: bool,
+    pub strip_non_semantic: bool,
+    pub audit_webgpu_limits: bool,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            strip_float_controls: true,
+            strip_non_semantic: true,
+            audit_webgpu_limits: true,
+        }
+    }
+}
+
+impl ConvertOptions {
+    /// Disable SPIR-V sanitization rewrites while keeping WebGPU limit auditing enabled.
+    pub const fn without_sanitization() -> Self {
+        Self {
+            strip_float_controls: false,
+            strip_non_semantic: false,
+            audit_webgpu_limits: true,
+        }
+    }
+
+    pub const fn sanitize_options(self) -> SanitizeOptions {
+        SanitizeOptions {
+            strip_float_controls: self.strip_float_controls,
+            strip_non_semantic: self.strip_non_semantic,
+        }
+    }
+}
+
 /// Successful SPIR-V -> WGSL lowering output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvertedShader {
@@ -59,6 +100,7 @@ pub struct ConvertedShader {
     pub entry_point: String,
     pub wgsl: String,
     pub spirv_bytes: usize,
+    pub audit: CompatAudit,
 }
 
 /// High-level error bucket for batch blocker reporting.
@@ -124,20 +166,37 @@ pub fn format_wgsl_filename(hash: u64) -> String {
     format!("{hash:016x}.wgsl")
 }
 
-/// Convert raw SPIR-V binary bytes into validated WebGPU-baseline WGSL.
+/// Convert raw SPIR-V binary bytes into validated WebGPU-baseline WGSL using default browser
+/// sanitization and WebGPU limit auditing options.
 pub fn convert_spirv_bytes(spirv_bytes: &[u8]) -> Result<ConvertedShader, ConversionError> {
+    convert_spirv_bytes_with_options(spirv_bytes, &ConvertOptions::default())
+}
+
+/// Convert raw SPIR-V binary bytes into validated WebGPU-baseline WGSL with explicit options.
+pub fn convert_spirv_bytes_with_options(
+    spirv_bytes: &[u8],
+    options: &ConvertOptions,
+) -> Result<ConvertedShader, ConversionError> {
     validate_spirv_header(spirv_bytes)?;
 
     let hash = fnv1a_64(spirv_bytes);
-    let options = spv::Options {
+    let (sanitized_bytes, mut audit) =
+        sanitize_spirv_bytes(spirv_bytes, &options.sanitize_options())
+            .map_err(classify_stream_error)?;
+
+    let spv_options = spv::Options {
         adjust_coordinate_space: true,
         strict_capabilities: true,
         block_ctx_dump_prefix: None,
     };
 
-    let module = spv::parse_u8_slice(spirv_bytes, &options).map_err(classify_spv_error)?;
+    let module = spv::parse_u8_slice(&sanitized_bytes, &spv_options).map_err(classify_spv_error)?;
 
     let (stage, entry_point) = detect_entry_point(&module)?;
+
+    if options.audit_webgpu_limits {
+        audit.merge(audit_naga_module(&module));
+    }
 
     let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
     let info = validator
@@ -153,7 +212,147 @@ pub fn convert_spirv_bytes(spirv_bytes: &[u8]) -> Result<ConvertedShader, Conver
         entry_point,
         wgsl: wgsl_source,
         spirv_bytes: spirv_bytes.len(),
+        audit,
     })
+}
+
+/// Run the full SPIR-V pre-pass + Naga WebGPU limits audit + baseline lowering check for a shader.
+pub fn audit_spirv_file(
+    source_path: &str,
+    spirv_bytes: &[u8],
+    options: &ConvertOptions,
+) -> ShaderAuditRecord {
+    let (sanitized_bytes, mut audit) =
+        match sanitize_spirv_bytes(spirv_bytes, &options.sanitize_options()) {
+            Ok(pair) => pair,
+            Err(err) => {
+                return ShaderAuditRecord {
+                    source_path: source_path.to_string(),
+                    stage: None,
+                    lowered_to_wgsl: false,
+                    stream_error: Some(err.to_string()),
+                    naga_error: None,
+                    audit: CompatAudit::default(),
+                };
+            }
+        };
+
+    let spv_options = spv::Options {
+        adjust_coordinate_space: true,
+        strict_capabilities: true,
+        block_ctx_dump_prefix: None,
+    };
+
+    let module = match spv::parse_u8_slice(&sanitized_bytes, &spv_options) {
+        Ok(module) => module,
+        Err(err) => {
+            let conv_err = classify_spv_error(err);
+            return ShaderAuditRecord {
+                source_path: source_path.to_string(),
+                stage: None,
+                lowered_to_wgsl: false,
+                stream_error: None,
+                naga_error: Some(conv_err.to_string()),
+                audit,
+            };
+        }
+    };
+
+    if options.audit_webgpu_limits {
+        audit.merge(audit_naga_module(&module));
+    }
+
+    let stage_name = module
+        .entry_points
+        .first()
+        .map(|ep| format!("{:?}", ep.stage).to_ascii_lowercase());
+
+    if let Err(err) = detect_entry_point(&module) {
+        return ShaderAuditRecord {
+            source_path: source_path.to_string(),
+            stage: stage_name,
+            lowered_to_wgsl: false,
+            stream_error: None,
+            naga_error: Some(err.to_string()),
+            audit,
+        };
+    }
+
+    let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
+    let info = match validator.validate(&module) {
+        Ok(info) => info,
+        Err(err) => {
+            let conv_err = classify_validation_error(&err.emit_to_string(""));
+            return ShaderAuditRecord {
+                source_path: source_path.to_string(),
+                stage: stage_name,
+                lowered_to_wgsl: false,
+                stream_error: None,
+                naga_error: Some(conv_err.to_string()),
+                audit,
+            };
+        }
+    };
+
+    match wgsl::write_string(&module, &info, wgsl::WriterFlags::empty()) {
+        Ok(_) => ShaderAuditRecord {
+            source_path: source_path.to_string(),
+            stage: stage_name,
+            lowered_to_wgsl: true,
+            stream_error: None,
+            naga_error: None,
+            audit,
+        },
+        Err(err) => {
+            let conv_err = classify_wgsl_error(err);
+            ShaderAuditRecord {
+                source_path: source_path.to_string(),
+                stage: stage_name,
+                lowered_to_wgsl: false,
+                stream_error: None,
+                naga_error: Some(conv_err.to_string()),
+                audit,
+            }
+        }
+    }
+}
+
+fn classify_stream_error(err: SpirvStreamError) -> ConversionError {
+    let detail = err.to_string();
+    match err {
+        SpirvStreamError::TooShort { .. } => ConversionError {
+            kind: ConversionErrorKind::InvalidSpirvHeader,
+            blocker_key: "InvalidSpirvHeader: truncated".to_string(),
+            keywords: vec!["TruncatedHeader".to_string()],
+            detail,
+        },
+        SpirvStreamError::UnalignedByteLength { .. } => ConversionError {
+            kind: ConversionErrorKind::InvalidSpirvHeader,
+            blocker_key: "InvalidSpirvHeader: unaligned length".to_string(),
+            keywords: vec!["UnalignedWordStream".to_string()],
+            detail,
+        },
+        SpirvStreamError::InvalidMagic { is_big_endian, .. } => {
+            let keyword = if is_big_endian {
+                "BigEndianSpirv"
+            } else {
+                "BadMagic"
+            };
+            ConversionError {
+                kind: ConversionErrorKind::InvalidSpirvHeader,
+                blocker_key: format!("InvalidSpirvHeader: {keyword}"),
+                keywords: vec![keyword.to_string()],
+                detail,
+            }
+        }
+        SpirvStreamError::InvalidWordCount { .. }
+        | SpirvStreamError::TruncatedInstruction { .. } => ConversionError {
+            kind: ConversionErrorKind::SpirvParseError,
+            blocker_key: "SpirvParseError: TruncatedOrMalformedStream".to_string(),
+            keywords: vec!["IncompleteData".to_string()],
+            detail,
+        },
+    }
 }
 
 fn validate_spirv_header(bytes: &[u8]) -> Result<(), ConversionError> {
