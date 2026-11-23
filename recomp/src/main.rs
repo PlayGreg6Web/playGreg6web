@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use playgta6_recomp::code_image::CodeImage;
 use playgta6_recomp::discover::discover;
 use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
+use playgta6_recomp::pdata::ExceptionDirectory;
 use playgta6_recomp::pe;
 use playgta6_recomp::summary::render_summary_json;
 
@@ -434,7 +435,15 @@ fn run_discover(args: &DiscoverArgs) -> Result<(), String> {
         fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
     let pe = Pe64::parse(&bytes)
         .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
-    let image = CodeImage::from_pe(&pe, &bytes);
+    let mut image = CodeImage::from_pe(&pe, &bytes);
+    let pdata = ExceptionDirectory::from_pe(&pe, &bytes);
+    if let Some(first) = pdata.diagnostics.first() {
+        eprintln!(
+            "Warning: {} .pdata diagnostic(s), first: {first}",
+            pdata.diagnostics.len()
+        );
+    }
+    pdata.seed(&mut image);
     let summary = render_summary_json(&image, &discover(&image));
 
     match &args.json_out {

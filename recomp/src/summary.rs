@@ -1,5 +1,6 @@
 //! Deterministic JSON summary of a discovery run (addresses and counts only, never code bytes).
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::cfg::{CallTarget, Edge};
@@ -7,16 +8,17 @@ use crate::code_image::CodeImage;
 use crate::discover::Analysis;
 use crate::reloc::RelocKind;
 
-const EDGE_KINDS: [&str; 6] = [
+const EDGE_KINDS: [&str; 7] = [
     "fallthrough",
     "taken",
     "jump",
     "tail_call",
     "indirect_jump",
     "return",
+    "jump_table",
 ];
 
-const RELOC_KINDS: [RelocKind; 8] = [
+const RELOC_KINDS: [RelocKind; 11] = [
     RelocKind::CallTarget,
     RelocKind::BranchTarget,
     RelocKind::RipData,
@@ -25,6 +27,9 @@ const RELOC_KINDS: [RelocKind; 8] = [
     RelocKind::JumpSlot,
     RelocKind::AbsoluteImmediate,
     RelocKind::AbsoluteDisplacement,
+    RelocKind::JumpTable,
+    RelocKind::JumpTableIndex,
+    RelocKind::JumpTableEntry,
 ];
 
 fn edge_index(edge: &Edge) -> usize {
@@ -35,6 +40,7 @@ fn edge_index(edge: &Edge) -> usize {
         Edge::TailCall(_) => 3,
         Edge::IndirectJump { .. } => 4,
         Edge::Return => 5,
+        Edge::JumpTable(_) => 6,
     }
 }
 
@@ -49,6 +55,9 @@ pub fn render_summary_json(image: &CodeImage<'_>, analysis: &Analysis) -> String
     let mut block_count = 0;
     let mut instruction_count = 0;
     let mut diagnostic_count = 0;
+    // `jmp reg` / `jmp [computed]` sites left unresolved (blocks shared by several functions are
+    // counted once).
+    let mut unresolved_jumps = BTreeSet::new();
     for function in analysis.functions.values() {
         block_count += function.blocks.len();
         instruction_count += function.instruction_count();
@@ -56,6 +65,9 @@ pub fn render_summary_json(image: &CodeImage<'_>, analysis: &Analysis) -> String
         for block in function.blocks.values() {
             for edge in &block.successors {
                 edge_counts[edge_index(edge)] += 1;
+                if *edge == (Edge::IndirectJump { slot: None }) {
+                    unresolved_jumps.insert(block.start);
+                }
             }
         }
     }
@@ -73,6 +85,18 @@ pub fn render_summary_json(image: &CodeImage<'_>, analysis: &Analysis) -> String
     let _ = writeln!(out, "  \"block_count\": {block_count},");
     let _ = writeln!(out, "  \"instruction_count\": {instruction_count},");
     let _ = writeln!(out, "  \"diagnostic_count\": {diagnostic_count},");
+    let _ = writeln!(
+        out,
+        "  \"pdata\": {{\"functions\": {}, \"ranges\": {}}},",
+        image.function_table.function_count(),
+        image.function_table.ranges().len()
+    );
+    let _ = writeln!(
+        out,
+        "  \"jump_tables\": {{\"resolved\": {}, \"unresolved\": {}}},",
+        analysis.jump_tables.len(),
+        unresolved_jumps.len()
+    );
 
     out.push_str("  \"edges\": {");
     for (i, (name, count)) in EDGE_KINDS.iter().zip(edge_counts).enumerate() {
@@ -165,11 +189,14 @@ mod tests {
                 "  \"block_count\": 2,\n",
                 "  \"instruction_count\": 3,\n",
                 "  \"diagnostic_count\": 0,\n",
+                "  \"pdata\": {\"functions\": 0, \"ranges\": 0},\n",
+                "  \"jump_tables\": {\"resolved\": 0, \"unresolved\": 0},\n",
                 "  \"edges\": {\"fallthrough\": 0, \"taken\": 0, \"jump\": 0, \"tail_call\": 0, ",
-                "\"indirect_jump\": 1, \"return\": 1},\n",
+                "\"indirect_jump\": 1, \"return\": 1, \"jump_table\": 0},\n",
                 "  \"relocations\": {\"call_target\": 1, \"branch_target\": 0, \"rip_data\": 0, ",
                 "\"rip_address\": 0, \"call_slot\": 0, \"jump_slot\": 1, \"absolute_immediate\": 0, ",
-                "\"absolute_displacement\": 0},\n",
+                "\"absolute_displacement\": 0, \"jump_table\": 0, \"jump_table_index\": 0, ",
+                "\"jump_table_entry\": 0},\n",
                 "  \"functions\": [\n",
                 "    {\"entry\": \"0x1000\", \"blocks\": 1, \"instructions\": 2, \"callees\": [\"0x100b\"], ",
                 "\"tail_calls\": [], \"indirect_calls\": 0, \"diagnostics\": []},\n",

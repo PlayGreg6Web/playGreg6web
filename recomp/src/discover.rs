@@ -7,27 +7,50 @@
 //!    and a leader found inside an already decoded block splits that block in place. A leader
 //!    inside an instruction starts a second, overlapping stream (flagged with a diagnostic) that
 //!    stops once it falls back into step with already decoded code.
+//!
+//!    Once the worklist is empty, every new register `jmp` is handed to [`crate::jump_table`]
+//!    together with its chain of sole predecessor blocks. A resolved switch table turns the jump's
+//!    successors into [`Edge::JumpTable`] edges and its targets into leaders, and the worklist
+//!    runs again; this repeats until a round resolves nothing new. Each round only sees the
+//!    complete block map of the previous fixpoint, so results stay independent of visiting order.
+//!    Finally every resolution is re-checked against the final CFG (a later-discovered jump into
+//!    the dispatch path voids the bound) and demoted back to [`Edge::IndirectJump`] if it no
+//!    longer holds.
 //! 2. Each function collects the blocks reachable from its entry through intra-function edges.
 //!    Edges into another function's entry are reclassified as [`Edge::TailCall`].
 //!
 //! Both phases are iterative (no recursion proportional to code size). Block splitting is
-//! `O(log n + block length)` and the per-instruction hot path does no heap formatting.
+//! `O(log n + block length)` and the per-instruction hot path does no heap formatting. Each
+//! jump-table round costs one `O(blocks)` predecessor pass.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 
 use crate::cfg::{
-    BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, Terminator,
+    BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, JumpTable,
+    Terminator,
 };
 use crate::code_image::CodeImage;
-use crate::reloc::RelocationMap;
+use crate::jump_table::{self, Step};
+use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
 
 /// `int 0x29` is the Windows `__fastfail` trap and never returns.
 const FASTFAIL_VECTOR: u8 = 0x29;
 
 /// Preceding blocks examined when looking for the block that contains an address.
 const CONTAINING_BLOCK_SCAN: usize = 8;
+
+/// Longest chain of blocks (the jump's block plus sole predecessors) sliced for a jump table.
+const MAX_TRACE_BLOCKS: usize = 4;
+
+/// Incoming intra-function edges of a block: how many, and one of them.
+#[derive(Clone, Copy)]
+struct Pred {
+    count: u32,
+    from: u64,
+    edge: Edge,
+}
 
 /// Where an address falls relative to already decoded blocks.
 enum Decoded {
@@ -44,8 +67,10 @@ enum Decoded {
 pub struct Analysis {
     /// Discovered functions keyed by entry VA.
     pub functions: BTreeMap<u64, Function>,
-    /// Address references of every decoded instruction.
+    /// Address references of every decoded instruction and of every resolved jump table.
     pub relocations: RelocationMap,
+    /// Resolved switch jump tables keyed by the VA of their indirect `jmp`.
+    pub jump_tables: BTreeMap<u64, JumpTable>,
 }
 
 impl Analysis {
@@ -55,7 +80,7 @@ impl Analysis {
     }
 }
 
-/// Discover functions, per-function CFGs and the relocation map starting from
+/// Discover functions, per-function CFGs, jump tables and the relocation map starting from
 /// `image.entry_points`. Never panics on malformed code: problems become [`Diagnostic`]s.
 pub fn discover(image: &CodeImage<'_>) -> Analysis {
     let mut state = Discovery::new(image);
@@ -63,14 +88,44 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
         state.add_function(entry);
     }
     state.run();
-    let relocations = RelocationMap::from_instructions(
-        image,
-        state.blocks.values().flat_map(|b| b.instructions.iter()),
-    );
+    while state.resolve_jump_tables() {
+        state.run();
+    }
+    state.verify_jump_tables();
+
+    let mut relocations = Vec::new();
+    for instr in state.blocks.values().flat_map(|b| b.instructions.iter()) {
+        instruction_relocations(image, instr, &mut relocations);
+    }
+    let jump_tables = std::mem::take(&mut state.jump_tables);
+    for table in jump_tables.values() {
+        jump_table_relocations(image, table, &mut relocations);
+    }
+    let relocations = RelocationMap::from_entries(relocations);
     let functions = state.into_functions();
     Analysis {
         functions,
         relocations,
+        jump_tables,
+    }
+}
+
+/// Relocations of a resolved table: the table and index-table reads plus one per entry.
+fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Vec<Relocation>) {
+    let mut push = |site, kind, target| {
+        out.push(Relocation {
+            site,
+            kind,
+            target,
+            region: image.region_of(target),
+        });
+    };
+    push(table.load_site, RelocKind::JumpTable, table.table);
+    if let Some(index) = table.index {
+        push(index.load_site, RelocKind::JumpTableIndex, index.table);
+    }
+    for (slot, &target) in (table.table..).step_by(4).zip(&table.targets) {
+        push(slot, RelocKind::JumpTableEntry, target);
     }
 }
 
@@ -83,6 +138,9 @@ struct Discovery<'i, 'a> {
     leaders: BTreeSet<u64>,
     worklist: Vec<u64>,
     entries: BTreeSet<u64>,
+    /// `jmp reg` sites decoded since the last jump-table round.
+    pending_jumps: BTreeSet<u64>,
+    jump_tables: BTreeMap<u64, JumpTable>,
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
@@ -94,6 +152,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             leaders: BTreeSet::new(),
             worklist: Vec::new(),
             entries: BTreeSet::new(),
+            pending_jumps: BTreeSet::new(),
+            jump_tables: BTreeMap::new(),
         }
     }
 
@@ -320,6 +380,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 block.successors.push(Edge::IndirectJump {
                     slot: rip_slot(instr),
                 });
+                if instr.op0_kind() == OpKind::Register {
+                    self.pending_jumps.insert(ip);
+                }
                 Some(Terminator::IndirectJump)
             }
             FlowControl::ConditionalBranch => self.branch(instr, block),
@@ -353,6 +416,131 @@ impl<'i, 'a> Discovery<'i, 'a> {
         self.add_leader(taken);
         self.add_leader(next);
         Some(Terminator::Branch)
+    }
+
+    /// Incoming intra-function edges of every block.
+    fn predecessors(&self) -> HashMap<u64, Pred> {
+        let mut preds: HashMap<u64, Pred> = HashMap::new();
+        for (&from, block) in &self.blocks {
+            for &edge in &block.successors {
+                if let Some(target) = edge.intra_target() {
+                    preds
+                        .entry(target)
+                        .and_modify(|p| p.count += 1)
+                        .or_insert(Pred {
+                            count: 1,
+                            from,
+                            edge,
+                        });
+                }
+            }
+        }
+        preds
+    }
+
+    /// The block whose last instruction is the indirect jump at `site`.
+    fn jump_block(&self, site: u64) -> Option<u64> {
+        let Decoded::Boundary { start, index } = self.locate(site) else {
+            return None;
+        };
+        let block = self.blocks.get(&start)?;
+        (index + 1 == block.instructions.len() && block.terminator == Terminator::IndirectJump)
+            .then_some(start)
+    }
+
+    /// Slice the jump at `site` together with its chain of sole predecessors.
+    fn match_jump_table(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<JumpTable> {
+        let start = self.jump_block(site)?;
+        let mut chain = vec![(self.blocks.get(&start)?, None)];
+        let mut current = start;
+        while chain.len() < MAX_TRACE_BLOCKS && !self.entries.contains(&current) {
+            let Some(pred) = preds.get(&current).filter(|p| p.count == 1) else {
+                break;
+            };
+            let Some(prev) = self.blocks.get(&pred.from) else {
+                break;
+            };
+            let taken = match pred.edge {
+                Edge::Taken(_) => Some(true),
+                Edge::Fallthrough(_) if prev.terminator == Terminator::Branch => Some(false),
+                Edge::Fallthrough(_) | Edge::Jump(_) => None,
+                _ => break,
+            };
+            chain.push((prev, taken));
+            current = pred.from;
+        }
+        let mut trace = Vec::new();
+        for (block, taken) in chain.into_iter().rev() {
+            let last = block.instructions.len().saturating_sub(1);
+            trace.extend(
+                block
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, instr)| Step {
+                        instr,
+                        taken: if i == last { taken } else { None },
+                    }),
+            );
+        }
+        jump_table::resolve(self.image, &trace)
+    }
+
+    /// Try every jump decoded since the last round. Returns whether any table was resolved.
+    fn resolve_jump_tables(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.pending_jumps);
+        if pending.is_empty() {
+            return false;
+        }
+        // One predecessor snapshot per round keeps the outcome independent of visiting order.
+        let preds = self.predecessors();
+        let resolved: Vec<JumpTable> = pending
+            .into_iter()
+            .filter_map(|site| self.match_jump_table(site, &preds))
+            .collect();
+        let progress = !resolved.is_empty();
+        for table in resolved {
+            if let Some(block) = self
+                .jump_block(table.site)
+                .and_then(|start| self.blocks.get_mut(&start))
+            {
+                let targets: BTreeSet<u64> = table.targets.iter().copied().collect();
+                block.successors = targets.into_iter().map(Edge::JumpTable).collect();
+            }
+            for &target in &table.targets {
+                self.add_leader(target);
+            }
+            self.jump_tables.insert(table.site, table);
+        }
+        progress
+    }
+
+    /// Demote resolutions that no longer hold in the final CFG (e.g. the dispatch block gained a
+    /// second predecessor), until the remaining set is stable.
+    fn verify_jump_tables(&mut self) {
+        loop {
+            let preds = self.predecessors();
+            let stale: Vec<u64> = self
+                .jump_tables
+                .iter()
+                .filter(|(site, table)| {
+                    self.match_jump_table(**site, &preds).as_ref() != Some(*table)
+                })
+                .map(|(site, _)| *site)
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            for site in stale {
+                self.jump_tables.remove(&site);
+                if let Some(block) = self
+                    .jump_block(site)
+                    .and_then(|start| self.blocks.get_mut(&start))
+                {
+                    block.successors = vec![Edge::IndirectJump { slot: None }];
+                }
+            }
+        }
     }
 
     /// Phase 2: assign blocks to functions and classify tail calls.

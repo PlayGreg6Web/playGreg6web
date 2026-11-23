@@ -25,6 +25,13 @@ pub enum RelocKind {
     /// Heuristic: absolute memory displacement without base register (`[disp32]`,
     /// `[index*scale+disp32]`, `moffs64`) inside the image.
     AbsoluteDisplacement,
+    /// Jump table read by a resolved switch dispatch (`site` is the entry load).
+    JumpTable,
+    /// Byte index table of a two-level switch (`site` is the `movzx` reading it).
+    JumpTableIndex,
+    /// One jump-table entry: `site` is the VA of the 32-bit entry itself (data, not an
+    /// instruction) and `target` the case it selects.
+    JumpTableEntry,
 }
 
 impl RelocKind {
@@ -43,6 +50,9 @@ impl RelocKind {
             Self::JumpSlot => "jump_slot",
             Self::AbsoluteImmediate => "absolute_immediate",
             Self::AbsoluteDisplacement => "absolute_displacement",
+            Self::JumpTable => "jump_table",
+            Self::JumpTableIndex => "jump_table_index",
+            Self::JumpTableEntry => "jump_table_entry",
         }
     }
 }
@@ -50,7 +60,8 @@ impl RelocKind {
 /// One address reference. Ordering is `(site, kind, target)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Relocation {
-    /// VA of the referencing instruction.
+    /// VA of the referencing instruction (of the table entry for
+    /// [`RelocKind::JumpTableEntry`]).
     pub site: u64,
     pub kind: RelocKind,
     /// Absolute referenced VA.

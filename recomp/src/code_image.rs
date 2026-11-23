@@ -4,6 +4,7 @@
 //! [`CodeImage::from_pe`] maps a parsed [`Pe64`] onto them.
 
 use crate::cfg::DiagnosticKind;
+use crate::pdata::FunctionTable;
 use crate::pe::{IMAGE_SCN_MEM_EXECUTE, Pe64};
 
 /// One mapped section of the image.
@@ -79,6 +80,9 @@ pub struct CodeImage<'a> {
     /// Call targets known never to return. Matches either a direct call target VA or the slot VA
     /// read by a RIP-relative indirect call (an IAT entry such as `ExitProcess`).
     pub no_return: Vec<u64>,
+    /// Exact function extents (from `.pdata`, see [`crate::pdata::ExceptionDirectory::seed`]);
+    /// empty when unknown. Jump-table targets must stay inside the jump's function.
+    pub function_table: FunctionTable,
 }
 
 impl<'a> CodeImage<'a> {
@@ -98,6 +102,7 @@ impl<'a> CodeImage<'a> {
             sections,
             entry_points,
             no_return: Vec::new(),
+            function_table: FunctionTable::default(),
         }
     }
 

@@ -1,8 +1,8 @@
 //! Per-function control-flow graph produced by [`crate::discover`] and consumed by the lifter.
 //!
 //! Invariants:
-//! - Every [`Edge::Fallthrough`], [`Edge::Taken`] and [`Edge::Jump`] target of a block has a block
-//!   with that start address in the same [`Function`].
+//! - Every [`Edge::Fallthrough`], [`Edge::Taken`], [`Edge::Jump`] and [`Edge::JumpTable`] target
+//!   of a block has a block with that start address in the same [`Function`].
 //! - [`Edge::TailCall`] targets are entries of other discovered functions.
 //! - A block with no instructions marks an address that could not be decoded; its
 //!   [`BasicBlock::diagnostics`] say why and its terminator is [`Terminator::Invalid`].
@@ -62,17 +62,25 @@ pub enum Edge {
     /// which form it was.
     TailCall(u64),
     /// Unresolved indirect jump. `slot` is the VA read by a RIP-relative `jmp [rip+x]` (import
-    /// thunk / IAT entry); `None` for register or computed memory operands (e.g. jump tables).
+    /// thunk / IAT entry); `None` for register or computed memory operands (e.g. jump tables
+    /// that could not be resolved).
     IndirectJump { slot: Option<u64> },
     /// Return to the caller.
     Return,
+    /// One distinct case target of a resolved switch jump table (see [`JumpTable`]); a block
+    /// ending in a resolved indirect jump has one such edge per distinct target, ascending.
+    JumpTable(u64),
 }
 
 impl Edge {
     /// Target VA for direct edges (including tail calls).
     pub fn target(&self) -> Option<u64> {
         match *self {
-            Self::Fallthrough(t) | Self::Taken(t) | Self::Jump(t) | Self::TailCall(t) => Some(t),
+            Self::Fallthrough(t)
+            | Self::Taken(t)
+            | Self::Jump(t)
+            | Self::TailCall(t)
+            | Self::JumpTable(t) => Some(t),
             Self::IndirectJump { .. } | Self::Return => None,
         }
     }
@@ -80,7 +88,7 @@ impl Edge {
     /// Target VA for edges that stay inside the function.
     pub fn intra_target(&self) -> Option<u64> {
         match *self {
-            Self::Fallthrough(t) | Self::Taken(t) | Self::Jump(t) => Some(t),
+            Self::Fallthrough(t) | Self::Taken(t) | Self::Jump(t) | Self::JumpTable(t) => Some(t),
             _ => None,
         }
     }
@@ -93,6 +101,7 @@ impl Edge {
             Self::TailCall(_) => "tail_call",
             Self::IndirectJump { .. } => "indirect_jump",
             Self::Return => "return",
+            Self::JumpTable(_) => "jump_table",
         }
     }
 }
@@ -113,6 +122,34 @@ pub struct CallSite {
     /// VA of the `call` instruction.
     pub site: u64,
     pub target: CallTarget,
+}
+
+/// Byte index table of a two-level switch: the switch value selects a byte that indexes the
+/// jump table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JumpTableIndex {
+    /// VA of the `movzx` that reads the index table.
+    pub load_site: u64,
+    /// VA of the first index byte.
+    pub table: u64,
+    /// Number of index bytes reachable under the proven bound.
+    pub len: u64,
+}
+
+/// A switch dispatch resolved from its jump table (MSVC x64 shape: 32-bit entries holding RVAs
+/// relative to the image base).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JumpTable {
+    /// VA of the indirect `jmp`.
+    pub site: u64,
+    /// VA of the instruction that reads the table entry.
+    pub load_site: u64,
+    /// VA of the first entry.
+    pub table: u64,
+    /// Case target of every entry, in table order (`targets.len()` entries).
+    pub targets: Vec<u64>,
+    /// Set for the two-level variant.
+    pub index: Option<JumpTableIndex>,
 }
 
 /// Category of a discovery problem.
@@ -163,8 +200,9 @@ pub struct BasicBlock {
     /// through or ends in [`Terminator::Invalid`].
     pub instructions: Vec<Instruction>,
     pub terminator: Terminator,
-    /// Successors: `[Taken, Fallthrough]` for branches, one edge otherwise, none for traps,
-    /// non-returning calls and invalid blocks.
+    /// Successors: `[Taken, Fallthrough]` for branches, one [`Edge::JumpTable`] per distinct
+    /// target for a resolved jump table, one edge otherwise, none for traps, non-returning calls
+    /// and invalid blocks.
     pub successors: Vec<Edge>,
     /// Calls inside this block, in address order.
     pub calls: Vec<CallSite>,
