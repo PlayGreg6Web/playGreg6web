@@ -7,3 +7,6 @@ license.workspace = true
 [[bin]]
 name = "playgta6-shaders"
 path = "src/main.rs"
+
+[dependencies]
+naga = { version = "30", features = ["spv-in", "wgsl-out"] }
