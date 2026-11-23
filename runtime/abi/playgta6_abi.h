@@ -408,6 +408,15 @@ inline constexpr uint32_t DF = 6;
 // A lifted guest function (`sub_<VA>`).
 using LiftedFn = void (*)(GuestState* state);
 
+// Guest address space (docs/wasm_abi.md "Guest Address Space"). Guest virtual addresses reach host
+// memory through one translation shared by lifted code, the import bridge and the runtime:
+//     host address = __playgta6_guest_base + guest VA   (64-bit wrapping add)
+// The runtime backs the guest address space with one contiguous host region starting at the guest
+// VA below, so guest pointers stay valid across page and allocation boundaries. In the browser
+// build the mapping is the identity (__playgta6_guest_base == 0): the guest address space is the
+// linear memory from kGuestAddressSpaceBase upwards, the runtime's own memory lies below it.
+inline constexpr uint64_t kGuestAddressSpaceBase = 4294967296;  // 0x1'0000'0000
+
 // =====================================================================================================
 // Packet ABI v2 (opcodes 22..34). See docs/gpu_commands.md "Opcodes (v2)".
 //
@@ -810,6 +819,11 @@ static_assert(sizeof(GpuCreateSampler2Payload) == 24, "GpuCreateSampler2Payload 
 
 // Runtime helpers called by lifted code (implemented by the runtime, not by JS).
 extern "C" {
+// Guest -> host translation base (see kGuestAddressSpaceBase): host = __playgta6_guest_base + VA.
+// Defined by the runtime, set before guest code runs and constant while guest code runs; lifted
+// code may load it once per function. 0 means identity (always the case in the browser build).
+extern uint64_t __playgta6_guest_base;
+
 // Run the guest code at `target` as if called; the caller already pushed the return address.
 // Returns when that code executes its `ret`.
 void __playgta6_indirect_call(playgta6::GuestState* state, uint64_t target);

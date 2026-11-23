@@ -81,3 +81,14 @@ fn lifter_cpu_helpers_match_runtime_abi() {
         );
     }
 }
+
+#[test]
+fn lifter_guest_base_symbol_matches_runtime_abi() {
+    let decl = format!("extern uint64_t {};", lift::GUEST_BASE_SYMBOL);
+    assert!(
+        ABI_HEADER.contains(&decl),
+        "{} is not declared in playgta6_abi.h",
+        lift::GUEST_BASE_SYMBOL
+    );
+    assert_eq!(abi_constant("kGuestAddressSpaceBase"), 0x1_0000_0000);
+}

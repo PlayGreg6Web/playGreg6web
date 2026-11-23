@@ -242,6 +242,9 @@ pub const ATOMICS_TARGET_FEATURES: &str = "+atomics,+bulk-memory";
 pub const BULK_MEMORY_TARGET_FEATURES: &str = "+bulk-memory";
 /// Shared lock table of the `cmpxchg16b` fallback (one definition across all linked modules).
 pub const CMPXCHG16B_LOCKS: &str = "__playgta6_cmpxchg16b_locks";
+/// Runtime-defined `i64` global holding the guest -> host translation base
+/// (`host = __playgta6_guest_base + guest VA`, see `docs/wasm_abi.md` "Guest Address Space").
+pub const GUEST_BASE_SYMBOL: &str = "__playgta6_guest_base";
 
 /// Symbol name of the lifted function for the guest address `va` (e.g. `sub_140001000`).
 pub fn function_symbol(va: u64) -> String {

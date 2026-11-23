@@ -16,6 +16,11 @@
 
 namespace {
 
+// ---- Guest address space: one translation base shared by lifted code, bridge and runtime. ----
+static_assert(playgta6::kGuestAddressSpaceBase == 0x100000000ULL);
+static_assert(playgta6::kGuestAddressSpaceBase % 65536 == 0, "must be 64 KiB aligned");
+static_assert(std::is_same_v<decltype(__playgta6_guest_base), uint64_t>);
+
 // ---- Packet ABI v2: the render/compute pipeline keys travel verbatim, so the ABI structs must stay
 // byte-for-byte identical to pso::GraphicsPipelineKey / pso::ComputePipelineKey. ----
 namespace abi_v2_parity {
