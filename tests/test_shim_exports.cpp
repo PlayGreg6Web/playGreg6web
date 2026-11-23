@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "os/shim_exports.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/xbox_offline.h"
@@ -35,7 +36,7 @@ Pg6ProcAddress by_name(Pg6Handle module, const char* name) {
 
 void test_registration_idempotent() {
     const size_t first = pg6_loader_register_all_shim_exports();
-    CHECK(first == 183);
+    CHECK(first == 281);
     CHECK(register_all_shim_exports() == first);
     CHECK(pg6_loader_register_all_shim_exports() == first);
 
@@ -74,13 +75,16 @@ void test_table_counts_and_lookup() {
         CHECK(by_name(mod, e.name) == e.address);
         CHECK(pg6_loader_resolve_import(e.module, e.name) == e.address);
     }
-    CHECK(per_module.size() == 6);
-    CHECK(per_module["KERNEL32.dll"] == 81);
-    CHECK(per_module["ADVAPI32.dll"] == 7);
+    CHECK(per_module.size() == 9);
+    CHECK(per_module["KERNEL32.dll"] == 154);
+    CHECK(per_module["ADVAPI32.dll"] == 10);
     CHECK(per_module["WS2_32.dll"] == 24);
-    CHECK(per_module["WINHTTP.dll"] == 11);
+    CHECK(per_module["WINHTTP.dll"] == 15);
     CHECK(per_module["xgameruntime.dll"] == 39);
     CHECK(per_module["Microsoft.Xbox.Services.141.GDK.C.Thunks.dll"] == 21);
+    CHECK(per_module["bcrypt.dll"] == 3);
+    CHECK(per_module["USER32.dll"] == 7);
+    CHECK(per_module["combase.dll"] == 8);
 
     // The unversioned XSAPI alias exposes the same exports.
     const Pg6Handle versioned = pg6_win32_get_module_handle_a("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll");
@@ -134,6 +138,16 @@ void test_samples_per_family() {
         {"ws2_32", "getaddrinfo", proc_address(&pg6_win32_getaddrinfo)},
         {"ws2_32", "GetAddrInfoW", proc_address(&pg6_win32_get_addr_info_w)},
         {"winhttp", "WinHttpOpen", proc_address(&pg6_win32_winhttp_open)},
+        {"winhttp", "WinHttpCrackUrl", proc_address(&pg6_win32_winhttp_crack_url)},
+        {"api-ms-win-core-string-l1-1-0", "MultiByteToWideChar",
+         proc_address(&pg6_win32_multi_byte_to_wide_char)},
+        {"api-ms-win-core-file-l1-1-0", "FindFirstFileW", proc_address(&pg6_win32_find_first_file_w)},
+        {"api-ms-win-core-com-l1-1-0", "CoCreateGuid", proc_address(&pg6_win32_co_create_guid)},
+        {"ext-ms-win-rtcore-ntuser-message-l1-1-0", "TranslateMessage",
+         proc_address(&pg6_win32_translate_message)},
+        {"user32", "CreateWindowExA", proc_address(&pg6_win32_create_window_ex_a)},
+        {"advapi32", "RegOpenKeyW", proc_address(&pg6_win32_reg_open_key_w)},
+        {"bcrypt", "BCryptGenRandom", proc_address(&pg6_win32_bcrypt_gen_random)},
         {"xgameruntime", "XTaskQueueCreate", proc_address(&pg6_gdk_xtask_queue_create)},
         {"xgameruntime", "XUserGetGamertag", proc_address(&pg6_gdk_xuser_get_gamertag)},
         {"xgameruntime", "XStoreQueryGameLicenseAsync",
@@ -200,7 +214,7 @@ void test_unknown_names_fail() {
     CHECK(by_name(k32, "pg6_win32_create_file_w") == 0);
 
     pg6_win32_set_last_error(0);
-    CHECK(pg6_win32_get_module_handle_a("user32.dll") == 0);
+    CHECK(pg6_win32_get_module_handle_a("nosuchmodule.dll") == 0);
     CHECK(pg6_win32_get_last_error() == ERROR_MOD_NOT_FOUND);
 }
 

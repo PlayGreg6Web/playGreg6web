@@ -3,6 +3,7 @@
 #include <mutex>
 #include <string_view>
 
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_sync.h"
 #include "os/xbox_offline.h"
@@ -16,6 +17,9 @@ namespace {
 #define PG6_MOD_ADV "ADVAPI32.dll"
 #define PG6_MOD_WS2 "WS2_32.dll"
 #define PG6_MOD_WHTTP "WINHTTP.dll"
+#define PG6_MOD_BCR "bcrypt.dll"
+#define PG6_MOD_USR "USER32.dll"
+#define PG6_MOD_CMB "combase.dll"
 #define PG6_MOD_XGR "xgameruntime.dll"
 #define PG6_MOD_XBL "Microsoft.Xbox.Services.141.GDK.C.Thunks.dll"
 
@@ -207,7 +211,105 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(ADV, "EventEnabled", pg6_win32_event_enabled) \
     E(ADV, "EventProviderEnabled", pg6_win32_event_provider_enabled) \
     E(ADV, "EventWrite", pg6_win32_event_write) \
-    E(ADV, "EventWriteTransfer", pg6_win32_event_write_transfer)
+    E(ADV, "EventWriteTransfer", pg6_win32_event_write_transfer) \
+    E(K32, "CreateDirectoryW", pg6_win32_create_directory_w) \
+    E(K32, "RemoveDirectoryW", pg6_win32_remove_directory_w) \
+    E(K32, "DeleteFileW", pg6_win32_delete_file_w) \
+    E(K32, "GetFileAttributesA", pg6_win32_get_file_attributes_a) \
+    E(K32, "GetFileAttributesW", pg6_win32_get_file_attributes_w) \
+    E(K32, "GetFileAttributesExW", pg6_win32_get_file_attributes_ex_w) \
+    E(K32, "SetFileAttributesW", pg6_win32_set_file_attributes_w) \
+    E(K32, "FindFirstFileW", pg6_win32_find_first_file_w) \
+    E(K32, "FindNextFileW", pg6_win32_find_next_file_w) \
+    E(K32, "FindClose", pg6_win32_find_close) \
+    E(K32, "GetFileTime", pg6_win32_get_file_time) \
+    E(K32, "SetFileTime", pg6_win32_set_file_time) \
+    E(K32, "FileTimeToLocalFileTime", pg6_win32_file_time_to_local_file_time) \
+    E(K32, "LocalFileTimeToFileTime", pg6_win32_local_file_time_to_file_time) \
+    E(K32, "FlushFileBuffers", pg6_win32_flush_file_buffers) \
+    E(K32, "SetEndOfFile", pg6_win32_set_end_of_file) \
+    E(K32, "GetDiskFreeSpaceExW", pg6_win32_get_disk_free_space_ex_w) \
+    E(K32, "MoveFileExW", pg6_win32_move_file_ex_w) \
+    E(K32, "GetCurrentProcess", pg6_win32_get_current_process) \
+    E(K32, "GetCurrentProcessId", pg6_win32_get_current_process_id) \
+    E(K32, "GetProcessId", pg6_win32_get_process_id) \
+    E(K32, "GetStartupInfoW", pg6_win32_get_startup_info_w) \
+    E(K32, "GetThreadPriority", pg6_win32_get_thread_priority) \
+    E(K32, "SetThreadPriority", pg6_win32_set_thread_priority) \
+    E(K32, "OpenThread", pg6_win32_open_thread) \
+    E(K32, "SuspendThread", pg6_win32_suspend_thread) \
+    E(K32, "TerminateProcess", pg6_win32_terminate_process) \
+    E(K32, "SetProcessPriorityBoost", pg6_win32_set_process_priority_boost) \
+    E(K32, "GetCurrentThreadStackLimits", pg6_win32_get_current_thread_stack_limits) \
+    E(K32, "IsProcessorFeaturePresent", pg6_win32_is_processor_feature_present) \
+    E(K32, "GetThreadGroupAffinity", pg6_win32_get_thread_group_affinity) \
+    E(K32, "SetThreadGroupAffinity", pg6_win32_set_thread_group_affinity) \
+    E(K32, "GetCommandLineA", pg6_win32_get_command_line_a) \
+    E(K32, "Sleep", pg6_win32_sleep) \
+    E(K32, "InitializeCriticalSectionAndSpinCount", pg6_win32_initialize_critical_section_and_spin_count) \
+    E(K32, "CreateSemaphoreExW", pg6_win32_create_semaphore_ex_w) \
+    E(K32, "VirtualQueryEx", pg6_win32_virtual_query_ex) \
+    E(K32, "LocalFree", pg6_win32_local_free) \
+    E(K32, "InitializeSListHead", pg6_win32_initialize_s_list_head) \
+    E(K32, "GetSystemInfo", pg6_win32_get_system_info) \
+    E(K32, "GetNativeSystemInfo", pg6_win32_get_native_system_info) \
+    E(K32, "GetLocalTime", pg6_win32_get_local_time) \
+    E(K32, "GetSystemTime", pg6_win32_get_system_time) \
+    E(K32, "GetSystemTimePreciseAsFileTime", pg6_win32_get_system_time_precise_as_file_time) \
+    E(K32, "GlobalMemoryStatusEx", pg6_win32_global_memory_status_ex) \
+    E(K32, "GetLogicalProcessorInformation", pg6_win32_get_logical_processor_information) \
+    E(K32, "FileTimeToSystemTime", pg6_win32_file_time_to_system_time) \
+    E(K32, "SystemTimeToFileTime", pg6_win32_system_time_to_file_time) \
+    E(K32, "GetTimeZoneInformation", pg6_win32_get_time_zone_information) \
+    E(K32, "GetDateFormatEx", pg6_win32_get_date_format_ex) \
+    E(K32, "GetTimeFormatEx", pg6_win32_get_time_format_ex) \
+    E(K32, "MultiByteToWideChar", pg6_win32_multi_byte_to_wide_char) \
+    E(K32, "WideCharToMultiByte", pg6_win32_wide_char_to_multi_byte) \
+    E(K32, "lstrcmpW", pg6_win32_lstrcmp_w) \
+    E(K32, "lstrcmpiW", pg6_win32_lstrcmpi_w) \
+    E(K32, "lstrlenW", pg6_win32_lstrlen_w) \
+    E(K32, "CompareStringW", pg6_win32_compare_string_w) \
+    E(K32, "CompareStringOrdinal", pg6_win32_compare_string_ordinal) \
+    E(K32, "GetUserDefaultLocaleName", pg6_win32_get_user_default_locale_name) \
+    E(K32, "GetUserDefaultGeoName", pg6_win32_get_user_default_geo_name) \
+    E(K32, "LocaleNameToLCID", pg6_win32_locale_name_to_lcid) \
+    E(K32, "FormatMessageA", pg6_win32_format_message_a) \
+    E(K32, "IsDebuggerPresent", pg6_win32_is_debugger_present) \
+    E(K32, "OutputDebugStringA", pg6_win32_output_debug_string_a) \
+    E(K32, "SetUnhandledExceptionFilter", pg6_win32_set_unhandled_exception_filter) \
+    E(K32, "UnhandledExceptionFilter", pg6_win32_unhandled_exception_filter) \
+    E(K32, "RegisterAppStateChangeNotification", pg6_win32_register_app_state_change_notification) \
+    E(K32, "UnregisterAppStateChangeNotification", pg6_win32_unregister_app_state_change_notification) \
+    E(K32, "RegisterAppConstrainedChangeNotification", pg6_win32_register_app_constrained_change_notification) \
+    E(K32, "UnregisterAppConstrainedChangeNotification", pg6_win32_unregister_app_constrained_change_notification) \
+    E(K32, "WerRegisterFile", pg6_win32_wer_register_file) \
+    E(K32, "SetNamedPipeHandleState", pg6_win32_set_named_pipe_handle_state) \
+    E(K32, "WaitNamedPipeW", pg6_win32_wait_named_pipe_w) \
+    E(WHTTP, "WinHttpAddRequestHeaders", pg6_win32_winhttp_add_request_headers) \
+    E(WHTTP, "WinHttpWriteData", pg6_win32_winhttp_write_data) \
+    E(WHTTP, "WinHttpQueryHeaders", pg6_win32_winhttp_query_headers) \
+    E(WHTTP, "WinHttpCrackUrl", pg6_win32_winhttp_crack_url) \
+    E(ADV, "RegOpenKeyW", pg6_win32_reg_open_key_w) \
+    E(ADV, "RegQueryValueExW", pg6_win32_reg_query_value_ex_w) \
+    E(ADV, "RegCloseKey", pg6_win32_reg_close_key) \
+    E(BCR, "BCryptOpenAlgorithmProvider", pg6_win32_bcrypt_open_algorithm_provider) \
+    E(BCR, "BCryptGenRandom", pg6_win32_bcrypt_gen_random) \
+    E(BCR, "BCryptCloseAlgorithmProvider", pg6_win32_bcrypt_close_algorithm_provider) \
+    E(CMB, "CoInitializeEx", pg6_win32_co_initialize_ex) \
+    E(CMB, "CoUninitialize", pg6_win32_co_uninitialize) \
+    E(CMB, "CoCreateInstance", pg6_win32_co_create_instance) \
+    E(CMB, "CoTaskMemAlloc", pg6_win32_co_task_mem_alloc) \
+    E(CMB, "CoTaskMemFree", pg6_win32_co_task_mem_free) \
+    E(CMB, "CoCreateGuid", pg6_win32_co_create_guid) \
+    E(CMB, "StringFromGUID2", pg6_win32_string_from_guid2) \
+    E(CMB, "PropVariantClear", pg6_win32_prop_variant_clear) \
+    E(USR, "RegisterClassExA", pg6_win32_register_class_ex_a) \
+    E(USR, "CreateWindowExA", pg6_win32_create_window_ex_a) \
+    E(USR, "DefWindowProcA", pg6_win32_def_window_proc_a) \
+    E(USR, "ShowWindow", pg6_win32_show_window) \
+    E(USR, "PeekMessageA", pg6_win32_peek_message_a) \
+    E(USR, "TranslateMessage", pg6_win32_translate_message) \
+    E(USR, "DispatchMessageA", pg6_win32_dispatch_message_a)
 
 #define PG6_SHIM_ENTRY(mod, name, fn) \
     Pg6ShimExport{PG6_MOD_##mod, name, #fn, playgta6::os::win32::proc_address(&fn)},
@@ -221,6 +323,7 @@ size_t register_all_once() {
     // Contract names the registered families are reached through, beyond O7's defaults
     // (api-ms-win-core-* already maps to KERNEL32.dll): ETW lives in api-ms-win-eventing-*.
     register_api_set_rule("api-ms-win-eventing-", "advapi32.dll");
+    register_api_set_rule("ext-ms-win-rtcore-ntuser-", "user32.dll");
 
     for (const Pg6ShimExport& e : kTable) {
         register_export(e.module, e.name, 0, e.address);

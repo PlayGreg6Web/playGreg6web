@@ -13,7 +13,10 @@
 //
 //   KERNEL32.dll                                   win32_kernel.h + win32_loader.h +
 //                                                  win32_sync.h shims
-//   ADVAPI32.dll                                   ETW Event* (reached via api-ms-win-eventing-*)
+//   ADVAPI32.dll                                   ETW Event* (reached via api-ms-win-eventing-*),
+//                                                  in-memory registry reads (win32_compat.h)
+//   bcrypt.dll, USER32.dll, combase.dll            RNG-only bcrypt, window fake (ext-ms-win-rtcore-
+//                                                  ntuser-*), COM helpers (win32_compat.h)
 //   WS2_32.dll, WINHTTP.dll                        xbox_offline.h
 //   xgameruntime.dll                               XGameRuntime, XTaskQueue, XAsync, XUser,
 //                                                  XSystem, XNetworking, XStore

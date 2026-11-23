@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <set>
 #include <unordered_map>
 
 namespace playgta6::os::win32 {
@@ -36,9 +38,29 @@ std::atomic<HttpfsMailboxClient*> g_httpfs_client{nullptr};
 // In-memory /userdata overlay
 // ---------------------------------------------------------------------------
 
+// FILETIME ticks (100 ns since 1601) used for the overlay's per-file timestamps.
+uint64_t now_filetime_ticks() {
+    constexpr uint64_t kEpochDiff100Ns = 116444736000000000ULL;
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const int64_t unix_100ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() / 100;
+    return kEpochDiff100Ns + static_cast<uint64_t>(unix_100ns > 0 ? unix_100ns : 0);
+}
+
+struct UserdataMeta {
+    uint64_t created = 0;
+    uint64_t accessed = 0;
+    uint64_t written = 0;
+    uint32_t attributes = 0;  // settable attribute bits only (READONLY, HIDDEN, ...)
+};
+
 struct UserdataOverlay {
     std::mutex mutex;
     std::unordered_map<std::string, std::vector<uint8_t>> files;
+    // O15: explicit directories (a directory also exists implicitly while a file is below it)
+    // and per-entry timestamps/attributes, keyed by the same normalized "/userdata/..." keys.
+    std::set<std::string> dirs;
+    std::unordered_map<std::string, UserdataMeta> meta;
 };
 
 UserdataOverlay& userdata_overlay() {
@@ -53,6 +75,7 @@ UserdataOverlay& userdata_overlay() {
 enum class KernelObjectKind : uint8_t {
     Dispatcher,
     File,
+    Opaque,  // O15: find handles, registry keys, ... owned by os/win32_compat
 };
 
 struct KernelObject {
@@ -66,6 +89,14 @@ struct DispatcherEntry final : KernelObject {
         : KernelObject(KernelObjectKind::Dispatcher), object(std::move(obj)) {}
 
     std::shared_ptr<DispatcherObject> object;
+};
+
+struct OpaqueEntry final : KernelObject {
+    OpaqueEntry(uint32_t t, std::shared_ptr<void> p)
+        : KernelObject(KernelObjectKind::Opaque), tag(t), payload(std::move(p)) {}
+
+    uint32_t tag;
+    std::shared_ptr<void> payload;
 };
 
 struct FileObject final : KernelObject {
@@ -132,6 +163,43 @@ struct KernelHandleTable {
 KernelHandleTable& handle_table() {
     static KernelHandleTable table;
     return table;
+}
+
+// Called with overlay.mutex held: stamps an entry as created (new) or written (modified).
+void stamp_locked(UserdataOverlay& overlay, const std::string& key, bool created) {
+    const uint64_t now = now_filetime_ticks();
+    UserdataMeta& m = overlay.meta[key];
+    if (created || m.created == 0) {
+        m.created = now;
+    }
+    m.accessed = now;
+    m.written = now;
+}
+
+constexpr char kUserdataRoot[] = "/userdata";
+
+// Called with overlay.mutex held.
+bool dir_exists_locked(const UserdataOverlay& overlay, const std::string& key) {
+    if (key == kUserdataRoot || overlay.dirs.count(key) != 0) {
+        return true;
+    }
+    const std::string prefix = key + "/";
+    for (const auto& kv : overlay.files) {
+        if (kv.first.compare(0, prefix.size(), prefix) == 0) {
+            return true;
+        }
+    }
+    for (const auto& d : overlay.dirs) {
+        if (d.compare(0, prefix.size(), prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string parent_key(const std::string& key) {
+    const size_t slash = key.rfind('/');
+    return slash == std::string::npos ? std::string() : key.substr(0, slash);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,11 +346,13 @@ Handle create_file_impl(std::string_view raw_path,
                     return INVALID_HANDLE_VALUE;
                 }
                 overlay.files.emplace(normalized, std::vector<uint8_t>{});
+                stamp_locked(overlay, normalized, true);
                 SetLastError(ERROR_SUCCESS);
                 break;
 
             case CREATE_ALWAYS:
                 overlay.files[normalized].clear();
+                stamp_locked(overlay, normalized, !exists);
                 SetLastError(exists ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
                 break;
 
@@ -297,6 +367,7 @@ Handle create_file_impl(std::string_view raw_path,
             case OPEN_ALWAYS:
                 if (!exists) {
                     overlay.files.emplace(normalized, std::vector<uint8_t>{});
+                    stamp_locked(overlay, normalized, true);
                     SetLastError(ERROR_SUCCESS);
                 } else {
                     SetLastError(ERROR_ALREADY_EXISTS);
@@ -313,6 +384,7 @@ Handle create_file_impl(std::string_view raw_path,
                     return INVALID_HANDLE_VALUE;
                 }
                 it->second.clear();
+                stamp_locked(overlay, normalized, false);
                 SetLastError(ERROR_SUCCESS);
                 break;
 
@@ -411,6 +483,30 @@ Handle insert_dispatcher_object(std::shared_ptr<DispatcherObject> object) {
     return handle_table().insert(std::make_shared<DispatcherEntry>(std::move(object)));
 }
 
+Handle insert_opaque_object(uint32_t tag, std::shared_ptr<void> payload) {
+    return handle_table().insert(std::make_shared<OpaqueEntry>(tag, std::move(payload)));
+}
+
+std::shared_ptr<void> lookup_opaque_object(Handle handle, uint32_t tag) {
+    auto obj = handle_table().lookup(handle);
+    if (!obj || obj->kind != KernelObjectKind::Opaque) {
+        return nullptr;
+    }
+    auto* entry = static_cast<OpaqueEntry*>(obj.get());
+    return entry->tag == tag ? entry->payload : nullptr;
+}
+
+std::shared_ptr<void> remove_opaque_object(Handle handle, uint32_t tag) {
+    if (!lookup_opaque_object(handle, tag)) {
+        return nullptr;
+    }
+    auto obj = handle_table().remove(handle);
+    if (!obj || obj->kind != KernelObjectKind::Opaque) {
+        return nullptr;
+    }
+    return static_cast<OpaqueEntry*>(obj.get())->payload;
+}
+
 std::shared_ptr<DispatcherObject> lookup_dispatcher_object(Handle handle) {
     auto obj = handle_table().lookup(handle);
     if (!obj || obj->kind != KernelObjectKind::Dispatcher) {
@@ -423,6 +519,8 @@ void clear_userdata_overlay() {
     auto& overlay = userdata_overlay();
     std::lock_guard<std::mutex> lock(overlay.mutex);
     overlay.files.clear();
+    overlay.dirs.clear();
+    overlay.meta.clear();
 }
 
 bool userdata_file_exists(std::string_view path) {
@@ -460,7 +558,399 @@ void write_userdata_file(std::string_view path, std::vector<uint8_t> data) {
     }
     auto& overlay = userdata_overlay();
     std::lock_guard<std::mutex> lock(overlay.mutex);
+    const bool existed = overlay.files.find(key) != overlay.files.end();
     overlay.files[key] = std::move(data);
+    stamp_locked(overlay, key, !existed);
+}
+
+// ---------------------------------------------------------------------------
+// Virtual filesystem seam (O15): directories, timestamps, attributes on the /userdata overlay
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint32_t kErrDirNotEmpty = 145u;
+constexpr uint32_t kErrDirectory = 267u;
+constexpr uint32_t kFileAttrReadOnly = 0x1u;
+constexpr uint32_t kSettableAttrMask = 0x1u | 0x2u | 0x4u | 0x20u | 0x100u | 0x2000u;
+
+bool is_userdata_key(std::string_view key) {
+    constexpr std::string_view root = "/userdata";
+    return key.size() >= root.size() && key.compare(0, root.size(), root) == 0 &&
+           (key.size() == root.size() || key[root.size()] == '/');
+}
+
+// overlay.mutex held. ERROR_FILE_NOT_FOUND when the parent exists, else ERROR_PATH_NOT_FOUND.
+uint32_t missing_error_locked(const UserdataOverlay& overlay, const std::string& key) {
+    const std::string parent = parent_key(key);
+    if (!parent.empty() && is_userdata_key(parent) && dir_exists_locked(overlay, parent) &&
+        overlay.files.find(parent) == overlay.files.end()) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+    return ERROR_PATH_NOT_FOUND;
+}
+
+// overlay.mutex held; the entry must exist.
+void fill_entry_locked(UserdataOverlay& overlay,
+                       const std::string& key,
+                       bool is_dir,
+                       UserdataEntry* out) {
+    UserdataMeta& m = overlay.meta[key];
+    if (m.created == 0) {
+        const uint64_t now = now_filetime_ticks();
+        m.created = m.accessed = m.written = now;
+    }
+    out->is_directory = is_dir;
+    out->size = 0;
+    if (!is_dir) {
+        out->size = overlay.files.find(key)->second.size();
+    }
+    out->created = m.created;
+    out->accessed = m.accessed;
+    out->written = m.written;
+    out->attributes = m.attributes;
+}
+
+}  // namespace
+
+uint32_t userdata_stat(std::string_view key_view, UserdataEntry* out) {
+    const std::string key(key_view);
+    if (out == nullptr) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    *out = UserdataEntry{};
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    if (overlay.files.find(key) != overlay.files.end()) {
+        fill_entry_locked(overlay, key, false, out);
+        return ERROR_SUCCESS;
+    }
+    if (dir_exists_locked(overlay, key)) {
+        fill_entry_locked(overlay, key, true, out);
+        return ERROR_SUCCESS;
+    }
+    return missing_error_locked(overlay, key);
+}
+
+uint32_t userdata_create_directory(std::string_view key_view) {
+    const std::string key(key_view);
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    if (overlay.files.find(key) != overlay.files.end() || dir_exists_locked(overlay, key)) {
+        return ERROR_ALREADY_EXISTS;
+    }
+    const std::string parent = parent_key(key);
+    if (overlay.files.find(parent) != overlay.files.end() || !dir_exists_locked(overlay, parent)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    overlay.dirs.insert(key);
+    stamp_locked(overlay, key, true);
+    return ERROR_SUCCESS;
+}
+
+uint32_t userdata_remove_directory(std::string_view key_view) {
+    const std::string key(key_view);
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    if (overlay.files.find(key) != overlay.files.end()) {
+        return kErrDirectory;
+    }
+    if (!dir_exists_locked(overlay, key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    if (key == kUserdataRoot) {
+        return ERROR_ACCESS_DENIED;
+    }
+    const std::string prefix = key + "/";
+    for (const auto& kv : overlay.files) {
+        if (kv.first.compare(0, prefix.size(), prefix) == 0) {
+            return kErrDirNotEmpty;
+        }
+    }
+    for (const auto& d : overlay.dirs) {
+        if (d.compare(0, prefix.size(), prefix) == 0) {
+            return kErrDirNotEmpty;
+        }
+    }
+    overlay.dirs.erase(key);
+    overlay.meta.erase(key);
+    return ERROR_SUCCESS;
+}
+
+uint32_t userdata_delete_file(std::string_view key_view) {
+    const std::string key(key_view);
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    auto it = overlay.files.find(key);
+    if (it == overlay.files.end()) {
+        return dir_exists_locked(overlay, key) ? ERROR_ACCESS_DENIED
+                                               : missing_error_locked(overlay, key);
+    }
+    auto mit = overlay.meta.find(key);
+    if (mit != overlay.meta.end() && (mit->second.attributes & kFileAttrReadOnly) != 0) {
+        return ERROR_ACCESS_DENIED;
+    }
+    overlay.files.erase(it);
+    overlay.meta.erase(key);
+    return ERROR_SUCCESS;
+}
+
+uint32_t userdata_list_directory(std::string_view key_view, std::vector<UserdataEntry>* out) {
+    const std::string key(key_view);
+    if (out == nullptr) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    out->clear();
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    if (overlay.files.find(key) != overlay.files.end() || !dir_exists_locked(overlay, key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    const std::string prefix = key + "/";
+    std::map<std::string, bool> children;  // name -> is_directory (sorted by name)
+    for (const auto& kv : overlay.files) {
+        if (kv.first.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        const std::string rest = kv.first.substr(prefix.size());
+        const size_t slash = rest.find('/');
+        if (slash == std::string::npos) {
+            children[rest] = false;
+        } else {
+            children[rest.substr(0, slash)] = true;
+        }
+    }
+    for (const auto& d : overlay.dirs) {
+        if (d.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        const std::string rest = d.substr(prefix.size());
+        const size_t slash = rest.find('/');
+        children[slash == std::string::npos ? rest : rest.substr(0, slash)] = true;
+    }
+    for (const auto& child : children) {
+        UserdataEntry entry;
+        fill_entry_locked(overlay, prefix + child.first, child.second, &entry);
+        entry.name = child.first;
+        out->push_back(std::move(entry));
+    }
+    return ERROR_SUCCESS;
+}
+
+uint32_t userdata_rename(std::string_view from_view,
+                         std::string_view to_view,
+                         bool replace_existing) {
+    const std::string from(from_view);
+    const std::string to(to_view);
+    if (!is_userdata_key(from) || !is_userdata_key(to) || from == kUserdataRoot ||
+        to == kUserdataRoot) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    const bool from_is_file = overlay.files.find(from) != overlay.files.end();
+    if (!from_is_file && !dir_exists_locked(overlay, from)) {
+        return missing_error_locked(overlay, from);
+    }
+    if (from == to) {
+        return ERROR_SUCCESS;
+    }
+    const std::string to_parent = parent_key(to);
+    if (overlay.files.find(to_parent) != overlay.files.end() ||
+        !dir_exists_locked(overlay, to_parent)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    const bool to_is_file = overlay.files.find(to) != overlay.files.end();
+    const bool to_is_dir = !to_is_file && dir_exists_locked(overlay, to);
+    if (to_is_file || to_is_dir) {
+        if (!replace_existing) {
+            return ERROR_ALREADY_EXISTS;
+        }
+        if (!from_is_file || to_is_dir) {
+            return ERROR_ACCESS_DENIED;  // replacing is only defined for file over file
+        }
+    }
+    if (!from_is_file && to.compare(0, from.size() + 1, from + "/") == 0) {
+        return ERROR_INVALID_PARAMETER;  // directory into itself
+    }
+
+    if (from_is_file) {
+        auto node = overlay.files.extract(from);
+        overlay.files.erase(to);
+        node.key() = to;
+        overlay.files.insert(std::move(node));
+        auto mit = overlay.meta.find(from);
+        if (mit != overlay.meta.end()) {
+            const UserdataMeta m = mit->second;
+            overlay.meta.erase(mit);
+            overlay.meta[to] = m;
+        }
+        return ERROR_SUCCESS;
+    }
+
+    const std::string from_prefix = from + "/";
+    auto rekey = [&](const std::string& old_key) { return to + old_key.substr(from.size()); };
+    std::vector<std::string> moved_files;
+    for (const auto& kv : overlay.files) {
+        if (kv.first.compare(0, from_prefix.size(), from_prefix) == 0) {
+            moved_files.push_back(kv.first);
+        }
+    }
+    for (const auto& old_key : moved_files) {
+        auto node = overlay.files.extract(old_key);
+        node.key() = rekey(old_key);
+        overlay.files.insert(std::move(node));
+    }
+    std::vector<std::string> moved_dirs;
+    for (const auto& d : overlay.dirs) {
+        if (d == from || d.compare(0, from_prefix.size(), from_prefix) == 0) {
+            moved_dirs.push_back(d);
+        }
+    }
+    for (const auto& d : moved_dirs) {
+        overlay.dirs.erase(d);
+        overlay.dirs.insert(rekey(d));
+    }
+    std::vector<std::string> moved_meta;
+    for (const auto& kv : overlay.meta) {
+        if (kv.first == from || kv.first.compare(0, from_prefix.size(), from_prefix) == 0) {
+            moved_meta.push_back(kv.first);
+        }
+    }
+    for (const auto& old_key : moved_meta) {
+        const UserdataMeta m = overlay.meta[old_key];
+        overlay.meta.erase(old_key);
+        overlay.meta[rekey(old_key)] = m;
+    }
+    overlay.dirs.insert(to);  // the moved directory keeps existing even when it ends up empty
+    return ERROR_SUCCESS;
+}
+
+uint32_t userdata_set_times(std::string_view key_view,
+                            const uint64_t* created,
+                            const uint64_t* accessed,
+                            const uint64_t* written) {
+    const std::string key(key_view);
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    const bool is_file = overlay.files.find(key) != overlay.files.end();
+    if (!is_file && !dir_exists_locked(overlay, key)) {
+        return missing_error_locked(overlay, key);
+    }
+    UserdataEntry unused;
+    fill_entry_locked(overlay, key, !is_file, &unused);  // materializes the meta record
+    UserdataMeta& m = overlay.meta[key];
+    if (created != nullptr) {
+        m.created = *created;
+    }
+    if (accessed != nullptr) {
+        m.accessed = *accessed;
+    }
+    if (written != nullptr) {
+        m.written = *written;
+    }
+    return ERROR_SUCCESS;
+}
+
+uint32_t userdata_set_attributes(std::string_view key_view, uint32_t attributes) {
+    const std::string key(key_view);
+    if (!is_userdata_key(key)) {
+        return ERROR_PATH_NOT_FOUND;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    const bool is_file = overlay.files.find(key) != overlay.files.end();
+    if (!is_file && !dir_exists_locked(overlay, key)) {
+        return missing_error_locked(overlay, key);
+    }
+    UserdataEntry unused;
+    fill_entry_locked(overlay, key, !is_file, &unused);
+    // Only explicit attribute bits are stored; FILE_ATTRIBUTE_NORMAL (0x80) is the "none set"
+    // marker so a later query can tell it from a never-touched entry.
+    uint32_t stored = attributes & kSettableAttrMask;
+    if (stored == 0) {
+        stored = 0x80u;
+    }
+    overlay.meta[key].attributes = stored;
+    return ERROR_SUCCESS;
+}
+
+uint64_t userdata_total_bytes() {
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    uint64_t total = 0;
+    for (const auto& kv : overlay.files) {
+        total += kv.second.size();
+    }
+    return total;
+}
+
+bool query_file_handle(Handle handle, FileHandleInfo* out) {
+    if (out == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *out = FileHandleInfo{};
+    auto obj = handle_table().lookup(handle);
+    if (!obj || obj->kind != KernelObjectKind::File) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+    auto* file = static_cast<FileObject*>(obj.get());
+    std::lock_guard<std::mutex> lock(file->mutex);
+    out->is_userdata = file->is_userdata;
+    out->desired_access = file->desired_access;
+    out->cursor = file->cursor;
+    out->userdata_key = file->userdata_key;
+    return true;
+}
+
+bool set_end_of_file_at_cursor(Handle handle) {
+    auto obj = handle_table().lookup(handle);
+    if (!obj || obj->kind != KernelObjectKind::File) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+    auto* file = static_cast<FileObject*>(obj.get());
+    std::lock_guard<std::mutex> lock(file->mutex);
+    if (!file->is_userdata || (file->desired_access & GENERIC_WRITE) == 0) {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+    // Zero-extension is bounded so a hostile seek position cannot exhaust host memory.
+    constexpr uint64_t kMaxUserdataFileBytes = 1ull << 32;
+    if (file->cursor > kMaxUserdataFileBytes) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> ud_lock(overlay.mutex);
+    auto it = overlay.files.find(file->userdata_key);
+    if (it == overlay.files.end()) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return false;
+    }
+    it->second.resize(static_cast<size_t>(file->cursor), 0);
+    stamp_locked(overlay, file->userdata_key, false);
+    return true;
 }
 
 std::string utf16_to_utf8(const char16_t* src) {
@@ -935,6 +1425,7 @@ bool WriteFile(Handle file_handle,
     }
     std::memcpy(data.data() + static_cast<size_t>(file->cursor), buffer, bytes_to_write);
     file->cursor = end_pos;
+    stamp_locked(overlay, file->userdata_key, false);
     if (bytes_written != nullptr) {
         *bytes_written = bytes_to_write;
     }

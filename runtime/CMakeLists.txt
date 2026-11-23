@@ -13,6 +13,10 @@ add_library(playgta6_core STATIC
     os/httpfs_mailbox.cpp
     os/win32_kernel.cpp
     os/win32_sync.cpp
+    os/win32_compat_file.cpp
+    os/win32_compat_sys.cpp
+    os/win32_compat_text.cpp
+    os/win32_compat_misc.cpp
     os/xgameruntime.cpp
     os/xbox_offline.cpp
     os/xbox_scarlett.cpp
@@ -103,6 +107,10 @@ else()
     target_compile_definitions(test_state_bridge PRIVATE
         PG6_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures")
     add_test(NAME state_bridge_tests COMMAND test_state_bridge)
+
+    add_executable(test_win32_compat ../tests/test_win32_compat.cpp)
+    target_link_libraries(test_win32_compat PRIVATE playgta6_core)
+    add_test(NAME playgta6_win32_compat_tests COMMAND test_win32_compat)
 
     add_executable(test_win32_sync ../tests/test_win32_sync.cpp)
     target_link_libraries(test_win32_sync PRIVATE playgta6_core)

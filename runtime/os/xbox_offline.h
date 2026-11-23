@@ -63,6 +63,26 @@ struct Pg6XTaskQueueRegistrationToken {
     uint64_t token = 0;
 };
 
+// URL_COMPONENTSW (64-bit layout) for WinHttpCrackUrl.
+struct Pg6UrlComponentsW {
+    uint32_t struct_size;
+    char16_t* scheme;
+    uint32_t scheme_length;
+    int32_t scheme_id;
+    char16_t* host_name;
+    uint32_t host_name_length;
+    uint16_t port;
+    char16_t* user_name;
+    uint32_t user_name_length;
+    char16_t* password;
+    uint32_t password_length;
+    char16_t* url_path;
+    uint32_t url_path_length;
+    char16_t* extra_info;
+    uint32_t extra_info_length;
+};
+static_assert(sizeof(Pg6UrlComponentsW) == 104, "Pg6UrlComponentsW must match URL_COMPONENTSW");
+
 using Pg6WinHttpStatusCallback = void (*)(Pg6HInternet handle,
                                           uint64_t context,
                                           uint32_t internet_status,
@@ -102,6 +122,11 @@ inline constexpr int32_t WSAHOST_NOT_FOUND = 11001;  // == EAI_NONAME
 // WinHTTP (GetLastError values).
 inline constexpr uint32_t ERROR_WINHTTP_NAME_NOT_RESOLVED = 12007u;
 inline constexpr uint32_t ERROR_WINHTTP_INCORRECT_HANDLE_STATE = 12019u;
+inline constexpr uint32_t ERROR_WINHTTP_INVALID_URL = 12005u;
+inline constexpr uint32_t ERROR_WINHTTP_UNRECOGNIZED_SCHEME = 12006u;
+inline constexpr uint32_t ERROR_WINHTTP_HEADER_NOT_FOUND = 12150u;
+inline constexpr int32_t INTERNET_SCHEME_HTTP = 1;
+inline constexpr int32_t INTERNET_SCHEME_HTTPS = 2;
 
 // ETW status codes.
 inline constexpr uint32_t ETW_ERROR_SUCCESS = 0u;
@@ -252,10 +277,32 @@ int32_t pg6_win32_winhttp_read_data(Pg6HInternet request,
                                     void* buffer,
                                     uint32_t bytes_to_read,
                                     uint32_t* bytes_read);
-Pg6WinHttpStatusCallback pg6_win32_winhttp_set_status_callback(Pg6HInternet handle,
-                                                               Pg6WinHttpStatusCallback callback,
-                                                               uint32_t notification_flags,
-                                                               uint64_t reserved);
+// The callback is a guest function address (an opaque integer here): it is never stored or called
+// because no request ever reaches a state that notifies it. Returns the previous callback (0), or
+// WINHTTP_INVALID_STATUS_CALLBACK (~0) with the Win32 last error set for a bad handle.
+uint64_t pg6_win32_winhttp_set_status_callback(Pg6HInternet handle,
+                                               uint64_t callback,
+                                               uint32_t notification_flags,
+                                               uint64_t reserved);
+int32_t pg6_win32_winhttp_add_request_headers(Pg6HInternet request,
+                                              const char16_t* headers,
+                                              uint32_t headers_length,
+                                              uint32_t modifiers);
+int32_t pg6_win32_winhttp_write_data(Pg6HInternet request,
+                                     const void* buffer,
+                                     uint32_t bytes_to_write,
+                                     uint32_t* bytes_written);
+int32_t pg6_win32_winhttp_query_headers(Pg6HInternet request,
+                                        uint32_t info_level,
+                                        const char16_t* name,
+                                        void* buffer,
+                                        uint32_t* buffer_length,
+                                        uint32_t* index);
+// Pure URL parser for http/https URLs (no network involved); see the .cpp for the component rules.
+int32_t pg6_win32_winhttp_crack_url(const char16_t* url,
+                                    uint32_t url_length,
+                                    uint32_t flags,
+                                    Pg6UrlComponentsW* components);
 int32_t pg6_win32_winhttp_set_option(Pg6HInternet handle,
                                      uint32_t option,
                                      const void* buffer,

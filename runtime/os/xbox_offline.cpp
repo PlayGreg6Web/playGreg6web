@@ -383,6 +383,49 @@ Pg6HInternet winhttp_child(const char* import_name,
     return handles().create(child_kind);
 }
 
+// WinHttpCrackUrl helpers. A requested component either has a caller buffer (copied, NUL
+// terminated) or a NULL pointer with a non-zero length (pointed into the URL string); a component
+// with zero length and NULL pointer is not requested.
+bool crack_component(const char16_t* src,
+                     size_t count,
+                     char16_t** pointer,
+                     uint32_t* length,
+                     bool* insufficient) {
+    if (*length == 0) {
+        return true;
+    }
+    if (*pointer == nullptr) {
+        *pointer = const_cast<char16_t*>(src);
+        *length = static_cast<uint32_t>(count);
+        return true;
+    }
+    if (count + 1 > *length) {
+        *length = static_cast<uint32_t>(count + 1);
+        *insufficient = true;
+        return false;
+    }
+    std::memcpy(*pointer, src, count * sizeof(char16_t));
+    (*pointer)[count] = 0;
+    *length = static_cast<uint32_t>(count);
+    return true;
+}
+
+bool ascii_ieq(const char16_t* s, size_t n, const char* lit) {
+    if (std::strlen(lit) != n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        char16_t c = s[i];
+        if (c >= u'A' && c <= u'Z') {
+            c = static_cast<char16_t>(c + 32);
+        }
+        if (c != static_cast<char16_t>(lit[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Registration that never fires (connectivity / license change notifications).
 HResult register_silent(const char* import_name,
                         HandleKind kind,
@@ -694,16 +737,190 @@ int32_t pg6_win32_winhttp_read_data(Pg6HInternet request,
                              off::ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
 }
 
-Pg6WinHttpStatusCallback pg6_win32_winhttp_set_status_callback(Pg6HInternet handle,
-                                                               Pg6WinHttpStatusCallback,
-                                                               uint32_t,
-                                                               uint64_t) {
+uint64_t pg6_win32_winhttp_set_status_callback(Pg6HInternet handle,
+                                               uint64_t,
+                                               uint32_t,
+                                               uint64_t) {
     if (off::winhttp_configure("WinHttpSetStatusCallback", handle, false) == 0) {
-        // WINHTTP_INVALID_STATUS_CALLBACK.
-        return reinterpret_cast<Pg6WinHttpStatusCallback>(~uintptr_t{0});
+        return ~uint64_t{0};  // WINHTTP_INVALID_STATUS_CALLBACK
     }
     // The callback is never stored: no request ever reaches a state that would notify it.
-    return nullptr;
+    return 0;
+}
+
+int32_t pg6_win32_winhttp_add_request_headers(Pg6HInternet request,
+                                              const char16_t* headers,
+                                              uint32_t headers_length,
+                                              uint32_t) {
+    off::hit("WinHttpAddRequestHeaders");
+    if (!off::handles().lookup(request, off::HandleKind::WinHttpRequest)) {
+        win32::SetLastError(win32::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if (headers == nullptr && headers_length != 0) {
+        win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    win32::SetLastError(win32::ERROR_SUCCESS);  // headers of a request that is never sent
+    return 1;
+}
+
+int32_t pg6_win32_winhttp_write_data(Pg6HInternet request,
+                                     const void*,
+                                     uint32_t,
+                                     uint32_t* bytes_written) {
+    if (bytes_written != nullptr) {
+        *bytes_written = 0;
+    }
+    return off::winhttp_fail("WinHttpWriteData",
+                             request,
+                             {off::HandleKind::WinHttpRequest},
+                             off::ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+}
+
+int32_t pg6_win32_winhttp_query_headers(Pg6HInternet request,
+                                        uint32_t,
+                                        const char16_t*,
+                                        void*,
+                                        uint32_t*,
+                                        uint32_t*) {
+    return off::winhttp_fail("WinHttpQueryHeaders",
+                             request,
+                             {off::HandleKind::WinHttpRequest},
+                             off::ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+}
+
+int32_t pg6_win32_winhttp_crack_url(const char16_t* url,
+                                    uint32_t url_length,
+                                    uint32_t,
+                                    Pg6UrlComponentsW* components) {
+    off::hit("WinHttpCrackUrl");
+    if (url == nullptr || components == nullptr ||
+        components->struct_size != sizeof(Pg6UrlComponentsW)) {
+        win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    size_t total = url_length;
+    if (total == 0) {
+        while (url[total] != 0) {
+            ++total;
+        }
+    }
+    // scheme "://" authority [path] [?query|#fragment]
+    size_t scheme_end = 0;
+    while (scheme_end < total && url[scheme_end] != u':') {
+        ++scheme_end;
+    }
+    if (scheme_end == 0 || scheme_end + 2 >= total || url[scheme_end + 1] != u'/' ||
+        url[scheme_end + 2] != u'/') {
+        win32::SetLastError(off::ERROR_WINHTTP_INVALID_URL);
+        return 0;
+    }
+    int32_t scheme_id = 0;
+    if (off::ascii_ieq(url, scheme_end, "http")) {
+        scheme_id = off::INTERNET_SCHEME_HTTP;
+    } else if (off::ascii_ieq(url, scheme_end, "https")) {
+        scheme_id = off::INTERNET_SCHEME_HTTPS;
+    } else {
+        win32::SetLastError(off::ERROR_WINHTTP_UNRECOGNIZED_SCHEME);
+        return 0;
+    }
+    const size_t auth_begin = scheme_end + 3;
+    size_t auth_end = auth_begin;
+    while (auth_end < total && url[auth_end] != u'/' && url[auth_end] != u'?' &&
+           url[auth_end] != u'#') {
+        ++auth_end;
+    }
+    size_t path_end = auth_end;
+    while (path_end < total && url[path_end] != u'?' && url[path_end] != u'#') {
+        ++path_end;
+    }
+
+    size_t host_begin = auth_begin;
+    size_t user_end = auth_begin;
+    size_t pass_begin = auth_begin;
+    size_t pass_end = auth_begin;
+    size_t at = auth_end;
+    for (size_t i = auth_begin; i < auth_end; ++i) {
+        if (url[i] == u'@') {
+            at = i;  // the last '@' separates user info from the host
+        }
+    }
+    if (at != auth_end) {
+        size_t colon = at;
+        for (size_t i = auth_begin; i < at; ++i) {
+            if (url[i] == u':') {
+                colon = i;
+                break;
+            }
+        }
+        user_end = colon;
+        pass_begin = colon < at ? colon + 1 : at;
+        pass_end = at;
+        host_begin = at + 1;
+    }
+    size_t host_end = auth_end;
+    uint32_t port = scheme_id == off::INTERNET_SCHEME_HTTPS ? 443u : 80u;
+    {
+        size_t colon = host_end;
+        for (size_t i = host_begin; i < auth_end; ++i) {
+            if (url[i] == u']') {
+                colon = auth_end;  // ports follow the closing bracket of an IPv6 literal
+                for (size_t j = i + 1; j < auth_end; ++j) {
+                    if (url[j] == u':') {
+                        colon = j;
+                        break;
+                    }
+                }
+                break;
+            }
+            if (url[i] == u':') {
+                colon = i;
+                break;
+            }
+        }
+        if (colon < auth_end) {
+            uint32_t value = 0;
+            if (colon + 1 == auth_end) {
+                win32::SetLastError(off::ERROR_WINHTTP_INVALID_URL);
+                return 0;
+            }
+            for (size_t i = colon + 1; i < auth_end; ++i) {
+                if (url[i] < u'0' || url[i] > u'9' || (value = value * 10 + (url[i] - u'0')) > 65535) {
+                    win32::SetLastError(off::ERROR_WINHTTP_INVALID_URL);
+                    return 0;
+                }
+            }
+            port = value;
+            host_end = colon;
+        }
+    }
+    if (host_end == host_begin) {
+        win32::SetLastError(off::ERROR_WINHTTP_INVALID_URL);
+        return 0;
+    }
+
+    components->scheme_id = scheme_id;
+    components->port = static_cast<uint16_t>(port);
+    bool insufficient = false;
+    off::crack_component(url, scheme_end, &components->scheme, &components->scheme_length,
+                         &insufficient);
+    off::crack_component(url + host_begin, host_end - host_begin, &components->host_name,
+                         &components->host_name_length, &insufficient);
+    off::crack_component(url + auth_begin, user_end - auth_begin, &components->user_name,
+                         &components->user_name_length, &insufficient);
+    off::crack_component(url + pass_begin, pass_end - pass_begin, &components->password,
+                         &components->password_length, &insufficient);
+    off::crack_component(url + auth_end, path_end - auth_end, &components->url_path,
+                         &components->url_path_length, &insufficient);
+    off::crack_component(url + path_end, total - path_end, &components->extra_info,
+                         &components->extra_info_length, &insufficient);
+    if (insufficient) {
+        win32::SetLastError(122u);  // ERROR_INSUFFICIENT_BUFFER; required sizes are in the struct
+        return 0;
+    }
+    win32::SetLastError(win32::ERROR_SUCCESS);
+    return 1;
 }
 
 int32_t pg6_win32_winhttp_set_option(Pg6HInternet handle, uint32_t, const void*, uint32_t) {

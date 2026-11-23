@@ -228,9 +228,8 @@ void test_winhttp() {
         pg6_win32_winhttp_open_request(connection, u"GET", u"/", nullptr, nullptr, nullptr, 0);
     CHECK(request != 0 && request != connection);
 
-    CHECK(pg6_win32_winhttp_set_status_callback(request, nullptr, 0xFFFFFFFFu, 0) == nullptr);
-    CHECK(reinterpret_cast<uintptr_t>(
-              pg6_win32_winhttp_set_status_callback(0x1234, nullptr, 0, 0)) == ~uintptr_t{0});
+    CHECK(pg6_win32_winhttp_set_status_callback(request, 0, 0xFFFFFFFFu, 0) == 0);
+    CHECK(pg6_win32_winhttp_set_status_callback(0x1234, 0, 0, 0) == ~uint64_t{0});
     CHECK(pg6_win32_winhttp_set_option(0, 1, nullptr, 0) == 1);
     CHECK(pg6_win32_winhttp_set_option(request, 1, nullptr, 0) == 1);
     CHECK(pg6_win32_winhttp_set_timeouts(session, 1, 1, 1, 1) == 1);
@@ -781,6 +780,115 @@ void test_hit_counters() {
     CHECK(dropped_telemetry_event_count() == 0);
 }
 
+// O15: the remaining winhttp calls.
+void test_winhttp_extras() {
+    reset_offline_diagnostics();
+    const Pg6HInternet session = pg6_win32_winhttp_open(u"agent", 0, nullptr, nullptr, 0);
+    const Pg6HInternet connection = pg6_win32_winhttp_connect(session, u"example.com", 443, 0);
+    const Pg6HInternet request =
+        pg6_win32_winhttp_open_request(connection, u"POST", u"/", nullptr, nullptr, nullptr, 0);
+    CHECK(request != 0);
+
+    // WinHttpAddRequestHeaders.
+    CHECK(pg6_win32_winhttp_add_request_headers(request, u"X-A: b\r\n", 0xFFFFFFFFu, 0) == 1);
+    CHECK(pg6_win32_winhttp_add_request_headers(request, nullptr, 5, 0) == 0);
+    CHECK(win32::GetLastError() == win32::ERROR_INVALID_PARAMETER);
+    CHECK(pg6_win32_winhttp_add_request_headers(session, u"X: y", 4, 0) == 0);
+    CHECK(win32::GetLastError() == win32::ERROR_INVALID_HANDLE);
+    CHECK(pg6_win32_winhttp_add_request_headers(0x1234, u"X: y", 4, 0) == 0);
+    CHECK(win32::GetLastError() == win32::ERROR_INVALID_HANDLE);
+
+    // WinHttpWriteData / WinHttpQueryHeaders: the request was never sent.
+    uint32_t written = 77;
+    CHECK(pg6_win32_winhttp_write_data(request, "abc", 3, &written) == 0);
+    CHECK(written == 0);
+    CHECK(win32::GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+    CHECK(pg6_win32_winhttp_write_data(0x1234, "abc", 3, nullptr) == 0);
+    CHECK(win32::GetLastError() == win32::ERROR_INVALID_HANDLE);
+    uint32_t length = 8;
+    CHECK(pg6_win32_winhttp_query_headers(request, 19, nullptr, nullptr, &length, nullptr) == 0);
+    CHECK(win32::GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_STATE);
+    CHECK(pg6_win32_winhttp_query_headers(0x1234, 19, nullptr, nullptr, &length, nullptr) == 0);
+    CHECK(win32::GetLastError() == win32::ERROR_INVALID_HANDLE);
+
+    pg6_win32_winhttp_close_handle(request);
+    pg6_win32_winhttp_close_handle(connection);
+    pg6_win32_winhttp_close_handle(session);
+
+    // WinHttpCrackUrl: components with caller buffers.
+    {
+        char16_t scheme[16], host[64], user[16], pass[16], path[64], extra[64];
+        Pg6UrlComponentsW c{};
+        c.struct_size = sizeof(c);
+        c.scheme = scheme;
+        c.scheme_length = 16;
+        c.host_name = host;
+        c.host_name_length = 64;
+        c.user_name = user;
+        c.user_name_length = 16;
+        c.password = pass;
+        c.password_length = 16;
+        c.url_path = path;
+        c.url_path_length = 64;
+        c.extra_info = extra;
+        c.extra_info_length = 64;
+        const char16_t* url = u"https://bob:secret@Example.com:8443/a/b.txt?x=1#frag";
+        CHECK(pg6_win32_winhttp_crack_url(url, 0, 0, &c) == 1);
+        CHECK(std::u16string(scheme) == u"https" && c.scheme_length == 5);
+        CHECK(c.scheme_id == INTERNET_SCHEME_HTTPS);
+        CHECK(std::u16string(host) == u"Example.com" && c.host_name_length == 11);
+        CHECK(c.port == 8443);
+        CHECK(std::u16string(user) == u"bob");
+        CHECK(std::u16string(pass) == u"secret");
+        CHECK(std::u16string(path) == u"/a/b.txt" && c.url_path_length == 8);
+        CHECK(std::u16string(extra) == u"?x=1#frag");
+    }
+    // Pointer mode (NULL pointer, non-zero length) points into the URL; default ports.
+    {
+        const char16_t* url = u"http://host.example/p";
+        Pg6UrlComponentsW c{};
+        c.struct_size = sizeof(c);
+        c.host_name_length = 1;
+        c.url_path_length = 1;
+        c.extra_info_length = 1;
+        CHECK(pg6_win32_winhttp_crack_url(url, 21, 0, &c) == 1);
+        CHECK(c.scheme_id == INTERNET_SCHEME_HTTP && c.port == 80);
+        CHECK(c.host_name == url + 7 && c.host_name_length == 12);
+        CHECK(c.url_path == url + 19 && c.url_path_length == 2);
+        CHECK(c.extra_info_length == 0);
+    }
+    // Buffer too small: required size (with NUL) is reported.
+    {
+        char16_t host[4];
+        Pg6UrlComponentsW c{};
+        c.struct_size = sizeof(c);
+        c.host_name = host;
+        c.host_name_length = 4;
+        CHECK(pg6_win32_winhttp_crack_url(u"http://example.com/", 0, 0, &c) == 0);
+        CHECK(win32::GetLastError() == 122u);
+        CHECK(c.host_name_length == 12);
+    }
+    // Errors.
+    {
+        Pg6UrlComponentsW c{};
+        c.struct_size = sizeof(c);
+        CHECK(pg6_win32_winhttp_crack_url(u"ftp://example.com/", 0, 0, &c) == 0);
+        CHECK(win32::GetLastError() == ERROR_WINHTTP_UNRECOGNIZED_SCHEME);
+        CHECK(pg6_win32_winhttp_crack_url(u"not a url", 0, 0, &c) == 0);
+        CHECK(win32::GetLastError() == ERROR_WINHTTP_INVALID_URL);
+        CHECK(pg6_win32_winhttp_crack_url(u"http:///path", 0, 0, &c) == 0);
+        CHECK(win32::GetLastError() == ERROR_WINHTTP_INVALID_URL);
+        CHECK(pg6_win32_winhttp_crack_url(u"http://h:99999/", 0, 0, &c) == 0);
+        CHECK(win32::GetLastError() == ERROR_WINHTTP_INVALID_URL);
+        CHECK(pg6_win32_winhttp_crack_url(nullptr, 0, 0, &c) == 0);
+        CHECK(win32::GetLastError() == win32::ERROR_INVALID_PARAMETER);
+        CHECK(pg6_win32_winhttp_crack_url(u"http://h/", 0, 0, nullptr) == 0);
+        Pg6UrlComponentsW bad{};
+        CHECK(pg6_win32_winhttp_crack_url(u"http://h/", 0, 0, &bad) == 0);  // struct_size == 0
+        CHECK(win32::GetLastError() == win32::ERROR_INVALID_PARAMETER);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -795,6 +903,7 @@ int main() {
     test_xstore(user);
     test_xuser_live(user);
     test_telemetry();
+    test_winhttp_extras();
     test_hit_counters();
 
     pg6_gdk_xuser_close_handle(user);

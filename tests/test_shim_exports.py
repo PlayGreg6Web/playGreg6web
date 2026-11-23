@@ -34,6 +34,9 @@ MODULE_PREFIX = {
     "ADVAPI32.dll": "pg6_win32_",
     "WS2_32.dll": "pg6_win32_",
     "WINHTTP.dll": "pg6_win32_",
+    "bcrypt.dll": "pg6_win32_",
+    "USER32.dll": "pg6_win32_",
+    "combase.dll": "pg6_win32_",
     "xgameruntime.dll": "pg6_gdk_",
 }
 XBL_PREFIX = ("microsoft.xbox.services", "pg6_gdk_")

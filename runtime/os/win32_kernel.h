@@ -134,6 +134,13 @@ Handle insert_dispatcher_object(std::shared_ptr<DispatcherObject> object);
 // Returns nullptr for invalid handles and for non-dispatcher handles (e.g. files).
 std::shared_ptr<DispatcherObject> lookup_dispatcher_object(Handle handle);
 
+// Handle-table seam for os/win32_compat (O15): opaque, tagged payload objects (find handles,
+// registry keys). lookup/remove return nullptr when the handle is invalid or carries another tag.
+// CloseHandle also releases them.
+Handle insert_opaque_object(uint32_t tag, std::shared_ptr<void> payload);
+std::shared_ptr<void> lookup_opaque_object(Handle handle, uint32_t tag);
+std::shared_ptr<void> remove_opaque_object(Handle handle, uint32_t tag);
+
 // In-memory /userdata overlay helpers for writeable saves and tests.
 void clear_userdata_overlay();
 bool userdata_file_exists(std::string_view path);
@@ -141,6 +148,50 @@ bool read_userdata_file(std::string_view path, std::vector<uint8_t>& out);
 void write_userdata_file(std::string_view path, std::vector<uint8_t> data);
 
 // Path conversion and normalization helpers.
+// Virtual filesystem seam for os/win32_compat (O15): the /userdata overlay as a small tree of
+// files and directories with FILETIME timestamps (100 ns ticks since 1601). Keys are the
+// normalized "/userdata/..." form produced by normalize_path(). Every function returns a Win32
+// error code (ERROR_SUCCESS on success) and is thread-safe. Directories exist explicitly (created
+// here) or implicitly (a file lives below them); "/userdata" itself always exists.
+struct UserdataEntry {
+    std::string name;  // last path component (empty for stat results)
+    bool is_directory = false;
+    uint64_t size = 0;
+    uint64_t created = 0;
+    uint64_t accessed = 0;
+    uint64_t written = 0;
+    uint32_t attributes = 0;  // settable FILE_ATTRIBUTE_* bits stored by userdata_set_attributes
+};
+
+uint32_t userdata_stat(std::string_view key, UserdataEntry* out);
+uint32_t userdata_create_directory(std::string_view key);
+uint32_t userdata_remove_directory(std::string_view key);
+uint32_t userdata_delete_file(std::string_view key);
+uint32_t userdata_list_directory(std::string_view key, std::vector<UserdataEntry>* out);
+uint32_t userdata_rename(std::string_view from, std::string_view to, bool replace_existing);
+// Null time pointers are left unchanged.
+uint32_t userdata_set_times(std::string_view key,
+                            const uint64_t* created,
+                            const uint64_t* accessed,
+                            const uint64_t* written);
+// Stored attribute bits: a non-zero value is returned verbatim (0x80 = NORMAL, none set); 0 means
+// the entry was never given explicit attributes.
+uint32_t userdata_set_attributes(std::string_view key, uint32_t attributes);
+// Sum of all file sizes in the overlay.
+uint64_t userdata_total_bytes();
+
+// File handles created by CreateFile*. Returns false (ERROR_INVALID_HANDLE) for other handles.
+// userdata_key stays empty for read-only game-data (HTTPFS) files.
+struct FileHandleInfo {
+    bool is_userdata = false;
+    uint32_t desired_access = 0;
+    uint64_t cursor = 0;
+    std::string userdata_key;
+};
+bool query_file_handle(Handle handle, FileHandleInfo* out);
+// SetEndOfFile: truncates or zero-extends the userdata file to the handle's cursor.
+bool set_end_of_file_at_cursor(Handle handle);
+
 std::string utf16_to_utf8(const char16_t* src);
 std::string normalize_path(std::string_view raw_path, bool* is_userdata = nullptr);
 

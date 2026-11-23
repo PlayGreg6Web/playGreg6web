@@ -27,7 +27,7 @@
 //!
 //! | DLL | Shim prefix |
 //! | :--- | :--- |
-//! | `kernel32`, `kernelbase`, `advapi32`, `ws2_32`, `winhttp`, API sets `api-ms-win-*` / `ext-ms-win-*` | `pg6_win32_` |
+//! | `kernel32`, `kernelbase`, `advapi32`, `ws2_32`, `winhttp`, `bcrypt`, `user32`, `combase`, `ole32`, API sets `api-ms-win-*` / `ext-ms-win-*` | `pg6_win32_` |
 //! | `xgameruntime`, Xbox Live (`microsoft.xbox.services*`) | `pg6_gdk_` |
 //! | `d3d12`, `d3d12_x`, `d3d12_xs` | `pg6_d3d12_` |
 //!
@@ -1001,7 +1001,8 @@ fn dll_key(dll: &str) -> String {
 /// Shim family prefix for an imported DLL, or `None` when the runtime has no family for it.
 pub fn shim_prefix_for_dll(dll: &str) -> Option<&'static str> {
     match dll_key(dll).as_str() {
-        "kernel32" | "kernelbase" | "advapi32" | "ws2_32" | "winhttp" => Some(PREFIX_WIN32),
+        "kernel32" | "kernelbase" | "advapi32" | "ws2_32" | "winhttp" | "bcrypt" | "user32"
+        | "combase" | "ole32" => Some(PREFIX_WIN32),
         "xgameruntime" => Some(PREFIX_GDK),
         "d3d12" | "d3d12_x" | "d3d12_xs" => Some(PREFIX_D3D12),
         s if s.starts_with("api-ms-win-") || s.starts_with("ext-ms-win-") => Some(PREFIX_WIN32),
@@ -2177,6 +2178,10 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             "WS2_32.dll",
             "WINHTTP.dll",
             "ADVAPI32.dll",
+            "bcrypt.dll",
+            "USER32.dll",
+            "combase.dll",
+            "ole32.dll",
         ] {
             assert_eq!(shim_prefix_for_dll(dll), Some("pg6_win32_"), "{dll}");
         }
@@ -2187,7 +2192,7 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
         );
         assert_eq!(shim_prefix_for_dll("d3d12_xs.dll"), Some("pg6_d3d12_"));
         assert_eq!(shim_prefix_for_dll("D3D12_X.DLL"), Some("pg6_d3d12_"));
-        assert_eq!(shim_prefix_for_dll("user32.dll"), None);
+        assert_eq!(shim_prefix_for_dll("gdi32.dll"), None);
         assert_eq!(shim_prefix_for_dll("kernel32.dll.bak"), None);
 
         assert_eq!(name_key("CreateFileW"), name_key("create_file_w"));
