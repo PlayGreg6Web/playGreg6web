@@ -25,3 +25,29 @@ Written into a `SharedArrayBuffer` by `web/input/input_bridge.js` (`Int32Array` 
 - `8..12`: `mouse_dx` (`i32`)
 - `12..16`: `mouse_dy` (`i32`)
 - `16..40`: `left_stick_x/y`, `right_stick_x/y`, `left_trigger`, `right_trigger` (`6 × f32`)
+
+## Recompiled Guest Code (`GuestState`, 416 bytes)
+Lifted x86-64 functions (`recomp/src/lift`) run on a guest CPU state matching `playgta6::GuestState` (little endian, one per guest thread):
+
+| Offset | Size | Field |
+| :--- | :--- | :--- |
+| `0` | `16 × 8` | `gpr[16]`: `rax rcx rdx rbx rsp rbp rsi rdi r8..r15` (x86 encoding order) |
+| `128` | `8` | `rip` (reserved for the runtime; lifted code does not maintain it) |
+| `136` | `8 × 1` | `flags`: `CF PF AF ZF SF OF DF pad`, each `0` or `1` |
+| `144` | `8` | `fs_base` |
+| `152` | `8` | `gs_base` (TEB on Win64) |
+| `160` | `16 × 16` | `xmm0..xmm15` (low qword first) |
+
+Calling convention:
+- Every lifted function is `void sub_<VA-hex>(GuestState* state)` (`LiftedFn`); arguments and results travel in the state per the Win64 ABI (`rcx rdx r8 r9` / `xmm0..3`, fifth argument at `rsp + 40` on entry, result in `rax` / `xmm0`).
+- The guest stack lives in guest memory and is addressed through `rsp`. A direct `call T` pushes the return address and calls `sub_T(state)`; `ret [imm16]` pops it (unchecked) and returns, so host and guest call stacks stay in lockstep.
+- Lifted code maps guest virtual addresses 1:1 onto wasm64 linear memory (`fs:`/`gs:` operands add `fs_base`/`gs_base`).
+
+Runtime helpers (C linkage, defined by the runtime, all take the state pointer first):
+
+| Function | Signature | Contract |
+| :--- | :--- | :--- |
+| `__playgta6_indirect_call` | `(state: ptr, target: i64) -> ()` | Run the guest code at `target` as if called (return address already pushed); returns when it executes `ret`. Used for indirect `call`/`jmp`, IAT calls and unresolved switch targets. |
+| `__playgta6_trap` | `(state: ptr, va: i64) -> !` | Trap instruction, invalid/unmapped code, or code after an assumed non-returning call at `va`. |
+| `__playgta6_unimplemented` | `(state: ptr, va: i64) -> !` | The instruction at `va` could not be lifted. |
+| `__playgta6_divide_error` | `(state: ptr, va: i64) -> !` | `#DE` from `div`/`idiv` at `va`. |

@@ -1,9 +1,11 @@
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -779,7 +781,49 @@ void test_d3d12_xs_compute_and_textured_indexed_draw() {
 
 }  // namespace
 
+void test_guest_state_layout() {
+    using namespace playgta6;
+
+    // Pinned to the lifter's `%playgta6.GuestState` (recomp/src/lift STATE_* constants).
+    CHECK(sizeof(GuestState) == 416);
+    CHECK(offsetof(GuestState, gpr) == 0);
+    CHECK(offsetof(GuestState, rip) == 128);
+    CHECK(offsetof(GuestState, flags) == 136);
+    CHECK(offsetof(GuestState, fs_base) == 144);
+    CHECK(offsetof(GuestState, gs_base) == 152);
+    CHECK(offsetof(GuestState, xmm) == 160);
+    CHECK(kGuestStateXmmStride == 16);
+    CHECK(kGuestStackArgOffset == 40);
+    CHECK(GuestReg::Rsp == 4 && GuestReg::R8 == 8 && GuestReg::R15 == 15);
+    CHECK(GuestFlag::CF == 0 && GuestFlag::OF == 5 && GuestFlag::DF == 6);
+
+    // Byte-level view: registers and xmm lanes are little endian at the documented offsets.
+    GuestState state{};
+    state.gpr[GuestReg::Rcx] = 0x1122334455667788ULL;
+    state.flags[GuestFlag::ZF] = 1;
+    state.gs_base = 0xAABBCCDDEEFF0011ULL;
+    state.xmm[3][0] = 0x0102030405060708ULL;
+    state.xmm[3][1] = 0x090A0B0C0D0E0F10ULL;
+    uint8_t raw[sizeof(GuestState)];
+    std::memcpy(raw, &state, sizeof(raw));
+    CHECK(raw[8] == 0x88 && raw[15] == 0x11);
+    CHECK(raw[kGuestStateFlagsOffset + GuestFlag::ZF] == 1);
+    CHECK(raw[kGuestStateGsBaseOffset] == 0x11 && raw[kGuestStateGsBaseOffset + 7] == 0xAA);
+    CHECK(raw[kGuestStateXmmOffset + 3 * kGuestStateXmmStride] == 0x08);
+    CHECK(raw[kGuestStateXmmOffset + 3 * kGuestStateXmmStride + 8] == 0x10);
+    CHECK(raw[kGuestStateXmmOffset + 3 * kGuestStateXmmStride + 15] == 0x09);
+
+    // Lifted-function type and helper signatures (`(ptr, i64)` on wasm64).
+    using HelperFn = void (*)(GuestState*, uint64_t);
+    static_assert(std::is_same_v<LiftedFn, void (*)(GuestState*)>);
+    static_assert(std::is_same_v<decltype(&__playgta6_indirect_call), HelperFn>);
+    static_assert(std::is_same_v<decltype(&__playgta6_trap), HelperFn>);
+    static_assert(std::is_same_v<decltype(&__playgta6_unimplemented), HelperFn>);
+    static_assert(std::is_same_v<decltype(&__playgta6_divide_error), HelperFn>);
+}
+
 int main() {
+    test_guest_state_layout();
     test_legacy_frame_packets();
     test_full_command_encoder_packets();
     test_d3d12_xs_shim_flow();

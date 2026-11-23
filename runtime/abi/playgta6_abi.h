@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace playgta6 {
@@ -298,4 +299,87 @@ struct GpuDispatchComputePayload {
 };
 static_assert(sizeof(GpuDispatchComputePayload) == 12, "GpuDispatchComputePayload layout must stay 12 bytes");
 
+// Guest x86-64 CPU state of recompiled code (recomp/src/lift, `%playgta6.GuestState`).
+// 416 bytes, little endian, one per guest thread. Every lifted function is
+// `void sub_<VA>(GuestState* state)`; see docs/wasm_abi.md for the calling convention.
+// The offsets below are checked against the lifter's STATE_* constants by
+// recomp/tests/guest_state_abi.rs. New fields are appended after `xmm` (bump kGuestStateSize).
+struct GuestState {
+    uint64_t gpr[16];     // rax rcx rdx rbx rsp rbp rsi rdi r8..r15 (x86 encoding order)
+    uint64_t rip;         // reserved for the runtime; lifted code does not maintain it
+    uint8_t flags[8];     // CF PF AF ZF SF OF DF pad, one byte each, always 0 or 1
+    uint64_t fs_base;     // `fs` segment base
+    uint64_t gs_base;     // `gs` segment base (TEB on Win64)
+    uint64_t xmm[16][2];  // xmm0..xmm15, low qword first
+};
+
+inline constexpr uint64_t kGuestStateGprOffset = 0;
+inline constexpr uint64_t kGuestStateRipOffset = 128;
+inline constexpr uint64_t kGuestStateFlagsOffset = 136;
+inline constexpr uint64_t kGuestStateFsBaseOffset = 144;
+inline constexpr uint64_t kGuestStateGsBaseOffset = 152;
+inline constexpr uint64_t kGuestStateXmmOffset = 160;
+inline constexpr uint64_t kGuestStateXmmStride = 16;
+inline constexpr uint64_t kGuestStateSize = 416;
+// Fifth Win64 argument relative to `rsp` at callee entry: return address + 32-byte shadow space.
+inline constexpr uint64_t kGuestStackArgOffset = 40;
+
+static_assert(sizeof(GuestState) == kGuestStateSize, "GuestState layout must stay 416 bytes");
+static_assert(alignof(GuestState) == 8, "GuestState must stay 8-byte aligned");
+static_assert(offsetof(GuestState, gpr) == kGuestStateGprOffset, "GuestState::gpr offset");
+static_assert(offsetof(GuestState, rip) == kGuestStateRipOffset, "GuestState::rip offset");
+static_assert(offsetof(GuestState, flags) == kGuestStateFlagsOffset, "GuestState::flags offset");
+static_assert(offsetof(GuestState, fs_base) == kGuestStateFsBaseOffset, "GuestState::fs_base offset");
+static_assert(offsetof(GuestState, gs_base) == kGuestStateGsBaseOffset, "GuestState::gs_base offset");
+static_assert(offsetof(GuestState, xmm) == kGuestStateXmmOffset, "GuestState::xmm offset");
+static_assert(sizeof(GuestState::xmm) == 16 * kGuestStateXmmStride, "GuestState::xmm stride");
+
+// Indices into GuestState::gpr (x86 register encoding).
+namespace GuestReg {
+inline constexpr uint32_t Rax = 0;
+inline constexpr uint32_t Rcx = 1;
+inline constexpr uint32_t Rdx = 2;
+inline constexpr uint32_t Rbx = 3;
+inline constexpr uint32_t Rsp = 4;
+inline constexpr uint32_t Rbp = 5;
+inline constexpr uint32_t Rsi = 6;
+inline constexpr uint32_t Rdi = 7;
+inline constexpr uint32_t R8 = 8;
+inline constexpr uint32_t R9 = 9;
+inline constexpr uint32_t R10 = 10;
+inline constexpr uint32_t R11 = 11;
+inline constexpr uint32_t R12 = 12;
+inline constexpr uint32_t R13 = 13;
+inline constexpr uint32_t R14 = 14;
+inline constexpr uint32_t R15 = 15;
+}  // namespace GuestReg
+
+// Indices into GuestState::flags.
+namespace GuestFlag {
+inline constexpr uint32_t CF = 0;
+inline constexpr uint32_t PF = 1;
+inline constexpr uint32_t AF = 2;
+inline constexpr uint32_t ZF = 3;
+inline constexpr uint32_t SF = 4;
+inline constexpr uint32_t OF = 5;
+inline constexpr uint32_t DF = 6;
+}  // namespace GuestFlag
+
+// A lifted guest function (`sub_<VA>`).
+using LiftedFn = void (*)(GuestState* state);
+
 }  // namespace playgta6
+
+// Runtime helpers called by lifted code (implemented by the runtime, not by JS).
+extern "C" {
+// Run the guest code at `target` as if called; the caller already pushed the return address.
+// Returns when that code executes its `ret`.
+void __playgta6_indirect_call(playgta6::GuestState* state, uint64_t target);
+// Guest trap (int3/ud2/__fastfail/hlt), invalid or unmapped code, or a call that was assumed
+// never to return, at guest address `va`.
+[[noreturn]] void __playgta6_trap(playgta6::GuestState* state, uint64_t va);
+// The instruction at `va` could not be lifted.
+[[noreturn]] void __playgta6_unimplemented(playgta6::GuestState* state, uint64_t va);
+// x86 divide error (#DE) raised by div/idiv at `va`.
+[[noreturn]] void __playgta6_divide_error(playgta6::GuestState* state, uint64_t va);
+}  // extern "C"
