@@ -49,6 +49,14 @@
 //! structs passed or returned by value, unknown types and host function-pointer parameters
 //! (guest callbacks would need a reverse guest trampoline).
 //!
+//! # Guest-state thunks
+//! The runtime can implement an import completely in C++ as `extern "C" void
+//! pg6_gthunk_<name>(void* state)` (`runtime/guest/guest_callbacks.h`: imports that take guest
+//! callbacks, such as `CreateThread`, `qsort` or `_initterm`). For an import of a DLL with a
+//! shim family whose name key matches such a guest-state thunk, the thunk takes precedence over
+//! the family's shim: the generated `pg6_import_<n>` just forwards the guest state to it (it
+//! marshals its own arguments and pops the return address itself).
+//!
 //! # Unresolved imports
 //! Every unresolved import still gets a thunk. On its first call it logs
 //! `unresolved import DLL!symbol (slot 0x...)` plus the reason once through `pg6_seam_log`
@@ -109,6 +117,8 @@ const PREFIX_WIN32: &str = "pg6_win32_";
 const PREFIX_GDK: &str = "pg6_gdk_";
 const PREFIX_D3D12: &str = "pg6_d3d12_";
 const SHIM_FAMILIES: [&str; 3] = [PREFIX_WIN32, PREFIX_GDK, PREFIX_D3D12];
+/// Runtime-written import thunks taking the guest state (`void pg6_gthunk_<name>(void* state)`).
+const PREFIX_GTHUNK: &str = "pg6_gthunk_";
 
 /// Alias resolution depth limit (guards against `using A = B; using B = A;`).
 const MAX_ALIAS_DEPTH: u8 = 16;
@@ -1141,6 +1151,8 @@ impl BridgePlan {
 /// Shim lookup keyed by `(family prefix, name key)`.
 struct ShimIndex<'a> {
     by_key: BTreeMap<(&'static str, String), Vec<&'a ShimDecl>>,
+    /// Guest-state thunks by name key (only `void (void*)` declarations).
+    gthunks: BTreeMap<String, &'a ShimDecl>,
 }
 
 impl<'a> ShimIndex<'a> {
@@ -1154,7 +1166,12 @@ impl<'a> ShimIndex<'a> {
                     .push(shim);
             }
         }
-        Self { by_key }
+        let gthunks = catalogue
+            .family(PREFIX_GTHUNK)
+            .filter(|s| is_guest_state_thunk(s))
+            .map(|s| (name_key(&s.name[PREFIX_GTHUNK.len()..]), s))
+            .collect();
+        Self { by_key, gthunks }
     }
 
     fn resolve(&self, dll: &str, symbol: &ImportedSymbol) -> Resolution {
@@ -1167,6 +1184,11 @@ impl<'a> ShimIndex<'a> {
                 return Resolution::Unresolved(Unresolved::ByOrdinal);
             }
         };
+        if let Some(gthunk) = self.gthunks.get(&name_key(name)) {
+            return Resolution::Bound {
+                shim: gthunk.name.clone(),
+            };
+        }
         match self
             .by_key
             .get(&(prefix, name_key(name)))
@@ -1187,6 +1209,15 @@ impl<'a> ShimIndex<'a> {
             }),
         }
     }
+}
+
+/// `void pg6_gthunk_<name>(void* state)`: a complete import thunk written by the runtime.
+fn is_guest_state_thunk(decl: &ShimDecl) -> bool {
+    decl.name.starts_with(PREFIX_GTHUNK)
+        && !decl.variadic
+        && decl.ret.kind == TypeKind::Void
+        && decl.params.len() == 1
+        && decl.params[0].kind == TypeKind::Ptr
 }
 
 /// Resolve every import and delay-load import of `pe` against `catalogue`.
@@ -1526,6 +1557,12 @@ fn arg_expr(i: usize, ty: &CType) -> String {
 
 fn render_bound_thunk(out: &mut String, import: &ImportBinding, shim: &ShimDecl) {
     let _ = writeln!(out, "void {}(void* state) {{", import.thunk_name());
+    if is_guest_state_thunk(shim) {
+        // Marshals its own arguments and pops the return address itself.
+        let _ = writeln!(out, "    {}(state);", shim.name);
+        let _ = writeln!(out, "}}");
+        return;
+    }
     if shim.params.len() > ARG_GPRS.len() {
         let _ = writeln!(
             out,
@@ -2328,6 +2365,53 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             "KERNEL32.dll and KERNEL32 merge: {coverage:?}"
         );
         assert_eq!(coverage.len(), 5, "{coverage:?}");
+    }
+
+    #[test]
+    fn guest_state_thunks_take_precedence_over_shims() {
+        let mut headers = mini_headers();
+        headers.push(ShimHeader {
+            include: "guest/cb.h".to_string(),
+            text: "extern \"C\" {\n\
+                   void pg6_gthunk_xtask_queue_submit_callback(void* state);\n\
+                   void pg6_gthunk_with_callback(void* state);\n\
+                   int pg6_gthunk_sleep(void* state);\n\
+                   void pg6_gthunk_not_imported(void* state);\n\
+                   }\n"
+                .to_string(),
+        });
+        let catalogue = Catalogue::scan(&headers);
+        let plan = plan_bridge(&rich_pe(), &catalogue);
+        let api = "api-ms-win-core-test-l1-1-0.dll";
+        assert_eq!(
+            find(&plan, "XGameRuntime.DLL!XTaskQueueSubmitCallback").bound_shim(),
+            Some("pg6_gthunk_xtask_queue_submit_callback"),
+            "function-pointer shim replaced by the guest-state thunk"
+        );
+        assert_eq!(
+            find(&plan, &format!("{api}!WithCallback")).bound_shim(),
+            Some("pg6_gthunk_with_callback")
+        );
+        assert_eq!(
+            find(&plan, &format!("{api}!Sleep")).bound_shim(),
+            Some("pg6_win32_sleep"),
+            "only `void (void*)` declarations are guest-state thunks"
+        );
+        assert_eq!(plan.bound_count(), 3 + 6 + 1 + 1 + 2);
+
+        let source = render_bridge(&plan, &catalogue).source;
+        let name = find(&plan, "XGameRuntime.DLL!XTaskQueueSubmitCallback").thunk_name();
+        let start = source
+            .find(&format!("void {name}(void* state) {{"))
+            .expect("forwarding thunk");
+        let end = start + source[start..].find("\n}\n").expect("thunk end");
+        assert_eq!(
+            &source[start..end],
+            format!(
+                "void {name}(void* state) {{\n    pg6_gthunk_xtask_queue_submit_callback(state);"
+            )
+        );
+        assert!(source.contains("#include \"guest/cb.h\""));
     }
 
     #[test]

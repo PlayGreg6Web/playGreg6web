@@ -26,6 +26,8 @@ add_library(playgta6_core STATIC
     gpu/descriptor_heap.cpp
     gpu/state_bridge.cpp
     guest/guest_runtime.cpp
+    guest/com_bridge.cpp
+    guest/guest_callbacks.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -123,4 +125,8 @@ else()
     add_executable(test_guest_runtime ../tests/test_guest_runtime.cpp)
     target_link_libraries(test_guest_runtime PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_runtime_tests COMMAND test_guest_runtime)
+
+    add_executable(test_com_bridge ../tests/test_com_bridge.cpp)
+    target_link_libraries(test_com_bridge PRIVATE playgta6_core)
+    add_test(NAME playgta6_com_bridge_tests COMMAND test_com_bridge)
 endif()
