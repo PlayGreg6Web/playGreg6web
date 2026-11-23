@@ -12,6 +12,7 @@ add_library(playgta6_core STATIC
     os/game_input.cpp
     os/httpfs_mailbox.cpp
     os/win32_kernel.cpp
+    os/win32_sync.cpp
     os/xgameruntime.cpp
     os/xbox_offline.cpp
     os/win32_loader.cpp
@@ -79,4 +80,8 @@ else()
     add_executable(test_descriptor_heap ../tests/test_descriptor_heap.cpp)
     target_link_libraries(test_descriptor_heap PRIVATE playgta6_core)
     add_test(NAME descriptor_heap_tests COMMAND test_descriptor_heap)
+
+    add_executable(test_win32_sync ../tests/test_win32_sync.cpp)
+    target_link_libraries(test_win32_sync PRIVATE playgta6_core)
+    add_test(NAME playgta6_win32_sync_tests COMMAND test_win32_sync)
 endif()

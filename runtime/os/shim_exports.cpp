@@ -4,6 +4,7 @@
 #include <string_view>
 
 #include "os/win32_kernel.h"
+#include "os/win32_sync.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
 
@@ -80,6 +81,31 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(K32, "GetSystemTimeAsFileTime", pg6_win32_get_system_time_as_file_time) \
     E(K32, "GetLastError", pg6_win32_get_last_error) \
     E(K32, "SetLastError", pg6_win32_set_last_error) \
+    E(K32, "CreateSemaphoreA", pg6_win32_create_semaphore_a) \
+    E(K32, "CreateSemaphoreW", pg6_win32_create_semaphore_w) \
+    E(K32, "ReleaseSemaphore", pg6_win32_release_semaphore) \
+    E(K32, "CreateMutexA", pg6_win32_create_mutex_a) \
+    E(K32, "CreateMutexW", pg6_win32_create_mutex_w) \
+    E(K32, "ReleaseMutex", pg6_win32_release_mutex) \
+    E(K32, "WaitForSingleObjectEx", pg6_win32_wait_for_single_object_ex) \
+    E(K32, "WaitForMultipleObjects", pg6_win32_wait_for_multiple_objects) \
+    E(K32, "WaitForMultipleObjectsEx", pg6_win32_wait_for_multiple_objects_ex) \
+    E(K32, "InitializeConditionVariable", pg6_win32_initialize_condition_variable) \
+    E(K32, "SleepConditionVariableSRW", pg6_win32_sleep_condition_variable_srw) \
+    E(K32, "SleepConditionVariableCS", pg6_win32_sleep_condition_variable_cs) \
+    E(K32, "WakeConditionVariable", pg6_win32_wake_condition_variable) \
+    E(K32, "WakeAllConditionVariable", pg6_win32_wake_all_condition_variable) \
+    E(K32, "CreateThread", pg6_win32_create_thread) \
+    E(K32, "ResumeThread", pg6_win32_resume_thread) \
+    E(K32, "GetExitCodeThread", pg6_win32_get_exit_code_thread) \
+    E(K32, "GetCurrentThread", pg6_win32_get_current_thread) \
+    E(K32, "GetCurrentThreadId", pg6_win32_get_current_thread_id) \
+    E(K32, "SetThreadAffinityMask", pg6_win32_set_thread_affinity_mask) \
+    E(K32, "CreateThreadpoolWork", pg6_win32_create_threadpool_work) \
+    E(K32, "SubmitThreadpoolWork", pg6_win32_submit_threadpool_work) \
+    E(K32, "WaitForThreadpoolWorkCallbacks", pg6_win32_wait_for_threadpool_work_callbacks) \
+    E(K32, "CloseThreadpoolWork", pg6_win32_close_threadpool_work) \
+    E(K32, "TrySubmitThreadpoolCallback", pg6_win32_try_submit_threadpool_callback) \
     E(XGR, "XGameRuntimeInitialize", pg6_gdk_xgame_runtime_initialize) \
     E(XGR, "XGameRuntimeUninitialize", pg6_gdk_xgame_runtime_uninitialize) \
     E(XGR, "XGameRuntimeIsInitialized", pg6_gdk_xgame_runtime_is_initialized) \

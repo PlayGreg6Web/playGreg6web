@@ -127,6 +127,13 @@ TlsTable* get_tls_table();
 void set_httpfs_client(HttpfsMailboxClient* client);
 HttpfsMailboxClient* get_httpfs_client();
 
+// Handle-table seam for os/win32_sync: waitable dispatcher objects (events, semaphores, mutexes,
+// threads) are implemented there but share this HANDLE namespace and CloseHandle.
+class DispatcherObject;
+Handle insert_dispatcher_object(std::shared_ptr<DispatcherObject> object);
+// Returns nullptr for invalid handles and for non-dispatcher handles (e.g. files).
+std::shared_ptr<DispatcherObject> lookup_dispatcher_object(Handle handle);
+
 // In-memory /userdata overlay helpers for writeable saves and tests.
 void clear_userdata_overlay();
 bool userdata_file_exists(std::string_view path);
@@ -184,6 +191,8 @@ void EnterCriticalSection(CriticalSection* critical_section);
 bool TryEnterCriticalSection(CriticalSection* critical_section);
 void LeaveCriticalSection(CriticalSection* critical_section);
 
+// Events and WaitForSingleObject are implemented in os/win32_sync.cpp on the shared dispatcher,
+// so events can be combined with semaphores, mutexes and threads in WaitForMultipleObjects.
 Handle CreateEventA(void* security_attributes,
                     bool manual_reset,
                     bool initial_state,

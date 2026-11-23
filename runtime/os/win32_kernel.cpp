@@ -47,11 +47,11 @@ UserdataOverlay& userdata_overlay() {
 }
 
 // ---------------------------------------------------------------------------
-// Unified kernel handle table (Events and Files)
+// Unified kernel handle table (dispatcher objects from os/win32_sync, and Files)
 // ---------------------------------------------------------------------------
 
 enum class KernelObjectKind : uint8_t {
-    Event,
+    Dispatcher,
     File,
 };
 
@@ -61,18 +61,11 @@ struct KernelObject {
     KernelObjectKind kind;
 };
 
-struct EventObject final : KernelObject {
-    EventObject(bool manual, bool initial, std::string event_name)
-        : KernelObject(KernelObjectKind::Event),
-          manual_reset(manual),
-          signaled(initial),
-          name(std::move(event_name)) {}
+struct DispatcherEntry final : KernelObject {
+    explicit DispatcherEntry(std::shared_ptr<DispatcherObject> obj)
+        : KernelObject(KernelObjectKind::Dispatcher), object(std::move(obj)) {}
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool manual_reset = false;
-    bool signaled = false;
-    std::string name;
+    std::shared_ptr<DispatcherObject> object;
 };
 
 struct FileObject final : KernelObject {
@@ -93,7 +86,6 @@ struct KernelHandleTable {
     std::mutex mutex;
     Handle next_handle = 1;
     std::unordered_map<Handle, std::shared_ptr<KernelObject>> objects;
-    std::unordered_map<std::string, std::weak_ptr<EventObject>> named_events;
 
     Handle insert(std::shared_ptr<KernelObject> obj) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -258,42 +250,6 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
     return true;
 }
 
-Handle create_event_impl(bool manual_reset, bool initial_state, std::string_view name) {
-    auto& table = handle_table();
-    if (!name.empty()) {
-        std::lock_guard<std::mutex> lock(table.mutex);
-        auto it = table.named_events.find(std::string(name));
-        if (it != table.named_events.end()) {
-            if (auto existing = it->second.lock()) {
-                Handle h = table.next_handle++;
-                while (h == kNullHandle || h == INVALID_HANDLE_VALUE ||
-                       table.objects.find(h) != table.objects.end()) {
-                    h = table.next_handle++;
-                }
-                table.objects.emplace(h, existing);
-                SetLastError(ERROR_ALREADY_EXISTS);
-                return h;
-            }
-            table.named_events.erase(it);
-        }
-
-        auto ev = std::make_shared<EventObject>(manual_reset, initial_state, std::string(name));
-        table.named_events.emplace(ev->name, ev);
-        Handle h = table.next_handle++;
-        while (h == kNullHandle || h == INVALID_HANDLE_VALUE ||
-               table.objects.find(h) != table.objects.end()) {
-            h = table.next_handle++;
-        }
-        table.objects.emplace(h, std::move(ev));
-        SetLastError(ERROR_SUCCESS);
-        return h;
-    }
-
-    auto ev = std::make_shared<EventObject>(manual_reset, initial_state, std::string{});
-    SetLastError(ERROR_SUCCESS);
-    return table.insert(std::move(ev));
-}
-
 Handle create_file_impl(std::string_view raw_path,
                         uint32_t desired_access,
                         uint32_t creation_disposition) {
@@ -446,6 +402,21 @@ void set_httpfs_client(HttpfsMailboxClient* client) {
 
 HttpfsMailboxClient* get_httpfs_client() {
     return g_httpfs_client.load(std::memory_order_acquire);
+}
+
+Handle insert_dispatcher_object(std::shared_ptr<DispatcherObject> object) {
+    if (!object) {
+        return kNullHandle;
+    }
+    return handle_table().insert(std::make_shared<DispatcherEntry>(std::move(object)));
+}
+
+std::shared_ptr<DispatcherObject> lookup_dispatcher_object(Handle handle) {
+    auto obj = handle_table().lookup(handle);
+    if (!obj || obj->kind != KernelObjectKind::Dispatcher) {
+        return nullptr;
+    }
+    return static_cast<DispatcherEntry*>(obj.get())->object;
 }
 
 void clear_userdata_overlay() {
@@ -807,99 +778,7 @@ void LeaveCriticalSection(CriticalSection* critical_section) {
     critical_section->mutex->unlock();
 }
 
-Handle CreateEventA(void* security_attributes,
-                    bool manual_reset,
-                    bool initial_state,
-                    const char* name) {
-    (void)security_attributes;
-    return create_event_impl(manual_reset, initial_state,
-                             name != nullptr ? std::string_view(name) : std::string_view{});
-}
-
-Handle CreateEventW(void* security_attributes,
-                    bool manual_reset,
-                    bool initial_state,
-                    const char16_t* name) {
-    (void)security_attributes;
-    const std::string utf8_name = name != nullptr ? utf16_to_utf8(name) : std::string{};
-    return create_event_impl(manual_reset, initial_state, utf8_name);
-}
-
-bool SetEvent(Handle event_handle) {
-    auto obj = handle_table().lookup(event_handle);
-    if (!obj || obj->kind != KernelObjectKind::Event) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return false;
-    }
-    auto* ev = static_cast<EventObject*>(obj.get());
-    {
-        std::lock_guard<std::mutex> lock(ev->mutex);
-        ev->signaled = true;
-    }
-    if (ev->manual_reset) {
-        ev->cv.notify_all();
-    } else {
-        ev->cv.notify_one();
-    }
-    return true;
-}
-
-bool ResetEvent(Handle event_handle) {
-    auto obj = handle_table().lookup(event_handle);
-    if (!obj || obj->kind != KernelObjectKind::Event) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return false;
-    }
-    auto* ev = static_cast<EventObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(ev->mutex);
-    ev->signaled = false;
-    return true;
-}
-
-uint32_t WaitForSingleObject(Handle handle, uint32_t timeout_ms) {
-    auto obj = handle_table().lookup(handle);
-    if (!obj || obj->kind != KernelObjectKind::Event) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return WAIT_FAILED;
-    }
-
-    auto* ev = static_cast<EventObject*>(obj.get());
-    std::unique_lock<std::mutex> lock(ev->mutex);
-
-    auto consume_if_signaled = [&]() -> bool {
-        if (!ev->signaled) {
-            return false;
-        }
-        if (!ev->manual_reset) {
-            ev->signaled = false;
-        }
-        return true;
-    };
-
-    if (consume_if_signaled()) {
-        return WAIT_OBJECT_0;
-    }
-    if (timeout_ms == 0) {
-        return WAIT_TIMEOUT;
-    }
-    if (timeout_ms == INFINITE_TIMEOUT) {
-        ev->cv.wait(lock, [&]() { return ev->signaled; });
-        if (!ev->manual_reset) {
-            ev->signaled = false;
-        }
-        return WAIT_OBJECT_0;
-    }
-
-    const bool ready = ev->cv.wait_for(
-        lock, std::chrono::milliseconds(timeout_ms), [&]() { return ev->signaled; });
-    if (!ready) {
-        return WAIT_TIMEOUT;
-    }
-    if (!ev->manual_reset) {
-        ev->signaled = false;
-    }
-    return WAIT_OBJECT_0;
-}
+// CreateEventA/W, SetEvent, ResetEvent and WaitForSingleObject live in os/win32_sync.cpp.
 
 // ---------------------------------------------------------------------------
 // File I/O shims

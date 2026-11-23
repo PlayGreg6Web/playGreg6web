@@ -35,7 +35,7 @@ Pg6ProcAddress by_name(Pg6Handle module, const char* name) {
 
 void test_registration_idempotent() {
     const size_t first = pg6_loader_register_all_shim_exports();
-    CHECK(first == 158);
+    CHECK(first == 183);
     CHECK(register_all_shim_exports() == first);
     CHECK(pg6_loader_register_all_shim_exports() == first);
 
@@ -75,7 +75,7 @@ void test_table_counts_and_lookup() {
         CHECK(pg6_loader_resolve_import(e.module, e.name) == e.address);
     }
     CHECK(per_module.size() == 6);
-    CHECK(per_module["KERNEL32.dll"] == 56);
+    CHECK(per_module["KERNEL32.dll"] == 81);
     CHECK(per_module["ADVAPI32.dll"] == 7);
     CHECK(per_module["WS2_32.dll"] == 24);
     CHECK(per_module["WINHTTP.dll"] == 11);

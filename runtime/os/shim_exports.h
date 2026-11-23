@@ -11,7 +11,8 @@
 // win32_loader.h, under the system DLL that exports the API on a real Xbox/Windows install and
 // under the real exported name, so a guest GetProcAddress / LoadLibrary / import bind can find it:
 //
-//   KERNEL32.dll                                   win32_kernel.h + win32_loader.h shims
+//   KERNEL32.dll                                   win32_kernel.h + win32_loader.h +
+//                                                  win32_sync.h shims
 //   ADVAPI32.dll                                   ETW Event* (reached via api-ms-win-eventing-*)
 //   WS2_32.dll, WINHTTP.dll                        xbox_offline.h
 //   xgameruntime.dll                               XGameRuntime, XTaskQueue, XAsync, XUser,
