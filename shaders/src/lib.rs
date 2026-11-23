@@ -4,3 +4,4 @@ pub mod dxbc;
 pub mod lower;
 pub mod pack;
 pub mod reflect;
+pub mod wave_emul;
