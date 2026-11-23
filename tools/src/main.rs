@@ -1,8 +1,12 @@
+mod rpf9;
+
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use rpf9::{DEFAULT_BOOTSET_HEAD_BYTES, inspect_rpf_file, json_escape, write_bootset};
 
 const ABI_VERSION: u32 = 1;
 
@@ -32,22 +36,6 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<FileEntry>) -> io::Resul
         }
     }
     Ok(())
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn render_manifest_json(entries: &[FileEntry]) -> String {
@@ -110,55 +98,177 @@ fn read_dotenv_key(key: &str) -> Option<String> {
     None
 }
 
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  playgta6-manifest [--game <game-dir>] [--out <local-data/data-manifest.json>]");
+    eprintln!(
+        "  playgta6-manifest bootset [--game <game-dir>] [--out <local-data/bootset.json>] [--head-bytes {DEFAULT_BOOTSET_HEAD_BYTES}]"
+    );
+    eprintln!("  playgta6-manifest inspect-rpf <file.rpf>");
+    eprintln!("Falls back to GTA6_GAME_DIR and GTA6_DATA_DIR from env or .env.");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Help,
+    Manifest {
+        game_dir: Option<PathBuf>,
+        out_file: Option<PathBuf>,
+    },
+    Bootset {
+        game_dir: Option<PathBuf>,
+        out_file: Option<PathBuf>,
+        head_bytes: u64,
+    },
+    InspectRpf {
+        rpf_path: PathBuf,
+    },
+}
+
+fn parse_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(Command::Help);
+    }
+
+    match args.first().map(String::as_str) {
+        Some("bootset") => {
+            let mut game_dir: Option<PathBuf> = None;
+            let mut out_file: Option<PathBuf> = None;
+            let mut head_bytes: u64 = DEFAULT_BOOTSET_HEAD_BYTES;
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--game" if i + 1 < args.len() => {
+                        game_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--out" if i + 1 < args.len() => {
+                        out_file = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--head-bytes" if i + 1 < args.len() => {
+                        head_bytes = args[i + 1].parse::<u64>().map_err(|_| {
+                            format!("Invalid --head-bytes value: {}", args[i + 1])
+                        })?;
+                        i += 2;
+                    }
+                    other => {
+                        return Err(format!("Unknown argument for bootset: {other}"));
+                    }
+                }
+            }
+            Ok(Command::Bootset {
+                game_dir,
+                out_file,
+                head_bytes,
+            })
+        }
+        Some("inspect-rpf") => {
+            if args.len() != 2 {
+                return Err("Usage: playgta6-manifest inspect-rpf <file.rpf>".to_string());
+            }
+            Ok(Command::InspectRpf {
+                rpf_path: PathBuf::from(&args[1]),
+            })
+        }
+        _ => {
+            let mut game_dir: Option<PathBuf> = None;
+            let mut out_file: Option<PathBuf> = None;
+
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--game" if i + 1 < args.len() => {
+                        game_dir = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    "--out" if i + 1 < args.len() => {
+                        out_file = Some(PathBuf::from(&args[i + 1]));
+                        i += 2;
+                    }
+                    other => {
+                        return Err(format!("Unknown argument: {other}"));
+                    }
+                }
+            }
+            Ok(Command::Manifest { game_dir, out_file })
+        }
+    }
+}
+
+fn default_data_path(file_name: &str) -> PathBuf {
+    let data_dir = read_dotenv_key("GTA6_DATA_DIR").unwrap_or_else(|| "local-data".to_string());
+    PathBuf::from(data_dir).join(file_name)
+}
+
+fn resolve_game_dir(cli_game_dir: Option<PathBuf>) -> Option<PathBuf> {
+    cli_game_dir.or_else(|| read_dotenv_key("GTA6_GAME_DIR").map(PathBuf::from))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        eprintln!("Usage: playgta6-manifest [--game <game-dir>] [--out <local-data/data-manifest.json>]");
-        eprintln!("Falls back to GTA6_GAME_DIR and GTA6_DATA_DIR from env or .env.");
-        return ExitCode::SUCCESS;
-    }
-
-    let mut game_dir: Option<PathBuf> = None;
-    let mut out_file: Option<PathBuf> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--game" if i + 1 < args.len() => {
-                game_dir = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--out" if i + 1 < args.len() => {
-                out_file = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                return ExitCode::FAILURE;
-            }
+    let command = match parse_args(&args) {
+        Ok(cmd) => cmd,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
         }
-    }
-
-    let Some(game_dir) = game_dir.or_else(|| read_dotenv_key("GTA6_GAME_DIR").map(PathBuf::from))
-    else {
-        eprintln!("Error: --game <dir> or GTA6_GAME_DIR (in .env) is required.");
-        return ExitCode::FAILURE;
     };
 
-    let out_file = out_file.unwrap_or_else(|| {
-        let data_dir = read_dotenv_key("GTA6_DATA_DIR").unwrap_or_else(|| "local-data".to_string());
-        PathBuf::from(data_dir).join("data-manifest.json")
-    });
-
-    match build_manifest(&game_dir, &out_file) {
-        Ok(count) => {
-            println!("Wrote {} entries to {}", count, out_file.display());
+    match command {
+        Command::Help => {
+            print_usage();
             ExitCode::SUCCESS
         }
-        Err(err) => {
-            eprintln!("Manifest generation failed: {err}");
-            ExitCode::FAILURE
+        Command::Manifest { game_dir, out_file } => {
+            let Some(game_dir) = resolve_game_dir(game_dir) else {
+                eprintln!("Error: --game <dir> or GTA6_GAME_DIR (in .env) is required.");
+                return ExitCode::FAILURE;
+            };
+            let out_file = out_file.unwrap_or_else(|| default_data_path("data-manifest.json"));
+            match build_manifest(&game_dir, &out_file) {
+                Ok(count) => {
+                    println!("Wrote {} entries to {}", count, out_file.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Manifest generation failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
         }
+        Command::Bootset {
+            game_dir,
+            out_file,
+            head_bytes,
+        } => {
+            let Some(game_dir) = resolve_game_dir(game_dir) else {
+                eprintln!("Error: --game <dir> or GTA6_GAME_DIR (in .env) is required.");
+                return ExitCode::FAILURE;
+            };
+            let out_file = out_file.unwrap_or_else(|| default_data_path("bootset.json"));
+            match write_bootset(&game_dir, &out_file, head_bytes) {
+                Ok(count) => {
+                    println!("Wrote {} bootset entries to {}", count, out_file.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Bootset generation failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::InspectRpf { rpf_path } => match inspect_rpf_file(&rpf_path) {
+            Ok(header) => {
+                println!("{}", header.format_summary());
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("RPF inspection failed: {err}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -188,5 +298,55 @@ mod tests {
         assert!(content.contains("\"path\": \"sub/a.bin\""));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parses_cli_subcommands_and_default_manifest() {
+        let default_args: Vec<String> = vec!["--game", "C:/game", "--out", "out.json"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            parse_args(&default_args).unwrap(),
+            Command::Manifest {
+                game_dir: Some(PathBuf::from("C:/game")),
+                out_file: Some(PathBuf::from("out.json")),
+            }
+        );
+
+        let bootset_args: Vec<String> = vec![
+            "bootset",
+            "--game",
+            "C:/game",
+            "--out",
+            "local-data/bootset.json",
+            "--head-bytes",
+            "32768",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            parse_args(&bootset_args).unwrap(),
+            Command::Bootset {
+                game_dir: Some(PathBuf::from("C:/game")),
+                out_file: Some(PathBuf::from("local-data/bootset.json")),
+                head_bytes: 32768,
+            }
+        );
+
+        let inspect_args: Vec<String> = vec!["inspect-rpf", "levels.rpf"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            parse_args(&inspect_args).unwrap(),
+            Command::InspectRpf {
+                rpf_path: PathBuf::from("levels.rpf"),
+            }
+        );
+
+        let bad_inspect: Vec<String> = vec!["inspect-rpf".to_string()];
+        assert!(parse_args(&bad_inspect).is_err());
     }
 }
