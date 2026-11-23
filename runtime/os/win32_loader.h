@@ -125,13 +125,41 @@ std::string canonical_module_name(std::string_view name);
 // Returns image_base, or 0 (ERROR_ALREADY_EXISTS / ERROR_INVALID_PARAMETER) on conflict.
 Handle register_main_module(std::string_view name, std::string_view path, uint64_t image_base);
 
+// Registers a recompiled guest DLL mapped at image_base (runtime/guest/program_loader.h): its
+// HMODULE is image_base, GetModuleHandle/LoadLibrary find it by name, and its exports
+// (register_guest_export / register_export_forwarder) are guest VAs. It takes over the name of a
+// virtual module registered earlier (that module's handle and exports stay reachable by handle
+// only). Returns image_base, or 0 if the name or base already belongs to another guest or main
+// module.
+Handle register_guest_module(std::string_view name,
+                             std::string_view path,
+                             uint64_t image_base,
+                             uint64_t size_of_image);
+// True for guest modules and the main image (both are recompiled guest code).
+bool is_guest_module(Handle module);
+
+// Publishes an export of a guest module or of the main image as a guest VA (name and/or ordinal
+// 1..65535).
+bool register_guest_export(std::string_view module,
+                           std::string_view name,
+                           uint32_t ordinal,
+                           uint64_t guest_va);
+
+// Publishes a forwarder export ("DLL.Name" or "DLL.#ordinal"): GetProcAddress and
+// resolve_import follow it (API-set names allowed, at most 16 hops, cycles fail).
+bool register_export_forwarder(std::string_view module,
+                               std::string_view name,
+                               uint32_t ordinal,
+                               std::string_view target);
+
 // Registers (or returns the existing) virtual module. Pinned modules behave like statically
 // imported DLLs: always visible, never unloaded by FreeLibrary. Unpinned modules are only visible
 // while their LoadLibrary reference count is > 0.
 Handle register_virtual_module(std::string_view name, bool pinned = true);
 
 // Publishes an export (name and/or ordinal 1..65535). Creates a pinned virtual module on demand.
-// Re-registering the same name/ordinal replaces the address.
+// Re-registering the same name/ordinal replaces the address. Host shim exports are not added to
+// a guest module (returns false): its exports are guest code.
 bool register_export(std::string_view module,
                      std::string_view name,
                      uint32_t ordinal,
@@ -191,6 +219,18 @@ Pg6ProcAddress pg6_loader_get_proc_address_by_ordinal(Pg6Handle module, uint32_t
 
 Pg6Handle pg6_loader_register_main_module(const char* name, const char* path, uint64_t image_base);
 Pg6Handle pg6_loader_register_virtual_module(const char* name, int32_t pinned);
+Pg6Handle pg6_loader_register_guest_module(const char* name,
+                                           const char* path,
+                                           uint64_t image_base,
+                                           uint64_t size_of_image);
+int32_t pg6_loader_register_guest_export(const char* module,
+                                         const char* name,
+                                         uint32_t ordinal,
+                                         uint64_t guest_va);
+int32_t pg6_loader_register_export_forwarder(const char* module,
+                                             const char* name,
+                                             uint32_t ordinal,
+                                             const char* target);
 int32_t pg6_loader_register_export(const char* module,
                                    const char* name,
                                    uint32_t ordinal,

@@ -40,6 +40,7 @@ add_library(playgta6_core STATIC
     guest/cpu_helpers.cpp
     guest/boot.cpp
     os/xgameruntime_provider.cpp
+    guest/program_loader.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -193,4 +194,8 @@ else()
     add_executable(test_guest_callback_unwind ../tests/test_guest_callback_unwind.cpp)
     target_link_libraries(test_guest_callback_unwind PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_callback_unwind_tests COMMAND test_guest_callback_unwind)
+
+    add_executable(test_program_loader ../tests/test_program_loader.cpp)
+    target_link_libraries(test_program_loader PRIVATE playgta6_core)
+    add_test(NAME playgta6_program_loader_tests COMMAND test_program_loader)
 endif()

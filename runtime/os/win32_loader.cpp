@@ -250,9 +250,12 @@ struct Module {
     std::string path;
     Handle handle = 0;
     bool pinned = true;
+    bool guest = false;  // a recompiled guest DLL: exports are guest VAs
     uint32_t load_count = 0;
     std::unordered_map<std::string, ProcAddress> by_name;
     std::unordered_map<uint32_t, ProcAddress> by_ordinal;
+    std::unordered_map<std::string, std::string> forward_by_name;
+    std::unordered_map<uint32_t, std::string> forward_by_ordinal;
 
     bool visible() const { return pinned || load_count > 0; }
 };
@@ -356,6 +359,8 @@ struct ModuleRegistry {
     std::unordered_map<std::string, std::unique_ptr<Module>> by_name;
     std::unordered_map<Handle, Module*> by_handle;
     std::vector<ApiSetRule> api_set_rules;
+    // Virtual modules whose name a guest module took over (still reachable by handle).
+    std::vector<std::unique_ptr<Module>> retired;
     Module* main_module = nullptr;
     uint64_t next_virtual_slot = 0;
 
@@ -423,7 +428,8 @@ struct ModuleRegistry {
     bool add_export_locked(std::string_view module,
                            std::string_view name,
                            uint32_t ordinal,
-                           ProcAddress address) {
+                           ProcAddress address,
+                           bool guest_export = false) {
         if (address == 0 || ordinal > 0xFFFFu || (name.empty() && ordinal == 0)) {
             return false;
         }
@@ -431,10 +437,11 @@ struct ModuleRegistry {
         auto existing = by_name.find(canonical_module_name(module));
         if (existing != by_name.end()) {
             m = existing->second.get();
-        } else {
+        } else if (!guest_export) {
             m = get_or_create_virtual_locked(module, true);
         }
-        if (m == nullptr) {
+        // Guest exports go to guest modules and the main image, host shims everywhere else.
+        if (m == nullptr || (guest_export ? !(m->guest || m == main_module) : m->guest)) {
             return false;
         }
         if (!name.empty()) {
@@ -444,6 +451,77 @@ struct ModuleRegistry {
             m->by_ordinal[ordinal] = address;
         }
         return true;
+    }
+
+    bool add_forwarder_locked(std::string_view module,
+                              std::string_view name,
+                              uint32_t ordinal,
+                              std::string_view target) {
+        if (target.empty() || ordinal > 0xFFFFu || (name.empty() && ordinal == 0)) {
+            return false;
+        }
+        auto existing = by_name.find(canonical_module_name(module));
+        if (existing == by_name.end()) {
+            return false;
+        }
+        Module* m = existing->second.get();
+        if (!name.empty()) {
+            m->forward_by_name[std::string(name)] = std::string(target);
+        }
+        if (ordinal != 0) {
+            m->forward_by_ordinal[ordinal] = std::string(target);
+        }
+        return true;
+    }
+
+    // Export lookup by name (ordinal == 0) or ordinal, following forwarders ("DLL.Name",
+    // "DLL.#ordinal"; the module part may be an API set) for at most kMaxForwards hops.
+    ProcAddress lookup_locked(const Module* m, std::string name, uint32_t ordinal) const {
+        static constexpr int kMaxForwards = 16;
+        for (int hop = 0; m != nullptr && hop <= kMaxForwards; ++hop) {
+            const std::string* forward = nullptr;
+            if (ordinal == 0) {
+                if (auto it = m->by_name.find(name); it != m->by_name.end()) {
+                    return it->second;
+                }
+                if (auto it = m->forward_by_name.find(name); it != m->forward_by_name.end()) {
+                    forward = &it->second;
+                }
+            } else {
+                if (auto it = m->by_ordinal.find(ordinal); it != m->by_ordinal.end()) {
+                    return it->second;
+                }
+                if (auto it = m->forward_by_ordinal.find(ordinal);
+                    it != m->forward_by_ordinal.end()) {
+                    forward = &it->second;
+                }
+            }
+            if (forward == nullptr) {
+                return 0;
+            }
+            const size_t dot = forward->rfind('.');
+            if (dot == std::string::npos || dot == 0 || dot + 1 == forward->size()) {
+                return 0;
+            }
+            const std::string symbol = forward->substr(dot + 1);
+            m = find_locked(canonical_module_name(std::string_view(*forward).substr(0, dot)));
+            if (symbol[0] == '#') {
+                const std::string digits = symbol.substr(1);
+                if (digits.empty() || digits.size() > 5 ||
+                    digits.find_first_not_of("0123456789") != std::string::npos) {
+                    return 0;
+                }
+                ordinal = static_cast<uint32_t>(std::stoul(digits));
+                name.clear();
+                if (ordinal == 0 || ordinal > 0xFFFFu) {
+                    return 0;
+                }
+            } else {
+                name = symbol;
+                ordinal = 0;
+            }
+        }
+        return 0;
     }
 
     bool add_api_set_rule_locked(std::string_view contract_prefix, std::string_view host_module) {
@@ -893,12 +971,11 @@ ProcAddress GetProcAddressByName(Handle module, std::string_view name) {
         SetLastError(ERROR_MOD_NOT_FOUND);
         return 0;
     }
-    auto it = m->by_name.find(std::string(name));
-    if (it == m->by_name.end()) {
+    const ProcAddress address = name.empty() ? 0 : reg.lookup_locked(m, std::string(name), 0);
+    if (address == 0) {
         SetLastError(ERROR_PROC_NOT_FOUND);
-        return 0;
     }
-    return it->second;
+    return address;
 }
 
 ProcAddress GetProcAddressByOrdinal(Handle module, uint32_t ordinal) {
@@ -909,12 +986,11 @@ ProcAddress GetProcAddressByOrdinal(Handle module, uint32_t ordinal) {
         SetLastError(ERROR_MOD_NOT_FOUND);
         return 0;
     }
-    auto it = m->by_ordinal.find(ordinal);
-    if (it == m->by_ordinal.end()) {
+    const ProcAddress address = ordinal == 0 ? 0 : reg.lookup_locked(m, {}, ordinal);
+    if (address == 0) {
         SetLastError(ERROR_PROC_NOT_FOUND);
-        return 0;
     }
-    return it->second;
+    return address;
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1033,81 @@ Handle register_main_module(std::string_view name, std::string_view path, uint64
     reg.by_handle.emplace(image_base, module.get());
     reg.by_name.emplace(canonical, std::move(module));
     return image_base;
+}
+
+Handle register_guest_module(std::string_view name,
+                             std::string_view path,
+                             uint64_t image_base,
+                             uint64_t size_of_image) {
+    const std::string display = module_basename(name);
+    if (display.empty() || image_base == 0 || size_of_image == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return kNullHandle;
+    }
+    const std::string canonical = ascii_lower(display);
+    auto& reg = module_registry();
+    std::unique_lock<std::shared_mutex> lock(reg.mutex);
+    auto by_handle = reg.by_handle.find(image_base);
+    auto by_name = reg.by_name.find(canonical);
+    if (by_handle != reg.by_handle.end() || by_name != reg.by_name.end()) {
+        const Module* existing =
+            by_handle != reg.by_handle.end() ? by_handle->second : by_name->second.get();
+        if (existing->guest && existing->handle == image_base && existing->canonical == canonical) {
+            return image_base;
+        }
+        // Only a virtual module's name can be taken over; its handle stays registered.
+        if (by_handle != reg.by_handle.end() || by_name->second->guest ||
+            by_name->second.get() == reg.main_module ||
+            by_name->second->handle < kVirtualModuleBase) {
+            SetLastError(ERROR_ALREADY_EXISTS);
+            return kNullHandle;
+        }
+        reg.retired.push_back(std::move(by_name->second));
+        reg.by_name.erase(by_name);
+    }
+    auto module = std::make_unique<Module>();
+    module->canonical = canonical;
+    module->display = display;
+    module->path = path.empty() ? display : std::string(path);
+    module->handle = image_base;
+    module->pinned = true;
+    module->guest = true;
+    reg.by_handle.emplace(image_base, module.get());
+    reg.by_name.emplace(canonical, std::move(module));
+    return image_base;
+}
+
+bool is_guest_module(Handle module) {
+    auto& reg = module_registry();
+    std::shared_lock<std::shared_mutex> lock(reg.mutex);
+    const Module* m = module == kNullHandle ? nullptr : reg.find_handle_locked(module);
+    return m != nullptr && (m->guest || m == reg.main_module);
+}
+
+bool register_guest_export(std::string_view module,
+                           std::string_view name,
+                           uint32_t ordinal,
+                           uint64_t guest_va) {
+    auto& reg = module_registry();
+    std::unique_lock<std::shared_mutex> lock(reg.mutex);
+    if (!reg.add_export_locked(module, name, ordinal, guest_va, true)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    return true;
+}
+
+bool register_export_forwarder(std::string_view module,
+                               std::string_view name,
+                               uint32_t ordinal,
+                               std::string_view target) {
+    auto& reg = module_registry();
+    std::unique_lock<std::shared_mutex> lock(reg.mutex);
+    if (!reg.add_forwarder_locked(module, name, ordinal, target)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    return true;
 }
 
 Handle register_virtual_module(std::string_view name, bool pinned) {
@@ -1025,12 +1176,11 @@ ProcAddress resolve_import(std::string_view module, std::string_view name) {
         SetLastError(ERROR_MOD_NOT_FOUND);
         return 0;
     }
-    auto it = m->by_name.find(std::string(name));
-    if (it == m->by_name.end()) {
+    const ProcAddress address = name.empty() ? 0 : reg.lookup_locked(m, std::string(name), 0);
+    if (address == 0) {
         SetLastError(ERROR_PROC_NOT_FOUND);
-        return 0;
     }
-    return it->second;
+    return address;
 }
 
 ProcAddress resolve_import_ordinal(std::string_view module, uint32_t ordinal) {
@@ -1041,12 +1191,11 @@ ProcAddress resolve_import_ordinal(std::string_view module, uint32_t ordinal) {
         SetLastError(ERROR_MOD_NOT_FOUND);
         return 0;
     }
-    auto it = m->by_ordinal.find(ordinal);
-    if (it == m->by_ordinal.end()) {
+    const ProcAddress address = ordinal == 0 ? 0 : reg.lookup_locked(m, {}, ordinal);
+    if (address == 0) {
         SetLastError(ERROR_PROC_NOT_FOUND);
-        return 0;
     }
-    return it->second;
+    return address;
 }
 
 }  // namespace playgta6::os::win32
@@ -1152,6 +1301,34 @@ Pg6Handle pg6_loader_register_main_module(const char* name, const char* path, ui
 
 Pg6Handle pg6_loader_register_virtual_module(const char* name, int32_t pinned) {
     return playgta6::os::win32::register_virtual_module(sv_or_empty(name), pinned != 0);
+}
+
+Pg6Handle pg6_loader_register_guest_module(const char* name,
+                                           const char* path,
+                                           uint64_t image_base,
+                                           uint64_t size_of_image) {
+    return playgta6::os::win32::register_guest_module(sv_or_empty(name), sv_or_empty(path),
+                                                      image_base, size_of_image);
+}
+
+int32_t pg6_loader_register_guest_export(const char* module,
+                                         const char* name,
+                                         uint32_t ordinal,
+                                         uint64_t guest_va) {
+    return playgta6::os::win32::register_guest_export(sv_or_empty(module), sv_or_empty(name),
+                                                      ordinal, guest_va)
+               ? 1
+               : 0;
+}
+
+int32_t pg6_loader_register_export_forwarder(const char* module,
+                                             const char* name,
+                                             uint32_t ordinal,
+                                             const char* target) {
+    return playgta6::os::win32::register_export_forwarder(sv_or_empty(module), sv_or_empty(name),
+                                                          ordinal, sv_or_empty(target))
+               ? 1
+               : 0;
 }
 
 int32_t pg6_loader_register_export(const char* module,

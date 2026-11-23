@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -16,14 +17,16 @@
 // not support, and describes that point in one structured report.
 //
 // A boot takes a list of guest modules (BootConfig::modules): modules[0] is the executable, any
-// further entries are guest DLLs loaded with it (today a list of one; R12's program loader is to
-// fill in more). Each module brings its PGIM image, lifted-function table(s) and import table.
+// further entries are guest DLLs loaded with it (guest/program_loader.h builds the list from a
+// recompiled program). Each module brings its PGIM image, lifted-function table(s) and import
+// table.
 //
 // Sequence (run_boot)
 // -------------------
 //  1. Load every PGIM image (os/image_loader.h) at its preferred base; modules[0] is registered as
-//     the main module (O7 module registry). Registering guest DLLs with O7 and binding one
-//     module's imports to another module's exports belongs to R12's program loader.
+//     the main module (O7 module registry). Guest DLLs are registered with O7 by the program
+//     loader through BootConfig::after_load; imports of one module bound to another module's
+//     exports are pre-filled in the images at build time.
 //  2. Register the lifted-function tables and bind every IAT slot (guest_runtime.h): slots whose
 //     import resolved to a runtime shim get the generated thunk; unresolved slots get the boot's
 //     own thunk, which reports `DLL!symbol` as an "unresolved_import" fault (or, in survey mode,
@@ -39,8 +42,9 @@
 //     at least 16) ask; TEB.ThreadLocalStoragePointer points at the vector of block pointers, so
 //     the inline MSVC sequence `mov rax, gs:[0x58]; mov rax, [rax + idx*8]` reaches the block.
 //  5. Run the TLS callbacks (AddressOfCallBacks, null-terminated) with
-//     (image_base, DLL_PROCESS_ATTACH, nullptr) - the DLLs' first (modules[1..] in order; their
-//     DllMain is R12's), the executable's last - then call the executable's entry point with
+//     (image_base, DLL_PROCESS_ATTACH, nullptr) - the DLLs' first (modules[1..] in order, each
+//     followed by its DllMain when BootConfig::call_dll_entry_points is set), the executable's
+//     last - then call the executable's entry point with
 //     rcx = PEB (what RtlUserThreadStart passes) through call_guest.
 //  6. The run ends when the entry point returns (exit code = eax; the guest exit handlers run
 //     first), when the guest calls the CRT exit/_exit (guest/guest_crt_exit.h runs the guest
@@ -389,6 +393,15 @@ struct BootConfig {
     size_t max_backtrace_frames = 32;
     CaptureHostStackFn capture_host_stack = nullptr;
     bool log_progress = true;       // phase lines through os::log
+    // Runs once every image is mapped, its lifted tables are registered and its IAT slots are
+    // bound, before the process block is created (R12's program loader registers the guest DLLs,
+    // their exports and function tables here). Returning false ends the boot with
+    // RegisterFailed and `error` as the message.
+    std::function<bool(os::VirtualMemoryArena& arena, std::string& error)> after_load;
+    // Call every DLL's entry point (modules[1..], in order, each right after its own TLS
+    // callbacks) as DllMain(image_base, DLL_PROCESS_ATTACH, nullptr) before the executable's
+    // entry point. A DllMain returning FALSE ends the boot with ProcessSetupFailed.
+    bool call_dll_entry_points = false;
 };
 
 struct BootResult {

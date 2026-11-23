@@ -1494,10 +1494,10 @@ void run_guest(const BootConfig& config) {
     BootState& b = boot();
     GuestThreadContext& main = *b.main_thread;
     VirtualMemoryArena& arena = *b.arena;
-    if (config.run_tls_callbacks) {
-        b.phase = "tls_callback";
-        for (const size_t mi : callback_order()) {
-            ModuleState& m = b.modules[mi];
+    for (const size_t mi : callback_order()) {
+        ModuleState& m = b.modules[mi];
+        if (config.run_tls_callbacks) {
+            b.phase = "tls_callback";
             for (const uint64_t callback : m.tls.callbacks) {
                 logf("guest boot: TLS callback 0x%016" PRIx64 " of %s (DLL_PROCESS_ATTACH)", callback,
                      m.name.c_str());
@@ -1505,6 +1505,18 @@ void run_guest(const BootConfig& config) {
                                 uint64_t{win64::kDllProcessAttach}, uint64_t{0});
                 ++m.tls.callbacks_run;
                 ++b.tls_callbacks_run;
+            }
+        }
+        if (config.call_dll_entry_points && mi != 0 && m.image.entry_point != 0) {
+            b.phase = "dll_main";
+            logf("guest boot: DllMain 0x%016" PRIx64 " of %s (DLL_PROCESS_ATTACH)",
+                 m.image.entry_point, m.name.c_str());
+            const uint64_t ok = call_guest_args(arena, main.thread.state, m.image.entry_point,
+                                                m.image.base, uint64_t{win64::kDllProcessAttach},
+                                                uint64_t{0});
+            if (static_cast<uint32_t>(ok) == 0) {
+                fail_setup(BootStatus::ProcessSetupFailed, "DllMain of " + m.name + " returned FALSE");
+                return;
             }
         }
     }
@@ -1894,6 +1906,14 @@ BootResult run_boot(const BootConfig& config) {
          " bound to shims, %" PRIu64 " without a shim%s",
          b.functions_registered, b.tables.size(), b.imports.size(), b.imports_bound,
          b.imports_unresolved, b.survey ? " [survey mode]" : "");
+    if (config.after_load) {
+        b.phase = "after_load";
+        std::string after_load_error;
+        if (!config.after_load(*b.arena, after_load_error)) {
+            fail_setup(BootStatus::RegisterFailed, after_load_error);
+            return finish();
+        }
+    }
 
     // 3. Process block, TLS directories, main thread.
     b.phase = "process";
