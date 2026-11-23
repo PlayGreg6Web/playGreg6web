@@ -613,7 +613,7 @@ fn end_to_end_build_writes_consistent_artifacts() {
     let table = String::from_utf8(tree["lift/functions.ll"].clone()).expect("utf8");
     let registered: Vec<u64> = table
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("%playgta6.LiftedFunction { i64 "))
+        .filter_map(|l| l.trim().strip_prefix("%Pg6LiftedFunctionEntry { i64 "))
         .map(|l| l.split(',').next().unwrap().parse::<i64>().unwrap() as u64)
         .collect();
     // `helper + 5` (a relocated pointer at an instruction boundary) splits `helper`.
@@ -774,19 +774,26 @@ fn registration_table_layout() {
     let mut out = Vec::new();
     write_registration_table("main", &[0x1_4000_1000, 0x1_4000_2000], &mut out).expect("render");
     let text = String::from_utf8(out).expect("utf8");
-    assert!(text.contains("%playgta6.LiftedFunction = type { i64, ptr }\n"));
+    assert!(text.contains("%Pg6LiftedFunctionEntry = type { i64, ptr }\n"));
     assert!(text.contains("declare void @sub_140001000(ptr)\n"));
     assert!(text.contains(
-        "@__playgta6_lifted_functions_main = constant [2 x %playgta6.LiftedFunction] [\n  \
-         %playgta6.LiftedFunction { i64 5368713216, ptr @sub_140001000 },\n  \
-         %playgta6.LiftedFunction { i64 5368717312, ptr @sub_140002000 }\n], align 8\n"
+        "@__playgta6_lifted_functions_main = constant [2 x %Pg6LiftedFunctionEntry] [\n  \
+         %Pg6LiftedFunctionEntry { i64 5368713216, ptr @sub_140001000 },\n  \
+         %Pg6LiftedFunctionEntry { i64 5368717312, ptr @sub_140002000 }\n], align 8\n"
     ));
-    assert!(text.ends_with("@__playgta6_lifted_function_count_main = constant i64 2, align 8\n"));
+    assert!(text.contains("@__playgta6_lifted_function_count_main = constant i64 2, align 8\n"));
+    assert!(text.ends_with(
+        "declare i32 @pg6_guest_register_lifted_functions(ptr, i64)\n\n\
+         define i32 @__playgta6_register_lifted_functions_main() {\n\
+         entry:\n  \
+         %ok = call i32 @pg6_guest_register_lifted_functions(ptr @__playgta6_lifted_functions_main, i64 2)\n  \
+         ret i32 %ok\n}\n"
+    ));
 
     let mut empty = Vec::new();
     write_registration_table("main", &[], &mut empty).expect("render");
     let text = String::from_utf8(empty).expect("utf8");
-    assert!(text.contains("constant [0 x %playgta6.LiftedFunction] zeroinitializer, align 8"));
+    assert!(text.contains("constant [0 x %Pg6LiftedFunctionEntry] zeroinitializer, align 8"));
     assert!(text.contains("constant i64 0, align 8"));
 }
 
@@ -1160,12 +1167,29 @@ fn link(
 }
 
 const RUNNER_JS: &str = r#"'use strict';
+// Runs `entry` after the module registered its function table through the generated
+// `__playgta6_register_lifted_functions_<module>`, which calls the runtime's
+// `pg6_guest_register_lifted_functions(entries, count)`; this stands in for the runtime.
 const fs = require('fs');
-const [wasmPath, entry, tableSymbol, countSymbol] = process.argv.slice(2);
+const [wasmPath, entry, registerSymbol, countSymbol] = process.argv.slice(2);
 const STATE = 0x100000, STACK_TOP = 0x1F0000, RSP = 4;
 const byVa = new Map();
+const vas = [];
+let ex;
 const fail = (what, va) => { throw new Error(what + ' 0x' + BigInt(va).toString(16)); };
+const view = () => new DataView(ex.memory.buffer);
+const getFn = (i) => { try { return ex.__indirect_function_table.get(Number(i)); } catch (e) { return ex.__indirect_function_table.get(BigInt(i)); } };
 const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(wasmPath)), { env: {
+  pg6_guest_register_lifted_functions(entries, count) {
+    const v = view();
+    for (let i = 0; i < Number(count); i++) {
+      const va = v.getBigUint64(Number(entries) + 16 * i, true);
+      if (vas.length && va <= BigInt(vas[vas.length - 1])) return 0;
+      vas.push('0x' + va.toString(16));
+      byVa.set(va, getFn(v.getBigUint64(Number(entries) + 16 * i + 8, true)));
+    }
+    return 1;
+  },
   __playgta6_indirect_call(state, target) {
     const fn = byVa.get(BigInt(target));
     if (!fn) fail('no registered function for', target);
@@ -1175,20 +1199,12 @@ const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync
   __playgta6_divide_error(state, va) { fail('divide error', va); },
   __playgta6_trap(state, va) { fail('trap', va); },
 } });
-const ex = instance.exports;
-const view = () => new DataView(ex.memory.buffer);
-const addr = (g) => Number(typeof g === 'object' ? g.value : g);
-const getFn = (i) => { try { return ex.__indirect_function_table.get(Number(i)); } catch (e) { return ex.__indirect_function_table.get(BigInt(i)); } };
+ex = instance.exports;
+if (ex[registerSymbol]() !== 1) throw new Error('registration rejected');
+const countGlobal = ex[countSymbol];
 let v = view();
-const table = addr(ex[tableSymbol]);
-const count = Number(v.getBigUint64(addr(ex[countSymbol]), true));
-const vas = [];
-for (let i = 0; i < count; i++) {
-  const va = v.getBigUint64(table + 16 * i, true);
-  if (vas.length && va <= BigInt(vas[vas.length - 1])) throw new Error('table not sorted');
-  vas.push('0x' + va.toString(16));
-  byVa.set(va, getFn(v.getBigUint64(table + 16 * i + 8, true)));
-}
+const count = Number(v.getBigUint64(Number(typeof countGlobal === 'object' ? countGlobal.value : countGlobal), true));
+if (count !== vas.length) throw new Error('count mismatch');
 for (let i = 0; i < 16; i++) v.setBigUint64(STATE + 8 * i, 0n, true);
 v.setBigUint64(STACK_TOP - 8, 0xC0DEC0DEn, true);
 v.setBigUint64(STATE + 8 * RSP, BigInt(STACK_TOP - 8), true);
@@ -1295,8 +1311,9 @@ fn cross_shard_chain_links_and_dispatches_through_the_registration_table() {
     );
 
     let entry = function_symbol(fa);
-    let (table, count) = registration_symbols("chain");
-    let exports = [entry.as_str(), table.as_str(), count.as_str()];
+    let (_, count) = registration_symbols("chain");
+    let register = register_function_symbol("chain");
+    let exports = [entry.as_str(), register.as_str(), count.as_str()];
     let wasm = tmp.path().join("chain.wasm");
     let mut failures = Vec::new();
     let linked = linkers().into_iter().any(|linker| {
@@ -1325,7 +1342,7 @@ fn cross_shard_chain_links_and_dispatches_through_the_registration_table() {
             .arg(&script)
             .arg(&wasm)
             .arg(&entry)
-            .arg(&table)
+            .arg(&register)
             .arg(&count)
             .output()
             .expect("run node");
@@ -1370,7 +1387,7 @@ fn many_small_functions() {
     let table =
         fs::read_to_string(options.module_dir().join(LIFT_DIR).join("functions.ll")).unwrap();
     assert_eq!(
-        table.matches("%playgta6.LiftedFunction { i64 ").count(),
+        table.matches("%Pg6LiftedFunctionEntry { i64 ").count(),
         count
     );
 }

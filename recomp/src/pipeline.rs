@@ -70,17 +70,19 @@
 //! `llc` at under 400 MiB, while a 300 MB shard takes ~90 s plus ~45 s at up to 1.9 GiB, hence
 //! [`DEFAULT_SHARD_INSTRUCTIONS`] = 65536.
 //!
-//! `lift/functions.ll` defines the bulk-registration table for the runtime dispatcher:
+//! `lift/functions.ll` defines the table for the guest runtime's bulk registration
+//! (`pg6_guest_register_lifted_functions` in `runtime/guest/guest_runtime.h`, which takes a
+//! sorted, duplicate-free array of `Pg6LiftedFunctionEntry { uint64_t va; LiftedFn fn; }`, 16
+//! bytes on wasm64, plus a `size_t` count) and a function that hands it over:
 //! ```text
-//! %playgta6.LiftedFunction = type { i64, ptr }            ; { u64 guest_va, LiftedFn fn }
-//! @__playgta6_lifted_functions_<module> = constant [N x %playgta6.LiftedFunction] [...], align 8
+//! %Pg6LiftedFunctionEntry = type { i64, ptr }
+//! @__playgta6_lifted_functions_<module> = constant [N x %Pg6LiftedFunctionEntry] [...], align 8
 //! @__playgta6_lifted_function_count_<module> = constant i64 N, align 8
+//! define i32 @__playgta6_register_lifted_functions_<module>()  ; calls the runtime, returns its result
 //! ```
 //! Entries are sorted by `guest_va` (strictly ascending) and cover every lifted function, which
-//! is every discovered function entry. In C++ (wasm64, 16-byte entries):
-//! `struct LiftedFunctionEntry { uint64_t va; playgta6::LiftedFn fn; };` with
-//! `extern "C" const LiftedFunctionEntry __playgta6_lifted_functions_main[];` and
-//! `extern "C" const uint64_t __playgta6_lifted_function_count_main;`.
+//! is every discovered function entry. The runtime (or the module's startup code) calls
+//! `__playgta6_register_lifted_functions_main()` once before running guest code.
 //!
 //! # Manifest schema (`schema_version` 1)
 //! Top-level keys, in order: `schema` (`"playgta6-recomp-build"`), `schema_version`, `module`,
@@ -100,7 +102,7 @@
 //! `reason`], `unreferenced` [`import`, `bound`]}), `lift` (`functions`, `instructions`,
 //! `unsupported_instructions`, `unsupported_by_mnemonic`, `shards` [`index`, `first`, `last`,
 //! `functions`, `instructions`, `ll`, `obj`], `registration` {`table_symbol`, `count_symbol`,
-//! `entry_type`, `count`, `ll`, `obj`}), `imports` (`total`, `bound`, `unresolved`, `by_dll`
+//! `register_function`, `entry_type`, `count`, `ll`, `obj`}), `imports` (`total`, `bound`, `unresolved`, `by_dll`
 //! [`dll`, `bound`, `unresolved`], `catalogue` {`headers`, `shims`, `diagnostics`}),
 //! `diagnostics` (totals: `pdata`, `discovery`, `image`, `catalogue`,
 //! `unsupported_instructions`), and `files` [`path`, `size`, `fnv1a64`] for every output file
@@ -160,8 +162,14 @@ pub const REGISTRATION_TABLE_PREFIX: &str = "__playgta6_lifted_functions_";
 pub const REGISTRATION_COUNT_PREFIX: &str = "__playgta6_lifted_function_count_";
 /// Module name used when none is given.
 pub const DEFAULT_MODULE: &str = "main";
-/// LLVM type of one registration entry.
-pub const REGISTRATION_ENTRY_TYPE: &str = "%playgta6.LiftedFunction";
+/// LLVM type of one registration entry (O9's `Pg6LiftedFunctionEntry { uint64_t va; LiftedFn fn; }`).
+pub const REGISTRATION_ENTRY_TYPE: &str = "%Pg6LiftedFunctionEntry";
+/// Symbol prefix of the generated `i32 ()` function that registers the table with the runtime
+/// (module name appended).
+pub const REGISTER_FUNCTION_PREFIX: &str = "__playgta6_register_lifted_functions_";
+/// The guest runtime's bulk registration entry point (`runtime/guest/guest_runtime.h`):
+/// `int32_t pg6_guest_register_lifted_functions(const Pg6LiftedFunctionEntry*, size_t)`.
+pub const RUNTIME_REGISTER_FUNCTION: &str = "pg6_guest_register_lifted_functions";
 /// Manifest schema name and version.
 pub const MANIFEST_SCHEMA: &str = "playgta6-recomp-build";
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -269,6 +277,11 @@ pub fn registration_symbols(module: &str) -> (String, String) {
         format!("{REGISTRATION_TABLE_PREFIX}{module}"),
         format!("{REGISTRATION_COUNT_PREFIX}{module}"),
     )
+}
+
+/// Symbol of the generated function registering `module`'s table with the guest runtime.
+pub fn register_function_symbol(module: &str) -> String {
+    format!("{REGISTER_FUNCTION_PREFIX}{module}")
 }
 
 /// Why a build failed. Messages carry names, addresses and the user's own paths only.
@@ -634,7 +647,18 @@ pub fn write_registration_table(
         }
         writeln!(out, "], align 8")?;
     }
-    writeln!(out, "@{count_symbol} = constant i64 {count}, align 8")
+    writeln!(out, "@{count_symbol} = constant i64 {count}, align 8")?;
+    writeln!(out)?;
+    writeln!(out, "declare i32 @{RUNTIME_REGISTER_FUNCTION}(ptr, i64)")?;
+    writeln!(out)?;
+    writeln!(out, "define i32 @{}() {{", register_function_symbol(module))?;
+    writeln!(out, "entry:")?;
+    writeln!(
+        out,
+        "  %ok = call i32 @{RUNTIME_REGISTER_FUNCTION}(ptr @{table}, i64 {count})"
+    )?;
+    writeln!(out, "  ret i32 %ok")?;
+    writeln!(out, "}}")
 }
 
 /// Removes shard and registration files a previous build left in `lift_dir`.
@@ -1824,6 +1848,10 @@ pub fn render_manifest(r: &PipelineReport) -> String {
             obj([
                 ("table_symbol", Json::Str(table_symbol)),
                 ("count_symbol", Json::Str(count_symbol)),
+                (
+                    "register_function",
+                    Json::Str(register_function_symbol(&r.module)),
+                ),
                 ("entry_type", Json::Str(REGISTRATION_ENTRY_TYPE.to_string())),
                 ("count", num(d.functions)),
                 ("ll", Json::Str(l.registration_ll.path.clone())),
