@@ -251,6 +251,9 @@ pub enum ImportedSymbol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportModule {
     pub dll_name: String,
+    /// RVA of the import address table (`FirstThunk`): symbol `i` is bound through the 8-byte
+    /// slot at `iat_rva + 8 * i`. 0 when the descriptor has no IAT.
+    pub iat_rva: u32,
     pub symbols: Vec<ImportedSymbol>,
 }
 
@@ -259,6 +262,9 @@ pub struct DelayImportModule {
     pub dll_name: String,
     pub attributes: u32,
     pub uses_rva: bool,
+    /// RVA of the delay-load import address table (always an RVA, also for VA-mode
+    /// descriptors): symbol `i` is bound through the slot at `iat_rva + 8 * i`. 0 when absent.
+    pub iat_rva: u32,
     pub symbols: Vec<ImportedSymbol>,
 }
 
@@ -645,7 +651,11 @@ fn parse_imports(
             Vec::new()
         };
 
-        modules.push(ImportModule { dll_name, symbols });
+        modules.push(ImportModule {
+            dll_name,
+            iat_rva: first_thunk,
+            symbols,
+        });
         index += 1;
     }
 
@@ -708,6 +718,11 @@ fn parse_delay_imports(
             "delay-load DLL name",
         )?;
 
+        let iat_rva = if iat_addr != 0 {
+            delay_addr32_to_rva(iat_addr, uses_rva, image_base, "delay-load IAT")?
+        } else {
+            0
+        };
         let thunk_addr = if int_addr != 0 { int_addr } else { iat_addr };
         let symbols = if thunk_addr != 0 {
             let thunk_rva = delay_addr32_to_rva(
@@ -742,6 +757,7 @@ fn parse_delay_imports(
             dll_name,
             attributes,
             uses_rva,
+            iat_rva,
             symbols,
         });
         index += 1;

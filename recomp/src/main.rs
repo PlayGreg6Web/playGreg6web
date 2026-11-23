@@ -10,6 +10,7 @@ use playgta6_recomp::discover::discover;
 use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
 use playgta6_recomp::pdata::ExceptionDirectory;
 use playgta6_recomp::pe;
+use playgta6_recomp::stubs;
 use playgta6_recomp::summary::render_summary_json;
 
 use pe::Pe64;
@@ -43,11 +44,20 @@ struct PackImageArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct StubsArgs {
+    pe_path: PathBuf,
+    shims: Vec<PathBuf>,
+    out_dir: PathBuf,
+    include_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
     Inspect(InspectArgs),
     Discover(DiscoverArgs),
     PackImage(PackImageArgs),
+    Stubs(StubsArgs),
 }
 
 fn print_usage() {
@@ -58,6 +68,9 @@ fn print_usage() {
     eprintln!("  playgta6-recomp inspect --from-env [--markdown <out-file>] [--json]");
     eprintln!("  playgta6-recomp discover <pe-path> [--out <json-file>]");
     eprintln!("  playgta6-recomp pack-image <pe-path> --out <dir> [--omit-code-bytes] [--no-headers]");
+    eprintln!(
+        "  playgta6-recomp stubs <pe-path> --shims <header>... --out <dir> [--include-root <dir>]"
+    );
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
@@ -67,6 +80,9 @@ fn print_usage() {
     eprintln!("  --out <dir>            pack-image: write <name>.pgim (contains game bytes; use gitignored work/) and <name>.pgim.json");
     eprintln!("  --omit-code-bytes      pack-image: map executable sections as zero-fill instead of storing their bytes");
     eprintln!("  --no-headers           pack-image: do not map the PE headers at the image base");
+    eprintln!("  --shims <header>...    stubs: runtime headers declaring the extern \"C\" shims");
+    eprintln!("  --out <dir>            stubs: write import thunks, seam header and manifest");
+    eprintln!("  --include-root <dir>   stubs: spell generated #includes relative to <dir>");
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
@@ -81,8 +97,9 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "inspect" => parse_inspect_args(&args[1..]),
         "discover" => parse_discover_args(&args[1..]),
         "pack-image" => parse_pack_image_args(&args[1..]),
+        "stubs" => parse_stubs_args(&args[1..]),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover' or 'pack-image'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image' or 'stubs'. Run with --help for usage."
         )),
     }
 }
@@ -234,6 +251,70 @@ fn parse_pack_image_args(args: &[String]) -> Result<Command, String> {
         pe_path,
         out_dir,
         options,
+    }))
+}
+
+fn parse_stubs_args(args: &[String]) -> Result<Command, String> {
+    let mut pe_path: Option<PathBuf> = None;
+    let mut shims: Vec<PathBuf> = Vec::new();
+    let mut out_dir: Option<PathBuf> = None;
+    let mut include_root: Option<PathBuf> = None;
+
+    let dir_value = |flag: &str, value: Option<&String>| -> Result<PathBuf, String> {
+        match value {
+            Some(v) if !v.starts_with('-') => Ok(PathBuf::from(v)),
+            Some(v) => Err(format!("{flag} requires a <dir> path argument, got '{v}'")),
+            None => Err(format!("{flag} requires a <dir> path argument")),
+        }
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--shims" => {
+                let start = shims.len();
+                while let Some(next) = args.get(i + 1).filter(|a| !a.starts_with('-')) {
+                    shims.push(PathBuf::from(next));
+                    i += 1;
+                }
+                if shims.len() == start {
+                    return Err("--shims requires at least one <header> path".to_string());
+                }
+            }
+            "--out" => {
+                i += 1;
+                out_dir = Some(dir_value("--out", args.get(i))?);
+            }
+            "--include-root" => {
+                i += 1;
+                include_root = Some(dir_value("--include-root", args.get(i))?);
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option '{flag}' for 'stubs'"));
+            }
+            positional => {
+                if pe_path.is_some() {
+                    return Err(format!(
+                        "unexpected extra positional argument '{positional}'"
+                    ));
+                }
+                pe_path = Some(PathBuf::from(positional));
+            }
+        }
+        i += 1;
+    }
+
+    let pe_path = pe_path.ok_or_else(|| "missing input PE path <pe-path>".to_string())?;
+    if shims.is_empty() {
+        return Err("missing --shims <header>... (runtime shim headers)".to_string());
+    }
+    let out_dir = out_dir.ok_or_else(|| "missing --out <dir>".to_string())?;
+    Ok(Command::Stubs(StubsArgs {
+        pe_path,
+        shims,
+        out_dir,
+        include_root,
     }))
 }
 
@@ -520,6 +601,39 @@ fn run_pack_image(args: &PackImageArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_stubs(args: &StubsArgs) -> Result<(), String> {
+    let path = &args.pe_path;
+    let bytes =
+        fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
+    let pe = Pe64::parse(&bytes)
+        .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
+
+    let mut headers = Vec::with_capacity(args.shims.len());
+    for header in &args.shims {
+        headers.push(
+            stubs::load_shim_header(header, args.include_root.as_deref())
+                .map_err(|e| format!("failed to read shim header '{}': {e}", header.display()))?,
+        );
+    }
+    let catalogue = stubs::Catalogue::scan(&headers);
+    let plan = stubs::plan_bridge(&pe, &catalogue);
+    stubs::render_bridge(&plan, &catalogue)
+        .write_to(&args.out_dir)
+        .map_err(|e| {
+            format!(
+                "failed to write import bridge to '{}': {e}",
+                args.out_dir.display()
+            )
+        })?;
+    print!("{}", stubs::render_coverage(&plan, &catalogue));
+    eprintln!(
+        "Wrote import bridge for {} to {}",
+        sanitized_source_label(path),
+        args.out_dir.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_cli(&args) {
@@ -542,6 +656,13 @@ fn main() -> ExitCode {
             }
         },
         Ok(Command::PackImage(pack_args)) => match run_pack_image(&pack_args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::Stubs(stubs_args)) => match run_stubs(&stubs_args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("Error: {err}");
@@ -803,6 +924,79 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
             "no file names or paths"
         );
         assert!(!manifest.contains("KERNEL32"), "no data bytes");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn cli_parses_stubs() {
+        assert_eq!(
+            parse_cli(&vec_s(&[
+                "stubs",
+                "game.exe",
+                "--shims",
+                "runtime/os/win32_kernel.h",
+                "runtime/os/xgameruntime.h",
+                "--out",
+                "work/bridge",
+                "--include-root",
+                "runtime",
+            ])),
+            Ok(Command::Stubs(StubsArgs {
+                pe_path: PathBuf::from("game.exe"),
+                shims: vec![
+                    PathBuf::from("runtime/os/win32_kernel.h"),
+                    PathBuf::from("runtime/os/xgameruntime.h"),
+                ],
+                out_dir: PathBuf::from("work/bridge"),
+                include_root: Some(PathBuf::from("runtime")),
+            }))
+        );
+        assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--out", "o"])).is_err());
+        assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "--out", "o"])).is_err());
+        assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h"])).is_err());
+        assert!(parse_cli(&vec_s(&["stubs", "--shims", "h.h", "--out", "o"])).is_err());
+        assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h", "--out"])).is_err());
+        assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h", "--x"])).is_err());
+    }
+
+    #[test]
+    fn stubs_end_to_end_writes_bridge() {
+        let temp_dir = env::temp_dir().join(format!(
+            "playgta6_recomp_stubs_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(temp_dir.join("rt").join("os")).expect("create temp dir");
+        let exe_path = temp_dir.join("SyntheticGame.exe");
+        fs::write(&exe_path, build_synthetic_pe64(false)).expect("write synthetic pe");
+        let header = temp_dir.join("rt").join("os").join("mini.h");
+        fs::write(
+            &header,
+            "extern \"C\" uint64_t pg6_win32_virtual_alloc(uint64_t a, uint64_t s, uint32_t t, uint32_t p);\n",
+        )
+        .expect("write header");
+
+        let out = temp_dir.join("out");
+        run_stubs(&StubsArgs {
+            pe_path: exe_path,
+            shims: vec![header],
+            out_dir: out.clone(),
+            include_root: Some(temp_dir.join("rt")),
+        })
+        .expect("run_stubs should succeed");
+
+        let source = fs::read_to_string(out.join(stubs::SOURCE_FILE)).expect("read source");
+        assert!(source.contains("#include \"os/mini.h\""));
+        assert!(source.contains("pg6_win32_virtual_alloc("));
+        let manifest = fs::read_to_string(out.join(stubs::MANIFEST_FILE)).expect("read manifest");
+        assert!(manifest.contains("\"bound\": 1"));
+        assert!(!manifest.contains("SyntheticGame"), "no paths");
+        assert!(out.join(stubs::HEADER_FILE).is_file());
+        assert!(out.join(stubs::SEAM_FILE).is_file());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -9,4 +9,5 @@ mod jump_table;
 pub mod pdata;
 pub mod pe;
 pub mod reloc;
+pub mod stubs;
 pub mod summary;
