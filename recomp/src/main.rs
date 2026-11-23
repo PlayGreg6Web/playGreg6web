@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use playgta6_recomp::code_image::CodeImage;
 use playgta6_recomp::discover::discover;
+use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
 use playgta6_recomp::pe;
 use playgta6_recomp::summary::render_summary_json;
 
@@ -34,10 +35,18 @@ struct DiscoverArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PackImageArgs {
+    pe_path: PathBuf,
+    out_dir: PathBuf,
+    options: ImageOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
     Inspect(InspectArgs),
     Discover(DiscoverArgs),
+    PackImage(PackImageArgs),
 }
 
 fn print_usage() {
@@ -47,13 +56,17 @@ fn print_usage() {
     eprintln!("  playgta6-recomp inspect <pe-path> [--markdown <out-file>] [--json]");
     eprintln!("  playgta6-recomp inspect --from-env [--markdown <out-file>] [--json]");
     eprintln!("  playgta6-recomp discover <pe-path> [--out <json-file>]");
+    eprintln!("  playgta6-recomp pack-image <pe-path> --out <dir> [--omit-code-bytes] [--no-headers]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
     eprintln!("  --markdown <out-file>  Write sanitized Markdown report to <out-file>");
     eprintln!("  --json                 Print sanitized JSON report to stdout");
     eprintln!("  --out <json-file>      Write the discovery summary (addresses and counts only) to <json-file>");
-    eprintln!("  -h, --help             Show this help message");
+    eprintln!("  --out <dir>            pack-image: write <name>.pgim (contains game bytes; use gitignored work/) and <name>.pgim.json");
+    eprintln!("  --omit-code-bytes      pack-image: map executable sections as zero-fill instead of storing their bytes");
+    eprintln!("  --no-headers           pack-image: do not map the PE headers at the image base");
+    eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
 }
@@ -66,8 +79,9 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
     match args[0].as_str() {
         "inspect" => parse_inspect_args(&args[1..]),
         "discover" => parse_discover_args(&args[1..]),
+        "pack-image" => parse_pack_image_args(&args[1..]),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect' or 'discover'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover' or 'pack-image'. Run with --help for usage."
         )),
     }
 }
@@ -170,6 +184,56 @@ fn parse_discover_args(args: &[String]) -> Result<Command, String> {
 
     let pe_path = pe_path.ok_or_else(|| "missing input PE path <pe-path>".to_string())?;
     Ok(Command::Discover(DiscoverArgs { pe_path, json_out }))
+}
+
+fn parse_pack_image_args(args: &[String]) -> Result<Command, String> {
+    let mut pe_path: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut options = ImageOptions::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--omit-code-bytes" => options.executable_bytes = ExecutableBytes::Omit,
+            "--no-headers" => options.map_headers = false,
+            "--out" => {
+                i += 1;
+                let Some(path_str) = args.get(i) else {
+                    return Err("--out requires a <dir> path argument".to_string());
+                };
+                if path_str.starts_with('-') {
+                    return Err(format!(
+                        "--out requires a <dir> path argument, got '{path_str}'"
+                    ));
+                }
+                out_dir = Some(PathBuf::from(path_str));
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option '{flag}' for 'pack-image'"));
+            }
+            positional => {
+                if pe_path.is_some() {
+                    return Err(format!(
+                        "unexpected extra positional argument '{positional}'"
+                    ));
+                }
+                pe_path = Some(PathBuf::from(positional));
+            }
+        }
+        i += 1;
+    }
+
+    let pe_path = pe_path.ok_or_else(|| "missing input PE path <pe-path>".to_string())?;
+    let out_dir = out_dir.ok_or_else(|| {
+        "missing --out <dir> (the packed image contains game bytes; use a gitignored directory such as work/)"
+            .to_string()
+    })?;
+    Ok(Command::PackImage(PackImageArgs {
+        pe_path,
+        out_dir,
+        options,
+    }))
 }
 
 fn parse_dotenv_key(content: &str, target_key: &str) -> Option<String> {
@@ -402,6 +466,51 @@ fn run_discover(args: &DiscoverArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_pack_image(args: &PackImageArgs) -> Result<(), String> {
+    let path = &args.pe_path;
+    let label = sanitized_source_label(path);
+    let bytes =
+        fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
+    let pe = Pe64::parse(&bytes)
+        .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
+    let built = image::build_guest_image(&pe, &bytes, args.options)
+        .map_err(|e| format!("failed to build guest image for {label}: {e}"))?;
+    let container = image::write_image(&built.image)
+        .map_err(|e| format!("failed to serialise guest image for {label}: {e}"))?;
+    let manifest = image::render_manifest_json(&built.image, &built.diagnostics)
+        .map_err(|e| format!("failed to render manifest for {label}: {e}"))?;
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("image");
+    let image_path = args.out_dir.join(format!("{stem}.pgim"));
+    let manifest_path = args.out_dir.join(format!("{stem}.pgim.json"));
+    fs::create_dir_all(&args.out_dir).map_err(|e| {
+        format!(
+            "failed to create output directory '{}': {e}",
+            args.out_dir.display()
+        )
+    })?;
+    fs::write(&image_path, &container)
+        .map_err(|e| format!("failed to write '{}': {e}", image_path.display()))?;
+    fs::write(&manifest_path, manifest)
+        .map_err(|e| format!("failed to write '{}': {e}", manifest_path.display()))?;
+
+    print!(
+        "Guest image for {label}: {}",
+        image::render_summary_text(&built.image, &built.diagnostics)
+    );
+    eprintln!(
+        "Wrote {} ({} bytes) and {}",
+        image_path.display(),
+        container.len(),
+        manifest_path.display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_cli(&args) {
@@ -417,6 +526,13 @@ fn main() -> ExitCode {
             }
         },
         Ok(Command::Discover(discover_args)) => match run_discover(&discover_args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::PackImage(pack_args)) => match run_pack_image(&pack_args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("Error: {err}");
@@ -597,6 +713,87 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
         assert!(json.contains("\"function_count\": 4"));
         assert!(json.contains("\"entry\": \"0x140001010\""));
         assert!(!json.contains("SyntheticGame"), "no file names or paths");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn cli_parses_pack_image() {
+        assert_eq!(
+            parse_cli(&vec_s(&["pack-image", "game.exe", "--out", "work/image"])),
+            Ok(Command::PackImage(PackImageArgs {
+                pe_path: PathBuf::from("game.exe"),
+                out_dir: PathBuf::from("work/image"),
+                options: ImageOptions::default(),
+            }))
+        );
+        assert_eq!(
+            parse_cli(&vec_s(&[
+                "pack-image",
+                "--omit-code-bytes",
+                "game.exe",
+                "--no-headers",
+                "--out",
+                "w"
+            ])),
+            Ok(Command::PackImage(PackImageArgs {
+                pe_path: PathBuf::from("game.exe"),
+                out_dir: PathBuf::from("w"),
+                options: ImageOptions {
+                    map_headers: false,
+                    executable_bytes: ExecutableBytes::Omit,
+                },
+            }))
+        );
+        assert!(
+            parse_cli(&vec_s(&["pack-image", "game.exe"])).is_err(),
+            "--out is required"
+        );
+        assert!(parse_cli(&vec_s(&["pack-image", "--out", "w"])).is_err());
+        assert!(parse_cli(&vec_s(&["pack-image", "a.exe", "--out"])).is_err());
+        assert!(parse_cli(&vec_s(&["pack-image", "a.exe", "b.exe", "--out", "w"])).is_err());
+        assert!(parse_cli(&vec_s(&["pack-image", "a.exe", "--out", "w", "--json"])).is_err());
+    }
+
+    #[test]
+    fn pack_image_end_to_end_writes_container_and_manifest() {
+        let temp_dir = env::temp_dir().join(format!(
+            "playgta6_recomp_pack_image_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let exe_path = temp_dir.join("SyntheticGame.exe");
+        let pe_bytes = build_synthetic_pe64(false);
+        fs::write(&exe_path, &pe_bytes).expect("write synthetic pe");
+
+        let out_dir = temp_dir.join("out");
+        run_pack_image(&PackImageArgs {
+            pe_path: exe_path,
+            out_dir: out_dir.clone(),
+            options: ImageOptions::default(),
+        })
+        .expect("run_pack_image should succeed");
+
+        let container = fs::read(out_dir.join("SyntheticGame.pgim")).expect("read container");
+        let packed = image::read_image(&container).expect("container validates");
+        assert_eq!(packed.image_base, 0x1_4000_0000);
+        assert_eq!(packed.sections.len(), 3);
+        let text = packed.section_at(0x1000).expect(".text mapped");
+        assert_eq!(text.data, &pe_bytes[0x200..0x200 + text.data.len()]);
+
+        let manifest =
+            fs::read_to_string(out_dir.join("SyntheticGame.pgim.json")).expect("read manifest");
+        assert!(manifest.contains("\"format\": \"PGIM\""));
+        assert!(manifest.contains(&format!("\"container_bytes\": {}", container.len())));
+        assert!(
+            !manifest.contains("SyntheticGame"),
+            "no file names or paths"
+        );
+        assert!(!manifest.contains("KERNEL32"), "no data bytes");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

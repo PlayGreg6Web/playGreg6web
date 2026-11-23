@@ -4,6 +4,7 @@
 pub mod cfg;
 pub mod code_image;
 pub mod discover;
+pub mod image;
 pub mod pe;
 pub mod reloc;
 pub mod summary;
