@@ -10,13 +10,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use playgta6_recomp::cfg::Terminator;
-use playgta6_recomp::code_image::CodeImage;
 use playgta6_recomp::discover::discover;
-use playgta6_recomp::eh::EhMetadata;
 use playgta6_recomp::lift::compile::{compile_to_wasm64_object, find_llvm_tool};
 use playgta6_recomp::lift::lift_module;
-use playgta6_recomp::pdata::ExceptionDirectory;
 use playgta6_recomp::pe::Pe64;
+use playgta6_recomp::pipeline::{Seeded, seed};
 
 /// File name of the lifted module inside `--out`.
 pub const LL_FILE: &str = "lifted.ll";
@@ -90,7 +88,7 @@ pub fn parse_lift_args(args: &[String]) -> Result<Option<LiftArgs>, String> {
 }
 
 /// Parses a virtual address written in hex, with or without a `0x` prefix.
-fn parse_va(text: &str) -> Result<u64, String> {
+pub fn parse_va(text: &str) -> Result<u64, String> {
     let digits = text
         .strip_prefix("0x")
         .or_else(|| text.strip_prefix("0X"))
@@ -106,11 +104,11 @@ pub fn run_lift(args: &LiftArgs) -> Result<String, String> {
         fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
     let pe = Pe64::parse(&bytes)
         .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
-    // Seed discovery exactly like `discover` does, so both report the same function set.
-    let mut image = CodeImage::from_pe(&pe, &bytes);
-    let pdata = ExceptionDirectory::from_pe(&pe, &bytes);
-    pdata.seed(&mut image);
-    EhMetadata::from_pe(&pe, &bytes, &pdata).seed(&mut image);
+    // Seed discovery exactly like `discover` and `build` do (`.pdata`, EH metadata, no-return
+    // imports).
+    let Seeded {
+        mut image, pdata, ..
+    } = seed(&pe, &bytes);
     image.entry_points.extend(&args.entries);
     image.entry_points.sort_unstable();
     image.entry_points.dedup();

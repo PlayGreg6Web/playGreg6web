@@ -6,12 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use playgta6_recomp::code_image::CodeImage;
 use playgta6_recomp::discover::discover;
-use playgta6_recomp::eh::EhMetadata;
 use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
-use playgta6_recomp::pdata::ExceptionDirectory;
 use playgta6_recomp::pe;
+use playgta6_recomp::pipeline::{self, PipelineOptions};
 use playgta6_recomp::stubs;
 use playgta6_recomp::summary::render_summary_json;
 
@@ -54,6 +52,19 @@ struct StubsArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildArgs {
+    target: InspectTarget,
+    out_dir: PathBuf,
+    module: Option<String>,
+    shims: Vec<PathBuf>,
+    entries: Vec<u64>,
+    emit_obj: bool,
+    jobs: Option<usize>,
+    shard_size: Option<usize>,
+    shard_instructions: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
     Inspect(InspectArgs),
@@ -61,6 +72,7 @@ enum Command {
     PackImage(PackImageArgs),
     Stubs(StubsArgs),
     Lift(lift_cmd::LiftArgs),
+    Build(BuildArgs),
 }
 
 fn print_usage() {
@@ -75,6 +87,9 @@ fn print_usage() {
         "  playgta6-recomp stubs <pe-path> --shims <header>... --out <dir> [--include-root <dir>]"
     );
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
+    eprintln!(
+        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]"
+    );
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
@@ -90,6 +105,16 @@ fn print_usage() {
     eprintln!("  --out <dir>            lift: write lifted.ll (and lifted.o) derived from game code; use gitignored work/");
     eprintln!("  --entry <va>           lift: extra function entry point (hex VA), repeatable");
     eprintln!("  --emit-obj             lift: also compile a wasm64 object with llc/clang");
+    eprintln!("  --out <dir>            build: write lifted shards, registration table, import bridge, guest image,");
+    eprintln!("                         report.txt and build-manifest.json (game-derived; gitignored work/ or outside the repo)");
+    eprintln!("  --from-env             build: use the single top-level .exe of GTA6_GAME_DIR");
+    eprintln!("  --module <name>        build: module name ([A-Za-z0-9_]): outputs go to <dir>/<name>/, table symbols get _<name> (default {})", pipeline::DEFAULT_MODULE);
+    eprintln!("  --shims <header>...    build: runtime shim headers (default: runtime/os/*.h + runtime/gpu/d3d12_xs.h of this checkout)");
+    eprintln!("  --entry <va>           build: extra function entry point (hex VA), repeatable");
+    eprintln!("  --emit-obj             build: also compile every shard and the registration table to wasm64 objects");
+    eprintln!("  --jobs N               build: worker threads for lifting/compiling (default: CPU count; output is identical)");
+    eprintln!("  --shard-size N         build: maximum functions per lifted shard (default {})", pipeline::DEFAULT_SHARD_SIZE);
+    eprintln!("  --shard-instructions N build: maximum instructions per lifted shard (default {})", pipeline::DEFAULT_SHARD_INSTRUCTIONS);
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
@@ -108,10 +133,126 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "lift" => {
             lift_cmd::parse_lift_args(&args[1..]).map(|a| a.map_or(Command::Help, Command::Lift))
         }
+        "build" => parse_build_args(&args[1..]),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs' or 'lift'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift' or 'build'. Run with --help for usage."
         )),
     }
+}
+
+fn parse_build_args(args: &[String]) -> Result<Command, String> {
+    let mut pe_path: Option<PathBuf> = None;
+    let mut from_env = false;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut module = None;
+    let mut shims: Vec<PathBuf> = Vec::new();
+    let mut entries = Vec::new();
+    let mut emit_obj = false;
+    let mut jobs = None;
+    let mut shard_size = None;
+    let mut shard_instructions = None;
+
+    let count = |flag: &str, value: Option<&String>| -> Result<usize, String> {
+        value
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| format!("{flag} requires a positive integer"))
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--from-env" => from_env = true,
+            "--emit-obj" => emit_obj = true,
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(dir) if !dir.starts_with('-') => out_dir = Some(PathBuf::from(dir)),
+                    _ => return Err("--out requires an output <dir> argument".to_string()),
+                }
+            }
+            "--shims" => {
+                let start = shims.len();
+                while let Some(next) = args.get(i + 1).filter(|a| !a.starts_with('-')) {
+                    shims.push(PathBuf::from(next));
+                    i += 1;
+                }
+                if shims.len() == start {
+                    return Err("--shims requires at least one <header> path".to_string());
+                }
+            }
+            "--module" => {
+                i += 1;
+                match args.get(i) {
+                    Some(name) if pipeline::is_valid_module_name(name) => {
+                        module = Some(name.clone());
+                    }
+                    _ => {
+                        return Err(
+                            "--module requires a <name> of 1-64 characters from [A-Za-z0-9_]"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            "--entry" => {
+                i += 1;
+                let Some(text) = args.get(i) else {
+                    return Err("--entry requires a hexadecimal <va> argument".to_string());
+                };
+                entries.push(lift_cmd::parse_va(text)?);
+            }
+            "--jobs" => {
+                i += 1;
+                jobs = Some(count("--jobs", args.get(i))?);
+            }
+            "--shard-size" => {
+                i += 1;
+                shard_size = Some(count("--shard-size", args.get(i))?);
+            }
+            "--shard-instructions" => {
+                i += 1;
+                shard_instructions = Some(count("--shard-instructions", args.get(i))?);
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option '{flag}' for 'build'"));
+            }
+            positional => {
+                if pe_path.is_some() {
+                    return Err(format!(
+                        "unexpected extra positional argument '{positional}'"
+                    ));
+                }
+                pe_path = Some(PathBuf::from(positional));
+            }
+        }
+        i += 1;
+    }
+
+    let target = match (pe_path, from_env) {
+        (Some(_), true) => return Err("cannot specify both <pe-path> and --from-env".to_string()),
+        (None, false) => {
+            return Err("missing input PE path (provide <pe-path> or --from-env)".to_string());
+        }
+        (Some(path), false) => InspectTarget::Path(path),
+        (None, true) => InspectTarget::FromEnv,
+    };
+    let out_dir = out_dir.ok_or_else(|| {
+        "missing --out <dir> (build outputs are derived from game code; use the gitignored work/)"
+            .to_string()
+    })?;
+    Ok(Command::Build(BuildArgs {
+        target,
+        out_dir,
+        module,
+        shims,
+        entries,
+        emit_obj,
+        jobs,
+        shard_size,
+        shard_instructions,
+    }))
 }
 
 fn parse_inspect_args(args: &[String]) -> Result<Command, String> {
@@ -526,23 +667,21 @@ fn run_discover(args: &DiscoverArgs) -> Result<(), String> {
         fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
     let pe = Pe64::parse(&bytes)
         .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
-    let mut image = CodeImage::from_pe(&pe, &bytes);
-    let pdata = ExceptionDirectory::from_pe(&pe, &bytes);
+    let pipeline::Seeded {
+        image, pdata, eh, ..
+    } = pipeline::seed(&pe, &bytes);
     if let Some(first) = pdata.diagnostics.first() {
         eprintln!(
             "Warning: {} .pdata diagnostic(s), first: {first}",
             pdata.diagnostics.len()
         );
     }
-    pdata.seed(&mut image);
-    let eh = EhMetadata::from_pe(&pe, &bytes, &pdata);
     if let Some(first) = eh.diagnostics.first() {
         eprintln!(
             "Warning: {} EH metadata diagnostic(s), first: {first}",
             eh.diagnostics.len()
         );
     }
-    eh.seed(&mut image);
     let summary = render_summary_json(&image, &discover(&image));
 
     match &args.json_out {
@@ -652,6 +791,62 @@ fn run_stubs(args: &StubsArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_build(args: &BuildArgs) -> Result<String, String> {
+    let pe_path = match &args.target {
+        InspectTarget::Path(path) => path.clone(),
+        InspectTarget::FromEnv => {
+            let cwd = env::current_dir()
+                .map_err(|e| format!("failed to determine current directory: {e}"))?;
+            let mut exes = find_top_level_exes(&resolve_game_dir_from_env(&cwd)?)?;
+            if exes.len() != 1 {
+                return Err(format!(
+                    "--from-env needs exactly one top-level .exe in GTA6_GAME_DIR, found {}; pass <pe-path> instead",
+                    exes.len()
+                ));
+            }
+            exes.remove(0)
+        }
+    };
+    let mut options = PipelineOptions::new(pe_path, &args.out_dir);
+    if let Some(module) = &args.module {
+        options.module = module.clone();
+    }
+    if args.shims.is_empty() {
+        let cwd = env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?;
+        let (headers, root) = pipeline::checkout_shim_headers(&cwd).ok_or(
+            "missing --shims <header>... (no playgta6web checkout found to take runtime/os/*.h from)",
+        )?;
+        options.shim_headers = headers;
+        options.include_root = Some(root);
+    } else {
+        options.shim_headers = args.shims.clone();
+    }
+    options.extra_entries = args.entries.clone();
+    options.emit_obj = args.emit_obj;
+    if let Some(jobs) = args.jobs {
+        options.jobs = jobs;
+    }
+    if let Some(shard_size) = args.shard_size {
+        options.shard_size = shard_size;
+    }
+    if let Some(limit) = args.shard_instructions {
+        options.shard_instructions = limit;
+    }
+    let start = std::time::Instant::now();
+    let report = pipeline::run_with_progress(&options, &mut |stage| {
+        eprintln!("[{:>9.2}s] {stage} done", start.elapsed().as_secs_f64());
+    })
+    .map_err(|e| e.to_string())?;
+    eprintln!(
+        "Wrote {} files and {} to {}",
+        report.files.len(),
+        pipeline::MANIFEST_FILE,
+        options.module_dir().display()
+    );
+    Ok(report.report)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_cli(&args) {
@@ -690,6 +885,16 @@ fn main() -> ExitCode {
         Ok(Command::Lift(lift_args)) => match lift_cmd::run_lift(&lift_args) {
             Ok(summary) => {
                 print!("{summary}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::Build(build_args)) => match run_build(&build_args) {
+            Ok(report) => {
+                print!("{report}");
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -986,6 +1191,103 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
         assert!(parse_cli(&vec_s(&["stubs", "--shims", "h.h", "--out", "o"])).is_err());
         assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h", "--out"])).is_err());
         assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h", "--x"])).is_err());
+    }
+
+    #[test]
+    fn cli_parses_build() {
+        assert_eq!(
+            parse_cli(&vec_s(&[
+                "build",
+                "game.exe",
+                "--out",
+                "work/build",
+                "--module",
+                "game",
+                "--shims",
+                "a.h",
+                "b.h",
+                "--entry",
+                "0x140001000",
+                "--emit-obj",
+                "--jobs",
+                "8",
+                "--shard-size",
+                "512",
+                "--shard-instructions",
+                "1000",
+            ])),
+            Ok(Command::Build(BuildArgs {
+                target: InspectTarget::Path(PathBuf::from("game.exe")),
+                out_dir: PathBuf::from("work/build"),
+                module: Some("game".to_string()),
+                shims: vec![PathBuf::from("a.h"), PathBuf::from("b.h")],
+                entries: vec![0x1_4000_1000],
+                emit_obj: true,
+                jobs: Some(8),
+                shard_size: Some(512),
+                shard_instructions: Some(1000),
+            }))
+        );
+        assert_eq!(
+            parse_cli(&vec_s(&["build", "--from-env", "--out", "w"])),
+            Ok(Command::Build(BuildArgs {
+                target: InspectTarget::FromEnv,
+                out_dir: PathBuf::from("w"),
+                module: None,
+                shims: Vec::new(),
+                entries: Vec::new(),
+                emit_obj: false,
+                jobs: None,
+                shard_size: None,
+                shard_instructions: None,
+            }))
+        );
+        assert!(parse_cli(&vec_s(&["build", "game.exe"])).is_err(), "--out is required");
+        assert!(parse_cli(&vec_s(&["build", "--out", "w"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--from-env", "--out", "w"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--jobs", "0"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--shard-size"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--shims"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--entry", "zz"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--bogus"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--module", "a/b"])).is_err());
+    }
+
+    #[test]
+    fn build_end_to_end_prints_the_report() {
+        let temp_dir = env::temp_dir().join(format!(
+            "playgta6_recomp_build_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let exe_path = temp_dir.join("SyntheticGame.exe");
+        fs::write(&exe_path, build_synthetic_pe64(false)).expect("write synthetic pe");
+        let header = temp_dir.join("mini.h");
+        fs::write(&header, "extern \"C\" void pg6_win32_virtual_alloc(void);\n").expect("header");
+
+        let out = temp_dir.join("out");
+        let report = run_build(&BuildArgs {
+            target: InspectTarget::Path(exe_path),
+            out_dir: out.clone(),
+            module: None,
+            shims: vec![header],
+            entries: Vec::new(),
+            emit_obj: false,
+            jobs: Some(2),
+            shard_size: None,
+            shard_instructions: None,
+        })
+        .expect("run_build should succeed");
+        assert!(report.starts_with("playgta6-recomp build report: module main\n"), "{report}");
+        assert!(report.contains("discovery: 4 functions"), "{report}");
+        assert!(!report.contains("SyntheticGame"), "no file names");
+        assert!(out.join("main").join(pipeline::MANIFEST_FILE).is_file());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

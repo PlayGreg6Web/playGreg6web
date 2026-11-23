@@ -10,6 +10,7 @@ mod jump_table;
 pub mod lift;
 pub mod pdata;
 pub mod pe;
+pub mod pipeline;
 pub mod reloc;
 pub mod stubs;
 pub mod summary;
