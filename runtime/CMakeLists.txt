@@ -7,6 +7,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(playgta6_core STATIC
     os/os_shim.cpp
+    os/vmem.cpp
+    os/threading.cpp
+    os/game_input.cpp
+    os/httpfs_mailbox.cpp
     gpu/cmd_encoder.cpp
 )
 target_include_directories(playgta6_core PUBLIC
@@ -33,8 +37,15 @@ if(EMSCRIPTEN)
         -sERROR_ON_UNDEFINED_SYMBOLS=0
     )
 else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(playgta6_core PUBLIC Threads::Threads)
+
     enable_testing()
     add_executable(runtime_tests ../tests/test_runtime_abi.cpp)
     target_link_libraries(runtime_tests PRIVATE playgta6_core)
     add_test(NAME runtime_abi_tests COMMAND runtime_tests)
+
+    add_executable(os_shim_tests ../tests/test_os_shims.cpp)
+    target_link_libraries(os_shim_tests PRIVATE playgta6_core)
+    add_test(NAME os_shim_tests COMMAND os_shim_tests)
 endif()
