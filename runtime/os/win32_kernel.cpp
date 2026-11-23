@@ -20,6 +20,8 @@ namespace {
 // ---------------------------------------------------------------------------
 
 thread_local uint32_t g_last_error = ERROR_SUCCESS;
+// When a guest thread runs on this host thread, its TEB LastErrorValue (see SetThreadLastErrorSlot).
+thread_local uint32_t* g_last_error_slot = nullptr;
 
 const std::chrono::steady_clock::time_point& process_start_time() {
     static const auto kStart = std::chrono::steady_clock::now();
@@ -1611,11 +1613,21 @@ void GetSystemTimeAsFileTime(FileTime* system_time_as_file_time) {
 }
 
 uint32_t GetLastError() {
-    return g_last_error;
+    return g_last_error_slot != nullptr ? *g_last_error_slot : g_last_error;
 }
 
 void SetLastError(uint32_t error_code) {
-    g_last_error = error_code;
+    if (g_last_error_slot != nullptr) {
+        *g_last_error_slot = error_code;
+    } else {
+        g_last_error = error_code;
+    }
+}
+
+uint32_t* SetThreadLastErrorSlot(uint32_t* slot) {
+    uint32_t* previous = g_last_error_slot;
+    g_last_error_slot = slot;
+    return previous;
 }
 
 }  // namespace playgta6::os::win32

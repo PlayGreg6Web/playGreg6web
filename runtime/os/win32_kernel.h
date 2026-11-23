@@ -311,6 +311,11 @@ void GetSystemTimeAsFileTime(FileTime* system_time_as_file_time);
 uint32_t GetLastError();
 void SetLastError(uint32_t error_code);
 
+// Redirects this host thread's last-error value to `slot` (the running guest thread's TEB
+// LastErrorValue, gs:[0x68], see guest/boot.h) so GetLastError/SetLastError and inline guest
+// reads of the TEB agree; nullptr restores the host thread_local. Returns the previous slot.
+uint32_t* SetThreadLastErrorSlot(uint32_t* slot);
+
 }  // namespace playgta6::os::win32
 
 // ---------------------------------------------------------------------------

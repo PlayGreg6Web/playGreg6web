@@ -72,6 +72,8 @@ Registry& registry() {
     return instance;
 }
 
+std::atomic<DispatchObserver> g_dispatch_observer{nullptr};
+
 const LiftedFunctionEntry* find_entry(const LiftedTable& table, uint64_t va) {
     const LiftedFunctionEntry* end = table.entries + table.count;
     const LiftedFunctionEntry* it = std::lower_bound(
@@ -393,6 +395,10 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size) {
     return out.length;
 }
 
+DispatchObserver set_dispatch_observer(DispatchObserver observer) {
+    return g_dispatch_observer.exchange(observer, std::memory_order_acq_rel);
+}
+
 void raise_fault(FaultKind kind, GuestState* state, uint64_t va, uint64_t detail) {
     const FaultInfo info{static_cast<uint32_t>(kind), 0, va, detail, state};
     if (FaultHandler handler = registry().fault_handler.load(std::memory_order_acquire)) {
@@ -495,6 +501,7 @@ void reset_guest_runtime() {
     reg.names.clear();
     reg.proc_to_synthetic.clear();
     reg.fault_handler.store(nullptr, std::memory_order_release);
+    g_dispatch_observer.store(nullptr, std::memory_order_release);
 }
 
 }  // namespace playgta6::guest
@@ -510,6 +517,9 @@ extern "C" {
 
 PG6_GUEST_HELPER void __playgta6_indirect_call(GuestState* state, uint64_t target) {
     state->rip = target;
+    if (guest::DispatchObserver observer = guest::g_dispatch_observer.load(std::memory_order_acquire)) {
+        observer(state, target);
+    }
     if (guest::is_synthetic_address(target)) {
         if (target == guest::kGuestReturnSentinel) {
             return;  // a jump to call_guest's return address: back to the host caller

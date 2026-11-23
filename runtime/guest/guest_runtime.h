@@ -184,6 +184,12 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size);
 
 [[noreturn]] void raise_fault(FaultKind kind, GuestState* state, uint64_t va, uint64_t detail = 0);
 
+// Optional observer run by __playgta6_indirect_call before it resolves `target` (call counting
+// and run bounds for diagnostics, see guest/boot.h). It may leave like a fault handler (throw,
+// longjmp) to stop the guest. nullptr removes it. Returns the previous observer.
+using DispatchObserver = void (*)(GuestState* state, uint64_t target);
+DispatchObserver set_dispatch_observer(DispatchObserver observer);
+
 // ---------------------------------------------------------------------------
 // Guest threads and entry calls
 // ---------------------------------------------------------------------------
