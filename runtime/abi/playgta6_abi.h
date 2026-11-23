@@ -807,4 +807,16 @@ void __playgta6_indirect_call(playgta6::GuestState* state, uint64_t target);
 [[noreturn]] void __playgta6_unimplemented(playgta6::GuestState* state, uint64_t va);
 // x86 divide error (#DE) raised by div/idiv at `va`.
 [[noreturn]] void __playgta6_divide_error(playgta6::GuestState* state, uint64_t va);
+// CPU identification helpers. Lifted code stores its registers to the state before the call and
+// reloads them after it; the helper reads/writes only the state's GPRs (32-bit results are stored
+// zero-extended into the 64-bit slots).
+// cpuid: in EAX = leaf, ECX = sub-leaf; out EAX EBX ECX EDX.
+void __playgta6_cpuid(playgta6::GuestState* state);
+// rdtsc: out EDX:EAX = time-stamp counter (monotonic per thread).
+void __playgta6_rdtsc(playgta6::GuestState* state);
+// rdtscp: as rdtsc, plus ECX = IA32_TSC_AUX (processor id).
+void __playgta6_rdtscp(playgta6::GuestState* state);
+// xgetbv: in ECX = XCR index; out EDX:EAX = XCR[ECX]. An index without an XCR raises #GP (does
+// not return).
+void __playgta6_xgetbv(playgta6::GuestState* state);
 }  // extern "C"

@@ -56,3 +56,14 @@ Runtime helpers (C linkage, defined by the runtime, all take the state pointer f
 | `__playgta6_trap` | `(state: ptr, va: i64) -> !` | Trap instruction, invalid/unmapped code, or code after an assumed non-returning call at `va`. |
 | `__playgta6_unimplemented` | `(state: ptr, va: i64) -> !` | The instruction at `va` could not be lifted. |
 | `__playgta6_divide_error` | `(state: ptr, va: i64) -> !` | `#DE` from `div`/`idiv` at `va`. |
+
+CPU identification helpers take only the state pointer, `(state: ptr) -> ()`. Lifted code stores its registers and flags to the state before the call and reloads them after; the helper touches only the GPR slots and stores 32-bit results zero-extended.
+
+| Function | In | Out |
+| :--- | :--- | :--- |
+| `__playgta6_cpuid` | `EAX` leaf, `ECX` sub-leaf | `EAX EBX ECX EDX` |
+| `__playgta6_rdtsc` | - | `EDX:EAX` = time-stamp counter (monotonic per thread) |
+| `__playgta6_rdtscp` | - | `EDX:EAX` as `rdtsc`, `ECX` = `IA32_TSC_AUX` (processor id) |
+| `__playgta6_xgetbv` | `ECX` XCR index | `EDX:EAX` = `XCR[ECX]`; an index without an XCR raises `#GP` and does not return |
+
+The advertised `cpuid` features must not exceed what the lifter implements.

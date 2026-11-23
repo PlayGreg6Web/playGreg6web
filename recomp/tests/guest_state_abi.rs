@@ -60,3 +60,19 @@ fn lifter_helpers_match_runtime_abi() {
         );
     }
 }
+
+#[test]
+fn lifter_cpu_helpers_match_runtime_abi() {
+    for helper in [
+        lift::HELPER_CPUID,
+        lift::HELPER_RDTSC,
+        lift::HELPER_RDTSCP,
+        lift::HELPER_XGETBV,
+    ] {
+        let decl = format!("void {helper}(playgta6::GuestState* state);");
+        assert!(
+            ABI_HEADER.contains(&decl),
+            "{helper} is not declared in playgta6_abi.h"
+        );
+    }
+}

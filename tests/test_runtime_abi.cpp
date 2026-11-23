@@ -1104,6 +1104,11 @@ void test_guest_state_layout() {
     static_assert(std::is_same_v<decltype(&__playgta6_trap), HelperFn>);
     static_assert(std::is_same_v<decltype(&__playgta6_unimplemented), HelperFn>);
     static_assert(std::is_same_v<decltype(&__playgta6_divide_error), HelperFn>);
+    using CpuHelperFn = void (*)(GuestState*);
+    static_assert(std::is_same_v<decltype(&__playgta6_cpuid), CpuHelperFn>);
+    static_assert(std::is_same_v<decltype(&__playgta6_rdtsc), CpuHelperFn>);
+    static_assert(std::is_same_v<decltype(&__playgta6_rdtscp), CpuHelperFn>);
+    static_assert(std::is_same_v<decltype(&__playgta6_xgetbv), CpuHelperFn>);
 }
 
 int main() {
