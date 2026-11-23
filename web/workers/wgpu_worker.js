@@ -485,6 +485,8 @@ class WgpuCommandProcessor {
       this.loadReflectionManifest(options.reflectionManifest);
     }
 
+    // Packet ABI v2 handler ({ handlePacket, destroyResource }), see render_state_packets.js.
+    this.extension = null;
     this._resetFrameState();
   }
 
@@ -1418,6 +1420,7 @@ class WgpuCommandProcessor {
     this._pipelineBindGroupLayouts.delete(id);
     this._computePipelineBindGroupLayouts.delete(id);
     this._shaderReflectionKeys.delete(id);
+    if (this.extension) this.extension.destroyResource(id);
   }
 
   _flushPresent() {
@@ -1484,6 +1487,26 @@ class WgpuCommandProcessor {
       }
       activePassKind = 'compute';
       return activePass;
+    };
+
+    // Pass access for queued extension commands ({ type, run(passControl) }).
+    const passControl = {
+      swapchainView,
+      get pass() { return activePass; },
+      get passKind() { return activePassKind; },
+      endPass: endActivePass,
+      beginRenderPass: (descriptor) => {
+        endActivePass();
+        if (timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
+          const tsWrites = this.passTimer.getPassTimestampWrites(`render_${renderPassIdx}`);
+          if (tsWrites) descriptor = { ...descriptor, timestampWrites: tsWrites };
+        }
+        renderPassIdx += 1;
+        activePass = encoder.beginRenderPass(descriptor);
+        activePassKind = 'render';
+        renderPassOpened = true;
+        return activePass;
+      },
     };
 
     for (const cmd of this._passCommands) {
@@ -1557,6 +1580,7 @@ class WgpuCommandProcessor {
           break;
         }
         default:
+          if (typeof cmd.run === 'function') cmd.run(passControl);
           break;
       }
     }
@@ -1836,6 +1860,7 @@ class WgpuCommandProcessor {
           }
           break;
         default:
+          if (this.extension) this.extension.handlePacket(opcode, view, payloadOffset, payloadBytes);
           break;
       }
 
@@ -2040,6 +2065,14 @@ function createWgpuWorkerHandler(options = {}) {
       enableRtPool: initPayload.enableRtPool ?? options.enableRtPool,
       reflectionManifest: initPayload.reflectionManifest ?? options.reflectionManifest,
     });
+    try {
+      if (!globalThis.PlayGta6RenderState && typeof importScripts === 'function') {
+        importScripts('./render_state_packets.js');
+      }
+      if (globalThis.PlayGta6RenderState) globalThis.PlayGta6RenderState.installRenderStatePackets(processor);
+    } catch (err) {
+      postMessage({ error: `packet ABI v2 unavailable: ${String(err)}` });
+    }
     if (attachedRing) {
       processor.attachRing(attachedRing);
     }

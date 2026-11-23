@@ -1319,6 +1319,24 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(lenient.packets[0].fields["trailing_bytes"], 4)
         self.assertFalse(gpu_trace.decode_stream(padded, strict=True).ok)
 
+    def test_state_bridge_fixture_disassembles_strictly(self) -> None:
+        # Packet stream recorded by runtime/gpu/state_bridge (tests/test_state_bridge.cpp).
+        hex_text = (REPO_ROOT / "tests" / "fixtures" / "state_bridge_frame.hex").read_text(encoding="utf-8")
+        trace = gpu_trace.decode_stream(bytes.fromhex("".join(hex_text.split())), strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+        self.assertEqual(trace.packet_count, 27)
+        self.assertEqual(trace.draw_calls, 2)
+        self.assertEqual(trace.opcode_histogram["BeginRenderPass"], 2)
+        self.assertEqual(trace.opcode_histogram["EndRenderPass"], 2)
+        first_pass = trace.packets[0].fields
+        self.assertTrue(first_pass["color_attachments"][0]["swapchain"])
+        self.assertEqual(first_pass["depth_stencil"]["view"]["format"], "depth32float")
+        pipelines = [p for p in trace.packets if p.name == "CreateRenderPipeline2"]
+        self.assertEqual([p.fields["key"]["depth_stencil"] is None for p in pipelines], [False, True])
+        self.assertEqual(pipelines[0].fields["key"]["color_targets"][0]["format"], "bgra8unorm")
+        set_groups = [p.fields["dynamic_offsets"] for p in trace.packets if p.name == "SetBindGroup2"]
+        self.assertEqual(set_groups, [[0], [256]])
+
     def test_encoder_rejects_wrong_key_size(self) -> None:
         with self.assertRaises(ValueError):
             gpu_trace.encode_create_render_pipeline2(1, 2, 3, 0, bytes(375))

@@ -1,0 +1,469 @@
+#pragma once
+
+// D3D12 command-list state -> GPU packet ABI v2 bridge.
+//
+// Drives the G7 PSO cache / output-merger tracker (pso_cache.h) and the G6 descriptor heap / root
+// signature / bind group / resource state library (descriptor_heap.h) from one per-command-list API
+// that the d3d12_xs shim layer calls, and emits the resulting packets (docs/gpu_commands.md v2)
+// through CommandEncoder.
+//
+//   d3d12_xs shim --> CommandListBridge --+--> pso::CommandListStateTracker --StateEvents--+
+//                                         +--> d3d12_state::RootArgumentState / BindGroupCache +--> packets
+//                                         +--> d3d12_state::CommandListStateTracker (barriers)  |
+//                     StateBridgeDevice (shared): PipelineCache, layouts, samplers, views, VA map
+//
+// Packet emission model
+// ---------------------
+// * Device-level objects (bind group layouts, pipeline layouts, pipelines, samplers, the root
+//   constant ring buffer) are created once per device and their creation packet is written into the
+//   stream of the command list that first needs them. Streams must therefore be executed in an order
+//   where that list runs first (true for a single recording thread; with several recording threads the
+//   submitter must preserve recording order, the same limitation G7's PipelineCache has).
+// * Bind groups are per command list (G6 BindGroupCache) and are created, re-created and retired
+//   (DestroyResource) in the list's own stream.
+// * WebGPU resets pipeline, bind groups, vertex/index buffers and dynamic state at every pass begin;
+//   the bridge re-emits whatever a draw needs after each BeginRenderPass.
+//
+// Ids
+// ---
+// All packet-level ids come from one allocator shared with the d3d12_xs device (BridgeOptions::
+// id_allocator), so pipelines, layouts, samplers and bind groups never collide with buffers/textures.
+// View ids handed to G7 are bridge-internal (they never appear in packets).
+//
+// Threading: StateBridgeDevice is thread-safe; CommandListBridge belongs to one recording thread.
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "abi/playgta6_abi.h"
+#include "gpu/cmd_encoder.h"
+#include "gpu/d3d12_xs.h"
+#include "gpu/descriptor_heap.h"
+#include "gpu/pso_cache.h"
+
+namespace playgta6::gpu::bridge {
+
+namespace pso = playgta6::gpu::pso;
+namespace d3d = playgta6::gpu::d3d12_state;
+
+// =====================================================================================================
+// Seam conversions between the G5 (d3d12_xs / ABI v1), G6 (d3d12_state) and G7 (pso) type families.
+// =====================================================================================================
+
+// v1 GpuIndexFormat (SetIndexBuffer) <-> G7 / key index format code.
+pso::WgpuIndexFormat to_wgpu_index_format(GpuIndexFormat format) noexcept;
+// G6 DESCRIPTOR_RANGE_TYPE-style DXGI value (uint32) -> G7 DxgiFormat.
+inline constexpr pso::DxgiFormat to_dxgi(uint32_t dxgi_format) noexcept {
+    return static_cast<pso::DxgiFormat>(dxgi_format);
+}
+// G6 SRV/UAV/RTV view dimension (D3D12_*_DIMENSION) -> GpuTextureViewDimension (Undefined when the
+// view has no WebGPU equivalent or is the default view).
+GpuTextureViewDimension to_view_dimension(uint32_t d3d12_view_dimension, bool* supported) noexcept;
+// G6 SamplerDesc (D3D12_SAMPLER_DESC numbering) -> CreateSampler2 payload (id left 0).
+GpuCreateSampler2Payload to_sampler_payload(const d3d::SamplerDesc& desc, bool* exact) noexcept;
+
+// =====================================================================================================
+// Registration records
+// =====================================================================================================
+
+// Texture metadata the bridge needs to resolve views (registered by the d3d12_xs device when it
+// creates a texture or swapchain buffer).
+struct TextureInfo {
+    pso::DxgiFormat format = pso::DxgiFormat::UNKNOWN;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth_or_array_size = 1;
+    uint32_t mip_levels = 1;
+    uint32_t sample_count = 1;
+    GpuTextureDimension dimension = GpuTextureDimension::Dim2D;
+    bool swapchain = false;  // render pass attachments name kGpuSwapchainTextureId instead of the id
+};
+
+// One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
+// layout-manifest.json `bindings` record). `entry.binding` and `join.binding` must match.
+struct LayoutBinding {
+    GpuBindGroupLayoutEntry entry{};
+    d3d::ShaderBinding join{};
+};
+
+struct GroupLayoutDesc {
+    uint64_t content_id = 0;  // S6 bind group layout id (0 = not from the manifest)
+    std::vector<LayoutBinding> bindings;
+};
+
+// The pipeline layout of one shader combination (S6 `pipelines` / `shaders` entry).
+struct PipelineLayoutDesc {
+    uint64_t content_id = 0;  // S6 pipeline layout id (0 = not from the manifest)
+    std::vector<GroupLayoutDesc> groups;  // group 0..n-1
+};
+
+// =====================================================================================================
+// Diagnostics
+// =====================================================================================================
+
+namespace BridgeDiag {
+inline constexpr uint64_t UnknownShaderModule = 1ull << 0;      // shader identity has no module id
+inline constexpr uint64_t MissingPipelineLayout = 1ull << 1;    // no layout registered: "auto"
+inline constexpr uint64_t RootArgumentNotSet = 1ull << 2;       // bind group skipped (draw skipped)
+inline constexpr uint64_t BindGroupBuildFailed = 1ull << 3;     // other G6 lookup failure
+inline constexpr uint64_t NullBinding = 1ull << 4;              // null/unresolved descriptor bound
+inline constexpr uint64_t ClearFallbackDropped = 1ull << 5;     // partial-rect clear: no packet yet
+inline constexpr uint64_t UsageConflict = 1ull << 6;            // WebGPU usage scope violation
+inline constexpr uint64_t UnknownTexture = 1ull << 7;           // view of an unregistered texture
+inline constexpr uint64_t UnsupportedViewDimension = 1ull << 8; // 1D array / MS array / 3D attachment
+inline constexpr uint64_t SamplerApproximated = 1ull << 9;      // border / mirror-once / min-max filter
+inline constexpr uint64_t DrawSkipped = 1ull << 10;             // see pso tracker diagnostics too
+inline constexpr uint64_t RootConstantRingWrapped = 1ull << 11; // ring reused: size it per frame
+inline constexpr uint64_t NoComputePipeline = 1ull << 12;       // Dispatch without a usable pipeline
+inline constexpr uint64_t CommandListClosed = 1ull << 13;       // call on a closed list ignored
+inline constexpr uint64_t ComponentMappingIgnored = 1ull << 14; // non-identity SRV swizzle
+}  // namespace BridgeDiag
+
+// =====================================================================================================
+// Device-level state
+// =====================================================================================================
+
+struct BridgeOptions {
+    // Shared resource id allocator (must be thread-safe, never return 0). Default: counter from 1.
+    std::function<uint32_t()> id_allocator;
+    uint32_t features = 0;  // pso::WgpuFeature bits enabled on the WebGPU device
+    pso::MidPassClearPolicy mid_pass_clear = pso::MidPassClearPolicy::SplitPass;
+    uint32_t max_texture_dimension_2d = 8192;
+    // Uniform ring for root constants (bound with dynamic offsets). Must hold one frame's worth.
+    uint32_t root_constant_ring_bytes = 1u << 20;
+};
+
+class GraphicsPipelineState;
+class ComputePipelineState;
+
+struct ViewRecord {
+    uint32_t texture_id = 0;  // packet texture id (kGpuSwapchainTextureId for swapchain buffers)
+    uint32_t resource_id = 0; // runtime resource id (usage tracking)
+    GpuTextureViewDesc view{};
+    d3d::SubresourceRange range{};
+    d3d::ResourceUsage usage = d3d::ResourceUsage::RenderTarget;
+};
+
+class StateBridgeDevice final : public pso::DescriptorViewResolver {
+public:
+    // `resource_states` (optional) is the queue-level registry the per-list barrier trackers report to.
+    explicit StateBridgeDevice(d3d::DescriptorHeapRegistry& heaps,
+                               BridgeOptions options = {},
+                               const d3d::ResourceStateRegistry* resource_states = nullptr);
+    ~StateBridgeDevice() override;
+    StateBridgeDevice(const StateBridgeDevice&) = delete;
+    StateBridgeDevice& operator=(const StateBridgeDevice&) = delete;
+
+    // ---- Registration (called by the d3d12_xs device) ----
+    void register_texture(uint32_t resource_id, const TextureInfo& info);
+    // Buffer placed at [gpu_va, gpu_va + byte_size) for CBV / root descriptor address resolution.
+    void register_buffer(uint32_t resource_id, uint64_t gpu_va, uint64_t byte_size);
+    void unregister_resource(uint32_t resource_id);
+    // Shader identity (D3D12GraphicsPsoDesc::vs/ps/cs) -> CreateShaderModule id.
+    void register_shader_module(uint64_t shader_identity, uint32_t module_id);
+    // Layout for a shader combination: (vs, ps) for graphics, (cs, 0) for compute.
+    void register_pipeline_layout(uint64_t first_shader, uint64_t second_shader, PipelineLayoutDesc layout);
+
+    // ---- Pipeline state objects (ID3D12Device::Create*PipelineState) ----
+    std::unique_ptr<GraphicsPipelineState> create_graphics_pipeline_state(
+        const pso::D3D12GraphicsPsoDesc& desc,
+        const d3d::RootSignature* root_signature);
+    std::unique_ptr<ComputePipelineState> create_compute_pipeline_state(
+        const pso::D3D12ComputePsoDesc& desc,
+        const d3d::RootSignature* root_signature);
+    // Final Release of a PSO: drops its pipeline-cache references and emits DestroyResource for the
+    // pipelines the cache evicted (only with EvictUnreferenced caches).
+    void release_pipeline_state(std::unique_ptr<GraphicsPipelineState> pso, CommandEncoder& encoder);
+
+    // ---- pso::DescriptorViewResolver over the G6 heaps ----
+    uint64_t rtv_descriptor_increment() const override;
+    bool resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewInfo* out) const override;
+    bool resolve_dsv(uint64_t cpu_handle, pso::DepthStencilViewInfo* out) const override;
+
+    // Resolves a CBV / root descriptor GPU virtual address (G6 GpuVaResolver contract).
+    bool resolve_gpu_va(uint64_t gpu_address, d3d::GpuVaResolution* out) const;
+    static bool gpu_va_trampoline(void* user, uint64_t gpu_address, d3d::GpuVaResolution* out);
+
+    const ViewRecord* view(uint32_t view_id) const;
+    pso::PipelineCache& pipeline_cache() noexcept { return *pipeline_cache_; }
+    d3d::DescriptorHeapRegistry& heaps() noexcept { return heaps_; }
+    const BridgeOptions& options() const noexcept { return options_; }
+    uint32_t allocate_id() { return options_.id_allocator(); }
+
+private:
+    friend class CommandListBridge;
+    friend class GraphicsPipelineState;
+    friend class ComputePipelineState;
+
+    struct GroupLayoutRecord {
+        uint32_t id = 0;
+        GpuCreateBindGroupLayoutPayload header{};
+        std::vector<GpuBindGroupLayoutEntry> entries;
+        std::vector<d3d::ShaderBinding> joins;  // same order as entries
+        bool emitted = false;
+    };
+    struct PipelineLayoutRecord {
+        uint32_t id = 0;
+        uint64_t content_id = 0;
+        std::vector<GroupLayoutRecord*> groups;
+        bool emitted = false;
+    };
+
+    bool texture_info(uint32_t resource_id, TextureInfo* out) const;
+    uint32_t intern_view(const ViewRecord& record) const;
+    bool resolve_view_descriptor(uint64_t cpu_handle, d3d::DescriptorKind kind, d3d::ViewDescriptor* out) const;
+    PipelineLayoutRecord* find_layout(uint64_t first_shader, uint64_t second_shader);
+    uint32_t module_id(uint64_t shader_identity, bool* known) const;
+    // Emits the layout's creation packets the first time any list needs them.
+    void ensure_layout_emitted(PipelineLayoutRecord* layout, CommandEncoder& encoder);
+    // Returns the sampler id for `desc`, emitting CreateSampler2 on first use.
+    uint32_t intern_sampler(const d3d::SamplerDesc& desc, CommandEncoder& encoder, uint64_t* diagnostics);
+    // Root constant ring buffer id; emits its CreateBuffer on first use.
+    uint32_t ensure_root_constant_ring(CommandEncoder& encoder);
+    // Reserves `bytes` (256-byte aligned start) in the ring and returns the offset.
+    uint32_t allocate_root_constants(uint32_t bytes, bool* wrapped);
+    // True exactly once per compute pipeline id: the caller emits CreateComputePipeline2.
+    bool claim_compute_creation(uint32_t pipeline_id);
+
+    d3d::DescriptorHeapRegistry& heaps_;
+    BridgeOptions options_;
+    const d3d::ResourceStateRegistry* resource_states_ = nullptr;
+    std::unique_ptr<pso::PipelineCache> pipeline_cache_;
+
+    mutable std::shared_mutex resources_mutex_;
+    std::unordered_map<uint32_t, TextureInfo> textures_;
+    std::map<uint64_t, std::pair<uint32_t, uint64_t>> buffers_by_va_;  // va -> (id, size)
+    std::unordered_map<uint32_t, uint64_t> buffer_va_;                  // id -> va
+    std::unordered_map<uint64_t, uint32_t> shader_modules_;
+
+    mutable std::mutex views_mutex_;
+    mutable std::deque<ViewRecord> views_;  // index = view_id - 1 (stable addresses)
+    mutable std::unordered_map<std::string, uint32_t> view_ids_;
+
+    std::mutex objects_mutex_;  // layouts, samplers, root constant ring
+    std::vector<std::unique_ptr<GroupLayoutRecord>> group_layouts_;
+    std::vector<std::unique_ptr<PipelineLayoutRecord>> pipeline_layouts_;
+    std::map<std::pair<uint64_t, uint64_t>, PipelineLayoutRecord*> layouts_by_shaders_;
+    std::unordered_map<std::string, uint32_t> samplers_;
+    std::unordered_set<uint32_t> emitted_compute_;
+    uint32_t ring_buffer_id_ = 0;
+    uint32_t ring_cursor_ = 0;
+};
+
+// Graphics PSO as seen by the bridge: the G7 GraphicsPso plus everything needed to emit its packets.
+class GraphicsPipelineState {
+public:
+    pso::GraphicsPso& pso() noexcept { return pso_; }
+    const d3d::RootSignature* root_signature() const noexcept { return root_signature_; }
+    uint64_t diagnostics() const noexcept { return diagnostics_; }
+
+private:
+    friend class StateBridgeDevice;
+    friend class CommandListBridge;
+    GraphicsPipelineState(const pso::D3D12GraphicsPsoDesc& desc, const pso::PipelineKeyOptions& options)
+        : pso_(desc, options) {}
+
+    pso::GraphicsPso pso_;
+    const d3d::RootSignature* root_signature_ = nullptr;
+    uint32_t vs_module_id_ = 0;
+    uint32_t fs_module_id_ = 0;
+    StateBridgeDevice::PipelineLayoutRecord* layout_ = nullptr;
+    std::vector<d3d::BindGroupPlan> plans_;  // one per layout group
+    uint64_t diagnostics_ = 0;               // BridgeDiag bits found at creation
+};
+
+class ComputePipelineState {
+public:
+    uint32_t pipeline_id() const noexcept { return pipeline_id_; }
+    const d3d::RootSignature* root_signature() const noexcept { return root_signature_; }
+    uint64_t diagnostics() const noexcept { return diagnostics_; }
+
+private:
+    friend class StateBridgeDevice;
+    friend class CommandListBridge;
+    ComputePipelineState() = default;
+
+    pso::ComputePipelineKey key_{};
+    uint32_t pipeline_id_ = 0;
+    const d3d::RootSignature* root_signature_ = nullptr;
+    uint32_t cs_module_id_ = 0;
+    StateBridgeDevice::PipelineLayoutRecord* layout_ = nullptr;
+    std::vector<d3d::BindGroupPlan> plans_;
+    uint64_t diagnostics_ = 0;
+};
+
+// =====================================================================================================
+// Per-command-list recording API (ID3D12GraphicsCommandList subset)
+// =====================================================================================================
+
+struct BridgeStats {
+    uint64_t draws = 0;
+    uint64_t draws_skipped = 0;
+    uint64_t dispatches = 0;
+    uint64_t render_passes = 0;
+    uint64_t pipelines_created = 0;
+    uint64_t bind_groups_created = 0;
+    uint64_t bind_groups_retired = 0;
+    uint64_t root_constant_uploads = 0;
+    uint64_t clear_fallbacks_dropped = 0;
+    uint64_t usage_conflicts = 0;
+};
+
+class CommandListBridge {
+public:
+    CommandListBridge(StateBridgeDevice& device, CommandEncoder& encoder);
+
+    // ID3D12GraphicsCommandList::Reset (state back to defaults; the encoder is not cleared).
+    void Reset(GraphicsPipelineState* initial_state = nullptr);
+    // Flushes pending clears, ends the open render pass and finishes the list.
+    void Close();
+    bool is_open() const noexcept { return open_; }
+
+    // Pipeline state.
+    void SetPipelineState(GraphicsPipelineState* pso);
+    void SetComputePipelineState(ComputePipelineState* pso);
+
+    // Output merger / clears.
+    void OMSetRenderTargets(uint32_t num_render_target_descriptors,
+                            const d3d::CpuDescriptorHandle* render_target_descriptors,
+                            bool rts_single_handle_to_descriptor_range,
+                            const d3d::CpuDescriptorHandle* depth_stencil_descriptor);
+    void ClearRenderTargetView(d3d::CpuDescriptorHandle rtv,
+                               const float color_rgba[4],
+                               uint32_t num_rects = 0,
+                               const pso::D3D12Rect* rects = nullptr);
+    void ClearDepthStencilView(d3d::CpuDescriptorHandle dsv,
+                               uint32_t clear_flags,
+                               float depth,
+                               uint8_t stencil,
+                               uint32_t num_rects = 0,
+                               const pso::D3D12Rect* rects = nullptr);
+    void OMSetBlendFactor(const float blend_factor[4]);
+    void OMSetStencilRef(uint32_t stencil_ref);
+
+    // Rasterizer.
+    void RSSetViewports(uint32_t num_viewports, const pso::D3D12Viewport* viewports);
+    void RSSetScissorRects(uint32_t num_rects, const pso::D3D12Rect* rects);
+
+    // Input assembler.
+    void IASetPrimitiveTopology(pso::D3DPrimitiveTopology topology);
+    void IASetVertexBuffers(uint32_t start_slot, uint32_t num_views, const d3d12_xs::D3D12VertexBufferView* views);
+    void IASetIndexBuffer(const d3d12_xs::D3D12IndexBufferView* view);
+
+    // Root signature and arguments.
+    d3d::Status SetDescriptorHeaps(uint32_t count, d3d::DescriptorHeap* const* heaps);
+    d3d::Status SetGraphicsRootSignature(const d3d::RootSignature* signature);
+    d3d::Status SetComputeRootSignature(const d3d::RootSignature* signature);
+    d3d::Status SetGraphicsRootDescriptorTable(uint32_t parameter_index, d3d::GpuDescriptorHandle base);
+    d3d::Status SetComputeRootDescriptorTable(uint32_t parameter_index, d3d::GpuDescriptorHandle base);
+    d3d::Status SetGraphicsRoot32BitConstants(uint32_t parameter_index, uint32_t num_values,
+                                              const uint32_t* values, uint32_t dest_offset);
+    d3d::Status SetComputeRoot32BitConstants(uint32_t parameter_index, uint32_t num_values,
+                                             const uint32_t* values, uint32_t dest_offset);
+    d3d::Status SetGraphicsRootConstantBufferView(uint32_t parameter_index, uint64_t gpu_address);
+    d3d::Status SetComputeRootConstantBufferView(uint32_t parameter_index, uint64_t gpu_address);
+    d3d::Status SetGraphicsRootShaderResourceView(uint32_t parameter_index, uint64_t gpu_address);
+    d3d::Status SetGraphicsRootUnorderedAccessView(uint32_t parameter_index, uint64_t gpu_address);
+
+    // Work.
+    void DrawInstanced(uint32_t vertex_count_per_instance, uint32_t instance_count,
+                       uint32_t start_vertex_location, uint32_t start_instance_location);
+    void DrawIndexedInstanced(uint32_t index_count_per_instance, uint32_t instance_count,
+                              uint32_t start_index_location, int32_t base_vertex_location,
+                              uint32_t start_instance_location);
+    void Dispatch(uint32_t thread_group_count_x, uint32_t thread_group_count_y, uint32_t thread_group_count_z);
+
+    // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
+    void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
+
+    // Inspection.
+    uint64_t diagnostics() const noexcept { return diagnostics_; }
+    uint64_t state_diagnostics() const noexcept { return tracker_.diagnostics(); }        // pso::StateDiag
+    uint64_t pipeline_diagnostics() const noexcept { return tracker_.pipeline_diagnostics(); }  // pso::PipelineDiag
+    const std::vector<d3d::UsageConflict>& usage_conflicts() const noexcept { return usage_conflicts_; }
+    const d3d::CommandListStateTracker& resource_states() const noexcept { return resource_states_; }
+    const BridgeStats& stats() const noexcept { return stats_; }
+    const pso::TrackerStats& tracker_stats() const noexcept { return tracker_.stats(); }
+
+private:
+    struct BoundGroup {
+        uint32_t bind_group_id = 0;
+        std::vector<uint32_t> dynamic_offsets;
+    };
+    struct VertexBinding {
+        uint32_t buffer_id = 0;
+        uint64_t offset = 0;
+    };
+
+    bool writable() noexcept;
+    void drain_events();
+    void emit_begin_render_pass(const pso::RenderPassDesc& pass);
+    void end_usage_scope();
+    void invalidate_pass_bindings();
+    bool apply_bind_groups(d3d::BindPoint bind_point,
+                           StateBridgeDevice::PipelineLayoutRecord* layout,
+                           const std::vector<d3d::BindGroupPlan>& plans,
+                           std::vector<BoundGroup>* bound,
+                           bool track_usage);
+    bool emit_bind_group(d3d::BindPoint bind_point,
+                         const StateBridgeDevice::GroupLayoutRecord& group,
+                         d3d::CachedBindGroup* cached);
+    void add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join);
+    GpuTextureViewDesc texture_view_desc(const d3d::ViewDescriptor& view);
+    uint32_t upload_root_constants(d3d::BindPoint bind_point, uint32_t parameter_index);
+    bool prepare_render_draw();
+    void apply_input_assembler(bool indexed);
+
+    StateBridgeDevice& device_;
+    CommandEncoder& encoder_;
+    pso::CommandListStateTracker tracker_;
+    d3d::RootArgumentState root_args_;
+    d3d::BindGroupCache bind_groups_;
+    d3d::CommandListStateTracker resource_states_;
+    d3d::UsageScope usage_scope_;
+    std::vector<d3d::UsageConflict> usage_conflicts_;
+
+    bool open_ = false;
+    GraphicsPipelineState* graphics_pso_ = nullptr;
+    ComputePipelineState* compute_pso_ = nullptr;
+    std::unordered_map<uint32_t, uint32_t> empty_bind_groups_;  // group layout id -> bind group id
+
+    // Input assembler state.
+    std::array<VertexBinding, pso::kMaxVertexBuffers> vertex_buffers_{};
+    uint32_t vertex_dirty_ = 0;
+    d3d12_xs::D3D12IndexBufferView index_buffer_{};
+    bool index_dirty_ = false;
+
+    // State applied in the open WebGPU pass.
+    bool render_pass_open_ = false;
+    std::vector<BoundGroup> render_groups_;
+    std::vector<BoundGroup> compute_groups_;
+    std::vector<uint32_t> scoped_bind_groups_;  // bind groups already added to the usage scope
+    bool compute_pass_valid_ = false;
+    uint32_t compute_pipeline_bound_ = 0;
+    // Root constants last uploaded per (bind point, parameter): values + ring offset.
+    struct RootConstantUpload {
+        std::vector<uint32_t> values;
+        uint32_t offset = 0;
+        bool valid = false;
+    };
+    std::array<std::array<RootConstantUpload, d3d::kMaxRootParameters>, d3d::kBindPointCount> root_uploads_{};
+
+    uint64_t diagnostics_ = 0;
+    BridgeStats stats_{};
+};
+
+}  // namespace playgta6::gpu::bridge

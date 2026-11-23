@@ -283,4 +283,13 @@ void CommandEncoder::dispatch_compute(
     write_packet(GpuOpcode::DispatchCompute, &payload, sizeof(payload));
 }
 
+void CommandEncoder::emit_packet(
+    GpuOpcode opcode,
+    const void* head,
+    uint32_t head_bytes,
+    const void* tail,
+    uint32_t tail_bytes) {
+    write_packet_with_tail(opcode, head, head_bytes, tail, tail_bytes);
+}
+
 }  // namespace playgta6::gpu

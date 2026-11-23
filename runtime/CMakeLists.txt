@@ -24,6 +24,7 @@ add_library(playgta6_core STATIC
     gpu/cmd_encoder.cpp
     gpu/pso_cache.cpp
     gpu/descriptor_heap.cpp
+    gpu/state_bridge.cpp
     guest/guest_runtime.cpp
 )
 target_include_directories(playgta6_core PUBLIC
@@ -96,6 +97,12 @@ else()
     add_executable(test_descriptor_heap ../tests/test_descriptor_heap.cpp)
     target_link_libraries(test_descriptor_heap PRIVATE playgta6_core)
     add_test(NAME descriptor_heap_tests COMMAND test_descriptor_heap)
+
+    add_executable(test_state_bridge ../tests/test_state_bridge.cpp)
+    target_link_libraries(test_state_bridge PRIVATE playgta6_core)
+    target_compile_definitions(test_state_bridge PRIVATE
+        PG6_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures")
+    add_test(NAME state_bridge_tests COMMAND test_state_bridge)
 
     add_executable(test_win32_sync ../tests/test_win32_sync.cpp)
     target_link_libraries(test_win32_sync PRIVATE playgta6_core)
