@@ -11,8 +11,9 @@ use super::{
 };
 use crate::cfg::{self, Edge, Terminator};
 use crate::lift::{
-    HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP, HELPER_UNIMPLEMENTED, LiftError,
-    WASM64_TRIPLE, emit_module, lift_function, lift_module,
+    GUEST_BASE_SYMBOL, GuestBase, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP,
+    HELPER_UNIMPLEMENTED, LiftError, WASM64_TRIPLE, emit_module, lift_function, lift_module,
+    lift_module_with,
 };
 
 /// Instructions of the LLVM block `label` (up to the next label or the end of the function).
@@ -267,8 +268,9 @@ fn indirect_and_rip_relative_calls_use_the_runtime_dispatcher() {
     let block = &func.blocks[&0x1000];
     assert_eq!(block.terminator, Terminator::IndirectJump);
     let ir = lift_function(&func).expect("lifts").ir;
+    // The slot address goes through the guest-base seam (default: the runtime's base symbol).
     assert!(
-        ir.contains(&format!("inttoptr i64 {slot} to ptr")),
+        ir.contains(&format!("add i64 {slot}, %t")),
         "RIP-relative slot address:\n{ir}"
     );
     assert!(ir.contains(&format!(
@@ -277,6 +279,46 @@ fn indirect_and_rip_relative_calls_use_the_runtime_dispatcher() {
     assert!(ir.contains(&format!(
         "  tail call void @{HELPER_INDIRECT_CALL}(ptr %state, i64 %t"
     )));
+}
+
+#[test]
+fn guest_addresses_go_through_the_selected_guest_base() {
+    // mov rax, [0x2000]; mov [rcx + 8], rax; ret
+    let func = asm_function(0x1000, |a| {
+        a.mov(rax, qword_ptr(0x2000u64))?;
+        a.mov(qword_ptr(rcx + 8), rax)?;
+        a.ret()
+    });
+    let decl = format!("@{GUEST_BASE_SYMBOL} = external global i64, align 8");
+
+    // Default: the runtime-defined base, an invariant load, declared once per module.
+    let module = lift_module([&func]).expect("lifts").ir;
+    let load = format!("load i64, ptr @{GUEST_BASE_SYMBOL}, align 8, !invariant.load !{{}}");
+    assert!(module.contains(&load), "{module}");
+    assert_eq!(module.matches(&decl).count(), 1, "{module}");
+    assert!(
+        module.contains("add i64 8192, %t"),
+        "absolute address translated:\n{module}"
+    );
+    assert!(!module.contains("inttoptr i64 8192 to ptr"), "{module}");
+
+    // Identity: plain inttoptr of the guest address, no base symbol.
+    let identity = lift_module_with([&func], GuestBase::Constant(0))
+        .expect("lifts")
+        .ir;
+    assert!(identity.contains("inttoptr i64 8192 to ptr"), "{identity}");
+    assert!(!identity.contains(GUEST_BASE_SYMBOL), "{identity}");
+
+    // A constant base folds into the address arithmetic (wrapping: shown as a signed i64).
+    let base = 0xFFFF_FFFF_C000_0000u64;
+    let constant = lift_module_with([&func], GuestBase::Constant(base))
+        .expect("lifts")
+        .ir;
+    assert!(
+        constant.contains(&format!("add i64 8192, {}", base as i64)),
+        "{constant}"
+    );
+    assert!(!constant.contains(GUEST_BASE_SYMBOL), "{constant}");
 }
 
 #[test]

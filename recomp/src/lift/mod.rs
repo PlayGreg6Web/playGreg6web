@@ -88,10 +88,33 @@
 //! be ordered on weakly ordered hosts.
 //!
 //! # Guest memory
-//! Guest virtual addresses are 64-bit and map 1:1 onto wasm64 linear memory (`inttoptr`). All
-//! guest loads/stores go through one place (`FunctionLifter::guest_ptr`) so the mapping policy can
-//! change later. Accesses are `align 1` (x86 allows unaligned access). All addressing modes are
-//! supported (`base + index*scale + disp`, RIP-relative, 32-bit address size, `fs:`/`gs:`).
+//! Guest virtual addresses are 64-bit. Every guest load/store/atomic/bulk access turns its guest
+//! address into a host pointer in exactly one place, `FunctionLifter::guest_ptr`, with the shared
+//! translation of `docs/wasm_abi.md` "Guest Address Space":
+//!
+//! ```text
+//! host = guest VA + base        (64-bit wrapping add, then inttoptr)
+//! ```
+//!
+//! where `base` is chosen per module by [`GuestBase`]:
+//! - [`GuestBase::Symbol`] (default, correct for every runtime configuration): `base` is loaded
+//!   from the runtime-defined `i64` global [`GUEST_BASE_SYMBOL`] (`@__playgta6_guest_base`). The
+//!   load is tagged `!invariant.load` (the runtime sets the base before guest code runs and never
+//!   changes it while guest code runs), so `-O2` keeps one load per function and hoists it out of
+//!   loops; each access costs one `i64.add`.
+//! - [`GuestBase::Constant`]: `base` is a lift-time constant. `Constant(0)` is the identity
+//!   mapping (guest VA == wasm64 linear-memory address), which is what the browser runtime uses:
+//!   no translation code at all. A constant-base module must only run with a runtime whose
+//!   `__playgta6_guest_base` equals the constant.
+//!
+//! Rejected alternatives: a symbol whose *address* is the base (folds into the wasm load offset,
+//! but the offset is unsigned, so it cannot express the non-zero bases native hosts need, and
+//! wasm-ld cannot place a symbol at an arbitrary address); a mutable global read without
+//! `!invariant.load` (every guest store could alias it, forcing a reload per access).
+//!
+//! The `GuestState` pointer is a host pointer and is never translated. Accesses are `align 1`
+//! (x86 allows unaligned access). All addressing modes are supported (`base + index*scale +
+//! disp`, RIP-relative, 32-bit address size, `fs:`/`gs:`).
 //!
 //! # Calls, returns and the guest stack
 //! `rsp` lives in the guest state and points into guest memory, so the guest stack is laid out
@@ -246,6 +269,16 @@ pub const CMPXCHG16B_LOCKS: &str = "__playgta6_cmpxchg16b_locks";
 /// (`host = __playgta6_guest_base + guest VA`, see `docs/wasm_abi.md` "Guest Address Space").
 pub const GUEST_BASE_SYMBOL: &str = "__playgta6_guest_base";
 
+/// How lifted code translates guest addresses (see "Guest memory" in the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuestBase {
+    /// `host = VA + @__playgta6_guest_base` (runtime-defined, loaded once per function).
+    #[default]
+    Symbol,
+    /// `host = VA + constant`; `Constant(0)` is the identity mapping (no translation code).
+    Constant(u64),
+}
+
 /// Symbol name of the lifted function for the guest address `va` (e.g. `sub_140001000`).
 pub fn function_symbol(va: u64) -> String {
     format!("sub_{va:X}")
@@ -363,6 +396,8 @@ enum Support {
     Pext,
     Crc32c,
     Helper(RuntimeHelper),
+    /// The `@__playgta6_guest_base` declaration ([`GuestBase::Symbol`]).
+    GuestBase,
 }
 
 /// LLVM bit-manipulation intrinsics used by the lifter.
@@ -417,16 +452,32 @@ impl LiftedModule {
 /// `terminator`, `successors` and, for direct calls into unmapped or non-executable memory,
 /// `calls` plus `diagnostics`. Blocks shared by several functions are lifted into each of them.
 pub fn lift_function(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
-    function::lift(func)
+    lift_function_with(func, GuestBase::default())
+}
+
+/// [`lift_function`] with an explicit guest address translation.
+pub fn lift_function_with(
+    func: &cfg::Function,
+    guest_base: GuestBase,
+) -> Result<LiftedFunction, LiftError> {
+    function::lift(func, guest_base)
 }
 
 /// Lifts a set of functions into one deterministic module (see [`emit_module`]).
 pub fn lift_module<'a>(
     functions: impl IntoIterator<Item = &'a cfg::Function>,
 ) -> Result<LiftedModule, LiftError> {
+    lift_module_with(functions, GuestBase::default())
+}
+
+/// [`lift_module`] with an explicit guest address translation.
+pub fn lift_module_with<'a>(
+    functions: impl IntoIterator<Item = &'a cfg::Function>,
+    guest_base: GuestBase,
+) -> Result<LiftedModule, LiftError> {
     let mut lifted = Vec::new();
     for func in functions {
-        lifted.push(lift_function(func)?);
+        lifted.push(lift_function_with(func, guest_base)?);
     }
     lifted.sort_by_key(|f| f.entry);
     let ir = emit_module(&lifted)?;
@@ -519,6 +570,9 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
             Support::Memset => out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"),
             Support::Helper(helper) => {
                 let _ = writeln!(out, "declare void @{}(ptr)", helper.symbol());
+            }
+            Support::GuestBase => {
+                let _ = writeln!(out, "@{GUEST_BASE_SYMBOL} = external global i64, align 8");
             }
             Support::Umul128
             | Support::Udiv128

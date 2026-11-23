@@ -13,8 +13,9 @@ use iced_x86::{
 };
 
 use super::{
-    GUEST_STATE_TYPE, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP, HELPER_UNIMPLEMENTED,
-    LiftError, LiftedFunction, Support, UnsupportedInstruction, function_symbol,
+    GUEST_BASE_SYMBOL, GUEST_STATE_TYPE, GuestBase, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL,
+    HELPER_TRAP, HELPER_UNIMPLEMENTED, LiftError, LiftedFunction, Support, UnsupportedInstruction,
+    function_symbol,
 };
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
@@ -183,7 +184,10 @@ fn is_immediate(kind: OpKind) -> bool {
 }
 
 /// Lifts one function (see `super::lift_function`).
-pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
+pub(super) fn lift(
+    func: &cfg::Function,
+    guest_base: GuestBase,
+) -> Result<LiftedFunction, LiftError> {
     if !func.blocks.contains_key(&func.entry) {
         return Err(LiftError::MissingEntryBlock { entry: func.entry });
     }
@@ -246,6 +250,7 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
         support: BTreeSet::new(),
         unsupported: Vec::new(),
         ea: None,
+        guest_base,
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
@@ -293,6 +298,8 @@ struct FunctionLifter<'a> {
     unsupported: Vec<UnsupportedInstruction>,
     /// Effective address (with segment base) of the current instruction's memory operand.
     ea: Option<String>,
+    /// Guest -> host address translation (`guest_ptr`).
+    guest_base: GuestBase,
 }
 
 struct Checkpoint {
@@ -752,10 +759,21 @@ impl FunctionLifter<'_> {
         Ok(ea)
     }
 
-    /// The single place where a guest address becomes a host pointer (identity mapping of guest
-    /// virtual addresses onto wasm64 linear memory).
+    /// The single place where a guest address becomes a host pointer:
+    /// `host = addr + base` (see "Guest memory" in the parent module and [`GuestBase`]).
     fn guest_ptr(&mut self, addr: &str) -> String {
-        self.val(&format!("inttoptr i64 {addr} to ptr"))
+        let host = match self.guest_base {
+            GuestBase::Constant(0) => addr.to_string(),
+            GuestBase::Constant(base) => self.val(&format!("add i64 {addr}, {}", imm(base, 64))),
+            GuestBase::Symbol => {
+                self.support.insert(Support::GuestBase);
+                let base = self.val(&format!(
+                    "load i64, ptr @{GUEST_BASE_SYMBOL}, align 8, !invariant.load !{{}}"
+                ));
+                self.val(&format!("add i64 {addr}, {base}"))
+            }
+        };
+        self.val(&format!("inttoptr i64 {host} to ptr"))
     }
 
     fn load_mem(&mut self, addr: &str, bits: u32) -> String {

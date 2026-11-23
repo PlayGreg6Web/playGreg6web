@@ -693,8 +693,9 @@ fn atomics_have_no_lost_updates_across_threads() {
         .map(|b| format!("{b:02x}"))
         .collect();
     let spec = format!(
-        "{{\"pages\":{},\"gprOffset\":{STATE_GPR_OFFSET},\"init\":[[\"{wide:#x}\",\"{init}\"]],\"read\":[[\"{counters:#x}\",88]],\"workers\":[{workers}]}}",
-        MEMORY_BYTES / 65536
+        "{{\"pages\":{},\"gprOffset\":{STATE_GPR_OFFSET},\"guestBase\":\"{:#x}\",\"init\":[[\"{wide:#x}\",\"{init}\"]],\"read\":[[\"{counters:#x}\",88]],\"workers\":[{workers}]}}",
+        MEMORY_BYTES / 65536,
+        built.guest_base
     );
     let out = run_script(&built, "runner_threads.js", RUNNER_THREADS_JS, &[spec]);
     if let Some(reason) = out.trim().strip_prefix("skip: ") {

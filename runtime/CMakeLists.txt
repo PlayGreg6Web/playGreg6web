@@ -147,6 +147,10 @@ else()
     target_link_libraries(test_vmem_contiguous PRIVATE playgta6_core)
     add_test(NAME playgta6_vmem_contiguous_tests COMMAND test_vmem_contiguous)
 
+    add_executable(test_guest_address_space ../tests/test_guest_address_space.cpp)
+    target_link_libraries(test_guest_address_space PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_address_space_tests COMMAND test_guest_address_space)
+
     add_executable(test_guest_runtime ../tests/test_guest_runtime.cpp)
     target_link_libraries(test_guest_runtime PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_runtime_tests COMMAND test_guest_runtime)

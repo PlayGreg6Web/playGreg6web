@@ -3,8 +3,10 @@
 // --shared-memory.
 // Usage: node [--experimental-wasm-memory64] runner_threads.js <module.wasm> '<spec JSON>'
 //
-// spec: { pages, gprOffset, init: [[addr, hex]], read: [[addr, len]],
+// spec: { pages, gprOffset, guestBase, init: [[addr, hex]], read: [[addr, len]],
 //              workers: [{ state, stackTop, shadowStack, calls: [{ fn, regs: [[index, value]] }] }] }
+// `init`/`read` addresses and `stackTop` are guest VAs (linear address = VA + guestBase, wrapping);
+// `state` and `shadowStack` are linear (host) addresses.
 // Every worker instantiates the module on the shared memory, then runs its calls in order (each
 // with a fresh register set and a pushed return address); all workers meet at a barrier before
 // every call so that the same call runs on all threads at once.
@@ -16,6 +18,7 @@ const { Worker, isMainThread, workerData, parentPort } = require('worker_threads
 
 const RETURN_ADDRESS = 0xC0DEC0DEn;
 const RSP = 4;
+const lin = (guestBase, addr) => Number(BigInt.asUintN(64, BigInt(addr) + BigInt(guestBase || 0)));
 
 // Reusable barrier for `n` threads on an Int32Array: [generation, arrived].
 function barrier(ctrl, n) {
@@ -71,14 +74,14 @@ if (isMainThread) {
   }
   const bytes = new Uint8Array(memory.buffer);
   for (const [addr, hex] of spec.init) {
-    const base = Number(BigInt(addr));
+    const base = lin(spec.guestBase, addr);
     for (let i = 0; i < hex.length; i += 2) bytes[base + i / 2] = parseInt(hex.substr(i, 2), 16);
   }
   const control = new Int32Array(new SharedArrayBuffer(8));
   let pending = spec.workers.length;
   let failure = null;
   const count = spec.workers.length;
-  const workers = spec.workers.map((w) => new Worker(__filename, { workerData: { module, memory, control, count, w, gprOffset: spec.gprOffset } }));
+  const workers = spec.workers.map((w) => new Worker(__filename, { workerData: { module, memory, control, count, w, gprOffset: spec.gprOffset, guestBase: spec.guestBase } }));
   const times = [];
   const finish = () => {
     pending -= 1;
@@ -88,7 +91,7 @@ if (isMainThread) {
       return;
     }
     const out = spec.read.map(([addr, len]) => {
-      const base = Number(BigInt(addr));
+      const base = lin(spec.guestBase, addr);
       let s = '';
       for (let i = 0; i < len; i++) s += bytes[base + i].toString(16).padStart(2, '0');
       return s;
@@ -112,7 +115,7 @@ if (isMainThread) {
     });
   }
 } else {
-  const { module, memory, control, count, w, gprOffset } = workerData;
+  const { module, memory, control, count, w, gprOffset, guestBase } = workerData;
   let instance = null;
   let setupError = null;
   try {
@@ -144,7 +147,7 @@ if (isMainThread) {
     for (let i = 0; i < 16; i++) view.setBigUint64(gpr + i * 8, 0n, true);
     for (const [i, v] of call.regs) view.setBigUint64(gpr + i * 8, BigInt(v), true);
     const rsp = BigInt(w.stackTop) - 8n;
-    view.setBigUint64(Number(rsp), RETURN_ADDRESS, true);
+    view.setBigUint64(lin(guestBase, rsp), RETURN_ADDRESS, true);
     view.setBigUint64(gpr + RSP * 8, rsp, true);
     const start = performance.timeOrigin + performance.now();
     instance.exports[call.fn](state);

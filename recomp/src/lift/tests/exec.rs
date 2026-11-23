@@ -24,8 +24,8 @@ use crate::lift::compile::{
     LlvmTool, compile_to_wasm64_object, find_llvm_tool, find_on_path, rustc_tool_dir,
 };
 use crate::lift::{
-    STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_MXCSR_OFFSET,
-    STATE_XMM_OFFSET, lift_module,
+    GUEST_BASE_SYMBOL, GuestBase, STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET,
+    STATE_MXCSR_OFFSET, STATE_SIZE, STATE_XMM_OFFSET, lift_module, lift_module_with,
 };
 
 pub(super) const RAX: usize = 0;
@@ -46,7 +46,11 @@ pub(super) const STATE_ADDR: u64 = 0x10_0000;
 pub(super) const DATA_ADDR: u64 = 0x18_0000;
 pub(super) const STACK_TOP: u64 = 0x1F_0000;
 pub(super) const CODE_BASE: u64 = 0x30_0000;
-pub(super) const MEMORY_BYTES: u64 = 8 << 20;
+pub(super) const MEMORY_BYTES: u64 = 16 << 20;
+/// Translation base the harness gives `@__playgta6_guest_base` (the runtime's job): guest memory
+/// at VA `v` lives at linear address `v + GUEST_BASE`. Non-zero, so every execution test goes
+/// through the guest-base seam; the state block (`STATE_ADDR`) is host memory and is not moved.
+pub(super) const GUEST_BASE: u64 = 0x80_0000;
 /// Host-implemented function in `runner.js`: `rax = rcx * 10 + rdx`.
 const HOST_MUL10_ADD: u64 = 0x7FFE_0000;
 
@@ -321,6 +325,9 @@ fn compile(dir: &Path, ir: &str, tool: &LlvmTool) -> PathBuf {
 pub(super) struct Built {
     dir: TempDir,
     wasm: PathBuf,
+    /// Translation the module was linked with: guest VA `v` lives at linear address
+    /// `v + guest_base` (wrapping), like `host = __playgta6_guest_base + VA` in the runtime.
+    pub guest_base: u64,
 }
 
 /// Linker arguments for a module with atomics (wasm-ld requires a shared memory for them).
@@ -346,8 +353,31 @@ pub(super) fn build_with<'a>(
     functions: impl IntoIterator<Item = &'a cfg::Function>,
     extra: &[String],
 ) -> Built {
+    build_with_guest_base(label, functions, extra, GuestBase::Symbol, GUEST_BASE)
+}
+
+/// [`build_with`] for a chosen guest address translation. With [`GuestBase::Symbol`] the harness
+/// plays the runtime's part and defines `@__playgta6_guest_base = symbol_value` (every other test
+/// uses [`GUEST_BASE`]); a constant base is baked into the code and `symbol_value` is unused.
+pub(super) fn build_with_guest_base<'a>(
+    label: &str,
+    functions: impl IntoIterator<Item = &'a cfg::Function>,
+    extra: &[String],
+    guest_base: GuestBase,
+    symbol_value: u64,
+) -> Built {
     let tools = tools();
-    let module = lift_module(functions).expect("lifts");
+    let mut module = lift_module_with(functions, guest_base).expect("lifts");
+    let declaration = format!("@{GUEST_BASE_SYMBOL} = external global i64, align 8");
+    let definition = format!(
+        "@{GUEST_BASE_SYMBOL} = global i64 {}, align 8",
+        symbol_value as i64
+    );
+    module.ir = module.ir.replace(&declaration, &definition);
+    let guest_base = match guest_base {
+        GuestBase::Symbol => symbol_value,
+        GuestBase::Constant(base) => base,
+    };
     let mut extra = extra.to_vec();
     if module.requires_shared_memory() && !extra.iter().any(|a| a == "--shared-memory") {
         extra.extend(shared_memory_link_args());
@@ -361,7 +391,11 @@ pub(super) fn build_with<'a>(
     if let Err(err) = link(&exec.linker, &obj, &exports, &wasm, &extra) {
         panic!("linking lifted module failed: {err}");
     }
-    Built { dir, wasm }
+    Built {
+        dir,
+        wasm,
+        guest_base,
+    }
 }
 
 // ----- execution ---------------------------------------------------------------------------------
@@ -424,7 +458,8 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
     let mut json = String::new();
     let _ = write!(
         json,
-        "{{\"state\":\"{STATE_ADDR:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"cases\":["
+        "{{\"state\":\"{STATE_ADDR:#x}\",\"stateSize\":{STATE_SIZE},\"guestBase\":\"{:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"cases\":[",
+        built.guest_base
     );
     for (i, case) in cases.iter().enumerate() {
         if i > 0 {
@@ -1396,4 +1431,128 @@ fn resolved_switch_executes() {
         assert_eq!(outcome.regs[RAX], expected, "switch({value:#x})");
     }
     assert_eq!(o[inputs.len()].regs[RAX], 77, "dispatcher default arm");
+}
+
+// ----- guest address translation -----------------------------------------------------------------
+
+/// Loads from an absolute address, a guest stack round trip (`push`/`pop`) and stores through
+/// register-relative addresses: every kind of guest access the seam has to translate.
+/// `rax = [data]; push rax; [data+16] = rsp; [data+8] = [rsp] + 1; pop rax; ret`. Also the
+/// fixture of the runtime's end-to-end test (tests/test_guest_address_space.cpp, see
+/// `writes_the_runtime_end_to_end_fixture`).
+fn translation_fixture(entry: u64, data: u64) -> cfg::Function {
+    asm_function(entry, |a| {
+        a.mov(rax, qword_ptr(data))?; // moffs64 absolute load
+        a.push(rax)?;
+        a.mov(rdx, data)?;
+        a.mov(qword_ptr(rdx + 16), rsp)?;
+        a.mov(rcx, qword_ptr(rsp))?;
+        a.add(rcx, 1)?;
+        a.mov(qword_ptr(rdx + 8), rcx)?;
+        a.pop(rax)?;
+        a.ret()
+    })
+}
+
+const TRANSLATION_VALUES: [u64; 3] = [0x1122_3344_5566_7788, u64::MAX, 0];
+
+fn translation_cases(entry: u64, data: u64, stack_top: u64) -> Vec<Case> {
+    TRANSLATION_VALUES
+        .iter()
+        .map(|&value| {
+            Case::new(entry)
+                .reg(RSP, stack_top)
+                .mem(data, &value.to_le_bytes())
+                .read(data + 8, 8)
+                .read(stack_top - 16, 8)
+                .read(data + 16, 8)
+        })
+        .collect()
+}
+
+fn check_translation(outcomes: &[Outcome], stack_top: u64, what: &str) {
+    for (o, value) in outcomes.iter().zip(TRANSLATION_VALUES) {
+        assert!(o.error.is_empty(), "{what}: {}", o.error);
+        assert_eq!(o.regs[RAX], value, "{what}: loaded value");
+        assert_eq!(o.regs[RSP], stack_top, "{what}: rsp");
+        assert_eq!(
+            o.mem[0],
+            value.wrapping_add(1).to_le_bytes(),
+            "{what}: stored value"
+        );
+        assert_eq!(
+            o.mem[1],
+            value.to_le_bytes(),
+            "{what}: value pushed on the guest stack"
+        );
+        assert_eq!(
+            o.mem[2],
+            (stack_top - 16).to_le_bytes(),
+            "{what}: guest rsp"
+        );
+    }
+}
+
+/// Writes the lifted end-to-end fixture for the runtime's proof that lifted code and
+/// `VirtualMemoryArena` agree (tests/test_guest_address_space.cpp): `sub_140001000` reading
+/// `.data` at 0x1_4000_3000, in both translation modes, as `.ll` files into the directory named
+/// by `PLAYGTA6_E2E_LIFT_DIR`. Does nothing without that variable.
+#[test]
+fn writes_the_runtime_end_to_end_fixture() {
+    let Some(dir) = env::var_os("PLAYGTA6_E2E_LIFT_DIR") else {
+        println!("SKIP writes_the_runtime_end_to_end_fixture: PLAYGTA6_E2E_LIFT_DIR not set");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    fs::create_dir_all(&dir).expect("create output dir");
+    let f = translation_fixture(0x1_4000_1000, 0x1_4000_3000);
+    for (name, mode) in [
+        ("e2e_symbol.ll", GuestBase::Symbol),
+        ("e2e_identity.ll", GuestBase::Constant(0)),
+    ] {
+        let module = lift_module_with([&f], mode).expect("lifts");
+        assert!(module.functions[0].unsupported.is_empty());
+        fs::write(dir.join(name), module.ir).expect("write .ll");
+    }
+}
+
+#[test]
+fn every_guest_base_mode_executes_the_same() {
+    if !exec_or_skip("every_guest_base_mode_executes_the_same") {
+        return;
+    }
+    let f = translation_fixture(CODE_BASE, CODE_BASE + 0x1000);
+    let cases = translation_cases(CODE_BASE, CODE_BASE + 0x1000, STACK_TOP);
+    for (label, mode, symbol) in [
+        ("base_symbol", GuestBase::Symbol, GUEST_BASE),
+        ("base_identity", GuestBase::Constant(0), 0),
+        ("base_constant", GuestBase::Constant(0x40_0000), 0),
+    ] {
+        let built = build_with_guest_base(label, [&f], &[], mode, symbol);
+        check_translation(&run(&built, &cases), STACK_TOP, label);
+    }
+}
+
+#[test]
+fn image_addresses_wrap_onto_low_linear_memory() {
+    if !exec_or_skip("image_addresses_wrap_onto_low_linear_memory") {
+        return;
+    }
+    // Code, data and stack at real image addresses (above 4 GiB) in a 16 MiB memory: the base is
+    // "negative" (0xA0_0000 - 0x1_4000_0000, wrapping), so guest 0x1_4000_0000 is linear 10 MiB.
+    // The runtime-symbol and the constant form must agree.
+    let image = 0x1_4000_0000u64;
+    let entry = image + 0x1000;
+    let data = image + 0x3000;
+    let stack_top = image + 0x10_0000;
+    let base = 0xA0_0000u64.wrapping_sub(image);
+    let f = translation_fixture(entry, data);
+    let cases = translation_cases(entry, data, stack_top);
+    for (label, mode) in [
+        ("wrap_symbol", GuestBase::Symbol),
+        ("wrap_constant", GuestBase::Constant(base)),
+    ] {
+        let built = build_with_guest_base(label, [&f], &[], mode, base);
+        check_translation(&run(&built, &cases), stack_top, label);
+    }
 }

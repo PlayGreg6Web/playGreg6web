@@ -1,8 +1,11 @@
 // Test-only harness: runs lifted wasm64 functions under node (memory64).
 // Usage: node [--experimental-wasm-memory64] runner.js <module.wasm> <cases.json>
 //
-// cases.json: { state, gprOffset, flagsOffset, xmmOffset, mxcsrOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
+// cases.json: { state, stateSize, guestBase, gprOffset, flagsOffset, xmmOffset, mxcsrOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
 // `regs` lists [index, value] pairs; unlisted registers are zero.
+// `mem`/`read` addresses and rsp are guest VAs: guest VA v lives at linear address
+// v + guestBase (64-bit wrapping), the translation the module was linked with. Addresses inside
+// the state block [state, state + stateSize) are host addresses and are used as they are.
 // For every case the harness writes guest registers/flags/memory, pushes a fake return address
 // (emulating the caller's `call`), invokes the export and prints one tab-separated line:
 //   <index> \t <regs listed in `out`, hex, comma separated> \t <CF PF AF ZF SF OF> \t <memory reads, hex> \t <error>
@@ -19,6 +22,14 @@ const XMM = STATE + (spec.xmmOffset || 0);
 const MXCSR = spec.mxcsrOffset ? STATE + spec.mxcsrOffset : 0;
 const RSP = 4;
 const RETURN_ADDRESS = 0xC0DEC0DEn;
+const GUEST_BASE = BigInt(spec.guestBase || 0);
+const STATE_END = STATE + (spec.stateSize || 0);
+// Guest VA -> linear address (the state block is host memory).
+const lin = (addr) => {
+  const a = BigInt(addr);
+  if (a >= BigInt(STATE) && a < BigInt(STATE_END)) return Number(a);
+  return Number(BigInt.asUintN(64, a + GUEST_BASE));
+};
 
 // Host-implemented "imports" reachable through __playgta6_indirect_call, keyed by guest VA.
 // 0x7FFE0000: rax = rcx * 10 + rdx, then `ret` (pops the return address like a real callee).
@@ -107,11 +118,11 @@ const lines = spec.cases.map((c, index) => {
   c.flags.forEach((f, i) => v.setUint8(FLAGS + i, f));
   if (MXCSR) v.setUint32(MXCSR, 0x1F80, true);
   for (const [addr, bytes] of c.mem) {
-    const base = Number(BigInt(addr));
+    const base = lin(addr);
     for (let i = 0; i < bytes.length; i += 2) v.setUint8(base + i / 2, parseInt(bytes.substr(i, 2), 16));
   }
   const rsp = (regs0.get(RSP) || 0n) - 8n;
-  v.setBigUint64(Number(rsp), RETURN_ADDRESS, true);
+  v.setBigUint64(lin(rsp), RETURN_ADDRESS, true);
   v.setBigUint64(GPR + RSP * 8, rsp, true);
 
   let error = '';
@@ -126,7 +137,7 @@ const lines = spec.cases.map((c, index) => {
   let flags = '';
   for (let i = 0; i < 6; i++) flags += v.getUint8(FLAGS + i);
   const mem = c.read.map(([addr, len]) => {
-    const base = Number(BigInt(addr));
+    const base = lin(addr);
     let s = '';
     for (let i = 0; i < len; i++) s += v.getUint8(base + i).toString(16).padStart(2, '0');
     return s;

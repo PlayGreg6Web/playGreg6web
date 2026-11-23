@@ -26,14 +26,17 @@ use super::integer::{RAX, RBX, RCX, RDX};
 use super::{Alu, Flag, FunctionLifter, R, RegRef, imm, reg_ref, unsupported};
 use crate::lift::{HELPER_TRAP, Support};
 
-/// `{lo, hi, success} = cmpxchg16b(addr, expected lo/hi, new lo/hi)` under a spinlock from the
+/// `{lo, hi, success} = cmpxchg16b(p, expected lo/hi, new lo/hi)` under a spinlock from the
 /// shared lock table (see the module docs for exactly what this guarantees). `linkonce_odr`
-/// gives every linked module the same table.
+/// gives every linked module the same table. `p` is the operand's host pointer (`guest_ptr`);
+/// the lock slot is taken from the host address, which has the same low bits as the guest
+/// address (the guest base is page aligned).
 pub(in crate::lift) const CMPXCHG16B_IR: &str = "\
 @__playgta6_cmpxchg16b_locks = linkonce_odr hidden global [64 x i32] zeroinitializer, align 4
 
-define internal { i64, i64, i1 } @__playgta6_cmpxchg16b(i64 %addr, i64 %cmp_lo, i64 %cmp_hi, i64 %new_lo, i64 %new_hi) {
+define internal { i64, i64, i1 } @__playgta6_cmpxchg16b(ptr %lo.p, i64 %cmp_lo, i64 %cmp_hi, i64 %new_lo, i64 %new_hi) {
 entry:
+  %addr = ptrtoint ptr %lo.p to i64
   %slot = lshr i64 %addr, 4
   %idx = and i64 %slot, 63
   %lock = getelementptr inbounds [64 x i32], ptr @__playgta6_cmpxchg16b_locks, i64 0, i64 %idx
@@ -43,9 +46,7 @@ acquire:
   %held = extractvalue { i32, i1 } %try, 1
   br i1 %held, label %locked, label %acquire
 locked:
-  %lo.p = inttoptr i64 %addr to ptr
-  %hi.addr = add i64 %addr, 8
-  %hi.p = inttoptr i64 %hi.addr to ptr
+  %hi.p = getelementptr i8, ptr %lo.p, i64 8
   %lo = load atomic i64, ptr %lo.p seq_cst, align 8
   %hi = load atomic i64, ptr %hi.p seq_cst, align 8
   %lo.eq = icmp eq i64 %lo, %cmp_lo
@@ -338,8 +339,9 @@ impl FunctionLifter<'_> {
             if locked {
                 self.support.insert(Support::Atomics);
                 self.support.insert(Support::Cmpxchg16b);
+                let ptr = self.guest_ptr(&ea);
                 let res = self.val(&format!(
-                    "call {{ i64, i64, i1 }} @__playgta6_cmpxchg16b(i64 {ea}, i64 {rax}, i64 {rdx}, i64 {rbx}, i64 {rcx})"
+                    "call {{ i64, i64, i1 }} @__playgta6_cmpxchg16b(ptr {ptr}, i64 {rax}, i64 {rdx}, i64 {rbx}, i64 {rcx})"
                 ));
                 let lo = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 0"));
                 let hi = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 1"));
