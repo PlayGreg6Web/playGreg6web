@@ -315,7 +315,7 @@ struct GpuDispatchComputePayload {
 static_assert(sizeof(GpuDispatchComputePayload) == 12, "GpuDispatchComputePayload layout must stay 12 bytes");
 
 // Guest x86-64 CPU state of recompiled code (recomp/src/lift, `%playgta6.GuestState`).
-// 688 bytes, little endian, one per guest thread. Every lifted function is
+// 704 bytes, little endian, one per guest thread. Every lifted function is
 // `void sub_<VA>(GuestState* state)`; see docs/wasm_abi.md for the calling convention.
 // The offsets below are checked against the lifter's STATE_* constants by
 // recomp/tests/guest_state_abi.rs. New fields are appended at the end (bump kGuestStateSize);
@@ -330,6 +330,13 @@ struct GuestState {
     uint64_t ymm_hi[16][2];  // bits 128..255 of ymm0..ymm15, low qword first
     uint32_t mxcsr;          // SSE control/status register; initialise to kGuestMxcsrDefault
     uint32_t reserved[3];    // zero; keeps the size a multiple of 16
+    // Pending context restore (exception unwind, longjmp; runtime/guest/guest_exceptions.h). While
+    // `unwind_pending` is nonzero, the registers above hold the restored context and every lifted
+    // activation returns to its caller without touching the state, until the activation that owns
+    // the restored `rsp` clears the flag and continues at `resume_rip`.
+    uint64_t resume_rip;     // guest address execution continues at
+    uint8_t unwind_pending;  // 0 or 1
+    uint8_t reserved2[7];    // zero; keeps the size a multiple of 16
 };
 
 inline constexpr uint64_t kGuestStateGprOffset = 0;
@@ -342,13 +349,15 @@ inline constexpr uint64_t kGuestStateXmmStride = 16;
 inline constexpr uint64_t kGuestStateYmmHiOffset = 416;
 inline constexpr uint64_t kGuestStateYmmHiStride = 16;
 inline constexpr uint64_t kGuestStateMxcsrOffset = 672;
-inline constexpr uint64_t kGuestStateSize = 688;
+inline constexpr uint64_t kGuestStateResumeRipOffset = 688;
+inline constexpr uint64_t kGuestStateUnwindPendingOffset = 696;
+inline constexpr uint64_t kGuestStateSize = 704;
 // Power-on / new-thread MXCSR (round to nearest, all exceptions masked, FTZ/DAZ off).
 inline constexpr uint32_t kGuestMxcsrDefault = 0x1F80;
 // Fifth Win64 argument relative to `rsp` at callee entry: return address + 32-byte shadow space.
 inline constexpr uint64_t kGuestStackArgOffset = 40;
 
-static_assert(sizeof(GuestState) == kGuestStateSize, "GuestState layout must stay 688 bytes");
+static_assert(sizeof(GuestState) == kGuestStateSize, "GuestState layout must stay 704 bytes");
 static_assert(alignof(GuestState) == 8, "GuestState must stay 8-byte aligned");
 static_assert(offsetof(GuestState, gpr) == kGuestStateGprOffset, "GuestState::gpr offset");
 static_assert(offsetof(GuestState, rip) == kGuestStateRipOffset, "GuestState::rip offset");
@@ -360,6 +369,10 @@ static_assert(sizeof(GuestState::xmm) == 16 * kGuestStateXmmStride, "GuestState:
 static_assert(offsetof(GuestState, ymm_hi) == kGuestStateYmmHiOffset, "GuestState::ymm_hi offset");
 static_assert(sizeof(GuestState::ymm_hi) == 16 * kGuestStateYmmHiStride, "GuestState::ymm_hi stride");
 static_assert(offsetof(GuestState, mxcsr) == kGuestStateMxcsrOffset, "GuestState::mxcsr offset");
+static_assert(offsetof(GuestState, resume_rip) == kGuestStateResumeRipOffset,
+              "GuestState::resume_rip offset");
+static_assert(offsetof(GuestState, unwind_pending) == kGuestStateUnwindPendingOffset,
+              "GuestState::unwind_pending offset");
 
 // Indices into GuestState::gpr (x86 register encoding).
 namespace GuestReg {

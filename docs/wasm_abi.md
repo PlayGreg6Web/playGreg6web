@@ -26,7 +26,7 @@ Written into a `SharedArrayBuffer` by `web/input/input_bridge.js` (`Int32Array` 
 - `12..16`: `mouse_dy` (`i32`)
 - `16..40`: `left_stick_x/y`, `right_stick_x/y`, `left_trigger`, `right_trigger` (`6 × f32`)
 
-## Recompiled Guest Code (`GuestState`, 688 bytes)
+## Recompiled Guest Code (`GuestState`, 704 bytes)
 Lifted x86-64 functions (`recomp/src/lift`) run on a guest CPU state matching `playgta6::GuestState` (little endian, one per guest thread):
 
 | Offset | Size | Field |
@@ -40,6 +40,9 @@ Lifted x86-64 functions (`recomp/src/lift`) run on a guest CPU state matching `p
 | `416` | `16 × 16` | `ymm_hi`: bits `128..255` of `ymm0..ymm15` (low qword first) |
 | `672` | `4` | `mxcsr` (initialise to `0x1F80`, `kGuestMxcsrDefault`) |
 | `676` | `12` | reserved (zero) |
+| `688` | `8` | `resume_rip`: where a pending context restore continues |
+| `696` | `1` | `unwind_pending`: `1` while a context restore (exception unwind, `longjmp`) propagates |
+| `697` | `7` | reserved (zero) |
 
 The layout is append-only: fields are only ever added at the end (bumping the size), existing offsets never move. The runtime zero-initialises a new thread's state except `rsp`, `gs_base` and `mxcsr = 0x1F80`. Legacy-SSE instructions leave `ymm_hi` untouched; VEX-128 instructions zero the destination's `ymm_hi`, exactly like hardware.
 
@@ -47,6 +50,7 @@ Calling convention:
 - Every lifted function is `void sub_<VA-hex>(GuestState* state)` (`LiftedFn`); arguments and results travel in the state per the Win64 ABI (`rcx rdx r8 r9` / `xmm0..3`, fifth argument at `rsp + 40` on entry, result in `rax` / `xmm0`).
 - The guest stack lives in guest memory and is addressed through `rsp`. A direct `call T` pushes the return address and calls `sub_T(state)`; `ret [imm16]` pops it (unchecked) and returns, so host and guest call stacks stay in lockstep.
 - Lifted code maps guest virtual addresses 1:1 onto wasm64 linear memory (`fs:`/`gs:` operands add `fs_base`/`gs_base`).
+- Context restores (`RtlRestoreContext`, the end of `RtlUnwindEx`, `longjmp`) continue at an arbitrary `rip` inside a function while host frames of the abandoned guest frames are still active. The runtime writes the restored registers into the state, sets `resume_rip` and `unwind_pending = 1` and returns. Every lifted activation (and every runtime frame that called guest code) seeing `unwind_pending` after a call returns to its caller immediately, without writing registers back; the activation whose entry `rsp` lies above the restored `rsp` clears the flag, reloads its registers from the state and branches to the block at `resume_rip`.
 
 Runtime helpers (C linkage, defined by the runtime, all take the state pointer first):
 

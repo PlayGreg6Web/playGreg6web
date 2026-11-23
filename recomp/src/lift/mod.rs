@@ -19,6 +19,9 @@
 //! | [`STATE_YMM_HI_OFFSET`] (416) | 16 x 16 | bits 128..255 of `ymm0..15` |
 //! | [`STATE_MXCSR_OFFSET`] (672) | 4 | MXCSR (the runtime initialises it to [`MXCSR_DEFAULT`]) |
 //! | 676 | 12 | reserved (zero) |
+//! | [`STATE_RESUME_RIP_OFFSET`] (688) | 8 | `rip` a pending context restore continues at |
+//! | [`STATE_UNWIND_PENDING_OFFSET`] (696) | 1 | 1 while a context restore propagates (exception unwind, `longjmp`) |
+//! | 697 | 7 | reserved (zero) |
 //!
 //! The layout is append-only (existing offsets never move) and mirrored by
 //! `runtime/abi/playgta6_abi.h` / `docs/wasm_abi.md`.
@@ -199,8 +202,12 @@ pub const STATE_YMM_HI_OFFSET: u64 = 416;
 pub const STATE_YMM_HI_STRIDE: u64 = 16;
 /// Byte offset of the 32-bit MXCSR in the guest state.
 pub const STATE_MXCSR_OFFSET: u64 = 672;
+/// Byte offset of the `rip` a pending context restore continues at.
+pub const STATE_RESUME_RIP_OFFSET: u64 = 688;
+/// Byte offset of the byte that is 1 while a context restore propagates down the host stack.
+pub const STATE_UNWIND_PENDING_OFFSET: u64 = 696;
 /// Total size of the guest state in bytes.
-pub const STATE_SIZE: u64 = 688;
+pub const STATE_SIZE: u64 = 704;
 /// MXCSR value of a new guest thread (round to nearest, all exceptions masked, FTZ/DAZ off).
 pub const MXCSR_DEFAULT: u32 = 0x1F80;
 
@@ -458,11 +465,11 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
     out.push('\n');
     let _ = writeln!(
         out,
-        "; gpr[16], rip, flags[CF PF AF ZF SF OF DF pad], fs_base, gs_base, xmm[16], ymm_hi[16], mxcsr, reserved"
+        "; gpr[16], rip, flags[CF PF AF ZF SF OF DF pad], fs_base, gs_base, xmm[16], ymm_hi[16], mxcsr, reserved, resume_rip, unwind_pending, reserved"
     );
     let _ = writeln!(
         out,
-        "{GUEST_STATE_TYPE} = type {{ [16 x i64], i64, [8 x i8], i64, i64, [16 x [2 x i64]], [16 x [2 x i64]], i32, [3 x i32] }}"
+        "{GUEST_STATE_TYPE} = type {{ [16 x i64], i64, [8 x i8], i64, i64, [16 x [2 x i64]], [16 x [2 x i64]], i32, [3 x i32], i64, i8, [7 x i8] }}"
     );
     out.push('\n');
     let _ = writeln!(out, "declare void @{HELPER_INDIRECT_CALL}(ptr, i64)");

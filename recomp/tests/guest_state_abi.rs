@@ -37,6 +37,11 @@ fn lifter_state_layout_matches_runtime_abi() {
         ("kGuestStateYmmHiOffset", lift::STATE_YMM_HI_OFFSET),
         ("kGuestStateYmmHiStride", lift::STATE_YMM_HI_STRIDE),
         ("kGuestStateMxcsrOffset", lift::STATE_MXCSR_OFFSET),
+        ("kGuestStateResumeRipOffset", lift::STATE_RESUME_RIP_OFFSET),
+        (
+            "kGuestStateUnwindPendingOffset",
+            lift::STATE_UNWIND_PENDING_OFFSET,
+        ),
         ("kGuestStateSize", lift::STATE_SIZE),
         ("kGuestStackArgOffset", lift::CALLEE_STACK_ARG_OFFSET),
     ];
