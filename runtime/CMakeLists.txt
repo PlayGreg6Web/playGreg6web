@@ -13,6 +13,7 @@ add_library(playgta6_core STATIC
     os/httpfs_mailbox.cpp
     os/win32_kernel.cpp
     os/xgameruntime.cpp
+    os/xbox_offline.cpp
     gpu/cmd_encoder.cpp
 )
 target_include_directories(playgta6_core PUBLIC
@@ -54,4 +55,8 @@ else()
     add_executable(test_xgameruntime ../tests/test_xgameruntime.cpp)
     target_link_libraries(test_xgameruntime PRIVATE playgta6_core)
     add_test(NAME playgta6_xgameruntime_tests COMMAND test_xgameruntime)
+
+    add_executable(test_xbox_offline ../tests/test_xbox_offline.cpp)
+    target_link_libraries(test_xbox_offline PRIVATE playgta6_core)
+    add_test(NAME playgta6_xbox_offline_tests COMMAND test_xbox_offline)
 endif()
