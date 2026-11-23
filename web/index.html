@@ -5,51 +5,662 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>playgta6web</title>
   <style>
+    :root {
+      --bg: #070a10;
+      --surface: rgba(11, 16, 26, 0.88);
+      --surface-elevated: rgba(18, 25, 39, 0.82);
+      --border: rgba(148, 163, 184, 0.2);
+      --border-subtle: rgba(148, 163, 184, 0.12);
+      --text: #e6edf3;
+      --muted: #8b99ae;
+      --ok: #34d399;
+      --ok-bg: rgba(16, 185, 129, 0.14);
+      --warn: #fbbf24;
+      --warn-bg: rgba(245, 158, 11, 0.14);
+      --err: #f87171;
+      --err-bg: rgba(239, 68, 68, 0.14);
+      --info: #38bdf8;
+      --info-bg: rgba(56, 189, 248, 0.14);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     html, body {
       margin: 0;
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background: #0a0d14;
-      color: #e6edf3;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
     }
+
     #viewport {
+      position: fixed;
+      inset: 0;
       width: 100%;
       height: 100%;
       display: block;
+      background: radial-gradient(circle at 20% 20%, #101829 0%, #070a10 70%);
     }
+
     #hud {
       position: fixed;
       top: 12px;
       left: 12px;
-      padding: 10px 14px;
-      background: rgba(10, 13, 20, 0.82);
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      border-radius: 8px;
+      z-index: 20;
+      width: min(410px, calc(100vw - 24px));
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text);
+      overflow: hidden;
+      user-select: none;
+    }
+
+    #hud.collapsed {
+      width: auto;
+      min-width: 240px;
+    }
+
+    .hud-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      background: rgba(15, 23, 42, 0.72);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    #hud.collapsed .hud-header {
+      border-bottom: none;
+    }
+
+    .hud-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .hud-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--info);
+      box-shadow: 0 0 8px var(--info);
+    }
+
+    .hud-dot[data-level="ok"] {
+      background: var(--ok);
+      box-shadow: 0 0 8px var(--ok);
+    }
+
+    .hud-dot[data-level="warn"] {
+      background: var(--warn);
+      box-shadow: 0 0 8px var(--warn);
+    }
+
+    .hud-dot[data-level="error"] {
+      background: var(--err);
+      box-shadow: 0 0 8px var(--err);
+    }
+
+    .hud-brand {
+      font-family: var(--sans);
+      font-weight: 700;
       font-size: 12px;
-      line-height: 1.5;
-      pointer-events: none;
+      letter-spacing: 0.03em;
+      color: #f8fafc;
+      white-space: nowrap;
+    }
+
+    #hud-status {
+      color: var(--muted);
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .hud-actions {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    .hud-btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(30, 41, 59, 0.72);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 3px 7px;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: background 120ms ease, border-color 120ms ease;
+    }
+
+    .hud-btn:hover {
+      background: rgba(51, 65, 85, 0.85);
+      border-color: rgba(148, 163, 184, 0.4);
+    }
+
+    .hud-btn:active {
+      transform: translateY(1px);
+    }
+
+    #hud-body {
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    #hud.collapsed #hud-body {
+      display: none;
+    }
+
+    .hud-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .hud-section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: var(--sans);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .badge-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 7px;
+      border-radius: 5px;
+      border: 1px solid var(--border-subtle);
+      background: var(--surface-elevated);
+      font-size: 10.5px;
+      color: var(--text);
+    }
+
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .badge[data-state="ok"] {
+      border-color: rgba(52, 211, 153, 0.35);
+      background: var(--ok-bg);
+      color: #d1fae5;
+    }
+
+    .badge[data-state="ok"] .badge-dot {
+      background: var(--ok);
+    }
+
+    .badge[data-state="warn"] {
+      border-color: rgba(251, 191, 36, 0.35);
+      background: var(--warn-bg);
+      color: #fef3c7;
+    }
+
+    .badge[data-state="warn"] .badge-dot {
+      background: var(--warn);
+    }
+
+    .badge[data-state="err"] {
+      border-color: rgba(248, 113, 113, 0.35);
+      background: var(--err-bg);
+      color: #fee2e2;
+    }
+
+    .badge[data-state="err"] .badge-dot {
+      background: var(--err);
+    }
+
+    .badge[data-state="info"] {
+      border-color: rgba(56, 189, 248, 0.35);
+      background: var(--info-bg);
+      color: #e0f2fe;
+    }
+
+    .badge[data-state="info"] .badge-dot {
+      background: var(--info);
+    }
+
+    .kv-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px;
+    }
+
+    .kv-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 5px 7px;
+      border-radius: 6px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .kv-card.span-2 {
+      grid-column: span 2;
+    }
+
+    .kv-label {
+      color: var(--muted);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .kv-value {
+      font-weight: 600;
+      font-size: 11px;
+      color: var(--text);
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .kv-value[data-state="ok"] { color: var(--ok); }
+    .kv-value[data-state="warn"] { color: var(--warn); }
+    .kv-value[data-state="err"] { color: var(--err); }
+    .kv-value[data-state="info"] { color: var(--info); }
+
+    #hud-log {
+      margin: 0;
+      padding: 7px 8px;
+      height: 150px;
+      overflow-y: auto;
+      border-radius: 6px;
+      background: rgba(4, 7, 13, 0.85);
+      border: 1px solid var(--border-subtle);
+      font-size: 10.5px;
+      line-height: 1.45;
+      user-select: text;
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 6px;
+      word-break: break-word;
+      padding: 1px 0;
+    }
+
+    .log-time {
+      color: #64748b;
+      flex-shrink: 0;
+    }
+
+    .log-msg {
+      color: #cbd5e1;
       white-space: pre-wrap;
-      max-width: 460px;
+    }
+
+    .log-entry[data-level="ok"] .log-msg { color: var(--ok); }
+    .log-entry[data-level="warn"] .log-msg { color: var(--warn); }
+    .log-entry[data-level="error"] .log-msg { color: var(--err); }
+
+    #hud-log::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    #hud-log::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.28);
+      border-radius: 3px;
     }
   </style>
 </head>
 <body>
   <canvas id="viewport"></canvas>
-  <div id="hud">Booting playgta6web...</div>
+
+  <div id="hud" role="region" aria-label="playgta6web diagnostics HUD">
+    <div class="hud-header">
+      <div class="hud-title-group">
+        <span id="hud-status-dot" class="hud-dot" data-level="info"></span>
+        <span class="hud-brand">playgta6web</span>
+        <span id="hud-status">Booting...</span>
+      </div>
+      <div class="hud-actions">
+        <button id="hud-toggle" class="hud-btn" type="button" title="Toggle HUD (F9)">Hide</button>
+      </div>
+    </div>
+
+    <div id="hud-body">
+      <section class="hud-section" aria-label="Browser capabilities">
+        <div class="hud-section-head">
+          <span>Browser Capabilities</span>
+        </div>
+        <div class="badge-grid">
+          <span id="cap-coi" class="badge" data-state="warn"><span class="badge-dot"></span>COI / SAB</span>
+          <span id="cap-webgpu" class="badge" data-state="warn"><span class="badge-dot"></span>WebGPU</span>
+          <span id="cap-wasm64" class="badge" data-state="warn"><span class="badge-dot"></span>Wasm64</span>
+          <span id="cap-opfs" class="badge" data-state="warn"><span class="badge-dot"></span>OPFS</span>
+          <span id="cap-gamepad" class="badge" data-state="warn"><span class="badge-dot"></span>Gamepad API</span>
+        </div>
+      </section>
+
+      <section class="hud-section" aria-label="Server readiness">
+        <div class="hud-section-head">
+          <span>Server Readiness (/api/status)</span>
+          <button id="hud-refresh-status" class="hud-btn" type="button">Refresh</button>
+        </div>
+        <div class="kv-grid">
+          <div class="kv-card">
+            <span class="kv-label">Manifest</span>
+            <span id="srv-manifest" class="kv-value" data-state="warn">Checking...</span>
+          </div>
+          <div class="kv-card">
+            <span class="kv-label">Bootset</span>
+            <span id="srv-bootset" class="kv-value" data-state="warn">Checking...</span>
+          </div>
+          <div class="kv-card">
+            <span class="kv-label">Wasm Binary</span>
+            <span id="srv-wasm" class="kv-value" data-state="warn">Checking...</span>
+          </div>
+          <div class="kv-card">
+            <span class="kv-label">Shader Packs</span>
+            <span id="srv-shaders" class="kv-value" data-state="warn">--</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="hud-section" aria-label="Live telemetry">
+        <div class="hud-section-head">
+          <span>Live Telemetry</span>
+        </div>
+        <div class="kv-grid">
+          <div class="kv-card">
+            <span class="kv-label">FPS</span>
+            <span id="metric-fps" class="kv-value">--</span>
+          </div>
+          <div class="kv-card">
+            <span class="kv-label">GPU Packets</span>
+            <span id="metric-gpu-packets" class="kv-value">0</span>
+          </div>
+          <div class="kv-card">
+            <span class="kv-label">OPFS Cache Hits</span>
+            <span id="metric-opfs-hits" class="kv-value">0</span>
+          </div>
+          <div class="kv-card">
+            <span class="kv-label">Pointer Lock</span>
+            <span id="metric-pointer-lock" class="kv-value">Unlocked</span>
+          </div>
+          <div class="kv-card span-2">
+            <span class="kv-label">Gamepad</span>
+            <span id="metric-gamepad" class="kv-value">None</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="hud-section" aria-label="Runtime log">
+        <div class="hud-section-head">
+          <span>Runtime Log</span>
+          <button id="hud-clear-log" class="hud-btn" type="button">Clear</button>
+        </div>
+        <div id="hud-log" role="log" aria-live="polite"></div>
+      </section>
+    </div>
+  </div>
 
   <script type="module">
     import { InputBridge } from './input/input_bridge.js';
 
-    const hud = document.getElementById('hud');
     const canvas = document.getElementById('viewport');
-    const lines = [];
-    const log = (msg) => {
-      lines.push(msg);
-      if (lines.length > 14) lines.shift();
-      hud.textContent = lines.join('\n');
+    const hudEl = document.getElementById('hud');
+    const statusDotEl = document.getElementById('hud-status-dot');
+    const statusEl = document.getElementById('hud-status');
+    const toggleBtn = document.getElementById('hud-toggle');
+    const refreshStatusBtn = document.getElementById('hud-refresh-status');
+    const clearLogBtn = document.getElementById('hud-clear-log');
+    const logEl = document.getElementById('hud-log');
+
+    const capEls = {
+      coi: document.getElementById('cap-coi'),
+      webgpu: document.getElementById('cap-webgpu'),
+      wasm64: document.getElementById('cap-wasm64'),
+      opfs: document.getElementById('cap-opfs'),
+      gamepad: document.getElementById('cap-gamepad'),
     };
+
+    const srvEls = {
+      manifest: document.getElementById('srv-manifest'),
+      bootset: document.getElementById('srv-bootset'),
+      wasm: document.getElementById('srv-wasm'),
+      shaders: document.getElementById('srv-shaders'),
+    };
+
+    const metricEls = {
+      fps: document.getElementById('metric-fps'),
+      gpuPackets: document.getElementById('metric-gpu-packets'),
+      opfsCacheHits: document.getElementById('metric-opfs-hits'),
+      pointerLock: document.getElementById('metric-pointer-lock'),
+      gamepad: document.getElementById('metric-gamepad'),
+    };
+
+    const MAX_LOG_LINES = 200;
+    const frameTimestamps = [];
+
+    function formatTime() {
+      const now = new Date();
+      return now.toTimeString().slice(0, 8);
+    }
+
+    function setBadge(el, ok, labelOk, labelFail) {
+      if (!el) return;
+      el.dataset.state = ok ? 'ok' : 'err';
+      el.title = ok ? labelOk : labelFail;
+    }
+
+    function setValue(el, text, state = '') {
+      if (!el) return;
+      el.textContent = text;
+      if (state) el.dataset.state = state;
+      else delete el.dataset.state;
+    }
+
+    function setStatus(text, level = 'info') {
+      statusEl.textContent = String(text ?? '');
+      const normalized = ['info', 'ok', 'warn', 'error'].includes(level) ? level : 'info';
+      statusDotEl.dataset.level = normalized;
+    }
+
+    function appendLog(message, level = 'info') {
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      const normalized = ['info', 'ok', 'warn', 'error'].includes(level) ? level : 'info';
+      entry.dataset.level = normalized;
+
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'log-time';
+      timeSpan.textContent = `[${formatTime()}]`;
+
+      const msgSpan = document.createElement('span');
+      msgSpan.className = 'log-msg';
+      msgSpan.textContent = String(message ?? '');
+
+      entry.append(timeSpan, msgSpan);
+      logEl.appendChild(entry);
+
+      while (logEl.childElementCount > MAX_LOG_LINES) {
+        logEl.removeChild(logEl.firstElementChild);
+      }
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function updateMetrics(metrics = {}) {
+      if (!metrics || typeof metrics !== 'object') return;
+
+      if (metrics.fps !== undefined && metrics.fps !== null) {
+        const fpsVal = typeof metrics.fps === 'number' && Number.isFinite(metrics.fps)
+          ? (metrics.fps >= 10 ? Math.round(metrics.fps).toString() : metrics.fps.toFixed(1))
+          : String(metrics.fps);
+        setValue(metricEls.fps, fpsVal, typeof metrics.fps === 'number' && metrics.fps >= 30 ? 'ok' : 'info');
+      }
+
+      const packets = metrics.gpuPackets ?? metrics.packets;
+      if (packets !== undefined && packets !== null) {
+        setValue(metricEls.gpuPackets, String(packets), 'info');
+      }
+
+      const opfsHits = metrics.opfsCacheHits ?? metrics.cacheHits;
+      if (opfsHits !== undefined && opfsHits !== null) {
+        setValue(metricEls.opfsCacheHits, String(opfsHits), Number(opfsHits) > 0 ? 'ok' : '');
+      }
+
+      if (metrics.pointerLock !== undefined) {
+        const locked = Boolean(metrics.pointerLock);
+        const label = typeof metrics.pointerLock === 'string'
+          ? metrics.pointerLock
+          : (locked ? 'Locked' : 'Unlocked');
+        setValue(metricEls.pointerLock, label, locked ? 'ok' : '');
+      }
+
+      if (metrics.gamepad !== undefined) {
+        if (typeof metrics.gamepad === 'string') {
+          setValue(metricEls.gamepad, metrics.gamepad, metrics.gamepad !== 'None' ? 'ok' : '');
+        } else if (typeof metrics.gamepad === 'number') {
+          setValue(
+            metricEls.gamepad,
+            metrics.gamepad > 0 ? `Connected (${metrics.gamepad})` : 'None',
+            metrics.gamepad > 0 ? 'ok' : ''
+          );
+        } else {
+          const active = Boolean(metrics.gamepad);
+          setValue(metricEls.gamepad, active ? 'Connected' : 'None', active ? 'ok' : '');
+        }
+      }
+
+      if (metrics.status !== undefined) {
+        setStatus(metrics.status, metrics.level || 'info');
+      }
+    }
+
+    function setCollapsed(collapsed) {
+      const next = Boolean(collapsed);
+      hudEl.classList.toggle('collapsed', next);
+      toggleBtn.textContent = next ? 'Show' : 'Hide';
+    }
+
+    async function refreshServerStatus() {
+      try {
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        setValue(srvEls.manifest, data.hasManifest ? 'Ready' : 'Missing', data.hasManifest ? 'ok' : 'warn');
+        setValue(srvEls.bootset, data.hasBootset ? 'Ready' : 'Missing', data.hasBootset ? 'ok' : 'warn');
+        setValue(srvEls.wasm, data.hasWasmBinary ? 'Ready' : 'Not built', data.hasWasmBinary ? 'ok' : 'warn');
+        const packCount = Number.isFinite(data.shaderPackCount) ? data.shaderPackCount : 0;
+        setValue(
+          srvEls.shaders,
+          `${packCount} pack${packCount === 1 ? '' : 's'}`,
+          packCount > 0 ? 'ok' : 'warn'
+        );
+      } catch {
+        setValue(srvEls.manifest, 'Offline', 'err');
+        setValue(srvEls.bootset, 'Offline', 'err');
+        setValue(srvEls.wasm, 'Offline', 'err');
+        setValue(srvEls.shaders, 'Offline', 'err');
+      }
+    }
+
+    const hudApi = {
+      setStatus,
+      appendLog,
+      updateMetrics,
+      refreshServerStatus,
+      setCollapsed,
+    };
+    window.playgta6Hud = hudApi;
+
+    toggleBtn.addEventListener('click', () => {
+      setCollapsed(!hudEl.classList.contains('collapsed'));
+    });
+
+    refreshStatusBtn.addEventListener('click', () => {
+      refreshServerStatus();
+    });
+
+    clearLogBtn.addEventListener('click', () => {
+      logEl.textContent = '';
+    });
+
+    window.addEventListener('keydown', (ev) => {
+      if (ev.code === 'F9') {
+        ev.preventDefault();
+        setCollapsed(!hudEl.classList.contains('collapsed'));
+      }
+    });
+
+    function updatePointerLockState() {
+      const locked = document.pointerLockElement === canvas;
+      updateMetrics({ pointerLock: locked });
+    }
+    document.addEventListener('pointerlockchange', updatePointerLockState);
+    document.addEventListener('pointerlockerror', () => {
+      appendLog('Pointer lock request denied by browser.', 'warn');
+      updatePointerLockState();
+    });
+    updatePointerLockState();
+
+    function updateGamepadState() {
+      if (typeof navigator.getGamepads !== 'function') {
+        updateMetrics({ gamepad: 'Unsupported' });
+        return;
+      }
+      const pads = Array.from(navigator.getGamepads() || []).filter(Boolean);
+      if (pads.length === 0) {
+        updateMetrics({ gamepad: 'None' });
+      } else if (pads.length === 1) {
+        const label = (pads[0].id || 'Gamepad').replace(/\s+/g, ' ').trim();
+        updateMetrics({ gamepad: label.length > 34 ? `${label.slice(0, 31)}...` : label });
+      } else {
+        updateMetrics({ gamepad: `${pads.length} connected` });
+      }
+    }
+    window.addEventListener('gamepadconnected', (ev) => {
+      appendLog(`Gamepad connected: ${ev.gamepad?.id || 'controller'}`, 'ok');
+      updateGamepadState();
+    });
+    window.addEventListener('gamepaddisconnected', (ev) => {
+      appendLog(`Gamepad disconnected: ${ev.gamepad?.id || 'controller'}`, 'warn');
+      updateGamepadState();
+    });
+    updateGamepadState();
 
     function detectWasm64() {
       try {
@@ -65,21 +676,63 @@
       sab: typeof SharedArrayBuffer === 'function',
       webgpu: 'gpu' in navigator,
       wasm64: detectWasm64(),
+      opfs: Boolean(navigator.storage && typeof navigator.storage.getDirectory === 'function'),
+      gamepad: typeof navigator.getGamepads === 'function',
     };
-    log(`COOP/COEP: ${caps.coi} | SAB: ${caps.sab} | WebGPU: ${caps.webgpu} | Wasm64: ${caps.wasm64}`);
+
+    setBadge(capEls.coi, caps.coi && caps.sab, 'Cross-Origin Isolated with SharedArrayBuffer', 'Requires COOP/COEP headers for SharedArrayBuffer');
+    setBadge(capEls.webgpu, caps.webgpu, 'WebGPU available', 'WebGPU unavailable');
+    setBadge(capEls.wasm64, caps.wasm64, 'WebAssembly Memory64 supported', 'WebAssembly Memory64 unsupported');
+    setBadge(capEls.opfs, caps.opfs, 'Origin Private File System supported', 'OPFS unavailable');
+    setBadge(capEls.gamepad, caps.gamepad, 'Gamepad API available', 'Gamepad API unavailable');
+
+    appendLog(
+      `COI/SAB: ${caps.coi && caps.sab} | WebGPU: ${caps.webgpu} | Wasm64: ${caps.wasm64} | OPFS: ${caps.opfs} | Gamepad: ${caps.gamepad}`
+    );
+
+    refreshServerStatus();
 
     const bc = new BroadcastChannel('game-progress');
     bc.onmessage = (ev) => {
       const d = ev.data || {};
-      if (d.error) log(`ERROR: ${d.error}`);
-      else if (d.label) log(d.label);
+      if (d.metrics && typeof d.metrics === 'object') {
+        updateMetrics(d.metrics);
+      }
+      if (d.status) {
+        setStatus(d.status, d.level || 'info');
+      }
+      if (d.error) {
+        setStatus('Runtime error', 'error');
+        appendLog(`ERROR: ${d.error}`, 'error');
+      } else if (d.label) {
+        const label = String(d.label);
+        const frameMatch = /^WebGPU frame #(\d+)/.exec(label);
+        if (frameMatch) {
+          const now = performance.now();
+          frameTimestamps.push(now);
+          while (frameTimestamps.length > 1 && now - frameTimestamps[0] > 1000) {
+            frameTimestamps.shift();
+          }
+          const fps = frameTimestamps.length > 1
+            ? ((frameTimestamps.length - 1) * 1000) / Math.max(1, now - frameTimestamps[0])
+            : 1;
+          updateMetrics({ fps, gpuPackets: Number(frameMatch[1]) });
+          setStatus('Running', 'ok');
+          appendLog(label, 'ok');
+        } else {
+          appendLog(label, label.includes('ready') ? 'ok' : 'info');
+        }
+      }
     };
 
     if (!caps.coi || !caps.sab) {
-      log('Serve via server/serve_local.py so COOP/COEP headers enable SharedArrayBuffer.');
+      setStatus('Missing COOP/COEP', 'error');
+      appendLog('Serve via server/serve_local.py so COOP/COEP headers enable SharedArrayBuffer.', 'error');
     } else if (!caps.webgpu) {
-      log('WebGPU is unavailable in this browser.');
+      setStatus('WebGPU unavailable', 'error');
+      appendLog('WebGPU is unavailable in this browser.', 'error');
     } else {
+      setStatus('Starting workers...', 'info');
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(window.innerWidth * dpr);
       canvas.height = Math.floor(window.innerHeight * dpr);
@@ -87,6 +740,11 @@
       const input = new InputBridge(canvas);
       const offscreen = canvas.transferControlToOffscreen();
       const loader = new Worker('./loader.js');
+
+      loader.onerror = (err) => {
+        setStatus('Worker error', 'error');
+        appendLog(`loader worker error: ${err.message || err}`, 'error');
+      };
 
       loader.postMessage(
         {

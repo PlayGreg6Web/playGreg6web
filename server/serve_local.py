@@ -2,24 +2,29 @@
 """Local dev & asset-streaming HTTP server for playgta6web.
 
 - Serves `web/` at `/` and `--data` (default `local-data/`) at `/data/`.
-- Sends Cross-Origin Isolation headers (COOP/COEP) required for SharedArrayBuffer.
-- Supports HTTP `Range: bytes=start-end` (`206 Partial Content`) for streaming large files.
+- Serves sanitized JSON readiness diagnostics at `/api/status`.
+- Sends Cross-Origin Isolation headers (COOP/COEP/CORP) required for SharedArrayBuffer.
+- Supports HTTP `Range` (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`), `HEAD`,
+  deterministic `ETag`/`Last-Modified`, `If-None-Match` (`304`), and `If-Range`.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import mimetypes
 import os
 import posixpath
 import re
+from datetime import timezone
+from email.utils import formatdate, parsedate_to_datetime
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("text/javascript", ".js")
@@ -63,6 +68,112 @@ def parse_byte_range(header: str, file_size: int) -> tuple[int, int] | None:
     return start, end
 
 
+def compute_etag(stat_result: os.stat_result) -> str:
+    """Return a deterministic strong ETag derived from file size and mtime_ns."""
+    return f'"{stat_result.st_size:x}-{stat_result.st_mtime_ns:x}"'
+
+
+def _strip_weak_prefix(tag: str) -> str:
+    cleaned = tag.strip()
+    if cleaned.startswith(("W/", "w/")):
+        return cleaned[2:].strip()
+    return cleaned
+
+
+def etag_matches_if_none_match(header_value: str, etag: str) -> bool:
+    """Evaluate `If-None-Match` using RFC 9110 weak comparison."""
+    target = _strip_weak_prefix(etag)
+    for raw_token in header_value.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if token == "*":
+            return True
+        if _strip_weak_prefix(token) == target:
+            return True
+    return False
+
+
+def if_range_matches(header_value: str, etag: str, last_modified: str, mtime: float) -> bool:
+    """Evaluate RFC 9110 Section 13.1.5 `If-Range` condition (strong ETag or HTTP-date)."""
+    value = header_value.strip()
+    if not value:
+        return False
+    if value.startswith('"') or value.startswith(("W/", "w/")):
+        # Strong comparison only: weak entity-tags never match If-Range.
+        if value.startswith(("W/", "w/")) or etag.startswith(("W/", "w/")):
+            return False
+        return value == etag
+    if value == last_modified:
+        return True
+    try:
+        parsed_dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return False
+    if parsed_dt is None:
+        return False
+    if parsed_dt.tzinfo is None:
+        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+    return int(parsed_dt.timestamp()) == int(mtime)
+
+
+def _count_shader_packs(web_root: Path, data_root: Path) -> int:
+    """Count `.wgsl.pack` bundles across expected shallow directories."""
+    candidate_dirs = [
+        data_root,
+        data_root / "shaders",
+        web_root / "dist",
+        web_root / "shaders",
+    ]
+    seen: set[Path] = set()
+    count = 0
+    for directory in candidate_dirs:
+        if not directory.is_dir():
+            continue
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            for entry in directory.iterdir():
+                if entry.is_file() and entry.name.lower().endswith(".wgsl.pack"):
+                    count += 1
+        except OSError:
+            continue
+    return count
+
+
+def build_status_payload(web_root: Path, data_root: Path) -> dict[str, bool | int]:
+    """Build sanitized readiness metadata with zero host filesystem paths."""
+    data_configured = data_root.is_dir()
+    has_manifest = data_configured and (data_root / "data-manifest.json").is_file()
+    has_bootset = data_configured and (data_root / "bootset.json").is_file()
+
+    dist_dir = web_root / "dist"
+    has_wasm = (dist_dir / "runtime.wasm").is_file()
+    if not has_wasm and dist_dir.is_dir():
+        try:
+            has_wasm = any(
+                entry.is_file() and entry.suffix.lower() == ".wasm"
+                for entry in dist_dir.iterdir()
+            )
+        except OSError:
+            has_wasm = False
+
+    return {
+        "ok": True,
+        "coopCoep": True,
+        "dataDirConfigured": data_configured,
+        "hasManifest": has_manifest,
+        "hasBootset": has_bootset,
+        "hasWasmBinary": has_wasm,
+        "shaderPackCount": _count_shader_packs(web_root, data_root),
+    }
+
+
 class PlayGta6Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -76,39 +187,82 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
-    def _resolve_target(self) -> Path | None:
-        url_path = urlsplit(self.path).path
+    def _resolve_target(self, url_path: str) -> Path | None:
         if url_path == "/":
             return (self.web_root / "index.html").resolve()
         if url_path.startswith("/data/"):
             return safe_resolve(self.data_root, url_path[len("/data/"):])
         return safe_resolve(self.web_root, url_path.lstrip("/"))
 
-    def _serve_file(self, send_body: bool) -> None:
-        target = self._resolve_target()
+    def _serve_status(self, send_body: bool) -> None:
+        payload = build_status_payload(self.web_root, self.data_root)
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if send_body:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _serve_file(self, url_path: str, send_body: bool) -> None:
+        target = self._resolve_target(url_path)
         if target is None or not target.is_file():
             self.send_response(HTTPStatus.NOT_FOUND)
             self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
 
-        file_size = target.stat().st_size
+        try:
+            st = target.stat()
+        except OSError:
+            self.send_response(HTTPStatus.NOT_FOUND)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+
+        file_size = st.st_size
+        etag = compute_etag(st)
+        last_modified = formatdate(st.st_mtime, usegmt=True)
+
+        if_none_match = self.headers.get("If-None-Match")
+        if if_none_match and etag_matches_if_none_match(if_none_match, etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+
         content_type, _ = mimetypes.guess_type(str(target))
         content_type = content_type or "application/octet-stream"
 
         range_header = self.headers.get("Range")
+        if_range_header = self.headers.get("If-Range")
+        apply_range = bool(range_header)
+        if apply_range and if_range_header:
+            if not if_range_matches(if_range_header, etag, last_modified, st.st_mtime):
+                apply_range = False
+
         start, end = 0, max(file_size - 1, 0)
         status = HTTPStatus.OK
 
-        if range_header:
+        if apply_range and range_header:
             parsed = parse_byte_range(range_header, file_size)
             if parsed is None:
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 self.send_header("Content-Range", f"bytes */{file_size}")
                 self.send_header("Content-Length", "0")
+                self.send_header("ETag", etag)
+                self.send_header("Last-Modified", last_modified)
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 return
             start, end = parsed
@@ -118,6 +272,9 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Cache-Control", "no-cache")
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.end_headers()
@@ -125,21 +282,31 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         if not send_body or length == 0:
             return
 
-        with target.open("rb") as f:
-            f.seek(start)
-            remaining = length
-            while remaining > 0:
-                chunk = f.read(min(256 * 1024, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
+        try:
+            with target.open("rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _dispatch(self, send_body: bool) -> None:
+        url_path = urlsplit(self.path).path
+        if url_path == "/api/status":
+            self._serve_status(send_body=send_body)
+            return
+        self._serve_file(url_path, send_body=send_body)
 
     def do_GET(self) -> None:
-        self._serve_file(send_body=True)
+        self._dispatch(send_body=True)
 
     def do_HEAD(self) -> None:
-        self._serve_file(send_body=False)
+        self._dispatch(send_body=False)
 
 
 def create_server(host: str, port: int, web_root: Path, data_root: Path) -> ThreadingHTTPServer:
