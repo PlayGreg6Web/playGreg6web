@@ -70,7 +70,10 @@
 //! the functions of `pg6_guest_seam.h`. The generator writes a default seam matching the
 //! lifter's `%playgta6.GuestState` (16 GPRs in x86 encoding order at offset 0, `xmm0..15` at
 //! offset 160 with a 16-byte stride, guest addresses translated like lifted code does:
-//! `host = __playgta6_guest_base + VA`, see `docs/wasm_abi.md` "Guest Address Space"). Building the
+//! `host = __playgta6_guest_base + VA`, see `docs/wasm_abi.md` "Guest Address Space"). Only
+//! top-level pointer arguments and pointer results are translated; pointers a shim stores into
+//! guest memory (out-parameters, structures) are host pointers and are valid guest addresses only
+//! under the identity mapping (the browser build) or when they point into the guest arena. Building the
 //! thunks with `-DPG6_GUEST_SEAM_HEADER="<header>"` swaps in another seam without regenerating.
 //! A seam provides `pg6_seam_get_gpr`/`pg6_seam_set_gpr`, `pg6_seam_get_xmm_lo`/
 //! `pg6_seam_set_xmm_lo`, `pg6_seam_load_u64`, `pg6_seam_host_ptr`/`pg6_seam_guest_addr`
@@ -3044,6 +3047,13 @@ void log(std::string_view message) {
     std::fflush(stderr);
 }
 }  // namespace playgta6::os
+
+// The runtime's guest -> host translation base. Identity, like the browser build: the fake shims
+// store host pointers through out-parameters (`*queue = &g_marker`), which the bridge does not
+// translate (see "Guest-state seam" in stubs.rs).
+extern "C" {
+uint64_t __playgta6_guest_base = 0;
+}
 
 namespace {
 int g_failures = 0;
