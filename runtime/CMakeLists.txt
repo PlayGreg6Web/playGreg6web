@@ -41,6 +41,7 @@ add_library(playgta6_core STATIC
     guest/boot.cpp
     os/xgameruntime_provider.cpp
     os/xbox_scarlett_guest.cpp
+    guest/program_loader.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -198,4 +199,8 @@ else()
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
     add_test(NAME playgta6_xbox_scarlett_guest_tests COMMAND test_xbox_scarlett_guest)
+
+    add_executable(test_program_loader ../tests/test_program_loader.cpp)
+    target_link_libraries(test_program_loader PRIVATE playgta6_core)
+    add_test(NAME playgta6_program_loader_tests COMMAND test_program_loader)
 endif()
