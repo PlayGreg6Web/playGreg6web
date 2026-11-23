@@ -1,10 +1,14 @@
-mod pe;
 mod report;
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use playgta6_recomp::code_image::CodeImage;
+use playgta6_recomp::discover::discover;
+use playgta6_recomp::pe;
+use playgta6_recomp::summary::render_summary_json;
 
 use pe::Pe64;
 
@@ -24,9 +28,16 @@ struct InspectArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoverArgs {
+    pe_path: PathBuf,
+    json_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Help,
     Inspect(InspectArgs),
+    Discover(DiscoverArgs),
 }
 
 fn print_usage() {
@@ -35,11 +46,13 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  playgta6-recomp inspect <pe-path> [--markdown <out-file>] [--json]");
     eprintln!("  playgta6-recomp inspect --from-env [--markdown <out-file>] [--json]");
+    eprintln!("  playgta6-recomp discover <pe-path> [--out <json-file>]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
     eprintln!("  --markdown <out-file>  Write sanitized Markdown report to <out-file>");
     eprintln!("  --json                 Print sanitized JSON report to stdout");
+    eprintln!("  --out <json-file>      Write the discovery summary (addresses and counts only) to <json-file>");
     eprintln!("  -h, --help             Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
@@ -52,8 +65,9 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
 
     match args[0].as_str() {
         "inspect" => parse_inspect_args(&args[1..]),
+        "discover" => parse_discover_args(&args[1..]),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect' or 'discover'. Run with --help for usage."
         )),
     }
 }
@@ -117,6 +131,45 @@ fn parse_inspect_args(args: &[String]) -> Result<Command, String> {
         markdown_out,
         json,
     }))
+}
+
+fn parse_discover_args(args: &[String]) -> Result<Command, String> {
+    let mut pe_path: Option<PathBuf> = None;
+    let mut json_out: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--out" => {
+                i += 1;
+                let Some(path_str) = args.get(i) else {
+                    return Err("--out requires a <json-file> path argument".to_string());
+                };
+                if path_str.starts_with('-') {
+                    return Err(format!(
+                        "--out requires a <json-file> path argument, got '{path_str}'"
+                    ));
+                }
+                json_out = Some(PathBuf::from(path_str));
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option '{flag}' for 'discover'"));
+            }
+            positional => {
+                if pe_path.is_some() {
+                    return Err(format!(
+                        "unexpected extra positional argument '{positional}'"
+                    ));
+                }
+                pe_path = Some(PathBuf::from(positional));
+            }
+        }
+        i += 1;
+    }
+
+    let pe_path = pe_path.ok_or_else(|| "missing input PE path <pe-path>".to_string())?;
+    Ok(Command::Discover(DiscoverArgs { pe_path, json_out }))
 }
 
 fn parse_dotenv_key(content: &str, target_key: &str) -> Option<String> {
@@ -311,6 +364,44 @@ fn run_inspect(args: &InspectArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_discover(args: &DiscoverArgs) -> Result<(), String> {
+    let path = &args.pe_path;
+    let bytes =
+        fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
+    let pe = Pe64::parse(&bytes)
+        .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
+    let image = CodeImage::from_pe(&pe, &bytes);
+    let summary = render_summary_json(&image, &discover(&image));
+
+    match &args.json_out {
+        Some(out_path) => {
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "failed to create output directory '{}': {e}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::write(out_path, summary).map_err(|e| {
+                format!(
+                    "failed to write discovery summary '{}': {e}",
+                    out_path.display()
+                )
+            })?;
+            eprintln!(
+                "Wrote discovery summary for {} to {}",
+                sanitized_source_label(path),
+                out_path.display()
+            );
+        }
+        None => print!("{summary}"),
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_cli(&args) {
@@ -319,6 +410,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Inspect(inspect_args)) => match run_inspect(&inspect_args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::Discover(discover_args)) => match run_discover(&discover_args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("Error: {err}");
@@ -447,6 +545,58 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
         let err = resolve_game_dir_with_env(None, &temp_dir)
             .expect_err("should error clearly when GTA6_GAME_DIR is unset");
         assert!(err.contains("GTA6_GAME_DIR"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn cli_parses_discover() {
+        assert_eq!(
+            parse_cli(&vec_s(&["discover", "game.exe", "--out", "work/cfg.json"])),
+            Ok(Command::Discover(DiscoverArgs {
+                pe_path: PathBuf::from("game.exe"),
+                json_out: Some(PathBuf::from("work/cfg.json")),
+            }))
+        );
+        assert_eq!(
+            parse_cli(&vec_s(&["discover", "game.exe"])),
+            Ok(Command::Discover(DiscoverArgs {
+                pe_path: PathBuf::from("game.exe"),
+                json_out: None,
+            }))
+        );
+        assert!(parse_cli(&vec_s(&["discover"])).is_err());
+        assert!(parse_cli(&vec_s(&["discover", "a.exe", "--out"])).is_err());
+        assert!(parse_cli(&vec_s(&["discover", "a.exe", "b.exe"])).is_err());
+        assert!(parse_cli(&vec_s(&["discover", "a.exe", "--json"])).is_err());
+    }
+
+    #[test]
+    fn discover_end_to_end_writes_sanitized_summary() {
+        let temp_dir = env::temp_dir().join(format!(
+            "playgta6_recomp_discover_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let exe_path = temp_dir.join("SyntheticGame.exe");
+        fs::write(&exe_path, build_synthetic_pe64(false)).expect("write synthetic pe");
+
+        let out = temp_dir.join("out").join("cfg.json");
+        run_discover(&DiscoverArgs {
+            pe_path: exe_path,
+            json_out: Some(out.clone()),
+        })
+        .expect("run_discover should succeed");
+
+        let json = fs::read_to_string(&out).expect("read summary");
+        assert!(json.contains("\"image_base\": \"0x140000000\""));
+        assert!(json.contains("\"function_count\": 4"));
+        assert!(json.contains("\"entry\": \"0x140001010\""));
+        assert!(!json.contains("SyntheticGame"), "no file names or paths");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

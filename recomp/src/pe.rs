@@ -1186,8 +1186,8 @@ fn le_u64(b: &[u8]) -> u64 {
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
-#[cfg(test)]
-pub(crate) mod test_util {
+#[doc(hidden)]
+pub mod test_util {
     use super::*;
 
     /// Builds a valid synthetic PE32+ binary in memory with:

@@ -7,3 +7,6 @@ license.workspace = true
 [[bin]]
 name = "playgta6-recomp"
 path = "src/main.rs"
+
+[dependencies]
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "instr_info"] }
