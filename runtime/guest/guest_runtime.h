@@ -61,10 +61,12 @@
 //
 // Guest memory
 // ------------
-// The runtime touches guest memory only through VirtualMemoryArena (stack setup, call_guest
-// arguments, IAT slots), like the O7 heap and the O10 image loader. Lifted code instead maps
-// guest addresses 1:1 onto linear memory; in the browser build the two only agree once the
-// arena hands out identity-mapped backing (not the case yet).
+// The runtime touches guest memory through VirtualMemoryArena (stack setup, call_guest
+// arguments, IAT slots), like the O7 heap and the O10 image loader. Lifted code reaches the same
+// bytes directly: host = __playgta6_guest_base + VA (docs/wasm_abi.md "Guest Address Space"),
+// where the base is the one published for the process arena (win32::get_vmem_arena(), identity in
+// the browser build). Stacks and images must therefore live in the published arena for lifted
+// code to see them; the C entry points below always use it.
 
 using Pg6HostThunkFn = void (*)(void* state);
 

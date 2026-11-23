@@ -579,8 +579,8 @@ ImageError load_image(ImageReader& reader,
         committed += run.size;
     }
 
-    // Stream payloads one at a time, verifying each checksum as its bytes pass through.
-    std::vector<uint8_t> buffer;
+    // Stream payloads one at a time straight into guest memory (the arena's backing is
+    // contiguous), verifying each checksum as its bytes pass through.
     for (size_t i = 0; i < layout.sections.size(); ++i) {
         const SectionEntry& s = layout.sections[i];
         if (s.payload_length == 0) {
@@ -590,14 +590,14 @@ ImageError load_image(ImageReader& reader,
         for (uint64_t done = 0; done < s.payload_length;) {
             const size_t n = static_cast<size_t>(
                 std::min<uint64_t>(kStreamChunkBytes, s.payload_length - done));
-            buffer.resize(n);
-            if (!reader.read(s.payload_offset + done, buffer.data(), n)) {
-                return fail(make_error(ImageErrorCode::ReadFailed, i, s.payload_offset + done));
-            }
-            state = fnv1a_64(buffer.data(), n, state);
-            if (!arena.write(base + s.rva + done, buffer.data(), n)) {
+            uint8_t* dst = arena.host_ptr(base + s.rva + done, n);
+            if (dst == nullptr) {
                 return fail(make_error(ImageErrorCode::WriteFailed, i, s.rva + done));
             }
+            if (!reader.read(s.payload_offset + done, dst, n)) {
+                return fail(make_error(ImageErrorCode::ReadFailed, i, s.payload_offset + done));
+            }
+            state = fnv1a_64(dst, n, state);
             done += n;
         }
         if (state != s.checksum) {

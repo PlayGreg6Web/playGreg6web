@@ -441,12 +441,24 @@ Handle create_file_impl(std::string_view raw_path,
 // ---------------------------------------------------------------------------
 
 VirtualMemoryArena& default_vmem_arena() {
-    static VirtualMemoryArena arena;
-    return arena;
+    // The process guest address space: identity-mapped where the platform allows it, and the
+    // translation base lifted code uses unless set_vmem_arena() installs another arena.
+    struct ProcessArena {
+        VirtualMemoryArena arena{kDefaultArenaBase, kProcessGuestSpaceSize,
+                                 ArenaPlacement::PreferIdentity};
+        ProcessArena() {
+            if (g_vmem_arena.load(std::memory_order_acquire) == nullptr) {
+                publish_guest_address_space(arena);
+            }
+        }
+    };
+    static ProcessArena instance;
+    return instance.arena;
 }
 
 void set_vmem_arena(VirtualMemoryArena* arena) {
     g_vmem_arena.store(arena, std::memory_order_release);
+    publish_guest_address_space(arena != nullptr ? *arena : default_vmem_arena());
 }
 
 VirtualMemoryArena* get_vmem_arena() {

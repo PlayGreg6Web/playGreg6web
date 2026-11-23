@@ -68,6 +68,10 @@ LINK_FLAGS: tuple[str, ...] = (
     "-sMODULARIZE=1",
     "-sEXPORT_NAME=createRuntimeModule",
     "-sALLOW_MEMORY_GROWTH=1",
+    # Guest address space (runtime/os/vmem.h): identity-mapped guest pool in linear memory
+    # [4 GiB, 16 GiB), runtime heap fenced below it.
+    "-sMAXIMUM_MEMORY=16GB",
+    "-Wl,--wrap=sbrk",
     "-sENVIRONMENT=worker",
     "-sERROR_ON_UNDEFINED_SYMBOLS=0",
     "-lexports.js",

@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(playgta6_core STATIC
     os/os_shim.cpp
     os/vmem.cpp
+    os/vmem_backing.cpp
     os/threading.cpp
     os/game_input.cpp
     os/httpfs_mailbox.cpp
@@ -53,6 +54,10 @@ if(EMSCRIPTEN)
         -sMODULARIZE=1
         -sEXPORT_NAME=createRuntimeModule
         -sALLOW_MEMORY_GROWTH=1
+        # Guest address space (os/vmem.h): linear memory [4 GiB, 16 GiB) is the identity-mapped
+        # guest pool, grown on commit; sbrk is fenced below 4 GiB so malloc never enters it.
+        -sMAXIMUM_MEMORY=16GB
+        -Wl,--wrap=sbrk
         -sENVIRONMENT=worker
         -sERROR_ON_UNDEFINED_SYMBOLS=0
         -lexports.js
@@ -129,6 +134,10 @@ else()
     add_executable(test_ucrt_bridge ../tests/test_ucrt_bridge.cpp)
     target_link_libraries(test_ucrt_bridge PRIVATE playgta6_core)
     add_test(NAME playgta6_ucrt_bridge_tests COMMAND test_ucrt_bridge)
+
+    add_executable(test_vmem_contiguous ../tests/test_vmem_contiguous.cpp)
+    target_link_libraries(test_vmem_contiguous PRIVATE playgta6_core)
+    add_test(NAME playgta6_vmem_contiguous_tests COMMAND test_vmem_contiguous)
 
     add_executable(test_guest_runtime ../tests/test_guest_runtime.cpp)
     target_link_libraries(test_guest_runtime PRIVATE playgta6_core)

@@ -3,9 +3,30 @@
 #include <algorithm>
 #include <cstring>
 
+#include "os/vmem_backing.h"
+
+// The translation base lifted code and the import bridge add to every guest address
+// (docs/wasm_abi.md "Guest Address Space"). Identity until an arena is published.
+extern "C" {
+uint64_t __playgta6_guest_base = 0;
+}
+
 namespace playgta6::os {
 
-VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base) {
+namespace {
+
+#ifdef __EMSCRIPTEN__
+// The wasm pool cannot spare address space for an inaccessible [0, space_base) prefix.
+constexpr bool kGuardLowAddresses = false;
+#else
+constexpr bool kGuardLowAddresses = true;
+#endif
+
+}  // namespace
+
+VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
+                                       uint64_t space_size,
+                                       ArenaPlacement placement) {
     uint64_t aligned = kDefaultArenaBase;
     if (default_base >= kAllocationGranularity &&
         align_up_checked(default_base, kAllocationGranularity, aligned) &&
@@ -14,6 +35,47 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base) {
     } else {
         default_base_ = kDefaultArenaBase;
     }
+    space_base_ = default_base_;
+
+    uint64_t size = 0;
+    if (space_size == 0 || !align_up_checked(space_size, kAllocationGranularity, size) ||
+        size > UINT64_MAX - space_base_) {
+        return;
+    }
+    space_size_ = size;
+
+    if (placement == ArenaPlacement::PreferIdentity) {
+        if (uint8_t* host = backing::reserve(size, space_base_)) {
+            backing_ = host;
+            backing_size_ = size;
+            guest_base_ = 0;
+            return;
+        }
+    }
+    if (kGuardLowAddresses) {
+        // Back guest VAs [0, space_end): the part below space_base_ is never committed, so null
+        // and small guest pointers fault.
+        const uint64_t total = space_base_ + size;
+        if (uint8_t* host = backing::reserve(total, 0)) {
+            backing_ = host;
+            backing_size_ = total;
+            guest_base_ = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
+        }
+    } else if (uint8_t* host = backing::reserve(size, 0)) {
+        backing_ = host;
+        backing_size_ = size;
+        guest_base_ = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host)) - space_base_;
+    }
+}
+
+VirtualMemoryArena::~VirtualMemoryArena() {
+    if (backing_ != nullptr) {
+        backing::release(backing_, backing_size_);
+    }
+}
+
+bool VirtualMemoryArena::protections_enforced() {
+    return backing::enforces_protection();
 }
 
 bool VirtualMemoryArena::is_valid_protect(PageProtect protect) {
@@ -55,6 +117,35 @@ const VirtualMemoryArena::Reservation* VirtualMemoryArena::find_reservation_lock
     return nullptr;
 }
 
+// Every page of [addr, addr + len) is committed with a readable (or writable) protection.
+// The range may cross reservations.
+bool VirtualMemoryArena::pages_allow_locked(uint64_t addr, size_t len, bool need_write) const {
+    if (len == 0 || addr > UINT64_MAX - len) {
+        return false;
+    }
+    const uint64_t end = addr + len;
+    uint64_t cursor = addr;
+    while (cursor < end) {
+        const Reservation* res = find_reservation_locked(cursor);
+        if (res == nullptr) {
+            return false;
+        }
+        const uint64_t res_end = res->base + res->size;
+        const uint64_t stop = std::min(end, res_end);
+        const size_t first_page = static_cast<size_t>((cursor - res->base) / kPageSize);
+        const size_t last_page = static_cast<size_t>((stop - 1u - res->base) / kPageSize);
+        for (size_t p = first_page; p <= last_page; ++p) {
+            const PageMeta& page = res->pages[p];
+            if (page.state != MemState::Commit ||
+                !(need_write ? is_writable(page.protect) : is_readable(page.protect))) {
+                return false;
+            }
+        }
+        cursor = stop;
+    }
+    return true;
+}
+
 bool VirtualMemoryArena::range_overlaps_locked(uint64_t start, uint64_t end) const {
     auto it = reservations_.lower_bound(start);
     if (it != reservations_.end()) {
@@ -73,6 +164,7 @@ bool VirtualMemoryArena::range_overlaps_locked(uint64_t start, uint64_t end) con
 }
 
 uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) const {
+    const uint64_t space_end = space_base_ + space_size_;
     uint64_t candidate = default_base_;
     for (const auto& [base, res] : reservations_) {
         const uint64_t res_end = res.base + res.granularity_size;
@@ -81,14 +173,14 @@ uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) cons
         }
         if (candidate <= UINT64_MAX - granularity_size &&
             candidate + granularity_size <= res.base) {
-            return candidate;
+            break;
         }
         if (res_end > candidate) {
             candidate = res_end;
         }
     }
-    if (candidate > UINT64_MAX - granularity_size) {
-        return 0;
+    if (candidate > space_end || granularity_size > space_end - candidate) {
+        return 0;  // address space exhausted
     }
     return candidate;
 }
@@ -96,7 +188,7 @@ uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) cons
 uint64_t VirtualMemoryArena::reserve_locked(uint64_t hint_addr,
                                             uint64_t size,
                                             PageProtect allocation_protect) {
-    if (size == 0 || !is_valid_protect(allocation_protect)) {
+    if (size == 0 || !is_valid_protect(allocation_protect) || !valid()) {
         return 0;
     }
 
@@ -121,6 +213,11 @@ uint64_t VirtualMemoryArena::reserve_locked(uint64_t hint_addr,
             return 0;
         }
         if (base > UINT64_MAX - gran_size) {
+            return 0;
+        }
+        // Only addresses inside the backed space can be handed out.
+        if (base < space_base_ || gran_size > space_size_ ||
+            base - space_base_ > space_size_ - gran_size) {
             return 0;
         }
         if (range_overlaps_locked(base, base + gran_size)) {
@@ -176,43 +273,45 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
 
     const size_t first_page = static_cast<size_t>((start - res->base) / kPageSize);
     const size_t last_page = static_cast<size_t>((end - res->base) / kPageSize);
+    auto run_ptr = [&](size_t page) { return translate(res->base + page * kPageSize); };
 
-    // Identify maximal uncommitted runs and allocate zero-initialized backing buffers first.
-    std::vector<CommittedExtent> new_extents;
+    // Back maximal runs of uncommitted pages first (zero-filled); on failure undo those runs so
+    // the bookkeeping never disagrees with the backing.
     uint64_t newly_committed_bytes = 0;
-
-    size_t i = first_page;
-    while (i < last_page) {
+    for (size_t i = first_page; i < last_page;) {
         if (res->pages[i].state == MemState::Commit) {
             ++i;
             continue;
         }
-        size_t run_start = i;
+        const size_t run_start = i;
         while (i < last_page && res->pages[i].state != MemState::Commit) {
             ++i;
         }
-        const uint64_t run_offset = static_cast<uint64_t>(run_start) * kPageSize;
         const uint64_t run_bytes = static_cast<uint64_t>(i - run_start) * kPageSize;
-
-        CommittedExtent ext;
-        ext.offset = run_offset;
-        ext.size = run_bytes;
-        ext.data = std::make_unique<uint8_t[]>(static_cast<size_t>(run_bytes));
-        new_extents.push_back(std::move(ext));
+        if (!backing::commit(run_ptr(run_start), run_bytes, protect)) {
+            for (size_t p = first_page; p < run_start; ++p) {
+                if (res->pages[p].state != MemState::Commit) {
+                    backing::decommit(run_ptr(p), kPageSize);
+                }
+            }
+            return false;
+        }
         newly_committed_bytes += run_bytes;
     }
 
-    if (!new_extents.empty()) {
-        for (auto& ext : new_extents) {
-            auto pos = std::lower_bound(
-                res->extents.begin(),
-                res->extents.end(),
-                ext.offset,
-                [](const CommittedExtent& existing, uint64_t off) {
-                    return existing.offset < off;
-                });
-            res->extents.insert(pos, std::move(ext));
+    // Already committed pages keep their data and take the new protection.
+    for (size_t i = first_page; i < last_page;) {
+        if (res->pages[i].state != MemState::Commit || res->pages[i].protect == protect) {
+            ++i;
+            continue;
         }
+        const size_t run_start = i;
+        while (i < last_page && res->pages[i].state == MemState::Commit &&
+               res->pages[i].protect != protect) {
+            ++i;
+        }
+        backing::protect(run_ptr(run_start), static_cast<uint64_t>(i - run_start) * kPageSize,
+                         protect);
     }
 
     for (size_t p = first_page; p < last_page; ++p) {
@@ -250,52 +349,8 @@ bool VirtualMemoryArena::decommit_locked(uint64_t addr, uint64_t size) {
         }
     }
 
-    const uint64_t rel_start = start - res->base;
-    const uint64_t rel_end = end - res->base;
-    const size_t first_page = static_cast<size_t>(rel_start / kPageSize);
-    const size_t last_page = static_cast<size_t>(rel_end / kPageSize);
-
-    // Rebuild extents list, trimming or splitting any extent partially overlapping [rel_start, rel_end).
-    std::vector<CommittedExtent> updated_extents;
-    updated_extents.reserve(res->extents.size() + 1);
-
-    for (auto& ext : res->extents) {
-        const uint64_t ext_start = ext.offset;
-        const uint64_t ext_end = ext.offset + ext.size;
-
-        if (ext_end <= rel_start || ext_start >= rel_end) {
-            // Completely disjoint.
-            updated_extents.push_back(std::move(ext));
-            continue;
-        }
-
-        // Left surviving slice.
-        if (ext_start < rel_start) {
-            const uint64_t left_size = rel_start - ext_start;
-            CommittedExtent left;
-            left.offset = ext_start;
-            left.size = left_size;
-            left.data = std::make_unique<uint8_t[]>(static_cast<size_t>(left_size));
-            std::memcpy(left.data.get(), ext.data.get(), static_cast<size_t>(left_size));
-            updated_extents.push_back(std::move(left));
-        }
-
-        // Right surviving slice.
-        if (ext_end > rel_end) {
-            const uint64_t right_size = ext_end - rel_end;
-            const uint64_t src_off = rel_end - ext_start;
-            CommittedExtent right;
-            right.offset = rel_end;
-            right.size = right_size;
-            right.data = std::make_unique<uint8_t[]>(static_cast<size_t>(right_size));
-            std::memcpy(right.data.get(),
-                        ext.data.get() + static_cast<size_t>(src_off),
-                        static_cast<size_t>(right_size));
-            updated_extents.push_back(std::move(right));
-        }
-    }
-
-    res->extents = std::move(updated_extents);
+    const size_t first_page = static_cast<size_t>((start - res->base) / kPageSize);
+    const size_t last_page = static_cast<size_t>((end - res->base) / kPageSize);
 
     uint64_t freed_bytes = 0;
     for (size_t p = first_page; p < last_page; ++p) {
@@ -304,6 +359,9 @@ bool VirtualMemoryArena::decommit_locked(uint64_t addr, uint64_t size) {
         }
         res->pages[p].state = MemState::Reserve;
         res->pages[p].protect = PageProtect::NoAccess;
+    }
+    if (freed_bytes != 0) {
+        backing::decommit(translate(start), end - start);
     }
     committed_bytes_ -= freed_bytes;
     return true;
@@ -320,6 +378,9 @@ bool VirtualMemoryArena::release_locked(uint64_t base_addr) {
         if (page.state == MemState::Commit) {
             res_committed += kPageSize;
         }
+    }
+    if (res_committed != 0) {
+        backing::decommit(translate(res.base), res.size);
     }
     reserved_bytes_ -= res.size;
     committed_bytes_ -= res_committed;
@@ -379,6 +440,9 @@ bool VirtualMemoryArena::protect(uint64_t addr,
         }
     }
 
+    if (!backing::protect(translate(start), end - start, new_protect)) {
+        return false;
+    }
     if (old_protect != nullptr) {
         *old_protect = res->pages[first_page].protect;
     }
@@ -477,9 +541,13 @@ MemoryBasicInfo VirtualMemoryArena::query(uint64_t addr) const {
     free_info.protect = PageProtect::NoAccess;
     free_info.allocation_protect = PageProtect::NoAccess;
 
+    // A free region extends to the next reservation, or to the end of the guest address space.
     auto next_it = reservations_.upper_bound(page_addr);
+    const uint64_t space_end = space_base_ + space_size_;
     if (next_it != reservations_.end()) {
         free_info.region_size = next_it->second.base - page_addr;
+    } else if (page_addr < space_end) {
+        free_info.region_size = space_end - page_addr;
     } else {
         free_info.region_size = 0;
     }
@@ -490,170 +558,40 @@ bool VirtualMemoryArena::read(uint64_t addr, void* dst, size_t len) const {
     if (len == 0) {
         return true;
     }
-    if (dst == nullptr || addr > UINT64_MAX - len) {
+    if (dst == nullptr) {
         return false;
     }
-
     std::lock_guard<std::mutex> lock(mutex_);
-    const Reservation* res = find_reservation_locked(addr);
-    if (!res) {
+    if (!pages_allow_locked(addr, len, false)) {
         return false;
     }
-    const uint64_t end = addr + len;
-    if (end > res->base + res->size) {
-        return false;
-    }
-
-    const size_t first_page = static_cast<size_t>((addr - res->base) / kPageSize);
-    const size_t last_page = static_cast<size_t>((end - 1u - res->base) / kPageSize);
-    for (size_t p = first_page; p <= last_page; ++p) {
-        if (res->pages[p].state != MemState::Commit || !is_readable(res->pages[p].protect)) {
-            return false;
-        }
-    }
-
-    uint8_t* out = static_cast<uint8_t*>(dst);
-    uint64_t cursor = addr - res->base;
-    size_t remaining = len;
-
-    for (const auto& ext : res->extents) {
-        if (remaining == 0) {
-            break;
-        }
-        const uint64_t ext_end = ext.offset + ext.size;
-        if (ext_end <= cursor) {
-            continue;
-        }
-        if (ext.offset > cursor) {
-            return false;
-        }
-        const uint64_t in_ext_off = cursor - ext.offset;
-        const size_t chunk = static_cast<size_t>(
-            std::min<uint64_t>(remaining, ext_end - cursor));
-        std::memcpy(out, ext.data.get() + static_cast<size_t>(in_ext_off), chunk);
-        out += chunk;
-        cursor += chunk;
-        remaining -= chunk;
-    }
-    return remaining == 0;
+    std::memcpy(dst, translate(addr), len);
+    return true;
 }
 
 bool VirtualMemoryArena::write(uint64_t addr, const void* src, size_t len) {
     if (len == 0) {
         return true;
     }
-    if (src == nullptr || addr > UINT64_MAX - len) {
+    if (src == nullptr) {
         return false;
     }
-
     std::lock_guard<std::mutex> lock(mutex_);
-    Reservation* res = find_reservation_locked(addr);
-    if (!res) {
+    if (!pages_allow_locked(addr, len, true)) {
         return false;
     }
-    const uint64_t end = addr + len;
-    if (end > res->base + res->size) {
-        return false;
-    }
-
-    const size_t first_page = static_cast<size_t>((addr - res->base) / kPageSize);
-    const size_t last_page = static_cast<size_t>((end - 1u - res->base) / kPageSize);
-    for (size_t p = first_page; p <= last_page; ++p) {
-        if (res->pages[p].state != MemState::Commit || !is_writable(res->pages[p].protect)) {
-            return false;
-        }
-    }
-
-    const uint8_t* in = static_cast<const uint8_t*>(src);
-    uint64_t cursor = addr - res->base;
-    size_t remaining = len;
-
-    for (auto& ext : res->extents) {
-        if (remaining == 0) {
-            break;
-        }
-        const uint64_t ext_end = ext.offset + ext.size;
-        if (ext_end <= cursor) {
-            continue;
-        }
-        if (ext.offset > cursor) {
-            return false;
-        }
-        const uint64_t in_ext_off = cursor - ext.offset;
-        const size_t chunk = static_cast<size_t>(
-            std::min<uint64_t>(remaining, ext_end - cursor));
-        std::memcpy(ext.data.get() + static_cast<size_t>(in_ext_off), in, chunk);
-        in += chunk;
-        cursor += chunk;
-        remaining -= chunk;
-    }
-    return remaining == 0;
+    std::memcpy(translate(addr), src, len);
+    return true;
 }
 
 uint8_t* VirtualMemoryArena::host_ptr(uint64_t addr, size_t len) {
-    if (len == 0 || addr > UINT64_MAX - len) {
-        return nullptr;
-    }
-
     std::lock_guard<std::mutex> lock(mutex_);
-    Reservation* res = find_reservation_locked(addr);
-    if (!res) {
-        return nullptr;
-    }
-    const uint64_t end = addr + len;
-    if (end > res->base + res->size) {
-        return nullptr;
-    }
-
-    const size_t first_page = static_cast<size_t>((addr - res->base) / kPageSize);
-    const size_t last_page = static_cast<size_t>((end - 1u - res->base) / kPageSize);
-    for (size_t p = first_page; p <= last_page; ++p) {
-        if (res->pages[p].state != MemState::Commit || !is_writable(res->pages[p].protect)) {
-            return nullptr;
-        }
-    }
-
-    const uint64_t rel_start = addr - res->base;
-    const uint64_t rel_end = end - res->base;
-    for (auto& ext : res->extents) {
-        if (rel_start >= ext.offset && rel_end <= ext.offset + ext.size) {
-            return ext.data.get() + static_cast<size_t>(rel_start - ext.offset);
-        }
-    }
-    return nullptr;
+    return pages_allow_locked(addr, len, true) ? translate(addr) : nullptr;
 }
 
 const uint8_t* VirtualMemoryArena::host_ptr_const(uint64_t addr, size_t len) const {
-    if (len == 0 || addr > UINT64_MAX - len) {
-        return nullptr;
-    }
-
     std::lock_guard<std::mutex> lock(mutex_);
-    const Reservation* res = find_reservation_locked(addr);
-    if (!res) {
-        return nullptr;
-    }
-    const uint64_t end = addr + len;
-    if (end > res->base + res->size) {
-        return nullptr;
-    }
-
-    const size_t first_page = static_cast<size_t>((addr - res->base) / kPageSize);
-    const size_t last_page = static_cast<size_t>((end - 1u - res->base) / kPageSize);
-    for (size_t p = first_page; p <= last_page; ++p) {
-        if (res->pages[p].state != MemState::Commit || !is_readable(res->pages[p].protect)) {
-            return nullptr;
-        }
-    }
-
-    const uint64_t rel_start = addr - res->base;
-    const uint64_t rel_end = end - res->base;
-    for (const auto& ext : res->extents) {
-        if (rel_start >= ext.offset && rel_end <= ext.offset + ext.size) {
-            return ext.data.get() + static_cast<size_t>(rel_start - ext.offset);
-        }
-    }
-    return nullptr;
+    return pages_allow_locked(addr, len, false) ? translate(addr) : nullptr;
 }
 
 uint64_t VirtualMemoryArena::reserved_bytes() const {
@@ -669,6 +607,10 @@ uint64_t VirtualMemoryArena::committed_bytes() const {
 size_t VirtualMemoryArena::reservation_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return reservations_.size();
+}
+
+void publish_guest_address_space(const VirtualMemoryArena& arena) {
+    __playgta6_guest_base = arena.guest_base();
 }
 
 }  // namespace playgta6::os

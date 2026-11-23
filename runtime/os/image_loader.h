@@ -16,8 +16,9 @@ namespace playgta6::os::pgim {
 // Loader for the PGIM v1 guest image container written by recomp/src/image.rs (that module is
 // authoritative for the format). A container is validated (parse_layout / parse_image) and then
 // mapped into a VirtualMemoryArena (load_image): reserve SizeOfImage, commit and zero the pages
-// sections cover, copy payloads to base + RVA, rebase if base != preferred base, and finally set
-// page protections.
+// sections cover, read payloads straight into guest memory at base + RVA, rebase if base !=
+// preferred base, and finally set page protections. The preferred base is honoured when it lies
+// inside the arena's guest address space (the default process space covers 0x1'4000'0000).
 
 inline constexpr uint32_t kVersion = 1;
 inline constexpr uint64_t kHeaderBytes = 64;

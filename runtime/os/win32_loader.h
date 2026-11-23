@@ -20,8 +20,8 @@
 // segment (as on Windows, where a heap handle is the heap's base address), so it can never collide
 // with kernel object handles from win32_kernel.cpp.
 //
-// Each heap owns arena segments (committed in one piece, so a block never straddles host
-// extents) and keeps all bookkeeping host-side: guest buffer overruns cannot corrupt allocator
+// Each heap owns arena segments (committed in one piece) and keeps all bookkeeping host-side:
+// guest buffer overruns cannot corrupt allocator
 // metadata, and HeapFree/HeapSize/HeapReAlloc on foreign or already-freed addresses are detected
 // exactly and fail with a Win32 error instead of being undefined behaviour. Blocks are 16-byte
 // aligned (Win64 MEMORY_ALLOCATION_ALIGNMENT). A heap binds to the arena returned by
