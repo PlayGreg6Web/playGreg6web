@@ -9,9 +9,14 @@
 // `state` and `shadowStack` are linear (host) addresses.
 // Every worker instantiates the module on the shared memory, then runs its calls in order (each
 // with a fresh register set and a pushed return address); all workers meet at a barrier before
-// every call so that the same call runs on all threads at once.
+// every call so that the same call runs on all threads at once. The barrier spins briefly before
+// it sleeps, so on a machine with enough cores the workers leave it within nanoseconds.
 // Prints the `read` ranges as hex, comma separated (or `error: ...`), then one line per call
-// index: `overlap <i> <0|1>`, 1 when every worker was inside call i at the same time.
+// index: `overlap <i> <n>`, where n is the largest number of workers any worker saw inside call i
+// (itself included) when it entered the call. Overlap is measured by a shared counter that the
+// workers bump around the call, not by wall-clock timestamps, so it cannot be fooled by coarse
+// clocks or by one worker finishing before a late one starts: n >= 2 means two calls really were
+// in flight at once.
 'use strict';
 const fs = require('fs');
 const { Worker, isMainThread, workerData, parentPort } = require('worker_threads');
@@ -20,15 +25,34 @@ const RETURN_ADDRESS = 0xC0DEC0DEn;
 const RSP = 4;
 const lin = (guestBase, addr) => Number(BigInt.asUintN(64, BigInt(addr) + BigInt(guestBase || 0)));
 
-// Reusable barrier for `n` threads on an Int32Array: [generation, arrived].
+// Control block (Int32Array): [generation, arrived, active, unused, peak of call 0, peak of call 1, ...]
+const GENERATION = 0;
+const ARRIVED = 1;
+const ACTIVE = 2;
+const PEAKS = 4;
+const SPIN_MS = 20;
+
+// Reusable barrier for `n` threads. Waiters spin first (all threads leave together when enough
+// CPUs are free) and fall back to Atomics.wait when the machine is oversubscribed.
 function barrier(ctrl, n) {
-  const generation = Atomics.load(ctrl, 0);
-  if (Atomics.add(ctrl, 1, 1) === n - 1) {
-    Atomics.store(ctrl, 1, 0);
-    Atomics.add(ctrl, 0, 1);
-    Atomics.notify(ctrl, 0);
+  const generation = Atomics.load(ctrl, GENERATION);
+  if (Atomics.add(ctrl, ARRIVED, 1) === n - 1) {
+    Atomics.store(ctrl, ARRIVED, 0);
+    Atomics.add(ctrl, GENERATION, 1);
+    Atomics.notify(ctrl, GENERATION);
   } else {
-    while (Atomics.load(ctrl, 0) === generation) Atomics.wait(ctrl, 0, generation);
+    const until = performance.now() + SPIN_MS;
+    while (Atomics.load(ctrl, GENERATION) === generation && performance.now() < until) {
+      // spin
+    }
+    while (Atomics.load(ctrl, GENERATION) === generation) Atomics.wait(ctrl, GENERATION, generation, 5);
+  }
+}
+
+function recordPeak(ctrl, call, seen) {
+  for (;;) {
+    const peak = Atomics.load(ctrl, PEAKS + call);
+    if (peak >= seen || Atomics.compareExchange(ctrl, PEAKS + call, peak, seen) === peak) return;
   }
 }
 
@@ -77,12 +101,11 @@ if (isMainThread) {
     const base = lin(spec.guestBase, addr);
     for (let i = 0; i < hex.length; i += 2) bytes[base + i / 2] = parseInt(hex.substr(i, 2), 16);
   }
-  const control = new Int32Array(new SharedArrayBuffer(8));
+  const control = new Int32Array(new SharedArrayBuffer(4 * (PEAKS + spec.workers[0].calls.length)));
   let pending = spec.workers.length;
   let failure = null;
   const count = spec.workers.length;
   const workers = spec.workers.map((w) => new Worker(__filename, { workerData: { module, memory, control, count, w, gprOffset: spec.gprOffset, guestBase: spec.guestBase } }));
-  const times = [];
   const finish = () => {
     pending -= 1;
     if (pending !== 0) return;
@@ -97,16 +120,13 @@ if (isMainThread) {
       return s;
     });
     process.stdout.write(out.join(',') + '\n');
-    for (let i = 0; i < times[0].length; i++) {
-      const start = Math.max(...times.map((t) => t[i][0]));
-      const end = Math.min(...times.map((t) => t[i][1]));
-      process.stdout.write(`overlap ${i} ${start < end ? 1 : 0}\n`);
+    for (let i = 0; i < spec.workers[0].calls.length; i++) {
+      process.stdout.write(`overlap ${i} ${Atomics.load(control, PEAKS + i)}\n`);
     }
   };
   for (const worker of workers) {
     worker.on('message', (msg) => {
-      if (msg && msg.times) times.push(msg.times);
-      else failure = failure || msg;
+      if (msg !== 'done') failure = failure || msg;
       finish();
     });
     worker.on('error', (e) => {
@@ -127,20 +147,33 @@ if (isMainThread) {
     setupError = e;
   }
   // A worker that failed to set up still takes part in every barrier.
-  const times = [];
   let error = setupError;
-  for (const call of w.calls) {
+  for (let index = 0; index < w.calls.length; index++) {
+    const call = w.calls[index];
+    if (!error) {
+      try {
+        prepare(call);
+      } catch (e) {
+        error = e;
+      }
+    }
     barrier(control, count);
     if (error) continue;
     try {
-      run(call);
+      // Count this call in flight; seeing another one in flight proves real overlap.
+      recordPeak(control, index, Atomics.add(control, ACTIVE, 1) + 1);
+      try {
+        instance.exports[call.fn](BigInt(w.state));
+      } finally {
+        Atomics.sub(control, ACTIVE, 1);
+      }
     } catch (e) {
       error = e;
     }
   }
-  parentPort.postMessage(error ? String(error && error.message ? error.message : error) : { times });
+  parentPort.postMessage(error ? String(error && error.message ? error.message : error) : 'done');
 
-  function run(call) {
+  function prepare(call) {
     const view = new DataView(memory.buffer);
     const state = BigInt(w.state);
     const gpr = Number(state) + gprOffset;
@@ -149,8 +182,5 @@ if (isMainThread) {
     const rsp = BigInt(w.stackTop) - 8n;
     view.setBigUint64(lin(guestBase, rsp), RETURN_ADDRESS, true);
     view.setBigUint64(gpr + RSP * 8, rsp, true);
-    const start = performance.timeOrigin + performance.now();
-    instance.exports[call.fn](state);
-    times.push([start, performance.timeOrigin + performance.now()]);
   }
 }

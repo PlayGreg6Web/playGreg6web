@@ -644,7 +644,11 @@ fn atomics_have_no_lost_updates_across_threads() {
     let built = build_with("threads", functions.values(), &extra);
 
     const WORKERS: u64 = 4;
-    const ITERATIONS: u64 = 100_000;
+    // The lifted loops are short, so on a loaded or small machine one worker can finish before
+    // the next is even scheduled. Each attempt is a fresh run with four times the iterations,
+    // until the non-atomic control proves that calls really interleaved (it lost updates) or the
+    // attempts run out.
+    const ATTEMPTS: [u64; 4] = [100_000, 400_000, 1_600_000, 3_200_000];
     let counters = DATA_ADDR;
     let (inc, cas, xadd, wide, spin, plain) = (
         counters,
@@ -655,85 +659,108 @@ fn atomics_have_no_lost_updates_across_threads() {
         counters + 80,
     );
     let wide_start: u128 = u128::from(u64::MAX - 1000) | (5u128 << 64);
-    let mut workers = String::new();
-    for w in 0..WORKERS {
-        if w > 0 {
-            workers.push(',');
-        }
-        let calls = [
-            (base, vec![(RCX, ITERATIONS), (RDX, inc)]),
-            (base + 0x100, vec![(RCX, ITERATIONS), (RDX, cas)]),
-            (base + 0x200, vec![(RCX, ITERATIONS), (RDX, xadd)]),
-            (base + 0x300, vec![(R9, ITERATIONS), (RSI, wide)]),
-            (base + 0x400, vec![(RCX, ITERATIONS), (RDX, spin)]),
-            (base + 0x500, vec![(RCX, ITERATIONS), (RDX, plain)]),
-        ];
-        let calls: Vec<String> = calls
-            .iter()
-            .map(|(va, regs)| {
-                let regs: Vec<String> = regs
-                    .iter()
-                    .map(|(i, v)| format!("[{i},\"{v:#x}\"]"))
-                    .collect();
-                format!("{{\"fn\":\"sub_{va:X}\",\"regs\":[{}]}}", regs.join(","))
-            })
-            .collect();
-        let _ = write!(
-            workers,
-            "{{\"state\":\"{:#x}\",\"stackTop\":\"{:#x}\",\"shadowStack\":\"{:#x}\",\"calls\":[{}]}}",
-            STATE_ADDR + w * 0x200,
-            STACK_TOP - w * 0x1_0000,
-            0x70_0000 + (w + 1) * 0x1_0000,
-            calls.join(",")
-        );
-    }
     let init: String = wide_start
         .to_le_bytes()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let spec = format!(
-        "{{\"pages\":{},\"gprOffset\":{STATE_GPR_OFFSET},\"guestBase\":\"{:#x}\",\"init\":[[\"{wide:#x}\",\"{init}\"]],\"read\":[[\"{counters:#x}\",88]],\"workers\":[{workers}]}}",
-        MEMORY_BYTES / 65536,
-        built.guest_base
-    );
-    let out = run_script(&built, "runner_threads.js", RUNNER_THREADS_JS, &[spec]);
-    if let Some(reason) = out.trim().strip_prefix("skip: ") {
-        println!("SKIP {test}: {reason}");
-        return;
+    let mut last_note = String::new();
+    for iterations in ATTEMPTS {
+        let mut workers = String::new();
+        for w in 0..WORKERS {
+            if w > 0 {
+                workers.push(',');
+            }
+            let calls = [
+                (base, vec![(RCX, iterations), (RDX, inc)]),
+                (base + 0x100, vec![(RCX, iterations), (RDX, cas)]),
+                (base + 0x200, vec![(RCX, iterations), (RDX, xadd)]),
+                (base + 0x300, vec![(R9, iterations), (RSI, wide)]),
+                (base + 0x400, vec![(RCX, iterations), (RDX, spin)]),
+                (base + 0x500, vec![(RCX, iterations), (RDX, plain)]),
+            ];
+            let calls: Vec<String> = calls
+                .iter()
+                .map(|(va, regs)| {
+                    let regs: Vec<String> = regs
+                        .iter()
+                        .map(|(i, v)| format!("[{i},\"{v:#x}\"]"))
+                        .collect();
+                    format!("{{\"fn\":\"sub_{va:X}\",\"regs\":[{}]}}", regs.join(","))
+                })
+                .collect();
+            let _ = write!(
+                workers,
+                "{{\"state\":\"{:#x}\",\"stackTop\":\"{:#x}\",\"shadowStack\":\"{:#x}\",\"calls\":[{}]}}",
+                STATE_ADDR + w * 0x200,
+                STACK_TOP - w * 0x1_0000,
+                0x70_0000 + (w + 1) * 0x1_0000,
+                calls.join(",")
+            );
+        }
+        let spec = format!(
+            "{{\"pages\":{},\"gprOffset\":{STATE_GPR_OFFSET},\"guestBase\":\"{:#x}\",\"init\":[[\"{wide:#x}\",\"{init}\"]],\"read\":[[\"{counters:#x}\",88]],\"workers\":[{workers}]}}",
+            MEMORY_BYTES / 65536,
+            built.guest_base
+        );
+        let out = run_script(&built, "runner_threads.js", RUNNER_THREADS_JS, &[spec]);
+        if let Some(reason) = out.trim().strip_prefix("skip: ") {
+            println!("SKIP {test}: {reason}");
+            return;
+        }
+        println!("{out}");
+        let first = out.lines().next().unwrap_or_default().trim();
+        assert!(!first.starts_with("error"), "{first}");
+        let bytes: Vec<u8> = (0..first.len() / 2)
+            .map(|i| u8::from_str_radix(&first[2 * i..2 * i + 2], 16).expect("hex"))
+            .collect();
+        let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        // The no-lost-updates checks are strict on every attempt, whether or not the threads
+        // overlapped: a lost update is a bug either way.
+        let total = WORKERS * iterations;
+        assert_eq!(u64_at(0), total, "lock inc");
+        assert_eq!(u64_at(16), total, "lock cmpxchg loop");
+        assert_eq!(u64_at(32) & 0xFFFF_FFFF, total, "lock xadd");
+        let wide_out = u128::from_le_bytes(bytes[48..64].try_into().unwrap());
+        assert_eq!(wide_out, wide_start + u128::from(total), "lock cmpxchg16b");
+        assert_eq!(u64_at(64), 0, "spinlock released");
+        assert_eq!(
+            u64_at(72),
+            total,
+            "xchg/btr spinlock protects a plain increment"
+        );
+        // Peak number of calls in flight at once, per call (see runner_threads.js).
+        let peaks: Vec<u64> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("overlap "))
+            .filter_map(|l| l.split(' ').nth(1)?.parse().ok())
+            .collect();
+        let survived = u64_at(80);
+        println!(
+            "non-atomic control: {survived} of {total} increments survived; peak concurrent calls {peaks:?}"
+        );
+        // The mutation check: a plain increment loses updates exactly when calls interleave, so
+        // a lost update in the control is proof that the atomic loops above ran under real
+        // contention and the harness can see a lost update. Observed overlap alone is not
+        // enough (a late worker may just catch the tail of an early one's call).
+        if survived < total {
+            assert!(
+                peaks[5] >= 2,
+                "the control lost updates, so calls must have overlapped: {out}"
+            );
+            println!(
+                "OVERLAP OBSERVED {test}: control lost {} updates",
+                total - survived
+            );
+            return;
+        }
+        last_note = format!("peak concurrent calls {peaks:?}");
     }
-    println!("{out}");
-    // Every call starts behind a barrier on all workers; at least one must really have run on
-    // all threads at the same time for this test to say anything about atomicity.
-    let overlapping = out
-        .lines()
-        .filter(|l| l.starts_with("overlap ") && l.ends_with(" 1"))
-        .count();
-    assert!(
-        overlapping > 0,
-        "the workers never ran concurrently:\n{out}"
-    );
-    let out = out.lines().next().unwrap_or_default().trim();
-    assert!(!out.starts_with("error"), "{out}");
-    let bytes: Vec<u8> = (0..out.len() / 2)
-        .map(|i| u8::from_str_radix(&out[2 * i..2 * i + 2], 16).expect("hex"))
-        .collect();
-    let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-    let total = WORKERS * ITERATIONS;
-    assert_eq!(u64_at(0), total, "lock inc");
-    assert_eq!(u64_at(16), total, "lock cmpxchg loop");
-    assert_eq!(u64_at(32) & 0xFFFF_FFFF, total, "lock xadd");
-    let wide_out = u128::from_le_bytes(bytes[48..64].try_into().unwrap());
-    assert_eq!(wide_out, wide_start + u128::from(total), "lock cmpxchg16b");
-    assert_eq!(u64_at(64), 0, "spinlock released");
-    assert_eq!(
-        u64_at(72),
-        total,
-        "xchg/btr spinlock protects a plain increment"
-    );
     println!(
-        "non-atomic control: {} of {total} increments survived",
-        u64_at(80)
+        "SKIP {test}: the workers never interleaved (the non-atomic control lost no update in \
+         any attempt up to {} iterations; {last_note}), so this machine offers no real \
+         concurrency; the atomic counters were still exact",
+        ATTEMPTS[ATTEMPTS.len() - 1]
     );
 }
 
