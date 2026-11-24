@@ -2425,6 +2425,30 @@ void test_xbox_unaligned_constant_buffers() {
     scene.release_all({list, heap});
 }
 
+// G47: UAV textures in formats WebGPU cannot bind as storage are created without STORAGE_BINDING
+// (WebGPU would reject the whole texture); storage-capable formats keep it.
+void test_uav_texture_storage_usage() {
+    Fixture fx;
+    Scene scene(fx);
+    const size_t mark = fx.captured.size();
+    const uint64_t rgba8 = committed(fx, scene.device, 1, texture_desc(64, 64, 28, 0x4), 0);    // R8G8B8A8_UNORM, UAV
+    const uint64_t r11 = committed(fx, scene.device, 1, texture_desc(64, 64, 26, 0x4), 0);      // R11G11B10_FLOAT, UAV
+    const uint64_t r8u = committed(fx, scene.device, 1, texture_desc(64, 64, 62, 0x5), 0);      // R8_UINT, RT + UAV
+    CHECK(rgba8 != 0 && r11 != 0 && r8u != 0);
+    const auto ps = packets_since(fx, mark);
+    CHECK(count_op(ps, GpuOpcode::CreateTexture2) == 3);
+    const Packet* a = find_op(ps, GpuOpcode::CreateTexture2, 0);
+    const Packet* b = find_op(ps, GpuOpcode::CreateTexture2, 1);
+    const Packet* c = find_op(ps, GpuOpcode::CreateTexture2, 2);
+    CHECK(a != nullptr && (payload_as<GpuCreateTexture2Payload>(*a).usage_flags & GpuTextureUsage::StorageBinding) != 0);
+    CHECK(b != nullptr && (payload_as<GpuCreateTexture2Payload>(*b).usage_flags & GpuTextureUsage::StorageBinding) == 0 &&
+          (payload_as<GpuCreateTexture2Payload>(*b).usage_flags & GpuTextureUsage::TextureBinding) != 0);
+    CHECK(c != nullptr && (payload_as<GpuCreateTexture2Payload>(*c).usage_flags & GpuTextureUsage::StorageBinding) == 0 &&
+          (payload_as<GpuCreateTexture2Payload>(*c).usage_flags & GpuTextureUsage::RenderAttachment) != 0);
+    CHECK(contains(host_device(scene.device)->diagnostics(), "has no WebGPU storage binding"));
+    scene.release_all({rgba8, r11, r8u});
+}
+
 // A WGPK pack with the given (key, stage) entries and tiny WGSL payloads.
 std::vector<uint8_t> wgpk(const std::vector<std::pair<uint64_t, uint8_t>>& entries) {
     std::vector<uint8_t> out(16 + entries.size() * 20, 0);
@@ -3053,6 +3077,7 @@ int main() {
     test_xbox_native_dxil_join();
     test_xbox_unaligned_constant_buffers();
     test_xbox_shader_pack_resolution();
+    test_uav_texture_storage_usage();
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();

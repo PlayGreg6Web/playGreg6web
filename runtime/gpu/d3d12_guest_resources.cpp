@@ -58,6 +58,28 @@ uint64_t u64_at(const uint32_t* u, size_t i) {
     return uint64_t{u[i]} | (uint64_t{u[i + 1]} << 32);
 }
 
+// Formats WebGPU allows STORAGE_BINDING for: the core set, plus the "texture-formats-tier1" set.
+bool storage_capable(pso::WgpuTextureFormat f, uint32_t features) {
+    using F = pso::WgpuTextureFormat;
+    switch (f) {
+        case F::Rgba8Unorm: case F::Rgba8Snorm: case F::Rgba8Uint: case F::Rgba8Sint:
+        case F::Rgba16Uint: case F::Rgba16Sint: case F::Rgba16Float:
+        case F::R32Uint: case F::R32Sint: case F::R32Float:
+        case F::Rg32Uint: case F::Rg32Sint: case F::Rg32Float:
+        case F::Rgba32Uint: case F::Rgba32Sint: case F::Rgba32Float:
+            return true;
+        case F::R8Unorm: case F::R8Snorm: case F::R8Uint: case F::R8Sint:
+        case F::Rg8Unorm: case F::Rg8Snorm: case F::Rg8Uint: case F::Rg8Sint:
+        case F::R16Unorm: case F::R16Snorm: case F::R16Uint: case F::R16Sint: case F::R16Float:
+        case F::Rg16Unorm: case F::Rg16Snorm: case F::Rg16Uint: case F::Rg16Sint: case F::Rg16Float:
+        case F::Rgba16Unorm: case F::Rgba16Snorm:
+        case F::Rgb10a2Uint: case F::Rgb10a2Unorm: case F::Rg11b10Ufloat:
+            return (features & pso::WgpuFeature::TextureFormatsTier1) != 0;
+        default:
+            return false;
+    }
+}
+
 uint32_t mips_or_all(uint32_t v) {
     return v == 0xFFFFFFFFu ? 0xffffu : v;
 }
@@ -451,7 +473,14 @@ bool Resource::initialize() {
                 p.usage_flags |= GpuTextureUsage::RenderAttachment;
             }
             if ((desc_.Flags & ResourceFlags::AllowUnorderedAccess) != 0) {
-                p.usage_flags |= GpuTextureUsage::StorageBinding;
+                if (storage_capable(m.format, dev.state_bridge().options().features)) {
+                    p.usage_flags |= GpuTextureUsage::StorageBinding;
+                } else {
+                    // WebGPU rejects the whole texture when STORAGE_BINDING is not allowed for its
+                    // format; such a texture keeps its other usages (its UAV bindings cannot work).
+                    dev.note_bad_argument(std::string("UAV texture format ") + pso::texture_format_name(m.format) +
+                                          " has no WebGPU storage binding: created without storage usage");
+                }
             }
             p.dimension = static_cast<uint8_t>(desc_.Dimension == ResourceDimension::Texture1D
                                                    ? GpuTextureDimension::Dim1D
