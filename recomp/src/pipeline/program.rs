@@ -111,12 +111,14 @@
 //! pg6_program.cpp         Pg6Program descriptor for runtime/guest/program_loader.h
 //! <module>/...            one single-module build per module (see the parent module)
 //! ```
-//! `pg6_program.cpp` includes `guest/program_loader.h` and defines
-//! `extern "C" const Pg6Program pg6_program`: the modules in initialisation order (executable
-//! last), each with file name, module name, assigned base, `SizeOfImage`, entry point VA,
-//! flags (`kPg6ProgramModuleMain`, `kPg6ProgramModuleDll`, `kPg6ProgramModuleTls`), TLS index,
-//! its `__playgta6_register_lifted_functions_<module>` and its bridge's
-//! `pg6_import_slots_<module>` / `pg6_import_slot_count_<module>`.
+//! `pg6_program.cpp` includes `guest/program_loader.h` and every module's
+//! `<module>/stubs/pg6_import_thunks.h` (compile it with the build root on the include path)
+//! and defines `extern "C" const Pg6Program pg6_program`: the modules in initialisation order
+//! (executable last), each with file name, module name, assigned base, `SizeOfImage`, entry
+//! point VA, flags (`kPg6ProgramModuleMain`, `kPg6ProgramModuleDll`, `kPg6ProgramModuleTls`),
+//! TLS index, its lifted-function table (`__playgta6_lifted_functions_<module>` and its count)
+//! and its import bridge table (`pg6_import_thunks_<module>` / `pg6_import_thunk_count_<module>`,
+//! the `Pg6BootImport` layout of `guest/boot.h`).
 //!
 //! # Manifest schema (`playgta6-recomp-program`, `schema_version` 1)
 //! Top-level keys in order: `schema`, `schema_version`, `tool` {`name`, `version`}, `options`
@@ -131,7 +133,7 @@
 //! `imports` {`total`, `guest`, `host_bound`, `host_unresolved`, `before` {`bound`,
 //! `unresolved`}}, `depends_on` [dll], `iat_prefill` [{`slot_rva`, `value`, `import`}],
 //! `registration` {`register_function`, `table_symbol`, `count`, `first`, `last`}, `bridge`
-//! {`slots_symbol`, `slot_count_symbol`}, `lift` {`functions`, `instructions`, `unsupported`},
+//! {`thunks_symbol`, `thunk_count_symbol`}, `lift` {`functions`, `instructions`, `unsupported`},
 //! `build_manifest` {`path`, `fnv1a64`}], `init_order` [dll], `cycles` [{`from`, `to`}],
 //! `imports` [{`importer`, `dll`, `name` | null, `ordinal` | null, `slot_rva` | null,
 //! `delay_load`, `binding` (`guest`, `host`, `unresolved`), `provider` (dll or null), `target`
@@ -1630,12 +1632,12 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                     "bridge",
                     obj([
                         (
-                            "slots_symbol",
-                            Json::Str(format!("pg6_import_slots_{}", m.module)),
+                            "thunks_symbol",
+                            Json::Str(format!("pg6_import_thunks_{}", m.module)),
                         ),
                         (
-                            "slot_count_symbol",
-                            Json::Str(format!("pg6_import_slot_count_{}", m.module)),
+                            "thunk_count_symbol",
+                            Json::Str(format!("pg6_import_thunk_count_{}", m.module)),
                         ),
                     ]),
                 ),
@@ -1849,19 +1851,32 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
          //\n\
          // Guest program descriptor for the runtime program loader: every module in\n\
          // initialisation order (executable last) with its assigned base, its lifted-function\n\
-         // registration and its import bridge slot table.\n",
+         // table and its import bridge table. Compile with the build root on the include path.\n",
     );
     let _ = writeln!(out, "#include <cstddef>\n#include <cstdint>\n");
-    let _ = writeln!(out, "#include {}\n", c_str(PROGRAM_LOADER_INCLUDE));
-    out.push_str("extern \"C\" {\n");
+    let _ = writeln!(out, "#include {}", c_str(PROGRAM_LOADER_INCLUDE));
     for m in &r.modules {
         let _ = writeln!(
             out,
-            "int32_t {}(void);\nextern const Pg6ImportSlotBinding* const pg6_import_slots_{};\n\
-             extern const size_t pg6_import_slot_count_{};",
-            register_function_symbol(&m.module),
-            m.module,
-            m.module
+            "#include {}",
+            c_str(&format!(
+                "{}/{}/{}",
+                m.module,
+                super::STUBS_DIR,
+                stubs::HEADER_FILE
+            ))
+        );
+    }
+    out.push_str(
+        "\nstatic_assert(sizeof(Pg6ImportThunk) == sizeof(Pg6BootImport) &&\n\
+         \x20             alignof(Pg6ImportThunk) == alignof(Pg6BootImport),\n\
+         \x20             \"import bridge tables are read as Pg6BootImport\");\n\nextern \"C\" {\n",
+    );
+    for m in &r.modules {
+        let (table, count) = registration_symbols(&m.module);
+        let _ = writeln!(
+            out,
+            "extern const Pg6LiftedFunctionEntry {table}[];\nextern const uint64_t {count};"
         );
     }
     out.push_str("}  // extern \"C\"\n\nnamespace {\n\nconst Pg6ProgramModule kModules[] = {\n");
@@ -1874,9 +1889,12 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
         if m.tls.is_some() {
             flags.push("kPg6ProgramModuleTls");
         }
+        let (table, count) = registration_symbols(&m.module);
         let _ = writeln!(
             out,
-            "    {{{}, {}, 0x{:x}ull, 0x{:x}ull, 0x{:x}ull, {}, {}u, &{}, &pg6_import_slots_{}, &pg6_import_slot_count_{}}},",
+            "    {{{}, {}, 0x{:x}ull, 0x{:x}ull, 0x{:x}ull, {}, {}u, {table}, &{count},\n     \
+             reinterpret_cast<const Pg6BootImport* const*>(&pg6_import_thunks_{}), \
+             &pg6_import_thunk_count_{}}},",
             c_str(&m.file),
             c_str(&m.module),
             m.base,
@@ -1884,7 +1902,6 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
             m.entry_point,
             flags.join(" | "),
             m.tls.as_ref().map_or(0, |t| t.index),
-            register_function_symbol(&m.module),
             m.module,
             m.module
         );

@@ -101,9 +101,6 @@ pub const SOURCE_FILE: &str = "pg6_import_thunks.cpp";
 pub const SEAM_FILE: &str = "pg6_guest_seam.h";
 /// Machine-readable binding manifest.
 pub const MANIFEST_FILE: &str = "pg6_import_manifest.json";
-/// Runtime header declaring `Pg6ImportSlotBinding`, included by namespaced bridges
-/// ([`render_bridge_namespaced`]).
-pub const GUEST_RUNTIME_INCLUDE: &str = "guest/guest_runtime.h";
 
 /// Byte offset of the 16 GPRs in the default seam's guest state (lifter layout).
 pub const SEAM_GPR_OFFSET: u64 = crate::lift::STATE_GPR_OFFSET;
@@ -1373,12 +1370,9 @@ pub fn render_bridge(plan: &BridgePlan, catalogue: &Catalogue) -> BridgeOutput {
 /// | `pg6_find_import_thunk` | `pg6_find_import_thunk_<ns>` |
 ///
 /// The header guards its shared type definitions (`PG6_IMPORT_THUNK_TYPES_DEFINED`) so several
-/// modules' headers can be included together. The source additionally defines the C-ABI slot
-/// table the runtime program loader binds (`runtime/guest/guest_runtime.h`):
-/// `extern "C" const Pg6ImportSlotBinding* const pg6_import_slots_<ns>` (sorted by slot RVA,
-/// null when empty) and `extern "C" const size_t pg6_import_slot_count_<ns>`. Imports bound to a
-/// guest module ([`ImportBinding::guest`]) get no thunk and no entry, and the manifest records
-/// them with `"status": "guest"`.
+/// modules' headers can be included together (the program descriptor does). Imports bound to a
+/// guest module ([`ImportBinding::guest`]) get no thunk and no table entry, and the manifest
+/// records them with `"status": "guest"`.
 pub fn render_bridge_namespaced(
     plan: &BridgePlan,
     catalogue: &Catalogue,
@@ -1805,16 +1799,13 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> 
     out.push_str("#ifdef PG6_GUEST_SEAM_HEADER\n#include PG6_GUEST_SEAM_HEADER\n#else\n");
     let _ = writeln!(out, "#include \"{SEAM_FILE}\"\n#endif");
 
-    let mut includes: BTreeSet<&str> = plan
+    let includes: BTreeSet<&str> = plan
         .imports
         .iter()
         .filter(|i| i.tabled())
         .filter_map(|i| catalogue.get(i.bound_shim()?))
         .map(|s| s.include.as_str())
         .collect();
-    if names.ns.is_some() {
-        includes.insert(GUEST_RUNTIME_INCLUDE);
-    }
     if !includes.is_empty() {
         out.push('\n');
         for include in includes {
@@ -1873,19 +1864,6 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> 
     let thunks = names.global("pg6_import_thunks");
     let count = names.global("pg6_import_thunk_count");
     let find = names.global("pg6_find_import_thunk");
-    if names.ns.is_some() && !sorted.is_empty() {
-        // The C-ABI slot table of the runtime program loader (one entry per slot, sorted).
-        out.push_str("const Pg6ImportSlotBinding kSlots[] = {\n");
-        for import in &sorted {
-            let _ = writeln!(
-                out,
-                "    {{0x{:08x}u, &{}}},",
-                import.slot_rva.unwrap_or(0),
-                names.thunk(import.index)
-            );
-        }
-        out.push_str("};\n\n");
-    }
     if sorted.is_empty() {
         let _ = writeln!(
             out,
@@ -1930,21 +1908,6 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> 
         );
     }
     let _ = writeln!(out, "const std::size_t {count} = {};", sorted.len());
-    if names.ns.is_some() {
-        let slots = names.global("pg6_import_slots");
-        let slot_count = names.global("pg6_import_slot_count");
-        let table = if sorted.is_empty() {
-            "nullptr"
-        } else {
-            "kSlots"
-        };
-        let _ = writeln!(
-            out,
-            "extern \"C\" const Pg6ImportSlotBinding* const {slots} = {table};\n\
-             extern \"C\" const std::size_t {slot_count} = {};",
-            sorted.len()
-        );
-    }
     let _ = write!(
         out,
         "

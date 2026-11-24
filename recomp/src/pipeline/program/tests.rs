@@ -929,14 +929,10 @@ fn two_dll_program_binds_ordinals_forwarders_and_data() {
     // Namespaced import bridges without the guest-bound slots.
     let stubs_src = fs::read_to_string(out.join("main/stubs/pg6_import_thunks.cpp")).unwrap();
     assert!(stubs_src.contains("const Pg6ImportThunk* const pg6_import_thunks_main = kThunks;"));
-    assert!(stubs_src.contains(
-        "extern \"C\" const Pg6ImportSlotBinding* const pg6_import_slots_main = kSlots;"
-    ));
-    assert!(stubs_src.contains("extern \"C\" const std::size_t pg6_import_slot_count_main = 2;"));
-    assert!(stubs_src.contains("#include \"guest/guest_runtime.h\""));
+    assert!(stubs_src.contains("const std::size_t pg6_import_thunk_count_main = 2;"));
     assert!(!stubs_src.contains(&format!("0x{:08x}u", exe.slot(0, 0) - EXE_BASE)));
     let a_src = fs::read_to_string(out.join("a/stubs/pg6_import_thunks.cpp")).unwrap();
-    assert!(a_src.contains("pg6_import_slots_a = nullptr;"));
+    assert!(a_src.contains("pg6_import_thunks_a = nullptr;"));
     let header = fs::read_to_string(out.join("a/stubs/pg6_import_thunks.h")).unwrap();
     assert!(header.contains("#ifndef PG6_IMPORT_THUNK_TYPES_DEFINED"));
     assert!(header.contains("pg6_find_import_thunk_a(uint32_t slot_rva);"));
@@ -983,8 +979,11 @@ fn two_dll_program_binds_ordinals_forwarders_and_data() {
     assert!(descriptor.contains("#include \"guest/program_loader.h\""));
     assert!(descriptor.contains(&format!(
         "{{\"a.dll\", \"a\", 0x{a_base:x}ull, 0x5000ull, 0x0ull, kPg6ProgramModuleDll, 0u, \
-         &__playgta6_register_lifted_functions_a, &pg6_import_slots_a, &pg6_import_slot_count_a}},"
+         __playgta6_lifted_functions_a, &__playgta6_lifted_function_count_a,\n     \
+         reinterpret_cast<const Pg6BootImport* const*>(&pg6_import_thunks_a), \
+         &pg6_import_thunk_count_a}},"
     )));
+    assert!(descriptor.contains("#include \"a/stubs/pg6_import_thunks.h\""));
     assert!(descriptor.contains("kPg6ProgramModuleMain"));
     assert!(
         fs::read_to_string(out.join(PROGRAM_REPORT_FILE))
@@ -1702,6 +1701,20 @@ fn linked_program_calls_across_modules_through_prefilled_iat_slots() {
         images.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         images.extend_from_slice(&bytes);
     }
+    // The runtime's guest base (host = base + guest VA): 0, the identity mapping, so the images
+    // are copied to their guest VAs in linear memory.
+    let base_ll = tmp.path().join("guest_base.ll");
+    fs::write(
+        &base_ll,
+        format!(
+            "target triple = \"wasm64-unknown-unknown\"\n@{} = global i64 0, align 8\n",
+            crate::lift::GUEST_BASE_SYMBOL
+        ),
+    )
+    .unwrap();
+    let base_obj = tmp.path().join("guest_base.o");
+    compile_to_wasm64_object(&llvm_tool().unwrap(), &base_ll, &base_obj).unwrap();
+    objects.push(base_obj);
     let images_path = tmp.path().join("images.bin");
     fs::write(&images_path, images).unwrap();
     let entry = function_symbol(EXE_BASE + u64::from(TEXT));
