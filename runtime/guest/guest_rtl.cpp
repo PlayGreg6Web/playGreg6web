@@ -45,13 +45,18 @@ bool fls_invoke(void* ctx, uint64_t callback, uint64_t value) {
 // Thread pool
 // ---------------------------------------------------------------------------
 
-// Persistent record of one guest work object (its callback may run many times).
+// Persistent record of one guest work object (its callback may run many times). It is deleted
+// exactly once, by whichever of CloseThreadpoolWork and the last outstanding callback finds it
+// closed with nothing pending: both decide under the registry mutex.
 struct WorkRecord {
     uint64_t function = 0;
     uint64_t context = 0;
-    std::atomic<uint32_t> pending{0};  // submitted callbacks that have not run yet
-    bool closed = false;                // guarded by the registry mutex
+    uint32_t pending = 0;  // submitted callbacks that have not finished; guarded by the registry mutex
+    bool closed = false;   // guarded by the registry mutex
 };
+
+// WorkRecord objects allocated and not yet deleted (tests: a double delete drives it below zero).
+std::atomic<int64_t> g_work_records{0};
 
 // One-shot record of a TrySubmitThreadpoolCallback.
 struct SimpleRecord {
@@ -70,16 +75,9 @@ PoolRegistry& pool() {
     return *instance;
 }
 
-void release_work_record_if_done(WorkRecord* record) {
-    PoolRegistry& reg = pool();
-    bool destroy = false;
-    {
-        std::lock_guard<std::mutex> lock(reg.mutex);
-        destroy = record->closed && record->pending.load(std::memory_order_acquire) == 0;
-    }
-    if (destroy) {
-        delete record;
-    }
+void delete_work_record(WorkRecord* record) {
+    delete record;
+    g_work_records.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void work_entry(Pg6TpCallbackInstance* instance, void* context, Pg6TpWork* work) {
@@ -95,8 +93,20 @@ void work_entry(Pg6TpCallbackInstance* instance, void* context, Pg6TpWork* work)
     PG6_RTL_CATCH_ALL {
         // A fault inside a pool callback has been reported by the fault handler.
     }
-    record->pending.fetch_sub(1, std::memory_order_acq_rel);
-    release_work_record_if_done(record);
+    // The decrement and the decision are one step under the registry mutex: with the decrement
+    // outside it, a Close in between saw the record closed with nothing pending too, and both
+    // deleted it (O32).
+    bool destroy = false;
+    {
+        std::lock_guard<std::mutex> lock(pool().mutex);
+        if (record->pending != 0) {
+            --record->pending;
+        }
+        destroy = record->closed && record->pending == 0;
+    }
+    if (destroy) {
+        delete_work_record(record);
+    }
 }
 
 void simple_entry(Pg6TpCallbackInstance* instance, void* context) {
@@ -111,6 +121,12 @@ void simple_entry(Pg6TpCallbackInstance* instance, void* context) {
     }
 }
 
+void report_unknown_work(uint64_t token, const char* api) {
+    char text[128];
+    std::snprintf(text, sizeof(text), "%s: unknown thread-pool work 0x%016" PRIx64, api, token);
+    com::detail::diagnostic(text);
+}
+
 WorkRecord* find_work(uint64_t token, const char* api) {
     PoolRegistry& reg = pool();
     {
@@ -120,9 +136,7 @@ WorkRecord* find_work(uint64_t token, const char* api) {
             return it->second;
         }
     }
-    char text[128];
-    std::snprintf(text, sizeof(text), "%s: unknown thread-pool work 0x%016" PRIx64, api, token);
-    com::detail::diagnostic(text);
+    report_unknown_work(token, api);
     return nullptr;
 }
 
@@ -259,11 +273,12 @@ uint64_t create_work_impl(uint64_t callback, uint64_t context, uint64_t callback
         return 0;
     }
     auto* record = new WorkRecord();
+    g_work_records.fetch_add(1, std::memory_order_relaxed);
     record->function = callback;
     record->context = context;
     Pg6TpWork* work = win32::CreateThreadpoolWork(&work_entry, record, nullptr);
     if (work == nullptr) {
-        delete record;
+        delete_work_record(record);
         return 0;
     }
     const uint64_t token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(work));
@@ -274,11 +289,20 @@ uint64_t create_work_impl(uint64_t callback, uint64_t context, uint64_t callback
 }
 
 void submit_work_impl(uint64_t token) {
-    WorkRecord* record = find_work(token, "SubmitThreadpoolWork");
-    if (record == nullptr) {
+    bool known = false;
+    {
+        PoolRegistry& reg = pool();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.works.find(token);
+        if (it != reg.works.end()) {
+            ++it->second->pending;
+            known = true;
+        }
+    }
+    if (!known) {
+        report_unknown_work(token, "SubmitThreadpoolWork");
         return;
     }
-    record->pending.fetch_add(1, std::memory_order_acq_rel);
     win32::SubmitThreadpoolWork(reinterpret_cast<Pg6TpWork*>(static_cast<uintptr_t>(token)));
 }
 
@@ -291,13 +315,18 @@ void wait_work_impl(uint64_t token, bool cancel_pending) {
                                           cancel_pending);
     if (cancel_pending) {
         // Everything is idle now: submissions cancelled before they ran never call work_entry.
-        record->pending.store(0, std::memory_order_release);
+        PoolRegistry& reg = pool();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        if (auto it = reg.works.find(token); it != reg.works.end()) {
+            it->second->pending = 0;
+        }
     }
 }
 
 void close_work_impl(uint64_t token) {
     PoolRegistry& reg = pool();
     WorkRecord* record = nullptr;
+    bool destroy = false;
     {
         std::lock_guard<std::mutex> lock(reg.mutex);
         auto it = reg.works.find(token);
@@ -305,16 +334,17 @@ void close_work_impl(uint64_t token) {
             record = it->second;
             reg.works.erase(it);
             record->closed = true;
+            destroy = record->pending == 0;  // otherwise the last outstanding callback deletes it
         }
     }
     if (record == nullptr) {
-        char text[128];
-        std::snprintf(text, sizeof(text), "CloseThreadpoolWork: unknown thread-pool work 0x%016" PRIx64, token);
-        com::detail::diagnostic(text);
+        report_unknown_work(token, "CloseThreadpoolWork");
         return;
     }
     win32::CloseThreadpoolWork(reinterpret_cast<Pg6TpWork*>(static_cast<uintptr_t>(token)));
-    release_work_record_if_done(record);
+    if (destroy) {
+        delete_work_record(record);
+    }
 }
 
 int32_t try_submit_callback_impl(uint64_t callback, uint64_t context, uint64_t callback_environ) {
@@ -350,12 +380,16 @@ uint64_t live_pool_records() {
     return reg.works.size() + reg.simple_live.load(std::memory_order_relaxed);
 }
 
+int64_t live_work_records() {
+    return g_work_records.load(std::memory_order_relaxed);
+}
+
 void reset_rtl() {
     PoolRegistry& reg = pool();
     std::lock_guard<std::mutex> lock(reg.mutex);
     for (auto& [token, record] : reg.works) {
         (void)token;
-        delete record;
+        delete_work_record(record);
     }
     reg.works.clear();
     reg.simple_live.store(0, std::memory_order_relaxed);

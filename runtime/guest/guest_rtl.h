@@ -39,6 +39,10 @@ void run_fls_thread_exit(GuestState& state);
 // accounting for tests).
 uint64_t live_pool_records();
 
+// Work-object records allocated and not yet deleted, including closed ones whose callbacks are
+// still outstanding (tests: each record is deleted exactly once, so this never drops below zero).
+int64_t live_work_records();
+
 // Tests only: forget every pool record (not concurrently with callbacks).
 void reset_rtl();
 

@@ -213,6 +213,14 @@ void sub_once_caller(GuestState* s) {
     ret(s);
 }
 
+// O32: a work callback that only reports that it started (the closer races its return).
+constexpr uint64_t kRaceCb = 0x140020700ULL;
+std::atomic<int> g_race_started{0};
+void sub_race_cb(GuestState* s) {
+    g_race_started.store(1, std::memory_order_release);
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kFlsDtor, sub_fls_dtor},
     {kOnceCb, sub_once_cb},
@@ -221,6 +229,7 @@ const LiftedFunctionEntry kFunctions[] = {
     {kThreadStart, sub_thread_start},
     {kFlsDtorSet, sub_fls_dtor_set},
     {kOnceCaller, sub_once_caller},
+    {kRaceCb, sub_race_cb},
 };
 
 struct GuestFault {
@@ -1676,6 +1685,28 @@ void test_thread_pool_guest() {
     win32::shutdown_thread_pool();
 }
 
+// O32: CloseThreadpoolWork while the last outstanding callback returns. Both sides used to decide
+// "closed and nothing pending" separately, and when the callback's decrement fell between Close
+// marking the record closed and Close checking it, both deleted the record: heap corruption,
+// about one run in twenty of this suite. Each record must be deleted exactly once.
+void test_thread_pool_close_races_last_callback() {
+    Fixture fx;
+    const int64_t before = rtl::live_work_records();
+    for (int i = 0; i < 5000; ++i) {
+        g_race_started.store(0, std::memory_order_relaxed);
+        const uint64_t work = fx.call(&pg6_gthunk_create_threadpool_work, {kRaceCb, 0, 0});
+        fx.call(&pg6_gthunk_submit_threadpool_work, {work});
+        while (g_race_started.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        fx.call(&pg6_gthunk_close_threadpool_work, {work});
+        CHECK(rtl::live_work_records() >= before);  // never deleted twice
+    }
+    CHECK(wait_for([&] { return rtl::live_work_records() == before; }));
+    CHECK(rtl::live_pool_records() == 0);
+    win32::shutdown_thread_pool();
+}
+
 // ---------------------------------------------------------------------------
 // RtlCaptureStackBackTrace
 // ---------------------------------------------------------------------------
@@ -1782,6 +1813,7 @@ int main() {
     RUN(test_copy_file2);
     RUN(test_links);
     RUN(test_thread_pool_guest);
+    RUN(test_thread_pool_close_races_last_callback);
     RUN(test_capture_stack_back_trace);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
