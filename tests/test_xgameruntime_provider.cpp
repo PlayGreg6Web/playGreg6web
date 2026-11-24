@@ -396,7 +396,7 @@ void test_unimplemented_slots() {
     }
     fx.restore_stack();
     CHECK(trapped);
-    CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::Unimplemented));
+    CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot));
     CHECK(fault.info.detail == 13);
     CHECK(diag_contains("slot 13 (XTaskQueueCreateComposite)"));
 

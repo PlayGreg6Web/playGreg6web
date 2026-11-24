@@ -35,6 +35,7 @@ add_library(playgta6_core STATIC
     guest/guest_exceptions.cpp
     guest/com_bridge.cpp
     guest/guest_callbacks.cpp
+    guest/guest_crt_exit.cpp
     guest/cpu_helpers.cpp
     guest/boot.cpp
     os/xgameruntime_provider.cpp
@@ -179,4 +180,8 @@ else()
     add_executable(test_xgameruntime_provider ../tests/test_xgameruntime_provider.cpp)
     target_link_libraries(test_xgameruntime_provider PRIVATE playgta6_core)
     add_test(NAME playgta6_xgameruntime_provider_tests COMMAND test_xgameruntime_provider)
+
+    add_executable(test_guest_crt_exit ../tests/test_guest_crt_exit.cpp)
+    target_link_libraries(test_guest_crt_exit PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_crt_exit_tests COMMAND test_guest_crt_exit)
 endif()

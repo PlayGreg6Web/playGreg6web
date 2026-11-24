@@ -60,6 +60,12 @@
 //                                functions (no guest thunk) are not callable by guest code: they
 //                                return NULL with ERROR_PROC_NOT_FOUND and a diagnostic instead of
 //                                a host function pointer.
+//   _crt_atexit, _crt_at_quick_exit, _register_onexit_function, _initialize_onexit_table,
+//   _execute_onexit_table, _register_thread_local_exe_atexit_callback, exit, quick_exit, _exit,
+//   _cexit, _c_exit              guest exit registration and the exit funnel
+//                                (guest/guest_crt_exit.{h,cpp}, O22). `exit`/`_exit` and
+//                                `_cexit`/`_c_exit` share a name key; the import bridge picks the
+//                                thunk whose name after the prefix equals the import name.
 
 namespace playgta6::guest::callbacks {
 
@@ -121,5 +127,18 @@ void pg6_gthunk_bsearch(void* state);
 void pg6_gthunk_initterm(void* state);
 void pg6_gthunk_initterm_e(void* state);
 void pg6_gthunk_get_proc_address(void* state);
+
+// guest/guest_crt_exit.cpp
+void pg6_gthunk_crt_atexit(void* state);
+void pg6_gthunk_crt_at_quick_exit(void* state);
+void pg6_gthunk_register_onexit_function(void* state);
+void pg6_gthunk_initialize_onexit_table(void* state);
+void pg6_gthunk_execute_onexit_table(void* state);
+void pg6_gthunk_register_thread_local_exe_atexit_callback(void* state);
+void pg6_gthunk_exit(void* state);
+void pg6_gthunk_quick_exit(void* state);
+void pg6_gthunk__exit(void* state);
+void pg6_gthunk__cexit(void* state);
+void pg6_gthunk__c_exit(void* state);
 
 }  // extern "C"

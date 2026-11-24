@@ -112,7 +112,7 @@
 // Every stub slot has its own synthetic address. The first call logs
 // "com bridge: unimplemented <Interface> {IID} slot N (<name>)" and every call counts a hit
 // (stub_hits / stub_hit_report); then the interface's SlotPolicy applies: Trap (default) raises
-// FaultKind::Unimplemented through O9's fault handler (va = the stub's synthetic address,
+// FaultKind::UnimplementedSlot through O9's fault handler (va = the stub's synthetic address,
 // detail = slot index); ReturnNotImpl sets rax = E_NOTIMPL and returns. The stub identifies its
 // slot through GuestState::rip, which __playgta6_indirect_call sets to the target before running
 // a host thunk (guest_runtime.h).
@@ -289,7 +289,7 @@ struct InterfaceInfo;
 
 // What a slot without an implementation does after it logged and counted the call.
 enum class SlotPolicy : uint8_t {
-    Trap = 0,           // FaultKind::Unimplemented through the O9 fault handler (default)
+    Trap = 0,           // FaultKind::UnimplementedSlot through the O9 fault handler (default)
     ReturnNotImpl = 1,  // rax = E_NOTIMPL, return to the caller
 };
 

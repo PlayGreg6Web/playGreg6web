@@ -140,6 +140,9 @@ enum class FaultKind : uint32_t {
     UnhandledException = 8,   // va = exception address; detail = exception code
     UnknownResumeTarget = 9,  // va = resume rip; detail = restored rsp
     UnwindFailed = 10,        // va = target ip (0 if none); detail = target frame
+    // A COM bridge interface slot without an implementation (guest/com_bridge.h): va = the slot's
+    // synthetic address; detail = slot index.
+    UnimplementedSlot = 11,
 };
 
 const char* fault_kind_name(FaultKind kind);

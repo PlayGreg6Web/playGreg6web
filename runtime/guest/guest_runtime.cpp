@@ -207,6 +207,8 @@ const char* fault_kind_name(FaultKind kind) {
             return "context restore to an unknown resume target";
         case FaultKind::UnwindFailed:
             return "guest unwind failed";
+        case FaultKind::UnimplementedSlot:
+            return "unimplemented COM interface slot";
     }
     return "unknown fault";
 }
@@ -396,6 +398,12 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size) {
         case FaultKind::UnwindFailed:
             out.append(" (target frame 0x%016" PRIx64 ")", info.detail);
             break;
+        case FaultKind::UnimplementedSlot: {
+            SyntheticTarget target;
+            const bool named = describe_synthetic(info.va, &target) && target.name != nullptr;
+            out.append(" (slot %" PRIu64 "%s%s)", info.detail, named ? ": " : "", named ? target.name : "");
+            break;
+        }
         default:
             break;
     }

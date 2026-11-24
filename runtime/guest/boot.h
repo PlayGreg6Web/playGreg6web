@@ -42,10 +42,12 @@
 //     (image_base, DLL_PROCESS_ATTACH, nullptr) - the DLLs' first (modules[1..] in order; their
 //     DllMain is R12's), the executable's last - then call the executable's entry point with
 //     rcx = PEB (what RtlUserThreadStart passes) through call_guest.
-//  6. The run ends when the entry point returns (exit code = eax), when the guest calls the CRT
-//     exit/_exit (the boot installs the ucrt_bridge exit hook; pg6_guest_boot_request_exit is the
-//     same path for other shims, e.g. a future ExitProcess), on the first fault, or at a run
-//     bound. Every outcome produces one JSON report plus a human-readable summary and a distinct
+//  6. The run ends when the entry point returns (exit code = eax; the guest exit handlers run
+//     first), when the guest calls the CRT exit/_exit (guest/guest_crt_exit.h runs the guest
+//     exit handlers, then the ucrt_bridge exit hook the boot installs stops the run;
+//     pg6_guest_boot_request_exit is the same path for other shims, and TerminateProcess of the
+//     current process takes it through win32::set_process_exit_handler), on the first fault, or
+//     at a run bound. Every outcome produces one JSON report plus a human-readable summary and a distinct
 //     BootStatus; the host process is never aborted by a guest fault.
 //
 // Progress is logged through os::log in the line format of W40's boot tracer
@@ -105,9 +107,10 @@
 // lifted_tables, functions_registered, imports {total, bound, unresolved, by_dll [{dll, bound,
 // unresolved}]}, process {peb, process_parameters}, main_thread {teb, stack_base, stack_limit,
 // tls_vector, tls_block}}, elapsed_ms. Addresses are "0x..." strings (null when absent); counts
-// are numbers. Fault kinds: trap, unimplemented, divide_error, unknown_target, stack_imbalance,
-// bad_stack, unresolved_import, crt_abort, crt_terminate, crt_invalid_parameter, crt_purecall,
-// cxx_throw, longjmp, dispatch_limit, wall_time_limit, and the harness's host_* kinds.
+// are numbers. Fault kinds: trap, unimplemented, unimplemented_slot, divide_error, unknown_target,
+// stack_imbalance, bad_stack, unresolved_import, crt_abort, crt_terminate, crt_invalid_parameter,
+// crt_purecall, cxx_throw, longjmp, dispatch_limit, wall_time_limit, and the harness's host_*
+// kinds.
 //
 // Guest TEB / PEB layout (x64 Windows, written by the boot; offsets checked below)
 // --------------------------------------------------------------------------------

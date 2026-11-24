@@ -55,7 +55,9 @@
 //! callbacks, such as `CreateThread`, `qsort` or `_initterm`). For an import of a DLL with a
 //! shim family whose name key matches such a guest-state thunk, the thunk takes precedence over
 //! the family's shim: the generated `pg6_import_<n>` just forwards the guest state to it (it
-//! marshals its own arguments and pops the return address itself).
+//! marshals its own arguments and pops the return address itself). When several guest-state
+//! thunks share a name key (`pg6_gthunk_exit` / `pg6_gthunk__exit`), the one whose name after
+//! the prefix equals the import name binds; without such a thunk the import is ambiguous.
 //!
 //! # Unresolved imports
 //! Every unresolved import still gets a thunk. On its first call it logs
@@ -1201,7 +1203,7 @@ impl BridgePlan {
 struct ShimIndex<'a> {
     by_key: BTreeMap<(&'static str, String), Vec<&'a ShimDecl>>,
     /// Guest-state thunks by name key (only `void (void*)` declarations).
-    gthunks: BTreeMap<String, &'a ShimDecl>,
+    gthunks: BTreeMap<String, Vec<&'a ShimDecl>>,
 }
 
 impl<'a> ShimIndex<'a> {
@@ -1215,11 +1217,16 @@ impl<'a> ShimIndex<'a> {
                     .push(shim);
             }
         }
-        let gthunks = catalogue
+        let mut gthunks: BTreeMap<String, Vec<&'a ShimDecl>> = BTreeMap::new();
+        for shim in catalogue
             .family(PREFIX_GTHUNK)
             .filter(|s| is_guest_state_thunk(s))
-            .map(|s| (name_key(&s.name[PREFIX_GTHUNK.len()..]), s))
-            .collect();
+        {
+            gthunks
+                .entry(name_key(&shim.name[PREFIX_GTHUNK.len()..]))
+                .or_default()
+                .push(shim);
+        }
         Self { by_key, gthunks }
     }
 
@@ -1233,10 +1240,28 @@ impl<'a> ShimIndex<'a> {
                 return Resolution::Unresolved(Unresolved::ByOrdinal);
             }
         };
-        if let Some(gthunk) = self.gthunks.get(&name_key(name)) {
-            return Resolution::Bound {
-                shim: gthunk.name.clone(),
-            };
+        match self.gthunks.get(&name_key(name)).map(Vec::as_slice) {
+            None | Some([]) => {}
+            Some([gthunk]) => {
+                return Resolution::Bound {
+                    shim: gthunk.name.clone(),
+                };
+            }
+            // Names that differ only in underscores (`exit` / `_exit`): the thunk whose name
+            // after the prefix is exactly the import name.
+            Some(many) => {
+                return match many
+                    .iter()
+                    .find(|s| &s.name[PREFIX_GTHUNK.len()..] == name.as_str())
+                {
+                    Some(gthunk) => Resolution::Bound {
+                        shim: gthunk.name.clone(),
+                    },
+                    None => Resolution::Unresolved(Unresolved::Ambiguous {
+                        candidates: many.iter().map(|s| s.name.clone()).collect(),
+                    }),
+                };
+            }
         }
         match self
             .by_key
@@ -2603,6 +2628,84 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             )
         );
         assert!(source.contains("#include \"guest/cb.h\""));
+    }
+
+    #[test]
+    fn guest_state_thunks_sharing_a_name_key_bind_by_exact_name() {
+        let mut headers = mini_headers();
+        headers.push(ShimHeader {
+            include: "guest/cb.h".to_string(),
+            text: "extern \"C\" {\n\
+                   void pg6_gthunk_exit(void* state);\n\
+                   void pg6_gthunk__exit(void* state);\n\
+                   void pg6_gthunk__cexit(void* state);\n\
+                   void pg6_gthunk__c_exit(void* state);\n\
+                   void pg6_gthunk_crt_atexit(void* state);\n\
+                   void pg6_gthunk_foo_bar(void* state);\n\
+                   void pg6_gthunk_foobar_(void* state);\n\
+                   }\n"
+                .to_string(),
+        });
+        let catalogue = Catalogue::scan(&headers);
+        let mut pe = synthetic_pe(false);
+        pe.imports.push(ImportModule {
+            dll_name: "api-ms-win-crt-runtime-l1-1-0.dll".to_string(),
+            iat_rva: 0x3000,
+            symbols: named(&[
+                "exit",
+                "_exit",
+                "_cexit",
+                "_c_exit",
+                "_crt_atexit",
+                "FooBar",
+            ]),
+        });
+        let plan = plan_bridge(&pe, &catalogue);
+        let dll = "api-ms-win-crt-runtime-l1-1-0.dll";
+        for (import, thunk) in [
+            ("exit", "pg6_gthunk_exit"),
+            ("_exit", "pg6_gthunk__exit"),
+            ("_cexit", "pg6_gthunk__cexit"),
+            ("_c_exit", "pg6_gthunk__c_exit"),
+            ("_crt_atexit", "pg6_gthunk_crt_atexit"),
+        ] {
+            assert_eq!(
+                find(&plan, &format!("{dll}!{import}")).bound_shim(),
+                Some(thunk),
+                "{import}"
+            );
+        }
+        // The runtime's real declarations scan the same way.
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime");
+        let header = load_shim_header(
+            &runtime.join("guest").join("guest_callbacks.h"),
+            Some(&runtime),
+        )
+        .expect("guest_callbacks.h");
+        let real = Catalogue::scan(&[header]);
+        assert!(real.diagnostics.is_empty(), "{:?}", real.diagnostics);
+        let real_plan = plan_bridge(&pe, &real);
+        for import in ["exit", "_exit", "_cexit", "_c_exit", "_crt_atexit"] {
+            let bound = find(&real_plan, &format!("{dll}!{import}"))
+                .bound_shim()
+                .map(str::to_string);
+            assert_eq!(
+                bound,
+                Some(format!("pg6_gthunk_{import}").replace("pg6_gthunk__crt", "pg6_gthunk_crt")),
+                "{import}"
+            );
+        }
+
+        let foo = find(&plan, &format!("{dll}!FooBar"));
+        assert_eq!(foo.bound_shim(), None);
+        assert!(
+            matches!(
+                &foo.resolution,
+                Resolution::Unresolved(Unresolved::Ambiguous { candidates }) if candidates.len() == 2
+            ),
+            "{:?}",
+            foo.resolution
+        );
     }
 
     #[test]

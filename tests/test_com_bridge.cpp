@@ -748,9 +748,15 @@ void test_unknown_slots_and_bad_pointers() {
     com::clear_diagnostics();
     CHECK(expect_fault([&] { fx.vcall(obj, 17); }, &fault));
     fx.restore_stack();
-    CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::Unimplemented));
+    CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot));
     CHECK(fault.info.detail == 17);
     CHECK(fault.info.va == com::slot_address(kICalc.info, 17));
+    {
+        char text[512];
+        format_fault(fault.info, text, sizeof(text));
+        CHECK(std::string(text).find("guest fault: unimplemented COM interface slot at 0x") == 0);
+        CHECK(std::string(text).find("(slot 17: ICalc::slot 17 (unimplemented))") != std::string::npos);
+    }
     CHECK(diag_contains("unimplemented ICalc {6D5140C1-7436-11CE-8034-00AA006009FA} slot 17"));
     CHECK(expect_fault([&] { fx.vcall(obj, 17); }, &fault));
     fx.restore_stack();

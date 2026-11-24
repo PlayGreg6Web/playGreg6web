@@ -15,8 +15,10 @@
 #include <utility>
 
 #include "guest/com_bridge.h"
+#include "guest/guest_crt_exit.h"
 #include "os/os_shim.h"
 #include "os/ucrt_bridge.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/win32_sync.h"
@@ -585,6 +587,8 @@ const char* fault_kind_id(FaultKind kind) {
             return "unknown_resume_target";
         case FaultKind::UnwindFailed:
             return "unwind_failed";
+        case FaultKind::UnimplementedSlot:
+            return "unimplemented_slot";
         default:
             break;
     }
@@ -746,11 +750,18 @@ void boot_exit_hook(int32_t code, int32_t kind) {
     stop_boot();
 }
 
+// TerminateProcess(GetCurrentProcess(), code) on the boot thread ends the run like _exit: no
+// guest exit handlers run (guest/guest_crt_exit.h).
+void boot_terminate_process_handler(uint32_t exit_code, void* /*user*/) {
+    request_exit(static_cast<int32_t>(exit_code));
+}
+
 void install_hooks() {
     BootState& b = boot();
     b.previous_fault_handler = set_fault_handler(&boot_fault_handler);
     b.previous_observer = set_dispatch_observer(&boot_dispatch_observer);
     b.previous_exit_hook = pg6_crt_set_exit_hook(&boot_exit_hook);
+    os::win32::set_process_exit_handler(&boot_terminate_process_handler, nullptr);
     b.hooks_installed = true;
 }
 
@@ -762,6 +773,7 @@ void remove_hooks() {
     set_fault_handler(b.previous_fault_handler);
     set_dispatch_observer(b.previous_observer);
     pg6_crt_set_exit_hook(b.previous_exit_hook);
+    os::win32::set_process_exit_handler(nullptr, nullptr);
     b.hooks_installed = false;
 }
 
@@ -1510,6 +1522,9 @@ void run_guest(const BootConfig& config) {
     b.entry_started = true;
     milestone("ENTRY_CALL", "calling entry point 0x%016" PRIx64, exe.image.entry_point);
     const uint64_t rax = call_guest_args(arena, main.thread.state, exe.image.entry_point, b.peb);
+    // Returning from the entry point exits the process: run the guest exit handlers registered
+    // so far (MSVC's startup code calls exit itself and never gets here).
+    crt_exit::run_exit_cleanup(main.thread.state, crt_exit::ExitMode::Full);
     b.status = BootStatus::Exited;
     b.exit_code = static_cast<int32_t>(static_cast<uint32_t>(rax));
     b.has_exit_code = true;
@@ -1704,6 +1719,7 @@ void reset_boot() {
         }
     }
     reset_guest_runtime();
+    crt_exit::reset_crt_exit();
     b.active = false;
     b.running = false;
     b.arena = nullptr;

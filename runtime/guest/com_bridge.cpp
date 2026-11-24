@@ -590,7 +590,7 @@ void stub_thunk(void* raw) {
     }
     if (stub == nullptr) {
         report("com bridge: stub entered with unknown rip " + hex(state.rip));
-        raise_fault(FaultKind::Unimplemented, &state, state.rip, 0);
+        raise_fault(FaultKind::UnimplementedSlot, &state, state.rip, 0);
     }
     const uint64_t hits = stub->hits.fetch_add(1, std::memory_order_relaxed) + 1;
     uint64_t return_address = 0;
@@ -616,7 +616,7 @@ void stub_thunk(void* raw) {
         detail::pop_return(state);
         return;
     }
-    raise_fault(FaultKind::Unimplemented, &state, state.rip, stub->slot);
+    raise_fault(FaultKind::UnimplementedSlot, &state, state.rip, stub->slot);
 }
 
 uint64_t register_stub_locked(Bridge& b, const InterfaceInfo& iface, uint32_t slot, const char* name) {
