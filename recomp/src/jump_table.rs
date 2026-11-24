@@ -918,6 +918,16 @@ impl Slicer<'_, '_, '_, '_> {
                 let load = self.table_load(at, 1, 1, depth)?;
                 self.index_table_from_load(load, 1, depth)
             }
+            // Index reloaded from a guarded memory slot (`mov eax, [rsp+0x30]`).
+            Mnemonic::Mov
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && ((dst.is_gpr32() && instr.memory_size().size() == 4)
+                        || (dst.is_gpr64() && instr.memory_size().size() == 8)) =>
+            {
+                self.slot_bound(at, width)
+            }
             Mnemonic::Mov
                 if instr.op_count() == 2
                     && instr.op0_kind() == OpKind::Register
@@ -1164,52 +1174,7 @@ impl Slicer<'_, '_, '_, '_> {
                     }
                     let bits = cmp_reg.size() as u32 * 8;
                     let imm = instr.try_immediate(1).ok()?;
-                    let imm_u = imm & mask(bits);
-                    let imm_s = sign_extend(imm, bits);
-                    let fact = match (jcc, taken) {
-                        (Mnemonic::Ja, false) | (Mnemonic::Jbe, true) => {
-                            GuardFact::UnsignedUpper(imm_u)
-                        }
-                        (Mnemonic::Jae, false) | (Mnemonic::Jb, true) => {
-                            GuardFact::UnsignedUpper(imm_u.checked_sub(1)?)
-                        }
-                        (Mnemonic::Jb, false) | (Mnemonic::Jae, true) => {
-                            GuardFact::UnsignedLower(imm_u)
-                        }
-                        (Mnemonic::Jbe, false) | (Mnemonic::Ja, true) => {
-                            if imm_u < mask(bits) {
-                                GuardFact::UnsignedLower(imm_u + 1)
-                            } else {
-                                return None;
-                            }
-                        }
-                        (Mnemonic::Jg, false) | (Mnemonic::Jle, true) => {
-                            GuardFact::SignedUpper(imm_s)
-                        }
-                        (Mnemonic::Jge, false) | (Mnemonic::Jl, true) => {
-                            if imm_s > min_signed(bits) {
-                                GuardFact::SignedUpper(imm_s - 1)
-                            } else {
-                                return None;
-                            }
-                        }
-                        (Mnemonic::Jl, false) | (Mnemonic::Jge, true) => {
-                            GuardFact::SignedLower(imm_s)
-                        }
-                        (Mnemonic::Jle, false) | (Mnemonic::Jg, true) => {
-                            if imm_s < max_signed(bits) {
-                                GuardFact::SignedLower(imm_s + 1)
-                            } else {
-                                return None;
-                            }
-                        }
-                        (Mnemonic::Je, true) | (Mnemonic::Jne, false) => GuardFact::Equal(imm_u),
-                        (Mnemonic::Je, false) | (Mnemonic::Jne, true) => GuardFact::NotEqual(imm_u),
-                        (Mnemonic::Js, false) | (Mnemonic::Jns, true) if imm_u == 0 => {
-                            GuardFact::SignedLower(0)
-                        }
-                        _ => return None,
-                    };
+                    let fact = Self::cmp_imm_fact(jcc, taken, imm, bits)?;
                     return Some(RawGuard {
                         reg: cmp_reg,
                         bits,
@@ -1258,6 +1223,151 @@ impl Slicer<'_, '_, '_, '_> {
             }
         }
         None
+    }
+
+    /// Whether `instr` may write memory (explicit operands, pushes, string stores, calls).
+    fn writes_memory(&mut self, instr: &Instruction) -> bool {
+        if matches!(
+            instr.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        ) {
+            return true;
+        }
+        self.info.info(instr).used_memory().iter().any(|m| {
+            matches!(
+                m.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            )
+        })
+    }
+
+    /// Whether the memory operands of `a` (operand `a_op`) and `b` (operand `b_op`) name the same
+    /// non-indexed location of the same size, e.g. the stack slot `[rsp+0x30]` in
+    /// `cmp dword [rsp+0x30], 11` and `mov eax, [rsp+0x30]`.
+    fn same_slot(a: &Instruction, a_op: u32, b: &Instruction, b_op: u32) -> bool {
+        a.op_kind(a_op) == OpKind::Memory
+            && b.op_kind(b_op) == OpKind::Memory
+            && a.memory_index() == Register::None
+            && b.memory_index() == Register::None
+            && a.memory_segment() == b.memory_segment()
+            && !matches!(a.memory_segment(), Register::FS | Register::GS)
+            && a.memory_size().size() == b.memory_size().size()
+            && if a.is_ip_rel_memory_operand() || b.is_ip_rel_memory_operand() {
+                a.is_ip_rel_memory_operand()
+                    && b.is_ip_rel_memory_operand()
+                    && a.ip_rel_memory_address() == b.ip_rel_memory_address()
+            } else {
+                a.memory_base().is_gpr64()
+                    && a.memory_base() == b.memory_base()
+                    && a.memory_displacement64() == b.memory_displacement64()
+            }
+    }
+
+    /// Bound of `mov r, [slot]` at `at` from `cmp [slot], imm` + `jcc` guards on the path before
+    /// it, accepted only while nothing on the path between guard and load can write memory or
+    /// change the slot's base register (`cmp dword [rsp+0x30], 11; ja default; ...;
+    /// mov eax, [rsp+0x30]`).
+    fn slot_bound(&mut self, at: usize, width: u32) -> Option<Bound> {
+        let load = self.trace[at].instr;
+        let base = load.memory_base();
+        let bits = load.memory_size().size() as u32 * 8;
+        let mut upper: Option<u64> = None;
+        let mut lower: u64 = 0;
+        for i in (0..at).rev() {
+            let instr = self.trace[i].instr;
+            if self.writes_memory(instr) || (base.is_gpr64() && self.writes(instr, base)) {
+                break;
+            }
+            if instr.mnemonic() == Mnemonic::Cmp
+                && Self::same_slot(instr, 0, load, 1)
+                && let Ok(imm) = instr.try_immediate(1)
+            {
+                // The flags of this `cmp` reach every later `jcc` up to the next flag write.
+                for k in i + 1..at {
+                    let step = self.trace[k];
+                    if let Some(taken) = step.taken
+                        && let Some(fact) =
+                            Self::cmp_imm_fact(step.instr.mnemonic(), taken, imm, bits)
+                    {
+                        match fact {
+                            GuardFact::UnsignedUpper(u) => {
+                                upper = Some(upper.map_or(u, |cur| cur.min(u)));
+                            }
+                            GuardFact::UnsignedLower(l) => lower = lower.max(l),
+                            GuardFact::Equal(v) => {
+                                lower = lower.max(v);
+                                upper = Some(upper.map_or(v, |cur| cur.min(v)));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if step.instr.rflags_modified() != 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        let upper = upper?;
+        if upper > mask(width) {
+            return Some(Bound {
+                min: 0,
+                max: mask(width),
+                index: None,
+            });
+        }
+        let max = upper;
+        (lower <= max).then_some(Bound {
+            min: lower,
+            max,
+            index: None,
+        })
+    }
+
+    /// Fact proven about the left operand of `cmp x, imm` (`bits` wide) when the conditional
+    /// branch `jcc` is taken (`taken`) or falls through.
+    fn cmp_imm_fact(jcc: Mnemonic, taken: bool, imm: u64, bits: u32) -> Option<GuardFact> {
+        let imm_u = imm & mask(bits);
+        let imm_s = sign_extend(imm, bits);
+        let fact = match (jcc, taken) {
+            (Mnemonic::Ja, false) | (Mnemonic::Jbe, true) => GuardFact::UnsignedUpper(imm_u),
+            (Mnemonic::Jae, false) | (Mnemonic::Jb, true) => {
+                GuardFact::UnsignedUpper(imm_u.checked_sub(1)?)
+            }
+            (Mnemonic::Jb, false) | (Mnemonic::Jae, true) => GuardFact::UnsignedLower(imm_u),
+            (Mnemonic::Jbe, false) | (Mnemonic::Ja, true) => {
+                if imm_u < mask(bits) {
+                    GuardFact::UnsignedLower(imm_u + 1)
+                } else {
+                    return None;
+                }
+            }
+            (Mnemonic::Jg, false) | (Mnemonic::Jle, true) => GuardFact::SignedUpper(imm_s),
+            (Mnemonic::Jge, false) | (Mnemonic::Jl, true) => {
+                if imm_s > min_signed(bits) {
+                    GuardFact::SignedUpper(imm_s - 1)
+                } else {
+                    return None;
+                }
+            }
+            (Mnemonic::Jl, false) | (Mnemonic::Jge, true) => GuardFact::SignedLower(imm_s),
+            (Mnemonic::Jle, false) | (Mnemonic::Jg, true) => {
+                if imm_s < max_signed(bits) {
+                    GuardFact::SignedLower(imm_s + 1)
+                } else {
+                    return None;
+                }
+            }
+            (Mnemonic::Je, true) | (Mnemonic::Jne, false) => GuardFact::Equal(imm_u),
+            (Mnemonic::Je, false) | (Mnemonic::Jne, true) => GuardFact::NotEqual(imm_u),
+            (Mnemonic::Js, false) | (Mnemonic::Jns, true) if imm_u == 0 => {
+                GuardFact::SignedLower(0)
+            }
+            _ => return None,
+        };
+        Some(fact)
     }
 
     /// Adapt `raw` (proven at `branch_at`) to `(reg, width)`, following register copies and
@@ -1842,6 +1952,65 @@ mod tests {
             jump_successors(&analysis.functions[&TEXT], jmp_va),
             cases.map(Edge::JumpTable)
         );
+    }
+
+    /// Switch whose index is bounded in a stack slot and reloaded from it:
+    /// `cmp dword [rsp+0x30], 2; ja default; <between>; mov eax, [rsp+0x30]; ...; jmp rcx`.
+    fn stack_slot_switch(
+        between: impl FnOnce(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>,
+    ) -> (Vec<u8>, [u64; 4], u64) {
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(dword_ptr(rsp + 0x30), ecx)?;
+            a.cmp(dword_ptr(rsp + 0x30), 2)?;
+            a.ja(def)?;
+            between(a)?;
+            a.mov(eax, dword_ptr(rsp + 0x30))?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        (code, cases, jmp_va)
+    }
+
+    #[test]
+    fn resolves_switch_with_index_bounded_in_a_stack_slot() {
+        let (code, cases, jmp_va) = stack_slot_switch(|a| a.test(r8d, r8d));
+        let data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("stack-slot bound resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases[..3]);
+    }
+
+    #[test]
+    fn stack_slot_bound_is_dropped_after_a_store_or_base_change() {
+        let stores: [fn(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>; 3] = [
+            |a| a.mov(dword_ptr(rsp + 0x30), r8d),
+            |a| a.push(rbx),
+            |a| a.call(0x1_4000_9000u64),
+        ];
+        for store in stores {
+            let (code, cases, jmp_va) = stack_slot_switch(store);
+            let data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+            let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+            assert!(
+                !analysis.jump_tables.contains_key(&jmp_va),
+                "bound must not survive a possible write to the slot"
+            );
+        }
     }
 
     #[test]
