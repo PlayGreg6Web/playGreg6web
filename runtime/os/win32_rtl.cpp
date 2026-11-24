@@ -640,7 +640,6 @@ extern "C" {
 int32_t pg6_win32_initialize_critical_section_ex(Pg6CriticalSection* critical_section,
                                                  uint32_t spin_count,
                                                  uint32_t flags) {
-    (void)spin_count;  // spinning is the mutex implementation's business
     if (critical_section == nullptr) {
         win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
         return 0;
@@ -650,10 +649,8 @@ int32_t pg6_win32_initialize_critical_section_ex(Pg6CriticalSection* critical_se
         win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    // The guest's storage is uninitialized memory, not a live object: construct in place instead
-    // of testing (and possibly dereferencing) whatever bytes are there.
-    new (&critical_section->mutex)
-        std::unique_ptr<std::recursive_mutex>(std::make_unique<std::recursive_mutex>());
+    // Constructs in place; whatever bytes the guest storage held are never read.
+    win32::InitializeCriticalSectionWithSpinCount(critical_section, spin_count);
     return 1;
 }
 

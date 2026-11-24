@@ -35,8 +35,18 @@ struct Pg6SrwLock {
     playgta6::os::SrwLock lock;
 };
 
+// CRITICAL_SECTION (RTL_CRITICAL_SECTION, 40 bytes on x64). The guest owns this storage and may hand
+// in uninitialized or statically zeroed memory, so the runtime never interprets it as a pointer:
+// the lock itself lives in a table keyed by the section's address (created by Initialize*, or on
+// first Enter for zero-initialized sections). Initialize writes the Windows initial field values
+// and Enter/Leave keep RecursionCount and OwningThread current for code that reads them inline.
 struct Pg6CriticalSection {
-    std::unique_ptr<std::recursive_mutex> mutex;
+    uint64_t debug_info;      // 0x00 (-1: no debug info, as Windows)
+    int32_t lock_count;       // 0x08 (-1 after initialization)
+    int32_t recursion_count;  // 0x0C
+    uint64_t owning_thread;   // 0x10 (thread id while owned, else 0)
+    uint64_t lock_semaphore;  // 0x18
+    uint64_t spin_count;      // 0x20
 };
 
 namespace playgta6::os::win32 {
@@ -237,6 +247,7 @@ bool TryAcquireSRWLockShared(SrwLock* srw_lock);
 // ---------------------------------------------------------------------------
 
 void InitializeCriticalSection(CriticalSection* critical_section);
+void InitializeCriticalSectionWithSpinCount(CriticalSection* critical_section, uint32_t spin_count);
 void DeleteCriticalSection(CriticalSection* critical_section);
 void EnterCriticalSection(CriticalSection* critical_section);
 bool TryEnterCriticalSection(CriticalSection* critical_section);

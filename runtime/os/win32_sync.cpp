@@ -846,8 +846,9 @@ bool SleepConditionVariableSRW(ConditionVariable* condition_variable,
 bool SleepConditionVariableCS(ConditionVariable* condition_variable,
                               CriticalSection* critical_section,
                               uint32_t timeout_ms) {
+    // The caller must own the section (Windows: undefined otherwise; here an error).
     if (condition_variable == nullptr || critical_section == nullptr ||
-        !critical_section->mutex) {
+        critical_section->recursion_count <= 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }

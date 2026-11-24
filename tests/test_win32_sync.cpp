@@ -2,12 +2,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <set>
 #include <thread>
 #include <vector>
 
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_sync.h"
 
@@ -745,7 +747,7 @@ void test_condition_variables() {
         LeaveCriticalSection(&cs);
         DeleteCriticalSection(&cs);
 
-        CHECK(!SleepConditionVariableCS(&cv, &cs, 0));  // deleted critical section
+        CHECK(!SleepConditionVariableCS(&cv, &cs, 0));  // section not entered
         CHECK(GetLastError() == ERROR_INVALID_PARAMETER);
     }
 }
@@ -1112,7 +1114,71 @@ void test_handle_errors() {
 
 }  // namespace
 
+// Critical sections live in guest memory the runtime must not interpret: uninitialized bytes,
+// re-initialization after Delete, and zero-initialized sections entered without an init call.
+void test_critical_section_guest_storage() {
+    alignas(8) unsigned char storage[40];
+    auto* cs = reinterpret_cast<CriticalSection*>(storage);
+
+    // Garbage that looks like a pointer must not be dereferenced or freed.
+    std::memset(storage, 0xCD, sizeof(storage));
+    InitializeCriticalSection(cs);
+    CHECK(cs->lock_count == -1 && cs->recursion_count == 0 && cs->owning_thread == 0);
+    CHECK(cs->debug_info == ~uint64_t{0});
+    EnterCriticalSection(cs);
+    EnterCriticalSection(cs);
+    CHECK(cs->recursion_count == 2 && cs->owning_thread != 0);
+    LeaveCriticalSection(cs);
+    CHECK(cs->recursion_count == 1 && cs->owning_thread != 0);
+    LeaveCriticalSection(cs);
+    CHECK(cs->recursion_count == 0 && cs->owning_thread == 0);
+    DeleteCriticalSection(cs);
+
+    // Delete, then Initialize again (also over garbage), via the spin-count variant.
+    std::memset(storage, 0xAB, sizeof(storage));
+    CHECK(pg6_win32_initialize_critical_section_and_spin_count(cs, 4000) == 1);
+    CHECK(cs->spin_count == 4000 && cs->recursion_count == 0);
+    CHECK(TryEnterCriticalSection(cs));
+    LeaveCriticalSection(cs);
+    DeleteCriticalSection(cs);
+    InitializeCriticalSection(cs);
+    EnterCriticalSection(cs);
+    LeaveCriticalSection(cs);
+    DeleteCriticalSection(cs);
+
+    // A statically zero-initialized section entered without Initialize works and excludes.
+    std::memset(storage, 0, sizeof(storage));
+    std::atomic<int> inside{0};
+    std::atomic<int> overlaps{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < 500; ++i) {
+                EnterCriticalSection(cs);
+                if (inside.fetch_add(1) != 0) {
+                    overlaps.fetch_add(1);
+                }
+                inside.fetch_sub(1);
+                LeaveCriticalSection(cs);
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    CHECK(overlaps.load() == 0);
+    CHECK(cs->recursion_count == 0 && cs->owning_thread == 0);
+    DeleteCriticalSection(cs);
+
+    // Leaving a section that was never entered or initialized reports an error, no crash.
+    std::memset(storage, 0x11, sizeof(storage));
+    SetLastError(0);
+    LeaveCriticalSection(cs);
+    CHECK(GetLastError() == ERROR_INVALID_HANDLE);
+}
+
 int main() {
+    test_critical_section_guest_storage();
     test_semaphores();
     test_mutexes();
     test_events_and_timeouts();

@@ -502,12 +502,12 @@ void pg6_win32_sleep(uint32_t milliseconds) {
 }
 
 int32_t pg6_win32_initialize_critical_section_and_spin_count(Pg6CriticalSection* critical_section,
-                                                             uint32_t) {
+                                                             uint32_t spin_count) {
     if (critical_section == nullptr) {
         win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    win32::InitializeCriticalSection(critical_section);
+    win32::InitializeCriticalSectionWithSpinCount(critical_section, spin_count);
     return 1;
 }
 

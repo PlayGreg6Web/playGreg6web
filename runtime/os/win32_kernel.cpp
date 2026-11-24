@@ -1242,44 +1242,107 @@ bool TryAcquireSRWLockShared(SrwLock* srw_lock) {
 // Synchronization shims (CriticalSection & Event)
 // ---------------------------------------------------------------------------
 
-void InitializeCriticalSection(CriticalSection* critical_section) {
+namespace {
+
+// Locks of critical sections, keyed by the section's address (see Pg6CriticalSection). Sharded so
+// unrelated sections do not contend on one table lock.
+struct CriticalSectionShard {
+    std::mutex mutex;
+    std::unordered_map<const void*, std::shared_ptr<std::recursive_mutex>> locks;
+};
+
+constexpr size_t kCriticalSectionShards = 64;
+
+CriticalSectionShard& critical_section_shard(const void* address) {
+    static CriticalSectionShard shards[kCriticalSectionShards];
+    const auto key = reinterpret_cast<uintptr_t>(address);
+    return shards[(key >> 4) % kCriticalSectionShards];
+}
+
+// The section's lock; created when missing and `create` (a zero-initialized section entered
+// without an Initialize call behaves like an initialized one).
+std::shared_ptr<std::recursive_mutex> critical_section_lock(const CriticalSection* cs, bool create) {
+    CriticalSectionShard& shard = critical_section_shard(cs);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    auto it = shard.locks.find(cs);
+    if (it != shard.locks.end()) {
+        return it->second;
+    }
+    if (!create) {
+        return nullptr;
+    }
+    auto lock = std::make_shared<std::recursive_mutex>();
+    shard.locks.emplace(cs, lock);
+    return lock;
+}
+
+uint64_t current_thread_owner_id() {
+    // Any nonzero per-thread value works for inline OwningThread checks; prefer the shim's id.
+    static std::atomic<uint64_t> next{1};
+    thread_local const uint64_t id = next.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+
+}  // namespace
+
+void InitializeCriticalSectionWithSpinCount(CriticalSection* critical_section, uint32_t spin_count) {
     if (critical_section == nullptr) {
         return;
     }
-    if (!critical_section->mutex) {
-        critical_section->mutex = std::make_unique<std::recursive_mutex>();
-    }
+    // Construct in place: never read what the guest storage held before (uninitialized memory,
+    // or a section that was deleted and is now initialized again).
+    *critical_section = CriticalSection{~uint64_t{0}, -1, 0, 0, 0, spin_count};
+    CriticalSectionShard& shard = critical_section_shard(critical_section);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    shard.locks[critical_section] = std::make_shared<std::recursive_mutex>();
+}
+
+void InitializeCriticalSection(CriticalSection* critical_section) {
+    InitializeCriticalSectionWithSpinCount(critical_section, 0);
 }
 
 void DeleteCriticalSection(CriticalSection* critical_section) {
     if (critical_section == nullptr) {
         return;
     }
-    critical_section->mutex.reset();
+    CriticalSectionShard& shard = critical_section_shard(critical_section);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    shard.locks.erase(critical_section);
 }
 
 void EnterCriticalSection(CriticalSection* critical_section) {
-    if (critical_section == nullptr || !critical_section->mutex) {
+    if (critical_section == nullptr) {
         SetLastError(ERROR_INVALID_HANDLE);
         return;
     }
-    critical_section->mutex->lock();
+    critical_section_lock(critical_section, true)->lock();
+    ++critical_section->recursion_count;
+    critical_section->owning_thread = current_thread_owner_id();
 }
 
 bool TryEnterCriticalSection(CriticalSection* critical_section) {
-    if (critical_section == nullptr || !critical_section->mutex) {
+    if (critical_section == nullptr) {
         SetLastError(ERROR_INVALID_HANDLE);
         return false;
     }
-    return critical_section->mutex->try_lock();
+    if (!critical_section_lock(critical_section, true)->try_lock()) {
+        return false;
+    }
+    ++critical_section->recursion_count;
+    critical_section->owning_thread = current_thread_owner_id();
+    return true;
 }
 
 void LeaveCriticalSection(CriticalSection* critical_section) {
-    if (critical_section == nullptr || !critical_section->mutex) {
+    const auto lock = critical_section != nullptr ? critical_section_lock(critical_section, false) : nullptr;
+    if (lock == nullptr) {
         SetLastError(ERROR_INVALID_HANDLE);
         return;
     }
-    critical_section->mutex->unlock();
+    if (critical_section->recursion_count > 0 && --critical_section->recursion_count == 0) {
+        critical_section->owning_thread = 0;
+    }
+    lock->unlock();
 }
 
 // CreateEventA/W, SetEvent, ResetEvent and WaitForSingleObject live in os/win32_sync.cpp.
