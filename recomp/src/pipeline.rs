@@ -1299,14 +1299,14 @@ pub fn run_module(
     drop(analysis);
 
     // Import bridge.
-    let mut bridge = match &link.bridge_namespace {
-        Some(ns) => stubs::render_bridge_namespaced(&plan, &catalogue, ns),
-        None => stubs::render_bridge(&plan, &catalogue),
-    };
-    if !options.memory.is_default() {
-        // The thunks translate guest pointers the way the lifted code does.
-        bridge.seam = stubs::render_seam_for(&options.memory);
-    }
+    // The thunks translate (and, for the translated window, marshal) guest pointers the way the
+    // lifted code addresses guest memory.
+    let bridge = stubs::render_bridge_for(
+        &plan,
+        &catalogue,
+        link.bridge_namespace.as_deref(),
+        &options.memory,
+    );
     let mut files = Vec::new();
     for (name, text) in [
         (stubs::HEADER_FILE, &bridge.header),

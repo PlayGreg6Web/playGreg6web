@@ -6,6 +6,7 @@
 use std::env;
 use std::path::PathBuf;
 
+use playgta6_recomp::lift::MemoryModel;
 use playgta6_recomp::pipeline;
 use playgta6_recomp::stubs;
 
@@ -16,14 +17,17 @@ pub struct ExportArgs {
     pub include_root: Option<PathBuf>,
     /// `DLL!export` selectors; empty = every registered export.
     pub only: Vec<String>,
+    /// Memory model of the code calling the thunks (`--memory-model`).
+    pub memory: MemoryModel,
 }
 
-pub const USAGE: &str = "  playgta6-recomp export-thunks --out <dir> [--shims <header>...] [--include-root <dir>] [--only <DLL>!<export>]...";
+pub const USAGE: &str = "  playgta6-recomp export-thunks --out <dir> [--shims <header>...] [--include-root <dir>] [--only <DLL>!<export>]... [--memory-model <m>]";
 
 pub const OPTIONS: &[&str] = &[
     "  --out <dir>            export-thunks: write pg6_export_thunks.{h,cpp}, the seam header and pg6_export_manifest.json:",
     "                         a marshaling thunk for every export the runtime registers (bindable under the static-import rules)",
     "  --only <DLL>!<name>    export-thunks: emit only this export (repeatable); for slim tables and test fixtures",
+    "  --memory-model <m>     export-thunks: memory model of the calling code (as for build; window marshals guest buffers)",
     "  --shims <header>...    export-thunks: runtime headers and export-table sources (default: this checkout's runtime/os/*.{h,cpp}, d3d12_xs, guest_callbacks.h)",
 ];
 
@@ -33,6 +37,7 @@ pub fn parse_export_args(args: &[String]) -> Result<Option<ExportArgs>, String> 
     let mut shims = Vec::new();
     let mut include_root = None;
     let mut only = Vec::new();
+    let mut memory = MemoryModel::default();
     let dir_value = |flag: &str, value: Option<&String>| -> Result<PathBuf, String> {
         match value {
             Some(v) if !v.starts_with('-') => Ok(PathBuf::from(v)),
@@ -58,6 +63,13 @@ pub fn parse_export_args(args: &[String]) -> Result<Option<ExportArgs>, String> 
                     _ => return Err("--only requires a <DLL>!<name> argument".to_string()),
                 }
             }
+            "--memory-model" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) if !v.starts_with('-') => memory = MemoryModel::from_name(v)?,
+                    _ => return Err("--memory-model requires a value".to_string()),
+                }
+            }
             "--shims" => {
                 let start = shims.len();
                 while let Some(next) = args.get(i + 1).filter(|a| !a.starts_with('-')) {
@@ -77,6 +89,7 @@ pub fn parse_export_args(args: &[String]) -> Result<Option<ExportArgs>, String> 
         shims,
         include_root,
         only,
+        memory,
     }))
 }
 
@@ -105,7 +118,7 @@ pub fn run_export_thunks(args: &ExportArgs) -> Result<String, String> {
     if !args.only.is_empty() {
         plan = plan.only(&args.only)?;
     }
-    stubs::render_exports(&plan, &catalogue)
+    stubs::render_exports_for(&plan, &catalogue, &args.memory)
         .write_to(&args.out_dir)
         .map_err(|e| {
             format!(

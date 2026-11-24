@@ -28,6 +28,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "abi/playgta6_abi.h"
 
@@ -103,6 +105,56 @@ bool copy_to_guest(uint64_t va, const void* src, size_t len);
 // memmove / memset between guest ranges (window or not), overlap-safe.
 bool move_guest(uint64_t dst, uint64_t src, size_t len);
 bool fill_guest(uint64_t dst, uint8_t value, size_t len);
+
+// (pointer, length) marshaling for host code called with guest buffers (O29; the generated
+// import thunks of code lifted with the windowed memory model use one per call). Outside the
+// window a buffer is its flat host pointer. A window buffer whose slots are mapped onto adjacent
+// host pages is passed as that contiguous view ("pinned": the host reads and writes the guest's
+// bytes in place). Any other window buffer is passed as a bounce copy of the guest bytes, copied
+// back (writable buffers) by finish(), which the destructor calls: a segmented copy. NUL-terminated
+// strings are measured through the window and handled the same way. guest_address() maps a host
+// pointer into a bounce copy back to the guest address it stands for (pointer results).
+// A bounce copy is a different address: host code that keeps the pointer beyond the call, or
+// relies on its identity or on atomicity, only sees the guest's bytes in place for contiguous
+// buffers (always, once the runtime keeps window runs contiguous; see guest/memory_model.h).
+class Buffers {
+public:
+    Buffers() = default;
+    Buffers(const Buffers&) = delete;
+    Buffers& operator=(const Buffers&) = delete;
+    ~Buffers() { finish(); }
+
+    // Host pointer for the guest buffer [va, va + bytes).
+    void* range(uint64_t va, uint64_t bytes, bool writable) {
+        if (!in_window(va)) [[likely]] {
+            return host_or_trap(va);
+        }
+        return range_window(va, bytes, writable);
+    }
+    // Host pointer for the NUL-terminated guest string at va (`char_size` bytes per character).
+    void* string(uint64_t va, size_t char_size) {
+        if (!in_window(va)) [[likely]] {
+            return host_or_trap(va);
+        }
+        return string_window(va, char_size);
+    }
+    // Copies writable bounce copies back to the guest (once).
+    void finish();
+    // guest_window::guest_address(), plus pointers into this call's bounce copies.
+    uint64_t guest_address(const void* host) const;
+    size_t bounce_count() const { return bounces_.size(); }
+
+private:
+    struct Bounce {
+        uint64_t va = 0;
+        size_t bytes = 0;
+        bool writable = false;
+        std::unique_ptr<uint8_t[]> data;
+    };
+    void* range_window(uint64_t va, uint64_t bytes, bool writable);
+    void* string_window(uint64_t va, size_t char_size);
+    std::vector<Bounce> bounces_;  // empty (no allocation) unless a window buffer is split
+};
 
 struct Stats {
     uint64_t mapped_slots = 0;

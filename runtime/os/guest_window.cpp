@@ -247,6 +247,103 @@ bool fill_guest(uint64_t dst, uint8_t value, size_t len) {
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Buffers: (pointer, length) marshaling
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// Larger buffers are passed as they are (the host sees the first slot's page): a bounce copy of
+// more than this is not worth it, and no caller passes window buffers that large.
+constexpr uint64_t kMaxBounceBytes = uint64_t{256} << 20;
+
+}  // namespace
+
+void* Buffers::range_window(uint64_t va, uint64_t bytes, bool writable) {
+    if (!enabled() || bytes == 0 || bytes > kMaxBounceBytes) {
+        return host_or_trap(va);
+    }
+    if (void* view = contiguous(va, static_cast<size_t>(bytes))) {
+        return view;  // pinned: the guest's bytes in place
+    }
+    Bounce b;
+    b.va = va;
+    b.bytes = static_cast<size_t>(bytes);
+    b.writable = writable;
+    b.data = std::make_unique<uint8_t[]>(b.bytes);
+    if (!copy_from_guest(b.data.get(), va, b.bytes)) {
+        return host_or_trap(va);  // a slot of the range is unmapped: fault like the guest would
+    }
+    void* host = b.data.get();
+    bounces_.push_back(std::move(b));
+    return host;
+}
+
+void* Buffers::string_window(uint64_t va, size_t char_size) {
+    if (!enabled() || char_size == 0 || char_size > 4) {
+        return host_or_trap(va);
+    }
+    // Measure the string slot by slot (terminator included).
+    uint64_t bytes = 0;
+    for (;;) {
+        const uint64_t at = va + bytes;
+        const auto* p = static_cast<const uint8_t*>(translate(at));
+        if (p == nullptr) {
+            return host_or_trap(va);
+        }
+        const uint64_t left = kSlotBytes - (at & (kSlotBytes - 1));
+        uint64_t i = 0;
+        for (; i + char_size <= left; i += char_size) {
+            bool zero = true;
+            for (size_t k = 0; k < char_size; ++k) {
+                zero = zero && p[i + k] == 0;
+            }
+            if (zero) {
+                return range_window(va, bytes + i + char_size, false);
+            }
+        }
+        if (i != left) {
+            // A character straddles the slot end (odd alignment): measure it through a copy.
+            uint8_t ch[4] = {};
+            if (!copy_from_guest(ch, at + i, char_size)) {
+                return host_or_trap(va);
+            }
+            bool zero = true;
+            for (size_t k = 0; k < char_size; ++k) {
+                zero = zero && ch[k] == 0;
+            }
+            if (zero) {
+                return range_window(va, bytes + i + char_size, false);
+            }
+            i += char_size;
+        }
+        bytes += i;
+        if (bytes > kMaxBounceBytes) {
+            return host_or_trap(va);
+        }
+    }
+}
+
+void Buffers::finish() {
+    for (Bounce& b : bounces_) {
+        if (b.writable) {
+            copy_to_guest(b.va, b.data.get(), b.bytes);
+            b.writable = false;
+        }
+    }
+}
+
+uint64_t Buffers::guest_address(const void* host) const {
+    const auto h = reinterpret_cast<uintptr_t>(host);
+    for (const Bounce& b : bounces_) {
+        const auto start = reinterpret_cast<uintptr_t>(b.data.get());
+        if (h >= start && h <= start + b.bytes) {
+            return b.va + (h - start);
+        }
+    }
+    return guest_window::guest_address(host);
+}
+
 Stats stats() {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);

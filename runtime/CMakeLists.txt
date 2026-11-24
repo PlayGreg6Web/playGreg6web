@@ -282,6 +282,15 @@ else()
     target_link_libraries(test_guest_window PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_window_tests COMMAND test_guest_window)
 
+    # O29: the checked-in output of `playgta6-recomp export-thunks --memory-model window --only ...`
+    # (tests/fixtures/export_thunks_window, kept in sync with the generator by a Rust test).
+    add_executable(test_window_marshal
+        ../tests/test_window_marshal.cpp
+        ../tests/fixtures/export_thunks_window/pg6_export_thunks.cpp)
+    target_include_directories(test_window_marshal PRIVATE ../tests/fixtures/export_thunks_window)
+    target_link_libraries(test_window_marshal PRIVATE playgta6_core)
+    add_test(NAME playgta6_window_marshal_tests COMMAND test_window_marshal)
+
     add_executable(test_guest_window_e2e ../tests/test_guest_window_e2e.cpp)
     target_link_libraries(test_guest_window_e2e PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_window_e2e_tests COMMAND test_guest_window_e2e)

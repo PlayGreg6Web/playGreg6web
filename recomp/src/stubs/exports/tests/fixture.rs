@@ -69,3 +69,69 @@ fn checked_in_test_fixture_matches_the_generator() {
         only.join(" ")
     );
 }
+
+/// O29: the exports of `tests/fixtures/export_thunks_window/`, thunks for code lifted with the
+/// translated CPU window (`tests/test_window_marshal.cpp` drives them with guest buffers split
+/// across non-adjacent window pages). Regenerate like the fixture above, with
+/// `--out tests/fixtures/export_thunks_window --memory-model window`.
+const WINDOW_FIXTURE_EXPORTS: &[&str] = &[
+    "KERNEL32.dll!ReadFile",
+    "KERNEL32.dll!CreateFileW",
+    "KERNEL32.dll!CloseHandle",
+    "VCRUNTIME140.dll!memcpy",
+    "api-ms-win-crt-string-l1-1-0.dll!strlen",
+    "api-ms-win-crt-string-l1-1-0.dll!strncpy",
+    "xmem.dll!XMemTransferMemory",
+];
+
+#[test]
+fn checked_in_window_fixture_matches_the_generator() {
+    let catalogue = checkout_catalogue();
+    let selectors: Vec<String> = WINDOW_FIXTURE_EXPORTS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let plan = plan_exports(&catalogue)
+        .only(&selectors)
+        .expect("fixture exports are registered");
+    assert_eq!(plan.rows.len(), WINDOW_FIXTURE_EXPORTS.len());
+    let out = render_exports_for(
+        &plan,
+        &catalogue,
+        &crate::lift::MemoryModel::translated_window(false),
+    );
+    assert!(out.source.contains("Pg6SeamBuffers pg6_buffers;"));
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("export_thunks_window");
+    let normalized = |text: &str| text.replace("\r\n", "\n");
+    let stale: Vec<&str> = [
+        (EXPORT_HEADER_FILE, &out.header),
+        (EXPORT_SOURCE_FILE, &out.source),
+        (crate::stubs::SEAM_FILE, &out.seam),
+    ]
+    .into_iter()
+    .filter(|(name, text)| {
+        fs::read_to_string(dir.join(name))
+            .map(|d| normalized(&d))
+            .ok()
+            .as_deref()
+            != Some(normalized(text).as_str())
+    })
+    .map(|(name, _)| name)
+    .collect();
+    let only: Vec<String> = WINDOW_FIXTURE_EXPORTS
+        .iter()
+        .map(|s| format!("--only \"{s}\""))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "tests/fixtures/export_thunks_window is stale ({}): regenerate with\n  playgta6-recomp \
+         export-thunks --out tests/fixtures/export_thunks_window --memory-model window {}\nand \
+         delete the generated pg6_export_manifest.json",
+        stale.join(", "),
+        only.join(" ")
+    );
+}

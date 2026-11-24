@@ -126,6 +126,18 @@
 //! (null must map to null), `kPg6SeamStackArgOffset`, `pg6_seam_return`, `pg6_seam_log` and
 //! `pg6_seam_trap_unresolved`.
 //!
+//! Code lifted with the translated CPU window (`MemoryModel::Windowed`, O29;
+//! [`render_bridge_for`], [`render_exports_for`]) gets a seam that translates through the
+//! runtime's `os/guest_window.h`, and thunks that marshal guest buffers ([`param_marshal`]): a
+//! data pointer with a neighbouring length parameter (by name: `size`, `count`, `*_bytes`, ...;
+//! the length after a run of pointers belongs to each of them, a count before the last pointer
+//! to it), a read-only C string, or one pointee. A window buffer whose slots sit on adjacent
+//! host pages is passed in place; any other window buffer as a bounce copy that is copied back
+//! after the call (non-const pointees), and pointer results into a bounce copy map back to the
+//! guest address. Outside the window nothing changes but one compare per pointer. Output
+//! strings without a length (`strcpy`'s destination) are passed as one character: they are
+//! correct only when the window keeps runs contiguous (see `runtime/guest/memory_model.h`).
+//!
 //! The loader fills each IAT slot with a value its indirect-call helper
 //! (`__playgta6_indirect_call(state, target)`) maps back to the slot; `pg6_find_import_thunk`
 //! then returns the thunk to run. Delay-load slots are bound the same way, so the guest's
@@ -169,6 +181,7 @@ mod tables;
 pub use exports::{
     EXPORT_HEADER_FILE, EXPORT_MANIFEST_FILE, EXPORT_SOURCE_FILE, ExportBinding, ExportCounts,
     ExportOutput, ExportPlan, ExportRow, plan_exports, render_export_coverage, render_exports,
+    render_exports_for,
 };
 pub use tables::{
     AuditEntry, ExportEntry, GapEntry, NameRule, PREFIX_CRT, PREFIX_D3D12, PREFIX_GDK, PREFIX_MW,
@@ -271,6 +284,9 @@ pub struct ShimDecl {
     pub include: String,
     pub ret: CType,
     pub params: Vec<CType>,
+    /// Declared parameter names (empty when unnamed), parallel to `params`; they only steer
+    /// marshaling (see [`param_marshal`]), so redeclarations may differ in them.
+    pub param_names: Vec<String>,
     pub variadic: bool,
 }
 
@@ -372,6 +388,7 @@ impl Catalogue {
                 include: headers[decl.header].include.clone(),
                 ret: env.ctype(&decl.ret),
                 params: decl.params.iter().map(|p| env.ctype(p)).collect(),
+                param_names: decl.param_names,
                 variadic: decl.variadic,
             };
             match catalogue.shims.get(&shim.name) {
@@ -619,6 +636,8 @@ struct RawDecl {
     name: String,
     ret: Vec<Tok>,
     params: Vec<Vec<Tok>>,
+    /// Declared parameter names (empty when unnamed), parallel to `params`.
+    param_names: Vec<String>,
     variadic: bool,
     header: usize,
 }
@@ -937,6 +956,7 @@ fn parse_function(stmt: &[Tok], header: usize) -> Option<RawDecl> {
     }
 
     let mut params = Vec::new();
+    let mut param_names = Vec::new();
     let mut variadic = false;
     let inner = &stmt[open + 1..close];
     let mut depth = 0i32;
@@ -952,7 +972,12 @@ fn parse_function(stmt: &[Tok], header: usize) -> Option<RawDecl> {
             if param.iter().filter(|t| t.is_punct('.')).count() >= 3 {
                 variadic = true;
             } else if !param.is_empty() {
-                params.push(strip_param_name(&param));
+                let ty = strip_param_name(&param);
+                param_names.push(match param.get(ty.len()) {
+                    Some(Tok::Ident(name)) if ty.len() < param.len() => name.clone(),
+                    _ => String::new(),
+                });
+                params.push(ty);
             }
         } else {
             current.push(tok.clone());
@@ -960,11 +985,13 @@ fn parse_function(stmt: &[Tok], header: usize) -> Option<RawDecl> {
     }
     if params.len() == 1 && params[0].len() == 1 && params[0][0].is_ident("void") {
         params.clear();
+        param_names.clear();
     }
     Some(RawDecl {
         name: name.to_string(),
         ret,
         params,
+        param_names,
         variadic,
         header,
     })
@@ -1740,6 +1767,27 @@ pub fn render_bridge_namespaced(
         catalogue,
         Names {
             ns: Some(namespace),
+            window: false,
+        },
+    )
+}
+
+/// [`render_bridge`] / [`render_bridge_namespaced`] for code lifted with `model`: under
+/// [`MemoryModel::Windowed`] the seam translates through the runtime's window-aware translation
+/// ([`render_seam_for`]) and the thunks marshal guest buffers ([`param_marshal`]); any other model
+/// gives the default output.
+pub fn render_bridge_for(
+    plan: &BridgePlan,
+    catalogue: &Catalogue,
+    namespace: Option<&str>,
+    model: &MemoryModel,
+) -> BridgeOutput {
+    render_bridge_with(
+        plan,
+        catalogue,
+        Names {
+            ns: namespace,
+            window: is_windowed(model),
         },
     )
 }
@@ -1748,15 +1796,17 @@ fn render_bridge_with(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>
     BridgeOutput {
         header: render_header(names),
         source: render_source(plan, catalogue, names),
-        seam: render_seam(),
+        seam: render_seam_text(names.window),
         manifest: render_manifest(plan, catalogue, names),
     }
 }
 
-/// Generated global names, optionally suffixed with a module namespace.
+/// Generated global names, optionally suffixed with a module namespace, and whether the thunks
+/// marshal for the translated window.
 #[derive(Debug, Clone, Copy, Default)]
 struct Names<'a> {
     ns: Option<&'a str>,
+    window: bool,
 }
 
 impl Names<'_> {
@@ -2002,6 +2052,8 @@ const SEAM_WINDOW_TRANSLATION: &str = "\
 // code uses the translated CPU window (memory model \"windowed\"), so guest addresses in the
 // window translate through its slot table (os/guest_window.h); an unmapped window address gives
 // a pointer that faults when dereferenced, as the guest's own access would.
+#include <type_traits>
+
 #include \"os/guest_window.h\"
 
 inline void* pg6_seam_host_ptr(uint64_t guest_va) {
@@ -2011,18 +2063,60 @@ inline void* pg6_seam_host_ptr(uint64_t guest_va) {
 inline uint64_t pg6_seam_guest_addr(const void* host) {
     return playgta6::os::guest_window::guest_address(host);
 }
-";
 
-/// Default seam ([`render_seam_for`] of the default memory model).
-fn render_seam() -> String {
-    render_seam_for(&MemoryModel::default())
+// Guest buffers of one call (os/guest_window.h Buffers): host-contiguous window ranges are passed
+// in place, split ones as bounce copies that are copied back after the call.
+using Pg6SeamBuffers = playgta6::os::guest_window::Buffers;
+
+template <typename T, typename = void>
+struct pg6_seam_complete : std::false_type {};
+template <typename T>
+struct pg6_seam_complete<T, std::void_t<decltype(sizeof(T))>> : std::true_type {};
+
+// Bytes of one pointee of pointer type P: 1 for void, 0 (passed as it is) for an incomplete type.
+template <typename P>
+constexpr uint64_t pg6_seam_elem() {
+    using T = std::remove_cv_t<std::remove_pointer_t<P>>;
+    if constexpr (std::is_void_v<T>) {
+        return 1;
+    } else if constexpr (pg6_seam_complete<T>::value) {
+        return sizeof(T);
+    } else {
+        return 0;
+    }
 }
+
+// A buffer of `bytes` bytes at guest_va (writable unless the pointee is const).
+template <typename P>
+P pg6_seam_range(Pg6SeamBuffers& buffers, uint64_t guest_va, uint64_t bytes) {
+    constexpr bool writable = !std::is_const_v<std::remove_pointer_t<P>>;
+    return static_cast<P>(buffers.range(guest_va, bytes, writable));
+}
+
+// A buffer of `count` pointees (the length saturates instead of wrapping).
+template <typename P>
+P pg6_seam_elements(Pg6SeamBuffers& buffers, uint64_t guest_va, uint64_t count) {
+    constexpr uint64_t elem = pg6_seam_elem<P>();
+    const uint64_t bytes = elem == 0 ? 0 : (count > UINT64_MAX / elem ? UINT64_MAX : count * elem);
+    return pg6_seam_range<P>(buffers, guest_va, bytes);
+}
+
+// A NUL-terminated string at guest_va.
+template <typename P>
+P pg6_seam_string(Pg6SeamBuffers& buffers, uint64_t guest_va) {
+    return static_cast<P>(buffers.string(guest_va, sizeof(std::remove_pointer_t<P>)));
+}
+";
 
 /// The guest-state seam for code lifted with `model`: [`MemoryModel::Windowed`] translates
 /// guest pointers through the runtime's window-aware translation; every other model keeps the
 /// default seam.
 pub fn render_seam_for(model: &MemoryModel) -> String {
-    render_seam_text(matches!(model, MemoryModel::Windowed(_)))
+    render_seam_text(is_windowed(model))
+}
+
+fn is_windowed(model: &MemoryModel) -> bool {
+    matches!(model, MemoryModel::Windowed(_))
 }
 
 const SOURCE_HELPERS: &str = "\
@@ -2089,9 +2183,9 @@ inline uint64_t pg6_bits_from_f64(double value) {
 
 ";
 
-/// Guest-state expression for Win64 argument `i` of kind `ty`.
-fn arg_expr(i: usize, ty: &CType) -> String {
-    let raw = if i < ARG_GPRS.len() {
+/// The raw 64-bit guest-state value of Win64 argument `i` of kind `ty`.
+fn raw_arg(i: usize, ty: &CType) -> String {
+    if i < ARG_GPRS.len() {
         match ty.kind {
             TypeKind::F32 | TypeKind::F64 => format!("pg6_seam_get_xmm_lo(state, {i})"),
             _ => format!("pg6_seam_get_gpr(state, {})", ARG_GPRS[i]),
@@ -2099,7 +2193,105 @@ fn arg_expr(i: usize, ty: &CType) -> String {
     } else {
         let offset = 8 * (i - ARG_GPRS.len());
         format!("pg6_seam_load_u64(rsp + kPg6SeamStackArgOffset + {offset})")
+    }
+}
+
+/// How a thunk of code lifted with the translated CPU window passes one parameter to its shim
+/// ([`param_marshal`]). Outside the window every class is the plain translation; inside it a
+/// buffer is passed in place when its slots are host-contiguous, else as a bounce copy (copied
+/// back after the call when the pointee is not const; `os/guest_window.h` `Buffers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamMarshal {
+    /// As the default thunk passes it (integers, floats, pointers to incomplete types).
+    Plain,
+    /// A buffer whose extent is parameter `len`: a number of pointees (`elements`; `void*`
+    /// counts bytes) or, for a length named as bytes, of bytes.
+    Range { len: usize, elements: bool },
+    /// A NUL-terminated string (`const char*`, `const char16_t*`, `const wchar_t*`).
+    CString,
+    /// One pointee (`T*`, `sizeof(T)` bytes; a pointer to an incomplete type stays plain).
+    Pointee,
+}
+
+/// Whether a parameter name reads as the length of a neighbouring buffer, and if so whether it
+/// is counted in bytes (`Some(false)`) or in elements (`Some(true)`). Unknown units count
+/// elements: a bounce copy may then be larger than the buffer, never smaller.
+fn length_unit(name: &str) -> Option<bool> {
+    let n = name.to_ascii_lowercase();
+    let bytes = n.contains("byte") || (n.starts_with("cb") && n.len() > 2) || n == "cb";
+    let length = bytes
+        || matches!(
+            n.as_str(),
+            "n" | "count" | "size" | "len" | "length" | "num" | "cch" | "capacity" | "max"
+        )
+        || n.ends_with("_count")
+        || n.ends_with("_size")
+        || n.ends_with("_len")
+        || n.ends_with("_length")
+        || n.ends_with("_capacity")
+        || n.ends_with("count")
+        || n.starts_with("num_")
+        || n.starts_with("cch")
+        || n.starts_with("max_");
+    length.then_some(!bytes)
+}
+
+/// Whether `ty` is a pointer to a NUL-terminated character string the callee only reads.
+fn is_const_c_string(ty: &CType) -> bool {
+    matches!(
+        ty.spelling.as_str(),
+        "const char*" | "const char16_t*" | "const wchar_t*" | "char const*" | "char16_t const*"
+    )
+}
+
+/// The marshaling of every parameter of `shim` for code lifted with the translated CPU window:
+/// a data pointer followed (or else preceded) by an integer parameter whose name reads as a
+/// length is a [`ParamMarshal::Range`]; a `const` character pointer without one is a
+/// [`ParamMarshal::CString`]; any other data pointer a [`ParamMarshal::Pointee`].
+pub fn param_marshal(shim: &ShimDecl) -> Vec<ParamMarshal> {
+    let n = shim.params.len();
+    let name = |i: usize| shim.param_names.get(i).map_or("", String::as_str);
+    let length_at = |i: usize| -> Option<bool> {
+        (shim.params[i].kind == TypeKind::Int)
+            .then(|| length_unit(name(i)))
+            .flatten()
     };
+    let is_ptr = |i: usize| shim.params[i].kind == TypeKind::Ptr;
+    // The length after a run of buffers belongs to each of them (`memcpy(dst, src, size)`).
+    let forward = |i: usize| -> Option<(usize, bool)> {
+        let j = (i + 1..n).find(|&j| !is_ptr(j))?;
+        length_at(j).map(|elements| (j, elements))
+    };
+    let mut plan = vec![ParamMarshal::Plain; n];
+    let mut used = vec![false; n];
+    for i in (0..n).filter(|&i| is_ptr(i)) {
+        if let Some((len, elements)) = forward(i) {
+            plan[i] = ParamMarshal::Range { len, elements };
+            used[len] = true;
+        }
+    }
+    for i in (0..n).filter(|&i| is_ptr(i)) {
+        if plan[i] != ParamMarshal::Plain {
+            continue;
+        }
+        // A count right before the last buffer (`num_pages, page_array`), unless it is another
+        // buffer's length (`ReadFile(buffer, bytes_to_read, bytes_read)`).
+        let backward = i
+            .checked_sub(1)
+            .filter(|&j| !used[j])
+            .and_then(|j| length_at(j).map(|elements| (j, elements)));
+        plan[i] = match backward {
+            Some((len, elements)) => ParamMarshal::Range { len, elements },
+            None if is_const_c_string(&shim.params[i]) => ParamMarshal::CString,
+            None => ParamMarshal::Pointee,
+        };
+    }
+    plan
+}
+
+/// Guest-state expression for Win64 argument `i` of kind `ty`.
+fn arg_expr(i: usize, ty: &CType) -> String {
+    let raw = raw_arg(i, ty);
     match ty.kind {
         TypeKind::F32 => format!("pg6_f32_from_bits({raw})"),
         TypeKind::F64 => format!("pg6_f64_from_bits({raw})"),
@@ -2108,13 +2300,49 @@ fn arg_expr(i: usize, ty: &CType) -> String {
     }
 }
 
-fn render_bound_thunk(out: &mut String, thunk: &str, shim: &ShimDecl) {
+/// Argument expression of parameter `i` under the windowed marshaling `plan`.
+fn marshaled_arg_expr(shim: &ShimDecl, plan: &[ParamMarshal], i: usize) -> String {
+    let ty = &shim.params[i];
+    let raw = raw_arg(i, ty);
+    let spelling = &ty.spelling;
+    match plan[i] {
+        ParamMarshal::Plain => arg_expr(i, ty),
+        ParamMarshal::Range { len, elements } => {
+            let count = format!(
+                "static_cast<uint64_t>({})",
+                arg_expr(len, &shim.params[len])
+            );
+            if elements {
+                format!("pg6_seam_elements<{spelling}>(pg6_buffers, {raw}, {count})")
+            } else {
+                format!("pg6_seam_range<{spelling}>(pg6_buffers, {raw}, {count})")
+            }
+        }
+        ParamMarshal::CString => format!("pg6_seam_string<{spelling}>(pg6_buffers, {raw})"),
+        ParamMarshal::Pointee => {
+            format!("pg6_seam_range<{spelling}>(pg6_buffers, {raw}, pg6_seam_elem<{spelling}>())")
+        }
+    }
+}
+
+fn render_bound_thunk(out: &mut String, thunk: &str, shim: &ShimDecl, window: bool) {
     let _ = writeln!(out, "void {thunk}(void* state) {{");
     if is_guest_state_thunk(shim) {
         // Marshals its own arguments and pops the return address itself.
         let _ = writeln!(out, "    {}(state);", shim.name);
         let _ = writeln!(out, "}}");
         return;
+    }
+    let plan = if window {
+        param_marshal(shim)
+    } else {
+        Vec::new()
+    };
+    let marshaled = plan.iter().any(|m| *m != ParamMarshal::Plain);
+    if marshaled {
+        // Guest buffers of this call: bounce copies (if any) go back to the guest before the
+        // results are stored.
+        let _ = writeln!(out, "    Pg6SeamBuffers pg6_buffers;");
     }
     if shim.params.len() > ARG_GPRS.len() {
         let _ = writeln!(
@@ -2129,22 +2357,38 @@ fn render_bound_thunk(out: &mut String, thunk: &str, shim: &ShimDecl) {
             .params
             .iter()
             .enumerate()
-            .map(|(i, ty)| format!("        {}", arg_expr(i, ty)))
+            .map(|(i, ty)| {
+                if marshaled {
+                    format!("        {}", marshaled_arg_expr(shim, &plan, i))
+                } else {
+                    format!("        {}", arg_expr(i, ty))
+                }
+            })
             .collect();
         format!("{}(\n{})", shim.name, args.join(",\n"))
+    };
+    let finish = if marshaled {
+        "    pg6_buffers.finish();\n"
+    } else {
+        ""
     };
     match shim.ret.kind {
         TypeKind::Void => {
             let _ = writeln!(out, "    {call};");
+            out.push_str(finish);
         }
         kind => {
             let _ = writeln!(out, "    const auto result = {call};");
+            out.push_str(finish);
             let store = match kind {
                 TypeKind::F32 => {
                     "pg6_seam_set_xmm_lo(state, 0, pg6_bits_from_f32(result))".to_string()
                 }
                 TypeKind::F64 => {
                     "pg6_seam_set_xmm_lo(state, 0, pg6_bits_from_f64(result))".to_string()
+                }
+                TypeKind::Ptr if marshaled => {
+                    format!("pg6_seam_set_gpr(state, {REG_RAX}, pg6_buffers.guest_address(result))")
                 }
                 TypeKind::Ptr => {
                     format!("pg6_seam_set_gpr(state, {REG_RAX}, pg6_seam_guest_addr(result))")
@@ -2226,7 +2470,7 @@ fn render_source(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -> 
                     comment_text(&import.label()),
                     shim.name
                 );
-                render_bound_thunk(&mut out, &thunk, shim);
+                render_bound_thunk(&mut out, &thunk, shim, names.window);
             }
             (resolution, _) => {
                 let reason = match resolution {
@@ -3710,6 +3954,94 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             .map(|p| load_shim_header(p, Some(&root)).expect("read runtime file"))
             .collect();
         Catalogue::scan(&headers)
+    }
+
+    /// O29: the windowed thunks' marshaling of this checkout's shims, on representatives of each
+    /// class, plus the coverage (printed with `--nocapture`).
+    #[test]
+    fn window_marshaling_of_the_checkout_shims() {
+        use ParamMarshal::{CString, Plain, Pointee, Range};
+        let catalogue = checkout_catalogue();
+        let plan = |name: &str| param_marshal(catalogue.get(name).expect(name));
+        // A file read into a guest buffer: the buffer's extent is bytes_to_read; bytes_read is
+        // one uint32_t, not another user of that length.
+        assert_eq!(
+            plan("pg6_win32_read_file"),
+            [
+                Plain,
+                Range {
+                    len: 2,
+                    elements: false
+                },
+                Plain,
+                Pointee,
+                Pointee
+            ]
+        );
+        // memcpy class: one length for both buffers.
+        assert_eq!(
+            plan("pg6_crt_memcpy"),
+            [
+                Range {
+                    len: 2,
+                    elements: true
+                },
+                Range {
+                    len: 2,
+                    elements: true
+                },
+                Plain
+            ]
+        );
+        // String functions: a read-only string, and a bounded copy.
+        assert_eq!(plan("pg6_crt_strlen"), [CString]);
+        assert_eq!(
+            plan("pg6_crt_strncpy"),
+            [
+                Range {
+                    len: 2,
+                    elements: true
+                },
+                Range {
+                    len: 2,
+                    elements: true
+                },
+                Plain
+            ]
+        );
+        // A count before its array.
+        assert_eq!(
+            plan("pg6_xbox_XMemFreePhysicalPages"),
+            [
+                Plain,
+                Range {
+                    len: 0,
+                    elements: true
+                }
+            ]
+        );
+
+        let mut pointer_shims = 0;
+        let mut ranges = 0;
+        let mut strings = 0;
+        for shim in catalogue.shims.values() {
+            let p = param_marshal(shim);
+            if p.iter().any(|m| *m != Plain) {
+                pointer_shims += 1;
+            }
+            if p.iter().any(|m| matches!(m, Range { .. })) {
+                ranges += 1;
+            }
+            if p.contains(&CString) {
+                strings += 1;
+            }
+        }
+        println!(
+            "window marshaling: {} shims, {pointer_shims} with data pointers, {ranges} with a \
+             (pointer, length) pair, {strings} with a read-only C string",
+            catalogue.shims.len()
+        );
+        assert!(ranges >= 80, "{ranges} (pointer, length) shims");
     }
 
     #[test]

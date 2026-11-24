@@ -1376,6 +1376,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                     "KERNEL32.dll!Sleep".to_string(),
                     "WS2_32.dll!closesocket".to_string()
                 ],
+                memory: MemoryModel::default(),
             }))
         );
         assert_eq!(
@@ -1385,6 +1386,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 shims: Vec::new(),
                 include_root: None,
                 only: Vec::new(),
+                memory: MemoryModel::default(),
             }))
         );
         assert_eq!(
@@ -1419,6 +1421,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
             shims: vec![header],
             include_root: None,
             only: vec!["kernel32!Tick".to_string()],
+            memory: MemoryModel::default(),
         };
         let summary = export_cmd::run_export_thunks(&args).expect("export-thunks");
         assert!(summary.contains("1 exports, 1 guest-callable"), "{summary}");

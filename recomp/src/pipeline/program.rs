@@ -1025,10 +1025,7 @@ pub fn build_program(
     diagnostics.dedup();
     // The export thunk table: one per program, next to (never inside) the module bridges.
     let export_plan = stubs::plan_exports(&catalogue);
-    let mut export_files = stubs::render_exports(&export_plan, &catalogue);
-    if !options.build.memory.is_default() {
-        export_files.seam = stubs::render_seam_for(&options.build.memory);
-    }
+    let export_files = stubs::render_exports_for(&export_plan, &catalogue, &options.build.memory);
     let exports_dir = out.join(EXPORTS_DIR);
     fs::create_dir_all(&exports_dir).map_err(io_error(format!(
         "failed to create output directory '{}'",

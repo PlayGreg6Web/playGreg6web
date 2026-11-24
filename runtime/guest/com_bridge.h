@@ -15,6 +15,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "guest/guest_runtime.h"
+#include "os/guest_window.h"
 #include "os/vmem.h"
 
 // Guest COM object bridge (O16).
@@ -581,6 +582,9 @@ struct CallContext {
     ComObject* object = nullptr;               // nullptr for flat (non-method) thunks
     const InterfaceInfo* iface = nullptr;
     uint64_t entry_rsp = 0;                    // rsp at entry (points at the return address)
+    // Bounce copies of raw pointer arguments whose pointee is split across non-adjacent
+    // translated-window pages (O29); copied back after the call.
+    os::guest_window::Buffers buffers{};
 
     // Raw Win64 argument at position `pos` (0 = rcx/this): integer view and float view.
     // A failed stack read raises FaultKind::BadStack.
@@ -761,11 +765,17 @@ struct Marshal {
             if (va == 0) {
                 return nullptr;
             }
-            void* host = nullptr;
-            if constexpr (std::is_void_v<Pointee>) {
-                host = guest_to_host(va, 1);
-            } else {
-                host = guest_to_host(va, sizeof(Pointee));
+            constexpr size_t bytes = [] {
+                if constexpr (std::is_void_v<Pointee>) {
+                    return size_t{1};
+                } else {
+                    return sizeof(Pointee);
+                }
+            }();
+            void* host = guest_to_host(va, bytes);
+            if (host == nullptr && os::guest_window::translated(va)) {
+                // A pointee split across non-adjacent window pages: a bounce copy (O29).
+                host = ctx.buffers.range(va, bytes, !std::is_const_v<Pointee>);
             }
             if (host == nullptr) {
                 log_bad_pointer("pointer argument", va);
@@ -856,9 +866,11 @@ void marshal_call(CallContext& ctx, unsigned first, Call&& fn, std::index_sequen
     (void)stored;
     if constexpr (std::is_void_v<R>) {
         fn(pass_arg<A>(ctx, std::get<I>(stored))...);
+        ctx.buffers.finish();
     } else {
         const uint64_t hidden = kReturnsViaHiddenPointer<R> ? ctx.int_arg(first - 1) : 0;
         const R result = fn(pass_arg<A>(ctx, std::get<I>(stored))...);
+        ctx.buffers.finish();
         if (ctx.state.unwind_pending == 0) {  // an unwind keeps the restored registers
             store_result<R>(ctx, result, hidden);
         }
