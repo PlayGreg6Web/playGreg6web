@@ -403,6 +403,9 @@ struct BootConfig {
     size_t recent_import_count = 32;
     size_t max_backtrace_frames = 32;
     CaptureHostStackFn capture_host_stack = nullptr;
+    // Record up to this many import calls (name, thread, first five integer arguments) for
+    // import_trace_text(); 0 = off.
+    size_t import_trace_limit = 0;
     // Start address of the host function containing a code address (0 if unknown), e.g. from the
     // host's unwind tables; makes host-frame -> lifted-function mapping exact.
     HostFunctionStartFn host_function_start = nullptr;
@@ -466,6 +469,10 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
 // Report / summary of the last boot (also after report_host_fault).
 std::string last_report_json();
 std::string last_summary();
+
+// The import trace of the last boot (BootConfig::import_trace_limit): one line per import call,
+// "seq thread dll!symbol arg0 arg1 arg2 arg3 arg4" (hex arguments: rcx rdx r8 r9 [rsp+0x28]).
+std::string import_trace_text();
 
 // Lifted function containing a host code address (exact only for natively compiled lifted code:
 // nearest lifted function pointer at or below `host_pc`). 0 if unknown.

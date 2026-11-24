@@ -1,6 +1,7 @@
 #include "os/vmem.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "os/vmem_backing.h"
@@ -22,7 +23,24 @@ constexpr bool kGuardLowAddresses = false;
 constexpr bool kGuardLowAddresses = true;
 #endif
 
+std::atomic<ArenaObserver> g_arena_observer{nullptr};
+
+void notify(const VirtualMemoryArena& arena,
+            ArenaEvent event,
+            uint64_t va,
+            uint64_t size,
+            PageProtect protect,
+            bool ok) {
+    if (ArenaObserver observer = g_arena_observer.load(std::memory_order_acquire)) {
+        observer(arena, event, va, size, protect, ok);
+    }
+}
+
 }  // namespace
+
+ArenaObserver set_arena_observer(ArenaObserver observer) {
+    return g_arena_observer.exchange(observer, std::memory_order_acq_rel);
+}
 
 VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
                                        uint64_t space_size,
@@ -392,17 +410,23 @@ uint64_t VirtualMemoryArena::reserve(uint64_t hint_addr,
                                      uint64_t size,
                                      PageProtect allocation_protect) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return reserve_locked(hint_addr, size, allocation_protect);
+    const uint64_t base = reserve_locked(hint_addr, size, allocation_protect);
+    notify(*this, ArenaEvent::Reserve, base != 0 ? base : hint_addr, size, allocation_protect, base != 0);
+    return base;
 }
 
 bool VirtualMemoryArena::commit(uint64_t addr, uint64_t size, PageProtect protect) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return commit_locked(addr, size, protect);
+    const bool ok = commit_locked(addr, size, protect);
+    notify(*this, ArenaEvent::Commit, addr, size, protect, ok);
+    return ok;
 }
 
 bool VirtualMemoryArena::decommit(uint64_t addr, uint64_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return decommit_locked(addr, size);
+    const bool ok = decommit_locked(addr, size);
+    notify(*this, ArenaEvent::Decommit, addr, size, PageProtect::NoAccess, ok);
+    return ok;
 }
 
 bool VirtualMemoryArena::protect(uint64_t addr,
@@ -454,7 +478,9 @@ bool VirtualMemoryArena::protect(uint64_t addr,
 
 bool VirtualMemoryArena::release(uint64_t base_addr) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return release_locked(base_addr);
+    const bool ok = release_locked(base_addr);
+    notify(*this, ArenaEvent::Release, base_addr, 0, PageProtect::NoAccess, ok);
+    return ok;
 }
 
 uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
@@ -476,13 +502,17 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
 
     if (do_reserve) {
         const uint64_t base = reserve_locked(addr, size, protect);
+        notify(*this, ArenaEvent::Reserve, base != 0 ? base : addr, size, protect, base != 0);
         if (base == 0) {
             return 0;
         }
         if (do_commit) {
             const Reservation* res = find_reservation_locked(base);
-            if (!res || !commit_locked(base, res->size, protect)) {
+            const bool ok = res != nullptr && commit_locked(base, res->size, protect);
+            notify(*this, ArenaEvent::Commit, base, size, protect, ok);
+            if (!ok) {
                 release_locked(base);
+                notify(*this, ArenaEvent::Release, base, 0, PageProtect::NoAccess, true);
                 return 0;
             }
         }
@@ -490,7 +520,9 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
     }
 
     // Commit only on an existing reservation.
-    if (!commit_locked(addr, size, protect)) {
+    const bool ok = commit_locked(addr, size, protect);
+    notify(*this, ArenaEvent::Commit, addr, size, protect, ok);
+    if (!ok) {
         return 0;
     }
     return align_down(addr, kPageSize);
@@ -502,10 +534,14 @@ bool VirtualMemoryArena::virtual_free(uint64_t addr, uint64_t size, uint32_t fre
         if (size != 0) {
             return false;
         }
-        return release_locked(addr);
+        const bool ok = release_locked(addr);
+        notify(*this, ArenaEvent::Release, addr, 0, PageProtect::NoAccess, ok);
+        return ok;
     }
     if (free_type == kMemDecommit) {
-        return decommit_locked(addr, size);
+        const bool ok = decommit_locked(addr, size);
+        notify(*this, ArenaEvent::Decommit, addr, size, PageProtect::NoAccess, ok);
+        return ok;
     }
     return false;
 }

@@ -26,6 +26,8 @@
 //                        host calls, so deep guest recursion needs a deep host stack)
 //   --report <file>      JSON report path (default boot-report.json)
 //   --summary <file>     also write the text summary there (it always goes to stderr)
+//   --import-trace <file> write every import call (sequence, thread, DLL!symbol, rcx rdx r8 r9
+//                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
 //   --no-tls-callbacks / --no-entry / --quiet
 //
 // Exit code: the BootStatus (0 = the guest exited; its own exit code is in the report),
@@ -122,6 +124,8 @@ struct Options {
     uint64_t host_stack_mb = 4096;
     std::string report = "boot-report.json";
     std::string summary;
+    std::string import_trace;  // --import-trace: names + arguments of every import call
+    uint64_t import_trace_limit = 200000;
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -170,7 +174,7 @@ bool parse(int argc, char** argv, Options& o) {
             return false;
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
                    a == "--program-dir" ||
-                   a == "--cmdline" || a == "--report" || a == "--summary") {
+                   a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace") {
             if (!value(v)) {
                 return false;
             }
@@ -181,16 +185,18 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--cwd"      ? o.cwd
                                   : a == "--cmdline"  ? o.cmdline
                                   : a == "--report"   ? o.report
+                                  : a == "--import-trace" ? o.import_trace
                                                       : o.summary;
             target = v;
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
-                   a == "--host-stack-mb" || a == "--survey-return") {
+                   a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit") {
             if (!value(v)) {
                 return false;
             }
             uint64_t& target = a == "--max-calls"     ? o.max_calls
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
+                               : a == "--import-trace-limit" ? o.import_trace_limit
                                : a == "--survey-return" ? o.survey_return
                                : a == "--stack"       ? o.stack
                                                       : o.host_stack_mb;
@@ -366,6 +372,9 @@ void write_outputs(bool print_summary) {
     const std::string summary = guest::last_summary();
     write_text(g_options.report, report);
     write_text(g_options.summary, summary);
+    if (!g_options.import_trace.empty()) {
+        write_text(g_options.import_trace, guest::import_trace_text());
+    }
     if (print_summary) {
         std::fprintf(stderr, "%s", summary.c_str());
     }
@@ -557,6 +566,7 @@ void run_boot_thread() {
     cfg.call_entry = g_options.entry;
     cfg.log_progress = !g_options.quiet;
     cfg.capture_host_stack = &capture_host_stack;
+    cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
     cfg.host_function_start = host_function_start;
     const guest::BootResult result = guest::run_boot(cfg);
     if (!g_finishing.exchange(true)) {

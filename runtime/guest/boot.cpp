@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -130,6 +131,59 @@ struct SurveyEntry {
 struct RecentImport {
     uint64_t seq = 0;
     size_t import_index = 0;
+    uint64_t args[5] = {};  // rcx rdx r8 r9 [rsp+0x28] at the call
+    uint32_t thread = 0;    // guest thread id (TEB ClientId)
+};
+
+// First call of an API worth a timeline entry (see kTimelineApis).
+struct FirstCall {
+    std::string name;
+    uint64_t seq = 0;  // import call sequence number (0 for host callables)
+    uint64_t elapsed_ms = 0;
+    uint32_t thread = 0;
+};
+
+// One reserve / commit / decommit / release on the boot's arena.
+struct ArenaRecord {
+    uint64_t import_seq = 0;  // import call this happened under (0: runtime itself)
+    long import_index = -1;
+    os::ArenaEvent event = os::ArenaEvent::Reserve;
+    bool ok = false;
+    uint64_t va = 0;
+    uint64_t size = 0;
+    uint32_t protect = 0;
+};
+
+constexpr size_t kArenaLogLimit = 4096;
+
+// APIs whose first call is a timeline milestone, with the W40 milestone name where one exists.
+struct TimelineApi {
+    const char* name;
+    const char* milestone;  // W40 BOOT_MILESTONES name or nullptr
+};
+constexpr TimelineApi kTimelineApis[] = {
+    {"_initterm", "CRT_INITTERM"},
+    {"_initterm_e", "CRT_INITTERM"},
+    {"XMemVirtualAlloc", "XMEM_INIT"},
+    {"XMemAllocatePhysicalPages", nullptr},
+    {"XGameRuntimeInitialize", "GDK_INIT"},
+    {"QueryApiImpl", nullptr},
+    {"InitializeApiImpl", nullptr},
+    {"LoadLibraryA", nullptr},
+    {"LoadLibraryW", nullptr},
+    {"LoadLibraryExA", nullptr},
+    {"LoadLibraryExW", nullptr},
+    {"GetProcAddress", nullptr},
+    {"CreateThread", nullptr},
+    {"CreateFileA", nullptr},
+    {"CreateFileW", nullptr},
+    {"CreateFile2", nullptr},
+    {"DStorageGetFactory", nullptr},
+    {"GameInputCreate", nullptr},
+    {"WSAStartup", nullptr},
+    {"D3D12ConfigureVirtualMemoryX", nullptr},
+    {"D3D12XboxCreateDevice", "D3D12_CREATE_DEVICE"},
+    {"BinkOpen", "BINK_OPEN"},
 };
 
 struct Milestone {
@@ -188,6 +242,25 @@ struct BootState {
     uint64_t tls_callbacks_run = 0;
     bool entry_started = false;
     std::vector<Milestone> milestones;
+    std::vector<FirstCall> first_calls;  // guarded by `mutex`
+    std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
+    size_t trace_limit = 0;
+    bool trace_truncated = false;
+    std::unordered_map<const GuestThreadContext*, RecentImport> thread_last;  // guarded by `mutex`
+    // The live guest state of contexts whose state lives elsewhere (O16 lazy threads).
+    std::unordered_map<const GuestThreadContext*, const GuestState*> thread_states;
+
+    // Address-space log of the boot's arena (guarded by `arena_mutex`).
+    std::mutex arena_mutex;
+    std::vector<ArenaRecord> arena_log;
+    uint64_t arena_events = 0;
+    uint64_t arena_failures = 0;
+    std::unordered_map<uint64_t, uint64_t> live_reservations;  // base -> requested size
+    uint64_t reserved_now = 0;
+    uint64_t reserved_peak = 0;
+    uint64_t commit_requests = 0;  // bytes requested by successful commits (not net)
+    bool arena_observer_installed = false;
+    os::ArenaObserver previous_arena_observer = nullptr;
 
     // Outcome.
     std::string phase = "config";
@@ -215,6 +288,10 @@ BootState& boot() {
 
 thread_local GuestThreadContext* t_active = nullptr;
 thread_local bool t_running_boot = false;
+// Import call (index into BootState::imports, sequence number) running on this thread, for
+// attributing arena events to the API that caused them.
+thread_local long t_last_import = -1;
+thread_local uint64_t t_last_import_seq = 0;
 
 void logf(const char* fmt, ...) {
     if (!boot().log_progress) {
@@ -237,7 +314,10 @@ uint64_t elapsed_ms() {
 // Records a W40 boot milestone and logs it as `[boot] <NAME> <text>`.
 void milestone(const char* name, const char* fmt, ...) {
     BootState& b = boot();
-    b.milestones.push_back(Milestone{name, elapsed_ms()});
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        b.milestones.push_back(Milestone{name, elapsed_ms()});
+    }
     if (!b.log_progress) {
         return;
     }
@@ -461,15 +541,16 @@ bool ends_with_call(const uint8_t (&b)[8]) {
     return false;
 }
 
-void scan_backtrace(FaultRecord& record, uint64_t rsp) {
+void scan_backtrace(FaultRecord& record, uint64_t rsp, const GuestThreadContext* thread = nullptr) {
     BootState& b = boot();
     if (b.arena == nullptr || rsp == 0) {
         return;
     }
     uint64_t top = rsp + 0x10000;
-    if (t_active != nullptr && rsp >= t_active->thread.stack_limit &&
-        rsp < t_active->thread.stack_top) {
-        top = t_active->thread.stack_top;
+    const GuestThreadContext* owner = thread != nullptr ? thread : t_active;
+    if (owner != nullptr && rsp >= owner->thread.stack_limit &&
+        rsp < owner->thread.stack_top) {
+        top = owner->thread.stack_top;
     }
     const uint64_t bytes = std::min<uint64_t>(top - rsp, kMaxScanBytes) & ~uint64_t{7};
     std::vector<uint64_t> words(static_cast<size_t>(bytes / 8));
@@ -716,17 +797,74 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     if (is_synthetic_address(target)) {
         const long index = import_for_target(target);
         if (index >= 0) {
-            b.import_counts[static_cast<size_t>(index)].fetch_add(1, std::memory_order_relaxed);
+            const uint64_t previous =
+                b.import_counts[static_cast<size_t>(index)].fetch_add(1, std::memory_order_relaxed);
             const uint64_t seq = b.import_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (b.recent_capacity != 0) {
-                std::lock_guard<std::mutex> lock(b.mutex);
-                const RecentImport entry{seq, static_cast<size_t>(index)};
-                if (b.recent.size() < b.recent_capacity) {
-                    b.recent.push_back(entry);
-                } else {
-                    b.recent[b.recent_next] = entry;
+            t_last_import = index;
+            t_last_import_seq = seq;
+            RecentImport entry{seq, static_cast<size_t>(index)};
+            entry.args[0] = state->gpr[GuestReg::Rcx];
+            entry.args[1] = state->gpr[GuestReg::Rdx];
+            entry.args[2] = state->gpr[GuestReg::R8];
+            entry.args[3] = state->gpr[GuestReg::R9];
+            if (b.arena != nullptr) {
+                read_u64(*b.arena, state->gpr[GuestReg::Rsp] + 0x28, entry.args[4]);
+            }
+            entry.thread = t_active != nullptr ? t_active->thread_id : 0;
+            const BootImport& imp = b.imports[static_cast<size_t>(index)].import;
+            const char* first_call_milestone = nullptr;
+            bool first_call = false;
+            if (previous == 0 && imp.symbol != nullptr) {
+                for (const TimelineApi& api : kTimelineApis) {
+                    if (std::strcmp(api.name, imp.symbol) == 0) {
+                        first_call = true;
+                        first_call_milestone = api.milestone;
+                    }
                 }
-                b.recent_next = (b.recent_next + 1) % b.recent_capacity;
+            }
+            {
+                std::lock_guard<std::mutex> lock(b.mutex);
+                if (b.recent_capacity != 0) {
+                    if (b.recent.size() < b.recent_capacity) {
+                        b.recent.push_back(entry);
+                    } else {
+                        b.recent[b.recent_next] = entry;
+                    }
+                    b.recent_next = (b.recent_next + 1) % b.recent_capacity;
+                }
+                if (b.trace_limit != 0) {
+                    if (b.trace.size() < b.trace_limit) {
+                        b.trace.push_back(entry);
+                    } else {
+                        b.trace_truncated = true;
+                    }
+                }
+                if (t_active != nullptr) {
+                    b.thread_last[t_active] = entry;
+                }
+                if (first_call) {
+                    b.first_calls.push_back(FirstCall{imp.symbol, seq, elapsed_ms(), entry.thread});
+                }
+            }
+            if (first_call_milestone != nullptr) {
+                milestone(first_call_milestone, "first %s (import call #%" PRIu64 ")", imp.symbol, seq);
+            }
+        } else {
+            // Host callables handed out by GetProcAddress / providers (QueryApiImpl, ...).
+            SyntheticTarget info;
+            if (describe_synthetic(target, &info) && !info.is_import && info.name != nullptr) {
+                for (const TimelineApi& api : kTimelineApis) {
+                    if (std::strcmp(api.name, info.name) != 0) {
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> lock(b.mutex);
+                    const bool seen = std::any_of(b.first_calls.begin(), b.first_calls.end(),
+                                                  [&](const FirstCall& f) { return f.name == info.name; });
+                    if (!seen) {
+                        b.first_calls.push_back(FirstCall{info.name, 0, elapsed_ms(),
+                                                          t_active != nullptr ? t_active->thread_id : 0});
+                    }
+                }
             }
         }
     }
@@ -738,6 +876,51 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     }
     if (b.max_wall_ms != 0 && (n & kWallCheckMask) == 0 && elapsed_ms() > b.max_wall_ms) {
         stop_on_limit(state, "wall_time_limit", target);
+    }
+}
+
+// Address-space log: what the guest (through shims) reserves and commits, in order, attributed to
+// the import call running on the requesting thread. Runs under the arena's lock (no arena calls).
+void boot_arena_observer(const os::VirtualMemoryArena& arena,
+                         os::ArenaEvent event,
+                         uint64_t va,
+                         uint64_t size,
+                         os::PageProtect protect,
+                         bool ok) {
+    BootState& b = boot();
+    if (&arena != b.arena) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(b.arena_mutex);
+    ++b.arena_events;
+    if (!ok) {
+        ++b.arena_failures;
+    }
+    if (ok) {
+        switch (event) {
+            case os::ArenaEvent::Reserve:
+                b.live_reservations[va] = size;
+                b.reserved_now += size;
+                b.reserved_peak = std::max(b.reserved_peak, b.reserved_now);
+                break;
+            case os::ArenaEvent::Release: {
+                auto it = b.live_reservations.find(va);
+                if (it != b.live_reservations.end()) {
+                    b.reserved_now -= it->second;
+                    b.live_reservations.erase(it);
+                }
+                break;
+            }
+            case os::ArenaEvent::Commit:
+                b.commit_requests += size;
+                break;
+            case os::ArenaEvent::Decommit:
+                break;
+        }
+    }
+    if (b.arena_log.size() < kArenaLogLimit) {
+        b.arena_log.push_back(ArenaRecord{t_last_import_seq, t_last_import, event, ok, va, size,
+                                          static_cast<uint32_t>(protect)});
     }
 }
 
@@ -1129,6 +1312,7 @@ void boot_thread_init_hook(GuestThread& thread) {
     {
         std::lock_guard<std::mutex> lock(b.mutex);
         b.threads.push_back(std::move(ctx));
+        b.thread_states[raw] = &thread.state;
     }
     activate_guest_thread(raw);
     for (const size_t mi : callback_order()) {
@@ -1341,7 +1525,10 @@ std::string build_report() {
         for (size_t k = 0; k < ordered.size(); ++k) {
             o += (k == 0 ? "\n    " : ",\n    ");
             o += "{\"seq\": " + std::to_string(ordered[k].seq) + ", " +
-                 import_name_json(b.imports[ordered[k].import_index].import) + "}";
+                 import_name_json(b.imports[ordered[k].import_index].import) + ", \"thread\": " +
+                 std::to_string(ordered[k].thread) + ", \"args\": [" + hex(ordered[k].args[0]) + ", " +
+                 hex(ordered[k].args[1]) + ", " + hex(ordered[k].args[2]) + ", " + hex(ordered[k].args[3]) +
+                 ", " + hex(ordered[k].args[4]) + "]}";
         }
         o += ordered.empty() ? "]},\n" : "\n  ]},\n";
 
@@ -1355,6 +1542,71 @@ std::string build_report() {
                  ", \"count\": " + std::to_string(e.count) + "}";
         }
         o += b.survey_called.empty() ? "]},\n" : "\n  ]},\n";
+    }
+
+    // Timeline of first calls, threads, address space.
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        o += "  \"first_calls\": [";
+        for (size_t k = 0; k < b.first_calls.size(); ++k) {
+            const FirstCall& f = b.first_calls[k];
+            o += (k == 0 ? "" : ", ") + std::string("{\"name\": ") + json_string(f.name) +
+                 ", \"import_seq\": " + std::to_string(f.seq) + ", \"elapsed_ms\": " +
+                 std::to_string(f.elapsed_ms) + ", \"thread\": " + std::to_string(f.thread) + "}";
+        }
+        o += "],\n  \"threads\": [";
+        for (size_t k = 0; k < b.threads.size(); ++k) {
+            const GuestThreadContext* t = b.threads[k].get();
+            const auto live = b.thread_states.find(t);
+            const GuestState& s = live != b.thread_states.end() ? *live->second : t->thread.state;
+            o += (k == 0 ? "\n    " : ",\n    ");
+            o += "{\"thread_id\": " + std::to_string(t->thread_id) + ", \"teb\": " + hex(t->teb) +
+                 ", \"stack_base\": " + hex(t->thread.stack_top) + ", \"stack_limit\": " +
+                 hex(t->thread.stack_limit) + ", \"rsp\": " + hex(s.gpr[GuestReg::Rsp]) + ", \"rip\": " +
+                 hex(s.rip) + ", \"last_import\": ";
+            const auto last = b.thread_last.find(t);
+            if (last != b.thread_last.end()) {
+                o += "{\"seq\": " + std::to_string(last->second.seq) + ", " +
+                     import_name_json(b.imports[last->second.import_index].import) + "}";
+            } else {
+                o += "null";
+            }
+            FaultRecord scan;
+            scan_backtrace(scan, s.gpr[GuestReg::Rsp], t);
+            o += ", \"stack_scan\": [";
+            for (size_t i = 0; i < scan.frames.size() && i < 8; ++i) {
+                o += (i == 0 ? "" : ", ") + hex(scan.frames[i].return_address);
+            }
+            o += "]}";
+        }
+        o += b.threads.empty() ? "],\n" : "\n  ],\n";
+    }
+    {
+        // Arena totals first: the arena observer takes arena_mutex under the arena's lock.
+        const uint64_t arena_reserved = b.arena != nullptr ? b.arena->reserved_bytes() : 0;
+        const uint64_t arena_committed = b.arena != nullptr ? b.arena->committed_bytes() : 0;
+        std::lock_guard<std::mutex> lock(b.arena_mutex);
+        static const char* const kEventNames[] = {"reserve", "commit", "decommit", "release"};
+        o += "  \"address_space\": {\"events\": " + std::to_string(b.arena_events) + ", \"failures\": " +
+             std::to_string(b.arena_failures) + ", \"reserved_now\": " + hex(b.reserved_now) +
+             ", \"reserved_peak\": " + hex(b.reserved_peak) + ", \"commit_requests\": " +
+             hex(b.commit_requests) + ", \"arena_reserved\": " +
+             hex(arena_reserved) + ", \"arena_committed\": " +
+             hex(arena_committed) + ", \"log_truncated\": " +
+             (b.arena_events > b.arena_log.size() ? "true" : "false") + ", \"log\": [";
+        for (size_t k = 0; k < b.arena_log.size(); ++k) {
+            const ArenaRecord& r = b.arena_log[k];
+            o += (k == 0 ? "\n    " : ",\n    ");
+            o += "{\"event\": " + json_string(kEventNames[static_cast<int>(r.event)]) + ", \"ok\": " +
+                 (r.ok ? "true" : "false") + ", \"va\": " + hex(r.va) + ", \"size\": " + hex(r.size) +
+                 ", \"protect\": " + hex(r.protect) + ", \"import_seq\": " + std::to_string(r.import_seq) +
+                 ", \"import\": " +
+                 (r.import_index >= 0 && static_cast<size_t>(r.import_index) < b.imports.size()
+                      ? json_string(import_label(b.imports[static_cast<size_t>(r.import_index)].import))
+                      : std::string("null")) +
+                 "}";
+        }
+        o += b.arena_log.empty() ? "]},\n" : "\n  ]},\n";
     }
 
     // Startup summary.
@@ -1531,6 +1783,24 @@ std::string build_summary() {
                 s += line;
             }
         }
+        if (!b.first_calls.empty()) {
+            s += "  first calls:";
+            for (const FirstCall& f : b.first_calls) {
+                std::snprintf(line, sizeof(line), " %s@#%" PRIu64, f.name.c_str(), f.seq);
+                s += line;
+            }
+            s += "\n";
+        }
+        std::snprintf(line, sizeof(line), "  guest threads: %zu\n", b.threads.size());
+        s += line;
+    }
+    {
+        std::lock_guard<std::mutex> lock(b.arena_mutex);
+        std::snprintf(line, sizeof(line),
+                      "  address space: %" PRIu64 " events (%" PRIu64 " failed), reserved now 0x%" PRIx64
+                      " peak 0x%" PRIx64 ", commit requests 0x%" PRIx64 "\n",
+                      b.arena_events, b.arena_failures, b.reserved_now, b.reserved_peak, b.commit_requests);
+        s += line;
     }
     return s;
 }
@@ -1840,9 +2110,32 @@ std::string last_summary() {
     return boot().last_summary;
 }
 
+std::string import_trace_text() {
+    BootState& b = boot();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    std::string out;
+    out.reserve(b.trace.size() * 96);
+    char line[512];
+    for (const RecentImport& r : b.trace) {
+        std::snprintf(line, sizeof(line),
+                      "%" PRIu64 " %u %s %" PRIx64 " %" PRIx64 " %" PRIx64 " %" PRIx64 " %" PRIx64 "\n",
+                      r.seq, r.thread, import_label(b.imports[r.import_index].import).c_str(), r.args[0],
+                      r.args[1], r.args[2], r.args[3], r.args[4]);
+        out += line;
+    }
+    if (b.trace_truncated) {
+        out += "# truncated at the trace limit\n";
+    }
+    return out;
+}
+
 void reset_boot() {
     BootState& b = boot();
     remove_hooks();
+    if (b.arena_observer_installed) {
+        os::set_arena_observer(b.previous_arena_observer);
+        b.arena_observer_installed = false;
+    }
     if (b.thread_hook_installed) {
         com::set_guest_thread_init_hook(nullptr);
         b.thread_hook_installed = false;
@@ -1898,6 +2191,24 @@ void reset_boot() {
     b.tls_callbacks_run = 0;
     b.entry_started = false;
     b.milestones.clear();
+    b.first_calls.clear();
+    b.trace.clear();
+    b.trace_limit = 0;
+    b.trace_truncated = false;
+    b.thread_last.clear();
+    b.thread_states.clear();
+    t_last_import = -1;
+    t_last_import_seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(b.arena_mutex);
+        b.arena_log.clear();
+        b.arena_events = 0;
+        b.arena_failures = 0;
+        b.live_reservations.clear();
+        b.reserved_now = 0;
+        b.reserved_peak = 0;
+        b.commit_requests = 0;
+    }
     b.phase = "config";
     b.status = BootStatus::BadConfig;
     b.exit_code = 0;
@@ -1918,6 +2229,9 @@ BootResult run_boot(const BootConfig& config) {
     b.recent_capacity = config.recent_import_count;
     b.max_frames = config.max_backtrace_frames;
     b.capture_host_stack = config.capture_host_stack;
+    b.trace_limit = config.import_trace_limit;
+    b.previous_arena_observer = os::set_arena_observer(&boot_arena_observer);
+    b.arena_observer_installed = true;
     b.host_function_start = config.host_function_start;
     b.arena = config.arena != nullptr ? config.arena : os::win32::get_vmem_arena();
     // One arena everywhere: O16 bridge objects and lazily created guest threads live in it too.

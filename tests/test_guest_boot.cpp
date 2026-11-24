@@ -941,6 +941,39 @@ void test_last_error_shared_with_teb() {
     CHECK(run.result.stats.exit_code == 0);
 }
 
+// Observability: import arguments, the import trace, threads and the address-space log.
+void test_observability() {
+    const Run run = boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.import_trace_limit = 16; });
+    CHECK(run.result.status == BootStatus::Exited);
+    const Json& recent = run.report["counters"]["recent"];
+    CHECK(recent.items.size() == 2);
+    CHECK(recent[0]["symbol"].text == "SetLastError");
+    CHECK(recent[0]["args"][0].hex() == 1234);  // rcx at the call
+    CHECK(recent[0]["thread"].number == os::win32::GetCurrentThreadId());
+    const std::string trace = import_trace_text();
+    CHECK(trace.find("1 ") == 0);
+    CHECK(trace.find("KERNEL32.dll!SetLastError 4d2 ") != std::string::npos);
+    CHECK(trace.find("KERNEL32.dll!GetLastError") != std::string::npos);
+    const Json& threads = run.report["threads"];
+    CHECK(threads.items.size() == 1);
+    CHECK(threads[0]["teb"].hex() == run.report["startup"]["main_thread"]["teb"].hex());
+    CHECK(threads[0]["last_import"]["symbol"].text == "GetLastError");
+    // Loading the image, the process block, the stack and the TEB all go through the arena.
+    const Json& space = run.report["address_space"];
+    CHECK(space["events"].number >= 4);
+    CHECK(space["failures"].number == 0);
+    CHECK(space["reserved_peak"].hex() >= kSizeOfImage);
+    bool image_reserve = false;
+    for (const Json& e : space["log"].items) {
+        if (e["event"].text == "reserve" && e["va"].hex() == kBase && e["ok"].boolean) {
+            image_reserve = true;
+            CHECK(e["import"].type == Json::Null);  // the runtime's own request, no import
+        }
+    }
+    CHECK(image_reserve);
+    CHECK(run.report["first_calls"].type == Json::Array);
+}
+
 void test_second_thread() {
     Run run = boot_scenario(Scenario::ReturnCode);
     CHECK(run.result.status == BootStatus::Exited);
@@ -1144,6 +1177,7 @@ int main() {
     test_fault_reports();
     test_survey_mode();
     test_last_error_shared_with_teb();
+    test_observability();
     test_second_thread();
     test_no_tls_and_load_failure();
     test_two_modules();

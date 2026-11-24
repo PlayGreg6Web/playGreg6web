@@ -310,4 +310,16 @@ private:
 // sets __playgta6_guest_base = arena.guest_base(). Must not run while guest code runs.
 void publish_guest_address_space(const VirtualMemoryArena& arena);
 
+// Optional diagnostics observer of reserve / commit / decommit / release requests on any arena
+// (successful or not), e.g. the boot report's address-space log. It runs under the arena's lock:
+// it must not call back into the arena. nullptr removes it. Returns the previous observer.
+enum class ArenaEvent : uint8_t { Reserve, Commit, Decommit, Release };
+using ArenaObserver = void (*)(const VirtualMemoryArena& arena,
+                               ArenaEvent event,
+                               uint64_t va,     // result for a successful reserve, else the request
+                               uint64_t size,   // requested bytes (0 for release)
+                               PageProtect protect,
+                               bool ok);
+ArenaObserver set_arena_observer(ArenaObserver observer);
+
 }  // namespace playgta6::os
