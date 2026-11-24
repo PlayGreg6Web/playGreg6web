@@ -11,10 +11,17 @@
 #include <string>
 #include <vector>
 
+#include "os/guest_heap.h"
 #include "os/ucrt_bridge.h"
 #include "os/win32_loader.h"
 
 namespace {
+
+bool default_guest_heap_owns_host(const void* host) {
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    return heap.to_guest(host) != 0 && heap.arena().query(heap.to_guest(host)).state ==
+                                           playgta6::os::MemState::Commit;
+}
 
 int g_failures = 0;
 
@@ -239,8 +246,20 @@ void test_runtime_lifecycle() {
 
     // argc/argv/command line.
     CHECK(*pg6_crt_p___argc() == 1);
-    CHECK((*pg6_crt_p___argv())[0] != nullptr);
+    {
+        // argv is an array of guest VAs in guest memory.
+        playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+        char** argv_va = *pg6_crt_p___argv();
+        CHECK(argv_va != nullptr);
+        const auto* argv_host = reinterpret_cast<const uint64_t*>(
+            heap.to_host(reinterpret_cast<uintptr_t>(argv_va)));
+        CHECK(argv_host != nullptr && argv_host[0] != 0 && argv_host[1] == 0);
+        CHECK(heap.owns(argv_host[0]));
+        CHECK(std::strcmp(reinterpret_cast<const char*>(heap.to_host(argv_host[0])),
+                          "game_scarlett_master.exe") == 0);
+    }
     CHECK(pg6_crt_get_narrow_winmain_command_line() != nullptr);
+    CHECK(default_guest_heap_owns_host(pg6_crt_get_narrow_winmain_command_line()));
     CHECK(pg6_crt_configure_narrow_argv(1) == 0);
     CHECK(pg6_crt_initialize_narrow_environment() == 0);
 
@@ -280,6 +299,7 @@ void test_runtime_lifecycle() {
 void test_heap_convert_locale() {
     void* p = pg6_crt_malloc(64);
     CHECK(p != nullptr);
+    CHECK(default_guest_heap_owns_host(p));  // the CRT heap lives in the guest address space
     pg6_crt_memset(p, 0x5A, 64);
     p = pg6_crt_realloc(p, 128);
     CHECK(p != nullptr);
@@ -424,12 +444,21 @@ void test_strings_and_memory() {
     CHECK(*pg6_crt_strrchr("abca", 'a') == 'a');
 
     // VCRUNTIME C++ exception & type_info helpers.
-    Pg6CrtStdExceptionData ex_src{"boom", 1};
+    // `what` holds guest VAs (the struct lives in guest memory), so the source string is a guest
+    // heap block and the copy is checked through the guest translation.
+    playgta6::os::GuestHeap& gheap = playgta6::os::default_guest_heap();
+    char* boom = playgta6::os::guest_crt::strdup("boom");
+    CHECK(boom != nullptr);
+    Pg6CrtStdExceptionData ex_src{
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(gheap.to_guest(boom))), 1};
     Pg6CrtStdExceptionData ex_dst{nullptr, 0};
     pg6_crt_std_exception_copy(&ex_src, &ex_dst);
     CHECK(ex_dst.do_free == 1 && ex_dst.what != nullptr && ex_dst.what != ex_src.what);
-    CHECK(std::strcmp(ex_dst.what, "boom") == 0);
+    CHECK(std::strcmp(reinterpret_cast<const char*>(
+                          gheap.to_host(reinterpret_cast<uintptr_t>(ex_dst.what))),
+                      "boom") == 0);
     pg6_crt_std_exception_destroy(&ex_dst);
+    playgta6::os::guest_crt::free(boom);
     CHECK(ex_dst.what == nullptr && ex_dst.do_free == 0);
 
     struct FakeTypeInfo {

@@ -23,6 +23,7 @@ add_library(playgta6_core STATIC
     os/xbox_scarlett.cpp
     os/xbox_middleware.cpp
     os/win32_loader.cpp
+    os/guest_heap.cpp
     os/ucrt_bridge.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
@@ -144,6 +145,10 @@ else()
     add_executable(test_ucrt_bridge ../tests/test_ucrt_bridge.cpp)
     target_link_libraries(test_ucrt_bridge PRIVATE playgta6_core)
     add_test(NAME playgta6_ucrt_bridge_tests COMMAND test_ucrt_bridge)
+
+    add_executable(test_guest_heap ../tests/test_guest_heap.cpp)
+    target_link_libraries(test_guest_heap PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_heap_tests COMMAND test_guest_heap)
 
     add_executable(test_vmem_contiguous ../tests/test_vmem_contiguous.cpp)
     target_link_libraries(test_vmem_contiguous PRIVATE playgta6_core)

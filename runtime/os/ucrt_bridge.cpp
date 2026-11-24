@@ -25,6 +25,7 @@
 
 #include <sys/stat.h>
 
+#include "os/guest_heap.h"
 #include "os/win32_loader.h"
 
 namespace {
@@ -55,10 +56,36 @@ std::atomic<int32_t> g_last_exit_code{0};
 
 int32_t g_commode = 0;
 int32_t g_argc = 1;
-char g_prog_name[] = "game_scarlett_master.exe";
-char* g_argv_storage[2] = {g_prog_name, nullptr};
-char** g_argv = g_argv_storage;
-char g_cmdline[] = "";
+const char kProgName[] = "game_scarlett_master.exe";
+
+// argv and the command line live in guest memory (guest heap, O24). g_argv holds the guest VA of
+// the argv array (an array of guest VAs); g_cmdline_va the guest VA of the command line string.
+// __p___argv returns the address of g_argv itself, which the import bridge round-trips.
+std::mutex g_guest_state_mutex;
+playgta6::os::GuestHeap* g_guest_state_heap = nullptr;
+char** g_argv = nullptr;
+uint64_t g_cmdline_va = 0;
+
+void ensure_guest_crt_state() {
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    std::lock_guard<std::mutex> lock(g_guest_state_mutex);
+    if (g_guest_state_heap == &heap) {
+        return;
+    }
+    g_guest_state_heap = &heap;
+    using playgta6::os::HeapFamily;
+    const uint64_t name_va = heap.alloc(sizeof(kProgName), 16, HeapFamily::Crt);
+    const uint64_t argv_va = heap.alloc(2 * sizeof(uint64_t), 16, HeapFamily::Crt);
+    g_cmdline_va = heap.alloc(1, 16, HeapFamily::Crt, playgta6::os::kHeapZeroMemory);
+    if (name_va == 0 || argv_va == 0 || g_cmdline_va == 0) {
+        g_argv = nullptr;
+        return;
+    }
+    std::memcpy(heap.to_host(name_va), kProgName, sizeof(kProgName));
+    const uint64_t table[2] = {name_va, 0};
+    std::memcpy(heap.to_host(argv_va), table, sizeof(table));
+    g_argv = reinterpret_cast<char**>(static_cast<uintptr_t>(argv_va));
+}
 
 // Static "C" locale struct matching Win64 UCRT `struct lconv`.
 char g_lconv_dot[] = ".";
@@ -1048,36 +1075,21 @@ int32_t pg6_crt_set_new_mode(int32_t new_mode) {
     return g_new_mode.exchange(new_mode, std::memory_order_acq_rel);
 }
 
+// The malloc family lives in the guest address space (os/guest_heap.h).
 void* pg6_crt_calloc(size_t count, size_t size) {
-    void* p = std::calloc(count == 0 ? 1 : count, size == 0 ? 1 : size);
-    if (p == nullptr) {
-        g_crt_errno = ENOMEM;
-    }
-    return p;
+    return playgta6::os::guest_crt::calloc(count, size, &g_crt_errno);
 }
 
 void pg6_crt_free(void* ptr) {
-    std::free(ptr);
+    playgta6::os::guest_crt::free(ptr);
 }
 
 void* pg6_crt_malloc(size_t size) {
-    void* p = std::malloc(size == 0 ? 1 : size);
-    if (p == nullptr) {
-        g_crt_errno = ENOMEM;
-    }
-    return p;
+    return playgta6::os::guest_crt::malloc(size, &g_crt_errno);
 }
 
 void* pg6_crt_realloc(void* ptr, size_t size) {
-    if (ptr != nullptr && size == 0) {
-        std::free(ptr);
-        return nullptr;
-    }
-    void* p = std::realloc(ptr, size == 0 ? 1 : size);
-    if (p == nullptr && size != 0) {
-        g_crt_errno = ENOMEM;
-    }
-    return p;
+    return playgta6::os::guest_crt::realloc(ptr, size, &g_crt_errno);
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1213,7 @@ int32_t* pg6_crt_p___argc(void) {
 }
 
 char*** pg6_crt_p___argv(void) {
+    ensure_guest_crt_state();
     return &g_argv;
 }
 
@@ -1246,7 +1259,8 @@ int32_t pg6_crt_get_errno(int32_t* value) {
 }
 
 char* pg6_crt_get_narrow_winmain_command_line(void) {
-    return g_cmdline;
+    ensure_guest_crt_state();
+    return reinterpret_cast<char*>(playgta6::os::default_guest_heap().to_host(g_cmdline_va));
 }
 
 int32_t pg6_crt_initialize_narrow_environment(void) {
@@ -1262,7 +1276,7 @@ int32_t pg6_crt_initialize_onexit_table(Pg6CrtOnexitTable* table) {
         return 0;
     }
     constexpr size_t kInitialCap = 32;
-    auto* buf = static_cast<Pg6CrtOnexitFn*>(std::calloc(kInitialCap, sizeof(Pg6CrtOnexitFn)));
+    auto* buf = static_cast<Pg6CrtOnexitFn*>(playgta6::os::guest_crt::calloc(kInitialCap, sizeof(Pg6CrtOnexitFn)));
     if (buf == nullptr) {
         return -1;
     }
@@ -1333,7 +1347,7 @@ int32_t pg6_crt_register_onexit_function(Pg6CrtOnexitTable* table, Pg6CrtOnexitF
         const size_t old_cap = static_cast<size_t>(table->end - table->first);
         const size_t new_cap = old_cap == 0 ? 32 : old_cap * 2;
         auto* grown = static_cast<Pg6CrtOnexitFn*>(
-            std::realloc(table->first, new_cap * sizeof(Pg6CrtOnexitFn)));
+            playgta6::os::guest_crt::realloc(table->first, new_cap * sizeof(Pg6CrtOnexitFn)));
         if (grown == nullptr) {
             return -1;
         }
@@ -1364,7 +1378,7 @@ int32_t pg6_crt_execute_onexit_table(Pg6CrtOnexitTable* table) {
             fn();
         }
     }
-    std::free(first);
+    playgta6::os::guest_crt::free(first);
     return 0;
 }
 
@@ -2401,11 +2415,15 @@ void pg6_crt_std_exception_copy(const Pg6CrtStdExceptionData* from, Pg6CrtStdExc
         to->do_free = 0;
         return;
     }
-    const size_t len = std::strlen(from->what) + 1;
-    char* copy = static_cast<char*>(std::malloc(len));
+    // `what` is a guest VA (the struct lives in guest memory); the copy is a guest heap block.
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    const char* from_host =
+        reinterpret_cast<const char*>(heap.to_host(reinterpret_cast<uintptr_t>(from->what)));
+    const size_t len = std::strlen(from_host) + 1;
+    char* copy = static_cast<char*>(playgta6::os::guest_crt::malloc(len, &g_crt_errno));
     if (copy != nullptr) {
-        std::memcpy(copy, from->what, len);
-        to->what = copy;
+        std::memcpy(copy, from_host, len);
+        to->what = reinterpret_cast<const char*>(static_cast<uintptr_t>(heap.to_guest(copy)));
         to->do_free = 1;
     } else {
         to->what = nullptr;
@@ -2418,7 +2436,8 @@ void pg6_crt_std_exception_destroy(Pg6CrtStdExceptionData* data) {
         return;
     }
     if (data->do_free != 0 && data->what != nullptr) {
-        std::free(const_cast<char*>(data->what));
+        playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+        heap.free(reinterpret_cast<uintptr_t>(data->what));
     }
     data->what = nullptr;
     data->do_free = 0;

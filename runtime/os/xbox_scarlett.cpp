@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "os/guest_heap.h"
 #include "os/httpfs_mailbox.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -41,18 +43,53 @@ uint64_t steady_microseconds() {
         std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
-void* aligned_alloc_bytes(size_t size, size_t alignment) {
-    const size_t effective_align = std::max(alignment, kMinAlignment);
-    const size_t alloc_size = size == 0 ? effective_align : size;
-    return ::operator new(alloc_size, std::align_val_t{effective_align}, std::nothrow);
+// All XMem memory comes from the guest address space (os/guest_heap.h, os/vmem.h): heap blocks and
+// physical-page backing from the guest heap (HeapFamily::XMem), XMemVirtualAlloc regions straight
+// from the arena. The shims below hand out host pointers (the import bridge translates top-level
+// results to guest VAs) and convert back with guest_of() when looking blocks up.
+VirtualMemoryArena& xmem_arena() {
+    return *win32::get_vmem_arena();
+}
+
+uint64_t guest_of(const void* host) {
+    return host == nullptr ? 0 : xmem_arena().guest_address(host);
+}
+
+void* host_of(uint64_t va) {
+    return va == 0 ? nullptr : xmem_arena().translate(va);
+}
+
+void* aligned_alloc_bytes(size_t size, size_t alignment, bool zero = false) {
+    GuestHeap& heap = default_guest_heap();
+    const uint64_t va = heap.alloc(size,
+                                   std::max(alignment, kMinAlignment),
+                                   HeapFamily::XMem,
+                                   zero ? kHeapZeroMemory : 0u);
+    return heap.to_host(va);
 }
 
 void aligned_free_bytes(void* ptr, size_t alignment) {
+    (void)alignment;
     if (ptr == nullptr) {
         return;
     }
-    const size_t effective_align = std::max(alignment, kMinAlignment);
-    ::operator delete(ptr, std::align_val_t{effective_align});
+    GuestHeap& heap = default_guest_heap();
+    heap.free(heap.to_guest(ptr));
+}
+
+// Win32 PAGE_* value -> arena protection; console modifier bits (PAGE_GUARD, NOCACHE,
+// WRITECOMBINE, GPU hints) in bits 8 and up are accepted and ignored.
+bool xmem_protect(uint32_t protect, PageProtect& out) {
+    switch (protect & 0xFFu) {
+        case win32::PAGE_NOACCESS: out = PageProtect::NoAccess; return true;
+        case win32::PAGE_READONLY: out = PageProtect::ReadOnly; return true;
+        case win32::PAGE_READWRITE:
+        case 0x08u: out = PageProtect::ReadWrite; return true;  // PAGE_WRITECOPY
+        case win32::PAGE_EXECUTE_READ: out = PageProtect::ExecuteRead; return true;
+        case win32::PAGE_EXECUTE_READWRITE:
+        case 0x80u: out = PageProtect::ExecuteReadWrite; return true;  // PAGE_EXECUTE_WRITECOPY
+        default: return false;
+    }
 }
 
 size_t decode_xmem_alignment(uint64_t attributes) {
@@ -100,7 +137,9 @@ struct PhysicalPage {
     uint64_t page_size = kXMemPageSize64K;
     uint32_t protect = win32::PAGE_READWRITE;
     uint32_t flags = 0;
-    std::vector<uint8_t> data;
+    // Guest heap block holding the page contents while the page is not mapped; 0 means "all
+    // zero, or currently inside a mapping" (see the physical page model below).
+    uint64_t store_va = 0;
 };
 
 struct VirtualRegion {
@@ -164,24 +203,57 @@ struct XMemState {
         return &it->second;
     }
 
-    ~XMemState() {
-        for (auto& [ptr, rec] : heap_allocs) {
-            aligned_free_bytes(ptr, rec.alignment);
-        }
-        for (auto& [ptr, mapping] : mappings) {
-            if (mapping.owns_buffer) {
-                aligned_free_bytes(ptr, mapping.alignment);
-            }
-        }
-        for (auto& [ptr, region] : virtual_regions) {
-            aligned_free_bytes(ptr, region.alignment);
-        }
-    }
+    // Guest memory belongs to the arena; nothing to give back at process exit (the arena may
+    // already be gone during static destruction).
 };
 
 XMemState& xmem_state() {
     static XMemState state;
     return state;
+}
+
+// Physical page model
+// -------------------
+// XMemAllocatePhysicalPages returns opaque page frame numbers for runtime-tracked pages; the
+// pages own no memory until they hold data. Mapping a page set (XMemMapPhysicalPages[Scatter])
+// materialises the pages in the guest address space - in a fresh guest heap block, or committed
+// inside an XMemVirtualAlloc region - by MOVING each page's stored contents there (the store is
+// freed). Unmapping, freeing the region, or xmem_reset_for_testing() moves the bytes back into a
+// new store (all-zero pages need no store). A page's bytes therefore exist exactly once in guest
+// memory and persist across unmap / map cycles; mapping the same page at two addresses at once
+// is not coherent (the second mapping starts zeroed), as before.
+void save_page_contents(PhysicalPage& page, const uint8_t* bytes) {
+    GuestHeap& heap = default_guest_heap();
+    if (page.store_va != 0) {
+        heap.free(page.store_va);
+        page.store_va = 0;
+    }
+    const size_t n = static_cast<size_t>(page.page_size);
+    if (std::none_of(bytes, bytes + n, [](uint8_t b) { return b != 0; })) {
+        return;
+    }
+    const uint64_t va = heap.alloc(n, kPageSize, HeapFamily::XMem);
+    if (va == 0) {
+        std::fprintf(stderr, "[xmem] out of guest memory saving a physical page; contents lost\n");
+        return;
+    }
+    std::memcpy(heap.to_host(va), bytes, n);
+    page.store_va = va;
+}
+
+void sync_mapping_to_pages_locked(XMemState& st, const PhysicalMapping& m) {
+    const auto* src_bytes = static_cast<const uint8_t*>(m.base);
+    for (size_t i = 0; i < m.page_handles.size(); ++i) {
+        auto pit = st.physical_pages.find(m.page_handles[i]);
+        if (pit != st.physical_pages.end()) {
+            save_page_contents(*pit->second, src_bytes + m.virtual_offsets[i]);
+        }
+    }
+    st.mapped_physical_bytes -= m.page_handles.size() * m.page_size;
+}
+
+void release_virtual_region(const VirtualRegion& region) {
+    xmem_arena().release(guest_of(region.base));
 }
 
 void* map_physical_pages_impl(void* virtual_address,
@@ -249,22 +321,42 @@ void* map_physical_pages_impl(void* virtual_address,
         }
         target_base = region->base;
         owns_buffer = false;
+        // The mapping's protection applies to the mapped span (the region may have been
+        // reserved or committed no-access).
+        PageProtect pp = PageProtect::ReadWrite;
+        xmem_protect(protect, pp);
         if (!region->committed) {
+            if (!xmem_arena().commit(guest_of(region->base), region->size, pp)) {
+                win32::SetLastError(win32::ERROR_NOT_ENOUGH_MEMORY);
+                return nullptr;
+            }
             region->committed = true;
+            region->protect = protect;
             st.virtual_committed_bytes += region->size;
+        } else {
+            xmem_arena().protect(guest_of(region->base),
+                                 static_cast<size_t>(align_up_u64(span_bytes, kPageSize)), pp);
         }
     } else {
-        target_base = aligned_alloc_bytes(static_cast<size_t>(span_bytes), align);
+        target_base = aligned_alloc_bytes(static_cast<size_t>(span_bytes), align, true);
         if (target_base == nullptr) {
             win32::SetLastError(win32::ERROR_NOT_ENOUGH_MEMORY);
             return nullptr;
         }
-        std::memset(target_base, 0, static_cast<size_t>(span_bytes));
     }
 
+    // Move the pages' stored contents into the mapping (gaps and unwritten pages stay zero).
     auto* dst_bytes = static_cast<uint8_t*>(target_base);
     for (size_t i = 0; i < num_pages; ++i) {
-        std::memcpy(dst_bytes + offsets[i], pages[i]->data.data(), static_cast<size_t>(page_size));
+        if (pages[i]->store_va != 0) {
+            std::memcpy(dst_bytes + offsets[i],
+                        host_of(pages[i]->store_va),
+                        static_cast<size_t>(page_size));
+            default_guest_heap().free(pages[i]->store_va);
+            pages[i]->store_va = 0;
+        } else if (!owns_buffer) {
+            std::memset(dst_bytes + offsets[i], 0, static_cast<size_t>(page_size));
+        }
     }
 
     PhysicalMapping mapping;
@@ -1550,17 +1642,7 @@ bool xmem_virtual_free(void* address) {
     // Remove any physical mapping attached to this virtual reservation.
     auto mit = st.mappings.find(address);
     if (mit != st.mappings.end()) {
-        const auto& m = mit->second;
-        const auto* src_bytes = static_cast<const uint8_t*>(m.base);
-        for (size_t i = 0; i < m.page_handles.size(); ++i) {
-            auto pit = st.physical_pages.find(m.page_handles[i]);
-            if (pit != st.physical_pages.end()) {
-                std::memcpy(pit->second->data.data(),
-                            src_bytes + m.virtual_offsets[i],
-                            static_cast<size_t>(m.page_size));
-            }
-        }
-        st.mapped_physical_bytes -= m.page_handles.size() * m.page_size;
+        sync_mapping_to_pages_locked(st, mit->second);
         st.mappings.erase(mit);
     }
 
@@ -1568,7 +1650,7 @@ bool xmem_virtual_free(void* address) {
         st.virtual_committed_bytes -= it->second.size;
     }
     st.virtual_reserved_bytes -= it->second.size;
-    aligned_free_bytes(it->second.base, it->second.alignment);
+    release_virtual_region(it->second);
     st.virtual_regions.erase(it);
     return true;
 }
@@ -1584,16 +1666,7 @@ bool xmem_unmap_physical_pages(void* virtual_address) {
         return false;
     }
     const PhysicalMapping& m = it->second;
-    const auto* src_bytes = static_cast<const uint8_t*>(m.base);
-    for (size_t i = 0; i < m.page_handles.size(); ++i) {
-        auto pit = st.physical_pages.find(m.page_handles[i]);
-        if (pit != st.physical_pages.end()) {
-            std::memcpy(pit->second->data.data(),
-                        src_bytes + m.virtual_offsets[i],
-                        static_cast<size_t>(m.page_size));
-        }
-    }
-    st.mapped_physical_bytes -= m.page_handles.size() * m.page_size;
+    sync_mapping_to_pages_locked(st, m);
     if (m.owns_buffer) {
         aligned_free_bytes(m.base, m.alignment);
     }
@@ -1617,9 +1690,14 @@ void xmem_reset_for_testing() {
     }
     st.mappings.clear();
     for (auto& [ptr, region] : st.virtual_regions) {
-        aligned_free_bytes(ptr, region.alignment);
+        release_virtual_region(region);
     }
     st.virtual_regions.clear();
+    for (auto& [handle, page] : st.physical_pages) {
+        if (page->store_va != 0) {
+            default_guest_heap().free(page->store_va);
+        }
+    }
     st.physical_pages.clear();
     st.next_page_handle = 0x1000ULL;
     st.heap_allocated_bytes = 0;
@@ -1838,7 +1916,6 @@ int32_t pg6_xbox_XMemAllocatePhysicalPages(size_t* num_pages,
         page->page_size = page_size;
         page->protect = protect;
         page->flags = flags;
-        page->data.assign(static_cast<size_t>(page_size), 0u);
         created.push_back(std::move(page));
     }
 
@@ -1874,6 +1951,9 @@ int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_ar
         auto it = st.physical_pages.find(page_array[i]);
         if (it != st.physical_pages.end()) {
             st.physical_pages_bytes -= it->second->page_size;
+            if (it->second->store_va != 0) {
+                playgta6::os::default_guest_heap().free(it->second->store_va);
+            }
             st.physical_pages.erase(it);
         }
     }
@@ -1904,52 +1984,78 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
                                 uint32_t allocation_type,
                                 uint32_t protect) {
     using namespace playgta6::os::scarlett;
+    namespace os = playgta6::os;
     if (size == 0) {
-        playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+        os::win32::SetLastError(os::win32::ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    const bool want_reserve = (allocation_type & playgta6::os::kMemReserve) != 0;
-    const bool want_commit = (allocation_type & playgta6::os::kMemCommit) != 0;
-    if (!want_reserve && !want_commit) {
-        playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+    // Console-only flags (MEM_LARGE_PAGES, MEM_TOP_DOWN, MEM_WRITE_WATCH, ...) are accepted; only
+    // MEM_RESERVE / MEM_COMMIT select the operation, large pages are normal 64 KiB pages.
+    const bool want_reserve = (allocation_type & os::kMemReserve) != 0;
+    const bool want_commit = (allocation_type & os::kMemCommit) != 0;
+    os::PageProtect pp = os::PageProtect::NoAccess;
+    if ((!want_reserve && !want_commit) || !xmem_protect(protect, pp)) {
+        os::win32::SetLastError(os::win32::ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
     const uint64_t page_align =
-        (allocation_type & kXMemFlagLargePages) != 0 ? kXMemPageSize64K : playgta6::os::kPageSize;
-    const size_t aligned_size = static_cast<size_t>(align_up_u64(size, page_align));
+        (allocation_type & kXMemFlagLargePages) != 0 ? kXMemPageSize64K : os::kPageSize;
+    const uint64_t aligned_size = align_up_u64(size, page_align);
+    if (aligned_size < size) {
+        os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
 
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
+    os::VirtualMemoryArena& arena = xmem_arena();
 
-    // Committing an existing reservation in place.
+    // Committing an existing XMemVirtualAlloc reservation in place.
     if (address != nullptr && !want_reserve && want_commit) {
-        VirtualRegion* existing = st.find_virtual_region_locked(address, aligned_size);
-        if (existing == nullptr) {
-            playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+        VirtualRegion* existing =
+            st.find_virtual_region_locked(address, static_cast<size_t>(aligned_size));
+        if (existing != nullptr) {
+            if (!existing->committed) {
+                if (!arena.commit(guest_of(existing->base), existing->size, pp)) {
+                    os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
+                    return nullptr;
+                }
+                existing->committed = true;
+                existing->protect = protect;
+                st.virtual_committed_bytes += existing->size;
+                st.update_peak_locked();
+            }
+            return existing->base;
+        }
+        // Not one of ours: plain VirtualAlloc semantics on whatever the arena has reserved there.
+        const uint64_t committed =
+            arena.virtual_alloc(guest_of(address), aligned_size, os::kMemCommit, pp);
+        if (committed == 0) {
+            os::win32::SetLastError(os::win32::ERROR_INVALID_PARAMETER);
             return nullptr;
         }
-        if (!existing->committed) {
-            existing->committed = true;
-            existing->protect = protect;
-            st.virtual_committed_bytes += existing->size;
-            st.update_peak_locked();
-        }
-        return existing->base;
+        return host_of(committed);
     }
 
-    const size_t align = static_cast<size_t>(kXMemPageSize64K);
-    void* ptr = aligned_alloc_bytes(aligned_size, align);
-    if (ptr == nullptr) {
-        playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_NOT_ENOUGH_MEMORY);
+    // A non-null address is a placement request that must be honoured exactly.
+    const uint32_t arena_type =
+        (want_reserve ? os::kMemReserve : 0u) | (want_commit ? os::kMemCommit : 0u);
+    uint64_t va = 0;
+    try {
+        va = arena.virtual_alloc(guest_of(address), aligned_size, arena_type, pp);
+    } catch (const std::bad_alloc&) {
+        va = 0;
+    }
+    if (va == 0) {
+        os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
-    std::memset(ptr, 0, aligned_size);
 
     VirtualRegion region;
-    region.base = ptr;
-    region.size = aligned_size;
-    region.alignment = align;
+    region.base = host_of(va);
+    region.size = static_cast<size_t>(aligned_size);
+    region.alignment = static_cast<size_t>(kXMemPageSize64K);
     region.allocation_type = allocation_type;
     region.protect = protect;
     region.committed = want_commit;
@@ -1958,9 +2064,9 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     if (want_commit) {
         st.virtual_committed_bytes += aligned_size;
     }
-    st.virtual_regions.emplace(ptr, region);
+    st.virtual_regions.emplace(region.base, region);
     st.update_peak_locked();
-    return ptr;
+    return region.base;
 }
 
 Pg6HResult pg6_xbox_XMemTransferMemory(void* dst, const void* src, size_t size, uint32_t flags) {
