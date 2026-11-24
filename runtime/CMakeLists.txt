@@ -47,6 +47,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_xs_xbox.cpp
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
+    gpu/gfx10_descriptors.cpp
     gpu/frame_capture.cpp
     os/xmem_windows.cpp
     os/guest_window.cpp
@@ -168,6 +169,10 @@ else()
     add_executable(test_descriptor_heap ../tests/test_descriptor_heap.cpp)
     target_link_libraries(test_descriptor_heap PRIVATE playgta6_core)
     add_test(NAME descriptor_heap_tests COMMAND test_descriptor_heap)
+
+    add_executable(test_gfx10_descriptors ../tests/test_gfx10_descriptors.cpp)
+    target_link_libraries(test_gfx10_descriptors PRIVATE playgta6_core)
+    add_test(NAME gfx10_descriptors_tests COMMAND test_gfx10_descriptors)
 
     add_executable(test_state_bridge ../tests/test_state_bridge.cpp)
     target_link_libraries(test_state_bridge PRIVATE playgta6_core)
