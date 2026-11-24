@@ -1011,6 +1011,32 @@ fn two_dll_program_binds_ordinals_forwarders_and_data() {
     )));
     assert!(descriptor.contains("#include \"a/stubs/pg6_import_thunks.h\""));
     assert!(descriptor.contains("kPg6ProgramModuleMain"));
+    // R18: one export thunk table per program, referenced by the descriptor.
+    assert!(descriptor.contains("#include \"exports/pg6_export_thunks.h\""));
+    assert!(descriptor.contains("static_assert(sizeof(Pg6ExportThunk) == sizeof(Pg6BootExport)"));
+    assert!(descriptor.contains(
+        "kModules,\n    reinterpret_cast<const Pg6BootExport* const*>(&pg6_export_thunks),\n    \
+         &pg6_export_thunk_count,\n};"
+    ));
+    for file in [
+        "pg6_export_thunks.h",
+        "pg6_export_thunks.cpp",
+        "pg6_guest_seam.h",
+        "pg6_export_manifest.json",
+    ] {
+        assert!(out.join("exports").join(file).is_file(), "exports/{file}");
+        assert!(
+            r.files.iter().any(|f| f.path == format!("exports/{file}")),
+            "exports/{file} listed in the program files"
+        );
+    }
+    assert!(r.manifest.contains("\"export_thunks\": {"));
+    assert!(r.manifest.contains("\"dir\": \"exports\""));
+    assert!(r.report.contains("export thunks (exports/):"));
+    // No module bridge thunk can clash with it: module thunks carry the module name, the table's
+    // thunks are internal to its translation unit.
+    let table = fs::read_to_string(out.join("exports").join("pg6_export_thunks.cpp")).unwrap();
+    assert!(!table.contains("pg6_import_"));
     assert!(
         fs::read_to_string(out.join(PROGRAM_REPORT_FILE))
             .unwrap()
@@ -1614,7 +1640,9 @@ fn namespaced_bridges_and_descriptor_compile_together() {
             m.module
         ));
     }
+    text.push_str("#include \"exports/pg6_export_thunks.h\"\n");
     text.push_str("const void* pg6_probe = &pg6_import_thunks_a;\n");
+    text.push_str("const void* pg6_probe_exports = &pg6_export_thunks;\n");
     fs::write(&both, text).unwrap();
     let mut sources = vec![both];
     sources.extend(r.modules.iter().map(|m| {
@@ -1622,6 +1650,7 @@ fn namespaced_bridges_and_descriptor_compile_together() {
             .join("stubs")
             .join("pg6_import_thunks.cpp")
     }));
+    sources.push(out.join("exports").join("pg6_export_thunks.cpp"));
     if runtime.join(PROGRAM_LOADER_INCLUDE).is_file() {
         sources.push(out.join(PROGRAM_DESCRIPTOR_FILE));
     }

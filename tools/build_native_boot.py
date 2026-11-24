@@ -487,7 +487,8 @@ def module_inputs(inputs: ModuleInputs) -> BuildInputs:
 
 def load_program(program_dir: Path) -> BuildInputs:
     """A `playgta6-recomp build-program` output: every module's shards, the generated program
-    descriptor (`pg6_program.cpp`) and every module's import bridge."""
+    descriptor (`pg6_program.cpp`), every module's import bridge and the program's export thunk
+    table (`exports/pg6_export_thunks.cpp`)."""
     program_dir = program_dir.resolve()
     path = program_dir / PROGRAM_MANIFEST_FILE
     try:
@@ -505,13 +506,17 @@ def load_program(program_dir: Path) -> BuildInputs:
     targets = {m.target for m in modules}
     if len(targets) != 1:
         raise NativeBootError(f"modules were built for different targets: {sorted(targets)}")
+    # The program-level export thunk table (R18): present in every program build; the descriptor
+    # references it, so it must be linked when it exists.
+    export_table = program_dir / "exports" / "pg6_export_thunks.cpp"
     return BuildInputs(
         root=program_dir,
         label=f"program ({len(modules)} modules)",
         target=modules[0].target,
         units=units,
         sources=[program_dir / "pg6_program.cpp"]
-        + [m.stubs_dir / "pg6_import_thunks.cpp" for m in modules],
+        + [m.stubs_dir / "pg6_import_thunks.cpp" for m in modules]
+        + ([export_table] if export_table.is_file() else []),
         include_dirs=[program_dir],
         defines=["PG6_BOOT_PROGRAM"],
         run_args=f"--program-dir {program_dir}",

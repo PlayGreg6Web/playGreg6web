@@ -2383,6 +2383,13 @@ BootResult run_boot(const BootConfig& config) {
          " bound to shims, %" PRIu64 " without a shim%s",
          b.functions_registered, b.tables.size(), b.imports.size(), b.imports_bound,
          b.imports_unresolved, b.survey ? " [survey mode]" : "");
+    if (!config.export_thunks.empty()) {
+        const ExportThunkStats exports = register_export_thunks(config.export_thunks);
+        logf("guest boot: %zu export thunks: %zu new guest-callable entries, %zu sharing an existing "
+             "entry, %zu without one, %zu not in the module registry%s",
+             exports.rows, exports.registered, exports.shared, exports.unavailable,
+             exports.unregistered, exports.failed != 0 ? " (synthetic address table full)" : "");
+    }
     if (config.after_load) {
         b.phase = "after_load";
         std::string after_load_error;

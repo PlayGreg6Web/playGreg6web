@@ -334,6 +334,8 @@ class HarnessTests(unittest.TestCase):
             make_module(root, shards=3, target=target, name="main")
             program = root / "out"
             (program / "pg6_program.cpp").write_text("// descriptor\n", encoding="utf-8")
+            (program / "exports").mkdir()
+            (program / "exports" / "pg6_export_thunks.cpp").write_text("// exports\n", encoding="utf-8")
             manifest = {
                 "schema": "playgta6-recomp-program",
                 "schema_version": 1,
@@ -359,6 +361,7 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("pg6_program.cpp", text)
             self.assertIn("msvcp140/stubs/pg6_import_thunks.cpp", text)
             self.assertIn("main/stubs/pg6_import_thunks.cpp", text)
+            self.assertIn("exports/pg6_export_thunks.cpp", text)  # R18: the program's export table
             self.assertIn("PRIVATE PG6_BOOT_PROGRAM", text)
             self.assertEqual(text.count("EXTERNAL_OBJECT"), 1)
             self.assertEqual(sum(1 for line in text.splitlines() if line.strip().endswith('.obj"')), 2 * 7)

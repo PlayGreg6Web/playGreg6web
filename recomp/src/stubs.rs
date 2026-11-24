@@ -91,6 +91,18 @@
 //! `xbox_scarlett_guest.cpp`) binds first, also for a DLL without a shim family. Guest-state
 //! thunks are never audit-gated: they are written for guest callers.
 //!
+//! # Export thunks (dynamic `GetProcAddress` coverage)
+//! The thunks above exist only for a module's static imports. Guest code that resolves an API
+//! with `GetModuleHandle` + `GetProcAddress` needs a guest-callable entry for every export the
+//! runtime registers, imported or not: [`plan_exports`] binds each `(DLL, export name)` of the
+//! runtime's export tables under exactly the rules of a static import of it (family table,
+//! export tables, audit verdict, marshalability, guest-state thunk precedence) and
+//! [`render_exports`] emits one table `{dll, name, ordinal, flags, shim, thunk, reason}` with one
+//! marshaling thunk per distinct shim (`playgta6-recomp export-thunks`; `build-program` emits it
+//! once per program under `exports/`). Exports with no bindable shim carry the reason instead of
+//! a thunk. See the `exports` module docs for the output files and `guest/export_thunks.h` for
+//! the runtime side.
+//!
 //! # Unresolved imports
 //! Every unresolved import still gets a thunk. On its first call it logs
 //! `unresolved import DLL!symbol (slot 0x...)` plus the reason once through `pg6_seam_log`
@@ -150,8 +162,13 @@ const ARG_GPRS: [u8; 4] = [1, 2, 8, 9];
 const REG_RAX: u8 = 0;
 const REG_RSP: u8 = 4;
 
+mod exports;
 mod tables;
 
+pub use exports::{
+    EXPORT_HEADER_FILE, EXPORT_MANIFEST_FILE, EXPORT_SOURCE_FILE, ExportBinding, ExportCounts,
+    ExportOutput, ExportPlan, ExportRow, plan_exports, render_export_coverage, render_exports,
+};
 pub use tables::{
     AuditEntry, ExportEntry, GapEntry, NameRule, PREFIX_CRT, PREFIX_D3D12, PREFIX_GDK, PREFIX_MW,
     PREFIX_WIN32, PREFIX_WS2, PREFIX_XBOX, SHIM_FAMILIES, ShimFamily, Verdict, family,
@@ -2432,11 +2449,11 @@ mod tests {
     use crate::pe::ImportModule;
     use crate::pe::test_util::build_synthetic_pe64;
 
-    const MINI_INCLUDE: &str = "mini/pg6_test_shims.h";
+    pub(in crate::stubs) const MINI_INCLUDE: &str = "mini/pg6_test_shims.h";
 
     /// Miniature shim surface: every type and declaration form the scanner must handle, plus
     /// decoys it must ignore. It is also compiled by the tool-gated tests.
-    const MINI_HEADER: &str = r#"// Miniature runtime shim header for generator tests.
+    pub(in crate::stubs) const MINI_HEADER: &str = r#"// Miniature runtime shim header for generator tests.
 #pragma once
 
 #include <cstddef>
@@ -2500,14 +2517,14 @@ Pg6Hr pg6_d3d12_d3d12_create_device(void* adapter, uint32_t feature_level, const
 extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
 "#;
 
-    fn mini_headers() -> Vec<ShimHeader> {
+    pub(in crate::stubs) fn mini_headers() -> Vec<ShimHeader> {
         vec![ShimHeader {
             include: MINI_INCLUDE.to_string(),
             text: MINI_HEADER.to_string(),
         }]
     }
 
-    fn mini_catalogue() -> Catalogue {
+    pub(in crate::stubs) fn mini_catalogue() -> Catalogue {
         Catalogue::scan(&mini_headers())
     }
 
@@ -2588,7 +2605,7 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
         shim.params.iter().map(|p| p.kind).collect()
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    pub(in crate::stubs) fn temp_dir(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!(
             "playgta6_stubs_{tag}_{}_{}",
             std::process::id(),
@@ -3458,7 +3475,7 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
     // Real runtime headers
     // -----------------------------------------------------------------------------------------
 
-    fn runtime_root() -> PathBuf {
+    pub(in crate::stubs) fn runtime_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("runtime")
@@ -3644,7 +3661,7 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
     }
 
     /// The default shim set of this checkout (headers and export-table sources).
-    fn checkout_catalogue() -> Catalogue {
+    pub(in crate::stubs) fn checkout_catalogue() -> Catalogue {
         let start = Path::new(env!("CARGO_MANIFEST_DIR"));
         let (paths, root) =
             crate::pipeline::checkout_shim_headers(start).expect("playgta6web checkout");
@@ -3850,13 +3867,13 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
     // Tool-gated: compile (and run) the generated C++ with a host compiler when one exists.
     // -----------------------------------------------------------------------------------------
 
-    enum Cxx {
+    pub(in crate::stubs) enum Cxx {
         Gnu(String),
         Msvc(String),
     }
 
     /// `$CXX`, else the first of `c++`, `g++`, `clang++`, `cl` that runs.
-    fn find_cxx() -> Option<Cxx> {
+    pub(in crate::stubs) fn find_cxx() -> Option<Cxx> {
         let candidates: Vec<String> = match env::var("CXX") {
             Ok(cxx) if !cxx.trim().is_empty() => vec![cxx],
             _ => ["c++", "g++", "clang++", "cl"].map(String::from).to_vec(),
@@ -3876,7 +3893,7 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
     }
 
     /// Compile `sources`; link into `exe` when given, otherwise check syntax only.
-    fn compile(
+    pub(in crate::stubs) fn compile(
         cxx: &Cxx,
         sources: &[PathBuf],
         includes: &[PathBuf],

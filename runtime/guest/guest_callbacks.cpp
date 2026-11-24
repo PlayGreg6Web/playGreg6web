@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "guest/export_thunks.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -454,10 +455,10 @@ int32_t initterm_e_impl(CallContext& ctx, uint64_t first, uint64_t last) {
 uint64_t get_proc_address_impl(uint64_t module, uint64_t name_or_ordinal) {
     namespace win32 = playgta6::os::win32;
     std::string name;
-    uint64_t proc = 0;
+    win32::ExportLookup found;
     if ((name_or_ordinal >> 16) == 0) {
         name = "#" + std::to_string(name_or_ordinal);
-        proc = win32::GetProcAddressByOrdinal(module, static_cast<uint32_t>(name_or_ordinal));
+        found = win32::LookupExport(module, {}, static_cast<uint32_t>(name_or_ordinal));
     } else {
         // Read the NUL-terminated ASCII name from guest memory (bounded).
         for (uint64_t i = 0; i < 1024; ++i) {
@@ -472,16 +473,24 @@ uint64_t get_proc_address_impl(uint64_t module, uint64_t name_or_ordinal) {
             }
             name.push_back(c);
         }
-        proc = win32::GetProcAddressByName(module, name);
+        found = win32::LookupExport(module, name);
     }
-    if (proc == 0) {
-        return 0;  // GetProcAddressBy* set the last error
+    if (found.address == 0) {
+        return 0;  // LookupExport set the last error
     }
-    const uint64_t callable = guest_callable_for_proc(proc);
+    if (found.guest) {
+        return found.address;  // an export of a recompiled guest module: a real guest VA
+    }
+    const uint64_t callable = guest_callable_for_proc(found.address);
     if (callable == 0) {
+        // A host shim the generator could not give a guest-callable thunk (denied by the shim
+        // audit, unmarshalable signature) or one the export table does not list. Optional APIs
+        // fail cleanly so their callers take the fallback path.
+        const char* reason = unavailable_reason_for_proc(found.address);
         com::detail::diagnostic(
             ("guest callbacks: GetProcAddress(" + hex(module) + ", " + name +
-             ") found a host-only export with no guest-callable entry")
+             ") found a host-only export with no guest-callable entry" +
+             (reason != nullptr ? std::string(": ") + reason : std::string(" (not in the export thunk table)")))
                 .c_str());
         win32::SetLastError(win32::ERROR_PROC_NOT_FOUND);
     }

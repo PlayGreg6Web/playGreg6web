@@ -49,6 +49,7 @@ add_library(playgta6_core STATIC
     guest/guest_exceptions.cpp
     guest/com_bridge.cpp
     guest/guest_callbacks.cpp
+    guest/export_thunks.cpp
     guest/guest_crt_exit.cpp
     guest/guest_rtl.cpp
     guest/cpu_helpers.cpp
@@ -240,6 +241,15 @@ else()
     add_executable(test_program_loader ../tests/test_program_loader.cpp)
     target_link_libraries(test_program_loader PRIVATE playgta6_core)
     add_test(NAME playgta6_program_loader_tests COMMAND test_program_loader)
+
+    # R18: links the checked-in output of `playgta6-recomp export-thunks --only ...`
+    # (tests/fixtures/export_thunks, kept in sync with the generator by a Rust test).
+    add_executable(test_export_thunks
+        ../tests/test_export_thunks.cpp
+        ../tests/fixtures/export_thunks/pg6_export_thunks.cpp)
+    target_include_directories(test_export_thunks PRIVATE ../tests/fixtures/export_thunks)
+    target_link_libraries(test_export_thunks PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_export_thunks_tests COMMAND test_export_thunks)
 
     add_executable(test_xasync_provider ../tests/test_xasync_provider.cpp)
     target_link_libraries(test_xasync_provider PRIVATE playgta6_core)

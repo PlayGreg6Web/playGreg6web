@@ -83,6 +83,12 @@ struct Pg6Program {
     uint32_t version;  // kPg6ProgramVersion
     uint32_t module_count;
     const Pg6ProgramModule* modules;  // initialisation order, executable last
+    // The program's export table: `pg6_export_thunks` / `pg6_export_thunk_count` of
+    // `exports/pg6_export_thunks.cpp` (guest/export_thunks.h, Pg6BootExport has the generated
+    // Pg6ExportThunk's layout). Added after version 1 shipped: a descriptor that stops at
+    // `modules` is still valid and just has no export thunks (both fields null).
+    const Pg6BootExport* const* exports;
+    const size_t* export_count;
 };
 
 }  // extern "C"

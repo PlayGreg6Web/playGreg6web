@@ -308,6 +308,9 @@ ProgramError prepare_program_boot(const Pg6Program& program,
         out.config.modules.push_back(std::move(module));
     }
     out.config.call_dll_entry_points = true;
+    if (program.exports != nullptr && *program.exports != nullptr && program.export_count != nullptr) {
+        out.config.export_thunks = std::span<const Pg6BootExport>(*program.exports, *program.export_count);
+    }
     ProgramBoot* self = &out;
     out.config.after_load = [self](os::VirtualMemoryArena& arena, std::string& message) {
         self->after_load_error = register_program_modules(arena, self->program, self->options);

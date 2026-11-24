@@ -116,6 +116,8 @@
 //! program-manifest.json   this program: modules, bases, bindings, order (schema below)
 //! program-report.txt      human-readable summary (also printed by the CLI)
 //! pg6_program.cpp         Pg6Program descriptor for runtime/guest/program_loader.h
+//! exports/                the program's export thunk table (R18): pg6_export_thunks.{h,cpp},
+//!                         pg6_guest_seam.h, pg6_export_manifest.json
 //! <module>/...            one single-module build per module (see the parent module)
 //! ```
 //! `pg6_program.cpp` includes `guest/program_loader.h` and every module's
@@ -125,7 +127,13 @@
 //! point VA, flags (`kPg6ProgramModuleMain`, `kPg6ProgramModuleDll`, `kPg6ProgramModuleTls`),
 //! TLS index, its lifted-function table (`__playgta6_lifted_functions_<module>` and its count)
 //! and its import bridge table (`pg6_import_thunks_<module>` / `pg6_import_thunk_count_<module>`,
-//! the `Pg6BootImport` layout of `guest/boot.h`).
+//! the `Pg6BootImport` layout of `guest/boot.h`). It also points `Pg6Program::exports` /
+//! `export_count` at `pg6_export_thunks` / `pg6_export_thunk_count` of `exports/`: one
+//! guest-callable thunk for every shim export the runtime registers
+//! ([`stubs::plan_exports`]), generated once for the whole program, never per module, so it
+//! cannot clash with any module's import bridge. The runtime registers it at boot
+//! (`guest/export_thunks.h`) so guest `GetProcAddress` can resolve APIs nobody imports
+//! statically. The same table is available on its own as `playgta6-recomp export-thunks`.
 //!
 //! # Manifest schema (`playgta6-recomp-program`, `schema_version` 1)
 //! Top-level keys in order: `schema`, `schema_version`, `tool` {`name`, `version`}, `options`
@@ -151,7 +159,8 @@
 //! [`stubs::Unresolved::recorded`]), `via`
 //! [forwarders], `rule`}], `external_dlls` [{`dll`, `status` (`host`, `host_only`, `missing`),
 //! `importers` [dll]}], `unreferenced_dlls` [dll], `allocator` {`provider` (`host`, a dll or
-//! null), `imports`}, `diagnostics` [{`kind`, `module`, `detail`}], `files` [{`path`, `size`,
+//! null), `imports`}, `export_thunks` {`dir`, `exports`, `generated`, `gthunk`, `none`,
+//! `distinct_thunks`, `none_by_reason` {code: n}}, `diagnostics` [{`kind`, `module`, `detail`}], `files` [{`path`, `size`,
 //! `fnv1a64`}] (the program-level files except the manifest). Addresses are `"0x..."` strings.
 //!
 //! # Determinism
@@ -241,6 +250,8 @@ pub const PROGRAM_MANIFEST_FILE: &str = "program-manifest.json";
 pub const PROGRAM_REPORT_FILE: &str = "program-report.txt";
 /// Runtime program descriptor source.
 pub const PROGRAM_DESCRIPTOR_FILE: &str = "pg6_program.cpp";
+/// Directory (in the build root) of the program-level export thunk table.
+pub const EXPORTS_DIR: &str = "exports";
 /// The runtime header the descriptor includes.
 pub const PROGRAM_LOADER_INCLUDE: &str = "guest/program_loader.h";
 pub const PROGRAM_SCHEMA: &str = "playgta6-recomp-program";
@@ -497,6 +508,8 @@ pub struct ExternalDll {
 /// Everything a program build produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramReport {
+    /// The program-level export thunk table.
+    pub export_table: ExportTableRecord,
     /// In initialisation order (executable last).
     pub modules: Vec<ModuleRecord>,
     pub cycles: Vec<(String, String)>,
@@ -511,6 +524,42 @@ pub struct ProgramReport {
     pub files: Vec<OutputFile>,
     pub report: String,
     pub manifest: String,
+}
+
+/// What the program's export thunk table (`exports/`, [`stubs::plan_exports`]) holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportTableRecord {
+    /// Registered exports with a row.
+    pub exports: usize,
+    /// Rows with a generated marshaling thunk / a guest-state thunk / no guest-callable entry.
+    pub generated: usize,
+    pub gthunk: usize,
+    pub none: usize,
+    /// Distinct thunks (guest-callable synthetic addresses the table needs at most).
+    pub distinct_thunks: usize,
+    /// Rows without a guest-callable entry per reason code.
+    pub none_by_reason: BTreeMap<String, usize>,
+}
+
+impl ExportTableRecord {
+    fn of(plan: &stubs::ExportPlan) -> Self {
+        let mut record = Self {
+            exports: plan.rows.len(),
+            distinct_thunks: plan.distinct_callees(),
+            none_by_reason: plan
+                .none_by_reason()
+                .into_iter()
+                .map(|(code, n)| (code.to_string(), n))
+                .collect(),
+            ..Self::default()
+        };
+        for (_, counts) in plan.counts_by_dll() {
+            record.generated += counts.generated;
+            record.gthunk += counts.gthunk;
+            record.none += counts.none;
+        }
+        record
+    }
 }
 
 impl ProgramReport {
@@ -971,7 +1020,30 @@ pub fn build_program(
     unreferenced.sort();
     diagnostics.sort();
     diagnostics.dedup();
+    // The export thunk table: one per program, next to (never inside) the module bridges.
+    let export_plan = stubs::plan_exports(&catalogue);
+    let export_files = stubs::render_exports(&export_plan, &catalogue);
+    let exports_dir = out.join(EXPORTS_DIR);
+    fs::create_dir_all(&exports_dir).map_err(io_error(format!(
+        "failed to create output directory '{}'",
+        exports_dir.display()
+    )))?;
+    let mut export_outputs = Vec::new();
+    for (name, text) in [
+        (stubs::EXPORT_HEADER_FILE, &export_files.header),
+        (stubs::EXPORT_SOURCE_FILE, &export_files.source),
+        (stubs::SEAM_FILE, &export_files.seam),
+        (stubs::EXPORT_MANIFEST_FILE, &export_files.manifest),
+    ] {
+        export_outputs.push(write_file(
+            out,
+            &format!("{EXPORTS_DIR}/{name}"),
+            text.as_bytes(),
+        )?);
+    }
+    progress("", "exports");
     let mut report = ProgramReport {
+        export_table: ExportTableRecord::of(&export_plan),
         modules: records,
         cycles,
         imports,
@@ -989,6 +1061,7 @@ pub fn build_program(
         PROGRAM_DESCRIPTOR_FILE,
         descriptor.as_bytes(),
     )?];
+    files.extend(export_outputs);
     report.report = render_report(&report);
     files.push(write_file(
         out,
@@ -1529,6 +1602,29 @@ pub fn render_report(r: &ProgramReport) -> String {
             let _ = writeln!(out, "allocator: no allocator imports");
         }
     }
+    let t = &r.export_table;
+    let _ = writeln!(
+        out,
+        "export thunks ({EXPORTS_DIR}/): {} exports, {} generated + {} guest-state thunks \
+         ({} distinct), {} without a guest-callable entry{}",
+        t.exports,
+        t.generated,
+        t.gthunk,
+        t.distinct_thunks,
+        t.none,
+        if t.none_by_reason.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                t.none_by_reason
+                    .iter()
+                    .map(|(code, n)| format!("{code} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    );
     let _ = writeln!(out, "external DLLs:");
     for e in &r.external {
         let _ = writeln!(
@@ -1905,6 +2001,26 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
             ]),
         ),
         (
+            "export_thunks",
+            obj([
+                ("dir", Json::Str(EXPORTS_DIR.into())),
+                ("exports", num(r.export_table.exports)),
+                ("generated", num(r.export_table.generated)),
+                ("gthunk", num(r.export_table.gthunk)),
+                ("none", num(r.export_table.none)),
+                ("distinct_thunks", num(r.export_table.distinct_thunks)),
+                (
+                    "none_by_reason",
+                    super::counts(
+                        r.export_table
+                            .none_by_reason
+                            .iter()
+                            .map(|(code, n)| (code.as_str(), *n)),
+                    ),
+                ),
+            ]),
+        ),
+        (
             "diagnostics",
             Json::Arr(
                 r.diagnostics
@@ -1957,7 +2073,8 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
          //\n\
          // Guest program descriptor for the runtime program loader: every module in\n\
          // initialisation order (executable last) with its assigned base, its lifted-function\n\
-         // table and its import bridge table. Compile with the build root on the include path.\n",
+         // table and its import bridge table, plus the program's export thunk table\n\
+         // (exports/). Compile with the build root on the include path.\n",
     );
     let _ = writeln!(out, "#include <cstddef>\n#include <cstdint>\n");
     let _ = writeln!(out, "#include {}", c_str(PROGRAM_LOADER_INCLUDE));
@@ -1973,10 +2090,18 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
             ))
         );
     }
+    let _ = writeln!(
+        out,
+        "#include {}",
+        c_str(&format!("{EXPORTS_DIR}/{}", stubs::EXPORT_HEADER_FILE))
+    );
     out.push_str(
         "\nstatic_assert(sizeof(Pg6ImportThunk) == sizeof(Pg6BootImport) &&\n\
          \x20             alignof(Pg6ImportThunk) == alignof(Pg6BootImport),\n\
-         \x20             \"import bridge tables are read as Pg6BootImport\");\n\nextern \"C\" {\n",
+         \x20             \"import bridge tables are read as Pg6BootImport\");\n\
+         static_assert(sizeof(Pg6ExportThunk) == sizeof(Pg6BootExport) &&\n\
+         \x20             alignof(Pg6ExportThunk) == alignof(Pg6BootExport),\n\
+         \x20             \"the export thunk table is read as Pg6BootExport\");\n\nextern \"C\" {\n",
     );
     for m in &r.modules {
         let (table, count) = registration_symbols(&m.module);
@@ -2017,7 +2142,9 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
          extern \"C\" const Pg6Program pg6_program = {\n    \
          kPg6ProgramVersion,\n    \
          static_cast<uint32_t>(sizeof(kModules) / sizeof(kModules[0])),\n    \
-         kModules,\n};\n",
+         kModules,\n    \
+         reinterpret_cast<const Pg6BootExport* const*>(&pg6_export_thunks),\n    \
+         &pg6_export_thunk_count,\n};\n",
     );
     out
 }

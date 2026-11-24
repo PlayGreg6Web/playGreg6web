@@ -477,12 +477,20 @@ struct ModuleRegistry {
 
     // Export lookup by name (ordinal == 0) or ordinal, following forwarders ("DLL.Name",
     // "DLL.#ordinal"; the module part may be an API set) for at most kMaxForwards hops.
-    ProcAddress lookup_locked(const Module* m, std::string name, uint32_t ordinal) const {
+    // `guest` (optional) is set to whether the export was found in a guest module (the address is
+    // then a guest VA, not a host proc address).
+    ProcAddress lookup_locked(const Module* m,
+                              std::string name,
+                              uint32_t ordinal,
+                              bool* guest = nullptr) const {
         static constexpr int kMaxForwards = 16;
         for (int hop = 0; m != nullptr && hop <= kMaxForwards; ++hop) {
             const std::string* forward = nullptr;
             if (ordinal == 0) {
                 if (auto it = m->by_name.find(name); it != m->by_name.end()) {
+                    if (guest != nullptr) {
+                        *guest = m->guest || m == main_module;
+                    }
                     return it->second;
                 }
                 if (auto it = m->forward_by_name.find(name); it != m->forward_by_name.end()) {
@@ -490,6 +498,9 @@ struct ModuleRegistry {
                 }
             } else {
                 if (auto it = m->by_ordinal.find(ordinal); it != m->by_ordinal.end()) {
+                    if (guest != nullptr) {
+                        *guest = m->guest || m == main_module;
+                    }
                     return it->second;
                 }
                 if (auto it = m->forward_by_ordinal.find(ordinal);
@@ -992,6 +1003,27 @@ ProcAddress GetProcAddressByOrdinal(Handle module, uint32_t ordinal) {
         SetLastError(ERROR_PROC_NOT_FOUND);
     }
     return address;
+}
+
+ExportLookup LookupExport(Handle module, std::string_view name, uint32_t ordinal) {
+    auto& reg = module_registry();
+    std::shared_lock<std::shared_mutex> lock(reg.mutex);
+    const Module* m = reg.find_handle_locked(module);
+    if (m == nullptr || !m->visible()) {
+        SetLastError(ERROR_MOD_NOT_FOUND);
+        return {};
+    }
+    ExportLookup found;
+    const bool by_ordinal = ordinal != 0;
+    if (by_ordinal || !name.empty()) {
+        found.address = reg.lookup_locked(m, by_ordinal ? std::string() : std::string(name),
+                                          by_ordinal ? ordinal : 0, &found.guest);
+    }
+    if (found.address == 0) {
+        found.guest = false;
+        SetLastError(ERROR_PROC_NOT_FOUND);
+    }
+    return found;
 }
 
 // ---------------------------------------------------------------------------

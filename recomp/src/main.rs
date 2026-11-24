@@ -1,3 +1,4 @@
+mod export_cmd;
 mod lift_cmd;
 mod program_cmd;
 mod report;
@@ -80,6 +81,7 @@ enum Command {
     SurveyInterfaces(playgta6_recomp::survey::cli::Args),
     Build(BuildArgs),
     BuildProgram(program_cmd::ProgramArgs),
+    ExportThunks(export_cmd::ExportArgs),
 }
 
 fn print_usage() {
@@ -99,6 +101,7 @@ fn print_usage() {
         "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>]"
     );
     eprintln!("{}", program_cmd::USAGE);
+    eprintln!("{}", export_cmd::USAGE);
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --from-env             Read GTA6_GAME_DIR from environment or .env and inspect top-level .exe files");
@@ -130,6 +133,9 @@ fn print_usage() {
     for line in program_cmd::OPTIONS {
         eprintln!("{line}");
     }
+    for line in export_cmd::OPTIONS {
+        eprintln!("{line}");
+    }
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("Pipeline target: Xbox Series x86-64 PE -> LLVM IR -> Wasm64 (memory64).");
@@ -153,8 +159,10 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "build" => parse_build_args(&args[1..]),
         "build-program" => program_cmd::parse_program_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::BuildProgram)),
+        "export-thunks" => export_cmd::parse_export_args(&args[1..])
+            .map(|a| a.map_or(Command::Help, Command::ExportThunks)),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'survey-interfaces', 'build' or 'build-program'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'survey-interfaces', 'build', 'build-program' or 'export-thunks'. Run with --help for usage."
         )),
     }
 }
@@ -978,6 +986,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Command::ExportThunks(export_args)) => {
+            match export_cmd::run_export_thunks(&export_args) {
+                Ok(summary) => {
+                    print!("{summary}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(Command::BuildProgram(program_args)) => match program_cmd::run_program(&program_args) {
             Ok(report) => {
                 print!("{report}");
@@ -1311,6 +1331,91 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
             "a PE and an import list are exclusive"
         );
         assert!(parse_cli(&vec_s(&["stubs", "--import-list", "--shims", "h.h"])).is_err());
+    }
+
+    #[test]
+    fn cli_parses_export_thunks() {
+        assert_eq!(
+            parse_cli(&vec_s(&[
+                "export-thunks",
+                "--out",
+                "o",
+                "--only",
+                "KERNEL32.dll!Sleep",
+                "--only",
+                "WS2_32.dll!closesocket",
+                "--shims",
+                "a.h",
+                "b.cpp",
+                "--include-root",
+                "rt",
+            ])),
+            Ok(Command::ExportThunks(export_cmd::ExportArgs {
+                out_dir: PathBuf::from("o"),
+                shims: vec![PathBuf::from("a.h"), PathBuf::from("b.cpp")],
+                include_root: Some(PathBuf::from("rt")),
+                only: vec![
+                    "KERNEL32.dll!Sleep".to_string(),
+                    "WS2_32.dll!closesocket".to_string()
+                ],
+            }))
+        );
+        assert_eq!(
+            parse_cli(&vec_s(&["export-thunks", "--out", "o"])),
+            Ok(Command::ExportThunks(export_cmd::ExportArgs {
+                out_dir: PathBuf::from("o"),
+                shims: Vec::new(),
+                include_root: None,
+                only: Vec::new(),
+            }))
+        );
+        assert_eq!(
+            parse_cli(&vec_s(&["export-thunks", "-h"])),
+            Ok(Command::Help)
+        );
+        assert!(
+            parse_cli(&vec_s(&["export-thunks"])).is_err(),
+            "--out is required"
+        );
+        assert!(parse_cli(&vec_s(&["export-thunks", "--out"])).is_err());
+        assert!(parse_cli(&vec_s(&["export-thunks", "--out", "o", "--only"])).is_err());
+        assert!(parse_cli(&vec_s(&["export-thunks", "--out", "o", "--shims"])).is_err());
+        assert!(parse_cli(&vec_s(&["export-thunks", "--out", "o", "stray"])).is_err());
+    }
+
+    #[test]
+    fn export_thunks_end_to_end_writes_the_table() {
+        let dir = std::env::temp_dir().join(format!("playgta6_export_cli_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let header = dir.join("shims.h");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &header,
+            "extern \"C\" unsigned pg6_win32_tick(void);\n\
+             #define PG6_MOD_K32 \"KERNEL32.dll\"\n\
+             #define T(E) E(K32, \"Tick\", pg6_win32_tick)\n",
+        )
+        .unwrap();
+        let args = export_cmd::ExportArgs {
+            out_dir: dir.join("out"),
+            shims: vec![header],
+            include_root: None,
+            only: vec!["kernel32!Tick".to_string()],
+        };
+        let summary = export_cmd::run_export_thunks(&args).expect("export-thunks");
+        assert!(summary.contains("1 exports, 1 guest-callable"), "{summary}");
+        let source = fs::read_to_string(dir.join("out").join(stubs::EXPORT_SOURCE_FILE)).unwrap();
+        assert!(source.contains("\"KERNEL32.dll\", \"Tick\""), "{source}");
+        let missing = export_cmd::ExportArgs {
+            only: vec!["KERNEL32.dll!Nope".to_string()],
+            ..args
+        };
+        assert!(
+            export_cmd::run_export_thunks(&missing)
+                .unwrap_err()
+                .contains("no registered export")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

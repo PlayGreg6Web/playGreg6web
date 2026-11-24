@@ -341,6 +341,15 @@ const Pg6BootImport kImportsE[] = {
 const Pg6BootImport* const kImportsEPtr = kImportsE;
 const size_t kImportsECount = 2;
 
+// The program's export thunk table (R18, `exports/pg6_export_thunks.cpp` of a program build): one
+// callable row and one that has no guest-callable entry.
+const Pg6BootExport kExports[] = {
+    {"KERNEL32.dll", "GetTickCount64", 0, kPg6BootExportGenerated, "pg6_win32_get_tick_count64", &host_77,
+     nullptr},
+    {"KERNEL32.dll", "GetLastError", 0, 0, nullptr, nullptr, "denied: test: not for guest code"}};
+const Pg6BootExport* const kExportsPtr = kExports;
+const size_t kExportCount = 2;
+
 const TlsSpec kTlsB{kData + 0x100, kData + 0x108, kData + 0x10, kText + 0x200};
 
 ModuleSpec spec_b() {
@@ -411,12 +420,13 @@ void test_boot_links_and_runs_a_program(VirtualMemoryArena& arena) {
          &kTableACount, &kImportsAPtr, &kImportsACount},
         exe_module(),
     };
-    const Pg6Program program{kPg6ProgramVersion, 3, modules};
+    const Pg6Program program{kPg6ProgramVersion, 3, modules, &kExportsPtr, &kExportCount};
     ProgramBoot pb;
     CHECK_CODE(prepare_program_boot(program,
                                     memory_image_source({{"b", b}, {"a", a}, {"main", exe_image()}}),
                                     ProgramLoadOptions{"D:\\", true}, pb),
                ProgramErrorCode::Ok);
+    CHECK(pb.config.export_thunks.size() == 2 && pb.config.export_thunks.data() == kExports);
     CHECK(pb.config.modules.size() == 3);
     CHECK(pb.config.modules[0].name == "game.exe" && pb.config.modules[1].name == "b.dll");
     CHECK(pb.config.call_dll_entry_points && pb.config.after_load);
@@ -428,6 +438,16 @@ void test_boot_links_and_runs_a_program(VirtualMemoryArena& arena) {
     const BootResult result = boot(pb);
     CHECK(result.status == BootStatus::Exited);
     CHECK(result.stats.exit_code == 11 + 1000 + 77);
+    // The boot registered the export table after the shim exports: a guest-callable entry for the
+    // row with a thunk (for the proc the module registry holds), a recorded reason for the other.
+    {
+        const uint64_t tick = win32::resolve_import("KERNEL32.dll", "GetTickCount64");
+        CHECK(tick != 0 && is_synthetic_address(guest_callable_for_proc(tick)));
+        const uint64_t last_error = win32::resolve_import("KERNEL32.dll", "GetLastError");
+        CHECK(last_error != 0 && guest_callable_for_proc(last_error) == 0);
+        const char* reason = unavailable_reason_for_proc(last_error);
+        CHECK(reason != nullptr && std::strstr(reason, "not for guest code") != nullptr);
+    }
     // TLS callbacks and DllMain of each DLL in initialisation order, then the entry point.
     CHECK(g_log == "bBAE");
     if (result.status != BootStatus::Exited) {

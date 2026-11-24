@@ -58,12 +58,15 @@
 //                                comparator cannot make the host read out of bounds)
 //   _initterm, _initterm_e       call the guest function-pointer table [first, last)
 //   GetProcAddress               reads the name (or MAKEINTRESOURCE ordinal: HIWORD == 0) from
-//                                guest memory, resolves it in the O7 module registry and returns
-//                                the export's guest-callable synthetic address
-//                                (guest_callable_for_proc). Exports registered only as host
-//                                functions (no guest thunk) are not callable by guest code: they
-//                                return NULL with ERROR_PROC_NOT_FOUND and a diagnostic instead of
-//                                a host function pointer.
+//                                guest memory, resolves it in the O7 module registry (API sets,
+//                                forwarders) and returns the export's address: a real guest VA
+//                                for a guest module's export, else the host shim's guest-callable
+//                                synthetic address (guest_callable_for_proc; every bindable shim
+//                                export gets one from the generated export table, see
+//                                guest/export_thunks.h). A host export without one (denied by the
+//                                shim audit, unmarshalable signature) is not callable by guest
+//                                code: NULL with ERROR_PROC_NOT_FOUND and a diagnostic that says
+//                                why, never a host function pointer.
 //   _crt_atexit, _crt_at_quick_exit, _register_onexit_function, _initialize_onexit_table,
 //   _execute_onexit_table, _register_thread_local_exe_atexit_callback, exit, quick_exit, _exit,
 //   _cexit, _c_exit              guest exit registration and the exit funnel

@@ -113,6 +113,17 @@ ProcAddress GetProcAddress(Handle module, const char* proc_name);
 ProcAddress GetProcAddressByName(Handle module, std::string_view name);
 ProcAddress GetProcAddressByOrdinal(Handle module, uint32_t ordinal);
 
+// GetProcAddressByName / ByOrdinal that also says what kind of address it found: `guest` is true
+// when the export (after following forwarders) belongs to a guest module or the main image, so
+// `address` is a guest VA callable as it is; otherwise it is a host proc address that guest code
+// can only call through a guest-callable entry (guest/guest_runtime.h guest_callable_for_proc).
+// `ordinal != 0` looks up by ordinal and ignores `name`. Sets the last error like GetProcAddress.
+struct ExportLookup {
+    ProcAddress address = 0;
+    bool guest = false;
+};
+ExportLookup LookupExport(Handle module, std::string_view name, uint32_t ordinal = 0);
+
 // ---------------------------------------------------------------------------
 // Registration API (runtime startup, PE loader, R5 import thunks)
 // ---------------------------------------------------------------------------

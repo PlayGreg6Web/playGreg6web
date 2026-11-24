@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "abi/playgta6_abi.h"
+#include "guest/export_thunks.h"
 #include "guest/guest_runtime.h"
 #include "os/image_loader.h"
 #include "os/vmem.h"
@@ -410,6 +411,11 @@ struct BootConfig {
     // host's unwind tables; makes host-frame -> lifted-function mapping exact.
     HostFunctionStartFn host_function_start = nullptr;
     bool log_progress = true;       // phase lines through os::log
+    // The generated export table (`pg6_export_thunks`, guest/export_thunks.h): guest-callable
+    // entries for every shim export, registered after the IAT slots are bound so that
+    // GetProcAddress finds them. Empty = none (exports without a static import then have no
+    // guest-callable entry).
+    std::span<const Pg6BootExport> export_thunks;
     // Runs once every image is mapped, its lifted tables are registered and its IAT slots are
     // bound, before the process block is created (R12's program loader registers the guest DLLs,
     // their exports and function tables here). Returning false ends the boot with
