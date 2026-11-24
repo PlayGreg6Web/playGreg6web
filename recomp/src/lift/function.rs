@@ -32,6 +32,8 @@ mod bit_ops;
 mod integer;
 #[path = "string_ops.rs"]
 mod string_ops;
+#[path = "unwind.rs"]
+mod unwind;
 
 pub(super) use atomics::CMPXCHG16B_IR;
 pub(super) use bit_ops::{PDEP_IR, PEXT_IR};
@@ -251,6 +253,7 @@ pub(super) fn lift(
         unsupported: Vec::new(),
         ea: None,
         guest_base,
+        unwind_sites: 0,
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
@@ -300,6 +303,8 @@ struct FunctionLifter<'a> {
     ea: Option<String>,
     /// Guest -> host address translation (`guest_ptr`).
     guest_base: GuestBase,
+    /// Calls followed by a resume-protocol check (see `unwind`).
+    unwind_sites: u32,
 }
 
 struct Checkpoint {
@@ -437,6 +442,7 @@ impl FunctionLifter<'_> {
     fn finish(mut self) -> LiftedFunction {
         let entry = self.func.entry;
         let symbol = function_symbol(entry);
+        self.unwind_blocks();
 
         let mut exits: Vec<u64> = std::mem::take(&mut self.exits);
         exits.sort_unstable();
@@ -468,6 +474,7 @@ impl FunctionLifter<'_> {
         // The emit helpers write to `self.body`, which is empty again here: build the entry
         // block's state loads there and splice them in front of the lifted blocks.
         self.sync_in();
+        self.unwind_entry();
         ir.push_str(&std::mem::take(&mut self.body));
         let _ = writeln!(ir, "  br label %{}", block_label(entry));
         ir.push_str(&body);
@@ -1636,7 +1643,7 @@ impl FunctionLifter<'_> {
                 return Ok(());
             }
             self.sync_out();
-            self.emit(&format!(
+            self.guest_call(&format!(
                 "call void @{}(ptr %state)",
                 function_symbol(target)
             ));
@@ -1646,7 +1653,7 @@ impl FunctionLifter<'_> {
             let target = self.indirect_target(ins)?;
             self.push(&return_address, 64)?;
             self.sync_out();
-            self.emit(&format!(
+            self.guest_call(&format!(
                 "call void @{HELPER_INDIRECT_CALL}(ptr %state, i64 {target})"
             ));
         }

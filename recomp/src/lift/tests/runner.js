@@ -1,7 +1,8 @@
 // Test-only harness: runs lifted wasm64 functions under node (memory64).
 // Usage: node [--experimental-wasm-memory64] runner.js <module.wasm> <cases.json>
 //
-// cases.json: { state, stateSize, guestBase, gprOffset, flagsOffset, xmmOffset, mxcsrOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
+// cases.json: { state, stateSize, guestBase, gprOffset, flagsOffset, xmmOffset, mxcsrOffset, resumeRipOffset,
+//               unwindPendingOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
 // `regs` lists [index, value] pairs; unlisted registers are zero.
 // `mem`/`read` addresses and rsp are guest VAs: guest VA v lives at linear address
 // v + guestBase (64-bit wrapping), the translation the module was linked with. Addresses inside
@@ -20,6 +21,8 @@ const FLAGS = STATE + spec.flagsOffset;
 const XMM = STATE + (spec.xmmOffset || 0);
 // MXCSR of a new guest thread (the runtime initialises it like this).
 const MXCSR = spec.mxcsrOffset ? STATE + spec.mxcsrOffset : 0;
+const RESUME_RIP = spec.resumeRipOffset ? STATE + spec.resumeRipOffset : 0;
+const UNWIND_PENDING = spec.unwindPendingOffset ? STATE + spec.unwindPendingOffset : 0;
 const RSP = 4;
 const RETURN_ADDRESS = 0xC0DEC0DEn;
 const GUEST_BASE = BigInt(spec.guestBase || 0);
@@ -50,6 +53,20 @@ const hostFunctions = new Map([
     const n = v.getBigInt64(GPR + 8 * 8, true);
     v.setFloat64(XMM, x * y + Number(n), true);
     v.setBigUint64(GPR + RSP * 8, v.getBigUint64(GPR + RSP * 8, true) + 8n, true);
+  }],
+  // 0x7FFE0020: stands in for RtlRestoreContext. rcx points at { rip, mask, gpr[16] }: every GPR
+  // whose bit is set in mask is restored, then the restore is left pending at rip (resume
+  // protocol: no `ret`, the lifted frames unwind until the owner resumes).
+  [0x7FFE0020n, () => {
+    const v = view();
+    const desc = lin(v.getBigUint64(GPR + 8, true));
+    const rip = v.getBigUint64(desc, true);
+    const mask = Number(v.getBigUint64(desc + 8, true));
+    for (let i = 0; i < 16; i++) {
+      if (mask & (1 << i)) v.setBigUint64(GPR + i * 8, v.getBigUint64(desc + 16 + i * 8, true), true);
+    }
+    v.setBigUint64(RESUME_RIP, rip, true);
+    v.setUint8(UNWIND_PENDING, 1);
   }],
 ]);
 
@@ -117,6 +134,7 @@ const lines = spec.cases.map((c, index) => {
   const regs0 = new Map(c.regs.map(([i, r]) => [i, BigInt(r)]));
   c.flags.forEach((f, i) => v.setUint8(FLAGS + i, f));
   if (MXCSR) v.setUint32(MXCSR, 0x1F80, true);
+  if (UNWIND_PENDING) v.setUint8(UNWIND_PENDING, 0);
   for (const [addr, bytes] of c.mem) {
     const base = lin(addr);
     for (let i = 0; i < bytes.length; i += 2) v.setUint8(base + i / 2, parseInt(bytes.substr(i, 2), 16));

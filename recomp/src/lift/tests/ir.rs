@@ -226,7 +226,12 @@ fn calls_push_return_addresses_and_sync_state() {
         .find("call void @sub_5000(ptr %state)")
         .expect("direct call");
     let before = &body[..call];
-    let after = &body[call..];
+    // The registers are reloaded after the call (past the resume-protocol check).
+    let call_at = lifted
+        .ir
+        .find("call void @sub_5000(ptr %state)")
+        .expect("call");
+    let after = &lifted.ir[call_at..];
     assert!(before.rfind("store i64").is_some() && after.contains("load i64, ptr %t"));
     assert_eq!(lifted.callees.iter().copied().collect::<Vec<_>>(), [0x5000]);
 }
@@ -438,9 +443,8 @@ fn code_after_a_non_returning_call_traps() {
     let block = &func.blocks[&0x1000];
     assert_eq!(block.terminator, Terminator::NoReturnCall);
     let ir = lift_function(&func).expect("lifts").ir;
-    let body = block_text(&ir, "bb_1000");
-    let call = body.find("call void @sub_8000(ptr %state)").expect("call");
-    assert!(body[call..].contains(&trap_call(block.end)), "{body}");
+    let call = ir.find("call void @sub_8000(ptr %state)").expect("call");
+    assert!(ir[call..].contains(&trap_call(block.end)), "{ir}");
 }
 
 #[test]

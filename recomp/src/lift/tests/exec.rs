@@ -25,7 +25,8 @@ use crate::lift::compile::{
 };
 use crate::lift::{
     GUEST_BASE_SYMBOL, GuestBase, STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET,
-    STATE_MXCSR_OFFSET, STATE_SIZE, STATE_XMM_OFFSET, lift_module, lift_module_with,
+    STATE_MXCSR_OFFSET, STATE_RESUME_RIP_OFFSET, STATE_SIZE, STATE_UNWIND_PENDING_OFFSET,
+    STATE_XMM_OFFSET, lift_module, lift_module_with,
 };
 
 pub(super) const RAX: usize = 0;
@@ -458,7 +459,7 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
     let mut json = String::new();
     let _ = write!(
         json,
-        "{{\"state\":\"{STATE_ADDR:#x}\",\"stateSize\":{STATE_SIZE},\"guestBase\":\"{:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"cases\":[",
+        "{{\"state\":\"{STATE_ADDR:#x}\",\"stateSize\":{STATE_SIZE},\"guestBase\":\"{:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"resumeRipOffset\":{STATE_RESUME_RIP_OFFSET},\"unwindPendingOffset\":{STATE_UNWIND_PENDING_OFFSET},\"cases\":[",
         built.guest_base
     );
     for (i, case) in cases.iter().enumerate() {

@@ -124,6 +124,11 @@
 //!   `call void @sub_T(ptr %state)`. Registers are synced around the call.
 //! - `ret [imm16]`: pop the return address (its value is not checked) plus `imm16` bytes, then
 //!   LLVM `ret void`. The host call stack and the guest stack therefore stay in lockstep.
+//! - after every call that can run guest code, the resume protocol (`unwind.rs`) tests
+//!   [`STATE_UNWIND_PENDING_OFFSET`]: while a context restore (exception unwind, `longjmp`) is
+//!   pending, activations return without writing their registers back until the one owning the
+//!   restored `rsp` resumes at the block for [`STATE_RESUME_RIP_OFFSET`]
+//!   ([`cfg::Function::resume_targets`]).
 //! - [`Edge::TailCall`](crate::cfg::Edge::TailCall) (a `jmp`, `jcc` side or fallthrough into another
 //!   function): tail call `@sub_T` followed by `ret void` (the callee's `ret` pops our caller's
 //!   return address, exactly like on hardware).
@@ -154,7 +159,9 @@
 //! - `void __playgta6_trap(ptr state, i64 va)` (noreturn): guest execution reached a trap: the
 //!   trap instruction at `va`, undecodable/unmapped code at `va`, a direct call into non-code
 //!   memory at `va`, the instruction after a call that was assumed never to return, or a
-//!   `cmpxchg16b` at `va` whose operand is not 16-byte aligned (#GP).
+//!   `cmpxchg16b` at `va` whose operand is not 16-byte aligned (#GP). Called with the resume
+//!   flag still set and `va` = the resume `rip`, it reports a context restore to a block that is
+//!   not a resume target of the owning function.
 //!
 //! Instructions whose results the runtime chooses call a helper that is declared only by modules
 //! using it. The lifted code stores all its registers and flags to the state before the call and

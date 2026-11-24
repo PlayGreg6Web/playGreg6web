@@ -6,6 +6,7 @@
 mod exec;
 mod exec_integer;
 mod exec_simd;
+mod exec_unwind;
 #[cfg(target_arch = "x86_64")]
 mod host_diff;
 #[cfg(target_arch = "x86_64")]
@@ -42,6 +43,7 @@ pub(super) struct Program {
     data: Vec<(u64, Vec<u8>)>,
     entries: Vec<u64>,
     no_return: Vec<u64>,
+    resume: Vec<(u64, u64)>,
 }
 
 impl Program {
@@ -89,6 +91,12 @@ impl Program {
         self
     }
 
+    /// Makes `target` a resume target of the function at `owner` (like an EH continuation).
+    pub fn resume(mut self, owner: u64, target: u64) -> Self {
+        self.resume.push((owner, target));
+        self
+    }
+
     /// Runs function discovery over the program.
     pub fn discover(&self) -> BTreeMap<u64, cfg::Function> {
         let lowest = self.pieces.iter().map(|(va, _)| *va).min().unwrap_or(0);
@@ -104,6 +112,8 @@ impl Program {
         let sections = code.chain(data).collect();
         let mut image = CodeImage::new(base, sections, self.entries.clone());
         image.no_return = self.no_return.clone();
+        image.eh.resume_targets = self.resume.clone();
+        image.eh.resume_targets.sort_unstable();
         discover(&image).functions
     }
 
