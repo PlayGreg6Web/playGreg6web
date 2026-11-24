@@ -19,6 +19,7 @@ add_library(playgta6_core STATIC
     os/win32_compat_text.cpp
     os/win32_compat_misc.cpp
     os/xgameruntime.cpp
+    os/xasync_provider.cpp
     os/xbox_offline.cpp
     os/xbox_scarlett.cpp
     os/xbox_middleware.cpp
@@ -203,4 +204,8 @@ else()
     add_executable(test_program_loader ../tests/test_program_loader.cpp)
     target_link_libraries(test_program_loader PRIVATE playgta6_core)
     add_test(NAME playgta6_program_loader_tests COMMAND test_program_loader)
+
+    add_executable(test_xasync_provider ../tests/test_xasync_provider.cpp)
+    target_link_libraries(test_xasync_provider PRIVATE playgta6_core)
+    add_test(NAME playgta6_xasync_provider_tests COMMAND test_xasync_provider)
 endif()

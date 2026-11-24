@@ -11,10 +11,25 @@
 #include <unordered_map>
 
 #include "os/threading.h"
+#include "os/xasync_provider.h"
+
+struct Pg6XTaskQueuePort {
+    Pg6XTaskQueue* owner = nullptr;
+    uint32_t port = 0;  // XTaskQueuePort
+};
 
 struct Pg6XTaskQueue {
     std::atomic<uint32_t> ref_count{1};
-    std::unique_ptr<playgta6::os::XTaskQueue> queue;
+    std::unique_ptr<playgta6::os::XTaskQueue> queue;  // null for a composite queue
+    Pg6XTaskQueuePort ports[2];                         // this queue's own work / completion ports
+    Pg6XTaskQueuePort* borrowed[2] = {nullptr, nullptr};  // composite: the ports it submits to
+    std::atomic<bool> composite_terminated{false};
+
+    Pg6XTaskQueue() {
+        ports[0] = Pg6XTaskQueuePort{this, 0};
+        ports[1] = Pg6XTaskQueuePort{this, 1};
+    }
+    ~Pg6XTaskQueue();  // a composite releases the queues owning its ports
 };
 
 struct Pg6XUser {
@@ -26,31 +41,6 @@ struct Pg6XUser {
 namespace playgta6::os::gdk {
 
 namespace {
-
-constexpr uint64_t kAsyncMagic = 0x5047364153594E43ULL;  // "PG6ASYNC"
-constexpr uint32_t kAsyncFlagResultReady = 1u << 0;
-constexpr uint32_t kAsyncFlagConsumed = 1u << 1;
-
-struct AsyncInternalHeader {
-    uint64_t magic = 0;
-    uint64_t op_id = 0;
-    int32_t cached_status = E_PENDING_HR;
-    uint32_t flags = 0;
-    uint64_t cached_result_size = 0;
-};
-
-static_assert(sizeof(AsyncInternalHeader) <= sizeof(Pg6XAsyncBlock::internal),
-              "AsyncInternalHeader must fit inside Pg6XAsyncBlock::internal");
-
-void write_async_header(XAsyncBlock* block, const AsyncInternalHeader& header) {
-    std::memcpy(block->internal, &header, sizeof(header));
-}
-
-AsyncInternalHeader read_async_header(const XAsyncBlock* block) {
-    AsyncInternalHeader header{};
-    std::memcpy(&header, block->internal, sizeof(header));
-    return header;
-}
 
 void retain_task_queue(Pg6XTaskQueue* q) {
     if (q != nullptr) {
@@ -64,102 +54,29 @@ void release_task_queue(Pg6XTaskQueue* q) {
     }
 }
 
+// The XTaskQueue and port index a submission to (queue, port) reaches: the queue's own port, or
+// for a composite queue the borrowed port's owner. nullptr for an invalid port.
+playgta6::os::XTaskQueue* port_target(XTaskQueueHandle queue, XTaskQueuePort port, uint32_t& index) {
+    const auto i = static_cast<uint32_t>(port);
+    if (i > 1) {
+        return nullptr;
+    }
+    if (queue->queue != nullptr) {
+        index = i;
+        return queue->queue.get();
+    }
+    const Pg6XTaskQueuePort* p = queue->borrowed[i];
+    if (p == nullptr || p->owner == nullptr || p->owner->queue == nullptr) {
+        return nullptr;
+    }
+    index = p->port;
+    return p->owner->queue.get();
+}
+
 void release_user(Pg6XUser* user) {
     if (user != nullptr && user->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         delete user;
     }
-}
-
-struct ScopedTaskQueueRef {
-    Pg6XTaskQueue* ptr = nullptr;
-
-    explicit ScopedTaskQueueRef(Pg6XTaskQueue* q = nullptr, bool add_ref = true) : ptr(q) {
-        if (add_ref && ptr != nullptr) {
-            retain_task_queue(ptr);
-        }
-    }
-
-    ~ScopedTaskQueueRef() { release_task_queue(ptr); }
-
-    ScopedTaskQueueRef(const ScopedTaskQueueRef& other) : ptr(other.ptr) {
-        retain_task_queue(ptr);
-    }
-
-    ScopedTaskQueueRef& operator=(const ScopedTaskQueueRef& other) {
-        if (this != &other) {
-            retain_task_queue(other.ptr);
-            release_task_queue(ptr);
-            ptr = other.ptr;
-        }
-        return *this;
-    }
-
-    ScopedTaskQueueRef(ScopedTaskQueueRef&& other) noexcept : ptr(other.ptr) {
-        other.ptr = nullptr;
-    }
-
-    ScopedTaskQueueRef& operator=(ScopedTaskQueueRef&& other) noexcept {
-        if (this != &other) {
-            release_task_queue(ptr);
-            ptr = other.ptr;
-            other.ptr = nullptr;
-        }
-        return *this;
-    }
-};
-
-struct AsyncOperationState {
-    std::mutex mutex;
-    std::condition_variable cv;
-    HResult status = E_PENDING_HR;
-    size_t result_size = 0;
-    bool result_ready = false;
-    bool callback_completed = false;
-    bool result_consumed = false;
-    std::thread::id callback_thread{};
-    Pg6XUser* user_result = nullptr;
-
-    ~AsyncOperationState() {
-        if (user_result != nullptr) {
-            release_user(user_result);
-            user_result = nullptr;
-        }
-    }
-};
-
-struct AsyncRegistry {
-    std::mutex mutex;
-    uint64_t next_id = 1;
-    std::unordered_map<uint64_t, std::shared_ptr<AsyncOperationState>> ops;
-
-    std::pair<uint64_t, std::shared_ptr<AsyncOperationState>> create() {
-        auto state = std::make_shared<AsyncOperationState>();
-        std::lock_guard<std::mutex> lock(mutex);
-        const uint64_t id = next_id++;
-        ops.emplace(id, state);
-        return {id, std::move(state)};
-    }
-
-    std::shared_ptr<AsyncOperationState> find(uint64_t id) {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto it = ops.find(id);
-        return it != ops.end() ? it->second : nullptr;
-    }
-
-    void erase(uint64_t id) {
-        std::lock_guard<std::mutex> lock(mutex);
-        ops.erase(id);
-    }
-
-    void clear() {
-        std::lock_guard<std::mutex> lock(mutex);
-        ops.clear();
-    }
-};
-
-AsyncRegistry& async_registry() {
-    static AsyncRegistry reg;
-    return reg;
 }
 
 bool map_dispatch_mode(XTaskQueueDispatchMode mode,
@@ -210,46 +127,6 @@ RuntimeState& runtime_state() {
     return state;
 }
 
-void complete_async_op(XAsyncBlock* async_block,
-                       uint64_t op_id,
-                       const std::shared_ptr<AsyncOperationState>& state,
-                       HResult final_status,
-                       size_t final_size) {
-    XAsyncCompletionRoutine cb = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->status = final_status;
-        state->result_size = final_size;
-        state->result_ready = true;
-        state->callback_thread = std::this_thread::get_id();
-        if (failed(final_status) && state->user_result != nullptr) {
-            release_user(state->user_result);
-            state->user_result = nullptr;
-        }
-        if (async_block != nullptr) {
-            AsyncInternalHeader header{};
-            header.magic = kAsyncMagic;
-            header.op_id = op_id;
-            header.cached_status = final_status;
-            header.flags = kAsyncFlagResultReady;
-            header.cached_result_size = static_cast<uint64_t>(final_size);
-            write_async_header(async_block, header);
-            cb = async_block->callback;
-        }
-    }
-
-    if (cb != nullptr && async_block != nullptr) {
-        cb(async_block);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->callback_thread = std::thread::id{};
-        state->callback_completed = true;
-    }
-    state->cv.notify_all();
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -265,7 +142,6 @@ HResult XGameRuntimeInitialize() {
 
 void XGameRuntimeUninitialize() {
     Pg6XTaskQueue* queue_to_release = nullptr;
-    bool clear_ops = false;
     {
         auto& state = runtime_state();
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -276,15 +152,11 @@ void XGameRuntimeUninitialize() {
         if (state.init_count == 0) {
             queue_to_release = state.process_queue;
             state.process_queue = nullptr;
-            clear_ops = true;
         }
     }
     if (queue_to_release != nullptr) {
         queue_to_release->queue->terminate(true, true);
         release_task_queue(queue_to_release);
-    }
-    if (clear_ops) {
-        async_registry().clear();
     }
 }
 
@@ -343,53 +215,53 @@ HResult XTaskQueueSubmitCallback(XTaskQueueHandle queue,
                                  XTaskQueuePort port,
                                  void* callback_context,
                                  XTaskQueueCallback callback) {
-    if (queue == nullptr || queue->queue == nullptr || callback == nullptr) {
+    if (queue == nullptr || callback == nullptr) {
         return E_INVALIDARG_HR;
+    }
+    uint32_t index = 0;
+    playgta6::os::XTaskQueue* target = port_target(queue, port, index);
+    if (target == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    if (queue->queue == nullptr && queue->composite_terminated.load(std::memory_order_acquire)) {
+        return E_ABORT_HR;
     }
 
     auto wrapper = [callback, callback_context](bool canceled) {
         callback(callback_context, canceled);
     };
-
-    bool submitted = false;
-    switch (port) {
-        case XTaskQueuePort::Work:
-            submitted = queue->queue->submit_work_cancellable(std::move(wrapper));
-            break;
-        case XTaskQueuePort::Completion:
-            submitted = queue->queue->submit_completion_cancellable(std::move(wrapper));
-            break;
-        default:
-            return E_INVALIDARG_HR;
-    }
-
+    const bool submitted = index == 0 ? target->submit_work_cancellable(std::move(wrapper))
+                                      : target->submit_completion_cancellable(std::move(wrapper));
     return submitted ? S_OK_HR : E_ABORT_HR;
 }
 
 bool XTaskQueueDispatch(XTaskQueueHandle queue,
                         XTaskQueuePort port,
                         uint32_t timeout_ms) {
-    if (queue == nullptr || queue->queue == nullptr) {
+    if (queue == nullptr) {
         return false;
     }
-    switch (port) {
-        case XTaskQueuePort::Work:
-            return queue->queue->dispatch_work(timeout_ms);
-        case XTaskQueuePort::Completion:
-            return queue->queue->dispatch_completion(timeout_ms);
-        default:
-            return false;
+    uint32_t index = 0;
+    playgta6::os::XTaskQueue* target = port_target(queue, port, index);
+    if (target == nullptr) {
+        return false;
     }
+    return index == 0 ? target->dispatch_work(timeout_ms) : target->dispatch_completion(timeout_ms);
 }
 
 HResult XTaskQueueTerminate(XTaskQueueHandle queue,
                             bool wait,
                             void* callback_context,
                             XTaskQueueTerminatedCallback callback) {
-    if (queue == nullptr || queue->queue == nullptr) {
+    if (queue == nullptr) {
         return E_INVALIDARG_HR;
     }
-    queue->queue->terminate(wait, true);
+    if (queue->queue == nullptr) {
+        // Composite: stop submissions through it; the borrowed ports keep running.
+        queue->composite_terminated.store(true, std::memory_order_release);
+    } else {
+        queue->queue->terminate(wait, true);
+    }
     if (callback != nullptr) {
         callback(callback_context);
     }
@@ -422,68 +294,36 @@ bool XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle* queue) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// XAsyncBlock helpers
-// ---------------------------------------------------------------------------
-
-HResult XAsyncGetStatus(XAsyncBlock* async_block, bool wait) {
-    if (async_block == nullptr) {
+HResult XTaskQueueGetPort(XTaskQueueHandle queue, XTaskQueuePort port, XTaskQueuePortHandle* port_handle) {
+    if (port_handle == nullptr) {
+        return E_POINTER_HR;
+    }
+    *port_handle = nullptr;
+    const auto i = static_cast<uint32_t>(port);
+    if (queue == nullptr || i > 1) {
         return E_INVALIDARG_HR;
     }
-    const AsyncInternalHeader header = read_async_header(async_block);
-    if (header.magic != kAsyncMagic) {
-        return E_INVALIDARG_HR;
-    }
-
-    auto state = async_registry().find(header.op_id);
-    if (!state) {
-        if ((header.flags & kAsyncFlagResultReady) != 0) {
-            return header.cached_status;
-        }
-        return E_INVALIDARG_HR;
-    }
-
-    std::unique_lock<std::mutex> lock(state->mutex);
-    if (wait && !state->callback_completed) {
-        if (state->callback_thread == std::this_thread::get_id() && state->result_ready) {
-            return state->status;
-        }
-        state->cv.wait(lock, [&]() { return state->callback_completed; });
-    }
-    return state->result_ready ? state->status : E_PENDING_HR;
+    *port_handle = queue->queue != nullptr ? &queue->ports[i] : queue->borrowed[i];
+    return *port_handle != nullptr ? S_OK_HR : E_INVALIDARG_HR;
 }
 
-HResult XAsyncGetResultSize(XAsyncBlock* async_block, size_t* buffer_size) {
-    if (async_block == nullptr || buffer_size == nullptr) {
+HResult XTaskQueueCreateComposite(XTaskQueuePortHandle work_port,
+                                  XTaskQueuePortHandle completion_port,
+                                  XTaskQueueHandle* queue) {
+    if (queue == nullptr) {
+        return E_POINTER_HR;
+    }
+    *queue = nullptr;
+    if (work_port == nullptr || completion_port == nullptr || work_port->owner == nullptr ||
+        completion_port->owner == nullptr) {
         return E_INVALIDARG_HR;
     }
-    *buffer_size = 0;
-
-    const AsyncInternalHeader header = read_async_header(async_block);
-    if (header.magic != kAsyncMagic) {
-        return E_INVALIDARG_HR;
-    }
-
-    auto state = async_registry().find(header.op_id);
-    if (!state) {
-        if ((header.flags & kAsyncFlagResultReady) != 0) {
-            if (failed(header.cached_status)) {
-                return header.cached_status;
-            }
-            *buffer_size = static_cast<size_t>(header.cached_result_size);
-            return S_OK_HR;
-        }
-        return E_INVALIDARG_HR;
-    }
-
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (!state->result_ready) {
-        return E_PENDING_HR;
-    }
-    if (failed(state->status)) {
-        return state->status;
-    }
-    *buffer_size = state->result_size;
+    auto* composite = new Pg6XTaskQueue();
+    composite->borrowed[0] = work_port;
+    composite->borrowed[1] = completion_port;
+    retain_task_queue(work_port->owner);
+    retain_task_queue(completion_port->owner);
+    *queue = composite;
     return S_OK_HR;
 }
 
@@ -491,71 +331,53 @@ HResult XAsyncGetResultSize(XAsyncBlock* async_block, size_t* buffer_size) {
 // Offline XUser stub
 // ---------------------------------------------------------------------------
 
+namespace {
+
+const char kXUserAddIdentity = 0;
+
+// XUserAddAsync through the XAsync provider framework: DoWork on the block's queue creates the
+// offline user, GetResult hands it out, Cleanup releases one nobody took.
+class XUserAddProvider final : public XAsyncProviderImpl {
+public:
+    ~XUserAddProvider() override { release_user(user_); }
+
+    HResult call(XAsyncOp op, XAsyncBlock* block, size_t buffer_size, uint64_t buffer) override {
+        switch (op) {
+            case XAsyncOp::Begin:
+                return XAsyncSchedule(block, 0);
+            case XAsyncOp::DoWork:
+                user_ = new Pg6XUser();
+                XAsyncComplete(block, S_OK_HR, sizeof(XUserHandle));
+                return S_OK_HR;
+            case XAsyncOp::GetResult:
+                if (buffer == 0 || buffer_size < sizeof(XUserHandle)) {
+                    return E_INVALIDARG_HR;
+                }
+                *reinterpret_cast<XUserHandle*>(static_cast<uintptr_t>(buffer)) = user_;
+                user_ = nullptr;
+                return S_OK_HR;
+            case XAsyncOp::Cleanup:
+                release_user(user_);
+                user_ = nullptr;
+                return S_OK_HR;
+            default:
+                return S_OK_HR;  // Cancel: a queued DoWork then completes with E_ABORT
+        }
+    }
+
+private:
+    Pg6XUser* user_ = nullptr;
+};
+
+}  // namespace
+
 HResult XUserAddAsync(XUserAddOptions options, XAsyncBlock* async_block) {
     (void)options;
     if (async_block == nullptr) {
         return E_INVALIDARG_HR;
     }
-
-    ScopedTaskQueueRef target_queue;
-    if (async_block->queue != nullptr) {
-        target_queue = ScopedTaskQueueRef(async_block->queue, /*add_ref=*/true);
-    } else {
-        XTaskQueueHandle proc_queue = nullptr;
-        if (!XTaskQueueGetCurrentProcessTaskQueue(&proc_queue) || proc_queue == nullptr) {
-            return E_FAIL_HR;
-        }
-        // XTaskQueueGetCurrentProcessTaskQueue already incremented ref_count.
-        target_queue = ScopedTaskQueueRef(proc_queue, /*add_ref=*/false);
-    }
-
-    auto [op_id, state] = async_registry().create();
-
-    AsyncInternalHeader init_header{};
-    init_header.magic = kAsyncMagic;
-    init_header.op_id = op_id;
-    init_header.cached_status = E_PENDING_HR;
-    init_header.flags = 0;
-    init_header.cached_result_size = 0;
-    write_async_header(async_block, init_header);
-
-    const bool submitted = target_queue.ptr->queue->submit_work_cancellable(
-        [async_block, op_id, state, target_queue](bool work_canceled) {
-            if (work_canceled) {
-                complete_async_op(async_block, op_id, state, E_ABORT_HR, 0);
-                return;
-            }
-
-            auto* offline_user = new Pg6XUser();
-            offline_user->xuid = kOfflineUserXuid;
-            offline_user->gamertag = kOfflineUserGamertag;
-
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->user_result = offline_user;
-            }
-
-            const bool comp_submitted = target_queue.ptr->queue->submit_completion_cancellable(
-                [async_block, op_id, state, target_queue](bool comp_canceled) {
-                    if (comp_canceled) {
-                        complete_async_op(async_block, op_id, state, E_ABORT_HR, 0);
-                    } else {
-                        complete_async_op(
-                            async_block, op_id, state, S_OK_HR, sizeof(XUserHandle));
-                    }
-                });
-
-            if (!comp_submitted) {
-                complete_async_op(async_block, op_id, state, E_ABORT_HR, 0);
-            }
-        });
-
-    if (!submitted) {
-        complete_async_op(async_block, op_id, state, E_ABORT_HR, 0);
-        return E_ABORT_HR;
-    }
-
-    return S_OK_HR;
+    return XAsyncBeginWith(async_block, std::make_unique<XUserAddProvider>(),
+                           static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&kXUserAddIdentity)), "XUserAddAsync");
 }
 
 HResult XUserAddResult(XAsyncBlock* async_block, XUserHandle* new_user) {
@@ -563,42 +385,9 @@ HResult XUserAddResult(XAsyncBlock* async_block, XUserHandle* new_user) {
         return E_INVALIDARG_HR;
     }
     *new_user = nullptr;
-
-    AsyncInternalHeader header = read_async_header(async_block);
-    if (header.magic != kAsyncMagic) {
-        return E_INVALIDARG_HR;
-    }
-
-    auto state = async_registry().find(header.op_id);
-    if (!state) {
-        if ((header.flags & kAsyncFlagConsumed) != 0) {
-            return E_FAIL_HR;
-        }
-        return E_INVALIDARG_HR;
-    }
-
-    HResult result_hr = S_OK_HR;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (!state->result_ready) {
-            return E_PENDING_HR;
-        }
-        if (failed(state->status)) {
-            result_hr = state->status;
-        } else if (state->result_consumed || state->user_result == nullptr) {
-            return E_FAIL_HR;
-        } else {
-            *new_user = state->user_result;
-            state->user_result = nullptr;
-            state->result_consumed = true;
-            header.flags |= kAsyncFlagConsumed;
-            write_async_header(async_block, header);
-            result_hr = S_OK_HR;
-        }
-    }
-
-    async_registry().erase(header.op_id);
-    return result_hr;
+    return XAsyncGetResultWith(async_block, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&kXUserAddIdentity)),
+                               sizeof(XUserHandle), static_cast<uint64_t>(reinterpret_cast<uintptr_t>(new_user)),
+                               nullptr);
 }
 
 HResult XUserGetId(XUserHandle user, uint64_t* user_id) {
@@ -671,6 +460,14 @@ XSystemAnalyticsInfo XSystemGetAnalyticsInfo() {
 
 }  // namespace playgta6::os::gdk
 
+Pg6XTaskQueue::~Pg6XTaskQueue() {
+    for (Pg6XTaskQueuePort* port : borrowed) {
+        if (port != nullptr) {
+            playgta6::os::gdk::release_task_queue(port->owner);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prefixed C-ABI entrypoints
 // ---------------------------------------------------------------------------
@@ -739,6 +536,19 @@ Pg6HResult pg6_gdk_xtask_queue_terminate(Pg6XTaskQueueHandle queue,
 
 int32_t pg6_gdk_xtask_queue_get_current_process_task_queue(Pg6XTaskQueueHandle* queue) {
     return playgta6::os::gdk::XTaskQueueGetCurrentProcessTaskQueue(queue) ? 1 : 0;
+}
+
+Pg6HResult pg6_gdk_xtask_queue_get_port(Pg6XTaskQueueHandle queue,
+                                        uint32_t port,
+                                        Pg6XTaskQueuePortHandle* port_handle) {
+    return playgta6::os::gdk::XTaskQueueGetPort(queue, static_cast<playgta6::os::gdk::XTaskQueuePort>(port),
+                                                port_handle);
+}
+
+Pg6HResult pg6_gdk_xtask_queue_create_composite(Pg6XTaskQueuePortHandle work_port,
+                                                Pg6XTaskQueuePortHandle completion_port,
+                                                Pg6XTaskQueueHandle* queue) {
+    return playgta6::os::gdk::XTaskQueueCreateComposite(work_port, completion_port, queue);
 }
 
 Pg6HResult pg6_gdk_xasync_get_status(Pg6XAsyncBlock* async_block, int32_t wait) {

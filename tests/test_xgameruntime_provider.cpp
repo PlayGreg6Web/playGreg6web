@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,6 +17,8 @@
 #include "os/win32_kernel.h"
 #include "os/shim_exports.h"
 #include "os/win32_loader.h"
+#include "os/xasync_provider.h"
+#include "os/xbox_middleware.h"
 #include "os/xgameruntime.h"
 #include "os/xgameruntime_provider.h"
 
@@ -74,9 +77,116 @@ void sub_async_done(GuestState* s) {
     ret(s);
 }
 
+// A guest XAsync provider (HRESULT provider(XAsyncOp op, const XAsyncProviderData* data)) that
+// drives the operation through the xgameruntime.dll XAsync interface like the game's statically
+// linked libraries do: Begin schedules, DoWork returns E_PENDING (rescheduled) g_provider_pending
+// times and then completes with an 8-byte payload, GetResult writes the payload.
+constexpr uint64_t kProvider = 0x140020200ULL;
+constexpr uint64_t kProviderRet = kProvider + 0x40;
+constexpr uint64_t kWorkFn = 0x140020300ULL;  // HRESULT work(XAsyncBlock*): returns g_work_result
+constexpr uint64_t kPayload = 0x0123456789ABCDEFULL;
+
+uint64_t g_async_api = 0;
+std::mutex g_provider_mutex;
+std::string g_provider_ops;
+int g_provider_pending = 0;
+uint64_t g_seen_async = 0;
+uint64_t g_seen_context = 0;
+uint64_t g_seen_buffer_size = 0;
+std::atomic<int> g_work_calls{0};
+int32_t g_work_result = 0;
+
+void store64(GuestState* /*s*/, uint64_t va, uint64_t value) {
+    CHECK(g_arena->write(va, &value, sizeof(value)));
+}
+
+// `call [vtable + 8*slot]` on the XAsync interface from guest code (this + up to 3 arguments).
+uint64_t guest_api_call(GuestState* s, uint32_t slot, std::initializer_list<uint64_t> args) {
+    s->gpr[GuestReg::Rsp] -= 0x28;
+    const uint64_t regs[3] = {GuestReg::Rdx, GuestReg::R8, GuestReg::R9};
+    size_t i = 0;
+    s->gpr[GuestReg::Rcx] = g_async_api;
+    for (uint64_t a : args) {
+        s->gpr[regs[i++]] = a;
+    }
+    s->gpr[GuestReg::Rsp] -= 8;
+    store64(s, s->gpr[GuestReg::Rsp], kProviderRet);
+    __playgta6_indirect_call(s, load64(load64(g_async_api) + 8ull * slot));
+    s->gpr[GuestReg::Rsp] += 0x28;
+    return s->gpr[GuestReg::Rax];
+}
+
+void provider_record(char c) {
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    g_provider_ops.push_back(c);
+}
+
+std::string provider_ops() {
+    std::lock_guard<std::mutex> lock(g_provider_mutex);
+    return g_provider_ops;
+}
+
+void sub_provider(GuestState* s) {
+    const uint32_t op = static_cast<uint32_t>(s->gpr[GuestReg::Rcx]);
+    const uint64_t data = s->gpr[GuestReg::Rdx];
+    const uint64_t async = load64(data);
+    uint64_t rax = 0;
+    switch (op) {
+        case 0:  // Begin
+            provider_record('B');
+            g_seen_async = async;
+            g_seen_context = load64(data + 24);
+            rax = guest_api_call(s, 9, {async, 0});  // XAsyncSchedule(async, 0)
+            break;
+        case 1: {  // DoWork
+            provider_record('W');
+            bool again = false;
+            {
+                std::lock_guard<std::mutex> lock(g_provider_mutex);
+                if (g_provider_pending > 0) {
+                    --g_provider_pending;
+                    again = true;
+                }
+            }
+            if (again) {
+                guest_api_call(s, 9, {async, 0});
+                rax = static_cast<uint32_t>(playgta6::os::gdk::E_PENDING_HR);
+            } else {
+                guest_api_call(s, 10, {async, 0, 8});  // XAsyncComplete(async, S_OK, 8)
+                rax = 0;
+            }
+            break;
+        }
+        case 2:  // GetResult
+            provider_record('R');
+            g_seen_buffer_size = load64(data + 8);
+            store64(s, load64(data + 16), kPayload);
+            break;
+        case 3:  // Cancel
+            provider_record('X');
+            break;
+        case 4:  // Cleanup
+            provider_record('C');
+            break;
+        default:
+            rax = static_cast<uint32_t>(com::E_INVALIDARG_HR);
+    }
+    s->gpr[GuestReg::Rax] = rax;
+    ret(s);
+}
+
+void sub_work(GuestState* s) {
+    g_work_calls.fetch_add(1);
+    g_seen_async = s->gpr[GuestReg::Rcx];
+    s->gpr[GuestReg::Rax] = static_cast<uint32_t>(g_work_result);
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kRecord, sub_record},
     {kAsyncDone, sub_async_done},
+    {kProvider, sub_provider},
+    {kWorkFn, sub_work},
 };
 
 struct GuestFault {
@@ -389,7 +499,7 @@ void test_unimplemented_slots() {
     com::clear_diagnostics();
     bool trapped = false;
     try {
-        fx.vcall(async, 13, {0, 0, 0});  // XTaskQueueCreateComposite: known name, not implemented
+        fx.vcall(async, 8, {0, 0, 0});  // unmapped slot of the XAsync interface
     } catch (const GuestFault& f) {
         fault = f;
         trapped = true;
@@ -397,8 +507,8 @@ void test_unimplemented_slots() {
     fx.restore_stack();
     CHECK(trapped);
     CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot));
-    CHECK(fault.info.detail == 13);
-    CHECK(diag_contains("slot 13 (XTaskQueueCreateComposite)"));
+    CHECK(fault.info.detail == 8);
+    CHECK(diag_contains("slot 8 called"));
 
     // A stub-only interface reports its slots too.
     int32_t hr = -1;
@@ -423,6 +533,167 @@ void test_unimplemented_slots() {
     CHECK(fx.vcall(unmapped, 2) >= 1);  // IUnknown still works
 }
 
+uint64_t make_guest_block(Fixture& fx, uint64_t queue) {
+    const uint64_t block = fx.alloc(sizeof(cbk::GuestAsyncBlock));
+    cbk::GuestAsyncBlock guest{};
+    guest.queue = queue;
+    guest.context = 0xC0;
+    guest.callback = kAsyncDone;
+    CHECK(com::write_guest(block, guest));
+    return block;
+}
+
+// The XAsync provider slots end to end: QueryApiImpl -> vtable slot -> framework -> guest provider.
+void test_async_provider_slots() {
+    namespace gdk = playgta6::os::gdk;
+    Fixture fx;
+    const uint64_t api = fx.query(kAsyncQueue, kAsyncQueue);
+    g_async_api = api;
+    const uint64_t out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(api, 12, {0, 0, out})) == 0);  // Manual / Manual queue
+    const uint64_t queue = load64(out);
+    const uint64_t identity = 0x1D1D;
+    const uint64_t name = fx.cstring("TestOperation");
+    auto dispatch = [&](uint64_t q, uint32_t port) { return (fx.vcall(api, 16, {q, port, 0}) & 0xFF) == 1; };
+
+    // Begin -> DoWork (E_PENDING, rescheduled) -> DoWork (complete) -> callback -> GetResult -> Cleanup.
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        g_provider_ops.clear();
+        g_provider_pending = 1;
+    }
+    const uint64_t block = make_guest_block(fx, queue);
+    CHECK(hr32(fx.vcall(api, 7, {block, 0xC7C7, identity, name, kProvider})) == 0);  // XAsyncBegin
+    CHECK(provider_ops() == "B");
+    CHECK(g_seen_async == block && g_seen_context == 0xC7C7);  // the guest block and context
+    CHECK(hr32(fx.vcall(api, 3, {block, 0})) == gdk::E_PENDING_HR);
+    CHECK(dispatch(queue, 0));
+    CHECK(hr32(fx.vcall(api, 3, {block, 0})) == gdk::E_PENDING_HR);
+    CHECK(dispatch(queue, 0));
+    CHECK(hr32(fx.vcall(api, 3, {block, 0})) == 0);
+    g_done_block = 0;
+    CHECK(dispatch(queue, 1));
+    CHECK(g_done_block == block);  // guest completion callback with the guest block
+    const uint64_t size = fx.alloc(8);
+    CHECK(hr32(fx.vcall(api, 4, {block, size})) == 0 && load64(size) == 8);
+    const uint64_t buffer = fx.alloc(16);
+    const uint64_t used = fx.alloc(8);
+    CHECK(hr32(fx.vcall(api, 11, {block, identity + 1, 16, buffer, used})) == com::E_INVALIDARG_HR);
+    CHECK(hr32(fx.vcall(api, 11, {block, identity, 4, buffer, used})) == gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+    CHECK(hr32(fx.vcall(api, 11, {block, identity, 16, buffer, used})) == 0);  // XAsyncGetResult
+    CHECK(load64(buffer) == kPayload && load64(used) == 8 && g_seen_buffer_size == 8);
+    CHECK(provider_ops() == "BWWRC");
+    CHECK(hr32(fx.vcall(api, 11, {block, identity, 16, buffer, 0})) == gdk::E_ILLEGAL_METHOD_CALL_HR);
+    CHECK(hr32(fx.vcall(api, 3, {block, 1})) == 0);
+    pg6_gdk_xasync_complete(cbk::async_shadow_find(block), gdk::E_FAIL_HR, 0);  // ignored
+    fx.vcall(api, 10, {block, static_cast<uint32_t>(gdk::E_FAIL_HR), 0});    // ignored too
+    CHECK(hr32(fx.vcall(api, 3, {block, 0})) == 0);
+
+    // XAsyncCancel before the work ran: the provider is told, the queued DoWork aborts.
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        g_provider_ops.clear();
+    }
+    const uint64_t block2 = make_guest_block(fx, queue);
+    CHECK(hr32(fx.vcall(api, 7, {block2, 0, identity, 0, kProvider})) == 0);
+    fx.vcall(api, 5, {block2});  // XAsyncCancel
+    CHECK(dispatch(queue, 0));
+    CHECK(hr32(fx.vcall(api, 3, {block2, 0})) == gdk::E_ABORT_HR);
+    g_done_block = 0;
+    CHECK(dispatch(queue, 1));
+    CHECK(g_done_block == block2);
+    CHECK(provider_ops() == "BXC");
+
+    // XAsyncRun: the guest work function runs as DoWork; its result is the status.
+    g_work_result = static_cast<int32_t>(0x80070005u);
+    const uint64_t block3 = make_guest_block(fx, queue);
+    CHECK(hr32(fx.vcall(api, 6, {block3, kWorkFn})) == 0);
+    CHECK(g_work_calls == 0);
+    CHECK(dispatch(queue, 0));
+    CHECK(g_work_calls == 1 && g_seen_async == block3);
+    CHECK(hr32(fx.vcall(api, 3, {block3, 0})) == static_cast<int32_t>(0x80070005u));
+    CHECK(dispatch(queue, 1));
+    CHECK(hr32(fx.vcall(api, 6, {block3, 0})) == com::E_INVALIDARG_HR);
+    CHECK(hr32(fx.vcall(api, 7, {block3, 0, 0, 0, 0})) == com::E_INVALIDARG_HR);
+
+    // Null queue: the process task queue's threads run DoWork and the callback.
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        g_provider_ops.clear();
+        g_provider_pending = 0;
+    }
+    const uint64_t block4 = make_guest_block(fx, 0);
+    g_done_block = 0;
+    CHECK(hr32(fx.vcall(api, 7, {block4, 0, identity, 0, kProvider})) == 0);
+    CHECK(hr32(fx.vcall(api, 3, {block4, 1})) == 0);  // wait
+    CHECK(g_done_block == block4);
+    CHECK(hr32(fx.vcall(api, 11, {block4, identity, 8, buffer, used})) == 0);
+    CHECK(provider_ops() == "BWRC");
+
+    // XTaskQueueGetPort / XTaskQueueCreateComposite: work from `queue`, completions from `queue2`.
+    CHECK(hr32(fx.vcall(api, 12, {0, 0, out})) == 0);
+    const uint64_t queue2 = load64(out);
+    CHECK(hr32(fx.vcall(api, 14, {queue, 0, out})) == 0);
+    const uint64_t work_port = load64(out);
+    CHECK(hr32(fx.vcall(api, 14, {queue2, 1, out})) == 0);
+    const uint64_t completion_port = load64(out);
+    CHECK(work_port != 0 && completion_port != 0 && work_port != completion_port);
+    com::clear_diagnostics();
+    CHECK(hr32(fx.vcall(api, 13, {work_port, 0x4242, out})) == com::E_INVALIDARG_HR);
+    CHECK(diag_contains("invalid XTaskQueuePortHandle"));
+    CHECK(hr32(fx.vcall(api, 13, {work_port, completion_port, out})) == 0);
+    const uint64_t composite = load64(out);
+    CHECK(composite != 0);
+    {
+        std::lock_guard<std::mutex> lock(g_provider_mutex);
+        g_provider_ops.clear();
+    }
+    const uint64_t block5 = make_guest_block(fx, composite);
+    CHECK(hr32(fx.vcall(api, 7, {block5, 0, identity, 0, kProvider})) == 0);
+    CHECK(!dispatch(queue2, 0));
+    CHECK(dispatch(queue, 0));  // the composite's work port is queue's
+    g_done_block = 0;
+    CHECK(!dispatch(queue, 1));
+    CHECK(dispatch(composite, 1));  // dispatching the composite dispatches queue2's port
+    CHECK(g_done_block == block5);
+    CHECK(hr32(fx.vcall(api, 11, {block5, identity, 8, buffer, used})) == 0);
+    for (uint64_t q : {composite, queue2, queue}) {
+        fx.vcall(api, 17, {q});  // XTaskQueueCloseHandle
+    }
+    fx.vcall(api, 2);
+    CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
+}
+
+// libHttpClient flat imports taking a guest XAsyncBlock go through shadow blocks.
+void test_http_client_thunks() {
+    namespace gdk = playgta6::os::gdk;
+    Fixture fx;
+    const uint64_t api = fx.query(kAsyncQueue, kAsyncQueue);
+    const uint64_t out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(api, 12, {0, 0, out})) == 0);
+    const uint64_t queue = load64(out);
+    const uint64_t perform = register_host_callable(&pg6_gthunk_hc_http_call_perform_async, "HCHttpCallPerformAsync");
+    const uint64_t cleanup = register_host_callable(&pg6_gthunk_hc_cleanup_async, "HCCleanupAsync");
+    CHECK(pg6_mw_hc_initialize(nullptr) == 0);
+    Pg6HCCallHandle call = nullptr;
+    CHECK(pg6_mw_hc_http_call_create(&call) == 0);
+    const uint64_t block = make_guest_block(fx, queue);
+    CHECK(hr32(fx.call(perform, {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(call)), block})) == 0);
+    CHECK(hr32(fx.vcall(api, 3, {block, 0})) == 0);  // offline: completed at once
+    g_done_block = 0;
+    CHECK((fx.vcall(api, 16, {queue, 1, 0}) & 0xFF) == 1);
+    CHECK(g_done_block == block);
+    const uint64_t block2 = make_guest_block(fx, queue);
+    CHECK(hr32(fx.call(cleanup, {block2})) == 0);
+    CHECK((fx.vcall(api, 16, {queue, 1, 0}) & 0xFF) == 1);
+    CHECK(g_done_block == block2);
+    CHECK(hr32(fx.call(perform, {0x1234, block})) == gdk::E_INVALIDARG_HR);  // unknown call handle
+    CHECK(hr32(fx.call(cleanup, {0})) == gdk::E_INVALIDARG_HR);
+    pg6_mw_hc_http_call_close_handle(call);
+    fx.vcall(api, 17, {queue});
+    CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
+}
+
 }  // namespace
 
 int main() {
@@ -431,6 +702,8 @@ int main() {
     test_task_queue_slots();
     test_user_slots();
     test_unimplemented_slots();
+    test_async_provider_slots();
+    test_http_client_thunks();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xgameruntime_provider: %d failure(s)\n", g_failures);
         return 1;

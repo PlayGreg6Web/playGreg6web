@@ -6,6 +6,7 @@
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_sync.h"
+#include "os/xasync_provider.h"
 #include "os/xbox_offline.h"
 #include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime.h"
@@ -124,6 +125,14 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(XGR, "XTaskQueueGetCurrentProcessTaskQueue", pg6_gdk_xtask_queue_get_current_process_task_queue) \
     E(XGR, "XAsyncGetStatus", pg6_gdk_xasync_get_status) \
     E(XGR, "XAsyncGetResultSize", pg6_gdk_xasync_get_result_size) \
+    E(XGR, "XTaskQueueGetPort", pg6_gdk_xtask_queue_get_port) \
+    E(XGR, "XTaskQueueCreateComposite", pg6_gdk_xtask_queue_create_composite) \
+    E(XGR, "XAsyncBegin", pg6_gdk_xasync_begin) \
+    E(XGR, "XAsyncSchedule", pg6_gdk_xasync_schedule) \
+    E(XGR, "XAsyncComplete", pg6_gdk_xasync_complete) \
+    E(XGR, "XAsyncGetResult", pg6_gdk_xasync_get_result) \
+    E(XGR, "XAsyncCancel", pg6_gdk_xasync_cancel) \
+    E(XGR, "XAsyncRun", pg6_gdk_xasync_run) \
     E(XGR, "XUserAddAsync", pg6_gdk_xuser_add_async) \
     E(XGR, "XUserAddResult", pg6_gdk_xuser_add_result) \
     E(XGR, "XUserGetId", pg6_gdk_xuser_get_id) \

@@ -18,6 +18,7 @@
 #include "guest/guest_runtime.h"
 #include "os/os_shim.h"
 #include "os/win32_loader.h"
+#include "os/xasync_provider.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
 
@@ -42,7 +43,14 @@
 //     s13 CreateComposite(3) h, s14 GetPort(3) h, s15 DuplicateHandle(2) h, s16 Dispatch(3) h,
 //     s17 CloseHandle(1) h, s19 SubmitDelayedCallback(5) h, s22 Terminate(4) m,
 //     s25 GetCurrentProcessTaskQueue(1) h, s29 ()->void called first by 58 wrappers
-//     (XThreadAssertNotTimeSensitive) m.
+//     (XThreadAssertNotTimeSensitive) m. O22 implements s5..s7, s9..s11, s13 and s14 on the XAsync
+//     provider framework (os/xasync_provider.h); the evidence's argument counts match the GDK
+//     signatures: XAsyncCancel(block), XAsyncRun(block, work), XAsyncBegin(block, context,
+//     identity, identityName, provider), XAsyncSchedule(block, delayMs), XAsyncComplete(block, hr,
+//     requiredBufferSize), XAsyncGetResult(block, identity, bufferSize, buffer, bufferUsed),
+//     XTaskQueueCreateComposite(workPort, completionPort, queue*), XTaskQueueGetPort(queue, port,
+//     portHandle*). s8 has no call-site evidence (XAsyncBeginAlloc would take 7 arguments) and
+//     stays a stub like the other unmapped slots.
 //   {01acd177-...} XUser: s4 CloseHandle h, s7 AddAsync h, s8 AddResult h, s11 GetId m,
 //     s20 CheckPrivilege m, s21/s22 ResolvePrivilegeWithUiAsync/Result m,
 //     s23 GetTokenAndSignatureAsync(9) h, s24 ...ResultSize m, s33/s34 Register/Unregister
@@ -124,6 +132,10 @@ HandleTable& stores() {
     static HandleTable t;
     return t;
 }
+HandleTable& ports() {
+    static HandleTable t;
+    return t;
+}
 
 template <typename T>
 T* from_guest(uint64_t value) {
@@ -166,6 +178,74 @@ Pg6XAsyncBlock* find_async(uint64_t guest_block) {
         com::detail::log_bad_pointer("XAsyncBlock (no operation started on it)", guest_block);
     }
     return shadow;
+}
+
+// ---------------------------------------------------------------------------
+// Guest async providers (O22)
+// ---------------------------------------------------------------------------
+
+// XAsyncProviderData in guest memory (Win64 layout).
+struct GuestAsyncProviderData {
+    uint64_t async;        // XAsyncBlock* (the guest block)
+    uint64_t buffer_size;  // size_t
+    uint64_t buffer;       // void*
+    uint64_t context;      // void*
+};
+static_assert(sizeof(GuestAsyncProviderData) == 32, "XAsyncProviderData is 32 bytes on x64");
+static_assert(offsetof(GuestAsyncProviderData, buffer_size) == 8);
+static_assert(offsetof(GuestAsyncProviderData, buffer) == 16);
+static_assert(offsetof(GuestAsyncProviderData, context) == 24);
+
+// A guest XAsyncProvider function behind the framework. Its XAsyncProviderData lives in guest
+// memory for the operation's lifetime; `async` is the guest block, `buffer` (GetResult) the guest
+// buffer. DoWork is a queue callback and runs as a top-level callback; Begin, GetResult, Cancel
+// and Cleanup run in the guest frames that caused them. A provider call left by an unwind (an
+// exception caught by an outer guest frame) counts as failed with E_ABORT.
+class GuestProvider final : public XAsyncProviderImpl {
+public:
+    GuestProvider(uint64_t function, uint64_t guest_block, uint64_t context) : function_(function) {
+        data_ = com::guest_alloc(sizeof(GuestAsyncProviderData));
+        const GuestAsyncProviderData data{guest_block, 0, 0, context};
+        if (data_ != 0 && !com::write_guest(data_, data)) {
+            com::guest_free(data_);
+            data_ = 0;
+        }
+    }
+    ~GuestProvider() override {
+        if (data_ != 0) {
+            com::guest_free(data_);
+        }
+    }
+    bool ok() const { return data_ != 0; }
+
+    HResult call(XAsyncOp op, XAsyncBlock* /*shadow*/, size_t buffer_size, uint64_t buffer) override {
+        if (op == XAsyncOp::GetResult) {
+            com::write_guest(data_ + offsetof(GuestAsyncProviderData, buffer_size), static_cast<uint64_t>(buffer_size));
+            com::write_guest(data_ + offsetof(GuestAsyncProviderData, buffer), buffer);
+        }
+        playgta6::GuestState& state = com::current_guest_state();
+        const com::GuestFunction<int32_t(uint32_t, uint64_t)> provider(function_);
+        const auto code = static_cast<uint32_t>(op);
+        const int32_t hr = op == XAsyncOp::DoWork ? provider.call_top_level(state, code, data_)
+                                                  : provider.call(state, code, data_);
+        return playgta6::guest::unwind_pending(state) ? E_ABORT_HR : hr;
+    }
+
+private:
+    uint64_t function_ = 0;
+    uint64_t data_ = 0;
+};
+
+std::string guest_string(uint64_t va, size_t max) {
+    std::string text;
+    for (uint64_t i = 0; va != 0 && i < max; ++i) {
+        char c = 0;
+        if (!com::read_guest(va + i, &c, 1) || c == 0) {
+            break;
+        }
+        text.push_back(c);
+    }
+    return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +437,105 @@ public:
 
     // XThreadAssertNotTimeSensitive (called at the top of 58 API wrappers): nothing to check.
     void AssertNotTimeSensitive() {}
+
+    // XAsync provider API (O22, os/xasync_provider.h) on the guest block's shadow.
+    void Cancel(uint64_t block) {
+        if (Pg6XAsyncBlock* shadow = find_async(block)) {
+            XAsyncCancel(shadow);
+        }
+    }
+
+    int32_t Run(uint64_t block, uint64_t work) {
+        if (work == 0) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XAsyncBlock* shadow = begin_async(block);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        return XAsyncRunWith(shadow, [work, block](XAsyncBlock*) -> HResult {
+            // DoWork of the queue: a top-level callback.
+            return com::GuestFunction<int32_t(uint64_t)>(work).call_top_level(com::current_guest_state(), block);
+        });
+    }
+
+    int32_t Begin(uint64_t block, uint64_t context, uint64_t identity, uint64_t identity_name, uint64_t provider) {
+        if (provider == 0) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XAsyncBlock* shadow = begin_async(block);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        auto adapter = std::make_unique<GuestProvider>(provider, block, context);
+        if (!adapter->ok()) {
+            return E_OUTOFMEMORY_HR;
+        }
+        const std::string name = guest_string(identity_name, 128);
+        return XAsyncBeginWith(shadow, std::move(adapter), identity, name.c_str());
+    }
+
+    int32_t Schedule(uint64_t block, uint32_t delay_ms) {
+        Pg6XAsyncBlock* shadow = find_async(block);
+        return shadow != nullptr ? XAsyncSchedule(shadow, delay_ms) : E_INVALIDARG_HR;
+    }
+
+    void Complete(uint64_t block, int32_t result, uint64_t required_buffer_size) {
+        if (Pg6XAsyncBlock* shadow = find_async(block)) {
+            XAsyncComplete(shadow, result, static_cast<size_t>(required_buffer_size));
+        }
+    }
+
+    int32_t GetResult(uint64_t block, uint64_t identity, uint64_t buffer_size, uint64_t buffer,
+                      GuestPtr<uint64_t> buffer_used) {
+        if (!buffer_used.is_null()) {
+            buffer_used.write(0);
+        }
+        Pg6XAsyncBlock* shadow = find_async(block);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        size_t used = 0;
+        const int32_t hr = XAsyncGetResultWith(shadow, identity, static_cast<size_t>(buffer_size), buffer, &used);
+        if (!buffer_used.is_null()) {
+            buffer_used.write(static_cast<uint64_t>(used));
+        }
+        return hr;
+    }
+
+    int32_t CreateComposite(uint64_t work_port, uint64_t completion_port, OutPtr queue) {
+        if (queue.is_null()) {
+            return E_POINTER_HR;
+        }
+        queue.write(0);
+        if (!check_handle(ports(), work_port, "XTaskQueuePortHandle") ||
+            !check_handle(ports(), completion_port, "XTaskQueuePortHandle")) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XTaskQueueHandle handle = nullptr;
+        const int32_t hr = pg6_gdk_xtask_queue_create_composite(from_guest<Pg6XTaskQueuePort>(work_port),
+                                                                from_guest<Pg6XTaskQueuePort>(completion_port), &handle);
+        queues().add(handle);
+        queue.write(to_guest(handle));
+        return hr;
+    }
+
+    int32_t GetPort(uint64_t queue, uint32_t port, OutPtr port_handle) {
+        if (port_handle.is_null()) {
+            return E_POINTER_HR;
+        }
+        port_handle.write(0);
+        if (!check_handle(queues(), queue, "XTaskQueue handle")) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XTaskQueuePortHandle handle = nullptr;
+        const int32_t hr = pg6_gdk_xtask_queue_get_port(from_guest<Pg6XTaskQueue>(queue), port, &handle);
+        if (handle != nullptr && !ports().contains(handle)) {
+            ports().add(handle);
+        }
+        port_handle.write(to_guest(handle));
+        return hr;
+    }
 };
 
 // {01acd177-91f9-4763-a38e-ccbb55ce32e0}: XUser.
@@ -698,15 +877,15 @@ using AQ = M<AsyncQueueApi>;
 constexpr auto kAsyncQueueTable = slot_table<27>({
     {3, AQ::method<&AsyncQueueApi::GetStatus>("XAsyncGetStatus")},
     {4, AQ::method<&AsyncQueueApi::GetResultSize>("XAsyncGetResultSize")},
-    {5, AQ::stub("XAsyncCancel")},
-    {6, AQ::stub("XAsyncRun")},
-    {7, AQ::stub("XAsyncBegin")},
-    {9, AQ::stub("XAsyncSchedule")},
-    {10, AQ::stub("XAsyncComplete")},
-    {11, AQ::stub("XAsyncGetResult")},
+    {5, AQ::method<&AsyncQueueApi::Cancel>("XAsyncCancel")},
+    {6, AQ::method<&AsyncQueueApi::Run>("XAsyncRun")},
+    {7, AQ::method<&AsyncQueueApi::Begin>("XAsyncBegin")},
+    {9, AQ::method<&AsyncQueueApi::Schedule>("XAsyncSchedule")},
+    {10, AQ::method<&AsyncQueueApi::Complete>("XAsyncComplete")},
+    {11, AQ::method<&AsyncQueueApi::GetResult>("XAsyncGetResult")},
     {12, AQ::method<&AsyncQueueApi::Create>("XTaskQueueCreate")},
-    {13, AQ::stub("XTaskQueueCreateComposite")},
-    {14, AQ::stub("XTaskQueueGetPort")},
+    {13, AQ::method<&AsyncQueueApi::CreateComposite>("XTaskQueueCreateComposite")},
+    {14, AQ::method<&AsyncQueueApi::GetPort>("XTaskQueueGetPort")},
     {15, AQ::method<&AsyncQueueApi::DuplicateHandle>("XTaskQueueDuplicateHandle")},
     {16, AQ::method<&AsyncQueueApi::Dispatch>("XTaskQueueDispatch")},
     {17, AQ::method<&AsyncQueueApi::CloseHandle>("XTaskQueueCloseHandle")},
@@ -1058,6 +1237,7 @@ void reset_xgameruntime_provider() {
     queues().clear();
     users().clear();
     stores().clear();
+    ports().clear();
     g_title_id.store(0, std::memory_order_relaxed);
 }
 

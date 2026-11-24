@@ -5,11 +5,14 @@
 
 // Opaque C-ABI handles (prefixed with Pg6* to avoid collisions with Xbox GDK SDK headers).
 struct Pg6XTaskQueue;
+struct Pg6XTaskQueuePort;
 struct Pg6XUser;
 struct Pg6XAsyncBlock;
 
 using Pg6HResult = int32_t;
 using Pg6XTaskQueueHandle = Pg6XTaskQueue*;
+// One port (work or completion) of a queue; valid while that queue lives (XTaskQueueGetPort).
+using Pg6XTaskQueuePortHandle = Pg6XTaskQueuePort*;
 using Pg6XUserHandle = Pg6XUser*;
 using Pg6XTaskQueueCallback = void (*)(void* context, bool canceled);
 using Pg6XTaskQueueTerminatedCallback = void (*)(void* context);
@@ -40,6 +43,7 @@ namespace playgta6::os::gdk {
 
 using HResult = Pg6HResult;
 using XTaskQueueHandle = Pg6XTaskQueueHandle;
+using XTaskQueuePortHandle = Pg6XTaskQueuePortHandle;
 using XUserHandle = Pg6XUserHandle;
 using XTaskQueueCallback = Pg6XTaskQueueCallback;
 using XTaskQueueTerminatedCallback = Pg6XTaskQueueTerminatedCallback;
@@ -151,8 +155,21 @@ HResult XTaskQueueTerminate(XTaskQueueHandle queue,
 
 bool XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle* queue);
 
+// Ports and composite queues (O22). XTaskQueueGetPort hands out the port of `queue` (for a
+// composite queue: the port it borrowed); the handle needs no close and stays valid while the
+// queue that owns the port lives. XTaskQueueCreateComposite makes a queue without ports of its
+// own: callbacks submitted to it go to the given ports (each port keeps its owner's dispatch
+// mode), XTaskQueueDispatch on it dispatches them, and it keeps the owning queues alive until it
+// is closed. Terminating a composite queue stops submissions through it (and runs the terminated
+// callback); the borrowed ports and their owners are not terminated, and callbacks already
+// submitted still run there.
+HResult XTaskQueueGetPort(XTaskQueueHandle queue, XTaskQueuePort port, XTaskQueuePortHandle* port_handle);
+HResult XTaskQueueCreateComposite(XTaskQueuePortHandle work_port,
+                                  XTaskQueuePortHandle completion_port,
+                                  XTaskQueueHandle* queue);
+
 // ---------------------------------------------------------------------------
-// XAsyncBlock status / result helpers
+// XAsyncBlock status / result helpers (implemented by os/xasync_provider.cpp)
 // ---------------------------------------------------------------------------
 
 HResult XAsyncGetStatus(XAsyncBlock* async_block, bool wait);
@@ -209,6 +226,12 @@ Pg6HResult pg6_gdk_xtask_queue_terminate(Pg6XTaskQueueHandle queue,
                                          void* callback_context,
                                          Pg6XTaskQueueTerminatedCallback callback);
 int32_t pg6_gdk_xtask_queue_get_current_process_task_queue(Pg6XTaskQueueHandle* queue);
+Pg6HResult pg6_gdk_xtask_queue_get_port(Pg6XTaskQueueHandle queue,
+                                        uint32_t port,
+                                        Pg6XTaskQueuePortHandle* port_handle);
+Pg6HResult pg6_gdk_xtask_queue_create_composite(Pg6XTaskQueuePortHandle work_port,
+                                                Pg6XTaskQueuePortHandle completion_port,
+                                                Pg6XTaskQueueHandle* queue);
 
 Pg6HResult pg6_gdk_xasync_get_status(Pg6XAsyncBlock* async_block, int32_t wait);
 Pg6HResult pg6_gdk_xasync_get_result_size(Pg6XAsyncBlock* async_block, size_t* buffer_size);

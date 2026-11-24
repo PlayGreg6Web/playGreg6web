@@ -12,6 +12,7 @@
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/xasync_provider.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
 
@@ -36,7 +37,7 @@ Pg6ProcAddress by_name(Pg6Handle module, const char* name) {
 
 void test_registration_idempotent() {
     const size_t first = pg6_loader_register_all_shim_exports();
-    CHECK(first == 282);
+    CHECK(first == 290);
     CHECK(register_all_shim_exports() == first);
     CHECK(pg6_loader_register_all_shim_exports() == first);
 
@@ -80,7 +81,7 @@ void test_table_counts_and_lookup() {
     CHECK(per_module["ADVAPI32.dll"] == 10);
     CHECK(per_module["WS2_32.dll"] == 24);
     CHECK(per_module["WINHTTP.dll"] == 15);
-    CHECK(per_module["xgameruntime.dll"] == 40);
+    CHECK(per_module["xgameruntime.dll"] == 48);
     CHECK(per_module["Microsoft.Xbox.Services.141.GDK.C.Thunks.dll"] == 21);
     CHECK(per_module["bcrypt.dll"] == 3);
     CHECK(per_module["USER32.dll"] == 7);
@@ -149,6 +150,7 @@ void test_samples_per_family() {
         {"advapi32", "RegOpenKeyW", proc_address(&pg6_win32_reg_open_key_w)},
         {"bcrypt", "BCryptGenRandom", proc_address(&pg6_win32_bcrypt_gen_random)},
         {"xgameruntime", "XTaskQueueCreate", proc_address(&pg6_gdk_xtask_queue_create)},
+        {"xgameruntime", "XAsyncBegin", proc_address(&pg6_gdk_xasync_begin)},
         {"xgameruntime", "XUserGetGamertag", proc_address(&pg6_gdk_xuser_get_gamertag)},
         {"xgameruntime", "XStoreQueryGameLicenseAsync",
          proc_address(&pg6_gdk_xstore_query_game_license_async)},

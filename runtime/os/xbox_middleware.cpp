@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "os/win32_loader.h"
+#include "os/xasync_provider.h"
 
 namespace playgta6::os::middleware {
 
@@ -31,65 +32,11 @@ using gdk::S_OK_HR;
 using gdk::failed;
 
 // ---------------------------------------------------------------------------
-// XAsyncBlock completion helper (mirrors O5 xgameruntime.cpp header contract)
+// XAsyncBlock completion helper (XAsync provider framework, os/xasync_provider.h)
 // ---------------------------------------------------------------------------
 
-struct CompletedAsyncHeader {
-    uint64_t magic = 0x5047364153594E43ULL;  // "PG6ASYNC"
-    uint64_t op_id = 0;
-    int32_t cached_status = 0;
-    uint32_t flags = 1u;  // result ready
-    uint64_t cached_result_size = 0;
-};
-static_assert(sizeof(CompletedAsyncHeader) <= sizeof(Pg6XAsyncBlock::internal),
-              "CompletedAsyncHeader must fit inside Pg6XAsyncBlock::internal");
-
-constexpr uint32_t kCompletionPort = static_cast<uint32_t>(gdk::XTaskQueuePort::Completion);
-
-void write_completed_header(Pg6XAsyncBlock* block, Pg6HResult status) {
-    CompletedAsyncHeader header{};
-    header.cached_status = status;
-    std::memcpy(block->internal, &header, sizeof(header));
-}
-
-void deliver_completion(void* context, bool canceled) {
-    auto* block = static_cast<Pg6XAsyncBlock*>(context);
-    if (canceled) {
-        write_completed_header(block, E_ABORT_HR);
-    }
-    if (block->callback != nullptr) {
-        block->callback(block);
-    }
-}
-
 Pg6HResult complete_async(Pg6XAsyncBlock* block, Pg6HResult status) {
-    if (block == nullptr) {
-        return E_INVALIDARG_HR;
-    }
-
-    Pg6XTaskQueueHandle queue = block->queue;
-    bool owns_queue_ref = false;
-    if (queue == nullptr) {
-        if (pg6_gdk_xtask_queue_get_current_process_task_queue(&queue) == 0 || queue == nullptr) {
-            return E_FAIL_HR;
-        }
-        owns_queue_ref = true;
-    }
-
-    uint8_t saved_internal[sizeof(block->internal)];
-    std::memcpy(saved_internal, block->internal, sizeof(saved_internal));
-    write_completed_header(block, status);
-
-    const Pg6HResult submitted =
-        pg6_gdk_xtask_queue_submit_callback(queue, kCompletionPort, block, &deliver_completion);
-    if (owns_queue_ref) {
-        pg6_gdk_xtask_queue_close_handle(queue);
-    }
-    if (failed(submitted)) {
-        std::memcpy(block->internal, saved_internal, sizeof(saved_internal));
-        return submitted;
-    }
-    return S_OK_HR;
+    return gdk::complete_async_immediately(block, status);
 }
 
 // ---------------------------------------------------------------------------

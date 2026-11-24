@@ -14,6 +14,8 @@
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/xasync_provider.h"
+#include "os/xbox_middleware.h"
 
 namespace playgta6::guest::callbacks {
 
@@ -103,8 +105,17 @@ void async_completion_entry(Pg6XAsyncBlock* block) {
     }
 }
 
+// The shim still references the shadow: its operation runs or its completion callback has not
+// returned yet.
 bool pending(AsyncShadow& shadow) {
-    return pg6_gdk_xasync_get_status(&shadow.block, 0) == playgta6::os::gdk::E_PENDING_HR;
+    return playgta6::os::gdk::xasync_in_flight(&shadow.block);
+}
+
+// Frees a shadow nobody references any more (its finished operation record goes too).
+void drop_shadow(std::unique_ptr<AsyncShadow> shadow) {
+    if (shadow) {
+        playgta6::os::gdk::xasync_forget(&shadow->block);
+    }
 }
 
 std::string hex(uint64_t value) {
@@ -175,20 +186,26 @@ Pg6XAsyncBlock* async_shadow_begin(uint64_t guest_block) {
     shadow->guest_callback = guest.callback;
     Pg6XAsyncBlock* result = &shadow->block;
 
-    ShadowRegistry& reg = shadows();
-    std::lock_guard<std::mutex> lock(reg.mutex);
-    auto it = reg.active.find(guest_block);
-    if (it != reg.active.end()) {
-        if (pending(*it->second)) {
-            com::detail::diagnostic(
-                ("guest callbacks: XAsyncBlock " + hex(guest_block) + " reused while its operation is pending")
-                    .c_str());
-            reg.retired.push_back(std::move(it->second));
+    std::unique_ptr<AsyncShadow> replaced;
+    {
+        ShadowRegistry& reg = shadows();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.active.find(guest_block);
+        if (it != reg.active.end()) {
+            if (pending(*it->second)) {
+                com::detail::diagnostic(
+                    ("guest callbacks: XAsyncBlock " + hex(guest_block) + " reused while its operation is pending")
+                        .c_str());
+                reg.retired.push_back(std::move(it->second));
+            } else {
+                replaced = std::move(it->second);
+            }
+            it->second = std::move(shadow);
+        } else {
+            reg.active.emplace(guest_block, std::move(shadow));
         }
-        it->second = std::move(shadow);
-    } else {
-        reg.active.emplace(guest_block, std::move(shadow));
     }
+    drop_shadow(std::move(replaced));  // outside the lock: may run a provider's Cleanup
     return result;
 }
 
@@ -200,12 +217,17 @@ Pg6XAsyncBlock* async_shadow_find(uint64_t guest_block) {
 }
 
 void async_shadow_end(uint64_t guest_block) {
-    ShadowRegistry& reg = shadows();
-    std::lock_guard<std::mutex> lock(reg.mutex);
-    auto it = reg.active.find(guest_block);
-    if (it != reg.active.end() && !pending(*it->second)) {
-        reg.active.erase(it);
+    std::unique_ptr<AsyncShadow> ended;
+    {
+        ShadowRegistry& reg = shadows();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.active.find(guest_block);
+        if (it != reg.active.end() && !pending(*it->second)) {
+            ended = std::move(it->second);
+            reg.active.erase(it);
+        }
     }
+    drop_shadow(std::move(ended));
 }
 
 size_t live_async_shadows() {
@@ -466,6 +488,23 @@ uint64_t get_proc_address_impl(uint64_t module, uint64_t name_or_ordinal) {
     return callable;
 }
 
+// libHttpClient flat imports taking a guest XAsyncBlock: the shim completes a shadow block, whose
+// completion entry calls the guest callback with the guest block (O22).
+int32_t hc_cleanup_async_impl(uint64_t block) {
+    Pg6XAsyncBlock* shadow = async_shadow_begin(block);
+    return shadow != nullptr ? pg6_mw_hc_cleanup_async(shadow) : playgta6::os::gdk::E_INVALIDARG_HR;
+}
+
+int32_t hc_http_call_perform_async_impl(uint64_t call, uint64_t block) {
+    Pg6XAsyncBlock* shadow = async_shadow_begin(block);
+    if (shadow == nullptr) {
+        return playgta6::os::gdk::E_INVALIDARG_HR;
+    }
+    // The call handle is the shim's own opaque value, handed to the guest by HCHttpCallCreate.
+    return pg6_mw_hc_http_call_perform_async(reinterpret_cast<Pg6HCCallHandle>(static_cast<uintptr_t>(call)),
+                                             shadow);
+}
+
 }  // namespace
 
 }  // namespace playgta6::guest::callbacks
@@ -505,6 +544,14 @@ void pg6_gthunk_initterm_e(void* state) {
 
 void pg6_gthunk_get_proc_address(void* state) {
     gcom::function_thunk<&cb::get_proc_address_impl>()(state);
+}
+
+void pg6_gthunk_hc_cleanup_async(void* state) {
+    gcom::function_thunk<&cb::hc_cleanup_async_impl>()(state);
+}
+
+void pg6_gthunk_hc_http_call_perform_async(void* state) {
+    gcom::function_thunk<&cb::hc_http_call_perform_async_impl>()(state);
 }
 
 }  // extern "C"

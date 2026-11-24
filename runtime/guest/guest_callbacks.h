@@ -35,7 +35,11 @@
 // with the *guest* block address); async_shadow_find() returns it for the XAsyncGetStatus /
 // XxxResult calls that follow; async_shadow_end() drops it once the result was consumed. A begin
 // on an address whose previous operation is still pending keeps the old shadow alive (the shim
-// still references it) and reports a diagnostic.
+// still references it) and reports a diagnostic. The operation state of a shadow lives in the
+// XAsync provider framework (os/xasync_provider.h), keyed by the shadow; "pending" means the
+// operation runs or its completion callback has not returned, and a dropped shadow's finished
+// record is forgotten with it (O22). The guest block's `internal` bytes get a copy of the
+// shadow's when the completion callback runs (opaque to the guest).
 //
 // Guest-state thunks for imports with function-pointer parameters
 // ----------------------------------------------------------------
@@ -66,6 +70,9 @@
 //                                (guest/guest_crt_exit.{h,cpp}, O22). `exit`/`_exit` and
 //                                `_cexit`/`_c_exit` share a name key; the import bridge picks the
 //                                thunk whose name after the prefix equals the import name.
+//   HCCleanupAsync, HCHttpCallPerformAsync
+//                                libHttpClient imports taking a guest XAsyncBlock: the shim
+//                                completes a shadow block (O22)
 
 namespace playgta6::guest::callbacks {
 
@@ -127,6 +134,8 @@ void pg6_gthunk_bsearch(void* state);
 void pg6_gthunk_initterm(void* state);
 void pg6_gthunk_initterm_e(void* state);
 void pg6_gthunk_get_proc_address(void* state);
+void pg6_gthunk_hc_cleanup_async(void* state);
+void pg6_gthunk_hc_http_call_perform_async(void* state);
 
 // guest/guest_crt_exit.cpp
 void pg6_gthunk_crt_atexit(void* state);
