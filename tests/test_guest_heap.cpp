@@ -589,7 +589,7 @@ void test_crt_family() {
     CHECK(pg6_guest_heap_get_stats(&hud) == 1 && pg6_guest_heap_get_stats(nullptr) == 0);
     pg6_guest_heap_set_soft_limit(hud.live_bytes + 1000);
     *pg6_crt_errno() = 0;
-    CHECK(pg6_crt_malloc(5000) == nullptr && *pg6_crt_errno() == ENOMEM);
+    CHECK(pg6_crt_malloc(5000) == nullptr && *pg6_crt_errno() == PG6_CRT_ENOMEM);
     void* fits = pg6_crt_malloc(500);
     CHECK(fits != nullptr);
     pg6_crt_free(fits);

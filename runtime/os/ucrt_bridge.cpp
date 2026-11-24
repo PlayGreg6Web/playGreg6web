@@ -815,7 +815,7 @@ extern "C" {
 
 char* pg6_crt_itoa(int32_t value, char* buffer, int32_t radix) {
     if (buffer == nullptr || radix < 2 || radix > 36) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return buffer;
     }
     static constexpr char kDigits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -868,7 +868,7 @@ int64_t pg6_crt_atoll(const char* str) {
 
 double pg6_crt_strtod(const char* str, char** endptr) {
     if (str == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         if (endptr != nullptr) {
             *endptr = nullptr;
         }
@@ -877,14 +877,14 @@ double pg6_crt_strtod(const char* str, char** endptr) {
     errno = 0;
     const double val = std::strtod(str, endptr);
     if (errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return val;
 }
 
 float pg6_crt_strtof(const char* str, char** endptr) {
     if (str == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         if (endptr != nullptr) {
             *endptr = nullptr;
         }
@@ -893,14 +893,14 @@ float pg6_crt_strtof(const char* str, char** endptr) {
     errno = 0;
     const float val = std::strtof(str, endptr);
     if (errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return val;
 }
 
 int32_t pg6_crt_strtol(const char* str, char** endptr, int32_t base) {
     if (str == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         if (endptr != nullptr) {
             *endptr = nullptr;
         }
@@ -909,22 +909,22 @@ int32_t pg6_crt_strtol(const char* str, char** endptr, int32_t base) {
     errno = 0;
     const long long val = std::strtoll(str, endptr, base);
     if (errno == ERANGE || val > INT32_MAX) {
-        g_crt_errno = ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
         return val < 0 ? INT32_MIN : INT32_MAX;
     }
     if (val < INT32_MIN) {
-        g_crt_errno = ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
         return INT32_MIN;
     }
     if (errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return static_cast<int32_t>(val);
 }
 
 int64_t pg6_crt_strtoll(const char* str, char** endptr, int32_t base) {
     if (str == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         if (endptr != nullptr) {
             *endptr = nullptr;
         }
@@ -933,14 +933,14 @@ int64_t pg6_crt_strtoll(const char* str, char** endptr, int32_t base) {
     errno = 0;
     const long long val = std::strtoll(str, endptr, base);
     if (errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return static_cast<int64_t>(val);
 }
 
 uint32_t pg6_crt_strtoul(const char* str, char** endptr, int32_t base) {
     if (str == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         if (endptr != nullptr) {
             *endptr = nullptr;
         }
@@ -954,30 +954,30 @@ uint32_t pg6_crt_strtoul(const char* str, char** endptr, int32_t base) {
     errno = 0;
     const unsigned long long val = std::strtoull(str, endptr, base);
     if (errno == ERANGE) {
-        g_crt_errno = ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
         return UINT32_MAX;
     }
     if (neg) {
         const unsigned long long abs_val = 0ull - val;
         if (abs_val > UINT32_MAX) {
-            g_crt_errno = ERANGE;
+            g_crt_errno = PG6_CRT_ERANGE;
             return UINT32_MAX;
         }
         return static_cast<uint32_t>(0u - static_cast<uint32_t>(abs_val));
     }
     if (val > UINT32_MAX) {
-        g_crt_errno = ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
         return UINT32_MAX;
     }
     if (errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return static_cast<uint32_t>(val);
 }
 
 uint64_t pg6_crt_strtoull(const char* str, char** endptr, int32_t base) {
     if (str == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         if (endptr != nullptr) {
             *endptr = nullptr;
         }
@@ -986,7 +986,7 @@ uint64_t pg6_crt_strtoull(const char* str, char** endptr, int32_t base) {
     errno = 0;
     const unsigned long long val = std::strtoull(str, endptr, base);
     if (errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return static_cast<uint64_t>(val);
 }
@@ -1019,7 +1019,7 @@ void pg6_crt_unlock_file(FILE* stream) {
 
 int32_t pg6_crt_wstat64(const uint16_t* path, Pg6CrtStat64* buffer) {
     if (path == nullptr || buffer == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     std::memset(buffer, 0, sizeof(*buffer));
@@ -1033,7 +1033,7 @@ int32_t pg6_crt_wstat64(const uint16_t* path, Pg6CrtStat64* buffer) {
     const int rc = stat(utf8.c_str(), &st);
 #endif
     if (rc != 0) {
-        g_crt_errno = errno != 0 ? errno : ENOENT;
+        g_crt_errno = errno != 0 ? pg6_crt_errno_from_host(errno) : PG6_CRT_ENOENT;
         return -1;
     }
     buffer->st_dev = static_cast<uint32_t>(st.st_dev);
@@ -1052,13 +1052,13 @@ int32_t pg6_crt_wstat64(const uint16_t* path, Pg6CrtStat64* buffer) {
 
 int32_t pg6_crt_remove(const char* path) {
     if (path == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     errno = 0;
     const int rc = std::remove(path);
     if (rc != 0 && errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return rc;
 }
@@ -1069,7 +1069,7 @@ int32_t pg6_crt_remove(const char* path) {
 
 int32_t pg6_crt_set_new_mode(int32_t new_mode) {
     if (new_mode != 0 && new_mode != 1) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return g_new_mode.exchange(new_mode, std::memory_order_acq_rel);
@@ -1077,7 +1077,8 @@ int32_t pg6_crt_set_new_mode(int32_t new_mode) {
 
 // The malloc family lives in the guest address space (os/guest_heap.h).
 void* pg6_crt_calloc(size_t count, size_t size) {
-    return playgta6::os::guest_crt::calloc(count, size, &g_crt_errno);
+    return pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::calloc(count, size, e); });
 }
 
 void pg6_crt_free(void* ptr) {
@@ -1085,11 +1086,13 @@ void pg6_crt_free(void* ptr) {
 }
 
 void* pg6_crt_malloc(size_t size) {
-    return playgta6::os::guest_crt::malloc(size, &g_crt_errno);
+    return pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::malloc(size, e); });
 }
 
 void* pg6_crt_realloc(void* ptr, size_t size) {
-    return playgta6::os::guest_crt::realloc(ptr, size, &g_crt_errno);
+    return pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::realloc(ptr, size, e); });
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,7 +1108,7 @@ int32_t pg6_crt_configthreadlocale(int32_t flag) {
         g_thread_locale_mode = flag;
         return prev;
     }
-    g_crt_errno = EINVAL;
+    g_crt_errno = PG6_CRT_EINVAL;
     return -1;
 }
 
@@ -1251,8 +1254,8 @@ void pg6_crt__exit(int32_t status) {
 
 int32_t pg6_crt_get_errno(int32_t* value) {
     if (value == nullptr) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     *value = g_crt_errno;
     return 0;
@@ -1454,7 +1457,7 @@ int32_t pg6_crt_stdio_common_vfprintf(uint64_t options,
     (void)options;
     (void)locale;
     if (stream == nullptr || format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return static_cast<int32_t>(std::vfprintf(stream, format, arglist));
@@ -1468,7 +1471,7 @@ int32_t pg6_crt_stdio_common_vfwprintf(uint64_t options,
     (void)options;
     (void)locale;
     if (stream == nullptr || format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     std::vector<uint16_t> formatted = format_utf16_va(format, arglist);
@@ -1491,7 +1494,7 @@ int32_t pg6_crt_stdio_common_vsnwprintf_s(uint64_t options,
     (void)options;
     (void)locale;
     if (format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     const std::vector<uint16_t> formatted = format_utf16_va(format, arglist);
@@ -1499,7 +1502,7 @@ int32_t pg6_crt_stdio_common_vsnwprintf_s(uint64_t options,
         return static_cast<int32_t>(formatted.size());
     }
     if (buffer == nullptr || buffer_count == 0) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     const bool truncate = (max_count == PG6_CRT_TRUNCATE);
@@ -1519,7 +1522,7 @@ int32_t pg6_crt_stdio_common_vsnwprintf_s(uint64_t options,
         return -1;
     }
     buffer[0] = 0;
-    g_crt_errno = ERANGE;
+    g_crt_errno = PG6_CRT_ERANGE;
     return -1;
 }
 
@@ -1531,7 +1534,7 @@ int32_t pg6_crt_stdio_common_vsprintf(uint64_t options,
                                       va_list arglist) {
     (void)locale;
     if (format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     // _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR (0x2) returns full needed count.
@@ -1558,13 +1561,13 @@ int32_t pg6_crt_stdio_common_vsprintf_s(uint64_t options,
     (void)options;
     (void)locale;
     if (buffer == nullptr || buffer_count == 0 || format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     const int needed = std::vsnprintf(buffer, buffer_count, format, arglist);
     if (needed < 0 || static_cast<size_t>(needed) >= buffer_count) {
         buffer[0] = '\0';
-        g_crt_errno = ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
         return -1;
     }
     return needed;
@@ -1579,7 +1582,7 @@ int32_t pg6_crt_stdio_common_vsscanf(uint64_t options,
     (void)options;
     (void)locale;
     if (buffer == nullptr || format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     if (buffer_count == static_cast<size_t>(-1)) {
@@ -1601,7 +1604,7 @@ int32_t pg6_crt_stdio_common_vswprintf(uint64_t options,
                                        va_list arglist) {
     (void)locale;
     if (format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     const std::vector<uint16_t> formatted = format_utf16_va(format, arglist);
@@ -1609,7 +1612,7 @@ int32_t pg6_crt_stdio_common_vswprintf(uint64_t options,
         return static_cast<int32_t>(formatted.size());
     }
     if (buffer == nullptr || buffer_count == 0) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     const size_t copy_len = std::min(formatted.size(), buffer_count - 1);
@@ -1631,7 +1634,7 @@ int32_t pg6_crt_stdio_common_vswprintf_s(uint64_t options,
                                          void* locale,
                                          va_list arglist) {
     if (buffer == nullptr || buffer_count == 0 || format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return pg6_crt_stdio_common_vsnwprintf_s(options, buffer, buffer_count, buffer_count, format,
@@ -1647,7 +1650,7 @@ int32_t pg6_crt_stdio_common_vswscanf(uint64_t options,
     (void)options;
     (void)locale;
     if (buffer == nullptr || format == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     const std::string input_utf8 = utf16_to_utf8_u16(buffer, buffer_count);
@@ -1657,7 +1660,7 @@ int32_t pg6_crt_stdio_common_vswscanf(uint64_t options,
 
 int32_t pg6_crt_fseeki64(FILE* stream, int64_t offset, int32_t origin) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     errno = 0;
@@ -1667,7 +1670,7 @@ int32_t pg6_crt_fseeki64(FILE* stream, int64_t offset, int32_t origin) {
     const int rc = fseeko(stream, static_cast<off_t>(offset), origin);
 #endif
     if (rc != 0 && errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return rc;
 }
@@ -1677,8 +1680,8 @@ int32_t pg6_crt_get_stream_buffer_pointers(FILE* stream,
                                            char*** ptr,
                                            int32_t** cnt) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     // msvcp140's basic_filebuf keeps these three pointers and dereferences them for every get/put
     // area access. A host FILE has no MSVC buffer layout, so each stream gets an empty buffer
@@ -1699,8 +1702,8 @@ int32_t pg6_crt_get_stream_buffer_pointers(FILE* stream,
         if (record == 0) {
             record = heap.alloc(24, 16, playgta6::os::HeapFamily::Crt, playgta6::os::kHeapZeroMemory);
             if (record == 0) {
-                g_crt_errno = ENOMEM;
-                return ENOMEM;
+                g_crt_errno = PG6_CRT_ENOMEM;
+                return PG6_CRT_ENOMEM;
             }
             records.emplace_back(stream, record);
         }
@@ -1724,7 +1727,7 @@ int32_t pg6_crt_set_fmode(int32_t mode) {
 
 FILE* pg6_crt_wfopen(const uint16_t* filename, const uint16_t* mode) {
     if (filename == nullptr || mode == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return nullptr;
     }
     const std::string fname_utf8 = utf16_to_utf8_u16(filename);
@@ -1734,7 +1737,7 @@ FILE* pg6_crt_wfopen(const uint16_t* filename, const uint16_t* mode) {
 
 int32_t pg6_crt_fclose(FILE* stream) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
     }
     return std::fclose(stream);
@@ -1746,7 +1749,7 @@ int32_t pg6_crt_fflush(FILE* stream) {
 
 int32_t pg6_crt_fgetc(FILE* stream) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
     }
     return std::fgetc(stream);
@@ -1754,7 +1757,7 @@ int32_t pg6_crt_fgetc(FILE* stream) {
 
 int32_t pg6_crt_fgetpos(FILE* stream, int64_t* pos) {
     if (stream == nullptr || pos == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     errno = 0;
@@ -1765,7 +1768,7 @@ int32_t pg6_crt_fgetpos(FILE* stream, int64_t* pos) {
 #endif
     if (off < 0) {
         if (errno != 0) {
-            g_crt_errno = errno;
+            g_crt_errno = pg6_crt_errno_from_host(errno);
         }
         return -1;
     }
@@ -1775,20 +1778,20 @@ int32_t pg6_crt_fgetpos(FILE* stream, int64_t* pos) {
 
 FILE* pg6_crt_fopen(const char* filename, const char* mode) {
     if (filename == nullptr || mode == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return nullptr;
     }
     errno = 0;
     FILE* f = std::fopen(filename, mode);
     if (f == nullptr && errno != 0) {
-        g_crt_errno = errno;
+        g_crt_errno = pg6_crt_errno_from_host(errno);
     }
     return f;
 }
 
 int32_t pg6_crt_fputc(int32_t ch, FILE* stream) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
     }
     return std::fputc(ch, stream);
@@ -1796,7 +1799,7 @@ int32_t pg6_crt_fputc(int32_t ch, FILE* stream) {
 
 size_t pg6_crt_fread(void* buffer, size_t size, size_t count, FILE* stream) {
     if (buffer == nullptr || stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return 0;
     }
     return std::fread(buffer, size, count, stream);
@@ -1804,7 +1807,7 @@ size_t pg6_crt_fread(void* buffer, size_t size, size_t count, FILE* stream) {
 
 int32_t pg6_crt_fseek(FILE* stream, int32_t offset, int32_t origin) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return std::fseek(stream, static_cast<long>(offset), origin);
@@ -1812,7 +1815,7 @@ int32_t pg6_crt_fseek(FILE* stream, int32_t offset, int32_t origin) {
 
 int32_t pg6_crt_fsetpos(FILE* stream, const int64_t* pos) {
     if (stream == nullptr || pos == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return pg6_crt_fseeki64(stream, *pos, SEEK_SET);
@@ -1820,7 +1823,7 @@ int32_t pg6_crt_fsetpos(FILE* stream, const int64_t* pos) {
 
 int32_t pg6_crt_ftell(FILE* stream) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return static_cast<int32_t>(std::ftell(stream));
@@ -1828,7 +1831,7 @@ int32_t pg6_crt_ftell(FILE* stream) {
 
 size_t pg6_crt_fwrite(const void* buffer, size_t size, size_t count, FILE* stream) {
     if (buffer == nullptr || stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return 0;
     }
     return std::fwrite(buffer, size, count, stream);
@@ -1842,7 +1845,7 @@ void pg6_crt_rewind(FILE* stream) {
 
 int32_t pg6_crt_setvbuf(FILE* stream, char* buffer, int32_t mode, size_t size) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     return std::setvbuf(stream, buffer, mode, size);
@@ -1850,7 +1853,7 @@ int32_t pg6_crt_setvbuf(FILE* stream, char* buffer, int32_t mode, size_t size) {
 
 int32_t pg6_crt_ungetc(int32_t ch, FILE* stream) {
     if (stream == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
     }
     return std::ungetc(ch, stream);
@@ -1862,7 +1865,7 @@ int32_t pg6_crt_ungetc(int32_t ch, FILE* stream) {
 
 int32_t pg6_crt_stricmp(const char* a, const char* b) {
     if (a == nullptr || b == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return INT32_MAX;
     }
     while (*a != '\0' && *b != '\0') {
@@ -1883,7 +1886,7 @@ int32_t pg6_crt_strnicmp(const char* a, const char* b, size_t max_count) {
         return 0;
     }
     if (a == nullptr || b == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return INT32_MAX;
     }
     for (size_t i = 0; i < max_count; ++i) {
@@ -1898,7 +1901,7 @@ int32_t pg6_crt_strnicmp(const char* a, const char* b, size_t max_count) {
 
 int32_t pg6_crt_wcsicoll(const uint16_t* a, const uint16_t* b) {
     if (a == nullptr || b == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return INT32_MAX;
     }
     while (*a != 0 && *b != 0) {
@@ -1920,7 +1923,7 @@ int32_t pg6_crt_wcsnicmp(const uint16_t* a, const uint16_t* b, size_t max_count)
         return 0;
     }
     if (a == nullptr || b == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return INT32_MAX;
     }
     for (size_t i = 0; i < max_count; ++i) {
@@ -1958,13 +1961,13 @@ char* pg6_crt_strcat(char* dst, const char* src) {
 
 int32_t pg6_crt_strcat_s(char* dst, size_t dst_size, const char* src) {
     if (dst == nullptr || dst_size == 0) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (src == nullptr) {
         dst[0] = '\0';
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     size_t dst_len = 0;
     while (dst_len < dst_size && dst[dst_len] != '\0') {
@@ -1972,14 +1975,14 @@ int32_t pg6_crt_strcat_s(char* dst, size_t dst_size, const char* src) {
     }
     if (dst_len == dst_size) {
         dst[0] = '\0';
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     const size_t src_len = std::strlen(src);
     if (dst_len + src_len + 1 > dst_size) {
         dst[0] = '\0';
-        g_crt_errno = ERANGE;
-        return ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
     }
     std::memcpy(dst + dst_len, src, src_len + 1);
     return 0;
@@ -1995,19 +1998,19 @@ char* pg6_crt_strcpy(char* dst, const char* src) {
 
 int32_t pg6_crt_strcpy_s(char* dst, size_t dst_size, const char* src) {
     if (dst == nullptr || dst_size == 0) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (src == nullptr) {
         dst[0] = '\0';
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     const size_t src_len = std::strlen(src);
     if (src_len + 1 > dst_size) {
         dst[0] = '\0';
-        g_crt_errno = ERANGE;
-        return ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
     }
     std::memcpy(dst, src, src_len + 1);
     return 0;
@@ -2035,8 +2038,8 @@ char* pg6_crt_strncpy(char* dst, const char* src, size_t count) {
 
 int32_t pg6_crt_strncpy_s(char* dst, size_t dst_size, const char* src, size_t count) {
     if (dst == nullptr || dst_size == 0) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (count == 0) {
         dst[0] = '\0';
@@ -2044,8 +2047,8 @@ int32_t pg6_crt_strncpy_s(char* dst, size_t dst_size, const char* src, size_t co
     }
     if (src == nullptr) {
         dst[0] = '\0';
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     const bool truncate = (count == PG6_CRT_TRUNCATE);
     const size_t limit = truncate ? (dst_size - 1) : count;
@@ -2057,8 +2060,8 @@ int32_t pg6_crt_strncpy_s(char* dst, size_t dst_size, const char* src, size_t co
     if (i < limit && src[i] != '\0') {
         // Ran out of destination space before copying `limit` characters or NUL.
         dst[0] = '\0';
-        g_crt_errno = ERANGE;
-        return ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
     }
     dst[i] = '\0';
     if (truncate && src[i] != '\0') {
@@ -2073,7 +2076,7 @@ char* pg6_crt_strpbrk(const char* str, const char* charset) {
 
 char* pg6_crt_strtok_s(char* str, const char* delim, char** context) {
     if (delim == nullptr || context == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return nullptr;
     }
     char* cur = (str != nullptr) ? str : *context;
@@ -2109,13 +2112,13 @@ int32_t pg6_crt_toupper(int32_t c) {
 
 int32_t pg6_crt_wcscat_s(uint16_t* dst, size_t dst_size, const uint16_t* src) {
     if (dst == nullptr || dst_size == 0) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (src == nullptr) {
         dst[0] = 0;
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     size_t dst_len = 0;
     while (dst_len < dst_size && dst[dst_len] != 0) {
@@ -2123,14 +2126,14 @@ int32_t pg6_crt_wcscat_s(uint16_t* dst, size_t dst_size, const uint16_t* src) {
     }
     if (dst_len == dst_size) {
         dst[0] = 0;
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     const size_t src_len = pg6_crt_wcslen(src);
     if (dst_len + src_len + 1 > dst_size) {
         dst[0] = 0;
-        g_crt_errno = ERANGE;
-        return ERANGE;
+        g_crt_errno = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
     }
     std::memcpy(dst + dst_len, src, (src_len + 1) * sizeof(uint16_t));
     return 0;
@@ -2194,13 +2197,13 @@ void pg6_crt_ftime64(Pg6CrtTimeb64* tp) {
 
 int32_t pg6_crt_gmtime64_s(Pg6CrtTm* result, const int64_t* timer) {
     if (result == nullptr) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (timer == nullptr || *timer < 0) {
         std::memset(result, -1, sizeof(*result));
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     const int64_t t = *timer;
     const int64_t days = t / 86400;
@@ -2232,13 +2235,13 @@ Pg6CrtTm* pg6_crt_gmtime64(const int64_t* timer) {
 
 int32_t pg6_crt_localtime64_s(Pg6CrtTm* result, const int64_t* timer) {
     if (result == nullptr) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (timer == nullptr || *timer < 0) {
         std::memset(result, -1, sizeof(*result));
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     std::tm local_tm{};
 #if defined(_MSC_VER)
@@ -2251,8 +2254,8 @@ int32_t pg6_crt_localtime64_s(Pg6CrtTm* result, const int64_t* timer) {
 #else
     const std::time_t t = static_cast<std::time_t>(*timer);
     if (localtime_r(&t, &local_tm) == nullptr) {
-        g_crt_errno = EINVAL;
-        return EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
 #endif
     from_std_tm(local_tm, *result);
@@ -2261,7 +2264,7 @@ int32_t pg6_crt_localtime64_s(Pg6CrtTm* result, const int64_t* timer) {
 
 int64_t pg6_crt_mkgmtime64(Pg6CrtTm* tm_ptr) {
     if (tm_ptr == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     // Normalize month overflow/underflow into years.
@@ -2286,7 +2289,7 @@ int64_t pg6_crt_mkgmtime64(Pg6CrtTm* tm_ptr) {
 
 int64_t pg6_crt_mktime64(Pg6CrtTm* tm_ptr) {
     if (tm_ptr == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
     std::tm host_tm = to_std_tm(*tm_ptr);
@@ -2316,7 +2319,7 @@ size_t pg6_crt_strftime(char* buffer,
                         const char* format,
                         const Pg6CrtTm* tm_ptr) {
     if (buffer == nullptr || max_size == 0 || format == nullptr || tm_ptr == nullptr) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return 0;
     }
     const std::tm host_tm = to_std_tm(*tm_ptr);
@@ -2333,7 +2336,7 @@ void* pg6_crt_bsearch(const void* key,
                       size_t size,
                       Pg6CrtCompareFn compare) {
     if (compare == nullptr || (num > 0 && (key == nullptr || base == nullptr || size == 0))) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return nullptr;
     }
     return std::bsearch(key, base, num, size, compare);
@@ -2341,7 +2344,7 @@ void* pg6_crt_bsearch(const void* key,
 
 void pg6_crt_qsort(void* base, size_t num, size_t size, Pg6CrtCompareFn compare) {
     if (compare == nullptr || (num > 0 && (base == nullptr || size == 0))) {
-        g_crt_errno = EINVAL;
+        g_crt_errno = PG6_CRT_EINVAL;
         return;
     }
     std::qsort(base, num, size, compare);
@@ -2445,7 +2448,8 @@ void pg6_crt_std_exception_copy(const Pg6CrtStdExceptionData* from, Pg6CrtStdExc
     const char* from_host =
         reinterpret_cast<const char*>(heap.to_host(reinterpret_cast<uintptr_t>(from->what)));
     const size_t len = std::strlen(from_host) + 1;
-    char* copy = static_cast<char*>(playgta6::os::guest_crt::malloc(len, &g_crt_errno));
+    char* copy = static_cast<char*>(pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::malloc(len, e); }));
     if (copy != nullptr) {
         std::memcpy(copy, from_host, len);
         to->what = reinterpret_cast<const char*>(static_cast<uintptr_t>(heap.to_guest(copy)));
@@ -2619,6 +2623,31 @@ void pg6_crt_reset_runtime_state(void) {
     g_crt_errno = 0;
     g_current_exception = nullptr;
     g_current_exception_context = nullptr;
+}
+
+int32_t pg6_crt_errno_from_host(int32_t host_errno) {
+    switch (host_errno) {
+        case 0: return 0;
+        case EPERM: return PG6_CRT_EPERM;
+        case ENOENT: return PG6_CRT_ENOENT;
+        case EIO: return PG6_CRT_EIO;
+        case EBADF: return PG6_CRT_EBADF;
+        case EAGAIN: return PG6_CRT_EAGAIN;
+        case ENOMEM: return PG6_CRT_ENOMEM;
+        case EACCES: return PG6_CRT_EACCES;
+        case EEXIST: return PG6_CRT_EEXIST;
+        case ENOTDIR: return PG6_CRT_ENOTDIR;
+        case EISDIR: return PG6_CRT_EISDIR;
+        case EINVAL: return PG6_CRT_EINVAL;
+        case EMFILE: return PG6_CRT_EMFILE;
+        case ENOSPC: return PG6_CRT_ENOSPC;
+        case EDOM: return PG6_CRT_EDOM;
+        case ERANGE: return PG6_CRT_ERANGE;
+        case ENAMETOOLONG: return PG6_CRT_ENAMETOOLONG;
+        case ENOTEMPTY: return PG6_CRT_ENOTEMPTY;
+        case EILSEQ: return PG6_CRT_EILSEQ;
+        default: return PG6_CRT_EINVAL;
+    }
 }
 
 int32_t pg6_crt_get_last_exit_code(void) {

@@ -148,6 +148,7 @@ AUDITED_FAMILY_INTERNALS: dict[str, str] = {
     "pg6_crt_execute_onexit_table": "host helper; guest imports bind pg6_gthunk_execute_onexit_table",
     "pg6_crt_reset_runtime_state": "test hook",
     "pg6_crt_get_last_exit_code": "test hook",
+    "pg6_crt_errno_from_host": "host helper: host errno -> MSVC errno",
     "pg6_ws2_WSASetLastError": "declared, not registered by winsock_ordinals.cpp",
 }
 AUDIT_ROW_RE = re.compile(r'\bX\((pg6_\w+),\s*(ok|deny|pending),\s*"([^"]*)"\)')

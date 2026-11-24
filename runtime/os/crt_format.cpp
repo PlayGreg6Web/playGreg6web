@@ -638,13 +638,13 @@ Store sprintf_store(size_t length, bool has_buffer, size_t count, uint64_t optio
     Store s;
     if (length > static_cast<size_t>(INT32_MAX)) {
         s.result = -1;
-        s.error = ERANGE;
+        s.error = PG6_CRT_ERANGE;
         return s;
     }
     const auto n = static_cast<int32_t>(length);
     if (!has_buffer) {
         s.result = count == 0 ? n : -1;  // measuring; a null buffer with a count is invalid
-        s.error = count == 0 ? 0 : EINVAL;
+        s.error = count == 0 ? 0 : PG6_CRT_EINVAL;
         return s;
     }
     if ((options & kStandardSnprintfBehavior) != 0) {
@@ -675,13 +675,13 @@ Store sprintf_s_store(size_t length, bool has_buffer, size_t count) {
     Store s;
     if (!has_buffer || count == 0) {
         s.result = -1;
-        s.error = EINVAL;
+        s.error = PG6_CRT_EINVAL;
         return s;
     }
     if (length >= count || length > static_cast<size_t>(INT32_MAX)) {
         s.result = -1;
         s.clear_first = true;
-        s.error = ERANGE;
+        s.error = PG6_CRT_ERANGE;
         return s;
     }
     s.units = length;
@@ -694,7 +694,7 @@ Store snprintf_s_store(size_t length, bool has_buffer, size_t count, size_t max_
     Store s;
     if (!has_buffer || count == 0) {
         s.result = -1;
-        s.error = EINVAL;
+        s.error = PG6_CRT_EINVAL;
         return s;
     }
     if (max_count == kTruncate) {
@@ -723,7 +723,7 @@ Store snprintf_s_store(size_t length, bool has_buffer, size_t count, size_t max_
     }
     s.result = -1;
     s.clear_first = true;
-    s.error = ERANGE;
+    s.error = PG6_CRT_ERANGE;
     return s;
 }
 
@@ -760,7 +760,7 @@ template <typename Unit>
 bool format_from_guest(uint64_t options, uint64_t format_va, uint64_t va_list, std::basic_string<Unit>& text) {
     std::basic_string<Unit> format;
     if (!read_format(format_va, format)) {
-        set_errno(EINVAL);
+        set_errno(PG6_CRT_EINVAL);
         return false;
     }
     cf::GuestArgSource args(va_list);
@@ -771,7 +771,7 @@ bool format_from_guest(uint64_t options, uint64_t format_va, uint64_t va_list, s
         status = cf::format_wide(format, options, args, text);
     }
     if (status != cf::Status::Ok) {
-        set_errno(status == cf::Status::Encoding ? EILSEQ : EINVAL);
+        set_errno(status == cf::Status::Encoding ? PG6_CRT_EILSEQ : PG6_CRT_EINVAL);
         return false;
     }
     return true;
@@ -798,13 +798,13 @@ int32_t apply_store(const cf::Store& store, uint64_t buffer, const std::basic_st
         return store.result;
     }
     if (store.units > 0 && !gcom::write_guest(buffer, text.data(), store.units * sizeof(Unit))) {
-        set_errno(EINVAL);
+        set_errno(PG6_CRT_EINVAL);
         return -1;
     }
     if (store.terminate) {
         const Unit zero = 0;
         if (!gcom::write_guest(buffer + store.units * sizeof(Unit), &zero, sizeof(zero))) {
-            set_errno(EINVAL);
+            set_errno(PG6_CRT_EINVAL);
             return -1;
         }
     }
@@ -826,7 +826,7 @@ template <typename Unit>
 int32_t vsprintf_s_impl(uint64_t options, uint64_t buffer, uint64_t count, uint64_t format, uint64_t /*locale*/,
                         uint64_t va_list) {
     if (buffer == 0 || count == 0) {
-        set_errno(EINVAL);
+        set_errno(PG6_CRT_EINVAL);
         return -1;
     }
     std::basic_string<Unit> text;
@@ -853,7 +853,7 @@ int32_t vswprintf_s_wide(uint64_t o, uint64_t b, uint64_t c, uint64_t f, uint64_
 int32_t vsnwprintf_s_wide(uint64_t options, uint64_t buffer, uint64_t count, uint64_t max_count,
                           uint64_t format, uint64_t /*locale*/, uint64_t va_list) {
     if (buffer == 0 || count == 0) {
-        set_errno(EINVAL);
+        set_errno(PG6_CRT_EINVAL);
         return -1;
     }
     std::u16string text;
@@ -878,7 +878,7 @@ int32_t vfprintf_narrow(uint64_t options, uint64_t stream_va, uint64_t format, u
                         uint64_t va_list) {
     FILE* stream = output_stream(stream_va);
     if (stream == nullptr) {
-        set_errno(EINVAL);
+        set_errno(PG6_CRT_EINVAL);
         return -1;
     }
     std::string text;
@@ -896,7 +896,7 @@ int32_t vfwprintf_wide(uint64_t options, uint64_t stream_va, uint64_t format, ui
                        uint64_t va_list) {
     FILE* stream = output_stream(stream_va);
     if (stream == nullptr) {
-        set_errno(EINVAL);
+        set_errno(PG6_CRT_EINVAL);
         return -1;
     }
     std::u16string text;

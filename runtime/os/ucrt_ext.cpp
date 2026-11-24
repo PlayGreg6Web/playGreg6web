@@ -68,7 +68,8 @@ constexpr std::string_view kMonths =
 constexpr size_t kTimeNamesBlock = 1024;
 
 char* guest_narrow(std::string_view text) {
-    auto* out = static_cast<char*>(playgta6::os::guest_crt::malloc(text.size() + 1, pg6_crt_errno()));
+    auto* out = static_cast<char*>(pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::malloc(text.size() + 1, e); }));
     if (out != nullptr) {
         std::memcpy(out, text.data(), text.size());
         out[text.size()] = '\0';
@@ -78,7 +79,9 @@ char* guest_narrow(std::string_view text) {
 
 uint16_t* guest_wide(std::string_view ascii) {
     auto* out = static_cast<uint16_t*>(
-        playgta6::os::guest_crt::malloc((ascii.size() + 1) * sizeof(uint16_t), pg6_crt_errno()));
+        pg6_crt_with_host_errno([&](int32_t* e) {
+            return playgta6::os::guest_crt::malloc((ascii.size() + 1) * sizeof(uint16_t), e);
+        }));
     if (out != nullptr) {
         for (size_t i = 0; i < ascii.size(); ++i) {
             out[i] = static_cast<uint8_t>(ascii[i]);
@@ -213,7 +216,7 @@ const uint16_t* pg6_crt_pctype_func(void) {
 
 char* pg6_crt_setlocale(int32_t category, const char* locale) {
     if (category < 0 || category > 5) {  // LC_ALL .. LC_TIME
-        *pg6_crt_errno() = EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
         return nullptr;
     }
     if (locale == nullptr || locale[0] == '\0' || std::strcmp(locale, "C") == 0) {
@@ -277,13 +280,13 @@ int32_t pg6_crt_iswxdigit(uint16_t c) {
 
 int32_t pg6_crt_wcscpy_s(uint16_t* dst, size_t dst_size, const uint16_t* src) {
     if (dst == nullptr || dst_size == 0) {
-        *pg6_crt_errno() = EINVAL;
-        return EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     if (src == nullptr) {
         dst[0] = 0;
-        *pg6_crt_errno() = EINVAL;
-        return EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     size_t len = 0;
     while (src[len] != 0) {
@@ -291,8 +294,8 @@ int32_t pg6_crt_wcscpy_s(uint16_t* dst, size_t dst_size, const uint16_t* src) {
     }
     if (len + 1 > dst_size) {
         dst[0] = 0;
-        *pg6_crt_errno() = ERANGE;
-        return ERANGE;
+        *pg6_crt_errno() = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
     }
     std::memcpy(dst, src, (len + 1) * sizeof(uint16_t));
     return 0;
@@ -310,7 +313,8 @@ size_t pg6_crt_wcsnlen(const uint16_t* str, size_t max_count) {
 }
 
 uint16_t* pg6_crt_wcsdup(const uint16_t* str) {
-    return playgta6::os::guest_crt::wcsdup(str, pg6_crt_errno());
+    return pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::wcsdup(str, e); });
 }
 
 size_t pg6_crt_strncnt(const char* str, size_t max_count) {
@@ -324,7 +328,8 @@ size_t pg6_crt_strncnt(const char* str, size_t max_count) {
 // --- heap ------------------------------------------------------------------
 
 void* pg6_crt_aligned_malloc(size_t size, size_t alignment) {
-    return playgta6::os::guest_crt::aligned_malloc(size, alignment, pg6_crt_errno());
+    return pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::aligned_malloc(size, alignment, e); });
 }
 
 void pg6_crt_aligned_free(void* ptr) {
@@ -335,8 +340,8 @@ void pg6_crt_aligned_free(void* ptr) {
 
 int32_t pg6_crt_rand_s(uint32_t* value) {
     if (value == nullptr) {
-        *pg6_crt_errno() = EINVAL;
-        return EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
     }
     thread_local std::mt19937_64 engine{std::random_device{}()};
     *value = static_cast<uint32_t>(engine());
@@ -351,7 +356,7 @@ int32_t pg6_crt_seh_filter_dll(uint32_t exception_num, void* exception_ptrs) {
 
 int32_t pg6_crt_fputs(const char* str, FILE* stream) {
     if (str == nullptr || stream == nullptr) {
-        *pg6_crt_errno() = EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
         return EOF;
     }
     return std::fputs(str, stream) < 0 ? EOF : 0;
@@ -359,12 +364,12 @@ int32_t pg6_crt_fputs(const char* str, FILE* stream) {
 
 uint16_t pg6_crt_fputwc(uint16_t ch, FILE* stream) {
     if (stream == nullptr) {
-        *pg6_crt_errno() = EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
         return PG6_CRT_WEOF;
     }
     // Text output in the "C" locale: units above 0xFF have no single-byte form.
     if (ch > 0xFF) {
-        *pg6_crt_errno() = EILSEQ;
+        *pg6_crt_errno() = PG6_CRT_EILSEQ;
         return PG6_CRT_WEOF;
     }
     return std::fputc(ch, stream) == EOF ? PG6_CRT_WEOF : ch;
@@ -372,7 +377,7 @@ uint16_t pg6_crt_fputwc(uint16_t ch, FILE* stream) {
 
 uint16_t pg6_crt_fgetwc(FILE* stream) {
     if (stream == nullptr) {
-        *pg6_crt_errno() = EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
         return PG6_CRT_WEOF;
     }
     const int c = std::fgetc(stream);
@@ -397,7 +402,8 @@ char* pg6_crt_getmonths(void) {
 }
 
 void* pg6_crt_gettnames(void) {
-    return playgta6::os::guest_crt::calloc(1, kTimeNamesBlock, pg6_crt_errno());
+    return pg6_crt_with_host_errno(
+        [&](int32_t* e) { return playgta6::os::guest_crt::calloc(1, kTimeNamesBlock, e); });
 }
 
 uint16_t* pg6_crt_w_getdays(void) {
@@ -428,7 +434,7 @@ size_t pg6_crt_wcsftime_lc(uint16_t* buffer,
                            void* lc_time) {
     (void)lc_time;
     if (buffer == nullptr || max_size == 0 || format == nullptr || tm_ptr == nullptr) {
-        *pg6_crt_errno() = EINVAL;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
         return 0;
     }
     // Literal units are copied as they are; each %-specification is formatted narrow (its
@@ -446,7 +452,7 @@ size_t pg6_crt_wcsftime_lc(uint16_t* buffer,
             ++i;
         }
         if (format[i] == 0 || format[i] > 0x7F) {
-            *pg6_crt_errno() = EINVAL;
+            *pg6_crt_errno() = PG6_CRT_EINVAL;
             buffer[0] = 0;
             return 0;
         }
@@ -459,7 +465,7 @@ size_t pg6_crt_wcsftime_lc(uint16_t* buffer,
     }
     if (out.size() + 1 > max_size) {
         buffer[0] = 0;
-        *pg6_crt_errno() = ERANGE;
+        *pg6_crt_errno() = PG6_CRT_ERANGE;
         return 0;
     }
     for (size_t k = 0; k < out.size(); ++k) {

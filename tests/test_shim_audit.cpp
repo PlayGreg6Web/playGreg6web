@@ -114,7 +114,7 @@ void test_long_and_wchar_widths() {
     char big[] = "4294967296";
     pg6_crt_set_errno(0);
     CHECK(pg6_crt_strtol(big, &end, 10) == INT32_MAX);
-    CHECK(*pg6_crt_errno() == ERANGE);
+    CHECK(*pg6_crt_errno() == PG6_CRT_ERANGE);
     char neg[] = "-4294967296";
     CHECK(pg6_crt_strtol(neg, &end, 10) == INT32_MIN);
     char ul[] = "4294967295";
@@ -139,10 +139,22 @@ void test_errno_pointer_semantics() {
     CHECK(pg6_crt_get_errno(&value) == 0 && value == 7);
     pg6_crt_set_errno(0);
     CHECK(*slot == 0);
-    CHECK(EINVAL == 22);   // MSVC EINVAL
-    CHECK(ERANGE == 34);   // MSVC ERANGE
-    CHECK(ENOENT == 2);    // MSVC ENOENT
-    CHECK(ENOMEM == 12);   // MSVC ENOMEM
+    // MSVC numbering whatever the host's (WASI/Emscripten: EINVAL 28, ERANGE 68, ENOENT 44).
+    CHECK(PG6_CRT_EINVAL == 22 && PG6_CRT_ERANGE == 34 && PG6_CRT_ENOENT == 2 &&
+          PG6_CRT_ENOMEM == 12 && PG6_CRT_EILSEQ == 42);
+    CHECK(pg6_crt_errno_from_host(0) == 0);
+    CHECK(pg6_crt_errno_from_host(EINVAL) == 22);
+    CHECK(pg6_crt_errno_from_host(ERANGE) == 34);
+    CHECK(pg6_crt_errno_from_host(ENOENT) == 2);
+    CHECK(pg6_crt_errno_from_host(ENOMEM) == 12);
+    CHECK(pg6_crt_errno_from_host(EILSEQ) == 42);
+    CHECK(pg6_crt_errno_from_host(ENAMETOOLONG) == 38);
+    CHECK(pg6_crt_errno_from_host(9999) == 22);
+    // Host errors reported by host APIs reach the guest translated.
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_strtod("1e999", nullptr) == HUGE_VAL);
+    CHECK(*pg6_crt_errno() == 34);
+    CHECK(pg6_crt_strcpy_s(nullptr, 4, "x") == 22);
 }
 
 // MSVC _dtest/_fdtest codes and struct tm conversion.
@@ -237,7 +249,7 @@ void test_ucrt_ext() {
 
     uint16_t small[3];
     const uint16_t abc[] = {'a', 'b', 'c', 0};
-    CHECK(pg6_crt_wcscpy_s(small, 3, abc) == ERANGE && small[0] == 0);
+    CHECK(pg6_crt_wcscpy_s(small, 3, abc) == PG6_CRT_ERANGE && small[0] == 0);
     uint16_t big[8];
     CHECK(pg6_crt_wcscpy_s(big, 8, abc) == 0 && big[2] == 'c' && big[3] == 0);
     CHECK(pg6_crt_wcsnlen(abc, 2) == 2);
@@ -272,7 +284,7 @@ void test_ucrt_ext() {
     pg6_crt_aligned_free(aligned);
     uint32_t r = 0;
     CHECK(pg6_crt_rand_s(&r) == 0);
-    CHECK(pg6_crt_rand_s(nullptr) == EINVAL);
+    CHECK(pg6_crt_rand_s(nullptr) == PG6_CRT_EINVAL);
 }
 
 }  // namespace

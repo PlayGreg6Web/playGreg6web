@@ -117,7 +117,7 @@
     X(pg6_crt_cexit, deny, "gthunk: pg6_gthunk__cexit (runs the guest onexit table, O22)") \
     X(pg6_crt_configure_narrow_argv, ok, "returns 0") \
     X(pg6_crt_crt_atexit, deny, "takes a guest callback; gthunk: pg6_gthunk_crt_atexit") \
-    X(pg6_crt_errno, ok, "returns the address of the thread's host errno int (round trip); values use the classic numbering MSVC shares for EINVAL/ERANGE/ENOENT/ENOMEM, host codes above 34 differ") \
+    X(pg6_crt_errno, ok, "returns the address of the thread's errno int (round trip); every value the CRT shims store is in MSVC numbering (host errno translated by pg6_crt_errno_from_host)") \
     X(pg6_crt__exit, deny, "returns to the caller; gthunk: pg6_gthunk__exit (exit funnel)") \
     X(pg6_crt_get_errno, ok, "") \
     X(pg6_crt_get_narrow_winmain_command_line, ok, "guest heap string (O24)") \

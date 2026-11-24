@@ -24,6 +24,27 @@ extern "C" {
 
 // MSVC secure-CRT constants.
 inline constexpr int32_t PG6_CRT_STRUNCATE = 80;
+
+// MSVC <errno.h> values. Every errno the guest can observe (through _errno()/_get_errno() or as
+// an errno_t result) uses these, whatever the host's numbering (WASI/Emscripten: EINVAL = 28).
+inline constexpr int32_t PG6_CRT_EPERM = 1;
+inline constexpr int32_t PG6_CRT_ENOENT = 2;
+inline constexpr int32_t PG6_CRT_EIO = 5;
+inline constexpr int32_t PG6_CRT_EBADF = 9;
+inline constexpr int32_t PG6_CRT_EAGAIN = 11;
+inline constexpr int32_t PG6_CRT_ENOMEM = 12;
+inline constexpr int32_t PG6_CRT_EACCES = 13;
+inline constexpr int32_t PG6_CRT_EEXIST = 17;
+inline constexpr int32_t PG6_CRT_ENOTDIR = 20;
+inline constexpr int32_t PG6_CRT_EISDIR = 21;
+inline constexpr int32_t PG6_CRT_EINVAL = 22;
+inline constexpr int32_t PG6_CRT_EMFILE = 24;
+inline constexpr int32_t PG6_CRT_ENOSPC = 28;
+inline constexpr int32_t PG6_CRT_EDOM = 33;
+inline constexpr int32_t PG6_CRT_ERANGE = 34;
+inline constexpr int32_t PG6_CRT_ENAMETOOLONG = 38;
+inline constexpr int32_t PG6_CRT_ENOTEMPTY = 41;
+inline constexpr int32_t PG6_CRT_EILSEQ = 42;
 inline constexpr size_t PG6_CRT_TRUNCATE = static_cast<size_t>(-1);
 
 // MSVC UCRT `_dtest` / `_fdtest` classification codes (`<corecrt_math.h>`).
@@ -177,6 +198,9 @@ void pg6_crt_reset_runtime_state(void);
 
 // Returns the last code passed to exit/_exit (or 0 if none).
 int32_t pg6_crt_get_last_exit_code(void);
+
+// The MSVC number of a host errno value (0 stays 0; unknown values map to EINVAL).
+int32_t pg6_crt_errno_from_host(int32_t host_errno);
 
 // ---------------------------------------------------------------------------
 // 1. api-ms-win-crt-convert-l1-1-0.dll (12 symbols)
@@ -485,3 +509,15 @@ char* pg6_crt_strstr(const char* str, const char* substr);
 uint16_t* pg6_crt_wcsrchr(const uint16_t* str, uint16_t ch);
 
 }  // extern "C"
+
+// Calls a host API that reports a host errno through an `int32_t*` (os/guest_heap.h guest_crt::*)
+// and stores a reported error into the CRT errno in MSVC numbering.
+template <typename F>
+auto pg6_crt_with_host_errno(F&& call) {
+    int32_t host_errno = 0;
+    auto result = call(&host_errno);
+    if (host_errno != 0) {
+        pg6_crt_set_errno(pg6_crt_errno_from_host(host_errno));
+    }
+    return result;
+}

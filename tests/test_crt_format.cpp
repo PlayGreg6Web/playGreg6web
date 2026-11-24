@@ -213,11 +213,11 @@ void test_store_semantics() {
     CHECK(s.result == 7 && s.units == 0);
     // vsprintf_s: too small -> buffer[0] = 0, -1, ERANGE.
     s = cf::sprintf_s_store(4, true, 4);
-    CHECK(s.clear_first && s.result == -1 && s.error == ERANGE);
+    CHECK(s.clear_first && s.result == -1 && s.error == PG6_CRT_ERANGE);
     s = cf::sprintf_s_store(3, true, 4);
     CHECK(s.units == 3 && s.terminate && s.result == 3);
     s = cf::sprintf_s_store(3, false, 4);
-    CHECK(s.result == -1 && s.error == EINVAL);
+    CHECK(s.result == -1 && s.error == PG6_CRT_EINVAL);
     // vsnwprintf_s.
     s = cf::snprintf_s_store(10, true, 4, cf::kTruncate);
     CHECK(s.units == 3 && s.terminate && s.result == -1);
@@ -226,7 +226,7 @@ void test_store_semantics() {
     s = cf::snprintf_s_store(10, true, 8, 5);
     CHECK(s.units == 5 && s.terminate && s.result == -1);
     s = cf::snprintf_s_store(10, true, 4, 9);
-    CHECK(s.clear_first && s.result == -1 && s.error == ERANGE);
+    CHECK(s.clear_first && s.result == -1 && s.error == PG6_CRT_ERANGE);
 }
 
 // The thunks read their arguments from guest registers and the guest stack and the format, the
@@ -277,7 +277,7 @@ void test_thunks_on_guest_memory() {
     // vsprintf_s: too small -> empty string, -1, ERANGE.
     *pg6_crt_errno() = 0;
     CHECK(call(&pg6_gthunk_stdio_common_vsprintf_s, kLegacy, buffer, 6) == -1);
-    CHECK(out[0] == 0 && *pg6_crt_errno() == ERANGE);
+    CHECK(out[0] == 0 && *pg6_crt_errno() == PG6_CRT_ERANGE);
     // Measuring.
     CHECK(call(&pg6_gthunk_stdio_common_vsprintf, kLegacy | cf::kStandardSnprintfBehavior, 0, 0) == 20);
 }
@@ -302,7 +302,7 @@ void test_stream_buffer_pointers() {
     char** err_base = nullptr;
     CHECK(pg6_crt_get_stream_buffer_pointers(pg6_crt_acrt_iob_func(2), &err_base, nullptr, nullptr) == 0);
     CHECK(err_base != base);
-    CHECK(pg6_crt_get_stream_buffer_pointers(nullptr, &base, &ptr, &cnt) == EINVAL);
+    CHECK(pg6_crt_get_stream_buffer_pointers(nullptr, &base, &ptr, &cnt) == PG6_CRT_EINVAL);
 }
 
 }  // namespace

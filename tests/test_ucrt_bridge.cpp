@@ -242,7 +242,7 @@ void test_runtime_lifecycle() {
     CHECK(*pg6_crt_errno() == 42);
     int32_t err_val = 0;
     CHECK(pg6_crt_get_errno(&err_val) == 0 && err_val == 42);
-    CHECK(pg6_crt_get_errno(nullptr) == EINVAL);
+    CHECK(pg6_crt_get_errno(nullptr) == PG6_CRT_EINVAL);
 
     // argc/argv/command line.
     CHECK(*pg6_crt_p___argc() == 1);
@@ -398,7 +398,7 @@ void test_strings_and_memory() {
     CHECK(pg6_crt_strcpy_s(sbuf, sizeof(sbuf), "hello") == 0);
     CHECK(pg6_crt_strcat_s(sbuf, sizeof(sbuf), " world") == 0);
     CHECK(pg6_crt_strcmp(sbuf, "hello world") == 0);
-    CHECK(pg6_crt_strcpy_s(sbuf, 4, "overflow") == ERANGE);
+    CHECK(pg6_crt_strcpy_s(sbuf, 4, "overflow") == PG6_CRT_ERANGE);
     CHECK(sbuf[0] == '\0');
 
     CHECK(pg6_crt_strncpy_s(sbuf, 5, "abcdefgh", PG6_CRT_TRUNCATE) == PG6_CRT_STRUNCATE);
