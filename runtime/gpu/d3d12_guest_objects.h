@@ -269,6 +269,10 @@ struct IFenceHost : IDeviceChildHost {
     virtual HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) = 0;
     virtual HResult Signal(uint64_t value) = 0;
     virtual uint32_t GetCreationFlags() = 0;
+    // Xbox slot 12: () -> the guest address of a 64-bit word holding the completed value. The
+    // executable's fence wait (0x144FB0AD0) reads the value through it, compares it with
+    // UINT64_MAX (device removed) and with the target value, and waits while it is below.
+    virtual uint64_t CompletedValueAddress() = 0;
 };
 
 // ID3D12DescriptorHeap: 8 GetDesc, 9 GetCPUDescriptorHandleForHeapStart, 10 GetGPUDescriptorHandleForHeapStart.
@@ -766,15 +770,18 @@ public:
     HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) override;
     HResult Signal(uint64_t value) override;
     uint32_t GetCreationFlags() override { return flags_; }
+    uint64_t CompletedValueAddress() override;
     // GPU-side signal (queue Signal): completes when the work submitted before it completed, which
     // in this runtime is at submission time (see Queue::Signal).
     void signal_from_queue(uint64_t value) { Signal(value); }
 
 private:
     void fire_events_locked(std::vector<uint64_t>* to_set);
+    void publish_value_locked();
 
     std::atomic<uint64_t> value_;
     uint32_t flags_;
+    uint64_t value_word_ = 0;  // guest word behind CompletedValueAddress (allocated on first use)
     std::mutex mutex_;
     std::multimap<uint64_t, uint64_t> waits_;  // value -> event handle
 };

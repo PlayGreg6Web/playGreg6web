@@ -508,6 +508,18 @@ void test_queue_allocator_fence() {
     CHECK(fx.vcall(fence, Slot::GetCompletedValue) == 20);
     CHECK(hr(fx.vcall(fence, Slot::FenceSignal, {I(25)})) == 0);
     CHECK(fx.vcall(fence, Slot::GetCompletedValue) == 25);
+    // Xbox slot 12: the address of a word holding the completed value, the same on every call and
+    // kept current by CPU and queue signals.
+    const uint64_t word = fx.vcall(fence, 12);
+    CHECK(word != 0 && fx.vcall(fence, 12) == word);
+    CHECK(load64(word) == 25);
+    CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(fence), I(30)})) == 0);
+    CHECK(load64(word) == 30);
+    CHECK(hr(fx.vcall(fence, Slot::FenceSignal, {I(~0ull)})) == 0);  // device-removed value
+    CHECK(load64(word) == ~0ull);
+    CHECK(hr(fx.vcall(fence, Slot::FenceSignal, {I(25)})) == 0);
+    CHECK(load64(word) == 25);
+    CHECK(com::stub_hits(dg::kID3D12Fence, 12) == 0);
     CHECK(hr(fx.vcall(queue, Slot::QueueWait, {I(fence), I(25)})) == 0);
     // A non-fence interface as fence argument is rejected.
     CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(allocator), I(1)})) == dg::kEInvalidArg);
