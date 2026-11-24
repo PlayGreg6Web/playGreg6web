@@ -189,10 +189,10 @@ pub fn no_return_thunks(analysis: &Analysis, no_return: &BTreeSet<u64>) -> BTree
 // ---------------------------------------------------------------------------------------------
 
 /// Instructions decoded when checking that a candidate without `.pdata` looks like code.
-/// Large enough for long straight-line leaf functions (e.g. static initializers that fill a table
-/// with hundreds of `lea`/`mov` pairs before their `ret`); zero runs and other data that decodes
+/// Large enough for long straight-line leaf functions (e.g. static initializers that fill tables
+/// with thousands of `lea`/`mov` pairs before their `ret`); zero runs and other data that decodes
 /// without ever reaching a control-flow instruction still fail at this bound.
-pub const PROBE_INSTRUCTIONS: usize = 4096;
+pub const PROBE_INSTRUCTIONS: usize = 65536;
 
 /// Upper bound on discovery rounds of the fixpoint (each round adds at least one entry or
 /// no-return thunk, so real inputs converge in a handful).
@@ -677,11 +677,11 @@ mod probe_tests {
 
     #[test]
     fn long_straight_line_leaf_function_is_code() {
-        // 1500 x `mov eax, 1` (5 bytes each), then `ret`: a static initializer shape.
-        let mut code: Vec<u8> = std::iter::repeat_n([0xb8, 1, 0, 0, 0], 1500).flatten().collect();
+        // 6000 x `mov eax, 1` (5 bytes each), then `ret`: a static initializer shape.
+        let mut code: Vec<u8> = std::iter::repeat_n([0xb8, 1, 0, 0, 0], 6000).flatten().collect();
         code.push(0xc3);
         let starts = probe_code(&code).expect("plausible");
-        assert_eq!(starts.len(), 1501);
+        assert_eq!(starts.len(), 6001);
     }
 
     #[test]
