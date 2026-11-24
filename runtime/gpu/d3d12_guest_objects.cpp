@@ -245,6 +245,10 @@ void Device::set_sink(PacketSink sink) {
 }
 
 void Device::submit(const uint8_t* data, size_t size) {
+    submit_parts({{data, size}});
+}
+
+void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts) {
     std::lock_guard<std::mutex> lock(submit_mutex_);
     auto emit = [&](const uint8_t* bytes, size_t n) {
         if (n == 0) {
@@ -262,7 +266,9 @@ void Device::submit(const uint8_t* data, size_t size) {
         emit(begin.data(), begin.size());
         frame_open_ = true;
     }
-    emit(data, size);
+    for (const auto& [data, size] : parts) {
+        emit(data, size);
+    }
     ++submissions_;
 }
 
@@ -301,6 +307,13 @@ DeviceStats Device::stats() const {
         s.submissions = submissions_;
     }
     s.bad_arguments = bad_arguments_.load();
+    s.resources = resources.load();
+    s.heaps = memory_heaps.load();
+    s.pipeline_states = pipeline_states.load();
+    s.command_lists = command_lists.load();
+    s.upload_bytes = upload_bytes_.load();
+    s.skipped_draws = skipped_draws_.load();
+    s.unsupported_copies = unsupported_copies_.load();
     return s;
 }
 
@@ -1142,27 +1155,27 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::method<&IDeviceHost::GetNodeCount>("GetNodeCount"),                     // 7
     DevM::method<&IDeviceHost::CreateCommandQueue>("CreateCommandQueue"),         // 8
     DevM::method<&IDeviceHost::CreateCommandAllocator>("CreateCommandAllocator"), // 9
-    DevM::stub("CreateGraphicsPipelineState"),                                    // 10
-    DevM::stub("CreateComputePipelineState"),                                     // 11
-    DevM::stub("CreateCommandList"),                                              // 12
+    DevM::method<&IDeviceHost::CreateGraphicsPipelineState>("CreateGraphicsPipelineState"),  // 10
+    DevM::method<&IDeviceHost::CreateComputePipelineState>("CreateComputePipelineState"),    // 11
+    DevM::method<&IDeviceHost::CreateCommandList>("CreateCommandList"),                      // 12
     DevM::method<&IDeviceHost::CheckFeatureSupport>("CheckFeatureSupport"),       // 13
     DevM::method<&IDeviceHost::CreateDescriptorHeap>("CreateDescriptorHeap"),     // 14
     DevM::method<&IDeviceHost::GetDescriptorHandleIncrementSize>("GetDescriptorHandleIncrementSize"),  // 15
     DevM::method<&IDeviceHost::CreateRootSignature>("CreateRootSignature"),       // 16
     DevM::method<&IDeviceHost::CreateConstantBufferView>("CreateConstantBufferView"),  // 17
-    DevM::stub("CreateShaderResourceView"),                                       // 18
-    DevM::stub("CreateUnorderedAccessView"),                                      // 19
-    DevM::stub("CreateRenderTargetView"),                                         // 20
-    DevM::stub("CreateDepthStencilView"),                                         // 21
+    DevM::method<&IDeviceHost::CreateShaderResourceView>("CreateShaderResourceView"),    // 18
+    DevM::method<&IDeviceHost::CreateUnorderedAccessView>("CreateUnorderedAccessView"),  // 19
+    DevM::method<&IDeviceHost::CreateRenderTargetView>("CreateRenderTargetView"),        // 20
+    DevM::method<&IDeviceHost::CreateDepthStencilView>("CreateDepthStencilView"),        // 21
     DevM::method<&IDeviceHost::CreateSampler>("CreateSampler"),                   // 22
     DevM::method<&IDeviceHost::CopyDescriptors>("CopyDescriptors"),               // 23
     DevM::method<&IDeviceHost::CopyDescriptorsSimple>("CopyDescriptorsSimple"),   // 24
     DevM::sret<&IDeviceHost::GetResourceAllocationInfo>("GetResourceAllocationInfo"),  // 25
     DevM::sret<&IDeviceHost::GetCustomHeapProperties>("GetCustomHeapProperties"),      // 26
-    DevM::stub("CreateCommittedResource"),                                        // 27
-    DevM::stub("CreateHeap"),                                                     // 28
-    DevM::stub("CreatePlacedResource"),                                           // 29
-    DevM::stub("CreateReservedResource"),                                         // 30
+    DevM::method<&IDeviceHost::CreateCommittedResource>("CreateCommittedResource"),  // 27
+    DevM::method<&IDeviceHost::CreateHeap>("CreateHeap"),                            // 28
+    DevM::method<&IDeviceHost::CreatePlacedResource>("CreatePlacedResource"),        // 29
+    DevM::method<&IDeviceHost::CreateReservedResource>("CreateReservedResource"),    // 30
     DevM::stub("CreateSharedHandle"),                                             // 31
     DevM::stub("OpenSharedHandle"),                                               // 32
     DevM::stub("OpenSharedHandleByName"),                                         // 33
@@ -1181,6 +1194,91 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),                                                          // 46
     DevM::stub(nullptr),                                                          // 47
     DevM::method<&IDeviceHost::CreateCommandQueueX>("CreateCommandQueue (Xbox slot 48)"),  // 48
+    DevM::stub(nullptr),  // 49
+    DevM::stub(nullptr),  // 50
+    DevM::stub(nullptr),  // 51
+    DevM::stub(nullptr),  // 52
+    DevM::stub(nullptr),  // 53
+    DevM::stub(nullptr),  // 54
+    DevM::stub(nullptr),  // 55
+    DevM::stub(nullptr),  // 56
+    DevM::stub(nullptr),  // 57
+    DevM::stub(nullptr),  // 58
+    DevM::stub(nullptr),  // 59
+    DevM::stub(nullptr),  // 60
+    DevM::stub(nullptr),  // 61
+    DevM::stub(nullptr),  // 62
+    DevM::stub(nullptr),  // 63
+    DevM::stub(nullptr),  // 64
+    DevM::stub(nullptr),  // 65
+    DevM::stub(nullptr),  // 66
+    DevM::stub(nullptr),  // 67
+    DevM::stub(nullptr),  // 68
+    DevM::stub(nullptr),  // 69
+    DevM::stub(nullptr),  // 70
+    DevM::stub(nullptr),  // 71
+    DevM::stub(nullptr),  // 72
+    DevM::method<&IDeviceHost::CreateCommandListX>("CreateCommandList (Xbox slot 73)"),  // 73
+    DevM::stub(nullptr),  // 74
+    DevM::stub(nullptr),  // 75
+    DevM::stub(nullptr),  // 76
+    DevM::stub(nullptr),  // 77
+    DevM::stub(nullptr),  // 78
+    DevM::stub(nullptr),  // 79
+    DevM::stub(nullptr),  // 80
+    DevM::stub(nullptr),  // 81
+    DevM::stub(nullptr),  // 82
+    DevM::stub(nullptr),  // 83
+    DevM::stub(nullptr),  // 84
+    DevM::stub(nullptr),  // 85
+    DevM::stub(nullptr),  // 86
+    DevM::stub(nullptr),  // 87
+    DevM::stub(nullptr),  // 88
+    DevM::stub(nullptr),  // 89
+    DevM::stub(nullptr),  // 90
+    DevM::stub(nullptr),  // 91
+    DevM::stub(nullptr),  // 92
+    DevM::stub(nullptr),  // 93
+    DevM::stub(nullptr),  // 94
+    DevM::stub(nullptr),  // 95
+    DevM::stub(nullptr),  // 96
+    DevM::stub(nullptr),  // 97
+    DevM::stub(nullptr),  // 98
+    DevM::stub(nullptr),  // 99
+    DevM::stub(nullptr),  // 100
+    DevM::stub(nullptr),  // 101
+    DevM::stub(nullptr),  // 102
+    DevM::stub(nullptr),  // 103
+    DevM::stub(nullptr),  // 104
+    DevM::stub(nullptr),  // 105
+    DevM::stub(nullptr),  // 106
+    DevM::stub(nullptr),  // 107
+    DevM::stub(nullptr),  // 108
+    DevM::stub(nullptr),  // 109
+    DevM::stub(nullptr),  // 110
+    DevM::stub(nullptr),  // 111
+    DevM::stub(nullptr),  // 112
+    DevM::stub(nullptr),  // 113
+    DevM::stub(nullptr),  // 114
+    DevM::stub(nullptr),  // 115
+    DevM::stub(nullptr),  // 116
+    DevM::stub(nullptr),  // 117
+    DevM::stub(nullptr),  // 118
+    DevM::stub(nullptr),  // 119
+    DevM::stub(nullptr),  // 120
+    DevM::stub(nullptr),  // 121
+    DevM::stub(nullptr),  // 122
+    DevM::stub(nullptr),  // 123
+    DevM::stub(nullptr),  // 124
+    DevM::stub(nullptr),  // 125
+    DevM::stub(nullptr),  // 126
+    DevM::method<&IDeviceHost::CreateCommittedResource3>("CreateCommittedResource3 (Xbox slot 127)"),  // 127
+    DevM::stub(nullptr),  // 128
+    DevM::stub(nullptr),  // 129
+    DevM::stub(nullptr),  // 130
+    DevM::stub(nullptr),  // 131
+    DevM::stub(nullptr),  // 132
+    DevM::method<&IDeviceHost::CreatePlacedResourceX>("CreatePlacedResource (Xbox slot 133)"),  // 133
 };
 constexpr Guid kDeviceIids[] = {
     IID_ID3D12Object,
@@ -1215,7 +1313,7 @@ constexpr com::MethodDesc kQueueMethods[] = {
     QueueM::stub(nullptr),                                                          // 31
     QueueM::method<&ICommandQueueHost::PresentX>("PresentX (Xbox slot 32)"),        // 32
     QueueM::stub(nullptr), QueueM::stub(nullptr),                                   // 33..34
-    QueueM::stub("ExecuteCommandLists (Xbox slot 35)"),                             // 35
+    QueueM::method<&ICommandQueueHost::ExecuteCommandListsX>("ExecuteCommandLists (Xbox slot 35)"),  // 35
 };
 constexpr Guid kQueueIids[] = {IID_ID3D12Object, IID_ID3D12DeviceChild, IID_ID3D12Pageable};
 

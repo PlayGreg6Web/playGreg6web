@@ -58,6 +58,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
@@ -274,6 +275,92 @@ struct ICommandQueueHost : IDeviceChildHost {
     virtual HResult Wait(InterfaceArg<IFenceHost> fence, uint64_t value) = 0;                  // 17
     virtual HResult GetTimestampFrequency(GuestPtr<uint64_t> frequency) = 0;                   // 18
     virtual HResult PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) = 0;  // 32
+    virtual void ExecuteCommandListsX(com::CallContext& ctx) = 0;                              // 35
+};
+
+// D3D12_RESOURCE_DESC1 as a struct-return value (72 bytes).
+struct ResourceDesc1Result {
+    uint8_t bytes[kGuestResourceDesc1Size];
+};
+
+// ID3D12Resource: 8 Map, 9 Unmap, 10 GetDesc, 11 GetGPUVirtualAddress, 12 WriteToSubresource,
+// 13 ReadFromSubresource, 14 GetHeapProperties; ID3D12Resource2: 16 GetDesc1.
+struct IResourceHost : IDeviceChildHost {
+    virtual HResult Map(uint32_t subresource, uint64_t read_range, OutPtr data) = 0;
+    virtual void Unmap(uint32_t subresource, uint64_t written_range) = 0;
+    virtual GuestResourceDesc GetDesc() = 0;
+    virtual uint64_t GetGPUVirtualAddress() = 0;
+    virtual HResult WriteToSubresource(com::CallContext& ctx) = 0;
+    virtual HResult ReadFromSubresource(com::CallContext& ctx) = 0;
+    virtual HResult GetHeapProperties(GuestPtr<GuestHeapProperties> properties, GuestPtr<uint32_t> flags) = 0;
+    virtual ResourceDesc1Result GetDesc1() = 0;
+};
+
+// ID3D12Heap: 8 GetDesc.
+struct IHeapHost : IDeviceChildHost {
+    virtual GuestHeapDesc GetDesc() = 0;
+};
+
+// ID3D12PipelineState: 8 GetCachedBlob.
+struct IPipelineStateHost : IDeviceChildHost {
+    virtual HResult GetCachedBlob(OutPtr blob) = 0;
+};
+
+// ID3D12GraphicsCommandList, public order (slot 9 Close confirmed, the rest unconfirmed).
+struct IGraphicsCommandListHost : IDeviceChildHost {
+    virtual uint32_t GetType() = 0;                                                                  // 8
+    virtual HResult Close() = 0;                                                                     // 9
+    virtual HResult Reset(InterfaceArg<ICommandAllocatorHost> allocator,
+                          InterfaceArg<IPipelineStateHost> initial_state) = 0;                       // 10
+    virtual void ClearState(InterfaceArg<IPipelineStateHost> state) = 0;                             // 11
+    virtual void DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t start_vertex,
+                               uint32_t start_instance) = 0;                                         // 12
+    virtual void DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t start_index,
+                                      int32_t base_vertex, uint32_t start_instance) = 0;             // 13
+    virtual void Dispatch(uint32_t x, uint32_t y, uint32_t z) = 0;                                   // 14
+    virtual void CopyBufferRegion(InterfaceArg<IResourceHost> dst, uint64_t dst_offset,
+                                  InterfaceArg<IResourceHost> src, uint64_t src_offset,
+                                  uint64_t bytes) = 0;                                               // 15
+    virtual void CopyTextureRegion(com::CallContext& ctx) = 0;                                       // 16
+    virtual void CopyResource(InterfaceArg<IResourceHost> dst, InterfaceArg<IResourceHost> src) = 0;  // 17
+    virtual void ResolveSubresource(com::CallContext& ctx) = 0;                                      // 19
+    virtual void IASetPrimitiveTopology(uint32_t topology) = 0;                                      // 20
+    virtual void RSSetViewports(uint32_t count, uint64_t viewports) = 0;                             // 21
+    virtual void RSSetScissorRects(uint32_t count, uint64_t rects) = 0;                              // 22
+    virtual void OMSetBlendFactor(uint64_t factor) = 0;                                              // 23
+    virtual void OMSetStencilRef(uint32_t ref) = 0;                                                  // 24
+    virtual void SetPipelineState(InterfaceArg<IPipelineStateHost> state) = 0;                       // 25
+    virtual void ResourceBarrier(uint32_t count, uint64_t barriers) = 0;                             // 26
+    virtual void SetDescriptorHeaps(uint32_t count, uint64_t heaps) = 0;                             // 28
+    virtual void SetComputeRootSignature(InterfaceArg<IRootSignatureHost> signature) = 0;            // 29
+    virtual void SetGraphicsRootSignature(InterfaceArg<IRootSignatureHost> signature) = 0;           // 30
+    virtual void SetComputeRootDescriptorTable(uint32_t index, uint64_t base) = 0;                   // 31
+    virtual void SetGraphicsRootDescriptorTable(uint32_t index, uint64_t base) = 0;                  // 32
+    virtual void SetComputeRoot32BitConstant(uint32_t index, uint32_t value, uint32_t offset) = 0;   // 33
+    virtual void SetGraphicsRoot32BitConstant(uint32_t index, uint32_t value, uint32_t offset) = 0;  // 34
+    virtual void SetComputeRoot32BitConstants(uint32_t index, uint32_t count, uint64_t values,
+                                              uint32_t offset) = 0;                                  // 35
+    virtual void SetGraphicsRoot32BitConstants(uint32_t index, uint32_t count, uint64_t values,
+                                               uint32_t offset) = 0;                                 // 36
+    virtual void SetComputeRootConstantBufferView(uint32_t index, uint64_t va) = 0;                  // 37
+    virtual void SetGraphicsRootConstantBufferView(uint32_t index, uint64_t va) = 0;                 // 38
+    virtual void SetComputeRootShaderResourceView(uint32_t index, uint64_t va) = 0;                  // 39
+    virtual void SetGraphicsRootShaderResourceView(uint32_t index, uint64_t va) = 0;                 // 40
+    virtual void SetComputeRootUnorderedAccessView(uint32_t index, uint64_t va) = 0;                 // 41
+    virtual void SetGraphicsRootUnorderedAccessView(uint32_t index, uint64_t va) = 0;                // 42
+    virtual void IASetIndexBuffer(uint64_t view) = 0;                                                // 43
+    virtual void IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t views) = 0;             // 44
+    virtual void SOSetTargets(uint32_t start, uint32_t count, uint64_t views) = 0;                   // 45
+    virtual void OMSetRenderTargets(uint32_t count, uint64_t rtvs, bool single_range, uint64_t dsv) = 0;  // 46
+    virtual void ClearDepthStencilView(uint64_t dsv, uint32_t flags, float depth, uint8_t stencil,
+                                       uint32_t rect_count, uint64_t rects) = 0;                     // 47
+    virtual void ClearRenderTargetView(uint64_t rtv, uint64_t color, uint32_t rect_count,
+                                       uint64_t rects) = 0;                                          // 48
+    virtual void ClearUnorderedAccessView(com::CallContext& ctx) = 0;                                // 49, 50
+    virtual void DiscardResource(InterfaceArg<IResourceHost> resource, uint64_t region) = 0;         // 51
+    virtual void QueryOperation(com::CallContext& ctx) = 0;                                          // 52..54
+    virtual void SetPredication(com::CallContext& ctx) = 0;                                          // 55
+    virtual void DebugMarker(com::CallContext& ctx) = 0;                                             // 56..58
 };
 
 struct HeapPropertiesResult {
@@ -307,6 +394,27 @@ struct IDeviceHost : IObjectHost {
     virtual HResult CreateCommandSignature(const GuestCommandSignatureDesc* desc, uint64_t root_signature,
                                            const Guid& riid, OutPtr out) = 0;                               // 41
     virtual HResult CreateCommandQueueX(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out) = 0;  // 48
+    // Resources, PSOs, command lists, views (d3d12_guest_resources.cpp, d3d12_guest_command_list.cpp).
+    virtual HResult CreateGraphicsPipelineState(uint64_t desc, const Guid& riid, OutPtr out) = 0;          // 10
+    virtual HResult CreateComputePipelineState(uint64_t desc, const Guid& riid, OutPtr out) = 0;           // 11
+    virtual HResult CreateCommandList(uint32_t node_mask, uint32_t type, InterfaceArg<ICommandAllocatorHost> allocator,
+                                      InterfaceArg<IPipelineStateHost> initial_state, const Guid& riid,
+                                      OutPtr out) = 0;                                                     // 12
+    virtual void CreateShaderResourceView(InterfaceArg<IResourceHost> resource, uint64_t desc, uint64_t dest) = 0;  // 18
+    virtual void CreateUnorderedAccessView(InterfaceArg<IResourceHost> resource, InterfaceArg<IResourceHost> counter,
+                                           uint64_t desc, uint64_t dest) = 0;                             // 19
+    virtual void CreateRenderTargetView(InterfaceArg<IResourceHost> resource, uint64_t desc, uint64_t dest) = 0;  // 20
+    virtual void CreateDepthStencilView(InterfaceArg<IResourceHost> resource, uint64_t desc, uint64_t dest) = 0;  // 21
+    virtual HResult CreateCommittedResource(com::CallContext& ctx) = 0;                                   // 27
+    virtual HResult CreateHeap(const GuestHeapDesc* desc, const Guid& riid, OutPtr out) = 0;              // 28
+    virtual HResult CreatePlacedResource(com::CallContext& ctx) = 0;                                      // 29
+    virtual HResult CreateReservedResource(uint64_t desc, uint32_t state, uint64_t clear, const Guid& riid,
+                                           OutPtr out) = 0;                                                 // 30
+    virtual HResult CreateCommandListX(const GuestCommandListDescX* desc, InterfaceArg<ICommandAllocatorHost> allocator,
+                                       InterfaceArg<IPipelineStateHost> initial_state, const Guid& riid,
+                                       OutPtr out) = 0;                                                    // 73
+    virtual HResult CreateCommittedResource3(com::CallContext& ctx) = 0;                                  // 127
+    virtual HResult CreatePlacedResourceX(com::CallContext& ctx) = 0;                                     // 133
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -323,6 +431,13 @@ struct DeviceOptions {
 };
 
 struct DeviceStats {
+    uint64_t resources = 0;
+    uint64_t heaps = 0;
+    uint64_t pipeline_states = 0;
+    uint64_t command_lists = 0;
+    uint64_t upload_bytes = 0;        // WriteBuffer / WriteTexture payload bytes emitted from guest memory
+    uint64_t skipped_draws = 0;       // draws skipped because the bound PSO has no shader module
+    uint64_t unsupported_copies = 0;  // GPU-to-GPU copies, resolves, ... (no packet; diagnosed)
     uint64_t queues = 0;
     uint64_t command_allocators = 0;
     uint64_t descriptor_heaps = 0;
@@ -332,6 +447,10 @@ struct DeviceStats {
     uint64_t submissions = 0;
     uint64_t bad_arguments = 0;  // malformed guest structs / pointers (diagnosed, E_INVALIDARG)
 };
+
+class Resource;
+class Heap;
+class CommandList;
 
 class Device final : public ObjectBase<IDeviceHost> {
 public:
@@ -373,6 +492,50 @@ public:
     HResult CreateCommandSignature(const GuestCommandSignatureDesc* desc, uint64_t root_signature,
                                    const Guid& riid, OutPtr out) override;
     HResult CreateCommandQueueX(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out) override;
+    HResult CreateGraphicsPipelineState(uint64_t desc, const Guid& riid, OutPtr out) override;
+    HResult CreateComputePipelineState(uint64_t desc, const Guid& riid, OutPtr out) override;
+    HResult CreateCommandList(uint32_t node_mask, uint32_t type, InterfaceArg<ICommandAllocatorHost> allocator,
+                              InterfaceArg<IPipelineStateHost> initial_state, const Guid& riid, OutPtr out) override;
+    void CreateShaderResourceView(InterfaceArg<IResourceHost> resource, uint64_t desc, uint64_t dest) override;
+    void CreateUnorderedAccessView(InterfaceArg<IResourceHost> resource, InterfaceArg<IResourceHost> counter,
+                                   uint64_t desc, uint64_t dest) override;
+    void CreateRenderTargetView(InterfaceArg<IResourceHost> resource, uint64_t desc, uint64_t dest) override;
+    void CreateDepthStencilView(InterfaceArg<IResourceHost> resource, uint64_t desc, uint64_t dest) override;
+    HResult CreateCommittedResource(com::CallContext& ctx) override;
+    HResult CreateHeap(const GuestHeapDesc* desc, const Guid& riid, OutPtr out) override;
+    HResult CreatePlacedResource(com::CallContext& ctx) override;
+    HResult CreateReservedResource(uint64_t desc, uint32_t state, uint64_t clear, const Guid& riid,
+                                   OutPtr out) override;
+    HResult CreateCommandListX(const GuestCommandListDescX* desc, InterfaceArg<ICommandAllocatorHost> allocator,
+                               InterfaceArg<IPipelineStateHost> initial_state, const Guid& riid, OutPtr out) override;
+    HResult CreateCommittedResource3(com::CallContext& ctx) override;
+    HResult CreatePlacedResourceX(com::CallContext& ctx) override;
+
+    // ---- Shaders ----
+    // Shader identity (shader_identity(): FNV-1a 64 over the DXIL container bytes the PSO desc passes)
+    // -> CreateShaderModule id. PSOs created before their modules are registered stay unresolved.
+    void register_shader_module(uint64_t identity, uint32_t module_id);
+    void note_unresolved_shader(uint64_t identity);
+    std::vector<uint64_t> unresolved_shaders() const;
+    bool shader_known(uint64_t identity) const;
+
+    // ---- Resources ----
+    // GPU virtual address range for memory without guest backing (default heaps, reserved
+    // resources): kFakeGpuVaBase upwards, 64 KiB aligned, never reused.
+    static constexpr uint64_t kFakeGpuVaBase = 0x00007E0000000000ull;
+    uint64_t allocate_gpu_va(uint64_t size);
+    // CPU-visible buffers whose guest memory is compared with a shadow copy at every
+    // ExecuteCommandLists (changed 4 KiB pages become WriteBuffer packets).
+    void track_cpu_buffer(Resource* resource);
+    void untrack_cpu_buffer(Resource* resource);
+    void flush_cpu_buffers(CommandEncoder& encoder);
+    // Designates a texture as the presented back buffer: render passes that target it write the
+    // canvas texture (kGpuSwapchainTextureId). The plane layout of PresentX is not established, so
+    // the host (or a test) names the back buffer. False if `resource` is not a 2D texture.
+    bool set_back_buffer(uint64_t resource_interface_pointer);
+    void note_upload(uint64_t bytes) { upload_bytes_.fetch_add(bytes, std::memory_order_relaxed); }
+    void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
+    void note_unsupported_copy(const std::string& message);
 
     // ---- Runtime side ----
     d3d::DescriptorHeapRegistry& heaps() { return heaps_; }
@@ -384,6 +547,8 @@ public:
     // Writes `bytes` to the sink as one submission (thread-safe, serialized).
     void submit(const uint8_t* data, size_t size);
     void submit(const CommandEncoder& encoder) { submit(encoder.data(), encoder.size()); }
+    // Several byte ranges as one submission (no other submission in between).
+    void submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts);
     // Present packet (and BeginFrame before the next frame's first submission).
     void present();
     void set_sink(PacketSink sink);
@@ -394,6 +559,7 @@ public:
 
     // Child counters.
     std::atomic<uint64_t> queues{0}, allocators{0}, descriptor_heaps{0}, root_signatures{0}, fences{0};
+    std::atomic<uint64_t> resources{0}, memory_heaps{0}, pipeline_states{0}, command_lists{0};
 
 private:
     HResult create_queue(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out);
@@ -413,6 +579,23 @@ private:
     mutable std::mutex diag_mutex_;
     std::vector<std::string> diags_;
     std::atomic<uint64_t> bad_arguments_{0};
+
+    HResult create_resource(const GuestResourceDesc& desc, const GuestHeapProperties& heap, uint32_t heap_flags,
+                            uint32_t initial_state, com::Ref<Heap> placed_heap, uint64_t heap_offset,
+                            uint64_t address, bool reserved, const Guid& riid, OutPtr out);
+    HResult create_command_list(uint32_t type, InterfaceArg<IPipelineStateHost> initial_state, const Guid& riid,
+                                OutPtr out);
+
+    mutable std::mutex shader_mutex_;
+    std::vector<uint64_t> unresolved_shaders_;
+    std::unordered_set<uint64_t> known_shaders_;
+    std::mutex va_mutex_;
+    uint64_t next_fake_va_ = kFakeGpuVaBase;
+    std::mutex tracked_mutex_;
+    std::vector<Resource*> tracked_;
+    std::atomic<uint64_t> upload_bytes_{0};
+    std::atomic<uint64_t> skipped_draws_{0};
+    std::atomic<uint64_t> unsupported_copies_{0};
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -529,6 +712,10 @@ public:
     HResult Wait(InterfaceArg<IFenceHost> fence, uint64_t value) override;
     HResult GetTimestampFrequency(GuestPtr<uint64_t> frequency) override;
     HResult PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) override;
+    // Xbox slot 35: (count, command lists, handle, flags); the handle and flags are not interpreted.
+    void ExecuteCommandListsX(com::CallContext& ctx) override;
+    // ExecuteCommandLists semantics for host callers and tests: list interface pointers.
+    void execute(const std::vector<uint64_t>& lists);
     const GuestCommandQueueDesc& desc() const { return desc_; }
 
 private:

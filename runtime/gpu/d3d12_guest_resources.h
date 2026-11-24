@@ -1,0 +1,262 @@
+#pragma once
+
+// Guest D3D12 resources, heaps, pipeline states and graphics command lists (G24, part 2), on top
+// of the device objects in d3d12_guest_objects.h.
+//
+// Memory and GPU virtual addresses
+// --------------------------------
+// The console is UMA: a buffer's GPU virtual address is the CPU address of its memory, and the
+// executable creates most resources at addresses it allocated itself (device slot 133). The layer
+// follows that model:
+//  * Buffers in CPU-visible memory (UPLOAD / READBACK / CUSTOM heaps with CPU access, and every
+//    resource created at a caller address that is guest memory) get guest memory; their GPU VA is
+//    that guest address. Committed ones get a fresh 64 KiB-aligned guest allocation, placed ones the
+//    heap's memory + offset.
+//  * Buffers without CPU access (DEFAULT heaps, reserved resources) get a GPU VA from the device's
+//    fake range (Device::kFakeGpuVaBase); they have no guest memory.
+//  * Textures have no GPU VA (GetGPUVirtualAddress returns 0, as in D3D12).
+// Every buffer is registered with the state bridge (VA -> buffer id) so CBVs, root views and
+// vertex/index buffer views resolve; every texture with its format, size and sample count.
+//
+// How data reaches the GPU process
+// --------------------------------
+// The packet ABI has WriteBuffer / WriteTexture (CPU -> GPU) and nothing for GPU -> CPU or GPU -> GPU.
+//  * CPU-visible buffers keep a host shadow of their contents. At every ExecuteCommandLists the
+//    device compares each tracked buffer with its shadow in 4 KiB pages and emits WriteBuffer for
+//    the changed runs (before the command lists' packets). Map/Unmap need no bookkeeping, so
+//    persistently mapped buffers and memory the guest writes without Map work the same way. Cost:
+//    one memcmp of every tracked buffer per submission.
+//  * CopyBufferRegion / CopyResource from a CPU-visible buffer and CopyTextureRegion from a placed
+//    footprint in a CPU-visible buffer become WriteBuffer / WriteTexture packets built from guest
+//    memory at ExecuteCommandLists time (the source holds what the GPU would read when the list
+//    executes). Copies from GPU-only memory, into CPU-visible memory, resolves and queries have no
+//    packet: they are diagnosed (Device::stats().unsupported_copies) and skipped.
+//  * The WebGPU worker applies WriteBuffer / WriteTexture as queue writes, i.e. before the frame's
+//    command buffer runs; a list that rewrites a buffer between two draws of the same frame sees
+//    the last write in both (limitation of the worker's frame model, not of this layer).
+//
+// Shaders
+// -------
+// PSO creation receives DXIL containers. A shader's identity is FNV-1a 64 over the exact container
+// bytes (pShaderBytecode[0, BytecodeLength)), the same function and "0x%016x" spelling the offline
+// pipeline uses for its SPIR-V hashes (shaders/src/convert.rs). The offline manifest keys modules by
+// the SPIR-V hash, so it needs a DXIL identity -> module entry; Device::register_shader_module
+// installs that mapping (StateBridgeDevice::register_shader_module) and the pipeline layout for the
+// shader pair goes through StateBridgeDevice::register_pipeline_layout. A PSO whose shaders have no
+// module is "unresolved": binding it diagnoses, records the identities (Device::unresolved_shaders)
+// and every draw with it is skipped (Device::stats().skipped_draws), never emitted with module 0.
+//
+// Command lists
+// -------------
+// One bridge::CommandListBridge + CommandEncoder per command list (single recording thread, like
+// D3D12). Reset clears the encoder; ExecuteCommandLists (queue Xbox slot 35) submits, per list:
+// pending shadow uploads, the list's deferred CPU-sourced copies, then its packet stream, and
+// commits its resource states to the device registry (G6 ResourceStateRegistry::execute).
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "gpu/d3d12_guest_objects.h"
+
+namespace playgta6::gpu::d3d12_guest {
+
+// FNV-1a 64 over `size` bytes (shader identity, see the header comment).
+uint64_t shader_identity(const void* data, size_t size);
+
+class Heap final : public ChildBase<IHeapHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12Heap";
+    Heap(com::Ref<Device> device, const GuestHeapDesc& desc);
+    ~Heap() override;
+    GuestHeapDesc GetDesc() override { return desc_; }
+    bool valid() const { return base_ != 0; }
+    bool cpu_visible() const { return cpu_visible_; }
+    uint64_t base() const { return base_; }  // guest address (CPU-visible) or fake GPU VA
+    const GuestHeapDesc& desc() const { return desc_; }
+
+private:
+    GuestHeapDesc desc_;
+    bool cpu_visible_ = false;
+    bool owns_guest_memory_ = false;
+    uint64_t base_ = 0;
+};
+
+class Resource final : public ChildBase<IResourceHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12Resource";
+
+    struct Placement {
+        GuestHeapProperties heap{};
+        uint32_t heap_flags = 0;
+        com::Ref<Heap> placed_heap;  // placed resources
+        uint64_t heap_offset = 0;
+        uint64_t address = 0;        // resources created at a caller address (Xbox slot 133)
+        bool reserved = false;
+    };
+
+    Resource(com::Ref<Device> device, const GuestResourceDesc& desc, Placement placement, uint32_t initial_state);
+    ~Resource() override;
+    // Creates the GPU object (packets) and registrations; false (diagnosed) if it cannot exist.
+    bool initialize();
+
+    // ---- IResourceHost ----
+    HResult Map(uint32_t subresource, uint64_t read_range, OutPtr data) override;
+    void Unmap(uint32_t subresource, uint64_t written_range) override;
+    GuestResourceDesc GetDesc() override { return desc_; }
+    uint64_t GetGPUVirtualAddress() override { return is_buffer() ? gpu_va_ : 0; }
+    HResult WriteToSubresource(com::CallContext& ctx) override;
+    HResult ReadFromSubresource(com::CallContext& ctx) override;
+    HResult GetHeapProperties(GuestPtr<GuestHeapProperties> properties, GuestPtr<uint32_t> flags) override;
+    ResourceDesc1Result GetDesc1() override;
+
+    // ---- Runtime side ----
+    uint32_t id() const { return id_; }
+    bool is_buffer() const { return desc_.Dimension == ResourceDimension::Buffer; }
+    const GuestResourceDesc& desc() const { return desc_; }
+    uint64_t gpu_va() const { return gpu_va_; }
+    uint64_t cpu_address() const { return cpu_va_; }  // guest address of CPU-visible memory, 0 if none
+    uint32_t mip_levels() const { return mips_; }
+    uint32_t array_layers() const;
+    uint32_t subresource_count() const;
+    bool has_gpu_texture() const { return gpu_texture_; }
+    // Shadow comparison (CPU-visible buffers): appends WriteBuffer packets for changed pages.
+    void flush_shadow(CommandEncoder& encoder);
+    // Marks the texture as the presented back buffer (Device::set_back_buffer).
+    void mark_back_buffer();
+
+private:
+    GuestResourceDesc desc_;
+    Placement placement_;
+    uint32_t initial_state_;
+    uint32_t id_ = 0;
+    uint32_t mips_ = 1;
+    uint64_t gpu_va_ = 0;
+    uint64_t cpu_va_ = 0;
+    uint64_t owned_guest_memory_ = 0;
+    bool gpu_texture_ = false;
+    bool tracked_ = false;
+    std::vector<uint8_t> shadow_;
+};
+
+class PipelineState final : public ChildBase<IPipelineStateHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12PipelineState";
+    PipelineState(com::Ref<Device> device, com::Ref<RootSignature> root_signature);
+    ~PipelineState() override;
+    HResult GetCachedBlob(OutPtr blob) override;
+
+    bool is_compute() const { return compute_ != nullptr; }
+    bool resolved() const { return resolved_; }
+    bridge::GraphicsPipelineState* graphics() const { return graphics_.get(); }
+    bridge::ComputePipelineState* compute() const { return compute_.get(); }
+    const std::vector<uint64_t>& shader_identities() const { return identities_; }
+
+private:
+    friend class Device;
+    com::Ref<RootSignature> root_signature_;
+    std::unique_ptr<bridge::GraphicsPipelineState> graphics_;
+    std::unique_ptr<bridge::ComputePipelineState> compute_;
+    std::vector<uint64_t> identities_;
+    bool resolved_ = false;
+};
+
+class CommandList final : public ChildBase<IGraphicsCommandListHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12GraphicsCommandList";
+    CommandList(com::Ref<Device> device, uint32_t type);
+    ~CommandList() override;
+
+    // ---- IGraphicsCommandListHost ----
+    uint32_t GetType() override { return type_; }
+    HResult Close() override;
+    HResult Reset(InterfaceArg<ICommandAllocatorHost> allocator, InterfaceArg<IPipelineStateHost> initial_state) override;
+    void ClearState(InterfaceArg<IPipelineStateHost> state) override;
+    void DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t start_vertex, uint32_t start_instance) override;
+    void DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t start_index, int32_t base_vertex,
+                              uint32_t start_instance) override;
+    void Dispatch(uint32_t x, uint32_t y, uint32_t z) override;
+    void CopyBufferRegion(InterfaceArg<IResourceHost> dst, uint64_t dst_offset, InterfaceArg<IResourceHost> src,
+                          uint64_t src_offset, uint64_t bytes) override;
+    void CopyTextureRegion(com::CallContext& ctx) override;
+    void CopyResource(InterfaceArg<IResourceHost> dst, InterfaceArg<IResourceHost> src) override;
+    void ResolveSubresource(com::CallContext& ctx) override;
+    void IASetPrimitiveTopology(uint32_t topology) override;
+    void RSSetViewports(uint32_t count, uint64_t viewports) override;
+    void RSSetScissorRects(uint32_t count, uint64_t rects) override;
+    void OMSetBlendFactor(uint64_t factor) override;
+    void OMSetStencilRef(uint32_t ref) override;
+    void SetPipelineState(InterfaceArg<IPipelineStateHost> state) override;
+    void ResourceBarrier(uint32_t count, uint64_t barriers) override;
+    void SetDescriptorHeaps(uint32_t count, uint64_t heaps) override;
+    void SetComputeRootSignature(InterfaceArg<IRootSignatureHost> signature) override;
+    void SetGraphicsRootSignature(InterfaceArg<IRootSignatureHost> signature) override;
+    void SetComputeRootDescriptorTable(uint32_t index, uint64_t base) override;
+    void SetGraphicsRootDescriptorTable(uint32_t index, uint64_t base) override;
+    void SetComputeRoot32BitConstant(uint32_t index, uint32_t value, uint32_t offset) override;
+    void SetGraphicsRoot32BitConstant(uint32_t index, uint32_t value, uint32_t offset) override;
+    void SetComputeRoot32BitConstants(uint32_t index, uint32_t count, uint64_t values, uint32_t offset) override;
+    void SetGraphicsRoot32BitConstants(uint32_t index, uint32_t count, uint64_t values, uint32_t offset) override;
+    void SetComputeRootConstantBufferView(uint32_t index, uint64_t va) override;
+    void SetGraphicsRootConstantBufferView(uint32_t index, uint64_t va) override;
+    void SetComputeRootShaderResourceView(uint32_t index, uint64_t va) override;
+    void SetGraphicsRootShaderResourceView(uint32_t index, uint64_t va) override;
+    void SetComputeRootUnorderedAccessView(uint32_t index, uint64_t va) override;
+    void SetGraphicsRootUnorderedAccessView(uint32_t index, uint64_t va) override;
+    void IASetIndexBuffer(uint64_t view) override;
+    void IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t views) override;
+    void SOSetTargets(uint32_t start, uint32_t count, uint64_t views) override;
+    void OMSetRenderTargets(uint32_t count, uint64_t rtvs, bool single_range, uint64_t dsv) override;
+    void ClearDepthStencilView(uint64_t dsv, uint32_t flags, float depth, uint8_t stencil, uint32_t rect_count,
+                               uint64_t rects) override;
+    void ClearRenderTargetView(uint64_t rtv, uint64_t color, uint32_t rect_count, uint64_t rects) override;
+    void ClearUnorderedAccessView(com::CallContext& ctx) override;
+    void DiscardResource(InterfaceArg<IResourceHost>, uint64_t) override {}
+    void QueryOperation(com::CallContext& ctx) override;
+    void SetPredication(com::CallContext&) override {}
+    void DebugMarker(com::CallContext&) override {}
+
+    // ---- Runtime side ----
+    bool is_open() const { return open_; }
+    // Appends this list's submission (deferred CPU-sourced copies, then its packets) to `out` and
+    // commits its resource states. The list must be closed.
+    void append_submission(CommandEncoder& out, std::vector<d3d::StateDiagnostic>* state_diagnostics);
+    const bridge::CommandListBridge& bridge_state() const { return bridge_; }
+    const CommandEncoder& encoder() const { return encoder_; }
+    uint64_t diagnostics_count() const { return diag_count_; }
+
+    // Reset with a host PSO (initial state at creation).
+    void reset(PipelineState* initial_state);
+
+private:
+    struct DeferredWrite {
+        bool texture = false;
+        uint32_t id = 0;
+        uint64_t dst_offset = 0;      // buffers
+        GpuWriteTexturePayload tex{};  // textures (data_len set)
+        uint64_t src = 0;             // guest address of the source bytes
+        uint64_t size = 0;
+    };
+
+    void note(const std::string& message);
+    bool usable();
+    Resource* resource(const InterfaceArg<IResourceHost>& arg) const;
+    void bind_pipeline(PipelineState* state);
+
+    uint32_t type_;
+    bool open_ = false;
+    CommandEncoder encoder_;
+    bridge::CommandListBridge bridge_;
+    PipelineState* graphics_pso_ = nullptr;  // current graphics PSO (kept alive by `pinned_`)
+    PipelineState* compute_pso_ = nullptr;   // current compute PSO
+    std::vector<com::Ref<com::ComObject>> pinned_;  // objects referenced by the recording
+    std::vector<DeferredWrite> deferred_;
+    uint64_t diag_count_ = 0;
+};
+
+extern const com::Interface<IResourceHost> kID3D12Resource;
+extern const com::Interface<IHeapHost> kID3D12Heap;
+extern const com::Interface<IPipelineStateHost> kID3D12PipelineState;
+extern const com::Interface<IGraphicsCommandListHost> kID3D12GraphicsCommandList;
+
+}  // namespace playgta6::gpu::d3d12_guest
