@@ -80,6 +80,7 @@ BIND_GROUP_ENTRY2_STRUCT = struct.Struct("<IIIIQQ16s")  # 48 bytes
 CREATE_BIND_GROUP2_STRUCT = struct.Struct("<IIII")  # 16 bytes + entry_count * 48
 SET_BIND_GROUP2_STRUCT = struct.Struct("<IIII")  # 16 bytes + count * 4
 CREATE_SAMPLER2_STRUCT = struct.Struct("<IBBBBBBBxHxxff")  # 24 bytes
+CREATE_TEXTURE2_STRUCT = struct.Struct("<IIIIIIIBBBB8s")  # 40 bytes (GpuCreateTexture2Payload)
 
 SWAPCHAIN_TEXTURE_ID = 0xFFFFFFFF
 MANIFEST_REFERENCE_FLAG = 0x1
@@ -2889,6 +2890,41 @@ def _decode_v2_payload(
             "max_anisotropy": aniso,
             "lod_min_clamp": lod_min,
             "lod_max_clamp": lod_max,
+            **extra,
+        }, True
+
+    if opcode == GpuOpcode.CreateTexture2:
+        can_decode, extra = fixed_fields(CREATE_TEXTURE2_STRUCT.size)
+        if not can_decode:
+            return extra, False
+        (res_id, width, height, depth_or_layers, mip_levels, sample_count, usage_flags,
+         dimension, tex_format, view_format_count, _reserved, view_formats) = (
+            CREATE_TEXTURE2_STRUCT.unpack_from(payload, 0)
+        )
+        usage_names, unknown_bits = decode_texture_usage(usage_flags)
+        if unknown_bits:
+            ctx.warn("unknown_texture_usage_bits", f"unrecognized usage_flags bits: 0x{unknown_bits:x}")
+        if view_format_count > 8:
+            ctx.warn("view_format_count", f"view_format_count {view_format_count} exceeds 8")
+        dim_name, _dim_webgpu, dim_known = decode_texture_dimension(dimension)
+        if not dim_known:
+            ctx.warn("unknown_texture_dimension", f"unknown dimension={dimension}")
+        return {
+            "id": res_id,
+            "width": width,
+            "height": height,
+            "depth_or_layers": depth_or_layers,
+            "mip_levels": mip_levels,
+            "sample_count": sample_count,
+            "usage_flags": usage_flags,
+            "usage_names": usage_names,
+            "dimension": dimension,
+            "dimension_name": dim_name,
+            "format": ctx.code(WGPU_TEXTURE_FORMAT_NAMES, tex_format, "texture format"),
+            "view_formats": [
+                ctx.code(WGPU_TEXTURE_FORMAT_NAMES, f, "texture format")
+                for f in view_formats[: min(view_format_count, 8)]
+            ],
             **extra,
         }, True
 

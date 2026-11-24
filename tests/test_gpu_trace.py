@@ -1444,6 +1444,26 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         with self.assertRaises(ValueError):
             gpu_trace.encode_create_render_pipeline2(1, 2, 3, 0, bytes(375))
 
+    def test_create_texture2_decodes(self) -> None:
+        # GpuCreateTexture2Payload (40 bytes): a 1280x720 rgba16float render target with one view
+        # format, then a truncated one.
+        self.assertEqual(gpu_trace.CREATE_TEXTURE2_STRUCT.size, 40)
+        payload = gpu_trace.CREATE_TEXTURE2_STRUCT.pack(
+            7, 1280, 720, 1, 1, 1, 0x1F, 2, 40, 1, 0, bytes([40, 0, 0, 0, 0, 0, 0, 0])
+        )
+        stream = gpu_trace.encode_packet(gpu_trace.GpuOpcode.CreateTexture2, payload)
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertEqual(len(trace.packets), 1)
+        fields = trace.packets[0].fields
+        self.assertTrue(trace.packets[0].valid)
+        self.assertEqual((fields["id"], fields["width"], fields["height"]), (7, 1280, 720))
+        self.assertEqual(fields["format"], "rgba16float")
+        self.assertEqual(fields["view_formats"], ["rgba16float"])
+        self.assertEqual(fields["sample_count"], 1)
+        self.assertEqual(len(trace.diagnostics), 0)
+        short = gpu_trace.encode_packet(gpu_trace.GpuOpcode.CreateTexture2, payload[:20])
+        self.assertFalse(gpu_trace.decode_stream(short).packets[0].valid)
+
 
 if __name__ == "__main__":
     unittest.main()
