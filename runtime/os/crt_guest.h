@@ -15,6 +15,15 @@
 //                                             one (0 at first). The runtime's
 //                                             _invalid_parameter_noinfo does not call it: the
 //                                             failing CRT call returns its error code instead.
+//   _set_new_handler(handler)                 swaps the recorded new handler, returns the previous.
+//   _callnewh(size)                           calls the recorded new handler with `size` through
+//                                             call_guest (operator new retries while it returns
+//                                             non-zero); 0 without a handler, and 0 while an
+//                                             unwind propagates out of it (std::bad_alloc).
+//   _beginthreadex(security, stack, start,    the arguments and Win64 ABI of CreateThread: the
+//                  arg, flags, thread_id)     thread starts through pg6_gthunk_create_thread (a
+//                                             guest thread with its own stack,
+//                                             guest/guest_callbacks.h); 0 on failure.
 //
 // The import bridge binds them by name key (pg6_gthunk_setusermatherr <- __setusermatherr) ahead
 // of the family shims.
@@ -24,6 +33,7 @@ namespace playgta6::os::crt_guest {
 // The recorded guest handler addresses (0 = none).
 uint64_t user_matherr_handler();
 uint64_t invalid_parameter_handler();
+uint64_t new_handler();
 // Tests: forget the recorded handlers.
 void reset_handlers();
 
@@ -33,5 +43,8 @@ extern "C" {
 
 void pg6_gthunk_setusermatherr(void* state);
 void pg6_gthunk_set_invalid_parameter_handler(void* state);
+void pg6_gthunk_set_new_handler(void* state);
+void pg6_gthunk_callnewh(void* state);
+void pg6_gthunk_beginthreadex(void* state);
 
 }  // extern "C"

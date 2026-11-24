@@ -6,6 +6,7 @@
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/ucrt_bridge.h"
+#include "os/ucrt_ext.h"
 #include "os/win32_sync.h"
 #include "os/winsock_ordinals.h"
 #include "os/xasync_provider.h"
@@ -371,6 +372,7 @@ size_t register_all_shim_exports() {
         // same name (the WS2_32 ordinal family over the O5 Winsock names, as in the bridge).
         pg6_winsock_ordinals_register_all();
         pg6_ucrt_register_all();
+        pg6_ucrt_ext_register_all();
         pg6_xbox_middleware_register_all();
         pg6_xbox_scarlett_register_all();
         // Guest-callable registrations come last so they replace a host shim registered under the

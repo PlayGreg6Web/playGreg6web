@@ -15,6 +15,7 @@
 #include "os/crt_guest.h"
 #include "os/shim_audit.h"
 #include "os/ucrt_bridge.h"
+#include "os/ucrt_ext.h"
 #include "os/winsock_ordinals.h"
 #include "os/xbox_middleware.h"
 #include "os/xbox_offline.h"
@@ -79,10 +80,10 @@ void test_rows_are_well_formed() {
             CHECK(row.note != nullptr && row.note[0] != '\0');  // deny/pending say why
         }
     }
-    // Every shim of the four audited families has a row (ucrt 186, middleware 98, xbox 16,
-    // winsock 25 registered + WSASetLastError, declared but not registered); stubs.rs checks
-    // the same against the export tables.
-    CHECK(seen.size() == 186u + 98u + 16u + 26u);
+    // Every shim of the four audited families has a row (ucrt 186 + ucrt_ext 37, middleware 98,
+    // xbox 16, winsock 25 registered + WSASetLastError, declared but not registered); stubs.rs
+    // checks the same against the export tables.
+    CHECK(seen.size() == 186u + 37u + 98u + 16u + 26u);
     CHECK(ok > 0);
     for (const GapRow& gap : kGaps) {
         if (gap.dll == nullptr) {
@@ -184,7 +185,94 @@ void test_crt_guest_handlers() {
     pg6_gthunk_setusermatherr(&state);
     CHECK(cg::user_matherr_handler() == 0x140003000);
     CHECK(state.gpr[reg::Rsp] == 0x10018);
+
+    // _set_new_handler swaps; _callnewh without a handler reports "no handler" (0).
+    state.gpr[reg::Rcx] = 0x140004000;
+    pg6_gthunk_set_new_handler(&state);
+    CHECK(state.gpr[reg::Rax] == 0);
+    CHECK(cg::new_handler() == 0x140004000);
     cg::reset_handlers();
+    state.gpr[reg::Rcx] = 64;
+    state.gpr[reg::Rax] = 0xDEAD;
+    pg6_gthunk_callnewh(&state);
+    CHECK(state.gpr[reg::Rax] == 0);
+    CHECK(state.gpr[reg::Rsp] == 0x10028);
+}
+
+// os/ucrt_ext.h: the UCRT internals msvcp140 depends on, "C" locale.
+void test_ucrt_ext() {
+    const uint16_t* ct = pg6_crt_pctype_func();
+    CHECK(ct[-1] == 0);       // EOF
+    CHECK(ct['A'] == 0x181);  // _UPPER | _HEX | alpha
+    CHECK(ct['g'] == 0x102);  // _LOWER | alpha
+    CHECK(ct['7'] == 0x84);   // _DIGIT | _HEX
+    CHECK(ct[' '] == 0x48);   // _SPACE | _BLANK
+    CHECK(ct['\t'] == 0x68);  // _SPACE | _CONTROL | _BLANK
+    CHECK(ct['\n'] == 0x28);  // _SPACE | _CONTROL
+    CHECK(ct['!'] == 0x10);   // _PUNCT
+    CHECK(ct[0x7F] == 0x20);  // _CONTROL
+    CHECK(ct[0xE9] == 0);     // nothing above 0x7F in the "C" locale
+    CHECK(pg6_crt_mb_cur_max_func() == 1);
+    CHECK(pg6_crt_lc_codepage_func() == 0);
+    uint16_t** names = pg6_crt_lc_locale_name_func();
+    for (int i = 0; i < 6; ++i) {
+        CHECK(names[i] == nullptr);
+    }
+    CHECK(std::strcmp(pg6_crt_setlocale(0, nullptr), "C") == 0);
+    CHECK(std::strcmp(pg6_crt_setlocale(0, ""), "C") == 0);
+    CHECK(pg6_crt_setlocale(0, "de-DE") == nullptr);
+    pg6_crt_lock_locales();
+    pg6_crt_lock_locales();  // recursive
+    pg6_crt_unlock_locales();
+    pg6_crt_unlock_locales();
+
+    CHECK(pg6_crt_btowc('A') == 'A');
+    CHECK(pg6_crt_btowc(-1) == PG6_CRT_WEOF);
+    CHECK(pg6_crt_atol("-99999999999") == INT32_MIN);
+    CHECK(pg6_crt_iswspace(0xA0) != 0 && pg6_crt_iswspace('x') == 0);
+    CHECK(pg6_crt_iswalnum(0xE9) != 0 && pg6_crt_iswalnum(0x20AC) == 0);
+    int32_t exp = 0;
+    CHECK(pg6_crt_frexp(8.0, &exp) == 0.5 && exp == 4);
+    CHECK(pg6_crt_ldexp(0.5, 4) == 8.0);
+
+    uint16_t small[3];
+    const uint16_t abc[] = {'a', 'b', 'c', 0};
+    CHECK(pg6_crt_wcscpy_s(small, 3, abc) == ERANGE && small[0] == 0);
+    uint16_t big[8];
+    CHECK(pg6_crt_wcscpy_s(big, 8, abc) == 0 && big[2] == 'c' && big[3] == 0);
+    CHECK(pg6_crt_wcsnlen(abc, 2) == 2);
+    CHECK(pg6_crt_strncnt("hello", 3) == 3);
+
+    char* days = pg6_crt_getdays();
+    CHECK(days != nullptr && std::strncmp(days, ":Sun:Sunday:Mon:Monday:", 23) == 0);
+    pg6_crt_free(days);
+    uint16_t* wmonths = pg6_crt_w_getmonths();
+    CHECK(wmonths != nullptr && wmonths[0] == ':' && wmonths[1] == 'J' && wmonths[4] == ':');
+    pg6_crt_free(wmonths);
+    void* names_block = pg6_crt_gettnames();
+    CHECK(names_block != nullptr);
+    pg6_crt_free(names_block);
+
+    Pg6CrtTm tm{};
+    tm.tm_year = 124;  // 2024-03-05 (Tuesday)
+    tm.tm_mon = 2;
+    tm.tm_mday = 5;
+    tm.tm_wday = 2;
+    char narrow[64];
+    CHECK(pg6_crt_strftime_lc(narrow, sizeof(narrow), "%a %b %d", &tm, nullptr) == 10);
+    CHECK(std::strcmp(narrow, "Tue Mar 05") == 0);
+    const uint16_t wfmt[] = {0x20AC, ' ', '%', 'Y', 0};
+    uint16_t wide[16];
+    CHECK(pg6_crt_wcsftime_lc(wide, 16, wfmt, &tm, nullptr) == 6);
+    CHECK(wide[0] == 0x20AC && wide[2] == '2' && wide[5] == '4' && wide[6] == 0);
+    CHECK(pg6_crt_wcsftime_lc(wide, 4, wfmt, &tm, nullptr) == 0 && wide[0] == 0);
+
+    void* aligned = pg6_crt_aligned_malloc(100, 256);
+    CHECK(aligned != nullptr && (reinterpret_cast<uintptr_t>(aligned) % 256) == 0);
+    pg6_crt_aligned_free(aligned);
+    uint32_t r = 0;
+    CHECK(pg6_crt_rand_s(&r) == 0);
+    CHECK(pg6_crt_rand_s(nullptr) == EINVAL);
 }
 
 }  // namespace
@@ -196,6 +284,7 @@ int main() {
     test_errno_pointer_semantics();
     test_math_and_time_codes();
     test_crt_guest_handlers();
+    test_ucrt_ext();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_shim_audit failed with %d failure(s)\n", g_failures);
         return 1;

@@ -238,6 +238,44 @@
     X(pg6_crt_strrchr, ok, "") \
     X(pg6_crt_strstr, ok, "") \
     X(pg6_crt_wcsrchr, ok, "UTF-16") \
+    /* ---- UCRT beyond O13 (os/ucrt_ext.h, O17): msvcp140's locale/time internals and helpers ---- */ \
+    X(pg6_crt_lock_locales, ok, "recursive process-wide lock") \
+    X(pg6_crt_unlock_locales, ok, "") \
+    X(pg6_crt_lc_codepage_func, ok, "C locale: 0 (CP_ACP, MSVC _CLOCALECP)") \
+    X(pg6_crt_lc_collate_cp_func, ok, "C locale: 0") \
+    X(pg6_crt_lc_locale_name_func, ok, "6 null locale names (C locale), host static read through the returned pointer") \
+    X(pg6_crt_mb_cur_max_func, ok, "C locale: 1") \
+    X(pg6_crt_pctype_func, ok, "257-entry MSVC ctype table (entry -1 = EOF), host static read through the returned pointer") \
+    X(pg6_crt_setlocale, ok, "C locale only: C, the empty name and NULL succeed, other names fail with NULL") \
+    X(pg6_crt_atol, ok, "Win64 long = int32, clamped") \
+    X(pg6_crt_btowc, ok, "C locale: byte value, EOF -> WEOF") \
+    X(pg6_crt_frexp, ok, "") \
+    X(pg6_crt_ldexp, ok, "") \
+    X(pg6_crt_isupper, ok, "C locale") \
+    X(pg6_crt_iswalnum, ok, "ASCII + Latin-1 letters; false above 0xFF") \
+    X(pg6_crt_iswdigit, ok, "ASCII digits") \
+    X(pg6_crt_iswspace, ok, "0x09-0x0D, 0x20, 0x85, 0xA0") \
+    X(pg6_crt_iswxdigit, ok, "") \
+    X(pg6_crt_wcscpy_s, ok, "UTF-16") \
+    X(pg6_crt_wcsnlen, ok, "UTF-16") \
+    X(pg6_crt_wcsdup, ok, "guest heap (O24)") \
+    X(pg6_crt_strncnt, ok, "") \
+    X(pg6_crt_aligned_malloc, ok, "guest heap (O24); free() and _aligned_free() release any block") \
+    X(pg6_crt_aligned_free, ok, "guest heap (O24)") \
+    X(pg6_crt_rand_s, ok, "per-thread PRNG seeded from std::random_device") \
+    X(pg6_crt_seh_filter_dll, ok, "EXCEPTION_CONTINUE_SEARCH") \
+    X(pg6_crt_fputs, ok, "host FILE* handle") \
+    X(pg6_crt_fputwc, ok, "C locale text: units above 0xFF fail with EILSEQ") \
+    X(pg6_crt_fgetwc, ok, "C locale text: one byte per unit") \
+    X(pg6_crt_ungetwc, ok, "") \
+    X(pg6_crt_getdays, ok, "guest heap string, freed by the caller") \
+    X(pg6_crt_getmonths, ok, "guest heap string, freed by the caller") \
+    X(pg6_crt_gettnames, ok, "opaque zeroed guest heap block, freed by the caller; only passed back to _Strftime") \
+    X(pg6_crt_w_getdays, ok, "guest heap string, freed by the caller") \
+    X(pg6_crt_w_getmonths, ok, "guest heap string, freed by the caller") \
+    X(pg6_crt_w_gettnames, ok, "opaque zeroed guest heap block, freed by the caller") \
+    X(pg6_crt_strftime_lc, ok, "C locale names; the _Gettnames block is ignored") \
+    X(pg6_crt_wcsftime_lc, ok, "C locale names; literal units copied, specifications formatted narrow and widened") \
     /* ---- libHttpClient.GDK (O14, offline) ---- */ \
     X(pg6_mw_hc_initialize, ok, "") \
     X(pg6_mw_hc_cleanup_async, deny, "completes a guest XAsyncBlock through the host callback path; gthunk: pg6_gthunk_hc_cleanup_async") \
@@ -388,6 +426,15 @@
     X(pg6_ws2_getaddrinfo, ok, "fails with WSAENETUNREACH, *result = null") \
     X(pg6_ws2_freeaddrinfo, ok, "")
 
-// No recorded gaps: every import of docs/imports_required.md binds or has an audit verdict.
-#define PG6_IMPORT_GAPS(X)
+// Imports of the shipped guest DLLs (msvcp140 & co.) that knowingly have no shim yet.
+#define PG6_IMPORT_GAPS(X) \
+    X("api-ms-win-crt-runtime-l1-1-0.dll", "_endthreadex", "ends the calling guest thread; the runtime has no guest thread exit path yet (ExitThread)") \
+    X("api-ms-win-crt-stdio-l1-1-0.dll", "_fsopen", "host file by a raw guest path, like the denied fopen: needs the win32 file shims' path mapping") \
+    X("api-ms-win-crt-stdio-l1-1-0.dll", "_wfsopen", "host file by a raw guest path, like the denied _wfopen") \
+    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wchdir", "host working directory: needs the win32 file shims' path mapping") \
+    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wremove", "host file by a raw guest path, like the denied remove") \
+    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wrename", "host file by a raw guest path, like the denied remove") \
+    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wrmdir", "host directory by a raw guest path, like the denied remove") \
+    X("api-ms-win-crt-environment-l1-1-0.dll", "_wgetcwd", "host working directory: needs the win32 file shims' path mapping") \
+    X("api-ms-win-crt-heap-l1-1-0.dll", "_aligned_offset_malloc", "no offset-aligned allocation in the guest heap (O24) yet")
 // clang-format on

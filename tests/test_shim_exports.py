@@ -135,12 +135,13 @@ class TestShimExportsSync(unittest.TestCase):
 # The audited shim families (O17): each lives in its own header and registers itself from its own
 # export table; the import bridge reads those tables (recomp/src/stubs/tables.rs scan_tables) and
 # binds a shim only with an `ok` row in runtime/os/shim_audit.h.
-AUDITED_FAMILIES = {
-    "pg6_crt_": "ucrt_bridge",
-    "pg6_mw_": "xbox_middleware",
-    "pg6_xbox_": "xbox_scarlett",
-    "pg6_ws2_": "winsock_ordinals",
-}
+AUDITED_FAMILIES = [
+    ("pg6_crt_", "ucrt_bridge"),
+    ("pg6_crt_", "ucrt_ext"),
+    ("pg6_mw_", "xbox_middleware"),
+    ("pg6_xbox_", "xbox_scarlett"),
+    ("pg6_ws2_", "winsock_ordinals"),
+]
 # Declared but deliberately not exported (host-side hooks): symbol -> reason. They never bind.
 AUDITED_FAMILY_INTERNALS: dict[str, str] = {
     "pg6_crt_set_exit_hook": "host-side test/runtime hook",
@@ -177,7 +178,7 @@ def audit_rows() -> dict[str, tuple[str, str]]:
 
 class TestAuditedFamiliesSync(unittest.TestCase):
     def test_every_family_shim_is_exported_or_internal(self) -> None:
-        for prefix, header in AUDITED_FAMILIES.items():
+        for prefix, header in AUDITED_FAMILIES:
             declared = family_shims(prefix, header)
             exported = family_exports(prefix, header)
             self.assertGreater(len(exported), 10, prefix)
@@ -188,10 +189,10 @@ class TestAuditedFamiliesSync(unittest.TestCase):
 
     def test_every_exported_shim_has_an_audit_row(self) -> None:
         rows = audit_rows()
-        for prefix, header in AUDITED_FAMILIES.items():
+        for prefix, header in AUDITED_FAMILIES:
             missing = sorted(family_exports(prefix, header) - set(rows))
             self.assertEqual(missing, [], "no PG6_SHIM_AUDIT row in runtime/os/shim_audit.h")
-        declared = set().union(*(family_shims(p, h) for p, h in AUDITED_FAMILIES.items()))
+        declared = set().union(*(family_shims(p, h) for p, h in AUDITED_FAMILIES))
         stale = sorted(set(rows) - declared)
         self.assertEqual(stale, [], "audit rows for symbols that are not declared")
         for sym, (verdict, note) in rows.items():

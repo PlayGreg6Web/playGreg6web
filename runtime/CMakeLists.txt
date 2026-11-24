@@ -27,6 +27,7 @@ add_library(playgta6_core STATIC
     os/guest_heap.cpp
     os/ucrt_bridge.cpp
     os/crt_guest.cpp
+    os/ucrt_ext.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
     os/winsock_ordinals.cpp
