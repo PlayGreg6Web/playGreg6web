@@ -129,6 +129,7 @@ class GpuOpcode(IntEnum):
     CreateBindGroup2 = 32
     SetBindGroup2 = 33
     CreateSampler2 = 34
+    CreateTexture2 = 35
 
 
 class GpuTextureFormat(IntEnum):

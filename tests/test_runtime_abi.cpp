@@ -945,6 +945,7 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(static_cast<uint16_t>(GpuOpcode::CreateBindGroup2) == 32);
     CHECK(static_cast<uint16_t>(GpuOpcode::SetBindGroup2) == 33);
     CHECK(static_cast<uint16_t>(GpuOpcode::CreateSampler2) == 34);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateTexture2) == 35);
 
     CHECK(sizeof(GpuTextureViewDesc) == 16);
     CHECK(sizeof(GpuBindGroupLayoutEntry) == 24);
@@ -995,6 +996,14 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(offsetof(GpuCreateSampler2Payload, max_anisotropy) == 12);
     CHECK(offsetof(GpuCreateSampler2Payload, lod_min_clamp) == 16);
     CHECK(offsetof(GpuCreateSampler2Payload, lod_max_clamp) == 20);
+    CHECK(sizeof(GpuCreateTexture2Payload) == 40);
+    CHECK(offsetof(GpuCreateTexture2Payload, sample_count) == 20);
+    CHECK(offsetof(GpuCreateTexture2Payload, usage_flags) == 24);
+    CHECK(offsetof(GpuCreateTexture2Payload, dimension) == 28);
+    CHECK(offsetof(GpuCreateTexture2Payload, format) == 29);
+    CHECK(offsetof(GpuCreateTexture2Payload, view_format_count) == 30);
+    CHECK(offsetof(GpuCreateTexture2Payload, view_formats) == 32);
+    CHECK(kGpuMaxTextureViewFormats == 8);
 
     // GpuBindGroupEntry2 starts with the exact v1 entry.
     CHECK(offsetof(GpuBindGroupEntry2, binding) == offsetof(GpuBindGroupEntry, binding));

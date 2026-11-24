@@ -61,6 +61,8 @@ enum class GpuOpcode : uint16_t {
     CreateBindGroup2 = 32,
     SetBindGroup2 = 33,
     CreateSampler2 = 34,
+    // v2 texture creation: full texture format codes, sample count and view formats.
+    CreateTexture2 = 35,
 };
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
@@ -814,6 +816,26 @@ struct GpuCreateSampler2Payload {
     float lod_max_clamp;
 };
 static_assert(sizeof(GpuCreateSampler2Payload) == 24, "GpuCreateSampler2Payload layout must stay 24 bytes");
+
+inline constexpr uint32_t kGpuMaxTextureViewFormats = 8;
+
+// CreateTexture2 (opcode 35): a GPUTextureDescriptor. `format` and `view_formats` use the v2 texture
+// format codes ("WebGPU enum codes"), not the v1 GpuTextureFormat of CreateTexture.
+struct GpuCreateTexture2Payload {
+    uint32_t id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth_or_layers;    // depth for 3D textures, array layers otherwise
+    uint32_t mip_levels;
+    uint32_t sample_count;       // 1 or 4
+    uint32_t usage_flags;        // GpuTextureUsage
+    uint8_t dimension;           // GpuTextureDimension
+    uint8_t format;              // v2 texture format code (never 0)
+    uint8_t view_format_count;   // <= kGpuMaxTextureViewFormats
+    uint8_t reserved;
+    uint8_t view_formats[kGpuMaxTextureViewFormats];  // first view_format_count entries used, rest 0
+};
+static_assert(sizeof(GpuCreateTexture2Payload) == 40, "GpuCreateTexture2Payload layout must stay 40 bytes");
 
 }  // namespace playgta6
 

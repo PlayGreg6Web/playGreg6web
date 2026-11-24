@@ -1099,7 +1099,7 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(len(gpu_trace.WGPU_TEXTURE_FORMAT_NAMES), 64)
         self.assertEqual(len(gpu_trace.WGPU_VERTEX_FORMAT_NAMES), 42)
         self.assertEqual(
-            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 35))
+            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 36))
         )
 
     def test_decode_full_v2_frame(self) -> None:

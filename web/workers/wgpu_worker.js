@@ -38,6 +38,7 @@ const OPCODES = Object.freeze({
   CREATE_BIND_GROUP2: 32,
   SET_BIND_GROUP2: 33,
   CREATE_SAMPLER2: 34,
+  CREATE_TEXTURE2: 35,
 });
 
 const SHADER_STAGE = Object.freeze({
@@ -2070,6 +2071,10 @@ function createWgpuWorkerHandler(options = {}) {
         importScripts('./render_state_packets.js');
       }
       if (globalThis.PlayGta6RenderState) globalThis.PlayGta6RenderState.installRenderStatePackets(processor);
+      if (!globalThis.PlayGta6TexturePackets && typeof importScripts === 'function') {
+        importScripts('./texture_packets.js');
+      }
+      if (globalThis.PlayGta6TexturePackets) globalThis.PlayGta6TexturePackets.installTexturePackets(processor);
     } catch (err) {
       postMessage({ error: `packet ABI v2 unavailable: ${String(err)}` });
     }
