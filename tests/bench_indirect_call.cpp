@@ -10,7 +10,7 @@
 //   mixed      hot-1024 with every 8th call to a host callable (import-like)
 // Every dispatch is checked (the callee counts calls), so the benchmark doubles as a smoke test.
 //
-//   bench_indirect_call --full [--threads N] [--calls N]
+//   bench_indirect_call --full [--threads N] [--calls N]   (best of 5 interleaved runs each)
 // Without --full (CTest, also as wasm64) it is a smoke run: a small registry and few calls,
 // whose numbers mean little.
 #include <algorithm>
@@ -227,7 +227,8 @@ double run(const Pattern& p, size_t calls, int threads) {
 int main(int argc, char** argv) {
     bool quick = true;
     int threads = 1;
-    size_t calls = 20'000'000;
+    size_t calls = 4'000'000;
+    int reps = 5;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--full") == 0) {
             quick = false;
@@ -241,12 +242,13 @@ int main(int argc, char** argv) {
         }
     }
     if (quick) {
+        reps = 1;
         calls = 20000;
     }
     const size_t pattern_length = quick ? 4096 : size_t{1} << 20;
     int failures = 0;
-    std::printf("%-6s %-10s %12s %12s %8s  (ns per dispatch, %d thread(s), %zu calls)\n", "mode", "pattern",
-                "cache off", "cache on", "speedup", threads, calls);
+    std::printf("%-6s %-10s %12s %12s %8s  (ns per dispatch, best of %d x %zu calls, %d thread(s))\n", "mode",
+                "pattern", "cache off", "cache on", "speedup", reps, calls, threads);
     for (bool shard : {false, true}) {
         reset_guest_runtime();
         Registry r = build_registry(shard, quick ? 100 : 1);
@@ -255,10 +257,17 @@ int main(int argc, char** argv) {
             return 1;
         }
         for (const Pattern& p : make_patterns(r, pattern_length)) {
-            set_dispatch_cache_enabled(false);
-            const double off = run(p, calls, threads);
-            set_dispatch_cache_enabled(true);
-            const double on = run(p, calls, threads);
+            // Interleaved repetitions, best of each: robust against a busy machine.
+            double off = 1e300;
+            double on = 1e300;
+            for (int rep = 0; rep < reps; ++rep) {
+                set_dispatch_cache_enabled(false);
+                const double a = run(p, calls, threads);
+                set_dispatch_cache_enabled(true);
+                const double b = run(p, calls, threads);
+                off = (a < 0 || off < 0) ? -1.0 : std::min(off, a);
+                on = (b < 0 || on < 0) ? -1.0 : std::min(on, b);
+            }
             if (off < 0 || on < 0) {
                 std::fprintf(stderr, "FAIL: dispatches lost (%s %s)\n", shard ? "shard" : "table", p.name.c_str());
                 ++failures;
