@@ -10,8 +10,9 @@
 //   mixed      hot-1024 with every 8th call to a host callable (import-like)
 // Every dispatch is checked (the callee counts calls), so the benchmark doubles as a smoke test.
 //
-//   bench_indirect_call [--quick] [--threads N] [--calls N]
-// --quick (used by CTest) runs a small registry and few calls; numbers are then meaningless.
+//   bench_indirect_call --full [--threads N] [--calls N]
+// Without --full (CTest, also as wasm64) it is a smoke run: a small registry and few calls,
+// whose numbers mean little.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -168,42 +169,48 @@ double run(const Pattern& p, size_t calls, int threads) {
     std::atomic<bool> go{false};
     std::atomic<bool> bad{false};
     std::vector<double> ns(static_cast<size_t>(threads));
-    std::vector<std::thread> workers;
-    for (int w = 0; w < threads; ++w) {
-        workers.emplace_back([&, w] {
-            GuestState state{};
-            const size_t n = p.targets.size();
-            // Warm up (fills the cache when on) outside the timed loop.
-            for (size_t i = 0; i < std::min(n, calls); ++i) {
-                __playgta6_indirect_call(&state, p.targets[i]);
+    auto body = [&](int w) {
+        GuestState state{};
+        const size_t n = p.targets.size();
+        // Warm up (fills the cache when on) outside the timed loop.
+        for (size_t i = 0; i < std::min(n, calls); ++i) {
+            __playgta6_indirect_call(&state, p.targets[i]);
+        }
+        ready.fetch_add(1);
+        while (!go.load()) {
+            std::this_thread::yield();
+        }
+        t_calls = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t i = static_cast<size_t>(w) * 7919 % n;
+        for (size_t c = 0; c < calls; ++c) {
+            __playgta6_indirect_call(&state, p.targets[i]);
+            if (++i == n) {
+                i = 0;
             }
-            ready.fetch_add(1);
-            while (!go.load()) {
-                std::this_thread::yield();
-            }
-            t_calls = 0;
-            const auto t0 = std::chrono::steady_clock::now();
-            size_t i = static_cast<size_t>(w) * 7919 % n;
-            for (size_t c = 0; c < calls; ++c) {
-                __playgta6_indirect_call(&state, p.targets[i]);
-                if (++i == n) {
-                    i = 0;
-                }
-            }
-            const auto t1 = std::chrono::steady_clock::now();
-            if (t_calls != calls) {
-                bad.store(true);
-            }
-            ns[static_cast<size_t>(w)] = std::chrono::duration<double, std::nano>(t1 - t0).count() /
-                                         static_cast<double>(calls);
-        });
-    }
-    while (ready.load() != threads) {
-        std::this_thread::yield();
-    }
-    go.store(true);
-    for (auto& t : workers) {
-        t.join();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        if (t_calls != calls) {
+            bad.store(true);
+        }
+        ns[static_cast<size_t>(w)] = std::chrono::duration<double, std::nano>(t1 - t0).count() /
+                                     static_cast<double>(calls);
+    };
+    if (threads == 1) {
+        go.store(true);  // on the calling thread (a wasm pthread per run starts slowly)
+        body(0);
+    } else {
+        std::vector<std::thread> workers;
+        for (int w = 0; w < threads; ++w) {
+            workers.emplace_back(body, w);
+        }
+        while (ready.load() != threads) {
+            std::this_thread::yield();
+        }
+        go.store(true);
+        for (auto& t : workers) {
+            t.join();
+        }
     }
     if (bad.load()) {
         return -1.0;
@@ -218,18 +225,18 @@ double run(const Pattern& p, size_t calls, int threads) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool quick = false;
+    bool quick = true;
     int threads = 1;
     size_t calls = 20'000'000;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--quick") == 0) {
-            quick = true;
+        if (std::strcmp(argv[i], "--full") == 0) {
+            quick = false;
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             threads = std::max(1, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--calls") == 0 && i + 1 < argc) {
             calls = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         } else {
-            std::fprintf(stderr, "usage: bench_indirect_call [--quick] [--threads N] [--calls N]\n");
+            std::fprintf(stderr, "usage: bench_indirect_call [--full] [--threads N] [--calls N]\n");
             return 64;
         }
     }
