@@ -1,6 +1,7 @@
 #include "gpu/d3d12_guest_objects.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
@@ -1126,9 +1127,67 @@ void Device::CopyDescriptorsSimple(uint32_t count, uint64_t dest, uint64_t src, 
     }
 }
 
+namespace {
+
+// GFX10 surface size of a texture whose Layout carries a console swizzle mode (0x100 | n) that is
+// verified against AMD addrlib (gpu/gfx10_detile.h, #551): 256B/4KB/64KB _S and _D, thick 3D for
+// _S. Mip chain and tail as addrlib places them; array slices repeat the chain. 0 when the
+// description is not such a texture (linear, depth/planar or unknown formats, MSAA, the _R / VAR /
+// _X modes): those keep the linear estimate, and the unverified tiled modes are counted.
+std::atomic<uint64_t> g_unverified_layout_answers{0};
+
+uint64_t console_layout_size(const GuestResourceDesc& d) {
+    if ((d.Dimension != ResourceDimension::Texture2D && d.Dimension != ResourceDimension::Texture3D) ||
+        d.Layout < 0x101u || d.Layout > 0x11Fu || d.Width == 0 || d.Width > 0xFFFFFFFFull || d.Height == 0) {
+        return 0;
+    }
+    const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d.Layout);
+    switch (mode) {
+        case gfx10::SwizzleMode::Sw256BS:
+        case gfx10::SwizzleMode::Sw256BD:
+        case gfx10::SwizzleMode::Sw4KBS:
+        case gfx10::SwizzleMode::Sw4KBD:
+        case gfx10::SwizzleMode::Sw64KBS:
+        case gfx10::SwizzleMode::Sw64KBD:
+            break;
+        default:
+            if (g_unverified_layout_answers.fetch_add(1) == 0) {
+                os::log("d3d12_xs: allocation size for console layout " + std::to_string(d.Layout) +
+                        " uses the linear estimate (mode not verified against addrlib; counted)");
+            }
+            return 0;
+    }
+    const DxgiFormatLayout l = dxgi_format_layout(d.Format);
+    if (d.SampleCount > 1 || !l.known || l.planes != 1) {
+        return 0;
+    }
+    const bool is_3d = d.Dimension == ResourceDimension::Texture3D;
+    uint32_t mips = d.MipLevels;
+    if (mips == 0) {
+        uint64_t extent = std::max<uint64_t>({d.Width, d.Height, is_3d ? d.DepthOrArraySize : 1u});
+        for (mips = 1; extent > 1; extent >>= 1) {
+            ++mips;
+        }
+    }
+    gfx10::TextureLayoutDesc g{};
+    g.dxgi_format = d.Format;
+    g.width = static_cast<uint32_t>(d.Width);
+    g.height = d.Height;
+    g.depth = is_3d ? std::max<uint32_t>(1u, d.DepthOrArraySize) : 1u;
+    g.mip_levels = mips;
+    g.d3d12_layout = d.Layout;
+    const uint64_t surface = gfx10::surface_bytes(g);
+    return surface * (is_3d ? 1u : std::max<uint32_t>(1u, d.DepthOrArraySize));
+}
+
+}  // namespace
+
 uint64_t resource_size_estimate(const GuestResourceDesc& d) {
     if (d.Dimension == ResourceDimension::Buffer) {
         return d.Width;
+    }
+    if (const uint64_t console = console_layout_size(d); console != 0) {
+        return console;
     }
     const DxgiFormatLayout l = dxgi_format_layout(d.Format);
     // Depth-stencil formats are stored as separate planes on this GPU: a 4-byte depth plane and a

@@ -181,6 +181,10 @@ else()
     target_link_libraries(test_gfx10_detile PRIVATE playgta6_core)
     add_test(NAME test_gfx10_detile COMMAND test_gfx10_detile)
 
+    add_executable(test_console_layout_sizes ../tests/test_console_layout_sizes.cpp)
+    target_link_libraries(test_console_layout_sizes PRIVATE playgta6_core)
+    add_test(NAME test_console_layout_sizes COMMAND test_console_layout_sizes)
+
     add_executable(test_state_bridge ../tests/test_state_bridge.cpp)
     target_link_libraries(test_state_bridge PRIVATE playgta6_core)
     target_compile_definitions(test_state_bridge PRIVATE
