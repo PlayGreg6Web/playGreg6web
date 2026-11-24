@@ -26,6 +26,7 @@ add_library(playgta6_core STATIC
     os/win32_loader.cpp
     os/guest_heap.cpp
     os/ucrt_bridge.cpp
+    os/crt_guest.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
     os/winsock_ordinals.cpp
@@ -121,6 +122,10 @@ else()
     add_executable(test_shim_exports ../tests/test_shim_exports.cpp)
     target_link_libraries(test_shim_exports PRIVATE playgta6_core)
     add_test(NAME playgta6_shim_exports_tests COMMAND test_shim_exports)
+
+    add_executable(test_shim_audit ../tests/test_shim_audit.cpp)
+    target_link_libraries(test_shim_audit PRIVATE playgta6_core)
+    add_test(NAME playgta6_shim_audit_tests COMMAND test_shim_audit)
 
     add_executable(test_image_loader ../tests/test_image_loader.cpp)
     target_link_libraries(test_image_loader PRIVATE playgta6_core)

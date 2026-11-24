@@ -5,13 +5,19 @@
 
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
+#include "os/ucrt_bridge.h"
 #include "os/win32_sync.h"
+#include "os/winsock_ordinals.h"
 #include "os/xasync_provider.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_offline.h"
 #include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "os/xgameruntime_provider.h"
+
+// os/xbox_scarlett.h cannot be included next to os/win32_compat.h (both define Pg6Guid).
+extern "C" size_t pg6_xbox_scarlett_register_all(void);
 
 namespace {
 
@@ -360,6 +366,15 @@ size_t register_all_shim_exports() {
     static size_t registered = 0;
     std::call_once(once, [] {
         registered = register_all_once();
+        // The other shim families (O17), in the import bridge's priority order: the registry keeps
+        // the last registration of a name, so a family registered later wins where two export the
+        // same name (the WS2_32 ordinal family over the O5 Winsock names, as in the bridge).
+        pg6_winsock_ordinals_register_all();
+        pg6_ucrt_register_all();
+        pg6_xbox_middleware_register_all();
+        pg6_xbox_scarlett_register_all();
+        // Guest-callable registrations come last so they replace a host shim registered under the
+        // same export (the bridge binds the pg6_gthunk_ for those imports as well).
         // Guest-callable QueryApiImpl / InitializeApiImpl* / XErrorReport / UninitializeApiImpl.
         gdk::provider::register_xgameruntime_provider();
         // Guest-callable XCRDAPI.dll / GameInput.dll / xg_xs.dll entry points (O23).

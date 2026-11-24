@@ -1283,7 +1283,7 @@ fn required_rules_and_forced_modules() {
     let throw = import(&r, "game.exe", "VCRUNTIME140.dll!_CxxThrowException");
     assert_eq!(throw.status(), "guest");
     assert_eq!(throw.rule, "vcruntime140*.dll!_CxxThrowException=guest");
-    // memcpy: prefer-host, but the bridge has no VCRUNTIME140 shim family, so guest.
+    // memcpy: prefer-host, but this test's shim catalogue has no shim for it, so guest.
     let memcpy = import(&r, "game.exe", "VCRUNTIME140.dll!memcpy");
     assert_eq!(memcpy.status(), "guest");
     assert_eq!(memcpy.rule, "vcruntime140.dll!memcpy=prefer-host");

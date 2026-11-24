@@ -1120,11 +1120,24 @@ fn checkout_shim_headers_come_from_runtime() {
     let (headers, root) = checkout_shim_headers(crate_dir).expect("inside the checkout");
     assert!(root.ends_with("runtime"));
     assert!(headers.iter().any(|h| h.ends_with("win32_kernel.h")));
-    assert!(headers.last().unwrap().ends_with("guest_callbacks.h"));
-    assert!(headers[headers.len() - 2].ends_with("d3d12_xs.h"));
-    let mut sorted = headers[..headers.len() - 2].to_vec();
+    // os/*.h (sorted), gpu/d3d12_xs.h, guest/guest_callbacks.h, then the export-table sources
+    // os/*.cpp (sorted).
+    let callbacks = headers
+        .iter()
+        .position(|h| h.ends_with("guest_callbacks.h"))
+        .expect("guest_callbacks.h");
+    assert!(headers[callbacks - 1].ends_with("d3d12_xs.h"));
+    let mut sorted = headers[..callbacks - 1].to_vec();
     sorted.sort();
-    assert_eq!(sorted, headers[..headers.len() - 2]);
+    assert_eq!(sorted, headers[..callbacks - 1]);
+    let sources = &headers[callbacks + 1..];
+    assert!(sources.iter().any(|h| h.ends_with("ucrt_bridge.cpp")));
+    assert!(sources.iter().any(|h| h.ends_with("shim_exports.cpp")));
+    assert!(
+        sources
+            .iter()
+            .all(|h| h.extension().is_some_and(|e| e == "cpp" || e == "h"))
+    );
 
     let tmp = TempDir::new("checkout");
     assert!(checkout_shim_headers(tmp.path()).is_none());

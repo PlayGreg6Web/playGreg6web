@@ -30,7 +30,8 @@ EXCLUDED_SHIMS: dict[str, str] = {}
 # symbol -> reason. Empty: every export name matches its symbol under the R5 rule.
 NAME_EXCEPTIONS: dict[str, str] = {}
 
-# DLL family prefix per registered module (mirrors shim_prefix_for_dll in recomp/src/stubs.rs).
+# Shim family of this table's entries per module (one of the families shim_families_for_dll in
+# recomp/src/stubs/tables.rs routes the module to; WS2_32.dll tries pg6_ws2_ first).
 MODULE_PREFIX = {
     "KERNEL32.dll": "pg6_win32_",
     "ADVAPI32.dll": "pg6_win32_",
@@ -129,6 +130,75 @@ class TestShimExportsSync(unittest.TestCase):
         self.assertEqual(bad, [], "\n".join(bad))
         stale = sorted(set(NAME_EXCEPTIONS) - {s for _, _, s in table_entries()})
         self.assertEqual(stale, [], "NAME_EXCEPTIONS lists unregistered symbols")
+
+
+# The audited shim families (O17): each lives in its own header and registers itself from its own
+# export table; the import bridge reads those tables (recomp/src/stubs/tables.rs scan_tables) and
+# binds a shim only with an `ok` row in runtime/os/shim_audit.h.
+AUDITED_FAMILIES = {
+    "pg6_crt_": "ucrt_bridge",
+    "pg6_mw_": "xbox_middleware",
+    "pg6_xbox_": "xbox_scarlett",
+    "pg6_ws2_": "winsock_ordinals",
+}
+# Declared but deliberately not exported (host-side hooks): symbol -> reason. They never bind.
+AUDITED_FAMILY_INTERNALS: dict[str, str] = {
+    "pg6_crt_set_exit_hook": "host-side test/runtime hook",
+    "pg6_crt_execute_onexit_table": "host helper; guest imports bind pg6_gthunk_execute_onexit_table",
+    "pg6_crt_reset_runtime_state": "test hook",
+    "pg6_crt_get_last_exit_code": "test hook",
+    "pg6_ws2_WSASetLastError": "declared, not registered by winsock_ordinals.cpp",
+}
+AUDIT_ROW_RE = re.compile(r'\bX\((pg6_\w+),\s*(ok|deny|pending),\s*"([^"]*)"\)')
+EXPORTED_RE = re.compile(r'"([^"]+)",[\s\\]*(?:\w+\(\s*)?&?(pg6_\w+)')
+
+
+def family_shims(prefix: str, header: str) -> set[str]:
+    text = strip_comments((OS_DIR / f"{header}.h").read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for block in re.finditer(r'extern\s+"C"\s*\{', text):
+        depth, i = 1, block.end()
+        while depth and i < len(text):
+            depth += (text[i] == "{") - (text[i] == "}")
+            i += 1
+        found |= set(re.findall(rf"\b({prefix}\w+)\s*\(", text[block.end() : i]))
+    return {s for s in found if not s.endswith("_register_all")}
+
+
+def family_exports(prefix: str, header: str) -> set[str]:
+    text = (OS_DIR / f"{header}.cpp").read_text(encoding="utf-8")
+    return {sym for _, sym in EXPORTED_RE.findall(text) if sym.startswith(prefix)}
+
+
+def audit_rows() -> dict[str, tuple[str, str]]:
+    text = (OS_DIR / "shim_audit.h").read_text(encoding="utf-8")
+    return {sym: (verdict, note) for sym, verdict, note in AUDIT_ROW_RE.findall(text)}
+
+
+class TestAuditedFamiliesSync(unittest.TestCase):
+    def test_every_family_shim_is_exported_or_internal(self) -> None:
+        for prefix, header in AUDITED_FAMILIES.items():
+            declared = family_shims(prefix, header)
+            exported = family_exports(prefix, header)
+            self.assertGreater(len(exported), 10, prefix)
+            missing = sorted(declared - exported - set(AUDITED_FAMILY_INTERNALS))
+            self.assertEqual(missing, [], f"{header}.h declares shims its table does not export")
+            unknown = sorted(exported - declared)
+            self.assertEqual(unknown, [], f"{header}.cpp exports undeclared symbols")
+
+    def test_every_exported_shim_has_an_audit_row(self) -> None:
+        rows = audit_rows()
+        for prefix, header in AUDITED_FAMILIES.items():
+            missing = sorted(family_exports(prefix, header) - set(rows))
+            self.assertEqual(missing, [], "no PG6_SHIM_AUDIT row in runtime/os/shim_audit.h")
+        declared = set().union(*(family_shims(p, h) for p, h in AUDITED_FAMILIES.items()))
+        stale = sorted(set(rows) - declared)
+        self.assertEqual(stale, [], "audit rows for symbols that are not declared")
+        for sym, (verdict, note) in rows.items():
+            if verdict != "ok":
+                self.assertTrue(note.strip(), f"{sym}: {verdict} without a reason")
+        stale_internal = sorted(set(AUDITED_FAMILY_INTERNALS) - declared)
+        self.assertEqual(stale_internal, [], "AUDITED_FAMILY_INTERNALS lists unknown symbols")
 
 
 if __name__ == "__main__":

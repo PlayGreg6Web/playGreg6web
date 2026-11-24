@@ -146,7 +146,9 @@
 //! `imports` [{`importer`, `dll`, `name` | null, `ordinal` | null, `slot_rva` | null,
 //! `delay_load`, `binding` (`guest`, `runtime`, `host`, `unresolved`), `provider` (dll, for
 //! `runtime` the runtime's exporting `KERNEL32.dll`/`ntdll.dll`, or null), `target`
-//! (VA or null), `kind` (`function`/`data` or null), `shim` | null, `reason` | null, `via`
+//! (VA or null), `kind` (`function`/`data` or null), `shim` | null, `reason` | null,
+//! `recorded` | null (the audited reason an unresolved import stays unbound, see
+//! [`stubs::Unresolved::recorded`]), `via`
 //! [forwarders], `rule`}], `external_dlls` [{`dll`, `status` (`host`, `host_only`, `missing`),
 //! `importers` [dll]}], `unreferenced_dlls` [dll], `allocator` {`provider` (`host`, a dll or
 //! null), `imports`}, `diagnostics` [{`kind`, `module`, `detail`}], `files` [{`path`, `size`,
@@ -1783,6 +1785,14 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                     ),
                 },
             };
+            // O17: the explicitly recorded reason an unresolved import stays unbound.
+            let recorded = match &i.binding {
+                Binding::Host {
+                    resolution: Resolution::Unresolved(why),
+                    ..
+                } => why.recorded().map_or(Json::Null, Json::Str),
+                _ => Json::Null,
+            };
             obj([
                 ("importer", Json::Str(i.importer.clone())),
                 ("dll", Json::Str(i.dll.clone())),
@@ -1799,6 +1809,7 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                 ("kind", kind),
                 ("shim", shim),
                 ("reason", reason),
+                ("recorded", recorded),
                 ("via", strs(&i.via)),
                 ("rule", Json::Str(i.rule.clone())),
             ])

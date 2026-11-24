@@ -47,7 +47,9 @@ struct PackImageArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StubsArgs {
-    pe_path: PathBuf,
+    /// The PE whose imports are bridged, or an import list (`--import-list`).
+    pe_path: Option<PathBuf>,
+    import_list: Option<PathBuf>,
     shims: Vec<PathBuf>,
     out_dir: PathBuf,
     include_root: Option<PathBuf>,
@@ -89,7 +91,7 @@ fn print_usage() {
     eprintln!("  playgta6-recomp discover <pe-path> [--out <json-file>]");
     eprintln!("  playgta6-recomp pack-image <pe-path> --out <dir> [--omit-code-bytes] [--no-headers]");
     eprintln!(
-        "  playgta6-recomp stubs <pe-path> --shims <header>... --out <dir> [--include-root <dir>]"
+        "  playgta6-recomp stubs <pe-path>|--import-list <file> --shims <header>... --out <dir> [--include-root <dir>]"
     );
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
     eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
@@ -106,7 +108,8 @@ fn print_usage() {
     eprintln!("  --out <dir>            pack-image: write <name>.pgim (contains game bytes; use gitignored work/) and <name>.pgim.json");
     eprintln!("  --omit-code-bytes      pack-image: map executable sections as zero-fill instead of storing their bytes");
     eprintln!("  --no-headers           pack-image: do not map the PE headers at the image base");
-    eprintln!("  --shims <header>...    stubs: runtime headers declaring the extern \"C\" shims");
+    eprintln!("  --shims <file>...      stubs: runtime headers declaring the extern \"C\" shims, and sources holding export/audit tables");
+    eprintln!("  --import-list <file>   stubs: bridge the imports listed in <file> (docs/imports_required.md tables or DLL!Name lines) instead of a PE");
     eprintln!("  --out <dir>            stubs: write import thunks, seam header and manifest");
     eprintln!("  --include-root <dir>   stubs: spell generated #includes relative to <dir>");
     eprintln!("  --out <dir>            lift: write lifted.ll (and lifted.o) derived from game code; use gitignored work/");
@@ -445,6 +448,7 @@ fn parse_pack_image_args(args: &[String]) -> Result<Command, String> {
 
 fn parse_stubs_args(args: &[String]) -> Result<Command, String> {
     let mut pe_path: Option<PathBuf> = None;
+    let mut import_list: Option<PathBuf> = None;
     let mut shims: Vec<PathBuf> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
     let mut include_root: Option<PathBuf> = None;
@@ -479,6 +483,10 @@ fn parse_stubs_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 include_root = Some(dir_value("--include-root", args.get(i))?);
             }
+            "--import-list" => {
+                i += 1;
+                import_list = Some(dir_value("--import-list", args.get(i))?);
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{flag}' for 'stubs'"));
             }
@@ -494,13 +502,20 @@ fn parse_stubs_args(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
 
-    let pe_path = pe_path.ok_or_else(|| "missing input PE path <pe-path>".to_string())?;
+    match (&pe_path, &import_list) {
+        (None, None) => return Err("missing input PE path <pe-path>".to_string()),
+        (Some(_), Some(_)) => {
+            return Err("give either <pe-path> or --import-list <file>, not both".to_string());
+        }
+        _ => {}
+    }
     if shims.is_empty() {
         return Err("missing --shims <header>... (runtime shim headers)".to_string());
     }
     let out_dir = out_dir.ok_or_else(|| "missing --out <dir>".to_string())?;
     Ok(Command::Stubs(StubsArgs {
         pe_path,
+        import_list,
         shims,
         out_dir,
         include_root,
@@ -797,12 +812,6 @@ fn run_pack_image(args: &PackImageArgs) -> Result<(), String> {
 }
 
 fn run_stubs(args: &StubsArgs) -> Result<(), String> {
-    let path = &args.pe_path;
-    let bytes =
-        fs::read(path).map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
-    let pe = Pe64::parse(&bytes)
-        .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
-
     let mut headers = Vec::with_capacity(args.shims.len());
     for header in &args.shims {
         headers.push(
@@ -811,7 +820,25 @@ fn run_stubs(args: &StubsArgs) -> Result<(), String> {
         );
     }
     let catalogue = stubs::Catalogue::scan(&headers);
-    let plan = stubs::plan_bridge(&pe, &catalogue);
+    let (plan, path) = match (&args.pe_path, &args.import_list) {
+        (Some(path), _) => {
+            let bytes = fs::read(path)
+                .map_err(|e| format!("failed to read PE file '{}': {e}", path.display()))?;
+            let pe = Pe64::parse(&bytes)
+                .map_err(|e| format!("failed to parse PE64 '{}': {e}", path.display()))?;
+            (stubs::plan_bridge(&pe, &catalogue), path)
+        }
+        (None, Some(path)) => {
+            let text = fs::read_to_string(path)
+                .map_err(|e| format!("failed to read import list '{}': {e}", path.display()))?;
+            let imports = stubs::parse_import_list(&text);
+            if imports.is_empty() {
+                return Err(format!("no imports found in '{}'", path.display()));
+            }
+            (stubs::plan_import_list(&imports, &catalogue), path)
+        }
+        (None, None) => return Err("missing input PE path <pe-path>".to_string()),
+    };
     stubs::render_bridge(&plan, &catalogue)
         .write_to(&args.out_dir)
         .map_err(|e| {
@@ -1235,7 +1262,8 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 "runtime",
             ])),
             Ok(Command::Stubs(StubsArgs {
-                pe_path: PathBuf::from("game.exe"),
+                pe_path: Some(PathBuf::from("game.exe")),
+                import_list: None,
                 shims: vec![
                     PathBuf::from("runtime/os/win32_kernel.h"),
                     PathBuf::from("runtime/os/xgameruntime.h"),
@@ -1250,6 +1278,39 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
         assert!(parse_cli(&vec_s(&["stubs", "--shims", "h.h", "--out", "o"])).is_err());
         assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h", "--out"])).is_err());
         assert!(parse_cli(&vec_s(&["stubs", "a.exe", "--shims", "h.h", "--x"])).is_err());
+        assert_eq!(
+            parse_cli(&vec_s(&[
+                "stubs",
+                "--import-list",
+                "docs/imports_required.md",
+                "--shims",
+                "h.h",
+                "--out",
+                "o"
+            ])),
+            Ok(Command::Stubs(StubsArgs {
+                pe_path: None,
+                import_list: Some(PathBuf::from("docs/imports_required.md")),
+                shims: vec![PathBuf::from("h.h")],
+                out_dir: PathBuf::from("o"),
+                include_root: None,
+            }))
+        );
+        assert!(
+            parse_cli(&vec_s(&[
+                "stubs",
+                "a.exe",
+                "--import-list",
+                "l.md",
+                "--shims",
+                "h.h",
+                "--out",
+                "o"
+            ]))
+            .is_err(),
+            "a PE and an import list are exclusive"
+        );
+        assert!(parse_cli(&vec_s(&["stubs", "--import-list", "--shims", "h.h"])).is_err());
     }
 
     #[test]
@@ -1390,7 +1451,8 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
 
         let out = temp_dir.join("out");
         run_stubs(&StubsArgs {
-            pe_path: exe_path,
+            pe_path: Some(exe_path),
+            import_list: None,
             shims: vec![header],
             out_dir: out.clone(),
             include_root: Some(temp_dir.join("rt")),

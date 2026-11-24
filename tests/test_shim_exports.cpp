@@ -9,11 +9,15 @@
 #include <vector>
 
 #include "os/shim_exports.h"
+#include "os/ucrt_bridge.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/winsock_ordinals.h"
 #include "os/xasync_provider.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_offline.h"
+#include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime.h"
 
 namespace {
@@ -33,6 +37,21 @@ using namespace playgta6::os::win32;
 
 Pg6ProcAddress by_name(Pg6Handle module, const char* name) {
     return pg6_loader_get_proc_address_by_name(module, name);
+}
+
+// Names winsock_ordinals.cpp registers under WS2_32.dll (23 ordinals + 2 names).
+bool winsock_family_name(const char* name) {
+    static const char* const kNames[] = {
+        "accept", "bind", "closesocket", "connect", "getsockname", "getsockopt", "htons",
+        "inet_addr", "inet_ntoa", "listen", "recv", "recvfrom", "select", "send", "sendto",
+        "setsockopt", "shutdown", "socket", "gethostbyname", "gethostname", "WSAGetLastError",
+        "WSAStartup", "__WSAFDIsSet", "getaddrinfo", "freeaddrinfo"};
+    for (const char* n : kNames) {
+        if (std::strcmp(n, name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void test_registration_idempotent() {
@@ -73,8 +92,13 @@ void test_table_counts_and_lookup() {
 
         const Pg6Handle mod = pg6_loader_register_virtual_module(e.module, 1);
         CHECK(mod != 0);
-        CHECK(by_name(mod, e.name) == e.address);
-        CHECK(pg6_loader_resolve_import(e.module, e.name) == e.address);
+        // The WS2_32 ordinal family (registered after this table) owns the names it exports.
+        const bool winsock_override =
+            std::strcmp(e.module, "WS2_32.dll") == 0 && winsock_family_name(e.name);
+        const Pg6ProcAddress expected = winsock_override ? by_name(mod, e.name) : e.address;
+        CHECK(winsock_override ? expected != e.address : true);
+        CHECK(by_name(mod, e.name) == expected);
+        CHECK(pg6_loader_resolve_import(e.module, e.name) == expected);
     }
     CHECK(per_module.size() == 10);
     CHECK(per_module["KERNEL32.dll"] == 154);
@@ -136,8 +160,9 @@ void test_samples_per_family() {
         {"advapi32", "EventWrite", proc_address(&pg6_win32_event_write)},
         {"api-ms-win-eventing-provider-l1-1-0", "EventRegister",
          proc_address(&pg6_win32_event_register)},
-        {"ws2_32", "WSAStartup", proc_address(&pg6_win32_wsa_startup)},
-        {"ws2_32", "getaddrinfo", proc_address(&pg6_win32_getaddrinfo)},
+        {"ws2_32", "WSAStartup", proc_address(&pg6_ws2_WSAStartup)},
+        {"ws2_32", "getaddrinfo", proc_address(&pg6_ws2_getaddrinfo)},
+        {"ws2_32", "WSACleanup", proc_address(&pg6_win32_wsa_cleanup)},
         {"ws2_32", "GetAddrInfoW", proc_address(&pg6_win32_get_addr_info_w)},
         {"winhttp", "WinHttpOpen", proc_address(&pg6_win32_winhttp_open)},
         {"winhttp", "WinHttpCrackUrl", proc_address(&pg6_win32_winhttp_crack_url)},
@@ -202,6 +227,52 @@ void test_exports_are_callable() {
     }
 }
 
+// O17: the other shim families are registered by register_all_shim_exports(), in the import
+// bridge's priority order, and a guest-callable pg6_gthunk_ registered for an export replaces the
+// family's host shim for that export (the bridge binds the gthunk as well).
+void test_families_and_guest_callable_precedence() {
+    register_all_shim_exports();
+    struct Sample {
+        const char* module;
+        const char* name;
+        Pg6ProcAddress expected;
+    };
+    const Sample samples[] = {
+        {"api-ms-win-crt-heap-l1-1-0.dll", "malloc", proc_address(&pg6_crt_malloc)},
+        {"ucrtbase.dll", "strlen", proc_address(&pg6_crt_strlen)},
+        {"VCRUNTIME140.dll", "memcpy", proc_address(&pg6_crt_memcpy)},
+        {"api-ms-win-crt-runtime-l1-1-0.dll", "_exit", proc_address(&pg6_crt__exit)},
+        {"api-ms-win-crt-runtime-l1-1-0.dll", "exit", proc_address(&pg6_crt_exit)},
+        {"libHttpClient.GDK.dll", "HCInitialize", proc_address(&pg6_mw_hc_initialize)},
+        {"XboxBvhBuilder.dll", "??1XboxBvhBuilder@@QEAA@XZ", proc_address(&pg6_mw_bvh_builder_dtor)},
+        {"WS2_32.dll", "closesocket", proc_address(&pg6_ws2_closesocket)},
+        {"WS2_32.dll", "WSASocketW", proc_address(&pg6_win32_wsa_socket_w)},
+    };
+    for (const Sample& s : samples) {
+        CHECK(pg6_loader_resolve_import(s.module, s.name) == s.expected);
+    }
+    CHECK(pg6_loader_resolve_import_ordinal("WS2_32.dll", 3) == proc_address(&pg6_ws2_closesocket));
+    CHECK(pg6_loader_resolve_import_ordinal("WS2_32.dll", 115) == proc_address(&pg6_ws2_WSAStartup));
+
+    // Exports with both a family host shim (xbox_scarlett.cpp) and a guest-callable thunk
+    // (xbox_scarlett_guest.cpp): the guest-callable registration wins, by name and by ordinal.
+    using ThunkFn = void (*)(void*);
+    const auto thunk = [](ThunkFn fn) {
+        return static_cast<Pg6ProcAddress>(reinterpret_cast<uintptr_t>(fn));
+    };
+    const Sample guest_callable[] = {
+        {"XCRDAPI.dll", "DStorageGetFactory", thunk(&pg6_gthunk_dstorage_get_factory)},
+        {"GameInput.dll", "GameInputCreate", thunk(&pg6_gthunk_game_input_create)},
+        {"xg_xs.dll", "XGCreateTextureComputer", thunk(&pg6_gthunk_xg_create_texture_computer)},
+        {"xg_xs.dll", "XGSuggestSwizzleMode", thunk(&pg6_gthunk_xg_suggest_swizzle_mode)},
+    };
+    for (const Sample& s : guest_callable) {
+        CHECK(pg6_loader_resolve_import(s.module, s.name) == s.expected);
+    }
+    CHECK(pg6_loader_resolve_import_ordinal("GameInput.dll", 1) ==
+          thunk(&pg6_gthunk_game_input_create));
+}
+
 void test_unknown_names_fail() {
     const Pg6Handle k32 = pg6_win32_get_module_handle_a("kernel32");
     pg6_win32_set_last_error(0);
@@ -229,6 +300,7 @@ int main() {
     test_module_lookup();
     test_samples_per_family();
     test_exports_are_callable();
+    test_families_and_guest_callable_precedence();
     test_unknown_names_fail();
 
     if (g_failures != 0) {

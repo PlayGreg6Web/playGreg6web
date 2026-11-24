@@ -23,21 +23,47 @@
 //! that shim unbindable instead of guessing.
 //!
 //! # Name mapping
-//! The DLL picks a shim family (DLL names compare case-insensitively, `.dll` optional):
+//! The DLL picks the shim families that may implement it, in priority order
+//! ([`shim_families_for_dll`]; DLL names compare case-insensitively, `.dll` optional):
 //!
-//! | DLL | Shim prefix |
-//! | :--- | :--- |
-//! | `kernel32`, `kernelbase`, `advapi32`, `ws2_32`, `winhttp`, `bcrypt`, `user32`, `combase`, `ole32`, API sets `api-ms-win-*` / `ext-ms-win-*` | `pg6_win32_` |
-//! | `xgameruntime`, Xbox Live (`microsoft.xbox.services*`) | `pg6_gdk_` |
-//! | `d3d12`, `d3d12_x`, `d3d12_xs` | `pg6_d3d12_` |
+//! | DLL | Families | Name rule | Audited |
+//! | :--- | :--- | :--- | :--- |
+//! | API sets `api-ms-win-crt-*`, `ucrtbase`, `vcruntime140`, `vcruntime140_1` | `pg6_crt_` | tables only | yes |
+//! | `ws2_32` | `pg6_ws2_`, then `pg6_win32_` | tables only / tables, then key | yes / no |
+//! | `kernel32`, `kernelbase`, `advapi32`, `winhttp`, `bcrypt`, `user32`, `combase`, `ole32`, other API sets `api-ms-win-*` / `ext-ms-win-*` | `pg6_win32_` | tables, then key | no |
+//! | `xgameruntime`, Xbox Live (`microsoft.xbox.services*`) | `pg6_gdk_` | tables, then key | no |
+//! | `d3d12`, `d3d12_x`, `d3d12_xs` | `pg6_d3d12_` | tables, then key | no |
+//! | `xmem`, `xcrdapi`, `xg_xs`, `gameinput` | `pg6_xbox_` | tables only | yes |
+//! | `libhttpclient.gdk`, `bink2scarlett`, `acphal`, `xapu`, `chad`, `amd_fidelityfx_loader_xbox`, `xboxbvhbuilder`, `mfplat`, `mfreadwrite` | `pg6_mw_` | tables only | yes |
 //!
-//! Inside the family the import name and the shim name (prefix stripped) are compared with
-//! case and underscores ignored, so `CreateFileW` binds `pg6_win32_create_file_w`,
-//! `GetTickCount64` binds `pg6_win32_get_tick_count64` and `XTaskQueueCreate` binds
+//! **Export tables** are authoritative. Every file passed in (headers and `.cpp` sources) is
+//! scanned for the runtime's export-registration tables ([`scan_tables`]): the `(DLL, export
+//! name, ordinal, symbol)` tuples the runtime registers in the module registry for
+//! `GetProcAddress` (`E(TAG, "Name", symbol)` X-macros, `{kDll, "Name", proc_address(&symbol)}`
+//! arrays, `export_entry("Name", &symbol, ordinal)` lists). An import binds the family symbol a
+//! table registers under its exact name: the entry under the import's own DLL when there is one,
+//! else the entry under another DLL of the family (`ucrtbase.dll!malloc` takes the
+//! `api-ms-win-crt-heap` entry). This is exact where name keys are not (`_exit` / `exit`,
+//! C++-decorated `??0XboxBvhBuilder@@QEAA@...`, `__stdio_common_vsprintf`).
+//! **Name keys** (families with "tables, then key"): when no table entry exists, the import name
+//! and the shim name (prefix stripped) are compared with case and underscores ignored, so
+//! `CreateFileW` binds `pg6_win32_create_file_w` and `XTaskQueueCreate` binds
 //! `pg6_gdk_xtask_queue_create`. Two shims with the same key make the import ambiguous.
-//! Ordinal imports carry no name and stay unresolved, except the few console exports whose
-//! ordinal is fixed and known (`ordinal_import_name`: `GameInput.dll` #1 = `GameInputCreate`),
-//! which resolve under that name.
+//! **Ordinals**: an ordinal import resolves under the export name a table registers for that
+//! (DLL, ordinal) ([`Catalogue::ordinal_import_name`]: `WS2_32.dll` #3 = `closesocket` from
+//! `winsock_ordinals.cpp`, `GameInput.dll` #1 = `GameInputCreate`); without one it is unresolved.
+//! **Families in order**: the first family with a bindable shim wins; if none has one the first
+//! family's reason is reported.
+//!
+//! # Shim audit
+//! A shim that can be marshaled is not necessarily correct when recompiled MSVC code calls it
+//! (variadic `va_list` arguments, MSVC struct layouts, host pointers returned into guest memory,
+//! callbacks). Every shim of an audited family needs a row in `PG6_SHIM_AUDIT`
+//! (`runtime/os/shim_audit.h`): `ok` binds; `deny` and `pending` leave the import a logging
+//! thunk whose message carries the recorded reason ([`Unresolved::Denied`],
+//! [`Unresolved::PendingAudit`]). `PG6_IMPORT_GAPS` records imports that knowingly have no shim
+//! ([`Unresolved::Gap`]). [`Unresolved::recorded`] is the explicit reason an import stays
+//! unbound; the manifest carries it as `recorded`.
 //!
 //! # Marshaling (Win64 ABI)
 //! Parameter `i < 4` comes from `rcx rdx r8 r9` (integer and pointer kinds) or from the low lane
@@ -59,10 +85,11 @@
 //! the family's shim: the generated `pg6_import_<n>` just forwards the guest state to it (it
 //! marshals its own arguments and pops the return address itself). When several guest-state
 //! thunks share a name key (`pg6_gthunk_exit` / `pg6_gthunk__exit`), the one whose name after
-//! the prefix equals the import name binds; without such a thunk the import is ambiguous. A few
-//! console DLLs have no shim family and are implemented only as guest-state thunks
-//! (`runtime/os/xbox_scarlett_guest.h`: `XCRDAPI`, `GameInput`, `xg_xs`); their imports bind
-//! when a matching thunk exists and are otherwise unresolved like any unknown DLL.
+//! the prefix equals the import name binds; without such a thunk the import is ambiguous. An
+//! export table entry that registers a guest-state thunk under exactly the import's DLL and name
+//! (`{"GameInput.dll", "GameInputCreate", 1, &pg6_gthunk_game_input_create}` in
+//! `xbox_scarlett_guest.cpp`) binds first, also for a DLL without a shim family. Guest-state
+//! thunks are never audit-gated: they are written for guest callers.
 //!
 //! # Unresolved imports
 //! Every unresolved import still gets a thunk. On its first call it logs
@@ -123,11 +150,14 @@ const ARG_GPRS: [u8; 4] = [1, 2, 8, 9];
 const REG_RAX: u8 = 0;
 const REG_RSP: u8 = 4;
 
-/// Shim families: name prefix of the runtime C-ABI functions for a DLL class.
-const PREFIX_WIN32: &str = "pg6_win32_";
-const PREFIX_GDK: &str = "pg6_gdk_";
-const PREFIX_D3D12: &str = "pg6_d3d12_";
-const SHIM_FAMILIES: [&str; 3] = [PREFIX_WIN32, PREFIX_GDK, PREFIX_D3D12];
+mod tables;
+
+pub use tables::{
+    AuditEntry, ExportEntry, GapEntry, NameRule, PREFIX_CRT, PREFIX_D3D12, PREFIX_GDK, PREFIX_MW,
+    PREFIX_WIN32, PREFIX_WS2, PREFIX_XBOX, SHIM_FAMILIES, ShimFamily, Verdict, family,
+    family_of_symbol, parse_import_list, scan_tables, shim_families_for_dll,
+};
+
 /// Runtime-written import thunks taking the guest state (`void pg6_gthunk_<name>(void* state)`).
 const PREFIX_GTHUNK: &str = "pg6_gthunk_";
 
@@ -260,32 +290,64 @@ impl ShimDecl {
     }
 }
 
-/// All `extern "C"` functions declared by a set of runtime headers.
+/// All `extern "C"` functions declared by a set of runtime headers, plus the export tables and
+/// audit rows found in the runtime sources scanned with them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalogue {
     shims: BTreeMap<String, ShimDecl>,
-    /// Number of headers scanned.
+    /// Number of files scanned (headers and sources).
     pub header_count: usize,
     /// Scanner notes (e.g. a function redeclared with a different signature).
     pub diagnostics: Vec<String>,
+    /// Export-table registrations ([`tables::scan_tables`]), in scan order.
+    pub exports: Vec<ExportEntry>,
+    /// `PG6_SHIM_AUDIT` rows by symbol.
+    pub audit: BTreeMap<String, AuditEntry>,
+    /// `PG6_IMPORT_GAPS` rows.
+    pub gaps: Vec<GapEntry>,
+}
+
+/// Whether an include spelling names a header (scanned for declarations); any other file (a
+/// `.cpp` source) is scanned for export tables only.
+fn is_header_file(include: &str) -> bool {
+    let lower = include.to_ascii_lowercase();
+    lower.ends_with(".h") || lower.ends_with(".hpp") || lower.ends_with(".hh")
 }
 
 impl Catalogue {
     /// Scan `headers` (all aliases and type names are collected before any signature is
     /// classified, so declaration order across headers does not matter). The first declaration
     /// of a name wins; conflicting redeclarations are reported in [`Catalogue::diagnostics`].
+    /// Every file (header or source) is also scanned for export and audit tables.
     pub fn scan(headers: &[ShimHeader]) -> Self {
         let mut env = TypeEnv::default();
         let mut raw = Vec::new();
-        for (index, header) in headers.iter().enumerate() {
-            let tokens = tokenize(&header.text);
-            scan_scope(&tokens, false, index, &mut env, &mut raw);
-        }
-
         let mut catalogue = Self {
             header_count: headers.len(),
             ..Self::default()
         };
+        for (index, header) in headers.iter().enumerate() {
+            if is_header_file(&header.include) {
+                let tokens = tokenize(&header.text);
+                scan_scope(&tokens, false, index, &mut env, &mut raw);
+            }
+            let found = tables::scan_tables(&header.text, &header.include);
+            catalogue.exports.extend(found.exports);
+            catalogue.gaps.extend(found.gaps);
+            catalogue.diagnostics.extend(found.diagnostics);
+            for row in found.audit {
+                match catalogue.audit.get(&row.symbol) {
+                    Some(existing) => catalogue.diagnostics.push(format!(
+                        "audit row for {} repeated in {} (keeping {})",
+                        row.symbol, row.source, existing.source
+                    )),
+                    None => {
+                        catalogue.audit.insert(row.symbol.clone(), row);
+                    }
+                }
+            }
+        }
+
         for decl in raw {
             let shim = ShimDecl {
                 name: decl.name,
@@ -338,6 +400,26 @@ impl Catalogue {
             .values()
             .filter(move |s| s.name.starts_with(prefix))
     }
+
+    /// Export name of ordinal `ordinal` of `dll`, from the runtime's export tables (an entry
+    /// registering that name under that ordinal, e.g. `export_entry("GameInputCreate", ...,
+    /// 1u)` under `GameInput.dll`). `None` when no table declares the ordinal or two tables
+    /// disagree. Ordinal imports resolve under this name.
+    pub fn ordinal_import_name(&self, dll: &str, ordinal: u16) -> Option<&str> {
+        let key = dll_key(dll);
+        let mut names = self
+            .exports
+            .iter()
+            .filter(|e| e.ordinal == Some(ordinal) && dll_key(&e.dll) == key)
+            .map(|e| e.name.as_str());
+        let first = names.next()?;
+        names.all(|n| n == first).then_some(first)
+    }
+
+    /// Recorded gap reason for an import without a shim (`PG6_IMPORT_GAPS`).
+    pub fn gap_for(&self, dll: &str, symbol: &ImportedSymbol) -> Option<&GapEntry> {
+        self.gaps.iter().find(|g| g.matches(dll, symbol))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -377,18 +459,51 @@ impl Tok {
 
 /// Split C++ source into tokens, dropping comments and preprocessor lines.
 fn tokenize(src: &str) -> Vec<Tok> {
+    tokenize_impl(src, false)
+}
+
+/// Like [`tokenize`], but keeps preprocessor directives (`#define` X-macro tables): a directive
+/// is `Punct('#')`, its tokens (line continuations joined) and a closing `Punct('\n')`.
+fn tokenize_keep_directives(src: &str) -> Vec<Tok> {
+    tokenize_impl(src, true)
+}
+
+fn tokenize_impl(src: &str, keep_directives: bool) -> Vec<Tok> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     let mut line_start = true;
+    let mut in_directive = false;
     while i < b.len() {
         let c = b[i];
         if c == b'\n' {
+            if in_directive {
+                out.push(Tok::Punct('\n'));
+                in_directive = false;
+            }
             line_start = true;
             i += 1;
             continue;
         }
         if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if keep_directives && c == b'\\' {
+            // Line continuation inside a kept directive.
+            let mut j = i + 1;
+            if j < b.len() && b[j] == b'\r' {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'\n' {
+                i = j + 1;
+                continue;
+            }
+        }
+        if c == b'#' && line_start && keep_directives {
+            out.push(Tok::Punct('#'));
+            in_directive = true;
+            line_start = false;
             i += 1;
             continue;
         }
@@ -1019,31 +1134,10 @@ fn dll_key(dll: &str) -> String {
     }
 }
 
-/// Shim family prefix for an imported DLL, or `None` when the runtime has no family for it.
+/// First (highest-priority) shim family prefix for an imported DLL, or `None` when the runtime
+/// has no family for it ([`shim_families_for_dll`] lists all of them).
 pub fn shim_prefix_for_dll(dll: &str) -> Option<&'static str> {
-    match dll_key(dll).as_str() {
-        "kernel32" | "kernelbase" | "advapi32" | "ws2_32" | "winhttp" | "bcrypt" | "user32"
-        | "combase" | "ole32" => Some(PREFIX_WIN32),
-        "xgameruntime" => Some(PREFIX_GDK),
-        "d3d12" | "d3d12_x" | "d3d12_xs" => Some(PREFIX_D3D12),
-        s if s.starts_with("api-ms-win-") || s.starts_with("ext-ms-win-") => Some(PREFIX_WIN32),
-        s if s.starts_with("microsoft.xbox.services") => Some(PREFIX_GDK),
-        _ => None,
-    }
-}
-
-/// DLLs without a shim family whose imports the runtime implements as guest-state thunks only.
-fn is_gthunk_only_dll(dll: &str) -> bool {
-    matches!(dll_key(dll).as_str(), "xcrdapi" | "gameinput" | "xg_xs")
-}
-
-/// Export name of an ordinal import whose ordinal is fixed and documented by the DLL's import
-/// library (only those the runtime implements).
-pub fn ordinal_import_name(dll: &str, ordinal: u16) -> Option<&'static str> {
-    match (dll_key(dll).as_str(), ordinal) {
-        ("gameinput", 1) => Some("GameInputCreate"),
-        _ => None,
-    }
+    shim_families_for_dll(dll).first().copied()
 }
 
 /// Matching key: ASCII-lowercased with underscores removed (`CreateFileW` and `create_file_w`
@@ -1068,6 +1162,17 @@ pub enum Unresolved {
     Ambiguous { candidates: Vec<String> },
     /// The matching shim's signature cannot be marshaled from guest state.
     Unmarshalable { shim: String, reason: String },
+    /// The shim's audit (`PG6_SHIM_AUDIT`) says it must not be called from recompiled code.
+    Denied { shim: String, reason: String },
+    /// The shim belongs to an audited family and is not audited yet (`note` is the `pending`
+    /// row's note, `None` when the shim has no audit row at all).
+    PendingAudit { shim: String, note: Option<String> },
+    /// No shim, with a recorded reason (`PG6_IMPORT_GAPS`); `code`/`detail` say why it failed.
+    Gap {
+        code: &'static str,
+        detail: String,
+        reason: String,
+    },
 }
 
 impl Unresolved {
@@ -1079,6 +1184,9 @@ impl Unresolved {
             Self::NoShim { .. } => "no_shim",
             Self::Ambiguous { .. } => "ambiguous",
             Self::Unmarshalable { .. } => "unmarshalable",
+            Self::Denied { .. } => "denied",
+            Self::PendingAudit { .. } => "pending_audit",
+            Self::Gap { code, .. } => code,
         }
     }
 
@@ -1086,12 +1194,40 @@ impl Unresolved {
     pub fn describe(&self) -> String {
         match self {
             Self::UnknownDll => "no runtime shim family for this DLL".to_string(),
-            Self::ByOrdinal => "imported by ordinal; no name to bind".to_string(),
+            Self::ByOrdinal => {
+                "imported by ordinal; no runtime export table declares this ordinal".to_string()
+            }
             Self::NoShim { prefix } => format!("no {prefix}* shim with a matching name"),
             Self::Ambiguous { candidates } => {
                 format!("ambiguous shims: {}", candidates.join(", "))
             }
             Self::Unmarshalable { shim, reason } => format!("{shim}: {reason}"),
+            Self::Denied { shim, reason } => format!("{shim}: denied by the shim audit: {reason}"),
+            Self::PendingAudit { shim, note } => match note {
+                Some(note) if !note.is_empty() => format!("{shim}: pending audit: {note}"),
+                Some(_) => format!("{shim}: pending audit"),
+                None => format!("{shim}: no PG6_SHIM_AUDIT row (unaudited shims never bind)"),
+            },
+            Self::Gap { detail, reason, .. } => format!("{detail}; recorded gap: {reason}"),
+        }
+    }
+
+    /// The explicitly recorded reason this import stays unbound: an audit verdict (`deny` or a
+    /// `pending` row), the shim's signature, or a `PG6_IMPORT_GAPS` row. `None` means nobody
+    /// decided it (no shim and no gap row, an ambiguity, or a shim without an audit row).
+    pub fn recorded(&self) -> Option<String> {
+        match self {
+            Self::Denied { reason, .. } => Some(format!("denied: {reason}")),
+            Self::PendingAudit {
+                note: Some(note), ..
+            } => Some(if note.is_empty() {
+                "pending audit".to_string()
+            } else {
+                format!("pending audit: {note}")
+            }),
+            Self::Unmarshalable { reason, .. } => Some(format!("unmarshalable: {reason}")),
+            Self::Gap { reason, .. } => Some(format!("gap: {reason}")),
+            _ => None,
         }
     }
 }
@@ -1218,17 +1354,25 @@ impl BridgePlan {
     }
 }
 
-/// Shim lookup keyed by `(family prefix, name key)`.
+/// Shim lookup: export tables, name keys and guest-state thunks.
 struct ShimIndex<'a> {
+    catalogue: &'a Catalogue,
+    /// `(family prefix, name key)` -> shims, for [`NameRule::TablesThenKey`] families.
     by_key: BTreeMap<(&'static str, String), Vec<&'a ShimDecl>>,
     /// Guest-state thunks by name key (only `void (void*)` declarations).
     gthunks: BTreeMap<String, Vec<&'a ShimDecl>>,
+    /// Export name -> table entries whose symbol is declared.
+    by_name: BTreeMap<&'a str, Vec<&'a ExportEntry>>,
 }
 
 impl<'a> ShimIndex<'a> {
     fn new(catalogue: &'a Catalogue) -> Self {
         let mut by_key: BTreeMap<(&'static str, String), Vec<&'a ShimDecl>> = BTreeMap::new();
-        for prefix in SHIM_FAMILIES {
+        for family in SHIM_FAMILIES
+            .iter()
+            .filter(|f| f.rule == NameRule::TablesThenKey)
+        {
+            let prefix = family.prefix;
             for shim in catalogue.family(prefix) {
                 by_key
                     .entry((prefix, name_key(&shim.name[prefix.len()..])))
@@ -1246,20 +1390,101 @@ impl<'a> ShimIndex<'a> {
                 .or_default()
                 .push(shim);
         }
-        Self { by_key, gthunks }
+        let mut by_name: BTreeMap<&'a str, Vec<&'a ExportEntry>> = BTreeMap::new();
+        for entry in &catalogue.exports {
+            if catalogue.get(&entry.symbol).is_some() {
+                by_name.entry(entry.name.as_str()).or_default().push(entry);
+            }
+        }
+        Self {
+            catalogue,
+            by_key,
+            gthunks,
+            by_name,
+        }
+    }
+
+    /// Distinct declared symbols the export tables register for `name` whose symbol satisfies
+    /// `accept`: those registered under `dll` itself when there are any, else all of them.
+    fn table_symbols(&self, dll: &str, name: &str, accept: impl Fn(&str) -> bool) -> Vec<&'a str> {
+        let Some(entries) = self.by_name.get(name) else {
+            return Vec::new();
+        };
+        let key = dll_key(dll);
+        let matching: Vec<&ExportEntry> = entries
+            .iter()
+            .copied()
+            .filter(|e| accept(&e.symbol))
+            .collect();
+        let same_dll: Vec<&ExportEntry> = matching
+            .iter()
+            .copied()
+            .filter(|e| dll_key(&e.dll) == key)
+            .collect();
+        let chosen = if same_dll.is_empty() {
+            matching
+        } else {
+            same_dll
+        };
+        let mut symbols: Vec<&'a str> = chosen.iter().map(|e| e.symbol.as_str()).collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        symbols
     }
 
     fn resolve(&self, dll: &str, symbol: &ImportedSymbol) -> Resolution {
-        let family = shim_prefix_for_dll(dll);
-        if family.is_none() && !is_gthunk_only_dll(dll) {
+        match self.resolve_inner(dll, symbol) {
+            Resolution::Unresolved(why) if why.recorded().is_none() => {
+                match self.catalogue.gap_for(dll, symbol) {
+                    Some(gap) => Resolution::Unresolved(Unresolved::Gap {
+                        code: why.code(),
+                        detail: why.describe(),
+                        reason: gap.reason.clone(),
+                    }),
+                    None => Resolution::Unresolved(why),
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn resolve_inner(&self, dll: &str, symbol: &ImportedSymbol) -> Resolution {
+        let families = shim_families_for_dll(dll);
+        let name: Option<&str> = match symbol {
+            ImportedSymbol::ByName { name, .. } => Some(name),
+            ImportedSymbol::ByOrdinal { ordinal } => {
+                self.catalogue.ordinal_import_name(dll, *ordinal)
+            }
+        };
+        // A table entry registering a guest-state thunk under exactly this DLL and name.
+        if let Some(name) = name {
+            let key = dll_key(dll);
+            let mut exact: Vec<&str> = self
+                .by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|e| dll_key(&e.dll) == key)
+                .filter(|e| {
+                    self.catalogue
+                        .get(&e.symbol)
+                        .is_some_and(is_guest_state_thunk)
+                })
+                .map(|e| e.symbol.as_str())
+                .collect();
+            exact.sort_unstable();
+            exact.dedup();
+            if let [gthunk] = exact.as_slice() {
+                return Resolution::Bound {
+                    shim: (*gthunk).to_string(),
+                };
+            }
+        }
+        if families.is_empty() {
             return Resolution::Unresolved(Unresolved::UnknownDll);
         }
-        let name: &str = match symbol {
-            ImportedSymbol::ByName { name, .. } => name,
-            ImportedSymbol::ByOrdinal { ordinal } => match ordinal_import_name(dll, *ordinal) {
-                Some(name) => name,
-                None => return Resolution::Unresolved(Unresolved::ByOrdinal),
-            },
+        let Some(name) = name else {
+            return Resolution::Unresolved(Unresolved::ByOrdinal);
         };
         match self.gthunks.get(&name_key(name)).map(Vec::as_slice) {
             None | Some([]) => {}
@@ -1284,28 +1509,72 @@ impl<'a> ShimIndex<'a> {
                 };
             }
         }
-        let Some(prefix) = family else {
-            return Resolution::Unresolved(Unresolved::UnknownDll);
-        };
-        match self
-            .by_key
-            .get(&(prefix, name_key(name)))
-            .map(Vec::as_slice)
-        {
-            None | Some([]) => Resolution::Unresolved(Unresolved::NoShim { prefix }),
-            Some([shim]) => match shim.unsupported_reason() {
-                None => Resolution::Bound {
-                    shim: shim.name.clone(),
-                },
-                Some(reason) => Resolution::Unresolved(Unresolved::Unmarshalable {
-                    shim: shim.name.clone(),
-                    reason,
+        // The families in priority order: the first one with a bindable shim wins; when none
+        // has one, the first family's reason is reported.
+        let mut first_failure: Option<Unresolved> = None;
+        for &prefix in families {
+            let Some(fam) = tables::family(prefix) else {
+                continue;
+            };
+            let mut candidates: Vec<&'a str> =
+                self.table_symbols(dll, name, |s| s.starts_with(prefix));
+            if candidates.is_empty() && fam.rule == NameRule::TablesThenKey {
+                candidates = self
+                    .by_key
+                    .get(&(prefix, name_key(name)))
+                    .map(|v| v.iter().map(|s| s.name.as_str()).collect())
+                    .unwrap_or_default();
+            }
+            let outcome = match candidates.as_slice() {
+                [] => continue,
+                [shim] => self.check(fam, shim),
+                many => Err(Unresolved::Ambiguous {
+                    candidates: many.iter().map(|s| (*s).to_string()).collect(),
                 }),
-            },
-            Some(many) => Resolution::Unresolved(Unresolved::Ambiguous {
-                candidates: many.iter().map(|s| s.name.clone()).collect(),
-            }),
+            };
+            match outcome {
+                Ok(shim) => return Resolution::Bound { shim },
+                Err(why) => {
+                    first_failure.get_or_insert(why);
+                }
+            }
         }
+        Resolution::Unresolved(first_failure.unwrap_or(Unresolved::NoShim {
+            prefix: families[0],
+        }))
+    }
+
+    /// Whether `shim` of `family` may bind: marshalable and, for audited families, audited `ok`.
+    fn check(&self, family: &ShimFamily, shim: &str) -> Result<String, Unresolved> {
+        let Some(decl) = self.catalogue.get(shim) else {
+            return Err(Unresolved::NoShim {
+                prefix: family.prefix,
+            });
+        };
+        if let Some(reason) = decl.unsupported_reason() {
+            return Err(Unresolved::Unmarshalable {
+                shim: shim.to_string(),
+                reason,
+            });
+        }
+        if family.audited {
+            match self.catalogue.audit.get(shim) {
+                Some(row) if row.verdict == Verdict::Ok => {}
+                Some(row) if row.verdict == Verdict::Deny => {
+                    return Err(Unresolved::Denied {
+                        shim: shim.to_string(),
+                        reason: row.note.clone(),
+                    });
+                }
+                row => {
+                    return Err(Unresolved::PendingAudit {
+                        shim: shim.to_string(),
+                        note: row.map(|r| r.note.clone()),
+                    });
+                }
+            }
+        }
+        Ok(shim.to_string())
     }
 }
 
@@ -1350,6 +1619,27 @@ pub fn plan_bridge(pe: &Pe64, catalogue: &Catalogue) -> BridgePlan {
             });
         }
     }
+    BridgePlan { imports }
+}
+
+/// Resolve an import list without a PE (e.g. [`parse_import_list`] of
+/// `docs/imports_required.md`): every import gets no IAT slot, so the rendered bridge has no
+/// thunks and the manifest lists each import with its binding.
+pub fn plan_import_list(imports: &[(String, ImportedSymbol)], catalogue: &Catalogue) -> BridgePlan {
+    let index = ShimIndex::new(catalogue);
+    let imports = imports
+        .iter()
+        .enumerate()
+        .map(|(i, (dll, symbol))| ImportBinding {
+            index: i,
+            dll: dll.clone(),
+            symbol: symbol.clone(),
+            slot_rva: None,
+            delay_load: false,
+            resolution: index.resolve(dll, symbol),
+            guest: None,
+        })
+        .collect();
     BridgePlan { imports }
 }
 
@@ -2066,9 +2356,13 @@ fn render_manifest(plan: &BridgePlan, catalogue: &Catalogue, names: Names<'_>) -
                 );
             }
             Resolution::Unresolved(why) => {
+                let recorded = why
+                    .recorded()
+                    .map_or_else(|| "null".to_string(), |r| json_str(&r));
                 let _ = write!(
                     out,
-                    "\"status\": \"unresolved\", \"reason\": {}, \"detail\": {}}}",
+                    "\"status\": \"unresolved\", \"reason\": {}, \"detail\": {}, \
+                     \"recorded\": {recorded}}}",
                     json_str(why.code()),
                     json_str(&why.describe())
                 );
@@ -2447,7 +2741,6 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             "api-ms-win-core-synch-l1-2-0.dll",
             "API-MS-WIN-CORE-FILE-L1-1-0.DLL",
             "ext-ms-win-ntuser-window-l1-1-0.dll",
-            "WS2_32.dll",
             "WINHTTP.dll",
             "ADVAPI32.dll",
             "bcrypt.dll",
@@ -2457,6 +2750,11 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
         ] {
             assert_eq!(shim_prefix_for_dll(dll), Some("pg6_win32_"), "{dll}");
         }
+        assert_eq!(
+            shim_prefix_for_dll("WS2_32.dll"),
+            Some("pg6_ws2_"),
+            "the Winsock ordinal family first, pg6_win32_ second"
+        );
         assert_eq!(shim_prefix_for_dll("XGameRuntime.dll"), Some("pg6_gdk_"));
         assert_eq!(
             shim_prefix_for_dll("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll"),
@@ -2608,17 +2906,41 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
     }
 
     #[test]
-    fn console_dlls_without_a_family_bind_guest_state_thunks_only() {
+    fn guest_state_thunks_bind_by_export_table_and_ordinal() {
         let mut headers = mini_headers();
         headers.push(ShimHeader {
             include: "os/xbox_scarlett_guest.h".to_string(),
-            text: "extern \"C\" {\n\
-                   void pg6_gthunk_dstorage_get_factory(void* state);\n\
-                   void pg6_gthunk_game_input_create(void* state);\n\
-                   }\n"
+            text: "extern \"C\" {
+                   void pg6_gthunk_dstorage_get_factory(void* state);
+                   void pg6_gthunk_game_input_create(void* state);
+                   void pg6_gthunk_only_in_table(void* state);
+                   }
+"
+                .to_string(),
+        });
+        // The guest-callable registration table (xbox_scarlett_guest.cpp shape).
+        headers.push(ShimHeader {
+            include: "os/xbox_scarlett_guest.cpp".to_string(),
+            text: "static const GuestExport kExports[] = {
+                   {\"XCRDAPI.dll\", \"DStorageGetFactory\", 0, &pg6_gthunk_dstorage_get_factory},
+                   {\"GameInput.dll\", \"GameInputCreate\", 1, &pg6_gthunk_game_input_create},
+                   {\"Console.dll\", \"OnlyInTable\", 0, &pg6_gthunk_only_in_table},
+                   };
+                   extern \"C\" void pg6_gthunk_not_a_decl_in_a_source(void* state) {}
+"
                 .to_string(),
         });
         let catalogue = Catalogue::scan(&headers);
+        assert!(
+            catalogue.get("pg6_gthunk_not_a_decl_in_a_source").is_none(),
+            "sources are scanned for tables only"
+        );
+        assert_eq!(
+            catalogue.ordinal_import_name("GAMEINPUT", 1),
+            Some("GameInputCreate")
+        );
+        assert_eq!(catalogue.ordinal_import_name("GameInput.dll", 2), None);
+        assert_eq!(catalogue.ordinal_import_name("KERNEL32.dll", 1), None);
         let mut pe = synthetic_pe(false);
         pe.imports.push(ImportModule {
             dll_name: "GameInput.dll".to_string(),
@@ -2638,6 +2960,11 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             iat_rva: 0x3100,
             symbols: named(&["DStorageGetFactory"]),
         });
+        pe.imports.push(ImportModule {
+            dll_name: "Console.dll".to_string(),
+            iat_rva: 0x3300,
+            symbols: named(&["OnlyInTable", "DStorageGetFactory"]),
+        });
         let plan = plan_bridge(&pe, &catalogue);
         assert_eq!(
             find(&plan, "XCRDAPI.dll!DStorageGetFactory").bound_shim(),
@@ -2645,24 +2972,34 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
         );
         assert_eq!(
             find(&plan, "XCRDAPI.dll!DStorageSomethingElse").resolution,
-            Resolution::Unresolved(Unresolved::UnknownDll)
+            Resolution::Unresolved(Unresolved::NoShim {
+                prefix: "pg6_xbox_"
+            })
         );
         assert_eq!(
-            find(&plan, "xmem.dll!DStorageGetFactory").resolution,
+            find(&plan, "xmem.dll!DStorageGetFactory").bound_shim(),
+            Some("pg6_gthunk_dstorage_get_factory"),
+            "a DLL with a shim family binds guest-state thunks by name key"
+        );
+        assert_eq!(
+            find(&plan, "Console.dll!OnlyInTable").bound_shim(),
+            Some("pg6_gthunk_only_in_table"),
+            "a table entry binds its guest-state thunk under exactly its DLL, family or not"
+        );
+        assert_eq!(
+            find(&plan, "Console.dll!DStorageGetFactory").resolution,
             Resolution::Unresolved(Unresolved::UnknownDll),
-            "only the listed console DLLs bind guest-state thunks without a family"
+            "no name-key thunks for a DLL without a family"
         );
         assert_eq!(
             find(&plan, "GameInput.dll!#1").bound_shim(),
             Some("pg6_gthunk_game_input_create"),
-            "GameInput ordinal 1 is GameInputCreate"
+            "GameInput ordinal 1 is GameInputCreate (from the table)"
         );
         assert_eq!(
             find(&plan, "GameInput.dll!#2").resolution,
             Resolution::Unresolved(Unresolved::ByOrdinal)
         );
-        assert_eq!(ordinal_import_name("gameinput", 1), Some("GameInputCreate"));
-        assert_eq!(ordinal_import_name("KERNEL32.dll", 1), None);
     }
 
     #[test]
@@ -2895,7 +3232,8 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             foo.thunk_name()
         )));
         assert!(out.source.contains(
-            "\"unresolved import KERNEL32.dll!#42 (slot 0x20c8): imported by ordinal; no name to bind\""
+            "\"unresolved import KERNEL32.dll!#42 (slot 0x20c8): imported by ordinal; no runtime \
+             export table declares this ordinal\""
         ));
         assert!(
             out.source
@@ -3301,8 +3639,211 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             Resolution::Unresolved(Unresolved::NoShim {
                 prefix: "pg6_d3d12_"
             }),
-            "d3d12_xs has no C-ABI entry points yet"
+            "d3d12_xs exports D3D12XboxCreateDevice, not D3D12CreateDevice"
         );
+    }
+
+    /// The default shim set of this checkout (headers and export-table sources).
+    fn checkout_catalogue() -> Catalogue {
+        let start = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (paths, root) =
+            crate::pipeline::checkout_shim_headers(start).expect("playgta6web checkout");
+        let headers: Vec<ShimHeader> = paths
+            .iter()
+            .map(|p| load_shim_header(p, Some(&root)).expect("read runtime file"))
+            .collect();
+        Catalogue::scan(&headers)
+    }
+
+    #[test]
+    fn real_export_tables_and_audit_cover_every_family_shim() {
+        let catalogue = checkout_catalogue();
+        assert!(
+            catalogue.diagnostics.is_empty(),
+            "{:#?}",
+            catalogue.diagnostics
+        );
+        let mut per_family: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for entry in &catalogue.exports {
+            if let Some(family) = family_of_symbol(&entry.symbol) {
+                per_family
+                    .entry(family.prefix)
+                    .or_default()
+                    .insert(entry.symbol.as_str());
+            }
+        }
+        let count = |prefix: &str| per_family.get(prefix).map_or(0, BTreeSet::len);
+        println!(
+            "export tables: {} entries; symbols per family: {:?}",
+            catalogue.exports.len(),
+            per_family
+                .iter()
+                .map(|(k, v)| (*k, v.len()))
+                .collect::<Vec<_>>()
+        );
+        assert!(count(PREFIX_CRT) >= 186, "ucrt_bridge table");
+        assert!(count(PREFIX_MW) >= 98, "xbox_middleware table");
+        assert!(count(PREFIX_XBOX) >= 16, "xbox_scarlett table");
+        assert!(count(PREFIX_WS2) >= 25, "winsock_ordinals table");
+        assert!(count(PREFIX_WIN32) >= 150, "shim_exports table");
+
+        // Every exported shim of an audited family is declared and has exactly one audit row;
+        // every audit row names a declared shim of an audited family.
+        let mut problems = Vec::new();
+        for family in SHIM_FAMILIES.iter().filter(|f| f.audited) {
+            for symbol in per_family.get(family.prefix).into_iter().flatten() {
+                if catalogue.get(symbol).is_none() {
+                    problems.push(format!("{symbol}: exported but not declared in a header"));
+                }
+                if !catalogue.audit.contains_key(*symbol) {
+                    problems.push(format!("{symbol}: no PG6_SHIM_AUDIT row"));
+                }
+            }
+        }
+        for row in catalogue.audit.values() {
+            if catalogue.get(&row.symbol).is_none() {
+                problems.push(format!("audit row {}: no such shim", row.symbol));
+            }
+            if !family_of_symbol(&row.symbol).is_some_and(|f| f.audited) {
+                problems.push(format!("audit row {}: not an audited family", row.symbol));
+            }
+            if row.verdict != Verdict::Ok && row.note.trim().is_empty() {
+                problems.push(format!(
+                    "audit row {}: {} without a reason",
+                    row.symbol,
+                    row.verdict.as_str()
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+
+        // A guest-state thunk registered for an export wins over the family shim registered for
+        // the same export (static bridge; tests/test_shim_exports.cpp checks the registry).
+        let resolver = ShimResolver::new(&catalogue);
+        let mut both = 0;
+        for entry in catalogue
+            .exports
+            .iter()
+            .filter(|e| e.symbol.starts_with(PREFIX_GTHUNK))
+        {
+            let symbol = ImportedSymbol::ByName {
+                hint: 0,
+                name: entry.name.clone(),
+            };
+            assert_eq!(
+                resolver.resolve(&entry.dll, &symbol),
+                Resolution::Bound {
+                    shim: entry.symbol.clone()
+                },
+                "{}!{}",
+                entry.dll,
+                entry.name
+            );
+            if catalogue.exports.iter().any(|e| {
+                e.name == entry.name
+                    && dll_key(&e.dll) == dll_key(&entry.dll)
+                    && family_of_symbol(&e.symbol).is_some()
+            }) {
+                both += 1;
+            }
+        }
+        assert!(
+            both >= 4,
+            "DStorageGetFactory, GameInputCreate, XG*: {both}"
+        );
+        let game_input = ImportedSymbol::ByOrdinal { ordinal: 1 };
+        assert_eq!(
+            resolver.resolve("GameInput.dll", &game_input),
+            Resolution::Bound {
+                shim: "pg6_gthunk_game_input_create".to_string()
+            }
+        );
+        assert_eq!(
+            catalogue.ordinal_import_name("WS2_32.dll", 115),
+            Some("WSAStartup")
+        );
+    }
+
+    /// DLLs of `docs/imports_required.md` that a program build loads as guest modules (the
+    /// redistributable C++ runtime shipped with the game, R12): their imports bind to guest
+    /// code, so the bridge is not asked.
+    const DOC_GUEST_DLLS: [&str; 3] = ["msvcp140", "vcruntime140", "vcruntime140_1"];
+
+    #[test]
+    fn imports_required_doc_binds_or_records_a_reason() {
+        let catalogue = checkout_catalogue();
+        let doc = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs")
+            .join("imports_required.md");
+        let imports = parse_import_list(&fs::read_to_string(doc).expect("read imports doc"));
+        assert_eq!(imports.len(), 587);
+        let plan = plan_import_list(&imports, &catalogue);
+        let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
+        let mut unrecorded = Vec::new();
+        for import in &plan.imports {
+            let status = if DOC_GUEST_DLLS.contains(&dll_key(&import.dll).as_str()) {
+                "guest".to_string()
+            } else if crate::pipeline::program::runtime_exception_api(&import.dll, &import.symbol)
+                .is_some()
+            {
+                // Bound to R11's exception thunks by the runtime program loader.
+                "runtime".to_string()
+            } else {
+                match &import.resolution {
+                    Resolution::Bound { shim } if shim.starts_with(PREFIX_GTHUNK) => {
+                        "gthunk".to_string()
+                    }
+                    Resolution::Bound { .. } => "host".to_string(),
+                    Resolution::Unresolved(why) => {
+                        if why.recorded().is_none() {
+                            unrecorded.push(format!("{}: {}", import.label(), why.describe()));
+                        }
+                        format!("unresolved:{}", why.code())
+                    }
+                }
+            };
+            *by_status.entry(status).or_default() += 1;
+        }
+        println!("docs/imports_required.md: {by_status:?}");
+        assert!(
+            unrecorded.is_empty(),
+            "imports unresolved without a recorded reason (add a shim, an audit row or a \
+             PG6_IMPORT_GAPS row):\n{}",
+            unrecorded.join("\n")
+        );
+
+        // The repository's coverage auditor reaches the same verdict from the bridge manifest
+        // (tools/check_import_coverage.py --bridge-manifest), when a Python 3 is available.
+        let dir = temp_dir("doc_manifest");
+        let manifest = dir.join(MANIFEST_FILE);
+        fs::write(&manifest, render_bridge(&plan, &catalogue).manifest).expect("write manifest");
+        let tool = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tools")
+            .join("check_import_coverage.py");
+        let ran = ["python3", "python"].iter().find_map(|python| {
+            Command::new(python)
+                .arg(&tool)
+                .arg("--bridge-manifest")
+                .arg(&manifest)
+                .output()
+                .ok()
+                .filter(|o| {
+                    // Windows' `python3` app-execution alias exists but cannot run scripts.
+                    !String::from_utf8_lossy(&o.stderr).contains("Microsoft Store")
+                })
+        });
+        match ran {
+            Some(output) => assert!(
+                output.status.success(),
+                "check_import_coverage.py --bridge-manifest failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            None => println!("no python found; skipping check_import_coverage.py"),
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------------------------

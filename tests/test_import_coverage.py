@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -344,6 +345,126 @@ void init() {
             data = json.loads(proc.stdout)
             self.assertFalse(data["ok"])
             self.assertNotIn(str(empty_repo), proc.stdout)
+
+
+def _bridge_import(dll, name=None, ordinal=None, status="unresolved", **extra):
+    entry = {"dll": dll, "name": name, "ordinal": ordinal, "status": status}
+    entry.update(extra)
+    return entry
+
+
+class TestBridgeManifestAudit(unittest.TestCase):
+    """O17: binding classes from an import bridge / program manifest (recomp/src/stubs.rs)."""
+
+    BRIDGE = {
+        "format": "playgta6-import-bridge",
+        "version": 1,
+        "imports": [
+            _bridge_import("KERNEL32.dll", "Sleep", status="bound", shim="pg6_win32_sleep"),
+            _bridge_import(
+                "api-ms-win-crt-utility-l1-1-0.dll", "qsort", status="bound", shim="pg6_gthunk_qsort"
+            ),
+            _bridge_import("MSVCP140.dll", "?foo@@YAXXZ", reason="unknown_dll", recorded=None),
+            _bridge_import(
+                "VCRUNTIME140.dll", "memcpy", status="bound", shim="pg6_crt_memcpy"
+            ),
+            _bridge_import(
+                "api-ms-win-core-rtlsupport-l1-1-0.dll", "RtlVirtualUnwind", reason="no_shim"
+            ),
+            _bridge_import(
+                "MFPlat.DLL",
+                "MFCreateAttributes",
+                reason="denied",
+                recorded="denied: host COM: IUnknown stub with a host vtable",
+            ),
+            _bridge_import("WS2_32.dll", ordinal=11, reason="unmarshalable", recorded="unmarshalable: x"),
+        ],
+    }
+
+    def test_classifies_every_binding_class(self) -> None:
+        report = cic.audit_bridge_manifest(self.BRIDGE)
+        self.assertTrue(report["ok"], report["unrecorded"])
+        self.assertEqual(report["kind"], "bridge")
+        totals = report["totals"]
+        self.assertEqual(
+            {k: totals[k] for k in cic.BINDING_CLASSES},
+            {"guest": 2, "runtime": 1, "gthunk": 1, "host": 1, "unresolved": 2},
+        )
+        self.assertEqual(totals["total"], 7)
+        labels = [u["import"] for u in report["unresolved"]]
+        self.assertEqual(labels, ["MFPlat.DLL!MFCreateAttributes", "WS2_32.dll!#11"])
+        self.assertEqual(report["dlls"]["MSVCP140.dll"]["guest"], 1)
+
+    def test_unrecorded_unresolved_import_fails(self) -> None:
+        manifest = dict(self.BRIDGE)
+        manifest["imports"] = self.BRIDGE["imports"] + [
+            _bridge_import("xmem.dll", "XMemNew", reason="no_shim", recorded=None)
+        ]
+        report = cic.audit_bridge_manifest(manifest)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["unrecorded"], ["xmem.dll!XMemNew"])
+        # Without the declared guest policy the C++ runtime imports are unresolved too.
+        report = cic.audit_bridge_manifest(self.BRIDGE, guest_dlls=[])
+        self.assertIn("MSVCP140.dll!?foo@@YAXXZ", report["unrecorded"])
+        self.assertEqual(report["totals"]["host"], 2)  # VCRUNTIME140!memcpy on the host now
+
+    def test_program_manifest_bindings(self) -> None:
+        program = {
+            "schema": "playgta6-recomp-program",
+            "imports": [
+                {"importer": "game.exe", "dll": "MSVCP140.dll", "name": "f", "ordinal": None,
+                 "binding": "guest", "shim": None, "reason": None},
+                {"importer": "game.exe", "dll": "KERNEL32.dll", "name": "RtlUnwindEx",
+                 "ordinal": None, "binding": "runtime", "shim": None, "reason": None},
+                {"importer": "msvcp140.dll", "dll": "api-ms-win-crt-runtime-l1-1-0.dll",
+                 "name": "_initterm", "ordinal": None, "binding": "host",
+                 "shim": "pg6_gthunk_initterm", "reason": None},
+                {"importer": "msvcp140.dll", "dll": "api-ms-win-crt-math-l1-1-0.dll",
+                 "name": "floor", "ordinal": None, "binding": "unresolved", "shim": None,
+                 "reason": "no_shim", "recorded": None},
+            ],
+        }
+        report = cic.audit_bridge_manifest(program)
+        self.assertEqual(report["kind"], "program")
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["unrecorded"], ["msvcp140.dll: api-ms-win-crt-math-l1-1-0.dll!floor"]
+        )
+        self.assertEqual(report["importers"]["game.exe"]["runtime"], 1)
+        self.assertEqual(report["importers"]["msvcp140.dll"]["gthunk"], 1)
+
+    def test_cli_bridge_mode_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "good.json"
+            good.write_text(json.dumps(self.BRIDGE), encoding="utf-8")
+            bad_manifest = dict(self.BRIDGE)
+            bad_manifest["imports"] = [_bridge_import("chad.dll", "XDspNew", reason="no_shim")]
+            bad = Path(tmp) / "bad.json"
+            bad.write_text(json.dumps(bad_manifest), encoding="utf-8")
+            tool = str(REPO_ROOT / "tools" / "check_import_coverage.py")
+            ok = subprocess.run(
+                [sys.executable, tool, "--bridge-manifest", str(good), "--json"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertEqual(json.loads(ok.stdout)["totals"]["gthunk"], 1)
+            fail = subprocess.run(
+                [sys.executable, tool, "--bridge-manifest", str(bad)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(fail.returncode, 1)
+            self.assertIn("NO RECORDED REASON", fail.stdout)
+
+    def test_runtime_exception_apis_match_the_program_builder(self) -> None:
+        source = (REPO_ROOT / "recomp" / "src" / "pipeline" / "program.rs").read_text(
+            encoding="utf-8"
+        )
+        block = source.split("pub const RUNTIME_EXCEPTION_APIS", 1)[1].split("];", 1)[0]
+        pairs = {
+            (dll.lower(), name)
+            for dll, name in re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', block)
+        }
+        self.assertEqual(pairs, set(cic.RUNTIME_EXCEPTION_APIS))
 
 
 if __name__ == "__main__":

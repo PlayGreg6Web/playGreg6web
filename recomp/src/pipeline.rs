@@ -486,8 +486,9 @@ fn apply_link(
 }
 
 /// The runtime's shim headers of the checkout containing `start` (or one of its ancestors):
-/// `runtime/os/*.h` (sorted), `runtime/gpu/d3d12_xs.h` and `runtime/guest/guest_callbacks.h`, with
-/// `runtime/` as include root.
+/// `runtime/os/*.h` (sorted), `runtime/gpu/d3d12_xs.h` and `runtime/guest/guest_callbacks.h`,
+/// then the export-table sources `runtime/os/*.cpp` (sorted) and `runtime/gpu/d3d12_xs_exports.*`
+/// when present, with `runtime/` as include root.
 /// `None` when `start` is not inside a playgta6web checkout.
 pub fn checkout_shim_headers(start: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
     let root = start.ancestors().find(|dir| {
@@ -513,6 +514,23 @@ pub fn checkout_shim_headers(start: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
     if callbacks.is_file() {
         headers.push(callbacks);
     }
+    // The export-registration tables (`runtime/os/*.cpp`): authoritative export names and
+    // ordinals of the shim families (`stubs::scan_tables`). Sources are scanned for tables
+    // only, never for declarations.
+    let mut sources: Vec<PathBuf> = fs::read_dir(runtime.join("os"))
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "cpp"))
+        .collect();
+    sources.sort();
+    // G24's d3d12_xs export table, once it exists.
+    for name in ["d3d12_xs_exports.h", "d3d12_xs_exports.cpp"] {
+        let path = runtime.join("gpu").join(name);
+        if path.is_file() {
+            sources.push(path);
+        }
+    }
+    headers.extend(sources);
     (!headers.is_empty()).then_some((headers, runtime))
 }
 

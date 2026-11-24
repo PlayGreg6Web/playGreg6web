@@ -1175,6 +1175,206 @@ def filter_report_missing_only(report: Mapping[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Import bridge binding audit (O17)
+# ---------------------------------------------------------------------------
+#
+# Registry coverage (above) says whether the runtime *has* something registered under an import's
+# name. What boot needs is how the recompiled image actually reaches each import: the import
+# bridge (`playgta6-recomp stubs`, recomp/src/stubs.rs) decides that and writes it into its
+# manifest, after the shim audit (runtime/os/shim_audit.h). This section reads such a manifest:
+#   - `pg6_import_manifest.json` of `playgta6-recomp stubs <pe> | --import-list <file>`
+#     (`"format": "playgta6-import-bridge"`), or
+#   - `program-manifest.json` of `playgta6-recomp build-program` (`"schema":
+#     "playgta6-recomp-program"`), whose imports already carry guest/runtime bindings.
+# Every import is classified as `guest` (an export of a guest module), `runtime` (R11 exception
+# thunk bound by the program loader), `gthunk` (a pg6_gthunk_ guest-state thunk), `host` (a
+# marshaled, audited host shim) or `unresolved`; an unresolved import must carry the bridge's
+# `recorded` reason (an audit verdict, an unmarshalable signature or a PG6_IMPORT_GAPS row).
+
+BRIDGE_FORMAT = "playgta6-import-bridge"
+PROGRAM_SCHEMA = "playgta6-recomp-program"
+BINDING_CLASSES: tuple[str, ...] = ("guest", "runtime", "gthunk", "host", "unresolved")
+
+# DLLs a program build loads as guest modules (the redistributable C++ runtime shipped with the
+# game, R12): imports of a single-module bridge manifest from these count as `guest`.
+DEFAULT_BRIDGE_GUEST_DLLS: frozenset[str] = frozenset(
+    {"msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"}
+)
+
+# Exception APIs the runtime program loader binds to R11's guest-state thunks whatever the
+# bridge generated (recomp/src/pipeline/program.rs RUNTIME_EXCEPTION_APIS; kept identical by
+# tests/test_import_coverage.py).
+RUNTIME_EXCEPTION_APIS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("kernel32.dll", name)
+        for name in (
+            "RaiseException",
+            "RtlCaptureContext",
+            "RtlLookupFunctionEntry",
+            "RtlVirtualUnwind",
+            "RtlUnwindEx",
+            "RtlUnwind",
+            "RtlRestoreContext",
+            "RtlPcToFileHeader",
+            "RtlAddFunctionTable",
+            "RtlDeleteFunctionTable",
+            "SetUnhandledExceptionFilter",
+            "UnhandledExceptionFilter",
+        )
+    }
+    | {
+        ("ntdll.dll", name)
+        for name in (
+            "RtlRaiseException",
+            "RtlCaptureContext",
+            "RtlLookupFunctionEntry",
+            "RtlVirtualUnwind",
+            "RtlUnwindEx",
+            "RtlUnwind",
+            "RtlRestoreContext",
+            "RtlPcToFileHeader",
+            "RtlAddFunctionTable",
+            "RtlDeleteFunctionTable",
+        )
+    }
+)
+
+
+def _runtime_exception_module(dll: str) -> str | None:
+    """`kernel32.dll`/`ntdll.dll` when imports of `dll` reach the runtime exception thunks."""
+    canon = canonical_dll_name(dll)
+    if canon in ("kernel32.dll", "kernelbase.dll") or canon.startswith("api-ms-win-core-"):
+        return "kernel32.dll"
+    if canon == "ntdll.dll":
+        return "ntdll.dll"
+    return None
+
+
+def classify_bridge_import(
+    entry: Mapping[str, Any], guest_dlls: frozenset[str] = DEFAULT_BRIDGE_GUEST_DLLS
+) -> dict[str, Any]:
+    """One manifest import -> {dll, symbol, class, shim, reason, recorded}."""
+    dll = str(entry.get("dll", ""))
+    name = entry.get("name")
+    ordinal = entry.get("ordinal")
+    symbol = str(name) if name is not None else f"#{ordinal}"
+    shim = entry.get("shim")
+    reason = entry.get("reason")
+    recorded = entry.get("recorded")
+    binding = entry.get("binding")  # program manifest
+    status = entry.get("status")  # bridge manifest
+    if binding is not None:
+        cls = {"guest": "guest", "runtime": "runtime", "host": "host"}.get(str(binding), "unresolved")
+    elif status == "guest" or canonical_dll_name(dll) in guest_dlls:
+        cls = "guest"
+    elif (
+        name is not None
+        and (module := _runtime_exception_module(dll)) is not None
+        and (module, str(name)) in RUNTIME_EXCEPTION_APIS
+    ):
+        cls = "runtime"
+    elif status == "bound":
+        cls = "host"
+    else:
+        cls = "unresolved"
+    if cls == "host" and isinstance(shim, str) and shim.startswith("pg6_gthunk_"):
+        cls = "gthunk"
+    if cls != "unresolved":
+        reason = None
+        recorded = None
+    return {
+        "importer": entry.get("importer"),
+        "dll": dll,
+        "symbol": symbol,
+        "class": cls,
+        "shim": shim if cls in ("host", "gthunk") else None,
+        "reason": reason,
+        "recorded": recorded,
+    }
+
+
+def audit_bridge_manifest(
+    manifest: Mapping[str, Any], guest_dlls: Iterable[str] | None = None
+) -> dict[str, Any]:
+    """Binding report for an import bridge or program manifest (see the section comment)."""
+    guest_set = (
+        DEFAULT_BRIDGE_GUEST_DLLS
+        if guest_dlls is None
+        else frozenset(canonical_dll_name(d) for d in guest_dlls if d.strip())
+    )
+    errors: list[str] = []
+    kind = (
+        "program"
+        if manifest.get("schema") == PROGRAM_SCHEMA
+        else "bridge"
+        if manifest.get("format") == BRIDGE_FORMAT
+        else None
+    )
+    if kind is None:
+        errors.append("not an import bridge or program manifest")
+    imports = manifest.get("imports")
+    if not isinstance(imports, list):
+        errors.append("manifest has no imports list")
+        imports = []
+    rows = [classify_bridge_import(e, guest_set) for e in imports if isinstance(e, Mapping)]
+    totals = {cls: 0 for cls in BINDING_CLASSES}
+    per_importer: dict[str, dict[str, int]] = {}
+    per_dll: dict[str, dict[str, int]] = {}
+    unresolved: list[dict[str, Any]] = []
+    unrecorded: list[str] = []
+    for row in rows:
+        totals[row["class"]] += 1
+        importer = str(row["importer"] or "")
+        per_importer.setdefault(importer, {cls: 0 for cls in BINDING_CLASSES})[row["class"]] += 1
+        per_dll.setdefault(row["dll"], {cls: 0 for cls in BINDING_CLASSES})[row["class"]] += 1
+        if row["class"] == "unresolved":
+            label = f"{row['dll']}!{row['symbol']}"
+            if importer:
+                label = f"{importer}: {label}"
+            unresolved.append(
+                {"import": label, "reason": row["reason"], "recorded": row["recorded"]}
+            )
+            if not row["recorded"]:
+                unrecorded.append(label)
+    totals["total"] = len(rows)
+    return {
+        "ok": not errors and not unrecorded,
+        "kind": kind,
+        "guest_dlls": sorted(guest_set) if kind == "bridge" else [],
+        "totals": totals,
+        "importers": dict(sorted(per_importer.items())),
+        "dlls": dict(sorted(per_dll.items(), key=lambda kv: kv[0].lower())),
+        "unresolved": unresolved,
+        "unrecorded": unrecorded,
+        "errors": errors,
+    }
+
+
+def format_bridge_report(report: Mapping[str, Any]) -> str:
+    lines = ["playgta6web Import Bridge Binding Audit", "=" * 88]
+    for err in report["errors"]:
+        lines.append(f"ERROR: {err}")
+    header = f"{'DLL':<52}" + "".join(f"{cls:>11}" for cls in BINDING_CLASSES)
+    lines.append(header)
+    lines.append("-" * len(header))
+    for dll, counts in report["dlls"].items():
+        lines.append(f"{dll:<52}" + "".join(f"{counts[cls]:>11}" for cls in BINDING_CLASSES))
+    lines.append("=" * 88)
+    totals = report["totals"]
+    lines.append(
+        f"Totals ({totals['total']} imports): "
+        + ", ".join(f"{totals[cls]} {cls}" for cls in BINDING_CLASSES)
+    )
+    if report["unresolved"]:
+        lines.append("Unresolved:")
+        for u in report["unresolved"]:
+            lines.append(f"  {u['import']}: {u['recorded'] or 'NO RECORDED REASON (' + str(u['reason']) + ')'}")
+    if report["unrecorded"]:
+        lines.append(f"{len(report['unrecorded'])} unresolved import(s) without a recorded reason")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 4. Human-readable formatter & CLI
 # ---------------------------------------------------------------------------
 
@@ -1261,12 +1461,45 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Minimum required effective boot coverage percentage (exit 1 if below; default: 0).",
     )
+    parser.add_argument(
+        "--bridge-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Audit the bindings in an import bridge manifest (pg6_import_manifest.json of "
+            "`playgta6-recomp stubs <pe>|--import-list docs/imports_required.md`) or a "
+            "program-manifest.json instead of registry coverage; exit 1 if an import is "
+            "unresolved without a recorded reason."
+        ),
+    )
+    parser.add_argument(
+        "--guest-dll",
+        action="append",
+        default=None,
+        help=(
+            "With --bridge-manifest on a single-module manifest: a DLL loaded as a guest module "
+            "(repeatable; default: msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll)."
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.bridge_manifest is not None:
+        try:
+            manifest = json.loads(args.bridge_manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(sanitize_message(f"failed to read bridge manifest: {exc}"), file=sys.stderr)
+            return 1
+        bridge_report = audit_bridge_manifest(manifest, args.guest_dll)
+        if args.json:
+            print(json.dumps(bridge_report, indent=2))
+        else:
+            print(format_bridge_report(bridge_report))
+        return 0 if bridge_report["ok"] else 1
 
     report = audit_import_coverage(args.repo_root)
     output_report = filter_report_missing_only(report) if args.missing_only else report
