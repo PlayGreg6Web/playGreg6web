@@ -505,8 +505,8 @@ Crossing cross_boundary(VirtualMemoryArena& arena,
     while (b != nullptr && b->sentinel_rsp + 8 != cur.gpr[GuestReg::Rsp]) {
         b = b->outer;
     }
-    if (b == nullptr || b->outer == nullptr) {
-        return Crossing::End;
+    if (b == nullptr || b->outer == nullptr || b->tag == top_level_call_tag()) {
+        return Crossing::End;  // a thread's outermost call, or a top-level callback
     }
     const BoundaryTag* tag = as_tag(b->tag);
     if (tag == nullptr) {

@@ -51,14 +51,14 @@ Trampoline consume(void* context) {
 void task_queue_entry(void* context, bool canceled) {
     const Trampoline t = consume(context);
     if (t.function != 0) {
-        com::GuestFunction<void(uint64_t, bool)>(t.function)(t.context, canceled);
+        com::GuestFunction<void(uint64_t, bool)>(t.function).call_top_level(t.context, canceled);
     }
 }
 
 void task_queue_terminated_entry(void* context) {
     const Trampoline t = consume(context);
     if (t.function != 0) {
-        com::GuestFunction<void(uint64_t)>(t.function)(t.context);
+        com::GuestFunction<void(uint64_t)>(t.function).call_top_level(t.context);
     }
 }
 
@@ -68,7 +68,7 @@ uint32_t thread_start_entry(void* parameter) {
         return 0;
     }
     playgta6::GuestState& state = com::current_guest_state(t.stack_size);
-    return com::GuestFunction<uint32_t(uint64_t)>(t.function).call(state, t.context);
+    return com::GuestFunction<uint32_t(uint64_t)>(t.function).call_top_level(state, t.context);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ void async_completion_entry(Pg6XAsyncBlock* block) {
     com::write_guest(shadow->guest_block + offsetof(GuestAsyncBlock, internal), shadow->block.internal,
                      sizeof(shadow->block.internal));
     if (shadow->guest_callback != 0) {
-        com::GuestFunction<void(uint64_t)>(shadow->guest_callback)(shadow->guest_block);
+        com::GuestFunction<void(uint64_t)>(shadow->guest_callback).call_top_level(shadow->guest_block);
     }
 }
 
@@ -334,9 +334,20 @@ void qsort_impl(CallContext& ctx, uint64_t base, uint64_t count, uint64_t size, 
         idx[i] = i;
     }
     std::vector<uint64_t> tmp(idx.size());
+    bool abandoned = false;
     merge_sort(idx, tmp, 0, idx.size(), [&](uint64_t a, uint64_t b) {
-        return cmp.call(ctx.state, base + a * size, base + b * size) <= 0;
+        if (abandoned) {
+            return true;  // no further guest calls; the order no longer matters
+        }
+        const bool le = cmp.call(ctx.state, base + a * size, base + b * size) <= 0;
+        abandoned = unwind_pending(ctx.state);
+        return le;
     });
+    if (abandoned) {
+        // The comparator raised and an outer guest frame unwinds: leave the array as it was (the
+        // CRT's qsort leaves it partially sorted; either is allowed after a throwing comparator).
+        return;
+    }
     std::vector<uint8_t> original(static_cast<size_t>(count * size));
     if (!com::read_guest(base, original.data(), original.size())) {
         com::detail::log_bad_pointer("qsort array", base);
@@ -367,6 +378,9 @@ GuestPtr<void> bsearch_impl(CallContext& ctx,
         const uint64_t mid = lo + (hi - lo) / 2;
         const uint64_t element = base + mid * size;
         const int32_t c = cmp.call(ctx.state, key, element);
+        if (unwind_pending(ctx.state)) {
+            return GuestPtr<void>();  // ignored: the thunk leaves rax to the restored context
+        }
         if (c == 0) {
             return GuestPtr<void>(element);
         }
@@ -388,6 +402,9 @@ void initterm_impl(CallContext& ctx, uint64_t first, uint64_t last) {
         }
         if (fn != 0) {
             com::GuestFunction<void()>(fn).call(ctx.state);
+            if (unwind_pending(ctx.state)) {
+                return;
+            }
         }
     }
 }
@@ -401,6 +418,9 @@ int32_t initterm_e_impl(CallContext& ctx, uint64_t first, uint64_t last) {
         }
         if (fn != 0) {
             const int32_t result = com::GuestFunction<int32_t()>(fn).call(ctx.state);
+            if (unwind_pending(ctx.state)) {
+                return 0;  // ignored, see bsearch
+            }
             if (result != 0) {
                 return result;
             }

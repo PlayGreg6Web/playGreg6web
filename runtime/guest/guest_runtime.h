@@ -255,6 +255,24 @@ uint64_t call_guest_tagged(os::VirtualMemoryArena& arena,
                            std::span<const uint64_t> args,
                            const void* tag);
 
+// Host code that called guest code checks this right after call_guest returns: true while a
+// context restore (exception unwind, longjmp) is propagating to a guest frame above it. The host
+// function must then stop what it was doing - no further guest calls, no use of the result, no
+// writes to the guest registers - release what it holds and return to its caller, so that the
+// unwind continues through the host frame (see "Context restores" above).
+inline bool unwind_pending(const GuestState& state) {
+    return state.unwind_pending != 0;
+}
+
+// Boundary tag of a top-level callback: guest code the runtime calls as a thread pool, task
+// queue or loader would (task-queue and XAsync callbacks, thread start routines, exit handlers).
+// The exception dispatcher's frame walk ends at such a boundary as at a thread's outermost
+// call_guest, so an exception leaving the callback is unhandled (top-level filter, then
+// FaultKind::UnhandledException) instead of reaching the guest frame that happened to make the
+// runtime run it (e.g. XTaskQueueDispatch); a context restore past it raises
+// UnknownResumeTarget.
+const void* top_level_call_tag();
+
 template <typename... Args>
 uint64_t call_guest_args(os::VirtualMemoryArena& arena, GuestState& state, uint64_t va, Args... args) {
     static_assert((std::is_integral_v<Args> && ...), "call_guest passes integer arguments only");

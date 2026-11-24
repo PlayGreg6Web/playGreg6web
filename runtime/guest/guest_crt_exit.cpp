@@ -166,7 +166,7 @@ int32_t execute_table(GuestState& state, uint64_t table_va) {
         }
         const uint64_t cleared = 0;
         com::write_guest(p, cleared);  // each entry runs at most once
-        com::GuestFunction<void()>(function).call(state);
+        com::GuestFunction<void()>(function).call_top_level(state);
         if (state.unwind_pending != 0) {
             return 0;  // a context restore (longjmp) out of a handler: leave at once
         }
@@ -227,7 +227,7 @@ void run_exit_cleanup(GuestState& state, ExitMode mode) {
         const uint64_t callback = s.tls_callback.load();
         if (callback != 0 && !s.tls_callback_called.exchange(true)) {
             // Thread-local destructors of the exiting thread run before the atexit handlers.
-            com::GuestFunction<void(uint64_t, uint32_t, uint64_t)>(callback).call(state, 0, kDllProcessDetach, 0);
+            com::GuestFunction<void(uint64_t, uint32_t, uint64_t)>(callback).call_top_level(state, 0, kDllProcessDetach, 0);
             if (state.unwind_pending != 0) {
                 return;
             }

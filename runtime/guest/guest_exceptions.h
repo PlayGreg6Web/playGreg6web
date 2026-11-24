@@ -59,7 +59,9 @@
 //   - consolidate (the STATUS_UNWIND_CONSOLIDATE callback, e.g. a C++ catch block run by
 //     __CxxCallCatchBlock on top of the already unwound frames): the walk continues at the target
 //     frame's context.
-// The outermost call_guest of a thread ends the walk (an exception reaching it is unhandled).
+// The outermost call_guest of a thread ends the walk (an exception reaching it is unhandled), and
+// so does a boundary tagged top_level_call_tag() (guest_runtime.h: callbacks the runtime runs as a
+// thread pool or task queue would, e.g. XTaskQueue and XAsync callbacks and exit handlers).
 //
 // Unwinding details
 // -----------------

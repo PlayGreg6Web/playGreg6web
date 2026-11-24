@@ -494,6 +494,11 @@ uint64_t call_guest(os::VirtualMemoryArena& arena,
     return call_guest_tagged(arena, state, va, args, nullptr);
 }
 
+const void* top_level_call_tag() {
+    static const uint64_t kTopLevel = 0x5047'544F'504C'564CULL;  // "PGTOPLVL"
+    return &kTopLevel;
+}
+
 uint64_t call_guest_tagged(os::VirtualMemoryArena& arena,
                            GuestState& state,
                            uint64_t va,
@@ -535,7 +540,8 @@ uint64_t call_guest_tagged(os::VirtualMemoryArena& arena,
         if (state.unwind_pending != 0) {
             // A context restore is propagating. It belongs to an enclosing guest frame only if its
             // rsp lies above this activation's frame and an enclosing activation exists.
-            if (state.gpr[GuestReg::Rsp] <= entry_rsp || scope.boundary.outer == nullptr) {
+            if (state.gpr[GuestReg::Rsp] <= entry_rsp || scope.boundary.outer == nullptr ||
+                tag == top_level_call_tag()) {
                 raise_fault(FaultKind::UnknownResumeTarget, &state, state.resume_rip,
                             state.gpr[GuestReg::Rsp]);
             }

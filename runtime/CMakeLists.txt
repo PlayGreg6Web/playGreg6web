@@ -184,4 +184,8 @@ else()
     add_executable(test_guest_crt_exit ../tests/test_guest_crt_exit.cpp)
     target_link_libraries(test_guest_crt_exit PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_crt_exit_tests COMMAND test_guest_crt_exit)
+
+    add_executable(test_guest_callback_unwind ../tests/test_guest_callback_unwind.cpp)
+    target_link_libraries(test_guest_callback_unwind PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_callback_unwind_tests COMMAND test_guest_callback_unwind)
 endif()

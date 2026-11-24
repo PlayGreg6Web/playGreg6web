@@ -34,6 +34,8 @@
 //                      cleared before it is called, and after every call the table is re-read so
 //                      that functions registered by a running handler run next (as UCRT does).
 //                      Then frees the buffer and nulls the table.
+// Handlers run as top-level callbacks (com::GuestFunction::call_top_level): an exception that
+// leaves one is unhandled, as MSVC terminates when an exception escapes an exit handler.
 // All table operations take one recursive process "exit lock" (UCRT's __acrt_exit_lock): a
 // handler may register further handlers or call exit itself on the same thread, other threads
 // wait.

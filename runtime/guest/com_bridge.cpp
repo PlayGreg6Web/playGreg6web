@@ -809,7 +809,8 @@ uint64_t detail::call_guest_raw(GuestState& state,
                                 uint64_t va,
                                 const uint64_t* bits,
                                 const bool* is_float,
-                                size_t count) {
+                                size_t count,
+                                const void* tag) {
     for (size_t i = 0; i < count && i < 4; ++i) {
         if (is_float[i]) {
             state.xmm[i][0] = bits[i];
@@ -817,7 +818,7 @@ uint64_t detail::call_guest_raw(GuestState& state,
         }
     }
     GuestStateScope scope(state);
-    return call_guest(guest_memory(), state, va, std::span<const uint64_t>(bits, count));
+    return call_guest_tagged(guest_memory(), state, va, std::span<const uint64_t>(bits, count), tag);
 }
 
 uint64_t guest_method_address(GuestState& state, uint64_t iface_ptr, uint32_t slot) {

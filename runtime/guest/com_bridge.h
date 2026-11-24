@@ -128,6 +128,13 @@
 // double (xmm and the integer register, as Win64 does for both), GuestPtr<T> and raw uint64_t
 // guest addresses; host pointers are rejected at compile time.
 //
+// Exceptions and longjmp across host frames (R11, guest_exceptions.h): after every host -> guest
+// call the caller checks unwind_pending(state) (guest_runtime.h); while it is set the result is
+// meaningless and the caller abandons its work and returns. The thunks of this header take part:
+// when the host function they ran returns with an unwind pending they neither store a result nor
+// pop the return address, so lifted code continues the unwind. GuestFunction::call_top_level runs
+// a callback behind top_level_call_tag() (exceptions leaving it are unhandled).
+//
 // Threading: the registry, vtables and stub table are thread-safe; lookups take a shared lock.
 // Guest memory: every access goes through the bridge arena (VirtualMemoryArena read/write/
 // host_ptr); guest addresses are always 64-bit values, never truncated host pointers.
@@ -640,8 +647,12 @@ void diagnostic(const char* message);
 void log_bad_pointer(const char* what, uint64_t va);
 [[noreturn]] void fault_bad_stack(GuestState& state, uint64_t va);
 
+// Pops the thunk's return address (like `ret`), except while an unwind propagates: rsp then holds
+// the restored context's value and lifted code continues the unwind.
 inline void pop_return(GuestState& state) {
-    state.gpr[GuestReg::Rsp] += 8;
+    if (state.unwind_pending == 0) {
+        state.gpr[GuestReg::Rsp] += 8;
+    }
 }
 
 template <typename T>
@@ -845,7 +856,9 @@ void marshal_call(CallContext& ctx, unsigned first, Call&& fn, std::index_sequen
     } else {
         const uint64_t hidden = kReturnsViaHiddenPointer<R> ? ctx.int_arg(first - 1) : 0;
         const R result = fn(pass_arg<A>(ctx, std::get<I>(stored))...);
-        store_result<R>(ctx, result, hidden);
+        if (ctx.state.unwind_pending == 0) {  // an unwind keeps the restored registers
+            store_result<R>(ctx, result, hidden);
+        }
     }
 }
 
@@ -1063,7 +1076,8 @@ uint64_t call_guest_raw(GuestState& state,
                         uint64_t va,
                         const uint64_t* bits,
                         const bool* is_float,
-                        size_t count);
+                        size_t count,
+                        const void* tag = nullptr);
 
 template <typename R>
 R guest_result(GuestState& state, uint64_t rax) {
@@ -1084,15 +1098,20 @@ R guest_result(GuestState& state, uint64_t rax) {
 }
 
 template <typename R, typename... A>
-R call_guest_typed(GuestState& state, uint64_t va, const A&... args) {
+R call_guest_typed_tagged(GuestState& state, const void* tag, uint64_t va, const A&... args) {
     constexpr size_t n = sizeof...(A);
     uint64_t bits[n + 1] = {};
     bool is_float[n + 1] = {};
     size_t i = 0;
     ((bits[i] = guest_arg_bits(args, &is_float[i]), ++i), ...);
     (void)i;
-    const uint64_t rax = call_guest_raw(state, va, bits, is_float, n);
+    const uint64_t rax = call_guest_raw(state, va, bits, is_float, n, tag);
     return guest_result<R>(state, rax);
+}
+
+template <typename R, typename... A>
+R call_guest_typed(GuestState& state, uint64_t va, const A&... args) {
+    return call_guest_typed_tagged<R>(state, nullptr, va, args...);
 }
 }  // namespace detail
 
@@ -1112,6 +1131,12 @@ public:
     R call(GuestState& state, A... args) const {
         return detail::call_guest_typed<R>(state, va_, args...);
     }
+    // As a top-level callback (top_level_call_tag(), guest_runtime.h): an exception leaving the
+    // guest function is unhandled instead of reaching the guest frames of an enclosing call.
+    R call_top_level(GuestState& state, A... args) const {
+        return detail::call_guest_typed_tagged<R>(state, top_level_call_tag(), va_, args...);
+    }
+    R call_top_level(A... args) const { return call_top_level(current_guest_state(), args...); }
 
 private:
     uint64_t va_ = 0;
