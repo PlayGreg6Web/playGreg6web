@@ -1108,6 +1108,20 @@ void boot_unresolved_thunk(void* raw_state) {
         b.status = BootStatus::Fault;
         stop_boot();
     }
+    // Another guest thread during a boot: reported like any other off-thread fault (the hook
+    // writes the report and parks the thread), once.
+    if (b.running && b.off_thread_fault != nullptr && !b.off_thread_fault_taken.exchange(true)) {
+        capture_fault("unresolved_import", state, return_address, state->rip);
+        b.fault.import_index = index;
+        b.message = "call to unresolved import " +
+                    (index >= 0 ? import_label(b.imports[static_cast<size_t>(index)].import)
+                                : std::string("(unknown slot)")) +
+                    " on guest thread " + std::to_string(t_active != nullptr ? t_active->thread_id : 0);
+        b.status = BootStatus::Fault;
+        log_trap();
+        finish_report();
+        b.off_thread_fault();  // does not return
+    }
     // Not the boot thread (or no boot): behave like the generated logging thunk.
     char message[256];
     std::snprintf(message, sizeof(message), "[trap] UNRESOLVED_IMPORT %s called outside the boot thread",
