@@ -40,7 +40,7 @@ use iced_x86::{
 use crate::cfg::{BasicBlock, Edge, Terminator};
 
 /// Blocks of the backward-reachable subgraph examined for one merge (beyond: no result).
-pub(crate) const MAX_REACH_BLOCKS: usize = 512;
+pub(crate) const MAX_REACH_BLOCKS: usize = 4096;
 
 /// Input changes of one block after which still-changing intervals widen to unknown.
 const WIDEN_AFTER: u32 = 8;

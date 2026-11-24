@@ -3408,6 +3408,61 @@ mod tests {
     }
 
     #[test]
+    fn large_loop_switch_keeps_its_table_once_the_cases_are_discovered() {
+        // A dispatch loop (base in r14 before the loop, `cmp ecx, N-1; ja` guard at the merge)
+        // whose cases, once discovered, put more than 512 blocks behind the merge: every case
+        // branches and jumps back to the merge. The table must survive the final verification.
+        const CASES: usize = 200;
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut merge = a.create_label();
+            let mut done = a.create_label();
+            let mut cases: Vec<CodeLabel> = (0..CASES).map(|_| a.create_label()).collect();
+            lea_rip(a, Register::R14, DATA)?;
+            a.xor(eax, eax)?;
+            a.set_label(&mut merge)?;
+            a.test(edi, edi)?;
+            a.je(done)?;
+            a.dec(edi)?;
+            a.movzx(ecx, byte_ptr(rsi))?;
+            a.inc(rsi)?;
+            a.cmp(ecx, (CASES - 1) as u32)?;
+            a.ja(merge)?;
+            a.movsxd(rcx, dword_ptr(r14 + rcx * 4))?;
+            a.add(rcx, r14)?;
+            a.jmp(rcx)?;
+            for (i, case) in cases.iter_mut().enumerate() {
+                let mut skip = a.create_label();
+                a.set_label(case)?;
+                a.test(edx, edx)?;
+                a.je(skip)?;
+                a.add(eax, i as u32)?;
+                a.set_label(&mut skip)?;
+                a.inc(eax)?;
+                a.jmp(merge)?;
+            }
+            a.set_label(&mut done)?;
+            a.ret()?;
+            labels.extend(cases.iter().copied());
+            Ok(())
+        });
+        let jmp_va = find_indirect_jmp(&code);
+        let analysis = analyze(
+            &code,
+            &signed_table(&ips),
+            &[0],
+            &[(0, code.len() as u32, 0)],
+        );
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("table kept after the cases join the loop");
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets, ips);
+        let blocks = analysis.functions[&TEXT].blocks.len();
+        assert!(blocks > 512, "{blocks} blocks");
+    }
+
+    #[test]
     fn unresolved_jumps_are_classified() {
         // Three functions: `jmp [rcx+8]`, `mov rax, [rcx]; jmp rax`, and `jmp rcx`.
         let (code, ips) = assemble_labeled(|a, labels| {
