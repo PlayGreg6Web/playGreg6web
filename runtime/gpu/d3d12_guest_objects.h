@@ -69,6 +69,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_guest_structs.h"
+#include "gpu/d3d12_xs_dump.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/pso_cache.h"
@@ -516,6 +517,8 @@ struct DeviceOptions {
     // layouts and shader signatures the WebGPU side needs. Off: a native pipeline state is
     // created (unresolved; its draws are skipped). Boot harness: --native-pipelines turns it off.
     bool refuse_native_pipelines = true;
+    // Pipeline dump directory (d3d12_xs_dump.h); empty: no dump.
+    std::string dump_dir;
 };
 
 struct DeviceStats {
@@ -672,10 +675,16 @@ public:
     // Reads a stage's code and metadata (false: unreadable, diagnosed). With `index`, the stage is
     // also indexed by the 16-byte values at its metadata's digest positions (d3d12_xs_xbox.h,
     // "Native pipelines and their DXIL") so find_native_stage can join a DXIL container to it.
-    bool read_native_stage(const xbox::NativeStage& stage, bool index, NativeStageRecord* out);
+    // `pixel` / `layout_b` only label the stage in the pipeline dump.
+    bool read_native_stage(const xbox::NativeStage& stage, bool index, NativeStageRecord* out, bool pixel = false,
+                           bool layout_b = false);
     // The indexed native stage whose metadata carries `digest` (a DXIL container's HASH digest).
     bool find_native_stage(const DxilDigest& digest, NativeStageRecord* out) const;
     size_t native_index_size() const;
+    // Pipeline dump (DeviceOptions::dump_dir), null when off. flush_pipeline_dump rewrites the
+    // manifest (also done every 60 presents and when the device is destroyed).
+    PipelineDump* pipeline_dump() const { return dump_.get(); }
+    void flush_pipeline_dump();
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
     void note_shader_size(uint64_t identity, uint64_t bytes, int kind = -1);
@@ -777,6 +786,8 @@ private:
     };
     std::unordered_map<DxilDigest, NativeStageRecord, DigestHash> native_by_digest_;  // under shader_mutex_
     std::unordered_set<uint64_t> indexed_native_;                                     // under shader_mutex_
+    std::unique_ptr<PipelineDump> dump_;
+    std::atomic<uint64_t> dump_presents_{0};
     struct ShaderFacts {
         uint64_t bytes = 0;
         int kind = -1;

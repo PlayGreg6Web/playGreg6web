@@ -235,9 +235,23 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     alias_listener_ = os::xmem_windows::add_alias_listener([this](const os::xmem_windows::AliasPair& p) {
         register_gpu_alias(p.gpu_base, p.cpu_base, p.size);
     });
+    if (!options_.dump_dir.empty()) {
+        dump_ = std::make_unique<PipelineDump>(options_.dump_dir);
+        if (!dump_->ok()) {
+            os::log("d3d12_xs: cannot create the pipeline dump directory " + options_.dump_dir);
+            dump_.reset();
+        }
+    }
+}
+
+void Device::flush_pipeline_dump() {
+    if (dump_) {
+        dump_->write_manifest();
+    }
 }
 
 Device::~Device() {
+    flush_pipeline_dump();
     os::xmem_windows::remove_alias_listener(alias_listener_);
     pacer_.shutdown();
 }
@@ -281,6 +295,9 @@ void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& 
 }
 
 void Device::present() {
+    if (dump_ && dump_presents_.fetch_add(1) % 60 == 59) {
+        dump_->write_manifest();
+    }
     CommandEncoder enc;
     enc.present();
     std::lock_guard<std::mutex> lock(submit_mutex_);

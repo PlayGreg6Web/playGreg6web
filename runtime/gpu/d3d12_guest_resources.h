@@ -159,6 +159,7 @@ struct GraphicsPsoSource {
     bool rect_list = false;  // Xbox rectangle topology type (desc says Triangle; d3d12_xs_xbox.h)
     // The console-native stages the DXIL vertex / pixel shader joins to (identity 0: not joined).
     Device::NativeStageRecord native_vs, native_ps;
+    Device::DxilDigest vs_digest{}, ps_digest{};  // HASH digests of the DXIL containers (zero: none)
 
     GraphicsPsoSource() = default;
     GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }
@@ -205,6 +206,9 @@ public:
         uint64_t pixel_code_identity = 0;
     };
     const Native* native() const { return native_.get(); }
+    // Index of this pipeline in the pipeline dump, kNoDumpIndex when not dumped.
+    static constexpr uint32_t kNoDumpIndex = 0xFFFFFFFFu;
+    uint32_t dump_index() const { return dump_index_; }
 
 private:
     friend class Device;
@@ -213,6 +217,7 @@ private:
     std::unique_ptr<bridge::ComputePipelineState> compute_;
     std::unique_ptr<GraphicsPsoSource> source_;
     std::unique_ptr<Native> native_;
+    uint32_t dump_index_ = kNoDumpIndex;
     std::vector<uint64_t> identities_;
     std::string unsupported_;
     bool resolved_ = false;
@@ -353,6 +358,7 @@ private:
     const d3d::RootSignature* graphics_root_signature_ = nullptr;
     bool rect_list_ = false;  // IASetPrimitiveTopology(xbox::kTopologyRectList)
     bool skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances);
+    void note_draw_for_dump();
     void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
     void describe_dropped_draw(const char* call, uint32_t count, uint32_t instances);
     struct ImmediateWrite {

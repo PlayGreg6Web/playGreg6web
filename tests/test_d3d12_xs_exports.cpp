@@ -6,8 +6,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2249,6 +2253,113 @@ void test_xbox_native_dxil_join() {
     scene.release_all({list, pso, pso2});
 }
 
+std::string read_text_file(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+std::string id_hex(uint64_t v) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "0x%016llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
+// G37: pipeline dump (d3d12_xs_dump.h) from synthetic stages, containers and draws.
+void test_xbox_pipeline_dump() {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("pg6-dump-test-" + std::to_string(std::rand()));
+    std::filesystem::remove_all(dir);
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.dump_dir = dir.string();
+        dx::set_device_options(options);
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->pipeline_dump() != nullptr);
+        int32_t result = -1;
+        namespace xb = dg::xbox;
+        using R = xb::NativeRange;
+
+        std::array<uint8_t, 16> vs_digest{}, ps_digest{};
+        for (int i = 0; i < 16; ++i) {
+            vs_digest[i] = static_cast<uint8_t>(0x21 + i);
+            ps_digest[i] = static_cast<uint8_t>(0x61 + i);
+        }
+        std::vector<uint8_t> vs_meta = byte_pattern(0x80, 7), ps_meta = byte_pattern(0x80, 8);
+        std::memcpy(vs_meta.data() + xb::kNativeDigestFirst, vs_digest.data(), 16);
+        std::memcpy(ps_meta.data() + xb::kNativeDigestFirst, ps_digest.data(), 16);
+        const std::vector<uint8_t> header = byte_pattern(0x184, 1), meta = byte_pattern(0x50, 2);
+        const std::vector<uint8_t> vs_code = byte_pattern(0x100, 3), ps_code = byte_pattern(0x200, 5);
+        xb::GuestNativePipelineDesc d{};
+        d.pRootSignature = scene.rs;
+        auto set = [&](R r, const std::vector<uint8_t>& bytes, bool aligned) {
+            d.ranges[static_cast<size_t>(r)] = {aligned ? put_aligned(bytes, 256) : put_bytes(bytes.data(), bytes.size()),
+                                                bytes.size()};
+        };
+        set(R::Header, header, false);
+        set(R::PipelineMetadata, meta, false);
+        set(R::PixelCode, ps_code, true);
+        set(R::PixelMetadata, ps_meta, false);
+        set(R::VertexCode, vs_code, true);
+        set(R::VertexMetadata, vs_meta, false);
+        CHECK(fx.create(scene.device, XSlot::CreateNativePso, {I(put(d))}, dg::IID_ID3D12PipelineState, &result) == 0);
+
+        scene.vs_bytes = container_with_hash(vs_digest);
+        scene.ps_bytes = container_with_hash(ps_digest);
+        const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+        const uint64_t stream = put(xb::GuestPipelineStateStreamDesc{bytes.size(), put_bytes(bytes.data(), bytes.size())});
+        const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream)}, dg::IID_ID3D12PipelineState, &result);
+        const uint64_t pso_again = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream)}, dg::IID_ID3D12PipelineState, &result);
+        const uint32_t index = pso != 0 ? object_of<dg::PipelineState>(pso)->dump_index() : dg::PipelineState::kNoDumpIndex;
+        CHECK(index != dg::PipelineState::kNoDumpIndex && pso_again != 0 &&
+              object_of<dg::PipelineState>(pso_again)->dump_index() == index);
+        const uint64_t list = scene.new_list();
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+        staged_set_pipeline_state(fx, fx.thread, list, pso);
+        fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+        fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        dev->flush_pipeline_dump();
+
+        // Files are named by the FNV-1a 64 of their bytes; the manifest lists them.
+        const uint64_t vs_code_id = dg::shader_identity(vs_code.data(), vs_code.size());
+        const uint64_t ps_code_id = dg::shader_identity(ps_code.data(), ps_code.size());
+        const std::string vs_bin = read_text_file(dir / "native" / (id_hex(vs_code_id) + ".bin"));
+        CHECK(vs_bin.size() == vs_code.size() && std::memcmp(vs_bin.data(), vs_code.data(), vs_code.size()) == 0);
+        CHECK(read_text_file(dir / "native" / (id_hex(ps_code_id) + ".meta")).size() == ps_meta.size());
+        const uint64_t vs_dxil = dg::shader_identity(scene.vs_bytes.data(), scene.vs_bytes.size());
+        const std::string dxbc = read_text_file(dir / "dxil" / (id_hex(vs_dxil) + ".dxbc"));
+        CHECK(dg::shader_identity(dxbc.data(), dxbc.size()) == vs_dxil);
+        const std::string m = read_text_file(dir / "manifest.json");
+        auto has = [&](const std::string& s) {
+            const bool found = m.find(s) != std::string::npos;
+            if (!found) {
+                std::fprintf(stderr, "manifest lacks: %s\n", s.c_str());
+            }
+            return found;
+        };
+        CHECK(has("\"schema\": \"playgta6-pipeline-dump\", \"schema_version\": 1"));
+        CHECK(has("{\"code_identity\": \"" + id_hex(vs_code_id) + "\", \"identity\": \"" +
+                  id_hex(dg::native_stage_identity(vs_code.data(), vs_code.size(), vs_meta.data(), vs_meta.size())) +
+                  "\", \"stage\": \"vertex\", \"layout\": \"A\", \"code_bytes\": 256, \"metadata_bytes\": 128"));
+        CHECK(has("\"stage\": \"pixel\""));
+        CHECK(has("\"vs\": {\"dxil_identity\": \"" + id_hex(vs_dxil) + "\", \"hash_digest\": \"2122232425262728292a2b2c2d2e2f30\", "
+                  "\"native_code_identity\": \"" + id_hex(vs_code_id) + "\""));
+        CHECK(has("{\"index\": " + std::to_string(index) + ", \"created\": 2, \"draws\": 2, "));
+        CHECK(has("\"rtv_formats\": [87]"));
+        CHECK(has("\"input_layout\": [{\"semantic\": \"POSITION\", \"index\": 0, \"format\": 6"));
+        CHECK(has("\"rasterizer\": {\"fill\": 3, \"cull\": 3"));
+        CHECK(has("\"root_signatures\": [\n {\"index\": 0, \"version\": \"1.1\""));
+        CHECK(has("\"root_signature\": 0"));
+
+        scene.release_all({list, pso, pso_again});
+    }
+    std::filesystem::remove_all(dir);
+}
+
 // G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
 void test_xbox_rect_lists() {
     Fixture fx;
@@ -2675,6 +2786,7 @@ int main() {
     test_xbox_native_pipelines();
     test_xbox_rect_lists();
     test_xbox_native_dxil_join();
+    test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();
     if (g_failures != 0) {

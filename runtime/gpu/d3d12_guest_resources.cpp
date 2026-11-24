@@ -1065,8 +1065,14 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
     }
     *identity = shader_identity(bytes.data(), bytes.size());
     dev.note_shader_size(*identity, bytes.size(), dxil_shader_kind(bytes.data(), bytes.size()));
-    if (digest != nullptr && !dxil_hash_digest(bytes.data(), bytes.size(), digest)) {
-        digest->fill(0);
+    Device::DxilDigest d{};
+    const bool has_digest = dxil_hash_digest(bytes.data(), bytes.size(), &d);
+    if (digest != nullptr) {
+        *digest = has_digest ? d : Device::DxilDigest{};
+    }
+    if (PipelineDump* dump = dev.pipeline_dump()) {
+        dump->dxil(*identity, has_digest ? &d : nullptr, dxil_shader_kind(bytes.data(), bytes.size()), bytes.data(),
+                   bytes.size());
     }
     return true;
 }
@@ -1089,6 +1095,8 @@ GraphicsPsoSource& GraphicsPsoSource::operator=(const GraphicsPsoSource& other) 
         root_signature = other.root_signature;
         rect_list = other.rect_list;
         native_vs = other.native_vs;
+        vs_digest = other.vs_digest;
+        ps_digest = other.ps_digest;
         native_ps = other.native_ps;
         fix_pointers();
     }
@@ -1177,8 +1185,7 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
         return kEInvalidArg;
     }
     pso::D3D12GraphicsPsoDesc& d = src.desc;
-    DxilDigest vs_digest{}, ps_digest{};
-    if (!read_shader(*this, g.VS, "VS", &d.vs, &vs_digest) || !read_shader(*this, g.PS, "PS", &d.ps, &ps_digest) ||
+    if (!read_shader(*this, g.VS, "VS", &d.vs, &src.vs_digest) || !read_shader(*this, g.PS, "PS", &d.ps, &src.ps_digest) ||
         !read_shader(*this, g.DS, "DS", &d.ds) || !read_shader(*this, g.HS, "HS", &d.hs) ||
         !read_shader(*this, g.GS, "GS", &d.gs)) {
         return kEInvalidArg;
@@ -1204,7 +1211,7 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
     // indexed by slot 57 with refuse_native_pipelines; d3d12_xs_xbox.h).
     if (native_index_size() != 0) {
         static const DxilDigest kZero{};
-        for (auto [digest, record] : {std::pair{&vs_digest, &src.native_vs}, std::pair{&ps_digest, &src.native_ps}}) {
+        for (auto [digest, record] : {std::pair{&src.vs_digest, &src.native_vs}, std::pair{&src.ps_digest, &src.native_ps}}) {
             if (*digest == kZero) {
                 continue;
             }
@@ -1281,6 +1288,10 @@ HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& r
             note_unresolved_shader(d.ps, ShaderStage::Pixel);
         }
     }
+    if (dump_) {
+        state->dump_index_ = dump_->pipeline(*src, src->vs_digest, src->ps_digest, rs.get(),
+                                             rs ? &rs->signature().desc() : nullptr);
+    }
     state->source_ = std::move(src);
     return hand_out(std::move(state), riid, out);
 }
@@ -1297,7 +1308,8 @@ HResult Device::create_placeholder_pso(const std::string& reason, const Guid& ri
     return hand_out(std::move(state), riid, out);
 }
 
-bool Device::read_native_stage(const xbox::NativeStage& s, bool index, NativeStageRecord* out) {
+bool Device::read_native_stage(const xbox::NativeStage& s, bool index, NativeStageRecord* out, bool pixel,
+                               bool layout_b) {
     *out = NativeStageRecord{};
     if (!s.present()) {
         return true;
@@ -1314,6 +1326,10 @@ bool Device::read_native_stage(const xbox::NativeStage& s, bool index, NativeSta
     out->code_bytes = static_cast<uint32_t>(code.size());
     out->metadata_bytes = static_cast<uint32_t>(meta.size());
     note_shader_size(out->identity, code.size());
+    if (dump_) {
+        dump_->native_stage(out->code_identity, out->identity, pixel, layout_b, code.data(), code.size(), meta.data(),
+                            meta.size());
+    }
     if (!index) {
         return true;
     }
@@ -1361,7 +1377,8 @@ HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Gu
         return kEInvalidArg;
     }
     NativeStageRecord vs, ps;
-    if (!read_native_stage(pipeline.vertex, false, &vs) || !read_native_stage(pipeline.pixel, false, &ps)) {
+    if (!read_native_stage(pipeline.vertex, false, &vs, false, pipeline.vertex_alt) ||
+        !read_native_stage(pipeline.pixel, false, &ps, true, pipeline.vertex_alt)) {
         return kEInvalidArg;
     }
     native->vertex_identity = vs.identity;

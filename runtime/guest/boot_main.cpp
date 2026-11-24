@@ -148,6 +148,7 @@ struct Options {
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
+    std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -165,7 +166,7 @@ void usage() {
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
                  "                     [--no-entry] [--quiet]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
-                 "                     [--native-pipelines]\n");
+                 "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -203,13 +204,14 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
-                   a == "--gpu-capture" || a == "--sandbox-id") {
+                   a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines") {
             if (!value(v)) {
                 return false;
             }
             std::string& target = a == "--pgim"       ? o.pgim
                                   : a == "--gpu-capture" ? o.gpu_capture
                                   : a == "--sandbox-id" ? o.sandbox_id
+                                  : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
                                   : a == "--game-dir" ? o.game_dir
@@ -407,6 +409,12 @@ void write_outputs(bool print_summary) {
         gpu::frame_capture_finish();
         std::fprintf(stderr, "[harness] GPU capture: %u frame(s) written to %s\n", gpu::frame_capture_frames(),
                      g_options.gpu_capture.c_str());
+    }
+    if (!g_options.dump_pipelines.empty()) {
+        if (auto device = gpu::d3d12_xs_exports::current_device()) {
+            device->flush_pipeline_dump();
+        }
+        std::fprintf(stderr, "[harness] pipeline dump written to %s\n", g_options.dump_pipelines.c_str());
     }
     const std::string report = guest::last_report_json();
     const std::string summary = guest::last_summary();
@@ -685,9 +693,23 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
-    if (g_options.native_pipelines) {
+    if (g_options.native_pipelines || !g_options.dump_pipelines.empty()) {
         gpu::d3d12_guest::DeviceOptions device_options;
-        device_options.refuse_native_pipelines = false;
+        device_options.refuse_native_pipelines = !g_options.native_pipelines;
+        if (!g_options.dump_pipelines.empty()) {
+            // The dump is derived from the title: only under a `work` directory (gitignored).
+            std::error_code ec;
+            const std::filesystem::path dir = std::filesystem::absolute(g_options.dump_pipelines, ec);
+            bool under_work = false;
+            for (const auto& part : dir) {
+                under_work = under_work || part == "work";
+            }
+            if (ec || !under_work) {
+                std::fprintf(stderr, "[harness] --dump-pipelines must name a directory under a `work` directory\n");
+                return kExitUsage;
+            }
+            device_options.dump_dir = dir.string();
+        }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
     }
     if (!g_options.gpu_capture.empty()) {

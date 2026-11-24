@@ -506,6 +506,7 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
     if (!usable()) {
         return;
     }
+    note_draw_for_dump();
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
         describe_skipped_draw("DrawInstanced", vertices, instances, "pipeline state without shader modules");
@@ -518,6 +519,14 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
     bridge_.DrawInstanced(vertices, instances, start_vertex, start_instance);
     if (bridge_.stats().draws_skipped != dropped) {
         describe_dropped_draw("DrawInstanced", vertices, instances);
+    }
+}
+
+void CommandList::note_draw_for_dump() {
+    if (graphics_pso_ != nullptr && graphics_pso_->dump_index() != PipelineState::kNoDumpIndex) {
+        if (PipelineDump* dump = device_->pipeline_dump()) {
+            dump->draw(graphics_pso_->dump_index());
+        }
     }
 }
 
@@ -538,6 +547,7 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
     if (!usable()) {
         return;
     }
+    note_draw_for_dump();
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
         describe_skipped_draw("DrawIndexedInstanced", indices, instances, "pipeline state without shader modules");
