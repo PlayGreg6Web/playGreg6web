@@ -1208,24 +1208,31 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
+                // A reflected stage (G62) gives the binding's minimum size: the home covers it.
+                const uint64_t home = std::max<uint64_t>(e.size, layout.min_binding_size);
                 if (base != 0 && e.size != 0 && device_.options().relocate_uniform &&
-                    device_.options().relocate_uniform(base + e.offset, e.size, &id, &offset)) {
+                    device_.options().relocate_uniform(base + e.offset, home, &id, &offset)) {
                     out.resource_id = id;
                     out.offset = offset;
                     // The relocated home is a whole multiple of 256 bytes (zero past the view).
-                    out.size = align_up(e.size, kUniformOffsetAlignment);
+                    out.size = align_up(home, kUniformOffsetAlignment);
                 } else {
                     diagnostics_ |= BridgeDiag::UnalignedUniform;
                 }
-            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
-                       layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) && e.size != 0 &&
-                       e.size % kUniformOffsetAlignment != 0) {
-                // Xbox constant-buffer views are 16-byte multiples; shaders may declare the 256-byte
-                // minimum of PC D3D12. Bind up to that much when the buffer has the room.
+            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && e.size != 0 &&
+                       (layout.min_binding_size != 0
+                            ? layout.min_binding_size > e.size
+                            : layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
+                                  e.size % kUniformOffsetAlignment != 0)) {
+                // Xbox constant-buffer views are 16-byte multiples. Bind up to what the stage reads:
+                // its reflected minimum (G62), else the 256-byte minimum of PC D3D12, when the
+                // buffer has the room.
+                const uint64_t target = layout.min_binding_size != 0 ? layout.min_binding_size
+                                                                     : align_up(e.size, kUniformOffsetAlignment);
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 d3d::GpuVaResolution res;
                 if (base != 0 && device_.resolve_gpu_va(base + e.offset, &res)) {
-                    out.size = std::min<uint64_t>(align_up(e.size, kUniformOffsetAlignment), res.resource_size - res.offset);
+                    out.size = std::min<uint64_t>(target, res.resource_size - res.offset);
                 }
             }
             break;

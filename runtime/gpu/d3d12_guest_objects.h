@@ -64,6 +64,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,6 +77,7 @@
 #include "gpu/descriptor_heap.h"
 #include "gpu/pso_cache.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/stage_reflection.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
 
@@ -566,6 +568,12 @@ struct DeviceOptions {
     // --shader-pack). Graphics pipelines whose stages all have a key are resolved: see
     // Device::resolve_with_pack. Null: no pack, every pipeline stays unresolved.
     std::shared_ptr<const ShaderPackIndex> shader_pack;
+    // Reflection of the pack's stages (gpu/stage_reflection.h; boot harness: <pack>.reflect.json).
+    // Pack-resolved pipelines whose stages all have an entry get their vertex attributes and
+    // pipeline layout from it (join_vertex_inputs / join_pipeline_layout); a pipeline that cannot be
+    // joined stays unresolved (its draws are skipped), with one report per pipeline. Stages without
+    // an entry keep layout_from_root_signature and element i -> @location(i).
+    std::shared_ptr<const StageReflectionIndex> stage_reflection;
     // Optional detiling hook for tiled console layouts (layout >= 0x101).
     DetileFn detile_texture;
 };
@@ -765,7 +773,9 @@ public:
     // numbered from 0 in root-parameter order: table ranges descriptor by descriptor, root
     // descriptors and root constants one each, then static samplers). Returns the keys used
     // (0 = stage absent); false when a stage has no key.
-    bool resolve_with_pack(const GraphicsPsoSource& source, uint64_t* vs_key, uint64_t* ps_key);
+    bool resolve_with_pack(GraphicsPsoSource& source, uint64_t* vs_key, uint64_t* ps_key);
+    // Reflection join failures reported so far (once per pipeline: stage keys + root signature).
+    size_t reflection_join_failures() const;
     void flush_pipeline_dump();
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
@@ -956,9 +966,10 @@ private:
     std::map<std::pair<uint64_t, uint64_t>, RelocatedIa> ia_relocations_;  // (base GPU VA, size)
     uint64_t ia_relocation_bytes_ = 0;
     uint64_t ia_relocation_seq_ = 0;
-    std::mutex pack_mutex_;
+    mutable std::mutex pack_mutex_;
     std::unordered_map<uint64_t, uint32_t> pack_modules_;                 // pack key -> module id
     std::set<std::pair<uint64_t, uint64_t>> pack_layouts_;                // (vs, ps) identities
+    std::set<std::tuple<uint64_t, uint64_t, uint64_t>> reflection_failures_;  // (vs key, ps key, root signature)
     uint32_t relocation_buffer_ = 0;  // current GPU buffer id (CreateBuffer packet only, no COM object)
     uint64_t relocation_used_ = 0;    // bytes used in relocation_buffer_
     std::atomic<uint64_t> dump_presents_{0};

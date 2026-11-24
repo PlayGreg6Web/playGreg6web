@@ -870,6 +870,18 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "[harness] shader pack %s: %zu key(s)\n", g_options.shader_pack.c_str(), index->size());
             device_options.shader_pack = std::move(index);
+            // Stage reflection sidecar (G62): <pack>.reflect.json next to the pack, when present.
+            const std::string sidecar = g_options.shader_pack + ".reflect.json";
+            if (std::ifstream rin(sidecar, std::ios::binary); rin) {
+                const std::string json((std::istreambuf_iterator<char>(rin)), std::istreambuf_iterator<char>());
+                auto reflection = std::make_shared<gpu::StageReflectionIndex>();
+                if (!gpu::parse_stage_reflection_json(json, reflection.get(), &error)) {
+                    std::fprintf(stderr, "[harness] %s: %s\n", sidecar.c_str(), error.c_str());
+                    return kExitUsage;
+                }
+                std::fprintf(stderr, "[harness] stage reflection %s: %zu stage(s)\n", sidecar.c_str(), reflection->size());
+                device_options.stage_reflection = std::move(reflection);
+            }
         }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
     }

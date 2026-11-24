@@ -373,6 +373,17 @@ struct VertexInputSignatureElement {
     uint32_t location = 0;
 };
 
+enum class WgpuVertexFormat : uint8_t;
+
+// A vertex attribute fixed by the vertex stage's reflection (G62, gpu/stage_reflection.h): the
+// attribute reads `format` at `offset` in vertex buffer `slot` into @location(location).
+struct VertexInputFetch {
+    uint32_t slot = 0;
+    uint32_t offset = 0;
+    uint32_t location = 0;
+    WgpuVertexFormat format{};  // WgpuVertexFormat::Undefined
+};
+
 // D3D12_GRAPHICS_PIPELINE_STATE_DESC (or the equivalent pipeline-state stream), with shader bytecode
 // replaced by opaque 64-bit shader identities (WGSL module id or content hash; 0 = no shader) and the
 // root signature replaced by an opaque id from the descriptor-heap/root-signature layer.
@@ -389,6 +400,11 @@ struct D3D12GraphicsPsoDesc {
     // Optional VS input signature. When absent, input element i is bound to @location(i).
     const VertexInputSignatureElement* vs_input_signature = nullptr;
     uint32_t vs_input_signature_count = 0;
+    // Optional attributes from the vertex stage's reflection (G62). When present they replace the
+    // element -> location mapping: the input elements still give each slot's classification and
+    // tight stride, and elements no fetch reads are dropped.
+    const VertexInputFetch* vs_input_fetches = nullptr;
+    uint32_t vs_input_fetch_count = 0;
     // Bit i set = the pixel shader writes SV_Target i. Targets the PS does not write get writeMask 0,
     // which WebGPU requires. Default assumes every declared target is written.
     uint32_t ps_output_mask = 0xFFu;

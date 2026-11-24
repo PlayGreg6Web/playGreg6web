@@ -26,6 +26,7 @@
 #include "gpu/gfx10_descriptors.h"
 #include "gpu/gfx10_detile.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/stage_reflection.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
 #include "os/shim_exports.h"
@@ -2863,6 +2864,100 @@ void test_xbox_shader_pack_resolution() {
     scene.release_all({list, pso, pso2, pso3});
 }
 
+// G62: pack-resolved stages with reflection get their vertex attributes and pipeline layout from
+// it; a pipeline whose reflection cannot be joined stays unresolved, reported once.
+void test_stage_reflection_join() {
+    std::array<uint8_t, 16> d1{}, d2{}, d3{};
+    for (int i = 0; i < 16; ++i) {
+        d1[i] = static_cast<uint8_t>(0x11 + i);
+        d2[i] = static_cast<uint8_t>(0x51 + i);
+        d3[i] = static_cast<uint8_t>(0xa1 + i);
+    }
+    const std::vector<uint8_t> vs_good = container_with_hash(d1), ps = container_with_hash(d2);
+    const std::vector<uint8_t> vs_bad = container_with_hash(d3);
+    const uint64_t vs_good_key = dg::shader_identity(vs_good.data(), vs_good.size());
+    const uint64_t vs_bad_key = dg::shader_identity(vs_bad.data(), vs_bad.size());
+    const uint64_t ps_key = dg::shader_identity(ps.data(), ps.size());
+    auto index = std::make_shared<playgta6::gpu::ShaderPackIndex>();
+    std::string error;
+    const std::vector<uint8_t> pack = wgpk({{vs_good_key, 1}, {vs_bad_key, 1}, {ps_key, 2}});
+    CHECK(playgta6::gpu::parse_shader_pack_index(pack.data(), pack.size(), index.get(), &error));
+    // The good vertex stage reads 2 floats inside POSITION (R32G32B32_FLOAT at offset 0) at
+    // @location(3); the bad one reads past the element. Neither stage binds anything (the scene's
+    // root signature is empty).
+    const std::string json = "{\"schema\": \"playgta6-stage-reflection\", \"version\": 1, \"stages\": {\"" +
+                             playgta6::gpu::pack_key_code(vs_good_key) +
+                             "\": {\"stage\": \"vertex\", \"vertex_inputs\": [{\"location\": 3, \"vb_slot\": 0, "
+                             "\"byte_offset\": 4, \"components\": 2, \"component_type\": \"f32\", "
+                             "\"fetch_format\": \"float32x2\"}]}, \"" +
+                             playgta6::gpu::pack_key_code(vs_bad_key) +
+                             "\": {\"stage\": \"vertex\", \"vertex_inputs\": [{\"location\": 0, \"vb_slot\": 0, "
+                             "\"byte_offset\": 40, \"components\": 2, \"component_type\": \"f32\"}]}, \"" +
+                             playgta6::gpu::pack_key_code(ps_key) + "\": {\"stage\": \"fragment\", \"bindings\": []}}}";
+    auto reflection = std::make_shared<playgta6::gpu::StageReflectionIndex>();
+    CHECK(playgta6::gpu::parse_stage_reflection_json(json, reflection.get(), &error));
+
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.shader_pack = index;
+    options.stage_reflection = reflection;
+    dx::set_device_options(options);
+    Scene scene(fx, /*register_shaders=*/false);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    auto create = [&](const std::vector<uint8_t>& vs_bytes) {
+        scene.vs_bytes = vs_bytes;
+        scene.ps_bytes = ps;
+        const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+        return fx.create(scene.device, XSlot::CreatePsoStream,
+                         {I(put(dg::xbox::GuestPipelineStateStreamDesc{bytes.size(), put_bytes(bytes.data(), bytes.size())}))},
+                         dg::IID_ID3D12PipelineState, &result);
+    };
+    const uint64_t pso = create(vs_good);
+    CHECK(result == 0 && pso != 0);
+    auto* state = object_of<dg::PipelineState>(pso);
+    CHECK(state->resolved() && state->graphics_source()->reflected &&
+          state->graphics_source()->desc.vs_input_fetch_count == 1);
+    CHECK(dev->reflection_join_failures() == 0);
+
+    const uint64_t bad = create(vs_bad);
+    CHECK(result == 0 && bad != 0 && !object_of<dg::PipelineState>(bad)->resolved());
+    CHECK(dev->reflection_join_failures() == 1);
+    const uint64_t bad2 = create(vs_bad);  // reported once per pipeline
+    CHECK(result == 0 && !object_of<dg::PipelineState>(bad2)->resolved() && dev->reflection_join_failures() == 1);
+
+    // The draw's pipeline takes the reflected attribute.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 32, 32, 0, 1}))});
+    fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 32, 32}))});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto packets = packets_since(fx, mark);
+    CHECK(count_op(packets, GpuOpcode::Draw) == 1);
+    const Packet* pipe = find_op(packets, GpuOpcode::CreateRenderPipeline2);
+    CHECK(pipe != nullptr);
+    if (pipe != nullptr) {
+        const auto key = payload_as<GpuCreateRenderPipeline2Payload>(*pipe).key;
+        CHECK(key.vertex_attribute_count == 1 && key.vertex_attributes[0].shader_location == 3 &&
+              key.vertex_attributes[0].offset == 4 &&
+              key.vertex_attributes[0].format ==
+                  static_cast<uint8_t>(playgta6::gpu::pso::WgpuVertexFormat::Float32x2) &&
+              key.vertex_buffers[0].array_stride == 12);
+    }
+    CHECK(dev->stats().skipped_draws == 0);
+    CHECK(t_balanced);
+    scene.release_all({list, pso, bad, bad2});
+}
+
 // G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
 void test_xbox_rect_lists() {
     Fixture fx;
@@ -4998,6 +5093,7 @@ int main() {
     test_xbox_native_dxil_join();
     test_xbox_unaligned_constant_buffers();
     test_xbox_shader_pack_resolution();
+    test_stage_reflection_join();
     test_uav_texture_storage_usage();
     test_descriptor_words_in_memory();
     test_tables_from_descriptor_memory();

@@ -186,6 +186,8 @@ struct GraphicsPsoSource {
     Device::NativeStageRecord native_vs, native_ps;
     Device::DxilDigest vs_digest{}, ps_digest{};  // HASH digests of the DXIL containers (zero: none)
     uint64_t pack_vs_key = 0, pack_ps_key = 0;   // shader pack keys the stages resolved with (0: none)
+    std::vector<pso::VertexInputFetch> vs_fetches;  // reflected vertex attributes (G62; empty: none)
+    bool reflected = false;                         // the vertex state comes from vs_fetches
 
     GraphicsPsoSource() = default;
     GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }

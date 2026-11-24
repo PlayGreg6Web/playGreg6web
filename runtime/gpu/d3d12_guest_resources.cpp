@@ -1970,6 +1970,8 @@ GraphicsPsoSource& GraphicsPsoSource::operator=(const GraphicsPsoSource& other) 
         native_vs = other.native_vs;
         pack_vs_key = other.pack_vs_key;
         pack_ps_key = other.pack_ps_key;
+        vs_fetches = other.vs_fetches;
+        reflected = other.reflected;
         vs_digest = other.vs_digest;
         ps_digest = other.ps_digest;
         native_ps = other.native_ps;
@@ -1984,6 +1986,8 @@ void GraphicsPsoSource::fix_pointers() {
     }
     desc.pInputElementDescs = input.empty() ? nullptr : input.data();
     desc.NumInputElements = static_cast<uint32_t>(input.size());
+    desc.vs_input_fetches = reflected ? vs_fetches.data() : nullptr;
+    desc.vs_input_fetch_count = reflected ? static_cast<uint32_t>(vs_fetches.size()) : 0u;
 }
 
 void convert_blend_desc(const GuestBlendDesc& g, pso::D3D12BlendDesc* out) {
@@ -2242,8 +2246,16 @@ bridge::PipelineLayoutDesc layout_from_root_signature(const d3d::RootSignatureDe
     return layout;
 }
 
-bool Device::resolve_with_pack(const GraphicsPsoSource& src, uint64_t* vs_key, uint64_t* ps_key) {
+size_t Device::reflection_join_failures() const {
+    std::lock_guard<std::mutex> lock(pack_mutex_);
+    return reflection_failures_.size();
+}
+
+bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_t* ps_key) {
     *vs_key = *ps_key = 0;
+    src.reflected = false;
+    src.vs_fetches.clear();
+    src.fix_pointers();
     const ShaderPackIndex* index = options_.shader_pack.get();
     const pso::D3D12GraphicsPsoDesc& d = src.desc;
     if (index == nullptr || d.vs == 0 || d.ds != 0 || d.hs != 0 || d.gs != 0) {
@@ -2264,6 +2276,54 @@ bool Device::resolve_with_pack(const GraphicsPsoSource& src, uint64_t* vs_key, u
         *vs_key = *ps_key = 0;
         return false;
     }
+    // Reflection join (G62): when every stage has reflection, the vertex attributes and the
+    // pipeline layout come from it; a pipeline that cannot be joined is not resolved.
+    const StageReflectionIndex* refl = options_.stage_reflection.get();
+    const StageReflection* vs_refl = nullptr;
+    const StageReflection* ps_refl = nullptr;
+    if (refl != nullptr) {
+        auto vit = refl->find(*vs_key);
+        auto pit = d.ps != 0 ? refl->find(*ps_key) : refl->end();
+        vs_refl = vit != refl->end() ? &vit->second : nullptr;
+        ps_refl = pit != refl->end() ? &pit->second : nullptr;
+        if (d.ps != 0 && (vs_refl == nullptr) != (ps_refl == nullptr)) {
+            vs_refl = ps_refl = nullptr;  // only one stage reflected: keep the conventions for both
+        }
+    }
+    bridge::PipelineLayoutDesc reflected_layout;
+    if (vs_refl != nullptr) {
+        std::string report;
+        bool ok = static_cast<bool>(src.root_signature);
+        if (!ok) {
+            report = "no root signature\n";
+        }
+        std::vector<pso::VertexInputFetch> fetches;
+        if (ok) {
+            ok = join_vertex_inputs(*vs_refl, src.input.data(), static_cast<uint32_t>(src.input.size()), &fetches,
+                                    &report);
+            std::vector<ReflectedStageRef> stages{{GpuShaderStageBits::Vertex, vs_refl}};
+            if (ps_refl != nullptr) {
+                stages.push_back({GpuShaderStageBits::Fragment, ps_refl});
+            }
+            ok = join_pipeline_layout(src.root_signature->signature().desc(), /*compute=*/false, stages,
+                                      &reflected_layout, &report) && ok;
+        }
+        if (!ok) {
+            const uint64_t rs_hash = src.root_signature ? src.root_signature->signature().hash() : 0;
+            std::lock_guard<std::mutex> lock(pack_mutex_);
+            if (reflection_failures_.insert({*vs_key, *ps_key, rs_hash}).second) {
+                char head[96];
+                std::snprintf(head, sizeof(head), "d3d12_xs: reflection join failed (vertex 0x%016" PRIx64
+                              ", pixel 0x%016" PRIx64 "):\n", *vs_key, *ps_key);
+                os::log(std::string(head) + report);
+            }
+            *vs_key = *ps_key = 0;
+            return false;
+        }
+        src.vs_fetches = std::move(fetches);
+        src.reflected = true;
+        src.fix_pointers();
+    }
     std::lock_guard<std::mutex> lock(pack_mutex_);
     auto module_for = [&](uint64_t key, GpuShaderStage stage) {
         auto it = pack_modules_.find(key);
@@ -2282,7 +2342,9 @@ bool Device::resolve_with_pack(const GraphicsPsoSource& src, uint64_t* vs_key, u
         register_shader_module(d.ps, module_for(*ps_key, GpuShaderStage::Fragment));
     }
     if (src.root_signature && pack_layouts_.insert({d.vs, d.ps}).second) {
-        bridge_->register_pipeline_layout(d.vs, d.ps, layout_from_root_signature(src.root_signature->signature().desc()));
+        bridge_->register_pipeline_layout(d.vs, d.ps,
+                                          src.reflected ? std::move(reflected_layout)
+                                                        : layout_from_root_signature(src.root_signature->signature().desc()));
     }
     return true;
 }
@@ -2464,6 +2526,31 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
                 break;
             }
         }
+        // Reflection join (G62) for the compute stage.
+        bridge::PipelineLayoutDesc reflected_layout;
+        bool reflected = false;
+        if (const StageReflectionIndex* refl = options_.stage_reflection.get(); refl != nullptr && pack_key != 0) {
+            if (auto rit = refl->find(pack_key); rit != refl->end()) {
+                std::string report;
+                const bool ok = static_cast<bool>(rs) &&
+                                join_pipeline_layout(rs->signature().desc(), /*compute=*/true,
+                                                     {{GpuShaderStageBits::Compute, &rit->second}}, &reflected_layout,
+                                                     &report);
+                if (ok) {
+                    reflected = true;
+                } else {
+                    const uint64_t rs_hash = rs ? rs->signature().hash() : 0;
+                    std::lock_guard<std::mutex> lock(pack_mutex_);
+                    if (reflection_failures_.insert({pack_key, 0, rs_hash}).second) {
+                        char head[80];
+                        std::snprintf(head, sizeof(head), "d3d12_xs: reflection join failed (compute 0x%016" PRIx64 "):\n",
+                                      pack_key);
+                        os::log(std::string(head) + (rs ? report : std::string("no root signature\n")));
+                    }
+                    pack_key = 0;  // not resolved: dispatches with it are skipped
+                }
+            }
+        }
         if (pack_key != 0) {
             std::lock_guard<std::mutex> lock(pack_mutex_);
             uint32_t module_id = 0;
@@ -2479,7 +2566,8 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
             }
             register_shader_module(d.cs, module_id);
             if (rs && pack_layouts_.insert({d.cs, 0}).second) {
-                bridge::PipelineLayoutDesc layout = layout_from_root_signature(rs->signature().desc());
+                bridge::PipelineLayoutDesc layout =
+                    reflected ? std::move(reflected_layout) : layout_from_root_signature(rs->signature().desc());
                 for (bridge::GroupLayoutDesc& group : layout.groups) {
                     for (bridge::LayoutBinding& b : group.bindings) {
                         b.entry.visibility = GpuShaderStageBits::Compute;

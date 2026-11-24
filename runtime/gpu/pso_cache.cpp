@@ -983,6 +983,21 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
             diag |= PipelineDiag::VertexSlotOutOfRange;
             continue;
         }
+        if (desc.vs_input_fetches != nullptr) {
+            // Reflected stage: elements only give strides and the slot's classification.
+            const WgpuVertexStepMode step = e.InputSlotClass == D3D12InputClassification::PerInstanceData
+                                                ? WgpuVertexStepMode::Instance
+                                                : WgpuVertexStepMode::Vertex;
+            if (step == WgpuVertexStepMode::Instance && e.InstanceDataStepRate == 0) {
+                t.instance_stride_zero_slots |= 1u << e.InputSlot;
+            }
+            if (slot_step[e.InputSlot] == WgpuVertexStepMode::Unused) {
+                slot_step[e.InputSlot] = step;
+            } else if (slot_step[e.InputSlot] != step) {
+                diag |= PipelineDiag::VertexLayoutInvalid;
+            }
+            continue;
+        }
 
         uint32_t location = i;
         if (desc.vs_input_signature != nullptr) {
@@ -1033,6 +1048,32 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
     for (size_t s = 0; s < signature_matched.size(); ++s) {
         if (!signature_matched[s]) {
             diag |= PipelineDiag::MissingVertexInput;
+        }
+    }
+
+    // Reflected vertex stage (G62): the stage's fetches are the attributes.
+    if (desc.vs_input_fetches != nullptr) {
+        attrs.clear();
+        location_mask = 0;
+        for (uint32_t i = 0; i < desc.vs_input_fetch_count; ++i) {
+            const VertexInputFetch& f = desc.vs_input_fetches[i];
+            if (f.slot >= kMaxVertexBuffers) {
+                diag |= PipelineDiag::VertexSlotOutOfRange;
+                continue;
+            }
+            if (f.location >= kMaxVertexAttributes) {
+                diag |= PipelineDiag::TooManyVertexAttributes;
+                continue;
+            }
+            if (f.format == WgpuVertexFormat::Undefined || (location_mask & (1u << f.location)) != 0) {
+                diag |= PipelineDiag::VertexLayoutInvalid;
+                continue;
+            }
+            if (slot_step[f.slot] == WgpuVertexStepMode::Unused) {
+                slot_step[f.slot] = WgpuVertexStepMode::Vertex;
+            }
+            location_mask |= 1u << f.location;
+            attrs.push_back(Attr{f.slot, f.offset, f.location, f.format});
         }
     }
 

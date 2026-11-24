@@ -972,6 +972,95 @@ void test_unaligned_uniform_relocation() {
     }
 }
 
+// G62: a uniform binding with a reflected minimum size (layout min_binding_size) is bound with at
+// least that many bytes, instead of the 256-byte PC minimum; without one the 256-byte rule stays.
+GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, uint64_t min_size,
+                                     std::vector<std::pair<uint64_t, uint64_t>>* calls) {
+    d3d::DescriptorHeapRegistry heaps;
+    heaps.set_cbv_alignment(16);
+    d3d::ResourceStateRegistry states;
+    bridge::BridgeOptions options = counting_options(5000);
+    options.relocate_uniform = [calls](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+        calls->emplace_back(va, size);
+        *id = 777;
+        *offset = 512;
+        return true;
+    };
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kCb = 300;
+    constexpr uint64_t kVs = 0xC1, kPs = 0xC2, kCbVa = 0x10000;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_buffer(kCb, kCbVa, 4096);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    d3d::DescriptorHeap* cbv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ConstantBufferViewDesc cbv;
+    cbv.buffer_location = kCbVa + view_offset;
+    cbv.size_in_bytes = view_size;
+    CHECK(heaps.create_constant_buffer_view(&cbv, cbv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Cbv;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    GpuBindGroupLayoutEntry entry = layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
+                                                 GpuBindingLayoutType::Buffer,
+                                                 static_cast<uint8_t>(GpuBufferBindingType::Uniform));
+    entry.min_binding_size = min_size;
+    group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Cbv, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {cbv_heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootDescriptorTable(0, cbv_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+    list.IASetVertexBuffers(0, 1, &vb);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+    GpuBindGroupEntry2 out{};
+    for (const Packet& packet : decode(enc)) {
+        if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
+            out = pod<GpuBindGroupEntry2>(packet, sizeof(GpuCreateBindGroup2Payload));
+        }
+    }
+    return out;
+}
+
+void test_reflected_uniform_min_size() {
+    std::vector<std::pair<uint64_t, uint64_t>> calls;
+    // Aligned view of 96 bytes: no minimum -> 256 (PC rule); minimum 160 -> 160; minimum 64 -> 96.
+    CHECK(bind_uniform_view(0x100, 96, 0, &calls).size == 256);
+    CHECK(bind_uniform_view(0x100, 96, 160, &calls).size == 160);
+    const GpuBindGroupEntry2 within = bind_uniform_view(0x100, 96, 64, &calls);
+    CHECK(within.size == 96 && within.offset == 0x100 && within.resource_id == 300);
+    CHECK(calls.empty());
+    // Unaligned view relocated: the copy covers the minimum (320 bytes -> a 512-byte home).
+    const GpuBindGroupEntry2 moved = bind_uniform_view(0x40, 96, 320, &calls);
+    CHECK(moved.resource_id == 777 && moved.size == 512);
+    CHECK(calls.size() == 1 && calls[0].second == 320);
+}
+
 // G48: a slot source over test-owned "descriptor memory" for one heap.
 class TestSlotSource final : public d3d::DescriptorSlotSource {
 public:
@@ -1749,6 +1838,7 @@ int main() {
     test_memory_backed_tables();
     test_representative_command_list();
     test_unaligned_uniform_relocation();
+    test_reflected_uniform_min_size();
     test_bind_group_rebuild_and_retire();
     test_usage_conflict_is_diagnosed();
     test_barrier_flushes_pending_clears();
