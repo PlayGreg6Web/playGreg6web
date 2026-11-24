@@ -479,7 +479,7 @@ bool Resource::initialize() {
         } else if (xmem_memory_ != nullptr) {
             gpu_va_ = com::host_to_guest(xmem_memory_);
         }
-        if (gpu_va_ != 0 && xmem_memory_ == nullptr && com::guest_to_host(gpu_va_, 1) != nullptr) {
+        if (gpu_va_ != 0 && xmem_memory_ == nullptr) {
             TextureProbe& p = texture_probe();
             std::lock_guard<std::mutex> lock(p.mutex);
             p.textures.push_back(this);
@@ -563,7 +563,9 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
             continue;
         }
         const uint64_t len = std::min<uint64_t>(kProbeBytes, std::max<uint64_t>(1, resource_size_estimate(r->desc_)));
-        const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(r->gpu_va_, static_cast<size_t>(len)));
+        // GPU-window addresses read their bytes from the CPU window (Device::register_gpu_alias).
+        const uint64_t cpu = r->device_->cpu_address_for_gpu(r->gpu_va_);
+        const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(len)));
         if (bytes == nullptr || std::all_of(bytes, bytes + len, [](uint8_t b) { return b == 0; })) {
             continue;
         }
