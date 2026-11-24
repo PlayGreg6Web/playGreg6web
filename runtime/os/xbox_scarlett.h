@@ -491,7 +491,9 @@ void pg6_xbox_XMemFree(void* address, uint64_t attributes);
 void pg6_xbox_XMemFreeDefault(void* address, uint64_t attributes);
 // Physical pages, in the shapes of the title's call sites (O27; the AWE-style
 // AllocateUserPhysicalPages / MapUserPhysicalPages[Scatter] argument order):
-//   XMemAllocatePhysicalPages(attributes, &count, pfns) -> 1 / 0
+//   XMemAllocatePhysicalPages(attributes, &count, pfns) -> 1 / 0; count is in pages (64 KiB for
+//     the title's attributes), pfns are frame numbers in 4 KiB units: a 64 KiB page's is a
+//     multiple of 16, the next page's 16 higher (the title keeps pfn >> 4 and maps with << 4, O30)
 //   XMemMapPhysicalPages(address, count, pfns) -> address (pfns null: unmap the slots); a null
 //     address places the pages in a fresh guest block (host callers; xmem_unmap_physical_pages)
 //   XMemMapPhysicalPagesScatter(addresses, count, pfns) -> 1 / 0 (null array or pfn 0: unmap)

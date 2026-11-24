@@ -295,8 +295,12 @@ XMemState& xmem_state() {
 
 // Physical page model (O24, reworked in O27 for the title's call shapes)
 // ----------------------------------------------------------------------
-// XMemAllocatePhysicalPages(attributes, &count, pfns) returns opaque page frame numbers for
-// runtime-tracked pages; the pages own no memory until they hold data. Pages are mapped one 64 KiB
+// XMemAllocatePhysicalPages(attributes, &count, pfns) returns page frame numbers for
+// runtime-tracked pages; the pages own no memory until they hold data. Frame numbers count 4 KiB
+// frames, as on the console (O30): a 64 KiB page's number is a multiple of 16 and the next page's
+// is 16 higher. The title relies on it: its streaming code keeps pfn >> 4 per page and passes
+// (pfn >> 4) << 4 to XMemMapPhysicalPagesScatter, so numbers 1 apart would collapse 16 pages
+// into one. Pages are mapped one 64 KiB
 // slot at a time: XMemMapPhysicalPages(va, count, pfns) maps consecutive slots (a null pfn array
 // unmaps them), XMemMapPhysicalPagesScatter(vas, count, pfns) maps one slot per VA (a null array
 // or a 0 pfn unmaps that slot), both into XMemVirtualAlloc reservations (only the mapped pages are
@@ -2492,8 +2496,12 @@ int32_t pg6_xbox_XMemAllocatePhysicalPages(uint64_t attributes, size_t* num_page
 
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
+    // Frame numbers in 4 KiB units: a page of page_size bytes takes page_size / 4 KiB numbers,
+    // aligned to that (O30; see the physical page model above).
+    const uint64_t frames = page_size / kXMemPageSize4K;
     for (size_t i = 0; i < count; ++i) {
-        const uint64_t handle = st.next_page_handle++;
+        const uint64_t handle = align_up_u64(st.next_page_handle, frames);
+        st.next_page_handle = handle + frames;
         created[i]->handle = handle;
         page_array[i] = handle;
         st.physical_pages.emplace(handle, std::move(created[i]));

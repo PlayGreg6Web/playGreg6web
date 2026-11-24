@@ -25,7 +25,8 @@
 //   PAGE_READWRITE | PAGE_GRAPHICS_READWRITE) and registered with the D3D12 device (Xbox slot 74).
 //   The view's address is otherwise only compared against zero by guest code.
 // * Streaming. Pool pages are mapped at window page k into the CPU window with
-//   XMemMapPhysicalPagesScatter (VA array, count, pfns; pfn 0 / null array unmaps) and into the
+//   XMemMapPhysicalPagesScatter (VA array, count, pfns; one entry per 64 KiB slot, pfns in 4 KiB
+//   frame units: the page's own number, (pfn >> 4) << 4; pfn 0 / null array unmaps) and into the
 //   GPU window, at the same page k, through queue slot 31 (d3d12_xs_xbox.h). The title converts
 //   CPU-window addresses to GPU-window addresses itself (48 functions read the window bases for
 //   such conversions) before handing them to D3D12, so D3D12 sees GPU-window addresses and the

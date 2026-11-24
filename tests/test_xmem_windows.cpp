@@ -226,6 +226,88 @@ void test_gpu_page_table() {
     reset();
 }
 
+// O30: physical page frame numbers count 4 KiB frames. The title's streaming code keeps
+// pfn >> 4 per 64 KiB pool page and maps window slots with (pfn >> 4) << 4, one scatter entry per
+// 64 KiB slot; the same window pages reach the GPU window through queue slot 31 by pool page
+// index. Synthetic sequence in that shape.
+void test_title_shaped_streaming() {
+    reset();
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuWindows);
+    const uint64_t S = window_size();
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kWindowType, 0x21u, kCpuProtect);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kWindowType, 0x3u, kGpuProtect);
+    CHECK(cpu != nullptr && gpu != nullptr);
+    const uint64_t C = va_of(cpu), G = va_of(gpu);
+
+    constexpr size_t kPool = 64;
+    size_t count = kPool;
+    uint64_t pfn[kPool]{};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == kPool);
+    for (size_t i = 0; i < kPool; ++i) {
+        CHECK(pfn[i] % 16 == 0);                          // a 64 KiB page is 16 frames
+        CHECK(i == 0 || pfn[i] == pfn[i - 1] + 16);
+    }
+    void* view = pg6_xbox_XMemVirtualAlloc(nullptr, kPool * k64K, kWindowType, 0x23u, 0x2004u);
+    CHECK(view != nullptr && pg6_xbox_XMemMapPhysicalPages(view, kPool, pfn) == view);
+    auto* v = static_cast<uint8_t*>(view);
+    for (size_t i = 0; i < kPool; ++i) {
+        std::memset(v + i * k64K, static_cast<int>(0x80 + i), k64K);
+    }
+
+    // The title's packed table and scatter arrays: pool pages 8..39 at window slots 0..31.
+    uint32_t packed[kPool];
+    for (size_t i = 0; i < kPool; ++i) {
+        packed[i] = static_cast<uint32_t>(pfn[i] >> 4);
+    }
+    constexpr size_t kFirst = 8, kSlots = 32;
+    uint64_t vas[kSlots], pages[kSlots];
+    for (size_t j = 0; j < kSlots; ++j) {
+        vas[j] = C + j * k64K;
+        pages[j] = static_cast<uint64_t>(packed[kFirst + j]) << 4;
+    }
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(vas, kSlots, pages) == 1);
+    for (size_t j = 0; j < kSlots; ++j) {  // every slot shows its own page, none repeats
+        const auto* w = static_cast<const uint8_t*>(arena().translate(C + j * k64K));
+        CHECK(w[0] == 0x80 + kFirst + j && w[k64K - 1] == 0x80 + kFirst + j);
+    }
+    // The same window pages in the GPU window (queue slot 31: pool page indices) agree.
+    std::vector<xw::PageMappingRange> ranges(1);
+    ranges[0].gpu_va = G;
+    for (size_t j = 0; j < kSlots; ++j) {
+        ranges[0].entries.push_back({1, static_cast<uint32_t>(kFirst + j), 1});
+    }
+    CHECK(xw::apply_gpu_page_mappings(ranges, va_of(view), kPool).mapped_pages == kSlots);
+    for (size_t j = 0; j < kSlots; ++j) {
+        const int64_t index = xw::gpu_page_pool_index(G + j * k64K);
+        CHECK(index == static_cast<int64_t>(kFirst + j));
+        const auto* w = static_cast<const uint8_t*>(arena().translate(C + j * k64K));
+        CHECK(w[5] == 0x80 + index);
+    }
+    // Unmap four slots (null array), then remap one of their pages while it is still mapped at
+    // another slot of the window.
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(vas + 4, 4, nullptr) == 1);
+    CHECK(arena().query(C + 4 * k64K).state == MemState::Reserve);
+    const uint64_t again_va[1] = {C + 100 * k64K};
+    const uint64_t again_page[1] = {static_cast<uint64_t>(packed[kFirst + 1]) << 4};  // still at slot 1
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(again_va, 1, again_page) == 1);
+    CHECK(static_cast<const uint8_t*>(arena().translate(C + 100 * k64K))[3] == 0x80 + kFirst + 1);
+    // A frame number inside a page (not its first frame) is not a page.
+    const uint64_t inside[1] = {pfn[3] + 1};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(again_va, 1, inside) == 0);
+
+    // Other page sizes take their size in frames: 4 KiB pages 1, 2 MiB pages 512.
+    size_t n4 = 2, n2m = 2;
+    uint64_t p4[2]{}, p2m[2]{};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage4K, &n4, p4) == 1 && p4[1] == p4[0] + 1);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage2M, &n2m, p2m) == 1);
+    CHECK(p2m[0] % 512 == 0 && p2m[1] == p2m[0] + 512);
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, p4) == 1 && pg6_xbox_XMemFreePhysicalPages(2, p2m) == 1);
+
+    CHECK(xmem_virtual_free(gpu) && xmem_virtual_free(cpu) && xmem_virtual_free(view));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(kPool, pfn) == 1);
+    reset();
+}
+
 // Exhaustion fails cleanly: the planner reports the first reservation that does not fit, and a
 // window bigger than the whole arena is refused by XMemVirtualAlloc without side effects.
 void test_exhaustion() {
@@ -308,6 +390,7 @@ int main() {
     test_phantom_gpu_window();
     test_pool_pages_in_windows();
     test_gpu_page_table();
+    test_title_shaped_streaming();
     test_exhaustion();
     test_browser_budget_replay();
     test_native_full_size_sequence();
