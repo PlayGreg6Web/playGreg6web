@@ -276,6 +276,21 @@
     X(pg6_crt_w_gettnames, ok, "opaque zeroed guest heap block, freed by the caller") \
     X(pg6_crt_strftime_lc, ok, "C locale names; the _Gettnames block is ignored") \
     X(pg6_crt_wcsftime_lc, ok, "C locale names; literal units copied, specifications formatted narrow and widened") \
+    X(pg6_crt_ceil, ok, "") \
+    X(pg6_crt_floor, ok, "") \
+    X(pg6_crt_sqrt, ok, "") \
+    X(pg6_crt_sqrtf, ok, "") \
+    X(pg6_crt_cosh, ok, "") \
+    X(pg6_crt_sinh, ok, "") \
+    X(pg6_crt_expm1, ok, "") \
+    X(pg6_crt_log1p, ok, "") \
+    X(pg6_crt_wcsncpy_s, ok, "UTF-16; _TRUNCATE -> STRUNCATE") \
+    X(pg6_crt_wcsncat_s, ok, "UTF-16; _TRUNCATE -> STRUNCATE") \
+    X(pg6_crt_wcstoul, ok, "Win64 unsigned long = uint32; ASCII digits; identity: endptr") \
+    X(pg6_crt_itow_s, ok, "UTF-16") \
+    X(pg6_crt_p___wargv, ok, "wide argv table and string are guest heap blocks holding guest addresses") \
+    X(pg6_crt_configure_wide_argv, ok, "returns 0") \
+    X(pg6_crt_invoke_watson, ok, "reports like abort and returns; the call site is a no-return import, so lifted code traps right after") \
     /* ---- libHttpClient.GDK (O14, offline) ---- */ \
     X(pg6_mw_hc_initialize, ok, "") \
     X(pg6_mw_hc_cleanup_async, deny, "completes a guest XAsyncBlock through the host callback path; gthunk: pg6_gthunk_hc_cleanup_async") \

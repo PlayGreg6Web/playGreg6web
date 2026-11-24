@@ -160,7 +160,22 @@ int32_t clamp_long(long long value) {
     E(TIME, "_W_Getmonths", pg6_crt_w_getmonths) \
     E(TIME, "_W_Gettnames", pg6_crt_w_gettnames) \
     E(TIME, "_Strftime", pg6_crt_strftime_lc) \
-    E(TIME, "_Wcsftime", pg6_crt_wcsftime_lc)
+    E(TIME, "_Wcsftime", pg6_crt_wcsftime_lc) \
+    E(MATH, "ceil", pg6_crt_ceil) \
+    E(MATH, "floor", pg6_crt_floor) \
+    E(MATH, "sqrt", pg6_crt_sqrt) \
+    E(MATH, "sqrtf", pg6_crt_sqrtf) \
+    E(MATH, "cosh", pg6_crt_cosh) \
+    E(MATH, "sinh", pg6_crt_sinh) \
+    E(MATH, "expm1", pg6_crt_expm1) \
+    E(MATH, "log1p", pg6_crt_log1p) \
+    E(STRING, "wcsncpy_s", pg6_crt_wcsncpy_s) \
+    E(STRING, "wcsncat_s", pg6_crt_wcsncat_s) \
+    E(CONVERT, "wcstoul", pg6_crt_wcstoul) \
+    E(CONVERT, "_itow_s", pg6_crt_itow_s) \
+    E(RUNTIME, "__p___wargv", pg6_crt_p___wargv) \
+    E(RUNTIME, "_configure_wide_argv", pg6_crt_configure_wide_argv) \
+    E(RUNTIME, "_invoke_watson", pg6_crt_invoke_watson)
 
 extern "C" {
 
@@ -473,6 +488,161 @@ size_t pg6_crt_wcsftime_lc(uint16_t* buffer,
     }
     buffer[out.size()] = 0;
     return out.size();
+}
+
+// --- the other redistributables --------------------------------------------
+
+double pg6_crt_ceil(double x) { return std::ceil(x); }
+double pg6_crt_floor(double x) { return std::floor(x); }
+double pg6_crt_sqrt(double x) { return std::sqrt(x); }
+float pg6_crt_sqrtf(float x) { return std::sqrt(x); }
+double pg6_crt_cosh(double x) { return std::cosh(x); }
+double pg6_crt_sinh(double x) { return std::sinh(x); }
+double pg6_crt_expm1(double x) { return std::expm1(x); }
+double pg6_crt_log1p(double x) { return std::log1p(x); }
+
+int32_t pg6_crt_wcsncpy_s(uint16_t* dst, size_t dst_size, const uint16_t* src, size_t count) {
+    if (dst == nullptr || dst_size == 0) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
+    }
+    if (count == 0) {
+        dst[0] = 0;
+        return 0;
+    }
+    if (src == nullptr) {
+        dst[0] = 0;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
+    }
+    const bool truncate = count == PG6_CRT_TRUNCATE;
+    const size_t limit = truncate ? dst_size - 1 : count;
+    size_t i = 0;
+    while (i < limit && i < dst_size - 1 && src[i] != 0) {
+        dst[i] = src[i];
+        ++i;
+    }
+    if (i < limit && src[i] != 0) {  // destination full before `limit` units or the terminator
+        dst[0] = 0;
+        *pg6_crt_errno() = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
+    }
+    dst[i] = 0;
+    return (truncate && src[i] != 0) ? PG6_CRT_STRUNCATE : 0;
+}
+
+int32_t pg6_crt_wcsncat_s(uint16_t* dst, size_t dst_size, const uint16_t* src, size_t count) {
+    if (dst == nullptr || dst_size == 0) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
+    }
+    if (src == nullptr && count != 0) {
+        dst[0] = 0;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
+    }
+    size_t len = 0;
+    while (len < dst_size && dst[len] != 0) {
+        ++len;
+    }
+    if (len == dst_size) {  // destination not terminated
+        dst[0] = 0;
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
+    }
+    const bool truncate = count == PG6_CRT_TRUNCATE;
+    size_t i = 0;
+    while ((truncate || i < count) && src[i] != 0) {
+        if (len + i + 1 >= dst_size) {
+            if (truncate) {
+                dst[len + i] = 0;
+                return PG6_CRT_STRUNCATE;
+            }
+            dst[0] = 0;
+            *pg6_crt_errno() = PG6_CRT_ERANGE;
+            return PG6_CRT_ERANGE;
+        }
+        dst[len + i] = src[i];
+        ++i;
+    }
+    dst[len + i] = 0;
+    return 0;
+}
+
+uint32_t pg6_crt_wcstoul(const uint16_t* str, uint16_t** end, int32_t base) {
+    if (str == nullptr) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        if (end != nullptr) {
+            *end = nullptr;
+        }
+        return 0;
+    }
+    // Digits, signs, prefixes and white space are ASCII; any other unit ends the number.
+    std::string narrow;
+    for (size_t i = 0; str[i] != 0; ++i) {
+        narrow.push_back(str[i] < 0x80 ? static_cast<char>(str[i]) : '\x01');
+    }
+    char* narrow_end = nullptr;
+    const uint32_t value = pg6_crt_strtoul(narrow.c_str(), &narrow_end, base);
+    if (end != nullptr) {
+        *end = const_cast<uint16_t*>(str) + (narrow_end - narrow.c_str());
+    }
+    return value;
+}
+
+int32_t pg6_crt_itow_s(int32_t value, uint16_t* buffer, size_t size, int32_t radix) {
+    if (buffer == nullptr || size == 0 || radix < 2 || radix > 36) {
+        if (buffer != nullptr && size > 0) {
+            buffer[0] = 0;
+        }
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return PG6_CRT_EINVAL;
+    }
+    char digits[40];
+    pg6_crt_itoa(value, digits, radix);
+    const size_t len = std::strlen(digits);
+    if (len + 1 > size) {
+        buffer[0] = 0;
+        *pg6_crt_errno() = PG6_CRT_ERANGE;
+        return PG6_CRT_ERANGE;
+    }
+    for (size_t i = 0; i <= len; ++i) {
+        buffer[i] = static_cast<uint8_t>(digits[i]);
+    }
+    return 0;
+}
+
+uint16_t*** pg6_crt_p___wargv(void) {
+    // Wide argv in guest memory ({program name, null}, guest addresses), built once; the
+    // returned address of the variable is round-tripped by the import thunk.
+    static uint16_t** wargv = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        uint16_t* name = guest_wide("game_scarlett_master.exe");
+        if (name == nullptr) {
+            return;
+        }
+        auto* table = static_cast<uint64_t*>(pg6_crt_with_host_errno(
+            [](int32_t* e) { return playgta6::os::guest_crt::calloc(2, sizeof(uint64_t), e); }));
+        if (table == nullptr) {
+            return;
+        }
+        playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+        table[0] = heap.to_guest(name);
+        wargv = reinterpret_cast<uint16_t**>(static_cast<uintptr_t>(heap.to_guest(table)));
+    });
+    return &wargv;
+}
+
+int32_t pg6_crt_configure_wide_argv(int32_t mode) {
+    (void)mode;
+    return 0;
+}
+
+void pg6_crt_invoke_watson(const uint16_t*, const uint16_t*, const uint16_t*, uint32_t, uintptr_t) {
+    // Fatal by contract: report like abort(); the call site is a no-return import, so lifted
+    // code traps right after.
+    pg6_crt_abort();
 }
 
 }  // extern "C"

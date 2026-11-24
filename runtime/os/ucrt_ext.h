@@ -97,6 +97,27 @@ uint16_t pg6_crt_fputwc(uint16_t ch, FILE* stream);
 uint16_t pg6_crt_fgetwc(FILE* stream);
 uint16_t pg6_crt_ungetwc(uint16_t ch, FILE* stream);
 
+// Imports of the other shipped redistributables (msvcp140_2, concrt140, vcomp140, vccorlib140).
+double pg6_crt_ceil(double x);
+double pg6_crt_floor(double x);
+double pg6_crt_sqrt(double x);
+float pg6_crt_sqrtf(float x);
+double pg6_crt_cosh(double x);
+double pg6_crt_sinh(double x);
+double pg6_crt_expm1(double x);
+double pg6_crt_log1p(double x);
+int32_t pg6_crt_wcsncpy_s(uint16_t* dst, size_t dst_size, const uint16_t* src, size_t count);
+int32_t pg6_crt_wcsncat_s(uint16_t* dst, size_t dst_size, const uint16_t* src, size_t count);
+uint32_t pg6_crt_wcstoul(const uint16_t* str, uint16_t** end, int32_t base);
+int32_t pg6_crt_itow_s(int32_t value, uint16_t* buffer, size_t size, int32_t radix);
+uint16_t*** pg6_crt_p___wargv(void);
+int32_t pg6_crt_configure_wide_argv(int32_t mode);
+void pg6_crt_invoke_watson(const uint16_t* expression,
+                           const uint16_t* function,
+                           const uint16_t* file,
+                           uint32_t line,
+                           uintptr_t reserved);
+
 // api-ms-win-crt-time (msvcp140's time_get / time_put)
 char* pg6_crt_getdays(void);
 char* pg6_crt_getmonths(void);

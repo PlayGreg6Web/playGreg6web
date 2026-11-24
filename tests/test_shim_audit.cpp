@@ -13,6 +13,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "os/crt_guest.h"
+#include "os/guest_heap.h"
 #include "os/shim_audit.h"
 #include "os/ucrt_bridge.h"
 #include "os/ucrt_ext.h"
@@ -80,10 +81,10 @@ void test_rows_are_well_formed() {
             CHECK(row.note != nullptr && row.note[0] != '\0');  // deny/pending say why
         }
     }
-    // Every shim of the four audited families has a row (ucrt 186 + ucrt_ext 37, middleware 98,
+    // Every shim of the four audited families has a row (ucrt 186 + ucrt_ext 52, middleware 98,
     // xbox 16, winsock 25 registered + WSASetLastError, declared but not registered); stubs.rs
     // checks the same against the export tables.
-    CHECK(seen.size() == 186u + 37u + 98u + 16u + 26u);
+    CHECK(seen.size() == 186u + 52u + 98u + 16u + 26u);
     CHECK(ok > 0);
     for (const GapRow& gap : kGaps) {
         if (gap.dll == nullptr) {
@@ -285,6 +286,33 @@ void test_ucrt_ext() {
     uint32_t r = 0;
     CHECK(pg6_crt_rand_s(&r) == 0);
     CHECK(pg6_crt_rand_s(nullptr) == PG6_CRT_EINVAL);
+
+    // The other redistributables' imports.
+    CHECK(pg6_crt_floor(-1.5) == -2.0 && pg6_crt_ceil(-1.5) == -1.0 && pg6_crt_sqrtf(4.0f) == 2.0f);
+    uint16_t w5[5];
+    CHECK(pg6_crt_wcsncpy_s(w5, 5, abc, 2) == 0 && w5[1] == 'b' && w5[2] == 0);
+    CHECK(pg6_crt_wcsncpy_s(w5, 3, abc, PG6_CRT_TRUNCATE) == PG6_CRT_STRUNCATE && w5[2] == 0);
+    CHECK(pg6_crt_wcsncpy_s(w5, 3, abc, 3) == PG6_CRT_ERANGE && w5[0] == 0);
+    uint16_t cat[6] = {'x', 0};
+    CHECK(pg6_crt_wcsncat_s(cat, 6, abc, 2) == 0 && cat[2] == 'b' && cat[3] == 0);
+    CHECK(pg6_crt_wcsncat_s(cat, 6, abc, PG6_CRT_TRUNCATE) == PG6_CRT_STRUNCATE && cat[5] == 0);
+    uint16_t small_cat[3] = {'x', 0};
+    CHECK(pg6_crt_wcsncat_s(small_cat, 3, abc, 3) == PG6_CRT_ERANGE && small_cat[0] == 0);
+    const uint16_t num[] = {' ', '4', '2', 0x20AC, 0};
+    uint16_t* num_end = nullptr;
+    CHECK(pg6_crt_wcstoul(num, &num_end, 10) == 42 && num_end == num + 3);
+    uint16_t itow[8];
+    CHECK(pg6_crt_itow_s(-255, itow, 8, 10) == 0 && itow[0] == '-' && itow[3] == '5' && itow[4] == 0);
+    CHECK(pg6_crt_itow_s(255, itow, 2, 16) == PG6_CRT_ERANGE && itow[0] == 0);
+    playgta6::os::GuestHeap& gheap = playgta6::os::default_guest_heap();
+    uint16_t** wargv_va = *pg6_crt_p___wargv();
+    CHECK(wargv_va != nullptr && gheap.owns(reinterpret_cast<uintptr_t>(wargv_va)));
+    if (wargv_va != nullptr) {
+        const auto* table = reinterpret_cast<const uint64_t*>(gheap.to_host(reinterpret_cast<uintptr_t>(wargv_va)));
+        const auto* name = reinterpret_cast<const uint16_t*>(gheap.to_host(table[0]));
+        CHECK(name[0] == 'g' && table[1] == 0);
+    }
+    CHECK(pg6_crt_configure_wide_argv(1) == 0);
 }
 
 }  // namespace
