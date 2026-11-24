@@ -972,6 +972,31 @@ void test_observability() {
     }
     CHECK(image_reserve);
     CHECK(run.report["first_calls"].type == Json::Array);
+    CHECK(run.report["recent_dispatches"].type == Json::Array);
+
+    // The boot seeds the console-mode value the title reads at startup (default: Series X).
+    auto console_mode = []() -> int64_t {
+        Pg6Handle key = 0;
+        if (pg6_win32_reg_open_key_w(0x80000002u, u"Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM",
+                                     &key) != 0) {
+            return -1;
+        }
+        uint32_t type = 0, value = 0, size = sizeof(value);
+        const int32_t status = pg6_win32_reg_query_value_ex_w(key, u"ConsoleMode", nullptr, &type,
+                                                              reinterpret_cast<uint8_t*>(&value), &size);
+        pg6_win32_reg_close_key(key);
+        return status == 0 && type == 4 && size == 4 ? static_cast<int64_t>(value) : -1;
+    };
+    os::win32::registry_clear();
+    CHECK(console_mode() == -1);
+    boot_scenario(Scenario::LastError);
+    CHECK(console_mode() == static_cast<int64_t>(kConsoleModeSeriesX));
+    os::win32::registry_clear();
+    boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.console_mode = kConsoleModeDevKit; });
+    CHECK(console_mode() == static_cast<int64_t>(kConsoleModeDevKit));
+    os::win32::registry_clear();
+    boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.console_mode = 0; });
+    CHECK(console_mode() == -1);
 }
 
 void test_second_thread() {

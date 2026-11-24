@@ -386,6 +386,10 @@ struct BootModule {
     uint32_t tls_directory_size = 0;
 };
 
+// Console-mode values (BootConfig::console_mode).
+inline constexpr uint32_t kConsoleModeSeriesX = 0x60;
+inline constexpr uint32_t kConsoleModeDevKit = 0x64;
+
 struct BootConfig {
     // modules[0] is the executable (entry point, main module, TLS index 0); at least one.
     std::vector<BootModule> modules;
@@ -406,6 +410,10 @@ struct BootConfig {
     // Record up to this many import calls (name, thread, first five integer arguments) for
     // import_trace_text(); 0 = off.
     size_t import_trace_limit = 0;
+    // Emulated console type: the console-mode value the title reads at startup (REG_DWORD
+    // "ConsoleMode" under HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM), seeded into the
+    // runtime registry before the entry point runs. 0 leaves the registry untouched.
+    uint32_t console_mode = kConsoleModeSeriesX;
     // Start address of the host function containing a code address (0 if unknown), e.g. from the
     // host's unwind tables; makes host-frame -> lifted-function mapping exact.
     HostFunctionStartFn host_function_start = nullptr;

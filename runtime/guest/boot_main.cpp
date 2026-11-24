@@ -28,6 +28,8 @@
 //   --summary <file>     also write the text summary there (it always goes to stderr)
 //   --import-trace <file> write every import call (sequence, thread, DLL!symbol, rcx rdx r8 r9
 //                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
+//   --console-mode <n>   console-mode registry value the title reads to pick its console type
+//                        (default 0x60 = Xbox Series X; 0 = leave it unset)
 //   --no-tls-callbacks / --no-entry / --quiet
 //
 // Exit code: the BootStatus (0 = the guest exited; its own exit code is in the report),
@@ -126,6 +128,7 @@ struct Options {
     std::string summary;
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
+    uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -189,11 +192,13 @@ bool parse(int argc, char** argv, Options& o) {
                                                       : o.summary;
             target = v;
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
-                   a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit") {
+                   a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
+                   a == "--console-mode") {
             if (!value(v)) {
                 return false;
             }
             uint64_t& target = a == "--max-calls"     ? o.max_calls
+                               : a == "--console-mode" ? o.console_mode
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
                                : a == "--import-trace-limit" ? o.import_trace_limit
@@ -568,6 +573,7 @@ void run_boot_thread() {
     cfg.capture_host_stack = &capture_host_stack;
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
     cfg.host_function_start = host_function_start;
+    cfg.console_mode = static_cast<uint32_t>(g_options.console_mode);
     const guest::BootResult result = guest::run_boot(cfg);
     if (!g_finishing.exchange(true)) {
         write_outputs(g_options.quiet);

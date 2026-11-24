@@ -61,6 +61,15 @@ struct HostFrame {
     uint64_t offset = 0;
 };
 
+// One dispatched (indirect or import) call: target, the return address the guest `call` pushed
+// (whatever is at [rsp] for a tail jump), and the first two integer arguments.
+struct DispatchRecord {
+    uint64_t target = 0;
+    uint64_t return_address = 0;
+    uint64_t rcx = 0;
+    uint64_t rdx = 0;
+};
+
 struct FaultRecord {
     bool present = false;
     std::string kind;
@@ -76,6 +85,7 @@ struct FaultRecord {
     std::vector<Frame> frames;
     bool has_host_frames = false;
     std::vector<HostFrame> host_frames;
+    std::vector<DispatchRecord> recent_dispatches;  // faulting thread, oldest first
 };
 
 struct ExecRange {
@@ -244,6 +254,7 @@ struct BootState {
     std::vector<Milestone> milestones;
     std::vector<FirstCall> first_calls;  // guarded by `mutex`
     std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
+    std::vector<std::string> trace_strings;  // string arguments of each trace entry
     size_t trace_limit = 0;
     bool trace_truncated = false;
     std::unordered_map<const GuestThreadContext*, RecentImport> thread_last;  // guarded by `mutex`
@@ -292,6 +303,10 @@ thread_local bool t_running_boot = false;
 // attributing arena events to the API that caused them.
 thread_local long t_last_import = -1;
 thread_local uint64_t t_last_import_seq = 0;
+// Ring of the last dispatched calls on this thread (fault reports).
+constexpr size_t kDispatchRing = 32;
+thread_local DispatchRecord t_dispatch_ring[kDispatchRing];
+thread_local uint64_t t_dispatch_count = 0;
 
 void logf(const char* fmt, ...) {
     if (!boot().log_progress) {
@@ -706,6 +721,10 @@ void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t de
         }
     }
     capture_host_frames(r);
+    const uint64_t count = std::min<uint64_t>(t_dispatch_count, kDispatchRing);
+    for (uint64_t k = t_dispatch_count - count; k < t_dispatch_count; ++k) {
+        r.recent_dispatches.push_back(t_dispatch_ring[k % kDispatchRing]);
+    }
 }
 
 [[noreturn]] void stop_boot() {
@@ -788,12 +807,71 @@ void stop_on_limit(GuestState* state, const char* kind, uint64_t target) {
     stop_boot();
 }
 
+// ` aN="..."` / ` aN=L"..."` for integer arguments that point at a readable, printable NUL-ended
+// (or 48+ character) ASCII or UTF-16 string in guest memory (import trace only).
+std::string describe_string_args(const uint64_t (&args)[5]) {
+    BootState& b = boot();
+    std::string out;
+    if (b.arena == nullptr) {
+        return out;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        const uint64_t va = args[i];
+        if (va < b.arena->space_base() || va - b.arena->space_base() >= b.arena->space_size()) {
+            continue;
+        }
+        uint8_t bytes[96];
+        size_t len = sizeof(bytes);
+        while (len >= 8 && !b.arena->read(va, bytes, len)) {
+            len /= 2;
+        }
+        if (len < 8) {
+            continue;
+        }
+        auto printable = [](uint8_t c) { return c >= 0x20 && c < 0x7F; };
+        std::string text;
+        bool wide = false;
+        size_t n = 0;
+        while (n < len && printable(bytes[n])) {
+            ++n;
+        }
+        if (n >= 3 && (n == len || bytes[n] == 0)) {
+            text.assign(reinterpret_cast<const char*>(bytes), std::min<size_t>(n, 48));
+        } else {
+            size_t w = 0;
+            while (2 * w + 1 < len && printable(bytes[2 * w]) && bytes[2 * w + 1] == 0) {
+                ++w;
+            }
+            if (w >= 3 && (2 * w + 1 >= len || (bytes[2 * w] == 0 && bytes[2 * w + 1] == 0))) {
+                wide = true;
+                for (size_t k = 0; k < w && k < 48; ++k) {
+                    text.push_back(static_cast<char>(bytes[2 * k]));
+                }
+            }
+        }
+        if (!text.empty()) {
+            out += " a" + std::to_string(i) + (wide ? "=L\"" : "=\"") + text + "\"";
+        }
+    }
+    return out;
+}
+
 void boot_dispatch_observer(GuestState* state, uint64_t target) {
     BootState& b = boot();
     if (!b.running) {
         return;
     }
     const uint64_t n = b.dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        DispatchRecord& d = t_dispatch_ring[t_dispatch_count++ % kDispatchRing];
+        d.target = target;
+        d.rcx = state->gpr[GuestReg::Rcx];
+        d.rdx = state->gpr[GuestReg::Rdx];
+        d.return_address = 0;
+        if (b.arena != nullptr) {
+            read_u64(*b.arena, state->gpr[GuestReg::Rsp], d.return_address);
+        }
+    }
     if (is_synthetic_address(target)) {
         const long index = import_for_target(target);
         if (index >= 0) {
@@ -812,6 +890,10 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
             }
             entry.thread = t_active != nullptr ? t_active->thread_id : 0;
             const BootImport& imp = b.imports[static_cast<size_t>(index)].import;
+            std::string strings;
+            if (b.trace_limit != 0) {
+                strings = describe_string_args(entry.args);
+            }
             const char* first_call_milestone = nullptr;
             bool first_call = false;
             if (previous == 0 && imp.symbol != nullptr) {
@@ -835,6 +917,7 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                 if (b.trace_limit != 0) {
                     if (b.trace.size() < b.trace_limit) {
                         b.trace.push_back(entry);
+                        b.trace_strings.push_back(std::move(strings));
                     } else {
                         b.trace_truncated = true;
                     }
@@ -1485,6 +1568,15 @@ std::string build_report() {
     }
     o += f.frames.empty() ? "]},\n" : "\n  ]},\n";
 
+    o += "  \"recent_dispatches\": [";
+    for (size_t i = 0; i < f.recent_dispatches.size(); ++i) {
+        const DispatchRecord& d = f.recent_dispatches[i];
+        o += (i == 0 ? "\n    " : ",\n    ");
+        o += "{\"target\": " + hex(d.target) + ", \"return_address\": " + hex(d.return_address) +
+             ", \"rcx\": " + hex(d.rcx) + ", \"rdx\": " + hex(d.rdx) + "}";
+    }
+    o += f.recent_dispatches.empty() ? "],\n" : "\n  ],\n";
+
     if (f.has_host_frames) {
         o += "  \"host_frames\": [";
         for (size_t i = 0; i < f.host_frames.size(); ++i) {
@@ -1756,6 +1848,15 @@ std::string build_summary() {
             for (const HostFrame& h : f.host_frames) {
                 std::snprintf(line, sizeof(line), "    sub_%" PRIX64 " (+0x%" PRIx64 " host)\n", h.function,
                               h.offset);
+                s += line;
+            }
+        }
+        if (!f.recent_dispatches.empty()) {
+            s += "  last dispatched calls on the faulting thread (oldest first):\n";
+            for (const DispatchRecord& d : f.recent_dispatches) {
+                std::snprintf(line, sizeof(line),
+                              "    -> 0x%016" PRIx64 " from 0x%016" PRIx64 " %s rcx=%" PRIx64 " rdx=%" PRIx64 "\n",
+                              d.target, d.return_address, function_text(d.return_address).c_str(), d.rcx, d.rdx);
                 s += line;
             }
         }
@@ -2122,6 +2223,12 @@ std::string import_trace_text() {
                       r.seq, r.thread, import_label(b.imports[r.import_index].import).c_str(), r.args[0],
                       r.args[1], r.args[2], r.args[3], r.args[4]);
         out += line;
+        const size_t k = static_cast<size_t>(&r - b.trace.data());
+        if (k < b.trace_strings.size() && !b.trace_strings[k].empty()) {
+            out.pop_back();  // the newline
+            out += b.trace_strings[k];
+            out += '\n';
+        }
     }
     if (b.trace_truncated) {
         out += "# truncated at the trace limit\n";
@@ -2193,12 +2300,14 @@ void reset_boot() {
     b.milestones.clear();
     b.first_calls.clear();
     b.trace.clear();
+    b.trace_strings.clear();
     b.trace_limit = 0;
     b.trace_truncated = false;
     b.thread_last.clear();
     b.thread_states.clear();
     t_last_import = -1;
     t_last_import_seq = 0;
+    t_dispatch_count = 0;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);
         b.arena_log.clear();
@@ -2240,6 +2349,13 @@ BootResult run_boot(const BootConfig& config) {
     // idempotent) and the command line GetCommandLineA/W report.
     os::win32::register_all_shim_exports();
     os::win32::set_command_line(config.command_line.empty() ? "game.exe" : config.command_line);
+    if (config.console_mode != 0) {
+        // Console-mode value the title reads at startup to pick its console type.
+        constexpr uint32_t kRegDword = 4;
+        const uint32_t mode = config.console_mode;
+        os::win32::registry_set_value("HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM",
+                                      u"ConsoleMode", kRegDword, &mode, sizeof(mode));
+    }
     b.active = true;
 
     auto finish = [&]() {
