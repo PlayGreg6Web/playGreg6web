@@ -1889,7 +1889,10 @@ std::string build_report() {
              ", \"neighbour_pairs\": " + std::to_string(c.neighbour_pairs) +
              ", \"neighbour_pairs_contiguous\": " + std::to_string(c.neighbour_pairs_contiguous) +
              ", \"neighbour_pairs_reversed\": " + std::to_string(c.neighbour_pairs_reversed) +
-             ", \"regions\": [";
+             ", \"run_kept\": " + std::to_string(c.run_kept) + ", \"run_moves\": " + std::to_string(c.run_moves) +
+             ", \"run_breaks\": " + std::to_string(c.run_breaks) +
+             ", \"run_relocations\": " + std::to_string(c.run_relocations) +
+             ", \"run_bytes_moved\": " + std::to_string(c.run_bytes_moved) + ", \"regions\": [";
         for (size_t k = 0; k < c.regions.size(); ++k) {
             const auto& r = c.regions[k];
             o += std::string(k == 0 ? "" : ", ") + "{\"base\": " + hex(r.base) + ", \"size\": " + hex(r.size) +

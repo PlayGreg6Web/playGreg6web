@@ -554,6 +554,24 @@ void swap_frames_locked(XMemState& st, PhysicalPage& page, PhysicalPage& other, 
     retarget_window_slots_locked(other);
 }
 
+// O31: the reservation whose slots the keeper may move `page`'s bytes between: the one holding the
+// page's first real mapping (pool_va), the title's pool view, which it never reads
+// (os/xmem_windows.h). Null when the page has none. Bytes at any other real mapping (the title's
+// XMem heaps, mapped right after the pool view) stay where they are: the title reads them there.
+const VirtualRegion* frame_region_locked(XMemState& st, const PhysicalPage& page) {
+    if (page.pool_va == 0) {
+        return nullptr;
+    }
+    const VirtualRegion* r = st.region_containing_locked(page.pool_va, 1);
+    return r != nullptr && !r->translated && !r->phantom ? r : nullptr;
+}
+
+// O31: whether guest VA `va` is a frame `page`'s bytes may move to or from.
+bool is_frame_locked(XMemState& st, uint64_t va, const PhysicalPage& page) {
+    const VirtualRegion* r = frame_region_locked(st, page);
+    return r != nullptr && st.region_containing_locked(va, 1) == r;
+}
+
 // O29: puts `page`'s bytes at `want` (swapping with the page living there) unless that page is in
 // a window run or `page`'s bytes also serve another window slot. False if not possible.
 bool place_at_locked(XMemState& st, PhysicalPage& page, uint64_t want) {
@@ -562,7 +580,8 @@ bool place_at_locked(XMemState& st, PhysicalPage& page, uint64_t want) {
     }
     PhysicalPage* other = home_owner_locked(st, want);
     if (page.window_slots.size() > 1 || other == nullptr || other == &page || !other->window_slots.empty() ||
-        other->page_size != page.page_size) {
+        other->page_size != page.page_size || !is_frame_locked(st, want, page) ||
+        (page.home_va != 0 && !is_frame_locked(st, page.home_va, page))) {
         return false;
     }
     swap_frames_locked(st, page, *other, want);
@@ -572,14 +591,22 @@ bool place_at_locked(XMemState& st, PhysicalPage& page, uint64_t want) {
 // O29: merging runs. Moves the pages of the window run [first, first + n slots) into n consecutive
 // frames (homes of pages that are in no window run) of a real mapping outside the window, in slot
 // order. False if a page of the run serves another window slot or no such frames exist.
+// O31: all within the members' pool view (frame_region_locked).
 bool relocate_run_locked(XMemState& st, uint64_t first, uint64_t n, uint64_t ps) {
     std::vector<PhysicalPage*> members;
     members.reserve(static_cast<size_t>(n));
+    const VirtualRegion* frames = nullptr;
     for (uint64_t i = 0; i < n; ++i) {
         PhysicalPage* m = window_page_locked(st, first + i * ps);
         if (m == nullptr || m->window_slots.size() != 1 || m->page_size != ps) {
             return false;
         }
+        const VirtualRegion* r = frame_region_locked(st, *m);
+        if (r == nullptr || (frames != nullptr && r != frames) ||
+            (m->home_va != 0 && st.region_containing_locked(m->home_va, 1) != r)) {
+            return false;
+        }
+        frames = r;
         members.push_back(m);
     }
     // First fit: n consecutive guest VAs of real mappings outside the window whose bytes belong
@@ -592,7 +619,8 @@ bool relocate_run_locked(XMemState& st, uint64_t first, uint64_t n, uint64_t ps)
             continue;
         }
         PhysicalPage* owner = home_owner_locked(st, va);
-        const bool free = owner != nullptr && owner->window_slots.empty() && owner->page_size == ps;
+        const bool free = owner != nullptr && owner->window_slots.empty() && owner->page_size == ps &&
+                          st.region_containing_locked(va, 1) == frames;
         if (!free) {
             found = 0;
             continue;

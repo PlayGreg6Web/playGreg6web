@@ -122,7 +122,8 @@
 // lifted_tables, functions_registered, imports {total, bound, unresolved, by_dll [{dll, bound,
 // unresolved}]}, process {peb, process_parameters}, main_thread {teb, stack_base, stack_limit,
 // tls_vector, tls_block}}, memory {model, cpu_window {maps, neighbour_pairs,
-// neighbour_pairs_contiguous, neighbour_pairs_reversed, regions [{base, size, translated, mapped_slots, aliased_slots, runs,
+// neighbour_pairs_contiguous, neighbour_pairs_reversed, run_kept, run_moves, run_breaks,
+// run_relocations, run_bytes_moved, regions [{base, size, translated, mapped_slots, aliased_slots, runs,
 // longest_run, adjacent_pairs, aliased_pairs, contiguous_pairs}]} (os/xbox_scarlett.h
 // XMemWindowContiguity), window {enabled, mapped_slots,
 // contiguous_pairs, split_pairs, map_calls} (os/guest_window.h)}, elapsed_ms. Addresses are "0x..." strings (null when absent); counts

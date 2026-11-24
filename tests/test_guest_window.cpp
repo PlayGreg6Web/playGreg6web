@@ -437,6 +437,51 @@ void test_xmem_window_run_keeper() {
     gw::reset_for_testing();
 }
 
+// O31: the keeper only moves bytes within the reservation where the page was first mapped (the
+// pool view). The windowed boot of the title faulted when it swapped a page the title uses in an
+// XMem heap mapped right after the pool view.
+void test_xmem_run_keeper_stays_in_the_pool() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    CHECK(cpu != nullptr && va_of(cpu) == W);
+    size_t count = 5;
+    uint64_t pfn[5] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 5);
+    // Pool view of four pages, and right after it a heap region holding the fifth page.
+    void* view = pg6_xbox_XMemVirtualAlloc(nullptr, 5 * k64K, kWindowType & ~0x400000u, 0x23u, kCpuProtect);
+    CHECK(view != nullptr);
+    CHECK(xmem_virtual_free(view));  // only to learn a free range of five pages
+    void* pool = pg6_xbox_XMemVirtualAlloc(view, 4 * k64K, kWindowType & ~0x400000u, 0x23u, kCpuProtect);
+    void* heap = pg6_xbox_XMemVirtualAlloc(static_cast<uint8_t*>(view) + 4 * k64K, k64K,
+                                           kWindowType & ~0x400000u, 0x23u, kCpuProtect);
+    CHECK(pool != nullptr && heap != nullptr);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(pool, 4, pfn) == pool);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(heap, 1, pfn + 4) == heap);
+    for (int i = 0; i < 4; ++i) {
+        std::memset(static_cast<uint8_t*>(pool) + i * k64K, 0x10 + i, k64K);
+    }
+    std::memset(heap, 0xEE, k64K);
+    // Slot 0 <- pool page 3 (the pool's last frame), slot 1 <- pool page 0: the frame after page 3
+    // is the heap's page, which must not move; the run moves to two free pool frames instead.
+    const uint64_t vas[] = {W, W + k64K};
+    const uint64_t pages[] = {pfn[3], pfn[0]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(vas, 2, pages) == 1);
+    CHECK(static_cast<uint8_t*>(heap)[0] == 0xEE && static_cast<uint8_t*>(heap)[k64K - 1] == 0xEE);
+    const XMemWindowContiguity c = xmem_window_contiguity();
+    CHECK(c.run_breaks == 0 && c.run_relocations == 1 && g_violation == 0);
+    const uint8_t* run = static_cast<const uint8_t*>(gw::contiguous(W, 2 * k64K));
+    CHECK(run != nullptr && run[0] == 0x13 && run[k64K - 1] == 0x13 && run[k64K] == 0x10);
+    gw::set_contiguous_runs_required(false);
+    CHECK(xmem_virtual_free(cpu));
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -446,6 +491,7 @@ int main() {
     test_com_bridge_window();
     test_xmem_translated_cpu_window();
     test_xmem_window_run_keeper();
+    test_xmem_run_keeper_stays_in_the_pool();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
