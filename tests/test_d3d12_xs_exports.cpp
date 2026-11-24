@@ -1745,7 +1745,7 @@ void test_compute_views_and_public_list() {
 
 namespace XSlot {
 // ID3D12Device (Xbox)
-constexpr uint32_t FeatureToggle = 49, RemovalCallbacks = 50, CreatePsoWithOverrides = 55, CreateComputePsoX = 57,
+constexpr uint32_t FeatureToggle = 49, RemovalCallbacks = 50, CreatePsoWithOverrides = 55, CreateNativePso = 57,
                    Slot61 = 61, PsoFromBlob = 62, PsoFromBlobCached = 67, SrvAtAddress = 70, UavAtAddress = 71,
                    PagePool = 74, SetFrameInterval = 78, ScheduleFrameEvent = 79, WaitFrameEvent = 80,
                    FrameStatistics = 81, CreatePsoStream = 86, CreateStateObject = 101, AllocationInfo1 = 108,
@@ -2069,7 +2069,7 @@ void test_xbox_pipeline_streams_and_overrides() {
     scene.execute({list});
     CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);
 
-    // Compute stream (root signature + CS) and the Xbox compute slot 57.
+    // Compute stream (root signature + CS) and the public compute slot 11.
     const std::vector<uint8_t> cs{'D', 'X', 'B', 'C', 0x57};
     dev->register_shader_module(dg::shader_identity(cs.data(), cs.size()), 9300);
     StreamBuilder c;
@@ -2082,7 +2082,8 @@ void test_xbox_pipeline_streams_and_overrides() {
     dg::GuestComputePipelineStateDesc cd{};
     cd.pRootSignature = scene.rs;
     cd.CS = {put_bytes(cs.data(), cs.size()), cs.size()};
-    const uint64_t cpso57 = fx.create(scene.device, XSlot::CreateComputePsoX, {I(put(cd))}, dg::IID_ID3D12PipelineState, &result);
+    const uint64_t cpso57 = fx.create(scene.device, Slot2::CreateComputePipelineState, {I(put(cd))},
+                                      dg::IID_ID3D12PipelineState, &result);
     CHECK(result == 0 && object_of<dg::PipelineState>(cpso57)->is_compute());
 
     // Mesh stream: a placeholder that binds as unresolved (never a null pointer).
@@ -2120,6 +2121,167 @@ void test_xbox_pipeline_streams_and_overrides() {
 
     CHECK(t_balanced);
     scene.release_all({list, pso, derived, cpso, cpso57, mpso});
+}
+
+// G32: console-native pipelines (Xbox slot 57). Synthetic records built from the range layout in
+// d3d12_xs_xbox.h; the bytes are arbitrary patterns.
+std::vector<uint8_t> byte_pattern(size_t n, uint8_t seed) {
+    std::vector<uint8_t> v(n);
+    for (size_t i = 0; i < n; ++i) {
+        v[i] = static_cast<uint8_t>(seed * 31 + i * 7);
+    }
+    return v;
+}
+
+uint64_t put_aligned(const std::vector<uint8_t>& bytes, uint64_t alignment = 256) {
+    const uint64_t va = com::guest_alloc(bytes.size() + alignment);
+    CHECK(va != 0);
+    const uint64_t aligned = (va + alignment - 1) / alignment * alignment;
+    CHECK(com::write_guest(aligned, bytes.data(), bytes.size()));
+    return aligned;
+}
+
+void test_xbox_native_pipelines() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    using R = dg::xbox::NativeRange;
+    namespace xb = dg::xbox;
+
+    const std::vector<uint8_t> header = byte_pattern(0x184, 1), meta = byte_pattern(0x50, 2);
+    const std::vector<uint8_t> vs_code = byte_pattern(0x140, 3), vs_meta = byte_pattern(0x30, 4);
+    const std::vector<uint8_t> ps_code = byte_pattern(0x180, 5), ps_meta = byte_pattern(0x70, 6);
+    const uint64_t header_va = put_bytes(header.data(), header.size());
+    const uint64_t meta_va = put_bytes(meta.data(), meta.size());
+    const uint64_t vs_code_va = put_aligned(vs_code), vs_meta_va = put_bytes(vs_meta.data(), vs_meta.size());
+    const uint64_t ps_code_va = put_aligned(ps_code), ps_meta_va = put_bytes(ps_meta.data(), ps_meta.size());
+    auto set = [](xb::GuestNativePipelineDesc& d, R r, uint64_t address, uint64_t size) {
+        d.ranges[static_cast<size_t>(r)] = xb::GuestNativeRange{address, size};
+    };
+    auto desc = [&](bool pixel, bool alt) {
+        xb::GuestNativePipelineDesc d{};
+        d.pRootSignature = scene.rs;
+        set(d, R::Header, header_va, header.size());
+        set(d, R::PipelineMetadata, meta_va, meta.size());
+        if (pixel) {
+            set(d, R::PixelCode, ps_code_va, ps_code.size());
+            set(d, R::PixelMetadata, ps_meta_va, ps_meta.size());
+        }
+        set(d, alt ? R::VertexCodeAlt : R::VertexCode, vs_code_va, vs_code.size());
+        set(d, alt ? R::VertexMetadataAlt : R::VertexMetadata, vs_meta_va, vs_meta.size());
+        return d;
+    };
+
+    // Unit: the range layout rules.
+    xb::NativePipeline p;
+    std::string error;
+    CHECK(xb::parse_native_pipeline(desc(true, false), &p, &error));
+    CHECK(p.root_signature == scene.rs && p.header.address == header_va && p.header.size == header.size() &&
+          p.metadata.size == meta.size() && p.pixel.present() && p.pixel.code.address == ps_code_va &&
+          p.vertex.code.address == vs_code_va && p.vertex.metadata.size == vs_meta.size() && !p.vertex_alt);
+    CHECK(xb::parse_native_pipeline(desc(false, true), &p, &error));
+    CHECK(!p.pixel.present() && p.vertex_alt && p.vertex.code.address == vs_code_va);
+    auto rejects = [&](xb::GuestNativePipelineDesc d, const char* message) {
+        const bool ok = xb::parse_native_pipeline(d, &p, &error);
+        CHECK(!ok && error.find(message) != std::string::npos);
+    };
+    xb::GuestNativePipelineDesc bad = desc(true, false);
+    bad.ranges[6] = bad.ranges[4];
+    bad.ranges[7] = bad.ranges[5];
+    rejects(bad, "two vertex stages");
+    bad = desc(true, false);
+    bad.ranges[4] = bad.ranges[5] = {};
+    rejects(bad, "no vertex stage");
+    bad = desc(true, false);
+    bad.ranges[4].address += 4;
+    rejects(bad, "256-byte aligned");
+    bad = desc(true, false);
+    bad.ranges[3] = {};
+    rejects(bad, "pixel stage has code without metadata");
+    bad = desc(true, false);
+    bad.ranges[0] = {};
+    rejects(bad, "no header record");
+    bad = desc(true, false);
+    bad.ranges[1].size = 0;
+    rejects(bad, "address or a size but not both");
+    bad = desc(true, false);
+    bad.ranges[2].size = xb::kMaxNativeRangeBytes + 256;
+    rejects(bad, "too large");
+
+    // Slot 57: an unresolved graphics pipeline state with one identity per stage (code, then metadata).
+    const uint64_t vs_id = dg::native_stage_identity(vs_code.data(), vs_code.size(), vs_meta.data(), vs_meta.size());
+    const uint64_t ps_id = dg::native_stage_identity(ps_code.data(), ps_code.size(), ps_meta.data(), ps_meta.size());
+    std::vector<uint8_t> concat = vs_code;
+    concat.insert(concat.end(), vs_meta.begin(), vs_meta.end());
+    CHECK(vs_id == dg::shader_identity(concat.data(), concat.size()) && vs_id != ps_id);
+    const uint64_t pso = fx.create(scene.device, XSlot::CreateNativePso, {I(put(desc(true, false)))},
+                                   dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    auto* state = object_of<dg::PipelineState>(pso);
+    CHECK(!state->is_compute() && !state->resolved() && state->graphics_source() == nullptr &&
+          !state->unsupported_reason().empty());
+    CHECK(state->native() != nullptr && state->native()->vertex_identity == vs_id &&
+          state->native()->pixel_identity == ps_id && state->native()->header == header);
+    CHECK((state->shader_identities() == std::vector<uint64_t>{vs_id, ps_id}));
+    CHECK(dev->shader_size(vs_id) == vs_code.size() && dev->shader_size(ps_id) == ps_code.size());
+    CHECK(load64(pso + 0x10) == xb::kPipelineStateTag && load64(pso + 0x18) == pso);
+    // The same stages elsewhere in memory keep their identities; other metadata gives another one.
+    const uint64_t vs_code_copy = put_aligned(vs_code);
+    xb::GuestNativePipelineDesc moved = desc(true, false);
+    moved.ranges[4].address = vs_code_copy;
+    const uint64_t pso_moved = fx.create(scene.device, XSlot::CreateNativePso, {I(put(moved))},
+                                         dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && object_of<dg::PipelineState>(pso_moved)->native()->vertex_identity == vs_id);
+    const std::vector<uint8_t> vs_meta2 = byte_pattern(0x30, 9);
+    xb::GuestNativePipelineDesc depth_only = desc(false, true);
+    depth_only.ranges[7].address = put_bytes(vs_meta2.data(), vs_meta2.size());
+    const uint64_t pso_depth = fx.create(scene.device, XSlot::CreateNativePso, {I(put(depth_only))},
+                                         dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso_depth != 0);
+    const dg::PipelineState::Native* dn = object_of<dg::PipelineState>(pso_depth)->native();
+    CHECK(dn->vertex_identity != vs_id && dn->pixel_identity == 0 && dn->layout.vertex_alt);
+    CHECK((dev->native_stage_counts() == std::array<uint32_t, 2>{2, 1}));
+    CHECK(dev->unresolved_shaders().empty());  // the DXIL list stays for the shader track
+    CHECK(counter(dev, xb::Counter::NativePipelineStates) == 3);
+    // Malformed descriptor: E_INVALIDARG and a cleared out pointer.
+    bad = desc(true, false);
+    bad.ranges[0] = {};
+    CHECK(fx.create(scene.device, XSlot::CreateNativePso, {I(put(bad))}, dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kEInvalidArg);
+    CHECK(counter(dev, xb::Counter::NativePipelineStatesRejected) == 1);
+
+    // Slot 55 on a native base: the base is handed out, the override entries are counted.
+    std::vector<uint8_t> overrides(2 * xb::kPsoOverrideStride, 0);
+    const uint32_t blend_kind = 2;
+    std::memcpy(overrides.data() + xb::kPsoOverrideStride, &blend_kind, 4);
+    const uint64_t derived = fx.create(scene.device, XSlot::CreatePsoWithOverrides,
+                                       {I(pso), I(2), I(put_bytes(overrides.data(), overrides.size()))},
+                                       dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && derived == pso);
+    CHECK(counter(dev, xb::Counter::NativeOverridesIgnored) == 2);
+
+    // The draw binds it as a graphics pipeline and is skipped (described once, with the stages).
+    const uint64_t skipped_before = dev->stats().skipped_draws;
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 0);
+    CHECK(dev->stats().skipped_draws == skipped_before + 2);
+    const std::vector<std::string> reports = dev->skipped_draw_reports();
+    CHECK(contains(reports, "native stages: vertex 320 B code + 48 B metadata (ranges 4/5), pixel 384 B code + "
+                            "112 B metadata; header record 388 B, pipeline metadata 80 B;"));
+    CHECK(contains(reports, "console-native pipeline"));
+
+    CHECK(t_balanced);
+    scene.release_all({list, derived, pso, pso_moved, pso_depth});
 }
 
 void test_xbox_device_queue_and_list_slots() {
@@ -2332,6 +2494,7 @@ int main() {
     test_xbox_frame_loop_present_and_pacing();
     test_frame_pacer_unit();
     test_xbox_pipeline_streams_and_overrides();
+    test_xbox_native_pipelines();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();
     if (g_failures != 0) {

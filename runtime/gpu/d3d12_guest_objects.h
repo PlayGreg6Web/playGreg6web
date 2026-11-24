@@ -475,6 +475,7 @@ struct IDeviceHost : IObjectHost {
     virtual HResult Slot50_RegisterRemovalCallbacks_unverified(uint64_t a, uint64_t b, uint64_t c) = 0;  // 50
     virtual HResult CreatePipelineStateWithOverrides(InterfaceArg<IPipelineStateHost> base, uint32_t count,
                                                      uint64_t overrides, const Guid& riid, OutPtr out) = 0;  // 55
+    virtual HResult CreateNativePipelineState(uint64_t desc, const Guid& riid, OutPtr out) = 0;          // 57
     virtual HResult Slot61_unverified(uint64_t a, uint64_t b) = 0;                                       // 61
     virtual HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) = 0;                   // 62, 67
     virtual void CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) = 0;  // 70
@@ -594,6 +595,7 @@ public:
     HResult Slot50_RegisterRemovalCallbacks_unverified(uint64_t a, uint64_t b, uint64_t c) override;
     HResult CreatePipelineStateWithOverrides(InterfaceArg<IPipelineStateHost> base, uint32_t count, uint64_t overrides,
                                              const Guid& riid, OutPtr out) override;
+    HResult CreateNativePipelineState(uint64_t desc, const Guid& riid, OutPtr out) override;
     HResult Slot61_unverified(uint64_t a, uint64_t b) override;
     HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) override;
     void CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) override;
@@ -629,6 +631,9 @@ public:
     // A pipeline state that binds as "unresolved" (draws skipped) for pipelines the layer cannot
     // build (mesh shaders, ...): handed out instead of a null pointer the caller would dereference.
     HResult create_placeholder_pso(const std::string& reason, const Guid& riid, OutPtr out);
+    // A console-native graphics pipeline (Xbox slot 57, d3d12_xs_xbox.h): unresolved, with one
+    // identity per stage (native_stage_identity).
+    HResult create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out);
 
     // ---- Shaders ----
     // Shader identity (shader_identity(): FNV-1a 64 over the DXIL container bytes the PSO desc passes)
@@ -641,6 +646,11 @@ public:
     std::array<uint32_t, 3> unresolved_shader_stages() const;
     // Root signatures created, by blob version (1.0, 1.1, 1.2).
     std::array<uint32_t, 3> root_signature_versions() const;
+    // Console-native stages (Xbox slot 57): distinct identities are counted per stage (vertex,
+    // pixel) instead of being logged one by one; the first native pipeline is logged once. They are
+    // not in unresolved_shaders() (that list is the DXIL the shader track can translate).
+    void note_native_stages(uint64_t vertex_identity, uint64_t pixel_identity);
+    std::array<uint32_t, 2> native_stage_counts() const;
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
     void note_shader_size(uint64_t identity, uint64_t bytes, int kind = -1);
@@ -731,6 +741,7 @@ private:
     std::array<uint32_t, 3> unresolved_by_stage_{};
     std::array<uint32_t, 3> root_signature_versions_{};  // under shader_mutex_
     std::unordered_set<uint64_t> known_shaders_;
+    std::unordered_set<uint64_t> native_stages_[2];  // under shader_mutex_ (vertex, pixel)
     struct ShaderFacts {
         uint64_t bytes = 0;
         int kind = -1;

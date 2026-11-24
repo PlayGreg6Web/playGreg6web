@@ -1291,7 +1291,7 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),  // 54
     DevM::method<&IDeviceHost::CreatePipelineStateWithOverrides>("CreatePipelineStateWithOverrides (Xbox slot 55)"),  // 55
     DevM::stub(nullptr),  // 56
-    DevM::method<&IDeviceHost::CreateComputePipelineState>("CreateComputePipelineState (Xbox slot 57)"),  // 57
+    DevM::method<&IDeviceHost::CreateNativePipelineState>("CreatePipelineState native (Xbox slot 57)"),  // 57
     DevM::stub(nullptr),  // 58
     DevM::stub(nullptr),  // 59
     DevM::stub(nullptr),  // 60

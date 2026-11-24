@@ -45,6 +45,8 @@
 // shader pair goes through StateBridgeDevice::register_pipeline_layout. A PSO whose shaders have no
 // module is "unresolved": binding it diagnoses, records the identities (Device::unresolved_shaders)
 // and every draw with it is skipped (Device::stats().skipped_draws), never emitted with module 0.
+// Console-native pipelines (Xbox slot 57) carry GPU machine code instead of DXIL: their stages get
+// native_stage_identity() identities and they are always unresolved (d3d12_xs_xbox.h).
 //
 // Command lists
 // -------------
@@ -65,6 +67,9 @@ namespace playgta6::gpu::d3d12_guest {
 
 // FNV-1a 64 over `size` bytes (shader identity, see the header comment).
 uint64_t shader_identity(const void* data, size_t size);
+// Identity of a console-native stage (Xbox slot 57): FNV-1a 64 over the code bytes followed by the
+// stage's metadata bytes (one hash over the concatenation).
+uint64_t native_stage_identity(const void* code, size_t code_size, const void* metadata, size_t metadata_size);
 
 class Heap final : public ChildBase<IHeapHost> {
 public:
@@ -186,6 +191,15 @@ public:
     const GraphicsPsoSource* graphics_source() const { return source_.get(); }
     // Why a placeholder was created instead of a pipeline (mesh shaders, ...); empty otherwise.
     const std::string& unsupported_reason() const { return unsupported_; }
+    // Console-native graphics pipeline (Xbox slot 57): the range layout, a copy of the header
+    // record (kept, not decoded) and the stage identities. Null for every other pipeline state.
+    struct Native {
+        xbox::NativePipeline layout;
+        std::vector<uint8_t> header;
+        uint64_t vertex_identity = 0;
+        uint64_t pixel_identity = 0;  // 0 = no pixel stage
+    };
+    const Native* native() const { return native_.get(); }
 
 private:
     friend class Device;
@@ -193,6 +207,7 @@ private:
     std::unique_ptr<bridge::GraphicsPipelineState> graphics_;
     std::unique_ptr<bridge::ComputePipelineState> compute_;
     std::unique_ptr<GraphicsPsoSource> source_;
+    std::unique_ptr<Native> native_;
     std::vector<uint64_t> identities_;
     std::string unsupported_;
     bool resolved_ = false;

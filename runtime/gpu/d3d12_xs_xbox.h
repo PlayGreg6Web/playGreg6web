@@ -39,12 +39,15 @@
 //              override = {u32 kind; desc}: kind 0 DEPTH_STENCIL_DESC, 1 RASTERIZER_DESC, 2 BLEND_DESC
 //              (byte layouts match the public structs), kind 5 unknown (ignored, counted). The
 //              result is read unconditionally: a pipeline state is always handed out. (high shape)
-//   57    1    (desc, riid, out), desc = D3D12_COMPUTE_PIPELINE_STATE_DESC-shaped (root signature
-//              first, from a compile queue)                       CreateComputePipelineState (medium)
+//              The bases are slot-57 pipelines (see "Console-native pipelines" below).
+//   57    1    (desc, IID_ID3D12PipelineState, out): a console-native graphics pipeline
+//              (GuestNativePipelineDesc below)                    native PSO, unresolved (high shape)
 //   61    1    (a, b); ignored                                     S_OK no-op (low)
-//   62    1    ({blob, .., flags=1}, 0, 0, riid, out); failure frees the blob and returns false
-//   67    1    (&{blob}, riid, out) from a PSO cache; failure falls back to slot 62
-//              Both create a PSO from a title-compiled blob (format unknown): E_NOTIMPL, *out = 0.
+//   62    1    (desc, 0, 0, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC with a DXIL
+//              compute shader; failure frees the bytecode and returns false
+//   67    1    (&desc, riid, out) from a PSO cache: a console-native compute pipeline (root
+//              signature + {address, size} ranges like slot 57); failure falls back to slot 62
+//              Both refused (E_NOTIMPL, *out = 0).
 //   70    2+   (RESOURCE_DESC (buffer), SRV desc + u64 GPU address at +0x28, CPU handle)
 //   71    2    (RESOURCE_DESC, UAV desc + u64 GPU address at +0x28, CPU handle)
 //              Buffer views at a GPU address without a resource object (high shape): resolved
@@ -122,6 +125,40 @@
 //  (offset, value, 0, mask): 0xC280/0x20000 per frame, 0xC3C0/0xC380 at creation), 132
 //  ((value, 0, 0, mask)), 142 (value or -1).
 //
+// Console-native pipelines (slots 57 and 67)
+// ------------------------------------------
+// Established from the call sites and from the descriptors the running title passes (local
+// observation; counts from one native boot of about 90 presents):
+//  * Slot 57 is called from one pipeline-compile job: for every pipeline node registered under a
+//    shader-program key it stores the root signature at the node's descriptor (+0x00), passes the
+//    descriptor with IID_ID3D12PipelineState and keeps the result in a map by node key; a failure
+//    leaves the node without a pipeline (no fallback). 25,450 calls, 45 root signatures.
+//  * The descriptor (GuestNativePipelineDesc) is the root signature followed by eight
+//    {address, size} ranges; everything after them was zero. Range 0 is a header record
+//    (380..520 bytes, 5,666 distinct), range 1 per-pipeline metadata (80..340 bytes). The other
+//    ranges come in pairs {code, metadata}: 2/3 the pixel stage, and exactly one of 4/5 or 6/7 the
+//    stage that processes vertices (two hardware layouts; the header's u32 at +0x04 tells them
+//    apart and agrees with the pair used in every call). The pixel pair is absent in 1,360 calls
+//    (depth-only pipelines); a pipeline without the vertex pair was never seen.
+//  * The code ranges are GPU machine code, not DXIL/DXBC: every one is 256-byte aligned (the GPU's
+//    shader-address granularity) and contains the GPU's end-of-program instruction; there is no
+//    container header. Distinct code: 8,838 vertex-stage blobs (320..44,096 bytes) and 9,991
+//    pixel blobs (256..51,328 bytes), about 140 MB in all. The DXIL of the same programs exists
+//    in the title's shader archive (the root signatures are built from it), but slot 57 never
+//    receives it: the shader track's DXIL path does not apply to these pipelines.
+//  * The header record and the metadata are a hardware register image (per-render-target blend
+//    controls, write masks, export formats, ...), not the public state structs. It is not decoded
+//    here, so no D3D12 description (blend/depth/raster/input layout/formats) is derived from it.
+//  * Every slot-57 pipeline is graphics: the per-frame draw binds one (vertex 320 B + pixel 384 B
+//    of code), slot 55 derives depth-stencil/blend variants from them, and no dispatch ever binds
+//    one.
+// The layer therefore creates a graphics pipeline state per call that carries a stable identity
+// per stage (FNV-1a 64 over the stage's code bytes followed by its metadata bytes) and stays
+// unresolved: binding it diagnoses, its draws are skipped (counted, described once). Slot 55 on
+// such a base hands the base out (its overrides cannot be applied to an undecoded state; counted).
+// Slot 67 has the same shape for compute (28-byte header, {code, metadata} ranges) and is refused,
+// which makes the title fall back to slot 62 with the DXIL compute shader.
+
 // Raytracing
 // ----------
 // CheckFeatureSupport(OPTIONS5) reports RaytracingTier NOT_SUPPORTED and CreateStateObject (101)
@@ -179,6 +216,51 @@ static_assert(sizeof(GuestResourceAllocationInfo1) == 24);
 // Device slot 55 override entry: u32 kind, then the description (BLEND_DESC is the largest).
 inline constexpr uint32_t kPsoOverrideStride = 0x14C;
 enum class PsoOverrideKind : uint32_t { DepthStencil = 0, Rasterizer = 1, Blend = 2 };
+
+// Device slot 57 descriptor (see "Console-native pipelines"): the root signature, then eight
+// {address, size} ranges; an absent range is {0, 0}.
+inline constexpr size_t kNativeRangeCount = 8;
+struct GuestNativeRange {
+    uint64_t address;
+    uint64_t size;
+};
+struct GuestNativePipelineDesc {
+    uint64_t pRootSignature;
+    GuestNativeRange ranges[kNativeRangeCount];
+};
+static_assert(sizeof(GuestNativePipelineDesc) == 0x88 && offsetof(GuestNativePipelineDesc, ranges) == 8);
+
+enum class NativeRange : size_t {
+    Header = 0,
+    PipelineMetadata = 1,
+    PixelCode = 2,
+    PixelMetadata = 3,
+    VertexCode = 4,       // vertex stage, layout A
+    VertexMetadata = 5,
+    VertexCodeAlt = 6,    // vertex stage, layout B
+    VertexMetadataAlt = 7,
+};
+inline constexpr uint64_t kNativeCodeAlignment = 256;
+inline constexpr uint64_t kMaxNativeRangeBytes = 4u << 20;
+
+struct NativeStage {
+    GuestNativeRange code{};
+    GuestNativeRange metadata{};
+    bool present() const { return code.size != 0; }
+};
+
+struct NativePipeline {
+    uint64_t root_signature = 0;
+    GuestNativeRange header{};
+    GuestNativeRange metadata{};
+    NativeStage vertex;
+    NativeStage pixel;          // absent for depth-only pipelines
+    bool vertex_alt = false;    // vertex stage in ranges 6/7 (layout B) instead of 4/5
+};
+
+// Checks the range layout (header and metadata present; exactly one vertex pair; pixel pair whole
+// or absent; code 256-byte aligned; sizes bounded). The contents are not interpreted.
+bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* out, std::string* error);
 
 // Device slots 70/71: the public view description followed by the buffer's GPU address.
 inline constexpr uint64_t kViewAtAddressOffset = 0x28;
@@ -260,6 +342,9 @@ enum class Counter : size_t {
     ShadingRateIgnored,
     StreamPipelineStates,
     OverridePipelineStates,
+    NativePipelineStates,        // slot 57
+    NativePipelineStatesRejected,
+    NativeOverridesIgnored,      // slot 55 override entries on a native base
     PlaceholderPipelineStates,
     UnknownOverrideKinds,
     BlobPipelineStatesRefused,

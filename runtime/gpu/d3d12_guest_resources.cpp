@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include "os/os_shim.h"
 #include "os/surface_blocks.h"
@@ -73,6 +74,18 @@ uint64_t shader_identity(const void* data, size_t size) {
     return h;
 }
 
+uint64_t native_stage_identity(const void* code, size_t code_size, const void* metadata, size_t metadata_size) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const auto& [data, size] : {std::pair<const void*, size_t>{code, code_size}, {metadata, metadata_size}}) {
+        const auto* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < size; ++i) {
+            h ^= p[i];
+            h *= 0x00000100000001b3ull;
+        }
+    }
+    return h;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Device: shaders, VA ranges, tracked buffers, diagnostics
 // ---------------------------------------------------------------------------------------------
@@ -110,6 +123,26 @@ void Device::note_unresolved_shader(uint64_t identity, ShaderStage stage) {
 std::array<uint32_t, 3> Device::unresolved_shader_stages() const {
     std::lock_guard<std::mutex> lock(shader_mutex_);
     return unresolved_by_stage_;
+}
+
+void Device::note_native_stages(uint64_t vertex_identity, uint64_t pixel_identity) {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    const bool first = native_stages_[0].empty();
+    if (vertex_identity != 0) {
+        native_stages_[0].insert(vertex_identity);
+    }
+    if (pixel_identity != 0) {
+        native_stages_[1].insert(pixel_identity);
+    }
+    if (first) {
+        os::log("d3d12_xs: console-native graphics pipelines (Xbox slot 57): stage code is GPU machine code, "
+                "not DXIL; their draws are skipped (distinct stages are counted, not listed)");
+    }
+}
+
+std::array<uint32_t, 2> Device::native_stage_counts() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return {static_cast<uint32_t>(native_stages_[0].size()), static_cast<uint32_t>(native_stages_[1].size())};
 }
 
 std::array<uint32_t, 3> Device::root_signature_versions() const {
@@ -1201,6 +1234,52 @@ HResult Device::create_placeholder_pso(const std::string& reason, const Guid& ri
     state->initialize_guest_payload();
     state->unsupported_ = reason;
     note_bad_argument("pipeline state not supported (" + reason + "): draws with it are skipped");
+    return hand_out(std::move(state), riid, out);
+}
+
+HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out) {
+    com::Ref<RootSignature> rs = root_signature_ref(pipeline.root_signature);
+    if (pipeline.root_signature != 0 && !rs) {
+        note_bad_argument("CreatePipelineState (native): invalid root signature " + hex(pipeline.root_signature));
+        return kEInvalidArg;
+    }
+    auto native = std::make_unique<PipelineState::Native>();
+    native->layout = pipeline;
+    native->header.resize(static_cast<size_t>(pipeline.header.size));
+    if (!com::read_guest(pipeline.header.address, native->header.data(), native->header.size())) {
+        note_bad_argument("CreatePipelineState (native): unreadable header record at " + hex(pipeline.header.address));
+        return kEInvalidArg;
+    }
+    // Stage identity: code followed by metadata (both read from guest memory once, here).
+    auto stage_identity = [&](const xbox::NativeStage& s, uint64_t* identity) {
+        *identity = 0;
+        if (!s.present()) {
+            return true;
+        }
+        std::vector<uint8_t> code(static_cast<size_t>(s.code.size));
+        std::vector<uint8_t> meta(static_cast<size_t>(s.metadata.size));
+        if (!com::read_guest(s.code.address, code.data(), code.size()) ||
+            !com::read_guest(s.metadata.address, meta.data(), meta.size())) {
+            note_bad_argument("CreatePipelineState (native): unreadable stage at " + hex(s.code.address));
+            return false;
+        }
+        *identity = native_stage_identity(code.data(), code.size(), meta.data(), meta.size());
+        note_shader_size(*identity, code.size());
+        return true;
+    };
+    if (!stage_identity(pipeline.vertex, &native->vertex_identity) ||
+        !stage_identity(pipeline.pixel, &native->pixel_identity)) {
+        return kEInvalidArg;
+    }
+    auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
+    if (!state) {
+        return kEOutOfMemory;
+    }
+    state->initialize_guest_payload();
+    state->identities_ = {native->vertex_identity, native->pixel_identity};
+    state->unsupported_ = "console-native pipeline: GPU machine code and a register-state record, not translated";
+    note_native_stages(native->vertex_identity, native->pixel_identity);
+    state->native_ = std::move(native);
     return hand_out(std::move(state), riid, out);
 }
 

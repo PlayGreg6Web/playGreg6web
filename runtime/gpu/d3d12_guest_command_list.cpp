@@ -344,33 +344,47 @@ void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32
         s += std::string(" the bound pipeline state has no graphics description") +
              (graphics_pso_->unsupported_reason().empty() ? "" : " (" + graphics_pso_->unsupported_reason() + ")") + ";";
     }
-    static const pso::D3D12GraphicsPsoDesc kNoDesc{};
-    const pso::D3D12GraphicsPsoDesc& d = src != nullptr ? src->desc : kNoDesc;
-    const char* stage_names[] = {"VS", "PS", "DS", "HS", "GS", "AS", "MS"};
-    const uint64_t stages[] = {d.vs, d.ps, d.ds, d.hs, d.gs, d.as, d.ms};
-    s += " shaders";
-    for (size_t i = 0; i < 7; ++i) {
-        if (stages[i] != 0) {
-            s += std::string(" ") + stage_names[i] + " " + std::to_string(device_->shader_size(stages[i])) +
-                 " B DXIL kind " + std::to_string(device_->shader_kind(stages[i])) +
-                 (device_->shader_known(stages[i]) ? "" : " (no module)");
+    if (const PipelineState::Native* n = graphics_pso_ != nullptr ? graphics_pso_->native() : nullptr) {
+        const xbox::NativePipeline& l = n->layout;
+        s += " native stages: vertex " + std::to_string(l.vertex.code.size) + " B code + " +
+             std::to_string(l.vertex.metadata.size) + " B metadata (ranges " + (l.vertex_alt ? "6/7" : "4/5") + ")";
+        s += l.pixel.present() ? ", pixel " + std::to_string(l.pixel.code.size) + " B code + " +
+                                     std::to_string(l.pixel.metadata.size) + " B metadata"
+                               : ", no pixel stage";
+        s += "; header record " + std::to_string(l.header.size) + " B, pipeline metadata " +
+             std::to_string(l.metadata.size) + " B;";
+    }
+    // Shaders, topology, input layout and formats exist only for a graphics description.
+    if (src != nullptr) {
+        const pso::D3D12GraphicsPsoDesc& d = src->desc;
+        const char* stage_names[] = {"VS", "PS", "DS", "HS", "GS", "AS", "MS"};
+        const uint64_t stages[] = {d.vs, d.ps, d.ds, d.hs, d.gs, d.as, d.ms};
+        s += " shaders";
+        for (size_t i = 0; i < 7; ++i) {
+            if (stages[i] != 0) {
+                s += std::string(" ") + stage_names[i] + " " + std::to_string(device_->shader_size(stages[i])) +
+                     " B DXIL kind " + std::to_string(device_->shader_kind(stages[i])) +
+                     (device_->shader_known(stages[i]) ? "" : " (no module)");
+            }
         }
+        s += "; topology type " + std::to_string(static_cast<uint32_t>(d.PrimitiveTopologyType));
+        s += "; input layout " + std::to_string(d.NumInputElements) + " element(s)";
+        for (uint32_t i = 0; i < d.NumInputElements && d.pInputElementDescs != nullptr; ++i) {
+            const pso::D3D12InputElementDesc& e = d.pInputElementDescs[i];
+            s += std::string(i == 0 ? " [" : ", ") + (e.SemanticName != nullptr ? e.SemanticName : "?") +
+                 std::to_string(e.SemanticIndex) + " fmt " + std::to_string(static_cast<uint32_t>(e.Format)) +
+                 " slot " + std::to_string(e.InputSlot) + (i + 1 == d.NumInputElements ? "]" : "");
+        }
+        s += "; render targets " + std::to_string(d.NumRenderTargets);
+        for (uint32_t i = 0; i < d.NumRenderTargets && i < pso::kD3D12SimultaneousRenderTargetCount; ++i) {
+            s += std::string(i == 0 ? " [fmt " : ", ") + std::to_string(static_cast<uint32_t>(d.RTVFormats[i])) +
+                 (i + 1 == d.NumRenderTargets ? "]" : "");
+        }
+        s += " depth fmt " + std::to_string(static_cast<uint32_t>(d.DSVFormat)) + " samples " +
+             std::to_string(d.SampleDesc.Count);
+    } else {
+        s += " no graphics description";
     }
-    s += "; topology type " + std::to_string(static_cast<uint32_t>(d.PrimitiveTopologyType));
-    s += "; input layout " + std::to_string(d.NumInputElements) + " element(s)";
-    for (uint32_t i = 0; i < d.NumInputElements && d.pInputElementDescs != nullptr; ++i) {
-        const pso::D3D12InputElementDesc& e = d.pInputElementDescs[i];
-        s += std::string(i == 0 ? " [" : ", ") + (e.SemanticName != nullptr ? e.SemanticName : "?") +
-             std::to_string(e.SemanticIndex) + " fmt " + std::to_string(static_cast<uint32_t>(e.Format)) + " slot " +
-             std::to_string(e.InputSlot) + (i + 1 == d.NumInputElements ? "]" : "");
-    }
-    s += "; render targets " + std::to_string(d.NumRenderTargets);
-    for (uint32_t i = 0; i < d.NumRenderTargets && i < pso::kD3D12SimultaneousRenderTargetCount; ++i) {
-        s += std::string(i == 0 ? " [fmt " : ", ") + std::to_string(static_cast<uint32_t>(d.RTVFormats[i])) +
-             (i + 1 == d.NumRenderTargets ? "]" : "");
-    }
-    s += " depth fmt " + std::to_string(static_cast<uint32_t>(d.DSVFormat)) + " samples " +
-         std::to_string(d.SampleDesc.Count);
 
     // Root signature layout and what is bound for each parameter.
     const d3d::RootSignature* rs = src != nullptr && src->root_signature ? &src->root_signature->signature()

@@ -42,6 +42,62 @@ constexpr uint64_t align_up(uint64_t v, uint64_t a) {
 namespace xbox {
 
 // ---------------------------------------------------------------------------------------------
+// Console-native pipelines (slot 57)
+// ---------------------------------------------------------------------------------------------
+
+bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* out, std::string* error) {
+    constexpr uint64_t kMaxRecordBytes = 64u << 10;  // header record and pipeline metadata
+    auto range = [&](NativeRange r) { return desc.ranges[static_cast<size_t>(r)]; };
+    auto fail = [&](const std::string& message) {
+        *error = message;
+        return false;
+    };
+    for (size_t i = 0; i < kNativeRangeCount; ++i) {
+        const GuestNativeRange& r = desc.ranges[i];
+        if ((r.address == 0) != (r.size == 0)) {
+            return fail("range " + std::to_string(i) + " has an address or a size but not both");
+        }
+        if (r.size > kMaxNativeRangeBytes) {
+            return fail("range " + std::to_string(i) + " is too large (" + std::to_string(r.size) + " bytes)");
+        }
+    }
+    NativePipeline p;
+    p.root_signature = desc.pRootSignature;
+    p.header = range(NativeRange::Header);
+    p.metadata = range(NativeRange::PipelineMetadata);
+    if (p.header.size == 0 || p.metadata.size == 0) {
+        return fail("no header record or pipeline metadata (ranges 0/1)");
+    }
+    if (p.header.size > kMaxRecordBytes || p.metadata.size > kMaxRecordBytes) {
+        return fail("header record or pipeline metadata larger than 64 KiB");
+    }
+    auto stage = [&](NativeRange code, NativeRange metadata, const char* name, NativeStage* s) {
+        s->code = range(code);
+        s->metadata = range(metadata);
+        if ((s->code.size == 0) != (s->metadata.size == 0)) {
+            return fail(std::string(name) + " stage has code without metadata or metadata without code");
+        }
+        if (s->code.size != 0 && s->code.address % kNativeCodeAlignment != 0) {
+            return fail(std::string(name) + " stage code is not 256-byte aligned");
+        }
+        return true;
+    };
+    NativeStage a, b;
+    if (!stage(NativeRange::PixelCode, NativeRange::PixelMetadata, "pixel", &p.pixel) ||
+        !stage(NativeRange::VertexCode, NativeRange::VertexMetadata, "vertex", &a) ||
+        !stage(NativeRange::VertexCodeAlt, NativeRange::VertexMetadataAlt, "vertex", &b)) {
+        return false;
+    }
+    if (a.present() == b.present()) {
+        return fail(a.present() ? "two vertex stages (ranges 4/5 and 6/7)" : "no vertex stage (ranges 4/5 or 6/7)");
+    }
+    p.vertex = a.present() ? a : b;
+    p.vertex_alt = b.present();
+    *out = p;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pipeline-state streams
 // ---------------------------------------------------------------------------------------------
 
@@ -496,6 +552,30 @@ HResult Device::CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& 
     return create_graphics_pso(p.graphics, riid, out);
 }
 
+HResult Device::CreateNativePipelineState(uint64_t desc_va, const Guid& riid, OutPtr out) {
+    xbox::GuestNativePipelineDesc d{};
+    xbox::NativePipeline p;
+    std::string error = "unreadable descriptor";
+    if (desc_va == 0 || !com::read_guest(desc_va, d) || !xbox::parse_native_pipeline(d, &p, &error)) {
+        count(xbox::Counter::NativePipelineStatesRejected);
+        note_bad_argument("CreatePipelineState (native, Xbox slot 57): " + error);
+        if (out) {
+            out.write(0);
+        }
+        return kEInvalidArg;
+    }
+    const HResult hr = create_native_pso(p, riid, out);
+    if (hr >= 0) {
+        count(xbox::Counter::NativePipelineStates);
+    } else {
+        count(xbox::Counter::NativePipelineStatesRejected);
+        if (out) {
+            out.write(0);
+        }
+    }
+    return hr;
+}
+
 HResult Device::CreatePipelineStateWithOverrides(InterfaceArg<IPipelineStateHost> base, uint32_t n, uint64_t overrides,
                                                  const Guid& riid, OutPtr out) {
     if (!base || n > kMaxOverrides || (n != 0 && overrides == 0)) {
@@ -507,6 +587,12 @@ HResult Device::CreatePipelineStateWithOverrides(InterfaceArg<IPipelineStateHost
     }
     auto* state = static_cast<PipelineState*>(base.get());
     const GraphicsPsoSource* source = state->graphics_source();
+    if (state->native() != nullptr) {
+        // Console-native base: its state is an undecoded register image, so the overrides cannot
+        // be applied; the base (same stages) is handed out and the entries are counted.
+        count(xbox::Counter::NativeOverridesIgnored, n);
+        return hand_out(com::Ref<PipelineState>::share(state), riid, out);
+    }
     if (source == nullptr) {
         // Compute or placeholder base: nothing to override, hand out the base itself.
         note_bad_argument("CreatePipelineStateWithOverrides: base is not a graphics pipeline (base returned)");
