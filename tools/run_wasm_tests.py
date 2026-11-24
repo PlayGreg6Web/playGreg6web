@@ -490,14 +490,14 @@ class DockerToolchain:
     def node_prefix(self, name: str, timeout_s: float) -> list[str]:
         return ["docker", "run", "--rm", "--name", name,
                 "-v", f"{self.config.build_dir}:/build:ro", "-v", f"{self.config.repo_root}:/src:ro",
-                "-w", "/build",
+                "-w", "/tmp",  # tests (NODERAWFS) write scratch files to the cwd
                 self.config.node_image, "timeout", "-s", "KILL", str(int(timeout_s) + 5), "node"]
 
     def probe_prefix(self) -> list[str]:
         return ["docker", "run", "--rm", self.config.node_image, "node"]
 
     def test_script_path(self, target: str) -> str:
-        return f"{target}.js"
+        return f"/build/{target}.js"
 
 
 class LocalToolchain:
@@ -583,6 +583,10 @@ def _built_markers(tc, targets: Sequence[str]) -> dict[str, bool]:
     return built
 
 
+def rwt_merge(first: CommandResult, second: CommandResult) -> CommandResult:
+    return CommandResult(second.returncode, first.output + second.output)
+
+
 def run_suite(config: Config, executor: Executor = run_command, out=print) -> tuple[int, dict | None]:
     started = time.monotonic()
     started_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
@@ -633,7 +637,15 @@ def run_suite(config: Config, executor: Executor = run_command, out=print) -> tu
             log_path.write_text(build_res.output, encoding="utf-8")
         except OSError:
             pass
-        built = _built_markers(tc, targets)
+        if build_res.returncode == 0:
+            built = {t: True for t in targets}  # ninja only exits 0 when every requested edge is done
+        else:
+            # Re-run once: the first run may have populated the Emscripten cache (touching sysroot
+            # headers), which makes ninja's dry run report everything dirty. The second run is
+            # incremental and leaves only the genuinely failing targets pending.
+            retry = tc.exec(cmake_build_args(tc.build, targets if config.filters else [], build_jobs))
+            build_res = rwt_merge(build_res, retry)
+            built = _built_markers(tc, targets)
     finally:
         tc.stop()
 

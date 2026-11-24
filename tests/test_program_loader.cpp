@@ -562,7 +562,12 @@ void test_guest_module_takes_over_a_virtual_name(VirtualMemoryArena& arena) {
 }  // namespace
 
 int main() {
+#ifdef __EMSCRIPTEN__
+    // The default wasm arena is 2 GiB ([4, 6) GiB) but the modules are mapped at 12 GiB.
+    VirtualMemoryArena arena(playgta6::os::kDefaultArenaBase, uint64_t{9} << 30);
+#else
     VirtualMemoryArena arena;
+#endif
     g_arena = &arena;
     win32::set_vmem_arena(&arena);
     test_boot_links_and_runs_a_program(arena);

@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -79,8 +80,9 @@ std::vector<GpuOpcode> opcodes(const std::vector<Packet>& packets) {
 
 bridge::BridgeOptions counting_options(uint32_t first_id) {
     bridge::BridgeOptions o;
-    auto next = std::make_shared<uint32_t>(first_id);
-    o.id_allocator = [next] { return (*next)++; };
+    // Atomic: the concurrent-recording case calls the allocator from several threads.
+    auto next = std::make_shared<std::atomic<uint32_t>>(first_id);
+    o.id_allocator = [next] { return next->fetch_add(1); };
     return o;
 }
 

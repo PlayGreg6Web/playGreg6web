@@ -241,7 +241,9 @@ class FakeDocker:
             if inner[0] == "cmake":
                 if on_line:
                     on_line("[1/2] Building CXX object x")
-                return rwt.CommandResult(0, "[1/2] Building\nFAILED: test_beta.js\n/x.cpp:1: error: bad\n")
+                if self.unbuilt:
+                    return rwt.CommandResult(1, "[1/2] Building\nFAILED: test_beta.js\n/x.cpp:1: error: bad\n")
+                return rwt.CommandResult(0, "[1/2] Building\n")
             if inner[0] == "ninja":
                 target = inner[-1]
                 return rwt.CommandResult(0, "ninja: no work to do.\n" if target not in self.unbuilt else "[1/1] Linking\n")
