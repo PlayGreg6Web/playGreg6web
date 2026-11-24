@@ -14,7 +14,11 @@
 //    heap's memory + offset.
 //  * Buffers without CPU access (DEFAULT heaps, reserved resources) get a GPU VA from the device's
 //    fake range (Device::kFakeGpuVaBase); they have no guest memory.
-//  * Textures have no GPU VA (GetGPUVirtualAddress returns 0, as in D3D12).
+//  * Textures: on the console every resource has a GPU VA, the address of its memory, and the
+//    executable uses it (it translates a texture's GPU VA into a CPU pointer and writes the
+//    texels itself). A texture's GPU VA is the memory it was created in: the caller address
+//    (slot 133), the placed heap's memory + offset, or its committed XMemAlloc memory; 0 only
+//    for a texture the layer gives no memory (committed textures other than render targets).
 // Every buffer is registered with the state bridge (VA -> buffer id) so CBVs, root views and
 // vertex/index buffer views resolve; every texture with its format, size and sample count.
 //
@@ -111,7 +115,7 @@ public:
     HResult Map(uint32_t subresource, uint64_t read_range, OutPtr data) override;
     void Unmap(uint32_t subresource, uint64_t written_range) override;
     GuestResourceDesc GetDesc() override { return desc_; }
-    uint64_t GetGPUVirtualAddress() override { return is_buffer() ? gpu_va_ : 0; }
+    uint64_t GetGPUVirtualAddress() override { return gpu_va_; }
     HResult WriteToSubresource(com::CallContext& ctx) override;
     HResult ReadFromSubresource(com::CallContext& ctx) override;
     HResult GetHeapProperties(GuestPtr<GuestHeapProperties> properties, GuestPtr<uint32_t> flags) override;

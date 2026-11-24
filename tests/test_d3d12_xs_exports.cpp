@@ -1106,7 +1106,8 @@ void test_resources() {
 
     // Render-target texture: CreateTexture2 with the v2 format code and RENDER_ATTACHMENT usage.
     const uint64_t rt = committed(fx, device, 1, texture_desc(64, 32, 28, 1), 4);  // R8G8B8A8_UNORM, RENDER_TARGET
-    CHECK(rt != 0 && fx.vcall(rt, Slot2::GetGPUVirtualAddress) == 0);
+    // Its GPU VA is its committed XMemAlloc memory (the console gives every resource a GPU VA).
+    CHECK(rt != 0 && fx.vcall(rt, Slot2::GetGPUVirtualAddress) != 0);
     const uint64_t desc_buf = put(dg::GuestResourceDesc{});
     CHECK(fx.sret_call(rt, Slot2::GetDesc, desc_buf) == desc_buf);
     CHECK(get<dg::GuestResourceDesc>(desc_buf).Width == 64 && get<dg::GuestResourceDesc>(desc_buf).Format == 28);
@@ -1116,6 +1117,7 @@ void test_resources() {
     // Mipped BC texture (mip count 0 = full chain).
     const uint64_t bc = committed(fx, device, 1, texture_desc(256, 128, 71, 0, 0), 0);  // BC1_UNORM
     CHECK(bc != 0 && object_of<dg::Resource>(bc)->mip_levels() == 9);
+    CHECK(fx.vcall(bc, Slot2::GetGPUVirtualAddress) == 0);  // committed, not a render target: no memory
 
     std::vector<Packet> ps = packets_since(fx, mark);
     CHECK(count_op(ps, GpuOpcode::CreateBuffer) == 2);
@@ -1158,6 +1160,9 @@ void test_resources() {
     const uint64_t sw = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
                                   dg::IID_ID3D12Resource, &result);
     CHECK(result == 0 && sw != 0);
+    // A texture at title memory: its GPU VA is that memory (the title translates it to a CPU
+    // pointer and writes the texels).
+    CHECK(fx.vcall(sw, Slot2::GetGPUVirtualAddress) == tex_memory);
     swizzled.Layout = 0x200;
     CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
                     dg::IID_ID3D12Resource, &result) == 0);

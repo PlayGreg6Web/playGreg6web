@@ -450,6 +450,14 @@ bool Resource::initialize() {
                 return false;
             }
         }
+        // The texture's GPU VA is its memory (see the header comment).
+        if (placement_.address != 0) {
+            gpu_va_ = placement_.address;
+        } else if (placement_.placed_heap) {
+            gpu_va_ = placement_.placed_heap->base() + placement_.heap_offset;
+        } else if (xmem_memory_ != nullptr) {
+            gpu_va_ = com::host_to_guest(xmem_memory_);
+        }
         const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
                                              : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
         const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(desc_.Format), usage,
