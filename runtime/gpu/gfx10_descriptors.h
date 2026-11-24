@@ -179,8 +179,8 @@ SamplerState decode_sampler(const uint32_t in[kSamplerDwords]) noexcept;
 // links, data, words of an unsupported generation).
 enum class SlotContent : uint8_t { Zero, Buffer, Image, Unknown };
 SlotContent classify_slot(const uint32_t words[8]) noexcept;
-// Plausibility checks: type field, resource_level = 1, destination selects in SQ_SEL_XYZW01, a
-// format that is not reserved, reserved bits zero.
+// Plausibility checks: type field, destination selects in SQ_SEL_XYZW01, a format that is not
+// reserved, reserved bits zero; images also resource_level = 1 and base_level <= last_level.
 bool plausible_buffer(const uint32_t words[kBufferDwords]) noexcept;
 bool plausible_image(const uint32_t words[kImageDwords]) noexcept;
 

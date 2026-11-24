@@ -322,16 +322,21 @@ void test_classify_slot() {
     CHECK(classify_slot(link) == SlotContent::Unknown);
     uint32_t floats[8] = {0x3f800000, 0xbf800000, 0, 0xffffffff, 0x3f800000, 0x3f800000, 0, 0};
     CHECK(classify_slot(floats) == SlotContent::Unknown);
-    // Buffer descriptor with resource_level 0 or a reserved format is rejected.
+    // Buffer descriptors: resource_level is not required (constant-buffer words with dword 3 =
+    // 0x0002403C: selects X, W, 0, 0, format 36, resource_level 0); a reserved format or a non-zero
+    // type is rejected.
     BufferResource b;
     b.format = Fmt::F32;
     uint32_t w[8] = {};
     encode(b, w);
     CHECK(classify_slot(w) == SlotContent::Buffer);
-    b.resource_level = false;
+    const uint32_t cbv[8] = {0x1000, 0x00100000, 6, 0x0002403Cu, 0, 0, 0, 0};
+    CHECK(classify_slot(cbv) == SlotContent::Buffer);
+    CHECK(decode_buffer(cbv).stride == 16 && decode_buffer(cbv).num_records == 6 && !decode_buffer(cbv).resource_level);
+    b.type = 1;
     encode(b, w);
     CHECK(classify_slot(w) == SlotContent::Unknown);
-    b.resource_level = true;
+    b.type = 0;
     b.format = 100;
     encode(b, w);
     CHECK(classify_slot(w) == SlotContent::Unknown);

@@ -198,9 +198,11 @@ BufferResource decode_buffer(const uint32_t in[kBufferDwords]) noexcept {
 }
 
 bool plausible_buffer(const uint32_t w[kBufferDwords]) noexcept {
-    // Type 0, resource_level 1, valid selects and format, unused bits 19..20 and 25..27 zero.
-    return bits(w[3], 30, 2) == 0 && bits(w[3], 24, 1) == 1 && valid_sels(w[3]) &&
-           valid_buffer_format(bits(w[3], 12, 7)) && bits(w[3], 19, 2) == 0 && bits(w[3], 25, 3) == 0;
+    // Type 0, valid selects and format, unused bits 19..20 and 25..27 zero. resource_level is not
+    // checked: the open-source drivers set it on gfx10, the console's own constant-buffer words leave
+    // it 0 (they are read with scalar loads, which ignore format, selects and that bit).
+    return bits(w[3], 30, 2) == 0 && valid_sels(w[3]) && valid_buffer_format(bits(w[3], 12, 7)) &&
+           bits(w[3], 19, 2) == 0 && bits(w[3], 25, 3) == 0;
 }
 
 // ---- T# ----
