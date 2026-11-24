@@ -485,6 +485,12 @@ void test_query_api() {
     CHECK(com::read_guest(buffer, id, sizeof(id)));
     CHECK(std::strlen(id) == 38);
     CHECK(hr32(fx.vcall(system, 3, {8, buffer, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+    // XSystemGetXboxLiveSandboxId (s4): offline, no sandbox: E_NOTIMPL, empty string, used 0.
+    CHECK(com::write_guest(used, uint64_t{77}));
+    CHECK(hr32(fx.vcall(system, 4, {0x20, buffer, used})) == com::E_NOTIMPL_HR);
+    CHECK(load64(used) == 0);
+    char sandbox = 'x';
+    CHECK(com::read_guest(buffer, &sandbox, 1) && sandbox == '\0');
 }
 
 void test_task_queue_slots() {

@@ -60,8 +60,9 @@
 //     are left as stubs.
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
-//   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h (s4 GetXboxLiveSandboxId,
-//     s5 GetAppSpecificDeviceId: stubs). XSystemGetDeviceType / GetAnalyticsInfo are never called.
+//   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
+//     (offline: no sandbox, E_NOTIMPL), s5 GetAppSpecificDeviceId stub. XSystemGetDeviceType /
+//     GetAnalyticsInfo are never called.
 //   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h (s4 XLaunchNewGame stub).
 //   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h; the
 //     other 40 used slots stay stubs (O8 offline policy: nothing about licences is invented).
@@ -741,6 +742,26 @@ public:
         id[kConsoleIdBytes - 1] = '\0';
         return com::write_guest(buffer, id, sizeof(id)) ? S_OK_HR : E_INVALIDARG_HR;
     }
+
+    // s4 XSystemGetXboxLiveSandboxId(size, buffer, used): the runtime is offline and has no Xbox
+    // Live sandbox, so it reports none: E_NOTIMPL, an empty string and used = 0 (every caller
+    // in the executable takes its failure path; no sandbox name is invented).
+    int32_t GetXboxLiveSandboxId(uint64_t size, uint64_t buffer, GuestPtr<uint64_t> used) {
+        if (!used.is_null()) {
+            used.write(0);
+        }
+        if (buffer != 0 && size != 0) {
+            const char nul = '\0';
+            com::write_guest(buffer, &nul, 1);
+        }
+        if (!sandbox_logged_.exchange(true)) {
+            os::log("xgameruntime: XSystemGetXboxLiveSandboxId: offline, no sandbox; returning E_NOTIMPL");
+        }
+        return com::E_NOTIMPL_HR;
+    }
+
+private:
+    std::atomic<bool> sandbox_logged_{false};
 };
 
 std::atomic<uint32_t> g_title_id{0};
@@ -1152,7 +1173,7 @@ constexpr auto kIFeature = com::declare_interface<FeatureApi>("xgameruntime.XGam
 using SY = M<SystemApi>;
 constexpr com::MethodDesc kSystemMethods[] = {
     SY::method<&SystemApi::GetConsoleId>("XSystemGetConsoleId"),
-    SY::stub("XSystemGetXboxLiveSandboxId"),
+    SY::method<&SystemApi::GetXboxLiveSandboxId>("XSystemGetXboxLiveSandboxId"),
     SY::stub("XSystemGetAppSpecificDeviceId"),
 };
 constexpr auto kISystem =
