@@ -133,8 +133,11 @@ use crate::discover::Analysis;
 use crate::eh::EhMetadata;
 use crate::image::{self, ImageBuild, ImageDiagnostic, ImageError, ImageOptions};
 use crate::lift::compile::{LlvmTool, compile_to_object, find_llvm_tool};
+use crate::lift::memory::{Window, WindowCheck};
 use crate::lift::target::LiftTarget;
-use crate::lift::{self, LiftError, WASM64_DATALAYOUT, WASM64_TRIPLE, function_symbol};
+use crate::lift::{
+    self, GuestBase, LiftError, MemoryModel, WASM64_DATALAYOUT, WASM64_TRIPLE, function_symbol,
+};
 use crate::pdata::ExceptionDirectory;
 use crate::pe::Pe64;
 use crate::reloc::RelocKind;
@@ -243,6 +246,9 @@ pub struct PipelineOptions {
     /// Code-generation target of the `.ll`/`.o` outputs ([`LiftTarget::Wasm64`] by default; the
     /// IR differs only in the lines [`LiftTarget::retarget`] rewrites).
     pub target: LiftTarget,
+    /// How lifted code translates guest addresses ([`MemoryModel::default`]: unchanged output;
+    /// another model is recorded in the manifests and the program descriptor).
+    pub memory: MemoryModel,
 }
 
 impl PipelineOptions {
@@ -262,6 +268,7 @@ impl PipelineOptions {
             shard_instructions: DEFAULT_SHARD_INSTRUCTIONS,
             image: ImageOptions::default(),
             target: LiftTarget::Wasm64,
+            memory: MemoryModel::default(),
         }
     }
 
@@ -599,13 +606,22 @@ pub fn lift_shards(
     tool: Option<&LlvmTool>,
     jobs: usize,
 ) -> Result<Vec<ShardRecord>, PipelineError> {
-    lift_shards_for(&LiftTarget::Wasm64, functions, shards, out_dir, tool, jobs)
+    lift_shards_for(
+        &LiftTarget::Wasm64,
+        &MemoryModel::default(),
+        functions,
+        shards,
+        out_dir,
+        tool,
+        jobs,
+    )
 }
 
 /// [`lift_shards`] for a given code-generation target (shard text rewritten by
-/// [`LiftTarget::retarget`], objects compiled for that target).
+/// [`LiftTarget::retarget`], objects compiled for that target) and memory model.
 pub fn lift_shards_for(
     target: &LiftTarget,
+    memory: &MemoryModel,
     functions: &[&Function],
     shards: &[Range<usize>],
     out_dir: &Path,
@@ -624,8 +640,14 @@ pub fn lift_shards_for(
                     let Some(range) = shards.get(index) else {
                         break;
                     };
-                    let result =
-                        lift_shard(target, index, &functions[range.clone()], &lift_dir, tool);
+                    let result = lift_shard(
+                        target,
+                        memory,
+                        index,
+                        &functions[range.clone()],
+                        &lift_dir,
+                        tool,
+                    );
                     if result.is_err() {
                         failed.store(true, Ordering::Relaxed);
                     }
@@ -644,6 +666,7 @@ pub fn lift_shards_for(
 
 fn lift_shard(
     target: &LiftTarget,
+    memory: &MemoryModel,
     index: usize,
     functions: &[&Function],
     lift_dir: &Path,
@@ -654,7 +677,7 @@ fn lift_shard(
     for function in functions {
         instructions += function.instruction_count();
         lifted.push(
-            lift::lift_function(function).map_err(|error| PipelineError::Lift {
+            lift::lift_function_with(function, *memory).map_err(|error| PipelineError::Lift {
                 entry: function.entry,
                 error,
             })?,
@@ -1101,6 +1124,7 @@ pub struct PipelineReport {
     pub emit_obj: bool,
     pub image_options: ImageOptions,
     pub target: LiftTarget,
+    pub memory: MemoryModel,
     /// Every output file except the manifest, sorted by path.
     pub files: Vec<OutputFile>,
     /// Entry VA of every lifted function (sorted; the registration table's entries).
@@ -1211,6 +1235,7 @@ pub fn run_module(
     let shard_ranges = plan_shards(&weights, options.shard_size, options.shard_instructions);
     let shards = lift_shards_for(
         &options.target,
+        &options.memory,
         &functions,
         &shard_ranges,
         out,
@@ -1351,6 +1376,7 @@ pub fn run_module(
         emit_obj: options.emit_obj,
         image_options: options.image,
         target: options.target.clone(),
+        memory: options.memory,
         files: Vec::new(),
         function_entries: entries,
         report: String::new(),
@@ -1691,6 +1717,56 @@ fn file_json(file: &OutputFile) -> Json {
     ])
 }
 
+/// The manifest record of a memory model; `None` for the default (manifests stay unchanged).
+fn memory_model_json(model: &MemoryModel) -> Option<Json> {
+    if model.is_default() {
+        return None;
+    }
+    let flat = |base: &GuestBase| match base {
+        GuestBase::Symbol => Json::Str(lift::GUEST_BASE_SYMBOL.to_string()),
+        GuestBase::Constant(c) => hex(*c),
+    };
+    Some(match model {
+        MemoryModel::Base(base) => obj([("model", Json::Str("base".into())), ("flat", flat(base))]),
+        MemoryModel::Windowed(Window {
+            flat: base,
+            base: window_base,
+            size,
+            check,
+            stack_flat,
+            contiguous_runs,
+        }) => obj([
+            ("model", Json::Str("windowed".into())),
+            ("flat", flat(base)),
+            ("window_base", hex(*window_base)),
+            ("window_size", hex(*size)),
+            (
+                "check",
+                Json::Str(
+                    match check {
+                        WindowCheck::Branch => "branch",
+                        WindowCheck::Select => "select",
+                        WindowCheck::Outline => "outline",
+                    }
+                    .into(),
+                ),
+            ),
+            ("stack_flat", Json::Bool(*stack_flat)),
+            ("contiguous_runs", Json::Bool(*contiguous_runs)),
+        ]),
+        MemoryModel::PageTable {
+            pages,
+            stack,
+            contiguous_runs,
+        } => obj([
+            ("model", Json::Str("page_table".into())),
+            ("pages", Json::Num(*pages)),
+            ("stack_flat", stack.as_ref().map_or(Json::Null, flat)),
+            ("contiguous_runs", Json::Bool(*contiguous_runs)),
+        ]),
+    })
+}
+
 impl Json {
     fn is_scalar(&self) -> bool {
         !matches!(self, Self::Arr(_) | Self::Obj(_))
@@ -1818,6 +1894,14 @@ pub fn render_manifest(r: &PipelineReport) -> String {
         (LiftTarget::Native { triple, cpu }, Json::Obj(mut fields)) => {
             fields.push(("target".to_string(), Json::Str(format!("native:{triple}"))));
             fields.push(("target_cpu".to_string(), Json::Str(cpu.clone())));
+            Json::Obj(fields)
+        }
+        (_, options) => options,
+    };
+    // So does another memory model than the default.
+    let options = match (memory_model_json(&r.memory), options) {
+        (Some(memory), Json::Obj(mut fields)) => {
+            fields.push(("memory_model".to_string(), memory));
             Json::Obj(fields)
         }
         (_, options) => options,

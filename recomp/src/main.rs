@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 use playgta6_recomp::discover::discover;
 use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
+use playgta6_recomp::lift::MemoryModel;
+use playgta6_recomp::lift::memory::MEMORY_MODEL_CHOICES;
 use playgta6_recomp::lift::target::LiftTarget;
 use playgta6_recomp::pe;
 use playgta6_recomp::pipeline::{self, PipelineOptions};
@@ -68,6 +70,7 @@ struct BuildArgs {
     shard_size: Option<usize>,
     shard_instructions: Option<usize>,
     codegen: LiftTarget,
+    memory: MemoryModel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +101,7 @@ fn print_usage() {
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
     eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
     eprintln!(
-        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>]"
+        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>]"
     );
     eprintln!("{}", program_cmd::USAGE);
     eprintln!("{}", export_cmd::USAGE);
@@ -130,6 +133,11 @@ fn print_usage() {
     eprintln!("  --shard-instructions N build: maximum instructions per lifted shard (default {})", pipeline::DEFAULT_SHARD_INSTRUCTIONS);
     eprintln!("  --target <t>           build: wasm64 (default), native (this host's x86-64 triple) or native:<triple>");
     eprintln!("  --target-cpu <cpu>     build: LLVM CPU of a native target (default {})", playgta6_recomp::lift::target::NATIVE_DEFAULT_CPU);
+    eprintln!("  --memory-model <m>     build, build-program: how lifted code translates guest addresses; recorded in the");
+    eprintln!("                         manifests and the program descriptor, and the runtime refuses a model it cannot serve:");
+    for (name, what) in MEMORY_MODEL_CHOICES {
+        eprintln!("                           {name:<12} {what}");
+    }
     for line in program_cmd::OPTIONS {
         eprintln!("{line}");
     }
@@ -180,6 +188,7 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
     let mut shard_instructions = None;
     let mut target_spec: Option<String> = None;
     let mut target_cpu: Option<String> = None;
+    let mut memory = MemoryModel::default();
 
     let count = |flag: &str, value: Option<&String>| -> Result<usize, String> {
         value
@@ -256,6 +265,13 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
                     target_cpu = Some(value.clone());
                 }
             }
+            "--memory-model" => {
+                i += 1;
+                let Some(value) = args.get(i).filter(|v| !v.starts_with('-')) else {
+                    return Err("--memory-model requires a value".to_string());
+                };
+                memory = MemoryModel::from_name(value)?;
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{flag}' for 'build'"));
             }
@@ -301,6 +317,7 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
         shard_size,
         shard_instructions,
         codegen,
+        memory,
     }))
 }
 
@@ -898,6 +915,7 @@ fn run_build(args: &BuildArgs) -> Result<String, String> {
     options.extra_entries = args.entries.clone();
     options.emit_obj = args.emit_obj;
     options.target = args.codegen.clone();
+    options.memory = args.memory;
     if let Some(jobs) = args.jobs {
         options.jobs = jobs;
     }
@@ -1452,6 +1470,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 shard_size: Some(512),
                 shard_instructions: Some(1000),
                 codegen: LiftTarget::Wasm64,
+                memory: MemoryModel::default(),
             }))
         );
         assert_eq!(
@@ -1467,9 +1486,20 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 shard_size: None,
                 shard_instructions: None,
                 codegen: LiftTarget::Wasm64,
+                memory: MemoryModel::default(),
             }))
         );
         assert!(parse_cli(&vec_s(&["build", "game.exe"])).is_err(), "--out is required");
+        let window = ["build", "a.exe", "--out", "w", "--memory-model", "window"];
+        match parse_cli(&vec_s(&window)) {
+            Ok(Command::Build(args)) => {
+                assert_eq!(args.memory, MemoryModel::translated_window(false));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let bad_model = ["build", "a.exe", "--out", "w", "--memory-model", "pages"];
+        assert!(parse_cli(&vec_s(&bad_model)).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--memory-model"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "--out", "w"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--from-env", "--out", "w"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--jobs", "0"])).is_err());
@@ -1524,6 +1554,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
             shard_size: None,
             shard_instructions: None,
             codegen: LiftTarget::Wasm64,
+            memory: MemoryModel::default(),
         })
         .expect("run_build should succeed");
         assert!(report.starts_with("playgta6-recomp build report: module main\n"), "{report}");

@@ -89,6 +89,12 @@ struct Pg6Program {
     // `modules` is still valid and just has no export thunks (both fields null).
     const Pg6BootExport* const* exports;
     const size_t* export_count;
+    // How the program's lifted code translates guest addresses (guest/memory_model.h). Added
+    // after `exports` (O29): null - also for a descriptor that stops earlier - is the flat
+    // default; the generator emits it only for another model. prepare_program_boot copies it into
+    // BootConfig::memory; check_program refuses a model this runtime cannot serve. (The default
+    // member initializer keeps -Wmissing-field-initializers quiet for descriptors without it.)
+    const Pg6GuestMemoryModel* memory = nullptr;
 };
 
 }  // extern "C"
@@ -103,6 +109,7 @@ enum class ProgramErrorCode : uint32_t {
     RegisterModuleFailed,  // the Win32 module registry refused a module or an export
     BadHeaders,            // mapped PE headers or export directory unreadable or malformed
     FunctionTableFailed,   // the unwinder refused the module's .pdata
+    UnsupportedMemoryModel,  // the lifted code's memory model is one this runtime cannot serve
 };
 
 const char* program_error_name(ProgramErrorCode code);

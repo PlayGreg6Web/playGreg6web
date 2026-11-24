@@ -57,6 +57,7 @@ add_library(playgta6_core STATIC
     guest/guest_rtl.cpp
     guest/cpu_helpers.cpp
     guest/guest_memory.cpp
+    guest/memory_model.cpp
     guest/boot.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp

@@ -181,10 +181,11 @@ use std::path::{Path, PathBuf};
 
 use super::{
     Input, Json, ModuleLink, OutputFile, PipelineError, PipelineOptions, PipelineReport,
-    check_options, hex, io_error, load_input, num, obj, register_function_symbol,
-    registration_symbols, run_module, write_file,
+    check_options, hex, io_error, load_input, memory_model_json, num, obj,
+    register_function_symbol, registration_symbols, run_module, write_file,
 };
 use crate::image::fnv1a_64;
+use crate::lift::MemoryModel;
 use crate::pe::{ImportedSymbol, Pe64};
 use crate::stubs::{self, Catalogue, GuestTarget, Resolution, ShimResolver};
 
@@ -520,6 +521,8 @@ pub struct ProgramReport {
     /// Allocator provider (`host` or a DLL) and the number of allocator imports.
     pub allocator: Option<(String, usize)>,
     pub diagnostics: Vec<Diagnostic>,
+    /// How every module's lifted code translates guest addresses (`ProgramOptions::build`).
+    pub memory: MemoryModel,
     /// Program-level files except the manifest.
     pub files: Vec<OutputFile>,
     pub report: String,
@@ -1051,6 +1054,7 @@ pub fn build_program(
         unreferenced,
         allocator,
         diagnostics,
+        memory: options.build.memory,
         files: Vec::new(),
         report: String::new(),
         manifest: String::new(),
@@ -1940,9 +1944,8 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                 ),
                 ("overrides", strs(&overrides)),
                 ("force_guest", strs(&force_guest)),
-                (
-                    "build",
-                    obj([
+                ("build", {
+                    let build = obj([
                         ("emit_obj", Json::Bool(b.emit_obj)),
                         ("shard_size", num(b.shard_size)),
                         ("shard_instructions", num(b.shard_instructions)),
@@ -1951,8 +1954,16 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                             "executable_bytes",
                             Json::Str(b.image.executable_bytes.as_str().into()),
                         ),
-                    ]),
-                ),
+                    ]);
+                    // Only another memory model than the default is recorded.
+                    match (memory_model_json(&b.memory), build) {
+                        (Some(memory), Json::Obj(mut fields)) => {
+                            fields.push(("memory_model".to_string(), memory));
+                            Json::Obj(fields)
+                        }
+                        (_, build) => build,
+                    }
+                }),
             ]),
         ),
         ("modules", Json::Arr(modules)),
@@ -2137,14 +2148,30 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
             m.module
         );
     }
+    out.push_str("};\n");
+    // The memory model record exists only for another model than the default (whose descriptor
+    // stays as it was: a null `memory` is the flat default).
+    let memory = !r.memory.is_default();
+    if memory {
+        let _ = writeln!(
+            out,
+            "\n// How the lifted code translates guest addresses (runtime/guest/memory_model.h).\n\
+             const Pg6GuestMemoryModel kMemoryModel = {};",
+            r.memory.runtime_record()
+        );
+    }
     out.push_str(
-        "};\n\n}  // namespace\n\n\
+        "\n}  // namespace\n\n\
          extern \"C\" const Pg6Program pg6_program = {\n    \
          kPg6ProgramVersion,\n    \
          static_cast<uint32_t>(sizeof(kModules) / sizeof(kModules[0])),\n    \
          kModules,\n    \
          reinterpret_cast<const Pg6BootExport* const*>(&pg6_export_thunks),\n    \
-         &pg6_export_thunk_count,\n};\n",
+         &pg6_export_thunk_count,\n",
     );
+    if memory {
+        out.push_str("    &kMemoryModel,\n");
+    }
+    out.push_str("};\n");
     out
 }

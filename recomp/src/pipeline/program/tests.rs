@@ -1672,6 +1672,117 @@ fn namespaced_bridges_and_descriptor_compile_together() {
     }
 }
 
+/// O29: the memory model reaches every module's lifted code, both manifests and the descriptor;
+/// the default leaves all three as they were.
+#[test]
+fn memory_model_is_recorded_for_the_runtime() {
+    let (exe, a, b) = (exe_main(), dll_a(DLL_BASE), dll_b(DLL_BASE));
+    let plain = TempDir::new("mm_default");
+    let r = build(&program_options(plain.path(), &exe, &[&a, &b]));
+    let out = plain.path().join("out");
+    let descriptor = fs::read_to_string(out.join(PROGRAM_DESCRIPTOR_FILE)).unwrap();
+    assert!(!descriptor.contains("Pg6GuestMemoryModel"));
+    assert!(!r.manifest.contains("memory_model"));
+    for m in &r.modules {
+        let manifest = fs::read_to_string(out.join(&m.module).join(MANIFEST_FILE)).unwrap();
+        assert!(!manifest.contains("memory_model"), "{}", m.module);
+    }
+
+    let windowed = TempDir::new("mm_window");
+    let mut options = program_options(windowed.path(), &exe, &[&a, &b]);
+    options.build.memory = MemoryModel::translated_window(false);
+    let r = build(&options);
+    let out = windowed.path().join("out");
+    let descriptor = fs::read_to_string(out.join(PROGRAM_DESCRIPTOR_FILE)).unwrap();
+    assert!(
+        descriptor.contains(
+            "const Pg6GuestMemoryModel kMemoryModel = {1u, 0x1u, 0u, 0u, 0x400000000ull, \
+             0x600000000ull, 0x0ull};"
+        ),
+        "{descriptor}"
+    );
+    assert!(descriptor.contains("&pg6_export_thunk_count,\n    &kMemoryModel,\n};"));
+    let record = "\"memory_model\": {\"model\": \"windowed\", \"flat\": \"__playgta6_guest_base\", \
+                  \"window_base\": \"0x400000000\", \"window_size\": \"0x600000000\", \
+                  \"check\": \"branch\", \"stack_flat\": true, \"contiguous_runs\": false}";
+    assert!(r.manifest.contains(record), "{}", r.manifest);
+    let mut translated = 0;
+    for m in &r.modules {
+        let dir = out.join(&m.module);
+        let manifest = fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
+        assert!(
+            manifest.contains("\"window_base\": \"0x400000000\""),
+            "{}",
+            m.module
+        );
+        assert!(manifest.contains("\"stack_flat\": true"), "{}", m.module);
+        let shard = fs::read_to_string(dir.join(LIFT_DIR).join("shard-00000.ll")).unwrap();
+        // Modules whose only memory accesses are stack-relative need no window check.
+        translated += usize::from(shard.contains("@__playgta6_window_table"));
+    }
+    assert!(
+        translated > 0,
+        "no module's lifted code translates through the window"
+    );
+
+    // The record's encoding is the runtime header's.
+    let header = include_str!("../../../../runtime/guest/memory_model.h");
+    for line in [
+        "kPg6MemoryModelFlat = 0u;",
+        "kPg6MemoryModelWindowed = 1u;",
+        "kPg6MemoryModelPageTable = 2u;",
+        "kPg6MemoryStackFlat = 1u << 0;",
+        "kPg6MemoryContiguousRuns = 1u << 1;",
+        "kPg6MemoryFlatConstant = 1u << 2;",
+        "kPg6MemoryCheckBranch = 0u;",
+        "kPg6MemoryCheckSelect = 1u;",
+        "kPg6MemoryCheckOutline = 2u;",
+        "    uint32_t model;",
+        "    uint32_t flags;",
+        "    uint32_t check;",
+        "    uint32_t reserved;",
+        "    uint64_t window_base;",
+        "    uint64_t window_size;",
+        "    uint64_t flat_base;",
+    ] {
+        assert!(
+            header.contains(line),
+            "runtime/guest/memory_model.h lacks `{line}`"
+        );
+    }
+    assert_eq!(
+        MemoryModel::translated_window(true).runtime_record(),
+        "{1u, 0x3u, 0u, 0u, 0x400000000ull, 0x600000000ull, 0x0ull}"
+    );
+    assert_eq!(
+        MemoryModel::Base(crate::lift::GuestBase::Constant(0x1000)).runtime_record(),
+        "{0u, 0x4u, 0u, 0u, 0x0ull, 0x0ull, 0x1000ull}"
+    );
+
+    // With a C++ compiler: the descriptor compiles against the runtime headers.
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime");
+    let Some(cxx) = find_cxx() else {
+        println!("SKIP memory_model_is_recorded_for_the_runtime (compile): no C++ compiler");
+        return;
+    };
+    let output = Command::new(&cxx)
+        .args(["-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+        .arg(format!("-I{}", runtime.display()))
+        .arg(format!(
+            "-I{}",
+            windowed.path().join("in").join("rt").display()
+        ))
+        .arg(format!("-I{}", out.display()))
+        .arg(out.join(PROGRAM_DESCRIPTOR_FILE))
+        .output()
+        .expect("run C++ compiler");
+    assert!(
+        output.status.success(),
+        "pg6_program.cpp does not compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ----- tool-gated: link the modules and run them under node --------------------------------------
 
 const RUNNER_JS: &str = r#"'use strict';

@@ -10,6 +10,7 @@
 #include "abi/playgta6_abi.h"
 #include "guest/export_thunks.h"
 #include "guest/guest_runtime.h"
+#include "guest/memory_model.h"
 #include "os/image_loader.h"
 #include "os/vmem.h"
 
@@ -440,6 +441,10 @@ struct BootConfig {
     // callbacks) as DllMain(image_base, DLL_PROCESS_ATTACH, nullptr) before the executable's
     // entry point. A DllMain returning FALSE ends the boot with ProcessSetupFailed.
     bool call_dll_entry_points = false;
+    // How the lifted code translates guest addresses (guest/memory_model.h; the program
+    // descriptor's Pg6Program::memory). Zero = flat, the default. The boot sets up what the model
+    // needs before loading any image and ends with BadConfig if this runtime cannot serve it.
+    Pg6GuestMemoryModel memory{};
 };
 
 struct BootResult {

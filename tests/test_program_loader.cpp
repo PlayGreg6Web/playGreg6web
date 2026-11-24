@@ -3,6 +3,7 @@
 // (IAT slots of guest-to-guest imports pre-filled in the images, the rest bound to host thunks),
 // booted through the boot sequence (guest/boot.h).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,10 +17,13 @@
 #include "guest/guest_exceptions.h"
 #include "guest/guest_runtime.h"
 #include "guest/program_loader.h"
+#include "guest/memory_model.h"
+#include "os/guest_window.h"
 #include "os/image_loader.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/xmem_windows.h"
 
 namespace {
 
@@ -579,6 +583,92 @@ void test_guest_module_takes_over_a_virtual_name(VirtualMemoryArena& arena) {
     (void)arena;
 }
 
+// O29: the descriptor's memory model. A model this runtime cannot serve is refused before
+// anything loads; the windowed model turns the translated window and its XMem policy on for the
+// boot and keeps the arena out of the window range, and reset_boot undoes all of it.
+void test_memory_model(VirtualMemoryArena& arena) {
+    namespace window = playgta6::os::guest_window;
+    namespace xw = playgta6::os::xmem_windows;
+    const Pg6ProgramModule modules[] = {exe_module()};
+    constexpr Pg6GuestMemoryModel kWindowed{kPg6MemoryModelWindowed, kPg6MemoryStackFlat,
+                                            kPg6MemoryCheckBranch, 0, kGuestWindowBase,
+                                            kGuestWindowSize, 0};
+    ProgramBoot pb;
+    const auto refused = [&](const Pg6GuestMemoryModel& model, const char* why) {
+        const Pg6Program program{kPg6ProgramVersion, 1, modules, nullptr, nullptr, &model};
+        const ProgramError e =
+            prepare_program_boot(program, memory_image_source({{"main", exe_image()}}), {}, pb);
+        CHECK_CODE(e, ProgramErrorCode::UnsupportedMemoryModel);
+        CHECK(e.detail.find(why) != std::string::npos);
+        CHECK_CODE(check_program(program), ProgramErrorCode::UnsupportedMemoryModel);
+    };
+    Pg6GuestMemoryModel runs = kWindowed;
+    runs.flags |= kPg6MemoryContiguousRuns;
+    refused(runs, "contiguous window runs");
+    Pg6GuestMemoryModel moved = kWindowed;
+    moved.window_base += 0x10000;
+    refused(moved, "is not this runtime's");
+    Pg6GuestMemoryModel smaller = kWindowed;
+    smaller.window_size = uint64_t{16} << 30;
+    refused(smaller, "is not this runtime's");
+    refused(Pg6GuestMemoryModel{kPg6MemoryModelPageTable, 0, 0, 0, 0, 1u << 20, 0}, "page-table");
+    refused(Pg6GuestMemoryModel{7, 0, 0, 0, 0, 0, 0}, "unknown memory model 7");
+    refused(Pg6GuestMemoryModel{kPg6MemoryModelWindowed, 1u << 9, 0, 0, kGuestWindowBase,
+                                kGuestWindowSize, 0},
+            "unknown memory model flags");
+    CHECK(memory_model_unsupported(kWindowed).empty());
+
+    // The flat default (a null record) changes nothing.
+    const xw::PlacementPolicy policy = xw::policy();
+    const bool window_was_on = window::enabled();
+    CHECK(!window_was_on);
+    {
+        const Pg6Program program{kPg6ProgramVersion, 1, modules, nullptr, nullptr, nullptr};
+        CHECK_CODE(prepare_program_boot(program, memory_image_source({{"main", exe_image()}}), {}, pb),
+                   ProgramErrorCode::Ok);
+        CHECK(is_default_memory_model(pb.config.memory));
+    }
+
+    // Windowed: served.
+    const Pg6Program program{kPg6ProgramVersion, 1, modules, nullptr, nullptr, &kWindowed};
+    CHECK_CODE(prepare_program_boot(program, memory_image_source({{"main", exe_image()}}), {}, pb),
+               ProgramErrorCode::Ok);
+    CHECK(pb.config.memory.model == kPg6MemoryModelWindowed && pb.config.memory.flags == kPg6MemoryStackFlat);
+    pb.config.call_entry = false;
+    const BootResult result = boot(pb);
+    CHECK(result.status == BootStatus::Exited);
+    CHECK(window::enabled());
+    CHECK(xw::policy() == xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    const bool spans = arena.space_base() < kGuestWindowBase + kGuestWindowSize &&
+                       kGuestWindowBase < arena.space_base() + arena.space_size();
+    const uint64_t probe = std::max(kGuestWindowBase, arena.space_base());
+    if (spans) {
+        // The arena keeps out of the window: one reservation over the part it spans.
+        CHECK(arena.query(probe).state == playgta6::os::MemState::Reserve);
+        CHECK(arena.reserve(probe, 0x10000) == 0);
+    }
+    // A window VA translates through the table (unmapped: no host address), others flat.
+    CHECK(window::translate(kGuestWindowBase + 0x1234) == nullptr);
+    CHECK(window::translate(kE) == arena.translate(kE));
+    reset_boot();
+    CHECK(window::enabled() == window_was_on);
+    CHECK(xw::policy() == policy);
+    if (spans) {
+        CHECK(arena.query(probe).state == playgta6::os::MemState::Free);
+    }
+
+    // A BootConfig with a model this runtime cannot serve ends the boot before anything loads.
+    CHECK_CODE(prepare_program_boot({kPg6ProgramVersion, 1, modules},
+                                    memory_image_source({{"main", exe_image()}}), {}, pb),
+               ProgramErrorCode::Ok);
+    pb.config.memory = runs;
+    const BootResult bad = boot(pb);
+    CHECK(bad.status == BootStatus::BadConfig);
+    CHECK(bad.summary.find("contiguous window runs") != std::string::npos);
+    CHECK(!window::enabled());
+    reset_boot();
+}
+
 }  // namespace
 
 int main() {
@@ -593,6 +683,7 @@ int main() {
     test_boot_links_and_runs_a_program(arena);
     test_failures(arena);
     test_guest_module_takes_over_a_virtual_name(arena);
+    test_memory_model(arena);
     win32::set_vmem_arena(nullptr);
     if (g_failures != 0) {
         std::fprintf(stderr, "test_program_loader failed with %d failure(s)\n", g_failures);

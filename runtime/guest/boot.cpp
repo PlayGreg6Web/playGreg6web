@@ -2397,6 +2397,7 @@ void reset_boot() {
             }
         }
     }
+    release_memory_model();
     reset_guest_runtime();
     crt_exit::reset_crt_exit();
     reset_guest_exceptions();
@@ -2509,6 +2510,13 @@ BootResult run_boot(const BootConfig& config) {
     if (config.modules.empty()) {
         fail_setup(BootStatus::BadConfig, "no modules");
         return finish();
+    }
+    if (std::string error; !apply_memory_model(config.memory, *b.arena, error)) {
+        fail_setup(BootStatus::BadConfig, error);
+        return finish();
+    }
+    if (!is_default_memory_model(config.memory)) {
+        logf("guest boot: memory model %s", describe_memory_model(config.memory).c_str());
     }
     for (size_t i = 0; i < config.modules.size(); ++i) {
         const BootModule& in = config.modules[i];

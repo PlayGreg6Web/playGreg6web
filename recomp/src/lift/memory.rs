@@ -88,6 +88,17 @@
 //! contiguous) costs least on code that does not touch the window (+8..25% on typical code, 2-3x
 //! on tight streaming loops), `PageTable` is uniformly slower but emits the least code and would
 //! add null-page / uncommitted-page traps. Both stay behind this option until the project decides.
+//! (Decided for the browser target: `Windowed` + `stack_flat`, docs/wasm_abi.md "Translated CPU
+//! window".)
+//!
+//! # Selecting a model for a build (O29)
+//! `playgta6-recomp build` / `build-program --memory-model` take a [`MEMORY_MODEL_CHOICES`] name
+//! ([`MemoryModel::from_name`]; `window` = [`MemoryModel::translated_window`]). A model other than
+//! the default is recorded as `memory_model` in `build-manifest.json` and `program-manifest.json`
+//! and as the `Pg6GuestMemoryModel` record of `pg6_program.cpp`
+//! ([`MemoryModel::runtime_record`], `runtime/guest/memory_model.h`), from which the runtime's
+//! boot turns the translated window and its XMem placement on, or refuses the program with the
+//! reason when the runtime build cannot serve the model. The default writes none of this.
 
 use super::GuestBase;
 
@@ -179,6 +190,108 @@ pub enum MemoryModel {
 impl Default for MemoryModel {
     fn default() -> Self {
         Self::Base(GuestBase::default())
+    }
+}
+
+/// `--memory-model` values of `build` / `build-program`, with what each selects.
+pub const MEMORY_MODEL_CHOICES: &[(&str, &str)] = &[
+    (
+        "base",
+        "host = VA + __playgta6_guest_base (default; unchanged output)",
+    ),
+    (
+        "window",
+        "the translated CPU window (docs/wasm_abi.md), branch check, stack accesses flat",
+    ),
+    (
+        "window-runs",
+        "window without straddle checks (needs a runtime that keeps window runs contiguous)",
+    ),
+];
+
+impl MemoryModel {
+    /// The browser target's translated CPU window ([`GUEST_WINDOW_BASE`], [`GUEST_WINDOW_SIZE`])
+    /// as adopted for O29: [`WindowCheck::Branch`], [`Window::stack_flat`], and
+    /// [`Window::contiguous_runs`] as given.
+    pub fn translated_window(contiguous_runs: bool) -> Self {
+        Self::Windowed(Window {
+            flat: GuestBase::default(),
+            base: GUEST_WINDOW_BASE,
+            size: GUEST_WINDOW_SIZE,
+            check: WindowCheck::Branch,
+            stack_flat: true,
+            contiguous_runs,
+        })
+    }
+
+    /// The model a [`MEMORY_MODEL_CHOICES`] name selects.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "base" => Ok(Self::default()),
+            "window" => Ok(Self::translated_window(false)),
+            "window-runs" => Ok(Self::translated_window(true)),
+            other => Err(format!(
+                "unknown memory model '{other}' (expected {})",
+                MEMORY_MODEL_CHOICES
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Whether this is the default (the outputs then do not mention the model at all).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The `Pg6GuestMemoryModel` initialiser (`runtime/guest/memory_model.h`) that tells the
+    /// runtime what this model's lifted code relies on.
+    pub fn runtime_record(&self) -> String {
+        const STACK_FLAT: u32 = 1 << 0;
+        const CONTIGUOUS_RUNS: u32 = 1 << 1;
+        const FLAT_CONSTANT: u32 = 1 << 2;
+        let flat_flags = |flat: &GuestBase| match flat {
+            GuestBase::Symbol => (0, 0),
+            GuestBase::Constant(c) => (FLAT_CONSTANT, *c),
+        };
+        let (model, flags, check, base, size, flat) = match self {
+            Self::Base(flat) => {
+                let (f, c) = flat_flags(flat);
+                (0, f, 0, 0, 0, c)
+            }
+            Self::Windowed(w) => {
+                let (f, c) = flat_flags(&w.flat);
+                let flags = f
+                    | if w.stack_flat { STACK_FLAT } else { 0 }
+                    | if w.contiguous_runs {
+                        CONTIGUOUS_RUNS
+                    } else {
+                        0
+                    };
+                let check = match w.check {
+                    WindowCheck::Branch => 0,
+                    WindowCheck::Select => 1,
+                    WindowCheck::Outline => 2,
+                };
+                (1, flags, check, w.base, w.size, c)
+            }
+            Self::PageTable {
+                pages,
+                stack,
+                contiguous_runs,
+            } => {
+                let (f, c) = stack.as_ref().map_or((0, 0), flat_flags);
+                let flags = f
+                    | if stack.is_some() { STACK_FLAT } else { 0 }
+                    | if *contiguous_runs { CONTIGUOUS_RUNS } else { 0 };
+                (2, flags, 0, 0, *pages, c)
+            }
+        };
+        format!(
+            "{{{model}u, 0x{flags:x}u, {check}u, 0u, 0x{base:x}ull, 0x{size:x}ull, 0x{flat:x}ull}}"
+        )
     }
 }
 

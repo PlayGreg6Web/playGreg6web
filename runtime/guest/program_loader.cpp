@@ -201,6 +201,8 @@ const char* program_error_name(ProgramErrorCode code) {
             return "bad PE headers";
         case ProgramErrorCode::FunctionTableFailed:
             return "function table registration failed";
+        case ProgramErrorCode::UnsupportedMemoryModel:
+            return "unsupported memory model";
     }
     return "unknown";
 }
@@ -243,6 +245,14 @@ ProgramError check_program(const Pg6Program& program) {
                 return fail(ProgramErrorCode::InvalidProgram, i,
                             std::string("image range overlaps ") + o.file_name);
             }
+        }
+    }
+    if (program.memory != nullptr) {
+        if (std::string why = memory_model_unsupported(*program.memory); !why.empty()) {
+            return fail(ProgramErrorCode::UnsupportedMemoryModel, SIZE_MAX,
+                        "the program was lifted with the memory model " +
+                            describe_memory_model(*program.memory) + ", which this runtime cannot serve: " +
+                            why);
         }
     }
     return {};
@@ -308,6 +318,9 @@ ProgramError prepare_program_boot(const Pg6Program& program,
         out.config.modules.push_back(std::move(module));
     }
     out.config.call_dll_entry_points = true;
+    if (program.memory != nullptr) {
+        out.config.memory = *program.memory;
+    }
     if (program.exports != nullptr && *program.exports != nullptr && program.export_count != nullptr) {
         out.config.export_thunks = std::span<const Pg6BootExport>(*program.exports, *program.export_count);
     }

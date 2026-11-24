@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use playgta6_recomp::lift::MemoryModel;
 use playgta6_recomp::lift::target::LiftTarget;
 use playgta6_recomp::pipeline::{self, program};
 
@@ -27,12 +28,15 @@ pub struct ProgramArgs {
     pub shard_instructions: Option<usize>,
     /// Code-generation target of every module (`--target`, `--target-cpu`).
     pub codegen: LiftTarget,
+    /// Memory model of every module (`--memory-model`).
+    pub memory: MemoryModel,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
+    "  --memory-model <m>     build-program: memory model of every module (as for build), recorded in pg6_program.cpp",
     "  --dll <file>           build-program: offer a DLL as a guest module (used when the program imports it)",
     "  --dll-dir <dir>        build-program: offer every *.dll in <dir>",
     "  --guest-dll <name>     build-program: build <name> as a guest module even if host-only by default or unreferenced",
@@ -62,6 +66,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         shard_size: None,
         shard_instructions: None,
         codegen: LiftTarget::Wasm64,
+        memory: MemoryModel::default(),
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -162,6 +167,10 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
                 i += 1;
                 target_cpu = Some(value(i, flag, "<cpu>")?);
             }
+            "--memory-model" => {
+                i += 1;
+                parsed.memory = MemoryModel::from_name(&value(i, flag, "<model>")?)?;
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}' for 'build-program'"));
             }
@@ -219,6 +228,7 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
     }
     build.emit_obj = args.emit_obj;
     build.target = args.codegen.clone();
+    build.memory = args.memory;
     if let Some(jobs) = args.jobs {
         build.jobs = jobs;
     }
@@ -324,6 +334,15 @@ mod tests {
             }
         );
         assert!(parse_program_args(&args(&["a.exe", "--out", "x", "--target", "arm"])).is_err());
+        assert_eq!(parsed.memory, MemoryModel::default());
+        let windowed =
+            parse_program_args(&args(&["a.exe", "--out", "x", "--memory-model", "window"]))
+                .unwrap()
+                .unwrap();
+        assert_eq!(windowed.memory, MemoryModel::translated_window(false));
+        assert!(
+            parse_program_args(&args(&["a.exe", "--out", "x", "--memory-model", "flat"])).is_err()
+        );
         assert!(
             parse_program_args(&args(&["a.exe", "--out", "x", "--target-cpu", "znver2"])).is_err()
         );
