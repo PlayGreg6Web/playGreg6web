@@ -8,6 +8,7 @@
 #include "abi/playgta6_abi.h"
 #include "os/game_input.h"
 #include "os/httpfs_mailbox.h"
+#include "os/surface_blocks.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/xbox_scarlett.h"
@@ -411,6 +412,50 @@ void test_dstorage_virtual_and_httpfs() {
 // 3. xg_xs.dll — XGCreateTextureComputer & XGSuggestSwizzleMode
 // ---------------------------------------------------------------------------
 
+// os/surface_blocks.h: 64 KiB block dimensions and padded sizes; the XG computer's Standard64KB
+// mode uses them for the surfaces they cover and keeps the linear layout otherwise.
+void test_surface_blocks() {
+    namespace sb = playgta6::os::surface;
+    const uint32_t expected[5][3] = {{1, 256, 256}, {2, 256, 128}, {4, 128, 128}, {8, 128, 64}, {16, 64, 64}};
+    for (const auto& e : expected) {
+        sb::BlockDims d{};
+        CHECK(sb::block64k_dims(e[0], &d) && d.width == e[1] && d.height == e[2]);
+        CHECK(static_cast<uint64_t>(d.width) * d.height * e[0] == sb::kBlockBytes);
+    }
+    CHECK(!sb::block64k_dims(3, nullptr) && !sb::block64k_dims(12, nullptr));
+
+    sb::Block64kLayout l{};
+    CHECK(sb::block64k_layout_2d(3840, 2160, 4, &l));
+    CHECK(l.padded_width == 3840 && l.padded_height == 2176 && l.row_pitch_bytes == 15360);
+    CHECK(l.size_bytes == 33423360ull && l.size_bytes == 510 * sb::kBlockBytes);
+    CHECK(sb::block64k_layout_2d(1920, 1080, 4, &l));
+    CHECK(l.padded_width == 1920 && l.padded_height == 1152 && l.size_bytes == 8847360ull);
+    CHECK(l.size_bytes == 135 * sb::kBlockBytes);
+    // Smaller than one block in a dimension: not covered.
+    CHECK(!sb::block64k_layout_2d(64, 4096, 4, &l));
+    CHECK(!sb::block64k_layout_2d(4096, 100, 4, &l));
+
+    // XG computer, Standard64KB: covered surfaces are padded, others keep the linear layout.
+    Pg6XgTextureDesc desc{};
+    desc.width = 3840;
+    desc.height = 2160;
+    desc.format = kDxgiFormatR8G8B8A8Unorm;
+    desc.dimension = kXgDimensionTexture2D;
+    desc.tile_mode = kXgTileModeStandard64KB;
+    Pg6IXGTextureAddressComputer* computer = nullptr;
+    CHECK(pg6_xbox_XGCreateTextureComputer(&desc, &computer) == S_OK_HR);
+    Pg6XgResourceLayout layout{};
+    CHECK(computer->GetResourceLayout(&layout) == S_OK_HR);
+    CHECK(layout.size_bytes == 33423360ull && layout.base_alignment_bytes == sb::kBlockBytes);
+    CHECK(layout.mips[0].row_pitch_bytes == 15360 && layout.mips[0].padded_rows == 2176);
+    computer->Release();
+    desc.mip_levels = 2;  // mip chains are not covered: the linear layout
+    CHECK(pg6_xbox_XGCreateTextureComputer(&desc, &computer) == S_OK_HR);
+    CHECK(computer->GetResourceLayout(&layout) == S_OK_HR);
+    CHECK(layout.mips[0].padded_rows == 2160);
+    computer->Release();
+}
+
 void test_xg_xs_texture_computer() {
     // XGSuggestSwizzleMode returns linear tile mode cleanly for valid descs, invalid for null.
     CHECK(pg6_xbox_XGSuggestSwizzleMode(nullptr) == kXgTileModeInvalid);
@@ -659,6 +704,7 @@ int main() {
     test_xmem_heap_and_hooks();
     test_xmem_physical_virtual_and_transfer();
     test_dstorage_virtual_and_httpfs();
+    test_surface_blocks();
     test_xg_xs_texture_computer();
     test_game_input_bridge();
     test_module_registry_resolution();

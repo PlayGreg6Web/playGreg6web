@@ -21,6 +21,7 @@
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/surface_blocks.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::os::scarlett {
@@ -1204,6 +1205,23 @@ public:
         }
 
         layout_.size_bytes = align_up_u64(cursor, base_align);
+
+        // The 64 KiB-block mode for the surfaces os/surface_blocks.h covers (single-sample 2D,
+        // one mip, one slice, 1x1-element formats, at least one block in each dimension): padded
+        // to whole blocks. Everything else keeps the linear layout above. Only sizes, pitches
+        // and padded extents follow the block rule; element order inside blocks is not modelled.
+        surface::Block64kLayout block{};
+        if (desc.tile_mode == kXgTileModeStandard64KB && desc.dimension == 3 && mips == 1 && array_size == 1 &&
+            std::max(desc.sample_count, 1u) == 1 && metrics_.block_width == 1 && metrics_.block_height == 1 &&
+            surface::block64k_layout_2d(desc.width, base_height, metrics_.bytes_per_block, &block)) {
+            Pg6XgMipLevelLayout& ml = layout_.mips[0];
+            ml.row_pitch_bytes = static_cast<uint32_t>(block.row_pitch_bytes);
+            ml.padded_rows = block.padded_height;
+            ml.slice_size_bytes = block.size_bytes;
+            ml.size_bytes = block.size_bytes;
+            layout_.size_bytes = block.size_bytes;
+            layout_.base_alignment_bytes = block.alignment;
+        }
     }
 
     Pg6HResult QueryInterface(const Pg6Guid& riid, void** ppv_object) override {
