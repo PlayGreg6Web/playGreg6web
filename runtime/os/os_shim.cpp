@@ -1,5 +1,6 @@
 #include "os/os_shim.h"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 
@@ -129,7 +130,18 @@ void httpfs_close(int32_t handle) {
 #endif
 }
 
+namespace {
+std::atomic<WgpuSubmitObserver> g_wgpu_observer{nullptr};
+}  // namespace
+
+void set_wgpu_submit_observer(WgpuSubmitObserver observer) {
+    g_wgpu_observer.store(observer, std::memory_order_release);
+}
+
 void wgpu_submit(const uint8_t* data, size_t len) {
+    if (WgpuSubmitObserver observer = g_wgpu_observer.load(std::memory_order_acquire)) {
+        observer(data, len);
+    }
 #ifdef __EMSCRIPTEN__
     host_wgpu_submit(data, len);
 #else

@@ -1,0 +1,51 @@
+// Frame capture: the GPU command stream handed to os::wgpu_submit, written as a .pg6trace (the
+// flat packet stream web/workers/gpu_recorder.js exports and tools/gpu_trace.py reads) plus a JSON
+// sidecar with frame boundaries and per-frame counters.
+//
+// Frames are delimited by Present packets: frame 0 is everything up to and including the first
+// Present (resource creation included), frame i the packets after Present i-1 up to Present i.
+// Capture stops after `frames` complete frames.
+//
+// Payloads: by default the trailing data of WriteBuffer, WriteTexture and CreateShaderModule
+// packets is omitted (the packet stays well-formed with data_len / code_len 0, so the file stays
+// small and parseable); the sidecar records each omitted payload's original length and FNV-1a 64
+// hash. `keep_payloads` writes them unchanged.
+//
+// Sidecar (<path>.json): {schema "playgta6-frame-capture", schema_version 1, trace, payloads
+// ("omitted" | "kept"), frames_requested, frames_complete, presents_seen, packets, bytes,
+// frames [{index, offset, bytes, packets, wall_ms, dispatches, import_calls}], omitted
+// [{packet, opcode, length, fnv1a64}], omitted_bytes}. wall_ms / dispatches / import_calls are
+// taken when the frame's Present is seen (counter source: frame_capture_set_counters).
+//
+// Capture files are derived from the running title: keep them out of the repository.
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
+namespace playgta6::gpu {
+
+struct FrameCaptureConfig {
+    std::string path;          // .pg6trace output; the sidecar is path + ".json"
+    uint32_t frames = 10;      // complete frames to capture (>= 1)
+    bool keep_payloads = false;
+    bool attach = true;        // install the os::wgpu_submit observer (tests feed frame_capture_observe)
+};
+
+// Starts a capture (replacing none: false if one is running or the file cannot be opened).
+bool frame_capture_start(const FrameCaptureConfig& config);
+// Feeds a batch of complete packets (the observer does this for wgpu_submit).
+void frame_capture_observe(const uint8_t* data, size_t len);
+// Flushes the trace and writes the sidecar; idempotent; detaches the observer.
+void frame_capture_finish();
+
+// Optional source of (dispatches, import calls) recorded per frame.
+using FrameCaptureCounters = void (*)(uint64_t* dispatches, uint64_t* import_calls);
+void frame_capture_set_counters(FrameCaptureCounters counters);
+
+// Frames completed so far by the running (or last) capture.
+uint32_t frame_capture_frames();
+
+}  // namespace playgta6::gpu

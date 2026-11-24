@@ -2334,6 +2334,14 @@ std::string last_summary() {
     return boot().last_summary;
 }
 
+LiveCounters live_counters() {
+    BootState& b = boot();
+    LiveCounters c;
+    c.dispatches = b.dispatches.load(std::memory_order_relaxed);
+    c.import_calls = b.import_calls.load(std::memory_order_relaxed);
+    return c;
+}
+
 std::string import_trace_text() {
     BootState& b = boot();
     std::lock_guard<std::mutex> lock(b.mutex);

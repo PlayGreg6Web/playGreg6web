@@ -45,6 +45,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_resources.cpp
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
+    gpu/frame_capture.cpp
     os/xmem_windows.cpp
     os/guest_window.cpp
     guest/guest_runtime.cpp
@@ -250,6 +251,10 @@ else()
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
     add_test(NAME playgta6_xbox_scarlett_guest_tests COMMAND test_xbox_scarlett_guest)
+
+    add_executable(test_frame_capture ../tests/test_frame_capture.cpp)
+    target_link_libraries(test_frame_capture PRIVATE playgta6_core)
+    add_test(NAME playgta6_frame_capture_tests COMMAND test_frame_capture)
 
     add_executable(test_program_loader ../tests/test_program_loader.cpp)
     target_link_libraries(test_program_loader PRIVATE playgta6_core)

@@ -30,6 +30,10 @@
 //                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
 //   --console-mode <n>   console-mode registry value the title reads to pick its console type
 //                        (default 0x60 = Xbox Series X; 0 = leave it unset)
+//   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
+//                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
+//   --gpu-capture-frames <n>  frames to capture (default 10)
+//   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
 //   --no-tls-callbacks / --no-entry / --quiet
 //
 // Exit code: the BootStatus (0 = the guest exited; its own exit code is in the report),
@@ -60,6 +64,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/frame_capture.h"
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
@@ -129,6 +134,9 @@ struct Options {
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
+    std::string gpu_capture;          // --gpu-capture: .pg6trace path
+    uint64_t gpu_capture_frames = 10;
+    bool gpu_capture_payloads = false;
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -144,7 +152,8 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet]\n");
+                 "                     [--no-entry] [--quiet]\n"
+                 "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -173,15 +182,19 @@ bool parse(int argc, char** argv, Options& o) {
             o.entry = false;
         } else if (a == "--quiet") {
             o.quiet = true;
+        } else if (a == "--gpu-capture-payloads") {
+            o.gpu_capture_payloads = true;
         } else if (a == "-h" || a == "--help") {
             return false;
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
                    a == "--program-dir" ||
-                   a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace") {
+                   a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
+                   a == "--gpu-capture") {
             if (!value(v)) {
                 return false;
             }
             std::string& target = a == "--pgim"       ? o.pgim
+                                  : a == "--gpu-capture" ? o.gpu_capture
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
                                   : a == "--game-dir" ? o.game_dir
@@ -193,11 +206,12 @@ bool parse(int argc, char** argv, Options& o) {
             target = v;
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
-                   a == "--console-mode") {
+                   a == "--console-mode" || a == "--gpu-capture-frames") {
             if (!value(v)) {
                 return false;
             }
             uint64_t& target = a == "--max-calls"     ? o.max_calls
+                               : a == "--gpu-capture-frames" ? o.gpu_capture_frames
                                : a == "--console-mode" ? o.console_mode
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
@@ -373,6 +387,11 @@ void write_text(const std::string& path, const std::string& text) {
 
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
 void write_outputs(bool print_summary) {
+    if (!g_options.gpu_capture.empty()) {
+        gpu::frame_capture_finish();
+        std::fprintf(stderr, "[harness] GPU capture: %u frame(s) written to %s\n", gpu::frame_capture_frames(),
+                     g_options.gpu_capture.c_str());
+    }
     const std::string report = guest::last_report_json();
     const std::string summary = guest::last_summary();
     write_text(g_options.report, report);
@@ -648,6 +667,21 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
+    if (!g_options.gpu_capture.empty()) {
+        gpu::FrameCaptureConfig capture;
+        capture.path = g_options.gpu_capture;
+        capture.frames = static_cast<uint32_t>(std::max<uint64_t>(1, g_options.gpu_capture_frames));
+        capture.keep_payloads = g_options.gpu_capture_payloads;
+        if (!gpu::frame_capture_start(capture)) {
+            std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
+            return kExitUsage;
+        }
+        gpu::frame_capture_set_counters([](uint64_t* dispatches, uint64_t* import_calls) {
+            const guest::LiveCounters c = guest::live_counters();
+            *dispatches = c.dispatches;
+            *import_calls = c.import_calls;
+        });
+    }
     start_watchdog();
 
     const uint64_t host_stack = g_options.host_stack_mb << 20;

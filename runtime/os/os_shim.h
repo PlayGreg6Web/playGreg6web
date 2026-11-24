@@ -24,4 +24,10 @@ int64_t httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len);
 void httpfs_close(int32_t handle);
 void wgpu_submit(const uint8_t* data, size_t len);
 
+// Sees every packet batch handed to wgpu_submit (complete packets) before it is forwarded, on any
+// build (native builds otherwise discard them). One observer; nullptr detaches. Used by the
+// native harness's frame capture (gpu/frame_capture.h).
+using WgpuSubmitObserver = void (*)(const uint8_t* data, size_t len);
+void set_wgpu_submit_observer(WgpuSubmitObserver observer);
+
 }  // namespace playgta6::os

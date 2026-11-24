@@ -495,6 +495,13 @@ std::string last_summary();
 // "seq thread dll!symbol arg0 arg1 arg2 arg3 arg4" (hex arguments: rcx rdx r8 r9 [rsp+0x28]).
 std::string import_trace_text();
 
+// Dispatched calls and import calls of the running (or last) boot so far; safe from any thread.
+struct LiveCounters {
+    uint64_t dispatches = 0;
+    uint64_t import_calls = 0;
+};
+LiveCounters live_counters();
+
 // Lifted function containing a host code address (exact only for natively compiled lifted code:
 // nearest lifted function pointer at or below `host_pc`). 0 if unknown.
 uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset = nullptr);
