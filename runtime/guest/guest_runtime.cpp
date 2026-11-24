@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -79,6 +80,101 @@ Registry& registry() {
 }
 
 std::atomic<DispatchObserver> g_dispatch_observer{nullptr};
+
+// ---- Dispatch cache ------------------------------------------------------------------------
+// A per-thread direct-mapped cache guest VA -> resolved lifted function or shard dispatcher in
+// front of the registry lookup. Only resolved lifted targets are cached (no misses, no synthetic
+// addresses: those resolve in O(1) already), so unknown targets still reach the slow path and
+// raise the same fault. Every registry change bumps g_dispatch_generation after publishing; an
+// entry is valid only for the generation it was filled under (read before the lookup), so no
+// thread ever uses an entry that a later registration could shadow. The hit path is one acquire
+// load of the generation plus thread-local memory: no locks, no shared writes.
+
+std::atomic<uint64_t> g_dispatch_generation{1};  // 0 marks an empty cache entry
+
+enum DispatchCacheKind : uint32_t { kCachedLifted = 1, kCachedShard = 2 };
+
+struct alignas(32) DispatchCacheEntry {
+    uint64_t va = 0;
+    uint64_t generation = 0;
+    union {
+        LiftedFn lifted;
+        Pg6ShardDispatchFn shard;
+    } fn{nullptr};
+    uint32_t local_idx = 0;
+    uint32_t kind = 0;
+};
+static_assert(sizeof(DispatchCacheEntry) == 32, "two entries per cache line");
+
+constexpr unsigned kDispatchCacheBits = 12;  // 4096 entries, 128 KiB per dispatching thread
+constexpr size_t kDispatchCacheSize = size_t{1} << kDispatchCacheBits;
+
+struct DispatchCache {
+    DispatchCacheEntry entries[kDispatchCacheSize];
+};
+
+// Plain pointer (no TLS init guard on the hit path); owned by a thread_local that frees it.
+thread_local DispatchCache* t_dispatch_cache = nullptr;
+
+struct DispatchCacheOwner {
+    DispatchCache* cache = nullptr;
+    bool destroyed = false;
+    ~DispatchCacheOwner() {
+        t_dispatch_cache = nullptr;
+        destroyed = true;
+        delete cache;
+        cache = nullptr;
+    }
+};
+
+inline size_t dispatch_cache_index(uint64_t va) {
+    return static_cast<size_t>((va * 0x9E3779B97F4A7C15ULL) >> (64 - kDispatchCacheBits));
+}
+
+// The calling thread's cache (allocated on first use), or nullptr if it cannot have one.
+DispatchCache* dispatch_cache_for_fill() {
+    if (DispatchCache* cache = t_dispatch_cache) {
+        return cache;
+    }
+    thread_local DispatchCacheOwner owner;
+    if (owner.destroyed) {
+        return nullptr;  // dispatch from a later thread_local destructor: stay uncached
+    }
+    if (owner.cache == nullptr) {
+        owner.cache = new (std::nothrow) DispatchCache{};
+    }
+    t_dispatch_cache = owner.cache;
+    return owner.cache;
+}
+
+std::atomic<bool> g_dispatch_cache_enabled{true};
+
+void fill_dispatch_cache(uint64_t va, uint64_t generation, LiftedFn lifted, Pg6ShardDispatchFn shard,
+                         uint32_t local_idx) {
+    if (!g_dispatch_cache_enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    DispatchCache* cache = dispatch_cache_for_fill();
+    if (cache == nullptr) {
+        return;
+    }
+    DispatchCacheEntry& e = cache->entries[dispatch_cache_index(va)];
+    e.va = va;
+    e.generation = generation;
+    if (lifted != nullptr) {
+        e.fn.lifted = lifted;
+        e.kind = kCachedLifted;
+    } else {
+        e.fn.shard = shard;
+        e.kind = kCachedShard;
+    }
+    e.local_idx = local_idx;
+}
+
+// Called after a registry change is published (under the registry mutex).
+void invalidate_dispatch_caches() {
+    g_dispatch_generation.fetch_add(1, std::memory_order_release);
+}
 
 const LiftedFunctionEntry* find_entry(const LiftedTable& table, uint64_t va) {
     const LiftedFunctionEntry* end = table.entries + table.count;
@@ -261,6 +357,7 @@ bool register_lifted_functions(std::span<const LiftedFunctionEntry> table) {
     reg.tables[n] = LiftedTable{table.data(), table.size(), lo, hi};
     reg.function_count.fetch_add(table.size(), std::memory_order_relaxed);
     reg.table_count.store(n + 1, std::memory_order_release);
+    invalidate_dispatch_caches();
     return true;
 }
 
@@ -313,6 +410,7 @@ bool register_shard_dispatch_table(const Pg6ShardDispatchTable& table, std::stri
     reg.shard_function_count.store(published->entry_count(), std::memory_order_relaxed);
     reg.shard_count.store(published->shard_count(), std::memory_order_relaxed);
     reg.shard_registry.store(published, std::memory_order_release);
+    invalidate_dispatch_caches();
     return true;
 }
 
@@ -374,6 +472,9 @@ size_t bind_import_slots(os::VirtualMemoryArena& arena,
         publish_synthetic_locked(reg);
         ++bound;
     }
+    if (bound != 0) {
+        invalidate_dispatch_caches();
+    }
     return bound;
 }
 
@@ -398,6 +499,7 @@ uint64_t register_host_callable(HostThunkFn thunk, const char* name, uint64_t pr
     if (proc_address != 0) {
         reg.proc_to_synthetic[proc_address] = address;
     }
+    invalidate_dispatch_caches();
     return address;
 }
 
@@ -490,6 +592,16 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size) {
 
 DispatchObserver set_dispatch_observer(DispatchObserver observer) {
     return g_dispatch_observer.exchange(observer, std::memory_order_acq_rel);
+}
+
+bool set_dispatch_cache_enabled(bool enabled) {
+    const bool previous = g_dispatch_cache_enabled.exchange(enabled, std::memory_order_relaxed);
+    invalidate_dispatch_caches();  // a disabled cache must not keep serving old fills
+    return previous;
+}
+
+uint64_t dispatch_cache_generation() {
+    return g_dispatch_generation.load(std::memory_order_acquire);
 }
 
 void raise_fault(FaultKind kind, GuestState* state, uint64_t va, uint64_t detail) {
@@ -644,6 +756,7 @@ void reset_guest_runtime() {
     reg.proc_to_synthetic.clear();
     reg.fault_handler.store(nullptr, std::memory_order_release);
     g_dispatch_observer.store(nullptr, std::memory_order_release);
+    invalidate_dispatch_caches();
 }
 
 }  // namespace playgta6::guest
@@ -662,6 +775,19 @@ PG6_GUEST_HELPER void __playgta6_indirect_call(GuestState* state, uint64_t targe
     if (guest::DispatchObserver observer = guest::g_dispatch_observer.load(std::memory_order_acquire)) {
         observer(state, target);
     }
+    // Fast path: this thread resolved `target` before and the registry has not changed since.
+    const uint64_t generation = guest::g_dispatch_generation.load(std::memory_order_acquire);
+    if (const guest::DispatchCache* cache = guest::t_dispatch_cache) {
+        const guest::DispatchCacheEntry& e = cache->entries[guest::dispatch_cache_index(target)];
+        if (e.va == target && e.generation == generation) {
+            if (e.kind == guest::kCachedLifted) {
+                e.fn.lifted(state);
+            } else {
+                e.fn.shard(e.local_idx, state);
+            }
+            return;
+        }
+    }
     if (guest::is_synthetic_address(target)) {
         if (target == guest::kGuestReturnSentinel) {
             return;  // a jump to call_guest's return address: back to the host caller
@@ -672,12 +798,15 @@ PG6_GUEST_HELPER void __playgta6_indirect_call(GuestState* state, uint64_t targe
         }
     } else {
         if (playgta6::LiftedFn fn = guest::find_lifted_function(target)) {
+            guest::fill_dispatch_cache(target, generation, fn, nullptr, 0);
             fn(state);
             return;
         }
         guest::ResolvedShardTarget shard_target{};
         if (guest::find_shard_dispatch_target(target, shard_target) &&
             shard_target.dispatcher != nullptr) {
+            guest::fill_dispatch_cache(target, generation, nullptr, shard_target.dispatcher,
+                                       shard_target.local_idx);
             shard_target.dispatcher(shard_target.local_idx, state);
             return;
         }

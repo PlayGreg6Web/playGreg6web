@@ -339,6 +339,11 @@ else()
     add_executable(test_shard_dispatch ../tests/test_shard_dispatch.cpp)
     target_link_libraries(test_shard_dispatch PRIVATE playgta6_core)
     add_test(NAME test_shard_dispatch COMMAND test_shard_dispatch)
+
+    # Indirect-call dispatch micro-benchmark (O33); CTest runs the --quick smoke variant.
+    add_executable(bench_indirect_call ../tests/bench_indirect_call.cpp)
+    target_link_libraries(bench_indirect_call PRIVATE playgta6_core)
+    add_test(NAME bench_indirect_call_smoke COMMAND bench_indirect_call --quick)
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)

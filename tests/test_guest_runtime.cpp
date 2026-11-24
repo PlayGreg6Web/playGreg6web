@@ -692,6 +692,216 @@ void test_concurrent_dispatch() {
     CHECK(last == kSyntheticBase + 5002 * kSyntheticStride);
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch cache (O33): direct __playgta6_indirect_call, targets that only record the call
+// ---------------------------------------------------------------------------
+
+thread_local uint64_t t_last_kind = 0;  // 1..3 lifted fns, 10 + local_idx for shard dispatchers
+thread_local uint64_t t_last_rip = 0;
+
+void cache_fn_a(GuestState* s) {
+    t_last_kind = 1;
+    t_last_rip = s->rip;
+}
+void cache_fn_b(GuestState* s) {
+    t_last_kind = 2;
+    t_last_rip = s->rip;
+}
+void cache_fn_c(GuestState* s) {
+    t_last_kind = 3;
+    t_last_rip = s->rip;
+}
+void cache_shard(uint32_t local_idx, Pg6GuestState* s) {
+    t_last_kind = 10 + local_idx;
+    t_last_rip = s->rip;
+}
+void cache_thunk(void* state) {
+    t_last_kind = 100;
+    t_last_rip = static_cast<GuestState*>(state)->rip;
+}
+
+constexpr uint64_t kCacheBase = 0x300000000ULL;
+
+// Dispatches `va` on a fresh state; returns the callee's kind, or 0 after an UnknownTarget fault
+// (whose info lands in *fault).
+// (Called through a pointer: with /EHsc MSVC assumes a direct call to an extern "C" function
+// cannot throw, but the throwing fault handler leaves through it.)
+void (*volatile g_indirect_call)(GuestState*, uint64_t) = __playgta6_indirect_call;
+
+uint64_t dispatch(uint64_t va, GuestFault* fault = nullptr) {
+    GuestState state{};
+    t_last_kind = 0;
+    t_last_rip = 0;
+    GuestFault local{};
+    if (expect_fault([&] { g_indirect_call(&state, va); }, fault != nullptr ? fault : &local)) {
+        return 0;
+    }
+    return t_last_rip == va ? t_last_kind : 0xBAD;
+}
+
+bool register_shard_table(const Pg6ShardFunctionEntry* entries, uint64_t count, const Pg6ShardDispatchFn* shards,
+                          uint32_t shard_count) {
+    Pg6ShardDispatchTable table{};
+    table.version = kPg6ShardDispatchVersion;
+    table.shard_count = shard_count;
+    table.entry_count = count;
+    table.shards = shards;
+    table.entries = entries;
+    return register_shard_dispatch_table(table);
+}
+
+void test_dispatch_cache_semantics() {
+    for (bool enabled : {true, false}) {
+        reset_guest_runtime();
+        set_fault_handler(throwing_handler);
+        set_dispatch_cache_enabled(enabled);
+        static const LiftedFunctionEntry table[] = {{kCacheBase + 0x10, cache_fn_a},
+                                                    {kCacheBase + 0x20, cache_fn_b}};
+        static const Pg6ShardDispatchFn shards[] = {cache_shard};
+        static const Pg6ShardFunctionEntry shard_entries[] = {{kCacheBase + 0x1000, 0, 7},
+                                                              {kCacheBase + 0x1010, 0, 8}};
+        CHECK(register_lifted_functions(table));
+        CHECK(register_shard_table(shard_entries, 2, shards, 1));
+
+        // Hits: the same answer on every call, both dispatch modes.
+        for (int i = 0; i < 3; ++i) {
+            CHECK(dispatch(kCacheBase + 0x10) == 1);
+            CHECK(dispatch(kCacheBase + 0x20) == 2);
+            CHECK(dispatch(kCacheBase + 0x1000) == 17);
+            CHECK(dispatch(kCacheBase + 0x1010) == 18);
+        }
+
+        // Unknown targets keep faulting with the same report, also after hits nearby.
+        for (int i = 0; i < 2; ++i) {
+            GuestFault fault{};
+            CHECK(dispatch(kCacheBase + 0x18, &fault) == 0);
+            CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+            CHECK(fault.info.va == kCacheBase + 0x18 && fault.info.detail == kCacheBase + 0x10);
+            CHECK(dispatch(kCacheBase + 0x1008, &fault) == 0);
+            CHECK(fault.info.va == kCacheBase + 0x1008 && fault.info.detail == kCacheBase + 0x1000);
+            CHECK(dispatch(0, &fault) == 0);
+            CHECK(fault.info.va == 0 && fault.info.detail == 0);
+            CHECK(dispatch(kSyntheticBase + 900 * kSyntheticStride, &fault) == 0);
+            CHECK(fault.message.find("synthetic address not bound") != std::string::npos);
+        }
+
+        // A later per-function table takes precedence over a shard entry the thread has cached.
+        static const LiftedFunctionEntry shadow[] = {{kCacheBase + 0x1010, cache_fn_c}};
+        const uint64_t generation = dispatch_cache_generation();
+        CHECK(register_lifted_functions(shadow));
+        CHECK(dispatch_cache_generation() > generation);
+        CHECK(dispatch(kCacheBase + 0x1010) == 3);
+        CHECK(dispatch(kCacheBase + 0x1000) == 17);
+
+        // Host callables and import slots invalidate too, and dispatch to them is uncached.
+        uint64_t g = dispatch_cache_generation();
+        const uint64_t host = register_host_callable(cache_thunk, "cache_thunk");
+        CHECK(host != 0 && dispatch_cache_generation() > g);
+        CHECK(dispatch(host) == 100);
+        CHECK(dispatch(host) == 100);
+        CHECK(dispatch(kCacheBase + 0x10) == 1);
+
+        // reset_guest_runtime drops cached entries: the same VA now resolves to the new table.
+        reset_guest_runtime();
+        set_fault_handler(throwing_handler);
+        GuestFault fault{};
+        CHECK(dispatch(kCacheBase + 0x10, &fault) == 0);
+        CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+        static const LiftedFunctionEntry replacement[] = {{kCacheBase + 0x10, cache_fn_c}};
+        CHECK(register_lifted_functions(replacement));
+        CHECK(dispatch(kCacheBase + 0x10) == 3);
+        g = dispatch_cache_generation();
+        CHECK(set_dispatch_cache_enabled(true) == true || !enabled);
+        CHECK(dispatch_cache_generation() > g);
+    }
+    reset_guest_runtime();
+}
+
+// Many VAs that share cache slots: every dispatch still reaches its own function.
+void test_dispatch_cache_collisions() {
+    reset_guest_runtime();
+    set_fault_handler(throwing_handler);
+    static std::vector<LiftedFunctionEntry> table = [] {
+        std::vector<LiftedFunctionEntry> t;
+        for (uint64_t i = 0; i < 20000; ++i) {
+            t.push_back({kCacheBase + 0x100000 + i * 16, (i % 2) != 0 ? cache_fn_b : cache_fn_a});
+        }
+        return t;
+    }();
+    CHECK(register_lifted_functions(table));
+    int wrong = 0;
+    for (int pass = 0; pass < 3; ++pass) {
+        for (uint64_t i = 0; i < 20000; i += 1 + pass) {
+            if (dispatch(kCacheBase + 0x100000 + i * 16) != ((i % 2) != 0 ? 2u : 1u)) {
+                ++wrong;
+            }
+        }
+    }
+    CHECK(wrong == 0);
+    reset_guest_runtime();
+}
+
+// Readers on many threads keep dispatching while the main thread registers a table that shadows
+// a shard entry they have cached and host callables: once a reader has seen the registration
+// complete, it must never get the stale target again.
+void test_dispatch_cache_concurrent_invalidation() {
+    reset_guest_runtime();
+    set_fault_handler(throwing_handler);
+    static const Pg6ShardDispatchFn shards[] = {cache_shard};
+    static const Pg6ShardFunctionEntry shard_entries[] = {{kCacheBase + 0x2000, 0, 5},
+                                                          {kCacheBase + 0x2010, 0, 6}};
+    CHECK(register_shard_table(shard_entries, 2, shards, 1));
+    static const LiftedFunctionEntry base[] = {{kCacheBase + 0x10, cache_fn_a}};
+    CHECK(register_lifted_functions(base));
+
+    constexpr int kThreads = 8;
+    std::atomic<bool> start{false};
+    std::atomic<bool> shadowed{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+    std::atomic<int> saw_new{0};
+    std::vector<std::thread> workers;
+    for (int w = 0; w < kThreads; ++w) {
+        workers.emplace_back([&] {
+            while (!start.load()) {
+                std::this_thread::yield();
+            }
+            bool done = false;
+            while (!done) {
+                done = stop.load(std::memory_order_acquire);
+                const bool after = shadowed.load(std::memory_order_acquire);
+                const uint64_t k = dispatch(kCacheBase + 0x2000);
+                if (after ? k != 2 : (k != 15 && k != 2)) {
+                    errors.fetch_add(1);
+                }
+                if (dispatch(kCacheBase + 0x2010) != 16 || dispatch(kCacheBase + 0x10) != 1) {
+                    errors.fetch_add(1);
+                }
+                if (after && k == 2) {
+                    saw_new.fetch_add(1);
+                }
+            }
+        });
+    }
+    start.store(true);
+    for (int i = 0; i < 2000; ++i) {
+        register_host_callable(cache_thunk);
+    }
+    static const LiftedFunctionEntry shadow[] = {{kCacheBase + 0x2000, cache_fn_b}};
+    CHECK(register_lifted_functions(shadow));
+    shadowed.store(true, std::memory_order_release);
+    for (int i = 0; i < 2000; ++i) {
+        register_host_callable(cache_thunk);
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    CHECK(errors.load() == 0);
+    CHECK(saw_new.load() >= kThreads);  // every reader's last iteration ran after the shadowing
+    reset_guest_runtime();
+}
+
 }  // namespace
 
 int main() {
@@ -707,6 +917,9 @@ int main() {
     test_c_abi_thread_and_call();
     test_bulk_registration();
     test_concurrent_dispatch();
+    test_dispatch_cache_semantics();
+    test_dispatch_cache_collisions();
+    test_dispatch_cache_concurrent_invalidation();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_runtime failed with %d failure(s)\n", g_failures);

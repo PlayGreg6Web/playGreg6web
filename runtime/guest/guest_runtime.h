@@ -30,6 +30,13 @@
 // are lock-free; registration takes a mutex and publishes with release stores, so it may run
 // concurrently with dispatch. Tables must stay alive for the life of the process.
 //
+// In front of steps 2 and 3 sits a per-thread direct-mapped cache (4096 entries) of resolved
+// lifted targets (per-function or shard dispatch): a hit costs one acquire load of the registry
+// generation plus thread-local memory, no lock and no shared write. Every registration (lifted
+// tables, shard dispatch tables, import slots, host callables) and reset_guest_runtime() bump
+// the generation after publishing, which invalidates all entries; misses and synthetic addresses
+// are never cached, so unknown targets fault exactly as without the cache.
+//
 // Synthetic addresses
 // -------------------
 // Imports (IAT slots) and host callables get synthetic guest addresses
@@ -223,6 +230,12 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size);
 // longjmp) to stop the guest. nullptr removes it. Returns the previous observer.
 using DispatchObserver = void (*)(GuestState* state, uint64_t target);
 DispatchObserver set_dispatch_observer(DispatchObserver observer);
+
+// Per-thread dispatch cache (see "Dispatch" above). On by default; turning it off (benchmarks,
+// A/B runs) invalidates every thread's entries and stops new fills. Returns the previous setting.
+bool set_dispatch_cache_enabled(bool enabled);
+// Current registry generation: bumped after every registration and by reset_guest_runtime().
+uint64_t dispatch_cache_generation();
 
 // ---------------------------------------------------------------------------
 // Guest threads and entry calls
