@@ -136,6 +136,7 @@ private:
     uint32_t mips_ = 1;
     uint64_t gpu_va_ = 0;
     uint64_t cpu_va_ = 0;
+    void* xmem_memory_ = nullptr;  // committed render-target memory from XMemAlloc (see initialize)
     uint64_t owned_guest_memory_ = 0;
     bool gpu_texture_ = false;
     bool tracked_ = false;
@@ -212,6 +213,8 @@ public:
     uint32_t GetType() override { return type_; }
     HResult Close() override;
     HResult Reset(InterfaceArg<ICommandAllocatorHost> allocator, InterfaceArg<IPipelineStateHost> initial_state) override;
+    HResult ResetX(InterfaceArg<ICommandAllocatorHost> allocator, InterfaceArg<IPipelineStateHost> initial_state,
+                   uint64_t extra) override;
     void ClearState(InterfaceArg<IPipelineStateHost> state) override;
     void DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t start_vertex, uint32_t start_instance) override;
     void DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t start_index, int32_t base_vertex,

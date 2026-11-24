@@ -1,11 +1,11 @@
-'use strict';
-
 // DXGI / Xbox Series texture format mapper, WebGPU 256-byte mip-chain layout &
 // upload alignment helpers, and CPU fallback BC1/BC3/BC4 block decoders.
 // Zero external dependencies; runs in Web Workers (importScripts), browsers, and Node.js.
 // Designed for runtime/gpu <-> web/workers/wgpu_worker.js (docs/gpu_commands.md).
 
-(function (root) {
+(function (globalScope) {
+  'use strict';
+
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
   const TEXTURE_COMPRESSION_BC_FEATURE = 'texture-compression-bc';
   const DEPTH32FLOAT_STENCIL8_FEATURE = 'depth32float-stencil8';
@@ -766,8 +766,8 @@
 
   if (typeof globalThis !== 'undefined') {
     globalThis.PlayGta6TextureFormats = exportsObj;
-  } else if (root) {
-    root.PlayGta6TextureFormats = exportsObj;
+  } else if (globalScope) {
+    globalScope.PlayGta6TextureFormats = exportsObj;
   }
 
   if (typeof module !== 'undefined' && module.exports) {

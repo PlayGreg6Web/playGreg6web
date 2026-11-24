@@ -220,6 +220,8 @@ class TestServeLocal(unittest.TestCase):
             "shaderPackUrl",
             "reflectionManifestUrl",
             "pgimUrl",
+            "programManifestUrl",
+            "gameBase",
         }
         self.assertEqual(set(data.keys()), expected_keys)
         self.assertTrue(data["ok"])
@@ -233,6 +235,8 @@ class TestServeLocal(unittest.TestCase):
         self.assertIsNone(data["shaderPackUrl"])
         self.assertIsNone(data["reflectionManifestUrl"])
         self.assertIsNone(data["pgimUrl"])
+        self.assertIsNone(data["programManifestUrl"])
+        self.assertIsNone(data["gameBase"])
 
         # Populate artifacts and verify dynamic detection.
         (self.data_root / "data-manifest.json").write_text("{}", encoding="utf-8")

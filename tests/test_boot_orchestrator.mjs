@@ -6,7 +6,8 @@ import { BootTracer, BOOT_MILESTONES } from '../web/telemetry/boot_tracer.js';
 
 const require = createRequire(import.meta.url);
 const orchestratorMod = require('../web/runtime/boot_orchestrator.js');
-const { BOOT_PHASE, BootOrchestrator, DEFAULT_STATUS_URL, discoverBootAssets } = orchestratorMod;
+const { BOOT_PHASE, BOOT_MODE, BootOrchestrator, DEFAULT_STATUS_URL, discoverBootAssets, isRealGuestBoot } =
+  orchestratorMod;
 
 function createMockFetch(payload, { ok = true, status = 200, throwError = null, delayMs = 0 } = {}) {
   const calls = [];
@@ -525,4 +526,225 @@ test('getState reports structured boot snapshot including tracer milestones', as
   assert.equal(state.tracer.stage, 'TLS_INIT');
   assert.equal(bootTracer.getSummary().milestonesReached >= 1, true);
   assert.ok(BOOT_MILESTONES.includes(state.tracer.stage));
+});
+
+test('W56 discovers programManifestUrl, gameBase, and bootMode from /api/status', async () => {
+  assert.deepEqual(BOOT_MODE, {
+    PENDING: 'pending',
+    WASM_GUEST: 'wasm-guest',
+    SMOKE_DEMO: 'smoke-demo',
+  });
+  assert.ok(Object.isFrozen(BOOT_MODE));
+
+  const discovered = discoverBootAssets(
+    readyStatus({
+      programManifestUrl: '/boot/program-manifest.json',
+      gameBase: '/game/',
+    })
+  );
+  assert.equal(discovered.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(discovered.gameBase, '/game/');
+  assert.equal(discovered.hasWasmBinary, true);
+  assert.equal(discovered.bootMode, 'wasm-guest');
+  assert.equal(isRealGuestBoot(discovered), true);
+
+  const objectManifest = discoverBootAssets({
+    ok: true,
+    hasWasmBinary: true,
+    programManifest: { url: '/boot/program-manifest.json' },
+    gameBase: '  /game/  ',
+  });
+  assert.equal(objectManifest.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(objectManifest.gameBase, '/game/');
+  assert.equal(objectManifest.bootMode, 'wasm-guest');
+
+  const absent = discoverBootAssets({ ok: true, hasWasmBinary: false });
+  assert.equal(absent.programManifestUrl, null);
+  assert.equal(absent.gameBase, null);
+  assert.equal(absent.hasWasmBinary, false);
+  assert.equal(absent.bootMode, 'smoke-demo');
+  assert.equal(isRealGuestBoot(absent), false);
+
+  const phaseEvents = [];
+  const fetchImpl = createMockFetch(
+    readyStatus({
+      programManifestUrl: '/boot/program-manifest.json',
+      gameBase: '/game/',
+    })
+  );
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl,
+    onPhaseChange: (event) => phaseEvents.push(event),
+  });
+
+  // Before discovery completes, bootMode is pending and discovered URLs are null.
+  const initialState = orchestrator.getState();
+  assert.equal(initialState.bootMode, 'pending');
+  assert.equal(initialState.programManifestUrl, null);
+  assert.equal(initialState.gameBase, null);
+  assert.equal(initialState.firstPresentSource, null);
+  assert.equal(orchestrator.isRealGuestBoot(), false);
+  assert.equal(isRealGuestBoot(orchestrator), false);
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(result.bootMode, 'wasm-guest');
+  assert.equal(result.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(result.gameBase, '/game/');
+
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].bootMode, 'wasm-guest');
+  assert.equal(launches[0].programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(launches[0].gameBase, '/game/');
+  assert.equal(launches[0].assets.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(launches[0].assets.gameBase, '/game/');
+  assert.equal(launches[0].status.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(launches[0].status.gameBase, '/game/');
+
+  const state = orchestrator.getState();
+  assert.equal(state.bootMode, 'wasm-guest');
+  assert.equal(state.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(state.gameBase, '/game/');
+  assert.equal(state.assets.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(state.assets.gameBase, '/game/');
+  assert.equal(state.assets.bootMode, 'wasm-guest');
+  assert.equal(state.status.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(state.status.gameBase, '/game/');
+  assert.equal(state.status.bootMode, 'wasm-guest');
+  assert.equal(orchestrator.isRealGuestBoot(), true);
+  assert.equal(isRealGuestBoot(orchestrator), true);
+  assert.equal(isRealGuestBoot(state), true);
+
+  const launchPhaseEvent = phaseEvents.find((ev) => ev.phase === BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.ok(launchPhaseEvent);
+  assert.equal(launchPhaseEvent.bootMode, 'wasm-guest');
+  assert.equal(launchPhaseEvent.programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(launchPhaseEvent.gameBase, '/game/');
+});
+
+test('W56 launches real wasm-guest mode when programManifestUrl is present without single pgimUrl', async () => {
+  const fetchImpl = createMockFetch({
+    ok: true,
+    hasWasmBinary: true,
+    splashImage: '/game/xbs_splash.png',
+    programManifestUrl: '/boot/program-manifest.json',
+    gameBase: '/game/',
+    pgimUrl: null,
+    shaderPackUrl: null,
+  });
+  const preloader = createPreloader();
+  const { orchestrator, launches, fallbacks } = createOrchestrator({ fetchImpl, preloader });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.equal(result.bootMode, 'wasm-guest');
+  assert.equal(orchestrator.isRealGuestBoot(), true);
+  assert.equal(launches.length, 1);
+  assert.equal(fallbacks.length, 0);
+  assert.equal(preloader.calls.length, 0);
+  assert.equal(orchestrator.getState().programManifestUrl, '/boot/program-manifest.json');
+  assert.equal(orchestrator.getState().gameBase, '/game/');
+});
+
+test('W56 tracks bootMode pending -> wasm-guest vs smoke-demo and tags firstPresentSource accurately', async () => {
+  // 1. Real Wasm guest boot via FIRST_PRESENT runtime log
+  let resolveFetch;
+  const deferredFetch = async () =>
+    new Promise((resolve) => {
+      resolveFetch = () =>
+        resolve({
+          ok: true,
+          status: 200,
+          async json() {
+            return readyStatus({
+              programManifestUrl: '/boot/program-manifest.json',
+              gameBase: '/game/',
+            });
+          },
+        });
+    });
+
+  const guest = createOrchestrator({ fetchImpl: deferredFetch });
+  const pendingStart = guest.orchestrator.start();
+  // While discovery is in flight, bootMode remains pending and isRealGuestBoot() is false.
+  assert.equal(guest.orchestrator.getState().phase, BOOT_PHASE.DISCOVERING);
+  assert.equal(guest.orchestrator.getState().bootMode, 'pending');
+  assert.equal(guest.orchestrator.isRealGuestBoot(), false);
+
+  resolveFetch();
+  await pendingStart;
+  assert.equal(guest.orchestrator.getState().bootMode, 'wasm-guest');
+  assert.equal(guest.orchestrator.isRealGuestBoot(), true);
+
+  guest.orchestrator.feedRuntimeLog('[boot] FIRST_PRESENT');
+  assert.equal(guest.orchestrator.getState().phase, BOOT_PHASE.PRESENTING);
+  assert.equal(guest.orchestrator.getState().firstPresent, true);
+  assert.equal(guest.orchestrator.getState().firstPresentSource, 'wasm-guest');
+  assert.equal(guest.orchestrator.isRealGuestBoot(), true);
+  assert.equal(guest.firstPresents.length, 1);
+  assert.equal(guest.firstPresents[0].firstPresentSource, 'wasm-guest');
+  assert.equal(guest.firstPresents[0].bootMode, 'wasm-guest');
+  assert.equal(guest.firstPresents[0].isRealGuestBoot, true);
+  assert.equal(guest.overlay.dismissals.length, 1);
+  assert.equal(guest.overlay.dismissals[0].firstPresentSource, 'wasm-guest');
+
+  // 2. Real Wasm guest boot via markFirstPresent()
+  const guestMark = createOrchestrator();
+  await guestMark.orchestrator.start();
+  const markRes = guestMark.orchestrator.markFirstPresent({ frameIndex: 1 });
+  assert.equal(markRes.ok, true);
+  assert.equal(markRes.alreadyPresented, false);
+  assert.equal(markRes.bootMode, 'wasm-guest');
+  assert.equal(markRes.firstPresentSource, 'wasm-guest');
+  assert.equal(guestMark.orchestrator.getState().firstPresentSource, 'wasm-guest');
+  assert.equal(guestMark.bootTracer.getSummary().readyForSplash, true);
+  // Duplicate call is idempotent and preserves firstPresentSource.
+  const dupRes = guestMark.orchestrator.markFirstPresent({ source: 'smoke_demo' });
+  assert.equal(dupRes.alreadyPresented, true);
+  assert.equal(dupRes.firstPresentSource, 'wasm-guest');
+  assert.equal(guestMark.orchestrator.getState().firstPresentSource, 'wasm-guest');
+
+  // 3. Fallback to Smoke Demo (no runtime.wasm) -> bootMode === 'smoke-demo'
+  const smokeFetch = createMockFetch(
+    readyStatus({
+      hasWasmBinary: false,
+      runtimeWasm: null,
+      programManifestUrl: null,
+      gameBase: '/game/',
+    })
+  );
+  const smoke = createOrchestrator({ fetchImpl: smokeFetch });
+  const smokeResult = await smoke.orchestrator.start();
+  assert.equal(smokeResult.ok, true);
+  assert.equal(smokeResult.fallback, true);
+  assert.equal(smokeResult.bootMode, 'smoke-demo');
+  assert.equal(smoke.orchestrator.getState().bootMode, 'smoke-demo');
+  assert.equal(smoke.orchestrator.getState().gameBase, '/game/');
+  assert.equal(smoke.orchestrator.getState().programManifestUrl, null);
+  assert.equal(smoke.orchestrator.isRealGuestBoot(), false);
+  assert.equal(isRealGuestBoot(smoke.orchestrator), false);
+  assert.equal(smoke.fallbacks.length, 1);
+  assert.equal(smoke.fallbacks[0].bootMode, 'smoke-demo');
+
+  const smokePresent = smoke.orchestrator.markFirstPresent({ source: 'smoke_demo' });
+  assert.equal(smokePresent.ok, true);
+  assert.equal(smokePresent.alreadyPresented, false);
+  assert.equal(smokePresent.bootMode, 'smoke-demo');
+  assert.equal(smokePresent.firstPresentSource, 'smoke-demo');
+  assert.equal(smoke.orchestrator.getState().firstPresent, true);
+  assert.equal(smoke.orchestrator.getState().firstPresentSource, 'smoke-demo');
+  assert.equal(smoke.orchestrator.isRealGuestBoot(), false);
+  assert.equal(smoke.firstPresents.length, 1);
+  assert.equal(smoke.firstPresents[0].firstPresentSource, 'smoke-demo');
+  assert.equal(smoke.firstPresents[0].isRealGuestBoot, false);
+
+  // 4. Discovery failure keeps bootMode === 'pending' and isRealGuestBoot() === false.
+  const errFetch = createMockFetch(null, { throwError: new TypeError('offline') });
+  const failed = createOrchestrator({ fetchImpl: errFetch });
+  const failRes = await failed.orchestrator.start();
+  assert.equal(failRes.ok, false);
+  assert.equal(failRes.bootMode, 'pending');
+  assert.equal(failed.orchestrator.getState().bootMode, 'pending');
+  assert.equal(failed.orchestrator.isRealGuestBoot(), false);
 });

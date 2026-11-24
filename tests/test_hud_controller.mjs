@@ -24,6 +24,7 @@ import {
 
 const require = createRequire(import.meta.url);
 const { GpuFrameRecorder, OPCODES } = require('../web/workers/gpu_recorder.js');
+const { GpuBootPanelController, EXPORT_FORMAT } = require('../web/ui/gpu_boot_panel.js');
 
 // --- Lightweight Mocks for Browser APIs (DOM, OPFS, IndexedDB, localStorage, fetch) ---
 
@@ -959,4 +960,209 @@ test('gracefully handles absent subsystems and failing download/HUD callbacks wi
   assert.equal(failRes.ok, false);
   assert.equal(failRes.action, HUD_ACTIONS.EXPORT_CRASH_REPORT);
   assert.match(failRes.error, /Download blocked by browser/);
+});
+
+function createPanelMockDocument() {
+  function makeNode(tagName) {
+    const listeners = new Map();
+    const attributes = new Map();
+    const node = {
+      tagName: tagName.toUpperCase(),
+      className: '',
+      textContent: '',
+      hidden: false,
+      style: {},
+      children: [],
+      parentNode: null,
+      setAttribute(name, val) {
+        attributes.set(name, String(val));
+      },
+      getAttribute(name) {
+        return attributes.has(name) ? attributes.get(name) : null;
+      },
+      appendChild(child) {
+        if (child && typeof child === 'object') {
+          child.parentNode = node;
+        }
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx !== -1) {
+          node.children.splice(idx, 1);
+        }
+        if (child && typeof child === 'object') {
+          child.parentNode = null;
+        }
+        return child;
+      },
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        listeners.get(type)?.delete(fn);
+      },
+    };
+    return node;
+  }
+
+  return {
+    head: makeNode('head'),
+    body: makeNode('body'),
+    createElement(tag) {
+      return makeNode(tag);
+    },
+    querySelector() {
+      return null;
+    },
+  };
+}
+
+test('updateGpuBootTelemetry and exportMissingShaders wire cleanly to real GpuBootPanelController and DOM button', async () => {
+  const doc = createPanelMockDocument();
+  const container = doc.createElement('div');
+  const gpuBootPanel = new GpuBootPanelController({
+    container,
+    documentObj: doc,
+    now: () => 1700000555000,
+  });
+
+  const downloads = [];
+  const clipboardWrites = [];
+  const hud = createMockHud();
+  const controller = new HudController({
+    hud,
+    gpuBootPanel,
+    downloadBlob(filename, data, mimeType) {
+      downloads.push({ filename, data, mimeType });
+    },
+    copyToClipboard(text) {
+      clipboardWrites.push(text);
+    },
+  });
+
+  // Update telemetry via HudController helper.
+  const panelState = controller.updateGpuBootTelemetry({
+    bootSummary: { stage: 'FIRST_PRESENT', milestonesReached: 9, totalMilestones: 9 },
+    frameStats: { framesPresented: 12, droppedFrames: 1 },
+    fallbackStats: { totalLookups: 10, packHits: 8, fallbackHits: 2, builtinHits: 0 },
+    missingShaders: [
+      { hash: '0x0000000000001234', stage: 'vertex', hits: 3, rawPath: 'C:\\Users\\alice\\shader.dxil' },
+      { hash: '0x0000000000005678', stage: 'fragment', hits: 7 },
+    ],
+  });
+
+  assert.ok(panelState);
+  assert.equal(panelState.boot.stage, 'FIRST_PRESENT');
+  assert.equal(panelState.boot.readyForSplash, true);
+  assert.equal(panelState.frameStats.framesPresented, 12);
+  assert.equal(panelState.totalMissingShaders, 2);
+
+  // Export missing shaders programmatically with clipboard copy.
+  const res = await controller.exportMissingShaders({ copyToClipboard: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, HUD_ACTIONS.EXPORT_MISSING_SHADERS);
+  assert.equal(res.filename, DEFAULT_FILENAMES.MISSING_SHADERS);
+  assert.equal(res.missingShaderCount, 2);
+  assert.equal(res.downloaded, true);
+  assert.equal(res.copied, true);
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].filename, 'playgta6-missing-shaders.json');
+  assert.equal(downloads[0].mimeType, 'application/json');
+  assert.equal(downloads[0].data, res.json);
+  assert.equal(clipboardWrites.length, 1);
+  assert.doesNotMatch(res.json, /alice/i);
+
+  const parsed = JSON.parse(res.json);
+  assert.equal(parsed.format, EXPORT_FORMAT);
+  assert.equal(parsed.missingShaderCount, 2);
+  assert.equal(parsed.missingShaders[0].hash, '0x0000000000005678');
+  assert.equal(parsed.missingShaders[0].hits, 7);
+
+  // Bind #btn-export-missing-shaders DOM button and verify click + destroy cleanup.
+  const exportMissingBtn = createMockElement();
+  controller.bindButtons({ exportMissingShadersBtn: exportMissingBtn });
+  assert.equal(controller.getState().boundControlCount, 1);
+  assert.equal(exportMissingBtn.listenerCount('click'), 1);
+
+  exportMissingBtn.click();
+  await flushAsync();
+  assert.equal(downloads.length, 2);
+
+  controller.destroy();
+  assert.equal(exportMissingBtn.listenerCount('click'), 0);
+  assert.equal(controller.updateGpuBootTelemetry({ frameStats: { framesPresented: 99 } }), null);
+  assert.equal(gpuBootPanel.getState().frameStats.framesPresented, 12);
+
+  gpuBootPanel.destroy();
+});
+
+test('HudController resolves app.gpuBootPanel fallback and preserves backwards compatibility when absent or failing', async () => {
+  // 1. Absent gpuBootPanel: safe no-op for telemetry and graceful failure for export.
+  const emptyController = new HudController({ hud: createMockHud() });
+  assert.equal(
+    emptyController.updateGpuBootTelemetry({
+      bootSummary: { stage: 'PGIM_LOAD' },
+      missingShaders: [{ hash: '0x1', stage: 'vertex', hits: 1 }],
+    }),
+    null
+  );
+  const absentRes = await emptyController.exportMissingShaders();
+  assert.equal(absentRes.ok, false);
+  assert.equal(absentRes.action, HUD_ACTIONS.EXPORT_MISSING_SHADERS);
+  assert.match(absentRes.error, /not configured/i);
+
+  // 2. Fallback via options.app.gpuBootPanel (including late attachment).
+  const doc = createPanelMockDocument();
+  const appStub = { gpuBootPanel: null };
+  const downloads = [];
+  const appController = new HudController({
+    app: appStub,
+    hud: createMockHud(),
+    downloadBlob(filename, data, mimeType) {
+      downloads.push({ filename, data, mimeType });
+    },
+  });
+  assert.equal(appController.updateGpuBootTelemetry({ bootSummary: { stage: 'PGIM_LOAD' } }), null);
+
+  appStub.gpuBootPanel = new GpuBootPanelController({
+    container: doc.createElement('div'),
+    documentObj: doc,
+    now: () => 1700000999000,
+  });
+
+  const updated = appController.updateGpuBootTelemetry({
+    bootSummary: { stage: 'BINK_OPEN' },
+    missingShaders: [{ hash: '0xabcd', stage: 'compute', hits: 2 }],
+  });
+  assert.equal(updated.boot.stage, 'BINK_OPEN');
+  assert.equal(updated.totalMissingShaders, 1);
+
+  const exp = await appController.exportMissingShaders();
+  assert.equal(exp.ok, true);
+  assert.equal(exp.missingShaderCount, 1);
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].filename, DEFAULT_FILENAMES.MISSING_SHADERS);
+
+  // 3. Throwing gpuBootPanel methods never crash caller.
+  const throwingController = new HudController({
+    hud: createMockHud(),
+    gpuBootPanel: {
+      update() {
+        throw new Error('panel update boom');
+      },
+      exportMissingShadersJson() {
+        throw new Error('panel export boom');
+      },
+    },
+  });
+  assert.equal(throwingController.updateGpuBootTelemetry({ bootSummary: { stage: 'PGIM_LOAD' } }), null);
+  const errRes = await throwingController.exportMissingShaders();
+  assert.equal(errRes.ok, false);
+  assert.equal(errRes.action, HUD_ACTIONS.EXPORT_MISSING_SHADERS);
+  assert.match(errRes.error, /panel export boom/);
+
+  appStub.gpuBootPanel.destroy();
 });

@@ -24,6 +24,7 @@
 #include "os/win32_loader.h"
 #include "os/surface_blocks.h"
 #include "os/xmem_windows.h"
+#include "guest/com_bridge.h"
 
 namespace playgta6::os::scarlett {
 
@@ -187,6 +188,9 @@ struct XMemState {
     std::mutex mutex;
     XMemAllocHookFn alloc_hook = nullptr;
     XMemFreeHookFn free_hook = nullptr;
+    uint64_t guest_hook_table = 0;   // exported __XMemAllocationHooks__ ({alloc, free, ...})
+    uint64_t guest_alloc_routine = 0;  // XMemSetAllocationHooks
+    uint64_t guest_free_routine = 0;
 
     std::unordered_map<void*, HeapAllocation> heap_allocs;
     std::unordered_map<uint64_t, std::shared_ptr<PhysicalPage>> physical_pages;
@@ -1735,6 +1739,54 @@ void xmem_set_allocation_hooks(XMemAllocHookFn alloc_hook, XMemFreeHookFn free_h
     st.free_hook = free_hook;
 }
 
+void xmem_set_guest_hook_table(uint64_t table_va) {
+    auto& st = xmem_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.guest_hook_table = table_va;
+}
+
+uint64_t xmem_guest_hook_table() {
+    auto& st = xmem_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return st.guest_hook_table;
+}
+
+namespace {
+
+// The guest routine for XMemAlloc (index 0) or XMemFree (index 1), 0 if none.
+uint64_t guest_hook_routine(size_t index) {
+    uint64_t table = 0;
+    uint64_t explicit_routine = 0;
+    {
+        auto& st = xmem_state();
+        std::lock_guard<std::mutex> lock(st.mutex);
+        if (st.guest_alloc_routine != 0 || st.guest_free_routine != 0) {
+            explicit_routine = index == 0 ? st.guest_alloc_routine : st.guest_free_routine;
+            return explicit_routine;
+        }
+        table = st.guest_hook_table;
+    }
+    uint64_t routine = 0;
+    if (table != 0 && !xmem_arena().read(table + 8 * index, &routine, sizeof(routine))) {
+        routine = 0;
+    }
+    return routine;
+}
+
+// Calls a guest routine with two integer arguments on this thread's guest state. The state is
+// restored afterwards: the caller may be a shim inside another guest call (D3D12 resource
+// creation allocating through XMemAlloc).
+uint64_t call_guest_routine(uint64_t routine, uint64_t a0, uint64_t a1) {
+    namespace gcom = playgta6::guest::com;
+    GuestState& state = gcom::current_guest_state();
+    const GuestState saved = state;
+    const uint64_t result = gcom::GuestFunction<uint64_t(uint64_t, uint64_t)>(routine).call(state, a0, a1);
+    state = saved;
+    return result;
+}
+
+}  // namespace
+
 bool xmem_get_allocation_info(const void* address, XMemAllocInfo* out_info) {
     if (address == nullptr) {
         return false;
@@ -1814,6 +1866,9 @@ void xmem_reset_for_testing() {
     std::lock_guard<std::mutex> lock(st.mutex);
     st.alloc_hook = nullptr;
     st.free_hook = nullptr;
+    st.guest_hook_table = 0;
+    st.guest_alloc_routine = 0;
+    st.guest_free_routine = 0;
     for (auto& [ptr, rec] : st.heap_allocs) {
         aligned_free_bytes(ptr, rec.alignment);
     }
@@ -1918,6 +1973,7 @@ size_t register_all_scarlett_exports() {
         "xmem.dll",
         {
             export_entry("XMemAlloc", &pg6_xbox_XMemAlloc),
+            export_entry("XMemSetAllocationHooks", &pg6_xbox_XMemSetAllocationHooks),
             export_entry("XMemAllocDefault", &pg6_xbox_XMemAllocDefault),
             export_entry("XMemAllocatePhysicalPages", &pg6_xbox_XMemAllocatePhysicalPages),
             export_entry("XMemFree", &pg6_xbox_XMemFree),
@@ -1971,7 +2027,18 @@ void* pg6_xbox_XMemAlloc(size_t size, uint64_t attributes) {
     if (hook != nullptr) {
         return hook(size, attributes);
     }
+    if (const uint64_t routine = playgta6::os::scarlett::guest_hook_routine(0); routine != 0) {
+        const uint64_t va = playgta6::os::scarlett::call_guest_routine(routine, size, attributes);
+        return playgta6::os::scarlett::host_of(va);
+    }
     return pg6_xbox_XMemAllocDefault(size, attributes);
+}
+
+void pg6_xbox_XMemSetAllocationHooks(uint64_t alloc_routine, uint64_t free_routine) {
+    auto& st = playgta6::os::scarlett::xmem_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.guest_alloc_routine = alloc_routine;
+    st.guest_free_routine = free_routine;
 }
 
 void* pg6_xbox_XMemAllocDefault(size_t size, uint64_t attributes) {
@@ -2006,6 +2073,10 @@ void pg6_xbox_XMemFree(void* address, uint64_t attributes) {
     }
     if (hook != nullptr) {
         hook(address, attributes);
+        return;
+    }
+    if (const uint64_t routine = playgta6::os::scarlett::guest_hook_routine(1); routine != 0) {
+        playgta6::os::scarlett::call_guest_routine(routine, playgta6::os::scarlett::guest_of(address), attributes);
         return;
     }
     pg6_xbox_XMemFreeDefault(address, attributes);

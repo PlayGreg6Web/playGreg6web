@@ -403,7 +403,16 @@ enum class Scenario {
     LastError,
     TerminateViaShim,
     OffThreadFault,
+    HostCallable,
+    OffThreadUnresolved,
 };
+
+// HostCallable: the entry calls a named host callable (like a COM method) twice.
+void host_answer(void* raw) {
+    auto* s = static_cast<GuestState*>(raw);
+    s->gpr[GuestReg::Rax] = 42;
+    s->gpr[GuestReg::Rsp] += 8;  // pops the return address
+}
 
 // OffThreadFault: a host thread that runs guest code faults while the boot thread waits.
 std::atomic<bool> g_off_thread_reported{false};
@@ -594,6 +603,29 @@ void sub_entry(GuestState* s) {
             store32(s->gs_base + 0x68, 77);                        // inline write
             call_iat(s, kSlotGetLastError, kEntryCallsIat);
             reg(s, GuestReg::Rax) = (reg(s, GuestReg::Rax) == 77 && from_teb == 1234) ? 0 : 1;
+            ret(s);
+            return;
+        }
+        case Scenario::HostCallable: {
+            const uint64_t answer = register_host_callable(&host_answer, "ITest::Answer");
+            for (int i = 0; i < 2; ++i) {
+                push(s, kEntryCallsIat);
+                __playgta6_indirect_call(s, answer);
+            }
+            CHECK(reg(s, GuestReg::Rax) == 42);
+            call_iat(s, kSlotGetLastError, kEntryCallsIat);
+            __playgta6_unimplemented(s, kEntry + 0x20);  // a fault, so the report lists the dispatches
+        }
+        case Scenario::OffThreadUnresolved: {
+            // A worker calls an import that did not resolve (parked by the hook, detached).
+            std::thread([] {
+                GuestState& state = com::current_guest_state();
+                call_iat(&state, kSlotMissingOne, kWorker + 4);
+            }).detach();
+            for (int i = 0; i < 5000 && !g_off_thread_reported.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            reg(s, GuestReg::Rax) = 0;
             ret(s);
             return;
         }
@@ -1019,6 +1051,33 @@ void test_observability() {
     CHECK(console_mode() == -1);
 }
 
+// host_callable_calls counts calls to named host callables in first-call order; com_stub_hits
+// lists COM stub slots (none here); recent_dispatches name host callables and imports.
+void test_host_callable_statistics() {
+    const Run run = boot_scenario(Scenario::HostCallable);
+    CHECK(run.result.status != BootStatus::Exited);
+    bool answer_named = false;
+    bool import_named = false;
+    for (const Json& d : run.report["recent_dispatches"].items) {
+        answer_named = answer_named || d["name"].text == "ITest::Answer";
+        import_named = import_named || (d["name"].type == Json::String &&
+                                        d["name"].text.find("!GetLastError") != std::string::npos);
+    }
+    CHECK(answer_named);
+    CHECK(import_named);
+    const Json& calls = run.report["host_callable_calls"];
+    CHECK(calls.type == Json::Array);
+    bool found = false;
+    for (const Json& c : calls.items) {
+        if (c["name"].text == "ITest::Answer") {
+            found = true;
+            CHECK(c["calls"].number == 2);
+        }
+    }
+    CHECK(found);
+    CHECK(run.report["com_stub_hits"].type == Json::Array);
+}
+
 void test_off_thread_fault() {
     // Without the hook the boot leaves such faults to the default handler: not exercised here.
     const Run run = boot_scenario(Scenario::OffThreadFault, [](BootConfig& cfg) {
@@ -1037,6 +1096,31 @@ void test_off_thread_fault() {
     CHECK(report["status"].text == "fault");
     CHECK(report["fault"]["kind"].text == "unimplemented");
     CHECK(report["fault"]["va"].hex() == kWorker + 4);
+    CHECK(report["message"].text.find("on guest thread") != std::string::npos);
+    (void)run;
+}
+
+// An unresolved import called on another guest thread is reported through the same hook
+// (before, the process aborted without a report).
+void test_off_thread_unresolved_import() {
+    g_off_thread_reported = false;
+    g_off_thread_report.clear();
+    const Run run = boot_scenario(Scenario::OffThreadUnresolved, [](BootConfig& cfg) {
+        cfg.off_thread_fault = [] {
+            g_off_thread_report = last_report_json();
+            g_off_thread_reported = true;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::hours(1));
+            }
+        };
+    });
+    CHECK(g_off_thread_reported.load());
+    bool ok = false;
+    const Json report = parse_json(g_off_thread_report, &ok);
+    CHECK(ok);
+    CHECK(report["status"].text == "fault");
+    CHECK(report["fault"]["kind"].text == "unresolved_import");
+    CHECK(report["message"].text.find("call to unresolved import") != std::string::npos);
     CHECK(report["message"].text.find("on guest thread") != std::string::npos);
     (void)run;
 }
@@ -1246,6 +1330,8 @@ int main() {
     test_last_error_shared_with_teb();
     test_observability();
     test_off_thread_fault();
+    test_host_callable_statistics();
+    test_off_thread_unresolved_import();
     test_second_thread();
     test_no_tls_and_load_failure();
     test_two_modules();

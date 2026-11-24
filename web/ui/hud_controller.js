@@ -16,6 +16,7 @@ export const HUD_ACTIONS = Object.freeze({
   TOGGLE_GPU_RECORDING: 'toggle_gpu_recording',
   EXPORT_GPU_TRACE: 'export_gpu_trace',
   EXPORT_CRASH_REPORT: 'export_crash_report',
+  EXPORT_MISSING_SHADERS: 'export_missing_shaders',
   SWITCH_INPUT_PROFILE: 'switch_input_profile',
   TOGGLE_SMOKE_DEMO: 'toggle_smoke_demo',
   RESTART_SESSION: 'restart_session',
@@ -25,6 +26,7 @@ export const DEFAULT_FILENAMES = Object.freeze({
   USERDATA_BACKUP: 'playgta6-userdata-backup.json',
   GPU_TRACE: 'playgta6-capture.pg6trace',
   CRASH_REPORT: 'playgta6-diagnostic-report.json',
+  MISSING_SHADERS: 'playgta6-missing-shaders.json',
 });
 
 const SUPPORTED_BUTTON_BINDINGS = Object.freeze([
@@ -33,6 +35,7 @@ const SUPPORTED_BUTTON_BINDINGS = Object.freeze([
   ['recordTraceBtn', 'click'],
   ['exportTraceBtn', 'click'],
   ['exportCrashBtn', 'click'],
+  ['exportMissingShadersBtn', 'click'],
   ['restartBtn', 'click'],
   ['smokeDemoBtn', 'click'],
   ['profileSelect', 'change'],
@@ -133,10 +136,12 @@ export class HudController {
   /**
    * @param {object} [options]
    * @param {object|null} [options.hud=null]
+   * @param {object|null} [options.app=null]
    * @param {object|null} [options.sessionController=null]
    * @param {object|null} [options.smokeDemoRunner=null]
    * @param {object|null} [options.storageManager=null]
    * @param {object|null} [options.gpuRecorder=null]
+   * @param {object|null} [options.gpuBootPanel=null]
    * @param {object|null} [options.crashReporter=null]
    * @param {object|null} [options.inputProfiles=null]
    * @param {object|null} [options.perfMonitor=null]
@@ -151,10 +156,12 @@ export class HudController {
 
     const {
       hud = null,
+      app = null,
       sessionController = null,
       smokeDemoRunner = null,
       storageManager = null,
       gpuRecorder = null,
+      gpuBootPanel = null,
       crashReporter = null,
       inputProfiles = null,
       perfMonitor = null,
@@ -178,10 +185,12 @@ export class HudController {
     }
 
     this._hud = hud || null;
+    this._app = app || null;
     this._sessionController = sessionController || null;
     this._smokeDemoRunner = smokeDemoRunner || null;
     this._storageManager = storageManager || null;
     this._gpuRecorder = gpuRecorder || null;
+    this._gpuBootPanel = gpuBootPanel || (app && app.gpuBootPanel) || null;
     this._crashReporter = crashReporter || null;
     this._inputProfiles = inputProfiles || null;
     this._perfMonitor = perfMonitor || null;
@@ -194,10 +203,25 @@ export class HudController {
     this._lastAction = null;
     this._boundListeners = [];
     this._boundElements = {};
+    this._exportingMissingShaders = false;
     this._destroyed = false;
   }
 
+  get isExportingMissingShaders() {
+    return this._exportingMissingShaders;
+  }
+
   // --- Internal Helpers ---
+
+  _getGpuBootPanel() {
+    if (this._gpuBootPanel) {
+      return this._gpuBootPanel;
+    }
+    if (this._app && this._app.gpuBootPanel) {
+      return this._app.gpuBootPanel;
+    }
+    return null;
+  }
 
   _hudLog(message, level = 'info') {
     if (this._hud && typeof this._hud.appendLog === 'function') {
@@ -767,6 +791,116 @@ export class HudController {
   }
 
   /**
+   * Exports the sanitized missing-shader shopping list JSON via
+   * `gpuBootPanel.exportMissingShadersJson()` and triggers a JSON download
+   * (`playgta6-missing-shaders.json`) when `downloadBlob` is available.
+   *
+   * @param {{ copyToClipboard?: boolean }} [options]
+   */
+  async exportMissingShaders(options = {}) {
+    const action = HUD_ACTIONS.EXPORT_MISSING_SHADERS;
+    const panel = this._getGpuBootPanel();
+    if (!panel || typeof panel.exportMissingShadersJson !== 'function') {
+      return this._finishAction(
+        action,
+        false,
+        'GPU boot panel unavailable; cannot export missing shaders.',
+        { error: 'GPU boot panel is not configured' },
+        'warn'
+      );
+    }
+
+    try {
+      const opts = isPlainObject(options) ? options : {};
+      let json;
+      this._exportingMissingShaders = true;
+      try {
+        json = panel.exportMissingShadersJson();
+      } finally {
+        this._exportingMissingShaders = false;
+      }
+
+      if (typeof json !== 'string' || json.length === 0) {
+        throw new TypeError('GPU boot panel did not return a missing-shader JSON string');
+      }
+
+      let missingShaderCount = null;
+      try {
+        const parsed = JSON.parse(json);
+        if (parsed && typeof parsed === 'object') {
+          if (Number.isFinite(parsed.missingShaderCount)) {
+            missingShaderCount = parsed.missingShaderCount;
+          } else if (Array.isArray(parsed.missingShaders)) {
+            missingShaderCount = parsed.missingShaders.length;
+          }
+        }
+      } catch {
+        // Leave missingShaderCount null if a custom mock returned non-JSON text.
+      }
+
+      const filename = DEFAULT_FILENAMES.MISSING_SHADERS;
+      const downloaded = await this._triggerDownload(filename, json, 'application/json');
+      const copied =
+        opts.copyToClipboard === true ? await this._triggerClipboardCopy(json) : false;
+      const byteLength = new TextEncoder().encode(json).byteLength;
+      const countDetail =
+        missingShaderCount !== null
+          ? `${missingShaderCount} missing shader${missingShaderCount === 1 ? '' : 's'}, `
+          : '';
+      const summary = `Exported missing-shader report (${countDetail}${formatBytes(byteLength)}) to ${filename}.`;
+
+      return this._finishAction(
+        action,
+        true,
+        summary,
+        { filename, json, byteLength, missingShaderCount, downloaded, copied },
+        'ok'
+      );
+    } catch (err) {
+      const error = toErrorMessage(err, 'Failed to export missing shaders');
+      return this._finishAction(action, false, `Failed to export missing shaders: ${error}`, {
+        error,
+      });
+    }
+  }
+
+  /**
+   * Forwards GPU/boot diagnostics telemetry (`bootSummary`, `missingShaders`,
+   * `fallbackStats`, `frameStats`) to `gpuBootPanel.update(payload)` when present.
+   * Safe no-op returning `null` when `gpuBootPanel` is absent or destroyed.
+   *
+   * @param {{
+   *   bootSummary?: object|null,
+   *   missingShaders?: Array|null,
+   *   fallbackStats?: object|null,
+   *   frameStats?: object|null,
+   * }|null|undefined} payload
+   * @returns {object|null}
+   */
+  updateGpuBootTelemetry(payload) {
+    if (this._destroyed) {
+      return null;
+    }
+    const panel = this._getGpuBootPanel();
+    if (!panel || typeof panel.update !== 'function') {
+      return null;
+    }
+    if (!payload || typeof payload !== 'object') {
+      try {
+        return typeof panel.getState === 'function' ? panel.getState() : null;
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const state = panel.update(payload);
+      return state !== undefined ? state : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Switches the active input profile via `inputProfiles.setActiveProfile(profileId)`
    * and persists it via `inputProfiles.save()`.
    *
@@ -987,6 +1121,7 @@ export class HudController {
    *   recordTraceBtn?: EventTarget|null,
    *   exportTraceBtn?: EventTarget|null,
    *   exportCrashBtn?: EventTarget|null,
+   *   exportMissingShadersBtn?: EventTarget|null,
    *   restartBtn?: EventTarget|null,
    *   smokeDemoBtn?: EventTarget|null,
    *   profileSelect?: EventTarget|null,
@@ -1016,6 +1151,9 @@ export class HudController {
       },
       exportCrashBtn: () => {
         void this.exportCrashReport();
+      },
+      exportMissingShadersBtn: () => {
+        void this.exportMissingShaders();
       },
       restartBtn: () => {
         void this.restartSession();

@@ -48,17 +48,39 @@ function isEventTargetLike(obj) {
   );
 }
 
-function detectWasm64(wasmApi) {
+export function detectWasm64(wasmApi) {
   if (!wasmApi || typeof wasmApi.Memory !== 'function') {
     return false;
   }
-  try {
-    // eslint-disable-next-line no-new
-    new wasmApi.Memory({ initial: 1n, maximum: 2n, index: 'i64' });
-    return true;
-  } catch {
-    return false;
+  // Probe spec-standard `{ address: 'i64' }` (Chrome 133+, Firefox 134+, Node 22+)
+  // first, then fall back to legacy proposal `{ index: 'i64' }`. Passing BigInt
+  // `initial`/`maximum` ensures non-Wasm64 engines (or mocks) that silently ignore
+  // unknown descriptor keys still throw a TypeError on BigInt-to-Number coercion.
+  for (const key of ['address', 'index']) {
+    try {
+      const mem = new wasmApi.Memory({ initial: 1n, maximum: 2n, [key]: 'i64' });
+      if (!mem || typeof mem !== 'object') {
+        continue;
+      }
+      if (typeof mem.type === 'function') {
+        try {
+          const info = mem.type();
+          if (info && typeof info === 'object') {
+            const addr = info.address ?? info.index;
+            if (addr !== undefined && addr !== 'i64') {
+              continue;
+            }
+          }
+        } catch {
+          // Ignore optional type-reflection errors.
+        }
+      }
+      return true;
+    } catch {
+      // Try next descriptor key or report unsupported below.
+    }
   }
+  return false;
 }
 
 function resolveDefaultWindow(options) {
@@ -133,6 +155,70 @@ function resolveDefaultDataBase(options, windowObj) {
   return '/data/';
 }
 
+function resolveDefaultBootBase(options, windowObj) {
+  if (typeof options.bootBase === 'string' && options.bootBase.length > 0) {
+    return options.bootBase;
+  }
+  const origin = windowObj && windowObj.location && windowObj.location.origin;
+  if (typeof origin === 'string' && origin.length > 0 && origin !== 'null') {
+    return `${origin}/boot/`;
+  }
+  return '/boot/';
+}
+
+export function resolveDefaultGameBase(options = {}, windowObj = null) {
+  if (options && typeof options.gameBase === 'string' && options.gameBase.length > 0) {
+    return options.gameBase;
+  }
+  const origin = windowObj && windowObj.location && windowObj.location.origin;
+  if (typeof origin === 'string' && origin.length > 0 && origin !== 'null') {
+    return `${origin}/game/`;
+  }
+  return '/game/';
+}
+
+function pickBootUrl(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    } else if (candidate && typeof candidate === 'object') {
+      for (const prop of ['url', 'path', 'href']) {
+        if (typeof candidate[prop] === 'string' && candidate[prop].trim().length > 0) {
+          return candidate[prop].trim();
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function extractBootAssetUrls(source) {
+  if (!source || typeof source !== 'object') {
+    return {};
+  }
+  const out = {};
+  const bootBase = pickBootUrl(source.bootBase);
+  const gameBase = pickBootUrl(source.gameBase);
+  const shaderPackUrl = pickBootUrl(source.shaderPackUrl, source.shaderPack, source.wgslPack);
+  const reflectionManifestUrl = pickBootUrl(
+    source.reflectionManifestUrl,
+    source.reflectionUrl,
+    source.reflectionManifest
+  );
+  const pgimUrl = pickBootUrl(source.pgimUrl, source.pgim, source.pgimImage);
+  const programManifestUrl = pickBootUrl(source.programManifestUrl, source.programManifest);
+  if (bootBase) out.bootBase = bootBase;
+  if (gameBase) out.gameBase = gameBase;
+  if (shaderPackUrl) out.shaderPackUrl = shaderPackUrl;
+  if (reflectionManifestUrl) out.reflectionManifestUrl = reflectionManifestUrl;
+  if (pgimUrl) out.pgimUrl = pgimUrl;
+  if (programManifestUrl) out.programManifestUrl = programManifestUrl;
+  return out;
+}
+
 function resolveViewportMetrics(canvas, windowObj, overrides = {}) {
   const dpr = isPositiveFinite(overrides.devicePixelRatio)
     ? overrides.devicePixelRatio
@@ -184,8 +270,11 @@ function createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory }
     );
 
     const wasmApi =
-      (windowObj && typeof windowObj === 'object' && windowObj.WebAssembly) ||
-      (typeof WebAssembly !== 'undefined' ? WebAssembly : null);
+      windowObj && typeof windowObj === 'object' && 'WebAssembly' in windowObj
+        ? windowObj.WebAssembly
+        : typeof WebAssembly !== 'undefined'
+          ? WebAssembly
+          : null;
     const wasm64 = detectWasm64(wasmApi);
 
     const opfs = Boolean(nav && nav.storage && typeof nav.storage.getDirectory === 'function');
@@ -304,6 +393,7 @@ export class PlayGta6AppHandle {
     this.storageManager = components.storageManager;
     this.bootTracer = components.bootTracer || null;
     this.splashOverlay = components.splashOverlay || null;
+    this.gpuBootPanel = components.gpuBootPanel || null;
     this.pgimPreloader = components.pgimPreloader || null;
     this.bootOrchestrator = components.bootOrchestrator || null;
 
@@ -366,6 +456,14 @@ export class PlayGta6AppHandle {
  * @param {string} [options.statusUrl='/api/status']
  * @param {string} [options.loaderUrl]
  * @param {string} [options.dataBase]
+ * @param {string} [options.bootBase]
+ * @param {string} [options.gameBase]
+ * @param {string} [options.programManifestUrl]
+ * @param {object|null} [options.gpuBootPanel]
+ * @param {Element|object|null} [options.gpuBootPanelRoot]
+ * @param {Function|null} [options.GpuBootPanelCtor]
+ * @param {object} [options.gpuBootPanelOptions]
+ * @param {boolean} [options.enableGpuBootPanel=true]
  * @param {string} [options.appVersion]
  * @param {string} [options.activeProfileId]
  * @param {boolean} [options.attachGlobalErrorHandlers=true]
@@ -441,6 +539,68 @@ export function bootstrapPlayGta6App(options = {}) {
       ? options.statusUrl
       : DEFAULT_STATUS_URL;
   const dataBase = resolveDefaultDataBase(options, windowObj);
+  const explicitBootBase =
+    typeof options.bootBase === 'string' && options.bootBase.length > 0 ? options.bootBase : null;
+  const defaultBootBase = resolveDefaultBootBase(options, windowObj);
+  const explicitGameBase =
+    typeof options.gameBase === 'string' && options.gameBase.length > 0 ? options.gameBase : null;
+  const defaultGameBase = resolveDefaultGameBase(options, windowObj);
+  const initialBootAssets = extractBootAssetUrls(options);
+  let latestDiscoveredBootAssets = { ...initialBootAssets };
+
+  function recordDiscoveredBootAssets(payload) {
+    if (!payload || typeof payload !== 'object') {
+      return;
+    }
+    const fromDirect = extractBootAssetUrls(payload);
+    const fromStatus = extractBootAssetUrls(payload.status || payload.serverStatus);
+    const fromAssets = extractBootAssetUrls(payload.assets);
+    const merged = { ...fromDirect, ...fromStatus, ...fromAssets };
+    if (Object.keys(merged).length > 0) {
+      latestDiscoveredBootAssets = { ...latestDiscoveredBootAssets, ...merged };
+    }
+  }
+
+  function resolveBootForwardFields(launchContext) {
+    let fromOrchestrator = {};
+    if (bootOrchestrator && typeof bootOrchestrator.getState === 'function') {
+      try {
+        const state = bootOrchestrator.getState();
+        if (state && typeof state === 'object') {
+          fromOrchestrator = {
+            ...extractBootAssetUrls(state.status),
+            ...extractBootAssetUrls(state.assets),
+          };
+        }
+      } catch {
+        // Ignore orchestrator state errors.
+      }
+    }
+    const fromLaunchStatus = extractBootAssetUrls(launchContext && launchContext.serverStatus);
+    const merged = {
+      ...initialBootAssets,
+      ...latestDiscoveredBootAssets,
+      ...fromOrchestrator,
+      ...fromLaunchStatus,
+    };
+    const fields = {
+      bootBase: explicitBootBase || merged.bootBase || defaultBootBase,
+      gameBase: explicitGameBase || merged.gameBase || defaultGameBase,
+    };
+    if (merged.shaderPackUrl) {
+      fields.shaderPackUrl = merged.shaderPackUrl;
+    }
+    if (merged.reflectionManifestUrl) {
+      fields.reflectionManifestUrl = merged.reflectionManifestUrl;
+    }
+    if (merged.pgimUrl) {
+      fields.pgimUrl = merged.pgimUrl;
+    }
+    if (merged.programManifestUrl) {
+      fields.programManifestUrl = merged.programManifestUrl;
+    }
+    return fields;
+  }
 
   // 1. CrashReporter (sanitized diagnostics + global window error handlers).
   const crashReporterOptions =
@@ -686,6 +846,200 @@ export function bootstrapPlayGta6App(options = {}) {
     ownsSplashOverlay = true;
   }
 
+  const gpuBootPanelRoot =
+    options.gpuBootPanelRoot !== undefined ? options.gpuBootPanelRoot : null;
+  const GpuBootPanelCtor =
+    options.GpuBootPanelCtor ||
+    (globalObj.PlayGta6GpuBootPanel && globalObj.PlayGta6GpuBootPanel.GpuBootPanelController) ||
+    (typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6GpuBootPanel &&
+      globalThis.PlayGta6GpuBootPanel.GpuBootPanelController) ||
+    null;
+
+  let gpuBootPanel = null;
+  let ownsGpuBootPanel = false;
+  if (options.gpuBootPanel !== undefined) {
+    gpuBootPanel = options.gpuBootPanel;
+  } else if (
+    options.enableGpuBootPanel !== false &&
+    gpuBootPanelRoot &&
+    typeof GpuBootPanelCtor === 'function'
+  ) {
+    const gpuBootPanelOptions =
+      options.gpuBootPanelOptions && typeof options.gpuBootPanelOptions === 'object'
+        ? options.gpuBootPanelOptions
+        : {};
+    gpuBootPanel = new GpuBootPanelCtor({
+      ...gpuBootPanelOptions,
+      container: gpuBootPanelRoot,
+      documentObj: documentObj || undefined,
+      now: gpuBootPanelOptions.now || epochNow,
+    });
+    ownsGpuBootPanel = true;
+  }
+
+  let latestPanelBootSummary = null;
+  let latestPanelFrameStats = undefined;
+  let latestPanelFallbackStats = undefined;
+  let latestPanelMissingShaders = undefined;
+  const bootTracerCleanupFns = [];
+
+  function safeUpdateGpuBootPanel(patch = {}) {
+    if (destroyed || !gpuBootPanel || typeof gpuBootPanel.update !== 'function') {
+      return;
+    }
+    if (patch.bootSummary !== undefined) {
+      latestPanelBootSummary = patch.bootSummary;
+    }
+    if (patch.frameStats !== undefined) {
+      latestPanelFrameStats = patch.frameStats;
+    }
+    if (patch.fallbackStats !== undefined) {
+      latestPanelFallbackStats = patch.fallbackStats;
+    }
+    if (patch.missingShaders !== undefined) {
+      latestPanelMissingShaders = patch.missingShaders;
+    }
+
+    const payload = {};
+    if (latestPanelBootSummary !== null && latestPanelBootSummary !== undefined) {
+      payload.bootSummary = latestPanelBootSummary;
+    } else if (bootTracer && typeof bootTracer.getSummary === 'function') {
+      try {
+        payload.bootSummary = bootTracer.getSummary();
+      } catch {
+        // Ignore tracer summary errors.
+      }
+    }
+    if (latestPanelFrameStats !== undefined) {
+      payload.frameStats = latestPanelFrameStats;
+    }
+    if (latestPanelFallbackStats !== undefined) {
+      payload.fallbackStats = latestPanelFallbackStats;
+    }
+    if (latestPanelMissingShaders !== undefined) {
+      payload.missingShaders = latestPanelMissingShaders;
+    }
+
+    try {
+      gpuBootPanel.update(payload);
+    } catch {
+      // Diagnostics panel errors must never interrupt boot or runtime.
+    }
+  }
+
+  function handleGpuTelemetryMessage(data) {
+    if (!data || typeof data !== 'object' || data.type !== 'gpu-telemetry') {
+      return false;
+    }
+    const patch = {};
+    if (data.bootSummary !== undefined) {
+      patch.bootSummary = data.bootSummary;
+    }
+    if (data.frameStats !== undefined) {
+      patch.frameStats = data.frameStats;
+    }
+    if (data.fallbackStats !== undefined) {
+      patch.fallbackStats = data.fallbackStats;
+    }
+    if (data.missingShaders !== undefined) {
+      patch.missingShaders = data.missingShaders;
+    }
+    safeUpdateGpuBootPanel(patch);
+    return true;
+  }
+
+  function hookBootTracerForPanel() {
+    if (!bootTracer || typeof bootTracer !== 'object' || !gpuBootPanel) {
+      return;
+    }
+    let hookDepth = 0;
+    let pendingEmit = false;
+
+    const emitFromTracer = (explicitSummary) => {
+      if (destroyed) {
+        return;
+      }
+      let summary = explicitSummary;
+      if (summary === undefined && typeof bootTracer.getSummary === 'function') {
+        try {
+          summary = bootTracer.getSummary();
+        } catch {
+          summary = undefined;
+        }
+      }
+      if (summary !== undefined) {
+        safeUpdateGpuBootPanel({ bootSummary: summary });
+      }
+    };
+
+    const wrapMethod = (methodName, shouldEmitOnResult) => {
+      if (typeof bootTracer[methodName] !== 'function') {
+        return;
+      }
+      const hasOwn = Object.prototype.hasOwnProperty.call(bootTracer, methodName);
+      const original = bootTracer[methodName];
+      const wrapped = function (...args) {
+        hookDepth += 1;
+        try {
+          const result = original.apply(this, args);
+          if (shouldEmitOnResult(result)) {
+            pendingEmit = true;
+          }
+          return result;
+        } finally {
+          hookDepth -= 1;
+          if (hookDepth === 0 && pendingEmit) {
+            pendingEmit = false;
+            emitFromTracer();
+          }
+        }
+      };
+      try {
+        bootTracer[methodName] = wrapped;
+        bootTracerCleanupFns.push(() => {
+          if (bootTracer[methodName] === wrapped) {
+            if (hasOwn) {
+              bootTracer[methodName] = original;
+            } else {
+              delete bootTracer[methodName];
+            }
+          }
+        });
+      } catch {
+        // Ignore frozen or non-writable tracer mocks.
+      }
+    };
+
+    wrapMethod('markMilestone', () => true);
+    wrapMethod('recordTrap', () => true);
+    wrapMethod('reset', () => true);
+    wrapMethod('ingestLogLine', (res) => Boolean(res));
+    wrapMethod('ingestLog', (res) => Boolean(res));
+
+    if (isEventTargetLike(bootTracer)) {
+      const onTracerEvent = (ev) => {
+        const detail =
+          ev && typeof ev === 'object' ? ev.detail || ev.summary || ev.bootSummary : undefined;
+        const summary =
+          detail &&
+          typeof detail === 'object' &&
+          ('stage' in detail || 'milestonesReached' in detail)
+            ? detail
+            : undefined;
+        emitFromTracer(summary);
+      };
+      bootTracer.addEventListener('milestone', onTracerEvent);
+      bootTracer.addEventListener('update', onTracerEvent);
+      bootTracer.addEventListener('summary', onTracerEvent);
+      bootTracerCleanupFns.push(() => {
+        bootTracer.removeEventListener('milestone', onTracerEvent);
+        bootTracer.removeEventListener('update', onTracerEvent);
+        bootTracer.removeEventListener('summary', onTracerEvent);
+      });
+    }
+  }
+
   const PgimPreloaderCtor =
     options.PgimPreloaderCtor ||
     (globalObj.PlayGta6PgimPreloader && globalObj.PlayGta6PgimPreloader.PgimPreloader) ||
@@ -762,9 +1116,16 @@ export function bootstrapPlayGta6App(options = {}) {
         // Fall back to direct tracer update.
       }
     }
-    if (bootTracer && typeof bootTracer.ingestLog === 'function') {
+    if (
+      bootTracer &&
+      (typeof bootTracer.ingestLogLine === 'function' || typeof bootTracer.ingestLog === 'function')
+    ) {
       try {
-        bootTracer.ingestLog(line);
+        if (typeof bootTracer.ingestLogLine === 'function') {
+          bootTracer.ingestLogLine(line);
+        } else {
+          bootTracer.ingestLog(line);
+        }
         const summary = bootTracer.getSummary();
         if (splashOverlay && typeof splashOverlay.updateBootState === 'function') {
           splashOverlay.updateBootState(summary);
@@ -794,6 +1155,8 @@ export function bootstrapPlayGta6App(options = {}) {
   let destroyed = false;
   let destroyPromise = null;
 
+  hookBootTracerForPanel();
+
   const resolvedRaf =
     options.raf ||
     smokeDemoOptions.raf ||
@@ -815,6 +1178,10 @@ export function bootstrapPlayGta6App(options = {}) {
 
     const pixelWidth = Math.max(1, Math.round(viewportWidth * viewportDpr));
     const pixelHeight = Math.max(1, Math.round(viewportHeight * viewportDpr));
+    if (launchContext && launchContext.serverStatus) {
+      recordDiscoveredBootAssets(launchContext.serverStatus);
+    }
+    const bootForwardFields = resolveBootForwardFields(launchContext);
 
     let worker;
     if (createWasmWorker) {
@@ -829,6 +1196,7 @@ export function bootstrapPlayGta6App(options = {}) {
         inputSab: inputBridge.sab,
         audioSab: audioEngine.sab,
         dataBase,
+        ...bootForwardFields,
         launchContext,
       });
     } else {
@@ -853,6 +1221,8 @@ export function bootstrapPlayGta6App(options = {}) {
       }
       throw new Error('PlayGta6AppHandle was destroyed while starting Wasm64 worker');
     }
+
+    let stopped = false;
 
     const onWorkerError = (ev) => {
       const errObj =
@@ -893,6 +1263,14 @@ export function bootstrapPlayGta6App(options = {}) {
       );
     };
 
+    const onWorkerMessage = (ev) => {
+      if (stopped || destroyed) {
+        return;
+      }
+      const data = ev && typeof ev === 'object' && ev.data !== undefined ? ev.data : ev;
+      handleGpuTelemetryMessage(data);
+    };
+
     let usedAddEventListener = false;
     let prevOnError = null;
     if (isEventTargetLike(worker)) {
@@ -902,6 +1280,16 @@ export function bootstrapPlayGta6App(options = {}) {
     } else {
       prevOnError = worker.onerror ?? null;
       worker.onerror = onWorkerError;
+    }
+
+    let attachedWorkerMessageListener = false;
+    if (typeof worker.addEventListener === 'function') {
+      try {
+        worker.addEventListener('message', onWorkerMessage);
+        attachedWorkerMessageListener = true;
+      } catch {
+        attachedWorkerMessageListener = false;
+      }
     }
 
     let progressChannel = null;
@@ -915,6 +1303,10 @@ export function bootstrapPlayGta6App(options = {}) {
         progressChannel.onmessage = (ev) => {
           const data = ev && ev.data && typeof ev.data === 'object' ? ev.data : null;
           if (!data) return;
+          if (data.type === 'gpu-telemetry') {
+            handleGpuTelemetryMessage(data);
+            return;
+          }
           if (data.metrics && hud && typeof hud.updateMetrics === 'function') {
             try {
               hud.updateMetrics(data.metrics);
@@ -967,6 +1359,7 @@ export function bootstrapPlayGta6App(options = {}) {
         inputSab: inputBridge.sab,
         audioSab: audioEngine.sab,
         dataBase,
+        ...bootForwardFields,
       };
       if (transferList) {
         worker.postMessage(initPayload, transferList);
@@ -975,7 +1368,6 @@ export function bootstrapPlayGta6App(options = {}) {
       }
     }
 
-    let stopped = false;
     const wasmHandle = {
       mode: SESSION_MODE.WASM,
       worker,
@@ -1002,6 +1394,17 @@ export function bootstrapPlayGta6App(options = {}) {
           worker.removeEventListener('messageerror', onMessageError);
         } else if (worker.onerror === onWorkerError) {
           worker.onerror = prevOnError;
+        }
+
+        if (attachedWorkerMessageListener) {
+          attachedWorkerMessageListener = false;
+          if (typeof worker.removeEventListener === 'function') {
+            try {
+              worker.removeEventListener('message', onWorkerMessage);
+            } catch {
+              // Ignore listener removal errors.
+            }
+          }
         }
 
         if (progressChannel) {
@@ -1225,10 +1628,12 @@ export function bootstrapPlayGta6App(options = {}) {
       splashOverlay: splashAdapter,
       preloader: pgimPreloader,
       bootTracer,
-      onLaunchRuntime: async () => {
+      onLaunchRuntime: async (bootPayload) => {
+        recordDiscoveredBootAssets(bootPayload);
         lastBootSessionResult = await session.start(pendingStartOpts);
       },
-      onFallbackSmokeDemo: async () => {
+      onFallbackSmokeDemo: async (bootPayload) => {
+        recordDiscoveredBootAssets(bootPayload);
         const fallbackOpts =
           pendingStartOpts && typeof pendingStartOpts === 'object'
             ? { preferSmoke: true, ...pendingStartOpts }
@@ -1301,7 +1706,9 @@ export function bootstrapPlayGta6App(options = {}) {
     if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
       pendingStartOpts = startOpts;
       lastBootSessionResult = null;
+      latestDiscoveredBootAssets = { ...initialBootAssets };
       const bootResult = await bootOrchestrator.start();
+      recordDiscoveredBootAssets(bootResult);
       if (lastBootSessionResult) {
         return lastBootSessionResult;
       }
@@ -1310,6 +1717,7 @@ export function bootstrapPlayGta6App(options = {}) {
       }
       return session.start(startOpts);
     }
+    latestDiscoveredBootAssets = { ...initialBootAssets };
     return session.start(startOpts);
   }
 
@@ -1388,6 +1796,23 @@ export function bootstrapPlayGta6App(options = {}) {
         // Ignore teardown errors.
       }
 
+      while (bootTracerCleanupFns.length > 0) {
+        const cleanup = bootTracerCleanupFns.pop();
+        try {
+          cleanup();
+        } catch {
+          // Ignore teardown errors.
+        }
+      }
+
+      try {
+        if (ownsGpuBootPanel && gpuBootPanel && typeof gpuBootPanel.destroy === 'function') {
+          gpuBootPanel.destroy();
+        }
+      } catch {
+        // Ignore teardown errors.
+      }
+
       try {
         if (ownsBootOrchestrator && bootOrchestrator && typeof bootOrchestrator.destroy === 'function') {
           bootOrchestrator.destroy();
@@ -1424,6 +1849,7 @@ export function bootstrapPlayGta6App(options = {}) {
     storageManager,
     bootTracer,
     splashOverlay,
+    gpuBootPanel,
     pgimPreloader,
     bootOrchestrator,
     getSmokeRunner: () => activeSmokeRunner,

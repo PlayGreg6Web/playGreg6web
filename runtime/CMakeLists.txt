@@ -57,6 +57,7 @@ add_library(playgta6_core STATIC
     guest/cpu_helpers.cpp
     guest/guest_memory.cpp
     guest/boot.cpp
+    wasm_boot.cpp
     os/xgameruntime_provider.cpp
     os/xbox_scarlett_guest.cpp
     guest/program_loader.cpp
@@ -146,6 +147,10 @@ else()
     add_executable(test_crt_scan ../tests/test_crt_scan.cpp)
     target_link_libraries(test_crt_scan PRIVATE playgta6_core)
     add_test(NAME playgta6_crt_scan_tests COMMAND test_crt_scan)
+
+    add_executable(test_xmem_hooks ../tests/test_xmem_hooks.cpp)
+    target_link_libraries(test_xmem_hooks PRIVATE playgta6_core)
+    add_test(NAME playgta6_xmem_hooks_tests COMMAND test_xmem_hooks)
 
     add_executable(test_image_loader ../tests/test_image_loader.cpp)
     target_link_libraries(test_image_loader PRIVATE playgta6_core)
@@ -277,6 +282,10 @@ else()
     add_executable(test_d3d12_xs_exports ../tests/test_d3d12_xs_exports.cpp)
     target_link_libraries(test_d3d12_xs_exports PRIVATE playgta6_core)
     add_test(NAME playgta6_d3d12_xs_exports_tests COMMAND test_d3d12_xs_exports)
+
+    add_executable(test_wasm_boot ../tests/test_wasm_boot.cpp)
+    target_link_libraries(test_wasm_boot PRIVATE playgta6_core)
+    add_test(NAME test_wasm_boot COMMAND test_wasm_boot)
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)

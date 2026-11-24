@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -188,6 +189,31 @@ class CompileTests(unittest.TestCase):
             tools=tools,
             delete_ir=kw.get("delete_ir", False),
         )
+
+    def test_same_content_units_compile_concurrently(self) -> None:
+        # Two modules whose shards share a manifest hash share cache keys. Compiled on two workers
+        # at once, one unit compiles and the other takes its cached object (before, both wrote
+        # the same temporary and one failed to move it into the cache).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = nb.load_module(make_module(root, shards=1, name="a")).units[0]
+            b = nb.load_module(make_module(root, shards=1, name="b")).units[0]
+            self.assertEqual(a.manifest_hash, b.manifest_hash)
+            inner = FakeRunner()
+
+            def runner(argv: Sequence[str], stdin: bytes | None) -> nb.CommandResult:
+                if Path(argv[0]).stem == "llc" and "--version" not in argv:
+                    time.sleep(0.3)  # keep the first compile in flight while the second starts
+                return inner(argv, stdin)
+
+            cfg = self._cfg(root, inner)
+            results = nb.compile_all([a, b], cfg, 2, runner)
+            self.assertTrue(all(r.error is None and r.obj is not None and r.obj.is_file() for r in results))
+            self.assertEqual(results[0].obj, results[1].obj)
+            self.assertEqual(sorted(r.cached for r in results), [False, True])
+            llc = [c for c in inner.calls if Path(c[0][0]).stem == "llc" and "--version" not in c[0]]
+            self.assertEqual(len(llc), 1)
+            self.assertEqual(sorted(p.name for p in cfg.cache_dir.iterdir()), [results[0].obj.name])
 
     def test_compiles_in_parallel_then_hits_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

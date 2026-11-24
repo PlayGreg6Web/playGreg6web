@@ -452,6 +452,17 @@ void test_query_api() {
         CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
     }
     {
+        // XSpeechSynthesizer slot 9 (XSpeechSynthesizerCreate): no synthesizer, so it fails and
+        // leaves the handle null; a null out pointer is invalid.
+        const uint64_t speech = fx.query(com::make_guid("3e241977-6237-41e9-8559-102c2d9983f1"),
+                                         com::make_guid("d722b373-8c4d-4692-9e51-d6ad9b37aa7d"));
+        const uint64_t handle = fx.alloc(8);
+        CHECK(com::write_guest(handle, uint64_t{0x1234}));
+        CHECK(hr32(fx.vcall(speech, 9, {handle})) == com::E_NOTIMPL_HR);
+        CHECK(load64(handle) == 0);
+        CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
+    }
+    {
         // {b884675d} slot 3: XSystemGetAnalyticsInfo through the hidden result pointer.
         const Guid analytics = com::make_guid("b884675d-b738-4a9c-815d-9a9a1e0c6c9b");
         const uint64_t api = fx.query(analytics, analytics);

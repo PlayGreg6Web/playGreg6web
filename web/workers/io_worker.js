@@ -106,9 +106,231 @@
 
   const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
+  const MOUNT_CACHE_PREFIX = '__pg6_mount__/';
+  const GAME_PACKAGE_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
+
   function normalizeDataBase(base) {
     const raw = typeof base === 'string' && base.length > 0 ? base : '/data/';
     return raw.endsWith('/') ? raw : `${raw}/`;
+  }
+
+  function normalizeOptionalBase(base) {
+    if (typeof base !== 'string') {
+      return null;
+    }
+    const trimmed = base.trim();
+    if (!trimmed) {
+      return null;
+    }
+    return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+  }
+
+  function basenameOfPath(posixPath) {
+    const slash = posixPath.lastIndexOf('/');
+    return slash < 0 ? posixPath : posixPath.slice(slash + 1);
+  }
+
+  function hasTraversalOrNulSegment(pathStr) {
+    if (pathStr.includes('\0')) {
+      return true;
+    }
+    const parts = pathStr.replace(/\\/g, '/').split('/');
+    for (let i = 0; i < parts.length; i += 1) {
+      const seg = parts[i];
+      if (seg === '..') {
+        return true;
+      }
+      if (seg.includes('%')) {
+        try {
+          const decoded = decodeURIComponent(seg);
+          if (
+            decoded === '..' ||
+            decoded.includes('\0') ||
+            decoded.includes('/') ||
+            decoded.includes('\\')
+          ) {
+            return true;
+          }
+        } catch {
+          // Ignore malformed percent-escape sequences.
+        }
+      }
+    }
+    return false;
+  }
+
+  function isDataPinnedPath(cleanPath) {
+    const base = basenameOfPath(cleanPath).toLowerCase();
+    return base === 'data-manifest.json' || base === 'bootset.json';
+  }
+
+  function isImplicitBootPath(cleanPath) {
+    const lower = cleanPath.toLowerCase();
+    return basenameOfPath(lower) === 'program-manifest.json' || lower.endsWith('.pgim');
+  }
+
+  function isGamePackagePath(cleanPath) {
+    const base = basenameOfPath(cleanPath).toLowerCase();
+    if (base === 'microsoftgame.config') {
+      return true;
+    }
+    return GAME_PACKAGE_EXT_RE.test(cleanPath);
+  }
+
+  /**
+   * Normalize Xbox/Win32/POSIX HTTPFS paths and route them against `bootBase`, `gameBase`,
+   * or `dataBase` while preserving `rpf://...` virtual URIs and blocking `..` / NUL traversal.
+   */
+  function resolveHttpfsRoute(rawPath, options = {}) {
+    if (typeof rawPath !== 'string' || rawPath.length === 0) {
+      return { ok: false, error: 'HTTPFS path must be a non-empty string' };
+    }
+    if (rawPath.includes('\0')) {
+      return { ok: false, error: 'path traversal blocked' };
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const dataBase = normalizeDataBase(opts.dataBase);
+    const bootBase = normalizeOptionalBase(opts.bootBase);
+    const gameBase = normalizeOptionalBase(opts.gameBase);
+
+    if (isRpfVirtualPath(rawPath)) {
+      const rest = rawPath.slice(RPF_URI_PREFIX.length);
+      if (hasTraversalOrNulSegment(rest)) {
+        return { ok: false, error: 'path traversal blocked' };
+      }
+      return {
+        ok: true,
+        isRpf: true,
+        mount: 'rpf',
+        base: null,
+        relPath: rawPath,
+        url: rawPath,
+      };
+    }
+
+    let s = rawPath.replace(/\\/g, '/');
+
+    // Strip Win32 extended-length / device prefixes (e.g. `\\?\G:\...` or `\\.\G:\...`).
+    if (/^\/\/[?.]\//.test(s)) {
+      s = s.slice(4);
+    }
+
+    // Strip Xbox/Win32 single-letter drive prefixes (e.g. `G:/`, `T:/`, `D:/`, `C:/`, `G:`).
+    let hadDrivePrefix = false;
+    if (/^[A-Za-z]:/.test(s)) {
+      hadDrivePrefix = true;
+      s = s.slice(2);
+    }
+
+    // Strip leading `/` and `./` prefixes.
+    while (s.startsWith('/') || s.startsWith('./')) {
+      if (s.startsWith('/')) {
+        s = s.slice(1);
+      } else {
+        s = s.slice(2);
+      }
+    }
+
+    if (hasTraversalOrNulSegment(s)) {
+      return { ok: false, error: 'path traversal blocked' };
+    }
+
+    const rawSegments = s.split('/');
+    const cleanSegments = [];
+    for (let i = 0; i < rawSegments.length; i += 1) {
+      const seg = rawSegments[i];
+      if (!seg || seg === '.') {
+        continue;
+      }
+      cleanSegments.push(seg);
+    }
+
+    if (cleanSegments.length === 0) {
+      return { ok: false, error: 'invalid HTTPFS path' };
+    }
+
+    const cleanPath = cleanSegments.join('/');
+    const lower = cleanPath.toLowerCase();
+
+    // 1. Data-pinned manifests always resolve against dataBase.
+    if (isDataPinnedPath(cleanPath)) {
+      return {
+        ok: true,
+        isRpf: false,
+        mount: 'data',
+        base: dataBase,
+        relPath: cleanPath,
+        url: `${dataBase}${cleanPath}`,
+      };
+    }
+
+    // 2. Explicit `boot/...` prefix routes against bootBase (stripping `boot/`) when configured.
+    if (bootBase && lower.startsWith('boot/')) {
+      const stripped = cleanPath.slice('boot/'.length);
+      if (!stripped) {
+        return { ok: false, error: 'invalid HTTPFS path' };
+      }
+      return {
+        ok: true,
+        isRpf: false,
+        mount: 'boot',
+        base: bootBase,
+        relPath: stripped,
+        url: `${bootBase}${stripped}`,
+      };
+    }
+
+    // 3. Explicit `game/...` mount prefix (without an Xbox/Win32 drive prefix) routes against
+    //    gameBase (stripping leading `game/`) when configured.
+    if (gameBase && !hadDrivePrefix && lower.startsWith('game/')) {
+      const stripped = cleanPath.slice('game/'.length);
+      if (!stripped) {
+        return { ok: false, error: 'invalid HTTPFS path' };
+      }
+      return {
+        ok: true,
+        isRpf: false,
+        mount: 'game',
+        base: gameBase,
+        relPath: stripped,
+        url: `${gameBase}${stripped}`,
+      };
+    }
+
+    // 4. Implicit boot files (`program-manifest.json`, `*.pgim`) route against bootBase when configured.
+    if (bootBase && isImplicitBootPath(cleanPath)) {
+      return {
+        ok: true,
+        isRpf: false,
+        mount: 'boot',
+        base: bootBase,
+        relPath: cleanPath,
+        url: `${bootBase}${cleanPath}`,
+      };
+    }
+
+    // 5. Game package files route against gameBase when configured (falling back to dataBase otherwise).
+    if (gameBase && isGamePackagePath(cleanPath)) {
+      return {
+        ok: true,
+        isRpf: false,
+        mount: 'game',
+        base: gameBase,
+        relPath: cleanPath,
+        url: `${gameBase}${cleanPath}`,
+      };
+    }
+
+    // 6. Default: resolve against dataBase.
+    return {
+      ok: true,
+      isRpf: false,
+      mount: 'data',
+      base: dataBase,
+      relPath: cleanPath,
+      url: `${dataBase}${cleanPath}`,
+    };
   }
 
   function normalizeRelPath(relPath) {
@@ -274,10 +496,16 @@
     if (err.code === 'INVALID_PATH') {
       return -22; // EINVAL
     }
+    if (err.status === 403 || err.statusCode === 403) {
+      return -13; // EACCES
+    }
     if (err.status === 404 || err.statusCode === 404) {
       return -2; // ENOENT
     }
     const msg = typeof err.message === 'string' ? err.message : '';
+    if (/\bHTTP\s+403\b/i.test(msg)) {
+      return -13; // EACCES
+    }
     if (/\bHTTP\s+404\b/i.test(msg) || /\bnot found\b/i.test(msg)) {
       return -2; // ENOENT
     }
@@ -363,8 +591,11 @@
       this._rpf9VfsModule = options.rpf9VfsModule || null;
 
       this.dataBase = normalizeDataBase(options.dataBase);
+      this.bootBase = normalizeOptionalBase(options.bootBase);
+      this.gameBase = normalizeOptionalBase(options.gameBase);
       this.manifest = options.manifest || null;
       this.rangeCache = options.rangeCache || null;
+      this._hasRoutedRangeCache = !options.rangeCache;
       this.scheduler = options.scheduler || null;
       this.rpfMountTable = options.rpfMountTable || null;
       this.fetchImpl = typeof options.fetchImpl === 'function' ? options.fetchImpl : null;
@@ -427,19 +658,62 @@
       return null;
     }
 
+    _getRouteBases() {
+      return {
+        dataBase: this.dataBase,
+        bootBase: this.bootBase,
+        gameBase: this.gameBase,
+      };
+    }
+
+    _resolveRoute(rawPath) {
+      return resolveHttpfsRoute(rawPath, this._getRouteBases());
+    }
+
+    _routeToCachePath(route) {
+      if (this._hasRoutedRangeCache && (route.mount === 'boot' || route.mount === 'game')) {
+        return `${MOUNT_CACHE_PREFIX}${route.mount}/${route.relPath}`;
+      }
+      return route.relPath;
+    }
+
+    _createRoutedFetch(baseFetch) {
+      if (typeof baseFetch !== 'function') {
+        return null;
+      }
+      const controller = this;
+      return function routedFetch(url, init) {
+        if (typeof url === 'string') {
+          const dataPrefix = controller.dataBase;
+          const bootMarker = `${dataPrefix}${MOUNT_CACHE_PREFIX}boot/`;
+          if (controller.bootBase && url.startsWith(bootMarker)) {
+            const rel = url.slice(bootMarker.length);
+            return baseFetch(`${controller.bootBase}${rel}`, init);
+          }
+          const gameMarker = `${dataPrefix}${MOUNT_CACHE_PREFIX}game/`;
+          if (controller.gameBase && url.startsWith(gameMarker)) {
+            const rel = url.slice(gameMarker.length);
+            return baseFetch(`${controller.gameBase}${rel}`, init);
+          }
+        }
+        return baseFetch(url, init);
+      };
+    }
+
     ensureRangeCache() {
       if (!this.rangeCache) {
         const mod = this._getRangeCacheModule();
         if (!mod || typeof mod.RangeCache !== 'function') {
           throw new Error('PlayGta6RangeCache unavailable in io_worker');
         }
+        this._hasRoutedRangeCache = true;
         this.rangeCache = new mod.RangeCache({
           dataBase: this.dataBase,
           chunkSize: this._cacheOptions.chunkSize,
           maxBytes: this._cacheOptions.maxBytes,
           maxPrefetchConcurrency: this._cacheOptions.maxPrefetchConcurrency,
           opfsDir: this._cacheOptions.opfsDir || null,
-          fetchImpl: this._getFetchImpl(),
+          fetchImpl: this._createRoutedFetch(this._getFetchImpl()),
         });
       }
       return this.rangeCache;
@@ -526,6 +800,31 @@
         });
       }
 
+      const routedEntries = [];
+      for (let i = 0; i < rawList.length; i += 1) {
+        const entry = rawList[i];
+        if (!entry || typeof entry.path !== 'string') {
+          continue;
+        }
+        const route = this._resolveRoute(entry.path);
+        if (!route.ok || route.isRpf) {
+          continue;
+        }
+        routedEntries.push(
+          Object.assign({}, entry, { path: this._routeToCachePath(route) }),
+        );
+      }
+
+      if (routedEntries.length === 0) {
+        return Promise.resolve({
+          requested: rawList.length,
+          scheduled: 0,
+          completed: 0,
+          cancelled: 0,
+          failed: 0,
+        });
+      }
+
       const scheduler = this.ensureScheduler();
       if (scheduler && typeof scheduler.schedulePrefetchList === 'function') {
         let signal = options.signal || null;
@@ -533,13 +832,13 @@
           this._prefetchAbortController = new AbortController();
           signal = this._prefetchAbortController.signal;
         }
-        const p = scheduler.schedulePrefetchList(rawList, { signal });
+        const p = scheduler.schedulePrefetchList(routedEntries, { signal });
         this._prefetchPromise = p;
         return p;
       }
 
       const cache = this.ensureRangeCache();
-      const p = cache.prefetchBootset(rawList, options);
+      const p = cache.prefetchBootset(routedEntries, options);
       this._prefetchPromise = p;
       return p;
     }
@@ -560,7 +859,12 @@
     }
 
     async ensureRpfMounted(archivePath, options = {}) {
-      const cleanArchive = normalizeRelPath(archivePath);
+      const route = this._resolveRoute(archivePath);
+      if (!route.ok || route.isRpf) {
+        throw createErrnoError(-22, route.error || `Invalid RPF archive path: ${archivePath}`);
+      }
+      const cleanArchive = route.relPath;
+      const cacheArchivePath = this._routeToCachePath(route);
       const archiveKey = cleanArchive.toLowerCase();
 
       const existing = this._mountedArchives.get(archiveKey);
@@ -578,7 +882,10 @@
         throw createErrnoError(-38, 'PlayGta6Rpf9Vfs unavailable in io_worker');
       }
 
-      const manifestLookup = this._findManifestEntry(cleanArchive);
+      const manifestLookup =
+        route.mount === 'data'
+          ? this._findManifestEntry(cleanArchive)
+          : { known: null, entry: null };
       if (manifestLookup.known === false) {
         throw createErrnoError(-2, `RPF archive not found in manifest: ${cleanArchive}`);
       }
@@ -610,7 +917,7 @@
             : record.pendingPriority !== null
               ? record.pendingPriority
               : IO_PRIORITY.NORMAL;
-          return this._scheduledRead(cleanArchive, offset, length, { priority: prio });
+          return this._scheduledRead(cacheArchivePath, offset, length, { priority: prio });
         };
 
         try {
@@ -689,8 +996,11 @@
         return this._readFromMountedRpf(record, parsed.innerPath, offset, length, priority);
       }
 
-      const cleanPath = normalizeRelPath(pathStr);
-      return this._scheduledRead(cleanPath, offset, length, {
+      const route = this._resolveRoute(pathStr);
+      if (!route.ok) {
+        throw createErrnoError(-22, route.error);
+      }
+      return this._scheduledRead(this._routeToCachePath(route), offset, length, {
         priority,
         signal: options.signal || null,
       });
@@ -718,8 +1028,15 @@
         });
       }
 
-      const cleanPath = normalizeRelPath(pathStr);
-      const manifestLookup = this._findManifestEntry(cleanPath);
+      const route = this._resolveRoute(pathStr);
+      if (!route.ok) {
+        throw createErrnoError(-22, route.error);
+      }
+      const cleanPath = route.relPath;
+      const manifestLookup =
+        route.mount === 'data'
+          ? this._findManifestEntry(cleanPath)
+          : { known: null, entry: null };
       if (manifestLookup.known === true) {
         return {
           path: cleanPath,
@@ -804,14 +1121,17 @@
         return handle;
       }
 
-      let cleanPath;
-      try {
-        cleanPath = normalizeRelPath(rawPath);
-      } catch {
+      const route = this._resolveRoute(rawPath);
+      if (!route.ok) {
         return -22; // EINVAL
       }
 
-      const manifestLookup = this._findManifestEntry(cleanPath);
+      const cleanPath = route.relPath;
+      const cachePath = this._routeToCachePath(route);
+      const manifestLookup =
+        route.mount === 'data'
+          ? this._findManifestEntry(cleanPath)
+          : { known: null, entry: null };
       if (manifestLookup.known === false) {
         return -2; // ENOENT
       }
@@ -824,7 +1144,7 @@
 
       if (manifestLookup.known === null && probeOnOpen) {
         try {
-          await this._scheduledRead(cleanPath, 0, 1, { priority: IO_PRIORITY.CRITICAL });
+          await this._scheduledRead(cachePath, 0, 1, { priority: IO_PRIORITY.CRITICAL });
         } catch (err) {
           return mapErrorToErrno(err, -2);
         }
@@ -835,6 +1155,9 @@
       this._handles.set(handle, {
         kind: 'direct',
         path: cleanPath,
+        cachePath,
+        mount: route.mount,
+        url: route.url,
         size:
           manifestLookup.entry && Number.isSafeInteger(manifestLookup.entry.size)
             ? manifestLookup.entry.size
@@ -860,7 +1183,7 @@
           IO_PRIORITY.CRITICAL,
         );
       }
-      return this._scheduledRead(entry.path, offset, reqLen, {
+      return this._scheduledRead(entry.cachePath || entry.path, offset, reqLen, {
         priority: IO_PRIORITY.CRITICAL,
       });
     }
@@ -883,6 +1206,8 @@
       return {
         kind: 'direct',
         path: entry.path,
+        mount: entry.mount || 'data',
+        url: entry.url || null,
         size: entry.size,
       };
     }
@@ -920,18 +1245,13 @@
           copy.set(this._payloadView.subarray(0, pathLen));
           const rawPath = utf8Decoder.decode(copy);
 
-          if (isRpfVirtualPath(rawPath)) {
-            const handle = await controller.openHandle(rawPath, { probeOnOpen });
-            if (typeof handle === 'number' && Number.isInteger(handle) && handle >= 0) {
-              this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
-            } else {
-              const errCode = typeof handle === 'number' && handle < 0 ? Math.trunc(handle) : -2;
-              this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
-            }
-            return;
+          const handle = await controller.openHandle(rawPath, { probeOnOpen });
+          if (typeof handle === 'number' && Number.isInteger(handle) && handle >= 0) {
+            this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
+          } else {
+            const errCode = typeof handle === 'number' && handle < 0 ? Math.trunc(handle) : -2;
+            this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
           }
-
-          return super._handleOpen(lengthBig, cap);
         }
       }
 
@@ -1007,6 +1327,12 @@
       this._prefetchAbortController = null;
 
       this.dataBase = normalizeDataBase(opts.dataBase !== undefined ? opts.dataBase : this.dataBase);
+      if (opts.bootBase !== undefined) {
+        this.bootBase = normalizeOptionalBase(opts.bootBase);
+      }
+      if (opts.gameBase !== undefined) {
+        this.gameBase = normalizeOptionalBase(opts.gameBase);
+      }
       if (typeof opts.fetchImpl === 'function') {
         this.fetchImpl = opts.fetchImpl;
       }
@@ -1034,7 +1360,9 @@
       }
 
       const fetchFn = this._getFetchImpl(opts.fetchImpl);
+      const routedFetchFn = this._createRoutedFetch(fetchFn);
 
+      this._hasRoutedRangeCache = !opts.rangeCache;
       this.rangeCache =
         opts.rangeCache ||
         new rangeCacheMod.RangeCache({
@@ -1047,7 +1375,7 @@
               ? opts.maxPrefetchConcurrency
               : this._cacheOptions.maxPrefetchConcurrency,
           opfsDir,
-          fetchImpl: fetchFn,
+          fetchImpl: routedFetchFn,
         });
 
       const schedulerMod = this._getIoSchedulerModule();
@@ -1145,6 +1473,9 @@
         bootsetEntries: bootsetCount,
         scheduler: Boolean(this.scheduler),
         rpfVfs: Boolean(this.rpfMountTable),
+        dataBase: this.dataBase,
+        bootBase: this.bootBase,
+        gameBase: this.gameBase,
       };
 
       if (this.postMessage) {
@@ -1228,6 +1559,23 @@
     }
   }
 
+  function createIoWorkerHandler(options = {}) {
+    const controller = new IoWorkerController(options);
+    const handler = (evOrMsg) => {
+      const data =
+        evOrMsg &&
+        typeof evOrMsg === 'object' &&
+        Object.prototype.hasOwnProperty.call(evOrMsg, 'data') &&
+        evOrMsg.data &&
+        typeof evOrMsg.data === 'object'
+          ? evOrMsg.data
+          : evOrMsg;
+      return controller.handleMessage(data);
+    };
+    handler.controller = controller;
+    return handler;
+  }
+
   const defaultController = new IoWorkerController({
     postMessage:
       typeof self !== 'undefined' && typeof self.postMessage === 'function'
@@ -1244,6 +1592,8 @@
     IO_PRIORITY,
     RPF_URI_PREFIX,
     IoWorkerController,
+    createIoWorkerHandler,
+    resolveHttpfsRoute,
     isRpfVirtualPath,
     parseRpfVirtualPath,
     emptyStats,

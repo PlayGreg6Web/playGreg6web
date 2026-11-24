@@ -155,7 +155,52 @@ void sub_vcall(GuestState* s) {
     s->gpr[GuestReg::Rsp] += 8;  // ret
 }
 
-const LiftedFunctionEntry kFunctions[] = {{kVCall, sub_vcall}};
+// A title's XMem allocation hook (shape of the one the executable exports): allocator id 0x80 with
+// page-size field 2 is carved, 64 KiB-rounded, out of an arena of kRtBudget bytes allocated once
+// through the default allocator; everything else goes to the default allocator.
+constexpr uint64_t kRtAllocHook = 0x140020400ULL;
+constexpr uint64_t kRtFreeHook = 0x140020500ULL;
+constexpr uint64_t kRtBudget = 0x5200000;
+uint64_t g_rt_base = 0;
+uint64_t g_rt_cursor = 0;
+int g_rt_frees = 0;
+
+uint64_t xmem_guest(void* host) {
+    return host == nullptr ? 0 : playgta6::os::win32::get_vmem_arena()->guest_address(host);
+}
+
+void sub_rt_alloc_hook(GuestState* s) {
+    const uint64_t size = s->gpr[GuestReg::Rcx];
+    const uint64_t attributes = s->gpr[GuestReg::Rdx];
+    uint64_t result = 0;
+    if (((attributes >> 16) & 0xFF) == 0x80 && (attributes & 0xC000) == 0x8000) {
+        if (g_rt_base == 0) {
+            g_rt_base = g_rt_cursor = xmem_guest(pg6_xbox_XMemAllocDefault(kRtBudget, attributes));
+        }
+        const uint64_t next = g_rt_cursor + ((size + 0xFFFF) & ~uint64_t{0xFFFF});
+        if (next <= g_rt_base + kRtBudget) {
+            result = g_rt_cursor;
+            g_rt_cursor = next;
+        }
+    } else {
+        result = xmem_guest(pg6_xbox_XMemAllocDefault(static_cast<size_t>(size), attributes));
+    }
+    s->gpr[GuestReg::Rax] = result;
+    s->gpr[GuestReg::Rsp] += 8;
+}
+
+void sub_rt_free_hook(GuestState* s) {
+    const uint64_t va = s->gpr[GuestReg::Rcx];
+    if (va >= g_rt_base && va < g_rt_base + kRtBudget) {
+        ++g_rt_frees;
+    } else {
+        pg6_xbox_XMemFreeDefault(playgta6::os::win32::get_vmem_arena()->translate(va), s->gpr[GuestReg::Rdx]);
+    }
+    s->gpr[GuestReg::Rsp] += 8;
+}
+
+const LiftedFunctionEntry kFunctions[] = {{kVCall, sub_vcall}, {kRtAllocHook, sub_rt_alloc_hook},
+                                          {kRtFreeHook, sub_rt_free_hook}};
 
 struct GuestFault {
     FaultInfo info;
@@ -463,6 +508,18 @@ void test_queue_allocator_fence() {
     CHECK(fx.vcall(fence, Slot::GetCompletedValue) == 20);
     CHECK(hr(fx.vcall(fence, Slot::FenceSignal, {I(25)})) == 0);
     CHECK(fx.vcall(fence, Slot::GetCompletedValue) == 25);
+    // Xbox slot 12: the address of a word holding the completed value, the same on every call and
+    // kept current by CPU and queue signals.
+    const uint64_t word = fx.vcall(fence, 12);
+    CHECK(word != 0 && fx.vcall(fence, 12) == word);
+    CHECK(load64(word) == 25);
+    CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(fence), I(30)})) == 0);
+    CHECK(load64(word) == 30);
+    CHECK(hr(fx.vcall(fence, Slot::FenceSignal, {I(~0ull)})) == 0);  // device-removed value
+    CHECK(load64(word) == ~0ull);
+    CHECK(hr(fx.vcall(fence, Slot::FenceSignal, {I(25)})) == 0);
+    CHECK(load64(word) == 25);
+    CHECK(com::stub_hits(dg::kID3D12Fence, 12) == 0);
     CHECK(hr(fx.vcall(queue, Slot::QueueWait, {I(fence), I(25)})) == 0);
     // A non-fence interface as fence argument is rejected.
     CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(allocator), I(1)})) == dg::kEInvalidArg);
@@ -661,6 +718,7 @@ void test_root_signatures_and_blobs() {
     auto* host_rs = host_object<dg::RootSignature, dg::IRootSignatureHost>(rs);
     CHECK(host_rs != nullptr && host_rs->signature().parameter_count() == 3);
     CHECK(dev->stats().root_signatures == 1);
+    CHECK((dev->root_signature_versions() == std::array<uint32_t, 3>{0, 1, 0}));  // one version 1.1
 
     // Version 1.0 layout (20-byte ranges, no flags) is read too; the empty local root signature the
     // executable serializes (version 1.1, no parameters, flags LOCAL_ROOT_SIGNATURE) works.
@@ -974,6 +1032,49 @@ T* object_of(uint64_t ptr) {
     return static_cast<T*>(r.object.get());
 }
 
+// Committed render targets allocate their memory with XMemAlloc (allocator id 0x80, page-size
+// field 2, 64 KiB-block sizes), so a title's hooked arena accounts for them: two 3840x2160 and two
+// 1920x1080 RGBA8 targets take 84,541,440 of 86,507,520 bytes, less than one large page left.
+void test_committed_render_targets_through_xmem_hooks() {
+    Fixture fx;
+    const uint64_t device = fx.create_device();
+    auto& xmem_arena = *playgta6::os::win32::get_vmem_arena();
+    const uint64_t table =
+        xmem_arena.virtual_alloc(0, 0x1000, playgta6::os::kMemReserve | playgta6::os::kMemCommit,
+                                 playgta6::os::PageProtect::ReadWrite);
+    const uint64_t hooks[2] = {kRtAllocHook, kRtFreeHook};
+    CHECK(table != 0 && xmem_arena.write(table, hooks, sizeof(hooks)));
+
+    // Without hooks nothing changes for the title: the default allocator.
+    const uint64_t plain = committed(fx, device, 1, texture_desc(1920, 1080, 28, 0x5), 0);
+    CHECK(plain != 0 && g_rt_base == 0);
+    fx.vcall(plain, Slot::Release);
+
+    playgta6::os::scarlett::xmem_set_guest_hook_table(table);
+    std::vector<uint64_t> targets;
+    for (int i = 0; i < 2; ++i) {
+        targets.push_back(committed(fx, device, 1, texture_desc(3840, 2160, 28, 0x5), 0));
+        targets.push_back(committed(fx, device, 1, texture_desc(1920, 1080, 28, 0x5), 0));
+    }
+    for (uint64_t t : targets) {
+        CHECK(t != 0);
+    }
+    CHECK(g_rt_base != 0);
+    const uint64_t used = g_rt_cursor - g_rt_base;
+    CHECK(used == 84541440ull);
+    CHECK(kRtBudget - used <= 0x1FFFFF);  // the title's "less than one large page left" check
+    // Non-render-target textures and buffers keep their previous allocation (not through XMem).
+    const uint64_t sampled = committed(fx, device, 1, texture_desc(4096, 4096, 28, 0), 0);
+    CHECK(sampled != 0 && g_rt_cursor - g_rt_base == used);
+    fx.vcall(sampled, Slot::Release);
+    for (uint64_t t : targets) {
+        fx.vcall(t, Slot::Release);
+    }
+    CHECK(g_rt_frees == 4);
+    playgta6::os::scarlett::xmem_set_guest_hook_table(0);
+    fx.vcall(device, Slot::Release);
+}
+
 void test_resources() {
     Fixture fx;
     const uint64_t device = fx.create_device();
@@ -1043,6 +1144,25 @@ void test_resources() {
                                   {I(title_memory), I(put(buffer_desc(8192))), I(0), I(0)}, dg::IID_ID3D12Resource, &result);
     CHECK(result == 0 && fx.vcall(at, Slot2::GetGPUVirtualAddress) == title_memory);
     CHECK(object_of<dg::Resource>(at)->cpu_address() == title_memory);
+
+    // Xbox textures may carry 0x100 | an XG swizzle mode in the layout field (here 0x102 on a
+    // 640x360 R32_UINT UAV texture); other layouts above 3, and swizzle modes on buffers, stay invalid.
+    const uint64_t tex_memory = com::guest_alloc(1 << 20);
+    dg::GuestResourceDesc swizzled = texture_desc(640, 360, 42, 0x4);
+    swizzled.Layout = 0x102;
+    const uint64_t sw = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
+                                  dg::IID_ID3D12Resource, &result);
+    CHECK(result == 0 && sw != 0);
+    swizzled.Layout = 0x200;
+    CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
+                    dg::IID_ID3D12Resource, &result) == 0);
+    CHECK(result == dg::kEInvalidArg && contains(dev->diagnostics(), "layout 512"));
+    dg::GuestResourceDesc swizzled_buffer = buffer_desc(4096);
+    swizzled_buffer.Layout = 0x102;
+    CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled_buffer)), I(0), I(0)},
+                    dg::IID_ID3D12Resource, &result) == 0);
+    CHECK(result == dg::kEInvalidArg);
+    fx.vcall(sw, Slot::Release);
 
     // Xbox slot 127 (CreateCommittedResource3 shape, DESC1 + layout + castable formats).
     uint8_t desc1[dg::kGuestResourceDesc1Size] = {};
@@ -1180,6 +1300,11 @@ struct Scene {
         CHECK(load64(alias_out) == list);
         fx.vcall(list, Slot::Release);
         CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        // Xbox slot 139 (allocator, null, 0) reopens the list like Reset; reopening an open list
+        // fails like Reset does.
+        CHECK(hr(fx.vcall(list, 139, {I(allocator), I(0), I(0)})) == 0);
+        CHECK(hr(fx.vcall(list, 139, {I(allocator), I(0), I(0)})) < 0);
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
         return list;
     }
 
@@ -1299,6 +1424,7 @@ void test_unresolved_shaders_and_indexed_draws() {
     dg::Device* dev = host_device(scene.device);
     CHECK(!object_of<dg::PipelineState>(scene.pso)->resolved());
     CHECK(dev->unresolved_shaders().size() == 2);
+    CHECK((dev->unresolved_shader_stages() == std::array<uint32_t, 3>{1, 1, 0}));  // one vertex, one pixel
     const uint64_t list = scene.new_list();
     const size_t mark = fx.captured.size();
     scene.record(fx.thread, list, 2);
@@ -2107,6 +2233,7 @@ int main() {
     test_queries_and_footprints();
     test_unknown_slots_and_private_data();
     test_resources();
+    test_committed_render_targets_through_xmem_hooks();
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();

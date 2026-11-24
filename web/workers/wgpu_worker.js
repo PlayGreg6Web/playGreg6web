@@ -253,6 +253,323 @@ function resolveSubsystemCtor(injectedCtor, globalNamespace, exportName, scriptR
   return null;
 }
 
+const WGPK_MAGIC_BYTES = Object.freeze([0x57, 0x47, 0x50, 0x4b]);
+const WGPK_VERSION = 1;
+const WGPK_HEADER_BYTES = 16;
+const WGPK_ENTRY_BYTES = 20;
+const WGPK_STAGE_NAMES = Object.freeze({ 1: 'vertex', 2: 'fragment', 3: 'compute' });
+
+function normalizeShaderHashBigInt(hash) {
+  if (typeof hash === 'bigint') {
+    return hash >= 0n && hash <= U64_MASK ? hash : null;
+  }
+  if (typeof hash === 'number') {
+    return Number.isInteger(hash) && Number.isSafeInteger(hash) && hash >= 0 ? BigInt(hash) : null;
+  }
+  if (typeof hash === 'string') {
+    const trimmed = hash.trim();
+    const rawHex =
+      trimmed.startsWith('0x') || trimmed.startsWith('0X') ? trimmed.slice(2) : trimmed;
+    if (/^[0-9a-fA-F]{1,16}$/.test(rawHex)) {
+      return BigInt(`0x${rawHex}`);
+    }
+  }
+  return null;
+}
+
+function formatShaderHashHex(hashBigInt) {
+  return `0x${hashBigInt.toString(16).padStart(16, '0')}`;
+}
+
+function parseHashOnlyShaderPayload(trimmed) {
+  if (typeof trimmed !== 'string' || trimmed.length === 0) {
+    return null;
+  }
+  const prefixed = /^(?:hash|wgpk)\s*:\s*(?:0[xX])?([0-9a-fA-F]{1,16})$/i.exec(trimmed);
+  if (prefixed) {
+    return formatShaderHashHex(BigInt(`0x${prefixed[1]}`));
+  }
+  const hex0x = /^0[xX]([0-9a-fA-F]{1,16})$/.exec(trimmed);
+  if (hex0x) {
+    return formatShaderHashHex(BigInt(`0x${hex0x[1]}`));
+  }
+  const bare64 = /^([0-9a-fA-F]{16})$/.exec(trimmed);
+  if (bare64) {
+    return formatShaderHashHex(BigInt(`0x${bare64[1]}`));
+  }
+  return null;
+}
+
+function unwrapPackLookupResult(raw) {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  if (typeof raw === 'string') {
+    return { wgsl: raw, entryPoint: null };
+  }
+  if (typeof raw === 'object') {
+    if (typeof raw.wgsl === 'string') {
+      return {
+        wgsl: raw.wgsl,
+        entryPoint:
+          typeof raw.entryPoint === 'string'
+            ? raw.entryPoint
+            : typeof raw.entry_point === 'string'
+              ? raw.entry_point
+              : null,
+      };
+    }
+    if (typeof raw.source === 'string') {
+      return { wgsl: raw.source, entryPoint: null };
+    }
+    if (typeof raw.code === 'string') {
+      return { wgsl: raw.code, entryPoint: null };
+    }
+  }
+  return null;
+}
+
+function lookupFromPackCache(packCache, hash) {
+  if (!packCache) {
+    return null;
+  }
+  const big = normalizeShaderHashBigInt(hash);
+  if (big === null) {
+    return null;
+  }
+  const hex = formatShaderHashHex(big);
+  const keys = [big, hex];
+  const tryCall = (fn, key) => {
+    if (typeof fn !== 'function') {
+      return null;
+    }
+    try {
+      return unwrapPackLookupResult(fn.call(packCache, key));
+    } catch (_) {
+      return null;
+    }
+  };
+  for (let i = 0; i < keys.length; i += 1) {
+    const key = keys[i];
+    const hit =
+      tryCall(packCache.getWgsl, key) ||
+      tryCall(packCache.getSource, key) ||
+      tryCall(packCache.getShaderSource, key) ||
+      tryCall(packCache.lookup, key) ||
+      tryCall(packCache.get, key);
+    if (hit) {
+      return hit;
+    }
+  }
+  return null;
+}
+
+function loadWgslPackIntoCache(packCache, buffer, packName) {
+  if (!packCache) {
+    return null;
+  }
+  if (typeof packCache.loadFromBuffer === 'function') {
+    return packCache.loadFromBuffer(buffer, packName);
+  }
+  if (typeof packCache.loadPackBuffer === 'function') {
+    return packCache.loadPackBuffer(buffer, packName);
+  }
+  if (typeof packCache.parse === 'function') {
+    return packCache.parse(buffer, packName);
+  }
+  return null;
+}
+
+/**
+ * Classic-worker-compatible WGPK v1 (.wgsl.pack) parser & in-memory cache.
+ * Binary layout matches shaders/src/pack.rs and web/workers/wgsl_pack_loader.js byte-for-byte.
+ */
+class InlineWgslPackCache {
+  constructor() {
+    this._packs = new Map();
+    this._entries = new Map();
+    this._nextPackId = 0;
+    this._strictDecoder = new TextDecoder('utf-8', { fatal: true });
+  }
+
+  _toBytes(buffer) {
+    if (buffer instanceof Uint8Array) {
+      return buffer;
+    }
+    if (ArrayBuffer.isView(buffer)) {
+      return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    }
+    if (
+      buffer instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer)
+    ) {
+      return new Uint8Array(buffer);
+    }
+    throw new TypeError('WGPK buffer must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView');
+  }
+
+  loadPackBuffer(buffer, packName) {
+    const bytes = this._toBytes(buffer);
+    if (bytes.byteLength < WGPK_HEADER_BYTES) {
+      throw new Error(
+        `WGPK pack truncated: ${bytes.byteLength} bytes (minimum header: ${WGPK_HEADER_BYTES})`
+      );
+    }
+    if (
+      bytes[0] !== WGPK_MAGIC_BYTES[0] ||
+      bytes[1] !== WGPK_MAGIC_BYTES[1] ||
+      bytes[2] !== WGPK_MAGIC_BYTES[2] ||
+      bytes[3] !== WGPK_MAGIC_BYTES[3]
+    ) {
+      throw new Error('Invalid WGPK pack magic (expected "WGPK")');
+    }
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const version = view.getUint32(4, true);
+    if (version !== WGPK_VERSION) {
+      throw new Error(`Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION})`);
+    }
+    const entryCount = view.getUint32(8, true);
+    const flags = view.getUint32(12, true);
+    const dataStart = WGPK_HEADER_BYTES + entryCount * WGPK_ENTRY_BYTES;
+    if (bytes.byteLength < dataStart) {
+      throw new Error(
+        `WGPK pack truncated: ${bytes.byteLength} bytes (entry table requires ${dataStart})`
+      );
+    }
+
+    const parsedEntries = new Array(entryCount);
+    const ranges = [];
+    const isShared =
+      typeof SharedArrayBuffer !== 'undefined' && bytes.buffer instanceof SharedArrayBuffer;
+
+    for (let idx = 0; idx < entryCount; idx += 1) {
+      const base = WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES;
+      const hash = view.getBigUint64(base, true);
+      const stageCode = bytes[base + 8];
+      const stage = WGPK_STAGE_NAMES[stageCode];
+      if (!stage) {
+        throw new Error(`Invalid WGPK shader stage value ${stageCode} at entry ${idx}`);
+      }
+      const offset = view.getUint32(base + 12, true);
+      const length = view.getUint32(base + 16, true);
+      const end = offset + length;
+      if (offset < dataStart || end > bytes.byteLength) {
+        throw new Error(`WGPK entry ${idx} payload [${offset}..+${length}] is out of bounds`);
+      }
+      if (length > 0) {
+        ranges.push({ start: offset, end, index: idx });
+      }
+      const slice = bytes.subarray(offset, end);
+      const wgsl = this._strictDecoder.decode(isShared ? slice.slice() : slice);
+      parsedEntries[idx] = {
+        hash,
+        hashHex: formatShaderHashHex(hash),
+        stage,
+        stageCode,
+        offset,
+        length,
+        wgsl,
+      };
+    }
+
+    if (ranges.length > 1) {
+      ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+      for (let i = 1; i < ranges.length; i += 1) {
+        if (ranges[i].start < ranges[i - 1].end) {
+          throw new Error('WGPK overlapping payload ranges detected');
+        }
+      }
+    }
+
+    const name =
+      typeof packName === 'string' && packName.length > 0
+        ? packName
+        : `pack-${this._nextPackId++}`;
+
+    if (this._packs.has(name)) {
+      for (const [key, rec] of this._entries.entries()) {
+        if (rec.packName === name) {
+          this._entries.delete(key);
+        }
+      }
+    }
+
+    const packInfo = {
+      name,
+      version,
+      flags,
+      entryCount,
+      byteLength: bytes.byteLength,
+      entries: parsedEntries,
+    };
+    this._packs.set(name, packInfo);
+    for (let i = 0; i < parsedEntries.length; i += 1) {
+      const entry = parsedEntries[i];
+      this._entries.set(entry.hash, { entry, packName: name });
+    }
+    return packInfo;
+  }
+
+  loadFromBuffer(buffer, packName) {
+    return this.loadPackBuffer(buffer, packName);
+  }
+
+  parse(buffer, packName) {
+    return this.loadPackBuffer(buffer, packName);
+  }
+
+  hasShader(hash) {
+    const key = normalizeShaderHashBigInt(hash);
+    return key !== null && this._entries.has(key);
+  }
+
+  has(hash) {
+    return this.hasShader(hash);
+  }
+
+  getByHash(hash) {
+    const key = normalizeShaderHashBigInt(hash);
+    if (key === null) return undefined;
+    const rec = this._entries.get(key);
+    return rec ? rec.entry : undefined;
+  }
+
+  getShaderSource(hash) {
+    const entry = this.getByHash(hash);
+    return entry ? entry.wgsl : undefined;
+  }
+
+  getSource(hash) {
+    return this.getShaderSource(hash);
+  }
+
+  getWgsl(hash) {
+    return this.getShaderSource(hash);
+  }
+
+  get(hash) {
+    return this.getShaderSource(hash);
+  }
+
+  clear() {
+    this._packs.clear();
+    this._entries.clear();
+  }
+
+  getStats() {
+    let totalPackBytes = 0;
+    for (const pack of this._packs.values()) {
+      totalPackBytes += pack.byteLength;
+    }
+    return {
+      packCount: this._packs.size,
+      shaderCount: this._entries.size,
+      totalPackBytes,
+    };
+  }
+}
+
 function deviceSupportsTimestampQuery(device) {
   if (!device || typeof device !== 'object') {
     return false;
@@ -484,6 +801,55 @@ class WgpuCommandProcessor {
 
     if (options.reflectionManifest !== undefined && options.reflectionManifest !== null) {
       this.loadReflectionManifest(options.reflectionManifest);
+    }
+
+    // 7. WgslPackCache + ShaderFallbackRouter (G28 / S12)
+    this._ownsWgslPackCache = false;
+    this.wgslPackCache = null;
+    if (options.wgslPackCache && typeof options.wgslPackCache === 'object') {
+      this.wgslPackCache = options.wgslPackCache;
+    } else {
+      this.wgslPackCache = new InlineWgslPackCache();
+      this._ownsWgslPackCache = true;
+    }
+
+    this._ownsShaderFallbackRouter = false;
+    this.shaderFallbackRouter = null;
+    if (options.shaderFallbackRouter && typeof options.shaderFallbackRouter === 'object') {
+      this.shaderFallbackRouter = options.shaderFallbackRouter;
+      if (
+        options.wgslPackCache &&
+        this.shaderFallbackRouter._packLoader == null &&
+        typeof this.shaderFallbackRouter.setPackLoader === 'function'
+      ) {
+        this.shaderFallbackRouter.setPackLoader(this.wgslPackCache);
+      }
+    } else if (options.enableShaderFallback !== false) {
+      const FallbackRouterCtor = resolveSubsystemCtor(
+        options.ShaderFallbackRouter,
+        'PlayGta6ShaderFallbackRouter',
+        'ShaderFallbackRouter',
+        './shader_fallback_router.js'
+      );
+      if (FallbackRouterCtor) {
+        const routerOpts = {
+          ...(options.shaderFallbackRouterOptions || {}),
+          packLoader: this.wgslPackCache,
+        };
+        if (
+          options.fallbackShaderHashes &&
+          typeof options.fallbackShaderHashes === 'object' &&
+          routerOpts.fallbackHashes === undefined
+        ) {
+          routerOpts.fallbackHashes = options.fallbackShaderHashes;
+        }
+        this.shaderFallbackRouter = new FallbackRouterCtor(routerOpts);
+        this._ownsShaderFallbackRouter = true;
+      }
+    }
+
+    if (options.wgslPackBuffer !== undefined && options.wgslPackBuffer !== null) {
+      this.loadWgslPack(options.wgslPackBuffer);
     }
 
     // Packet ABI v2 handler ({ handlePacket, destroyResource }), see render_state_packets.js.
@@ -762,6 +1128,59 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * Parse and load a binary WGPK (`.wgsl.pack`) buffer into `wgslPackCache`.
+   *
+   * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
+   * @param {string} [packName]
+   */
+  loadWgslPack(buffer, packName) {
+    if (this._destroyed) {
+      throw new Error('WgpuCommandProcessor has been destroyed');
+    }
+    if (!this.wgslPackCache) {
+      this.wgslPackCache = new InlineWgslPackCache();
+      this._ownsWgslPackCache = true;
+    }
+    const result = loadWgslPackIntoCache(this.wgslPackCache, buffer, packName);
+    if (
+      this.shaderFallbackRouter &&
+      this.shaderFallbackRouter._packLoader == null &&
+      typeof this.shaderFallbackRouter.setPackLoader === 'function'
+    ) {
+      this.shaderFallbackRouter.setPackLoader(this.wgslPackCache);
+    }
+    return result;
+  }
+
+  /**
+   * Return top missing shaders recorded by `ShaderFallbackRouter` (sorted by hit count desc).
+   *
+   * @param {{ limit?: number }} [opts]
+   */
+  getMissingShaders(opts) {
+    if (
+      this.shaderFallbackRouter &&
+      typeof this.shaderFallbackRouter.getMissingReport === 'function'
+    ) {
+      return this.shaderFallbackRouter.getMissingReport(opts);
+    }
+    return [];
+  }
+
+  /**
+   * Return aggregate lookup / fallback telemetry from `ShaderFallbackRouter`, or null if disabled.
+   */
+  getShaderFallbackStats() {
+    if (
+      this.shaderFallbackRouter &&
+      typeof this.shaderFallbackRouter.getStats === 'function'
+    ) {
+      return this.shaderFallbackRouter.getStats();
+    }
+    return null;
+  }
+
+  /**
    * Resolve the GPUBindGroupLayout for a pipeline handle and group index, preferring
    * S6-reflected layouts built during pipeline creation and falling back to
    * `pipeline.getBindGroupLayout(groupIndex)`.
@@ -1037,14 +1456,87 @@ class WgpuCommandProcessor {
 
     const rawBytes = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 16, codeLen);
     const isShared = typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer;
-    const code = this._decoder.decode(isShared ? rawBytes.slice() : rawBytes);
+    const rawCode = this._decoder.decode(isShared ? rawBytes.slice() : rawBytes);
+    const trimmed = rawCode.trim();
+    const stageName = stageCodeToName(stage) || 'vertex';
+    const hashOnlyHex = parseHashOnlyShaderPayload(trimmed);
+
+    let code = rawCode;
+    let hashHex = null;
+    let entryPoint = null;
+    let source = 'inline';
+    let requestedHash = null;
+    let resolvedHash = null;
+
+    if (trimmed.length === 0 || hashOnlyHex !== null) {
+      let lookupHashHex = hashOnlyHex;
+      if (!lookupHashHex) {
+        const explicitKey = this._shaderReflectionKeys.get(id);
+        const explicitBigInt =
+          explicitKey !== undefined ? normalizeShaderHashBigInt(explicitKey) : null;
+        lookupHashHex =
+          explicitBigInt !== null
+            ? formatShaderHashHex(explicitBigInt)
+            : fnv1a64Hex(`empty:${stageName}:${id}`);
+      }
+      requestedHash = lookupHashHex;
+
+      if (
+        this.shaderFallbackRouter &&
+        typeof this.shaderFallbackRouter.resolve === 'function'
+      ) {
+        const resolved = this.shaderFallbackRouter.resolve(lookupHashHex, stageName);
+        if (resolved && typeof resolved.wgsl === 'string' && resolved.wgsl.length > 0) {
+          code = resolved.wgsl;
+          source = resolved.source || 'fallback';
+          requestedHash = resolved.requestedHash || lookupHashHex;
+          resolvedHash = resolved.resolvedHash !== undefined ? resolved.resolvedHash : null;
+          hashHex = resolvedHash || fnv1a64Hex(code);
+          entryPoint = resolved.entryPoint || extractWgslEntryPoint(code, stage);
+        }
+      } else if (this.wgslPackCache) {
+        const packHit = lookupFromPackCache(this.wgslPackCache, lookupHashHex);
+        if (packHit && typeof packHit.wgsl === 'string' && packHit.wgsl.length > 0) {
+          code = packHit.wgsl;
+          source = 'pack';
+          resolvedHash = lookupHashHex;
+          hashHex = lookupHashHex;
+          entryPoint = packHit.entryPoint || extractWgslEntryPoint(code, stage);
+        }
+      }
+    }
+
+    if (hashHex === null) {
+      hashHex = fnv1a64Hex(code);
+    }
+    if (entryPoint === null) {
+      entryPoint = extractWgslEntryPoint(code, stage);
+    }
+    if (requestedHash === null) {
+      requestedHash = hashHex;
+    }
+    if (resolvedHash === null && source === 'inline') {
+      resolvedHash = hashHex;
+    }
+
     const module = this.device.createShaderModule({ code });
-    const hashHex = fnv1a64Hex(code);
-    const entryPoint = extractWgslEntryPoint(code, stage);
-    this.shaderModules.set(id, { module, stage, code, hashHex, entryPoint });
+    this.shaderModules.set(id, {
+      module,
+      stage,
+      code,
+      hashHex,
+      entryPoint,
+      source,
+      requestedHash,
+      resolvedHash,
+    });
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
+      const byteSize =
+        code === rawCode
+          ? Math.max(0, Math.trunc(codeLen))
+          : new TextEncoder().encode(code).byteLength;
       this.resourceRegistry.register('shaderModule', id, module, {
-        byteSize: Math.max(0, Math.trunc(codeLen)),
+        byteSize,
         label: `shaderModule:${id}`,
       });
     }
@@ -1909,6 +2401,11 @@ class WgpuCommandProcessor {
       this.reflectionRegistry && typeof this.reflectionRegistry.getStats === 'function'
         ? this.reflectionRegistry.getStats()
         : null;
+    const shaderFallback = this.getShaderFallbackStats();
+    const wgslPackCache =
+      this.wgslPackCache && typeof this.wgslPackCache.getStats === 'function'
+        ? this.wgslPackCache.getStats()
+        : null;
 
     return {
       frameCount: this.frameCount,
@@ -1937,6 +2434,8 @@ class WgpuCommandProcessor {
       rtPoolHitRate: rtPool ? rtPool.hitRate : 0,
       reflectionRegistry,
       reflectionShaderCount: reflectionRegistry ? reflectionRegistry.shaderCount : 0,
+      shaderFallback,
+      wgslPackCache,
     };
   }
 
@@ -2010,6 +2509,13 @@ class WgpuCommandProcessor {
     ) {
       this.reflectionRegistry.clear();
     }
+    if (
+      this.wgslPackCache &&
+      this._ownsWgslPackCache &&
+      typeof this.wgslPackCache.clear === 'function'
+    ) {
+      this.wgslPackCache.clear();
+    }
 
     this._pendingTimerReadbacks.clear();
     this._lastPassTimings = null;
@@ -2017,14 +2523,394 @@ class WgpuCommandProcessor {
   }
 }
 
+const DEFAULT_TELEMETRY_INTERVAL_MS = 250;
+const DEFAULT_TELEMETRY_MISSING_LIMIT = 64;
+
+function toNonNegativeInt(value, fallback = 0) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function toNonNegativeFinite(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return null;
+  }
+  return n;
+}
+
+function sanitizeTelemetryStage(stage) {
+  if (typeof stage === 'number') {
+    return WGPK_STAGE_NAMES[stage] || 'unknown';
+  }
+  if (typeof stage === 'string') {
+    const key = stage.trim().toLowerCase();
+    if (key === 'vertex' || key === 'vs' || key === 'vert' || key === '1') {
+      return 'vertex';
+    }
+    if (
+      key === 'fragment' ||
+      key === 'fs' ||
+      key === 'frag' ||
+      key === 'pixel' ||
+      key === 'ps' ||
+      key === '2'
+    ) {
+      return 'fragment';
+    }
+    if (key === 'compute' || key === 'cs' || key === 'comp' || key === '3') {
+      return 'compute';
+    }
+  }
+  return 'unknown';
+}
+
+function sanitizeMissingShaderRecord(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const rawHash =
+    entry.hash !== undefined
+      ? entry.hash
+      : entry.shaderHash !== undefined
+        ? entry.shaderHash
+        : entry.hashHex;
+  const hashBigInt = normalizeShaderHashBigInt(rawHash);
+  if (hashBigInt === null) {
+    return null;
+  }
+  const hash = formatShaderHashHex(hashBigInt);
+  const stage = sanitizeTelemetryStage(entry.stage);
+  const rawHits =
+    entry.hitCount !== undefined
+      ? entry.hitCount
+      : entry.hits !== undefined
+        ? entry.hits
+        : entry.drawCount !== undefined
+          ? entry.drawCount
+          : entry.count;
+  const hitCount = rawHits === undefined || rawHits === null ? 1 : toNonNegativeInt(rawHits, 0);
+  const firstSeenMs = toNonNegativeFinite(entry.firstSeenMs);
+  const lastSeenMs = toNonNegativeFinite(entry.lastSeenMs);
+
+  const sanitized = {
+    hash,
+    stage,
+    hits: hitCount,
+    hitCount,
+  };
+  if (firstSeenMs !== null) {
+    sanitized.firstSeenMs = firstSeenMs;
+  }
+  if (lastSeenMs !== null) {
+    sanitized.lastSeenMs = lastSeenMs;
+  }
+  return sanitized;
+}
+
+/**
+ * Build a sanitized `{ type: 'gpu-telemetry', frameStats, fallbackStats, missingShaders, timestamp }`
+ * payload matching `GpuBootPanelController.update(...)` (zero host paths, zero raw bytes).
+ *
+ * @param {WgpuCommandProcessor | object | null | undefined} processor
+ * @param {{ limit?: number, missingShaderLimit?: number, timestamp?: number, now?: () => number }} [options]
+ */
+function buildGpuTelemetrySnapshot(processor, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const rawLimit =
+    opts.limit !== undefined
+      ? opts.limit
+      : opts.missingShaderLimit !== undefined
+        ? opts.missingShaderLimit
+        : DEFAULT_TELEMETRY_MISSING_LIMIT;
+  const limit =
+    Number.isInteger(rawLimit) && rawLimit >= 0 ? rawLimit : DEFAULT_TELEMETRY_MISSING_LIMIT;
+
+  let stats = null;
+  if (processor && typeof processor.getStats === 'function') {
+    try {
+      stats = processor.getStats();
+    } catch (_) {
+      stats = null;
+    }
+  }
+
+  let rawFallback = null;
+  if (processor && typeof processor.getShaderFallbackStats === 'function') {
+    try {
+      rawFallback = processor.getShaderFallbackStats();
+    } catch (_) {
+      rawFallback = null;
+    }
+  } else if (stats && stats.shaderFallback && typeof stats.shaderFallback === 'object') {
+    rawFallback = stats.shaderFallback;
+  }
+
+  let rawMissing = [];
+  if (processor && typeof processor.getMissingShaders === 'function') {
+    try {
+      const list = processor.getMissingShaders({ limit });
+      if (Array.isArray(list)) {
+        rawMissing = list;
+      }
+    } catch (_) {
+      rawMissing = [];
+    }
+  }
+
+  const missingShaders = [];
+  for (let i = 0; i < rawMissing.length && missingShaders.length < limit; i += 1) {
+    const clean = sanitizeMissingShaderRecord(rawMissing[i]);
+    if (clean) {
+      missingShaders.push(clean);
+    }
+  }
+
+  const framesPresented = toNonNegativeInt(
+    stats && stats.frameCount !== undefined
+      ? stats.frameCount
+      : stats && stats.framesPresented !== undefined
+        ? stats.framesPresented
+        : processor && processor.frameCount,
+    0
+  );
+  const droppedFrames = toNonNegativeInt(stats && stats.droppedFrames, 0);
+  const drawCalls = toNonNegativeInt(stats && stats.drawCalls, 0);
+  const computeDispatches = toNonNegativeInt(stats && stats.computeDispatches, 0);
+  const packetsProcessed = toNonNegativeInt(
+    stats && stats.packetCount !== undefined
+      ? stats.packetCount
+      : stats && stats.packetsProcessed,
+    0
+  );
+
+  const packHits = toNonNegativeInt(rawFallback && rawFallback.packHits, 0);
+  const fallbackHits = toNonNegativeInt(rawFallback && rawFallback.fallbackHits, 0);
+  const builtinHits = toNonNegativeInt(rawFallback && rawFallback.builtinHits, 0);
+  const sumHits = packHits + fallbackHits + builtinHits;
+  const totalLookups =
+    rawFallback && rawFallback.totalLookups !== undefined && rawFallback.totalLookups !== null
+      ? toNonNegativeInt(rawFallback.totalLookups, sumHits)
+      : rawFallback && rawFallback.totalResolves !== undefined && rawFallback.totalResolves !== null
+        ? toNonNegativeInt(rawFallback.totalResolves, sumHits)
+        : sumHits;
+  const uniqueMissing =
+    rawFallback && rawFallback.uniqueMissing !== undefined && rawFallback.uniqueMissing !== null
+      ? toNonNegativeInt(rawFallback.uniqueMissing, missingShaders.length)
+      : rawFallback && rawFallback.missingCount !== undefined && rawFallback.missingCount !== null
+        ? toNonNegativeInt(rawFallback.missingCount, missingShaders.length)
+        : missingShaders.length;
+  const overflowMissingCount = toNonNegativeInt(rawFallback && rawFallback.overflowMissingCount, 0);
+
+  let hitRatePct;
+  if (
+    rawFallback &&
+    rawFallback.hitRatePct !== undefined &&
+    rawFallback.hitRatePct !== null &&
+    Number.isFinite(Number(rawFallback.hitRatePct))
+  ) {
+    const clamped = Math.min(100, Math.max(0, Number(rawFallback.hitRatePct)));
+    hitRatePct = Math.round(clamped * 100) / 100;
+  } else {
+    hitRatePct = totalLookups > 0 ? Math.round((packHits / totalLookups) * 10000) / 100 : 0;
+  }
+
+  let timestamp;
+  if (typeof opts.timestamp === 'number' && Number.isFinite(opts.timestamp)) {
+    timestamp = opts.timestamp;
+  } else if (typeof opts.now === 'function') {
+    const t = opts.now();
+    timestamp = typeof t === 'number' && Number.isFinite(t) ? t : Date.now();
+  } else {
+    timestamp = Date.now();
+  }
+
+  return {
+    type: 'gpu-telemetry',
+    frameStats: {
+      framesPresented,
+      droppedFrames,
+      drawCalls,
+      computeDispatches,
+      packetsProcessed,
+    },
+    fallbackStats: {
+      totalLookups,
+      totalResolves: totalLookups,
+      packHits,
+      fallbackHits,
+      builtinHits,
+      hitRatePct,
+      uniqueMissing,
+      missingCount: uniqueMissing,
+      overflowMissingCount,
+    },
+    missingShaders,
+    timestamp,
+  };
+}
+
 function createWgpuWorkerHandler(options = {}) {
   const postMessage =
     typeof options.postMessage === 'function' ? options.postMessage : () => {};
   const injectedRingCtor =
     typeof options.GpuRingBuffer === 'function' ? options.GpuRingBuffer : null;
+  const telemetryIntervalMs =
+    typeof options.telemetryIntervalMs === 'number' &&
+    Number.isFinite(options.telemetryIntervalMs) &&
+    options.telemetryIntervalMs >= 0
+      ? options.telemetryIntervalMs
+      : DEFAULT_TELEMETRY_INTERVAL_MS;
+  const telemetryMissingLimit =
+    Number.isInteger(options.telemetryMissingLimit) && options.telemetryMissingLimit >= 0
+      ? options.telemetryMissingLimit
+      : DEFAULT_TELEMETRY_MISSING_LIMIT;
+  const telemetryNow = typeof options.now === 'function' ? options.now : () => Date.now();
   let canvas = options.canvas || null;
   let processor = options.processor || null;
   let attachedRing = processor && processor.ring ? processor.ring : null;
+  let preloadedInDefaultInit = false;
+  let lastTelemetryEmitMs = -Infinity;
+
+  function emitTelemetry(overrideOptions = {}) {
+    const ts = telemetryNow();
+    const snap = buildGpuTelemetrySnapshot(processor, {
+      limit:
+        overrideOptions.limit !== undefined ? overrideOptions.limit : telemetryMissingLimit,
+      timestamp: ts,
+    });
+    if (overrideOptions.id !== undefined) {
+      snap.id = overrideOptions.id;
+    }
+    postMessage(snap);
+    return snap;
+  }
+
+  function maybeEmitFrameTelemetry(prevFrameCount, nextFrameCount) {
+    if (nextFrameCount <= prevFrameCount) {
+      return false;
+    }
+    const nowMs = telemetryNow();
+    const reachedFirstFrame = prevFrameCount === 0 && nextFrameCount >= 1;
+    const isFrameOne = nextFrameCount === 1;
+    const throttleElapsed =
+      lastTelemetryEmitMs === -Infinity || nowMs - lastTelemetryEmitMs >= telemetryIntervalMs;
+
+    if (reachedFirstFrame || isFrameOne || throttleElapsed) {
+      lastTelemetryEmitMs = nowMs;
+      emitTelemetry();
+      return true;
+    }
+    return false;
+  }
+
+  async function preloadBootShaderAssets(targetProcessor, initPayload = {}) {
+    const summary = {
+      shaderPackLoaded: false,
+      shaderPackShaders: 0,
+      reflectionLoaded: false,
+      reflectionShaders: 0,
+    };
+    if (!targetProcessor || !initPayload || typeof initPayload !== 'object') {
+      return summary;
+    }
+
+    const activeFetch =
+      typeof initPayload.fetch === 'function'
+        ? initPayload.fetch
+        : typeof options.fetch === 'function'
+          ? options.fetch
+          : typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
+            ? globalThis.fetch
+            : null;
+
+    const shaderPackUrl =
+      typeof initPayload.shaderPackUrl === 'string' && initPayload.shaderPackUrl.trim().length > 0
+        ? initPayload.shaderPackUrl.trim()
+        : null;
+    const reflectionManifestUrl =
+      typeof initPayload.reflectionManifestUrl === 'string' &&
+      initPayload.reflectionManifestUrl.trim().length > 0
+        ? initPayload.reflectionManifestUrl.trim()
+        : null;
+
+    const tasks = [];
+
+    if (shaderPackUrl && activeFetch) {
+      tasks.push(
+        (async () => {
+          try {
+            const resp = await activeFetch(shaderPackUrl);
+            if (!resp || !resp.ok || typeof resp.arrayBuffer !== 'function') {
+              return;
+            }
+            const buffer = await resp.arrayBuffer();
+            if (typeof targetProcessor.loadWgslPack === 'function') {
+              targetProcessor.loadWgslPack(buffer, shaderPackUrl);
+            } else if (targetProcessor.wgslPackCache) {
+              loadWgslPackIntoCache(targetProcessor.wgslPackCache, buffer, shaderPackUrl);
+            }
+            summary.shaderPackLoaded = true;
+            if (
+              targetProcessor.wgslPackCache &&
+              typeof targetProcessor.wgslPackCache.getStats === 'function'
+            ) {
+              const packStats = targetProcessor.wgslPackCache.getStats();
+              summary.shaderPackShaders = packStats ? packStats.shaderCount || 0 : 0;
+            }
+          } catch (_) {
+            // Non-fatal: worker init must never abort if shader pack fetch/parse fails.
+          }
+        })()
+      );
+    }
+
+    if (reflectionManifestUrl && activeFetch) {
+      tasks.push(
+        (async () => {
+          try {
+            const resp = await activeFetch(reflectionManifestUrl);
+            if (!resp || !resp.ok) {
+              return;
+            }
+            const manifestData =
+              typeof resp.text === 'function'
+                ? await resp.text()
+                : typeof resp.json === 'function'
+                  ? await resp.json()
+                  : null;
+            if (
+              manifestData !== null &&
+              typeof targetProcessor.loadReflectionManifest === 'function'
+            ) {
+              targetProcessor.loadReflectionManifest(manifestData);
+              summary.reflectionLoaded = true;
+              if (typeof targetProcessor.getStats === 'function') {
+                const pStats = targetProcessor.getStats();
+                summary.reflectionShaders = pStats ? pStats.reflectionShaderCount || 0 : 0;
+              }
+            }
+          } catch (_) {
+            // Non-fatal: worker init must never abort if reflection manifest fetch/parse fails.
+          }
+        })()
+      );
+    }
+
+    if (tasks.length > 0) {
+      await Promise.all(tasks);
+    }
+    return summary;
+  }
 
   async function defaultInitGpu(offscreen, width, height, initPayload = {}) {
     canvas = offscreen;
@@ -2056,6 +2942,10 @@ function createWgpuWorkerHandler(options = {}) {
       resourceRegistry: options.resourceRegistry,
       rtPool: options.rtPool,
       pipelineCache: options.pipelineCache,
+      wgslPackCache: options.wgslPackCache,
+      shaderFallbackRouter: options.shaderFallbackRouter,
+      ShaderFallbackRouter: options.ShaderFallbackRouter,
+      shaderFallbackRouterOptions: options.shaderFallbackRouterOptions,
       enableStagingPool: initPayload.enableStagingPool ?? options.enableStagingPool,
       enableUniformRing: initPayload.enableUniformRing ?? options.enableUniformRing,
       enablePassTimer: initPayload.enablePassTimer ?? options.enablePassTimer,
@@ -2064,6 +2954,10 @@ function createWgpuWorkerHandler(options = {}) {
       enableResourceRegistry:
         initPayload.enableResourceRegistry ?? options.enableResourceRegistry,
       enableRtPool: initPayload.enableRtPool ?? options.enableRtPool,
+      enableShaderFallback:
+        initPayload.enableShaderFallback ?? options.enableShaderFallback,
+      fallbackShaderHashes:
+        initPayload.fallbackShaderHashes ?? options.fallbackShaderHashes,
       reflectionManifest: initPayload.reflectionManifest ?? options.reflectionManifest,
     });
     try {
@@ -2081,6 +2975,9 @@ function createWgpuWorkerHandler(options = {}) {
     if (attachedRing) {
       processor.attachRing(attachedRing);
     }
+
+    await preloadBootShaderAssets(processor, initPayload);
+    preloadedInDefaultInit = true;
 
     const info = adapter.info
       ? `${adapter.info.vendor || 'gpu'} ${adapter.info.architecture || ''}`.trim()
@@ -2117,6 +3014,7 @@ function createWgpuWorkerHandler(options = {}) {
     const payload = msg || {};
     try {
       if (payload.init && payload.canvas) {
+        preloadedInDefaultInit = false;
         const created = await initGpu(
           payload.canvas,
           payload.width || 1280,
@@ -2125,12 +3023,18 @@ function createWgpuWorkerHandler(options = {}) {
         );
         if (created && created !== processor) {
           processor = created;
+          lastTelemetryEmitMs = -Infinity;
         }
         if (payload.ringSab || payload.ring) {
           attachRingFromMessage(payload);
         } else if (attachedRing && processor) {
           processor.attachRing(attachedRing);
         }
+        if (!preloadedInDefaultInit && processor) {
+          await preloadBootShaderAssets(processor, payload);
+        }
+      } else if (payload.init && processor) {
+        await preloadBootShaderAssets(processor, payload);
       } else if (payload.resize && canvas) {
         const nextW = Math.max(1, payload.width | 0);
         const nextH = Math.max(1, payload.height | 0);
@@ -2149,6 +3053,25 @@ function createWgpuWorkerHandler(options = {}) {
           reflectionLoaded: true,
           shaderCount: stats.reflectionShaderCount,
         });
+      } else if (payload.type === 'request-gpu-telemetry') {
+        emitTelemetry({
+          id: payload.id,
+          limit: payload.limit,
+        });
+      } else if (payload.missingShaders && processor) {
+        const missingOpts =
+          payload.limit !== undefined ? { limit: payload.limit } : undefined;
+        postMessage({
+          id: payload.id,
+          missingShaders:
+            typeof processor.getMissingShaders === 'function'
+              ? processor.getMissingShaders(missingOpts)
+              : [],
+          shaderFallbackStats:
+            typeof processor.getShaderFallbackStats === 'function'
+              ? processor.getShaderFallbackStats()
+              : null,
+        });
       } else if (payload.stats) {
         postMessage({
           id: payload.id,
@@ -2159,15 +3082,26 @@ function createWgpuWorkerHandler(options = {}) {
           processor.destroy();
         }
         postMessage({ id: payload.id, destroyed: true });
-      } else if (payload.drainRing && processor) {
+      } else if ((payload.drainRing || payload.type === 'drain-ring') && processor) {
+        const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.drainRing();
         if (result.presents > 0) {
           postMessage({ frame: result.frameCount });
+          maybeEmitFrameTelemetry(prevFrames, result.frameCount);
         }
-      } else if (payload.cmdBuffer && processor) {
-        const result = processor.executeCommandBuffer(payload.cmdBuffer);
+      } else if (
+        processor &&
+        (payload.cmdBuffer ||
+          ((payload.type === 'submit' || payload.type === 'executeBatch') &&
+            (payload.buffer || payload.commands || payload.data)))
+      ) {
+        const batchBuffer =
+          payload.cmdBuffer || payload.buffer || payload.commands || payload.data;
+        const prevFrames = toNonNegativeInt(processor.frameCount, 0);
+        const result = processor.executeCommandBuffer(batchBuffer);
         if (result.presents > 0) {
           postMessage({ frame: result.frameCount });
+          maybeEmitFrameTelemetry(prevFrames, result.frameCount);
         }
       }
     } catch (err) {
@@ -2189,6 +3123,11 @@ function createWgpuWorkerHandler(options = {}) {
 const exportedApi = {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
+  buildGpuTelemetrySnapshot,
+  DEFAULT_TELEMETRY_INTERVAL_MS,
+  DEFAULT_TELEMETRY_MISSING_LIMIT,
+  InlineWgslPackCache,
+  parseHashOnlyShaderPayload,
   resolveGpuRingBuffer,
   estimateTextureBytes,
   fnv1a64Hex,

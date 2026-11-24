@@ -632,6 +632,14 @@ HResult Device::CreateRootSignature(uint32_t, uint64_t blob, uint64_t length, co
         note_bad_argument(std::string("CreateRootSignature: invalid root signature: ") + d3d::status_name(err.status));
         return kEInvalidArg;
     }
+    {
+        // The parser accepts versions 1..3 only (1.0, 1.1, 1.2).
+        const uint32_t version = static_cast<uint32_t>(desc.version);
+        std::lock_guard<std::mutex> lock(shader_mutex_);
+        if (++root_signature_versions_[version - 1] == 1) {
+            os::log("d3d12_xs: first root signature of version 1." + std::to_string(version - 1));
+        }
+    }
     auto object = com::create_object<RootSignature>(com::implements(kID3D12RootSignature), device_ref(this),
                                                     std::move(signature));
     return hand_out(std::move(object), riid, out);
@@ -940,7 +948,33 @@ Fence::Fence(com::Ref<Device> device, uint64_t initial_value, uint32_t flags)
 }
 
 Fence::~Fence() {
+    if (value_word_ != 0) {
+        com::guest_free(value_word_);
+    }
     device_->fences.fetch_sub(1);
+}
+
+uint64_t Fence::CompletedValueAddress() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (value_word_ == 0) {
+        value_word_ = com::guest_alloc(sizeof(uint64_t));
+        if (value_word_ == 0) {
+            device_->note_bad_argument("ID3D12Fence Xbox slot 12: out of guest memory for the completed value");
+            return 0;
+        }
+        publish_value_locked();
+    }
+    return value_word_;
+}
+
+// Guest code reads the word while other threads signal: one aligned 64-bit store.
+void Fence::publish_value_locked() {
+    if (value_word_ == 0) {
+        return;
+    }
+    if (auto* word = static_cast<uint64_t*>(com::guest_to_host(value_word_, sizeof(uint64_t)))) {
+        std::atomic_ref<uint64_t>(*word).store(value_.load(std::memory_order_acquire), std::memory_order_release);
+    }
 }
 
 namespace {
@@ -977,6 +1011,7 @@ HResult Fence::Signal(uint64_t value) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         value_.store(value, std::memory_order_release);
+        publish_value_locked();
         fire_events_locked(&to_set);
     }
     for (uint64_t handle : to_set) {
@@ -1396,6 +1431,7 @@ constexpr com::MethodDesc kFenceMethods[] = {
     FenceM::method<&IFenceHost::SetEventOnCompletion>("SetEventOnCompletion"),  // 9
     FenceM::method<&IFenceHost::Signal>("Signal"),                              // 10
     FenceM::method<&IFenceHost::GetCreationFlags>("GetCreationFlags"),          // 11 (ID3D12Fence1)
+    FenceM::method<&IFenceHost::CompletedValueAddress>("completed-value address (Xbox slot 12)"),  // 12
 };
 constexpr Guid kFenceIids[] = {IID_ID3D12Object, IID_ID3D12DeviceChild, IID_ID3D12Pageable, IID_ID3D12Fence1};
 

@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <random>

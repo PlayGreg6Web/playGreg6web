@@ -1,5 +1,3 @@
-'use strict';
-
 // GPU packet ABI v2 CreateTexture2 (opcode 35, docs/gpu_commands.md "CreateTexture2") for
 // WgpuCommandProcessor: textures with any v2 texture format code, a sample count and view formats,
 // as created by the d3d12_xs layer (runtime/gpu). The texture lands in the processor's own tables
@@ -8,6 +6,9 @@
 //
 // Install with installTexturePackets(processor) after the v2 handler (render_state_packets.js): it
 // chains in front of processor.extension and forwards every other opcode to it.
+
+(function (globalScope) {
+  'use strict';
 
 const CREATE_TEXTURE2 = 35;
 const CREATE_TEXTURE2_BYTES = 40;
@@ -151,10 +152,13 @@ const exportedApi = {
   TEXTURE_FORMAT_NAMES,
 };
 
-if (typeof globalThis !== 'undefined') {
-  globalThis.PlayGta6TexturePackets = exportedApi;
-}
+  if (typeof globalThis !== 'undefined') {
+    globalThis.PlayGta6TexturePackets = exportedApi;
+  } else if (globalScope) {
+    globalScope.PlayGta6TexturePackets = exportedApi;
+  }
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = exportedApi;
-}
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = exportedApi;
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : this);

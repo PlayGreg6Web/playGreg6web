@@ -48,10 +48,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Run the native boot harness (`R14`) on the real program build in a fix-and-rerun loop: triage each first fault, fix boot/loader/dispatcher/shim defects with regression tests or record the missing piece for its owning task, until the title reaches its first D3D12 device creation.
 - [x] **R18 — Guest-Callable Thunks for Every Catalogued Shim Export: Dynamic `GetProcAddress` Coverage (`recomp/src/stubs/`, `runtime/guest/`)** — `DONE` (PR #289, closes #283) *(no game files required — observed at boot: `GetProcAddress` returns NULL for host shims that are not statically imported)*
   - Generate guest-callable marshaling thunks for every audited, bindable shim in the catalogue, register them with the guest runtime, and make dynamic `GetProcAddress` binding return callable guest addresses.
-- [ ] **R19 — Windowed Guest-Memory Translation: Fit a 16 GiB CPU Window into the wasm64 Guest Pool (prototype + measurements)** — `IN PROGRESS` (#285, @Timon-ok) *(follow-up to O27: the title's CPU window cannot be identity-mapped into the 12 GiB browser pool; option off by default, no ABI change until measured)*
+- [x] **R19 — Windowed Guest-Memory Translation: Fit a 16 GiB CPU Window into the wasm64 Guest Pool (prototype + measurements)** — `DONE` (PRs #300, #304, closes #285; ABI proposal open as #306) *(follow-up to O27: the title's CPU window cannot be identity-mapped into the 12 GiB browser pool; option off by default, no ABI change until measured)*
   - Prototype a second translation for one registered address range in the lifter's `guest_ptr` seam (per-64 KiB page table) with pool-backed window pages in the arena, and measure code-size and run-time cost.
-- [ ] **R20 — Real-Binary Boot Bring-Up, Phase 2: Native Boot from Device Creation to the First Presented Frame** — `IN PROGRESS` (#296, @Timon-ok) *(continues R17; local game files only for local runs)*
+- [x] **R20 — Real-Binary Boot Bring-Up, Phase 2: Native Boot from Device Creation to the First Presented Frame** — `DONE` (PRs #297–#338, closes #296) *(continues R17; local game files only for local runs)*
   - Iterate the native boot past `D3D12XboxCreateDevice` until the title presents its first frame, fixing each blocker by cause with a synthetic regression test.
+- [ ] **R23 — Real-Binary Boot Bring-Up, Phase 3: Native Boot from the First Present to a Sustained Frame Loop** — `IN PROGRESS` (#341, @Timon-ok) *(continues R20; local game files only for local runs)*
+  - Iterate the native boot past the first presented frames (audio HAL object, remaining command-list slots) to a sustained frame loop, and add a local frame capture of the recorded GPU command stream.
 
 ---
 

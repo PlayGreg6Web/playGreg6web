@@ -498,6 +498,9 @@ test('wgpu_worker message handler supports attachRing, drainRing, injected GpuRi
   await worker.handleMessage({ drainRing: true });
 
   assert.deepEqual(posted.shift(), { frame: 1 });
+  const frame1Telemetry = posted.shift();
+  assert.equal(frame1Telemetry.type, 'gpu-telemetry');
+  assert.equal(frame1Telemetry.frameStats.framesPresented, 1);
   assert.equal(worker.processor.frameCount, 1);
   assert.ok(calls.some((c) => c.op === 'submit'));
 

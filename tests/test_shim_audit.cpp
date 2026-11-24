@@ -82,9 +82,9 @@ void test_rows_are_well_formed() {
         }
     }
     // Every shim of the four audited families has a row (ucrt 186 + ucrt_ext 52, middleware 98,
-    // xbox 16, winsock 25 registered + WSASetLastError, declared but not registered); stubs.rs
+    // xbox 17, winsock 25 registered + WSASetLastError, declared but not registered); stubs.rs
     // checks the same against the export tables.
-    CHECK(seen.size() == 186u + 52u + 98u + 16u + 26u);
+    CHECK(seen.size() == 186u + 52u + 98u + 17u + 26u);
     CHECK(ok > 0);
     for (const GapRow& gap : kGaps) {
         if (gap.dll == nullptr) {

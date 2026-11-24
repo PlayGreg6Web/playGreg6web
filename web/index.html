@@ -399,6 +399,81 @@
       background: rgba(148, 163, 184, 0.28);
       border-radius: 3px;
     }
+
+    #gpu-boot-panel-root {
+      width: 100%;
+      border-radius: 6px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-subtle);
+      overflow: hidden;
+    }
+
+    #gpu-boot-panel-root:empty {
+      display: none;
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel {
+      width: 100%;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 10.5px;
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__header {
+      background: rgba(15, 23, 42, 0.65);
+      border-bottom-color: var(--border-subtle);
+      padding: 6px 8px;
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__title {
+      font-family: var(--sans);
+      font-size: 11px;
+      color: var(--text);
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__summary-badge {
+      background: var(--info-bg);
+      color: #e0f2fe;
+      font-size: 10px;
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__btn {
+      border-color: var(--border);
+      background: rgba(30, 41, 59, 0.72);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 10px;
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__btn:hover {
+      background: rgba(51, 65, 85, 0.85);
+      border-color: rgba(148, 163, 184, 0.4);
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__body {
+      padding: 8px;
+      gap: 8px;
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__section-title,
+    #gpu-boot-panel-root .pg6-gpu-panel__metric-label,
+    #gpu-boot-panel-root .pg6-gpu-panel__table th,
+    #gpu-boot-panel-root .pg6-gpu-panel__empty-cell {
+      color: var(--muted);
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__metric {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border-subtle);
+    }
+
+    #gpu-boot-panel-root .pg6-gpu-panel__progress-fill {
+      background: var(--info);
+    }
   </style>
 </head>
 <body>
@@ -496,11 +571,19 @@
           <button id="btn-clear-cache" class="hud-btn" type="button">Clear Cache</button>
           <button id="btn-export-saves" class="hud-btn" type="button">Export Saves</button>
           <button id="btn-export-crash" class="hud-btn" type="button">Export Report</button>
+          <button id="btn-export-missing-shaders" class="hud-btn" type="button">Missing Shaders</button>
         </div>
         <div class="control-row">
           <label class="kv-label" for="select-input-profile">Input Profile</label>
           <select id="select-input-profile" class="hud-select" aria-label="Input Profile"></select>
         </div>
+      </section>
+
+      <section class="hud-section" aria-label="Frame-1 GPU and shader diagnostics">
+        <div class="hud-section-head">
+          <span>GPU Boot &amp; Shaders</span>
+        </div>
+        <div id="gpu-boot-panel-root" class="gpu-boot-panel-slot"></div>
       </section>
 
       <section class="hud-section" aria-label="Runtime log">
@@ -515,6 +598,7 @@
 
   <script src="./runtime/pgim_preloader.js"></script>
   <script src="./ui/splash_overlay.js"></script>
+  <script src="./ui/gpu_boot_panel.js"></script>
   <script src="./runtime/boot_orchestrator.js"></script>
   <script type="module">
     import { bootstrapPlayGta6App } from './app_bootstrap.js';
@@ -522,6 +606,7 @@
 
     const canvas = document.getElementById('viewport');
     const splashOverlayRoot = document.getElementById('splash-overlay-root');
+    const gpuBootPanelRoot = document.getElementById('gpu-boot-panel-root');
     const hudEl = document.getElementById('hud');
     const statusDotEl = document.getElementById('hud-status-dot');
     const statusEl = document.getElementById('hud-status');
@@ -537,6 +622,7 @@
     const clearCacheBtn = document.getElementById('btn-clear-cache');
     const exportSavesBtn = document.getElementById('btn-export-saves');
     const exportCrashBtn = document.getElementById('btn-export-crash');
+    const exportMissingShadersBtn = document.getElementById('btn-export-missing-shaders');
     const profileSelect = document.getElementById('select-input-profile');
 
     const capEls = {
@@ -657,6 +743,50 @@
       if (metrics.status !== undefined) {
         setStatus(metrics.status, metrics.level || 'info');
       }
+
+      if (
+        activeHudController &&
+        (metrics.bootSummary !== undefined ||
+          metrics.missingShaders !== undefined ||
+          metrics.fallbackStats !== undefined ||
+          metrics.frameStats !== undefined)
+      ) {
+        activeHudController.updateGpuBootTelemetry({
+          bootSummary: metrics.bootSummary,
+          missingShaders: metrics.missingShaders,
+          fallbackStats: metrics.fallbackStats,
+          frameStats: metrics.frameStats,
+        });
+      }
+    }
+
+    function downloadJsonFile(filename, data) {
+      if (
+        typeof Blob !== 'function' ||
+        typeof URL === 'undefined' ||
+        typeof URL.createObjectURL !== 'function'
+      ) {
+        return;
+      }
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.style.display = 'none';
+        if (document.body) {
+          document.body.appendChild(anchor);
+        }
+        anchor.click();
+        if (anchor.parentNode) {
+          anchor.parentNode.removeChild(anchor);
+        }
+      } finally {
+        if (typeof URL.revokeObjectURL === 'function') {
+          URL.revokeObjectURL(url);
+        }
+      }
     }
 
     function setCollapsed(collapsed) {
@@ -708,6 +838,7 @@
       }
     }
 
+    let activeHudController = null;
     const hudApi = {
       setStatus,
       appendLog,
@@ -718,6 +849,7 @@
     window.playgta6Hud = hudApi;
     window.playgta6App = null;
     window.playgta6HudController = null;
+    window.playgta6GpuBootPanel = null;
 
     toggleBtn.addEventListener('click', () => {
       setCollapsed(!hudEl.classList.contains('collapsed'));
@@ -811,9 +943,36 @@
       const app = bootstrapPlayGta6App({
         canvas,
         splashContainer: splashOverlayRoot,
+        gpuBootPanelRoot,
         hud: hudApi,
         dataBase: `${location.origin}/data/`,
       });
+
+      let hudController = null;
+      let ownsGpuBootPanel = false;
+      let gpuBootPanel = app.gpuBootPanel || null;
+      const GpuBootPanelCtor = globalThis.PlayGta6GpuBootPanel?.GpuBootPanelController;
+      if (!gpuBootPanel && gpuBootPanelRoot && typeof GpuBootPanelCtor === 'function') {
+        gpuBootPanel = new GpuBootPanelCtor({
+          container: gpuBootPanelRoot,
+          collapsed: true,
+          onExportMissingShaders(jsonText, payload) {
+            if (hudController && hudController.isExportingMissingShaders) {
+              return;
+            }
+            downloadJsonFile('playgta6-missing-shaders.json', jsonText);
+            const count =
+              payload && Number.isFinite(payload.missingShaderCount)
+                ? payload.missingShaderCount
+                : 0;
+            appendLog(
+              `Exported missing-shader report (${count} missing shader${count === 1 ? '' : 's'}) to playgta6-missing-shaders.json.`,
+              'ok'
+            );
+          },
+        });
+        ownsGpuBootPanel = true;
+      }
 
       const smokeRunnerProxy = {
         get recorder() {
@@ -854,15 +1013,18 @@
         },
       };
 
-      const hudController = new HudController({
+      hudController = new HudController({
+        app,
         sessionController: app.session,
         smokeDemoRunner: smokeRunnerProxy,
         storageManager: app.storageManager,
         crashReporter: app.crashReporter,
         perfMonitor: app.perfMonitor,
         inputProfiles: app.inputProfiles,
+        gpuBootPanel,
         hud: hudApi,
       });
+      activeHudController = hudController;
 
       populateInputProfiles(profileSelect, app.inputProfiles);
       hudController.bindButtons({
@@ -873,6 +1035,7 @@
         clearCacheBtn,
         exportSavesBtn,
         exportCrashBtn,
+        exportMissingShadersBtn,
         profileSelect,
       });
 
@@ -880,6 +1043,7 @@
       window.playgta6HudController = hudController;
       window.playgta6SplashOverlay = app.splashOverlay;
       window.playgta6BootOrchestrator = app.bootOrchestrator;
+      window.playgta6GpuBootPanel = gpuBootPanel;
 
       const syncControlStates = () => {
         const isSmoke = app.session.getState() === 'running_smoke';
@@ -893,6 +1057,9 @@
           recordTraceBtn.dataset.recording = recording ? 'true' : 'false';
           recordTraceBtn.setAttribute('aria-pressed', recording ? 'true' : 'false');
           recordTraceBtn.textContent = recording ? 'Stop Trace' : 'Record Trace';
+        }
+        if (app.bootTracer && typeof app.bootTracer.getSummary === 'function') {
+          hudController.updateGpuBootTelemetry({ bootSummary: app.bootTracer.getSummary() });
         }
       };
 
@@ -908,7 +1075,11 @@
 
       window.addEventListener('pagehide', () => {
         unsubscribeSession();
+        activeHudController = null;
         hudController.destroy();
+        if (ownsGpuBootPanel && gpuBootPanel && typeof gpuBootPanel.destroy === 'function') {
+          gpuBootPanel.destroy();
+        }
         void app.destroy();
       });
 

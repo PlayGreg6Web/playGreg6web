@@ -5,6 +5,9 @@ import bootstrapDefault, {
   DEFAULT_LOADER_URL,
   PlayGta6AppHandle,
   bootstrapPlayGta6App,
+  detectWasm64,
+  extractBootAssetUrls,
+  resolveDefaultGameBase,
 } from '../web/app_bootstrap.js';
 import { SESSION_MODE, SESSION_STATE } from '../web/runtime/session_controller.js';
 import { SmokeDemoRunner } from '../web/demo/run_smoke_demo.js';
@@ -933,4 +936,748 @@ test('W45 wires BootTracer, SplashOverlayController, and BootOrchestrator throug
   await app.destroy();
   assert.equal(app.splashOverlay.getState().destroyed, true);
   assert.equal(app.bootOrchestrator.getState().destroyed, true);
+});
+
+test('W49 startWasmRuntime forwards bootBase, shaderPackUrl, reflectionManifestUrl, and pgimUrl from /api/status', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+  const { createWorkerBootInitPayloads } = require('../web/loader.js');
+
+  const clock = createClock(7000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+  webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  const workerCalls = [];
+  const postedMessages = [];
+  const mockWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      postedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+
+  const statusPayload = {
+    ok: true,
+    coopCoep: true,
+    dataDirConfigured: true,
+    hasManifest: true,
+    hasBootset: true,
+    hasWasmBinary: true,
+    shaderPackCount: 1,
+    shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    reflectionManifestUrl: '/shaders/reflection-manifest.json',
+    pgimUrl: '/boot/guest.pgim',
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch(statusPayload),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      workerCalls.push(args);
+      return mockWorker;
+    },
+  });
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(workerCalls.length, 1);
+  assert.equal(postedMessages.length, 1);
+
+  assert.equal(workerCalls[0].bootBase, 'https://playgta6.local/boot/');
+  assert.equal(workerCalls[0].shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(workerCalls[0].reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(workerCalls[0].pgimUrl, '/boot/guest.pgim');
+
+  const initPayload = postedMessages[0].payload;
+  assert.equal(initPayload.bootBase, 'https://playgta6.local/boot/');
+  assert.equal(initPayload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(initPayload.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(initPayload.pgimUrl, '/boot/guest.pgim');
+
+  // Verify W47 loader init payload forwarding consumes the exact fields posted by app_bootstrap.
+  const workerInits = createWorkerBootInitPayloads(initPayload);
+  assert.equal(workerInits.ioInit.bootBase, 'https://playgta6.local/boot/');
+  assert.equal(workerInits.ioInit.pgimUrl, '/boot/guest.pgim');
+  assert.equal(workerInits.gpuInit.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(workerInits.gpuInit.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+
+  await app.destroy();
+
+  // Also verify BootOrchestrator discovery path and default '/boot/' fallback when location.origin is absent.
+  const orchWorkerCalls = [];
+  const orchPostedMessages = [];
+  const orchWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      orchPostedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+  const hostNoOrigin = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  hostNoOrigin.windowObj.location = { origin: 'null' };
+
+  const orchApp = bootstrapPlayGta6App({
+    windowObj: hostNoOrigin.windowObj,
+    documentObj: hostNoOrigin.documentObj,
+    navigatorObj: hostNoOrigin.navigatorObj,
+    fetchImpl: createMockFetch(statusPayload),
+    canvas: webgpu.canvas,
+    hud,
+    enableBootOrchestrator: true,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      orchWorkerCalls.push(args);
+      return orchWorker;
+    },
+  });
+
+  const orchStarted = await orchApp.start();
+  assert.equal(orchStarted.ok, true);
+  assert.equal(orchStarted.mode, SESSION_MODE.WASM);
+  assert.equal(orchWorkerCalls.length, 1);
+  assert.equal(orchPostedMessages.length, 1);
+
+  assert.equal(orchWorkerCalls[0].bootBase, '/boot/');
+  assert.equal(orchWorkerCalls[0].shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(orchWorkerCalls[0].reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(orchWorkerCalls[0].pgimUrl, '/boot/guest.pgim');
+
+  assert.equal(orchPostedMessages[0].payload.bootBase, '/boot/');
+  assert.equal(orchPostedMessages[0].payload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(orchPostedMessages[0].payload.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(orchPostedMessages[0].payload.pgimUrl, '/boot/guest.pgim');
+
+  await orchApp.destroy();
+});
+
+test('W54 resolveDefaultGameBase and extractBootAssetUrls discover gameBase and programManifestUrl', () => {
+  assert.equal(
+    resolveDefaultGameBase({ gameBase: 'https://cdn.local/custom-game/' }, { location: { origin: 'https://playgta6.local' } }),
+    'https://cdn.local/custom-game/'
+  );
+  assert.equal(
+    resolveDefaultGameBase({}, { location: { origin: 'https://playgta6.local' } }),
+    'https://playgta6.local/game/'
+  );
+  assert.equal(resolveDefaultGameBase({}, { location: { origin: 'null' } }), '/game/');
+  assert.equal(resolveDefaultGameBase({}, null), '/game/');
+
+  assert.deepEqual(
+    extractBootAssetUrls({
+      bootBase: '/boot/',
+      gameBase: '/game-alt/',
+      shaderPackUrl: '/shaders/pack.wgsl',
+      reflectionManifestUrl: '/shaders/reflection.json',
+      pgimUrl: '/boot/guest.pgim',
+      programManifestUrl: '/boot/program-manifest.json',
+    }),
+    {
+      bootBase: '/boot/',
+      gameBase: '/game-alt/',
+      shaderPackUrl: '/shaders/pack.wgsl',
+      reflectionManifestUrl: '/shaders/reflection.json',
+      pgimUrl: '/boot/guest.pgim',
+      programManifestUrl: '/boot/program-manifest.json',
+    }
+  );
+
+  assert.deepEqual(
+    extractBootAssetUrls({
+      programManifest: { url: '/boot/alt-program-manifest.json' },
+    }),
+    {
+      programManifestUrl: '/boot/alt-program-manifest.json',
+    }
+  );
+});
+
+test('W54 startWasmRuntime forwards gameBase and programManifestUrl into createWasmWorker and worker.postMessage', async () => {
+  const clock = createClock(8000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+  webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  const workerCalls = [];
+  const postedMessages = [];
+  const mockWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      postedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+
+  const statusPayload = {
+    ok: true,
+    coopCoep: true,
+    dataDirConfigured: true,
+    hasManifest: true,
+    hasBootset: true,
+    hasWasmBinary: true,
+    shaderPackCount: 2,
+    shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    reflectionManifestUrl: '/shaders/reflection-manifest.json',
+    pgimUrl: '/boot/guest.pgim',
+    programManifestUrl: '/boot/program-manifest.json',
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch(statusPayload),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      workerCalls.push(args);
+      return mockWorker;
+    },
+  });
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(workerCalls.length, 1);
+  assert.equal(postedMessages.length, 1);
+
+  assert.equal(workerCalls[0].bootBase, 'https://playgta6.local/boot/');
+  assert.equal(workerCalls[0].gameBase, 'https://playgta6.local/game/');
+  assert.equal(workerCalls[0].shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(workerCalls[0].reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(workerCalls[0].pgimUrl, '/boot/guest.pgim');
+  assert.equal(workerCalls[0].programManifestUrl, '/boot/program-manifest.json');
+
+  const initPayload = postedMessages[0].payload;
+  assert.equal(initPayload.bootBase, 'https://playgta6.local/boot/');
+  assert.equal(initPayload.gameBase, 'https://playgta6.local/game/');
+  assert.equal(initPayload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(initPayload.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(initPayload.pgimUrl, '/boot/guest.pgim');
+  assert.equal(initPayload.programManifestUrl, '/boot/program-manifest.json');
+
+  await app.destroy();
+
+  // Verify discovered gameBase + programManifest alias and '/game/' fallback when origin is 'null'.
+  const altWorkerCalls = [];
+  const altPostedMessages = [];
+  const altWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      altPostedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+  const hostNoOrigin = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  hostNoOrigin.windowObj.location = { origin: 'null' };
+
+  const altApp = bootstrapPlayGta6App({
+    windowObj: hostNoOrigin.windowObj,
+    documentObj: hostNoOrigin.documentObj,
+    navigatorObj: hostNoOrigin.navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      hasWasmBinary: true,
+      gameBase: '/custom-game-root/',
+      programManifest: '/boot/alias-program-manifest.json',
+      pgimUrl: '/boot/guest.pgim',
+    }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      altWorkerCalls.push(args);
+      return altWorker;
+    },
+  });
+
+  const altStarted = await altApp.start();
+  assert.equal(altStarted.ok, true);
+  assert.equal(altWorkerCalls[0].gameBase, '/custom-game-root/');
+  assert.equal(altWorkerCalls[0].programManifestUrl, '/boot/alias-program-manifest.json');
+  assert.equal(altPostedMessages[0].payload.gameBase, '/custom-game-root/');
+  assert.equal(altPostedMessages[0].payload.programManifestUrl, '/boot/alias-program-manifest.json');
+
+  await altApp.destroy();
+
+  // Verify '/game/' default fallback when neither options.gameBase, status.gameBase, nor valid origin is set.
+  const fallbackWorkerCalls = [];
+  const fallbackPostedMessages = [];
+  const fallbackWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      fallbackPostedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+
+  const fallbackApp = bootstrapPlayGta6App({
+    windowObj: hostNoOrigin.windowObj,
+    documentObj: hostNoOrigin.documentObj,
+    navigatorObj: hostNoOrigin.navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      fallbackWorkerCalls.push(args);
+      return fallbackWorker;
+    },
+  });
+
+  const fallbackStarted = await fallbackApp.start();
+  assert.equal(fallbackStarted.ok, true);
+  assert.equal(fallbackWorkerCalls[0].gameBase, '/game/');
+  assert.equal(fallbackPostedMessages[0].payload.gameBase, '/game/');
+  assert.equal(fallbackWorkerCalls[0].programManifestUrl, undefined);
+  assert.equal(fallbackPostedMessages[0].payload.programManifestUrl, undefined);
+
+  await fallbackApp.destroy();
+});
+
+test('W54 connects BootTracer updates and worker gpu-telemetry events to injected gpuBootPanel and cleans up on destroy', async () => {
+  const clock = createClock(9000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const panelUpdates = [];
+  let panelDestroyCalls = 0;
+  const mockGpuBootPanel = {
+    update(snapshot) {
+      panelUpdates.push(snapshot);
+    },
+    destroy() {
+      panelDestroyCalls += 1;
+    },
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    gpuBootPanel: mockGpuBootPanel,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  assert.equal(app.gpuBootPanel, mockGpuBootPanel);
+  assert.equal(panelUpdates.length, 0);
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(mockWorker.listenerCount('message'), 1);
+
+  // BootTracer milestone updates flow into gpuBootPanel.update({ bootSummary }).
+  app.bootTracer.markMilestone('PGIM_LOAD');
+  assert.equal(panelUpdates.length, 1);
+  assert.equal(panelUpdates[0].bootSummary.stage, 'PGIM_LOAD');
+  assert.equal(panelUpdates[0].bootSummary.milestonesReached, 1);
+
+  // BootTracer ingestLogLine updates flow once (without duplicate updates).
+  app.bootTracer.ingestLogLine('[boot] D3D12_CREATE_DEVICE');
+  assert.equal(panelUpdates.length, 2);
+  assert.equal(panelUpdates[1].bootSummary.stage, 'D3D12_CREATE_DEVICE');
+
+  // Unrelated log lines do not emit spurious panel updates.
+  app.bootTracer.ingestLogLine('ordinary non-milestone message');
+  assert.equal(panelUpdates.length, 2);
+
+  // Worker gpu-telemetry messages forward bootSummary, frameStats, fallbackStats, missingShaders.
+  const frameStats = { framesPresented: 4, droppedFrames: 1 };
+  const fallbackStats = { totalLookups: 10, packHits: 8, fallbackHits: 2, builtinHits: 0 };
+  const missingShaders = [{ hash: '0x00000000deadbeef', stage: 'fragment', hits: 2 }];
+
+  mockWorker.dispatch('message', {
+    data: {
+      type: 'gpu-telemetry',
+      frameStats,
+      fallbackStats,
+      missingShaders,
+    },
+  });
+
+  assert.equal(panelUpdates.length, 3);
+  assert.equal(panelUpdates[2].bootSummary.stage, 'D3D12_CREATE_DEVICE');
+  assert.deepEqual(panelUpdates[2].frameStats, frameStats);
+  assert.deepEqual(panelUpdates[2].fallbackStats, fallbackStats);
+  assert.deepEqual(panelUpdates[2].missingShaders, missingShaders);
+
+  // Non-telemetry worker messages are ignored.
+  mockWorker.dispatch('message', { data: { type: 'other-event', ok: true } });
+  assert.equal(panelUpdates.length, 3);
+
+  // destroy() removes worker and tracer hooks, and does NOT destroy an externally-owned gpuBootPanel.
+  await app.destroy();
+  assert.equal(mockWorker.listenerCount('message'), 0);
+  assert.equal(mockWorker.listenerCount(), 0);
+  assert.equal(panelDestroyCalls, 0);
+
+  // Subsequent worker telemetry or BootTracer calls after destroy() must not invoke gpuBootPanel.update().
+  mockWorker.dispatch('message', {
+    data: { type: 'gpu-telemetry', frameStats: { framesPresented: 99, droppedFrames: 0 } },
+  });
+  app.bootTracer.markMilestone('FIRST_PRESENT');
+  assert.equal(panelUpdates.length, 3);
+});
+
+test('W54 constructs owned GpuBootPanelController from gpuBootPanelRoot and globalThis auto-discovery and destroys on teardown', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const gpuBootPanelApi = require('../web/ui/gpu_boot_panel.js');
+  const { GpuBootPanelController } = gpuBootPanelApi;
+
+  const clock = createClock(10000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  function makeMockDomNode(tag = 'div') {
+    const attrs = new Map();
+    const listeners = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      parentNode: null,
+      children: [],
+      style: {},
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        listeners.get(type)?.delete(fn);
+      },
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  const panelRoot = makeMockDomNode('div');
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  documentObj.head = makeMockDomNode('head');
+  documentObj.createElement = (tag) => makeMockDomNode(tag);
+  documentObj.querySelector = () => null;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  // Auto-discover via globalThis.PlayGta6GpuBootPanel.GpuBootPanelController (no GpuBootPanelCtor passed).
+  const prevGlobal = globalThis.PlayGta6GpuBootPanel;
+  globalThis.PlayGta6GpuBootPanel = gpuBootPanelApi;
+  let app = null;
+  try {
+    app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: true }),
+      canvas: webgpu.canvas,
+      hud,
+      gpuBootPanelRoot: panelRoot,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    assert.ok(app.gpuBootPanel instanceof GpuBootPanelController);
+    assert.equal(panelRoot.children.length, 1);
+
+    const started = await app.start();
+    assert.equal(started.ok, true);
+
+    app.bootTracer.markMilestone('FIRST_PRESENT');
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        frameStats: { framesPresented: 7, droppedFrames: 0 },
+        fallbackStats: { totalLookups: 20, packHits: 18, fallbackHits: 2, builtinHits: 0 },
+        missingShaders: [{ hash: '0x1234', stage: 'vertex', hits: 2 }],
+      },
+    });
+
+    const state = app.gpuBootPanel.getState();
+    assert.equal(state.boot.stage, 'FIRST_PRESENT');
+    assert.equal(state.boot.readyForSplash, true);
+    assert.equal(state.frameStats.framesPresented, 7);
+    assert.equal(state.fallbackStats.packHits, 18);
+    assert.equal(state.totalMissingShaders, 1);
+    assert.equal(state.missingShaders[0].hash, '0x0000000000001234');
+
+    await app.destroy();
+    assert.equal(app.gpuBootPanel.getState().destroyed, true);
+    assert.equal(panelRoot.children.length, 0);
+    assert.equal(mockWorker.listenerCount(), 0);
+  } finally {
+    if (app && !app.destroyed) {
+      await app.destroy();
+    }
+    if (prevGlobal === undefined) {
+      delete globalThis.PlayGta6GpuBootPanel;
+    } else {
+      globalThis.PlayGta6GpuBootPanel = prevGlobal;
+    }
+  }
+});
+
+test('W58 detectWasm64 supports spec-standard address: i64, legacy index: i64, and rejects non-Wasm64 engines', () => {
+  // Simulates WebIDL ToNumber coercion on i32 memory limits, which throws TypeError on BigInt.
+  function assertI32Limit(value) {
+    return +value;
+  }
+
+  // 1. Modern Chrome/V8/Firefox/Node engine accepting only `{ address: 'i64' }` with BigInt limits.
+  const modernCalls = [];
+  const modernWasmApi = {
+    Memory: class MockModernMemory {
+      constructor(desc) {
+        modernCalls.push(desc);
+        if (desc.address === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(modernWasmApi), true);
+  assert.equal(modernCalls.length, 1);
+  assert.equal(modernCalls[0].address, 'i64');
+  assert.equal(modernCalls[0].initial, 1n);
+  assert.equal(modernCalls[0].maximum, 2n);
+
+  // 2. Older memory64 proposal engine accepting only legacy `{ index: 'i64' }`.
+  const legacyCalls = [];
+  const legacyWasmApi = {
+    Memory: class MockLegacyMemory {
+      constructor(desc) {
+        legacyCalls.push(desc);
+        if (desc.index === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        // Unknown `address` key is ignored -> treated as i32 -> BigInt throws TypeError.
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(legacyWasmApi), true);
+  assert.equal(legacyCalls.length, 2);
+  assert.equal(legacyCalls[0].address, 'i64');
+  assert.equal(legacyCalls[1].index, 'i64');
+
+  // 3. Non-Wasm64 engine that ignores both keys and throws on BigInt initial/maximum.
+  const wasm32Calls = [];
+  const wasm32OnlyApi = {
+    Memory: class MockWasm32Memory {
+      constructor(desc) {
+        wasm32Calls.push(desc);
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(wasm32OnlyApi), false);
+  assert.equal(wasm32Calls.length, 2);
+  assert.equal(wasm32Calls[0].address, 'i64');
+  assert.equal(wasm32Calls[1].index, 'i64');
+
+  // 4. Defensive edge cases: missing API or mock whose type reflection reports i32.
+  assert.equal(detectWasm64(null), false);
+  assert.equal(detectWasm64(undefined), false);
+  assert.equal(detectWasm64({}), false);
+  assert.equal(
+    detectWasm64({
+      Memory: class MockI32ReflectingMemory {
+        type() {
+          return { minimum: 1, maximum: 2, address: 'i32' };
+        }
+      },
+    }),
+    false
+  );
+});
+
+test('W58 bootstrapPlayGta6App capability probe reports wasm64 for address: i64, legacy index: i64, and non-Wasm64 engines', async () => {
+  async function probeWithWebAssembly(mockWebAssembly) {
+    const clock = createClock(11000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.WebAssembly = mockWebAssembly;
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      raf: raf.raf,
+      cancelRaf: raf.cancelRaf,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+
+    try {
+      const env = await app.session.probeEnvironment();
+      return env.capabilities.wasm64;
+    } finally {
+      await app.destroy();
+    }
+  }
+
+  // Modern engine accepting only `{ address: 'i64' }`.
+  const modernResult = await probeWithWebAssembly({
+    Memory: class MockModernMemory {
+      constructor(desc) {
+        if (desc.address !== 'i64') {
+          return +desc.initial;
+        }
+      }
+    },
+  });
+  assert.equal(modernResult, true);
+
+  // Legacy engine accepting only `{ index: 'i64' }`.
+  const legacyResult = await probeWithWebAssembly({
+    Memory: class MockLegacyMemory {
+      constructor(desc) {
+        if (desc.index !== 'i64') {
+          return +desc.initial;
+        }
+      }
+    },
+  });
+  assert.equal(legacyResult, true);
+
+  // Non-Wasm64 engine rejecting BigInt/i64 memory.
+  const wasm32Result = await probeWithWebAssembly({
+    Memory: class MockWasm32Memory {
+      constructor(desc) {
+        return +desc.initial;
+      }
+    },
+  });
+  assert.equal(wasm32Result, false);
+
+  // Explicitly absent WebAssembly API on windowObj.
+  const absentResult = await probeWithWebAssembly(null);
+  assert.equal(absentResult, false);
 });

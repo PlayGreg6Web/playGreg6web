@@ -77,9 +77,10 @@
 //     a directory of the /userdata overlay).
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
 //     (returns Disabled: the runtime presents SDR).
+//   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
+//     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XGameSave {704c3f58-...}, XSpeechSynthesizer
-//     {3e241977-...}, XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
+//     XGameSave {704c3f58-...}, XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
 //     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
 //   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
 //     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
@@ -974,6 +975,29 @@ public:
     }
 };
 
+// XSpeechSynthesizer. The runtime has no speech synthesizer: creation fails, and the title's
+// own failure path runs (no handle is invented).
+class SpeechApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XSpeechSynthesizer";
+
+    // s9: XSpeechSynthesizerCreate(XSpeechSynthesizerHandle*). The executable passes the address
+    // of a handle field that is still null and runs its setup only on success.
+    int32_t Create(GuestPtr<uint64_t> handle) {
+        if (handle.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        handle.write(0);
+        if (!logged_.exchange(true)) {
+            os::log("xgameruntime: XSpeechSynthesizerCreate: no speech synthesizer; returning E_NOTIMPL");
+        }
+        return com::E_NOTIMPL_HR;
+    }
+
+private:
+    std::atomic<bool> logged_{false};
+};
+
 // XSystemAnalyticsInfo (x64): two XVersion (four uint16 each) and two 64-byte strings.
 struct GuestAnalyticsInfo {
     uint16_t os_version[4];       // major, minor, build, revision
@@ -1195,8 +1219,12 @@ constexpr auto kPlsTable = slot_table<2>({
 });
 constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocalStorageApi>(
     "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});
-constexpr auto kISpeech = com::declare_interface<StubApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid, {},
-                                                          {.slot_count = 32});
+using SP = M<SpeechApi>;
+constexpr auto kSpeechTable = slot_table<7>({
+    {9, SP::method<&SpeechApi::Create>("XSpeechSynthesizerCreate")},
+});
+constexpr auto kISpeech = com::declare_interface<SpeechApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid,
+                                                            kSpeechTable.slots, {.slot_count = 32});
 constexpr auto kIEvent = com::declare_interface<StubApi>("xgameruntime.XGameEvent", kEventGuid, {},
                                                          {.slot_count = 16});
 constexpr auto kIDisplay = com::declare_interface<StubApi>("xgameruntime.{1b339674} (XDisplay?)", kDisplayGuid,
@@ -1248,7 +1276,7 @@ const ApiEntry kApis[] = {
     {kStoreProvider, kStoreExtIid, &kIStoreExt.info, [] { return make<StubApi>(kIStoreExt); }},
     {kPlsProvider, kPlsIid, &kIPersistentLocalStorage.info,
      [] { return make<PersistentLocalStorageApi>(kIPersistentLocalStorage); }},
-    {kSpeechProvider, kSpeechIid, &kISpeech.info, [] { return make<StubApi>(kISpeech); }},
+    {kSpeechProvider, kSpeechIid, &kISpeech.info, [] { return make<SpeechApi>(kISpeech); }},
     {kEventGuid, kEventGuid, &kIEvent.info, [] { return make<StubApi>(kIEvent); }},
     {kDisplayGuid, kDisplayGuid, &kIDisplay.info, [] { return make<StubApi>(kIDisplay); }},
     {kUnmapped3Provider, kUnmapped3Iid, &kIUnmapped3.info, [] { return make<HdrModeApi>(kIUnmapped3); }},

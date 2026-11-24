@@ -3,11 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { bootstrapPlayGta6App } from '../web/app_bootstrap.js';
-import { HudController, DEFAULT_FILENAMES } from '../web/ui/hud_controller.js';
+import { HudController, HUD_ACTIONS, DEFAULT_FILENAMES } from '../web/ui/hud_controller.js';
 import { SESSION_STATE, SESSION_MODE } from '../web/runtime/session_controller.js';
+
+const require = createRequire(import.meta.url);
+const { GpuBootPanelController, EXPORT_FORMAT } = require('../web/ui/gpu_boot_panel.js');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -472,7 +476,10 @@ test('web/index.html preserves all HUD IDs and adds Controls & Diagnostics eleme
     'btn-clear-cache',
     'btn-export-saves',
     'btn-export-crash',
+    'btn-export-missing-shaders',
     'select-input-profile',
+    // Frame-1 GPU & missing-shader diagnostics panel (W55)
+    'gpu-boot-panel-root',
   ];
 
   for (const id of requiredIds) {
@@ -842,4 +849,144 @@ test('web/index.html wires W45 splash overlay root, UMD boot scripts, and global
   assert.match(moduleScript, /splashContainer:\s*splashOverlayRoot/);
   assert.match(moduleScript, /window\.playgta6SplashOverlay\s*=\s*app\.splashOverlay/);
   assert.match(moduleScript, /window\.playgta6BootOrchestrator\s*=\s*app\.bootOrchestrator/);
+});
+
+test('web/index.html wires W55 GpuBootPanelController script, #gpu-boot-panel-root container, bootstrap option, and HUD export control', async () => {
+  assert.match(indexHtml, /<script\s+src="\.\/ui\/gpu_boot_panel\.js"><\/script>/);
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, 'web', 'ui', 'gpu_boot_panel.js')), true);
+
+  // #gpu-boot-panel-root must live inside #hud-body.
+  const hudBodyIdx = indexHtml.indexOf('id="hud-body"');
+  const panelRootIdx = indexHtml.indexOf('id="gpu-boot-panel-root"');
+  const scriptIdx = indexHtml.indexOf('<script src="./ui/gpu_boot_panel.js">');
+  assert.ok(hudBodyIdx !== -1 && panelRootIdx > hudBodyIdx && panelRootIdx < scriptIdx);
+  assert.match(indexHtml, /id="btn-export-missing-shaders"/);
+
+  const moduleScript = extractModuleScript(indexHtml);
+  assert.match(moduleScript, /getElementById\(\s*['"]gpu-boot-panel-root['"]\s*\)/);
+  assert.match(moduleScript, /getElementById\(\s*['"]btn-export-missing-shaders['"]\s*\)/);
+  assert.match(moduleScript, /bootstrapPlayGta6App\(\{[\s\S]*\bgpuBootPanelRoot\b[\s\S]*\}\)/);
+  assert.match(moduleScript, /PlayGta6GpuBootPanel\?\.\s*GpuBootPanelController/);
+  assert.match(moduleScript, /onExportMissingShaders\s*\(/);
+  assert.match(moduleScript, /playgta6-missing-shaders\.json/);
+  assert.match(moduleScript, /new\s+HudController\(\{[\s\S]*\bgpuBootPanel\b[\s\S]*\}\)/);
+  assert.match(moduleScript, /exportMissingShadersBtn/);
+  assert.match(moduleScript, /window\.playgta6GpuBootPanel\s*=\s*gpuBootPanel/);
+  assert.match(moduleScript, /gpuBootPanel\.destroy\(\)/);
+
+  // Integration check: mount real GpuBootPanelController into mock #gpu-boot-panel-root
+  // and wire it with HudController using the same guard pattern as web/index.html.
+  function createPanelMockElement(tagName = 'DIV') {
+    const el = createMockEventTarget({
+      tagName: tagName.toUpperCase(),
+      className: '',
+      hidden: false,
+      style: {},
+      parentNode: null,
+    });
+    const baseAppend = el.appendChild.bind(el);
+    el.appendChild = (child) => {
+      if (child && typeof child === 'object') {
+        child.parentNode = el;
+      }
+      return baseAppend(child);
+    };
+    el.removeChild = (child) => {
+      const idx = el.children.indexOf(child);
+      if (idx !== -1) {
+        el.children.splice(idx, 1);
+      }
+      if (child && typeof child === 'object') {
+        child.parentNode = null;
+      }
+      return child;
+    };
+    return el;
+  }
+
+  const head = createPanelMockElement('HEAD');
+  const panelRoot = createPanelMockElement('DIV');
+  const exportBtn = createMockEventTarget({ textContent: 'Missing Shaders' });
+  const panelDoc = {
+    head,
+    body: createPanelMockElement('BODY'),
+    createElement(tag) {
+      return createPanelMockElement(tag);
+    },
+    querySelector() {
+      return null;
+    },
+  };
+
+  const downloads = [];
+  const hud = createMockHud();
+  let hudController = null;
+
+  const gpuBootPanel = new GpuBootPanelController({
+    container: panelRoot,
+    documentObj: panelDoc,
+    collapsed: true,
+    now: () => 1700000000000,
+    onExportMissingShaders(jsonText) {
+      if (hudController && hudController.isExportingMissingShaders) {
+        return;
+      }
+      downloads.push({
+        source: 'panel',
+        filename: DEFAULT_FILENAMES.MISSING_SHADERS,
+        data: jsonText,
+        mimeType: 'application/json',
+      });
+    },
+  });
+
+  assert.equal(panelRoot.children.length, 1, 'GpuBootPanelController must mount into #gpu-boot-panel-root');
+
+  hudController = new HudController({
+    hud,
+    gpuBootPanel,
+    downloadBlob(filename, data, mimeType) {
+      downloads.push({ source: 'hud', filename, data, mimeType });
+    },
+  });
+
+  hudController.bindButtons({ exportMissingShadersBtn: exportBtn });
+
+  const state = hudController.updateGpuBootTelemetry({
+    bootSummary: { stage: 'D3D12_CREATE_DEVICE', milestonesReached: 7, totalMilestones: 9 },
+    frameStats: { framesPresented: 2, droppedFrames: 0 },
+    fallbackStats: { totalLookups: 4, packHits: 3, fallbackHits: 1, builtinHits: 0 },
+    missingShaders: [
+      { hash: '0x00000000deadbeef', stage: 'fragment', hits: 5, hostPath: 'C:\\secret\\path.dxil' },
+    ],
+  });
+
+  assert.equal(state.boot.stage, 'D3D12_CREATE_DEVICE');
+  assert.equal(state.totalMissingShaders, 1);
+
+  // Clicking #btn-export-missing-shaders should download exactly once (via HudController).
+  exportBtn.dispatch('click');
+  await flushMicrotasks();
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].source, 'hud');
+  assert.equal(downloads[0].filename, DEFAULT_FILENAMES.MISSING_SHADERS);
+  assert.equal(downloads[0].mimeType, 'application/json');
+  assert.doesNotMatch(downloads[0].data, /secret/);
+
+  const parsed = JSON.parse(downloads[0].data);
+  assert.equal(parsed.format, EXPORT_FORMAT);
+  assert.equal(parsed.missingShaderCount, 1);
+  assert.equal(parsed.missingShaders[0].hash, '0x00000000deadbeef');
+  assert.equal(hudController.getState().lastAction?.action, HUD_ACTIONS.EXPORT_MISSING_SHADERS);
+  assert.equal(hudController.getState().lastAction?.ok, true);
+
+  // Direct export on panel triggers panel's own onExportMissingShaders download helper.
+  gpuBootPanel.exportMissingShadersJson();
+  assert.equal(downloads.length, 2);
+  assert.equal(downloads[1].source, 'panel');
+
+  hudController.destroy();
+  gpuBootPanel.destroy();
+  assert.equal(exportBtn.listenerCount('click'), 0);
+  assert.equal(panelRoot.children.length, 0);
 });

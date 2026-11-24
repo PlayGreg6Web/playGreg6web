@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include "os/os_shim.h"
+#include "os/surface_blocks.h"
+#include "os/xbox_scarlett.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -88,14 +90,28 @@ void Device::register_shader_module(uint64_t identity, uint32_t module_id) {
                               unresolved_shaders_.end());
 }
 
-void Device::note_unresolved_shader(uint64_t identity) {
+void Device::note_unresolved_shader(uint64_t identity, ShaderStage stage) {
+    static constexpr const char* kStageNames[] = {"vertex", "pixel", "compute"};
+    const size_t index = static_cast<size_t>(stage);
     std::lock_guard<std::mutex> lock(shader_mutex_);
     if (std::find(unresolved_shaders_.begin(), unresolved_shaders_.end(), identity) == unresolved_shaders_.end()) {
         unresolved_shaders_.push_back(identity);
+        ++unresolved_by_stage_[index];
         char name[24];
         std::snprintf(name, sizeof(name), "0x%016" PRIx64, identity);
-        os::log(std::string("d3d12_xs: no shader module for DXIL identity ") + name + " (draws with it are skipped)");
+        os::log(std::string("d3d12_xs: no shader module for DXIL identity ") + name + " (" + kStageNames[index] +
+                " shader; " + (stage == ShaderStage::Compute ? "dispatches" : "draws") + " with it are skipped)");
     }
+}
+
+std::array<uint32_t, 3> Device::unresolved_shader_stages() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return unresolved_by_stage_;
+}
+
+std::array<uint32_t, 3> Device::root_signature_versions() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return root_signature_versions_;
 }
 
 std::vector<uint64_t> Device::unresolved_shaders() const {
@@ -193,7 +209,24 @@ Resource::~Resource() {
     if (owned_guest_memory_ != 0) {
         com::guest_memory().release(owned_guest_memory_);
     }
+    if (xmem_memory_ != nullptr) {
+        pg6_xbox_XMemFree(xmem_memory_, kD3D12ResourceXMemAttributes);
+    }
     device_->resources.fetch_sub(1);
+}
+
+uint64_t committed_memory_size(const GuestResourceDesc& d) {
+    // The 64 KiB-block surface size where os/surface_blocks.h covers the resource, else the
+    // linear estimate.
+    const DxgiFormatLayout l = dxgi_format_layout(d.Format);
+    os::surface::Block64kLayout block{};
+    if (d.Dimension == ResourceDimension::Texture2D && d.MipLevels <= 1 && d.DepthOrArraySize <= 1 &&
+        d.SampleCount <= 1 && l.known && l.block_width == 1 && l.block_height == 1 && l.planes == 1 &&
+        d.Width <= 0xFFFFFFFFull &&
+        os::surface::block64k_layout_2d(static_cast<uint32_t>(d.Width), d.Height, l.block_bytes, &block)) {
+        return block.size_bytes;
+    }
+    return resource_size_estimate(d);
 }
 
 uint32_t Resource::array_layers() const {
@@ -259,6 +292,19 @@ bool Resource::initialize() {
         mips_ = desc_.MipLevels == 0 ? full_mip_count(desc_) : desc_.MipLevels;
         const bool depth = (desc_.Flags & ResourceFlags::AllowDepthStencil) != 0;
         const bool rt = (desc_.Flags & ResourceFlags::AllowRenderTarget) != 0;
+        if (rt && !depth && !placement_.placed_heap && !placement_.reserved && placement_.address == 0) {
+            // The console's D3D12 allocates committed-resource memory with XMemAlloc, so a
+            // title's XMem allocation hooks see it (and may place it in arenas of their own).
+            // Only committed render targets for now: they are what the boot shows (other
+            // resource kinds are left as they were until a title shows their accounting).
+            const uint64_t size = committed_memory_size(desc_);
+            xmem_memory_ = pg6_xbox_XMemAlloc(static_cast<size_t>(size), kD3D12ResourceXMemAttributes);
+            if (xmem_memory_ == nullptr) {
+                dev.note_bad_argument("XMemAlloc of " + std::to_string(size) + " bytes for a render target failed");
+                id_ = 0;
+                return false;
+            }
+        }
         const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
                                              : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
         const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(desc_.Format), usage,
@@ -466,9 +512,17 @@ ResourceDesc1Result Resource::GetDesc1() {
 // ---------------------------------------------------------------------------------------------
 
 namespace {
+// Xbox: a texture's layout field may also hold 0x100 | an XG swizzle mode. The executable builds
+// 0x100, 0x102, 0x10A and 0x100 | a per-texture mode byte itself, and XGSuggestSwizzleMode writes
+// into that field (kXgDefaultSwizzleMode). The guest layer keeps no CPU image of textures, so the
+// mode does not change what is created; it is accepted, not interpreted.
+bool xbox_swizzle_layout(uint32_t layout) { return (layout & ~0xFFu) == 0x100u; }
+
 bool validate_desc(Device& dev, const GuestResourceDesc& d) {
+    const bool layout_ok =
+        d.Layout <= 3 || (d.Dimension != ResourceDimension::Buffer && xbox_swizzle_layout(d.Layout));
     if (d.Dimension < ResourceDimension::Buffer || d.Dimension > ResourceDimension::Texture3D || d.Width == 0 ||
-        d.Layout > 3) {
+        !layout_ok) {
         dev.note_bad_argument("invalid resource description (dimension " + std::to_string(d.Dimension) + ", width " +
                               std::to_string(d.Width) + ", layout " + std::to_string(d.Layout) + ")");
         return false;
@@ -1059,10 +1113,11 @@ HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& r
     state->identities_ = {d.vs, d.ps};
     state->resolved_ = (state->graphics_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
     if (!state->resolved_) {
-        for (uint64_t id : {d.vs, d.ps}) {
-            if (id != 0 && !shader_known(id)) {
-                note_unresolved_shader(id);
-            }
+        if (d.vs != 0 && !shader_known(d.vs)) {
+            note_unresolved_shader(d.vs, ShaderStage::Vertex);
+        }
+        if (d.ps != 0 && !shader_known(d.ps)) {
+            note_unresolved_shader(d.ps, ShaderStage::Pixel);
         }
     }
     state->source_ = std::move(src);
@@ -1114,7 +1169,7 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     state->identities_ = {d.cs};
     state->resolved_ = (state->compute_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
     if (!state->resolved_ && !shader_known(d.cs)) {
-        note_unresolved_shader(d.cs);
+        note_unresolved_shader(d.cs, ShaderStage::Compute);
     }
     return hand_out(std::move(state), riid, out);
 }

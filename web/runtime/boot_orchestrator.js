@@ -23,6 +23,13 @@
     DESTROYED: 'DESTROYED',
   });
 
+  /** Explicit boot mode distinguishing real Wasm64 guest boot vs smoke-demo fallback. */
+  const BOOT_MODE = Object.freeze({
+    PENDING: 'pending',
+    WASM_GUEST: 'wasm-guest',
+    SMOKE_DEMO: 'smoke-demo',
+  });
+
   function defaultFetchImpl() {
     if (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') {
       return globalThis.fetch.bind(globalThis);
@@ -140,11 +147,59 @@
     return null;
   }
 
+  function normalizeFirstPresentSource(value) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'wasm-guest' || normalized === 'wasm_guest') {
+      return BOOT_MODE.WASM_GUEST;
+    }
+    if (normalized === 'smoke-demo' || normalized === 'smoke_demo') {
+      return BOOT_MODE.SMOKE_DEMO;
+    }
+    return null;
+  }
+
+  function resolveFirstPresentSource(meta, bootMode) {
+    const explicit =
+      meta && typeof meta === 'object'
+        ? normalizeFirstPresentSource(meta.firstPresentSource) || normalizeFirstPresentSource(meta.source)
+        : null;
+    if (explicit) return explicit;
+    if (bootMode === BOOT_MODE.WASM_GUEST) return BOOT_MODE.WASM_GUEST;
+    if (bootMode === BOOT_MODE.SMOKE_DEMO) return BOOT_MODE.SMOKE_DEMO;
+    return null;
+  }
+
+  /**
+   * Returns true ONLY when the supplied orchestrator, state snapshot, assets object, or
+   * mode string represents a real Wasm64 guest boot (`bootMode === 'wasm-guest'`).
+   *
+   * @param {unknown} target
+   * @returns {boolean}
+   */
+  function isRealGuestBoot(target) {
+    if (typeof target === 'string') {
+      return target === BOOT_MODE.WASM_GUEST;
+    }
+    if (target && typeof target === 'object') {
+      if (typeof target.isRealGuestBoot === 'function') {
+        return target.isRealGuestBoot() === true;
+      }
+      if (typeof target.getState === 'function') {
+        const state = target.getState();
+        return Boolean(state && state.bootMode === BOOT_MODE.WASM_GUEST);
+      }
+      return target.bootMode === BOOT_MODE.WASM_GUEST;
+    }
+    return false;
+  }
+
   /**
    * Normalize `/api/status` JSON into the boot-discovery fields used by this orchestrator.
    * Accepts both the current server payload (`hasWasmBinary`, `shaderPackCount`) and the
-   * richer artifact URLs (`splashImage`, `pgimUrl`, `shaderPackUrl`, `reflectionManifestUrl`,
-   * `runtimeWasm`) that tests and later server revisions expose.
+   * richer artifact URLs (`splashImage`, `pgimUrl`, `programManifestUrl`, `gameBase`,
+   * `shaderPackUrl`, `reflectionManifestUrl`, `runtimeWasm`) that tests and later server
+   * revisions expose.
    */
   function discoverBootAssets(status) {
     const src = status && typeof status === 'object' ? status : {};
@@ -155,6 +210,11 @@
       urlFromArtifact(src.splash)
     );
     const pgimUrl = pickUrl(src.pgimUrl, src.pgim, urlFromArtifact(src.pgimImage));
+    const programManifestUrl = pickUrl(
+      src.programManifestUrl,
+      urlFromArtifact(src.programManifest)
+    );
+    const gameBase = pickUrl(src.gameBase, src.gameBaseUrl);
     const shaderPackUrl = pickUrl(src.shaderPackUrl, src.shaderPack, urlFromArtifact(src.wgslPack));
     const reflectionManifestUrl = pickUrl(
       src.reflectionManifestUrl,
@@ -165,15 +225,21 @@
     const runtimeArtifact = src.runtimeWasm !== undefined ? src.runtimeWasm : src.hasWasmBinary;
     const runtimeWasmUrl = urlFromArtifact(src.runtimeWasm) || (src.hasWasmBinary ? '/dist/runtime.wasm' : null);
     const runtimeWasmAvailable = presentFlag(runtimeArtifact) || src.hasWasmBinary === true;
+    const canLaunchGuest = runtimeWasmAvailable && Boolean(pgimUrl || programManifestUrl);
+    const bootMode = canLaunchGuest ? BOOT_MODE.WASM_GUEST : BOOT_MODE.SMOKE_DEMO;
 
     return {
       splashImage,
       pgimUrl,
+      programManifestUrl,
+      gameBase,
       shaderPackUrl,
       reflectionManifestUrl,
+      hasWasmBinary: runtimeWasmAvailable,
       runtimeWasm: runtimeWasmAvailable ? runtimeWasmUrl || true : null,
       runtimeWasmUrl: runtimeWasmAvailable ? runtimeWasmUrl : null,
       runtimeWasmAvailable,
+      bootMode,
     };
   }
 
@@ -250,6 +316,7 @@
       this._onFirstPresent = optionalFn(onFirstPresent, 'onFirstPresent');
 
       this._phase = BOOT_PHASE.IDLE;
+      this._bootMode = BOOT_MODE.PENDING;
       this._status = null;
       this._assets = null;
       this._bundle = null;
@@ -257,6 +324,7 @@
       this._fallbackReason = null;
       this._error = null;
       this._firstPresent = false;
+      this._firstPresentSource = null;
       this._destroyed = false;
       this._aborted = false;
       this._pgimLoadMarked = false;
@@ -266,9 +334,20 @@
       this._controller = new AbortController();
     }
 
+    /**
+     * Returns true ONLY when the orchestrator is running a real Wasm64 guest boot
+     * (`bootMode === 'wasm-guest'`).
+     */
+    isRealGuestBoot() {
+      return this._bootMode === BOOT_MODE.WASM_GUEST;
+    }
+
     getState() {
       return {
         phase: this._phase,
+        bootMode: this._bootMode,
+        programManifestUrl: this._assets ? this._assets.programManifestUrl : null,
+        gameBase: this._assets ? this._assets.gameBase : null,
         status: this._status ? { ...this._status } : null,
         assets: this._assets ? { ...this._assets } : null,
         bundle: this._bundle,
@@ -277,6 +356,7 @@
         fallbackReason: this._fallbackReason,
         error: this._error ? this._error.message : null,
         firstPresent: this._firstPresent,
+        firstPresentSource: this._firstPresentSource,
         destroyed: this._destroyed,
         aborted: this._aborted,
       };
@@ -289,6 +369,10 @@
       const event = {
         phase: nextPhase,
         previousPhase,
+        bootMode: this._bootMode,
+        programManifestUrl: this._assets ? this._assets.programManifestUrl : null,
+        gameBase: this._assets ? this._assets.gameBase : null,
+        firstPresentSource: this._firstPresentSource,
         status: this._status,
         assets: this._assets,
         bundle: this._bundle,
@@ -321,6 +405,9 @@
       const tracer = tracerSnapshot(this._bootTracer);
       const payload = {
         splashImage,
+        bootMode: this._bootMode,
+        programManifestUrl: this._assets ? this._assets.programManifestUrl : null,
+        gameBase: this._assets ? this._assets.gameBase : null,
         status: this._status,
         assets: this._assets,
         tracer,
@@ -367,6 +454,7 @@
 
       this._pushOverlay({
         phase: this._phase,
+        bootMode: this._bootMode,
         progress: this._progress,
         tracer: tracerSnapshot(this._bootTracer),
         status: this._status,
@@ -438,8 +526,8 @@
       if (!assets.runtimeWasmAvailable) {
         return 'No Wasm64 runtime binary available (runtimeWasm/hasWasmBinary); falling back to WebGPU G5 smoke demo.';
       }
-      if (!assets.pgimUrl) {
-        return 'No PGIM guest image URL (pgimUrl) discovered; falling back to WebGPU G5 smoke demo.';
+      if (!assets.pgimUrl && !assets.programManifestUrl) {
+        return 'No PGIM guest image URL (pgimUrl) or programManifestUrl discovered; falling back to WebGPU G5 smoke demo.';
       }
       return 'Runtime launch requirements were not met; falling back to WebGPU G5 smoke demo.';
     }
@@ -455,6 +543,7 @@
           ok: false,
           destroyed: true,
           phase: BOOT_PHASE.DESTROYED,
+          bootMode: this._bootMode,
           error: new Error('BootOrchestrator has been destroyed'),
         };
       }
@@ -470,7 +559,11 @@
           ok: true,
           alreadyStarted: true,
           phase: this._phase,
+          bootMode: this._bootMode,
+          programManifestUrl: this._assets ? this._assets.programManifestUrl : null,
+          gameBase: this._assets ? this._assets.gameBase : null,
           status: this._status,
+          assets: this._assets,
           bundle: this._bundle,
           fallbackReason: this._fallbackReason,
         };
@@ -501,6 +594,7 @@
     }
 
     async _startInternal(signal, token) {
+      this._bootMode = BOOT_MODE.PENDING;
       this._error = null;
       this._fallbackReason = null;
       this._bundle = null;
@@ -513,14 +607,22 @@
         this._setPhase(BOOT_PHASE.DISCOVERING);
         const status = await this._fetchStatus(signal);
         if (token !== this._sessionToken) {
-          return { ok: false, aborted: true, phase: this._phase };
+          return { ok: false, aborted: true, phase: this._phase, bootMode: this._bootMode };
         }
-        this._status = status;
         this._assets = discoverBootAssets(status);
+        this._status = {
+          ...status,
+          programManifestUrl: this._assets.programManifestUrl,
+          gameBase: this._assets.gameBase,
+          bootMode: this._assets.bootMode,
+        };
         this._initOverlay(this._assets.splashImage);
         this._pushOverlay({
           phase: this._phase,
-          status,
+          bootMode: this._bootMode,
+          programManifestUrl: this._assets.programManifestUrl,
+          gameBase: this._assets.gameBase,
+          status: this._status,
           assets: this._assets,
           tracer: tracerSnapshot(this._bootTracer),
           splashImage: this._assets.splashImage,
@@ -535,38 +637,42 @@
 
         throwIfAborted(signal);
         if (token !== this._sessionToken) {
-          return { ok: false, aborted: true, phase: this._phase };
+          return { ok: false, aborted: true, phase: this._phase, bootMode: this._bootMode };
         }
 
-        const canLaunch = this._assets.runtimeWasmAvailable && Boolean(this._assets.pgimUrl);
-        const launchPayload = {
-          status: this._status,
-          assets: this._assets,
-          bundle: this._bundle,
-          bootTracer: this._bootTracer,
-        };
+        const canLaunch =
+          this._assets.runtimeWasmAvailable &&
+          Boolean(this._assets.pgimUrl || this._assets.programManifestUrl);
 
         if (canLaunch) {
-          this._setPhase(BOOT_PHASE.LAUNCHING_RUNTIME);
-          await invokeQuietAsync(this._onLaunchRuntime, {
+          this._bootMode = BOOT_MODE.WASM_GUEST;
+          this._status = { ...this._status, bootMode: this._bootMode };
+          const launchPayload = {
+            bootMode: this._bootMode,
+            programManifestUrl: this._assets.programManifestUrl,
+            gameBase: this._assets.gameBase,
             status: this._status,
+            assets: this._assets,
             bundle: this._bundle,
             bootTracer: this._bootTracer,
-            assets: this._assets,
-          });
+          };
+          this._setPhase(BOOT_PHASE.LAUNCHING_RUNTIME);
+          await invokeQuietAsync(this._onLaunchRuntime, launchPayload);
           return {
             ok: true,
             phase: this._phase,
-            status: this._status,
-            bundle: this._bundle,
-            assets: this._assets,
             ...launchPayload,
           };
         }
 
+        this._bootMode = BOOT_MODE.SMOKE_DEMO;
+        this._status = { ...this._status, bootMode: this._bootMode };
         this._fallbackReason = this._fallbackReasonFor(this._assets);
         this._setPhase(BOOT_PHASE.FALLBACK_SMOKE_DEMO, { reason: this._fallbackReason });
         await invokeQuietAsync(this._onFallbackSmokeDemo, {
+          bootMode: this._bootMode,
+          programManifestUrl: this._assets.programManifestUrl,
+          gameBase: this._assets.gameBase,
           status: this._status,
           bundle: this._bundle,
           reason: this._fallbackReason,
@@ -577,6 +683,9 @@
           ok: true,
           fallback: true,
           phase: this._phase,
+          bootMode: this._bootMode,
+          programManifestUrl: this._assets.programManifestUrl,
+          gameBase: this._assets.gameBase,
           status: this._status,
           bundle: this._bundle,
           assets: this._assets,
@@ -585,7 +694,7 @@
         };
       } catch (err) {
         if (this._destroyed) {
-          return { ok: false, destroyed: true, phase: BOOT_PHASE.DESTROYED };
+          return { ok: false, destroyed: true, phase: BOOT_PHASE.DESTROYED, bootMode: this._bootMode };
         }
         if (signal.aborted || isAbortError(err) || token !== this._sessionToken) {
           this._aborted = true;
@@ -594,6 +703,7 @@
             ok: false,
             aborted: true,
             phase: this._phase,
+            bootMode: this._bootMode,
             error: toError(err, 'Boot pipeline aborted'),
           };
         }
@@ -603,6 +713,7 @@
         return {
           ok: false,
           phase: this._phase,
+          bootMode: this._bootMode,
           error: normalized,
         };
       }
@@ -627,6 +738,8 @@
       const tracer = tracerSnapshot(this._bootTracer);
       this._pushOverlay({
         phase: this._phase,
+        bootMode: this._bootMode,
+        firstPresentSource: this._firstPresentSource,
         tracer,
         status: this._status,
         logLine: typeof line === 'string' ? line : null,
@@ -639,35 +752,71 @@
     }
 
     /**
-     * Transition to PRESENTING, dismiss splash, and fire `onFirstPresent` once.
+     * Transition to PRESENTING, dismiss splash, record `firstPresentSource`
+     * (`'wasm-guest'` vs `'smoke-demo'`), and fire `onFirstPresent` once.
      *
      * @param {object} [meta]
      */
     notifyFirstPresent(meta = {}) {
       if (this._destroyed || this._firstPresent) {
-        return { ok: true, alreadyPresented: true, phase: this._phase };
+        return {
+          ok: true,
+          alreadyPresented: true,
+          phase: this._phase,
+          bootMode: this._bootMode,
+          firstPresentSource: this._firstPresentSource,
+        };
       }
+      const safeMeta = meta && typeof meta === 'object' ? meta : {};
+      const firstPresentSource = resolveFirstPresentSource(safeMeta, this._bootMode);
+      const enrichedMeta = {
+        ...safeMeta,
+        bootMode: this._bootMode,
+        firstPresentSource,
+        isRealGuestBoot: this.isRealGuestBoot(),
+      };
+
       this._firstPresent = true;
+      this._firstPresentSource = firstPresentSource;
       if (this._bootTracer && typeof this._bootTracer.markMilestone === 'function') {
         const tracer = tracerSnapshot(this._bootTracer);
         if (!tracer || tracer.readyForSplash !== true) {
           try {
-            this._bootTracer.markMilestone('FIRST_PRESENT', meta);
+            this._bootTracer.markMilestone('FIRST_PRESENT', enrichedMeta);
           } catch {
             // Ignore unknown-milestone errors from stub tracers.
           }
         }
       }
-      this._setPhase(BOOT_PHASE.PRESENTING, { meta });
-      callQuiet(this._splashOverlay, 'dismiss', meta);
-      callQuiet(this._splashOverlay, 'hide', meta);
+      this._setPhase(BOOT_PHASE.PRESENTING, {
+        meta: enrichedMeta,
+        firstPresentSource: this._firstPresentSource,
+      });
+      callQuiet(this._splashOverlay, 'dismiss', enrichedMeta);
+      callQuiet(this._splashOverlay, 'hide', enrichedMeta);
       invokeQuiet(this._onFirstPresent, {
-        ...meta,
+        ...enrichedMeta,
         status: this._status,
+        assets: this._assets,
         bundle: this._bundle,
         tracer: tracerSnapshot(this._bootTracer),
       });
-      return { ok: true, alreadyPresented: false, phase: this._phase };
+      return {
+        ok: true,
+        alreadyPresented: false,
+        phase: this._phase,
+        bootMode: this._bootMode,
+        firstPresentSource: this._firstPresentSource,
+      };
+    }
+
+    /**
+     * Alias for `notifyFirstPresent(meta)` to mark FIRST_PRESENT cleanly for guest or smoke frames.
+     *
+     * @param {object} [meta]
+     */
+    markFirstPresent(meta = {}) {
+      return this.notifyFirstPresent(meta);
     }
 
     /**
@@ -704,9 +853,11 @@
 
   const exportedApi = Object.freeze({
     BOOT_PHASE,
+    BOOT_MODE,
     DEFAULT_STATUS_URL,
     BootOrchestrator,
     discoverBootAssets,
+    isRealGuestBoot,
     default: BootOrchestrator,
   });
 

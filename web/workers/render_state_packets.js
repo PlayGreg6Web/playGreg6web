@@ -1,5 +1,3 @@
-'use strict';
-
 // GPU packet ABI v2 (opcodes 22..34, docs/gpu_commands.md "Opcodes (v2)") for WgpuCommandProcessor:
 // explicit bind group / pipeline layouts, pipelines built from the 376-byte render pipeline key,
 // explicit render passes, dynamic render state, bind groups with texture view descriptors and
@@ -9,6 +7,9 @@
 // (pipelines, computePipelines, samplers, bindGroups) so v1 SetPipeline / SetComputePipeline /
 // SetBindGroup / DestroyResource keep working on them. Pass-level packets are queued in the
 // processor's per-frame command list and replayed at Present through the `run(passControl)` hook.
+
+(function (globalScope) {
+  'use strict';
 
 // "WebGPU enum codes" (docs/gpu_commands.md): numbering of the pso::Wgpu* enums and the *_name()
 // tables in runtime/gpu/pso_cache.{h,cpp}. tests/test_render_state_packets.mjs cross-checks them.
@@ -787,10 +788,13 @@ const exportedApi = {
   VIEW_DIMENSION_NAMES,
 };
 
-if (typeof globalThis !== 'undefined') {
-  globalThis.PlayGta6RenderState = exportedApi;
-}
+  if (typeof globalThis !== 'undefined') {
+    globalThis.PlayGta6RenderState = exportedApi;
+  } else if (globalScope) {
+    globalScope.PlayGta6RenderState = exportedApi;
+  }
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = exportedApi;
-}
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = exportedApi;
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : this);

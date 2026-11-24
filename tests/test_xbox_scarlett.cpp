@@ -639,9 +639,9 @@ void test_game_input_bridge() {
 
 void test_module_registry_resolution() {
     const size_t count = pg6_xbox_scarlett_register_all();
-    CHECK(count == 16u);
+    CHECK(count == 17u);
     // Idempotent second call.
-    CHECK(pg6_xbox_scarlett_register_all() == 16u);
+    CHECK(pg6_xbox_scarlett_register_all() == 17u);
 
     // xmem.dll (12 exports)
     const Pg6Handle h_xmem = win32::GetModuleHandleA("xmem.dll");

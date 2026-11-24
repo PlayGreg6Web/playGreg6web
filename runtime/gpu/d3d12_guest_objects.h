@@ -54,6 +54,7 @@
 // every interface are logging stubs with SlotPolicy::ReturnNotImpl (first call logged with the slot
 // index, every call counted in com::stub_hit_report()).
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -269,6 +270,10 @@ struct IFenceHost : IDeviceChildHost {
     virtual HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) = 0;
     virtual HResult Signal(uint64_t value) = 0;
     virtual uint32_t GetCreationFlags() = 0;
+    // Xbox slot 12: () -> the guest address of a 64-bit word holding the completed value. The
+    // executable's fence wait (0x144FB0AD0) reads the value through it, compares it with
+    // UINT64_MAX (device removed) and with the target value, and waits while it is below.
+    virtual uint64_t CompletedValueAddress() = 0;
 };
 
 // ID3D12DescriptorHeap: 8 GetDesc, 9 GetCPUDescriptorHandleForHeapStart, 10 GetGPUDescriptorHandleForHeapStart.
@@ -338,6 +343,9 @@ struct IGraphicsCommandListHost : IDeviceChildHost {
     virtual HResult Close() = 0;                                                                     // 9
     virtual HResult Reset(InterfaceArg<ICommandAllocatorHost> allocator,
                           InterfaceArg<IPipelineStateHost> initial_state) = 0;                       // 10
+    // Xbox slot 139: (allocator, initial state, u64) -> HRESULT, a Reset with a third argument.
+    virtual HResult ResetX(InterfaceArg<ICommandAllocatorHost> allocator, InterfaceArg<IPipelineStateHost> initial_state,
+                           uint64_t extra) = 0;
     virtual void ClearState(InterfaceArg<IPipelineStateHost> state) = 0;                             // 11
     virtual void DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t start_vertex,
                                uint32_t start_instance) = 0;                                         // 12
@@ -617,8 +625,13 @@ public:
     // Shader identity (shader_identity(): FNV-1a 64 over the DXIL container bytes the PSO desc passes)
     // -> CreateShaderModule id. PSOs created before their modules are registered stay unresolved.
     void register_shader_module(uint64_t identity, uint32_t module_id);
-    void note_unresolved_shader(uint64_t identity);
+    enum class ShaderStage : uint8_t { Vertex, Pixel, Compute };
+    void note_unresolved_shader(uint64_t identity, ShaderStage stage);
     std::vector<uint64_t> unresolved_shaders() const;
+    // Distinct unresolved identities by the stage they were first used at (vertex, pixel, compute).
+    std::array<uint32_t, 3> unresolved_shader_stages() const;
+    // Root signatures created, by blob version (1.0, 1.1, 1.2).
+    std::array<uint32_t, 3> root_signature_versions() const;
     bool shader_known(uint64_t identity) const;
 
     // ---- Resources ----
@@ -695,6 +708,8 @@ private:
 
     mutable std::mutex shader_mutex_;
     std::vector<uint64_t> unresolved_shaders_;
+    std::array<uint32_t, 3> unresolved_by_stage_{};
+    std::array<uint32_t, 3> root_signature_versions_{};  // under shader_mutex_
     std::unordered_set<uint64_t> known_shaders_;
     std::mutex va_mutex_;
     uint64_t next_fake_va_ = kFakeGpuVaBase;
@@ -763,15 +778,18 @@ public:
     HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) override;
     HResult Signal(uint64_t value) override;
     uint32_t GetCreationFlags() override { return flags_; }
+    uint64_t CompletedValueAddress() override;
     // GPU-side signal (queue Signal): completes when the work submitted before it completed, which
     // in this runtime is at submission time (see Queue::Signal).
     void signal_from_queue(uint64_t value) { Signal(value); }
 
 private:
     void fire_events_locked(std::vector<uint64_t>* to_set);
+    void publish_value_locked();
 
     std::atomic<uint64_t> value_;
     uint32_t flags_;
+    uint64_t value_word_ = 0;  // guest word behind CompletedValueAddress (allocated on first use)
     std::mutex mutex_;
     std::multimap<uint64_t, uint64_t> waits_;  // value -> event handle
 };
@@ -881,6 +899,18 @@ DxgiFormatLayout dxgi_format_layout(uint32_t format);
 uint32_t plane_block_bytes(uint32_t format, uint32_t plane);
 // Linear size of a resource's subresources (no tiling or alignment padding).
 uint64_t resource_size_estimate(const GuestResourceDesc& desc);
+// Bytes the console's D3D12 allocates for a committed resource: the 64 KiB-block surface size
+// for the 2D surfaces os/surface_blocks.h covers, otherwise resource_size_estimate.
+uint64_t committed_memory_size(const GuestResourceDesc& desc);
+
+// XMemAlloc attributes for committed-resource memory (XALLOC_ATTRIBUTES fields):
+//   allocator id (bits 16..23) = 0x80 - inferred from a title's allocator hook, which registers
+//     its D3D resource arena handler for allocator id 0x80 (the public layout reserves ids from
+//     128 for the system; the first is the D3D allocator);
+//   page size (bits 14..15) = 2 - inferred from the same hook, which accepts only page-size field
+//     2 (large pages) for that arena;
+//   object type (bits 0..13), alignment, memory type and the rest = 0 (not documented values).
+inline constexpr uint64_t kD3D12ResourceXMemAttributes = (uint64_t{0x80} << 16) | (uint64_t{2} << 14);
 com::Ref<Device> device_ref(Device* device);
 
 // Root signature description from a D3D12_VERSIONED_ROOT_SIGNATURE_DESC in guest memory (all nested

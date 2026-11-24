@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -7,6 +8,7 @@
 
 #include "os/guest_heap.h"
 #include "os/win32_loader.h"
+#include "os/xasync_provider.h"
 #include "os/xbox_middleware.h"
 #include "os/xgameruntime.h"
 
@@ -456,9 +458,29 @@ void test_audio_apu_xapu_xdsp() {
     CHECK(acp_com->vtbl->release(acp_hal_raw) == 1u);
     CHECK(acp_com->vtbl->release(acp_hal_raw) == 0u);
 
-    uint32_t shape_counts[4] = {1u, 2u, 3u, 4u};
-    CHECK(pg6_mw_acp_hal_allocate_shape_contexts(shape_counts) == S_OK_HR);
+    // Shape contexts: six counts, then the call fills one pointer per kind with a zeroed array
+    // (only kind 4, 64 bytes per context, is established). A kind of unknown size fails and
+    // hands out nothing.
+    struct ShapeContexts {
+        uint32_t counts[6];
+        uint64_t arrays[6];
+    };
+    ShapeContexts shape{};
+    shape.counts[4] = 350;
+    shape.arrays[0] = 0x1234;
+    CHECK(pg6_mw_acp_hal_allocate_shape_contexts(&shape) == S_OK_HR);
+    CHECK(shape.arrays[0] == 0 && shape.arrays[1] == 0 && shape.arrays[5] == 0);
+    CHECK(shape.arrays[4] != 0 && shape.arrays[4] % 256 == 0);
+    const auto* contexts = static_cast<const uint8_t*>(playgta6::os::default_guest_heap().to_host(shape.arrays[4]));
+    CHECK(contexts != nullptr);
+    CHECK(std::all_of(contexts, contexts + 350 * 64, [](uint8_t v) { return v == 0; }));
     CHECK(pg6_mw_acp_hal_release_shape_contexts() == S_OK_HR);
+    ShapeContexts unknown{};
+    unknown.counts[0] = 2;
+    unknown.counts[4] = 1;
+    CHECK(pg6_mw_acp_hal_allocate_shape_contexts(&unknown) == playgta6::os::gdk::E_NOTIMPL_HR);
+    CHECK(unknown.arrays[0] == 0 && unknown.arrays[4] == 0);
+    CHECK(pg6_mw_acp_hal_allocate_shape_contexts(nullptr) == playgta6::os::gdk::E_INVALIDARG_HR);
 
     // ApuCreateHeap -> ApuAlloc -> validity/mapping -> ApuFree round-trip.
     CHECK(pg6_mw_apu_create_heap(4u * 1024u * 1024u, 2u * 1024u * 1024u) == S_OK_HR);

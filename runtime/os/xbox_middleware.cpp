@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "os/guest_heap.h"
+#include "os/os_shim.h"
 #include "os/win32_loader.h"
 #include "os/xasync_provider.h"
 
@@ -226,6 +227,7 @@ struct ApuGlobals {
     uint32_t cached_heap_size = 0;
     uint32_t non_cached_heap_size = 0;
     uint32_t shape_context_allocs = 0;
+    std::vector<uint64_t> shape_context_arrays;  // guest heap blocks handed out by AllocateShapeContexts
     Pg6ApuAddress next_apu_addr = 0x10000000u;
     std::vector<ApuBlock> blocks;
 };
@@ -1466,12 +1468,60 @@ Pg6HResult pg6_mw_acp_hal_create(void** acp_hal) {
     return gdk::S_OK_HR;
 }
 
-Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(const void* context_counts) {
-    if (context_counts == nullptr) {
+namespace {
+// The request AcpHalAllocateShapeContexts takes: six 32-bit context counts, then one pointer per
+// kind that the call fills with a zeroed array of that many contexts. Layout from the executable:
+// it zeroes counts 0-3 and 5, sets count 4, and after the call clears count 4 x 64 bytes at the
+// pointer at +0x38 (0x18 + 8 * 4).
+struct ShapeContextRequest {
+    uint32_t counts[6];
+    uint64_t arrays[6];  // guest addresses, written by the call
+};
+static_assert(sizeof(ShapeContextRequest) == 0x48);
+// Context size per kind; 0 = not established (no title has asked for that kind yet).
+constexpr uint32_t kShapeContextBytes[6] = {0, 0, 0, 0, 64, 0};
+constexpr uint32_t kShapeContextAlignment = 256;
+}  // namespace
+
+Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts) {
+    if (contexts == nullptr) {
         return gdk::E_INVALIDARG_HR;
+    }
+    ShapeContextRequest request{};
+    std::memcpy(&request, contexts, sizeof(request));
+    for (uint32_t kind = 0; kind < 6; ++kind) {
+        request.arrays[kind] = 0;
+        if (request.counts[kind] != 0 && kShapeContextBytes[kind] == 0) {
+            std::memcpy(contexts, &request, sizeof(request));
+            playgta6::os::log("AcpHalAllocateShapeContexts: " + std::to_string(request.counts[kind]) +
+                              " contexts of kind " + std::to_string(kind) +
+                              " requested; the size of that kind is not established, returning E_NOTIMPL");
+            return gdk::E_NOTIMPL_HR;
+        }
     }
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    for (uint32_t kind = 0; kind < 6; ++kind) {
+        if (request.counts[kind] == 0) {
+            continue;
+        }
+        const uint64_t bytes = uint64_t{request.counts[kind]} * kShapeContextBytes[kind];
+        const uint64_t va = heap.alloc(bytes, kShapeContextAlignment, playgta6::os::HeapFamily::Other,
+                                       playgta6::os::kHeapZeroMemory);
+        if (va == 0) {
+            for (uint32_t k = 0; k < kind; ++k) {
+                if (request.arrays[k] != 0) {
+                    heap.free(request.arrays[k]);
+                    g.shape_context_arrays.pop_back();
+                }
+            }
+            return gdk::E_OUTOFMEMORY_HR;
+        }
+        request.arrays[kind] = va;
+        g.shape_context_arrays.push_back(va);
+    }
+    std::memcpy(contexts, &request, sizeof(request));
     ++g.shape_context_allocs;
     return gdk::S_OK_HR;
 }
@@ -1479,6 +1529,10 @@ Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(const void* context_counts) {
 Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void) {
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
+    for (uint64_t va : g.shape_context_arrays) {
+        playgta6::os::default_guest_heap().free(va);
+    }
+    g.shape_context_arrays.clear();
     if (g.shape_context_allocs > 0) {
         --g.shape_context_allocs;
     }

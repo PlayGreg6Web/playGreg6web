@@ -13,6 +13,10 @@ use playgta6_shaders::dxbc::{
     DxbcFileEntry, parse_dxbc, render_dxbc_batch_json, render_dxbc_batch_md,
     render_dxbc_info_json, render_dxbc_info_md,
 };
+use playgta6_shaders::dxil_reflect::{
+    DxilReflectionErrorRecord, build_dxil_reflection_manifest, reflect_dxil_bytes_with_options,
+    sanitize_source_path,
+};
 use playgta6_shaders::pack::{
     BlockerReportInput, FailedShaderRecord, PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry,
     SHADER_INDEX_ABI_VERSION, ShaderIndexEntry, read_pack, render_blocker_report_md,
@@ -54,6 +58,11 @@ enum Command {
         no_sanitize: bool,
         no_lower: bool,
     },
+    ReflectDxil {
+        target_path: PathBuf,
+        out_path: Option<PathBuf>,
+        json: bool,
+    },
 }
 
 fn print_usage() {
@@ -70,6 +79,7 @@ fn print_usage() {
     eprintln!(
         "  playgta6-shaders reflect --spirv <dir> --out <dir> [--pipelines <list.txt>] [--register-shift <b|t|u|s>=<n>]... [--no-sanitize] [--no-lower]"
     );
+    eprintln!("  playgta6-shaders reflect-dxil <file-or-dir> [--out <json>] [--json]");
     eprintln!();
     eprintln!(
         "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> Naga lower -> WGSL -> .wgsl.pack"
@@ -269,8 +279,49 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 no_lower,
             })
         }
+        "reflect-dxil" => {
+            let mut target_path: Option<PathBuf> = None;
+            let mut out_path: Option<PathBuf> = None;
+            let mut json = false;
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--out" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --out".to_string())?;
+                        out_path = Some(PathBuf::from(val));
+                    }
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option for reflect-dxil: {other}"));
+                    }
+                    path_arg => {
+                        if target_path.is_some() {
+                            return Err(format!(
+                                "unexpected extra argument for reflect-dxil: {path_arg}"
+                            ));
+                        }
+                        target_path = Some(PathBuf::from(path_arg));
+                    }
+                }
+                i += 1;
+            }
+
+            let target_path = target_path.ok_or_else(|| {
+                "reflect-dxil requires <file-or-dir> [--out <json>] [--json]".to_string()
+            })?;
+
+            Ok(Command::ReflectDxil {
+                target_path,
+                out_path,
+                json,
+            })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', or 'reflect')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', or 'reflect-dxil')"
         )),
     }
 }
@@ -740,6 +791,88 @@ fn run_reflect(
     Ok(())
 }
 
+fn build_reflect_dxil_json(target_path: &Path) -> Result<(String, usize, usize, usize, usize), String> {
+    let convention = RegisterConvention::default();
+    let mut reflections = Vec::new();
+    let mut errors = Vec::new();
+
+    if target_path.is_file() {
+        let source = sanitize_source_path(target_path, None);
+        let bytes = fs::read(target_path)
+            .map_err(|err| format!("failed to read DXBC/DXIL file {source}: {err}"))?;
+        let refl = reflect_dxil_bytes_with_options(&bytes, Some(&source), &convention)
+            .map_err(|err| format!("failed to reflect DXBC/DXIL container {source}: {err}"))?;
+        reflections.push(refl);
+    } else if target_path.is_dir() {
+        let files = collect_dxbc_files(target_path)?;
+        for path in &files {
+            let source = sanitize_source_path(path, Some(target_path));
+            match fs::read(path) {
+                Ok(bytes) => match reflect_dxil_bytes_with_options(&bytes, Some(&source), &convention) {
+                    Ok(refl) => reflections.push(refl),
+                    Err(err) => errors.push(DxilReflectionErrorRecord {
+                        source,
+                        error: err.to_string(),
+                    }),
+                },
+                Err(err) => errors.push(DxilReflectionErrorRecord {
+                    source,
+                    error: format!("read error: {err}"),
+                }),
+            }
+        }
+    } else {
+        return Err(format!(
+            "DXBC/DXIL path does not exist: {}",
+            sanitize_source_path(target_path, None)
+        ));
+    }
+
+    let manifest = build_dxil_reflection_manifest(&reflections, &errors, &convention)
+        .map_err(|err| format!("failed to build DXIL reflection manifest: {err}"))?;
+    let json = manifest.render_json();
+    Ok((
+        json,
+        manifest.shaders.len(),
+        manifest.bind_group_layouts.len(),
+        manifest.pipeline_layouts.len(),
+        manifest.errors.len(),
+    ))
+}
+
+fn run_reflect_dxil(target_path: &Path, out_path: Option<&Path>, json_flag: bool) -> Result<(), String> {
+    let (json, shader_count, bgl_count, pl_count, err_count) = build_reflect_dxil_json(target_path)?;
+    if let Some(dest) = out_path {
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create output directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(dest, json.as_bytes()).map_err(|err| {
+            format!(
+                "failed to write DXIL reflection manifest {}: {err}",
+                dest.display()
+            )
+        })?;
+        if json_flag {
+            print!("{json}");
+        } else {
+            println!(
+                "Reflected {shader_count} DXBC/DXIL shader(s) ({bgl_count} bind group layouts, {pl_count} pipeline layouts, {err_count} errors); manifest: {}",
+                dest.display()
+            );
+        }
+    } else {
+        print!("{json}");
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args) {
@@ -841,6 +974,17 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(Command::ReflectDxil {
+            target_path,
+            out_path,
+            json,
+        }) => match run_reflect_dxil(&target_path, out_path.as_deref(), json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!();
@@ -1260,5 +1404,76 @@ mod tests {
         out.extend_from_slice(&(dxil_payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&dxil_payload);
         out
+    }
+
+    #[test]
+    fn cli_parses_reflect_dxil_arguments() {
+        let cmd = parse_args(&[
+            "reflect-dxil".to_string(),
+            "shaders_dir".to_string(),
+            "--out".to_string(),
+            "out/dxil-layouts.json".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::ReflectDxil {
+                target_path: PathBuf::from("shaders_dir"),
+                out_path: Some(PathBuf::from("out/dxil-layouts.json")),
+                json: true,
+            }
+        );
+
+        let cmd_min = parse_args(&["reflect-dxil".to_string(), "vs.dxil".to_string()]).unwrap();
+        assert_eq!(
+            cmd_min,
+            Command::ReflectDxil {
+                target_path: PathBuf::from("vs.dxil"),
+                out_path: None,
+                json: false,
+            }
+        );
+
+        assert!(parse_args(&["reflect-dxil".to_string()]).is_err());
+        assert!(parse_args(&["reflect-dxil".to_string(), "vs.dxil".to_string(), "--out".to_string()]).is_err());
+        assert!(parse_args(&["reflect-dxil".to_string(), "vs.dxil".to_string(), "--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn end_to_end_reflect_dxil_single_file_and_dir_emits_sanitized_s6_json() {
+        let root = make_temp_dir("playgta6_shaders_reflect_dxil");
+        let nested = root.join("sub");
+        fs::create_dir_all(&nested).unwrap();
+
+        let dxil_file = nested.join("cs_sample.dxil");
+        fs::write(&dxil_file, build_minimal_dxil_container()).unwrap();
+        fs::write(root.join("corrupt.cso"), b"bad-dxbc").unwrap();
+
+        let out_file = root.join("out/manifest.json");
+        run_reflect_dxil(&dxil_file, Some(&out_file), false).expect("single-file reflect-dxil should succeed");
+        let single_json = fs::read_to_string(&out_file).unwrap();
+        assert!(single_json.starts_with("{\n  \"schema_version\": 1,\n"));
+        assert!(single_json.contains("\"name\": \"cs_sample.dxil\""));
+        assert!(single_json.contains("\"stage\": \"compute\""));
+        // Strict sanitization: zero host directory paths leaked into JSON!
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(
+            !single_json.contains(&root_str),
+            "host path must never appear in sanitized reflection JSON"
+        );
+
+        let (dir_json, shaders, _, _, errors) =
+            build_reflect_dxil_json(&root).expect("directory reflect-dxil should succeed");
+        assert_eq!(shaders, 1);
+        assert_eq!(errors, 1);
+        assert!(dir_json.contains("\"name\": \"sub/cs_sample.dxil\""));
+        assert!(dir_json.contains("\"source\":\"corrupt.cso\""));
+        assert!(
+            !dir_json.contains(&root_str),
+            "host path must never appear in directory reflection JSON"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
