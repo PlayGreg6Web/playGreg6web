@@ -737,6 +737,26 @@ void test_iunknown() {
     fx.restore_stack();
 }
 
+// Pointers into read-only guest memory (an image's .rdata: formats, strings, GUIDs) translate:
+// guest_to_host needs a readable extent, not a writable one.
+void test_read_only_pointers() {
+    Fixture fx;
+    const uint64_t page = fx.arena.virtual_alloc(0, 0x1000, playgta6::os::kMemReserve | playgta6::os::kMemCommit,
+                                                 playgta6::os::PageProtect::ReadWrite);
+    CHECK(page != 0);
+    const uint32_t value = 0x600DF00D;
+    CHECK(fx.arena.write(page + 0x40, &value, sizeof(value)));
+    CHECK(fx.arena.protect(page, 0x1000, playgta6::os::PageProtect::ReadOnly));
+    const auto* host = static_cast<const uint32_t*>(com::guest_to_host(page + 0x40, sizeof(value)));
+    CHECK(host != nullptr && *host == value);
+    CHECK(com::GuestPtr<const uint32_t>(page + 0x40).host() != nullptr);
+    CHECK(!com::write_guest(page + 0x40, &value, sizeof(value)));  // writes stay checked
+    // Uncommitted memory still does not translate.
+    CHECK(fx.arena.protect(page, 0x1000, playgta6::os::PageProtect::NoAccess));
+    CHECK(com::guest_to_host(page + 0x40, sizeof(value)) == nullptr);
+    fx.arena.virtual_free(page, 0, playgta6::os::kMemRelease);
+}
+
 void test_unknown_slots_and_bad_pointers() {
     Fixture fx;
     com::Ref<Calc> calc = com::create_object<Calc>(com::implements(kICalc, kIOther), 1);
@@ -1101,6 +1121,7 @@ int main() {
     test_layout_and_marshaling();
     test_flat_function_thunk();
     test_iunknown();
+    test_read_only_pointers();
     test_unknown_slots_and_bad_pointers();
     test_host_to_guest_calls();
     test_nested_callbacks();

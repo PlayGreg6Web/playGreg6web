@@ -15,6 +15,8 @@
 #include "os/crt_format.h"
 #include "os/guest_heap.h"
 #include "os/ucrt_bridge.h"
+#include "os/vmem.h"
+#include "os/win32_kernel.h"
 
 namespace {
 
@@ -280,6 +282,31 @@ void test_thunks_on_guest_memory() {
     CHECK(out[0] == 0 && *pg6_crt_errno() == PG6_CRT_ERANGE);
     // Measuring.
     CHECK(call(&pg6_gthunk_stdio_common_vsprintf, kLegacy | cf::kStandardSnprintfBehavior, 0, 0) == 20);
+
+    // Formats and %s strings in read-only guest memory (an image's .rdata) are readable too.
+    playgta6::os::VirtualMemoryArena& arena = *playgta6::os::win32::get_vmem_arena();
+    const uint64_t rdata = arena.virtual_alloc(0, 0x2000, playgta6::os::kMemReserve | playgta6::os::kMemCommit,
+                                               playgta6::os::PageProtect::ReadWrite);
+    CHECK(rdata != 0);
+    const char ro_format[] = "%s!";
+    const char ro_text[] = "read-only";
+    const uint64_t ro_format_va = rdata + 0x1000 - 2;  // straddles the page boundary
+    CHECK(arena.write(ro_format_va, ro_format, sizeof(ro_format)));
+    CHECK(arena.write(rdata + 0x100, ro_text, sizeof(ro_text)));
+    CHECK(arena.protect(rdata, 0x2000, playgta6::os::PageProtect::ReadOnly));
+    const uint64_t ro_slots[1] = {rdata + 0x100};
+    const uint64_t ro_va_list = put(ro_slots, sizeof(ro_slots));
+    state.gpr[reg::Rcx] = kLegacy;
+    state.gpr[reg::Rdx] = buffer;
+    state.gpr[reg::R8] = 64;
+    state.gpr[reg::R9] = ro_format_va;
+    state.gpr[reg::Rsp] = stack;
+    const uint64_t ro_args[2] = {0, ro_va_list};
+    std::memcpy(heap.to_host(stack + 40), ro_args, sizeof(ro_args));
+    pg6_gthunk_stdio_common_vsprintf(&state);
+    CHECK(static_cast<int32_t>(state.gpr[reg::Rax]) == 10);
+    CHECK(std::strcmp(out, "read-only!") == 0);
+    arena.virtual_free(rdata, 0, playgta6::os::kMemRelease);
 }
 
 // _get_stream_buffer_pointers hands msvcp140's basic_filebuf an empty buffer record in guest

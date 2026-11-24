@@ -583,16 +583,17 @@ bool read_guest_units(uint64_t address, size_t max, Out& out) {
     namespace gcom = playgta6::guest::com;
     out.clear();
     uint64_t va = address;
+    Unit host[0x1000 / sizeof(Unit) + 1];
     while (out.size() < max) {
-        // Read up to the end of the current 4 KiB page at a time.
+        // Read up to the end of the current 4 KiB page at a time. A checked copy, not a writable
+        // host pointer: formats and strings often live in read-only image sections (.rdata).
         const uint64_t page_left = 0x1000 - (va & 0xFFF);
         size_t units = static_cast<size_t>(page_left / sizeof(Unit));
         if (units == 0) {
             units = 1;
         }
         units = std::min(units, max - out.size());
-        const auto* host = static_cast<const Unit*>(gcom::guest_to_host(va, units * sizeof(Unit)));
-        if (host == nullptr) {
+        if (va == 0 || !gcom::read_guest(va, host, units * sizeof(Unit))) {
             return false;
         }
         for (size_t k = 0; k < units; ++k) {

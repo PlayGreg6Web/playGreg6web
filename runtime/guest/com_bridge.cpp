@@ -204,7 +204,10 @@ void* guest_to_host(uint64_t va, size_t len) {
     if (va == 0) {
         return nullptr;
     }
-    return guest_memory().host_ptr(va, len == 0 ? 1 : len);
+    // Readable is enough (the documented contract): `const` data such as formats, strings and
+    // GUIDs often lives in read-only image sections. Writes through the pointer to read-only
+    // memory fault, as they would on the console.
+    return const_cast<uint8_t*>(guest_memory().host_ptr_const(va, len == 0 ? 1 : len));
 }
 
 bool read_guest(uint64_t va, void* dst, size_t len) {
