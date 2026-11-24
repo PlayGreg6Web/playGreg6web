@@ -8,7 +8,9 @@
 #include <mutex>
 
 #include "abi/playgta6_abi.h"
+#include "guest/guest_runtime.h"
 #include "os/guest_window.h"
+#include "os/os_shim.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::guest {
@@ -19,9 +21,21 @@ namespace window = os::guest_window;
 namespace xw = os::xmem_windows;
 
 // Whether this runtime keeps every two adjacent mapped window slots host-contiguous, which code
-// lifted with kPg6MemoryContiguousRuns relies on (it has no straddle check). Not yet: XMem maps
-// pool pages wherever the title asks, and a slot's bytes are its page's (os/xbox_scarlett.cpp).
-constexpr bool kServesContiguousRuns = false;
+// lifted with kPg6MemoryContiguousRuns relies on (it has no straddle check): XMem's window-centric
+// placement moves a page's bytes next to its window neighbour's (os/xbox_scarlett.cpp,
+// keep_window_run_locked), and where it cannot, the guest stops with a fault at that slot
+// (runs_violation) instead of lifted code reading the wrong bytes.
+constexpr bool kServesContiguousRuns = true;
+
+[[noreturn]] void runs_violation(uint64_t window_va) {
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "translated window: the slots around 0x%" PRIx64
+                  " cannot be kept host-contiguous (the program was lifted with contiguous runs)",
+                  window_va);
+    os::log(line);
+    raise_fault(FaultKind::Trap, nullptr, window_va);
+}
 
 std::string hex(uint64_t v) {
     char buf[24];
@@ -155,6 +169,7 @@ bool apply_memory_model(const Pg6GuestMemoryModel& m, os::VirtualMemoryArena& ar
     window::set_enabled(true);
     a.previous_policy = xw::policy();
     xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    window::set_contiguous_runs_required((m.flags & kPg6MemoryContiguousRuns) != 0, &runs_violation);
     a.active = true;
     return true;
 }
@@ -166,6 +181,7 @@ void release_memory_model() {
         return;
     }
     xw::set_policy(a.previous_policy);
+    window::set_contiguous_runs_required(false);
     // Slots still mapped belong to an XMem CPU window the guest did not release; they stay valid
     // (and the window on) until XMem unmaps them.
     if (a.enabled_window && window::stats().mapped_slots == 0) {

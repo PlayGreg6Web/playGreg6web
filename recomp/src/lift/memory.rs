@@ -57,9 +57,9 @@
 //! - [`Window::contiguous_runs`]: no straddle check or slow path at all; sound only if the runtime
 //!   keeps every two adjacent *mapped* slots on adjacent host pages (a window-centric page
 //!   allocator: the title never dereferences its pool view, O27, so a page's bytes may live where
-//!   the window needs them; merging runs costs a copy). The R19 runtime prototype does not do
-//!   this yet (it aliases pool-view pages, which are adjacent only when the title maps consecutive
-//!   pool pages at consecutive slots).
+//!   the window needs them; merging runs costs a copy). The runtime does this while a program
+//!   lifted with contiguous runs boots (O29, `runtime/guest/memory_model.h`) and stops the guest
+//!   at the first mapping it cannot keep contiguous, such as one page at two adjacent slots.
 //!
 //! # What LLVM makes of it
 //! - The guest base (`!invariant.load`) is loaded once per function; `W`, `S`, `pages` are
@@ -205,7 +205,7 @@ pub const MEMORY_MODEL_CHOICES: &[(&str, &str)] = &[
     ),
     (
         "window-runs",
-        "window without straddle checks (needs a runtime that keeps window runs contiguous)",
+        "window without straddle checks (the runtime keeps window runs contiguous, or stops)",
     ),
 ];
 

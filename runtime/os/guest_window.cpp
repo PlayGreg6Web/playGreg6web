@@ -344,6 +344,31 @@ uint64_t Buffers::guest_address(const void* host) const {
     return guest_window::guest_address(host);
 }
 
+namespace {
+
+std::atomic<bool> g_runs_required{false};
+std::atomic<ContiguityViolationFn> g_on_violation{nullptr};
+
+}  // namespace
+
+void set_contiguous_runs_required(bool required, ContiguityViolationFn on_violation) {
+    g_on_violation.store(on_violation, std::memory_order_release);
+    g_runs_required.store(required, std::memory_order_release);
+}
+
+bool contiguous_runs_required() {
+    return g_runs_required.load(std::memory_order_acquire);
+}
+
+void contiguity_violation(uint64_t window_va) {
+    if (!contiguous_runs_required()) {
+        return;
+    }
+    if (ContiguityViolationFn fn = g_on_violation.load(std::memory_order_acquire)) {
+        fn(window_va);
+    }
+}
+
 Stats stats() {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);

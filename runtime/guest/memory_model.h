@@ -19,7 +19,11 @@
 //   still dereferences a window VA flat faults instead of touching unrelated memory).
 //   Flags: kPg6MemoryStackFlat - rsp-relative accesses skip the window check (sound because
 //   guest stacks are arena allocations, never in the window); kPg6MemoryContiguousRuns - no
-//   straddle check, which needs a runtime that keeps adjacent mapped slots host-contiguous.
+//   straddle check, which needs adjacent mapped slots to be host-contiguous: the boot then has
+//   XMem keep window runs contiguous (window-centric placement, os/xbox_scarlett.cpp
+//   keep_window_run_locked: a page's bytes move next to its window neighbour's, merging runs
+//   copies) and stops the guest with a fault at the first slot it cannot keep contiguous (a page
+//   mapped at two adjacent slots, for one), so lifted code never reads the wrong bytes.
 // * PageTable: a lifter prototype (every VA through a page table); no runtime support.
 //
 // A runtime build serves a model only if it can do everything the lifted code relies on;

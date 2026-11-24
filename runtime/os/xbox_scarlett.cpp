@@ -183,6 +183,11 @@ struct PhysicalPage {
     uint32_t mapped_slots = 0;  // real and phantom mappings
     // R19: translated-window slots this page is mapped at (they alias the page's bytes).
     std::vector<uint64_t> window_slots;
+    // O29: the page's first real mapping (the title maps every pool page into its pool view
+    // first), 0 if none. A CPU-window slot of a page whose pool_va lies outside that window
+    // aliases those bytes under the translated window, so two such window slots are
+    // host-contiguous exactly when their pages' pool VAs are adjacent.
+    uint64_t pool_va = 0;
 };
 
 struct VirtualRegion {
@@ -227,6 +232,23 @@ struct XMemState {
     uint64_t peak_working_set_bytes = 0;
     uint64_t alias_conflicts = 0;  // a page mapped at a second real address while it had a home
     bool translated_window_live = false;  // R19: the one translated window is in use
+    // O29: CPU-window mappings of pages that live elsewhere (their pool view), and how often such
+    // a mapping lands next to a mapped slot whose page is its pool-view neighbour
+    // (host-contiguous under the translated window's aliasing).
+    uint64_t cpu_window_maps = 0;
+    uint64_t cpu_window_neighbour_pairs = 0;
+    uint64_t cpu_window_neighbour_pairs_contiguous = 0;
+    uint64_t cpu_window_neighbour_pairs_reversed = 0;  // pool-view neighbours in reverse order
+    // O29: the translated window's run keeper (keep_window_run_locked).
+    uint64_t run_kept = 0;      // a new slot already sat next to its neighbour's bytes
+    uint64_t run_moves = 0;     // ... after moving the page's bytes (a frame swap)
+    uint64_t run_breaks = 0;    // ... could not be kept contiguous
+    uint64_t run_relocations = 0;  // whole runs moved to fresh frames (merges)
+    bool keeping_runs = false;     // inside keep_window_run_locked (intermediate states are fine)
+    uint64_t run_bytes_moved = 0;
+    // Guest VA -> handle of the page whose bytes live there after a frame swap (validated on use:
+    // the page must still exist and have that home).
+    std::unordered_map<uint64_t, uint64_t> moved_homes;
 
     void update_peak_locked() {
         const uint64_t current =
@@ -355,7 +377,37 @@ void retarget_window_slots_locked(PhysicalPage& page) {
     uint8_t* bytes = page_bytes_locked(page);
     for (uint64_t slot : page.window_slots) {
         guest_window::map_slot(slot, bytes);
+        // O29: the bytes moved (their home was unmapped or the page was mapped elsewhere): with
+        // contiguous runs required, the slot's neighbours must still be host-adjacent.
+        if (guest_window::contiguous_runs_required() && !xmem_state().keeping_runs) {
+            const uint64_t ps = page.page_size;
+            const bool left_ok = guest_window::slot_host(slot - ps) == nullptr ||
+                                 static_cast<uint8_t*>(guest_window::slot_host(slot - ps)) + ps == bytes;
+            const bool right_ok = guest_window::slot_host(slot + ps) == nullptr ||
+                                  static_cast<uint8_t*>(guest_window::slot_host(slot + ps)) == bytes + ps;
+            if (!left_ok || !right_ok) {
+                guest_window::contiguity_violation(slot);
+            }
+        }
     }
+}
+
+// O29: the page whose bytes live at guest VA `va` (a real mapping's home), or null.
+PhysicalPage* home_owner_locked(XMemState& st, uint64_t va) {
+    if (auto it = st.moved_homes.find(va); it != st.moved_homes.end()) {
+        auto pit = st.physical_pages.find(it->second);
+        if (pit != st.physical_pages.end() && pit->second->home_va == va) {
+            return pit->second.get();
+        }
+        st.moved_homes.erase(it);
+    }
+    if (auto sit = st.page_slots.find(va); sit != st.page_slots.end()) {
+        auto pit = st.physical_pages.find(sit->second);
+        if (pit != st.physical_pages.end() && pit->second->home_va == va) {
+            return pit->second.get();
+        }
+    }
+    return nullptr;
 }
 
 // Removes the page mapped at slot `va` (guest VA); the caller holds the lock.
@@ -383,10 +435,12 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         xmem_windows::note_cpu_window_mapping(-static_cast<int64_t>(ps));
         return;
     }
-    if (page.home_va == va) {
-        save_page_contents(page, static_cast<const uint8_t*>(host_of(va)));
-        page.home_va = 0;
-        retarget_window_slots_locked(page);
+    // The bytes living here (the page's own, or after a frame swap another page's, O29) go to a
+    // store before the slot loses its memory.
+    if (PhysicalPage* owner = page.home_va == va ? &page : home_owner_locked(st, va)) {
+        save_page_contents(*owner, static_cast<const uint8_t*>(host_of(va)));
+        owner->home_va = 0;
+        retarget_window_slots_locked(*owner);
     }
     VirtualRegion* region = st.region_containing_locked(va, ps);
     if (region != nullptr && !region->phantom) {
@@ -398,6 +452,218 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
             xmem_windows::note_cpu_window_mapping(-static_cast<int64_t>(ps));
         }
     }
+}
+
+uint64_t region_guest_base(const VirtualRegion& region) {
+    return region.translated ? guest_window::kWindowBase : guest_of(region.base);
+}
+
+// Whether `page` lives outside `region` (its first mapping is elsewhere): its slots in `region`
+// alias those bytes under the translated window.
+bool aliases_into(const PhysicalPage& page, uint64_t base, const VirtualRegion& region) {
+    return page.pool_va != 0 && page.pool_va - base >= region.size;
+}
+
+// O29: a page was just mapped at CPU-window slot `va` of `region`: count the mapping (if the page
+// lives elsewhere) and its mapped neighbours that do too, and whether each neighbour's page is the
+// page's pool-view neighbour.
+void note_cpu_window_map_locked(XMemState& st, uint64_t va, const PhysicalPage& page, const VirtualRegion& region) {
+    const uint64_t base = region_guest_base(region);
+    if (!aliases_into(page, base, region)) {
+        return;
+    }
+    ++st.cpu_window_maps;
+    const uint64_t ps = page.page_size;
+    for (const int64_t step : {-1, 1}) {
+        const uint64_t nva = va + static_cast<uint64_t>(step * static_cast<int64_t>(ps));
+        if (nva - base >= region.size) {
+            continue;
+        }
+        const auto sit = st.page_slots.find(nva);
+        if (sit == st.page_slots.end()) {
+            continue;
+        }
+        const auto pit = st.physical_pages.find(sit->second);
+        if (pit == st.physical_pages.end() || !aliases_into(*pit->second, base, region)) {
+            continue;
+        }
+        ++st.cpu_window_neighbour_pairs;
+        if (pit->second->pool_va - page.pool_va == nva - va) {
+            ++st.cpu_window_neighbour_pairs_contiguous;
+        } else if (page.pool_va - pit->second->pool_va == nva - va) {
+            ++st.cpu_window_neighbour_pairs_reversed;
+        }
+    }
+}
+
+// O29: the guest VA of `page`'s bytes (its home, else its store), 0 if it has neither yet.
+uint64_t page_position(const PhysicalPage& page) {
+    return page.home_va != 0 ? page.home_va : page.store_va;
+}
+
+// O29: the page mapped at translated-window slot `va`, or null.
+PhysicalPage* window_page_locked(XMemState& st, uint64_t va) {
+    if (!guest_window::in_window(va)) {
+        return nullptr;
+    }
+    auto sit = st.page_slots.find(va);
+    if (sit == st.page_slots.end()) {
+        return nullptr;
+    }
+    auto pit = st.physical_pages.find(sit->second);
+    return pit != st.physical_pages.end() ? pit->second.get() : nullptr;
+}
+
+// O29: moves `page`'s bytes to guest VA `want`, the home of `other` (a page in no window run),
+// whose bytes go where `page`'s were (its home or its store): two 64 KiB copies.
+void swap_frames_locked(XMemState& st, PhysicalPage& page, PhysicalPage& other, uint64_t want) {
+    const uint64_t ps = page.page_size;
+    const uint64_t from = page_position(page);
+    std::vector<uint8_t> tmp(static_cast<size_t>(ps));
+    std::memcpy(tmp.data(), host_of(want), tmp.size());
+    std::memcpy(host_of(want), host_of(from), tmp.size());
+    std::memcpy(host_of(from), tmp.data(), tmp.size());
+    other.home_va = page.home_va;  // 0 when `page` lived in a store
+    if (page.home_va == 0) {
+        other.store_va = page.store_va;  // the store block now holds `other`'s bytes
+        page.store_va = 0;
+    }
+    page.home_va = want;
+    st.moved_homes[want] = page.handle;
+    if (other.home_va != 0) {
+        st.moved_homes[other.home_va] = other.handle;
+    }
+    ++st.run_moves;
+    st.run_bytes_moved += 2 * ps;
+    retarget_window_slots_locked(page);
+    retarget_window_slots_locked(other);
+}
+
+// O29: puts `page`'s bytes at `want` (swapping with the page living there) unless that page is in
+// a window run or `page`'s bytes also serve another window slot. False if not possible.
+bool place_at_locked(XMemState& st, PhysicalPage& page, uint64_t want) {
+    if (page_position(page) == want) {
+        return true;
+    }
+    PhysicalPage* other = home_owner_locked(st, want);
+    if (page.window_slots.size() > 1 || other == nullptr || other == &page || !other->window_slots.empty() ||
+        other->page_size != page.page_size) {
+        return false;
+    }
+    swap_frames_locked(st, page, *other, want);
+    return true;
+}
+
+// O29: merging runs. Moves the pages of the window run [first, first + n slots) into n consecutive
+// frames (homes of pages that are in no window run) of a real mapping outside the window, in slot
+// order. False if a page of the run serves another window slot or no such frames exist.
+bool relocate_run_locked(XMemState& st, uint64_t first, uint64_t n, uint64_t ps) {
+    std::vector<PhysicalPage*> members;
+    members.reserve(static_cast<size_t>(n));
+    for (uint64_t i = 0; i < n; ++i) {
+        PhysicalPage* m = window_page_locked(st, first + i * ps);
+        if (m == nullptr || m->window_slots.size() != 1 || m->page_size != ps) {
+            return false;
+        }
+        members.push_back(m);
+    }
+    // First fit: n consecutive guest VAs of real mappings outside the window whose bytes belong
+    // to pages in no window run.
+    uint64_t start = 0;
+    uint64_t found = 0;
+    uint64_t prev = 0;
+    for (const auto& [va, handle] : st.page_slots) {
+        if (guest_window::in_window(va)) {
+            continue;
+        }
+        PhysicalPage* owner = home_owner_locked(st, va);
+        const bool free = owner != nullptr && owner->window_slots.empty() && owner->page_size == ps;
+        if (!free) {
+            found = 0;
+            continue;
+        }
+        if (found == 0 || va != prev + ps) {
+            start = va;
+            found = 0;
+        }
+        prev = va;
+        if (++found == n) {
+            break;
+        }
+    }
+    if (found != n) {
+        return false;
+    }
+    for (uint64_t i = 0; i < n; ++i) {
+        const uint64_t want = start + i * ps;
+        PhysicalPage* other = home_owner_locked(st, want);
+        if (other == nullptr) {
+            return false;  // cannot happen: checked above, and members never own these frames
+        }
+        swap_frames_locked(st, *members[static_cast<size_t>(i)], *other, want);
+    }
+    ++st.run_relocations;
+    return true;
+}
+
+// O29: window-centric placement. Under the translated window a slot aliases its page's bytes, so
+// two adjacent slots are host-contiguous only when their pages' bytes are. `page` was just mapped
+// at window slot `va` (already listed in its window_slots). Runs on either side are contiguous
+// already (this keeps them so), so `page`'s bytes must sit right after the left run's last page
+// and right before the right run's first: moved there by a frame swap with the page living at that
+// position when needed. When the two sides do not line up, or that page is itself in a run, the
+// whole merged run moves to consecutive free frames (merging runs copies). What cannot be kept
+// contiguous - a page whose bytes serve two window slots, no free frames - is a break: counted,
+// and reported to guest_window (whose handler stops the guest). Active only while contiguous runs
+// are required.
+void keep_window_run_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
+    // Only code lifted with contiguous runs needs it: moving pages leaves the pool view's VAs
+    // naming other pages' bytes (the title never reads its pool view, os/xmem_windows.h), which
+    // the plain windowed model has no reason to accept.
+    if (!guest_window::contiguous_runs_required()) {
+        return;
+    }
+    struct Keeping {
+        XMemState& st;
+        explicit Keeping(XMemState& s) : st(s) { st.keeping_runs = true; }
+        ~Keeping() { st.keeping_runs = false; }
+    } keeping(st);
+    const uint64_t ps = page.page_size;
+    PhysicalPage* left = window_page_locked(st, va - ps);
+    PhysicalPage* right = window_page_locked(st, va + ps);
+    if (left == nullptr && right == nullptr) {
+        return;
+    }
+    if (left != nullptr) {
+        page_bytes_locked(*left);
+    }
+    if (right != nullptr) {
+        page_bytes_locked(*right);
+    }
+    page_bytes_locked(page);
+    const uint64_t want = left != nullptr ? page_position(*left) + ps : page_position(*right) - ps;
+    const bool sides_line_up = left == nullptr || right == nullptr || page_position(*right) == page_position(*left) + 2 * ps;
+    if (sides_line_up && page_position(page) == want) {
+        ++st.run_kept;
+        return;
+    }
+    if (sides_line_up && ps == kXMemPageSize64K && place_at_locked(st, page, want)) {
+        return;
+    }
+    // Merge: move the whole run around `va` to fresh frames.
+    uint64_t first = va;
+    while (window_page_locked(st, first - ps) != nullptr) {
+        first -= ps;
+    }
+    uint64_t last = va;
+    while (window_page_locked(st, last + ps) != nullptr) {
+        last += ps;
+    }
+    if (ps == kXMemPageSize64K && relocate_run_locked(st, first, (last - first) / ps + 1, ps)) {
+        return;
+    }
+    ++st.run_breaks;
+    guest_window::contiguity_violation(va);
 }
 
 // Maps `page` at slot `va` (guest VA); the caller validated the page and holds the lock.
@@ -428,8 +694,12 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
             return false;
         }
         page.window_slots.push_back(va);
+        keep_window_run_locked(st, va, page);  // O29: may move the page's bytes next to a neighbour's
+        bytes = page_bytes_locked(page);
+        retarget_window_slots_locked(page);
         guest_window::map_slot(va, bytes);
         xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
+        note_cpu_window_map_locked(st, va, page, *region);
         return true;
     }
     if (region != nullptr && !region->committed) {
@@ -457,9 +727,13 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
     } else if (page.home_va == 0) {
         std::memset(dst, 0, static_cast<size_t>(ps));
     }
+    if (page.pool_va == 0) {
+        page.pool_va = va;
+    }
     page.home_va = va;
     if (region != nullptr && region->cpu_window) {
         xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
+        note_cpu_window_map_locked(st, va, page, *region);
     }
     retarget_window_slots_locked(page);
     return true;
@@ -1885,6 +2159,62 @@ bool xmem_unmap_physical_pages(void* virtual_address) {
     return true;
 }
 
+XMemWindowContiguity xmem_window_contiguity() {
+    auto& st = xmem_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    XMemWindowContiguity c;
+    c.maps = st.cpu_window_maps;
+    c.neighbour_pairs = st.cpu_window_neighbour_pairs;
+    c.neighbour_pairs_contiguous = st.cpu_window_neighbour_pairs_contiguous;
+    c.neighbour_pairs_reversed = st.cpu_window_neighbour_pairs_reversed;
+    c.run_kept = st.run_kept;
+    c.run_moves = st.run_moves;
+    c.run_breaks = st.run_breaks;
+    c.run_relocations = st.run_relocations;
+    c.run_bytes_moved = st.run_bytes_moved;
+    for (const auto& [key, region] : st.virtual_regions) {
+        if (!region.cpu_window || region.phantom) {
+            continue;
+        }
+        XMemWindowContiguity::Region r;
+        r.base = region_guest_base(region);
+        r.size = region.size;
+        r.translated = region.translated;
+        uint64_t prev_va = 0;
+        const PhysicalPage* prev = nullptr;
+        uint64_t run = 0;
+        for (auto it = st.page_slots.lower_bound(r.base); it != st.page_slots.end() && it->first - r.base < r.size;
+             ++it) {
+            const auto pit = st.physical_pages.find(it->second);
+            const PhysicalPage* page = pit != st.physical_pages.end() ? pit->second.get() : nullptr;
+            const uint64_t ps = page != nullptr ? page->page_size : kXMemPageSize64K;
+            const bool aliased = page != nullptr && aliases_into(*page, r.base, region);
+            ++r.mapped_slots;
+            r.aliased_slots += aliased ? 1 : 0;
+            if (run != 0 && it->first == prev_va + ps) {
+                ++run;
+                ++r.adjacent_pairs;
+                if (aliased && prev != nullptr && aliases_into(*prev, r.base, region)) {
+                    ++r.aliased_pairs;
+                    if (page->pool_va == prev->pool_va + ps) {
+                        ++r.contiguous_pairs;
+                    }
+                }
+            } else {
+                ++r.runs;
+                run = 1;
+            }
+            r.longest_run = std::max(r.longest_run, run);
+            prev_va = it->first;
+            prev = page;
+        }
+        c.regions.push_back(r);
+    }
+    std::sort(c.regions.begin(), c.regions.end(),
+              [](const XMemWindowContiguity::Region& a, const XMemWindowContiguity::Region& b) { return a.base < b.base; });
+    return c;
+}
+
 void xmem_reset_for_testing() {
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
@@ -1908,6 +2238,17 @@ void xmem_reset_for_testing() {
     st.virtual_regions.clear();
     st.region_index.clear();
     st.alias_conflicts = 0;
+    st.cpu_window_maps = 0;
+    st.cpu_window_neighbour_pairs = 0;
+    st.cpu_window_neighbour_pairs_contiguous = 0;
+    st.cpu_window_neighbour_pairs_reversed = 0;
+    st.run_kept = 0;
+    st.run_moves = 0;
+    st.run_breaks = 0;
+    st.run_relocations = 0;
+    st.run_bytes_moved = 0;
+    st.moved_homes.clear();
+    st.translated_window_live = false;
     xmem_windows::reset_for_testing();
     for (auto& [handle, page] : st.physical_pages) {
         if (page->store_va != 0) {

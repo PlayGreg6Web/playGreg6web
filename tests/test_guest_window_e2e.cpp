@@ -13,9 +13,14 @@
 // -DPLAYGTA6_E2E_LIFTED, the real lifted sub_140001000 from
 // recomp/src/lift/tests/exec_memory.rs `writes_the_runtime_window_fixture`.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -240,6 +245,110 @@ void run(const char* what, VirtualMemoryArena& arena, Title& t, LiftedFn fn) {
 
 }  // namespace
 
+// O29: replays a recorded XMem mapping sequence of CPU-window-shaped reservations (local data,
+// never in the repo; lines "R <va> <size> <phantom>", "M <va> <pfn> <region va>",
+// "U <va> <pfn> <region va>" in hex) under the translated window with XMem's window-centric
+// placement (`keep_runs`) or without it, and prints how contiguous the window's runs are. With `large_pages`, a page number
+// repeated at consecutive slots stands for consecutive pages (page + 0, + 1, ...).
+void replay_mapping_trace(const char* path, bool large_pages, bool keep_runs) {
+    const char* what = "replay";
+    std::FILE* f = std::fopen(path, "r");
+    CHECK(f != nullptr);
+    if (f == nullptr) {
+        return;
+    }
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    // With `keep_runs` XMem's window-centric placement works (as for code lifted with contiguous
+    // runs); a violation is only counted here.
+    gw::set_contiguous_runs_required(keep_runs, [](uint64_t) {});
+    struct Line {
+        char op;
+        uint64_t a, b, c;
+    };
+    std::vector<Line> lines;
+    char op = 0;
+    unsigned long long a = 0, b = 0, c = 0;
+    uint64_t min_pfn = ~uint64_t{0}, max_pfn = 0;
+    while (std::fscanf(f, " %c %llx %llx %llx", &op, &a, &b, &c) == 4) {
+        lines.push_back(Line{op, a, b, c});
+        if (op == 'M') {
+            min_pfn = std::min<uint64_t>(min_pfn, b);
+            max_pfn = std::max<uint64_t>(max_pfn, b);
+        }
+    }
+    std::fclose(f);
+    std::vector<std::pair<uint64_t, uint64_t>> regions;  // trace base -> replay base
+    for (const Line& l : lines) {
+        if (l.op == 'R' && l.c == 0) {
+            void* r = pg6_xbox_XMemVirtualAlloc(nullptr, l.b, kWindowType, 0x21u, 0x4u);
+            CHECK(r != nullptr);
+            regions.emplace_back(l.a, win32::get_vmem_arena()->guest_address(r));
+        }
+    }
+    if (regions.empty() || min_pfn > max_pfn) {
+        return;
+    }
+    regions[0].second = W;  // the first CPU window is the translated one
+    size_t count = static_cast<size_t>(max_pfn - min_pfn + 1 + (large_pages ? 16 : 0));
+    std::vector<uint64_t> pages(count);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pages.data()) == 1 && count == pages.size());
+    const auto replay_va = [&](uint64_t trace_va, uint64_t trace_region) {
+        for (const auto& [from, to] : regions) {
+            if (from == trace_region) {
+                return to + (trace_va - from);
+            }
+        }
+        return uint64_t{0};
+    };
+    std::unordered_map<uint64_t, uint64_t> raw;  // window slot -> trace page (for large_pages)
+    uint64_t maps = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (const Line& l : lines) {
+        if (l.op == 'R') {
+            continue;
+        }
+        const uint64_t va = replay_va(l.a, l.c);
+        if (va == 0) {
+            continue;
+        }
+        if (l.op == 'U') {
+            raw.erase(va);
+            CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&va, 1, nullptr) == 1);
+            continue;
+        }
+        uint64_t page = l.b - min_pfn;
+        if (large_pages && l.c == regions[0].first) {
+            uint64_t k = 0;
+            while (k < 15 && raw.count(va - (k + 1) * k64K) != 0 && raw[va - (k + 1) * k64K] == l.b) {
+                ++k;
+            }
+            raw[va] = l.b;
+            page += k;
+        }
+        ++maps;
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&va, 1, &pages[page]) == 1);
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const XMemWindowContiguity c2 = xmem_window_contiguity();
+    const gw::Stats s = gw::stats();
+    std::printf("  replay (%s, %s): %zu lines, %llu maps in %.0f ms; window: %llu mapped slots, %llu contiguous / %llu "
+                "split neighbour pairs; run keeper: %llu kept, %llu moved (%llu MiB copied), %llu run merges, %llu broken\n",
+                large_pages ? "page + slot offset" : "as recorded", keep_runs ? "runs kept" : "aliased",
+                lines.size(), static_cast<unsigned long long>(maps), ms,
+                static_cast<unsigned long long>(s.mapped_slots), static_cast<unsigned long long>(s.contiguous_pairs),
+                static_cast<unsigned long long>(s.split_pairs), static_cast<unsigned long long>(c2.run_kept),
+                static_cast<unsigned long long>(c2.run_moves),
+                static_cast<unsigned long long>(c2.run_bytes_moved >> 20),
+                static_cast<unsigned long long>(c2.run_relocations), static_cast<unsigned long long>(c2.run_breaks));
+    gw::set_contiguous_runs_required(false);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 int main() {
     std::printf("test_guest_window_e2e\n");
     const char* what = "setup";
@@ -274,6 +383,14 @@ int main() {
     }
     xmem_reset_for_testing();
     gw::reset_for_testing();
+    // Local measurement only (the trace is derived from a run of the title, never checked in).
+    if (const char* trace = std::getenv("PLAYGTA6_XMEM_REPLAY")) {
+        for (const bool large_pages : {false, true}) {
+            for (const bool keep_runs : {false, true}) {
+                replay_mapping_trace(trace, large_pages, keep_runs);
+            }
+        }
+    }
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window_e2e: %d failure(s)\n", g_failures);
         return 1;

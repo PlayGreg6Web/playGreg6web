@@ -156,6 +156,17 @@ private:
     std::vector<Bounce> bounces_;  // empty (no allocation) unless a window buffer is split
 };
 
+// Contiguous runs (O29): code lifted with the windowed model's `contiguous_runs` has no straddle
+// check, so every two adjacent mapped slots must sit on adjacent host pages. The XMem layer keeps
+// them so where it can (it moves a page's bytes to the frame next to its neighbour's); when it
+// cannot, and runs are required, it reports the slot through the violation handler (the boot's
+// stops the guest with a fault) instead of letting lifted code read the wrong bytes.
+using ContiguityViolationFn = void (*)(uint64_t window_va);
+void set_contiguous_runs_required(bool required, ContiguityViolationFn on_violation = nullptr);
+bool contiguous_runs_required();
+// Reports a slot whose neighbours could not be kept host-contiguous (no-op unless required).
+void contiguity_violation(uint64_t window_va);
+
 struct Stats {
     uint64_t mapped_slots = 0;
     // Adjacent pairs of mapped slots whose host pages are adjacent / not adjacent: how often a

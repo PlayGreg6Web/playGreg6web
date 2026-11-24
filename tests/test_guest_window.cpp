@@ -296,6 +296,22 @@ void test_xmem_translated_cpu_window() {
     const gw::Stats s = gw::stats();
     CHECK(s.mapped_slots == 6 && s.contiguous_pairs == 2 && s.split_pairs == 0);
     CHECK(xw::accounting().cpu_window_mapped == 6 * k64K);
+    // O29: XMem's view of the same mapping sequence (what the boot report records).
+    {
+        const XMemWindowContiguity c = xmem_window_contiguity();
+        CHECK(c.maps == 6 && c.neighbour_pairs == 2 && c.neighbour_pairs_contiguous == 2);
+        const XMemWindowContiguity::Region* cpu_region = nullptr;
+        for (const auto& r : c.regions) {
+            cpu_region = r.translated ? &r : cpu_region;
+        }
+        CHECK(cpu_region != nullptr);
+        if (cpu_region != nullptr) {
+            CHECK(cpu_region->base == W && cpu_region->mapped_slots == 6 && cpu_region->aliased_slots == 6);
+            CHECK(cpu_region->runs == 4 && cpu_region->longest_run == 3);
+            CHECK(cpu_region->adjacent_pairs == 2 && cpu_region->aliased_pairs == 2 &&
+                  cpu_region->contiguous_pairs == 2);
+        }
+    }
 
     // Unmap one slot (it traps afterwards), remap another slot to a different page.
     const uint64_t unmap[] = {W + 9 * GiB};
@@ -333,6 +349,81 @@ void test_xmem_translated_cpu_window() {
     gw::reset_for_testing();
 }
 
+uint64_t g_violation = 0;
+void record_violation(uint64_t window_va) {
+    g_violation = window_va;
+}
+
+// O29: window-centric placement. A page mapped next to a mapped window slot whose bytes are not
+// its neighbours' moves there (a frame swap with the page living at the wanted position); what
+// cannot be kept contiguous is counted and, with contiguous runs required, reported.
+void test_xmem_window_run_keeper() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    CHECK(cpu != nullptr && va_of(cpu) == W);
+    constexpr size_t kPool = 16;
+    size_t count = kPool;
+    uint64_t pfn[kPool] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == kPool);
+    void* view = pg6_xbox_XMemVirtualAlloc(nullptr, kPool * k64K, kWindowType & ~0x400000u, 0x23u, kCpuProtect);
+    CHECK(view != nullptr && pg6_xbox_XMemMapPhysicalPages(view, kPool, pfn) == view);
+    auto* pool = static_cast<uint8_t*>(view);
+    for (size_t p = 0; p < kPool; ++p) {
+        std::memset(pool + p * k64K, static_cast<int>(0x40 + p), k64K);
+    }
+    const auto byte_at = [](uint64_t va) {
+        uint8_t b = 0;
+        CHECK(gw::copy_from_guest(&b, va, 1));
+        return b;
+    };
+
+    // The keeper works while contiguous runs are required (a violation handler that only records).
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+    // Slot 0 <- page 5, slot 1 <- page 9: page 9's bytes swap frames with page 6 (in no window run).
+    const uint64_t a[] = {W, W + k64K};
+    const uint64_t pa[] = {pfn[5], pfn[9]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(a, 2, pa) == 1);
+    CHECK(gw::contiguous(W + k64K - 8, 16) != nullptr);
+    CHECK(byte_at(W) == 0x45 && byte_at(W + k64K) == 0x49 && byte_at(W + 2 * k64K - 1) == 0x49);
+    // Page 6 kept its bytes (now in page 9's old frame): visible when it is mapped somewhere.
+    const uint64_t b[] = {W + 8 * k64K};
+    const uint64_t pb[] = {pfn[6]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(b, 1, pb) == 1);
+    CHECK(byte_at(W + 8 * k64K + 77) == 0x46);
+    // Mapping to the left of a run works too: slot 7 <- page 2 moves next to page 6's frame.
+    const uint64_t c[] = {W + 7 * k64K};
+    const uint64_t pc[] = {pfn[2]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(c, 1, pc) == 1);
+    CHECK(gw::contiguous(W + 8 * k64K - 8, 16) != nullptr && byte_at(W + 7 * k64K) == 0x42);
+    XMemWindowContiguity s = xmem_window_contiguity();
+    CHECK(s.run_moves == 2 && s.run_breaks == 0 && s.run_bytes_moved == 4 * k64K);
+
+    CHECK(g_violation == 0);
+    // The same page at two adjacent slots (one copy of its bytes cannot sit at both): a break,
+    // reported through guest_window.
+    const uint64_t d[] = {W + 2 * k64K};
+    const uint64_t pd[] = {pfn[9]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(d, 1, pd) == 1);
+    CHECK(g_violation == W + 2 * k64K);
+    s = xmem_window_contiguity();
+    CHECK(s.run_breaks == 1);
+    CHECK(gw::contiguous(W + 2 * k64K - 8, 16) == nullptr);
+    gw::set_contiguous_runs_required(false);
+    CHECK(!gw::contiguous_runs_required());
+
+    // Unmapping the pool view slot whose frame now holds page 9's bytes keeps them (store).
+    CHECK(pg6_xbox_XMemMapPhysicalPages(static_cast<uint8_t*>(view) + 6 * k64K, 1, nullptr) != nullptr);
+    CHECK(byte_at(W + k64K + 5) == 0x49);
+
+    CHECK(xmem_virtual_free(cpu));
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -341,6 +432,7 @@ int main() {
     test_slow_path_helpers();
     test_com_bridge_window();
     test_xmem_translated_cpu_window();
+    test_xmem_window_run_keeper();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;

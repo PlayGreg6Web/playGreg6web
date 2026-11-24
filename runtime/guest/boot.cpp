@@ -293,6 +293,7 @@ struct BootState {
     int32_t exit_code = 0;
     bool has_exit_code = false;
     std::string message;
+    std::string memory_model = "flat";  // describe_memory_model of the boot's model (O29)
     FaultRecord fault;
 
     std::string last_report;
@@ -1877,6 +1878,35 @@ std::string build_report() {
     } else {
         o += "    \"main_thread\": null},\n";
     }
+    {
+        // O29: the memory model, how the title maps pool pages into its CPU windows (adjacent
+        // slots holding pool-view neighbours are host-contiguous under the translated window) and
+        // the translated window's own slot table.
+        const os::scarlett::XMemWindowContiguity c = os::scarlett::xmem_window_contiguity();
+        const os::guest_window::Stats w = os::guest_window::stats();
+        o += "  \"memory\": {\"model\": " + json_string(b.memory_model) +
+             ", \"cpu_window\": {\"maps\": " + std::to_string(c.maps) +
+             ", \"neighbour_pairs\": " + std::to_string(c.neighbour_pairs) +
+             ", \"neighbour_pairs_contiguous\": " + std::to_string(c.neighbour_pairs_contiguous) +
+             ", \"neighbour_pairs_reversed\": " + std::to_string(c.neighbour_pairs_reversed) +
+             ", \"regions\": [";
+        for (size_t k = 0; k < c.regions.size(); ++k) {
+            const auto& r = c.regions[k];
+            o += std::string(k == 0 ? "" : ", ") + "{\"base\": " + hex(r.base) + ", \"size\": " + hex(r.size) +
+                 ", \"translated\": " + (r.translated ? "true" : "false") +
+                 ", \"mapped_slots\": " + std::to_string(r.mapped_slots) +
+                 ", \"aliased_slots\": " + std::to_string(r.aliased_slots) + ", \"runs\": " + std::to_string(r.runs) +
+                 ", \"longest_run\": " + std::to_string(r.longest_run) +
+                 ", \"adjacent_pairs\": " + std::to_string(r.adjacent_pairs) +
+                 ", \"aliased_pairs\": " + std::to_string(r.aliased_pairs) +
+                 ", \"contiguous_pairs\": " + std::to_string(r.contiguous_pairs) + "}";
+        }
+        o += std::string("]}, \"window\": {\"enabled\": ") + (os::guest_window::enabled() ? "true" : "false") +
+             ", \"mapped_slots\": " + std::to_string(w.mapped_slots) +
+             ", \"contiguous_pairs\": " + std::to_string(w.contiguous_pairs) +
+             ", \"split_pairs\": " + std::to_string(w.split_pairs) + ", \"map_calls\": " +
+             std::to_string(w.map_calls) + "}},\n";
+    }
     o += "  \"elapsed_ms\": " + std::to_string(elapsed_ms()) + "\n";
     o += "}\n";
     return o;
@@ -2535,8 +2565,9 @@ BootResult run_boot(const BootConfig& config) {
         fail_setup(BootStatus::BadConfig, error);
         return finish();
     }
+    b.memory_model = describe_memory_model(config.memory);
     if (!is_default_memory_model(config.memory)) {
-        logf("guest boot: memory model %s", describe_memory_model(config.memory).c_str());
+        logf("guest boot: memory model %s", b.memory_model.c_str());
     }
     for (size_t i = 0; i < config.modules.size(); ++i) {
         const BootModule& in = config.modules[i];

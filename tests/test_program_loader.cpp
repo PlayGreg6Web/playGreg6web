@@ -604,7 +604,7 @@ void test_memory_model(VirtualMemoryArena& arena) {
     };
     Pg6GuestMemoryModel runs = kWindowed;
     runs.flags |= kPg6MemoryContiguousRuns;
-    refused(runs, "contiguous window runs");
+    CHECK(memory_model_unsupported(runs).empty());  // served: XMem keeps window runs contiguous
     Pg6GuestMemoryModel moved = kWindowed;
     moved.window_base += 0x10000;
     refused(moved, "is not this runtime's");
@@ -650,6 +650,7 @@ void test_memory_model(VirtualMemoryArena& arena) {
     // A window VA translates through the table (unmapped: no host address), others flat.
     CHECK(window::translate(kGuestWindowBase + 0x1234) == nullptr);
     CHECK(window::translate(kE) == arena.translate(kE));
+    CHECK(!window::contiguous_runs_required());
     reset_boot();
     CHECK(window::enabled() == window_was_on);
     CHECK(xw::policy() == policy);
@@ -661,12 +662,23 @@ void test_memory_model(VirtualMemoryArena& arena) {
     CHECK_CODE(prepare_program_boot({kPg6ProgramVersion, 1, modules},
                                     memory_image_source({{"main", exe_image()}}), {}, pb),
                ProgramErrorCode::Ok);
-    pb.config.memory = runs;
+    pb.config.memory = moved;
     const BootResult bad = boot(pb);
     CHECK(bad.status == BootStatus::BadConfig);
-    CHECK(bad.summary.find("contiguous window runs") != std::string::npos);
+    CHECK(bad.summary.find("is not this runtime's") != std::string::npos);
     CHECK(!window::enabled());
     reset_boot();
+
+    // Contiguous runs: the boot requires them of XMem for its duration.
+    CHECK_CODE(prepare_program_boot({kPg6ProgramVersion, 1, modules},
+                                    memory_image_source({{"main", exe_image()}}), {}, pb),
+               ProgramErrorCode::Ok);
+    pb.config.memory = runs;
+    pb.config.call_entry = false;
+    CHECK(boot(pb).status == BootStatus::Exited);
+    CHECK(window::contiguous_runs_required());
+    reset_boot();
+    CHECK(!window::contiguous_runs_required() && !window::enabled());
 }
 
 }  // namespace

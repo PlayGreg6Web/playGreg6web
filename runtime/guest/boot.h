@@ -121,7 +121,11 @@
 // template_start, template_size, zero_fill, alignment, index_va, callbacks [va], callbacks_run}}],
 // lifted_tables, functions_registered, imports {total, bound, unresolved, by_dll [{dll, bound,
 // unresolved}]}, process {peb, process_parameters}, main_thread {teb, stack_base, stack_limit,
-// tls_vector, tls_block}}, elapsed_ms. Addresses are "0x..." strings (null when absent); counts
+// tls_vector, tls_block}}, memory {model, cpu_window {maps, neighbour_pairs,
+// neighbour_pairs_contiguous, neighbour_pairs_reversed, regions [{base, size, translated, mapped_slots, aliased_slots, runs,
+// longest_run, adjacent_pairs, aliased_pairs, contiguous_pairs}]} (os/xbox_scarlett.h
+// XMemWindowContiguity), window {enabled, mapped_slots,
+// contiguous_pairs, split_pairs, map_calls} (os/guest_window.h)}, elapsed_ms. Addresses are "0x..." strings (null when absent); counts
 // are numbers. Fault kinds: trap, unimplemented, unimplemented_slot, divide_error, unknown_target,
 // stack_imbalance, bad_stack, unresolved_import, crt_abort, crt_terminate, crt_invalid_parameter,
 // crt_purecall, cxx_throw, longjmp, dispatch_limit, wall_time_limit, and the harness's host_*

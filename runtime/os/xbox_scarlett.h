@@ -359,6 +359,39 @@ uint64_t xmem_guest_hook_table();
 bool xmem_get_allocation_info(const void* address, XMemAllocInfo* out_info);
 bool xmem_virtual_free(void* address);
 bool xmem_unmap_physical_pages(void* virtual_address);
+// O29: how the title maps pool pages into its CPU windows. A window slot of a page whose first
+// mapping lies elsewhere (the pool view) aliases those bytes under the translated window; two
+// adjacent such slots are host-contiguous when their pages are pool-view neighbours. Event
+// counters cover every aliasing mapping since the reset; `regions` (in address order) the current
+// mappings of every CPU-window-shaped reservation (the pool view is one too: its pages live there).
+struct XMemWindowContiguity {
+    uint64_t maps = 0;                        // aliasing pages mapped into a CPU window
+    uint64_t neighbour_pairs = 0;             // ... next to a mapped aliasing slot (each side)
+    uint64_t neighbour_pairs_contiguous = 0;  // ... whose page is its pool-view neighbour
+    uint64_t neighbour_pairs_reversed = 0;    // ... its pool-view neighbour in reverse order
+    // The translated window's run keeper (window-centric placement): new slots next to a mapped
+    // one that already sat next to its bytes / were moved there (a 2 x 64 KiB frame swap) / could
+    // not be kept contiguous.
+    uint64_t run_kept = 0;
+    uint64_t run_moves = 0;
+    uint64_t run_breaks = 0;
+    uint64_t run_relocations = 0;  // whole runs moved to fresh frames to merge with a neighbour
+    uint64_t run_bytes_moved = 0;
+    struct Region {
+        uint64_t base = 0;
+        uint64_t size = 0;
+        bool translated = false;
+        uint64_t mapped_slots = 0;
+        uint64_t aliased_slots = 0;     // slots of pages that live elsewhere
+        uint64_t runs = 0;              // maximal runs of consecutive mapped slots
+        uint64_t longest_run = 0;
+        uint64_t adjacent_pairs = 0;    // consecutive mapped slot pairs
+        uint64_t aliased_pairs = 0;     // ... both aliasing
+        uint64_t contiguous_pairs = 0;  // ... holding pool-view neighbours
+    };
+    std::vector<Region> regions;
+};
+XMemWindowContiguity xmem_window_contiguity();
 void xmem_reset_for_testing();
 
 // DirectStorage backing hooks (in-memory virtual file table + host read callback + HTTPFS fallback).
