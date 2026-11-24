@@ -344,11 +344,11 @@
     X(pg6_mw_acp_hal_allocate_shape_contexts, ok, "") \
     X(pg6_mw_acp_hal_release_shape_contexts, ok, "") \
     X(pg6_mw_apu_create_heap, ok, "") \
-    X(pg6_mw_apu_alloc, pending, "allocates from the host heap and stores the host pointer into guest memory; move to the guest heap (O24) first") \
-    X(pg6_mw_apu_free, pending, "pairs with ApuAlloc (host heap)") \
-    X(pg6_mw_apu_is_virtual_address_valid, pending, "pairs with ApuAlloc (host heap)") \
-    X(pg6_mw_apu_map_apu_address, pending, "pairs with ApuAlloc (host heap)") \
-    X(pg6_mw_apu_map_virtual_address, pending, "pairs with ApuAlloc (host heap)") \
+    X(pg6_mw_apu_alloc, ok, "guest heap block (O24, zero-filled); the out-parameter receives its guest address; APU addresses are synthetic") \
+    X(pg6_mw_apu_free, ok, "releases the guest heap block") \
+    X(pg6_mw_apu_is_virtual_address_valid, ok, "") \
+    X(pg6_mw_apu_map_apu_address, ok, "returns the block address (translated by the thunk)") \
+    X(pg6_mw_apu_map_virtual_address, ok, "") \
     /* ---- xapu / chad (loopback sessions) ---- */ \
     X(pg6_mw_xapu_connect, ok, "synthetic handle") \
     X(pg6_mw_xapu_disconnect, ok, "") \

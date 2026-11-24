@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "os/guest_heap.h"
 #include "os/win32_loader.h"
 #include "os/xasync_provider.h"
 
@@ -210,8 +211,9 @@ bool is_live_bink_locked(const BinkGlobals& g, Pg6HBink bink) {
 // ---------------------------------------------------------------------------
 
 struct ApuBlock {
-    std::unique_ptr<uint8_t[]> raw_storage;
-    uint8_t* aligned_ptr = nullptr;
+    // Guest heap block (O24): guest memory the title reads and writes, accounted as guest memory.
+    uint64_t va = 0;
+    uint8_t* aligned_ptr = nullptr;  // host view of `va`
     uint32_t size = 0;
     uint32_t alignment = 16;
     uint32_t flags = 0;
@@ -1507,16 +1509,6 @@ Pg6HResult pg6_mw_apu_alloc(void** virtual_address,
     }
 
     const uint32_t align = mw::normalize_alignment(alignment_in_bytes);
-    const size_t total_alloc = static_cast<size_t>(size_in_bytes) + static_cast<size_t>(align);
-    std::unique_ptr<uint8_t[]> raw(new (std::nothrow) uint8_t[total_alloc]());
-    if (!raw) {
-        return gdk::E_OUTOFMEMORY_HR;
-    }
-
-    const uintptr_t base = reinterpret_cast<uintptr_t>(raw.get());
-    const uintptr_t aligned = (base + (static_cast<uintptr_t>(align) - 1u)) &
-                              ~(static_cast<uintptr_t>(align) - 1u);
-    auto* aligned_ptr = reinterpret_cast<uint8_t*>(aligned);
 
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
@@ -1527,19 +1519,28 @@ Pg6HResult pg6_mw_apu_alloc(void** virtual_address,
     if (next_aligned + size_in_bytes > 0xFFFF0000ULL) {
         return gdk::E_OUTOFMEMORY_HR;
     }
+
+    // Guest memory (the title reads and writes it), zero-filled like the console's APU heap.
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    const uint64_t va = heap.alloc(size_in_bytes, align, playgta6::os::HeapFamily::Other,
+                                   playgta6::os::kHeapZeroMemory);
+    if (va == 0) {
+        return gdk::E_OUTOFMEMORY_HR;
+    }
     const Pg6ApuAddress apu_addr = static_cast<Pg6ApuAddress>(next_aligned);
     g.next_apu_addr = static_cast<Pg6ApuAddress>(next_aligned + size_in_bytes);
 
     mw::ApuBlock block{};
-    block.raw_storage = std::move(raw);
-    block.aligned_ptr = aligned_ptr;
+    block.va = va;
+    block.aligned_ptr = heap.to_host(va);
     block.size = size_in_bytes;
     block.alignment = align;
     block.flags = flags;
     block.apu_addr = apu_addr;
     g.blocks.push_back(std::move(block));
 
-    *virtual_address = aligned_ptr;
+    // Stored into guest memory: the guest address of the block.
+    *virtual_address = reinterpret_cast<void*>(static_cast<uintptr_t>(va));
     if (physical_address != nullptr) {
         *physical_address = apu_addr;
     }
@@ -1554,6 +1555,7 @@ Pg6HResult pg6_mw_apu_free(void* virtual_address) {
     std::lock_guard<std::mutex> lock(g.mutex);
     for (auto it = g.blocks.begin(); it != g.blocks.end(); ++it) {
         if (it->aligned_ptr == virtual_address) {
+            playgta6::os::default_guest_heap().free(it->va);
             g.blocks.erase(it);
             return gdk::S_OK_HR;
         }

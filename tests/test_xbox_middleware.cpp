@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "os/guest_heap.h"
 #include "os/win32_loader.h"
 #include "os/xbox_middleware.h"
 #include "os/xgameruntime.h"
@@ -462,13 +463,18 @@ void test_audio_apu_xapu_xdsp() {
     // ApuCreateHeap -> ApuAlloc -> validity/mapping -> ApuFree round-trip.
     CHECK(pg6_mw_apu_create_heap(4u * 1024u * 1024u, 2u * 1024u * 1024u) == S_OK_HR);
 
-    void* virt = nullptr;
+    void* virt_va = nullptr;
     Pg6ApuAddress phys = 0u;
-    CHECK(pg6_mw_apu_alloc(&virt, &phys, 4096u, 256u, 0u) == S_OK_HR);
-    CHECK(virt != nullptr);
+    CHECK(pg6_mw_apu_alloc(&virt_va, &phys, 4096u, 256u, 0u) == S_OK_HR);
+    CHECK(virt_va != nullptr);
     CHECK(phys != 0u);
-    CHECK((reinterpret_cast<uintptr_t>(virt) % 256u) == 0u);
+    CHECK((reinterpret_cast<uintptr_t>(virt_va) % 256u) == 0u);
     CHECK((phys % 256u) == 0u);
+    // The out-parameter holds a guest address (a guest heap block, O24); the other entry points
+    // take host pointers, as the import bridge passes them.
+    playgta6::os::GuestHeap& guest_heap = playgta6::os::default_guest_heap();
+    CHECK(guest_heap.owns(reinterpret_cast<uintptr_t>(virt_va)));
+    void* virt = guest_heap.to_host(reinterpret_cast<uintptr_t>(virt_va));
 
     // Memory is readable/writable and valid within range.
     std::memset(virt, 0x5A, 4096u);
@@ -486,6 +492,7 @@ void test_audio_apu_xapu_xdsp() {
     CHECK(pg6_mw_apu_is_virtual_address_valid(virt, 16u) == 0);
     CHECK(pg6_mw_apu_map_apu_address(phys) == nullptr);
     CHECK(pg6_mw_apu_free(virt) == E_INVALIDARG_HR);
+    CHECK(!guest_heap.owns(reinterpret_cast<uintptr_t>(virt_va)));  // released to the guest heap
 
     // XApu connect / enqueue / result count / dequeue / disconnect.
     Pg6XApuHandle xapu = nullptr;
