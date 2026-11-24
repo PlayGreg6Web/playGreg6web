@@ -343,6 +343,22 @@ def compile_unit(unit: Unit, cfg: CompileConfig, runner: CommandRunner = run_com
     # The manifest hash is the content identity when present (cheap, and survives --delete-ir).
     content = None if unit.manifest_hash is not None else _read(unit.ll)
     key = cache_key(unit, cfg, content)
+    # Units with the same content share a cache key (identical shards in different modules): one
+    # compiles, the others wait for it and take the cached object.
+    with _key_lock(key):
+        return _compile_keyed(unit, cfg, runner, key, start)
+
+
+_KEY_LOCKS: dict[str, threading.Lock] = {}
+_KEY_LOCKS_GUARD = threading.Lock()
+
+
+def _key_lock(key: str) -> threading.Lock:
+    with _KEY_LOCKS_GUARD:
+        return _KEY_LOCKS.setdefault(key, threading.Lock())
+
+
+def _compile_keyed(unit: Unit, cfg: CompileConfig, runner: CommandRunner, key: str, start: float) -> UnitResult:
     obj = cfg.cache_dir / f"{key}{cfg.obj_suffix}"
     if obj.is_file():
         return UnitResult(unit, obj, True, time.monotonic() - start)
