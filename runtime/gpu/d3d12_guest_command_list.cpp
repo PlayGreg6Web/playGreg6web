@@ -912,6 +912,10 @@ constexpr Guid kCommandListIids[] = {
     com::make_guid("8754318e-d3a9-4541-98cf-645b50dc4874"),  // ID3D12GraphicsCommandList4
     com::make_guid("55050859-4024-474c-87f5-6472eaee44ea"),  // ID3D12GraphicsCommandList5
     com::make_guid("c3827890-e548-4cfa-96cf-5689a9370f80"),  // ID3D12GraphicsCommandList6
+    // Requested by the title from CreateCommandList (Xbox slot 73), first for a direct list: the
+    // Xbox runtime's own graphics-command-list IID (the vtable this interface implements, Xbox
+    // slots included, was built from the title's command-list calls).
+    com::make_guid("c3827890-4024-474c-98cf-645b51dc4874"),
 };
 
 constexpr com::InterfaceOptions list_options() {

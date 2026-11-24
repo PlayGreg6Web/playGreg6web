@@ -48,6 +48,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -406,6 +407,9 @@ struct DescriptorHeapDesc {
     uint32_t num_descriptors = 0;
     uint32_t flags = DescriptorHeapFlags::None;
     uint32_t node_mask = 0;
+    // Non-zero: the heap's CPU descriptor handles are this address + index * increment (an
+    // Xbox descriptor heap placed in title memory). Zero: tagged registry handles.
+    uint64_t cpu_address = 0;
 };
 
 class DescriptorHeap {
@@ -535,6 +539,9 @@ private:
     uint32_t next_unused_slot_ = 0;          // guarded by mutex_
     std::atomic<uint32_t> live_heaps_{0};
     mutable std::mutex mutex_;
+    // Heaps placed at a CPU address (DescriptorHeapDesc::cpu_address), by address.
+    std::map<uint64_t, DescriptorHeap*> placed_;  // guarded by placed_mutex_
+    mutable std::shared_mutex placed_mutex_;
 };
 
 // ---------------------------------------------------------------------------

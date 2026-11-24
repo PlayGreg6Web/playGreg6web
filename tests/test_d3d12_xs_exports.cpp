@@ -407,6 +407,17 @@ void test_queue_allocator_fence() {
     CHECK(fx.create(device, Slot::CreateCommandQueue, {I(bad)}, dg::IID_ID3D12CommandQueue, &result) == 0);
     CHECK(result == dg::kEInvalidArg);
     CHECK(dev->stats().bad_arguments == 1);
+    // Compute queues with the Xbox queue flag bit 1 (flags 2 and 3) are accepted; unknown bits are not.
+    for (uint32_t flags : {2u, 3u}) {
+        const uint64_t flagged = put(dg::GuestCommandQueueDesc{2, 0, flags, 0});
+        const uint64_t q = fx.create(device, Slot::CreateCommandQueueX, {I(flagged)}, dg::IID_ID3D12CommandQueue, &result);
+        CHECK(q != 0 && result == 0);
+        fx.vcall(q, Slot::Release);
+    }
+    const uint64_t unknown_flags = put(dg::GuestCommandQueueDesc{2, 0, 4, 0});
+    CHECK(fx.create(device, Slot::CreateCommandQueueX, {I(unknown_flags)}, dg::IID_ID3D12CommandQueue, &result) == 0);
+    CHECK(result == dg::kEInvalidArg);
+    CHECK(dev->stats().bad_arguments == 2);
 
     const uint64_t freq = put<uint64_t>(0);
     CHECK(hr(fx.vcall(queue, Slot::GetTimestampFrequency, {I(freq)})) == 0);
@@ -498,15 +509,18 @@ void test_descriptor_heaps() {
     auto* host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap);
     CHECK(host_heap != nullptr && host_heap->heap()->capacity() == 64);
 
-    // Struct returns: the executable passes the result pointer in rcx and `this` in rdx; the MSVC
-    // member order (this, result) works too.
+    // Struct returns: the executable passes the result pointer in rcx and `this` in rdx. With
+    // `this` in rcx an 8-byte handle comes back in rax (the executable's other call shape for
+    // slot 9; rdx is whatever the caller left there and is not written).
     const uint64_t result_buf = put<uint64_t>(0);
     CHECK(fx.sret_call(heap, Slot::GetCPUStart, result_buf) == result_buf);
     const uint64_t cpu_start = load64(result_buf);
     CHECK(cpu_start == host_heap->heap()->cpu_start().ptr);
+    // CPU handles point at guest memory of the heap's size (the executable writes through them).
+    CHECK(com::guest_to_host(cpu_start, 64 * 32) != nullptr);
     store64(result_buf, 0);
-    CHECK(fx.sret_call(heap, Slot::GetCPUStart, result_buf, {}, /*this_first=*/true) == result_buf);
-    CHECK(load64(result_buf) == cpu_start);
+    CHECK(fx.sret_call(heap, Slot::GetCPUStart, result_buf, {}, /*this_first=*/true) == cpu_start);
+    CHECK(load64(result_buf) == 0);
     CHECK(fx.sret_call(heap, Slot::GetGPUStart, result_buf) == result_buf);
     CHECK(load64(result_buf) == host_heap->heap()->gpu_start().ptr && load64(result_buf) != 0);
     CHECK(dg::sret_stats().result_first == 2 && dg::sret_stats().this_first == 1);
@@ -522,6 +536,35 @@ void test_descriptor_heaps() {
           view->num_elements_or_size == 256);
     fx.vcall(device, Slot::CopyDescriptorsSimple, {I(1), I(cpu_start + 10 * 32), I(cpu_start + 3 * 32), I(0)});
     CHECK(host_heap->heap()->view(10)->kind == d3d::DescriptorKind::Cbv);
+
+    // Xbox descriptor placed in title memory: {type, count, flags, node, address, size == count *
+    // increment}. Its CPU handles are that address plus index * increment.
+    {
+        struct PlacedDesc {
+            dg::GuestDescriptorHeapDesc base;
+            uint64_t address;
+            uint64_t size;
+        };
+        const uint64_t memory = 0x1'7000'0000ull;  // any address; descriptors live in the registry
+        const uint64_t placed_desc = put(PlacedDesc{{0, 8, 1, 1}, memory, 8 * 32});
+        const uint64_t placed = fx.create(device, Slot::CreateDescriptorHeap, {I(placed_desc)},
+                                          dg::IID_ID3D12DescriptorHeap, &result);
+        CHECK(result == 0 && placed != 0);
+        CHECK(fx.sret_call(placed, Slot::GetCPUStart, result_buf, {}, /*this_first=*/true) == memory);
+        auto* host_placed = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(placed);
+        fx.vcall(device, Slot::CreateConstantBufferView, {I(cbv), I(memory + 5 * 32)});
+        CHECK(host_placed->heap()->view(5) != nullptr && host_placed->heap()->view(5)->kind == d3d::DescriptorKind::Cbv);
+        // A second heap overlapping the first is refused; a size that does not match is a public desc.
+        CHECK(fx.create(device, Slot::CreateDescriptorHeap, {I(put(PlacedDesc{{0, 8, 1, 1}, memory + 64, 8 * 32}))},
+                        dg::IID_ID3D12DescriptorHeap, &result) == 0);
+        const uint64_t loose = fx.create(device, Slot::CreateDescriptorHeap,
+                                         {I(put(PlacedDesc{{0, 8, 1, 1}, memory + 0x10000, 7}))},
+                                         dg::IID_ID3D12DescriptorHeap, &result);
+        CHECK(loose != 0 && fx.sret_call(loose, Slot::GetCPUStart, result_buf, {}, true) != memory + 0x10000);
+        CHECK(dev->counter(dg::xbox::Counter::PlacedDescriptorHeaps) == 1);
+        fx.vcall(loose, Slot::Release);
+        fx.vcall(placed, Slot::Release);
+    }
 
     // Sampler heap + CreateSampler.
     const uint64_t smp_desc = put(dg::GuestDescriptorHeapDesc{1, 16, 1, 0});
@@ -1130,6 +1173,12 @@ struct Scene {
                                         {I(put(dg::GuestCommandListDescX{0, {6, 1, 0}})), I(allocator), I(0)},
                                         dg::IID_ID3D12GraphicsCommandList, &result);
         CHECK(result == 0 && list != 0);
+        // The executable asks slot 73 for the Xbox graphics-command-list IID; it is an alias.
+        const uint64_t xbox_iid = put(com::make_guid("c3827890-4024-474c-98cf-645b51dc4874"));
+        const uint64_t alias_out = put(uint64_t{0});
+        CHECK(hr(fx.vcall(list, 0, {I(xbox_iid), I(alias_out)})) == 0);
+        CHECK(load64(alias_out) == list);
+        fx.vcall(list, Slot::Release);
         CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
         return list;
     }

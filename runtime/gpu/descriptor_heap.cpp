@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <iterator>
 #include <cstring>
 #include <limits>
 
@@ -116,6 +117,9 @@ GpuDescriptorHandle DescriptorHeap::gpu_start() const noexcept {
 }
 
 CpuDescriptorHandle DescriptorHeap::cpu_handle(uint32_t index) const noexcept {
+    if (desc_.cpu_address != 0) {
+        return CpuDescriptorHandle{desc_.cpu_address + static_cast<uint64_t>(index) * increment()};
+    }
     return CpuDescriptorHandle{
         (static_cast<uint64_t>(kCpuTag | serial_) << 32) |
         (static_cast<uint64_t>(index) * increment())};
@@ -244,6 +248,28 @@ Status DescriptorHeapRegistry::create_heap(const DescriptorHeapDesc& desc, Descr
         return Status::InvalidArgument;
     }
 
+    const uint64_t placed_bytes = static_cast<uint64_t>(desc.num_descriptors) * descriptor_handle_increment_size(desc.type);
+    if (desc.cpu_address != 0) {
+        // CPU handles are plain addresses: below the tag bits, aligned, not overlapping another
+        // placed heap.
+        if ((desc.cpu_address >> 62) != 0 || ((desc.cpu_address + placed_bytes) >> 62) != 0 ||
+            desc.cpu_address > UINT64_MAX - placed_bytes || desc.cpu_address % 8 != 0) {
+            return Status::InvalidArgument;
+        }
+        std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+        auto next = placed_.lower_bound(desc.cpu_address);
+        if (next != placed_.end() && next->first < desc.cpu_address + placed_bytes) {
+            return Status::InvalidArgument;
+        }
+        if (next != placed_.begin()) {
+            const DescriptorHeap* prev = std::prev(next)->second;
+            if (std::prev(next)->first + static_cast<uint64_t>(prev->capacity()) * prev->increment() >
+                desc.cpu_address) {
+                return Status::InvalidArgument;
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     uint32_t slot = 0;
     if (!free_slots_.empty()) {
@@ -258,6 +284,10 @@ Status DescriptorHeapRegistry::create_heap(const DescriptorHeapDesc& desc, Descr
     auto* heap = new DescriptorHeap(desc, serial);
     owned_.emplace(heap, slot);
     slots_[slot].store(heap, std::memory_order_release);
+    if (desc.cpu_address != 0) {
+        std::unique_lock<std::shared_mutex> placed_lock(placed_mutex_);
+        placed_[desc.cpu_address] = heap;
+    }
     live_heaps_.fetch_add(1, std::memory_order_relaxed);
     *out_heap = heap;
     return Status::Ok;
@@ -274,6 +304,10 @@ void DescriptorHeapRegistry::destroy_heap(DescriptorHeap* heap) {
     }
     const uint32_t slot = it->second;
     owned_.erase(it);
+    if (heap->desc().cpu_address != 0) {
+        std::unique_lock<std::shared_mutex> placed_lock(placed_mutex_);
+        placed_.erase(heap->desc().cpu_address);
+    }
     slots_[slot].store(nullptr, std::memory_order_release);
     slot_generation_[slot] = static_cast<uint16_t>((slot_generation_[slot] + 1) & kSlotGenerationMask);
     free_slots_.push_back(slot);
@@ -287,6 +321,29 @@ uint32_t DescriptorHeapRegistry::heap_count() const noexcept {
 
 Status DescriptorHeapRegistry::resolve(uint64_t ptr, uint32_t tag, ResolvedDescriptor* out) const noexcept {
     const uint32_t hi = static_cast<uint32_t>(ptr >> 32);
+    if (tag == kCpuTag && (hi & kTagMask) == 0 && ptr != 0) {
+        // A CPU handle of a heap placed at an address.
+        std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+        auto it = placed_.upper_bound(ptr);
+        if (it == placed_.begin()) {
+            return Status::InvalidHandle;
+        }
+        --it;
+        const DescriptorHeap* heap = it->second;
+        const uint64_t offset = ptr - it->first;
+        const uint32_t inc = heap->increment();
+        if (offset % inc != 0) {
+            return Status::MisalignedHandle;
+        }
+        if (offset / inc >= heap->capacity()) {
+            return Status::InvalidHandle;
+        }
+        if (out != nullptr) {
+            out->heap = const_cast<DescriptorHeap*>(heap);
+            out->index = static_cast<uint32_t>(offset / inc);
+        }
+        return Status::Ok;
+    }
     if ((hi & kTagMask) != tag) {
         return Status::InvalidHandle;
     }

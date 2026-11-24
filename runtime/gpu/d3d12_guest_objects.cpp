@@ -350,7 +350,11 @@ HResult Device::create_queue(const GuestCommandQueueDesc* desc, const Guid& riid
         return kEInvalidArg;
     }
     // DIRECT 0, COMPUTE 2, COPY 3 (BUNDLE 1 cannot be a queue; video queues are not supported).
-    if ((desc->Type != 0 && desc->Type != 2 && desc->Type != 3) || desc->Flags > 1) {
+    // Flags: bit 0 is DISABLE_GPU_TIMEOUT; bit 1 is an Xbox queue flag the title sets on its
+    // compute queues (flags 1, 2 and 3 on three of them). Both only steer scheduling on the
+    // console; queues here execute the same way whatever they say, so they are accepted.
+    constexpr uint32_t kKnownQueueFlags = 0x3;
+    if ((desc->Type != 0 && desc->Type != 2 && desc->Type != 3) || (desc->Flags & ~kKnownQueueFlags) != 0) {
         note_bad_argument("CreateCommandQueue: unsupported type " + std::to_string(desc->Type) + " / flags " +
                           std::to_string(desc->Flags));
         return kEInvalidArg;
@@ -548,16 +552,52 @@ HResult Device::CreateDescriptorHeap(const GuestDescriptorHeapDesc* desc, const 
     hd.num_descriptors = desc->NumDescriptors;
     hd.flags = desc->Flags;
     hd.node_mask = desc->NodeMask;
+    // Xbox descriptor: 16 more bytes follow the public ones, {u64 address, u64 size}. A non-zero
+    // address places the heap's descriptors in title memory: the title fills `size` with exactly
+    // NumDescriptors * GetDescriptorHandleIncrementSize(Type) and expects the heap's CPU start to
+    // equal `address`. Anything else in those bytes is ignored (a public 16-byte descriptor).
+    uint64_t placement[2] = {0, 0};
+    const uint64_t desc_va = com::guest_memory().guest_address(desc);
+    const uint64_t placed_size =
+        static_cast<uint64_t>(desc->NumDescriptors) * d3d::descriptor_handle_increment_size(hd.type);
+    if (com::read_guest(desc_va + sizeof(GuestDescriptorHeapDesc), placement, sizeof(placement)) &&
+        placement[0] != 0 && placement[1] == placed_size) {
+        hd.cpu_address = placement[0];
+    }
+    // Every other heap gets guest memory of its own: on the console a CPU descriptor handle is a
+    // pointer, and the title writes through it (it keeps free lists inside unused descriptors).
+    // Descriptor contents written through the API stay in the registry.
+    const bool placed = hd.cpu_address != 0;
+    uint64_t owned_memory = 0;
+    if (!placed) {
+        owned_memory = com::guest_alloc(placed_size);
+        if (owned_memory == 0) {
+            note_bad_argument("CreateDescriptorHeap: no guest memory for " + std::to_string(placed_size) + " bytes");
+            return kEOutOfMemory;
+        }
+        hd.cpu_address = owned_memory;
+    }
     d3d::DescriptorHeap* heap = nullptr;
     const d3d::Status status = heaps_.create_heap(hd, &heap);
     if (status != d3d::Status::Ok) {
+        if (owned_memory != 0) {
+            com::guest_free(owned_memory);
+        }
         note_bad_argument(std::string("CreateDescriptorHeap: ") + d3d::status_name(status));
         return status == d3d::Status::TooManyHeaps ? kEOutOfMemory : kEInvalidArg;
+    }
+    if (placed) {
+        count(xbox::Counter::PlacedDescriptorHeaps);
     }
     auto object = com::create_object<DescriptorHeap>(com::implements(kID3D12DescriptorHeap), device_ref(this),
                                                      heap, *desc);
     if (!object) {
         heaps_.destroy_heap(heap);
+        if (owned_memory != 0) {
+            com::guest_free(owned_memory);
+        }
+    } else {
+        object->set_owned_memory(owned_memory);
     }
     return hand_out(std::move(object), riid, out);
 }
@@ -965,6 +1005,9 @@ DescriptorHeap::DescriptorHeap(com::Ref<Device> device, d3d::DescriptorHeap* hea
 
 DescriptorHeap::~DescriptorHeap() {
     device_->heaps().destroy_heap(heap_);
+    if (owned_memory_ != 0) {
+        com::guest_free(owned_memory_);
+    }
     device_->descriptor_heaps.fetch_sub(1);
 }
 

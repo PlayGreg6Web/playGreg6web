@@ -32,6 +32,8 @@
 // * Struct returns: at slots 25/26 (and Xbox slot 108) the caller passes the hidden result pointer
 //   in rcx and `this` in rdx (C-style), not `this` first as MSVC member functions do. Struct-
 //   returning methods here accept both orders (SretMethods below) and count which one they saw.
+//   An 8-byte struct (a descriptor handle) called with `this` in rcx is returned in rax: the
+//   executable calls descriptor-heap slot 9 that way (rcx = this only, rax used).
 // * Inlined accessors: 11 functions compare the byte at [device + 0x18] against 0 before writing
 //   descriptors straight into descriptor memory; a non-zero byte makes them call
 //   CopyDescriptorsSimple / CreateConstantBufferView instead. The device payload sets it to 1.
@@ -54,6 +56,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -156,6 +159,20 @@ void sret_thunk(void* raw_state) {
     const uint64_t self = this_first ? state.gpr[GuestReg::Rcx] : state.gpr[GuestReg::Rdx];
     const uint64_t hidden = this_first ? state.gpr[GuestReg::Rdx] : state.gpr[GuestReg::Rcx];
     com::CallContext ctx{state, self, r.object.get(), r.iface, state.gpr[GuestReg::Rsp]};
+    if constexpr (sizeof(R) <= 8 && std::tuple_size_v<Params> == 0) {
+        // An 8-byte struct (a descriptor handle) with `this` in rcx comes back in rax: the
+        // executable calls GetCPUDescriptorHandleForHeapStart with rcx = this only and uses rax
+        // (rdx holds whatever the caller left there). With the result pointer in rcx and `this`
+        // in rdx it is a hidden result, as below.
+        if (this_first) {
+            R result = (static_cast<Host*>(r.host)->*M)();
+            uint64_t bits = 0;
+            std::memcpy(&bits, &result, sizeof(R));
+            ctx.set_rax(bits);
+            com::detail::pop_return(state);
+            return;
+        }
+    }
     invoke_sret<Host, M, R>(ctx, static_cast<Host*>(r.host), hidden, static_cast<Params*>(nullptr),
                             std::make_index_sequence<std::tuple_size_v<Params>>{});
     com::detail::pop_return(state);
@@ -768,10 +785,13 @@ public:
     CpuHandleResult GetCPUDescriptorHandleForHeapStart() override { return {heap_->cpu_start().ptr}; }
     GpuHandleResult GetGPUDescriptorHandleForHeapStart() override { return {heap_->gpu_start().ptr}; }
     d3d::DescriptorHeap* heap() const { return heap_; }
+    // Guest memory behind the CPU handles that the device allocated for this heap (freed with it).
+    void set_owned_memory(uint64_t va) { owned_memory_ = va; }
 
 private:
     d3d::DescriptorHeap* heap_;
     GuestDescriptorHeapDesc desc_;
+    uint64_t owned_memory_ = 0;
 };
 
 class RootSignature final : public ChildBase<IRootSignatureHost> {

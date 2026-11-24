@@ -267,6 +267,7 @@ enum class Counter : size_t {
     ViewsAtAddress,
     PagePools,
     PageMappingsApplied,
+    PlacedDescriptorHeaps,  // descriptor heaps placed at a title address (CreateDescriptorHeap)
     Suspends,
     Resumes,
     FeatureToggles,
