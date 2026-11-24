@@ -137,6 +137,17 @@ void pg6_gthunk_get_proc_address(void* state);
 void pg6_gthunk_hc_cleanup_async(void* state);
 void pg6_gthunk_hc_http_call_perform_async(void* state);
 
+// guest/guest_rtl.cpp (O26): imports with guest callbacks or that need the guest state. The
+// thread-pool work family takes opaque PTP_WORK values as uint64_t (see guest/guest_rtl.h).
+void pg6_gthunk_fls_free(void* state);
+void pg6_gthunk_init_once_execute_once(void* state);
+void pg6_gthunk_rtl_capture_stack_back_trace(void* state);
+void pg6_gthunk_create_threadpool_work(void* state);
+void pg6_gthunk_submit_threadpool_work(void* state);
+void pg6_gthunk_wait_for_threadpool_work_callbacks(void* state);
+void pg6_gthunk_close_threadpool_work(void* state);
+void pg6_gthunk_try_submit_threadpool_callback(void* state);
+
 // guest/guest_crt_exit.cpp
 void pg6_gthunk_crt_atexit(void* state);
 void pg6_gthunk_crt_at_quick_exit(void* state);

@@ -10,8 +10,10 @@
 #include <shared_mutex>
 #include <unordered_map>
 
+#include "guest/guest_rtl.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
+#include "os/win32_rtl.h"
 
 namespace playgta6::guest::com {
 
@@ -151,8 +153,11 @@ struct LazyGuestThread {
 
     ~LazyGuestThread() {
         if (created && generation == g_generation.load(std::memory_order_acquire)) {
+            rtl::run_fls_thread_exit(thread.state);  // FLS destructors of this thread (O26)
             destroy_guest_thread(*arena, thread);
             bridge().lazy_threads.fetch_sub(1, std::memory_order_relaxed);
+        } else if (created) {
+            os::win32::fls_run_thread_exit(nullptr, nullptr);  // stale thread: only release the storage
         }
     }
 };
@@ -789,6 +794,7 @@ GuestState& current_guest_state(uint64_t min_stack_size) {
         lazy.arena = &arena;
         lazy.generation = generation;
         lazy.created = true;
+        os::win32::fls_mark_thread_hooked();  // ~LazyGuestThread runs this thread's FLS destructors
         b.lazy_threads.fetch_add(1, std::memory_order_relaxed);
         if (GuestThreadInitHook hook = b.init_hook.load(std::memory_order_acquire)) {
             hook(lazy.thread);

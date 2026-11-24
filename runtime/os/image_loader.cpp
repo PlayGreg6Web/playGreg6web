@@ -658,7 +658,7 @@ ImageError load_image(ImageReader& reader,
 
     if (options.register_main_module != nullptr) {
         const ModuleRegistration& reg = *options.register_main_module;
-        if (win32::register_main_module(reg.name, reg.path, base) == win32::kNullHandle) {
+        if (win32::register_main_module(reg.name, reg.path, base, h.size_of_image) == win32::kNullHandle) {
             return fail(make_error(ImageErrorCode::RegisterFailed, kNoIndex, 0, base));
         }
     }

@@ -12,6 +12,7 @@
 
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
+#include "guest/guest_rtl.h"
 #include "os/os_shim.h"
 #include "os/ucrt_bridge.h"
 
@@ -234,6 +235,10 @@ void run_exit_cleanup(GuestState& state, ExitMode mode) {
         }
         if (s.atexit_table != 0) {
             execute_table(state, s.atexit_table);
+        }
+        if (state.unwind_pending == 0) {
+            // FLS destructors of the exiting thread (the CRT's per-thread data lives there).
+            rtl::run_fls_thread_exit(state);
         }
     } else if (mode == ExitMode::Quick) {
         if (s.at_quick_exit_table != 0) {

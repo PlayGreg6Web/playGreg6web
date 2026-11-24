@@ -251,6 +251,7 @@ struct Module {
     Handle handle = 0;
     bool pinned = true;
     bool guest = false;  // a recompiled guest DLL: exports are guest VAs
+    uint64_t image_size = 0;  // guest modules / main image: SizeOfImage (0 = unknown)
     uint32_t load_count = 0;
     std::unordered_map<std::string, ProcAddress> by_name;
     std::unordered_map<uint32_t, ProcAddress> by_ordinal;
@@ -1001,7 +1002,10 @@ std::string canonical_module_name(std::string_view name) {
     return ascii_lower(module_basename(name));
 }
 
-Handle register_main_module(std::string_view name, std::string_view path, uint64_t image_base) {
+Handle register_main_module(std::string_view name,
+                            std::string_view path,
+                            uint64_t image_base,
+                            uint64_t size_of_image) {
     const std::string display = module_basename(name);
     if (display.empty() || image_base == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -1013,6 +1017,9 @@ Handle register_main_module(std::string_view name, std::string_view path, uint64
     if (reg.main_module != nullptr) {
         if (reg.main_module->handle == image_base && reg.main_module->canonical == canonical) {
             reg.main_module->path = path.empty() ? display : std::string(path);
+            if (size_of_image != 0) {
+                reg.main_module->image_size = size_of_image;
+            }
             return image_base;
         }
         SetLastError(ERROR_ALREADY_EXISTS);
@@ -1029,6 +1036,7 @@ Handle register_main_module(std::string_view name, std::string_view path, uint64
     module->path = path.empty() ? display : std::string(path);
     module->handle = image_base;
     module->pinned = true;
+    module->image_size = size_of_image;
     reg.main_module = module.get();
     reg.by_handle.emplace(image_base, module.get());
     reg.by_name.emplace(canonical, std::move(module));
@@ -1072,9 +1080,41 @@ Handle register_guest_module(std::string_view name,
     module->handle = image_base;
     module->pinned = true;
     module->guest = true;
+    module->image_size = size_of_image;
     reg.by_handle.emplace(image_base, module.get());
     reg.by_name.emplace(canonical, std::move(module));
     return image_base;
+}
+
+Handle find_module_by_address(uint64_t address) {
+    auto& reg = module_registry();
+    std::shared_lock<std::shared_mutex> lock(reg.mutex);
+    for (const auto& [handle, module] : reg.by_handle) {
+        const uint64_t size = module->image_size != 0
+                                  ? module->image_size
+                                  : (handle >= kVirtualModuleBase ? kVirtualModuleStride : 0);
+        if (size != 0 && address >= handle && address - handle < size && module->visible()) {
+            return handle;
+        }
+    }
+    SetLastError(ERROR_MOD_NOT_FOUND);
+    return kNullHandle;
+}
+
+bool module_add_reference(Handle module, bool pin, bool add_reference) {
+    auto& reg = module_registry();
+    std::unique_lock<std::shared_mutex> lock(reg.mutex);
+    Module* m = reg.find_handle_locked(module);
+    if (m == nullptr || !m->visible()) {
+        SetLastError(ERROR_MOD_NOT_FOUND);
+        return false;
+    }
+    if (pin) {
+        m->pinned = true;
+    } else if (add_reference && !m->pinned && m->load_count != UINT32_MAX) {
+        ++m->load_count;
+    }
+    return true;
 }
 
 bool is_guest_module(Handle module) {

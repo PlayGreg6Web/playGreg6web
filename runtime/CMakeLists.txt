@@ -18,6 +18,9 @@ add_library(playgta6_core STATIC
     os/win32_compat_sys.cpp
     os/win32_compat_text.cpp
     os/win32_compat_misc.cpp
+    os/win32_rtl.cpp
+    os/win32_rtl_text.cpp
+    os/win32_rtl_file.cpp
     os/xgameruntime.cpp
     os/xasync_provider.cpp
     os/xbox_offline.cpp
@@ -44,6 +47,7 @@ add_library(playgta6_core STATIC
     guest/com_bridge.cpp
     guest/guest_callbacks.cpp
     guest/guest_crt_exit.cpp
+    guest/guest_rtl.cpp
     guest/cpu_helpers.cpp
     guest/boot.cpp
     os/xgameruntime_provider.cpp
@@ -149,6 +153,10 @@ else()
     add_executable(test_win32_compat ../tests/test_win32_compat.cpp)
     target_link_libraries(test_win32_compat PRIVATE playgta6_core)
     add_test(NAME playgta6_win32_compat_tests COMMAND test_win32_compat)
+
+    add_executable(test_win32_rtl ../tests/test_win32_rtl.cpp)
+    target_link_libraries(test_win32_rtl PRIVATE playgta6_core)
+    add_test(NAME playgta6_win32_rtl_tests COMMAND test_win32_rtl)
 
     add_executable(test_win32_sync ../tests/test_win32_sync.cpp)
     target_link_libraries(test_win32_sync PRIVATE playgta6_core)

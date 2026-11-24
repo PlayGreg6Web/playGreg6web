@@ -123,7 +123,11 @@ std::string canonical_module_name(std::string_view name);
 
 // Registers the main guest image (GetModuleHandle(NULL), GetModuleFileName(NULL)).
 // Returns image_base, or 0 (ERROR_ALREADY_EXISTS / ERROR_INVALID_PARAMETER) on conflict.
-Handle register_main_module(std::string_view name, std::string_view path, uint64_t image_base);
+// size_of_image (optional, 0 = unknown) lets find_module_by_address attribute addresses to it.
+Handle register_main_module(std::string_view name,
+                            std::string_view path,
+                            uint64_t image_base,
+                            uint64_t size_of_image = 0);
 
 // Registers a recompiled guest DLL mapped at image_base (runtime/guest/program_loader.h): its
 // HMODULE is image_base, GetModuleHandle/LoadLibrary find it by name, and its exports
@@ -137,6 +141,14 @@ Handle register_guest_module(std::string_view name,
                              uint64_t size_of_image);
 // True for guest modules and the main image (both are recompiled guest code).
 bool is_guest_module(Handle module);
+
+// The visible module whose image range [base, base + size) contains `address` (guest modules and
+// the main image with a known size; virtual modules cover their synthetic stride), 0 with
+// ERROR_MOD_NOT_FOUND otherwise (GetModuleHandleEx FROM_ADDRESS, O26).
+Handle find_module_by_address(uint64_t address);
+// GetModuleHandleEx reference accounting: `pin` makes the module permanent, otherwise
+// `add_reference` takes a LoadLibrary-style reference on unpinned modules.
+bool module_add_reference(Handle module, bool pin, bool add_reference);
 
 // Publishes an export of a guest module or of the main image as a guest VA (name and/or ordinal
 // 1..65535).

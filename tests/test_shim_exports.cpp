@@ -56,7 +56,7 @@ bool winsock_family_name(const char* name) {
 
 void test_registration_idempotent() {
     const size_t first = pg6_loader_register_all_shim_exports();
-    CHECK(first == 293);
+    CHECK(first == 320);
     CHECK(register_all_shim_exports() == first);
     CHECK(pg6_loader_register_all_shim_exports() == first);
 
@@ -101,7 +101,7 @@ void test_table_counts_and_lookup() {
         CHECK(pg6_loader_resolve_import(e.module, e.name) == expected);
     }
     CHECK(per_module.size() == 10);
-    CHECK(per_module["KERNEL32.dll"] == 154);
+    CHECK(per_module["KERNEL32.dll"] == 181);
     CHECK(per_module["ADVAPI32.dll"] == 10);
     CHECK(per_module["WS2_32.dll"] == 24);
     CHECK(per_module["WINHTTP.dll"] == 15);

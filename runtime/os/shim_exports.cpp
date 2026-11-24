@@ -7,6 +7,7 @@
 #include "os/win32_kernel.h"
 #include "os/ucrt_bridge.h"
 #include "os/ucrt_ext.h"
+#include "os/win32_rtl.h"
 #include "os/win32_sync.h"
 #include "os/winsock_ordinals.h"
 #include "os/xasync_provider.h"
@@ -120,6 +121,33 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(K32, "WaitForThreadpoolWorkCallbacks", pg6_win32_wait_for_threadpool_work_callbacks) \
     E(K32, "CloseThreadpoolWork", pg6_win32_close_threadpool_work) \
     E(K32, "TrySubmitThreadpoolCallback", pg6_win32_try_submit_threadpool_callback) \
+    E(K32, "InitializeCriticalSectionEx", pg6_win32_initialize_critical_section_ex) \
+    E(K32, "FlsAlloc", pg6_win32_fls_alloc) \
+    E(K32, "FlsFree", pg6_win32_fls_free) \
+    E(K32, "FlsGetValue", pg6_win32_fls_get_value) \
+    E(K32, "FlsSetValue", pg6_win32_fls_set_value) \
+    E(K32, "EncodePointer", pg6_win32_encode_pointer) \
+    E(K32, "DecodePointer", pg6_win32_decode_pointer) \
+    E(K32, "InitOnceExecuteOnce", pg6_win32_init_once_execute_once) \
+    E(K32, "InterlockedPushEntrySList", pg6_win32_interlocked_push_entry_slist) \
+    E(K32, "InterlockedPopEntrySList", pg6_win32_interlocked_pop_entry_slist) \
+    E(K32, "InterlockedFlushSList", pg6_win32_interlocked_flush_slist) \
+    E(K32, "QueryDepthSList", pg6_win32_query_depth_slist) \
+    E(K32, "SwitchToThread", pg6_win32_switch_to_thread) \
+    E(K32, "GetModuleHandleExW", pg6_win32_get_module_handle_ex_w) \
+    E(K32, "RtlCaptureStackBackTrace", pg6_win32_rtl_capture_stack_back_trace) \
+    E(K32, "FreeLibraryWhenCallbackReturns", pg6_win32_free_library_when_callback_returns) \
+    E(K32, "LCMapStringEx", pg6_win32_lc_map_string_ex) \
+    E(K32, "CompareStringEx", pg6_win32_compare_string_ex) \
+    E(K32, "GetLocaleInfoEx", pg6_win32_get_locale_info_ex) \
+    E(K32, "GetStringTypeW", pg6_win32_get_string_type_w) \
+    E(K32, "GetCPInfo", pg6_win32_get_cp_info) \
+    E(K32, "FindFirstFileExW", pg6_win32_find_first_file_ex_w) \
+    E(K32, "GetFileInformationByHandle", pg6_win32_get_file_information_by_handle) \
+    E(K32, "GetTempPathW", pg6_win32_get_temp_path_w) \
+    E(K32, "CopyFile2", pg6_win32_copy_file2) \
+    E(K32, "CreateHardLinkW", pg6_win32_create_hard_link_w) \
+    E(K32, "CreateSymbolicLinkW", pg6_win32_create_symbolic_link_w) \
     E(XGR, "XGameRuntimeInitialize", pg6_gdk_xgame_runtime_initialize) \
     E(XGR, "XGameRuntimeUninitialize", pg6_gdk_xgame_runtime_uninitialize) \
     E(XGR, "XGameRuntimeIsInitialized", pg6_gdk_xgame_runtime_is_initialized) \
