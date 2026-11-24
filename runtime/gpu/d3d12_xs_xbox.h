@@ -266,6 +266,16 @@ struct NativePipeline {
 // or absent; code 256-byte aligned; sizes bounded). The contents are not interpreted.
 bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* out, std::string* error);
 
+// Rectangle lists. The title's pipeline-stream builder maps its topology enum through a table: the
+// rectangle entry becomes primitive topology type 19 (0x13) in the PRIMITIVE_TOPOLOGY subobject,
+// and command lists then set topology 17 (0x11), the GPU's DI_PT_RECTLIST primitive type (public
+// gfx10 register definitions): three vertices per rectangle, the fourth corner implied. The
+// per-frame full-screen pass draws one this way (DrawInstanced(3, 1)). Pipeline states accept the
+// type (as triangles, flagged); draws with the topology are skipped, because emitting them as
+// triangle lists would cover half of each rectangle (no fourth-vertex expansion yet).
+inline constexpr uint32_t kTopologyTypeRect = 19;
+inline constexpr uint32_t kTopologyRectList = 17;
+
 // Device slots 70/71: the public view description followed by the buffer's GPU address.
 inline constexpr uint64_t kViewAtAddressOffset = 0x28;
 
@@ -353,6 +363,8 @@ enum class Counter : size_t {
     ExtraPlanesIgnored,
     ExecutesWithToken,
     IndirectSkipped,
+    RectListPipelineStates,      // topology type kTopologyTypeRect accepted
+    RectListDrawsSkipped,        // draws with topology kTopologyRectList
     DepthBoundsIgnored,
     ShadingRateIgnored,
     StreamPipelineStates,

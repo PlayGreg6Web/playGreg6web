@@ -1052,6 +1052,7 @@ GraphicsPsoSource& GraphicsPsoSource::operator=(const GraphicsPsoSource& other) 
         semantic_names = other.semantic_names;
         input = other.input;
         root_signature = other.root_signature;
+        rect_list = other.rect_list;
         fix_pointers();
     }
     return *this;
@@ -1148,9 +1149,18 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
         note_bad_argument("CreateGraphicsPipelineState: no vertex shader");
         return kEInvalidArg;
     }
-    if (g.NumRenderTargets > 8 || g.InputLayout.NumElements > kMaxInputElements || g.PrimitiveTopologyType > 4) {
-        note_bad_argument("CreateGraphicsPipelineState: out-of-range counts or topology type");
+    // Xbox rectangle topology type: kept as triangles plus a flag (d3d12_xs_xbox.h).
+    src.rect_list = g.PrimitiveTopologyType == xbox::kTopologyTypeRect;
+    const uint32_t topology_type = src.rect_list ? 3u : g.PrimitiveTopologyType;
+    if (g.NumRenderTargets > 8 || g.InputLayout.NumElements > kMaxInputElements || topology_type > 4) {
+        note_bad_argument("CreateGraphicsPipelineState: out-of-range counts or topology type (render targets " +
+                          std::to_string(g.NumRenderTargets) + ", input elements " +
+                          std::to_string(g.InputLayout.NumElements) + ", topology type " +
+                          std::to_string(g.PrimitiveTopologyType) + ")");
         return kEInvalidArg;
+    }
+    if (src.rect_list) {
+        count(xbox::Counter::RectListPipelineStates);
     }
     d.stream_output_enabled = g.StreamOutput.NumEntries > 0;
     convert_blend_desc(g.BlendState, &d.BlendState);
@@ -1189,7 +1199,7 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
         t.InstanceDataStepRate = e.InstanceDataStepRate;
     }
     d.IBStripCutValue = static_cast<pso::D3D12IndexBufferStripCutValue>(g.IBStripCutValue);
-    d.PrimitiveTopologyType = static_cast<pso::D3D12PrimitiveTopologyType>(g.PrimitiveTopologyType);
+    d.PrimitiveTopologyType = static_cast<pso::D3D12PrimitiveTopologyType>(topology_type);
     d.NumRenderTargets = g.NumRenderTargets;
     for (int i = 0; i < 8; ++i) {
         d.RTVFormats[i] = static_cast<pso::DxgiFormat>(g.RTVFormats[i]);

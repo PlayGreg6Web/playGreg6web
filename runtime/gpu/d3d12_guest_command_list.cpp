@@ -187,6 +187,7 @@ void CommandList::reset(PipelineState* initial_state) {
     index_buffer_ = {};
     rtv_handles_.clear();
     dsv_handle_ = 0;
+    rect_list_ = false;
     pinned_.clear();
     graphics_pso_ = nullptr;
     compute_pso_ = nullptr;
@@ -367,7 +368,8 @@ void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32
                      (device_->shader_known(stages[i]) ? "" : " (no module)");
             }
         }
-        s += "; topology type " + std::to_string(static_cast<uint32_t>(d.PrimitiveTopologyType));
+        s += "; topology type " + std::to_string(static_cast<uint32_t>(d.PrimitiveTopologyType)) +
+             (src->rect_list ? " (rectangle list)" : "");
         s += "; input layout " + std::to_string(d.NumInputElements) + " element(s)";
         for (uint32_t i = 0; i < d.NumInputElements && d.pInputElementDescs != nullptr; ++i) {
             const pso::D3D12InputElementDesc& e = d.pInputElementDescs[i];
@@ -497,11 +499,26 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
         describe_skipped_draw("DrawInstanced", vertices, instances, "pipeline state without shader modules");
         return;
     }
+    if (skip_rect_list_draw("DrawInstanced", vertices, instances)) {
+        return;
+    }
     const uint64_t dropped = bridge_.stats().draws_skipped;
     bridge_.DrawInstanced(vertices, instances, start_vertex, start_instance);
     if (bridge_.stats().draws_skipped != dropped) {
         describe_dropped_draw("DrawInstanced", vertices, instances);
     }
+}
+
+// Rectangle lists (d3d12_xs_xbox.h) have no WebGPU topology and need a fourth-vertex expansion;
+// as triangle lists they would cover half of each rectangle, so such draws are skipped.
+bool CommandList::skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances) {
+    if (!rect_list_) {
+        return false;
+    }
+    device_->note_skipped_draw();
+    device_->count(xbox::Counter::RectListDrawsSkipped);
+    describe_skipped_draw(call, count, instances, "rectangle-list topology (fourth-vertex expansion not emulated)");
+    return true;
 }
 
 void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t start_index, int32_t base_vertex,
@@ -512,6 +529,9 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
         describe_skipped_draw("DrawIndexedInstanced", indices, instances, "pipeline state without shader modules");
+        return;
+    }
+    if (skip_rect_list_draw("DrawIndexedInstanced", indices, instances)) {
         return;
     }
     const uint64_t dropped = bridge_.stats().draws_skipped;
@@ -700,6 +720,7 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
 
 void CommandList::IASetPrimitiveTopology(uint32_t topology) {
     if (usable()) {
+        rect_list_ = topology == xbox::kTopologyRectList;
         bridge_.IASetPrimitiveTopology(static_cast<pso::D3DPrimitiveTopology>(topology));
     }
 }

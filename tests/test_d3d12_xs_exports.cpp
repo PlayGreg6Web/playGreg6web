@@ -1966,7 +1966,7 @@ struct RtFormats {
     uint32_t count;
 };
 
-std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode) {
+std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode, uint32_t topology_type = 3) {
     StreamBuilder s;
     s.add<uint64_t>(0, 8, scene.rs);
     const dg::GuestShaderBytecode vs{put_bytes(scene.vs_bytes.data(), scene.vs_bytes.size()), scene.vs_bytes.size()};
@@ -1997,7 +1997,7 @@ std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode) {
     e.SemanticName = put_bytes(kPosition, sizeof(kPosition));
     e.Format = 6;
     s.add(12, 8, dg::GuestInputLayoutDesc{put(e), 1});
-    s.add<uint32_t>(14, 4, 3);
+    s.add<uint32_t>(14, 4, topology_type);
     RtFormats f{};
     f.formats[0] = 87;
     f.count = 1;
@@ -2141,6 +2141,54 @@ void test_xbox_pipeline_streams_and_overrides() {
 
     CHECK(t_balanced);
     scene.release_all({list, pso, derived, cpso, cpso57, cpso62, cpso62b, mpso});
+}
+
+// G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
+void test_xbox_rect_lists() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    const std::vector<uint8_t> bytes = graphics_stream(scene, 3, dg::xbox::kTopologyTypeRect);
+    const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream,
+                                   {I(put(dg::xbox::GuestPipelineStateStreamDesc{bytes.size(),
+                                                                                 put_bytes(bytes.data(), bytes.size())}))},
+                                   dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    auto* state = object_of<dg::PipelineState>(pso);
+    CHECK(state->resolved() && state->graphics_source() != nullptr && state->graphics_source()->rect_list);
+    CHECK(state->graphics_source()->desc.PrimitiveTopologyType == playgta6::gpu::pso::D3D12PrimitiveTopologyType::Triangle);
+    CHECK(counter(dev, dg::xbox::Counter::RectListPipelineStates) == 1);
+    // Another unknown topology type is still refused.
+    const std::vector<uint8_t> bad = graphics_stream(scene, 3, 18);
+    CHECK(fx.create(scene.device, XSlot::CreatePsoStream,
+                    {I(put(dg::xbox::GuestPipelineStateStreamDesc{bad.size(), put_bytes(bad.data(), bad.size())}))},
+                    dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kEInvalidArg);
+
+    // A rectangle-list draw is skipped and described; a triangle-list draw after it is emitted.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 32, 32, 0, 1}))});
+    fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 32, 32}))});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(dg::xbox::kTopologyRectList)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);
+    CHECK(counter(dev, dg::xbox::Counter::RectListDrawsSkipped) == 1 && dev->stats().skipped_draws == 1);
+    CHECK(contains(dev->skipped_draw_reports(), "rectangle-list topology"));
+    CHECK(contains(dev->skipped_draw_reports(), "topology type 3 (rectangle list)"));
+
+    CHECK(t_balanced);
+    scene.release_all({list, pso});
 }
 
 // G32: console-native pipelines (Xbox slot 57). Synthetic records built from the range layout in
@@ -2515,6 +2563,7 @@ int main() {
     test_frame_pacer_unit();
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_native_pipelines();
+    test_xbox_rect_lists();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();
     if (g_failures != 0) {

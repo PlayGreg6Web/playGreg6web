@@ -156,6 +156,7 @@ struct GraphicsPsoSource {
     std::vector<std::string> semantic_names;
     std::vector<pso::D3D12InputElementDesc> input;
     com::Ref<RootSignature> root_signature;
+    bool rect_list = false;  // Xbox rectangle topology type (desc says Triangle; d3d12_xs_xbox.h)
 
     GraphicsPsoSource() = default;
     GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }
@@ -346,6 +347,8 @@ private:
     uint64_t dsv_handle_ = 0;
     void record_root_arg(uint32_t index, uint8_t kind, uint64_t value, uint32_t count);
     const d3d::RootSignature* graphics_root_signature_ = nullptr;
+    bool rect_list_ = false;  // IASetPrimitiveTopology(xbox::kTopologyRectList)
+    bool skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances);
     void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
     void describe_dropped_draw(const char* call, uint32_t count, uint32_t instances);
     struct ImmediateWrite {
