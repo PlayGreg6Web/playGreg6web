@@ -893,6 +893,16 @@ const char* synthetic_name(uint64_t target) {
     return nullptr;
 }
 
+// What a dispatched synthetic target is: a host callable's name or an import's dll!symbol
+// (empty for lifted code and unknown targets).
+std::string dispatch_label(uint64_t target) {
+    if (const char* name = synthetic_name(target)) {
+        return name;
+    }
+    const long index = import_for_target(target);
+    return index >= 0 ? import_label(boot().imports[static_cast<size_t>(index)].import) : std::string();
+}
+
 void boot_dispatch_observer(GuestState* state, uint64_t target) {
     BootState& b = boot();
     if (!b.running) {
@@ -1621,7 +1631,8 @@ std::string build_report() {
     for (size_t i = 0; i < f.recent_dispatches.size(); ++i) {
         const DispatchRecord& d = f.recent_dispatches[i];
         o += (i == 0 ? "\n    " : ",\n    ");
-        o += "{\"target\": " + hex(d.target) + ", \"name\": " + json_cstr(synthetic_name(d.target)) +
+        const std::string label = dispatch_label(d.target);
+        o += "{\"target\": " + hex(d.target) + ", \"name\": " + (label.empty() ? "null" : json_string(label)) +
              ", \"return_address\": " + hex(d.return_address) + ", \"rcx\": " + hex(d.rcx) +
              ", \"rdx\": " + hex(d.rdx) + "}";
     }
@@ -1939,10 +1950,10 @@ std::string build_summary() {
         if (!f.recent_dispatches.empty()) {
             s += "  last dispatched calls on the faulting thread (oldest first):\n";
             for (const DispatchRecord& d : f.recent_dispatches) {
-                const char* name = synthetic_name(d.target);
+                const std::string label = dispatch_label(d.target);
                 std::snprintf(line, sizeof(line),
                               "    -> 0x%016" PRIx64 "%s%s from 0x%016" PRIx64 " %s rcx=%" PRIx64 " rdx=%" PRIx64 "\n",
-                              d.target, name != nullptr ? " " : "", name != nullptr ? name : "", d.return_address,
+                              d.target, label.empty() ? "" : " ", label.c_str(), d.return_address,
                               function_text(d.return_address).c_str(), d.rcx, d.rdx);
                 s += line;
             }

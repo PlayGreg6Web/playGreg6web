@@ -611,9 +611,9 @@ void sub_entry(GuestState* s) {
                 push(s, kEntryCallsIat);
                 __playgta6_indirect_call(s, answer);
             }
-            reg(s, GuestReg::Rax) = reg(s, GuestReg::Rax) == 42 ? 0 : 1;
-            ret(s);
-            return;
+            CHECK(reg(s, GuestReg::Rax) == 42);
+            call_iat(s, kSlotGetLastError, kEntryCallsIat);
+            __playgta6_unimplemented(s, kEntry + 0x20);  // a fault, so the report lists the dispatches
         }
         case Scenario::OffThreadFault: {
             // The worker never returns from the fault (the hook parks it); it is detached.
@@ -1038,10 +1038,19 @@ void test_observability() {
 }
 
 // host_callable_calls counts calls to named host callables in first-call order; com_stub_hits
-// lists COM stub slots (none here).
+// lists COM stub slots (none here); recent_dispatches name host callables and imports.
 void test_host_callable_statistics() {
     const Run run = boot_scenario(Scenario::HostCallable);
-    CHECK(run.result.status == BootStatus::Exited);
+    CHECK(run.result.status != BootStatus::Exited);
+    bool answer_named = false;
+    bool import_named = false;
+    for (const Json& d : run.report["recent_dispatches"].items) {
+        answer_named = answer_named || d["name"].text == "ITest::Answer";
+        import_named = import_named || (d["name"].type == Json::String &&
+                                        d["name"].text.find("!GetLastError") != std::string::npos);
+    }
+    CHECK(answer_named);
+    CHECK(import_named);
     const Json& calls = run.report["host_callable_calls"];
     CHECK(calls.type == Json::Array);
     bool found = false;
