@@ -64,6 +64,25 @@ void* host_of(uint64_t va) {
     return va == 0 ? nullptr : xmem_arena().translate(va);
 }
 
+// O29: the guest VA of a pointer argument as the import thunks translated it. With the
+// translated CPU window on, a window VA arrives as the host page backing its slot (or, for an
+// unmapped slot, as va + kTrapDelta); both decode to the window VA. A page that also has an arena
+// name (a pool-view page mapped into the window) decodes to the window VA: callers that key
+// objects by host pointer look the raw pointer up first. Everything else: guest_of().
+uint64_t guest_of_arg(const void* host) {
+    if (host != nullptr && os::guest_window::enabled()) [[unlikely]] {
+        const uint64_t h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
+        if (os::guest_window::in_window(h - os::guest_window::kTrapDelta)) {
+            return h - os::guest_window::kTrapDelta;
+        }
+        const uint64_t va = os::guest_window::guest_address(host);
+        if (os::guest_window::in_window(va)) {
+            return va;
+        }
+    }
+    return guest_of(host);
+}
+
 void* aligned_alloc_bytes(size_t size, size_t alignment, bool zero = false) {
     GuestHeap& heap = default_guest_heap();
     const uint64_t va = heap.alloc(size,
@@ -1813,6 +1832,11 @@ bool xmem_virtual_free(void* address) {
     std::lock_guard<std::mutex> lock(st.mutex);
     auto it = st.virtual_regions.find(address);
     if (it == st.virtual_regions.end()) {
+        // The translated window, as the import thunk handed its base over (O29).
+        address = host_of(guest_of_arg(address));
+        it = st.virtual_regions.find(address);
+    }
+    if (it == st.virtual_regions.end()) {
         return false;
     }
     // Unmap every physical page mapped inside this reservation (their bytes go back to the store).
@@ -2202,9 +2226,11 @@ void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address, size_t num_pages, con
         std::lock_guard<std::mutex> lock(st.mutex);
         st.owned_blocks[guest_of(base)] = OwnedBlock{num_pages * page_size, align};
     }
+    // A caller's address may be a translated-window VA (O29: guest_of_arg decodes the thunk's form).
+    const uint64_t base_va = virtual_address != nullptr ? guest_of_arg(virtual_address) : guest_of(base);
     std::vector<uint64_t> vas(num_pages);
     for (size_t i = 0; i < num_pages; ++i) {
-        vas[i] = guest_of(base) + i * page_size;
+        vas[i] = base_va + i * page_size;
     }
     if (!map_slots(vas.data(), num_pages, page_array)) {
         if (virtual_address == nullptr) {
@@ -2212,7 +2238,8 @@ void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address, size_t num_pages, con
         }
         return nullptr;
     }
-    return base;
+    // The caller's address in the form the thunk translates back to the same VA.
+    return virtual_address != nullptr ? host_of(base_va) : base;
 }
 
 int32_t pg6_xbox_XMemMapPhysicalPagesScatter(const uint64_t* virtual_addresses,

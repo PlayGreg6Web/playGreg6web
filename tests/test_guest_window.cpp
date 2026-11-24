@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
 #include "os/guest_window.h"
 #include "os/vmem.h"
@@ -132,9 +133,57 @@ void test_table_translation_and_copies() {
     CHECK(s.mapped_slots == 4);
     CHECK(s.contiguous_pairs == 1 && s.split_pairs == 1);  // 0|1 adjacent, 1|2 split (5 alone)
 
+    // O29: the reverse translation answers with the window VA for bytes of a mapped slot's page,
+    // flat for everything else; host_or_trap never turns a non-null guest pointer into null.
+    CHECK(gw::guest_address(pages.page(7) + 5) == W + 2 * k64K + 5);
+    CHECK(gw::guest_address(pages.page(0) + k64K - 1) == W + k64K - 1);
+    CHECK(gw::guest_address(pages.page(1)) == W + k64K);
+    CHECK(gw::guest_address(nullptr) == 0);
+    const void* flat = arena().translate(0x1'4000'0000ull);
+    CHECK(gw::guest_address(flat) == 0x1'4000'0000ull);
+    CHECK(gw::guest_address(pages.page(4)) ==
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pages.page(4))) - __playgta6_guest_base);
+    CHECK(gw::host_or_trap(0) == nullptr);
+    CHECK(gw::host_or_trap(W + 2 * k64K + 5) == pages.page(7) + 5);
+    CHECK(reinterpret_cast<uintptr_t>(gw::host_or_trap(W + 3 * k64K + 1)) == W + 3 * k64K + 1 + gw::kTrapDelta);
+    CHECK(gw::host_or_trap(0x1'4000'0000ull) == flat);
+    CHECK(gw::translated(W + 3 * k64K) && !gw::translated(W - 1));
+
     CHECK(gw::unmap_slot(W + 5 * k64K));
     CHECK(gw::translate(W + 5 * k64K) == nullptr);
+    CHECK(gw::guest_address(pages.page(3)) != W + 5 * k64K);  // forgotten with the slot
+    // Remapping a slot moves its reverse entry with it.
+    CHECK(gw::map_slot(W + 2 * k64K, pages.page(6)));
+    CHECK(gw::guest_address(pages.page(6) + 1) == W + 2 * k64K + 1);
+    CHECK(gw::guest_address(pages.page(7) + 1) != W + 2 * k64K + 1);
     gw::reset_for_testing();
+    CHECK(gw::guest_address(pages.page(6)) != W + 2 * k64K);
+    CHECK(!gw::translated(W));
+}
+
+// O29: the COM bridge's guest pointer seam (guest_to_host / read_guest / write_guest /
+// host_to_guest) serves window addresses through the shared translation.
+void test_com_bridge_window() {
+    namespace com = playgta6::guest::com;
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    Pages pages;
+    CHECK(gw::map_slot(W, pages.page(0)));
+    CHECK(gw::map_slot(W + k64K, pages.page(2)));  // not host-adjacent to slot 0
+    CHECK(com::guest_to_host(W + 10, 16) == pages.page(0) + 10);
+    CHECK(com::guest_to_host(W + k64K - 8, 16) == nullptr);  // straddles non-adjacent pages
+    CHECK(com::guest_to_host(W + 5 * k64K, 4) == nullptr);   // unmapped
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    CHECK(com::write_guest(W + k64K - 8, data, sizeof(data)));
+    CHECK(std::memcmp(pages.page(0) + k64K - 8, data, 8) == 0);
+    CHECK(std::memcmp(pages.page(2), data + 8, 8) == 0);
+    uint8_t back[16] = {};
+    CHECK(com::read_guest(W + k64K - 8, back, sizeof(back)) && std::memcmp(back, data, 16) == 0);
+    CHECK(!com::read_guest(W + 5 * k64K, back, 4));
+    CHECK(com::host_to_guest(pages.page(2) + 4) == W + k64K + 4);
+    CHECK(com::host_to_guest(pages.page(4)) == pages.va + 4 * k64K);
+    gw::reset_for_testing();
+    CHECK(com::host_to_guest(pages.page(2)) == pages.va + 2 * k64K);  // window off: the arena
 }
 
 void test_slow_path_helpers() {
@@ -267,7 +316,17 @@ void test_xmem_translated_cpu_window() {
     CHECK(gw::copy_from_guest(&b, W + 12 * GiB + 9, 1) && b == 0);
     CHECK(gw::copy_to_guest(W + 12 * GiB + 9, &marker, 1));
 
-    CHECK(xmem_virtual_free(cpu));
+    // O29: window addresses as the windowed import thunks hand them over (the slot's backing page,
+    // or va + kTrapDelta for an unmapped slot) name the window VA.
+    const uint64_t two_pages[] = {pfn[2], pfn[3]};
+    void* mapped = pg6_xbox_XMemMapPhysicalPages(gw::host_or_trap(W + 7 * GiB), 2, two_pages);
+    CHECK(mapped != nullptr && gw::guest_address(mapped) == W + 7 * GiB);
+    CHECK(gw::translate(W + 7 * GiB + 3) == pool + 2 * k64K + 3);
+    CHECK(gw::translate(W + 7 * GiB + k64K) == pool + 3 * k64K);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(gw::host_or_trap(W + 7 * GiB), 2, nullptr) != nullptr);  // unmap
+    CHECK(gw::translate(W + 7 * GiB) == nullptr);
+
+    CHECK(xmem_virtual_free(gw::host_or_trap(W)));  // slot 0 is mapped: its backing page arrives
     CHECK(gw::translate(W + 3 * GiB) == nullptr);
     CHECK(gw::stats().mapped_slots == 0);
     xmem_reset_for_testing();
@@ -280,6 +339,7 @@ int main() {
     std::printf("test_guest_window\n");
     test_table_translation_and_copies();
     test_slow_path_helpers();
+    test_com_bridge_window();
     test_xmem_translated_cpu_window();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);

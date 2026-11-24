@@ -29,6 +29,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "abi/playgta6_abi.h"
+
 namespace playgta6::os::guest_window {
 
 inline constexpr uint64_t kSlotBytes = 64ull << 10;
@@ -54,9 +56,42 @@ bool unmap_slot(uint64_t window_va);
 // Host page backing the slot of `window_va`, or nullptr if unmapped / outside.
 void* slot_host(uint64_t window_va);
 
+// Whether `va` translates through the window table right now (in the window, window on). Host
+// consumers that validate guest pointers against an arena take the window path when this holds.
+inline bool translated(uint64_t va) {
+    return in_window(va) && enabled();
+}
+
+// The window part of translate(): `va` lies in the window.
+void* translate_window(uint64_t va);
+
 // The shared translation: host address of guest `va` (window slots through the table, everything
-// else through __playgta6_guest_base). nullptr for an unmapped window slot.
-void* translate(uint64_t va);
+// else through __playgta6_guest_base). nullptr for an unmapped window slot. Outside the window
+// (always, with the window off) the cost is one compare and a not-taken branch.
+inline void* translate(uint64_t va) {
+    if (in_window(va)) [[unlikely]] {
+        return translate_window(va);
+    }
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(__playgta6_guest_base + va));
+}
+
+// What a host consumer that must not see null for a non-null guest pointer uses (the generated
+// import thunks): like translate(), but 0 stays null and an unmapped window slot gives the
+// address the lifted code would access (va + kTrapDelta), so dereferencing it faults like the
+// guest's own access would.
+inline void* host_or_trap(uint64_t va) {
+    if (in_window(va)) [[unlikely]] {
+        void* host = translate_window(va);
+        return host != nullptr ? host : reinterpret_cast<void*>(static_cast<uintptr_t>(va + kTrapDelta));
+    }
+    return va == 0 ? nullptr : reinterpret_cast<void*>(static_cast<uintptr_t>(__playgta6_guest_base + va));
+}
+
+// The reverse of translate(): the guest VA of host address `host`. A host page that backs a
+// mapped window slot answers with the window VA (the address guest code knows the bytes by;
+// a page mapped at several slots answers with one of them), anything else with
+// host - __playgta6_guest_base. nullptr stays 0.
+uint64_t guest_address(const void* host);
 
 // Host pointer for [va, va + len) when the range is host-contiguous (outside the window, or every
 // window slot it touches mapped onto adjacent host pages), else nullptr.

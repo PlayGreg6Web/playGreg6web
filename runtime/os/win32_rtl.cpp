@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "os/guest_window.h"
 #include "os/vmem.h"
 #include "os/win32_loader.h"
 
@@ -215,6 +216,9 @@ uint64_t* slist_next_slot(uint64_t entry) {
     if (arena == nullptr || entry == 0 || (entry & 15u) != 0) {
         return nullptr;
     }
+    if (guest_window::translated(entry)) [[unlikely]] {
+        return static_cast<uint64_t*>(guest_window::translate(entry));  // aligned: within one slot
+    }
     return reinterpret_cast<uint64_t*>(arena->host_ptr(entry, sizeof(uint64_t)));
 }
 
@@ -238,7 +242,9 @@ bool read_guest_u16_string(uint64_t address, std::u16string* out) {
     constexpr size_t kMaxChars = 4096;
     for (size_t i = 0; i < kMaxChars; ++i) {
         char16_t c = 0;
-        if (!arena->read(address + 2 * i, &c, sizeof(c))) {
+        const uint64_t va = address + 2 * i;
+        if (guest_window::translated(va) ? !guest_window::copy_from_guest(&c, va, sizeof(c))
+                                         : !arena->read(va, &c, sizeof(c))) {
             return false;
         }
         if (c == 0) {

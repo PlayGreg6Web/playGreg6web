@@ -18,6 +18,7 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
+#include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/shim_exports.h"
 #include "os/ucrt_bridge.h"
@@ -1496,6 +1497,14 @@ uint64_t host_to_guest(uint64_t host) {
     const VirtualMemoryArena* arena = boot().arena;
     if (arena == nullptr || !arena->valid()) {
         return 0;
+    }
+    if (os::guest_window::enabled()) {
+        // A fault inside a translated-window page reports the window VA (O29).
+        const uint64_t window_va =
+            os::guest_window::guest_address(reinterpret_cast<const void*>(static_cast<uintptr_t>(host)));
+        if (os::guest_window::in_window(window_va)) {
+            return window_va;
+        }
     }
     const uint64_t va = host - arena->guest_base();
     return va >= arena->space_base() && va - arena->space_base() < arena->space_size() ? va : 0;

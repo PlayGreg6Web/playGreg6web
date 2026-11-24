@@ -560,10 +560,29 @@ public:
                                            : static_cast<uint64_t>(row_pitch) * ml.padded_rows;
         void* d = com::guest_to_host(dst, layout_.size_bytes);
         const void* s = com::guest_to_host(src, src_len);
-        if (d == nullptr || s == nullptr) {
+        // A range that is not one host piece (a translated-window buffer over non-adjacent pages,
+        // O29) goes through a bounce copy, segment by segment.
+        std::vector<uint8_t> dst_bounce;
+        std::vector<uint8_t> src_bounce;
+        if (s == nullptr) {
+            src_bounce.resize(static_cast<size_t>(src_len));
+            if (!com::read_guest(src, src_bounce.data(), src_bounce.size())) {
+                return com::E_INVALIDARG_HR;
+            }
+            s = src_bounce.data();
+        }
+        if (d == nullptr) {
+            dst_bounce.resize(static_cast<size_t>(layout_.size_bytes));
+            if (!com::read_guest(dst, dst_bounce.data(), dst_bounce.size())) {
+                return com::E_INVALIDARG_HR;
+            }
+            d = dst_bounce.data();
+        }
+        const HResult hr = host_->CopyIntoSubresource(d, plane, subresource, s, row_pitch, slice_pitch);
+        if (!dst_bounce.empty() && !com::write_guest(dst, dst_bounce.data(), dst_bounce.size())) {
             return com::E_INVALIDARG_HR;
         }
-        return host_->CopyIntoSubresource(d, plane, subresource, s, row_pitch, slice_pitch);
+        return hr;
     }
 
     // 10 (D3D12 GetResourceTiling shape; standard 64 KiB tiles)

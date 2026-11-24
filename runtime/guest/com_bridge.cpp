@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "guest/guest_rtl.h"
+#include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/win32_rtl.h"
@@ -204,17 +205,40 @@ void* guest_to_host(uint64_t va, size_t len) {
     if (va == 0) {
         return nullptr;
     }
+    // The translated CPU window (O29): mapped slots whose host pages are contiguous over the range.
+    if (os::guest_window::translated(va)) [[unlikely]] {
+        return os::guest_window::contiguous(va, len == 0 ? 1 : len);
+    }
     // Readable is enough (the documented contract): `const` data such as formats, strings and
     // GUIDs often lives in read-only image sections. Writes through the pointer to read-only
     // memory fault, as they would on the console.
     return const_cast<uint8_t*>(guest_memory().host_ptr_const(va, len == 0 ? 1 : len));
 }
 
+uint64_t host_to_guest(const void* host) {
+    if (host == nullptr) {
+        return 0;
+    }
+    if (os::guest_window::enabled()) [[unlikely]] {
+        const uint64_t va = os::guest_window::guest_address(host);
+        if (os::guest_window::in_window(va)) {
+            return va;
+        }
+    }
+    return guest_memory().guest_address(host);
+}
+
 bool read_guest(uint64_t va, void* dst, size_t len) {
+    if (os::guest_window::translated(va)) [[unlikely]] {
+        return os::guest_window::copy_from_guest(dst, va, len);
+    }
     return va != 0 && guest_memory().read(va, dst, len);
 }
 
 bool write_guest(uint64_t va, const void* src, size_t len) {
+    if (os::guest_window::translated(va)) [[unlikely]] {
+        return os::guest_window::copy_to_guest(va, src, len);
+    }
     return va != 0 && guest_memory().write(va, src, len);
 }
 

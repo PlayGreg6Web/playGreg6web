@@ -765,7 +765,9 @@ void CommandList::WriteValue64(uint64_t address, uint32_t a2, uint64_t value, ui
 
 void CommandList::apply_immediate_writes() {
     for (const ImmediateWrite& w : immediate_writes_) {
-        if (!com::write_guest(w.address, &w.value, w.size)) {
+        // The address is a GPU VA: inside an alias window it names the CPU window's bytes (a
+        // phantom GPU window has none of its own; O29: the CPU window may be translated).
+        if (!com::write_guest(device_->cpu_address_for_gpu(w.address), &w.value, w.size)) {
             device_->note_bad_argument("ExecuteCommandLists: immediate write to " + hex(w.address) +
                                        " is not guest memory");
         }

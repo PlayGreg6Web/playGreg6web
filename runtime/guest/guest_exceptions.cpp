@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <vector>
 
+#include "os/guest_window.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 
@@ -37,14 +38,30 @@ constexpr uint8_t kUwopSaveXmm128 = 8;
 constexpr uint8_t kUwopSaveXmm128Far = 9;
 constexpr uint8_t kUwopPushMachframe = 10;
 
+// Guest memory through the arena, or through the translated CPU window for window VAs (O29:
+// records, contexts and argument arrays the guest passes may live there).
+bool read_bytes(VirtualMemoryArena& arena, uint64_t va, void* dst, size_t len) {
+    if (os::guest_window::translated(va)) [[unlikely]] {
+        return os::guest_window::copy_from_guest(dst, va, len);
+    }
+    return arena.read(va, dst, len);
+}
+
+bool write_bytes(VirtualMemoryArena& arena, uint64_t va, const void* src, size_t len) {
+    if (os::guest_window::translated(va)) [[unlikely]] {
+        return os::guest_window::copy_to_guest(va, src, len);
+    }
+    return arena.write(va, src, len);
+}
+
 template <typename T>
 bool read_guest(VirtualMemoryArena& arena, uint64_t va, T& out) {
-    return arena.read(va, &out, sizeof(T));
+    return read_bytes(arena, va, &out, sizeof(T));
 }
 
 template <typename T>
 bool write_guest(VirtualMemoryArena& arena, uint64_t va, const T& value) {
-    return arena.write(va, &value, sizeof(T));
+    return write_bytes(arena, va, &value, sizeof(T));
 }
 
 bool read_u64(VirtualMemoryArena& arena, uint64_t va, uint64_t& out) {
@@ -87,7 +104,7 @@ std::unique_ptr<Table> make_table(VirtualMemoryArena& arena,
         return nullptr;
     }
     std::vector<GuestRuntimeFunction> raw(count);
-    if (!arena.read(table_va, raw.data(), raw.size() * sizeof(GuestRuntimeFunction))) {
+    if (!read_bytes(arena, table_va, raw.data(), raw.size() * sizeof(GuestRuntimeFunction))) {
         return nullptr;
     }
     auto table = std::make_unique<Table>();
@@ -861,7 +878,7 @@ void thunk_raise_exception(void* p) {
     const uint64_t count = std::min<uint64_t>(static_cast<uint32_t>(arg(arena, s, 2)), kExceptionMaximumParameters);
     const uint64_t args = arg(arena, s, 3);
     if (args != 0 && count != 0) {
-        arena.read(args, rec.information, count * sizeof(uint64_t));
+        read_bytes(arena, args, rec.information, count * sizeof(uint64_t));
         rec.number_parameters = static_cast<uint32_t>(count);
     }
     raise_from_thunk(s, arena, rec);

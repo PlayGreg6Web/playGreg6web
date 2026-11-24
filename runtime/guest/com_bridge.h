@@ -231,6 +231,9 @@ os::VirtualMemoryArena& guest_memory();
 // The one guest -> host pointer translation: host pointer to [va, va + len) when it lies in one
 // committed, readable extent, else nullptr (also for va == 0).
 void* guest_to_host(uint64_t va, size_t len);
+// The reverse, for host pointers guest_to_host (or a marshaled pointer argument) produced: the
+// window VA for bytes of a translated-window page, else the arena's guest address. 0 for null.
+uint64_t host_to_guest(const void* host);
 bool read_guest(uint64_t va, void* dst, size_t len);
 bool write_guest(uint64_t va, const void* src, size_t len);
 

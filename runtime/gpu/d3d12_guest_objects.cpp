@@ -557,7 +557,7 @@ HResult Device::CreateDescriptorHeap(const GuestDescriptorHeapDesc* desc, const 
     // NumDescriptors * GetDescriptorHandleIncrementSize(Type) and expects the heap's CPU start to
     // equal `address`. Anything else in those bytes is ignored (a public 16-byte descriptor).
     uint64_t placement[2] = {0, 0};
-    const uint64_t desc_va = com::guest_memory().guest_address(desc);
+    const uint64_t desc_va = com::host_to_guest(desc);
     const uint64_t placed_size =
         static_cast<uint64_t>(desc->NumDescriptors) * d3d::descriptor_handle_increment_size(hd.type);
     if (com::read_guest(desc_va + sizeof(GuestDescriptorHeapDesc), placement, sizeof(placement)) &&

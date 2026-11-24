@@ -1719,7 +1719,22 @@ fn memory_model_is_recorded_for_the_runtime() {
         let shard = fs::read_to_string(dir.join(LIFT_DIR).join("shard-00000.ll")).unwrap();
         // Modules whose only memory accesses are stack-relative need no window check.
         translated += usize::from(shard.contains("@__playgta6_window_table"));
+        // The import thunks translate pointer arguments and results the same way.
+        let seam = fs::read_to_string(dir.join("stubs").join(stubs::SEAM_FILE)).unwrap();
+        assert!(seam.contains("guest_window::host_or_trap(guest_va)"), "{}", m.module);
+        assert!(seam.contains("guest_window::guest_address(host)"), "{}", m.module);
     }
+    let seam = fs::read_to_string(out.join(EXPORTS_DIR).join(stubs::SEAM_FILE)).unwrap();
+    assert!(seam.contains("guest_window::host_or_trap(guest_va)"));
+    let plain_seam = fs::read_to_string(
+        plain
+            .path()
+            .join("out")
+            .join(EXPORTS_DIR)
+            .join(stubs::SEAM_FILE),
+    )
+    .unwrap();
+    assert!(!plain_seam.contains("guest_window"));
     assert!(
         translated > 0,
         "no module's lifted code translates through the window"
@@ -1765,22 +1780,34 @@ fn memory_model_is_recorded_for_the_runtime() {
         println!("SKIP memory_model_is_recorded_for_the_runtime (compile): no C++ compiler");
         return;
     };
-    let output = Command::new(&cxx)
-        .args(["-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
-        .arg(format!("-I{}", runtime.display()))
-        .arg(format!(
-            "-I{}",
-            windowed.path().join("in").join("rt").display()
-        ))
-        .arg(format!("-I{}", out.display()))
-        .arg(out.join(PROGRAM_DESCRIPTOR_FILE))
-        .output()
-        .expect("run C++ compiler");
-    assert!(
-        output.status.success(),
-        "pg6_program.cpp does not compile:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut sources = vec![
+        out.join(PROGRAM_DESCRIPTOR_FILE),
+        out.join(EXPORTS_DIR).join("pg6_export_thunks.cpp"),
+    ];
+    sources.extend(
+        r.modules
+            .iter()
+            .map(|m| out.join(&m.module).join("stubs").join("pg6_import_thunks.cpp")),
     );
+    for source in &sources {
+        let output = Command::new(&cxx)
+            .args(["-std=c++20", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+            .arg(format!("-I{}", runtime.display()))
+            .arg(format!(
+                "-I{}",
+                windowed.path().join("in").join("rt").display()
+            ))
+            .arg(format!("-I{}", out.display()))
+            .arg(source)
+            .output()
+            .expect("run C++ compiler");
+        assert!(
+            output.status.success(),
+            "{} does not compile:\n{}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 // ----- tool-gated: link the modules and run them under node --------------------------------------

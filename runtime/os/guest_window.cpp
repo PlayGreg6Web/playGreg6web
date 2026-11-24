@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -26,6 +27,10 @@ struct State {
     std::atomic<bool> enabled{false};
     uint64_t map_calls = 0;
     uint64_t unmap_calls = 0;
+    // guest_address(): host page -> the (last) slot mapped onto it; reverse_entries mirrors its
+    // size so the common case (nothing mapped) needs no lock.
+    std::map<uint64_t, uint64_t> reverse;
+    std::atomic<size_t> reverse_entries{0};
 };
 
 State& state() {
@@ -48,6 +53,21 @@ uint64_t slot_va(uint64_t slot) {
 void fill_unmapped_locked() {
     for (uint64_t i = 0; i < kWindowSlots; ++i) {
         entry(i).store(static_cast<int64_t>(kTrapDelta), std::memory_order_relaxed);
+    }
+    state().reverse.clear();
+    state().reverse_entries.store(0, std::memory_order_release);
+}
+
+// Forgets the reverse entry of `slot`'s current host page (if it still names this slot).
+void forget_reverse_locked(State& s, uint64_t slot) {
+    const uint64_t delta = static_cast<uint64_t>(entry(slot).load(std::memory_order_relaxed));
+    if (delta == kTrapDelta) {
+        return;
+    }
+    const auto it = s.reverse.find(slot_va(slot) + delta);
+    if (it != s.reverse.end() && it->second == slot) {
+        s.reverse.erase(it);
+        s.reverse_entries.store(s.reverse.size(), std::memory_order_release);
     }
 }
 
@@ -94,6 +114,7 @@ bool map_slot(uint64_t window_va, void* host_page) {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     const uint64_t slot = slot_of(window_va);
+    forget_reverse_locked(s, slot);
     if (host_page == nullptr) {
         ++s.unmap_calls;
         entry(slot).store(static_cast<int64_t>(kTrapDelta), std::memory_order_release);
@@ -102,6 +123,8 @@ bool map_slot(uint64_t window_va, void* host_page) {
     ++s.map_calls;
     const uint64_t host = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_page));
     entry(slot).store(static_cast<int64_t>(host - slot_va(slot)), std::memory_order_release);
+    s.reverse[host] = slot;
+    s.reverse_entries.store(s.reverse.size(), std::memory_order_release);
     return true;
 }
 
@@ -121,9 +144,28 @@ void* slot_host(uint64_t window_va) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(slot_va(slot) + delta));
 }
 
-void* translate(uint64_t va) {
+void* translate_window(uint64_t va) {
     size_t run = 0;
     return host_and_run(va, 1, &run);
+}
+
+uint64_t guest_address(const void* host) {
+    if (host == nullptr) {
+        return 0;
+    }
+    const uint64_t h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
+    State& s = state();
+    if (s.reverse_entries.load(std::memory_order_acquire) != 0) {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto it = s.reverse.upper_bound(h);
+        if (it != s.reverse.begin()) {
+            --it;
+            if (h - it->first < kSlotBytes) {
+                return slot_va(it->second) + (h - it->first);
+            }
+        }
+    }
+    return h - __playgta6_guest_base;
 }
 
 void* contiguous(uint64_t va, size_t len) {
