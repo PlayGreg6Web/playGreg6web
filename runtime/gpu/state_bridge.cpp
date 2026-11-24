@@ -134,6 +134,19 @@ GpuCreateSampler2Payload to_sampler_payload(const d3d::SamplerDesc& desc, bool* 
     return p;
 }
 
+d3d::SamplerDesc sampler_for_binding(const d3d::SamplerDesc& desc, uint8_t layout_sampler_type, bool* changed) noexcept {
+    d3d::SamplerDesc out = desc;
+    const bool comparison = ((desc.filter >> 7) & 0x3u) == 1u;
+    const bool drop = comparison && layout_sampler_type != static_cast<uint8_t>(GpuSamplerBindingType::Comparison);
+    if (drop) {
+        out.filter &= ~(0x3u << 7);
+    }
+    if (changed != nullptr) {
+        *changed = drop;
+    }
+    return out;
+}
+
 // =====================================================================================================
 // StateBridgeDevice
 // =====================================================================================================
@@ -1221,10 +1234,19 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             out.resource_id = e.resource_id;
             out.view = texture_view_desc(e.view);
             break;
-        case d3d::BindResourceKind::Sampler:
+        case d3d::BindResourceKind::Sampler: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
-            out.resource_id = device_.intern_sampler(e.sampler, side, &diagnostics_);
+            bool dropped = false;
+            const d3d::SamplerDesc s =
+                layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Sampler)
+                    ? sampler_for_binding(e.sampler, layout.binding_type, &dropped)
+                    : e.sampler;
+            if (dropped) {
+                diagnostics_ |= BridgeDiag::SamplerApproximated;
+            }
+            out.resource_id = device_.intern_sampler(s, side, &diagnostics_);
             break;
+        }
         case d3d::BindResourceKind::RootConstants:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
             out.resource_id = device_.ensure_root_constant_ring(side);

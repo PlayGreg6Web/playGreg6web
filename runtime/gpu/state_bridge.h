@@ -74,6 +74,11 @@ inline constexpr pso::DxgiFormat to_dxgi(uint32_t dxgi_format) noexcept {
 GpuTextureViewDimension to_view_dimension(uint32_t d3d12_view_dimension, bool* supported) noexcept;
 // G6 SamplerDesc (D3D12_SAMPLER_DESC numbering) -> CreateSampler2 payload (id left 0).
 GpuCreateSampler2Payload to_sampler_payload(const d3d::SamplerDesc& desc, bool* exact) noexcept;
+// The sampler bound to a layout entry of `layout_sampler_type` (GpuSamplerBindingType): a
+// comparison sampler (D3D12 filter reduction 1) bound where the layout, and so the shader, samples
+// without comparison drops the comparison (WebGPU rejects a comparison sampler there); everything
+// else is returned unchanged. *changed reports a drop.
+d3d::SamplerDesc sampler_for_binding(const d3d::SamplerDesc& desc, uint8_t layout_sampler_type, bool* changed) noexcept;
 
 // =====================================================================================================
 // Registration records

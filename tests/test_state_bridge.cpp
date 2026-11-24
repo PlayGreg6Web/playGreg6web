@@ -320,6 +320,21 @@ void test_seam_conversions() {
     CHECK(s.compare == static_cast<uint8_t>(pso::WgpuCompareFunction::LessEqual));
     CHECK(s.lod_max_clamp == 4.0f);
 
+    // A comparison sampler bound where the layout samples without comparison loses the comparison;
+    // in a comparison entry, and for plain samplers, nothing changes.
+    bool changed = false;
+    const d3d::SamplerDesc plain_slot =
+        bridge::sampler_for_binding(cmp, static_cast<uint8_t>(GpuSamplerBindingType::Filtering), &changed);
+    CHECK(changed && plain_slot.filter == 0x14);
+    s = bridge::to_sampler_payload(plain_slot, &exact);
+    CHECK(s.compare == 0 && s.min_filter == 1 && s.mag_filter == 1 && s.mipmap_filter == 0);
+    const d3d::SamplerDesc cmp_slot =
+        bridge::sampler_for_binding(cmp, static_cast<uint8_t>(GpuSamplerBindingType::Comparison), &changed);
+    CHECK(!changed && cmp_slot.filter == 0x94);
+    const d3d::SamplerDesc plain = bridge::sampler_for_binding(
+        d3d::SamplerDesc{}, static_cast<uint8_t>(GpuSamplerBindingType::Filtering), &changed);
+    CHECK(!changed && plain.filter == d3d::SamplerDesc{}.filter);
+
     // Anisotropic + border address mode: approximated.
     d3d::SamplerDesc aniso;
     aniso.filter = 0x55;
