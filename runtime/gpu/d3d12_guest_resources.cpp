@@ -382,6 +382,21 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     if (!mapping.supported() || pso::has_depth_aspect(mapping.format) || pso::has_stencil_aspect(mapping.format)) {
         return false;
     }
+    if ((mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0) {
+        // The GPU texture has a substitute format (e.g. rgba8unorm for BC without the feature):
+        // the guest's texels do not fit it and are not converted. Skip, reported once per texture.
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+            first = conversion_skipped_.insert(resource_id).second;
+        }
+        if (first) {
+            note_unsupported_copy("texture upload: DXGI format " + std::to_string(tt.dxgi_format) +
+                                  " has a substitute WebGPU format that needs CPU conversion (not implemented); "
+                                  "texels not uploaded");
+        }
+        return false;
+    }
     const uint32_t w = tt.width;
     const uint32_t h = (tt.dimension == ResourceDimension::Texture1D) ? 1u : std::max<uint32_t>(1u, tt.height);
     const uint32_t d = (tt.dimension == ResourceDimension::Texture3D) ? std::max<uint32_t>(1u, tt.depth) : 1u;
@@ -1006,6 +1021,12 @@ void Device::note_unsupported_copy(const std::string& message) {
     note_bad_argument(message);
 }
 
+bool Device::upload_needs_conversion(uint32_t dxgi_format) const {
+    const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(dxgi_format),
+                                                                pso::FormatUsage::Sampled, bridge_->options().features);
+    return m.supported() && (m.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Heap
 // ---------------------------------------------------------------------------------------------
@@ -1430,6 +1451,11 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
     if (box_va != 0 && !com::read_guest(box_va, box)) {
         device_->note_bad_argument("WriteToSubresource: unreadable box");
         return kEInvalidArg;
+    }
+    if (device_->upload_needs_conversion(desc_.Format)) {
+        device_->note_unsupported_copy("WriteToSubresource: DXGI format " + std::to_string(desc_.Format) +
+                                       " needs CPU conversion for its WebGPU format (not implemented); skipped");
+        return kSOk;
     }
     const DxgiFormatLayout l = dxgi_format_layout(desc_.Format);
     const uint32_t bw = std::max<uint32_t>(1, box.right - box.left);

@@ -840,6 +840,10 @@ public:
     void note_texture_upload(uint64_t count = 1) { textures_uploaded_.fetch_add(count, std::memory_order_relaxed); }
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
+    // True when a texture of `dxgi_format` gets a substitute WebGPU format whose texels differ from
+    // the guest's (BC without texture-compression-bc, packed 16-bit RGBA): the guest's bytes cannot
+    // be uploaded as they are, and no CPU conversion exists yet, so uploads to it are skipped.
+    bool upload_needs_conversion(uint32_t dxgi_format) const;
 
     // ---- Descriptor words in descriptor memory (bridge/descriptor_words.h, G48) ----
     // After a registry write at `cpu_handle`: writes the words the console's D3D12 leaves in the
@@ -995,6 +999,7 @@ private:
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
     std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
+    std::unordered_set<uint32_t> conversion_skipped_;  // under tracked_textures_mutex_: reported once
     struct AddressTextureKey {
         uint64_t gpu_va = 0;
         uint32_t dxgi_format = 0;

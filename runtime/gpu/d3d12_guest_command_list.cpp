@@ -1027,6 +1027,11 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
         note("CopyTextureRegion: footprint exceeds the source buffer");
         return;
     }
+    if (device_->upload_needs_conversion(tex->desc().Format)) {
+        device_->note_unsupported_copy("CopyTextureRegion: DXGI format " + std::to_string(tex->desc().Format) +
+                                       " needs CPU conversion for its WebGPU format (not implemented); skipped");
+        return;
+    }
     const uint32_t mip = sub % tex->mip_levels();
     const uint32_t layer = (sub / tex->mip_levels()) % tex->array_layers();
     const bool is3d = tex->desc().Dimension == ResourceDimension::Texture3D;

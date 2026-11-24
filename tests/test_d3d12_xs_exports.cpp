@@ -1622,6 +1622,49 @@ void test_unresolved_shaders_and_indexed_draws() {
     scene.release_all({list, pso2, ib});
 }
 
+// G62: a BC texture on a device without texture-compression-bc gets a substitute rgba8unorm GPU
+// texture; its block-compressed bytes do not fit it, so the upload is skipped and diagnosed instead
+// of emitting a WriteTexture WebGPU rejects. With the feature the texture stays BC and uploads.
+void test_bc_upload_needs_feature() {
+    for (const bool with_bc : {false, true}) {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.bridge.features = with_bc ? playgta6::gpu::pso::WgpuFeature::TextureCompressionBc : 0u;
+        dx::set_device_options(options);
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->upload_needs_conversion(77) == !with_bc);  // BC3_UNORM
+        CHECK(!dev->upload_needs_conversion(28));             // R8G8B8A8_UNORM
+        const uint64_t list = scene.new_list();
+        const uint64_t upload = committed(fx, scene.device, 2, buffer_desc(256 * 4), 0xAC3);
+        const uint64_t tex = committed(fx, scene.device, 1, texture_desc(16, 16, 77, 0), 0x400);
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        dg::GuestTextureCopyLocation dst{};
+        dst.pResource = tex;
+        dg::GuestTextureCopyLocation src{};
+        src.pResource = upload;
+        src.Type = 1;
+        src.PlacedFootprint = {0, {77, 16, 16, 1, 256}};  // 4x4 blocks of 16 bytes per row
+        fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        const size_t mark = fx.captured.size();
+        scene.execute({list});
+        const auto ps = packets_since(fx, mark);
+        if (with_bc) {
+            const Packet* wt = find_op(ps, GpuOpcode::WriteTexture);
+            CHECK(wt != nullptr && payload_as<GpuWriteTexturePayload>(*wt).bytes_per_row == 256 &&
+                  payload_as<GpuWriteTexturePayload>(*wt).rows_per_image == 4);
+            CHECK(dev->stats().unsupported_copies == 0);
+        } else {
+            CHECK(count_op(ps, GpuOpcode::WriteTexture) == 0);
+            CHECK(dev->stats().unsupported_copies == 1);
+            CHECK(contains(dev->diagnostics(), "CopyTextureRegion: DXGI format 77 needs CPU conversion"));
+        }
+        scene.release_all({list, upload, tex});
+    }
+}
+
 void test_copies_and_barriers() {
     Fixture fx;
     Scene scene(fx);
@@ -5082,6 +5125,7 @@ int main() {
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();
+    test_bc_upload_needs_feature();
     test_concurrent_recording();
     test_compute_views_and_public_list();
     test_xbox_inlined_list_fields_and_staged_pso();
