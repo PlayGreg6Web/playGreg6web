@@ -184,11 +184,34 @@ void sub_work(GuestState* s) {
     ret(s);
 }
 
+// bool callback(const XGameSaveContainerInfo*, void* context): records the container name and
+// blob count and stops after g_enum_stop_after calls.
+constexpr uint64_t kEnumCb = 0x140020500ULL;
+std::vector<std::string> g_enum_names;
+std::vector<uint32_t> g_enum_blobs;
+size_t g_enum_stop_after = 100;
+
+void sub_enum_cb(GuestState* s) {
+    const uint64_t info = s->gpr[GuestReg::Rcx];
+    uint64_t name_ptr = 0;
+    uint32_t blobs = 0;
+    CHECK(g_arena->read(info, &name_ptr, sizeof(name_ptr)));
+    CHECK(g_arena->read(info + 16, &blobs, sizeof(blobs)));
+    char name[64] = {};
+    CHECK(g_arena->read(name_ptr, name, sizeof(name) - 1));
+    g_enum_names.push_back(name);
+    g_enum_blobs.push_back(blobs);
+    CHECK(s->gpr[GuestReg::Rdx] == 0xE11E);
+    s->gpr[GuestReg::Rax] = g_enum_names.size() < g_enum_stop_after ? 1 : 0;
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kRecord, sub_record},
     {kAsyncDone, sub_async_done},
     {kProvider, sub_provider},
     {kWorkFn, sub_work},
+    {kEnumCb, sub_enum_cb},
 };
 
 struct GuestFault {
@@ -506,6 +529,34 @@ void test_query_api() {
         CHECK(async_handle != 0);
         fx.vcall(save, 6, {async_handle});
         CHECK(hr32(fx.vcall(save, 4, {0x10, cfg, 0, 0})) == com::E_INVALIDARG_HR);
+
+        // s13 / s14: container enumeration through the guest callback (context passed through).
+        {
+            const uint64_t p2 = fx.alloc(8);
+            CHECK(hr32(fx.vcall(save, 3, {0x10, cfg, 0, p2})) == 0);
+            const uint64_t h2 = load64(p2);
+            const uint64_t player = fx.cstring("Player");
+            g_enum_names.clear();
+            CHECK(hr32(fx.vcall(save, 13, {h2, player, 0xE11E, kEnumCb})) == 0);  // empty store
+            CHECK(g_enum_names.empty());
+            gs::Store store = gs::open_store("00000000-0000-0000-0000-000000000001");
+            CHECK(store.create_container("Player") == 0);
+            CHECK(store.create_container("Settings") == 0);
+            CHECK(store.submit_update("Player", {{"a", {1, 2, 3}}}, {}) == 0);
+            CHECK(hr32(fx.vcall(save, 13, {h2, player, 0xE11E, kEnumCb})) == 0);
+            CHECK(g_enum_names.size() == 1 && g_enum_names[0] == "Player" && g_enum_blobs[0] == 1);
+            g_enum_names.clear();
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == 0);
+            CHECK(g_enum_names.size() == 2 && g_enum_names[1] == "Settings");
+            g_enum_names.clear();
+            g_enum_stop_after = 1;  // the callback returns false: enumeration stops
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == 0 && g_enum_names.size() == 1);
+            g_enum_stop_after = 100;
+            CHECK(hr32(fx.vcall(save, 14, {0x9999, 0xE11E, kEnumCb})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, 0})) == com::E_INVALIDARG_HR);
+            fx.vcall(save, 6, {h2});
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == com::E_INVALIDARG_HR);  // closed
+        }
         std::filesystem::remove_all(dir);
         gs::set_save_dir("");
     }

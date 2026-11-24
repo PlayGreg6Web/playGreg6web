@@ -90,7 +90,13 @@
 //     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
 //   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h,
 //     s5 InitializeProviderResult, s6 CloseProvider (O34: a local provider on the host directory
-//     --save-dir, never any cloud sync; s5/s6 by public header order).
+//     --save-dir, never any cloud sync; s5/s6 by public header order), s13
+//     EnumerateContainerInfoByName(provider, prefix, context, callback) and s14
+//     EnumerateContainerInfo(provider, context, callback) (the title calls s13 with "Player" and
+//     "SettingsProfileSettings", s14 once; the callback is a code address). The other slots the
+//     title has wrappers for (arguments excluding this: s8 2, s9 2, s11 3, s12 1, s16 3, s17 1,
+//     s19 4, s20 5, s21 4 with a 32-bit third, s22 4, s23 3, s24 1, s25 4, s28 2, s29 1) were
+//     never reached and stay logging stubs until a boot calls them.
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
 //     XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
 //     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
@@ -1235,6 +1241,65 @@ public:
         return hr;
     }
 
+    // XGameSaveContainerInfo as handed to the enumeration callback (x64; field order from the
+    // public documentation: name, totalSize, blobCount, lastModifiedTime, needsSync).
+    struct GuestContainerInfo {
+        uint64_t name;
+        uint64_t total_size;
+        uint32_t blob_count;
+        uint32_t pad;
+        uint64_t last_modified;  // time_t (seconds since 1970)
+        uint8_t needs_sync;      // never: nothing is synchronised
+        uint8_t pad2[7];
+    };
+    static_assert(sizeof(GuestContainerInfo) == 40);
+
+    // Calls bool callback(const XGameSaveContainerInfo*, void* context) for every container whose
+    // name starts with `prefix`, until the callback returns false.
+    int32_t EnumerateContainers(uint64_t provider_handle, const std::string& prefix, uint64_t context,
+                                uint64_t callback) {
+        auto provider = save_providers().find(provider_handle);
+        if (!provider || callback == 0) {
+            return E_INVALIDARG_HR;
+        }
+        std::vector<gamesave::ContainerInfo> containers;
+        const int32_t hr = provider->store.enumerate_containers(prefix, &containers);
+        if (hr < 0) {
+            return hr;
+        }
+        const com::GuestFunction<uint64_t(uint64_t, uint64_t)> cb(callback);
+        for (const gamesave::ContainerInfo& info : containers) {
+            const uint64_t block = com::guest_alloc(sizeof(GuestContainerInfo) + info.name.size() + 1);
+            if (block == 0) {
+                return E_OUTOFMEMORY_HR;
+            }
+            GuestContainerInfo guest{};
+            guest.name = block + sizeof(GuestContainerInfo);
+            guest.total_size = info.total_size;
+            guest.blob_count = info.blob_count;
+            guest.last_modified = info.last_modified / 10000000ull - 11644473600ull;
+            com::write_guest(block, guest);
+            com::write_guest(guest.name, info.name.c_str(), info.name.size() + 1);
+            const bool keep_going = (cb.call(com::current_guest_state(), block, context) & 0xFF) != 0;
+            com::guest_free(block);
+            if (!keep_going) {
+                break;
+            }
+        }
+        return S_OK_HR;
+    }
+
+    // s13: XGameSaveEnumerateContainerInfoByName(provider, prefix, context, callback).
+    int32_t EnumerateContainerInfoByName(uint64_t provider, uint64_t prefix, uint64_t context, uint64_t callback) {
+        return prefix == 0 ? E_INVALIDARG_HR
+                           : EnumerateContainers(provider, guest_string(prefix, 256), context, callback);
+    }
+
+    // s14: XGameSaveEnumerateContainerInfo(provider, context, callback).
+    int32_t EnumerateContainerInfo(uint64_t provider, uint64_t context, uint64_t callback) {
+        return EnumerateContainers(provider, std::string(), context, callback);
+    }
+
     // s6: XGameSaveCloseProvider(XGameSaveProviderHandle).
     void CloseProvider(uint64_t provider) {
         if (!save_providers().remove(provider)) {
@@ -1465,11 +1530,13 @@ constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPac
                                                               kPackageTable.slots, {.slot_count = 48});
 
 using GS = M<GameSaveApi>;
-constexpr auto kGameSaveTable = slot_table<4>({
+constexpr auto kGameSaveTable = slot_table<12>({
     {3, GS::method<&GameSaveApi::InitializeProvider>("XGameSaveInitializeProvider")},
     {4, GS::method<&GameSaveApi::InitializeProviderAsync>("XGameSaveInitializeProviderAsync")},
     {5, GS::method<&GameSaveApi::InitializeProviderResult>("XGameSaveInitializeProviderResult")},
     {6, GS::method<&GameSaveApi::CloseProvider>("XGameSaveCloseProvider")},
+    {13, GS::method<&GameSaveApi::EnumerateContainerInfoByName>("XGameSaveEnumerateContainerInfoByName")},
+    {14, GS::method<&GameSaveApi::EnumerateContainerInfo>("XGameSaveEnumerateContainerInfo")},
 });
 constexpr auto kIGameSave = com::declare_interface<GameSaveApi>("xgameruntime.XGameSave", kGameSaveIid,
                                                                kGameSaveTable.slots, {.slot_count = 40});
