@@ -1414,6 +1414,44 @@ void test_frame_end_to_end() {
     CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 130) == 0);
     CHECK(hr(fx.vcall(list, 130, {I(0x700000), I(0), I(0)})) == dg::kENotImpl);  // unestablished slot: logging stub
     CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 130) == 1);
+
+    // Xbox slots 71 / 74 write immediate values to guest memory when the list executes, in
+    // recording order; slot 146 (enhanced barriers) records nothing and checks the resources.
+    const uint64_t markers = com::guest_alloc(64);
+    CHECK(com::write_guest(markers, uint64_t{0}) && com::write_guest(markers + 8, uint64_t{0}));
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, 71, {I(markers + 4), I(0x1234), I(0), I(0)});
+    fx.vcall(list, 74, {I(markers + 8), I(7), I(0x1122334455667788ull), I(1)});
+    fx.vcall(list, 74, {I(markers + 8), I(7), I(42), I(1)});  // the later write wins
+    fx.vcall(list, 71, {I(markers + 2), I(1), I(0), I(0)});  // misaligned: diagnosed, dropped
+    CHECK(contains(dev->diagnostics(), "slot 71: invalid address"));
+    struct BufferBarrier {
+        uint32_t sync_before, sync_after, access_before, access_after;
+        uint64_t resource, offset, size;
+    };
+    static_assert(sizeof(BufferBarrier) == 40);
+    const BufferBarrier bb[2] = {{0, 0, 0, 0, scene.vb, 0, ~0ull}, {0, 0, 0, 0, 0x7000'0000ull, 0, ~0ull}};
+    const uint64_t bb_va = put_bytes(bb, sizeof(bb));
+    struct BarrierGroup {
+        uint32_t type, count;
+        uint64_t barriers;
+    };
+    const BarrierGroup group{2, 2, bb_va};
+    const size_t diags_before = dev->diagnostics().size();
+    fx.vcall(list, 146, {I(1), I(put_bytes(&group, sizeof(group)))});
+    CHECK(dev->diagnostics().size() == diags_before + 1);  // only the unknown resource
+    CHECK(contains(dev->diagnostics(), "names an unknown resource"));
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    CHECK(load64(markers) == 0 && load64(markers + 8) == 0);  // nothing before execution
+    const size_t mark5 = fx.captured.size();
+    scene.execute({list});
+    CHECK(count_op(packets_since(fx, mark5), GpuOpcode::Draw) == 0);
+    uint32_t marker = 0;
+    CHECK(com::read_guest(markers + 4, marker) && marker == 0x1234);
+    CHECK(load64(markers + 8) == 42);
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 71) == 0 &&
+          com::stub_hits(dg::kID3D12GraphicsCommandList, 74) == 0 &&
+          com::stub_hits(dg::kID3D12GraphicsCommandList, 146) == 0);
     CHECK(t_balanced);
     scene.release_all({list});
 }

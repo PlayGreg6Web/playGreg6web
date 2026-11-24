@@ -401,6 +401,14 @@ struct IGraphicsCommandListHost : IDeviceChildHost {
     virtual void OMSetDepthBounds(float min_depth, float max_depth) = 0;               // Xbox 70
     virtual void RSSetShadingRate(uint32_t rate, uint64_t combiners) = 0;              // Xbox 126
     virtual void RSSetShadingRateImage(InterfaceArg<IResourceHost> image) = 0;         // Xbox 127
+    // Xbox 71: (address, u32 value, 0, 0): writes a 32-bit value to guest memory when the GPU
+    // reaches this point (the title's per-frame marker array, 3 frames x 18 u32).
+    virtual void WriteValue32(uint64_t address, uint32_t value, uint32_t a3, uint32_t a4) = 0;
+    // Xbox 74: (address, 7, value, 1): writes a 64-bit value (a frame counter, a word the CPU
+    // also writes with a 64-bit store) to guest memory when the GPU reaches this point.
+    virtual void WriteValue64(uint64_t address, uint32_t a2, uint64_t value, uint32_t a4) = 0;
+    // Xbox 146: enhanced barriers, (UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP*).
+    virtual void Barrier(uint32_t group_count, uint64_t groups) = 0;
     // Xbox-only slots whose meaning is not established: recorded, no effect.
     virtual void note_xbox_slot(uint32_t slot) = 0;
     template <uint32_t Slot>

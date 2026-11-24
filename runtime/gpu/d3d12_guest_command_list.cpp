@@ -137,6 +137,9 @@ void CommandQueue::execute(const std::vector<uint64_t>& lists) {
         ordered.push_back(spans[1 + resolved.size() + i]);
     }
     device_->submit_parts(ordered);
+    for (CommandList* list : resolved) {
+        list->apply_immediate_writes();
+    }
     for (const d3d::StateDiagnostic& d : state_diags) {
         device_->note_bad_argument(std::string("resource state at ExecuteCommandLists: ") +
                                    d3d::state_diagnostic_name(d.code) + " (resource " + std::to_string(d.resource_id) +
@@ -177,6 +180,7 @@ Resource* CommandList::resource(const InterfaceArg<IResourceHost>& arg) const {
 void CommandList::reset(PipelineState* initial_state) {
     encoder_.clear();
     deferred_.clear();
+    immediate_writes_.clear();
     pinned_.clear();
     graphics_pso_ = nullptr;
     compute_pso_ = nullptr;
@@ -508,6 +512,94 @@ void CommandList::OMSetBlendFactor(uint64_t factor) {
 void CommandList::OMSetStencilRef(uint32_t ref) {
     if (usable()) {
         bridge_.OMSetStencilRef(ref);
+    }
+}
+
+void CommandList::WriteValue32(uint64_t address, uint32_t value, uint32_t a3, uint32_t a4) {
+    if (!usable()) {
+        return;
+    }
+    if (address == 0 || (address & 3) != 0) {
+        note("ID3D12GraphicsCommandList Xbox slot 71: invalid address " + hex(address));
+        return;
+    }
+    if (a3 != 0 || a4 != 0) {
+        note("ID3D12GraphicsCommandList Xbox slot 71: arguments " + hex(a3) + ", " + hex(a4) + " are not interpreted");
+    }
+    immediate_writes_.push_back(ImmediateWrite{address, value, 4});
+}
+
+void CommandList::WriteValue64(uint64_t address, uint32_t a2, uint64_t value, uint32_t a4) {
+    if (!usable()) {
+        return;
+    }
+    if (address == 0 || (address & 7) != 0) {
+        note("ID3D12GraphicsCommandList Xbox slot 74: invalid address " + hex(address));
+        return;
+    }
+    if (a2 != 7 || a4 != 1) {
+        note("ID3D12GraphicsCommandList Xbox slot 74: arguments " + hex(a2) + ", " + hex(a4) +
+             " differ from the observed (7, 1); not interpreted");
+    }
+    immediate_writes_.push_back(ImmediateWrite{address, value, 8});
+}
+
+void CommandList::apply_immediate_writes() {
+    for (const ImmediateWrite& w : immediate_writes_) {
+        if (!com::write_guest(w.address, &w.value, w.size)) {
+            device_->note_bad_argument("ExecuteCommandLists: immediate write to " + hex(w.address) +
+                                       " is not guest memory");
+        }
+    }
+}
+
+namespace {
+// D3D12_BARRIER_GROUP {D3D12_BARRIER_TYPE Type; UINT32 NumBarriers; const void* pBarriers}.
+struct GuestBarrierGroup {
+    uint32_t Type;
+    uint32_t NumBarriers;
+    uint64_t pBarriers;
+};
+static_assert(sizeof(GuestBarrierGroup) == 16);
+// Element sizes of the three barrier types (global, texture, buffer) and the offset of their
+// resource pointer (none for global barriers).
+constexpr uint32_t kBarrierBytes[3] = {16, 64, 40};
+constexpr uint32_t kBarrierResourceOffset[3] = {0, 24, 16};
+constexpr uint32_t kMaxBarrierGroups = 4096;
+constexpr uint32_t kMaxBarriersPerGroup = 65536;
+}  // namespace
+
+void CommandList::Barrier(uint32_t group_count, uint64_t groups) {
+    if (!usable()) {
+        return;
+    }
+    std::vector<GuestBarrierGroup> g;
+    if (group_count > kMaxBarrierGroups || !read_n(groups, group_count, &g)) {
+        note("Barrier (Xbox slot 146): unreadable barrier group array " + hex(groups));
+        return;
+    }
+    // Enhanced barriers order GPU work and change layouts; WebGPU orders its own work and has no
+    // layouts, so nothing is recorded. The groups are still checked: the resources they name must
+    // be resources of this device.
+    for (const GuestBarrierGroup& group : g) {
+        if (group.Type > 2 || group.NumBarriers > kMaxBarriersPerGroup ||
+            (group.NumBarriers != 0 && group.pBarriers == 0)) {
+            note("Barrier (Xbox slot 146): invalid barrier group (type " + std::to_string(group.Type) + ", " +
+                 std::to_string(group.NumBarriers) + " barriers)");
+            continue;
+        }
+        if (group.Type == 0) {
+            continue;
+        }
+        for (uint32_t i = 0; i < group.NumBarriers; ++i) {
+            uint64_t resource_va = 0;
+            const uint64_t at = group.pBarriers + uint64_t{i} * kBarrierBytes[group.Type] +
+                                kBarrierResourceOffset[group.Type];
+            if (!com::read_guest(at, resource_va) || as_resource(resource_va) == nullptr) {
+                note("Barrier (Xbox slot 146): barrier " + std::to_string(i) + " names an unknown resource " +
+                     hex(resource_va));
+            }
+        }
     }
 }
 
@@ -884,9 +976,10 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 63..66
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 67..69
     CL::method<&H::OMSetDepthBounds>("OMSetDepthBounds"),                             // 70
-    CL::stub(nullptr),                                                                // 71
+    CL::method<&H::WriteValue32>("write value 32 (Xbox slot 71)"),                    // 71
     CL::method<&H::XboxSlot<72>>("Xbox slot 72"),                                     // 72
-    CL::stub(nullptr), CL::stub(nullptr),                                             // 73..74
+    CL::stub(nullptr),                                                                // 73
+    CL::method<&H::WriteValue64>("write value 64 (Xbox slot 74)"),                    // 74
     CL::method<&H::XboxSlot<75>>("Xbox slot 75"),                                     // 75
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 76..79
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 80..83
@@ -915,6 +1008,8 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::stub(nullptr),                                                                // 140
     CL::stub(nullptr),                                                                // 141
     CL::method<&H::XboxSlot<142>>("Xbox slot 142"),                                   // 142
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 143..145
+    CL::method<&H::Barrier>("Barrier (Xbox slot 146)"),                               // 146
 };
 constexpr Guid kCommandListIids[] = {
     IID_ID3D12Object,

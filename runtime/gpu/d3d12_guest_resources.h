@@ -265,7 +265,14 @@ public:
     void OMSetDepthBounds(float min_depth, float max_depth) override;
     void RSSetShadingRate(uint32_t rate, uint64_t combiners) override;
     void RSSetShadingRateImage(InterfaceArg<IResourceHost> image) override;
+    void WriteValue32(uint64_t address, uint32_t value, uint32_t a3, uint32_t a4) override;
+    void WriteValue64(uint64_t address, uint32_t a2, uint64_t value, uint32_t a4) override;
+    void Barrier(uint32_t group_count, uint64_t groups) override;
     void note_xbox_slot(uint32_t slot) override;
+    // Immediate value writes recorded by Xbox slots 71 / 74, applied to guest memory in order when
+    // the list is executed (work completes at submission in this runtime, as fences do).
+    void apply_immediate_writes();
+    size_t immediate_write_count() const { return immediate_writes_.size(); }
 
     // ---- Runtime side ----
     bool is_open() const { return open_; }
@@ -306,6 +313,12 @@ private:
     PipelineState* compute_pso_ = nullptr;   // current compute PSO
     std::vector<com::Ref<com::ComObject>> pinned_;  // objects referenced by the recording
     std::vector<DeferredWrite> deferred_;
+    struct ImmediateWrite {
+        uint64_t address = 0;
+        uint64_t value = 0;
+        uint32_t size = 0;  // 4 or 8
+    };
+    std::vector<ImmediateWrite> immediate_writes_;
     uint64_t diag_count_ = 0;
     std::map<uint32_t, uint64_t> xbox_calls_;
 };
