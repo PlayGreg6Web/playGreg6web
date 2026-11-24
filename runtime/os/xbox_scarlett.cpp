@@ -442,8 +442,19 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
     // The bytes living here (the page's own, or after a frame swap another page's, O29) go to a
     // store before the slot loses its memory.
     if (PhysicalPage* owner = page.home_va == va ? &page : home_owner_locked(st, va)) {
-        save_page_contents(*owner, static_cast<const uint8_t*>(host_of(va)));
-        owner->home_va = 0;
+        // O30: a page that is still mapped at its first real slot (the title's pool view), whose
+        // memory holds nobody else's bytes, goes back there instead of into a new store block:
+        // one copy, and no store per page the title streams through its CPU window.
+        const uint64_t back = owner->pool_va;
+        const auto still = back != 0 && back != va ? st.page_slots.find(back) : st.page_slots.end();
+        if (still != st.page_slots.end() && still->second == owner->handle &&
+            home_owner_locked(st, back) == nullptr) {
+            std::memcpy(host_of(back), host_of(va), static_cast<size_t>(owner->page_size));
+            owner->home_va = back;
+        } else {
+            save_page_contents(*owner, static_cast<const uint8_t*>(host_of(va)));
+            owner->home_va = 0;
+        }
         retarget_window_slots_locked(*owner);
     }
     VirtualRegion* region = st.region_containing_locked(va, ps);

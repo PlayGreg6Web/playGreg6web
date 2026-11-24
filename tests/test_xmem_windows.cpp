@@ -285,8 +285,11 @@ void test_title_shaped_streaming() {
     }
     // Unmap four slots (null array), then remap one of their pages while it is still mapped at
     // another slot of the window.
+    static_cast<uint8_t*>(arena().translate(C + 4 * k64K))[9] = 0x3C;  // written through the window
     CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(vas + 4, 4, nullptr) == 1);
     CHECK(arena().query(C + 4 * k64K).state == MemState::Reserve);
+    // The unmapped pages' bytes went back to their pool-view slots (no store copies).
+    CHECK(v[(kFirst + 4) * k64K + 9] == 0x3C && v[(kFirst + 4) * k64K + 10] == 0x80 + kFirst + 4);
     const uint64_t again_va[1] = {C + 100 * k64K};
     const uint64_t again_page[1] = {static_cast<uint64_t>(packed[kFirst + 1]) << 4};  // still at slot 1
     CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(again_va, 1, again_page) == 1);
