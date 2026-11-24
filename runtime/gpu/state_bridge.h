@@ -130,6 +130,7 @@ inline constexpr uint64_t RootConstantRingWrapped = 1ull << 11; // ring reused: 
 inline constexpr uint64_t NoComputePipeline = 1ull << 12;       // Dispatch without a usable pipeline
 inline constexpr uint64_t CommandListClosed = 1ull << 13;       // call on a closed list ignored
 inline constexpr uint64_t ComponentMappingIgnored = 1ull << 14; // non-identity SRV swizzle
+inline constexpr uint64_t UnalignedUniform = 1ull << 15;        // uniform binding offset % 256, not relocated
 }  // namespace BridgeDiag
 
 // =====================================================================================================
@@ -144,7 +145,14 @@ struct BridgeOptions {
     uint32_t max_texture_dimension_2d = 8192;
     // Uniform ring for root constants (bound with dynamic offsets). Must hold one frame's worth.
     uint32_t root_constant_ring_bytes = 1u << 20;
+    // Uniform-buffer bindings whose offset is not a multiple of kUniformOffsetAlignment (WebGPU's
+    // minUniformBufferOffsetAlignment) are relocated through this hook: given the binding's GPU
+    // address and size it returns a buffer id and an aligned offset that hold the same bytes
+    // (false: no relocation, the binding is emitted as it is and diagnosed).
+    std::function<bool(uint64_t gpu_va, uint64_t size, uint32_t* buffer_id, uint64_t* offset)> relocate_uniform;
 };
+
+inline constexpr uint64_t kUniformOffsetAlignment = 256;
 
 class GraphicsPipelineState;
 class ComputePipelineState;
@@ -201,6 +209,8 @@ public:
     pso::PipelineCache& pipeline_cache() noexcept { return *pipeline_cache_; }
     d3d::DescriptorHeapRegistry& heaps() noexcept { return heaps_; }
     const BridgeOptions& options() const noexcept { return options_; }
+    // GPU address of a registered buffer (0 when unknown).
+    uint64_t buffer_gpu_va(uint32_t resource_id) const;
     uint32_t allocate_id() { return options_.id_allocator(); }
     // The registered description of texture `resource_id` (false if it is not a texture).
     bool texture_info(uint32_t resource_id, TextureInfo* out) const;

@@ -686,6 +686,11 @@ public:
     PipelineDump* pipeline_dump() const { return dump_.get(); }
     // A GPU-only buffer owned by the runtime (rectangle-list expansion); empty on failure.
     com::Ref<Resource> create_internal_buffer(uint64_t size);
+    // Uniform bindings at offsets WebGPU cannot bind (BridgeOptions::relocate_uniform): the bytes
+    // at [va, va + size) (CPU-visible memory only) get a 256-byte aligned home in runtime-owned
+    // buffers, refreshed from guest memory at every submission (flush_cpu_buffers) when changed.
+    bool relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset);
+    size_t relocated_uniform_count() const;
     void flush_pipeline_dump();
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
@@ -789,6 +794,17 @@ private:
     std::unordered_map<DxilDigest, NativeStageRecord, DigestHash> native_by_digest_;  // under shader_mutex_
     std::unordered_set<uint64_t> indexed_native_;                                     // under shader_mutex_
     std::unique_ptr<PipelineDump> dump_;
+    struct RelocatedUniform {
+        uint64_t va = 0;
+        uint64_t size = 0;
+        uint32_t buffer_id = 0;
+        uint64_t offset = 0;
+        std::vector<uint8_t> shadow;  // bytes last written (empty: never written)
+    };
+    mutable std::mutex relocation_mutex_;
+    std::map<std::pair<uint64_t, uint64_t>, RelocatedUniform> relocations_;  // (va, size)
+    uint32_t relocation_buffer_ = 0;  // current GPU buffer id (CreateBuffer packet only, no COM object)
+    uint64_t relocation_used_ = 0;    // bytes used in relocation_buffer_
     std::atomic<uint64_t> dump_presents_{0};
     struct ShaderFacts {
         uint64_t bytes = 0;

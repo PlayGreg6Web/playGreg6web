@@ -169,6 +169,12 @@ void StateBridgeDevice::register_buffer(uint32_t resource_id, uint64_t gpu_va, u
     buffer_va_[resource_id] = gpu_va;
 }
 
+uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
+    std::shared_lock lock(resources_mutex_);
+    auto it = buffer_va_.find(resource_id);
+    return it != buffer_va_.end() ? it->second : 0;
+}
+
 void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
     std::unique_lock lock(resources_mutex_);
     textures_.erase(resource_id);
@@ -1071,6 +1077,22 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
             out.resource_id = e.resource_id;
             out.offset = e.offset;
             out.size = e.size;
+            // WebGPU binds uniform buffers only at 256-byte aligned offsets; the title's constant
+            // buffers are 16-byte aligned (Xbox). Relocate to a copy at an aligned offset.
+            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
+                e.offset % kUniformOffsetAlignment != 0) {
+                const uint64_t base = device_.buffer_gpu_va(e.resource_id);
+                uint32_t id = 0;
+                uint64_t offset = 0;
+                if (base != 0 && e.size != 0 && device_.options().relocate_uniform &&
+                    device_.options().relocate_uniform(base + e.offset, e.size, &id, &offset)) {
+                    out.resource_id = id;
+                    out.offset = offset;
+                } else {
+                    diagnostics_ |= BridgeDiag::UnalignedUniform;
+                }
+            }
             break;
         case d3d::BindResourceKind::TextureView:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);

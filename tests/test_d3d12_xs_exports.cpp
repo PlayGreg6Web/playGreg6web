@@ -2360,6 +2360,70 @@ void test_xbox_pipeline_dump() {
     std::filesystem::remove_all(dir);
 }
 
+// G47: constant-buffer views at 16-byte aligned addresses are accepted, and unaligned uniform
+// bindings get an aligned copy that is refreshed at every submission when the bytes change.
+void test_xbox_unaligned_constant_buffers() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t cbv = put(dg::GuestConstantBufferViewDesc{scene.vb_va + 16, 32});
+    const uint64_t heap_desc = put(dg::GuestDescriptorHeapDesc{0, 4, 0, 0});
+    int32_t result = -1;
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap, {I(heap_desc)},
+                                    dg::IID_ID3D12DescriptorHeap, &result);
+    CHECK(result == 0 && heap != 0);
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    const uint64_t result_buf = put<uint64_t>(0);
+    fx.sret_call(heap, Slot::GetCPUStart, result_buf);
+    const uint64_t cpu_start = load64(result_buf);
+    fx.vcall(scene.device, Slot::CreateConstantBufferView, {I(cbv), I(cpu_start)});
+    const auto* host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap);
+    CHECK(host_heap != nullptr && host_heap->heap()->view(0) != nullptr &&
+          host_heap->heap()->view(0)->kind == d3d::DescriptorKind::Cbv &&
+          host_heap->heap()->view(0)->num_elements_or_size == 32);
+    CHECK(dev->stats().bad_arguments == bad_before);
+
+    const float values[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    CHECK(com::write_guest(scene.vb_va + 16, values, sizeof(values)));
+    uint32_t id = 0;
+    uint64_t offset = 1;
+    CHECK(dev->relocate_uniform(scene.vb_va + 16, 32, &id, &offset));
+    CHECK(id != 0 && offset % 256 == 0);
+    uint32_t id2 = 0;
+    uint64_t offset2 = 0;
+    CHECK(dev->relocate_uniform(scene.vb_va + 16, 32, &id2, &offset2) && id2 == id && offset2 == offset);
+    CHECK(!dev->relocate_uniform(0x00007E0000000000ull, 32, &id2, &offset2));  // GPU-only memory
+    auto writes_to = [&](const std::vector<Packet>& ps) {
+        std::vector<std::vector<uint8_t>> out;
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == id) {
+                out.emplace_back(p.payload.begin() + sizeof(GpuWriteBufferPayload), p.payload.end());
+            }
+        }
+        return out;
+    };
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    size_t mark = fx.captured.size();
+    scene.execute({list});
+    auto w = writes_to(packets_since(fx, mark));
+    CHECK(w.size() == 1 && w[0].size() == 32 && std::memcmp(w[0].data(), values, 32) == 0);
+    mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(writes_to(packets_since(fx, mark)).empty());  // unchanged
+    const float changed = 9;
+    CHECK(com::write_guest(scene.vb_va + 16, &changed, 4));
+    mark = fx.captured.size();
+    scene.execute({list});
+    w = writes_to(packets_since(fx, mark));
+    CHECK(w.size() == 1 && w[0].size() == 32 && std::memcmp(w[0].data(), &changed, 4) == 0);
+    CHECK(dev->relocated_uniform_count() == 1);
+
+    CHECK(t_balanced);
+    scene.release_all({list, heap});
+}
+
 // G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
 void test_xbox_rect_lists() {
     Fixture fx;
@@ -2808,6 +2872,7 @@ int main() {
     test_xbox_native_pipelines();
     test_xbox_rect_lists();
     test_xbox_native_dxil_join();
+    test_xbox_unaligned_constant_buffers();
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();

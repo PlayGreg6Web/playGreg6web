@@ -227,8 +227,14 @@ std::u16string PrivateData::name() const {
 // ---------------------------------------------------------------------------------------------
 
 Device::Device(DeviceOptions options) : options_(std::move(options)) {
+    // The title creates constant-buffer views at 16-byte aligned addresses and sizes (Xbox; PC
+    // D3D12 requires 256).
+    heaps_.set_cbv_alignment(16);
     bridge::BridgeOptions bo = options_.bridge;
     bo.id_allocator = [this] { return allocate_id(); };
+    bo.relocate_uniform = [this](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+        return relocate_uniform(va, size, id, offset);
+    };
     bridge_ = std::make_unique<bridge::StateBridgeDevice>(heaps_, std::move(bo), &resource_states_);
     sink_ = options_.sink;
     // O27: the XMem CPU/GPU window pairs, whether reserved before or after this device.
@@ -677,7 +683,9 @@ void Device::CreateConstantBufferView(uint64_t desc_va, uint64_t dest) {
     }
     const d3d::Status s = heaps_.create_constant_buffer_view(desc, d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
-        note_bad_argument(std::string("CreateConstantBufferView: ") + d3d::status_name(s) + " (handle " + hex(dest) + ")");
+        note_bad_argument(std::string("CreateConstantBufferView: ") + d3d::status_name(s) + " (address " +
+                          hex(desc != nullptr ? desc->buffer_location : 0) + ", size " +
+                          std::to_string(desc != nullptr ? desc->size_in_bytes : 0) + ", handle " + hex(dest) + ")");
     }
 }
 

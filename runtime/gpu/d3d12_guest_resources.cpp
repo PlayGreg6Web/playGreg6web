@@ -208,10 +208,62 @@ void Device::untrack_cpu_buffer(Resource* resource) {
 }
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
-    std::lock_guard<std::mutex> lock(tracked_mutex_);
-    for (Resource* r : tracked_) {
-        r->flush_shadow(encoder);
+    {
+        std::lock_guard<std::mutex> lock(tracked_mutex_);
+        for (Resource* r : tracked_) {
+            r->flush_shadow(encoder);
+        }
     }
+    // Relocated uniform ranges: refresh the aligned copies whose guest bytes changed.
+    std::lock_guard<std::mutex> lock(relocation_mutex_);
+    std::vector<uint8_t> bytes;
+    for (auto& [key, r] : relocations_) {
+        bytes.resize(static_cast<size_t>(r.size));
+        if (!com::read_guest(cpu_address_for_gpu(r.va), bytes.data(), bytes.size()) || bytes == r.shadow) {
+            continue;
+        }
+        encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
+        r.shadow = bytes;
+        note_upload(r.size);
+    }
+}
+
+bool Device::relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {
+    constexpr uint64_t kChunk = 1u << 20;
+    if (size == 0 || size > (64u << 10)) {
+        return false;
+    }
+    uint8_t probe = 0;
+    if (!com::read_guest(cpu_address_for_gpu(va), &probe, 1)) {
+        return false;  // GPU-only memory: no bytes to copy
+    }
+    std::lock_guard<std::mutex> lock(relocation_mutex_);
+    auto it = relocations_.find({va, size});
+    if (it == relocations_.end()) {
+        const uint64_t need = align_up(size, bridge::kUniformOffsetAlignment);
+        if (relocation_buffer_ == 0 || relocation_used_ + need > kChunk) {
+            relocation_buffer_ = allocate_id();
+            CommandEncoder enc;
+            enc.create_buffer(relocation_buffer_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, kChunk);
+            submit(enc);
+            relocation_used_ = 0;
+        }
+        RelocatedUniform r;
+        r.va = va;
+        r.size = size;
+        r.buffer_id = relocation_buffer_;
+        r.offset = relocation_used_;
+        relocation_used_ += need;
+        it = relocations_.emplace(std::make_pair(va, size), std::move(r)).first;
+    }
+    *buffer_id = it->second.buffer_id;
+    *offset = it->second.offset;
+    return true;
+}
+
+size_t Device::relocated_uniform_count() const {
+    std::lock_guard<std::mutex> lock(relocation_mutex_);
+    return relocations_.size();
 }
 
 bool Device::set_back_buffer(uint64_t resource_interface_pointer) {

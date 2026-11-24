@@ -474,7 +474,7 @@ Status DescriptorHeapRegistry::create_constant_buffer_view(
     ViewDescriptor r{};
     r.kind = DescriptorKind::Cbv;
     if (desc != nullptr) {
-        if ((desc->size_in_bytes % 256u) != 0 || (desc->buffer_location % 256u) != 0) {
+        if ((desc->size_in_bytes % cbv_alignment_) != 0 || (desc->buffer_location % cbv_alignment_) != 0) {
             return Status::InvalidArgument;
         }
         r.first_element_or_address = desc->buffer_location;

@@ -481,6 +481,9 @@ public:
 
     Status create_heap(const DescriptorHeapDesc& desc, DescriptorHeap** out_heap);
     void destroy_heap(DescriptorHeap* heap);
+    // Required alignment of a constant-buffer view's address and size (power of two). D3D12 on PC
+    // requires 256 (the default); the Xbox title passes 16-byte aligned views.
+    void set_cbv_alignment(uint32_t alignment) noexcept { cbv_alignment_ = alignment; }
     uint32_t heap_count() const noexcept;
 
     Status resolve_cpu(CpuDescriptorHandle handle, ResolvedDescriptor* out) const noexcept;
@@ -542,6 +545,7 @@ private:
     // Heaps placed at a CPU address (DescriptorHeapDesc::cpu_address), by address.
     std::map<uint64_t, DescriptorHeap*> placed_;  // guarded by placed_mutex_
     mutable std::shared_mutex placed_mutex_;
+    uint32_t cbv_alignment_ = 256;
 };
 
 // ---------------------------------------------------------------------------
