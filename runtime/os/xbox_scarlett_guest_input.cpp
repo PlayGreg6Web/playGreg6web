@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -9,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "gpu/gfx10_detile.h"
 #include "os/game_input.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
@@ -500,6 +502,7 @@ public:
 
     XgComputer(Pg6IXGTextureAddressComputer* host, const XgResourceDesc& desc) : host_(host), desc_(desc) {
         host_->GetResourceLayout(&layout_);
+        init_tiled();
     }
     ~XgComputer() override { host_->Release(); }
 
@@ -553,6 +556,9 @@ public:
         }
         if (layout_.mip_levels == 0) {
             return com::E_INVALIDARG_HR;
+        }
+        if (tiled_) {
+            return copy_into_tiled(dst, plane, subresource, src, row_pitch, slice_pitch);
         }
         const Pg6XgMipLevelLayout& ml = layout_.mips[subresource % layout_.mip_levels];
         const uint32_t depth = desc_.dimension == 4 ? ml.depth : 1u;
@@ -652,9 +658,83 @@ public:
     }
 
 private:
+    // A 2D (single slice) or 3D descriptor whose swizzle mode (+0x2C, 0x100 | n) is a tiled GFX10
+    // mode: CopyIntoSubresource writes the GFX10 layout the runtime's detiler reads back
+    // (gpu/gfx10_detile.h) instead of linear rows. The surface must fit the size this computer
+    // reports (layout_.size_bytes); otherwise the copy stays linear.
+    void init_tiled() {
+        namespace gfx10 = playgta6::gpu::gfx10;
+        const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(desc_.swizzle_mode);
+        if (mode == gfx10::SwizzleMode::Linear || mode == gfx10::SwizzleMode::Unsupported ||
+            (desc_.dimension != 3 && desc_.dimension != 4) || (desc_.dimension == 3 && desc_.depth_or_array_size > 1) ||
+            desc_.sample_count > 1 || layout_.mip_levels == 0) {
+            return;
+        }
+        tiled_desc_.dxgi_format = desc_.format;
+        tiled_desc_.width = static_cast<uint32_t>(desc_.width);
+        tiled_desc_.height = std::max<uint32_t>(desc_.height, 1u);
+        tiled_desc_.depth = desc_.dimension == 4 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
+        tiled_desc_.mip_levels = layout_.mip_levels;
+        tiled_desc_.d3d12_layout = desc_.swizzle_mode;
+        const size_t bytes = gfx10::surface_bytes(tiled_desc_);
+        if (bytes == 0 || bytes > layout_.size_bytes) {
+            if (bytes != 0) {
+                diag("xg_xs: swizzle mode 0x" + hex32(desc_.swizzle_mode) + " surface (" + std::to_string(bytes) +
+                     " bytes) exceeds the reported size (" + std::to_string(layout_.size_bytes) +
+                     "); copies stay linear");
+            }
+            return;
+        }
+        surface_bytes_ = bytes;
+        tiled_ = true;
+    }
+
+    HResult copy_into_tiled(uint64_t dst, uint32_t plane, uint32_t subresource, uint64_t src, uint32_t row_pitch,
+                            uint32_t slice_pitch) {
+        namespace gfx10 = playgta6::gpu::gfx10;
+        if (plane != 0 || subresource >= tiled_desc_.mip_levels) {
+            return com::E_INVALIDARG_HR;
+        }
+        const gfx10::FormatGeometry g = gfx10::format_geometry(tiled_desc_.dxgi_format);
+        const uint32_t mip = subresource;
+        const uint32_t w = std::max(1u, tiled_desc_.width >> mip);
+        const uint32_t h = std::max(1u, tiled_desc_.height >> mip);
+        const uint32_t d = std::max(1u, tiled_desc_.depth >> mip);
+        const uint32_t row_bytes = (w + g.block_width - 1u) / g.block_width * g.bytes_per_block;
+        const uint32_t rows = (h + g.block_height - 1u) / g.block_height;
+        if (row_pitch < row_bytes || (d > 1 && slice_pitch < uint64_t{row_pitch} * rows)) {
+            return com::E_INVALIDARG_HR;
+        }
+        std::vector<uint8_t> linear(size_t{row_bytes} * rows * d);
+        for (uint32_t z = 0; z < d; ++z) {
+            for (uint32_t y = 0; y < rows; ++y) {
+                const uint64_t from = src + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
+                if (!com::read_guest(from, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
+                    return com::E_INVALIDARG_HR;
+                }
+            }
+        }
+        std::vector<uint8_t> surface(surface_bytes_);
+        if (!com::read_guest(dst, surface.data(), surface.size()) ||
+            !gfx10::tile_into_surface(tiled_desc_, mip, linear.data(), linear.size(), surface.data(), surface.size()) ||
+            !com::write_guest(dst, surface.data(), surface.size())) {
+            return com::E_INVALIDARG_HR;
+        }
+        return kOk;
+    }
+
+    static std::string hex32(uint32_t v) {
+        char b[12];
+        std::snprintf(b, sizeof(b), "%x", v);
+        return b;
+    }
+
     Pg6IXGTextureAddressComputer* host_;
     XgResourceDesc desc_;
     Pg6XgResourceLayout layout_{};
+    playgta6::gpu::gfx10::TextureLayoutDesc tiled_desc_{};
+    size_t surface_bytes_ = 0;
+    bool tiled_ = false;
 };
 
 // ---------------------------------------------------------------------------

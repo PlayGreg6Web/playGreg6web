@@ -5,6 +5,7 @@
 // __playgta6_indirect_call, exactly like recompiled guest code. The zlib streams below were
 // produced from the synthetic generators in this file (pattern_data / skewed_data).
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "abi/playgta6_abi.h"
+#include "gpu/gfx10_detile.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
@@ -1309,6 +1311,41 @@ void test_xg() {
 
     // An unsupported dimension fails.
     CHECK(as_hr(fx.dcall(create, {I(xg_desc(7, 16, 16, 1, 1, 28)), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
+
+    // A tiled swizzle mode (+0x2C = 0x100 | 5, 4KB_S): CopyIntoSubresource writes the GFX10
+    // layout that the runtime's detiler reads back, per mip (mip 1 of a 9-mip 256x256 RGBA8 sits
+    // where the GFX10 chain puts it) and for a thick 3D surface.
+    namespace gfx10 = playgta6::gpu::gfx10;
+    struct TiledCase {
+        uint32_t dim, w, h, d, mips, format, bpe, mip;
+    };
+    for (const TiledCase& c : {TiledCase{3, 256, 256, 1, 9, 28, 4, 1}, TiledCase{3, 64, 64, 1, 1, 28, 4, 0},
+                               TiledCase{4, 16, 16, 16, 1, 10, 8, 0}}) {
+        const uint64_t tdesc = xg_desc(c.dim, c.w, c.h, c.d, c.mips, c.format);
+        const uint32_t swizzle = 0x105;
+        CHECK(com::write_guest(tdesc + 0x2C, swizzle));
+        const uint64_t tout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
+        const uint64_t tcomp = load64(tout);
+        const uint32_t mw = std::max(1u, c.w >> c.mip), mh = std::max(1u, c.h >> c.mip);
+        const uint32_t md = std::max(1u, c.d >> c.mip);
+        std::vector<uint8_t> lin(size_t{mw} * mh * md * c.bpe);
+        for (size_t i = 0; i < lin.size(); ++i) {
+            lin[i] = static_cast<uint8_t>(i * 7 + (i >> 9));
+        }
+        const uint64_t tsrc = com::guest_alloc(lin.size());
+        CHECK(com::write_guest(tsrc, lin.data(), lin.size()));
+        const gfx10::TextureLayoutDesc gd{c.format, c.w, c.h, c.dim == 4 ? c.d : 1u, c.mips, swizzle, 0};
+        const size_t surface = gfx10::surface_bytes(gd);
+        CHECK(surface != 0);
+        const uint64_t tdst = com::guest_alloc(surface + 0x10000);
+        CHECK(as_hr(fx.vcall(tcomp, 8, {I(tdst), I(0), I(c.mip), I(tsrc), I(mw * c.bpe), I(mw * c.bpe * mh)})) == 0);
+        const std::vector<uint8_t> written = guest_bytes(tdst, surface);
+        std::vector<uint8_t> back;
+        CHECK(gfx10::detile_from_surface(gd, c.mip, written.data(), written.size(), back).ok);
+        CHECK(back == lin);
+        CHECK(fx.vcall(tcomp, 1) == 0);
+    }
 }
 
 // AcpHalCreate: a guest object without an IUnknown prefix. Connect (0), submit (2), disconnect

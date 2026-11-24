@@ -139,10 +139,12 @@
 //   mode (0x100 | n), +0x30 u32 flags.
 // xg_xs.dll!XGSuggestSwizzleMode(const XG_RESOURCE_DESC*, UINT32 (0), UINT32* mode) -> HRESULT
 //   1 call site, writing desc +0x2C; the one-argument host shim (O12) does not match it.
-// Fidelity: layouts are linear (row pitch aligned to 256 bytes, mips one after another, no
-// console tiling/swizzle) and tiling uses the D3D12 standard 64 KiB tile shapes. That is
-// self-consistent for the runtime's own uploads, but texture data the title stores pre-swizzled
-// for the console layout will not match until the real tiling is known.
+// Fidelity: GetResourceLayout reports linear layouts (row pitch aligned to 256 bytes, mips one
+// after another) and GetResourceTiling uses the D3D12 standard 64 KiB tile shapes.
+// CopyIntoSubresource writes the GFX10 layout of the descriptor's swizzle mode (AMD addrlib
+// equations and mip chain, gpu/gfx10_detile.h) for single-slice 2D and 3D resources when that
+// surface fits the reported size, so the runtime's detiler reads back what was written; other
+// descriptors are copied linearly.
 
 namespace playgta6::os::scarlett::guest_api {
 

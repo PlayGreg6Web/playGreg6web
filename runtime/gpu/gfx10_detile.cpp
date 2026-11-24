@@ -1036,6 +1036,23 @@ DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, co
     return res;
 }
 
+bool tile_into_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
+                       size_t linear_src_bytes, uint8_t* surface, size_t surface_size) {
+    if (linear_src == nullptr || surface == nullptr || is_linear_layout(desc)) {
+        return false;
+    }
+    size_t linear_size = 0;
+    uint32_t row_pitch = 0, rows = 0, slices = 0;
+    const char* err = walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+                                       [](size_t, size_t, uint32_t) {});
+    if (err != nullptr || linear_src_bytes < linear_size) {
+        return false;
+    }
+    walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+                     [&](size_t lin, size_t dst, uint32_t n) { std::memcpy(surface + dst, linear_src + lin, n); });
+    return true;
+}
+
 bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
                                 size_t linear_src_bytes, std::vector<uint8_t>& surface) {
     const size_t need = surface_bytes(desc);

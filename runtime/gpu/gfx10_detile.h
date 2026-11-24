@@ -124,6 +124,12 @@ size_t surface_bytes(const TextureLayoutDesc& desc) noexcept;
 DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* surface,
                                  size_t surface_bytes, std::vector<uint8_t>& linear_out);
 
+// Inverse of detile_from_surface: writes the tight rows of mip `mip` (D3D mip dimensions) into
+// the whole surface at `surface` (surface_size >= surface_bytes(desc)); other bytes are kept.
+// Tiled layouts only.
+bool tile_into_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
+                       size_t linear_src_bytes, uint8_t* surface, size_t surface_size);
+
 // Inverse of detile_from_surface for synthetic tests: writes mip `mip` into `surface` (resized to
 // surface_bytes(desc) if smaller; other bytes are kept).
 bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
