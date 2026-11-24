@@ -8,6 +8,9 @@ pub const ALLOCATION_GRANULARITY: u64 = 0x1_0000;
 /// Every module must end below the runtime's virtual module handles
 /// (`kVirtualModuleBase` in `runtime/os/win32_loader.h`).
 pub const ADDRESS_LIMIT: u64 = 0x0000_7FF8_0000_0000;
+/// Default range every module must lie in: the runtime's guest image pool `[4 GiB, 16 GiB)`
+/// (O18, `docs/wasm_abi.md` "Guest Address Space"; identity-mapped in the browser).
+pub const DEFAULT_ADDRESS_POOL: (u64, u64) = (0x1_0000_0000, 0x4_0000_0000);
 
 /// One module to place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,48 +27,57 @@ pub fn reserved_size(size_of_image: u32) -> u64 {
     u64::from(size_of_image).next_multiple_of(ALLOCATION_GRANULARITY)
 }
 
-/// Assigns every module a disjoint range, in request order: a module keeps its preferred base
-/// when `[base, base + reserved)` overlaps nothing placed before it; otherwise it goes to the
-/// lowest granularity-aligned address at or above its preferred base where it fits (a module
-/// that cannot be moved is an error). The first request (the executable) therefore always keeps
-/// its base, and the result depends only on the requests and their order.
-pub fn assign_bases(requests: &[Request]) -> Result<Vec<u64>, String> {
+/// Assigns every module a disjoint range inside `pool` (`[lo, hi)`, at most up to
+/// [`ADDRESS_LIMIT`]), in request order: a module keeps its preferred base when
+/// `[base, base + reserved)` lies in the pool and overlaps nothing placed before it; otherwise it
+/// goes to the lowest granularity-aligned address at or above `max(preferred base, lo)` where it
+/// fits in the pool, or, when there is none, the lowest such address at or above `lo` (a module
+/// that cannot be moved is an error). With the executable first and inside the pool it keeps its
+/// base, and the result depends only on the requests, their order and the pool.
+pub fn assign_bases(requests: &[Request], pool: (u64, u64)) -> Result<Vec<u64>, String> {
+    let (lo, hi) = (
+        pool.0.max(ALLOCATION_GRANULARITY),
+        pool.1.min(ADDRESS_LIMIT),
+    );
+    if lo >= hi {
+        return Err(format!(
+            "empty address pool [0x{:x}, 0x{:x})",
+            pool.0, pool.1
+        ));
+    }
     let mut placed: Vec<(u64, u64)> = Vec::new();
     let mut bases = Vec::with_capacity(requests.len());
     for request in requests {
         let size = reserved_size(request.size_of_image);
         let fits = |start: u64, placed: &[(u64, u64)]| {
-            start != 0
-                && start
-                    .checked_add(size)
-                    .is_some_and(|end| end <= ADDRESS_LIMIT)
+            start >= lo
+                && start.checked_add(size).is_some_and(|end| end <= hi)
                 && placed.iter().all(|&(s, e)| start + size <= s || e <= start)
         };
         let base = if fits(request.preferred_base, &placed) {
             request.preferred_base
         } else if !request.relocatable {
             return Err(format!(
-                "{} has its relocations stripped and cannot move from its preferred base 0x{:x}, \
-                 which overlaps another module",
+                "{} has its relocations stripped and cannot move from its preferred base 0x{:x},                  which overlaps another module or lies outside the address pool [0x{lo:x}, 0x{hi:x})",
                 request.name, request.preferred_base
             ));
         } else {
-            let start = request
-                .preferred_base
-                .next_multiple_of(ALLOCATION_GRANULARITY);
-            let mut candidates: Vec<u64> = placed
-                .iter()
-                .map(|&(_, end)| end.next_multiple_of(ALLOCATION_GRANULARITY))
-                .filter(|&c| c >= start)
-                .collect();
-            candidates.push(start);
-            candidates.sort_unstable();
-            candidates
-                .into_iter()
-                .find(|&c| fits(c, &placed))
+            let first_fit = |from: u64| {
+                let start = from.next_multiple_of(ALLOCATION_GRANULARITY);
+                let mut candidates: Vec<u64> = placed
+                    .iter()
+                    .map(|&(_, end)| end.next_multiple_of(ALLOCATION_GRANULARITY))
+                    .filter(|&c| c >= start)
+                    .collect();
+                candidates.push(start);
+                candidates.sort_unstable();
+                candidates.into_iter().find(|&c| fits(c, &placed))
+            };
+            first_fit(request.preferred_base.max(lo))
+                .or_else(|| first_fit(lo))
                 .ok_or_else(|| {
                     format!(
-                        "no free range of 0x{size:x} bytes at or above 0x{start:x} for {}",
+                        "no free range of 0x{size:x} bytes in the address pool [0x{lo:x}, 0x{hi:x}) for {}",
                         request.name
                     )
                 })?

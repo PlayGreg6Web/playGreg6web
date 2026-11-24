@@ -477,6 +477,8 @@ fn program_options(dir: &Path, exe: &Synth, dlls: &[&Synth]) -> ProgramOptions {
     }
     options.build.shim_headers = vec![header];
     options.build.jobs = 2;
+    // The fixtures use low bases (the execution test maps them into a small linear memory).
+    options.address_pool = (0x1_0000, ADDRESS_LIMIT);
     options
 }
 
@@ -735,14 +737,19 @@ fn assign_bases_keeps_free_bases_and_first_fits_collisions() {
         size_of_image: size,
         relocatable,
     };
-    let bases = assign_bases(&[
-        req("exe", 0x1_4000_0000, 0x5000, false),
-        req("a", 0x1_8000_0000, 0x12000, true),
-        req("b", 0x1_8000_0000, 0x5000, true),
-        req("c", 0x1_8000_0000, 0x5000, true),
-        req("d", 0x1_4000_0000, 0x1000, true),
-        req("e", 0x2_0000_0000, 0x1000, true),
-    ])
+    let bases = assign_bases(
+        &[
+            req("exe", 0x1_4000_0000, 0x5000, false),
+            req("a", 0x1_8000_0000, 0x12000, true),
+            req("b", 0x1_8000_0000, 0x5000, true),
+            req("c", 0x1_8000_0000, 0x5000, true),
+            req("d", 0x1_4000_0000, 0x1000, true),
+            req("e", 0x2_0000_0000, 0x1000, true),
+            // Outside the pool: moved to the lowest free slot of the pool.
+            req("far", 0x7_0000_0000, 0x1000, true),
+        ],
+        DEFAULT_ADDRESS_POOL,
+    )
     .unwrap();
     assert_eq!(
         bases,
@@ -752,21 +759,40 @@ fn assign_bases_keeps_free_bases_and_first_fits_collisions() {
             0x1_8002_0000,
             0x1_8003_0000,
             0x1_4001_0000,
-            0x2_0000_0000
+            0x2_0000_0000,
+            0x1_0000_0000
         ]
     );
-    let err = assign_bases(&[
-        req("exe", 0x1_8000_0000, 0x5000, true),
-        req("fixed", 0x1_8000_0000, 0x5000, false),
-    ])
+    let err = assign_bases(
+        &[
+            req("exe", 0x1_8000_0000, 0x5000, true),
+            req("fixed", 0x1_8000_0000, 0x5000, false),
+        ],
+        DEFAULT_ADDRESS_POOL,
+    )
     .unwrap_err();
     assert!(err.contains("relocations stripped"), "{err}");
-    let err = assign_bases(&[
-        req("exe", ADDRESS_LIMIT - 0x10000, 0x10000, false),
-        req("x", ADDRESS_LIMIT - 0x10000, 0x10000, true),
-    ])
+    // An executable outside the pool moves if it can, else it is an error.
+    assert_eq!(
+        assign_bases(&[req("exe", 0x40_0000, 0x5000, true)], DEFAULT_ADDRESS_POOL).unwrap(),
+        vec![0x1_0000_0000]
+    );
+    let err = assign_bases(
+        &[req("exe", 0x40_0000, 0x5000, false)],
+        DEFAULT_ADDRESS_POOL,
+    )
+    .unwrap_err();
+    assert!(err.contains("outside the address pool"), "{err}");
+    let err = assign_bases(
+        &[
+            req("exe", 0x1_0000_0000, 0x18000, false),
+            req("x", 0x1_0000_0000, 0x18000, true),
+        ],
+        (0x1_0000_0000, 0x1_0003_0000),
+    )
     .unwrap_err();
     assert!(err.contains("no free range"), "{err}");
+    assert!(assign_bases(&[], (5, 5)).is_err());
 }
 
 #[test]
@@ -1346,6 +1372,79 @@ fn allocator_family_must_not_split() {
     options.build.out_dir = tmp.path().join("out2");
     let r = build(&options);
     assert!(has_diag(&r, "allocator_split"));
+}
+
+#[test]
+fn exception_apis_bind_to_runtime_thunks() {
+    let mut exe = Synth::new("game.exe", EXE_BASE, false);
+    exe.imports = vec![
+        (
+            "KERNEL32.dll",
+            vec![Imp::Name("RtlUnwindEx"), Imp::Name("VirtualAlloc")],
+        ),
+        (
+            "api-ms-win-core-rtlsupport-l1-1-0.dll",
+            vec![Imp::Name("RtlCaptureContext")],
+        ),
+        (
+            "api-ms-win-core-errorhandling-l1-1-0.dll",
+            vec![Imp::Name("SetUnhandledExceptionFilter")],
+        ),
+        ("ntdll.dll", vec![Imp::Name("RtlRaiseException")]),
+    ];
+    let tmp = TempDir::new("runtime_thunks");
+    let r = build(&program_options(tmp.path(), &exe, &[]));
+    for label in [
+        "KERNEL32.dll!RtlUnwindEx",
+        "api-ms-win-core-rtlsupport-l1-1-0.dll!RtlCaptureContext",
+        "api-ms-win-core-errorhandling-l1-1-0.dll!SetUnhandledExceptionFilter",
+        "ntdll.dll!RtlRaiseException",
+    ] {
+        assert_eq!(import(&r, "game.exe", label).status(), "runtime", "{label}");
+    }
+    assert_eq!(
+        import(&r, "game.exe", "ntdll.dll!RtlRaiseException").binding,
+        Binding::Runtime {
+            module: "ntdll.dll".into(),
+            name: "RtlRaiseException".into()
+        }
+    );
+    assert_eq!(
+        import(&r, "game.exe", "KERNEL32.dll!VirtualAlloc").status(),
+        "host"
+    );
+    let main = r.module("game.exe").unwrap();
+    assert_eq!((main.imports.runtime, main.imports.host_bound), (4, 1));
+    assert!(r.manifest.contains("\"binding\": \"runtime\""));
+    assert!(
+        r.report
+            .contains("now 0 guest, 4 runtime, 1 host, 0 unresolved")
+    );
+}
+
+#[test]
+fn runtime_exception_apis_match_the_runtime_thunks() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/guest/guest_exceptions.cpp");
+    let source = fs::read_to_string(&path).expect("read guest_exceptions.cpp");
+    let exports: Vec<(String, String)> = source
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("{\"KERNEL32.dll\", \"") || l.starts_with("{\"ntdll.dll\", \""))
+        .filter_map(|l| {
+            let mut parts = l.split('"');
+            let module = parts.nth(1)?.to_string();
+            let name = parts.nth(1)?.to_string();
+            Some((module, name))
+        })
+        .collect();
+    let expected: Vec<(String, String)> = RUNTIME_EXCEPTION_APIS
+        .iter()
+        .map(|(m, n)| (m.to_string(), n.to_string()))
+        .collect();
+    assert_eq!(
+        exports, expected,
+        "keep RUNTIME_EXCEPTION_APIS in sync with guest_exceptions.cpp"
+    );
 }
 
 /// Regression (real DLLs): one importer names `KERNEL32.dll`, another the API set that maps to

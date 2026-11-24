@@ -1069,10 +1069,11 @@ fn checkout_shim_headers_come_from_runtime() {
     let (headers, root) = checkout_shim_headers(crate_dir).expect("inside the checkout");
     assert!(root.ends_with("runtime"));
     assert!(headers.iter().any(|h| h.ends_with("win32_kernel.h")));
-    assert!(headers.last().unwrap().ends_with("d3d12_xs.h"));
-    let mut sorted = headers[..headers.len() - 1].to_vec();
+    assert!(headers.last().unwrap().ends_with("guest_callbacks.h"));
+    assert!(headers[headers.len() - 2].ends_with("d3d12_xs.h"));
+    let mut sorted = headers[..headers.len() - 2].to_vec();
     sorted.sort();
-    assert_eq!(sorted, headers[..headers.len() - 1]);
+    assert_eq!(sorted, headers[..headers.len() - 2]);
 
     let tmp = TempDir::new("checkout");
     assert!(checkout_shim_headers(tmp.path()).is_none());
@@ -1083,11 +1084,9 @@ fn checkout_shim_headers_come_from_runtime() {
     let report = run(&options).expect("build with the real runtime headers");
     assert!(report.imports.shims > 0);
     assert!(
-        report
-            .imports
-            .headers
-            .iter()
-            .all(|h| h.starts_with("os/") || h.starts_with("gpu/"))
+        report.imports.headers.iter().all(|h| h.starts_with("os/")
+            || h.starts_with("gpu/")
+            || h == "guest/guest_callbacks.h")
     );
 }
 

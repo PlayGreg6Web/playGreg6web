@@ -18,6 +18,7 @@ pub struct ProgramArgs {
     pub overrides: program::Overrides,
     pub policy_files: Vec<PathBuf>,
     pub allow_allocator_split: bool,
+    pub address_pool: Option<(u64, u64)>,
     pub shims: Vec<PathBuf>,
     pub emit_obj: bool,
     pub jobs: Option<usize>,
@@ -25,7 +26,7 @@ pub struct ProgramArgs {
     pub shard_instructions: Option<usize>,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]";
 
 pub const OPTIONS: &[&str] = &[
     "  --dll <file>           build-program: offer a DLL as a guest module (used when the program imports it)",
@@ -35,6 +36,7 @@ pub const OPTIONS: &[&str] = &[
     "  --bind <rule>          build-program: binding rule <dll>!<symbol-pattern>=guest|host|prefer-host (first match wins)",
     "  --policy <file>        build-program: rules from a file (<dll>!<symbol>=<action>, <dll>=guest|host, # comments)",
     "  --allow-allocator-split build-program: report heap functions bound to different allocators instead of failing",
+    "  --address-pool <lo>-<hi> build-program: hex range every module image must lie in (default 0x100000000-0x400000000)",
 ];
 
 /// Parses the arguments after `build-program`. `Ok(None)` means help was requested.
@@ -49,6 +51,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         overrides: program::Overrides::default(),
         policy_files: Vec::new(),
         allow_allocator_split: false,
+        address_pool: None,
         shims: Vec::new(),
         emit_obj: false,
         jobs: None,
@@ -99,6 +102,22 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
             "--bind" => {
                 i += 1;
                 parsed.overrides.add_bind(&value(i, flag, "<rule>")?)?;
+            }
+            "--address-pool" => {
+                i += 1;
+                let text = value(i, flag, "<lo>-<hi>")?;
+                let parse = |t: &str| {
+                    let t = t.trim();
+                    u64::from_str_radix(t.strip_prefix("0x").unwrap_or(t), 16).ok()
+                };
+                parsed.address_pool = Some(
+                    text.split_once('-')
+                        .and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)))
+                        .filter(|(lo, hi)| lo < hi)
+                        .ok_or(
+                            "--address-pool expects <lo>-<hi> in hex, e.g. 0x100000000-0x400000000",
+                        )?,
+                );
             }
             "--policy" => {
                 i += 1;
@@ -164,6 +183,9 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
             .map_err(|e| format!("{}: {e}", file.display()))?;
     }
     options.allow_allocator_split = args.allow_allocator_split;
+    if let Some(pool) = args.address_pool {
+        options.address_pool = pool;
+    }
     let build = &mut options.build;
     if args.shims.is_empty() {
         let cwd = env::current_dir()
@@ -231,6 +253,8 @@ mod tests {
             "--allow-allocator-split",
             "--jobs",
             "3",
+            "--address-pool",
+            "0x10000-0x40000000",
         ]))
         .unwrap()
         .unwrap();
@@ -245,6 +269,10 @@ mod tests {
         );
         assert!(parsed.allow_allocator_split);
         assert_eq!(parsed.jobs, Some(3));
+        assert_eq!(parsed.address_pool, Some((0x10000, 0x4000_0000)));
+        assert!(
+            parse_program_args(&args(&["a.exe", "--out", "x", "--address-pool", "5-1"])).is_err()
+        );
         assert_eq!(parse_program_args(&args(&["--help"])), Ok(None));
         assert!(parse_program_args(&args(&["game.exe"])).is_err());
         assert!(parse_program_args(&args(&["--out", "x"])).is_err());

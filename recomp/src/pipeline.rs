@@ -481,7 +481,8 @@ fn apply_link(
 }
 
 /// The runtime's shim headers of the checkout containing `start` (or one of its ancestors):
-/// `runtime/os/*.h` (sorted) and `runtime/gpu/d3d12_xs.h`, with `runtime/` as include root.
+/// `runtime/os/*.h` (sorted), `runtime/gpu/d3d12_xs.h` and `runtime/guest/guest_callbacks.h`, with
+/// `runtime/` as include root.
 /// `None` when `start` is not inside a playgta6web checkout.
 pub fn checkout_shim_headers(start: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
     let root = start.ancestors().find(|dir| {
@@ -501,6 +502,11 @@ pub fn checkout_shim_headers(start: &Path) -> Option<(Vec<PathBuf>, PathBuf)> {
     let gpu = runtime.join("gpu").join("d3d12_xs.h");
     if gpu.is_file() {
         headers.push(gpu);
+    }
+    // O16's complete guest-state import thunks (`pg6_gthunk_*`).
+    let callbacks = runtime.join("guest").join("guest_callbacks.h");
+    if callbacks.is_file() {
+        headers.push(callbacks);
     }
     (!headers.is_empty()).then_some((headers, runtime))
 }

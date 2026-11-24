@@ -683,11 +683,34 @@ impl EhMetadata {
             ..Self::default()
         };
 
+        // The module that implements the handlers itself (`vcruntime140*.dll`) exports them
+        // under their import names and calls them directly instead of through the IAT.
+        let exported: BTreeMap<u64, HandlerKind> = pe
+            .exports
+            .iter()
+            .flat_map(|t| t.symbols.iter())
+            .filter(|e| e.forwarder.is_none())
+            .filter_map(|e| {
+                let name = e.name.as_deref()?;
+                let kind = HANDLER_IMPORTS.iter().find(|(n, _)| *n == name)?.1;
+                Some((base + u64::from(e.rva), kind))
+            })
+            .collect();
+
         // Identify every handler routine once.
         let handler_rvas = dir.handler_rvas();
         let scans: Vec<(u32, HandlerScan)> = handler_rvas
             .iter()
-            .map(|&rva| (rva, scan_handler(&image, &slots, base + u64::from(rva))))
+            .map(|&rva| {
+                let mut scan = scan_handler(&image, &slots, base + u64::from(rva));
+                // A direct call to an exported handler counts like a call through its import.
+                scan.kinds
+                    .extend(scan.direct_calls.iter().filter_map(|c| exported.get(c)));
+                scan.kinds.sort_unstable();
+                scan.kinds.dedup();
+                scan.direct_calls.retain(|c| !exported.contains_key(c));
+                (rva, scan)
+            })
             .collect();
         // Cookie-check helpers called first by recognised wrappers identify `__GSHandlerCheck`.
         let gs_helpers: BTreeSet<u64> = scans
@@ -696,7 +719,12 @@ impl EhMetadata {
             .filter_map(|(_, scan)| scan.direct_calls.first().copied())
             .collect();
         for (rva, scan) in &scans {
-            let handler = if let Some(kind) = scan.thunk {
+            let handler = if let Some(&kind) = exported.get(&(base + u64::from(*rva))) {
+                Ok(Handler {
+                    kind,
+                    wrapper: false,
+                })
+            } else if let Some(kind) = scan.thunk {
                 Ok(Handler {
                     kind,
                     wrapper: false,
@@ -1909,6 +1937,79 @@ mod tests {
     }
 
     // ----- handlers ----------------------------------------------------------------------------
+
+    /// Regression (real `vcruntime140.dll`): the DLL that implements the handlers exports them
+    /// and its own functions use them directly, and through GS wrappers that call them directly.
+    #[test]
+    fn identifies_exported_handlers_and_their_local_wrappers() {
+        const LOCAL_WRAPPER: u32 = 0x11b0;
+        const F_LOCAL: u32 = 0x11c0;
+        const UNWIND_LOCAL: u32 = 0x2780;
+        const UNWIND_EXPORTED: u32 = 0x2790;
+        const EXPORTS: u32 = 0x27a0;
+        let mut file = pe_with_pdata(&[
+            (F_UNKNOWN, F_UNKNOWN + 0x10, UNWIND_EXPORTED),
+            (F_LOCAL, F_LOCAL + 0x10, UNWIND_LOCAL),
+        ]);
+        put(&mut file, GS_HELPER, &[0xc3]);
+        put(&mut file, UNKNOWN_HANDLER, &[0x31, 0xc0, 0xc3]);
+        call(&mut file, LOCAL_WRAPPER, GS_HELPER);
+        call(&mut file, LOCAL_WRAPPER + 5, UNKNOWN_HANDLER);
+        put(&mut file, LOCAL_WRAPPER + 10, &[0xc3]);
+        let no_scopes = le(0);
+        put(
+            &mut file,
+            UNWIND_EXPORTED,
+            &unwind_bytes(UNW_FLAG_EHANDLER, &trailer(UNKNOWN_HANDLER, &no_scopes)),
+        );
+        put(
+            &mut file,
+            UNWIND_LOCAL,
+            &unwind_bytes(UNW_FLAG_EHANDLER, &trailer(LOCAL_WRAPPER, &no_scopes)),
+        );
+        // Export directory: `__C_specific_handler` at UNKNOWN_HANDLER.
+        let (eat, names, ords, name, dll) = (
+            EXPORTS + 40,
+            EXPORTS + 44,
+            EXPORTS + 48,
+            EXPORTS + 52,
+            EXPORTS + 80,
+        );
+        put(&mut file, EXPORTS + 12, &le(dll));
+        put(&mut file, EXPORTS + 16, &le(1));
+        put(&mut file, EXPORTS + 20, &le(1));
+        put(&mut file, EXPORTS + 24, &le(1));
+        put(&mut file, EXPORTS + 28, &le(eat));
+        put(&mut file, EXPORTS + 32, &le(names));
+        put(&mut file, EXPORTS + 36, &le(ords));
+        put(&mut file, eat, &le(UNKNOWN_HANDLER));
+        put(&mut file, names, &le(name));
+        put(&mut file, ords, &[0, 0]);
+        put(&mut file, name, b"__C_specific_handler\0");
+        put(&mut file, dll, b"vc.dll\0");
+        file[0x108..0x10c].copy_from_slice(&le(EXPORTS));
+        file[0x10c..0x110].copy_from_slice(&le(0x60));
+
+        let pe = Pe64::parse(&file).unwrap();
+        let dir = ExceptionDirectory::from_pe(&pe, &file);
+        let eh = EhMetadata::from_pe(&pe, &file, &dir);
+        assert_eq!(
+            eh.handlers.get(&UNKNOWN_HANDLER),
+            Some(&Handler {
+                kind: HandlerKind::CSpecific,
+                wrapper: false
+            })
+        );
+        assert_eq!(
+            eh.handlers.get(&LOCAL_WRAPPER),
+            Some(&Handler {
+                kind: HandlerKind::CSpecific,
+                wrapper: true
+            })
+        );
+        assert!(eh.unrecognised.is_empty(), "{:?}", eh.unrecognised);
+        assert_eq!(eh.stats().c_specific, 2);
+    }
 
     #[test]
     fn identifies_handlers_through_thunks_and_wrappers() {

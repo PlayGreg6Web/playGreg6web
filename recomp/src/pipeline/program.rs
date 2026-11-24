@@ -20,10 +20,12 @@
 //!    dependencies come before their importers. An edge that closes a cycle is dropped from the
 //!    ordering and reported under `cycles` (the order stays deterministic).
 //! 4. **Base assignment** ([`rebase::assign_bases`]), in the order executable, then initialisation
-//!    order: a module keeps its preferred base when `[base, base + SizeOfImage rounded up to
-//!    64 KiB)` overlaps no module placed before it; otherwise it moves to the lowest 64 KiB-aligned
-//!    address at or above its preferred base where it fits, below `0x7FF8_0000_0000` (the
-//!    runtime's virtual module handles). The executable always keeps its base. A module with
+//!    order, inside the address pool (`--address-pool`, default `[0x1_0000_0000, 0x4_0000_0000)`:
+//!    the runtime's 12 GiB guest image pool of O18): a module keeps its preferred base when
+//!    `[base, base + SizeOfImage rounded up to 64 KiB)` lies in the pool and overlaps no module
+//!    placed before it; otherwise it moves to the lowest 64 KiB-aligned address at or above
+//!    `max(preferred base, pool start)` where it fits in the pool (failing that, the lowest one
+//!    from the pool start). An executable inside the pool keeps its base. A module with
 //!    `IMAGE_FILE_RELOCS_STRIPPED` that would have to move is an error.
 //! 5. **Build-time rebasing** ([`rebase::rebase_pe`]): a moved module's file bytes get its base
 //!    relocations applied and `ImageBase` rewritten before anything else reads them, so
@@ -48,8 +50,13 @@
 //! Every import of every module (the executable and the guest DLLs alike) is bound to exactly
 //! one of: an export of a guest module (its IAT slot holds the export's real guest VA, so
 //! `call [rip+slot]` reaches the lifted function through the dispatcher and a data import reads
-//! the variable), the host shim bridge (the slot gets a synthetic address bound to a thunk at
-//! load time, R5/O9), or, when the bridge has no shim, the bridge's logging thunk (unresolved).
+//! the variable), a runtime exception thunk (`runtime`: the exception APIs of
+//! [`RUNTIME_EXCEPTION_APIS`] - `RaiseException`, `RtlUnwindEx`, `RtlVirtualUnwind`, ... - work on
+//! the caller's registers, so the runtime program loader binds their slots to R11's guest-state
+//! thunks, `guest_exceptions.h` `exception_thunk_for`, whatever the bridge generated; this takes
+//! precedence for `KERNEL32`/`KERNELBASE`/`ntdll` and every API set mapped to them), the host shim
+//! bridge (the slot gets a synthetic address bound to a thunk at load time, R5/O9), or, when the
+//! bridge has no shim, the bridge's logging thunk (unresolved).
 //! Imports of DLLs that are not guest modules always go to the bridge. For a guest module's
 //! export the first matching rule of the [`Policy`] decides (`dll!symbol=action`, `*`
 //! wildcards; DLL patterns match canonical names after API-set mapping, symbol patterns the
@@ -122,7 +129,8 @@
 //!
 //! # Manifest schema (`playgta6-recomp-program`, `schema_version` 1)
 //! Top-level keys in order: `schema`, `schema_version`, `tool` {`name`, `version`}, `options`
-//! {`allow_allocator_split`, `overrides` [rule strings], `force_guest` [dll], `build` {`emit_obj`,
+//! {`allow_allocator_split`, `address_pool` [lo, hi], `overrides` [rule strings], `force_guest`
+//! [dll], `build` {`emit_obj`,
 //! `shard_size`, `shard_instructions`, `map_headers`, `executable_bytes`}}, `modules` [in
 //! initialisation order: `file`, `dll`, `module`, `role` (`exe`/`dll`), `reason` (`executable`,
 //! `import`, `forwarder`, `forced`), `input` {`size`, `fnv1a64`}, `built_fnv1a64` (bytes
@@ -130,13 +138,14 @@
 //! `range_end` (base + reserved size), `entry_point` (VA or null; `DllMain` for a DLL), `tls`
 //! (null or {`index`, `start`, `end`, `index_va`, `callbacks` [VA], `zero_fill`,
 //! `characteristics`}), `exports` {`total`, `functions`, `data`, `forwarders`, `ordinal_only`},
-//! `imports` {`total`, `guest`, `host_bound`, `host_unresolved`, `before` {`bound`,
+//! `imports` {`total`, `guest`, `runtime`, `host_bound`, `host_unresolved`, `before` {`bound`,
 //! `unresolved`}}, `depends_on` [dll], `iat_prefill` [{`slot_rva`, `value`, `import`}],
 //! `registration` {`register_function`, `table_symbol`, `count`, `first`, `last`}, `bridge`
 //! {`thunks_symbol`, `thunk_count_symbol`}, `lift` {`functions`, `instructions`, `unsupported`},
 //! `build_manifest` {`path`, `fnv1a64`}], `init_order` [dll], `cycles` [{`from`, `to`}],
 //! `imports` [{`importer`, `dll`, `name` | null, `ordinal` | null, `slot_rva` | null,
-//! `delay_load`, `binding` (`guest`, `host`, `unresolved`), `provider` (dll or null), `target`
+//! `delay_load`, `binding` (`guest`, `runtime`, `host`, `unresolved`), `provider` (dll, for
+//! `runtime` the runtime's exporting `KERNEL32.dll`/`ntdll.dll`, or null), `target`
 //! (VA or null), `kind` (`function`/`data` or null), `shim` | null, `reason` | null, `via`
 //! [forwarders], `rule`}], `external_dlls` [{`dll`, `status` (`host`, `host_only`, `missing`),
 //! `importers` [dll]}], `unreferenced_dlls` [dll], `allocator` {`provider` (`host`, a dll or
@@ -170,7 +179,57 @@ use crate::stubs::{self, Catalogue, GuestTarget, Resolution, ShimResolver};
 
 pub use link::{API_SET_RULES, ExportKind, api_set_host, canonical_dll, module_symbol};
 pub use policy::{Action, Overrides, Policy, Role};
-pub use rebase::{ADDRESS_LIMIT, ALLOCATION_GRANULARITY};
+pub use rebase::{ADDRESS_LIMIT, ALLOCATION_GRANULARITY, DEFAULT_ADDRESS_POOL};
+
+/// The exception APIs the runtime implements as guest-state thunks (`kExports` in
+/// `runtime/guest/guest_exceptions.cpp`, kept identical by a test): `(module, name)`.
+pub const RUNTIME_EXCEPTION_APIS: &[(&str, &str)] = &[
+    ("KERNEL32.dll", "RaiseException"),
+    ("KERNEL32.dll", "RtlCaptureContext"),
+    ("KERNEL32.dll", "RtlLookupFunctionEntry"),
+    ("KERNEL32.dll", "RtlVirtualUnwind"),
+    ("KERNEL32.dll", "RtlUnwindEx"),
+    ("KERNEL32.dll", "RtlUnwind"),
+    ("KERNEL32.dll", "RtlRestoreContext"),
+    ("KERNEL32.dll", "RtlPcToFileHeader"),
+    ("KERNEL32.dll", "RtlAddFunctionTable"),
+    ("KERNEL32.dll", "RtlDeleteFunctionTable"),
+    ("KERNEL32.dll", "SetUnhandledExceptionFilter"),
+    ("KERNEL32.dll", "UnhandledExceptionFilter"),
+    ("ntdll.dll", "RtlRaiseException"),
+    ("ntdll.dll", "RtlCaptureContext"),
+    ("ntdll.dll", "RtlLookupFunctionEntry"),
+    ("ntdll.dll", "RtlVirtualUnwind"),
+    ("ntdll.dll", "RtlUnwindEx"),
+    ("ntdll.dll", "RtlUnwind"),
+    ("ntdll.dll", "RtlRestoreContext"),
+    ("ntdll.dll", "RtlPcToFileHeader"),
+    ("ntdll.dll", "RtlAddFunctionTable"),
+    ("ntdll.dll", "RtlDeleteFunctionTable"),
+];
+
+/// The runtime exception thunk `(module, name)` an import of `symbol` from `dll` binds to:
+/// `KERNEL32.dll`, `KERNELBASE.dll` and the API sets mapped to `kernel32.dll` use the KERNEL32
+/// list, `ntdll.dll` the ntdll list.
+pub fn runtime_exception_api(
+    dll: &str,
+    symbol: &ImportedSymbol,
+) -> Option<(&'static str, &'static str)> {
+    let ImportedSymbol::ByName { name, .. } = symbol else {
+        return None;
+    };
+    let canonical = canonical_dll(dll);
+    let target = api_set_host(&canonical).unwrap_or(&canonical);
+    let module = match target {
+        "kernel32.dll" | "kernelbase.dll" => "KERNEL32.dll",
+        "ntdll.dll" => "ntdll.dll",
+        _ => return None,
+    };
+    RUNTIME_EXCEPTION_APIS
+        .iter()
+        .find(|(m, n)| *m == module && n == name)
+        .copied()
+}
 
 use link::{ExportIndex, ExportSummary, ModuleExports, Provider, symbol_text};
 
@@ -233,6 +292,8 @@ pub struct ProgramOptions {
     pub overrides: Overrides,
     /// Report an allocator split instead of failing.
     pub allow_allocator_split: bool,
+    /// `[lo, hi)` every module's image must lie in ([`DEFAULT_ADDRESS_POOL`]).
+    pub address_pool: (u64, u64),
     /// Per-module build settings (`out_dir` is the program's build root; `pe_path` and `module`
     /// are set per module).
     pub build: PipelineOptions,
@@ -248,6 +309,7 @@ impl ProgramOptions {
             dll_dirs: Vec::new(),
             overrides: Overrides::default(),
             allow_allocator_split: false,
+            address_pool: DEFAULT_ADDRESS_POOL,
         }
     }
 }
@@ -307,6 +369,8 @@ pub struct TlsRecord {
 pub struct ImportCounts {
     pub total: usize,
     pub guest: usize,
+    /// Runtime exception thunks ([`RUNTIME_EXCEPTION_APIS`]).
+    pub runtime: usize,
     pub host_bound: usize,
     pub host_unresolved: usize,
     /// What the import bridge alone (a single-module build) binds: shims and unresolved.
@@ -363,6 +427,9 @@ pub enum Binding {
         va: u64,
         kind: ExportKind,
     },
+    /// A runtime exception thunk of `module` (`KERNEL32.dll` / `ntdll.dll`), bound by the
+    /// runtime program loader.
+    Runtime { module: String, name: String },
     /// The import bridge, resolving `(dll, symbol)` (the import's own, or a forwarder's target).
     Host {
         dll: String,
@@ -394,10 +461,11 @@ impl ImportRecord {
         format!("{}!{}", self.dll, symbol_text(&self.symbol))
     }
 
-    /// `guest`, `host` (bound to a shim) or `unresolved`.
+    /// `guest`, `runtime`, `host` (bound to a shim) or `unresolved`.
     pub fn status(&self) -> &'static str {
         match &self.binding {
             Binding::Guest { .. } => "guest",
+            Binding::Runtime { .. } => "runtime",
             Binding::Host {
                 resolution: Resolution::Bound { .. },
                 ..
@@ -720,7 +788,8 @@ pub fn build_program(
             }
         })
         .collect();
-    let bases = rebase::assign_bases(&requests).map_err(ProgramError::Layout)?;
+    let bases =
+        rebase::assign_bases(&requests, options.address_pool).map_err(ProgramError::Layout)?;
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for (dll, &base) in placement.iter().zip(&bases) {
         let entry = loaded.get_mut(*dll).expect("placed module is loaded");
@@ -806,6 +875,7 @@ pub fn build_program(
                         },
                     );
                 }
+                Binding::Runtime { .. } => count.runtime += 1,
                 Binding::Host {
                     dll: target,
                     symbol: target_symbol,
@@ -1021,10 +1091,17 @@ fn bind_import(
             detail,
         });
     };
-    let host = |dll: &str, symbol: &ImportedSymbol| Binding::Host {
-        dll: dll.to_string(),
-        symbol: symbol.clone(),
-        resolution: resolver.resolve(dll, symbol),
+    // Everything that is not a guest export: a runtime exception thunk ahead of the bridge.
+    let host = |dll: &str, symbol: &ImportedSymbol| match runtime_exception_api(dll, symbol) {
+        Some((module, name)) => Binding::Runtime {
+            module: module.to_string(),
+            name: name.to_string(),
+        },
+        None => Binding::Host {
+            dll: dll.to_string(),
+            symbol: symbol.clone(),
+            resolution: resolver.resolve(dll, symbol),
+        },
     };
     let mut record = ImportRecord {
         importer: importer.to_string(),
@@ -1150,6 +1227,7 @@ fn check_symbols(
 fn provider_of(binding: &Binding) -> String {
     match binding {
         Binding::Guest { dll, va, .. } => format!("{dll}@0x{va:x}"),
+        Binding::Runtime { module, name } => format!("runtime:{module}!{name}"),
         Binding::Host { dll, symbol, .. } => {
             // API-set contracts and their host module are one provider.
             let canonical = canonical_dll(dll);
@@ -1179,6 +1257,7 @@ fn check_allocator(
         total += 1;
         let side = match &import.binding {
             Binding::Guest { dll, .. } => dll.clone(),
+            Binding::Runtime { .. } => "runtime".to_string(),
             Binding::Host { .. } => "host".to_string(),
         };
         sides
@@ -1333,7 +1412,7 @@ pub fn render_report(r: &ProgramReport) -> String {
         "instr",
         "lifted",
         "exports",
-        "imports g/h/u",
+        "imports g/r/h/u",
         "fn/data/fwd"
     );
     for m in &r.modules {
@@ -1353,8 +1432,8 @@ pub fn render_report(r: &ProgramReport) -> String {
             percent(m.instructions - m.unsupported, m.instructions),
             m.exports.total,
             format!(
-                "{}/{}/{}",
-                m.imports.guest, m.imports.host_bound, m.imports.host_unresolved
+                "{}/{}/{}/{}",
+                m.imports.guest, m.imports.runtime, m.imports.host_bound, m.imports.host_unresolved
             ),
             format!(
                 "{}/{}/{}",
@@ -1364,7 +1443,7 @@ pub fn render_report(r: &ProgramReport) -> String {
     }
     let _ = writeln!(
         out,
-        "  (* rebased from its preferred base; imports g/h/u = guest module / host shim / unresolved)"
+        "  (* rebased from its preferred base; imports g/r/h/u = guest module / runtime exception thunk / host shim / unresolved)"
     );
     for m in &r.modules {
         if m.base != m.preferred_base {
@@ -1381,12 +1460,13 @@ pub fn render_report(r: &ProgramReport) -> String {
         let i = &m.imports;
         let _ = writeln!(
             out,
-            "  {}: {} imports; before {} bound / {} unresolved; now {} guest, {} host, {} unresolved; {} IAT slots pre-filled",
+            "  {}: {} imports; before {} bound / {} unresolved; now {} guest, {} runtime, {} host, {} unresolved; {} IAT slots pre-filled",
             m.file,
             i.total,
             i.before_bound,
             i.before_unresolved,
             i.guest,
+            i.runtime,
             i.host_bound,
             i.host_unresolved,
             m.iat_prefill.len()
@@ -1589,6 +1669,7 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                         ("total", num(m.imports.total)),
                         ("guest", num(m.imports.guest)),
                         ("host_bound", num(m.imports.host_bound)),
+                        ("runtime", num(m.imports.runtime)),
                         ("host_unresolved", num(m.imports.host_unresolved)),
                         (
                             "before",
@@ -1678,6 +1759,13 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                     Json::Null,
                     Json::Null,
                 ),
+                Binding::Runtime { module, .. } => (
+                    Json::Str(module.clone()),
+                    Json::Null,
+                    Json::Null,
+                    Json::Str("guest_exceptions".into()),
+                    Json::Null,
+                ),
                 Binding::Host { resolution, .. } => match resolution {
                     Resolution::Bound { shim } => (
                         Json::Null,
@@ -1735,6 +1823,13 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                 (
                     "allow_allocator_split",
                     Json::Bool(options.allow_allocator_split),
+                ),
+                (
+                    "address_pool",
+                    Json::Arr(vec![
+                        hex(options.address_pool.0),
+                        hex(options.address_pool.1),
+                    ]),
                 ),
                 ("overrides", strs(&overrides)),
                 ("force_guest", strs(&force_guest)),
