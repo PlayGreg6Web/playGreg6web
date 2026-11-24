@@ -4272,4 +4272,65 @@ int main(int argc, char** argv) {
         );
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// The bridge for the executable's real import list (docs/imports_required.md) against the
+    /// checkout's default shim set: every family header the bound shims come from is included
+    /// into one translation unit, as in the program build.
+    #[test]
+    fn generated_bridge_for_imports_required_compiles_tool_gated() {
+        let Some(cxx) = find_cxx() else {
+            println!("note: no C++ compiler found ($CXX, c++, g++, clang++, cl); skipping");
+            return;
+        };
+        let catalogue = checkout_catalogue();
+        let doc = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs")
+            .join("imports_required.md");
+        let imports = parse_import_list(&fs::read_to_string(doc).expect("read imports doc"));
+        let mut pe = synthetic_pe(false);
+        pe.imports.clear();
+        pe.delay_imports.clear();
+        let mut iat = 0x10_000u32;
+        for (dll, symbol) in imports {
+            match pe.imports.last_mut() {
+                Some(module) if module.dll_name == dll => module.symbols.push(symbol),
+                _ => {
+                    iat += 0x1000;
+                    pe.imports.push(ImportModule {
+                        dll_name: dll,
+                        iat_rva: iat,
+                        symbols: vec![symbol],
+                    });
+                }
+            }
+        }
+        let plan = plan_bridge(&pe, &catalogue);
+        let includes: BTreeSet<&str> = plan
+            .imports
+            .iter()
+            .filter_map(|i| catalogue.get(i.bound_shim()?))
+            .map(|s| s.include.as_str())
+            .collect();
+        assert!(includes.contains("os/ucrt_bridge.h"), "{includes:?}");
+        assert!(includes.contains("os/xbox_scarlett.h"), "{includes:?}");
+        let dir = temp_dir("compile_doc");
+        render_bridge(&plan, &catalogue)
+            .write_to(&dir)
+            .expect("write bridge");
+        compile(
+            &cxx,
+            &[dir.join(SOURCE_FILE)],
+            &[dir.clone(), runtime_root()],
+            None,
+            false,
+            &dir,
+        );
+        println!(
+            "generated thunks for {} imports_required.md bindings compile ({} headers)",
+            plan.bound_count(),
+            includes.len()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

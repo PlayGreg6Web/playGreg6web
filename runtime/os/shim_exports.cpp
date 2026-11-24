@@ -12,13 +12,11 @@
 #include "os/xasync_provider.h"
 #include "os/xbox_middleware.h"
 #include "os/xbox_offline.h"
+#include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "os/xgameruntime_provider.h"
-
-// os/xbox_scarlett.h cannot be included next to os/win32_compat.h (both define Pg6Guid).
-extern "C" size_t pg6_xbox_scarlett_register_all(void);
 
 namespace {
 

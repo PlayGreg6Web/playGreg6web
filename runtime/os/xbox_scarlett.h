@@ -8,6 +8,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "os/game_input.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/xgameruntime.h"
 
@@ -21,26 +22,23 @@
 // All C-ABI types are prefixed with Pg6* and all C-ABI entrypoints are prefixed with pg6_xbox_*
 // to avoid collisions with Windows SDK / Xbox GDK headers on MSVC hosts and Emscripten Wasm64.
 
-struct Pg6Guid {
-    uint32_t data1 = 0;
-    uint16_t data2 = 0;
-    uint16_t data3 = 0;
-    uint8_t data4[8]{};
-
-    constexpr bool operator==(const Pg6Guid& other) const {
-        if (data1 != other.data1 || data2 != other.data2 || data3 != other.data3) {
+// Pg6Guid is the one GUID type of os/win32_compat.h (a second definition here made the two headers
+// impossible to include together, e.g. in the generated import bridge).
+constexpr bool operator==(const Pg6Guid& a, const Pg6Guid& b) {
+    if (a.data1 != b.data1 || a.data2 != b.data2 || a.data3 != b.data3) {
+        return false;
+    }
+    for (size_t i = 0; i < 8; ++i) {
+        if (a.data4[i] != b.data4[i]) {
             return false;
         }
-        for (size_t i = 0; i < 8; ++i) {
-            if (data4[i] != other.data4[i]) {
-                return false;
-            }
-        }
-        return true;
     }
+    return true;
+}
 
-    constexpr bool operator!=(const Pg6Guid& other) const { return !(*this == other); }
-};
+constexpr bool operator!=(const Pg6Guid& a, const Pg6Guid& b) {
+    return !(a == b);
+}
 static_assert(sizeof(Pg6Guid) == 16, "Pg6Guid must be 16 bytes (standard COM GUID layout)");
 
 // Minimal COM-like base interface (QueryInterface / AddRef / Release).
