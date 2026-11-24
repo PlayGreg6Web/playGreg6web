@@ -706,6 +706,7 @@ void test_root_signatures_and_blobs() {
     auto* host_rs = host_object<dg::RootSignature, dg::IRootSignatureHost>(rs);
     CHECK(host_rs != nullptr && host_rs->signature().parameter_count() == 3);
     CHECK(dev->stats().root_signatures == 1);
+    CHECK((dev->root_signature_versions() == std::array<uint32_t, 3>{0, 1, 0}));  // one version 1.1
 
     // Version 1.0 layout (20-byte ranges, no flags) is read too; the empty local root signature the
     // executable serializes (version 1.1, no parameters, flags LOCAL_ROOT_SIGNATURE) works.
@@ -1392,6 +1393,7 @@ void test_unresolved_shaders_and_indexed_draws() {
     dg::Device* dev = host_device(scene.device);
     CHECK(!object_of<dg::PipelineState>(scene.pso)->resolved());
     CHECK(dev->unresolved_shaders().size() == 2);
+    CHECK((dev->unresolved_shader_stages() == std::array<uint32_t, 3>{1, 1, 0}));  // one vertex, one pixel
     const uint64_t list = scene.new_list();
     const size_t mark = fx.captured.size();
     scene.record(fx.thread, list, 2);

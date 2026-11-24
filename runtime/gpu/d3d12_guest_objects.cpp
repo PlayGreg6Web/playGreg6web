@@ -632,6 +632,14 @@ HResult Device::CreateRootSignature(uint32_t, uint64_t blob, uint64_t length, co
         note_bad_argument(std::string("CreateRootSignature: invalid root signature: ") + d3d::status_name(err.status));
         return kEInvalidArg;
     }
+    {
+        // The parser accepts versions 1..3 only (1.0, 1.1, 1.2).
+        const uint32_t version = static_cast<uint32_t>(desc.version);
+        std::lock_guard<std::mutex> lock(shader_mutex_);
+        if (++root_signature_versions_[version - 1] == 1) {
+            os::log("d3d12_xs: first root signature of version 1." + std::to_string(version - 1));
+        }
+    }
     auto object = com::create_object<RootSignature>(com::implements(kID3D12RootSignature), device_ref(this),
                                                     std::move(signature));
     return hand_out(std::move(object), riid, out);

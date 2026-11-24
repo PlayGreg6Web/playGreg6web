@@ -90,14 +90,28 @@ void Device::register_shader_module(uint64_t identity, uint32_t module_id) {
                               unresolved_shaders_.end());
 }
 
-void Device::note_unresolved_shader(uint64_t identity) {
+void Device::note_unresolved_shader(uint64_t identity, ShaderStage stage) {
+    static constexpr const char* kStageNames[] = {"vertex", "pixel", "compute"};
+    const size_t index = static_cast<size_t>(stage);
     std::lock_guard<std::mutex> lock(shader_mutex_);
     if (std::find(unresolved_shaders_.begin(), unresolved_shaders_.end(), identity) == unresolved_shaders_.end()) {
         unresolved_shaders_.push_back(identity);
+        ++unresolved_by_stage_[index];
         char name[24];
         std::snprintf(name, sizeof(name), "0x%016" PRIx64, identity);
-        os::log(std::string("d3d12_xs: no shader module for DXIL identity ") + name + " (draws with it are skipped)");
+        os::log(std::string("d3d12_xs: no shader module for DXIL identity ") + name + " (" + kStageNames[index] +
+                " shader; " + (stage == ShaderStage::Compute ? "dispatches" : "draws") + " with it are skipped)");
     }
+}
+
+std::array<uint32_t, 3> Device::unresolved_shader_stages() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return unresolved_by_stage_;
+}
+
+std::array<uint32_t, 3> Device::root_signature_versions() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return root_signature_versions_;
 }
 
 std::vector<uint64_t> Device::unresolved_shaders() const {
@@ -1091,10 +1105,11 @@ HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& r
     state->identities_ = {d.vs, d.ps};
     state->resolved_ = (state->graphics_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
     if (!state->resolved_) {
-        for (uint64_t id : {d.vs, d.ps}) {
-            if (id != 0 && !shader_known(id)) {
-                note_unresolved_shader(id);
-            }
+        if (d.vs != 0 && !shader_known(d.vs)) {
+            note_unresolved_shader(d.vs, ShaderStage::Vertex);
+        }
+        if (d.ps != 0 && !shader_known(d.ps)) {
+            note_unresolved_shader(d.ps, ShaderStage::Pixel);
         }
     }
     state->source_ = std::move(src);
@@ -1146,7 +1161,7 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     state->identities_ = {d.cs};
     state->resolved_ = (state->compute_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
     if (!state->resolved_ && !shader_known(d.cs)) {
-        note_unresolved_shader(d.cs);
+        note_unresolved_shader(d.cs, ShaderStage::Compute);
     }
     return hand_out(std::move(state), riid, out);
 }

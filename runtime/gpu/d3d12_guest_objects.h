@@ -54,6 +54,7 @@
 // every interface are logging stubs with SlotPolicy::ReturnNotImpl (first call logged with the slot
 // index, every call counted in com::stub_hit_report()).
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -620,8 +621,13 @@ public:
     // Shader identity (shader_identity(): FNV-1a 64 over the DXIL container bytes the PSO desc passes)
     // -> CreateShaderModule id. PSOs created before their modules are registered stay unresolved.
     void register_shader_module(uint64_t identity, uint32_t module_id);
-    void note_unresolved_shader(uint64_t identity);
+    enum class ShaderStage : uint8_t { Vertex, Pixel, Compute };
+    void note_unresolved_shader(uint64_t identity, ShaderStage stage);
     std::vector<uint64_t> unresolved_shaders() const;
+    // Distinct unresolved identities by the stage they were first used at (vertex, pixel, compute).
+    std::array<uint32_t, 3> unresolved_shader_stages() const;
+    // Root signatures created, by blob version (1.0, 1.1, 1.2).
+    std::array<uint32_t, 3> root_signature_versions() const;
     bool shader_known(uint64_t identity) const;
 
     // ---- Resources ----
@@ -698,6 +704,8 @@ private:
 
     mutable std::mutex shader_mutex_;
     std::vector<uint64_t> unresolved_shaders_;
+    std::array<uint32_t, 3> unresolved_by_stage_{};
+    std::array<uint32_t, 3> root_signature_versions_{};  // under shader_mutex_
     std::unordered_set<uint64_t> known_shaders_;
     std::mutex va_mutex_;
     uint64_t next_fake_va_ = kFakeGpuVaBase;
