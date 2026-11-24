@@ -71,8 +71,10 @@
 //
 // Request execution
 // -----------------
-// Guest threads only enqueue: EnqueueRequest copies the 0x48-byte request and takes references
-// to the file / status array objects. Submit (or the automatic submit at half capacity) hands
+// Guest threads only enqueue: EnqueueRequest copies the 0x48-byte request and pins the host side
+// of the file / status array objects (no COM reference: a guest Release while a request is
+// pending does not cut the read short, and no bridge object ever holds a COM reference to
+// another, so reset_com_bridge() can drop them in any order). Submit (or the automatic submit at half capacity) hands
 // the batch to a small pool of runtime worker threads (one by default, set_dstorage_worker_threads)
 // that execute each queue in FIFO order; a queue's status and signal entries are fences: they
 // complete after every request enqueued before them, with the first failure HRESULT of the
@@ -92,6 +94,55 @@
 // end of the file, ERROR_INVALID_DATA (0x8007000D) for a corrupt or size-mismatched zlib stream,
 // E_HANDLE for a closed file, and whatever else the file layer reports. Cancelled requests are
 // skipped without counting as failures.
+//
+// GameInput.dll ordinal 1 = GameInputCreate(IGameInput**) -> HRESULT
+//   One call site, in a lazy getter that caches the interface in one global (AddRef/Release on
+//   the swap); 10 callers of the getter. No IID is involved. IGameInput slots used (the GameInput
+//   v0 public order holds for every used slot):
+//     s4  GetCurrentReading(kind, device, reading**)        2 sites, arity 4, kinds 0x40000
+//                                                           (Gamepad) and 0x10 (Keyboard), the
+//                                                           device found by enumeration         h
+//     s5  GetNextReading(ref, kind, device, reading**)      1 site, arity 5, kind Keyboard      h
+//     s6  GetPreviousReading(ref, kind, device, reading**)  1 site, arity 5, kind Gamepad       h
+//     s9  RegisterDeviceCallback(device, kind, statusFilter, enumerationKind, context, callback,
+//         token*)                                           2 sites, arity 8: device null, kinds
+//                                                           Gamepad / Keyboard, filter 1
+//                                                           (Connected), enumeration 2
+//                                                           (Blocking)                          h
+//     s13 UnregisterCallback(token, timeoutUs) -> bool      2 sites, arity 3 (5000, UINT64_MAX) h
+//     s16 FindDeviceFromId(const APP_LOCAL_DEVICE_ID*, device**)  1 site, arity 3               h
+//   IGameInputReading: s14 GetKeyCount (1 site), s15 GetKeyState(count, GameInputKeyState*) (1
+//     site, 12-byte entries, scan code at +0 and virtual key at +8 read), s22 GetGamepadState
+//     (3 sites, bool result, buttons at +0 compared between readings), s1/s2 AddRef/Release on
+//     every reading (h).
+//   IGameInputDevice: s3 GetDeviceInfo (2 sites, in both device callbacks; the 32-byte
+//     APP_LOCAL_DEVICE_ID at +0x20 of GameInputDeviceInfo is copied), s10 SetRumbleState(const
+//     GameInputRumbleParams*) (1 site), s1/s2 (h).
+//   Device callbacks test bit 0 (Connected) of the current status (5th argument) and AddRef the
+//   device they keep. Unused slots are named logging stubs in the v0 order (low confidence).
+//
+// xg_xs.dll!XGCreateTextureComputer(const XG_RESOURCE_DESC*, XGTextureAddressComputer**) -> HRESULT
+//   4 call sites. The computer is not an IUnknown: slot 1 drops it (3 sites), slot 0 is never
+//   called (AddRef). Used slots:
+//     s2  GetResourceLayout(XG_RESOURCE_LAYOUT*)   2 sites: 0x18-byte header + 4 planes of 0x6C8
+//                                                  bytes, 15 mip entries of 0x70 bytes from plane
+//                                                  +0x38; the title reads mip +0x00 (u64), +0x10
+//                                                  (u64), +0x1C (u32) and copies whole planes    m
+//     s8  CopyIntoSubresource(dst, plane, subresource, src, rowPitch, slicePitch)  1 site, arity 7 m
+//     s10 GetResourceTiling(numTiles*, packedMipInfo*, tileShape*, numTilings*, firstTiling,
+//         tilings*)                                1 site, arity 7, the D3D12 GetResourceTiling
+//                                                  shapes (12-byte packed-mip info, tile shape and
+//                                                  subresource tiling entries)                   m
+//   XG_RESOURCE_DESC as built by the title: +0x00 u32 dimension (2/3/4), +0x08 u64 alignment,
+//   +0x10 u64 width, +0x18 u32 height, +0x1C u16 depth or array size, +0x1E u16 mip levels,
+//   +0x20 u32 DXGI format, +0x24 u32 sample count, +0x28 u32 sample quality, +0x2C u32 swizzle
+//   mode (0x100 | n), +0x30 u32 flags.
+// xg_xs.dll!XGSuggestSwizzleMode(const XG_RESOURCE_DESC*, UINT32 (0), UINT32* mode) -> HRESULT
+//   1 call site, writing desc +0x2C; the one-argument host shim (O12) does not match it.
+// Fidelity: layouts are linear (row pitch aligned to 256 bytes, mips one after another, no
+// console tiling/swizzle) and tiling uses the D3D12 standard 64 KiB tile shapes. That is
+// self-consistent for the runtime's own uploads, but texture data the title stores pre-swizzled
+// for the console layout will not match until the real tiling is known.
 
 namespace playgta6::os::scarlett::guest_api {
 
@@ -221,6 +272,134 @@ enum class InflateStatus { Ok, BadHeader, BadData, OutputTooSmall, Truncated, Ch
 InflateStatus inflate_stream(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap, size_t* out_len);
 
 // ---------------------------------------------------------------------------
+// GameInput.dll (v0) guest structs and constants
+// ---------------------------------------------------------------------------
+
+inline constexpr uint32_t kGameInputKindKeyboard = 0x00000010u;
+inline constexpr uint32_t kGameInputKindMouse = 0x00000020u;
+inline constexpr uint32_t kGameInputKindGamepad = 0x00040000u;
+inline constexpr uint32_t kGameInputDeviceConnected = 0x1u;
+inline constexpr uint32_t kGameInputDeviceInputEnabled = 0x2u;
+inline constexpr HResult kGameInputDeviceNotFound = static_cast<HResult>(0x838A0002u);
+inline constexpr HResult kGameInputReadingNotFound = static_cast<HResult>(0x838A0003u);
+
+struct GameInputGamepadState {
+    uint32_t buttons;  // GameInputGamepadButtons: Menu 0x1, View 0x2, A 0x4, B 0x8, X 0x10, Y 0x20, ...
+    float left_trigger;
+    float right_trigger;
+    float left_thumbstick_x;
+    float left_thumbstick_y;
+    float right_thumbstick_x;
+    float right_thumbstick_y;
+};
+static_assert(sizeof(GameInputGamepadState) == 28);
+
+struct GameInputKeyState {
+    uint32_t scan_code;
+    uint32_t code_point;
+    uint8_t virtual_key;
+    uint8_t is_dead_key;
+    uint8_t reserved[2];
+};
+static_assert(sizeof(GameInputKeyState) == 12);
+
+struct AppLocalDeviceId {
+    uint8_t value[32];
+};
+
+struct GameInputRumbleParams {
+    float low_frequency;
+    float high_frequency;
+    float left_trigger;
+    float right_trigger;
+};
+
+// GameInputDeviceInfo of the virtual devices, kept in each device object's guest payload. Only
+// deviceId (+0x20) is read by the title; the other filled fields follow the v0 layout (low
+// confidence).
+inline constexpr uint64_t kGameInputDeviceInfoSize = 0x100;
+inline constexpr uint64_t kDeviceInfoVendorId = 0x04;
+inline constexpr uint64_t kDeviceInfoProductId = 0x06;
+inline constexpr uint64_t kDeviceInfoDeviceId = 0x20;
+inline constexpr uint64_t kDeviceInfoSupportedInput = 0x68;
+
+// The virtual gamepad's last SetRumbleState (host integration and tests).
+GameInputRumbleParams virtual_gamepad_rumble();
+
+// ---------------------------------------------------------------------------
+// xg_xs.dll guest structs
+// ---------------------------------------------------------------------------
+
+struct XgResourceDesc {
+    uint32_t dimension;  // D3D12_RESOURCE_DIMENSION: 2 Texture1D, 3 Texture2D, 4 Texture3D
+    uint32_t reserved0;
+    uint64_t alignment;
+    uint64_t width;
+    uint32_t height;
+    uint16_t depth_or_array_size;
+    uint16_t mip_levels;
+    uint32_t format;  // DXGI_FORMAT
+    uint32_t sample_count;
+    uint32_t sample_quality;
+    uint32_t swizzle_mode;
+    uint32_t flags;
+};
+inline constexpr size_t kXgResourceDescBytes = 0x34;  // bytes the title writes
+static_assert(offsetof(XgResourceDesc, flags) == 0x30);
+
+inline constexpr uint64_t kXgLayoutPlaneOffset = 0x18;
+inline constexpr uint64_t kXgLayoutPlaneSize = 0x6C8;
+inline constexpr uint64_t kXgLayoutMaxPlanes = 4;
+inline constexpr uint64_t kXgPlaneMipOffset = 0x38;
+inline constexpr uint64_t kXgMipLayoutSize = 0x70;
+inline constexpr uint64_t kXgMaxMips = 15;
+inline constexpr uint64_t kXgResourceLayoutSize = kXgLayoutPlaneOffset + kXgLayoutMaxPlanes * kXgLayoutPlaneSize;
+static_assert(kXgPlaneMipOffset + kXgMaxMips * kXgMipLayoutSize == kXgLayoutPlaneSize);
+
+// Mip entry written by GetResourceLayout. The title reads +0x00, +0x10 and +0x1C; the field names
+// are the hypothesis (total size, 2D slice size, row pitch in bytes) the values follow.
+struct XgMipLayout {
+    uint64_t size_bytes;
+    uint64_t offset_bytes;
+    uint64_t slice_2d_size_bytes;
+    uint32_t pitch_pixels;
+    uint32_t pitch_bytes;
+    uint32_t alignment_bytes;
+    uint32_t padded_width_elements;
+    uint32_t padded_height_elements;
+    uint32_t padded_depth_or_array_size;
+    uint32_t width_elements;
+    uint32_t height_elements;
+    uint32_t depth_or_array_size;
+    uint32_t sample_count;
+    uint8_t reserved[0x70 - 0x40];
+};
+static_assert(sizeof(XgMipLayout) == kXgMipLayoutSize && offsetof(XgMipLayout, pitch_bytes) == 0x1C);
+
+// D3D12 tiling structs used by GetResourceTiling.
+struct XgPackedMipInfo {
+    uint8_t num_standard_mips;
+    uint8_t num_packed_mips;
+    uint8_t reserved[2];
+    uint32_t num_tiles_for_packed_mips;
+    uint32_t start_tile_index_in_overall_resource;
+};
+struct XgTileShape {
+    uint32_t width_in_texels;
+    uint32_t height_in_texels;
+    uint32_t depth_in_texels;
+};
+struct XgSubresourceTiling {
+    uint32_t width_in_tiles;
+    uint16_t height_in_tiles;
+    uint16_t depth_in_tiles;
+    uint32_t start_tile_index_in_overall_resource;
+};
+static_assert(sizeof(XgPackedMipInfo) == 12 && sizeof(XgTileShape) == 12 && sizeof(XgSubresourceTiling) == 12);
+inline constexpr uint32_t kXgPackedTile = 0xFFFFFFFFu;  // D3D12_PACKED_TILE
+inline constexpr uint32_t kXgDefaultSwizzleMode = 0x100u;  // the mode the title itself uses by default
+
+// ---------------------------------------------------------------------------
 // Registration and testing
 // ---------------------------------------------------------------------------
 
@@ -233,11 +412,21 @@ void register_xbox_scarlett_guest_exports();
 // singleton and zeroes the statistics. Call before reset_com_bridge().
 void reset_xbox_scarlett_guest();
 
+namespace detail {
+void reset_input_guest();  // GameInput / XG part of reset_xbox_scarlett_guest()
+}  // namespace detail
+
 }  // namespace playgta6::os::scarlett::guest_api
 
 extern "C" {
 
 // XCRDAPI.dll!DStorageGetFactory(REFIID riid, void** ppv) -> HRESULT
 void pg6_gthunk_dstorage_get_factory(void* state);
+// GameInput.dll ordinal 1: GameInputCreate(IGameInput** game_input) -> HRESULT
+void pg6_gthunk_game_input_create(void* state);
+// xg_xs.dll!XGCreateTextureComputer(const XG_RESOURCE_DESC*, XGTextureAddressComputer**) -> HRESULT
+void pg6_gthunk_xg_create_texture_computer(void* state);
+// xg_xs.dll!XGSuggestSwizzleMode(const XG_RESOURCE_DESC*, UINT32, UINT32* mode) -> HRESULT
+void pg6_gthunk_xg_suggest_swizzle_mode(void* state);
 
 }  // extern "C"

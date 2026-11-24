@@ -972,6 +972,339 @@ void test_concurrent_queues() {
     CHECK(ga::dstorage_stats().requests_completed == static_cast<uint64_t>(kThreads * kRequests));
 }
 
+// ---------------------------------------------------------------------------
+// GameInput
+// ---------------------------------------------------------------------------
+
+struct InputFixture : Fixture {
+    InputState shared{};
+
+    InputFixture() { os::scarlett::set_game_input_state(&shared); }
+    ~InputFixture() { os::scarlett::set_game_input_state(nullptr); }
+
+    void set_input(uint32_t buttons, float lx = 0.0f, float ly = 0.0f, float lt = 0.0f) {
+        InputState v{};
+        v.buttons = buttons;
+        v.left_stick_x = lx;
+        v.left_stick_y = ly;
+        v.left_trigger = lt;
+        os::GameInputReader::write_monotonic(shared, v);
+    }
+
+    uint64_t game_input() {
+        const uint64_t out = out_slot();
+        CHECK(as_hr(dcall(export_address("GameInput.dll", "GameInputCreate"), {I(out)})) == 0);
+        return load64(out);
+    }
+
+    uint64_t reading(uint64_t gi, uint32_t kind, uint64_t device = 0, HResult* hr_out = nullptr) {
+        const uint64_t out = out_slot();
+        const HResult hr = as_hr(vcall(gi, 4, {I(kind), I(device), I(out)}));
+        if (hr_out != nullptr) {
+            *hr_out = hr;
+        }
+        return load64(out);
+    }
+
+    uint64_t neighbour(uint64_t gi, uint32_t slot, uint64_t ref, uint32_t kind, HResult* hr_out) {
+        const uint64_t out = out_slot();
+        *hr_out = as_hr(vcall(gi, slot, {I(ref), I(kind), I(0), I(out)}));
+        return load64(out);
+    }
+
+    ga::GameInputGamepadState gamepad(uint64_t r, bool* ok) {
+        const uint64_t va = com::guest_alloc(sizeof(ga::GameInputGamepadState));
+        *ok = (vcall(r, 22, {I(va)}) & 0xFF) != 0;
+        ga::GameInputGamepadState s{};
+        CHECK(com::read_guest(va, s));
+        return s;
+    }
+};
+
+void test_game_input_readings() {
+    InputFixture fx;
+    const uint64_t gi = fx.game_input();
+    CHECK(gi != 0 && gi == fx.game_input());  // one IGameInput
+    CHECK(fx.vcall(gi, 2) == 2);
+
+    fx.set_input(os::input_button::kGamepadA | os::input_button::kRightBumper, 0.0f, 0.0f, 0.5f);
+    HResult hr = 0;
+    const uint64_t r1 = fx.reading(gi, ga::kGameInputKindGamepad, 0, &hr);
+    CHECK(hr == 0 && r1 != 0);
+    CHECK(static_cast<uint32_t>(fx.vcall(r1, 3)) == ga::kGameInputKindGamepad);  // GetInputKind
+    CHECK(fx.vcall(r1, 5) != 0);                                                 // GetTimestamp
+    bool ok = false;
+    ga::GameInputGamepadState s = fx.gamepad(r1, &ok);
+    CHECK(ok);
+    CHECK(s.buttons == (0x4u | 0x800u));  // A | RightShoulder
+    CHECK(s.left_trigger > 0.4f && s.left_trigger < 0.6f);
+    CHECK(fx.vcall(r1, 14) == 0);  // a gamepad reading has no keys
+    const uint64_t seq1 = fx.vcall(r1, 4, {I(ga::kGameInputKindGamepad)});
+
+    // No new input: GetNextReading finds nothing; the current reading is the same snapshot.
+    CHECK(fx.neighbour(gi, 5, r1, ga::kGameInputKindGamepad, &hr) == 0);
+    CHECK(hr == ga::kGameInputReadingNotFound);
+    const uint64_t same = fx.reading(gi, ga::kGameInputKindGamepad);
+    CHECK(fx.vcall(same, 4, {I(0)}) == seq1);
+    CHECK(fx.vcall(same, 2) == 0);
+
+    // New input: next reading, then walking back with GetPreviousReading.
+    fx.set_input(os::input_button::kGamepadB, 0.0f, 0.0f, 0.0f);
+    const uint64_t r2 = fx.neighbour(gi, 5, r1, ga::kGameInputKindGamepad, &hr);
+    CHECK(hr == 0 && r2 != 0);
+    CHECK(fx.vcall(r2, 4, {I(0)}) > seq1);
+    s = fx.gamepad(r2, &ok);
+    CHECK(ok && s.buttons == 0x8u);
+    const uint64_t back = fx.neighbour(gi, 6, r2, ga::kGameInputKindGamepad, &hr);
+    CHECK(hr == 0 && fx.vcall(back, 4, {I(0)}) == seq1);
+    CHECK(fx.neighbour(gi, 6, r1, ga::kGameInputKindGamepad, &hr) == 0);
+    CHECK(hr == ga::kGameInputReadingNotFound);
+
+    // Keyboard readings carry the SAB keys (W and Space).
+    fx.set_input(os::input_button::kMoveForward | os::input_button::kJump);
+    const uint64_t kb = fx.reading(gi, ga::kGameInputKindKeyboard, 0, &hr);
+    CHECK(hr == 0);
+    CHECK(fx.vcall(kb, 14) == 2);
+    const uint64_t keys = com::guest_alloc(16 * sizeof(ga::GameInputKeyState));
+    CHECK(fx.vcall(kb, 15, {I(16), I(keys)}) == 2);
+    ga::GameInputKeyState k[2]{};
+    CHECK(com::read_guest(keys, k, sizeof(k)));
+    CHECK(k[0].scan_code == 0x11 && k[0].virtual_key == 0x57 && k[0].code_point == 'w');
+    CHECK(k[1].scan_code == 0x39 && k[1].virtual_key == 0x20);
+    CHECK(fx.vcall(kb, 15, {I(1), I(keys)}) == 1);
+    fx.gamepad(kb, &ok);
+    CHECK(!ok);  // not a gamepad reading
+    // Mouse readings are not provided.
+    CHECK(fx.reading(gi, ga::kGameInputKindMouse, 0, &hr) == 0);
+    CHECK(hr == ga::kGameInputReadingNotFound);
+
+    // GetDevice on a reading returns an AddRef'd device.
+    const uint64_t dev_out = fx.out_slot();
+    fx.vcall(r1, 6, {I(dev_out)});
+    const uint64_t device = load64(dev_out);
+    CHECK(device != 0);
+    CHECK(static_cast<uint32_t>(fx.vcall(device, 4)) == (ga::kGameInputDeviceConnected | ga::kGameInputDeviceInputEnabled));
+    CHECK(fx.vcall(device, 2) >= 1);
+
+    // Every-frame pattern: GetCurrentReading + Release leaks nothing.
+    for (uint64_t r : {r1, r2, back, kb}) {
+        CHECK(fx.vcall(r, 2) == 0);
+    }
+    const uint64_t frame_out = fx.out_slot();
+    const com::BridgeStats before = com::bridge_stats();
+    for (int i = 0; i < 200; ++i) {
+        fx.set_input(static_cast<uint32_t>(i & 1) * os::input_button::kGamepadX);
+        CHECK(as_hr(fx.vcall(gi, 4, {I(ga::kGameInputKindGamepad), I(0), I(frame_out)})) == 0);
+        CHECK(fx.vcall(load64(frame_out), 2) == 0);
+    }
+    const com::BridgeStats after = com::bridge_stats();
+    CHECK(after.live_objects == before.live_objects);
+    CHECK(after.guest_bytes_in_use == before.guest_bytes_in_use);
+
+    // Unused slots are named logging stubs.
+    bool faulted = false;
+    try {
+        fx.vcall(gi, 7, {I(0), I(0), I(0)});
+    } catch (const GuestFault&) {
+        faulted = true;
+    }
+    CHECK(faulted);
+    CHECK(diag_contains("GameInput.IGameInput"));
+    CHECK(diag_contains("(GetTemporalReading)"));
+    bool reported = false;
+    for (const com::StubHit& h : com::stub_hit_report()) {
+        reported |= h.interface_name == "GameInput.IGameInput" && h.slot == 7 && h.hits == 1;
+    }
+    CHECK(reported);
+}
+
+void test_game_input_devices() {
+    InputFixture fx;
+    const uint64_t gi = fx.game_input();
+    g_device_cb.calls = 0;
+    const uint64_t token_va = fx.out_slot();
+    // The title's gamepad registration: no device, Gamepad kind, Connected filter, blocking.
+    CHECK(as_hr(fx.vcall(gi, 9, {I(0), I(ga::kGameInputKindGamepad), I(1), I(2), I(0x1234), I(kGuestDeviceCallback),
+                                 I(token_va)})) == 0);
+    CHECK(g_device_cb.calls.load() == 1);
+    CHECK(g_device_cb.context == 0x1234);
+    CHECK(g_device_cb.token == load64(token_va) && g_device_cb.token != 0);
+    CHECK((g_device_cb.current & ga::kGameInputDeviceConnected) != 0);
+    CHECK(g_device_cb.previous == 0);
+    const uint64_t pad = g_device_cb.device;
+    CHECK(pad != 0);
+
+    // GetDeviceInfo -> deviceId at +0x20 -> FindDeviceFromId finds the same device.
+    const uint64_t info = fx.vcall(pad, 3);
+    CHECK(info != 0);
+    ga::AppLocalDeviceId id{};
+    CHECK(com::read_guest(info + ga::kDeviceInfoDeviceId, id));
+    uint32_t supported = 0;
+    CHECK(com::read_guest(info + ga::kDeviceInfoSupportedInput, supported));
+    CHECK(supported == ga::kGameInputKindGamepad);
+    const uint64_t id_va = com::guest_alloc(sizeof(id));
+    CHECK(com::write_guest(id_va, id));
+    const uint64_t found = fx.out_slot();
+    CHECK(as_hr(fx.vcall(gi, 16, {I(id_va), I(found)})) == 0);
+    CHECK(load64(found) == pad);
+    CHECK(fx.vcall(pad, 2) >= 1);  // FindDeviceFromId's reference
+    id.value[0] ^= 0xFF;
+    CHECK(com::write_guest(id_va, id));
+    CHECK(as_hr(fx.vcall(gi, 16, {I(id_va), I(found)})) == ga::kGameInputDeviceNotFound);
+    CHECK(load64(found) == 0);
+
+    // Readings filtered by the device; a keyboard device does not give gamepad readings.
+    HResult hr = 0;
+    const uint64_t r = fx.reading(gi, ga::kGameInputKindGamepad, pad, &hr);
+    CHECK(hr == 0 && r != 0);
+    CHECK(fx.vcall(r, 2) == 0);
+
+    // SetRumbleState (slot 10)
+    const ga::GameInputRumbleParams rumble{0.25f, 0.5f, 0.0f, 1.0f};
+    const uint64_t rumble_va = com::guest_alloc(sizeof(rumble));
+    CHECK(com::write_guest(rumble_va, rumble));
+    fx.vcall(pad, 10, {I(rumble_va)});
+    const ga::GameInputRumbleParams got = ga::virtual_gamepad_rumble();
+    CHECK(got.low_frequency == 0.25f && got.high_frequency == 0.5f && got.right_trigger == 1.0f);
+
+    // The keyboard registration enumerates the keyboard device; NoEnumeration calls nothing.
+    const uint64_t token2 = fx.out_slot();
+    CHECK(as_hr(fx.vcall(gi, 9, {I(0), I(ga::kGameInputKindKeyboard), I(1), I(2), I(0), I(kGuestDeviceCallback),
+                                 I(token2)})) == 0);
+    CHECK(g_device_cb.calls.load() == 2);
+    CHECK(g_device_cb.device != pad);
+    const uint64_t keyboard = g_device_cb.device;
+    CHECK(as_hr(fx.vcall(gi, 9, {I(0), I(ga::kGameInputKindGamepad), I(1), I(0), I(0), I(kGuestDeviceCallback),
+                                 I(fx.out_slot())})) == 0);
+    CHECK(g_device_cb.calls.load() == 2);
+    HResult khr = 0;
+    CHECK(fx.reading(gi, ga::kGameInputKindGamepad, keyboard, &khr) == 0);
+    CHECK(khr == ga::kGameInputReadingNotFound);
+
+    // UnregisterCallback (slot 13) -> bool
+    CHECK((fx.vcall(gi, 13, {I(load64(token_va)), I(5000)}) & 0xFF) == 1);
+    CHECK((fx.vcall(gi, 13, {I(load64(token_va)), I(5000)}) & 0xFF) == 0);
+    CHECK((fx.vcall(gi, 13, {I(load64(token2)), I(~0ull)}) & 0xFF) == 1);
+
+    // Releasing the guest's references (the module keeps one) destroys nothing yet; dropping the
+    // module reference destroys IGameInput and both devices.
+    CHECK(fx.vcall(gi, 2) == 1);
+    const uint64_t live_before = com::bridge_stats().live_objects;
+    ga::reset_xbox_scarlett_guest();
+    CHECK(com::bridge_stats().live_objects == live_before - 3);
+}
+
+// ---------------------------------------------------------------------------
+// xg_xs
+// ---------------------------------------------------------------------------
+
+uint64_t xg_desc(uint32_t dimension, uint64_t width, uint32_t height, uint16_t depth, uint16_t mips, uint32_t format) {
+    ga::XgResourceDesc d{};
+    d.dimension = dimension;
+    d.width = width;
+    d.height = height;
+    d.depth_or_array_size = depth;
+    d.mip_levels = mips;
+    d.format = format;
+    d.sample_count = 1;
+    d.swizzle_mode = 0x100;
+    const uint64_t va = com::guest_alloc(0x40);
+    CHECK(com::write_guest(va, &d, ga::kXgResourceDescBytes));
+    return va;
+}
+
+void test_xg() {
+    Fixture fx;
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    const uint64_t suggest = fx.export_address("xg_xs.dll", "XGSuggestSwizzleMode");
+
+    // XGSuggestSwizzleMode(desc, 0, &desc.mode)
+    const uint64_t desc = xg_desc(3, 256, 256, 1, 0, 28);
+    CHECK(as_hr(fx.dcall(suggest, {I(desc), I(0), I(desc + 0x2C)})) == 0);
+    uint32_t mode = 0;
+    CHECK(com::read_guest(desc + 0x2C, mode));
+    CHECK(mode == ga::kXgDefaultSwizzleMode);
+
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+    const uint64_t comp = load64(out);
+    CHECK(comp != 0);
+
+    const uint64_t layout_va = com::guest_alloc(ga::kXgResourceLayoutSize);
+    CHECK(as_hr(fx.vcall(comp, 2, {I(layout_va)})) == 0);
+    const std::vector<uint8_t> layout = guest_bytes(layout_va, ga::kXgResourceLayoutSize);
+    uint64_t total = 0;
+    uint32_t mips = 0;
+    std::memcpy(&total, layout.data(), 8);
+    std::memcpy(&mips, layout.data() + 0x10, 4);
+    CHECK(mips == 9);
+    ga::XgMipLayout m0{};
+    ga::XgMipLayout m1{};
+    std::memcpy(&m0, layout.data() + ga::kXgLayoutPlaneOffset + ga::kXgPlaneMipOffset, sizeof(m0));
+    std::memcpy(&m1, layout.data() + ga::kXgLayoutPlaneOffset + ga::kXgPlaneMipOffset + ga::kXgMipLayoutSize, sizeof(m1));
+    CHECK(m0.pitch_bytes == 1024 && m0.size_bytes == 256u * 1024u && m0.slice_2d_size_bytes == 256u * 1024u);
+    CHECK(m0.offset_bytes == 0 && m0.width_elements == 256 && m0.height_elements == 256);
+    CHECK(m1.pitch_bytes == 512 && m1.offset_bytes >= m0.size_bytes);
+    CHECK(total >= m1.offset_bytes + m1.size_bytes);
+
+    // CopyIntoSubresource (slot 8) of mip 0 from a tightly packed source.
+    std::vector<uint8_t> texels(256 * 256 * 4);
+    for (size_t i = 0; i < texels.size(); ++i) {
+        texels[i] = static_cast<uint8_t>(i * 13 + (i >> 10));
+    }
+    const uint64_t src = com::guest_alloc(texels.size());
+    CHECK(com::write_guest(src, texels.data(), texels.size()));
+    const uint64_t dst = com::guest_alloc(total);
+    CHECK(as_hr(fx.vcall(comp, 8, {I(dst), I(0), I(0), I(src), I(1024), I(256 * 1024)})) == 0);
+    CHECK(guest_bytes(dst, texels.size()) == texels);
+    CHECK(as_hr(fx.vcall(comp, 8, {I(0), I(0), I(0), I(src), I(1024), I(0)})) == com::E_POINTER_HR);
+
+    // Slot 1 drops the computer (no IUnknown on this interface).
+    CHECK(fx.vcall(comp, 0) == 2);
+    CHECK(fx.vcall(comp, 1) == 1);
+    CHECK(fx.vcall(comp, 1) == 0);
+
+    // GetResourceTiling (slot 10) for a BC1 4096x4096 texture with a full mip chain.
+    const uint64_t out2 = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(xg_desc(3, 4096, 4096, 1, 0, 71)), I(out2)})) == 0);
+    const uint64_t bc = load64(out2);
+    const uint64_t num_tiles = com::guest_alloc(4);
+    const uint64_t packed = com::guest_alloc(12);
+    const uint64_t shape = com::guest_alloc(12);
+    const uint64_t count = com::guest_alloc(4);
+    const uint64_t tilings = com::guest_alloc(16 * 12);
+    uint32_t cap = 16;
+    CHECK(com::write_guest(count, cap));
+    fx.vcall(bc, 10, {I(num_tiles), I(packed), I(shape), I(count), I(0), I(tilings)});
+    ga::XgTileShape ts{};
+    ga::XgPackedMipInfo pm{};
+    CHECK(com::read_guest(shape, ts));
+    CHECK(com::read_guest(packed, pm));
+    CHECK(ts.width_in_texels == 512 && ts.height_in_texels == 256 && ts.depth_in_texels == 1);
+    CHECK(pm.num_standard_mips == 4 && pm.num_packed_mips == 9);
+    CHECK(pm.num_tiles_for_packed_mips >= 1);
+    uint32_t written = 0;
+    CHECK(com::read_guest(count, written));
+    CHECK(written == 13);
+    ga::XgSubresourceTiling t0{};
+    ga::XgSubresourceTiling t3{};
+    ga::XgSubresourceTiling t4{};
+    CHECK(com::read_guest(tilings, t0));
+    CHECK(com::read_guest(tilings + 36, t3));
+    CHECK(com::read_guest(tilings + 48, t4));
+    CHECK(t0.width_in_tiles == 8 && t0.height_in_tiles == 16 && t0.start_tile_index_in_overall_resource == 0);
+    CHECK(t3.width_in_tiles == 1 && t3.height_in_tiles == 2);
+    CHECK(t4.start_tile_index_in_overall_resource == ga::kXgPackedTile);
+    uint32_t tiles = 0;
+    CHECK(com::read_guest(num_tiles, tiles));
+    CHECK(tiles == 128 + 32 + 8 + 2 + pm.num_tiles_for_packed_mips);
+    CHECK(pm.start_tile_index_in_overall_resource == 170);
+    CHECK(fx.vcall(bc, 1) == 0);
+
+    // An unsupported dimension fails.
+    CHECK(as_hr(fx.dcall(create, {I(xg_desc(7, 16, 16, 1, 1, 28)), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
+}
+
 }  // namespace
 
 int main() {
@@ -984,6 +1317,9 @@ int main() {
     test_cancel_close_and_signal();
     test_backpressure_and_leaks();
     test_concurrent_queues();
+    test_game_input_readings();
+    test_game_input_devices();
+    test_xg();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xbox_scarlett_guest: %d failure(s)\n", g_failures);
         return 1;

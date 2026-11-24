@@ -35,7 +35,9 @@
 //! case and underscores ignored, so `CreateFileW` binds `pg6_win32_create_file_w`,
 //! `GetTickCount64` binds `pg6_win32_get_tick_count64` and `XTaskQueueCreate` binds
 //! `pg6_gdk_xtask_queue_create`. Two shims with the same key make the import ambiguous.
-//! Ordinal imports carry no name and stay unresolved.
+//! Ordinal imports carry no name and stay unresolved, except the few console exports whose
+//! ordinal is fixed and known (`ordinal_import_name`: `GameInput.dll` #1 = `GameInputCreate`),
+//! which resolve under that name.
 //!
 //! # Marshaling (Win64 ABI)
 //! Parameter `i < 4` comes from `rcx rdx r8 r9` (integer and pointer kinds) or from the low lane
@@ -1035,6 +1037,15 @@ fn is_gthunk_only_dll(dll: &str) -> bool {
     matches!(dll_key(dll).as_str(), "xcrdapi" | "gameinput" | "xg_xs")
 }
 
+/// Export name of an ordinal import whose ordinal is fixed and documented by the DLL's import
+/// library (only those the runtime implements).
+pub fn ordinal_import_name(dll: &str, ordinal: u16) -> Option<&'static str> {
+    match (dll_key(dll).as_str(), ordinal) {
+        ("gameinput", 1) => Some("GameInputCreate"),
+        _ => None,
+    }
+}
+
 /// Matching key: ASCII-lowercased with underscores removed (`CreateFileW` and `create_file_w`
 /// both give `createfilew`).
 pub fn name_key(name: &str) -> String {
@@ -1243,11 +1254,12 @@ impl<'a> ShimIndex<'a> {
         if family.is_none() && !is_gthunk_only_dll(dll) {
             return Resolution::Unresolved(Unresolved::UnknownDll);
         }
-        let name = match symbol {
+        let name: &str = match symbol {
             ImportedSymbol::ByName { name, .. } => name,
-            ImportedSymbol::ByOrdinal { .. } => {
-                return Resolution::Unresolved(Unresolved::ByOrdinal);
-            }
+            ImportedSymbol::ByOrdinal { ordinal } => match ordinal_import_name(dll, *ordinal) {
+                Some(name) => name,
+                None => return Resolution::Unresolved(Unresolved::ByOrdinal),
+            },
         };
         match self.gthunks.get(&name_key(name)).map(Vec::as_slice) {
             None | Some([]) => {}
@@ -1261,7 +1273,7 @@ impl<'a> ShimIndex<'a> {
             Some(many) => {
                 return match many
                     .iter()
-                    .find(|s| &s.name[PREFIX_GTHUNK.len()..] == name.as_str())
+                    .find(|s| &s.name[PREFIX_GTHUNK.len()..] == name)
                 {
                     Some(gthunk) => Resolution::Bound {
                         shim: gthunk.name.clone(),
@@ -2602,11 +2614,20 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             include: "os/xbox_scarlett_guest.h".to_string(),
             text: "extern \"C\" {\n\
                    void pg6_gthunk_dstorage_get_factory(void* state);\n\
+                   void pg6_gthunk_game_input_create(void* state);\n\
                    }\n"
                 .to_string(),
         });
         let catalogue = Catalogue::scan(&headers);
         let mut pe = synthetic_pe(false);
+        pe.imports.push(ImportModule {
+            dll_name: "GameInput.dll".to_string(),
+            iat_rva: 0x3200,
+            symbols: vec![
+                ImportedSymbol::ByOrdinal { ordinal: 1 },
+                ImportedSymbol::ByOrdinal { ordinal: 2 },
+            ],
+        });
         pe.imports.push(ImportModule {
             dll_name: "XCRDAPI.dll".to_string(),
             iat_rva: 0x3000,
@@ -2631,6 +2652,17 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             Resolution::Unresolved(Unresolved::UnknownDll),
             "only the listed console DLLs bind guest-state thunks without a family"
         );
+        assert_eq!(
+            find(&plan, "GameInput.dll!#1").bound_shim(),
+            Some("pg6_gthunk_game_input_create"),
+            "GameInput ordinal 1 is GameInputCreate"
+        );
+        assert_eq!(
+            find(&plan, "GameInput.dll!#2").resolution,
+            Resolution::Unresolved(Unresolved::ByOrdinal)
+        );
+        assert_eq!(ordinal_import_name("gameinput", 1), Some("GameInputCreate"));
+        assert_eq!(ordinal_import_name("KERNEL32.dll", 1), None);
     }
 
     #[test]

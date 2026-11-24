@@ -713,7 +713,7 @@ public:
                                                   " is not an IDStorageFile");
                 item.error = com::E_INVALIDARG_HR;
             } else {
-                item.file = com::Ref<DStorageFile>::share(file.get());
+                item.file = std::move(file);
             }
         }
         enqueue(std::move(item));
@@ -731,7 +731,7 @@ public:
         }
         Item item;
         item.kind = Item::Status;
-        item.status = com::Ref<DStorageStatusArray>::share(array.get());
+        item.status = array;
         item.index = index;
         array->mark_pending(index);
         enqueue(std::move(item));
@@ -833,8 +833,8 @@ private:
     struct Item {
         enum Kind : uint8_t { Request, Status, Signal } kind = Request;
         DStorageRequest req{};
-        com::Ref<DStorageFile> file;
-        com::Ref<DStorageStatusArray> status;
+        com::InterfaceArg<DStorageFile> file;  // pins the host object (no COM reference)
+        com::InterfaceArg<DStorageStatusArray> status;
         uint32_t index = 0;
         uint64_t signal = 0;
         uint64_t value = 0;
@@ -1468,6 +1468,9 @@ void set_dstorage_coalescing(uint64_t max_gap, uint64_t max_span) {
 void register_xbox_scarlett_guest_exports() {
     static const GuestExport kExports[] = {
         {"XCRDAPI.dll", "DStorageGetFactory", 0, &pg6_gthunk_dstorage_get_factory},
+        {"GameInput.dll", "GameInputCreate", 1, &pg6_gthunk_game_input_create},
+        {"xg_xs.dll", "XGCreateTextureComputer", 0, &pg6_gthunk_xg_create_texture_computer},
+        {"xg_xs.dll", "XGSuggestSwizzleMode", 0, &pg6_gthunk_xg_suggest_swizzle_mode},
     };
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -1482,6 +1485,7 @@ void register_xbox_scarlett_guest_exports() {
 
 void reset_xbox_scarlett_guest() {
     scheduler().shutdown();
+    detail::reset_input_guest();
     {
         ModuleState& st = module_state();
         std::lock_guard<std::mutex> lock(st.mutex);

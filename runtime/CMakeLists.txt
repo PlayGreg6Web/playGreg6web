@@ -42,6 +42,7 @@ add_library(playgta6_core STATIC
     os/xgameruntime_provider.cpp
     os/xbox_scarlett_guest.cpp
     guest/program_loader.cpp
+    os/xbox_scarlett_guest_input.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
