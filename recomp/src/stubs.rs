@@ -2097,8 +2097,11 @@ P pg6_seam_range(Pg6SeamBuffers& buffers, uint64_t guest_va, uint64_t bytes) {
 template <typename P>
 P pg6_seam_elements(Pg6SeamBuffers& buffers, uint64_t guest_va, uint64_t count) {
     constexpr uint64_t elem = pg6_seam_elem<P>();
-    const uint64_t bytes = elem == 0 ? 0 : (count > UINT64_MAX / elem ? UINT64_MAX : count * elem);
-    return pg6_seam_range<P>(buffers, guest_va, bytes);
+    if constexpr (elem == 0) {
+        return pg6_seam_range<P>(buffers, guest_va, 0);
+    } else {
+        return pg6_seam_range<P>(buffers, guest_va, count > UINT64_MAX / elem ? UINT64_MAX : count * elem);
+    }
 }
 
 // A NUL-terminated string at guest_va.
