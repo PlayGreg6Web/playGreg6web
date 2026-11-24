@@ -1,3 +1,5 @@
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -400,7 +402,12 @@ enum class Scenario {
     CrtAbort,
     LastError,
     TerminateViaShim,
+    OffThreadFault,
 };
+
+// OffThreadFault: a host thread that runs guest code faults while the boot thread waits.
+std::atomic<bool> g_off_thread_reported{false};
+std::string g_off_thread_report;
 
 Scenario g_scenario = Scenario::ReturnCode;
 std::vector<std::string> g_events;
@@ -587,6 +594,19 @@ void sub_entry(GuestState* s) {
             store32(s->gs_base + 0x68, 77);                        // inline write
             call_iat(s, kSlotGetLastError, kEntryCallsIat);
             reg(s, GuestReg::Rax) = (reg(s, GuestReg::Rax) == 77 && from_teb == 1234) ? 0 : 1;
+            ret(s);
+            return;
+        }
+        case Scenario::OffThreadFault: {
+            // The worker never returns from the fault (the hook parks it); it is detached.
+            std::thread([] {
+                GuestState& state = com::current_guest_state();
+                __playgta6_unimplemented(&state, kWorker + 4);
+            }).detach();
+            for (int i = 0; i < 5000 && !g_off_thread_reported.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            reg(s, GuestReg::Rax) = 0;
             ret(s);
             return;
         }
@@ -999,6 +1019,28 @@ void test_observability() {
     CHECK(console_mode() == -1);
 }
 
+void test_off_thread_fault() {
+    // Without the hook the boot leaves such faults to the default handler: not exercised here.
+    const Run run = boot_scenario(Scenario::OffThreadFault, [](BootConfig& cfg) {
+        cfg.off_thread_fault = [] {
+            g_off_thread_report = last_report_json();
+            g_off_thread_reported = true;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::hours(1));  // the harness terminates here
+            }
+        };
+    });
+    CHECK(g_off_thread_reported.load());
+    bool ok = false;
+    const Json report = parse_json(g_off_thread_report, &ok);
+    CHECK(ok);
+    CHECK(report["status"].text == "fault");
+    CHECK(report["fault"]["kind"].text == "unimplemented");
+    CHECK(report["fault"]["va"].hex() == kWorker + 4);
+    CHECK(report["message"].text.find("on guest thread") != std::string::npos);
+    (void)run;
+}
+
 void test_second_thread() {
     Run run = boot_scenario(Scenario::ReturnCode);
     CHECK(run.result.status == BootStatus::Exited);
@@ -1203,6 +1245,7 @@ int main() {
     test_survey_mode();
     test_last_error_shared_with_teb();
     test_observability();
+    test_off_thread_fault();
     test_second_thread();
     test_no_tls_and_load_failure();
     test_two_modules();

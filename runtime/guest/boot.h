@@ -374,6 +374,7 @@ const char* boot_status_name(BootStatus status);
 // Captures host return addresses of the calling thread (innermost first). Returns the count.
 using CaptureHostStackFn = size_t (*)(void** frames, size_t max_frames);
 using HostFunctionStartFn = uint64_t (*)(uint64_t host_pc);
+using OffThreadFaultFn = void (*)();
 
 struct BootModule {
     os::pgim::ImageReader* image = nullptr;  // required
@@ -418,6 +419,12 @@ struct BootConfig {
     // Start address of the host function containing a code address (0 if unknown), e.g. from the
     // host's unwind tables; makes host-frame -> lifted-function mapping exact.
     HostFunctionStartFn host_function_start = nullptr;
+    // A guest fault on a thread other than the boot thread (a CreateThread worker, a pool
+    // callback) cannot unwind into the boot. With this hook the boot records it like a boot-thread
+    // fault (status Fault, fault record with that thread's registers, finished report) and then
+    // calls the hook, which must not return (the harness writes its outputs and terminates).
+    // nullptr: such faults go to the default fault handler (log and abort).
+    OffThreadFaultFn off_thread_fault = nullptr;
     bool log_progress = true;       // phase lines through os::log
     // The generated export table (`pg6_export_thunks`, guest/export_thunks.h): guest-callable
     // entries for every shim export, registered after the IAT slots are bound so that

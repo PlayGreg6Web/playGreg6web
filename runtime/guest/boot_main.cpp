@@ -408,6 +408,14 @@ void write_outputs(bool print_summary) {
     terminate_now(code);
 }
 
+// BootConfig::off_thread_fault: the boot already recorded the fault of a non-boot guest thread.
+void off_thread_fault() {
+    if (!g_finishing.exchange(true)) {
+        write_outputs(true);
+    }
+    terminate_now(static_cast<int>(guest::BootStatus::Fault));
+}
+
 #ifdef _WIN32
 // Start of the host function containing pc, from the image's unwind table (.pdata).
 uint64_t host_function_start(uint64_t pc) {
@@ -574,6 +582,7 @@ void run_boot_thread() {
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
     cfg.host_function_start = host_function_start;
     cfg.console_mode = static_cast<uint32_t>(g_options.console_mode);
+    cfg.off_thread_fault = &off_thread_fault;
     const guest::BootResult result = guest::run_boot(cfg);
     if (!g_finishing.exchange(true)) {
         write_outputs(g_options.quiet);

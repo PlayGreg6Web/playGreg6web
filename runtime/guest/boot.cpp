@@ -217,6 +217,8 @@ struct BootState {
     size_t max_frames = 32;
     CaptureHostStackFn capture_host_stack = nullptr;
     HostFunctionStartFn host_function_start = nullptr;
+    OffThreadFaultFn off_thread_fault = nullptr;
+    std::atomic<bool> off_thread_fault_taken{false};
     bool log_progress = true;
     std::chrono::steady_clock::time_point start;
 
@@ -780,10 +782,17 @@ const char* fault_kind_id(FaultKind kind) {
     return "unknown";
 }
 
+void log_trap();
+void finish_report();
+
 void boot_fault_handler(const FaultInfo* info) {
     BootState& b = boot();
-    if (!b.running || !t_running_boot || info == nullptr) {
+    if (!b.running || info == nullptr) {
         return;  // the default handler logs and aborts
+    }
+    const bool other_thread = !t_running_boot;
+    if (other_thread && (b.off_thread_fault == nullptr || b.off_thread_fault_taken.exchange(true))) {
+        return;
     }
     const auto kind = static_cast<FaultKind>(info->kind);
     const bool inside = kind == FaultKind::Trap || kind == FaultKind::Unimplemented ||
@@ -792,7 +801,16 @@ void boot_fault_handler(const FaultInfo* info) {
     char message[256];
     std::snprintf(message, sizeof(message), "%s at 0x%016" PRIx64, fault_kind_name(kind), info->va);
     b.message = message;
+    if (other_thread) {
+        b.message += " on guest thread " + std::to_string(t_active != nullptr ? t_active->thread_id : 0);
+    }
     b.status = BootStatus::Fault;
+    if (other_thread) {
+        log_trap();
+        finish_report();
+        b.off_thread_fault();  // does not return
+        return;
+    }
     stop_boot();
 }
 
@@ -2342,6 +2360,8 @@ BootResult run_boot(const BootConfig& config) {
     b.previous_arena_observer = os::set_arena_observer(&boot_arena_observer);
     b.arena_observer_installed = true;
     b.host_function_start = config.host_function_start;
+    b.off_thread_fault = config.off_thread_fault;
+    b.off_thread_fault_taken = false;
     b.arena = config.arena != nullptr ? config.arena : os::win32::get_vmem_arena();
     // One arena everywhere: O16 bridge objects and lazily created guest threads live in it too.
     com::set_guest_memory(config.arena);
