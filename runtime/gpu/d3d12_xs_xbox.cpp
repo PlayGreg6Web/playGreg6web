@@ -1003,6 +1003,7 @@ void CommandList::ExecuteIndirect(com::CallContext&) {
     if (usable()) {
         // No indirect draw/dispatch packet exists in the GPU ABI: diagnosed and skipped.
         device_->count(xbox::Counter::IndirectSkipped);
+        count_work(Work::IndirectExecutionsSkipped);
         device_->note_skipped_draw();
     }
 }

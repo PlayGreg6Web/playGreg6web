@@ -14,6 +14,69 @@
 namespace playgta6::gpu::d3d12_guest {
 
 namespace {
+std::atomic<uint64_t> g_work[static_cast<size_t>(Work::Count)] = {};
+}  // namespace
+
+void count_work(Work w, uint64_t n) {
+    g_work[static_cast<size_t>(w)].fetch_add(n, std::memory_order_relaxed);
+}
+
+uint64_t work_total(Work w) {
+    return g_work[static_cast<size_t>(w)].load(std::memory_order_relaxed);
+}
+
+const char* work_name(Work w) {
+    switch (w) {
+    case Work::DrawsIssued: return "draws_issued";
+    case Work::DrawsEmitted: return "draws_emitted";
+    case Work::DrawsNoShaderModule: return "draws_no_shader_module";
+    case Work::DrawsMeshPipeline: return "draws_mesh_pipeline";
+    case Work::DrawsRectList: return "draws_rect_list";
+    case Work::DrawsDroppedByBridge: return "draws_dropped_by_bridge";
+    case Work::DispatchesIssued: return "dispatches_issued";
+    case Work::DispatchesEmitted: return "dispatches_emitted";
+    case Work::DispatchesNoShaderModule: return "dispatches_no_shader_module";
+    case Work::DispatchesDroppedByBridge: return "dispatches_dropped_by_bridge";
+    case Work::IndirectExecutionsSkipped: return "indirect_executions_skipped";
+    case Work::TextureUploads: return "texture_uploads";
+    case Work::BufferUploads: return "buffer_uploads";
+    case Work::CopiesSkipped: return "copies_skipped";
+    case Work::ResourcesCreated: return "resources_created";
+    case Work::ResourcesDestroyed: return "resources_destroyed";
+    case Work::Count: break;
+    }
+    return "?";
+}
+
+namespace {
+// Counts the outcome of one recorded draw from the state bridge's statistics: emitted if the
+// bridge drew, dropped by the bridge if it skipped, otherwise `fallback` (set by the caller's own
+// skip paths).
+class DrawOutcome {
+public:
+    explicit DrawOutcome(const bridge::CommandListBridge& b)
+        : bridge_(b), drawn_(b.stats().draws), dropped_(b.stats().draws_skipped) {
+        count_work(Work::DrawsIssued);
+    }
+    ~DrawOutcome() {
+        if (bridge_.stats().draws != drawn_) {
+            count_work(Work::DrawsEmitted);
+        } else if (bridge_.stats().draws_skipped != dropped_) {
+            count_work(Work::DrawsDroppedByBridge);
+        } else {
+            count_work(fallback);
+        }
+    }
+    Work fallback = Work::DrawsDroppedByBridge;
+
+private:
+    const bridge::CommandListBridge& bridge_;
+    uint64_t drawn_;
+    uint64_t dropped_;
+};
+}  // namespace
+
+namespace {
 
 constexpr uint32_t kMaxViewports = 16;
 constexpr uint32_t kMaxRects = 64;
@@ -513,7 +576,11 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
         return;
     }
     note_draw_for_dump();
+    DrawOutcome outcome(bridge_);
+    outcome.fallback = Work::DrawsRectList;
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
+        outcome.fallback = graphics_pso_->unsupported_reason().empty() ? Work::DrawsNoShaderModule
+                                                                       : Work::DrawsMeshPipeline;
         device_->note_skipped_draw();
         describe_skipped_draw("DrawInstanced", vertices, instances, "pipeline state without shader modules");
         return;
@@ -813,7 +880,11 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
         return;
     }
     note_draw_for_dump();
+    DrawOutcome outcome(bridge_);
+    outcome.fallback = Work::DrawsRectList;
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
+        outcome.fallback = graphics_pso_->unsupported_reason().empty() ? Work::DrawsNoShaderModule
+                                                                       : Work::DrawsMeshPipeline;
         device_->note_skipped_draw();
         describe_skipped_draw("DrawIndexedInstanced", indices, instances, "pipeline state without shader modules");
         return;
@@ -833,11 +904,15 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
     if (!usable()) {
         return;
     }
+    count_work(Work::DispatchesIssued);
     if (compute_pso_ != nullptr && !compute_pso_->resolved()) {
+        count_work(Work::DispatchesNoShaderModule);
         device_->note_skipped_draw();
         return;
     }
+    const uint64_t emitted = bridge_.stats().dispatches;
     bridge_.Dispatch(x, y, z);
+    count_work(bridge_.stats().dispatches != emitted ? Work::DispatchesEmitted : Work::DispatchesDroppedByBridge);
 }
 
 // ---- Copies ----
@@ -989,10 +1064,12 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
             continue;
         }
         if (w.texture) {
+            count_work(Work::TextureUploads);
             out.write_texture(w.tex.texture_id, w.tex.mip_level, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
                               w.tex.width, w.tex.height, w.tex.depth_or_layers, w.tex.bytes_per_row,
                               w.tex.rows_per_image, bytes.data(), static_cast<uint32_t>(bytes.size()));
         } else {
+            count_work(Work::BufferUploads);
             for (uint64_t off = 0; off < w.size; off += kMaxWriteChunk) {
                 const uint64_t n = std::min(kMaxWriteChunk, w.size - off);
                 out.write_buffer(w.id, static_cast<uint32_t>(w.dst_offset + off), bytes.data() + off,

@@ -767,6 +767,12 @@ int main(int argc, char** argv) {
                 {"frame_polls", waits.polls},
                 {"arena_events", c.arena_events},
             };
+            // Recorded GPU work by outcome (gpu/d3d12_guest_objects.h, Work).
+            namespace dg = gpu::d3d12_guest;
+            for (size_t w = 0; w < static_cast<size_t>(dg::Work::Count); ++w) {
+                sample->counters.emplace_back(dg::work_name(static_cast<dg::Work>(w)),
+                                              dg::work_total(static_cast<dg::Work>(w)));
+            }
         });
     }
     start_watchdog();

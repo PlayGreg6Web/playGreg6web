@@ -1019,6 +1019,35 @@ DxgiFormatLayout dxgi_format_layout(uint32_t format);
 uint32_t plane_block_bytes(uint32_t format, uint32_t plane);
 // Linear size of a resource's subresources (no tiling or alignment padding).
 uint64_t resource_size_estimate(const GuestResourceDesc& desc);
+
+// Process-wide totals of the work the title records, by outcome (monotonic; sampled per Present).
+// A draw is "issued" when the title records it and ends in exactly one of: emitted (a packet),
+// no shader module, mesh/amplification pipeline (placeholder state), rectangle list, or dropped by
+// the state bridge (no pipeline state, missing bindings, ...). Dispatches likewise. Indirect
+// executions have no packet and are counted separately. Uploads count WriteTexture / WriteBuffer
+// packets the layer builds from guest memory; copies it cannot express are "copies skipped".
+enum class Work : size_t {
+    DrawsIssued,
+    DrawsEmitted,
+    DrawsNoShaderModule,
+    DrawsMeshPipeline,
+    DrawsRectList,
+    DrawsDroppedByBridge,
+    DispatchesIssued,
+    DispatchesEmitted,
+    DispatchesNoShaderModule,
+    DispatchesDroppedByBridge,
+    IndirectExecutionsSkipped,
+    TextureUploads,
+    BufferUploads,
+    CopiesSkipped,
+    ResourcesCreated,
+    ResourcesDestroyed,
+    Count
+};
+void count_work(Work w, uint64_t n = 1);
+uint64_t work_total(Work w);
+const char* work_name(Work w);
 // Bytes the console's D3D12 allocates for a committed resource: the 64 KiB-block surface size
 // for the 2D surfaces os/surface_blocks.h covers, otherwise resource_size_estimate.
 uint64_t committed_memory_size(const GuestResourceDesc& desc);

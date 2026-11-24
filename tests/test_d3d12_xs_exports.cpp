@@ -1470,8 +1470,15 @@ void test_unresolved_shaders_and_indexed_draws() {
     CHECK((dev->unresolved_shader_stages() == std::array<uint32_t, 3>{1, 1, 0}));  // one vertex, one pixel
     const uint64_t list = scene.new_list();
     const size_t mark = fx.captured.size();
+    // Recorded work by outcome (process-wide totals: compare differences).
+    using W = dg::Work;
+    auto work = [](W w) { return dg::work_total(w); };
+    const uint64_t issued0 = work(W::DrawsIssued), no_module0 = work(W::DrawsNoShaderModule);
+    const uint64_t emitted0 = work(W::DrawsEmitted), bridge0 = work(W::DrawsDroppedByBridge);
     scene.record(fx.thread, list, 2);
     scene.execute({list});
+    CHECK(work(W::DrawsIssued) == issued0 + 2 && work(W::DrawsNoShaderModule) == no_module0 + 2);
+    CHECK(work(W::DrawsEmitted) == emitted0);
     const auto ps = packets_since(fx, mark);
     CHECK(count_op(ps, GpuOpcode::Draw) == 0);
     CHECK(count_op(ps, GpuOpcode::CreateRenderPipeline2) == 0);  // never a pipeline with module 0
@@ -1497,6 +1504,7 @@ void test_unresolved_shaders_and_indexed_draws() {
     fx.vcall(bare, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
     fx.vcall(bare, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
     CHECK(hr(fx.vcall(bare, Slot2::Close)) == 0);
+    CHECK(work(W::DrawsDroppedByBridge) == bridge0 + 2 && work(W::DrawsIssued) == issued0 + 4);
     const std::vector<std::string> reports2 = dev->skipped_draw_reports();
     CHECK(reports2.size() == 2);
     if (reports2.size() == 2) {
@@ -1522,6 +1530,7 @@ void test_unresolved_shaders_and_indexed_draws() {
     fx.vcall(list, Slot2::IASetIndexBuffer,
              {I(put(dg::GuestIndexBufferView{fx.vcall(ib, Slot2::GetGPUVirtualAddress), 6, 57}))});
     fx.vcall(list, Slot2::DrawIndexedInstanced, {I(3), I(1), I(0), I(0), I(0)});
+    CHECK(work(W::DrawsEmitted) == emitted0 + 1 && work(W::DrawsIssued) == issued0 + 5);
     // An unknown GPU VA is diagnosed (null binding), not dereferenced.
     fx.vcall(list, Slot2::IASetVertexBuffers, {I(1), I(1), I(put(dg::GuestVertexBufferView{0x123456000ULL, 36, 12}))});
     CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);

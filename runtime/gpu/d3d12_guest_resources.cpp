@@ -302,6 +302,7 @@ bool Device::set_back_buffer(uint64_t resource_interface_pointer) {
 }
 
 void Device::note_unsupported_copy(const std::string& message) {
+    count_work(Work::CopiesSkipped);
     unsupported_copies_.fetch_add(1, std::memory_order_relaxed);
     note_bad_argument(message);
 }
@@ -339,6 +340,9 @@ Resource::Resource(com::Ref<Device> device, const GuestResourceDesc& desc, Place
 }
 
 Resource::~Resource() {
+    if (id_ != 0) {
+        count_work(Work::ResourcesDestroyed);
+    }
     if (tracked_) {
         device_->untrack_cpu_buffer(this);
     }
@@ -508,6 +512,7 @@ bool Resource::initialize() {
     sd.initial_state = initial_state_;
     sd.implicit_promotion = is_buffer() || (desc_.Flags & ResourceFlags::AllowSimultaneousAccess) != 0;
     dev.resource_states().register_resource(id_, sd);
+    count_work(Work::ResourcesCreated);
     return true;
 }
 
@@ -550,7 +555,8 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     auto emit = [&](uint64_t begin, uint64_t end) {
         for (uint64_t off = begin; off < end; off += kMaxWriteChunk) {
             const uint64_t n = std::min(kMaxWriteChunk, end - off);
-            encoder.write_buffer(id_, static_cast<uint32_t>(off), live + off, static_cast<uint32_t>(n));
+            count_work(Work::BufferUploads);
+        encoder.write_buffer(id_, static_cast<uint32_t>(off), live + off, static_cast<uint32_t>(n));
             std::memcpy(shadow_.data() + off, live + off, static_cast<size_t>(n));
             uploaded += n;
         }
@@ -627,6 +633,7 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
     }
     CommandEncoder enc;
     const bool is3d = desc_.Dimension == ResourceDimension::Texture3D;
+    count_work(Work::TextureUploads);
     enc.write_texture(id_, mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, row_pitch,
                       row_pitch != 0 ? depth_pitch / row_pitch : rows, bytes.data(), static_cast<uint32_t>(len));
     device_->submit(enc);
