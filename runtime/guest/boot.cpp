@@ -930,8 +930,15 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
         d.rcx = state->gpr[GuestReg::Rcx];
         d.rdx = state->gpr[GuestReg::Rdx];
         d.return_address = 0;
-        if (b.arena != nullptr) {
-            read_u64(*b.arena, state->gpr[GuestReg::Rsp], d.return_address);
+        const uint64_t rsp = state->gpr[GuestReg::Rsp];
+        if (t_active != nullptr && b.arena != nullptr && rsp >= t_active->thread.stack_limit &&
+            rsp <= t_active->thread.stack_top - 8) {
+            // The thread's own stack is committed read/write for its whole life: read it like
+            // lifted code does, without the arena lock (taken on every dispatch, it serialized
+            // all guest threads).
+            std::memcpy(&d.return_address, b.arena->translate(rsp), sizeof(d.return_address));
+        } else if (b.arena != nullptr) {
+            read_u64(*b.arena, rsp, d.return_address);
         }
     }
     if (is_synthetic_address(target)) {

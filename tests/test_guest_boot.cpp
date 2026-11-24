@@ -1143,13 +1143,18 @@ void test_host_callable_statistics() {
     CHECK(run.result.status != BootStatus::Exited);
     bool answer_named = false;
     bool import_named = false;
+    size_t without_caller = 0;
     for (const Json& d : run.report["recent_dispatches"].items) {
+        // Every dispatch was reached by a call: the observer read its return address off the
+        // guest thread's stack.
+        without_caller += d["return_address"].hex() == 0 ? 1 : 0;
         answer_named = answer_named || d["name"].text == "ITest::Answer";
         import_named = import_named || (d["name"].type == Json::String &&
                                         d["name"].text.find("!GetLastError") != std::string::npos);
     }
     CHECK(answer_named);
     CHECK(import_named);
+    CHECK(!run.report["recent_dispatches"].items.empty() && without_caller == 0);
     const Json& calls = run.report["host_callable_calls"];
     CHECK(calls.type == Json::Array);
     bool found = false;
