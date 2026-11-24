@@ -109,6 +109,13 @@ pub const HELPER_GUEST_WRITE: &str = "__playgta6_guest_write";
 pub const HELPER_GUEST_MEMMOVE: &str = "__playgta6_guest_memmove";
 /// `void (i64 dst, i8 value, i64 n)`: `memset` of a guest range, segment by segment.
 pub const HELPER_GUEST_MEMSET: &str = "__playgta6_guest_memset";
+/// The browser target's CPU window (`kGuestWindowBase` / `kGuestWindowSize` in
+/// `runtime/abi/playgta6_abi.h`): above the 16 GiB wasm64 memory, 24 GiB (both console profiles).
+pub const GUEST_WINDOW_BASE: u64 = 0x4_0000_0000;
+pub const GUEST_WINDOW_SIZE: u64 = 0x6_0000_0000;
+/// Delta of an unmapped slot (`kGuestWindowTrapDelta`): the address lands beyond any memory.
+pub const GUEST_WINDOW_TRAP_DELTA: u64 = 1 << 63;
+
 /// Largest single access the lifter emits (a 256-bit AVX operand).
 pub const MAX_ACCESS_BYTES: u64 = 32;
 

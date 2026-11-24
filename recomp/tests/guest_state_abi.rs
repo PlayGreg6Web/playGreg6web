@@ -92,3 +92,31 @@ fn lifter_guest_base_symbol_matches_runtime_abi() {
     );
     assert_eq!(abi_constant("kGuestAddressSpaceBase"), 0x1_0000_0000);
 }
+
+#[test]
+fn lifter_window_constants_match_runtime_abi() {
+    use playgta6_recomp::lift::memory;
+    assert_eq!(abi_constant("kGuestWindowBase"), memory::GUEST_WINDOW_BASE);
+    assert_eq!(abi_constant("kGuestWindowSize"), memory::GUEST_WINDOW_SIZE);
+    assert_eq!(abi_constant("kGuestWindowSlotBytes"), memory::SLOT_BYTES);
+    assert!(ABI_HEADER.contains(&format!(
+        "kGuestWindowTrapDelta = {}ull;",
+        memory::GUEST_WINDOW_TRAP_DELTA
+    )));
+    assert!(ABI_HEADER.contains(&format!(
+        "extern int64_t {}[];",
+        memory::WINDOW_TABLE_SYMBOL
+    )));
+    for helper in [
+        memory::HELPER_GUEST_READ,
+        memory::HELPER_GUEST_SCRATCH,
+        memory::HELPER_GUEST_WRITE,
+        memory::HELPER_GUEST_MEMMOVE,
+        memory::HELPER_GUEST_MEMSET,
+    ] {
+        assert!(
+            ABI_HEADER.contains(&format!(" {helper}(")),
+            "{helper} is not declared in playgta6_abi.h"
+        );
+    }
+}

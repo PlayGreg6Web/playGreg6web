@@ -419,6 +419,16 @@ using LiftedFn = void (*)(GuestState* state);
 // linear memory from kGuestAddressSpaceBase upwards, the runtime's own memory lies below it.
 inline constexpr uint64_t kGuestAddressSpaceBase = 4294967296;  // 0x1'0000'0000
 
+// Translated CPU window (docs/wasm_abi.md "Translated CPU window"): guest VAs
+// [kGuestWindowBase, kGuestWindowBase + kGuestWindowSize) translate through
+// __playgta6_window_table, one int64 delta per kGuestWindowSlotBytes slot:
+//     host address = va + __playgta6_window_table[(va - kGuestWindowBase) >> 16]
+// An unmapped slot holds kGuestWindowTrapDelta (the address lands beyond any memory and traps).
+inline constexpr uint64_t kGuestWindowBase = 17179869184;       // 0x4'0000'0000 (16 GiB)
+inline constexpr uint64_t kGuestWindowSize = 25769803776;       // 0x6'0000'0000 (24 GiB)
+inline constexpr uint64_t kGuestWindowSlotBytes = 65536;
+inline constexpr uint64_t kGuestWindowTrapDelta = 9223372036854775808ull;  // 2^63
+
 // =====================================================================================================
 // Packet ABI v2 (opcodes 22..34). See docs/gpu_commands.md "Opcodes (v2)".
 //
@@ -845,6 +855,17 @@ extern "C" {
 // Defined by the runtime, set before guest code runs and constant while guest code runs; lifted
 // code may load it once per function. 0 means identity (always the case in the browser build).
 extern uint64_t __playgta6_guest_base;
+
+// Translated CPU window: the per-slot delta table (kGuestWindowSize / kGuestWindowSlotBytes
+// entries; changes at run time) and the slow-path helpers lifted code calls for accesses that may
+// straddle two slots and for bulk copies / fills over translated ranges. An unmapped slot raises a
+// guest fault in the helpers.
+extern int64_t __playgta6_window_table[];
+void* __playgta6_guest_read(uint64_t va, uint64_t n);   // n <= 64; returns per-thread scratch
+void* __playgta6_guest_scratch();
+void __playgta6_guest_write(uint64_t va, uint64_t n);   // scratch -> guest
+void __playgta6_guest_memmove(uint64_t dst, uint64_t src, uint64_t n);
+void __playgta6_guest_memset(uint64_t dst, uint8_t value, uint64_t n);
 
 // Run the guest code at `target` as if called; the caller already pushed the return address.
 // Returns when that code executes its `ret`.

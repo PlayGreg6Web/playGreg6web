@@ -98,3 +98,26 @@ host address = __playgta6_guest_base + guest VA        (64-bit wrapping add)
 ### Native host builds
 - The runtime reserves the guest address space from the OS and commits pages on demand. The process arena is placed at its own VAs (identity) when the OS allows it; otherwise (or for additional arenas, e.g. in tests) `__playgta6_guest_base` is non-zero and the VAs below `kGuestAddressSpaceBase` are reserved inaccessible, so null and small guest pointers fault.
 - Page protections are enforced with OS page protection (execute is treated as read).
+
+### Translated CPU window (browser target)
+The title reserves a 16 GiB CPU window (24 GiB on another console profile) and maps 64 KiB pool pages at arbitrary window slots; it cannot be backed inside the 12 GiB identity pool. The window is therefore placed above the wasm64 memory and every guest access to it translates through a per-slot table:
+
+```
+va in [kGuestWindowBase, kGuestWindowBase + kGuestWindowSize):
+    host address = va + __playgta6_window_table[(va - kGuestWindowBase) >> 16]
+otherwise:
+    host address = __playgta6_guest_base + va
+```
+
+| Symbol / constant | Defined in | Meaning |
+| :--- | :--- | :--- |
+| `kGuestWindowBase` | `runtime/abi/playgta6_abi.h` | `0x4'0000'0000` (16 GiB): first guest VA of the window, above any wasm64 memory. |
+| `kGuestWindowSize` | `runtime/abi/playgta6_abi.h` | `0x6'0000'0000` (24 GiB): window range (covers both console profiles). |
+| `kGuestWindowSlotBytes` | `runtime/abi/playgta6_abi.h` | `65536`: one table slot. |
+| `kGuestWindowTrapDelta` | `runtime/abi/playgta6_abi.h` | `2^63`: delta of an unmapped slot; the address lands beyond any memory (wasm: "out of bounds" trap, native: non-canonical fault). |
+| `__playgta6_window_table` | runtime (`int64_t[kGuestWindowSize / 65536]`, C linkage) | Delta per slot. Changes at run time (map / unmap): lifted code reads entries with ordinary loads, never invariant ones. |
+
+- Lifted code is built with the lifter's `MemoryModel::Windowed` at these constants, with `stack_flat` (stack-pointer-relative accesses skip the window check: guest stacks never lie in the window). An access of `n > 1` bytes whose offset in its slot exceeds `65536 - n` may straddle two slots and calls the slow-path helpers below; naturally aligned accesses (atomics) never straddle. `rep movs` / `rep stos` over a range touching the window call the segmented helpers.
+- Runtime helpers (C linkage): `void* __playgta6_guest_read(u64 va, u64 n)` (copies `n <= 64` bytes into a per-thread scratch buffer and returns it), `void* __playgta6_guest_scratch()`, `void __playgta6_guest_write(u64 va, u64 n)` (copies the scratch buffer to `va`), `void __playgta6_guest_memmove(u64 dst, u64 src, u64 n)`, `void __playgta6_guest_memset(u64 dst, u8 value, u64 n)`. An unmapped slot raises a guest fault.
+- Host code that receives a guest pointer that may point into the window must translate it with the runtime's shared function (`os/guest_window.h`) and must not assume a guest buffer is host-contiguous across 64 KiB slots (segmented copies or a contiguous view).
+- Page protections inside the window are not tracked per slot; an unmapped slot always traps.

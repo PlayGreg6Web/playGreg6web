@@ -16,6 +16,9 @@ alignas(64) int64_t __playgta6_window_table[playgta6::os::guest_window::kWindowS
 
 namespace playgta6::os::guest_window {
 
+static_assert(kWindowBase == kGuestWindowBase && kWindowMaxSize == kGuestWindowSize);
+static_assert(kSlotBytes == kGuestWindowSlotBytes && kTrapDelta == kGuestWindowTrapDelta);
+
 namespace {
 
 struct State {
