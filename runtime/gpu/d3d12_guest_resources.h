@@ -160,6 +160,7 @@ struct GraphicsPsoSource {
     // The console-native stages the DXIL vertex / pixel shader joins to (identity 0: not joined).
     Device::NativeStageRecord native_vs, native_ps;
     Device::DxilDigest vs_digest{}, ps_digest{};  // HASH digests of the DXIL containers (zero: none)
+    uint64_t pack_vs_key = 0, pack_ps_key = 0;   // shader pack keys the stages resolved with (0: none)
 
     GraphicsPsoSource() = default;
     GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }
@@ -167,6 +168,13 @@ struct GraphicsPsoSource {
     // Points desc.pInputElementDescs and every SemanticName at this object's own storage.
     void fix_pointers();
 };
+
+// The pipeline layout Device::resolve_with_pack registers for a pack-resolved pipeline: one group,
+// bindings numbered from 0 in root-parameter order (table ranges descriptor by descriptor, an
+// unbounded range as one; root CBV/SRV/UAV and root constants one each; then static samplers).
+// CBVs and root constants are uniform buffers, SRVs 2D float textures, UAVs storage buffers,
+// samplers filtering samplers; every binding is visible to the vertex and fragment stages.
+bridge::PipelineLayoutDesc layout_from_root_signature(const d3d::RootSignatureDesc& rs);
 
 // D3D12 guest struct -> pipeline-cache description (shared by the public and the Xbox creators).
 void convert_blend_desc(const GuestBlendDesc& g, pso::D3D12BlendDesc* out);

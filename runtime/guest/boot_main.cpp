@@ -59,6 +59,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -149,6 +151,7 @@ struct Options {
     bool gpu_capture_payloads = false;
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
+    std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -166,7 +169,8 @@ void usage() {
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
                  "                     [--no-entry] [--quiet]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
-                 "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n");
+                 "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n"
+                 "                     [--shader-pack <file.wgsl.pack>]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -204,7 +208,8 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
-                   a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines") {
+                   a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
+                   a == "--shader-pack") {
             if (!value(v)) {
                 return false;
             }
@@ -212,6 +217,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--gpu-capture" ? o.gpu_capture
                                   : a == "--sandbox-id" ? o.sandbox_id
                                   : a == "--dump-pipelines" ? o.dump_pipelines
+                                  : a == "--shader-pack" ? o.shader_pack
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
                                   : a == "--game-dir" ? o.game_dir
@@ -693,7 +699,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
-    if (g_options.native_pipelines || !g_options.dump_pipelines.empty()) {
+    if (g_options.native_pipelines || !g_options.dump_pipelines.empty() || !g_options.shader_pack.empty()) {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.refuse_native_pipelines = !g_options.native_pipelines;
         if (!g_options.dump_pipelines.empty()) {
@@ -709,6 +715,18 @@ int main(int argc, char** argv) {
                 return kExitUsage;
             }
             device_options.dump_dir = dir.string();
+        }
+        if (!g_options.shader_pack.empty()) {
+            std::ifstream in(g_options.shader_pack, std::ios::binary);
+            const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            auto index = std::make_shared<gpu::ShaderPackIndex>();
+            std::string error;
+            if (!gpu::parse_shader_pack_index(bytes.data(), bytes.size(), index.get(), &error)) {
+                std::fprintf(stderr, "[harness] --shader-pack %s: %s\n", g_options.shader_pack.c_str(), error.c_str());
+                return kExitUsage;
+            }
+            std::fprintf(stderr, "[harness] shader pack %s: %zu key(s)\n", g_options.shader_pack.c_str(), index->size());
+            device_options.shader_pack = std::move(index);
         }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
     }

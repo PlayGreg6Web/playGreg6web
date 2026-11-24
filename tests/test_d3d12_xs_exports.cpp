@@ -21,6 +21,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "gpu/shader_pack_index.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
 #include "os/shim_exports.h"
@@ -2424,6 +2425,184 @@ void test_xbox_unaligned_constant_buffers() {
     scene.release_all({list, heap});
 }
 
+// A WGPK pack with the given (key, stage) entries and tiny WGSL payloads.
+std::vector<uint8_t> wgpk(const std::vector<std::pair<uint64_t, uint8_t>>& entries) {
+    std::vector<uint8_t> out(16 + entries.size() * 20, 0);
+    std::memcpy(out.data(), "WGPK", 4);
+    const uint32_t version = 1, count = static_cast<uint32_t>(entries.size()), flags = 0;
+    std::memcpy(out.data() + 4, &version, 4);
+    std::memcpy(out.data() + 8, &count, 4);
+    std::memcpy(out.data() + 12, &flags, 4);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const std::string code = "// stage " + std::to_string(entries[i].second) + "\n";
+        const uint32_t offset = static_cast<uint32_t>(out.size()), length = static_cast<uint32_t>(code.size());
+        uint8_t* e = out.data() + 16 + i * 20;
+        std::memcpy(e, &entries[i].first, 8);
+        e[8] = entries[i].second;
+        std::memcpy(e + 12, &offset, 4);
+        std::memcpy(e + 16, &length, 4);
+        out.insert(out.end(), code.begin(), code.end());
+    }
+    return out;
+}
+
+// G47: the shader pack index resolves graphics pipeline stages (by the joined native code
+// identity, else by the DXIL identity) so their draws are emitted.
+void test_xbox_shader_pack_resolution() {
+    namespace xb = dg::xbox;
+    using R = xb::NativeRange;
+    // Unit: WGPK index parsing.
+    playgta6::gpu::ShaderPackIndex parsed;
+    std::string error;
+    std::vector<uint8_t> pack = wgpk({{0x1111, 1}, {0x2222, 2}});
+    CHECK(playgta6::gpu::parse_shader_pack_index(pack.data(), pack.size(), &parsed, &error));
+    CHECK(parsed.size() == 2 && parsed.at(0x1111) == playgta6::gpu::PackStage::Vertex &&
+          parsed.at(0x2222) == playgta6::gpu::PackStage::Fragment);
+    std::vector<uint8_t> bad = pack;
+    bad[0] = 'X';
+    CHECK(!playgta6::gpu::parse_shader_pack_index(bad.data(), bad.size(), &parsed, &error));
+    bad = pack;
+    bad[16 + 8] = 7;  // stage
+    CHECK(!playgta6::gpu::parse_shader_pack_index(bad.data(), bad.size(), &parsed, &error) &&
+          error.find("stage 7") != std::string::npos);
+    CHECK(!playgta6::gpu::parse_shader_pack_index(pack.data(), 30, &parsed, &error));
+    CHECK(playgta6::gpu::pack_key_code(0xabc) == "0x0000000000000abc");
+
+    // Unit: layout from a root signature (CBV table of 2, root constants, static sampler).
+    d3d::RootSignatureDesc rsd;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Cbv;
+    range.num_descriptors = 2;
+    range.base_shader_register = 27;
+    range.register_space = 1;
+    table.ranges.push_back(range);
+    rsd.parameters.push_back(table);
+    d3d::RootParameterDesc constants;
+    constants.parameter_type = d3d::RootParameterType::Constants32Bit;
+    constants.num_32bit_values = 4;
+    constants.shader_register = 3;
+    rsd.parameters.push_back(constants);
+    d3d::StaticSamplerDesc sampler;
+    sampler.shader_register = 5;
+    rsd.static_samplers.push_back(sampler);
+    const auto layout = dg::layout_from_root_signature(rsd);
+    CHECK(layout.groups.size() == 1 && layout.groups[0].bindings.size() == 4);
+    if (layout.groups.size() == 1 && layout.groups[0].bindings.size() == 4) {
+        const auto& b = layout.groups[0].bindings;
+        CHECK(b[0].entry.binding == 0 && b[0].join.shader_register == 27 && b[0].join.register_space == 1 &&
+              b[0].entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+              b[0].entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform));
+        CHECK(b[1].entry.binding == 1 && b[1].join.shader_register == 28);
+        CHECK(b[2].entry.binding == 2 && b[2].join.root_constants && b[2].join.shader_register == 3);
+        CHECK(b[3].entry.binding == 3 && b[3].entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Sampler) &&
+              b[3].join.register_class == d3d::DescriptorRangeType::Sampler && b[3].join.shader_register == 5);
+    }
+
+    // Device: a native stage indexed by slot 57 (vertex), its DXIL joined by digest; the pixel
+    // stage has no native stage and is keyed by its DXIL identity.
+    std::array<uint8_t, 16> vs_digest{}, ps_digest{};
+    for (int i = 0; i < 16; ++i) {
+        vs_digest[i] = static_cast<uint8_t>(0x31 + i);
+        ps_digest[i] = static_cast<uint8_t>(0x91 + i);
+    }
+    std::vector<uint8_t> vs_meta = byte_pattern(0x80, 4);
+    std::memcpy(vs_meta.data() + xb::kNativeDigestFirst, vs_digest.data(), 16);
+    const std::vector<uint8_t> header = byte_pattern(0x184, 1), meta = byte_pattern(0x50, 2);
+    const std::vector<uint8_t> vs_code = byte_pattern(0x140, 3);
+    const std::vector<uint8_t> vs_container = container_with_hash(vs_digest);
+    const std::vector<uint8_t> ps_container = container_with_hash(ps_digest);
+    const uint64_t vs_key = dg::shader_identity(vs_code.data(), vs_code.size());
+    const uint64_t ps_key = dg::shader_identity(ps_container.data(), ps_container.size());
+    auto index = std::make_shared<playgta6::gpu::ShaderPackIndex>();
+    const std::vector<uint8_t> real_pack = wgpk({{vs_key, 1}, {ps_key, 2}});
+    CHECK(playgta6::gpu::parse_shader_pack_index(real_pack.data(), real_pack.size(), index.get(), &error));
+
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.shader_pack = index;
+    dx::set_device_options(options);
+    Scene scene(fx, /*register_shaders=*/false);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    xb::GuestNativePipelineDesc d{};
+    d.pRootSignature = scene.rs;
+    d.ranges[static_cast<size_t>(R::Header)] = {put_bytes(header.data(), header.size()), header.size()};
+    d.ranges[static_cast<size_t>(R::PipelineMetadata)] = {put_bytes(meta.data(), meta.size()), meta.size()};
+    d.ranges[static_cast<size_t>(R::VertexCode)] = {put_aligned(vs_code, 256), vs_code.size()};
+    d.ranges[static_cast<size_t>(R::VertexMetadata)] = {put_bytes(vs_meta.data(), vs_meta.size()), vs_meta.size()};
+    CHECK(fx.create(scene.device, XSlot::CreateNativePso, {I(put(d))}, dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kENotImpl);
+
+    scene.vs_bytes = vs_container;
+    scene.ps_bytes = ps_container;
+    const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+    const uint64_t stream = put(xb::GuestPipelineStateStreamDesc{bytes.size(), put_bytes(bytes.data(), bytes.size())});
+    size_t mark = fx.captured.size();
+    const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream)}, dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    auto* state = object_of<dg::PipelineState>(pso);
+    CHECK(state->resolved() && state->graphics_source()->pack_vs_key == vs_key &&
+          state->graphics_source()->pack_ps_key == ps_key);
+    auto ps = packets_since(fx, mark);
+    CHECK(count_op(ps, GpuOpcode::CreateShaderModule) == 2);
+    uint32_t vs_module = 0;
+    for (const Packet& p : ps) {
+        if (p.opcode != GpuOpcode::CreateShaderModule) {
+            continue;
+        }
+        const auto m = payload_as<GpuCreateShaderModulePayload>(p);
+        const std::string code(p.payload.begin() + sizeof(GpuCreateShaderModulePayload), p.payload.end());
+        if (m.stage == static_cast<uint32_t>(GpuShaderStage::Vertex)) {
+            CHECK(code == playgta6::gpu::pack_key_code(vs_key));
+            vs_module = m.id;
+        } else {
+            CHECK(m.stage == static_cast<uint32_t>(GpuShaderStage::Fragment) &&
+                  code == playgta6::gpu::pack_key_code(ps_key));
+        }
+    }
+    // The same stages again: no new modules.
+    mark = fx.captured.size();
+    const uint64_t pso2 = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream)}, dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && object_of<dg::PipelineState>(pso2)->resolved());
+    CHECK(count_op(packets_since(fx, mark), GpuOpcode::CreateShaderModule) == 0);
+    // A stage without a key leaves the pipeline unresolved.
+    scene.ps_bytes = container_with_hash(vs_digest);
+    scene.ps_bytes.push_back(0);
+    const std::vector<uint8_t> bytes3 = graphics_stream(scene, 3);
+    const uint64_t pso3 = fx.create(scene.device, XSlot::CreatePsoStream,
+                                    {I(put(xb::GuestPipelineStateStreamDesc{bytes3.size(),
+                                                                            put_bytes(bytes3.data(), bytes3.size())}))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && !object_of<dg::PipelineState>(pso3)->resolved());
+
+    // The draw is emitted with the pack-resolved modules.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 32, 32, 0, 1}))});
+    fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 32, 32}))});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    mark = fx.captured.size();
+    scene.execute({list});
+    ps = packets_since(fx, mark);
+    CHECK(count_op(ps, GpuOpcode::Draw) == 1);
+    const Packet* pipe = find_op(ps, GpuOpcode::CreateRenderPipeline2);
+    CHECK(pipe != nullptr && payload_as<GpuCreateRenderPipeline2Payload>(*pipe).vs_module_id == vs_module &&
+          payload_as<GpuCreateRenderPipeline2Payload>(*pipe).pipeline_layout_id != 0);
+    CHECK(dev->stats().skipped_draws == 0);
+
+    CHECK(t_balanced);
+    scene.release_all({list, pso, pso2, pso3});
+}
+
 // G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
 void test_xbox_rect_lists() {
     Fixture fx;
@@ -2873,6 +3052,7 @@ int main() {
     test_xbox_rect_lists();
     test_xbox_native_dxil_join();
     test_xbox_unaligned_constant_buffers();
+    test_xbox_shader_pack_resolution();
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();

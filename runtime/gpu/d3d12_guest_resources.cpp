@@ -1166,6 +1166,8 @@ GraphicsPsoSource& GraphicsPsoSource::operator=(const GraphicsPsoSource& other) 
         root_signature = other.root_signature;
         rect_list = other.rect_list;
         native_vs = other.native_vs;
+        pack_vs_key = other.pack_vs_key;
+        pack_ps_key = other.pack_ps_key;
         vs_digest = other.vs_digest;
         ps_digest = other.ps_digest;
         native_ps = other.native_ps;
@@ -1338,11 +1340,129 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
     return create_graphics_pso_from(std::move(src), riid, out);
 }
 
+// Pipeline layout from a root signature (convention in Device::resolve_with_pack).
+bridge::PipelineLayoutDesc layout_from_root_signature(const d3d::RootSignatureDesc& rs) {
+    bridge::GroupLayoutDesc group;
+    uint32_t binding = 0;
+    auto add = [&](GpuBindingLayoutType type, uint8_t binding_type, uint8_t view_dimension, d3d::DescriptorRangeType cls,
+                   uint32_t reg, uint32_t space, bool root_constants) {
+        bridge::LayoutBinding b;
+        b.entry.binding = binding;
+        b.entry.visibility = GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment;
+        b.entry.type = static_cast<uint8_t>(type);
+        b.entry.binding_type = binding_type;
+        b.entry.view_dimension = view_dimension;
+        b.join.binding = binding;
+        b.join.register_class = cls;
+        b.join.shader_register = reg;
+        b.join.register_space = space;
+        b.join.root_constants = root_constants;
+        group.bindings.push_back(b);
+        ++binding;
+    };
+    auto add_class = [&](d3d::DescriptorRangeType cls, uint32_t reg, uint32_t space, bool root_constants) {
+        switch (cls) {
+            case d3d::DescriptorRangeType::Cbv:
+                add(GpuBindingLayoutType::Buffer, static_cast<uint8_t>(GpuBufferBindingType::Uniform), 0, cls, reg, space,
+                    root_constants);
+                break;
+            case d3d::DescriptorRangeType::Srv:
+                add(GpuBindingLayoutType::Texture, static_cast<uint8_t>(GpuTextureSampleType::Float),
+                    static_cast<uint8_t>(GpuTextureViewDimension::Dim2D), cls, reg, space, false);
+                break;
+            case d3d::DescriptorRangeType::Uav:
+                add(GpuBindingLayoutType::Buffer, static_cast<uint8_t>(GpuBufferBindingType::Storage), 0, cls, reg, space,
+                    false);
+                break;
+            case d3d::DescriptorRangeType::Sampler:
+                add(GpuBindingLayoutType::Sampler, static_cast<uint8_t>(GpuSamplerBindingType::Filtering), 0, cls, reg,
+                    space, false);
+                break;
+        }
+    };
+    for (const d3d::RootParameterDesc& p : rs.parameters) {
+        switch (p.parameter_type) {
+            case d3d::RootParameterType::DescriptorTable:
+                for (const d3d::DescriptorRangeDesc& r : p.ranges) {
+                    const uint32_t n = r.num_descriptors == d3d::kUnboundedDescriptorCount ? 1 : r.num_descriptors;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        add_class(r.range_type, r.base_shader_register + i, r.register_space, false);
+                    }
+                }
+                break;
+            case d3d::RootParameterType::Constants32Bit:
+                add_class(d3d::DescriptorRangeType::Cbv, p.shader_register, p.register_space, true);
+                break;
+            case d3d::RootParameterType::Cbv:
+                add_class(d3d::DescriptorRangeType::Cbv, p.shader_register, p.register_space, false);
+                break;
+            case d3d::RootParameterType::Srv:
+                add_class(d3d::DescriptorRangeType::Srv, p.shader_register, p.register_space, false);
+                break;
+            case d3d::RootParameterType::Uav:
+                add_class(d3d::DescriptorRangeType::Uav, p.shader_register, p.register_space, false);
+                break;
+        }
+    }
+    for (const d3d::StaticSamplerDesc& s : rs.static_samplers) {
+        add_class(d3d::DescriptorRangeType::Sampler, s.shader_register, s.register_space, false);
+    }
+    bridge::PipelineLayoutDesc layout;
+    layout.groups.push_back(std::move(group));
+    return layout;
+}
+
+bool Device::resolve_with_pack(const GraphicsPsoSource& src, uint64_t* vs_key, uint64_t* ps_key) {
+    *vs_key = *ps_key = 0;
+    const ShaderPackIndex* index = options_.shader_pack.get();
+    const pso::D3D12GraphicsPsoDesc& d = src.desc;
+    if (index == nullptr || d.vs == 0 || d.ds != 0 || d.hs != 0 || d.gs != 0) {
+        return false;
+    }
+    auto key_for = [&](uint64_t dxil, const NativeStageRecord& native, PackStage stage, uint64_t* key) {
+        for (uint64_t k : {native.identity != 0 ? native.code_identity : 0, dxil}) {
+            auto it = k != 0 ? index->find(k) : index->end();
+            if (it != index->end() && it->second == stage) {
+                *key = k;
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!key_for(d.vs, src.native_vs, PackStage::Vertex, vs_key) ||
+        (d.ps != 0 && !key_for(d.ps, src.native_ps, PackStage::Fragment, ps_key))) {
+        *vs_key = *ps_key = 0;
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pack_mutex_);
+    auto module_for = [&](uint64_t key, GpuShaderStage stage) {
+        auto it = pack_modules_.find(key);
+        if (it != pack_modules_.end()) {
+            return it->second;
+        }
+        const uint32_t id = allocate_id();
+        CommandEncoder enc;
+        enc.create_shader_module(id, stage, pack_key_code(key));
+        submit(enc);
+        pack_modules_.emplace(key, id);
+        return id;
+    };
+    register_shader_module(d.vs, module_for(*vs_key, GpuShaderStage::Vertex));
+    if (d.ps != 0) {
+        register_shader_module(d.ps, module_for(*ps_key, GpuShaderStage::Fragment));
+    }
+    if (src.root_signature && pack_layouts_.insert({d.vs, d.ps}).second) {
+        bridge_->register_pipeline_layout(d.vs, d.ps, layout_from_root_signature(src.root_signature->signature().desc()));
+    }
+    return true;
+}
+
 HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& riid, OutPtr out) {
     auto src = std::make_unique<GraphicsPsoSource>(source);  // copy: fixes the internal pointers
     const com::Ref<RootSignature>& rs = src->root_signature;
     pso::D3D12GraphicsPsoDesc& d = src->desc;
     d.root_signature_id = rs ? static_cast<uint32_t>(rs->signature().hash()) : 0u;
+    resolve_with_pack(*src, &src->pack_vs_key, &src->pack_ps_key);
     auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
     if (!state) {
         return kEOutOfMemory;

@@ -62,6 +62,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -73,6 +74,7 @@
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/pso_cache.h"
+#include "gpu/shader_pack_index.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
 
@@ -519,6 +521,10 @@ struct DeviceOptions {
     bool refuse_native_pipelines = true;
     // Pipeline dump directory (d3d12_xs_dump.h); empty: no dump.
     std::string dump_dir;
+    // Keys of the WGSL pack the WebGPU side loads (shader_pack_index.h; boot harness:
+    // --shader-pack). Graphics pipelines whose stages all have a key are resolved: see
+    // Device::resolve_with_pack. Null: no pack, every pipeline stays unresolved.
+    std::shared_ptr<const ShaderPackIndex> shader_pack;
 };
 
 struct DeviceStats {
@@ -691,6 +697,15 @@ public:
     // buffers, refreshed from guest memory at every submission (flush_cpu_buffers) when changed.
     bool relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset);
     size_t relocated_uniform_count() const;
+    // Shader pack resolution (DeviceOptions::shader_pack). Each stage of a graphics pipeline is
+    // looked up by the code-only identity of the console-native stage its DXIL joins to, else by
+    // its DXIL identity. When every stage has a key, the stages get modules (one CreateShaderModule
+    // per key, code = pack_key_code(key), resolved by the WebGPU side from its pack) and, unless
+    // one is registered, a pipeline layout derived from the root signature (one group; bindings
+    // numbered from 0 in root-parameter order: table ranges descriptor by descriptor, root
+    // descriptors and root constants one each, then static samplers). Returns the keys used
+    // (0 = stage absent); false when a stage has no key.
+    bool resolve_with_pack(const GraphicsPsoSource& source, uint64_t* vs_key, uint64_t* ps_key);
     void flush_pipeline_dump();
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
@@ -803,6 +818,9 @@ private:
     };
     mutable std::mutex relocation_mutex_;
     std::map<std::pair<uint64_t, uint64_t>, RelocatedUniform> relocations_;  // (va, size)
+    std::mutex pack_mutex_;
+    std::unordered_map<uint64_t, uint32_t> pack_modules_;                 // pack key -> module id
+    std::set<std::pair<uint64_t, uint64_t>> pack_layouts_;                // (vs, ps) identities
     uint32_t relocation_buffer_ = 0;  // current GPU buffer id (CreateBuffer packet only, no COM object)
     uint64_t relocation_used_ = 0;    // bytes used in relocation_buffer_
     std::atomic<uint64_t> dump_presents_{0};

@@ -46,6 +46,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
     gpu/d3d12_xs_dump.cpp
+    gpu/shader_pack_index.cpp
     gpu/frame_capture.cpp
     os/xmem_windows.cpp
     os/guest_window.cpp
