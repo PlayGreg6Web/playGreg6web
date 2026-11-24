@@ -210,6 +210,18 @@ HResult CommandList::Reset(InterfaceArg<ICommandAllocatorHost> allocator, Interf
     return kSOk;
 }
 
+// Xbox slot 139. The executable's command-list pool takes a closed list from its ring and calls
+// slot 139 with (an ID3D12CommandAllocator, null, 0), checks the HRESULT, then records into the
+// list: a Reset onto that allocator. The third argument is recorded when non-zero (its meaning
+// is unknown; the boot has only shown 0).
+HResult CommandList::ResetX(InterfaceArg<ICommandAllocatorHost> allocator, InterfaceArg<IPipelineStateHost> initial_state,
+                            uint64_t extra) {
+    if (extra != 0) {
+        note("ID3D12GraphicsCommandList Xbox slot 139: third argument " + hex(extra) + " is not interpreted");
+    }
+    return Reset(std::move(allocator), std::move(initial_state));
+}
+
 void CommandList::ClearState(InterfaceArg<IPipelineStateHost> state) {
     if (!usable()) {
         return;
@@ -898,7 +910,9 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::method<&H::XboxSlot<131>>("Xbox slot 131 (register write)"),                  // 131
     CL::method<&H::XboxSlot<132>>("Xbox slot 132 (register write)"),                  // 132
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 133..136
-    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 137..140
+    CL::stub(nullptr), CL::stub(nullptr),                                             // 137..138
+    CL::method<&H::ResetX>("Reset (Xbox slot 139)"),                                  // 139
+    CL::stub(nullptr),                                                                // 140
     CL::stub(nullptr),                                                                // 141
     CL::method<&H::XboxSlot<142>>("Xbox slot 142"),                                   // 142
 };

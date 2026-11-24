@@ -338,6 +338,9 @@ struct IGraphicsCommandListHost : IDeviceChildHost {
     virtual HResult Close() = 0;                                                                     // 9
     virtual HResult Reset(InterfaceArg<ICommandAllocatorHost> allocator,
                           InterfaceArg<IPipelineStateHost> initial_state) = 0;                       // 10
+    // Xbox slot 139: (allocator, initial state, u64) -> HRESULT, a Reset with a third argument.
+    virtual HResult ResetX(InterfaceArg<ICommandAllocatorHost> allocator, InterfaceArg<IPipelineStateHost> initial_state,
+                           uint64_t extra) = 0;
     virtual void ClearState(InterfaceArg<IPipelineStateHost> state) = 0;                             // 11
     virtual void DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t start_vertex,
                                uint32_t start_instance) = 0;                                         // 12

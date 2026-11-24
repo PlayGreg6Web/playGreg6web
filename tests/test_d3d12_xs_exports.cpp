@@ -1268,6 +1268,11 @@ struct Scene {
         CHECK(load64(alias_out) == list);
         fx.vcall(list, Slot::Release);
         CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        // Xbox slot 139 (allocator, null, 0) reopens the list like Reset; reopening an open list
+        // fails like Reset does.
+        CHECK(hr(fx.vcall(list, 139, {I(allocator), I(0), I(0)})) == 0);
+        CHECK(hr(fx.vcall(list, 139, {I(allocator), I(0), I(0)})) < 0);
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
         return list;
     }
 
