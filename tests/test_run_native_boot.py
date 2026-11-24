@@ -133,6 +133,16 @@ class StalenessTests(unittest.TestCase):
             plan, *_ = rnb.make_plan(fx.repo, fx.build, fx.exe, fx.pkg, 3, True, None)
             self.assertEqual([s["stage"] for s in plan.steps], ["recomp", "program", "harness"])
 
+    def test_trust_build_skips_staleness(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            touch(fx.exe, fx.base + 500)
+            touch(fx.repo / "runtime" / "a.cpp", fx.base + 600)
+            code, _, err, calls = fx.run("--name", "r1", "--no-build", "--trust-build")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn("[plan]", err)
+
     def test_no_build_and_dry_run(self):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))

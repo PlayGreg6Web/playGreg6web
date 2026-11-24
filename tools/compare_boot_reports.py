@@ -174,16 +174,28 @@ def load_capture(trace_path: Path) -> Capture:
 # ---------------------------------------------------------------------------
 
 
+def keyed_milestones(report: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Milestones with unique keys: a repeated name (one PGIM_LOAD per module) becomes NAME#2, NAME#3."""
+    seen: Counter = Counter()
+    out = []
+    for m in report.get("milestones") or []:
+        seen[m["milestone"]] += 1
+        n = seen[m["milestone"]]
+        out.append((m["milestone"] if n == 1 else f"{m['milestone']}#{n}", m))
+    return out
+
+
 def compare_milestones(c: Comparison, ra: dict[str, Any], rb: dict[str, Any]) -> None:
-    ma = [(m["milestone"], m.get("elapsed_ms")) for m in ra.get("milestones") or []]
-    mb = [(m["milestone"], m.get("elapsed_ms")) for m in rb.get("milestones") or []]
+    ka, kb = keyed_milestones(ra), keyed_milestones(rb)
+    ma = [(k, m.get("elapsed_ms")) for k, m in ka]
+    mb = [(k, m.get("elapsed_ms")) for k, m in kb]
     c.exact("milestones.sequence", [n for n, _ in ma], [n for n, _ in mb])
     ta, tb = dict(ma), dict(mb)
     for name in sorted(set(ta) | set(tb)):
         c.time(f"milestones.{name}.elapsed_ms", ta.get(name), tb.get(name))
     # import_seq exists from report schema 2 on; compare it only when both sides have it.
-    sa = {m["milestone"]: m["import_seq"] for m in ra.get("milestones") or [] if "import_seq" in m}
-    sb = {m["milestone"]: m["import_seq"] for m in rb.get("milestones") or [] if "import_seq" in m}
+    sa = {k: m["import_seq"] for k, m in ka if "import_seq" in m}
+    sb = {k: m["import_seq"] for k, m in kb if "import_seq" in m}
     for name in sorted(set(sa) & set(sb)):
         c.count(f"milestones.{name}.import_seq", sa[name], sb[name])
     fa = {f["name"]: f for f in ra.get("first_calls") or []}

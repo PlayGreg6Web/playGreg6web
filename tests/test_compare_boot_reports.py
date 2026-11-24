@@ -95,6 +95,17 @@ class CompareTests(unittest.TestCase):
         c = self.run_compare(make_report(), b)
         self.assertIn("milestones.sequence", self.fields(c))
 
+    def test_repeated_milestone_names_are_compared_individually(self):
+        a = make_report()
+        a["milestones"] = [{"milestone": "PGIM_LOAD", "elapsed_ms": 100}, {"milestone": "PGIM_LOAD", "elapsed_ms": 200}]
+        b = copy.deepcopy(a)
+        self.assertEqual(self.run_compare(a, b).failures(), [])
+        b["milestones"][0]["elapsed_ms"] = 9000  # the first of the two differs, the last one does not
+        self.assertIn("milestones.PGIM_LOAD.elapsed_ms", self.fields(self.run_compare(a, b)))
+        b = copy.deepcopy(a)
+        b["milestones"][1]["elapsed_ms"] = 9000
+        self.assertIn("milestones.PGIM_LOAD#2.elapsed_ms", self.fields(self.run_compare(a, b)))
+
     def test_changed_stop_fails(self):
         b = make_report()
         b["fault"]["va"] = "0x2000"

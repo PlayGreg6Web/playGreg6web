@@ -15,7 +15,8 @@ What it does, in order:
    binary is missing or older than the program manifest, any `runtime/` source or
    `tools/build_native_boot.py`. Only stale stages run, in dependency order (a rebuilt stage makes
    the later ones stale). `--rebuild` forces all, `--no-build` fails instead of building,
-   `--dry-run` prints the plan and stops.
+   `--dry-run` prints the plan and stops, `--trust-build` skips the checks and uses the existing
+   program and harness as they are (for a build made elsewhere, e.g. from another checkout).
 2. Run `playgta6_boot --program-dir <program> --name <exe name> --game-dir <game-dir>` with a
    preset or explicit options. Presets: `smoke` (60 s limit, 90 s watchdog), `start-screen`
    (120 s limit; an input script pressing A for 100 ms once a second from 5 s on), `long`
@@ -218,7 +219,8 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
         lines.append(f"message: {report['message']}")
     lines.append("milestones:")
     for m in report.get("milestones") or []:
-        lines.append(f"  {m.get('milestone')}: {m.get('elapsed_ms')} ms, import call {m.get('import_seq', '?')}")
+        seq = f", import call {m['import_seq']}" if "import_seq" in m else ""
+        lines.append(f"  {m.get('milestone')}: {m.get('elapsed_ms')} ms{seq}")
     presents = report.get("presents") or []
     fp = report.get("first_present")
     first = f", first at import call {fp.get('import_seq')} ({fp.get('elapsed_ms')} ms)" if isinstance(fp, dict) else ""
@@ -258,6 +260,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     p.add_argument("--rebuild", action="store_true", help="rebuild every stage")
     p.add_argument("--no-build", action="store_true", help="fail instead of building a stale stage")
+    p.add_argument("--trust-build", action="store_true",
+                   help="skip the staleness checks and use the existing program and harness as they are")
     p.add_argument("--dry-run", action="store_true", help="print the build plan and the command, then stop")
     p.add_argument("--harness", type=Path, help="use this harness instead of the built one (no harness build)")
     p.add_argument("--max-ms", type=int, help="harness --max-ms (default from the preset)")
@@ -312,6 +316,8 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(f"run directory {run_dir} already exists (pick another --name)")
 
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness)
+    if args.trust_build:
+        plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
     watchdog_ms = args.watchdog_ms if args.watchdog_ms is not None else preset["watchdog_ms"]
 
