@@ -15,6 +15,7 @@
 #include "abi/playgta6_abi.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
+#include "os/guest_window.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/xbox_scarlett.h"
@@ -40,6 +41,9 @@ namespace win32 = playgta6::os::win32;
 constexpr uint64_t kAllocHook = 0x140030000ULL;     // void* alloc(size_t, uint64_t attributes)
 constexpr uint64_t kFreeHook = 0x140030100ULL;      // void free(void*, uint64_t attributes)
 constexpr uint64_t kOtherAlloc = 0x140030200ULL;    // XMemSetAllocationHooks routine
+constexpr uint64_t kWindowAlloc = 0x140030300ULL;   // hands out translated-window addresses
+constexpr uint64_t kWindowFree = 0x140030400ULL;    // records the address it is given
+constexpr uint64_t kWindowBlock = playgta6::os::guest_window::kWindowBase + 0x10040;
 constexpr uint64_t kArenaId = 0x80;                 // allocator id served by the arena
 constexpr uint64_t kArenaAttributes = (kArenaId << 16) | (2u << 14);
 constexpr uint64_t kBudget = 8u << 20;
@@ -49,6 +53,7 @@ std::atomic<int> g_free_calls{0};
 std::atomic<int> g_other_calls{0};
 std::atomic<uint64_t> g_arena_base{0};
 std::atomic<uint64_t> g_cursor{0};
+std::atomic<uint64_t> g_window_freed{0};
 
 uint64_t guest_of(void* host) {
     return host == nullptr ? 0 : win32::get_vmem_arena()->guest_address(host);
@@ -109,11 +114,43 @@ void sub_other_alloc(GuestState* s) {
     ret(s);
 }
 
+void sub_window_alloc(GuestState* s) {
+    s->gpr[GuestReg::Rax] = kWindowBlock;
+    ret(s);
+}
+
+void sub_window_free(GuestState* s) {
+    g_window_freed = s->gpr[GuestReg::Rcx];
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kAllocHook, sub_alloc_hook},
     {kFreeHook, sub_free_hook},
     {kOtherAlloc, sub_other_alloc},
+    {kWindowAlloc, sub_window_alloc},
+    {kWindowFree, sub_window_free},
 };
+
+// O31: a title allocator that hands out translated-window addresses. The import thunks of a
+// windowed program translate the result back to the window address, and hand XMemFree the
+// window address in their own form (the slot's backing page); the free routine gets the window
+// address again.
+void test_window_addresses() {
+    namespace gw = playgta6::os::guest_window;
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    std::vector<uint8_t> page(2 * 0x10000);
+    auto* aligned = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(page.data()) + 0xFFFF) & ~uintptr_t{0xFFFF});
+    CHECK(gw::map_slot(gw::kWindowBase + 0x10000, aligned));
+    pg6_xbox_XMemSetAllocationHooks(kWindowAlloc, kWindowFree);
+    void* p = pg6_xbox_XMemAlloc(64, 0);
+    CHECK(gw::guest_address(p) == kWindowBlock);  // what the thunk returns to the guest
+    pg6_xbox_XMemFree(gw::host_or_trap(kWindowBlock), 0);  // what the thunk passes
+    CHECK(g_window_freed == kWindowBlock);
+    pg6_xbox_XMemSetAllocationHooks(0, 0);
+    gw::reset_for_testing();
+}
 
 void test_hooks() {
     auto& arena = *win32::get_vmem_arena();
@@ -199,6 +236,7 @@ void test_hooks() {
 int main() {
     CHECK(register_lifted_functions(kFunctions));
     test_hooks();
+    test_window_addresses();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xmem_hooks failed with %d failure(s)\n", g_failures);
         return 1;

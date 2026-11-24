@@ -1,5 +1,6 @@
 #include "os/win32_kernel.h"
 
+#include "os/guest_window.h"
 #include "os/xmem_windows.h"
 
 #include <algorithm>
@@ -1113,6 +1114,22 @@ std::string normalize_path(std::string_view raw_path, bool* is_userdata) {
 // Virtual memory shims
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// O31: a range touching the translated CPU window (os/guest_window.h) is XMem's: its pages are
+// mapped through the window table, not the arena (which only holds a no-access reservation over
+// the range natively, or nothing in the browser). VirtualAlloc / VirtualProtect / VirtualFree
+// there would act on that reservation instead, so they are refused.
+bool touches_translated_window(uint64_t address, uint64_t size) {
+    if (!guest_window::enabled()) {
+        return false;
+    }
+    const uint64_t end = size == 0 || address > UINT64_MAX - size ? address + 1 : address + size;
+    return address < guest_window::kWindowBase + guest_window::kWindowMaxSize && end > guest_window::kWindowBase;
+}
+
+}  // namespace
+
 uint64_t VirtualAlloc(uint64_t address,
                       uint64_t size,
                       uint32_t allocation_type,
@@ -1125,6 +1142,10 @@ uint64_t VirtualAlloc(uint64_t address,
         return 0;
     }
 
+    if (address != 0 && touches_translated_window(address, size)) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return 0;
+    }
     const uint64_t result = get_vmem_arena()->virtual_alloc(address, size, allocation_type, pp);
     if (result == 0) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -1142,6 +1163,10 @@ bool VirtualProtect(uint64_t address,
         return false;
     }
 
+    if (touches_translated_window(address, size)) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return false;
+    }
     PageProtect prev = PageProtect::NoAccess;
     const bool ok = get_vmem_arena()->protect(address, size, pp, &prev);
     if (!ok) {
@@ -1163,6 +1188,10 @@ bool VirtualFree(uint64_t address, uint64_t size, uint32_t free_type) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
+    if (touches_translated_window(address, size)) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return false;
+    }
     const bool ok = get_vmem_arena()->virtual_free(address, size, free_type);
     if (!ok) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -1178,6 +1207,25 @@ size_t VirtualQuery(uint64_t address, MemoryBasicInformation* buffer, size_t len
 
     MemoryBasicInfo info = get_vmem_arena()->query(address);
     xmem_windows::Window phantom;
+    xmem_windows::Window window;
+    if (guest_window::translated(address) && xmem_windows::find_window(address, 1, &window)) {
+        // O31: the translated CPU window: a reservation whose mapped 64 KiB slots read as committed
+        // with the window's protection, the rest as reserved. The region runs while the state does.
+        const uint64_t slot = address & ~(guest_window::kSlotBytes - 1);
+        const bool mapped = guest_window::slot_host(slot) != nullptr;
+        uint64_t end = slot + guest_window::kSlotBytes;
+        while (end < window.base + window.size && (guest_window::slot_host(end) != nullptr) == mapped) {
+            end += guest_window::kSlotBytes;
+        }
+        info.base_address = address & ~(kPageSize - 1);
+        info.allocation_base = window.base;
+        info.region_size = end - info.base_address;
+        info.state = mapped ? MemState::Commit : MemState::Reserve;
+        PageProtect window_protect = PageProtect::ReadWrite;
+        to_page_protect(window.protect, window_protect);
+        info.protect = mapped ? window_protect : PageProtect::NoAccess;
+        info.allocation_protect = window_protect;
+    }
     if (info.state == MemState::Free && xmem_windows::is_phantom(address) &&
         xmem_windows::find_window(address, 1, &phantom)) {
         // O27: a GPU window placed outside the guest pool reads as a no-access reservation.

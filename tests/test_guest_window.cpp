@@ -296,6 +296,19 @@ void test_xmem_translated_cpu_window() {
     const gw::Stats s = gw::stats();
     CHECK(s.mapped_slots == 6 && s.contiguous_pairs == 2 && s.split_pairs == 0);
     CHECK(xw::accounting().cpu_window_mapped == 6 * k64K);
+    // O31: the Win32 virtual-memory shims see the translated window as XMem's reservation: mapped
+    // slots committed (the run W .. W + 3 slots), others reserved; no arena operation touches it.
+    {
+        win32::MemoryBasicInformation mbi{};
+        CHECK(win32::VirtualQuery(W + k64K + 5, &mbi, sizeof(mbi)) == sizeof(mbi));
+        CHECK(mbi.state == kMemCommit && mbi.allocation_base == W && mbi.base_address == W + k64K);
+        CHECK(mbi.region_size == 2 * k64K && mbi.protect == kCpuProtect);
+        CHECK(win32::VirtualQuery(W + 4 * k64K, &mbi, sizeof(mbi)) == sizeof(mbi));
+        CHECK(mbi.state == kMemReserve && mbi.protect == static_cast<uint32_t>(PageProtect::NoAccess));
+        CHECK(!win32::VirtualFree(W, 0, win32::MEM_RELEASE));
+        CHECK(!win32::VirtualProtect(W, k64K, kCpuProtect, nullptr));
+        CHECK(win32::VirtualAlloc(W + 4 * k64K, k64K, win32::MEM_COMMIT, kCpuProtect) == 0);
+    }
     // O29: XMem's view of the same mapping sequence (what the boot report records).
     {
         const XMemWindowContiguity c = xmem_window_contiguity();

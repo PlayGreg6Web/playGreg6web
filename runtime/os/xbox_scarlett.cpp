@@ -2456,7 +2456,9 @@ void pg6_xbox_XMemFree(void* address, uint64_t attributes) {
         return;
     }
     if (const uint64_t routine = playgta6::os::scarlett::guest_hook_routine(1); routine != 0) {
-        playgta6::os::scarlett::call_guest_routine(routine, playgta6::os::scarlett::guest_of(address), attributes);
+        // The title's allocator may hand out translated-window addresses: the guest routine gets
+        // the address it returned, in whatever form the import thunk passed it (O31).
+        playgta6::os::scarlett::call_guest_routine(routine, playgta6::os::scarlett::guest_of_arg(address), attributes);
         return;
     }
     pg6_xbox_XMemFreeDefault(address, attributes);

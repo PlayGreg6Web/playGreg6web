@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "os/guest_window.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -1169,19 +1170,25 @@ const char* class_name_ptr(const char* literal) {
     return keep.back().c_str();
 }
 
+// The guest form of a host pointer, for fields of guest structures (class_name).
+const char* guest_name(const char* literal) {
+    return reinterpret_cast<const char*>(
+        static_cast<uintptr_t>(playgta6::os::guest_window::guest_address(class_name_ptr(literal))));
+}
+
 void test_windows() {
     reset_window_state();
     Pg6WndClassExA wc{};
     wc.size = sizeof(wc);
     wc.window_proc = 0x140001000;
-    wc.class_name = class_name_ptr("TitleWindow");
+    wc.class_name = guest_name("TitleWindow");
     const uint16_t atom = pg6_win32_register_class_ex_a(&wc);
     CHECK(atom >= 0xC000);
     CHECK(pg6_win32_register_class_ex_a(&wc) == 0);
     CHECK(GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
-    wc.class_name = class_name_ptr("TITLEWINDOW");  // class names are case-insensitive
+    wc.class_name = guest_name("TITLEWINDOW");  // class names are case-insensitive
     CHECK(pg6_win32_register_class_ex_a(&wc) == 0);
-    wc.class_name = class_name_ptr("Other");
+    wc.class_name = guest_name("Other");
     CHECK(pg6_win32_register_class_ex_a(&wc) == atom + 1);
     Pg6WndClassExA bad = wc;
     bad.size = 48;
@@ -1193,7 +1200,7 @@ void test_windows() {
     bad.class_name = reinterpret_cast<const char*>(0x1234);  // an atom, not a name
     CHECK(pg6_win32_register_class_ex_a(&bad) == 0);
     bad = wc;
-    bad.class_name = class_name_ptr("NoProc");
+    bad.class_name = guest_name("NoProc");
     bad.window_proc = 0;
     CHECK(pg6_win32_register_class_ex_a(&bad) == 0);
     CHECK(pg6_win32_register_class_ex_a(nullptr) == 0);

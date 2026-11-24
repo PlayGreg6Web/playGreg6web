@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "os/guest_window.h"
 #include "os/win32_kernel.h"
 #include "os/xasync_provider.h"
 
@@ -336,8 +337,11 @@ bool crack_component(const char16_t* src,
     if (*length == 0) {
         return true;
     }
+    // The component pointers are guest addresses held in guest memory (O31: they may lie in the
+    // translated CPU window): a pointer into the URL is stored in its guest form, a caller buffer
+    // is written through the shared translation.
     if (*pointer == nullptr) {
-        *pointer = const_cast<char16_t*>(src);
+        *pointer = reinterpret_cast<char16_t*>(static_cast<uintptr_t>(guest_window::guest_address(src)));
         *length = static_cast<uint32_t>(count);
         return true;
     }
@@ -346,8 +350,12 @@ bool crack_component(const char16_t* src,
         *insufficient = true;
         return false;
     }
-    std::memcpy(*pointer, src, count * sizeof(char16_t));
-    (*pointer)[count] = 0;
+    const uint64_t dst = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(*pointer));
+    const char16_t nul = 0;
+    if (!guest_window::copy_to_guest(dst, src, count * sizeof(char16_t)) ||
+        !guest_window::copy_to_guest(dst + count * sizeof(char16_t), &nul, sizeof(nul))) {
+        return false;
+    }
     *length = static_cast<uint32_t>(count);
     return true;
 }

@@ -24,7 +24,9 @@
 #include "os/guest_window.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/win32_compat.h"
 #include "os/win32_loader.h"
+#include "os/xbox_offline.h"
 #include "pg6_export_thunks.h"
 
 namespace {
@@ -251,6 +253,36 @@ void test_memset_and_string_destinations() {
     CHECK(std::memcmp(window_bytes(d, sizeof(src)).data(), src, sizeof(src)) == 0);
 }
 
+// O31: guest pointers held in guest structures (not top-level arguments, which the thunks
+// translate) are read and written through the shared translation: a window class name and
+// WinHttpCrackUrl component buffers, split across non-adjacent window pages.
+void test_pointer_fields_in_the_window() {
+    Fixture fx;
+    const char name[] = "WindowedClassName";
+    const uint64_t name_va = W + k64K - 7;
+    CHECK(gw::copy_to_guest(name_va, name, sizeof(name)));
+    Pg6WndClassExA wc{};
+    wc.size = sizeof(wc);
+    wc.window_proc = 0x140001000;
+    wc.class_name = reinterpret_cast<const char*>(static_cast<uintptr_t>(name_va));
+    const uint16_t atom = pg6_win32_register_class_ex_a(&wc);
+    CHECK(atom != 0);
+    CHECK(pg6_win32_register_class_ex_a(&wc) == 0);  // the same name: it was read correctly
+
+    const uint64_t host_va = W + k64K - 6;  // 3 characters in slot 0, the rest in slot 1
+    Pg6UrlComponentsW c{};
+    c.struct_size = sizeof(c);
+    c.host_name = reinterpret_cast<char16_t*>(static_cast<uintptr_t>(host_va));
+    c.host_name_length = 32;
+    c.url_path_length = 1;  // pointer mode: a guest pointer into the URL
+    const char16_t* url = u"https://example.invalid/a/b";
+    CHECK(pg6_win32_winhttp_crack_url(url, 0, 0, &c) == 1);
+    std::u16string got(15, u'\0');
+    CHECK(gw::copy_from_guest(got.data(), host_va, 15 * sizeof(char16_t)));
+    CHECK(got.substr(0, 15) == u"example.invalid" && c.host_name_length == 15);
+    CHECK(reinterpret_cast<uintptr_t>(c.url_path) == gw::guest_address(url + 23) && c.url_path_length == 4);
+}
+
 // The COM bridge's raw pointer parameters (what a COM method with a buffer argument receives).
 void test_com_raw_pointer_argument() {
     Fixture fx;
@@ -293,6 +325,7 @@ int main() {
     test_memcpy_class();
     test_string_functions();
     test_memset_and_string_destinations();
+    test_pointer_fields_in_the_window();
     test_com_raw_pointer_argument();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_window_marshal: %d failure(s)\n", g_failures);

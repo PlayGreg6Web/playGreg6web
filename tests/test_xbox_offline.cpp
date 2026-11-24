@@ -8,10 +8,16 @@
 #include <vector>
 
 #include "os/win32_kernel.h"
+#include "os/guest_window.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
 
 namespace {
+
+// The guest form of a host pointer, for pointer fields of guest structures (URL_COMPONENTS).
+char16_t* gp(const char16_t* host) {
+    return reinterpret_cast<char16_t*>(static_cast<uintptr_t>(playgta6::os::guest_window::guest_address(host)));
+}
 
 int g_failures = 0;
 
@@ -820,17 +826,17 @@ void test_winhttp_extras() {
         char16_t scheme[16], host[64], user[16], pass[16], path[64], extra[64];
         Pg6UrlComponentsW c{};
         c.struct_size = sizeof(c);
-        c.scheme = scheme;
+        c.scheme = gp(scheme);
         c.scheme_length = 16;
-        c.host_name = host;
+        c.host_name = gp(host);
         c.host_name_length = 64;
-        c.user_name = user;
+        c.user_name = gp(user);
         c.user_name_length = 16;
-        c.password = pass;
+        c.password = gp(pass);
         c.password_length = 16;
-        c.url_path = path;
+        c.url_path = gp(path);
         c.url_path_length = 64;
-        c.extra_info = extra;
+        c.extra_info = gp(extra);
         c.extra_info_length = 64;
         const char16_t* url = u"https://bob:secret@Example.com:8443/a/b.txt?x=1#frag";
         CHECK(pg6_win32_winhttp_crack_url(url, 0, 0, &c) == 1);
@@ -853,8 +859,8 @@ void test_winhttp_extras() {
         c.extra_info_length = 1;
         CHECK(pg6_win32_winhttp_crack_url(url, 21, 0, &c) == 1);
         CHECK(c.scheme_id == INTERNET_SCHEME_HTTP && c.port == 80);
-        CHECK(c.host_name == url + 7 && c.host_name_length == 12);
-        CHECK(c.url_path == url + 19 && c.url_path_length == 2);
+        CHECK(c.host_name == gp(url + 7) && c.host_name_length == 12);
+        CHECK(c.url_path == gp(url + 19) && c.url_path_length == 2);
         CHECK(c.extra_info_length == 0);
     }
     // Buffer too small: required size (with NUL) is reported.
@@ -862,7 +868,7 @@ void test_winhttp_extras() {
         char16_t host[4];
         Pg6UrlComponentsW c{};
         c.struct_size = sizeof(c);
-        c.host_name = host;
+        c.host_name = gp(host);
         c.host_name_length = 4;
         CHECK(pg6_win32_winhttp_crack_url(u"http://example.com/", 0, 0, &c) == 0);
         CHECK(win32::GetLastError() == 122u);

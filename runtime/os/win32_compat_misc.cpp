@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/win32_compat.h"
 #include "os/win32_compat_internal.h"
@@ -627,7 +628,15 @@ uint16_t pg6_win32_register_class_ex_a(const Pg6WndClassExA* window_class) {
         win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    const std::string name = lower_ascii(window_class->class_name);
+    // class_name is a guest address held in guest memory (O31: it may lie in the translated
+    // CPU window): read it through the shared translation, one character at a time.
+    std::string raw;
+    const uint64_t name_va = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(window_class->class_name));
+    for (char c = 0; raw.size() < 256 && playgta6::os::guest_window::copy_from_guest(&c, name_va + raw.size(), 1) &&
+                     c != 0;) {
+        raw.push_back(c);
+    }
+    const std::string name = lower_ascii(raw);
     auto& w = windows();
     std::lock_guard<std::mutex> lock(w.mutex);
     if (w.classes.count(name) != 0) {

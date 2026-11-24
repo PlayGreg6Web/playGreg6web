@@ -123,6 +123,7 @@ inline constexpr uint32_t ERROR_READ_FAULT = 30u;
 inline constexpr uint32_t ERROR_HANDLE_EOF = 38u;
 inline constexpr uint32_t ERROR_FILE_EXISTS = 80u;
 inline constexpr uint32_t ERROR_INVALID_PARAMETER = 87u;
+inline constexpr uint32_t ERROR_INVALID_ADDRESS = 487u;
 inline constexpr uint32_t ERROR_NEGATIVE_SEEK = 131u;
 inline constexpr uint32_t ERROR_ALREADY_EXISTS = 183u;
 inline constexpr uint32_t ERROR_NO_MORE_ITEMS = 259u;
