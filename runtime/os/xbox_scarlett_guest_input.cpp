@@ -1,6 +1,7 @@
 // GameInput.dll and xg_xs.dll guest interfaces (O23); evidence and layouts in xbox_scarlett_guest.h.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -517,19 +518,42 @@ public:
         std::vector<uint8_t> bytes(kXgResourceLayoutSize, 0);
         const uint32_t mips = std::min<uint32_t>(layout_.mip_levels, kXgMaxMips);
         const uint32_t planes = 1;
-        std::memcpy(bytes.data() + 0x00, &layout_.size_bytes, 8);
-        std::memcpy(bytes.data() + 0x08, &layout_.base_alignment_bytes, 8);
+        const uint64_t total = tiled_ ? surface_bytes_ : layout_.size_bytes;
+        const uint64_t base_alignment = tiled_ ? std::max<uint64_t>(layout_.base_alignment_bytes, tiled_block_bytes_)
+                                               : layout_.base_alignment_bytes;
+        std::memcpy(bytes.data() + 0x00, &total, 8);
+        std::memcpy(bytes.data() + 0x08, &base_alignment, 8);
         std::memcpy(bytes.data() + 0x10, &mips, 4);
         std::memcpy(bytes.data() + 0x14, &planes, 4);
         uint8_t* plane = bytes.data() + kXgLayoutPlaneOffset;
         // Plane header (hypothesis): +0x04 bytes per element, +0x08 size, +0x18 base alignment.
         const ElementInfo e = element_info(desc_.format);
         std::memcpy(plane + 0x04, &e.bytes, 4);
-        std::memcpy(plane + 0x08, &layout_.size_bytes, 8);
-        std::memcpy(plane + 0x18, &layout_.base_alignment_bytes, 8);
+        std::memcpy(plane + 0x08, &total, 8);
+        std::memcpy(plane + 0x18, &base_alignment, 8);
         for (uint32_t m = 0; m < mips; ++m) {
             const Pg6XgMipLevelLayout& hm = layout_.mips[m];
             XgMipLayout gm{};
+            if (tiled_) {
+                // GFX10 placement (gpu/gfx10_detile.h): the same source the detiler and
+                // CopyIntoSubresource use.
+                const playgta6::gpu::gfx10::MipPlacement mp = playgta6::gpu::gfx10::mip_placement(tiled_desc_, m);
+                gm.size_bytes = mp.size_bytes * slices_;
+                gm.offset_bytes = mp.offset_bytes;
+                gm.slice_2d_size_bytes = mp.slice_bytes;
+                gm.pitch_bytes = mp.pitch_elements * e.bytes;
+                gm.pitch_pixels = mp.pitch_elements * e.block;
+                gm.alignment_bytes = static_cast<uint32_t>(mp.block_bytes);
+                gm.padded_width_elements = mp.pitch_elements;
+                gm.padded_height_elements = mp.height_elements;
+                gm.padded_depth_or_array_size = desc_.dimension == 4 ? hm.depth : layout_.array_size;
+                gm.width_elements = ceil_div(hm.width, e.block);
+                gm.height_elements = ceil_div(hm.height, e.block);
+                gm.depth_or_array_size = gm.padded_depth_or_array_size;
+                gm.sample_count = 1;
+                std::memcpy(plane + kXgPlaneMipOffset + m * kXgMipLayoutSize, &gm, sizeof(gm));
+                continue;
+            }
             gm.size_bytes = hm.size_bytes;
             gm.offset_bytes = hm.offset_bytes;
             gm.slice_2d_size_bytes = hm.slice_size_bytes;
@@ -658,16 +682,26 @@ public:
     }
 
 private:
-    // A 2D (single slice) or 3D descriptor whose swizzle mode (+0x2C, 0x100 | n) is a tiled GFX10
-    // mode: CopyIntoSubresource writes the GFX10 layout the runtime's detiler reads back
-    // (gpu/gfx10_detile.h) instead of linear rows. The surface must fit the size this computer
-    // reports (layout_.size_bytes); otherwise the copy stays linear.
+    // A 2D (array slices repeat the chain) or 3D descriptor whose swizzle mode (+0x2C, 0x100 | n) is a GFX10 mode
+    // verified against addrlib (256B/4KB/64KB _S and _D; thick 3D for _S): GetResourceLayout
+    // reports the GFX10 surface and CopyIntoSubresource writes the GFX10 layout the runtime's
+    // detiler reads back (gpu/gfx10_detile.h, one placement for all three). Other tiled modes keep
+    // the linear answer and are counted.
     void init_tiled() {
         namespace gfx10 = playgta6::gpu::gfx10;
         const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(desc_.swizzle_mode);
-        if (mode == gfx10::SwizzleMode::Linear || mode == gfx10::SwizzleMode::Unsupported ||
-            (desc_.dimension != 3 && desc_.dimension != 4) || (desc_.dimension == 3 && desc_.depth_or_array_size > 1) ||
-            desc_.sample_count > 1 || layout_.mip_levels == 0) {
+        if (mode == gfx10::SwizzleMode::Linear || mode == gfx10::SwizzleMode::Unsupported) {
+            return;
+        }
+        const bool verified = mode == gfx10::SwizzleMode::Sw256BS || mode == gfx10::SwizzleMode::Sw256BD ||
+                              mode == gfx10::SwizzleMode::Sw4KBS || mode == gfx10::SwizzleMode::Sw4KBD ||
+                              mode == gfx10::SwizzleMode::Sw64KBS || mode == gfx10::SwizzleMode::Sw64KBD;
+        if (!verified || (desc_.dimension != 3 && desc_.dimension != 4) || desc_.sample_count > 1 ||
+            layout_.mip_levels == 0) {
+            if (xg_linear_answers().fetch_add(1) == 0) {
+                diag("xg_xs: swizzle mode 0x" + hex32(desc_.swizzle_mode) +
+                     " answered with the linear layout (mode not verified or MSAA; counted)");
+            }
             return;
         }
         tiled_desc_.dxgi_format = desc_.format;
@@ -676,27 +710,33 @@ private:
         tiled_desc_.depth = desc_.dimension == 4 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
         tiled_desc_.mip_levels = layout_.mip_levels;
         tiled_desc_.d3d12_layout = desc_.swizzle_mode;
-        const size_t bytes = gfx10::surface_bytes(tiled_desc_);
-        if (bytes == 0 || bytes > layout_.size_bytes) {
-            if (bytes != 0) {
-                diag("xg_xs: swizzle mode 0x" + hex32(desc_.swizzle_mode) + " surface (" + std::to_string(bytes) +
-                     " bytes) exceeds the reported size (" + std::to_string(layout_.size_bytes) +
-                     "); copies stay linear");
-            }
+        // 2D arrays repeat the chain per slice (addrlib: slice stride = mip-chain slice size).
+        slices_ = desc_.dimension == 3 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
+        chain_bytes_ = gfx10::surface_bytes(tiled_desc_);
+        const size_t bytes = chain_bytes_ * slices_;
+        if (bytes == 0) {
+            xg_linear_answers().fetch_add(1);
             return;
         }
         surface_bytes_ = bytes;
+        tiled_block_bytes_ = gfx10::mip_placement(tiled_desc_, 0).block_bytes;
         tiled_ = true;
+    }
+
+    static std::atomic<uint64_t>& xg_linear_answers() {
+        static std::atomic<uint64_t> n{0};
+        return n;
     }
 
     HResult copy_into_tiled(uint64_t dst, uint32_t plane, uint32_t subresource, uint64_t src, uint32_t row_pitch,
                             uint32_t slice_pitch) {
         namespace gfx10 = playgta6::gpu::gfx10;
-        if (plane != 0 || subresource >= tiled_desc_.mip_levels) {
+        if (plane != 0 || subresource >= tiled_desc_.mip_levels * slices_) {
             return com::E_INVALIDARG_HR;
         }
         const gfx10::FormatGeometry g = gfx10::format_geometry(tiled_desc_.dxgi_format);
-        const uint32_t mip = subresource;
+        const uint32_t mip = subresource % tiled_desc_.mip_levels;
+        dst += uint64_t{subresource / tiled_desc_.mip_levels} * chain_bytes_;
         const uint32_t w = std::max(1u, tiled_desc_.width >> mip);
         const uint32_t h = std::max(1u, tiled_desc_.height >> mip);
         const uint32_t d = std::max(1u, tiled_desc_.depth >> mip);
@@ -714,7 +754,7 @@ private:
                 }
             }
         }
-        std::vector<uint8_t> surface(surface_bytes_);
+        std::vector<uint8_t> surface(chain_bytes_);
         if (!com::read_guest(dst, surface.data(), surface.size()) ||
             !gfx10::tile_into_surface(tiled_desc_, mip, linear.data(), linear.size(), surface.data(), surface.size()) ||
             !com::write_guest(dst, surface.data(), surface.size())) {
@@ -733,7 +773,10 @@ private:
     XgResourceDesc desc_;
     Pg6XgResourceLayout layout_{};
     playgta6::gpu::gfx10::TextureLayoutDesc tiled_desc_{};
-    size_t surface_bytes_ = 0;
+    size_t surface_bytes_ = 0;  // whole resource (chain x slices)
+    size_t chain_bytes_ = 0;    // one slice's mip chain
+    uint32_t slices_ = 1;
+    uint64_t tiled_block_bytes_ = 0;
     bool tiled_ = false;
 };
 

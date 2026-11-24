@@ -113,6 +113,13 @@ struct MipPlacement {
     uint32_t tail_x = 0;  // element coordinate of the mip inside the tail block
     uint32_t tail_y = 0;
     uint32_t tail_z = 0;
+    // addrlib ADDR2_MIP_INFO-style figures for reporting a layout (XG GetResourceLayout):
+    uint32_t pitch_elements = 0;   // padded pitch (tail mips: the tail region, halved per level)
+    uint32_t height_elements = 0;  // padded height
+    uint64_t slice_bytes = 0;      // pitch * height * bytes per element
+    uint64_t size_bytes = 0;       // slice_bytes * padded depth (single mip: the whole surface)
+    uint64_t offset_bytes = 0;     // ADDR2_MIP_INFO::offset (tail mips: tail offset x depth blocks)
+    uint64_t block_bytes = 0;      // swizzle block size (base alignment)
 };
 MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept;
 

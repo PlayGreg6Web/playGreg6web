@@ -1312,39 +1312,74 @@ void test_xg() {
     // An unsupported dimension fails.
     CHECK(as_hr(fx.dcall(create, {I(xg_desc(7, 16, 16, 1, 1, 28)), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
 
-    // A tiled swizzle mode (+0x2C = 0x100 | 5, 4KB_S): CopyIntoSubresource writes the GFX10
-    // layout that the runtime's detiler reads back, per mip (mip 1 of a 9-mip 256x256 RGBA8 sits
-    // where the GFX10 chain puts it) and for a thick 3D surface.
+    // A tiled swizzle mode (+0x2C = 0x100 | n): GetResourceLayout reports the GFX10 surface and
+    // CopyIntoSubresource writes the GFX10 layout that the runtime's detiler reads back, per mip
+    // (mip 1 of a 9-mip 256x256 RGBA8 sits where the GFX10 chain puts it), per array slice, for a
+    // thick 3D surface and for 64KB_D. An unverified mode (64KB_R_X) keeps the linear answer.
     namespace gfx10 = playgta6::gpu::gfx10;
     struct TiledCase {
-        uint32_t dim, w, h, d, mips, format, bpe, mip;
+        uint32_t dim, w, h, d, mips, format, bpe, mip, slice, swizzle;
     };
-    for (const TiledCase& c : {TiledCase{3, 256, 256, 1, 9, 28, 4, 1}, TiledCase{3, 64, 64, 1, 1, 28, 4, 0},
-                               TiledCase{4, 16, 16, 16, 1, 10, 8, 0}}) {
+    for (const TiledCase& c : {TiledCase{3, 256, 256, 1, 9, 28, 4, 1, 0, 0x105}, TiledCase{3, 64, 64, 1, 1, 28, 4, 0, 0, 0x105},
+                               TiledCase{4, 16, 16, 16, 1, 10, 8, 0, 0, 0x105}, TiledCase{3, 256, 256, 3, 2, 61, 1, 1, 2, 0x10A},
+                               TiledCase{3, 512, 256, 1, 3, 71, 8, 0, 0, 0x10A}}) {
         const uint64_t tdesc = xg_desc(c.dim, c.w, c.h, c.d, c.mips, c.format);
-        const uint32_t swizzle = 0x105;
-        CHECK(com::write_guest(tdesc + 0x2C, swizzle));
+        CHECK(com::write_guest(tdesc + 0x2C, c.swizzle));
         const uint64_t tout = fx.out_slot();
         CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
         const uint64_t tcomp = load64(tout);
+        const gfx10::FormatGeometry fg = gfx10::format_geometry(c.format);
         const uint32_t mw = std::max(1u, c.w >> c.mip), mh = std::max(1u, c.h >> c.mip);
-        const uint32_t md = std::max(1u, c.d >> c.mip);
-        std::vector<uint8_t> lin(size_t{mw} * mh * md * c.bpe);
+        const uint32_t md = c.dim == 4 ? std::max(1u, c.d >> c.mip) : 1u;
+        const uint32_t row = (mw + fg.block_width - 1) / fg.block_width * c.bpe;
+        const uint32_t rows = (mh + fg.block_height - 1) / fg.block_height;
+        std::vector<uint8_t> lin(size_t{row} * rows * md);
         for (size_t i = 0; i < lin.size(); ++i) {
             lin[i] = static_cast<uint8_t>(i * 7 + (i >> 9));
         }
         const uint64_t tsrc = com::guest_alloc(lin.size());
         CHECK(com::write_guest(tsrc, lin.data(), lin.size()));
-        const gfx10::TextureLayoutDesc gd{c.format, c.w, c.h, c.dim == 4 ? c.d : 1u, c.mips, swizzle, 0};
-        const size_t surface = gfx10::surface_bytes(gd);
-        CHECK(surface != 0);
-        const uint64_t tdst = com::guest_alloc(surface + 0x10000);
-        CHECK(as_hr(fx.vcall(tcomp, 8, {I(tdst), I(0), I(c.mip), I(tsrc), I(mw * c.bpe), I(mw * c.bpe * mh)})) == 0);
-        const std::vector<uint8_t> written = guest_bytes(tdst, surface);
+        const gfx10::TextureLayoutDesc gd{c.format, c.w, c.h, c.dim == 4 ? c.d : 1u, c.mips, c.swizzle, 0};
+        const size_t chain = gfx10::surface_bytes(gd);
+        const uint32_t slices = c.dim == 3 ? c.d : 1u;
+        CHECK(chain != 0);
+
+        const uint64_t tlayout = com::guest_alloc(ga::kXgResourceLayoutSize);
+        CHECK(as_hr(fx.vcall(tcomp, 2, {I(tlayout)})) == 0);
+        const std::vector<uint8_t> lb = guest_bytes(tlayout, ga::kXgResourceLayoutSize);
+        uint64_t ttotal = 0;
+        std::memcpy(&ttotal, lb.data(), 8);
+        CHECK(ttotal == chain * slices);
+        ga::XgMipLayout tm{};
+        std::memcpy(&tm, lb.data() + ga::kXgLayoutPlaneOffset + ga::kXgPlaneMipOffset + c.mip * ga::kXgMipLayoutSize,
+                    sizeof(tm));
+        const gfx10::MipPlacement mp = gfx10::mip_placement(gd, c.mip);
+        CHECK(tm.pitch_bytes == mp.pitch_elements * c.bpe && tm.offset_bytes == mp.offset_bytes);
+        CHECK(tm.size_bytes == mp.size_bytes * slices && tm.slice_2d_size_bytes == mp.slice_bytes);
+
+        const uint64_t tdst = com::guest_alloc(chain * slices + 0x10000);
+        const uint32_t sub = c.slice * c.mips + c.mip;
+        CHECK(as_hr(fx.vcall(tcomp, 8, {I(tdst), I(0), I(sub), I(tsrc), I(row), I(row * rows)})) == 0);
+        const std::vector<uint8_t> written = guest_bytes(tdst + c.slice * chain, chain);
         std::vector<uint8_t> back;
         CHECK(gfx10::detile_from_surface(gd, c.mip, written.data(), written.size(), back).ok);
         CHECK(back == lin);
         CHECK(fx.vcall(tcomp, 1) == 0);
+    }
+    {
+        const uint64_t rdesc = xg_desc(3, 256, 256, 1, 1, 28);
+        const uint32_t rx = 0x11B;
+        CHECK(com::write_guest(rdesc + 0x2C, rx));
+        const uint64_t rout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(rdesc), I(rout)})) == 0);
+        const uint64_t rcomp = load64(rout);
+        const uint64_t rlayout = com::guest_alloc(ga::kXgResourceLayoutSize);
+        CHECK(as_hr(fx.vcall(rcomp, 2, {I(rlayout)})) == 0);
+        ga::XgMipLayout rm{};
+        std::memcpy(&rm, guest_bytes(rlayout, ga::kXgResourceLayoutSize).data() + ga::kXgLayoutPlaneOffset +
+                             ga::kXgPlaneMipOffset, sizeof(rm));
+        CHECK(rm.pitch_bytes == 1024 && rm.size_bytes == 256u * 1024u);
+        CHECK(fx.vcall(rcomp, 1) == 0);
     }
 }
 

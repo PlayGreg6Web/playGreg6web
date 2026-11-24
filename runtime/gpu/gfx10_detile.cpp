@@ -775,6 +775,10 @@ struct ChainLayout {
     uint64_t slice_stride = 0;        // bytes per slice (thin) or per block of slices (thick)
     uint64_t total_bytes = 0;
     uint32_t pitch[kMaxMips] = {};    // padded mip pitch in elements
+    uint32_t height[kMaxMips] = {};   // padded mip height in elements
+    uint64_t slice_bytes[kMaxMips] = {};
+    uint64_t size_bytes[kMaxMips] = {};
+    uint64_t offset[kMaxMips] = {};   // addrlib ADDR2_MIP_INFO::offset
     uint64_t macro_offset[kMaxMips] = {};
     bool in_tail[kMaxMips] = {};
     uint32_t tail_x[kMaxMips] = {};
@@ -819,12 +823,17 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
             const uint32_t w = shift_ceil(ew, static_cast<uint32_t>(i));
             const uint32_t h = shift_ceil(eh, static_cast<uint32_t>(i));
             c.pitch[i] = static_cast<uint32_t>(align_pow2(w, c.bw));
-            c.macro_offset[i] = chain;
-            chain += uint64_t{c.pitch[i]} * align_pow2(h, c.bh) * bpe;
+            c.height[i] = static_cast<uint32_t>(align_pow2(h, c.bh));
+            c.macro_offset[i] = c.offset[i] = chain;
+            c.slice_bytes[i] = c.size_bytes[i] = uint64_t{c.pitch[i]} * c.height[i] * bpe;
+            chain += c.slice_bytes[i];
         }
     } else if (c.mips == 1u) {
         c.pitch[0] = static_cast<uint32_t>(align_pow2(ew, c.bw));
-        chain = uint64_t{c.pitch[0]} * align_pow2(eh, c.bh) * bpe;
+        c.height[0] = static_cast<uint32_t>(align_pow2(eh, c.bh));
+        c.slice_bytes[0] = uint64_t{c.pitch[0]} * c.height[0] * bpe;
+        chain = c.slice_bytes[0];
+        c.size_bytes[0] = chain * num_slices;
     } else {
         // Mip tail: the largest region that a mip may occupy in the tail block (addrlib
         // Lib::GetMipTailDim), and how many mips fit (Gfx10Lib::GetMaxNumMipsInTail).
@@ -852,14 +861,34 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
                 break;
             }
             c.pitch[i] = static_cast<uint32_t>(align_pow2(w, c.bw));
-            const uint64_t slice = uint64_t{c.pitch[i]} * align_pow2(h, c.bh) * bpe;
+            c.height[i] = static_cast<uint32_t>(align_pow2(h, c.bh));
+            const uint64_t slice = uint64_t{c.pitch[i]} * c.height[i] * bpe;
+            const uint32_t d = thick ? shift_ceil(depth, i) : 1u;
+            c.slice_bytes[i] = slice;
+            c.size_bytes[i] = slice * align_pow2(d, c.bd);
             mip_slice_size[i] = slice * c.bd;
             chain += slice;
         }
-        uint64_t macro = first_tail != c.mips ? block_bytes : 0u;
+        uint32_t b256d = 0;
+        for (uint32_t i = 0; i < 8u && c.shape.eq != nullptr; ++i) {
+            if ((c.shape.eq[i] >> 4) == 3u) b256d = std::max(b256d, (c.shape.eq[i] & 0xFu) + 1u);
+        }
+        uint32_t tail_depth_blocks = 1;
+        uint64_t macro = 0;
+        uint64_t offset = 0;
+        if (first_tail != c.mips) {
+            const uint32_t tail_depth = thick ? shift_ceil(depth, first_tail) : 1u;
+            offset = block_bytes * align_pow2(tail_depth, c.bd) / c.bd;
+            macro = block_bytes;
+            if (thick) {
+                tail_depth_blocks = static_cast<uint32_t>(align_pow2(tail_depth, 1u << b256d) >> b256d);
+            }
+        }
         for (int32_t i = static_cast<int32_t>(first_tail) - 1; i >= 0; --i) {
             c.macro_offset[i] = macro;
+            c.offset[i] = offset;
             macro += mip_slice_size[i];
+            offset += c.size_bytes[i];
         }
         // Tail mips: placed by coordinate inside the block (Gfx10Lib::ComputeSurfaceInfoMacroTiled).
         uint32_t b256w = 0, b256h = 0;
@@ -893,6 +922,13 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
             c.tail_x[i] = mx << b256w;
             c.tail_y[i] = my << b256h;
             c.macro_offset[i] = 0;
+            c.offset[i] = uint64_t{off} * tail_depth_blocks;
+            // Tail mip pitch/height: the tail region, halved per level down to one 256 B block.
+            const uint32_t level = i - first_tail;
+            c.pitch[i] = std::max(tw >> level, 1u << b256w);
+            c.height[i] = std::max(th >> level, 1u << b256h);
+            c.slice_bytes[i] = uint64_t{c.pitch[i]} * c.height[i] * bpe;
+            c.size_bytes[i] = c.slice_bytes[i] * (thick ? (uint64_t{tail_depth_blocks} << b256d) : 1u);
         }
     }
     c.slice_stride = thick ? chain * c.bd : chain;
@@ -947,6 +983,12 @@ MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept
     p.in_tail = c.in_tail[mip];
     p.tail_x = c.tail_x[mip];
     p.tail_y = c.tail_y[mip];
+    p.pitch_elements = c.pitch[mip];
+    p.height_elements = c.height[mip];
+    p.slice_bytes = c.slice_bytes[mip];
+    p.size_bytes = c.size_bytes[mip];
+    p.offset_bytes = c.offset[mip];
+    p.block_bytes = uint64_t{1} << c.shape.blk_size_log2;
     p.ok = true;
     return p;
 }
