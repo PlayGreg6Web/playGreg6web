@@ -93,7 +93,7 @@
 //! [`name`, `rva`, `virtual_size`, `stored_bytes`, `protection`], `base_relocations` {`dir64`,
 //! `highlow`}, `container_bytes`), `pdata` (`records`, `valid`, `functions`, `diagnostics` by
 //! kind), `discovery` (`rounds`, `entry_points`, `functions`, `blocks`, `instructions`,
-//! `jump_tables` {`resolved`, `unresolved`}, `terminators` {`trap`, `invalid`,
+//! `jump_tables` {`resolved`, `unresolved`, `inferred`}, `terminators` {`trap`, `invalid`,
 //! `no_return_call`}, `relocations` by kind, `diagnostics` by kind), `refinements` (`no_return`
 //! {`imports` [`label`, `slot`], `thunks`}, `code_pointers` {`pdata_present`, `round_limit_hit`,
 //! `by_source` {source: {status: count}}, `accepted`}, `dispatch` {`registered_functions`,
@@ -887,6 +887,8 @@ pub struct DiscoveryStats {
     pub instructions: usize,
     pub jump_tables_resolved: usize,
     pub jump_tables_unresolved: usize,
+    /// Resolved tables whose extent was inferred (no proven index bound); part of `resolved`.
+    pub jump_tables_inferred: usize,
     pub trap_blocks: usize,
     pub invalid_blocks: usize,
     pub no_return_calls: usize,
@@ -906,6 +908,7 @@ impl DiscoveryStats {
             instructions: 0,
             jump_tables_resolved: analysis.jump_tables.len(),
             jump_tables_unresolved: 0,
+            jump_tables_inferred: analysis.jump_tables.values().filter(|t| t.inferred).count(),
             trap_blocks: 0,
             invalid_blocks: 0,
             no_return_calls: 0,
@@ -1440,8 +1443,9 @@ pub fn render_report(r: &PipelineReport) -> String {
     );
     let _ = writeln!(
         out,
-        "  jump tables: {} resolved, {} unresolved indirect jumps (dispatched at run time)",
-        d.jump_tables_resolved, d.jump_tables_unresolved
+        "  jump tables: {} resolved ({} with an inferred extent), {} unresolved indirect jumps \
+         (dispatched at run time)",
+        d.jump_tables_resolved, d.jump_tables_inferred, d.jump_tables_unresolved
     );
     if !l.unsupported.is_empty() {
         let mut rows: Vec<(&String, &usize)> = l.unsupported.iter().collect();
@@ -1869,6 +1873,7 @@ pub fn render_manifest(r: &PipelineReport) -> String {
             obj([
                 ("resolved", num(d.jump_tables_resolved)),
                 ("unresolved", num(d.jump_tables_unresolved)),
+                ("inferred", num(d.jump_tables_inferred)),
             ]),
         ),
         (

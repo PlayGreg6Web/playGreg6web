@@ -190,7 +190,9 @@ pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpT
         _ => return None,
     };
 
-    let bound = slicer.bound(load.index, load.index_at, load.index_width, 0)?;
+    let Some(bound) = slicer.bound(load.index, load.index_at, load.index_width, 0) else {
+        return infer_extent(image, jmp, trace[load.at].instr.ip(), load.table, encoding);
+    };
     if bound.min > bound.max {
         return None;
     }
@@ -217,6 +219,52 @@ pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpT
         table: table_start,
         targets,
         index: bound.index,
+        inferred: false,
+    })
+}
+
+/// Fewest leading entries an inferred table must have.
+const MIN_INFERRED_ENTRIES: usize = 2;
+/// Most entries read for an inferred table.
+const MAX_INFERRED_ENTRIES: usize = 4096;
+
+/// A matched table load (`[base + index*scale]` on a known table base, the dispatch shape of a
+/// compiled switch) whose index bound the slice cannot prove, e.g. a remainder computed by a loop
+/// or a merge with several incoming paths. The table is read from index 0 while entries land
+/// inside the `.pdata` function that contains the jump; the first entry that does not ends it.
+/// Over-reading only adds case blocks inside the function, under-reading leaves a value to the
+/// runtime dispatcher (see [`JumpTable::inferred`]). Not done without a `.pdata` owner.
+fn infer_extent(
+    image: &CodeImage<'_>,
+    jmp: &Instruction,
+    load_site: u64,
+    table: u64,
+    encoding: EntryEncoding,
+) -> Option<JumpTable> {
+    let owner = image.function_table.function_at(jmp.ip())?;
+    let entry_size = encoding.entry_size();
+    let mut targets = Vec::new();
+    let mut va = table;
+    while targets.len() < MAX_INFERRED_ENTRIES {
+        let Some(chunk) = read(image, va, entry_size) else {
+            break;
+        };
+        let target = encoding.decode(chunk);
+        if image.code_bytes(target).is_err()
+            || image.function_table.function_at(target) != Some(owner)
+        {
+            break;
+        }
+        targets.push(target);
+        va += entry_size;
+    }
+    (targets.len() >= MIN_INFERRED_ENTRIES).then(|| JumpTable {
+        site: jmp.ip(),
+        load_site,
+        table,
+        targets,
+        index: None,
+        inferred: true,
     })
 }
 
@@ -362,6 +410,38 @@ impl Slicer<'_, '_, '_, '_> {
             && instr.op0_register().is_gpr32()
             && instr.op0_register().full_register() == reg
             && matches!(info.op0_access(), OpAccess::Write | OpAccess::ReadWrite)
+    }
+
+    /// Whether every bit of the full register `reg` from bit `bits` up is zero just before
+    /// `before`: its last write is a `movzx` from at most `bits` bits, or an `and` with a mask
+    /// below `1 << bits`, into a 32- or 64-bit register.
+    fn is_zero_above(&mut self, reg: Register, before: usize, bits: u32) -> bool {
+        let Some(at) = self.def(reg, before) else {
+            return false;
+        };
+        let instr = self.trace[at].instr;
+        if instr.op_count() != 2
+            || instr.op0_kind() != OpKind::Register
+            || !(instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64())
+        {
+            return false;
+        }
+        match instr.mnemonic() {
+            Mnemonic::Movzx => {
+                let src_bits = match instr.op1_kind() {
+                    OpKind::Register if !is_high_byte(instr.op1_register()) => {
+                        instr.op1_register().size() as u32 * 8
+                    }
+                    OpKind::Memory => instr.memory_size().size() as u32 * 8,
+                    _ => return false,
+                };
+                src_bits <= bits
+            }
+            Mnemonic::And => instr
+                .try_immediate(1)
+                .is_ok_and(|imm| imm & mask(instr.op0_register().size() as u32 * 8) <= mask(bits)),
+            _ => false,
+        }
     }
 
     /// Symbolic value of the full register `reg` just before position `before`.
@@ -1387,6 +1467,22 @@ impl Slicer<'_, '_, '_, '_> {
         let target_full = raw.reg.full_register();
 
         for _ in 0..=MAX_ALIAS_DEPTH {
+            if cur_reg == target_full
+                && raw.bits < 32
+                && raw.bits < cur_width
+                && self.is_zero_above(cur_reg, cur_pos, raw.bits)
+            {
+                // `movzx eax, dl; cmp al, 0x28; ja default`: the bits above the compared byte are
+                // zero, so an unsigned fact about the byte holds for the whole register (a signed
+                // one does not: a "negative" byte is a large zero-extended value).
+                return match raw.fact {
+                    fact @ (GuardFact::UnsignedUpper(_)
+                    | GuardFact::UnsignedLower(_)
+                    | GuardFact::Equal(_)
+                    | GuardFact::NotEqual(_)) => Some(fact),
+                    _ => None,
+                };
+            }
             if cur_reg == target_full {
                 let width_ok = raw.bits >= cur_width
                     || (raw.bits == 32
@@ -1575,6 +1671,13 @@ mod tests {
         &block.successors
     }
 
+    /// No bound was proven for the jump at `jmp`: it is unresolved or only inferred.
+    fn assert_not_proven(analysis: &Analysis, jmp: u32) {
+        if let Some(table) = analysis.jump_tables.get(&(TEXT + u64::from(jmp))) {
+            assert!(table.inferred, "bound must not be proven: {table:#x?}");
+        }
+    }
+
     fn assert_unresolved(analysis: &Analysis, jmp: u32) {
         assert!(analysis.jump_tables.is_empty());
         assert_eq!(
@@ -1598,6 +1701,7 @@ mod tests {
                     table: DATA,
                     targets: targets.to_vec(),
                     index: None,
+                    inferred: false,
                 }]
             );
             assert_eq!(analysis.functions.len(), 1);
@@ -1682,6 +1786,7 @@ mod tests {
                     table: DATA + 0x20,
                     len: 8,
                 }),
+                inferred: false,
             }
         );
         assert_eq!(
@@ -2006,11 +2111,110 @@ mod tests {
             let (code, cases, jmp_va) = stack_slot_switch(store);
             let data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
             let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
-            assert!(
-                !analysis.jump_tables.contains_key(&jmp_va),
-                "bound must not survive a possible write to the slot"
-            );
+            assert_not_proven(&analysis, (jmp_va - TEXT) as u32);
         }
+    }
+
+    /// `movzx eax, dl; cmp al, 2; <jcc> default; ...; jmp rcx` over a three-entry table.
+    fn byte_guard_switch(signed: bool) -> (Vec<u8>, [u64; 4], u64) {
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movzx(eax, dl)?;
+            a.cmp(al, 2)?;
+            if signed {
+                a.jg(def)?;
+            } else {
+                a.ja(def)?;
+            }
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        (code, cases, jmp_va)
+    }
+
+    #[test]
+    fn byte_guard_bounds_a_zero_extended_index() {
+        let (code, cases, jmp_va) = byte_guard_switch(false);
+        let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        data.extend_from_slice(&rva_table([DATA_RVA; 4])); // past the bound: never read
+        let analysis = analyze(&code, &data, &[0], &[]);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(!table.inferred);
+        assert_eq!(table.targets, cases[..3]);
+
+        // A signed byte guard does not bound the zero-extended value (0x80..0xff pass `jg`).
+        let (code, cases, jmp_va) = byte_guard_switch(true);
+        let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        data.extend_from_slice(&rva_table([DATA_RVA; 4]));
+        assert_unresolved(&analyze(&code, &data, &[0], &[]), (jmp_va - TEXT) as u32);
+    }
+
+    /// `jmp` through a table whose index is a remainder left by a loop (no guard bounds it).
+    fn loop_remainder_switch() -> (Vec<u8>, [u64; 4], u64) {
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def, mut top, mut tail) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.set_label(&mut top)?;
+            a.cmp(ecx, 3)?;
+            a.jb(tail)?;
+            a.sub(ecx, 3)?;
+            a.jmp(top)?;
+            a.set_label(&mut tail)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        (code, cases, jmp_va)
+    }
+
+    #[test]
+    fn infers_the_extent_of_a_table_without_a_provable_bound() {
+        let (code, cases, jmp_va) = loop_remainder_switch();
+        // Three cases inside the function, then an entry that leaves it (the next table, data).
+        let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        data.extend_from_slice(&rva_table([DATA_RVA, 0]));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(table.inferred);
+        assert_eq!(table.table, DATA);
+        assert_eq!(table.targets, cases[..3]);
+        assert_eq!(
+            jump_successors(&analysis.functions[&TEXT], jmp_va),
+            cases[..3]
+                .iter()
+                .map(|&c| Edge::JumpTable(c))
+                .collect::<Vec<_>>()
+        );
+
+        // Without a `.pdata` function the extent is not inferred.
+        let analysis = analyze(&code, &data, &[0], &[]);
+        assert_unresolved(&analysis, (jmp_va - TEXT) as u32);
+
+        // A single in-function entry is not a table.
+        let mut short = rva_table([(cases[0] - BASE) as u32]);
+        short.extend_from_slice(&rva_table([DATA_RVA, 0]));
+        let analysis = analyze(&code, &short, &[0], &[(0, code.len() as u32, 0)]);
+        assert!(analysis.jump_tables.is_empty());
     }
 
     #[test]
@@ -2109,7 +2313,9 @@ mod tests {
         let loop_head = code.len();
         code.extend([0x83, 0xfb, 0x03, 0x77, 0x00]); // cmp ebx, 3; ja done (patched)
         let ja_at = code.len() - 1;
-        code.extend([0x89, 0xd8, 0x49, 0x63, 0x04, 0x86, 0x4c, 0x01, 0xf0, 0xff, 0xe0]);
+        code.extend([
+            0x89, 0xd8, 0x49, 0x63, 0x04, 0x86, 0x4c, 0x01, 0xf0, 0xff, 0xe0,
+        ]);
         let jmp_va = TEXT + code.len() as u64 - 2;
         let mut cases = [0u64; 4];
         let mut call_at = None;
@@ -2148,8 +2354,16 @@ mod tests {
     #[test]
     fn resolves_switch_with_table_base_loaded_before_the_loop() {
         let (code, cases, jmp_va) = loop_switch(&[0xff, 0xc3], false);
-        let analysis = analyze(&code, &signed_offsets(&cases), &[0], &[(0, code.len() as u32, 0)]);
-        let jt = analysis.jump_tables.get(&jmp_va).expect("loop switch resolved");
+        let analysis = analyze(
+            &code,
+            &signed_offsets(&cases),
+            &[0],
+            &[(0, code.len() as u32, 0)],
+        );
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("loop switch resolved");
         assert_eq!(jt.table, DATA);
         assert_eq!(jt.targets, cases);
         assert_eq!(
@@ -2162,7 +2376,12 @@ mod tests {
     fn loop_switch_stays_unresolved_when_a_path_changes_the_base() {
         // case 3: mov r14, rbx; inc ebx: the base differs on one back edge.
         let (code, cases, jmp_va) = loop_switch(&[0x49, 0x89, 0xde, 0xff, 0xc3], false);
-        let analysis = analyze(&code, &signed_offsets(&cases), &[0], &[(0, code.len() as u32, 0)]);
+        let analysis = analyze(
+            &code,
+            &signed_offsets(&cases),
+            &[0],
+            &[(0, code.len() as u32, 0)],
+        );
         assert!(!analysis.jump_tables.contains_key(&jmp_va));
     }
 
@@ -2170,8 +2389,16 @@ mod tests {
     fn loop_switch_keeps_a_nonvolatile_base_across_calls() {
         // case 0 calls (a function entry at the next instruction); r14 survives the call.
         let (code, cases, jmp_va) = loop_switch(&[0xff, 0xc3], true);
-        let analysis = analyze(&code, &signed_offsets(&cases), &[0], &[(0, code.len() as u32, 0)]);
-        let jt = analysis.jump_tables.get(&jmp_va).expect("resolved across the call");
+        let analysis = analyze(
+            &code,
+            &signed_offsets(&cases),
+            &[0],
+            &[(0, code.len() as u32, 0)],
+        );
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("resolved across the call");
         assert_eq!(jt.targets, cases);
     }
 
@@ -2667,7 +2894,7 @@ mod tests {
         let cases_wrap = find_four_cases(&code_wrap);
         let jmp_wrap = (find_indirect_jmp(&code_wrap) - TEXT) as u32;
         let data_wrap = rva_table(cases_wrap.map(|va| (va - BASE) as u32));
-        assert_unresolved(
+        assert_not_proven(
             &analyze(
                 &code_wrap,
                 &data_wrap,
@@ -2697,7 +2924,7 @@ mod tests {
         let cases_neg = find_four_cases(&code_neg);
         let jmp_neg = (find_indirect_jmp(&code_neg) - TEXT) as u32;
         let data_neg = rva_table(cases_neg.map(|va| (va - BASE) as u32));
-        assert_unresolved(
+        assert_not_proven(
             &analyze(&code_neg, &data_neg, &[0], &[(0, code_neg.len() as u32, 0)]),
             jmp_neg,
         );

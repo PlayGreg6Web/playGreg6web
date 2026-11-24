@@ -151,6 +151,10 @@ pub struct JumpTable {
     pub targets: Vec<u64>,
     /// Set for the two-level variant.
     pub index: Option<JumpTableIndex>,
+    /// No bound on the index was proven: `targets` is the table's leading run of entries that
+    /// land inside the jumping function (`.pdata` range). The lifted `switch` on the computed
+    /// target sends every other value through the runtime dispatcher, as for an unresolved jump.
+    pub inferred: bool,
 }
 
 /// Category of a discovery problem.
