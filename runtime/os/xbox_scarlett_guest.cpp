@@ -1471,6 +1471,17 @@ void register_xbox_scarlett_guest_exports() {
         {"GameInput.dll", "GameInputCreate", 1, &pg6_gthunk_game_input_create},
         {"xg_xs.dll", "XGCreateTextureComputer", 0, &pg6_gthunk_xg_create_texture_computer},
         {"xg_xs.dll", "XGSuggestSwizzleMode", 0, &pg6_gthunk_xg_suggest_swizzle_mode},
+        {"AcpHal.dll", "AcpHalCreate", 0, &pg6_gthunk_acp_hal_create},
+        {"chad.dll", "XDspActivate", 0, &pg6_gthunk_xdsp_activate},
+        {"chad.dll", "XDspConnectWithMaximumStreamLimit", 0, &pg6_gthunk_xdsp_connect_with_maximum_stream_limit},
+        {"chad.dll", "XDspDeactivate", 0, &pg6_gthunk_xdsp_deactivate},
+        {"chad.dll", "XDspDisconnect", 0, &pg6_gthunk_xdsp_disconnect},
+        {"chad.dll", "XDspSubmitCommand", 0, &pg6_gthunk_xdsp_submit_command},
+        {"xapu.dll", "XApuConnect", 0, &pg6_gthunk_xapu_connect},
+        {"xapu.dll", "XApuDequeueResult", 0, &pg6_gthunk_xapu_dequeue_result},
+        {"xapu.dll", "XApuDisconnect", 0, &pg6_gthunk_xapu_disconnect},
+        {"xapu.dll", "XApuEnqueueCommand", 0, &pg6_gthunk_xapu_enqueue_command},
+        {"xapu.dll", "XApuGetResultCount", 0, &pg6_gthunk_xapu_get_result_count},
     };
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);

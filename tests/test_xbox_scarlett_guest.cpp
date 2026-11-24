@@ -279,6 +279,12 @@ uint64_t load64(uint64_t va) {
     return value;
 }
 
+uint32_t load32(uint64_t va) {
+    uint32_t value = 0;
+    CHECK(g_arena->read(va, &value, sizeof(value)));
+    return value;
+}
+
 void store64(uint64_t va, uint64_t value) {
     CHECK(g_arena->write(va, &value, sizeof(value)));
 }
@@ -1305,6 +1311,124 @@ void test_xg() {
     CHECK(as_hr(fx.dcall(create, {I(xg_desc(7, 16, 16, 1, 1, 28)), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
 }
 
+// AcpHalCreate: a guest object without an IUnknown prefix. Connect (0), submit (2), disconnect
+// (1), release (5); commands outside a connection fail; slots 3/4 trap.
+void test_acp_hal() {
+    Fixture fx;
+    const uint64_t create = fx.export_address("AcpHal.dll", "AcpHalCreate");
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(out)})) == 0);
+    const uint64_t hal = load64(out);
+    CHECK(hal != 0 && ga::acp_hal_state(hal).valid && !ga::acp_hal_state(hal).connected);
+
+    const uint64_t payload = com::guest_alloc(4);
+    CHECK(com::write_guest(payload, uint32_t{0xC0}));
+    CHECK(as_hr(fx.vcall(hal, 2, {I(2), I(0xF0F0F0F0u), I(0xFFFFFFFFu), I(payload), I(0)})) < 0);  // not connected
+    CHECK(as_hr(fx.vcall(hal, 0, {I(0x1000), I(0x1000)})) == 0);
+    CHECK(ga::acp_hal_state(hal).connected);
+    CHECK(as_hr(fx.vcall(hal, 2, {I(2), I(0xF0F0F0F0u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    CHECK(as_hr(fx.vcall(hal, 2, {I(5), I(0xF6F6F6F6u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    CHECK(as_hr(fx.vcall(hal, 2, {I(5), I(0xF6F6F6F6u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    CHECK(ga::acp_hal_state(hal).commands_2 == 1 && ga::acp_hal_state(hal).commands_5 == 2);
+    CHECK(as_hr(fx.vcall(hal, 0, {I(0), I(0x1000)})) == com::E_INVALIDARG_HR);
+
+    bool faulted = false;
+    try {
+        fx.vcall(hal, 3);
+    } catch (const GuestFault& f) {
+        faulted = f.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot);
+    }
+    CHECK(faulted);
+
+    CHECK(as_hr(fx.vcall(hal, 1)) == 0);
+    CHECK(!ga::acp_hal_state(hal).connected);
+    CHECK(fx.vcall(hal, 5) == 0);  // the last reference
+    CHECK(!ga::acp_hal_state(hal).valid);
+    CHECK(as_hr(fx.dcall(create, {I(0)})) == com::E_POINTER_HR);
+}
+
+// chad.dll XDsp in the executable's call shapes: connect hands out an opaque handle, activation
+// fails (no DSP) and clears both outputs, commands are accepted, disconnect forgets the handle.
+void test_xdsp() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("chad.dll", "XDspConnectWithMaximumStreamLimit");
+    const uint64_t activate = fx.export_address("chad.dll", "XDspActivate");
+    const uint64_t deactivate = fx.export_address("chad.dll", "XDspDeactivate");
+    const uint64_t disconnect = fx.export_address("chad.dll", "XDspDisconnect");
+    const uint64_t submit = fx.export_address("chad.dll", "XDspSubmitCommand");
+    const uint64_t memory = com::guest_alloc(0x1000);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(memory), I(0x1000), I(8), I(0x80), I(1), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    CHECK(handle != 0 && ga::xdsp_stats().connections == 1);
+    CHECK(as_hr(fx.dcall(connect, {I(0), I(0x1000), I(8), I(0x80), I(1), I(out)})) == com::E_INVALIDARG_HR);
+    CHECK(load64(out) == 0);
+
+    const uint64_t out_a = fx.out_slot();
+    const uint64_t out_b = fx.out_slot();
+    CHECK(com::write_guest(out_a, uint64_t{0x77}) && com::write_guest(out_b, uint64_t{0x77}));
+    const uint64_t params = com::guest_alloc(0x20);
+    CHECK(as_hr(fx.dcall(activate, {I(handle), I(params), I(out_a), I(out_b)})) == com::E_NOTIMPL_HR);
+    CHECK(load64(out_a) == 0 && load64(out_b) == 0);
+    CHECK(as_hr(fx.dcall(activate, {I(0x1234), I(params), I(out_a), I(out_b)})) == com::E_INVALIDARG_HR);
+
+    const uint64_t command = com::guest_alloc(0x40);
+    CHECK(as_hr(fx.dcall(submit, {I(handle), I(command)})) == 0);
+    CHECK(as_hr(fx.dcall(submit, {I(handle), I(0)})) == com::E_INVALIDARG_HR);
+    CHECK(as_hr(fx.dcall(submit, {I(0x1234), I(command)})) == com::E_INVALIDARG_HR);
+    CHECK(ga::xdsp_stats().commands == 1);
+
+    CHECK(as_hr(fx.dcall(deactivate, {I(0)})) == 0);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+    CHECK(ga::xdsp_stats().connections == 0);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == com::E_INVALIDARG_HR);
+}
+
+// xapu.dll in the executable's call shapes: commands 1, 2 and 5 are acknowledged with a result
+// {type, voice index} in order; other types get none; the count is returned directly.
+void test_xapu() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t count = fx.export_address("xapu.dll", "XApuGetResultCount");
+    const uint64_t dequeue = fx.export_address("xapu.dll", "XApuDequeueResult");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    CHECK(handle != 0);
+    // The second argument receives the shared voice memory: 128 input slots of 0x280 bytes,
+    // then 128 output slots of 0x1E00 bytes, zeroed.
+    const uint64_t shared = load64(p2);
+    CHECK(shared != 0);
+    CHECK(load64(shared) == 0 && load64(shared + 0x14000 + 0x7F * 0x1E00 + 0x1DF8) == 0);
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(0), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
+
+    auto command = [&](uint32_t type, uint32_t voice) {
+        const uint64_t c = com::guest_alloc(0x40);
+        const uint32_t head[2] = {type, voice};
+        CHECK(com::write_guest(c, head, sizeof(head)));
+        CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+    };
+    command(5, 7);
+    command(9, 3);  // not acknowledged
+    command(2, 7);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 2);
+    const uint64_t result = com::guest_alloc(0x38);
+    CHECK(com::write_guest(result + 0x30, uint64_t{~0ull}));
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+    CHECK(load32(result) == 5 && load32(result + 4) == 7 && load64(result + 0x30) == 0);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+    CHECK(load32(result) == 2 && load32(result + 4) == 7);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) < 0);  // empty
+    CHECK(ga::xapu_stats().commands == 3 && ga::xapu_stats().pending_results == 0);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1320,6 +1444,9 @@ int main() {
     test_game_input_readings();
     test_game_input_devices();
     test_xg();
+    test_acp_hal();
+    test_xdsp();
+    test_xapu();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xbox_scarlett_guest: %d failure(s)\n", g_failures);
         return 1;

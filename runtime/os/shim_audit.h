@@ -355,7 +355,7 @@
     X(pg6_mw_bink_get_platform_info, ok, "zeroes the first 8 bytes of the output") \
     X(pg6_mw_bink_free_globals, ok, "") \
     /* ---- AcpHal ---- */ \
-    X(pg6_mw_acp_hal_create, deny, "host COM: returns an IUnknown stub with a host vtable") \
+    X(pg6_mw_acp_hal_create, deny, "host COM: returns an IUnknown stub with a host vtable; gthunk: pg6_gthunk_acp_hal_create (R23)") \
     X(pg6_mw_acp_hal_allocate_shape_contexts, ok, "") \
     X(pg6_mw_acp_hal_release_shape_contexts, ok, "") \
     X(pg6_mw_apu_create_heap, ok, "") \
@@ -365,16 +365,16 @@
     X(pg6_mw_apu_map_apu_address, ok, "returns the block address (translated by the thunk)") \
     X(pg6_mw_apu_map_virtual_address, ok, "") \
     /* ---- xapu / chad (loopback sessions) ---- */ \
-    X(pg6_mw_xapu_connect, ok, "synthetic handle") \
-    X(pg6_mw_xapu_disconnect, ok, "") \
-    X(pg6_mw_xapu_enqueue_command, ok, "") \
-    X(pg6_mw_xapu_dequeue_result, ok, "") \
-    X(pg6_mw_xapu_get_result_count, ok, "") \
-    X(pg6_mw_xdsp_connect_with_maximum_stream_limit, ok, "synthetic handle") \
-    X(pg6_mw_xdsp_disconnect, ok, "") \
-    X(pg6_mw_xdsp_activate, ok, "") \
-    X(pg6_mw_xdsp_deactivate, ok, "") \
-    X(pg6_mw_xdsp_submit_command, ok, "") \
+    X(pg6_mw_xapu_connect, deny, "wrong call form (params, p2, &handle) and host-pointer handles; gthunk: pg6_gthunk_xapu_connect (R23)") \
+    X(pg6_mw_xapu_disconnect, deny, "host-pointer handle; gthunk: pg6_gthunk_xapu_disconnect (R23)") \
+    X(pg6_mw_xapu_enqueue_command, deny, "host-pointer handle, no results; gthunk: pg6_gthunk_xapu_enqueue_command (R23)") \
+    X(pg6_mw_xapu_dequeue_result, deny, "wrong call form (handle, &result); gthunk: pg6_gthunk_xapu_dequeue_result (R23)") \
+    X(pg6_mw_xapu_get_result_count, deny, "wrong call form (returns the count); gthunk: pg6_gthunk_xapu_get_result_count (R23)") \
+    X(pg6_mw_xdsp_connect_with_maximum_stream_limit, deny, "wrong call form (memory, size, limit, 0x80, 1, &handle) and host-pointer handles; gthunk: pg6_gthunk_xdsp_connect_with_maximum_stream_limit (R23)") \
+    X(pg6_mw_xdsp_disconnect, deny, "host-pointer handle; gthunk: pg6_gthunk_xdsp_disconnect (R23)") \
+    X(pg6_mw_xdsp_activate, deny, "wrong call form (handle, params, &out_a, &out_b); gthunk: pg6_gthunk_xdsp_activate (R23)") \
+    X(pg6_mw_xdsp_deactivate, deny, "host-pointer handle; gthunk: pg6_gthunk_xdsp_deactivate (R23)") \
+    X(pg6_mw_xdsp_submit_command, deny, "wrong call form (handle, command); gthunk: pg6_gthunk_xdsp_submit_command (R23)") \
     /* ---- amd_fidelityfx_loader_xbox ---- */ \
     X(pg6_mw_ffx_create_context, ok, "synthetic context handle; ignores the allocation callbacks") \
     X(pg6_mw_ffx_destroy_context, ok, "") \

@@ -408,6 +408,32 @@ inline constexpr uint32_t kXgDefaultSwizzleMode = 0x100u;  // the mode the title
 // win32::register_all_shim_exports().
 void register_xbox_scarlett_guest_exports();
 
+// AcpHal.dll!AcpHalCreate's guest object (acp_hal_guest.cpp): what a test can observe of the
+// IAcpHal at guest address `hal` (valid = false for anything else).
+struct AcpHalState {
+    bool valid = false;
+    bool connected = false;
+    uint64_t commands_2 = 0;  // submitted commands with id 2 / id 5
+    uint64_t commands_5 = 0;
+};
+AcpHalState acp_hal_state(uint64_t hal);
+
+// chad.dll XDsp guest model (acp_hal_guest.cpp): open connections and commands accepted.
+struct XDspStats {
+    uint64_t connections = 0;
+    uint64_t commands = 0;
+};
+XDspStats xdsp_stats();
+
+// xapu.dll guest model (acp_hal_guest.cpp): open connections, commands accepted, results not
+// yet dequeued.
+struct XApuStats {
+    uint64_t connections = 0;
+    uint64_t commands = 0;
+    uint64_t pending_results = 0;
+};
+XApuStats xapu_stats();
+
 // Tests only: stops the DirectStorage workers (waiting for running work), forgets the factory
 // singleton and zeroes the statistics. Call before reset_com_bridge().
 void reset_xbox_scarlett_guest();
@@ -428,5 +454,19 @@ void pg6_gthunk_game_input_create(void* state);
 void pg6_gthunk_xg_create_texture_computer(void* state);
 // xg_xs.dll!XGSuggestSwizzleMode(const XG_RESOURCE_DESC*, UINT32, UINT32* mode) -> HRESULT
 void pg6_gthunk_xg_suggest_swizzle_mode(void* state);
+// AcpHal.dll!AcpHalCreate(IAcpHal** hal) -> HRESULT (guest object without an IUnknown prefix)
+void pg6_gthunk_acp_hal_create(void* state);
+// chad.dll XDsp (acp_hal_guest.cpp has the call shapes)
+void pg6_gthunk_xdsp_connect_with_maximum_stream_limit(void* state);
+void pg6_gthunk_xdsp_activate(void* state);
+void pg6_gthunk_xdsp_deactivate(void* state);
+void pg6_gthunk_xdsp_disconnect(void* state);
+void pg6_gthunk_xdsp_submit_command(void* state);
+// xapu.dll (acp_hal_guest.cpp has the call shapes)
+void pg6_gthunk_xapu_connect(void* state);
+void pg6_gthunk_xapu_disconnect(void* state);
+void pg6_gthunk_xapu_enqueue_command(void* state);
+void pg6_gthunk_xapu_get_result_count(void* state);
+void pg6_gthunk_xapu_dequeue_result(void* state);
 
 }  // extern "C"
