@@ -189,7 +189,10 @@ pub fn no_return_thunks(analysis: &Analysis, no_return: &BTreeSet<u64>) -> BTree
 // ---------------------------------------------------------------------------------------------
 
 /// Instructions decoded when checking that a candidate without `.pdata` looks like code.
-pub const PROBE_INSTRUCTIONS: usize = 64;
+/// Large enough for long straight-line leaf functions (e.g. static initializers that fill a table
+/// with hundreds of `lea`/`mov` pairs before their `ret`); zero runs and other data that decodes
+/// without ever reaching a control-flow instruction still fail at this bound.
+pub const PROBE_INSTRUCTIONS: usize = 4096;
 
 /// Upper bound on discovery rounds of the fixpoint (each round adds at least one entry or
 /// no-return thunk, so real inputs converge in a handful).
@@ -658,4 +661,35 @@ pub fn check_import_slots(pe: &Pe64, plan: &BridgePlan, analysis: &Analysis) -> 
         }
     }
     check
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::code_image::CodeSection;
+
+    const TEXT: u64 = 0x1_4000_1000;
+
+    fn probe_code(code: &[u8]) -> Result<Vec<u64>, PointerStatus> {
+        let image = CodeImage::new(0x1_4000_0000, vec![CodeSection::new(TEXT, code, true)], vec![]);
+        probe(&image, TEXT)
+    }
+
+    #[test]
+    fn long_straight_line_leaf_function_is_code() {
+        // 1500 x `mov eax, 1` (5 bytes each), then `ret`: a static initializer shape.
+        let mut code: Vec<u8> = std::iter::repeat_n([0xb8, 1, 0, 0, 0], 1500).flatten().collect();
+        code.push(0xc3);
+        let starts = probe_code(&code).expect("plausible");
+        assert_eq!(starts.len(), 1501);
+    }
+
+    #[test]
+    fn data_without_control_flow_is_still_implausible() {
+        // A `nop` sled longer than the probe never reaches a control-flow instruction.
+        let code = vec![0x90u8; PROBE_INSTRUCTIONS + 10];
+        assert_eq!(probe_code(&code), Err(PointerStatus::Implausible));
+        assert_eq!(probe_code(&[0, 0, 0xc3]), Err(PointerStatus::Implausible));
+        assert_eq!(probe_code(&[0xcc, 0xc3]), Err(PointerStatus::Implausible));
+    }
 }
