@@ -494,8 +494,9 @@ void test_task_queue_callback_exception_is_unhandled() {
     CHECK(kind == static_cast<uint32_t>(FaultKind::UnhandledException));
     CHECK(fx.last_fault.detail == kCodeCaught);
     CHECK(g_log == "XF");  // kTry's handler is never consulted
-    // The queue is not closed: the fault left it with an in-flight callback (a test artifact of
-    // throwing out of the fault handler), and closing would wait for it.
+    // The exception left the callback by unwinding, which still released its in-flight count, so
+    // the queue closes without waiting (and without leaking).
+    pg6_gdk_xtask_queue_close_handle(queue);
 
     // Same for a guest exit handler raising: unhandled, not caught by the guest calling exit.
     pg6_crt_set_exit_hook(&throwing_exit_hook);

@@ -156,8 +156,29 @@ XTaskQueue::XTaskQueue(DispatchMode work_mode,
 }
 
 XTaskQueue::~XTaskQueue() {
-    terminate(true, false);
+    // Entries still queued own resources (their callbacks free them): cancel them so every
+    // cancellable one runs once with canceled=true instead of being destroyed unrun.
+    terminate(true, true);
 }
+
+namespace {
+
+// Counts a callback as active for its scope, also when the callback exits by an exception, so a
+// terminating queue never waits for a callback that is gone.
+template <typename Port>
+struct ActiveCallback {
+    explicit ActiveCallback(Port& p) : port(p) {}
+    ~ActiveCallback() {
+        std::lock_guard<std::mutex> lock(port.mutex);
+        --port.active_callbacks;
+        if (port.active_callbacks == 0) {
+            port.done_cv.notify_all();
+        }
+    }
+    Port& port;
+};
+
+}  // namespace
 
 void XTaskQueue::start_workers(Port& port, uint32_t count) {
     std::lock_guard<std::mutex> lock(port.join_mutex);
@@ -186,15 +207,10 @@ void XTaskQueue::worker_loop(Port& port) {
             ++port.active_callbacks;
         }
 
-        if (entry.callback) {
-            entry.callback(false);
-        }
-
         {
-            std::lock_guard<std::mutex> lock(port.mutex);
-            --port.active_callbacks;
-            if (port.active_callbacks == 0) {
-                port.done_cv.notify_all();
+            ActiveCallback<Port> active(port);
+            if (entry.callback) {
+                entry.callback(false);
             }
         }
     }
@@ -213,13 +229,9 @@ bool XTaskQueue::submit_to_port(Port& port, TaskEntry entry) {
             }
             ++port.active_callbacks;
         }
-        entry.callback(false);
         {
-            std::lock_guard<std::mutex> lock(port.mutex);
-            --port.active_callbacks;
-            if (port.active_callbacks == 0) {
-                port.done_cv.notify_all();
-            }
+            ActiveCallback<Port> active(port);
+            entry.callback(false);
         }
         return true;
     }
@@ -304,15 +316,10 @@ bool XTaskQueue::dispatch_from_port(Port& port, uint32_t timeout_ms) {
         ++port.active_callbacks;
     }
 
-    if (entry.callback) {
-        entry.callback(false);
-    }
-
     {
-        std::lock_guard<std::mutex> lock(port.mutex);
-        --port.active_callbacks;
-        if (port.active_callbacks == 0) {
-            port.done_cv.notify_all();
+        ActiveCallback<Port> active(port);
+        if (entry.callback) {
+            entry.callback(false);
         }
     }
     return true;

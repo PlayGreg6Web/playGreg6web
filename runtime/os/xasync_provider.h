@@ -136,6 +136,8 @@ void xasync_forget(XAsyncBlock* async_block);
 bool xasync_in_flight(XAsyncBlock* async_block);
 // Operation records held (diagnostics, leak tests).
 size_t xasync_record_count();
+// Queued task records (DoWork / completion entries) not yet run or released (leak tests).
+size_t xasync_task_count();
 
 }  // namespace playgta6::os::gdk
 

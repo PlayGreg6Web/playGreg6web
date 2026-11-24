@@ -1,3 +1,4 @@
+#include <atomic>
 #include "os/xasync_provider.h"
 
 #include <chrono>
@@ -153,7 +154,15 @@ void end_call(const OpRef& op) {
     maybe_cleanup(op);
 }
 
+std::atomic<size_t> g_live_tasks{0};
+
+// A queued DoWork/completion entry. Owned by the queue entry that carries it: freed when the
+// callback runs (normally or cancelled), which XTaskQueue guarantees for every accepted entry.
 struct Task {
+    explicit Task(OpRef o) : op(std::move(o)) { g_live_tasks.fetch_add(1, std::memory_order_relaxed); }
+    ~Task() { g_live_tasks.fetch_sub(1, std::memory_order_relaxed); }
+    Task(const Task&) = delete;
+    Task& operator=(const Task&) = delete;
     OpRef op;
 };
 
@@ -161,7 +170,7 @@ HResult submit(const OpRef& op, XTaskQueuePort port, XTaskQueueCallback fn) {
     if (op->queue == nullptr) {
         return E_FAIL_HR;
     }
-    auto* task = new Task{op};
+    auto* task = new Task(op);
     const HResult hr = XTaskQueueSubmitCallback(op->queue, port, task, fn);
     if (failed(hr)) {
         delete task;
@@ -233,7 +242,7 @@ void complete(const OpRef& op, HResult result, size_t required, bool explicit_ca
     const HResult hr = submit(op, XTaskQueuePort::Completion, &completion_entry);
     if (failed(hr)) {
         // The completion port refuses callbacks (terminated queue): no completion may be lost.
-        completion_entry(new Task{op}, false);
+        completion_entry(new Task(op), false);
     }
 }
 
@@ -659,6 +668,10 @@ void xasync_forget(XAsyncBlock* async_block) {
         reg.ops.erase(it);
     }
     maybe_cleanup(op);
+}
+
+size_t xasync_task_count() {
+    return g_live_tasks.load(std::memory_order_relaxed);
 }
 
 size_t xasync_record_count() {

@@ -345,6 +345,34 @@ void test_run() {
     pg6_gdk_xtask_queue_close_handle(queue);
 }
 
+// Entries still queued when the last handle closes (no terminate call) are cancelled by the
+// queue's destruction: every task record is released and each pending operation still completes
+// (E_ABORT) exactly once. Regression for the AddressSanitizer leaks at teardown.
+void test_pending_entries_released_at_queue_destruction() {
+    const size_t tasks_before = xasync_task_count();
+    {
+        XTaskQueueHandle queue = make_queue(0, 0);
+        // Pending DoWork never dispatched.
+        Script a;
+        Pg6XAsyncBlock b1 = make_block(queue, &a);
+        CHECK(pg6_gdk_xasync_begin(&b1, &a, &kIdentity, nullptr, &script_provider) == S_OK_HR);
+        // DoWork dispatched, completion left pending.
+        Script b;
+        Pg6XAsyncBlock b2 = make_block(queue, &b);
+        CHECK(pg6_gdk_xasync_begin(&b2, &b, &kIdentity, nullptr, &script_provider) == S_OK_HR);
+        CHECK(pg6_gdk_xtask_queue_dispatch(queue, kWork, 0) == 1);
+        CHECK(pg6_gdk_xtask_queue_dispatch(queue, kWork, 0) == 1);
+        Script c;
+        Pg6XAsyncBlock b3 = make_block(queue, &c);
+        CHECK(pg6_gdk_xasync_begin(&b3, &c, &kIdentity, nullptr, &script_provider) == S_OK_HR);
+        CHECK(xasync_task_count() > tasks_before);
+        pg6_gdk_xtask_queue_close_handle(queue);
+        CHECK(a.callbacks == 1 && b.callbacks == 1 && c.callbacks == 1);
+        CHECK(pg6_gdk_xasync_get_status(&b3, 0) == E_ABORT_HR);
+    }
+    CHECK(xasync_task_count() == tasks_before);
+}
+
 void test_ports_and_composite() {
     XTaskQueueHandle a = make_queue(0, 0);
     XTaskQueueHandle b = make_queue(0, 0);
@@ -485,6 +513,7 @@ int main() {
         {"cancel", test_cancel},
         {"wait_from_another_thread_and_threads", test_wait_from_another_thread_and_threads},
         {"run", test_run},
+        {"pending_entries_released_at_queue_destruction", test_pending_entries_released_at_queue_destruction},
         {"ports_and_composite", test_ports_and_composite},
         {"stress", test_stress},
     };
