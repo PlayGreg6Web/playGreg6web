@@ -639,6 +639,25 @@ HResult Device::create_resource(const GuestResourceDesc& desc, const GuestHeapPr
     return hand_out(std::move(resource), riid, out);
 }
 
+com::Ref<Resource> Device::create_internal_buffer(uint64_t size) {
+    GuestResourceDesc desc{};
+    desc.Dimension = ResourceDimension::Buffer;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleCount = 1;
+    desc.Layout = 1;  // ROW_MAJOR
+    Resource::Placement pl;
+    pl.heap.Type = HeapType::Default;
+    auto resource = com::create_object<Resource>(com::implements(kID3D12Resource), device_ref(this), desc, std::move(pl),
+                                                 uint32_t{0});
+    if (!resource || !resource->initialize()) {
+        return {};
+    }
+    return resource;
+}
+
 HResult Device::CreateCommittedResource(com::CallContext& ctx) {
     // (pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, riid, ppvResource)
     GuestHeapProperties props{};

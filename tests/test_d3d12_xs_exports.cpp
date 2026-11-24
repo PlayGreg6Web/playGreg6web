@@ -2383,7 +2383,11 @@ void test_xbox_rect_lists() {
                     dg::IID_ID3D12PipelineState, &result) == 0 &&
           result == dg::kEInvalidArg);
 
-    // A rectangle-list draw is skipped and described; a triangle-list draw after it is emitted.
+    // A rectangle-list draw becomes two triangles (v0 v1 v2, v2 v3 v0, v3 = v0 + v2 - v1) in a
+    // runtime-owned vertex buffer written at execute time; a triangle-list draw after it is emitted
+    // as it is; an indexed rectangle list is skipped and described.
+    const float verts[9] = {0.0f, 1.0f, 0.25f, 0.0f, 0.0f, 0.5f, 1.0f, 0.0f, 0.75f};
+    CHECK(com::write_guest(scene.vb_va, verts, sizeof(verts)));
     const uint64_t list = scene.new_list();
     CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
     fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
@@ -2394,16 +2398,34 @@ void test_xbox_rect_lists() {
     fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
     fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(dg::xbox::kTopologyRectList)});
     fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawIndexedInstanced, {I(3), I(1), I(0), I(0), I(0)});
     fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
     fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
     CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
     const size_t mark = fx.captured.size();
     scene.execute({list});
-    CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);
+    const auto ps = packets_since(fx, mark);
+    CHECK(count_op(ps, GpuOpcode::Draw) == 2);
+    const Packet* first = find_op(ps, GpuOpcode::Draw, 0);
+    const Packet* second = find_op(ps, GpuOpcode::Draw, 1);
+    CHECK(first != nullptr && payload_as<GpuDrawPayload>(*first).vertex_count == 6 &&
+          payload_as<GpuDrawPayload>(*first).first_vertex == 0);
+    CHECK(second != nullptr && payload_as<GpuDrawPayload>(*second).vertex_count == 3);
+    bool expanded = false;
+    for (const Packet& p : ps) {
+        if (p.opcode != GpuOpcode::WriteBuffer || payload_as<GpuWriteBufferPayload>(p).data_len != 72) {
+            continue;
+        }
+        float got[18];
+        std::memcpy(got, p.payload.data() + sizeof(GpuWriteBufferPayload), sizeof(got));
+        const float want[18] = {0, 1, 0.25f, 0, 0, 0.5f, 1, 0, 0.75f, 1, 0, 0.75f, 1, 1, 0.5f, 0, 1, 0.25f};
+        expanded = std::memcmp(got, want, sizeof(want)) == 0;
+    }
+    CHECK(expanded);
+    CHECK(counter(dev, dg::xbox::Counter::RectListDrawsExpanded) == 1);
     CHECK(counter(dev, dg::xbox::Counter::RectListDrawsSkipped) == 1 && dev->stats().skipped_draws == 1);
-    CHECK(contains(dev->skipped_draw_reports(), "rectangle-list topology"));
+    CHECK(contains(dev->skipped_draw_reports(), "indexed rectangle-list topology"));
     CHECK(contains(dev->skipped_draw_reports(), "topology type 3 (rectangle list)"));
-
     CHECK(t_balanced);
     scene.release_all({list, pso});
 }

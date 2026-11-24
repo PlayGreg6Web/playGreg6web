@@ -305,9 +305,16 @@ bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* 
 // rectangle entry becomes primitive topology type 19 (0x13) in the PRIMITIVE_TOPOLOGY subobject,
 // and command lists then set topology 17 (0x11), the GPU's DI_PT_RECTLIST primitive type (public
 // gfx10 register definitions): three vertices per rectangle, the fourth corner implied. The
-// per-frame full-screen pass draws one this way (DrawInstanced(3, 1)). Pipeline states accept the
-// type (as triangles, flagged); draws with the topology are skipped, because emitting them as
-// triangle lists would cover half of each rectangle (no fourth-vertex expansion yet).
+// per-frame full-screen pass draws one this way (DrawInstanced(3, 1), 59 in one boot; no indexed
+// or multi-instance rectangle lists were seen). In the title's rectangles v1 is the right-angle
+// corner, so the implied corner is v3 = v0 + v2 - v1. Pipeline states accept the type (as
+// triangles, flagged). Non-indexed draws are expanded on the guest side without packet changes:
+// at ExecuteCommandLists each rectangle's vertices, read from CPU-visible vertex buffers, become
+// two triangles (v0 v1 v2, v2 v3 v0) in a runtime-owned buffer (v3 computed per per-vertex
+// attribute in the input layout's format; integer formats wrap, normalized ones clamp). This is
+// exact when the vertex shader is affine in its inputs (the hardware derives the corner from the
+// shaded vertices). Indexed rectangle lists, GPU-only vertex buffers and formats without a
+// corner rule are skipped and described.
 inline constexpr uint32_t kTopologyTypeRect = 19;
 inline constexpr uint32_t kTopologyRectList = 17;
 
@@ -399,7 +406,8 @@ enum class Counter : size_t {
     ExecutesWithToken,
     IndirectSkipped,
     RectListPipelineStates,      // topology type kTopologyTypeRect accepted
-    RectListDrawsSkipped,        // draws with topology kTopologyRectList
+    RectListDrawsSkipped,        // draws with topology kTopologyRectList that were not expanded
+    RectListDrawsExpanded,       // ... expanded into triangle lists
     DepthBoundsIgnored,
     ShadingRateIgnored,
     StreamPipelineStates,

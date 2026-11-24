@@ -357,7 +357,23 @@ private:
     void record_root_arg(uint32_t index, uint8_t kind, uint64_t value, uint32_t count);
     const d3d::RootSignature* graphics_root_signature_ = nullptr;
     bool rect_list_ = false;  // IASetPrimitiveTopology(xbox::kTopologyRectList)
-    bool skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances);
+    bool skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
+    // Rectangle-list expansion (d3d12_xs_xbox.h): each rectangle's three vertices become two
+    // triangles (v0 v1 v2, v2 v3 v0) with v3 = v0 + v2 - v1 for every per-vertex attribute, written
+    // into list-owned vertex buffers at ExecuteCommandLists. False (with `why`) when not possible.
+    bool expand_rect_list_draw(uint32_t vertices, uint32_t instances, uint32_t start_vertex, uint32_t start_instance,
+                               std::string* why);
+    struct RectExpansion {
+        uint32_t buffer_id = 0;
+        uint64_t src = 0;  // guest address of the first source vertex
+        uint32_t stride = 0;
+        uint32_t rects = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> elements;  // (byte offset, DXGI format)
+    };
+    std::vector<RectExpansion> rect_expansions_;
+    std::vector<com::Ref<Resource>> rect_buffers_;  // reused across recordings
+    size_t rect_buffers_used_ = 0;
+    std::array<d3d12_xs::D3D12VertexBufferView, 32> bridge_vb_views_{};  // as last passed to the bridge
     void note_draw_for_dump();
     void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
     void describe_dropped_draw(const char* call, uint32_t count, uint32_t instances);

@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <map>
 
 #include "gpu/d3d12_guest_resources.h"
 
@@ -188,6 +191,9 @@ void CommandList::reset(PipelineState* initial_state) {
     rtv_handles_.clear();
     dsv_handle_ = 0;
     rect_list_ = false;
+    rect_expansions_.clear();
+    rect_buffers_used_ = 0;
+    bridge_vb_views_ = {};
     pinned_.clear();
     graphics_pso_ = nullptr;
     compute_pso_ = nullptr;
@@ -512,7 +518,11 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
         describe_skipped_draw("DrawInstanced", vertices, instances, "pipeline state without shader modules");
         return;
     }
-    if (skip_rect_list_draw("DrawInstanced", vertices, instances)) {
+    if (rect_list_) {
+        std::string why;
+        if (!expand_rect_list_draw(vertices, instances, start_vertex, start_instance, &why)) {
+            skip_rect_list_draw("DrawInstanced", vertices, instances, why.c_str());
+        }
         return;
     }
     const uint64_t dropped = bridge_.stats().draws_skipped;
@@ -520,6 +530,261 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
     if (bridge_.stats().draws_skipped != dropped) {
         describe_dropped_draw("DrawInstanced", vertices, instances);
     }
+}
+
+namespace {
+
+// Per-vertex attribute formats a rectangle's implied corner can be computed for: component count
+// and encoding. Integer formats use wrapping integer arithmetic, the others float arithmetic
+// (normalized formats clamped and rounded).
+enum class RectComp { F32, F16, Unorm8, Snorm8, Unorm16, Snorm16, U32, S32 };
+struct RectFormat {
+    RectComp comp;
+    uint32_t count;
+};
+
+bool rect_format(uint32_t dxgi, RectFormat* out) {
+    switch (dxgi) {
+        case 2: *out = {RectComp::F32, 4}; return true;   // R32G32B32A32_FLOAT
+        case 6: *out = {RectComp::F32, 3}; return true;   // R32G32B32_FLOAT
+        case 16: *out = {RectComp::F32, 2}; return true;  // R32G32_FLOAT
+        case 41: *out = {RectComp::F32, 1}; return true;  // R32_FLOAT
+        case 10: *out = {RectComp::F16, 4}; return true;  // R16G16B16A16_FLOAT
+        case 34: *out = {RectComp::F16, 2}; return true;  // R16G16_FLOAT
+        case 54: *out = {RectComp::F16, 1}; return true;  // R16_FLOAT
+        case 28: case 87: case 88: *out = {RectComp::Unorm8, 4}; return true;  // R8G8B8A8 / B8G8R8A8 / B8G8R8X8_UNORM
+        case 49: *out = {RectComp::Unorm8, 2}; return true;  // R8G8_UNORM
+        case 61: *out = {RectComp::Unorm8, 1}; return true;  // R8_UNORM
+        case 31: *out = {RectComp::Snorm8, 4}; return true;  // R8G8B8A8_SNORM
+        case 51: *out = {RectComp::Snorm8, 2}; return true;  // R8G8_SNORM
+        case 11: *out = {RectComp::Unorm16, 4}; return true;  // R16G16B16A16_UNORM
+        case 35: *out = {RectComp::Unorm16, 2}; return true;  // R16G16_UNORM
+        case 13: *out = {RectComp::Snorm16, 4}; return true;  // R16G16B16A16_SNORM
+        case 37: *out = {RectComp::Snorm16, 2}; return true;  // R16G16_SNORM
+        case 3: *out = {RectComp::U32, 4}; return true;  // R32G32B32A32_UINT
+        case 7: *out = {RectComp::U32, 3}; return true;
+        case 17: *out = {RectComp::U32, 2}; return true;
+        case 42: *out = {RectComp::U32, 1}; return true;
+        case 4: *out = {RectComp::S32, 4}; return true;  // R32G32B32A32_SINT
+        case 8: *out = {RectComp::S32, 3}; return true;
+        case 18: *out = {RectComp::S32, 2}; return true;
+        case 43: *out = {RectComp::S32, 1}; return true;
+        default: return false;
+    }
+}
+
+uint32_t rect_comp_bytes(RectComp c) {
+    switch (c) {
+        case RectComp::F32: case RectComp::U32: case RectComp::S32: return 4;
+        case RectComp::F16: case RectComp::Unorm16: case RectComp::Snorm16: return 2;
+        default: return 1;
+    }
+}
+
+float half_to_float(uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    float v;
+    if (exp == 0) {
+        v = std::ldexp(static_cast<float>(man), -24);
+    } else if (exp == 31) {
+        v = man != 0 ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+    } else {
+        v = std::ldexp(static_cast<float>(man | 0x400), static_cast<int>(exp) - 25);
+    }
+    return sign ? -v : v;
+}
+
+uint16_t float_to_half(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const uint16_t sign = static_cast<uint16_t>((x >> 16) & 0x8000);
+    const int32_t exp = static_cast<int32_t>((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t man = x & 0x7FFFFF;
+    if (((x >> 23) & 0xFF) == 0xFF) {
+        return sign | 0x7C00 | (man != 0 ? 0x200 : 0);
+    }
+    if (exp >= 31) {
+        return sign | 0x7C00;
+    }
+    if (exp <= 0) {
+        if (exp < -10) {
+            return sign;
+        }
+        man |= 0x800000;
+        const uint32_t shift = static_cast<uint32_t>(14 - exp);
+        uint32_t m = man >> shift;
+        if ((man >> (shift - 1)) & 1) {
+            ++m;  // round half up
+        }
+        return sign | static_cast<uint16_t>(m);
+    }
+    uint32_t h = (static_cast<uint32_t>(exp) << 10) | (man >> 13);
+    if (man & 0x1000) {
+        ++h;  // round half up (may carry into the exponent, which is correct)
+    }
+    return sign | static_cast<uint16_t>(h);
+}
+
+// One component of the implied corner: d = a + c - b.
+void rect_corner_component(RectComp k, const uint8_t* a, const uint8_t* b, const uint8_t* c, uint8_t* d) {
+    auto rd = [](const uint8_t* p, auto t) {
+        decltype(t) v;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+    };
+    switch (k) {
+        case RectComp::F32: {
+            const float v = rd(a, 0.0f) + rd(c, 0.0f) - rd(b, 0.0f);
+            std::memcpy(d, &v, 4);
+            break;
+        }
+        case RectComp::F16: {
+            const uint16_t v = float_to_half(half_to_float(rd(a, uint16_t{})) + half_to_float(rd(c, uint16_t{})) -
+                                             half_to_float(rd(b, uint16_t{})));
+            std::memcpy(d, &v, 2);
+            break;
+        }
+        case RectComp::Unorm8: {
+            const int v = int{*a} + int{*c} - int{*b};
+            *d = static_cast<uint8_t>(std::clamp(v, 0, 255));
+            break;
+        }
+        case RectComp::Snorm8: {
+            const int v = int{static_cast<int8_t>(*a)} + int{static_cast<int8_t>(*c)} - int{static_cast<int8_t>(*b)};
+            *d = static_cast<uint8_t>(static_cast<int8_t>(std::clamp(v, -127, 127)));
+            break;
+        }
+        case RectComp::Unorm16: {
+            const int v = int{rd(a, uint16_t{})} + int{rd(c, uint16_t{})} - int{rd(b, uint16_t{})};
+            const uint16_t o = static_cast<uint16_t>(std::clamp(v, 0, 65535));
+            std::memcpy(d, &o, 2);
+            break;
+        }
+        case RectComp::Snorm16: {
+            const int v = int{rd(a, int16_t{})} + int{rd(c, int16_t{})} - int{rd(b, int16_t{})};
+            const int16_t o = static_cast<int16_t>(std::clamp(v, -32767, 32767));
+            std::memcpy(d, &o, 2);
+            break;
+        }
+        case RectComp::U32:
+        case RectComp::S32: {
+            const uint32_t v = rd(a, uint32_t{}) + rd(c, uint32_t{}) - rd(b, uint32_t{});
+            std::memcpy(d, &v, 4);
+            break;
+        }
+    }
+}
+
+}  // namespace
+
+bool CommandList::expand_rect_list_draw(uint32_t vertices, uint32_t instances, uint32_t start_vertex,
+                                        uint32_t start_instance, std::string* why) {
+    const GraphicsPsoSource* src = graphics_pso_ != nullptr ? graphics_pso_->graphics_source() : nullptr;
+    if (src == nullptr) {
+        *why = "rectangle-list topology without a graphics pipeline description";
+        return false;
+    }
+    if (vertices == 0 || vertices % 3 != 0) {
+        *why = "rectangle-list draw with a vertex count that is not a multiple of 3";
+        return false;
+    }
+    const pso::D3D12GraphicsPsoDesc& d = src->desc;
+    // Per-vertex slots and their elements (per-instance slots are left as they are).
+    std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> slots;
+    std::array<uint32_t, 32> next_offset{};
+    for (uint32_t i = 0; i < d.NumInputElements && d.pInputElementDescs != nullptr; ++i) {
+        const pso::D3D12InputElementDesc& e = d.pInputElementDescs[i];
+        const uint32_t fmt = static_cast<uint32_t>(e.Format);
+        RectFormat rf{};
+        if (e.InputSlot >= 32) {
+            *why = "rectangle-list draw with an input slot out of range";
+            return false;
+        }
+        const uint32_t offset = e.AlignedByteOffset == pso::kD3D12AppendAlignedElement ? next_offset[e.InputSlot]
+                                                                                       : e.AlignedByteOffset;
+        if (!rect_format(fmt, &rf)) {
+            *why = "rectangle-list draw with vertex format " + std::to_string(fmt) + " (implied corner not computed)";
+            return false;
+        }
+        next_offset[e.InputSlot] = offset + rf.count * rect_comp_bytes(rf.comp);
+        if (e.InputSlotClass == pso::D3D12InputClassification::PerVertexData) {
+            slots[e.InputSlot].emplace_back(offset, fmt);
+        }
+    }
+    const uint32_t rects = vertices / 3;
+    std::vector<std::pair<uint32_t, RectExpansion>> plan;
+    for (const auto& [slot, elements] : slots) {
+        const VertexBufferRecord& vb = vertex_buffers_[slot];
+        if (vb.va == 0 || vb.stride == 0) {
+            *why = "rectangle-list draw without a vertex buffer in slot " + std::to_string(slot);
+            return false;
+        }
+        for (const auto& [offset, fmt] : elements) {
+            RectFormat rf{};
+            rect_format(fmt, &rf);
+            if (offset + rf.count * rect_comp_bytes(rf.comp) > vb.stride) {
+                *why = "rectangle-list draw with an element beyond the vertex stride";
+                return false;
+            }
+        }
+        if (uint64_t{start_vertex + vertices} * vb.stride > vb.size) {
+            *why = "rectangle-list draw beyond its vertex buffer";
+            return false;
+        }
+        const uint64_t cpu = device_->cpu_address_for_gpu(vb.va);
+        uint8_t probe = 0;
+        if (!com::read_guest(cpu, &probe, 1)) {
+            *why = "rectangle-list draw from a vertex buffer without CPU-visible memory";
+            return false;
+        }
+        RectExpansion x;
+        x.src = cpu + uint64_t{start_vertex} * vb.stride;
+        x.stride = vb.stride;
+        x.rects = rects;
+        x.elements = elements;
+        plan.emplace_back(slot, std::move(x));
+    }
+    // List-owned vertex buffers, reused across recordings.
+    std::vector<std::pair<uint32_t, d3d12_xs::D3D12VertexBufferView>> views;
+    for (auto& [slot, x] : plan) {
+        const uint64_t bytes = uint64_t{x.rects} * 6 * x.stride;
+        if (rect_buffers_used_ == rect_buffers_.size() || rect_buffers_[rect_buffers_used_]->desc().Width < bytes) {
+            com::Ref<Resource> buffer = device_->create_internal_buffer(std::max<uint64_t>(bytes, 4096));
+            if (!buffer) {
+                *why = "rectangle-list draw: no vertex buffer for the expansion";
+                return false;
+            }
+            if (rect_buffers_used_ == rect_buffers_.size()) {
+                rect_buffers_.push_back(std::move(buffer));
+            } else {
+                rect_buffers_[rect_buffers_used_] = std::move(buffer);
+            }
+        }
+        Resource* buffer = rect_buffers_[rect_buffers_used_++].get();
+        x.buffer_id = buffer->id();
+        d3d12_xs::D3D12VertexBufferView v{};
+        v.buffer_id = buffer->id();
+        v.offset = 0;
+        v.size_in_bytes = static_cast<uint32_t>(bytes);
+        v.stride_in_bytes = x.stride;
+        views.emplace_back(slot, v);
+        rect_expansions_.push_back(std::move(x));
+    }
+    for (const auto& [slot, v] : views) {
+        bridge_.IASetVertexBuffers(slot, 1, &v);
+    }
+    bridge_.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const uint64_t dropped = bridge_.stats().draws_skipped;
+    bridge_.DrawInstanced(rects * 6, instances, 0, start_instance);
+    if (bridge_.stats().draws_skipped != dropped) {
+        describe_dropped_draw("DrawInstanced (expanded rectangle list)", rects * 6, instances);
+    }
+    for (const auto& [slot, v] : views) {
+        bridge_.IASetVertexBuffers(slot, 1, &bridge_vb_views_[slot]);
+    }
+    bridge_.IASetPrimitiveTopology(static_cast<pso::D3DPrimitiveTopology>(xbox::kTopologyRectList));
+    device_->count(xbox::Counter::RectListDrawsExpanded);
+    return true;
 }
 
 void CommandList::note_draw_for_dump() {
@@ -530,15 +795,15 @@ void CommandList::note_draw_for_dump() {
     }
 }
 
-// Rectangle lists (d3d12_xs_xbox.h) have no WebGPU topology and need a fourth-vertex expansion;
-// as triangle lists they would cover half of each rectangle, so such draws are skipped.
-bool CommandList::skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances) {
+// Rectangle-list draws that cannot be expanded are skipped: as triangle lists they would cover
+// half of each rectangle.
+bool CommandList::skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances, const char* reason) {
     if (!rect_list_) {
         return false;
     }
     device_->note_skipped_draw();
     device_->count(xbox::Counter::RectListDrawsSkipped);
-    describe_skipped_draw(call, count, instances, "rectangle-list topology (fourth-vertex expansion not emulated)");
+    describe_skipped_draw(call, count, instances, reason);
     return true;
 }
 
@@ -553,7 +818,8 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
         describe_skipped_draw("DrawIndexedInstanced", indices, instances, "pipeline state without shader modules");
         return;
     }
-    if (skip_rect_list_draw("DrawIndexedInstanced", indices, instances)) {
+    if (skip_rect_list_draw("DrawIndexedInstanced", indices, instances,
+                            "indexed rectangle-list topology (not expanded; the title draws none)")) {
         return;
     }
     const uint64_t dropped = bridge_.stats().draws_skipped;
@@ -734,6 +1000,42 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
             }
         }
         device_->note_upload(w.size);
+    }
+    // Rectangle-list expansions: the source vertices as they are now, three per rectangle, become
+    // two triangles (v0 v1 v2, v2 v3 v0) with v3 = v0 + v2 - v1 per per-vertex attribute.
+    for (const RectExpansion& x : rect_expansions_) {
+        std::vector<uint8_t> in(static_cast<size_t>(uint64_t{x.rects} * 3 * x.stride));
+        if (!com::read_guest(x.src, in.data(), in.size())) {
+            device_->note_bad_argument("ExecuteCommandLists: rectangle-list vertices at " + hex(x.src) +
+                                       " no longer readable");
+            continue;
+        }
+        std::vector<uint8_t> out_bytes(static_cast<size_t>(uint64_t{x.rects} * 6 * x.stride));
+        for (uint32_t r = 0; r < x.rects; ++r) {
+            const uint8_t* v0 = in.data() + size_t{r} * 3 * x.stride;
+            const uint8_t* v1 = v0 + x.stride;
+            const uint8_t* v2 = v1 + x.stride;
+            uint8_t* o = out_bytes.data() + size_t{r} * 6 * x.stride;
+            std::vector<uint8_t> v3(v0, v0 + x.stride);
+            for (const auto& [offset, fmt] : x.elements) {
+                RectFormat rf{};
+                rect_format(fmt, &rf);
+                const uint32_t cb = rect_comp_bytes(rf.comp);
+                for (uint32_t c = 0; c < rf.count; ++c) {
+                    const uint32_t at = offset + c * cb;
+                    rect_corner_component(rf.comp, v0 + at, v1 + at, v2 + at, v3.data() + at);
+                }
+            }
+            for (const uint8_t* v : {v0, v1, v2, v2, static_cast<const uint8_t*>(v3.data()), v0}) {
+                std::memcpy(o, v, x.stride);
+                o += x.stride;
+            }
+        }
+        for (uint64_t off = 0; off < out_bytes.size(); off += kMaxWriteChunk) {
+            const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, out_bytes.size() - off);
+            out.write_buffer(x.buffer_id, static_cast<uint32_t>(off), out_bytes.data() + off, static_cast<uint32_t>(n));
+        }
+        device_->note_upload(out_bytes.size());
     }
     device_->resource_states().execute(bridge_.resource_states(), state_diagnostics);
 }
@@ -1111,6 +1413,7 @@ void CommandList::IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t vi
     if (views == 0) {
         for (uint32_t i = 0; i < count; ++i) {
             vertex_buffers_[start + i] = VertexBufferRecord{};
+            bridge_vb_views_[start + i] = d3d12_xs::D3D12VertexBufferView{};
         }
         bridge_.IASetVertexBuffers(start, count, nullptr);
         return;
@@ -1132,6 +1435,7 @@ void CommandList::IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t vi
         }
         v[i].size_in_bytes = g[i].SizeInBytes;
         v[i].stride_in_bytes = g[i].StrideInBytes;
+        bridge_vb_views_[start + i] = v[i];
     }
     bridge_.IASetVertexBuffers(start, count, v.data());
 }

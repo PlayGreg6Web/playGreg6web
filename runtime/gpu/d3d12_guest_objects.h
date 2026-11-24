@@ -684,6 +684,8 @@ public:
     // Pipeline dump (DeviceOptions::dump_dir), null when off. flush_pipeline_dump rewrites the
     // manifest (also done every 60 presents and when the device is destroyed).
     PipelineDump* pipeline_dump() const { return dump_.get(); }
+    // A GPU-only buffer owned by the runtime (rectangle-list expansion); empty on failure.
+    com::Ref<Resource> create_internal_buffer(uint64_t size);
     void flush_pipeline_dump();
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
