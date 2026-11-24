@@ -56,12 +56,20 @@ const CONTAINING_BLOCK_SCAN: usize = 8;
 /// Longest chain of blocks (the jump's block plus sole predecessors) sliced for a jump table.
 const MAX_TRACE_BLOCKS: usize = 4;
 
-/// Incoming intra-function edges of a block: how many, and one of them.
-#[derive(Clone, Copy)]
+/// Blocks visited when looking for the definitions of a register that reach a merge block.
+const MAX_REACH_BLOCKS: usize = 256;
+
+/// Times one resolved jump table may be replaced by a changed resolution.
+const MAX_TABLE_REVISIONS: u32 = 8;
+
+/// Incoming intra-function edges of a block: how many, one of them, and every source block
+/// (`others` holds the sources beyond `from`).
+#[derive(Clone)]
 struct Pred {
     count: u32,
     from: u64,
     edge: Edge,
+    others: Vec<u64>,
 }
 
 /// Where an address falls relative to already decoded blocks.
@@ -104,7 +112,7 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
     }
     state.run();
     loop {
-        while state.resolve_jump_tables() {
+        while state.resolve_jump_tables() || state.revise_jump_tables() {
             state.run();
         }
         if !state.add_late_resume_targets() {
@@ -162,6 +170,8 @@ struct Discovery<'i, 'a> {
     /// `jmp reg` sites decoded since the last jump-table round.
     pending_jumps: BTreeSet<u64>,
     jump_tables: BTreeMap<u64, JumpTable>,
+    /// How often each resolved table was revised (see `revise_jump_tables`).
+    table_revisions: HashMap<u64, u32>,
     /// `setjmp`-family IAT slots ([`CodeImage::eh`]).
     setjmp_slots: HashSet<u64>,
     /// Resume targets with their owning function: `(owner entry, target)`.
@@ -181,6 +191,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             entries: BTreeSet::new(),
             pending_jumps: BTreeSet::new(),
             jump_tables: BTreeMap::new(),
+            table_revisions: HashMap::new(),
             setjmp_slots: image.eh.setjmp_slots.iter().copied().collect(),
             resume_roots: BTreeSet::new(),
             return_sites: BTreeSet::new(),
@@ -538,11 +549,15 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 if let Some(target) = edge.intra_target() {
                     preds
                         .entry(target)
-                        .and_modify(|p| p.count += 1)
+                        .and_modify(|p| {
+                            p.count += 1;
+                            p.others.push(from);
+                        })
                         .or_insert(Pred {
                             count: 1,
                             from,
                             edge,
+                            others: Vec::new(),
                         });
                 }
             }
@@ -581,6 +596,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             chain.push((prev, taken));
             current = pred.from;
         }
+        let first_block = current;
         let mut trace = Vec::new();
         for (block, taken) in chain.into_iter().rev() {
             let last = block.instructions.len().saturating_sub(1);
@@ -595,7 +611,102 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     }),
             );
         }
-        jump_table::resolve(self.image, &trace)
+        if let Some(table) = jump_table::resolve(self.image, &trace) {
+            return Some(table);
+        }
+        // The chain stops at a merge (e.g. a loop header): a table base loaded before the merge
+        // is invisible to the slice. Registers the trace reads before writing them whose value
+        // at the merge is one RIP-relative `lea` constant on every incoming path are made
+        // explicit as `lea reg, [rip+X]` in front of the trace, and the slice runs again.
+        let prefix: Vec<Instruction> = live_in_registers(&trace)
+            .into_iter()
+            .filter_map(|reg| {
+                let va = self.reaching_rip_lea(first_block, reg, preds)?;
+                synthetic_rip_lea(reg, va)
+            })
+            .collect();
+        if prefix.is_empty() {
+            return None;
+        }
+        let mut extended: Vec<Step<'_>> = prefix
+            .iter()
+            .map(|instr| Step { instr, taken: None })
+            .collect();
+        extended.extend(trace.iter().copied());
+        jump_table::resolve(self.image, &extended)
+    }
+
+    /// The constant every intra-function path into `block` leaves in the 64-bit register `reg`,
+    /// when each path's last write to it is `lea reg, [rip+X]` with the same `X` (loops that do
+    /// not write `reg` are followed around). `None` if any path writes `reg` differently,
+    /// crosses a call while `reg` is volatile, reaches a function entry, or the search exceeds
+    /// [`MAX_REACH_BLOCKS`].
+    fn reaching_rip_lea(
+        &self,
+        block: u64,
+        reg: iced_x86::Register,
+        preds: &HashMap<u64, Pred>,
+    ) -> Option<u64> {
+        let volatile = is_volatile_register(reg);
+        let mut info = iced_x86::InstructionInfoFactory::new();
+        let mut value: Option<u64> = None;
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut stack: Vec<u64> = Vec::new();
+        let push_preds = |of: u64, stack: &mut Vec<u64>| -> Option<()> {
+            let pred = preds.get(&of)?;
+            stack.push(pred.from);
+            stack.extend(pred.others.iter().copied());
+            Some(())
+        };
+        if self.entries.contains(&block) {
+            return None;
+        }
+        push_preds(block, &mut stack)?;
+        while let Some(at) = stack.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            if seen.len() > MAX_REACH_BLOCKS {
+                return None;
+            }
+            let pred_block = self.blocks.get(&at)?;
+            let mut defined = false;
+            for instr in pred_block.instructions.iter().rev() {
+                if volatile && matches!(instr.flow_control(), FlowControl::Call | FlowControl::IndirectCall) {
+                    return None;
+                }
+                let writes = info.info(instr).used_registers().iter().any(|used| {
+                    used.register().full_register() == reg
+                        && matches!(
+                            used.access(),
+                            iced_x86::OpAccess::Write
+                                | iced_x86::OpAccess::CondWrite
+                                | iced_x86::OpAccess::ReadWrite
+                                | iced_x86::OpAccess::ReadCondWrite
+                        )
+                });
+                if !writes {
+                    continue;
+                }
+                let constant = (instr.mnemonic() == Mnemonic::Lea
+                    && instr.op0_register() == reg
+                    && instr.is_ip_rel_memory_operand())
+                .then(|| instr.ip_rel_memory_address())?;
+                if value.is_some_and(|v| v != constant) {
+                    return None;
+                }
+                value = Some(constant);
+                defined = true;
+                break;
+            }
+            if !defined {
+                if self.entries.contains(&at) {
+                    return None;
+                }
+                push_preds(at, &mut stack)?;
+            }
+        }
+        value
     }
 
     /// Try every jump decoded since the last round. Returns whether any table was resolved.
@@ -612,6 +723,43 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .collect();
         let progress = !resolved.is_empty();
         for table in resolved {
+            if let Some(block) = self
+                .jump_block(table.site)
+                .and_then(|start| self.blocks.get_mut(&start))
+            {
+                let targets: BTreeSet<u64> = table.targets.iter().copied().collect();
+                block.successors = targets.into_iter().map(Edge::JumpTable).collect();
+            }
+            for &target in &table.targets {
+                self.add_leader(target);
+            }
+            self.jump_tables.insert(table.site, table);
+        }
+        progress
+    }
+
+    /// Re-match every resolved table against the current CFG and adopt a changed resolution.
+    /// A table resolved early can be too narrow: e.g. a switch in a loop whose index is zeroed
+    /// before the loop resolves to the first case only until the loop's back edges are known.
+    /// New targets become leaders (the caller runs the worklist again). Resolutions that no
+    /// longer match at all are left to [`Self::verify_jump_tables`]. Each table is revised at most
+    /// [`MAX_TABLE_REVISIONS`] times, so the rounds terminate.
+    fn revise_jump_tables(&mut self) -> bool {
+        let preds = self.predecessors();
+        let changed: Vec<JumpTable> = self
+            .jump_tables
+            .iter()
+            .filter(|(site, _)| {
+                self.table_revisions.get(site).copied().unwrap_or(0) < MAX_TABLE_REVISIONS
+            })
+            .filter_map(|(site, table)| {
+                let now = self.match_jump_table(*site, &preds)?;
+                (now != *table).then_some(now)
+            })
+            .collect();
+        let progress = !changed.is_empty();
+        for table in changed {
+            *self.table_revisions.entry(table.site).or_insert(0) += 1;
             if let Some(block) = self
                 .jump_block(table.site)
                 .and_then(|start| self.blocks.get_mut(&start))
@@ -751,6 +899,54 @@ impl<'i, 'a> Discovery<'i, 'a> {
 }
 
 /// Slot VA read by a RIP-relative indirect `call`/`jmp`.
+/// `lea reg, [rip+X]` with `ip_rel_memory_address() == va`, decoded from its encoding (`disp32`
+/// 0 at `ip = va - 7`), so the slicer sees exactly what such an instruction in the image would be.
+fn synthetic_rip_lea(reg: iced_x86::Register, va: u64) -> Option<Instruction> {
+    let n = reg.number() as u8;
+    let bytes = [0x48 | ((n >> 3) << 2), 0x8D, ((n & 7) << 3) | 0x05, 0, 0, 0, 0];
+    let mut decoder = Decoder::with_ip(64, &bytes, va.wrapping_sub(7), DecoderOptions::NONE);
+    let instr = decoder.decode();
+    (!instr.is_invalid() && instr.op0_register() == reg && instr.ip_rel_memory_address() == va)
+        .then_some(instr)
+}
+
+/// Win64 volatile (caller-saved) general purpose registers: a call may change them.
+fn is_volatile_register(reg: iced_x86::Register) -> bool {
+    use iced_x86::Register as R;
+    matches!(reg, R::RAX | R::RCX | R::RDX | R::R8 | R::R9 | R::R10 | R::R11)
+}
+
+/// 64-bit general purpose registers (other than `rsp`) the trace reads before it writes them.
+fn live_in_registers(trace: &[Step<'_>]) -> Vec<iced_x86::Register> {
+    use iced_x86::OpAccess;
+    let mut info = iced_x86::InstructionInfoFactory::new();
+    let mut written: Vec<iced_x86::Register> = Vec::new();
+    let mut live: Vec<iced_x86::Register> = Vec::new();
+    for step in trace {
+        let used = info.info(step.instr).used_registers().to_vec();
+        for u in &used {
+            let full = u.register().full_register();
+            if !full.is_gpr64() || full == iced_x86::Register::RSP {
+                continue;
+            }
+            let reads = matches!(
+                u.access(),
+                OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+            );
+            if reads && !written.contains(&full) && !live.contains(&full) {
+                live.push(full);
+            }
+        }
+        for u in &used {
+            let full = u.register().full_register();
+            if full.is_gpr64() && matches!(u.access(), OpAccess::Write | OpAccess::ReadWrite) {
+                written.push(full);
+            }
+        }
+    }
+    live
+}
+
 fn rip_slot(instr: &Instruction) -> Option<u64> {
     (instr.op_count() > 0 && instr.op_kind(0) == OpKind::Memory && instr.is_ip_rel_memory_operand())
         .then(|| instr.ip_rel_memory_address())

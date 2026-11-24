@@ -1921,6 +1921,91 @@ mod tests {
         assert_eq!(jt.targets, cases);
     }
 
+    /// A switch inside a loop whose table base was loaded before the loop:
+    /// ```text
+    ///   0: lea r14, [rip+DATA]         7: xor ebx, ebx
+    ///   9: loop: cmp ebx, 3            c: ja done
+    ///   e: mov eax, ebx               10: movsxd rax, dword [r14+rax*4]
+    ///  14: add rax, r14               17: jmp rax
+    ///  19..: four cases `<case_body>; jmp loop`, then done: ret
+    /// ```
+    /// The dispatch's predecessor chain stops at the loop header (entry + four back edges), so the
+    /// `lea` is only visible through the definitions reaching the header.
+    fn loop_switch(case3_body: &[u8], call_in_case0: bool) -> (Vec<u8>, [u64; 4], u64) {
+        let mut code = Vec::new();
+        let disp = (DATA as i64 - (TEXT as i64 + 7)) as i32;
+        code.extend([0x4c, 0x8d, 0x35]);
+        code.extend(disp.to_le_bytes());
+        code.extend([0x31, 0xdb]); // xor ebx, ebx
+        let loop_head = code.len();
+        code.extend([0x83, 0xfb, 0x03, 0x77, 0x00]); // cmp ebx, 3; ja done (patched)
+        let ja_at = code.len() - 1;
+        code.extend([0x89, 0xd8, 0x49, 0x63, 0x04, 0x86, 0x4c, 0x01, 0xf0, 0xff, 0xe0]);
+        let jmp_va = TEXT + code.len() as u64 - 2;
+        let mut cases = [0u64; 4];
+        let mut call_at = None;
+        for (i, case) in cases.iter_mut().enumerate() {
+            *case = TEXT + code.len() as u64;
+            match i {
+                0 if call_in_case0 => {
+                    call_at = Some(code.len());
+                    code.extend([0xe8, 0, 0, 0, 0, 0xff, 0xc3]); // call callee; inc ebx
+                }
+                3 => code.extend(case3_body),
+                _ => code.extend([0xff, 0xc3]), // inc ebx
+            }
+            let rel = loop_head as i64 - (code.len() as i64 + 2);
+            code.extend([0xeb, rel as i8 as u8]); // jmp loop
+        }
+        let done = code.len();
+        code[ja_at] = (done - (ja_at + 1)) as u8;
+        code.push(0xc3);
+        if let Some(at) = call_at {
+            // The callee: a separate function after `done`.
+            let rel = (code.len() - (at + 5)) as i32;
+            code[at + 1..at + 5].copy_from_slice(&rel.to_le_bytes());
+            code.push(0xc3);
+        }
+        (code, cases, jmp_va)
+    }
+
+    fn signed_offsets(cases: &[u64]) -> Vec<u8> {
+        cases
+            .iter()
+            .flat_map(|&va| ((va as i64 - DATA as i64) as i32).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn resolves_switch_with_table_base_loaded_before_the_loop() {
+        let (code, cases, jmp_va) = loop_switch(&[0xff, 0xc3], false);
+        let analysis = analyze(&code, &signed_offsets(&cases), &[0], &[(0, code.len() as u32, 0)]);
+        let jt = analysis.jump_tables.get(&jmp_va).expect("loop switch resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+        assert_eq!(
+            jump_successors(&analysis.functions[&TEXT], jmp_va),
+            cases.map(Edge::JumpTable)
+        );
+    }
+
+    #[test]
+    fn loop_switch_stays_unresolved_when_a_path_changes_the_base() {
+        // case 3: mov r14, rbx; inc ebx: the base differs on one back edge.
+        let (code, cases, jmp_va) = loop_switch(&[0x49, 0x89, 0xde, 0xff, 0xc3], false);
+        let analysis = analyze(&code, &signed_offsets(&cases), &[0], &[(0, code.len() as u32, 0)]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+    }
+
+    #[test]
+    fn loop_switch_keeps_a_nonvolatile_base_across_calls() {
+        // case 0 calls (a function entry at the next instruction); r14 survives the call.
+        let (code, cases, jmp_va) = loop_switch(&[0xff, 0xc3], true);
+        let analysis = analyze(&code, &signed_offsets(&cases), &[0], &[(0, code.len() as u32, 0)]);
+        let jt = analysis.jump_tables.get(&jmp_va).expect("resolved across the call");
+        assert_eq!(jt.targets, cases);
+    }
+
     #[test]
     fn resolves_table_relative_signed_offset_switch() {
         // `lea rdx, [rip + DATA]; movsxd rcx, dword ptr [rdx + rax*4]; add rcx, rdx; jmp rcx`
