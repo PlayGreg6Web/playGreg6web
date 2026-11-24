@@ -60,7 +60,10 @@
 //     FindUserById, ...); the executable keeps {handle, s11 XUID, s9 8-byte value} per user and
 //     rebuilds that record from the value through s10 (value, &handle), i.e. FindUserByLocalId.
 //     s3 DuplicateHandle(2) h. Stubs: s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
-//     s25 GetTokenAndSignatureResult; s13, s14, s19 are unidentified.
+//     s25 GetTokenAndSignatureResult. s13 GetIsGuest(2) h: the executable passes a one-byte
+//     local and stores it as a flag (header order: FindUserById, GetIsGuest, ...); the local
+//     offline user is not a guest. s19 has the shape of GetAgeGroup (a 4-byte result kept only
+//     when 1..3) and stays a stub (age group is reported, not answered); s14 is unidentified.
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
@@ -638,6 +641,16 @@ public:
             return E_INVALIDARG_HR;
         }
         local_id.write(kOfflineUserLocalId);
+        return S_OK_HR;
+    }
+
+    // s13 XUserGetIsGuest(user, bool* isGuest): the runtime's one local user is a real local
+    // account, not a guest. Claims nothing about sign-in, privileges or ownership.
+    int32_t GetIsGuest(uint64_t user, GuestPtr<uint8_t> is_guest) {
+        if (!check_handle(users(), user, "XUserHandle") || is_guest.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        is_guest.write(0);
         return S_OK_HR;
     }
 
@@ -1247,9 +1260,9 @@ constexpr auto kUserTable = slot_table<32>({
     {10, US::stub("XUserFindUserByLocalId")},
     {11, US::method<&UserApi::GetId>("XUserGetId")},
     {12, US::stub("XUserFindUserById")},
-    {13, US::stub("XUser slot 13 (unidentified)")},
+    {13, US::method<&UserApi::GetIsGuest>("XUserGetIsGuest")},
     {14, US::stub("XUser slot 14 (unidentified)")},
-    {19, US::stub("XUser slot 19 (unidentified)")},
+    {19, US::stub("XUser slot 19 (GetAgeGroup shape)")},
     {20, US::method<&UserApi::CheckPrivilege>("XUserCheckPrivilege")},
     {21, US::method<&UserApi::ResolvePrivilegeWithUiAsync>("XUserResolvePrivilegeWithUiAsync")},
     {22, US::method<&UserApi::ResolvePrivilegeWithUiResult>("XUserResolvePrivilegeWithUiResult")},

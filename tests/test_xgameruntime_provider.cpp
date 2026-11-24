@@ -607,6 +607,12 @@ void test_user_slots() {
     CHECK(local_id != 0 && local_id != playgta6::os::gdk::kOfflineUserXuid);
     CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == 0 && load64(out) == local_id);
     CHECK(hr32(fx.vcall(user_api, 9, {user, 0})) == com::E_INVALIDARG_HR);
+    // XUserGetIsGuest (s13): the local user is not a guest; invalid without an out pointer.
+    const uint64_t guest_flag = fx.alloc(8);
+    CHECK(com::write_guest(guest_flag, uint64_t{0xff}));
+    CHECK(hr32(fx.vcall(user_api, 13, {user, guest_flag})) == 0);
+    CHECK((load64(guest_flag) & 0xff) == 0);
+    CHECK(hr32(fx.vcall(user_api, 13, {user, 0})) == com::E_INVALIDARG_HR);
     // XUserDuplicateHandle (s3): a second handle to the same local user, closed independently.
     const uint64_t dup_out = fx.alloc(8);
     CHECK(hr32(fx.vcall(user_api, 3, {user, dup_out})) == 0);
