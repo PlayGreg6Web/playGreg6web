@@ -1,6 +1,7 @@
 """Keeps the runtime shim export table (runtime/os/shim_exports.cpp) in sync with the shim headers.
 
-Every `extern "C"` function named pg6_win32_* / pg6_gdk_* declared in runtime/os/*.h must be
+Every `extern "C"` function named pg6_win32_* / pg6_gdk_* declared in runtime/os/*.h (and
+pg6_d3d12_* in runtime/gpu/d3d12_xs.h, the d3d12_xs.dll exports) must be
 registered in the table or listed in EXCLUDED_SHIMS; the table may not name symbols that do not
 exist; and each export name must map back to its shim symbol under the R5 import-bridge rule
 (recomp/src/stubs.rs `name_key`: ASCII-lowercase, underscores removed) unless listed in
@@ -14,9 +15,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OS_DIR = REPO_ROOT / "runtime" / "os"
 TABLE_CPP = OS_DIR / "shim_exports.cpp"
+GPU_SHIM_HEADERS = [REPO_ROOT / "runtime" / "gpu" / "d3d12_xs.h"]
 
-SHIM_RE = re.compile(r"\b(pg6_(?:win32|gdk)_\w+)\s*\(")
-ENTRY_RE = re.compile(r'^\s*E\((\w+),\s*"([^"]+)",\s*(pg6_(?:win32|gdk)_\w+)\)', re.MULTILINE)
+SHIM_RE = re.compile(r"\b(pg6_(?:win32|gdk|d3d12)_\w+)\s*\(")
+ENTRY_RE = re.compile(r'^\s*E\((\w+),\s*"([^"]+)",\s*(pg6_(?:win32|gdk|d3d12)_\w+)\)', re.MULTILINE)
 MODULE_RE = re.compile(r'#define PG6_MOD_(\w+)\s+"([^"]+)"')
 
 # Declared shims that are intentionally NOT exported: symbol -> reason. Currently every shim
@@ -38,6 +40,7 @@ MODULE_PREFIX = {
     "USER32.dll": "pg6_win32_",
     "combase.dll": "pg6_win32_",
     "xgameruntime.dll": "pg6_gdk_",
+    "d3d12_xs.dll": "pg6_d3d12_",
 }
 XBL_PREFIX = ("microsoft.xbox.services", "pg6_gdk_")
 
@@ -54,7 +57,7 @@ def strip_comments(text: str) -> str:
 def declared_shims() -> dict[str, str]:
     """symbol -> header file name, for every shim declared inside an extern "C" block."""
     found: dict[str, str] = {}
-    for header in sorted(OS_DIR.glob("*.h")):
+    for header in sorted(OS_DIR.glob("*.h")) + GPU_SHIM_HEADERS:
         text = strip_comments(header.read_text(encoding="utf-8"))
         for block in re.finditer(r'extern\s+"C"\s*\{', text):
             depth, i = 1, block.end()

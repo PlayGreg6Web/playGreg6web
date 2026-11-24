@@ -511,3 +511,15 @@ private:
 };
 
 }  // namespace playgta6::gpu::d3d12_xs
+
+// d3d12_xs.dll C-ABI exports (G24, implemented in gpu/d3d12_xs_exports.cpp; see that header). Declared
+// here because the R5 import bridge scans this header for pg6_d3d12_* shims. Pointer parameters are
+// host-translated guest pointers; out parameters receive guest addresses. Return HRESULTs.
+extern "C" {
+
+int32_t pg6_d3d12_d3d12_xbox_create_device(void* adapter, const void* parameters, const void* riid,
+                                           uint64_t* device);
+int32_t pg6_d3d12_d3d12_serialize_versioned_root_signature(const void* desc, uint64_t* blob, uint64_t* error_blob);
+int32_t pg6_d3d12_d3d12_configure_virtual_memory_x(const void* configuration);
+
+}  // extern "C"

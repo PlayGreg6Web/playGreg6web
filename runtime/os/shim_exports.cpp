@@ -10,6 +10,7 @@
 #include "os/xbox_offline.h"
 #include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime.h"
+#include "gpu/d3d12_xs_exports.h"
 #include "os/xgameruntime_provider.h"
 
 namespace {
@@ -25,6 +26,7 @@ namespace {
 #define PG6_MOD_CMB "combase.dll"
 #define PG6_MOD_XGR "xgameruntime.dll"
 #define PG6_MOD_XBL "Microsoft.Xbox.Services.141.GDK.C.Thunks.dll"
+#define PG6_MOD_D3D "d3d12_xs.dll"
 
 // Second name of the XSAPI thunk module (toolset-independent spelling); same export set as XBL.
 constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.dll";
@@ -321,7 +323,10 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(USR, "ShowWindow", pg6_win32_show_window) \
     E(USR, "PeekMessageA", pg6_win32_peek_message_a) \
     E(USR, "TranslateMessage", pg6_win32_translate_message) \
-    E(USR, "DispatchMessageA", pg6_win32_dispatch_message_a)
+    E(USR, "DispatchMessageA", pg6_win32_dispatch_message_a) \
+    E(D3D, "D3D12XboxCreateDevice", pg6_d3d12_d3d12_xbox_create_device) \
+    E(D3D, "D3D12SerializeVersionedRootSignature", pg6_d3d12_d3d12_serialize_versioned_root_signature) \
+    E(D3D, "D3D12ConfigureVirtualMemoryX", pg6_d3d12_d3d12_configure_virtual_memory_x)
 
 #define PG6_SHIM_ENTRY(mod, name, fn) \
     Pg6ShimExport{PG6_MOD_##mod, name, #fn, playgta6::os::win32::proc_address(&fn)},
@@ -359,6 +364,8 @@ size_t register_all_shim_exports() {
         gdk::provider::register_xgameruntime_provider();
         // Guest-callable XCRDAPI.dll / GameInput.dll / xg_xs.dll entry points (O23).
         scarlett::guest_api::register_xbox_scarlett_guest_exports();
+        // Guest-callable thunks for the d3d12_xs.dll exports (GetProcAddress hands those out).
+        playgta6::gpu::d3d12_xs_exports::register_d3d12_xs_exports();
     });
     return registered;
 }

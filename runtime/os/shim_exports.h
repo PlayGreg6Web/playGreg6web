@@ -22,6 +22,9 @@
 //                                                  XSystem, XNetworking, XStore
 //   Microsoft.Xbox.Services.141.GDK.C.Thunks.dll   Xbl* (XSAPI C API); also reachable as
 //   (and Microsoft.Xbox.Services.GDK.C.Thunks.dll) the unversioned alias
+//   d3d12_xs.dll                                   D3D12XboxCreateDevice, D3D12SerializeVersioned-
+//                                                  RootSignature, D3D12ConfigureVirtualMemoryX
+//                                                  (pg6_d3d12_*, gpu/d3d12_xs_exports.h)
 //
 // The name <-> symbol mapping lives in exactly one place, the PG6_SHIM_EXPORTS table in
 // shim_exports.cpp; tests/test_shim_exports.py checks it against the headers (every declared shim

@@ -1,0 +1,609 @@
+#pragma once
+
+// Guest-facing D3D12 objects for d3d12_xs.dll (G24), built on the guest COM bridge (O16,
+// guest/com_bridge.h) and driving the G6 descriptor heaps / root signatures, the G7 PSO cache and
+// the G20 state bridge.
+//
+// Guest code reaches every D3D12 method as `mov rax,[rcx]; call [rax+8*slot]` on interface pointers
+// that d3d12_xs_exports.h hands out. Each interface below is a declarative com::declare_interface
+// table in the slot order established from the real executable (static analysis, local only; only
+// slot indices, argument counts, call-site counts and IIDs are recorded here):
+//
+// Evidence summary (game_scarlett_master.exe)
+// -------------------------------------------
+// * D3D12XboxCreateDevice is called once, with adapter = null, a 0x50-byte parameter block on the
+//   stack and riid = IID_ID3D12Device11; the device lands in one global and is copied into 11 more.
+//   Interface pointers were followed from there (globals, call arguments, return values, queue
+//   wrapper objects): 42 distinct device slots in 54 functions (~93 call sites).
+// * ID3D12Device: the public ID3D12Device order holds for slots 0..43. Confirmed by IID arguments
+//   at the public creation slots (8 queue, 9 allocator, 14 descriptor heap, 16 root signature,
+//   27 committed resource, 36 fence, 39 query heap, 41 command signature), by argument counts
+//   (15 GetDescriptorHandleIncrementSize 2, 17 CreateConstantBufferView 3, 18 CreateShaderResourceView
+//   4, 19 CreateUnorderedAccessView 5, 24 CopyDescriptorsSimple 5) and by the struct-returning shape
+//   of 25 GetResourceAllocationInfo / 26 GetCustomHeapProperties. From slot 44 on the public order
+//   does NOT hold: slot 48 returns an ID3D12CommandQueue from a 16-byte queue descriptor (4 calls),
+//   slot 73 an ID3D12GraphicsCommandList from (16-byte descriptor, allocator, PSO, riid, out)
+//   (3 calls), slots 55/57/67/86 return ID3D12PipelineState objects, 101 an ID3D12StateObject,
+//   127 an ID3D12Resource with the CreateCommittedResource3 argument shape (heap properties, heap
+//   flags, DESC1, initial layout, clear value, protected session, castable formats, riid, out) and
+//   133 an ID3D12Resource from (address, desc, initial state, clear value, riid, out) (5 calls).
+//   Slots 49, 50, 61, 62, 70, 71, 74, 78, 79, 80, 81, 108, 119, 132 are Xbox-specific with no public
+//   counterpart. Unestablished slots stay logging stubs.
+// * Struct returns: at slots 25/26 (and Xbox slot 108) the caller passes the hidden result pointer
+//   in rcx and `this` in rdx (C-style), not `this` first as MSVC member functions do. Struct-
+//   returning methods here accept both orders (SretMethods below) and count which one they saw.
+// * Inlined accessors: 11 functions compare the byte at [device + 0x18] against 0 before writing
+//   descriptors straight into descriptor memory; a non-zero byte makes them call
+//   CopyDescriptorsSimple / CreateConstantBufferView instead. The device payload sets it to 1.
+// * ID3D12CommandQueue: GetTimestampFrequency is slot 18 (out u64, result divided into a float),
+//   Signal is slot 16 (fence, value), i.e. the public slots shifted by +2: two extra methods sit
+//   between slots 3 and 15, so ExecuteCommandLists (public 10) is NOT established and stays a stub.
+//   The submission thread executes command lists through slot 35 (this, count, lists, handle,
+//   flags) and presents through slot 32 (plane count, plane array, parameters).
+// * ID3D12GraphicsCommandList: created by device slot 73 and immediately closed through slot 9
+//   (public Close); slots 131/132 (Xbox-specific) are called on a fresh list. List pointers live in
+//   heap-allocated pools that static analysis cannot follow, so the remaining slots follow the
+//   public order with low confidence (no contradicting evidence).
+// * Allocators, descriptor heaps, fences, root signatures: only Release (slot 2) was observed on
+//   tracked pointers; their method slots follow the public order (low confidence).
+//
+// Lifetime: bridge refcounting; children hold a com::Ref to their device. Unimplemented slots of
+// every interface are logging stubs with SlotPolicy::ReturnNotImpl (first call logged with the slot
+// index, every call counted in com::stub_hit_report()).
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "gpu/cmd_encoder.h"
+#include "gpu/d3d12_guest_structs.h"
+#include "gpu/descriptor_heap.h"
+#include "gpu/pso_cache.h"
+#include "gpu/state_bridge.h"
+#include "guest/com_bridge.h"
+
+namespace playgta6::gpu::d3d12_guest {
+
+namespace com = playgta6::guest::com;
+namespace d3d = playgta6::gpu::d3d12_state;
+using com::GuestPtr;
+using com::Guid;
+using com::HResult;
+using com::InterfaceArg;
+using com::OutPtr;
+
+// ---------------------------------------------------------------------------------------------
+// HRESULTs and IIDs (public values)
+// ---------------------------------------------------------------------------------------------
+
+inline constexpr HResult kSOk = 0;
+inline constexpr HResult kSFalse = 1;
+inline constexpr HResult kEInvalidArg = static_cast<HResult>(0x80070057u);
+inline constexpr HResult kEOutOfMemory = static_cast<HResult>(0x8007000Eu);
+inline constexpr HResult kEPointer = static_cast<HResult>(0x80004003u);
+inline constexpr HResult kENoInterface = static_cast<HResult>(0x80004002u);
+inline constexpr HResult kENotImpl = static_cast<HResult>(0x80004001u);
+inline constexpr HResult kEFail = static_cast<HResult>(0x80004005u);
+inline constexpr HResult kDxgiErrorNotFound = static_cast<HResult>(0x887A0002u);
+inline constexpr HResult kDxgiErrorMoreData = static_cast<HResult>(0x887A0003u);
+
+inline constexpr Guid IID_ID3D12Object = com::make_guid("c4fec28f-7966-4e95-9f94-f431cb56c3b8");
+inline constexpr Guid IID_ID3D12DeviceChild = com::make_guid("905db94b-a00c-4140-9df5-2b64ca9ea357");
+inline constexpr Guid IID_ID3D12Pageable = com::make_guid("63ee58fb-1268-4835-86da-f008ce62f0d6");
+inline constexpr Guid IID_ID3D12Device = com::make_guid("189819f1-1db6-4b57-be54-1821339b85f7");
+inline constexpr Guid IID_ID3D12Device11 = com::make_guid("5405c344-d457-444e-b4dd-2366e45aee39");
+inline constexpr Guid IID_ID3D12CommandQueue = com::make_guid("0ec870a6-5d7e-4c22-8cfc-5baae07616ed");
+inline constexpr Guid IID_ID3D12CommandAllocator = com::make_guid("6102dee4-af59-4b09-b999-b44d73f09b24");
+inline constexpr Guid IID_ID3D12CommandList = com::make_guid("7116d91c-e7e4-47ce-b8c6-ec8168f437e5");
+inline constexpr Guid IID_ID3D12GraphicsCommandList = com::make_guid("5b160d0f-ac1b-4185-8ba8-b3ae42a5a455");
+inline constexpr Guid IID_ID3D12DescriptorHeap = com::make_guid("8efb471d-616c-4f49-90f7-127bb763fa51");
+inline constexpr Guid IID_ID3D12RootSignature = com::make_guid("c54a6b66-72df-4ee8-8be5-a946a1429214");
+inline constexpr Guid IID_ID3D12Fence = com::make_guid("0a753dcf-c4d8-4b91-adf6-be5a60d95a76");
+inline constexpr Guid IID_ID3D12Fence1 = com::make_guid("433685fe-e22b-4ca0-a8db-b5b4f4dd0e4a");
+inline constexpr Guid IID_ID3D12QueryHeap = com::make_guid("0d9658ae-ed45-469e-a61d-970ec583cab4");
+inline constexpr Guid IID_ID3D12CommandSignature = com::make_guid("c36a797c-ec80-4f0a-8985-a7b2475082d1");
+inline constexpr Guid IID_ID3D12Resource = com::make_guid("696442be-a72e-4059-bc79-5b5c98040fad");
+inline constexpr Guid IID_ID3D12Heap = com::make_guid("6b3b2502-6e51-45b3-90ee-9884265e8df3");
+inline constexpr Guid IID_ID3D12PipelineState = com::make_guid("765a30f3-f624-4c6f-a828-ace948622445");
+inline constexpr Guid IID_ID3DBlob = com::make_guid("8ba5fb08-5195-40e2-ac58-0d989c3a0102");
+
+// ---------------------------------------------------------------------------------------------
+// Struct-returning methods (hidden result pointer in either rcx or rdx, see the header comment)
+// ---------------------------------------------------------------------------------------------
+
+struct SretStats {
+    uint64_t this_first = 0;    // rcx = this, rdx = result (MSVC member convention)
+    uint64_t result_first = 0;  // rcx = result, rdx = this (observed in the executable)
+};
+SretStats sret_stats();
+void reset_sret_stats();
+
+namespace detail {
+void note_sret(bool this_first);
+bool resolve_sret_this(GuestState& state, const void* host_tag, com::detail::Resolved* out, bool* this_first);
+
+template <typename Host, auto M, typename R, typename... A, size_t... I>
+void invoke_sret(com::CallContext& ctx, Host* self, uint64_t hidden, std::tuple<A...>*, std::index_sequence<I...>) {
+    R result{};
+    com::detail::marshal_call<void, A...>(
+        ctx, 2u, [&](auto&&... args) { result = (self->*M)(std::forward<decltype(args)>(args)...); },
+        std::index_sequence<I...>{});
+    if (!com::write_guest(hidden, result)) {
+        com::detail::log_bad_pointer("hidden result pointer", hidden);
+    }
+    ctx.set_rax(hidden);
+}
+
+template <typename Host, auto M>
+void sret_thunk(void* raw_state) {
+    using Traits = com::detail::MemberFn<decltype(M)>;
+    using R = typename Traits::Ret;
+    using Params = typename Traits::Params;
+    static_assert(std::is_class_v<R> && std::is_trivially_copyable_v<R>, "struct-returning methods only");
+    GuestState& state = *static_cast<GuestState*>(raw_state);
+    com::detail::Resolved r;
+    bool this_first = true;
+    resolve_sret_this(state, com::detail::type_tag<Host>(), &r, &this_first);
+    com::GuestStateScope scope(state);
+    const uint64_t self = this_first ? state.gpr[GuestReg::Rcx] : state.gpr[GuestReg::Rdx];
+    const uint64_t hidden = this_first ? state.gpr[GuestReg::Rdx] : state.gpr[GuestReg::Rcx];
+    com::CallContext ctx{state, self, r.object.get(), r.iface, state.gpr[GuestReg::Rsp]};
+    invoke_sret<Host, M, R>(ctx, static_cast<Host*>(r.host), hidden, static_cast<Params*>(nullptr),
+                            std::make_index_sequence<std::tuple_size_v<Params>>{});
+    com::detail::pop_return(state);
+}
+}  // namespace detail
+
+template <typename Host>
+struct Methods : com::Methods<Host> {
+    template <auto M>
+    static constexpr com::MethodDesc sret(const char* name) {
+        return com::MethodDesc{name, &detail::sret_thunk<Host, M>};
+    }
+};
+
+// ---------------------------------------------------------------------------------------------
+// Host interfaces
+// ---------------------------------------------------------------------------------------------
+
+// ID3D12Object (slots 3..6).
+struct IObjectHost {
+    virtual HResult GetPrivateData(const Guid& guid, GuestPtr<uint32_t> data_size, uint64_t data) = 0;
+    virtual HResult SetPrivateData(const Guid& guid, uint32_t data_size, uint64_t data) = 0;
+    virtual HResult SetPrivateDataInterface(const Guid& guid, uint64_t unknown) = 0;
+    virtual HResult SetName(uint64_t name) = 0;
+};
+
+// ID3D12DeviceChild (slot 7).
+struct IDeviceChildHost : IObjectHost {
+    virtual HResult GetDevice(const Guid& riid, OutPtr device) = 0;
+};
+
+class Device;
+
+// Private data / name storage shared by every object (ID3D12Object semantics).
+class PrivateData {
+public:
+    HResult get(const Guid& guid, GuestPtr<uint32_t> data_size, uint64_t data);
+    HResult set(const Guid& guid, uint32_t data_size, uint64_t data);
+    HResult set_interface(const Guid& guid, uint64_t unknown);
+    HResult set_name(uint64_t name);
+    std::u16string name() const;
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, std::vector<uint8_t>> entries_;  // key: raw GUID bytes
+    std::u16string name_;
+};
+
+template <typename Iface>
+class ObjectBase : public com::ComObject, public Iface {
+public:
+    HResult GetPrivateData(const Guid& guid, GuestPtr<uint32_t> size, uint64_t data) override {
+        return data_.get(guid, size, data);
+    }
+    HResult SetPrivateData(const Guid& guid, uint32_t size, uint64_t data) override {
+        return data_.set(guid, size, data);
+    }
+    HResult SetPrivateDataInterface(const Guid& guid, uint64_t unknown) override {
+        return data_.set_interface(guid, unknown);
+    }
+    HResult SetName(uint64_t name) override { return data_.set_name(name); }
+    std::u16string debug_name() const { return data_.name(); }
+
+private:
+    PrivateData data_;
+};
+
+template <typename Iface>
+class ChildBase : public ObjectBase<Iface> {
+public:
+    explicit ChildBase(com::Ref<Device> device) : device_(std::move(device)) {}
+    HResult GetDevice(const Guid& riid, OutPtr out) override;
+    Device& device() const { return *device_; }
+
+protected:
+    com::Ref<Device> device_;
+};
+
+// ID3DBlob: 3 GetBufferPointer, 4 GetBufferSize.
+struct IBlobHost {
+    virtual uint64_t GetBufferPointer() = 0;
+    virtual uint64_t GetBufferSize() = 0;
+};
+
+// ID3D12CommandAllocator: 8 Reset.
+struct ICommandAllocatorHost : IDeviceChildHost {
+    virtual HResult Reset() = 0;
+};
+
+// ID3D12Fence: 8 GetCompletedValue, 9 SetEventOnCompletion, 10 Signal; ID3D12Fence1: 11 GetCreationFlags.
+struct IFenceHost : IDeviceChildHost {
+    virtual uint64_t GetCompletedValue() = 0;
+    virtual HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) = 0;
+    virtual HResult Signal(uint64_t value) = 0;
+    virtual uint32_t GetCreationFlags() = 0;
+};
+
+// ID3D12DescriptorHeap: 8 GetDesc, 9 GetCPUDescriptorHandleForHeapStart, 10 GetGPUDescriptorHandleForHeapStart.
+struct CpuHandleResult {
+    uint64_t ptr;
+};
+struct GpuHandleResult {
+    uint64_t ptr;
+};
+struct IDescriptorHeapHost : IDeviceChildHost {
+    virtual GuestDescriptorHeapDesc GetDesc() = 0;
+    virtual CpuHandleResult GetCPUDescriptorHandleForHeapStart() = 0;
+    virtual GpuHandleResult GetGPUDescriptorHandleForHeapStart() = 0;
+};
+
+// ID3D12RootSignature, ID3D12QueryHeap, ID3D12CommandSignature: no methods beyond ID3D12DeviceChild.
+struct IRootSignatureHost : IDeviceChildHost {};
+struct IQueryHeapHost : IDeviceChildHost {};
+struct ICommandSignatureHost : IDeviceChildHost {};
+
+// ID3D12CommandQueue in the Xbox slot order (see the header comment).
+struct ICommandQueueHost : IDeviceChildHost {
+    virtual HResult Signal(InterfaceArg<IFenceHost> fence, uint64_t value) = 0;                // 16
+    virtual HResult Wait(InterfaceArg<IFenceHost> fence, uint64_t value) = 0;                  // 17
+    virtual HResult GetTimestampFrequency(GuestPtr<uint64_t> frequency) = 0;                   // 18
+    virtual HResult PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) = 0;  // 32
+};
+
+struct HeapPropertiesResult {
+    GuestHeapProperties props;
+};
+
+// ID3D12Device (public slots 0..43 plus the evidenced Xbox slots).
+struct IDeviceHost : IObjectHost {
+    virtual uint32_t GetNodeCount() = 0;                                                                  // 7
+    virtual HResult CreateCommandQueue(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out) = 0;  // 8
+    virtual HResult CreateCommandAllocator(uint32_t type, const Guid& riid, OutPtr out) = 0;               // 9
+    virtual HResult CheckFeatureSupport(uint32_t feature, uint64_t data, uint32_t size) = 0;               // 13
+    virtual HResult CreateDescriptorHeap(const GuestDescriptorHeapDesc* desc, const Guid& riid, OutPtr out) = 0;  // 14
+    virtual uint32_t GetDescriptorHandleIncrementSize(uint32_t type) = 0;                                 // 15
+    virtual HResult CreateRootSignature(uint32_t node_mask, uint64_t blob, uint64_t length, const Guid& riid,
+                                        OutPtr out) = 0;                                                    // 16
+    virtual void CreateConstantBufferView(uint64_t desc, uint64_t dest) = 0;                              // 17
+    virtual void CreateSampler(uint64_t desc, uint64_t dest) = 0;                                         // 22
+    virtual void CopyDescriptors(com::CallContext& ctx) = 0;                                              // 23
+    virtual void CopyDescriptorsSimple(uint32_t count, uint64_t dest, uint64_t src, uint32_t type) = 0;   // 24
+    virtual GuestResourceAllocationInfo GetResourceAllocationInfo(uint32_t visible_mask, uint32_t count,
+                                                                  uint64_t descs) = 0;                     // 25
+    virtual HeapPropertiesResult GetCustomHeapProperties(uint32_t node_mask, uint32_t heap_type) = 0;     // 26
+    virtual HResult MakeResident(uint32_t count, uint64_t objects) = 0;                                   // 34
+    virtual HResult Evict(uint32_t count, uint64_t objects) = 0;                                          // 35
+    virtual HResult CreateFence(uint64_t initial_value, uint32_t flags, const Guid& riid, OutPtr out) = 0;  // 36
+    virtual HResult GetDeviceRemovedReason() = 0;                                                         // 37
+    virtual void GetCopyableFootprints(com::CallContext& ctx) = 0;                                        // 38
+    virtual HResult CreateQueryHeap(const GuestQueryHeapDesc* desc, const Guid& riid, OutPtr out) = 0;    // 39
+    virtual HResult SetStablePowerState(bool enable) = 0;                                                 // 40
+    virtual HResult CreateCommandSignature(const GuestCommandSignatureDesc* desc, uint64_t root_signature,
+                                           const Guid& riid, OutPtr out) = 0;                               // 41
+    virtual HResult CreateCommandQueueX(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out) = 0;  // 48
+};
+
+// ---------------------------------------------------------------------------------------------
+// Device
+// ---------------------------------------------------------------------------------------------
+
+// Where packets go (default: playgta6::os::wgpu_submit). Called with the device's submit mutex held.
+using PacketSink = std::function<void(const uint8_t* data, size_t size)>;
+
+struct DeviceOptions {
+    PacketSink sink;                    // empty: os::wgpu_submit
+    bridge::BridgeOptions bridge;       // id_allocator is replaced by the device's allocator
+    uint64_t timestamp_frequency = 1000000000ull;
+};
+
+struct DeviceStats {
+    uint64_t queues = 0;
+    uint64_t command_allocators = 0;
+    uint64_t descriptor_heaps = 0;
+    uint64_t root_signatures = 0;
+    uint64_t fences = 0;
+    uint64_t presents = 0;
+    uint64_t submissions = 0;
+    uint64_t bad_arguments = 0;  // malformed guest structs / pointers (diagnosed, E_INVALIDARG)
+};
+
+class Device final : public ObjectBase<IDeviceHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12Device";
+    // Guest payload (after the vtable pointer, at device + 0x10): the byte at device + 0x18 is read
+    // by inlined accessors in the executable (see the header comment).
+    static constexpr uint64_t kComPayloadSize = 16;
+    static constexpr uint64_t kInlineApiFlagOffset = 0x18;
+
+    explicit Device(DeviceOptions options = {});
+    ~Device() override;
+
+    // Must run once right after create_object (writes the guest payload).
+    void initialize_guest_payload();
+
+    // ---- IDeviceHost ----
+    uint32_t GetNodeCount() override { return 1; }
+    HResult CreateCommandQueue(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out) override;
+    HResult CreateCommandAllocator(uint32_t type, const Guid& riid, OutPtr out) override;
+    HResult CheckFeatureSupport(uint32_t feature, uint64_t data, uint32_t size) override;
+    HResult CreateDescriptorHeap(const GuestDescriptorHeapDesc* desc, const Guid& riid, OutPtr out) override;
+    uint32_t GetDescriptorHandleIncrementSize(uint32_t type) override;
+    HResult CreateRootSignature(uint32_t node_mask, uint64_t blob, uint64_t length, const Guid& riid,
+                                OutPtr out) override;
+    void CreateConstantBufferView(uint64_t desc, uint64_t dest) override;
+    void CreateSampler(uint64_t desc, uint64_t dest) override;
+    void CopyDescriptors(com::CallContext& ctx) override;
+    void CopyDescriptorsSimple(uint32_t count, uint64_t dest, uint64_t src, uint32_t type) override;
+    GuestResourceAllocationInfo GetResourceAllocationInfo(uint32_t visible_mask, uint32_t count,
+                                                          uint64_t descs) override;
+    HeapPropertiesResult GetCustomHeapProperties(uint32_t node_mask, uint32_t heap_type) override;
+    HResult MakeResident(uint32_t, uint64_t) override { return kSOk; }
+    HResult Evict(uint32_t, uint64_t) override { return kSOk; }
+    HResult CreateFence(uint64_t initial_value, uint32_t flags, const Guid& riid, OutPtr out) override;
+    HResult GetDeviceRemovedReason() override { return kSOk; }
+    void GetCopyableFootprints(com::CallContext& ctx) override;
+    HResult CreateQueryHeap(const GuestQueryHeapDesc* desc, const Guid& riid, OutPtr out) override;
+    HResult SetStablePowerState(bool) override { return kSOk; }
+    HResult CreateCommandSignature(const GuestCommandSignatureDesc* desc, uint64_t root_signature,
+                                   const Guid& riid, OutPtr out) override;
+    HResult CreateCommandQueueX(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out) override;
+
+    // ---- Runtime side ----
+    d3d::DescriptorHeapRegistry& heaps() { return heaps_; }
+    d3d::ResourceStateRegistry& resource_states() { return resource_states_; }
+    bridge::StateBridgeDevice& state_bridge() { return *bridge_; }
+    uint32_t allocate_id() { return next_id_.fetch_add(1, std::memory_order_relaxed); }
+    uint64_t timestamp_frequency() const { return options_.timestamp_frequency; }
+
+    // Writes `bytes` to the sink as one submission (thread-safe, serialized).
+    void submit(const uint8_t* data, size_t size);
+    void submit(const CommandEncoder& encoder) { submit(encoder.data(), encoder.size()); }
+    // Present packet (and BeginFrame before the next frame's first submission).
+    void present();
+    void set_sink(PacketSink sink);
+
+    DeviceStats stats() const;
+    void note_bad_argument(const std::string& message);
+    std::vector<std::string> diagnostics() const;
+
+    // Child counters.
+    std::atomic<uint64_t> queues{0}, allocators{0}, descriptor_heaps{0}, root_signatures{0}, fences{0};
+
+private:
+    HResult create_queue(const GuestCommandQueueDesc* desc, const Guid& riid, OutPtr out);
+
+    DeviceOptions options_;
+    d3d::DescriptorHeapRegistry heaps_;
+    d3d::ResourceStateRegistry resource_states_;
+    std::atomic<uint32_t> next_id_{1};
+    std::unique_ptr<bridge::StateBridgeDevice> bridge_;
+
+    mutable std::mutex submit_mutex_;
+    PacketSink sink_;
+    bool frame_open_ = false;
+    uint64_t presents_ = 0;
+    uint64_t submissions_ = 0;
+
+    mutable std::mutex diag_mutex_;
+    std::vector<std::string> diags_;
+    std::atomic<uint64_t> bad_arguments_{0};
+};
+
+// ---------------------------------------------------------------------------------------------
+// Children
+// ---------------------------------------------------------------------------------------------
+
+class Blob final : public com::ComObject, public IBlobHost {
+public:
+    static constexpr const char* kComClassName = "ID3DBlob";
+    explicit Blob(uint64_t size);
+    ~Blob() override;
+    bool valid() const { return buffer_ != 0 || size_ == 0; }
+    uint64_t GetBufferPointer() override { return buffer_; }
+    uint64_t GetBufferSize() override { return size_; }
+    // Creates a blob holding `bytes` (guest memory); empty Ref on allocation failure.
+    static com::Ref<Blob> create(const void* bytes, size_t size);
+
+private:
+    uint64_t buffer_ = 0;
+    uint64_t size_ = 0;
+};
+
+class CommandAllocator final : public ChildBase<ICommandAllocatorHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12CommandAllocator";
+    CommandAllocator(com::Ref<Device> device, uint32_t type);
+    ~CommandAllocator() override;
+    HResult Reset() override;
+    uint32_t type() const { return type_; }
+    uint64_t resets() const { return resets_.load(); }
+
+private:
+    uint32_t type_;
+    std::atomic<uint64_t> resets_{0};
+};
+
+class Fence final : public ChildBase<IFenceHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12Fence";
+    Fence(com::Ref<Device> device, uint64_t initial_value, uint32_t flags);
+    ~Fence() override;
+    uint64_t GetCompletedValue() override { return value_.load(std::memory_order_acquire); }
+    HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) override;
+    HResult Signal(uint64_t value) override;
+    uint32_t GetCreationFlags() override { return flags_; }
+    // GPU-side signal (queue Signal): completes when the work submitted before it completed, which
+    // in this runtime is at submission time (see Queue::Signal).
+    void signal_from_queue(uint64_t value) { Signal(value); }
+
+private:
+    void fire_events_locked(std::vector<uint64_t>* to_set);
+
+    std::atomic<uint64_t> value_;
+    uint32_t flags_;
+    std::mutex mutex_;
+    std::multimap<uint64_t, uint64_t> waits_;  // value -> event handle
+};
+
+class DescriptorHeap final : public ChildBase<IDescriptorHeapHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12DescriptorHeap";
+    DescriptorHeap(com::Ref<Device> device, d3d::DescriptorHeap* heap, const GuestDescriptorHeapDesc& desc);
+    ~DescriptorHeap() override;
+    GuestDescriptorHeapDesc GetDesc() override { return desc_; }
+    CpuHandleResult GetCPUDescriptorHandleForHeapStart() override { return {heap_->cpu_start().ptr}; }
+    GpuHandleResult GetGPUDescriptorHandleForHeapStart() override { return {heap_->gpu_start().ptr}; }
+    d3d::DescriptorHeap* heap() const { return heap_; }
+
+private:
+    d3d::DescriptorHeap* heap_;
+    GuestDescriptorHeapDesc desc_;
+};
+
+class RootSignature final : public ChildBase<IRootSignatureHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12RootSignature";
+    RootSignature(com::Ref<Device> device, std::unique_ptr<d3d::RootSignature> signature);
+    ~RootSignature() override;
+    const d3d::RootSignature& signature() const { return *signature_; }
+
+private:
+    std::unique_ptr<d3d::RootSignature> signature_;
+};
+
+class QueryHeap final : public ChildBase<IQueryHeapHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12QueryHeap";
+    QueryHeap(com::Ref<Device> device, const GuestQueryHeapDesc& desc) : ChildBase(std::move(device)), desc_(desc) {}
+    const GuestQueryHeapDesc& desc() const { return desc_; }
+
+private:
+    GuestQueryHeapDesc desc_;
+};
+
+class CommandSignature final : public ChildBase<ICommandSignatureHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12CommandSignature";
+    CommandSignature(com::Ref<Device> device, uint32_t byte_stride, uint32_t argument_count)
+        : ChildBase(std::move(device)), byte_stride_(byte_stride), argument_count_(argument_count) {}
+    uint32_t byte_stride() const { return byte_stride_; }
+    uint32_t argument_count() const { return argument_count_; }
+
+private:
+    uint32_t byte_stride_;
+    uint32_t argument_count_;
+};
+
+class CommandQueue final : public ChildBase<ICommandQueueHost> {
+public:
+    static constexpr const char* kComClassName = "ID3D12CommandQueue";
+    CommandQueue(com::Ref<Device> device, const GuestCommandQueueDesc& desc);
+    ~CommandQueue() override;
+    HResult Signal(InterfaceArg<IFenceHost> fence, uint64_t value) override;
+    HResult Wait(InterfaceArg<IFenceHost> fence, uint64_t value) override;
+    HResult GetTimestampFrequency(GuestPtr<uint64_t> frequency) override;
+    HResult PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) override;
+    const GuestCommandQueueDesc& desc() const { return desc_; }
+
+private:
+    GuestCommandQueueDesc desc_;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Interface declarations (vtables)
+// ---------------------------------------------------------------------------------------------
+
+extern const com::Interface<IDeviceHost> kID3D12Device;
+extern const com::Interface<ICommandQueueHost> kID3D12CommandQueue;
+extern const com::Interface<ICommandAllocatorHost> kID3D12CommandAllocator;
+extern const com::Interface<IFenceHost> kID3D12Fence;
+extern const com::Interface<IDescriptorHeapHost> kID3D12DescriptorHeap;
+extern const com::Interface<IRootSignatureHost> kID3D12RootSignature;
+extern const com::Interface<IQueryHeapHost> kID3D12QueryHeap;
+extern const com::Interface<ICommandSignatureHost> kID3D12CommandSignature;
+extern const com::Interface<IBlobHost> kID3DBlob;
+
+// DXGI format block layout (bytes per element or compressed block, block size, plane count).
+struct DxgiFormatLayout {
+    uint32_t block_bytes = 0;
+    uint32_t block_width = 1;
+    uint32_t block_height = 1;
+    uint32_t planes = 1;
+    bool known = false;
+};
+DxgiFormatLayout dxgi_format_layout(uint32_t format);
+// Bytes per element of `plane` (depth-stencil formats: 4-byte depth plane, 1-byte stencil plane).
+uint32_t plane_block_bytes(uint32_t format, uint32_t plane);
+// Linear size of a resource's subresources (no tiling or alignment padding).
+uint64_t resource_size_estimate(const GuestResourceDesc& desc);
+com::Ref<Device> device_ref(Device* device);
+
+// Root signature description from a D3D12_VERSIONED_ROOT_SIGNATURE_DESC in guest memory (all nested
+// arrays read through the seam). False + message on malformed input.
+bool read_versioned_root_signature(uint64_t desc_va, d3d::RootSignatureDesc* out, std::string* error);
+bool read_versioned_root_signature(const GuestVersionedRootSignatureDesc& desc, d3d::RootSignatureDesc* out,
+                                   std::string* error);
+
+// Hands `object` to guest code as the interface answering `riid` (QueryInterface semantics): writes
+// the pointer to *out and returns S_OK, or E_NOINTERFACE (and *out = 0). Consumes the reference.
+template <typename T>
+HResult hand_out(com::Ref<T> object, const Guid& riid, OutPtr out) {
+    if (!object) {
+        if (out) {
+            out.write(0);
+        }
+        return kEOutOfMemory;
+    }
+    if (out.is_null()) {
+        return kSFalse;  // D3D12: a null out pointer only tests whether creation would succeed
+    }
+    uint64_t pointer = 0;
+    const HResult hr = object->query_interface(riid, &pointer);
+    if (hr < 0 || !out.write(pointer)) {
+        if (pointer != 0) {
+            object->release();
+        }
+        out.write(0);
+        return hr < 0 ? hr : kEPointer;
+    }
+    return kSOk;
+}
+
+template <typename Iface>
+HResult ChildBase<Iface>::GetDevice(const Guid& riid, OutPtr out) {
+    if (out.is_null()) {
+        return kEPointer;
+    }
+    uint64_t pointer = 0;
+    const HResult hr = device_->query_interface(riid, &pointer);
+    out.write(pointer);
+    return hr;
+}
+
+}  // namespace playgta6::gpu::d3d12_guest

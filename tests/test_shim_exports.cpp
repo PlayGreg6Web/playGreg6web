@@ -37,7 +37,7 @@ Pg6ProcAddress by_name(Pg6Handle module, const char* name) {
 
 void test_registration_idempotent() {
     const size_t first = pg6_loader_register_all_shim_exports();
-    CHECK(first == 290);
+    CHECK(first == 293);
     CHECK(register_all_shim_exports() == first);
     CHECK(pg6_loader_register_all_shim_exports() == first);
 
@@ -76,7 +76,7 @@ void test_table_counts_and_lookup() {
         CHECK(by_name(mod, e.name) == e.address);
         CHECK(pg6_loader_resolve_import(e.module, e.name) == e.address);
     }
-    CHECK(per_module.size() == 9);
+    CHECK(per_module.size() == 10);
     CHECK(per_module["KERNEL32.dll"] == 154);
     CHECK(per_module["ADVAPI32.dll"] == 10);
     CHECK(per_module["WS2_32.dll"] == 24);
@@ -86,6 +86,7 @@ void test_table_counts_and_lookup() {
     CHECK(per_module["bcrypt.dll"] == 3);
     CHECK(per_module["USER32.dll"] == 7);
     CHECK(per_module["combase.dll"] == 8);
+    CHECK(per_module["d3d12_xs.dll"] == 3);
 
     // The unversioned XSAPI alias exposes the same exports.
     const Pg6Handle versioned = pg6_win32_get_module_handle_a("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll");
