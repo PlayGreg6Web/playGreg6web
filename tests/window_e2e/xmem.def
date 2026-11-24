@@ -1,0 +1,6 @@
+LIBRARY xmem.dll
+EXPORTS
+  XMemVirtualAlloc
+  XMemAllocatePhysicalPages
+  XMemMapPhysicalPages
+  XMemMapPhysicalPagesScatter
