@@ -276,8 +276,8 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
     }
 
     Reservation* res = find_reservation_locked(addr);
-    if (!res) {
-        return false;
+    if (!res || res->placeholder) {
+        return false;  // placeholders are never committed
     }
 
     const uint64_t start = align_down(addr, kPageSize);
@@ -487,7 +487,7 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
                                            uint64_t size,
                                            uint32_t alloc_type,
                                            PageProtect protect) {
-    constexpr uint32_t kAllowed = kMemReserve | kMemCommit;
+    constexpr uint32_t kAllowed = kMemReserve | kMemCommit | kMemReservePlaceholder | kMemReplacePlaceholder;
     if (size == 0 || alloc_type == 0 || (alloc_type & ~kAllowed) != 0) {
         return 0;
     }
@@ -496,6 +496,45 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if ((alloc_type & kMemReservePlaceholder) != 0) {
+        // A new placeholder: reserve only, no access, allocation-granularity aligned.
+        if (alloc_type != (kMemReserve | kMemReservePlaceholder) || protect != PageProtect::NoAccess ||
+            (addr % kAllocationGranularity) != 0 || (size % kAllocationGranularity) != 0) {
+            return 0;
+        }
+        const uint64_t base = reserve_locked(addr, size, protect);
+        notify(*this, ArenaEvent::Reserve, base != 0 ? base : addr, size, protect, base != 0);
+        if (base != 0) {
+            reservations_.at(base).placeholder = true;
+        }
+        return base;
+    }
+    if ((alloc_type & kMemReplacePlaceholder) != 0) {
+        // Exactly one placeholder becomes a normal reservation (address space is unchanged).
+        if ((alloc_type & kMemReserve) == 0 || addr == 0) {
+            return 0;
+        }
+        auto it = reservations_.find(addr);
+        if (it == reservations_.end() || !it->second.placeholder || it->second.size != size) {
+            return 0;
+        }
+        Reservation& res = it->second;
+        res.placeholder = false;
+        res.replaced_placeholder = true;
+        res.allocation_protect = protect;
+        if ((alloc_type & kMemCommit) != 0) {
+            const bool ok = commit_locked(addr, size, protect);
+            notify(*this, ArenaEvent::Commit, addr, size, protect, ok);
+            if (!ok) {
+                res.placeholder = true;  // back to a placeholder: the call fails as a whole
+                res.replaced_placeholder = false;
+                res.allocation_protect = PageProtect::NoAccess;
+                return 0;
+            }
+        }
+        return addr;
+    }
 
     const bool do_reserve = (alloc_type & kMemReserve) != 0 || addr == 0;
     const bool do_commit = (alloc_type & kMemCommit) != 0;
@@ -528,8 +567,106 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
     return align_down(addr, kPageSize);
 }
 
+bool VirtualMemoryArena::split_placeholder_locked(uint64_t addr, uint64_t size) {
+    if (size == 0 || (addr % kAllocationGranularity) != 0 || (size % kAllocationGranularity) != 0 ||
+        addr > UINT64_MAX - size) {
+        return false;
+    }
+    Reservation* found = find_reservation_locked(addr);
+    if (found == nullptr) {
+        return false;
+    }
+    const uint64_t base = found->base;
+    const uint64_t end = base + found->size;
+    if (addr + size > end) {
+        return false;
+    }
+    if (!found->placeholder) {
+        // A reservation that replaced a placeholder goes back to being one (its whole range).
+        if (!found->replaced_placeholder || addr != base || size != found->size) {
+            return false;
+        }
+        decommit_locked(base, found->size);
+        found->placeholder = true;
+        found->replaced_placeholder = false;
+        found->allocation_protect = PageProtect::NoAccess;
+        return true;
+    }
+    if (addr == base && size == found->size) {
+        return true;  // already exactly this placeholder
+    }
+    // [base, addr) / [addr, addr + size) / [addr + size, end): each non-empty piece is a placeholder.
+    Reservation whole = std::move(*found);
+    reservations_.erase(base);
+    auto piece = [&](uint64_t from, uint64_t to) {
+        if (from == to) {
+            return;
+        }
+        Reservation r;
+        r.base = from;
+        r.size = to - from;
+        r.granularity_size = to - from;
+        r.allocation_protect = PageProtect::NoAccess;
+        r.placeholder = true;
+        const auto first = whole.pages.begin() + static_cast<std::ptrdiff_t>((from - base) / kPageSize);
+        const auto last = whole.pages.begin() + static_cast<std::ptrdiff_t>((to - base) / kPageSize);
+        r.pages.assign(first, last);
+        reservations_.emplace(from, std::move(r));
+    };
+    piece(base, addr);
+    piece(addr, addr + size);
+    piece(addr + size, end);
+    return true;
+}
+
+bool VirtualMemoryArena::coalesce_placeholders_locked(uint64_t addr, uint64_t size) {
+    if (size == 0 || addr > UINT64_MAX - size) {
+        return false;
+    }
+    const uint64_t end = addr + size;
+    // The placeholders starting at addr must tile [addr, end) exactly.
+    uint64_t cursor = addr;
+    std::vector<uint64_t> bases;
+    while (cursor < end) {
+        auto it = reservations_.find(cursor);
+        if (it == reservations_.end() || !it->second.placeholder || it->second.size > end - cursor) {
+            return false;
+        }
+        bases.push_back(cursor);
+        cursor += it->second.size;
+    }
+    if (bases.size() < 2) {
+        return bases.size() == 1;  // a single placeholder is already coalesced
+    }
+    Reservation merged;
+    merged.base = addr;
+    merged.size = size;
+    merged.granularity_size = size;
+    merged.allocation_protect = PageProtect::NoAccess;
+    merged.placeholder = true;
+    for (const uint64_t b : bases) {
+        auto it = reservations_.find(b);
+        merged.pages.insert(merged.pages.end(), it->second.pages.begin(), it->second.pages.end());
+        reservations_.erase(it);
+    }
+    reservations_.emplace(addr, std::move(merged));
+    return true;
+}
+
 bool VirtualMemoryArena::virtual_free(uint64_t addr, uint64_t size, uint32_t free_type) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (free_type == (kMemRelease | kMemPreservePlaceholder)) {
+        return split_placeholder_locked(addr, size);
+    }
+    if (free_type == (kMemRelease | kMemCoalescePlaceholders)) {
+        return coalesce_placeholders_locked(addr, size);
+    }
+    if (free_type == kMemDecommit) {
+        const Reservation* res = find_reservation_locked(addr);
+        if (res != nullptr && res->placeholder) {
+            return false;
+        }
+    }
     if (free_type == kMemRelease) {
         if (size != 0) {
             return false;

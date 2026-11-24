@@ -1131,7 +1131,11 @@ bool VirtualProtect(uint64_t address,
 }
 
 bool VirtualFree(uint64_t address, uint64_t size, uint32_t free_type) {
-    if (free_type != MEM_DECOMMIT && free_type != MEM_RELEASE) {
+    // MEM_RELEASE may carry MEM_PRESERVE_PLACEHOLDER (split / back to a placeholder) or
+    // MEM_COALESCE_PLACEHOLDERS; the arena implements both.
+    if (free_type != MEM_DECOMMIT && free_type != MEM_RELEASE &&
+        free_type != (MEM_RELEASE | kMemPreservePlaceholder) &&
+        free_type != (MEM_RELEASE | kMemCoalescePlaceholders)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }

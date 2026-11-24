@@ -274,6 +274,53 @@ void test_image_base_hint() {
     CHECK(arena.release(heap));
 }
 
+// Placeholders: reserve, split (MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), replace
+// (MEM_REPLACE_PLACEHOLDER), back to a placeholder, coalesce, release.
+void test_placeholders() {
+    VirtualMemoryArena arena;
+    constexpr uint64_t kG = 0x10000;
+    // Only reserve + NoAccess + 64 KiB granularity.
+    CHECK(arena.virtual_alloc(0, 8 * kG, kMemReserve | kMemCommit | kMemReservePlaceholder, PageProtect::NoAccess) == 0);
+    CHECK(arena.virtual_alloc(0, 8 * kG, kMemReserve | kMemReservePlaceholder, PageProtect::ReadWrite) == 0);
+    CHECK(arena.virtual_alloc(0, 8 * kG + 0x1000, kMemReserve | kMemReservePlaceholder, PageProtect::NoAccess) == 0);
+    const uint64_t base = arena.virtual_alloc(0, 8 * kG, kMemReserve | kMemReservePlaceholder, PageProtect::NoAccess);
+    CHECK(base != 0);
+    const uint64_t reserved = arena.reserved_bytes();
+    CHECK(!arena.commit(base, kG, PageProtect::ReadWrite));  // never committable
+    CHECK(!arena.virtual_free(base, kG, kMemDecommit));
+
+    // Split [base, +2G) | [+2G, +5G) | [+5G, +8G) out of the placeholder.
+    CHECK(arena.virtual_free(base, 2 * kG, kMemRelease | kMemPreservePlaceholder));
+    CHECK(arena.virtual_free(base + 2 * kG, 3 * kG, kMemRelease | kMemPreservePlaceholder));
+    CHECK(arena.reservation_count() == 3);
+    CHECK(arena.reserved_bytes() == reserved);
+    CHECK(!arena.virtual_free(base + kG / 2, kG, kMemRelease | kMemPreservePlaceholder));  // not 64 KiB aligned
+    CHECK(arena.query(base + 3 * kG).allocation_base == base + 2 * kG);
+
+    // Replace the middle one exactly, committed: usable memory.
+    CHECK(arena.virtual_alloc(base + 2 * kG, 2 * kG, kMemReserve | kMemReplacePlaceholder, PageProtect::ReadWrite) ==
+          0);  // wrong size
+    CHECK(arena.virtual_alloc(base + 2 * kG, 3 * kG, kMemReserve | kMemCommit | kMemReplacePlaceholder,
+                              PageProtect::ReadWrite) == base + 2 * kG);
+    const uint32_t value = 0xC0FFEE;
+    CHECK(arena.write(base + 2 * kG + 8, &value, sizeof(value)));
+    CHECK(arena.virtual_alloc(base + 2 * kG, 3 * kG, kMemReserve | kMemReplacePlaceholder, PageProtect::ReadWrite) ==
+          0);  // no longer a placeholder
+    CHECK(!arena.commit(base, kG, PageProtect::ReadWrite));  // the others still are
+    // Coalescing needs placeholders only.
+    CHECK(!arena.virtual_free(base, 8 * kG, kMemRelease | kMemCoalescePlaceholders));
+
+    // Back to a placeholder (whole range only), then coalesce all three and release.
+    CHECK(!arena.virtual_free(base + 2 * kG, kG, kMemRelease | kMemPreservePlaceholder));
+    CHECK(arena.virtual_free(base + 2 * kG, 3 * kG, kMemRelease | kMemPreservePlaceholder));
+    CHECK(arena.committed_bytes() == 0);
+    CHECK(!arena.write(base + 2 * kG + 8, &value, sizeof(value)));
+    CHECK(arena.virtual_free(base, 8 * kG, kMemRelease | kMemCoalescePlaceholders));
+    CHECK(arena.reservation_count() == 1);
+    CHECK(arena.virtual_free(base, 0, kMemRelease));
+    CHECK(arena.reservation_count() == 0 && arena.reserved_bytes() == 0);
+}
+
 void test_exhaustion() {
     // A 1 MiB space: 16 granules, then clean failure.
     VirtualMemoryArena small(kDefaultArenaBase, 1 << 20);
@@ -426,6 +473,7 @@ int main() {
     test_protection_bookkeeping();
     test_protection_enforced();
     test_image_base_hint();
+    test_placeholders();
     test_exhaustion();
     test_many_reservations();
     test_concurrent_reservations();

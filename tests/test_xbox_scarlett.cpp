@@ -194,6 +194,28 @@ void test_xmem_physical_virtual_and_transfer() {
     }
     CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 1ull << 20, win32::MEM_RESERVE, 0u, 0x4000u) == nullptr);
 
+    // The title's placeholder region: XMemVirtualAlloc(MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+    // PAGE_NOACCESS), split with VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), each piece
+    // replaced with MEM_LARGE_PAGES | MEM_PHYSICAL | MEM_REPLACE_PLACEHOLDER | MEM_RESERVE.
+    {
+        constexpr uint64_t kPiece = 2ull << 20;
+        void* region = pg6_xbox_XMemVirtualAlloc(nullptr, 3 * kPiece, 0x42000u, 7u, win32::PAGE_NOACCESS);
+        CHECK(region != nullptr);
+        // XMem takes and returns host pointers; VirtualFree takes guest addresses.
+        auto& arena = *win32::get_vmem_arena();
+        const uint64_t base = arena.guest_address(region);
+        CHECK(win32::VirtualFree(base, kPiece, win32::MEM_RELEASE | 0x2u));
+        CHECK(win32::VirtualFree(base + kPiece, kPiece, win32::MEM_RELEASE | 0x2u));
+        for (int i = 0; i < 3; ++i) {
+            void* want = arena.translate(base + i * kPiece);
+            void* piece = pg6_xbox_XMemVirtualAlloc(want, kPiece, 0x20406000u, 0x27u, 0x1004u);
+            CHECK(piece == want);
+        }
+        // Replacing twice fails: the range is no longer a placeholder.
+        CHECK(pg6_xbox_XMemVirtualAlloc(region, kPiece, 0x20406000u, 0x27u, 0x1004u) == nullptr);
+        CHECK(win32::VirtualFree(base + kPiece, kPiece, 0x1u | win32::MEM_RELEASE) == false);  // not placeholders
+    }
+
     uint8_t src_pattern[256];
     for (size_t i = 0; i < sizeof(src_pattern); ++i) {
         src_pattern[i] = static_cast<uint8_t>((i * 7u + 3u) & 0xFFu);

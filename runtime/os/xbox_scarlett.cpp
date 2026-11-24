@@ -2144,8 +2144,11 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     const bool phantom = window && playgta6::os::xmem_windows::place_phantom(window_kind);
 
     // A non-null address is a placement request that must be honoured exactly.
+    // Placeholders (MEM_RESERVE_PLACEHOLDER / MEM_REPLACE_PLACEHOLDER) are the arena's.
+    const uint32_t placeholder_bits =
+        allocation_type & (os::kMemReservePlaceholder | os::kMemReplacePlaceholder);
     const uint32_t arena_type =
-        (want_reserve ? os::kMemReserve : 0u) | (want_commit ? os::kMemCommit : 0u);
+        (want_reserve ? os::kMemReserve : 0u) | (want_commit ? os::kMemCommit : 0u) | placeholder_bits;
     uint64_t va = 0;
     if (phantom) {
         va = playgta6::os::xmem_windows::reserve_phantom(aligned_size);
@@ -2159,6 +2162,11 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     if (va == 0) {
         os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
+    }
+    if ((allocation_type & os::kMemReservePlaceholder) != 0) {
+        // A placeholder is not usable memory: it is split with VirtualFree and its pieces are
+        // replaced by XMemVirtualAlloc(MEM_REPLACE_PLACEHOLDER), which become regions here.
+        return host_of(va);
     }
 
     VirtualRegion region;

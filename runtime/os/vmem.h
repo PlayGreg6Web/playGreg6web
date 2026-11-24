@@ -117,6 +117,13 @@ inline constexpr uint32_t kMemReserve = 0x00002000u;
 inline constexpr uint32_t kMemDecommit = 0x00004000u;
 inline constexpr uint32_t kMemRelease = 0x00008000u;
 inline constexpr uint32_t kMemFree = 0x00010000u;
+// Placeholders (VirtualAlloc2 / VirtualFree, Windows 10 1803+; the Xbox OS takes the same flags):
+// a placeholder is a no-access reservation that can only be split, coalesced, replaced by a
+// real reservation of exactly its range, or released.
+inline constexpr uint32_t kMemCoalescePlaceholders = 0x00000001u;  // VirtualFree, with MEM_RELEASE
+inline constexpr uint32_t kMemPreservePlaceholder = 0x00000002u;   // VirtualFree, with MEM_RELEASE
+inline constexpr uint32_t kMemReplacePlaceholder = 0x00004000u;    // VirtualAlloc, with MEM_RESERVE
+inline constexpr uint32_t kMemReservePlaceholder = 0x00040000u;    // VirtualAlloc, with MEM_RESERVE
 
 enum class MemState : uint32_t {
     Free = kMemFree,
@@ -224,12 +231,20 @@ public:
     bool release(uint64_t base_addr);
 
     // Unified Win32/Xbox VirtualAlloc wrapper (kMemReserve, kMemCommit, or both).
+    // Placeholders: kMemReserve | kMemReservePlaceholder with NoAccess reserves one (64 KiB
+    // aligned, never committable); kMemReserve | kMemReplacePlaceholder (optionally | kMemCommit)
+    // at the exact base and size of a placeholder turns it into a normal reservation.
     uint64_t virtual_alloc(uint64_t addr,
                            uint64_t size,
                            uint32_t alloc_type,
                            PageProtect protect);
 
     // Unified Win32/Xbox VirtualFree wrapper (kMemDecommit or kMemRelease).
+    // kMemRelease | kMemPreservePlaceholder: splits [addr, addr + size) out of a placeholder as a
+    // placeholder of its own (64 KiB boundaries), or turns a reservation that replaced a
+    // placeholder back into one (its whole range; committed pages are discarded).
+    // kMemRelease | kMemCoalescePlaceholders: merges the adjacent placeholders that exactly cover
+    // [addr, addr + size) into one. kMemRelease of a placeholder (size 0) releases it.
     bool virtual_free(uint64_t addr, uint64_t size, uint32_t free_type);
 
     // Query state and protection of the region starting at addr (Win32 VirtualQuery).
@@ -277,7 +292,12 @@ private:
         uint64_t granularity_size = 0;  // 64 KiB-aligned VA slot occupancy
         PageProtect allocation_protect = PageProtect::NoAccess;
         std::vector<PageMeta> pages;
+        bool placeholder = false;            // a placeholder (see virtual_alloc / virtual_free)
+        bool replaced_placeholder = false;   // a reservation made by replacing a placeholder
     };
+
+    bool split_placeholder_locked(uint64_t addr, uint64_t size);
+    bool coalesce_placeholders_locked(uint64_t addr, uint64_t size);
 
     uint64_t reserve_locked(uint64_t hint_addr,
                             uint64_t size,
