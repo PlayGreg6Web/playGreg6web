@@ -1065,7 +1065,12 @@ void test_host_fault_mapping() {
 }  // namespace
 
 int main() {
+#ifdef __EMSCRIPTEN__
+    // The default wasm arena is 2 GiB ([4, 6) GiB) but the helper DLL is mapped at 6 GiB.
+    VirtualMemoryArena arena(os::kDefaultArenaBase, uint64_t{4} << 30);
+#else
     VirtualMemoryArena arena;
+#endif
     g_arena = &arena;
     os::win32::set_vmem_arena(&arena);
     g_image = build_image();

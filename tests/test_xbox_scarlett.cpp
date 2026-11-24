@@ -566,49 +566,49 @@ void test_module_registry_resolution() {
     // xmem.dll (12 exports)
     const Pg6Handle h_xmem = win32::GetModuleHandleA("xmem.dll");
     CHECK(h_xmem != win32::kNullHandle);
-    CHECK(win32::GetProcAddress(h_xmem, "XMemAlloc") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemAlloc") ==
           win32::proc_address(&pg6_xbox_XMemAlloc));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemAllocDefault") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemAllocDefault") ==
           win32::proc_address(&pg6_xbox_XMemAllocDefault));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemAllocatePhysicalPages") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemAllocatePhysicalPages") ==
           win32::proc_address(&pg6_xbox_XMemAllocatePhysicalPages));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemFree") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemFree") ==
           win32::proc_address(&pg6_xbox_XMemFree));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemFreeDefault") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemFreeDefault") ==
           win32::proc_address(&pg6_xbox_XMemFreeDefault));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemFreePhysicalPages") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemFreePhysicalPages") ==
           win32::proc_address(&pg6_xbox_XMemFreePhysicalPages));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemGetWorkingSetStatistics") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemGetWorkingSetStatistics") ==
           win32::proc_address(&pg6_xbox_XMemGetWorkingSetStatistics));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemIsToolsMemAvailable") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemIsToolsMemAvailable") ==
           win32::proc_address(&pg6_xbox_XMemIsToolsMemAvailable));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemMapPhysicalPages") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemMapPhysicalPages") ==
           win32::proc_address(&pg6_xbox_XMemMapPhysicalPages));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemMapPhysicalPagesScatter") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemMapPhysicalPagesScatter") ==
           win32::proc_address(&pg6_xbox_XMemMapPhysicalPagesScatter));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemTransferMemory") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemTransferMemory") ==
           win32::proc_address(&pg6_xbox_XMemTransferMemory));
-    CHECK(win32::GetProcAddress(h_xmem, "XMemVirtualAlloc") ==
+    CHECK(win32::GetProcAddressByName(h_xmem, "XMemVirtualAlloc") ==
           win32::proc_address(&pg6_xbox_XMemVirtualAlloc));
 
     // XCRDAPI.dll (1 export)
     const Pg6Handle h_xcrd = win32::GetModuleHandleA("XCRDAPI.dll");
     CHECK(h_xcrd != win32::kNullHandle);
-    CHECK(win32::GetProcAddress(h_xcrd, "DStorageGetFactory") ==
+    CHECK(win32::GetProcAddressByName(h_xcrd, "DStorageGetFactory") ==
           win32::proc_address(&pg6_xbox_DStorageGetFactory));
 
     // xg_xs.dll (2 exports)
     const Pg6Handle h_xg = win32::GetModuleHandleA("xg_xs.dll");
     CHECK(h_xg != win32::kNullHandle);
-    CHECK(win32::GetProcAddress(h_xg, "XGCreateTextureComputer") ==
+    CHECK(win32::GetProcAddressByName(h_xg, "XGCreateTextureComputer") ==
           win32::proc_address(&pg6_xbox_XGCreateTextureComputer));
-    CHECK(win32::GetProcAddress(h_xg, "XGSuggestSwizzleMode") ==
+    CHECK(win32::GetProcAddressByName(h_xg, "XGSuggestSwizzleMode") ==
           win32::proc_address(&pg6_xbox_XGSuggestSwizzleMode));
 
     // GameInput.dll (1 export: both ordinal #1 and name "GameInputCreate")
     const Pg6Handle h_gi = win32::GetModuleHandleA("GameInput.dll");
     CHECK(h_gi != win32::kNullHandle);
-    CHECK(win32::GetProcAddress(h_gi, "GameInputCreate") ==
+    CHECK(win32::GetProcAddressByName(h_gi, "GameInputCreate") ==
           win32::proc_address(&pg6_xbox_GameInputCreate));
     CHECK(win32::GetProcAddress(h_gi, reinterpret_cast<const char*>(uintptr_t{1})) ==
           win32::proc_address(&pg6_xbox_GameInputCreate));

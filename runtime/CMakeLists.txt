@@ -51,7 +51,11 @@ target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-if(EMSCRIPTEN)
+# Local-only wasm64 test build (tools/run_wasm_tests.py): keeps the CTest executables below enabled
+# under Emscripten instead of building the browser `runtime` target. Off by default.
+option(PLAYGTA6_WASM_TESTS "Build the CTest executables as wasm64 + pthreads Node tests (Emscripten only)" OFF)
+
+if(EMSCRIPTEN AND NOT PLAYGTA6_WASM_TESTS)
     add_executable(runtime main.cpp)
     target_link_libraries(runtime PRIVATE playgta6_core)
     set_target_properties(runtime PROPERTIES
@@ -86,8 +90,10 @@ if(EMSCRIPTEN)
         -Wl,--undefined=__playgta6_xgetbv
     )
 else()
-    find_package(Threads REQUIRED)
-    target_link_libraries(playgta6_core PUBLIC Threads::Threads)
+    if(NOT EMSCRIPTEN)
+        find_package(Threads REQUIRED)
+        target_link_libraries(playgta6_core PUBLIC Threads::Threads)
+    endif()
 
     enable_testing()
     add_executable(runtime_tests ../tests/test_runtime_abi.cpp)
@@ -215,4 +221,39 @@ else()
     add_executable(test_d3d12_xs_exports ../tests/test_d3d12_xs_exports.cpp)
     target_link_libraries(test_d3d12_xs_exports PRIVATE playgta6_core)
     add_test(NAME playgta6_d3d12_xs_exports_tests COMMAND test_d3d12_xs_exports)
+endif()
+
+if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)
+    # Same memory model as the browser runtime (MEMORY64, pthreads, 16 GiB max, sbrk fenced below
+    # the guest pool); -fexceptions because test fault handlers throw. The host_* imports that
+    # os_shim.cpp declares are resolved by a Node-side JS library instead of the page's glue.
+    set(PLAYGTA6_WASM_TEST_JS_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/../tools/wasm_test_support/host_imports.js"
+        CACHE FILEPATH "JS library providing the env.host_* imports for Node-run wasm64 tests")
+    target_compile_options(playgta6_core PUBLIC -pthread -sMEMORY64=1 -fexceptions)
+    # The browser's process arena is the whole 12 GiB guest pool, which leaves no room for the extra
+    # arenas several tests create next to it (offset-arena, rebase and multi-arena checks): tests
+    # get a 4 GiB process arena instead (vmem.h: sizes are build parameters), 8 GiB stay free.
+    target_compile_definitions(playgta6_core PUBLIC PLAYGTA6_PROCESS_GUEST_SPACE_SIZE=4294967296ULL)
+    get_directory_property(_pg6_wasm_targets BUILDSYSTEM_TARGETS)
+    foreach(_t IN LISTS _pg6_wasm_targets)
+        get_target_property(_type ${_t} TYPE)
+        if(_type STREQUAL "EXECUTABLE")
+            set_target_properties(${_t} PROPERTIES SUFFIX ".js")
+            target_link_options(${_t} PRIVATE
+                -pthread -sMEMORY64=1 -fexceptions
+                -sPTHREAD_POOL_SIZE=24
+                -sPROXY_TO_PTHREAD=1
+                -sEXIT_RUNTIME=1
+                -sSTACK_SIZE=1MB
+                -sALLOW_MEMORY_GROWTH=1
+                -sMAXIMUM_MEMORY=16GB
+                -Wl,--wrap=sbrk
+                -sENVIRONMENT=node
+                -sERROR_ON_UNDEFINED_SYMBOLS=1
+                -sNODERAWFS=1  # tests read tests/fixtures from the host, like the native build
+                --js-library=${PLAYGTA6_WASM_TEST_JS_LIBRARY}
+            )
+            set_property(TARGET ${_t} APPEND PROPERTY LINK_DEPENDS "${PLAYGTA6_WASM_TEST_JS_LIBRARY}")
+        endif()
+    endforeach()
 endif()

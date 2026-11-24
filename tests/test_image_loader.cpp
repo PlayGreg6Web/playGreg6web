@@ -49,6 +49,20 @@ void check_code_impl(const ImageError& err, ImageErrorCode code, uint64_t index,
 
 constexpr uint64_t kBase = 0x2'0000'0000ULL;
 
+// Arenas for these tests. Native arenas default to 64 GiB. On wasm every arena comes out of the
+// 12 GiB guest pool [4, 16) GiB (the process arena is shrunk in the wasm test build, see
+// runtime/CMakeLists.txt) and two arenas can be alive at once, so each test asks only for the
+// guest VAs it touches: arena_bytes_to(top) covers [4 GiB, top).
+constexpr uint64_t kPoolEnd = 0x4'0000'0000ULL;  // top of the wasm pool (16 GiB)
+constexpr uint64_t arena_bytes_to([[maybe_unused]] uint64_t top) {
+#ifdef __EMSCRIPTEN__
+    return top - kDefaultArenaBase;
+#else
+    return kDefaultGuestSpaceSize;
+#endif
+}
+constexpr uint64_t kTestArena = arena_bytes_to(0x2'4000'0000ULL);  // images at 8 GiB + small
+
 struct Sec {
     std::string name;
     uint32_t rva = 0;
@@ -383,7 +397,7 @@ void test_parse_image_views() {
 void test_roundtrip_preferred_base() {
     const Img img = fixture();
     const std::vector<uint8_t> bytes = write_container(img);
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
     const Baseline base0 = baseline_of(arena);
 
     LoadedImage li;
@@ -431,7 +445,7 @@ void test_rebase() {
         {0x2'0001'0000ULL, 4},   // small positive delta
     };
     for (const auto& c : cases) {
-        VirtualMemoryArena arena;
+        VirtualMemoryArena arena(kDefaultArenaBase, arena_bytes_to(kPoolEnd));
         const Baseline base0 = baseline_of(arena);
         LoadedImage li;
         CHECK(load(arena, bytes, li, c.base).ok());
@@ -463,7 +477,7 @@ void test_rebase() {
 
     // Preferred base occupied: the arena picks another base and the image is rebased.
     {
-        VirtualMemoryArena arena;
+        VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
         CHECK(arena.reserve(kBase, 0x10000, PageProtect::ReadWrite) == kBase);
         const Baseline base0 = baseline_of(arena);
         LoadedImage li;
@@ -486,14 +500,14 @@ void test_relocations_stripped() {
     const std::vector<uint8_t> bytes = write_container(img);
 
     {
-        VirtualMemoryArena arena;
+        VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
         LoadedImage li;
         CHECK(load(arena, bytes, li).ok());
         CHECK(li.base == kBase && !li.rebased);
         VERIFY_MEMORY(arena, img, li);
     }
     {
-        VirtualMemoryArena arena;
+        VirtualMemoryArena arena(kDefaultArenaBase, arena_bytes_to(0x2'9000'0000ULL));
         const Baseline base0 = baseline_of(arena);
         LoadedImage li;
         CHECK_CODE(load(arena, bytes, li, 0x2'8000'0000ULL), ImageErrorCode::RelocationsStripped);
@@ -501,7 +515,7 @@ void test_relocations_stripped() {
     }
     {
         // Preferred base taken: there is no fallback for an image that cannot be rebased.
-        VirtualMemoryArena arena;
+        VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
         CHECK(arena.reserve(kBase, 0x10000, PageProtect::ReadWrite) == kBase);
         const Baseline base0 = baseline_of(arena);
         LoadedImage li;
@@ -528,7 +542,7 @@ void test_omitted_executable_bytes() {
     CHECK(parsed.layout.header.executable_bytes_omitted());
     CHECK(parsed.layout.sections[1].bytes_omitted() && parsed.payloads[1].empty());
 
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
     LoadedImage li;
     CHECK(load(arena, bytes, li, 0x2'0010'0000ULL).ok());
     CHECK(li.rebased && li.dir64_applied == 1 && li.highlow_applied == 1);
@@ -570,7 +584,7 @@ void test_protection_variants() {
         {"b", 0x5800, 0x10, W | X, 0, pattern(7, 0x10), 0},
     };
     const std::vector<uint8_t> bytes = write_container(img);
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
     LoadedImage li;
     CHECK(load(arena, bytes, li).ok());
     VERIFY_MEMORY(arena, img, li);
@@ -739,7 +753,7 @@ void test_corrupt_containers() {
 void test_cleanup_on_failure() {
     const Img img = fixture();
     const std::vector<uint8_t> good = write_container(img);
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
     const uint64_t other = arena.reserve(0, 0x20000, PageProtect::ReadWrite);
     CHECK(other != 0);
     CHECK(arena.commit(other, 0x4000, PageProtect::ReadWrite));
@@ -824,13 +838,13 @@ void test_streaming_reader() {
         log.reads.emplace_back(off, len);
         return mem.read(off, dst, len);
     });
-    VirtualMemoryArena a1;
+    VirtualMemoryArena a1(kDefaultArenaBase, arena_bytes_to(0x2'8000'0000ULL));
     LoadedImage streamed;
     LoadOptions opts;
     opts.requested_base = 0x2'4000'0000ULL;
     CHECK(load_image(streaming, a1, opts, streamed).ok());
 
-    VirtualMemoryArena a2;
+    VirtualMemoryArena a2(kDefaultArenaBase, arena_bytes_to(0x2'8000'0000ULL));
     LoadedImage direct;
     CHECK(load_image(bytes, a2, opts, direct).ok());
 
@@ -881,7 +895,7 @@ void test_hostile_reader() {
     CHECK_CODE(parse_layout(hostile, layout), ImageErrorCode::ReadFailed);
     CHECK(layout.sections.empty() && served == 64);
 
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
     LoadedImage li;
     LoadOptions opts;
     CHECK_CODE(load_image(hostile, arena, opts, li), ImageErrorCode::ReadFailed);
@@ -909,7 +923,7 @@ void test_large_sparse_image() {
     const std::vector<uint8_t> bytes = write_container(img);
     CHECK(bytes.size() < 0xC0000);  // tables + payloads only, not SizeOfImage
 
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, arena_bytes_to(0x3'0000'0000ULL));
     LoadedImage li;
     size_t payload_reads = 0;
     MemoryImageReader mem(bytes);
@@ -1063,7 +1077,7 @@ void test_golden_rust_container() {
     CHECK(write_container(img) == golden);
 
     // Loading it rebases exactly as apply_relocations does.
-    VirtualMemoryArena arena;
+    VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
     LoadedImage li;
     CHECK(load(arena, golden, li, 0x1'4001'0000ULL).ok());
     CHECK(li.rebased && li.dir64_applied == 1 && li.highlow_applied == 2);

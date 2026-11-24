@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <set>
 #include <string>
 #include <thread>
@@ -1159,19 +1160,28 @@ void test_bcrypt() {
 // Window fake
 // ---------------------------------------------------------------------------
 
+// Class names are MAKEINTATOM-style "name or atom" pointers: a value with HIWORD == 0 is an atom.
+// Emscripten places string literals below 64 KiB on wasm64, so literals would be read as atoms;
+// copy names onto the heap (guest pointers are never below 64 KiB either).
+const char* class_name_ptr(const char* literal) {
+    static std::deque<std::string> keep;
+    keep.emplace_back(literal);
+    return keep.back().c_str();
+}
+
 void test_windows() {
     reset_window_state();
     Pg6WndClassExA wc{};
     wc.size = sizeof(wc);
     wc.window_proc = 0x140001000;
-    wc.class_name = "TitleWindow";
+    wc.class_name = class_name_ptr("TitleWindow");
     const uint16_t atom = pg6_win32_register_class_ex_a(&wc);
     CHECK(atom >= 0xC000);
     CHECK(pg6_win32_register_class_ex_a(&wc) == 0);
     CHECK(GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
-    wc.class_name = "TITLEWINDOW";  // class names are case-insensitive
+    wc.class_name = class_name_ptr("TITLEWINDOW");  // class names are case-insensitive
     CHECK(pg6_win32_register_class_ex_a(&wc) == 0);
-    wc.class_name = "Other";
+    wc.class_name = class_name_ptr("Other");
     CHECK(pg6_win32_register_class_ex_a(&wc) == atom + 1);
     Pg6WndClassExA bad = wc;
     bad.size = 48;
@@ -1183,22 +1193,22 @@ void test_windows() {
     bad.class_name = reinterpret_cast<const char*>(0x1234);  // an atom, not a name
     CHECK(pg6_win32_register_class_ex_a(&bad) == 0);
     bad = wc;
-    bad.class_name = "NoProc";
+    bad.class_name = class_name_ptr("NoProc");
     bad.window_proc = 0;
     CHECK(pg6_win32_register_class_ex_a(&bad) == 0);
     CHECK(pg6_win32_register_class_ex_a(nullptr) == 0);
 
     CHECK(window_count() == 0);
-    CHECK(pg6_win32_create_window_ex_a(0, "NoSuchClass", "t", 0, 0, 0, 1, 1, 0, 0, 0, nullptr) == 0);
+    CHECK(pg6_win32_create_window_ex_a(0, class_name_ptr("NoSuchClass"), "t", 0, 0, 0, 1, 1, 0, 0, 0, nullptr) == 0);
     CHECK(GetLastError() == ERROR_CANNOT_FIND_WND_CLASS);
     CHECK(pg6_win32_create_window_ex_a(0, nullptr, "t", 0, 0, 0, 1, 1, 0, 0, 0, nullptr) == 0);
     const Pg6Handle hwnd =
-        pg6_win32_create_window_ex_a(0, "titlewindow", "Title", 0x10CF0000, 0, 0, 1920, 1080, 0, 0, 0x140000000, nullptr);
+        pg6_win32_create_window_ex_a(0, class_name_ptr("titlewindow"), "Title", 0x10CF0000, 0, 0, 1920, 1080, 0, 0, 0x140000000, nullptr);
     CHECK(hwnd != 0 && window_count() == 1);
     const Pg6Handle by_atom = pg6_win32_create_window_ex_a(
         0, reinterpret_cast<const char*>(static_cast<uintptr_t>(atom)), nullptr, 0, 0, 0, 1, 1, hwnd, 0, 0, nullptr);
     CHECK(by_atom != 0 && by_atom != hwnd);
-    CHECK(pg6_win32_create_window_ex_a(0, "TitleWindow", nullptr, 0, 0, 0, 1, 1, 0xBAD, 0, 0, nullptr) == 0);
+    CHECK(pg6_win32_create_window_ex_a(0, class_name_ptr("TitleWindow"), nullptr, 0, 0, 0, 1, 1, 0xBAD, 0, 0, nullptr) == 0);
     CHECK(GetLastError() == ERROR_INVALID_WINDOW_HANDLE);
 
     // DefWindowProc: 0, except WM_NCCREATE which must be TRUE for creation to proceed.
@@ -1248,7 +1258,7 @@ void test_windows() {
 
     reset_window_state();
     CHECK(window_count() == 0 && queued_message_count() == 0);
-    CHECK(pg6_win32_create_window_ex_a(0, "TitleWindow", nullptr, 0, 0, 0, 1, 1, 0, 0, 0, nullptr) == 0);
+    CHECK(pg6_win32_create_window_ex_a(0, class_name_ptr("TitleWindow"), nullptr, 0, 0, 0, 1, 1, 0, 0, 0, nullptr) == 0);
 }
 
 }  // namespace
