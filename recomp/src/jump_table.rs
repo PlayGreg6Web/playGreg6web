@@ -165,7 +165,19 @@ struct RawGuard {
 }
 
 /// Resolve the jump table dispatched by the indirect `jmp` that ends `trace`.
+#[cfg(test)]
 pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpTable> {
+    resolve_in(image, trace, None)
+}
+
+/// [`resolve`] for a jump whose function extent is known: `leaf` is `[entry, next entry)` of the
+/// discovered function containing the jump. It is used only for a jump outside every `.pdata`
+/// range (a leaf function), to bound an inferred table ([`infer_extent`]).
+pub(crate) fn resolve_in(
+    image: &CodeImage<'_>,
+    trace: &[Step<'_>],
+    leaf: Option<(u64, u64)>,
+) -> Option<JumpTable> {
     let at = trace.len().checked_sub(1)?;
     let jmp = trace[at].instr;
     if jmp.flow_control() != FlowControl::IndirectBranch {
@@ -191,7 +203,14 @@ pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpT
     };
 
     let Some(bound) = slicer.bound(load.index, load.index_at, load.index_width, 0) else {
-        return infer_extent(image, jmp, trace[load.at].instr.ip(), load.table, encoding);
+        return infer_extent(
+            image,
+            jmp,
+            trace[load.at].instr.ip(),
+            load.table,
+            encoding,
+            leaf,
+        );
     };
     if bound.min > bound.max {
         return None;
@@ -318,21 +337,47 @@ fn is_table_read(instr: &Instruction) -> bool {
 const MIN_INFERRED_ENTRIES: usize = 2;
 /// Most entries read for an inferred table.
 const MAX_INFERRED_ENTRIES: usize = 4096;
+/// Largest `.pdata` gap accepted as the extent of a leaf function's inferred table.
+const MAX_LEAF_GAP: u64 = 0x1000;
 
 /// A matched table load (`[base + index*scale]` on a known table base, the dispatch shape of a
 /// compiled switch) whose index bound the slice cannot prove, e.g. a remainder computed by a loop
 /// or a merge with several incoming paths. The table is read from index 0 while entries land
 /// inside the `.pdata` function that contains the jump; the first entry that does not ends it.
 /// Over-reading only adds case blocks inside the function, under-reading leaves a value to the
-/// runtime dispatcher (see [`JumpTable::inferred`]). Not done without a `.pdata` owner.
+/// runtime dispatcher (see [`JumpTable::inferred`]). A jump outside every `.pdata` range is in a
+/// leaf function (no unwind data): its cases are taken from the jump to the next discovered
+/// function entry (`leaf` = `[entry, next entry)`), inside the gap between the neighbouring
+/// `.pdata` ranges (bounded on both sides, at most [`MAX_LEAF_GAP`] bytes). Not done without a
+/// `.pdata` owner or both bounds.
 fn infer_extent(
     image: &CodeImage<'_>,
     jmp: &Instruction,
     load_site: u64,
     table: u64,
     encoding: EntryEncoding,
+    leaf: Option<(u64, u64)>,
 ) -> Option<JumpTable> {
-    let owner = image.function_table.function_at(jmp.ip())?;
+    let owner = image.function_table.function_at(jmp.ip());
+    let leaf_gap = match owner {
+        Some(_) => None,
+        None => {
+            let (gap_start, gap_end) = image
+                .function_table
+                .gap_at(jmp.ip())
+                .filter(|(start, end)| end - start <= MAX_LEAF_GAP)?;
+            let (entry, next) = leaf?;
+            let (start, end) = (entry.max(gap_start), next.min(gap_end));
+            (start <= jmp.ip() && jmp.ip() < end).then_some(())?;
+            // Cases after the dispatch only: an over-read entry that lands before it (e.g. inside
+            // another switch's dispatch sequence) would split blocks of proven code.
+            Some((jmp.next_ip(), end))
+        }
+    };
+    let inside = |target: u64| match leaf_gap {
+        Some((start, end)) => (start..end).contains(&target),
+        None => image.function_table.function_at(target) == owner,
+    };
     let entry_size = encoding.entry_size();
     let mut targets = Vec::new();
     let mut va = table;
@@ -341,9 +386,7 @@ fn infer_extent(
             break;
         };
         let target = encoding.decode(chunk);
-        if image.code_bytes(target).is_err()
-            || image.function_table.function_at(target) != Some(owner)
-        {
+        if image.code_bytes(target).is_err() || !inside(target) {
             break;
         }
         targets.push(target);
@@ -2299,6 +2342,35 @@ mod tests {
 
         // Without a `.pdata` function the extent is not inferred.
         let analysis = analyze(&code, &data, &[0], &[]);
+        assert_unresolved(&analysis, (jmp_va - TEXT) as u32);
+
+        // A leaf function (no `.pdata` record) followed by a `.pdata` function `next`: the
+        // extent is [leaf entry, next entry) inside the `.pdata` gap.
+        let end = code.len() as u32;
+        let next = end + 0x10;
+        let mut padded = code.clone();
+        padded.resize(next as usize, 0xCC);
+        padded.extend_from_slice(&[0xC3; 0x10]);
+        let neighbours = [(0x0, 0x1, 0x0), (next, next + 0x10, next)];
+        let analysis = analyze(&padded, &data, &[0, next], &neighbours);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(table.inferred);
+        assert_eq!(table.targets, cases[..3]);
+
+        // `next` another leaf in the same gap: an entry at or past it ends the table.
+        let mut two_leaves = padded.clone();
+        two_leaves.extend_from_slice(&[0xC3; 0x10]);
+        let gap_end = next + 0x10;
+        let leaf_neighbours = [(0x0, 0x1, 0x0), (gap_end, gap_end + 0x10, gap_end)];
+        let mut into_next = rva_table(cases[..2].iter().map(|va| (va - BASE) as u32));
+        into_next.extend_from_slice(&rva_table([(TEXT - BASE) as u32 + next, 0]));
+        let analysis = analyze(&two_leaves, &into_next, &[0, next], &leaf_neighbours);
+        assert_eq!(analysis.jump_tables[&jmp_va].targets, cases[..2]);
+
+        // The gap must be bounded on both sides, and the function by a next entry.
+        let analysis = analyze(&padded, &data, &[0, next], &[(next, next + 0x10, next)]);
+        assert_unresolved(&analysis, (jmp_va - TEXT) as u32);
+        let analysis = analyze(&padded, &data, &[0], &neighbours);
         assert_unresolved(&analysis, (jmp_va - TEXT) as u32);
 
         // A single in-function entry is not a table.

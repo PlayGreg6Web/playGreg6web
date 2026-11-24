@@ -662,10 +662,19 @@ impl<'i, 'a> Discovery<'i, 'a> {
         Some((constants, all))
     }
 
+    /// `[entry, next entry)` of the discovered function entries around `site` (both must exist):
+    /// the extent of a leaf function, which has no `.pdata` range ([`jump_table::resolve_in`]).
+    fn leaf_extent(&self, site: u64) -> Option<(u64, u64)> {
+        let entry = *self.entries.range(..=site).next_back()?;
+        let next = *self.entries.range(site + 1..).next()?;
+        Some((entry, next))
+    }
+
     /// Slice the jump at `site` together with its chain of sole predecessors.
     fn match_jump_table(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<JumpTable> {
         let (trace, first_block) = self.jump_trace(site, preds)?;
-        if let Some(table) = jump_table::resolve(self.image, &trace) {
+        let leaf = self.leaf_extent(site);
+        if let Some(table) = jump_table::resolve_in(self.image, &trace, leaf) {
             return Some(table);
         }
         // The chain stops at a merge (e.g. a loop header): a table base or an index bound
@@ -675,14 +684,15 @@ impl<'i, 'a> Discovery<'i, 'a> {
         // resolution.
         let (constants, all) = self.reaching_prefix(&trace, first_block, preds)?;
         if !constants.is_empty()
-            && let Some(table) = jump_table::resolve(self.image, &prefixed(&constants, &trace))
+            && let Some(table) =
+                jump_table::resolve_in(self.image, &prefixed(&constants, &trace), leaf)
         {
             return Some(table);
         }
         if all.len() == constants.len() {
             return None;
         }
-        jump_table::resolve(self.image, &prefixed(&all, &trace))
+        jump_table::resolve_in(self.image, &prefixed(&all, &trace), leaf)
     }
 
     /// Why each indirect jump without an import slot that is left to run-time dispatch did not

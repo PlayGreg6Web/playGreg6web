@@ -633,6 +633,16 @@ impl FunctionTable {
         self.range_at(va).map(|r| r.function)
     }
 
+    /// The gap between two `.pdata` ranges that contains `va` (`[previous end, next start)`), or
+    /// `None` when `va` is covered or lies before the first / after the last range. Leaf functions
+    /// (no unwind data, so no `.pdata` record) live in such gaps.
+    pub fn gap_at(&self, va: u64) -> Option<(u64, u64)> {
+        let idx = self.ranges.partition_point(|r| r.start <= va);
+        let previous = self.ranges.get(idx.checked_sub(1)?)?;
+        let next = self.ranges.get(idx)?;
+        (va >= previous.end).then_some((previous.end, next.start))
+    }
+
     /// Primary function entries in ascending order.
     pub fn function_entries(&self) -> impl Iterator<Item = u64> + '_ {
         self.ranges
