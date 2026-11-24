@@ -44,6 +44,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_resources.cpp
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
+    os/xmem_windows.cpp
     guest/guest_runtime.cpp
     guest/guest_exceptions.cpp
     guest/com_bridge.cpp
@@ -243,6 +244,10 @@ else()
     add_executable(test_xasync_provider ../tests/test_xasync_provider.cpp)
     target_link_libraries(test_xasync_provider PRIVATE playgta6_core)
     add_test(NAME playgta6_xasync_provider_tests COMMAND test_xasync_provider)
+
+    add_executable(test_xmem_windows ../tests/test_xmem_windows.cpp)
+    target_link_libraries(test_xmem_windows PRIVATE playgta6_core)
+    add_test(NAME playgta6_xmem_windows_tests COMMAND test_xmem_windows)
 
     add_executable(test_d3d12_xs_exports ../tests/test_d3d12_xs_exports.cpp)
     target_link_libraries(test_d3d12_xs_exports PRIVATE playgta6_core)

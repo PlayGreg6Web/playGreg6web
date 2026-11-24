@@ -217,7 +217,9 @@ bool Resource::initialize() {
         if (placement_.address != 0) {
             gpu_va_ = placement_.address;
             const uint64_t cpu = dev.cpu_address_for_gpu(placement_.address);
-            if (com::guest_to_host(cpu, static_cast<size_t>(size)) != nullptr) {
+            // Inside an alias window the CPU pages may be mapped later (streaming): keep the CPU
+            // address; flush_shadow reads whatever is mapped at each submission.
+            if (cpu != placement_.address || com::guest_to_host(cpu, static_cast<size_t>(size)) != nullptr) {
                 cpu_va_ = cpu;
             } else {
                 dev.note_bad_argument("resource at " + hex(placement_.address) +
@@ -333,9 +335,14 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu_va_, static_cast<size_t>(size)));
     std::vector<uint8_t> copy;
     if (live == nullptr) {
-        copy.resize(static_cast<size_t>(size));
+        // Not mapped in one piece (e.g. an alias-window buffer whose pages are mapped one by one):
+        // unreadable pages keep their shadow contents, i.e. count as unchanged.
+        copy.assign(shadow_.begin(), shadow_.end());
         if (!com::read_guest(cpu_va_, copy.data(), copy.size())) {
-            return;
+            for (uint64_t page = 0; page < size; page += kShadowPage) {
+                const uint64_t n = std::min(kShadowPage, size - page);
+                com::read_guest(cpu_va_ + page, copy.data() + page, static_cast<size_t>(n));
+            }
         }
         live = copy.data();
     }

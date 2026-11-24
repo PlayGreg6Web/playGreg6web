@@ -694,6 +694,7 @@ private:
     };
     mutable std::mutex alias_mutex_;
     std::vector<AliasWindow> aliases_;
+    uint64_t alias_listener_ = 0;  // os::xmem_windows subscription (O27)
 };
 
 // ---------------------------------------------------------------------------------------------

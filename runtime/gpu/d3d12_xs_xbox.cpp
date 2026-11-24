@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -686,6 +687,11 @@ GuestResourceAllocationInfo Device::GetResourceAllocationInfo1(uint32_t visible_
 
 void Device::register_gpu_alias(uint64_t gpu_base, uint64_t cpu_base, uint64_t size) {
     std::lock_guard<std::mutex> lock(alias_mutex_);
+    for (const AliasWindow& w : aliases_) {
+        if (w.gpu_base == gpu_base && w.cpu_base == cpu_base && w.size == size) {
+            return;
+        }
+    }
     aliases_.push_back(AliasWindow{gpu_base, cpu_base, size});
 }
 
@@ -720,8 +726,51 @@ HResult CommandQueue::ResumeX() {
     return kSOk;
 }
 
-HResult CommandQueue::Slot31_UpdatePageMappings_unverified(com::CallContext&) {
-    device_->count(xbox::Counter::PageMappingsIgnored);
+HResult CommandQueue::Slot31_UpdatePageMappings_unverified(com::CallContext& ctx) {
+    // (range count, ranges, page-pool address, pool pages, 0); range = {u64 GPU-window address,
+    // u32 entry count, u64 entries}, entry = {u32 kind, u32 pool page, u32 page count}
+    // (d3d12_xs_xbox.h). Applied to the XMem GPU page table (os/xmem_windows.h).
+    const uint64_t count = static_cast<uint32_t>(ctx.int_arg(1));
+    const uint64_t ranges_va = ctx.int_arg(2);
+    const uint64_t pool_va = ctx.int_arg(3);
+    const uint64_t pool_pages = static_cast<uint32_t>(ctx.int_arg(4));
+    constexpr uint64_t kMaxRanges = 1u << 16, kMaxEntries = 1u << 20;
+    if (count > kMaxRanges || (count != 0 && ranges_va == 0)) {
+        device_->note_bad_argument("page-mapping update (queue slot 31): bad range array");
+        return kEInvalidArg;
+    }
+    std::vector<os::xmem_windows::PageMappingRange> ranges(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        struct {
+            uint64_t gpu_va;
+            uint32_t entries;
+            uint32_t pad;
+            uint64_t entries_va;
+        } r{};
+        static_assert(sizeof(r) == 0x18);
+        if (!com::read_guest(ranges_va + sizeof(r) * i, &r, sizeof(r)) || r.entries > kMaxEntries ||
+            (r.entries != 0 && r.entries_va == 0)) {
+            device_->note_bad_argument("page-mapping update (queue slot 31): unreadable range " + std::to_string(i));
+            return kEInvalidArg;
+        }
+        ranges[i].gpu_va = r.gpu_va;
+        ranges[i].entries.resize(r.entries);
+        for (uint32_t e = 0; e < r.entries; ++e) {
+            uint32_t words[3] = {};
+            if (!com::read_guest(r.entries_va + sizeof(words) * e, words, sizeof(words))) {
+                device_->note_bad_argument("page-mapping update (queue slot 31): unreadable entry");
+                return kEInvalidArg;
+            }
+            ranges[i].entries[e] = {words[0], words[1], words[2]};
+        }
+    }
+    const auto result = os::xmem_windows::apply_gpu_page_mappings(ranges, pool_va, pool_pages);
+    device_->count(xbox::Counter::PageMappingsApplied);
+    if (result.outside_window != 0 || result.skipped_entries != 0) {
+        device_->note_bad_argument("page-mapping update (queue slot 31): " + std::to_string(result.outside_window) +
+                                   " pages outside a GPU window, " + std::to_string(result.skipped_entries) +
+                                   " unknown entries");
+    }
     return kSOk;
 }
 

@@ -440,22 +440,19 @@ void* pg6_xbox_XMemAlloc(size_t size, uint64_t attributes);
 void* pg6_xbox_XMemAllocDefault(size_t size, uint64_t attributes);
 void pg6_xbox_XMemFree(void* address, uint64_t attributes);
 void pg6_xbox_XMemFreeDefault(void* address, uint64_t attributes);
-int32_t pg6_xbox_XMemAllocatePhysicalPages(size_t* num_pages,
-                                           uint64_t* page_array,
-                                           uint32_t flags,
-                                           uint32_t protect);
+// Physical pages, in the shapes of the title's call sites (O27; the AWE-style
+// AllocateUserPhysicalPages / MapUserPhysicalPages[Scatter] argument order):
+//   XMemAllocatePhysicalPages(attributes, &count, pfns) -> 1 / 0
+//   XMemMapPhysicalPages(address, count, pfns) -> address (pfns null: unmap the slots); a null
+//     address places the pages in a fresh guest block (host callers; xmem_unmap_physical_pages)
+//   XMemMapPhysicalPagesScatter(addresses, count, pfns) -> 1 / 0 (null array or pfn 0: unmap)
+// `addresses` holds guest VAs (it is an array the import bridge does not translate).
+int32_t pg6_xbox_XMemAllocatePhysicalPages(uint64_t attributes, size_t* num_pages, uint64_t* page_array);
 int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_array);
-void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address,
-                                    size_t num_pages,
-                                    uint32_t protect,
-                                    const uint64_t* page_array,
-                                    uint32_t flags);
-void* pg6_xbox_XMemMapPhysicalPagesScatter(void* virtual_address,
-                                           size_t num_pages,
-                                           uint32_t protect,
-                                           const uint64_t* page_array,
-                                           const uint64_t* virtual_offsets,
-                                           uint32_t flags);
+void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address, size_t num_pages, const uint64_t* page_array);
+int32_t pg6_xbox_XMemMapPhysicalPagesScatter(const uint64_t* virtual_addresses,
+                                             size_t num_pages,
+                                             const uint64_t* page_array);
 // XMemVirtualAlloc(address, size, flAllocationType, XMem flags, flProtect): VirtualAlloc plus
 // an XMem flags argument in the 4th position. The order is taken from the title's call sites
 // (reserve with MEM_64K_PAGES | MEM_RESERVE, XMem flags 0x21 / 0x3, protection PAGE_READWRITE /

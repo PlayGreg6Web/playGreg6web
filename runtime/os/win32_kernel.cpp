@@ -1,5 +1,7 @@
 #include "os/win32_kernel.h"
 
+#include "os/xmem_windows.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -1146,7 +1148,18 @@ size_t VirtualQuery(uint64_t address, MemoryBasicInformation* buffer, size_t len
         return 0;
     }
 
-    const MemoryBasicInfo info = get_vmem_arena()->query(address);
+    MemoryBasicInfo info = get_vmem_arena()->query(address);
+    xmem_windows::Window phantom;
+    if (info.state == MemState::Free && xmem_windows::is_phantom(address) &&
+        xmem_windows::find_window(address, 1, &phantom)) {
+        // O27: a GPU window placed outside the guest pool reads as a no-access reservation.
+        info.base_address = address & ~(kPageSize - 1);
+        info.allocation_base = phantom.base;
+        info.region_size = phantom.base + phantom.size - info.base_address;
+        info.state = MemState::Reserve;
+        info.protect = PageProtect::NoAccess;
+        info.allocation_protect = PageProtect::NoAccess;
+    }
     buffer->base_address = info.base_address;
     buffer->allocation_base = info.allocation_base;
     buffer->allocation_protect = static_cast<uint32_t>(info.allocation_protect);

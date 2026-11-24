@@ -8,6 +8,7 @@
 
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
+#include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -230,9 +231,16 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     bo.id_allocator = [this] { return allocate_id(); };
     bridge_ = std::make_unique<bridge::StateBridgeDevice>(heaps_, std::move(bo), &resource_states_);
     sink_ = options_.sink;
+    // O27: the XMem CPU/GPU window pairs, whether reserved before or after this device.
+    alias_listener_ = os::xmem_windows::add_alias_listener([this](const os::xmem_windows::AliasPair& p) {
+        register_gpu_alias(p.gpu_base, p.cpu_base, p.size);
+    });
 }
 
-Device::~Device() = default;
+Device::~Device() {
+    os::xmem_windows::remove_alias_listener(alias_listener_);
+    pacer_.shutdown();
+}
 
 void Device::initialize_guest_payload() {
     const uint8_t one = 1;

@@ -23,6 +23,8 @@
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/xbox_scarlett.h"
+#include "os/xmem_windows.h"
 
 namespace {
 
@@ -1950,7 +1952,7 @@ void test_xbox_device_queue_and_list_slots() {
     CHECK(hr(fx.vcall(scene.queue, XSlot::Suspend, {I(0)})) == 0 && queue->suspended());
     CHECK(hr(fx.vcall(scene.queue, XSlot::Resume)) == 0 && !queue->suspended());
     CHECK(hr(fx.vcall(scene.queue, XSlot::PageMappings, {I(0), I(0), I(0), I(0), I(0)})) == 0);
-    CHECK(counter(dev, dg::xbox::Counter::PageMappingsIgnored) == 1);
+    CHECK(counter(dev, dg::xbox::Counter::PageMappingsApplied) == 1);
 
     // Allocator slot 9: the command-buffer allocation callback is recorded, never called.
     CHECK(hr(fx.vcall(scene.allocator, XSlot::AllocationCallback, {I(0x140005000), I(0x1234)})) == 0);
@@ -1986,6 +1988,65 @@ void test_xbox_device_queue_and_list_slots() {
     scene.release_all({list, buf, heap, aliased});
 }
 
+// O27: the XMem CPU/GPU windows reach the device's alias table whether they are reserved before
+// or after the device, and queue slot 31 applies GPU-window page mappings.
+void test_xmem_window_alias_wiring() {
+    namespace xw = playgta6::os::xmem_windows;
+    namespace sc = playgta6::os::scarlett;
+    constexpr uint64_t S = 1ull << 30, k64K = 64ull << 10;
+    constexpr uint32_t kType = 0x20402000u;
+    sc::xmem_reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuWindows);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kType, 0x21u, 0x4u);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kType, 0x3u, 0x801u);
+    CHECK(cpu != nullptr && gpu != nullptr);
+    {
+        Fixture fx;
+        const uint64_t device = fx.create_device();
+        dg::Device* dev = host_device(device);
+        const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu);
+        const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu);
+        CHECK(G >= xw::kPhantomBase && dev->cpu_address_for_gpu(G + 3 * k64K + 8) == C + 3 * k64K + 8);
+        // A buffer created at a GPU-window address reads its bytes from the CPU window, page by page
+        // as pages get mapped.
+        int32_t result = -1;
+        const uint64_t buf = fx.create(device, Slot2::CreatePlacedResourceX,
+                                       {I(G + 4 * k64K), I(put(buffer_desc(2 * k64K))), I(0), I(0)},
+                                       dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(buf)->cpu_address() == C + 4 * k64K);
+        // Queue slot 31: one range, map pool pages 2 and 3 at GPU pages 4 and 5.
+        const uint64_t queue = fx.create(device, Slot::CreateCommandQueue, {I(put(dg::GuestCommandQueueDesc{}))},
+                                         dg::IID_ID3D12CommandQueue);
+        const uint32_t entries[6] = {1, 2, 1, 1, 3, 1};
+        struct {
+            uint64_t gpu_va;
+            uint32_t n, pad;
+            uint64_t entries;
+        } range{G + 4 * k64K, 2, 0, put_bytes(entries, sizeof(entries))};
+        CHECK(hr(fx.vcall(queue, 31, {I(1), I(put(range)), I(0x1000), I(16), I(0)})) == 0);
+        CHECK(xw::gpu_page_pool_index(G + 4 * k64K) == 2 && xw::gpu_page_pool_index(G + 5 * k64K) == 3);
+        CHECK(hr(fx.vcall(queue, 31, {I(1), I(0), I(0), I(0), I(0)})) == dg::kEInvalidArg);
+        fx.vcall(buf, Slot::Release);
+        fx.vcall(queue, Slot::Release);
+        CHECK(fx.vcall(device, Slot::Release) == 0);
+    }
+    {
+        // Windows reserved after the device exists.
+        sc::xmem_reset_for_testing();
+        xw::set_policy(xw::PlacementPolicy::PhantomGpuWindows);
+        Fixture fx;
+        const uint64_t device = fx.create_device();
+        dg::Device* dev = host_device(device);
+        void* cpu2 = pg6_xbox_XMemVirtualAlloc(nullptr, S, kType, 0x21u, 0x4u);
+        void* gpu2 = pg6_xbox_XMemVirtualAlloc(nullptr, S, kType, 0x3u, 0x801u);
+        const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu2);
+        const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu2);
+        CHECK(dev->cpu_address_for_gpu(G + 8) == C + 8);
+        CHECK(fx.vcall(device, Slot::Release) == 0);
+    }
+    sc::xmem_reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -2007,6 +2068,7 @@ int main() {
     test_frame_pacer_unit();
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_device_queue_and_list_slots();
+    test_xmem_window_alias_wiring();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -20,6 +21,7 @@
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/xmem_windows.h"
 
 namespace playgta6::os::scarlett {
 
@@ -150,11 +152,13 @@ struct HeapAllocation {
 struct PhysicalPage {
     uint64_t handle = 0;
     uint64_t page_size = kXMemPageSize64K;
-    uint32_t protect = win32::PAGE_READWRITE;
-    uint32_t flags = 0;
-    // Guest heap block holding the page contents while the page is not mapped; 0 means "all
-    // zero, or currently inside a mapping" (see the physical page model below).
+    uint64_t attributes = 0;
+    // Guest heap block holding the page contents while the page has no home; 0 means "all zero,
+    // or currently at its home" (see the physical page model below).
     uint64_t store_va = 0;
+    // Guest VA where the page's bytes currently live (a real mapping), 0 if none.
+    uint64_t home_va = 0;
+    uint32_t mapped_slots = 0;  // real and phantom mappings
 };
 
 struct VirtualRegion {
@@ -164,18 +168,14 @@ struct VirtualRegion {
     uint32_t allocation_type = 0;
     uint32_t protect = win32::PAGE_READWRITE;
     bool committed = false;
+    bool phantom = false;     // O27: placed in the phantom space (no guest memory)
+    bool cpu_window = false;  // O27: a CPU window (xmem_windows.h)
 };
 
-struct PhysicalMapping {
-    void* base = nullptr;
-    size_t size = 0;
+// A guest heap block that XMemMapPhysicalPages(nullptr, ...) created for its pages.
+struct OwnedBlock {
+    uint64_t size = 0;
     size_t alignment = static_cast<size_t>(kXMemPageSize64K);
-    uint64_t page_size = kXMemPageSize64K;
-    uint32_t protect = win32::PAGE_READWRITE;
-    uint32_t flags = 0;
-    bool owns_buffer = true;
-    std::vector<uint64_t> page_handles;
-    std::vector<uint64_t> virtual_offsets;
 };
 
 struct XMemState {
@@ -186,7 +186,9 @@ struct XMemState {
     std::unordered_map<void*, HeapAllocation> heap_allocs;
     std::unordered_map<uint64_t, std::shared_ptr<PhysicalPage>> physical_pages;
     std::unordered_map<void*, VirtualRegion> virtual_regions;
-    std::unordered_map<void*, PhysicalMapping> mappings;
+    std::map<uint64_t, void*> region_index;     // guest base -> virtual_regions key
+    std::map<uint64_t, OwnedBlock> owned_blocks;  // guest base -> block
+    std::map<uint64_t, uint64_t> page_slots;      // mapped page VA (guest) -> page handle
 
     uint64_t next_page_handle = 0x1000ULL;
     uint64_t heap_allocated_bytes = 0;
@@ -195,6 +197,7 @@ struct XMemState {
     uint64_t virtual_reserved_bytes = 0;
     uint64_t mapped_physical_bytes = 0;
     uint64_t peak_working_set_bytes = 0;
+    uint64_t alias_conflicts = 0;  // a page mapped at a second real address while it had a home
 
     void update_peak_locked() {
         const uint64_t current =
@@ -218,6 +221,18 @@ struct XMemState {
         return &it->second;
     }
 
+    // Region containing the guest range [va, va + len), if any.
+    VirtualRegion* region_containing_locked(uint64_t va, uint64_t len);
+    // Owned block containing [va, va + len): its base, or 0.
+    uint64_t block_containing_locked(uint64_t va, uint64_t len) const {
+        auto it = owned_blocks.upper_bound(va);
+        if (it == owned_blocks.begin()) {
+            return 0;
+        }
+        --it;
+        return va - it->first < it->second.size && len <= it->second.size - (va - it->first) ? it->first : 0;
+    }
+
     // Guest memory belongs to the arena; nothing to give back at process exit (the arena may
     // already be gone during static destruction).
 };
@@ -227,16 +242,37 @@ XMemState& xmem_state() {
     return state;
 }
 
-// Physical page model
-// -------------------
-// XMemAllocatePhysicalPages returns opaque page frame numbers for runtime-tracked pages; the
-// pages own no memory until they hold data. Mapping a page set (XMemMapPhysicalPages[Scatter])
-// materialises the pages in the guest address space - in a fresh guest heap block, or committed
-// inside an XMemVirtualAlloc region - by MOVING each page's stored contents there (the store is
-// freed). Unmapping, freeing the region, or xmem_reset_for_testing() moves the bytes back into a
-// new store (all-zero pages need no store). A page's bytes therefore exist exactly once in guest
-// memory and persist across unmap / map cycles; mapping the same page at two addresses at once
-// is not coherent (the second mapping starts zeroed), as before.
+// Physical page model (O24, reworked in O27 for the title's call shapes)
+// ----------------------------------------------------------------------
+// XMemAllocatePhysicalPages(attributes, &count, pfns) returns opaque page frame numbers for
+// runtime-tracked pages; the pages own no memory until they hold data. Pages are mapped one 64 KiB
+// slot at a time: XMemMapPhysicalPages(va, count, pfns) maps consecutive slots (a null pfn array
+// unmaps them), XMemMapPhysicalPagesScatter(vas, count, pfns) maps one slot per VA (a null array
+// or a 0 pfn unmaps that slot), both into XMemVirtualAlloc reservations (only the mapped pages are
+// committed; unmapping decommits them). A page's bytes live in exactly one place: its home (the
+// real slot it was last mapped at) or, without a home, a store block in the guest heap. Mapping a
+// page at a new real slot moves the bytes there; unmapping its home moves them back to the store.
+// Slots in phantom reservations (xmem_windows.h: GPU windows) never become homes and hold no
+// bytes, so mapping a page into the CPU window and the GPU window keeps one copy. Mapping a page
+// at two real slots at once cannot alias in one address space: the newer slot becomes the home
+// and the older keeps a stale copy (counted in alias_conflicts).
+VirtualRegion* XMemState::region_containing_locked(uint64_t va, uint64_t len) {
+    auto it = region_index.upper_bound(va);
+    if (it == region_index.begin()) {
+        return nullptr;
+    }
+    --it;
+    auto rit = virtual_regions.find(it->second);
+    if (rit == virtual_regions.end()) {
+        return nullptr;
+    }
+    VirtualRegion& r = rit->second;
+    if (va - it->first >= r.size || len > r.size - (va - it->first)) {
+        return nullptr;
+    }
+    return &r;
+}
+
 void save_page_contents(PhysicalPage& page, const uint8_t* bytes) {
     GuestHeap& heap = default_guest_heap();
     if (page.store_va != 0) {
@@ -256,139 +292,135 @@ void save_page_contents(PhysicalPage& page, const uint8_t* bytes) {
     page.store_va = va;
 }
 
-void sync_mapping_to_pages_locked(XMemState& st, const PhysicalMapping& m) {
-    const auto* src_bytes = static_cast<const uint8_t*>(m.base);
-    for (size_t i = 0; i < m.page_handles.size(); ++i) {
-        auto pit = st.physical_pages.find(m.page_handles[i]);
-        if (pit != st.physical_pages.end()) {
-            save_page_contents(*pit->second, src_bytes + m.virtual_offsets[i]);
-        }
-    }
-    st.mapped_physical_bytes -= m.page_handles.size() * m.page_size;
-}
-
 void release_virtual_region(const VirtualRegion& region) {
+    if (region.phantom) {
+        return;  // no arena reservation behind it
+    }
     xmem_arena().release(guest_of(region.base));
 }
 
-void* map_physical_pages_impl(void* virtual_address,
-                              size_t num_pages,
-                              uint32_t protect,
-                              const uint64_t* page_array,
-                              const uint64_t* virtual_offsets,
-                              uint32_t flags) {
-    if (num_pages == 0 || page_array == nullptr) {
-        win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-        return nullptr;
+// Removes the page mapped at slot `va` (guest VA); the caller holds the lock.
+void unmap_slot_locked(XMemState& st, uint64_t va) {
+    auto sit = st.page_slots.find(va);
+    if (sit == st.page_slots.end()) {
+        return;
     }
+    auto pit = st.physical_pages.find(sit->second);
+    st.page_slots.erase(sit);
+    if (pit == st.physical_pages.end()) {
+        return;
+    }
+    PhysicalPage& page = *pit->second;
+    const uint64_t ps = page.page_size;
+    if (page.mapped_slots > 0) {
+        --page.mapped_slots;
+    }
+    st.mapped_physical_bytes -= ps;
+    if (page.home_va == va) {
+        save_page_contents(page, static_cast<const uint8_t*>(host_of(va)));
+        page.home_va = 0;
+    }
+    VirtualRegion* region = st.region_containing_locked(va, ps);
+    if (region != nullptr && !region->phantom) {
+        if (!region->committed) {
+            xmem_arena().decommit(va, ps);
+            st.virtual_committed_bytes -= ps;
+        }
+        if (region->cpu_window) {
+            xmem_windows::note_cpu_window_mapping(-static_cast<int64_t>(ps));
+        }
+    }
+}
 
+// Maps `page` at slot `va` (guest VA); the caller validated the page and holds the lock.
+bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
+    const uint64_t ps = page.page_size;
+    if ((va % std::min<uint64_t>(ps, kXMemPageSize64K)) != 0) {
+        return false;
+    }
+    VirtualRegion* region = st.region_containing_locked(va, ps);
+    const bool in_block = region == nullptr && st.block_containing_locked(va, ps) != 0;
+    if (region == nullptr && !in_block) {
+        return false;
+    }
+    unmap_slot_locked(st, va);
+    st.page_slots[va] = page.handle;
+    ++page.mapped_slots;
+    st.mapped_physical_bytes += ps;
+    if (region != nullptr && region->phantom) {
+        return true;  // address only: no bytes move
+    }
+    if (region != nullptr && !region->committed) {
+        PageProtect pp = PageProtect::ReadWrite;
+        xmem_protect(region->protect, pp);
+        if (pp == PageProtect::NoAccess) {
+            pp = PageProtect::ReadWrite;
+        }
+        if (!xmem_arena().commit(va, ps, pp)) {
+            st.page_slots.erase(va);
+            --page.mapped_slots;
+            st.mapped_physical_bytes -= ps;
+            return false;
+        }
+        st.virtual_committed_bytes += ps;
+    }
+    auto* dst = static_cast<uint8_t*>(host_of(va));
+    if (page.home_va != 0 && page.home_va != va) {
+        std::memcpy(dst, host_of(page.home_va), static_cast<size_t>(ps));
+        ++st.alias_conflicts;
+    } else if (page.store_va != 0) {
+        std::memcpy(dst, host_of(page.store_va), static_cast<size_t>(ps));
+        default_guest_heap().free(page.store_va);
+        page.store_va = 0;
+    } else if (page.home_va == 0) {
+        std::memset(dst, 0, static_cast<size_t>(ps));
+    }
+    page.home_va = va;
+    if (region != nullptr && region->cpu_window) {
+        xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
+    }
+    return true;
+}
+
+// Maps (pfn != 0) or unmaps (pfn == 0 / null array) one slot per entry of `vas`; all-or-nothing
+// validation of the page handles first.
+bool map_slots(const uint64_t* vas, size_t count, const uint64_t* pfns) {
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
-
-    std::vector<std::shared_ptr<PhysicalPage>> pages;
-    pages.reserve(num_pages);
-    uint64_t page_size = 0;
-    for (size_t i = 0; i < num_pages; ++i) {
-        auto it = st.physical_pages.find(page_array[i]);
-        if (it == st.physical_pages.end()) {
-            win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        if (i == 0) {
-            page_size = it->second->page_size;
-        } else if (it->second->page_size != page_size) {
-            win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        pages.push_back(it->second);
-    }
-
-    std::vector<uint64_t> offsets(num_pages);
-    uint64_t span_bytes = 0;
-    for (size_t i = 0; i < num_pages; ++i) {
-        const uint64_t off = virtual_offsets != nullptr ? virtual_offsets[i] : (i * page_size);
-        if ((off % page_size) != 0) {
-            win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        if (off > UINT64_MAX - page_size) {
-            win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        offsets[i] = off;
-        span_bytes = std::max(span_bytes, off + page_size);
-    }
-
-    const size_t align = static_cast<size_t>(std::min<uint64_t>(page_size, kXMemPageSize64K));
-    void* target_base = nullptr;
-    bool owns_buffer = true;
-
-    if (virtual_address != nullptr) {
-        if (st.mappings.find(virtual_address) != st.mappings.end()) {
-            win32::SetLastError(win32::ERROR_ALREADY_EXISTS);
-            return nullptr;
-        }
-        VirtualRegion* region = st.find_virtual_region_locked(
-            virtual_address, static_cast<size_t>(span_bytes));
-        if (region == nullptr) {
-            win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-            return nullptr;
-        }
-        target_base = region->base;
-        owns_buffer = false;
-        // The mapping's protection applies to the mapped span (the region may have been
-        // reserved or committed no-access).
-        PageProtect pp = PageProtect::ReadWrite;
-        xmem_protect(protect, pp);
-        if (!region->committed) {
-            if (!xmem_arena().commit(guest_of(region->base), region->size, pp)) {
-                win32::SetLastError(win32::ERROR_NOT_ENOUGH_MEMORY);
-                return nullptr;
+    if (pfns != nullptr) {
+        for (size_t i = 0; i < count; ++i) {
+            if (pfns[i] != 0 && st.physical_pages.find(pfns[i]) == st.physical_pages.end()) {
+                win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
+                return false;
             }
-            region->committed = true;
-            region->protect = protect;
-            st.virtual_committed_bytes += region->size;
-        } else {
-            xmem_arena().protect(guest_of(region->base),
-                                 static_cast<size_t>(align_up_u64(span_bytes, kPageSize)), pp);
-        }
-    } else {
-        target_base = aligned_alloc_bytes(static_cast<size_t>(span_bytes), align, true);
-        if (target_base == nullptr) {
-            win32::SetLastError(win32::ERROR_NOT_ENOUGH_MEMORY);
-            return nullptr;
         }
     }
-
-    // Move the pages' stored contents into the mapping (gaps and unwritten pages stay zero).
-    auto* dst_bytes = static_cast<uint8_t*>(target_base);
-    for (size_t i = 0; i < num_pages; ++i) {
-        if (pages[i]->store_va != 0) {
-            std::memcpy(dst_bytes + offsets[i],
-                        host_of(pages[i]->store_va),
-                        static_cast<size_t>(page_size));
-            default_guest_heap().free(pages[i]->store_va);
-            pages[i]->store_va = 0;
-        } else if (!owns_buffer) {
-            std::memset(dst_bytes + offsets[i], 0, static_cast<size_t>(page_size));
+    bool ok = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (pfns == nullptr || pfns[i] == 0) {
+            unmap_slot_locked(st, vas[i]);
+            continue;
+        }
+        if (!map_slot_locked(st, vas[i], *st.physical_pages[pfns[i]])) {
+            ok = false;
         }
     }
-
-    PhysicalMapping mapping;
-    mapping.base = target_base;
-    mapping.size = static_cast<size_t>(span_bytes);
-    mapping.alignment = align;
-    mapping.page_size = page_size;
-    mapping.protect = protect;
-    mapping.flags = flags;
-    mapping.owns_buffer = owns_buffer;
-    mapping.page_handles.assign(page_array, page_array + num_pages);
-    mapping.virtual_offsets = std::move(offsets);
-
-    st.mapped_physical_bytes += num_pages * page_size;
-    st.mappings.emplace(target_base, std::move(mapping));
     st.update_peak_locked();
-    return target_base;
+    if (!ok) {
+        win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
+    }
+    return ok;
+}
+
+// Unmaps every slot in [base, base + size).
+void unmap_range_locked(XMemState& st, uint64_t base, uint64_t size) {
+    std::vector<uint64_t> slots;
+    for (auto it = st.page_slots.lower_bound(base); it != st.page_slots.end() && it->first < base + size; ++it) {
+        slots.push_back(it->first);
+    }
+    for (uint64_t va : slots) {
+        unmap_slot_locked(st, va);
+    }
 }
 
 // ===========================================================================
@@ -1654,18 +1686,19 @@ bool xmem_virtual_free(void* address) {
     if (it == st.virtual_regions.end()) {
         return false;
     }
-    // Remove any physical mapping attached to this virtual reservation.
-    auto mit = st.mappings.find(address);
-    if (mit != st.mappings.end()) {
-        sync_mapping_to_pages_locked(st, mit->second);
-        st.mappings.erase(mit);
-    }
+    // Unmap every physical page mapped inside this reservation (their bytes go back to the store).
+    const uint64_t base_va = guest_of(address);
+    unmap_range_locked(st, base_va, it->second.size);
 
     if (it->second.committed) {
         st.virtual_committed_bytes -= it->second.size;
     }
-    st.virtual_reserved_bytes -= it->second.size;
+    if (!it->second.phantom) {
+        st.virtual_reserved_bytes -= it->second.size;
+    }
+    xmem_windows::forget_window(base_va);
     release_virtual_region(it->second);
+    st.region_index.erase(base_va);
     st.virtual_regions.erase(it);
     return true;
 }
@@ -1676,16 +1709,23 @@ bool xmem_unmap_physical_pages(void* virtual_address) {
     }
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
-    auto it = st.mappings.find(virtual_address);
-    if (it == st.mappings.end()) {
+    const uint64_t base = guest_of(virtual_address);
+    auto bit = st.owned_blocks.find(base);
+    if (bit != st.owned_blocks.end()) {
+        unmap_range_locked(st, base, bit->second.size);
+        aligned_free_bytes(virtual_address, bit->second.alignment);
+        st.owned_blocks.erase(bit);
+        return true;
+    }
+    VirtualRegion* region = st.find_virtual_region_locked(virtual_address, 0);
+    if (region == nullptr) {
         return false;
     }
-    const PhysicalMapping& m = it->second;
-    sync_mapping_to_pages_locked(st, m);
-    if (m.owns_buffer) {
-        aligned_free_bytes(m.base, m.alignment);
+    auto first = st.page_slots.lower_bound(base);
+    if (first == st.page_slots.end() || first->first >= base + region->size) {
+        return false;
     }
-    st.mappings.erase(it);
+    unmap_range_locked(st, base, region->size);
     return true;
 }
 
@@ -1698,16 +1738,18 @@ void xmem_reset_for_testing() {
         aligned_free_bytes(ptr, rec.alignment);
     }
     st.heap_allocs.clear();
-    for (auto& [ptr, mapping] : st.mappings) {
-        if (mapping.owns_buffer) {
-            aligned_free_bytes(ptr, mapping.alignment);
-        }
+    st.page_slots.clear();
+    for (auto& [base, block] : st.owned_blocks) {
+        aligned_free_bytes(host_of(base), block.alignment);
     }
-    st.mappings.clear();
+    st.owned_blocks.clear();
     for (auto& [ptr, region] : st.virtual_regions) {
         release_virtual_region(region);
     }
     st.virtual_regions.clear();
+    st.region_index.clear();
+    st.alias_conflicts = 0;
+    xmem_windows::reset_for_testing();
     for (auto& [handle, page] : st.physical_pages) {
         if (page->store_va != 0) {
             default_guest_heap().free(page->store_va);
@@ -1911,17 +1953,16 @@ void pg6_xbox_XMemFreeDefault(void* address, uint64_t attributes) {
     aligned_free_bytes(address, align);
 }
 
-int32_t pg6_xbox_XMemAllocatePhysicalPages(size_t* num_pages,
-                                           uint64_t* page_array,
-                                           uint32_t flags,
-                                           uint32_t protect) {
+int32_t pg6_xbox_XMemAllocatePhysicalPages(uint64_t attributes, size_t* num_pages, uint64_t* page_array) {
     using namespace playgta6::os::scarlett;
     if (num_pages == nullptr || page_array == nullptr || *num_pages == 0) {
         playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
         return 0;
     }
 
-    const uint64_t page_size = decode_physical_page_size(flags);
+    // The title sizes every page set in 64 KiB units (attributes 0x180 / 0x280 / 0x380); the
+    // page-size bits of the runtime's own flag encoding are honoured for host callers.
+    const uint64_t page_size = decode_physical_page_size(static_cast<uint32_t>(attributes));
     const size_t count = *num_pages;
 
     std::vector<std::shared_ptr<PhysicalPage>> created;
@@ -1929,8 +1970,7 @@ int32_t pg6_xbox_XMemAllocatePhysicalPages(size_t* num_pages,
     for (size_t i = 0; i < count; ++i) {
         auto page = std::make_shared<PhysicalPage>();
         page->page_size = page_size;
-        page->protect = protect;
-        page->flags = flags;
+        page->attributes = attributes;
         created.push_back(std::move(page));
     }
 
@@ -1965,6 +2005,11 @@ int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_ar
     for (size_t i = 0; i < num_pages; ++i) {
         auto it = st.physical_pages.find(page_array[i]);
         if (it != st.physical_pages.end()) {
+            // Freed while mapped: the slots stop referring to it (their memory stays as is).
+            for (auto sit = st.page_slots.begin(); sit != st.page_slots.end();) {
+                sit = sit->second == page_array[i] ? st.page_slots.erase(sit) : std::next(sit);
+            }
+            st.mapped_physical_bytes -= it->second->mapped_slots * it->second->page_size;
             st.physical_pages_bytes -= it->second->page_size;
             if (it->second->store_va != 0) {
                 playgta6::os::default_guest_heap().free(it->second->store_va);
@@ -1975,23 +2020,59 @@ int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_ar
     return 1;
 }
 
-void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address,
-                                    size_t num_pages,
-                                    uint32_t protect,
-                                    const uint64_t* page_array,
-                                    uint32_t flags) {
-    return playgta6::os::scarlett::map_physical_pages_impl(
-        virtual_address, num_pages, protect, page_array, nullptr, flags);
+void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address, size_t num_pages, const uint64_t* page_array) {
+    using namespace playgta6::os::scarlett;
+    if (num_pages == 0 || (virtual_address == nullptr && page_array == nullptr)) {
+        playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    uint64_t page_size = kXMemPageSize64K;
+    if (page_array != nullptr) {
+        auto& st = xmem_state();
+        std::lock_guard<std::mutex> lock(st.mutex);
+        auto it = st.physical_pages.find(page_array[0]);
+        if (it == st.physical_pages.end()) {
+            playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        page_size = it->second->page_size;
+    }
+    void* base = virtual_address;
+    if (base == nullptr) {
+        // No address: a fresh guest heap block holds the pages (released by
+        // xmem_unmap_physical_pages).
+        const size_t align = static_cast<size_t>(std::min<uint64_t>(page_size, kXMemPageSize64K));
+        base = aligned_alloc_bytes(static_cast<size_t>(num_pages * page_size), align, true);
+        if (base == nullptr) {
+            playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_NOT_ENOUGH_MEMORY);
+            return nullptr;
+        }
+        auto& st = xmem_state();
+        std::lock_guard<std::mutex> lock(st.mutex);
+        st.owned_blocks[guest_of(base)] = OwnedBlock{num_pages * page_size, align};
+    }
+    std::vector<uint64_t> vas(num_pages);
+    for (size_t i = 0; i < num_pages; ++i) {
+        vas[i] = guest_of(base) + i * page_size;
+    }
+    if (!map_slots(vas.data(), num_pages, page_array)) {
+        if (virtual_address == nullptr) {
+            xmem_unmap_physical_pages(base);
+        }
+        return nullptr;
+    }
+    return base;
 }
 
-void* pg6_xbox_XMemMapPhysicalPagesScatter(void* virtual_address,
-                                           size_t num_pages,
-                                           uint32_t protect,
-                                           const uint64_t* page_array,
-                                           const uint64_t* virtual_offsets,
-                                           uint32_t flags) {
-    return playgta6::os::scarlett::map_physical_pages_impl(
-        virtual_address, num_pages, protect, page_array, virtual_offsets, flags);
+int32_t pg6_xbox_XMemMapPhysicalPagesScatter(const uint64_t* virtual_addresses,
+                                             size_t num_pages,
+                                             const uint64_t* page_array) {
+    using namespace playgta6::os::scarlett;
+    if (num_pages == 0 || virtual_addresses == nullptr) {
+        playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    return map_slots(virtual_addresses, num_pages, page_array) ? 1 : 0;
 }
 
 void* pg6_xbox_XMemVirtualAlloc(void* address,
@@ -2055,14 +2136,25 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
         return host_of(committed);
     }
 
+    // O27: CPU / GPU windows (xmem_windows.h). Under the phantom policy a GPU window gets an
+    // address outside the guest pool and no arena reservation.
+    playgta6::os::xmem_windows::WindowKind window_kind{};
+    const bool window =
+        address == nullptr && playgta6::os::xmem_windows::classify(allocation_type, protect, aligned_size, &window_kind);
+    const bool phantom = window && playgta6::os::xmem_windows::place_phantom(window_kind);
+
     // A non-null address is a placement request that must be honoured exactly.
     const uint32_t arena_type =
         (want_reserve ? os::kMemReserve : 0u) | (want_commit ? os::kMemCommit : 0u);
     uint64_t va = 0;
-    try {
-        va = arena.virtual_alloc(guest_of(address), aligned_size, arena_type, pp);
-    } catch (const std::bad_alloc&) {
-        va = 0;
+    if (phantom) {
+        va = playgta6::os::xmem_windows::reserve_phantom(aligned_size);
+    } else {
+        try {
+            va = arena.virtual_alloc(guest_of(address), aligned_size, arena_type, pp);
+        } catch (const std::bad_alloc&) {
+            va = 0;
+        }
     }
     if (va == 0) {
         os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
@@ -2076,13 +2168,27 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     region.allocation_type = allocation_type;
     region.protect = protect;
     region.committed = want_commit;
+    region.phantom = phantom;
+    region.cpu_window = window && window_kind == playgta6::os::xmem_windows::WindowKind::Cpu;
 
-    st.virtual_reserved_bytes += aligned_size;
+    if (!phantom) {
+        st.virtual_reserved_bytes += aligned_size;
+    }
     if (want_commit) {
         st.virtual_committed_bytes += aligned_size;
     }
     st.virtual_regions.emplace(region.base, region);
+    st.region_index[va] = region.base;
     st.update_peak_locked();
+    if (window) {
+        playgta6::os::xmem_windows::Window w;
+        w.base = va;
+        w.size = aligned_size;
+        w.kind = window_kind;
+        w.protect = protect;
+        w.phantom = phantom;
+        playgta6::os::xmem_windows::note_window(w);  // may call alias listeners (they must not call back into xmem)
+    }
     return region.base;
 }
 
@@ -2124,7 +2230,7 @@ Pg6HResult pg6_xbox_XMemGetWorkingSetStatistics(Pg6XMemWorkingSetStats* stats) {
     stats->tools_mem_bytes = 0ULL;
     stats->live_heap_allocations = static_cast<uint32_t>(st.heap_allocs.size());
     stats->live_physical_pages = static_cast<uint32_t>(st.physical_pages.size());
-    stats->live_virtual_mappings = static_cast<uint32_t>(st.mappings.size());
+    stats->live_virtual_mappings = static_cast<uint32_t>(st.page_slots.size());  // mapped page slots
     stats->reserved = 0u;
     return playgta6::os::gdk::S_OK_HR;
 }

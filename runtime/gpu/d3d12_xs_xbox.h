@@ -75,8 +75,8 @@
 //  D3D12ConfigureVirtualMemoryX; pages of a physical page pool (registered through slot 74) are
 //  mapped into the CPU window through xmem and into the GPU window through queue slot 31. Other
 //  addresses are passed unchanged (UMA: GPU address = CPU address). Device::register_gpu_alias
-//  makes buffers at GPU-window addresses read their bytes from the CPU window; who registers the
-//  window (the xmem layer, which sees both reservations) is not wired here.
+//  makes buffers at GPU-window addresses read their bytes from the CPU window; the device
+//  subscribes to the window pairs the XMem layer recognises (os/xmem_windows.h, O27).
 //
 // Queue slots
 // -----------
@@ -84,8 +84,8 @@
 //  31 (range count, ranges, page-pool address, pool pages, 0) on a second queue: page-mapping
 //     update of the GPU window (medium shape). Range = 0x18 bytes {u64 GPU-window address, u32
 //     entry count, u64 entries}, entry = 12 bytes {u32 kind (1 map, 2 unmap), u32 pool page, u32
-//     page count}; the same window pages are mapped into the CPU window through xmem. Counted and
-//     ignored: with the alias window registered the GPU window reads the CPU window directly.
+//     page count}; the same window pages are mapped into the CPU window through xmem. Applied
+//     to the XMem GPU page table (os/xmem_windows.h, O27).
 //  32 PresentX(plane count, planes, params) (high shape). Plane = GuestPresentPlaneX (0x48 bytes):
 //     token (the slot-80 frame token), resource count, &resource pointer, source rects, ... Plane
 //     0's first resource is the back buffer; also called with (0, 0, 0) during suspend.
@@ -266,7 +266,7 @@ enum class Counter : size_t {
     StateObjectsRefused,
     ViewsAtAddress,
     PagePools,
-    PageMappingsIgnored,
+    PageMappingsApplied,
     Suspends,
     Resumes,
     FeatureToggles,

@@ -770,12 +770,11 @@ void test_xmem_physical_pages() {
     // 2 MiB pages via the page-size flag; allocation commits nothing.
     size_t n = 4;
     uint64_t pfn[4]{};
-    CHECK(pg6_xbox_XMemAllocatePhysicalPages(&n, pfn, kXMemFlagPage2M, win32::PAGE_READWRITE) == 1);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage2M, &n, pfn) == 1);
     CHECK(arena.committed_bytes() == committed0 && heap.stats().live_bytes == heap_live0);
 
     // Map contiguously: guest memory, zero filled; write; unmap persists into guest-backed pages.
-    auto* m = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(
-        nullptr, 4, win32::PAGE_READWRITE, pfn, kXMemFlagPage2M));
+    auto* m = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 4, pfn));
     CHECK(m != nullptr && xmem_ptr_valid(m, 4 * kXMemPageSize2M));
     CHECK(m[0] == 0 && m[4 * kXMemPageSize2M - 1] == 0);
     for (int i = 0; i < 4; ++i) {
@@ -785,22 +784,22 @@ void test_xmem_physical_pages() {
     Pg6XMemWorkingSetStats ws{};
     CHECK(pg6_xbox_XMemGetWorkingSetStatistics(&ws) == gdk::S_OK_HR);
     CHECK(ws.physical_pages_bytes == 4 * kXMemPageSize2M &&
-          ws.mapped_physical_bytes == 4 * kXMemPageSize2M && ws.live_virtual_mappings == 1);
+          ws.mapped_physical_bytes == 4 * kXMemPageSize2M && ws.live_virtual_mappings == 4);
     CHECK(xmem_unmap_physical_pages(m));
     CHECK(!xmem_unmap_physical_pages(m));
     // Stored in guest heap blocks while unmapped.
     CHECK(heap.stats().live_bytes == heap_live0 + 4 * kXMemPageSize2M);
 
-    // Map a subset scattered into a reserved region (commits it), contents survive and move.
+    // Map a subset scattered into a reserved region (commits the mapped pages), contents move.
     void* region = pg6_xbox_XMemVirtualAlloc(nullptr, 6 * kXMemPageSize2M, win32::MEM_RESERVE,
                                              0, win32::PAGE_READWRITE);
     CHECK(region != nullptr);
     const uint64_t scatter_pfn[2] = {pfn[2], pfn[0]};
-    const uint64_t offsets[2] = {kXMemPageSize2M, 3 * kXMemPageSize2M};
-    auto* sc = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPagesScatter(
-        region, 2, win32::PAGE_READWRITE, scatter_pfn, offsets, kXMemFlagPage2M));
-    CHECK(sc == region);
-    CHECK(sc[0] == 0);                                               // gap
+    const uint64_t region_va = arena.guest_address(region);
+    const uint64_t vas[2] = {region_va + kXMemPageSize2M, region_va + 3 * kXMemPageSize2M};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(vas, 2, scatter_pfn) == 1);
+    auto* sc = static_cast<uint8_t*>(region);
+    CHECK(arena.query(region_va).state == MemState::Reserve);         // gap: not committed
     CHECK(sc[kXMemPageSize2M] == 0x12 && sc[kXMemPageSize2M + 5] == 0xEE);  // pfn[2] at +2 MiB
     CHECK(sc[3 * kXMemPageSize2M] == 0x10);                          // pfn[0] at +6 MiB
     CHECK(heap.stats().live_bytes == heap_live0 + 2 * kXMemPageSize2M);  // moved, not copied
@@ -809,19 +808,17 @@ void test_xmem_physical_pages() {
     CHECK(heap.stats().live_bytes == heap_live0 + 4 * kXMemPageSize2M);
 
     // Mapping again shows the saved bytes.
-    auto* again = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(
-        nullptr, 2, win32::PAGE_READWRITE, pfn, kXMemFlagPage2M));
+    auto* again = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 2, pfn));
     CHECK(again != nullptr && again[0] == 0x10 && again[1] == 0x77 &&
           again[kXMemPageSize2M] == 0x11);
     CHECK(xmem_unmap_physical_pages(again));
 
     // Bad frame numbers, zero pages, misaligned scatter offsets.
     const uint64_t bogus[1] = {0xDEADBEEF};
-    CHECK(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, win32::PAGE_READWRITE, bogus, 0) == nullptr);
-    CHECK(pg6_xbox_XMemMapPhysicalPages(nullptr, 0, win32::PAGE_READWRITE, pfn, 0) == nullptr);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, bogus) == nullptr);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(nullptr, 0, pfn) == nullptr);
     const uint64_t odd[1] = {123};
-    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(nullptr, 1, win32::PAGE_READWRITE, pfn, odd,
-                                               kXMemFlagPage2M) == nullptr);
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(odd, 1, pfn) == 0);
 
     // Freeing the pages returns every byte; zero pages never needed a store.
     CHECK(pg6_xbox_XMemFreePhysicalPages(4, pfn) == 1);
@@ -832,9 +829,9 @@ void test_xmem_physical_pages() {
     // 4 KiB / default 64 KiB pages, all-zero pages need no backing at all.
     size_t k = 8;
     uint64_t small[8]{};
-    CHECK(pg6_xbox_XMemAllocatePhysicalPages(&k, small, 0, win32::PAGE_READWRITE) == 1);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &k, small) == 1);
     auto* sm = static_cast<uint8_t*>(
-        pg6_xbox_XMemMapPhysicalPages(nullptr, 8, win32::PAGE_READWRITE, small, 0));
+        pg6_xbox_XMemMapPhysicalPages(nullptr, 8, small));
     CHECK(sm != nullptr && xmem_ptr_valid(sm, 8 * kXMemPageSize64K));
     CHECK(xmem_unmap_physical_pages(sm));
     CHECK(heap.stats().live_bytes == heap_live0);  // nothing written, nothing stored

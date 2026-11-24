@@ -131,21 +131,18 @@ void test_xmem_physical_virtual_and_transfer() {
     // Allocate 3 x 4 KiB physical pages.
     size_t num_pages = 3;
     uint64_t handles[3]{};
-    CHECK(pg6_xbox_XMemAllocatePhysicalPages(&num_pages,
-                                             handles,
-                                             kXMemFlagPage4K,
-                                             win32::PAGE_READWRITE) == 1);
+    // (attributes, &count, pfns): the title's argument order (O27).
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage4K, &num_pages, handles) == 1);
     CHECK(handles[0] != 0 && handles[1] != 0 && handles[2] != 0);
     CHECK(handles[0] != handles[1] && handles[1] != handles[2]);
 
     // Invalid physical page allocation arguments rejected.
     size_t zero_pages = 0;
-    CHECK(pg6_xbox_XMemAllocatePhysicalPages(&zero_pages, handles, 0, win32::PAGE_READWRITE) == 0);
-    CHECK(pg6_xbox_XMemAllocatePhysicalPages(nullptr, handles, 0, win32::PAGE_READWRITE) == 0);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &zero_pages, handles) == 0);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, nullptr, handles) == 0);
 
-    // Contiguous mapping via XMemMapPhysicalPages.
-    void* mapped = pg6_xbox_XMemMapPhysicalPages(
-        nullptr, 3, win32::PAGE_READWRITE, handles, kXMemFlagPage4K);
+    // Contiguous mapping via XMemMapPhysicalPages (no address: a fresh block).
+    void* mapped = pg6_xbox_XMemMapPhysicalPages(nullptr, 3, handles);
     CHECK(mapped != nullptr);
     auto* mapped_bytes = static_cast<uint8_t*>(mapped);
     std::memset(mapped_bytes + 0 * kXMemPageSize4K, 0x11, kXMemPageSize4K);
@@ -162,12 +159,11 @@ void test_xmem_physical_virtual_and_transfer() {
     CHECK(va_reserved != nullptr);
 
     const uint64_t scatter_handles[2] = {handles[2], handles[0]};
-    const uint64_t scatter_offsets[2] = {0, 2 * kXMemPageSize4K};
-    void* scatter_mapped = pg6_xbox_XMemMapPhysicalPagesScatter(
-        va_reserved, 2, win32::PAGE_READWRITE, scatter_handles, scatter_offsets, kXMemFlagPage4K);
-    CHECK(scatter_mapped == va_reserved);
+    const uint64_t base_va = win32::get_vmem_arena()->guest_address(va_reserved);
+    const uint64_t scatter_vas[2] = {base_va, base_va + 2 * kXMemPageSize4K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(scatter_vas, 2, scatter_handles) == 1);
 
-    const auto* scatter_bytes = static_cast<const uint8_t*>(scatter_mapped);
+    const auto* scatter_bytes = static_cast<const uint8_t*>(va_reserved);
     CHECK(scatter_bytes[0] == 0x33);
     CHECK(scatter_bytes[kXMemPageSize4K - 1] == 0x33);
     CHECK(scatter_bytes[2 * kXMemPageSize4K] == 0x11);
@@ -217,7 +213,7 @@ void test_xmem_physical_virtual_and_transfer() {
     CHECK(pg6_xbox_XMemGetWorkingSetStatistics(&stats) == S_OK_HR);
     CHECK(stats.live_physical_pages == 3);
     CHECK(stats.physical_pages_bytes == 3 * kXMemPageSize4K);
-    CHECK(stats.live_virtual_mappings == 1);
+    CHECK(stats.live_virtual_mappings == 2);  // mapped page slots
     CHECK(stats.mapped_physical_bytes == 2 * kXMemPageSize4K);
     CHECK(stats.virtual_committed_bytes >= 8192);
 
