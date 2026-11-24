@@ -613,6 +613,31 @@ void test_user_slots() {
     CHECK(hr32(fx.vcall(user_api, 13, {user, guest_flag})) == 0);
     CHECK((load64(guest_flag) & 0xff) == 0);
     CHECK(hr32(fx.vcall(user_api, 13, {user, 0})) == com::E_INVALIDARG_HR);
+    // XUserGetAgeGroup (s19): the configured age group, default Unknown (0); every value is
+    // reported as configured; a bad handle or a null out pointer is invalid.
+    {
+        namespace gp = playgta6::os::gdk::provider;
+        CHECK(gp::user_age_group() == gp::UserAgeGroup::Unknown);
+        const uint64_t age = fx.alloc(8);
+        CHECK(com::write_guest(age, uint64_t{0xffffffffffffffffull}));
+        CHECK(hr32(fx.vcall(user_api, 19, {user, age})) == 0);
+        CHECK((load64(age) & 0xffffffffull) == 0);
+        const std::pair<const char*, uint32_t> groups[] = {
+            {"unknown", 0}, {"child", 1}, {"teen", 2}, {"adult", 3}};
+        for (const auto& [name, value] : groups) {
+            gp::UserAgeGroup group{};
+            CHECK(gp::parse_user_age_group(name, &group));
+            gp::set_user_age_group(group);
+            CHECK(hr32(fx.vcall(user_api, 19, {user, age})) == 0);
+            CHECK((load64(age) & 0xffffffffull) == value);
+        }
+        gp::UserAgeGroup ignored{};
+        CHECK(!gp::parse_user_age_group("Adult", &ignored));
+        CHECK(!gp::parse_user_age_group("", &ignored));
+        gp::set_user_age_group(gp::UserAgeGroup::Unknown);
+        CHECK(hr32(fx.vcall(user_api, 19, {user, 0})) == com::E_INVALIDARG_HR);
+        CHECK(hr32(fx.vcall(user_api, 19, {0x1234, age})) == com::E_INVALIDARG_HR);
+    }
     // XUserDuplicateHandle (s3): a second handle to the same local user, closed independently.
     const uint64_t dup_out = fx.alloc(8);
     CHECK(hr32(fx.vcall(user_api, 3, {user, dup_out})) == 0);

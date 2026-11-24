@@ -11,6 +11,7 @@
 #include "guest/export_thunks.h"
 #include "guest/guest_runtime.h"
 #include "guest/memory_model.h"
+#include "os/xgameruntime_provider.h"
 #include "os/image_loader.h"
 #include "os/vmem.h"
 
@@ -427,6 +428,9 @@ struct BootConfig {
     // what XSystemGetXboxLiveSandboxId reports. A retail console reports "RETAIL"; empty = no
     // sandbox (E_NOTIMPL). The runtime stays offline either way: no user, network or store.
     std::string sandbox_id = "RETAIL";
+    // The local user's age group (an attribute of the person using the runtime, set by them):
+    // what XUserGetAgeGroup reports. Default Unknown (no account data offline).
+    os::gdk::provider::UserAgeGroup user_age_group = os::gdk::provider::UserAgeGroup::Unknown;
     // Start address of the host function containing a code address (0 if unknown), e.g. from the
     // host's unwind tables; makes host-frame -> lifted-function mapping exact.
     HostFunctionStartFn host_function_start = nullptr;

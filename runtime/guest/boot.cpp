@@ -2544,6 +2544,7 @@ BootResult run_boot(const BootConfig& config) {
                                       u"ConsoleMode", kRegDword, &mode, sizeof(mode));
     }
     os::gdk::provider::set_xbox_live_sandbox_id(config.sandbox_id);
+    os::gdk::provider::set_user_age_group(config.user_age_group);
     b.active = true;
 
     auto finish = [&]() {

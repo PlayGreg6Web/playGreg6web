@@ -32,6 +32,8 @@
 //                        (default 0x60 = Xbox Series X; 0 = leave it unset)
 //   --sandbox-id <text>  Xbox Live sandbox the emulated console reports (default RETAIL, a retail
 //                        console; "" = none: XSystemGetXboxLiveSandboxId fails with E_NOTIMPL)
+//   --user-age-group <unknown|child|teen|adult>  the local user's age group XUserGetAgeGroup
+//                        reports (default unknown: no account data offline)
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --gpu-capture-frames <n>  frames to capture (default 10)
@@ -81,6 +83,7 @@
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/xgameruntime_provider.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -146,6 +149,7 @@ struct Options {
     uint64_t arena_log_limit = 4096;  // --arena-log-limit
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
+    std::string user_age_group = "unknown";  // --user-age-group
     std::string gpu_capture;          // --gpu-capture: .pg6trace path
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
@@ -209,7 +213,8 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack") {
+                   a == "--shader-pack" ||
+                   a == "--user-age-group") {
             if (!value(v)) {
                 return false;
             }
@@ -218,6 +223,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--sandbox-id" ? o.sandbox_id
                                   : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--shader-pack" ? o.shader_pack
+                                  : a == "--user-age-group" ? o.user_age_group
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
                                   : a == "--game-dir" ? o.game_dir
@@ -251,6 +257,11 @@ bool parse(int argc, char** argv, Options& o) {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return false;
         }
+    }
+    if (playgta6::os::gdk::provider::UserAgeGroup group{};
+        !playgta6::os::gdk::provider::parse_user_age_group(o.user_age_group, &group)) {
+        std::fprintf(stderr, "--user-age-group must be unknown, child, teen or adult\n");
+        return false;
     }
 #ifdef PG6_BOOT_PROGRAM
     if (o.program_dir.empty()) {
@@ -633,6 +644,7 @@ void run_boot_thread() {
     cfg.host_function_start = host_function_start;
     cfg.console_mode = static_cast<uint32_t>(g_options.console_mode);
     cfg.sandbox_id = g_options.sandbox_id;
+    playgta6::os::gdk::provider::parse_user_age_group(g_options.user_age_group, &cfg.user_age_group);
     cfg.off_thread_fault = &off_thread_fault;
     const guest::BootResult result = guest::run_boot(cfg);
     if (!g_finishing.exchange(true)) {

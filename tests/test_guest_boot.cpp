@@ -1064,6 +1064,15 @@ void test_observability() {
     CHECK(os::gdk::provider::xbox_live_sandbox_id() == "RETAIL");
     boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.sandbox_id.clear(); });
     CHECK(os::gdk::provider::xbox_live_sandbox_id().empty());
+
+    // The local user's age group reaches the provider (default: Unknown).
+    os::gdk::provider::set_user_age_group(os::gdk::provider::UserAgeGroup::Teen);
+    boot_scenario(Scenario::LastError);
+    CHECK(os::gdk::provider::user_age_group() == os::gdk::provider::UserAgeGroup::Unknown);
+    boot_scenario(Scenario::LastError,
+                  [](BootConfig& cfg) { cfg.user_age_group = os::gdk::provider::UserAgeGroup::Child; });
+    CHECK(os::gdk::provider::user_age_group() == os::gdk::provider::UserAgeGroup::Child);
+    os::gdk::provider::set_user_age_group(os::gdk::provider::UserAgeGroup::Unknown);
 }
 
 // host_callable_calls counts calls to named host callables in first-call order; com_stub_hits

@@ -62,8 +62,9 @@
 //     s3 DuplicateHandle(2) h. Stubs: s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
 //     s25 GetTokenAndSignatureResult. s13 GetIsGuest(2) h: the executable passes a one-byte
 //     local and stores it as a flag (header order: FindUserById, GetIsGuest, ...); the local
-//     offline user is not a guest. s19 has the shape of GetAgeGroup (a 4-byte result kept only
-//     when 1..3) and stays a stub (age group is reported, not answered); s14 is unidentified.
+//     offline user is not a guest. s19 GetAgeGroup(2) h (a 4-byte result the caller keeps only
+//     when 1..3): the configured age group (--user-age-group, default Unknown); s14 is
+//     unidentified.
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
@@ -566,6 +567,9 @@ public:
 };
 
 // {01acd177-91f9-4763-a38e-ccbb55ce32e0}: XUser.
+// Configured age group of the local user (set_user_age_group).
+std::atomic<uint32_t> g_user_age_group{static_cast<uint32_t>(UserAgeGroup::Unknown)};
+
 class UserApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XUser";
@@ -651,6 +655,16 @@ public:
             return E_INVALIDARG_HR;
         }
         is_guest.write(0);
+        return S_OK_HR;
+    }
+
+    // s19 XUserGetAgeGroup(user, XUserAgeGroup* ageGroup): the configured age group of the local
+    // user (set_user_age_group; default Unknown, the truthful answer without account data).
+    int32_t GetAgeGroup(uint64_t user, GuestPtr<uint32_t> age_group) {
+        if (!check_handle(users(), user, "XUserHandle") || age_group.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        age_group.write(g_user_age_group.load(std::memory_order_relaxed));
         return S_OK_HR;
     }
 
@@ -783,6 +797,7 @@ std::string configured_sandbox_id() {
     std::lock_guard<std::mutex> lock(sandbox_mutex());
     return sandbox_id_storage();
 }
+
 
 class SystemApi : public com::ComObject {
 public:
@@ -1262,7 +1277,7 @@ constexpr auto kUserTable = slot_table<32>({
     {12, US::stub("XUserFindUserById")},
     {13, US::method<&UserApi::GetIsGuest>("XUserGetIsGuest")},
     {14, US::stub("XUser slot 14 (unidentified)")},
-    {19, US::stub("XUser slot 19 (GetAgeGroup shape)")},
+    {19, US::method<&UserApi::GetAgeGroup>("XUserGetAgeGroup")},
     {20, US::method<&UserApi::CheckPrivilege>("XUserCheckPrivilege")},
     {21, US::method<&UserApi::ResolvePrivilegeWithUiAsync>("XUserResolvePrivilegeWithUiAsync")},
     {22, US::method<&UserApi::ResolvePrivilegeWithUiResult>("XUserResolvePrivilegeWithUiResult")},
@@ -1611,6 +1626,30 @@ std::string xbox_live_sandbox_id() {
     return configured_sandbox_id();
 }
 
+void set_user_age_group(UserAgeGroup group) {
+    g_user_age_group.store(static_cast<uint32_t>(group), std::memory_order_relaxed);
+}
+
+UserAgeGroup user_age_group() {
+    return static_cast<UserAgeGroup>(g_user_age_group.load(std::memory_order_relaxed));
+}
+
+bool parse_user_age_group(const std::string& text, UserAgeGroup* group) {
+    static constexpr std::pair<const char*, UserAgeGroup> kNames[] = {
+        {"unknown", UserAgeGroup::Unknown},
+        {"child", UserAgeGroup::Child},
+        {"teen", UserAgeGroup::Teen},
+        {"adult", UserAgeGroup::Adult},
+    };
+    for (const auto& [name, value] : kNames) {
+        if (text == name) {
+            *group = value;
+            return true;
+        }
+    }
+    return false;
+}
+
 void reset_xgameruntime_provider() {
     ProviderState& st = state();
     std::lock_guard<std::mutex> lock(st.mutex);
@@ -1625,6 +1664,7 @@ void reset_xgameruntime_provider() {
     ports().clear();
     g_title_id.store(0, std::memory_order_relaxed);
     set_xbox_live_sandbox_id("");
+    set_user_age_group(UserAgeGroup::Unknown);
 }
 
 }  // namespace playgta6::os::gdk::provider

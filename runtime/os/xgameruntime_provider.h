@@ -57,6 +57,15 @@ void set_xbox_title_id(uint32_t title_id);
 void set_xbox_live_sandbox_id(const std::string& sandbox_id);
 std::string xbox_live_sandbox_id();
 
+// The local user's age group (XUserAgeGroup), an attribute of the person using the runtime set by
+// configuration: what XUserGetAgeGroup reports. Default Unknown: a local offline user has no
+// account data to say otherwise.
+enum class UserAgeGroup : uint32_t { Unknown = 0, Child = 1, Teen = 2, Adult = 3 };
+void set_user_age_group(UserAgeGroup group);
+UserAgeGroup user_age_group();
+// "unknown" / "child" / "teen" / "adult" -> the group; false for anything else.
+bool parse_user_age_group(const std::string& text, UserAgeGroup* group);
+
 // Every distinct QueryApiImpl request so far (known and unknown), sorted by GUID.
 std::vector<ApiRequest> api_requests();
 
