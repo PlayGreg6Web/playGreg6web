@@ -589,7 +589,14 @@ ThreadPool& thread_pool() {
     return pool;
 }
 
+std::atomic<uint32_t> g_forced_submit_failures{0};
+
 bool submit_to_pool(std::function<void()> callback) {
+    for (uint32_t forced = g_forced_submit_failures.load(std::memory_order_relaxed); forced != 0;) {
+        if (g_forced_submit_failures.compare_exchange_weak(forced, forced - 1, std::memory_order_relaxed)) {
+            return false;  // test seam: stands in for a pool that refuses the work
+        }
+    }
     auto& pool = thread_pool();
     std::lock_guard<std::mutex> lock(pool.mutex);
     if (!pool.queue) {
@@ -982,9 +989,9 @@ Pg6TpWork* CreateThreadpoolWork(Pg6TpWorkCallback callback, void* context, void*
     return work.get();
 }
 
-void SubmitThreadpoolWork(Pg6TpWork* work) {
+bool SubmitThreadpoolWork(Pg6TpWork* work) {
     if (work == nullptr) {
-        return;
+        return false;
     }
     std::shared_ptr<Pg6TpWork> keep;
     uint64_t epoch = 0;
@@ -992,7 +999,7 @@ void SubmitThreadpoolWork(Pg6TpWork* work) {
         std::lock_guard<std::mutex> lock(work->mutex);
         keep = work->self;
         if (!keep) {
-            return;  // already closed
+            return false;  // already closed
         }
         ++work->queued;
         epoch = work->epoch;
@@ -1006,7 +1013,13 @@ void SubmitThreadpoolWork(Pg6TpWork* work) {
             }
         }
         work->idle_cv.notify_all();
+        return false;
     }
+    return true;
+}
+
+void fail_next_thread_pool_submissions_for_testing(uint32_t count) {
+    g_forced_submit_failures.store(count, std::memory_order_relaxed);
 }
 
 void WaitForThreadpoolWorkCallbacks(Pg6TpWork* work, bool cancel_pending_callbacks) {

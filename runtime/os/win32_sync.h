@@ -159,7 +159,10 @@ uint64_t SetThreadAffinityMask(Handle thread, uint64_t affinity_mask);
 // ---------------------------------------------------------------------------
 
 Pg6TpWork* CreateThreadpoolWork(Pg6TpWorkCallback callback, void* context, void* callback_environ);
-void SubmitThreadpoolWork(Pg6TpWork* work);
+// False when the work was not queued (null, closed, or the pool refused it): no callback will run.
+bool SubmitThreadpoolWork(Pg6TpWork* work);
+// Tests: the next `count` pool submissions (work and simple callbacks) fail as if the pool refused them.
+void fail_next_thread_pool_submissions_for_testing(uint32_t count);
 void WaitForThreadpoolWorkCallbacks(Pg6TpWork* work, bool cancel_pending_callbacks);
 void CloseThreadpoolWork(Pg6TpWork* work);
 bool TrySubmitThreadpoolCallback(Pg6TpSimpleCallback callback,

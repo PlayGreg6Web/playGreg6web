@@ -1707,6 +1707,21 @@ void test_thread_pool_close_races_last_callback() {
     win32::shutdown_thread_pool();
 }
 
+// O35: a submission the pool refuses never runs a callback, so nothing would release its pending
+// count and the record leaked after Close.
+void test_thread_pool_failed_submit_releases_record() {
+    Fixture fx;
+    const int64_t before = rtl::live_work_records();
+    const uint64_t work = fx.call(&pg6_gthunk_create_threadpool_work, {kRaceCb, 0, 0});
+    CHECK(rtl::live_work_records() == before + 1);
+    win32::fail_next_thread_pool_submissions_for_testing(1);
+    fx.call(&pg6_gthunk_submit_threadpool_work, {work});
+    fx.call(&pg6_gthunk_close_threadpool_work, {work});
+    CHECK(rtl::live_work_records() == before);
+    CHECK(rtl::live_pool_records() == 0);
+    win32::shutdown_thread_pool();
+}
+
 // ---------------------------------------------------------------------------
 // RtlCaptureStackBackTrace
 // ---------------------------------------------------------------------------
@@ -1814,6 +1829,7 @@ int main() {
     RUN(test_links);
     RUN(test_thread_pool_guest);
     RUN(test_thread_pool_close_races_last_callback);
+    RUN(test_thread_pool_failed_submit_releases_record);
     RUN(test_capture_stack_back_trace);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

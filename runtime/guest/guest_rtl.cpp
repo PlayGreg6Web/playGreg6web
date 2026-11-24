@@ -289,21 +289,36 @@ uint64_t create_work_impl(uint64_t callback, uint64_t context, uint64_t callback
 }
 
 void submit_work_impl(uint64_t token) {
-    bool known = false;
+    WorkRecord* record = nullptr;
     {
         PoolRegistry& reg = pool();
         std::lock_guard<std::mutex> lock(reg.mutex);
         auto it = reg.works.find(token);
         if (it != reg.works.end()) {
-            ++it->second->pending;
-            known = true;
+            record = it->second;
+            ++record->pending;
         }
     }
-    if (!known) {
+    if (record == nullptr) {
         report_unknown_work(token, "SubmitThreadpoolWork");
         return;
     }
-    win32::SubmitThreadpoolWork(reinterpret_cast<Pg6TpWork*>(static_cast<uintptr_t>(token)));
+    if (win32::SubmitThreadpoolWork(reinterpret_cast<Pg6TpWork*>(static_cast<uintptr_t>(token)))) {
+        return;
+    }
+    // Never queued, so no callback will release the pending count taken above (O35). The count
+    // keeps the record alive until here; a Close that raced in left the deletion to us.
+    bool destroy = false;
+    {
+        std::lock_guard<std::mutex> lock(pool().mutex);
+        if (record->pending != 0) {
+            --record->pending;
+        }
+        destroy = record->closed && record->pending == 0;
+    }
+    if (destroy) {
+        delete_work_record(record);
+    }
 }
 
 void wait_work_impl(uint64_t token, bool cancel_pending) {
