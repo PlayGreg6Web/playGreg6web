@@ -1076,7 +1076,10 @@ uint32_t CommandListBridge::upload_root_constants(d3d::BindPoint bind_point, uin
         return upload.offset;
     }
     const uint32_t buffer_id = device_.ensure_root_constant_ring(encoder_);
-    const uint32_t bytes = align_up(std::max<uint32_t>(static_cast<uint32_t>(values.size()) * 4u, 16u), 16u);
+    // The whole 256-byte ring slot is written (zero past the values): it is what the binding
+    // covers (see the RootConstants case of to_bind_entry).
+    const uint32_t bytes = align_up(std::max<uint32_t>(static_cast<uint32_t>(values.size()) * 4u, 1u),
+                                    kRootConstantAlignment);
     bool wrapped = false;
     const uint32_t offset = device_.allocate_root_constants(bytes, &wrapped);
     if (wrapped) {
@@ -1257,7 +1260,10 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
         case d3d::BindResourceKind::RootConstants:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
             out.resource_id = device_.ensure_root_constant_ring(side);
-            out.size = align_up(std::max<uint32_t>(static_cast<uint32_t>(e.size), 16u), 16u);
+            // Bind the whole ring slot (256 bytes, zero past the values), like a constant-buffer
+            // view padded to the PC D3D12 minimum: stages may declare the constants as a larger
+            // uniform block, and WebGPU rejects a binding smaller than the shader's block.
+            out.size = align_up(std::max<uint32_t>(static_cast<uint32_t>(e.size), 1u), kRootConstantAlignment);
             break;
         case d3d::BindResourceKind::Null:
             switch (static_cast<GpuBindingLayoutType>(layout.type)) {

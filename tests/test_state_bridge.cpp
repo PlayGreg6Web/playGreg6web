@@ -456,7 +456,7 @@ void test_representative_command_list() {
     const auto b1 = pod<GpuBindGroupEntry2>(p[10], sizeof(bg) + sizeof(GpuBindGroupEntry2));
     const auto b2 = pod<GpuBindGroupEntry2>(p[10], sizeof(bg) + 2 * sizeof(GpuBindGroupEntry2));
     CHECK(b0.binding == 0 && b0.resource_type == static_cast<uint32_t>(GpuBindResourceType::Buffer));
-    CHECK(b0.resource_id == 1003 && b0.offset == 0 && b0.size == 16);
+    CHECK(b0.resource_id == 1003 && b0.offset == 0 && b0.size == 256);  // the whole ring slot
     CHECK(b1.binding == 1 && b1.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView));
     CHECK(b1.resource_id == Scene::kAlbedo);
     CHECK(b1.view.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm));
@@ -465,7 +465,7 @@ void test_representative_command_list() {
     CHECK(b2.binding == 2 && b2.resource_type == static_cast<uint32_t>(GpuBindResourceType::Sampler));
     CHECK(b2.resource_id == 1004);
     const auto wb = pod<GpuWriteBufferPayload>(p[11]);
-    CHECK(wb.id == 1003 && wb.dst_offset == 0 && wb.data_len == 16);
+    CHECK(wb.id == 1003 && wb.dst_offset == 0 && wb.data_len == 256);  // zero past the values
     CHECK(pod<uint32_t>(p[11], sizeof(wb) + 4) == 0x3f000000u);
     const auto sbg = pod<GpuSetBindGroup2Payload>(p[12]);
     CHECK(sbg.group_index == 0 && sbg.bind_group_id == 1005 && sbg.dynamic_offset_count == 1);

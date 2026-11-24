@@ -396,14 +396,15 @@ test('state bridge fixture stream produces the exact WebGPU calls', () => {
   assert.deepEqual(bindGroup.desc, {
     layout: bglCall.result,
     entries: [
-      { binding: 0, resource: { buffer: ring.result, offset: 0, size: 16 } },
+      { binding: 0, resource: { buffer: ring.result, offset: 0, size: 256 } },
       { binding: 1, resource: albedoView.result },
       { binding: 2, resource: sampler.result },
     ],
   });
   const writes = gpu.results('writeBuffer').filter((c) => c.buffer === ring.result);
   assert.deepEqual(writes.map((w) => w.dstOffset), [0, 256]);
-  assert.deepEqual([...new Float32Array(writes[0].data.buffer)], [1, 0.5, 0.25, 1]);
+  // The whole 256-byte ring slot is written: the 4 constants, then zeros.
+  assert.deepEqual([...new Float32Array(writes[0].data.buffer)], [1, 0.5, 0.25, 1, ...new Array(60).fill(0)]);
 
   const vb = gpu.results('createBuffer').find((c) => c.desc.size === 36).result;
   const f32 = Math.fround;
