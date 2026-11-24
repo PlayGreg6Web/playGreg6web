@@ -1132,6 +1132,25 @@ void test_resources() {
     CHECK(result == 0 && fx.vcall(at, Slot2::GetGPUVirtualAddress) == title_memory);
     CHECK(object_of<dg::Resource>(at)->cpu_address() == title_memory);
 
+    // Xbox textures may carry 0x100 | an XG swizzle mode in the layout field (here 0x102 on a
+    // 640x360 R32_UINT UAV texture); other layouts above 3, and swizzle modes on buffers, stay invalid.
+    const uint64_t tex_memory = com::guest_alloc(1 << 20);
+    dg::GuestResourceDesc swizzled = texture_desc(640, 360, 42, 0x4);
+    swizzled.Layout = 0x102;
+    const uint64_t sw = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
+                                  dg::IID_ID3D12Resource, &result);
+    CHECK(result == 0 && sw != 0);
+    swizzled.Layout = 0x200;
+    CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
+                    dg::IID_ID3D12Resource, &result) == 0);
+    CHECK(result == dg::kEInvalidArg && contains(dev->diagnostics(), "layout 512"));
+    dg::GuestResourceDesc swizzled_buffer = buffer_desc(4096);
+    swizzled_buffer.Layout = 0x102;
+    CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled_buffer)), I(0), I(0)},
+                    dg::IID_ID3D12Resource, &result) == 0);
+    CHECK(result == dg::kEInvalidArg);
+    fx.vcall(sw, Slot::Release);
+
     // Xbox slot 127 (CreateCommittedResource3 shape, DESC1 + layout + castable formats).
     uint8_t desc1[dg::kGuestResourceDesc1Size] = {};
     const dg::GuestResourceDesc base = buffer_desc(512);

@@ -498,9 +498,17 @@ ResourceDesc1Result Resource::GetDesc1() {
 // ---------------------------------------------------------------------------------------------
 
 namespace {
+// Xbox: a texture's layout field may also hold 0x100 | an XG swizzle mode. The executable builds
+// 0x100, 0x102, 0x10A and 0x100 | a per-texture mode byte itself, and XGSuggestSwizzleMode writes
+// into that field (kXgDefaultSwizzleMode). The guest layer keeps no CPU image of textures, so the
+// mode does not change what is created; it is accepted, not interpreted.
+bool xbox_swizzle_layout(uint32_t layout) { return (layout & ~0xFFu) == 0x100u; }
+
 bool validate_desc(Device& dev, const GuestResourceDesc& d) {
+    const bool layout_ok =
+        d.Layout <= 3 || (d.Dimension != ResourceDimension::Buffer && xbox_swizzle_layout(d.Layout));
     if (d.Dimension < ResourceDimension::Buffer || d.Dimension > ResourceDimension::Texture3D || d.Width == 0 ||
-        d.Layout > 3) {
+        !layout_ok) {
         dev.note_bad_argument("invalid resource description (dimension " + std::to_string(d.Dimension) + ", width " +
                               std::to_string(d.Width) + ", layout " + std::to_string(d.Layout) + ")");
         return false;
