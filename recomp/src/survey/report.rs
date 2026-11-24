@@ -90,6 +90,13 @@ fn render_key_text(out: &mut String, k: &KeyReport) {
             format!("; globals {}", hex_list(&k.globals))
         }
     );
+    if !k.global_fields.is_empty() {
+        let _ = writeln!(
+            out,
+            "    global object fields: {}",
+            field_list(&k.global_fields).join(",")
+        );
+    }
     if !k.slots.is_empty() {
         let _ = writeln!(
             out,
@@ -140,6 +147,20 @@ fn json_str(s: &str) -> String {
     }
     o.push('"');
     o
+}
+
+/// `0x<global>+0x<disp>` (or `-0x<disp>`) per field.
+fn field_list(fields: &[(u64, i64)]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|&(g, d)| {
+            if d < 0 {
+                format!("0x{g:x}-0x{:x}", d.unsigned_abs())
+            } else {
+                format!("0x{g:x}+0x{d:x}")
+            }
+        })
+        .collect()
 }
 
 fn json_hex_list(values: &[u64]) -> String {
@@ -200,7 +221,7 @@ pub fn render_json(s: &Survey) -> String {
                 o,
                 "      {{\"key\": [{}], \"source_calls\": {}, \"source_functions\": {}, \
                  \"out\": {{\"stack\": {}, \"global\": {}, \"ret\": {}}}, \"globals\": {}, \
-                 \"unresolved\": {}, \"slots\": [",
+                 \"global_fields\": [{}], \"unresolved\": {}, \"slots\": [",
                 key.join(", "),
                 k.source_calls,
                 k.source_functions,
@@ -208,6 +229,11 @@ pub fn render_json(s: &Survey) -> String {
                 k.out_global,
                 k.out_ret,
                 json_hex_list(&k.globals),
+                field_list(&k.global_fields)
+                    .iter()
+                    .map(|s| json_str(s))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 json_counts(&k.unresolved)
             );
             for (n, sl) in k.slots.iter().enumerate() {

@@ -863,6 +863,161 @@ fn object_fields_are_followed_inside_a_function_only_until_a_call() {
 }
 
 #[test]
+fn fields_of_a_global_object_are_followed_across_functions() {
+    let mut fx = Fx::new();
+    let create = fx.import("dev.dll", "Create");
+    // Stores the interface into field 0x48 of the object G0 points to.
+    fx.func(|a| {
+        create_dev(a, create)?;
+        a.mov(rcx, qword_ptr(rsp + 0x30))?;
+        load_g(a, Register::RAX, G0)?;
+        a.mov(qword_ptr(rax + 0x48), rcx)?;
+        epilogue(a)
+    });
+    // Another function reloads the object pointer and the field.
+    fx.func(|a| {
+        a.sub(rsp, 0x28)?;
+        load_g(a, Register::RDX, G0)?;
+        a.mov(rcx, qword_ptr(rdx + 0x48))?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.call(qword_ptr(rax + 0x20))?;
+        // A different field of the same object is not the interface.
+        load_g(a, Register::RDX, G0)?;
+        a.mov(rcx, qword_ptr(rdx + 0x50))?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.call(qword_ptr(rax + 0x28))?;
+        a.add(rsp, 0x28)?;
+        a.ret()
+    });
+    let s = fx.run(config(&[DEV]));
+    let k = key(&s, "dev", 0);
+    assert_eq!(k.global_fields, [(G0, 0x48)]);
+    assert!(k.globals.is_empty());
+    assert_eq!(slot_numbers(k), [4]);
+    assert_eq!(slot(k, 4).unwrap().confidence, Confidence::Medium);
+    assert!(!k.unresolved.contains_key("stored_to_unknown"));
+    assert!(render_text(&s).contains(&format!("global object fields: {G0:#x}+0x48")));
+    assert!(render_json(&s).contains(&format!("\"global_fields\": [\"{G0:#x}+0x48\"]")));
+}
+
+#[test]
+fn return_values_reach_the_callers() {
+    let mut fx = Fx::new();
+    let create = fx.import("dev.dll", "Create");
+    let getter = fx.func(|a| {
+        create_dev(a, create)?;
+        a.mov(rax, qword_ptr(rsp + 0x30))?;
+        epilogue(a)
+    });
+    // A tail call forwards the return value.
+    let forwarder = fx.func(|a| a.jmp(getter));
+    for (target, disp) in [(getter, 0x28), (forwarder, 0x30)] {
+        fx.func(|a| {
+            a.sub(rsp, 0x28)?;
+            a.call(target)?;
+            a.mov(rcx, rax)?;
+            a.mov(rax, qword_ptr(rcx))?;
+            a.call(qword_ptr(rax + disp))?;
+            a.add(rsp, 0x28)?;
+            a.ret()
+        });
+    }
+    let s = fx.run(config(&[DEV]));
+    let k = key(&s, "dev", 0);
+    assert_eq!(slot_numbers(k), [5, 6]);
+    assert!(
+        k.slots
+            .iter()
+            .all(|s| s.sites == 1 && s.confidence == Confidence::Medium)
+    );
+    // The getter has callers, so its return is followed, not counted as an escape.
+    assert!(!k.unresolved.contains_key("returned_to_caller"));
+}
+
+#[test]
+fn out_parameters_reach_stack_slots_and_globals_of_the_callers() {
+    let mut fx = Fx::new();
+    let create = fx.import("dev.dll", "Create");
+    // void make(Iface** out) { Create(.., &tmp); *out = tmp; }
+    let make = fx.func(|a| {
+        a.push(rbx)?;
+        a.mov(rbx, rcx)?;
+        a.sub(rsp, 0x30)?;
+        a.lea(rdx, qword_ptr(rsp + 0x28))?;
+        call_slot(a, create)?;
+        a.mov(rax, qword_ptr(rsp + 0x28))?;
+        a.mov(qword_ptr(rbx), rax)?;
+        a.add(rsp, 0x30)?;
+        a.pop(rbx)?;
+        a.ret()
+    });
+    // Out pointer on the caller's stack.
+    fx.func(|a| {
+        a.sub(rsp, 0x38)?;
+        a.lea(rcx, qword_ptr(rsp + 0x30))?;
+        a.call(make)?;
+        a.mov(rcx, qword_ptr(rsp + 0x30))?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.call(qword_ptr(rax + 0x38))?;
+        epilogue(a)
+    });
+    // Out pointer is a global, used elsewhere.
+    fx.func(|a| {
+        a.sub(rsp, 0x28)?;
+        lea_g(a, Register::RCX, G1)?;
+        a.call(make)?;
+        a.add(rsp, 0x28)?;
+        a.ret()
+    });
+    fx.func(|a| {
+        load_g(a, Register::RCX, G1)?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.sub(rsp, 0x28)?;
+        a.call(qword_ptr(rax + 0x40))?;
+        a.add(rsp, 0x28)?;
+        a.ret()
+    });
+    let s = fx.run(config(&[DEV]));
+    let k = key(&s, "dev", 0);
+    assert_eq!(k.globals, [G1]);
+    assert_eq!(slot_numbers(k), [7, 8]);
+    assert!(!k.unresolved.contains_key("stored_to_field"));
+}
+
+#[test]
+fn struct_return_calls_with_this_in_rdx_are_confirmed() {
+    let mut fx = Fx::new();
+    let create = fx.import("dev.dll", "Create");
+    fx.func(|a| {
+        a.sub(rsp, 0x58)?;
+        a.lea(rdx, qword_ptr(rsp + 0x50))?;
+        call_slot(a, create)?;
+        // GetSomething(&result) on the interface: rcx = result buffer, rdx = this.
+        a.mov(rdx, qword_ptr(rsp + 0x50))?;
+        a.lea(rcx, qword_ptr(rsp + 0x30))?;
+        a.mov(rax, qword_ptr(rdx))?;
+        a.call(qword_ptr(rax + 0x48))?;
+        // `this` in rdx but rcx not a stack buffer: still unconfirmed.
+        a.mov(rdx, qword_ptr(rsp + 0x50))?;
+        a.mov(rcx, rdi)?;
+        a.mov(rax, qword_ptr(rdx))?;
+        a.call(qword_ptr(rax + 0x50))?;
+        a.add(rsp, 0x58)?;
+        a.ret()
+    });
+    let s = fx.run(config(&[DEV]));
+    let k = key(&s, "dev", 0);
+    let sret = slot(k, 9).unwrap();
+    assert_eq!((sret.sites, sret.unconfirmed_sites), (1, 0));
+    assert_eq!(evidence_str(sret.evidence), "regs+sret");
+    assert_eq!(sret.confidence, Confidence::High);
+    // Only the unconfirmed call counts `rdx` as an interface passed as an argument.
+    assert_eq!(k.unresolved.get("passed_as_argument"), Some(&1));
+    let other = slot(k, 10).unwrap();
+    assert_eq!((other.sites, other.unconfirmed_sites), (0, 1));
+}
+
+#[test]
 fn results_are_deterministic_and_the_json_has_the_documented_shape() {
     let build = || {
         let (mut fx, _, guids) = proc_fixture();

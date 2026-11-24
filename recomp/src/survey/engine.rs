@@ -6,8 +6,16 @@
 //! of a global, a stack address (relative to the entry `rsp`), an interface pointer of a *key*
 //! (a source plus its GUID arguments), the vtable loaded from such a pointer, or a method pointer
 //! loaded from that vtable. Memory is tracked in two places: 8-byte stack slots and object fields
-//! (`[reg+disp]` of an opaque incoming pointer) live in the per-block [`State`]; globals are
+//! (`[reg+disp]` of an opaque incoming pointer) live in the per-block [`State`]; globals and the
+//! fields of objects whose pointer is held in a global (`mov r,[g]` then `[r+disp]`) are
 //! flow-insensitive facts shared by all functions ([`Facts`]).
+//!
+//! # Results of callees
+//!
+//! A function that returns an interface pointer in `rax`, or stores one through an incoming
+//! argument register (`[rcx]`, `[rdx]`, ...: an out-parameter), records that as a fact keyed by
+//! its entry; direct calls to it then yield the pointer in `rax` or in the stack slot / global
+//! the caller passed, with [`Prov::Returned`].
 //!
 //! # Fixpoint
 //!
@@ -16,7 +24,7 @@
 //! single extra pass over the fixpoint states, never during iteration, so a value that is lost at
 //! a join can never produce a result.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use iced_x86::{Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 
@@ -52,8 +60,11 @@ const VOLATILE: [usize; 7] = [0, 1, 2, 8, 9, 10, 11];
 pub(super) enum Prov {
     /// Obtained and used inside one function (stack slot, register or return value).
     Local,
-    /// Loaded from a global that some function stored the pointer to.
+    /// Loaded from a global (or a field of a global object) that some function stored the
+    /// pointer to.
     Global,
+    /// Returned by a called function, in `rax` or through an out-parameter.
+    Returned,
     /// Passed in by a caller that was analysed with the pointer bound to an argument.
     Context,
 }
@@ -75,6 +86,9 @@ pub(super) enum V {
     Proc(u32),
     /// Function pointer variable of proc source `n`.
     FnVar(u32),
+    /// Pointer loaded from the global at this address: the identity of a global object whose
+    /// fields are tracked flow-insensitively.
+    GPtr(u64),
     Iface(KeyId, Prov),
     Vtbl(KeyId, Prov),
     Method(KeyId, u32, Prov),
@@ -250,7 +264,7 @@ pub(super) enum Reason {
     PassedBeyondLimit,
     /// The pointer was passed as a non-`this` argument of a vtable call.
     PassedAsArgument,
-    /// The pointer was returned to the caller in `rax`.
+    /// The pointer was returned in `rax` by a function that no discovered call reaches.
     ReturnedToCaller,
     /// The vtable slot of a call is computed (`call [vtable+reg*8]`, unaligned or huge offset).
     ComputedSlot,
@@ -309,6 +323,9 @@ pub(super) const EV_REGS: u8 = 1;
 pub(super) const EV_XMM: u8 = 2;
 pub(super) const EV_STACK: u8 = 4;
 pub(super) const EV_TAIL: u8 = 8;
+/// Struct-return call: `rcx` is a stack address (the hidden result pointer) and `this` is in
+/// `rdx`; the site counts as confirmed when `rdx` is the interface the vtable came from.
+pub(super) const EV_SRET: u8 = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UseRec {
@@ -342,6 +359,14 @@ pub(super) struct Facts {
     /// Functions that forward their own arguments unchanged to a source (import or proc), mapped
     /// to that source: calls to them are source calls.
     pub forwarders: BTreeMap<u64, usize>,
+    /// `(global, disp)` -> interface keys stored to field `disp` of the object whose pointer is
+    /// held in `global`.
+    pub iface_fields: BTreeMap<(u64, i64), BTreeSet<KeyId>>,
+    /// `(function, binding)` -> interface keys the function returns in `rax`.
+    pub returns: BTreeMap<(u64, Binding), BTreeSet<KeyId>>,
+    /// `(function, argument index)` -> interface keys the function stores through that incoming
+    /// argument register (`[arg+0]`).
+    pub out_args: BTreeMap<(u64, u8), BTreeSet<KeyId>>,
     /// Counts facts that can change later analyses (new globals, function-pointer variables,
     /// source calls).
     pub generation: u64,
@@ -372,6 +397,49 @@ impl Facts {
         if self.iface_globals.entry(va).or_default().insert(key) {
             self.generation += 1;
         }
+    }
+
+    fn add_iface_field(&mut self, va: u64, disp: i64, key: KeyId) {
+        if self.iface_fields.entry((va, disp)).or_default().insert(key) {
+            self.generation += 1;
+        }
+    }
+
+    fn add_return(&mut self, function: u64, binding: Binding, key: KeyId) {
+        if self
+            .returns
+            .entry((function, binding))
+            .or_default()
+            .insert(key)
+        {
+            self.generation += 1;
+        }
+    }
+
+    fn add_out_arg(&mut self, function: u64, arg: u8, key: KeyId) {
+        if self
+            .out_args
+            .entry((function, arg))
+            .or_default()
+            .insert(key)
+        {
+            self.generation += 1;
+        }
+    }
+
+    /// The single key `function` returns for `binding` (falling back to the analysis without
+    /// bound arguments); `None` when unknown or ambiguous.
+    fn returned_key(&self, function: u64, binding: Binding) -> Option<KeyId> {
+        let set = self
+            .returns
+            .get(&(function, binding))
+            .or_else(|| self.returns.get(&(function, Binding::default())))?;
+        (set.len() == 1).then(|| *set.first().expect("non-empty"))
+    }
+
+    fn out_arg_key(&self, function: u64, arg: u8) -> Option<KeyId> {
+        let set = self.out_args.get(&(function, arg))?;
+        (set.len() == 1).then(|| *set.first().expect("non-empty"))
     }
 
     fn add_fn_var(&mut self, va: u64, src: u32) {
@@ -422,6 +490,8 @@ enum MemRef {
     Global(u64),
     Stack(i64),
     Field(u8, i64),
+    /// `[p+disp]` where `p` was loaded from the global.
+    GlobalField(u64, i64),
     /// `[vtable+disp]`.
     VtblSlot(KeyId, Prov, i64),
     /// `[iface+disp]`.
@@ -442,6 +512,7 @@ enum Callee {
 pub(super) struct Frame {
     pub entry: u64,
     pub depth: u8,
+    pub binding: Binding,
 }
 
 pub(super) struct Engine<'a> {
@@ -451,6 +522,8 @@ pub(super) struct Engine<'a> {
     pub analysis: &'a Analysis,
     pub facts: Facts,
     thunks: HashMap<u64, Thunk>,
+    /// Functions reached by at least one direct call or tail call.
+    called: HashSet<u64>,
     info: InstructionInfoFactory,
     /// Callee contexts found while recording, to be analysed next.
     pub pending: Vec<(u64, Binding)>,
@@ -488,6 +561,23 @@ fn is_iface(v: V) -> Option<KeyId> {
     }
 }
 
+/// Interface pointers held in the four argument registers.
+fn binding_of(st: &State) -> Binding {
+    let mut b = Binding::default();
+    for (i, r) in ARG_REGS.iter().enumerate() {
+        b.0[i] = is_iface(st.regs[*r]);
+    }
+    b
+}
+
+/// Argument index (0 = `rcx`) of the register whose entry value is object `id`.
+fn arg_index_of(id: u8) -> Option<u8> {
+    ARG_REGS
+        .iter()
+        .position(|&r| r == usize::from(id))
+        .map(|i| i as u8)
+}
+
 impl<'a> Engine<'a> {
     pub(super) fn new(
         plan: &'a Plan,
@@ -519,6 +609,21 @@ impl<'a> Engine<'a> {
                 _ => {}
             }
         }
+        let mut called = HashSet::new();
+        for f in analysis.functions.values() {
+            for block in f.blocks.values() {
+                for c in &block.calls {
+                    if let crate::cfg::CallTarget::Direct(t) = c.target {
+                        called.insert(t);
+                    }
+                }
+                for e in &block.successors {
+                    if let Edge::TailCall(t) = e {
+                        called.insert(*t);
+                    }
+                }
+            }
+        }
         let mut facts = Facts::default();
         facts
             .guard_slots
@@ -530,6 +635,7 @@ impl<'a> Engine<'a> {
             analysis,
             facts,
             thunks,
+            called,
             info: InstructionInfoFactory::new(),
             pending: Vec::new(),
             aborted: 0,
@@ -547,8 +653,12 @@ impl<'a> Engine<'a> {
         }
         slots.extend(self.facts.fn_vars.keys().map(|&k| (k, ())));
         slots.extend(self.facts.iface_globals.keys().map(|&k| (k, ())));
+        slots.extend(self.facts.iface_fields.keys().map(|&(g, _)| (g, ())));
         let mut fns: HashMap<u64, ()> = self.plan.fn_sources.keys().map(|&k| (k, ())).collect();
         fns.extend(self.facts.forwarders.keys().map(|&k| (k, ())));
+        // Callers of functions that hand out interface pointers.
+        fns.extend(self.facts.returns.keys().map(|&(f, _)| (f, ())));
+        fns.extend(self.facts.out_args.keys().map(|&(f, _)| (f, ())));
         for (entry, thunk) in &self.thunks {
             if let Thunk::JmpSlot(g) = thunk
                 && slots.contains_key(g)
@@ -564,6 +674,14 @@ impl<'a> Engine<'a> {
                     for c in &block.calls {
                         if let crate::cfg::CallTarget::Direct(t) = c.target
                             && fns.contains_key(&t)
+                        {
+                            hit = true;
+                            break 'blocks;
+                        }
+                    }
+                    for e in &block.successors {
+                        if let Edge::TailCall(t) = e
+                            && fns.contains_key(t)
                         {
                             hit = true;
                             break 'blocks;
@@ -598,6 +716,7 @@ impl<'a> Engine<'a> {
         let frame = Frame {
             entry: function.entry,
             depth,
+            binding,
         };
         let Some(entry_idx) = index_of(function.entry) else {
             return;
@@ -651,7 +770,58 @@ impl<'a> Engine<'a> {
             for edge in &block.successors {
                 if let Edge::TailCall(t) = edge {
                     self.bind_callee(&frame, *t, &st, block.terminator_site(), true);
+                    self.forward_tail_results(&frame, *t, &st);
                 }
+            }
+        }
+    }
+
+    /// A tail call hands the callee's results to this function's caller: its return value
+    /// becomes ours, and an out-parameter written through one of our own (unchanged) incoming
+    /// arguments is ours too.
+    fn forward_tail_results(&mut self, f: &Frame, target: u64, st: &State) {
+        if let Some(k) = self.facts.returned_key(target, binding_of(st)) {
+            self.facts.add_return(f.entry, f.binding, k);
+        }
+        for (i, &r) in ARG_REGS.iter().enumerate() {
+            if let V::Obj(id) = st.regs[r]
+                && let Some(own) = arg_index_of(id)
+                && let Some(k) = self.facts.out_arg_key(target, i as u8)
+            {
+                self.facts.add_out_arg(f.entry, own, k);
+            }
+        }
+    }
+
+    /// Effects of a direct call to `target` that the facts know about: the returned interface in
+    /// `rax` and interfaces written through out-parameters. `args` are the argument registers
+    /// before the call.
+    fn apply_call_results(
+        &mut self,
+        f: &Frame,
+        target: u64,
+        binding: Binding,
+        args: [V; 4],
+        st: &mut State,
+        rec: bool,
+    ) {
+        if let Some(k) = self.facts.returned_key(target, binding) {
+            st.regs[RAX] = V::Iface(k, Prov::Returned);
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let Some(k) = self.facts.out_arg_key(target, i as u8) else {
+                continue;
+            };
+            match *arg {
+                V::Stack(o) => st.stack_store(o, V::Iface(k, Prov::Returned), 8),
+                V::Addr(g) if rec => self.facts.add_iface_global(g, k),
+                V::GPtr(g) if rec => self.facts.add_iface_field(g, 0, k),
+                V::Obj(id) if rec => {
+                    if let Some(own) = arg_index_of(id) {
+                        self.facts.add_out_arg(f.entry, own, k);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -692,7 +862,11 @@ impl<'a> Engine<'a> {
             }
             Mnemonic::Ret => {
                 if rec && let V::Iface(k, _) = st.regs[RAX] {
-                    self.facts.unresolved(Reason::ReturnedToCaller, k, ins.ip());
+                    self.facts.add_return(f.entry, f.binding, k);
+                    // Followed into the callers; only a function nobody calls directly loses it.
+                    if !self.called.contains(&f.entry) {
+                        self.facts.unresolved(Reason::ReturnedToCaller, k, ins.ip());
+                    }
                 }
             }
             Mnemonic::Push => self.do_push(f, ins, st, rec),
@@ -798,7 +972,6 @@ impl<'a> Engine<'a> {
     }
 
     fn do_mov(&mut self, f: &Frame, ins: &Instruction, st: &mut State, rec: bool) {
-        let _ = f;
         match ins.op0_kind() {
             OpKind::Register => {
                 let dst = ins.op0_register();
@@ -848,7 +1021,7 @@ impl<'a> Engine<'a> {
                     k if is_immediate(k) => V::Const(ins.immediate(1)),
                     _ => V::Unk,
                 };
-                self.store(ins, st, v, size, rec);
+                self.store(f, ins, st, v, size, rec);
             }
             _ => self.fallback(ins, st),
         }
@@ -962,6 +1135,7 @@ impl<'a> Engine<'a> {
         match bv {
             V::Stack(o) => MemRef::Stack(o.wrapping_add(disp)),
             V::Addr(a) => MemRef::Global(a.wrapping_add(disp as u64)),
+            V::GPtr(g) => MemRef::GlobalField(g, disp),
             V::Const(c) if self.image.contains(c.wrapping_add(disp as u64)) => {
                 MemRef::Global(c.wrapping_add(disp as u64))
             }
@@ -977,6 +1151,19 @@ impl<'a> Engine<'a> {
             MemRef::Global(g) => self.load_global(g, ins.ip(), rec),
             MemRef::Stack(o) => st.mem_get(Loc::Stack(o)),
             MemRef::Field(id, d) => st.mem_get(Loc::Field(id, d)),
+            MemRef::GlobalField(g, d) => match self.facts.iface_fields.get(&(g, d)) {
+                Some(keys) if keys.len() == 1 => {
+                    V::Iface(*keys.first().expect("non-empty"), Prov::Global)
+                }
+                Some(keys) => {
+                    if rec {
+                        let k = *keys.first().expect("non-empty");
+                        self.facts.unresolved(Reason::GlobalAmbiguous, k, ins.ip());
+                    }
+                    V::Unk
+                }
+                None => V::Unk,
+            },
             MemRef::VtblSlot(k, p, disp) => {
                 if disp >= 0 && disp % 8 == 0 && ((disp / 8) as u64) < u64::from(MAX_SLOT) {
                     V::Method(k, (disp / 8) as u32, p)
@@ -1019,13 +1206,23 @@ impl<'a> Engine<'a> {
                 let k = *keys.first().expect("non-empty");
                 self.facts.unresolved(Reason::GlobalAmbiguous, k, site);
             }
+            return V::Unk;
         }
-        V::Unk
+        // Any other pointer-sized global may point to an object whose fields hold interfaces.
+        V::GPtr(g)
     }
 
-    fn store(&mut self, ins: &Instruction, st: &mut State, v: V, size: i64, rec: bool) {
+    fn store(&mut self, f: &Frame, ins: &Instruction, st: &mut State, v: V, size: i64, rec: bool) {
         let escaped = matches!(v, V::Iface(..));
         match self.mem_ref(ins, st) {
+            MemRef::GlobalField(g, d) => {
+                if rec
+                    && size == 8
+                    && let V::Iface(k, _) = v
+                {
+                    self.facts.add_iface_field(g, d, k);
+                }
+            }
             MemRef::Global(g) => {
                 if rec && size == 8 {
                     match v {
@@ -1053,7 +1250,11 @@ impl<'a> Engine<'a> {
                     st.mem_put(Loc::Field(id, d), v);
                 }
                 if rec && let V::Iface(k, _) = v {
-                    self.facts.unresolved(Reason::StoredToField, k, ins.ip());
+                    match arg_index_of(id) {
+                        // `[arg+0]`: an out-parameter, followed into the callers.
+                        Some(i) if d == 0 && size == 8 => self.facts.add_out_arg(f.entry, i, k),
+                        _ => self.facts.unresolved(Reason::StoredToField, k, ins.ip()),
+                    }
                 }
             }
             _ => {
@@ -1155,7 +1356,10 @@ impl<'a> Engine<'a> {
                     if rec {
                         self.bind_callee(f, t, st, site, false);
                     }
+                    let binding = binding_of(st);
+                    let args = ARG_REGS.map(|r| st.regs[r]);
                     self.clobber_call(st);
+                    self.apply_call_results(f, t, binding, args, st, rec);
                 }
             }
             Callee::DispatchThunk => match (st.regs[RAX], st.regs[RCX]) {
@@ -1378,8 +1582,12 @@ impl<'a> Engine<'a> {
         prov: Prov,
     ) {
         let site = ins.ip();
-        let confirmed = is_iface(st.regs[RCX]) == Some(key);
-        let (mut args, mut evidence) = (1u8, 0u8);
+        // Struct return: hidden result pointer (a stack address) in `rcx`, `this` in `rdx`.
+        let sret = is_iface(st.regs[RCX]) != Some(key)
+            && is_iface(st.regs[RDX]) == Some(key)
+            && matches!(st.regs[RCX], V::Stack(_));
+        let confirmed = is_iface(st.regs[RCX]) == Some(key) || sret;
+        let (mut args, mut evidence) = (1u8, if sret { EV_SRET } else { 0 });
         let gpr_bits = st.written & 7;
         let xmm_bits = (st.written >> 3) & 7;
         if gpr_bits != 0 {
@@ -1427,6 +1635,9 @@ impl<'a> Engine<'a> {
         }
         if rec {
             for r in [RDX, R8, R9] {
+                if sret && r == RDX {
+                    continue;
+                }
                 if let V::Iface(k, _) = st.regs[r]
                     && !outs.iter().any(|(_, _, ov)| *ov == Some(st.regs[r]))
                 {

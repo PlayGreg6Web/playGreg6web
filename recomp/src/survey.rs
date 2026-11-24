@@ -37,8 +37,17 @@
 //!
 //! Inter-procedurally, interface pointers passed in `rcx`/`rdx`/`r8`/`r9` to a discovered
 //! function (direct calls and tail calls) are propagated into it, up to [`Config::max_depth`]
-//! levels. A function containing a vtable call is a "wrapper"; `caller_sites` counts the direct
-//! calls and tail calls that reach those wrapper functions.
+//! levels. In the other direction, a function that returns an interface pointer in `rax` or
+//! stores one through an incoming argument (`mov [rcx],r`: an out-parameter) hands it to its
+//! direct callers (into `rax`, or into the stack slot, global or global-object field they passed),
+//! and tail calls forward both. Pointers stored into a field of an object whose pointer is kept in
+//! a global (`mov r,[g]; mov [r+disp],iface`) are followed like globals and listed as global
+//! object fields. A function containing a vtable call is a "wrapper"; `caller_sites` counts the
+//! direct calls and tail calls that reach those wrapper functions.
+//!
+//! Struct-returning methods take the hidden result pointer in `rcx` and `this` in `rdx`; a call
+//! whose vtable came from the interface in `rdx` while `rcx` is a stack address is confirmed and
+//! marked with the `sret` evidence kind.
 //!
 //! # Honesty
 //!
@@ -49,8 +58,8 @@
 //!   to the site. A register written for another reason inflates it, an argument set up in a
 //!   callee-saved register earlier cannot be seen. Each site carries its evidence kinds.
 //! - Confidence: `high` when every confirmed site used a pointer obtained locally, `medium` when
-//!   some came through a global or a caller-supplied argument, `low` when only unconfirmed sites
-//!   exist.
+//!   some came through a global, a global-object field, a callee's result or a caller-supplied
+//!   argument, `low` when only unconfirmed sites exist.
 //! - Everything the analysis cannot follow is counted by reason in the unresolved bucket
 //!   ([`engine::Reason`]) instead of being guessed. Stack slots are forgotten only at the exact
 //!   address passed to a call, memory writes through unknown pointers do not alias tracked
@@ -461,6 +470,9 @@ pub fn evidence_str(bits: u8) -> String {
     if bits & engine::EV_TAIL != 0 {
         parts.push("tail");
     }
+    if bits & engine::EV_SRET != 0 {
+        parts.push("sret");
+    }
     parts.join("+")
 }
 
@@ -495,6 +507,8 @@ pub struct KeyReport {
     pub out_ret: u32,
     /// Globals that hold interface pointers of this key.
     pub globals: Vec<u64>,
+    /// `(global, disp)`: fields of objects pointed to by a global that hold pointers of this key.
+    pub global_fields: Vec<(u64, i64)>,
     pub slots: Vec<SlotReport>,
     pub unresolved: BTreeMap<&'static str, u32>,
 }
@@ -691,6 +705,7 @@ fn build_report(plan: &Plan, engine: &Engine<'_>, analysis: &Analysis, stats: St
     used.extend(facts.source_calls.keys().map(|(k, _)| *k));
     used.extend(facts.uses.keys().map(|(k, _, _)| *k));
     used.extend(facts.iface_globals.values().flatten().copied());
+    used.extend(facts.iface_fields.values().flatten().copied());
     used.extend(
         facts
             .unresolved
@@ -729,6 +744,12 @@ fn build_report(plan: &Plan, engine: &Engine<'_>, analysis: &Analysis, stats: St
                 .iter()
                 .filter(|(_, ks)| ks.contains(&key))
                 .map(|(g, _)| *g)
+                .collect(),
+            global_fields: facts
+                .iface_fields
+                .iter()
+                .filter(|(_, ks)| ks.contains(&key))
+                .map(|(f, _)| *f)
                 .collect(),
             slots: Vec::new(),
             unresolved: BTreeMap::new(),
