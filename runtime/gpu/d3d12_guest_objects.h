@@ -881,6 +881,18 @@ DxgiFormatLayout dxgi_format_layout(uint32_t format);
 uint32_t plane_block_bytes(uint32_t format, uint32_t plane);
 // Linear size of a resource's subresources (no tiling or alignment padding).
 uint64_t resource_size_estimate(const GuestResourceDesc& desc);
+// Bytes the console's D3D12 allocates for a committed resource: the 64 KiB-block surface size
+// for the 2D surfaces os/surface_blocks.h covers, otherwise resource_size_estimate.
+uint64_t committed_memory_size(const GuestResourceDesc& desc);
+
+// XMemAlloc attributes for committed-resource memory (XALLOC_ATTRIBUTES fields):
+//   allocator id (bits 16..23) = 0x80 - inferred from a title's allocator hook, which registers
+//     its D3D resource arena handler for allocator id 0x80 (the public layout reserves ids from
+//     128 for the system; the first is the D3D allocator);
+//   page size (bits 14..15) = 2 - inferred from the same hook, which accepts only page-size field
+//     2 (large pages) for that arena;
+//   object type (bits 0..13), alignment, memory type and the rest = 0 (not documented values).
+inline constexpr uint64_t kD3D12ResourceXMemAttributes = (uint64_t{0x80} << 16) | (uint64_t{2} << 14);
 com::Ref<Device> device_ref(Device* device);
 
 // Root signature description from a D3D12_VERSIONED_ROOT_SIGNATURE_DESC in guest memory (all nested

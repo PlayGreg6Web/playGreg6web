@@ -136,6 +136,7 @@ private:
     uint32_t mips_ = 1;
     uint64_t gpu_va_ = 0;
     uint64_t cpu_va_ = 0;
+    void* xmem_memory_ = nullptr;  // committed render-target memory from XMemAlloc (see initialize)
     uint64_t owned_guest_memory_ = 0;
     bool gpu_texture_ = false;
     bool tracked_ = false;
