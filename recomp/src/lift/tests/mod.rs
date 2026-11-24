@@ -5,6 +5,7 @@
 
 mod exec;
 mod exec_integer;
+mod exec_memory;
 mod exec_native;
 mod exec_simd;
 mod exec_unwind;
@@ -23,6 +24,8 @@ mod host_diff_simd_int;
 mod ir;
 mod ir_integer;
 mod ir_simd;
+mod memory_bench;
+mod memory_models;
 #[cfg(target_arch = "x86_64")]
 mod simd_diff;
 

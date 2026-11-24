@@ -23,10 +23,11 @@ use crate::cfg;
 use crate::lift::compile::{
     LlvmTool, compile_to_wasm64_object, find_llvm_tool, find_on_path, rustc_tool_dir,
 };
+use crate::lift::memory::{PAGE_TABLE_SYMBOL, WINDOW_TABLE_SYMBOL, Window, WindowCheck};
 use crate::lift::{
-    GUEST_BASE_SYMBOL, GuestBase, STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET,
-    STATE_MXCSR_OFFSET, STATE_RESUME_RIP_OFFSET, STATE_SIZE, STATE_UNWIND_PENDING_OFFSET,
-    STATE_XMM_OFFSET, lift_module, lift_module_with,
+    GUEST_BASE_SYMBOL, GuestBase, MemoryModel, STATE_FLAGS_OFFSET, STATE_GPR_OFFSET,
+    STATE_GS_BASE_OFFSET, STATE_MXCSR_OFFSET, STATE_RESUME_RIP_OFFSET, STATE_SIZE,
+    STATE_UNWIND_PENDING_OFFSET, STATE_XMM_OFFSET, lift_module, lift_module_with,
 };
 
 pub(super) const RAX: usize = 0;
@@ -52,6 +53,189 @@ pub(super) const MEMORY_BYTES: u64 = 16 << 20;
 /// at VA `v` lives at linear address `v + GUEST_BASE`. Non-zero, so every execution test goes
 /// through the guest-base seam; the state block (`STATE_ADDR`) is host memory and is not moved.
 pub(super) const GUEST_BASE: u64 = 0x80_0000;
+
+// ----- R19 table memory models ------------------------------------------------------------------
+//
+// `PLAYGTA6_LIFT_MEMORY_MODEL=window|page` runs every test that uses the default build
+// ([`build`] / [`build_with`]) under a table model (lift/memory.rs) instead of the base model.
+// Both map the guest range [WINDOW_BASE, WINDOW_BASE + WINDOW_SIZE) - which holds DATA_ADDR and the
+// guest stack, while code and jump tables at CODE_BASE stay outside - slot by slot onto scrambled
+// linear pages at WINDOW_BACKING, so accesses that straddle a 64 KiB slot take the slow path.
+
+/// First guest VA of the harness window (64 KiB aligned).
+pub(super) const WINDOW_BASE: u64 = 0x10_0000;
+/// Size of the harness window: 16 slots.
+pub(super) const WINDOW_SIZE: u64 = 0x10_0000;
+/// Linear address of the pages backing the window slots (free in the harness memory map).
+pub(super) const WINDOW_BACKING: u64 = 0x40_0000;
+/// Slots of the page-table model (guest VAs below 4 GiB).
+pub(super) const PAGE_COUNT: u64 = 1 << 16;
+
+/// Linear page backing harness window slot `k` (a permutation: neighbours are never adjacent).
+pub(super) fn window_backing(k: u64) -> u64 {
+    WINDOW_BACKING + ((k * 7) % (WINDOW_SIZE >> 16)) * 0x1_0000
+}
+
+/// The memory model a test build uses, with the harness spec (`memory` in the runner JSON).
+#[derive(Clone)]
+pub(super) struct HarnessMemory {
+    pub model: MemoryModel,
+    /// JSON object for the runners, empty for the base model.
+    pub json: String,
+}
+
+impl HarnessMemory {
+    pub fn base(base: GuestBase) -> Self {
+        Self {
+            model: base.into(),
+            json: String::new(),
+        }
+    }
+
+    /// The window model over the harness window, slots `(guest VA, Some(linear) / None)`.
+    pub fn window(slots: &[(u64, Option<u64>)]) -> Self {
+        Self::window_with(slots, WindowCheck::Branch)
+    }
+
+    /// [`Self::window`] with the given range-check shape.
+    pub fn window_with(slots: &[(u64, Option<u64>)], check: WindowCheck) -> Self {
+        Self::window_opts(slots, check, false)
+    }
+
+    /// [`Self::window`] with every option. `stack_flat` needs the slots holding guest stacks to
+    /// translate like the flat base ([`Self::stack_identity_slots`]).
+    pub fn window_opts(slots: &[(u64, Option<u64>)], check: WindowCheck, stack_flat: bool) -> Self {
+        Self::window_full(slots, check, stack_flat, false)
+    }
+
+    /// [`Self::window_opts`] plus `contiguous_runs` (needs [`Self::contiguous_slots`]-like
+    /// mappings: adjacent mapped slots on adjacent pages).
+    pub fn window_full(
+        slots: &[(u64, Option<u64>)],
+        check: WindowCheck,
+        stack_flat: bool,
+        contiguous_runs: bool,
+    ) -> Self {
+        Self {
+            model: MemoryModel::Windowed(Window {
+                flat: GuestBase::Symbol,
+                base: WINDOW_BASE,
+                size: WINDOW_SIZE,
+                check,
+                stack_flat,
+                contiguous_runs,
+            }),
+            json: format!(
+                "{{\"model\":\"window\",\"base\":\"{WINDOW_BASE:#x}\",\"size\":\"{WINDOW_SIZE:#x}\",\"slots\":[{}]}}",
+                slots_json(slots)
+            ),
+        }
+    }
+
+    /// The page-table model over [0, 4 GiB), slots as for [`Self::window`].
+    pub fn page(slots: &[(u64, Option<u64>)]) -> Self {
+        Self::page_opts(slots, None)
+    }
+
+    /// [`Self::page`] with stack-relative accesses translated by `stack` (see
+    /// [`Self::window_opts`]).
+    pub fn page_opts(slots: &[(u64, Option<u64>)], stack: Option<GuestBase>) -> Self {
+        Self::page_full(slots, stack, false)
+    }
+
+    /// [`Self::page_opts`] plus `contiguous_runs` (see [`Self::window_full`]).
+    pub fn page_full(
+        slots: &[(u64, Option<u64>)],
+        stack: Option<GuestBase>,
+        contiguous_runs: bool,
+    ) -> Self {
+        Self {
+            model: MemoryModel::PageTable {
+                pages: PAGE_COUNT,
+                stack,
+                contiguous_runs,
+            },
+            json: format!(
+                "{{\"model\":\"page\",\"pages\":{PAGE_COUNT},\"slots\":[{}]}}",
+                slots_json(slots)
+            ),
+        }
+    }
+
+    /// Every harness window slot mapped onto its scrambled backing page.
+    pub fn standard_slots() -> Vec<(u64, Option<u64>)> {
+        (0..WINDOW_SIZE >> 16)
+            .map(|k| (WINDOW_BASE + (k << 16), Some(window_backing(k))))
+            .collect()
+    }
+
+    /// [`Self::standard_slots`], except that the slots holding the guest stacks (the top four:
+    /// STACK_TOP and the threads test's stacks below it) translate exactly like the flat base, as
+    /// the stack-flat options require.
+    pub fn stack_identity_slots() -> Vec<(u64, Option<u64>)> {
+        let mut slots = Self::standard_slots();
+        for (va, linear) in &mut slots {
+            if *va >= WINDOW_BASE + WINDOW_SIZE - 4 * 0x1_0000 {
+                *linear = Some(*va + GUEST_BASE);
+            }
+        }
+        slots
+    }
+
+    /// Every harness window slot on consecutive backing pages (one contiguous run), except the
+    /// stack slots, which translate like the flat base (as in [`Self::stack_identity_slots`]).
+    pub fn contiguous_slots() -> Vec<(u64, Option<u64>)> {
+        (0..WINDOW_SIZE >> 16)
+            .map(|k| {
+                let va = WINDOW_BASE + (k << 16);
+                if va >= WINDOW_BASE + WINDOW_SIZE - 4 * 0x1_0000 {
+                    (va, Some(va + GUEST_BASE))
+                } else {
+                    (va, Some(WINDOW_BACKING + (k << 16)))
+                }
+            })
+            .collect()
+    }
+
+    /// The model `PLAYGTA6_LIFT_MEMORY_MODEL` selects for default builds.
+    pub fn from_env() -> Self {
+        match env::var("PLAYGTA6_LIFT_MEMORY_MODEL").as_deref() {
+            Ok("window") => Self::window(&Self::standard_slots()),
+            Ok("window-select") => Self::window_with(&Self::standard_slots(), WindowCheck::Select),
+            Ok("window-outline") => {
+                Self::window_with(&Self::standard_slots(), WindowCheck::Outline)
+            }
+            Ok("window-outline-stack") => {
+                Self::window_opts(&Self::stack_identity_slots(), WindowCheck::Outline, true)
+            }
+            Ok("window-runs") => {
+                Self::window_full(&Self::contiguous_slots(), WindowCheck::Branch, true, true)
+            }
+            Ok("page-runs") => {
+                Self::page_full(&Self::contiguous_slots(), Some(GuestBase::Symbol), true)
+            }
+            Ok("window-stack") => {
+                Self::window_opts(&Self::stack_identity_slots(), WindowCheck::Branch, true)
+            }
+            Ok("page-stack") => {
+                Self::page_opts(&Self::stack_identity_slots(), Some(GuestBase::Symbol))
+            }
+            Ok("page") => Self::page(&Self::standard_slots()),
+            _ => Self::base(GuestBase::Symbol),
+        }
+    }
+}
+
+fn slots_json(slots: &[(u64, Option<u64>)]) -> String {
+    slots
+        .iter()
+        .map(|(va, linear)| match linear {
+            Some(l) => format!("[\"{va:#x}\",\"{l:#x}\"]"),
+            None => format!("[\"{va:#x}\",null]"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
 /// Host-implemented function in `runner.js`: `rax = rcx * 10 + rdx`.
 const HOST_MUL10_ADD: u64 = 0x7FFE_0000;
 
@@ -329,6 +513,8 @@ pub(super) struct Built {
     /// Translation the module was linked with: guest VA `v` lives at linear address
     /// `v + guest_base` (wrapping), like `host = __playgta6_guest_base + VA` in the runtime.
     pub guest_base: u64,
+    /// R19 table model spec for the runners (empty for the base model).
+    pub memory_json: String,
 }
 
 /// Linker arguments for a module with atomics (wasm-ld requires a shared memory for them).
@@ -354,7 +540,13 @@ pub(super) fn build_with<'a>(
     functions: impl IntoIterator<Item = &'a cfg::Function>,
     extra: &[String],
 ) -> Built {
-    build_with_guest_base(label, functions, extra, GuestBase::Symbol, GUEST_BASE)
+    build_with_memory(
+        label,
+        functions,
+        extra,
+        &HarnessMemory::from_env(),
+        GUEST_BASE,
+    )
 }
 
 /// [`build_with`] for a chosen guest address translation. With [`GuestBase::Symbol`] the harness
@@ -367,19 +559,63 @@ pub(super) fn build_with_guest_base<'a>(
     guest_base: GuestBase,
     symbol_value: u64,
 ) -> Built {
+    build_with_memory(
+        label,
+        functions,
+        extra,
+        &HarnessMemory::base(guest_base),
+        symbol_value,
+    )
+}
+
+/// [`build_with`] under any memory model. The harness plays the runtime's part: it defines
+/// `@__playgta6_guest_base = symbol_value` and the model's delta table (exported, the runners
+/// fill it).
+pub(super) fn build_with_memory<'a>(
+    label: &str,
+    functions: impl IntoIterator<Item = &'a cfg::Function>,
+    extra: &[String],
+    memory: &HarnessMemory,
+    symbol_value: u64,
+) -> Built {
     let tools = tools();
-    let mut module = lift_module_with(functions, guest_base).expect("lifts");
+    let mut module = lift_module_with(functions, memory.model).expect("lifts");
     let declaration = format!("@{GUEST_BASE_SYMBOL} = external global i64, align 8");
     let definition = format!(
         "@{GUEST_BASE_SYMBOL} = global i64 {}, align 8",
         symbol_value as i64
     );
     module.ir = module.ir.replace(&declaration, &definition);
-    let guest_base = match guest_base {
+    let mut extra = extra.to_vec();
+    let flat = match memory.model {
+        MemoryModel::Base(base) => base,
+        MemoryModel::Windowed(w) => {
+            let entries = w.size >> 16;
+            module.ir = module.ir.replace(
+                &format!("@{WINDOW_TABLE_SYMBOL} = external global [0 x i64], align 8"),
+                &format!(
+                    "@{WINDOW_TABLE_SYMBOL} = global [{entries} x i64] zeroinitializer, align 8"
+                ),
+            );
+            extra.push(format!("--export-if-defined={WINDOW_TABLE_SYMBOL}"));
+            w.flat
+        }
+        MemoryModel::PageTable { pages, .. } => {
+            module.ir = module.ir.replace(
+                &format!("@{PAGE_TABLE_SYMBOL} = external global [0 x i64], align 8"),
+                &format!(
+                    "@{PAGE_TABLE_SYMBOL} = global [{} x i64] zeroinitializer, align 8",
+                    pages + 1
+                ),
+            );
+            extra.push(format!("--export-if-defined={PAGE_TABLE_SYMBOL}"));
+            GuestBase::Symbol
+        }
+    };
+    let guest_base = match flat {
         GuestBase::Symbol => symbol_value,
         GuestBase::Constant(base) => base,
     };
-    let mut extra = extra.to_vec();
     if module.requires_shared_memory() && !extra.iter().any(|a| a == "--shared-memory") {
         extra.extend(shared_memory_link_args());
     }
@@ -396,6 +632,7 @@ pub(super) fn build_with_guest_base<'a>(
         dir,
         wasm,
         guest_base,
+        memory_json: memory.json.clone(),
     }
 }
 
@@ -459,8 +696,13 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
     let mut json = String::new();
     let _ = write!(
         json,
-        "{{\"state\":\"{STATE_ADDR:#x}\",\"stateSize\":{STATE_SIZE},\"guestBase\":\"{:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"resumeRipOffset\":{STATE_RESUME_RIP_OFFSET},\"unwindPendingOffset\":{STATE_UNWIND_PENDING_OFFSET},\"cases\":[",
-        built.guest_base
+        "{{\"state\":\"{STATE_ADDR:#x}\",\"stateSize\":{STATE_SIZE},\"guestBase\":\"{:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"resumeRipOffset\":{STATE_RESUME_RIP_OFFSET},\"unwindPendingOffset\":{STATE_UNWIND_PENDING_OFFSET},{}\"cases\":[",
+        built.guest_base,
+        if built.memory_json.is_empty() {
+            String::new()
+        } else {
+            format!("\"memory\":{},", built.memory_json)
+        }
     );
     for (i, case) in cases.iter().enumerate() {
         if i > 0 {

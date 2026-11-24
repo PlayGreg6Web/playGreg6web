@@ -8,9 +8,9 @@ use std::fmt::Write as _;
 use iced_x86::code_asm::*;
 
 use super::exec::{
-    CODE_BASE, Case, DATA_ADDR, MEMORY_BYTES, Outcome, R8, R9, R10, R11, RAX, RBP, RBX, RCX, RDI,
-    RDX, RSI, RSP, STACK_TOP, STATE_ADDR, build, build_with, exec_or_skip, run, run_script,
-    shared_memory_link_args, shared_memory_or_skip,
+    CODE_BASE, Case, DATA_ADDR, GUEST_BASE, HarnessMemory, MEMORY_BYTES, Outcome, R8, R9, R10, R11,
+    RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, STACK_TOP, STATE_ADDR, build, build_with_memory,
+    exec_or_skip, run, run_script, shared_memory_link_args, shared_memory_or_skip,
 };
 use super::ir_integer::random_integer_program;
 use super::{Program, asm_function};
@@ -555,7 +555,15 @@ fn misaligned_cmpxchg16b_and_fences_execute() {
 
 #[test]
 fn atomics_have_no_lost_updates_across_threads() {
-    let test = "atomics_have_no_lost_updates_across_threads";
+    atomics_across_threads(
+        "atomics_have_no_lost_updates_across_threads",
+        &HarnessMemory::from_env(),
+    );
+}
+
+/// The threads test under a given memory model (R19 runs it with the counters and the guest
+/// stacks inside a translated window: `exec_memory.rs`).
+pub(super) fn atomics_across_threads(test: &str, memory: &HarnessMemory) {
     if !exec_or_skip(test) || !shared_memory_or_skip(test) {
         return;
     }
@@ -641,7 +649,7 @@ fn atomics_have_no_lost_updates_across_threads() {
     let mut extra = vec!["--import-memory".to_string()];
     extra.extend(shared_memory_link_args());
     extra.push("--export-if-defined=__stack_pointer".to_string());
-    let built = build_with("threads", functions.values(), &extra);
+    let built = build_with_memory("threads", functions.values(), &extra, memory, GUEST_BASE);
 
     const WORKERS: u64 = 4;
     // The lifted loops are short, so on a loaded or small machine one worker can finish before
@@ -699,9 +707,14 @@ fn atomics_have_no_lost_updates_across_threads() {
             );
         }
         let spec = format!(
-            "{{\"pages\":{},\"gprOffset\":{STATE_GPR_OFFSET},\"guestBase\":\"{:#x}\",\"init\":[[\"{wide:#x}\",\"{init}\"]],\"read\":[[\"{counters:#x}\",88]],\"workers\":[{workers}]}}",
+            "{{\"pages\":{},\"gprOffset\":{STATE_GPR_OFFSET},\"guestBase\":\"{:#x}\",{}\"init\":[[\"{wide:#x}\",\"{init}\"]],\"read\":[[\"{counters:#x}\",88]],\"workers\":[{workers}]}}",
             MEMORY_BYTES / 65536,
-            built.guest_base
+            built.guest_base,
+            if built.memory_json.is_empty() {
+                String::new()
+            } else {
+                format!("\"memory\":{},", built.memory_json)
+            }
         );
         let out = run_script(&built, "runner_threads.js", RUNNER_THREADS_JS, &[spec]);
         if let Some(reason) = out.trim().strip_prefix("skip: ") {

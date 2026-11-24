@@ -13,9 +13,8 @@ use iced_x86::{
 };
 
 use super::{
-    GUEST_BASE_SYMBOL, GUEST_STATE_TYPE, GuestBase, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL,
-    HELPER_TRAP, HELPER_UNIMPLEMENTED, LiftError, LiftedFunction, Support, UnsupportedInstruction,
-    function_symbol,
+    GUEST_STATE_TYPE, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP, HELPER_UNIMPLEMENTED,
+    LiftError, LiftedFunction, MemoryModel, Support, UnsupportedInstruction, function_symbol,
 };
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
@@ -30,6 +29,8 @@ mod atomics;
 mod bit_ops;
 #[path = "integer.rs"]
 mod integer;
+#[path = "memory_access.rs"]
+mod memory_access;
 #[path = "string_ops.rs"]
 mod string_ops;
 #[path = "unwind.rs"]
@@ -186,10 +187,7 @@ fn is_immediate(kind: OpKind) -> bool {
 }
 
 /// Lifts one function (see `super::lift_function`).
-pub(super) fn lift(
-    func: &cfg::Function,
-    guest_base: GuestBase,
-) -> Result<LiftedFunction, LiftError> {
+pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFunction, LiftError> {
     if !func.blocks.contains_key(&func.entry) {
         return Err(LiftError::MissingEntryBlock { entry: func.entry });
     }
@@ -252,7 +250,8 @@ pub(super) fn lift(
         support: BTreeSet::new(),
         unsupported: Vec::new(),
         ea: None,
-        guest_base,
+        memory,
+        stack_values: BTreeSet::new(),
         unwind_sites: 0,
     };
     lifter.lift_blocks()?;
@@ -301,8 +300,10 @@ struct FunctionLifter<'a> {
     unsupported: Vec<UnsupportedInstruction>,
     /// Effective address (with segment base) of the current instruction's memory operand.
     ea: Option<String>,
-    /// Guest -> host address translation (`guest_ptr`).
-    guest_base: GuestBase,
+    /// Guest -> host address translation (`memory_access.rs`).
+    memory: MemoryModel,
+    /// SSA values known to be stack-pointer-relative guest addresses (table models only).
+    stack_values: BTreeSet<String>,
     /// Calls followed by a resume-protocol check (see `unwind`).
     unwind_sites: u32,
 }
@@ -631,7 +632,11 @@ impl FunctionLifter<'_> {
 
     fn load_gpr(&mut self, idx: usize) -> R<String> {
         let slot = self.gpr_slot(idx)?;
-        Ok(self.val(&format!("load i64, ptr {slot}")))
+        let v = self.val(&format!("load i64, ptr {slot}"));
+        if idx == RSP {
+            self.note_stack_value(&v);
+        }
+        Ok(v)
     }
 
     fn store_gpr(&mut self, idx: usize, value: &str) -> R<()> {
@@ -731,6 +736,8 @@ impl FunctionLifter<'_> {
         };
         if addr32 {
             addr = self.val(&format!("and i64 {addr}, 4294967295"));
+        } else if base == Register::RSP && index == Register::None {
+            self.note_stack_value(&addr);
         }
         if with_segment {
             let field = match ins.memory_segment() {
@@ -766,36 +773,21 @@ impl FunctionLifter<'_> {
         Ok(ea)
     }
 
-    /// The single place where a guest address becomes a host pointer:
-    /// `host = addr + base` (see "Guest memory" in the parent module and [`GuestBase`]).
-    fn guest_ptr(&mut self, addr: &str) -> String {
-        let host = match self.guest_base {
-            GuestBase::Constant(0) => addr.to_string(),
-            GuestBase::Constant(base) => self.val(&format!("add i64 {addr}, {}", imm(base, 64))),
-            GuestBase::Symbol => {
-                self.support.insert(Support::GuestBase);
-                let base = self.val(&format!(
-                    "load i64, ptr @{GUEST_BASE_SYMBOL}, align 8, !invariant.load !{{}}"
-                ));
-                self.val(&format!("add i64 {addr}, {base}"))
-            }
-        };
-        self.val(&format!("inttoptr i64 {host} to ptr"))
-    }
+    // Guest addresses become host pointers only in `memory_access.rs` (`guest_ptr`,
+    // `guest_load`, `guest_store`, `guest_memmove`, `guest_memset`).
 
     fn load_mem(&mut self, addr: &str, bits: u32) -> String {
-        let ptr = self.guest_ptr(addr);
-        self.val(&format!("load i{bits}, ptr {ptr}, align 1"))
+        self.guest_load(addr, &format!("i{bits}"), u64::from(bits / 8))
     }
 
     fn store_mem(&mut self, addr: &str, value: &str, bits: u32) {
-        let ptr = self.guest_ptr(addr);
-        self.emit(&format!("store i{bits} {value}, ptr {ptr}, align 1"));
+        self.guest_store(addr, &format!("i{bits}"), value, u64::from(bits / 8));
     }
 
     fn push(&mut self, value: &str, bits: u32) -> R<()> {
         let rsp = self.load_gpr(RSP)?;
         let new_rsp = self.val(&format!("sub i64 {rsp}, {}", bits / 8));
+        self.note_stack_value(&new_rsp);
         self.store_mem(&new_rsp, value, bits);
         self.store_gpr(RSP, &new_rsp)
     }

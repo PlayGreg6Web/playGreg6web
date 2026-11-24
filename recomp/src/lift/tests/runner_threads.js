@@ -6,7 +6,8 @@
 // spec: { pages, gprOffset, guestBase, init: [[addr, hex]], read: [[addr, len]],
 //              workers: [{ state, stackTop, shadowStack, calls: [{ fn, regs: [[index, value]] }] }] }
 // `init`/`read` addresses and `stackTop` are guest VAs (linear address = VA + guestBase, wrapping);
-// `state` and `shadowStack` are linear (host) addresses.
+// `state` and `shadowStack` are linear (host) addresses. Optional `memory`: an R19 table model
+// exactly as in runner.js (the main thread fills the exported delta table before the workers run).
 // Every worker instantiates the module on the shared memory, then runs its calls in order (each
 // with a fresh register set and a pushed return address); all workers meet at a barrier before
 // every call so that the same call runs on all threads at once. The barrier spins briefly before
@@ -23,7 +24,30 @@ const { Worker, isMainThread, workerData, parentPort } = require('worker_threads
 
 const RETURN_ADDRESS = 0xC0DEC0DEn;
 const RSP = 4;
-const lin = (guestBase, addr) => Number(BigInt.asUintN(64, BigInt(addr) + BigInt(guestBase || 0)));
+const TRAP_DELTA = 0x8000000000000000n;
+// Guest VA -> linear address under `mem` (null: guestBase translation), reading the delta table at
+// `tableAddr` from `memory`.
+function translator(memory, guestBase, mem, tableAddr) {
+  const view = () => new DataView(memory.buffer);
+  const index = (a) => {
+    if (!mem) return -1;
+    if (mem.model === 'window') {
+      const rel = BigInt.asUintN(64, a - BigInt(mem.base));
+      return rel < BigInt(mem.size) ? Number(rel >> 16n) : -1;
+    }
+    const idx = a >> 16n;
+    return Number(idx < BigInt(mem.pages) ? idx : BigInt(mem.pages));
+  };
+  const lin = (addr) => {
+    const a = BigInt.asUintN(64, BigInt(addr));
+    const i = index(a);
+    const d = i < 0 ? BigInt(guestBase || 0) : view().getBigUint64(tableAddr + i * 8, true);
+    const h = BigInt.asUintN(64, a + d);
+    if (h >= TRAP_DELTA) throw new Error(`unmapped guest page at 0x${a.toString(16)}`);
+    return Number(h);
+  };
+  return { view, index, lin };
+}
 
 // Control block (Int32Array): [generation, arrived, active, unused, peak of call 0, peak of call 1, ...]
 const GENERATION = 0;
@@ -56,10 +80,12 @@ function recordPeak(ctrl, call, seen) {
   }
 }
 
-function imports(memory) {
+function imports(memory, t, scratch) {
   const fail = (what) => (state, va) => {
     throw new Error(`${what} at 0x${va.toString(16)}`);
   };
+  const byte = (va) => t.view().getUint8(t.lin(va));
+  const put = (va, b) => t.view().setUint8(t.lin(va), b);
   return {
     env: {
       memory,
@@ -67,6 +93,23 @@ function imports(memory) {
       __playgta6_unimplemented: fail('unimplemented instruction'),
       __playgta6_divide_error: fail('divide error'),
       __playgta6_trap: fail('trap'),
+      // R19 slow paths (per-thread scratch buffer).
+      __playgta6_guest_read(va, n) {
+        for (let i = 0n; i < n; i++) t.view().setUint8(scratch + Number(i), byte(va + i));
+        return BigInt(scratch);
+      },
+      __playgta6_guest_scratch: () => BigInt(scratch),
+      __playgta6_guest_write(va, n) {
+        for (let i = 0n; i < n; i++) put(va + i, t.view().getUint8(scratch + Number(i)));
+      },
+      __playgta6_guest_memmove(dst, src, n) {
+        const tmp = [];
+        for (let i = 0n; i < n; i++) tmp.push(byte(src + i));
+        tmp.forEach((b, i) => put(dst + BigInt(i), b));
+      },
+      __playgta6_guest_memset(dst, value, n) {
+        for (let i = 0n; i < n; i++) put(dst + i, Number(value) & 0xFF);
+      },
     },
   };
 }
@@ -77,12 +120,13 @@ if (isMainThread) {
   const module = new WebAssembly.Module(fs.readFileSync(wasmPath));
   // The memory64 descriptor key changed across V8 versions; use the first one that links.
   let memory = null;
+  let probe = null;
   let lastError = null;
   for (const key of ['address', 'index']) {
     for (const size of [spec.pages, BigInt(spec.pages)]) {
       try {
         const m = new WebAssembly.Memory({ initial: size, maximum: size, shared: true, [key]: 'i64' });
-        new WebAssembly.Instance(module, imports(m));
+        probe = new WebAssembly.Instance(module, imports(m, translator(m, spec.guestBase, null, 0), 0));
         memory = m;
         break;
       } catch (e) {
@@ -97,15 +141,34 @@ if (isMainThread) {
     process.exit(0);
   }
   const bytes = new Uint8Array(memory.buffer);
+  const mem = spec.memory || null;
+  let tableAddr = 0;
+  if (mem) {
+    const sym = probe.exports[mem.model === 'window' ? '__playgta6_window_table' : '__playgta6_page_table'];
+    tableAddr = sym ? Number(sym.value) : 0;
+    const view = new DataView(memory.buffer);
+    const entries = mem.model === 'window' ? Number(BigInt(mem.size) >> 16n) : mem.pages + 1;
+    for (let i = 0; i < entries; i++) {
+      const d = mem.model === 'window' || i === mem.pages ? TRAP_DELTA : BigInt(spec.guestBase || 0);
+      view.setBigUint64(tableAddr + i * 8, d, true);
+    }
+    const t = translator(memory, spec.guestBase, mem, tableAddr);
+    for (const [va, linear] of mem.slots) {
+      const a = BigInt(va) & ~0xFFFFn;
+      const d = linear === null ? TRAP_DELTA : BigInt.asUintN(64, BigInt(linear) - a);
+      view.setBigUint64(tableAddr + t.index(a) * 8, d, true);
+    }
+  }
+  const t = translator(memory, spec.guestBase, mem, tableAddr);
+  const lin = (_, addr) => t.lin(addr);
   for (const [addr, hex] of spec.init) {
-    const base = lin(spec.guestBase, addr);
-    for (let i = 0; i < hex.length; i += 2) bytes[base + i / 2] = parseInt(hex.substr(i, 2), 16);
+    for (let i = 0; i < hex.length; i += 2) bytes[lin(null, BigInt(addr) + BigInt(i / 2))] = parseInt(hex.substr(i, 2), 16);
   }
   const control = new Int32Array(new SharedArrayBuffer(4 * (PEAKS + spec.workers[0].calls.length)));
   let pending = spec.workers.length;
   let failure = null;
   const count = spec.workers.length;
-  const workers = spec.workers.map((w) => new Worker(__filename, { workerData: { module, memory, control, count, w, gprOffset: spec.gprOffset, guestBase: spec.guestBase } }));
+  const workers = spec.workers.map((w) => new Worker(__filename, { workerData: { module, memory, control, count, w, gprOffset: spec.gprOffset, guestBase: spec.guestBase, mem, tableAddr } }));
   const finish = () => {
     pending -= 1;
     if (pending !== 0) return;
@@ -114,9 +177,8 @@ if (isMainThread) {
       return;
     }
     const out = spec.read.map(([addr, len]) => {
-      const base = lin(spec.guestBase, addr);
       let s = '';
-      for (let i = 0; i < len; i++) s += bytes[base + i].toString(16).padStart(2, '0');
+      for (let i = 0; i < len; i++) s += bytes[lin(null, BigInt(addr) + BigInt(i))].toString(16).padStart(2, '0');
       return s;
     });
     process.stdout.write(out.join(',') + '\n');
@@ -135,11 +197,13 @@ if (isMainThread) {
     });
   }
 } else {
-  const { module, memory, control, count, w, gprOffset, guestBase } = workerData;
+  const { module, memory, control, count, w, gprOffset, guestBase, mem, tableAddr } = workerData;
+  const t = translator(memory, guestBase, mem, tableAddr);
   let instance = null;
   let setupError = null;
   try {
-    instance = new WebAssembly.Instance(module, imports(memory));
+    // Per-worker scratch just below its shadow stack region.
+    instance = new WebAssembly.Instance(module, imports(memory, t, Number(BigInt(w.shadowStack)) - 0xF000));
     // Each thread gets its own LLVM shadow stack (if the module uses one at all).
     const sp = instance.exports.__stack_pointer;
     if (sp instanceof WebAssembly.Global) sp.value = BigInt(w.shadowStack);
@@ -180,7 +244,7 @@ if (isMainThread) {
     for (let i = 0; i < 16; i++) view.setBigUint64(gpr + i * 8, 0n, true);
     for (const [i, v] of call.regs) view.setBigUint64(gpr + i * 8, BigInt(v), true);
     const rsp = BigInt(w.stackTop) - 8n;
-    view.setBigUint64(lin(guestBase, rsp), RETURN_ADDRESS, true);
+    for (let i = 0n; i < 8n; i++) view.setUint8(t.lin(rsp + i), Number((RETURN_ADDRESS >> (8n * i)) & 0xFFn));
     view.setBigUint64(gpr + RSP * 8, rsp, true);
   }
 }

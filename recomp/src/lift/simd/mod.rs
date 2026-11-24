@@ -590,13 +590,13 @@ impl FunctionLifter<'_> {
         ins.memory_size().size()
     }
 
-    /// Pointer to the memory operand plus `offset` bytes.
-    fn mem_ptr_at(&mut self, ins: &Instruction, offset: u64) -> R<String> {
+    /// Guest address of the memory operand plus `offset` bytes.
+    fn mem_ea_at(&mut self, ins: &Instruction, offset: u64) -> R<String> {
         let mut ea = self.mem_ea(ins)?;
         if offset != 0 {
             ea = self.val(&format!("add i64 {ea}, {offset}"));
         }
-        Ok(self.guest_ptr(&ea))
+        Ok(ea)
     }
 
     /// Byte offset of the current lane's part of the memory operand, checking its size: `bytes`
@@ -623,15 +623,15 @@ impl FunctionLifter<'_> {
     /// Loads a value of type `ty` from the memory operand (the current lane's part of it).
     fn mem_load(&mut self, ins: &Instruction, ty: Ty) -> R<String> {
         let offset = self.mem_part(ins, Self::ty_bytes(ty))?;
-        let ptr = self.mem_ptr_at(ins, offset)?;
-        Ok(self.val(&format!("load {}, ptr {ptr}, align 1", ty.ir())))
+        let ea = self.mem_ea_at(ins, offset)?;
+        Ok(self.guest_load(&ea, &ty.ir(), Self::ty_bytes(ty) as u64))
     }
 
     /// Stores a value of type `ty` to the memory operand (the current lane's part of it).
     fn mem_store(&mut self, ins: &Instruction, v: &str, ty: Ty) -> R<()> {
         let offset = self.mem_part(ins, Self::ty_bytes(ty))?;
-        let ptr = self.mem_ptr_at(ins, offset)?;
-        self.emit(&format!("store {} {v}, ptr {ptr}, align 1", ty.ir()));
+        let ea = self.mem_ea_at(ins, offset)?;
+        self.guest_store(&ea, &ty.ir(), v, Self::ty_bytes(ty) as u64);
         Ok(())
     }
 
@@ -643,8 +643,8 @@ impl FunctionLifter<'_> {
                 Self::mem_bytes(ins)
             ));
         }
-        let ptr = self.mem_ptr_at(ins, offset)?;
-        Ok(self.val(&format!("load {}, ptr {ptr}, align 1", ty.ir())))
+        let ea = self.mem_ea_at(ins, offset)?;
+        Ok(self.guest_load(&ea, &ty.ir(), Self::ty_bytes(ty) as u64))
     }
 
     /// Stores `ty` at `offset` into a memory operand of exactly `total` bytes.
@@ -662,8 +662,8 @@ impl FunctionLifter<'_> {
                 Self::mem_bytes(ins)
             ));
         }
-        let ptr = self.mem_ptr_at(ins, offset)?;
-        self.emit(&format!("store {} {v}, ptr {ptr}, align 1", ty.ir()));
+        let ea = self.mem_ea_at(ins, offset)?;
+        self.guest_store(&ea, &ty.ir(), v, Self::ty_bytes(ty) as u64);
         Ok(())
     }
 

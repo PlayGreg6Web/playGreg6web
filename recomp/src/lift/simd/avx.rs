@@ -542,18 +542,33 @@ impl FunctionLifter<'_> {
             self.start_block(&pre);
             self.emit(&format!("br i1 {c}, label %{act}, label %{cont}"));
             self.start_block(&act);
-            let ptr = self.mem_ptr_at(ins, u64::from(l) * bytes)?;
+            let ea = self.mem_ea_at(ins, u64::from(l) * bytes)?;
             let loaded = if let Some(src) = &src {
-                let x = self.val(&format!("extractelement {vt} {src}, i32 {l}"));
-                self.emit(&format!("store {st} {x}, ptr {ptr}, align 1"));
+                if self.accesses_branch() {
+                    let x = self.val(&format!("extractelement {vt} {src}, i32 {l}"));
+                    self.guest_store(&ea, st, &x, bytes);
+                } else {
+                    let ptr = self.guest_ptr(&ea);
+                    let x = self.val(&format!("extractelement {vt} {src}, i32 {l}"));
+                    self.emit(&format!("store {st} {x}, ptr {ptr}, align 1"));
+                }
                 None
             } else {
-                Some(self.val(&format!("load {st}, ptr {ptr}, align 1")))
+                Some(self.guest_load(&ea, st, bytes))
+            };
+            // A table memory model ends the access in a block of its own (R19).
+            let from = if self.accesses_branch() {
+                let end = self.new_label("mend");
+                self.emit(&format!("br label %{end}"));
+                self.start_block(&end);
+                end
+            } else {
+                act.clone()
             };
             self.emit(&format!("br label %{cont}"));
             self.start_block(&cont);
             if let Some(x) = loaded {
-                let v = self.val(&format!("phi {st} [ {x}, %{act} ], [ 0, %{pre} ]"));
+                let v = self.val(&format!("phi {st} [ {x}, %{from} ], [ 0, %{pre} ]"));
                 acc = self.val(&format!("insertelement {vt} {acc}, {st} {v}, i32 {l}"));
             }
         }

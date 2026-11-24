@@ -7,6 +7,11 @@
 // `mem`/`read` addresses and rsp are guest VAs: guest VA v lives at linear address
 // v + guestBase (64-bit wrapping), the translation the module was linked with. Addresses inside
 // the state block [state, state + stateSize) are host addresses and are used as they are.
+// Optional `memory` (R19 table models, lift/memory.rs): { model: "window", base, size, slots } or
+// { model: "page", pages, slots }; `slots` lists [slot guest VA, linear address or null =
+// unmapped]. The harness fills the exported delta table like the runtime would (every other slot:
+// the guestBase translation for "page", unmapped for "window"), translates every guest address the
+// same way and provides the __playgta6_guest_* slow-path helpers.
 // For every case the harness writes guest registers/flags/memory, pushes a fake return address
 // (emulating the caller's `call`), invokes the export and prints one tab-separated line:
 //   <index> \t <regs listed in `out`, hex, comma separated> \t <CF PF AF ZF SF OF> \t <memory reads, hex> \t <error>
@@ -27,11 +32,46 @@ const RSP = 4;
 const RETURN_ADDRESS = 0xC0DEC0DEn;
 const GUEST_BASE = BigInt(spec.guestBase || 0);
 const STATE_END = STATE + (spec.stateSize || 0);
+const MEM = spec.memory || null;
+const TRAP_DELTA = 0x8000000000000000n;  // unmapped slot: the address lands beyond any memory
+const SCRATCH = 0x7FF000;  // linear scratch buffer of the slow-path helpers
+let tableAddr = 0;
+// Table index of guest VA `a` (BigInt) under the table model, or -1 for the flat translation.
+const tableIndex = (a) => {
+  if (!MEM) return -1;
+  if (MEM.model === 'window') {
+    const rel = BigInt.asUintN(64, a - BigInt(MEM.base));
+    return rel < BigInt(MEM.size) ? Number(rel >> 16n) : -1;
+  }
+  const idx = a >> 16n;
+  return Number(idx < BigInt(MEM.pages) ? idx : BigInt(MEM.pages));
+};
+const delta = (a) => {
+  const i = tableIndex(a);
+  return i < 0 ? GUEST_BASE : view().getBigUint64(tableAddr + i * 8, true);
+};
 // Guest VA -> linear address (the state block is host memory).
 const lin = (addr) => {
-  const a = BigInt(addr);
+  const a = BigInt.asUintN(64, BigInt(addr));
   if (a >= BigInt(STATE) && a < BigInt(STATE_END)) return Number(a);
-  return Number(BigInt.asUintN(64, a + GUEST_BASE));
+  const h = BigInt.asUintN(64, a + delta(a));
+  if (h >= TRAP_DELTA) throw new Error(`unmapped guest page at ${hex(a)}`);
+  return Number(h);
+};
+const getByte = (va) => view().getUint8(lin(va));
+const setByte = (va, b) => view().setUint8(lin(va), b);
+const rd64 = (va) => {
+  let x = 0n;
+  for (let i = 7; i >= 0; i--) x = (x << 8n) | BigInt(getByte(BigInt(va) + BigInt(i)));
+  return x;
+};
+// Maps the slot containing guest VA `va` at linear address `linear` (null: unmapped).
+const mapSlot = (va, linear) => {
+  const a = BigInt.asUintN(64, BigInt(va)) & ~0xFFFFn;
+  const i = tableIndex(a);
+  if (i < 0) throw new Error(`no table slot for ${hex(a)}`);
+  const d = linear === null ? TRAP_DELTA : BigInt.asUintN(64, BigInt(linear) - a);
+  view().setBigUint64(tableAddr + i * 8, d, true);
 };
 
 // Host-implemented "imports" reachable through __playgta6_indirect_call, keyed by guest VA.
@@ -59,14 +99,23 @@ const hostFunctions = new Map([
   // protocol: no `ret`, the lifted frames unwind until the owner resumes).
   [0x7FFE0020n, () => {
     const v = view();
-    const desc = lin(v.getBigUint64(GPR + 8, true));
-    const rip = v.getBigUint64(desc, true);
-    const mask = Number(v.getBigUint64(desc + 8, true));
+    const desc = v.getBigUint64(GPR + 8, true);
+    const rip = rd64(desc);
+    const mask = Number(rd64(desc + 8n));
     for (let i = 0; i < 16; i++) {
-      if (mask & (1 << i)) v.setBigUint64(GPR + i * 8, v.getBigUint64(desc + 16 + i * 8, true), true);
+      if (mask & (1 << i)) v.setBigUint64(GPR + i * 8, rd64(desc + 16n + BigInt(i) * 8n), true);
     }
     v.setBigUint64(RESUME_RIP, rip, true);
     v.setUint8(UNWIND_PENDING, 1);
+  }],
+  // 0x7FFE0030: remaps the table slot holding guest VA rcx to linear address rdx (0 = unmap), the
+  // way XMemMapPhysicalPagesScatter changes the window under running code; then `ret`.
+  [0x7FFE0030n, () => {
+    const v = view();
+    const va = v.getBigUint64(GPR + 8, true);
+    const linear = v.getBigUint64(GPR + 16, true);
+    mapSlot(va, linear === 0n ? null : linear);
+    v.setBigUint64(GPR + RSP * 8, v.getBigUint64(GPR + RSP * 8, true) + 8n, true);
   }],
 ]);
 
@@ -110,6 +159,25 @@ const imports = {
       if (getReg32(state, 1) !== 0) throw new Error('xgetbv: #GP');
       setRegs(state, [[0, 7], [2, 0]]);
     },
+    // R19 slow paths: byte by byte through the same translation (an unmapped slot throws).
+    __playgta6_guest_read(va, n) {
+      for (let i = 0n; i < n; i++) view().setUint8(SCRATCH + Number(i), getByte(va + i));
+      return BigInt(SCRATCH);
+    },
+    __playgta6_guest_scratch() {
+      return BigInt(SCRATCH);
+    },
+    __playgta6_guest_write(va, n) {
+      for (let i = 0n; i < n; i++) setByte(va + i, view().getUint8(SCRATCH + Number(i)));
+    },
+    __playgta6_guest_memmove(dst, src, n) {
+      const tmp = [];
+      for (let i = 0n; i < n; i++) tmp.push(getByte(src + i));
+      tmp.forEach((b, i) => setByte(dst + BigInt(i), b));
+    },
+    __playgta6_guest_memset(dst, value, n) {
+      for (let i = 0n; i < n; i++) setByte(dst + i, Number(value) & 0xFF);
+    },
   },
 };
 
@@ -126,6 +194,19 @@ for (const [name, fn] of Object.entries(instance.exports)) {
   const m = /^sub_([0-9A-F]+)$/.exec(name);
   if (m) lifted.set(BigInt('0x' + m[1]), fn);
 }
+if (MEM) {
+  const sym = instance.exports[MEM.model === 'window' ? '__playgta6_window_table' : '__playgta6_page_table'];
+  if (sym) {
+    tableAddr = Number(sym.value);
+    const entries = MEM.model === 'window' ? Number(BigInt(MEM.size) >> 16n) : MEM.pages + 1;
+    const v = view();
+    for (let i = 0; i < entries; i++) {
+      const d = MEM.model === 'window' || i === MEM.pages ? TRAP_DELTA : GUEST_BASE;
+      v.setBigUint64(tableAddr + i * 8, d, true);
+    }
+    for (const [va, linear] of MEM.slots) mapSlot(BigInt(va), linear === null ? null : BigInt(linear));
+  }
+}
 
 const lines = spec.cases.map((c, index) => {
   let v = view();
@@ -136,11 +217,11 @@ const lines = spec.cases.map((c, index) => {
   if (MXCSR) v.setUint32(MXCSR, 0x1F80, true);
   if (UNWIND_PENDING) v.setUint8(UNWIND_PENDING, 0);
   for (const [addr, bytes] of c.mem) {
-    const base = lin(addr);
-    for (let i = 0; i < bytes.length; i += 2) v.setUint8(base + i / 2, parseInt(bytes.substr(i, 2), 16));
+    const base = BigInt(addr);
+    for (let i = 0; i < bytes.length; i += 2) setByte(base + BigInt(i / 2), parseInt(bytes.substr(i, 2), 16));
   }
   const rsp = (regs0.get(RSP) || 0n) - 8n;
-  v.setBigUint64(lin(rsp), RETURN_ADDRESS, true);
+  for (let i = 0n; i < 8n; i++) setByte(rsp + i, Number((RETURN_ADDRESS >> (8n * i)) & 0xFFn));
   v.setBigUint64(GPR + RSP * 8, rsp, true);
 
   let error = '';
@@ -155,9 +236,9 @@ const lines = spec.cases.map((c, index) => {
   let flags = '';
   for (let i = 0; i < 6; i++) flags += v.getUint8(FLAGS + i);
   const mem = c.read.map(([addr, len]) => {
-    const base = lin(addr);
+    const base = BigInt(addr);
     let s = '';
-    for (let i = 0; i < len; i++) s += v.getUint8(base + i).toString(16).padStart(2, '0');
+    for (let i = 0; i < len; i++) s += getByte(base + BigInt(i)).toString(16).padStart(2, '0');
     return s;
   }).join(',');
   return `${index}\t${regs}\t${flags}\t${mem}\t${error}`;

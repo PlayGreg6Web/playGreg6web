@@ -268,12 +268,14 @@ impl FunctionLifter<'_> {
         self.start_block(&fast);
         let src_low = self.run_low(df, &src, &total, bits);
         let dst_low = self.run_low(df, &rdi, &total, bits);
-        let src_ptr = self.guest_ptr(&src_low);
-        let dst_ptr = self.guest_ptr(&dst_low);
-        self.support.insert(Support::Memmove);
-        self.emit(&format!(
-            "call void @llvm.memmove.p0.p0.i64(ptr align 1 {dst_ptr}, ptr align 1 {src_ptr}, i64 {total}, i1 false)"
-        ));
+        if !self.guest_memmove(&dst_low, &src_low, &total)? {
+            let src_ptr = self.guest_ptr(&src_low);
+            let dst_ptr = self.guest_ptr(&dst_low);
+            self.support.insert(Support::Memmove);
+            self.emit(&format!(
+                "call void @llvm.memmove.p0.p0.i64(ptr align 1 {dst_ptr}, ptr align 1 {src_ptr}, i64 {total}, i1 false)"
+            ));
+        }
         let delta = self.run_delta(df, &total);
         self.advance(RSI, &rsi, &delta)?;
         self.advance(RDI, &rdi, &delta)?;
@@ -307,11 +309,13 @@ impl FunctionLifter<'_> {
         self.start_block(&fast);
         let rdi = self.load_gpr(RDI)?;
         let dst_low = self.run_low(df, &rdi, &total, bits);
-        let dst_ptr = self.guest_ptr(&dst_low);
-        self.support.insert(Support::Memset);
-        self.emit(&format!(
-            "call void @llvm.memset.p0.i64(ptr align 1 {dst_ptr}, i8 {byte}, i64 {total}, i1 false)"
-        ));
+        if !self.guest_memset(&dst_low, &byte, &total)? {
+            let dst_ptr = self.guest_ptr(&dst_low);
+            self.support.insert(Support::Memset);
+            self.emit(&format!(
+                "call void @llvm.memset.p0.i64(ptr align 1 {dst_ptr}, i8 {byte}, i64 {total}, i1 false)"
+            ));
+        }
         let delta = self.run_delta(df, &total);
         self.advance(RDI, &rdi, &delta)?;
         self.store_gpr(RCX, "0")?;

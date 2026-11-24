@@ -183,8 +183,11 @@
 //! The lifter never panics on arbitrary decoded input.
 
 pub mod compile;
-pub mod target;
 mod function;
+pub mod memory;
+pub mod target;
+
+pub use memory::MemoryModel;
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -406,6 +409,8 @@ enum Support {
     Helper(RuntimeHelper),
     /// The `@__playgta6_guest_base` declaration ([`GuestBase::Symbol`]).
     GuestBase,
+    /// R19 memory models ([`memory`]): a delta table or a guest-memory runtime helper.
+    Memory(memory::Decl),
 }
 
 /// LLVM bit-manipulation intrinsics used by the lifter.
@@ -463,12 +468,13 @@ pub fn lift_function(func: &cfg::Function) -> Result<LiftedFunction, LiftError> 
     lift_function_with(func, GuestBase::default())
 }
 
-/// [`lift_function`] with an explicit guest address translation.
+/// [`lift_function`] with an explicit guest address translation ([`GuestBase`] or any
+/// [`MemoryModel`]).
 pub fn lift_function_with(
     func: &cfg::Function,
-    guest_base: GuestBase,
+    model: impl Into<MemoryModel>,
 ) -> Result<LiftedFunction, LiftError> {
-    function::lift(func, guest_base)
+    function::lift(func, model.into())
 }
 
 /// Lifts a set of functions into one deterministic module (see [`emit_module`]).
@@ -478,14 +484,16 @@ pub fn lift_module<'a>(
     lift_module_with(functions, GuestBase::default())
 }
 
-/// [`lift_module`] with an explicit guest address translation.
+/// [`lift_module`] with an explicit guest address translation ([`GuestBase`] or any
+/// [`MemoryModel`]).
 pub fn lift_module_with<'a>(
     functions: impl IntoIterator<Item = &'a cfg::Function>,
-    guest_base: GuestBase,
+    model: impl Into<MemoryModel>,
 ) -> Result<LiftedModule, LiftError> {
+    let model = model.into();
     let mut lifted = Vec::new();
     for func in functions {
-        lifted.push(lift_function_with(func, guest_base)?);
+        lifted.push(lift_function_with(func, model)?);
     }
     lifted.sort_by_key(|f| f.entry);
     let ir = emit_module(&lifted)?;
@@ -582,6 +590,7 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
             Support::GuestBase => {
                 let _ = writeln!(out, "@{GUEST_BASE_SYMBOL} = external global i64, align 8");
             }
+            Support::Memory(decl) => out.push_str(&decl.declaration()),
             Support::Umul128
             | Support::Udiv128
             | Support::Sdiv128
