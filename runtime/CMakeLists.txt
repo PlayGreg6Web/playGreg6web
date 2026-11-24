@@ -43,6 +43,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_xs_exports.cpp
     gpu/d3d12_guest_resources.cpp
     gpu/d3d12_guest_command_list.cpp
+    gpu/d3d12_xs_xbox.cpp
     guest/guest_runtime.cpp
     guest/guest_exceptions.cpp
     guest/com_bridge.cpp

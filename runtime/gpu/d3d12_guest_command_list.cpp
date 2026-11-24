@@ -53,6 +53,7 @@ HResult Device::create_command_list(uint32_t type, InterfaceArg<IPipelineStateHo
     }
     auto list = com::create_object<CommandList>(com::implements(kID3D12GraphicsCommandList), device_ref(this), type);
     if (list) {
+        list->initialize_guest_payload();
         list->reset(initial_state ? static_cast<PipelineState*>(initial_state.get()) : nullptr);
     }
     return hand_out(std::move(list), riid, out);
@@ -81,10 +82,14 @@ HResult Device::CreateCommandListX(const GuestCommandListDescX* desc, InterfaceA
 // ---------------------------------------------------------------------------------------------
 
 void CommandQueue::ExecuteCommandListsX(com::CallContext& ctx) {
-    // (NumCommandLists, ppCommandLists, handle, flags): the trailing handle (produced by Xbox device
-    // slot 80 in the executable) and flags are not interpreted.
+    // (NumCommandLists, ppCommandLists, frame token, flags): the token (device slot 80's output, 0
+    // outside a frame) is recorded; the flags are not interpreted.
     const uint32_t count = static_cast<uint32_t>(ctx.int_arg(1));
     const uint64_t lists = ctx.int_arg(2);
+    if (ctx.int_arg(3) != 0) {
+        device_->last_execute_token.store(ctx.int_arg(3));
+        device_->count(xbox::Counter::ExecutesWithToken);
+    }
     std::vector<uint64_t> pointers;
     if (count > kMaxListsPerExecute || !read_n(lists, count, &pointers)) {
         device_->note_bad_argument("ExecuteCommandLists: unreadable list array " + hex(lists));
@@ -795,7 +800,7 @@ void CommandList::ClearRenderTargetView(uint64_t rtv, uint64_t color, uint32_t r
 }
 
 // ---------------------------------------------------------------------------------------------
-// Vtable (public ID3D12GraphicsCommandList order)
+// Vtable (Xbox ID3D12GraphicsCommandList order, see d3d12_xs_xbox.h)
 // ---------------------------------------------------------------------------------------------
 
 namespace {
@@ -825,41 +830,77 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::method<&H::RSSetScissorRects>("RSSetScissorRects"),                           // 22
     CL::method<&H::OMSetBlendFactor>("OMSetBlendFactor"),                             // 23
     CL::method<&H::OMSetStencilRef>("OMSetStencilRef"),                               // 24
-    CL::method<&H::SetPipelineState>("SetPipelineState"),                             // 25
+    CL::method<&H::SetPipelineStateX>("SetPipelineState (staged)"),                   // 25
     CL::method<&H::ResourceBarrier>("ResourceBarrier"),                               // 26
     CL::stub("ExecuteBundle"),                                                        // 27
-    CL::method<&H::SetDescriptorHeaps>("SetDescriptorHeaps"),                         // 28
-    CL::method<&H::SetComputeRootSignature>("SetComputeRootSignature"),               // 29
-    CL::method<&H::SetGraphicsRootSignature>("SetGraphicsRootSignature"),             // 30
-    CL::method<&H::SetComputeRootDescriptorTable>("SetComputeRootDescriptorTable"),   // 31
-    CL::method<&H::SetGraphicsRootDescriptorTable>("SetGraphicsRootDescriptorTable"), // 32
-    CL::method<&H::SetComputeRoot32BitConstant>("SetComputeRoot32BitConstant"),       // 33
-    CL::method<&H::SetGraphicsRoot32BitConstant>("SetGraphicsRoot32BitConstant"),     // 34
-    CL::method<&H::SetComputeRoot32BitConstants>("SetComputeRoot32BitConstants"),     // 35
-    CL::method<&H::SetGraphicsRoot32BitConstants>("SetGraphicsRoot32BitConstants"),   // 36
-    CL::method<&H::SetComputeRootConstantBufferView>("SetComputeRootConstantBufferView"),    // 37
-    CL::method<&H::SetGraphicsRootConstantBufferView>("SetGraphicsRootConstantBufferView"),  // 38
-    CL::method<&H::SetComputeRootShaderResourceView>("SetComputeRootShaderResourceView"),    // 39
-    CL::method<&H::SetGraphicsRootShaderResourceView>("SetGraphicsRootShaderResourceView"),  // 40
-    CL::method<&H::SetComputeRootUnorderedAccessView>("SetComputeRootUnorderedAccessView"),  // 41
-    CL::method<&H::SetGraphicsRootUnorderedAccessView>("SetGraphicsRootUnorderedAccessView"),  // 42
-    CL::method<&H::IASetIndexBuffer>("IASetIndexBuffer"),                             // 43
-    CL::method<&H::IASetVertexBuffers>("IASetVertexBuffers"),                         // 44
-    CL::method<&H::SOSetTargets>("SOSetTargets"),                                     // 45
-    CL::method<&H::OMSetRenderTargets>("OMSetRenderTargets"),                         // 46
-    CL::method<&H::ClearDepthStencilView>("ClearDepthStencilView"),                   // 47
-    CL::method<&H::ClearRenderTargetView>("ClearRenderTargetView"),                   // 48
-    CL::method<&H::ClearUnorderedAccessView>("ClearUnorderedAccessViewUint"),         // 49
-    CL::method<&H::ClearUnorderedAccessView>("ClearUnorderedAccessViewFloat"),        // 50
-    CL::method<&H::DiscardResource>("DiscardResource"),                               // 51
-    CL::method<&H::QueryOperation>("BeginQuery"),                                     // 52
-    CL::method<&H::QueryOperation>("EndQuery"),                                       // 53
-    CL::method<&H::QueryOperation>("ResolveQueryData"),                               // 54
-    CL::method<&H::SetPredication>("SetPredication"),                                 // 55
-    CL::method<&H::DebugMarker>("SetMarker"),                                         // 56
-    CL::method<&H::DebugMarker>("BeginEvent"),                                        // 57
-    CL::method<&H::DebugMarker>("EndEvent"),                                          // 58
-    CL::stub("ExecuteIndirect"),                                                      // 59
+    // Xbox order from here on (d3d12_xs_xbox.h): queries and predication moved up, public 28..51 +4.
+    CL::method<&H::QueryOperation>("BeginQuery"),                                     // 28
+    CL::method<&H::QueryOperation>("EndQuery"),                                       // 29
+    CL::method<&H::QueryOperation>("ResolveQueryData"),                               // 30
+    CL::method<&H::SetPredication>("SetPredication (inferred)"),                      // 31
+    CL::method<&H::SetDescriptorHeaps>("SetDescriptorHeaps"),                         // 32
+    CL::method<&H::SetComputeRootSignature>("SetComputeRootSignature"),               // 33
+    CL::method<&H::SetGraphicsRootSignature>("SetGraphicsRootSignature"),             // 34
+    CL::method<&H::SetComputeRootDescriptorTable>("SetComputeRootDescriptorTable"),   // 35
+    CL::method<&H::SetGraphicsRootDescriptorTable>("SetGraphicsRootDescriptorTable"), // 36
+    CL::method<&H::SetComputeRoot32BitConstant>("SetComputeRoot32BitConstant"),       // 37
+    CL::method<&H::SetGraphicsRoot32BitConstant>("SetGraphicsRoot32BitConstant"),     // 38
+    CL::method<&H::SetComputeRoot32BitConstants>("SetComputeRoot32BitConstants"),     // 39
+    CL::method<&H::SetGraphicsRoot32BitConstants>("SetGraphicsRoot32BitConstants"),   // 40
+    CL::method<&H::SetComputeRootConstantBufferView>("SetComputeRootConstantBufferView"),    // 41
+    CL::method<&H::SetGraphicsRootConstantBufferView>("SetGraphicsRootConstantBufferView"),  // 42
+    CL::method<&H::SetComputeRootShaderResourceView>("SetComputeRootShaderResourceView"),    // 43
+    CL::method<&H::SetGraphicsRootShaderResourceView>("SetGraphicsRootShaderResourceView"),  // 44
+    CL::method<&H::SetComputeRootUnorderedAccessView>("SetComputeRootUnorderedAccessView"),  // 45
+    CL::method<&H::SetGraphicsRootUnorderedAccessView>("SetGraphicsRootUnorderedAccessView"),  // 46
+    CL::method<&H::IASetIndexBuffer>("IASetIndexBuffer"),                             // 47
+    CL::method<&H::IASetVertexBuffers>("IASetVertexBuffers"),                         // 48
+    CL::method<&H::SOSetTargets>("SOSetTargets"),                                     // 49
+    CL::method<&H::OMSetRenderTargets>("OMSetRenderTargets"),                         // 50
+    CL::method<&H::ClearDepthStencilView>("ClearDepthStencilView"),                   // 51
+    CL::method<&H::ClearRenderTargetView>("ClearRenderTargetView"),                   // 52
+    CL::method<&H::ClearUnorderedAccessView>("ClearUnorderedAccessViewUint"),         // 53
+    CL::method<&H::ClearUnorderedAccessView>("ClearUnorderedAccessViewFloat"),        // 54
+    CL::method<&H::DiscardResource>("DiscardResource"),                               // 55
+    CL::method<&H::DebugMarker>("SetMarker (inferred)"),                              // 56
+    CL::method<&H::DebugMarker>("BeginEvent (inferred)"),                             // 57
+    CL::method<&H::DebugMarker>("EndEvent (inferred)"),                               // 58
+    CL::method<&H::XboxSlot<59>>("Xbox slot 59"),                                     // 59
+    CL::method<&H::XboxSlot<60>>("Xbox slot 60"),                                     // 60
+    CL::method<&H::ExecuteIndirect>("ExecuteIndirect"),                               // 61
+    CL::method<&H::XboxSlot<62>>("Xbox slot 62"),                                     // 62
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 63..66
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 67..69
+    CL::method<&H::OMSetDepthBounds>("OMSetDepthBounds"),                             // 70
+    CL::stub(nullptr),                                                                // 71
+    CL::method<&H::XboxSlot<72>>("Xbox slot 72"),                                     // 72
+    CL::stub(nullptr), CL::stub(nullptr),                                             // 73..74
+    CL::method<&H::XboxSlot<75>>("Xbox slot 75"),                                     // 75
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 76..79
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 80..83
+    CL::stub(nullptr), CL::stub(nullptr),                                             // 84..85
+    CL::method<&H::XboxSlot<86>>("Xbox slot 86"),                                     // 86
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 87..89
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 90..93
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 94..97
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 98..101
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 102..105
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 106..109
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 110..113
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 114..117
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 118..121
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 122..125
+    CL::method<&H::RSSetShadingRate>("RSSetShadingRate"),                             // 126
+    CL::method<&H::RSSetShadingRateImage>("RSSetShadingRateImage"),                   // 127
+    CL::method<&H::XboxSlot<128>>("Xbox slot 128"),                                   // 128
+    CL::method<&H::XboxSlot<129>>("Xbox slot 129"),                                   // 129
+    CL::stub(nullptr),                                                                // 130
+    CL::method<&H::XboxSlot<131>>("Xbox slot 131 (register write)"),                  // 131
+    CL::method<&H::XboxSlot<132>>("Xbox slot 132 (register write)"),                  // 132
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 133..136
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 137..140
+    CL::stub(nullptr),                                                                // 141
+    CL::method<&H::XboxSlot<142>>("Xbox slot 142"),                                   // 142
 };
 constexpr Guid kCommandListIids[] = {
     IID_ID3D12Object,

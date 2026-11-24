@@ -3,6 +3,7 @@
 // (or a flat export) through __playgta6_indirect_call. Synthetic data only.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -454,9 +455,13 @@ void test_queue_allocator_fence() {
     CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(allocator), I(1)})) == dg::kEInvalidArg);
     pg6_win32_close_handle(event);
 
-    // PresentX with planes ends the frame: BeginFrame (first packet of the frame) + Present.
+    // PresentX with planes ends the frame: BeginFrame (first packet of the frame) + Present (a
+    // plane without a resource still presents; G27 tests cover the back buffer).
     fx.captured.clear();
-    CHECK(hr(fx.vcall(queue, Slot::PresentX, {I(1), I(0), I(0)})) == 0);
+    CHECK(hr(fx.vcall(queue, Slot::PresentX, {I(1), I(0), I(0)})) == dg::kEInvalidArg);  // no plane array
+    CHECK(fx.captured.empty());
+    const uint64_t plane = put(dg::xbox::GuestPresentPlaneX{});
+    CHECK(hr(fx.vcall(queue, Slot::PresentX, {I(1), I(plane), I(0)})) == 0);
     CHECK(fx.captured.size() == 2);
     GpuPacketHeader h{};
     std::memcpy(&h, fx.captured[0].data(), sizeof(h));
@@ -807,9 +812,9 @@ constexpr uint32_t ExecuteCommandLists = 35;
 // ID3D12GraphicsCommandList
 constexpr uint32_t Close = 9, Reset = 10, DrawInstanced = 12, DrawIndexedInstanced = 13, CopyBufferRegion = 15,
                    CopyTextureRegion = 16, IASetPrimitiveTopology = 20, RSSetViewports = 21, RSSetScissorRects = 22,
-                   SetPipelineState = 25, ResourceBarrier = 26, SetGraphicsRootSignature = 30, IASetIndexBuffer = 43,
-                   IASetVertexBuffers = 44, OMSetRenderTargets = 46, ClearDepthStencilView = 47,
-                   ClearRenderTargetView = 48;
+                   SetPipelineState = 25, ResourceBarrier = 26, SetGraphicsRootSignature = 34, IASetIndexBuffer = 47,
+                   IASetVertexBuffers = 48, OMSetRenderTargets = 50, ClearDepthStencilView = 51,
+                   ClearRenderTargetView = 52;  // Xbox order (G27)
 }  // namespace Slot2
 
 struct Packet {
@@ -1041,7 +1046,7 @@ struct Scene {
     std::vector<uint8_t> ps_bytes{'D', 'X', 'B', 'C', 9, 8, 7};
     static constexpr uint32_t kVsModule = 9001, kPsModule = 9002;
 
-    explicit Scene(Fixture& f, bool register_shaders = true) : fx(f) {
+    explicit Scene(Fixture& f, bool register_shaders = true, bool name_back_buffer = true) : fx(f) {
         device = fx.create_device();
         dg::Device* dev = host_device(device);
         queue = fx.create(device, Slot::CreateCommandQueue, {I(put(dg::GuestCommandQueueDesc{}))}, dg::IID_ID3D12CommandQueue);
@@ -1053,7 +1058,9 @@ struct Scene {
         rtv = load64(start);
         rt = committed(fx, device, 1, texture_desc(64, 64, 87, 1), 4);  // B8G8R8A8_UNORM
         fx.vcall(device, Slot2::CreateRenderTargetView, {I(rt), I(0), I(rtv)});
-        CHECK(dev->set_back_buffer(rt));
+        if (name_back_buffer) {
+            CHECK(dev->set_back_buffer(rt));
+        }
 
         // Empty root signature (ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT) through the serialize export.
         dg::GuestVersionedRootSignatureDesc rsd{};
@@ -1170,7 +1177,7 @@ void test_frame_end_to_end() {
     scene.record(fx.thread, list);
     CHECK(fx.captured.size() == mark);  // recording submits nothing
     scene.execute({list});
-    CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(0), I(0)})) == 0);
+    CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(dg::xbox::GuestPresentPlaneX{})), I(0)})) == 0);
 
     const std::vector<Packet> ps = packets_since(fx, mark);
     // The vertex data written through Map reaches the GPU before the list's packets.
@@ -1228,9 +1235,9 @@ void test_frame_end_to_end() {
     CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
     fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
     CHECK(contains(dev->diagnostics(), "call on a closed command list"));
-    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 131) == 0);
-    CHECK(hr(fx.vcall(list, 131, {I(0x700000), I(0), I(0)})) == dg::kENotImpl);  // Xbox-only slot: logging stub
-    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 131) == 1);
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 130) == 0);
+    CHECK(hr(fx.vcall(list, 130, {I(0x700000), I(0), I(0)})) == dg::kENotImpl);  // unestablished slot: logging stub
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 130) == 1);
     CHECK(t_balanced);
     scene.release_all({list});
 }
@@ -1401,7 +1408,7 @@ void test_compute_views_and_public_list() {
                                     dg::IID_ID3D12PipelineState, &result);
     CHECK(result == 0 && object_of<dg::PipelineState>(cpso)->is_compute() && object_of<dg::PipelineState>(cpso)->resolved());
     CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(cpso)})) == 0);
-    fx.vcall(list, 29, {I(scene.rs)});  // SetComputeRootSignature
+    fx.vcall(list, 33, {I(scene.rs)});  // SetComputeRootSignature (Xbox slot)
     fx.vcall(list, 14, {I(4), I(2), I(1)});  // Dispatch
     CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
     const size_t mark = fx.captured.size();
@@ -1466,6 +1473,519 @@ void test_compute_views_and_public_list() {
     scene.release_all({list, cpso, srv_heap, tex, dsv_heap, depth});
 }
 
+// ---------------------------------------------------------------------------
+// G27: Xbox-specific device, queue and command-list slots (d3d12_xs_xbox.h)
+// ---------------------------------------------------------------------------
+
+namespace XSlot {
+// ID3D12Device (Xbox)
+constexpr uint32_t FeatureToggle = 49, RemovalCallbacks = 50, CreatePsoWithOverrides = 55, CreateComputePsoX = 57,
+                   Slot61 = 61, PsoFromBlob = 62, PsoFromBlobCached = 67, SrvAtAddress = 70, UavAtAddress = 71,
+                   PagePool = 74, SetFrameInterval = 78, ScheduleFrameEvent = 79, WaitFrameEvent = 80,
+                   FrameStatistics = 81, CreatePsoStream = 86, CreateStateObject = 101, AllocationInfo1 = 108,
+                   Slot119 = 119, Slot132 = 132;
+// ID3D12CommandQueue (Xbox)
+constexpr uint32_t Suspend = 23, Resume = 24, PageMappings = 31;
+// ID3D12CommandAllocator (Xbox)
+constexpr uint32_t AllocationCallback = 9;
+// ID3D12GraphicsCommandList (Xbox)
+constexpr uint32_t ExecuteIndirect = 61, OMSetDepthBounds = 70, RSSetShadingRate = 126, RSSetShadingRateImage = 127,
+                   RegisterWrite = 131, SetDescriptorHeaps = 32, BeginQuery = 28;
+}  // namespace XSlot
+
+uint64_t counter(dg::Device* dev, dg::xbox::Counter c) {
+    return dev->counter(c);
+}
+
+// Copies a PSO's 32-byte payload into the list and calls SetPipelineState with only `this` (rdx
+// holds garbage), as the executable's inlined code does.
+void staged_set_pipeline_state(Fixture& fx, GuestThread& t, uint64_t list, uint64_t pso) {
+    uint8_t payload[32];
+    CHECK(com::read_guest(pso + 0x10, payload, sizeof(payload)));
+    CHECK(com::write_guest(list + dg::xbox::kListStagedPipelineOffset, payload, sizeof(payload)));
+    fx.vcall_on(t, list, 25, {I(0x00000000DEAD0000ULL)});
+}
+
+void test_xbox_inlined_list_fields_and_staged_pso() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+
+    // The list's guest payload is zero: the inlined fast paths' cursors never admit a write.
+    for (uint64_t off : {0x18u, 0x20u, 0x28u, 0x30u, 0x544u, 0x548u, 0x554u}) {
+        CHECK(load64(list + off) == 0);
+    }
+    // The PSO payload is the tag and the PSO's own interface pointer.
+    CHECK(load64(scene.pso + 0x10) == dg::xbox::kPipelineStateTag && load64(scene.pso + 0x18) == scene.pso);
+
+    // Record with the staged protocol only (no initial PSO on Reset).
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, scene.pso);
+    CHECK(load64(list + dg::xbox::kListStagedPipelineOffset) == 0);  // consumed
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 32, 32, 0, 1}))});
+    fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 32, 32}))});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    // Without a staged copy, slot 25 takes the PSO from rdx (public convention).
+    fx.vcall(list, 25, {I(scene.pso)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    // Neither: diagnosed, nothing bound.
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    fx.vcall(list, 25, {I(0x00000000BEEF0000ULL)});
+    CHECK(dev->stats().bad_arguments > bad_before);
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+    CHECK(count_op(ps, GpuOpcode::Draw) == 2);
+    CHECK(find_op(ps, GpuOpcode::CreateRenderPipeline2) != nullptr);
+    CHECK(dev->stats().skipped_draws == 0);
+    CHECK(t_balanced);
+    scene.release_all({list});
+}
+
+void test_xbox_frame_loop_present_and_pacing() {
+    Fixture fx;
+    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+    const uint64_t rt_id = object_of<dg::Resource>(scene.rt)->id();
+
+    // 5 ms frame events (output 0, interval, period, flags), as slot 78 is called.
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(5000), I(2), I(0)})) == 0);
+    CHECK(dev->frame_pacer().interval_us() == 5000 && dev->frame_pacer().period() == 2);
+    CHECK(hr(fx.vcall(scene.device, XSlot::ScheduleFrameEvent, {I(2), I(0), I(0), I(0)})) == 0);
+
+    const uint64_t token_slot = put<uint64_t>(0);
+    const uint64_t present_token = put<uint64_t>(0);
+    const uint64_t rt_slot = put<uint64_t>(scene.rt);
+    uint64_t previous = 0;
+    std::vector<std::vector<Packet>> frames;
+    const auto start = std::chrono::steady_clock::now();
+    for (int frame = 0; frame < 4; ++frame) {
+        const size_t mark = fx.captured.size();
+        // Frame start: (type 0, timeout 0, 0, flags 2, &token) never fails and never blocks.
+        store64(token_slot, 0);
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(token_slot)})) == 0);
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+        const uint64_t token = load64(token_slot);
+        CHECK(token >= 1 && token >= previous);
+        // Record and execute with the frame token (count, lists, token, flags 3).
+        scene.record(fx.thread, list);
+        std::vector<uint64_t> lists{list};
+        fx.vcall(scene.queue, Slot2::ExecuteCommandLists, {I(1), I(put_bytes(lists.data(), 8)), I(token), I(3)});
+        CHECK(dev->last_execute_token.load() == token);
+        // Before presenting: wait until the previous frame's token is over (type 2, INFINITE).
+        if (previous != 0) {
+            store64(present_token, previous);
+            CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent,
+                              {I(2), I(0xFFFFFFFFu), I(0), I(0), I(present_token)})) == 0);
+            CHECK(load64(present_token) > previous);
+        }
+        // PresentX(plane count, planes, params): plane 0 names the back buffer.
+        dg::xbox::GuestPresentPlaneX plane{};
+        plane.Token = token;
+        plane.ResourceCount = 1;
+        plane.ppResources = rt_slot;
+        uint8_t params[32] = {};
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(put_bytes(params, sizeof(params)))})) == 0);
+        frames.push_back(packets_since(fx, mark));
+        previous = token;
+        // The next frame waits for a newer tick (bounded by one interval).
+        store64(token_slot, 0);
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(1000), I(0), I(0), I(token_slot)})) == 0);
+        CHECK(load64(token_slot) > token);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Paced: four frames take at least ~3 intervals, and nothing spins for long.
+    CHECK(elapsed >= std::chrono::milliseconds(12));
+    CHECK(elapsed < std::chrono::seconds(5));
+    // The first present names the back buffer: frame 0 rendered into the texture, later frames
+    // into the canvas; every frame ends with Present.
+    CHECK(counter(dev, dg::xbox::Counter::BackBufferMarks) == 1);
+    CHECK(object_of<dg::Resource>(scene.rt)->is_back_buffer());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const Packet* pass = find_op(frames[i], GpuOpcode::BeginRenderPass);
+        CHECK(pass != nullptr);
+        if (pass != nullptr) {
+            const uint32_t target = payload_as<GpuBeginRenderPassPayload>(*pass).color[0].texture_id;
+            CHECK(target == (i == 0 ? rt_id : kGpuSwapchainTextureId));
+        }
+        CHECK(!frames[i].empty() && frames[i].back().opcode == GpuOpcode::Present);
+    }
+    CHECK(dev->stats().presents == 4 && counter(dev, dg::xbox::Counter::PresentsWithPlanes) == 4);
+    CHECK(dev->last_present_token.load() == previous);
+    // A present without planes (suspend flush) emits nothing.
+    const size_t mark = fx.captured.size();
+    CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(0), I(0), I(0)})) == 0);
+    CHECK(fx.captured.size() == mark);
+
+    // Shutdown releases a waiter blocked on another thread (longest interval) and later waits
+    // return at once: no deadlock when the submission thread is still waiting.
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(100000000), I(1), I(0)})) == 0);
+    CHECK(dev->frame_pacer().interval_us() == dg::xbox::FramePacer::kMaxIntervalUs);
+    GuestThread other{};
+    CHECK(create_guest_thread(fx.arena, 512 * 1024, other));
+    std::atomic<int32_t> waiter_hr{-1};
+    const uint64_t waiter_slot = put<uint64_t>(0);
+    std::thread waiter([&] {
+        waiter_hr = hr(fx.vcall_on(other, scene.device, XSlot::WaitFrameEvent,
+                                   {I(0), I(0xFFFFFFFFu), I(0), I(0), I(waiter_slot)}));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    dev->shutdown_frame_events();
+    waiter.join();
+    CHECK(waiter_hr.load() == 0 && load64(waiter_slot) != 0);
+    const auto s0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0xFFFFFFFFu), I(0), I(0), I(token_slot)})) == 0);
+    }
+    CHECK(std::chrono::steady_clock::now() - s0 < std::chrono::milliseconds(100));
+    destroy_guest_thread(fx.arena, other);
+    CHECK(t_balanced);
+    scene.release_all({list});
+}
+
+void test_frame_pacer_unit() {
+    dg::xbox::FramePacer pacer;
+    pacer.set_interval(2000, 1);
+    uint64_t frame = 0;
+    const uint64_t now = pacer.current_frame();
+    // Waiting after the current tick blocks until the next one.
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(pacer.wait_after(now, 1000, &frame) == dg::xbox::FramePacer::WaitResult::Ok && frame > now);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
+    // Waiting after an older tick returns at once.
+    CHECK(pacer.wait_after(0, 1000, &frame) == dg::xbox::FramePacer::WaitResult::Ok);
+    // A timeout shorter than the interval times out.
+    pacer.set_interval(100000, 1);
+    CHECK(pacer.wait_after(pacer.current_frame(), 1, &frame) == dg::xbox::FramePacer::WaitResult::Timeout);
+    // Clamping.
+    pacer.set_interval(1, 1);
+    CHECK(pacer.interval_us() == dg::xbox::FramePacer::kMinIntervalUs);
+    pacer.set_interval(0, 1);
+    CHECK(pacer.interval_us() == dg::xbox::FramePacer::kDefaultIntervalUs);
+    pacer.shutdown();
+    CHECK(pacer.is_shut_down());
+    CHECK(pacer.wait_after(pacer.current_frame() + 100, 0xFFFFFFFFu, &frame) == dg::xbox::FramePacer::WaitResult::Shutdown);
+}
+
+// Pipeline-state subobject stream (public layout: pointer-aligned subobjects, u32 type first).
+struct StreamBuilder {
+    std::vector<uint8_t> bytes;
+    template <typename T>
+    void add(uint32_t type, size_t data_offset, const T& value) {
+        const size_t off = (bytes.size() + 7) & ~size_t{7};
+        bytes.resize(off + data_offset + sizeof(T), 0);
+        std::memcpy(bytes.data() + off, &type, 4);
+        std::memcpy(bytes.data() + off + data_offset, &value, sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + 7) & ~size_t{7}, 0); }
+};
+
+struct RtFormats {
+    uint32_t formats[8];
+    uint32_t count;
+};
+
+std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode) {
+    StreamBuilder s;
+    s.add<uint64_t>(0, 8, scene.rs);
+    const dg::GuestShaderBytecode vs{put_bytes(scene.vs_bytes.data(), scene.vs_bytes.size()), scene.vs_bytes.size()};
+    const dg::GuestShaderBytecode ps{put_bytes(scene.ps_bytes.data(), scene.ps_bytes.size()), scene.ps_bytes.size()};
+    s.add(1, 8, vs);
+    s.add(2, 8, ps);
+    dg::GuestBlendDesc blend{};
+    for (auto& t : blend.RenderTarget) {
+        t.SrcBlend = t.SrcBlendAlpha = 2;
+        t.DestBlend = t.DestBlendAlpha = 1;
+        t.BlendOp = t.BlendOpAlpha = 1;
+        t.LogicOp = 4;
+        t.RenderTargetWriteMask = 0xF;
+    }
+    s.add(8, 4, blend);
+    s.add<uint32_t>(9, 4, 0xFFFFFFFFu);
+    dg::GuestRasterizerDesc r{};
+    r.FillMode = 3;
+    r.CullMode = cull_mode;
+    r.DepthClipEnable = 1;
+    s.add(10, 4, r);
+    uint8_t ds1[56] = {};  // DEPTH_STENCIL1: depth off
+    s.add(21, 4, ds1);
+    const uint32_t sample[2] = {1, 0};
+    s.add(17, 4, sample);
+    static const char kPosition[] = "POSITION";
+    dg::GuestInputElementDesc e{};
+    e.SemanticName = put_bytes(kPosition, sizeof(kPosition));
+    e.Format = 6;
+    s.add(12, 8, dg::GuestInputLayoutDesc{put(e), 1});
+    s.add<uint32_t>(14, 4, 3);
+    RtFormats f{};
+    f.formats[0] = 87;
+    f.count = 1;
+    s.add(15, 4, f);
+    s.add<uint32_t>(16, 4, 0);
+    s.finish();
+    return s.bytes;
+}
+
+void test_xbox_pipeline_streams_and_overrides() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+
+    // Unit: the parser follows the public layout and reports what it saw.
+    const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+    dg::xbox::StreamPipeline parsed;
+    std::string error;
+    CHECK(dg::xbox::parse_pipeline_stream(bytes.data(), bytes.size(), &parsed, &error));
+    CHECK(parsed.kind == dg::xbox::StreamPipelineKind::Graphics && parsed.subobjects == 12);
+    CHECK(parsed.graphics.pRootSignature == scene.rs && parsed.graphics.NumRenderTargets == 1 &&
+          parsed.graphics.RTVFormats[0] == 87 && parsed.graphics.RasterizerState.CullMode == 3 &&
+          parsed.graphics.SampleCount == 1 && parsed.graphics.PrimitiveTopologyType == 3 &&
+          parsed.graphics.InputLayout.NumElements == 1 && parsed.graphics.DepthStencilState.DepthEnable == 0);
+    std::vector<uint8_t> broken = bytes;
+    broken[0] = 99;  // unknown subobject type
+    CHECK(!dg::xbox::parse_pipeline_stream(broken.data(), broken.size(), &parsed, &error) &&
+          error.find("unknown subobject type 99") != std::string::npos);
+    CHECK(!dg::xbox::parse_pipeline_stream(bytes.data(), bytes.size() - 12, &parsed, &error));
+
+    // Slot 86: ({SizeInBytes, pStream}, riid, out).
+    auto stream_desc = [&](const std::vector<uint8_t>& b) {
+        return put(dg::xbox::GuestPipelineStateStreamDesc{b.size(), put_bytes(b.data(), b.size())});
+    };
+    const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream_desc(bytes))},
+                                   dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    auto* state = object_of<dg::PipelineState>(pso);
+    CHECK(state->resolved() && state->graphics_source() != nullptr);
+    CHECK(state->graphics_source()->desc.RTVFormats[0] == playgta6::gpu::pso::DxgiFormat(87));
+    CHECK(load64(pso + 0x10) == dg::xbox::kPipelineStateTag && load64(pso + 0x18) == pso);
+
+    // Slot 55: (base, n, overrides of 0x14C bytes {u32 kind; desc}, riid, out).
+    std::vector<uint8_t> overrides(2 * dg::xbox::kPsoOverrideStride, 0);
+    const uint32_t raster_kind = 1, unknown_kind = 5;
+    dg::GuestRasterizerDesc r{};
+    r.FillMode = 2;  // WIREFRAME
+    r.CullMode = 1;  // NONE
+    std::memcpy(overrides.data(), &raster_kind, 4);
+    std::memcpy(overrides.data() + 4, &r, sizeof(r));
+    std::memcpy(overrides.data() + dg::xbox::kPsoOverrideStride, &unknown_kind, 4);
+    const uint64_t derived = fx.create(scene.device, XSlot::CreatePsoWithOverrides,
+                                       {I(pso), I(2), I(put_bytes(overrides.data(), overrides.size()))},
+                                       dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && derived != 0 && derived != pso);
+    const auto* dsrc = object_of<dg::PipelineState>(derived)->graphics_source();
+    CHECK(dsrc != nullptr && dsrc->desc.RasterizerState.CullMode == playgta6::gpu::pso::D3D12CullMode(1) &&
+          dsrc->desc.RasterizerState.FillMode == playgta6::gpu::pso::D3D12FillMode(2));
+    CHECK(dsrc->desc.NumInputElements == 1 && std::string(dsrc->desc.pInputElementDescs[0].SemanticName) == "POSITION");
+    CHECK(state->graphics_source()->desc.RasterizerState.CullMode == playgta6::gpu::pso::D3D12CullMode(3));
+    CHECK(counter(dev, dg::xbox::Counter::UnknownOverrideKinds) == 1);
+    CHECK(fx.create(scene.device, XSlot::CreatePsoWithOverrides, {I(scene.allocator), I(0), I(0)},
+                    dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kEInvalidArg);
+
+    // A derived PSO draws: staged protocol on the list.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, derived);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);
+
+    // Compute stream (root signature + CS) and the Xbox compute slot 57.
+    const std::vector<uint8_t> cs{'D', 'X', 'B', 'C', 0x57};
+    dev->register_shader_module(dg::shader_identity(cs.data(), cs.size()), 9300);
+    StreamBuilder c;
+    c.add<uint64_t>(0, 8, scene.rs);
+    c.add(6, 8, dg::GuestShaderBytecode{put_bytes(cs.data(), cs.size()), cs.size()});
+    c.finish();
+    const uint64_t cpso = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream_desc(c.bytes))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && object_of<dg::PipelineState>(cpso)->is_compute() && object_of<dg::PipelineState>(cpso)->resolved());
+    dg::GuestComputePipelineStateDesc cd{};
+    cd.pRootSignature = scene.rs;
+    cd.CS = {put_bytes(cs.data(), cs.size()), cs.size()};
+    const uint64_t cpso57 = fx.create(scene.device, XSlot::CreateComputePsoX, {I(put(cd))}, dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && object_of<dg::PipelineState>(cpso57)->is_compute());
+
+    // Mesh stream: a placeholder that binds as unresolved (never a null pointer).
+    StreamBuilder m;
+    m.add<uint64_t>(0, 8, scene.rs);
+    m.add(24, 8, dg::GuestShaderBytecode{put_bytes(cs.data(), cs.size()), cs.size()});
+    m.finish();
+    const uint64_t mpso = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream_desc(m.bytes))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && mpso != 0 && !object_of<dg::PipelineState>(mpso)->resolved() &&
+          !object_of<dg::PipelineState>(mpso)->unsupported_reason().empty());
+    // Malformed stream: E_INVALIDARG and a cleared out pointer.
+    CHECK(fx.create(scene.device, XSlot::CreatePsoStream, {I(stream_desc(broken))}, dg::IID_ID3D12PipelineState,
+                    &result) == 0 &&
+          result == dg::kEInvalidArg);
+
+    // Title-blob PSOs (62, 67) and ray-tracing state objects (101) are refused with a null out.
+    const uint64_t out62 = put<uint64_t>(0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlob,
+                      {I(put<uint64_t>(0)), I(0), I(0), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out62)})) ==
+          dg::kENotImpl);
+    CHECK(load64(out62) == 0);
+    const uint64_t out67 = put<uint64_t>(0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlobCached,
+                      {I(put<uint64_t>(0)), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out67)})) == dg::kENotImpl);
+    CHECK(load64(out67) == 0);
+    const uint64_t so = fx.create(scene.device, XSlot::CreateStateObject, {I(put<uint64_t>(3))},
+                                  com::make_guid("47016943-fca8-4594-93ea-af258b55346d"), &result);
+    CHECK(so == 0 && result == dg::kENotImpl);
+    CHECK(counter(dev, dg::xbox::Counter::StateObjectsRefused) == 1);
+    // Ray tracing is reported as unsupported (OPTIONS5.RaytracingTier = 0).
+    const uint64_t opts5 = put_bytes(std::vector<uint8_t>(12, 0xFF).data(), 12);
+    CHECK(hr(fx.vcall(scene.device, Slot::CheckFeatureSupport, {I(27), I(opts5), I(12)})) == 0);
+    CHECK(load32(opts5 + 8) == 0);
+
+    CHECK(t_balanced);
+    scene.release_all({list, pso, derived, cpso, cpso57, mpso});
+}
+
+void test_xbox_device_queue_and_list_slots() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+
+    // Recorded no-ops with S_OK (results ignored or only checked for success by the caller).
+    CHECK(hr(fx.vcall(scene.device, XSlot::FeatureToggle, {I(0x11F), I(1)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::RemovalCallbacks, {I(0x140001000), I(0), I(0x140001000)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::Slot61, {I(1), I(2)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::Slot119, {I(put<uint64_t>(0)), I(0x80), I(0)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::Slot132, {I(3)})) == 0);
+    CHECK(counter(dev, dg::xbox::Counter::FeatureToggles) == 1 && counter(dev, dg::xbox::Counter::XboxNoOps) == 4);
+
+    // Page pool (address, pages, &handle) and frame statistics (token, flags, &count, entries).
+    const uint64_t handle = put<uint64_t>(0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::PagePool, {I(com::guest_alloc(65536)), I(1), I(handle)})) == 0);
+    CHECK(load64(handle) != 0);
+    const uint64_t stat_count = put<uint32_t>(6);
+    CHECK(hr(fx.vcall(scene.device, XSlot::FrameStatistics, {I(1), I(0x11100), I(stat_count), I(put_bytes(
+                                                                std::vector<uint8_t>(6 * 0x38).data(), 6 * 0x38))})) == 0);
+    CHECK(load32(stat_count) == 0);
+
+    // GetResourceAllocationInfo1 (slot 108): struct return, result in rcx and this in rdx.
+    dg::GuestResourceDesc descs[2] = {buffer_desc(1000), buffer_desc(70000)};
+    const uint64_t descs_va = put_bytes(descs, sizeof(descs));
+    const uint64_t infos = put_bytes(std::vector<uint8_t>(48, 0xEE).data(), 48);
+    const uint64_t result_buf = put(dg::GuestResourceAllocationInfo{});
+    CHECK(fx.sret_call(scene.device, XSlot::AllocationInfo1, result_buf, {I(1), I(2), I(descs_va), I(infos)}) == result_buf);
+    const auto total = get<dg::GuestResourceAllocationInfo>(result_buf);
+    const auto i0 = get<dg::xbox::GuestResourceAllocationInfo1>(infos);
+    const auto i1 = get<dg::xbox::GuestResourceAllocationInfo1>(infos + 24);
+    CHECK(total.SizeInBytes == 65536 + 131072 && total.Alignment == 65536);
+    CHECK(i0.Offset == 0 && i0.SizeInBytes == 65536 && i1.Offset == 65536 && i1.SizeInBytes == 131072);
+
+    // Buffer views at GPU addresses (slots 70/71): view desc + u64 address at +0x28.
+    const uint64_t buf = committed(fx, scene.device, 2, buffer_desc(4096), 0xAC3);
+    const uint64_t buf_va = fx.vcall(buf, Slot2::GetGPUVirtualAddress);
+    const uint32_t buf_id = object_of<dg::Resource>(buf)->id();
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                    {I(put(dg::GuestDescriptorHeapDesc{0, 8, 1, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    const uint64_t start = put<uint64_t>(0);
+    fx.sret_call(heap, Slot::GetCPUStart, start);
+    const uint64_t cpu0 = load64(start);
+    auto* host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap)->heap();
+    uint8_t srv[48] = {};
+    dg::GuestShaderResourceViewDesc sd{};
+    sd.ViewDimension = 1;  // BUFFER
+    sd.Shader4ComponentMapping = 0x1688;
+    sd.u[2] = 4;   // NumElements
+    sd.u[3] = 16;  // StructureByteStride
+    std::memcpy(srv, &sd, sizeof(sd));
+    const uint64_t at = buf_va + 64;
+    std::memcpy(srv + 0x28, &at, 8);
+    const uint64_t rdesc = put(buffer_desc(64));
+    fx.vcall(scene.device, XSlot::SrvAtAddress, {I(rdesc), I(put_bytes(srv, sizeof(srv))), I(cpu0)});
+    const d3d::ViewDescriptor* v0 = host_heap->view(0);
+    CHECK(v0 != nullptr && v0->kind == d3d::DescriptorKind::Srv && v0->resource_id == buf_id && v0->first_element_or_address == 4);
+    uint8_t uav[48] = {};
+    dg::GuestUnorderedAccessViewDesc ud{};
+    ud.Format = 39;  // R32_TYPELESS
+    ud.ViewDimension = 1;
+    ud.u[2] = 8;
+    ud.u[6] = 1;  // RAW
+    std::memcpy(uav, &ud, sizeof(ud));
+    const uint64_t at2 = buf_va + 16;
+    std::memcpy(uav + 0x28, &at2, 8);
+    fx.vcall(scene.device, XSlot::UavAtAddress, {I(rdesc), I(put_bytes(uav, sizeof(uav))), I(cpu0 + 32)});
+    const d3d::ViewDescriptor* v1 = host_heap->view(1);
+    CHECK(v1 != nullptr && v1->kind == d3d::DescriptorKind::Uav && v1->resource_id == buf_id && v1->first_element_or_address == 4);
+    const uint64_t unknown = 0x00000BAD00000000ULL;
+    std::memcpy(srv + 0x28, &unknown, 8);
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    fx.vcall(scene.device, XSlot::SrvAtAddress, {I(rdesc), I(put_bytes(srv, sizeof(srv))), I(cpu0 + 64)});
+    CHECK(dev->stats().bad_arguments == bad_before + 1);  // unknown address: null descriptor, diagnosed
+    CHECK(counter(dev, dg::xbox::Counter::ViewsAtAddress) == 3);
+
+    // GPU alias window: a buffer at a GPU-window address reads its bytes from the CPU window.
+    const uint64_t cpu_window = com::guest_alloc(1 << 16);
+    const uint64_t gpu_window = 0x00007D0000000000ULL;
+    dev->register_gpu_alias(gpu_window, cpu_window, 1 << 16);
+    CHECK(dev->cpu_address_for_gpu(gpu_window + 0x1000) == cpu_window + 0x1000);
+    CHECK(dev->cpu_address_for_gpu(0x1234) == 0x1234);
+    const uint64_t aliased = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                       {I(gpu_window + 0x1000), I(put(buffer_desc(4096))), I(0), I(0)},
+                                       dg::IID_ID3D12Resource, &result);
+    CHECK(result == 0 && fx.vcall(aliased, Slot2::GetGPUVirtualAddress) == gpu_window + 0x1000);
+    CHECK(object_of<dg::Resource>(aliased)->cpu_address() == cpu_window + 0x1000);
+
+    // Queue: suspend / resume and page mappings.
+    auto* queue = host_object<dg::CommandQueue, dg::ICommandQueueHost>(scene.queue);
+    CHECK(hr(fx.vcall(scene.queue, XSlot::Suspend, {I(0)})) == 0 && queue->suspended());
+    CHECK(hr(fx.vcall(scene.queue, XSlot::Resume)) == 0 && !queue->suspended());
+    CHECK(hr(fx.vcall(scene.queue, XSlot::PageMappings, {I(0), I(0), I(0), I(0), I(0)})) == 0);
+    CHECK(counter(dev, dg::xbox::Counter::PageMappingsIgnored) == 1);
+
+    // Allocator slot 9: the command-buffer allocation callback is recorded, never called.
+    CHECK(hr(fx.vcall(scene.allocator, XSlot::AllocationCallback, {I(0x140005000), I(0x1234)})) == 0);
+    auto* host_allocator = host_object<dg::CommandAllocator, dg::ICommandAllocatorHost>(scene.allocator);
+    CHECK(host_allocator->allocation_callback() == 0x140005000);
+
+    // Command list: Xbox slots in a recording (draw, unsupported state, recorded-only slots).
+    const uint64_t list = scene.new_list();
+    scene.record(fx.thread, list);  // closes
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(scene.pso)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, XSlot::OMSetDepthBounds, {F32(0.0f), F32(1.0f)});
+    fx.vcall(list, XSlot::RSSetShadingRate, {I(0), I(0)});
+    fx.vcall(list, XSlot::RSSetShadingRateImage, {I(0)});
+    fx.vcall(list, XSlot::RegisterWrite, {I(0xC280), I(0x20000), I(0), I(0xFFFFFFFFFF00ULL)});
+    fx.vcall(list, 132, {I(0x700000), I(0), I(0), I(0xFFFFFFFFFF00ULL)});
+    fx.vcall(list, XSlot::BeginQuery, {I(0), I(0), I(0)});
+    fx.vcall(list, XSlot::ExecuteIndirect, {I(0), I(1), I(buf), I(0), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const auto calls = object_of<dg::CommandList>(list)->xbox_slot_calls();
+    CHECK(calls.size() == 2 && calls[0].first == 131 && calls[1].first == 132);
+    CHECK(counter(dev, dg::xbox::Counter::DepthBoundsIgnored) == 1 &&
+          counter(dev, dg::xbox::Counter::ShadingRateIgnored) == 2 &&
+          counter(dev, dg::xbox::Counter::IndirectSkipped) == 1);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);  // the indirect draw has no packet
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 131) == 0);
+
+    CHECK(t_balanced);
+    scene.release_all({list, buf, heap, aliased});
+}
+
 }  // namespace
 
 int main() {
@@ -1482,6 +2002,11 @@ int main() {
     test_copies_and_barriers();
     test_concurrent_recording();
     test_compute_views_and_public_list();
+    test_xbox_inlined_list_fields_and_staged_pso();
+    test_xbox_frame_loop_present_and_pacing();
+    test_frame_pacer_unit();
+    test_xbox_pipeline_streams_and_overrides();
+    test_xbox_device_queue_and_list_slots();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

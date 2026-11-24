@@ -28,7 +28,7 @@
 //   flags, DESC1, initial layout, clear value, protected session, castable formats, riid, out) and
 //   133 an ID3D12Resource from (address, desc, initial state, clear value, riid, out) (5 calls).
 //   Slots 49, 50, 61, 62, 70, 71, 74, 78, 79, 80, 81, 108, 119, 132 are Xbox-specific with no public
-//   counterpart. Unestablished slots stay logging stubs.
+//   counterpart; G27 established them (d3d12_xs_xbox.h). Unestablished slots stay logging stubs.
 // * Struct returns: at slots 25/26 (and Xbox slot 108) the caller passes the hidden result pointer
 //   in rcx and `this` in rdx (C-style), not `this` first as MSVC member functions do. Struct-
 //   returning methods here accept both orders (SretMethods below) and count which one they saw.
@@ -38,12 +38,13 @@
 // * ID3D12CommandQueue: GetTimestampFrequency is slot 18 (out u64, result divided into a float),
 //   Signal is slot 16 (fence, value), i.e. the public slots shifted by +2: two extra methods sit
 //   between slots 3 and 15, so ExecuteCommandLists (public 10) is NOT established and stays a stub.
-//   The submission thread executes command lists through slot 35 (this, count, lists, handle,
-//   flags) and presents through slot 32 (plane count, plane array, parameters).
+//   The submission thread executes command lists through slot 35 (this, count, lists, frame token,
+//   flags) and presents through slot 32 (plane count, plane array, parameters); no other execute
+//   slot is called. Slots 23/24/31: d3d12_xs_xbox.h.
 // * ID3D12GraphicsCommandList: created by device slot 73 and immediately closed through slot 9
-//   (public Close); slots 131/132 (Xbox-specific) are called on a fresh list. List pointers live in
-//   heap-allocated pools that static analysis cannot follow, so the remaining slots follow the
-//   public order with low confidence (no contradicting evidence).
+//   (public Close). G27 followed the lists through the context objects that own them: the Xbox
+//   order (queries at 28..31, public 28..51 shifted by +4) and the inlined fast paths that write
+//   command buffers directly are documented in d3d12_xs_xbox.h.
 // * Allocators, descriptor heaps, fences, root signatures: only Release (slot 2) was observed on
 //   tracked pointers; their method slots follow the public order (low confidence).
 //
@@ -63,6 +64,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_guest_structs.h"
+#include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/pso_cache.h"
 #include "gpu/state_bridge.h"
@@ -238,9 +240,10 @@ struct IBlobHost {
     virtual uint64_t GetBufferSize() = 0;
 };
 
-// ID3D12CommandAllocator: 8 Reset.
+// ID3D12CommandAllocator: 8 Reset; Xbox 9 (callback, context) (see d3d12_xs_xbox.h).
 struct ICommandAllocatorHost : IDeviceChildHost {
     virtual HResult Reset() = 0;
+    virtual HResult SetAllocationCallback_unverified(uint64_t callback, uint64_t context) = 0;
 };
 
 // ID3D12Fence: 8 GetCompletedValue, 9 SetEventOnCompletion, 10 Signal; ID3D12Fence1: 11 GetCreationFlags.
@@ -276,6 +279,10 @@ struct ICommandQueueHost : IDeviceChildHost {
     virtual HResult GetTimestampFrequency(GuestPtr<uint64_t> frequency) = 0;                   // 18
     virtual HResult PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) = 0;  // 32
     virtual void ExecuteCommandListsX(com::CallContext& ctx) = 0;                              // 35
+    // d3d12_xs_xbox.cpp
+    virtual HResult SuspendX(uint32_t flags) = 0;                                              // 23
+    virtual HResult ResumeX() = 0;                                                             // 24
+    virtual HResult Slot31_UpdatePageMappings_unverified(com::CallContext& ctx) = 0;           // 31
 };
 
 // D3D12_RESOURCE_DESC1 as a struct-return value (72 bytes).
@@ -306,7 +313,9 @@ struct IPipelineStateHost : IDeviceChildHost {
     virtual HResult GetCachedBlob(OutPtr blob) = 0;
 };
 
-// ID3D12GraphicsCommandList, public order (slot 9 Close confirmed, the rest unconfirmed).
+// ID3D12GraphicsCommandList. The slot comments give the public order; the Xbox vtable
+// (d3d12_guest_command_list.cpp, evidence in d3d12_xs_xbox.h) keeps 0..27, puts the query and
+// predication methods at 28..31, shifts public 28..51 by +4 and has Xbox-only slots further up.
 struct IGraphicsCommandListHost : IDeviceChildHost {
     virtual uint32_t GetType() = 0;                                                                  // 8
     virtual HResult Close() = 0;                                                                     // 9
@@ -361,6 +370,18 @@ struct IGraphicsCommandListHost : IDeviceChildHost {
     virtual void QueryOperation(com::CallContext& ctx) = 0;                                          // 52..54
     virtual void SetPredication(com::CallContext& ctx) = 0;                                          // 55
     virtual void DebugMarker(com::CallContext& ctx) = 0;                                             // 56..58
+    // Xbox slots (see d3d12_xs_xbox.h).
+    virtual void SetPipelineStateX(com::CallContext& ctx) = 0;  // Xbox 25: staged PSO, rdx fallback
+    virtual void ExecuteIndirect(com::CallContext& ctx) = 0;    // Xbox 61
+    virtual void OMSetDepthBounds(float min_depth, float max_depth) = 0;               // Xbox 70
+    virtual void RSSetShadingRate(uint32_t rate, uint64_t combiners) = 0;              // Xbox 126
+    virtual void RSSetShadingRateImage(InterfaceArg<IResourceHost> image) = 0;         // Xbox 127
+    // Xbox-only slots whose meaning is not established: recorded, no effect.
+    virtual void note_xbox_slot(uint32_t slot) = 0;
+    template <uint32_t Slot>
+    void XboxSlot(com::CallContext&) {
+        note_xbox_slot(Slot);
+    }
 };
 
 struct HeapPropertiesResult {
@@ -415,6 +436,29 @@ struct IDeviceHost : IObjectHost {
                                        OutPtr out) = 0;                                                    // 73
     virtual HResult CreateCommittedResource3(com::CallContext& ctx) = 0;                                  // 127
     virtual HResult CreatePlacedResourceX(com::CallContext& ctx) = 0;                                     // 133
+    // Xbox slots (d3d12_xs_xbox.cpp; evidence and confidence in d3d12_xs_xbox.h).
+    virtual HResult Slot49_SetFeatureToggle_unverified(uint32_t feature, uint32_t value) = 0;           // 49
+    virtual HResult Slot50_RegisterRemovalCallbacks_unverified(uint64_t a, uint64_t b, uint64_t c) = 0;  // 50
+    virtual HResult CreatePipelineStateWithOverrides(InterfaceArg<IPipelineStateHost> base, uint32_t count,
+                                                     uint64_t overrides, const Guid& riid, OutPtr out) = 0;  // 55
+    virtual HResult Slot61_unverified(uint64_t a, uint64_t b) = 0;                                       // 61
+    virtual HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) = 0;                   // 62, 67
+    virtual void CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) = 0;  // 70
+    virtual void CreateUnorderedAccessViewAtAddress(uint64_t resource_desc, uint64_t view_desc,
+                                                    uint64_t dest) = 0;                                  // 71
+    virtual HResult RegisterPagePool_unverified(uint64_t address, uint32_t pages, GuestPtr<uint64_t> handle) = 0;  // 74
+    virtual HResult SetFrameIntervalX(uint64_t output, uint32_t interval_us, uint32_t period, uint32_t flags) = 0;  // 78
+    virtual HResult ScheduleFrameEventX(uint32_t type, uint32_t offset_us, uint64_t reserved, uint32_t flags) = 0;  // 79
+    virtual HResult WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t reserved, uint32_t flags,
+                                    GuestPtr<uint64_t> token) = 0;                                       // 80
+    virtual HResult QueryFrameStatistics_unverified(uint64_t token, uint32_t flags, GuestPtr<uint32_t> count,
+                                                    uint64_t entries) = 0;                               // 81
+    virtual HResult CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& riid, OutPtr out) = 0;  // 86
+    virtual HResult CreateStateObject(uint64_t desc, const Guid& riid, OutPtr out) = 0;                  // 101
+    virtual GuestResourceAllocationInfo GetResourceAllocationInfo1(uint32_t visible_mask, uint32_t count, uint64_t descs,
+                                                                   uint64_t infos) = 0;                  // 108
+    virtual HResult Slot119_unverified(uint64_t buffer, uint32_t size, uint32_t flags) = 0;              // 119
+    virtual HResult Slot132_unverified(uint32_t value) = 0;                                              // 132
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -451,6 +495,7 @@ struct DeviceStats {
 class Resource;
 class Heap;
 class CommandList;
+struct GraphicsPsoSource;
 
 class Device final : public ObjectBase<IDeviceHost> {
 public:
@@ -510,6 +555,46 @@ public:
                                InterfaceArg<IPipelineStateHost> initial_state, const Guid& riid, OutPtr out) override;
     HResult CreateCommittedResource3(com::CallContext& ctx) override;
     HResult CreatePlacedResourceX(com::CallContext& ctx) override;
+    // Xbox slots (d3d12_xs_xbox.cpp).
+    HResult Slot49_SetFeatureToggle_unverified(uint32_t feature, uint32_t value) override;
+    HResult Slot50_RegisterRemovalCallbacks_unverified(uint64_t a, uint64_t b, uint64_t c) override;
+    HResult CreatePipelineStateWithOverrides(InterfaceArg<IPipelineStateHost> base, uint32_t count, uint64_t overrides,
+                                             const Guid& riid, OutPtr out) override;
+    HResult Slot61_unverified(uint64_t a, uint64_t b) override;
+    HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) override;
+    void CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) override;
+    void CreateUnorderedAccessViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) override;
+    HResult RegisterPagePool_unverified(uint64_t address, uint32_t pages, GuestPtr<uint64_t> handle) override;
+    HResult SetFrameIntervalX(uint64_t output, uint32_t interval_us, uint32_t period, uint32_t flags) override;
+    HResult ScheduleFrameEventX(uint32_t type, uint32_t offset_us, uint64_t reserved, uint32_t flags) override;
+    HResult WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t reserved, uint32_t flags,
+                            GuestPtr<uint64_t> token) override;
+    HResult QueryFrameStatistics_unverified(uint64_t token, uint32_t flags, GuestPtr<uint32_t> count,
+                                            uint64_t entries) override;
+    HResult CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& riid, OutPtr out) override;
+    HResult CreateStateObject(uint64_t desc, const Guid& riid, OutPtr out) override;
+    GuestResourceAllocationInfo GetResourceAllocationInfo1(uint32_t visible_mask, uint32_t count, uint64_t descs,
+                                                           uint64_t infos) override;
+    HResult Slot119_unverified(uint64_t buffer, uint32_t size, uint32_t flags) override;
+    HResult Slot132_unverified(uint32_t value) override;
+
+    // ---- Xbox frame model (d3d12_xs_xbox.h) ----
+    xbox::FramePacer& frame_pacer() { return pacer_; }
+    // Wakes every WaitFrameEventX and makes later ones return at once (shutdown, tests).
+    void shutdown_frame_events() { pacer_.shutdown(); }
+    void count(xbox::Counter c, uint64_t n = 1) { xbox_counters_[static_cast<size_t>(c)].fetch_add(n); }
+    uint64_t counter(xbox::Counter c) const { return xbox_counters_[static_cast<size_t>(c)].load(); }
+    // Last frame token passed to ExecuteCommandLists / a present plane (0 = none).
+    std::atomic<uint64_t> last_execute_token{0};
+    std::atomic<uint64_t> last_present_token{0};
+
+    // ---- Pipeline-state creation from host-side descriptions (also used by the Xbox slots) ----
+    HResult create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, const Guid& riid, OutPtr out);
+    HResult create_graphics_pso_from(GraphicsPsoSource source, const Guid& riid, OutPtr out);
+    HResult create_compute_pso(const GuestComputePipelineStateDesc& g, const Guid& riid, OutPtr out);
+    // A pipeline state that binds as "unresolved" (draws skipped) for pipelines the layer cannot
+    // build (mesh shaders, ...): handed out instead of a null pointer the caller would dereference.
+    HResult create_placeholder_pso(const std::string& reason, const Guid& riid, OutPtr out);
 
     // ---- Shaders ----
     // Shader identity (shader_identity(): FNV-1a 64 over the DXIL container bytes the PSO desc passes)
@@ -530,9 +615,14 @@ public:
     void untrack_cpu_buffer(Resource* resource);
     void flush_cpu_buffers(CommandEncoder& encoder);
     // Designates a texture as the presented back buffer: render passes that target it write the
-    // canvas texture (kGpuSwapchainTextureId). The plane layout of PresentX is not established, so
-    // the host (or a test) names the back buffer. False if `resource` is not a 2D texture.
+    // canvas texture (kGpuSwapchainTextureId). PresentX calls it for plane 0's resource the first
+    // time that resource is presented (d3d12_xs_xbox.h). False if `resource` is not a 2D texture.
     bool set_back_buffer(uint64_t resource_interface_pointer);
+    // GPU address windows aliasing CPU memory (the executable reserves a CPU window and a GPU window
+    // of equal size and maps the same pages into both; d3d12_xs_xbox.h). A buffer created at a GPU
+    // address inside a registered window reads its contents from the matching CPU address.
+    void register_gpu_alias(uint64_t gpu_base, uint64_t cpu_base, uint64_t size);
+    uint64_t cpu_address_for_gpu(uint64_t gpu_va) const;  // gpu_va itself outside every window
     void note_upload(uint64_t bytes) { upload_bytes_.fetch_add(bytes, std::memory_order_relaxed); }
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
@@ -596,6 +686,14 @@ private:
     std::atomic<uint64_t> upload_bytes_{0};
     std::atomic<uint64_t> skipped_draws_{0};
     std::atomic<uint64_t> unsupported_copies_{0};
+    xbox::FramePacer pacer_;
+    std::atomic<uint64_t> xbox_counters_[static_cast<size_t>(xbox::Counter::Count)] = {};
+    std::atomic<uint64_t> last_frame_token_{0};
+    struct AliasWindow {
+        uint64_t gpu_base, cpu_base, size;
+    };
+    mutable std::mutex alias_mutex_;
+    std::vector<AliasWindow> aliases_;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -624,12 +722,18 @@ public:
     CommandAllocator(com::Ref<Device> device, uint32_t type);
     ~CommandAllocator() override;
     HResult Reset() override;
+    // Xbox slot 9: the executable registers a callback that hands out memory for the allocator's
+    // command buffers. This layer never writes command buffers into guest memory, so the callback
+    // is only recorded (never called).
+    HResult SetAllocationCallback_unverified(uint64_t callback, uint64_t context) override;
     uint32_t type() const { return type_; }
     uint64_t resets() const { return resets_.load(); }
+    uint64_t allocation_callback() const { return callback_.load(); }
 
 private:
     uint32_t type_;
     std::atomic<uint64_t> resets_{0};
+    std::atomic<uint64_t> callback_{0};
 };
 
 class Fence final : public ChildBase<IFenceHost> {
@@ -711,15 +815,22 @@ public:
     HResult Signal(InterfaceArg<IFenceHost> fence, uint64_t value) override;
     HResult Wait(InterfaceArg<IFenceHost> fence, uint64_t value) override;
     HResult GetTimestampFrequency(GuestPtr<uint64_t> frequency) override;
+    // Xbox slot 32 (d3d12_xs_xbox.cpp): plane 0's first resource is the back buffer.
     HResult PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) override;
-    // Xbox slot 35: (count, command lists, handle, flags); the handle and flags are not interpreted.
+    // Xbox slot 35: (count, command lists, frame token, flags); the token is recorded, the flags are
+    // not interpreted.
     void ExecuteCommandListsX(com::CallContext& ctx) override;
+    HResult SuspendX(uint32_t flags) override;
+    HResult ResumeX() override;
+    HResult Slot31_UpdatePageMappings_unverified(com::CallContext& ctx) override;
+    bool suspended() const { return suspended_.load(); }
     // ExecuteCommandLists semantics for host callers and tests: list interface pointers.
     void execute(const std::vector<uint64_t>& lists);
     const GuestCommandQueueDesc& desc() const { return desc_; }
 
 private:
     GuestCommandQueueDesc desc_;
+    std::atomic<bool> suspended_{false};
 };
 
 // ---------------------------------------------------------------------------------------------

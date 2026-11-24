@@ -53,6 +53,8 @@
 // pending shadow uploads, the list's deferred CPU-sourced copies, then its packet stream, and
 // commits its resource states to the device registry (G6 ResourceStateRegistry::execute).
 
+#include <atomic>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -124,6 +126,7 @@ public:
     void flush_shadow(CommandEncoder& encoder);
     // Marks the texture as the presented back buffer (Device::set_back_buffer).
     void mark_back_buffer();
+    bool is_back_buffer() const { return back_buffer_; }
 
 private:
     GuestResourceDesc desc_;
@@ -136,34 +139,72 @@ private:
     uint64_t owned_guest_memory_ = 0;
     bool gpu_texture_ = false;
     bool tracked_ = false;
+    std::atomic<bool> back_buffer_{false};
     std::vector<uint8_t> shadow_;
 };
+
+// Host-side copy of a graphics pipeline description (Xbox device slot 55 derives new pipeline
+// states from an existing one, so the description must outlive the guest structs it came from).
+struct GraphicsPsoSource {
+    pso::D3D12GraphicsPsoDesc desc{};
+    std::vector<std::string> semantic_names;
+    std::vector<pso::D3D12InputElementDesc> input;
+    com::Ref<RootSignature> root_signature;
+
+    GraphicsPsoSource() = default;
+    GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }
+    GraphicsPsoSource& operator=(const GraphicsPsoSource& other);
+    // Points desc.pInputElementDescs and every SemanticName at this object's own storage.
+    void fix_pointers();
+};
+
+// D3D12 guest struct -> pipeline-cache description (shared by the public and the Xbox creators).
+void convert_blend_desc(const GuestBlendDesc& g, pso::D3D12BlendDesc* out);
+void convert_rasterizer_desc(const GuestRasterizerDesc& g, pso::D3D12RasterizerDesc* out);
+void convert_depth_stencil_desc(const GuestDepthStencilDesc& g, pso::D3D12DepthStencilDesc* out);
 
 class PipelineState final : public ChildBase<IPipelineStateHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12PipelineState";
+    // Guest payload at pso + 0x10. The executable copies these 32 bytes into the command list
+    // (list + 0x544 .. 0x563) before calling SetPipelineState with only `this` (see d3d12_xs_xbox.h):
+    // payload[0] = kPipelineStateTag, payload[1] = the PSO's own interface pointer.
+    static constexpr uint64_t kComPayloadSize = 32;
     PipelineState(com::Ref<Device> device, com::Ref<RootSignature> root_signature);
     ~PipelineState() override;
     HResult GetCachedBlob(OutPtr blob) override;
 
+    // Writes the guest payload (must run once right after create_object).
+    void initialize_guest_payload();
     bool is_compute() const { return compute_ != nullptr; }
     bool resolved() const { return resolved_; }
     bridge::GraphicsPipelineState* graphics() const { return graphics_.get(); }
     bridge::ComputePipelineState* compute() const { return compute_.get(); }
     const std::vector<uint64_t>& shader_identities() const { return identities_; }
+    // Graphics description (null for compute and placeholder pipeline states).
+    const GraphicsPsoSource* graphics_source() const { return source_.get(); }
+    // Why a placeholder was created instead of a pipeline (mesh shaders, ...); empty otherwise.
+    const std::string& unsupported_reason() const { return unsupported_; }
 
 private:
     friend class Device;
     com::Ref<RootSignature> root_signature_;
     std::unique_ptr<bridge::GraphicsPipelineState> graphics_;
     std::unique_ptr<bridge::ComputePipelineState> compute_;
+    std::unique_ptr<GraphicsPsoSource> source_;
     std::vector<uint64_t> identities_;
+    std::string unsupported_;
     bool resolved_ = false;
 };
 
 class CommandList final : public ChildBase<IGraphicsCommandListHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12GraphicsCommandList";
+    // Guest payload at list + 0x10, zero-filled (layout: d3d12_xs_xbox.h, "inlined command-list
+    // accesses"): the title's inlined fast paths compare write cursors at list + 0x18 / 0x28 / 0x30,
+    // which stay zero so every call takes the vtable path, and it stages pipeline states at
+    // list + 0x544.
+    static constexpr uint64_t kComPayloadSize = 0x580;
     CommandList(com::Ref<Device> device, uint32_t type);
     ~CommandList() override;
 
@@ -215,6 +256,13 @@ public:
     void QueryOperation(com::CallContext& ctx) override;
     void SetPredication(com::CallContext&) override {}
     void DebugMarker(com::CallContext&) override {}
+    // Xbox slots (d3d12_xs_xbox.cpp).
+    void SetPipelineStateX(com::CallContext& ctx) override;
+    void ExecuteIndirect(com::CallContext& ctx) override;
+    void OMSetDepthBounds(float min_depth, float max_depth) override;
+    void RSSetShadingRate(uint32_t rate, uint64_t combiners) override;
+    void RSSetShadingRateImage(InterfaceArg<IResourceHost> image) override;
+    void note_xbox_slot(uint32_t slot) override;
 
     // ---- Runtime side ----
     bool is_open() const { return open_; }
@@ -227,6 +275,10 @@ public:
 
     // Reset with a host PSO (initial state at creation).
     void reset(PipelineState* initial_state);
+    // Calls of Xbox-specific slots recorded without effect (slot -> count).
+    std::vector<std::pair<uint32_t, uint64_t>> xbox_slot_calls() const;
+    // Must run once right after create_object (zero-fills the guest payload).
+    void initialize_guest_payload();
 
 private:
     struct DeferredWrite {
@@ -252,6 +304,7 @@ private:
     std::vector<com::Ref<com::ComObject>> pinned_;  // objects referenced by the recording
     std::vector<DeferredWrite> deferred_;
     uint64_t diag_count_ = 0;
+    std::map<uint32_t, uint64_t> xbox_calls_;
 };
 
 extern const com::Interface<IResourceHost> kID3D12Resource;

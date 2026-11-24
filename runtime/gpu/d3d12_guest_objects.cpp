@@ -504,6 +504,18 @@ HResult Device::CheckFeatureSupport(uint32_t feature, uint64_t data, uint32_t si
         const uint32_t highest = std::min<uint32_t>(requested, 0x3u);
         return fill(&highest, 4);
     }
+    case 27: {  // OPTIONS5 { SRVOnlyTiledResourceTier3, RenderPassesTier, RaytracingTier }
+        const uint32_t o[3] = {0, 0, 0};  // no ray tracing (d3d12_xs_xbox.h)
+        return fill(o, sizeof(o));
+    }
+    case 30: {  // OPTIONS6 { AdditionalShadingRates, PerPrimitiveVRS..., VariableShadingRateTier, ... }
+        const uint32_t o[5] = {0, 0, 0, 0, 0};  // no variable-rate shading: full-rate output
+        return fill(o, sizeof(o));
+    }
+    case 32: {  // OPTIONS7 { MeshShaderTier, SamplerFeedbackTier }
+        const uint32_t o[2] = {0, 0};
+        return fill(o, sizeof(o));
+    }
     default:
         note_bad_argument("CheckFeatureSupport: feature " + std::to_string(feature) + " not answered");
         return kEInvalidArg;
@@ -999,15 +1011,6 @@ HResult CommandQueue::GetTimestampFrequency(GuestPtr<uint64_t> frequency) {
     return kSOk;
 }
 
-HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t, uint64_t) {
-    // The plane / present parameter layouts are not established (see the header): only the plane
-    // count is interpreted. A present with planes ends the frame (Present packet).
-    if (plane_count != 0) {
-        device_->present();
-    }
-    return kSOk;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Root signature reader
 // ---------------------------------------------------------------------------------------------
@@ -1194,44 +1197,44 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),                                                          // 46
     DevM::stub(nullptr),                                                          // 47
     DevM::method<&IDeviceHost::CreateCommandQueueX>("CreateCommandQueue (Xbox slot 48)"),  // 48
-    DevM::stub(nullptr),  // 49
-    DevM::stub(nullptr),  // 50
+    DevM::method<&IDeviceHost::Slot49_SetFeatureToggle_unverified>("Xbox slot 49 (feature toggle)"),  // 49
+    DevM::method<&IDeviceHost::Slot50_RegisterRemovalCallbacks_unverified>("Xbox slot 50"),  // 50
     DevM::stub(nullptr),  // 51
     DevM::stub(nullptr),  // 52
     DevM::stub(nullptr),  // 53
     DevM::stub(nullptr),  // 54
-    DevM::stub(nullptr),  // 55
+    DevM::method<&IDeviceHost::CreatePipelineStateWithOverrides>("CreatePipelineStateWithOverrides (Xbox slot 55)"),  // 55
     DevM::stub(nullptr),  // 56
-    DevM::stub(nullptr),  // 57
+    DevM::method<&IDeviceHost::CreateComputePipelineState>("CreateComputePipelineState (Xbox slot 57)"),  // 57
     DevM::stub(nullptr),  // 58
     DevM::stub(nullptr),  // 59
     DevM::stub(nullptr),  // 60
-    DevM::stub(nullptr),  // 61
-    DevM::stub(nullptr),  // 62
+    DevM::method<&IDeviceHost::Slot61_unverified>("Xbox slot 61"),  // 61
+    DevM::method<&IDeviceHost::CreatePipelineStateFromBlob_unverified>("PSO from title blob (Xbox slot 62)"),  // 62
     DevM::stub(nullptr),  // 63
     DevM::stub(nullptr),  // 64
     DevM::stub(nullptr),  // 65
     DevM::stub(nullptr),  // 66
-    DevM::stub(nullptr),  // 67
+    DevM::method<&IDeviceHost::CreatePipelineStateFromBlob_unverified>("PSO from title blob (Xbox slot 67)"),  // 67
     DevM::stub(nullptr),  // 68
     DevM::stub(nullptr),  // 69
-    DevM::stub(nullptr),  // 70
-    DevM::stub(nullptr),  // 71
+    DevM::method<&IDeviceHost::CreateShaderResourceViewAtAddress>("SRV at address (Xbox slot 70)"),  // 70
+    DevM::method<&IDeviceHost::CreateUnorderedAccessViewAtAddress>("UAV at address (Xbox slot 71)"),  // 71
     DevM::stub(nullptr),  // 72
     DevM::method<&IDeviceHost::CreateCommandListX>("CreateCommandList (Xbox slot 73)"),  // 73
-    DevM::stub(nullptr),  // 74
+    DevM::method<&IDeviceHost::RegisterPagePool_unverified>("page pool (Xbox slot 74)"),  // 74
     DevM::stub(nullptr),  // 75
     DevM::stub(nullptr),  // 76
     DevM::stub(nullptr),  // 77
-    DevM::stub(nullptr),  // 78
-    DevM::stub(nullptr),  // 79
-    DevM::stub(nullptr),  // 80
-    DevM::stub(nullptr),  // 81
+    DevM::method<&IDeviceHost::SetFrameIntervalX>("SetFrameIntervalX (Xbox slot 78)"),  // 78
+    DevM::method<&IDeviceHost::ScheduleFrameEventX>("ScheduleFrameEventX (Xbox slot 79)"),  // 79
+    DevM::method<&IDeviceHost::WaitFrameEventX>("WaitFrameEventX (Xbox slot 80)"),  // 80
+    DevM::method<&IDeviceHost::QueryFrameStatistics_unverified>("frame statistics (Xbox slot 81)"),  // 81
     DevM::stub(nullptr),  // 82
     DevM::stub(nullptr),  // 83
     DevM::stub(nullptr),  // 84
     DevM::stub(nullptr),  // 85
-    DevM::stub(nullptr),  // 86
+    DevM::method<&IDeviceHost::CreatePipelineStateFromStream>("CreatePipelineState stream (Xbox slot 86)"),  // 86
     DevM::stub(nullptr),  // 87
     DevM::stub(nullptr),  // 88
     DevM::stub(nullptr),  // 89
@@ -1246,14 +1249,14 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),  // 98
     DevM::stub(nullptr),  // 99
     DevM::stub(nullptr),  // 100
-    DevM::stub(nullptr),  // 101
+    DevM::method<&IDeviceHost::CreateStateObject>("CreateStateObject (Xbox slot 101)"),  // 101
     DevM::stub(nullptr),  // 102
     DevM::stub(nullptr),  // 103
     DevM::stub(nullptr),  // 104
     DevM::stub(nullptr),  // 105
     DevM::stub(nullptr),  // 106
     DevM::stub(nullptr),  // 107
-    DevM::stub(nullptr),  // 108
+    DevM::sret<&IDeviceHost::GetResourceAllocationInfo1>("GetResourceAllocationInfo1 (Xbox slot 108)"),  // 108
     DevM::stub(nullptr),  // 109
     DevM::stub(nullptr),  // 110
     DevM::stub(nullptr),  // 111
@@ -1264,7 +1267,7 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),  // 116
     DevM::stub(nullptr),  // 117
     DevM::stub(nullptr),  // 118
-    DevM::stub(nullptr),  // 119
+    DevM::method<&IDeviceHost::Slot119_unverified>("Xbox slot 119"),  // 119
     DevM::stub(nullptr),  // 120
     DevM::stub(nullptr),  // 121
     DevM::stub(nullptr),  // 122
@@ -1277,7 +1280,7 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),  // 129
     DevM::stub(nullptr),  // 130
     DevM::stub(nullptr),  // 131
-    DevM::stub(nullptr),  // 132
+    DevM::method<&IDeviceHost::Slot132_unverified>("Xbox slot 132"),  // 132
     DevM::method<&IDeviceHost::CreatePlacedResourceX>("CreatePlacedResource (Xbox slot 133)"),  // 133
 };
 constexpr Guid kDeviceIids[] = {
@@ -1308,9 +1311,11 @@ constexpr com::MethodDesc kQueueMethods[] = {
     QueueM::method<&ICommandQueueHost::Wait>("Wait"),                               // 17
     QueueM::method<&ICommandQueueHost::GetTimestampFrequency>("GetTimestampFrequency"),  // 18
     QueueM::stub(nullptr), QueueM::stub(nullptr), QueueM::stub(nullptr), QueueM::stub(nullptr),  // 19..22
-    QueueM::stub(nullptr), QueueM::stub(nullptr), QueueM::stub(nullptr), QueueM::stub(nullptr),  // 23..26
+    QueueM::method<&ICommandQueueHost::SuspendX>("SuspendX (Xbox slot 23)"),        // 23
+    QueueM::method<&ICommandQueueHost::ResumeX>("ResumeX (Xbox slot 24)"),          // 24
+    QueueM::stub(nullptr), QueueM::stub(nullptr),                                   // 25..26
     QueueM::stub(nullptr), QueueM::stub(nullptr), QueueM::stub(nullptr), QueueM::stub(nullptr),  // 27..30
-    QueueM::stub(nullptr),                                                          // 31
+    QueueM::method<&ICommandQueueHost::Slot31_UpdatePageMappings_unverified>("page mappings (Xbox slot 31)"),  // 31
     QueueM::method<&ICommandQueueHost::PresentX>("PresentX (Xbox slot 32)"),        // 32
     QueueM::stub(nullptr), QueueM::stub(nullptr),                                   // 33..34
     QueueM::method<&ICommandQueueHost::ExecuteCommandListsX>("ExecuteCommandLists (Xbox slot 35)"),  // 35
@@ -1325,6 +1330,7 @@ constexpr com::MethodDesc kAllocatorMethods[] = {
     AllocM::method<&IObjectHost::SetName>("SetName"),
     AllocM::method<&IDeviceChildHost::GetDevice>("GetDevice"),
     AllocM::method<&ICommandAllocatorHost::Reset>("Reset"),  // 8
+    AllocM::method<&ICommandAllocatorHost::SetAllocationCallback_unverified>("allocation callback (Xbox slot 9)"),  // 9
 };
 constexpr Guid kPageableIids[] = {IID_ID3D12Object, IID_ID3D12DeviceChild, IID_ID3D12Pageable};
 

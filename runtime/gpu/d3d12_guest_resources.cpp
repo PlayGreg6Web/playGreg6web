@@ -216,8 +216,9 @@ bool Resource::initialize() {
         const uint64_t size = desc_.Width;
         if (placement_.address != 0) {
             gpu_va_ = placement_.address;
-            if (com::guest_to_host(placement_.address, static_cast<size_t>(size)) != nullptr) {
-                cpu_va_ = placement_.address;
+            const uint64_t cpu = dev.cpu_address_for_gpu(placement_.address);
+            if (com::guest_to_host(cpu, static_cast<size_t>(size)) != nullptr) {
+                cpu_va_ = cpu;
             } else {
                 dev.note_bad_argument("resource at " + hex(placement_.address) +
                                       " is not guest memory: contents cannot be uploaded");
@@ -321,6 +322,7 @@ void Resource::mark_back_buffer() {
     info.dimension = GpuTextureDimension::Dim2D;
     info.swapchain = true;
     device_->state_bridge().register_texture(id_, info);
+    back_buffer_.store(true);
 }
 
 void Resource::flush_shadow(CommandEncoder& encoder) {
@@ -882,18 +884,99 @@ com::Ref<RootSignature> root_signature_ref(uint64_t va) {
 
 }  // namespace
 
+GraphicsPsoSource& GraphicsPsoSource::operator=(const GraphicsPsoSource& other) {
+    if (this != &other) {
+        desc = other.desc;
+        semantic_names = other.semantic_names;
+        input = other.input;
+        root_signature = other.root_signature;
+        fix_pointers();
+    }
+    return *this;
+}
+
+void GraphicsPsoSource::fix_pointers() {
+    for (size_t i = 0; i < input.size() && i < semantic_names.size(); ++i) {
+        input[i].SemanticName = semantic_names[i].c_str();
+    }
+    desc.pInputElementDescs = input.empty() ? nullptr : input.data();
+    desc.NumInputElements = static_cast<uint32_t>(input.size());
+}
+
+void convert_blend_desc(const GuestBlendDesc& g, pso::D3D12BlendDesc* out) {
+    out->AlphaToCoverageEnable = g.AlphaToCoverageEnable != 0;
+    out->IndependentBlendEnable = g.IndependentBlendEnable != 0;
+    for (int i = 0; i < 8; ++i) {
+        const GuestRenderTargetBlendDesc& s = g.RenderTarget[i];
+        pso::D3D12RenderTargetBlendDesc& t = out->RenderTarget[i];
+        t.BlendEnable = s.BlendEnable != 0;
+        t.LogicOpEnable = s.LogicOpEnable != 0;
+        t.SrcBlend = static_cast<pso::D3D12Blend>(s.SrcBlend);
+        t.DestBlend = static_cast<pso::D3D12Blend>(s.DestBlend);
+        t.BlendOp = static_cast<pso::D3D12BlendOp>(s.BlendOp);
+        t.SrcBlendAlpha = static_cast<pso::D3D12Blend>(s.SrcBlendAlpha);
+        t.DestBlendAlpha = static_cast<pso::D3D12Blend>(s.DestBlendAlpha);
+        t.BlendOpAlpha = static_cast<pso::D3D12BlendOp>(s.BlendOpAlpha);
+        t.LogicOp = static_cast<pso::D3D12LogicOp>(s.LogicOp);
+        t.RenderTargetWriteMask = s.RenderTargetWriteMask;
+    }
+}
+
+void convert_rasterizer_desc(const GuestRasterizerDesc& r, pso::D3D12RasterizerDesc* out) {
+    out->FillMode = static_cast<pso::D3D12FillMode>(r.FillMode);
+    out->CullMode = static_cast<pso::D3D12CullMode>(r.CullMode);
+    out->FrontCounterClockwise = r.FrontCounterClockwise != 0;
+    out->DepthBias = r.DepthBias;
+    out->DepthBiasClamp = r.DepthBiasClamp;
+    out->SlopeScaledDepthBias = r.SlopeScaledDepthBias;
+    out->DepthClipEnable = r.DepthClipEnable != 0;
+    out->MultisampleEnable = r.MultisampleEnable != 0;
+    out->AntialiasedLineEnable = r.AntialiasedLineEnable != 0;
+    out->ForcedSampleCount = r.ForcedSampleCount;
+    out->ConservativeRaster = static_cast<pso::D3D12ConservativeRasterizationMode>(r.ConservativeRaster);
+}
+
+void convert_depth_stencil_desc(const GuestDepthStencilDesc& ds, pso::D3D12DepthStencilDesc* out) {
+    out->DepthEnable = ds.DepthEnable != 0;
+    out->DepthWriteMask = static_cast<pso::D3D12DepthWriteMask>(ds.DepthWriteMask);
+    out->DepthFunc = static_cast<pso::D3D12ComparisonFunc>(ds.DepthFunc);
+    out->StencilEnable = ds.StencilEnable != 0;
+    out->StencilReadMask = ds.StencilReadMask;
+    out->StencilWriteMask = ds.StencilWriteMask;
+    auto op = [](const GuestDepthStencilOpDesc& s) {
+        pso::D3D12DepthStencilOpDesc o;
+        o.StencilFailOp = static_cast<pso::D3D12StencilOp>(s.StencilFailOp);
+        o.StencilDepthFailOp = static_cast<pso::D3D12StencilOp>(s.StencilDepthFailOp);
+        o.StencilPassOp = static_cast<pso::D3D12StencilOp>(s.StencilPassOp);
+        o.StencilFunc = static_cast<pso::D3D12ComparisonFunc>(s.StencilFunc);
+        return o;
+    };
+    out->FrontFace = op(ds.FrontFace);
+    out->BackFace = op(ds.BackFace);
+}
+
+void PipelineState::initialize_guest_payload() {
+    const uint64_t payload[2] = {xbox::kPipelineStateTag, identity()};
+    com::write_guest(payload_address(), payload, sizeof(payload));
+}
+
 HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, OutPtr out) {
     GuestGraphicsPipelineStateDesc g{};
     if (desc_va == 0 || !com::read_guest(desc_va, g)) {
         note_bad_argument("CreateGraphicsPipelineState: unreadable descriptor");
         return kEInvalidArg;
     }
-    com::Ref<RootSignature> rs = root_signature_ref(g.pRootSignature);
-    if (g.pRootSignature != 0 && !rs) {
+    return create_graphics_pso(g, riid, out);
+}
+
+HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, const Guid& riid, OutPtr out) {
+    GraphicsPsoSource src;
+    src.root_signature = root_signature_ref(g.pRootSignature);
+    if (g.pRootSignature != 0 && !src.root_signature) {
         note_bad_argument("CreateGraphicsPipelineState: invalid root signature " + hex(g.pRootSignature));
         return kEInvalidArg;
     }
-    pso::D3D12GraphicsPsoDesc d{};
+    pso::D3D12GraphicsPsoDesc& d = src.desc;
     if (!read_shader(*this, g.VS, "VS", &d.vs) || !read_shader(*this, g.PS, "PS", &d.ps) ||
         !read_shader(*this, g.DS, "DS", &d.ds) || !read_shader(*this, g.HS, "HS", &d.hs) ||
         !read_shader(*this, g.GS, "GS", &d.gs)) {
@@ -907,58 +990,15 @@ HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, 
         note_bad_argument("CreateGraphicsPipelineState: out-of-range counts or topology type");
         return kEInvalidArg;
     }
-    d.root_signature_id = rs ? static_cast<uint32_t>(rs->signature().hash()) : 0u;
     d.stream_output_enabled = g.StreamOutput.NumEntries > 0;
-    d.BlendState.AlphaToCoverageEnable = g.BlendState.AlphaToCoverageEnable != 0;
-    d.BlendState.IndependentBlendEnable = g.BlendState.IndependentBlendEnable != 0;
-    for (int i = 0; i < 8; ++i) {
-        const GuestRenderTargetBlendDesc& s = g.BlendState.RenderTarget[i];
-        pso::D3D12RenderTargetBlendDesc& t = d.BlendState.RenderTarget[i];
-        t.BlendEnable = s.BlendEnable != 0;
-        t.LogicOpEnable = s.LogicOpEnable != 0;
-        t.SrcBlend = static_cast<pso::D3D12Blend>(s.SrcBlend);
-        t.DestBlend = static_cast<pso::D3D12Blend>(s.DestBlend);
-        t.BlendOp = static_cast<pso::D3D12BlendOp>(s.BlendOp);
-        t.SrcBlendAlpha = static_cast<pso::D3D12Blend>(s.SrcBlendAlpha);
-        t.DestBlendAlpha = static_cast<pso::D3D12Blend>(s.DestBlendAlpha);
-        t.BlendOpAlpha = static_cast<pso::D3D12BlendOp>(s.BlendOpAlpha);
-        t.LogicOp = static_cast<pso::D3D12LogicOp>(s.LogicOp);
-        t.RenderTargetWriteMask = s.RenderTargetWriteMask;
-    }
+    convert_blend_desc(g.BlendState, &d.BlendState);
     d.SampleMask = g.SampleMask;
-    const GuestRasterizerDesc& r = g.RasterizerState;
-    d.RasterizerState.FillMode = static_cast<pso::D3D12FillMode>(r.FillMode);
-    d.RasterizerState.CullMode = static_cast<pso::D3D12CullMode>(r.CullMode);
-    d.RasterizerState.FrontCounterClockwise = r.FrontCounterClockwise != 0;
-    d.RasterizerState.DepthBias = r.DepthBias;
-    d.RasterizerState.DepthBiasClamp = r.DepthBiasClamp;
-    d.RasterizerState.SlopeScaledDepthBias = r.SlopeScaledDepthBias;
-    d.RasterizerState.DepthClipEnable = r.DepthClipEnable != 0;
-    d.RasterizerState.MultisampleEnable = r.MultisampleEnable != 0;
-    d.RasterizerState.AntialiasedLineEnable = r.AntialiasedLineEnable != 0;
-    d.RasterizerState.ForcedSampleCount = r.ForcedSampleCount;
-    d.RasterizerState.ConservativeRaster = static_cast<pso::D3D12ConservativeRasterizationMode>(r.ConservativeRaster);
-    const GuestDepthStencilDesc& ds = g.DepthStencilState;
-    d.DepthStencilState.DepthEnable = ds.DepthEnable != 0;
-    d.DepthStencilState.DepthWriteMask = static_cast<pso::D3D12DepthWriteMask>(ds.DepthWriteMask);
-    d.DepthStencilState.DepthFunc = static_cast<pso::D3D12ComparisonFunc>(ds.DepthFunc);
-    d.DepthStencilState.StencilEnable = ds.StencilEnable != 0;
-    d.DepthStencilState.StencilReadMask = ds.StencilReadMask;
-    d.DepthStencilState.StencilWriteMask = ds.StencilWriteMask;
-    auto op = [](const GuestDepthStencilOpDesc& s) {
-        pso::D3D12DepthStencilOpDesc o;
-        o.StencilFailOp = static_cast<pso::D3D12StencilOp>(s.StencilFailOp);
-        o.StencilDepthFailOp = static_cast<pso::D3D12StencilOp>(s.StencilDepthFailOp);
-        o.StencilPassOp = static_cast<pso::D3D12StencilOp>(s.StencilPassOp);
-        o.StencilFunc = static_cast<pso::D3D12ComparisonFunc>(s.StencilFunc);
-        return o;
-    };
-    d.DepthStencilState.FrontFace = op(ds.FrontFace);
-    d.DepthStencilState.BackFace = op(ds.BackFace);
-    // Input layout: semantic names are guest strings; they only need to live through the create call.
+    convert_rasterizer_desc(g.RasterizerState, &d.RasterizerState);
+    convert_depth_stencil_desc(g.DepthStencilState, &d.DepthStencilState);
+    // Input layout: semantic names are guest strings, copied into the source.
     std::vector<GuestInputElementDesc> elements(g.InputLayout.NumElements);
-    std::vector<std::string> names(g.InputLayout.NumElements);
-    std::vector<pso::D3D12InputElementDesc> input(g.InputLayout.NumElements);
+    src.semantic_names.assign(g.InputLayout.NumElements, std::string());
+    src.input.assign(g.InputLayout.NumElements, pso::D3D12InputElementDesc{});
     for (uint32_t i = 0; i < g.InputLayout.NumElements; ++i) {
         if (!com::read_guest(g.InputLayout.pInputElementDescs + sizeof(GuestInputElementDesc) * i, elements[i])) {
             note_bad_argument("CreateGraphicsPipelineState: unreadable input element " + std::to_string(i));
@@ -973,21 +1013,19 @@ HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, 
             if (ch == 0) {
                 break;
             }
-            names[i].push_back(ch);
+            src.semantic_names[i].push_back(ch);
         }
     }
     for (uint32_t i = 0; i < g.InputLayout.NumElements; ++i) {
         const GuestInputElementDesc& e = elements[i];
-        input[i].SemanticName = names[i].c_str();
-        input[i].SemanticIndex = e.SemanticIndex;
-        input[i].Format = static_cast<pso::DxgiFormat>(e.Format);
-        input[i].InputSlot = e.InputSlot;
-        input[i].AlignedByteOffset = e.AlignedByteOffset;
-        input[i].InputSlotClass = static_cast<pso::D3D12InputClassification>(e.InputSlotClass);
-        input[i].InstanceDataStepRate = e.InstanceDataStepRate;
+        pso::D3D12InputElementDesc& t = src.input[i];
+        t.SemanticIndex = e.SemanticIndex;
+        t.Format = static_cast<pso::DxgiFormat>(e.Format);
+        t.InputSlot = e.InputSlot;
+        t.AlignedByteOffset = e.AlignedByteOffset;
+        t.InputSlotClass = static_cast<pso::D3D12InputClassification>(e.InputSlotClass);
+        t.InstanceDataStepRate = e.InstanceDataStepRate;
     }
-    d.pInputElementDescs = input.empty() ? nullptr : input.data();
-    d.NumInputElements = g.InputLayout.NumElements;
     d.IBStripCutValue = static_cast<pso::D3D12IndexBufferStripCutValue>(g.IBStripCutValue);
     d.PrimitiveTopologyType = static_cast<pso::D3D12PrimitiveTopologyType>(g.PrimitiveTopologyType);
     d.NumRenderTargets = g.NumRenderTargets;
@@ -997,11 +1035,19 @@ HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, 
     d.DSVFormat = static_cast<pso::DxgiFormat>(g.DSVFormat);
     d.SampleDesc.Count = g.SampleCount;
     d.SampleDesc.Quality = g.SampleQuality;
+    return create_graphics_pso_from(std::move(src), riid, out);
+}
 
+HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& riid, OutPtr out) {
+    auto src = std::make_unique<GraphicsPsoSource>(source);  // copy: fixes the internal pointers
+    const com::Ref<RootSignature>& rs = src->root_signature;
+    pso::D3D12GraphicsPsoDesc& d = src->desc;
+    d.root_signature_id = rs ? static_cast<uint32_t>(rs->signature().hash()) : 0u;
     auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
     if (!state) {
         return kEOutOfMemory;
     }
+    state->initialize_guest_payload();
     state->graphics_ = bridge_->create_graphics_pipeline_state(d, rs ? &rs->signature() : nullptr);
     state->identities_ = {d.vs, d.ps};
     state->resolved_ = (state->graphics_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
@@ -1012,6 +1058,19 @@ HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, 
             }
         }
     }
+    state->source_ = std::move(src);
+    return hand_out(std::move(state), riid, out);
+}
+
+HResult Device::create_placeholder_pso(const std::string& reason, const Guid& riid, OutPtr out) {
+    auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this),
+                                                   com::Ref<RootSignature>{});
+    if (!state) {
+        return kEOutOfMemory;
+    }
+    state->initialize_guest_payload();
+    state->unsupported_ = reason;
+    note_bad_argument("pipeline state not supported (" + reason + "): draws with it are skipped");
     return hand_out(std::move(state), riid, out);
 }
 
@@ -1021,6 +1080,10 @@ HResult Device::CreateComputePipelineState(uint64_t desc_va, const Guid& riid, O
         note_bad_argument("CreateComputePipelineState: unreadable descriptor");
         return kEInvalidArg;
     }
+    return create_compute_pso(g, riid, out);
+}
+
+HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const Guid& riid, OutPtr out) {
     com::Ref<RootSignature> rs = root_signature_ref(g.pRootSignature);
     if (g.pRootSignature != 0 && !rs) {
         note_bad_argument("CreateComputePipelineState: invalid root signature " + hex(g.pRootSignature));
@@ -1039,6 +1102,7 @@ HResult Device::CreateComputePipelineState(uint64_t desc_va, const Guid& riid, O
     if (!state) {
         return kEOutOfMemory;
     }
+    state->initialize_guest_payload();
     state->compute_ = bridge_->create_compute_pipeline_state(d, rs ? &rs->signature() : nullptr);
     state->identities_ = {d.cs};
     state->resolved_ = (state->compute_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
