@@ -1746,7 +1746,8 @@ void test_compute_views_and_public_list() {
 namespace XSlot {
 // ID3D12Device (Xbox)
 constexpr uint32_t FeatureToggle = 49, RemovalCallbacks = 50, CreatePsoWithOverrides = 55, CreateNativePso = 57,
-                   Slot61 = 61, PsoFromBlob = 62, PsoFromBlobCached = 67, SrvAtAddress = 70, UavAtAddress = 71,
+                   Slot61 = 61, PsoFromBlob = 62 /* compute, DXIL */, PsoFromBlobCached = 67 /* native compute */,
+                   SrvAtAddress = 70, UavAtAddress = 71,
                    PagePool = 74, SetFrameInterval = 78, ScheduleFrameEvent = 79, WaitFrameEvent = 80,
                    FrameStatistics = 81, CreatePsoStream = 86, CreateStateObject = 101, AllocationInfo1 = 108,
                    Slot119 = 119, Slot132 = 132;
@@ -2100,12 +2101,25 @@ void test_xbox_pipeline_streams_and_overrides() {
                     &result) == 0 &&
           result == dg::kEInvalidArg);
 
-    // Title-blob PSOs (62, 67) and ray-tracing state objects (101) are refused with a null out.
-    const uint64_t out62 = put<uint64_t>(0);
+    // Slot 62: (D3D12_COMPUTE_PIPELINE_STATE_DESC, 0, 0, riid, out) creates a compute PSO from the
+    // DXIL; the two unknown arguments are reported when not zero.
+    const uint64_t cpso62 = fx.create(scene.device, XSlot::PsoFromBlob, {I(put(cd)), I(0), I(0)},
+                                      dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && cpso62 != 0);
+    auto* c62 = object_of<dg::PipelineState>(cpso62);
+    CHECK(c62->is_compute() && c62->resolved() &&
+          (c62->shader_identities() == std::vector<uint64_t>{dg::shader_identity(cs.data(), cs.size())}));
+    CHECK(load64(cpso62 + 0x10) == dg::xbox::kPipelineStateTag);
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    const uint64_t cpso62b = fx.create(scene.device, XSlot::PsoFromBlob, {I(put(cd)), I(7), I(0)},
+                                       dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && cpso62b != 0 && dev->stats().bad_arguments == bad_before + 1);
+    CHECK(counter(dev, dg::xbox::Counter::ComputePipelineStatesX) == 2);
+    const uint64_t out62 = put<uint64_t>(0x1234);
     CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlob,
-                      {I(put<uint64_t>(0)), I(0), I(0), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out62)})) ==
-          dg::kENotImpl);
+                      {I(0), I(0), I(0), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out62)})) == dg::kEInvalidArg);
     CHECK(load64(out62) == 0);
+    // Slot 67 (console-native compute) and ray-tracing state objects (101) are refused with a null out.
     const uint64_t out67 = put<uint64_t>(0);
     CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlobCached,
                       {I(put<uint64_t>(0)), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out67)})) == dg::kENotImpl);
@@ -2120,7 +2134,7 @@ void test_xbox_pipeline_streams_and_overrides() {
     CHECK(load32(opts5 + 8) == 0);
 
     CHECK(t_balanced);
-    scene.release_all({list, pso, derived, cpso, cpso57, mpso});
+    scene.release_all({list, pso, derived, cpso, cpso57, cpso62, cpso62b, mpso});
 }
 
 // G32: console-native pipelines (Xbox slot 57). Synthetic records built from the range layout in

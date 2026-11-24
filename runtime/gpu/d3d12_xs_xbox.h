@@ -43,11 +43,13 @@
 //   57    1    (desc, IID_ID3D12PipelineState, out): a console-native graphics pipeline
 //              (GuestNativePipelineDesc below)                    native PSO, unresolved (high shape)
 //   61    1    (a, b); ignored                                     S_OK no-op (low)
-//   62    1    (desc, 0, 0, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC with a DXIL
-//              compute shader; failure frees the bytecode and returns false
+//   62    1    (desc, 0, 0, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (NodeMask 1, no
+//              cached PSO, flags 0) with a DXIL compute shader (program kind 5) in every call;
+//              failure frees the bytecode and returns false
+//                                                                 CreateComputePipelineState (high)
 //   67    1    (&desc, riid, out) from a PSO cache: a console-native compute pipeline (root
 //              signature + {address, size} ranges like slot 57); failure falls back to slot 62
-//              Both refused (E_NOTIMPL, *out = 0).
+//                                                                 refused: E_NOTIMPL, *out = 0 (high)
 //   70    2+   (RESOURCE_DESC (buffer), SRV desc + u64 GPU address at +0x28, CPU handle)
 //   71    2    (RESOURCE_DESC, UAV desc + u64 GPU address at +0x28, CPU handle)
 //              Buffer views at a GPU address without a resource object (high shape): resolved
@@ -157,7 +159,9 @@
 // unresolved: binding it diagnoses, its draws are skipped (counted, described once). Slot 55 on
 // such a base hands the base out (its overrides cannot be applied to an undecoded state; counted).
 // Slot 67 has the same shape for compute (28-byte header, {code, metadata} ranges) and is refused,
-// which makes the title fall back to slot 62 with the DXIL compute shader.
+// which makes the title fall back to slot 62 with the DXIL compute shader: 2,689 calls each, the
+// two alternating; 2,436 distinct DXIL compute containers (568 bytes .. over 64 KiB). Slot 62
+// creates ordinary compute pipeline states from them (the shader track's DXIL path applies).
 
 // Raytracing
 // ----------
@@ -347,7 +351,8 @@ enum class Counter : size_t {
     NativeOverridesIgnored,      // slot 55 override entries on a native base
     PlaceholderPipelineStates,
     UnknownOverrideKinds,
-    BlobPipelineStatesRefused,
+    ComputePipelineStatesX,      // slot 62 (DXIL)
+    BlobPipelineStatesRefused,   // slot 67 (console-native compute)
     StateObjectsRefused,
     ViewsAtAddress,
     PagePools,

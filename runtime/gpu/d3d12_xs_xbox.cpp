@@ -484,18 +484,43 @@ HResult Device::RegisterPagePool_unverified(uint64_t, uint32_t, GuestPtr<uint64_
     return kSOk;
 }
 
-HResult Device::CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) {
-    // Slot 62: (desc, 0, 0, riid, out) -> out at position 5; slot 67: (&desc, riid, out) -> out at 3.
-    // The blob format is the title's own: refuse and clear whichever out pointer is a valid
-    // pointer to a null-initialised slot (both callers take their failure path).
-    count(xbox::Counter::BlobPipelineStatesRefused);
-    for (unsigned pos : {3u, 5u}) {
-        const uint64_t out = ctx.int_arg(pos);
-        uint64_t current = 1;
-        if (out != 0 && com::read_guest(out, &current, sizeof(current)) && current == 0) {
-            const uint64_t zero = 0;
-            com::write_guest(out, &zero, sizeof(zero));
+HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
+    // Slot 62: (desc, a, b, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (DXIL compute
+    // shader). a and b were always 0; other values are recorded and otherwise ignored.
+    const uint64_t desc_va = ctx.int_arg(1);
+    const uint64_t a = ctx.int_arg(2), b = ctx.int_arg(3);
+    OutPtr out(ctx.int_arg(5));
+    Guid riid{};
+    GuestComputePipelineStateDesc g{};
+    if (desc_va == 0 || !com::read_guest(desc_va, g) || !com::read_guest(ctx.int_arg(4), riid)) {
+        note_bad_argument("CreateComputePipelineState (Xbox slot 62): unreadable descriptor or interface id");
+        if (out) {
+            out.write(0);
         }
+        return kEInvalidArg;
+    }
+    if (a != 0 || b != 0) {
+        note_bad_argument("CreateComputePipelineState (Xbox slot 62): unknown arguments " + hex(a) + ", " + hex(b) +
+                          " ignored");
+    }
+    const HResult hr = create_compute_pso(g, riid, out);
+    if (hr >= 0) {
+        count(xbox::Counter::ComputePipelineStatesX);
+    } else if (out) {
+        out.write(0);  // the caller frees the bytecode and takes its failure path
+    }
+    return hr;
+}
+
+HResult Device::CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) {
+    // Slot 67: (&desc, riid, out), a console-native compute pipeline. Refused with a cleared out
+    // pointer: the caller falls back to slot 62 with the DXIL compute shader.
+    count(xbox::Counter::BlobPipelineStatesRefused);
+    const uint64_t out = ctx.int_arg(3);
+    uint64_t current = 1;
+    if (out != 0 && com::read_guest(out, &current, sizeof(current)) && current == 0) {
+        const uint64_t zero = 0;
+        com::write_guest(out, &zero, sizeof(zero));
     }
     return kENotImpl;
 }

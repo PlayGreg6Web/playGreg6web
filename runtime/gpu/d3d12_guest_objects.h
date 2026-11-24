@@ -477,7 +477,8 @@ struct IDeviceHost : IObjectHost {
                                                      uint64_t overrides, const Guid& riid, OutPtr out) = 0;  // 55
     virtual HResult CreateNativePipelineState(uint64_t desc, const Guid& riid, OutPtr out) = 0;          // 57
     virtual HResult Slot61_unverified(uint64_t a, uint64_t b) = 0;                                       // 61
-    virtual HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) = 0;                   // 62, 67
+    virtual HResult CreateComputePipelineStateX(com::CallContext& ctx) = 0;                              // 62
+    virtual HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) = 0;                   // 67
     virtual void CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) = 0;  // 70
     virtual void CreateUnorderedAccessViewAtAddress(uint64_t resource_desc, uint64_t view_desc,
                                                     uint64_t dest) = 0;                                  // 71
@@ -597,6 +598,7 @@ public:
                                              const Guid& riid, OutPtr out) override;
     HResult CreateNativePipelineState(uint64_t desc, const Guid& riid, OutPtr out) override;
     HResult Slot61_unverified(uint64_t a, uint64_t b) override;
+    HResult CreateComputePipelineStateX(com::CallContext& ctx) override;
     HResult CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) override;
     void CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) override;
     void CreateUnorderedAccessViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) override;

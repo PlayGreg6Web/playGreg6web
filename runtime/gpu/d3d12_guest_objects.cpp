@@ -1296,12 +1296,12 @@ constexpr com::MethodDesc kDeviceMethods[] = {
     DevM::stub(nullptr),  // 59
     DevM::stub(nullptr),  // 60
     DevM::method<&IDeviceHost::Slot61_unverified>("Xbox slot 61"),  // 61
-    DevM::method<&IDeviceHost::CreatePipelineStateFromBlob_unverified>("PSO from title blob (Xbox slot 62)"),  // 62
+    DevM::method<&IDeviceHost::CreateComputePipelineStateX>("CreateComputePipelineState (Xbox slot 62)"),  // 62
     DevM::stub(nullptr),  // 63
     DevM::stub(nullptr),  // 64
     DevM::stub(nullptr),  // 65
     DevM::stub(nullptr),  // 66
-    DevM::method<&IDeviceHost::CreatePipelineStateFromBlob_unverified>("PSO from title blob (Xbox slot 67)"),  // 67
+    DevM::method<&IDeviceHost::CreatePipelineStateFromBlob_unverified>("native compute PSO (Xbox slot 67)"),  // 67
     DevM::stub(nullptr),  // 68
     DevM::stub(nullptr),  // 69
     DevM::method<&IDeviceHost::CreateShaderResourceViewAtAddress>("SRV at address (Xbox slot 70)"),  // 70
