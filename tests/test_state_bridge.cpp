@@ -19,6 +19,7 @@
 #include "gpu/descriptor_words.h"
 #include "gpu/gfx10_detile.h"
 #include "gpu/pso_cache.h"
+#include "wasm_boot.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
 #include "os/vmem.h"
@@ -1881,6 +1882,75 @@ void test_all_subresource_uploads() {
     com::set_guest_memory(nullptr);
 }
 
+// G66: streamed textures arrive as BC (and 16-bit normalized) texels in console layouts. They are
+// uploaded only when the device's WebGPU features include the format: the browser player's set
+// (boot::kDefaultWasmWgpuFeatures, which the native harness now declares too) uploads them; a
+// device with no features substitutes the format and skips the texels.
+void test_bc_texture_upload_needs_feature() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace gfx10 = playgta6::gpu::gfx10;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        // 64x64 BC3 (16 B blocks, 16x16 blocks), 4KB_S, one mip: one 4 KiB block.
+        gfx10::TextureLayoutDesc g{};
+        g.dxgi_format = 77;
+        g.width = 64;
+        g.height = 64;
+        g.d3d12_layout = 0x105;
+        const size_t size = gfx10::surface_bytes(g);
+        CHECK(size == 4096u);
+        std::vector<uint8_t> blocks(16u * 16u * 16u);
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            blocks[i] = static_cast<uint8_t>(1u + i % 253u);
+        }
+        std::vector<uint8_t> surface(size, 0);
+        CHECK(gfx10::tile_surface_subresource(g, 0, 0, blocks.data(), blocks.size(), surface.data(), surface.size()));
+        const uint64_t mem = arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+
+        for (const uint32_t features : {0u, static_cast<uint32_t>(playgta6::boot::kDefaultWasmWgpuFeatures)}) {
+            dg::DeviceOptions dev_opts;
+            dev_opts.sink = [](const uint8_t*, size_t) {};
+            dev_opts.bridge.features = features;
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+            const uint32_t id = device->ensure_address_texture(mem, 77, 64, 64, 1, 1, 0x105,
+                                                               GpuTextureDimension::Dim2D, false);
+            CHECK(id != 0);
+            gpu::CommandEncoder enc;
+            const bool uploaded = device->sync_bound_texture_memory(id, enc);
+            std::vector<Packet> writes;
+            for (const Packet& pk : decode(enc)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    writes.push_back(pk);
+                }
+            }
+            if (features == 0) {
+                CHECK(!uploaded && writes.empty());  // bc3 unavailable: substitute format, no texels
+            } else {
+                CHECK(uploaded && writes.size() == 1);
+                if (writes.size() == 1) {
+                    const auto wt = pod<GpuWriteTexturePayload>(writes[0]);
+                    CHECK(wt.width == 64 && wt.height == 64 && wt.bytes_per_row == 256 && wt.rows_per_image == 16);
+                    bool same = true;
+                    for (uint32_t y = 0; same && y < 16u; ++y) {
+                        same = std::memcmp(writes[0].payload.data() + sizeof(GpuWriteTexturePayload) + y * 256u,
+                                           blocks.data() + y * 256u, 256u) == 0;
+                    }
+                    CHECK(same);
+                }
+            }
+        }
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
 // ------------------------------------------------------------------------------------------------
 // G49b: GPU Fence completion audit & ExecuteCommandLists / PresentX com::Ref lifetime audit
 // ------------------------------------------------------------------------------------------------
@@ -2081,6 +2151,7 @@ int main() {
     test_concurrent_command_lists();
     test_dirty_texture_memory_upload();
     test_all_subresource_uploads();
+    test_bc_texture_upload_needs_feature();
     test_fence_completion_and_ref_lifetime();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

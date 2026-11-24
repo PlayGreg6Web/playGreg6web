@@ -93,6 +93,7 @@
 #include "os/xgameruntime_provider.h"
 #include "os/xgamesave_local.h"
 #include "os/xbox_scarlett_guest.h"
+#include "wasm_boot.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -170,6 +171,10 @@ struct Options {
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     std::string input_script;       // --input-script: timed controller buttons (guest/input_script.h)
+    // --wgpu-features: pso::WgpuFeature bits of the WebGPU device that replays the run. The bridge
+    // picks texture formats (and whether guest texels can be uploaded as they are) by them; the
+    // default is the browser player's negotiated set (boot::kDefaultWasmWgpuFeatures).
+    uint64_t wgpu_features = playgta6::boot::kDefaultWasmWgpuFeatures;
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -188,7 +193,8 @@ void usage() {
                  "                     [--no-entry] [--quiet]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
                  "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n"
-                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n");
+                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
+                 "                     [--wgpu-features <mask>]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -253,7 +259,7 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
                    a == "--console-mode" || a == "--gpu-capture-frames" || a == "--arena-log-limit" ||
-                   a == "--dstorage-workers" || a == "--profile-interval-us") {
+                   a == "--dstorage-workers" || a == "--profile-interval-us" || a == "--wgpu-features") {
             if (!value(v)) {
                 return false;
             }
@@ -263,6 +269,7 @@ bool parse(int argc, char** argv, Options& o) {
                                : a == "--console-mode" ? o.console_mode
                                : a == "--dstorage-workers" ? o.dstorage_workers
                                : a == "--profile-interval-us" ? o.profile_interval_us
+                               : a == "--wgpu-features" ? o.wgpu_features
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
                                : a == "--import-trace-limit" ? o.import_trace_limit
@@ -855,9 +862,14 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
-    if (g_options.native_pipelines || !g_options.dump_pipelines.empty() || !g_options.shader_pack.empty()) {
+    {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.refuse_native_pipelines = !g_options.native_pipelines;
+        // The features of the WebGPU device that replays the run (by default the browser player's):
+        // without them BC and 16-bit normalized textures get substitute formats and their guest
+        // texels are never uploaded.
+        device_options.bridge.features = static_cast<uint32_t>(g_options.wgpu_features & gpu::pso::WgpuFeature::All);
+        std::fprintf(stderr, "[harness] WebGPU features 0x%x\n", device_options.bridge.features);
         if (!g_options.dump_pipelines.empty()) {
             // The dump is derived from the title: only under a `work` directory (gitignored).
             std::error_code ec;
