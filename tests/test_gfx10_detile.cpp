@@ -1,5 +1,6 @@
 // Synthetic unit tests for the AMD GFX10 / RDNA2 texture detiler (runtime/gpu/gfx10_detile.h).
 // Zero copyrighted game data: all inputs are deterministically generated synthetic patterns.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -378,6 +379,90 @@ void test_addrlib_equations_3d() {
     CHECK(tiled_footprint_bytes({28u, 8u, 8u, 1u, 1u, 0x0FFu, 0u}, 0u) == 0u);
 }
 
+// Whole-surface placement (addrlib gfx10 mip chain): sizes, mip-0 offsets, mip-tail coordinates.
+void test_mip_chain_placement() {
+    // 4 B, 4KB_S, 256x256 with 9 mips: tail block (mips 4..8) first, then mips 3, 2, 1, 0.
+    const TextureLayoutDesc rgba{28u, 256u, 256u, 1u, 9u, 0x105u, 0u};
+    CHECK(surface_bytes(rgba) == 352256u);
+    CHECK(mip_placement(rgba, 0u).macro_block_offset == 90112u);
+    CHECK(mip_placement(rgba, 1u).macro_block_offset == 24576u);
+    CHECK(mip_placement(rgba, 3u).macro_block_offset == 4096u);
+    CHECK(!mip_placement(rgba, 3u).in_tail);
+    CHECK(mip_placement(rgba, 4u).in_tail);
+    CHECK(!mip_placement(rgba, 9u).ok);
+
+    // Block-compressed chains.
+    CHECK(surface_bytes({77u, 1024u, 1024u, 1u, 11u, 0x105u, 0u}) == 1400832u);
+    CHECK(surface_bytes({71u, 128u, 1024u, 1u, 6u, 0x105u, 0u}) == 126976u);
+    CHECK(surface_bytes({98u, 2048u, 128u, 1u, 6u, 0x105u, 0u}) == 389120u);
+    CHECK(surface_bytes({71u, 2048u, 2048u, 1u, 12u, 0x105u, 0u}) == 2797568u);
+    CHECK(mip_placement({71u, 2048u, 2048u, 1u, 12u, 0x105u, 0u}, 0u).macro_block_offset == 700416u);
+
+    // The whole chain in the tail: 16 B elements, 32x32 BC3 with 4 mips. Mip 0 at tail offset
+    // 2048 (x + 8 in 4x4-element units of 256 B), mip 1 at 1536 (x + 4, y + 8).
+    const TextureLayoutDesc tail{77u, 32u, 32u, 1u, 4u, 0x105u, 0u};
+    CHECK(surface_bytes(tail) == 4096u);
+    const MipPlacement m0 = mip_placement(tail, 0u);
+    CHECK(m0.ok && m0.in_tail && m0.tail_x == 8u && m0.tail_y == 0u);
+    const MipPlacement m1 = mip_placement(tail, 1u);
+    CHECK(m1.ok && m1.in_tail && m1.tail_x == 4u && m1.tail_y == 8u);
+
+    // A single mip keeps mip 0 at the base.
+    CHECK(surface_bytes({28u, 64u, 256u, 1u, 1u, 0x105u, 0u}) == 65536u);
+    CHECK(mip_placement({28u, 64u, 256u, 1u, 1u, 0x105u, 0u}, 0u).macro_block_offset == 0u);
+    // 256B modes: smallest mip first, no tail. 4 B, 16x16 with 2 mips: mip 1 (8x8) = 256 B first.
+    CHECK(surface_bytes({28u, 16u, 16u, 1u, 2u, 0x101u, 0u}) == 256u + 1024u);
+    CHECK(mip_placement({28u, 16u, 16u, 1u, 2u, 0x101u, 0u}, 0u).macro_block_offset == 256u);
+    // Linear: mip 0 only.
+    CHECK(mip_placement({28u, 16u, 16u, 1u, 2u, 0x100u, 0u}, 0u).ok);
+    CHECK(!mip_placement({28u, 16u, 16u, 1u, 2u, 0x100u, 0u}, 1u).ok);
+}
+
+// Every mip of a chain written into one surface must read back unchanged (no overlaps).
+void verify_surface_round_trip(const TextureLayoutDesc& desc, uint32_t seed) {
+    const FormatGeometry fmt = format_geometry(desc.dxgi_format);
+    std::vector<uint8_t> surface;
+    std::vector<std::vector<uint8_t>> inputs;
+    for (uint32_t mip = 0; mip < desc.mip_levels; ++mip) {
+        const uint32_t w = std::max(1u, desc.width >> mip);
+        const uint32_t h = std::max(1u, desc.height >> mip);
+        const uint32_t d = std::max(1u, desc.depth >> mip);
+        const size_t size = static_cast<size_t>((w + fmt.block_width - 1u) / fmt.block_width) *
+                            ((h + fmt.block_height - 1u) / fmt.block_height) * d * fmt.bytes_per_block;
+        inputs.push_back(make_synthetic_linear(size, seed + mip));
+        CHECK(tile_into_surface_for_test(desc, mip, inputs.back().data(), inputs.back().size(), surface));
+    }
+    CHECK(surface.size() == surface_bytes(desc));
+    for (uint32_t mip = 0; mip < desc.mip_levels; ++mip) {
+        std::vector<uint8_t> out;
+        const DetileResult r = detile_from_surface(desc, mip, surface.data(), surface.size(), out);
+        CHECK(r.ok);
+        CHECK(out == inputs[mip]);
+    }
+    std::vector<uint8_t> out;
+    CHECK(!detile_from_surface(desc, 0u, surface.data(), surface.size() - 1u, out).ok);
+}
+
+void test_mip_chain_round_trips() {
+    verify_surface_round_trip({28u, 256u, 256u, 1u, 9u, 0x105u, 0u}, 9100u);
+    verify_surface_round_trip({77u, 32u, 32u, 1u, 4u, 0x105u, 0u}, 9200u);
+    verify_surface_round_trip({71u, 128u, 1024u, 1u, 6u, 0x105u, 0u}, 9300u);
+    verify_surface_round_trip({98u, 100u, 60u, 1u, 5u, 0x105u, 0u}, 9400u);
+    verify_surface_round_trip({61u, 300u, 20u, 1u, 9u, 0x10Au, 0u}, 9500u);
+    verify_surface_round_trip({10u, 64u, 64u, 1u, 7u, 0x109u, 0u}, 9600u);
+    verify_surface_round_trip({28u, 64u, 64u, 1u, 7u, 0x102u, 0u}, 9700u);
+    verify_surface_round_trip({10u, 32u, 32u, 32u, 4u, 0x105u, 0u}, 9800u);  // thick 3D chain
+    verify_surface_round_trip({10u, 17u, 17u, 17u, 1u, 0x105u, 0u}, 9900u);
+    // A single-mip surface matches detile_subresource.
+    const TextureLayoutDesc one{10u, 17u, 17u, 17u, 1u, 0x105u, 0u};
+    const std::vector<uint8_t> lin = make_synthetic_linear(17u * 17u * 17u * 8u, 9950u);
+    std::vector<uint8_t> tiled;
+    CHECK(tile_subresource_for_test(one, 0u, lin.data(), lin.size(), tiled));
+    std::vector<uint8_t> out;
+    CHECK(detile_from_surface(one, 0u, tiled.data(), tiled.size(), out).ok);
+    CHECK(out == lin);
+}
+
 void test_linear_custom_pitch() {
     // R8G8B8A8_UNORM 20x10: tight row = 80 bytes, custom D3D12 row pitch = 256 bytes.
     const TextureLayoutDesc desc{
@@ -478,6 +563,8 @@ int main() {
     test_small_3d_16x16x4();
     test_addrlib_equations_2d();
     test_addrlib_equations_3d();
+    test_mip_chain_placement();
+    test_mip_chain_round_trips();
     test_linear_custom_pitch();
     test_bounds_and_error_rejection();
 

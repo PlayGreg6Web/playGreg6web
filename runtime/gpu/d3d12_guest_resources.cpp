@@ -97,25 +97,23 @@ uint32_t mips_or_all(uint32_t v) {
     return v == 0xFFFFFFFFu ? 0xffffu : v;
 }
 
-// The mip-0 source byte footprint gfx10::detile_subresource reads (whole tiles, thick 3D blocks
-// for 3D _S surfaces). Returns 0 for linear or unrecognized formats/modes.
-uint64_t tiled_mip0_footprint_bytes(uint32_t d3d12_layout, uint32_t dxgi_format,
-                                    uint32_t blocks_x, uint32_t blocks_y, uint32_t slices) noexcept {
+// Bytes of the whole tiled surface from its base address (all mips: on GFX10 mip 0 is stored
+// last, or inside the mip-tail block; see gfx10::MipPlacement). Returns 0 for linear or
+// unrecognized formats/modes.
+uint64_t tiled_surface_bytes(uint32_t d3d12_layout, uint32_t dxgi_format, uint32_t width, uint32_t height,
+                             uint32_t slices, uint32_t mip_levels) noexcept {
     const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d3d12_layout);
-    const gfx10::FormatGeometry fmt = gfx10::format_geometry(dxgi_format);
-    if (!fmt.supported || mode == gfx10::SwizzleMode::Unsupported || mode == gfx10::SwizzleMode::Linear ||
-        blocks_x == 0 || blocks_y == 0 || slices == 0 || blocks_x > UINT32_MAX / fmt.block_width ||
-        blocks_y > UINT32_MAX / fmt.block_height) {
+    if (mode == gfx10::SwizzleMode::Unsupported || mode == gfx10::SwizzleMode::Linear) {
         return 0;
     }
     gfx10::TextureLayoutDesc desc{};
     desc.dxgi_format = dxgi_format;
-    desc.width = blocks_x * fmt.block_width;
-    desc.height = blocks_y * fmt.block_height;
+    desc.width = width;
+    desc.height = height;
     desc.depth = slices;
-    desc.mip_levels = 1;
+    desc.mip_levels = std::max<uint32_t>(1u, mip_levels);
     desc.d3d12_layout = d3d12_layout;
-    return gfx10::tiled_footprint_bytes(desc, 0u);
+    return gfx10::surface_bytes(desc);
 }
 
 bool read_guest_best_effort(uint64_t cpu_va, uint8_t* dst, size_t size) {
@@ -398,7 +396,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     std::vector<uint8_t> raw;
     bool read_ok = false;
     if (is_tiled && detile_fn) {
-        uint64_t tiled_bytes = tiled_mip0_footprint_bytes(tt.layout, tt.dxgi_format, blocks_x, blocks_y, d);
+        uint64_t tiled_bytes = tiled_surface_bytes(tt.layout, tt.dxgi_format, w, h, d, tt.mip_levels);
         if (tiled_bytes == 0) {
             GuestResourceDesc tmp{};
             tmp.Dimension = tt.dimension;

@@ -751,4 +751,318 @@ bool tile_subresource_for_test(const TextureLayoutDesc& desc, uint32_t mip, cons
     return true;
 }
 
+namespace {
+
+constexpr uint32_t kMaxMips = 16;
+
+uint32_t shift_ceil(uint32_t v, uint32_t s) noexcept {
+    return s >= 32u ? 1u : std::max(1u, static_cast<uint32_t>((uint64_t{v} + (uint64_t{1} << s) - 1u) >> s));
+}
+
+uint64_t align_pow2(uint64_t v, uint64_t a) noexcept {
+    return (v + a - 1u) & ~(a - 1u);
+}
+
+// The whole-surface layout of a tiled resource (see MipPlacement in the header).
+struct ChainLayout {
+    bool ok = false;
+    const char* error = nullptr;
+    TileShape shape{};
+    FormatGeometry fmt{};
+    uint32_t bpp_log2 = 0;
+    uint32_t mips = 1;
+    uint32_t bw = 1, bh = 1, bd = 1;  // block dimensions in elements
+    uint64_t slice_stride = 0;        // bytes per slice (thin) or per block of slices (thick)
+    uint64_t total_bytes = 0;
+    uint32_t pitch[kMaxMips] = {};    // padded mip pitch in elements
+    uint64_t macro_offset[kMaxMips] = {};
+    bool in_tail[kMaxMips] = {};
+    uint32_t tail_x[kMaxMips] = {};
+    uint32_t tail_y[kMaxMips] = {};
+};
+
+ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
+    ChainLayout c{};
+    c.fmt = format_geometry(desc.dxgi_format);
+    if (!c.fmt.supported) {
+        c.error = "unsupported DXGI format";
+        return c;
+    }
+    c.bpp_log2 = bpp_to_log2(c.fmt.bytes_per_block);
+    const SwizzleTraits traits = classify_mode(decode_d3d12_layout(desc.d3d12_layout));
+    if (!traits.valid || traits.family == SwizzleFamily::Linear) {
+        c.error = "not a tiled layout";
+        return c;
+    }
+    if (desc.width == 0 || desc.height == 0 || desc.depth == 0) {
+        c.error = "invalid texture dimensions";
+        return c;
+    }
+    c.mips = std::min(std::max(desc.mip_levels, 1u), kMaxMips);
+    const uint32_t ew = (desc.width + c.fmt.block_width - 1u) / c.fmt.block_width;
+    const uint32_t eh = (desc.height + c.fmt.block_height - 1u) / c.fmt.block_height;
+    const uint32_t depth = desc.depth;
+    c.shape = compute_tile_shape(traits, c.bpp_log2, depth > 1u);
+    const bool thick = c.shape.thick_3d;
+    c.bw = 1u << c.shape.w_log2;
+    c.bh = 1u << c.shape.h_log2;
+    c.bd = thick ? (1u << c.shape.d_log2) : 1u;
+    const uint32_t blk = c.shape.blk_size_log2;
+    const uint64_t block_bytes = uint64_t{1} << blk;
+    const uint64_t bpe = c.fmt.bytes_per_block;
+    const uint64_t num_slices = thick ? align_pow2(depth, c.bd) : depth;
+
+    uint64_t chain = 0;
+    if (blk == 8u) {
+        // Micro-tiled (256B): mips smallest-first, each padded to whole blocks, no tail.
+        for (int32_t i = static_cast<int32_t>(c.mips) - 1; i >= 0; --i) {
+            const uint32_t w = shift_ceil(ew, static_cast<uint32_t>(i));
+            const uint32_t h = shift_ceil(eh, static_cast<uint32_t>(i));
+            c.pitch[i] = static_cast<uint32_t>(align_pow2(w, c.bw));
+            c.macro_offset[i] = chain;
+            chain += uint64_t{c.pitch[i]} * align_pow2(h, c.bh) * bpe;
+        }
+    } else if (c.mips == 1u) {
+        c.pitch[0] = static_cast<uint32_t>(align_pow2(ew, c.bw));
+        chain = uint64_t{c.pitch[0]} * align_pow2(eh, c.bh) * bpe;
+    } else {
+        // Mip tail: the largest region that a mip may occupy in the tail block (addrlib
+        // Lib::GetMipTailDim), and how many mips fit (Gfx10Lib::GetMaxNumMipsInTail).
+        uint32_t tw = c.bw, th = c.bh;
+        if (thick) {
+            const uint32_t dim = blk % 3u;
+            if (dim == 0u) {
+                th >>= 1;
+            } else if (dim == 1u) {
+                tw >>= 1;
+            }  // dim == 2 halves the depth, which IsInMipTail does not test
+        } else {
+            tw >>= 1;
+        }
+        const uint32_t eff = thick ? blk - (blk - 8u) / 3u : blk;
+        const uint32_t max_mips_in_tail = eff <= 11u ? 1u + (1u << (eff - 9u)) : eff - 4u;
+        uint32_t first_tail = c.mips;
+        uint64_t mip_slice_size[kMaxMips] = {};
+        for (uint32_t i = 0; i < c.mips; ++i) {
+            const uint32_t w = shift_ceil(ew, i);
+            const uint32_t h = shift_ceil(eh, i);
+            if (w <= tw && h <= th && c.mips - i <= max_mips_in_tail) {
+                first_tail = i;
+                chain += block_bytes / c.bd;
+                break;
+            }
+            c.pitch[i] = static_cast<uint32_t>(align_pow2(w, c.bw));
+            const uint64_t slice = uint64_t{c.pitch[i]} * align_pow2(h, c.bh) * bpe;
+            mip_slice_size[i] = slice * c.bd;
+            chain += slice;
+        }
+        uint64_t macro = first_tail != c.mips ? block_bytes : 0u;
+        for (int32_t i = static_cast<int32_t>(first_tail) - 1; i >= 0; --i) {
+            c.macro_offset[i] = macro;
+            macro += mip_slice_size[i];
+        }
+        // Tail mips: placed by coordinate inside the block (Gfx10Lib::ComputeSurfaceInfoMacroTiled).
+        uint32_t b256w = 0, b256h = 0;
+        for (uint32_t i = 0; i < 8u && c.shape.eq != nullptr; ++i) {
+            const uint32_t axis = c.shape.eq[i] >> 4;
+            const uint32_t bit = (c.shape.eq[i] & 0xFu) + 1u;
+            if (axis == 1u) b256w = std::max(b256w, bit);
+            if (axis == 2u) b256h = std::max(b256h, bit);
+        }
+        if (c.shape.eq == nullptr) {
+            constexpr uint32_t kW256[5] = {4, 4, 3, 3, 2};
+            constexpr uint32_t kH256[5] = {4, 3, 3, 2, 2};
+            b256w = kW256[c.bpp_log2];
+            b256h = kH256[c.bpp_log2];
+        }
+        for (uint32_t i = first_tail; i < c.mips; ++i) {
+            const uint32_t m = max_mips_in_tail - 1u - (i - first_tail);
+            const uint32_t off = m > 6u ? (16u << m) : (m << 8);
+            uint32_t mx = ((off >> 9) & 1u) | ((off >> 10) & 2u) | ((off >> 11) & 4u) | ((off >> 12) & 8u) |
+                          ((off >> 13) & 16u) | ((off >> 14) & 32u);
+            uint32_t my = ((off >> 8) & 1u) | ((off >> 9) & 2u) | ((off >> 10) & 4u) | ((off >> 11) & 8u) |
+                          ((off >> 12) & 16u) | ((off >> 13) & 32u);
+            if (blk & 1u) {
+                std::swap(mx, my);
+                if (c.bpp_log2 & 1u) {
+                    my = (my << 1) | (mx & 1u);
+                    mx >>= 1;
+                }
+            }
+            c.in_tail[i] = true;
+            c.tail_x[i] = mx << b256w;
+            c.tail_y[i] = my << b256h;
+            c.macro_offset[i] = 0;
+        }
+    }
+    c.slice_stride = thick ? chain * c.bd : chain;
+    c.total_bytes = chain * num_slices;
+    c.ok = true;
+    return c;
+}
+
+uint64_t chain_address(const ChainLayout& c, uint32_t mip, uint32_t x, uint32_t y, uint32_t z) noexcept {
+    const TileShape& s = c.shape;
+    const uint32_t tx = x + c.tail_x[mip];
+    const uint32_t ty = y + c.tail_y[mip];
+    uint32_t intra = 0;
+    if (s.eq != nullptr) {
+        intra = apply_equation(s.eq, s.blk_size_log2, tx, ty, s.thick_3d ? z : 0u);
+    } else {
+        intra = deposit_bits((tx & (c.bw - 1u)) << c.bpp_log2, s.x_mask) | deposit_bits(ty & (c.bh - 1u), s.y_mask);
+    }
+    if (s.xor_mode) {
+        intra = apply_gfx10_xor_64k(intra);
+    }
+    const uint64_t slice = s.thick_3d ? z / c.bd : z;
+    const uint64_t blk_index = c.in_tail[mip] ? 0u : uint64_t{y / c.bh} * (c.pitch[mip] / c.bw) + x / c.bw;
+    return c.slice_stride * slice + c.macro_offset[mip] + (blk_index << s.blk_size_log2) + intra;
+}
+
+bool is_linear_layout(const TextureLayoutDesc& desc) noexcept {
+    return classify_mode(decode_d3d12_layout(desc.d3d12_layout)).family == SwizzleFamily::Linear;
+}
+
+}  // namespace
+
+MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept {
+    MipPlacement p{};
+    if (is_linear_layout(desc)) {
+        if (mip != 0u) {
+            p.error = "linear mip chains are not modelled (mip 0 only)";
+            return p;
+        }
+        p.surface_bytes = tiled_footprint_bytes(desc, 0u);
+        p.ok = p.surface_bytes != 0u;
+        p.error = p.ok ? nullptr : "unsupported linear subresource";
+        return p;
+    }
+    const ChainLayout c = build_chain(desc);
+    if (!c.ok || mip >= c.mips) {
+        p.error = c.ok ? "mip level out of range" : c.error;
+        return p;
+    }
+    p.surface_bytes = c.total_bytes;
+    p.macro_block_offset = c.macro_offset[mip];
+    p.in_tail = c.in_tail[mip];
+    p.tail_x = c.tail_x[mip];
+    p.tail_y = c.tail_y[mip];
+    p.ok = true;
+    return p;
+}
+
+size_t surface_bytes(const TextureLayoutDesc& desc) noexcept {
+    const MipPlacement p = mip_placement(desc, 0u);
+    return p.ok ? static_cast<size_t>(p.surface_bytes) : 0u;
+}
+
+namespace {
+
+// Shared walk for detile_from_surface / tile_into_surface_for_test: calls fn(linear_offset,
+// surface_offset) for every element of mip `mip`.
+template <typename Fn>
+const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, size_t surface_size, size_t* linear_size,
+                             uint32_t* row_pitch, uint32_t* rows, uint32_t* slices, Fn&& fn) {
+    const ChainLayout c = build_chain(desc);
+    if (!c.ok) {
+        return c.error;
+    }
+    if (mip >= c.mips) {
+        return "mip level out of range";
+    }
+    if (surface_size < c.total_bytes) {
+        return "source buffer truncated for surface footprint";
+    }
+    const uint32_t mip_w = std::max(1u, desc.width >> std::min(mip, 31u));
+    const uint32_t mip_h = std::max(1u, desc.height >> std::min(mip, 31u));
+    const uint32_t mip_d = std::max(1u, desc.depth >> std::min(mip, 31u));
+    const uint32_t bx = (mip_w + c.fmt.block_width - 1u) / c.fmt.block_width;
+    const uint32_t by = (mip_h + c.fmt.block_height - 1u) / c.fmt.block_height;
+    const uint32_t bpe = c.fmt.bytes_per_block;
+    *row_pitch = bx * bpe;
+    *rows = by;
+    *slices = mip_d;
+    *linear_size = size_t{*row_pitch} * by * mip_d;
+    for (uint32_t z = 0; z < mip_d; ++z) {
+        for (uint32_t y = 0; y < by; ++y) {
+            for (uint32_t x = 0; x < bx; ++x) {
+                const uint64_t addr = chain_address(c, mip, x, y, z);
+                if (addr > surface_size || bpe > surface_size - addr) {
+                    return "tiled source offset out of bounds";
+                }
+                fn((size_t{z} * by + y) * *row_pitch + size_t{x} * bpe, static_cast<size_t>(addr), bpe);
+            }
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* surface,
+                                 size_t surface_size, std::vector<uint8_t>& linear_out) {
+    if (is_linear_layout(desc)) {
+        if (mip != 0u) {
+            linear_out.clear();
+            DetileResult r{};
+            r.error = "linear mip chains are not modelled (mip 0 only)";
+            return r;
+        }
+        return detile_subresource(desc, 0u, surface, surface_size, linear_out);
+    }
+    DetileResult res{};
+    linear_out.clear();
+    if (surface == nullptr) {
+        res.error = "null source pointer";
+        return res;
+    }
+    size_t linear_size = 0;
+    uint32_t row_pitch = 0, rows = 0, slices = 0;
+    // First pass validates and sizes; the walk is cheap compared with the copy.
+    const char* err = walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+                                       [](size_t, size_t, uint32_t) {});
+    if (err != nullptr) {
+        res.error = err;
+        return res;
+    }
+    linear_out.resize(linear_size);
+    walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+                     [&](size_t lin, size_t src, uint32_t n) { std::memcpy(linear_out.data() + lin, surface + src, n); });
+    res.ok = true;
+    res.row_pitch_bytes = row_pitch;
+    res.rows = rows;
+    res.slices = slices;
+    res.tiled_bytes_consumed = surface_bytes(desc);
+    return res;
+}
+
+bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
+                                size_t linear_src_bytes, std::vector<uint8_t>& surface) {
+    const size_t need = surface_bytes(desc);
+    if (need == 0u || linear_src == nullptr) {
+        return false;
+    }
+    if (surface.size() < need) {
+        surface.resize(need, 0u);
+    }
+    if (is_linear_layout(desc)) {
+        std::vector<uint8_t> tiled;
+        if (mip != 0u || !tile_subresource_for_test(desc, 0u, linear_src, linear_src_bytes, tiled)) {
+            return false;
+        }
+        std::memcpy(surface.data(), tiled.data(), tiled.size());
+        return true;
+    }
+    size_t linear_size = 0;
+    uint32_t row_pitch = 0, rows = 0, slices = 0;
+    const char* err = walk_surface_mip(desc, mip, surface.size(), &linear_size, &row_pitch, &rows, &slices,
+                                       [](size_t, size_t, uint32_t) {});
+    if (err != nullptr || linear_src_bytes < linear_size) {
+        return false;
+    }
+    walk_surface_mip(desc, mip, surface.size(), &linear_size, &row_pitch, &rows, &slices,
+                     [&](size_t lin, size_t dst, uint32_t n) { std::memcpy(surface.data() + dst, linear_src + lin, n); });
+    return true;
+}
+
 }  // namespace playgta6::gpu::gfx10

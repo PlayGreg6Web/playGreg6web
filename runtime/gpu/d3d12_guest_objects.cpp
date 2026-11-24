@@ -269,7 +269,7 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
             desc.pitch_bytes = 0;
 
             std::vector<uint8_t> linear_out;
-            const gfx10::DetileResult res = gfx10::detile_subresource(desc, /*mip=*/0u, src, src_bytes, linear_out);
+            const gfx10::DetileResult res = gfx10::detile_from_surface(desc, /*mip=*/0u, src, src_bytes, linear_out);
             if (!res.ok || req.dst_row_pitch < res.row_pitch_bytes) {
                 return false;
             }

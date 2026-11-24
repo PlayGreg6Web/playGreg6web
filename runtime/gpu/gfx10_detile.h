@@ -97,6 +97,38 @@ size_t tiled_footprint_bytes(const TextureLayoutDesc& desc, uint32_t mip) noexce
 DetileResult detile_subresource(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* src,
                                 size_t src_bytes, std::vector<uint8_t>& linear_out);
 
+// Whole-surface view (all mips and slices from the resource's base address), following AMD
+// addrlib's gfx10 placement (Gfx10Lib::ComputeSurfaceInfoMacroTiled / MicroTiled and
+// ComputeSurfaceAddrFromCoordMacroTiled): mip sizes in elements are rounded up per level; in
+// 4KB/64KB modes the mip tail (one block holding every mip that fits) comes first and the larger
+// mips follow smallest-first, so mip 0 sits last, or inside the tail block at a fixed coordinate
+// when the whole chain fits there; 256B modes store the mips smallest-first without a tail.
+// Linear layouts keep mip 0 at offset 0 (only mip 0 is supported for them).
+struct MipPlacement {
+    bool ok = false;
+    const char* error = nullptr;
+    uint64_t surface_bytes = 0;       // bytes of the whole surface from the base address
+    uint64_t macro_block_offset = 0;  // offset of the mip's first block (0 for mips in the tail)
+    bool in_tail = false;
+    uint32_t tail_x = 0;  // element coordinate of the mip inside the tail block
+    uint32_t tail_y = 0;
+    uint32_t tail_z = 0;
+};
+MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept;
+
+// Bytes of the whole surface (desc.mip_levels mips, all slices) from the base address; 0 if unsupported.
+size_t surface_bytes(const TextureLayoutDesc& desc) noexcept;
+
+// Detile mip `mip` from the whole surface starting at the resource's base address (see
+// MipPlacement). Output rows are tight, with D3D mip dimensions (max(1, size >> mip)).
+DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* surface,
+                                 size_t surface_bytes, std::vector<uint8_t>& linear_out);
+
+// Inverse of detile_from_surface for synthetic tests: writes mip `mip` into `surface` (resized to
+// surface_bytes(desc) if smaller; other bytes are kept).
+bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
+                                size_t linear_src_bytes, std::vector<uint8_t>& surface);
+
 // Inverse encoder for synthetic round-trip unit tests: tiles tightly-packed linear subresource
 // bytes into the exact tiled/pitched GPU layout expected by detile_subresource.
 bool tile_subresource_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
