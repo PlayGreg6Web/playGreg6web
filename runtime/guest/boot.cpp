@@ -25,6 +25,7 @@
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/win32_sync.h"
+#include "os/xbox_scarlett.h"
 
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND) || defined(__EXCEPTIONS)
 #define PG6_BOOT_HAS_EXCEPTIONS 1
@@ -2538,6 +2539,19 @@ BootResult run_boot(const BootConfig& config) {
     // unless after_load (R12's register_program_modules) registered it already.
     for (ModuleState& m : b.modules) {
         m.pdata = pc_to_image_base(m.image.base) != 0 || register_image_from_headers(*b.arena, m.image.base);
+    }
+    // XMem allocation hooks: the platform picks up a module's exported `__XMemAllocationHooks__`
+    // structure (the first module, in load order, that exports one).
+    os::scarlett::xmem_set_guest_hook_table(0);
+    for (const ModuleState& m : b.modules) {
+        const os::win32::Handle module = os::win32::find_module_by_address(m.image.base);
+        const os::win32::ExportLookup hooks =
+            module != 0 ? os::win32::LookupExport(module, "__XMemAllocationHooks__") : os::win32::ExportLookup{};
+        if (hooks.guest && hooks.address != 0) {
+            os::scarlett::xmem_set_guest_hook_table(hooks.address);
+            logf("guest boot: XMem allocation hooks from %s at 0x%016" PRIx64, m.name.c_str(), hooks.address);
+            break;
+        }
     }
 
     // 3. Process block, TLS directories, main thread.

@@ -145,6 +145,10 @@ else()
     target_link_libraries(test_crt_scan PRIVATE playgta6_core)
     add_test(NAME playgta6_crt_scan_tests COMMAND test_crt_scan)
 
+    add_executable(test_xmem_hooks ../tests/test_xmem_hooks.cpp)
+    target_link_libraries(test_xmem_hooks PRIVATE playgta6_core)
+    add_test(NAME playgta6_xmem_hooks_tests COMMAND test_xmem_hooks)
+
     add_executable(test_image_loader ../tests/test_image_loader.cpp)
     target_link_libraries(test_image_loader PRIVATE playgta6_core)
     add_test(NAME playgta6_image_loader_tests COMMAND test_image_loader)

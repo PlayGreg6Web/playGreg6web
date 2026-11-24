@@ -342,6 +342,20 @@ using XMemAllocHookFn = void* (*)(size_t size, uint64_t attributes);
 using XMemFreeHookFn = void (*)(void* address, uint64_t attributes);
 
 void xmem_set_allocation_hooks(XMemAllocHookFn alloc_hook, XMemFreeHookFn free_hook);
+
+// Guest allocation hooks (the console's XMem routes XMemAlloc / XMemFree through a title's own
+// routines; XMemAllocDefault / XMemFreeDefault never do):
+// * A module that exports the data symbol `__XMemAllocationHooks__` ({alloc routine, free
+//   routine, ...}, guest function addresses) provides them: the boot passes that structure's
+//   guest address here once the modules are loaded. Its entries are read at every call, so a
+//   title that changes them later is followed. 0 removes it.
+// * XMemSetAllocationHooks(alloc, free) (documented API) sets them explicitly and takes
+//   precedence over the exported structure; null routines remove them.
+// Routines are called on the calling thread's guest state as alloc(size, attributes) -> guest
+// address and free(address, attributes). A host hook (xmem_set_allocation_hooks) takes
+// precedence over both (tests, tools).
+void xmem_set_guest_hook_table(uint64_t table_va);
+uint64_t xmem_guest_hook_table();
 bool xmem_get_allocation_info(const void* address, XMemAllocInfo* out_info);
 bool xmem_virtual_free(void* address);
 bool xmem_unmap_physical_pages(void* virtual_address);
@@ -436,6 +450,8 @@ size_t register_all_scarlett_exports();
 extern "C" {
 
 // xmem.dll (12 imports)
+// XMemSetAllocationHooks(XMemAllocRoutine*, XMemFreeRoutine*): guest routine addresses.
+void pg6_xbox_XMemSetAllocationHooks(uint64_t alloc_routine, uint64_t free_routine);
 void* pg6_xbox_XMemAlloc(size_t size, uint64_t attributes);
 void* pg6_xbox_XMemAllocDefault(size_t size, uint64_t attributes);
 void pg6_xbox_XMemFree(void* address, uint64_t attributes);

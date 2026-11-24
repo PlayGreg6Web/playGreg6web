@@ -397,7 +397,8 @@
     X(pg6_mw_mf_create_source_resolver, deny, "host COM: IUnknown stub with a host vtable") \
     X(pg6_mw_mf_create_source_reader_from_media_source, deny, "host COM: IUnknown stub with a host vtable") \
     /* ---- xmem / XCRDAPI / xg_xs / GameInput (O12) ---- */ \
-    X(pg6_xbox_XMemAlloc, ok, "guest heap (O24); a host allocation hook, when installed, must return guest memory") \
+    X(pg6_xbox_XMemAlloc, ok, "guest heap (O24); a host allocation hook, when installed, must return guest memory; guest hooks run as guest routines") \
+    X(pg6_xbox_XMemSetAllocationHooks, ok, "guest routine addresses are integers") \
     X(pg6_xbox_XMemAllocDefault, ok, "guest heap (O24)") \
     X(pg6_xbox_XMemFree, ok, "guest heap (O24)") \
     X(pg6_xbox_XMemFreeDefault, ok, "guest heap (O24)") \
