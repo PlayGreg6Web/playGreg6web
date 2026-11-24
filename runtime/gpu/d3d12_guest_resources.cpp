@@ -97,95 +97,25 @@ uint32_t mips_or_all(uint32_t v) {
     return v == 0xFFFFFFFFu ? 0xffffu : v;
 }
 
-// Computes the exact mip-0 tiled source byte footprint expected by gfx10::detile_subresource for
-// all supported formats (1B/2B/4B/8B/16B per block, including BC1..BC7) and 2D/3D swizzle modes.
-// Returns 0 for linear or unrecognized formats/modes.
+// The mip-0 source byte footprint gfx10::detile_subresource reads (whole tiles, thick 3D blocks
+// for 3D _S surfaces). Returns 0 for linear or unrecognized formats/modes.
 uint64_t tiled_mip0_footprint_bytes(uint32_t d3d12_layout, uint32_t dxgi_format,
                                     uint32_t blocks_x, uint32_t blocks_y, uint32_t slices) noexcept {
     const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d3d12_layout);
     const gfx10::FormatGeometry fmt = gfx10::format_geometry(dxgi_format);
     if (!fmt.supported || mode == gfx10::SwizzleMode::Unsupported || mode == gfx10::SwizzleMode::Linear ||
-        blocks_x == 0 || blocks_y == 0 || slices == 0) {
+        blocks_x == 0 || blocks_y == 0 || slices == 0 || blocks_x > UINT32_MAX / fmt.block_width ||
+        blocks_y > UINT32_MAX / fmt.block_height) {
         return 0;
     }
-    uint32_t bpp_log2 = 0xFFu;
-    switch (fmt.bytes_per_block) {
-        case 1:  bpp_log2 = 0; break;
-        case 2:  bpp_log2 = 1; break;
-        case 4:  bpp_log2 = 2; break;
-        case 8:  bpp_log2 = 3; break;
-        case 16: bpp_log2 = 4; break;
-        default: return 0;
-    }
-    uint32_t blk_size_log2 = 0;
-    bool is_standard = false;
-    switch (mode) {
-        case gfx10::SwizzleMode::Sw256BS: is_standard = true; blk_size_log2 = 8; break;
-        case gfx10::SwizzleMode::Sw256BD:
-        case gfx10::SwizzleMode::Sw256BR: blk_size_log2 = 8; break;
-        case gfx10::SwizzleMode::Sw4KBS:  is_standard = true; blk_size_log2 = 12; break;
-        case gfx10::SwizzleMode::Sw4KBD:
-        case gfx10::SwizzleMode::Sw4KBR:  blk_size_log2 = 12; break;
-        case gfx10::SwizzleMode::Sw64KBS:
-        case gfx10::SwizzleMode::SwVarS:
-        case gfx10::SwizzleMode::Sw64KBSX:
-        case gfx10::SwizzleMode::SwVarSX: is_standard = true; blk_size_log2 = 16; break;
-        case gfx10::SwizzleMode::Sw64KBD:
-        case gfx10::SwizzleMode::Sw64KBR:
-        case gfx10::SwizzleMode::SwVarD:
-        case gfx10::SwizzleMode::SwVarR:
-        case gfx10::SwizzleMode::Sw64KBDX:
-        case gfx10::SwizzleMode::Sw64KBRX:
-        case gfx10::SwizzleMode::SwVarDX:
-        case gfx10::SwizzleMode::SwVarRX: blk_size_log2 = 16; break;
-        default: return 0;
-    }
-    uint32_t w_log2 = 0;
-    uint32_t h_log2 = 0;
-    uint32_t d_log2 = 0;
-    if (slices > 1u && is_standard && blk_size_log2 >= 12u) {
-        if (blk_size_log2 == 12u) {
-            constexpr uint32_t kW[5] = {4, 4, 4, 3, 3};
-            constexpr uint32_t kH[5] = {4, 4, 3, 3, 3};
-            constexpr uint32_t kD[5] = {4, 3, 3, 3, 2};
-            w_log2 = kW[bpp_log2];
-            h_log2 = kH[bpp_log2];
-            d_log2 = kD[bpp_log2];
-        } else {
-            constexpr uint32_t kW[5] = {6, 5, 5, 5, 4};
-            constexpr uint32_t kH[5] = {5, 5, 5, 4, 4};
-            constexpr uint32_t kD[5] = {5, 5, 4, 4, 4};
-            w_log2 = kW[bpp_log2];
-            h_log2 = kH[bpp_log2];
-            d_log2 = kD[bpp_log2];
-        }
-    } else {
-        constexpr uint32_t kW256[5] = {4, 4, 3, 3, 2};
-        constexpr uint32_t kH256[5] = {4, 3, 3, 2, 2};
-        const uint32_t shift = (blk_size_log2 - 8u) / 2u;
-        w_log2 = kW256[bpp_log2] + shift;
-        h_log2 = kH256[bpp_log2] + shift;
-        d_log2 = 0;
-    }
-    const uint64_t tile_w = uint64_t{1} << w_log2;
-    const uint64_t tile_h = uint64_t{1} << h_log2;
-    const uint64_t tile_d = uint64_t{1} << d_log2;
-    const uint64_t tx = (uint64_t{blocks_x} + tile_w - 1u) >> w_log2;
-    const uint64_t ty = (uint64_t{blocks_y} + tile_h - 1u) >> h_log2;
-    const uint64_t tz = (uint64_t{slices} + tile_d - 1u) >> d_log2;
-    const uint64_t tile_bytes = uint64_t{1} << blk_size_log2;
-    if (tx == 0 || ty == 0 || tz == 0 || tx > UINT64_MAX / ty) {
-        return 0;
-    }
-    const uint64_t txy = tx * ty;
-    if (txy > UINT64_MAX / tz) {
-        return 0;
-    }
-    const uint64_t total_tiles = txy * tz;
-    if (total_tiles > UINT64_MAX / tile_bytes) {
-        return 0;
-    }
-    return total_tiles * tile_bytes;
+    gfx10::TextureLayoutDesc desc{};
+    desc.dxgi_format = dxgi_format;
+    desc.width = blocks_x * fmt.block_width;
+    desc.height = blocks_y * fmt.block_height;
+    desc.depth = slices;
+    desc.mip_levels = 1;
+    desc.d3d12_layout = d3d12_layout;
+    return gfx10::tiled_footprint_bytes(desc, 0u);
 }
 
 bool read_guest_best_effort(uint64_t cpu_va, uint8_t* dst, size_t size) {

@@ -89,32 +89,57 @@ constexpr uint32_t deposit_bits(uint32_t value, uint32_t mask) noexcept {
     return result;
 }
 
-// 16-bit intra-tile coordinate interleave masks for 2D surfaces (x is in bytes, y is in blocks).
-// Truncating a mask to the low 8 or 12 bits yields the exact 256B or 4KB intra-tile equation.
+// Per-address-bit swizzle equations of the non-XOR GFX10 modes, taken from AMD addrlib's public
+// pattern tables (src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h, RB+ variants, which
+// RDNA2 uses): GFX10_SW_{256,4K,64K}_{S,D}_RBPLUS_PATINFO and GFX10_SW_{4K,64K}_S3_RBPLUS_PATINFO,
+// indexed by log2(bytes per element). Entry i is the source of address bit i: 0 = byte within the
+// element (always 0 for an element's first byte), else axis | coordinate bit, with x/y/z counted in
+// elements (texels or 4x4 blocks). In each family the 256B/4KB equation is the low 8/12 entries
+// of the 64KB one, so one 16-entry table per family covers all three block sizes.
+using BitEq = uint8_t;
+constexpr BitEq kX = 0x10u;
+constexpr BitEq kY = 0x20u;
+constexpr BitEq kZ = 0x30u;
+constexpr BitEq X(uint32_t b) { return static_cast<BitEq>(kX | b); }
+constexpr BitEq Y(uint32_t b) { return static_cast<BitEq>(kY | b); }
+constexpr BitEq Z(uint32_t b) { return static_cast<BitEq>(kZ | b); }
+
+// SW_256B_S / SW_4KB_S / SW_64KB_S (2D; thin).
+constexpr BitEq kEqStandard[5][16] = {
+    {X(0), X(1), X(2), X(3), Y(0), Y(1), Y(2), Y(3), Y(4), X(4), Y(5), X(5), Y(6), X(6), Y(7), X(7)},
+    {0, X(0), X(1), X(2), Y(0), Y(1), Y(2), X(3), Y(3), X(4), Y(4), X(5), Y(5), X(6), Y(6), X(7)},
+    {0, 0, X(0), X(1), Y(0), Y(1), Y(2), X(2), Y(3), X(3), Y(4), X(4), Y(5), X(5), Y(6), X(6)},
+    {0, 0, 0, X(0), Y(0), Y(1), X(1), X(2), Y(2), X(3), Y(3), X(4), Y(4), X(5), Y(5), X(6)},
+    {0, 0, 0, 0, Y(0), Y(1), X(0), X(1), Y(2), X(2), Y(3), X(3), Y(4), X(4), Y(5), X(5)},
+};
+
+// SW_256B_D / SW_4KB_D / SW_64KB_D (2D; also used per slice for 3D surfaces).
+constexpr BitEq kEqDisplay[5][16] = {
+    {X(0), X(1), X(2), Y(1), Y(0), Y(2), X(3), Y(3), Y(4), X(4), Y(5), X(5), Y(6), X(6), Y(7), X(7)},
+    {0, X(0), X(1), X(2), Y(0), Y(1), Y(2), X(3), Y(3), X(4), Y(4), X(5), Y(5), X(6), Y(6), X(7)},
+    {0, 0, X(0), X(1), Y(0), Y(1), X(2), Y(2), Y(3), X(3), Y(4), X(4), Y(5), X(5), Y(6), X(6)},
+    {0, 0, 0, X(0), Y(0), X(1), X(2), Y(1), Y(2), X(3), Y(3), X(4), Y(4), X(5), Y(5), X(6)},
+    {0, 0, 0, 0, X(0), Y(0), X(1), Y(1), Y(2), X(2), Y(3), X(3), Y(4), X(4), Y(5), X(5)},
+};
+
+// SW_4KB_S / SW_64KB_S on 3D surfaces (thick, "S3").
+constexpr BitEq kEqStandard3D[5][16] = {
+    {X(0), X(1), Z(0), Y(0), Z(1), Y(1), X(2), Z(2), Y(2), X(3), Z(3), Y(3), X(4), Z(4), Y(4), X(5)},
+    {0, X(0), Z(0), Y(0), Z(1), Y(1), X(1), Z(2), Y(2), X(2), Z(3), Y(3), X(3), Z(4), Y(4), X(4)},
+    {0, 0, X(0), Y(0), Z(0), Y(1), X(1), Z(1), Y(2), X(2), Z(2), Y(3), X(3), Z(3), Y(4), X(4)},
+    {0, 0, 0, X(0), Z(0), Y(0), X(1), Z(1), Y(1), X(2), Z(2), Y(2), X(3), Z(3), Y(3), X(4)},
+    {0, 0, 0, 0, Z(0), Y(0), X(0), Z(1), Y(1), X(1), Z(2), Y(2), X(2), Z(3), Y(3), X(3)},
+};
+
+// 16-bit intra-tile coordinate interleave masks (x is in bytes, y is in blocks), used for the _R
+// modes only. GFX10 addrlib defines no pattern for 256B_R / 4KB_R / 64KB_R / VAR_R; these masks
+// are not taken from it.
 struct Masks2D {
     uint16_t x_bytes_mask;
     uint16_t y_mask;
 };
 
-// Publicly documented D3D12 Standard Swizzle / AMD GFX10 SW_*_S 2D masks indexed by bpp_log2 (0..4).
-constexpr Masks2D kMasks2DStandard[5] = {
-    {0xAA0Fu, 0x55F0u},  // 1B  (8bpp):   256B=16x16, 4KB=64x64,  64KB=256x256
-    {0xAA8Fu, 0x5570u},  // 2B  (16bpp):  256B=16x8,  4KB=64x32,  64KB=256x128
-    {0xAA8Fu, 0x5570u},  // 4B  (32bpp):  256B=8x8,   4KB=32x32,  64KB=128x128
-    {0xAACFu, 0x5530u},  // 8B  (64bpp):  256B=8x4,   4KB=32x16,  64KB=128x64
-    {0xAACFu, 0x5530u},  // 16B (128bpp): 256B=4x4,   4KB=16x16,  64KB=64x64
-};
-
-// Publicly documented AMD GFX10 SW_*_D (Displayable / X-first Morton) 2D masks indexed by bpp_log2 (0..4).
-constexpr Masks2D kMasks2DDisplay[5] = {
-    {0x5533u, 0xAACCu},  // 1B  (8bpp):   256B=16x16, 4KB=64x64,  64KB=256x256
-    {0x5557u, 0xAAA8u},  // 2B  (16bpp):  256B=16x8,  4KB=64x32,  64KB=256x128
-    {0x5557u, 0xAAA8u},  // 4B  (32bpp):  256B=8x8,   4KB=32x32,  64KB=128x128
-    {0x555Fu, 0xAAA0u},  // 8B  (64bpp):  256B=8x4,   4KB=32x16,  64KB=128x64
-    {0x555Fu, 0xAAA0u},  // 16B (128bpp): 256B=4x4,   4KB=16x16,  64KB=64x64
-};
-
-// Publicly documented AMD GFX10 SW_*_R (Rotated / Y-first Morton) 2D masks indexed by bpp_log2 (0..4).
+// Y-first Morton masks for the _R modes, indexed by bpp_log2 (0..4).
 constexpr Masks2D kMasks2DRotated[5] = {
     {0xAAA3u, 0x555Cu},  // 1B  (8bpp):   256B=16x16, 4KB=64x64,  64KB=256x256
     {0xAAD3u, 0x552Cu},  // 2B  (16bpp):  256B=16x8,  4KB=64x32,  64KB=256x128
@@ -123,29 +148,38 @@ constexpr Masks2D kMasks2DRotated[5] = {
     {0xAAAFu, 0x5550u},  // 16B (128bpp): 256B=4x4,   4KB=16x16,  64KB=64x64
 };
 
-// 16-bit intra-tile coordinate interleave masks for thick 3D Standard Swizzle (4KB / 64KB / Var _S).
-struct Masks3D {
-    uint16_t x_bytes_mask;
-    uint16_t y_mask;
-    uint16_t z_mask;
-};
+// Compile-time verification: in every equation the low bpp_log2 entries are the byte within the
+// element, and each axis uses coordinate bits 0..n-1 exactly once within 256B, 4KB and 64KB.
+constexpr bool verify_equation(const BitEq* eq, uint32_t b, bool thick) noexcept {
+    for (uint32_t i = 0; i < b; ++i) {
+        if (eq[i] != 0) return false;
+    }
+    for (uint32_t blk : {8u, 12u, 16u}) {
+        uint32_t seen[4] = {0, 0, 0, 0};
+        for (uint32_t i = b; i < blk; ++i) {
+            const uint32_t axis = eq[i] >> 4;
+            const uint32_t bit = eq[i] & 0xFu;
+            if (axis == 0 || axis > 3 || (axis == 3 && !thick)) return false;
+            if (seen[axis] & (1u << bit)) return false;
+            seen[axis] |= 1u << bit;
+        }
+        for (uint32_t axis = 1; axis <= 3; ++axis) {
+            if ((seen[axis] & (seen[axis] + 1u)) != 0) return false;  // bits 0..n-1, no gaps
+        }
+    }
+    return true;
+}
 
-constexpr Masks3D kMasks3DStandard[5] = {
-    {0x900Fu, 0x2530u, 0x4AC0u},  // 1B  (8bpp):   4KB=16x16x16, 64KB=64x32x32
-    {0x210Fu, 0x4A30u, 0x94C0u},  // 2B  (16bpp):  4KB=16x16x8,  64KB=32x32x32
-    {0x490Fu, 0x9230u, 0x24C0u},  // 4B  (32bpp):  4KB=16x8x8,   64KB=32x32x16
-    {0x990Fu, 0x2230u, 0x44C0u},  // 8B  (64bpp):  4KB=8x8x8,    64KB=32x16x16
-    {0x491Fu, 0x2260u, 0x9480u},  // 16B (128bpp): 4KB=8x8x4,    64KB=16x16x16
-};
-
-// Compile-time verification that all 2D and 3D mask tables partition 16-bit offsets bijectively
-// and keep the lowest bpp_log2 byte-within-element bits in x_bytes_mask.
 constexpr bool verify_mask_tables() noexcept {
     constexpr uint32_t kExpectedW256[5] = {4, 4, 3, 3, 2};
     constexpr uint32_t kExpectedH256[5] = {4, 3, 3, 2, 2};
     for (uint32_t b = 0; b < 5; ++b) {
+        if (!verify_equation(kEqStandard[b], b, false) || !verify_equation(kEqDisplay[b], b, false) ||
+            !verify_equation(kEqStandard3D[b], b, true)) {
+            return false;
+        }
         const uint16_t bpp_bits = static_cast<uint16_t>((1u << b) - 1u);
-        const Masks2D sets[3] = {kMasks2DStandard[b], kMasks2DDisplay[b], kMasks2DRotated[b]};
+        const Masks2D sets[1] = {kMasks2DRotated[b]};
         for (const auto& m : sets) {
             if ((m.x_bytes_mask & m.y_mask) != 0u) return false;
             if ((m.x_bytes_mask | m.y_mask) != 0xFFFFu) return false;
@@ -160,26 +194,10 @@ constexpr bool verify_mask_tables() noexcept {
             const uint32_t y64k = static_cast<uint32_t>(std::popcount(m.y_mask));
             if (x64k - b != kExpectedW256[b] + 4u || y64k != kExpectedH256[b] + 4u) return false;
         }
-        const auto& m3 = kMasks3DStandard[b];
-        if ((m3.x_bytes_mask & m3.y_mask) != 0u || (m3.x_bytes_mask & m3.z_mask) != 0u ||
-            (m3.y_mask & m3.z_mask) != 0u) {
-            return false;
-        }
-        if ((m3.x_bytes_mask | m3.y_mask | m3.z_mask) != 0xFFFFu) return false;
-        if ((m3.x_bytes_mask & bpp_bits) != bpp_bits) return false;
     }
     return true;
 }
 static_assert(verify_mask_tables(), "GFX10 swizzle mask table invariant failed");
-
-constexpr Masks2D select_masks_2d(SwizzleFamily family, uint32_t bpp_log2) noexcept {
-    switch (family) {
-        case SwizzleFamily::Standard: return kMasks2DStandard[bpp_log2];
-        case SwizzleFamily::Display:  return kMasks2DDisplay[bpp_log2];
-        case SwizzleFamily::Rotated:  return kMasks2DRotated[bpp_log2];
-        default:                      return {0, 0};
-    }
-}
 
 // GFX10 64KB/Var _X pipe-bank XOR: leaves bits [0..7] (256B pipe interleave) untouched and XORs
 // pipe/bank bits [8..11] with reverse-ordered upper intra-tile bits [15..12]. Bijective involution.
@@ -194,9 +212,9 @@ struct TileShape {
     uint32_t h_log2 = 0;
     uint32_t d_log2 = 0;
     uint32_t blk_size_log2 = 0;
-    uint16_t x_mask = 0;
+    const BitEq* eq = nullptr;  // _S / _D / S3: addrlib equation (first blk_size_log2 entries)
+    uint16_t x_mask = 0;        // _R only (eq == nullptr)
     uint16_t y_mask = 0;
-    uint16_t z_mask = 0;
     bool xor_mode = false;
     bool thick_3d = false;
 };
@@ -207,28 +225,47 @@ constexpr TileShape compute_tile_shape(SwizzleTraits traits, uint32_t bpp_log2, 
     s.xor_mode = traits.xor_mode;
     const uint16_t blk_mask = static_cast<uint16_t>((1u << traits.blk_size_log2) - 1u);
 
-    // On GFX10, 4KB/64KB/Var Standard (_S) modes use thick 3D tiling for 3D surfaces;
-    // 256B modes and Display/Rotated (_D, _R) modes stack 2D tiled slices along Z.
-    if (is_3d && traits.family == SwizzleFamily::Standard && traits.blk_size_log2 >= 12u) {
-        const Masks3D m = kMasks3DStandard[bpp_log2];
-        s.x_mask = static_cast<uint16_t>(m.x_bytes_mask & blk_mask);
-        s.y_mask = static_cast<uint16_t>(m.y_mask & blk_mask);
-        s.z_mask = static_cast<uint16_t>(m.z_mask & blk_mask);
-        s.w_log2 = static_cast<uint32_t>(std::popcount(s.x_mask)) - bpp_log2;
-        s.h_log2 = static_cast<uint32_t>(std::popcount(s.y_mask));
-        s.d_log2 = static_cast<uint32_t>(std::popcount(s.z_mask));
-        s.thick_3d = true;
+    // addrlib (Gfx10Lib::GetSwizzlePatternInfo): 3D surfaces in 4KB_S / 64KB_S use the thick S3
+    // patterns; 256B modes and _D / _R modes stack 2D tiled slices along Z.
+    const bool thick = is_3d && traits.family == SwizzleFamily::Standard && traits.blk_size_log2 >= 12u;
+    if (traits.family == SwizzleFamily::Standard || traits.family == SwizzleFamily::Display) {
+        s.eq = thick ? kEqStandard3D[bpp_log2]
+                     : (traits.family == SwizzleFamily::Standard ? kEqStandard[bpp_log2] : kEqDisplay[bpp_log2]);
+        uint32_t extent[4] = {0, 0, 0, 0};
+        for (uint32_t i = 0; i < traits.blk_size_log2; ++i) {
+            const uint32_t axis = s.eq[i] >> 4;
+            if (axis != 0) {
+                extent[axis] = std::max(extent[axis], (s.eq[i] & 0xFu) + 1u);
+            }
+        }
+        s.w_log2 = extent[1];
+        s.h_log2 = extent[2];
+        s.d_log2 = extent[3];
+        s.thick_3d = thick;
     } else {
-        const Masks2D m = select_masks_2d(traits.family, bpp_log2);
+        const Masks2D m = kMasks2DRotated[bpp_log2];
         s.x_mask = static_cast<uint16_t>(m.x_bytes_mask & blk_mask);
         s.y_mask = static_cast<uint16_t>(m.y_mask & blk_mask);
-        s.z_mask = 0;
         s.w_log2 = static_cast<uint32_t>(std::popcount(s.x_mask)) - bpp_log2;
         s.h_log2 = static_cast<uint32_t>(std::popcount(s.y_mask));
         s.d_log2 = 0;
         s.thick_3d = false;
     }
     return s;
+}
+
+constexpr uint32_t apply_equation(const BitEq* eq, uint32_t blk_size_log2, uint32_t x, uint32_t y,
+                                  uint32_t z) noexcept {
+    uint32_t intra = 0;
+    for (uint32_t i = 0; i < blk_size_log2; ++i) {
+        const uint32_t axis = eq[i] >> 4;
+        const uint32_t bit = eq[i] & 0xFu;
+        const uint32_t coord = axis == 1 ? x : (axis == 2 ? y : z);
+        if (axis != 0) {
+            intra |= ((coord >> bit) & 1u) << i;
+        }
+    }
+    return intra;
 }
 
 constexpr size_t tiled_byte_offset_shape(const TileShape& shape, uint32_t bpp_log2, uint32_t bx, uint32_t by,
@@ -241,13 +278,15 @@ constexpr size_t tiled_byte_offset_shape(const TileShape& shape, uint32_t bpp_lo
     const uint32_t tile_y = by >> shape.h_log2;
     const uint32_t tile_z = bz >> shape.d_log2;
 
-    const uint32_t local_x_bytes = (bx & tile_w_mask) << bpp_log2;
     const uint32_t local_y = by & tile_h_mask;
     const uint32_t local_z = bz & tile_d_mask;
 
-    uint32_t intra = deposit_bits(local_x_bytes, shape.x_mask) | deposit_bits(local_y, shape.y_mask);
-    if (shape.thick_3d) {
-        intra |= deposit_bits(local_z, shape.z_mask);
+    uint32_t intra = 0;
+    if (shape.eq != nullptr) {
+        intra = apply_equation(shape.eq, shape.blk_size_log2, bx & tile_w_mask, local_y, local_z);
+    } else {
+        const uint32_t local_x_bytes = (bx & tile_w_mask) << bpp_log2;
+        intra = deposit_bits(local_x_bytes, shape.x_mask) | deposit_bits(local_y, shape.y_mask);
     }
     if (shape.xor_mode) {
         intra = apply_gfx10_xor_64k(intra);
@@ -584,6 +623,11 @@ size_t tiled_byte_offset_2d(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t
     const uint32_t tiles_per_row = static_cast<uint32_t>(
         (static_cast<uint64_t>(eff_pitch) + tile_w - 1u) >> shape.w_log2);
     return tiled_byte_offset_shape(shape, bpp_log2, bx, by, /*bz=*/0u, tiles_per_row, /*tiles_per_col=*/1u);
+}
+
+size_t tiled_footprint_bytes(const TextureLayoutDesc& desc, uint32_t mip) noexcept {
+    const SubresourcePlan plan = plan_subresource(desc, mip);
+    return plan.ok ? plan.tiled_total_bytes : 0u;
 }
 
 DetileResult detile_subresource(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* src,

@@ -291,6 +291,93 @@ void test_small_3d_16x16x4() {
     verify_round_trip({61u, 16u, 16u, 4u, 1u, 0x105u, 0u}, 0u, 6007u);  // 1B thick 4KB
 }
 
+// Golden addresses from AMD addrlib's public gfx10 RB+ pattern tables (gfx10SwizzlePattern.h).
+void test_addrlib_equations_2d() {
+    // SW_256B_D, 4 B elements: 0 0 X0 X1 Y0 Y1 X2 Y2 (SW_256B_S ends Y2 X2 instead).
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 1, 1, 4, 8) == 4u + 16u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 2, 0, 4, 8) == 8u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 2, 4, 8) == 32u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 4, 0, 4, 8) == 64u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 4, 4, 8) == 128u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BS, 4, 0, 4, 8) == 128u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BS, 0, 4, 4, 8) == 64u);
+    // SW_256B_D, 1 B: X0 X1 X2 Y1 Y0 Y2 X3 Y3.
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 1, 1, 16) == 16u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 2, 1, 16) == 8u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 8, 0, 1, 16) == 64u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 8, 1, 16) == 128u);
+    // SW_256B_D, 8 B: 0 0 0 X0 Y0 X1 X2 Y1.
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 1, 0, 8, 8) == 8u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 1, 8, 8) == 16u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 2, 0, 8, 8) == 32u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 4, 0, 8, 8) == 64u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw256BD, 0, 2, 8, 8) == 128u);
+    // SW_4KB_D, 16 B: 0 0 0 0 X0 Y0 X1 Y1 Y2 X2 Y3 X3.
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw4KBD, 0, 4, 16, 16) == 256u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw4KBD, 4, 0, 16, 16) == 512u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw4KBD, 0, 8, 16, 16) == 1024u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw4KBD, 8, 0, 16, 16) == 2048u);
+    // SW_64KB_D, 4 B: 0 0 X0 X1 Y0 Y1 X2 Y2 Y3 X3 Y4 X4 Y5 X5 Y6 X6.
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw64KBD, 4, 4, 4, 128) == 64u + 128u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw64KBD, 0, 8, 4, 128) == 256u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw64KBD, 8, 0, 4, 128) == 512u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw64KBD, 0, 64, 4, 128) == 16384u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw64KBD, 64, 0, 4, 128) == 32768u);
+    // SW_4KB_S, 4 B (unchanged): 0 0 X0 X1 Y0 Y1 Y2 X2 Y3 X3 Y4 X4.
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw4KBS, 0, 8, 4, 32) == 256u);
+    CHECK(tiled_byte_offset_2d(SwizzleMode::Sw4KBS, 8, 0, 4, 32) == 512u);
+}
+
+// Thick 3D SW_4KB_S (addrlib GFX10_SW_4K_S3): tile a texture whose elements carry their own
+// coordinates and check where they land.
+void check_thick_position(uint32_t dxgi_format, uint32_t bpe, uint32_t w, uint32_t h, uint32_t d, uint32_t x,
+                          uint32_t y, uint32_t z, size_t expected_offset) {
+    const TextureLayoutDesc desc{dxgi_format, w, h, d, 1u, 0x105u, 0u};
+    std::vector<uint8_t> linear(static_cast<size_t>(w) * h * d * bpe, 0u);
+    const size_t index = (static_cast<size_t>(z) * h + y) * w + x;
+    linear[index * bpe] = 0xA5u;
+    std::vector<uint8_t> tiled;
+    CHECK(tile_subresource_for_test(desc, 0u, linear.data(), linear.size(), tiled));
+    CHECK(expected_offset < tiled.size());
+    if (expected_offset < tiled.size()) {
+        CHECK(tiled[expected_offset] == 0xA5u);
+    }
+}
+
+void test_addrlib_equations_3d() {
+    // 8 B elements, 4KB_S3: 0 0 0 X0 Z0 Y0 X1 Z1 Y1 X2 Z2 Y2 (8x8x8 block).
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 1u, 0u, 0u, 8u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 0u, 0u, 1u, 16u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 0u, 1u, 0u, 32u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 2u, 0u, 0u, 64u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 0u, 0u, 2u, 128u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 0u, 2u, 0u, 256u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 4u, 0u, 0u, 512u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 0u, 0u, 4u, 1024u);
+    check_thick_position(10u, 8u, 8u, 8u, 8u, 0u, 4u, 0u, 2048u);
+    // 4 B elements: 0 0 X0 Y0 Z0 Y1 X1 Z1 Y2 X2 Z2 Y3 (8x16x8 block).
+    check_thick_position(28u, 4u, 8u, 16u, 8u, 0u, 8u, 0u, 2048u);
+    check_thick_position(28u, 4u, 8u, 16u, 8u, 4u, 0u, 0u, 512u);
+    check_thick_position(28u, 4u, 8u, 16u, 8u, 0u, 0u, 4u, 1024u);
+    // 1 B elements: X0 X1 Z0 Y0 Z1 Y1 X2 Z2 Y2 X3 Z3 Y3 (16x16x16 block).
+    check_thick_position(61u, 1u, 16u, 16u, 16u, 0u, 0u, 1u, 4u);
+    check_thick_position(61u, 1u, 16u, 16u, 16u, 0u, 1u, 0u, 8u);
+    check_thick_position(61u, 1u, 16u, 16u, 16u, 8u, 0u, 0u, 512u);
+
+    // Footprints: whole thick blocks.
+    CHECK(tiled_footprint_bytes({28u, 8u, 16u, 8u, 1u, 0x105u, 0u}, 0u) == 4096u);
+    CHECK(tiled_footprint_bytes({28u, 16u, 8u, 8u, 1u, 0x105u, 0u}, 0u) == 8192u);
+    CHECK(tiled_footprint_bytes({10u, 17u, 17u, 17u, 1u, 0x105u, 0u}, 0u) == 27u * 4096u);
+    CHECK(tiled_footprint_bytes({10u, 33u, 33u, 33u, 1u, 0x105u, 0u}, 0u) == 125u * 4096u);
+    CHECK(tiled_footprint_bytes({2u, 4u, 8u, 8u, 1u, 0x105u, 0u}, 0u) == 4096u);  // 16 B: 4x8x8
+    CHECK(tiled_footprint_bytes({2u, 8u, 8u, 4u, 1u, 0x105u, 0u}, 0u) == 8192u);
+    // 64KB_S3, 4 B: 32x32x16 block.
+    CHECK(tiled_footprint_bytes({28u, 32u, 32u, 16u, 1u, 0x109u, 0u}, 0u) == 65536u);
+    // 3D in _D modes stays 2D-sliced: one 256B_D block (8x8 at 4 B) per slice.
+    CHECK(tiled_footprint_bytes({28u, 8u, 8u, 3u, 1u, 0x102u, 0u}, 0u) == 3u * 256u);
+    CHECK(tiled_footprint_bytes({28u, 8u, 8u, 1u, 1u, 0x0FFu, 0u}, 0u) == 0u);
+}
+
 void test_linear_custom_pitch() {
     // R8G8B8A8_UNORM 20x10: tight row = 80 bytes, custom D3D12 row pitch = 256 bytes.
     const TextureLayoutDesc desc{
@@ -389,6 +476,8 @@ int main() {
     test_r32g32b32a32_2x2_sw256bd();
     test_required_formats_and_modes();
     test_small_3d_16x16x4();
+    test_addrlib_equations_2d();
+    test_addrlib_equations_3d();
     test_linear_custom_pitch();
     test_bounds_and_error_rejection();
 

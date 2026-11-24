@@ -3,8 +3,10 @@
 // AMD GFX10 / RDNA2 console texture detiler (G49a): converts tiled Xbox Series texture memory
 // into tightly-packed linear texels/blocks for WebGPU WriteTexture upload.
 //
-// Swizzle equations follow the publicly documented AMD GFX10 addrlib / D3D12 Standard Swizzle
-// bit-interleaving specifications (256B, 4KB, 64KB, Var, and 64KB/Var XOR pipe-bank modes).
+// The _S and _D equations (256B/4KB/64KB, thin) and the thick 3D _S equations (4KB/64KB) are AMD
+// addrlib's public gfx10 RB+ pattern tables (gfx10SwizzlePattern.h). The _R / VAR modes and the
+// _X pipe-bank XOR are not from addrlib (gfx10 defines no non-XOR _R or VAR_S/D pattern, and the
+// XOR term depends on the pipe configuration); they stay unverified.
 // Pure C++20, zero external dependencies, Wasm64-safe, bounds-checked on every read.
 
 #include <cstddef>
@@ -83,6 +85,10 @@ bool is_swizzle_supported(SwizzleMode mode) noexcept;
 // and `pitch_in_blocks` stride. Returns SIZE_MAX if `mode` or `bytes_per_block` is invalid.
 size_t tiled_byte_offset_2d(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t bytes_per_block,
                             uint32_t pitch_in_blocks) noexcept;
+
+// Source bytes detile_subresource needs for subresource `mip` (whole tiles; for Linear the pitched
+// rows). 0 if the format, layout or dimensions are not supported.
+size_t tiled_footprint_bytes(const TextureLayoutDesc& desc, uint32_t mip) noexcept;
 
 // Detile a single subresource (mip level `mip`) from `src[0..src_bytes)` into tightly-packed linear
 // rows in `linear_out`. Supports 2D (depth == 1) and 3D (depth > 1) textures in linear and tiled
