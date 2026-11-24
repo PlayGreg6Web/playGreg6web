@@ -109,6 +109,12 @@ P pg6_seam_string(Pg6SeamBuffers& buffers, uint64_t guest_va) {
     return static_cast<P>(buffers.string(guest_va, sizeof(std::remove_pointer_t<P>)));
 }
 
+// A writable string at dst_va that the callee extends with the string at src_va.
+template <typename P>
+P pg6_seam_string_out(Pg6SeamBuffers& buffers, uint64_t dst_va, uint64_t src_va) {
+    return static_cast<P>(buffers.string_out(dst_va, src_va, sizeof(std::remove_pointer_t<P>)));
+}
+
 inline uint64_t pg6_seam_load_u64(uint64_t guest_va) {
     uint64_t value;
     std::memcpy(&value, pg6_seam_host_ptr(guest_va), 8);

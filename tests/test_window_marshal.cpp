@@ -4,8 +4,8 @@
 // with the generator, recomp/src/stubs/exports/tests/fixture.rs). The test maps window slots onto
 // arena pages so that slot 0 | slot 1 are NOT host-adjacent and slot 1 | slot 2 are, then calls the
 // thunks the way guest code does with buffers that span those slots: a file read into a window
-// buffer (CreateFileW with a split path, ReadFile), memcpy-class CRT calls (memcpy,
-// XMemTransferMemory), string functions (strlen, strncpy), and a COM method's raw pointer argument
+// buffer (CreateFileW with a split path, ReadFile), memcpy-class CRT calls (memcpy, memset,
+// XMemTransferMemory), string functions (strlen, strncpy, strcpy, strcat), and a COM method's raw pointer argument
 // (the COM bridge's Marshal). Split buffers go through bounce copies, contiguous ones are used in
 // place, and pointer results map back to the guest addresses they stand for. Synthetic data only.
 
@@ -229,6 +229,28 @@ void test_string_functions() {
     CHECK(std::memcmp(window_bytes(d2, sizeof(text)).data(), text, sizeof(text)) == 0);
 }
 
+// O31: memset (the length follows the fill value) and string destinations without a length
+// (strcpy, strcat) on buffers split across non-adjacent slots.
+void test_memset_and_string_destinations() {
+    Fixture fx;
+    const uint64_t dst = W + k64K - 40;  // 40 bytes in slot 0, the rest in slot 1
+    CHECK(fx.call(thunk("memset"), {dst, 0x5A, 100}) == dst);
+    CHECK(window_bytes(dst, 100) == std::vector<uint8_t>(100, 0x5A));
+    CHECK(fx.page(2)[59] == 0x5A && fx.page(2)[60] != 0x5A);  // exactly 100 bytes, nothing beyond
+
+    const char src[] = "a source string longer than what is left of the slot";
+    const uint64_t s = W + 2 * k64K + 0x100;  // inside slot 2
+    CHECK(gw::copy_to_guest(s, src, sizeof(src)));
+    const uint64_t d = W + k64K - 10;
+    const char start[] = "head:";
+    CHECK(gw::copy_to_guest(d, start, sizeof(start)));
+    CHECK(fx.call(thunk("strcat"), {d, s}) == d);
+    const std::string expect = std::string(start) + src;
+    CHECK(std::memcmp(window_bytes(d, expect.size() + 1).data(), expect.c_str(), expect.size() + 1) == 0);
+    CHECK(fx.call(thunk("strcpy"), {d, s}) == d);
+    CHECK(std::memcmp(window_bytes(d, sizeof(src)).data(), src, sizeof(src)) == 0);
+}
+
 // The COM bridge's raw pointer parameters (what a COM method with a buffer argument receives).
 void test_com_raw_pointer_argument() {
     Fixture fx;
@@ -270,6 +292,7 @@ int main() {
     test_file_read_into_window_buffers();
     test_memcpy_class();
     test_string_functions();
+    test_memset_and_string_destinations();
     test_com_raw_pointer_argument();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_window_marshal: %d failure(s)\n", g_failures);

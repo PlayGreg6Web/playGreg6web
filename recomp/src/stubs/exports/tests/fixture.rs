@@ -79,8 +79,11 @@ const WINDOW_FIXTURE_EXPORTS: &[&str] = &[
     "KERNEL32.dll!CreateFileW",
     "KERNEL32.dll!CloseHandle",
     "VCRUNTIME140.dll!memcpy",
+    "VCRUNTIME140.dll!memset",
     "api-ms-win-crt-string-l1-1-0.dll!strlen",
     "api-ms-win-crt-string-l1-1-0.dll!strncpy",
+    "api-ms-win-crt-string-l1-1-0.dll!strcpy",
+    "api-ms-win-crt-string-l1-1-0.dll!strcat",
     "xmem.dll!XMemTransferMemory",
 ];
 

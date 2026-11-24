@@ -138,6 +138,14 @@ public:
         }
         return string_window(va, char_size);
     }
+    // Host pointer for a writable NUL-terminated string at dst that the callee extends with the
+    // string at src (strcpy / strcat shapes: no length parameter).
+    void* string_out(uint64_t dst, uint64_t src, size_t char_size) {
+        if (!in_window(dst)) [[likely]] {
+            return host_or_trap(dst);
+        }
+        return string_out_window(dst, src, char_size);
+    }
     // Copies writable bounce copies back to the guest (once).
     void finish();
     // guest_window::guest_address(), plus pointers into this call's bounce copies.
@@ -153,6 +161,7 @@ private:
     };
     void* range_window(uint64_t va, uint64_t bytes, bool writable);
     void* string_window(uint64_t va, size_t char_size);
+    void* string_out_window(uint64_t dst, uint64_t src, size_t char_size);
     std::vector<Bounce> bounces_;  // empty (no allocation) unless a window buffer is split
 };
 

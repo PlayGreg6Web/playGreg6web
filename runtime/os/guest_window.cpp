@@ -279,17 +279,17 @@ void* Buffers::range_window(uint64_t va, uint64_t bytes, bool writable) {
     return host;
 }
 
-void* Buffers::string_window(uint64_t va, size_t char_size) {
-    if (!enabled() || char_size == 0 || char_size > 4) {
-        return host_or_trap(va);
-    }
-    // Measure the string slot by slot (terminator included).
+namespace {
+
+// Bytes of the NUL-terminated string at guest `va` (terminator included), measured slot by slot
+// through the shared translation; 0 if it runs into an unmapped slot or past kMaxBounceBytes.
+uint64_t measure_string(uint64_t va, size_t char_size) {
     uint64_t bytes = 0;
     for (;;) {
         const uint64_t at = va + bytes;
         const auto* p = static_cast<const uint8_t*>(translate(at));
         if (p == nullptr) {
-            return host_or_trap(va);
+            return 0;
         }
         const uint64_t left = kSlotBytes - (at & (kSlotBytes - 1));
         uint64_t i = 0;
@@ -299,29 +299,53 @@ void* Buffers::string_window(uint64_t va, size_t char_size) {
                 zero = zero && p[i + k] == 0;
             }
             if (zero) {
-                return range_window(va, bytes + i + char_size, false);
+                return bytes + i + char_size;
             }
         }
         if (i != left) {
             // A character straddles the slot end (odd alignment): measure it through a copy.
             uint8_t ch[4] = {};
             if (!copy_from_guest(ch, at + i, char_size)) {
-                return host_or_trap(va);
+                return 0;
             }
             bool zero = true;
             for (size_t k = 0; k < char_size; ++k) {
                 zero = zero && ch[k] == 0;
             }
             if (zero) {
-                return range_window(va, bytes + i + char_size, false);
+                return bytes + i + char_size;
             }
             i += char_size;
         }
         bytes += i;
         if (bytes > kMaxBounceBytes) {
-            return host_or_trap(va);
+            return 0;
         }
     }
+}
+
+}  // namespace
+
+void* Buffers::string_window(uint64_t va, size_t char_size) {
+    if (!enabled() || char_size == 0 || char_size > 4) {
+        return host_or_trap(va);
+    }
+    const uint64_t bytes = measure_string(va, char_size);
+    return bytes == 0 ? host_or_trap(va) : range_window(va, bytes, false);
+}
+
+void* Buffers::string_out_window(uint64_t dst, uint64_t src, size_t char_size) {
+    if (!enabled() || char_size == 0 || char_size > 4) {
+        return host_or_trap(dst);
+    }
+    // Room for the destination's current string followed by the source's (strcat; an upper
+    // bound for strcpy): a bounce copy may be larger than what the callee writes, never smaller.
+    const uint64_t have = measure_string(dst, char_size);
+    const uint64_t add = src != 0 ? measure_string(src, char_size) : 0;
+    if (add == 0) {
+        return host_or_trap(dst);
+    }
+    return range_window(dst, (have != 0 ? have - char_size : 0) + add, true);
 }
 
 void Buffers::finish() {

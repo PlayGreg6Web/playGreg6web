@@ -130,13 +130,15 @@
 //! [`render_bridge_for`], [`render_exports_for`]) gets a seam that translates through the
 //! runtime's `os/guest_window.h`, and thunks that marshal guest buffers ([`param_marshal`]): a
 //! data pointer with a neighbouring length parameter (by name: `size`, `count`, `*_bytes`, ...;
-//! the length after a run of pointers belongs to each of them, a count before the last pointer
-//! to it), a read-only C string, or one pointee. A window buffer whose slots sit on adjacent
-//! host pages is passed in place; any other window buffer as a bounce copy that is copied back
-//! after the call (non-const pointees), and pointer results into a bounce copy map back to the
-//! guest address. Outside the window nothing changes but one compare per pointer. Output
-//! strings without a length (`strcpy`'s destination) are passed as one character: they are
-//! correct only when the window keeps runs contiguous (see `runtime/guest/memory_model.h`).
+//! the length after a run of pointers belongs to each of them, also past a fill value for a
+//! buffer-named pointer as in `memset`, a count before the last pointer to it), a read-only C
+//! string, a string destination without a length (`strcpy` / `strcat`: room for both strings),
+//! or one pointee. A window buffer whose slots sit on adjacent host pages is passed in place; any
+//! other window buffer as a bounce copy that is copied back after the call (non-const pointees),
+//! and pointer results into a bounce copy map back to the guest address. Outside the window
+//! nothing changes but one compare per pointer. The writable strings that remain one character
+//! (`strtok` keeps its pointer, `itoa` has no source) are correct only when the window keeps runs
+//! contiguous (see `runtime/guest/memory_model.h`).
 //!
 //! The loader fills each IAT slot with a value its indirect-call helper
 //! (`__playgta6_indirect_call(state, target)`) maps back to the slot; `pg6_find_import_thunk`
@@ -2109,6 +2111,12 @@ template <typename P>
 P pg6_seam_string(Pg6SeamBuffers& buffers, uint64_t guest_va) {
     return static_cast<P>(buffers.string(guest_va, sizeof(std::remove_pointer_t<P>)));
 }
+
+// A writable string at dst_va that the callee extends with the string at src_va.
+template <typename P>
+P pg6_seam_string_out(Pg6SeamBuffers& buffers, uint64_t dst_va, uint64_t src_va) {
+    return static_cast<P>(buffers.string_out(dst_va, src_va, sizeof(std::remove_pointer_t<P>)));
+}
 ";
 
 /// The guest-state seam for code lifted with `model`: [`MemoryModel::Windowed`] translates
@@ -2214,6 +2222,10 @@ pub enum ParamMarshal {
     CString,
     /// One pointee (`T*`, `sizeof(T)` bytes; a pointer to an incomplete type stays plain).
     Pointee,
+    /// A writable NUL-terminated string the callee extends with the read-only string parameter
+    /// `src` (a destination named `dst` / `dest` without a length: `strcpy`, `strcat`). Room for
+    /// both strings.
+    StringOut { src: usize },
 }
 
 /// Whether a parameter name reads as the length of a neighbouring buffer, and if so whether it
@@ -2261,9 +2273,54 @@ pub fn param_marshal(shim: &ShimDecl) -> Vec<ParamMarshal> {
     };
     let is_ptr = |i: usize| shim.params[i].kind == TypeKind::Ptr;
     // The length after a run of buffers belongs to each of them (`memcpy(dst, src, size)`).
+    // For a pointer named as a memory buffer it may also follow other integers
+    // (`memset(dst, value, size)`), but never a later buffer of its own (`f(name, flags, buffer,
+    // size)`: the size is the buffer's).
+    let buffer_named = |i: usize| {
+        matches!(
+            name(i).to_ascii_lowercase().as_str(),
+            "buf"
+                | "buffer"
+                | "dst"
+                | "dest"
+                | "src"
+                | "source"
+                | "data"
+                | "mem"
+                | "ptr"
+                | "p"
+                | "s"
+        )
+    };
     let forward = |i: usize| -> Option<(usize, bool)> {
-        let j = (i + 1..n).find(|&j| !is_ptr(j))?;
-        length_at(j).map(|elements| (j, elements))
+        let first = (i + 1..n).find(|&j| !is_ptr(j))?;
+        if let Some(elements) = length_at(first) {
+            return Some((first, elements));
+        }
+        if !buffer_named(i) {
+            return None;
+        }
+        (first..n)
+            .take_while(|&j| !is_ptr(j))
+            .find_map(|j| length_at(j).map(|elements| (j, elements)))
+    };
+    // The one read-only string a writable string destination is built from.
+    let string_source = |i: usize| -> Option<usize> {
+        let out = shim.params[i].spelling.as_str();
+        let dest = matches!(name(i).to_ascii_lowercase().as_str(), "dst" | "dest");
+        if !dest || !matches!(out, "char*" | "char16_t*" | "wchar_t*") {
+            return None;
+        }
+        let mut sources = (0..n).filter(|&j| {
+            is_const_c_string(&shim.params[j])
+                && shim.params[j]
+                    .spelling
+                    .replace("const ", "")
+                    .replace(" const", "")
+                    == out
+        });
+        let src = sources.next()?;
+        sources.next().is_none().then_some(src)
     };
     let mut plan = vec![ParamMarshal::Plain; n];
     let mut used = vec![false; n];
@@ -2286,7 +2343,10 @@ pub fn param_marshal(shim: &ShimDecl) -> Vec<ParamMarshal> {
         plan[i] = match backward {
             Some((len, elements)) => ParamMarshal::Range { len, elements },
             None if is_const_c_string(&shim.params[i]) => ParamMarshal::CString,
-            None => ParamMarshal::Pointee,
+            None => match string_source(i) {
+                Some(src) => ParamMarshal::StringOut { src },
+                None => ParamMarshal::Pointee,
+            },
         };
     }
     plan
@@ -2322,6 +2382,10 @@ fn marshaled_arg_expr(shim: &ShimDecl, plan: &[ParamMarshal], i: usize) -> Strin
             }
         }
         ParamMarshal::CString => format!("pg6_seam_string<{spelling}>(pg6_buffers, {raw})"),
+        ParamMarshal::StringOut { src } => format!(
+            "pg6_seam_string_out<{spelling}>(pg6_buffers, {raw}, {})",
+            raw_arg(src, &shim.params[src])
+        ),
         ParamMarshal::Pointee => {
             format!("pg6_seam_range<{spelling}>(pg6_buffers, {raw}, pg6_seam_elem<{spelling}>())")
         }
@@ -3963,7 +4027,7 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
     /// class, plus the coverage (printed with `--nocapture`).
     #[test]
     fn window_marshaling_of_the_checkout_shims() {
-        use ParamMarshal::{CString, Plain, Pointee, Range};
+        use ParamMarshal::{CString, Plain, Pointee, Range, StringOut};
         let catalogue = checkout_catalogue();
         let plan = |name: &str| param_marshal(catalogue.get(name).expect(name));
         // A file read into a guest buffer: the buffer's extent is bytes_to_read; bytes_read is
@@ -4012,6 +4076,19 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
                 Plain
             ]
         );
+        // memset class: the length follows another integer (O31: the windowed boot of the title
+        // hands memset destinations in the CPU window).
+        assert_eq!(
+            plan("pg6_crt_memset"),
+            [
+                Range {
+                    len: 2,
+                    elements: true
+                },
+                Plain,
+                Plain
+            ]
+        );
         // A count before its array.
         assert_eq!(
             plan("pg6_xbox_XMemFreePhysicalPages"),
@@ -4037,6 +4114,21 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             }
             if p.contains(&CString) {
                 strings += 1;
+            }
+        }
+        // Writable strings without a length: string destinations get room for the result;
+        // what remains one pointee is printed (strtok keeps its pointer, itoa has no source).
+        assert_eq!(plan("pg6_crt_strcpy"), [StringOut { src: 1 }, CString]);
+        assert_eq!(plan("pg6_crt_strcat"), [StringOut { src: 1 }, CString]);
+        for shim in catalogue.shims.values() {
+            for (i, m) in param_marshal(shim).iter().enumerate() {
+                let s = shim.params[i].spelling.as_str();
+                if *m == Pointee && (s == "char*" || s == "char16_t*" || s == "wchar_t*") {
+                    println!(
+                        "window marshaling: writable string without extent: {} {:?}",
+                        shim.name, shim.param_names
+                    );
+                }
             }
         }
         println!(
