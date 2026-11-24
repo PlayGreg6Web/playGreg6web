@@ -268,9 +268,11 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
             desc.mip_levels = std::max<uint32_t>(1u, req.mip_levels);
             desc.d3d12_layout = req.layout;
             desc.pitch_bytes = 0;
+            desc.array_size = desc.depth > 1u ? 1u : std::max<uint32_t>(1u, req.array_size);
 
             std::vector<uint8_t> linear_out;
-            const gfx10::DetileResult res = gfx10::detile_from_surface(desc, /*mip=*/0u, src, src_bytes, linear_out);
+            const gfx10::DetileResult res =
+                gfx10::detile_surface_subresource(desc, req.mip, req.array_slice, src, src_bytes, linear_out);
             if (!res.ok || req.dst_row_pitch < res.row_pitch_bytes) {
                 return false;
             }

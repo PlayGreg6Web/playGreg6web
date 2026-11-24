@@ -463,6 +463,131 @@ void test_mip_chain_round_trips() {
     CHECK(out == lin);
 }
 
+// Every (mip, array slice) written into one surface reads back unchanged per subresource.
+void verify_subresource_round_trip(TextureLayoutDesc desc, uint32_t layers, uint32_t seed) {
+    desc.array_size = layers;
+    const FormatGeometry fmt = format_geometry(desc.dxgi_format);
+    const size_t size = surface_bytes(desc);
+    TextureLayoutDesc one = desc;
+    one.array_size = 1;
+    CHECK(size != 0 && size == surface_bytes(one) * (desc.depth > 1u ? 1u : layers));
+    std::vector<uint8_t> surface(size, 0);
+    const uint32_t slices = desc.depth > 1u ? 1u : layers;
+    std::vector<std::vector<uint8_t>> inputs;
+    for (uint32_t s = 0; s < slices; ++s) {
+        for (uint32_t mip = 0; mip < desc.mip_levels; ++mip) {
+            const uint32_t w = std::max(1u, desc.width >> mip);
+            const uint32_t h = std::max(1u, desc.height >> mip);
+            const uint32_t d = std::max(1u, desc.depth >> mip);
+            const size_t n = static_cast<size_t>((w + fmt.block_width - 1u) / fmt.block_width) *
+                             ((h + fmt.block_height - 1u) / fmt.block_height) * d * fmt.bytes_per_block;
+            inputs.push_back(make_synthetic_linear(n, seed + s * 64u + mip));
+            CHECK(tile_surface_subresource(desc, mip, s, inputs.back().data(), inputs.back().size(), surface.data(),
+                                           surface.size()));
+        }
+    }
+    size_t i = 0;
+    for (uint32_t s = 0; s < slices; ++s) {
+        for (uint32_t mip = 0; mip < desc.mip_levels; ++mip, ++i) {
+            std::vector<uint8_t> out;
+            const DetileResult r = detile_surface_subresource(desc, mip, s, surface.data(), surface.size(), out);
+            CHECK(r.ok);
+            CHECK(out == inputs[i]);
+        }
+    }
+    // Slice s sits one whole chain after slice s - 1 (addrlib: slice stride = chain size).
+    if (slices > 1u) {
+        std::vector<uint8_t> a, b;
+        CHECK(detile_surface_subresource(desc, 0u, 1u, surface.data(), surface.size(), a).ok);
+        CHECK(detile_surface_subresource(one, 0u, 0u, surface.data() + surface_bytes(one), surface_bytes(one), b).ok);
+        CHECK(a == b);
+    }
+    std::vector<uint8_t> out;
+    CHECK(!detile_surface_subresource(desc, 0u, slices, surface.data(), surface.size(), out).ok);
+    CHECK(!detile_surface_subresource(desc, desc.mip_levels, 0u, surface.data(), surface.size(), out).ok);
+    CHECK(!detile_surface_subresource(desc, 0u, 0u, surface.data(), surface.size() - 1u, out).ok);
+}
+
+void test_subresource_round_trips() {
+    // Each verified mode, multi-mip 2D arrays (tail mips included where the mode has a tail).
+    verify_subresource_round_trip({28u, 64u, 64u, 1u, 7u, 0x101u, 0u}, 3u, 12100u);   // 256B_S
+    verify_subresource_round_trip({28u, 64u, 32u, 1u, 7u, 0x102u, 0u}, 2u, 12200u);   // 256B_D
+    verify_subresource_round_trip({28u, 256u, 256u, 1u, 9u, 0x105u, 0u}, 2u, 12300u); // 4KB_S
+    verify_subresource_round_trip({77u, 128u, 64u, 1u, 8u, 0x105u, 0u}, 3u, 12400u);  // 4KB_S BC3
+    verify_subresource_round_trip({61u, 100u, 60u, 1u, 7u, 0x106u, 0u}, 2u, 12500u);  // 4KB_D 1 B
+    verify_subresource_round_trip({71u, 512u, 512u, 1u, 10u, 0x109u, 0u}, 2u, 12600u); // 64KB_S BC1
+    verify_subresource_round_trip({10u, 300u, 20u, 1u, 9u, 0x10Au, 0u}, 2u, 12700u);  // 64KB_D 8 B
+    verify_subresource_round_trip({2u, 32u, 32u, 1u, 6u, 0x10Au, 0u}, 4u, 12800u);    // 16 B, all in tail
+    // 3D: one subresource per mip (every depth slice); no array slices.
+    verify_subresource_round_trip({10u, 32u, 32u, 32u, 4u, 0x105u, 0u}, 1u, 12900u);  // thick
+    verify_subresource_round_trip({28u, 16u, 16u, 8u, 3u, 0x106u, 0u}, 1u, 13000u);   // 2D-sliced
+    const TextureLayoutDesc vol{10u, 32u, 32u, 32u, 4u, 0x105u, 0u};
+    std::vector<uint8_t> surface(surface_bytes(vol)), out;
+    CHECK(!detile_surface_subresource(vol, 0u, 1u, surface.data(), surface.size(), out).ok);
+    TextureLayoutDesc vol_array = vol;
+    vol_array.array_size = 2u;
+    CHECK(surface_bytes(vol_array) == 0u);
+}
+
+// Tail mips are read inside the tail block at addrlib's coordinates: 32x32 BC3 with 4 mips in
+// 4KB_S keeps the whole chain in one block, mip 0 at element (8, 0) and mip 1 at (4, 8). The
+// expected bytes come from the plain 4KB_S equation (tiled_byte_offset_2d) at those coordinates.
+void test_tail_coordinates() {
+    TextureLayoutDesc desc{77u, 32u, 32u, 1u, 4u, 0x105u, 0u};
+    desc.array_size = 2u;
+    std::vector<uint8_t> surface = make_synthetic_linear(2u * 4096u, 13100u);
+    CHECK(surface_bytes(desc) == 2u * 4096u);
+    struct Case {
+        uint32_t mip, tx, ty, blocks;
+    };
+    for (const Case c : {Case{0u, 8u, 0u, 8u}, Case{1u, 4u, 8u, 4u}}) {
+        for (uint32_t s = 0; s < 2u; ++s) {
+            std::vector<uint8_t> out;
+            const DetileResult r = detile_surface_subresource(desc, c.mip, s, surface.data(), surface.size(), out);
+            CHECK(r.ok && out.size() == size_t{c.blocks} * c.blocks * 16u);
+            bool same = out.size() == size_t{c.blocks} * c.blocks * 16u;
+            for (uint32_t y = 0; same && y < c.blocks; ++y) {
+                for (uint32_t x = 0; same && x < c.blocks; ++x) {
+                    const size_t off = size_t{s} * 4096u + tiled_byte_offset_2d(SwizzleMode::Sw4KBS, c.tx + x, c.ty + y, 16u, 16u);
+                    same = std::memcmp(out.data() + (size_t{y} * c.blocks + x) * 16u, surface.data() + off, 16u) == 0;
+                }
+            }
+            CHECK(same);
+        }
+    }
+}
+
+// Linear layouts: mip 0 only (the console's linear mip rule is not established, #665); array
+// slices where every candidate rule agrees on the slice stride (one mip, 256 B-multiple rows).
+void test_linear_subresources() {
+    TextureLayoutDesc arr{28u, 64u, 4u, 1u, 1u, 0x100u, 0u};
+    arr.array_size = 3u;
+    const std::vector<uint8_t> src = make_synthetic_linear(3u * 1024u, 13200u);
+    CHECK(surface_bytes(arr) == 3u * 1024u);
+    for (uint32_t s = 0; s < 3u; ++s) {
+        std::vector<uint8_t> out;
+        CHECK(detile_surface_subresource(arr, 0u, s, src.data(), src.size(), out).ok);
+        CHECK(out.size() == 1024u && std::memcmp(out.data(), src.data() + s * 1024u, 1024u) == 0);
+    }
+    std::vector<uint8_t> out;
+    CHECK(!detile_surface_subresource(arr, 0u, 3u, src.data(), src.size(), out).ok);
+    TextureLayoutDesc narrow = arr;  // 80 B rows: a 256 B pitch rule and tight packing disagree
+    narrow.width = 20u;
+    CHECK(detile_surface_subresource(narrow, 0u, 0u, src.data(), src.size(), out).ok);
+    CHECK(!detile_surface_subresource(narrow, 0u, 1u, src.data(), src.size(), out).ok);
+    TextureLayoutDesc chain = arr;  // multi-mip: slice stride depends on the mip rule
+    chain.mip_levels = 2u;
+    CHECK(!detile_surface_subresource(chain, 0u, 1u, src.data(), src.size(), out).ok);
+    // 128x72 R32_FLOAT with 7 mips: mip 0 at the base, the other mips refused.
+    const TextureLayoutDesc r32{41u, 128u, 72u, 1u, 7u, 0x100u, 0u};
+    const std::vector<uint8_t> big = make_synthetic_linear(128u * 72u * 4u, 13300u);
+    CHECK(detile_surface_subresource(r32, 0u, 0u, big.data(), big.size(), out).ok && out == big);
+    for (uint32_t mip = 1; mip < 7u; ++mip) {
+        CHECK(!detile_surface_subresource(r32, mip, 0u, big.data(), big.size(), out).ok);
+        CHECK(!mip_placement(r32, mip).ok);
+    }
+}
+
 void test_linear_custom_pitch() {
     // R8G8B8A8_UNORM 20x10: tight row = 80 bytes, custom D3D12 row pitch = 256 bytes.
     const TextureLayoutDesc desc{
@@ -565,6 +690,9 @@ int main() {
     test_addrlib_equations_3d();
     test_mip_chain_placement();
     test_mip_chain_round_trips();
+    test_subresource_round_trips();
+    test_tail_coordinates();
+    test_linear_subresources();
     test_linear_custom_pitch();
     test_bounds_and_error_rejection();
 

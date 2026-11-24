@@ -17,6 +17,7 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/descriptor_words.h"
+#include "gpu/gfx10_detile.h"
 #include "gpu/pso_cache.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
@@ -1649,6 +1650,179 @@ void test_dirty_texture_memory_upload() {
     com::set_guest_memory(nullptr);
 }
 
+// G64: every mip and array slice of a console-tiled texture uploads from the whole GFX10 surface,
+// with per-subresource dirty tracking (one changed mip -> one WriteTexture; steady state -> none).
+void test_all_subresource_uploads() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace gfx10 = playgta6::gpu::gfx10;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        dg::DeviceOptions dev_opts;
+        dev_opts.sink = [](const uint8_t*, size_t) {};
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        // 64x64 R8G8B8A8, 7 mips, 2 array slices, 4KB_S: mips 0..1 are macro blocks, 2..6 in the tail.
+        constexpr uint32_t kW = 64, kMips = 7, kLayers = 2;
+        gfx10::TextureLayoutDesc g{};
+        g.dxgi_format = 28;
+        g.width = kW;
+        g.height = kW;
+        g.mip_levels = kMips;
+        g.d3d12_layout = 0x105;
+        g.array_size = kLayers;
+        const size_t surface_size = gfx10::surface_bytes(g);
+        CHECK(surface_size != 0 && surface_size <= (1u << 20));
+        CHECK(gfx10::mip_placement(g, 2).in_tail && !gfx10::mip_placement(g, 1).in_tail);
+
+        std::vector<std::vector<uint8_t>> lin(kMips * kLayers);
+        std::vector<uint8_t> surface(surface_size, 0);
+        auto fill = [&](uint32_t m, uint32_t s, uint32_t seed) {
+            const uint32_t w = std::max(1u, kW >> m);
+            std::vector<uint8_t>& v = lin[m + s * kMips];
+            v.resize(size_t{w} * w * 4);
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = static_cast<uint8_t>(1u + ((i * 7u + seed * 31u + m * 13u + s * 101u) % 251u));
+            }
+            CHECK(gfx10::tile_surface_subresource(g, m, s, v.data(), v.size(), surface.data(), surface.size()));
+        };
+        for (uint32_t s = 0; s < kLayers; ++s) {
+            for (uint32_t m = 0; m < kMips; ++m) {
+                fill(m, s, 1);
+            }
+        }
+        const uint64_t mem = arena.virtual_alloc(0, 1u << 20, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+
+        dg::GuestResourceDesc d{};
+        d.Dimension = dg::ResourceDimension::Texture2D;
+        d.Width = kW;
+        d.Height = kW;
+        d.DepthOrArraySize = kLayers;
+        d.MipLevels = kMips;
+        d.Format = 28;
+        d.SampleCount = 1;
+        d.Layout = 0x105;
+        dg::Resource::Placement pl{};
+        pl.address = mem;
+        auto tex = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+                                                    d, pl, 0u);
+        CHECK(tex && tex->initialize());
+
+        auto writes = [](const gpu::CommandEncoder& enc) {
+            std::vector<Packet> out;
+            for (const Packet& pk : decode(enc)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    out.push_back(pk);
+                }
+            }
+            return out;
+        };
+        auto check_payload = [&](const Packet& pk) {
+            const auto wt = pod<GpuWriteTexturePayload>(pk);
+            CHECK(wt.texture_id == tex->id() && wt.mip_level < kMips && wt.origin_z < kLayers);
+            if (wt.mip_level >= kMips || wt.origin_z >= kLayers) {
+                return;
+            }
+            const uint32_t w = std::max(1u, kW >> wt.mip_level);
+            CHECK(wt.width == w && wt.height == w && wt.depth_or_layers == 1 && wt.bytes_per_row == 256);
+            const std::vector<uint8_t>& v = lin[wt.mip_level + wt.origin_z * kMips];
+            const uint8_t* rows = pk.payload.data() + sizeof(GpuWriteTexturePayload);
+            bool same = pk.payload.size() >= sizeof(GpuWriteTexturePayload) + size_t{256} * w;
+            for (uint32_t y = 0; same && y < w; ++y) {
+                same = std::memcmp(rows + y * 256u, v.data() + size_t{y} * w * 4, size_t{w} * 4) == 0;
+            }
+            CHECK(same);
+        };
+
+        // First sync: all 14 subresources, each with its own texels.
+        gpu::CommandEncoder e1;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e1));
+        const auto w1 = writes(e1);
+        CHECK(w1.size() == kMips * kLayers);
+        uint32_t seen = 0;
+        for (const Packet& pk : w1) {
+            check_payload(pk);
+            const auto wt = pod<GpuWriteTexturePayload>(pk);
+            seen |= 1u << (wt.mip_level + wt.origin_z * kMips);
+        }
+        CHECK(seen == (1u << (kMips * kLayers)) - 1u);
+        const uint64_t uploads = device->stats().textures_uploaded;
+        CHECK(uploads == kMips * kLayers);
+
+        // Steady state: no re-upload.
+        gpu::CommandEncoder e2;
+        CHECK(!device->sync_bound_texture_memory(tex->id(), e2));
+        CHECK(writes(e2).empty());
+
+        // One changed macro-block mip (mip 1 of slice 1) -> one upload.
+        fill(1, 1, 2);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        gpu::CommandEncoder e3;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e3));
+        const auto w3 = writes(e3);
+        CHECK(w3.size() == 1);
+        if (w3.size() == 1) {
+            const auto wt = pod<GpuWriteTexturePayload>(w3[0]);
+            CHECK(wt.mip_level == 1 && wt.origin_z == 1);
+            check_payload(w3[0]);
+        }
+
+        // One changed tail mip (mip 5 of slice 0, inside the shared tail block) -> one upload.
+        fill(5, 0, 3);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        gpu::CommandEncoder e4;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e4));
+        const auto w4 = writes(e4);
+        CHECK(w4.size() == 1);
+        if (w4.size() == 1) {
+            const auto wt = pod<GpuWriteTexturePayload>(w4[0]);
+            CHECK(wt.mip_level == 5 && wt.origin_z == 0);
+            check_payload(w4[0]);
+        }
+        CHECK(device->stats().textures_uploaded == uploads + 2);
+
+        // A linear 2D array whose rows are a multiple of 256 B uploads every slice (mip 0 only).
+        const uint64_t lin_mem =
+            arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        std::vector<uint8_t> slices(64u * 2u * 4u * 3u);
+        for (size_t i = 0; i < slices.size(); ++i) {
+            slices[i] = static_cast<uint8_t>(1u + i % 199u);
+        }
+        CHECK(com::write_guest(lin_mem, slices.data(), slices.size()));
+        dg::GuestResourceDesc ld = d;
+        ld.Width = 64;
+        ld.Height = 2;
+        ld.DepthOrArraySize = 3;
+        ld.MipLevels = 1;
+        ld.Layout = 0x100;
+        dg::Resource::Placement lpl{};
+        lpl.address = lin_mem;
+        auto ltex = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                     dg::device_ref(device.get()), ld, lpl, 0u);
+        CHECK(ltex && ltex->initialize());
+        gpu::CommandEncoder e5;
+        CHECK(device->sync_bound_texture_memory(ltex->id(), e5));
+        const auto w5 = writes(e5);
+        CHECK(w5.size() == 3);
+        for (const Packet& pk : w5) {
+            const auto wt = pod<GpuWriteTexturePayload>(pk);
+            CHECK(wt.mip_level == 0 && wt.origin_z < 3 && wt.width == 64 && wt.height == 2);
+            if (wt.origin_z < 3) {
+                CHECK(std::memcmp(pk.payload.data() + sizeof(GpuWriteTexturePayload),
+                                  slices.data() + size_t{wt.origin_z} * 512u, 512u) == 0);
+            }
+        }
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
 // ------------------------------------------------------------------------------------------------
 // G49b: GPU Fence completion audit & ExecuteCommandLists / PresentX com::Ref lifetime audit
 // ------------------------------------------------------------------------------------------------
@@ -1848,6 +2022,7 @@ int main() {
     test_indexed_draw_and_layout_dedup();
     test_concurrent_command_lists();
     test_dirty_texture_memory_upload();
+    test_all_subresource_uploads();
     test_fence_completion_and_ref_lifetime();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

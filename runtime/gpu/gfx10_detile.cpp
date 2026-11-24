@@ -802,6 +802,10 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
         c.error = "invalid texture dimensions";
         return c;
     }
+    if (desc.depth > 1u && desc.array_size > 1u) {
+        c.error = "3D textures have no array slices";
+        return c;
+    }
     c.mips = std::min(std::max(desc.mip_levels, 1u), kMaxMips);
     const uint32_t ew = (desc.width + c.fmt.block_width - 1u) / c.fmt.block_width;
     const uint32_t eh = (desc.height + c.fmt.block_height - 1u) / c.fmt.block_height;
@@ -814,7 +818,7 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
     const uint32_t blk = c.shape.blk_size_log2;
     const uint64_t block_bytes = uint64_t{1} << blk;
     const uint64_t bpe = c.fmt.bytes_per_block;
-    const uint64_t num_slices = thick ? align_pow2(depth, c.bd) : depth;
+    const uint64_t num_slices = thick ? align_pow2(depth, c.bd) : uint64_t{depth} * std::max(desc.array_size, 1u);
 
     uint64_t chain = 0;
     if (blk == 8u) {
@@ -968,7 +972,7 @@ MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept
             p.error = "linear mip chains are not modelled (mip 0 only)";
             return p;
         }
-        p.surface_bytes = tiled_footprint_bytes(desc, 0u);
+        p.surface_bytes = uint64_t{tiled_footprint_bytes(desc, 0u)} * std::max(desc.array_size, 1u);
         p.ok = p.surface_bytes != 0u;
         p.error = p.ok ? nullptr : "unsupported linear subresource";
         return p;
@@ -1000,11 +1004,14 @@ size_t surface_bytes(const TextureLayoutDesc& desc) noexcept {
 
 namespace {
 
-// Shared walk for detile_from_surface / tile_into_surface_for_test: calls fn(linear_offset,
-// surface_offset) for every element of mip `mip`.
+constexpr uint32_t kAllSlices = 0xFFFFFFFFu;
+
+// Shared walk for the surface detile/tile functions: calls fn(linear_offset, surface_offset,
+// bytes) for every element of mip `mip` in array slice `array_slice` (kAllSlices: every array
+// slice, in order). 3D textures: every depth slice of the mip (array_slice 0 or kAllSlices).
 template <typename Fn>
-const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, size_t surface_size, size_t* linear_size,
-                             uint32_t* row_pitch, uint32_t* rows, uint32_t* slices, Fn&& fn) {
+const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice, size_t surface_size,
+                             size_t* linear_size, uint32_t* row_pitch, uint32_t* rows, uint32_t* slices, Fn&& fn) {
     const ChainLayout c = build_chain(desc);
     if (!c.ok) {
         return c.error;
@@ -1018,17 +1025,34 @@ const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, size_t
     const uint32_t mip_w = std::max(1u, desc.width >> std::min(mip, 31u));
     const uint32_t mip_h = std::max(1u, desc.height >> std::min(mip, 31u));
     const uint32_t mip_d = std::max(1u, desc.depth >> std::min(mip, 31u));
+    const uint32_t layers = std::max(desc.array_size, 1u);
+    uint32_t z0 = 0;
+    uint32_t nz = 0;
+    if (desc.depth > 1u) {
+        if (array_slice != 0u && array_slice != kAllSlices) {
+            return "3D textures have no array slices";
+        }
+        nz = mip_d;
+    } else if (array_slice == kAllSlices) {
+        nz = layers;
+    } else {
+        if (array_slice >= layers) {
+            return "array slice out of range";
+        }
+        z0 = array_slice;
+        nz = 1;
+    }
     const uint32_t bx = (mip_w + c.fmt.block_width - 1u) / c.fmt.block_width;
     const uint32_t by = (mip_h + c.fmt.block_height - 1u) / c.fmt.block_height;
     const uint32_t bpe = c.fmt.bytes_per_block;
     *row_pitch = bx * bpe;
     *rows = by;
-    *slices = mip_d;
-    *linear_size = size_t{*row_pitch} * by * mip_d;
-    for (uint32_t z = 0; z < mip_d; ++z) {
+    *slices = nz;
+    *linear_size = size_t{*row_pitch} * by * nz;
+    for (uint32_t z = 0; z < nz; ++z) {
         for (uint32_t y = 0; y < by; ++y) {
             for (uint32_t x = 0; x < bx; ++x) {
-                const uint64_t addr = chain_address(c, mip, x, y, z);
+                const uint64_t addr = chain_address(c, mip, x, y, z0 + z);
                 if (addr > surface_size || bpe > surface_size - addr) {
                     return "tiled source offset out of bounds";
                 }
@@ -1039,18 +1063,63 @@ const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, size_t
     return nullptr;
 }
 
-}  // namespace
-
-DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* surface,
-                                 size_t surface_size, std::vector<uint8_t>& linear_out) {
-    if (is_linear_layout(desc)) {
-        if (mip != 0u) {
-            linear_out.clear();
-            DetileResult r{};
-            r.error = "linear mip chains are not modelled (mip 0 only)";
-            return r;
-        }
+// Linear layouts: mip 0 at the base. Array slices only where every candidate linear rule gives
+// the same slice stride (one mip; rows a multiple of 256 B, or an explicit pitch).
+DetileResult detile_linear(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice, const uint8_t* surface,
+                           size_t surface_size, std::vector<uint8_t>& linear_out) {
+    DetileResult res{};
+    linear_out.clear();
+    if (mip != 0u) {
+        res.error = "linear mip chains are not modelled (mip 0 only)";
+        return res;
+    }
+    const uint32_t layers = std::max(desc.array_size, 1u);
+    const bool all = array_slice == kAllSlices;
+    if (!all && array_slice >= layers) {
+        res.error = "array slice out of range";
+        return res;
+    }
+    if (layers == 1u || (!all && array_slice == 0u)) {
         return detile_subresource(desc, 0u, surface, surface_size, linear_out);
+    }
+    const SubresourcePlan plan = plan_subresource(desc, 0u);
+    if (!plan.ok) {
+        res.error = plan.error;
+        return res;
+    }
+    if (desc.depth > 1u || std::max(desc.mip_levels, 1u) > 1u ||
+        (desc.pitch_bytes == 0u && (plan.linear_row_pitch % 256u) != 0u)) {
+        res.error = "linear array slice stride is not modelled";
+        return res;
+    }
+    const size_t stride = plan.tiled_total_bytes;
+    const uint32_t first = all ? 0u : array_slice;
+    const uint32_t count = all ? layers : 1u;
+    std::vector<uint8_t> one;
+    for (uint32_t s = first; s < first + count; ++s) {
+        const size_t off = stride * s;
+        if (surface == nullptr || off > surface_size) {
+            linear_out.clear();
+            res = DetileResult{};
+            res.error = "source buffer truncated for surface footprint";
+            return res;
+        }
+        res = detile_subresource(desc, 0u, surface + off, surface_size - off, one);
+        if (!res.ok) {
+            linear_out.clear();
+            return res;
+        }
+        linear_out.insert(linear_out.end(), one.begin(), one.end());
+    }
+    res.slices = count;
+    res.tiled_bytes_consumed = stride * (first + count);
+    return res;
+}
+
+DetileResult detile_surface_impl(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
+                                 const uint8_t* surface, size_t surface_size, std::vector<uint8_t>& linear_out) {
+    if (is_linear_layout(desc)) {
+        return detile_linear(desc, mip, array_slice, surface, surface_size, linear_out);
     }
     DetileResult res{};
     linear_out.clear();
@@ -1061,14 +1130,14 @@ DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, co
     size_t linear_size = 0;
     uint32_t row_pitch = 0, rows = 0, slices = 0;
     // First pass validates and sizes; the walk is cheap compared with the copy.
-    const char* err = walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+    const char* err = walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
                                        [](size_t, size_t, uint32_t) {});
     if (err != nullptr) {
         res.error = err;
         return res;
     }
     linear_out.resize(linear_size);
-    walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+    walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
                      [&](size_t lin, size_t src, uint32_t n) { std::memcpy(linear_out.data() + lin, surface + src, n); });
     res.ok = true;
     res.row_pitch_bytes = row_pitch;
@@ -1078,21 +1147,52 @@ DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, co
     return res;
 }
 
-bool tile_into_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
+bool tile_surface_impl(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice, const uint8_t* linear_src,
                        size_t linear_src_bytes, uint8_t* surface, size_t surface_size) {
     if (linear_src == nullptr || surface == nullptr || is_linear_layout(desc)) {
         return false;
     }
     size_t linear_size = 0;
     uint32_t row_pitch = 0, rows = 0, slices = 0;
-    const char* err = walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+    const char* err = walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
                                        [](size_t, size_t, uint32_t) {});
     if (err != nullptr || linear_src_bytes < linear_size) {
         return false;
     }
-    walk_surface_mip(desc, mip, surface_size, &linear_size, &row_pitch, &rows, &slices,
+    walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
                      [&](size_t lin, size_t dst, uint32_t n) { std::memcpy(surface + dst, linear_src + lin, n); });
     return true;
+}
+
+}  // namespace
+
+DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* surface,
+                                 size_t surface_size, std::vector<uint8_t>& linear_out) {
+    return detile_surface_impl(desc, mip, kAllSlices, surface, surface_size, linear_out);
+}
+
+DetileResult detile_surface_subresource(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
+                                        const uint8_t* surface, size_t surface_size,
+                                        std::vector<uint8_t>& linear_out) {
+    if (array_slice == kAllSlices) {
+        linear_out.clear();
+        DetileResult r{};
+        r.error = "array slice out of range";
+        return r;
+    }
+    return detile_surface_impl(desc, mip, array_slice, surface, surface_size, linear_out);
+}
+
+bool tile_into_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
+                       size_t linear_src_bytes, uint8_t* surface, size_t surface_size) {
+    return tile_surface_impl(desc, mip, kAllSlices, linear_src, linear_src_bytes, surface, surface_size);
+}
+
+bool tile_surface_subresource(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
+                              const uint8_t* linear_src, size_t linear_src_bytes, uint8_t* surface,
+                              size_t surface_size) {
+    return array_slice != kAllSlices &&
+           tile_surface_impl(desc, mip, array_slice, linear_src, linear_src_bytes, surface, surface_size);
 }
 
 bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
@@ -1112,16 +1212,8 @@ bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, con
         std::memcpy(surface.data(), tiled.data(), tiled.size());
         return true;
     }
-    size_t linear_size = 0;
-    uint32_t row_pitch = 0, rows = 0, slices = 0;
-    const char* err = walk_surface_mip(desc, mip, surface.size(), &linear_size, &row_pitch, &rows, &slices,
-                                       [](size_t, size_t, uint32_t) {});
-    if (err != nullptr || linear_src_bytes < linear_size) {
-        return false;
-    }
-    walk_surface_mip(desc, mip, surface.size(), &linear_size, &row_pitch, &rows, &slices,
-                     [&](size_t lin, size_t dst, uint32_t n) { std::memcpy(surface.data() + dst, linear_src + lin, n); });
-    return true;
+    return tile_surface_impl(desc, mip, kAllSlices, linear_src, linear_src_bytes, surface.data(), surface.size());
 }
 
 }  // namespace playgta6::gpu::gfx10
+

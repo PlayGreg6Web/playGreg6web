@@ -50,6 +50,9 @@ struct TextureLayoutDesc {
     // For Linear mode, pitch_bytes must be >= row_width_bytes when non-zero.
     // For tiled modes, pitch_bytes must be a multiple of bytes_per_block and >= row_width_bytes when non-zero.
     uint32_t pitch_bytes = 0;
+    // 2D array slices (depth must be 1 when > 1). Thin layouts repeat the whole mip chain per
+    // slice (addrlib: slice stride = mip-chain size), so the surface is chain x array_size.
+    uint32_t array_size = 1;
 };
 
 struct FormatGeometry {
@@ -103,7 +106,10 @@ DetileResult detile_subresource(const TextureLayoutDesc& desc, uint32_t mip, con
 // 4KB/64KB modes the mip tail (one block holding every mip that fits) comes first and the larger
 // mips follow smallest-first, so mip 0 sits last, or inside the tail block at a fixed coordinate
 // when the whole chain fits there; 256B modes store the mips smallest-first without a tail.
-// Linear layouts keep mip 0 at offset 0 (only mip 0 is supported for them).
+// Linear layouts keep mip 0 at offset 0 (only mip 0 is supported for them): the real linear mip
+// rule is not established. addrlib's gfx10 ADDR_SW_LINEAR chain (256 B pitch, mips
+// smallest-first) is what the sampler needs, but it disagrees with the tight allocation answer
+// the title has been given so far (#665).
 struct MipPlacement {
     bool ok = false;
     const char* error = nullptr;
@@ -130,6 +136,20 @@ size_t surface_bytes(const TextureLayoutDesc& desc) noexcept;
 // MipPlacement). Output rows are tight, with D3D mip dimensions (max(1, size >> mip)).
 DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* surface,
                                  size_t surface_bytes, std::vector<uint8_t>& linear_out);
+
+// One subresource of the whole surface: mip `mip` of array slice `array_slice` (3D: every depth
+// slice of the mip; array_slice must be 0). Tail mips are read inside the tail block at their
+// addrlib coordinates. Linear layouts: mip 0 only; array slices only when the slice stride is the
+// same under every candidate linear rule (one mip, row bytes a multiple of 256 or an explicit
+// pitch_bytes).
+DetileResult detile_surface_subresource(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
+                                        const uint8_t* surface, size_t surface_bytes,
+                                        std::vector<uint8_t>& linear_out);
+
+// Inverse of detile_surface_subresource for tiled layouts; other bytes of `surface` are kept.
+bool tile_surface_subresource(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
+                              const uint8_t* linear_src, size_t linear_src_bytes, uint8_t* surface,
+                              size_t surface_size);
 
 // Inverse of detile_from_surface: writes the tight rows of mip `mip` (D3D mip dimensions) into
 // the whole surface at `surface` (surface_size >= surface_bytes(desc)); other bytes are kept.

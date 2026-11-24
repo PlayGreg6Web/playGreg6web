@@ -514,19 +514,23 @@ using PacketSink = std::function<void(const uint8_t* data, size_t size)>;
 
 // Pluggable detiling callback for console-tiled guest textures (G49b / G49a hook).
 // Given raw guest bytes (`src`, `src_bytes`) in console layout `req.layout` (e.g. 0x100 | swizzle),
-// writes mip-0 linear rows with `req.dst_row_pitch` bytes per row into `dst` (`dst_bytes`).
-// Returns true on success, false if unsupported.
+// writes the linear rows of subresource (`req.mip`, `req.array_slice`) with `req.dst_row_pitch`
+// bytes per row into `dst` (`dst_bytes`). `src` is the whole surface (every mip and slice) from
+// the resource's base address. Returns true on success, false if unsupported.
 struct TextureDetileRequest {
     uint32_t dxgi_format = 0;
-    uint32_t width = 0;
+    uint32_t width = 0;   // mip 0
     uint32_t height = 0;
-    uint32_t depth = 1;
+    uint32_t depth = 1;   // 3D depth (1 for 1D/2D)
     uint32_t mip_levels = 1;
     uint32_t layout = 0;
     uint32_t block_bytes = 0;
     uint32_t block_width = 1;
     uint32_t block_height = 1;
     uint32_t dst_row_pitch = 0;
+    uint32_t array_size = 1;   // 1D/2D array slices
+    uint32_t mip = 0;          // subresource to write
+    uint32_t array_slice = 0;
 };
 using DetileFn = std::function<bool(const TextureDetileRequest& req,
                                     const uint8_t* src,
@@ -546,8 +550,11 @@ struct TrackedTexture {
     uint32_t layout = 0;
     uint32_t dimension = 0;     // ResourceDimension (2=1D, 3=2D, 4=3D)
     uint32_t sample_count = 1;
-    uint64_t last_upload_hash = 0;
+    uint64_t last_upload_hash = 0;  // whole source surface
     bool ever_uploaded = false;
+    // Per subresource (mip + array_slice * mip_levels): hash of the last uploaded linear texels,
+    // 0 = never uploaded (the GPU texture is still zero there).
+    std::vector<uint64_t> subresource_hashes;
 };
 
 struct DeviceOptions {
@@ -800,9 +807,10 @@ public:
     void track_cpu_buffer(Resource* resource);
     void untrack_cpu_buffer(Resource* resource);
     void flush_cpu_buffers(CommandEncoder& encoder);
-    // Dirty-tracked guest texture memory upload (G49b): tracks mip-0 FNV-1a 64 hashes and layout
-    // metadata for guest-memory-backed GPU textures and emits WriteTexture packets when bound SRV
-    // memory changes.
+    // Dirty-tracked guest texture memory upload (G49b, G64): tracks FNV-1a 64 hashes of the whole
+    // source surface and of each subresource, plus layout metadata, for guest-memory-backed GPU
+    // textures, and emits one WriteTexture per changed subresource (every mip and array slice of a
+    // console-tiled surface) when bound SRV memory changes.
     void track_guest_texture(const TrackedTexture& tex);
     void untrack_guest_texture(uint32_t resource_id);
     bool tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const;

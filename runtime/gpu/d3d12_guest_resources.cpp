@@ -105,7 +105,7 @@ uint32_t mips_or_all(uint32_t v) {
 // last, or inside the mip-tail block; see gfx10::MipPlacement). Returns 0 for linear or
 // unrecognized formats/modes.
 uint64_t tiled_surface_bytes(uint32_t d3d12_layout, uint32_t dxgi_format, uint32_t width, uint32_t height,
-                             uint32_t slices, uint32_t mip_levels) noexcept {
+                             uint32_t depth, uint32_t mip_levels, uint32_t array_size) noexcept {
     const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d3d12_layout);
     if (mode == gfx10::SwizzleMode::Unsupported || mode == gfx10::SwizzleMode::Linear) {
         return 0;
@@ -114,7 +114,8 @@ uint64_t tiled_surface_bytes(uint32_t d3d12_layout, uint32_t dxgi_format, uint32
     desc.dxgi_format = dxgi_format;
     desc.width = width;
     desc.height = height;
-    desc.depth = slices;
+    desc.depth = depth;
+    desc.array_size = array_size;
     desc.mip_levels = std::max<uint32_t>(1u, mip_levels);
     desc.d3d12_layout = d3d12_layout;
     return gfx10::surface_bytes(desc);
@@ -383,16 +384,14 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     const uint32_t w = tt.width;
     const uint32_t h = (tt.dimension == ResourceDimension::Texture1D) ? 1u : std::max<uint32_t>(1u, tt.height);
     const uint32_t d = (tt.dimension == ResourceDimension::Texture3D) ? std::max<uint32_t>(1u, tt.depth) : 1u;
+    const uint32_t layers = (tt.dimension == ResourceDimension::Texture3D) ? 1u : std::max<uint32_t>(1u, tt.depth);
+    const uint32_t mips = std::max<uint32_t>(1u, tt.mip_levels);
     const uint32_t blocks_x = (w + l.block_width - 1u) / l.block_width;
     const uint32_t blocks_y = (h + l.block_height - 1u) / l.block_height;
-    const uint32_t copy_w = blocks_x * l.block_width;
-    const uint32_t copy_h = blocks_y * l.block_height;
     const uint64_t tight_row_bytes = uint64_t{blocks_x} * l.block_bytes;
-    const uint64_t aligned_row_pitch = align_up(tight_row_bytes, 256u);
     const uint64_t tight_mip0_bytes = tight_row_bytes * blocks_y * d;
-    const uint64_t aligned_mip0_bytes = aligned_row_pitch * blocks_y * d;
     constexpr uint64_t kMaxSyncTextureBytes = 64u << 20;
-    if (tight_mip0_bytes == 0 || aligned_mip0_bytes == 0 || aligned_mip0_bytes > kMaxSyncTextureBytes) {
+    if (tight_mip0_bytes == 0 || align_up(tight_row_bytes, 256u) * blocks_y * d > kMaxSyncTextureBytes) {
         return false;
     }
 
@@ -407,12 +406,32 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
-    // Safely read mip-0 bytes via CPU-window translation (never crashes on unmapped/guard pages).
+    // The subresources this layout places (subresource index = mip + slice * mips). Tiled: every
+    // mip and array slice of the GFX10 surface (gfx10::MipPlacement). Linear: mip 0 at the base
+    // (the linear mip rule is not established, #665); array slices only where every candidate
+    // rule gives the same slice stride (one mip, rows a multiple of 256 B).
+    struct Sub {
+        uint32_t mip;
+        uint32_t slice;
+    };
+    std::vector<Sub> subs;
+    uint64_t tiled_bytes = 0;
+    if (is_tiled && detile_fn) {
+        tiled_bytes = tiled_surface_bytes(tt.layout, tt.dxgi_format, w, h, d, mips, layers);
+    }
+    const bool whole_surface = tiled_bytes != 0;
+    const uint32_t linear_layers = (!is_tiled && layers > 1u && mips == 1u && tight_row_bytes % 256u == 0u) ? layers : 1u;
+    for (uint32_t s = 0; s < (whole_surface ? layers : linear_layers); ++s) {
+        for (uint32_t m = 0; m < (whole_surface ? mips : 1u); ++m) {
+            subs.push_back({m, s});
+        }
+    }
+
+    // Safely read the source bytes via CPU-window translation (never crashes on unmapped/guard pages).
     const uint64_t cpu_va = cpu_address_for_gpu(tt.gpu_va);
     std::vector<uint8_t> raw;
     bool read_ok = false;
     if (is_tiled && detile_fn) {
-        uint64_t tiled_bytes = tiled_surface_bytes(tt.layout, tt.dxgi_format, w, h, d, tt.mip_levels);
         if (tiled_bytes == 0) {
             GuestResourceDesc tmp{};
             tmp.Dimension = tt.dimension;
@@ -432,7 +451,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
     }
     if (!read_ok) {
-        raw.resize(static_cast<size_t>(tight_mip0_bytes));
+        raw.resize(static_cast<size_t>(tight_mip0_bytes * linear_layers));
         read_ok = com::read_guest(cpu_va, raw.data(), raw.size());
     }
     if (!read_ok) {
@@ -449,32 +468,59 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
-    std::vector<uint8_t> staged(static_cast<size_t>(aligned_mip0_bytes), 0);
-    bool detiled = false;
-    if (is_tiled && detile_fn) {
-        TextureDetileRequest req{};
-        req.dxgi_format = tt.dxgi_format;
-        req.width = w;
-        req.height = h;
-        req.depth = d;
-        req.mip_levels = tt.mip_levels;
-        req.layout = tt.layout;
-        req.block_bytes = l.block_bytes;
-        req.block_width = l.block_width;
-        req.block_height = l.block_height;
-        req.dst_row_pitch = static_cast<uint32_t>(aligned_row_pitch);
-        detiled = detile_fn(req, raw.data(), raw.size(), staged.data(), staged.size());
-        if (!detiled && !is_tiny) {
-            return false;
+    // Stage every placed subresource; only those whose texels changed since their last upload
+    // are written (per-subresource dirty tracking), so one changed mip costs one upload.
+    struct Staged {
+        Sub sub;
+        uint32_t copy_w, copy_h, copy_d, row_pitch, rows;
+        uint64_t hash;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<Staged> staged;
+    for (const Sub& sub : subs) {
+        const uint32_t mw = std::max(1u, w >> sub.mip);
+        const uint32_t mh = std::max(1u, h >> sub.mip);
+        const uint32_t md = std::max(1u, d >> sub.mip);
+        const uint32_t bx = (mw + l.block_width - 1u) / l.block_width;
+        const uint32_t by = (mh + l.block_height - 1u) / l.block_height;
+        const uint64_t row_bytes = uint64_t{bx} * l.block_bytes;
+        const uint64_t row_pitch = align_up(row_bytes, 256u);
+        Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {}};
+        st.bytes.assign(static_cast<size_t>(row_pitch * by * md), 0);
+        bool detiled = false;
+        if (is_tiled && detile_fn) {
+            TextureDetileRequest req{};
+            req.dxgi_format = tt.dxgi_format;
+            req.width = w;
+            req.height = h;
+            req.depth = d;
+            req.mip_levels = mips;
+            req.layout = tt.layout;
+            req.block_bytes = l.block_bytes;
+            req.block_width = l.block_width;
+            req.block_height = l.block_height;
+            req.dst_row_pitch = st.row_pitch;
+            req.array_size = whole_surface ? layers : 1u;
+            req.mip = sub.mip;
+            req.array_slice = sub.slice;
+            detiled = detile_fn(req, raw.data(), raw.size(), st.bytes.data(), st.bytes.size());
+            if (!detiled && (sub.mip != 0u || sub.slice != 0u)) {
+                continue;  // the hook does not place this subresource
+            }
+            if (!detiled && !is_tiny) {
+                return false;
+            }
         }
-    }
-    if (!detiled) {
-        const uint32_t total_rows = blocks_y * d;
-        for (uint32_t r = 0; r < total_rows; ++r) {
-            std::memcpy(staged.data() + static_cast<size_t>(r) * aligned_row_pitch,
-                        raw.data() + static_cast<size_t>(r) * tight_row_bytes,
-                        static_cast<size_t>(tight_row_bytes));
+        if (!detiled) {
+            const uint64_t slice_off = uint64_t{sub.slice} * tight_mip0_bytes;
+            const uint32_t total_rows = by * md;
+            for (uint32_t r = 0; r < total_rows; ++r) {
+                std::memcpy(st.bytes.data() + static_cast<size_t>(r) * row_pitch,
+                            raw.data() + static_cast<size_t>(slice_off + r * row_bytes), static_cast<size_t>(row_bytes));
+            }
         }
+        st.hash = shader_identity(st.bytes.data(), st.bytes.size());
+        staged.push_back(std::move(st));
     }
 
     {
@@ -483,20 +529,37 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         if (it == tracked_textures_.end()) {
             return false;
         }
-        if (it->second.ever_uploaded && it->second.last_upload_hash == hash) {
+        TrackedTexture& cur = it->second;
+        if (cur.ever_uploaded && cur.last_upload_hash == hash) {
             return false;
         }
-        it->second.last_upload_hash = hash;
-        it->second.ever_uploaded = true;
+        cur.last_upload_hash = hash;
+        cur.ever_uploaded = true;
+        cur.subresource_hashes.resize(size_t{mips} * layers, 0);
+        auto out = staged.begin();
+        for (Staged& st : staged) {
+            uint64_t& seen = cur.subresource_hashes[st.sub.mip + size_t{st.sub.slice} * mips];
+            const bool zero = std::all_of(st.bytes.begin(), st.bytes.end(), [](uint8_t b) { return b == 0; });
+            if (seen == st.hash || (seen == 0 && zero)) {
+                continue;  // unchanged, or still zero as the GPU texture was created
+            }
+            seen = st.hash;
+            if (&*out != &st) {
+                *out = std::move(st);
+            }
+            ++out;
+        }
+        staged.erase(out, staged.end());
     }
 
-    encoder.write_texture(resource_id, 0u, 0u, 0u, 0u, copy_w, copy_h, d,
-                          static_cast<uint32_t>(aligned_row_pitch), blocks_y,
-                          staged.data(), static_cast<uint32_t>(staged.size()));
-    count_work(Work::TextureUploads);
-    note_upload(staged.size());
-    note_texture_upload();
-    return true;
+    for (const Staged& st : staged) {
+        encoder.write_texture(resource_id, st.sub.mip, 0u, 0u, st.sub.slice, st.copy_w, st.copy_h, st.copy_d,
+                              st.row_pitch, st.rows, st.bytes.data(), static_cast<uint32_t>(st.bytes.size()));
+        count_work(Work::TextureUploads);
+        note_upload(st.bytes.size());
+        note_texture_upload();
+    }
+    return !staged.empty();
 }
 
 uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, uint32_t width, uint32_t height,

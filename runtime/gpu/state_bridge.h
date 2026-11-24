@@ -166,8 +166,8 @@ struct BridgeOptions {
     const d3d::DescriptorSlotSource* slot_source = nullptr;
     // Guest texture-memory sync hook (G49b): invoked when a texture SRV is bound in a root
     // descriptor table at draw/dispatch or submission refresh time. Inspects guest memory backing
-    // `resource_id` and emits WriteTexture into `encoder` if mip-0 bytes changed; returns true
-    // when a WriteTexture packet was emitted.
+    // `resource_id` and emits WriteTexture into `encoder` for each subresource whose texels
+    // changed; returns true when a WriteTexture packet was emitted.
     std::function<bool(uint32_t resource_id, CommandEncoder& encoder)> sync_texture_memory;
 };
 
