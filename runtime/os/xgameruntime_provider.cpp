@@ -59,7 +59,7 @@
 //     Close, Compare, GetMaxUsers, AddAsync, AddResult, GetLocalId, FindUserByLocalId, GetId,
 //     FindUserById, ...); the executable keeps {handle, s11 XUID, s9 8-byte value} per user and
 //     rebuilds that record from the value through s10 (value, &handle), i.e. FindUserByLocalId.
-//     Stubs: s3 Duplicate, s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
+//     s3 DuplicateHandle(2) h. Stubs: s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
 //     s25 GetTokenAndSignatureResult; s13, s14, s19 are unidentified.
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
@@ -610,6 +610,22 @@ public:
         }
         id.write(xuid);
         return hr;
+    }
+
+    // s3 XUserDuplicateHandle(user, XUserHandle* duplicated): a new handle to the same local user
+    // (closed independently with s4).
+    int32_t DuplicateHandle(uint64_t user, OutPtr duplicated) {
+        if (duplicated.is_null() || !duplicated.write(0) || !check_handle(users(), user, "XUserHandle")) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XUserHandle copy = nullptr;
+        const int32_t hr = gdk::XUserDuplicateHandle(from_guest<Pg6XUser>(user), &copy);
+        if (hr < 0 || copy == nullptr) {
+            return hr < 0 ? hr : E_INVALIDARG_HR;
+        }
+        users().add(copy);
+        duplicated.write(to_guest(copy));
+        return S_OK_HR;
     }
 
     // s9 XUserGetLocalId(user, XUserLocalId* localId): the local (per-console) identifier of the
@@ -1180,7 +1196,7 @@ constexpr auto kIAsyncQueue =
 
 using US = M<UserApi>;
 constexpr auto kUserTable = slot_table<32>({
-    {3, US::stub("XUserDuplicateHandle")},
+    {3, US::method<&UserApi::DuplicateHandle>("XUserDuplicateHandle")},
     {4, US::method<&UserApi::CloseHandle>("XUserCloseHandle")},
     {5, US::stub("XUserCompare")},
     {7, US::method<&UserApi::AddAsync>("XUserAddAsync")},

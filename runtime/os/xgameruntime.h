@@ -190,6 +190,8 @@ HResult XUserGetGamertag(XUserHandle user,
                          char* gamertag,
                          size_t* gamertag_used);
 void XUserCloseHandle(XUserHandle user);
+// A second, independently closed handle to the same (local) user.
+HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated);
 
 // ---------------------------------------------------------------------------
 // XSystem device & analytics info

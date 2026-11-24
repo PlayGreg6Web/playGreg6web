@@ -441,6 +441,17 @@ void XUserCloseHandle(XUserHandle user) {
     release_user(user);
 }
 
+HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated) {
+    if (user == nullptr || duplicated == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    auto* copy = new Pg6XUser();
+    copy->xuid = user->xuid;
+    copy->gamertag = user->gamertag;
+    *duplicated = copy;
+    return S_OK_HR;
+}
+
 // ---------------------------------------------------------------------------
 // XSystem device & analytics info
 // ---------------------------------------------------------------------------

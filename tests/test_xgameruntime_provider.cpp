@@ -594,6 +594,16 @@ void test_user_slots() {
     CHECK(local_id != 0 && local_id != playgta6::os::gdk::kOfflineUserXuid);
     CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == 0 && load64(out) == local_id);
     CHECK(hr32(fx.vcall(user_api, 9, {user, 0})) == com::E_INVALIDARG_HR);
+    // XUserDuplicateHandle (s3): a second handle to the same local user, closed independently.
+    const uint64_t dup_out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(user_api, 3, {user, dup_out})) == 0);
+    const uint64_t dup = load64(dup_out);
+    CHECK(dup != 0 && dup != user);
+    CHECK(hr32(fx.vcall(user_api, 11, {dup, out})) == 0 && load64(out) == playgta6::os::gdk::kOfflineUserXuid);
+    CHECK(hr32(fx.vcall(user_api, 9, {dup, out})) == 0 && load64(out) == local_id);
+    fx.vcall(user_api, 4, {dup});  // XUserCloseHandle on the duplicate only
+    CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == 0);
+    CHECK(hr32(fx.vcall(user_api, 3, {0x1234, dup_out})) == com::E_INVALIDARG_HR);
     const uint64_t tag = fx.alloc(32);
     CHECK(hr32(fx.vcall(user_ext, 3, {user, 0, 32, tag, out})) == 0);  // XUserGetGamertag
     char text[32] = {};
