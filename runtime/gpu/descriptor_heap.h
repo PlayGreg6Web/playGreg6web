@@ -883,6 +883,24 @@ using GpuVaResolver = bool (*)(void* user, uint64_t gpu_address, GpuVaResolution
 
 inline constexpr uint64_t kMaxUniformBindingSize = 65536;
 
+// Descriptor memory (G48). On the console the GPU reads a root table's descriptors from the heap's
+// memory when the draw executes; the title fills that memory itself (it copies descriptor words
+// between slots). A slot source reads table slots from that memory instead of the registry
+// records: a heap it `reads` is decoded slot by slot, and a cached bind group over it is
+// revalidated by comparing the words of the windows it read.
+class DescriptorSlotSource {
+public:
+    virtual ~DescriptorSlotSource() = default;
+    virtual bool reads(const DescriptorHeap& heap) const = 0;
+    // Bytes of slots [first, first + count); false (and *out empty) when unreadable.
+    virtual bool snapshot(const DescriptorHeap& heap, uint32_t first, uint32_t count, std::vector<uint8_t>* out) const = 0;
+    // The view slot `index` holds for a binding of `range` (kind of the binding; resource 0 /
+    // address 0 when nothing binds).
+    virtual ViewDescriptor view(const DescriptorHeap& heap, uint32_t index, DescriptorRangeType range) const = 0;
+    // The sampler slot `index` holds; false when none.
+    virtual bool sampler(const DescriptorHeap& heap, uint32_t index, SamplerDesc* out) const = 0;
+};
+
 struct CachedBindGroup {
     uint64_t layout_key = 0;
     std::vector<BindGroupEntry> entries;  // sorted by binding
@@ -892,7 +910,22 @@ struct CachedBindGroup {
     // Internal validity data.
     std::vector<uint64_t> key;
     std::vector<uint64_t> built_generation;  // per plan table window
+    // Memory-backed tables (DescriptorSlotSource): the words of every window read at the build and
+    // the GPU handle of each table parameter's base (root parameter index, handle).
+    bool from_memory = false;
+    std::vector<uint8_t> built_words;
+    std::vector<std::pair<uint32_t, uint64_t>> table_bases;
 };
+
+// Re-reads the memory-backed table entries of `group` (built for `plan`) through `source`: true
+// when the windows' words changed since the build, in which case the table entries and
+// built_words are rebuilt (other entries are kept). Heaps are looked up again by their handles.
+bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
+                           const DescriptorSlotSource& source,
+                           const BindGroupPlan& plan,
+                           GpuVaResolver resolver,
+                           void* resolver_user,
+                           CachedBindGroup* group);
 
 struct BindGroupLookup {
     Status status = Status::Ok;
@@ -920,6 +953,9 @@ public:
 
     // Drops every entry, appending their gpu ids (if non-zero) to `retired`.
     void clear(std::vector<uint32_t>* retired);
+    // Tables in heaps the source reads come from descriptor memory (nullptr: registry only).
+    void set_slot_source(const DescriptorSlotSource* source) noexcept { slot_source_ = source; }
+    const DescriptorSlotSource* slot_source() const noexcept { return slot_source_; }
     size_t size() const noexcept { return entries_.size(); }
     uint64_t hits() const noexcept { return hits_; }
     uint64_t misses() const noexcept { return misses_; }
@@ -934,8 +970,14 @@ private:
         void* resolver_user,
         CachedBindGroup* out);
 
+    // Words of the plan's memory-backed windows under the current arguments (false: none).
+    bool memory_words(const RootArgumentState& state, BindPoint bind_point, const BindGroupPlan& plan,
+                      std::vector<uint8_t>* out) const;
+
     std::unordered_map<uint64_t, std::unique_ptr<CachedBindGroup>> entries_;
     std::vector<uint64_t> scratch_key_;
+    std::vector<uint8_t> scratch_words_;
+    const DescriptorSlotSource* slot_source_ = nullptr;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
 };

@@ -236,6 +236,8 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     bo.relocate_uniform = [this](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
         return relocate_uniform(va, size, id, offset);
     };
+    slot_source_ = std::make_unique<MemorySlotSource>(*this);
+    bo.slot_source = slot_source_.get();
     bridge_ = std::make_unique<bridge::StateBridgeDevice>(heaps_, std::move(bo), &resource_states_);
     sink_ = options_.sink;
     // O27: the XMem CPU/GPU window pairs, whether reserved before or after this device.
@@ -762,6 +764,80 @@ void Device::copy_descriptor_memory(const std::vector<std::pair<uint64_t, uint32
         }
         at += n;
     }
+}
+
+// ---- Root tables read from descriptor memory (G48) ----
+
+bool Device::MemorySlotSource::reads(const d3d::DescriptorHeap& heap) const {
+    return heap.desc().cpu_address != 0 && heap.shader_visible() &&
+           (heap.type() == d3d::DescriptorHeapType::CbvSrvUav || heap.type() == d3d::DescriptorHeapType::Sampler);
+}
+
+bool Device::MemorySlotSource::snapshot(const d3d::DescriptorHeap& heap, uint32_t first, uint32_t count,
+                                        std::vector<uint8_t>* out) const {
+    out->assign(size_t{count} * heap.increment(), 0);
+    if (count == 0 || first >= heap.capacity() || count > heap.capacity() - first) {
+        out->clear();
+        return false;
+    }
+    if (!com::read_guest(heap.desc().cpu_address + uint64_t{first} * heap.increment(), out->data(), out->size())) {
+        out->clear();
+        return false;
+    }
+    return true;
+}
+
+void Device::MemorySlotSource::note(uint32_t kind, uint32_t status, uint64_t address) const {
+    device_.slot_reads_[kind][status].fetch_add(1, std::memory_order_relaxed);
+    if (status == static_cast<uint32_t>(bridge::DecodeStatus::Ok)) {
+        return;
+    }
+    const uint32_t bit = 1u << (kind * 7 + status);
+    if ((device_.slot_reads_reported_.fetch_or(bit) & bit) == 0) {
+        static constexpr const char* kKinds[4] = {"CBV", "SRV", "UAV", "sampler"};
+        os::log(std::string("d3d12_xs: root table ") + kKinds[kind] + " slot at " + hex(address) + " read from descriptor memory: " +
+                bridge::decode_status_name(static_cast<bridge::DecodeStatus>(status)) +
+                " (bound as null; first of its kind)");
+    }
+}
+
+d3d::ViewDescriptor Device::MemorySlotSource::view(const d3d::DescriptorHeap& heap, uint32_t index,
+                                                   d3d::DescriptorRangeType range) const {
+    uint32_t words[bridge::kViewSlotBytes / 4] = {};
+    const uint64_t address = heap.desc().cpu_address + uint64_t{index} * heap.increment();
+    d3d::ViewDescriptor v;
+    bridge::DecodeStatus status = bridge::DecodeStatus::NotDescriptor;
+    if (heap.increment() >= bridge::kViewSlotBytes && com::read_guest(address, words, bridge::kViewSlotBytes)) {
+        status = bridge::decode_view_words(*device_.bridge_, words, range, &v);
+    } else {
+        v.kind = range == d3d::DescriptorRangeType::Cbv ? d3d::DescriptorKind::Cbv
+                                                        : (range == d3d::DescriptorRangeType::Uav ? d3d::DescriptorKind::Uav
+                                                                                                   : d3d::DescriptorKind::Srv);
+    }
+    const uint32_t kind = range == d3d::DescriptorRangeType::Cbv ? 0u : (range == d3d::DescriptorRangeType::Uav ? 2u : 1u);
+    note(kind, static_cast<uint32_t>(status), address);
+    return v;
+}
+
+bool Device::MemorySlotSource::sampler(const d3d::DescriptorHeap& heap, uint32_t index, d3d::SamplerDesc* out) const {
+    uint32_t words[bridge::kSamplerSlotBytes / 4] = {};
+    const uint64_t address = heap.desc().cpu_address + uint64_t{index} * heap.increment();
+    bridge::DecodeStatus status = bridge::DecodeStatus::NotDescriptor;
+    if (com::read_guest(address, words, bridge::kSamplerSlotBytes)) {
+        status = bridge::decode_sampler_words(words, out);
+    }
+    note(3, static_cast<uint32_t>(status), address);
+    return status == bridge::DecodeStatus::Ok;
+}
+
+Device::SlotReadCounts Device::descriptor_slot_reads() const {
+    SlotReadCounts out{};
+    for (size_t k = 0; k < out.size(); ++k) {
+        for (size_t s = 0; s < out[k].size(); ++s) {
+            out[k][s] = slot_reads_[k][s].load(std::memory_order_relaxed);
+        }
+    }
+    return out;
 }
 
 std::array<uint64_t, 7> Device::descriptor_word_counts() const {

@@ -229,6 +229,157 @@ WordsStatus buffer_words_at_address(uint64_t va, const d3d::ViewDescriptor& v, u
     return WordsStatus::Ok;
 }
 
+const char* decode_status_name(DecodeStatus status) noexcept {
+    switch (status) {
+    case DecodeStatus::Ok: return "ok";
+    case DecodeStatus::Zero: return "zero words (null descriptor)";
+    case DecodeStatus::NotDescriptor: return "no descriptor words";
+    case DecodeStatus::KindMismatch: return "descriptor of another kind";
+    case DecodeStatus::UnresolvedAddress: return "buffer address in no known buffer";
+    case DecodeStatus::UnknownTexture: return "image address of no known texture";
+    case DecodeStatus::UnsupportedFormat: return "image format without a DXGI format";
+    case DecodeStatus::Count: break;
+    }
+    return "?";
+}
+
+namespace {
+
+d3d::DescriptorKind kind_of(d3d::DescriptorRangeType range) noexcept {
+    switch (range) {
+    case d3d::DescriptorRangeType::Cbv: return d3d::DescriptorKind::Cbv;
+    case d3d::DescriptorRangeType::Uav: return d3d::DescriptorKind::Uav;
+    default: return d3d::DescriptorKind::Srv;
+    }
+}
+
+// Byte size of a buffer descriptor's window: records of `stride` bytes when the stride is set and
+// out-of-bounds checks count records, else num_records bytes.
+uint64_t buffer_bytes(const hw::BufferResource& b) noexcept {
+    if (b.stride != 0 && b.oob_select != hw::Oob::Complete) {
+        return uint64_t{b.num_records} * b.stride;
+    }
+    return b.num_records;
+}
+
+uint32_t srgb_sibling(uint32_t dxgi) noexcept {
+    static constexpr uint32_t kPairs[][2] = {{28, 29}, {87, 91}, {88, 93}, {71, 72}, {74, 75}, {77, 78}, {98, 99}};
+    for (const auto& p : kPairs) {
+        if (p[0] == dxgi) {
+            return p[1];
+        }
+        if (p[1] == dxgi) {
+            return p[0];
+        }
+    }
+    return 0;
+}
+
+uint32_t view_dimension(const hw::ImageResource& img) noexcept {
+    switch (img.type) {
+    case hw::ImageType::Tex1D: return d3d::ViewDimension::Texture1D;
+    case hw::ImageType::Tex1DArray: return d3d::ViewDimension::Texture1DArray;
+    case hw::ImageType::Tex2D: return d3d::ViewDimension::Texture2D;
+    case hw::ImageType::Tex2DArray: return d3d::ViewDimension::Texture2DArray;
+    case hw::ImageType::Tex2DMsaa: return d3d::ViewDimension::Texture2DMs;
+    case hw::ImageType::Tex2DMsaaArray: return d3d::ViewDimension::Texture2DMsArray;
+    case hw::ImageType::Tex3D: return d3d::ViewDimension::Texture3D;
+    case hw::ImageType::Cube:
+        return img.depth > img.base_array + 6 ? d3d::ViewDimension::TextureCubeArray : d3d::ViewDimension::TextureCube;
+    default: return d3d::ViewDimension::Unknown;
+    }
+}
+
+}  // namespace
+
+DecodeStatus decode_view_words(const StateBridgeDevice& device, const uint32_t w[8], d3d::DescriptorRangeType range,
+                               d3d::ViewDescriptor* out) {
+    *out = d3d::ViewDescriptor{};
+    out->kind = kind_of(range);
+    const hw::SlotContent content = hw::classify_slot(w);
+    if (content == hw::SlotContent::Zero) {
+        return DecodeStatus::Zero;
+    }
+    if (content == hw::SlotContent::Unknown || range == d3d::DescriptorRangeType::Sampler) {
+        return content == hw::SlotContent::Unknown ? DecodeStatus::NotDescriptor : DecodeStatus::KindMismatch;
+    }
+    if (content == hw::SlotContent::Buffer) {
+        const hw::BufferResource b = hw::decode_buffer(w);
+        const uint64_t bytes = buffer_bytes(b);
+        if (range == d3d::DescriptorRangeType::Cbv) {
+            out->first_element_or_address = b.base;
+            out->num_elements_or_size = static_cast<uint32_t>(std::min<uint64_t>(bytes, 0xffffffffu));
+            d3d::GpuVaResolution res;
+            return device.resolve_gpu_va(b.base, &res) ? DecodeStatus::Ok : DecodeStatus::UnresolvedAddress;
+        }
+        d3d::GpuVaResolution res;
+        if (!device.resolve_gpu_va(b.base, &res)) {
+            return DecodeStatus::UnresolvedAddress;
+        }
+        out->dimension = static_cast<uint8_t>(d3d::ViewDimension::Buffer);
+        out->resource_id = res.resource_id;
+        out->structure_byte_stride = 1;
+        out->first_element_or_address = res.offset;
+        out->num_elements_or_size = static_cast<uint32_t>(
+            std::min<uint64_t>(bytes, res.resource_size > res.offset ? res.resource_size - res.offset : 0));
+        return DecodeStatus::Ok;
+    }
+    // Image words.
+    if (range == d3d::DescriptorRangeType::Cbv) {
+        return DecodeStatus::KindMismatch;
+    }
+    const hw::ImageResource img = hw::decode_image(w);
+    const uint32_t id = device.texture_at(img.base);
+    if (id == 0) {
+        return DecodeStatus::UnknownTexture;
+    }
+    bool exact = false;
+    const uint32_t dxgi = hw::dxgi_format(img.format, img.dst_sel, &exact);
+    if (dxgi == 0) {
+        return DecodeStatus::UnsupportedFormat;
+    }
+    out->resource_id = id;
+    // The view format: the decoded one when it is the texture's own format or its sRGB sibling (what
+    // a WebGPU view of the texture may use), else the texture's format (0).
+    TextureInfo tex;
+    const uint32_t own = device.texture_info(id, &tex) ? static_cast<uint32_t>(tex.format) : 0u;
+    out->format = dxgi == own || srgb_sibling(dxgi) == own ? dxgi : 0u;
+    out->dimension = static_cast<uint8_t>(view_dimension(img));
+    if (out->kind == d3d::DescriptorKind::Srv) {
+        hw::HardwareFormat f;
+        uint32_t mapping = d3d::kDefaultShader4ComponentMapping;
+        if (!exact && hw::hardware_format(dxgi, &f)) {
+            hw::component_mapping_from(f.swizzle, img.dst_sel, &mapping);
+        }
+        out->component_mapping = mapping;
+        out->min_lod_clamp = hw::u4_8_to_lod(img.min_lod);
+    }
+    const bool msaa = img.type == hw::ImageType::Tex2DMsaa || img.type == hw::ImageType::Tex2DMsaaArray;
+    out->first_mip = static_cast<uint16_t>(msaa ? 0u : img.base_level);
+    out->mip_levels = static_cast<uint16_t>(msaa || out->kind == d3d::DescriptorKind::Uav
+                                                ? 1u
+                                                : img.last_level - img.base_level + 1u);
+    out->first_array_slice = img.base_array;
+    out->array_size = img.depth > img.base_array ? img.depth - img.base_array : 1u;
+    if (out->dimension == d3d::ViewDimension::TextureCube || out->dimension == d3d::ViewDimension::TextureCubeArray) {
+        out->array_size = std::max(1u, out->array_size / 6u);  // cube arrays: NumCubes
+    }
+    return DecodeStatus::Ok;
+}
+
+DecodeStatus decode_sampler_words(const uint32_t w[4], d3d::SamplerDesc* out) {
+    if (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 0) {
+        return DecodeStatus::Zero;
+    }
+    const hw::SamplerState s = hw::decode_sampler(w);
+    // Unused dword 3 bits 12..29 must be zero; enumerations in range.
+    if ((w[3] & 0x3ffff000u) != 0 || s.max_aniso_ratio > 4 || s.filter_mode > 2 || s.z_filter > 2) {
+        return DecodeStatus::NotDescriptor;
+    }
+    *out = hw::d3d12_from_sampler(s);
+    return DecodeStatus::Ok;
+}
+
 void sampler_words(const d3d::SamplerDesc& desc, uint32_t out[4]) {
     hw::encode(hw::sampler_from_d3d12(desc), out);
 }

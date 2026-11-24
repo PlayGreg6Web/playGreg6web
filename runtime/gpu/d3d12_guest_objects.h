@@ -755,6 +755,11 @@ public:
                                 const std::vector<std::pair<uint64_t, uint32_t>>& src_ranges, uint32_t type);
     // Slots written per outcome (index = bridge::WordsStatus).
     std::array<uint64_t, 7> descriptor_word_counts() const;
+    // Root-table slots read back from descriptor memory, per binding kind (0 CBV, 1 SRV, 2 UAV,
+    // 3 sampler) and outcome (index = bridge::DecodeStatus). Ok slots bind; every other outcome binds
+    // null and its first occurrence per kind is logged with the reason.
+    using SlotReadCounts = std::array<std::array<uint64_t, 7>, 4>;
+    SlotReadCounts descriptor_slot_reads() const;
     // Xbox slots 70 / 71 after parsing the view description (d3d12_xs_xbox.cpp).
     void view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDesc& desc, uint64_t va, uint64_t dest);
     uint64_t count_texture_view_at_address();
@@ -854,6 +859,24 @@ private:
     std::atomic<uint64_t> upload_bytes_{0};
     std::array<std::atomic<uint64_t>, 7> descriptor_words_{};
     std::atomic<uint32_t> descriptor_words_reported_{0};  // bit per WordsStatus already logged
+    // Root tables read from descriptor memory (BridgeOptions::slot_source).
+    class MemorySlotSource final : public d3d::DescriptorSlotSource {
+    public:
+        explicit MemorySlotSource(Device& device) : device_(device) {}
+        bool reads(const d3d::DescriptorHeap& heap) const override;
+        bool snapshot(const d3d::DescriptorHeap& heap, uint32_t first, uint32_t count,
+                      std::vector<uint8_t>* out) const override;
+        d3d::ViewDescriptor view(const d3d::DescriptorHeap& heap, uint32_t index,
+                                 d3d::DescriptorRangeType range) const override;
+        bool sampler(const d3d::DescriptorHeap& heap, uint32_t index, d3d::SamplerDesc* out) const override;
+
+    private:
+        void note(uint32_t kind, uint32_t status, uint64_t address) const;
+        Device& device_;
+    };
+    std::unique_ptr<MemorySlotSource> slot_source_;
+    mutable std::array<std::array<std::atomic<uint64_t>, 7>, 4> slot_reads_{};
+    mutable std::atomic<uint32_t> slot_reads_reported_{0};  // bit per (kind, status) already logged
     std::atomic<uint64_t> skipped_draws_{0};
     std::atomic<uint64_t> unsupported_copies_{0};
     xbox::FramePacer pacer_;

@@ -94,6 +94,8 @@ public:
         uint32_t tail_bytes = 0);
 
     const uint8_t* data() const { return buf_.data(); }
+    // Overwrites `bytes` already-encoded bytes at `offset` (false when out of range).
+    bool patch(size_t offset, const void* bytes, size_t size);
     size_t size() const { return buf_.size(); }
 
 private:

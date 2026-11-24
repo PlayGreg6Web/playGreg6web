@@ -630,6 +630,7 @@ CommandListBridge::CommandListBridge(StateBridgeDevice& device, CommandEncoder& 
       encoder_(encoder),
       tracker_(tracker_options(device.options())),
       resource_states_(device.resource_states_) {
+    bind_groups_.set_slot_source(device.options().slot_source);
     Reset();
 }
 
@@ -649,6 +650,7 @@ void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
     render_groups_.clear();
     compute_groups_.clear();
     scoped_bind_groups_.clear();
+    memory_groups_.clear();
     compute_pass_valid_ = false;
     compute_pipeline_bound_ = 0;
     for (auto& point : root_uploads_) {
@@ -1079,14 +1081,84 @@ uint32_t CommandListBridge::upload_root_constants(d3d::BindPoint bind_point, uin
 
 bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
                                         const StateBridgeDevice::GroupLayoutRecord& group,
-                                        d3d::CachedBindGroup* cached) {
+                                        d3d::CachedBindGroup* cached,
+                                        const d3d::BindGroupPlan* plan) {
     if (cached->entries.size() != group.entries.size()) {
         diagnostics_ |= BridgeDiag::BindGroupBuildFailed;
         return false;
     }
-    std::vector<GpuBindGroupEntry2> entries(cached->entries.size());
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const d3d::BindGroupEntry& e = cached->entries[i];
+    std::vector<GpuBindGroupEntry2> entries;
+    gpu_entries(group, *cached, encoder_, &entries);
+    GpuCreateBindGroup2Payload header{};
+    header.id = device_.allocate_id();
+    header.layout_id = group.id;
+    header.entry_count = static_cast<uint32_t>(entries.size());
+    const uint32_t entry_bytes = static_cast<uint32_t>(entries.size() * sizeof(GpuBindGroupEntry2));
+    encoder_.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(), entry_bytes);
+    cached->gpu_id = header.id;
+    ++stats_.bind_groups_created;
+    if (cached->from_memory && plan != nullptr) {
+        note_memory_group(group, *plan, *cached, encoder_.size() - entry_bytes);
+    }
+    return true;
+}
+
+void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group,
+                                          const d3d::BindGroupPlan& plan,
+                                          const d3d::CachedBindGroup& cached,
+                                          size_t entries_offset) {
+    for (MemoryBindGroup& m : memory_groups_) {
+        if (m.built.gpu_id == cached.gpu_id) {
+            if (entries_offset != kNoPacket) {
+                m.entries_offset = entries_offset;
+                m.built = cached;
+            }
+            return;
+        }
+    }
+    memory_groups_.push_back(MemoryBindGroup{entries_offset, &group, plan, cached});
+    ++stats_.memory_bind_groups;
+}
+
+uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) {
+    const d3d::DescriptorSlotSource* source = device_.options().slot_source;
+    if (source == nullptr) {
+        return 0;
+    }
+    uint32_t refreshed = 0;
+    for (MemoryBindGroup& m : memory_groups_) {
+        if (!d3d::refresh_table_entries(device_.heaps(), *source, m.plan, &StateBridgeDevice::gpu_va_trampoline,
+                                        &device_, &m.built)) {
+            continue;
+        }
+        std::vector<GpuBindGroupEntry2> entries;
+        gpu_entries(*m.group, m.built, prelude, &entries);
+        const size_t bytes = entries.size() * sizeof(GpuBindGroupEntry2);
+        if (m.entries_offset != kNoPacket) {
+            encoder_.patch(m.entries_offset, entries.data(), bytes);
+        } else {
+            // Created by an earlier recording of this list: create it again under the same id.
+            GpuCreateBindGroup2Payload header{};
+            header.id = m.built.gpu_id;
+            header.layout_id = m.group->id;
+            header.entry_count = static_cast<uint32_t>(entries.size());
+            prelude.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(),
+                                static_cast<uint32_t>(bytes));
+        }
+        ++refreshed;
+        ++stats_.memory_bind_groups_refreshed;
+    }
+    return refreshed;
+}
+
+void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group,
+                                    const d3d::CachedBindGroup& cached,
+                                    CommandEncoder& side,
+                                    std::vector<GpuBindGroupEntry2>* result) {
+    std::vector<GpuBindGroupEntry2>& entries = *result;
+    entries.assign(cached.entries.size(), GpuBindGroupEntry2{});
+    for (size_t i = 0; i < entries.size() && i < group.entries.size(); ++i) {
+        const d3d::BindGroupEntry& e = cached.entries[i];
         const GpuBindGroupLayoutEntry& layout = group.entries[i];
         GpuBindGroupEntry2& out = entries[i];
         out.binding = layout.binding;
@@ -1108,8 +1180,20 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
                     device_.options().relocate_uniform(base + e.offset, e.size, &id, &offset)) {
                     out.resource_id = id;
                     out.offset = offset;
+                    // The relocated home is a whole multiple of 256 bytes (zero past the view).
+                    out.size = align_up(e.size, kUniformOffsetAlignment);
                 } else {
                     diagnostics_ |= BridgeDiag::UnalignedUniform;
+                }
+            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                       layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) && e.size != 0 &&
+                       e.size % kUniformOffsetAlignment != 0) {
+                // Xbox constant-buffer views are 16-byte multiples; shaders may declare the 256-byte
+                // minimum of PC D3D12. Bind up to that much when the buffer has the room.
+                const uint64_t base = device_.buffer_gpu_va(e.resource_id);
+                d3d::GpuVaResolution res;
+                if (base != 0 && device_.resolve_gpu_va(base + e.offset, &res)) {
+                    out.size = std::min<uint64_t>(align_up(e.size, kUniformOffsetAlignment), res.resource_size - res.offset);
                 }
             }
             break;
@@ -1120,11 +1204,11 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
             break;
         case d3d::BindResourceKind::Sampler:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
-            out.resource_id = device_.intern_sampler(e.sampler, encoder_, &diagnostics_);
+            out.resource_id = device_.intern_sampler(e.sampler, side, &diagnostics_);
             break;
         case d3d::BindResourceKind::RootConstants:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
-            out.resource_id = device_.ensure_root_constant_ring(encoder_);
+            out.resource_id = device_.ensure_root_constant_ring(side);
             out.size = align_up(std::max<uint32_t>(static_cast<uint32_t>(e.size), 16u), 16u);
             break;
         case d3d::BindResourceKind::Null:
@@ -1143,15 +1227,6 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
             break;
         }
     }
-    GpuCreateBindGroup2Payload header{};
-    header.id = device_.allocate_id();
-    header.layout_id = group.id;
-    header.entry_count = static_cast<uint32_t>(entries.size());
-    encoder_.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(),
-                         static_cast<uint32_t>(entries.size() * sizeof(GpuBindGroupEntry2)));
-    cached->gpu_id = header.id;
-    ++stats_.bind_groups_created;
-    return true;
 }
 
 void CommandListBridge::add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join) {
@@ -1205,13 +1280,15 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             cached = lookup.bind_group;
             if (lookup.rebuilt || cached->gpu_id == 0) {
                 device_.ensure_layout_emitted(layout, encoder_);
-                if (!emit_bind_group(bind_point, group, cached)) {
+                if (!emit_bind_group(bind_point, group, cached, &plans[g])) {
                     return false;
                 }
                 if (lookup.retired_gpu_id != 0) {
                     encoder_.destroy_resource(lookup.retired_gpu_id);
                     ++stats_.bind_groups_retired;
                 }
+            } else if (cached->from_memory) {
+                note_memory_group(group, plans[g], *cached, kNoPacket);  // created by an earlier recording
             }
             bind_group_id = cached->gpu_id;
             for (size_t i = 0; i < group.entries.size(); ++i) {

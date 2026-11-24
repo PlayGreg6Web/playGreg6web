@@ -69,6 +69,29 @@ void sampler_words(const d3d12_state::SamplerDesc& desc, uint32_t out[kSamplerSl
 WordsStatus buffer_words_at_address(uint64_t va, const d3d12_state::ViewDescriptor& view,
                                     uint32_t out[kViewSlotBytes / 4]);
 
+// ---- Reading words back (root tables read from descriptor memory) ----
+// The binding a slot's words describe, as the registry record an API-created view would carry, so
+// the same translation to bind group entries applies. Buffers resolve through the bridge's VA map
+// (recorded as a byte window: structure_byte_stride 1, FirstElement = byte offset, NumElements =
+// bytes); images through the texture descriptor addresses (TextureInfo::gpu_va).
+enum class DecodeStatus : uint8_t {
+    Ok,
+    Zero,               // all-zero slot: null descriptor
+    NotDescriptor,      // no plausible buffer / image words (free-list link, data, ...)
+    KindMismatch,       // image words for a constant buffer, buffer words for a sampler, ...
+    UnresolvedAddress,  // buffer words whose address is in no registered buffer
+    UnknownTexture,     // image words whose address is no texture (e.g. a slot-70 texture)
+    UnsupportedFormat,  // image words with a format the table has no DXGI format for
+    Count
+};
+const char* decode_status_name(DecodeStatus status) noexcept;
+// `range` is the register class of the binding (CBV, SRV, UAV). `out` is a null record of the
+// binding's kind unless the status is Ok.
+DecodeStatus decode_view_words(const StateBridgeDevice& device, const uint32_t words[kViewSlotBytes / 4],
+                               d3d12_state::DescriptorRangeType range, d3d12_state::ViewDescriptor* out);
+// Sampler words (16 bytes); NotDescriptor / Zero leave `out` unchanged.
+DecodeStatus decode_sampler_words(const uint32_t words[kSamplerSlotBytes / 4], d3d12_state::SamplerDesc* out);
+
 // A texture the title describes only by address and resource description (Xbox device slot 70 /
 // 71: no resource object exists). Same encoding as a texture view, base = `address`.
 struct AddressTexture {

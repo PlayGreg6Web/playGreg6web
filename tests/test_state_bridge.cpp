@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/cmd_encoder.h"
 #include "gpu/descriptor_heap.h"
+#include "gpu/descriptor_words.h"
 #include "gpu/pso_cache.h"
 #include "gpu/state_bridge.h"
 
@@ -939,7 +941,7 @@ void test_unaligned_uniform_relocation() {
         if (bind_group != nullptr) {
             const auto entry = pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload));
             if (with_hook) {
-                CHECK(entry.resource_id == 777 && entry.offset == 512 && entry.size == 96);
+                CHECK(entry.resource_id == 777 && entry.offset == 512 && entry.size == 256);  // whole relocated slot
                 CHECK(calls.size() == 1 && calls[0].first == kCbVa + 0x40 && calls[0].second == 96);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedUniform) == 0);
             } else {
@@ -950,8 +952,248 @@ void test_unaligned_uniform_relocation() {
     }
 }
 
+// G48: a slot source over test-owned "descriptor memory" for one heap.
+class TestSlotSource final : public d3d::DescriptorSlotSource {
+public:
+    TestSlotSource(const bridge::StateBridgeDevice& device, const d3d::DescriptorHeap* heap)
+        : device_(device), heap_(heap), memory_(size_t{heap->capacity()} * heap->increment(), 0) {}
+    bool reads(const d3d::DescriptorHeap& heap) const override { return &heap == heap_; }
+    bool snapshot(const d3d::DescriptorHeap&, uint32_t first, uint32_t count, std::vector<uint8_t>* out) const override {
+        const size_t inc = heap_->increment();
+        out->assign(memory_.begin() + first * inc, memory_.begin() + (first + count) * inc);
+        return true;
+    }
+    d3d::ViewDescriptor view(const d3d::DescriptorHeap&, uint32_t index, d3d::DescriptorRangeType range) const override {
+        d3d::ViewDescriptor v;
+        last_status = bridge::decode_view_words(device_, words(index), range, &v);
+        return v;
+    }
+    bool sampler(const d3d::DescriptorHeap&, uint32_t index, d3d::SamplerDesc* out) const override {
+        return bridge::decode_sampler_words(words(index), out) == bridge::DecodeStatus::Ok;
+    }
+    void write(uint32_t index, const uint32_t* w, size_t bytes) {
+        std::memcpy(memory_.data() + size_t{index} * heap_->increment(), w, bytes);
+    }
+    const uint32_t* words(uint32_t index) const {
+        return reinterpret_cast<const uint32_t*>(memory_.data() + size_t{index} * heap_->increment());
+    }
+    mutable bridge::DecodeStatus last_status = bridge::DecodeStatus::Ok;
+
+private:
+    const bridge::StateBridgeDevice& device_;
+    const d3d::DescriptorHeap* heap_;
+    std::vector<uint8_t> memory_;
+};
+
+GpuBindGroupEntry2 last_bind_group_entry(const gpu::CommandEncoder& enc, uint32_t* id = nullptr) {
+    GpuBindGroupEntry2 entry{};
+    for (const Packet& packet : decode(enc)) {
+        if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
+            entry = pod<GpuBindGroupEntry2>(packet, sizeof(GpuCreateBindGroup2Payload));
+            if (id != nullptr) {
+                *id = pod<GpuCreateBindGroup2Payload>(packet).id;
+            }
+        }
+    }
+    return entry;
+}
+
+// G48: root tables read from descriptor memory, revalidated by their words, refreshed at execution.
+void test_memory_backed_tables() {
+    d3d::DescriptorHeapRegistry heaps;
+    heaps.set_cbv_alignment(16);
+    d3d::ResourceStateRegistry states;
+    bridge::BridgeOptions options = counting_options(6000);
+    // The slot source needs the device; it is installed through the options before the device exists.
+    struct Holder {
+        std::unique_ptr<TestSlotSource> source;
+    } holder;
+    struct Forward final : d3d::DescriptorSlotSource {
+        Holder* h = nullptr;
+        bool reads(const d3d::DescriptorHeap& heap) const override { return h->source && h->source->reads(heap); }
+        bool snapshot(const d3d::DescriptorHeap& heap, uint32_t f, uint32_t c, std::vector<uint8_t>* o) const override {
+            return h->source->snapshot(heap, f, c, o);
+        }
+        d3d::ViewDescriptor view(const d3d::DescriptorHeap& heap, uint32_t i, d3d::DescriptorRangeType r) const override {
+            return h->source->view(heap, i, r);
+        }
+        bool sampler(const d3d::DescriptorHeap& heap, uint32_t i, d3d::SamplerDesc* o) const override {
+            return h->source->sampler(heap, i, o);
+        }
+    } forward;
+    forward.h = &holder;
+    options.slot_source = &forward;
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kCb = 300, kTexture = 301, kVsModule = 1, kFsModule = 2;
+    constexpr uint64_t kVs = 0xD1, kPs = 0xD2, kCbVa = 0x10000, kTextureVa = 0x7E00'0001'0000ull;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    bridge::TextureInfo tex{pso::DxgiFormat::R8G8B8A8_UNORM, 128, 64, 1, 8, 1, GpuTextureDimension::Dim2D, false};
+    tex.gpu_va = kTextureVa;
+    device.register_texture(kTexture, tex);
+    device.register_buffer(kCb, kCbVa, 4096);
+    device.register_shader_module(kVs, kVsModule);
+    device.register_shader_module(kPs, kFsModule);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    d3d::DescriptorHeap* heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 8, true);
+    holder.source = std::make_unique<TestSlotSource>(device, heap);
+    TestSlotSource& memory = *holder.source;
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    // Decoding: words of API-created views read back as the same bindings.
+    {
+        uint32_t w[8];
+        d3d::ViewDescriptor cbv{};
+        cbv.kind = d3d::DescriptorKind::Cbv;
+        cbv.first_element_or_address = kCbVa + 0x40;
+        cbv.num_elements_or_size = 96;
+        CHECK(bridge::view_words(device, cbv, w) == bridge::WordsStatus::Ok);
+        d3d::ViewDescriptor back;
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Cbv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.kind == d3d::DescriptorKind::Cbv && back.first_element_or_address == kCbVa + 0x40 &&
+              back.num_elements_or_size == 96);
+        d3d::ViewDescriptor srv{};
+        srv.kind = d3d::DescriptorKind::Srv;
+        srv.resource_id = kCb;
+        srv.dimension = d3d::ViewDimension::Buffer;
+        srv.first_element_or_address = 4;
+        srv.num_elements_or_size = 8;
+        srv.structure_byte_stride = 16;
+        CHECK(bridge::view_words(device, srv, w) == bridge::WordsStatus::Ok);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.resource_id == kCb && back.structure_byte_stride == 1 && back.first_element_or_address == 64 &&
+              back.num_elements_or_size == 128);
+        d3d::ViewDescriptor img{};
+        img.kind = d3d::DescriptorKind::Srv;
+        img.resource_id = kTexture;
+        img.dimension = d3d::ViewDimension::Texture2D;
+        img.format = 29;  // sRGB view of an R8G8B8A8_UNORM texture
+        img.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        img.first_mip = 2;
+        img.mip_levels = 3;
+        CHECK(bridge::view_words(device, img, w) == bridge::WordsStatus::Ok);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.resource_id == kTexture && back.format == 29 && back.dimension == d3d::ViewDimension::Texture2D &&
+              back.first_mip == 2 && back.mip_levels == 3 && back.component_mapping == d3d::kDefaultShader4ComponentMapping);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Cbv, &back) == bridge::DecodeStatus::KindMismatch);
+        const uint32_t link[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+        CHECK(bridge::decode_view_words(device, link, d3d::DescriptorRangeType::Srv, &back) ==
+                  bridge::DecodeStatus::NotDescriptor &&
+              back.resource_id == 0);
+        uint32_t far[4];
+        bridge::constant_buffer_words(0x9'0000'0000ull, 64, far);
+        const uint32_t far8[8] = {far[0], far[1], far[2], far[3], 0, 0, 0, 0};
+        CHECK(bridge::decode_view_words(device, far8, d3d::DescriptorRangeType::Srv, &back) ==
+              bridge::DecodeStatus::UnresolvedAddress);
+        uint32_t tw[8];
+        bridge::AddressTexture at;
+        at.width = 64;
+        at.height = 64;
+        at.format = 28;
+        CHECK(bridge::image_words_at_address(0x9'0000'0000ull, at, img, tw) == bridge::WordsStatus::Ok);
+        CHECK(bridge::decode_view_words(device, tw, d3d::DescriptorRangeType::Srv, &back) ==
+              bridge::DecodeStatus::UnknownTexture);
+        uint32_t sw[4];
+        d3d::SamplerDesc s;
+        s.filter = 0x15;
+        s.address_u = 3;
+        bridge::sampler_words(s, sw);
+        d3d::SamplerDesc sb;
+        CHECK(bridge::decode_sampler_words(sw, &sb) == bridge::DecodeStatus::Ok && sb.filter == 0x15 && sb.address_u == 3);
+    }
+
+    // A CBV table whose slot only exists in memory (the title copied it there).
+    uint32_t cb[4];
+    bridge::constant_buffer_words(kCbVa + 0x40, 96, cb);
+    memory.write(3, cb, sizeof(cb));
+    CHECK(heap->view(3)->kind == d3d::DescriptorKind::Empty);  // nothing in the registry
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Cbv;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
+                                           GpuBindingLayoutType::Buffer, static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                              join(0, d3d::DescriptorRangeType::Cbv, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootDescriptorTable(0, heap->gpu_handle(3)) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+    list.IASetVertexBuffers(0, 1, &vb);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.DrawInstanced(3, 1, 0, 0);  // same words: same bind group
+    list.Close();
+    uint32_t id = 0;
+    GpuBindGroupEntry2 e = last_bind_group_entry(enc, &id);
+    CHECK(e.resource_id == kCb && e.offset == 0x40 && e.size == 96);
+    CHECK(list.stats().bind_groups_created == 1 && list.stats().memory_bind_groups == 1);
+
+    // Unchanged at execution: nothing to do. Changed: the recorded entries are rewritten in place.
+    gpu::CommandEncoder prelude;
+    CHECK(list.refresh_memory_bind_groups(prelude) == 0);
+    bridge::constant_buffer_words(kCbVa + 0x100, 32, cb);
+    memory.write(3, cb, sizeof(cb));
+    const size_t before = enc.size();
+    CHECK(list.refresh_memory_bind_groups(prelude) == 1);
+    CHECK(enc.size() == before && prelude.size() == 0);
+    uint32_t id2 = 0;
+    e = last_bind_group_entry(enc, &id2);
+    CHECK(id2 == id && e.resource_id == kCb && e.offset == 0x100 && e.size == 256);  // widened to 256 bytes
+    CHECK(list.refresh_memory_bind_groups(prelude) == 0);
+
+    // Words the runtime cannot read as a descriptor bind null.
+    const uint32_t link[8] = {9, 0, 0, 0, 0, 0, 0, 0};
+    memory.write(3, link, sizeof(link));
+    CHECK(list.refresh_memory_bind_groups(prelude) == 1);
+    e = last_bind_group_entry(enc);
+    CHECK(e.resource_id == 0 && memory.last_status == bridge::DecodeStatus::NotDescriptor);
+
+    // A new recording over the same table: the cached group is revalidated by its words.
+    bridge::constant_buffer_words(kCbVa + 0x200, 16, cb);
+    memory.write(3, cb, sizeof(cb));
+    gpu::CommandEncoder enc2;
+    bridge::CommandListBridge list2(device, enc2);
+    CHECK(list2.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list2.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list2.SetPipelineState(state.get());
+    CHECK(list2.SetGraphicsRootDescriptorTable(0, heap->gpu_handle(3)) == d3d::Status::Ok);
+    list2.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list2.IASetVertexBuffers(0, 1, &vb);
+    list2.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list2.DrawInstanced(3, 1, 0, 0);
+    bridge::constant_buffer_words(kCbVa + 0x300, 16, cb);
+    memory.write(3, cb, sizeof(cb));
+    list2.DrawInstanced(3, 1, 0, 0);  // words changed between draws: rebuilt under a new id
+    list2.Close();
+    CHECK(list2.stats().bind_groups_created == 2 && list2.stats().memory_bind_groups == 2);
+    e = last_bind_group_entry(enc2);
+    CHECK(e.offset == 0x300);
+}
+
 int main() {
     test_seam_conversions();
+    test_memory_backed_tables();
     test_representative_command_list();
     test_unaligned_uniform_relocation();
     test_bind_group_rebuild_and_retire();

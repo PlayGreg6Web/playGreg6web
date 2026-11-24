@@ -153,6 +153,9 @@ struct BridgeOptions {
     // address and size it returns a buffer id and an aligned offset that hold the same bytes
     // (false: no relocation, the binding is emitted as it is and diagnosed).
     std::function<bool(uint64_t gpu_va, uint64_t size, uint32_t* buffer_id, uint64_t* offset)> relocate_uniform;
+    // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
+    // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
+    const d3d::DescriptorSlotSource* slot_source = nullptr;
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
@@ -334,6 +337,8 @@ struct BridgeStats {
     uint64_t pipelines_created = 0;
     uint64_t bind_groups_created = 0;
     uint64_t bind_groups_retired = 0;
+    uint64_t memory_bind_groups = 0;            // bind groups over descriptor memory (recorded)
+    uint64_t memory_bind_groups_refreshed = 0;  // ... rebuilt at ExecuteCommandLists (words changed)
     uint64_t root_constant_uploads = 0;
     uint64_t clear_fallbacks_dropped = 0;
     uint64_t usage_conflicts = 0;
@@ -406,6 +411,12 @@ public:
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
 
+    // ExecuteCommandLists: re-reads the descriptor memory of every bind group this list recorded over
+    // memory-backed tables (the GPU reads a table when the draw executes) and rewrites the recorded
+    // CreateBindGroup2 entries in place where the words changed. Packets it needs first (samplers)
+    // go to `prelude`. Returns the number of bind groups rebuilt.
+    uint32_t refresh_memory_bind_groups(CommandEncoder& prelude);
+
     // Inspection.
     uint64_t diagnostics() const noexcept { return diagnostics_; }
     uint64_t state_diagnostics() const noexcept { return tracker_.diagnostics(); }        // pso::StateDiag
@@ -437,7 +448,11 @@ private:
                            bool track_usage);
     bool emit_bind_group(d3d::BindPoint bind_point,
                          const StateBridgeDevice::GroupLayoutRecord& group,
-                         d3d::CachedBindGroup* cached);
+                         d3d::CachedBindGroup* cached,
+                         const d3d::BindGroupPlan* plan = nullptr);
+    // The CreateBindGroup2 entries for `cached` (samplers are interned through `side`).
+    void gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
+                     CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
     void add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join);
     GpuTextureViewDesc texture_view_desc(const d3d::ViewDescriptor& view);
     uint32_t upload_root_constants(d3d::BindPoint bind_point, uint32_t parameter_index);
@@ -457,6 +472,18 @@ private:
     GraphicsPipelineState* graphics_pso_ = nullptr;
     ComputePipelineState* compute_pso_ = nullptr;
     std::unordered_map<uint32_t, uint32_t> empty_bind_groups_;  // group layout id -> bind group id
+    // Bind groups recorded over descriptor memory: where their entries sit in the encoder, what
+    // they were built from.
+    struct MemoryBindGroup {
+        size_t entries_offset = 0;  // byte offset of the GpuBindGroupEntry2 array in encoder_
+        const StateBridgeDevice::GroupLayoutRecord* group = nullptr;
+        d3d::BindGroupPlan plan;
+        d3d::CachedBindGroup built;
+    };
+    std::vector<MemoryBindGroup> memory_groups_;
+    static constexpr size_t kNoPacket = ~size_t{0};  // created by an earlier recording
+    void note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::BindGroupPlan& plan,
+                           const d3d::CachedBindGroup& cached, size_t entries_offset);
 
     // Input assembler state.
     std::array<VertexBinding, pso::kMaxVertexBuffers> vertex_buffers_{};

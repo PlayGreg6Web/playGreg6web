@@ -22,6 +22,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "gpu/descriptor_words.h"
 #include "gpu/gfx10_descriptors.h"
 #include "gpu/shader_pack_index.h"
 #include "guest/com_bridge.h"
@@ -2571,6 +2572,49 @@ void test_descriptor_words_in_memory() {
     scene.release_all({heap, smp, buf, tex});
 }
 
+// G48: shader-visible tables are read from descriptor memory: a slot the title copied itself binds
+// like the API-created view it was copied from; other words bind null and are counted.
+void test_tables_from_descriptor_memory() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const d3d::DescriptorSlotSource* source = dev->state_bridge().options().slot_source;
+    CHECK(source != nullptr);
+    const uint64_t cpu_heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                        {I(put(dg::GuestDescriptorHeapDesc{0, 4, 0, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    const uint64_t gpu_heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                        {I(put(dg::GuestDescriptorHeapDesc{0, 8, 1, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    const uint64_t start = put<uint64_t>(0);
+    fx.sret_call(cpu_heap, Slot::GetCPUStart, start);
+    const uint64_t cpu0 = load64(start);
+    fx.sret_call(gpu_heap, Slot::GetCPUStart, start);
+    const uint64_t gpu0 = load64(start);
+    const auto* visible = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(gpu_heap)->heap();
+    const auto* cpu_only = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(cpu_heap)->heap();
+    CHECK(source->reads(*visible) && !source->reads(*cpu_only));
+
+    // The API creates the CBV in the CPU heap; the title copies the 32-byte slot itself.
+    const uint64_t buf = committed(fx, scene.device, 2, buffer_desc(4096), 0xAC3);
+    const uint64_t buf_va = fx.vcall(buf, Slot2::GetGPUVirtualAddress);
+    fx.vcall(scene.device, Slot::CreateConstantBufferView, {I(put(dg::GuestConstantBufferViewDesc{buf_va + 0x60, 96})), I(cpu0)});
+    uint8_t slot[32];
+    CHECK(com::read_guest(cpu0, slot, 32) && com::write_guest(gpu0 + 5 * 32, slot, 32));
+    CHECK(visible->view(5)->kind == d3d::DescriptorKind::Empty);
+    const d3d::ViewDescriptor v = source->view(*visible, 5, d3d::DescriptorRangeType::Cbv);
+    CHECK(v.kind == d3d::DescriptorKind::Cbv && v.first_element_or_address == buf_va + 0x60 && v.num_elements_or_size == 96);
+    // A never-written slot holding the title's free-list link binds null.
+    const uint32_t link[8] = {6, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(com::write_guest(gpu0 + 6 * 32, link, 32));
+    const d3d::ViewDescriptor n = source->view(*visible, 6, d3d::DescriptorRangeType::Srv);
+    CHECK(n.resource_id == 0);
+    const auto reads = dev->descriptor_slot_reads();
+    CHECK(reads[0][static_cast<size_t>(playgta6::gpu::bridge::DecodeStatus::Ok)] == 1);
+    CHECK(reads[1][static_cast<size_t>(playgta6::gpu::bridge::DecodeStatus::NotDescriptor)] == 1);
+    std::vector<uint8_t> words;
+    CHECK(source->snapshot(*visible, 5, 2, &words) && words.size() == 64 && std::memcmp(words.data(), slot, 32) == 0);
+    scene.release_all({cpu_heap, gpu_heap, buf});
+}
+
 // A WGPK pack with the given (key, stage) entries and tiny WGSL payloads.
 std::vector<uint8_t> wgpk(const std::vector<std::pair<uint64_t, uint8_t>>& entries) {
     std::vector<uint8_t> out(16 + entries.size() * 20, 0);
@@ -3201,6 +3245,7 @@ int main() {
     test_xbox_shader_pack_resolution();
     test_uav_texture_storage_usage();
     test_descriptor_words_in_memory();
+    test_tables_from_descriptor_memory();
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();

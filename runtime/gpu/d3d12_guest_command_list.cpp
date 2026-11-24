@@ -1057,6 +1057,9 @@ void CommandList::QueryOperation(com::CallContext&) {
 }
 
 void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateDiagnostic>* state_diagnostics) {
+    // Root tables over descriptor memory: the GPU reads the slots when the list executes, so they are
+    // read again now and the recorded bind groups are rewritten where the title changed them.
+    bridge_.refresh_memory_bind_groups(out);
     for (const DeferredWrite& w : deferred_) {
         std::vector<uint8_t> bytes(static_cast<size_t>(w.size));
         if (!com::read_guest(w.src, bytes.data(), bytes.size())) {

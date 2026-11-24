@@ -283,6 +283,16 @@ void CommandEncoder::dispatch_compute(
     write_packet(GpuOpcode::DispatchCompute, &payload, sizeof(payload));
 }
 
+bool CommandEncoder::patch(size_t offset, const void* bytes, size_t size) {
+    if (offset > buf_.size() || size > buf_.size() - offset) {
+        return false;
+    }
+    if (size != 0) {
+        std::memcpy(buf_.data() + offset, bytes, size);
+    }
+    return true;
+}
+
 void CommandEncoder::emit_packet(
     GpuOpcode opcode,
     const void* head,

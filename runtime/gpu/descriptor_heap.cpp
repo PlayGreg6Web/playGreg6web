@@ -1744,6 +1744,42 @@ void translate_view(
     e->kind = BindResourceKind::TextureView;
 }
 
+// One descriptor-table entry of a bind group: slot `index` of `heap`, from the registry record or
+// (when `source` reads the heap) from descriptor memory.
+void table_entry(const DescriptorSlotSource* source,
+                 const DescriptorHeap& heap,
+                 uint32_t index,
+                 DescriptorRangeType register_class,
+                 GpuVaResolver resolver,
+                 void* user,
+                 BindGroupEntry* e) {
+    e->kind = BindResourceKind::Null;
+    if (index >= heap.capacity()) {
+        return;
+    }
+    if (source != nullptr && source->reads(heap)) {
+        if (register_class == DescriptorRangeType::Sampler) {
+            SamplerDesc s;
+            if (source->sampler(heap, index, &s)) {
+                e->kind = BindResourceKind::Sampler;
+                e->sampler = s;
+            }
+        } else {
+            translate_view(source->view(heap, index, register_class), register_class, resolver, user, e);
+        }
+        return;
+    }
+    if (register_class == DescriptorRangeType::Sampler) {
+        const SamplerDescriptor* s = heap.sampler(index);
+        if (s != nullptr && s->kind == DescriptorKind::Sampler) {
+            e->kind = BindResourceKind::Sampler;
+            e->sampler = s->desc;
+        }
+    } else if (const ViewDescriptor* v = heap.view(index)) {
+        translate_view(*v, register_class, resolver, user, e);
+    }
+}
+
 uint64_t hash_key(const std::vector<uint64_t>& key) noexcept {
     Fnv64 h;
     for (uint64_t v : key) {
@@ -1854,6 +1890,15 @@ void BindGroupCache::build_entries(
     for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
         out->built_generation.push_back(state.argument(bind_point, w.parameter_index).heap->generation());
     }
+    out->built_words.clear();
+    out->table_bases.clear();
+    out->from_memory = memory_words(state, bind_point, plan, &out->built_words);
+    if (out->from_memory) {
+        for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
+            const RootArgument& arg = state.argument(bind_point, w.parameter_index);
+            out->table_bases.emplace_back(w.parameter_index, arg.heap->gpu_handle(arg.base_index).ptr);
+        }
+    }
     out->entries.reserve(plan.entries().size());
     const RootSignatureDesc& desc = signature.desc();
     for (const PlanEntry& p : plan.entries()) {
@@ -1867,16 +1912,8 @@ void BindGroupCache::build_entries(
             const RootArgument& arg = state.argument(bind_point, p.root_parameter_index);
             const uint64_t index = static_cast<uint64_t>(arg.base_index) + p.table_offset;
             if (index < arg.heap->capacity()) {
-                const uint32_t idx = static_cast<uint32_t>(index);
-                if (p.register_class == DescriptorRangeType::Sampler) {
-                    const SamplerDescriptor* s = arg.heap->sampler(idx);
-                    if (s != nullptr && s->kind == DescriptorKind::Sampler) {
-                        e.kind = BindResourceKind::Sampler;
-                        e.sampler = s->desc;
-                    }
-                } else if (const ViewDescriptor* v = arg.heap->view(idx)) {
-                    translate_view(*v, p.register_class, resolver, resolver_user, &e);
-                }
+                table_entry(slot_source_, *arg.heap, static_cast<uint32_t>(index), p.register_class, resolver,
+                            resolver_user, &e);
             }
             break;
         }
@@ -1968,6 +2005,10 @@ BindGroupLookup BindGroupCache::get_or_build(
                     static_cast<uint32_t>(first), windows[t].count, cached.built_generation[t]);
             }
         }
+        if (!changed && cached.from_memory) {
+            // Slots the title writes itself have no generation: compare the words.
+            changed = !memory_words(state, bind_point, plan, &scratch_words_) || scratch_words_ != cached.built_words;
+        }
         result.bind_group = &cached;
         if (!changed) {
             ++hits_;
@@ -1993,6 +2034,87 @@ BindGroupLookup BindGroupCache::get_or_build(
     result.rebuilt = true;
     entries_.emplace(h, std::move(entry));
     return result;
+}
+
+bool BindGroupCache::memory_words(const RootArgumentState& state, BindPoint bind_point, const BindGroupPlan& plan,
+                                  std::vector<uint8_t>* out) const {
+    out->clear();
+    if (slot_source_ == nullptr) {
+        return false;
+    }
+    bool any = false;
+    std::vector<uint8_t> window;
+    for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
+        const RootArgument& arg = state.argument(bind_point, w.parameter_index);
+        if (arg.heap == nullptr || !slot_source_->reads(*arg.heap)) {
+            continue;
+        }
+        const uint64_t first = static_cast<uint64_t>(arg.base_index) + w.first_offset;
+        if (first >= arg.heap->capacity()) {
+            continue;
+        }
+        const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(w.count, arg.heap->capacity() - first));
+        slot_source_->snapshot(*arg.heap, static_cast<uint32_t>(first), count, &window);
+        out->insert(out->end(), window.begin(), window.end());
+        any = true;
+    }
+    return any;
+}
+
+bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
+                           const DescriptorSlotSource& source,
+                           const BindGroupPlan& plan,
+                           GpuVaResolver resolver,
+                           void* resolver_user,
+                           CachedBindGroup* group) {
+    if (!group->from_memory) {
+        return false;
+    }
+    // Resolve every table base again (the heap may be gone) and read the windows.
+    std::vector<std::pair<uint32_t, ResolvedDescriptor>> bases;
+    std::vector<uint8_t> words;
+    std::vector<uint8_t> window;
+    for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
+        auto it = std::find_if(group->table_bases.begin(), group->table_bases.end(),
+                               [&](const auto& b) { return b.first == w.parameter_index; });
+        ResolvedDescriptor r;
+        if (it == group->table_bases.end() || heaps.resolve_gpu(GpuDescriptorHandle{it->second}, &r) != Status::Ok) {
+            continue;
+        }
+        bases.emplace_back(w.parameter_index, r);
+        if (!source.reads(*r.heap)) {
+            continue;
+        }
+        const uint64_t first = static_cast<uint64_t>(r.index) + w.first_offset;
+        if (first >= r.heap->capacity()) {
+            continue;
+        }
+        const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(w.count, r.heap->capacity() - first));
+        source.snapshot(*r.heap, static_cast<uint32_t>(first), count, &window);
+        words.insert(words.end(), window.begin(), window.end());
+    }
+    if (words == group->built_words) {
+        return false;
+    }
+    group->built_words = std::move(words);
+    group->null_entries = 0;
+    for (size_t i = 0; i < group->entries.size() && i < plan.entries().size(); ++i) {
+        const PlanEntry& p = plan.entries()[i];
+        BindGroupEntry& e = group->entries[i];
+        if (p.source == PlanSource::DescriptorTable) {
+            auto it = std::find_if(bases.begin(), bases.end(), [&](const auto& b) { return b.first == p.root_parameter_index; });
+            e = BindGroupEntry{};
+            e.binding = p.binding;
+            e.root_parameter_index = p.root_parameter_index;
+            if (it != bases.end()) {
+                table_entry(&source, *it->second.heap, static_cast<uint32_t>(std::min<uint64_t>(
+                                                           uint64_t{it->second.index} + p.table_offset, 0xffffffffu)),
+                            p.register_class, resolver, resolver_user, &e);
+            }
+        }
+        group->null_entries += e.kind == BindResourceKind::Null ? 1u : 0u;
+    }
+    return true;
 }
 
 void BindGroupCache::clear(std::vector<uint32_t>* retired) {
