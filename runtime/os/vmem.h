@@ -88,6 +88,17 @@
 // Sizes (build parameters, bytes): PLAYGTA6_PROCESS_GUEST_SPACE_SIZE (process arena;
 // default 64 GiB native, 12 GiB wasm = the whole pool) and PLAYGTA6_GUEST_SPACE_SIZE (other
 // arenas; default 64 GiB native, 2 GiB wasm). The constructor takes any size at run time.
+//
+// R19: a translated window (prototype, off by default)
+// ----------------------------------------------------
+// The title's 16 GiB CPU window does not fit the 12 GiB identity pool (os/xmem_windows.h). With
+// os/guest_window.h turned on and xmem_windows::PlacementPolicy::PhantomGpuTranslatedCpu, the CPU
+// window is placed above the wasm64 memory at [16 GiB, 40 GiB) and takes no arena address space;
+// each mapped 64 KiB slot translates through a delta table onto the pool page's bytes. Lifted
+// code must then be built with the lifter's MemoryModel::Windowed (recomp/src/lift/memory.rs,
+// which also records the alternatives and the measurements), and every host consumer that takes
+// a guest pointer that may point into the window must use guest_window::translate / the segmented
+// copies instead of translate() above: this arena only translates arena addresses.
 
 namespace playgta6::os {
 

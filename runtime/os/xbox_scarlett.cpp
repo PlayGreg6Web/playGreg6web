@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "os/guest_heap.h"
+#include "os/guest_window.h"
 #include "os/httpfs_mailbox.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -159,6 +160,8 @@ struct PhysicalPage {
     // Guest VA where the page's bytes currently live (a real mapping), 0 if none.
     uint64_t home_va = 0;
     uint32_t mapped_slots = 0;  // real and phantom mappings
+    // R19: translated-window slots this page is mapped at (they alias the page's bytes).
+    std::vector<uint64_t> window_slots;
 };
 
 struct VirtualRegion {
@@ -170,6 +173,7 @@ struct VirtualRegion {
     bool committed = false;
     bool phantom = false;     // O27: placed in the phantom space (no guest memory)
     bool cpu_window = false;  // O27: a CPU window (xmem_windows.h)
+    bool translated = false;  // R19: the CPU window at os/guest_window.h's translated range
 };
 
 // A guest heap block that XMemMapPhysicalPages(nullptr, ...) created for its pages.
@@ -198,6 +202,7 @@ struct XMemState {
     uint64_t mapped_physical_bytes = 0;
     uint64_t peak_working_set_bytes = 0;
     uint64_t alias_conflicts = 0;  // a page mapped at a second real address while it had a home
+    bool translated_window_live = false;  // R19: the one translated window is in use
 
     void update_peak_locked() {
         const uint64_t current =
@@ -293,10 +298,40 @@ void save_page_contents(PhysicalPage& page, const uint8_t* bytes) {
 }
 
 void release_virtual_region(const VirtualRegion& region) {
-    if (region.phantom) {
+    if (region.phantom || region.translated) {
         return;  // no arena reservation behind it
     }
     xmem_arena().release(guest_of(region.base));
+}
+
+// R19: host bytes of `page` (its home, else its store; a zeroed store is created for a page that
+// has neither, so a translated window slot always has backing).
+uint8_t* page_bytes_locked(PhysicalPage& page) {
+    if (page.home_va != 0) {
+        return static_cast<uint8_t*>(host_of(page.home_va));
+    }
+    if (page.store_va == 0) {
+        GuestHeap& heap = default_guest_heap();
+        const uint64_t va = heap.alloc(static_cast<size_t>(page.page_size), kXMemPageSize64K, HeapFamily::XMem);
+        if (va == 0) {
+            return nullptr;
+        }
+        std::memset(heap.to_host(va), 0, static_cast<size_t>(page.page_size));
+        page.store_va = va;
+    }
+    return static_cast<uint8_t*>(host_of(page.store_va));
+}
+
+// R19: points every translated-window slot of `page` at the page's current bytes (after its home
+// or store moved).
+void retarget_window_slots_locked(PhysicalPage& page) {
+    if (page.window_slots.empty()) {
+        return;
+    }
+    uint8_t* bytes = page_bytes_locked(page);
+    for (uint64_t slot : page.window_slots) {
+        guest_window::map_slot(slot, bytes);
+    }
 }
 
 // Removes the page mapped at slot `va` (guest VA); the caller holds the lock.
@@ -316,9 +351,18 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         --page.mapped_slots;
     }
     st.mapped_physical_bytes -= ps;
+    if (VirtualRegion* tr = st.region_containing_locked(va, ps); tr != nullptr && tr->translated) {
+        // R19: an alias of the page's bytes; nothing moves.
+        page.window_slots.erase(std::remove(page.window_slots.begin(), page.window_slots.end(), va),
+                                page.window_slots.end());
+        guest_window::unmap_slot(va);
+        xmem_windows::note_cpu_window_mapping(-static_cast<int64_t>(ps));
+        return;
+    }
     if (page.home_va == va) {
         save_page_contents(page, static_cast<const uint8_t*>(host_of(va)));
         page.home_va = 0;
+        retarget_window_slots_locked(page);
     }
     VirtualRegion* region = st.region_containing_locked(va, ps);
     if (region != nullptr && !region->phantom) {
@@ -350,6 +394,20 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
     if (region != nullptr && region->phantom) {
         return true;  // address only: no bytes move
     }
+    if (region != nullptr && region->translated) {
+        // R19: the window slot aliases the page's bytes (its home or store) through the table.
+        uint8_t* bytes = page_bytes_locked(page);
+        if (bytes == nullptr) {
+            st.page_slots.erase(va);
+            --page.mapped_slots;
+            st.mapped_physical_bytes -= ps;
+            return false;
+        }
+        page.window_slots.push_back(va);
+        guest_window::map_slot(va, bytes);
+        xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
+        return true;
+    }
     if (region != nullptr && !region->committed) {
         PageProtect pp = PageProtect::ReadWrite;
         xmem_protect(region->protect, pp);
@@ -379,6 +437,7 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
     if (region != nullptr && region->cpu_window) {
         xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
     }
+    retarget_window_slots_locked(page);
     return true;
 }
 
@@ -1693,8 +1752,11 @@ bool xmem_virtual_free(void* address) {
     if (it->second.committed) {
         st.virtual_committed_bytes -= it->second.size;
     }
-    if (!it->second.phantom) {
+    if (!it->second.phantom && !it->second.translated) {
         st.virtual_reserved_bytes -= it->second.size;
+    }
+    if (it->second.translated) {
+        st.translated_window_live = false;
     }
     xmem_windows::forget_window(base_va);
     release_virtual_region(it->second);
@@ -2142,6 +2204,12 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     const bool window =
         address == nullptr && playgta6::os::xmem_windows::classify(allocation_type, protect, aligned_size, &window_kind);
     const bool phantom = window && playgta6::os::xmem_windows::place_phantom(window_kind);
+    // R19: the (first) CPU window goes to the translated range when that policy and the window
+    // table are on; it needs no arena reservation.
+    const bool translated = window && !phantom && !st.translated_window_live &&
+                            playgta6::os::xmem_windows::place_translated(window_kind) &&
+                            os::guest_window::enabled() && aligned_size <= os::guest_window::kWindowMaxSize &&
+                            !want_commit;
 
     // A non-null address is a placement request that must be honoured exactly.
     // Placeholders (MEM_RESERVE_PLACEHOLDER / MEM_REPLACE_PLACEHOLDER) are the arena's.
@@ -2152,6 +2220,9 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     uint64_t va = 0;
     if (phantom) {
         va = playgta6::os::xmem_windows::reserve_phantom(aligned_size);
+    } else if (translated) {
+        va = os::guest_window::kWindowBase;
+        st.translated_window_live = true;
     } else {
         try {
             va = arena.virtual_alloc(guest_of(address), aligned_size, arena_type, pp);
@@ -2178,8 +2249,9 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     region.committed = want_commit;
     region.phantom = phantom;
     region.cpu_window = window && window_kind == playgta6::os::xmem_windows::WindowKind::Cpu;
+    region.translated = translated;
 
-    if (!phantom) {
+    if (!phantom && !translated) {
         st.virtual_reserved_bytes += aligned_size;
     }
     if (want_commit) {

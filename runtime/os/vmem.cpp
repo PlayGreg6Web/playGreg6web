@@ -73,11 +73,16 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
     if (kGuardLowAddresses) {
         // Back guest VAs [0, space_end): the part below space_base_ is never committed, so null
         // and small guest pointers fault.
-        const uint64_t total = space_base_ + size;
+        // One extra granule so that the base can be 64 KiB aligned (mmap only aligns to 4 KiB):
+        // guest 64 KiB alignment then carries over to host pointers.
+        const uint64_t total = space_base_ + size + kAllocationGranularity;
         if (uint8_t* host = backing::reserve(total, 0)) {
             backing_ = host;
             backing_size_ = total;
-            guest_base_ = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
+            uint64_t aligned = 0;
+            align_up_checked(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host)),
+                             kAllocationGranularity, aligned);
+            guest_base_ = aligned;
         }
     } else if (uint8_t* host = backing::reserve(size, 0)) {
         backing_ = host;

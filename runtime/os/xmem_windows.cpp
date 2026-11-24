@@ -87,7 +87,13 @@ void set_policy(PlacementPolicy policy) {
 }
 
 bool place_phantom(WindowKind kind) {
-    return kind == WindowKind::Gpu && policy() == PlacementPolicy::PhantomGpuWindows;
+    const PlacementPolicy p = policy();
+    return kind == WindowKind::Gpu &&
+           (p == PlacementPolicy::PhantomGpuWindows || p == PlacementPolicy::PhantomGpuTranslatedCpu);
+}
+
+bool place_translated(WindowKind kind) {
+    return kind == WindowKind::Cpu && policy() == PlacementPolicy::PhantomGpuTranslatedCpu;
 }
 
 uint64_t reserve_phantom(uint64_t size) {
@@ -315,9 +321,15 @@ FitResult plan_fit(std::span<const PlannedReservation> sequence, uint64_t pool_b
         const PlannedReservation& q = sequence[i];
         const uint64_t bytes = align_up(q.size, kWindowPageSize);
         WindowKind kind{};
-        if (classify(q.allocation_type, q.protect, q.size, &kind) && kind == WindowKind::Gpu &&
-            policy == PlacementPolicy::PhantomGpuWindows) {
+        const bool is_window = classify(q.allocation_type, q.protect, q.size, &kind);
+        if (is_window && kind == WindowKind::Gpu &&
+            (policy == PlacementPolicy::PhantomGpuWindows || policy == PlacementPolicy::PhantomGpuTranslatedCpu)) {
             r.phantom_bytes += bytes;
+            continue;
+        }
+        if (is_window && kind == WindowKind::Cpu && policy == PlacementPolicy::PhantomGpuTranslatedCpu &&
+            r.translated_bytes == 0) {
+            r.translated_bytes += bytes;  // one translated window; it takes no pool address space
             continue;
         }
         if (used > pool_bytes || bytes > pool_bytes - used) {

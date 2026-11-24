@@ -101,6 +101,9 @@ enum class WindowKind : uint8_t { Cpu, Gpu };
 enum class PlacementPolicy : uint8_t {
     Arena,              // every window is an arena reservation (native default)
     PhantomGpuWindows,  // GPU windows live in the phantom space (wasm default)
+    // R19 prototype (off unless selected): GPU windows phantom as above, the (first) CPU window at
+    // os/guest_window.h's translated range, backed slot by slot through the window table.
+    PhantomGpuTranslatedCpu,
 };
 
 struct Window {
@@ -124,6 +127,8 @@ PlacementPolicy policy();
 void set_policy(PlacementPolicy policy);
 // True if a window of this kind is placed in the phantom space under the current policy.
 bool place_phantom(WindowKind kind);
+// True if a window of this kind is placed in the translated window range (R19).
+bool place_translated(WindowKind kind);
 
 // Phantom space: 64 KiB-aligned bump allocation (never reused); 0 when exhausted.
 uint64_t reserve_phantom(uint64_t size);
@@ -191,6 +196,7 @@ struct FitResult {
     bool fits = false;
     uint64_t identity_bytes = 0;   // address space taken in the pool
     uint64_t phantom_bytes = 0;    // address space placed in the phantom space
+    uint64_t translated_bytes = 0; // address space placed in the translated window (R19)
     size_t first_failure = SIZE_MAX;
 };
 FitResult plan_fit(std::span<const PlannedReservation> sequence, uint64_t pool_bytes, uint64_t fixed_bytes,
