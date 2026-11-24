@@ -575,6 +575,50 @@ void test_win32_file_io() {
 
         clear_userdata_overlay();
     }
+
+    // 4d. ReadFile / WriteFile with an OVERLAPPED transfer at its Offset (not the file pointer),
+    // fill Internal/InternalHigh and signal hEvent; a read at the end fails with ERROR_HANDLE_EOF.
+    {
+        clear_userdata_overlay();
+        struct Overlapped {
+            uint64_t internal;
+            uint64_t internal_high;
+            uint32_t offset;
+            uint32_t offset_high;
+            Handle event;
+        };
+        const Handle f = CreateFileA("/userdata/overlapped.bin", GENERIC_READ | GENERIC_WRITE, 0,
+                                     nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+        CHECK(f != INVALID_HANDLE_VALUE);
+        uint32_t n = 0;
+        CHECK(WriteFile(f, "0123456789abcdef", 16, &n) && n == 16);  // file pointer now 16
+
+        const Handle ev = CreateEventW(nullptr, true, false, nullptr);
+        Overlapped ov{~0ull, ~0ull, 4, 0, ev};
+        char buf[8] = {};
+        CHECK(ReadFile(f, buf, 4, &n, &ov));
+        CHECK(n == 4 && std::memcmp(buf, "4567", 4) == 0);
+        CHECK(ov.internal == 0 && ov.internal_high == 4);
+        CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+
+        // Without an OVERLAPPED the read continues at the pointer the overlapped read left.
+        CHECK(ReadFile(f, buf, 2, &n) && n == 2 && std::memcmp(buf, "89", 2) == 0);
+
+        Overlapped wov{~0ull, ~0ull, 2, 0, kNullHandle};
+        CHECK(WriteFile(f, "XY", 2, &n, &wov) && n == 2);
+        CHECK(wov.internal == 0 && wov.internal_high == 2);
+        Overlapped rov{0, 0, 0, 0, kNullHandle};
+        CHECK(ReadFile(f, buf, 6, &n, &rov) && n == 6 && std::memcmp(buf, "01XY45", 6) == 0);
+
+        Overlapped eov{~0ull, ~0ull, 16, 0, kNullHandle};
+        CHECK(!ReadFile(f, buf, 4, &n, &eov));
+        CHECK(GetLastError() == ERROR_HANDLE_EOF && n == 0);
+        CHECK(eov.internal == 0xC0000011u && eov.internal_high == 0);
+
+        CHECK(CloseHandle(ev));
+        CHECK(CloseHandle(f));
+        clear_userdata_overlay();
+    }
 }
 
 // ---------------------------------------------------------------------------

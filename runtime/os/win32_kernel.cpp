@@ -1401,16 +1401,51 @@ Handle CreateFileW(const char16_t* file_name,
     return create_file_impl(utf8_path, desired_access, creation_disposition);
 }
 
-bool ReadFile(Handle file_handle,
-              void* buffer,
-              uint32_t bytes_to_read,
-              uint32_t* bytes_read,
-              void* overlapped) {
-    (void)overlapped;
-    if (bytes_read != nullptr) {
-        *bytes_read = 0;
-    }
+namespace {
 
+// x64 OVERLAPPED: Internal, InternalHigh, Offset, OffsetHigh, hEvent (32 bytes).
+struct OverlappedLayout {
+    uint64_t internal;
+    uint64_t internal_high;
+    uint32_t offset;
+    uint32_t offset_high;
+    uint64_t event;
+};
+static_assert(sizeof(OverlappedLayout) == 32, "OVERLAPPED is 32 bytes on x64");
+
+uint64_t overlapped_offset(const void* overlapped) {
+    OverlappedLayout o;
+    std::memcpy(&o, overlapped, sizeof(o));
+    return (static_cast<uint64_t>(o.offset_high) << 32) | o.offset;
+}
+
+// Every transfer completes synchronously: record the status and byte count in the OVERLAPPED and
+// signal its event, as a completed asynchronous operation would.
+void complete_overlapped(void* overlapped, uint32_t status, uint64_t transferred) {
+    OverlappedLayout o;
+    std::memcpy(&o, overlapped, sizeof(o));
+    o.internal = status;
+    o.internal_high = transferred;
+    std::memcpy(overlapped, &o, sizeof(o));
+    if (o.event != 0) {
+        SetEvent(static_cast<Handle>(o.event));
+    }
+}
+
+constexpr uint32_t kStatusSuccess = 0;
+constexpr uint32_t kStatusEndOfFile = 0xC0000011u;
+
+}  // namespace
+
+namespace {
+
+// Reads at `*start` (an OVERLAPPED offset) or at the file pointer; either way the file pointer
+// ends after the bytes read, as for a synchronous handle.
+bool read_file_at(Handle file_handle,
+                  void* buffer,
+                  uint32_t bytes_to_read,
+                  uint32_t* bytes_read,
+                  const uint64_t* start) {
     auto obj = handle_table().lookup(file_handle);
     if (!obj || obj->kind != KernelObjectKind::File) {
         SetLastError(ERROR_INVALID_HANDLE);
@@ -1419,6 +1454,9 @@ bool ReadFile(Handle file_handle,
 
     auto* file = static_cast<FileObject*>(obj.get());
     std::lock_guard<std::mutex> lock(file->mutex);
+    if (start != nullptr) {
+        file->cursor = *start;
+    }
 
     if ((file->desired_access & GENERIC_READ) == 0) {
         SetLastError(ERROR_ACCESS_DENIED);
@@ -1475,16 +1513,11 @@ bool ReadFile(Handle file_handle,
     return true;
 }
 
-bool WriteFile(Handle file_handle,
-               const void* buffer,
-               uint32_t bytes_to_write,
-               uint32_t* bytes_written,
-               void* overlapped) {
-    (void)overlapped;
-    if (bytes_written != nullptr) {
-        *bytes_written = 0;
-    }
-
+bool write_file_at(Handle file_handle,
+                   const void* buffer,
+                   uint32_t bytes_to_write,
+                   uint32_t* bytes_written,
+                   const uint64_t* start) {
     auto obj = handle_table().lookup(file_handle);
     if (!obj || obj->kind != KernelObjectKind::File) {
         SetLastError(ERROR_INVALID_HANDLE);
@@ -1493,6 +1526,9 @@ bool WriteFile(Handle file_handle,
 
     auto* file = static_cast<FileObject*>(obj.get());
     std::lock_guard<std::mutex> lock(file->mutex);
+    if (start != nullptr) {
+        file->cursor = *start;
+    }
 
     if (!file->is_userdata || (file->desired_access & GENERIC_WRITE) == 0) {
         SetLastError(ERROR_ACCESS_DENIED);
@@ -1519,6 +1555,62 @@ bool WriteFile(Handle file_handle,
     if (bytes_written != nullptr) {
         *bytes_written = bytes_to_write;
     }
+    return true;
+}
+
+}  // namespace
+
+bool ReadFile(Handle file_handle,
+              void* buffer,
+              uint32_t bytes_to_read,
+              uint32_t* bytes_read,
+              void* overlapped) {
+    if (bytes_read != nullptr) {
+        *bytes_read = 0;
+    }
+    if (overlapped == nullptr) {
+        return read_file_at(file_handle, buffer, bytes_to_read, bytes_read, nullptr);
+    }
+    // A read with an OVERLAPPED starts at its Offset/OffsetHigh, not at the file pointer, and
+    // reading at or past the end fails with ERROR_HANDLE_EOF.
+    const uint64_t offset = overlapped_offset(overlapped);
+    uint32_t got = 0;
+    if (!read_file_at(file_handle, buffer, bytes_to_read, &got, &offset)) {
+        return false;
+    }
+    if (bytes_read != nullptr) {
+        *bytes_read = got;
+    }
+    if (got == 0 && bytes_to_read != 0) {
+        complete_overlapped(overlapped, kStatusEndOfFile, 0);
+        SetLastError(ERROR_HANDLE_EOF);
+        return false;
+    }
+    complete_overlapped(overlapped, kStatusSuccess, got);
+    return true;
+}
+
+bool WriteFile(Handle file_handle,
+               const void* buffer,
+               uint32_t bytes_to_write,
+               uint32_t* bytes_written,
+               void* overlapped) {
+    if (bytes_written != nullptr) {
+        *bytes_written = 0;
+    }
+    if (overlapped == nullptr) {
+        return write_file_at(file_handle, buffer, bytes_to_write, bytes_written, nullptr);
+    }
+    // A write with an OVERLAPPED starts at its Offset/OffsetHigh, not at the file pointer.
+    const uint64_t offset = overlapped_offset(overlapped);
+    uint32_t put = 0;
+    if (!write_file_at(file_handle, buffer, bytes_to_write, &put, &offset)) {
+        return false;
+    }
+    if (bytes_written != nullptr) {
+        *bytes_written = put;
+    }
+    complete_overlapped(overlapped, kStatusSuccess, put);
     return true;
 }
 
