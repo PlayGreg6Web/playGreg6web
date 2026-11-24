@@ -144,10 +144,10 @@
     X(pg6_crt_stdio_common_vsnwprintf_s, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsnwprintf_s (os/crt_format.h)") \
     X(pg6_crt_stdio_common_vsprintf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsprintf (os/crt_format.h)") \
     X(pg6_crt_stdio_common_vsprintf_s, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsprintf_s (os/crt_format.h)") \
-    X(pg6_crt_stdio_common_vsscanf, deny, "host va_list of guest out-pointers; scanf over guest argument slots is not implemented") \
+    X(pg6_crt_stdio_common_vsscanf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsscanf (os/crt_scan.h)") \
     X(pg6_crt_stdio_common_vswprintf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vswprintf (os/crt_format.h)") \
     X(pg6_crt_stdio_common_vswprintf_s, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vswprintf_s (os/crt_format.h)") \
-    X(pg6_crt_stdio_common_vswscanf, deny, "host va_list of guest out-pointers; scanf over guest argument slots is not implemented") \
+    X(pg6_crt_stdio_common_vswscanf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vswscanf (os/crt_scan.h)") \
     X(pg6_crt_fseeki64, ok, "") \
     X(pg6_crt_get_stream_buffer_pointers, ok, "per-stream empty {base, ptr, cnt} record in guest memory (guest addresses): basic_filebuf sees no buffered characters and transfers through fgetc/fputc/fwrite") \
     X(pg6_crt_set_fmode, ok, "") \
