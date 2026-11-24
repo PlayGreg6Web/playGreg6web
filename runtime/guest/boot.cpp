@@ -258,6 +258,14 @@ struct BootState {
     std::vector<FirstCall> first_calls;  // guarded by `mutex`
     std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
     std::vector<std::string> trace_strings;  // string arguments of each trace entry
+    struct CallableCalls {
+        const char* name = nullptr;
+        uint64_t calls = 0;
+        uint64_t first_import_seq = 0;  // import calls made before the first call
+        size_t order = 0;
+    };
+    std::mutex callable_mutex;
+    std::unordered_map<uint64_t, CallableCalls> callable_calls;  // synthetic target -> calls
     size_t trace_limit = 0;
     bool trace_truncated = false;
     std::unordered_map<const GuestThreadContext*, RecentImport> thread_last;  // guarded by `mutex`
@@ -875,6 +883,16 @@ std::string describe_string_args(const uint64_t (&args)[5]) {
     return out;
 }
 
+// The registered name of a host callable at a synthetic address (COM slots, GetProcAddress
+// callables), else null.
+const char* synthetic_name(uint64_t target) {
+    SyntheticTarget info;
+    if (is_synthetic_address(target) && describe_synthetic(target, &info) && !info.is_import) {
+        return info.name;
+    }
+    return nullptr;
+}
+
 void boot_dispatch_observer(GuestState* state, uint64_t target) {
     BootState& b = boot();
     if (!b.running) {
@@ -955,6 +973,18 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
             // Host callables handed out by GetProcAddress / providers (QueryApiImpl, ...).
             SyntheticTarget info;
             if (describe_synthetic(target, &info) && !info.is_import && info.name != nullptr) {
+                {
+                    // Per-callable call counts with the import-call number of the first call
+                    // (COM methods: D3D12 / xgameruntime milestones and slot statistics).
+                    std::lock_guard<std::mutex> lock(b.callable_mutex);
+                    auto [it, inserted] = b.callable_calls.try_emplace(target);
+                    if (inserted) {
+                        it->second.name = info.name;
+                        it->second.first_import_seq = b.import_calls.load(std::memory_order_relaxed);
+                        it->second.order = b.callable_calls.size();
+                    }
+                    ++it->second.calls;
+                }
                 for (const TimelineApi& api : kTimelineApis) {
                     if (std::strcmp(api.name, info.name) != 0) {
                         continue;
@@ -1591,10 +1621,46 @@ std::string build_report() {
     for (size_t i = 0; i < f.recent_dispatches.size(); ++i) {
         const DispatchRecord& d = f.recent_dispatches[i];
         o += (i == 0 ? "\n    " : ",\n    ");
-        o += "{\"target\": " + hex(d.target) + ", \"return_address\": " + hex(d.return_address) +
-             ", \"rcx\": " + hex(d.rcx) + ", \"rdx\": " + hex(d.rdx) + "}";
+        o += "{\"target\": " + hex(d.target) + ", \"name\": " + json_cstr(synthetic_name(d.target)) +
+             ", \"return_address\": " + hex(d.return_address) + ", \"rcx\": " + hex(d.rcx) +
+             ", \"rdx\": " + hex(d.rdx) + "}";
     }
     o += f.recent_dispatches.empty() ? "],\n" : "\n  ],\n";
+
+    // Host callables (COM methods, GetProcAddress results) called by guest code, in first-call
+    // order, with the number of import calls made before the first call.
+    o += "  \"host_callable_calls\": [";
+    {
+        std::vector<std::pair<uint64_t, BootState::CallableCalls>> rows;
+        {
+            std::lock_guard<std::mutex> lock(b.callable_mutex);
+            rows.assign(b.callable_calls.begin(), b.callable_calls.end());
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& c) { return a.second.order < c.second.order; });
+        for (size_t i = 0; i < rows.size(); ++i) {
+            o += (i == 0 ? "\n    " : ",\n    ");
+            o += "{\"name\": " + json_cstr(rows[i].second.name) + ", \"target\": " + hex(rows[i].first) +
+                 ", \"calls\": " + std::to_string(rows[i].second.calls) + ", \"first_after_import_call\": " +
+                 std::to_string(rows[i].second.first_import_seq) + "}";
+        }
+        o += rows.empty() ? "],\n" : "\n  ],\n";
+    }
+
+    // COM-bridge slots without an implementation that guest code called (named or not): what the
+    // title asked of D3D12 / xgameruntime interfaces and got a stub for.
+    o += "  \"com_stub_hits\": [";
+    {
+        const std::vector<com::StubHit> hits = com::stub_hit_report();
+        for (size_t i = 0; i < hits.size(); ++i) {
+            const com::StubHit& h = hits[i];
+            o += (i == 0 ? "\n    " : ",\n    ");
+            o += "{\"interface\": " + json_string(h.interface_name) + ", \"iid\": " +
+                 json_string(com::format_guid(h.iid)) + ", \"slot\": " + std::to_string(h.slot) +
+                 ", \"method\": " + json_string(h.method_name) + ", \"hits\": " + std::to_string(h.hits) + "}";
+        }
+        o += hits.empty() ? "],\n" : "\n  ],\n";
+    }
 
     if (f.has_host_frames) {
         o += "  \"host_frames\": [";
@@ -1873,10 +1939,23 @@ std::string build_summary() {
         if (!f.recent_dispatches.empty()) {
             s += "  last dispatched calls on the faulting thread (oldest first):\n";
             for (const DispatchRecord& d : f.recent_dispatches) {
+                const char* name = synthetic_name(d.target);
                 std::snprintf(line, sizeof(line),
-                              "    -> 0x%016" PRIx64 " from 0x%016" PRIx64 " %s rcx=%" PRIx64 " rdx=%" PRIx64 "\n",
-                              d.target, d.return_address, function_text(d.return_address).c_str(), d.rcx, d.rdx);
+                              "    -> 0x%016" PRIx64 "%s%s from 0x%016" PRIx64 " %s rcx=%" PRIx64 " rdx=%" PRIx64 "\n",
+                              d.target, name != nullptr ? " " : "", name != nullptr ? name : "", d.return_address,
+                              function_text(d.return_address).c_str(), d.rcx, d.rdx);
                 s += line;
+            }
+        }
+    }
+    {
+        const std::vector<com::StubHit> hits = com::stub_hit_report();
+        if (!hits.empty()) {
+            s += "  COM stub slots called (interface, slot, method, calls):\n";
+            for (const com::StubHit& h : hits) {
+                s += "    " + h.interface_name + " slot " + std::to_string(h.slot) +
+                     (h.method_name.empty() ? std::string() : " (" + h.method_name + ")") + " x" +
+                     std::to_string(h.hits) + "\n";
             }
         }
     }
@@ -2320,6 +2399,10 @@ void reset_boot() {
     b.first_calls.clear();
     b.trace.clear();
     b.trace_strings.clear();
+    {
+        std::lock_guard<std::mutex> lock(b.callable_mutex);
+        b.callable_calls.clear();
+    }
     b.trace_limit = 0;
     b.trace_truncated = false;
     b.thread_last.clear();
