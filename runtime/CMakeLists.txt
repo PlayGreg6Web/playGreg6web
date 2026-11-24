@@ -68,6 +68,7 @@ add_library(playgta6_core STATIC
     guest/input_script.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp
+    os/xgamesave_local.cpp
     os/xbox_scarlett_guest.cpp
     guest/program_loader.cpp
     guest/shard_dispatch.cpp
@@ -268,6 +269,10 @@ else()
     add_executable(test_xgameruntime_provider ../tests/test_xgameruntime_provider.cpp)
     target_link_libraries(test_xgameruntime_provider PRIVATE playgta6_core)
     add_test(NAME playgta6_xgameruntime_provider_tests COMMAND test_xgameruntime_provider)
+
+    add_executable(test_xgamesave_local ../tests/test_xgamesave_local.cpp)
+    target_link_libraries(test_xgamesave_local PRIVATE playgta6_core)
+    add_test(NAME playgta6_xgamesave_local_tests COMMAND test_xgamesave_local)
 
     add_executable(test_guest_crt_exit ../tests/test_guest_crt_exit.cpp)
     target_link_libraries(test_guest_crt_exit PRIVATE playgta6_core)

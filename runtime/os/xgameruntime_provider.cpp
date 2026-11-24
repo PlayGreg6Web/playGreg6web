@@ -22,6 +22,7 @@
 #include "os/xasync_provider.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
+#include "os/xgamesave_local.h"
 
 // Evidence and mapping
 // --------------------
@@ -87,8 +88,9 @@
 //     (returns Disabled: the runtime presents SDR).
 //   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
 //     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
-//   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h
-//     (no game-save provider offline: E_NOTIMPL, no handle, the async operation never starts).
+//   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h,
+//     s5 InitializeProviderResult, s6 CloseProvider (O34: a local provider on the host directory
+//     --save-dir, never any cloud sync; s5/s6 by public header order).
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
 //     XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
 //     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
@@ -1110,40 +1112,141 @@ private:
     std::atomic<bool> logged_{false};
 };
 
-// XGameSave (public header order: s3 XGameSaveInitializeProvider, s4 XGameSaveInitializeProviderAsync).
-// The executable calls s4 through a wrapper (user, configuration id string, bool syncOnDemand,
-// 0x38-byte block = XAsyncBlock) and, when the call fails, marks its save system as failed and
-// frees the block. The runtime has no game-save provider (no connected storage, offline): both
-// initialisations fail with E_NOTIMPL, no provider handle is invented and the async operation is
-// never started (its callback never runs).
+// XGameSave (public header order: s3 XGameSaveInitializeProvider, s4 XGameSaveInitializeProviderAsync,
+// s5 XGameSaveInitializeProviderResult, s6 XGameSaveCloseProvider). The executable calls s4
+// through a wrapper (user, configuration id string, bool syncOnDemand, 0x38-byte block =
+// XAsyncBlock). O34: the provider is local, like a console's offline save store
+// (os/xgamesave_local.h, host directory --save-dir). That is a truthful offline answer, not a
+// cloud or entitlement claim: nothing is ever synchronised.
+struct SaveProvider {
+    gamesave::Store store;
+    std::string configuration_id;
+};
+
+class SaveProviders {
+public:
+    uint64_t add(const std::string& configuration_id) {
+        auto provider = std::make_shared<SaveProvider>(
+            SaveProvider{gamesave::open_store(configuration_id), configuration_id});
+        std::lock_guard<std::mutex> lock(mutex_);
+        const uint64_t id = kFirst + next_++;
+        providers_.emplace(id, std::move(provider));
+        return id;
+    }
+    std::shared_ptr<SaveProvider> find(uint64_t id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = providers_.find(id);
+        return it == providers_.end() ? nullptr : it->second;
+    }
+    bool remove(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return providers_.erase(id) != 0;
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        providers_.clear();
+    }
+
+private:
+    static constexpr uint64_t kFirst = 0x5047530000000ULL;
+    mutable std::mutex mutex_;
+    std::map<uint64_t, std::shared_ptr<SaveProvider>> providers_;
+    uint64_t next_ = 1;
+};
+
+SaveProviders& save_providers() {
+    static SaveProviders p;
+    return p;
+}
+
+// XGameSaveInitializeProviderAsync: the provider is created in DoWork and handed over by Result.
+class SaveInitOp final : public XAsyncProviderImpl {
+public:
+    explicit SaveInitOp(std::string configuration_id) : configuration_id_(std::move(configuration_id)) {}
+    HResult call(XAsyncOp op, XAsyncBlock* block, size_t /*buffer_size*/, uint64_t buffer) override {
+        switch (op) {
+        case XAsyncOp::Begin:
+            return XAsyncSchedule(block, 0);
+        case XAsyncOp::DoWork:
+            handle_ = save_providers().add(configuration_id_);
+            XAsyncComplete(block, S_OK_HR, sizeof(uint64_t));
+            return E_PENDING_HR;
+        case XAsyncOp::GetResult:
+            return com::write_guest(buffer, handle_) ? S_OK_HR : E_INVALIDARG_HR;
+        default:
+            return S_OK_HR;
+        }
+    }
+
+private:
+    std::string configuration_id_;
+    uint64_t handle_ = 0;
+};
+
 class GameSaveApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XGameSave";
 
     // s3: XGameSaveInitializeProvider(user, configurationId, syncOnDemand, XGameSaveProviderHandle*).
-    int32_t InitializeProvider(uint64_t /*user*/, uint64_t /*configuration_id*/, uint64_t /*sync_on_demand*/,
+    int32_t InitializeProvider(uint64_t user, uint64_t configuration_id, uint64_t /*sync_on_demand*/,
                                GuestPtr<uint64_t> provider) {
-        if (!provider.is_null()) {
-            provider.write(0);
+        if (provider.is_null()) {
+            return E_POINTER_HR;
+        }
+        provider.write(0);
+        if (user == 0 || configuration_id == 0) {
+            return E_INVALIDARG_HR;
         }
         log_once("XGameSaveInitializeProvider");
-        return com::E_NOTIMPL_HR;
+        provider.write(save_providers().add(guest_string(configuration_id, 256)));
+        return S_OK_HR;
     }
 
     // s4: XGameSaveInitializeProviderAsync(user, configurationId, syncOnDemand, XAsyncBlock*).
-    int32_t InitializeProviderAsync(uint64_t /*user*/, uint64_t /*configuration_id*/,
-                                    uint64_t /*sync_on_demand*/, uint64_t async) {
-        if (async == 0) {
+    int32_t InitializeProviderAsync(uint64_t user, uint64_t configuration_id, uint64_t /*sync_on_demand*/,
+                                    uint64_t async) {
+        if (async == 0 || user == 0 || configuration_id == 0) {
             return E_INVALIDARG_HR;
         }
         log_once("XGameSaveInitializeProviderAsync");
-        return com::E_NOTIMPL_HR;
+        Pg6XAsyncBlock* shadow = begin_async(async);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        return XAsyncBeginWith(shadow, std::make_unique<SaveInitOp>(guest_string(configuration_id, 256)), 0,
+                               "XGameSaveInitializeProviderAsync");
+    }
+
+    // s5: XGameSaveInitializeProviderResult(XAsyncBlock*, XGameSaveProviderHandle*).
+    int32_t InitializeProviderResult(uint64_t async, uint64_t provider) {
+        if (provider == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(provider, uint64_t{0});
+        Pg6XAsyncBlock* shadow = find_async(async);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        size_t used = 0;
+        const int32_t hr = XAsyncGetResultWith(shadow, 0, sizeof(uint64_t), provider, &used);
+        if (hr != E_PENDING_HR) {
+            cbk::async_shadow_end(async);
+        }
+        return hr;
+    }
+
+    // s6: XGameSaveCloseProvider(XGameSaveProviderHandle).
+    void CloseProvider(uint64_t provider) {
+        if (!save_providers().remove(provider)) {
+            com::detail::log_bad_pointer("XGameSaveProviderHandle", provider);
+        }
     }
 
 private:
     void log_once(const char* api) {
         if (!logged_.exchange(true)) {
-            os::log(std::string("xgameruntime: ") + api + ": no game-save provider (offline runtime); returning E_NOTIMPL");
+            os::log(std::string("xgameruntime: ") + api + ": local game-save provider (dir " +
+                    gamesave::save_dir() + "); no cloud sync");
         }
     }
 
@@ -1362,9 +1465,11 @@ constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPac
                                                               kPackageTable.slots, {.slot_count = 48});
 
 using GS = M<GameSaveApi>;
-constexpr auto kGameSaveTable = slot_table<2>({
+constexpr auto kGameSaveTable = slot_table<4>({
     {3, GS::method<&GameSaveApi::InitializeProvider>("XGameSaveInitializeProvider")},
     {4, GS::method<&GameSaveApi::InitializeProviderAsync>("XGameSaveInitializeProviderAsync")},
+    {5, GS::method<&GameSaveApi::InitializeProviderResult>("XGameSaveInitializeProviderResult")},
+    {6, GS::method<&GameSaveApi::CloseProvider>("XGameSaveCloseProvider")},
 });
 constexpr auto kIGameSave = com::declare_interface<GameSaveApi>("xgameruntime.XGameSave", kGameSaveIid,
                                                                kGameSaveTable.slots, {.slot_count = 40});
@@ -1662,6 +1767,7 @@ void reset_xgameruntime_provider() {
     users().clear();
     stores().clear();
     ports().clear();
+    save_providers().clear();
     g_title_id.store(0, std::memory_order_relaxed);
     set_xbox_live_sandbox_id("");
     set_user_age_group(UserAgeGroup::Unknown);

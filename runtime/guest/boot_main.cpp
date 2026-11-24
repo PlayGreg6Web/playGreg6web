@@ -35,6 +35,8 @@
 //                        console; "" = none: XSystemGetXboxLiveSandboxId fails with E_NOTIMPL)
 //   --user-age-group <unknown|child|teen|adult>  the local user's age group XUserGetAgeGroup
 //                        reports (default unknown: no account data offline)
+//   --save-dir <dir>     host directory of the local XGameSave store (default pg6-saves in the
+//                        working directory); saves persist there between runs, no cloud sync
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --gpu-capture-frames <n>  frames to capture (default 10)
@@ -89,6 +91,7 @@
 #include "os/win32_kernel.h"
 #include "os/xbox_scarlett.h"
 #include "os/xgameruntime_provider.h"
+#include "os/xgamesave_local.h"
 #include "os/xbox_scarlett_guest.h"
 
 #ifdef _WIN32
@@ -157,6 +160,7 @@ struct Options {
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
     std::string user_age_group = "unknown";  // --user-age-group
+    std::string save_dir;                    // --save-dir
     std::string gpu_capture;          // --gpu-capture: .pg6trace path
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
@@ -224,7 +228,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" || a == "--input-script" ||
-                   a == "--user-age-group" || a == "--profile") {
+                   a == "--user-age-group" || a == "--profile" || a == "--save-dir") {
             if (!value(v)) {
                 return false;
             }
@@ -235,6 +239,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--shader-pack" ? o.shader_pack
                                   : a == "--input-script" ? o.input_script
                                   : a == "--user-age-group" ? o.user_age_group
+                                  : a == "--save-dir" ? o.save_dir
                                   : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
@@ -777,6 +782,7 @@ void run_boot_thread() {
     cfg.host_function_start = host_function_start;
     cfg.console_mode = static_cast<uint32_t>(g_options.console_mode);
     cfg.sandbox_id = g_options.sandbox_id;
+    playgta6::os::gdk::gamesave::set_save_dir(g_options.save_dir);
     playgta6::os::gdk::provider::parse_user_age_group(g_options.user_age_group, &cfg.user_age_group);
     cfg.off_thread_fault = &off_thread_fault;
     cfg.guest_thread_started = &profile_thread_started;
