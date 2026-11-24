@@ -402,6 +402,7 @@ enum class Scenario {
     SurveyReturn,
     CrtAbort,
     LastError,
+    PresentMark,
     TerminateViaShim,
     OffThreadFault,
     HostCallable,
@@ -607,6 +608,17 @@ void sub_entry(GuestState* s) {
             ret(s);
             return;
         }
+        case Scenario::PresentMark: {
+            // Two import calls, the first Present, one more call.
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            call_iat(s, kSlotGetLastError, kEntryCallsIat);
+            mark_first_present();
+            mark_first_present();  // later marks are ignored
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            reg(s, GuestReg::Rax) = 0;
+            ret(s);
+            return;
+        }
         case Scenario::HostCallable: {
             const uint64_t answer = register_host_callable(&host_answer, "ITest::Answer");
             for (int i = 0; i < 2; ++i) {
@@ -737,7 +749,7 @@ Run boot_scenario(Scenario scenario, void (*tweak)(BootConfig&) = nullptr) {
     run.report = parse_json(run.result.report_json, &ok);
     CHECK(ok);
     CHECK(run.report["schema"].text == "playgta6-boot-report");
-    CHECK(run.report["schema_version"].number == 1);
+    CHECK(run.report["schema_version"].number == 2);
     CHECK(run.report["status"].text == boot_status_name(run.result.status));
     CHECK(!run.result.summary.empty());
     if (!ok) {
@@ -773,6 +785,41 @@ void test_layout_offsets() {
     CHECK(sizeof(win64::Teb64) == 0x2000);
     CHECK(sizeof(win64::Peb64) == 0x1000);
     CHECK(sizeof(BootImport) == 48);
+}
+
+// Report schema 2: milestone import indices, the import calls up to the first Present, and the
+// members a report extension adds.
+void test_report_import_fields() {
+    Run run = boot_scenario(Scenario::ReturnCode);
+    CHECK(run.report["milestones"].items.size() == 3);
+    for (const Json& m : run.report["milestones"].items) {
+        CHECK(m.has("import_seq") && m["import_seq"].number == 0);  // no import call before the entry returned
+    }
+    CHECK(run.report["first_present"].type == Json::Null);  // nothing marked a Present
+    CHECK(!run.report.has("presents"));
+
+    set_report_extension([]() -> std::string { return "\"presents\": [{\"index\": 0}]"; });
+    run = boot_scenario(Scenario::PresentMark);
+    set_report_extension(nullptr);
+    CHECK(run.result.status == BootStatus::Exited);
+    CHECK(run.report["presents"].type == Json::Array && run.report["presents"].items.size() == 1);
+    CHECK(run.report["presents"][0]["index"].number == 0);
+    const Json& fp = run.report["first_present"];
+    CHECK(fp.type == Json::Object);
+    CHECK(fp["import_seq"].number == 2);
+    CHECK(fp["imports"].items.size() == 2);  // SetLastError and GetLastError, one thread, one call each
+    uint64_t total = 0;
+    bool names = false;
+    for (const Json& row : fp["imports"].items) {
+        total += static_cast<uint64_t>(row["count"].number);
+        names = names || (row["symbol"].text == "SetLastError" && row["dll"].text == "KERNEL32.dll");
+    }
+    CHECK(total == 2 && names);  // the call after the Present is not counted
+    CHECK(fp["imports"][0]["thread"].number == fp["imports"][1]["thread"].number);
+    CHECK(run.report["counters"]["import_calls"].number == 3);
+    // A later boot starts clean.
+    run = boot_scenario(Scenario::ReturnCode);
+    CHECK(run.report["first_present"].type == Json::Null);
 }
 
 void test_clean_boot_and_teb() {
@@ -1628,6 +1675,7 @@ int main() {
     test_last_error_shared_with_teb();
     test_observability();
     test_off_thread_fault();
+    test_report_import_fields();
     test_host_callable_statistics();
     test_off_thread_unresolved_import();
     test_second_thread();

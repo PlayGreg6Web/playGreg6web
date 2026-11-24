@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -178,6 +179,30 @@ std::string json_escape(const std::string& in) {
     return out;
 }
 
+// The per-Present samples as a JSON array (the sidecar's "presents" value and the boot report's).
+std::string presents_array_json(const CaptureState& s) {
+    std::string out = "[";
+    char buf[320];
+    for (size_t i = 0; i < s.presents.size(); ++i) {
+        const PresentSample& p = s.presents[i];
+        std::snprintf(buf, sizeof(buf),
+                      "%s\n    {\"index\": %zu, \"wall_ms\": %.3f, \"dispatches\": %" PRIu64 ", \"import_calls\": %" PRIu64
+                      ", \"reserved_bytes\": %" PRIu64 ", \"committed_bytes\": %" PRIu64 ", \"counters\": {",
+                      i == 0 ? "" : ",", i, p.wall_ms, p.counters.dispatches, p.counters.import_calls,
+                      p.counters.reserved_bytes, p.counters.committed_bytes);
+        out += buf;
+        for (size_t k = 0; k < p.counters.counters.size(); ++k) {
+            out += k == 0 ? "\"" : ", \"";
+            out += json_escape(p.counters.counters[k].first);
+            std::snprintf(buf, sizeof(buf), "\": %" PRIu64, p.counters.counters[k].second);
+            out += buf;
+        }
+        out += "}}";
+    }
+    out += s.presents.empty() ? "]" : "\n  ]";
+    return out;
+}
+
 }  // namespace
 
 bool frame_capture_start(const FrameCaptureConfig& config) {
@@ -248,21 +273,8 @@ void frame_capture_finish() {
                      "%s\n    {\"index\": %zu, \"offset\": %" PRIu64 ", \"bytes\": %" PRIu64 ", \"packets\": %" PRIu64 "}",
                      i == 0 ? "" : ",", i, f.offset, f.bytes, f.packets);
     }
-    std::fprintf(side, "%s],\n  \"presents\": [", s.frames.empty() ? "" : "\n  ");
-    for (size_t i = 0; i < s.presents.size(); ++i) {
-        const PresentSample& p = s.presents[i];
-        std::fprintf(side,
-                     "%s\n    {\"index\": %zu, \"wall_ms\": %.3f, \"dispatches\": %" PRIu64 ", \"import_calls\": %" PRIu64
-                     ", \"reserved_bytes\": %" PRIu64 ", \"committed_bytes\": %" PRIu64 ", \"counters\": {",
-                     i == 0 ? "" : ",", i, p.wall_ms, p.counters.dispatches, p.counters.import_calls,
-                     p.counters.reserved_bytes, p.counters.committed_bytes);
-        for (size_t k = 0; k < p.counters.counters.size(); ++k) {
-            std::fprintf(side, "%s\"%s\": %" PRIu64, k == 0 ? "" : ", ",
-                         json_escape(p.counters.counters[k].first).c_str(), p.counters.counters[k].second);
-        }
-        std::fprintf(side, "}}");
-    }
-    std::fprintf(side, "%s],\n  \"omitted\": [", s.presents.empty() ? "" : "\n  ");
+    std::fprintf(side, "%s],\n  \"presents\": %s,\n  \"omitted\": [", s.frames.empty() ? "" : "\n  ",
+                 presents_array_json(s).c_str());
     for (size_t i = 0; i < s.omitted.size(); ++i) {
         const Omitted& o = s.omitted[i];
         std::fprintf(side,
@@ -271,6 +283,12 @@ void frame_capture_finish() {
     }
     std::fprintf(side, "%s]\n}\n", s.omitted.empty() ? "" : "\n  ");
     std::fclose(side);
+}
+
+std::string frame_capture_presents_json() {
+    CaptureState& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return presents_array_json(s);
 }
 
 void frame_capture_set_counters(FrameCaptureCounters counters) {

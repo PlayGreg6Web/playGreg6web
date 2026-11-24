@@ -106,11 +106,12 @@
 // max_wall_ms (checked on every indirect dispatch; a loop without calls is not interrupted - the
 // native harness adds a watchdog for that).
 //
-// JSON report (schema "playgta6-boot-report", schema_version 1)
+// JSON report (schema "playgta6-boot-report", schema_version 2; version 2 only adds fields to
+// version 1: milestones[].import_seq, first_present and the extension's members, see below)
 // -------------------------------------------------------------
 // Top-level keys in order: schema, schema_version, status (BootStatus name), status_code,
 // exit_code (number or null), phase (setup step or "tls_callback"/"entry"), message,
-// milestones ([{milestone, elapsed_ms}]: the W40 BOOT_MILESTONES reached - PGIM_LOAD, TLS_INIT,
+// milestones ([{milestone, elapsed_ms, import_seq (import calls made so far)}]: the W40 BOOT_MILESTONES reached - PGIM_LOAD, TLS_INIT,
 // ENTRY_CALL), fault (null or {kind, trap_kind (W40 TRAP_KIND name or null), va, detail,
 // function {entry, offset} | null, import {dll, symbol, slot_rva, delay_load, module} | null,
 // host_address, host_pc}), registers ({rax..r15, rip, gs_base,
@@ -128,7 +129,11 @@
 // run_relocations, run_bytes_moved, regions [{base, size, translated, mapped_slots, aliased_slots, runs,
 // longest_run, adjacent_pairs, aliased_pairs, contiguous_pairs}]} (os/xbox_scarlett.h
 // XMemWindowContiguity), window {enabled, mapped_slots,
-// contiguous_pairs, split_pairs, map_calls} (os/guest_window.h)}, elapsed_ms. Addresses are "0x..." strings (null when absent); counts
+// contiguous_pairs, split_pairs, map_calls} (os/guest_window.h)}, first_present (null until
+// mark_first_present was called, else {import_seq, elapsed_ms, imports [{thread, dll, symbol,
+// count}]}: the import calls made up to the first Present per guest thread id and import), the
+// members of the report extension (the harness adds "presents": the per-Present samples of the
+// GPU capture, see gpu/frame_capture.h), elapsed_ms. Addresses are "0x..." strings (null when absent); counts
 // are numbers. Fault kinds: trap, unimplemented, unimplemented_slot, divide_error, unknown_target,
 // stack_imbalance, bad_stack, unresolved_import, crt_abort, crt_terminate, crt_invalid_parameter,
 // crt_purecall, cxx_throw, longjmp, dispatch_limit, wall_time_limit, and the harness's host_*
@@ -516,6 +521,15 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
 
 // Report / summary of the last boot (also after report_host_fault).
 std::string last_report_json();
+
+// Reports that the title presented its first frame: the report's first_present records the import
+// calls made so far per guest thread and import. Later calls are ignored; reset by the next boot.
+void mark_first_present();
+
+// Source of extra top-level report members: returns `"name": value[, ...]` text (no braces, no
+// trailing comma; empty for none), called whenever the report is built. nullptr removes it.
+using ReportExtension = std::string (*)();
+void set_report_extension(ReportExtension extension);
 std::string last_summary();
 
 // The import trace of the last boot (BootConfig::import_trace_limit): one line per import call,

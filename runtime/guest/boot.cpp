@@ -203,7 +203,10 @@ constexpr TimelineApi kTimelineApis[] = {
 struct Milestone {
     const char* name = "";
     uint64_t elapsed_ms = 0;
+    uint64_t import_seq = 0;  // import calls made when the milestone was recorded
 };
+
+std::atomic<ReportExtension> g_report_extension{nullptr};
 
 struct BootState {
     std::mutex mutex;  // recent ring, survey list
@@ -261,6 +264,11 @@ struct BootState {
     bool entry_started = false;
     std::vector<Milestone> milestones;
     std::vector<FirstCall> first_calls;  // guarded by `mutex`
+    // Import calls per (guest thread << 32 | import index) until the first Present (mark_first_present).
+    std::unordered_map<uint64_t, uint64_t> pre_present_counts;  // guarded by `mutex`
+    bool present_seen = false;                                  // guarded by `mutex`
+    uint64_t present_import_seq = 0;
+    uint64_t present_elapsed_ms = 0;
     std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
     std::vector<std::string> trace_strings;  // string arguments of each trace entry
     struct CallableCalls {
@@ -349,7 +357,7 @@ void milestone(const char* name, const char* fmt, ...) {
     BootState& b = boot();
     {
         std::lock_guard<std::mutex> lock(b.mutex);
-        b.milestones.push_back(Milestone{name, elapsed_ms()});
+        b.milestones.push_back(Milestone{name, elapsed_ms(), b.import_calls.load(std::memory_order_relaxed)});
     }
     if (!b.log_progress) {
         return;
@@ -979,6 +987,9 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                 if (t_active != nullptr) {
                     b.thread_last[t_active] = entry;
                 }
+                if (!b.present_seen) {
+                    ++b.pre_present_counts[(static_cast<uint64_t>(entry.thread) << 32) | static_cast<uint32_t>(index)];
+                }
                 if (first_call) {
                     b.first_calls.push_back(FirstCall{imp.symbol, seq, elapsed_ms(), entry.thread});
                 }
@@ -1599,7 +1610,7 @@ std::string build_report() {
     o.reserve(16384);
     o += "{\n";
     o += "  \"schema\": \"playgta6-boot-report\",\n";
-    o += "  \"schema_version\": 1,\n";
+    o += "  \"schema_version\": 2,\n";
     o += "  \"status\": " + json_string(boot_status_name(b.status)) + ",\n";
     o += "  \"status_code\": " + std::to_string(static_cast<int32_t>(b.status)) + ",\n";
     o += "  \"exit_code\": " + (b.has_exit_code ? std::to_string(b.exit_code) : std::string("null")) + ",\n";
@@ -1608,7 +1619,8 @@ std::string build_report() {
     o += "  \"milestones\": [";
     for (size_t k = 0; k < b.milestones.size(); ++k) {
         o += (k == 0 ? "" : ", ") + std::string("{\"milestone\": ") + json_string(b.milestones[k].name) +
-             ", \"elapsed_ms\": " + std::to_string(b.milestones[k].elapsed_ms) + "}";
+             ", \"elapsed_ms\": " + std::to_string(b.milestones[k].elapsed_ms) +
+             ", \"import_seq\": " + std::to_string(b.milestones[k].import_seq) + "}";
     }
     o += "],\n";
 
@@ -1917,6 +1929,37 @@ std::string build_report() {
              ", \"contiguous_pairs\": " + std::to_string(w.contiguous_pairs) +
              ", \"split_pairs\": " + std::to_string(w.split_pairs) + ", \"map_calls\": " +
              std::to_string(w.map_calls) + "}},\n";
+    }
+    // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
+    // Present was reported through mark_first_present), then the extension's members (per-Present samples).
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        if (!b.present_seen) {
+            o += "  \"first_present\": null,\n";
+        } else {
+            std::vector<std::pair<uint64_t, uint64_t>> rows(b.pre_present_counts.begin(), b.pre_present_counts.end());
+            std::sort(rows.begin(), rows.end());
+            o += "  \"first_present\": {\"import_seq\": " + std::to_string(b.present_import_seq) +
+                 ", \"elapsed_ms\": " + std::to_string(b.present_elapsed_ms) + ", \"imports\": [";
+            for (size_t k = 0; k < rows.size(); ++k) {
+                const size_t index = static_cast<size_t>(rows[k].first & 0xffffffffu);
+                o += (k == 0 ? "\n    " : ",\n    ");
+                o += "{\"thread\": " + std::to_string(rows[k].first >> 32) + ", ";
+                if (index < b.imports.size()) {
+                    o += import_name_json(b.imports[index].import);
+                } else {
+                    o += "\"dll\": null, \"symbol\": null";
+                }
+                o += ", \"count\": " + std::to_string(rows[k].second) + "}";
+            }
+            o += rows.empty() ? "]},\n" : "\n  ]},\n";
+        }
+    }
+    if (const ReportExtension extension = g_report_extension.load(std::memory_order_acquire)) {
+        const std::string members = extension();
+        if (!members.empty()) {
+            o += "  " + members + ",\n";
+        }
     }
     o += "  \"elapsed_ms\": " + std::to_string(elapsed_ms()) + "\n";
     o += "}\n";
@@ -2393,6 +2436,20 @@ std::string last_report_json() {
     return boot().last_report;
 }
 
+void set_report_extension(ReportExtension extension) {
+    g_report_extension.store(extension, std::memory_order_release);
+}
+
+void mark_first_present() {
+    BootState& b = boot();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    if (!b.present_seen) {
+        b.present_seen = true;
+        b.present_import_seq = b.import_calls.load(std::memory_order_relaxed);
+        b.present_elapsed_ms = elapsed_ms();
+    }
+}
+
 std::string last_summary() {
     return boot().last_summary;
 }
@@ -2499,6 +2556,10 @@ void reset_boot() {
     b.entry_started = false;
     b.milestones.clear();
     b.first_calls.clear();
+    b.pre_present_counts.clear();
+    b.present_seen = false;
+    b.present_import_seq = 0;
+    b.present_elapsed_ms = 0;
     b.trace.clear();
     b.trace_strings.clear();
     {

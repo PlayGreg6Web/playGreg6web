@@ -7,12 +7,18 @@ Inputs are the artifacts of `playgta6_boot` (runtime/guest/boot_main.cpp):
   * optionally the GPU captures (`--gpu-capture`, a `.pg6trace` plus its `<trace>.json`
     sidecar, schema "playgta6-frame-capture"), passed with `--capture A.pg6trace B.pg6trace`;
   * optionally the import traces (`--import-trace`), passed with
-    `--import-trace A.txt B.txt` (needs the captures: the first Present's import-call index
-    in the sidecar bounds "up to the first present").
+    `--import-trace A.txt B.txt`.
+
+Report schema 2 (R42) carries what schema 1 needed the extra files for: `milestones[].import_seq`,
+`presents` (the per-Present samples of a `--gpu-capture` run) and `first_present` (import calls
+per guest thread and name up to the first Present). The tool prefers these report fields and
+falls back, per side, to the capture sidecar `presents` and to the import trace (bounded by the
+first Present's import-call index in the sidecar) for schema 1 reports. Both versions are read.
 
 What is compared (section names are the prefixes of the field paths used by --ignore):
 
-  milestones   named boot milestones reached (set and order exact), elapsed_ms (time tolerance)
+  milestones   named boot milestones reached (set and order exact), elapsed_ms (time tolerance),
+               import_seq (count tolerance; schema 2 reports)
   first_calls  first call of the timeline APIs (device creation, ...): name set exact,
                import-call index (count tolerance), elapsed_ms (time tolerance)
   stop         status, exit_code, phase, fault kind / trap kind / address / function / import,
@@ -21,8 +27,8 @@ What is compared (section names are the prefixes of the field paths used by --ig
   address_space  reservation log sequence (event, ok, va, size, protect) exact, plus failure
                count and reserved peak
   import_trace import-call counts by name up to the first Present, overall and on the busiest
-               thread (count tolerance)
-  presents     per-Present sample distributions from the sidecars (min / median / max of
+               thread (count tolerance); from the report's first_present or the import traces
+  presents     per-Present sample distributions from the reports or the sidecars (min / median / max of
                dispatches, import calls, reserved / committed bytes, every named counter,
                and wall_ms with the time tolerance)
   capture      frame by frame: packet count, byte count and per-opcode packet counts (exact);
@@ -175,6 +181,11 @@ def compare_milestones(c: Comparison, ra: dict[str, Any], rb: dict[str, Any]) ->
     ta, tb = dict(ma), dict(mb)
     for name in sorted(set(ta) | set(tb)):
         c.time(f"milestones.{name}.elapsed_ms", ta.get(name), tb.get(name))
+    # import_seq exists from report schema 2 on; compare it only when both sides have it.
+    sa = {m["milestone"]: m["import_seq"] for m in ra.get("milestones") or [] if "import_seq" in m}
+    sb = {m["milestone"]: m["import_seq"] for m in rb.get("milestones") or [] if "import_seq" in m}
+    for name in sorted(set(sa) & set(sb)):
+        c.count(f"milestones.{name}.import_seq", sa[name], sb[name])
     fa = {f["name"]: f for f in ra.get("first_calls") or []}
     fb = {f["name"]: f for f in rb.get("first_calls") or []}
     c.exact("first_calls.names", sorted(fa), sorted(fb))
@@ -234,9 +245,11 @@ def compare_address_space(c: Comparison, ra: dict[str, Any], rb: dict[str, Any])
     )
 
 
-def first_present_seq(cap: Capture | None) -> int | None:
-    presents = (cap.sidecar.get("presents") or []) if cap else []
-    return presents[0].get("import_calls") if presents else None
+@dataclass
+class FirstPresent:
+    import_seq: int | None
+    overall: dict[str, int]
+    busiest: dict[str, int]
 
 
 def trace_counts(rows: list[tuple[int, int, str]], limit: int | None) -> tuple[Counter, Counter]:
@@ -247,16 +260,38 @@ def trace_counts(rows: list[tuple[int, int, str]], limit: int | None) -> tuple[C
     return overall, Counter(label for _, t, label in rows if t == busiest)
 
 
-def compare_import_traces(c: Comparison, ta: list, tb: list, ca: Capture | None, cb: Capture | None) -> None:
-    la, lb = first_present_seq(ca), first_present_seq(cb)
-    c.exact("import_trace.first_present_seen", la is not None, lb is not None)
-    c.count("import_trace.first_present_import_call", la, lb)
-    if la is None or lb is None:
+def first_present_from_report(report: dict[str, Any]) -> FirstPresent | None:
+    """Schema 2: the report's own `first_present` (null or absent: not available)."""
+    fp = report.get("first_present")
+    if not isinstance(fp, dict):
+        return None
+    overall: Counter = Counter()
+    per_thread: dict[Any, Counter] = {}
+    for row in fp.get("imports") or []:
+        name = f"{row.get('dll')}!{row.get('symbol')}"
+        overall[name] += row.get("count", 0)
+        per_thread.setdefault(row.get("thread"), Counter())[name] += row.get("count", 0)
+    busiest = max(per_thread.values(), key=lambda t: sum(t.values()), default=Counter())
+    return FirstPresent(fp.get("import_seq"), dict(overall), dict(busiest))
+
+
+def first_present_from_trace(rows: list | None, cap: Capture | None) -> FirstPresent | None:
+    """Schema 1 fallback: the import trace bounded by the sidecar's first Present."""
+    presents = (cap.sidecar.get("presents") or []) if cap else []
+    if rows is None or not presents:
+        return None
+    seq = presents[0].get("import_calls")
+    overall, busiest = trace_counts(rows, seq)
+    return FirstPresent(seq, dict(overall), dict(busiest))
+
+
+def compare_first_present(c: Comparison, a: FirstPresent | None, b: FirstPresent | None) -> None:
+    c.exact("import_trace.first_present_seen", a is not None, b is not None)
+    if a is None or b is None:
         return
-    oa, ba = trace_counts(ta, la)
-    ob, bb = trace_counts(tb, lb)
-    c.mapping("import_trace.overall", dict(oa), dict(ob), "count")
-    c.mapping("import_trace.busiest_thread", dict(ba), dict(bb), "count")
+    c.count("import_trace.first_present_import_call", a.import_seq, b.import_seq)
+    c.mapping("import_trace.overall", a.overall, b.overall, "count")
+    c.mapping("import_trace.busiest_thread", a.busiest, b.busiest, "count")
 
 
 def distribution(values: list[float]) -> dict[str, float | None]:
@@ -265,9 +300,9 @@ def distribution(values: list[float]) -> dict[str, float | None]:
     return {"min": min(values), "median": statistics.median(values), "max": max(values)}
 
 
-def present_series(cap: Capture) -> dict[str, list[float]]:
+def present_series(presents: list[dict[str, Any]]) -> dict[str, list[float]]:
     series: dict[str, list[float]] = {}
-    for p in cap.sidecar.get("presents") or []:
+    for p in presents:
         flat = {k: p.get(k) for k in ("wall_ms", "dispatches", "import_calls", "reserved_bytes", "committed_bytes")}
         flat.update({f"counters.{k}": v for k, v in (p.get("counters") or {}).items()})
         for key, value in flat.items():
@@ -276,10 +311,19 @@ def present_series(cap: Capture) -> dict[str, list[float]]:
     return series
 
 
-def compare_presents(c: Comparison, ca: Capture, cb: Capture) -> None:
-    pa, pb = ca.sidecar.get("presents") or [], cb.sidecar.get("presents") or []
+def presents_of(report: dict[str, Any], cap: Capture | None) -> list[dict[str, Any]] | None:
+    """The report's `presents` (schema 2) if it has samples, else the capture sidecar's."""
+    own = report.get("presents")
+    if isinstance(own, list) and own:
+        return own
+    if cap is not None:
+        return cap.sidecar.get("presents") or []
+    return None
+
+
+def compare_presents(c: Comparison, pa: list[dict[str, Any]], pb: list[dict[str, Any]]) -> None:
     c.count("presents.count", len(pa), len(pb))
-    sa, sb = present_series(ca), present_series(cb)
+    sa, sb = present_series(pa), present_series(pb)
     for key in sorted(set(sa) | set(sb)):
         da, db = distribution(sa.get(key, [])), distribution(sb.get(key, []))
         for stat in ("min", "median", "max"):
@@ -324,10 +368,16 @@ def compare(
     compare_stop(c, ra, rb)
     compare_imports(c, ra, rb)
     compare_address_space(c, ra, rb)
-    if import_traces:
-        compare_import_traces(c, *import_traces, *(captures or (None, None)))
+    caps = captures or (None, None)
+    traces = import_traces or (None, None)
+    fa = first_present_from_report(ra) or first_present_from_trace(traces[0], caps[0])
+    fb = first_present_from_report(rb) or first_present_from_trace(traces[1], caps[1])
+    if fa is not None or fb is not None or import_traces:
+        compare_first_present(c, fa, fb)
+    pa, pb = presents_of(ra, caps[0]), presents_of(rb, caps[1])
+    if pa is not None and pb is not None:
+        compare_presents(c, pa, pb)
     if captures:
-        compare_presents(c, *captures)
         compare_captures(c, *captures)
     return c
 

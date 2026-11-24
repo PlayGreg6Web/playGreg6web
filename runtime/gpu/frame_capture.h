@@ -59,6 +59,10 @@ struct FrameCaptureSample {
 using FrameCaptureCounters = void (*)(FrameCaptureSample* sample);
 void frame_capture_set_counters(FrameCaptureCounters counters);
 
+// The per-Present samples of the running (or last) capture as a JSON array, the same text as the
+// sidecar's "presents" value (the boot report's "presents" reuses it).
+std::string frame_capture_presents_json();
+
 // Frames completed so far by the running (or last) capture.
 uint32_t frame_capture_frames();
 

@@ -898,7 +898,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
             return kExitUsage;
         }
+        // The report carries the capture's per-Present samples (the sidecar's "presents").
+        guest::set_report_extension([]() { return "\"presents\": " + gpu::frame_capture_presents_json(); });
         gpu::frame_capture_set_counters([](gpu::FrameCaptureSample* sample) {
+            guest::mark_first_present();  // sampled at every Present; only the first one counts
             const guest::LiveCounters c = guest::live_counters();
             sample->dispatches = c.dispatches;
             sample->import_calls = c.import_calls;
