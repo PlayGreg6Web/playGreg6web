@@ -451,6 +451,20 @@ void test_query_api() {
         CHECK(back[0] == 0.0f && back[1] == 0.0f && back[2] == 0.0f);
         CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
     }
+    {
+        // {b884675d} slot 3: XSystemGetAnalyticsInfo through the hidden result pointer.
+        const Guid analytics = com::make_guid("b884675d-b738-4a9c-815d-9a9a1e0c6c9b");
+        const uint64_t api = fx.query(analytics, analytics);
+        const uint64_t out = fx.alloc(0x90);
+        CHECK(fx.vcall(api, 3, {out}) == out);
+        char info[0x90] = {};
+        CHECK(com::read_guest(out, info, sizeof(info)));
+        uint16_t major = 0;
+        std::memcpy(&major, info, 2);
+        CHECK(major == 10);
+        CHECK(std::strcmp(info + 16, "Windows.Xbox") == 0);
+        CHECK(std::strcmp(info + 80, "Xbox Series X") == 0);
+    }
     const uint64_t system = fx.query(kSystemProvider, kSystemIid);
     const uint64_t buffer = fx.alloc(64);
     const uint64_t used = fx.alloc(8);

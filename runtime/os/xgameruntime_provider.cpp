@@ -80,8 +80,11 @@
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
 //     XGameSave {704c3f58-...}, XSpeechSynthesizer
 //     {3e241977-...}, XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
-//     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...},
-//     {b884675d-...}, {dfcd4649-...}.
+//     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
+//   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
+//     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
+//     no-argument function returning a 144-byte struct by value, i.e. XSystemGetAnalyticsInfo()
+//     -> XSystemAnalyticsInfo {XVersion osVersion, hostingOsVersion; char family[64], form[64]}.
 
 namespace playgta6::os::gdk::provider {
 
@@ -971,6 +974,36 @@ public:
     }
 };
 
+// XSystemAnalyticsInfo (x64): two XVersion (four uint16 each) and two 64-byte strings.
+struct GuestAnalyticsInfo {
+    uint16_t os_version[4];       // major, minor, build, revision
+    uint16_t hosting_version[4];
+    char family[64];
+    char form[64];
+};
+static_assert(sizeof(GuestAnalyticsInfo) == 0x90, "XSystemAnalyticsInfo is 144 bytes");
+
+// {b884675d-...}: XSystemGetAnalyticsInfo (returned by value through the hidden result pointer).
+// A fixed, local description of the emulated console (the boot's default console type).
+class AnalyticsInfoApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XSystemAnalyticsInfo";
+
+    uint64_t GetAnalyticsInfo(uint64_t result) {
+        GuestAnalyticsInfo info{};
+        info.os_version[0] = 10;
+        info.os_version[2] = 22621;
+        info.hosting_version[0] = 10;
+        info.hosting_version[2] = 22621;
+        std::strncpy(info.family, "Windows.Xbox", sizeof(info.family) - 1);
+        std::strncpy(info.form, "Xbox Series X", sizeof(info.form) - 1);
+        if (result != 0) {
+            com::write_guest(result, &info, sizeof(info));
+        }
+        return result;
+    }
+};
+
 // Interfaces whose slots are all logging stubs.
 class StubApi : public com::ComObject {
 public:
@@ -1176,8 +1209,12 @@ constexpr auto kIUnmapped3 = com::declare_interface<HdrModeApi>("xgameruntime.{0
                                                                 kUnmapped3Table.slots, {.slot_count = 16});
 constexpr auto kIUnmapped9 = com::declare_interface<StubApi>("xgameruntime.{a4f1aee2}", kUnmapped9Iid, {},
                                                              {.slot_count = 16});
-constexpr auto kIUnmapped10 = com::declare_interface<StubApi>("xgameruntime.{b884675d}", kUnmapped10Guid, {},
-                                                              {.slot_count = 16});
+using AI = M<AnalyticsInfoApi>;
+constexpr auto kUnmapped10Table = slot_table<1>({
+    {3, AI::method<&AnalyticsInfoApi::GetAnalyticsInfo>("XSystemGetAnalyticsInfo")},
+});
+constexpr auto kIUnmapped10 = com::declare_interface<AnalyticsInfoApi>(
+    "xgameruntime.{b884675d}", kUnmapped10Guid, kUnmapped10Table.slots, {.slot_count = 16});
 constexpr auto kIUnmapped13 = com::declare_interface<StubApi>("xgameruntime.{dfcd4649}", kUnmapped13Iid, {},
                                                               {.slot_count = 32});
 
@@ -1216,7 +1253,7 @@ const ApiEntry kApis[] = {
     {kDisplayGuid, kDisplayGuid, &kIDisplay.info, [] { return make<StubApi>(kIDisplay); }},
     {kUnmapped3Provider, kUnmapped3Iid, &kIUnmapped3.info, [] { return make<HdrModeApi>(kIUnmapped3); }},
     {kUnmapped9Provider, kUnmapped9Iid, &kIUnmapped9.info, [] { return make<StubApi>(kIUnmapped9); }},
-    {kUnmapped10Guid, kUnmapped10Guid, &kIUnmapped10.info, [] { return make<StubApi>(kIUnmapped10); }},
+    {kUnmapped10Guid, kUnmapped10Guid, &kIUnmapped10.info, [] { return make<AnalyticsInfoApi>(kIUnmapped10); }},
     {kUnmapped13Provider, kUnmapped13Iid, &kIUnmapped13.info, [] { return make<StubApi>(kIUnmapped13); }},
 };
 constexpr size_t kApiCount = sizeof(kApis) / sizeof(kApis[0]);
