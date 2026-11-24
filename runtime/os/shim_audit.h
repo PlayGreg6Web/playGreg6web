@@ -139,17 +139,17 @@
     /* ---- api-ms-win-crt-stdio ---- */ \
     X(pg6_crt_acrt_iob_func, ok, "stable host stdin/stdout/stderr handles, only round-tripped by the guest") \
     X(pg6_crt_p__commode, ok, "returns the address of a host int (round trip)") \
-    X(pg6_crt_stdio_common_vfprintf, deny, "host va_list: the guest passes a pointer to 8-byte guest argument slots; needs the MSVC formatter over guest slots") \
-    X(pg6_crt_stdio_common_vfwprintf, deny, "host va_list (see __stdio_common_vfprintf)") \
-    X(pg6_crt_stdio_common_vsnwprintf_s, deny, "host va_list (see __stdio_common_vfprintf)") \
-    X(pg6_crt_stdio_common_vsprintf, deny, "host va_list (see __stdio_common_vfprintf)") \
-    X(pg6_crt_stdio_common_vsprintf_s, deny, "host va_list (see __stdio_common_vfprintf)") \
+    X(pg6_crt_stdio_common_vfprintf, deny, "host va_list: the guest passes a pointer to 8-byte guest argument slots; gthunk: pg6_gthunk_stdio_common_vfprintf (MSVC formatter over guest slots, os/crt_format.h)") \
+    X(pg6_crt_stdio_common_vfwprintf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vfwprintf (os/crt_format.h)") \
+    X(pg6_crt_stdio_common_vsnwprintf_s, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsnwprintf_s (os/crt_format.h)") \
+    X(pg6_crt_stdio_common_vsprintf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsprintf (os/crt_format.h)") \
+    X(pg6_crt_stdio_common_vsprintf_s, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vsprintf_s (os/crt_format.h)") \
     X(pg6_crt_stdio_common_vsscanf, deny, "host va_list of guest out-pointers; scanf over guest argument slots is not implemented") \
-    X(pg6_crt_stdio_common_vswprintf, deny, "host va_list (see __stdio_common_vfprintf)") \
-    X(pg6_crt_stdio_common_vswprintf_s, deny, "host va_list (see __stdio_common_vfprintf)") \
+    X(pg6_crt_stdio_common_vswprintf, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vswprintf (os/crt_format.h)") \
+    X(pg6_crt_stdio_common_vswprintf_s, deny, "host va_list; gthunk: pg6_gthunk_stdio_common_vswprintf_s (os/crt_format.h)") \
     X(pg6_crt_stdio_common_vswscanf, deny, "host va_list of guest out-pointers; scanf over guest argument slots is not implemented") \
     X(pg6_crt_fseeki64, ok, "") \
-    X(pg6_crt_get_stream_buffer_pointers, deny, "cannot expose MSVC FILE buffer internals: returns null out-pointers that msvcp140's basic_filebuf dereferences") \
+    X(pg6_crt_get_stream_buffer_pointers, ok, "per-stream empty {base, ptr, cnt} record in guest memory (guest addresses): basic_filebuf sees no buffered characters and transfers through fgetc/fputc/fwrite") \
     X(pg6_crt_set_fmode, ok, "") \
     X(pg6_crt_wfopen, deny, "opens host files by a raw guest path (and can create/truncate them), bypassing the win32 file shims' path mapping") \
     X(pg6_crt_fclose, ok, "host FILE* handle") \

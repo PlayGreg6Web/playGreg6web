@@ -1680,14 +1680,39 @@ int32_t pg6_crt_get_stream_buffer_pointers(FILE* stream,
         g_crt_errno = EINVAL;
         return EINVAL;
     }
+    // msvcp140's basic_filebuf keeps these three pointers and dereferences them for every get/put
+    // area access. A host FILE has no MSVC buffer layout, so each stream gets an empty buffer
+    // record {base, ptr, cnt} = {0, 0, 0} in guest memory: the stream buffer never sees buffered
+    // characters and does every transfer through the stdio functions (fgetc/fputc/fwrite). The
+    // out-pointers are guest addresses (stored into guest memory).
+    static std::mutex records_mutex;
+    static std::vector<std::pair<FILE*, uint64_t>> records;
+    uint64_t record = 0;
+    {
+        std::lock_guard<std::mutex> lock(records_mutex);
+        playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+        for (const auto& r : records) {
+            if (r.first == stream && heap.owns(r.second)) {
+                record = r.second;
+            }
+        }
+        if (record == 0) {
+            record = heap.alloc(24, 16, playgta6::os::HeapFamily::Crt, playgta6::os::kHeapZeroMemory);
+            if (record == 0) {
+                g_crt_errno = ENOMEM;
+                return ENOMEM;
+            }
+            records.emplace_back(stream, record);
+        }
+    }
     if (base != nullptr) {
-        *base = nullptr;
+        *base = reinterpret_cast<char**>(static_cast<uintptr_t>(record));
     }
     if (ptr != nullptr) {
-        *ptr = nullptr;
+        *ptr = reinterpret_cast<char**>(static_cast<uintptr_t>(record + 8));
     }
     if (cnt != nullptr) {
-        *cnt = nullptr;
+        *cnt = reinterpret_cast<int32_t*>(static_cast<uintptr_t>(record + 16));
     }
     return 0;
 }

@@ -28,6 +28,7 @@ add_library(playgta6_core STATIC
     os/ucrt_bridge.cpp
     os/crt_guest.cpp
     os/ucrt_ext.cpp
+    os/crt_format.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
     os/winsock_ordinals.cpp
@@ -127,6 +128,10 @@ else()
     add_executable(test_shim_audit ../tests/test_shim_audit.cpp)
     target_link_libraries(test_shim_audit PRIVATE playgta6_core)
     add_test(NAME playgta6_shim_audit_tests COMMAND test_shim_audit)
+
+    add_executable(test_crt_format ../tests/test_crt_format.cpp)
+    target_link_libraries(test_crt_format PRIVATE playgta6_core)
+    add_test(NAME playgta6_crt_format_tests COMMAND test_crt_format)
 
     add_executable(test_image_loader ../tests/test_image_loader.cpp)
     target_link_libraries(test_image_loader PRIVATE playgta6_core)
