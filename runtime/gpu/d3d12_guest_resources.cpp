@@ -14,6 +14,18 @@ namespace playgta6::gpu::d3d12_guest {
 
 namespace {
 
+struct TextureProbe {
+    std::mutex mutex;
+    std::vector<Resource*> textures;
+    size_t cursor = 0;
+    uint64_t with_data = 0;
+};
+
+TextureProbe& texture_probe() {
+    static TextureProbe p;
+    return p;
+}
+
 constexpr uint64_t kShadowPage = 4096;
 constexpr uint64_t kMaxWriteChunk = 1u << 20;
 constexpr uint64_t kMaxShaderBytes = 64u << 20;
@@ -343,6 +355,11 @@ Resource::~Resource() {
     if (id_ != 0) {
         count_work(Work::ResourcesDestroyed);
     }
+    if (probe_registered_) {
+        TextureProbe& p = texture_probe();
+        std::lock_guard<std::mutex> lock(p.mutex);
+        p.textures.erase(std::remove(p.textures.begin(), p.textures.end(), this), p.textures.end());
+    }
     if (tracked_) {
         device_->untrack_cpu_buffer(this);
     }
@@ -462,6 +479,12 @@ bool Resource::initialize() {
         } else if (xmem_memory_ != nullptr) {
             gpu_va_ = com::host_to_guest(xmem_memory_);
         }
+        if (gpu_va_ != 0 && xmem_memory_ == nullptr && com::guest_to_host(gpu_va_, 1) != nullptr) {
+            TextureProbe& p = texture_probe();
+            std::lock_guard<std::mutex> lock(p.mutex);
+            p.textures.push_back(this);
+            probe_registered_ = true;
+        }
         const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
                                              : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
         const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(desc_.Format), usage,
@@ -527,6 +550,40 @@ bool Resource::initialize() {
     dev.resource_states().register_resource(id_, sd);
     count_work(Work::ResourcesCreated);
     return true;
+}
+
+TextureProbeTotals probe_texture_contents(size_t budget) {
+    constexpr uint64_t kProbeBytes = 64u << 10;
+    TextureProbe& p = texture_probe();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    for (size_t n = 0; n < budget && !p.textures.empty(); ++n) {
+        p.cursor %= p.textures.size();
+        Resource* r = p.textures[p.cursor++];
+        if (r->probe_seen_data_) {
+            continue;
+        }
+        const uint64_t len = std::min<uint64_t>(kProbeBytes, std::max<uint64_t>(1, resource_size_estimate(r->desc_)));
+        const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(r->gpu_va_, static_cast<size_t>(len)));
+        if (bytes == nullptr || std::all_of(bytes, bytes + len, [](uint8_t b) { return b == 0; })) {
+            continue;
+        }
+        r->probe_seen_data_ = true;
+        ++p.with_data;
+        if (p.with_data <= 64) {
+            const GuestResourceDesc& d = r->desc_;
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: texture data written directly: format %u, %" PRIu64 "x%ux%u, %u mip(s), "
+                          "layout 0x%x, flags 0x%x, dimension %u (texture %u of %zu registered)",
+                          d.Format, d.Width, d.Height, static_cast<unsigned>(d.DepthOrArraySize), r->mips_,
+                          d.Layout, d.Flags, d.Dimension, static_cast<unsigned>(p.with_data), p.textures.size());
+            os::log(line);
+        }
+    }
+    TextureProbeTotals t;
+    t.registered = p.textures.size();
+    t.with_data = p.with_data;
+    return t;
 }
 
 void Resource::mark_back_buffer() {

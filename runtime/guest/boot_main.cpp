@@ -73,6 +73,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/frame_capture.h"
@@ -922,6 +923,10 @@ int main(int argc, char** argv) {
             sample->counters.emplace_back("dstorage_bytes_delivered", ds.bytes_delivered);
             sample->counters.emplace_back("dstorage_decompressed_requests", ds.decompressed_requests);
             sample->counters.emplace_back("dstorage_file_reads", ds.file_reads);
+            // Textures the title fills by writing their memory (no upload call).
+            const gpu::d3d12_guest::TextureProbeTotals probe = gpu::d3d12_guest::probe_texture_contents(256);
+            sample->counters.emplace_back("textures_with_memory", probe.registered);
+            sample->counters.emplace_back("textures_with_data", probe.with_data);
         });
     }
     start_watchdog();

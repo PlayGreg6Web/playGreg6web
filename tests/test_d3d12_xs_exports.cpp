@@ -1166,6 +1166,13 @@ void test_resources() {
     // A texture at title memory: its GPU VA is that memory (the title translates it to a CPU
     // pointer and writes the texels).
     CHECK(fx.vcall(sw, Slot2::GetGPUVirtualAddress) == tex_memory);
+    // The content probe notices the first write into such a texture's memory, once.
+    const dg::TextureProbeTotals probe0 = dg::probe_texture_contents(1 << 20);
+    CHECK(probe0.registered >= 1);
+    CHECK(com::write_guest(tex_memory + 128, uint32_t{0x3f800000}));
+    const dg::TextureProbeTotals probe1 = dg::probe_texture_contents(1 << 20);
+    CHECK(probe1.with_data == probe0.with_data + 1);
+    CHECK(dg::probe_texture_contents(1 << 20).with_data == probe1.with_data);
     swizzled.Layout = 0x200;
     CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
                     dg::IID_ID3D12Resource, &result) == 0);

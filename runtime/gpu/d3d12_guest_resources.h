@@ -81,6 +81,16 @@ bool parse_uav_desc(const GuestUnorderedAccessViewDesc& g, d3d::ViewDesc* out);
 // stage's metadata bytes (one hash over the concatenation).
 uint64_t native_stage_identity(const void* code, size_t code_size, const void* metadata, size_t metadata_size);
 
+// Diagnostics for textures whose memory the title writes directly (no upload call): every texture
+// with readable guest memory is registered; probe_texture_contents() looks at up to `budget` of
+// them (round robin) and reports each the first time its first 64 KiB are not all zero (format,
+// size, mips, layout; once, through the log). Nothing is uploaded.
+struct TextureProbeTotals {
+    uint64_t registered = 0;  // live textures with guest memory
+    uint64_t with_data = 0;   // of all registered so far, seen with non-zero memory
+};
+TextureProbeTotals probe_texture_contents(size_t budget);
+
 class Heap final : public ChildBase<IHeapHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12Heap";
@@ -158,6 +168,9 @@ private:
     bool tracked_ = false;
     std::atomic<bool> back_buffer_{false};
     std::vector<uint8_t> shadow_;
+    friend TextureProbeTotals probe_texture_contents(size_t budget);
+    bool probe_registered_ = false;
+    bool probe_seen_data_ = false;
 };
 
 // Host-side copy of a graphics pipeline description (Xbox device slot 55 derives new pipeline
