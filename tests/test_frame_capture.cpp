@@ -75,6 +75,14 @@ void test_capture_omits_payloads_and_stops() {
     config.frames = 2;
     CHECK(fc::frame_capture_start(config));
     CHECK(!fc::frame_capture_start(config));  // one capture at a time
+    static uint64_t calls = 0;
+    fc::frame_capture_set_counters([](fc::FrameCaptureSample* s) {
+        calls += 10;
+        s->dispatches = calls;
+        s->import_calls = calls / 10;
+        s->reserved_bytes = 0x1000 * calls;
+        s->committed_bytes = 0x100 * calls;
+    });
 
     const std::vector<uint8_t> blob(1000, 0xAB);
     CommandEncoder e;
@@ -124,6 +132,10 @@ void test_capture_omits_payloads_and_stops() {
     CHECK(side.find("\"length\": 1000") != std::string::npos);
     const std::string frame1 = "\"index\": 1, \"offset\": " + std::to_string(ps[5].offset);
     CHECK(side.find(frame1) != std::string::npos);
+    // One sample per Present, the third one after the captured frames.
+    CHECK(side.find("\"dispatches\": 30, \"import_calls\": 3, \"reserved_bytes\": 122880, \"committed_bytes\": 7680") !=
+          std::string::npos);
+    fc::frame_capture_set_counters(nullptr);
     std::filesystem::remove(path);
     std::filesystem::remove(path + ".json");
 }

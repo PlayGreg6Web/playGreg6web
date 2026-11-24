@@ -13,9 +13,11 @@
 //
 // Sidecar (<path>.json): {schema "playgta6-frame-capture", schema_version 1, trace, payloads
 // ("omitted" | "kept"), frames_requested, frames_complete, presents_seen, packets, bytes,
-// frames [{index, offset, bytes, packets, wall_ms, dispatches, import_calls}], omitted
-// [{packet, opcode, length, fnv1a64}], omitted_bytes}. wall_ms / dispatches / import_calls are
-// taken when the frame's Present is seen (counter source: frame_capture_set_counters).
+// frames [{index, offset, bytes, packets}], presents [{index, wall_ms, dispatches, import_calls,
+// reserved_bytes, committed_bytes}], omitted [{packet, opcode, length, fnv1a64}], omitted_bytes}.
+// `presents` has one sample per Present seen, also after the captured frames (a timeline of the
+// whole run): wall time since the capture started and the counters of frame_capture_set_counters
+// at that Present.
 //
 // Capture files are derived from the running title: keep them out of the repository.
 
@@ -41,8 +43,14 @@ void frame_capture_observe(const uint8_t* data, size_t len);
 // Flushes the trace and writes the sidecar; idempotent; detaches the observer.
 void frame_capture_finish();
 
-// Optional source of (dispatches, import calls) recorded per frame.
-using FrameCaptureCounters = void (*)(uint64_t* dispatches, uint64_t* import_calls);
+// Optional source of the counters sampled at every Present.
+struct FrameCaptureSample {
+    uint64_t dispatches = 0;
+    uint64_t import_calls = 0;
+    uint64_t reserved_bytes = 0;   // guest address space reserved
+    uint64_t committed_bytes = 0;  // guest memory committed
+};
+using FrameCaptureCounters = void (*)(FrameCaptureSample* sample);
 void frame_capture_set_counters(FrameCaptureCounters counters);
 
 // Frames completed so far by the running (or last) capture.

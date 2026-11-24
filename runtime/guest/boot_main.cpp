@@ -676,10 +676,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
             return kExitUsage;
         }
-        gpu::frame_capture_set_counters([](uint64_t* dispatches, uint64_t* import_calls) {
+        gpu::frame_capture_set_counters([](gpu::FrameCaptureSample* sample) {
             const guest::LiveCounters c = guest::live_counters();
-            *dispatches = c.dispatches;
-            *import_calls = c.import_calls;
+            sample->dispatches = c.dispatches;
+            sample->import_calls = c.import_calls;
+            const os::VirtualMemoryArena* arena = os::win32::get_vmem_arena();
+            sample->reserved_bytes = arena->reserved_bytes();
+            sample->committed_bytes = arena->committed_bytes();
         });
     }
     start_watchdog();
