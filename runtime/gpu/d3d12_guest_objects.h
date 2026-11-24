@@ -508,10 +508,14 @@ struct DeviceOptions {
     PacketSink sink;                    // empty: os::wgpu_submit
     bridge::BridgeOptions bridge;       // id_allocator is replaced by the device's allocator
     uint64_t timestamp_frequency = 1000000000ull;
-    // Xbox slot 57: record the console-native pipeline's stages, then fail the call (E_NOTIMPL)
-    // so the title creates that pipeline from DXIL through slot 86 (d3d12_xs_xbox.h, "Native
-    // pipelines and their DXIL"). Off: a native (unresolved) pipeline state is created.
-    bool refuse_native_pipelines = false;
+    // Xbox slot 57: index the console-native pipeline's stages, then fail the call (E_NOTIMPL) so
+    // the title creates the pipeline from DXIL through slot 86 when it is requested (d3d12_xs_xbox.h,
+    // "Native pipelines and their DXIL"). On by default. This deliberately differs from a console,
+    // which creates these pipelines: the fallback is the title's own code path (the same one it
+    // takes for compute when slot 67 is refused), and only it carries the public state, input
+    // layouts and shader signatures the WebGPU side needs. Off: a native pipeline state is
+    // created (unresolved; its draws are skipped). Boot harness: --native-pipelines turns it off.
+    bool refuse_native_pipelines = true;
 };
 
 struct DeviceStats {

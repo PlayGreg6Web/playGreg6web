@@ -41,7 +41,8 @@
 //              result is read unconditionally: a pipeline state is always handed out. (high shape)
 //              The bases are slot-57 pipelines (see "Console-native pipelines" below).
 //   57    1    (desc, IID_ID3D12PipelineState, out): a console-native graphics pipeline
-//              (GuestNativePipelineDesc below)                    native PSO, unresolved (high shape)
+//              (GuestNativePipelineDesc below)  stages indexed, then E_NOTIMPL (default) or a
+//                                                                 native PSO, unresolved (high shape)
 //   61    1    (a, b); ignored                                     S_OK no-op (low)
 //   62    1    (desc, 0, 0, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (NodeMask 1, no
 //              cached PSO, flags 0) with a DXIL compute shader (program kind 5) in every call;
@@ -172,11 +173,12 @@
 //    55. Only when that lookup finds nothing does it build a pipeline-state stream from the
 //    program's DXIL stages and the public state structs and call slot 86.
 //  * The compile job inserts a pipeline into the manager's map only when slot 57 succeeds. So when
-//    slot 57 fails, every request falls back to slot 86. A real console does not fail these calls,
-//    so DeviceOptions::refuse_native_pipelines is off by default. With it on, one boot created every
-//    requested graphics pipeline from DXIL (50,472 slot-86 calls, 738 distinct containers: 229
-//    vertex, 509 pixel). The per-frame pass then carries its DXIL pair and its public state (input layout,
-//    render-target and depth formats, rectangle-list topology).
+//    slot 57 fails, every request falls back to slot 86. A real console does not fail these calls;
+//    DeviceOptions::refuse_native_pipelines (on by default) fails them on purpose, the same answer
+//    as for the native compute slot 67. One boot then created every requested graphics pipeline
+//    from DXIL (50,472 slot-86 calls, 738 distinct containers: 229 vertex, 509 pixel) and slot 55
+//    was never called. The per-frame pass carries its DXIL pair and its public state (input
+//    layout, render-target and depth formats, rectangle-list topology).
 //  * The containers are shader model 6.6 / DXIL 1.6 with clear signature, PSV0, SFI0, HASH and
 //    PRIV parts. The DXIL part's program header is valid, but its bitcode offset points at a
 //    trailer of under 16 bytes. The program body is a payload that starts with one fixed tag in
@@ -185,11 +187,11 @@
 //    these as DXIL; this layer does not try to decode the payload.
 //  * Join key: a stage's metadata range (slot 57) carries the 16-byte digest of the DXIL container's
 //    HASH part for the same shader, at 0x14 + 0x40 * k (pixel stages: range 3; vertex stages of
-//    layout A: range 5; no layout-B vertex stage has been seen joined yet). In one boot with the
-//    option on, 228 of 229 distinct DXIL vertex shaders and 470 of 509 pixel shaders joined (97% of
-//    the 100,928 stage uses) against 18,829 indexed native stages. With refuse_native_pipelines on, slot 57 indexes its stages
-//    under those positions before failing, and graphics pipeline states record the native stage
-//    (identity, code-only identity, sizes) that each of their DXIL stages joins to.
+//    layout A: range 5; no layout-B vertex stage has been seen joined yet). In one boot, 228 of 229
+//    distinct DXIL vertex shaders and 470 of 509 pixel shaders joined (97% of the 100,928 stage
+//    uses) against 18,829 indexed native stages. While refusing, slot 57 indexes its stages under
+//    those positions, and graphics pipeline states record the native stage (identity, code-only
+//    identity, sizes) that each of their DXIL stages joins to.
 
 // Raytracing
 // ----------

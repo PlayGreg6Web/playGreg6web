@@ -2166,7 +2166,7 @@ void test_xbox_native_dxil_join() {
     Fixture fx;
     dg::DeviceOptions options;
     options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
-    options.refuse_native_pipelines = true;
+    CHECK(options.refuse_native_pipelines);  // the default
     dx::set_device_options(options);
     Scene scene(fx);
     dg::Device* dev = host_device(scene.device);
@@ -2317,6 +2317,10 @@ uint64_t put_aligned(const std::vector<uint8_t>& bytes, uint64_t alignment = 256
 
 void test_xbox_native_pipelines() {
     Fixture fx;
+    dg::DeviceOptions options;  // native pipeline states (refuse_native_pipelines is on by default)
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.refuse_native_pipelines = false;
+    dx::set_device_options(options);
     Scene scene(fx);
     dg::Device* dev = host_device(scene.device);
     int32_t result = -1;

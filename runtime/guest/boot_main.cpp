@@ -147,7 +147,7 @@ struct Options {
     std::string gpu_capture;          // --gpu-capture: .pg6trace path
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
-    bool refuse_native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines
+    bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -165,7 +165,7 @@ void usage() {
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
                  "                     [--no-entry] [--quiet]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
-                 "                     [--refuse-native-pipelines]\n");
+                 "                     [--native-pipelines]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -196,8 +196,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.quiet = true;
         } else if (a == "--gpu-capture-payloads") {
             o.gpu_capture_payloads = true;
-        } else if (a == "--refuse-native-pipelines") {
-            o.refuse_native_pipelines = true;
+        } else if (a == "--native-pipelines") {
+            o.native_pipelines = true;
         } else if (a == "-h" || a == "--help") {
             return false;
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
@@ -685,9 +685,9 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
-    if (g_options.refuse_native_pipelines) {
+    if (g_options.native_pipelines) {
         gpu::d3d12_guest::DeviceOptions device_options;
-        device_options.refuse_native_pipelines = true;
+        device_options.refuse_native_pipelines = false;
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
     }
     if (!g_options.gpu_capture.empty()) {
