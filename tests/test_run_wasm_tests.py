@@ -248,7 +248,7 @@ class FakeDocker:
                 target = inner[-1]
                 return rwt.CommandResult(0, "ninja: no work to do.\n" if target not in self.unbuilt else "[1/1] Linking\n")
         for target, (rc, out, timed_out) in self.outcomes.items():
-            if f"{target}.js" in argv:
+            if any(arg.endswith(f"/{target}.js") for arg in argv):
                 return rwt.CommandResult(rc, out, timed_out, 0.5)
         if "node" in argv and any(a.endswith(".js") for a in argv):
             return rwt.CommandResult(0, "all good\n", False, 0.25)
