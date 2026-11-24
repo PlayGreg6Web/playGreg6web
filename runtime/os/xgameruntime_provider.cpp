@@ -17,6 +17,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/xasync_provider.h"
 #include "os/xbox_offline.h"
@@ -66,11 +67,20 @@
 //     other 40 used slots stay stubs (O8 offline policy: nothing about licences is invented).
 //   {37e56907-...}/{bf2346b2-...} XNetworking: s15 GetConnectivityHint h, s16/s17
 //     Register/UnregisterConnectivityHintChanged h.
-//   {af406016-...}/{0b9d556e-...} XPackage: s4 IsPackagedProcess()->bool h.
+//   {af406016-...}/{0b9d556e-...} XPackage: s3 GetCurrentProcessPackageIdentifier(2) h (local
+//     deterministic id), s4 IsPackagedProcess()->bool h, s5 CreateInstallationMonitor(6) h,
+//     s6 CloseInstallationMonitorHandle(1) h, s7 GetInstallationProgress(2) h,
+//     s9 RegisterInstallationProgressChanged(4) h (the local package is complete: progress is
+//     always finished and launchable, and never changes), s39 EnumeratePackages(4) h (no local
+//     content packages; game-package enumeration returns E_NOTIMPL).
+//   {f4faf4d4-...}/{41a4e10c-...} XPersistentLocalStorage: s4 GetPath(3) h ("T:\userdata\pls\",
+//     a directory of the /userdata overlay).
+//   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
+//     (returns Disabled: the runtime presents SDR).
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XGameSave {704c3f58-...}, XPersistentLocalStorage {f4faf4d4-...}, XSpeechSynthesizer
+//     XGameSave {704c3f58-...}, XSpeechSynthesizer
 //     {3e241977-...}, XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
-//     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {03f0fe74-...}, {a4f1aee2-...},
+//     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...},
 //     {b884675d-...}, {dfcd4649-...}.
 
 namespace playgta6::os::gdk::provider {
@@ -133,6 +143,10 @@ HandleTable& stores() {
     return t;
 }
 HandleTable& ports() {
+    static HandleTable t;
+    return t;
+}
+HandleTable& installation_monitors() {
     static HandleTable t;
     return t;
 }
@@ -807,11 +821,154 @@ public:
     }
 };
 
+// XPackageInstallationProgress (x64): totalBytes, installedBytes, launchable, completed.
+struct GuestInstallationProgress {
+    uint64_t total_bytes;
+    uint64_t installed_bytes;
+    uint8_t launchable;
+    uint8_t completed;
+    uint8_t padding[6];
+};
+static_assert(sizeof(GuestInstallationProgress) == 24, "XPackageInstallationProgress is 24 bytes on x64");
+
 // {af406016-...}/{0b9d556e-...}: XPackage.
 class PackageApi : public com::ComObject {
+    struct InstallationMonitor {
+        uint64_t unused = 0;
+    };
+    // Equal non-zero byte counts: their ratio is 1, never 0/0.
+    static constexpr uint64_t kInstalledBytes = 1;
+    std::atomic<uint64_t> next_progress_token_{1};
+
 public:
     static constexpr const char* kComClassName = "xgameruntime XPackage";
     bool IsPackagedProcess() { return true; }
+
+    // XPackageGetCurrentProcessPackageIdentifier(bufferSize, buffer): a deterministic local
+    // identifier, 32 zero digits (XPACKAGE_IDENTIFIER_MAX_LENGTH, 33 bytes with the terminator),
+    // like XSystemGetConsoleId. No package, licence or store state is derived from it here.
+    int32_t GetCurrentProcessPackageIdentifier(uint64_t size, uint64_t buffer) {
+        constexpr uint64_t kIdentifierBytes = 33;
+        if (buffer == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (size < kIdentifierBytes) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
+        }
+        char id[kIdentifierBytes];
+        std::memset(id, '0', sizeof(id) - 1);
+        id[kIdentifierBytes - 1] = '\0';
+        return com::write_guest(buffer, id, sizeof(id)) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    // XPackageCreateInstallationMonitor(packageIdentifier, selectorCount, selectors,
+    // minimumUpdateIntervalMs, queue, installationMonitor*). The package is installed in full on
+    // the local device, so a monitor only ever reports a finished installation and never fires.
+    int32_t CreateInstallationMonitor(uint64_t /*identifier*/, uint64_t selector_count, uint64_t selectors,
+                                      uint64_t /*interval_ms*/, uint64_t queue, OutPtr monitor) {
+        if (monitor.is_null()) {
+            return E_POINTER_HR;
+        }
+        monitor.write(0);
+        if ((static_cast<uint32_t>(selector_count) != 0 && selectors == 0) || !optional_queue_ok(queue)) {
+            return E_INVALIDARG_HR;
+        }
+        auto* handle = new InstallationMonitor{};
+        installation_monitors().add(handle);
+        monitor.write(to_guest(handle));
+        return S_OK_HR;
+    }
+
+    void CloseInstallationMonitorHandle(uint64_t monitor) {
+        if (check_handle(installation_monitors(), monitor, "XPackageInstallationMonitorHandle")) {
+            installation_monitors().remove(from_guest<void>(monitor));
+            delete from_guest<InstallationMonitor>(monitor);
+        }
+    }
+
+    // XPackageRegisterInstallationProgressChanged(monitor, context, callback, token*): a finished
+    // installation never changes, so the callback is not kept and never runs.
+    int32_t RegisterInstallationProgressChanged(uint64_t monitor, uint64_t /*context*/, uint64_t callback,
+                                                GuestPtr<uint64_t> token) {
+        if (!check_handle(installation_monitors(), monitor, "XPackageInstallationMonitorHandle") ||
+            callback == 0 || token.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        token.write(next_progress_token_.fetch_add(1, std::memory_order_relaxed));
+        return S_OK_HR;
+    }
+
+    // XPackageEnumeratePackages(kind, scope, context, callback). Content packages (kind 1): none
+    // are installed locally, so the callback never runs. Game packages (kind 0) are not modelled
+    // yet and fail with E_NOTIMPL, so a boot that needs them shows it.
+    int32_t EnumeratePackages(uint64_t kind, uint64_t /*scope*/, uint64_t /*context*/, uint64_t callback) {
+        constexpr uint32_t kXPackageKindContent = 1;
+        if (callback == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (static_cast<uint32_t>(kind) != kXPackageKindContent) {
+            os::log("xgameruntime: XPackageEnumeratePackages(kind " + std::to_string(static_cast<uint32_t>(kind)) +
+                    ") is not modelled; returning E_NOTIMPL");
+            return com::E_NOTIMPL_HR;
+        }
+        return S_OK_HR;
+    }
+
+    // XPackageGetInstallationProgress(monitor, progress*): complete and launchable.
+    void GetInstallationProgress(uint64_t monitor, GuestPtr<GuestInstallationProgress> progress) {
+        if (!check_handle(installation_monitors(), monitor, "XPackageInstallationMonitorHandle") ||
+            progress.is_null()) {
+            return;
+        }
+        GuestInstallationProgress value{};
+        value.total_bytes = kInstalledBytes;
+        value.installed_bytes = kInstalledBytes;
+        value.launchable = 1;
+        value.completed = 1;
+        progress.write(value);
+    }
+};
+
+// {f4faf4d4-...}/{41a4e10c-...}: XPersistentLocalStorage. The storage is a directory of the
+// runtime's writable /userdata overlay.
+class PersistentLocalStorageApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XPersistentLocalStorage";
+    static constexpr char kPath[] = "T:\\userdata\\pls\\";
+
+    // XPersistentLocalStorageGetPath(pathSize, path, pathUsed*): size in bytes with the terminator.
+    int32_t GetPath(uint64_t size, uint64_t path, GuestPtr<uint64_t> used) {
+        constexpr uint64_t kBytes = sizeof(kPath);
+        if (!used.is_null()) {
+            used.write(kBytes);
+        }
+        if (path == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (size < kBytes) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
+        }
+        win32::userdata_create_directory("/userdata/pls");
+        return com::write_guest(path, kPath, kBytes) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+};
+
+// {03f0fe74-...}/{35f07670-...}: slot 4 is called through a two-argument wrapper (a preference
+// enum, a pointer to a 12-byte result) whose enum result the caller compares with 1 before taking
+// an HDR set-up path: the shape of XDisplayTryEnableHdrMode(preference, XDisplayHdrModeInfo*) ->
+// XDisplayHdrModeResult {Unknown, Enabled, Disabled}. The runtime presents SDR: Disabled.
+class HdrModeApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XDisplay (HDR mode)";
+    static constexpr uint32_t kHdrModeDisabled = 2;
+
+    uint32_t TryEnableHdrMode(uint64_t /*preference*/, uint64_t info) {
+        if (info != 0) {
+            const float zero[3] = {0.0f, 0.0f, 0.0f};  // min / max / max full-frame tone-map nits
+            com::write_guest(info, zero, sizeof(zero));
+        }
+        return kHdrModeDisabled;
+    }
 };
 
 // Interfaces whose slots are all logging stubs.
@@ -982,30 +1139,41 @@ constexpr auto kINetworking = com::declare_interface<NetworkingApi>("xgameruntim
                                                                     kNetworkingTable.slots, {.slot_count = 32});
 
 using PK = M<PackageApi>;
-constexpr com::MethodDesc kPackageMethods[] = {
-    PK::stub("XPackageGetCurrentProcessPackageIdentifier"),
-    PK::method<&PackageApi::IsPackagedProcess>("XPackageIsPackagedProcess"),
-    PK::stub("XPackageCreateInstallationMonitor"),
-    PK::stub("XPackageCloseInstallationMonitorHandle"),
-    PK::stub("XPackageGetInstallationProgress"),
-};
+constexpr auto kPackageTable = slot_table<37>({
+    {3, PK::method<&PackageApi::GetCurrentProcessPackageIdentifier>("XPackageGetCurrentProcessPackageIdentifier")},
+    {4, PK::method<&PackageApi::IsPackagedProcess>("XPackageIsPackagedProcess")},
+    {5, PK::method<&PackageApi::CreateInstallationMonitor>("XPackageCreateInstallationMonitor")},
+    {6, PK::method<&PackageApi::CloseInstallationMonitorHandle>("XPackageCloseInstallationMonitorHandle")},
+    {7, PK::method<&PackageApi::GetInstallationProgress>("XPackageGetInstallationProgress")},
+    {9, PK::method<&PackageApi::RegisterInstallationProgressChanged>(
+            "XPackageRegisterInstallationProgressChanged")},
+    {39, PK::method<&PackageApi::EnumeratePackages>("XPackageEnumeratePackages")},
+});
 constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPackage", kPackageIid,
-                                                              kPackageMethods, {.slot_count = 48});
+                                                              kPackageTable.slots, {.slot_count = 48});
 
 constexpr auto kIGameSave = com::declare_interface<StubApi>("xgameruntime.XGameSave", kGameSaveIid, {},
                                                             {.slot_count = 40});
 constexpr auto kIStoreExt = com::declare_interface<StubApi>("xgameruntime.XStoreExt", kStoreExtIid, {},
                                                             {.slot_count = 96});
-constexpr auto kIPersistentLocalStorage = com::declare_interface<StubApi>(
-    "xgameruntime.XPersistentLocalStorage", kPlsIid, {}, {.slot_count = 16});
+using PL = M<PersistentLocalStorageApi>;
+constexpr auto kPlsTable = slot_table<2>({
+    {4, PL::method<&PersistentLocalStorageApi::GetPath>("XPersistentLocalStorageGetPath")},
+});
+constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocalStorageApi>(
+    "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});
 constexpr auto kISpeech = com::declare_interface<StubApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid, {},
                                                           {.slot_count = 32});
 constexpr auto kIEvent = com::declare_interface<StubApi>("xgameruntime.XGameEvent", kEventGuid, {},
                                                          {.slot_count = 16});
 constexpr auto kIDisplay = com::declare_interface<StubApi>("xgameruntime.{1b339674} (XDisplay?)", kDisplayGuid,
                                                            {}, {.slot_count = 16});
-constexpr auto kIUnmapped3 = com::declare_interface<StubApi>("xgameruntime.{03f0fe74}", kUnmapped3Iid, {},
-                                                             {.slot_count = 16});
+using HD = M<HdrModeApi>;
+constexpr auto kUnmapped3Table = slot_table<2>({
+    {4, HD::method<&HdrModeApi::TryEnableHdrMode>("XDisplayTryEnableHdrMode")},
+});
+constexpr auto kIUnmapped3 = com::declare_interface<HdrModeApi>("xgameruntime.{03f0fe74}", kUnmapped3Iid,
+                                                                kUnmapped3Table.slots, {.slot_count = 16});
 constexpr auto kIUnmapped9 = com::declare_interface<StubApi>("xgameruntime.{a4f1aee2}", kUnmapped9Iid, {},
                                                              {.slot_count = 16});
 constexpr auto kIUnmapped10 = com::declare_interface<StubApi>("xgameruntime.{b884675d}", kUnmapped10Guid, {},
@@ -1041,11 +1209,12 @@ const ApiEntry kApis[] = {
     {kPackageProvider, kPackageIid, &kIPackage.info, [] { return make<PackageApi>(kIPackage); }},
     {kGameSaveProvider, kGameSaveIid, &kIGameSave.info, [] { return make<StubApi>(kIGameSave); }},
     {kStoreProvider, kStoreExtIid, &kIStoreExt.info, [] { return make<StubApi>(kIStoreExt); }},
-    {kPlsProvider, kPlsIid, &kIPersistentLocalStorage.info, [] { return make<StubApi>(kIPersistentLocalStorage); }},
+    {kPlsProvider, kPlsIid, &kIPersistentLocalStorage.info,
+     [] { return make<PersistentLocalStorageApi>(kIPersistentLocalStorage); }},
     {kSpeechProvider, kSpeechIid, &kISpeech.info, [] { return make<StubApi>(kISpeech); }},
     {kEventGuid, kEventGuid, &kIEvent.info, [] { return make<StubApi>(kIEvent); }},
     {kDisplayGuid, kDisplayGuid, &kIDisplay.info, [] { return make<StubApi>(kIDisplay); }},
-    {kUnmapped3Provider, kUnmapped3Iid, &kIUnmapped3.info, [] { return make<StubApi>(kIUnmapped3); }},
+    {kUnmapped3Provider, kUnmapped3Iid, &kIUnmapped3.info, [] { return make<HdrModeApi>(kIUnmapped3); }},
     {kUnmapped9Provider, kUnmapped9Iid, &kIUnmapped9.info, [] { return make<StubApi>(kIUnmapped9); }},
     {kUnmapped10Guid, kUnmapped10Guid, &kIUnmapped10.info, [] { return make<StubApi>(kIUnmapped10); }},
     {kUnmapped13Provider, kUnmapped13Iid, &kIUnmapped13.info, [] { return make<StubApi>(kIUnmapped13); }},

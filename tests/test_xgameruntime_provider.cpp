@@ -225,6 +225,10 @@ constexpr Guid kSystemProvider = com::make_guid("e349bd1a-fc20-4e40-b99c-4178cc6
 constexpr Guid kSystemIid = com::make_guid("1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf");
 constexpr Guid kPackageProvider = com::make_guid("af406016-e850-4aa8-a88d-2f3dcb9dac7e");
 constexpr Guid kPackageIid = com::make_guid("0b9d556e-ab70-43f4-baa0-9999ac4cb040");
+constexpr Guid kPlsProvider = com::make_guid("f4faf4d4-2d04-4fce-b3e0-474a713a3e84");
+constexpr Guid kPlsIid = com::make_guid("41a4e10c-5a7e-41d9-8c37-37bde62a07d6");
+constexpr Guid kHdrProvider = com::make_guid("03f0fe74-fdd9-4e5c-b630-f9339c47acc5");
+constexpr Guid kHdrIid = com::make_guid("35f07670-706e-4bfb-9476-090798c5ebf3");
 constexpr Guid kUnmappedProvider = com::make_guid("dfcd4649-4ff8-4043-ba07-35d607df98b0");
 constexpr Guid kUnmappedIid = com::make_guid("eaf669df-5542-4590-99a3-8dc061f837cc");
 constexpr Guid kBogus = com::make_guid("12345678-1234-1234-1234-123456789abc");
@@ -380,6 +384,73 @@ void test_query_api() {
     CHECK((fx.vcall(feature, 3, {1}) & 0xFF) == 0);
     const uint64_t package = fx.query(kPackageProvider, kPackageIid);
     CHECK((fx.vcall(package, 4) & 0xFF) == 1);
+    {
+        // XPackageGetCurrentProcessPackageIdentifier(33, buffer): 32 digits and a terminator.
+        const uint64_t ident = fx.alloc(40);
+        CHECK(hr32(fx.vcall(package, 3, {33, ident})) == 0);
+        char text[33] = {};
+        CHECK(com::read_guest(ident, text, sizeof(text)));
+        CHECK(std::strlen(text) == 32);
+        CHECK(hr32(fx.vcall(package, 3, {32, ident})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(hr32(fx.vcall(package, 3, {33, 0})) == com::E_INVALIDARG_HR);
+
+        // Installation monitor: created without selectors, always complete and launchable.
+        const uint64_t monitor_out = fx.alloc(8);
+        CHECK(hr32(fx.vcall(package, 5, {ident, 0, 0, 5000, 0, monitor_out})) == 0);
+        const uint64_t monitor = load64(monitor_out);
+        CHECK(monitor != 0);
+        const uint64_t progress = fx.alloc(24);
+        fx.vcall(package, 7, {monitor, progress});
+        CHECK(load64(progress) != 0 && load64(progress) == load64(progress + 8));
+        uint8_t flags[2] = {};
+        CHECK(com::read_guest(progress + 16, flags, sizeof(flags)));
+        CHECK(flags[0] == 1 && flags[1] == 1);
+        // Progress-changed registration hands out a token (the callback never fires).
+        const uint64_t token = fx.alloc(8);
+        CHECK(hr32(fx.vcall(package, 9, {monitor, 0x1234, kRecord, token})) == 0);
+        CHECK(load64(token) != 0);
+        CHECK(hr32(fx.vcall(package, 9, {monitor, 0x1234, 0, token})) == com::E_INVALIDARG_HR);
+        CHECK(hr32(fx.vcall(package, 9, {0x5555, 0x1234, kRecord, token})) == com::E_INVALIDARG_HR);
+        // Selectors without an array, and a missing out pointer, are rejected.
+        CHECK(hr32(fx.vcall(package, 5, {ident, 2, 0, 5000, 0, monitor_out})) == com::E_INVALIDARG_HR);
+        CHECK(load64(monitor_out) == 0);
+        CHECK(hr32(fx.vcall(package, 5, {ident, 0, 0, 5000, 0, 0})) == com::E_POINTER_HR);
+        fx.vcall(package, 6, {monitor});
+
+        // XPackageEnumeratePackages: no content packages (the callback never runs); game
+        // packages are not modelled.
+        g_record_calls = 0;
+        CHECK(hr32(fx.vcall(package, 39, {1, 0, 0xABC, kRecord})) == 0);
+        CHECK(g_record_calls == 0);
+        CHECK(hr32(fx.vcall(package, 39, {0, 0, 0xABC, kRecord})) == com::E_NOTIMPL_HR);
+        CHECK(hr32(fx.vcall(package, 39, {1, 0, 0xABC, 0})) == com::E_INVALIDARG_HR);
+    }
+    {
+        // XPersistentLocalStorageGetPath(size, path, used): a /userdata overlay directory.
+        const uint64_t pls = fx.query(kPlsProvider, kPlsIid);
+        const uint64_t path = fx.alloc(256);
+        const uint64_t used = fx.alloc(8);
+        CHECK(hr32(fx.vcall(pls, 4, {256, path, 0})) == 0);
+        char text[64] = {};
+        CHECK(com::read_guest(path, text, sizeof(text)));
+        CHECK(std::strcmp(text, "T:\\userdata\\pls\\") == 0);
+        playgta6::os::win32::UserdataEntry entry;
+        CHECK(playgta6::os::win32::userdata_stat("/userdata/pls", &entry) == 0 && entry.is_directory);
+        CHECK(hr32(fx.vcall(pls, 4, {4, path, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(load64(used) == std::strlen(text) + 1);
+    }
+    {
+        // {03f0fe74} slot 4 (XDisplayTryEnableHdrMode shape): Disabled, zeroed info.
+        const uint64_t hdr = fx.query(kHdrProvider, kHdrIid);
+        const uint64_t info = fx.alloc(12);
+        const float ones[3] = {1.0f, 1.0f, 1.0f};
+        CHECK(com::write_guest(info, ones, sizeof(ones)));
+        CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, info})) == 2);
+        float back[3] = {};
+        CHECK(com::read_guest(info, back, sizeof(back)));
+        CHECK(back[0] == 0.0f && back[1] == 0.0f && back[2] == 0.0f);
+        CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
+    }
     const uint64_t system = fx.query(kSystemProvider, kSystemIid);
     const uint64_t buffer = fx.alloc(64);
     const uint64_t used = fx.alloc(8);
