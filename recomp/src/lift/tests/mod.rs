@@ -5,6 +5,7 @@
 
 mod exec;
 mod exec_integer;
+mod exec_native;
 mod exec_simd;
 mod exec_unwind;
 #[cfg(target_arch = "x86_64")]

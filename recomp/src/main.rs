@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use playgta6_recomp::discover::discover;
 use playgta6_recomp::image::{self, ExecutableBytes, ImageOptions};
+use playgta6_recomp::lift::target::LiftTarget;
 use playgta6_recomp::pe;
 use playgta6_recomp::pipeline::{self, PipelineOptions};
 use playgta6_recomp::stubs;
@@ -63,6 +64,7 @@ struct BuildArgs {
     jobs: Option<usize>,
     shard_size: Option<usize>,
     shard_instructions: Option<usize>,
+    codegen: LiftTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +94,7 @@ fn print_usage() {
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
     eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
     eprintln!(
-        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]"
+        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>]"
     );
     eprintln!("{}", program_cmd::USAGE);
     eprintln!();
@@ -114,12 +116,14 @@ fn print_usage() {
     eprintln!("                         report.txt and build-manifest.json (game-derived; gitignored work/ or outside the repo)");
     eprintln!("  --from-env             build: use the single top-level .exe of GTA6_GAME_DIR");
     eprintln!("  --module <name>        build: module name ([A-Za-z0-9_]): outputs go to <dir>/<name>/, table symbols get _<name> (default {})", pipeline::DEFAULT_MODULE);
-    eprintln!("  --shims <header>...    build: runtime shim headers (default: runtime/os/*.h + runtime/gpu/d3d12_xs.h of this checkout)");
+    eprintln!("  --shims <header>...    build: runtime shim headers (default: runtime/os/*.h + runtime/gpu/d3d12_xs.h + runtime/guest/guest_callbacks.h of this checkout)");
     eprintln!("  --entry <va>           build: extra function entry point (hex VA), repeatable");
     eprintln!("  --emit-obj             build: also compile every shard and the registration table to wasm64 objects");
     eprintln!("  --jobs N               build: worker threads for lifting/compiling (default: CPU count; output is identical)");
     eprintln!("  --shard-size N         build: maximum functions per lifted shard (default {})", pipeline::DEFAULT_SHARD_SIZE);
     eprintln!("  --shard-instructions N build: maximum instructions per lifted shard (default {})", pipeline::DEFAULT_SHARD_INSTRUCTIONS);
+    eprintln!("  --target <t>           build: wasm64 (default), native (this host's x86-64 triple) or native:<triple>");
+    eprintln!("  --target-cpu <cpu>     build: LLVM CPU of a native target (default {})", playgta6_recomp::lift::target::NATIVE_DEFAULT_CPU);
     for line in program_cmd::OPTIONS {
         eprintln!("{line}");
     }
@@ -163,6 +167,8 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
     let mut jobs = None;
     let mut shard_size = None;
     let mut shard_instructions = None;
+    let mut target_spec: Option<String> = None;
+    let mut target_cpu: Option<String> = None;
 
     let count = |flag: &str, value: Option<&String>| -> Result<usize, String> {
         value
@@ -227,6 +233,18 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 shard_instructions = Some(count("--shard-instructions", args.get(i))?);
             }
+            "--target" | "--target-cpu" => {
+                let flag = args[i].clone();
+                i += 1;
+                let Some(value) = args.get(i).filter(|v| !v.starts_with('-')) else {
+                    return Err(format!("{flag} requires a value"));
+                };
+                if flag == "--target" {
+                    target_spec = Some(value.clone());
+                } else {
+                    target_cpu = Some(value.clone());
+                }
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{flag}' for 'build'"));
             }
@@ -254,6 +272,13 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
         "missing --out <dir> (build outputs are derived from game code; use the gitignored work/)"
             .to_string()
     })?;
+    let codegen = LiftTarget::parse(
+        target_spec.as_deref().unwrap_or("wasm64"),
+        target_cpu.as_deref(),
+    )?;
+    if target_cpu.is_some() && !codegen.is_native() {
+        return Err("--target-cpu needs --target native".to_string());
+    }
     Ok(Command::Build(BuildArgs {
         target,
         out_dir,
@@ -264,6 +289,7 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
         jobs,
         shard_size,
         shard_instructions,
+        codegen,
     }))
 }
 
@@ -836,6 +862,7 @@ fn run_build(args: &BuildArgs) -> Result<String, String> {
     }
     options.extra_entries = args.entries.clone();
     options.emit_obj = args.emit_obj;
+    options.target = args.codegen.clone();
     if let Some(jobs) = args.jobs {
         options.jobs = jobs;
     }
@@ -1258,6 +1285,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 jobs: Some(8),
                 shard_size: Some(512),
                 shard_instructions: Some(1000),
+                codegen: LiftTarget::Wasm64,
             }))
         );
         assert_eq!(
@@ -1272,6 +1300,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 jobs: None,
                 shard_size: None,
                 shard_instructions: None,
+                codegen: LiftTarget::Wasm64,
             }))
         );
         assert!(parse_cli(&vec_s(&["build", "game.exe"])).is_err(), "--out is required");
@@ -1283,6 +1312,22 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--entry", "zz"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--bogus"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--module", "a/b"])).is_err());
+        match parse_cli(&vec_s(&[
+            "build", "a.exe", "--out", "w", "--target", "native:x86_64-unknown-linux-gnu",
+            "--target-cpu", "znver2",
+        ])) {
+            Ok(Command::Build(args)) => assert_eq!(
+                args.codegen,
+                LiftTarget::Native {
+                    triple: "x86_64-unknown-linux-gnu".to_string(),
+                    cpu: "znver2".to_string()
+                }
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--target", "arm"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--target-cpu", "x"])).is_err());
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--target"])).is_err());
     }
 
     #[test]
@@ -1312,6 +1357,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
             jobs: Some(2),
             shard_size: None,
             shard_instructions: None,
+            codegen: LiftTarget::Wasm64,
         })
         .expect("run_build should succeed");
         assert!(report.starts_with("playgta6-recomp build report: module main\n"), "{report}");

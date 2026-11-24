@@ -183,6 +183,7 @@
 //! The lifter never panics on arbitrary decoded input.
 
 pub mod compile;
+pub mod target;
 mod function;
 
 use std::collections::BTreeSet;

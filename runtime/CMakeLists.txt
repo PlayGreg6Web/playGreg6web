@@ -188,6 +188,10 @@ else()
     target_link_libraries(test_cpu_helpers PRIVATE playgta6_core)
     add_test(NAME playgta6_cpu_helpers_tests COMMAND test_cpu_helpers)
 
+    # Native first-boot harness without lifted code (tools/build_native_boot.py links the full one).
+    add_executable(playgta6_boot guest/boot_main.cpp)
+    target_link_libraries(playgta6_boot PRIVATE playgta6_core)
+
     add_executable(test_guest_boot ../tests/test_guest_boot.cpp)
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_boot_tests COMMAND test_guest_boot)

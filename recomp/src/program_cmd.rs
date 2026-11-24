@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use playgta6_recomp::lift::target::LiftTarget;
 use playgta6_recomp::pipeline::{self, program};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,11 +25,14 @@ pub struct ProgramArgs {
     pub jobs: Option<usize>,
     pub shard_size: Option<usize>,
     pub shard_instructions: Option<usize>,
+    /// Code-generation target of every module (`--target`, `--target-cpu`).
+    pub codegen: LiftTarget,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>]";
 
 pub const OPTIONS: &[&str] = &[
+    "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
     "  --dll <file>           build-program: offer a DLL as a guest module (used when the program imports it)",
     "  --dll-dir <dir>        build-program: offer every *.dll in <dir>",
     "  --guest-dll <name>     build-program: build <name> as a guest module even if host-only by default or unreferenced",
@@ -57,6 +61,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         jobs: None,
         shard_size: None,
         shard_instructions: None,
+        codegen: LiftTarget::Wasm64,
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -70,6 +75,8 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
             .filter(|&n| n > 0)
             .ok_or_else(|| format!("{flag} requires a positive integer"))
     };
+    let mut target_spec: Option<String> = None;
+    let mut target_cpu: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
@@ -147,6 +154,14 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
                 i += 1;
                 parsed.shard_instructions = Some(count(i, flag)?);
             }
+            "--target" => {
+                i += 1;
+                target_spec = Some(value(i, flag, "<target>")?);
+            }
+            "--target-cpu" => {
+                i += 1;
+                target_cpu = Some(value(i, flag, "<cpu>")?);
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}' for 'build-program'"));
             }
@@ -160,6 +175,10 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
             }
         }
         i += 1;
+    }
+    parsed.codegen = LiftTarget::parse(target_spec.as_deref().unwrap_or("wasm64"), target_cpu.as_deref())?;
+    if target_cpu.is_some() && !parsed.codegen.is_native() {
+        return Err("--target-cpu needs --target native".to_string());
     }
     parsed.exe = exe.ok_or("missing input executable path")?;
     parsed.out_dir = out_dir.ok_or(
@@ -199,6 +218,7 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
         build.shim_headers = args.shims.clone();
     }
     build.emit_obj = args.emit_obj;
+    build.target = args.codegen.clone();
     if let Some(jobs) = args.jobs {
         build.jobs = jobs;
     }
@@ -279,6 +299,33 @@ mod tests {
         assert!(parse_program_args(&args(&["a.exe", "--out", "x", "--bind", "nope"])).is_err());
         assert!(
             parse_program_args(&args(&["a.exe", "--out", "x", "--bind", "a!b=sideways"])).is_err()
+        );
+        assert_eq!(parsed.codegen, LiftTarget::Wasm64);
+    }
+
+    #[test]
+    fn parses_the_codegen_target() {
+        let parsed = parse_program_args(&args(&[
+            "game.exe",
+            "--out",
+            "w",
+            "--target",
+            "native:x86_64-pc-windows-msvc",
+            "--target-cpu",
+            "znver2",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed.codegen,
+            LiftTarget::Native {
+                triple: "x86_64-pc-windows-msvc".to_string(),
+                cpu: "znver2".to_string()
+            }
+        );
+        assert!(parse_program_args(&args(&["a.exe", "--out", "x", "--target", "arm"])).is_err());
+        assert!(
+            parse_program_args(&args(&["a.exe", "--out", "x", "--target-cpu", "znver2"])).is_err()
         );
     }
 }

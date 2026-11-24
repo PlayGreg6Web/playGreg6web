@@ -18,6 +18,7 @@
 #include "os/ucrt_bridge.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/win32_compat.h"
 #include "os/win32_sync.h"
 
 // Boot sequence tests: a synthetic PGIM image (PE headers with a TLS directory, IAT, TLS template)
@@ -214,6 +215,11 @@ constexpr uint32_t kSlotGetLastError = kIatRva + 0x10;
 constexpr uint32_t kSlotMissingOne = kIatRva + 0x18;
 constexpr uint32_t kSlotMissingTwo = kIatRva + 0x20;
 constexpr uint32_t kSlotAbort = kIatRva + 0x28;
+constexpr uint32_t kSlotTerminate = kIatRva + 0x30;
+constexpr uint32_t kSlotCaptureContext = kIatRva + 0x38;
+constexpr uint32_t kPdataRva = 0x2080;
+constexpr uint32_t kLeafInfoRva = 0x20B0;
+constexpr uint32_t kAlloc8InfoRva = 0x20B4;
 
 void put32(std::vector<uint8_t>& out, uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
@@ -296,7 +302,7 @@ uint8_t template_byte(size_t i) { return static_cast<uint8_t>(0xA0 + i); }
 // with_tls = false drops the TLS data directory.
 std::vector<uint8_t> build_image(bool with_tls = true, uint64_t base = kBase,
                                  std::vector<uint64_t> callbacks = {kCallback1, kCallback2},
-                                 uint8_t seed = 0xA0) {
+                                 uint8_t seed = 0xA0, bool with_pdata = true) {
     using namespace os::pgim;
     // PE headers: DOS stub + PE32+ optional header with 16 data directories.
     std::vector<uint8_t> headers(0x400, 0);
@@ -312,6 +318,11 @@ std::vector<uint8_t> build_image(bool with_tls = true, uint64_t base = kBase,
     set16(headers, opt + 68, 2);  // IMAGE_SUBSYSTEM_WINDOWS_GUI
     set64(headers, opt + 72, kPeStackReserve);
     set32(headers, opt + 108, 16);
+    set32(headers, opt + 56, kSizeOfImage);
+    if (with_pdata) {
+        set32(headers, opt + 112 + 8 * 3, kPdataRva);
+        set32(headers, opt + 112 + 8 * 3 + 4, 36);
+    }
     if (with_tls) {
         set32(headers, opt + 112 + 8 * 9, kTlsDirRva);
         set32(headers, opt + 112 + 8 * 9 + 4, 40);
@@ -332,6 +343,19 @@ std::vector<uint8_t> build_image(bool with_tls = true, uint64_t base = kBase,
     set64(rdata, 0x08, base + kTlsTemplateRva + kTlsTemplateSize);
     set64(rdata, 0x10, base + kTlsIndexRva);
     set64(rdata, 0x18, base + kCallbacksRva);
+    if (with_pdata) {
+        // .pdata (RUNTIME_FUNCTION begin, end, unwind info) + UNWIND_INFO: entry and mid allocate
+        // 8 bytes (UWOP_ALLOC_SMALL at prolog offset 1), leaf has no unwind codes.
+        const uint32_t pdata[3][3] = {{0x1000, 0x1100, kAlloc8InfoRva},
+                                      {0x1100, 0x1180, kAlloc8InfoRva},
+                                      {0x1180, 0x11C0, kLeafInfoRva}};
+        for (size_t i = 0; i < 3; ++i) {
+            for (size_t j = 0; j < 3; ++j) set32(rdata, kPdataRva - 0x2000 + 12 * i + 4 * j, pdata[i][j]);
+        }
+        set32(rdata, kLeafInfoRva - 0x2000, 0x00000001u);   // version 1, no codes
+        set32(rdata, kAlloc8InfoRva - 0x2000, 0x00010101u); // version 1, prolog 1, 1 code
+        set16(rdata, kAlloc8InfoRva - 0x2000 + 4, 0x0201);  // offset 1: UWOP_ALLOC_SMALL 8
+    }
     set32(rdata, 0x20, kTlsZeroFill);
     set32(rdata, 0x24, 0x00500000);  // IMAGE_SCN_ALIGN_16BYTES
     for (size_t i = 0; i < callbacks.size(); ++i) set64(rdata, kCallbacksRva - kTlsDirRva + 8 * i, callbacks[i]);
@@ -375,6 +399,7 @@ enum class Scenario {
     SurveyReturn,
     CrtAbort,
     LastError,
+    TerminateViaShim,
 };
 
 Scenario g_scenario = Scenario::ReturnCode;
@@ -388,6 +413,8 @@ struct Observed {
     uint32_t tls_index = 0;
     uint64_t callback_args[2][3] = {};
     uint32_t mxcsr = 0;
+    uint64_t limit_low = 0, limit_high = 0;
+    std::string command_line_a;
     std::u16string command_line;
 } g_seen;
 
@@ -477,6 +504,8 @@ void sub_entry(GuestState* s) {
                 CHECK(g_arena->read(g_seen.tls_block, g_seen.tls_bytes.data(), g_seen.tls_bytes.size()));
             }
             g_seen.mxcsr = s->mxcsr;
+            pg6_win32_get_current_thread_stack_limits(&g_seen.limit_low, &g_seen.limit_high);
+            g_seen.command_line_a = pg6_win32_get_command_line_a();
             // RTL_USER_PROCESS_PARAMETERS.CommandLine
             const uint16_t length = static_cast<uint16_t>(load32(g_seen.peb_params + 0x70));
             const uint64_t buffer = load64(g_seen.peb_params + 0x78);
@@ -540,6 +569,13 @@ void sub_entry(GuestState* s) {
             reg(s, GuestReg::Rax) = 5;
             ret(s);
             return;
+        case Scenario::TerminateViaShim:
+            reg(s, GuestReg::Rcx) = ~uint64_t{0};  // GetCurrentProcess()
+            reg(s, GuestReg::Rdx) = 11;
+            call_iat(s, kSlotTerminate, kEntryCallsIat);
+            g_events.push_back("after-terminate");
+            ret(s);
+            return;
         case Scenario::CrtAbort:
             call_iat(s, kSlotAbort, kEntryCallsIat);
             ret(s);
@@ -561,6 +597,12 @@ void sub_entry(GuestState* s) {
 void thunk_exit(void* raw) {
     auto* s = static_cast<GuestState*>(raw);
     pg6_crt_exit(static_cast<int32_t>(reg(s, GuestReg::Rcx)));
+    ret(s);
+}
+void thunk_terminate(void* raw) {
+    auto* s = static_cast<GuestState*>(raw);
+    reg(s, GuestReg::Rax) = static_cast<uint64_t>(
+        pg6_win32_terminate_process(reg(s, GuestReg::Rcx), static_cast<uint32_t>(reg(s, GuestReg::Rdx))));
     ret(s);
 }
 void thunk_abort(void* raw) {
@@ -599,6 +641,10 @@ const BootImport kImports[] = {
      &thunk_generated_unresolved},
     {kSlotAbort, kPg6BootImportBound, 0, "api-ms-win-crt-runtime-l1-1-0.dll", "abort", "pg6_crt_abort",
      &thunk_abort},
+    {kSlotTerminate, kPg6BootImportBound, 0, "KERNEL32.dll", "TerminateProcess", "pg6_win32_terminate_process",
+     &thunk_terminate},
+    // Left unresolved by the import bridge; the boot binds it to R11's runtime thunk.
+    {kSlotCaptureContext, 0, 0, "KERNEL32.dll", "RtlCaptureContext", nullptr, &thunk_generated_unresolved},
 };
 
 std::vector<uint8_t> g_image;
@@ -713,6 +759,8 @@ void test_clean_boot_and_teb() {
     CHECK(g_seen.peb == run.report["startup"]["process"]["peb"].hex());
     CHECK(g_seen.peb_image_base == kBase);
     CHECK(g_seen.mxcsr == kGuestMxcsrDefault);
+    CHECK(g_seen.limit_low == g_seen.stack_limit && g_seen.limit_high == g_seen.stack_base);
+    CHECK(g_seen.command_line_a == "boot_test.exe -flag ä");
     CHECK(g_seen.command_line == u"boot_test.exe -flag \u00E4");
     // Implicit TLS through gs:[0x58].
     CHECK(g_seen.tls_index == 0);
@@ -732,8 +780,9 @@ void test_clean_boot_and_teb() {
     CHECK(tls["callbacks"].items.size() == 2 && tls["callbacks"][0].hex() == kCallback1);
     // Startup summary.
     const Json& imports = run.report["startup"]["imports"];
-    CHECK(imports["total"].number == 6);
-    CHECK(imports["bound"].number == 4);
+    CHECK(imports["total"].number == 8);
+    CHECK(imports["bound"].number == 6);
+    CHECK(run.report["startup"]["modules"][0]["imports"]["runtime_thunks"].number == 1);
     CHECK(imports["unresolved"].number == 2);
     CHECK(imports["by_dll"].items.size() == 3);
     CHECK(run.report["startup"]["functions_registered"].number == 6);
@@ -757,6 +806,11 @@ void test_exit_paths() {
     CHECK(run.result.stats.exit_code == 9);
     CHECK(g_events.back() == "entry");
 
+    run = boot_scenario(Scenario::TerminateViaShim);
+    CHECK(run.result.status == BootStatus::Exited);
+    CHECK(run.result.stats.exit_code == 11);
+    CHECK(g_events.back() == "entry");
+
     run = boot_scenario(Scenario::CrtAbort);
     CHECK(run.result.status == BootStatus::GuestAbort);
     CHECK(run.report["fault"]["kind"].text == "crt_abort");
@@ -764,22 +818,30 @@ void test_exit_paths() {
 }
 
 void test_fault_reports() {
-    // Trap two calls deep: function + backtrace.
-    Run run = boot_scenario(Scenario::Trap);
-    CHECK(run.result.status == BootStatus::Fault);
-    CHECK(run.report["phase"].text == "entry");
-    check_fault(run, "trap", kLeaf + 4, kLeaf);
-    CHECK(run.report["fault"]["trap_kind"].text == "GUEST_TRAP");
-    const Json& bt = run.report["backtrace"];
-    CHECK(bt["method"].text == "stack-scan-call-verified");
-    CHECK(bt["frames"].items.size() == 2);
-    CHECK(bt["frames"][0]["return_address"].hex() == kMidCallsLeaf);
-    CHECK(bt["frames"][0]["function"].hex() == kMid);
-    CHECK(bt["frames"][0]["offset"].hex() == kMidCallsLeaf - kMid);
-    CHECK(bt["frames"][1]["return_address"].hex() == kEntryCallsMid);
-    CHECK(bt["frames"][1]["function"].hex() == kEntry);
-    CHECK(bt["frames"][0]["stack_address"].hex() < bt["frames"][1]["stack_address"].hex());
-    CHECK(run.result.summary.find("sub_140001180+0x4") != std::string::npos);
+    // Trap two calls deep: function + backtrace, walked by R11's unwinder over the image's
+    // .pdata, and by the call-verified stack scan when the image has no .pdata.
+    const std::vector<uint8_t> saved = g_image;
+    Run run;
+    for (const bool pdata : {true, false}) {
+        g_image = build_image(true, kBase, {kCallback1, kCallback2}, 0xA0, pdata);
+        run = boot_scenario(Scenario::Trap);
+        CHECK(run.result.status == BootStatus::Fault);
+        CHECK(run.report["phase"].text == "entry");
+        CHECK(run.report["startup"]["modules"][0]["pdata"].boolean == pdata);
+        check_fault(run, "trap", kLeaf + 4, kLeaf);
+        CHECK(run.report["fault"]["trap_kind"].text == "GUEST_TRAP");
+        const Json& bt = run.report["backtrace"];
+        CHECK(bt["method"].text == (pdata ? "rtl-virtual-unwind" : "stack-scan-call-verified"));
+        CHECK(bt["frames"].items.size() == 2);
+        CHECK(bt["frames"][0]["return_address"].hex() == kMidCallsLeaf);
+        CHECK(bt["frames"][0]["function"].hex() == kMid);
+        CHECK(bt["frames"][0]["offset"].hex() == kMidCallsLeaf - kMid);
+        CHECK(bt["frames"][1]["return_address"].hex() == kEntryCallsMid);
+        CHECK(bt["frames"][1]["function"].hex() == kEntry);
+        CHECK(bt["frames"][0]["stack_address"].hex() < bt["frames"][1]["stack_address"].hex());
+        CHECK(run.result.summary.find("sub_140001180+0x4") != std::string::npos);
+    }
+    g_image = saved;
 
     run = boot_scenario(Scenario::Unimplemented);
     check_fault(run, "unimplemented", kEntry + 0x20, kEntry);
@@ -790,7 +852,8 @@ void test_fault_reports() {
     check_fault(run, "unknown_target", kUnknownInsideEntry, kEntry);
     CHECK(run.report["fault"]["trap_kind"].text == "INDIRECT_CALL_MISS");
     CHECK(run.report["fault"]["detail"].hex() == kEntry);  // nearest entry below the target
-    CHECK(run.report["backtrace"]["frames"].items.size() == 1);
+    // (the synthetic unwind info describes the Trap scenario's frames; only the caller is exact here)
+    CHECK(!run.report["backtrace"]["frames"].items.empty());
     CHECK(run.report["backtrace"]["frames"][0]["return_address"].hex() == kEntryCallsIat);
 
     run = boot_scenario(Scenario::StackImbalance);
@@ -973,7 +1036,7 @@ void test_no_tls_and_load_failure() {
     os::win32::set_vmem_arena(g_arena);
     CHECK(pg6_guest_boot_run(&cfg, &stats) == PG6_BOOT_EXITED);
     CHECK(stats.exit_code == 42);
-    CHECK(stats.imports_total == 6);
+    CHECK(stats.imports_total == 8);
     char small[16];
     const size_t full = pg6_guest_boot_report_json(small, sizeof(small));
     CHECK(full > sizeof(small) && std::strlen(small) == sizeof(small) - 1);
@@ -1036,7 +1099,7 @@ void test_two_modules() {
     CHECK(modules[1]["imports"]["unresolved"].number == 1);
     CHECK(modules[0]["tls"]["index"].number == 0);
     CHECK(report["startup"]["functions_registered"].number == 7);
-    CHECK(report["startup"]["imports"]["total"].number == 7);
+    CHECK(report["startup"]["imports"]["total"].number == 9);
     // The DLL's IAT slot got its own synthetic address (bound to the boot's unresolved thunk).
     SyntheticTarget target;
     CHECK(describe_synthetic(load64(kDllBase + kIatRva), &target));

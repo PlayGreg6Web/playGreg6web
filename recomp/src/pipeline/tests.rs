@@ -13,7 +13,7 @@ use super::refine::{PointerSource, PointerStatus};
 use super::*;
 use crate::cfg::Terminator;
 use crate::discover::discover;
-use crate::lift::compile::{find_on_path, rustc_tool_dir};
+use crate::lift::compile::{compile_to_wasm64_object, find_on_path, rustc_tool_dir};
 
 const BASE: u64 = 0x1_4000_0000;
 const RDATA: u32 = 0x1000;
@@ -677,6 +677,57 @@ fn outputs_are_identical_across_runs_and_job_counts() {
     assert_eq!(trees[0].len(), 10 + 9);
     assert_eq!(trees[0], trees[1], "jobs 1 vs 8");
     assert_eq!(trees[1], trees[2], "repeated run");
+}
+
+#[test]
+fn native_target_changes_only_the_target_lines() {
+    let tmp = TempDir::new("target");
+    let pe = chain_fixture(300, true);
+    let build = |name: &str, target: Option<LiftTarget>| {
+        let mut options = options_for(tmp.path(), &pe);
+        options.out_dir = tmp.path().join(name);
+        options.shard_size = 64;
+        if let Some(target) = target {
+            options.target = target;
+        }
+        run(&options).expect("build succeeds");
+        read_tree(&options.module_dir())
+    };
+    let default = build("default", None);
+    let explicit = build("wasm64", Some(LiftTarget::Wasm64));
+    assert_eq!(default, explicit, "the default target is wasm64 and changes nothing");
+    let manifest = String::from_utf8(default[MANIFEST_FILE].clone()).expect("utf-8");
+    assert!(!manifest.contains("\"target\""), "wasm64 manifests keep their key set");
+    for (path, bytes) in &default {
+        if path.ends_with(".ll") {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(text.contains(&format!("target triple = \"{}\"", lift::WASM64_TRIPLE)));
+            assert!(text.contains(&format!("target datalayout = \"{WASM64_DATALAYOUT}\"")));
+        }
+    }
+
+    let native = LiftTarget::parse("native:x86_64-unknown-linux-gnu", None).expect("target");
+    let retargeted = build("native", Some(native.clone()));
+    assert_eq!(
+        default.keys().collect::<Vec<_>>(),
+        retargeted.keys().collect::<Vec<_>>()
+    );
+    for (path, bytes) in &default {
+        let other = &retargeted[path];
+        if path.ends_with(".ll") {
+            let wasm = String::from_utf8(bytes.clone()).expect("utf-8");
+            assert_eq!(
+                String::from_utf8(other.clone()).expect("utf-8"),
+                native.retarget(wasm),
+                "{path}: only the target lines differ"
+            );
+        } else if path != MANIFEST_FILE && path != REPORT_FILE {
+            assert_eq!(bytes, other, "{path} does not depend on the target");
+        }
+    }
+    let manifest = String::from_utf8(retargeted[MANIFEST_FILE].clone()).expect("utf-8");
+    assert!(manifest.contains("\"target\": \"native:x86_64-unknown-linux-gnu\""), "{manifest}");
+    assert!(manifest.contains("\"target_cpu\": \"x86-64-v3\""));
 }
 
 #[test]

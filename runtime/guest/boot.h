@@ -70,12 +70,21 @@
 // gs_base and mxcsr, a guest backtrace, counters (indirect dispatches, import calls by name with
 // counts, the last `recent_import_count` imports in order) and the startup summary.
 //
-// Guest backtrace: there is no unwinder on main yet (R11), so the boot scans the guest stack from
-// rsp to the stack top and reports every 8-byte word that is the address right after a `call`
-// instruction inside a registered lifted function ("stack-scan-call-verified": the bytes before
-// it decode as `call rel32` or `call r/m64`). When the image's executable bytes are omitted the
-// call check is impossible and the method is "stack-scan-unverified". A scan can report stale
-// return addresses left in dead stack slots; it never misses a live frame below the stack top.
+// Guest backtrace: each loaded image's .pdata is registered with R11's unwinder
+// (guest_exceptions.h, register_image_from_headers), and the backtrace walks the guest stack with
+// RtlVirtualUnwind from the fault ("rtl-virtual-unwind", or "rtl-virtual-unwind-partial" when the
+// walk stops before call_guest's return sentinel). For code without .pdata the boot scans the
+// guest stack from rsp to the stack top and reports every 8-byte word that is the address right
+// after a `call` instruction inside a registered lifted function ("stack-scan-call-verified": the
+// bytes before it decode as `call rel32` or `call r/m64`; "stack-scan-unverified" when the
+// image's executable bytes are omitted). A scan can report stale return addresses left in dead
+// stack slots; it never misses a live frame below the stack top.
+//
+// Runtime services wired by the boot: register_all_shim_exports (O7/O11, incl. the O16
+// xgameruntime.dll provider), R11's exception exports (imports the bridge left unresolved but R11
+// implements as runtime thunks - RaiseException, RtlVirtualUnwind, ... - are bound to them), the
+// guest command line (GetCommandLineA/W), GetCurrentThreadStackLimits = the guest stack, O15's
+// TerminateProcess exit handler, and O16's guest memory (= the boot's arena).
 // Optionally (BootConfig::capture_host_stack) host return addresses are mapped back to lifted
 // functions too ("host_frames"): with native lifted code every guest call is a host call, so
 // this chain is exact up to inlining.
@@ -86,8 +95,8 @@
 //
 // Survey mode (diagnostic, UNSAFE)
 // --------------------------------
-// BootConfig::survey makes calls to unresolved imports log once, return 0 in rax, pop the return
-// address and continue, so one run lists many missing imports in the order they are first called
+// BootConfig::survey makes calls to unresolved imports log once, return
+// BootConfig::survey_return (default 0) in rax, pop the return address and continue, so one run lists many missing imports in the order they are first called
 // (report "survey.unresolved_called"). The guest then runs on made-up results: everything after
 // the first unresolved call is suspect. Off by default. Bound the run with max_dispatches and/or
 // max_wall_ms (checked on every indirect dispatch; a loop without calls is not interrupted - the
@@ -363,6 +372,7 @@ const char* boot_status_name(BootStatus status);
 
 // Captures host return addresses of the calling thread (innermost first). Returns the count.
 using CaptureHostStackFn = size_t (*)(void** frames, size_t max_frames);
+using HostFunctionStartFn = uint64_t (*)(uint64_t host_pc);
 
 struct BootModule {
     os::pgim::ImageReader* image = nullptr;  // required
@@ -387,11 +397,15 @@ struct BootConfig {
     bool run_tls_callbacks = true;
     bool call_entry = true;
     bool survey = false;            // see "Survey mode" above
+    uint64_t survey_return = 0;     // rax returned by unresolved imports in survey mode
     uint64_t max_dispatches = 0;    // 0 = unbounded
     uint64_t max_wall_ms = 0;       // 0 = unbounded
     size_t recent_import_count = 32;
     size_t max_backtrace_frames = 32;
     CaptureHostStackFn capture_host_stack = nullptr;
+    // Start address of the host function containing a code address (0 if unknown), e.g. from the
+    // host's unwind tables; makes host-frame -> lifted-function mapping exact.
+    HostFunctionStartFn host_function_start = nullptr;
     bool log_progress = true;       // phase lines through os::log
     // Runs once every image is mapped, its lifted tables are registered and its IAT slots are
     // bound, before the process block is created (R12's program loader registers the guest DLLs,

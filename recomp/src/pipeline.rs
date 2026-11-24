@@ -132,7 +132,8 @@ use crate::code_image::CodeImage;
 use crate::discover::Analysis;
 use crate::eh::EhMetadata;
 use crate::image::{self, ImageBuild, ImageDiagnostic, ImageError, ImageOptions};
-use crate::lift::compile::{LlvmTool, compile_to_wasm64_object, find_llvm_tool};
+use crate::lift::compile::{LlvmTool, compile_to_object, find_llvm_tool};
+use crate::lift::target::LiftTarget;
 use crate::lift::{self, LiftError, WASM64_DATALAYOUT, WASM64_TRIPLE, function_symbol};
 use crate::pdata::ExceptionDirectory;
 use crate::pe::Pe64;
@@ -239,6 +240,9 @@ pub struct PipelineOptions {
     /// Maximum instructions per shard (a larger function gets a shard of its own).
     pub shard_instructions: usize,
     pub image: ImageOptions,
+    /// Code-generation target of the `.ll`/`.o` outputs ([`LiftTarget::Wasm64`] by default; the
+    /// IR differs only in the lines [`LiftTarget::retarget`] rewrites).
+    pub target: LiftTarget,
 }
 
 impl PipelineOptions {
@@ -257,6 +261,7 @@ impl PipelineOptions {
             shard_size: DEFAULT_SHARD_SIZE,
             shard_instructions: DEFAULT_SHARD_INSTRUCTIONS,
             image: ImageOptions::default(),
+            target: LiftTarget::Wasm64,
         }
     }
 
@@ -576,6 +581,19 @@ pub fn lift_shards(
     tool: Option<&LlvmTool>,
     jobs: usize,
 ) -> Result<Vec<ShardRecord>, PipelineError> {
+    lift_shards_for(&LiftTarget::Wasm64, functions, shards, out_dir, tool, jobs)
+}
+
+/// [`lift_shards`] for a given code-generation target (shard text rewritten by
+/// [`LiftTarget::retarget`], objects compiled for that target).
+pub fn lift_shards_for(
+    target: &LiftTarget,
+    functions: &[&Function],
+    shards: &[Range<usize>],
+    out_dir: &Path,
+    tool: Option<&LlvmTool>,
+    jobs: usize,
+) -> Result<Vec<ShardRecord>, PipelineError> {
     let lift_dir = out_dir.join(LIFT_DIR);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -588,7 +606,8 @@ pub fn lift_shards(
                     let Some(range) = shards.get(index) else {
                         break;
                     };
-                    let result = lift_shard(index, &functions[range.clone()], &lift_dir, tool);
+                    let result =
+                        lift_shard(target, index, &functions[range.clone()], &lift_dir, tool);
                     if result.is_err() {
                         failed.store(true, Ordering::Relaxed);
                     }
@@ -606,6 +625,7 @@ pub fn lift_shards(
 }
 
 fn lift_shard(
+    target: &LiftTarget,
     index: usize,
     functions: &[&Function],
     lift_dir: &Path,
@@ -626,7 +646,7 @@ fn lift_shard(
     for u in lifted.iter().flat_map(|f| f.unsupported.iter()) {
         *unsupported.entry(u.mnemonic.clone()).or_insert(0) += 1;
     }
-    let ir = lift::emit_module(&lifted).map_err(|error| PipelineError::Lift {
+    let ir = lift::emit_module(&lifted).map(|ir| target.retarget(ir)).map_err(|error| PipelineError::Lift {
         entry: lifted.first().map_or(0, |f| f.entry),
         error,
     })?;
@@ -642,7 +662,7 @@ fn lift_shard(
     };
     drop(ir);
     let obj = tool
-        .map(|tool| compile(tool, lift_dir, &ll_name, &shard_file_name(index, "o")))
+        .map(|tool| compile(tool, target, lift_dir, &ll_name, &shard_file_name(index, "o")))
         .transpose()?;
     Ok(ShardRecord {
         index,
@@ -659,12 +679,13 @@ fn lift_shard(
 /// Compiles `lift_dir/ll_name` to `lift_dir/obj_name` and records the object.
 fn compile(
     tool: &LlvmTool,
+    target: &LiftTarget,
     lift_dir: &Path,
     ll_name: &str,
     obj_name: &str,
 ) -> Result<OutputFile, PipelineError> {
     let obj_path = lift_dir.join(obj_name);
-    compile_to_wasm64_object(tool, &lift_dir.join(ll_name), &obj_path).map_err(|e| {
+    compile_to_object(tool, target, &lift_dir.join(ll_name), &obj_path).map_err(|e| {
         PipelineError::Compile {
             file: format!("{LIFT_DIR}/{ll_name}"),
             error: e.to_string(),
@@ -1058,6 +1079,7 @@ pub struct PipelineReport {
     pub extra_entries: Vec<u64>,
     pub emit_obj: bool,
     pub image_options: ImageOptions,
+    pub target: LiftTarget,
     /// Every output file except the manifest, sorted by path.
     pub files: Vec<OutputFile>,
     /// Entry VA of every lifted function (sorted; the registration table's entries).
@@ -1166,7 +1188,14 @@ pub fn run_module(
     let functions: Vec<&Function> = analysis.functions.values().collect();
     let weights: Vec<usize> = functions.iter().map(|f| f.instruction_count()).collect();
     let shard_ranges = plan_shards(&weights, options.shard_size, options.shard_instructions);
-    let shards = lift_shards(&functions, &shard_ranges, out, tool.as_ref(), options.jobs)?;
+    let shards = lift_shards_for(
+        &options.target,
+        &functions,
+        &shard_ranges,
+        out,
+        tool.as_ref(),
+        options.jobs,
+    )?;
     progress("lift");
     let entries: Vec<u64> = analysis.functions.keys().copied().collect();
     let registration_name = format!("{REGISTRATION_STEM}.ll");
@@ -1177,7 +1206,13 @@ pub fn run_module(
         let mut writer = BufWriter::new(file);
         write_registration_table(&options.module, &entries, &mut writer)
             .and_then(|()| writer.flush())
-            .map_err(io_error(context))?;
+            .map_err(io_error(context.clone()))?;
+        drop(writer);
+        if options.target.is_native() {
+            let text = fs::read_to_string(&registration_path).map_err(io_error(context.clone()))?;
+            fs::write(&registration_path, options.target.retarget(text))
+                .map_err(io_error(context))?;
+        }
     }
     let (size, hash) = hash_file(&registration_path)?;
     let registration_ll = OutputFile {
@@ -1190,6 +1225,7 @@ pub fn run_module(
         .map(|tool| {
             compile(
                 tool,
+                &options.target,
                 &out.join(LIFT_DIR),
                 &registration_name,
                 &format!("{REGISTRATION_STEM}.o"),
@@ -1293,6 +1329,7 @@ pub fn run_module(
         },
         emit_obj: options.emit_obj,
         image_options: options.image,
+        target: options.target.clone(),
         files: Vec::new(),
         function_entries: entries,
         report: String::new(),
@@ -1754,6 +1791,15 @@ pub fn render_manifest(r: &PipelineReport) -> String {
             Json::Str(r.image_options.executable_bytes.as_str().to_string()),
         ),
     ]);
+    // A native build records its target; wasm64 manifests stay exactly as before.
+    let options = match (&r.target, options) {
+        (LiftTarget::Native { triple, cpu }, Json::Obj(mut fields)) => {
+            fields.push(("target".to_string(), Json::Str(format!("native:{triple}"))));
+            fields.push(("target_cpu".to_string(), Json::Str(cpu.clone())));
+            Json::Obj(fields)
+        }
+        (_, options) => options,
+    };
     let image = obj([
         ("image_base", hex(r.image.image_base)),
         ("entry_point", hex(r.image.entry_point)),

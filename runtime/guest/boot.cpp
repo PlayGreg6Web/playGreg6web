@@ -16,7 +16,9 @@
 
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
+#include "guest/guest_exceptions.h"
 #include "os/os_shim.h"
+#include "os/shim_exports.h"
 #include "os/ucrt_bridge.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
@@ -107,6 +109,8 @@ struct ModuleState {
     uint64_t functions = 0;
     size_t import_count = 0;
     uint64_t imports_bound = 0;
+    uint64_t imports_runtime = 0;  // unresolved by the bridge, bound to runtime thunks (R11)
+    bool pdata = false;           // .pdata registered with the R11 unwinder
     uint64_t imports_unresolved = 0;
     TlsInfo tls;
 };
@@ -142,11 +146,13 @@ struct BootState {
 
     // Options.
     bool survey = false;
+    uint64_t survey_return = 0;
     uint64_t max_dispatches = 0;
     uint64_t max_wall_ms = 0;
     size_t recent_capacity = 32;
     size_t max_frames = 32;
     CaptureHostStackFn capture_host_stack = nullptr;
+    HostFunctionStartFn host_function_start = nullptr;
     bool log_progress = true;
     std::chrono::steady_clock::time_point start;
 
@@ -526,8 +532,83 @@ void capture_host_frames(FaultRecord& record) {
     }
 }
 
-// Fills the common parts of a fault record from a guest state.
-void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t detail) {
+// Walks the guest stack with R11's RtlVirtualUnwind over the images' .pdata (guest_exceptions.h).
+// `inside` = the fault is at `va` inside a function (the state's rsp is that function's rsp);
+// otherwise rsp points at the return address of a call (imports, dispatch targets). Records the
+// return addresses of the callers. Returns false (record untouched) when the first frame has no
+// unwind data, so the caller can fall back to the stack scan.
+bool unwind_backtrace(FaultRecord& record, const GuestState& state, uint64_t va, bool inside) {
+    BootState& b = boot();
+    VirtualMemoryArena& arena = *b.arena;
+    auto ctx = std::make_unique<GuestContext>();
+    std::memset(ctx.get(), 0, sizeof(*ctx));
+    std::memcpy(ctx->gpr, state.gpr, sizeof(ctx->gpr));
+    uint64_t stack_top = UINT64_MAX;
+    if (t_active != nullptr && state.gpr[GuestReg::Rsp] >= t_active->thread.stack_limit &&
+        state.gpr[GuestReg::Rsp] < t_active->thread.stack_top) {
+        stack_top = t_active->thread.stack_top;
+    }
+    std::vector<Frame> frames;
+    uint64_t pc = va;
+    if (!inside) {
+        uint64_t ret = 0;
+        if (!read_u64(arena, ctx->gpr[GuestReg::Rsp], ret)) {
+            return false;
+        }
+        frames.push_back(Frame{ctx->gpr[GuestReg::Rsp], ret, nearest_entry(ret)});
+        ctx->gpr[GuestReg::Rsp] += 8;
+        pc = ret;
+    }
+    if (pc_to_image_base(pc) == 0) {
+        return false;  // no registered .pdata for this code: the stack scan does better
+    }
+    bool complete = false;
+    for (size_t depth = 0; depth < 4 * b.max_frames && frames.size() < b.max_frames; ++depth) {
+        if (pc == kGuestReturnSentinel) {
+            complete = true;
+            break;
+        }
+        bool has_bytes = false;
+        if (!in_exec_range(pc, &has_bytes)) {
+            break;
+        }
+        uint64_t image_base = 0;
+        const uint64_t entry = lookup_function_entry(arena, pc, &image_base);
+        const uint64_t rsp_before = ctx->gpr[GuestReg::Rsp];
+        if (entry == 0) {
+            uint64_t ret = 0;  // leaf: the return address is at rsp
+            if (!read_u64(arena, rsp_before, ret)) {
+                break;
+            }
+            ctx->rip = ret;
+            ctx->gpr[GuestReg::Rsp] = rsp_before + 8;
+        } else {
+            ctx->rip = pc;
+            uint64_t handler_data = 0;
+            uint64_t establisher = 0;
+            bool ok = false;
+            virtual_unwind(arena, 0, image_base, pc, entry, *ctx, &handler_data, &establisher, nullptr, &ok);
+            if (!ok) {
+                break;
+            }
+        }
+        if (ctx->gpr[GuestReg::Rsp] <= rsp_before || ctx->gpr[GuestReg::Rsp] > stack_top) {
+            break;  // no progress or off the stack
+        }
+        pc = ctx->rip;
+        if (pc == kGuestReturnSentinel) {
+            complete = true;
+            break;
+        }
+        frames.push_back(Frame{ctx->gpr[GuestReg::Rsp] - 8, pc, nearest_entry(pc)});
+    }
+    record.frames = std::move(frames);
+    record.backtrace_method = complete ? "rtl-virtual-unwind" : "rtl-virtual-unwind-partial";
+    return true;
+}
+
+// Fills the common parts of a fault record from a guest state. `inside` as for unwind_backtrace.
+void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t detail, bool inside = false) {
     BootState& b = boot();
     FaultRecord& r = b.fault;
     r = FaultRecord{};
@@ -539,7 +620,9 @@ void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t de
     if (regs != nullptr) {
         r.has_registers = true;
         r.registers = *regs;
-        scan_backtrace(r, regs->gpr[GuestReg::Rsp]);
+        if (!unwind_backtrace(r, *regs, va, inside)) {
+            scan_backtrace(r, regs->gpr[GuestReg::Rsp]);
+        }
     }
     capture_host_frames(r);
 }
@@ -589,6 +672,8 @@ const char* fault_kind_id(FaultKind kind) {
             return "unwind_failed";
         case FaultKind::UnimplementedSlot:
             return "unimplemented_slot";
+        case FaultKind::GeneralProtection:
+            return "general_protection";
         default:
             break;
     }
@@ -601,7 +686,9 @@ void boot_fault_handler(const FaultInfo* info) {
         return;  // the default handler logs and aborts
     }
     const auto kind = static_cast<FaultKind>(info->kind);
-    capture_fault(fault_kind_id(kind), info->state, info->va, info->detail);
+    const bool inside = kind == FaultKind::Trap || kind == FaultKind::Unimplemented ||
+                        kind == FaultKind::DivideError;
+    capture_fault(fault_kind_id(kind), info->state, info->va, info->detail, inside);
     char message[256];
     std::snprintf(message, sizeof(message), "%s at 0x%016" PRIx64, fault_kind_name(kind), info->va);
     b.message = message;
@@ -680,10 +767,10 @@ void boot_unresolved_thunk(void* raw_state) {
         }
         if (first) {
             logf("[import] unresolved import %s called from 0x%016" PRIx64
-                 " (survey mode: returning 0)",
-                 import_label(b.imports[i].import).c_str(), return_address);
+                 " (survey mode: returning 0x%" PRIx64 ")",
+                 import_label(b.imports[i].import).c_str(), return_address, b.survey_return);
         }
-        state->gpr[GuestReg::Rax] = 0;
+        state->gpr[GuestReg::Rax] = b.survey_return;
         state->gpr[GuestReg::Rsp] += 8;  // like `ret`
         return;
     }
@@ -1063,6 +1150,16 @@ std::string hex(uint64_t v) {
     return buf;
 }
 
+// Guest VA of a host address inside the arena's guest address space, or 0.
+uint64_t host_to_guest(uint64_t host) {
+    const VirtualMemoryArena* arena = boot().arena;
+    if (arena == nullptr || !arena->valid()) {
+        return 0;
+    }
+    const uint64_t va = host - arena->guest_base();
+    return va >= arena->space_base() && va - arena->space_base() < arena->space_size() ? va : 0;
+}
+
 std::string hex_or_null(uint64_t v) {
     return v == 0 ? std::string("null") : hex(v);
 }
@@ -1162,7 +1259,9 @@ std::string build_report() {
         const char* trap_kind = w40_trap_kind(f.kind);
         o += "  \"fault\": {\"kind\": " + json_string(f.kind) + ", \"trap_kind\": " + json_cstr(trap_kind) +
              ", \"va\": " + hex(f.va) + ", \"detail\": " + hex(f.detail) +
-             ", \"function\": " + function_json(f.va) + ", \"import\": ";
+             ", \"function\": " + function_json(f.va) +
+             (f.kind == "unhandled_exception" ? ", \"exception_code\": " + hex(f.detail) : std::string()) +
+             ", \"import\": ";
         if (f.import_index >= 0) {
             const ImportRecord& rec = b.imports[static_cast<size_t>(f.import_index)];
             o += "{" + import_name_json(rec.import) + ", \"slot_rva\": " + hex(rec.import.slot_rva) +
@@ -1172,6 +1271,7 @@ std::string build_report() {
             o += "null";
         }
         o += ", \"host_address\": " + (f.has_host ? hex(f.host_address) : std::string("null"));
+        o += ", \"guest_address\": " + (f.has_host ? hex_or_null(host_to_guest(f.host_address)) : std::string("null"));
         o += ", \"host_pc\": " + (f.has_host ? hex(f.host_pc) : std::string("null"));
         o += "},\n";
     } else {
@@ -1270,7 +1370,9 @@ std::string build_report() {
              ", \"lifted_tables\": " + std::to_string(m.tables.size()) + ", \"functions\": " +
              std::to_string(m.functions) + ", \"imports\": {\"total\": " +
              std::to_string(m.import_count) + ", \"bound\": " + std::to_string(m.imports_bound) +
-             ", \"unresolved\": " + std::to_string(m.imports_unresolved) + "}, \"tls\": " + tls_json(m) + "}";
+             ", \"unresolved\": " + std::to_string(m.imports_unresolved) + ", \"runtime_thunks\": " +
+             std::to_string(m.imports_runtime) + "}, \"pdata\": " + (m.pdata ? "true" : "false") +
+             ", \"tls\": " + tls_json(m) + "}";
     }
     o += b.modules.empty() ? "],\n" : "\n  ],\n";
     o += "    \"lifted_tables\": " + std::to_string(b.tables.size()) +
@@ -1345,9 +1447,10 @@ std::string build_summary() {
         std::snprintf(line, sizeof(line),
                       "  module %s: image 0x%" PRIx64 " (0x%" PRIx64 " bytes), entry 0x%" PRIx64
                       ", %" PRIu64 " lifted functions, imports %zu (%" PRIu64 " bound, %" PRIu64
-                      " unresolved)\n",
+                      " of them to R11 runtime thunks, %" PRIu64 " unresolved), .pdata %s\n",
                       m.name.c_str(), m.image.base, m.image.size_of_image, m.image.entry_point,
-                      m.functions, m.import_count, m.imports_bound, m.imports_unresolved);
+                      m.functions, m.import_count, m.imports_bound, m.imports_runtime,
+                      m.imports_unresolved, m.pdata ? "registered" : "absent");
         s += line;
         if (m.tls.present) {
             std::snprintf(line, sizeof(line),
@@ -1489,6 +1592,23 @@ void fail_setup(BootStatus status, const std::string& message) {
     logf("guest boot: %s failed: %s", b.phase.c_str(), message.c_str());
 }
 
+// call_guest returns early while an R11 context restore propagates (GuestState::unwind_pending);
+// one still pending when a top-level boot call returns has no owner: stop with a report.
+void check_unowned_restore(GuestState& state) {
+    if (state.unwind_pending == 0) {
+        return;
+    }
+    BootState& b = boot();
+    capture_fault("unowned_restore", &state, state.resume_rip, state.gpr[GuestReg::Rsp]);
+    char message[160];
+    std::snprintf(message, sizeof(message),
+                  "a context restore to 0x%016" PRIx64 " was still pending when the guest call returned",
+                  state.resume_rip);
+    b.message = message;
+    b.status = BootStatus::Fault;
+    stop_boot();
+}
+
 // Runs the guest part (TLS callbacks + entry). Returns normally when the entry returned.
 void run_guest(const BootConfig& config) {
     BootState& b = boot();
@@ -1503,6 +1623,7 @@ void run_guest(const BootConfig& config) {
                      m.name.c_str());
                 call_guest_args(arena, main.thread.state, callback, m.image.base,
                                 uint64_t{win64::kDllProcessAttach}, uint64_t{0});
+                check_unowned_restore(main.thread.state);
                 ++m.tls.callbacks_run;
                 ++b.tls_callbacks_run;
             }
@@ -1534,6 +1655,7 @@ void run_guest(const BootConfig& config) {
     b.entry_started = true;
     milestone("ENTRY_CALL", "calling entry point 0x%016" PRIx64, exe.image.entry_point);
     const uint64_t rax = call_guest_args(arena, main.thread.state, exe.image.entry_point, b.peb);
+    check_unowned_restore(main.thread.state);
     // Returning from the entry point exits the process: run the guest exit handlers registered
     // so far (MSVC's startup code calls exit itself and never gets here).
     crt_exit::run_exit_cleanup(main.thread.state, crt_exit::ExitMode::Full);
@@ -1583,8 +1705,14 @@ uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset) {
         return 0;
     }
     --it;
-    // Lifted functions are far smaller than 1 MiB of host code; beyond that the PC is elsewhere.
-    if (host_pc - it->first >= (uint64_t{1} << 20)) {
+    if (b.host_function_start != nullptr) {
+        // Exact: the host function containing the PC must be a lifted function itself.
+        const uint64_t start = b.host_function_start(host_pc);
+        if (start == 0 || start != it->first) {
+            return 0;
+        }
+    } else if (host_pc - it->first >= (uint64_t{1} << 20)) {
+        // Heuristic: lifted functions are far smaller than 1 MiB of host code.
         return 0;
     }
     if (offset != nullptr) {
@@ -1634,6 +1762,9 @@ GuestThreadContext* activate_guest_thread(GuestThreadContext* context) {
             context->teb + offsetof(win64::Teb64, last_error_value), sizeof(uint32_t)));
     }
     os::win32::SetThreadLastErrorSlot(slot);
+    // GetCurrentThreadStackLimits reports the guest stack, like TEB StackLimit/StackBase.
+    os::win32::set_current_thread_stack_limits(context != nullptr ? context->thread.stack_limit : 0,
+                                               context != nullptr ? context->thread.stack_top : 0);
     return previous;
 }
 
@@ -1686,10 +1817,15 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
     if (fn != 0) {
         std::snprintf(function, sizeof(function), "sub_%" PRIX64, fn);
     }
-    char message[256];
+    char where[64] = "outside the guest address space";
+    if (const uint64_t va = host_to_guest(host_address); va != 0) {
+        std::snprintf(where, sizeof(where), "guest VA 0x%" PRIx64, va);
+    }
+    char message[320];
     std::snprintf(message, sizeof(message),
-                  "host %s at address 0x%" PRIx64 " (host pc 0x%" PRIx64 ", lifted function %s)", name,
-                  host_address, host_pc, function);
+                  "host %s at host address 0x%" PRIx64 " = %s (host pc 0x%" PRIx64
+                  ", lifted function %s)",
+                  name, host_address, where, host_pc, function);
     b.message = message;
     log_trap();
     finish_report();
@@ -1732,6 +1868,8 @@ void reset_boot() {
     }
     reset_guest_runtime();
     crt_exit::reset_crt_exit();
+    reset_guest_exceptions();
+    com::set_guest_memory(nullptr);
     b.active = false;
     b.running = false;
     b.arena = nullptr;
@@ -1774,12 +1912,20 @@ BootResult run_boot(const BootConfig& config) {
     b.start = std::chrono::steady_clock::now();
     b.log_progress = config.log_progress;
     b.survey = config.survey;
+    b.survey_return = config.survey_return;
     b.max_dispatches = config.max_dispatches;
     b.max_wall_ms = config.max_wall_ms;
     b.recent_capacity = config.recent_import_count;
     b.max_frames = config.max_backtrace_frames;
     b.capture_host_stack = config.capture_host_stack;
+    b.host_function_start = config.host_function_start;
     b.arena = config.arena != nullptr ? config.arena : os::win32::get_vmem_arena();
+    // One arena everywhere: O16 bridge objects and lazily created guest threads live in it too.
+    com::set_guest_memory(config.arena);
+    // Guest-visible process state: O7 export registry (incl. the virtual xgameruntime.dll provider,
+    // idempotent) and the command line GetCommandLineA/W report.
+    os::win32::register_all_shim_exports();
+    os::win32::set_command_line(config.command_line.empty() ? "game.exe" : config.command_line);
     b.active = true;
 
     auto finish = [&]() {
@@ -1863,11 +2009,24 @@ BootResult run_boot(const BootConfig& config) {
     }
     b.functions_registered = lifted_function_count();
     b.phase = "bind";
+    register_exception_exports();
     for (size_t i = 0; i < config.modules.size(); ++i) {
         ModuleState& m = b.modules[i];
         m.import_count = config.modules[i].imports.size();
         for (const BootImport& imp : config.modules[i].imports) {
-            b.imports.push_back(ImportRecord{imp, i, m.image.base});
+            ImportRecord rec{imp, i, m.image.base};
+            // R11 implements the exception APIs (RtlVirtualUnwind, RaiseException, ...) as runtime
+            // thunks rather than C-ABI shims, so the import bridge leaves them unresolved.
+            // (also when the bridge bound a shim: the guest-state thunks own these APIs)
+            if (imp.dll != nullptr && imp.symbol != nullptr) {
+                if (HostThunkFn thunk = exception_thunk_for(imp.dll, imp.symbol)) {
+                    rec.import.thunk = thunk;
+                    rec.import.flags |= kPg6BootImportBound;
+                    rec.import.shim = "guest_exceptions";
+                    ++m.imports_runtime;
+                }
+            }
+            b.imports.push_back(rec);
         }
     }
     b.by_slot.resize(b.imports.size());
@@ -1887,7 +2046,11 @@ BootResult run_boot(const BootConfig& config) {
         ModuleState& m = b.modules[i];
         std::vector<ImportSlotBinding> bindings;
         bindings.reserve(m.import_count);
-        for (const BootImport& imp : config.modules[i].imports) {
+        for (const ImportRecord& rec : b.imports) {
+            if (rec.module != i) {
+                continue;
+            }
+            const BootImport& imp = rec.import;
             const bool resolved = import_resolved(imp);
             bindings.push_back(ImportSlotBinding{imp.slot_rva, resolved ? imp.thunk : &boot_unresolved_thunk});
             (resolved ? m.imports_bound : m.imports_unresolved) += 1;
@@ -1913,6 +2076,11 @@ BootResult run_boot(const BootConfig& config) {
             fail_setup(BootStatus::RegisterFailed, after_load_error);
             return finish();
         }
+    }
+    // R11 unwinder: every image's .pdata (RtlLookupFunctionEntry, exception dispatch, backtraces),
+    // unless after_load (R12's register_program_modules) registered it already.
+    for (ModuleState& m : b.modules) {
+        m.pdata = pc_to_image_base(m.image.base) != 0 || register_image_from_headers(*b.arena, m.image.base);
     }
 
     // 3. Process block, TLS directories, main thread.
@@ -1976,7 +2144,9 @@ BootResult run_boot(const BootConfig& config) {
     remove_hooks();
     log_trap();
     BootResult result = finish();
-    logf("%s", result.summary.c_str());
+    if (b.log_progress) {
+        os::log(result.summary);  // not through logf: the summary is longer than its buffer
+    }
     return result;
 }
 

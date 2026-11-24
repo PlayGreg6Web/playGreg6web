@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::WASM64_TRIPLE;
+use super::target::LiftTarget;
 
 /// Environment variable overriding the LLVM tool (path to `llc` or `clang`).
 pub const LLC_ENV: &str = "PLAYGTA6_LLC";
@@ -143,6 +144,60 @@ pub fn compile_to_wasm64_object(
                 .arg(input)
                 .arg("-o")
                 .arg(object);
+            let result = run(llc, &mut cmd);
+            if opt.is_some() {
+                let _ = std::fs::remove_file(&optimized);
+            }
+            result
+        }
+    }
+}
+
+/// Compiles `ll` into an object for `target` at `-O2`: [`compile_to_wasm64_object`] for
+/// [`LiftTarget::Wasm64`]; for a native target the same `opt` + `llc` (or `clang`) steps with the
+/// native triple and CPU (`-relocation-model=pic` outside Windows, so objects link into PIE
+/// executables).
+pub fn compile_to_object(
+    tool: &LlvmTool,
+    target: &LiftTarget,
+    ll: &Path,
+    object: &Path,
+) -> Result<(), CompileError> {
+    let LiftTarget::Native { triple, cpu } = target else {
+        return compile_to_wasm64_object(tool, ll, object);
+    };
+    let pic = !triple.contains("windows");
+    match tool {
+        LlvmTool::Clang(clang) => {
+            let mut cmd = Command::new(clang);
+            cmd.arg(format!("--target={triple}"))
+                .arg(format!("-march={cpu}"))
+                .args(["-O2", "-c", "-x", "ir"]);
+            if pic {
+                cmd.arg("-fPIC");
+            }
+            cmd.arg(ll).arg("-o").arg(object);
+            run(clang, &mut cmd)
+        }
+        LlvmTool::Llc { llc, opt } => {
+            let optimized = object.with_extension("opt.bc");
+            let input = match opt {
+                Some(opt) => {
+                    let mut cmd = Command::new(opt);
+                    cmd.arg("-O2").arg(ll).arg("-o").arg(&optimized);
+                    run(opt, &mut cmd)?;
+                    optimized.as_path()
+                }
+                None => ll,
+            };
+            let mut cmd = Command::new(llc);
+            cmd.arg(format!("-mtriple={triple}"))
+                .arg(format!("-mcpu={cpu}"))
+                .args(["-O2", "-filetype=obj"]);
+            if pic {
+                cmd.arg("-relocation-model=pic");
+            }
+            cmd.arg(input).arg("-o").arg(object);
             let result = run(llc, &mut cmd);
             if opt.is_some() {
                 let _ = std::fs::remove_file(&optimized);
