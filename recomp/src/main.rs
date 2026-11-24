@@ -73,6 +73,7 @@ enum Command {
     PackImage(PackImageArgs),
     Stubs(StubsArgs),
     Lift(lift_cmd::LiftArgs),
+    SurveyInterfaces(playgta6_recomp::survey::cli::Args),
     Build(BuildArgs),
     BuildProgram(program_cmd::ProgramArgs),
 }
@@ -89,6 +90,7 @@ fn print_usage() {
         "  playgta6-recomp stubs <pe-path> --shims <header>... --out <dir> [--include-root <dir>]"
     );
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
+    eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
     eprintln!(
         "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N]"
     );
@@ -139,11 +141,13 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "lift" => {
             lift_cmd::parse_lift_args(&args[1..]).map(|a| a.map_or(Command::Help, Command::Lift))
         }
+        "survey-interfaces" => playgta6_recomp::survey::cli::parse_args(&args[1..])
+            .map(|a| a.map_or(Command::Help, Command::SurveyInterfaces)),
         "build" => parse_build_args(&args[1..]),
         "build-program" => program_cmd::parse_program_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::BuildProgram)),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'build' or 'build-program'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'survey-interfaces', 'build' or 'build-program'. Run with --help for usage."
         )),
     }
 }
@@ -885,6 +889,16 @@ fn main() -> ExitCode {
         },
         Ok(Command::Stubs(stubs_args)) => match run_stubs(&stubs_args) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::SurveyInterfaces(a)) => match playgta6_recomp::survey::cli::run(&a) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
             Err(err) => {
                 eprintln!("Error: {err}");
                 ExitCode::FAILURE
