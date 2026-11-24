@@ -588,6 +588,12 @@ void test_user_slots() {
     CHECK(cbk::live_async_shadows() == 0);
     CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == 0);  // XUserGetId
     CHECK(load64(out) == playgta6::os::gdk::kOfflineUserXuid);
+    // XUserGetLocalId (s9): stable, non-zero, distinct from the XUID; invalid without an out pointer.
+    CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == 0);
+    const uint64_t local_id = load64(out);
+    CHECK(local_id != 0 && local_id != playgta6::os::gdk::kOfflineUserXuid);
+    CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == 0 && load64(out) == local_id);
+    CHECK(hr32(fx.vcall(user_api, 9, {user, 0})) == com::E_INVALIDARG_HR);
     const uint64_t tag = fx.alloc(32);
     CHECK(hr32(fx.vcall(user_ext, 3, {user, 0, 32, tag, out})) == 0);  // XUserGetGamertag
     char text[32] = {};
@@ -602,6 +608,7 @@ void test_user_slots() {
     com::clear_diagnostics();
     CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == com::E_INVALIDARG_HR);
     CHECK(diag_contains("invalid XUserHandle"));
+    CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == com::E_INVALIDARG_HR);  // closed handle
     // Results on a block without an operation.
     const uint64_t other_block = fx.alloc(sizeof(cbk::GuestAsyncBlock));
     CHECK(hr32(fx.vcall(user_api, 8, {other_block, out})) == com::E_INVALIDARG_HR);
