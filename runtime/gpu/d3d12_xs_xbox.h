@@ -163,6 +163,34 @@
 // two alternating; 2,436 distinct DXIL compute containers (568 bytes .. over 64 KiB). Slot 62
 // creates ordinary compute pipeline states from them (the shader track's DXIL path applies).
 
+// Native pipelines and their DXIL (G37)
+// -------------------------------------
+// How the title picks a graphics pipeline (static analysis, confirmed at run time):
+//  * Every pipeline request goes through one function (0x142479760). It hashes the program and
+//    state and asks the native-pipeline manager (global at 0x1475DDB90, created unconditionally at
+//    startup) for a pipeline compiled earlier through slot 57, deriving state variants through slot
+//    55. Only when that lookup finds nothing does it build a pipeline-state stream from the
+//    program's DXIL stages and the public state structs and call slot 86.
+//  * The compile job inserts a pipeline into the manager's map only when slot 57 succeeds. So when
+//    slot 57 fails, every request falls back to slot 86. A real console does not fail these calls,
+//    so DeviceOptions::refuse_native_pipelines is off by default. With it on, one boot created every
+//    requested graphics pipeline from DXIL (50,472 slot-86 calls, 738 distinct containers: 229
+//    vertex, 509 pixel). The per-frame pass then carries its DXIL pair and its public state (input layout,
+//    render-target and depth formats, rectangle-list topology).
+//  * The containers are shader model 6.6 / DXIL 1.6 with clear signature, PSV0, SFI0, HASH and
+//    PRIV parts. The DXIL part's program header is valid, but its bitcode offset points at a
+//    trailer of under 16 bytes. The program body is a payload that starts with one fixed tag in
+//    every container, has 6-8 bits/byte of entropy and is not LLVM bitcode or a common compression
+//    format. The slot-62 compute containers are built the same way. The shader track cannot read
+//    these as DXIL; this layer does not try to decode the payload.
+//  * Join key: a stage's metadata range (slot 57) carries the 16-byte digest of the DXIL container's
+//    HASH part for the same shader, at 0x14 + 0x40 * k (pixel stages: range 3; vertex stages of
+//    layout A: range 5; no layout-B vertex stage has been seen joined yet). In one boot with the
+//    option on, 228 of 229 distinct DXIL vertex shaders and 470 of 509 pixel shaders joined (97% of
+//    the 100,928 stage uses) against 18,829 indexed native stages. With refuse_native_pipelines on, slot 57 indexes its stages
+//    under those positions before failing, and graphics pipeline states record the native stage
+//    (identity, code-only identity, sizes) that each of their DXIL stages joins to.
+
 // Raytracing
 // ----------
 // CheckFeatureSupport(OPTIONS5) reports RaytracingTier NOT_SUPPORTED and CreateStateObject (101)
@@ -261,6 +289,11 @@ struct NativePipeline {
     NativeStage pixel;          // absent for depth-only pipelines
     bool vertex_alt = false;    // vertex stage in ranges 6/7 (layout B) instead of 4/5
 };
+
+// Candidate positions of the DXIL HASH digest (16 bytes) inside a stage's metadata range:
+// kNativeDigestFirst + k * kNativeDigestStride (see "Native pipelines and their DXIL").
+inline constexpr size_t kNativeDigestFirst = 0x14;
+inline constexpr size_t kNativeDigestStride = 0x40;
 
 // Checks the range layout (header and metadata present; exactly one vertex pair; pixel pair whole
 // or absent; code 256-byte aligned; sizes bounded). The contents are not interpreted.
@@ -372,6 +405,9 @@ enum class Counter : size_t {
     NativePipelineStates,        // slot 57
     NativePipelineStatesRejected,
     NativeOverridesIgnored,      // slot 55 override entries on a native base
+    NativePipelineStatesRefused, // slot 57 with DeviceOptions::refuse_native_pipelines
+    DxilStagesJoined,            // DXIL stage joined to an indexed native stage
+    DxilStagesNotJoined,
     PlaceholderPipelineStates,
     UnknownOverrideKinds,
     ComputePipelineStatesX,      // slot 62 (DXIL)

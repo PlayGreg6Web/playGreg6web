@@ -2143,6 +2143,112 @@ void test_xbox_pipeline_streams_and_overrides() {
     scene.release_all({list, pso, derived, cpso, cpso57, cpso62, cpso62b, mpso});
 }
 
+std::vector<uint8_t> byte_pattern(size_t n, uint8_t seed);
+uint64_t put_aligned(const std::vector<uint8_t>& bytes, uint64_t alignment);
+
+// A DXBC container with only a HASH part (flags, 16-byte digest), enough for the join.
+std::vector<uint8_t> container_with_hash(const std::array<uint8_t, 16>& digest) {
+    std::vector<uint8_t> c(32 + 4 + 8 + 20, 0);
+    std::memcpy(c.data(), "DXBC", 4);
+    const uint32_t total = static_cast<uint32_t>(c.size()), parts = 1, part_offset = 36, part_size = 20;
+    std::memcpy(c.data() + 24, &total, 4);
+    std::memcpy(c.data() + 28, &parts, 4);
+    std::memcpy(c.data() + 32, &part_offset, 4);
+    std::memcpy(c.data() + 36, "HASH", 4);
+    std::memcpy(c.data() + 40, &part_size, 4);
+    std::memcpy(c.data() + 48, digest.data(), 16);  // after the u32 flags
+    return c;
+}
+
+// G37: with refuse_native_pipelines, slot 57 indexes the stages and fails; slot-86 pipelines built
+// from DXIL record the native stage each DXIL stage joins to (by the HASH digest in the metadata).
+void test_xbox_native_dxil_join() {
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.refuse_native_pipelines = true;
+    dx::set_device_options(options);
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    namespace xb = dg::xbox;
+    using R = xb::NativeRange;
+
+    std::array<uint8_t, 16> vs_digest{}, ps_digest{}, other_digest{};
+    for (int i = 0; i < 16; ++i) {
+        vs_digest[i] = static_cast<uint8_t>(0x10 + i);
+        ps_digest[i] = static_cast<uint8_t>(0x80 + i);
+        other_digest[i] = static_cast<uint8_t>(0xC0 + i);
+    }
+    // Metadata with the digest at a candidate position (0x14 + 0x40 * k).
+    std::vector<uint8_t> vs_meta = byte_pattern(0x80, 4), ps_meta = byte_pattern(0xC0, 6);
+    std::memcpy(vs_meta.data() + xb::kNativeDigestFirst + xb::kNativeDigestStride, vs_digest.data(), 16);
+    std::memcpy(ps_meta.data() + xb::kNativeDigestFirst + 2 * xb::kNativeDigestStride, ps_digest.data(), 16);
+    const std::vector<uint8_t> header = byte_pattern(0x184, 1), meta = byte_pattern(0x50, 2);
+    const std::vector<uint8_t> vs_code = byte_pattern(0x140, 3), ps_code = byte_pattern(0x180, 5);
+    xb::GuestNativePipelineDesc d{};
+    d.pRootSignature = scene.rs;
+    auto set = [&](R r, const std::vector<uint8_t>& bytes, bool aligned) {
+        d.ranges[static_cast<size_t>(r)] = {aligned ? put_aligned(bytes, 256) : put_bytes(bytes.data(), bytes.size()),
+                                            bytes.size()};
+    };
+    set(R::Header, header, false);
+    set(R::PipelineMetadata, meta, false);
+    set(R::PixelCode, ps_code, true);
+    set(R::PixelMetadata, ps_meta, false);
+    set(R::VertexCode, vs_code, true);
+    set(R::VertexMetadata, vs_meta, false);
+
+    // Slot 57 fails (the title then uses slot 86) after indexing both stages.
+    CHECK(fx.create(scene.device, XSlot::CreateNativePso, {I(put(d))}, dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kENotImpl);
+    CHECK(counter(dev, xb::Counter::NativePipelineStatesRefused) == 1 && dev->native_index_size() == 2);
+    CHECK(counter(dev, xb::Counter::NativePipelineStates) == 0);
+
+    // A DXIL pipeline whose containers carry those digests joins both stages.
+    scene.vs_bytes = container_with_hash(vs_digest);
+    scene.ps_bytes = container_with_hash(ps_digest);
+    const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+    const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream,
+                                   {I(put(xb::GuestPipelineStateStreamDesc{bytes.size(),
+                                                                           put_bytes(bytes.data(), bytes.size())}))},
+                                   dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    const dg::GraphicsPsoSource* src = object_of<dg::PipelineState>(pso)->graphics_source();
+    CHECK(src != nullptr);
+    CHECK(src->native_vs.identity ==
+              dg::native_stage_identity(vs_code.data(), vs_code.size(), vs_meta.data(), vs_meta.size()) &&
+          src->native_vs.code_identity == dg::shader_identity(vs_code.data(), vs_code.size()) &&
+          src->native_vs.code_bytes == vs_code.size() && src->native_vs.metadata_bytes == vs_meta.size());
+    CHECK(src->native_ps.identity ==
+          dg::native_stage_identity(ps_code.data(), ps_code.size(), ps_meta.data(), ps_meta.size()));
+    CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 2 && counter(dev, xb::Counter::DxilStagesNotJoined) == 0);
+    // A container whose digest no native stage carries stays unjoined.
+    scene.ps_bytes = container_with_hash(other_digest);
+    const std::vector<uint8_t> bytes2 = graphics_stream(scene, 3);
+    const uint64_t pso2 = fx.create(scene.device, XSlot::CreatePsoStream,
+                                    {I(put(xb::GuestPipelineStateStreamDesc{bytes2.size(),
+                                                                            put_bytes(bytes2.data(), bytes2.size())}))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && object_of<dg::PipelineState>(pso2)->graphics_source()->native_ps.identity == 0);
+    CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 3 && counter(dev, xb::Counter::DxilStagesNotJoined) == 1);
+
+    // The skipped draw (no shader modules) names the joined native stages.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    scene.execute({list});
+    CHECK(contains(dev->skipped_draw_reports(), "VS joins native stage 320 B code + 128 B metadata"));
+    CHECK(contains(dev->skipped_draw_reports(), "PS joins native stage 384 B code + 192 B metadata"));
+
+    CHECK(t_balanced);
+    scene.release_all({list, pso, pso2});
+}
+
 // G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
 void test_xbox_rect_lists() {
     Fixture fx;
@@ -2564,6 +2670,7 @@ int main() {
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_native_pipelines();
     test_xbox_rect_lists();
+    test_xbox_native_dxil_join();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();
     if (g_failures != 0) {

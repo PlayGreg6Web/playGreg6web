@@ -157,6 +157,8 @@ struct GraphicsPsoSource {
     std::vector<pso::D3D12InputElementDesc> input;
     com::Ref<RootSignature> root_signature;
     bool rect_list = false;  // Xbox rectangle topology type (desc says Triangle; d3d12_xs_xbox.h)
+    // The console-native stages the DXIL vertex / pixel shader joins to (identity 0: not joined).
+    Device::NativeStageRecord native_vs, native_ps;
 
     GraphicsPsoSource() = default;
     GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }
@@ -199,6 +201,8 @@ public:
         std::vector<uint8_t> header;
         uint64_t vertex_identity = 0;
         uint64_t pixel_identity = 0;  // 0 = no pixel stage
+        uint64_t vertex_code_identity = 0;  // FNV-1a 64 over the code range only
+        uint64_t pixel_code_identity = 0;
     };
     const Native* native() const { return native_.get(); }
 

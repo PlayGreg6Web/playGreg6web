@@ -368,6 +368,18 @@ void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32
                      (device_->shader_known(stages[i]) ? "" : " (no module)");
             }
         }
+        for (const auto& [name, n] : {std::pair{"VS", &src->native_vs}, std::pair{"PS", &src->native_ps}}) {
+            if (n->identity != 0) {
+                s += std::string("; ") + name + " joins native stage " + std::to_string(n->code_bytes) + " B code + " +
+                     std::to_string(n->metadata_bytes) + " B metadata";
+            }
+        }
+        const pso::D3D12RenderTargetBlendDesc& rt0 = d.BlendState.RenderTarget[0];
+        s += "; blend rt0 " + std::string(rt0.BlendEnable ? "on" : "off") + " mask " +
+             std::to_string(static_cast<uint32_t>(rt0.RenderTargetWriteMask)) + ", depth " +
+             (d.DepthStencilState.DepthEnable ? "on func " + std::to_string(static_cast<uint32_t>(d.DepthStencilState.DepthFunc))
+                                              : std::string("off")) +
+             ", cull " + std::to_string(static_cast<uint32_t>(d.RasterizerState.CullMode));
         s += "; topology type " + std::to_string(static_cast<uint32_t>(d.PrimitiveTopologyType)) +
              (src->rect_list ? " (rectangle list)" : "");
         s += "; input layout " + std::to_string(d.NumInputElements) + " element(s)";

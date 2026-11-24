@@ -618,6 +618,17 @@ HResult Device::CreateNativePipelineState(uint64_t desc_va, const Guid& riid, Ou
         }
         return kEInvalidArg;
     }
+    if (options_.refuse_native_pipelines) {
+        // Index the stages for the DXIL join, then fail: the title creates the pipeline through
+        // slot 86 from DXIL when it is requested (see "Native pipelines and their DXIL").
+        NativeStageRecord vs, ps;
+        const bool ok = read_native_stage(p.vertex, true, &vs) && read_native_stage(p.pixel, true, &ps);
+        count(ok ? xbox::Counter::NativePipelineStatesRefused : xbox::Counter::NativePipelineStatesRejected);
+        if (out) {
+            out.write(0);
+        }
+        return ok ? kENotImpl : kEInvalidArg;
+    }
     const HResult hr = create_native_pso(p, riid, out);
     if (hr >= 0) {
         count(xbox::Counter::NativePipelineStates);

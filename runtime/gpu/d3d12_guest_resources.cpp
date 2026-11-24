@@ -1016,9 +1016,41 @@ int dxil_shader_kind(const uint8_t* p, size_t n) {
     return -1;
 }
 
+// The 16-byte digest of a DXBC container's HASH part (after its u32 flags); false without one.
+bool dxil_hash_digest(const uint8_t* p, size_t n, Device::DxilDigest* out) {
+    auto u32 = [&](size_t at) {
+        uint32_t v = 0;
+        std::memcpy(&v, p + at, 4);
+        return v;
+    };
+    if (n < 32 || u32(0) != 0x43425844u) {  // "DXBC"
+        return false;
+    }
+    const uint32_t parts = u32(28);
+    if (parts > 64 || 32 + uint64_t{parts} * 4 > n) {
+        return false;
+    }
+    for (uint32_t i = 0; i < parts; ++i) {
+        const uint32_t off = u32(32 + i * 4);
+        if (uint64_t{off} + 8 > n) {
+            return false;
+        }
+        if (u32(off) == 0x48534148u && u32(off + 4) >= 20 && uint64_t{off} + 8 + 20 <= n) {  // "HASH"
+            std::memcpy(out->data(), p + off + 12, 16);
+            return true;
+        }
+    }
+    return false;
+}
+
 // Reads a shader's bytecode and returns its identity (0 = no shader). False on unreadable input.
-bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage, uint64_t* identity) {
+// `digest` (optional) receives the container's HASH digest; it stays all-zero without one.
+bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage, uint64_t* identity,
+                 Device::DxilDigest* digest = nullptr) {
     *identity = 0;
+    if (digest != nullptr) {
+        digest->fill(0);
+    }
     if (code.pShaderBytecode == 0 || code.BytecodeLength == 0) {
         return true;
     }
@@ -1033,6 +1065,9 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
     }
     *identity = shader_identity(bytes.data(), bytes.size());
     dev.note_shader_size(*identity, bytes.size(), dxil_shader_kind(bytes.data(), bytes.size()));
+    if (digest != nullptr && !dxil_hash_digest(bytes.data(), bytes.size(), digest)) {
+        digest->fill(0);
+    }
     return true;
 }
 
@@ -1053,6 +1088,8 @@ GraphicsPsoSource& GraphicsPsoSource::operator=(const GraphicsPsoSource& other) 
         input = other.input;
         root_signature = other.root_signature;
         rect_list = other.rect_list;
+        native_vs = other.native_vs;
+        native_ps = other.native_ps;
         fix_pointers();
     }
     return *this;
@@ -1140,7 +1177,8 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
         return kEInvalidArg;
     }
     pso::D3D12GraphicsPsoDesc& d = src.desc;
-    if (!read_shader(*this, g.VS, "VS", &d.vs) || !read_shader(*this, g.PS, "PS", &d.ps) ||
+    DxilDigest vs_digest{}, ps_digest{};
+    if (!read_shader(*this, g.VS, "VS", &d.vs, &vs_digest) || !read_shader(*this, g.PS, "PS", &d.ps, &ps_digest) ||
         !read_shader(*this, g.DS, "DS", &d.ds) || !read_shader(*this, g.HS, "HS", &d.hs) ||
         !read_shader(*this, g.GS, "GS", &d.gs)) {
         return kEInvalidArg;
@@ -1161,6 +1199,18 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
     }
     if (src.rect_list) {
         count(xbox::Counter::RectListPipelineStates);
+    }
+    // Join each DXIL stage to the console-native stage compiled from the same shader (only stages
+    // indexed by slot 57 with refuse_native_pipelines; d3d12_xs_xbox.h).
+    if (native_index_size() != 0) {
+        static const DxilDigest kZero{};
+        for (auto [digest, record] : {std::pair{&vs_digest, &src.native_vs}, std::pair{&ps_digest, &src.native_ps}}) {
+            if (*digest == kZero) {
+                continue;
+            }
+            count(find_native_stage(*digest, record) ? xbox::Counter::DxilStagesJoined
+                                                     : xbox::Counter::DxilStagesNotJoined);
+        }
     }
     d.stream_output_enabled = g.StreamOutput.NumEntries > 0;
     convert_blend_desc(g.BlendState, &d.BlendState);
@@ -1247,6 +1297,56 @@ HResult Device::create_placeholder_pso(const std::string& reason, const Guid& ri
     return hand_out(std::move(state), riid, out);
 }
 
+bool Device::read_native_stage(const xbox::NativeStage& s, bool index, NativeStageRecord* out) {
+    *out = NativeStageRecord{};
+    if (!s.present()) {
+        return true;
+    }
+    std::vector<uint8_t> code(static_cast<size_t>(s.code.size));
+    std::vector<uint8_t> meta(static_cast<size_t>(s.metadata.size));
+    if (!com::read_guest(s.code.address, code.data(), code.size()) ||
+        !com::read_guest(s.metadata.address, meta.data(), meta.size())) {
+        note_bad_argument("CreatePipelineState (native): unreadable stage at " + hex(s.code.address));
+        return false;
+    }
+    out->identity = native_stage_identity(code.data(), code.size(), meta.data(), meta.size());
+    out->code_identity = shader_identity(code.data(), code.size());
+    out->code_bytes = static_cast<uint32_t>(code.size());
+    out->metadata_bytes = static_cast<uint32_t>(meta.size());
+    note_shader_size(out->identity, code.size());
+    if (!index) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    if (!indexed_native_.insert(out->identity).second) {
+        return true;
+    }
+    static const DxilDigest kZero{};
+    for (size_t o = xbox::kNativeDigestFirst; o + 16 <= meta.size(); o += xbox::kNativeDigestStride) {
+        DxilDigest d;
+        std::memcpy(d.data(), meta.data() + o, 16);
+        if (d != kZero) {
+            native_by_digest_.emplace(d, *out);
+        }
+    }
+    return true;
+}
+
+bool Device::find_native_stage(const DxilDigest& digest, NativeStageRecord* out) const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    auto it = native_by_digest_.find(digest);
+    if (it == native_by_digest_.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
+}
+
+size_t Device::native_index_size() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return indexed_native_.size();
+}
+
 HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out) {
     com::Ref<RootSignature> rs = root_signature_ref(pipeline.root_signature);
     if (pipeline.root_signature != 0 && !rs) {
@@ -1260,27 +1360,14 @@ HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Gu
         note_bad_argument("CreatePipelineState (native): unreadable header record at " + hex(pipeline.header.address));
         return kEInvalidArg;
     }
-    // Stage identity: code followed by metadata (both read from guest memory once, here).
-    auto stage_identity = [&](const xbox::NativeStage& s, uint64_t* identity) {
-        *identity = 0;
-        if (!s.present()) {
-            return true;
-        }
-        std::vector<uint8_t> code(static_cast<size_t>(s.code.size));
-        std::vector<uint8_t> meta(static_cast<size_t>(s.metadata.size));
-        if (!com::read_guest(s.code.address, code.data(), code.size()) ||
-            !com::read_guest(s.metadata.address, meta.data(), meta.size())) {
-            note_bad_argument("CreatePipelineState (native): unreadable stage at " + hex(s.code.address));
-            return false;
-        }
-        *identity = native_stage_identity(code.data(), code.size(), meta.data(), meta.size());
-        note_shader_size(*identity, code.size());
-        return true;
-    };
-    if (!stage_identity(pipeline.vertex, &native->vertex_identity) ||
-        !stage_identity(pipeline.pixel, &native->pixel_identity)) {
+    NativeStageRecord vs, ps;
+    if (!read_native_stage(pipeline.vertex, false, &vs) || !read_native_stage(pipeline.pixel, false, &ps)) {
         return kEInvalidArg;
     }
+    native->vertex_identity = vs.identity;
+    native->pixel_identity = ps.identity;
+    native->vertex_code_identity = vs.code_identity;
+    native->pixel_code_identity = ps.code_identity;
     auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
     if (!state) {
         return kEOutOfMemory;

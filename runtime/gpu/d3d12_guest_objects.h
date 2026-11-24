@@ -508,6 +508,10 @@ struct DeviceOptions {
     PacketSink sink;                    // empty: os::wgpu_submit
     bridge::BridgeOptions bridge;       // id_allocator is replaced by the device's allocator
     uint64_t timestamp_frequency = 1000000000ull;
+    // Xbox slot 57: record the console-native pipeline's stages, then fail the call (E_NOTIMPL)
+    // so the title creates that pipeline from DXIL through slot 86 (d3d12_xs_xbox.h, "Native
+    // pipelines and their DXIL"). Off: a native (unresolved) pipeline state is created.
+    bool refuse_native_pipelines = false;
 };
 
 struct DeviceStats {
@@ -653,6 +657,21 @@ public:
     // not in unresolved_shaders() (that list is the DXIL the shader track can translate).
     void note_native_stages(uint64_t vertex_identity, uint64_t pixel_identity);
     std::array<uint32_t, 2> native_stage_counts() const;
+    // A console-native stage as the guest layer sees it (Xbox slot 57).
+    struct NativeStageRecord {
+        uint64_t identity = 0;       // native_stage_identity: code then metadata
+        uint64_t code_identity = 0;  // FNV-1a 64 over the code range only
+        uint32_t code_bytes = 0;
+        uint32_t metadata_bytes = 0;
+    };
+    using DxilDigest = std::array<uint8_t, 16>;
+    // Reads a stage's code and metadata (false: unreadable, diagnosed). With `index`, the stage is
+    // also indexed by the 16-byte values at its metadata's digest positions (d3d12_xs_xbox.h,
+    // "Native pipelines and their DXIL") so find_native_stage can join a DXIL container to it.
+    bool read_native_stage(const xbox::NativeStage& stage, bool index, NativeStageRecord* out);
+    // The indexed native stage whose metadata carries `digest` (a DXIL container's HASH digest).
+    bool find_native_stage(const DxilDigest& digest, NativeStageRecord* out) const;
+    size_t native_index_size() const;
     bool shader_known(uint64_t identity) const;
     // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
     void note_shader_size(uint64_t identity, uint64_t bytes, int kind = -1);
@@ -744,6 +763,16 @@ private:
     std::array<uint32_t, 3> root_signature_versions_{};  // under shader_mutex_
     std::unordered_set<uint64_t> known_shaders_;
     std::unordered_set<uint64_t> native_stages_[2];  // under shader_mutex_ (vertex, pixel)
+    struct DigestHash {
+        size_t operator()(const DxilDigest& d) const {
+            uint64_t a = 0, b = 0;
+            std::memcpy(&a, d.data(), 8);
+            std::memcpy(&b, d.data() + 8, 8);
+            return static_cast<size_t>(a ^ (b * 0x9E3779B97F4A7C15ull));
+        }
+    };
+    std::unordered_map<DxilDigest, NativeStageRecord, DigestHash> native_by_digest_;  // under shader_mutex_
+    std::unordered_set<uint64_t> indexed_native_;                                     // under shader_mutex_
     struct ShaderFacts {
         uint64_t bytes = 0;
         int kind = -1;
