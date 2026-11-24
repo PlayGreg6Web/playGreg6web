@@ -463,6 +463,19 @@ void test_query_api() {
         CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
     }
     {
+        // XGameSave slots 3/4 (InitializeProvider / InitializeProviderAsync): no game-save
+        // provider offline, so both fail; no handle is invented and a null block is invalid.
+        const uint64_t save = fx.query(com::make_guid("704c3f58-e629-4cc2-b197-30511b996fe2"),
+                                       com::make_guid("1bfff3af-f14a-40a3-8e35-9ada906593f9"));
+        const uint64_t provider = fx.alloc(8);
+        CHECK(com::write_guest(provider, uint64_t{0x1234}));
+        CHECK(hr32(fx.vcall(save, 3, {0x10, 0x20, 0, provider})) == com::E_NOTIMPL_HR);
+        CHECK(load64(provider) == 0);
+        const uint64_t block = fx.alloc(0x38);
+        CHECK(hr32(fx.vcall(save, 4, {0x10, 0x20, 0, block})) == com::E_NOTIMPL_HR);
+        CHECK(hr32(fx.vcall(save, 4, {0x10, 0x20, 0, 0})) == com::E_INVALIDARG_HR);
+    }
+    {
         // {b884675d} slot 3: XSystemGetAnalyticsInfo through the hidden result pointer.
         const Guid analytics = com::make_guid("b884675d-b738-4a9c-815d-9a9a1e0c6c9b");
         const uint64_t api = fx.query(analytics, analytics);

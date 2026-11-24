@@ -80,8 +80,10 @@
 //     (returns Disabled: the runtime presents SDR).
 //   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
 //     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
+//   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h
+//     (no game-save provider offline: E_NOTIMPL, no handle, the async operation never starts).
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XGameSave {704c3f58-...}, XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
+//     XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
 //     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
 //   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
 //     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
@@ -1050,6 +1052,46 @@ private:
     std::atomic<bool> logged_{false};
 };
 
+// XGameSave (public header order: s3 XGameSaveInitializeProvider, s4 XGameSaveInitializeProviderAsync).
+// The executable calls s4 through a wrapper (user, configuration id string, bool syncOnDemand,
+// 0x38-byte block = XAsyncBlock) and, when the call fails, marks its save system as failed and
+// frees the block. The runtime has no game-save provider (no connected storage, offline): both
+// initialisations fail with E_NOTIMPL, no provider handle is invented and the async operation is
+// never started (its callback never runs).
+class GameSaveApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XGameSave";
+
+    // s3: XGameSaveInitializeProvider(user, configurationId, syncOnDemand, XGameSaveProviderHandle*).
+    int32_t InitializeProvider(uint64_t /*user*/, uint64_t /*configuration_id*/, uint64_t /*sync_on_demand*/,
+                               GuestPtr<uint64_t> provider) {
+        if (!provider.is_null()) {
+            provider.write(0);
+        }
+        log_once("XGameSaveInitializeProvider");
+        return com::E_NOTIMPL_HR;
+    }
+
+    // s4: XGameSaveInitializeProviderAsync(user, configurationId, syncOnDemand, XAsyncBlock*).
+    int32_t InitializeProviderAsync(uint64_t /*user*/, uint64_t /*configuration_id*/,
+                                    uint64_t /*sync_on_demand*/, uint64_t async) {
+        if (async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        log_once("XGameSaveInitializeProviderAsync");
+        return com::E_NOTIMPL_HR;
+    }
+
+private:
+    void log_once(const char* api) {
+        if (!logged_.exchange(true)) {
+            os::log(std::string("xgameruntime: ") + api + ": no game-save provider (offline runtime); returning E_NOTIMPL");
+        }
+    }
+
+    std::atomic<bool> logged_{false};
+};
+
 // XSystemAnalyticsInfo (x64): two XVersion (four uint16 each) and two 64-byte strings.
 struct GuestAnalyticsInfo {
     uint16_t os_version[4];       // major, minor, build, revision
@@ -1261,8 +1303,13 @@ constexpr auto kPackageTable = slot_table<37>({
 constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPackage", kPackageIid,
                                                               kPackageTable.slots, {.slot_count = 48});
 
-constexpr auto kIGameSave = com::declare_interface<StubApi>("xgameruntime.XGameSave", kGameSaveIid, {},
-                                                            {.slot_count = 40});
+using GS = M<GameSaveApi>;
+constexpr auto kGameSaveTable = slot_table<2>({
+    {3, GS::method<&GameSaveApi::InitializeProvider>("XGameSaveInitializeProvider")},
+    {4, GS::method<&GameSaveApi::InitializeProviderAsync>("XGameSaveInitializeProviderAsync")},
+});
+constexpr auto kIGameSave = com::declare_interface<GameSaveApi>("xgameruntime.XGameSave", kGameSaveIid,
+                                                               kGameSaveTable.slots, {.slot_count = 40});
 constexpr auto kIStoreExt = com::declare_interface<StubApi>("xgameruntime.XStoreExt", kStoreExtIid, {},
                                                             {.slot_count = 96});
 using PL = M<PersistentLocalStorageApi>;
@@ -1324,7 +1371,7 @@ const ApiEntry kApis[] = {
     {kStoreProvider, kStoreIid, &kIStore.info, [] { return make<StoreApi>(kIStore); }},
     {kNetworkingProvider, kNetworkingIid, &kINetworking.info, [] { return make<NetworkingApi>(kINetworking); }},
     {kPackageProvider, kPackageIid, &kIPackage.info, [] { return make<PackageApi>(kIPackage); }},
-    {kGameSaveProvider, kGameSaveIid, &kIGameSave.info, [] { return make<StubApi>(kIGameSave); }},
+    {kGameSaveProvider, kGameSaveIid, &kIGameSave.info, [] { return make<GameSaveApi>(kIGameSave); }},
     {kStoreProvider, kStoreExtIid, &kIStoreExt.info, [] { return make<StubApi>(kIStoreExt); }},
     {kPlsProvider, kPlsIid, &kIPersistentLocalStorage.info,
      [] { return make<PersistentLocalStorageApi>(kIPersistentLocalStorage); }},

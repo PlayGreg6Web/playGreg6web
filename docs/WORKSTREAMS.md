@@ -64,7 +64,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add `--strip` (`-Wl,--strip-all`), `--opt Os/Oz`, `--pthread-pool-size`, `--extra-link-flag`, and a V8 1 GiB `.wasm` module size check to `build_guest_wasm.py`.
 - [x] **R26 — `--no-link-opt` & `--shrink-largest-shards` in `tools/build_guest_wasm.py`** — `DONE` (PR #381, closes #377) *(no game files required)*
   - Add `--no-link-opt` to skip high-RAM `wasm-opt` during linking and `--shrink-largest-shards` to recompile the heaviest shards at `-Oz` to stay under browser `.wasm` size limits.
-- [ ] **R29 — Jump-Table Recovery Across Control-Flow Merges: Reaching Definitions for Table Base and Index (`recomp/src/jump_table.rs`)** — `IN PROGRESS` (#405, @Timon-ok) *(driven by the native boot; synthetic fixtures only)*
+- [x] **R29 — Jump-Table Recovery Across Control-Flow Merges: Reaching Definitions for Table Base and Index (`recomp/src/jump_table.rs`)** — `DONE` (PR #433, closes #405) *(driven by the native boot; synthetic fixtures only)*
   - Resolve switches whose table base or index reaches the indirect jump through control-flow merges, keeping the existing soundness rules, and measure resolved / unresolved counts before and after.
 
 ---
@@ -130,6 +130,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Load multi-module `PG6_BOOT_PROGRAM` bundles over HTTPFS inside `runtime/wasm_boot` with synthetic unit test coverage.
 - [ ] **O29 — Honour the Translated CPU Window in the Runtime: Import-Bridge Seam, COM Bridge, Guest Reads/Writes, (pointer, length) Shims & Contiguous-Run Page Allocator** — `IN PROGRESS` (#373, @Timon-ok) *(no game files required for repo tests — follow-up to R19 / #306; off for programs lifted with the default memory model)*
   - Convert runtime consumers that can receive CPU-window pointers to the shared translation, keep adjacent mapped slots host-contiguous, and let the program descriptor select the memory model at boot.
+- [ ] **O30 — `XMemMapPhysicalPagesScatter` Semantics: One Page Number per Large Page, Not per 64 KiB Slot (`runtime/os/xbox_scarlett.cpp`, `xmem_windows`)** — `IN PROGRESS` (#464, @Timon-ok) *(found by O29's contiguity measurement on the real mapping sequence; synthetic tests)*
+  - Establish the scatter-mapping call's real page-array semantics from the title's call sites, fix the shim and the window model (CPU and GPU side), and check the neighbouring physical-page shims for the same unit error.
 
 ---
 

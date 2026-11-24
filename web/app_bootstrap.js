@@ -2062,7 +2062,11 @@ export function bootstrapPlayGta6App(options = {}) {
     const onUncapturedError = (ev) => {
       if (deviceStopped || destroyed) return;
       const errObj = ev && ev.error ? ev.error : ev;
-      crashReporter.recordError('webgpu_validation', errObj, { source: 'smokeDemo' });
+      const sessionRecordsCrash =
+        Boolean(session) && typeof session.recordGpuValidationError === 'function';
+      if (!sessionRecordsCrash) {
+        crashReporter.recordError('webgpu_validation', errObj, { source: 'smokeDemo' });
+      }
       recordValidationError(
         { error: errObj, source: 'smokeDemo' },
         { source: 'smokeDemo', skipCrashReporter: true, skipHudLog: true }

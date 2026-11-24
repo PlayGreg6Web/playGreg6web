@@ -1858,7 +1858,7 @@ test('W73 forwards /api/status sideModuleUrls and sideModuleCount into loader bo
   ]);
 
   const snap = app.getDiagnosticsSnapshot();
-  assert.equal(snap.bootMode, 'wasm-guest');
+  assert.equal(snap.bootMode, 'real-wasm64');
   assert.equal(snap.sideModuleCount, 2);
 
   await app.destroy();
@@ -2063,7 +2063,7 @@ test('W73 forwards wgpu_worker gpu-validation-error and splash-frame-presented t
   assert.equal(Object.isFrozen(snap.recentValidationErrors), true);
   assert.equal(Object.isFrozen(snap.recentValidationErrors[0]), true);
 
-  assert.equal(snap.bootMode, 'wasm-guest');
+  assert.equal(snap.bootMode, 'real-wasm64');
   assert.equal(snap.milestone, 'FIRST_PRESENT');
   assert.equal(snap.sideModuleCount, 1);
   assert.equal(snap.validationErrorCount, 5);
@@ -2127,7 +2127,7 @@ test('W73 globalScope.__playgta6 supports custom globalScope, attachGlobalHook o
   });
 
   const smokeSnap = customGlobal.__playgta6.getDiagnosticsSnapshot();
-  assert.equal(smokeSnap.bootMode, 'smoke-demo');
+  assert.equal(smokeSnap.bootMode, 'smoke');
   assert.equal(smokeSnap.milestone, 'FIRST_PRESENT');
   assert.equal(smokeSnap.sideModuleCount, 0);
   assert.ok(smokeSnap.framesPresented >= 2);
