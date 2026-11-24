@@ -1133,18 +1133,22 @@ namespace {
 
 // GFX10 surface size of a texture whose Layout carries a console swizzle mode (0x100 | n) that is
 // verified against AMD addrlib (gpu/gfx10_detile.h, #551): 256B/4KB/64KB _S and _D, thick 3D for
-// _S. Mip chain and tail as addrlib places them; array slices repeat the chain. 0 when the
-// description is not such a texture (linear, depth/planar or unknown formats, MSAA, the _R / VAR /
-// _X modes): those keep the linear estimate, and the unverified tiled modes are counted.
+// _S, and the console linear layout 0x100 (ADDR_SW_LINEAR, #678; 1D too). Mip chain and tail as
+// addrlib places them; array slices repeat the chain. 0 when the description is not such a
+// texture (D3D12 layouts 0-3, depth/planar or unknown formats, MSAA, the _R / VAR / _X modes):
+// those keep the tight estimate, and the unverified tiled modes are counted.
 std::atomic<uint64_t> g_unverified_layout_answers{0};
 
 uint64_t console_layout_size(const GuestResourceDesc& d) {
-    if ((d.Dimension != ResourceDimension::Texture2D && d.Dimension != ResourceDimension::Texture3D) ||
-        d.Layout < 0x101u || d.Layout > 0x11Fu || d.Width == 0 || d.Width > 0xFFFFFFFFull || d.Height == 0) {
+    const bool linear = d.Layout == gfx10::kConsoleLinearLayout;
+    if ((d.Dimension != ResourceDimension::Texture2D && d.Dimension != ResourceDimension::Texture3D &&
+         !(linear && d.Dimension == ResourceDimension::Texture1D)) ||
+        d.Layout < 0x100u || d.Layout > 0x11Fu || d.Width == 0 || d.Width > 0xFFFFFFFFull || d.Height == 0) {
         return 0;
     }
     const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d.Layout);
     switch (mode) {
+        case gfx10::SwizzleMode::Linear:
         case gfx10::SwizzleMode::Sw256BS:
         case gfx10::SwizzleMode::Sw256BD:
         case gfx10::SwizzleMode::Sw4KBS:
@@ -1174,7 +1178,7 @@ uint64_t console_layout_size(const GuestResourceDesc& d) {
     gfx10::TextureLayoutDesc g{};
     g.dxgi_format = d.Format;
     g.width = static_cast<uint32_t>(d.Width);
-    g.height = d.Height;
+    g.height = d.Dimension == ResourceDimension::Texture1D ? 1u : d.Height;
     g.depth = is_3d ? std::max<uint32_t>(1u, d.DepthOrArraySize) : 1u;
     g.mip_levels = mips;
     g.d3d12_layout = d.Layout;

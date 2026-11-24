@@ -106,10 +106,14 @@ DetileResult detile_subresource(const TextureLayoutDesc& desc, uint32_t mip, con
 // 4KB/64KB modes the mip tail (one block holding every mip that fits) comes first and the larger
 // mips follow smallest-first, so mip 0 sits last, or inside the tail block at a fixed coordinate
 // when the whole chain fits there; 256B modes store the mips smallest-first without a tail.
-// Linear layouts keep mip 0 at offset 0 (only mip 0 is supported for them): the real linear mip
-// rule is not established. addrlib's gfx10 ADDR_SW_LINEAR chain (256 B pitch, mips
-// smallest-first) is what the sampler needs, but it disagrees with the tight allocation answer
-// the title has been given so far (#665).
+// The console linear layout (0x100, SW_LINEAR, no explicit pitch_bytes) follows addrlib's gfx10
+// ADDR_SW_LINEAR chain (Gfx10Lib::HwlComputeSurfaceInfoLinear): every mip's pitch aligned to
+// 256 B, heights unpadded, mips smallest-first (mip 0 last), each slice holding the whole chain,
+// base alignment 256 B. This one placement answers D3D12 allocation sizes, XG GetResourceLayout
+// and the texture upload (#678). Layouts 0 / 1 (D3D12 UNKNOWN / ROW_MAJOR) and explicit pitches
+// keep mip 0 at offset 0 (only mip 0 is supported for them).
+constexpr uint32_t kConsoleLinearLayout = 0x100;
+constexpr uint64_t kConsoleLinearAlignment = 256;
 struct MipPlacement {
     bool ok = false;
     const char* error = nullptr;
@@ -139,14 +143,15 @@ DetileResult detile_from_surface(const TextureLayoutDesc& desc, uint32_t mip, co
 
 // One subresource of the whole surface: mip `mip` of array slice `array_slice` (3D: every depth
 // slice of the mip; array_slice must be 0). Tail mips are read inside the tail block at their
-// addrlib coordinates. Linear layouts: mip 0 only; array slices only when the slice stride is the
-// same under every candidate linear rule (one mip, row bytes a multiple of 256 or an explicit
-// pitch_bytes).
+// addrlib coordinates; console linear (0x100) mips at their ADDR_SW_LINEAR offsets. Layouts 0 / 1
+// and explicit pitches: mip 0 only; array slices only when the slice stride is the same under
+// every candidate linear rule (one mip, row bytes a multiple of 256 or an explicit pitch_bytes).
 DetileResult detile_surface_subresource(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
                                         const uint8_t* surface, size_t surface_bytes,
                                         std::vector<uint8_t>& linear_out);
 
-// Inverse of detile_surface_subresource for tiled layouts; other bytes of `surface` are kept.
+// Inverse of detile_surface_subresource for tiled and console linear (0x100) layouts; other
+// bytes of `surface` are kept.
 bool tile_surface_subresource(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
                               const uint8_t* linear_src, size_t linear_src_bytes, uint8_t* surface,
                               size_t surface_size);

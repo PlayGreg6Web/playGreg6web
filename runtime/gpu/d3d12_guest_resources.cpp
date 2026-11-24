@@ -101,13 +101,14 @@ uint32_t mips_or_all(uint32_t v) {
     return v == 0xFFFFFFFFu ? 0xffffu : v;
 }
 
-// Bytes of the whole tiled surface from its base address (all mips: on GFX10 mip 0 is stored
-// last, or inside the mip-tail block; see gfx10::MipPlacement). Returns 0 for linear or
-// unrecognized formats/modes.
+// Bytes of the whole console-layout surface from its base address (all mips and slices: on GFX10
+// mip 0 is stored last, or inside the mip-tail block; see gfx10::MipPlacement). Returns 0 for
+// D3D12 layouts 0-3 or unrecognized formats/modes.
 uint64_t tiled_surface_bytes(uint32_t d3d12_layout, uint32_t dxgi_format, uint32_t width, uint32_t height,
                              uint32_t depth, uint32_t mip_levels, uint32_t array_size) noexcept {
     const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d3d12_layout);
-    if (mode == gfx10::SwizzleMode::Unsupported || mode == gfx10::SwizzleMode::Linear) {
+    if (mode == gfx10::SwizzleMode::Unsupported ||
+        (mode == gfx10::SwizzleMode::Linear && d3d12_layout != gfx10::kConsoleLinearLayout)) {
         return 0;
     }
     gfx10::TextureLayoutDesc desc{};
@@ -395,7 +396,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
-    const bool is_tiled = tt.layout >= 0x101u;
+    // Console layouts (0x100 | swizzle mode, linear 0x100 included) are placed by the GFX10
+    // surface code through the detile hook; D3D12 layouts 0-3 are read as tight rows.
+    const bool is_tiled = tt.layout >= gfx10::kConsoleLinearLayout;
     const bool is_tiny = (w <= 2u && h <= 2u);
     DetileFn detile_fn;
     {
@@ -406,10 +409,11 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
-    // The subresources this layout places (subresource index = mip + slice * mips). Tiled: every
-    // mip and array slice of the GFX10 surface (gfx10::MipPlacement). Linear: mip 0 at the base
-    // (the linear mip rule is not established, #665); array slices only where every candidate
-    // rule gives the same slice stride (one mip, rows a multiple of 256 B).
+    // The subresources this layout places (subresource index = mip + slice * mips). Console
+    // layouts: every mip and array slice of the GFX10 surface (gfx10::MipPlacement; linear 0x100
+    // follows addrlib's ADDR_SW_LINEAR chain, #678). D3D12 layouts 0-3: mip 0 at the base; array
+    // slices only where every candidate rule gives the same slice stride (one mip, rows a
+    // multiple of 256 B).
     struct Sub {
         uint32_t mip;
         uint32_t slice;
@@ -1069,10 +1073,11 @@ Resource::~Resource() {
 
 uint64_t committed_memory_size(const GuestResourceDesc& d) {
     // The 64 KiB-block surface size where os/surface_blocks.h covers the resource, else the
-    // linear estimate.
+    // size estimate (console layouts, including linear 0x100, use their GFX10 placement there).
     const DxgiFormatLayout l = dxgi_format_layout(d.Format);
     os::surface::Block64kLayout block{};
-    if (d.Dimension == ResourceDimension::Texture2D && d.MipLevels <= 1 && d.DepthOrArraySize <= 1 &&
+    if (d.Layout != gfx10::kConsoleLinearLayout && d.Dimension == ResourceDimension::Texture2D &&
+        d.MipLevels <= 1 && d.DepthOrArraySize <= 1 &&
         d.SampleCount <= 1 && l.known && l.block_width == 1 && l.block_height == 1 && l.planes == 1 &&
         d.Width <= 0xFFFFFFFFull &&
         os::surface::block64k_layout_2d(static_cast<uint32_t>(d.Width), d.Height, l.block_bytes, &block)) {

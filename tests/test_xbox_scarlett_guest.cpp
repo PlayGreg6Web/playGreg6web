@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "abi/playgta6_abi.h"
+#include "gpu/d3d12_guest_objects.h"
 #include "gpu/gfx10_detile.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
@@ -1250,10 +1251,12 @@ void test_xg() {
     ga::XgMipLayout m1{};
     std::memcpy(&m0, layout.data() + ga::kXgLayoutPlaneOffset + ga::kXgPlaneMipOffset, sizeof(m0));
     std::memcpy(&m1, layout.data() + ga::kXgLayoutPlaneOffset + ga::kXgPlaneMipOffset + ga::kXgMipLayoutSize, sizeof(m1));
+    // Linear (0x100): addrlib ADDR_SW_LINEAR, mips smallest-first with 256 B-aligned pitches, so
+    // mip 0 sits after mips 8..1 (98,048 B) and mip 1 after mips 8..2 (32,512 B).
     CHECK(m0.pitch_bytes == 1024 && m0.size_bytes == 256u * 1024u && m0.slice_2d_size_bytes == 256u * 1024u);
-    CHECK(m0.offset_bytes == 0 && m0.width_elements == 256 && m0.height_elements == 256);
-    CHECK(m1.pitch_bytes == 512 && m1.offset_bytes >= m0.size_bytes);
-    CHECK(total >= m1.offset_bytes + m1.size_bytes);
+    CHECK(m0.offset_bytes == 98048u && m0.width_elements == 256 && m0.height_elements == 256);
+    CHECK(m1.pitch_bytes == 512 && m1.offset_bytes == 32512u);
+    CHECK(total == 98048u + 256u * 1024u);
 
     // CopyIntoSubresource (slot 8) of mip 0 from a tightly packed source.
     std::vector<uint8_t> texels(256 * 256 * 4);
@@ -1264,7 +1267,7 @@ void test_xg() {
     CHECK(com::write_guest(src, texels.data(), texels.size()));
     const uint64_t dst = com::guest_alloc(total);
     CHECK(as_hr(fx.vcall(comp, 8, {I(dst), I(0), I(0), I(src), I(1024), I(256 * 1024)})) == 0);
-    CHECK(guest_bytes(dst, texels.size()) == texels);
+    CHECK(guest_bytes(dst + 98048u, texels.size()) == texels);
     CHECK(as_hr(fx.vcall(comp, 8, {I(0), I(0), I(0), I(src), I(1024), I(0)})) == com::E_POINTER_HR);
 
     // Slot 1 drops the computer (no IUnknown on this interface).
@@ -1316,13 +1319,19 @@ void test_xg() {
     // CopyIntoSubresource writes the GFX10 layout that the runtime's detiler reads back, per mip
     // (mip 1 of a 9-mip 256x256 RGBA8 sits where the GFX10 chain puts it), per array slice, for a
     // thick 3D surface and for 64KB_D. An unverified mode (64KB_R_X) keeps the linear answer.
+    // Linear 0x100 (#678): the same placement, and the D3D12 allocation size for the same
+    // description equals the XG total (one rule for allocation, XG and the upload's de-tiler).
     namespace gfx10 = playgta6::gpu::gfx10;
+    namespace dg = playgta6::gpu::d3d12_guest;
     struct TiledCase {
         uint32_t dim, w, h, d, mips, format, bpe, mip, slice, swizzle;
     };
     for (const TiledCase& c : {TiledCase{3, 256, 256, 1, 9, 28, 4, 1, 0, 0x105}, TiledCase{3, 64, 64, 1, 1, 28, 4, 0, 0, 0x105},
                                TiledCase{4, 16, 16, 16, 1, 10, 8, 0, 0, 0x105}, TiledCase{3, 256, 256, 3, 2, 61, 1, 1, 2, 0x10A},
-                               TiledCase{3, 512, 256, 1, 3, 71, 8, 0, 0, 0x10A}}) {
+                               TiledCase{3, 512, 256, 1, 3, 71, 8, 0, 0, 0x10A}, TiledCase{3, 128, 72, 1, 7, 41, 4, 3, 0, 0x100},
+                               TiledCase{3, 128, 72, 1, 7, 41, 4, 0, 0, 0x100}, TiledCase{3, 20, 6, 3, 3, 28, 4, 1, 2, 0x100},
+                               TiledCase{4, 32, 32, 36, 1, 42, 4, 0, 0, 0x100}, TiledCase{3, 100, 60, 1, 5, 71, 8, 2, 0, 0x100},
+                               TiledCase{2, 4096, 1, 1, 3, 41, 4, 2, 0, 0x100}}) {
         const uint64_t tdesc = xg_desc(c.dim, c.w, c.h, c.d, c.mips, c.format);
         CHECK(com::write_guest(tdesc + 0x2C, c.swizzle));
         const uint64_t tout = fx.out_slot();
@@ -1341,8 +1350,18 @@ void test_xg() {
         CHECK(com::write_guest(tsrc, lin.data(), lin.size()));
         const gfx10::TextureLayoutDesc gd{c.format, c.w, c.h, c.dim == 4 ? c.d : 1u, c.mips, c.swizzle, 0};
         const size_t chain = gfx10::surface_bytes(gd);
-        const uint32_t slices = c.dim == 3 ? c.d : 1u;
+        const uint32_t slices = c.dim != 4 ? c.d : 1u;
         CHECK(chain != 0);
+        dg::GuestResourceDesc rd{};
+        rd.Dimension = c.dim;
+        rd.Width = c.w;
+        rd.Height = c.h;
+        rd.DepthOrArraySize = static_cast<uint16_t>(c.d);
+        rd.MipLevels = static_cast<uint16_t>(c.mips);
+        rd.Format = c.format;
+        rd.SampleCount = 1;
+        rd.Layout = c.swizzle;
+        CHECK(dg::resource_size_estimate(rd) == chain * slices);
 
         const uint64_t tlayout = com::guest_alloc(ga::kXgResourceLayoutSize);
         CHECK(as_hr(fx.vcall(tcomp, 2, {I(tlayout)})) == 0);

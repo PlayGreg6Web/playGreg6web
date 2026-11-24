@@ -1787,6 +1787,64 @@ void test_all_subresource_uploads() {
         }
         CHECK(device->stats().textures_uploaded == uploads + 2);
 
+        // Console linear 0x100 with a mip chain (#678): every mip uploads from its addrlib
+        // ADDR_SW_LINEAR offset (smallest mip first, 256 B pitch), inside the allocation size.
+        {
+            gfx10::TextureLayoutDesc lg{};
+            lg.dxgi_format = 41;  // R32_FLOAT
+            lg.width = 128;
+            lg.height = 72;
+            lg.mip_levels = 7;
+            lg.d3d12_layout = 0x100;
+            dg::GuestResourceDesc rd = d;
+            rd.Width = 128;
+            rd.Height = 72;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 7;
+            rd.Format = 41;
+            rd.Layout = 0x100;
+            const size_t lsize = gfx10::surface_bytes(lg);
+            CHECK(lsize == 55552u && dg::resource_size_estimate(rd) == lsize);
+            std::vector<uint8_t> lsurf(lsize, 0);
+            std::vector<std::vector<uint8_t>> mips(7);
+            for (uint32_t m = 0; m < 7; ++m) {
+                const uint32_t mw = std::max(1u, 128u >> m), mh = std::max(1u, 72u >> m);
+                mips[m].resize(size_t{mw} * mh * 4);
+                for (size_t i = 0; i < mips[m].size(); ++i) {
+                    mips[m][i] = static_cast<uint8_t>(1u + (i * 5u + m * 41u) % 241u);
+                }
+                CHECK(gfx10::tile_surface_subresource(lg, m, 0, mips[m].data(), mips[m].size(), lsurf.data(), lsurf.size()));
+            }
+            const uint64_t lmem =
+                arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+            CHECK(com::write_guest(lmem, lsurf.data(), lsurf.size()));
+            dg::Resource::Placement lp{};
+            lp.address = lmem;
+            auto ctex = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                         dg::device_ref(device.get()), rd, lp, 0u);
+            CHECK(ctex && ctex->initialize());
+            gpu::CommandEncoder ec;
+            CHECK(device->sync_bound_texture_memory(ctex->id(), ec));
+            const auto wc = writes(ec);
+            CHECK(wc.size() == 7);
+            for (const Packet& pk : wc) {
+                const auto wt = pod<GpuWriteTexturePayload>(pk);
+                CHECK(wt.mip_level < 7 && wt.origin_z == 0);
+                if (wt.mip_level >= 7) {
+                    continue;
+                }
+                const uint32_t mw = std::max(1u, 128u >> wt.mip_level), mh = std::max(1u, 72u >> wt.mip_level);
+                const uint32_t pitch = (mw * 4u + 255u) / 256u * 256u;
+                CHECK(wt.width == mw && wt.height == mh && wt.bytes_per_row == pitch);
+                bool same = true;
+                for (uint32_t y = 0; same && y < mh; ++y) {
+                    same = std::memcmp(pk.payload.data() + sizeof(GpuWriteTexturePayload) + size_t{y} * pitch,
+                                       mips[wt.mip_level].data() + size_t{y} * mw * 4, size_t{mw} * 4) == 0;
+                }
+                CHECK(same);
+            }
+        }
+
         // A linear 2D array whose rows are a multiple of 256 B uploads every slice (mip 0 only).
         const uint64_t lin_mem =
             arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);

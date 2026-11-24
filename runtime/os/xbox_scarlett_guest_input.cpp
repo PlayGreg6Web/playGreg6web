@@ -683,21 +683,23 @@ public:
 
 private:
     // A 2D (array slices repeat the chain) or 3D descriptor whose swizzle mode (+0x2C, 0x100 | n) is a GFX10 mode
-    // verified against addrlib (256B/4KB/64KB _S and _D; thick 3D for _S): GetResourceLayout
-    // reports the GFX10 surface and CopyIntoSubresource writes the GFX10 layout the runtime's
-    // detiler reads back (gpu/gfx10_detile.h, one placement for all three). Other tiled modes keep
-    // the linear answer and are counted.
+    // verified against addrlib (256B/4KB/64KB _S and _D; thick 3D for _S), or the console linear
+    // mode 0x100 (addrlib ADDR_SW_LINEAR; 1D too, #678): GetResourceLayout reports the GFX10
+    // surface and CopyIntoSubresource writes the GFX10 layout the runtime's detiler reads back
+    // (gpu/gfx10_detile.h, one placement for the allocation size, XG and the upload). Other tiled
+    // modes keep the host computer's answer and are counted.
     void init_tiled() {
         namespace gfx10 = playgta6::gpu::gfx10;
         const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(desc_.swizzle_mode);
-        if (mode == gfx10::SwizzleMode::Linear || mode == gfx10::SwizzleMode::Unsupported) {
+        const bool linear = desc_.swizzle_mode == gfx10::kConsoleLinearLayout;
+        if ((mode == gfx10::SwizzleMode::Linear && !linear) || mode == gfx10::SwizzleMode::Unsupported) {
             return;
         }
-        const bool verified = mode == gfx10::SwizzleMode::Sw256BS || mode == gfx10::SwizzleMode::Sw256BD ||
+        const bool verified = linear || mode == gfx10::SwizzleMode::Sw256BS || mode == gfx10::SwizzleMode::Sw256BD ||
                               mode == gfx10::SwizzleMode::Sw4KBS || mode == gfx10::SwizzleMode::Sw4KBD ||
                               mode == gfx10::SwizzleMode::Sw64KBS || mode == gfx10::SwizzleMode::Sw64KBD;
-        if (!verified || (desc_.dimension != 3 && desc_.dimension != 4) || desc_.sample_count > 1 ||
-            layout_.mip_levels == 0) {
+        if (!verified || (desc_.dimension != 3 && desc_.dimension != 4 && !(linear && desc_.dimension == 2)) ||
+            desc_.sample_count > 1 || layout_.mip_levels == 0) {
             if (xg_linear_answers().fetch_add(1) == 0) {
                 diag("xg_xs: swizzle mode 0x" + hex32(desc_.swizzle_mode) +
                      " answered with the linear layout (mode not verified or MSAA; counted)");
@@ -706,12 +708,12 @@ private:
         }
         tiled_desc_.dxgi_format = desc_.format;
         tiled_desc_.width = static_cast<uint32_t>(desc_.width);
-        tiled_desc_.height = std::max<uint32_t>(desc_.height, 1u);
+        tiled_desc_.height = desc_.dimension == 2 ? 1u : std::max<uint32_t>(desc_.height, 1u);
         tiled_desc_.depth = desc_.dimension == 4 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
         tiled_desc_.mip_levels = layout_.mip_levels;
         tiled_desc_.d3d12_layout = desc_.swizzle_mode;
-        // 2D arrays repeat the chain per slice (addrlib: slice stride = mip-chain slice size).
-        slices_ = desc_.dimension == 3 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
+        // 1D/2D arrays repeat the chain per slice (addrlib: slice stride = mip-chain slice size).
+        slices_ = desc_.dimension != 4 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
         chain_bytes_ = gfx10::surface_bytes(tiled_desc_);
         const size_t bytes = chain_bytes_ * slices_;
         if (bytes == 0) {

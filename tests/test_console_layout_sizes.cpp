@@ -37,10 +37,21 @@ dg::GuestResourceDesc texture(uint32_t dimension, uint64_t w, uint32_t h, uint16
 }
 
 void test_sizes() {
-    // Linear: the estimate is unchanged (256x256 RGBA8, 9 mips: 349,524 bytes).
-    const uint64_t linear = dg::resource_size_estimate(texture(3, 256, 256, 1, 9, 28, 0x100));
-    CHECK(linear == 349524u);
-    CHECK(dg::resource_size_estimate(texture(3, 256, 256, 1, 9, 28, 0)) == linear);
+    // D3D12 layout 0: the tight estimate (256x256 RGBA8, 9 mips: 349,524 bytes).
+    CHECK(dg::resource_size_estimate(texture(3, 256, 256, 1, 9, 28, 0)) == 349524u);
+    // Console linear 0x100 (#678): addrlib ADDR_SW_LINEAR, 256 B-aligned pitch per mip, the same
+    // placement XG and the upload use: 360,192 bytes for 256x256 RGBA8 with 9 mips.
+    CHECK(dg::resource_size_estimate(texture(3, 256, 256, 1, 9, 28, 0x100)) == 360192u);
+    const gfx10::TextureLayoutDesc r32{41u, 128u, 72u, 1u, 7u, 0x100u, 0u};
+    CHECK(dg::resource_size_estimate(texture(3, 128, 72, 1, 7, 41, 0x100)) == 55552u);
+    CHECK(gfx10::surface_bytes(r32) == 55552u);
+    CHECK(dg::resource_size_estimate(texture(3, 128, 72, 4, 7, 41, 0x100)) == 4u * 55552u);    // array
+    CHECK(dg::resource_size_estimate(texture(4, 32, 32, 36, 1, 42, 0x100)) == 36u * 32u * 256u);  // 3D
+    CHECK(dg::resource_size_estimate(texture(2, 4096, 1, 1, 1, 41, 0x100)) == 16384u);       // 1D
+    CHECK(dg::resource_size_estimate(texture(3, 560, 16, 1, 1, 29, 0x100)) == 2304u * 16u);
+    // Committed resources use the same size (no 64 KiB-block model for 0x100).
+    CHECK(dg::committed_memory_size(texture(3, 128, 72, 1, 7, 41, 0x100)) == 55552u);
+    CHECK(dg::committed_memory_size(texture(3, 560, 16, 1, 1, 29, 0x100)) == 2304u * 16u);
 
     // 4KB_S: mip tail first, mip 0 last (addrlib): 352,256 bytes.
     CHECK(dg::resource_size_estimate(texture(3, 256, 256, 1, 9, 28, 0x105)) == 352256u);
@@ -57,7 +68,7 @@ void test_sizes() {
     CHECK(dg::resource_size_estimate(texture(3, 1280, 720, 1, 1, 28, 0x102)) == 160u * 90u * 256u);
 
     // Not verified or not applicable: linear estimate.
-    const uint64_t lin_rx = dg::resource_size_estimate(texture(3, 256, 256, 1, 1, 28, 0x100));
+    const uint64_t lin_rx = dg::resource_size_estimate(texture(3, 256, 256, 1, 1, 28, 0));
     CHECK(dg::resource_size_estimate(texture(3, 256, 256, 1, 1, 28, 0x11B)) == lin_rx);  // 64KB_R_X
     CHECK(dg::resource_size_estimate(texture(3, 256, 256, 1, 1, 28, 0x103)) == lin_rx);  // 256B_R
     dg::GuestResourceDesc msaa = texture(3, 256, 256, 1, 1, 28, 0x105);

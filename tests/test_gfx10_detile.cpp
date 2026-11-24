@@ -413,9 +413,62 @@ void test_mip_chain_placement() {
     // 256B modes: smallest mip first, no tail. 4 B, 16x16 with 2 mips: mip 1 (8x8) = 256 B first.
     CHECK(surface_bytes({28u, 16u, 16u, 1u, 2u, 0x101u, 0u}) == 256u + 1024u);
     CHECK(mip_placement({28u, 16u, 16u, 1u, 2u, 0x101u, 0u}, 0u).macro_block_offset == 256u);
-    // Linear: mip 0 only.
-    CHECK(mip_placement({28u, 16u, 16u, 1u, 2u, 0x100u, 0u}, 0u).ok);
-    CHECK(!mip_placement({28u, 16u, 16u, 1u, 2u, 0x100u, 0u}, 1u).ok);
+    // D3D12 ROW_MAJOR: mip 0 only.
+    CHECK(mip_placement({28u, 16u, 16u, 1u, 2u, 1u, 0u}, 0u).ok);
+    CHECK(!mip_placement({28u, 16u, 16u, 1u, 2u, 1u, 0u}, 1u).ok);
+}
+
+void verify_surface_round_trip(const TextureLayoutDesc& desc, uint32_t seed);
+
+// Console linear (0x100): addrlib gfx10 ADDR_SW_LINEAR (Gfx10Lib::HwlComputeSurfaceInfoLinear).
+void test_console_linear_chain() {
+    // 128x72 R32_FLOAT with 7 mips: pitches aligned to 64 elements (256 B), heights unpadded,
+    // mip sizes rounded up (addrlib GetMipSize: ShiftCeil, so 72 -> 36, 18, 9, 5, 3, 2), smallest
+    // mip first. Offsets: mip 6 at 0 (64x2), 5 at 512, 4 at 1,280, 3 at 2,560, 2 at 4,864, 1 at
+    // 9,472, mip 0 at 18,688; 55,552 B in all.
+    const TextureLayoutDesc r32{41u, 128u, 72u, 1u, 7u, 0x100u, 0u};
+    CHECK(surface_bytes(r32) == 55552u);
+    const uint64_t offsets[7] = {18688u, 9472u, 4864u, 2560u, 1280u, 512u, 0u};
+    const uint32_t pitches[7] = {128u, 64u, 64u, 64u, 64u, 64u, 64u};
+    const uint32_t heights[7] = {72u, 36u, 18u, 9u, 5u, 3u, 2u};
+    for (uint32_t mip = 0; mip < 7u; ++mip) {
+        const MipPlacement p = mip_placement(r32, mip);
+        CHECK(p.ok && !p.in_tail && p.offset_bytes == offsets[mip] && p.macro_block_offset == offsets[mip]);
+        CHECK(p.pitch_elements == pitches[mip] && p.height_elements == heights[mip]);
+        CHECK(p.slice_bytes == uint64_t{pitches[mip]} * heights[mip] * 4u && p.block_bytes == 256u);
+    }
+    CHECK(!mip_placement(r32, 7u).ok);
+    // Mip 2 rows (32 x 4 B = 128 B) sit at a 256 B pitch inside the surface.
+    std::vector<uint8_t> surface(55552u, 0u);
+    const std::vector<uint8_t> mip2 = make_synthetic_linear(32u * 18u * 4u, 13400u);
+    CHECK(tile_surface_subresource(r32, 2u, 0u, mip2.data(), mip2.size(), surface.data(), surface.size()));
+    for (uint32_t y = 0; y < 18u; ++y) {
+        CHECK(std::memcmp(surface.data() + 4864u + y * 256u, mip2.data() + y * 128u, 128u) == 0);
+    }
+    // Mip 4 (D3D 8x4 texels) reads 4 rows of its 5-row (ShiftCeil) slot at 1,280.
+    std::vector<uint8_t> out4;
+    const DetileResult r4 = detile_surface_subresource(r32, 4u, 0u, surface.data(), surface.size(), out4);
+    CHECK(r4.ok && r4.rows == 4u && r4.row_pitch_bytes == 32u && out4.size() == 128u);
+    // Single mip: pitch aligned, height not (addrlib): 20x10 RGBA8 rows of 80 B at a 256 B pitch.
+    CHECK(surface_bytes({28u, 20u, 10u, 1u, 1u, 0x100u, 0u}) == 256u * 10u);
+    CHECK(surface_bytes({28u, 64u, 150u, 1u, 1u, 0x100u, 0u}) == 256u * 150u);
+    // BC1 100x60, 2 mips: 25x15 then 13x8 blocks, pitch aligned to 32 blocks (256 B).
+    CHECK(surface_bytes({71u, 100u, 60u, 1u, 2u, 0x100u, 0u}) == 32u * 8u * 8u + 32u * 15u * 8u);
+    CHECK(mip_placement({71u, 100u, 60u, 1u, 2u, 0x100u, 0u}, 0u).offset_bytes == 32u * 8u * 8u);
+    // Each slice (array slice or 3D depth slice) holds the whole chain.
+    TextureLayoutDesc arr = r32;
+    arr.array_size = 3u;
+    CHECK(surface_bytes(arr) == 3u * 55552u);
+    CHECK(surface_bytes({42u, 32u, 32u, 36u, 1u, 0x100u, 0u}) == 36u * 32u * 256u);
+    // An explicit pitch keeps the single-subresource path (mip 0 at the base).
+    TextureLayoutDesc pitched = r32;
+    pitched.pitch_bytes = 512u;
+    CHECK(!mip_placement(pitched, 1u).ok);
+    // Round trips: chains, arrays, 3D, 1D-like rows, BC.
+    verify_surface_round_trip(r32, 13500u);
+    verify_surface_round_trip({71u, 100u, 60u, 1u, 5u, 0x100u, 0u}, 13600u);
+    verify_surface_round_trip({10u, 20u, 12u, 6u, 3u, 0x100u, 0u}, 13700u);
+    verify_surface_round_trip({61u, 4096u, 1u, 1u, 13u, 0x100u, 0u}, 13800u);
 }
 
 // Every mip of a chain written into one surface must read back unchanged (no overlaps).
@@ -557,10 +610,10 @@ void test_tail_coordinates() {
     }
 }
 
-// Linear layouts: mip 0 only (the console's linear mip rule is not established, #665); array
-// slices where every candidate rule agrees on the slice stride (one mip, 256 B-multiple rows).
+// D3D12 linear layouts (ROW_MAJOR here): mip 0 only; array slices where every candidate rule
+// agrees on the slice stride (one mip, 256 B-multiple rows).
 void test_linear_subresources() {
-    TextureLayoutDesc arr{28u, 64u, 4u, 1u, 1u, 0x100u, 0u};
+    TextureLayoutDesc arr{28u, 64u, 4u, 1u, 1u, 1u, 0u};
     arr.array_size = 3u;
     const std::vector<uint8_t> src = make_synthetic_linear(3u * 1024u, 13200u);
     CHECK(surface_bytes(arr) == 3u * 1024u);
@@ -578,8 +631,8 @@ void test_linear_subresources() {
     TextureLayoutDesc chain = arr;  // multi-mip: slice stride depends on the mip rule
     chain.mip_levels = 2u;
     CHECK(!detile_surface_subresource(chain, 0u, 1u, src.data(), src.size(), out).ok);
-    // 128x72 R32_FLOAT with 7 mips: mip 0 at the base, the other mips refused.
-    const TextureLayoutDesc r32{41u, 128u, 72u, 1u, 7u, 0x100u, 0u};
+    // 128x72 R32_FLOAT with 7 mips in ROW_MAJOR: mip 0 at the base, the other mips refused.
+    const TextureLayoutDesc r32{41u, 128u, 72u, 1u, 7u, 1u, 0u};
     const std::vector<uint8_t> big = make_synthetic_linear(128u * 72u * 4u, 13300u);
     CHECK(detile_surface_subresource(r32, 0u, 0u, big.data(), big.size(), out).ok && out == big);
     for (uint32_t mip = 1; mip < 7u; ++mip) {
@@ -690,6 +743,7 @@ int main() {
     test_addrlib_equations_3d();
     test_mip_chain_placement();
     test_mip_chain_round_trips();
+    test_console_linear_chain();
     test_subresource_round_trips();
     test_tail_coordinates();
     test_linear_subresources();

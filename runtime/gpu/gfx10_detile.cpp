@@ -783,7 +783,15 @@ struct ChainLayout {
     bool in_tail[kMaxMips] = {};
     uint32_t tail_x[kMaxMips] = {};
     uint32_t tail_y[kMaxMips] = {};
+    bool linear = false;  // console linear (ADDR_SW_LINEAR): pitched rows, no blocks
 };
+
+// The console linear layout (0x100 | SW_LINEAR) without an explicit pitch: placed by the same
+// chain code as the tiled modes. Layouts 0 / 1 (D3D12 UNKNOWN / ROW_MAJOR) and explicit pitches
+// keep the single-subresource path (mip 0 at the base, rows at pitch_bytes or tight).
+bool is_console_linear(const TextureLayoutDesc& desc) noexcept {
+    return desc.d3d12_layout == kConsoleLinearLayout && desc.pitch_bytes == 0u;
+}
 
 ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
     ChainLayout c{};
@@ -794,7 +802,8 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
     }
     c.bpp_log2 = bpp_to_log2(c.fmt.bytes_per_block);
     const SwizzleTraits traits = classify_mode(decode_d3d12_layout(desc.d3d12_layout));
-    if (!traits.valid || traits.family == SwizzleFamily::Linear) {
+    c.linear = is_console_linear(desc);
+    if (!traits.valid || (traits.family == SwizzleFamily::Linear && !c.linear)) {
         c.error = "not a tiled layout";
         return c;
     }
@@ -810,6 +819,29 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
     const uint32_t ew = (desc.width + c.fmt.block_width - 1u) / c.fmt.block_width;
     const uint32_t eh = (desc.height + c.fmt.block_height - 1u) / c.fmt.block_height;
     const uint32_t depth = desc.depth;
+    if (c.linear) {
+        // AMD addrlib Gfx10Lib::HwlComputeSurfaceInfoLinear, ADDR_SW_LINEAR: the pitch of every
+        // mip is aligned to 256 bytes (256 / bytes-per-element elements), mip sizes are rounded up
+        // (Gfx10Lib::GetMipSize: ShiftCeil of the element size), heights are not padded,
+        // mips are stored smallest-first (mip 0 last), and each slice (array slice or 3D depth
+        // slice) holds the whole chain: slice stride = chain size, surface = chain x slices.
+        const uint64_t bpe = c.fmt.bytes_per_block;
+        const uint32_t pitch_align = 256u / c.fmt.bytes_per_block;
+        uint64_t chain = 0;
+        for (int32_t i = static_cast<int32_t>(c.mips) - 1; i >= 0; --i) {
+            const uint32_t m = static_cast<uint32_t>(i);
+            c.pitch[m] = static_cast<uint32_t>(align_pow2(shift_ceil(ew, m), pitch_align));
+            c.height[m] = shift_ceil(eh, m);
+            c.slice_bytes[m] = uint64_t{c.pitch[m]} * c.height[m] * bpe;
+            c.size_bytes[m] = c.slice_bytes[m] * (depth > 1u ? shift_ceil(depth, m) : 1u);
+            c.offset[m] = c.macro_offset[m] = chain;
+            chain += c.slice_bytes[m];
+        }
+        c.slice_stride = chain;
+        c.total_bytes = chain * depth * std::max(desc.array_size, 1u);
+        c.ok = true;
+        return c;
+    }
     c.shape = compute_tile_shape(traits, c.bpp_log2, depth > 1u);
     const bool thick = c.shape.thick_3d;
     c.bw = 1u << c.shape.w_log2;
@@ -942,6 +974,10 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
 }
 
 uint64_t chain_address(const ChainLayout& c, uint32_t mip, uint32_t x, uint32_t y, uint32_t z) noexcept {
+    if (c.linear) {
+        return c.slice_stride * z + c.offset[mip] +
+               (uint64_t{y} * c.pitch[mip] + x) * c.fmt.bytes_per_block;
+    }
     const TileShape& s = c.shape;
     const uint32_t tx = x + c.tail_x[mip];
     const uint32_t ty = y + c.tail_y[mip];
@@ -959,8 +995,10 @@ uint64_t chain_address(const ChainLayout& c, uint32_t mip, uint32_t x, uint32_t 
     return c.slice_stride * slice + c.macro_offset[mip] + (blk_index << s.blk_size_log2) + intra;
 }
 
+// Linear layouts outside the chain code (D3D12 UNKNOWN / ROW_MAJOR, or an explicit pitch).
 bool is_linear_layout(const TextureLayoutDesc& desc) noexcept {
-    return classify_mode(decode_d3d12_layout(desc.d3d12_layout)).family == SwizzleFamily::Linear;
+    return classify_mode(decode_d3d12_layout(desc.d3d12_layout)).family == SwizzleFamily::Linear &&
+           !is_console_linear(desc);
 }
 
 }  // namespace
@@ -992,7 +1030,7 @@ MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept
     p.slice_bytes = c.slice_bytes[mip];
     p.size_bytes = c.size_bytes[mip];
     p.offset_bytes = c.offset[mip];
-    p.block_bytes = uint64_t{1} << c.shape.blk_size_log2;
+    p.block_bytes = c.linear ? kConsoleLinearAlignment : uint64_t{1} << c.shape.blk_size_log2;
     p.ok = true;
     return p;
 }
