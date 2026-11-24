@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "gpu/descriptor_words.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/xmem_windows.h"
@@ -668,6 +669,109 @@ HResult Device::CreateRootSignature(uint32_t, uint64_t blob, uint64_t length, co
     return hand_out(std::move(object), riid, out);
 }
 
+void Device::store_descriptor_words(uint64_t cpu_handle) {
+    d3d::ResolvedDescriptor r;
+    if (heaps_.resolve_cpu(d3d::CpuDescriptorHandle{cpu_handle}, &r) != d3d::Status::Ok ||
+        r.heap->desc().cpu_address == 0) {
+        return;
+    }
+    const uint64_t address = r.heap->desc().cpu_address + uint64_t{r.index} * r.heap->increment();
+    uint32_t words[bridge::kViewSlotBytes / 4] = {};
+    if (r.heap->type() == d3d::DescriptorHeapType::Sampler) {
+        const d3d::SamplerDescriptor* s = r.heap->sampler(r.index);
+        if (s != nullptr && s->kind == d3d::DescriptorKind::Sampler) {
+            bridge::sampler_words(s->desc, words);
+        }
+        com::write_guest(address, words, bridge::kSamplerSlotBytes);
+        return;
+    }
+    if (r.heap->type() != d3d::DescriptorHeapType::CbvSrvUav) {
+        return;  // RTV / DSV slots hold render-target state on the console, not shader words
+    }
+    const d3d::ViewDescriptor* v = r.heap->view(r.index);
+    const bridge::WordsStatus status =
+        v != nullptr ? bridge::view_words(*bridge_, *v, words) : bridge::WordsStatus::Null;
+    store_descriptor_words(cpu_handle, words,
+                           v != nullptr && v->kind == d3d::DescriptorKind::Cbv ? bridge::kCbvWordBytes
+                                                                              : bridge::kViewSlotBytes);
+    descriptor_words_[static_cast<size_t>(status)].fetch_add(1, std::memory_order_relaxed);
+    const uint32_t bit = 1u << static_cast<uint32_t>(status);
+    if (status != bridge::WordsStatus::Ok && status != bridge::WordsStatus::Null &&
+        (descriptor_words_reported_.fetch_or(bit) & bit) == 0) {
+        os::log(std::string("d3d12_xs: descriptor words: ") + bridge::words_status_name(status) +
+                " (first at handle " + hex(cpu_handle) + "; zero words written)");
+    }
+}
+
+void Device::store_descriptor_words(uint64_t cpu_handle, const uint32_t* words, size_t bytes) {
+    d3d::ResolvedDescriptor r;
+    if (heaps_.resolve_cpu(d3d::CpuDescriptorHandle{cpu_handle}, &r) != d3d::Status::Ok ||
+        r.heap->desc().cpu_address == 0 || bytes > r.heap->increment()) {
+        return;
+    }
+    com::write_guest(r.heap->desc().cpu_address + uint64_t{r.index} * r.heap->increment(), words, bytes);
+}
+
+void Device::copy_descriptor_memory(const std::vector<std::pair<uint64_t, uint32_t>>& dst_ranges,
+                                    const std::vector<std::pair<uint64_t, uint32_t>>& src_ranges, uint32_t type) {
+    const uint32_t inc = d3d::descriptor_handle_increment_size(static_cast<d3d::DescriptorHeapType>(type));
+    if (inc == 0 || (type != static_cast<uint32_t>(d3d::DescriptorHeapType::CbvSrvUav) &&
+                     type != static_cast<uint32_t>(d3d::DescriptorHeapType::Sampler))) {
+        return;
+    }
+    // Read every source slot first (the result equals "read all sources, then write all
+    // destinations", as for the registry copy). A source without guest memory contributes the words
+    // of its registry record.
+    std::vector<uint8_t> bytes;
+    for (const auto& [start, count] : src_ranges) {
+        d3d::ResolvedDescriptor r;
+        if (heaps_.resolve_cpu(d3d::CpuDescriptorHandle{start}, &r) != d3d::Status::Ok) {
+            return;
+        }
+        const size_t at = bytes.size();
+        bytes.resize(at + size_t{count} * inc);
+        if (r.heap->desc().cpu_address != 0) {
+            if (!com::read_guest(r.heap->desc().cpu_address + uint64_t{r.index} * inc, bytes.data() + at,
+                                 size_t{count} * inc)) {
+                return;
+            }
+            continue;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t words[bridge::kViewSlotBytes / 4] = {};
+            if (r.heap->type() == d3d::DescriptorHeapType::Sampler) {
+                const d3d::SamplerDescriptor* s = r.heap->sampler(r.index + i);
+                if (s != nullptr && s->kind == d3d::DescriptorKind::Sampler) {
+                    bridge::sampler_words(s->desc, words);
+                }
+            } else if (const d3d::ViewDescriptor* v = r.heap->view(r.index + i)) {
+                bridge::view_words(*bridge_, *v, words);
+            }
+            std::memcpy(bytes.data() + at + size_t{i} * inc, words, inc);
+        }
+    }
+    size_t at = 0;
+    for (const auto& [start, count] : dst_ranges) {
+        d3d::ResolvedDescriptor r;
+        if (heaps_.resolve_cpu(d3d::CpuDescriptorHandle{start}, &r) != d3d::Status::Ok) {
+            return;
+        }
+        const size_t n = std::min(size_t{count} * inc, bytes.size() - at);
+        if (r.heap->desc().cpu_address != 0 && n != 0) {
+            com::write_guest(r.heap->desc().cpu_address + uint64_t{r.index} * inc, bytes.data() + at, n);
+        }
+        at += n;
+    }
+}
+
+std::array<uint64_t, 7> Device::descriptor_word_counts() const {
+    std::array<uint64_t, 7> out{};
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i] = descriptor_words_[i].load(std::memory_order_relaxed);
+    }
+    return out;
+}
+
 void Device::CreateConstantBufferView(uint64_t desc_va, uint64_t dest) {
     d3d::ConstantBufferViewDesc cbv;
     const d3d::ConstantBufferViewDesc* desc = nullptr;
@@ -686,7 +790,9 @@ void Device::CreateConstantBufferView(uint64_t desc_va, uint64_t dest) {
         note_bad_argument(std::string("CreateConstantBufferView: ") + d3d::status_name(s) + " (address " +
                           hex(desc != nullptr ? desc->buffer_location : 0) + ", size " +
                           std::to_string(desc != nullptr ? desc->size_in_bytes : 0) + ", handle " + hex(dest) + ")");
+        return;
     }
+    store_descriptor_words(dest);
 }
 
 void Device::CreateSampler(uint64_t desc_va, uint64_t dest) {
@@ -709,7 +815,9 @@ void Device::CreateSampler(uint64_t desc_va, uint64_t dest) {
     const d3d::Status s = heaps_.create_sampler(sd, d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string("CreateSampler: ") + d3d::status_name(s) + " (handle " + hex(dest) + ")");
+        return;
     }
+    store_descriptor_words(dest);
 }
 
 void Device::CopyDescriptors(com::CallContext& ctx) {
@@ -737,7 +845,16 @@ void Device::CopyDescriptors(com::CallContext& ctx) {
                                                   static_cast<d3d::DescriptorHeapType>(type));
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string("CopyDescriptors: ") + d3d::status_name(s));
+        return;
     }
+    std::vector<std::pair<uint64_t, uint32_t>> dst_ranges, src_ranges;
+    for (uint32_t i = 0; i < num_dst; ++i) {
+        dst_ranges.emplace_back(ds[i].ptr, dst_sizes != 0 ? dz[i] : 1u);
+    }
+    for (uint32_t i = 0; i < num_src; ++i) {
+        src_ranges.emplace_back(ss[i].ptr, src_sizes != 0 ? sz[i] : 1u);
+    }
+    copy_descriptor_memory(dst_ranges, src_ranges, type);
 }
 
 void Device::CopyDescriptorsSimple(uint32_t count, uint64_t dest, uint64_t src, uint32_t type) {
@@ -750,6 +867,10 @@ void Device::CopyDescriptorsSimple(uint32_t count, uint64_t dest, uint64_t src, 
                                                          static_cast<d3d::DescriptorHeapType>(type));
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string("CopyDescriptorsSimple: ") + d3d::status_name(s));
+        return;
+    }
+    if (count != 0) {
+        copy_descriptor_memory({{dest, count}}, {{src, count}}, type);
     }
 }
 

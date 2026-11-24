@@ -2,6 +2,7 @@
 // a hand-written "lifted" caller sets up Win64 arguments, loads `[this]` and calls a vtable slot
 // (or a flat export) through __playgta6_indirect_call. Synthetic data only.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "gpu/gfx10_descriptors.h"
 #include "gpu/shader_pack_index.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
@@ -2463,6 +2465,112 @@ void test_uav_texture_storage_usage() {
     scene.release_all({rgba8, r11, r8u});
 }
 
+// G48: descriptor creation and copies leave the console's descriptor words in the slot's guest
+// memory (descriptor_words.h), so slots the title copies itself carry them.
+void test_descriptor_words_in_memory() {
+    namespace hw = playgta6::gpu::gfx10;
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                    {I(put(dg::GuestDescriptorHeapDesc{0, 16, 0, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    const uint64_t start = put<uint64_t>(0);
+    fx.sret_call(heap, Slot::GetCPUStart, start);
+    const uint64_t cpu0 = load64(start);
+    auto slot = [&](uint32_t i) {
+        std::array<uint32_t, 8> w{};
+        CHECK(com::read_guest(cpu0 + 32ull * i, w.data(), 32));
+        return w;
+    };
+    // The title keeps a free list in unused slots; a CBV write replaces dwords 0..3 only.
+    const uint32_t link[8] = {7, 0, 0, 0, 0xAAAA, 0xBBBB, 0, 0};
+    CHECK(com::write_guest(cpu0, link, sizeof(link)));
+
+    // CBV: the console's words (stride 16, records of 16 bytes, dword 3 0x0002403C).
+    fx.vcall(scene.device, Slot::CreateConstantBufferView,
+             {I(put(dg::GuestConstantBufferViewDesc{scene.vb_va + 0x40, 96})), I(cpu0)});
+    auto w = slot(0);
+    CHECK(w[0] == static_cast<uint32_t>(scene.vb_va + 0x40) && w[1] == ((scene.vb_va + 0x40) >> 32 | (16u << 16)) &&
+          w[2] == 6 && w[3] == 0x0002403Cu && w[4] == 0xAAAA && w[5] == 0xBBBB);
+    CHECK(hw::classify_slot(w.data()) == hw::SlotContent::Buffer);
+    fx.vcall(scene.device, Slot::CreateConstantBufferView, {I(0), I(cpu0 + 32)});  // null CBV
+    w = slot(1);
+    CHECK(w[0] == 0 && w[1] == (16u << 16) && w[2] == 0 && w[3] == 0x0002403Cu);
+
+    // Buffer SRV (structured) and texture SRV.
+    const uint64_t buf = committed(fx, scene.device, 2, buffer_desc(4096), 0xAC3);
+    const uint64_t buf_va = fx.vcall(buf, Slot2::GetGPUVirtualAddress);
+    dg::GuestShaderResourceViewDesc sd{};
+    sd.ViewDimension = 1;
+    sd.Shader4ComponentMapping = 0x1688;
+    sd.u[0] = 2;   // FirstElement
+    sd.u[2] = 10;  // NumElements
+    sd.u[3] = 16;  // StructureByteStride
+    fx.vcall(scene.device, Slot2::CreateShaderResourceView, {I(buf), I(put(sd)), I(cpu0 + 64)});
+    const hw::BufferResource b = hw::decode_buffer(slot(2).data());
+    CHECK(b.base == buf_va + 32 && b.stride == 16 && b.num_records == 10 && b.format == hw::Fmt::F32);
+
+    const uint64_t tex = committed(fx, scene.device, 1, texture_desc(64, 32, 87, 0), 0);  // B8G8R8A8_UNORM
+    const uint32_t tex_id = object_of<dg::Resource>(tex)->id();
+    fx.vcall(scene.device, Slot2::CreateShaderResourceView, {I(tex), I(0), I(cpu0 + 96)});
+    const auto tw = slot(3);
+    CHECK(hw::classify_slot(tw.data()) == hw::SlotContent::Image);
+    const hw::ImageResource img = hw::decode_image(tw.data());
+    CHECK(img.base != 0 && img.base % 256 == 0 && img.width == 64 && img.height == 32 && img.format == 56 &&
+          img.dst_sel == (hw::Swizzle{hw::Sel::Z, hw::Sel::Y, hw::Sel::X, hw::Sel::W}) &&
+          img.type == hw::ImageType::Tex2D);
+    CHECK(dev->state_bridge().texture_at(img.base) == tex_id);
+    CHECK(fx.vcall(tex, Slot2::GetGPUVirtualAddress) == 0);  // no memory: no GPU VA, a descriptor address only
+
+    // CopyDescriptorsSimple copies the memory too, including words the title wrote itself.
+    const uint32_t title_words[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    CHECK(com::write_guest(cpu0 + 4 * 32, title_words, 32));
+    fx.vcall(scene.device, Slot::CopyDescriptorsSimple, {I(2), I(cpu0 + 8 * 32), I(cpu0 + 3 * 32), I(0)});
+    CHECK(slot(8) == tw);
+    const auto copied = slot(9);
+    CHECK(std::memcmp(copied.data(), title_words, 32) == 0);
+
+    // Sampler words in a sampler heap (16-byte slots).
+    const uint64_t smp = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                   {I(put(dg::GuestDescriptorHeapDesc{1, 4, 0, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    fx.sret_call(smp, Slot::GetCPUStart, start);
+    const uint64_t smp0 = load64(start);
+    dg::GuestSamplerDesc ss{};
+    ss.Filter = 0x15;
+    ss.AddressU = ss.AddressV = ss.AddressW = 3;
+    ss.MaxLOD = 4.0f;
+    fx.vcall(scene.device, Slot::CreateSampler, {I(put(ss)), I(smp0 + 16)});
+    uint32_t sw[4] = {};
+    CHECK(com::read_guest(smp0 + 16, sw, 16));
+    const hw::SamplerState st = hw::decode_sampler(sw);
+    CHECK(st.clamp_x == 2 && st.xy_mag_filter == 1 && st.mip_filter == 2 && st.max_lod == 4u * 256u);
+
+    // A texture view at an address (Xbox slot 70): no resource object; image words carry the address.
+    uint8_t srv[48] = {};
+    dg::GuestShaderResourceViewDesc td{};
+    td.Format = 98;  // BC7_UNORM
+    td.ViewDimension = 4;
+    td.Shader4ComponentMapping = 0x1688;
+    td.u[1] = 0xffffffffu;  // all mips
+    std::memcpy(srv, &td, sizeof(td));
+    const uint64_t at = 0x0000'0009'0000'0000ull;
+    std::memcpy(srv + 0x28, &at, 8);
+    dg::GuestResourceDesc rd = texture_desc(256, 128, 98, 0);
+    rd.MipLevels = 0;
+    fx.vcall(scene.device, XSlot::SrvAtAddress, {I(put(rd)), I(put_bytes(srv, sizeof(srv))), I(cpu0 + 10 * 32)});
+    const hw::ImageResource ai = hw::decode_image(slot(10).data());
+    CHECK(ai.base == at && ai.format == 181 && ai.width == 256 && ai.height == 128 && ai.last_level == 8 &&
+          ai.max_mip == 8);
+    auto* host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap)->heap();
+    CHECK(host_heap->view(10) != nullptr && host_heap->view(10)->kind == d3d::DescriptorKind::Srv &&
+          host_heap->view(10)->resource_id == 0);
+    CHECK(counter(dev, dg::xbox::Counter::TextureViewsAtAddress) == 1);
+    const auto counts = dev->descriptor_word_counts();
+    CHECK(counts[0] == 3 && counts[1] == 1);  // ok: CBV, buffer SRV, texture SRV; null: the null CBV
+
+    scene.release_all({heap, smp, buf, tex});
+}
+
 // A WGPK pack with the given (key, stage) entries and tiny WGSL payloads.
 std::vector<uint8_t> wgpk(const std::vector<std::pair<uint64_t, uint8_t>>& entries) {
     std::vector<uint8_t> out(16 + entries.size() * 20, 0);
@@ -3092,6 +3200,7 @@ int main() {
     test_xbox_unaligned_constant_buffers();
     test_xbox_shader_pack_resolution();
     test_uav_texture_storage_usage();
+    test_descriptor_words_in_memory();
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();

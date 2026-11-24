@@ -51,10 +51,14 @@
 //   67    1    (&desc, riid, out) from a PSO cache: a console-native compute pipeline (root
 //              signature + {address, size} ranges like slot 57); failure falls back to slot 62
 //                                                                 refused: E_NOTIMPL, *out = 0 (high)
-//   70    2+   (RESOURCE_DESC (buffer), SRV desc + u64 GPU address at +0x28, CPU handle)
+//   70    2+   (RESOURCE_DESC, SRV desc + u64 GPU address at +0x28, CPU handle)
 //   71    2    (RESOURCE_DESC, UAV desc + u64 GPU address at +0x28, CPU handle)
-//              Buffer views at a GPU address without a resource object (high shape): resolved
-//              through the state bridge's VA map.
+//              Views at a GPU address without a resource object (high shape). Buffer views are
+//              resolved through the state bridge's VA map. Texture views (the RESOURCE_DESC gives
+//              the texture: dimension, size, mips, format, an Xbox layout value 0x100..0x105) are
+//              how the title makes textures from memory it filled itself (streamed into the GPU
+//              window); the registry gets a null view and the slot gets image words with the
+//              address (descriptor_words.h); no GPU texture exists for them yet.
 //   74    1    (address from XMemVirtualAlloc+XMemMapPhysicalPages, pages, &handle); traps on
 //              failure                                            page-pool registration: handle (low)
 //   78    1    (output=0, interval us, period, flags=0); checked  SetFrameIntervalX-like (medium)
@@ -424,6 +428,7 @@ enum class Counter : size_t {
     BlobPipelineStatesRefused,   // slot 67 (console-native compute)
     StateObjectsRefused,
     ViewsAtAddress,
+    TextureViewsAtAddress,  // slot 70 / 71 texture views: no resource object, words only
     PagePools,
     PageMappingsApplied,
     PlacedDescriptorHeaps,  // descriptor heaps placed at a title address (CreateDescriptorHeap)

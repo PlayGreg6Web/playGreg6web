@@ -504,6 +504,10 @@ bool Resource::initialize() {
             enc.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
             dev.submit(enc);
             gpu_texture_ = true;
+            // The address its descriptor words carry (descriptor_words.h): its GPU VA, or for a
+            // texture without memory a range of the device's fake GPU VA space.
+            descriptor_va_ = gpu_va_ != 0 ? gpu_va_
+                                          : dev.allocate_gpu_va(std::max<uint64_t>(committed_memory_size(desc_), 1));
             bridge::TextureInfo info;
             info.format = static_cast<pso::DxgiFormat>(desc_.Format);
             info.width = p.width;
@@ -512,6 +516,7 @@ bool Resource::initialize() {
             info.mip_levels = mips_;
             info.sample_count = p.sample_count;
             info.dimension = static_cast<GpuTextureDimension>(p.dimension);
+            info.gpu_va = descriptor_va_;
             dev.state_bridge().register_texture(id_, info);
         }
     }
@@ -534,6 +539,7 @@ void Resource::mark_back_buffer() {
     info.sample_count = 1;
     info.dimension = GpuTextureDimension::Dim2D;
     info.swapchain = true;
+    info.gpu_va = descriptor_va_;
     device_->state_bridge().register_texture(id_, info);
     back_buffer_.store(true);
 }
@@ -846,6 +852,109 @@ uint32_t resource_id(const InterfaceArg<IResourceHost>& r) {
 }
 }  // namespace
 
+bool parse_srv_desc(const GuestShaderResourceViewDesc& g, d3d::ViewDesc* out) {
+    d3d::ViewDesc vd;
+    vd.format = g.Format;
+    vd.dimension = g.ViewDimension;
+    vd.component_mapping = g.Shader4ComponentMapping;
+    const uint32_t* u = g.u;
+    switch (g.ViewDimension) {
+    case d3d::ViewDimension::Buffer:
+        vd.first_element = u64_at(u, 0);
+        vd.num_elements = u[2];
+        vd.structure_byte_stride = u[3];
+        vd.flags = u[4];
+        break;
+    case d3d::ViewDimension::Texture1D:
+    case d3d::ViewDimension::Texture3D:
+    case d3d::ViewDimension::TextureCube:
+        vd.first_mip = u[0];
+        vd.mip_levels = mips_or_all(u[1]);
+        vd.min_lod_clamp = f32(u[2]);
+        break;
+    case d3d::ViewDimension::Texture1DArray:
+    case d3d::ViewDimension::TextureCubeArray:
+        vd.first_mip = u[0];
+        vd.mip_levels = mips_or_all(u[1]);
+        vd.first_array_slice = u[2];
+        vd.array_size = u[3];
+        vd.min_lod_clamp = f32(u[4]);
+        break;
+    case d3d::ViewDimension::Texture2D:
+        vd.first_mip = u[0];
+        vd.mip_levels = mips_or_all(u[1]);
+        vd.plane_slice = u[2];
+        vd.min_lod_clamp = f32(u[3]);
+        break;
+    case d3d::ViewDimension::Texture2DArray:
+        vd.first_mip = u[0];
+        vd.mip_levels = mips_or_all(u[1]);
+        vd.first_array_slice = u[2];
+        vd.array_size = u[3];
+        vd.plane_slice = u[4];
+        vd.min_lod_clamp = f32(u[5]);
+        break;
+    case d3d::ViewDimension::Texture2DMs:
+        break;
+    case d3d::ViewDimension::Texture2DMsArray:
+        vd.first_array_slice = u[0];
+        vd.array_size = u[1];
+        break;
+    case 11:  // RAYTRACING_ACCELERATION_STRUCTURE: Location
+        vd.first_element = u64_at(u, 0);
+        break;
+    default:
+        return false;
+    }
+    *out = vd;
+    return true;
+}
+
+bool parse_uav_desc(const GuestUnorderedAccessViewDesc& g, d3d::ViewDesc* out) {
+    d3d::ViewDesc vd;
+    vd.format = g.Format;
+    vd.dimension = g.ViewDimension;
+    const uint32_t* u = g.u;
+    switch (g.ViewDimension) {
+    case d3d::ViewDimension::Buffer:
+        vd.first_element = u64_at(u, 0);
+        vd.num_elements = u[2];
+        vd.structure_byte_stride = u[3];
+        vd.counter_offset_in_bytes = u64_at(u, 4);
+        vd.flags = u[6];
+        break;
+    case d3d::ViewDimension::Texture1D:
+        vd.first_mip = u[0];
+        break;
+    case d3d::ViewDimension::Texture1DArray:
+    case d3d::ViewDimension::Texture3D:
+        vd.first_mip = u[0];
+        vd.first_array_slice = u[1];
+        vd.array_size = u[2];
+        break;
+    case d3d::ViewDimension::Texture2D:
+        vd.first_mip = u[0];
+        vd.plane_slice = u[1];
+        break;
+    case d3d::ViewDimension::Texture2DArray:
+        vd.first_mip = u[0];
+        vd.first_array_slice = u[1];
+        vd.array_size = u[2];
+        vd.plane_slice = u[3];
+        break;
+    case d3d::ViewDimension::Texture2DMs:
+        break;
+    case d3d::ViewDimension::Texture2DMsArray:
+        vd.first_array_slice = u[0];
+        vd.array_size = u[1];
+        break;
+    default:
+        return false;
+    }
+    *out = vd;
+    return true;
+}
+
 void Device::CreateShaderResourceView(InterfaceArg<IResourceHost> resource, uint64_t desc_va, uint64_t dest) {
     d3d::ViewDesc vd;
     const d3d::ViewDesc* desc = nullptr;
@@ -855,56 +964,7 @@ void Device::CreateShaderResourceView(InterfaceArg<IResourceHost> resource, uint
             note_bad_argument("CreateShaderResourceView: unreadable descriptor");
             return;
         }
-        vd.format = g.Format;
-        vd.dimension = g.ViewDimension;
-        vd.component_mapping = g.Shader4ComponentMapping;
-        const uint32_t* u = g.u;
-        switch (g.ViewDimension) {
-        case d3d::ViewDimension::Buffer:
-            vd.first_element = u64_at(u, 0);
-            vd.num_elements = u[2];
-            vd.structure_byte_stride = u[3];
-            vd.flags = u[4];
-            break;
-        case d3d::ViewDimension::Texture1D:
-        case d3d::ViewDimension::Texture3D:
-        case d3d::ViewDimension::TextureCube:
-            vd.first_mip = u[0];
-            vd.mip_levels = mips_or_all(u[1]);
-            vd.min_lod_clamp = f32(u[2]);
-            break;
-        case d3d::ViewDimension::Texture1DArray:
-        case d3d::ViewDimension::TextureCubeArray:
-            vd.first_mip = u[0];
-            vd.mip_levels = mips_or_all(u[1]);
-            vd.first_array_slice = u[2];
-            vd.array_size = u[3];
-            vd.min_lod_clamp = f32(u[4]);
-            break;
-        case d3d::ViewDimension::Texture2D:
-            vd.first_mip = u[0];
-            vd.mip_levels = mips_or_all(u[1]);
-            vd.plane_slice = u[2];
-            vd.min_lod_clamp = f32(u[3]);
-            break;
-        case d3d::ViewDimension::Texture2DArray:
-            vd.first_mip = u[0];
-            vd.mip_levels = mips_or_all(u[1]);
-            vd.first_array_slice = u[2];
-            vd.array_size = u[3];
-            vd.plane_slice = u[4];
-            vd.min_lod_clamp = f32(u[5]);
-            break;
-        case d3d::ViewDimension::Texture2DMs:
-            break;
-        case d3d::ViewDimension::Texture2DMsArray:
-            vd.first_array_slice = u[0];
-            vd.array_size = u[1];
-            break;
-        case 11:  // RAYTRACING_ACCELERATION_STRUCTURE: Location
-            vd.first_element = u64_at(u, 0);
-            break;
-        default:
+        if (!parse_srv_desc(g, &vd)) {
             note_bad_argument("CreateShaderResourceView: invalid view dimension " + std::to_string(g.ViewDimension));
             return;
         }
@@ -913,7 +973,9 @@ void Device::CreateShaderResourceView(InterfaceArg<IResourceHost> resource, uint
     const d3d::Status s = heaps_.create_shader_resource_view(resource_id(resource), desc, d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string("CreateShaderResourceView: ") + d3d::status_name(s));
+        return;
     }
+    store_descriptor_words(dest);
 }
 
 void Device::CreateUnorderedAccessView(InterfaceArg<IResourceHost> resource, InterfaceArg<IResourceHost> counter,
@@ -926,43 +988,7 @@ void Device::CreateUnorderedAccessView(InterfaceArg<IResourceHost> resource, Int
             note_bad_argument("CreateUnorderedAccessView: unreadable descriptor");
             return;
         }
-        vd.format = g.Format;
-        vd.dimension = g.ViewDimension;
-        const uint32_t* u = g.u;
-        switch (g.ViewDimension) {
-        case d3d::ViewDimension::Buffer:
-            vd.first_element = u64_at(u, 0);
-            vd.num_elements = u[2];
-            vd.structure_byte_stride = u[3];
-            vd.counter_offset_in_bytes = u64_at(u, 4);
-            vd.flags = u[6];
-            break;
-        case d3d::ViewDimension::Texture1D:
-            vd.first_mip = u[0];
-            break;
-        case d3d::ViewDimension::Texture1DArray:
-        case d3d::ViewDimension::Texture3D:
-            vd.first_mip = u[0];
-            vd.first_array_slice = u[1];
-            vd.array_size = u[2];
-            break;
-        case d3d::ViewDimension::Texture2D:
-            vd.first_mip = u[0];
-            vd.plane_slice = u[1];
-            break;
-        case d3d::ViewDimension::Texture2DArray:
-            vd.first_mip = u[0];
-            vd.first_array_slice = u[1];
-            vd.array_size = u[2];
-            vd.plane_slice = u[3];
-            break;
-        case d3d::ViewDimension::Texture2DMs:
-            break;
-        case d3d::ViewDimension::Texture2DMsArray:
-            vd.first_array_slice = u[0];
-            vd.array_size = u[1];
-            break;
-        default:
+        if (!parse_uav_desc(g, &vd)) {
             note_bad_argument("CreateUnorderedAccessView: invalid view dimension " + std::to_string(g.ViewDimension));
             return;
         }
@@ -972,7 +998,9 @@ void Device::CreateUnorderedAccessView(InterfaceArg<IResourceHost> resource, Int
                                                               d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string("CreateUnorderedAccessView: ") + d3d::status_name(s));
+        return;
     }
+    store_descriptor_words(dest);
 }
 
 void Device::CreateRenderTargetView(InterfaceArg<IResourceHost> resource, uint64_t desc_va, uint64_t dest) {

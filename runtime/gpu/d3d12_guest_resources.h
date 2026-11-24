@@ -19,6 +19,8 @@
 //    texels itself). A texture's GPU VA is the memory it was created in: the caller address
 //    (slot 133), the placed heap's memory + offset, or its committed XMemAlloc memory; 0 only
 //    for a texture the layer gives no memory (committed textures other than render targets).
+//    Its descriptor words (descriptor_words.h) carry that address; a texture without memory gets
+//    a descriptor address from the fake GPU VA range instead (not reported as its GPU VA).
 // Every buffer is registered with the state bridge (VA -> buffer id) so CBVs, root views and
 // vertex/index buffer views resolve; every texture with its format, size and sample count.
 //
@@ -71,6 +73,10 @@ namespace playgta6::gpu::d3d12_guest {
 
 // FNV-1a 64 over `size` bytes (shader identity, see the header comment).
 uint64_t shader_identity(const void* data, size_t size);
+// D3D12_SHADER_RESOURCE_VIEW_DESC / D3D12_UNORDERED_ACCESS_VIEW_DESC -> registry view description
+// (false for an invalid view dimension). Also used by the Xbox views at an address (slots 70 / 71).
+bool parse_srv_desc(const GuestShaderResourceViewDesc& g, d3d::ViewDesc* out);
+bool parse_uav_desc(const GuestUnorderedAccessViewDesc& g, d3d::ViewDesc* out);
 // Identity of a console-native stage (Xbox slot 57): FNV-1a 64 over the code bytes followed by the
 // stage's metadata bytes (one hash over the concatenation).
 uint64_t native_stage_identity(const void* code, size_t code_size, const void* metadata, size_t metadata_size);
@@ -144,6 +150,7 @@ private:
     uint32_t id_ = 0;
     uint32_t mips_ = 1;
     uint64_t gpu_va_ = 0;
+    uint64_t descriptor_va_ = 0;  // textures: the address their descriptor words carry
     uint64_t cpu_va_ = 0;
     void* xmem_memory_ = nullptr;  // committed render-target memory from XMemAlloc (see initialize)
     uint64_t owned_guest_memory_ = 0;

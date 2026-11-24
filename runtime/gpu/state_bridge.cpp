@@ -157,7 +157,21 @@ StateBridgeDevice::~StateBridgeDevice() = default;
 
 void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo& info) {
     std::unique_lock lock(resources_mutex_);
+    if (auto it = textures_.find(resource_id); it != textures_.end() && it->second.gpu_va != 0) {
+        if (auto v = textures_by_va_.find(it->second.gpu_va); v != textures_by_va_.end() && v->second == resource_id) {
+            textures_by_va_.erase(v);
+        }
+    }
     textures_[resource_id] = info;
+    if (info.gpu_va != 0) {
+        textures_by_va_[info.gpu_va] = resource_id;
+    }
+}
+
+uint32_t StateBridgeDevice::texture_at(uint64_t gpu_va) const {
+    std::shared_lock lock(resources_mutex_);
+    auto it = textures_by_va_.find(gpu_va);
+    return it != textures_by_va_.end() ? it->second : 0u;
 }
 
 void StateBridgeDevice::register_buffer(uint32_t resource_id, uint64_t gpu_va, uint64_t byte_size) {
@@ -177,7 +191,12 @@ uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
 
 void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
     std::unique_lock lock(resources_mutex_);
-    textures_.erase(resource_id);
+    if (auto it = textures_.find(resource_id); it != textures_.end()) {
+        if (auto v = textures_by_va_.find(it->second.gpu_va); v != textures_by_va_.end() && v->second == resource_id) {
+            textures_by_va_.erase(v);
+        }
+        textures_.erase(it);
+    }
     if (auto it = buffer_va_.find(resource_id); it != buffer_va_.end()) {
         buffers_by_va_.erase(it->second);
         buffer_va_.erase(it);

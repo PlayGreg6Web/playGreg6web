@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/descriptor_words.h"
 #include "os/os_shim.h"
 #include "os/xmem_windows.h"
 
@@ -731,7 +732,97 @@ uint32_t buffer_element_size(uint32_t format, uint32_t stride, bool raw) {
 
 }  // namespace
 
-void Device::CreateShaderResourceViewAtAddress(uint64_t, uint64_t view_desc, uint64_t dest) {
+namespace {
+
+// The registry record a view description produces, for the descriptor words (resource 0).
+d3d::ViewDescriptor words_record(d3d::DescriptorKind kind, const d3d::ViewDesc& vd) {
+    d3d::ViewDescriptor v{};
+    v.kind = kind;
+    v.format = vd.format;
+    v.dimension = static_cast<uint8_t>(vd.dimension);
+    v.flags = static_cast<uint16_t>(vd.flags);
+    v.first_element_or_address = vd.first_element;
+    v.num_elements_or_size = vd.num_elements;
+    v.structure_byte_stride = vd.structure_byte_stride;
+    v.component_mapping = kind == d3d::DescriptorKind::Srv ? vd.component_mapping : 0u;
+    v.first_mip = static_cast<uint16_t>(std::min<uint32_t>(vd.first_mip, 0xffffu));
+    v.mip_levels = kind == d3d::DescriptorKind::Srv ? static_cast<uint16_t>(std::min<uint32_t>(vd.mip_levels, 0xffffu))
+                                                    : uint16_t{1};
+    v.first_array_slice = vd.first_array_slice;
+    v.array_size = vd.array_size;
+    v.plane_slice = vd.plane_slice;
+    v.min_lod_clamp = kind == d3d::DescriptorKind::Srv ? vd.min_lod_clamp : 0.0f;
+    return v;
+}
+
+}  // namespace
+
+void Device::view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDesc& desc, uint64_t va,
+                             uint64_t dest) {
+    const char* what = uav ? "CreateUnorderedAccessView (Xbox slot 71)" : "CreateShaderResourceView (Xbox slot 70)";
+    const d3d::DescriptorKind kind = uav ? d3d::DescriptorKind::Uav : d3d::DescriptorKind::Srv;
+    uint32_t words[bridge::kViewSlotBytes / 4] = {};
+    d3d::ViewDesc vd = desc;
+    uint32_t id = 0;
+    if (vd.dimension == d3d::ViewDimension::Buffer) {
+        bridge::buffer_words_at_address(va, words_record(kind, desc), words);
+        d3d::GpuVaResolution res;
+        if (state_bridge().resolve_gpu_va(va, &res)) {
+            const uint32_t elem = buffer_element_size(vd.format, vd.structure_byte_stride,
+                                                      (vd.flags & d3d::BufferViewFlags::Raw) != 0);
+            if (elem == 0 || res.offset % elem != 0) {
+                note_bad_argument(std::string(what) + ": address " + hex(va) + " is not element-aligned inside its buffer");
+                return;
+            }
+            id = res.resource_id;
+            vd.first_element += res.offset / elem;
+        } else {
+            note_bad_argument(std::string(what) + ": unknown GPU address " + hex(va) + " (null descriptor written)");
+        }
+        count(xbox::Counter::ViewsAtAddress);
+    } else {
+        // A texture described only by its RESOURCE_DESC and address: no resource object exists.
+        GuestResourceDesc rd{};
+        if (resource_desc == 0 || !com::read_guest(resource_desc, rd)) {
+            note_bad_argument(std::string(what) + ": unreadable resource description for a texture view");
+            return;
+        }
+        bridge::AddressTexture t;
+        t.dimension = rd.Dimension;
+        t.width = rd.Width;
+        t.height = rd.Height;
+        t.depth_or_array_size = rd.DepthOrArraySize;
+        uint32_t full = 1;
+        for (uint64_t extent = std::max<uint64_t>({rd.Width, rd.Height, rd.Dimension == 4 ? rd.DepthOrArraySize : 1u});
+             extent > 1; extent >>= 1) {
+            ++full;
+        }
+        t.mip_levels = rd.MipLevels == 0 ? full : rd.MipLevels;
+        t.format = rd.Format;
+        t.sample_count = rd.SampleCount;
+        const bridge::WordsStatus ws = bridge::image_words_at_address(va, t, words_record(kind, desc), words);
+        if (count_texture_view_at_address() == 1) {
+            os::log(std::string("d3d12_xs: ") + what + ": first texture view at an address (" + hex(va) + ", format " +
+                    std::to_string(rd.Format) + ", " + std::to_string(rd.Width) + "x" + std::to_string(rd.Height) +
+                    ", layout " + std::to_string(rd.Layout) + "): image words written (" + bridge::words_status_name(ws) +
+                    "), no GPU texture");
+        }
+    }
+    const d3d::Status s = uav ? heaps_.create_unordered_access_view(id, 0, &vd, d3d::CpuDescriptorHandle{dest})
+                              : heaps_.create_shader_resource_view(id, &vd, d3d::CpuDescriptorHandle{dest});
+    if (s != d3d::Status::Ok) {
+        note_bad_argument(std::string(what) + ": " + d3d::status_name(s));
+        return;
+    }
+    store_descriptor_words(dest, words, bridge::kViewSlotBytes);
+}
+
+uint64_t Device::count_texture_view_at_address() {
+    count(xbox::Counter::TextureViewsAtAddress);
+    return counter(xbox::Counter::TextureViewsAtAddress);
+}
+
+void Device::CreateShaderResourceViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) {
     GuestShaderResourceViewDesc g{};
     uint64_t va = 0;
     if (view_desc == 0 || !com::read_guest(view_desc, g) ||
@@ -739,42 +830,16 @@ void Device::CreateShaderResourceViewAtAddress(uint64_t, uint64_t view_desc, uin
         note_bad_argument("CreateShaderResourceView (Xbox slot 70): unreadable descriptor");
         return;
     }
-    if (g.ViewDimension != d3d::ViewDimension::Buffer) {
-        note_bad_argument("CreateShaderResourceView (Xbox slot 70): only buffer views are supported (dimension " +
-                          std::to_string(g.ViewDimension) + ")");
+    d3d::ViewDesc vd;
+    if (!parse_srv_desc(g, &vd)) {
+        note_bad_argument("CreateShaderResourceView (Xbox slot 70): invalid view dimension " +
+                          std::to_string(g.ViewDimension));
         return;
     }
-    d3d::ViewDesc vd;
-    vd.format = g.Format;
-    vd.dimension = g.ViewDimension;
-    vd.component_mapping = g.Shader4ComponentMapping;
-    vd.first_element = uint64_t{g.u[0]} | (uint64_t{g.u[1]} << 32);
-    vd.num_elements = g.u[2];
-    vd.structure_byte_stride = g.u[3];
-    vd.flags = g.u[4];
-    d3d::GpuVaResolution res;
-    uint32_t id = 0;
-    if (state_bridge().resolve_gpu_va(va, &res)) {
-        const uint32_t elem = buffer_element_size(g.Format, g.u[3], (g.u[4] & 1) != 0);
-        if (elem == 0 || res.offset % elem != 0) {
-            note_bad_argument("CreateShaderResourceView (Xbox slot 70): address " + hex(va) +
-                              " is not element-aligned inside its buffer");
-            return;
-        }
-        id = res.resource_id;
-        vd.first_element += res.offset / elem;
-    } else {
-        note_bad_argument("CreateShaderResourceView (Xbox slot 70): unknown GPU address " + hex(va) +
-                          " (null descriptor written)");
-    }
-    count(xbox::Counter::ViewsAtAddress);
-    const d3d::Status s = heaps_.create_shader_resource_view(id, &vd, d3d::CpuDescriptorHandle{dest});
-    if (s != d3d::Status::Ok) {
-        note_bad_argument(std::string("CreateShaderResourceView (Xbox slot 70): ") + d3d::status_name(s));
-    }
+    view_at_address(false, resource_desc, vd, va, dest);
 }
 
-void Device::CreateUnorderedAccessViewAtAddress(uint64_t, uint64_t view_desc, uint64_t dest) {
+void Device::CreateUnorderedAccessViewAtAddress(uint64_t resource_desc, uint64_t view_desc, uint64_t dest) {
     GuestUnorderedAccessViewDesc g{};
     uint64_t va = 0;
     if (view_desc == 0 || !com::read_guest(view_desc, g) ||
@@ -782,38 +847,13 @@ void Device::CreateUnorderedAccessViewAtAddress(uint64_t, uint64_t view_desc, ui
         note_bad_argument("CreateUnorderedAccessView (Xbox slot 71): unreadable descriptor");
         return;
     }
-    if (g.ViewDimension != d3d::ViewDimension::Buffer) {
-        note_bad_argument("CreateUnorderedAccessView (Xbox slot 71): only buffer views are supported");
+    d3d::ViewDesc vd;
+    if (!parse_uav_desc(g, &vd)) {
+        note_bad_argument("CreateUnorderedAccessView (Xbox slot 71): invalid view dimension " +
+                          std::to_string(g.ViewDimension));
         return;
     }
-    d3d::ViewDesc vd;
-    vd.format = g.Format;
-    vd.dimension = g.ViewDimension;
-    vd.first_element = uint64_t{g.u[0]} | (uint64_t{g.u[1]} << 32);
-    vd.num_elements = g.u[2];
-    vd.structure_byte_stride = g.u[3];
-    vd.counter_offset_in_bytes = uint64_t{g.u[4]} | (uint64_t{g.u[5]} << 32);
-    vd.flags = g.u[6];
-    d3d::GpuVaResolution res;
-    uint32_t id = 0;
-    if (state_bridge().resolve_gpu_va(va, &res)) {
-        const uint32_t elem = buffer_element_size(g.Format, g.u[3], (g.u[6] & 1) != 0);
-        if (elem == 0 || res.offset % elem != 0) {
-            note_bad_argument("CreateUnorderedAccessView (Xbox slot 71): address " + hex(va) +
-                              " is not element-aligned inside its buffer");
-            return;
-        }
-        id = res.resource_id;
-        vd.first_element += res.offset / elem;
-    } else {
-        note_bad_argument("CreateUnorderedAccessView (Xbox slot 71): unknown GPU address " + hex(va) +
-                          " (null descriptor written)");
-    }
-    count(xbox::Counter::ViewsAtAddress);
-    const d3d::Status s = heaps_.create_unordered_access_view(id, 0, &vd, d3d::CpuDescriptorHandle{dest});
-    if (s != d3d::Status::Ok) {
-        note_bad_argument(std::string("CreateUnorderedAccessView (Xbox slot 71): ") + d3d::status_name(s));
-    }
+    view_at_address(true, resource_desc, vd, va, dest);
 }
 
 GuestResourceAllocationInfo Device::GetResourceAllocationInfo1(uint32_t visible_mask, uint32_t n, uint64_t descs,

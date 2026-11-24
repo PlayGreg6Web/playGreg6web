@@ -90,6 +90,9 @@ struct TextureInfo {
     uint32_t sample_count = 1;
     GpuTextureDimension dimension = GpuTextureDimension::Dim2D;
     bool swapchain = false;  // render pass attachments name kGpuSwapchainTextureId instead of the id
+    // Address the texture's descriptor words carry (descriptor_words.h): its memory address on the
+    // console model, or a runtime-assigned range; 0 = none.
+    uint64_t gpu_va = 0;
 };
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
@@ -214,6 +217,8 @@ public:
     uint32_t allocate_id() { return options_.id_allocator(); }
     // The registered description of texture `resource_id` (false if it is not a texture).
     bool texture_info(uint32_t resource_id, TextureInfo* out) const;
+    // The texture whose descriptor address (TextureInfo::gpu_va) is exactly `gpu_va` (0 if none).
+    uint32_t texture_at(uint64_t gpu_va) const;
 
 private:
     friend class CommandListBridge;
@@ -258,6 +263,7 @@ private:
     std::unordered_map<uint32_t, TextureInfo> textures_;
     std::map<uint64_t, std::pair<uint32_t, uint64_t>> buffers_by_va_;  // va -> (id, size)
     std::unordered_map<uint32_t, uint64_t> buffer_va_;                  // id -> va
+    std::unordered_map<uint64_t, uint32_t> textures_by_va_;             // descriptor address -> id
     std::unordered_map<uint64_t, uint32_t> shader_modules_;
 
     mutable std::mutex views_mutex_;

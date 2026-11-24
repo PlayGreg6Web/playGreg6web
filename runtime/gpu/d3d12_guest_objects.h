@@ -743,6 +743,22 @@ public:
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
 
+    // ---- Descriptor words in descriptor memory (bridge/descriptor_words.h, G48) ----
+    // After a registry write at `cpu_handle`: writes the words the console's D3D12 leaves in the
+    // slot (heaps without guest memory are skipped). The title copies whole slots itself when it
+    // fills shader-visible tables, so the words must be in its memory.
+    void store_descriptor_words(uint64_t cpu_handle);
+    // Writes `words` (one slot of the heap's increment) at `cpu_handle` (Xbox slots 70 / 71).
+    void store_descriptor_words(uint64_t cpu_handle, const uint32_t* words, size_t bytes);
+    // CopyDescriptors*: the console copies the slots' memory along with the descriptors.
+    void copy_descriptor_memory(const std::vector<std::pair<uint64_t, uint32_t>>& dst_ranges,
+                                const std::vector<std::pair<uint64_t, uint32_t>>& src_ranges, uint32_t type);
+    // Slots written per outcome (index = bridge::WordsStatus).
+    std::array<uint64_t, 7> descriptor_word_counts() const;
+    // Xbox slots 70 / 71 after parsing the view description (d3d12_xs_xbox.cpp).
+    void view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDesc& desc, uint64_t va, uint64_t dest);
+    uint64_t count_texture_view_at_address();
+
     // ---- Runtime side ----
     d3d::DescriptorHeapRegistry& heaps() { return heaps_; }
     d3d::ResourceStateRegistry& resource_states() { return resource_states_; }
@@ -836,6 +852,8 @@ private:
     std::mutex tracked_mutex_;
     std::vector<Resource*> tracked_;
     std::atomic<uint64_t> upload_bytes_{0};
+    std::array<std::atomic<uint64_t>, 7> descriptor_words_{};
+    std::atomic<uint32_t> descriptor_words_reported_{0};  // bit per WordsStatus already logged
     std::atomic<uint64_t> skipped_draws_{0};
     std::atomic<uint64_t> unsupported_copies_{0};
     xbox::FramePacer pacer_;
