@@ -158,7 +158,7 @@ void test_xmem_physical_virtual_and_transfer() {
     // Reserve a virtual range via XMemVirtualAlloc, then scatter-map pages in reverse order
     // with gaps (offsets: page 0 -> 8 KiB, page 2 -> 0 KiB).
     void* va_reserved = pg6_xbox_XMemVirtualAlloc(
-        nullptr, 4 * kXMemPageSize4K, win32::MEM_RESERVE, win32::PAGE_NOACCESS);
+        nullptr, 4 * kXMemPageSize4K, win32::MEM_RESERVE, 0, win32::PAGE_NOACCESS);
     CHECK(va_reserved != nullptr);
 
     const uint64_t scatter_handles[2] = {handles[2], handles[0]};
@@ -175,11 +175,28 @@ void test_xmem_physical_virtual_and_transfer() {
 
     // Standalone XMemVirtualAlloc reserve + in-place commit + XMemTransferMemory.
     void* va_buf = pg6_xbox_XMemVirtualAlloc(
-        nullptr, 8192, win32::MEM_RESERVE, win32::PAGE_READWRITE);
+        nullptr, 8192, win32::MEM_RESERVE, 0, win32::PAGE_READWRITE);
     CHECK(va_buf != nullptr);
     void* va_committed = pg6_xbox_XMemVirtualAlloc(
-        va_buf, 8192, win32::MEM_COMMIT, win32::PAGE_READWRITE);
+        va_buf, 8192, win32::MEM_COMMIT, 0, win32::PAGE_READWRITE);
     CHECK(va_committed == va_buf);
+
+    // The title's reservation shapes: MEM_64K_PAGES | MEM_RESERVE, XMem flags in the 4th argument,
+    // the protection (with PAGE_GRAPHICS_* bits) in the 5th.
+    void* big = pg6_xbox_XMemVirtualAlloc(nullptr, 256ull << 20, 0x20400000u | win32::MEM_RESERVE,
+                                          0x21u, win32::PAGE_READWRITE);
+    CHECK(big != nullptr);
+    CHECK(reinterpret_cast<uintptr_t>(big) % kXMemPageSize64K == 0);
+    void* gpu_only = pg6_xbox_XMemVirtualAlloc(nullptr, 64ull << 20, 0x20400000u | win32::MEM_RESERVE,
+                                               0x3u, 0x800u | win32::PAGE_NOACCESS);
+    CHECK(gpu_only != nullptr);
+    void* graphics_rw = pg6_xbox_XMemVirtualAlloc(nullptr, 1ull << 20, win32::MEM_RESERVE | win32::MEM_COMMIT,
+                                                  0u, 0x2000u /*PAGE_GRAPHICS_READWRITE*/);
+    CHECK(graphics_rw != nullptr);
+    if (graphics_rw != nullptr) {
+        static_cast<uint8_t*>(graphics_rw)[100] = 7;  // the CPU view is writable
+    }
+    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 1ull << 20, win32::MEM_RESERVE, 0u, 0x4000u) == nullptr);
 
     uint8_t src_pattern[256];
     for (size_t i = 0; i < sizeof(src_pattern); ++i) {

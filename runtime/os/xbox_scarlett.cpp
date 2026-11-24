@@ -88,6 +88,21 @@ bool xmem_protect(uint32_t protect, PageProtect& out) {
         case win32::PAGE_EXECUTE_READ: out = PageProtect::ExecuteRead; return true;
         case win32::PAGE_EXECUTE_READWRITE:
         case 0x80u: out = PageProtect::ExecuteReadWrite; return true;  // PAGE_EXECUTE_WRITECOPY
+        case 0x00u:
+            // Only PAGE_GRAPHICS_* bits: the CPU view of a GPU-only mapping.
+            if ((protect & 0x800u) != 0) {  // PAGE_GRAPHICS_NOACCESS
+                out = PageProtect::NoAccess;
+                return true;
+            }
+            if ((protect & 0x1000u) != 0) {  // PAGE_GRAPHICS_READONLY
+                out = PageProtect::ReadOnly;
+                return true;
+            }
+            if ((protect & 0x2000u) != 0) {  // PAGE_GRAPHICS_READWRITE
+                out = PageProtect::ReadWrite;
+                return true;
+            }
+            return false;
         default: return false;
     }
 }
@@ -1982,7 +1997,9 @@ void* pg6_xbox_XMemMapPhysicalPagesScatter(void* virtual_address,
 void* pg6_xbox_XMemVirtualAlloc(void* address,
                                 size_t size,
                                 uint32_t allocation_type,
+                                uint32_t xmem_flags,
                                 uint32_t protect) {
+    (void)xmem_flags;  // memory category for the title's budgets; one guest pool here
     using namespace playgta6::os::scarlett;
     namespace os = playgta6::os;
     if (size == 0) {

@@ -456,9 +456,14 @@ void* pg6_xbox_XMemMapPhysicalPagesScatter(void* virtual_address,
                                            const uint64_t* page_array,
                                            const uint64_t* virtual_offsets,
                                            uint32_t flags);
+// XMemVirtualAlloc(address, size, flAllocationType, XMem flags, flProtect): VirtualAlloc plus
+// an XMem flags argument in the 4th position. The order is taken from the title's call sites
+// (reserve with MEM_64K_PAGES | MEM_RESERVE, XMem flags 0x21 / 0x3, protection PAGE_READWRITE /
+// PAGE_GRAPHICS_NOACCESS | PAGE_NOACCESS); the XMem flags are accepted and ignored.
 void* pg6_xbox_XMemVirtualAlloc(void* address,
                                 size_t size,
                                 uint32_t allocation_type,
+                                uint32_t xmem_flags,
                                 uint32_t protect);
 Pg6HResult pg6_xbox_XMemTransferMemory(void* dst, const void* src, size_t size, uint32_t flags);
 Pg6HResult pg6_xbox_XMemGetWorkingSetStatistics(Pg6XMemWorkingSetStats* stats);

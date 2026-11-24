@@ -708,7 +708,7 @@ void test_xmem_virtual_alloc() {
     const uint64_t region_count = std::min<uint64_t>(kRegions, arena.space_size() / (2 * kGiB));
     for (uint64_t i = 0; i < region_count; ++i) {
         void* r = pg6_xbox_XMemVirtualAlloc(nullptr, 1 * kGiB, win32::MEM_RESERVE,
-                                            win32::PAGE_READWRITE);
+                                            0, win32::PAGE_READWRITE);
         CHECK(r != nullptr);
         if (r == nullptr) {
             continue;
@@ -734,21 +734,21 @@ void test_xmem_virtual_alloc() {
     // In-place commit of a whole region, console flags accepted.
     void* part = pg6_xbox_XMemVirtualAlloc(nullptr, 3 * kMiB + 1,
                                            win32::MEM_RESERVE | 0x20000000u /*large pages*/,
-                                           win32::PAGE_READWRITE | 0x400u /*write combine*/);
+                                           0, win32::PAGE_READWRITE | 0x400u /*write combine*/);
     CHECK(part != nullptr);
     const uint64_t committed1 = arena.committed_bytes();
-    CHECK(pg6_xbox_XMemVirtualAlloc(part, 3 * kMiB, win32::MEM_COMMIT, win32::PAGE_READWRITE) ==
+    CHECK(pg6_xbox_XMemVirtualAlloc(part, 3 * kMiB, win32::MEM_COMMIT, 0, win32::PAGE_READWRITE) ==
           part);
     CHECK(arena.committed_bytes() > committed1);
     std::memset(part, 0x3C, 3 * kMiB);
     // Placement request: honoured exactly or fails.
-    CHECK(pg6_xbox_XMemVirtualAlloc(part, 64 * kKiB, win32::MEM_RESERVE, win32::PAGE_READWRITE) ==
+    CHECK(pg6_xbox_XMemVirtualAlloc(part, 64 * kKiB, win32::MEM_RESERVE, 0, win32::PAGE_READWRITE) ==
           nullptr);
     // Bad arguments.
-    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 0, win32::MEM_RESERVE, win32::PAGE_READWRITE) ==
+    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 0, win32::MEM_RESERVE, 0, win32::PAGE_READWRITE) ==
           nullptr);
-    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 4096, 0, win32::PAGE_READWRITE) == nullptr);
-    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 4096, win32::MEM_COMMIT, 0x3) == nullptr);
+    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 4096, 0, 0, win32::PAGE_READWRITE) == nullptr);
+    CHECK(pg6_xbox_XMemVirtualAlloc(nullptr, 4096, win32::MEM_COMMIT, 0, 0x3) == nullptr);
 
     CHECK(xmem_virtual_free(part));
     CHECK(!xmem_virtual_free(part));
@@ -793,7 +793,7 @@ void test_xmem_physical_pages() {
 
     // Map a subset scattered into a reserved region (commits it), contents survive and move.
     void* region = pg6_xbox_XMemVirtualAlloc(nullptr, 6 * kXMemPageSize2M, win32::MEM_RESERVE,
-                                             win32::PAGE_READWRITE);
+                                             0, win32::PAGE_READWRITE);
     CHECK(region != nullptr);
     const uint64_t scatter_pfn[2] = {pfn[2], pfn[0]};
     const uint64_t offsets[2] = {kXMemPageSize2M, 3 * kXMemPageSize2M};
