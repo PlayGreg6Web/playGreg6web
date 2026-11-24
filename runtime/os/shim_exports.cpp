@@ -7,6 +7,7 @@
 #include "os/win32_kernel.h"
 #include "os/win32_sync.h"
 #include "os/xbox_offline.h"
+#include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime.h"
 #include "os/xgameruntime_provider.h"
 
@@ -347,6 +348,8 @@ size_t register_all_shim_exports() {
         registered = register_all_once();
         // Guest-callable QueryApiImpl / InitializeApiImpl* / XErrorReport / UninitializeApiImpl.
         gdk::provider::register_xgameruntime_provider();
+        // Guest-callable XCRDAPI.dll / GameInput.dll / xg_xs.dll entry points (O23).
+        scarlett::guest_api::register_xbox_scarlett_guest_exports();
     });
     return registered;
 }

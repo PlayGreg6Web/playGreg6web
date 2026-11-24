@@ -57,7 +57,10 @@
 //! the family's shim: the generated `pg6_import_<n>` just forwards the guest state to it (it
 //! marshals its own arguments and pops the return address itself). When several guest-state
 //! thunks share a name key (`pg6_gthunk_exit` / `pg6_gthunk__exit`), the one whose name after
-//! the prefix equals the import name binds; without such a thunk the import is ambiguous.
+//! the prefix equals the import name binds; without such a thunk the import is ambiguous. A few
+//! console DLLs have no shim family and are implemented only as guest-state thunks
+//! (`runtime/os/xbox_scarlett_guest.h`: `XCRDAPI`, `GameInput`, `xg_xs`); their imports bind
+//! when a matching thunk exists and are otherwise unresolved like any unknown DLL.
 //!
 //! # Unresolved imports
 //! Every unresolved import still gets a thunk. On its first call it logs
@@ -1027,6 +1030,11 @@ pub fn shim_prefix_for_dll(dll: &str) -> Option<&'static str> {
     }
 }
 
+/// DLLs without a shim family whose imports the runtime implements as guest-state thunks only.
+fn is_gthunk_only_dll(dll: &str) -> bool {
+    matches!(dll_key(dll).as_str(), "xcrdapi" | "gameinput" | "xg_xs")
+}
+
 /// Matching key: ASCII-lowercased with underscores removed (`CreateFileW` and `create_file_w`
 /// both give `createfilew`).
 pub fn name_key(name: &str) -> String {
@@ -1231,9 +1239,10 @@ impl<'a> ShimIndex<'a> {
     }
 
     fn resolve(&self, dll: &str, symbol: &ImportedSymbol) -> Resolution {
-        let Some(prefix) = shim_prefix_for_dll(dll) else {
+        let family = shim_prefix_for_dll(dll);
+        if family.is_none() && !is_gthunk_only_dll(dll) {
             return Resolution::Unresolved(Unresolved::UnknownDll);
-        };
+        }
         let name = match symbol {
             ImportedSymbol::ByName { name, .. } => name,
             ImportedSymbol::ByOrdinal { .. } => {
@@ -1263,6 +1272,9 @@ impl<'a> ShimIndex<'a> {
                 };
             }
         }
+        let Some(prefix) = family else {
+            return Resolution::Unresolved(Unresolved::UnknownDll);
+        };
         match self
             .by_key
             .get(&(prefix, name_key(name)))
@@ -2581,6 +2593,44 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             "KERNEL32.dll and KERNEL32 merge: {coverage:?}"
         );
         assert_eq!(coverage.len(), 5, "{coverage:?}");
+    }
+
+    #[test]
+    fn console_dlls_without_a_family_bind_guest_state_thunks_only() {
+        let mut headers = mini_headers();
+        headers.push(ShimHeader {
+            include: "os/xbox_scarlett_guest.h".to_string(),
+            text: "extern \"C\" {\n\
+                   void pg6_gthunk_dstorage_get_factory(void* state);\n\
+                   }\n"
+                .to_string(),
+        });
+        let catalogue = Catalogue::scan(&headers);
+        let mut pe = synthetic_pe(false);
+        pe.imports.push(ImportModule {
+            dll_name: "XCRDAPI.dll".to_string(),
+            iat_rva: 0x3000,
+            symbols: named(&["DStorageGetFactory", "DStorageSomethingElse"]),
+        });
+        pe.imports.push(ImportModule {
+            dll_name: "xmem.dll".to_string(),
+            iat_rva: 0x3100,
+            symbols: named(&["DStorageGetFactory"]),
+        });
+        let plan = plan_bridge(&pe, &catalogue);
+        assert_eq!(
+            find(&plan, "XCRDAPI.dll!DStorageGetFactory").bound_shim(),
+            Some("pg6_gthunk_dstorage_get_factory")
+        );
+        assert_eq!(
+            find(&plan, "XCRDAPI.dll!DStorageSomethingElse").resolution,
+            Resolution::Unresolved(Unresolved::UnknownDll)
+        );
+        assert_eq!(
+            find(&plan, "xmem.dll!DStorageGetFactory").resolution,
+            Resolution::Unresolved(Unresolved::UnknownDll),
+            "only the listed console DLLs bind guest-state thunks without a family"
+        );
     }
 
     #[test]
