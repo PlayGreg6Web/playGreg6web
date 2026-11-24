@@ -286,7 +286,7 @@ void pg6_mw_bink_free_globals(void);
 // ---------------------------------------------------------------------------
 
 Pg6HResult pg6_mw_acp_hal_create(void** acp_hal);
-Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(const void* context_counts);
+Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts);  // counts in, context arrays out
 Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void);
 Pg6HResult pg6_mw_apu_create_heap(uint32_t cached_size_in_bytes,
                                   uint32_t non_cached_size_in_bytes);
