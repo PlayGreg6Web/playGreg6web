@@ -1240,6 +1240,24 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 } else {
                     diagnostics_ |= BridgeDiag::UnalignedUniform;
                 }
+            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                       layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage) &&
+                       e.offset % kUniformOffsetAlignment != 0) {
+                // O36: storage bindings need a 256-byte aligned offset too (WebGPU's
+                // minStorageBufferOffsetAlignment); a read-only view at any other offset is bound
+                // as a relocated copy whose first byte is the view's (see relocate_storage).
+                const uint64_t base = device_.buffer_gpu_va(e.resource_id);
+                uint32_t id = 0;
+                uint64_t offset = 0;
+                if (base != 0 && e.size != 0 && device_.options().relocate_storage &&
+                    device_.options().relocate_storage(base + e.offset, e.size, &id, &offset)) {
+                    out.resource_id = id;
+                    out.offset = offset;
+                    out.size = align_up(e.size, 4u);
+                    ++stats_.storage_relocated;
+                } else {
+                    diagnostics_ |= BridgeDiag::UnalignedStorage;
+                }
             } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && e.size != 0 &&
                        (layout.min_binding_size != 0
                             ? layout.min_binding_size > e.size

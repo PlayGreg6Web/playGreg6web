@@ -249,6 +249,9 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     bo.relocate_uniform = [this](uint64_t va, uint64_t size, uint64_t binding_size, uint32_t* id, uint64_t* offset) {
         return relocate_uniform(va, size, binding_size, id, offset);
     };
+    bo.relocate_storage = [this](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+        return relocate_storage_buffer(va, size, id, offset, /*require_zero_offset=*/false);
+    };
     bo.sync_texture_memory = [this](uint32_t resource_id, CommandEncoder& encoder) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
