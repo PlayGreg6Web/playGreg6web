@@ -40,6 +40,8 @@ TextureProbe& texture_probe() {
 }
 
 constexpr uint64_t kShadowPage = 4096;
+
+
 constexpr uint64_t kMaxWriteChunk = 1u << 20;
 constexpr uint64_t kMaxShaderBytes = 64u << 20;
 constexpr uint32_t kMaxInputElements = 32;
@@ -163,6 +165,39 @@ bool read_guest_best_effort(uint64_t cpu_va, uint8_t* dst, size_t size) {
 }
 
 }  // namespace
+
+// O36: whether two byte ranges are equal. Without write tracking (wasm linear memory has none),
+// flush_shadow compares every tracked CPU-visible buffer with its shadow at each submission: the
+// real program tracks ~183 MB, compared twice a frame, the browser boot's frame-time bottleneck.
+// The wasm64 libc memcmp compares 4 bytes per step; this compares 64 with wasm SIMD (the browser
+// target requires SIMD anyway: lifted code is built with it), about 1.5x faster on the real
+// program. The host memcmp is vectorized.
+#if defined(__EMSCRIPTEN__)
+__attribute__((target("simd128"))) bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n) {
+    typedef uint64_t u64x2 __attribute__((vector_size(16)));
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        u64x2 x[4];
+        u64x2 y[4];
+        std::memcpy(x, a + i, 64);
+        std::memcpy(y, b + i, 64);
+        const u64x2 d = (x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3]);
+        if ((d[0] | d[1]) != 0) {
+            return false;
+        }
+    }
+    for (; i < n; ++i) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+#else
+bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n) {
+    return std::memcmp(a, b, n) == 0;
+}
+#endif
 
 uint64_t shader_identity(const void* data, size_t size) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -1515,7 +1550,7 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const uint64_t n = std::min(kShadowPage, size - page);
         const bool changed = (candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)]) &&
-                             std::memcmp(shadow_.data() + page, live + page, static_cast<size_t>(n)) != 0;
+                             !same_bytes(shadow_.data() + page, live + page, static_cast<size_t>(n));
         if (changed && !in_run) {
             run_start = page;
             in_run = true;

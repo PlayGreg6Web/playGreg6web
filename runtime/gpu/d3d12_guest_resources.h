@@ -71,6 +71,10 @@
 
 namespace playgta6::gpu::d3d12_guest {
 
+// O36: whether `n` bytes at `a` and `b` are equal (memcmp == 0); on wasm64 a SIMD compare, which
+// flush_shadow uses for the shadow comparison of CPU-visible buffers.
+bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n);
+
 // FNV-1a 64 over `size` bytes (shader identity, see the header comment).
 uint64_t shader_identity(const void* data, size_t size);
 // D3D12_SHADER_RESOURCE_VIEW_DESC / D3D12_UNORDERED_ACCESS_VIEW_DESC -> registry view description

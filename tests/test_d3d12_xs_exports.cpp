@@ -5193,10 +5193,39 @@ void test_g58_relocate_ia_vb_ib() {
 
 }  // namespace
 
+// O36: the shadow comparison (a SIMD compare on wasm64) finds a single differing byte at every
+// position of 64-byte blocks and of the tail, at any alignment, and nothing in equal ranges.
+void test_same_bytes() {
+    std::vector<uint8_t> a(4096 + 64 + 37);
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = static_cast<uint8_t>(i * 131u + 7u);
+    }
+    std::vector<uint8_t> b = a;
+    for (size_t start : {size_t{0}, size_t{1}, size_t{3}, size_t{8}, size_t{63}}) {
+        for (size_t n : {size_t{0}, size_t{1}, size_t{63}, size_t{64}, size_t{65}, size_t{4096}, a.size() - start}) {
+            if (start + n > a.size()) {
+                continue;
+            }
+            CHECK(dg::same_bytes(a.data() + start, b.data() + start, n));
+            for (size_t pos = 0; pos < n; pos += (n > 200 ? 61 : 1)) {
+                b[start + pos] ^= 0x10u;
+                CHECK(!dg::same_bytes(a.data() + start, b.data() + start, n));
+                b[start + pos] ^= 0x10u;
+            }
+            if (n != 0) {
+                b[start + n - 1] ^= 0x80u;  // the last byte
+                CHECK(!dg::same_bytes(a.data() + start, b.data() + start, n));
+                b[start + n - 1] ^= 0x80u;
+            }
+        }
+    }
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
     playgta6::os::set_write_tracking(true);
+    test_same_bytes();
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();
