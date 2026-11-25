@@ -1,3 +1,4 @@
+#include "os/guest_window.h"
 #include "os/xbox_scarlett_guest.h"
 
 #include <algorithm>
@@ -1071,6 +1072,9 @@ HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len
     if (out == scratch.data() && !com::write_guest(r.destination, out, expected)) {
         return com::E_INVALIDARG_HR;
     }
+    if (out != scratch.data()) {
+        guest_window::mark_written(r.destination, expected);  // O37: inflated in place
+    }
     counters().decompressed_requests.fetch_add(1, std::memory_order_relaxed);
     counters().bytes_delivered.fetch_add(expected, std::memory_order_relaxed);
     return kOk;
@@ -1149,6 +1153,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         void* direct = plain ? com::guest_to_host(r.destination, r.source_size) : nullptr;
         if (direct != nullptr) {
             const HResult hr = reader.read(item.file->host(), r.source_offset, direct, r.source_size);
+            guest_window::mark_written(r.destination, static_cast<size_t>(r.source_size));  // O37
             if (gdk::succeeded(hr)) {
                 counters().bytes_delivered.fetch_add(r.source_size, std::memory_order_relaxed);
             }

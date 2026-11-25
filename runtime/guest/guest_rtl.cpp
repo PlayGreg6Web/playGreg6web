@@ -184,6 +184,7 @@ int32_t init_once_impl(com::CallContext& ctx,
             return r != 0 ? win32::InitOnceOutcome::Completed : win32::InitOnceOutcome::Failed;
         },
         &result);
+    os::guest_window::mark_written(once_va, sizeof(Pg6InitOnce));  // O37: the state word changed
     if (unwind_pending(state)) {
         return 0;
     }

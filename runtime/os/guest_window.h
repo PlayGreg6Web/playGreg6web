@@ -106,6 +106,24 @@ bool copy_to_guest(uint64_t va, const void* src, size_t len);
 bool move_guest(uint64_t dst, uint64_t src, size_t len);
 bool fill_guest(uint64_t dst, uint8_t value, size_t len);
 
+// Write marks (O37; docs/wasm_abi.md "__playgta6_window_dirty"): the browser has no OS write
+// watch, so window slots carry their own. Lifted code marks a slot after storing into it; host code
+// that writes window memory marks the range after the write (mark_written; the segmented copies,
+// fill, move and Buffers do it themselves) and remapping a slot marks it. A reader that keeps a
+// copy of window memory takes the marks of its range (take_written: appends the offsets of the
+// marked slots within the range, relative to `va` and clamped to 0, and clears them) before it
+// compares, so a write racing with the comparison is reported again. take_written is false for a
+// range outside the window or with the window off: such memory has no marks.
+void mark_written(uint64_t va, size_t len);
+bool take_written(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets);
+// Verification (tests, and real-program runs): a reader that uses the marks also compares the
+// unmarked slots and reports changes found there (note_verify_miss): a miss is a writer that did
+// not mark.
+void set_write_marks_verified(bool on);
+bool write_marks_verified();
+void note_verify_miss(uint64_t va);
+uint64_t verify_misses();
+
 // (pointer, length) marshaling for host code called with guest buffers (O29; the generated
 // import thunks of code lifted with the windowed memory model use one per call). Outside the
 // window a buffer is its flat host pointer. A window buffer whose slots are mapped onto adjacent
@@ -146,7 +164,14 @@ public:
         }
         return string_out_window(dst, src, char_size);
     }
-    // Copies writable bounce copies back to the guest (once).
+    // A writable buffer the host writes in place (a contiguous view, or the COM bridge's direct
+    // pointer arguments): its window slots are marked written by finish(), after the host call.
+    void note_written(uint64_t va, uint64_t bytes) {
+        if (in_window(va) && bytes != 0) [[unlikely]] {
+            written_.push_back({va, bytes});
+        }
+    }
+    // Copies writable bounce copies back to the guest and marks written ranges (once).
     void finish();
     // guest_window::guest_address(), plus pointers into this call's bounce copies.
     uint64_t guest_address(const void* host) const;
@@ -163,6 +188,11 @@ private:
     void* string_window(uint64_t va, size_t char_size);
     void* string_out_window(uint64_t dst, uint64_t src, size_t char_size);
     std::vector<Bounce> bounces_;  // empty (no allocation) unless a window buffer is split
+    struct Written {
+        uint64_t va = 0;
+        uint64_t bytes = 0;
+    };
+    std::vector<Written> written_;  // window ranges written in place (marked by finish())
 };
 
 // Contiguous runs (O29): code lifted with the windowed model's `contiguous_runs` has no straddle
@@ -194,4 +224,6 @@ void reset_for_testing();
 extern "C" {
 // The window's delta table read by lifted code (`MemoryModel::Windowed`), kWindowSlots entries.
 extern int64_t __playgta6_window_table[];
+// Write marks, kWindowSlots + 1 entries (the last is the spare branch-free checks store to).
+extern uint8_t __playgta6_window_dirty[];
 }

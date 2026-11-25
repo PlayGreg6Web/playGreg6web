@@ -541,6 +541,7 @@ uint64_t InterlockedPushEntrySList(SListHeader* head, uint64_t entry) {
     const uint64_t word1 = slist_lock(head);
     const uint64_t first = slist_first(head);
     std::memcpy(next, &first, sizeof(first));
+    guest_window::mark_written(entry, sizeof(first));  // O37
     slist_set_first(head, entry);
     slist_unlock(head, slist_bump(word1, +1));
     return first;

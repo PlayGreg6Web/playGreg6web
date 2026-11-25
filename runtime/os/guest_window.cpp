@@ -109,6 +109,57 @@ bool enabled() {
     return state().enabled.load(std::memory_order_acquire);
 }
 
+namespace {
+
+std::atomic_ref<uint8_t> mark(uint64_t slot) {
+    return std::atomic_ref<uint8_t>(__playgta6_window_dirty[slot]);
+}
+
+std::atomic<bool> g_verify{false};
+std::atomic<uint64_t> g_verify_misses{0};
+
+}  // namespace
+
+void mark_written(uint64_t va, size_t len) {
+    if (!in_window(va) || len == 0) {
+        return;
+    }
+    const uint64_t last_va = std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1);
+    for (uint64_t slot = slot_of(va); slot <= slot_of(last_va); ++slot) {
+        mark(slot).store(1, std::memory_order_release);
+    }
+}
+
+bool take_written(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets) {
+    if (!translated(va) || len == 0) {
+        return false;
+    }
+    const uint64_t last_va = std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1);
+    for (uint64_t slot = slot_of(va); slot <= slot_of(last_va); ++slot) {
+        if (mark(slot).exchange(0, std::memory_order_acq_rel) != 0 && slot_offsets != nullptr) {
+            const uint64_t start = slot_va(slot);
+            slot_offsets->push_back(start > va ? start - va : 0);
+        }
+    }
+    return true;
+}
+
+void set_write_marks_verified(bool on) {
+    g_verify.store(on, std::memory_order_relaxed);
+}
+
+bool write_marks_verified() {
+    return g_verify.load(std::memory_order_relaxed);
+}
+
+void note_verify_miss(uint64_t) {
+    g_verify_misses.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t verify_misses() {
+    return g_verify_misses.load(std::memory_order_relaxed);
+}
+
 bool map_slot(uint64_t window_va, void* host_page) {
     if (!in_window(window_va)) {
         return false;
@@ -116,6 +167,8 @@ bool map_slot(uint64_t window_va, void* host_page) {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     const uint64_t slot = slot_of(window_va);
+    // Other bytes appear at the slot (or none): a reader's copy of it is stale.
+    mark(slot).store(1, std::memory_order_release);
     forget_reverse_locked(s, slot);
     if (host_page == nullptr) {
         ++s.unmap_calls;
@@ -215,6 +268,7 @@ bool copy_to_guest(uint64_t va, const void* src, size_t len) {
             return false;
         }
         std::memcpy(dst, in + done, run);
+        mark_written(va + done, run);
         done += run;
     }
     return true;
@@ -227,6 +281,7 @@ bool move_guest(uint64_t dst, uint64_t src, size_t len) {
     if (void* d = contiguous(dst, len)) {
         if (void* s = contiguous(src, len)) {
             std::memmove(d, s, len);
+            mark_written(dst, len);
             return true;
         }
     }
@@ -244,6 +299,7 @@ bool fill_guest(uint64_t dst, uint8_t value, size_t len) {
             return false;
         }
         std::memset(p, value, run);
+        mark_written(dst + done, run);
         done += run;
     }
     return true;
@@ -263,10 +319,16 @@ constexpr uint64_t kMaxBounceBytes = uint64_t{256} << 20;
 
 void* Buffers::range_window(uint64_t va, uint64_t bytes, bool writable) {
     if (!enabled() || bytes == 0 || bytes > kMaxBounceBytes) {
+        if (writable) {
+            note_written(va, bytes);
+        }
         return host_or_trap(va);
     }
     if (void* view = contiguous(va, static_cast<size_t>(bytes))) {
-        return view;  // pinned: the guest's bytes in place
+        if (writable) {
+            note_written(va, bytes);  // pinned: the host writes the guest's bytes in place
+        }
+        return view;
     }
     Bounce b;
     b.va = va;
@@ -353,10 +415,14 @@ void* Buffers::string_out_window(uint64_t dst, uint64_t src, size_t char_size) {
 void Buffers::finish() {
     for (Bounce& b : bounces_) {
         if (b.writable) {
-            copy_to_guest(b.va, b.data.get(), b.bytes);
+            copy_to_guest(b.va, b.data.get(), b.bytes);  // marks the range
             b.writable = false;
         }
     }
+    for (const Written& w : written_) {
+        mark_written(w.va, static_cast<size_t>(w.bytes));
+    }
+    written_.clear();
 }
 
 uint64_t Buffers::guest_address(const void* host) const {
@@ -426,6 +492,11 @@ void reset_for_testing() {
     s.enabled.store(false, std::memory_order_release);
     s.map_calls = 0;
     s.unmap_calls = 0;
+    for (uint64_t i = 0; i <= kWindowSlots; ++i) {
+        mark(i).store(0, std::memory_order_relaxed);
+    }
+    g_verify.store(false, std::memory_order_relaxed);
+    g_verify_misses.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace playgta6::os::guest_window

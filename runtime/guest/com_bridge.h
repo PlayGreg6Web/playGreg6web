@@ -773,6 +773,11 @@ struct Marshal {
                 }
             }();
             void* host = guest_to_host(va, bytes);
+            if constexpr (!std::is_const_v<Pointee>) {
+                if (host != nullptr) {
+                    ctx.buffers.note_written(va, bytes);  // O37: the callee may write in place
+                }
+            }
             if (host == nullptr && os::guest_window::translated(va)) {
                 // A pointee split across non-adjacent window pages: a bounce copy (O29).
                 host = ctx.buffers.range(va, bytes, !std::is_const_v<Pointee>);

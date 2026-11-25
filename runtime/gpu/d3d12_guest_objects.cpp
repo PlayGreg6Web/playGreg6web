@@ -1,3 +1,4 @@
+#include "os/guest_window.h"
 #include "gpu/d3d12_guest_objects.h"
 
 #include <algorithm>
@@ -1482,6 +1483,7 @@ void Fence::publish_value_locked() {
     const uint64_t current = value_.load(std::memory_order_acquire);
     if (auto* word = static_cast<uint64_t*>(com::guest_to_host(value_word_, sizeof(uint64_t)))) {
         std::atomic_ref<uint64_t>(*word).store(current, std::memory_order_release);
+        os::guest_window::mark_written(value_word_, sizeof(uint64_t));  // O37
     } else {
         com::write_guest(value_word_, current);
     }

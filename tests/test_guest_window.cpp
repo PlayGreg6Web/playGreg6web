@@ -482,6 +482,79 @@ void test_xmem_run_keeper_stays_in_the_pool() {
     gw::reset_for_testing();
 }
 
+// O37: write marks. Host writers mark the slots they write (after the write), remapping marks,
+// take_written reports and clears, read-only uses never mark, and Buffers marks in-place writable
+// views only when the host call is done.
+std::vector<uint64_t> taken(uint64_t va, size_t len) {
+    std::vector<uint64_t> out;
+    CHECK(gw::take_written(va, len, &out));
+    return out;
+}
+
+void test_write_marks() {
+    gw::reset_for_testing();
+    std::vector<uint64_t> none;
+    CHECK(!gw::take_written(W, k64K, &none));  // window off: no marks
+    gw::set_enabled(true);
+    Pages pages;
+    CHECK(gw::map_slot(W, pages.page(0)));
+    CHECK(gw::map_slot(W + k64K, pages.page(1)));
+    CHECK(gw::map_slot(W + 2 * k64K, pages.page(5)));
+    // Mapping marks: the slot's bytes changed.
+    CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{0, k64K, 2 * k64K}));
+    CHECK(taken(W, 3 * k64K).empty());  // taking clears
+    CHECK(!gw::take_written(W - k64K, 16, &none));  // outside the window: untracked
+
+    // Segmented copy over a slot boundary marks both slots; offsets relative to the range.
+    uint8_t data[64] = {1, 2, 3};
+    CHECK(gw::copy_to_guest(W + k64K - 32, data, sizeof(data)));
+    CHECK((taken(W + 100, 3 * k64K - 100) == std::vector<uint64_t>{0, k64K - 100}));
+    // Reads mark nothing.
+    uint8_t back[64] = {};
+    CHECK(gw::copy_from_guest(back, W + 10, sizeof(back)));
+    CHECK(gw::contiguous(W, 2 * k64K) != nullptr);
+    CHECK(taken(W, 3 * k64K).empty());
+    // fill and move mark their destination only.
+    CHECK(gw::fill_guest(W + 2 * k64K + 5, 0x11, 10));
+    CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{2 * k64K}));
+    CHECK(gw::move_guest(W + 8, W + 2 * k64K, 16));
+    CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{0}));
+    gw::mark_written(W + 3 * k64K - 1, 2);  // past the mapped slots: still a slot mark
+    CHECK((taken(W, 4 * k64K) == std::vector<uint64_t>{2 * k64K, 3 * k64K}));
+
+    // Buffers: a writable in-place view is marked by finish(), not when it is handed out; a
+    // read-only one is never marked; a writable bounce copy is marked when it is copied back.
+    {
+        gw::Buffers b;
+        CHECK(b.range(W + 16, 64, true) == pages.page(0) + 16);
+        CHECK(b.range(W + k64K + 16, 64, false) == pages.page(1) + 16);
+        CHECK(taken(W, 3 * k64K).empty());
+        b.finish();
+        CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{0}));
+    }
+    {
+        gw::Buffers b;
+        void* bounce = b.range(W + 2 * k64K - 8, 16, true);  // slots 1 | 2 are not host-adjacent
+        CHECK(bounce != nullptr && b.bounce_count() == 1);
+        std::memset(bounce, 0x22, 16);
+    }
+    CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{k64K, 2 * k64K}));
+    CHECK(pages.page(5)[7] == 0x22);
+
+    // The slow-path store helper lifted code calls for straddling stores marks too.
+    std::memset(__playgta6_guest_scratch(), 0x33, 8);
+    __playgta6_guest_write(W + k64K - 4, 8);
+    CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{0, k64K}));
+
+    // Verification counters.
+    CHECK(!gw::write_marks_verified() && gw::verify_misses() == 0);
+    gw::set_write_marks_verified(true);
+    gw::note_verify_miss(W);
+    CHECK(gw::write_marks_verified() && gw::verify_misses() == 1);
+    gw::reset_for_testing();
+    CHECK(!gw::write_marks_verified() && gw::verify_misses() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -492,6 +565,7 @@ int main() {
     test_xmem_translated_cpu_window();
     test_xmem_window_run_keeper();
     test_xmem_run_keeper_stays_in_the_pool();
+    test_write_marks();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;

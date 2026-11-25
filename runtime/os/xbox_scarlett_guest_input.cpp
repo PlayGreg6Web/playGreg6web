@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "os/guest_window.h"
 #include "gpu/gfx10_detile.h"
 #include "os/game_input.h"
 #include "os/xbox_scarlett.h"
@@ -582,7 +583,9 @@ public:
             return com::E_INVALIDARG_HR;
         }
         if (tiled_) {
-            return copy_into_tiled(dst, plane, subresource, src, row_pitch, slice_pitch);
+            const HResult hr = copy_into_tiled(dst, plane, subresource, src, row_pitch, slice_pitch);
+            guest_window::mark_written(dst, static_cast<size_t>(layout_.size_bytes));  // O37
+            return hr;
         }
         const Pg6XgMipLevelLayout& ml = layout_.mips[subresource % layout_.mip_levels];
         const uint32_t depth = desc_.dimension == 4 ? ml.depth : 1u;
@@ -612,6 +615,7 @@ public:
         if (!dst_bounce.empty() && !com::write_guest(dst, dst_bounce.data(), dst_bounce.size())) {
             return com::E_INVALIDARG_HR;
         }
+        guest_window::mark_written(dst, static_cast<size_t>(layout_.size_bytes));  // O37
         return hr;
     }
 

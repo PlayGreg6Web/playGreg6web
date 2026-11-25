@@ -1,3 +1,4 @@
+#include "os/guest_window.h"
 #include "os/xgameruntime_provider.h"
 
 #include <algorithm>
@@ -779,6 +780,7 @@ public:
         size_t host_used = 0;
         const int32_t hr = pg6_gdk_xuser_get_gamertag(from_guest<Pg6XUser>(user), component,
                                                       static_cast<size_t>(size), host_buffer, &host_used);
+        os::guest_window::mark_written(buffer, static_cast<size_t>(size));  // O37
         used.write(static_cast<uint64_t>(host_used));
         return hr;
     }
