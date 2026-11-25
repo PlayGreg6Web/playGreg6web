@@ -17,6 +17,8 @@ namespace playgta6::os::audio_report {
 
 constexpr uint64_t kWindowMs = 10000;
 constexpr size_t kMaxWindows = 64;
+// Frames of one spatial pass (10 ms at 48 kHz): passes count as frames in the fraction.
+constexpr uint64_t kSpatialPassFrames = 480;
 
 // Window index of an elapsed time, clamped to the last window.
 inline size_t window_index(uint64_t elapsed_ms, bool* clamped = nullptr) {
@@ -74,15 +76,22 @@ inline Windows& windows() {
 
 struct Totals {
     uint64_t render_frames = 0, render_nonzero_frames = 0, render_silent_releases = 0;
-    uint64_t spatial_passes = 0, spatial_object_buffers = 0, spatial_nonzero_buffers = 0;
+    uint64_t spatial_passes = 0, spatial_object_buffers = 0, spatial_nonzero_buffers = 0, spatial_nonzero_passes = 0;
     uint64_t xapu_decoded_packets = 0, xapu_failed_packets = 0, xapu_results_posted = 0;
 };
+
+// Non-silent share of everything the title released: render-client frames plus spatial passes
+// (kSpatialPassFrames each, non-silent when any object buffer holds a non-zero sample).
+inline double non_silent_fraction(const Totals& t) {
+    const uint64_t frames = t.render_frames + t.spatial_passes * kSpatialPassFrames;
+    const uint64_t nonzero = t.render_nonzero_frames + t.spatial_nonzero_passes * kSpatialPassFrames;
+    return frames == 0 ? 0.0 : static_cast<double>(nonzero) / static_cast<double>(frames);
+}
 
 // The `audio` value: totals, "non_silent_fraction" (0 with no frames), "window_ms" and
 // "non_silent_frames_per_window".
 inline std::string to_json(const Totals& t, const std::vector<uint64_t>& windows_nonsilent, uint64_t clamped) {
-    const double fraction = t.render_frames == 0 ? 0.0
-        : static_cast<double>(t.render_nonzero_frames) / static_cast<double>(t.render_frames);
+    const double fraction = non_silent_fraction(t);
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.6f", fraction > 1.0 ? 1.0 : fraction);
     std::string o = "{";
@@ -94,6 +103,7 @@ inline std::string to_json(const Totals& t, const std::vector<uint64_t>& windows
     add("spatial_passes", t.spatial_passes);
     add("spatial_object_buffers", t.spatial_object_buffers);
     add("spatial_nonzero_buffers", t.spatial_nonzero_buffers);
+    add("spatial_nonzero_passes", t.spatial_nonzero_passes);
     add("xapu_decoded_packets", t.xapu_decoded_packets);
     add("xapu_failed_packets", t.xapu_failed_packets);
     add("xapu_results_posted", t.xapu_results_posted);

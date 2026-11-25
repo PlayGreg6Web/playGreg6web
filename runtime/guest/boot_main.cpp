@@ -1057,6 +1057,7 @@ int main(int argc, char** argv) {
                 t.spatial_passes = a.spatial_passes;
                 t.spatial_object_buffers = a.spatial_object_buffers;
                 t.spatial_nonzero_buffers = a.spatial_nonzero_buffers;
+                t.spatial_nonzero_passes = a.spatial_nonzero_passes;
                 t.xapu_decoded_packets = x.decoded_packets;
                 t.xapu_failed_packets = x.failed_packets;
                 t.xapu_results_posted = x.type3_results;

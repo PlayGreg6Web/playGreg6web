@@ -45,6 +45,17 @@ int main() {
     CHECK(json.find("\"non_silent_fraction\": 0.250000") != std::string::npos);
     CHECK(json.find("\"xapu_decoded_packets\": 7") != std::string::npos);
     CHECK(json.find("\"non_silent_frames_per_window\": [480, 0, 960]") != std::string::npos);
+    // Spatial-only title (no render client): passes count as kSpatialPassFrames frames each.
+    ar::Totals s;
+    s.spatial_passes = 100;
+    s.spatial_nonzero_passes = 25;
+    CHECK(ar::non_silent_fraction(s) == 0.25);
+    CHECK(ar::to_json(s, {}, 0).find("\"non_silent_fraction\": 0.250000") != std::string::npos);
+    CHECK(ar::to_json(s, {}, 0).find("\"spatial_nonzero_passes\": 25") != std::string::npos);
+    // Both paths: 1000 render frames (250 non-zero) + 10 passes (5 non-zero) = 4800 + 1000 frames.
+    t.spatial_passes = 10;
+    t.spatial_nonzero_passes = 5;
+    CHECK(ar::non_silent_fraction(t) == (250.0 + 2400.0) / (1000.0 + 4800.0));
     CHECK(ar::to_json(ar::Totals{}, {}, 0).find("\"non_silent_fraction\": 0.000000") != std::string::npos);
 
     if (g_failures == 0) std::printf("test_audio_report: ok\n");
