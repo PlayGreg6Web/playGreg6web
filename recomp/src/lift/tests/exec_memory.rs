@@ -7,8 +7,8 @@ use iced_x86::code_asm::*;
 
 use super::asm_function;
 use super::exec::{
-    CODE_BASE, Case, GUEST_BASE, HarnessMemory, Outcome, RAX, RBX, RCX, RDI, RSP, STACK_TOP,
-    WINDOW_BASE, build_with_memory, exec_or_skip, run, window_backing,
+    CODE_BASE, Case, GUEST_BASE, HarnessMemory, Outcome, RAX, RBX, RCX, RDI, RDX, RSP, STACK_TOP,
+    WINDOW_BASE, WINDOW_SIZE, build_with_memory, exec_or_skip, run, window_backing,
 };
 use super::exec_integer::atomics_across_threads;
 use crate::lift::GuestBase;
@@ -398,4 +398,263 @@ fn writes_the_runtime_window_fixture() {
         };
         std::fs::write(dir.join(name), ir).expect("write .ll");
     }
+}
+
+// ----- O37: window write marks ------------------------------------------------------------------
+
+/// A guest VA outside the harness window (flat translation), free in the harness memory map.
+const FLAT_ADDR: u64 = 0x28_0000;
+
+/// Window slot of harness VA `va`.
+fn slot(va: u64) -> u64 {
+    (va - WINDOW_BASE) >> 16
+}
+
+/// The models the write marks apply to, plus the reference and a table model without a window.
+fn mark_models() -> Vec<(&'static str, HarnessMemory)> {
+    vec![
+        ("base", HarnessMemory::base(GuestBase::Symbol)),
+        (
+            "page",
+            HarnessMemory::page(&HarnessMemory::standard_slots()),
+        ),
+        (
+            "window",
+            HarnessMemory::window(&HarnessMemory::standard_slots()),
+        ),
+        (
+            "window_select",
+            HarnessMemory::window_with(&HarnessMemory::standard_slots(), WindowCheck::Select),
+        ),
+        (
+            "window_outline",
+            HarnessMemory::window_with(&HarnessMemory::standard_slots(), WindowCheck::Outline),
+        ),
+        (
+            "window_runs",
+            HarnessMemory::window_full(
+                &HarnessMemory::contiguous_slots(),
+                WindowCheck::Branch,
+                true,
+                true,
+            ),
+        ),
+    ]
+}
+
+/// The marks a case should leave under `model`: `slots` for the window models, nothing without a
+/// window; the branch-free check also marks its spare entry (the slot count) for a store outside.
+fn expected_marks(model: &str, slots: &[u64], outside_store: bool) -> Vec<u64> {
+    match model {
+        "base" | "page" => Vec::new(),
+        _ => {
+            let mut v: Vec<u64> = slots.to_vec();
+            if model == "window_select" && outside_store {
+                v.push(WINDOW_SIZE >> 16);
+            }
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+    }
+}
+
+#[test]
+fn stores_into_the_window_mark_their_slots() {
+    if !exec_or_skip("stores_into_the_window_mark_their_slots") {
+        return;
+    }
+    // f(rcx, rdx): mov [rcx], rax; mov [rdx], eax; ret - one store into the window (or a
+    // straddling one), one outside.
+    let f = asm_function(CODE_BASE, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.mov(dword_ptr(rdx), eax)?;
+        a.ret()
+    });
+    let aligned = boundary(2) + 0x100;
+    let straddle = boundary(4) - 3;
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        let cases = [
+            Case::new(CODE_BASE)
+                .reg(RAX, 0x1122_3344_5566_7788)
+                .reg(RCX, aligned)
+                .reg(RDX, FLAT_ADDR)
+                .read(aligned, 8),
+            // A straddling store: the slow path (or, with contiguous runs, the lifted code) marks
+            // both slots.
+            Case::new(CODE_BASE)
+                .reg(RAX, 0x0102_0304_0506_0708)
+                .reg(RCX, straddle)
+                .reg(RDX, FLAT_ADDR)
+                .read(straddle, 8),
+            // Both stores outside the window: no slot marked.
+            Case::new(CODE_BASE)
+                .reg(RAX, 7)
+                .reg(RCX, FLAT_ADDR + 0x40)
+                .reg(RDX, FLAT_ADDR),
+        ];
+        let o = run(&built, &cases);
+        ok(&o, name);
+        assert_eq!(le(&o[0].mem[0]), 0x1122_3344_5566_7788, "{name}");
+        assert_eq!(le(&o[1].mem[0]), 0x0102_0304_0506_0708, "{name}");
+        assert_eq!(
+            o[0].dirty,
+            expected_marks(name, &[slot(aligned)], true),
+            "{name}: aligned"
+        );
+        assert_eq!(
+            o[1].dirty,
+            expected_marks(name, &[slot(straddle), slot(straddle) + 1], true),
+            "{name}: straddling"
+        );
+        assert_eq!(
+            o[2].dirty,
+            expected_marks(name, &[], true),
+            "{name}: outside"
+        );
+    }
+}
+
+#[test]
+fn loads_mark_nothing() {
+    if !exec_or_skip("loads_mark_nothing") {
+        return;
+    }
+    let f = asm_function(CODE_BASE, |a| {
+        a.mov(rax, qword_ptr(rcx))?;
+        a.add(rax, qword_ptr(rcx + 0xFFF8))?;
+        a.ret()
+    });
+    let at = boundary(3) - 0x10;
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        let o = run(
+            &built,
+            &[Case::new(CODE_BASE).reg(RCX, at).mem(at, &[1; 8])],
+        );
+        ok(&o, name);
+        assert!(o[0].dirty.is_empty(), "{name}: {:?}", o[0].dirty);
+    }
+}
+
+#[test]
+fn rep_movs_and_stos_into_the_window_mark_the_destination() {
+    if !exec_or_skip("rep_movs_and_stos_into_the_window_mark_the_destination") {
+        return;
+    }
+    // rep movsb from outside the window to a range over slots 5 | 6, then rep stosb over 7 | 8.
+    let f = asm_function(CODE_BASE, |a| {
+        a.rep().movsb()?;
+        a.mov(rdi, r8)?;
+        a.mov(rcx, r9)?;
+        a.rep().stosb()?;
+        a.ret()
+    });
+    let dst = boundary(6) - 100;
+    let fill = boundary(8) - 10;
+    let src_bytes = pattern(300, 3);
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        let o = run(
+            &built,
+            &[Case::new(CODE_BASE)
+                .reg(super::exec::RSI, FLAT_ADDR)
+                .reg(RDI, dst)
+                .reg(RCX, 300)
+                .reg(RAX, 0x5A)
+                .reg(super::exec::R8, fill)
+                .reg(super::exec::R9, 20)
+                .mem(FLAT_ADDR, &src_bytes)
+                .read(dst, 300)
+                .read(fill, 20)],
+        );
+        ok(&o, name);
+        assert_eq!(o[0].mem[0], src_bytes, "{name}: copy");
+        assert_eq!(o[0].mem[1], vec![0x5A; 20], "{name}: fill");
+        assert_eq!(
+            o[0].dirty,
+            expected_marks(
+                name,
+                &[slot(dst), slot(dst) + 1, slot(fill), slot(fill) + 1],
+                false
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn atomics_into_the_window_mark_their_slot() {
+    if !exec_or_skip("atomics_into_the_window_mark_their_slot") {
+        return;
+    }
+    // lock xadd [rcx], rax; xchg [rdx], rbx; lock cmpxchg [r8], r9 (rax holds the old value of
+    // [rcx] after the xadd, so the cmpxchg compares with that); lock bts [r10], 3; ret.
+    let f = asm_function(CODE_BASE, |a| {
+        a.lock().xadd(qword_ptr(rcx), rax)?;
+        a.xchg(qword_ptr(rdx), rbx)?;
+        a.lock().cmpxchg(qword_ptr(r8), r9)?;
+        a.lock().bts(qword_ptr(r10), 3)?;
+        a.ret()
+    });
+    let xadd_at = boundary(1) + 0x40;
+    let xchg_at = boundary(3) + 0x80;
+    let cmpxchg_at = boundary(5) + 0x100;
+    let bts_at = boundary(7) + 0x200;
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        let inside = Case::new(CODE_BASE)
+            .reg(RAX, 1)
+            .reg(RCX, xadd_at)
+            .reg(super::exec::RDX, xchg_at)
+            .reg(RBX, 9)
+            .reg(super::exec::R8, cmpxchg_at)
+            .reg(super::exec::R9, 0x77)
+            .reg(super::exec::R10, bts_at)
+            .mem(xadd_at, &[0; 8])
+            .mem(cmpxchg_at, &[5, 0, 0, 0, 0, 0, 0, 0])
+            .mem(bts_at, &[0; 8])
+            .read(xchg_at, 8)
+            .read(bts_at, 8);
+        let outside = Case::new(CODE_BASE)
+            .reg(RAX, 1)
+            .reg(RCX, FLAT_ADDR)
+            .reg(super::exec::RDX, FLAT_ADDR + 8)
+            .reg(super::exec::R8, FLAT_ADDR + 16)
+            .reg(super::exec::R10, FLAT_ADDR + 24)
+            .mem(FLAT_ADDR, &[0; 32]);
+        let o = run(&built, &[inside, outside]);
+        ok(&o, name);
+        assert_eq!(le(&o[0].mem[0]), 9, "{name}: xchg");
+        assert_eq!(le(&o[0].mem[1]), 8, "{name}: bts");
+        assert_eq!(
+            o[0].dirty,
+            expected_marks(
+                name,
+                &[slot(xadd_at), slot(xchg_at), slot(cmpxchg_at), slot(bts_at)],
+                false
+            ),
+            "{name}: inside"
+        );
+        assert_eq!(
+            o[1].dirty,
+            expected_marks(name, &[], true),
+            "{name}: outside"
+        );
+    }
+}
+
+#[test]
+fn default_output_has_no_write_marks() {
+    let f = asm_function(CODE_BASE, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.lock().xadd(qword_ptr(rcx), rax)?;
+        a.ret()
+    });
+    let ir = lift_module_with([&f], MemoryModel::default())
+        .expect("lifts")
+        .ir;
+    assert!(!ir.contains("__playgta6_window_dirty"), "{ir}");
+    assert!(!ir.contains("store atomic i8 1"), "{ir}");
 }

@@ -23,7 +23,9 @@ use crate::cfg;
 use crate::lift::compile::{
     LlvmTool, compile_to_wasm64_object, find_llvm_tool, find_on_path, rustc_tool_dir,
 };
-use crate::lift::memory::{PAGE_TABLE_SYMBOL, WINDOW_TABLE_SYMBOL, Window, WindowCheck};
+use crate::lift::memory::{
+    PAGE_TABLE_SYMBOL, WINDOW_DIRTY_SYMBOL, WINDOW_TABLE_SYMBOL, Window, WindowCheck,
+};
 use crate::lift::{
     GUEST_BASE_SYMBOL, GuestBase, MemoryModel, STATE_FLAGS_OFFSET, STATE_GPR_OFFSET,
     STATE_GS_BASE_OFFSET, STATE_MXCSR_OFFSET, STATE_RESUME_RIP_OFFSET, STATE_SIZE,
@@ -598,6 +600,15 @@ pub(super) fn build_with_memory<'a>(
                 ),
             );
             extra.push(format!("--export-if-defined={WINDOW_TABLE_SYMBOL}"));
+            // O37: the write marks, one per slot plus the spare entry.
+            module.ir = module.ir.replace(
+                &format!("@{WINDOW_DIRTY_SYMBOL} = external global [0 x i8], align 1"),
+                &format!(
+                    "@{WINDOW_DIRTY_SYMBOL} = global [{} x i8] zeroinitializer, align 1",
+                    entries + 1
+                ),
+            );
+            extra.push(format!("--export-if-defined={WINDOW_DIRTY_SYMBOL}"));
             w.flat
         }
         MemoryModel::PageTable { pages, .. } => {
@@ -689,6 +700,9 @@ pub(super) struct Outcome {
     /// CF PF AF ZF SF OF
     pub flags: [bool; 6],
     pub mem: Vec<Vec<u8>>,
+    /// O37: window write marks set by the case (slot indices; the spare entry is the window's
+    /// slot count), cleared before each case.
+    pub dirty: Vec<u64>,
     pub error: String,
 }
 
@@ -766,7 +780,7 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
         .lines()
         .zip(cases)
         .map(|(line, case)| {
-            let mut parts = line.splitn(5, '\t');
+            let mut parts = line.splitn(6, '\t');
             let _index = parts.next();
             let mut regs = [0u64; 16];
             let values = parts.next().unwrap_or_default();
@@ -790,11 +804,19 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
                         .collect()
                 })
                 .collect();
+            let dirty = parts
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse().expect("slot index"))
+                .collect();
             let error = parts.next().unwrap_or_default().to_string();
             Outcome {
                 regs,
                 flags,
                 mem,
+                dirty,
                 error,
             }
         })

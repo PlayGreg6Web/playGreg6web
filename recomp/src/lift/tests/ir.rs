@@ -937,11 +937,18 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
     assert_eq!(ir.matches("br label %ret_epilog").count(), 2, "{ir}");
 
     // Compact windowed accesses: 2 non-stack loads -> 2 `align 1` loads total (not 6!),
-    // 2 non-stack stores -> 2 `align 1` stores inside sub_2000 + outlined cold slow_store helpers.
+    // 2 non-stack stores -> one `align 1` store on the flat and one on the window path each (O37:
+    // the window path marks its slot after the store, without a second branch) + outlined cold
+    // slow_store helpers.
     assert_eq!(
         fn_ir.matches(", align 1\n").count(),
-        4,
-        "2 loads + 2 stores = 4 align-1 accesses total (no per-path duplication):\n{fn_ir}"
+        8,
+        "2 loads + 2 x 2 stores + 2 slot marks = 8 align-1 accesses total:\n{fn_ir}"
+    );
+    assert_eq!(
+        fn_ir.matches("store atomic i8 1, ptr ").count(),
+        2,
+        "each window store marks its slot:\n{fn_ir}"
     );
     assert!(
         ir.contains("define internal void @__playgta6_slow_store8(i64 noundef %va, i64 noundef %v) unnamed_addr noinline cold #0 {"),

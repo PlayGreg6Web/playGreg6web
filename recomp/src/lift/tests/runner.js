@@ -36,6 +36,15 @@ const MEM = spec.memory || null;
 const TRAP_DELTA = 0x8000000000000000n;  // unmapped slot: the address lands beyond any memory
 const SCRATCH = 0x7FF000;  // linear scratch buffer of the slow-path helpers
 let tableAddr = 0;
+let dirtyAddr = 0;  // O37: window write marks (one byte per slot plus the spare entry)
+// Marks the window slots of [va, va + n) written, as the runtime's slow-path helpers do.
+const markWritten = (va, n) => {
+  if (!dirtyAddr || !MEM || MEM.model !== 'window' || n === 0n) return;
+  for (let a = BigInt(va); a < BigInt(va) + n; a = (a | 0xFFFFn) + 1n) {
+    const i = tableIndex(a);
+    if (i >= 0) view().setUint8(dirtyAddr + i, 1);
+  }
+};
 // Table index of guest VA `a` (BigInt) under the table model, or -1 for the flat translation.
 const tableIndex = (a) => {
   if (!MEM) return -1;
@@ -169,14 +178,17 @@ const imports = {
     },
     __playgta6_guest_write(va, n) {
       for (let i = 0n; i < n; i++) setByte(va + i, view().getUint8(SCRATCH + Number(i)));
+      markWritten(va, n);
     },
     __playgta6_guest_memmove(dst, src, n) {
       const tmp = [];
       for (let i = 0n; i < n; i++) tmp.push(getByte(src + i));
       tmp.forEach((b, i) => setByte(dst + BigInt(i), b));
+      markWritten(dst, n);
     },
     __playgta6_guest_memset(dst, value, n) {
       for (let i = 0n; i < n; i++) setByte(dst + i, Number(value) & 0xFF);
+      markWritten(dst, n);
     },
   },
 };
@@ -206,7 +218,10 @@ if (MEM) {
     }
     for (const [va, linear] of MEM.slots) mapSlot(BigInt(va), linear === null ? null : BigInt(linear));
   }
+  const marks = instance.exports.__playgta6_window_dirty;
+  if (marks) dirtyAddr = Number(marks.value);
 }
+const dirtyEntries = () => (MEM && MEM.model === 'window' ? Number(BigInt(MEM.size) >> 16n) + 1 : 0);
 
 const lines = spec.cases.map((c, index) => {
   let v = view();
@@ -216,6 +231,7 @@ const lines = spec.cases.map((c, index) => {
   c.flags.forEach((f, i) => v.setUint8(FLAGS + i, f));
   if (MXCSR) v.setUint32(MXCSR, 0x1F80, true);
   if (UNWIND_PENDING) v.setUint8(UNWIND_PENDING, 0);
+  if (dirtyAddr) for (let i = 0; i < dirtyEntries(); i++) v.setUint8(dirtyAddr + i, 0);
   for (const [addr, bytes] of c.mem) {
     const base = BigInt(addr);
     for (let i = 0; i < bytes.length; i += 2) setByte(base + BigInt(i / 2), parseInt(bytes.substr(i, 2), 16));
@@ -241,6 +257,8 @@ const lines = spec.cases.map((c, index) => {
     for (let i = 0; i < len; i++) s += getByte(base + BigInt(i)).toString(16).padStart(2, '0');
     return s;
   }).join(',');
-  return `${index}\t${regs}\t${flags}\t${mem}\t${error}`;
+  const dirty = [];
+  if (dirtyAddr) for (let i = 0; i < dirtyEntries(); i++) if (v.getUint8(dirtyAddr + i)) dirty.push(i);
+  return `${index}\t${regs}\t${flags}\t${mem}\t${dirty.join(',')}\t${error}`;
 });
 process.stdout.write(lines.join('\n') + '\n');

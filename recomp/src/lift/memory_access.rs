@@ -5,8 +5,8 @@
 use super::{FunctionLifter, R, imm};
 use crate::lift::memory::{
     Decl, HELPER_GUEST_MEMMOVE, HELPER_GUEST_MEMSET, HELPER_GUEST_READ, MemoryModel,
-    PAGE_TABLE_SYMBOL, SLOT_BYTES, SLOT_SHIFT, WINDOW_TABLE_SYMBOL, Window, WindowCheck,
-    helper_value_type, slow_store_helper, window_helper,
+    PAGE_TABLE_SYMBOL, SLOT_BYTES, SLOT_SHIFT, WINDOW_DIRTY_SYMBOL, WINDOW_TABLE_SYMBOL, Window,
+    WindowCheck, helper_value_type, slow_store_helper, window_helper,
 };
 use crate::lift::{GuestBase, Support};
 
@@ -19,6 +19,16 @@ pub(super) const LIKELY: &str = "!prof !{!\"branch_weights\", i32 2000, i32 1}";
 enum Access<'v> {
     Load { ty: &'v str },
     Store { ty: &'v str, value: &'v str },
+}
+
+/// O37: how a write through [`FunctionLifter::guest_ptr_write`] marks its window slot.
+pub(super) enum WriteMark {
+    /// No window (or a stack-pointer-relative access, which never reaches it).
+    None,
+    /// Branch-free window check: always store the mark (the spare entry outside the window).
+    Always(String),
+    /// Branching window check: mark slot `index` when `inside` holds.
+    Inside { inside: String, index: String },
 }
 
 impl FunctionLifter<'_> {
@@ -67,6 +77,61 @@ impl FunctionLifter<'_> {
         let raw = self.val(&format!("lshr i64 {addr}, {SLOT_SHIFT}"));
         let inside = self.val(&format!("icmp ult i64 {raw}, {pages}"));
         self.val(&format!("select i1 {inside}, i64 {raw}, i64 {pages}"))
+    }
+
+    /// O37: marks window slot `index` written (`__playgta6_window_dirty[index] = 1`, an atomic
+    /// release store of one byte). Emitted after the store it reports.
+    fn window_mark(&mut self, index: &str) {
+        self.support.insert(Support::Memory(Decl::WindowDirty));
+        let m = self.val(&format!(
+            "getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 {index}"
+        ));
+        self.emit(&format!("store atomic i8 1, ptr {m} release, align 1"));
+    }
+
+    /// O37: [`Self::guest_ptr`] for an access that writes (atomics, `lock`ed bit operations).
+    /// After the write the caller passes the returned mark to [`Self::finish_write`], which marks
+    /// the window slot written: in its own rarely taken block for the branching window check, as an
+    /// unconditional store (the spare entry outside the window) for the branch-free one, nothing
+    /// for models without a window.
+    pub(super) fn guest_ptr_write(&mut self, addr: &str) -> (String, WriteMark) {
+        match self.memory {
+            MemoryModel::Windowed(w)
+                if !(self.stack_flat().is_some() && self.stack_values.contains(addr)) =>
+            {
+                let (inside, rel) = self.window_test(addr, w);
+                let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+                let spare = w.size >> SLOT_SHIFT;
+                let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
+                let ptr = self.guest_ptr(addr);
+                let mark = if w.check == WindowCheck::Select {
+                    WriteMark::Always(index)
+                } else {
+                    WriteMark::Inside { inside, index }
+                };
+                (ptr, mark)
+            }
+            _ => (self.guest_ptr(addr), WriteMark::None),
+        }
+    }
+
+    /// O37: emits the mark [`Self::guest_ptr_write`] returned, after the write.
+    pub(super) fn finish_write(&mut self, mark: WriteMark) {
+        match mark {
+            WriteMark::None => {}
+            WriteMark::Always(index) => self.window_mark(&index),
+            WriteMark::Inside { inside, index } => {
+                let mark_block = self.new_label("gm");
+                let cont = self.new_label("gmc");
+                self.emit(&format!(
+                    "br i1 {inside}, label %{mark_block}, label %{cont}, {UNLIKELY}"
+                ));
+                self.start_block(&mark_block);
+                self.window_mark(&index);
+                self.emit(&format!("br label %{cont}"));
+                self.start_block(&cont);
+            }
+        }
     }
 
     /// The translation seam for accesses that never straddle a 64 KiB slot (naturally aligned:
@@ -154,6 +219,7 @@ impl FunctionLifter<'_> {
                 }
                 self.support
                     .insert(Support::Memory(Decl::WindowStore { bytes: width, base }));
+                self.support.insert(Support::Memory(Decl::WindowDirty));
                 let name = window_helper(true, bytes, base);
                 let raw = if *ty == vty {
                     (*value).to_string()
@@ -281,7 +347,11 @@ impl FunctionLifter<'_> {
                 if bytes <= 1 || self.contiguous_runs() {
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-                    return self.access_at(&ptr, &access);
+                    let v = self.access_at(&ptr, &access);
+                    if let Access::Store { .. } = access {
+                        self.select_marks(&inside, addr, w, bytes);
+                    }
+                    return v;
                 }
                 // One rarely taken branch: a window access that leaves its slot.
                 let offset = self.val(&format!("and i64 {addr}, {}", SLOT_BYTES - 1));
@@ -298,6 +368,7 @@ impl FunctionLifter<'_> {
                 let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
                 if let Access::Store { .. } = access {
                     self.access_at(&p_fast, &access);
+                    self.select_marks(&inside, addr, w, 1);
                 }
                 self.emit(&format!("br label %{join}"));
                 self.start_block(&slow);
@@ -342,6 +413,10 @@ impl FunctionLifter<'_> {
                     }
                     _ => None,
                 }
+            }
+            MemoryModel::Windowed(w) if matches!(access, Access::Store { .. }) => {
+                self.window_store(addr, bytes, w, &access);
+                None
             }
             MemoryModel::Windowed(w) => {
                 let (inside, rel) = self.window_test(addr, w);
@@ -412,6 +487,76 @@ impl FunctionLifter<'_> {
                     None
                 }
             }
+        }
+    }
+
+    /// O37: a store under the branching window check. The flat path stores directly; the window
+    /// path stores and then marks the slot written (and, when runs are kept contiguous and the store
+    /// may leave its slot, the slot of its last byte); a store that may leave its slot otherwise
+    /// takes the runtime helper, which marks. No branch beyond the window check and the straddle
+    /// check the loads have too.
+    fn window_store(&mut self, addr: &str, bytes: u64, w: Window, access: &Access<'_>) {
+        let (inside, rel) = self.window_test(addr, w);
+        let win = self.new_label("gw");
+        let flat = self.new_label("gf");
+        let join = self.new_label("gj");
+        self.emit(&format!(
+            "br i1 {inside}, label %{win}, label %{flat}, {UNLIKELY}"
+        ));
+        self.start_block(&flat);
+        let host_flat = self.flat_host(addr, w.flat);
+        let p_flat = self.val(&format!("inttoptr i64 {host_flat} to ptr"));
+        self.access_at(&p_flat, access);
+        self.emit(&format!("br label %{join}"));
+        self.start_block(&win);
+        let straddle_checked = bytes > 1 && !self.contiguous_runs();
+        let slow = if straddle_checked {
+            let table = self.new_label("gt");
+            let slow = self.new_label("gs");
+            let offset = self.val(&format!("and i64 {addr}, {}", SLOT_BYTES - 1));
+            let fits = self.val(&format!("icmp ule i64 {offset}, {}", SLOT_BYTES - bytes));
+            self.emit(&format!(
+                "br i1 {fits}, label %{table}, label %{slow}, {LIKELY}"
+            ));
+            self.start_block(&table);
+            Some(slow)
+        } else {
+            None
+        };
+        let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+        let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+        let host = self.val(&format!("add i64 {addr}, {delta}"));
+        let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+        self.access_at(&ptr, access);
+        self.window_mark(&index);
+        if bytes > 1 && self.contiguous_runs() {
+            let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
+            let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
+            self.window_mark(&last_index);
+        }
+        self.emit(&format!("br label %{join}"));
+        if let (Some(slow), Access::Store { ty, value }) = (slow, access) {
+            self.start_block(&slow);
+            self.slow_store(addr, bytes, ty, value);
+            self.emit(&format!("br label %{join}"));
+        }
+        self.start_block(&join);
+    }
+
+    /// O37: marks of a store under the branch-free window check: the slot (the spare entry
+    /// outside the window) and, when runs are kept contiguous and the store is wider than a byte,
+    /// the slot of its last byte.
+    fn select_marks(&mut self, inside: &str, addr: &str, w: Window, bytes: u64) {
+        let rel = self.val(&format!("sub i64 {addr}, {}", imm(w.base, 64)));
+        let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+        let spare = w.size >> SLOT_SHIFT;
+        let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
+        self.window_mark(&index);
+        if bytes > 1 && self.contiguous_runs() {
+            let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
+            let last_raw = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
+            let last_index = self.val(&format!("select i1 {inside}, i64 {last_raw}, i64 {spare}"));
+            self.window_mark(&last_index);
         }
     }
 

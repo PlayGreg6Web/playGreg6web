@@ -182,8 +182,10 @@ impl FunctionLifter<'_> {
                         Mnemonic::Btr => ("and", self.val(&format!("xor i8 {one}, -1"))),
                         _ => ("xor", one.clone()),
                     };
-                    let ptr = self.guest_ptr(&addr);
-                    self.atomic_rmw(op, &ptr, &operand, 8)
+                    let (ptr, mark) = self.guest_ptr_write(&addr);
+                    let old = self.atomic_rmw(op, &ptr, &operand, 8);
+                    self.finish_write(mark);
+                    old
                 } else {
                     let old = self.load_mem(&addr, 8);
                     let new = match m {

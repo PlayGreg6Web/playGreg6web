@@ -23,6 +23,7 @@
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
 use super::integer::{RAX, RBX, RCX, RDX};
+use super::memory_access::WriteMark;
 use super::{Alu, ColdTrapKind, Flag, FunctionLifter, R, RegRef, reg_ref, unsupported};
 use crate::lift::Support;
 
@@ -103,9 +104,11 @@ impl FunctionLifter<'_> {
         (old, ok)
     }
 
-    fn memory_ptr(&mut self, ins: &Instruction) -> R<String> {
+    /// Host pointer of the memory operand of an atomic instruction (they all write: a failed
+    /// `cmpxchg` writes the old value back) and the window mark to emit after the write (O37).
+    fn memory_ptr(&mut self, ins: &Instruction) -> R<(String, WriteMark)> {
         let ea = self.mem_ea(ins)?;
-        Ok(self.guest_ptr(&ea))
+        Ok(self.guest_ptr_write(&ea))
     }
 
     /// Every `lock`-prefixed instruction.
@@ -152,8 +155,9 @@ impl FunctionLifter<'_> {
             }
             Alu::Cmp | Alu::Test => return unsupported("lock prefix on cmp/test (#UD)"),
         };
-        let ptr = self.memory_ptr(ins)?;
+        let (ptr, mark) = self.memory_ptr(ins)?;
         let old = self.atomic_rmw(rmw, &ptr, &operand, bits);
+        self.finish_write(mark);
         self.alu_value(op, &old, &b, bits);
         Ok(())
     }
@@ -161,7 +165,7 @@ impl FunctionLifter<'_> {
     /// `lock inc/dec/not/neg [mem]`.
     fn atomic_unary(&mut self, ins: &Instruction) -> R<()> {
         let bits = self.op_bits(ins, 0)?;
-        let ptr = self.memory_ptr(ins)?;
+        let (ptr, mark) = self.memory_ptr(ins)?;
         let m = ins.mnemonic();
         let old = match m {
             Mnemonic::Inc => self.atomic_rmw("add", &ptr, "1", bits),
@@ -201,6 +205,7 @@ impl FunctionLifter<'_> {
                 seen
             }
         };
+        self.finish_write(mark);
         self.unary_value(m, &old, bits);
         Ok(())
     }
@@ -217,8 +222,9 @@ impl FunctionLifter<'_> {
         }
         let bits = self.op_bits(ins, mem)?;
         let v = self.read_op(ins, reg, bits)?;
-        let ptr = self.memory_ptr(ins)?;
+        let (ptr, mark) = self.memory_ptr(ins)?;
         let old = self.atomic_rmw("xchg", &ptr, &v, bits);
+        self.finish_write(mark);
         self.write_op(ins, reg, &old, bits)
     }
 
@@ -227,8 +233,9 @@ impl FunctionLifter<'_> {
         let bits = self.op_bits(ins, 0)?;
         let b = self.read_op(ins, 1, bits)?;
         if locked {
-            let ptr = self.memory_ptr(ins)?;
+            let (ptr, mark) = self.memory_ptr(ins)?;
             let old = self.atomic_rmw("add", &ptr, &b, bits);
+            self.finish_write(mark);
             self.alu_value(Alu::Add, &old, &b, bits);
             return self.write_op(ins, 1, &old, bits);
         }
@@ -248,8 +255,10 @@ impl FunctionLifter<'_> {
         let src = self.read_op(ins, 1, bits)?;
         let (expected, _) = self.read_reg(acc)?;
         let (old, eq) = if locked {
-            let ptr = self.memory_ptr(ins)?;
-            self.atomic_cmpxchg(&ptr, &expected, &src, bits)
+            let (ptr, mark) = self.memory_ptr(ins)?;
+            let r = self.atomic_cmpxchg(&ptr, &expected, &src, bits);
+            self.finish_write(mark);
+            r
         } else {
             let old = self.read_op(ins, 0, bits)?;
             let eq = self.val(&format!("icmp eq i{bits} {expected}, {old}"));
@@ -322,10 +331,11 @@ impl FunctionLifter<'_> {
             if locked {
                 self.support.insert(Support::Atomics);
                 self.support.insert(Support::Cmpxchg16b);
-                let ptr = self.guest_ptr(&ea);
+                let (ptr, mark) = self.guest_ptr_write(&ea);
                 let res = self.val(&format!(
                     "call {{ i64, i64, i1 }} @__playgta6_cmpxchg16b(ptr {ptr}, i64 {rax}, i64 {rdx}, i64 {rbx}, i64 {rcx})"
                 ));
+                self.finish_write(mark);
                 let lo = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 0"));
                 let hi = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 1"));
                 let eq = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 2"));
@@ -351,8 +361,10 @@ impl FunctionLifter<'_> {
             let expected = self.join32(&edx, &eax);
             let new = self.join32(&ecx, &ebx);
             let (old, eq) = if locked {
-                let ptr = self.guest_ptr(&ea);
-                self.atomic_cmpxchg(&ptr, &expected, &new, 64)
+                let (ptr, mark) = self.guest_ptr_write(&ea);
+                let r = self.atomic_cmpxchg(&ptr, &expected, &new, 64);
+                self.finish_write(mark);
+                r
             } else {
                 let old = self.load_mem(&ea, 64);
                 let eq = self.val(&format!("icmp eq i64 {old}, {expected}"));

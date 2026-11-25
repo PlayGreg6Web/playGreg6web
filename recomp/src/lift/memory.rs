@@ -108,6 +108,11 @@ pub const SLOT_BYTES: u64 = 64 << 10;
 pub const SLOT_SHIFT: u32 = 16;
 /// Delta table of the window ([`MemoryModel::Windowed`]): `[S / 64 KiB x i64]`, runtime-defined.
 pub const WINDOW_TABLE_SYMBOL: &str = "__playgta6_window_table";
+/// Write marks of the translated window (O37; docs/wasm_abi.md): one byte per slot plus a spare
+/// entry at index `size >> 16` (the window's slot count; `kGuestWindowSize / kGuestWindowSlotBytes`
+/// for the browser's window), set after every store into the slot. Branch-free window checks store
+/// the spare entry for addresses outside the window.
+pub const WINDOW_DIRTY_SYMBOL: &str = "__playgta6_window_dirty";
 /// Delta table of [`MemoryModel::PageTable`]: `[pages + 1 x i64]`, runtime-defined.
 pub const PAGE_TABLE_SYMBOL: &str = "__playgta6_page_table";
 /// `ptr (i64 va, i64 n)`: copies `n` guest bytes into a per-thread scratch buffer and returns it.
@@ -317,6 +322,8 @@ impl MemoryModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Decl {
     WindowTable,
+    /// `@__playgta6_window_dirty` (stores into the translated window mark their slot).
+    WindowDirty,
     PageTable,
     Read,
     Write,
@@ -365,6 +372,9 @@ impl Decl {
         match self {
             Self::WindowTable => {
                 "@__playgta6_window_table = external global [0 x i64], align 8\n".to_string()
+            }
+            Self::WindowDirty => {
+                format!("@{WINDOW_DIRTY_SYMBOL} = external global [0 x i8], align 1\n")
             }
             Self::PageTable => {
                 "@__playgta6_page_table = external global [0 x i64], align 8\n".to_string()
@@ -434,7 +444,14 @@ fn outlined(store: bool, bytes: u64, base: u64) -> String {
         "  %rel = sub i64 %va, {}\n  %idx = lshr i64 %rel, {SLOT_SHIFT}\n  %e = getelementptr i64, ptr @{WINDOW_TABLE_SYMBOL}, i64 %idx\n  %d = load i64, ptr %e, align 8\n  %h = add i64 %va, %d\n  %p = inttoptr i64 %h to ptr\n",
         base as i64
     ));
-    out.push_str(&access("%p", "f"));
+    if store {
+        // O37: mark the slot after the store (the slow path's runtime helper marks itself).
+        out.push_str(&format!(
+            "  store {vty} %v, ptr %p, align 1\n  %m = getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 %idx\n  store atomic i8 1, ptr %m release, align 1\n  ret void\n"
+        ));
+    } else {
+        out.push_str(&access("%p", "f"));
+    }
     if bytes > 1 {
         out.push_str("slow:\n");
         if store {
