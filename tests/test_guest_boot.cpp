@@ -13,6 +13,7 @@
 #include "abi/playgta6_abi.h"
 #include <thread>
 
+#include "gpu/present_pacing.h"
 #include "guest/boot.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
@@ -612,9 +613,12 @@ void sub_entry(GuestState* s) {
             // Two import calls, the first Present, one more call.
             call_iat(s, kSlotSetLastError, kEntryCallsIat);
             call_iat(s, kSlotGetLastError, kEntryCallsIat);
-            mark_first_present();
-            mark_first_present();  // later marks are ignored
+            // A PresentX reaches the display (present pacer) without any GPU capture running:
+            // that alone marks the first Present.
+            gpu::present_pacer().present(0);
+            gpu::present_pacer().present(0);
             call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            mark_first_present();  // later marks are ignored
             reg(s, GuestReg::Rax) = 0;
             ret(s);
             return;
@@ -807,6 +811,15 @@ void test_report_import_fields() {
     const Json& fp = run.report["first_present"];
     CHECK(fp.type == Json::Object);
     CHECK(fp["import_seq"].number == 2);
+    // ... and is a FIRST_PRESENT milestone at that import call (the last milestone; once).
+    int first_present_milestones = 0;
+    for (const Json& m : run.report["milestones"].items) {
+        if (m["milestone"].text == "FIRST_PRESENT") {
+            ++first_present_milestones;
+            CHECK(m["import_seq"].number == 2);
+        }
+    }
+    CHECK(first_present_milestones == 1);
     CHECK(fp["imports"].items.size() == 2);  // SetLastError and GetLastError, one thread, one call each
     uint64_t total = 0;
     bool names = false;

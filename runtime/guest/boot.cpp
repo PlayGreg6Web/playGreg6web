@@ -2590,12 +2590,17 @@ void set_report_extension(ReportExtension extension) {
 
 void mark_first_present() {
     BootState& b = boot();
-    std::lock_guard<std::mutex> lock(b.mutex);
-    if (!b.present_seen) {
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        if (b.present_seen) {
+            return;
+        }
         b.present_seen = true;
-        b.present_import_seq = b.import_calls.load(std::memory_order_relaxed);
+        b.present_import_seq = seq = b.import_calls.load(std::memory_order_relaxed);
         b.present_elapsed_ms = elapsed_ms();
     }
+    milestone("FIRST_PRESENT", "first PresentX (import call #%" PRIu64 ")", seq);
 }
 
 std::string last_summary() {
@@ -2759,6 +2764,9 @@ BootResult run_boot(const BootConfig& config) {
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
+    // Every present marks the first one (report first_present, FIRST_PRESENT milestone), with or
+    // without a GPU capture.
+    gpu::present_pacer().set_observer(&mark_first_present);
     b.guest_thread_started = config.guest_thread_started;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);
