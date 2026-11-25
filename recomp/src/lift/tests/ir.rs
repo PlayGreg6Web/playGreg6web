@@ -629,6 +629,38 @@ fn flags_overwritten_before_any_reader_are_not_materialised() {
     }
 }
 
+#[test]
+fn register_and_flag_allocas_are_forwarded_within_a_block() {
+    let func = asm_function(0x1000, |a| {
+        a.add(rax, rcx)?;
+        a.add(rax, rdx)?;
+        a.push(rbx)?;
+        a.pop(rbx)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    let body = block_text(ir, "bb_1000");
+    let loads = |slot: &str| body.matches(&format!(" = load i64, ptr %{slot}\n")).count();
+    let stores = |slot: &str| {
+        let suffix = format!(", ptr %{slot}");
+        body.lines()
+            .filter(|l| l.trim_start().starts_with("store ") && l.ends_with(&suffix))
+            .count()
+    };
+    // Each alloca is loaded at most once per block; later reads reuse the value.
+    for reg in ["rax", "rcx", "rdx", "rbx", "rsp"] {
+        assert!(loads(reg) <= 1, "{reg}:\n{ir}");
+    }
+    assert_eq!(body.matches(" = load i1, ptr %").count(), 0, "{ir}");
+    // Overwritten stores are gone: only the second add's rax and the ret's rsp remain.
+    assert_eq!(stores("rax"), 1, "{ir}");
+    assert_eq!(stores("rsp"), 1, "{ir}");
+    assert_eq!(flag_stores(&body, "cf"), 1, "{ir}");
+    // The final values still reach the state.
+    assert!(ir.contains("i32 0, i64 0\n"), "{ir}");
+}
+
 /// A block built by hand (for CFG shapes discovery never produces).
 fn block(
     start: u64,

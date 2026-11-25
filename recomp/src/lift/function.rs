@@ -342,9 +342,79 @@ pub(super) fn lift(
         flag_summaries,
         dead_after: flag_liveness::dead_after(func, flag_summaries),
         dead_flags: 0,
+        known: Known::default(),
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
+}
+
+/// Removes stores to a GPR or flag alloca that a later store to the same alloca overwrites in the
+/// same LLVM block with no use of the alloca in between. The allocas never escape (only `load`
+/// and `store` name them), so nothing else can read the overwritten value; a terminator or label
+/// ends the block and counts as a use of every alloca, as a successor may load it. With the load
+/// forwarding of [`FunctionLifter::known`], a register written twice in a block (`push`/`pop`
+/// pairs, `rsp` updates, flags of consecutive ALU instructions) keeps only its last store.
+fn drop_overwritten_slot_stores(ir: &str) -> String {
+    const TERMINATORS: [&str; 8] = [
+        "br ",
+        "switch ",
+        "ret ",
+        "unreachable",
+        "indirectbr ",
+        "invoke ",
+        "resume ",
+        "callbr ",
+    ];
+    let slot_of = |name: &str| -> Option<usize> {
+        GPR_NAMES.iter().position(|&g| g == name).or_else(|| {
+            FLAGS
+                .iter()
+                .position(|f| &f.slot()[1..] == name)
+                .map(|i| GPR_NAMES.len() + i)
+        })
+    };
+    let lines: Vec<&str> = ir.lines().collect();
+    let mut keep = vec![true; lines.len()];
+    let mut pending: [Option<usize>; 22] = [None; 22];
+    for (i, line) in lines.iter().enumerate() {
+        let code = line.trim();
+        if !line.starts_with(' ') || TERMINATORS.iter().any(|t| code.starts_with(t)) {
+            pending = [None; 22];
+            continue;
+        }
+        let stored = code
+            .strip_prefix("store ")
+            .and_then(|rest| rest.rsplit_once(", ptr %"))
+            .and_then(|(_, slot)| slot_of(slot));
+        // Every alloca the line names (as a whole `%name` token) is read, except the stored one.
+        let mut rest = code;
+        while let Some(at) = rest.find('%') {
+            rest = &rest[at + 1..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .unwrap_or(rest.len());
+            if let Some(slot) = slot_of(&rest[..end])
+                && Some(slot) != stored
+            {
+                pending[slot] = None;
+            }
+            rest = &rest[end..];
+        }
+        if let Some(slot) = stored {
+            if let Some(earlier) = pending[slot] {
+                keep[earlier] = false;
+            }
+            pending[slot] = Some(i);
+        }
+    }
+    let mut out = String::with_capacity(ir.len());
+    for (line, keep) in lines.iter().zip(keep) {
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Terminators whose last instruction is the control transfer itself (lowered from the edges).
@@ -416,6 +486,18 @@ struct FunctionLifter<'a> {
     /// [`Self::dead_after`] of the instruction being lifted (0 outside modelled instructions):
     /// these flags are neither computed nor stored.
     dead_flags: FlagMask,
+    /// Load forwarding: the value each GPR / flag alloca holds, as far as it is known in the
+    /// current LLVM basic block (the last value stored or loaded there). The allocas are private
+    /// to the function and never escape, so a later load in the same block reads exactly that
+    /// value; every store is still emitted. Cleared at each new block (see [`Self::start_block`]).
+    known: Known,
+}
+
+/// See [`FunctionLifter::known`].
+#[derive(Clone, Default)]
+struct Known {
+    gprs: [Option<String>; 16],
+    flags: [Option<String>; 6],
 }
 
 struct Checkpoint {
@@ -426,6 +508,7 @@ struct Checkpoint {
     cold_traps: usize,
     has_shared_ret: bool,
     support: BTreeSet<Support>,
+    known: Known,
 }
 
 impl FunctionLifter<'_> {
@@ -620,6 +703,7 @@ impl FunctionLifter<'_> {
         self.xmm_allocas(&mut ir);
         // The emit helpers write to `self.body`, which is empty again here: build the entry
         // block's state loads there and splice them in front of the lifted blocks.
+        self.known = Known::default();
         self.sync_in();
         self.unwind_entry();
         if self.support.contains(&Support::GuestBase)
@@ -642,6 +726,7 @@ impl FunctionLifter<'_> {
         let _ = writeln!(ir, "  br label %{}", block_label(entry));
         ir.push_str(&body);
         ir.push_str("}\n");
+        let ir = drop_overwritten_slot_stores(&ir);
 
         let mut unsupported = std::mem::take(&mut self.unsupported);
         unsupported.sort_by_key(|u| u.address);
@@ -729,6 +814,7 @@ impl FunctionLifter<'_> {
             cold_traps: self.cold_traps.len(),
             has_shared_ret: self.has_shared_ret,
             support: self.support.clone(),
+            known: self.known.clone(),
         }
     }
 
@@ -740,6 +826,7 @@ impl FunctionLifter<'_> {
         self.cold_traps.truncate(checkpoint.cold_traps);
         self.has_shared_ret = checkpoint.has_shared_ret;
         self.support = checkpoint.support;
+        self.known = checkpoint.known;
     }
 
     fn trap_unsupported(&mut self, ins: &Instruction, reason: String) {
@@ -773,7 +860,10 @@ impl FunctionLifter<'_> {
             "br i1 {fault}, label %cold_trap, label %{ok}, {}",
             memory_access::UNLIKELY
         ));
+        // `ok` has this block as its only predecessor: the known values stay valid there.
+        let known = std::mem::take(&mut self.known);
         self.start_block(&ok);
+        self.known = known;
     }
 
     // ----- IR emission primitives ---------------------------------------------------------------
@@ -805,6 +895,7 @@ impl FunctionLifter<'_> {
     }
 
     fn start_block(&mut self, label: &str) {
+        self.known = Known::default();
         self.current_block.clear();
         self.current_block.push_str(label);
         let _ = writeln!(self.body, "{label}:");
@@ -838,6 +929,7 @@ impl FunctionLifter<'_> {
                 let ptr = self.state_gpr_ptr(idx);
                 let v = self.val(&format!("load i64, ptr {ptr}"));
                 self.emit(&format!("store i64 {v}, ptr %{}", GPR_NAMES[idx]));
+                self.known.gprs[idx] = Some(v);
             }
         }
         for flag in FLAGS {
@@ -846,6 +938,7 @@ impl FunctionLifter<'_> {
                 let byte = self.val(&format!("load i8, ptr {ptr}, !range !{{i8 0, i8 2}}"));
                 let bit = self.val(&format!("trunc i8 {byte} to i1"));
                 self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
+                self.known.flags[flag as usize] = Some(bit);
             }
         }
         if state & OTHER_STATE != 0 {
@@ -877,14 +970,16 @@ impl FunctionLifter<'_> {
     fn sync_out_parts(&mut self, state: StateMask, flags: FlagMask) {
         for idx in 0..16 {
             if self.regs[idx] && state & (1 << idx) != 0 {
-                let v = self.val(&format!("load i64, ptr %{}", GPR_NAMES[idx]));
+                let Ok(v) = self.load_gpr(idx) else {
+                    unreachable!("register {idx} is tracked")
+                };
                 let ptr = self.state_gpr_ptr(idx);
                 self.emit(&format!("store i64 {v}, ptr {ptr}"));
             }
         }
         for flag in FLAGS {
             if self.flags[flag as usize] && flags & (1 << flag as usize) != 0 {
-                let bit = self.val(&format!("load i1, ptr {}", flag.slot()));
+                let bit = self.load_flag(flag);
                 let byte = self.val(&format!("zext i1 {bit} to i8"));
                 let ptr = self.state_flag_ptr(flag);
                 self.emit(&format!("store i8 {byte}, ptr {ptr}"));
@@ -914,7 +1009,14 @@ impl FunctionLifter<'_> {
 
     fn load_gpr(&mut self, idx: usize) -> R<String> {
         let slot = self.gpr_slot(idx)?;
-        let v = self.val(&format!("load i64, ptr {slot}"));
+        let v = match &self.known.gprs[idx] {
+            Some(v) => v.clone(),
+            None => {
+                let v = self.val(&format!("load i64, ptr {slot}"));
+                self.known.gprs[idx] = Some(v.clone());
+                v
+            }
+        };
         if idx == RSP {
             self.note_stack_value(&v);
         }
@@ -924,6 +1026,7 @@ impl FunctionLifter<'_> {
     fn store_gpr(&mut self, idx: usize, value: &str) -> R<()> {
         let slot = self.gpr_slot(idx)?;
         self.emit(&format!("store i64 {value}, ptr {slot}"));
+        self.known.gprs[idx] = Some(value.to_string());
         Ok(())
     }
 
@@ -1139,11 +1242,22 @@ impl FunctionLifter<'_> {
             return;
         }
         self.emit(&format!("store i1 {value}, ptr {}", flag.slot()));
+        self.known.flags[flag as usize] = Some(value.to_string());
     }
 
     fn get_flag(&mut self, flag: Flag) -> String {
         debug_assert!(self.flags[flag as usize], "flag {flag:?} was not tracked");
-        self.val(&format!("load i1, ptr {}", flag.slot()))
+        self.load_flag(flag)
+    }
+
+    /// The flag's alloca value, forwarded from [`Self::known`] when the block already has it.
+    fn load_flag(&mut self, flag: Flag) -> String {
+        if let Some(v) = &self.known.flags[flag as usize] {
+            return v.clone();
+        }
+        let v = self.val(&format!("load i1, ptr {}", flag.slot()));
+        self.known.flags[flag as usize] = Some(v.clone());
+        v
     }
 
     fn msb(&mut self, v: &str, bits: u32) -> String {
