@@ -26,6 +26,9 @@ What is compared (section names are the prefixes of the field paths used by --ig
   imports      total import calls and per-name call counts from the report (count tolerance)
   address_space  reservation log sequence (event, ok, va, size, protect) exact, plus failure
                count and reserved peak
+  gpu_work     draws / dispatches issued, emitted and skipped by reason (count tolerance;
+               both reports must carry it)
+  memory.alias XMem alias_slots / alias_conflicts (count tolerance; both reports must carry it)
   import_trace import-call counts by name up to the first Present, overall and on the busiest
                thread (count tolerance); from the report's first_present or the import traces
   presents     per-Present sample distributions from the reports or the sidecars (min / median / max of
@@ -347,6 +350,24 @@ def compare_presents(c: Comparison, pa: list[dict[str, Any]], pb: list[dict[str,
             (c.time if key == "wall_ms" else c.count)(path, da[stat], db[stat])
 
 
+def compare_progress(c: Comparison, ra: dict[str, Any], rb: dict[str, Any]) -> None:
+    """R40 progress counters: `gpu_work` (draws / dispatches emitted vs skipped by reason) and the
+    XMem alias stats (`memory.cpu_window.alias_*`). Wall-clock dependent, so count tolerance; each
+    section is compared only when both reports carry it (older reports lack them)."""
+    wa, wb = ra.get("gpu_work"), rb.get("gpu_work")
+    if isinstance(wa, dict) and isinstance(wb, dict):
+        c.mapping("gpu_work", wa, wb, "count")
+
+    def alias(r: dict[str, Any]) -> dict[str, Any]:
+        mem = r.get("memory") if isinstance(r.get("memory"), dict) else {}
+        win = mem.get("cpu_window") if isinstance(mem.get("cpu_window"), dict) else {}
+        return {k: win[k] for k in ("alias_slots", "alias_conflicts") if k in win}
+
+    aa, ab = alias(ra), alias(rb)
+    if aa and ab:
+        c.mapping("memory.alias", aa, ab, "count")
+
+
 def compare_captures(c: Comparison, ca: Capture, cb: Capture) -> None:
     for key in ("frames_complete", "payloads"):
         c.exact(f"capture.{key}", ca.sidecar.get(key), cb.sidecar.get(key))
@@ -605,6 +626,7 @@ def compare(
     compare_stop(c, ra, rb)
     compare_imports(c, ra, rb)
     compare_address_space(c, ra, rb)
+    compare_progress(c, ra, rb)
     caps = captures or (None, None)
     traces = import_traces or (None, None)
     fa = first_present_from_report(ra) or first_present_from_trace(traces[0], caps[0])

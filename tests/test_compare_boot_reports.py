@@ -157,6 +157,38 @@ class CompareTests(unittest.TestCase):
         self.assertNotIn("import_trace.busiest_thread.k!A", f)  # 2 calls up to the first present in both
 
 
+class ProgressCounterTests(unittest.TestCase):
+    """R40: gpu_work and memory.cpu_window.alias_* are compared with count tolerance."""
+
+    @staticmethod
+    def report(draws_emitted: int, skipped: int, alias_slots: int) -> dict:
+        r = make_report_v2()
+        r["gpu_work"] = {"draws_emitted": draws_emitted, "draws_no_shader_module": skipped,
+                         "dispatches_emitted": 10, "dispatches_no_shader_module": 0}
+        r["memory"] = {"cpu_window": {"alias_slots": alias_slots, "alias_conflicts": 0}}
+        return r
+
+    def run_compare(self, a: dict, b: dict, ignore=()) -> cbr.Comparison:
+        return cbr.compare(a, b, cbr.Tolerances(), ignore)
+
+    def test_equal_and_within_tolerance_pass(self) -> None:
+        c = self.run_compare(self.report(1000, 5, 20), self.report(1020, 5, 20))
+        self.assertEqual(c.failures(), [])
+        self.assertTrue(any(e["field"] == "gpu_work.draws_emitted" for e in c.entries))
+        self.assertTrue(any(e["field"] == "memory.alias.alias_slots" for e in c.entries))
+
+    def test_skip_regression_is_flagged_and_ignorable(self) -> None:
+        a, b = self.report(1000, 0, 20), self.report(1000, 400, 60)
+        fields = {e["field"] for e in self.run_compare(a, b).failures()}
+        self.assertEqual(fields, {"gpu_work.draws_no_shader_module", "memory.alias.alias_slots"})
+        c = self.run_compare(a, b, ["gpu_work.*", "memory.alias.*"])
+        self.assertEqual(c.failures(), [])
+
+    def test_missing_on_one_side_is_not_compared(self) -> None:
+        c = self.run_compare(make_report_v2(), self.report(1, 1, 1))
+        self.assertFalse(any(e["field"].startswith(("gpu_work", "memory.alias")) for e in c.entries))
+
+
 class ReportVersionTests(unittest.TestCase):
     tol = cbr.Tolerances()
 

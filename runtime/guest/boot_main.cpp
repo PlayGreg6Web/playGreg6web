@@ -969,6 +969,26 @@ int main(int argc, char** argv) {
         }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
     }
+    // R40: the report always carries the D3D12 layer's work totals (draws / dispatches emitted vs
+    // skipped by reason), and the capture's per-Present samples when a capture runs.
+    {
+        const bool with_presents = !g_options.gpu_capture.empty();
+        static bool s_with_presents = false;
+        s_with_presents = with_presents;
+        guest::set_report_extension([]() {
+            namespace dg = gpu::d3d12_guest;
+            std::string o = "\"gpu_work\": {";
+            for (size_t i = 0; i < static_cast<size_t>(dg::Work::Count); ++i) {
+                const dg::Work w = static_cast<dg::Work>(i);
+                o += std::string(i == 0 ? "" : ", ") + "\"" + dg::work_name(w) + "\": " + std::to_string(dg::work_total(w));
+            }
+            o += "}";
+            if (s_with_presents) {
+                o += ",\n  \"presents\": " + gpu::frame_capture_presents_json();
+            }
+            return o;
+        });
+    }
     if (!g_options.gpu_capture.empty()) {
         gpu::FrameCaptureConfig capture;
         capture.path = g_options.gpu_capture;
@@ -978,8 +998,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
             return kExitUsage;
         }
-        // The report carries the capture's per-Present samples (the sidecar's "presents").
-        guest::set_report_extension([]() { return "\"presents\": " + gpu::frame_capture_presents_json(); });
         gpu::frame_capture_set_counters([](gpu::FrameCaptureSample* sample) {
             guest::mark_first_present();  // sampled at every Present; only the first one counts
             const guest::LiveCounters c = guest::live_counters();
