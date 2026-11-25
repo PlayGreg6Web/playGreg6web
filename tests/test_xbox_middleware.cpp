@@ -472,7 +472,26 @@ void test_audio_apu_xapu_xdsp() {
     const auto* contexts = static_cast<const uint8_t*>(playgta6::os::default_guest_heap().to_host(shape.arrays[4]));
     CHECK(contexts != nullptr);
     CHECK(std::all_of(contexts, contexts + 350 * 64, [](uint8_t v) { return v == 0; }));
+    // R40: the XMA census reads the kind-4 contexts: fresh ones are untouched.
+    Pg6XmaContextCensus xma = pg6_mw_xma_context_census();
+    CHECK(xma.contexts == 350 && xma.touched == 0 && xma.input_valid == 0 && xma.output_pending == 0);
+    {
+        auto* writable = static_cast<uint8_t*>(playgta6::os::default_guest_heap().to_host(shape.arrays[4]));
+        // Context 3: input buffer 0 valid (dword 0 bit 20), write offset == read offset (nothing decoded).
+        const uint32_t queued = (1u << 20) | 12u;
+        std::memcpy(writable + 3 * 64, &queued, 4);
+        // Context 7: output write offset 2 (dword 0 bits 27-31), read offset 0 (dword 9 bits 0-4).
+        const uint32_t decoded = 2u << 27;
+        std::memcpy(writable + 7 * 64, &decoded, 4);
+        // Context 9: set up (a buffer address) but neither valid nor pending.
+        const uint32_t address = 0x1000;
+        std::memcpy(writable + 9 * 64 + 0x1C, &address, 4);
+    }
+    xma = pg6_mw_xma_context_census();
+    CHECK(xma.contexts == 350 && xma.touched == 3 && xma.input_valid == 1 && xma.output_pending == 1);
     CHECK(pg6_mw_acp_hal_release_shape_contexts() == S_OK_HR);
+    xma = pg6_mw_xma_context_census();
+    CHECK(xma.contexts == 0 && xma.touched == 0);
     ShapeContexts unknown{};
     unknown.counts[0] = 2;
     unknown.counts[4] = 1;

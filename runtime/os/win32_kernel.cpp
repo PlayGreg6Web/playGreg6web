@@ -8,6 +8,8 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -1692,6 +1694,29 @@ constexpr uint32_t kStatusEndOfFile = 0xC0000011u;
 
 namespace {
 
+// PG6_AUDIO_TRACE=1: ReadFile on a path naming audio (at most 2000 lines).
+void trace_audio_read(const std::string& path, uint64_t offset, uint32_t size, int64_t got,
+                      std::chrono::steady_clock::time_point start) {
+    static const bool on = [] {
+        const char* e = std::getenv("PG6_AUDIO_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    static std::atomic<uint32_t> lines{0};
+    std::string lower = path;
+    for (char& c : lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (!on || lower.find("audio") == std::string::npos || lines.fetch_add(1) >= 2000) {
+        return;
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+    char line[400];
+    std::snprintf(line, sizeof(line), "audio-trace: ReadFile '%s' +0x%llx %u -> %lld (%lld us)", path.c_str(),
+                  static_cast<unsigned long long>(offset), size, static_cast<long long>(got),
+                  static_cast<long long>(us.count()));
+    std::fprintf(stderr, "%s\n", line);
+}
+
 // Reads at `*start` (an OVERLAPPED offset) or at the file pointer; either way the file pointer
 // ends after the bytes read, as for a synchronous handle.
 bool read_file_at(Handle file_handle,
@@ -1753,8 +1778,10 @@ bool read_file_at(Handle file_handle,
         return false;
     }
 
+    const auto read_start = std::chrono::steady_clock::now();
     const int64_t got =
         file->httpfs_client->read(file->httpfs_handle, file->cursor, buffer, bytes_to_read);
+    trace_audio_read(file->httpfs_key, file->cursor, bytes_to_read, got, read_start);
     if (got < 0) {
         SetLastError(ERROR_READ_FAULT);
         return false;

@@ -81,6 +81,10 @@ struct Totals {
     uint64_t xapu_commands = 0, xapu_unhandled_commands = 0;
     // Commands per type the model knows: 1 (start), 2 (free), 3 (Opus decode), 5.
     uint64_t xapu_type1 = 0, xapu_type2 = 0, xapu_type3 = 0, xapu_type5 = 0;
+    // XMA decoder contexts (AcpHal shape contexts of kind 4) at report time: allocated, set up by
+    // the title, with an input buffer marked valid, and with decoded output not yet consumed.
+    // There is no XMA decoder, so input_valid > 0 means XMA voices (music, ambience) wait forever.
+    uint64_t xma_contexts = 0, xma_contexts_touched = 0, xma_contexts_input_valid = 0, xma_contexts_output_pending = 0;
 };
 
 // Non-silent share of everything the title released: render-client frames plus spatial passes
@@ -115,6 +119,10 @@ inline std::string to_json(const Totals& t, const std::vector<uint64_t>& windows
     o += "\"xapu_commands_by_type\": {\"1\": " + std::to_string(t.xapu_type1) + ", \"2\": " +
          std::to_string(t.xapu_type2) + ", \"3\": " + std::to_string(t.xapu_type3) + ", \"5\": " +
          std::to_string(t.xapu_type5) + "}, ";
+    add("xma_contexts", t.xma_contexts);
+    add("xma_contexts_touched", t.xma_contexts_touched);
+    add("xma_contexts_input_valid", t.xma_contexts_input_valid);
+    add("xma_contexts_output_pending", t.xma_contexts_output_pending);
     add("window_ms", kWindowMs);
     add("windows_clamped", clamped);
     o += "\"non_silent_frames_per_window\": [";

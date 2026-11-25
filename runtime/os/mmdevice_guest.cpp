@@ -48,6 +48,7 @@
 
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
 
 namespace playgta6::os::scarlett::guest_api {
@@ -365,6 +366,12 @@ void trace_window(uint32_t objects_this_pass, float pass_peak) {
                   static_cast<unsigned long long>(rf - rf_last), static_cast<unsigned long long>(rnz - rnz_last),
                   static_cast<unsigned long long>(g_render_silent_releases.load()),
                   static_cast<unsigned long long>(xa - xapu_last), static_cast<unsigned long long>(xd - xdsp_last));
+    com::detail::diagnostic(line);
+    const Pg6XmaContextCensus xma = pg6_mw_xma_context_census();
+    std::snprintf(line, sizeof(line),
+                  "audio-trace: XMA contexts %u: %u set up, %u with input valid, %u with output pending (no XMA "
+                  "decoder: input stays queued)",
+                  xma.contexts, xma.touched, xma.input_valid, xma.output_pending);
     com::detail::diagnostic(line);
     objects = 0;
     peak = 0.0f;

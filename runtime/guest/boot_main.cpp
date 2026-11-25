@@ -101,6 +101,7 @@
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_scarlett.h"
 #include "os/xgameruntime_provider.h"
 #include "os/xgamesave_local.h"
@@ -1081,6 +1082,11 @@ int main(int argc, char** argv) {
                 t.xapu_type2 = x.type2_commands;
                 t.xapu_type3 = x.type3_commands;
                 t.xapu_type5 = x.type5_commands;
+                const Pg6XmaContextCensus xma = pg6_mw_xma_context_census();
+                t.xma_contexts = xma.contexts;
+                t.xma_contexts_touched = xma.touched;
+                t.xma_contexts_input_valid = xma.input_valid;
+                t.xma_contexts_output_pending = xma.output_pending;
                 o += ",\n  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
             }
             if (s_with_presents) {

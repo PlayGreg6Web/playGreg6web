@@ -298,6 +298,20 @@ void pg6_mw_bink_free_globals(void);
 Pg6HResult pg6_mw_acp_hal_create(void** acp_hal);
 Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts);  // counts in, context arrays out
 Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void);
+
+// R40: census of the XMA decoder contexts (shape context kind 4) the title allocated. Each is 64
+// bytes in the public XMA context layout; the executable's stream consumer (0x140078120) reads
+// dword 0 bits 22-26 (output buffer block count) and 27-31 (output write offset, in 256-byte
+// blocks) and dword 9 bits 0-4 (output read offset), and only copies decoded PCM out and sends
+// AcpHal command 0x12 (tag 0xF1F1F1F1) when the write offset has moved. No XMA decoder exists
+// here, so the write offset never moves and every XMA voice (music, ambience) stays silent.
+struct Pg6XmaContextCensus {
+    uint32_t contexts = 0;        // kind-4 contexts allocated
+    uint32_t touched = 0;         // contexts with any non-zero byte (set up by the title)
+    uint32_t input_valid = 0;     // dword 0 bit 20 or 21 (input buffer 0 / 1 valid): data waiting to decode
+    uint32_t output_pending = 0;  // output write offset != read offset (decoded data not yet consumed)
+};
+Pg6XmaContextCensus pg6_mw_xma_context_census(void);
 Pg6HResult pg6_mw_apu_create_heap(uint32_t cached_size_in_bytes,
                                   uint32_t non_cached_size_in_bytes);
 Pg6HResult pg6_mw_apu_alloc(void** virtual_address,

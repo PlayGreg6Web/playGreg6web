@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
@@ -45,6 +47,39 @@ std::string hr_text(HResult hr) {
 
 void diag(const std::string& message) {
     com::detail::diagnostic(message.c_str());
+}
+
+int64_t trace_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool path_is_audio(const std::u16string& path) {
+    std::string lower;
+    for (char16_t c : path) {
+        lower.push_back(static_cast<char>(c < 0x80 ? std::tolower(static_cast<int>(c)) : '?'));
+    }
+    return lower.find("audio") != std::string::npos;
+}
+
+// PG6_AUDIO_TRACE=1: every request on a file whose path names audio (at most 2000 lines).
+void trace_audio_request(const std::u16string& path, const DStorageRequest& r, HResult hr, int64_t enqueued_ms) {
+    static std::atomic<uint32_t> lines{0};
+    if (!path_is_audio(path) || lines.fetch_add(1) >= 2000) {
+        return;
+    }
+    std::string name;
+    for (char16_t c : path) {
+        name.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+    }
+    char line[400];
+    std::snprintf(line, sizeof(line),
+                  "audio-trace: XCRDAPI '%s' +0x%" PRIx64 " %u -> %u bytes, options 0x%" PRIx64 ", %s, %" PRId64
+                  " ms after enqueue (t=%" PRId64 ")",
+                  name.c_str(), r.source_offset, r.source_size, r.destination_size, r.options, hr_text(hr).c_str(),
+                  trace_now_ms() - enqueued_ms, trace_now_ms());
+    diag(line);
 }
 
 // One diagnostic per distinct problem (requests can fail by the thousand).
@@ -844,6 +879,7 @@ private:
         uint64_t value = 0;
         HResult error = kOk;  // found at enqueue time
         bool cancelled = false;
+        int64_t enqueued_ms = 0;  // PG6_AUDIO_TRACE: request latency
     };
 
     size_t occupancy_locked() const { return pending_.size() + submitted_.size() + in_flight_; }
@@ -857,6 +893,7 @@ private:
     }
 
     void enqueue(Item&& item) {
+        item.enqueued_ms = trace_now_ms();
         std::unique_lock<std::mutex> lock(mutex_);
         while (!closed_ && occupancy_locked() >= capacity_) {
             if (!pending_.empty()) {
@@ -1242,6 +1279,9 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         if (gdk::failed(results[i]) && items[i].kind == Item::Request && !items[i].cancelled) {
             diag_once(once().read_failed, "XCRDAPI: request failed with " + hr_text(results[i]));
         }
+        if (items[i].kind == Item::Request && items[i].file && audio_trace_enabled()) {
+            trace_audio_request(items[i].file->path(), items[i].req, results[i], items[i].enqueued_ms);
+        }
     }
 }
 
@@ -1344,6 +1384,13 @@ HResult DStorageFactory::OpenFile(GuestPtr<char16_t> path, const Guid& riid, Out
     }
     void* raw = nullptr;
     const HResult hr = host_->OpenFile(name.c_str(), scarlett::kIidIDStorageFile, &raw);
+    if (audio_trace_enabled()) {
+        std::string utf8;
+        for (char16_t c : name) {
+            utf8.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+        }
+        diag("audio-trace: XCRDAPI OpenFile '" + utf8 + "' -> " + hr_text(hr));
+    }
     if (gdk::failed(hr)) {
         return hr;
     }

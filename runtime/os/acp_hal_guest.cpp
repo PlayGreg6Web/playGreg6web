@@ -19,8 +19,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -272,10 +274,17 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 //
 // Codec census (R40, menu-flow run of 420 s): the executable sends XApu only types 1, 2 and 3
 // (5 is wired but was not seen); every decode command carries one Opus packet (287 decoded, 0
-// failed, 287 type-3 results). No other codec reaches a hardware model: AcpHalAllocateShapeContexts
-// is called with every count but kind 4 zeroed (xbox_middleware.cpp), so no SHAPE/XMA decoder
-// contexts exist, XDspActivate is never reached, and the executable imports no XAudio2/XMA API;
-// PCM and ADPCM are decoded by the title's own code. The boot report's audio section carries the
+// failed, 287 type-3 results). That Opus path carries only short one-shot sounds: a menu-flow run
+// with PG6_AUDIO_TRACE=1 shows every voice on slot 0, started and freed after 7 or 23 packets
+// (0.1 / 0.56 s), one at a time. Music and ambience are XMA, not Opus: AcpHalAllocateShapeContexts
+// asks for 350 contexts of kind 4 (XMA, 64 bytes each, xbox_middleware.cpp), and the stream
+// consumer at 0x140078120 reads the XMA context's output write / read offsets and only copies PCM
+// out (then sends AcpHal command 0x12, tag 0xF1F1F1F1) once the hardware has advanced the write
+// offset. There is no XMA decoder here, so those voices never produce a sample; the boot report's
+// `xma_contexts*` fields count the contexts with queued input. The streamed banks themselves load
+// fine: in that run all 1043 XCRDAPI requests on audio.rpf (zlib) and 557 ReadFile calls succeed
+// within 1 ms. XDspActivate is never reached and the executable imports no XAudio2 API; PCM and
+// ADPCM are decoded by the title's own code. The boot report's audio section carries the
 // per-type counts and `xapu_unhandled_commands` so a new codec path shows up there first.
 // ---------------------------------------------------------------------------
 
@@ -311,6 +320,8 @@ struct XApuState {
     uint64_t unhandled = 0;       // commands of a type the model does not know (no result)
     bool decode_logged = false;
     bool failure_logged = false;
+    std::map<std::pair<uint64_t, uint32_t>, std::pair<uint64_t, int64_t>> trace_voices;  // packets, start ms
+    uint32_t trace_lines = 0;
 };
 XApuState& xapu() {
     static XApuState s;
@@ -457,6 +468,31 @@ XApuResult decode_command(uint64_t handle, const uint8_t* cmd) {
     return make_result(3, voice, 0);
 }
 
+// PG6_AUDIO_TRACE=1 (the caller holds the lock): one line per voice start (type 1), free (type 2,
+// with the packets decoded since its start) and other non-decode command; at most 400 lines.
+void trace_command(uint64_t handle, uint32_t type, uint32_t voice) {
+    auto& s = xapu();
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    auto& v = s.trace_voices[{handle, voice}];
+    if (type == 3) {
+        ++v.first;
+        return;
+    }
+    if (type == 1) {
+        v = {0, now};
+    }
+    if (s.trace_lines++ >= 400) {
+        return;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "audio-trace: XApu command %u voice %u (t=%" PRId64 "): %" PRIu64
+                  " packets over %" PRId64 " ms since its start",
+                  type, voice, now, v.first, v.second != 0 ? now - v.second : -1);
+    diag(line);
+}
+
 HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags*/) {
     uint32_t head[2] = {};
     if (command == 0 || !com::read_guest(command, head, sizeof(head))) {
@@ -476,6 +512,9 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (++xapu().commands[type] == 1) {
         diag("XApu: first command of type " + std::to_string(type) +
              (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
+    }
+    if (audio_trace_enabled()) {
+        trace_command(handle, type, head[1]);
     }
     if (type == 1 || type == 2) {
         // The voice starts or is freed: its next packet begins a new stream.
@@ -525,6 +564,14 @@ HResult xapu_dequeue_result(uint64_t handle, uint64_t result) {
 }
 
 }  // namespace
+
+bool audio_trace_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PG6_AUDIO_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
 
 XApuStats xapu_stats() {
     XApuStats s;

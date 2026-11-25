@@ -479,6 +479,9 @@ struct XApuStats {
 };
 XApuStats xapu_stats();
 
+// PG6_AUDIO_TRACE=1 (read once): audio diagnostics (XApu voice lifetimes, audio file requests).
+bool audio_trace_enabled();
+
 // The default audio render endpoint (mmdevice_guest.cpp): combase!CoCreateInstance(
 // CLSID_MMDeviceEnumerator) -> IMMDeviceEnumerator with one active eRender endpoint, its
 // IAudioClient (48 kHz float32 stereo mix format, 10 ms period) and ISpatialAudioClient (7.1.4

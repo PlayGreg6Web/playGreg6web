@@ -287,6 +287,8 @@ struct ApuGlobals {
     uint32_t non_cached_heap_size = 0;
     uint32_t shape_context_allocs = 0;
     std::vector<uint64_t> shape_context_arrays;  // guest heap blocks handed out by AllocateShapeContexts
+    uint64_t xma_contexts = 0;                   // the kind-4 (XMA) array of the live allocation
+    uint32_t xma_context_count = 0;
     Pg6ApuAddress next_apu_addr = 0x10000000u;
     std::vector<ApuBlock> blocks;
 };
@@ -1576,7 +1578,9 @@ struct ShapeContextRequest {
     uint64_t arrays[6];  // guest addresses, written by the call
 };
 static_assert(sizeof(ShapeContextRequest) == 0x48);
-// Context size per kind; 0 = not established (no title has asked for that kind yet).
+// Context size per kind; 0 = not established (no title has asked for that kind yet). Kind 4 is
+// XMA (the only kind this title asks for: 350 contexts at 0x1443AEC40): 64-byte XMA contexts.
+constexpr uint32_t kShapeContextKindXma = 4;
 constexpr uint32_t kShapeContextBytes[6] = {0, 0, 0, 0, 64, 0};
 constexpr uint32_t kShapeContextAlignment = 256;
 }  // namespace
@@ -1618,6 +1622,10 @@ Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts) {
         }
         request.arrays[kind] = va;
         g.shape_context_arrays.push_back(va);
+        if (kind == kShapeContextKindXma) {
+            g.xma_contexts = va;
+            g.xma_context_count = request.counts[kind];
+        }
     }
     std::memcpy(contexts, &request, sizeof(request));
     ++g.shape_context_allocs;
@@ -1631,10 +1639,43 @@ Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void) {
         playgta6::os::default_guest_heap().free(va);
     }
     g.shape_context_arrays.clear();
+    g.xma_contexts = 0;
+    g.xma_context_count = 0;
     if (g.shape_context_allocs > 0) {
         --g.shape_context_allocs;
     }
     return gdk::S_OK_HR;
+}
+
+Pg6XmaContextCensus pg6_mw_xma_context_census(void) {
+    Pg6XmaContextCensus c;
+    auto& g = mw::apu_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    if (g.xma_contexts == 0) {
+        return c;
+    }
+    const auto* base = static_cast<const uint8_t*>(
+        playgta6::os::default_guest_heap().to_host(g.xma_contexts));
+    if (base == nullptr) {
+        return c;
+    }
+    c.contexts = g.xma_context_count;
+    for (uint32_t i = 0; i < g.xma_context_count; ++i) {
+        const uint8_t* ctx = base + size_t{i} * kShapeContextBytes[kShapeContextKindXma];
+        uint32_t d0 = 0, d9 = 0;
+        std::memcpy(&d0, ctx, 4);
+        std::memcpy(&d9, ctx + 0x24, 4);
+        if (std::any_of(ctx, ctx + kShapeContextBytes[kShapeContextKindXma], [](uint8_t v) { return v != 0; })) {
+            ++c.touched;
+        }
+        if ((d0 & (3u << 20)) != 0) {
+            ++c.input_valid;
+        }
+        if ((d0 >> 27) != (d9 & 0x1Fu)) {
+            ++c.output_pending;
+        }
+    }
+    return c;
 }
 
 Pg6HResult pg6_mw_apu_create_heap(uint32_t cached_size_in_bytes,
