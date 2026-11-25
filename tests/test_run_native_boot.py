@@ -310,6 +310,19 @@ class RunTests(unittest.TestCase):
         self.assertIn(["78000", "DUp", "100"], events)
         self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown"})
 
+    def test_menu_flow_3_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow-3"]["max_ms"], 420_000)
+        script = rnb.input_script_text(420_000, "menu-flow-3").splitlines()
+        events = [line.split() for line in script if not line.startswith("#")]
+        times = [int(e[0]) for e in events]
+        self.assertEqual(times, sorted(times))
+        self.assertLess(times[-1], 420_000)
+        self.assertIn(["64000", "DUp", "100"], events)
+        self.assertIn(["200000", "RDown", "1200"], events)
+        self.assertIn(["302000", "A", "100"], events)
+        self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown", "RDown"})
+        self.assertFalse([e for e in events if e[1] == "DUp" and 200_000 <= int(e[0]) < 302_000])
+
     def test_presets(self):
         self.assertEqual(rnb.PRESETS["long"]["max_ms"], 600_000)
         self.assertFalse(rnb.PRESETS["smoke"]["input"])
