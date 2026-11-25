@@ -3085,13 +3085,13 @@ mod tests {
             );
             spec.image_base = bad_base;
             let file = build_pe(&spec);
-            assert_eq!(
-                build(&file, ImageOptions::default()).map(|_| ()),
-                Err(ImageError::BadHeaderField {
-                    field: "image_base + size_of_image",
-                    value: bad_base,
+            // Pe64::parse already rejects the overflow (R50), so the image builder never sees it.
+            assert!(matches!(
+                Pe64::parse(&file),
+                Err(crate::pe::PeError::IntegerOverflow {
+                    context: "optional header image_base + size_of_image",
                 })
-            );
+            ));
         }
 
         // Exact u64::MAX fit: image_base + size_of_image == u64::MAX is valid.
