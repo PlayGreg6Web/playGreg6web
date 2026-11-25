@@ -1302,6 +1302,99 @@ void test_unaligned_storage_relocation() {
     }
 }
 
+// G66 (#691): a cached bind group over a relocated storage copy must follow the copy when the
+// device hands its home to another range (LRU eviction, relocation_epoch bumped). Before, the cache
+// hit kept binding the old home, so the LEGAL NOTICES draws read another draw's vertex data (grey).
+void test_cached_bind_group_follows_moved_relocation() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    uint64_t home = 1024, epoch = 0;
+    int calls = 0;
+    bridge::BridgeOptions options = counting_options(5000);
+    options.relocate_storage = [&](uint64_t, uint64_t, uint32_t* id, uint64_t* offset) {
+        ++calls;
+        *id = 888;
+        *offset = home;
+        return true;
+    };
+    options.relocation_epoch = [&epoch] { return epoch; };
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kBuf = 301;
+    constexpr uint64_t kVs = 0xC5, kPs = 0xC6, kBufVa = 0x20000;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    device.register_buffer(kBuf, kBufVa, 4096);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    d3d::DescriptorHeap* srv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc srv;
+    srv.dimension = d3d::ViewDimension::Buffer;
+    srv.first_element = 4;  // offset 0x40: not 256-byte aligned, so relocated
+    srv.num_elements = 8;
+    srv.structure_byte_stride = 16;
+    CHECK(heaps.create_shader_resource_view(kBuf, &srv, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Srv;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                                           static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                              join(0, d3d::DescriptorRangeType::Srv, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    // One recording of the frame; returns the offsets of the bind groups created so far.
+    const auto record = [&] {
+        list.Reset(state.get());
+        d3d::DescriptorHeap* visible[] = {srv_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootDescriptorTable(0, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        std::vector<uint64_t> offsets;
+        for (const Packet& packet : decode(enc)) {
+            if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
+                offsets.push_back(pod<GpuBindGroupEntry2>(packet, sizeof(GpuCreateBindGroup2Payload)).offset);
+            }
+        }
+        return offsets;
+    };
+    CHECK((record() == std::vector<uint64_t>{1024}));
+    CHECK((record() == std::vector<uint64_t>{1024}));  // cache hit, nothing moved
+    epoch = 1;                                          // another range evicted: same home, kept
+    CHECK((record() == std::vector<uint64_t>{1024}));
+    CHECK(list.stats().bind_groups_relocation_moved == 0);
+    home = 2048;  // this range's home handed away: the next lookup relocates it elsewhere
+    epoch = 2;
+    CHECK((record() == std::vector<uint64_t>{1024, 2048}));
+    CHECK(list.stats().bind_groups_relocation_moved == 1);
+    CHECK((record() == std::vector<uint64_t>{1024, 2048}));  // the new group is cached again
+    CHECK(calls >= 3);
+}
+
 // G62: a uniform binding with a reflected minimum size (layout min_binding_size) is bound with at
 // least that many bytes, instead of the 256-byte PC minimum; without one the 256-byte rule stays.
 GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, uint64_t min_size,
@@ -3092,6 +3185,7 @@ int main() {
     test_representative_command_list();
     test_unaligned_uniform_relocation();
     test_unaligned_storage_relocation();
+    test_cached_bind_group_follows_moved_relocation();
     test_storage_texture_needs_storage_usage();
     test_reflected_uniform_min_size();
     test_bind_group_rebuild_and_retire();

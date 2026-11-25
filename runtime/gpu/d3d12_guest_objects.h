@@ -1112,6 +1112,8 @@ private:
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
     uint64_t storage_relocation_seq_ = 0;
+    // G66 (#691): uniform / storage relocation homes handed to another range (BridgeOptions::relocation_epoch).
+    std::atomic<uint64_t> relocation_evictions_{0};
     struct RelocatedIa {
         uint64_t buffer_bytes = 0;   // WebGPU buffer size (guest size rounded up to 4)
         uint32_t buffer_id = 0;

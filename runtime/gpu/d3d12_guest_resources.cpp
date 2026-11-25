@@ -1476,6 +1476,7 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
             relocation_free_[{lru->second.size, std::get<2>(lru->first)}].emplace_back(lru->second.buffer_id,
                                                                                          lru->second.offset);
             relocations_.erase(lru);
+            relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
         }
         RelocatedUniform r;
         r.va = va;
@@ -1589,6 +1590,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             }
             storage_relocations_.erase(lru_it);
         }
+        relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (target_buf == 0) {

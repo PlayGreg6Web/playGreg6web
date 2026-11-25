@@ -1406,6 +1406,8 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     }
     std::vector<GpuBindGroupEntry2> entries;
     gpu_entries(group, *cached, encoder_, &entries);
+    cached->relocations = pending_relocations_;
+    cached->relocation_epoch = device_.options().relocation_epoch ? device_.options().relocation_epoch() : 0;
     GpuCreateBindGroup2Payload header{};
     header.id = device_.allocate_id();
     header.layout_id = group.id;
@@ -1424,6 +1426,34 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
         note_memory_group(group, *plan, *cached, encoder_.size() - entry_bytes);
     }
     return true;
+}
+
+bool CommandListBridge::relocations_moved(d3d::CachedBindGroup* cached) {
+    const BridgeOptions& options = device_.options();
+    if (cached->relocations.empty() || !options.relocation_epoch) {
+        return false;
+    }
+    const uint64_t epoch = options.relocation_epoch();
+    if (epoch == cached->relocation_epoch) {
+        return false;
+    }
+    // Resolve each relocation again (a hit also marks the home used, so the LRU keeps it).
+    bool moved = false;
+    for (const d3d::CachedBindGroup::Relocation& r : cached->relocations) {
+        uint32_t id = 0;
+        uint64_t offset = 0;
+        const bool ok = r.storage ? options.relocate_storage && options.relocate_storage(r.va, r.size, &id, &offset)
+                                  : options.relocate_uniform &&
+                                        options.relocate_uniform(r.va, r.size, r.binding_size, &id, &offset);
+        if (!ok || id != r.buffer_id || offset != r.offset) {
+            moved = true;
+            break;
+        }
+    }
+    if (!moved) {
+        cached->relocation_epoch = options.relocation_epoch();
+    }
+    return moved;
 }
 
 void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group,
@@ -1517,6 +1547,11 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
     std::vector<GpuBindGroupEntry2>& entries = *result;
     entries.assign(cached.entries.size(), GpuBindGroupEntry2{});
     pending_redirects_.clear();
+    pending_relocations_.clear();
+    const auto relocated = [this](size_t entry, bool storage, uint64_t va, uint64_t size, uint64_t binding_size,
+                                  uint32_t id, uint64_t offset) {
+        pending_relocations_.push_back({static_cast<uint32_t>(entry), storage, va, size, binding_size, id, offset});
+    };
     for (size_t i = 0; i < entries.size() && i < group.entries.size(); ++i) {
         const d3d::BindGroupEntry& e = cached.entries[i];
         const GpuBindGroupLayoutEntry& layout = group.entries[i];
@@ -1544,6 +1579,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 const uint64_t home = std::max<uint64_t>(e.size, layout.min_binding_size);
                 if (base != 0 && e.size != 0 && device_.options().relocate_uniform &&
                     device_.options().relocate_uniform(base + e.offset, e.size, home, &id, &offset)) {
+                    relocated(i, false, base + e.offset, e.size, home, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     // The relocated home is a whole multiple of 256 bytes (zero past the view).
@@ -1562,6 +1598,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 uint64_t offset = 0;
                 if (base != 0 && e.size != 0 && device_.options().relocate_storage &&
                     device_.options().relocate_storage(base + e.offset, e.size, &id, &offset)) {
+                    relocated(i, true, base + e.offset, e.size, 0, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     out.size = align_up(e.size, 4u);
@@ -1600,6 +1637,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 uint64_t offset = 0;
                 if (uniform && room < target && base != 0 && device_.options().relocate_uniform &&
                     device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
+                    relocated(i, false, base + e.offset, e.size, target, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     out.size = align_up(target, kUniformOffsetAlignment);
@@ -1625,6 +1663,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     out.size = std::min<uint64_t>(room, kMaxUniformBindingSize);
                 } else if (base != 0 && device_.options().relocate_uniform &&
                            device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
+                    relocated(i, false, base + e.offset, e.size, target, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     out.size = target;
@@ -1853,6 +1892,17 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                     encoder_.destroy_resource(lookup.retired_gpu_id);
                     ++stats_.bind_groups_retired;
                 }
+            } else if (relocations_moved(cached)) {
+                // G66 (#691): a relocated home of this cached group now holds another range (the
+                // LRU evicted it while the group sat in the cache): bind a group over the new homes.
+                const uint32_t old_id = cached->gpu_id;
+                device_.ensure_layout_emitted(layout, encoder_);
+                if (!emit_bind_group(bind_point, group, cached, &plans[g])) {
+                    return false;
+                }
+                redirects_.erase(old_id);
+                encoder_.destroy_resource(old_id);
+                ++stats_.bind_groups_relocation_moved;
             } else if (cached->from_memory) {
                 note_memory_group(group, plans[g], *cached, kNoPacket);  // created by an earlier recording
             }

@@ -178,6 +178,10 @@ struct BridgeOptions {
     // first byte, so the view's bytes must start the binding: an aligned-down binding would need an
     // offset the stage does not take.
     std::function<bool(uint64_t gpu_va, uint64_t size, uint32_t* buffer_id, uint64_t* offset)> relocate_storage;
+    // G66 (#691): bumped whenever the two hooks above hand an existing home to another range (LRU
+    // eviction). A cached bind group bound to a relocated home re-resolves its relocations when it
+    // changed and is re-created if one moved; otherwise it would read another draw's bytes.
+    std::function<uint64_t()> relocation_epoch;
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
@@ -424,6 +428,7 @@ struct BridgeStats {
     uint64_t pipelines_created = 0;
     uint64_t bind_groups_created = 0;
     uint64_t bind_groups_retired = 0;
+    uint64_t bind_groups_relocation_moved = 0;  // G66: cache hits re-created, a relocated home moved
     uint64_t bind_group_cache_hits = 0;    // G66: bind group lookups answered without a CreateBindGroup
     uint64_t bind_group_cache_misses = 0;  // ... rebuilt (first use or changed descriptors)
     uint64_t memory_bind_groups = 0;            // bind groups over descriptor memory (recorded)
@@ -571,6 +576,10 @@ private:
     // The CreateBindGroup2 entries for `cached` (samplers are interned through `side`).
     void gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
                      CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
+    // G66 (#691): true when a relocation `cached` was emitted with now resolves to another home.
+    bool relocations_moved(d3d::CachedBindGroup* cached);
+    // Relocations the last gpu_entries call made.
+    std::vector<d3d::CachedBindGroup::Relocation> pending_relocations_;
     void sync_bound_textures(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
                              CommandEncoder& target);
     void add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join);

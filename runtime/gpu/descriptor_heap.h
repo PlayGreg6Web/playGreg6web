@@ -992,6 +992,20 @@ struct CachedBindGroup {
     uint32_t gpu_id = 0;  // WebGPU bind group id, assigned by the caller after a rebuild
     uint32_t null_entries = 0;
     uint64_t last_used_epoch = 0;  // BindGroupCache epoch of the last lookup that returned it
+    // G66 (#691): entries the bridge bound as a relocated copy (relocate_uniform / relocate_storage)
+    // and the home it got, with the relocation epoch at that time. A cache hit does not relocate
+    // again, so a home the device has since handed to another range must be noticed here.
+    struct Relocation {
+        uint32_t entry = 0;
+        bool storage = false;
+        uint64_t va = 0;
+        uint64_t size = 0;
+        uint64_t binding_size = 0;
+        uint32_t buffer_id = 0;
+        uint64_t offset = 0;
+    };
+    std::vector<Relocation> relocations;
+    uint64_t relocation_epoch = 0;
 
     // Internal validity data.
     std::vector<uint64_t> key;
