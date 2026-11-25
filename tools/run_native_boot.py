@@ -328,6 +328,7 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     return "\n".join(lines)
 
 
+NL = chr(10)
 THUMB_MIN_SEGMENT_MS = 1000.0
 
 
@@ -573,11 +574,8 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if args.thumbnails:
         tlines = make_thumbnails(args, run_dir, report, env)
         with (run_dir / "digest.txt").open("a", encoding="utf-8") as f:
-            f.write("
-".join(tlines) + "
-")
-        print("
-".join(tlines))
+            f.write(NL.join(tlines) + NL)
+        print(NL.join(tlines))
     if args.baseline:
         return compare_with_baseline(args, run_dir, runs_dir)
     return 0
