@@ -30,6 +30,7 @@
 #include "gpu/gpu_va_watch.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
+#include "os/guest_window.h"
 #include "os/shim_exports.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -5272,11 +5273,102 @@ void test_same_bytes() {
     }
 }
 
+// O37: a CPU-visible buffer in the translated CPU window (the browser's) is flushed from the
+// window's write marks: the first flush compares everything; later ones only pages of slots marked
+// since, so an unmarked write is not seen (lifted code and host writers always mark) unless the
+// marks are verified, which compares the rest too and counts the miss.
+void test_window_write_marks_flush() {
+    namespace gw = playgta6::os::guest_window;
+    namespace xw = playgta6::os::xmem_windows;
+    namespace sc = playgta6::os::scarlett;
+    constexpr uint64_t k64K = 64ull << 10, k16G = 16ull << 30;
+    constexpr uint32_t kType = 0x20402000u;
+    // The browser has no OS write watch: without it (here: turned off), the marks are used.
+    playgta6::os::set_write_tracking(false);
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x21u, 0x4u);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x3u, 0x801u);
+    const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu);
+    const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu);
+    CHECK(C == gw::kWindowBase && xw::is_phantom(G, k16G));
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+    const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, pfn) == 1);
+    {
+        Fixture fx;
+        Scene scene(fx);
+        int32_t result = -1;
+        const uint64_t buf = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                       {I(G + 4 * k64K), I(put(buffer_desc(2 * k64K))), I(0), I(0)},
+                                       dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(buf)->cpu_address() == C + 4 * k64K);
+        const uint32_t id = object_of<dg::Resource>(buf)->id();
+        auto writes = [&](size_t mark) {
+            std::vector<uint32_t> offsets;
+            for (const Packet& p : packets_since(fx, mark)) {
+                if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == id) {
+                    offsets.push_back(payload_as<GpuWriteBufferPayload>(p).dst_offset);
+                }
+            }
+            return offsets;
+        };
+        const uint64_t list = scene.new_list();
+        const uint32_t one = 1;
+        // First flush: everything compared (the marks of the mapping are taken here too).
+        CHECK(com::write_guest(C + 5 * k64K + 0x2000, one));
+        size_t mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x2000)}));
+        // Nothing marked: nothing compared, nothing uploaded.
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK(writes(mark).empty());
+        // A marked write (a host writer, or lifted code) is uploaded: its 4 KiB page only.
+        const uint32_t two = 2;
+        CHECK(com::write_guest(C + 4 * k64K + 0x100, two));
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark) == std::vector<uint32_t>{0}));
+        // An unmarked write is not compared...
+        auto* raw = static_cast<uint32_t*>(gw::translate(C + 5 * k64K + 0x3000));
+        CHECK(raw != nullptr);
+        *raw = 3;
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK(writes(mark).empty());
+        // ... unless the marks are verified: then it is uploaded and counted as a miss.
+        gw::set_write_marks_verified(true);
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x3000)}));
+        CHECK(gw::verify_misses() == 1);
+        gw::set_write_marks_verified(false);
+        // Remapping a slot marks it: other bytes appear there and are uploaded.
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&slots[0], 1, &pfn[1]) == 1);
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK(!writes(mark).empty());
+        fx.vcall(buf, Slot::Release);
+        fx.vcall(list, Slot::Release);
+        scene.release_all();
+    }
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    playgta6::os::set_write_tracking(true);
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
     playgta6::os::set_write_tracking(true);
     test_same_bytes();
+    test_window_write_marks_flush();
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();

@@ -1936,7 +1936,9 @@ std::string build_report() {
              ", \"mapped_slots\": " + std::to_string(w.mapped_slots) +
              ", \"contiguous_pairs\": " + std::to_string(w.contiguous_pairs) +
              ", \"split_pairs\": " + std::to_string(w.split_pairs) + ", \"map_calls\": " +
-             std::to_string(w.map_calls) + "}},\n";
+             std::to_string(w.map_calls) + ", \"write_marks_verified\": " +
+             (os::guest_window::write_marks_verified() ? "true" : "false") +
+             ", \"write_mark_misses\": " + std::to_string(os::guest_window::verify_misses()) + "}},\n";
     }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
     // Present was reported through mark_first_present), then the extension's members (per-Present samples).
@@ -2511,6 +2513,10 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     if (json_uint(json, "import_trace_limit", n)) {
         config.import_trace_limit = static_cast<size_t>(n);
     }
+    const std::string_view verify = json_value(json, "verify_window_marks");
+    if (verify == "true" || verify == "false") {
+        config.verify_window_marks = verify == "true";
+    }
     const std::string_view to_log = json_value(json, "report_to_log");
     if (to_log == "true") {
         config.report_sink = [](std::string_view report) { log_report_json(report); };
@@ -2734,6 +2740,7 @@ BootResult run_boot(const BootConfig& config) {
     b.host_function_start = config.host_function_start;
     b.off_thread_fault = config.off_thread_fault;
     b.report_sink = config.report_sink;
+    os::guest_window::set_write_marks_verified(config.verify_window_marks);
     b.guest_thread_started = config.guest_thread_started;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);

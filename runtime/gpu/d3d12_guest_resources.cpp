@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "gpu/gfx10_detile.h"
+#include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/surface_blocks.h"
@@ -1625,6 +1626,29 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
         }
     }
     write_tracked_ = tracked;
+    // O37: the translated window keeps write marks per 64 KiB slot instead (the browser has no OS
+    // write watch): the same protocol, with the slot marks taken (cleared) before the comparison
+    // and the first flush after the marks became usable comparing everything.
+    bool window_candidates = false;
+    if (!tracked && os::guest_window::translated(cpu_va_)) {
+        std::vector<uint64_t> slots;
+        const bool marked = os::guest_window::take_written(cpu_va_, static_cast<size_t>(size), &slots);
+        if (marked && window_marked_) {
+            candidate.assign(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), false);
+            for (uint64_t off : slots) {
+                const uint64_t slot_end = ((cpu_va_ + off) | (os::guest_window::kSlotBytes - 1)) + 1 - cpu_va_;
+                const uint64_t hi = std::min<uint64_t>(size, slot_end);
+                for (uint64_t page = off / kShadowPage * kShadowPage; page < hi; page += kShadowPage) {
+                    candidate[static_cast<size_t>(page / kShadowPage)] = true;
+                }
+            }
+            window_candidates = true;
+        }
+        window_marked_ = marked;
+    }
+    // Verification: compare the unmarked pages too and count changes found there (a writer that
+    // did not mark); such a page is uploaded all the same.
+    const bool verify = window_candidates && os::guest_window::write_marks_verified();
     uint64_t run_start = 0;
     bool in_run = false;
     uint64_t uploaded = 0;
@@ -1641,8 +1665,12 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     };
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const uint64_t n = std::min(kShadowPage, size - page);
-        const bool changed = (candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)]) &&
+        const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
+        const bool changed = (listed || verify) &&
                              !same_bytes(shadow_.data() + page, live + page, static_cast<size_t>(n));
+        if (changed && !listed) {
+            os::guest_window::note_verify_miss(cpu_va_ + page);
+        }
         if (changed && !in_run) {
             run_start = page;
             in_run = true;

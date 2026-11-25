@@ -477,6 +477,9 @@ struct BootConfig {
     // fault on another thread, which never returns to the caller of run_boot). For a boot with no
     // file to write it to: the browser boot logs it (log_report_json). Empty = not called.
     std::function<void(std::string_view report_json)> report_sink;
+    // O37: readers that use the translated window's write marks also compare the unmarked slots
+    // and count the changes found there (report: memory.window.write_mark_misses).
+    bool verify_window_marks = false;
 };
 
 struct BootResult {
@@ -492,7 +495,7 @@ BootResult run_boot(const BootConfig& config);
 
 // O36: run options of a boot that has no command line (the browser boot), as a JSON object:
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
-//    "import_trace_limit": 0, "report_to_log": true}
+//    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to
 // log_report_json. False (config unchanged) if `json` is not a JSON object.
 bool apply_boot_options_json(std::string_view json, BootConfig& config);
