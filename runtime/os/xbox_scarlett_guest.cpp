@@ -118,6 +118,7 @@ struct Counters {
     std::atomic<uint64_t> submits{0};
     std::atomic<uint64_t> live_queues{0};
     std::atomic<uint64_t> physical_page_requests{0};
+    std::atomic<uint64_t> bcpack_requests{0};  // failed E_NOTIMPL: no BCPack decoder
 
     std::atomic<uint32_t> worker_threads{1};
     std::atomic<uint64_t> max_gap{64 * 1024};
@@ -1124,9 +1125,16 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             continue;
         }
         if (opts.bcpack_mode != 0) {
-            diag_once(once().bcpack, "XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
-                                         std::to_string(opts.bcpack_mode) +
-                                         "); BCPack decompression is not supported, failing with E_NOTIMPL");
+            const uint64_t n = counters().bcpack_requests.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0) {  // the 1st, 2nd, 4th, ... (they fail by the hundred: say which)
+                std::string name;
+                read_guest_string(r.name, 96, &name);
+                diag("XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
+                     std::to_string(opts.bcpack_mode) + ", " + std::to_string(r.source_size) + " -> " +
+                     std::to_string(r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size) +
+                     " bytes, request '" + name + "'); BCPack decompression is not supported, failing with " +
+                     "E_NOTIMPL (BCPack request " + std::to_string(n) + ")");
+            }
             results[i] = com::E_NOTIMPL_HR;
             continue;
         }
@@ -1485,6 +1493,7 @@ DStorageStats dstorage_stats() {
     s.submits = c.submits.load();
     s.live_queues = c.live_queues.load();
     s.physical_page_requests = c.physical_page_requests.load();
+    s.bcpack_requests = c.bcpack_requests.load();
     return s;
 }
 
@@ -1545,6 +1554,8 @@ void reset_xbox_scarlett_guest() {
     c.coalesced_requests = 0;
     c.decompressed_requests = 0;
     c.submits = 0;
+    c.physical_page_requests = 0;
+    c.bcpack_requests = 0;
     c.worker_threads = 1;
     c.max_gap = 64 * 1024;
     c.max_span = 4 * 1024 * 1024;

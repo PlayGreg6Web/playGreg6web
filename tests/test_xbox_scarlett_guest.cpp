@@ -888,11 +888,22 @@ void test_compressed_and_memory_sources() {
     // BCPack (bits 1-4) fails truthfully.
     ga::DStorageRequest bc = file_request(file, 100, 16, dest, 65536);
     bc.options = 3ull << 1;
+    const uint64_t bc_before = ga::dstorage_stats().bcpack_requests;
     fx.enqueue(queue, bc);
     fx.vcall(queue, 4, {I(status), I(3)});
     fx.vcall(queue, 6);
     CHECK(fx.wait_complete(status, 3));
     CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
+    CHECK(ga::dstorage_stats().bcpack_requests == bc_before + 1);  // counted (the title fails them by the hundred)
+    bc.options = (7ull << 1) | ga::kDStorageOptionDestinationIsPhysicalPages;  // the title's 0x20000e
+    CHECK(bc.options == 0x20000eu);
+    CHECK(ga::parse_dstorage_options(bc.options).bcpack_mode == 7);
+    fx.enqueue(queue, bc);
+    fx.vcall(queue, 4, {I(status), I(3)});
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 3));
+    CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
+    CHECK(ga::dstorage_stats().bcpack_requests == bc_before + 2);
 
     // Unsupported compression format and option bits.
     ga::DStorageRequest f2 = file_request(file, 100, 16, dest, 65536);

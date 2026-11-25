@@ -1145,6 +1145,7 @@ int main(int argc, char** argv) {
             const os::scarlett::guest_api::DStorageStats ds = os::scarlett::guest_api::dstorage_stats();
             sample->counters.emplace_back("dstorage_requests_completed", ds.requests_completed);
             sample->counters.emplace_back("dstorage_requests_failed", ds.requests_failed);
+            sample->counters.emplace_back("dstorage_bcpack_requests", ds.bcpack_requests);
             sample->counters.emplace_back("dstorage_bytes_delivered", ds.bytes_delivered);
             sample->counters.emplace_back("dstorage_decompressed_requests", ds.decompressed_requests);
             sample->counters.emplace_back("dstorage_file_reads", ds.file_reads);

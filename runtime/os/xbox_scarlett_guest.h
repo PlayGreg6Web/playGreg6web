@@ -291,6 +291,7 @@ struct DStorageStats {
     uint64_t submits = 0;             // explicit + automatic
     uint64_t live_queues = 0;
     uint64_t physical_page_requests = 0;  // requests with DestinationIsPhysicalPages (option bit 21)
+    uint64_t bcpack_requests = 0;  // BCPack requests (option bits 1-4), all failed E_NOTIMPL (no decoder)
 };
 
 DStorageStats dstorage_stats();

@@ -288,6 +288,8 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
 # Screens of the menu flow by draws per frame (the live present counters, #663): start screen ~21,
 # loading 4, UI TEXT SIZE 20, FINISH SETUP? 30, 23, LEGAL NOTICES 37 (44 with the cursor moved),
 # then the list screen reached through LEGAL NOTICES' "Next >": 50 with the cursor up, 33 after Down.
+# Replayed (R40 menu-to-ingame run): that list screen is a legal-document viewer (a "PRIVACY POLICY"
+# heading, an entry list on the left, hints SCROLL / SELECT (A) / BACK (B)); 51 with a document open.
 LIST_SCREEN = "draws_per_frame==33|50"
 
 
