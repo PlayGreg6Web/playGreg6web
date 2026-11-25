@@ -812,7 +812,10 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                         continue;
                     }
                     lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite);
+                    // The translator declares storage textures write-only (texture_storage_*<fmt, write>);
+                    // the layout must match, and read-write access is not even allowed for formats
+                    // such as rgba8unorm (WebGPU rejects the layout, the pipeline and the frame).
+                    lb.entry.binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
                     lb.entry.view_dimension = static_cast<uint8_t>(b.view_dimension);
                     lb.entry.storage_format = b.storage_format;
                     break;

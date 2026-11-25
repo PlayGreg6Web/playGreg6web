@@ -359,7 +359,8 @@ void test_layout_join() {
         const bridge::LayoutBinding& w = slots.groups[0].bindings[0];
         CHECK(w.join.table_parameter == 0 && w.join.table_slot == 0 &&
               w.join.register_class == d3d::DescriptorRangeType::Uav &&
-              w.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) && w.entry.storage_format == 18);
+              w.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) && w.entry.storage_format == 18 &&
+              w.entry.binding_type == static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly));
     } else {
         CHECK(false);
     }

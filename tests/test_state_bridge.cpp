@@ -1018,7 +1018,7 @@ void test_storage_texture_needs_storage_usage() {
         bridge::GroupLayoutDesc group;
         GpuBindGroupLayoutEntry entry =
             layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::StorageTexture,
-                         static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite),
+                         static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly),
                          static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
         entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
         group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
