@@ -5,6 +5,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -472,6 +473,10 @@ struct BootConfig {
     // descriptor's Pg6Program::memory). Zero = flat, the default. The boot sets up what the model
     // needs before loading any image and ends with BadConfig if this runtime cannot serve it.
     Pg6GuestMemoryModel memory{};
+    // O36: receives the finished report JSON (the same text as BootResult::report_json, also for a
+    // fault on another thread, which never returns to the caller of run_boot). For a boot with no
+    // file to write it to: the browser boot logs it (log_report_json). Empty = not called.
+    std::function<void(std::string_view report_json)> report_sink;
 };
 
 struct BootResult {
@@ -484,6 +489,27 @@ struct BootResult {
 // Runs the boot sequence on the calling host thread. Only one boot may run at a time per process;
 // a previous boot's state is released first (see reset_boot).
 BootResult run_boot(const BootConfig& config);
+
+// O36: run options of a boot that has no command line (the browser boot), as a JSON object:
+//   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
+//    "import_trace_limit": 0, "report_to_log": true}
+// Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to
+// log_report_json. False (config unchanged) if `json` is not a JSON object.
+bool apply_boot_options_json(std::string_view json, BootConfig& config);
+
+// O36: writes a report through os::log as lines "[boot-report <i>/<n>] <chunk>" (chunks of at
+// most `chunk_bytes`, split on UTF-8 boundaries); concatenating the chunks in order gives the
+// report back. `write` replaces os::log (tests).
+void log_report_json(std::string_view report_json,
+                     size_t chunk_bytes = 8192,
+                     const std::function<void(std::string_view)>& write = {});
+
+// O36: the browser boot's one call: reads `path` through `read` (absent = nothing to do) and
+// applies it with apply_boot_options_json. False only for a file that is not a JSON object.
+using BootFileReader = std::function<bool(const std::string& path, std::vector<uint8_t>& out)>;
+bool load_boot_options(BootConfig& config,
+                       const BootFileReader& read,
+                       const std::string& path = "boot/boot-options.json");
 
 // Releases everything the last boot created (image, PEB, threads), restores the fault handler,
 // the dispatch observer and the CRT exit hook, and resets the guest runtime registries

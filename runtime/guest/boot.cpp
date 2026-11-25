@@ -225,6 +225,7 @@ struct BootState {
     CaptureHostStackFn capture_host_stack = nullptr;
     HostFunctionStartFn host_function_start = nullptr;
     OffThreadFaultFn off_thread_fault = nullptr;
+    std::function<void(std::string_view)> report_sink;  // O36
     GuestThreadStartedFn guest_thread_started = nullptr;
     std::atomic<bool> off_thread_fault_taken{false};
     bool log_progress = true;
@@ -2155,6 +2156,9 @@ void finish_report() {
     BootState& b = boot();
     b.last_report = build_report();
     b.last_summary = build_summary();
+    if (b.report_sink) {
+        b.report_sink(b.last_report);
+    }
 }
 
 BootStats collect_stats() {
@@ -2443,6 +2447,120 @@ std::string last_report_json() {
     return boot().last_report;
 }
 
+namespace {
+
+// The value after `"key":` in a flat JSON object; empty if absent.
+std::string_view json_value(std::string_view json, std::string_view key) {
+    const std::string quoted = "\"" + std::string(key) + "\"";
+    size_t at = json.find(quoted);
+    if (at == std::string_view::npos) {
+        return {};
+    }
+    at = json.find(':', at + quoted.size());
+    if (at == std::string_view::npos) {
+        return {};
+    }
+    ++at;
+    while (at < json.size() && (json[at] == ' ' || json[at] == '\t' || json[at] == '\n' || json[at] == '\r')) {
+        ++at;
+    }
+    size_t end = at;
+    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != '\n') {
+        ++end;
+    }
+    while (end > at && (json[end - 1] == ' ' || json[end - 1] == '\r' || json[end - 1] == '\t')) {
+        --end;
+    }
+    return json.substr(at, end - at);
+}
+
+bool json_uint(std::string_view json, std::string_view key, uint64_t& out) {
+    const std::string_view v = json_value(json, key);
+    if (v.empty()) {
+        return false;
+    }
+    uint64_t n = 0;
+    for (const char c : v) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        n = n * 10 + static_cast<uint64_t>(c - '0');
+    }
+    out = n;
+    return true;
+}
+
+}  // namespace
+
+bool apply_boot_options_json(std::string_view json, BootConfig& config) {
+    size_t first = json.find_first_not_of(" \t\r\n");
+    size_t last = json.find_last_not_of(" \t\r\n");
+    if (first == std::string_view::npos || json[first] != '{' || json[last] != '}') {
+        return false;
+    }
+    uint64_t n = 0;
+    if (json_uint(json, "max_wall_ms", n)) {
+        config.max_wall_ms = n;
+    }
+    if (json_uint(json, "max_dispatches", n)) {
+        config.max_dispatches = n;
+    }
+    if (json_uint(json, "arena_log_limit", n)) {
+        config.arena_log_limit = static_cast<size_t>(n);
+    }
+    if (json_uint(json, "import_trace_limit", n)) {
+        config.import_trace_limit = static_cast<size_t>(n);
+    }
+    const std::string_view to_log = json_value(json, "report_to_log");
+    if (to_log == "true") {
+        config.report_sink = [](std::string_view report) { log_report_json(report); };
+    } else if (to_log == "false") {
+        config.report_sink = nullptr;
+    }
+    return true;
+}
+
+void log_report_json(std::string_view report_json,
+                     size_t chunk_bytes,
+                     const std::function<void(std::string_view)>& write) {
+    if (chunk_bytes < 8) {
+        chunk_bytes = 8;
+    }
+    std::vector<std::string_view> chunks;
+    size_t at = 0;
+    while (at < report_json.size()) {
+        size_t end = std::min(report_json.size(), at + chunk_bytes);
+        // Never split a UTF-8 sequence: back off to the lead byte of the sequence at `end`.
+        while (end < report_json.size() && end > at + 1 &&
+               (static_cast<unsigned char>(report_json[end]) & 0xC0u) == 0x80u) {
+            --end;
+        }
+        chunks.push_back(report_json.substr(at, end - at));
+        at = end;
+    }
+    const size_t n = chunks.size();
+    for (size_t i = 0; i < n; ++i) {
+        std::string line = "[boot-report " + std::to_string(i + 1) + "/" + std::to_string(n) + "] ";
+        line.append(chunks[i]);
+        if (write) {
+            write(line);
+        } else {
+            os::log(line);
+        }
+    }
+}
+
+bool load_boot_options(BootConfig& config, const BootFileReader& read, const std::string& path) {
+    std::vector<uint8_t> bytes;
+    if (!read || !read(path, bytes)) {
+        return true;  // no options file: run as configured
+    }
+    const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    const bool ok = apply_boot_options_json(text, config);
+    os::log(ok ? "[boot] BOOT_OPTIONS " + path + " applied" : "[boot] BOOT_OPTIONS " + path + " ignored (not a JSON object)");
+    return ok;
+}
+
 void set_report_extension(ReportExtension extension) {
     g_report_extension.store(extension, std::memory_order_release);
 }
@@ -2615,6 +2733,7 @@ BootResult run_boot(const BootConfig& config) {
     b.arena_observer_installed = true;
     b.host_function_start = config.host_function_start;
     b.off_thread_fault = config.off_thread_fault;
+    b.report_sink = config.report_sink;
     b.guest_thread_started = config.guest_thread_started;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);

@@ -1659,6 +1659,69 @@ void test_shard_dispatch_boot() {
     }
 }
 
+// O36: run options for a boot without a command line, and the report through a sink (the browser
+// boot logs it in chunks, which concatenate back to the report).
+std::string g_sunk_report;
+int g_sink_calls = 0;
+
+void test_boot_options_and_report_sink() {
+    BootConfig cfg;
+    CHECK(!apply_boot_options_json("", cfg));
+    CHECK(!apply_boot_options_json("[1]", cfg));
+    CHECK(apply_boot_options_json("{}", cfg));
+    CHECK(cfg.max_wall_ms == 0 && !cfg.report_sink);
+    CHECK(apply_boot_options_json(
+        " {\"max_wall_ms\": 300000, \"max_dispatches\":7,\n \"arena_log_limit\": 12, "
+        "\"import_trace_limit\": 5, \"unknown\": \"x\", \"report_to_log\": true}\n", cfg));
+    CHECK(cfg.max_wall_ms == 300000 && cfg.max_dispatches == 7);
+    CHECK(cfg.arena_log_limit == 12 && cfg.import_trace_limit == 5);
+    CHECK(static_cast<bool>(cfg.report_sink));
+    CHECK(apply_boot_options_json("{\"report_to_log\": false, \"max_wall_ms\": \"x\"}", cfg));
+    CHECK(!cfg.report_sink && cfg.max_wall_ms == 300000);
+
+    // Chunks split on UTF-8 boundaries and concatenate back to the text.
+    const std::string text = "{\"a\": \"\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80 \xC3\xA9\"}\n{}";
+    std::vector<std::string> lines;
+    log_report_json(text, 8, [&](std::string_view line) { lines.emplace_back(line); });
+    std::string joined;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string head = "[boot-report " + std::to_string(i + 1) + "/" + std::to_string(lines.size()) + "] ";
+        CHECK(lines[i].rfind(head, 0) == 0);
+        const std::string chunk = lines[i].substr(head.size());
+        CHECK(!chunk.empty() && chunk.size() <= 8);
+        CHECK((static_cast<unsigned char>(chunk.front()) & 0xC0u) != 0x80u);
+        joined += chunk;
+    }
+    CHECK(lines.size() > 1 && joined == text);
+
+    // The sink receives the finished report, the same text run_boot returns.
+    g_sunk_report.clear();
+    g_sink_calls = 0;
+    Run run = boot_scenario(Scenario::ReturnCode, [](BootConfig& c) {
+        c.report_sink = [](std::string_view report) {
+            g_sunk_report.assign(report);
+            ++g_sink_calls;
+        };
+    });
+    CHECK(g_sink_calls == 1);
+    CHECK(g_sunk_report == run.result.report_json);
+
+    // Absent options file: nothing changes; a file that is not an object is reported.
+    BootConfig opts;
+    CHECK(load_boot_options(opts, [](const std::string&, std::vector<uint8_t>&) { return false; }));
+    CHECK(opts.max_wall_ms == 0);
+    CHECK(load_boot_options(opts, [](const std::string& path, std::vector<uint8_t>& out) {
+        const std::string body = path == "boot/boot-options.json" ? "{\"max_wall_ms\": 5}" : "";
+        out.assign(body.begin(), body.end());
+        return true;
+    }));
+    CHECK(opts.max_wall_ms == 5);
+    CHECK(!load_boot_options(opts, [](const std::string&, std::vector<uint8_t>& out) {
+        out.assign({'n', 'o'});
+        return true;
+    }));
+}
+
 }  // namespace
 
 int main() {
@@ -1688,6 +1751,7 @@ int main() {
     test_two_modules();
     test_host_fault_mapping();
     test_shard_dispatch_boot();
+    test_boot_options_and_report_sink();
 
     reset_boot();
     os::win32::set_vmem_arena(nullptr);

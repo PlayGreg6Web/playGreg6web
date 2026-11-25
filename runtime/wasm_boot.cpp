@@ -781,6 +781,11 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     device_options.bridge.features = cfg.wgpu_features;
     device_options_guard.install(std::move(device_options));
 
+    // O36: optional run options (wall-time bound, report to the log) from boot/boot-options.json.
+    guest::load_boot_options(program_boot.config, [&cfg](const std::string& path, std::vector<uint8_t>& out) {
+        std::string error;
+        return load_file_via_httpfs(cfg, path, out, error);
+    });
     const guest::BootResult boot = guest::run_boot(program_boot.config);
     if (auto dev = gpu::d3d12_xs_exports::current_device()) {
         if (!dump_dir.empty()) {
