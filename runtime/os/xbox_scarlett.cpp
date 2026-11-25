@@ -239,6 +239,7 @@ struct XMemState {
     uint64_t mapped_physical_bytes = 0;
     uint64_t peak_working_set_bytes = 0;
     uint64_t alias_conflicts = 0;  // a page mapped at a second real address while it had a home
+    uint64_t zero_fills = 0;       // O36: slots zeroed by memset (fresh commits skip it)
     uint64_t alias_slots = 0;      // O36: ... mapped as an alias of its bytes instead (one memory)
     bool shared_exhausted_logged = false;
     bool translated_window_live = false;  // R19: the one translated window is in use
@@ -956,6 +957,7 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
         page.store_va = 0;
     } else if (page.home_va == 0 && !fresh_zero) {
         std::memset(dst, 0, static_cast<size_t>(ps));
+        ++st.zero_fills;
     }
     if (page.pool_va == 0) {
         page.pool_va = va;
@@ -1047,6 +1049,8 @@ FastResult map_slot_fast(XMemState& st, std::unique_lock<std::mutex>& lock, uint
     lock.unlock();
 
     bool ok = true;
+    bool fresh_zero = false;  // O36: slot committed just now, already zero
+    bool zero_filled = false;
     uint8_t* view = nullptr;
     if (shared) {
         if (create) {
@@ -1063,19 +1067,25 @@ FastResult map_slot_fast(XMemState& st, std::unique_lock<std::mutex>& lock, uint
         }
         ok = ok && xmem_arena().map_shared(va, object, ps);
     } else {
-        ok = !commit || xmem_arena().commit(va, ps, pp);
+        uint64_t newly = 0;
+        ok = !commit || xmem_arena().commit(va, ps, pp, &newly);
+        fresh_zero = commit && ok && newly == ps;
         if (ok) {
             auto* dst = static_cast<uint8_t*>(host_of(va));
             if (store != 0) {
                 std::memcpy(dst, host_of(store), static_cast<size_t>(ps));
                 default_guest_heap().free(store);
-            } else {
+            } else if (!fresh_zero) {
                 std::memset(dst, 0, static_cast<size_t>(ps));
+                zero_filled = true;
             }
         }
     }
 
     lock.lock();
+    if (zero_filled) {
+        ++st.zero_fills;
+    }
     if (create && view != nullptr) {
         page.shared = object;  // kept even if the slot could not show it (as shared_bytes_locked)
         page.view = view;
@@ -2698,6 +2708,7 @@ XMemWindowContiguity xmem_window_contiguity() {
     c.run_bytes_moved = st.run_bytes_moved;
     c.alias_slots = st.alias_slots;
     c.alias_conflicts = st.alias_conflicts;
+    c.zero_fills = st.zero_fills;
     for (const auto& [key, region] : st.virtual_regions) {
         if (!region.cpu_window || region.phantom) {
             continue;
@@ -2765,6 +2776,7 @@ void xmem_reset_for_testing() {
     st.virtual_regions.clear();
     st.region_index.clear();
     st.alias_conflicts = 0;
+    st.zero_fills = 0;
     st.alias_slots = 0;
     st.shared_exhausted_logged = false;
     st.cpu_window_maps = 0;

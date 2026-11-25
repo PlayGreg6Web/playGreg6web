@@ -280,6 +280,44 @@ void test_xmem_physical_virtual_and_transfer() {
     CHECK(pg6_xbox_XMemFreePhysicalPages(3, handles) == 0);
 }
 
+// O36: the fast map path skips the zero-fill of a slot it just committed (fresh commits read as
+// zero already; zeroing would make the whole pool view resident), but still zeroes a reused slot.
+void test_xmem_fast_map_skips_fresh_zero_fill() {
+    auto* arena = win32::get_vmem_arena();
+    xmem_reset_for_testing();
+    void* res = pg6_xbox_XMemVirtualAlloc(
+        nullptr, 2 * kXMemPageSize64K, 0x20400000u | win32::MEM_RESERVE, 0x21u, win32::PAGE_READWRITE);
+    CHECK(res != nullptr);
+    if (res == nullptr) {
+        return;
+    }
+    const uint64_t base = arena->guest_address(res);
+    size_t n = 2;
+    uint64_t pfn[2]{};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage64K, &n, pfn) == 1);
+    uint8_t* slot = arena->translate(base);
+    const uint64_t before = xmem_window_contiguity().zero_fills;
+    CHECK(pg6_xbox_XMemMapPhysicalPages(slot, 1, &pfn[0]) != nullptr);
+    CHECK(xmem_window_contiguity().zero_fills == before);  // fresh commit: no memset
+    bool zero = true;
+    for (uint64_t i = 0; i < kXMemPageSize64K; ++i) {
+        zero = zero && slot[i] == 0;
+    }
+    CHECK(zero);
+    // Reused slot: dirty it, unmap, map another content-less page: it reads zero again.
+    std::memset(slot, 0x5A, kXMemPageSize64K);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(slot, 1, nullptr) != nullptr);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(slot, 1, &pfn[1]) != nullptr);
+    zero = true;
+    for (uint64_t i = 0; i < kXMemPageSize64K; ++i) {
+        zero = zero && slot[i] == 0;
+    }
+    CHECK(zero);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(slot, 1, nullptr) != nullptr);
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+    CHECK(xmem_virtual_free(res));
+}
+
 // R40: XMemMapPhysicalPages / unmap from many threads at once (their data work runs outside the
 // XMem lock): disjoint slots keep every thread's bytes, and threads fighting over the same slots
 // and pages leave every page's bytes intact and the accounting balanced. Both reservation kinds:
@@ -833,6 +871,7 @@ int main() {
     test_xmem_heap_and_hooks();
     test_xmem_physical_virtual_and_transfer();
     test_xmem_concurrent_map_unmap();
+    test_xmem_fast_map_skips_fresh_zero_fill();
     test_dstorage_virtual_and_httpfs();
     test_surface_blocks();
     test_xg_xs_texture_computer();

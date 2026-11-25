@@ -381,6 +381,7 @@ struct XMemWindowContiguity {
     // model, native shared views) / as a copy, the newer address becoming the home (conflicts).
     uint64_t alias_slots = 0;
     uint64_t alias_conflicts = 0;
+    uint64_t zero_fills = 0;  // O36: slots zeroed by memset (a freshly committed slot is skipped)
     struct Region {
         uint64_t base = 0;
         uint64_t size = 0;
