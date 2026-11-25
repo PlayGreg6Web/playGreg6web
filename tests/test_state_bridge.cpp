@@ -2822,10 +2822,90 @@ void test_fragment_storage_texture_format_conversion() {
     CHECK(order.find("C[DD]C") != std::string::npos);
 }
 
+// #482: a mixed vertex+fragment storage binding is converted too; when the texture is also the pass's
+// render attachment it is counted as an alias and not converted.
+void test_vertex_mixed_storage_and_attachment_alias() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    bridge::StateBridgeDevice device(heaps, counting_options(7000), &states);
+    constexpr uint32_t kTarget = 100, kTex = 302;
+    constexpr uint64_t kVs = 0xE1, kPs = 0xE2;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    bridge::TextureInfo tex{pso::DxgiFormat::R16G16B16A16_FLOAT, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+    tex.storage = true;
+    device.register_texture(kTex, tex);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 2, false);
+    d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc vd;
+    vd.format = static_cast<uint32_t>(tex.format);
+    vd.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Uav;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    GpuBindGroupLayoutEntry entry =
+        layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment, GpuBindingLayoutType::StorageTexture,
+                     static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite),
+                     static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+    entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+    group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {view_heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+    list.IASetVertexBuffers(0, 1, &vb);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+    CHECK(list.stats().storage_conversions == 2 && list.stats().storage_views_attachment_alias == 0);
+
+    gpu::CommandEncoder enc2;
+    bridge::CommandListBridge list2(device, enc2);
+    CHECK(list2.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list2.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list2.SetPipelineState(state.get());
+    CHECK(list2.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list2.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list2.IASetVertexBuffers(0, 1, &vb);
+    CHECK(heaps.create_render_target_view(kTex, nullptr, rtv_heap->cpu_handle(1)) == d3d::Status::Ok);
+    const d3d::CpuDescriptorHandle rtv1 = rtv_heap->cpu_handle(1);
+    list2.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list2.DrawInstanced(3, 1, 0, 0);
+    list2.Close();
+    CHECK(list2.stats().storage_views_attachment_alias >= 1 && list2.stats().storage_conversions == 0);
+}
+
 int main() {
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
     test_fragment_storage_texture_format_conversion();
+    test_vertex_mixed_storage_and_attachment_alias();
     test_seam_conversions();
     test_memory_backed_tables();
     test_representative_command_list();

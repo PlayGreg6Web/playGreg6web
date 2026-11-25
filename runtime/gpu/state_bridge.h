@@ -246,6 +246,11 @@ public:
     uint64_t rtv_descriptor_increment() const override;
     bool resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewInfo* out) const override;
     bool resolve_dsv(uint64_t cpu_handle, pso::DepthStencilViewInfo* out) const override;
+    // Texture id behind an RTV/DSV descriptor (0 if null or unknown).
+    uint32_t attachment_texture(uint64_t cpu_handle, d3d::DescriptorKind kind) const {
+        d3d::ViewDescriptor v{};
+        return cpu_handle != 0 && resolve_view_descriptor(cpu_handle, kind, &v) ? v.resource_id : 0u;
+    }
 
     // Resolves a CBV / root descriptor GPU virtual address (G6 GpuVaResolver contract).
     bool resolve_gpu_va(uint64_t gpu_address, d3d::GpuVaResolution* out) const;
@@ -421,6 +426,8 @@ struct BridgeStats {
     uint64_t storage_views_without_usage = 0;
     // ... of a texture whose format is not the stage's storage format, bound as null too.
     uint64_t storage_views_format_mismatch = 0;
+    // Redirected storage views whose texture is also a render attachment of the draw's pass: counted, not converted.
+    uint64_t storage_views_attachment_alias = 0;
     // Compute storage-texture bindings of another format than the stage's bound instead to an
     // intermediate texture in the stage's format (#482: both formats storage-capable and float),
     // converted into the real texture after the dispatch (and from it before, for read access).
@@ -608,6 +615,7 @@ private:
     std::vector<MemoryBindGroup> memory_groups_;
     // Storage redirects the last gpu_entries call made, and those of each bind group (by gpu id).
     std::vector<StorageRedirect> pending_redirects_;
+    std::array<uint32_t, pso::kMaxColorTargets + 1> om_attachments_{};  // texture ids of the bound RTVs + DSV
     std::unordered_map<uint32_t, std::vector<StorageRedirect>> redirects_;
     static constexpr size_t kNoPacket = ~size_t{0};  // created by an earlier recording
     void note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::BindGroupPlan& plan,

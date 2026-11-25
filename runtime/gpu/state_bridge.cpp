@@ -957,6 +957,11 @@ void CommandListBridge::OMSetRenderTargets(uint32_t num_render_target_descriptor
         }
     }
     const uint64_t dsv = depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0;
+    om_attachments_.fill(0);
+    for (uint32_t i = 0; i < n; ++i) {
+        om_attachments_[i] = device_.attachment_texture(handles[i], d3d::DescriptorKind::Rtv);
+    }
+    om_attachments_[pso::kMaxColorTargets] = device_.attachment_texture(dsv, d3d::DescriptorKind::Dsv);
     tracker_.OMSetRenderTargets(n, render_target_descriptors != nullptr ? handles.data() : nullptr,
                                 rts_single_handle_to_descriptor_range,
                                 depth_stencil_descriptor != nullptr ? &dsv : nullptr, device_);
@@ -1673,9 +1678,10 @@ bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, 
     using D = GpuTextureViewDimension;
     // Compute or fragment only: the conversions run as dispatches next to the stage's own (compute),
     // or around the render pass (fragment).
+    // Vertex and mixed vertex/fragment bindings are converted the same way as fragment ones.
     const bool compute_only = (layout.visibility & ~GpuShaderStageBits::Compute) == 0;
-    const bool fragment_only = (layout.visibility & ~GpuShaderStageBits::Fragment) == 0;
-    if (layout.visibility == 0 || (!compute_only && !fragment_only) || info.sample_count > 1 ||
+    const bool render_only = (layout.visibility & GpuShaderStageBits::Compute) == 0;
+    if (layout.visibility == 0 || (!compute_only && !render_only) || info.sample_count > 1 ||
         !convertible_storage_format(own_format) || !convertible_storage_format(layout.storage_format)) {
         return false;
     }
@@ -1855,6 +1861,15 @@ bool CommandListBridge::prepare_render_draw() {
                 active.insert(active.end(), it->second.begin(), it->second.end());
             }
         }
+        // The same texture as a render attachment of this pass: detected and counted, not converted.
+        active.erase(std::remove_if(active.begin(), active.end(),
+                                    [&](const StorageRedirect& r) {
+                                        const bool alias = std::find(om_attachments_.begin(), om_attachments_.end(),
+                                                                     r.texture) != om_attachments_.end();
+                                        stats_.storage_views_attachment_alias += alias ? 1u : 0u;
+                                        return alias;
+                                    }),
+                     active.end());
         if (active.empty()) {
             break;
         }
