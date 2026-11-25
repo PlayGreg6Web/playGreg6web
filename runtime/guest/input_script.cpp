@@ -45,7 +45,20 @@ bool button_bit(const std::string& name, uint32_t& bit) {
     return false;
 }
 
-bool parse_buttons(const std::string& text, uint32_t& out) {
+// Analog names (right stick, triggers): full deflection while held. False when `name` is not one.
+bool analog_name(const std::string& name, InputScriptEvent& e) {
+    if (name == "RUp") e.right_stick_y = 1.0f;
+    else if (name == "RDown") e.right_stick_y = -1.0f;
+    else if (name == "RLeft") e.right_stick_x = -1.0f;
+    else if (name == "RRight") e.right_stick_x = 1.0f;
+    else if (name == "LT") e.left_trigger = 1.0f;
+    else if (name == "RT") e.right_trigger = 1.0f;
+    else return false;
+    return true;
+}
+
+bool parse_buttons(const std::string& text, InputScriptEvent& e) {
+    uint32_t& out = e.buttons;
     uint64_t number = 0;
     if (parse_number(text, number)) {
         if (number == 0 || number > 0xffffffffull) {
@@ -55,21 +68,25 @@ bool parse_buttons(const std::string& text, uint32_t& out) {
         return true;
     }
     out = 0;
+    bool any_analog = false;
     size_t start = 0;
     while (start <= text.size()) {
         const size_t plus = text.find('+', start);
         const std::string part = text.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
         uint32_t bit = 0;
-        if (!button_bit(part, bit)) {
+        if (analog_name(part, e)) {
+            any_analog = true;
+        } else if (button_bit(part, bit)) {
+            out |= bit;
+        } else {
             return false;
         }
-        out |= bit;
         if (plus == std::string::npos) {
             break;
         }
         start = plus + 1;
     }
-    return out != 0;
+    return out != 0 || any_analog;
 }
 
 }  // namespace
@@ -99,7 +116,7 @@ bool parse_input_script(const std::string& text, std::vector<InputScriptEvent>& 
             error = where + "bad time '" + time_text + "'";
             return false;
         }
-        if (!parse_buttons(buttons_text, e.buttons)) {
+        if (!parse_buttons(buttons_text, e)) {
             error = where + "bad buttons '" + buttons_text + "'";
             return false;
         }
@@ -138,9 +155,15 @@ void InputScriptPlayer::stop() {
     }
 }
 
-void InputScriptPlayer::write(uint32_t buttons) {
+void InputScriptPlayer::write(const InputScriptEvent* held) {
     playgta6::InputState values{};
-    values.buttons = buttons;
+    if (held != nullptr) {
+        values.buttons = held->buttons;
+        values.right_stick_x = held->right_stick_x;
+        values.right_stick_y = held->right_stick_y;
+        values.left_trigger = held->left_trigger;
+        values.right_trigger = held->right_trigger;
+    }
     playgta6::os::GameInputReader::write_monotonic(*state_, values);
     writes_.fetch_add(1);
 }
@@ -164,12 +187,12 @@ void InputScriptPlayer::run() {
         if (!wait_until(press)) {
             return;
         }
-        write(e.buttons);
+        write(&e);
         if (!wait_until(press + std::chrono::milliseconds(e.hold_ms))) {
-            write(0);
+            write(nullptr);
             return;
         }
-        write(0);
+        write(nullptr);
     }
 }
 

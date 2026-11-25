@@ -58,6 +58,17 @@ void test_parse() {
         CHECK(ev[2].buttons == button::kDPadLeft && ev[3].buttons == button::kDPadRight);
         CHECK(ev[4].buttons == (button::kLeftStickPress | button::kRightStickPress));
     }
+    // Right stick and triggers.
+    CHECK(parse_input_script("10 RUp\n20 RDown+A\n30 RLeft+RT\n40 RRight+LT\n50 LT+RT\n", ev, error) &&
+          ev.size() == 5);
+    if (ev.size() == 5) {
+        CHECK(ev[0].right_stick_y == 1.0f && ev[0].buttons == 0);
+        CHECK(ev[1].right_stick_y == -1.0f && ev[1].buttons == button::kGamepadA);
+        CHECK(ev[2].right_stick_x == -1.0f && ev[2].right_trigger == 1.0f && ev[2].left_trigger == 0.0f);
+        CHECK(ev[3].right_stick_x == 1.0f && ev[3].left_trigger == 1.0f);
+        CHECK(ev[4].left_trigger == 1.0f && ev[4].right_trigger == 1.0f && ev[4].right_stick_x == 0.0f);
+    }
+    CHECK(!parse_input_script("10 RUpp\n", ev, error));
 
     // Malformed lines are refused with their line number.
     CHECK(!parse_input_script("1000 A\nsoon A\n", ev, error) && error.rfind("line 2:", 0) == 0);
@@ -89,6 +100,34 @@ void test_player_presses_and_releases() {
         }
         CHECK(released);
         CHECK(state.seq == 2);  // one write per press and per release
+    }
+
+    // Right stick and triggers reach the gamepad state, then clear on release.
+    {
+        playgta6::InputState analog{};
+        playgta6::os::GameInputReader areader(&analog);
+        std::vector<InputScriptEvent> ev;
+        std::string error;
+        CHECK(parse_input_script("0 RUp+RRight+LT+RT 200\n", ev, error) && ev.size() == 1);
+        playgta6::guest::InputScriptPlayer player(ev, &analog);
+        player.start();
+        playgta6::os::GameInputFrame frame;
+        bool held = false;
+        for (int i = 0; i < 100 && !held; ++i) {
+            if (areader.poll(frame, false) && frame.left_trigger > 0.9f) {
+                held = frame.right_stick.y > 0.5f && frame.right_stick.x > 0.5f && frame.right_trigger > 0.9f;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(held);
+        bool released = false;
+        for (int i = 0; i < 200 && !released; ++i) {
+            released = player.writes() == 2 && areader.poll(frame, false) && frame.right_stick.y == 0.0f &&
+                       frame.right_stick.x == 0.0f && frame.left_trigger == 0.0f && frame.right_trigger == 0.0f;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(released);
     }
 
     // stop() ends playback before a later event and leaves nothing pressed.
