@@ -604,6 +604,14 @@ struct DeviceOptions {
     // publish it. Off: values are published at issue. Boot harness: --no-fence-lag turns it off.
     bool fence_publish_lag = true;
     uint32_t fence_publish_cap_ms = 100;
+    // Lazy GPU objects (G66, #1077): a guest resource's CreateBuffer / CreateTexture2 packet is held
+    // until the first submission that references its id (a bind group entry, render pass attachment,
+    // vertex / index buffer, WriteBuffer / WriteTexture) and written right before that packet; a
+    // resource released before any use gets neither a create nor a DestroyResource packet. Titles
+    // create thousands of resources (4K render targets, placed resources in large heaps) that are
+    // never bound; creating them all at once costs the browser's GPU process gigabytes. Ids are
+    // allocated at creation either way, so recorded packets stay valid. Off: created at once.
+    bool defer_gpu_objects = true;
 };
 
 struct DeviceStats {
@@ -627,6 +635,11 @@ struct DeviceStats {
     // memory) and the bytes allocated for them (lazy chunks written so far).
     uint64_t shadow_bytes = 0;
     uint64_t shadow_resident_bytes = 0;
+    // Lazy GPU objects (DeviceOptions::defer_gpu_objects): create packets held now, written on first
+    // use so far, and dropped at release without ever being written.
+    uint64_t gpu_objects_pending = 0;
+    uint64_t gpu_objects_created_on_use = 0;
+    uint64_t gpu_objects_never_created = 0;
 };
 
 class Resource;
@@ -956,6 +969,17 @@ public:
     uint32_t present(std::span<const uint32_t> plane_textures = {});
     void set_sink(PacketSink sink);
 
+    // ---- Lazy GPU objects (G66, #1077; DeviceOptions::defer_gpu_objects) ----
+    // `create` holds the create packet(s) of resource `id`: it is written right before the first
+    // submitted packet that references `id` (submit, submit_parts and present all check), or at once
+    // when deferral is off.
+    void defer_create(uint32_t id, const CommandEncoder& create);
+    // Resource `id` is released: true if its create packet was never written (it is dropped; the
+    // GPU object never existed, so no DestroyResource must be sent).
+    bool release_deferred(uint32_t id);
+    // True while `id`'s create packet is held.
+    bool gpu_object_pending(uint32_t id) const;
+
     DeviceStats stats() const;
     void note_bad_argument(const std::string& message);
     std::vector<std::string> diagnostics() const;
@@ -975,6 +999,13 @@ private:
 
     mutable std::mutex submit_mutex_;
     PacketSink sink_;
+    // With submit_mutex_ held: `bytes` (whole packets) to the sink, each held create packet written
+    // before the first packet that references its id (emit_locked), or as they are (write_sink_locked).
+    void emit_locked(const uint8_t* bytes, size_t n);
+    void write_sink_locked(const uint8_t* bytes, size_t n);
+    std::unordered_map<uint32_t, std::vector<uint8_t>> deferred_creates_;  // under submit_mutex_
+    uint64_t gpu_objects_created_on_use_ = 0;                              // under submit_mutex_
+    uint64_t gpu_objects_never_created_ = 0;                               // under submit_mutex_
     bool frame_open_ = false;
     uint64_t presents_ = 0;
     uint64_t submissions_ = 0;
@@ -1402,6 +1433,12 @@ enum class Work : size_t {
     // Reflected descriptor-table bindings joined by table slot because the root signature does not
     // declare that slot as their class (stage_reflection.h, #482), per pipeline state created.
     ReflectionTableSlotsOutsideRs,
+    // Lazy GPU objects (G66, #1077; Device::defer_create): guest resources whose create packet was
+    // held at creation, written before the first packet that used them, and dropped at release
+    // without ever being written.
+    GpuObjectsDeferred,
+    GpuObjectsCreatedOnUse,
+    GpuObjectsNeverCreated,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

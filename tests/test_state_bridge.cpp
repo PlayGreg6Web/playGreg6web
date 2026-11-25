@@ -1563,6 +1563,7 @@ void test_dirty_texture_memory_upload() {
         dev_opts.sink = [&submitted](const uint8_t* data, size_t size) {
             submitted.insert(submitted.end(), data, data + size);
         };
+        dev_opts.defer_gpu_objects = false;  // the create packets are checked at creation
         auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
         CHECK(device);
         device->initialize_guest_payload();

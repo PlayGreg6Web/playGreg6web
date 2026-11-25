@@ -1370,9 +1370,10 @@ Resource::~Resource() {
     if (id_ != 0) {
         device_->state_bridge().unregister_resource(id_);
         device_->resource_states().unregister_resource(id_);
-        CommandEncoder enc;
-        enc.destroy_resource(id_);
-        if (is_buffer() || gpu_texture_) {
+        // A GPU object whose create packet was never written (never used) needs no DestroyResource.
+        if ((is_buffer() || gpu_texture_) && !device_->release_deferred(id_)) {
+            CommandEncoder enc;
+            enc.destroy_resource(id_);
             device_->submit(enc);
         }
     }
@@ -1459,7 +1460,7 @@ bool Resource::initialize() {
                               GpuBufferUsage::Storage | GpuBufferUsage::Indirect | GpuBufferUsage::CopyDst |
                               GpuBufferUsage::CopySrc,
                           allocated);
-        dev.submit(enc);
+        dev.defer_create(id_, enc);  // written before the first packet that uses it (G66)
         dev.state_bridge().register_buffer(id_, gpu_va_, size, allocated);
         if (cpu_va_ != 0) {
             // O36: no host memory yet (see shadow_chunks_): the chunks come with the first uploads.
@@ -1565,7 +1566,7 @@ bool Resource::initialize() {
             }
             CommandEncoder enc;
             enc.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
-            dev.submit(enc);
+            dev.defer_create(id_, enc);  // written before the first packet that uses it (G66)
             gpu_texture_ = true;
             // The address its descriptor words carry (descriptor_words.h): its GPU VA, or for a
             // texture without memory a range of the device's fake GPU VA space.

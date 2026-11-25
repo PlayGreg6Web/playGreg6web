@@ -45,6 +45,9 @@ const char* work_name(Work w) {
     case Work::ResourcesCreated: return "resources_created";
     case Work::ResourcesDestroyed: return "resources_destroyed";
     case Work::ReflectionTableSlotsOutsideRs: return "reflection_table_slots_outside_rs";
+    case Work::GpuObjectsDeferred: return "gpu_objects_deferred";
+    case Work::GpuObjectsCreatedOnUse: return "gpu_objects_created_on_use";
+    case Work::GpuObjectsNeverCreated: return "gpu_objects_never_created";
     case Work::Count: break;
     }
     return "?";

@@ -603,6 +603,7 @@ void test_bgra8_uav_storage_usage() {
         dg::DeviceOptions options;
         options.sink = [&captured](const uint8_t* data, size_t size) { captured.emplace_back(data, data + size); };
         options.bridge.features = enabled ? pso::WgpuFeature::Bgra8UnormStorage : 0u;
+        options.defer_gpu_objects = false;  // the create packet is checked at creation
         com::Ref<dg::Device> device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), options);
         CHECK(device);
         if (!device) {

@@ -227,7 +227,9 @@ struct Fixture {
     std::vector<std::vector<uint8_t>>* packets = nullptr;
     std::vector<std::vector<uint8_t>> captured;
 
-    Fixture() {
+    // `defer_gpu_objects` off: every resource's create packet is written at creation (the tests
+    // that inspect creation payloads); on (the default): on first use (DeviceOptions).
+    explicit Fixture(bool defer_gpu_objects = true) {
         reset_guest_runtime();
         com::reset_com_bridge();
         dx::reset_for_tests();
@@ -240,6 +242,7 @@ struct Fixture {
         CHECK(dx::register_d3d12_xs_exports() == 3);
         dg::DeviceOptions options;
         options.sink = [this](const uint8_t* data, size_t size) { captured.emplace_back(data, data + size); };
+        options.defer_gpu_objects = defer_gpu_objects;
         dx::set_device_options(options);
         t_balanced = true;
     }
@@ -1129,7 +1132,7 @@ void test_committed_render_targets_through_xmem_hooks() {
 }
 
 void test_resources() {
-    Fixture fx;
+    Fixture fx(false);  // checks the create packets as resources are created
     const uint64_t device = fx.create_device();
     dg::Device* dev = host_device(device);
     int32_t result = -1;
@@ -1704,7 +1707,7 @@ void test_bc_upload_needs_feature() {
 // RTV of an _SRGB resource (and the reverse) is a valid WebGPU view.
 void test_srgb_sibling_view_formats() {
     namespace pso = playgta6::gpu::pso;
-    Fixture fx;
+    Fixture fx(false);  // checks the create packets as resources are created
     Scene scene(fx);
     struct Case {
         uint32_t dxgi;
@@ -3045,7 +3048,7 @@ void test_xbox_unaligned_constant_buffers() {
 // G47: UAV textures in formats WebGPU cannot bind as storage are created without STORAGE_BINDING
 // (WebGPU would reject the whole texture); storage-capable formats keep it.
 void test_uav_texture_storage_usage() {
-    Fixture fx;
+    Fixture fx(false);  // checks the create packets as resources are created
     Scene scene(fx);
     const size_t mark = fx.captured.size();
     const uint64_t rgba8 = committed(fx, scene.device, 1, texture_desc(64, 64, 28, 0x4), 0);    // R8G8B8A8_UNORM, UAV
@@ -3068,6 +3071,110 @@ void test_uav_texture_storage_usage() {
 
 // G48: descriptor creation and copies leave the console's descriptor words in the slot's guest
 // memory (descriptor_words.h), so slots the title copies itself carry them.
+// G66 (#1077): a guest resource's GPU object is created on first use. An unused resource never gets
+// a create (or a DestroyResource) packet; the first packet that uses one is preceded by its create,
+// exactly once; a used resource's release destroys it.
+void test_lazy_gpu_object_creation() {
+    Fixture fx;
+    const uint64_t device = fx.create_device();
+    dg::Device* dev = host_device(device);
+    const size_t mark = fx.captured.size();
+    const uint64_t unused_rt = committed(fx, device, 1, texture_desc(3840, 2160, 28, 1 /* RT */), 4);
+    const uint64_t unused_buf = committed(fx, device, 1, buffer_desc(1 << 20), 0);
+    const uint64_t tex = committed(fx, device, 1, texture_desc(64, 32, 28, 1), 4);
+    const uint64_t buf = committed(fx, device, 1, buffer_desc(4096), 0);
+    CHECK(unused_rt != 0 && unused_buf != 0 && tex != 0 && buf != 0);
+    const uint32_t tex_id = object_of<dg::Resource>(tex)->id();
+    const uint32_t buf_id = object_of<dg::Resource>(buf)->id();
+    const uint32_t unused_rt_id = object_of<dg::Resource>(unused_rt)->id();
+    // Ids are allocated at creation (recorded packets name them), the GPU objects are not.
+    CHECK(tex_id != 0 && buf_id != 0 && unused_rt_id != 0 && tex_id != unused_rt_id);
+    {
+        const std::vector<Packet> ps = packets_since(fx, mark);
+        CHECK(count_op(ps, GpuOpcode::CreateTexture2) == 0);
+        CHECK(count_op(ps, GpuOpcode::CreateBuffer) == 0);
+    }
+    CHECK(dev->gpu_object_pending(tex_id) && dev->gpu_object_pending(buf_id) && dev->gpu_object_pending(unused_rt_id));
+    CHECK(dev->stats().gpu_objects_pending == 4);
+
+    // Unused resources released: neither a create nor a DestroyResource packet.
+    size_t at = fx.captured.size();
+    CHECK(fx.vcall(unused_rt, Slot::Release) == 0);
+    CHECK(fx.vcall(unused_buf, Slot::Release) == 0);
+    {
+        const std::vector<Packet> ps = packets_since(fx, at);
+        CHECK(count_op(ps, GpuOpcode::DestroyResource) == 0 && count_op(ps, GpuOpcode::CreateTexture2) == 0 &&
+              count_op(ps, GpuOpcode::CreateBuffer) == 0);
+    }
+    CHECK(dev->stats().gpu_objects_never_created == 2 && dev->stats().gpu_objects_pending == 2);
+
+    // First use of the texture (sampled by the present pass's bind group): its create comes first.
+    at = fx.captured.size();
+    const uint32_t planes[] = {tex_id};
+    CHECK(dev->present(planes) == 1);
+    {
+        const std::vector<Packet> ps = packets_since(fx, at);
+        CHECK(count_op(ps, GpuOpcode::CreateTexture2) == 1);
+        const Packet* create = find_op(ps, GpuOpcode::CreateTexture2);
+        CHECK(create != nullptr && payload_as<GpuCreateTexture2Payload>(*create).id == tex_id &&
+              payload_as<GpuCreateTexture2Payload>(*create).width == 64);
+        size_t use = ps.size();
+        for (size_t i = 0; i < ps.size(); ++i) {
+            if (ps[i].opcode != GpuOpcode::CreateBindGroup2) {
+                continue;
+            }
+            const auto h = payload_as<GpuCreateBindGroup2Payload>(ps[i]);
+            for (uint32_t e = 0; e < h.entry_count; ++e) {
+                const auto entry = payload_as<GpuBindGroupEntry2>(
+                    ps[i], sizeof(GpuCreateBindGroup2Payload) + e * sizeof(GpuBindGroupEntry2));
+                if (entry.resource_id == tex_id) {
+                    use = std::min(use, i);
+                }
+            }
+        }
+        CHECK(use < ps.size() && index_of(ps, GpuOpcode::CreateTexture2) < use);
+    }
+    CHECK(!dev->gpu_object_pending(tex_id));
+    // Later uses: no second create.
+    at = fx.captured.size();
+    dev->present(planes);
+    CHECK(count_op(packets_since(fx, at), GpuOpcode::CreateTexture2) == 0);
+
+    // First use of the buffer inside a submission with other packets: create right before the use.
+    at = fx.captured.size();
+    {
+        gpu::CommandEncoder enc;
+        enc.nop();
+        enc.set_vertex_buffer(0, buf_id);
+        enc.nop();
+        dev->submit(enc);
+    }
+    {
+        const std::vector<Packet> ps = packets_since(fx, at);
+        const size_t create = index_of(ps, GpuOpcode::CreateBuffer);
+        const size_t use = index_of(ps, GpuOpcode::SetVertexBuffer);
+        CHECK(count_op(ps, GpuOpcode::CreateBuffer) == 1 && create < use && create + 1 == use);
+        CHECK(payload_as<GpuCreateBufferPayload>(ps[create]).id == buf_id);
+        CHECK(count_op(ps, GpuOpcode::Nop) == 2);
+    }
+
+    // Used resources are destroyed on release.
+    at = fx.captured.size();
+    CHECK(fx.vcall(tex, Slot::Release) == 0);
+    CHECK(fx.vcall(buf, Slot::Release) == 0);
+    {
+        const std::vector<Packet> ps = packets_since(fx, at);
+        CHECK(count_op(ps, GpuOpcode::DestroyResource) == 2);
+        const Packet* d0 = find_op(ps, GpuOpcode::DestroyResource, 0);
+        const Packet* d1 = find_op(ps, GpuOpcode::DestroyResource, 1);
+        CHECK(d0 != nullptr && d1 != nullptr && payload_as<GpuDestroyResourcePayload>(*d0).id == tex_id &&
+              payload_as<GpuDestroyResourcePayload>(*d1).id == buf_id);
+    }
+    const dg::DeviceStats st = dev->stats();
+    CHECK(st.gpu_objects_pending == 0 && st.gpu_objects_created_on_use == 2 && st.gpu_objects_never_created == 2);
+    fx.vcall(device, Slot::Release);
+}
+
 void test_descriptor_words_in_memory() {
     namespace hw = playgta6::gpu::gfx10;
     Fixture fx;
@@ -5805,6 +5912,7 @@ int main() {
     test_xbox_shader_pack_resolution();
     test_stage_reflection_join();
     test_uav_texture_storage_usage();
+    test_lazy_gpu_object_creation();
     test_descriptor_words_in_memory();
     test_tables_from_descriptor_memory();
     test_xbox_pipeline_dump();

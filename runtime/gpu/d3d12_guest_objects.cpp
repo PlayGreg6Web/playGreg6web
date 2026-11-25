@@ -444,26 +444,186 @@ void Device::submit(const uint8_t* data, size_t size) {
 
 void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts) {
     std::lock_guard<std::mutex> lock(submit_mutex_);
-    auto emit = [&](const uint8_t* bytes, size_t n) {
-        if (n == 0) {
-            return;
-        }
-        if (sink_) {
-            sink_(bytes, n);
-        } else {
-            os::wgpu_submit(bytes, n);
-        }
-    };
     if (!frame_open_) {
         CommandEncoder begin;
         begin.begin_frame();
-        emit(begin.data(), begin.size());
+        write_sink_locked(begin.data(), begin.size());
         frame_open_ = true;
     }
     for (const auto& [data, size] : parts) {
-        emit(data, size);
+        emit_locked(data, size);
     }
     ++submissions_;
+}
+
+void Device::write_sink_locked(const uint8_t* bytes, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    if (sink_) {
+        sink_(bytes, n);
+    } else {
+        os::wgpu_submit(bytes, n);
+    }
+}
+
+namespace {
+
+uint32_t read_u32(const uint8_t* p) {
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+// Calls `fn(id)` for every resource id (buffer or texture) the packet references. Only these
+// opcodes name guest resources (playgta6_abi.h); the ids of other objects (pipelines, bind groups,
+// shader modules, samplers, layouts) are never deferred.
+template <typename Fn>
+void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&& fn) {
+    switch (static_cast<GpuOpcode>(opcode)) {
+    case GpuOpcode::WriteBuffer:
+    case GpuOpcode::WriteTexture:
+    case GpuOpcode::SetIndexBuffer:
+        if (len >= 4) {
+            fn(read_u32(p));
+        }
+        break;
+    case GpuOpcode::SetVertexBuffer:
+        if (len >= sizeof(GpuSetVertexBufferPayload)) {
+            fn(read_u32(p + offsetof(GpuSetVertexBufferPayload, buffer_id)));
+        }
+        break;
+    case GpuOpcode::BeginRenderPass:
+        if (len >= sizeof(GpuBeginRenderPassPayload)) {
+            const uint32_t colors = std::min<uint32_t>(read_u32(p), kGpuMaxColorAttachments);
+            for (uint32_t i = 0; i < colors; ++i) {
+                fn(read_u32(p + offsetof(GpuBeginRenderPassPayload, color) + i * sizeof(GpuRenderPassColorAttachment)));
+            }
+            fn(read_u32(p + offsetof(GpuBeginRenderPassPayload, depth_stencil)));
+        }
+        break;
+    case GpuOpcode::CreateBindGroup2:
+        if (len >= sizeof(GpuCreateBindGroup2Payload)) {
+            const uint32_t count = read_u32(p + offsetof(GpuCreateBindGroup2Payload, entry_count));
+            for (uint32_t i = 0; i < count; ++i) {
+                const size_t at = sizeof(GpuCreateBindGroup2Payload) + size_t{i} * sizeof(GpuBindGroupEntry2);
+                if (at + sizeof(GpuBindGroupEntry2) > len) {
+                    break;
+                }
+                fn(read_u32(p + at + offsetof(GpuBindGroupEntry2, resource_id)));
+            }
+        }
+        break;
+    case GpuOpcode::CreateBindGroup:
+        if (len >= sizeof(GpuCreateBindGroupPayload)) {
+            const uint32_t count = read_u32(p + offsetof(GpuCreateBindGroupPayload, entry_count));
+            for (uint32_t i = 0; i < count; ++i) {
+                const size_t at = sizeof(GpuCreateBindGroupPayload) + size_t{i} * sizeof(GpuBindGroupEntry);
+                if (at + sizeof(GpuBindGroupEntry) > len) {
+                    break;
+                }
+                fn(read_u32(p + at + offsetof(GpuBindGroupEntry, resource_id)));
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+}  // namespace
+
+void Device::emit_locked(const uint8_t* bytes, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    if (deferred_creates_.empty()) {
+        write_sink_locked(bytes, n);
+        return;
+    }
+    // Walk the packets: a held create goes right before the first packet that references its id,
+    // and a DestroyResource of a still-held id is dropped along with the create. The bytes are
+    // copied only when that happens.
+    std::vector<uint8_t> out;
+    bool rewritten = false;
+    size_t copied = 0;  // bytes[0, copied) are in `out`
+    auto flush_to = [&](size_t end) {
+        if (!rewritten) {
+            out.reserve(n + 256);
+            rewritten = true;
+        }
+        out.insert(out.end(), bytes + copied, bytes + end);
+        copied = end;
+    };
+    size_t off = 0;
+    while (off + sizeof(GpuPacketHeader) <= n && !deferred_creates_.empty()) {
+        GpuPacketHeader h{};
+        std::memcpy(&h, bytes + off, sizeof(h));
+        const size_t next = off + sizeof(GpuPacketHeader) + h.payload_bytes;
+        if (next > n) {
+            break;  // malformed tail: passed through as it is
+        }
+        const uint8_t* payload = bytes + off + sizeof(GpuPacketHeader);
+        if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::DestroyResource) {
+            const auto it = h.payload_bytes >= 4 ? deferred_creates_.find(read_u32(payload)) : deferred_creates_.end();
+            if (it != deferred_creates_.end()) {
+                deferred_creates_.erase(it);
+                ++gpu_objects_never_created_;
+                count_work(Work::GpuObjectsNeverCreated);
+                flush_to(off);
+                copied = next;  // the packet is skipped
+            }
+        } else {
+            for_each_resource_ref(h.opcode, payload, h.payload_bytes, [&](uint32_t id) {
+                const auto it = id == 0 ? deferred_creates_.end() : deferred_creates_.find(id);
+                if (it == deferred_creates_.end()) {
+                    return;
+                }
+                flush_to(off);
+                out.insert(out.end(), it->second.begin(), it->second.end());
+                deferred_creates_.erase(it);
+                ++gpu_objects_created_on_use_;
+                count_work(Work::GpuObjectsCreatedOnUse);
+            });
+        }
+        off = next;
+    }
+    if (!rewritten) {
+        write_sink_locked(bytes, n);
+        return;
+    }
+    flush_to(n);
+    write_sink_locked(out.data(), out.size());
+}
+
+void Device::defer_create(uint32_t id, const CommandEncoder& create) {
+    if (id == 0 || create.size() == 0) {
+        return;
+    }
+    if (!options_.defer_gpu_objects) {
+        submit(create);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    deferred_creates_[id].assign(create.data(), create.data() + create.size());
+    count_work(Work::GpuObjectsDeferred);
+}
+
+bool Device::release_deferred(uint32_t id) {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    const auto it = deferred_creates_.find(id);
+    if (it == deferred_creates_.end()) {
+        return false;
+    }
+    deferred_creates_.erase(it);
+    ++gpu_objects_never_created_;
+    count_work(Work::GpuObjectsNeverCreated);
+    return true;
+}
+
+bool Device::gpu_object_pending(uint32_t id) const {
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    return deferred_creates_.count(id) != 0;
 }
 
 namespace {
@@ -660,16 +820,8 @@ uint32_t Device::present(std::span<const uint32_t> plane_textures) {
     if (!frame_open_) {
         begin.begin_frame();
     }
-    for (const CommandEncoder* e : {&begin, &enc}) {
-        if (e->size() == 0) {
-            continue;
-        }
-        if (sink_) {
-            sink_(e->data(), e->size());
-        } else {
-            os::wgpu_submit(e->data(), e->size());
-        }
-    }
+    write_sink_locked(begin.data(), begin.size());
+    emit_locked(enc.data(), enc.size());
     frame_open_ = false;
     ++presents_;
     va_watch::set_frame(presents_);
@@ -687,6 +839,9 @@ DeviceStats Device::stats() const {
         std::lock_guard<std::mutex> lock(submit_mutex_);
         s.presents = presents_;
         s.submissions = submissions_;
+        s.gpu_objects_pending = deferred_creates_.size();
+        s.gpu_objects_created_on_use = gpu_objects_created_on_use_;
+        s.gpu_objects_never_created = gpu_objects_never_created_;
     }
     s.bad_arguments = bad_arguments_.load();
     s.resources = resources.load();
