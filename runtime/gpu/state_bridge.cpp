@@ -1328,6 +1328,24 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
             out.resource_id = e.resource_id;
             out.view = texture_view_desc(e.view);
+            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture)) {
+                // A storage view needs a texture created with STORAGE_BINDING; binding one of a
+                // texture without it would invalidate the whole command buffer. Bound null instead.
+                TextureInfo info;
+                if (e.resource_id != 0 && (!device_.texture_info(e.resource_id, &info) || !info.storage)) {
+                    out.resource_id = 0;
+                    out.view = GpuTextureViewDesc{};
+                    diagnostics_ |= BridgeDiag::StorageViewNoUsage;
+                    ++stats_.storage_views_without_usage;
+                } else if (e.resource_id != 0 && layout.storage_format != 0 &&
+                           (out.view.format == 0 ||
+                            out.view.format == static_cast<uint8_t>(pso::srgb_sibling(
+                                                   static_cast<pso::WgpuTextureFormat>(layout.storage_format))))) {
+                    // An sRGB (or default) view of a storage-capable texture: view it in the stage's
+                    // storage format (storage views cannot be sRGB).
+                    out.view.format = layout.storage_format;
+                }
+            }
             break;
         case d3d::BindResourceKind::Sampler: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);

@@ -978,6 +978,94 @@ void test_unaligned_uniform_relocation() {
 // O36: a structured-buffer SRV starting at an element that is not 256-byte aligned, bound as a
 // read-only storage buffer: WebGPU's minStorageBufferOffsetAlignment is 256 too, so the bridge binds
 // a relocated copy (relocate_storage hook); without the hook the binding is diagnosed.
+// #482: a storage-texture binding (a stage writing through a table slot). A texture created with
+// STORAGE_BINDING usage is bound as a storage view in the stage's storage format (an sRGB view of
+// an R8G8B8A8_UNORM_SRGB texture becomes rgba8unorm); one created without it is bound null and
+// counted, instead of a view WebGPU rejects with the whole command buffer.
+void test_storage_texture_needs_storage_usage() {
+    for (const bool with_usage : {true, false}) {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::StateBridgeDevice device(heaps, counting_options(7000), &states);
+        constexpr uint32_t kTarget = 100, kTex = 302;
+        constexpr uint64_t kVs = 0xE1, kPs = 0xE2;
+        device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                          GpuTextureDimension::Dim2D, false});
+        bridge::TextureInfo tex{pso::DxgiFormat::R8G8B8A8_UNORM_SRGB, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D,
+                                false};
+        tex.storage = with_usage;
+        device.register_texture(kTex, tex);
+        device.register_shader_module(kVs, 1);
+        device.register_shader_module(kPs, 2);
+        d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+        d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::ViewDesc vd;
+        vd.format = static_cast<uint32_t>(pso::DxgiFormat::R8G8B8A8_UNORM_SRGB);
+        vd.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Uav;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs.parameters.push_back(table);
+        d3d::RootSignature root;
+        CHECK(d3d::RootSignature::build(rs, &root).ok());
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        GpuBindGroupLayoutEntry entry =
+            layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::StorageTexture,
+                         static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite),
+                         static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+        entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+        group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kVs, kPs, layout);
+        pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+        d.vs = kVs;
+        d.ps = kPs;
+        d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+        auto state = device.create_graphics_pipeline_state(d, &root);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {view_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+        list.SetPipelineState(state.get());
+        CHECK(list.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        GpuBindGroupEntry2 out{};
+        bool found = false;
+        for (const Packet& packet : decode(enc)) {
+            if (packet.opcode == GpuOpcode::CreateBindGroup2 &&
+                packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
+                out = pod<GpuBindGroupEntry2>(packet, sizeof(GpuCreateBindGroup2Payload));
+                found = true;
+            }
+        }
+        CHECK(found);
+        if (with_usage) {
+            CHECK(out.resource_id == kTex &&
+                  out.view.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm));
+            CHECK(list.stats().storage_views_without_usage == 0 &&
+                  (list.diagnostics() & bridge::BridgeDiag::StorageViewNoUsage) == 0);
+        } else {
+            CHECK(out.resource_id == 0);
+            CHECK(list.stats().storage_views_without_usage == 1 &&
+                  (list.diagnostics() & bridge::BridgeDiag::StorageViewNoUsage) != 0);
+        }
+    }
+}
+
 void test_unaligned_storage_relocation() {
     for (const bool with_hook : {true, false}) {
         d3d::DescriptorHeapRegistry heaps;
@@ -2413,6 +2501,7 @@ int main() {
     test_representative_command_list();
     test_unaligned_uniform_relocation();
     test_unaligned_storage_relocation();
+    test_storage_texture_needs_storage_usage();
     test_reflected_uniform_min_size();
     test_bind_group_rebuild_and_retire();
     test_usage_conflict_is_diagnosed();

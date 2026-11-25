@@ -103,6 +103,8 @@ struct TextureInfo {
     uint32_t layout = 0;
     // Created with pso::FormatUsage::SampledOnly (never a render target): its views map with it too.
     bool sampled_only = false;
+    // Created with STORAGE_BINDING usage (storage views of it are valid).
+    bool storage = false;
 };
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
@@ -145,6 +147,7 @@ inline constexpr uint64_t CommandListClosed = 1ull << 13;       // call on a clo
 inline constexpr uint64_t ComponentMappingIgnored = 1ull << 14; // non-identity SRV swizzle
 inline constexpr uint64_t UnalignedUniform = 1ull << 15;        // uniform binding offset % 256, not relocated
 inline constexpr uint64_t UnalignedStorage = 1ull << 16;        // storage binding offset % 256, not relocated
+inline constexpr uint64_t StorageViewNoUsage = 1ull << 17;      // storage view of a texture without storage usage
 }  // namespace BridgeDiag
 
 // =====================================================================================================
@@ -381,6 +384,9 @@ struct BridgeStats {
     uint64_t uniforms_zero_extended = 0;
     // Read-only storage bindings at an offset not a multiple of 256, bound as a relocated copy (O36).
     uint64_t storage_relocated = 0;
+    // Storage-texture bindings of a texture created without STORAGE_BINDING usage, bound as null
+    // (a storage view of it would invalidate the bind group and the whole command buffer).
+    uint64_t storage_views_without_usage = 0;
     // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
     // the bound heap: bound as null.
     uint64_t heap_index_misses = 0;

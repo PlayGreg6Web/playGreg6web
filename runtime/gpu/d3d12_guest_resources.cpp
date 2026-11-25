@@ -838,6 +838,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     info.gpu_va = gpu_va;
     info.layout = d3d12_layout;
     info.sampled_only = true;
+    info.storage = (payload.usage_flags & GpuTextureUsage::StorageBinding) != 0;
     bridge_->register_texture(id, info);
 
     if (gpu_va < kFakeGpuVaBase) {
@@ -1509,6 +1510,7 @@ bool Resource::initialize() {
             info.dimension = static_cast<GpuTextureDimension>(p.dimension);
             info.gpu_va = descriptor_va_;
             info.layout = desc_.Layout;
+            info.storage = (p.usage_flags & GpuTextureUsage::StorageBinding) != 0;
             dev.state_bridge().register_texture(id_, info);
             va_watch::note_texture(descriptor_va_, committed_memory_size(desc_), p.width, p.height, desc_.Format, id_);
             if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {

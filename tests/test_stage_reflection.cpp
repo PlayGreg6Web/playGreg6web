@@ -345,6 +345,24 @@ void test_layout_join() {
     report.clear();
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &writable}}, &untouched, &report));
     CHECK(report.find("cannot take a CBV") != std::string::npos);
+    // Over a declared SRV it joins the slot as a UAV (the stage writes through the descriptor, #482:
+    // compute stages image_store through s5 + 32 where the root signature declares an SRV).
+    StageReflection over_srv;
+    ReflectedBinding st_srv = st;
+    st_srv.table_byte_offset = 0;  // slot 0 = SRV t2 space 1
+    over_srv.bindings = {st_srv};
+    report.clear();
+    JoinStats srv_stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &over_srv}}, &slots, &report, &srv_stats));
+    CHECK(report.empty() && srv_stats.table_slots_outside_rs == 1);
+    if (slots.groups.size() == 1 && slots.groups[0].bindings.size() == 1) {
+        const bridge::LayoutBinding& w = slots.groups[0].bindings[0];
+        CHECK(w.join.table_parameter == 0 && w.join.table_slot == 0 &&
+              w.join.register_class == d3d::DescriptorRangeType::Uav &&
+              w.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) && w.entry.storage_format == 18);
+    } else {
+        CHECK(false);
+    }
 
     // Two stages that disagree on one binding.
     StageReflection a, b;
