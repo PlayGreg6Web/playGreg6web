@@ -72,6 +72,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
   - Landed: default audio render endpoint (MMDevice/WASAPI) with stereo downmix, PCM ring and `--audio-dump`; XMem map/unmap work outside the lock; menu-flow preset through LEGAL NOTICES and right-stick/trigger input scripting; boot report screen timeline, GPU work counters and XMem alias diffs; XG/D3D12 tiling and layout fixes; CI guard against PRs that revert merged changes.
   - Since #1246: audio: ISpatialAudioObject::SetVolume, non-zero title buffer count (#1278); native tooling: shared object cache across checkouts, run_native_boot hints and `--thumbnails` (#1254, #1251, #1255); lifter speedups: truncating imul as plain mul, callee-observable flag stores only, IR guards for hot paths (#1252, #1316, #1337); boot report: per-present samples without GPU capture (#1248).
+  - Since #1378: XMem write tracking for physical-page views cuts render-thread compare from 46% to <0.5% and raises presents from 7 to 12/s (#1375); XApu decodes Opus stream packets and posts type-3 results (#1378); setvbuf guest buffer handled (#1384).
 - [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 - [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
@@ -245,6 +246,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [ ] **G62 — Bind Translated Stages by Reflection: Vertex-Input and Resource-Binding Contract Between the Shader Pack and the D3D12 Guest Layer (runtime side)** — `IN PROGRESS` (#651, @Timon-ok) *(contract discussed on #482; repo tests synthetic)*
   - Build vertex layouts and bind-group layouts for pack-resolved pipelines from each stage's reflection joined to the D3D12 input layout and root signature, instead of numbering conventions.
   - Landed: table slots the root signature does not declare are joined (console stages read tables as memory), A8_UNORM held as rgba8unorm with the value in alpha (glyph atlas), sRGB/linear viewFormats siblings and `--watch-gpu-va`.
+  - Since #1351: CB-indexed bindless join landed (#1383); contract on #482.
 - [x] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `DONE` (PR #676, closes #665) *(G49 follow-up)*
   - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
 - [x] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `DONE` (PR #689, closes #678) *(G64 follow-up)*
@@ -253,6 +255,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Trace DirectStorage requests to their destinations and the textures the steady-state draws bind; fix runtime gaps, report formats that need a decoder.
   - Landed: inline S# samplers bound from stage reflection, table-slot joins counted, compute stages writing through a declared SRV slot, every PresentX plane composed into the canvas, queue fence values published a frame late and PRESENT waits completing on present.
   - Capture tooling: `replay_capture.py` with thinned uploads and an end-to-end test, lazy GPU object creation.
+  - Since #1351: 32-bit heap offset wrap fixed (#1352).
 
 ---
 
