@@ -64,6 +64,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <tuple>
 #include <string>
 #include <unordered_map>
@@ -891,12 +892,14 @@ public:
     void submit(const CommandEncoder& encoder) { submit(encoder.data(), encoder.size()); }
     // Several byte ranges as one submission (no other submission in between).
     void submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts);
-    // Present packet (and BeginFrame before the next frame's first submission). A non-zero
-    // `source_texture_id` (the presented plane's texture, PresentX) is first drawn into the canvas
-    // texture (kGpuSwapchainTextureId) by a fullscreen pass, scaled to the canvas, so every
-    // presented back buffer reaches the screen whenever its render-target views were created.
-    // Returns true when that blit was emitted.
-    bool present(uint32_t source_texture_id = 0);
+    // Present packet (and BeginFrame before the next frame's first submission). `plane_textures`
+    // (PresentX planes, plane 0 on top; 0 = no texture) are first drawn into the canvas texture
+    // (kGpuSwapchainTextureId) by one pass, each scaled to the full canvas: the last drawable plane
+    // opaque, the ones above it blended as premultiplied alpha. So every presented back buffer
+    // reaches the screen whenever its render-target views were created. Planes that cannot be
+    // sampled with filtering, or that already are the canvas (set_back_buffer), are skipped.
+    // Returns the number of planes drawn.
+    uint32_t present(std::span<const uint32_t> plane_textures = {});
     void set_sink(PacketSink sink);
 
     DeviceStats stats() const;
@@ -921,12 +924,12 @@ private:
     bool frame_open_ = false;
     uint64_t presents_ = 0;
     uint64_t submissions_ = 0;
-    // Present blit objects (under submit_mutex_), created on first use: shader modules, layouts,
-    // sampler, one pipeline per canvas format, one bind group per presented texture.
-    bool emit_present_blit(uint32_t source_texture_id, CommandEncoder& enc);
+    // Present composition objects (under submit_mutex_), created on first use: shader modules,
+    // layouts, sampler, one pipeline per (canvas format, blended), one bind group per texture.
+    uint32_t emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc);
     struct PresentBlit {
         uint32_t vs = 0, fs = 0, group_layout = 0, pipeline_layout = 0, sampler = 0;
-        std::unordered_map<uint8_t, uint32_t> pipelines;   // canvas view format code -> pipeline
+        std::unordered_map<uint32_t, uint32_t> pipelines;  // canvas format code << 1 | blended -> pipeline
         std::unordered_map<uint32_t, uint32_t> groups;     // presented texture id -> bind group
     } present_blit_;
 

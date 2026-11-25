@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -1207,32 +1208,37 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t) 
                                          prev, plane.Token, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         }
     }
-    // Plane 0's texture is drawn into the canvas at the Present (Device::present), every frame:
-    // titles alternate several back buffers, and their render-target views predate the present.
-    uint32_t source_texture = 0;
-    uint64_t resource = 0;
-    if (plane.ResourceCount != 0 && plane.ppResources != 0 &&
-        com::read_guest(plane.ppResources, &resource, sizeof(resource)) && resource != 0) {
-        com::detail::Resolved r;
-        if (com::detail::lookup_interface(resource, &r) && r.iface == &kID3D12Resource.info) {
-            auto* res = static_cast<Resource*>(static_cast<IResourceHost*>(r.host));
-            if (res->desc().Dimension == ResourceDimension::Texture2D && res->has_gpu_texture()) {
-                source_texture = res->id();
-            } else {
-                device_->note_bad_argument("PresentX: plane 0 resource " + hex(resource) +
-                                           " is not a 2D texture with a GPU object");
-            }
-        } else {
-            device_->note_bad_argument("PresentX: plane 0 resource " + hex(resource) + " is not a resource");
+    // Every plane's texture is drawn into the canvas at the Present (Device::present), every
+    // frame: titles alternate back buffers whose render-target views predate the present, and
+    // compose the frame from several planes (e.g. a 4K scene plane under a 1080p overlay plane).
+    // Each plane contributes its first resource, full screen.
+    std::array<uint32_t, kMaxPlanes> textures{};
+    for (uint32_t i = 0; i < plane_count; ++i) {
+        xbox::GuestPresentPlaneX p{};
+        uint64_t resource = 0;
+        if (!com::read_guest(planes + uint64_t{i} * sizeof(p), p) || p.ResourceCount == 0 || p.ppResources == 0 ||
+            !com::read_guest(p.ppResources, &resource, sizeof(resource)) || resource == 0) {
+            device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " has no readable resource");
+            continue;
         }
-    } else {
-        device_->note_bad_argument("PresentX: plane 0 has no readable resource");
-    }
-    if (plane_count > 1) {
-        device_->count(xbox::Counter::ExtraPlanesIgnored, plane_count - 1);
+        com::detail::Resolved r;
+        if (!com::detail::lookup_interface(resource, &r) || r.iface != &kID3D12Resource.info) {
+            device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " resource " + hex(resource) +
+                                       " is not a resource");
+            continue;
+        }
+        auto* res = static_cast<Resource*>(static_cast<IResourceHost*>(r.host));
+        if (res->desc().Dimension != ResourceDimension::Texture2D || !res->has_gpu_texture()) {
+            device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " resource " + hex(resource) +
+                                       " is not a 2D texture with a GPU object");
+            continue;
+        }
+        textures[i] = res->id();
     }
     device_->count(xbox::Counter::PresentsWithPlanes);
-    device_->count(device_->present(source_texture) ? xbox::Counter::PresentBlits : xbox::Counter::PresentsNotBlitted);
+    const uint32_t drawn = device_->present(std::span<const uint32_t>(textures.data(), plane_count));
+    device_->count(xbox::Counter::PresentPlanesDrawn, drawn);
+    device_->count(xbox::Counter::PresentPlanesNotDrawn, plane_count - drawn);
     return kSOk;
 }
 

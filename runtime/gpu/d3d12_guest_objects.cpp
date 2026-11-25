@@ -449,17 +449,30 @@ uint8_t present_canvas_format(pso::WgpuTextureFormat f) {
 
 }  // namespace
 
-bool Device::emit_present_blit(uint32_t source_texture_id, CommandEncoder& enc) {
-    bridge::TextureInfo info;
-    if (!bridge_->texture_info(source_texture_id, &info) || info.swapchain ||
-        info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
-        return false;  // gone, already the canvas (set_back_buffer), or not a plain 2D texture
+uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc) {
+    // Drawable planes, bottom (last plane) first; the bottom one picks the canvas format.
+    std::vector<uint32_t> order;
+    uint8_t canvas_format = 0;
+    for (size_t i = plane_textures.size(); i-- > 0;) {
+        const uint32_t id = plane_textures[i];
+        bridge::TextureInfo info;
+        if (id == 0 || !bridge_->texture_info(id, &info) || info.swapchain ||
+            info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
+            continue;  // none, gone, already the canvas (set_back_buffer), or not a plain 2D texture
+        }
+        const pso::TextureFormatMapping m =
+            pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features);
+        const uint8_t format = present_canvas_format(m.format);
+        if (format == 0) {
+            continue;
+        }
+        if (order.empty()) {
+            canvas_format = format;
+        }
+        order.push_back(id);
     }
-    const pso::TextureFormatMapping m =
-        pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features);
-    const uint8_t canvas_format = present_canvas_format(m.format);
-    if (canvas_format == 0) {
-        return false;
+    if (order.empty()) {
+        return 0;
     }
     PresentBlit& b = present_blit_;
     if (b.vs == 0) {
@@ -497,40 +510,59 @@ bool Device::emit_present_blit(uint32_t source_texture_id, CommandEncoder& enc) 
         s.lod_max_clamp = 32.0f;
         enc.emit_packet(GpuOpcode::CreateSampler2, &s, sizeof(s));
     }
-    uint32_t& pipeline = b.pipelines[canvas_format];
-    if (pipeline == 0) {
-        pipeline = allocate_id();
-        GpuCreateRenderPipeline2Payload p{};
-        p.id = pipeline;
-        p.vs_module_id = b.vs;
-        p.fs_module_id = b.fs;
-        p.pipeline_layout_id = b.pipeline_layout;
-        p.key.color_target_count = 1;
-        p.key.color_targets[0].format = canvas_format;
-        p.key.color_targets[0].write_mask = 0xF;
-        p.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
-        p.key.multisample.count = 1;
-        p.key.multisample.mask = 0xFFFFFFFFu;
-        enc.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
-    }
-    uint32_t& group = b.groups[source_texture_id];
-    if (group == 0) {
-        group = allocate_id();
-        GpuBindGroupEntry2 e[2] = {};
-        e[0].binding = 0;
-        e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
-        e[0].resource_id = source_texture_id;
-        e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
-        e[0].view.mip_level_count = 1;
-        e[0].view.array_layer_count = 1;
-        e[1].binding = 1;
-        e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
-        e[1].resource_id = b.sampler;
-        GpuCreateBindGroup2Payload g{};
-        g.id = group;
-        g.layout_id = b.group_layout;
-        g.entry_count = 2;
-        enc.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+    auto pipeline_for = [&](bool blended) {
+        uint32_t& pipeline = b.pipelines[uint32_t{canvas_format} << 1 | (blended ? 1u : 0u)];
+        if (pipeline == 0) {
+            pipeline = allocate_id();
+            GpuCreateRenderPipeline2Payload p{};
+            p.id = pipeline;
+            p.vs_module_id = b.vs;
+            p.fs_module_id = b.fs;
+            p.pipeline_layout_id = b.pipeline_layout;
+            p.key.color_target_count = 1;
+            GpuColorTargetKey& t = p.key.color_targets[0];
+            t.format = canvas_format;
+            t.write_mask = 0xF;
+            if (blended) {  // premultiplied alpha over the planes below
+                t.blend_enabled = 1;
+                t.color = {static_cast<uint8_t>(pso::WgpuBlendOperation::Add),
+                           static_cast<uint8_t>(pso::WgpuBlendFactor::One),
+                           static_cast<uint8_t>(pso::WgpuBlendFactor::OneMinusSrcAlpha), 0};
+                t.alpha = t.color;
+            }
+            p.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+            p.key.multisample.count = 1;
+            p.key.multisample.mask = 0xFFFFFFFFu;
+            enc.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
+        }
+        return pipeline;
+    };
+    auto group_for = [&](uint32_t texture_id) {
+        uint32_t& group = b.groups[texture_id];
+        if (group == 0) {
+            group = allocate_id();
+            GpuBindGroupEntry2 e[2] = {};
+            e[0].binding = 0;
+            e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+            e[0].resource_id = texture_id;
+            e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+            e[0].view.mip_level_count = 1;
+            e[0].view.array_layer_count = 1;
+            e[1].binding = 1;
+            e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
+            e[1].resource_id = b.sampler;
+            GpuCreateBindGroup2Payload g{};
+            g.id = group;
+            g.layout_id = b.group_layout;
+            g.entry_count = 2;
+            enc.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        }
+        return group;
+    };
+    std::vector<std::pair<uint32_t, uint32_t>> draws;  // (pipeline, bind group), bottom first
+    for (size_t k = 0; k < order.size(); ++k) {
+        const uint32_t pipeline = pipeline_for(k > 0);
+        draws.emplace_back(pipeline, group_for(order[k]));
     }
     GpuBeginRenderPassPayload pass{};
     pass.color_count = 1;
@@ -543,23 +575,25 @@ bool Device::emit_present_blit(uint32_t source_texture_id, CommandEncoder& enc) 
     pass.color[0].view.array_layer_count = 1;
     pass.color[0].clear_value[3] = 1.0f;
     enc.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
-    enc.set_pipeline(pipeline);
-    GpuSetBindGroup2Payload set{};
-    set.group_index = 0;
-    set.bind_group_id = group;
-    enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
-    enc.draw(3);
+    for (const auto& [pipeline, group] : draws) {
+        enc.set_pipeline(pipeline);
+        GpuSetBindGroup2Payload set{};
+        set.group_index = 0;
+        set.bind_group_id = group;
+        enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+        enc.draw(3);
+    }
     enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
-    return true;
+    return static_cast<uint32_t>(order.size());
 }
 
-bool Device::present(uint32_t source_texture_id) {
+uint32_t Device::present(std::span<const uint32_t> plane_textures) {
     if (dump_ && dump_presents_.fetch_add(1) % 60 == 59) {
         dump_->write_manifest();
     }
     std::lock_guard<std::mutex> lock(submit_mutex_);
     CommandEncoder enc;
-    const bool blitted = source_texture_id != 0 && emit_present_blit(source_texture_id, enc);
+    const uint32_t drawn = plane_textures.empty() ? 0u : emit_present_planes(plane_textures, enc);
     enc.present();
     CommandEncoder begin;
     if (!frame_open_) {
@@ -578,7 +612,7 @@ bool Device::present(uint32_t source_texture_id) {
     frame_open_ = false;
     ++presents_;
     va_watch::set_frame(presents_);
-    return blitted;
+    return drawn;
 }
 
 DeviceStats Device::stats() const {

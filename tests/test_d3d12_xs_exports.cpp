@@ -2128,8 +2128,8 @@ void test_xbox_frame_loop_present_and_pacing() {
     CHECK(elapsed < std::chrono::seconds(5));
     // Every frame renders into the texture, then PresentX draws it into the canvas (the texture is
     // never retargeted), then Present.
-    CHECK(counter(dev, dg::xbox::Counter::PresentBlits) == 4);
-    CHECK(counter(dev, dg::xbox::Counter::PresentsNotBlitted) == 0);
+    CHECK(counter(dev, dg::xbox::Counter::PresentPlanesDrawn) == 4);
+    CHECK(counter(dev, dg::xbox::Counter::PresentPlanesNotDrawn) == 0);
     CHECK(!object_of<dg::Resource>(scene.rt)->is_back_buffer());
     for (size_t i = 0; i < frames.size(); ++i) {
         const Packet* pass = find_op(frames[i], GpuOpcode::BeginRenderPass);
@@ -2229,17 +2229,69 @@ void test_present_alternating_back_buffers() {
     CHECK(count_op(all, GpuOpcode::CreateRenderPipeline2) == 1);
     CHECK(count_op(all, GpuOpcode::CreateBindGroup2) == 2);
     CHECK(count_op(all, GpuOpcode::BeginRenderPass) == 4);
-    CHECK(counter(dev, dg::xbox::Counter::PresentBlits) == 4);
+    CHECK(counter(dev, dg::xbox::Counter::PresentPlanesDrawn) == 4);
     CHECK(!object_of<dg::Resource>(scene.rt)->is_back_buffer() && !object_of<dg::Resource>(rt2)->is_back_buffer());
+
+    // Two planes (this title: a 1080p overlay as plane 0 over the 4K scene as plane 1): one canvas
+    // pass in the bottom plane's format, the scene drawn opaque, then the overlay blended
+    // (premultiplied alpha) on top.
+    {
+        const uint64_t overlay = committed(fx, scene.device, 1, texture_desc(32, 32, 28, 1), 4);  // R8G8B8A8_UNORM
+        const uint32_t overlay_id = object_of<dg::Resource>(overlay)->id();
+        const uint64_t slots = put_bytes(std::array<uint64_t, 2>{overlay, scene.rt}.data(), 16);
+        dg::xbox::GuestPresentPlaneX planes[2] = {};
+        for (uint32_t i = 0; i < 2; ++i) {
+            planes[i].Token = 7;
+            planes[i].ResourceCount = 1;
+            planes[i].ppResources = slots + 8 * i;
+        }
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(2), I(put_bytes(planes, sizeof(planes))), I(0)})) == 0);
+        const std::vector<Packet> ps2 = packets_since(fx, mark);
+        all.insert(all.end(), ps2.begin(), ps2.end());
+        CHECK(count_op(ps2, GpuOpcode::BeginRenderPass) == 1 && count_op(ps2, GpuOpcode::Draw) == 2);
+        const Packet* pass = find_op(ps2, GpuOpcode::BeginRenderPass);
+        CHECK(pass != nullptr && payload_as<GpuBeginRenderPassPayload>(*pass).color[0].view.format ==
+                                     static_cast<uint8_t>(playgta6::gpu::pso::WgpuTextureFormat::Bgra8Unorm));
+        auto texture_of = [&](const Packet* set) {
+            const uint32_t group = payload_as<GpuSetBindGroup2Payload>(*set).bind_group_id;
+            for (const Packet& c : all) {
+                if (c.opcode == GpuOpcode::CreateBindGroup2 && payload_as<GpuCreateBindGroup2Payload>(c).id == group) {
+                    return payload_as<GpuBindGroupEntry2>(c, sizeof(GpuCreateBindGroup2Payload)).resource_id;
+                }
+            }
+            return 0u;
+        };
+        auto blended = [&](const Packet* set_pipeline) {
+            const uint32_t id = payload_as<GpuSetPipelinePayload>(*set_pipeline).pipeline_id;
+            for (const Packet& c : all) {
+                if (c.opcode == GpuOpcode::CreateRenderPipeline2 && payload_as<GpuCreateRenderPipeline2Payload>(c).id == id) {
+                    return payload_as<GpuCreateRenderPipeline2Payload>(c).key.color_targets[0].blend_enabled != 0;
+                }
+            }
+            return false;
+        };
+        const Packet* set0 = find_op(ps2, GpuOpcode::SetBindGroup2, 0);
+        const Packet* set1 = find_op(ps2, GpuOpcode::SetBindGroup2, 1);
+        const Packet* pipe0 = find_op(ps2, GpuOpcode::SetPipeline, 0);
+        const Packet* pipe1 = find_op(ps2, GpuOpcode::SetPipeline, 1);
+        CHECK(set0 != nullptr && set1 != nullptr && pipe0 != nullptr && pipe1 != nullptr);
+        if (set0 != nullptr && set1 != nullptr && pipe0 != nullptr && pipe1 != nullptr) {
+            CHECK(texture_of(set0) == ids[0] && texture_of(set1) == overlay_id);
+            CHECK(!blended(pipe0) && blended(pipe1));
+        }
+        CHECK(counter(dev, dg::xbox::Counter::PresentPlanesDrawn) == 6);
+        fx.vcall(overlay, Slot::Release);
+    }
 
     // Not a filterable colour format: Present only, counted.
     const std::vector<Packet> ps = present(r32, 5);
     CHECK(ps.size() >= 1 && ps.back().opcode == GpuOpcode::Present && find_op(ps, GpuOpcode::BeginRenderPass) == nullptr);
-    CHECK(counter(dev, dg::xbox::Counter::PresentsNotBlitted) == 1);
+    CHECK(counter(dev, dg::xbox::Counter::PresentPlanesNotDrawn) == 1);
     // A host-named back buffer already renders into the canvas: no blit.
     CHECK(dev->set_back_buffer(rt2));
     CHECK(find_op(present(rt2, 6), GpuOpcode::BeginRenderPass) == nullptr);
-    CHECK(counter(dev, dg::xbox::Counter::PresentsNotBlitted) == 2);
+    CHECK(counter(dev, dg::xbox::Counter::PresentPlanesNotDrawn) == 2);
     CHECK(t_balanced);
     scene.release_all({rt2, r32});
 }

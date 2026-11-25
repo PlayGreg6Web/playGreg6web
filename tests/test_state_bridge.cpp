@@ -2258,7 +2258,7 @@ void test_fence_completion_and_ref_lifetime() {
             }
             // Each present drew the back buffer into the canvas; the texture was never retargeted.
             CHECK(!back_buf->is_back_buffer());
-            CHECK(device->counter(dg::xbox::Counter::PresentBlits) == 16);
+            CHECK(device->counter(dg::xbox::Counter::PresentPlanesDrawn) == 16);
             com::guest_free(plane_va);
             com::guest_free(bb_slot);
         }
