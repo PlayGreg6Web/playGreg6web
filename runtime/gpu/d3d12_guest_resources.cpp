@@ -174,6 +174,74 @@ uint64_t shader_identity(const void* data, size_t size) {
     return h;
 }
 
+namespace {
+
+inline uint64_t load_u64(const uint8_t* p) {
+    uint64_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+inline uint64_t rotl64(uint64_t v, int r) {
+    return (v << r) | (v >> (64 - r));
+}
+
+constexpr uint64_t kContentPrime1 = 0x9E3779B185EBCA87ull;
+constexpr uint64_t kContentPrime2 = 0xC2B2AE3D27D4EB4Full;
+
+inline uint64_t content_round(uint64_t acc, uint64_t word) {
+    return rotl64(acc + word * kContentPrime2, 31) * kContentPrime1;
+}
+
+}  // namespace
+
+uint64_t content_hash(const void* data, size_t size) {
+    // Four independent lanes (xxHash64-style rounds) so the multiplies overlap.
+    const auto* p = static_cast<const uint8_t*>(data);
+    uint64_t a = kContentPrime1 + kContentPrime2;
+    uint64_t b = kContentPrime2;
+    uint64_t c = 0;
+    uint64_t d = 0 - kContentPrime1;
+    size_t i = 0;
+    for (; i + 32 <= size; i += 32) {
+        a = content_round(a, load_u64(p + i));
+        b = content_round(b, load_u64(p + i + 8));
+        c = content_round(c, load_u64(p + i + 16));
+        d = content_round(d, load_u64(p + i + 24));
+    }
+    uint64_t h = rotl64(a, 1) + rotl64(b, 7) + rotl64(c, 12) + rotl64(d, 18) + static_cast<uint64_t>(size);
+    for (; i + 8 <= size; i += 8) {
+        h = rotl64(h ^ content_round(0, load_u64(p + i)), 27) * kContentPrime1 + 0x85EBCA77C2B2AE63ull;
+    }
+    for (; i < size; ++i) {
+        h = rotl64(h ^ (p[i] * 0x27D4EB2F165667C5ull), 11) * kContentPrime1;
+    }
+    h ^= h >> 33;
+    h *= kContentPrime2;
+    h ^= h >> 29;
+    return h;
+}
+
+bool all_zero_bytes(const void* data, size_t size) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    size_t i = 0;
+    for (; i + 64 <= size; i += 64) {
+        uint64_t acc = 0;
+        for (size_t k = 0; k < 64; k += 8) {
+            acc |= load_u64(p + i + k);
+        }
+        if (acc != 0) {
+            return false;
+        }
+    }
+    for (; i < size; ++i) {
+        if (p[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 uint64_t native_stage_identity(const void* code, size_t code_size, const void* metadata, size_t metadata_size) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (const auto& [data, size] : {std::pair<const void*, size_t>{code, code_size}, {metadata, metadata_size}}) {
@@ -346,6 +414,19 @@ void Device::set_detile_fn(DetileFn fn) {
     detile_texture_ = std::move(fn);
 }
 
+namespace {
+std::atomic<uint64_t> g_submissions{0};
+thread_local uint64_t t_submission = 0;  // 0 = outside ExecuteCommandLists
+}  // namespace
+
+void Device::begin_submission() {
+    t_submission = g_submissions.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void Device::end_submission() {
+    t_submission = 0;
+}
+
 bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& encoder) {
     if (resource_id == 0) {
         return false;
@@ -358,6 +439,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
         const auto it = tracked_textures_.find(resource_id);
         if (it != tracked_textures_.end()) {
+            if (t_submission != 0 && it->second.synced_submission == t_submission) {
+                return false;  // already synced into an earlier part of this submission
+            }
+            it->second.synced_submission = t_submission;
             tt = it->second;
         } else {
             bridge::TextureInfo info{};
@@ -378,6 +463,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                                : (info.dimension == GpuTextureDimension::Dim3D ? ResourceDimension::Texture3D
                                                                              : ResourceDimension::Texture2D);
             tt.sample_count = info.sample_count;
+            tt.synced_submission = t_submission;
             tracked_textures_[resource_id] = tt;
         }
     }
@@ -511,12 +597,12 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
-    const bool all_zero = std::all_of(raw.begin(), raw.end(), [](uint8_t b) { return b == 0; });
+    const bool all_zero = all_zero_bytes(raw.data(), raw.size());
     if (all_zero && !tt.ever_uploaded) {
         return false;
     }
 
-    const uint64_t hash = shader_identity(raw.data(), raw.size());
+    const uint64_t hash = content_hash(raw.data(), raw.size());
     if (tt.ever_uploaded && hash == tt.last_upload_hash) {
         return false;
     }
@@ -590,7 +676,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
         }
-        st.hash = shader_identity(st.bytes.data(), st.bytes.size());
+        st.hash = content_hash(st.bytes.data(), st.bytes.size());
         staged.push_back(std::move(st));
     }
 
@@ -610,7 +696,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         auto out = staged.begin();
         for (Staged& st : staged) {
             uint64_t& seen = cur.subresource_hashes[st.sub.mip + size_t{st.sub.slice} * mips];
-            const bool zero = std::all_of(st.bytes.begin(), st.bytes.end(), [](uint8_t b) { return b == 0; });
+            const bool zero = all_zero_bytes(st.bytes.data(), st.bytes.size());
             if (seen == st.hash || (seen == 0 && zero)) {
                 continue;  // unchanged, or still zero as the GPU texture was created
             }
@@ -782,7 +868,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (!read_guest_best_effort(cpu_address_for_gpu(r.va), bytes.data(), bytes.size())) {
                 continue;
             }
-            const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+            const uint64_t hash = content_hash(bytes.data(), bytes.size());
             if (r.ever_uploaded && hash == r.last_hash) {
                 continue;
             }
@@ -807,7 +893,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (!read_guest_best_effort(cpu_address_for_gpu(key.first), bytes.data(), bytes.size())) {
                 continue;
             }
-            const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+            const uint64_t hash = content_hash(bytes.data(), bytes.size());
             if (hash == r.last_hash) {
                 continue;
             }
@@ -898,7 +984,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     if (!read_guest_best_effort(cpu_va, bytes.data(), bytes.size())) {
         return false;
     }
-    const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+    const uint64_t hash = content_hash(bytes.data(), bytes.size());
     const uint64_t write_len = align_up(size, 4u);
     bytes.resize(static_cast<size_t>(write_len), 0);
 
@@ -1031,7 +1117,7 @@ bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id,
     if (!read_guest_best_effort(cpu_va, bytes.data(), bytes.size())) {
         return false;
     }
-    const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+    const uint64_t hash = content_hash(bytes.data(), bytes.size());
     const uint64_t buffer_bytes = align_up(size, 4u);
     bytes.resize(static_cast<size_t>(buffer_bytes), 0);
 
@@ -1402,7 +1488,7 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
         // GPU-window addresses read their bytes from the CPU window (Device::register_gpu_alias).
         const uint64_t cpu = r->device_->cpu_address_for_gpu(r->gpu_va_);
         const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(len)));
-        if (bytes == nullptr || std::all_of(bytes, bytes + len, [](uint8_t b) { return b == 0; })) {
+        if (bytes == nullptr || all_zero_bytes(bytes, static_cast<size_t>(len))) {
             continue;
         }
         r->probe_seen_data_ = true;
@@ -1425,7 +1511,7 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
             continue;
         }
         const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(v.cpu, static_cast<size_t>(v.len)));
-        if (bytes == nullptr || std::all_of(bytes, bytes + v.len, [](uint8_t b) { return b == 0; })) {
+        if (bytes == nullptr || all_zero_bytes(bytes, static_cast<size_t>(v.len))) {
             continue;
         }
         v.seen_data = true;

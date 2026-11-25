@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -1828,6 +1829,26 @@ void test_all_subresource_uploads() {
         }
         CHECK(device->stats().textures_uploaded == uploads + 2);
 
+        // Inside one submission a texture is read once: a change made between two bind groups of
+        // the same ExecuteCommandLists reaches the GPU with the next submission.
+        device->begin_submission();
+        fill(2, 0, 4);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        gpu::CommandEncoder e5a;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e5a));
+        fill(3, 0, 5);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        gpu::CommandEncoder e5b;
+        CHECK(!device->sync_bound_texture_memory(tex->id(), e5b));
+        CHECK(writes(e5b).empty());
+        device->end_submission();
+        device->begin_submission();
+        gpu::CommandEncoder e6;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e6));
+        CHECK(writes(e6).size() == 1);
+        device->end_submission();
+        CHECK(device->stats().textures_uploaded == uploads + 4);
+
         // Console linear 0x100 with a mip chain (#678): every mip uploads from its addrlib
         // ADDR_SW_LINEAR offset (smallest mip first, 256 B pitch), inside the allocation size.
         {
@@ -2247,7 +2268,49 @@ void test_fence_completion_and_ref_lifetime() {
     com::set_guest_memory(nullptr);
 }
 
+// content_hash / all_zero_bytes: the change detection of mirrored guest memory sees every
+// single-bit change at every position and length (lane boundaries, word tails, byte tails).
+void test_content_hash_change_detection() {
+    namespace dg = playgta6::gpu::d3d12_guest;
+    std::vector<uint8_t> buf(203);
+    for (size_t i = 0; i < buf.size(); ++i) {
+        buf[i] = static_cast<uint8_t>(i * 37u + 11u);
+    }
+    int missed = 0;
+    for (size_t len = 0; len <= buf.size(); ++len) {
+        const uint64_t base = dg::content_hash(buf.data(), len);
+        CHECK(dg::content_hash(buf.data(), len) == base);
+        if (len > 0) {
+            CHECK(dg::content_hash(buf.data(), len - 1) != base);
+        }
+        for (size_t pos = 0; pos < len; ++pos) {
+            for (int bit = 0; bit < 8; bit += 3) {
+                buf[pos] ^= static_cast<uint8_t>(1u << bit);
+                missed += dg::content_hash(buf.data(), len) == base ? 1 : 0;
+                buf[pos] ^= static_cast<uint8_t>(1u << bit);
+            }
+        }
+    }
+    CHECK(missed == 0);
+    // Swapped words (same multiset of bytes) hash differently.
+    std::vector<uint8_t> swapped(buf.begin(), buf.begin() + 64);
+    std::swap_ranges(swapped.begin(), swapped.begin() + 8, swapped.begin() + 8);
+    CHECK(dg::content_hash(swapped.data(), 64) != dg::content_hash(buf.data(), 64));
+
+    std::vector<uint8_t> zero(300, 0);
+    for (size_t len = 0; len <= zero.size(); len += 7) {
+        CHECK(dg::all_zero_bytes(zero.data(), len));
+    }
+    for (size_t pos = 0; pos < zero.size(); ++pos) {
+        zero[pos] = 1;
+        CHECK(!dg::all_zero_bytes(zero.data(), zero.size()));
+        CHECK(dg::all_zero_bytes(zero.data(), pos));
+        zero[pos] = 0;
+    }
+}
+
 int main() {
+    test_content_hash_change_detection();
     test_seam_conversions();
     test_memory_backed_tables();
     test_representative_command_list();

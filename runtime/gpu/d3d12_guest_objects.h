@@ -552,6 +552,9 @@ struct TrackedTexture {
     uint32_t sample_count = 1;
     uint64_t last_upload_hash = 0;  // whole source surface
     bool ever_uploaded = false;
+    // Submission (Device::begin_submission) that last looked at this texture: a texture bound in
+    // several bind groups or lists of one ExecuteCommandLists is read and hashed once.
+    uint64_t synced_submission = 0;
     // Per subresource (mip + array_slice * mip_levels): hash of the last uploaded linear texels,
     // 0 = never uploaded (the GPU texture is still zero there).
     std::vector<uint64_t> subresource_hashes;
@@ -820,6 +823,10 @@ public:
     bool tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const;
     void set_detile_fn(DetileFn fn);
     bool sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& encoder);
+    // Brackets one ExecuteCommandLists on the calling thread: inside it each tracked texture is
+    // synced at most once (TrackedTexture::synced_submission).
+    void begin_submission();
+    void end_submission();
     // Marks a texture as the destination of a recorded copy (CopyTextureRegion). The copy writes
     // texels in API coordinates and defines the contents from then on; the guest memory at the
     // texture's address is no longer uploaded (or de-tiled) over it.

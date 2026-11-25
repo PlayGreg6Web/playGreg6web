@@ -187,11 +187,13 @@ void CommandQueue::execute(const std::vector<uint64_t>& lists) {
     }
     // One submission: changed CPU-visible buffers, then each list's CPU-sourced copies and packets.
     std::vector<CommandEncoder> parts(1 + resolved.size());
+    device_->begin_submission();
     device_->flush_cpu_buffers(parts[0]);
     std::vector<d3d::StateDiagnostic> state_diags;
     for (size_t i = 0; i < resolved.size(); ++i) {
         resolved[i]->append_submission(parts[i + 1], &state_diags);
     }
+    device_->end_submission();
     std::vector<std::pair<const uint8_t*, size_t>> spans;
     for (const CommandEncoder& e : parts) {
         spans.emplace_back(e.data(), e.size());
