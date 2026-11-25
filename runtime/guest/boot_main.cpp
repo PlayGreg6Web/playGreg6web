@@ -92,6 +92,7 @@
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
+#include "os/audio_report.h"
 #include "os/audio_wav_dump.h"
 #include "os/os_shim.h"
 #include "os/vmem.h"
@@ -1045,6 +1046,23 @@ int main(int argc, char** argv) {
                 o += std::string(i == 0 ? "" : ", ") + "\"" + dg::work_name(w) + "\": " + std::to_string(dg::work_total(w));
             }
             o += "}";
+            {
+                namespace ar = os::audio_report;
+                const os::scarlett::guest_api::AudioEndpointStats a = os::scarlett::guest_api::audio_endpoint_stats();
+                const os::scarlett::guest_api::XApuStats x = os::scarlett::guest_api::xapu_stats();
+                ar::Totals t;
+                t.render_frames = a.render_frames;
+                t.render_nonzero_frames = a.render_nonzero_frames;
+                t.render_silent_releases = a.render_silent_releases;
+                t.spatial_passes = a.spatial_passes;
+                t.spatial_object_buffers = a.spatial_object_buffers;
+                t.spatial_nonzero_buffers = a.spatial_nonzero_buffers;
+                t.xapu_decoded_packets = x.decoded_packets;
+                t.xapu_failed_packets = x.failed_packets;
+                t.xapu_results_posted = x.type3_results;
+                o += ",
+  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
+            }
             if (s_with_presents) {
                 o += ",\n  \"presents\": " + gpu::frame_capture_presents_json();
             }

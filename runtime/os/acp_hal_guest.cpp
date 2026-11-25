@@ -512,6 +512,9 @@ XApuStats xapu_stats() {
     s.decoded_packets = xapu().decoded_packets;
     s.failed_packets = xapu().failed_packets;
     s.decoded_bytes = xapu().decoded_bytes;
+    if (const auto t3 = xapu().commands.find(3); t3 != xapu().commands.end()) {
+        s.type3_results = t3->second;
+    }
     return s;
 }
 

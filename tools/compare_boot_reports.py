@@ -28,6 +28,8 @@ What is compared (section names are the prefixes of the field paths used by --ig
                count and reserved peak
   gpu_work     draws / dispatches issued, emitted and skipped by reason (count tolerance;
                both reports must carry it)
+  audio        totals, non_silent_fraction and per-window non-silent frames (count tolerance;
+               both reports must carry it)
   memory.alias XMem alias_slots / alias_conflicts (count tolerance; both reports must carry it)
   import_trace import-call counts by name up to the first Present, overall and on the busiest
                thread (count tolerance); from the report's first_present or the import traces
@@ -370,6 +372,18 @@ def compare_progress(c: Comparison, ra: dict[str, Any], rb: dict[str, Any]) -> N
     wa, wb = ra.get("gpu_work"), rb.get("gpu_work")
     if isinstance(wa, dict) and isinstance(wb, dict):
         c.mapping("gpu_work", wa, wb, "count")
+
+    aua, aub = ra.get("audio"), rb.get("audio")
+    if isinstance(aua, dict) and isinstance(aub, dict):
+        for key in sorted(set(aua) | set(aub)):
+            va, vb = aua.get(key), aub.get(key)
+            if key == "non_silent_frames_per_window":
+                va, vb = va or [], vb or []
+                c.count("audio.windows", len(va), len(vb))
+                for i in range(min(len(va), len(vb))):
+                    c.count(f"audio.{key}[{i}]", va[i], vb[i])
+            else:
+                c.count(f"audio.{key}", va, vb)
 
     def alias(r: dict[str, Any]) -> dict[str, Any]:
         mem = r.get("memory") if isinstance(r.get("memory"), dict) else {}

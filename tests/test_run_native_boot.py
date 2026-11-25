@@ -436,5 +436,22 @@ class ThumbnailTests(unittest.TestCase):
             self.assertIn("--gpu-capture-payloads", lines[0])
 
 
+class AudioLineTests(unittest.TestCase):
+    def test_audio_line_summarizes_section(self):
+        report = {"audio": {"render_frames": 4800, "non_silent_fraction": 0.5, "spatial_passes": 3,
+             "xapu_decoded_packets": 9, "xapu_failed_packets": 1, "xapu_results_posted": 10,
+             "non_silent_frames_per_window": [2400, 0, 0]}}
+        line = rnb.audio_line(report)
+        self.assertEqual(
+            line,
+            "audio: 4800 frames, 50.0% non-silent (1/3 windows), spatial passes 3, "
+            "xapu decoded 9 / failed 1 / results 10")
+        self.assertIn(line, rnb.digest(report, 0))
+
+    def test_no_audio_section_no_line(self):
+        self.assertIsNone(rnb.audio_line({}))
+        self.assertNotIn("audio:", rnb.digest({}, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

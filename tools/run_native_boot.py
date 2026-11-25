@@ -309,6 +309,20 @@ def timeline_presents(report: dict) -> list:
     return report.get("presents") or screen_timeline.presents_from_samples(report.get("present_samples") or [])
 
 
+def audio_line(report: dict) -> str | None:
+    """One-line summary of the report's `audio` section (None when the report has none)."""
+    a = report.get("audio")
+    if not isinstance(a, dict):
+        return None
+    windows = a.get("non_silent_frames_per_window") or []
+    live = sum(1 for w in windows if w)
+    fraction = a.get("non_silent_fraction") or 0
+    return (f"audio: {a.get('render_frames', 0)} frames, {fraction * 100:.1f}% non-silent "
+            f"({live}/{len(windows)} windows), spatial passes {a.get('spatial_passes', 0)}, "
+            f"xapu decoded {a.get('xapu_decoded_packets', 0)} / failed {a.get('xapu_failed_packets', 0)} "
+            f"/ results {a.get('xapu_results_posted', 0)}")
+
+
 def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     lines = [f"status: {report.get('status')} (phase {report.get('phase')}, exit_code {report.get('exit_code')}, "
              f"harness exit {exit_code}), {report.get('elapsed_ms')} ms"]
@@ -336,6 +350,9 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
                     if re.search(r"draw|dispatch|upload|copy|clear", k) and v}
         for k, v in list(counters.items())[:max_counters]:
             lines.append(f"  {k}: {v}")
+    audio = audio_line(report)
+    if audio:
+        lines.append(audio)
     fault = report.get("fault")
     if isinstance(fault, dict):
         func = (fault.get("function") or {}).get("entry")

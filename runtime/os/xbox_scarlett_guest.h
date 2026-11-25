@@ -440,6 +440,7 @@ struct XApuStats {
     uint64_t decoded_packets = 0;
     uint64_t failed_packets = 0;
     uint64_t decoded_bytes = 0;
+    uint64_t type3_results = 0;  // type-3 results posted (one per decode command)
 };
 XApuStats xapu_stats();
 

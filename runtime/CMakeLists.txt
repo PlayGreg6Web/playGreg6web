@@ -335,6 +335,10 @@ else()
     target_link_libraries(test_audio_wav_dump PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_wav_dump_tests COMMAND test_audio_wav_dump)
 
+    add_executable(test_audio_report ../tests/test_audio_report.cpp)
+    target_link_libraries(test_audio_report PRIVATE playgta6_core)
+    add_test(NAME playgta6_audio_report_tests COMMAND test_audio_report)
+
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
     if(PLAYGTA6_OPUS)

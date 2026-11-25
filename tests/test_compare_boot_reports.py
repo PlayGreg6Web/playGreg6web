@@ -1373,5 +1373,30 @@ class PresentFpsAvgAndMinRatioTests(unittest.TestCase):
         )
 
 
+class AudioCompareTests(unittest.TestCase):
+    def audio(self, **over):
+        a = {"render_frames": 4800, "non_silent_fraction": 0.5, "xapu_decoded_packets": 9,
+             "non_silent_frames_per_window": [2400, 0]}
+        a.update(over)
+        r = make_report()
+        r["audio"] = a
+        return r
+
+    def test_within_tolerance_passes(self):
+        c = cbr.compare(self.audio(), self.audio(render_frames=4801), cbr.Tolerances())
+        self.assertEqual(c.failures(), [])
+
+    def test_window_and_total_differences_fail(self):
+        b = self.audio(xapu_decoded_packets=0, non_silent_frames_per_window=[0, 0, 5])
+        fields = {e["field"] for e in cbr.compare(self.audio(), b, cbr.Tolerances()).failures()}
+        self.assertIn("audio.xapu_decoded_packets", fields)
+        self.assertIn("audio.windows", fields)
+        self.assertIn("audio.non_silent_frames_per_window[0]", fields)
+
+    def test_one_sided_audio_is_skipped(self):
+        c = cbr.compare(self.audio(), make_report(), cbr.Tolerances())
+        self.assertFalse([e for e in c.failures() if e["field"].startswith("audio")])
+
+
 if __name__ == "__main__":
     unittest.main()
