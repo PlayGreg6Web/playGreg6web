@@ -2,9 +2,15 @@
 #include "gpu/gpu_va_watch.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 #include "gpu/gfx10_detile.h"
@@ -200,6 +206,153 @@ bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n) {
     return std::memcmp(a, b, n) == 0;
 }
 #endif
+
+namespace {
+
+// R40: helper threads for the shadow comparison. XMem physical pages are file views in the arena's
+// shared zone, which cannot carry MEM_WRITE_WATCH, so the CPU-visible buffers placed there are
+// compared whole at every submission: a memory-bandwidth-bound memcmp on the submitting (guest
+// render) thread, ~72% of its time in the menu flow (several GB per second of comparison). Split
+// across the caller and three helpers it runs ~1.7x faster in the boot (3.7 -> 6.1 GB/s; ~2x on
+// an idle machine). run() hands out parts to the helpers and the caller alike and returns when all
+// are done; concurrent callers take turns.
+#if !defined(__EMSCRIPTEN__)
+class ComparePool {
+public:
+    static ComparePool& get() {
+        static ComparePool* pool = new ComparePool();  // never destroyed: helpers run until exit
+        return *pool;
+    }
+
+    unsigned helpers() const { return static_cast<unsigned>(threads_.size()); }
+
+    void run(unsigned parts, const std::function<void(unsigned)>& fn) {
+        std::lock_guard<std::mutex> turn(run_mutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            fn_ = &fn;
+            parts_ = parts;
+            next_.store(0, std::memory_order_relaxed);
+            done_.store(0, std::memory_order_relaxed);
+            generation_.fetch_add(1, std::memory_order_release);
+        }
+        wake_.notify_all();
+        drain(fn, parts);
+        // What is left is at most one part per helper (tens of microseconds): spin rather than pay
+        // a blocking wait's wake-up latency once per buffer.
+        auto finished = [&] {
+            return done_.load(std::memory_order_acquire) == parts && active_.load(std::memory_order_acquire) == 0;
+        };
+        spin_until(finished);
+        std::unique_lock<std::mutex> lock(mutex_);
+        finished_.wait(lock, finished);  // (under the lock: no helper can join after this)
+        fn_ = nullptr;                   // a helper waking late finds no work
+    }
+
+private:
+    ComparePool() {
+        const unsigned cores = std::thread::hardware_concurrency();
+        const unsigned helpers = std::min(3u, cores / 4);  // bandwidth-bound: 4 threads get most of it
+        for (unsigned i = 0; i < helpers; ++i) {
+            threads_.emplace_back([this] { helper(); });
+        }
+        for (std::thread& t : threads_) {
+            t.detach();
+        }
+    }
+
+    void drain(const std::function<void(unsigned)>& fn, unsigned parts) {
+        for (;;) {
+            const unsigned k = next_.fetch_add(1, std::memory_order_relaxed);
+            if (k >= parts) {
+                return;
+            }
+            fn(k);
+            if (done_.fetch_add(1, std::memory_order_acq_rel) + 1 == parts) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                finished_.notify_all();
+            }
+        }
+    }
+
+    // Spins (yielding) for up to ~200 us until `ready()`.
+    template <typename Ready>
+    static void spin_until(const Ready& ready) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(200);
+        while (!ready()) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    void helper() {
+        uint64_t seen = 0;
+        for (;;) {
+            // A flush compares its buffers back to back: wait for the next one spinning first.
+            spin_until([&] { return generation_.load(std::memory_order_acquire) != seen; });
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait(lock, [&] { return generation_.load(std::memory_order_relaxed) != seen; });
+            seen = generation_.load(std::memory_order_relaxed);
+            if (fn_ == nullptr) {
+                continue;
+            }
+            const std::function<void(unsigned)>* fn = fn_;
+            const unsigned parts = parts_;
+            active_.fetch_add(1, std::memory_order_relaxed);  // (under mutex_, while fn_ is set)
+            lock.unlock();
+            drain(*fn, parts);
+            if (active_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> relock(mutex_);
+                finished_.notify_all();
+            }
+        }
+    }
+
+    std::mutex run_mutex_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::condition_variable finished_;
+    const std::function<void(unsigned)>* fn_ = nullptr;  // guarded by mutex_
+    unsigned parts_ = 0;                                 // guarded by mutex_
+    std::atomic<uint64_t> generation_{0};                // changed under mutex_
+    std::atomic<unsigned> active_{0};                    // helpers inside drain(); joins under mutex_
+    std::atomic<unsigned> next_{0};
+    std::atomic<unsigned> done_{0};
+    std::vector<std::thread> threads_;
+};
+#endif
+
+}  // namespace
+
+void compare_pages(size_t pages,
+                   uint64_t bytes,
+                   const std::function<bool(size_t)>& same,
+                   std::vector<uint8_t>* changed) {
+    changed->assign(pages, 0);
+    auto compare = [&](size_t first, size_t last) {
+        for (size_t i = first; i < last; ++i) {
+            (*changed)[i] = same(i) ? 0 : 1;
+        }
+    };
+#if !defined(__EMSCRIPTEN__)
+    constexpr uint64_t kPartBytes = 256u << 10;
+    constexpr uint64_t kParallelMinBytes = 1u << 20;
+    ComparePool& pool = ComparePool::get();
+    if (pool.helpers() != 0 && pages != 0 && bytes >= kParallelMinBytes) {
+        const uint64_t page_size = std::max<uint64_t>(1, bytes / pages);
+        const size_t per_part = static_cast<size_t>(std::max<uint64_t>(1, kPartBytes / page_size));
+        const unsigned parts = static_cast<unsigned>((pages + per_part - 1) / per_part);
+        pool.run(parts, [&](unsigned k) {
+            const size_t first = static_cast<size_t>(k) * per_part;
+            compare(first, std::min(pages, first + per_part));
+        });
+        return;
+    }
+#endif
+    compare(0, pages);
+}
 
 uint64_t shader_identity(const void* data, size_t size) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -1827,10 +1980,18 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
         }
         return;
     }
+    // Every page is compared here (no candidates, or verification): the bulk of the work when the
+    // buffer has no write tracking (R40: split across helper threads, compare_pages).
+    std::vector<uint8_t> differs;
+    compare_pages(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), size,
+                  [&](size_t i) {
+                      const uint64_t page = static_cast<uint64_t>(i) * kShadowPage;
+                      return shadow_same(page, live + page, std::min(kShadowPage, size - page));
+                  },
+                  &differs);
     for (uint64_t page = 0; page < size; page += kShadowPage) {
-        const uint64_t n = std::min(kShadowPage, size - page);
         const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
-        const bool changed = (listed || verify) && !shadow_same(page, live + page, n);
+        const bool changed = differs[static_cast<size_t>(page / kShadowPage)] != 0;
         if (changed && !listed && !os::guest_window::write_marked(cpu_va_ + page)) {
             // (A slot marked by now was written while this flush compared: not missed, and its
             // mark reports it again.)

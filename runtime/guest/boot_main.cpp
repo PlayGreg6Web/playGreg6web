@@ -534,26 +534,66 @@ std::string profile_symbol(uint64_t pc) {
     return name;
 }
 
-std::string profile_label(uint64_t pc, uint32_t thread_id) {
-    uint64_t offset = 0;
-    if (const uint64_t fn = guest::guest_function_for_host_pc(pc, &offset)) {
-        char text[40];
-        std::snprintf(text, sizeof(text), "guest sub_%" PRIX64, fn);
-        return text;
+// The return address of the function containing `ctx.Rip`: a leaf function (no unwind data) has
+// it on top of the stack (`top`, copied while the thread was suspended); otherwise one virtual
+// unwind step (on the live stack, after the resume: a statistical answer, not an exact one).
+uint64_t profile_caller(const CONTEXT& ctx, uint64_t top) {
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+    if (entry == nullptr) {
+        return top;
     }
+    CONTEXT unwound = ctx;
+    void* handler_data = nullptr;
+    DWORD64 establisher = 0;
+    __try {
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &unwound, &handler_data, &establisher,
+                         nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return unwound.Rip;
+}
+
+std::string profile_module(uint64_t pc) {
     HMODULE module = nullptr;
-    std::string where = "runtime";
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCWSTR>(static_cast<uintptr_t>(pc)), &module) &&
         module != GetModuleHandleW(nullptr)) {
         char path[MAX_PATH] = {};
         GetModuleFileNameA(module, path, MAX_PATH);
         const char* base = std::strrchr(path, '\\');
-        where = std::string("os ") + (base != nullptr ? base + 1 : path);
+        return std::string("os ") + (base != nullptr ? base + 1 : path);
     }
+    return "runtime";
+}
+
+std::string profile_label(const CONTEXT& ctx, uint64_t top, uint32_t thread_id) {
+    const uint64_t pc = ctx.Rip;
+    uint64_t offset = 0;
+    if (const uint64_t fn = guest::guest_function_for_host_pc(pc, &offset)) {
+        char text[40];
+        std::snprintf(text, sizeof(text), "guest sub_%" PRIX64, fn);
+        return text;
+    }
+    std::string where = profile_module(pc);
     const std::string symbol = profile_symbol(pc);
     if (!symbol.empty()) {
         where += " " + symbol;
+    }
+    // In a system DLL: name who called it (a memchr or a wait says little without its caller).
+    if (where.compare(0, 3, "os ") == 0) {
+        if (const uint64_t caller = profile_caller(ctx, top)) {
+            uint64_t caller_offset = 0;
+            if (const uint64_t fn = guest::guest_function_for_host_pc(caller, &caller_offset)) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " <- guest sub_%" PRIX64, fn);
+                where += text;
+            } else {
+                const std::string caller_symbol = profile_symbol(caller);
+                where += " <- " + (caller_symbol.empty() ? profile_module(caller) : caller_symbol);
+            }
+        }
     }
     const std::string last = guest::guest_thread_last_import(thread_id);
     return where + " (last import " + (last.empty() ? "none" : last) + ")";
@@ -571,11 +611,15 @@ void profile_loop(uint64_t interval_us) {
                 continue;
             }
             CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_CONTROL;
+            ctx.ContextFlags = CONTEXT_FULL;
             const bool ok = GetThreadContext(t.handle, &ctx) != 0;
+            uint64_t top = 0;  // a leaf function's return address (profile_caller)
+            if (ok && ctx.Rsp != 0) {
+                std::memcpy(&top, reinterpret_cast<const void*>(static_cast<uintptr_t>(ctx.Rsp)), sizeof(top));
+            }
             ResumeThread(t.handle);
             if (ok) {
-                ++g_profile_labels[t.id][profile_label(ctx.Rip, t.id)];
+                ++g_profile_labels[t.id][profile_label(ctx, top, t.id)];
             }
         }
         std::this_thread::sleep_for(std::chrono::microseconds(interval_us));

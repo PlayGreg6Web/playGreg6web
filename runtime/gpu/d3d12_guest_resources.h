@@ -64,6 +64,7 @@
 // commits its resource states to the device registry (G6 ResourceStateRegistry::execute).
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -76,6 +77,14 @@ namespace playgta6::gpu::d3d12_guest {
 // O36: whether `n` bytes at `a` and `b` are equal (memcmp == 0); on wasm64 a SIMD compare, which
 // flush_shadow uses for the shadow comparison of CPU-visible buffers.
 bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n);
+// R40: the shadow comparison of a CPU-visible buffer, page by page: (*changed)[i] = 0 when
+// same(i), else 1, for the `pages` pages of `bytes` bytes in all. Natively a comparison of 1 MiB or
+// more is split across a few helper threads (memory-bandwidth bound), so `same` must be safe to
+// call concurrently for different pages.
+void compare_pages(size_t pages,
+                   uint64_t bytes,
+                   const std::function<bool(size_t)>& same,
+                   std::vector<uint8_t>* changed);
 
 // FNV-1a 64 over `size` bytes (shader identity, see the header comment).
 uint64_t shader_identity(const void* data, size_t size);

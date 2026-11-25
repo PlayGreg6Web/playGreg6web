@@ -2,6 +2,7 @@
 // a hand-written "lifted" caller sets up Win64 arguments, loads `[this]` and calls a vtable slot
 // (or a flat export) through __playgta6_indirect_call. Synthetic data only.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -5735,6 +5736,106 @@ void test_same_bytes() {
     }
 }
 
+// R40: the page-wise shadow comparison (split across helper threads from 1 MiB) reports exactly
+// the pages holding a difference, for sizes below and above the split and a short last page, and
+// from several threads at once. Prints the ns per 4 KiB page of a 64 MiB comparison against a
+// single-threaded same_bytes loop (the old flush_shadow path).
+void test_compare_shadow_pages() {
+    constexpr uint64_t kPage = 4096;
+    // flush_shadow's use: page i is the same when its shadow bytes equal the live bytes.
+    const auto compare_shadow = [](const uint8_t* shadow, const uint8_t* live, uint64_t size, uint64_t page,
+                                   std::vector<uint8_t>* changed) {
+        dg::compare_pages(static_cast<size_t>((size + page - 1) / page), size,
+                          [&](size_t i) {
+                              const uint64_t at = static_cast<uint64_t>(i) * page;
+                              return dg::same_bytes(shadow + at, live + at, static_cast<size_t>(std::min(page, size - at)));
+                          },
+                          changed);
+    };
+    const uint64_t sizes[] = {1, kPage - 1, kPage, 3 * kPage + 5, (uint64_t{1} << 20) - 1, uint64_t{1} << 20,
+                              (uint64_t{5} << 20) + 123};
+    for (uint64_t size : sizes) {
+        std::vector<uint8_t> shadow(static_cast<size_t>(size));
+        for (size_t i = 0; i < shadow.size(); ++i) {
+            shadow[i] = static_cast<uint8_t>(i * 131u + 7u);
+        }
+        std::vector<uint8_t> live = shadow;
+        const size_t pages = static_cast<size_t>((size + kPage - 1) / kPage);
+        std::vector<uint8_t> changed;
+        compare_shadow(shadow.data(), live.data(), size, kPage, &changed);
+        CHECK(changed.size() == pages);
+        CHECK(std::count(changed.begin(), changed.end(), uint8_t{1}) == 0);
+        // One byte in the first, a middle and the last page (its last byte).
+        std::vector<size_t> touched = {0, pages / 2, pages - 1};
+        live[0] ^= 1u;
+        live[static_cast<size_t>((pages / 2) * kPage + 17 < size ? (pages / 2) * kPage + 17 : 0)] ^= 2u;
+        live[live.size() - 1] ^= 4u;
+        compare_shadow(shadow.data(), live.data(), size, kPage, &changed);
+        for (size_t p = 0; p < pages; ++p) {
+            const bool expect = std::find(touched.begin(), touched.end(), p) != touched.end() &&
+                                std::memcmp(shadow.data() + p * kPage, live.data() + p * kPage,
+                                            static_cast<size_t>(std::min<uint64_t>(kPage, size - p * kPage))) != 0;
+            CHECK((changed[p] != 0) == expect);
+        }
+    }
+    // Concurrent callers take turns on the helper threads and each gets its own answer.
+    {
+        constexpr uint64_t kSize = uint64_t{4} << 20;
+        std::vector<std::thread> threads;
+        std::atomic<int> wrong{0};
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&, t] {
+                std::vector<uint8_t> shadow(static_cast<size_t>(kSize), 0x5a);
+                std::vector<uint8_t> live = shadow;
+                const size_t page = static_cast<size_t>(t * 97 + 3);
+                live[page * kPage + 11] = 0;
+                std::vector<uint8_t> changed;
+                for (int round = 0; round < 20; ++round) {
+                    compare_shadow(shadow.data(), live.data(), kSize, kPage, &changed);
+                    for (size_t p = 0; p < changed.size(); ++p) {
+                        if ((changed[p] != 0) != (p == page)) {
+                            ++wrong;
+                        }
+                    }
+                }
+            });
+        }
+        for (std::thread& t : threads) {
+            t.join();
+        }
+        CHECK(wrong.load() == 0);
+    }
+    // Microbenchmark: a 64 MiB buffer equal to its shadow (the common case).
+    {
+        constexpr uint64_t kSize = uint64_t{64} << 20;
+        std::vector<uint8_t> shadow(static_cast<size_t>(kSize));
+        for (size_t i = 0; i < shadow.size(); i += 64) {
+            shadow[i] = static_cast<uint8_t>(i >> 6);
+        }
+        std::vector<uint8_t> live = shadow;
+        std::vector<uint8_t> changed;
+        auto best_ns = [&](auto&& fn) {
+            double best = 1e300;
+            for (int r = 0; r < 5; ++r) {
+                const auto t0 = std::chrono::steady_clock::now();
+                fn();
+                best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count());
+            }
+            return best / static_cast<double>(kSize / kPage);
+        };
+        size_t same = 0;
+        const double serial = best_ns([&] {
+            for (uint64_t at = 0; at < kSize; at += kPage) {
+                same += dg::same_bytes(shadow.data() + at, live.data() + at, kPage) ? 1 : 0;
+            }
+        });
+        const double split = best_ns([&] { compare_shadow(shadow.data(), live.data(), kSize, kPage, &changed); });
+        CHECK(same != 0);
+        std::printf("compare_shadow_pages 64 MiB: %.1f ns/page serial same_bytes, %.1f ns/page split (%.2fx)\n", serial,
+                    split, serial / split);
+    }
+}
+
 // O37: a CPU-visible buffer in the translated CPU window (the browser's) is flushed from the
 // window's write marks: the first flush compares everything; later ones only pages of slots marked
 // since, so an unmarked write is not seen (lifted code and host writers always mark) unless the
@@ -5879,6 +5980,7 @@ int main() {
     // harness turns it on); exercise that path here too.
     playgta6::os::set_write_tracking(true);
     test_same_bytes();
+    test_compare_shadow_pages();
     test_window_write_marks_flush();
     test_export_registration();
     test_create_device();
