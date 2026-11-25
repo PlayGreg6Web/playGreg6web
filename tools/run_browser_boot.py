@@ -82,6 +82,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
+import clean_build_dirs  # noqa: E402
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".c", ".cmake", ".txt", ".rs", ".toml"}
@@ -3942,6 +3943,7 @@ def _run(
         )
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
     print(f"[run] {repo_relative_label(run_dir, repo)}", file=sys.stderr, flush=True)
 
     session = session_runner(

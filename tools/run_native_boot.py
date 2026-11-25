@@ -63,6 +63,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
 import screen_timeline  # noqa: E402
+import clean_build_dirs  # noqa: E402
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".c", ".cmake", ".txt", ".rs", ".toml"}
@@ -547,6 +548,7 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(f"harness not found after the build: {harness}")
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    clean_build_dirs.write_marker(build_dir, "run_native_boot.py", repo)
     if preset["input"] and not args.input_script:
         script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)
