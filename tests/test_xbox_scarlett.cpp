@@ -196,6 +196,8 @@ void test_xmem_physical_virtual_and_transfer() {
         const uint64_t back[1] = {handles[2]};
         CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at_first, 1, back) == 1);
         CHECK(scatter_bytes[0] == 0x33 && scatter_bytes[kXMemPageSize4K - 1] == 0x33);
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at_gap, 1, none) == 1);
+        CHECK(pg6_xbox_XMemFreePhysicalPages(2, fresh) == 1);
     }
 
     // Standalone XMemVirtualAlloc reserve + in-place commit + XMemTransferMemory.
