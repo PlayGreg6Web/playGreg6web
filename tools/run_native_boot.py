@@ -185,7 +185,8 @@ def choose_build_dir(repo: Path, requested: Path | None, env: Mapping[str, str],
 
 
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
-              force: bool, harness_override: Path | None) -> tuple[Plan, Path, Path]:
+              force: bool, harness_override: Path | None,
+              rebuild_program: bool = False) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path."""
     program = build_dir / "program"
     recomp = repo / "target" / "release" / ("playgta6-recomp" + EXE_SUFFIX)
@@ -214,7 +215,8 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
     # The import bindings come from the runtime's shim headers and export tables: a new guest
     # thunk (e.g. combase!CoCreateInstance) is only bound once the program is generated again.
     shim_time = max([mtime(p) or 0.0 for p in shim_inputs(repo)] + [0.0])
-    reason = stale("program", manifest, [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0),
+    reason = "forced (--rebuild-program)" if rebuild_program else None
+    reason = reason or stale("program", manifest, [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0),
                                          ("the runtime shim headers or export tables", shim_time)])
     if reason is None and plan.has("recomp"):
         reason = "the recompiler is rebuilt"
@@ -318,6 +320,26 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     return "\n".join(lines)
 
 
+def shader_pack_hint(report: dict, shader_pack: Path | None) -> str | None:
+    """One line when no shader pack was given and most draws were dropped for want of a shader module."""
+    if shader_pack:
+        return None
+    work = report.get("gpu_work")
+    if not isinstance(work, dict):
+        return None
+    dropped = work.get("draws_no_shader_module")
+    if not isinstance(dropped, int) or dropped <= 0:
+        return None
+    total = work.get("draws_issued")
+    if not isinstance(total, int) or total < dropped:
+        total = dropped + (work.get("draws_emitted") if isinstance(work.get("draws_emitted"), int) else 0)
+    if dropped * 2 <= total:
+        return None
+    return (f"hint: no shader pack: {dropped} of {total} draws dropped (draws_no_shader_module); build one with "
+            "`cargo run --release -p playgta6-shaders -- pack-rdna2 <input-dir> --out <out.wgsl.pack>` "
+            "and pass --shader-pack")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Rebuild what is stale, run playgta6_boot with a preset or explicit options and keep the run. "
@@ -332,6 +354,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--runs-dir", type=Path, help="run directories (default <build-dir>/runs)")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     p.add_argument("--rebuild", action="store_true", help="rebuild every stage")
+    p.add_argument("--rebuild-program", action="store_true",
+                   help="regenerate the lifted program even when the stamps say it is current")
     p.add_argument("--no-build", action="store_true", help="fail instead of building a stale stage")
     p.add_argument("--trust-build", action="store_true",
                    help="skip the staleness checks and use the existing program and harness as they are")
@@ -375,8 +399,10 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     exe = args.exe or (Path(env["PLAYGTA6_EXE"]) if env.get("PLAYGTA6_EXE") else None)
     game_dir = args.game_dir or (Path(env["PLAYGTA6_GAME_DIR"]) if env.get("PLAYGTA6_GAME_DIR") else None)
     if exe is None or game_dir is None:
-        raise RunnerError("the game exe and package directory are required: --exe / --game-dir "
-                          "or PLAYGTA6_EXE / PLAYGTA6_GAME_DIR (they are never read from the repository)")
+        missing = ["--exe (or $PLAYGTA6_EXE)" if exe is None else "",
+                   "--game-dir (or $PLAYGTA6_GAME_DIR)" if game_dir is None else ""]
+        raise RunnerError("missing game paths: pass " + " and ".join(m for m in missing if m)
+                          + " (they are never read from the repository)")
     if not args.dry_run and not exe.is_file():
         raise RunnerError(f"exe not found: {exe}")
     if not args.dry_run and not game_dir.is_dir():
@@ -393,7 +419,8 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if run_dir.exists() and any(run_dir.iterdir()):
         raise RunnerError(f"run directory {run_dir} already exists (pick another --name)")
 
-    plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness)
+    plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
+                                      args.rebuild_program)
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
@@ -463,6 +490,9 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     text = digest(report, code)
     (run_dir / "digest.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
+    hint = shader_pack_hint(report, args.shader_pack)
+    if hint:
+        print(hint)
     if args.baseline:
         return compare_with_baseline(args, run_dir, runs_dir)
     return 0

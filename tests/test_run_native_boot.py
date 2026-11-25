@@ -194,6 +194,36 @@ class RunTests(unittest.TestCase):
                                 env=env, repo_root=fx.repo)
             self.assertEqual(code, 0)
 
+    def test_missing_paths_name_the_flags(self):
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(rnb.main(["--exe", "x"], env={}), 2)
+        self.assertIn("--game-dir", err.getvalue())
+        self.assertNotIn("--exe (", err.getvalue())
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(rnb.main([], env={}), 2)
+        self.assertIn("--exe", err.getvalue())
+        self.assertIn("--game-dir", err.getvalue())
+
+    def test_rebuild_program_forces_only_program_and_harness(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            code, _, err, calls = fx.run("--rebuild-program", "--name", "rp", "--dry-run")
+            self.assertEqual(code, 0, err)
+            self.assertIn("[plan] program: forced (--rebuild-program)", err)
+            self.assertNotIn("[plan] recomp", err)
+
+    def test_shader_pack_hint(self):
+        work = {"draws_issued": 100, "draws_emitted": 10, "draws_no_shader_module": 90}
+        hint = rnb.shader_pack_hint({"gpu_work": work}, None)
+        self.assertIn("no shader pack: 90 of 100 draws dropped", hint)
+        self.assertIn("pack-rdna2", hint)
+        self.assertIsNone(rnb.shader_pack_hint({"gpu_work": work}, Path("p.pack")))
+        self.assertIsNone(rnb.shader_pack_hint({"gpu_work": {"draws_issued": 100, "draws_no_shader_module": 10}}, None))
+        self.assertIsNone(rnb.shader_pack_hint({}, None))
+        self.assertIn("5 of 6", rnb.shader_pack_hint({"gpu_work": {"draws_emitted": 1, "draws_no_shader_module": 5}}, None))
+
     def test_run_directory_and_digest(self):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))
