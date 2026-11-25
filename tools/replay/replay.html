@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pg6trace replay</title>
+<style>body{background:#222;color:#ddd;font:13px monospace;margin:8px}canvas{width:960px;height:540px;display:block}pre{white-space:pre-wrap}</style>
+<script src="/workers/wgpu_worker.js"></script>
+<script src="/workers/render_state_packets.js"></script>
+<script src="/workers/texture_packets.js"></script>
+</head>
+<body>
+<canvas id="c" width="3840" height="2160"></canvas>
+<pre id="log"></pre>
+<script>
+// Driven by tools/replay_capture.py. Query: trace, pack (files under /data/), frames (last frame),
+// thumbat (comma list of frames to read back). Logs "swapchain frame N ... non-black ..." lines,
+// fills window.__thumbs ('swap<N>' -> PNG data URL) and ends with a "RESULT:" line.
+const log = (s) => { document.getElementById('log').textContent += s + '\n'; };
+const q = new URLSearchParams(location.search);
+window.__thumbs = {};
+function splitFrames(bytes) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const frames = []; let start = 0, off = 0;
+  while (off + 8 <= bytes.byteLength) {
+    const op = v.getUint16(off, true); off += 8 + v.getUint32(off + 4, true);
+    if (op === 7) { frames.push(bytes.slice(start, off)); start = off; }
+  }
+  if (start < bytes.byteLength) frames.push(bytes.slice(start));
+  return frames;
+}
+(async () => {
+  try {
+    if (!navigator.gpu) { log('RESULT: navigator.gpu unavailable'); return; }
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    const wanted = ['texture-compression-bc', 'depth32float-stencil8', 'float32-filterable', 'bgra8unorm-storage',
+                    'rg11b10ufloat-renderable', 'texture-formats-tier1'];
+    const device = await adapter.requestDevice({ requiredFeatures: wanted.filter((f) => adapter.features.has(f)) });
+    let errors = 0; device.onuncapturederror = (e) => { if (errors++ < 20) log('VALIDATION: ' + e.error.message); };
+    const ctx = document.getElementById('c').getContext('webgpu');
+    const origConfigure = ctx.configure.bind(ctx);
+    ctx.configure = (cfg) => origConfigure({ ...cfg, usage: (cfg.usage ?? GPUTextureUsage.RENDER_ATTACHMENT) | GPUTextureUsage.COPY_SRC });
+    const format = q.get('canvas') || navigator.gpu.getPreferredCanvasFormat();
+    ctx.configure({ device, format, alphaMode: 'opaque' });
+    const processor = new globalThis.PlayGta6Wgpu.WgpuCommandProcessor(device, ctx, { format, width: 3840, height: 2160 });
+    globalThis.PlayGta6RenderState.installRenderStatePackets(processor);
+    if (globalThis.PlayGta6TexturePackets) globalThis.PlayGta6TexturePackets.installTexturePackets(processor);
+    processor.loadWgslPack(await (await fetch('/data/' + q.get('pack'))).arrayBuffer(), q.get('pack'));
+    const frames = splitFrames(new Uint8Array(await (await fetch('/data/' + q.get('trace'))).arrayBuffer()));
+    log('trace: ' + frames.length + ' frames');
+    const thumbAt = (q.get('thumbat') || '').split(',').filter(Boolean).map(Number);
+    const n = Math.min(frames.length, parseInt(q.get('frames') || '1000000', 10) + 1);
+    const reads = [];
+    for (let i = 0; i < n; ++i) {
+      processor.executeCommandBuffer(frames[i].buffer);
+      if (thumbAt.includes(i)) {
+        const t = ctx.getCurrentTexture(), bpr = Math.ceil(t.width * 4 / 256) * 256;
+        const buf = device.createBuffer({ size: bpr * t.height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const enc = device.createCommandEncoder();
+        enc.copyTextureToBuffer({ texture: t }, { buffer: buf, bytesPerRow: bpr }, { width: t.width, height: t.height });
+        device.queue.submit([enc.finish()]);
+        reads.push({ frame: i, buf, bpr, w: t.width, h: t.height, fmt: t.format });
+      }
+      await device.queue.onSubmittedWorkDone();
+    }
+    for (const s of reads) {
+      await s.buf.mapAsync(GPUMapMode.READ);
+      const px = new Uint8Array(s.buf.getMappedRange());
+      let nz = 0, total = 0; const hist = new Set();
+      for (let y = 0; y < s.h; y += 4) for (let x = 0; x < s.w; x += 4) {
+        const o = y * s.bpr + x * 4, k = px[o] | (px[o + 1] << 8) | (px[o + 2] << 16);
+        ++total; if (k) ++nz; hist.add(k);
+      }
+      log('swapchain frame ' + s.frame + ' (' + s.w + 'x' + s.h + ' ' + s.fmt + '): non-black ' + nz + '/' + total +
+          ' (' + (100 * nz / total).toFixed(2) + '%), distinct ' + hist.size);
+      const tw = 960, th = Math.round(s.h * tw / s.w), c = document.createElement('canvas');
+      c.width = tw; c.height = th;
+      const g = c.getContext('2d'), img = g.createImageData(tw, th), bgr = s.fmt.startsWith('bgra');
+      for (let y = 0; y < th; ++y) for (let x = 0; x < tw; ++x) {
+        const o = Math.floor(y * s.h / th) * s.bpr + Math.floor(x * s.w / tw) * 4, i = (y * tw + x) * 4;
+        img.data[i] = px[o + (bgr ? 2 : 0)]; img.data[i + 1] = px[o + 1]; img.data[i + 2] = px[o + (bgr ? 0 : 2)]; img.data[i + 3] = 255;
+      }
+      g.putImageData(img, 0, 0);
+      window.__thumbs['swap' + s.frame] = c.toDataURL('image/png');
+      s.buf.unmap();
+    }
+    log('RESULT: replayed ' + n + ' frame(s), ' + errors + ' validation error(s)');
+  } catch (err) { log('RESULT: exception ' + (err && err.stack ? err.stack : err)); }
+})();
+</script>
+</body>
+</html>
