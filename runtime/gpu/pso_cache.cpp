@@ -328,7 +328,13 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
         case D::R8_UINT: return color(F::R8Uint);
         case D::R8_SNORM: return color(F::R8Snorm);
         case D::R8_SINT: return color(F::R8Sint);
-        case D::A8_UNORM: return color(F::R8Unorm);
+        // Alpha-only: shaders read (0, 0, 0, a) and render targets keep the output's alpha. WebGPU
+        // has no A8 format and r8unorm would hold the value in red (read as .x, written from .x),
+        // so the texture is rgba8unorm with the value in alpha (uploads widen each texel,
+        // widen_a8_texels; render targets write alpha only).
+        case D::A8_UNORM:
+            r.promoted = true;
+            return color(F::Rgba8Unorm);
         case D::R9G9B9E5_SHAREDEXP: return color(F::Rgb9e5Ufloat);
         case D::BC1_TYPELESS: return typeless_color(F::Bc1RgbaUnorm);
         case D::BC1_UNORM: return color(F::Bc1RgbaUnorm);
@@ -566,6 +572,19 @@ uint16_t to_half(float value) noexcept {
 }
 
 }  // namespace
+
+bool widen_a8_texels(DxgiFormat from, WgpuTextureFormat to, const uint8_t* src, size_t count, uint8_t* dst) noexcept {
+    if (from != DxgiFormat::A8_UNORM || to != WgpuTextureFormat::Rgba8Unorm || src == nullptr || dst == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        dst[i * 4 + 0] = 0;
+        dst[i * 4 + 1] = 0;
+        dst[i * 4 + 2] = 0;
+        dst[i * 4 + 3] = src[i];
+    }
+    return true;
+}
 
 bool convert_norm16_texels(DxgiFormat from, WgpuTextureFormat to, const uint8_t* src, size_t count,
                            uint8_t* dst) noexcept {
@@ -1344,6 +1363,10 @@ GraphicsPsoTranslation translate_graphics_pso(const D3D12GraphicsPsoDesc& desc, 
     for (uint32_t i = 0; i < kMaxColorTargets; ++i) {
         const D3D12RenderTargetBlendDesc& rt = bs.IndependentBlendEnable ? bs.RenderTarget[i] : bs.RenderTarget[0];
         k.color_targets[i] = lower_render_target_blend(rt, features, &diag);
+        if (i < desc.NumRenderTargets && desc.RTVFormats[i] == DxgiFormat::A8_UNORM) {
+            // An A8 target (rgba8unorm here, see describe_dxgi) stores only the output's alpha.
+            k.color_targets[i].write_mask &= D3D12ColorWriteEnable::Alpha;
+        }
     }
     k.multisample.alpha_to_coverage_enabled = bs.AlphaToCoverageEnable ? 1 : 0;
 

@@ -126,6 +126,12 @@ private:
 };
 
 class Resource;
+// A8_UNORM upload rows widened for the rgba8unorm texture that holds them (pso::widen_a8_texels):
+// `slices` x `rows` rows of `width` texels, `src_pitch` bytes apart (`slice_pitch` between slices),
+// into rows `*out_pitch` bytes apart (256-aligned), slice after slice. False (nothing written) when
+// the source does not hold that many bytes.
+bool widen_a8_rows(const uint8_t* src, size_t src_size, uint32_t width, uint32_t rows, uint32_t slices,
+                   uint32_t src_pitch, uint64_t slice_pitch, std::vector<uint8_t>* out, uint32_t* out_pitch);
 // --watch-gpu-va (gpu/gpu_va_watch.h): reports `r`'s memory range under `kind` when it is watched.
 // True when it was reported; `handle` (a descriptor written over `r`) is then remembered.
 bool va_watch_resource(const char* kind, const Resource* r, const std::string& detail, uint64_t handle = 0);
@@ -390,6 +396,7 @@ private:
         GpuWriteTexturePayload tex{};  // textures (data_len set)
         uint64_t src = 0;             // guest address of the source bytes
         uint64_t size = 0;
+        bool widen_a8 = false;        // A8_UNORM texels into an rgba8unorm texture (widen_a8_rows)
     };
 
     void note(const std::string& message);

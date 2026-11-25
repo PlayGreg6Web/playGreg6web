@@ -539,7 +539,11 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                     "enabled): uploads round each value to float16 (11-bit mantissa)");
         }
     }
-    if ((mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 && !convert_norm16) {
+    // A8_UNORM held as rgba8unorm: each texel widened to (0, 0, 0, a).
+    const bool convert_a8 = (mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 &&
+                            pso::widen_a8_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
+                                                 probe_src, 1, probe_dst);
+    if ((mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 && !convert_norm16 && !convert_a8) {
         // The GPU texture has a substitute format (e.g. rgba8unorm for BC without the feature):
         // the guest's texels do not fit it and are not converted. Skip, reported once per texture.
         bool first = false;
@@ -711,6 +715,17 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 pso::convert_norm16_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
                                            st.bytes.data() + static_cast<size_t>(r) * row_pitch, comps,
                                            converted.data() + static_cast<size_t>(r) * out_pitch);
+            }
+            st.bytes = std::move(converted);
+            st.row_pitch = static_cast<uint32_t>(out_pitch);
+        }
+        if (convert_a8) {
+            const uint64_t out_pitch = align_up(row_bytes * 4u, 256u);
+            std::vector<uint8_t> converted(static_cast<size_t>(out_pitch * by * md), 0);
+            for (uint32_t r = 0; r < by * md; ++r) {
+                pso::widen_a8_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
+                                     st.bytes.data() + static_cast<size_t>(r) * row_pitch, static_cast<size_t>(row_bytes),
+                                     converted.data() + static_cast<size_t>(r) * out_pitch);
             }
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
@@ -1249,7 +1264,28 @@ void Device::note_unsupported_copy(const std::string& message) {
 bool Device::upload_needs_conversion(uint32_t dxgi_format) const {
     const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(dxgi_format),
                                                                 pso::FormatUsage::Sampled, bridge_->options().features);
-    return m.supported() && (m.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0;
+    // A8_UNORM is converted on upload (widen_a8_rows).
+    return m.supported() && (m.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 &&
+           static_cast<pso::DxgiFormat>(dxgi_format) != pso::DxgiFormat::A8_UNORM;
+}
+
+bool widen_a8_rows(const uint8_t* src, size_t src_size, uint32_t width, uint32_t rows, uint32_t slices,
+                   uint32_t src_pitch, uint64_t slice_pitch, std::vector<uint8_t>* out, uint32_t* out_pitch) {
+    const uint64_t pitch = align_up(uint64_t{width} * 4u, 256u);
+    if (rows == 0 || slices == 0 ||
+        uint64_t{slices - 1} * slice_pitch + uint64_t{rows - 1} * src_pitch + width > src_size) {
+        return false;
+    }
+    out->assign(static_cast<size_t>(pitch * rows * slices), 0);
+    for (uint32_t z = 0; z < slices; ++z) {
+        for (uint32_t r = 0; r < rows; ++r) {
+            pso::widen_a8_texels(pso::DxgiFormat::A8_UNORM, pso::WgpuTextureFormat::Rgba8Unorm,
+                                 src + z * slice_pitch + uint64_t{r} * src_pitch, width,
+                                 out->data() + (uint64_t{z} * rows + r) * pitch);
+        }
+    }
+    *out_pitch = static_cast<uint32_t>(pitch);
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1818,6 +1854,20 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
     CommandEncoder enc;
     const bool is3d = desc_.Dimension == ResourceDimension::Texture3D;
     count_work(Work::TextureUploads);
+    if (desc_.Format == static_cast<uint32_t>(pso::DxgiFormat::A8_UNORM)) {
+        std::vector<uint8_t> wide;
+        uint32_t pitch = 0;
+        if (!widen_a8_rows(bytes.data(), bytes.size(), bw, rows, bd, row_pitch, depth_pitch, &wide, &pitch)) {
+            device_->note_bad_argument("WriteToSubresource: A8 source smaller than its box");
+            return kEInvalidArg;
+        }
+        enc.write_texture(id_, mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, pitch, rows, wide.data(),
+                          static_cast<uint32_t>(wide.size()));
+        device_->submit(enc);
+        device_->note_upload(wide.size());
+        device_->note_texture_upload();
+        return kSOk;
+    }
     enc.write_texture(id_, mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, row_pitch,
                       row_pitch != 0 ? depth_pitch / row_pitch : rows, bytes.data(), static_cast<uint32_t>(len));
     device_->submit(enc);

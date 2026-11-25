@@ -1779,6 +1779,44 @@ void test_gpu_va_watch_hooks() {
     scene.release_all({list, upload, tex, other, heap});
 }
 
+// G62: A8_UNORM textures are rgba8unorm with the value in alpha; an upload widens each texel to
+// (0, 0, 0, a) so shaders that read .a see the guest's value.
+void test_a8_upload_widened() {
+    Fixture fx;
+    Scene scene(fx);
+    const uint64_t list = scene.new_list();
+    const uint64_t upload = committed(fx, scene.device, 2, buffer_desc(256 * 4), 0xAC3);
+    const uint64_t tex = committed(fx, scene.device, 1, texture_desc(16, 4, 65, 0), 0x400);  // A8_UNORM
+    std::vector<uint8_t> src(256 * 4, 0);
+    for (uint32_t i = 0; i < src.size(); ++i) {
+        src[i] = static_cast<uint8_t>(i + 1);
+    }
+    CHECK(com::write_guest(object_of<dg::Resource>(upload)->cpu_address(), src.data(), src.size()));
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    dg::GuestTextureCopyLocation dst{};
+    dst.pResource = tex;
+    dg::GuestTextureCopyLocation srcloc{};
+    srcloc.pResource = upload;
+    srcloc.Type = 1;
+    srcloc.PlacedFootprint = {0, {65, 16, 4, 1, 256}};
+    fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst)), I(0), I(0), I(0), I(put(srcloc)), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+    const Packet* wt = find_op(ps, GpuOpcode::WriteTexture);
+    CHECK(wt != nullptr);
+    if (wt != nullptr) {
+        const auto t = payload_as<GpuWriteTexturePayload>(*wt);
+        CHECK(t.width == 16 && t.height == 4 && t.bytes_per_row == 256 && t.data_len == 256 * 4);
+        const uint8_t* d = wt->payload.data() + sizeof(GpuWriteTexturePayload);
+        // Row 0 texel 1 and row 1 texel 0: (0, 0, 0, guest byte).
+        CHECK(d[4] == 0 && d[5] == 0 && d[6] == 0 && d[7] == src[1]);
+        CHECK(d[256 + 3] == src[256]);
+    }
+    scene.release_all({list, upload, tex});
+}
+
 void test_copies_and_barriers() {
     Fixture fx;
     Scene scene(fx);
@@ -5524,6 +5562,7 @@ int main() {
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();
+    test_a8_upload_widened();
     test_gpu_va_watch_hooks();
     test_srgb_sibling_view_formats();
     test_bc_upload_needs_feature();

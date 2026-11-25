@@ -308,8 +308,10 @@ void test_texture_format_mapping() {
          FormatDiag::FeatureFallback},
         {D::R8_UNORM, FormatUsage::Sampled, 0, TF::R8Unorm, 0},
         {D::R8_UNORM, FormatUsage::RenderTarget, 0, TF::R8Unorm, 0},
-        {D::A8_UNORM, FormatUsage::Sampled, 0, TF::R8Unorm, 0},
-        {D::A8_UNORM, FormatUsage::RenderTarget, 0, TF::R8Unorm, 0},
+        // A8_UNORM: rgba8unorm holding the value in alpha (uploads widen, targets write alpha only).
+        {D::A8_UNORM, FormatUsage::Sampled, 0, TF::Rgba8Unorm, FormatDiag::FeatureFallback | FormatDiag::NeedsCpuConversion},
+        {D::A8_UNORM, FormatUsage::RenderTarget, 0, TF::Rgba8Unorm,
+         FormatDiag::FeatureFallback | FormatDiag::NeedsCpuConversion},
     };
     for (const Expect& e : expects) {
         const TextureFormatMapping m = map_texture_format(e.dxgi, e.usage, e.features);
@@ -404,7 +406,7 @@ void test_texture_format_mapping() {
         CHECK(d16.format == TF::Depth16Unorm);
         CHECK(d16.diagnostics == 0);
     }
-    // A8_UNORM maps cleanly to core r8unorm with no extra device features required.
+    // A8_UNORM maps to core rgba8unorm with no extra device features required.
     CHECK(map_texture_format(D::A8_UNORM, FormatUsage::Sampled, 0).required_features == 0);
     CHECK(map_texture_format(D::A8_UNORM, FormatUsage::RenderTarget, 0).required_features == 0);
     // Depth-sampling views carry the aspect.
@@ -516,6 +518,20 @@ void test_sampled_only_norm16() {
                                  reinterpret_cast<uint8_t*>(f)));
     CHECK(!convert_norm16_texels(D::R8G8B8A8_UNORM, TF::R32Float, reinterpret_cast<const uint8_t*>(unorm), 4,
                                  reinterpret_cast<uint8_t*>(f)));
+    // A8_UNORM texels widen to (0, 0, 0, a); other pairs are refused.
+    const uint8_t a8[3] = {0x00, 0x7f, 0xff};
+    uint8_t wide[12] = {};
+    CHECK(widen_a8_texels(D::A8_UNORM, TF::Rgba8Unorm, a8, 3, wide));
+    CHECK(wide[3] == 0x00 && wide[7] == 0x7f && wide[11] == 0xff && wide[0] == 0 && wide[4] == 0 && wide[10] == 0);
+    CHECK(!widen_a8_texels(D::R8_UNORM, TF::Rgba8Unorm, a8, 3, wide));
+    CHECK(!widen_a8_texels(D::A8_UNORM, TF::R8Unorm, a8, 3, wide));
+    // An A8 render target writes alpha only (its rgba8unorm stand-in keeps rgb at 0).
+    D3D12GraphicsPsoDesc a8_rt = basic_desc();
+    a8_rt.RTVFormats[0] = D::A8_UNORM;
+    CHECK(translate_graphics_pso(a8_rt, PipelineKeyOptions{}).base.color_targets[0].write_mask ==
+          D3D12ColorWriteEnable::Alpha);
+    CHECK(translate_graphics_pso(basic_desc(), PipelineKeyOptions{}).base.color_targets[0].write_mask ==
+          D3D12ColorWriteEnable::All);
 }
 
 void test_vertex_format_mapping() {

@@ -1061,6 +1061,7 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
     wr.tex.depth_or_layers = d;
     wr.tex.bytes_per_row = fp.RowPitch;
     wr.tex.rows_per_image = rows_per_slice;
+    wr.widen_a8 = tex->desc().Format == static_cast<uint32_t>(pso::DxgiFormat::A8_UNORM);
     deferred_.push_back(wr);
     device_->note_texture_copy_destination(tex->id());
 }
@@ -1107,7 +1108,17 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
             device_->note_bad_argument("ExecuteCommandLists: copy source " + hex(w.src) + " no longer readable");
             continue;
         }
-        if (w.texture) {
+        if (w.texture && w.widen_a8) {
+            count_work(Work::TextureUploads);
+            std::vector<uint8_t> wide;
+            uint32_t pitch = 0;
+            if (widen_a8_rows(bytes.data(), bytes.size(), w.tex.width, w.tex.height, w.tex.depth_or_layers,
+                              w.tex.bytes_per_row, uint64_t{w.tex.rows_per_image} * w.tex.bytes_per_row, &wide, &pitch)) {
+                out.write_texture(w.tex.texture_id, w.tex.mip_level, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
+                                  w.tex.width, w.tex.height, w.tex.depth_or_layers, pitch, w.tex.height, wide.data(),
+                                  static_cast<uint32_t>(wide.size()));
+            }
+        } else if (w.texture) {
             count_work(Work::TextureUploads);
             out.write_texture(w.tex.texture_id, w.tex.mip_level, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
                               w.tex.width, w.tex.height, w.tex.depth_or_layers, w.tex.bytes_per_row,

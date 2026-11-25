@@ -762,6 +762,9 @@ TextureFormatMapping map_texture_format(DxgiFormat format, FormatUsage usage, ui
 // count): `count` components from `src` (2 bytes each) to `dst` (4 or 2 bytes each). UNORM maps v to
 // v / 65535, SNORM to max(v / 32767, -1) (D3D/WebGPU conversion); 16float rounds to nearest even.
 // False (nothing written) if the pair is not such a conversion.
+// A8_UNORM texels (one byte) widened into the rgba8unorm texture that holds them: (0, 0, 0, a).
+// False when `from` / `to` are not A8_UNORM / rgba8unorm.
+bool widen_a8_texels(DxgiFormat from, WgpuTextureFormat to, const uint8_t* src, size_t count, uint8_t* dst) noexcept;
 bool convert_norm16_texels(DxgiFormat from, WgpuTextureFormat to, const uint8_t* src, size_t count,
                            uint8_t* dst) noexcept;
 
