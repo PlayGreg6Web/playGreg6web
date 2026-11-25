@@ -221,6 +221,17 @@ class RunTests(unittest.TestCase):
             self.assertNotIn("heap_live_blocks", out)
             self.assertEqual(json.loads((run / "command.json").read_text())["harness_exit"], 9)
 
+    def test_digest_presents_without_capture(self):
+        # No --gpu-capture: no per-Present samples, but the pacer's count and first_present.
+        report = {"status": "limit_reached", "milestones": [], "counters": {"import_calls": 9},
+                  "present_pacing": {"enabled": True, "presents": 5712},
+                  "first_present": {"import_seq": 91460, "elapsed_ms": 2900, "imports": []}}
+        text = rnb.digest(report, 7)
+        self.assertIn("presents: 5712 (paced, no capture samples), first at import call 91460 (2900 ms)", text)
+        report.pop("present_pacing")
+        report["first_present"] = None
+        self.assertIn("presents: 0\n", rnb.digest(report, 7))
+
     def test_menu_flow_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow"]["max_ms"], 240_000)
         script = rnb.input_script_text(240_000, "menu-flow").splitlines()

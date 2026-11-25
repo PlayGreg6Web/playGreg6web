@@ -259,7 +259,13 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     presents = report.get("presents") or []
     fp = report.get("first_present")
     first = f", first at import call {fp.get('import_seq')} ({fp.get('elapsed_ms')} ms)" if isinstance(fp, dict) else ""
-    lines.append(f"presents: {len(presents)}{first}")
+    if presents:
+        lines.append(f"presents: {len(presents)}{first}")
+    else:
+        # No capture, so no per-Present samples: the present pacer's count (not "0 presents").
+        paced = (report.get("present_pacing") or {}).get("presents")
+        count = f"{paced} (paced, no capture samples)" if paced else "0"
+        lines.append(f"presents: {count}{first}")
     if presents:
         last = presents[-1]
         lines.append(f"  last: wall {last.get('wall_ms')} ms, dispatches {last.get('dispatches')}, "
