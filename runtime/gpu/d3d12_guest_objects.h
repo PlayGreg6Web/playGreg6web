@@ -220,6 +220,7 @@ struct IDeviceChildHost : IObjectHost {
 };
 
 class Device;
+class Fence;
 
 // Private data / name storage shared by every object (ID3D12Object semantics).
 class PrivateData {
