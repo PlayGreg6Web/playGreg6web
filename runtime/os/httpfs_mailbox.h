@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -67,15 +68,45 @@ static_assert(offsetof(HttpfsMailbox, payload) == kHttpfsHeaderBytes, "payload o
 static_assert(sizeof(HttpfsMailbox) == kHttpfsHeaderBytes + kHttpfsPayloadBytes,
               "HttpfsMailbox total size must equal header + payload");
 
+// FIFO (ticket) lock: waiters get the lock in arrival order. A thread that releases and at once
+// re-acquires it (a bulk reader looping over chunks) queues behind the threads already waiting,
+// where a plain mutex usually lets it barge in again and starve them.
+class HttpfsFairMutex {
+public:
+    void lock();
+    void unlock();
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    uint64_t next_ticket_ = 0;
+    uint64_t now_serving_ = 0;
+};
+
+// Host calls a client can forward requests to directly instead of staging them in a mailbox
+// (the in-process browser bridge: the host reads straight into the caller's buffer).
+struct HttpfsDirectBackend {
+    std::function<int32_t(std::string_view rel_path)> open;
+    std::function<int64_t(int32_t handle, uint64_t offset, void* dst, size_t len)> read;
+    std::function<bool(int32_t handle)> close;
+};
+
 // Thread-safe C++ client helper that encodes Open/Read/Close requests into an HttpfsMailbox.
 // Supports both synchronous injectable responder callbacks (for native unit tests) and
 // asynchronous worker-to-worker Atomics.wait / Atomics.notify responders.
+//
+// One request is in flight at a time (the downstream mailbox / host channel is single-lane).
+// Reads larger than the payload capacity are split into chunks, and the lock is taken per chunk
+// in FIFO order: a short read from another thread waits for at most one chunk of a bulk read,
+// not for the whole bulk read.
 class HttpfsMailboxClient {
 public:
     using ResponderCallback = std::function<void(HttpfsMailbox& mailbox)>;
 
     explicit HttpfsMailboxClient(HttpfsMailbox* mailbox,
                                  ResponderCallback responder = nullptr);
+    // Direct mode: requests go to `backend` (chunked to kHttpfsPayloadBytes, no payload copy).
+    explicit HttpfsMailboxClient(HttpfsDirectBackend backend);
 
     void set_responder(ResponderCallback responder);
     size_t payload_capacity() const;
@@ -103,10 +134,15 @@ public:
 private:
     HttpfsStatus execute_roundtrip_locked(int64_t& out_result);
     size_t effective_capacity_locked() const;
+    // One chunk (min(remaining, capacity) bytes, stored in *asked) under the lock: bytes read
+    // (>= 0) or < 0 on error.
+    int64_t read_chunk(int32_t handle, uint64_t offset, uint8_t* dst, size_t remaining, size_t* asked);
 
     HttpfsMailbox* mailbox_ = nullptr;
     ResponderCallback responder_;
-    mutable std::mutex mutex_;
+    HttpfsDirectBackend direct_;
+    bool direct_mode_ = false;
+    mutable HttpfsFairMutex mutex_;
 };
 
 }  // namespace playgta6::os

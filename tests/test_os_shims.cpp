@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -719,6 +720,81 @@ void test_httpfs_mailbox() {
 
         HttpfsMailboxClient::shutdown_waiter(*mb);
         io_worker.join();
+    }
+
+    // 6c. Direct mode: host reads land straight in the caller's buffer, in 64 KiB chunks.
+    {
+        std::vector<uint8_t> blob(kHttpfsPayloadBytes * 2 + 100);
+        for (size_t i = 0; i < blob.size(); ++i) {
+            blob[i] = static_cast<uint8_t>((i * 13u + 5u) & 0xFFu);
+        }
+        std::vector<std::pair<uint64_t, size_t>> calls;
+        std::vector<const void*> dsts;
+        bool closed = false;
+        HttpfsDirectBackend backend;
+        backend.open = [](std::string_view p) { return p == "data/a.rpf" ? 7 : -2; };
+        backend.read = [&](int32_t h, uint64_t off, void* dst, size_t len) -> int64_t {
+            if (h != 7) {
+                return -9;
+            }
+            calls.emplace_back(off, len);
+            dsts.push_back(dst);
+            if (off >= blob.size()) {
+                return 0;
+            }
+            const size_t n = std::min<size_t>(len, blob.size() - static_cast<size_t>(off));
+            std::memcpy(dst, blob.data() + off, n);
+            return static_cast<int64_t>(n);
+        };
+        backend.close = [&](int32_t h) {
+            closed = h == 7;
+            return closed;
+        };
+        HttpfsMailboxClient client(std::move(backend));
+        CHECK(client.payload_capacity() == kHttpfsPayloadBytes);
+        CHECK(client.open("data/missing.rpf") < 0);
+        const int32_t h = client.open("data/a.rpf");
+        CHECK(h == 7);
+        std::vector<uint8_t> out(blob.size() + 50, 0);
+        CHECK(client.read(h, 0, out.data(), out.size()) == static_cast<int64_t>(blob.size()));
+        CHECK(std::memcmp(out.data(), blob.data(), blob.size()) == 0);
+        CHECK(calls.size() == 3);  // 64 KiB, 64 KiB, short tail (EOF)
+        CHECK(calls[1].first == kHttpfsPayloadBytes && calls[1].second == kHttpfsPayloadBytes);
+        CHECK(dsts.size() == 3 && dsts[0] == out.data() && dsts[1] == out.data() + kHttpfsPayloadBytes);
+        CHECK(client.read(-1, 0, out.data(), 1) < 0);
+        CHECK(client.close(h) && closed);
+    }
+
+    // 6d. A short read from another thread is served between the chunks of a bulk read (the
+    // lock is per chunk, FIFO), not after the whole bulk read.
+    {
+        std::atomic<int> bulk_chunks{0};
+        std::atomic<int> small_done_after{-1};
+        std::atomic<bool> bulk_started{false};
+        HttpfsDirectBackend backend;
+        backend.open = [](std::string_view) { return 1; };
+        backend.read = [&](int32_t h, uint64_t, void*, size_t len) -> int64_t {
+            if (h == 1) {
+                bulk_started.store(true);
+                bulk_chunks.fetch_add(1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            return static_cast<int64_t>(len);
+        };
+        backend.close = [](int32_t) { return true; };
+        HttpfsMailboxClient client(std::move(backend));
+        constexpr int kBulkChunks = 64;
+        std::vector<uint8_t> bulk(kHttpfsPayloadBytes * kBulkChunks);
+        std::thread bulk_reader([&] { client.read(1, 0, bulk.data(), bulk.size()); });
+        while (!bulk_started.load()) {
+            std::this_thread::yield();
+        }
+        uint8_t one = 0;
+        CHECK(client.read(2, 0, &one, 1) == 1);
+        small_done_after.store(bulk_chunks.load());
+        bulk_reader.join();
+        CHECK(bulk_chunks.load() == kBulkChunks);
+        CHECK(small_done_after.load() < kBulkChunks / 2);
     }
 }
 

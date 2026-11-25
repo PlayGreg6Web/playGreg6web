@@ -9,16 +9,36 @@ namespace playgta6::os {
 static_assert(alignof(HttpfsMailbox) >= std::atomic_ref<int32_t>::required_alignment,
               "HttpfsMailbox alignment must satisfy atomic_ref<int32_t>");
 
+void HttpfsFairMutex::lock() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const uint64_t ticket = next_ticket_++;
+    cv_.wait(lock, [&] { return now_serving_ == ticket; });
+}
+
+void HttpfsFairMutex::unlock() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++now_serving_;
+    }
+    cv_.notify_all();
+}
+
 HttpfsMailboxClient::HttpfsMailboxClient(HttpfsMailbox* mailbox,
                                          ResponderCallback responder)
     : mailbox_(mailbox), responder_(std::move(responder)) {}
 
+HttpfsMailboxClient::HttpfsMailboxClient(HttpfsDirectBackend backend)
+    : direct_(std::move(backend)), direct_mode_(true) {}
+
 void HttpfsMailboxClient::set_responder(ResponderCallback responder) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     responder_ = std::move(responder);
 }
 
 size_t HttpfsMailboxClient::effective_capacity_locked() const {
+    if (direct_mode_) {
+        return kHttpfsPayloadBytes;
+    }
     if (mailbox_ == nullptr) {
         return 0;
     }
@@ -29,7 +49,7 @@ size_t HttpfsMailboxClient::effective_capacity_locked() const {
 }
 
 size_t HttpfsMailboxClient::payload_capacity() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     return effective_capacity_locked();
 }
 
@@ -97,7 +117,14 @@ HttpfsStatus HttpfsMailboxClient::execute_roundtrip_locked(int64_t& out_result) 
 }
 
 int32_t HttpfsMailboxClient::open(std::string_view rel_path) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    if (direct_mode_) {
+        if (rel_path.empty() || !direct_.open) {
+            return -1;
+        }
+        const int32_t handle = direct_.open(rel_path);
+        return handle < 0 ? -1 : handle;
+    }
     if (mailbox_ == nullptr || rel_path.empty()) {
         return -1;
     }
@@ -140,58 +167,27 @@ int64_t HttpfsMailboxClient::read(int32_t handle, uint64_t offset, void* dst, si
         return -1;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (mailbox_ == nullptr) {
-        return -1;
-    }
-
-    const size_t cap = effective_capacity_locked();
-    if (cap == 0) {
-        return -1;
-    }
-
     uint8_t* out = static_cast<uint8_t*>(dst);
     uint64_t cur_offset = offset;
     size_t remaining = len;
     int64_t total_read = 0;
 
     while (remaining > 0) {
-        const size_t chunk = std::min(remaining, cap);
-        mailbox_->op = static_cast<uint32_t>(HttpfsOp::Read);
-        mailbox_->handle = handle;
-        mailbox_->offset = cur_offset;
-        mailbox_->length = static_cast<uint64_t>(chunk);
-        mailbox_->result = -1;
-
-        int64_t chunk_res = -1;
-        const HttpfsStatus status = execute_roundtrip_locked(chunk_res);
-
-        if (status != HttpfsStatus::ResponseReady || chunk_res < 0 ||
-            static_cast<uint64_t>(chunk_res) > chunk) {
-            std::atomic_ref<int32_t> status_ref(mailbox_->status);
-            if (status != HttpfsStatus::Shutdown) {
-                status_ref.store(static_cast<int32_t>(HttpfsStatus::Idle),
-                                 std::memory_order_release);
-                status_ref.notify_one();
-            }
-            return chunk_res < 0 ? chunk_res : -1;
+        // The lock is taken per chunk (FIFO), so other threads' requests interleave with a bulk
+        // read instead of waiting for all of it.
+        size_t asked = 0;
+        const int64_t got_or_error = read_chunk(handle, cur_offset, out, remaining, &asked);
+        if (got_or_error < 0) {
+            return got_or_error;
         }
-
-        const size_t got = static_cast<size_t>(chunk_res);
-        if (got > 0) {
-            std::memcpy(out, mailbox_->payload, got);
-        }
-
-        std::atomic_ref<int32_t> status_ref(mailbox_->status);
-        status_ref.store(static_cast<int32_t>(HttpfsStatus::Idle), std::memory_order_release);
-        status_ref.notify_one();
+        const size_t got = static_cast<size_t>(got_or_error);
 
         out += got;
         cur_offset += got;
         remaining -= got;
         total_read += static_cast<int64_t>(got);
 
-        if (got < chunk) {
+        if (got < asked) {
             // Reached EOF.
             break;
         }
@@ -200,12 +196,69 @@ int64_t HttpfsMailboxClient::read(int32_t handle, uint64_t offset, void* dst, si
     return total_read;
 }
 
+int64_t HttpfsMailboxClient::read_chunk(int32_t handle,
+                                        uint64_t offset,
+                                        uint8_t* dst,
+                                        size_t remaining,
+                                        size_t* asked) {
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    const size_t cap = effective_capacity_locked();
+    if (cap == 0) {
+        return -1;
+    }
+    const size_t chunk = std::min(remaining, cap);
+    *asked = chunk;
+
+    if (direct_mode_) {
+        if (!direct_.read) {
+            return -1;
+        }
+        const int64_t n = direct_.read(handle, offset, dst, chunk);
+        if (n < 0) {
+            return n;
+        }
+        return static_cast<uint64_t>(n) > chunk ? -1 : n;
+    }
+
+    mailbox_->op = static_cast<uint32_t>(HttpfsOp::Read);
+    mailbox_->handle = handle;
+    mailbox_->offset = offset;
+    mailbox_->length = static_cast<uint64_t>(chunk);
+    mailbox_->result = -1;
+
+    int64_t chunk_res = -1;
+    const HttpfsStatus status = execute_roundtrip_locked(chunk_res);
+
+    if (status != HttpfsStatus::ResponseReady || chunk_res < 0 ||
+        static_cast<uint64_t>(chunk_res) > chunk) {
+        std::atomic_ref<int32_t> status_ref(mailbox_->status);
+        if (status != HttpfsStatus::Shutdown) {
+            status_ref.store(static_cast<int32_t>(HttpfsStatus::Idle), std::memory_order_release);
+            status_ref.notify_one();
+        }
+        return chunk_res < 0 ? chunk_res : -1;
+    }
+
+    const size_t got = static_cast<size_t>(chunk_res);
+    if (got > 0) {
+        std::memcpy(dst, mailbox_->payload, got);
+    }
+
+    std::atomic_ref<int32_t> status_ref(mailbox_->status);
+    status_ref.store(static_cast<int32_t>(HttpfsStatus::Idle), std::memory_order_release);
+    status_ref.notify_one();
+    return chunk_res;
+}
+
 bool HttpfsMailboxClient::close(int32_t handle) {
     if (handle < 0) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    if (direct_mode_) {
+        return direct_.close ? direct_.close(handle) : false;
+    }
     if (mailbox_ == nullptr) {
         return false;
     }

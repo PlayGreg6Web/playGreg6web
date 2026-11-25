@@ -323,15 +323,11 @@ struct ScopedActiveBootConfig {
     ScopedActiveBootConfig& operator=(const ScopedActiveBootConfig&) = delete;
 };
 
-size_t mailbox_payload_cap(const os::HttpfsMailbox& mb) {
-    if (mb.payload_capacity == 0) {
-        return os::kHttpfsPayloadBytes;
-    }
-    return std::min<size_t>(mb.payload_capacity, os::kHttpfsPayloadBytes);
-}
-
 // Bridges Win32 CreateFile/GetFileAttributes and Xbox DirectStorage (XCRDAPI) onto
 // open_path/read_path/close_path whenever no Win32 HTTPFS client is already installed.
+// Direct mode: reads go straight into the caller's buffer (no mailbox staging copy), one chunk
+// per FIFO lock turn, so a bulk DirectStorage read no longer holds every other reader (Bink,
+// ReadFile on the title's threads) off for its whole length.
 class ScopedWin32HttpfsBridge {
 public:
     explicit ScopedWin32HttpfsBridge(const WasmBootConfig& cfg) : cfg_(&cfg) {
@@ -339,10 +335,19 @@ public:
         if (previous_ != nullptr) {
             return;
         }
-        mailbox_ = std::make_unique<os::HttpfsMailbox>();
-        os::HttpfsMailboxClient::init_mailbox(*mailbox_);
-        client_ = std::make_unique<os::HttpfsMailboxClient>(
-            mailbox_.get(), [this](os::HttpfsMailbox& mb) { handle(mb); });
+        os::HttpfsDirectBackend backend;
+        backend.open = [this](std::string_view rel) { return open_rel(rel); };
+        backend.read = [this](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+            return handle < 0 ? -9 : read_path(*cfg_, handle, offset, dst, len);
+        };
+        backend.close = [this](int32_t handle) {
+            if (handle < 0) {
+                return false;
+            }
+            close_path(*cfg_, handle);
+            return true;
+        };
+        client_ = std::make_unique<os::HttpfsMailboxClient>(std::move(backend));
         os::win32::set_httpfs_client(client_.get());
         installed_ = true;
     }
@@ -357,81 +362,36 @@ public:
     ScopedWin32HttpfsBridge& operator=(const ScopedWin32HttpfsBridge&) = delete;
 
 private:
-    void handle(os::HttpfsMailbox& mb) {
-        using os::HttpfsMailboxClient;
-        using os::HttpfsOp;
-        using os::HttpfsStatus;
-
-        const size_t cap = mailbox_payload_cap(mb);
-        switch (static_cast<HttpfsOp>(mb.op)) {
-            case HttpfsOp::Open: {
-                const size_t len = static_cast<size_t>(std::min<uint64_t>(mb.length, cap));
-                std::string rel(reinterpret_cast<const char*>(mb.payload), len);
-                std::replace(rel.begin(), rel.end(), '\\', '/');
-                for (;;) {
-                    if (rel.size() >= 2 && rel[0] == '.' && rel[1] == '/') {
-                        rel.erase(0, 2);
-                    } else if (!rel.empty() && rel.front() == '/') {
-                        rel.erase(0, 1);
-                    } else {
-                        break;
-                    }
-                }
-                if (rel.empty()) {
-                    HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
-                    return;
-                }
-                const std::string lower = to_lower_ascii(rel);
-                const bool has_root_prefix =
-                    lower.rfind("game/", 0) == 0 || lower.rfind("boot/", 0) == 0;
-                int32_t handle = -1;
-                if (!has_root_prefix) {
-                    handle = open_path(*cfg_, "game/" + rel);
-                }
-                if (handle < 0) {
-                    handle = open_path(*cfg_, rel);
-                }
-                if (handle < 0) {
-                    HttpfsMailboxClient::complete_response(mb, handle, HttpfsStatus::Error);
-                    return;
-                }
-                HttpfsMailboxClient::complete_response(mb, handle, HttpfsStatus::ResponseReady);
-                return;
+    int32_t open_rel(std::string_view raw) {
+        std::string rel(raw);
+        std::replace(rel.begin(), rel.end(), '\\', '/');
+        for (;;) {
+            if (rel.size() >= 2 && rel[0] == '.' && rel[1] == '/') {
+                rel.erase(0, 2);
+            } else if (!rel.empty() && rel.front() == '/') {
+                rel.erase(0, 1);
+            } else {
+                break;
             }
-            case HttpfsOp::Read: {
-                if (mb.handle < 0) {
-                    HttpfsMailboxClient::complete_response(mb, -9, HttpfsStatus::Error);
-                    return;
-                }
-                const size_t len = static_cast<size_t>(std::min<uint64_t>(mb.length, cap));
-                const int64_t n = read_path(*cfg_, mb.handle, mb.offset, mb.payload, len);
-                if (n < 0 || static_cast<uint64_t>(n) > len) {
-                    HttpfsMailboxClient::complete_response(
-                        mb, n < 0 ? n : -1, HttpfsStatus::Error);
-                    return;
-                }
-                HttpfsMailboxClient::complete_response(mb, n, HttpfsStatus::ResponseReady);
-                return;
-            }
-            case HttpfsOp::Close: {
-                if (mb.handle < 0) {
-                    HttpfsMailboxClient::complete_response(mb, -9, HttpfsStatus::Error);
-                    return;
-                }
-                close_path(*cfg_, mb.handle);
-                HttpfsMailboxClient::complete_response(mb, 0, HttpfsStatus::ResponseReady);
-                return;
-            }
-            default:
-                HttpfsMailboxClient::complete_response(mb, -1, HttpfsStatus::Error);
-                return;
         }
+        if (rel.empty()) {
+            return -2;
+        }
+        const std::string lower = to_lower_ascii(rel);
+        const bool has_root_prefix = lower.rfind("game/", 0) == 0 || lower.rfind("boot/", 0) == 0;
+        int32_t handle = -1;
+        if (!has_root_prefix) {
+            handle = open_path(*cfg_, "game/" + rel);
+        }
+        if (handle < 0) {
+            handle = open_path(*cfg_, rel);
+        }
+        return handle;
     }
 
     const WasmBootConfig* cfg_ = nullptr;
     os::HttpfsMailboxClient* previous_ = nullptr;
     bool installed_ = false;
-    std::unique_ptr<os::HttpfsMailbox> mailbox_;
     std::unique_ptr<os::HttpfsMailboxClient> client_;
 };
 
