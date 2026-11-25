@@ -20,6 +20,20 @@ jobs:
             exit 1
           fi
 
+  stale-revert:
+    name: No Stale Revert Guard
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tools/check_stale_revert.py --base origin/${{ github.base_ref }} --head HEAD
+
   rust:
     name: Rust Pipelines (recomp, shaders, tools)
     runs-on: ubuntu-latest
