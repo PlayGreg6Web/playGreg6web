@@ -232,10 +232,14 @@ public:
 
     // Commit a 4 KiB page-aligned sub-range inside an existing reservation.
     // Newly committed pages are zero-initialized; already committed pages retain data
-    // and receive the updated protection.
+    // and receive the updated protection. `newly_committed` (optional) receives how many bytes
+    // of the range were not committed before (and so read as zero now): a caller that would
+    // zero the range itself can skip that when it equals the range size (O36: a memset of a
+    // fresh page touches memory the backing otherwise leaves untouched).
     bool commit(uint64_t addr,
                 uint64_t size,
-                PageProtect protect = PageProtect::ReadWrite);
+                PageProtect protect = PageProtect::ReadWrite,
+                uint64_t* newly_committed = nullptr);
 
     // Decommit a 4 KiB page-aligned sub-range, releasing its host backing storage.
     // If size == 0 and addr == reservation base, decommits the entire reservation.
@@ -335,7 +339,7 @@ private:
     uint64_t reserve_locked(uint64_t hint_addr,
                             uint64_t size,
                             PageProtect allocation_protect);
-    bool commit_locked(uint64_t addr, uint64_t size, PageProtect protect);
+    bool commit_locked(uint64_t addr, uint64_t size, PageProtect protect, uint64_t* newly_committed = nullptr);
     bool decommit_locked(uint64_t addr, uint64_t size);
     bool release_locked(uint64_t base_addr);
 

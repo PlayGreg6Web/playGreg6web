@@ -898,19 +898,25 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
         retarget_window_slots_locked(page);
         return true;
     }
+    // O36: a slot committed just now reads as zero already (the arena zero-fills fresh commits;
+    // in the browser untouched linear memory is zero): zeroing it again would make every mapped
+    // page resident, e.g. the whole multi-GiB pool view the title maps once at startup.
+    bool fresh_zero = false;
     if (region != nullptr && !region->committed) {
         PageProtect pp = PageProtect::ReadWrite;
         xmem_protect(region->protect, pp);
         if (pp == PageProtect::NoAccess) {
             pp = PageProtect::ReadWrite;
         }
-        if (!xmem_arena().commit(va, ps, pp)) {
+        uint64_t newly = 0;
+        if (!xmem_arena().commit(va, ps, pp, &newly)) {
             st.page_slots.erase(va);
             --page.mapped_slots;
             st.mapped_physical_bytes -= ps;
             return false;
         }
         st.virtual_committed_bytes += ps;
+        fresh_zero = newly == ps;
     }
     auto* dst = static_cast<uint8_t*>(host_of(va));
     if (page.view != nullptr) {
@@ -929,7 +935,7 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
         std::memcpy(dst, host_of(page.store_va), static_cast<size_t>(ps));
         default_guest_heap().free(page.store_va);
         page.store_va = 0;
-    } else if (page.home_va == 0) {
+    } else if (page.home_va == 0 && !fresh_zero) {
         std::memset(dst, 0, static_cast<size_t>(ps));
     }
     if (page.pool_va == 0) {

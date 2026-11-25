@@ -121,10 +121,20 @@ void test_zero_fill() {
     // Decommit / recommit a middle run: zero again, neighbours untouched.
     CHECK(arena.decommit(a + 16 * kPageSize, 8 * kPageSize));
     CHECK(arena.committed_bytes() == 256 * 1024 - 8 * kPageSize);
-    CHECK(arena.commit(a + 16 * kPageSize, 8 * kPageSize, PageProtect::ReadWrite));
+    // O36: commit reports how much of the range was fresh (zero-filled) versus kept.
+    uint64_t newly = 123;
+    CHECK(arena.commit(a + 16 * kPageSize, 8 * kPageSize, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 8 * kPageSize);
     CHECK(arena.read(a, buf.data(), buf.size()));
     CHECK(all_zero(buf.data() + 16 * kPageSize, 8 * kPageSize));
     CHECK(buf[16 * kPageSize - 1] == 0xCD && buf[24 * kPageSize] == 0xCD);
+    CHECK(arena.commit(a + 12 * kPageSize, 8 * kPageSize, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 0);  // all of it was committed already: contents kept
+    CHECK(arena.decommit(a + 20 * kPageSize, 2 * kPageSize));
+    CHECK(arena.commit(a + 16 * kPageSize, 8 * kPageSize, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 2 * kPageSize);
+    CHECK(!arena.commit(a + 16 * kPageSize, 512 * 1024, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 0);
 
     // Release + reserve the same VA again: fresh, zeroed pages.
     CHECK(arena.release(a));

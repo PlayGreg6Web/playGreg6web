@@ -346,7 +346,10 @@ uint64_t VirtualMemoryArena::reserve_locked(uint64_t hint_addr,
     return base;
 }
 
-bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect protect) {
+bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect protect, uint64_t* newly_committed) {
+    if (newly_committed != nullptr) {
+        *newly_committed = 0;
+    }
     if (size == 0 || !is_valid_protect(protect)) {
         return false;
     }
@@ -417,6 +420,9 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
         res->pages[p].protect = protect;
     }
     committed_bytes_ += newly_committed_bytes;
+    if (newly_committed != nullptr) {
+        *newly_committed = newly_committed_bytes;
+    }
     return true;
 }
 
@@ -605,9 +611,9 @@ uint64_t VirtualMemoryArena::reserve(uint64_t hint_addr,
     return base;
 }
 
-bool VirtualMemoryArena::commit(uint64_t addr, uint64_t size, PageProtect protect) {
+bool VirtualMemoryArena::commit(uint64_t addr, uint64_t size, PageProtect protect, uint64_t* newly_committed) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const bool ok = commit_locked(addr, size, protect);
+    const bool ok = commit_locked(addr, size, protect, newly_committed);
     notify(*this, ArenaEvent::Commit, addr, size, protect, ok);
     return ok;
 }

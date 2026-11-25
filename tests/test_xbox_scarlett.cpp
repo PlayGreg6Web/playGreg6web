@@ -170,6 +170,34 @@ void test_xmem_physical_virtual_and_transfer() {
     CHECK(scatter_bytes[2 * kXMemPageSize4K] == 0x11);
     CHECK(scatter_bytes[3 * kXMemPageSize4K - 1] == 0x11);
 
+    // O36: a page without contents mapped at a slot reads zero, whether the slot was never
+    // committed (no memset needed) or held another page's bytes before (unmapped first).
+    {
+        size_t one = 2;
+        uint64_t fresh[2]{};
+        CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage4K, &one, fresh) == 1);
+        const uint64_t at_gap[1] = {base_va + 1 * kXMemPageSize4K};
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at_gap, 1, &fresh[0]) == 1);
+        bool zero = true;
+        for (uint64_t i = 0; i < kXMemPageSize4K; ++i) {
+            zero = zero && scatter_bytes[kXMemPageSize4K + i] == 0;
+        }
+        CHECK(zero);
+        const uint64_t at_first[1] = {base_va};
+        const uint64_t none[1] = {0};
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at_first, 1, none) == 1);  // page 2 leaves
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at_first, 1, &fresh[1]) == 1);
+        zero = true;
+        for (uint64_t i = 0; i < kXMemPageSize4K; ++i) {
+            zero = zero && scatter_bytes[i] == 0;
+        }
+        CHECK(zero);
+        // Page 2 kept its bytes: mapped back at its slot it shows them again.
+        const uint64_t back[1] = {handles[2]};
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at_first, 1, back) == 1);
+        CHECK(scatter_bytes[0] == 0x33 && scatter_bytes[kXMemPageSize4K - 1] == 0x33);
+    }
+
     // Standalone XMemVirtualAlloc reserve + in-place commit + XMemTransferMemory.
     void* va_buf = pg6_xbox_XMemVirtualAlloc(
         nullptr, 8192, win32::MEM_RESERVE, 0, win32::PAGE_READWRITE);
