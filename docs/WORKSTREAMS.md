@@ -71,6 +71,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [ ] **R40 — Real-Binary Boot, Phase 5: Past the Start Screen — Steady State, Scripted Input, Next Blockers** — `IN PROGRESS` (#663, @Timon-ok) *(continues R32)*
   - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
   - Landed: default audio render endpoint (MMDevice/WASAPI) with stereo downmix, PCM ring and `--audio-dump`; XMem map/unmap work outside the lock; menu-flow preset through LEGAL NOTICES and right-stick/trigger input scripting; boot report screen timeline, GPU work counters and XMem alias diffs; XG/D3D12 tiling and layout fixes; CI guard against PRs that revert merged changes.
+  - Since #1246: audio: ISpatialAudioObject::SetVolume, non-zero title buffer count (#1278); native tooling: shared object cache across checkouts, run_native_boot hints and `--thumbnails` (#1254, #1251, #1255); lifter speedups: truncating imul as plain mul, callee-observable flag stores only, IR guards for hot paths (#1252, #1316, #1337); boot report: per-present samples without GPU capture (#1248).
 - [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 - [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
@@ -158,9 +159,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [x] **O36 — Browser Boot Parity: Run the Real Program's wasm64 Boot Locally in Chrome and Close the Gap to the Native Boot** — `DONE` (closes #687) *(coordinated with the browser pipeline's owner)*
   - Run the browser boot end to end locally, compare it with a native run of the same commit, and fix wasm-only runtime gaps; web and build-tool items go to their owner first.
   - Landed: one XMem backing for every mapping of a physical page, no zeroing of freshly committed slots (browser RAM), HTTPFS direct bridge reads with cached game-file sizes, lazy buffer shadows, dirty-slot-only flushes and 60 Hz present pacing.
+  - Since #1246: browser boot-option switches for runtime flags (#1336), no zero-fill of freshly committed XMem slots (#1338).
 - [x] **O37 — Write Tracking for the Translated CPU Window in the Browser: Per-Slot Dirty Bits From Lifted Stores and Copy Helpers** — `DONE` (closes #716) *(O36 follow-up)*
   - Lifted window stores and runtime copy helpers set per-slot dirty bits so the GPU shadow flush compares only written slots in the browser.
   - Landed with O36: window write marks, atomics target feature, translated-window placement of physical-page reservations, and flushing CPU-visible buffers from the write marks.
+  - Since #1246: CPU-visible buffer shadow comparison split across helper threads (#1256).
 
 ---
 
