@@ -417,6 +417,22 @@ class RunTests(unittest.TestCase):
         self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
         self.assertLess(int(tail[-1][0]), 420_000)
 
+    def test_menu_to_ingame_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-to-ingame"]["max_ms"], 900_000)
+        script = rnb.input_script_text(900_000, "menu-to-ingame")
+        before, header, body, after = self._sections(script)
+        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
+        self.assertEqual(after[:9], ["capture", "1000 DUp 150", "3000 A 100",
+                                     "wait draws_per_frame==34 for 2s timeout 30s",
+                                     "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+                                     "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
+        tail = [line.split() for line in after[9:]]
+        self.assertEqual([e[1] for e in tail[:4]], ["A"] * 4)
+        self.assertIn("Up+RT", {e[1] for e in tail})
+        times = [int(e[0]) for e in tail]
+        self.assertEqual(times, sorted(times))
+        self.assertLess(times[-1], 900_000)
+
     def test_logged_input_times_and_wait_line(self):
         log = ("[harness] input script x: 12 event(s)\n"
                "[input] 20000 ms: press 0x1 100\n"

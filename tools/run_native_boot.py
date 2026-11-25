@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-command native boot runner: rebuild what is stale, run `playgta6_boot`, keep the run.
 
-    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|long]
+    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|menu-to-ingame|long]
         [--name NAME]
         [--exe PATH] [--game-dir DIR] [options] [-- extra playgta6_boot options]
 
@@ -33,7 +33,10 @@ What it does, in order:
    NOTICES to the list screen, then A every 3 s), `menu-flow-2` (360 s limit; the same, then the
    Up x6 + Down, Down, A cycle on), `menu-flow-3` (420 s limit; the same to the list screen, then
    scrolls it with RDown + Down and presses A), `menu-flow-4` (420 s limit;
-   Up + A on the list screen, which leads to the 34 draws/frame screen, then the menu cycle), `long`
+   Up + A on the list screen, which leads to the 34 draws/frame screen, then the menu cycle),
+   `menu-to-ingame` (900 s limit; menu-flow-4 to the 34 draws/frame screen, then the browser
+   preset's later phases, web/input/input_bridge.js: hold-A / Menu skip until the screen changes,
+   A confirmations, then left/right stick and trigger movement with A every 12 s), `long`
    (600 s limit, 630 s watchdog). The menu-flow presets are screen-synchronised: they repeat the
    menu cycle until the list screen after LEGAL NOTICES holds (draws/frame 33 or 50, read live from
    the present counters; `wait` / `repeat` steps in runtime/guest/input_script.h), so a slower run
@@ -97,6 +100,7 @@ PRESETS: dict[str, dict] = {
     "menu-flow-2": {"max_ms": 360_000, "watchdog_ms": 390_000, "input": "menu-flow-2"},
     "menu-flow-3": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-3"},
     "menu-flow-4": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-4"},
+    "menu-to-ingame": {"max_ms": 900_000, "watchdog_ms": 930_000, "input": "menu-to-ingame"},
     "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
@@ -370,7 +374,29 @@ def menu_flow_4_script_text(duration_ms: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def menu_to_ingame_script_text(duration_ms: int) -> str:
+    """The menu-to-ingame preset: menu-flow-4 to the 34 draws/frame screen, then the steps of the
+    browser preset of the same name (web/input/input_bridge.js, #1228) that the native presets lacked:
+    a hold-A (600 ms) / Menu skip + A, repeated every 15 s until the screen leaves 34 draws/frame
+    (steady 3 s, 120 s timeout); A every 2.5 s x4 (Story / New Game / Continue confirmations); then
+    every 12 s A, left stick forward, right stick, LT, RT (in-game movement)."""
+    lines = ["# menu-to-ingame (tools/run_native_boot.py): menu-flow-4 to " + NEXT_SCREEN + ", then the browser",
+             "# menu-to-ingame skip / confirm / movement phases"]
+    lines += _to_list_screen()
+    lines += ["1000 DUp 150", "3000 A 100", f"wait {NEXT_SCREEN} for 2s timeout 30s",
+              "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+              "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end"]
+    events: list[tuple[int, str, int]] = [(t, "A", INPUT_HOLD_MS) for t in range(1_000, 11_000, 2_500)]
+    for t in range(12_000, duration_ms, 12_000):
+        events += [(t, "A", INPUT_HOLD_MS), (t + 1_500, "Up", 1_500), (t + 3_500, "RRight", 1_200),
+                   (t + 5_500, "LT", 1_000), (t + 7_000, "Up+RT", 1_000)]
+    lines += _lines(events, duration_ms)
+    return "\n".join(lines) + "\n"
+
+
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-to-ingame":
+        return menu_to_ingame_script_text(duration_ms)
     if kind == "menu-flow-4":
         return menu_flow_4_script_text(duration_ms)
     if kind == "menu-flow-3":
