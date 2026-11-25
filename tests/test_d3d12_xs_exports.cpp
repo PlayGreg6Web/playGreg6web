@@ -27,6 +27,7 @@
 #include "gpu/gfx10_detile.h"
 #include "gpu/shader_pack_index.h"
 #include "gpu/stage_reflection.h"
+#include "gpu/gpu_va_watch.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
 #include "os/shim_exports.h"
@@ -1725,6 +1726,56 @@ void test_srgb_sibling_view_formats() {
     scene.release_all({textures[0], textures[1], textures[2]});
     CHECK(pso::srgb_sibling(pso::WgpuTextureFormat::Bc7RgbaUnormSrgb) == pso::WgpuTextureFormat::Bc7RgbaUnorm);
     CHECK(pso::srgb_sibling(pso::WgpuTextureFormat::Bgra8Unorm) == pso::WgpuTextureFormat::Bgra8UnormSrgb);
+}
+
+// G62: --watch-gpu-va through the guest layer: a texture picked by its size, an SRV over it, a copy
+// into it and a root SRV at its address are each reported with the frame they happened in.
+void test_gpu_va_watch_hooks() {
+    namespace w = playgta6::gpu::va_watch;
+    std::string error;
+    w::reset();
+    CHECK(w::configure("textures:24x8", &error));
+    Fixture fx;
+    Scene scene(fx);
+    const uint64_t list = scene.new_list();
+    const uint64_t upload = committed(fx, scene.device, 2, buffer_desc(256 * 8), 0xAC3);
+    const uint64_t tex = committed(fx, scene.device, 1, texture_desc(24, 8, 28, 0), 0x400);
+    const uint64_t other = committed(fx, scene.device, 1, texture_desc(16, 8, 28, 0), 0x400);
+    const uint64_t tex_va = object_of<dg::Resource>(tex)->descriptor_va();
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap, {I(put(dg::GuestDescriptorHeapDesc{0, 4, 0, 0}))},
+                                    dg::IID_ID3D12DescriptorHeap);
+    const uint64_t start = put<uint64_t>(0);
+    fx.sret_call(heap, Slot::GetCPUStart, start);
+    fx.vcall(scene.device, Slot2::CreateShaderResourceView, {I(tex), I(0), I(load64(start))});
+    fx.vcall(scene.device, Slot2::CreateShaderResourceView, {I(other), I(0), I(load64(start) + 32)});
+    // A copy of the watched descriptor is reported and makes the destination watched too.
+    fx.vcall(scene.device, Slot::CopyDescriptorsSimple, {I(1), I(load64(start) + 64), I(load64(start)), I(0)});
+    fx.vcall(scene.device, Slot::CopyDescriptorsSimple, {I(1), I(load64(start) + 96), I(load64(start) + 64), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    dg::GuestTextureCopyLocation dst{};
+    dst.pResource = tex;
+    dg::GuestTextureCopyLocation src{};
+    src.pResource = upload;
+    src.Type = 1;
+    src.PlacedFootprint = {0, {28, 24, 8, 1, 256}};
+    fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const auto ev = w::events();
+    auto has = [&](const std::string& kind) {
+        for (const auto& e : ev) {
+            if (e.kind == kind && e.va == tex_va) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(tex_va != 0);
+    CHECK(has("texture") && has("descriptor SRV") && has("copy destination (CopyTextureRegion)") && has("descriptor copy"));
+    for (const auto& e : ev) {
+        CHECK(e.va == tex_va);  // the 16x8 texture is not watched
+    }
+    w::reset();
+    scene.release_all({list, upload, tex, other, heap});
 }
 
 void test_copies_and_barriers() {
@@ -5209,6 +5260,7 @@ int main() {
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();
+    test_gpu_va_watch_hooks();
     test_srgb_sibling_view_formats();
     test_bc_upload_needs_feature();
     test_concurrent_recording();

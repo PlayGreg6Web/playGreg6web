@@ -48,6 +48,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
     gpu/stage_reflection.cpp
+    gpu/gpu_va_watch.cpp
     gpu/gfx10_descriptors.cpp
     gpu/gfx10_detile.cpp
     gpu/descriptor_words.cpp
@@ -191,6 +192,10 @@ else()
     add_executable(test_stage_reflection ../tests/test_stage_reflection.cpp)
     target_link_libraries(test_stage_reflection PRIVATE playgta6_core)
     add_test(NAME test_stage_reflection COMMAND test_stage_reflection)
+
+    add_executable(test_gpu_va_watch ../tests/test_gpu_va_watch.cpp)
+    target_link_libraries(test_gpu_va_watch PRIVATE playgta6_core)
+    add_test(NAME test_gpu_va_watch COMMAND test_gpu_va_watch)
 
     add_executable(test_state_bridge ../tests/test_state_bridge.cpp)
     target_link_libraries(test_state_bridge PRIVATE playgta6_core)

@@ -82,6 +82,7 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/input_script.h"
+#include "gpu/gpu_va_watch.h"
 #include "os/guest_heap.h"
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
@@ -171,6 +172,7 @@ struct Options {
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     std::string input_script;       // --input-script: timed controller buttons (guest/input_script.h)
+    std::string watch_gpu_va;       // --watch-gpu-va: GPU address ranges to report references to (gpu/gpu_va_watch.h)
     // --wgpu-features: pso::WgpuFeature bits of the WebGPU device that replays the run. The bridge
     // picks texture formats (and whether guest texels can be uploaded as they are) by them; the
     // default is the browser player's negotiated set (boot::kDefaultWasmWgpuFeatures).
@@ -194,7 +196,8 @@ void usage() {
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
                  "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
-                 "                     [--wgpu-features <mask>]\n");
+                 "                     [--wgpu-features <mask>]\n"
+                 "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -233,7 +236,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--input-script" ||
+                   a == "--shader-pack" || a == "--input-script" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir") {
             if (!value(v)) {
                 return false;
@@ -244,6 +247,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--shader-pack" ? o.shader_pack
                                   : a == "--input-script" ? o.input_script
+                                  : a == "--watch-gpu-va" ? o.watch_gpu_va
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
                                   : a == "--profile" ? o.profile
@@ -567,6 +571,9 @@ void finish_profile() {}
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
 void write_outputs(bool print_summary) {
     finish_profile();
+    if (!g_options.watch_gpu_va.empty()) {
+        std::fprintf(stderr, "%s", gpu::va_watch::summary().c_str());
+    }
     if (!g_options.gpu_capture.empty()) {
         gpu::frame_capture_finish();
         std::fprintf(stderr, "[harness] GPU capture: %u frame(s) written to %s\n", gpu::frame_capture_frames(),
@@ -976,6 +983,14 @@ int main(int argc, char** argv) {
     // the browser's input bridge writes (the title reads it through the GameInput adapter).
     static playgta6::InputState script_input{};
     static std::unique_ptr<playgta6::guest::InputScriptPlayer> script_player;
+    if (!g_options.watch_gpu_va.empty()) {
+        std::string error;
+        if (!gpu::va_watch::configure(g_options.watch_gpu_va, &error)) {
+            std::fprintf(stderr, "[harness] --watch-gpu-va: %s\n", error.c_str());
+            return kExitUsage;
+        }
+        std::fprintf(stderr, "[harness] watching GPU addresses: %s\n", g_options.watch_gpu_va.c_str());
+    }
     if (!g_options.input_script.empty()) {
         std::ifstream in(g_options.input_script, std::ios::binary);
         const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

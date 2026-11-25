@@ -1,4 +1,5 @@
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/gpu_va_watch.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -440,6 +441,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     const uint32_t blocks_y = (h + l.block_height - 1u) / l.block_height;
     const uint64_t tight_row_bytes = uint64_t{blocks_x} * l.block_bytes;
     const uint64_t tight_mip0_bytes = tight_row_bytes * blocks_y * d;
+    va_watch::touch("upload (bound texture memory)", tt.gpu_va, tight_mip0_bytes * layers,
+                    "texture id " + std::to_string(resource_id) + ", DXGI format " + std::to_string(tt.dxgi_format));
     constexpr uint64_t kMaxSyncTextureBytes = 64u << 20;
     if (tight_mip0_bytes == 0 || align_up(tight_row_bytes, 256u) * blocks_y * d > kMaxSyncTextureBytes) {
         return false;
@@ -1362,6 +1365,7 @@ bool Resource::initialize() {
             info.gpu_va = descriptor_va_;
             info.layout = desc_.Layout;
             dev.state_bridge().register_texture(id_, info);
+            va_watch::note_texture(descriptor_va_, committed_memory_size(desc_), p.width, p.height, desc_.Format, id_);
             if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {
                 TrackedTexture tt{};
                 tt.resource_id = id_;
@@ -1504,6 +1508,8 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     bool in_run = false;
     uint64_t uploaded = 0;
     auto emit = [&](uint64_t begin, uint64_t end) {
+        va_watch::touch("upload (CPU-visible buffer flush)", gpu_va_ + begin, end - begin,
+                        "buffer id " + std::to_string(id_));
         for (uint64_t off = begin; off < end; off += kMaxWriteChunk) {
             const uint64_t n = std::min(kMaxWriteChunk, end - off);
             count_work(Work::BufferUploads);
@@ -1590,6 +1596,7 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
                                        " needs CPU conversion for its WebGPU format (not implemented); skipped");
         return kSOk;
     }
+    va_watch_resource("upload (WriteToSubresource)", this, "subresource " + std::to_string(sub));
     const DxgiFormatLayout l = dxgi_format_layout(desc_.Format);
     const uint32_t bw = std::max<uint32_t>(1, box.right - box.left);
     const uint32_t bh = std::max<uint32_t>(1, box.bottom - box.top);
@@ -1927,6 +1934,9 @@ void Device::CreateShaderResourceView(InterfaceArg<IResourceHost> resource, uint
         }
         desc = &vd;
     }
+    if (va_watch::active()) {
+        va_watch_resource("descriptor SRV", static_cast<const Resource*>(resource.get()), "CreateShaderResourceView at handle " + hex(dest), dest);
+    }
     const d3d::Status s = heaps_.create_shader_resource_view(resource_id(resource), desc, d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string("CreateShaderResourceView: ") + d3d::status_name(s));
@@ -1950,6 +1960,9 @@ void Device::CreateUnorderedAccessView(InterfaceArg<IResourceHost> resource, Int
             return;
         }
         desc = &vd;
+    }
+    if (va_watch::active()) {
+        va_watch_resource("descriptor UAV", static_cast<const Resource*>(resource.get()), "CreateUnorderedAccessView at handle " + hex(dest), dest);
     }
     const d3d::Status s = heaps_.create_unordered_access_view(resource_id(resource), resource_id(counter), desc,
                                                               d3d::CpuDescriptorHandle{dest});
@@ -2007,6 +2020,9 @@ void Device::CreateRenderTargetView(InterfaceArg<IResourceHost> resource, uint64
             return;
         }
         desc = &vd;
+    }
+    if (va_watch::active()) {
+        va_watch_resource("descriptor RTV", static_cast<const Resource*>(resource.get()), "CreateRenderTargetView at handle " + hex(dest));
     }
     const d3d::Status s = heaps_.create_render_target_view(resource_id(resource), desc, d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
@@ -2891,5 +2907,18 @@ const com::Interface<IHeapHost> kID3D12Heap =
     com::declare_interface<IHeapHost>("ID3D12Heap", IID_ID3D12Heap, kHeapMethods, opts(16, kHeapIids));
 const com::Interface<IPipelineStateHost> kID3D12PipelineState = com::declare_interface<IPipelineStateHost>(
     "ID3D12PipelineState", IID_ID3D12PipelineState, kPipelineStateMethods, opts(16, kPageable));
+
+bool va_watch_resource(const char* kind, const Resource* r, const std::string& detail, uint64_t handle) {
+    if (r == nullptr || !va_watch::active()) {
+        return false;
+    }
+    const uint64_t size = r->is_buffer() ? r->desc().Width : committed_memory_size(r->desc());
+    const uint64_t va = r->is_buffer() ? r->gpu_va() : r->descriptor_va();
+    if (!va_watch::touch(kind, va, size, "resource id " + std::to_string(r->id()) + ", " + detail)) {
+        return false;
+    }
+    va_watch::watch_handle(handle, va);
+    return true;
+}
 
 }  // namespace playgta6::gpu::d3d12_guest

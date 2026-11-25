@@ -115,6 +115,11 @@ private:
     uint64_t base_ = 0;
 };
 
+class Resource;
+// --watch-gpu-va (gpu/gpu_va_watch.h): reports `r`'s memory range under `kind` when it is watched.
+// True when it was reported; `handle` (a descriptor written over `r`) is then remembered.
+bool va_watch_resource(const char* kind, const Resource* r, const std::string& detail, uint64_t handle = 0);
+
 class Resource final : public ChildBase<IResourceHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12Resource";
@@ -148,6 +153,8 @@ public:
     bool is_buffer() const { return desc_.Dimension == ResourceDimension::Buffer; }
     const GuestResourceDesc& desc() const { return desc_; }
     uint64_t gpu_va() const { return gpu_va_; }
+    // Textures: the address their descriptor words carry (their memory, or a fake GPU VA range).
+    uint64_t descriptor_va() const { return descriptor_va_ != 0 ? descriptor_va_ : gpu_va_; }
     uint64_t cpu_address() const { return cpu_va_; }  // guest address of CPU-visible memory, 0 if none
     uint32_t mip_levels() const { return mips_; }
     uint32_t array_layers() const;

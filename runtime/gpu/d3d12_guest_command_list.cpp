@@ -10,6 +10,7 @@
 #include <map>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/gpu_va_watch.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -933,6 +934,8 @@ void CommandList::CopyBufferRegion(InterfaceArg<IResourceHost> dst_arg, uint64_t
     }
     Resource* dst = resource(dst_arg);
     Resource* src = resource(src_arg);
+    va_watch_resource("copy source (CopyBufferRegion)", src, "to resource id " + std::to_string(dst ? dst->id() : 0));
+    va_watch_resource("copy destination (CopyBufferRegion)", dst, "from resource id " + std::to_string(src ? src->id() : 0));
     if (dst == nullptr || src == nullptr || !dst->is_buffer() || !src->is_buffer() ||
         dst_offset + bytes > dst->desc().Width || src_offset + bytes > src->desc().Width) {
         note("CopyBufferRegion: invalid resources or range");
@@ -958,6 +961,8 @@ void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg
     }
     Resource* dst = resource(dst_arg);
     Resource* src = resource(src_arg);
+    va_watch_resource("copy source (CopyResource)", src, "to resource id " + std::to_string(dst ? dst->id() : 0));
+    va_watch_resource("copy destination (CopyResource)", dst, "from resource id " + std::to_string(src ? src->id() : 0));
     if (dst == nullptr || src == nullptr) {
         note("CopyResource: invalid resources");
         return;
@@ -986,6 +991,8 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
     }
     Resource* tex = as_resource(dst.pResource);
     Resource* buf = as_resource(src.pResource);
+    va_watch_resource("copy source (CopyTextureRegion)", buf, "to resource id " + std::to_string(tex ? tex->id() : 0));
+    va_watch_resource("copy destination (CopyTextureRegion)", tex, "from resource id " + std::to_string(buf ? buf->id() : 0));
     if (tex == nullptr || buf == nullptr || dst.Type != 0 || src.Type != 1 || tex->is_buffer() || !buf->is_buffer()) {
         device_->note_unsupported_copy("CopyTextureRegion: only buffer footprint -> texture subresource is supported");
         return;
@@ -1447,32 +1454,38 @@ void CommandList::SetGraphicsRoot32BitConstants(uint32_t index, uint32_t count, 
 }
 
 void CommandList::SetComputeRootConstantBufferView(uint32_t index, uint64_t va) {
+    va_watch::touch("root CBV (compute)", va, 1, "root parameter " + std::to_string(index));
     PG6_ROOT_CALL(bridge_.SetComputeRootConstantBufferView(index, va), "SetComputeRootConstantBufferView");
 }
 
 void CommandList::SetGraphicsRootConstantBufferView(uint32_t index, uint64_t va) {
+    va_watch::touch("root CBV (graphics)", va, 1, "root parameter " + std::to_string(index));
     record_root_arg(index, 3, va, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootConstantBufferView(index, va), "SetGraphicsRootConstantBufferView");
 }
 
-void CommandList::SetComputeRootShaderResourceView(uint32_t, uint64_t) {
+void CommandList::SetComputeRootShaderResourceView(uint32_t index, uint64_t va) {
+    va_watch::touch("root SRV (compute)", va, 1, "root parameter " + std::to_string(index));
     if (usable()) {
         note("SetComputeRootShaderResourceView: compute root SRVs are not supported by the state bridge (ignored)");
     }
 }
 
 void CommandList::SetGraphicsRootShaderResourceView(uint32_t index, uint64_t va) {
+    va_watch::touch("root SRV (graphics)", va, 1, "root parameter " + std::to_string(index));
     record_root_arg(index, 4, va, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootShaderResourceView(index, va), "SetGraphicsRootShaderResourceView");
 }
 
-void CommandList::SetComputeRootUnorderedAccessView(uint32_t, uint64_t) {
+void CommandList::SetComputeRootUnorderedAccessView(uint32_t index, uint64_t va) {
+    va_watch::touch("root UAV (compute)", va, 1, "root parameter " + std::to_string(index));
     if (usable()) {
         note("SetComputeRootUnorderedAccessView: compute root UAVs are not supported by the state bridge (ignored)");
     }
 }
 
 void CommandList::SetGraphicsRootUnorderedAccessView(uint32_t index, uint64_t va) {
+    va_watch::touch("root UAV (graphics)", va, 1, "root parameter " + std::to_string(index));
     record_root_arg(index, 5, va, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootUnorderedAccessView(index, va), "SetGraphicsRootUnorderedAccessView");
 }

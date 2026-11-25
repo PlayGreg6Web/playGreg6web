@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "gpu/descriptor_words.h"
+#include "gpu/gpu_va_watch.h"
 #include "gpu/gfx10_descriptors.h"
 #include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
@@ -426,6 +427,7 @@ void Device::present() {
     }
     frame_open_ = false;
     ++presents_;
+    va_watch::set_frame(presents_);
 }
 
 DeviceStats Device::stats() const {
@@ -818,6 +820,20 @@ void Device::store_descriptor_words(uint64_t cpu_handle, const uint32_t* words, 
 void Device::copy_descriptor_memory(const std::vector<std::pair<uint64_t, uint32_t>>& dst_ranges,
                                     const std::vector<std::pair<uint64_t, uint32_t>>& src_ranges, uint32_t type) {
     const uint32_t inc = d3d::descriptor_handle_increment_size(static_cast<d3d::DescriptorHeapType>(type));
+    if (va_watch::active() && inc != 0) {
+        // Pair source and destination slots in order (both lists cover the same count).
+        size_t di = 0;
+        uint32_t dk = 0;
+        for (const auto& [start, count] : src_ranges) {
+            for (uint32_t k = 0; k < count && di < dst_ranges.size(); ++k) {
+                va_watch::descriptor_copied(start + uint64_t{k} * inc, dst_ranges[di].first + uint64_t{dk} * inc);
+                if (++dk == dst_ranges[di].second) {
+                    ++di;
+                    dk = 0;
+                }
+            }
+        }
+    }
     if (inc == 0 || (type != static_cast<uint32_t>(d3d::DescriptorHeapType::CbvSrvUav) &&
                      type != static_cast<uint32_t>(d3d::DescriptorHeapType::Sampler))) {
         return;
@@ -909,6 +925,21 @@ d3d::ViewDescriptor Device::MemorySlotSource::view(const d3d::DescriptorHeap& he
     d3d::ViewDescriptor v;
     bridge::DecodeStatus status = bridge::DecodeStatus::NotDescriptor;
     if (heap.increment() >= bridge::kViewSlotBytes && com::read_guest(address, words, bridge::kViewSlotBytes)) {
+        if (va_watch::active()) {
+            static constexpr const char* kRange[4] = {"SRV", "UAV", "CBV", "sampler"};
+            const char* what = kRange[static_cast<uint32_t>(range) & 3u];
+            const gfx10::SlotContent content = gfx10::classify_slot(words);
+            if (content == gfx10::SlotContent::Image) {
+                const gfx10::ImageResource img = gfx10::decode_image(words);
+                va_watch::touch("table slot (image)", img.base, 1,
+                                std::string(what) + " slot at " + hex(address) + ", " + std::to_string(img.width) + "x" +
+                                    std::to_string(img.height));
+            } else if (content == gfx10::SlotContent::Buffer) {
+                const gfx10::BufferResource b = gfx10::decode_buffer(words);
+                va_watch::touch("table slot (buffer)", b.base, std::max<uint64_t>(b.num_records, 1),
+                                std::string(what) + " slot at " + hex(address));
+            }
+        }
         status = bridge::decode_view_words(*device_.bridge_, words, range, &v);
         if (range != d3d::DescriptorRangeType::Cbv && gfx10::classify_slot(words) == gfx10::SlotContent::Buffer &&
             (status == bridge::DecodeStatus::UnresolvedAddress ||
@@ -1039,6 +1070,8 @@ void Device::CreateConstantBufferView(uint64_t desc_va, uint64_t dest) {
         cbv.buffer_location = g.BufferLocation;
         cbv.size_in_bytes = g.SizeInBytes;
         desc = &cbv;
+        va_watch::touch("descriptor CBV", cbv.buffer_location, cbv.size_in_bytes,
+                        "CreateConstantBufferView at handle " + hex(dest));
     }
     const d3d::Status s = heaps_.create_constant_buffer_view(desc, d3d::CpuDescriptorHandle{dest});
     if (s != d3d::Status::Ok) {
