@@ -1802,6 +1802,24 @@ BindGroupPlan BindGroupPlan::build(
         PlanEntry e;
         e.binding = b.binding;
         e.register_class = b.root_constants ? DescriptorRangeType::Cbv : b.register_class;
+        if (b.heap != HeapAccess::None) {
+            // Heap-indexed: the index is a root constant; the descriptor comes from the bound heap.
+            if (b.heap_index_parameter < signature.parameter_count() &&
+                signature.parameter(b.heap_index_parameter).type == RootParameterType::Constants32Bit &&
+                b.heap_index_dword < signature.parameter(b.heap_index_parameter).num_32bit_values &&
+                b.heap_shift < 32 &&
+                (b.heap == HeapAccess::Sampler) == (b.register_class == DescriptorRangeType::Sampler)) {
+                e.source = PlanSource::HeapIndexed;
+                e.root_parameter_index = b.heap_index_parameter;
+                e.heap_dword = b.heap_index_dword;
+                e.heap_shift = b.heap_shift;
+                plan.parameter_mask_ |= 1ull << e.root_parameter_index;
+            } else {
+                ++plan.unresolved_;
+            }
+            plan.entries_.push_back(e);
+            continue;
+        }
         const BindingSlot* slot = nullptr;
         uint32_t table_offset = 0;
         if (b.root_constants) {
@@ -1870,10 +1888,38 @@ BindGroupPlan BindGroupPlan::build(
         h.u32(static_cast<uint32_t>(e.register_class));
         h.u32(e.root_parameter_index);
         h.u32(e.table_offset);
+        h.u32(e.heap_dword);
+        h.u32(e.heap_shift);
     }
     plan.hash_ = h.h;
     return plan;
 }
+
+namespace {
+
+// The heap slot a heap-indexed plan entry reads under the current root constants: false (and
+// nothing set) when no heap of that type is bound, or the byte offset is not a whole descriptor
+// inside the heap.
+bool heap_slot(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p, DescriptorHeap** heap,
+               uint32_t* index) {
+    const DescriptorHeap* h = state.bound_heap(p.register_class == DescriptorRangeType::Sampler
+                                                   ? DescriptorHeapType::Sampler
+                                                   : DescriptorHeapType::CbvSrvUav);
+    const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
+    if (h == nullptr || p.heap_dword >= values.size()) {
+        return false;
+    }
+    const uint64_t byte_offset = uint64_t{values[p.heap_dword]} << p.heap_shift;
+    const uint64_t increment = h->increment();
+    if (increment == 0 || byte_offset % increment != 0 || byte_offset / increment >= h->capacity()) {
+        return false;
+    }
+    *heap = const_cast<DescriptorHeap*>(h);
+    *index = static_cast<uint32_t>(byte_offset / increment);
+    return true;
+}
+
+}  // namespace
 
 void BindGroupCache::build_entries(
     const RootArgumentState& state,
@@ -1892,6 +1938,7 @@ void BindGroupCache::build_entries(
     }
     out->built_words.clear();
     out->table_bases.clear();
+    out->heap_slots.clear();
     out->from_memory = memory_words(state, bind_point, plan, &out->built_words);
     if (out->from_memory) {
         for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
@@ -1940,6 +1987,21 @@ void BindGroupCache::build_entries(
             e.root_parameter_index = kNoIndex;
             e.sampler = static_sampler_to_desc(desc.static_samplers[p.root_parameter_index]);
             break;
+        case PlanSource::HeapIndexed: {
+            DescriptorHeap* heap = nullptr;
+            uint32_t index = 0;
+            CachedBindGroup::HeapSlot slot;
+            slot.entry = static_cast<uint32_t>(out->entries.size());
+            if (heap_slot(state, bind_point, p, &heap, &index)) {
+                slot.gpu_handle = heap->gpu_handle(index).ptr;
+                slot.generation = heap->generation();
+                table_entry(slot_source_, *heap, index, p.register_class, resolver, resolver_user, &e);
+            } else {
+                ++heap_index_misses_;  // index outside the bound heap: bound as null, counted
+            }
+            out->heap_slots.push_back(slot);
+            break;
+        }
         }
         out->null_entries += e.kind == BindResourceKind::Null ? 1u : 0u;
         out->entries.push_back(e);
@@ -1991,6 +2053,17 @@ BindGroupLookup BindGroupCache::get_or_build(
             break;
         }
     }
+    // Heap-indexed entries: the bound heap and the byte offset the root constant selects.
+    for (const PlanEntry& p : plan.entries()) {
+        if (p.source != PlanSource::HeapIndexed) {
+            continue;
+        }
+        const DescriptorHeap* heap = state.bound_heap(
+            p.register_class == DescriptorRangeType::Sampler ? DescriptorHeapType::Sampler : DescriptorHeapType::CbvSrvUav);
+        const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
+        scratch_key_.push_back(heap != nullptr ? heap->serial() : 0u);
+        scratch_key_.push_back(p.heap_dword < values.size() ? uint64_t{values[p.heap_dword]} << p.heap_shift : ~0ull);
+    }
     const uint64_t h = hash_key(scratch_key_);
     auto it = entries_.find(h);
     if (it != entries_.end() && it->second->key == scratch_key_) {
@@ -2003,6 +2076,14 @@ BindGroupLookup BindGroupCache::get_or_build(
             if (first < arg.heap->capacity()) {
                 changed = arg.heap->range_changed_since(
                     static_cast<uint32_t>(first), windows[t].count, cached.built_generation[t]);
+            }
+        }
+        for (const CachedBindGroup::HeapSlot& s : cached.heap_slots) {
+            DescriptorHeap* heap = nullptr;
+            uint32_t index = 0;
+            if (!changed && s.gpu_handle != 0 && s.entry < plan.entries().size() &&
+                heap_slot(state, bind_point, plan.entries()[s.entry], &heap, &index)) {
+                changed = heap->range_changed_since(index, 1, s.generation);
             }
         }
         if (!changed && cached.from_memory) {
@@ -2058,6 +2139,18 @@ bool BindGroupCache::memory_words(const RootArgumentState& state, BindPoint bind
         out->insert(out->end(), window.begin(), window.end());
         any = true;
     }
+    // Heap-indexed slots the title writes itself, after the windows.
+    for (const PlanEntry& p : plan.entries()) {
+        DescriptorHeap* heap = nullptr;
+        uint32_t index = 0;
+        if (p.source != PlanSource::HeapIndexed || !heap_slot(state, bind_point, p, &heap, &index) ||
+            !slot_source_->reads(*heap)) {
+            continue;
+        }
+        slot_source_->snapshot(*heap, index, 1, &window);
+        out->insert(out->end(), window.begin(), window.end());
+        any = true;
+    }
     return any;
 }
 
@@ -2093,6 +2186,19 @@ bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
         source.snapshot(*r.heap, static_cast<uint32_t>(first), count, &window);
         words.insert(words.end(), window.begin(), window.end());
     }
+    // Heap-indexed slots, by the handle read at the build (the root constants are part of the key).
+    std::vector<std::pair<uint32_t, ResolvedDescriptor>> heap_slots;
+    for (const CachedBindGroup::HeapSlot& s : group->heap_slots) {
+        ResolvedDescriptor r;
+        if (s.gpu_handle == 0 || heaps.resolve_gpu(GpuDescriptorHandle{s.gpu_handle}, &r) != Status::Ok) {
+            continue;
+        }
+        heap_slots.emplace_back(s.entry, r);
+        if (source.reads(*r.heap)) {
+            source.snapshot(*r.heap, r.index, 1, &window);
+            words.insert(words.end(), window.begin(), window.end());
+        }
+    }
     if (words == group->built_words) {
         return false;
     }
@@ -2110,6 +2216,14 @@ bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
                 table_entry(&source, *it->second.heap, static_cast<uint32_t>(std::min<uint64_t>(
                                                            uint64_t{it->second.index} + p.table_offset, 0xffffffffu)),
                             p.register_class, resolver, resolver_user, &e);
+            }
+        } else if (p.source == PlanSource::HeapIndexed) {
+            auto it = std::find_if(heap_slots.begin(), heap_slots.end(), [&](const auto& s) { return s.first == i; });
+            if (it != heap_slots.end()) {
+                e = BindGroupEntry{};
+                e.binding = p.binding;
+                e.root_parameter_index = p.root_parameter_index;
+                table_entry(&source, *it->second.heap, it->second.index, p.register_class, resolver, resolver_user, &e);
             }
         }
         group->null_entries += e.kind == BindResourceKind::Null ? 1u : 0u;

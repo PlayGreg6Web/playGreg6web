@@ -793,12 +793,25 @@ private:
 // One entry of a WebGPU bind group layout as reflected by S6 (a
 // layout-manifest.json "bindings" record): the shader's own @binding plus its
 // D3D register join key.
+// A descriptor the stage reads straight from a bound heap (SM 6.6 ResourceDescriptorHeap[i] /
+// SamplerDescriptorHeap[i], root-signature flags CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED /
+// SAMPLER_HEAP_DIRECTLY_INDEXED): the descriptor at byte offset (root constant << shift) of the
+// bound heap of that type.
+enum class HeapAccess : uint8_t { None = 0, Sampler = 1, Resource = 2 };
+
 struct ShaderBinding {
     uint32_t binding = 0;  // WebGPU @binding inside the group
     DescriptorRangeType register_class = DescriptorRangeType::Srv;  // b=Cbv, t=Srv, u=Uav, s=Sampler
     uint32_t shader_register = 0;
     uint32_t register_space = 0;
     bool root_constants = false;  // S6 "root_constants": true (register is null)
+    // Heap-indexed descriptor (register/space unused): the index is 32-bit value `heap_index_dword`
+    // of root-constants parameter `heap_index_parameter`, shifted left by `heap_shift` into a byte
+    // offset of the heap.
+    HeapAccess heap = HeapAccess::None;
+    uint32_t heap_index_parameter = kNoIndex;
+    uint32_t heap_index_dword = 0;
+    uint32_t heap_shift = 0;
 };
 
 enum class PlanSource : uint32_t {
@@ -807,6 +820,7 @@ enum class PlanSource : uint32_t {
     RootDescriptor = 2,
     RootConstants = 3,
     StaticSampler = 4,
+    HeapIndexed = 5,  // ShaderBinding::heap: root_parameter_index is the constants parameter
 };
 
 struct PlanEntry {
@@ -815,6 +829,8 @@ struct PlanEntry {
     DescriptorRangeType register_class = DescriptorRangeType::Srv;
     uint32_t root_parameter_index = kNoIndex;  // static sampler index for StaticSampler
     uint32_t table_offset = 0;                 // DescriptorTable: descriptor offset from the table start
+    uint32_t heap_dword = 0;                   // HeapIndexed: the index constant within the parameter
+    uint32_t heap_shift = 0;                   // HeapIndexed: byte offset = index << heap_shift
 };
 
 // The (root signature x bind group layout) join, computed once and reused for
@@ -915,6 +931,14 @@ struct CachedBindGroup {
     bool from_memory = false;
     std::vector<uint8_t> built_words;
     std::vector<std::pair<uint32_t, uint64_t>> table_bases;
+    // Heap-indexed entries: (plan entry index, GPU handle of the slot read, its generation at the
+    // build); handle 0 when the index fell outside the heap.
+    struct HeapSlot {
+        uint32_t entry = 0;
+        uint64_t gpu_handle = 0;
+        uint64_t generation = 0;
+    };
+    std::vector<HeapSlot> heap_slots;
 };
 
 // Re-reads the memory-backed table entries of `group` (built for `plan`) through `source`: true
@@ -959,6 +983,9 @@ public:
     size_t size() const noexcept { return entries_.size(); }
     uint64_t hits() const noexcept { return hits_; }
     uint64_t misses() const noexcept { return misses_; }
+    // Heap-indexed bindings whose index fell outside the bound heap (or no heap was bound, or the
+    // byte offset is not a whole descriptor): bound as null, counted.
+    uint64_t heap_index_misses() const noexcept { return heap_index_misses_; }
 
 private:
     void build_entries(
@@ -980,6 +1007,7 @@ private:
     const DescriptorSlotSource* slot_source_ = nullptr;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
+    uint64_t heap_index_misses_ = 0;
 };
 
 // ---------------------------------------------------------------------------

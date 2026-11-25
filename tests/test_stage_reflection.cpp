@@ -324,6 +324,67 @@ void test_layout_join() {
     CHECK(report.find("the stages disagree") != std::string::npos);
 }
 
+// S34 heap sources: parsed, and joined to a root-constants parameter for the index.
+void test_heap_sources() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 1,
+  "stages": {
+    "0x00000000000000c3": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "texture", "view_dimension": "2d-array",
+         "source": {"resource_heap": {"base_user_sgpr": 11, "stride": 32, "index": {"user_sgpr": 10, "shift": 5}}}},
+        {"group": 0, "binding": 1, "kind": "sampler",
+         "source": {"sampler_heap": {"base_user_sgpr": 11, "stride": 16, "index": {"user_sgpr": 9, "shift": 4}}}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    const StageReflection& ps = index.at(0xc3);
+    CHECK(ps.bindings.size() == 2);
+    CHECK(ps.bindings[0].source == ReflectedSource::ResourceHeap && ps.bindings[0].heap_base_sgpr == 11 &&
+          ps.bindings[0].heap_stride == 32 && ps.bindings[0].heap_index_sgpr == 10 && ps.bindings[0].heap_shift == 5);
+    CHECK(ps.bindings[1].source == ReflectedSource::SamplerHeap && ps.bindings[1].heap_stride == 16 &&
+          ps.bindings[1].heap_index_sgpr == 9 && ps.bindings[1].heap_shift == 4);
+
+    StageReflectionIndex bad;
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x1": {"stage": "fragment",
+           "bindings": [{"group": 0, "binding": 0, "kind": "sampler",
+                         "source": {"sampler_heap": {"base_user_sgpr": 11, "stride": 16}}}]}}})",
+        &bad, &error));
+    CHECK(error.find("sampler_heap needs") != std::string::npos);
+
+    // ui_root_signature: [1] = 2 root constants at s9..s10.
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report));
+    CHECK(report.empty());
+    const bridge::LayoutBinding* tex = find(layout, 0, 0);
+    CHECK(tex != nullptr && tex->join.heap == d3d::HeapAccess::Resource &&
+          tex->join.register_class == d3d::DescriptorRangeType::Srv && tex->join.heap_index_parameter == 1 &&
+          tex->join.heap_index_dword == 1 && tex->join.heap_shift == 5 &&
+          tex->entry.view_dimension == static_cast<uint8_t>(GpuTextureViewDimension::Dim2DArray));
+    const bridge::LayoutBinding* smp = find(layout, 0, 1);
+    CHECK(smp != nullptr && smp->join.heap == d3d::HeapAccess::Sampler &&
+          smp->join.register_class == d3d::DescriptorRangeType::Sampler && smp->join.heap_index_parameter == 1 &&
+          smp->join.heap_index_dword == 0 && smp->join.heap_shift == 4);
+
+    // The index outside a constants parameter, and a texture from the sampler heap, are reported.
+    StageReflection wrong = ps;
+    wrong.bindings[0].heap_index_sgpr = 8;  // the table
+    wrong.bindings[1].kind = ReflectedBindingKind::Texture;
+    report.clear();
+    bridge::PipelineLayoutDesc untouched;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &wrong}}, &untouched, &report));
+    CHECK(report.find("s8 is not inside a root-constants parameter") != std::string::npos);
+    CHECK(report.find("cannot come from the sampler heap") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -331,6 +392,7 @@ int main() {
     test_user_data_rule();
     test_vertex_join();
     test_layout_join();
+    test_heap_sources();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;

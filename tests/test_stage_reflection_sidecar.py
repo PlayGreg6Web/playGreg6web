@@ -59,6 +59,33 @@ class SidecarTests(unittest.TestCase):
         kinds = [b["kind"] for b in written["stages"]["0x00000000000000b2"]["bindings"]]
         self.assertEqual(kinds, ["texture", "sampler"])
 
+    def test_heap_sources_are_kept(self):
+        sampler_heap = {"sampler_heap": {"base_user_sgpr": 11, "stride": 16, "index": {"user_sgpr": 9, "shift": 4}}}
+        resource_heap = {"resource_heap": {"base_user_sgpr": 4, "stride": 32, "index": {"user_sgpr": 5, "shift": 5}}}
+        entry = {"hash_fnv1a64": "0x00000000000000c3", "stage": "fragment", "bindings": [
+            {"group": 0, "binding": 0, "kind": "texture", "view_dimension": "2d-array", "source": resource_heap},
+            {"group": 0, "binding": 1, "kind": "sampler", "source": sampler_heap}]}
+        doc, skipped = sidecar.build([entry])
+        self.assertEqual(skipped, {})
+        bindings = doc["stages"]["0x00000000000000c3"]["bindings"]
+        self.assertEqual(bindings[0]["source"], resource_heap)
+        self.assertEqual(bindings[1]["source"], sampler_heap)
+
+    def test_malformed_heap_source_is_skipped(self):
+        bad = [
+            {"sampler_heap": {"base_user_sgpr": 11, "stride": 16}},
+            {"sampler_heap": {"base_user_sgpr": 11, "stride": 16, "index": {"user_sgpr": 9}}},
+            {"resource_heap": {"base_user_sgpr": 4, "stride": 32, "index": {"user_sgpr": 5, "shift": 40}}},
+            {"resource_heap": {"base_user_sgpr": "4", "stride": 32, "index": {"user_sgpr": 5, "shift": 5}}},
+            {"sampler_heap": 3},
+        ]
+        for i, source in enumerate(bad):
+            entry = {"hash_fnv1a64": f"0x{i:016x}", "stage": "fragment",
+                     "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": source}]}
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, source)
+            self.assertEqual(skipped, {"malformed heap source": 1}, source)
+
 
 if __name__ == "__main__":
     unittest.main()

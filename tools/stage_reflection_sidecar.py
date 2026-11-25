@@ -6,7 +6,8 @@ Input: one or more JSON files, each either a `playgta6-shaders translate-rdna2 -
 stage) or a `playgta6-shaders pack-rdna2 --json` summary (its `entries` list). A stage enters the
 sidecar only when its reflection carries the join keys the runtime needs:
   - every binding has a `source` ({user_sgpr, table_byte_offset} | {user_sgpr, root_constants} |
-    {user_sgpr, root_descriptor} | {static_sampler});
+    {user_sgpr, root_descriptor} | {static_sampler} | {sampler_heap | resource_heap: {base_user_sgpr,
+    stride, index: {user_sgpr, shift}}} (S34: a directly indexed heap, index from a root constant));
   - a vertex stage that fetches attributes lists `vertex_inputs` ({location, vb_slot, byte_offset,
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
@@ -46,6 +47,17 @@ def stage_name(stage: str) -> str | None:
     return {"vertex": "vertex", "fragment": "fragment", "pixel": "fragment", "compute": "compute"}.get(stage)
 
 
+def heap_source_ok(source: dict[str, Any]) -> bool | None:
+    """None: not a heap source; else whether it has base_user_sgpr, stride, index {user_sgpr, shift}."""
+    heap = source.get("sampler_heap", source.get("resource_heap"))
+    if heap is None:
+        return None
+    if not isinstance(heap, dict) or not isinstance(heap.get("index"), dict):
+        return False
+    ints = (heap.get("base_user_sgpr"), heap.get("stride"), heap["index"].get("user_sgpr"), heap["index"].get("shift"))
+    return all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in ints) and ints[3] < 32
+
+
 def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, str]:
     """(key, sidecar stage, reason it was skipped)."""
     key = entry.get("hash_fnv1a64")
@@ -57,6 +69,8 @@ def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, s
         source = b.get("source")
         if not isinstance(source, dict):
             return key, None, "binding without source"
+        if heap_source_ok(source) is False:
+            return key, None, "malformed heap source"
         kind = KIND_MAP.get(str(b.get("kind", "")))
         if kind is None:
             return key, None, f"unknown binding kind {b.get('kind')!r}"

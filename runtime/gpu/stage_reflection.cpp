@@ -355,7 +355,23 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                 *error = "binding " + std::to_string(r.group) + ":" + std::to_string(r.binding) + " has no source";
                 return false;
             }
-            if (src->get("static_sampler") != nullptr) {
+            const Json* heap = src->get("sampler_heap");
+            const bool sampler_heap = heap != nullptr;
+            if (heap == nullptr) {
+                heap = src->get("resource_heap");
+            }
+            if (heap != nullptr) {
+                r.source = sampler_heap ? ReflectedSource::SamplerHeap : ReflectedSource::ResourceHeap;
+                const Json* index = heap->type == Json::Type::Object ? heap->get("index") : nullptr;
+                if (index == nullptr || index->type != Json::Type::Object ||
+                    !get_u32(*heap, "base_user_sgpr", &r.heap_base_sgpr) || !get_u32(*heap, "stride", &r.heap_stride) ||
+                    !get_u32(*index, "user_sgpr", &r.heap_index_sgpr) || !get_u32(*index, "shift", &r.heap_shift) ||
+                    r.heap_shift >= 32) {
+                    *error = std::string(sampler_heap ? "sampler_heap" : "resource_heap") +
+                             " needs base_user_sgpr, stride and index {user_sgpr, shift}";
+                    return false;
+                }
+            } else if (src->get("static_sampler") != nullptr) {
                 r.source = ReflectedSource::StaticSampler;
                 if (!get_u32(*src, "static_sampler", &r.static_sampler)) {
                     *error = "bad static_sampler";
@@ -411,8 +427,31 @@ std::string binding_key(const ReflectedBinding& b) {
         case ReflectedSource::RootConstants: k += " <- root constants at s" + std::to_string(b.user_sgpr); break;
         case ReflectedSource::RootDescriptor: k += " <- root descriptor at s" + std::to_string(b.user_sgpr); break;
         case ReflectedSource::StaticSampler: k += " <- static sampler " + std::to_string(b.static_sampler); break;
+        case ReflectedSource::SamplerHeap:
+        case ReflectedSource::ResourceHeap:
+            k += std::string(" <- ") + (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") +
+                 " heap[s" + std::to_string(b.heap_index_sgpr) + " << " + std::to_string(b.heap_shift) + "]";
+            break;
     }
     return k;
+}
+
+// The root-constants parameter holding user SGPR `user_sgpr` and the 32-bit value's index in it
+// (-1 when no constants parameter covers it).
+int root_constant_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr, uint32_t* dword) {
+    uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
+    for (size_t i = 0; i < rs.parameters.size(); ++i) {
+        const uint32_t n = parameter_dwords(rs.parameters[i]);
+        if (user_sgpr >= sgpr && user_sgpr < sgpr + n) {
+            if (rs.parameters[i].parameter_type != d3d::RootParameterType::Constants32Bit) {
+                return -1;
+            }
+            *dword = user_sgpr - sgpr;
+            return static_cast<int>(i);
+        }
+        sgpr += n;
+    }
+    return -1;
 }
 
 bool kind_accepts(ReflectedBindingKind kind, d3d::DescriptorRangeType cls) {
@@ -459,7 +498,9 @@ bool same_binding(const bridge::LayoutBinding& a, const bridge::LayoutBinding& b
     return a.entry.type == b.entry.type && a.entry.binding_type == b.entry.binding_type &&
            a.entry.view_dimension == b.entry.view_dimension && a.join.register_class == b.join.register_class &&
            a.join.shader_register == b.join.shader_register && a.join.register_space == b.join.register_space &&
-           a.join.root_constants == b.join.root_constants;
+           a.join.root_constants == b.join.root_constants && a.join.heap == b.join.heap &&
+           a.join.heap_index_parameter == b.join.heap_index_parameter &&
+           a.join.heap_index_dword == b.join.heap_index_dword && a.join.heap_shift == b.join.heap_shift;
 }
 
 pso::WgpuVertexFormat element_class(pso::WgpuVertexFormat f, ReflectedComponentType* cls) {
@@ -553,7 +594,31 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
             // Where the descriptor comes from, as a root-signature register.
             d3d::DescriptorRangeType cls = d3d::DescriptorRangeType::Srv;
             uint32_t reg = 0, space = 0;
-            if (b.source == ReflectedSource::StaticSampler) {
+            if (b.source == ReflectedSource::SamplerHeap || b.source == ReflectedSource::ResourceHeap) {
+                // Heap-indexed: the index must be a root constant; the class follows the kind.
+                uint32_t dword = 0;
+                const int pi = root_constant_for_user_sgpr(rs, compute, b.heap_index_sgpr, &dword);
+                if (pi < 0) {
+                    fail(b, "s" + std::to_string(b.heap_index_sgpr) + " is not inside a root-constants parameter");
+                    continue;
+                }
+                const bool sampler_kind =
+                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+                if ((b.source == ReflectedSource::SamplerHeap) != sampler_kind) {
+                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
+                                (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") + " heap");
+                    continue;
+                }
+                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                          ? d3d::DescriptorRangeType::Uav
+                          : d3d::DescriptorRangeType::Srv;
+                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+                lb.join.heap_index_dword = dword;
+                lb.join.heap_shift = b.heap_shift;
+            } else if (b.source == ReflectedSource::StaticSampler) {
                 if (b.static_sampler >= rs.static_samplers.size()) {
                     fail(b, "no static sampler " + std::to_string(b.static_sampler));
                     continue;
@@ -606,6 +671,8 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                         space = p.register_space;
                         break;
                     case ReflectedSource::StaticSampler:
+                    case ReflectedSource::SamplerHeap:
+                    case ReflectedSource::ResourceHeap:
                         break;
                 }
             }

@@ -371,6 +371,9 @@ struct BridgeStats {
     // Uniform bindings smaller than the stage's block with no room in their buffer, bound as a
     // relocated copy zero-extended to the block size.
     uint64_t uniforms_zero_extended = 0;
+    // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
+    // the bound heap: bound as null.
+    uint64_t heap_index_misses = 0;
 };
 
 class CommandListBridge {

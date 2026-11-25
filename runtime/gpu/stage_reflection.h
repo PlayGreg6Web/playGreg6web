@@ -29,7 +29,13 @@
 //                 "sample_type" ("float" | "unfilterable_float" | "depth" | "sint" | "uint"),
 //                 "multisampled", "min_binding_size_bytes",
 //                 "source": {"user_sgpr", "table_byte_offset"} | {"user_sgpr", "root_constants": true} |
-//                           {"user_sgpr", "root_descriptor": true} | {"static_sampler": <index>}}]}}}
+//                           {"user_sgpr", "root_descriptor": true} | {"static_sampler": <index>} |
+//                           {"sampler_heap" | "resource_heap": {"base_user_sgpr", "stride",
+//                                                               "index": {"user_sgpr", "shift"}}}}]}}}
+// A heap source (S34; SM 6.6 SamplerDescriptorHeap[i] / ResourceDescriptorHeap[i] under the root-
+// signature flags SAMPLER_HEAP_DIRECTLY_INDEXED / CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED): the index is
+// a root constant (the user SGPR inside a constants parameter); the descriptor is the one at byte
+// offset (index << shift) of the bound heap, chosen at draw time.
 // Stages without an entry keep the layer's conventions (layout_from_root_signature, input element i
 // -> @location(i)).
 
@@ -69,7 +75,7 @@ enum class ReflectedBindingKind : uint8_t {
     ComparisonSampler,
 };
 
-enum class ReflectedSource : uint8_t { Table = 0, RootConstants, RootDescriptor, StaticSampler };
+enum class ReflectedSource : uint8_t { Table = 0, RootConstants, RootDescriptor, StaticSampler, SamplerHeap, ResourceHeap };
 
 struct ReflectedBinding {
     uint32_t group = 0;
@@ -84,6 +90,13 @@ struct ReflectedBinding {
     uint32_t user_sgpr = 0;           // Table / RootConstants / RootDescriptor
     uint32_t table_byte_offset = 0;   // Table
     uint32_t static_sampler = 0;      // StaticSampler: index in the root signature's static samplers
+    // SamplerHeap / ResourceHeap (S34): the descriptor at byte offset (user SGPR heap_index_sgpr <<
+    // heap_shift) of the heap whose base is in user SGPR heap_base_sgpr; heap_stride is the
+    // descriptor size the stage assumes.
+    uint32_t heap_base_sgpr = 0;
+    uint32_t heap_stride = 0;
+    uint32_t heap_index_sgpr = 0;
+    uint32_t heap_shift = 0;
 };
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };

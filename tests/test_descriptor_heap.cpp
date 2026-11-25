@@ -1157,6 +1157,108 @@ void test_bind_group_plan() {
     CHECK(empty.entries().empty() && empty.parameter_mask() == 0);
 }
 
+// SM 6.6 directly indexed heaps (S34 heap sources): the descriptor comes from the bound heap at
+// byte offset (root constant << shift), chosen at draw time.
+void test_heap_indexed_bind_groups() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 64, true);
+    DescriptorHeap* smp = make_heap(reg, DescriptorHeapType::Sampler, 16, true);
+    RootSignatureDesc d;
+    d.flags = 0x400 | 0x800;  // CBV_SRV_UAV / SAMPLER heap directly indexed
+    d.parameters.push_back(constants(0, 2));  // s8..s9
+    RootSignature rs;
+    CHECK(RootSignature::build(d, &rs).ok());
+
+    SamplerDesc a;
+    a.max_anisotropy = 4;
+    SamplerDesc b;
+    b.max_anisotropy = 8;
+    CHECK(reg.create_sampler(a, cpu_at(smp, 3)) == Status::Ok);
+    CHECK(reg.create_sampler(b, cpu_at(smp, 5)) == Status::Ok);
+    fill_srvs(reg, heap, 7, 1, 700);
+    fill_srvs(reg, heap, 9, 1, 900);
+
+    // Sampler index in constant 0 (byte offset = value << 4), texture index in constant 1 (<< 5).
+    ShaderBinding s;
+    s.binding = 0;
+    s.register_class = DescriptorRangeType::Sampler;
+    s.heap = HeapAccess::Sampler;
+    s.heap_index_parameter = 0;
+    s.heap_index_dword = 0;
+    s.heap_shift = 4;
+    ShaderBinding t;
+    t.binding = 1;
+    t.register_class = DescriptorRangeType::Srv;
+    t.heap = HeapAccess::Resource;
+    t.heap_index_parameter = 0;
+    t.heap_index_dword = 1;
+    t.heap_shift = 5;
+    const ShaderBinding bindings[] = {s, t};
+    const BindGroupPlan plan = BindGroupPlan::build(rs, bindings, WebGpuStage::Fragment);
+    CHECK(plan.unresolved_count() == 0 && plan.parameter_mask() == 1);
+    CHECK(plan.entries()[0].source == PlanSource::HeapIndexed && plan.entries()[1].source == PlanSource::HeapIndexed);
+
+    // The index must be a value of a constants parameter, and the heap must match the class.
+    ShaderBinding off_end = s;
+    off_end.heap_index_dword = 2;
+    ShaderBinding wrong_heap = t;
+    wrong_heap.heap = HeapAccess::Sampler;
+    const ShaderBinding bad[] = {off_end, wrong_heap};
+    CHECK(BindGroupPlan::build(rs, bad, WebGpuStage::Fragment).unresolved_count() == 2);
+
+    RootArgumentState st;
+    BindGroupCache cache;
+    const BindPoint G = BindPoint::Graphics;
+    DescriptorHeap* heaps[2] = {heap, smp};
+    CHECK(st.set_descriptor_heaps(2, heaps) == Status::Ok);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    const uint32_t k0[2] = {3, 7};
+    CHECK(st.set_root_constants(G, 0, 2, k0, 0) == Status::Ok);
+    BindGroupLookup g = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(g.status == Status::Ok && g.rebuilt && g.bind_group != nullptr);
+    CHECK(g.bind_group->entries[0].kind == BindResourceKind::Sampler &&
+          g.bind_group->entries[0].sampler.max_anisotropy == 4);
+    CHECK(g.bind_group->entries[1].kind == BindResourceKind::TextureView && g.bind_group->entries[1].resource_id == 700);
+    CHECK(g.bind_group->null_entries == 0 && cache.heap_index_misses() == 0);
+    g.bind_group->gpu_id = 50;
+    CHECK(!cache.get_or_build(st, G, plan, 1, test_resolver, nullptr).rebuilt);
+
+    // Changing the root constants selects other descriptors.
+    const uint32_t k1[2] = {5, 9};
+    CHECK(st.set_root_constants(G, 0, 2, k1, 0) == Status::Ok);
+    BindGroupLookup g2 = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(g2.rebuilt && g2.bind_group != g.bind_group);
+    CHECK(g2.bind_group->entries[0].sampler.max_anisotropy == 8 && g2.bind_group->entries[1].resource_id == 900);
+    g2.bind_group->gpu_id = 51;
+    // Back to the first values: the first group again, unchanged.
+    CHECK(st.set_root_constants(G, 0, 2, k0, 0) == Status::Ok);
+    BindGroupLookup back = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(!back.rebuilt && back.bind_group->gpu_id == 50);
+    // Rewriting the slot the group reads rebuilds it in place.
+    fill_srvs(reg, heap, 7, 1, 701);
+    BindGroupLookup rewritten = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(rewritten.rebuilt && rewritten.retired_gpu_id == 50 && rewritten.bind_group->entries[1].resource_id == 701);
+
+    // Out of range (and not a whole descriptor): null entries, counted, no crash.
+    const uint32_t far[2] = {16, 0xffffffffu};
+    CHECK(st.set_root_constant(G, 0, far[0], 0) == Status::Ok);
+    CHECK(st.set_root_constant(G, 0, far[1], 1) == Status::Ok);
+    BindGroupLookup oob = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(oob.status == Status::Ok && oob.bind_group != nullptr);
+    CHECK(oob.bind_group->entries[0].kind == BindResourceKind::Null && oob.bind_group->entries[1].kind == BindResourceKind::Null);
+    CHECK(oob.bind_group->null_entries == 2 && cache.heap_index_misses() == 2);
+    CHECK(!cache.get_or_build(st, G, plan, 1, test_resolver, nullptr).rebuilt);  // cached, not re-counted
+    CHECK(cache.heap_index_misses() == 2);
+
+    // No sampler heap bound: null, counted.
+    DescriptorHeap* only_views[1] = {heap};
+    CHECK(st.set_descriptor_heaps(1, only_views) == Status::Ok);
+    CHECK(st.set_root_constants(G, 0, 2, k0, 0) == Status::Ok);
+    BindGroupLookup no_heap = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(no_heap.status == Status::Ok && no_heap.bind_group->entries[0].kind == BindResourceKind::Null);
+    CHECK(no_heap.bind_group->entries[1].resource_id == 701 && cache.heap_index_misses() == 3);
+}
+
 void test_bind_group_cache() {
     DescriptorHeapRegistry reg;
     DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 256, true);
@@ -1781,6 +1883,7 @@ int main() {
     test_root_arguments();
     test_bind_group_plan();
     test_bind_group_cache();
+    test_heap_indexed_bind_groups();
     test_state_tracker_basic();
     test_state_tracker_subresources_and_split();
     test_state_tracker_execute();
