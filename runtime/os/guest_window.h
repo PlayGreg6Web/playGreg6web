@@ -29,6 +29,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -160,11 +162,35 @@ public:
     // take_written within the pass: false if [va, va + len) is not translated; otherwise appends
     // the offsets (from `va`, as take_written) of the slots marked when this pass first took them.
     bool take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets);
+    // Takes every marked slot of the window at once (one scan of the mark table, alias groups
+    // expanded) and appends their slot numbers to `slots`; every later take() of this pass answers
+    // from that scan. False (nothing taken) with the window off.
+    bool take_dirty(std::vector<uint64_t>* slots);
 
 private:
     std::vector<uint32_t> pass_of_;  // per slot: the pass that took its mark (0: none yet)
     std::vector<uint8_t> marked_;    // per slot: whether that take found it marked
+    std::vector<uint8_t> scan_marked_;  // per slot: marked in this pass's take_dirty scan
+    std::vector<uint64_t> scan_dirty_;  // the slots set in scan_marked_
+    bool scanned_ = false;
     uint32_t pass_ = 0;
+};
+
+// O36: window slot -> the keys (buffers) whose range overlaps it, so a flush visits only the
+// buffers of dirty slots instead of walking every tracked buffer. Not thread-safe (the owner locks).
+class SlotIndex {
+public:
+    // Indexes [va, va + len) (a window range) under `key`; replaces an earlier entry of the key.
+    void add(const void* key, uint64_t va, uint64_t len);
+    void remove(const void* key);
+    // Appends each key overlapping any of `slots` (slot numbers from MarkPass::take_dirty) once.
+    void collect(const std::vector<uint64_t>& slots, std::vector<const void*>* out) const;
+    void clear();
+    size_t size() const;
+
+private:
+    std::unordered_map<uint64_t, std::vector<const void*>> by_slot_;
+    std::unordered_map<const void*, std::pair<uint64_t, uint64_t>> ranges_;  // key -> first, last slot
 };
 
 // (pointer, length) marshaling for host code called with guest buffers (O29; the generated

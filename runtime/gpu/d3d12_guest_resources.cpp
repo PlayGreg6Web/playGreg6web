@@ -410,6 +410,7 @@ void Device::track_cpu_buffer(Resource* resource) {
 void Device::untrack_cpu_buffer(Resource* resource) {
     std::lock_guard<std::mutex> lock(tracked_mutex_);
     tracked_.erase(std::remove(tracked_.begin(), tracked_.end(), resource), tracked_.end());
+    slot_index_.remove(resource);
 }
 
 void Device::track_guest_texture(const TrackedTexture& tex) {
@@ -906,8 +907,38 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     };
     {
         std::lock_guard<std::mutex> lock(tracked_mutex_);
-        for (Resource* r : tracked_) {
-            r->flush_shadow(encoder, &mark_pass_);
+        // O36: take every dirty window slot once, then visit only the buffers overlapping one (plus
+        // the buffers not indexed yet: non-window, or whose first full comparison is still due).
+        // Verification mode compares unmarked pages too, so it visits everything.
+        std::vector<uint64_t> dirty;
+        const bool scanned = mark_pass_.take_dirty(&dirty);
+        if (!scanned || os::guest_window::write_marks_verified()) {
+            slot_index_.clear();
+            for (Resource* r : tracked_) {
+                r->set_slot_indexed(false);
+                r->flush_shadow(encoder, &mark_pass_);
+            }
+        } else {
+            std::vector<const void*> visit;
+            slot_index_.collect(dirty, &visit);
+            for (Resource* r : tracked_) {
+                if (r->slot_indexed()) {
+                    continue;
+                }
+                r->flush_shadow(encoder, &mark_pass_);
+                if (r->window_marks_in_use()) {
+                    slot_index_.add(r, r->cpu_address(), r->shadow_bytes());
+                    r->set_slot_indexed(true);
+                }
+            }
+            for (const void* p : visit) {
+                Resource* r = const_cast<Resource*>(static_cast<const Resource*>(p));
+                r->flush_shadow(encoder, &mark_pass_);
+                if (!r->window_marks_in_use()) {
+                    slot_index_.remove(r);
+                    r->set_slot_indexed(false);
+                }
+            }
         }
     }
     // Relocated uniform ranges: refresh the aligned copies whose guest bytes changed.

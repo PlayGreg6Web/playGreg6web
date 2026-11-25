@@ -179,6 +179,12 @@ public:
     // Shadow comparison (CPU-visible buffers): appends WriteBuffer packets for changed pages.
     // `marks`: the flush's pass over the translated window's write marks (null: a pass of its own).
     void flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks = nullptr);
+    // O36: the flush indexes a buffer by window slot once its write marks are in use; it is then
+    // only flushed when one of its slots is marked.
+    bool window_marks_in_use() const { return window_marked_ && cpu_va_ != 0 && !shadow_.empty(); }
+    uint64_t shadow_bytes() const { return shadow_.size(); }
+    bool slot_indexed() const { return slot_indexed_; }
+    void set_slot_indexed(bool v) { slot_indexed_ = v; }
     // Marks the texture as the presented back buffer (Device::set_back_buffer).
     void mark_back_buffer();
     bool is_back_buffer() const { return back_buffer_; }
@@ -206,6 +212,7 @@ private:
     // O37: the translated window's write marks cover this buffer and were taken at a full
     // comparison: later flushes compare only the pages of slots marked since.
     bool window_marked_ = false;
+    bool slot_indexed_ = false;  // under Device::tracked_mutex_
     friend TextureProbeTotals probe_texture_contents(size_t budget);
     bool probe_registered_ = false;
     bool probe_seen_data_ = false;

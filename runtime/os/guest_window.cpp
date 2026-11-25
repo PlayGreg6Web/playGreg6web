@@ -188,11 +188,79 @@ void MarkPass::begin() {
         std::fill(pass_of_.begin(), pass_of_.end(), 0u);
         pass_ = 1;
     }
+    for (const uint64_t slot : scan_dirty_) {
+        scan_marked_[slot] = 0;
+    }
+    scan_dirty_.clear();
+    scanned_ = false;
+}
+
+bool MarkPass::take_dirty(std::vector<uint64_t>* slots) {
+    if (!enabled()) {
+        return false;
+    }
+    if (pass_ == 0) {
+        pass_ = 1;
+    }
+    if (scan_marked_.empty()) {
+        scan_marked_.assign(kWindowSlots, 0u);
+    }
+    State& s = state();
+    std::unique_lock<std::mutex> lock(s.mutex, std::defer_lock);
+    if (s.alias_group_count.load(std::memory_order_acquire) != 0) {
+        lock.lock();
+    }
+    auto add = [&](uint64_t slot) {
+        if (scan_marked_[slot] != 0) {
+            return;
+        }
+        scan_marked_[slot] = 1;
+        scan_dirty_.push_back(slot);
+        if (slots != nullptr) {
+            slots->push_back(slot);
+        }
+    };
+    for (uint64_t base = 0; base < kWindowSlots; base += 8) {
+        uint64_t word = 0;
+        std::memcpy(&word, &__playgta6_window_dirty[base], sizeof(word));
+        if (word == 0) {
+            continue;
+        }
+        for (uint64_t slot = base; slot < base + 8 && slot < kWindowSlots; ++slot) {
+            if (mark(slot).exchange(0, std::memory_order_acq_rel) == 0) {
+                continue;
+            }
+            add(slot);
+            if (lock.owns_lock()) {
+                const auto git = s.alias_groups.find(slot_host_locked(slot));
+                if (git != s.alias_groups.end()) {
+                    for (const uint64_t g : git->second) {
+                        if (g != slot) {
+                            mark(g).exchange(0, std::memory_order_acq_rel);
+                            add(g);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    scanned_ = true;
+    return true;
 }
 
 bool MarkPass::take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets) {
     if (!translated(va) || len == 0) {
         return false;
+    }
+    if (scanned_) {
+        const uint64_t last = slot_of(std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1));
+        for (uint64_t slot = slot_of(va); slot <= last; ++slot) {
+            if (scan_marked_[slot] != 0 && slot_offsets != nullptr) {
+                const uint64_t start = slot_va(slot);
+                slot_offsets->push_back(start > va ? start - va : 0);
+            }
+        }
+        return true;
     }
     if (pass_of_.empty()) {
         pass_of_.assign(kWindowSlots, 0u);
@@ -238,6 +306,59 @@ bool MarkPass::take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets
         }
     }
     return true;
+}
+
+void SlotIndex::add(const void* key, uint64_t va, uint64_t len) {
+    remove(key);
+    if (!in_window(va) || len == 0) {
+        return;
+    }
+    const uint64_t first = slot_of(va);
+    const uint64_t last = slot_of(std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1));
+    for (uint64_t slot = first; slot <= last; ++slot) {
+        by_slot_[slot].push_back(key);
+    }
+    ranges_[key] = {first, last};
+}
+
+void SlotIndex::remove(const void* key) {
+    const auto it = ranges_.find(key);
+    if (it == ranges_.end()) {
+        return;
+    }
+    for (uint64_t slot = it->second.first; slot <= it->second.second; ++slot) {
+        const auto sit = by_slot_.find(slot);
+        if (sit == by_slot_.end()) {
+            continue;
+        }
+        auto& v = sit->second;
+        v.erase(std::remove(v.begin(), v.end(), key), v.end());
+        if (v.empty()) {
+            by_slot_.erase(sit);
+        }
+    }
+    ranges_.erase(it);
+}
+
+void SlotIndex::collect(const std::vector<uint64_t>& slots, std::vector<const void*>* out) const {
+    const size_t start = out->size();
+    for (const uint64_t slot : slots) {
+        const auto it = by_slot_.find(slot);
+        if (it != by_slot_.end()) {
+            out->insert(out->end(), it->second.begin(), it->second.end());
+        }
+    }
+    std::sort(out->begin() + static_cast<std::ptrdiff_t>(start), out->end());
+    out->erase(std::unique(out->begin() + static_cast<std::ptrdiff_t>(start), out->end()), out->end());
+}
+
+void SlotIndex::clear() {
+    by_slot_.clear();
+    ranges_.clear();
+}
+
+size_t SlotIndex::size() const {
+    return ranges_.size();
 }
 
 uint64_t map_runtime_range(void* host, uint64_t bytes) {

@@ -1072,6 +1072,7 @@ private:
     uint64_t next_fake_va_ = kFakeGpuVaBase;
     std::mutex tracked_mutex_;
     std::vector<Resource*> tracked_;
+    os::guest_window::SlotIndex slot_index_;  // O36: window slot -> tracked buffers (under tracked_mutex_)
     // O36: one pass over the translated window's write marks per flush_cpu_buffers, shared by the
     // tracked buffers and the relocated ranges (under flush_mutex_).
     std::mutex flush_mutex_;

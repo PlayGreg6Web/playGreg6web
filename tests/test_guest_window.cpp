@@ -3,6 +3,7 @@
 // integration (PlacementPolicy::PhantomGpuTranslatedCpu): a 16 GiB CPU window that takes no pool
 // address space, pool pages scattered across it, aliasing the pool view. Synthetic data only.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -570,6 +571,42 @@ void test_write_marks() {
         c.clear();
         CHECK(pass.take(W, 2 * k64K, &c) && (c == std::vector<uint64_t>{0}));  // the next pass sees it
         CHECK(!pass.take(0x1000, 16, &c));  // not translated
+    }
+
+    // O36: one scan takes every dirty slot; a slot index visits only the buffers overlapping them.
+    {
+        gw::MarkPass pass;
+        pass.begin();
+        std::vector<uint64_t> drain;
+        CHECK(pass.take_dirty(&drain));  // clear whatever earlier checks left marked
+        pass.begin();
+        gw::SlotIndex index;
+        std::vector<int> keys(3000);
+        for (int i = 0; i < 3000; ++i) {
+            index.add(&keys[i], W + static_cast<uint64_t>(10 + i) * k64K, k64K);  // one slot each
+        }
+        index.add(&keys[0], W + 10 * k64K, 2 * k64K);  // keys[0] now spans slots 10 and 11 (replaces)
+        CHECK(index.size() == 3000);
+        gw::mark_written(W + 1500 * k64K + 5, 1);
+        gw::mark_written(W + 11 * k64K, 1);  // shared slot: keys[0] and keys[1]
+        std::vector<uint64_t> dirty;
+        CHECK(pass.take_dirty(&dirty) && dirty.size() == 2);
+        std::vector<const void*> visit;
+        index.collect(dirty, &visit);
+        CHECK(visit.size() == 3);
+        CHECK(std::find(visit.begin(), visit.end(), &keys[0]) != visit.end());
+        CHECK(std::find(visit.begin(), visit.end(), &keys[1]) != visit.end());
+        CHECK(std::find(visit.begin(), visit.end(), &keys[1490]) != visit.end());
+        // The pass answers later takes from the scan: marked slots only, none re-taken.
+        std::vector<uint64_t> r;
+        CHECK(pass.take(W + 1490 * k64K, 12 * k64K, &r) && (r == std::vector<uint64_t>{10 * k64K}));
+        index.remove(&keys[0]);
+        visit.clear();
+        index.collect(dirty, &visit);
+        CHECK(visit.size() == 2);
+        pass.begin();
+        dirty.clear();
+        CHECK(pass.take_dirty(&dirty) && dirty.empty());
     }
 
     // Verification counters.
