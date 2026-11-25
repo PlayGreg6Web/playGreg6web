@@ -581,6 +581,8 @@ private:
                           StorageRedirect* out);
     // Emits one conversion dispatch: real -> intermediate (`into_intermediate`) or back.
     void emit_storage_conversion(const StorageRedirect& r, bool into_intermediate);
+    // Fragment-stage redirects of the open render pass: converted out when the pass ends.
+    std::vector<StorageRedirect> pass_redirects_;
 
     StateBridgeDevice& device_;
     CommandEncoder& encoder_;

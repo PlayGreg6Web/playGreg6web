@@ -1130,6 +1130,18 @@ void CommandListBridge::drain_events() {
             encoder_.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
             end_usage_scope();
             render_pass_open_ = false;
+            // Fragment storage bindings redirected to intermediates: what the pass wrote goes back.
+            for (const StorageRedirect& r : pass_redirects_) {
+                if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly)) {
+                    emit_storage_conversion(r, false);
+                }
+            }
+            if (!pass_redirects_.empty()) {
+                pass_redirects_.clear();
+                compute_pipeline_bound_ = 0;
+                compute_groups_.clear();
+                compute_pass_valid_ = false;
+            }
             break;
         case pso::StateEventType::SetPipeline:
             if (e.pipeline_key != nullptr && graphics_pso_ != nullptr) {
@@ -1659,9 +1671,11 @@ bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, 
                                          const TextureInfo& info, uint8_t own_format, const GpuTextureViewDesc& view,
                                          CommandEncoder& side, StorageRedirect* out) {
     using D = GpuTextureViewDimension;
-    // Compute only: the conversion runs as dispatches next to the stage's own.
-    if ((layout.visibility & GpuShaderStageBits::Compute) == 0 ||
-        (layout.visibility & ~GpuShaderStageBits::Compute) != 0 || info.sample_count > 1 ||
+    // Compute or fragment only: the conversions run as dispatches next to the stage's own (compute),
+    // or around the render pass (fragment).
+    const bool compute_only = (layout.visibility & ~GpuShaderStageBits::Compute) == 0;
+    const bool fragment_only = (layout.visibility & ~GpuShaderStageBits::Fragment) == 0;
+    if (layout.visibility == 0 || (!compute_only && !fragment_only) || info.sample_count > 1 ||
         !convertible_storage_format(own_format) || !convertible_storage_format(layout.storage_format)) {
         return false;
     }
@@ -1818,15 +1832,60 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
 // ---- Work ----
 
 bool CommandListBridge::prepare_render_draw() {
-    const bool ok = tracker_.prepare_draw(&device_.pipeline_cache());
-    drain_events();
-    if (ok && graphics_pso_ != nullptr && graphics_pso_->layout_ != nullptr &&
-        graphics_pso_->plans_.size() == graphics_pso_->layout_->groups.size() &&
-        !apply_bind_groups(d3d::BindPoint::Graphics, graphics_pso_->layout_, graphics_pso_->plans_, &render_groups_,
-                           true)) {
-        ++stats_.draws_skipped;
-        diagnostics_ |= BridgeDiag::DrawSkipped;
-        return false;
+    bool ok = false;
+    // Attempt 1 may find fragment storage bindings redirected to intermediates that the pass has not
+    // copied in yet: the pass ends, the conversions run, and attempt 2 reopens it (loadOp load).
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ok = tracker_.prepare_draw(&device_.pipeline_cache());
+        drain_events();
+        if (ok && graphics_pso_ != nullptr && graphics_pso_->layout_ != nullptr &&
+            graphics_pso_->plans_.size() == graphics_pso_->layout_->groups.size() &&
+            !apply_bind_groups(d3d::BindPoint::Graphics, graphics_pso_->layout_, graphics_pso_->plans_,
+                               &render_groups_, true)) {
+            ++stats_.draws_skipped;
+            diagnostics_ |= BridgeDiag::DrawSkipped;
+            return false;
+        }
+        if (!ok) {
+            break;
+        }
+        std::vector<StorageRedirect> active;
+        for (const BoundGroup& b : render_groups_) {
+            if (const auto it = redirects_.find(b.bind_group_id); it != redirects_.end()) {
+                active.insert(active.end(), it->second.begin(), it->second.end());
+            }
+        }
+        if (active.empty()) {
+            break;
+        }
+        const auto tracked = [&](const StorageRedirect& r) {
+            return std::any_of(pass_redirects_.begin(), pass_redirects_.end(),
+                               [&](const StorageRedirect& o) { return o.same_target(r); });
+        };
+        bool need_in = false;
+        for (const StorageRedirect& r : active) {
+            need_in |= !tracked(r) && r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
+        }
+        if (!need_in || attempt == 1) {
+            for (const StorageRedirect& r : active) {
+                if (!tracked(r)) {
+                    pass_redirects_.push_back(r);
+                }
+            }
+            break;
+        }
+        tracker_.flush_pending_clears();
+        tracker_.end_render_pass();
+        drain_events();  // converts out what the pass wrote so far
+        for (const StorageRedirect& r : active) {
+            if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly)) {
+                emit_storage_conversion(r, true);  // real texture -> intermediate
+            }
+        }
+        compute_pipeline_bound_ = 0;
+        compute_groups_.clear();
+        compute_pass_valid_ = false;
+        pass_redirects_ = std::move(active);
     }
     if (!ok) {
         ++stats_.draws_skipped;
