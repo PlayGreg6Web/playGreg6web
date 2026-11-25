@@ -466,11 +466,13 @@ class RunTests(unittest.TestCase):
         script = rnb.input_script_text(900_000, "menu-to-ingame")
         before, header, body, after = self._sections(script)
         self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
-        self.assertEqual(after[:9], ["capture", "1000 DUp 150", "3000 A 100",
-                                     "wait draws_per_frame==34 for 2s timeout 30s",
-                                     "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
-                                     "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
-        tail = [line.split() for line in after[9:]]
+        self.assertEqual(after[:15], ["capture",
+                                      "repeat every 20s until draws_per_frame!=33|50|51 for 3s timeout 240s",
+                                      "0 B 150", "3000 A 100", "5000 RDown 1200", "7000 RDown 1200",
+                                      "9000 RDown 1200", "12000 B 150", "15000 DDown 150", "end",
+                                      "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+                                      "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
+        tail = [line.split() for line in after[15:]]
         self.assertEqual([e[1] for e in tail[:4]], ["A"] * 4)
         self.assertIn("Up+RT", {e[1] for e in tail})
         times = [int(e[0]) for e in tail]

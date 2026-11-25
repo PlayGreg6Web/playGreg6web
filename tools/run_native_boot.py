@@ -34,7 +34,8 @@ What it does, in order:
    Up x6 + Down, Down, A cycle on), `menu-flow-3` (420 s limit; the same to the list screen, then
    scrolls it with RDown + Down and presses A), `menu-flow-4` (420 s limit;
    Up + A on the list screen, which leads to the 34 draws/frame screen, then the menu cycle),
-   `menu-to-ingame` (900 s limit; menu-flow-4 to the 34 draws/frame screen, then the browser
+   `menu-to-ingame` (900 s limit; to the legal-document viewer, B / open, scroll, close each
+   entry until the viewer is dismissed, then the browser
    preset's later phases, web/input/input_bridge.js: hold-A / Menu skip until the screen changes,
    A confirmations, then left/right stick and trigger movement with A every 12 s), `long`
    (600 s limit, 630 s watchdog). The menu-flow presets are screen-synchronised: they repeat the
@@ -376,16 +377,33 @@ def menu_flow_4_script_text(duration_ms: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The legal-document viewer (the list screen): 50 / 33 draws/frame on its list, 51 with a document open.
+VIEWER_SCREEN = "33|50|51"
+
+
+def _viewer_round() -> list[tuple[int, str, int]]:
+    """One round on the legal-document viewer: B (back: leaves the viewer, or closes an open
+    document), A (open the entry under the cursor), RDown x3 (scroll the document to its end),
+    B (back to the list), D-pad Down (next entry)."""
+    return [(0, "B", 150), (3_000, "A", INPUT_HOLD_MS), (5_000, "RDown", 1_200), (7_000, "RDown", 1_200),
+            (9_000, "RDown", 1_200), (12_000, "B", 150), (15_000, "DDown", 150)]
+
+
 def menu_to_ingame_script_text(duration_ms: int) -> str:
-    """The menu-to-ingame preset: menu-flow-4 to the 34 draws/frame screen, then the steps of the
-    browser preset of the same name (web/input/input_bridge.js, #1228) that the native presets lacked:
-    a hold-A (600 ms) / Menu skip + A, repeated every 15 s until the screen leaves 34 draws/frame
-    (steady 3 s, 120 s timeout); A every 2.5 s x4 (Story / New Game / Continue confirmations); then
-    every 12 s A, left stick forward, right stick, LT, RT (in-game movement)."""
-    lines = ["# menu-to-ingame (tools/run_native_boot.py): menu-flow-4 to " + NEXT_SCREEN + ", then the browser",
+    """The menu-to-ingame preset: to the legal-document viewer after LEGAL NOTICES (_to_list_screen),
+    then the viewer rounds (_viewer_round, every 20 s until the screen is no longer the viewer, steady
+    3 s, 240 s timeout; #663: the run stayed on the viewer, which no preset had pressed B on), then
+    the steps of the browser preset of the same name (web/input/input_bridge.js, #1228): a hold-A
+    (600 ms) / Menu skip + A, repeated every 15 s until the screen leaves 34 draws/frame (steady 3 s,
+    120 s timeout); A every 2.5 s x4 (Story / New Game / Continue confirmations); then every 12 s A,
+    left stick forward, right stick, LT, RT (in-game movement)."""
+    lines = ["# menu-to-ingame (tools/run_native_boot.py): to the legal-document viewer (" + LIST_SCREEN + "),",
+             "# B / open, scroll, close each entry until it is dismissed; then the browser",
              "# menu-to-ingame skip / confirm / movement phases"]
     lines += _to_list_screen()
-    lines += ["1000 DUp 150", "3000 A 100", f"wait {NEXT_SCREEN} for 2s timeout 30s",
+    lines.append(f"repeat every 20s until draws_per_frame!={VIEWER_SCREEN} for 3s timeout 240s")
+    lines += ["  " + line for line in _lines(_viewer_round())]
+    lines += ["end",
               "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
               "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end"]
     events: list[tuple[int, str, int]] = [(t, "A", INPUT_HOLD_MS) for t in range(1_000, 11_000, 2_500)]
