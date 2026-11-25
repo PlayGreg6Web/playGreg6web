@@ -187,13 +187,21 @@ uint32_t StateBridgeDevice::texture_at(uint64_t gpu_va) const {
     return it != textures_by_va_.end() ? it->second : 0u;
 }
 
-void StateBridgeDevice::register_buffer(uint32_t resource_id, uint64_t gpu_va, uint64_t byte_size) {
+void StateBridgeDevice::register_buffer(uint32_t resource_id, uint64_t gpu_va, uint64_t byte_size,
+                                        uint64_t allocated_size) {
     std::unique_lock lock(resources_mutex_);
     if (auto it = buffer_va_.find(resource_id); it != buffer_va_.end()) {
         buffers_by_va_.erase(it->second);
     }
     buffers_by_va_[gpu_va] = {resource_id, byte_size};
     buffer_va_[resource_id] = gpu_va;
+    buffer_allocated_[resource_id] = std::max(byte_size, allocated_size);
+}
+
+uint64_t StateBridgeDevice::buffer_allocated_size(uint32_t resource_id) const {
+    std::shared_lock lock(resources_mutex_);
+    auto it = buffer_allocated_.find(resource_id);
+    return it != buffer_allocated_.end() ? it->second : 0;
 }
 
 uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
@@ -214,6 +222,7 @@ void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
         buffers_by_va_.erase(it->second);
         buffer_va_.erase(it);
     }
+    buffer_allocated_.erase(resource_id);
 }
 
 void StateBridgeDevice::register_shader_module(uint64_t shader_identity, uint32_t module_id) {
@@ -1215,10 +1224,11 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
-                // A reflected stage (G62) gives the binding's minimum size: the home covers it.
+                // A reflected stage (G62) gives the binding's minimum size: the home covers it,
+                // zero past the view's bytes.
                 const uint64_t home = std::max<uint64_t>(e.size, layout.min_binding_size);
                 if (base != 0 && e.size != 0 && device_.options().relocate_uniform &&
-                    device_.options().relocate_uniform(base + e.offset, home, &id, &offset)) {
+                    device_.options().relocate_uniform(base + e.offset, e.size, home, &id, &offset)) {
                     out.resource_id = id;
                     out.offset = offset;
                     // The relocated home is a whole multiple of 256 bytes (zero past the view).
@@ -1231,15 +1241,61 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                             ? layout.min_binding_size > e.size
                             : layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
                                   e.size % kUniformOffsetAlignment != 0)) {
-                // Xbox constant-buffer views are 16-byte multiples. Bind up to what the stage reads:
-                // its reflected minimum (G62), else the 256-byte minimum of PC D3D12, when the
-                // buffer has the room.
+                // Xbox constant-buffer views are 16-byte multiples, and a stage may declare a larger
+                // uniform block than the view (on the console it reads whatever memory follows).
+                // WebGPU needs the binding to cover the block: bind up to the stage's reflected
+                // minimum (G62). Without one the block size is unknown here: bind the view through
+                // to the rest of its buffer, at most the 64 KiB uniform binding limit (the memory
+                // that follows, as on the console), at least the 256-byte minimum of PC D3D12.
+                // Extend the range when the buffer has the room; otherwise bind a relocated copy
+                // whose bytes past the view are zero (the zero-extension WebGPU needs, not data).
                 const uint64_t target = layout.min_binding_size != 0 ? layout.min_binding_size
                                                                      : align_up(e.size, kUniformOffsetAlignment);
+                // Room: the WebGPU buffer behind the view, including the zero padding a buffer
+                // smaller than a uniform block is allocated with (Resource::initialize).
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
-                d3d::GpuVaResolution res;
-                if (base != 0 && device_.resolve_gpu_va(base + e.offset, &res)) {
-                    out.size = std::min<uint64_t>(target, res.resource_size - res.offset);
+                const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                const uint64_t room = allocated > e.offset ? allocated - e.offset : 0;
+                if (base != 0 && room != 0) {
+                    out.size = std::min<uint64_t>(target, room);
+                    if (layout.min_binding_size == 0 && room >= target) {
+                        out.size = std::min<uint64_t>(room, kMaxUniformBindingSize);
+                    }
+                }
+                const bool uniform = layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform);
+                uint32_t id = 0;
+                uint64_t offset = 0;
+                if (uniform && room < target && base != 0 && device_.options().relocate_uniform &&
+                    device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
+                    out.resource_id = id;
+                    out.offset = offset;
+                    out.size = align_up(target, kUniformOffsetAlignment);
+                    ++stats_.uniforms_zero_extended;
+                }
+            } else if (layout.type != static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                       (e.view.kind == d3d::DescriptorKind::Cbv || e.view.kind == d3d::DescriptorKind::Srv) &&
+                       e.size != 0 && e.size % kUniformOffsetAlignment != 0) {
+                // A constant-buffer or read-only buffer view in a slot the conventional (root-
+                // signature) layout does not describe as a buffer: the stage's translated code may
+                // still read it as a uniform block whose size this layer does not know. Bind it
+                // through to the rest of its buffer (at most 64 KiB, the memory that follows, as on
+                // the console; the zero padding of a small buffer), at least 256 bytes; when the
+                // buffer has less room, as a relocated copy zero past the view's bytes (what D3D12's
+                // bounds-checked reads past a buffer view return).
+                const uint64_t target = align_up(e.size, kUniformOffsetAlignment);
+                const uint64_t base = device_.buffer_gpu_va(e.resource_id);
+                const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                const uint64_t room = allocated > e.offset ? allocated - e.offset : 0;
+                uint32_t id = 0;
+                uint64_t offset = 0;
+                if (room >= target && e.offset % kUniformOffsetAlignment == 0) {
+                    out.size = std::min<uint64_t>(room, kMaxUniformBindingSize);
+                } else if (base != 0 && device_.options().relocate_uniform &&
+                           device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
+                    out.resource_id = id;
+                    out.offset = offset;
+                    out.size = target;
+                    ++stats_.uniforms_zero_extended;
                 }
             }
             break;

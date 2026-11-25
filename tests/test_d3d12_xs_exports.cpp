@@ -2579,12 +2579,12 @@ void test_xbox_unaligned_constant_buffers() {
     CHECK(com::write_guest(scene.vb_va + 16, values, sizeof(values)));
     uint32_t id = 0;
     uint64_t offset = 1;
-    CHECK(dev->relocate_uniform(scene.vb_va + 16, 32, &id, &offset));
+    CHECK(dev->relocate_uniform(scene.vb_va + 16, 32, 32, &id, &offset));
     CHECK(id != 0 && offset % 256 == 0);
     uint32_t id2 = 0;
     uint64_t offset2 = 0;
-    CHECK(dev->relocate_uniform(scene.vb_va + 16, 32, &id2, &offset2) && id2 == id && offset2 == offset);
-    CHECK(!dev->relocate_uniform(0x00007E0000000000ull, 32, &id2, &offset2));  // GPU-only memory
+    CHECK(dev->relocate_uniform(scene.vb_va + 16, 32, 32, &id2, &offset2) && id2 == id && offset2 == offset);
+    CHECK(!dev->relocate_uniform(0x00007E0000000000ull, 32, 32, &id2, &offset2));  // GPU-only memory
     auto writes_to = [&](const std::vector<Packet>& ps) {
         std::vector<std::vector<uint8_t>> out;
         for (const Packet& p : ps) {
@@ -2611,6 +2611,25 @@ void test_xbox_unaligned_constant_buffers() {
     w = writes_to(packets_since(fx, mark));
     CHECK(w.size() == 1 && w[0].size() == 32 && std::memcmp(w[0].data(), &changed, 4) == 0);
     CHECK(dev->relocated_uniform_count() == 1);
+    // G66: a 16-byte view bound for a 128-byte block gets its own home (256 bytes): only the view's
+    // 16 bytes are written; the rest of the home stays zero (zero-extension, not guest memory).
+    uint32_t id3 = 0;
+    uint64_t offset3 = 1;
+    CHECK(dev->relocate_uniform(scene.vb_va + 16, 16, 128, &id3, &offset3) && offset3 % 256 == 0);
+    CHECK(id3 != id || offset3 != offset);
+    CHECK(dev->relocated_uniform_count() == 2);
+    mark = fx.captured.size();
+    scene.execute({list});
+    size_t small_writes = 0;
+    for (const Packet& p : packets_since(fx, mark)) {
+        if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == id3 &&
+            payload_as<GpuWriteBufferPayload>(p).dst_offset == offset3) {
+            ++small_writes;
+            CHECK(p.payload.size() - sizeof(GpuWriteBufferPayload) == 16);
+            CHECK(std::memcmp(p.payload.data() + sizeof(GpuWriteBufferPayload), &changed, 4) == 0);
+        }
+    }
+    CHECK(small_writes == 1);
 
     CHECK(t_balanced);
     scene.release_all({list, heap});

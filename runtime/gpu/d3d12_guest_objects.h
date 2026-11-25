@@ -751,10 +751,14 @@ public:
     PipelineDump* pipeline_dump() const { return dump_.get(); }
     // A GPU-only buffer owned by the runtime (rectangle-list expansion); empty on failure.
     com::Ref<Resource> create_internal_buffer(uint64_t size);
-    // Uniform bindings at offsets WebGPU cannot bind (BridgeOptions::relocate_uniform): the bytes
-    // at [va, va + size) (CPU-visible memory only) get a 256-byte aligned home in runtime-owned
-    // buffers, refreshed from guest memory at every submission (flush_cpu_buffers) when changed.
-    bool relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset);
+    // Uniform bindings WebGPU cannot bind where they are (BridgeOptions::relocate_uniform): at an
+    // unaligned offset, or smaller than the stage's uniform block with no room behind them in
+    // their buffer. The bytes at [va, va + size) (CPU-visible memory only) get a 256-byte aligned
+    // home of at least `binding_size` bytes in runtime-owned buffers, refreshed from guest memory
+    // at every submission (flush_cpu_buffers) when changed. The home past `size` stays zero: that
+    // is the zero-extension WebGPU needs to bind the declared block, not data (a console stage
+    // reading past a small constant buffer reads whatever memory follows).
+    bool relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size, uint32_t* buffer_id, uint64_t* offset);
     size_t relocated_uniform_count() const;
     // Storage buffer views at unaligned offsets or address-only GPU VAs (G51): the bytes at
     // [va, va + size) (readable guest/alias memory only) get a 256-byte aligned home (or a
@@ -934,13 +938,14 @@ private:
     std::unique_ptr<PipelineDump> dump_;
     struct RelocatedUniform {
         uint64_t va = 0;
-        uint64_t size = 0;
+        uint64_t size = 0;  // guest bytes copied; the home is align_up(max(size, binding), 256), zero past them
         uint32_t buffer_id = 0;
         uint64_t offset = 0;
         std::vector<uint8_t> shadow;  // bytes last written (empty: never written)
     };
     mutable std::mutex relocation_mutex_;
-    std::map<std::pair<uint64_t, uint64_t>, RelocatedUniform> relocations_;  // (va, size)
+    // (va, size, home bytes)
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, RelocatedUniform> relocations_;
     struct RelocatedStorage {
         uint64_t va = 0;
         uint64_t size = 0;

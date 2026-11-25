@@ -763,7 +763,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         std::lock_guard<std::mutex> lock(relocation_mutex_);
         std::vector<uint8_t> bytes;
         for (auto& [key, r] : relocations_) {
-            bytes.resize(static_cast<size_t>(r.size));
+            bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
             if (!com::read_guest(cpu_address_for_gpu(r.va), bytes.data(), bytes.size()) || bytes == r.shadow) {
                 continue;
             }
@@ -824,9 +824,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     }
 }
 
-bool Device::relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {
+bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size, uint32_t* buffer_id,
+                              uint64_t* offset) {
     constexpr uint64_t kChunk = 1u << 20;
-    if (size == 0 || size > (64u << 10)) {
+    const uint64_t need = align_up(std::max(size, binding_size), bridge::kUniformOffsetAlignment);
+    if (size == 0 || need > (64u << 10)) {
         return false;
     }
     uint8_t probe = 0;
@@ -834,9 +836,10 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, u
         return false;  // GPU-only memory: no bytes to copy
     }
     std::lock_guard<std::mutex> lock(relocation_mutex_);
-    auto it = relocations_.find({va, size});
+    auto it = relocations_.find({va, size, need});
     if (it == relocations_.end()) {
-        const uint64_t need = align_up(size, bridge::kUniformOffsetAlignment);
+        // A fresh home: the chunk is zero-initialised and homes are never reused, so the bytes
+        // past `size` stay zero (zero-extension for WebGPU's minimum binding size, not data).
         if (relocation_buffer_ == 0 || relocation_used_ + need > kChunk) {
             relocation_buffer_ = allocate_id();
             CommandEncoder enc;
@@ -850,7 +853,7 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, u
         r.buffer_id = relocation_buffer_;
         r.offset = relocation_used_;
         relocation_used_ += need;
-        it = relocations_.emplace(std::make_pair(va, size), std::move(r)).first;
+        it = relocations_.emplace(std::make_tuple(va, size, need), std::move(r)).first;
     }
     *buffer_id = it->second.buffer_id;
     *offset = it->second.offset;
@@ -1226,14 +1229,21 @@ bool Resource::initialize() {
             owned_guest_memory_ = va;
             gpu_va_ = cpu_va_ = va;
         }
+        // A small buffer is allocated with at least kSmallBufferPadding bytes: the title binds whole
+        // 16-byte buffers (written by the GPU) as constant buffers to stages that declare uniform
+        // blocks of up to a few KiB, and WebGPU needs the binding to cover the declared block. The
+        // bytes past the guest's size are never written, so they stay zero (the zero-extension
+        // WebGPU needs, not data; on the console the stage reads whatever memory follows).
+        constexpr uint64_t kSmallBufferPadding = 4096;
+        const uint64_t allocated = std::max<uint64_t>(align_up(size, 4), kSmallBufferPadding);
         CommandEncoder enc;
         enc.create_buffer(id_,
                           GpuBufferUsage::Vertex | GpuBufferUsage::Index | GpuBufferUsage::Uniform |
                               GpuBufferUsage::Storage | GpuBufferUsage::Indirect | GpuBufferUsage::CopyDst |
                               GpuBufferUsage::CopySrc,
-                          align_up(size, 4));
+                          allocated);
         dev.submit(enc);
-        dev.state_bridge().register_buffer(id_, gpu_va_, size);
+        dev.state_bridge().register_buffer(id_, gpu_va_, size, allocated);
         if (cpu_va_ != 0) {
             shadow_.assign(static_cast<size_t>(size), 0);
             dev.track_cpu_buffer(this);

@@ -159,10 +159,13 @@ struct BridgeOptions {
     // Uniform ring for root constants (bound with dynamic offsets). Must hold one frame's worth.
     uint32_t root_constant_ring_bytes = 1u << 20;
     // Uniform-buffer bindings whose offset is not a multiple of kUniformOffsetAlignment (WebGPU's
-    // minUniformBufferOffsetAlignment) are relocated through this hook: given the binding's GPU
-    // address and size it returns a buffer id and an aligned offset that hold the same bytes
+    // minUniformBufferOffsetAlignment), or that are smaller than the stage's uniform block with no
+    // room behind them in their buffer, are relocated through this hook: given the binding's GPU
+    // address, its size and the size the binding must have, it returns a buffer id and an aligned
+    // offset holding the same `size` bytes followed by zeros up to `binding_size` rounded to 256
     // (false: no relocation, the binding is emitted as it is and diagnosed).
-    std::function<bool(uint64_t gpu_va, uint64_t size, uint32_t* buffer_id, uint64_t* offset)> relocate_uniform;
+    std::function<bool(uint64_t gpu_va, uint64_t size, uint64_t binding_size, uint32_t* buffer_id, uint64_t* offset)>
+        relocate_uniform;
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
@@ -174,6 +177,8 @@ struct BridgeOptions {
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
+// WebGPU's default maxUniformBufferBindingSize (also D3D12's 4096 x 16-byte constant buffer limit).
+inline constexpr uint64_t kMaxUniformBindingSize = 65536;
 
 class GraphicsPipelineState;
 class ComputePipelineState;
@@ -199,7 +204,11 @@ public:
     // ---- Registration (called by the d3d12_xs device) ----
     void register_texture(uint32_t resource_id, const TextureInfo& info);
     // Buffer placed at [gpu_va, gpu_va + byte_size) for CBV / root descriptor address resolution.
-    void register_buffer(uint32_t resource_id, uint64_t gpu_va, uint64_t byte_size);
+    // `allocated_size`: the WebGPU buffer's size when it is larger than the guest's `byte_size`
+    // (zero padding a binding may extend into, see buffer_allocated_size); 0 = byte_size.
+    void register_buffer(uint32_t resource_id, uint64_t gpu_va, uint64_t byte_size, uint64_t allocated_size = 0);
+    // Bytes the WebGPU buffer has (>= the guest size; 0 for an unknown buffer).
+    uint64_t buffer_allocated_size(uint32_t resource_id) const;
     void unregister_resource(uint32_t resource_id);
     // Shader identity (D3D12GraphicsPsoDesc::vs/ps/cs) -> CreateShaderModule id.
     void register_shader_module(uint64_t shader_identity, uint32_t module_id);
@@ -281,6 +290,7 @@ private:
     std::unordered_map<uint32_t, TextureInfo> textures_;
     std::map<uint64_t, std::pair<uint32_t, uint64_t>> buffers_by_va_;  // va -> (id, size)
     std::unordered_map<uint32_t, uint64_t> buffer_va_;                  // id -> va
+    std::unordered_map<uint32_t, uint64_t> buffer_allocated_;           // id -> WebGPU buffer size
     std::unordered_map<uint64_t, uint32_t> textures_by_va_;             // descriptor address -> id
     std::unordered_map<uint64_t, uint32_t> shader_modules_;
 
@@ -358,6 +368,9 @@ struct BridgeStats {
     uint64_t clear_fallbacks_dropped = 0;
     uint64_t usage_conflicts = 0;
     uint64_t texture_memory_syncs = 0;
+    // Uniform bindings smaller than the stage's block with no room in their buffer, bound as a
+    // relocated copy zero-extended to the block size.
+    uint64_t uniforms_zero_extended = 0;
 };
 
 class CommandListBridge {

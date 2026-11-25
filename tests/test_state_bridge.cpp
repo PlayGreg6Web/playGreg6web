@@ -889,7 +889,7 @@ void test_unaligned_uniform_relocation() {
         std::vector<std::pair<uint64_t, uint64_t>> calls;
         bridge::BridgeOptions options = counting_options(5000);
         if (with_hook) {
-            options.relocate_uniform = [&calls](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+            options.relocate_uniform = [&calls](uint64_t va, uint64_t size, uint64_t, uint32_t* id, uint64_t* offset) {
                 calls.emplace_back(va, size);
                 *id = 777;
                 *offset = 512;
@@ -977,13 +977,14 @@ void test_unaligned_uniform_relocation() {
 // G62: a uniform binding with a reflected minimum size (layout min_binding_size) is bound with at
 // least that many bytes, instead of the 256-byte PC minimum; without one the 256-byte rule stays.
 GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, uint64_t min_size,
-                                     std::vector<std::pair<uint64_t, uint64_t>>* calls) {
+                                     std::vector<std::pair<uint64_t, uint64_t>>* calls, uint64_t buffer_size = 4096,
+                                     uint64_t allocated_size = 0, bool texture_slot = false) {
     d3d::DescriptorHeapRegistry heaps;
     heaps.set_cbv_alignment(16);
     d3d::ResourceStateRegistry states;
     bridge::BridgeOptions options = counting_options(5000);
-    options.relocate_uniform = [calls](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
-        calls->emplace_back(va, size);
+    options.relocate_uniform = [calls](uint64_t, uint64_t size, uint64_t binding_size, uint32_t* id, uint64_t* offset) {
+        calls->emplace_back(size, binding_size);  // (view bytes copied, binding size)
         *id = 777;
         *offset = 512;
         return true;
@@ -992,7 +993,7 @@ GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, u
     constexpr uint32_t kTarget = 100, kCb = 300;
     constexpr uint64_t kVs = 0xC1, kPs = 0xC2, kCbVa = 0x10000;
     device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
-    device.register_buffer(kCb, kCbVa, 4096);
+    device.register_buffer(kCb, kCbVa, buffer_size, allocated_size);
     device.register_shader_module(kVs, 1);
     device.register_shader_module(kPs, 2);
     d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
@@ -1014,9 +1015,11 @@ GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, u
     CHECK(d3d::RootSignature::build(rs, &root).ok());
     bridge::PipelineLayoutDesc layout;
     bridge::GroupLayoutDesc group;
-    GpuBindGroupLayoutEntry entry = layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
-                                                 GpuBindingLayoutType::Buffer,
-                                                 static_cast<uint8_t>(GpuBufferBindingType::Uniform));
+    GpuBindGroupLayoutEntry entry =
+        texture_slot ? layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
+                                    GpuBindingLayoutType::Texture, static_cast<uint8_t>(GpuTextureSampleType::Float))
+                     : layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
+                                    GpuBindingLayoutType::Buffer, static_cast<uint8_t>(GpuBufferBindingType::Uniform));
     entry.min_binding_size = min_size;
     group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Cbv, 0)});
     layout.groups.push_back(group);
@@ -1051,16 +1054,52 @@ GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, u
 
 void test_reflected_uniform_min_size() {
     std::vector<std::pair<uint64_t, uint64_t>> calls;
-    // Aligned view of 96 bytes: no minimum -> 256 (PC rule); minimum 160 -> 160; minimum 64 -> 96.
-    CHECK(bind_uniform_view(0x100, 96, 0, &calls).size == 256);
+    // Aligned view of 96 bytes: no minimum -> the rest of the buffer (the block size is unknown;
+    // 4096 - 0x100 bytes follow, as on the console); minimum 160 -> 160; minimum 64 -> 96.
+    CHECK(bind_uniform_view(0x100, 96, 0, &calls).size == 4096 - 0x100);
     CHECK(bind_uniform_view(0x100, 96, 160, &calls).size == 160);
     const GpuBindGroupEntry2 within = bind_uniform_view(0x100, 96, 64, &calls);
     CHECK(within.size == 96 && within.offset == 0x100 && within.resource_id == 300);
     CHECK(calls.empty());
-    // Unaligned view relocated: the copy covers the minimum (320 bytes -> a 512-byte home).
+    // Unaligned view relocated: the copy holds the view's 96 bytes and covers the minimum (320
+    // bytes -> a 512-byte home, zero past the view).
     const GpuBindGroupEntry2 moved = bind_uniform_view(0x40, 96, 320, &calls);
     CHECK(moved.resource_id == 777 && moved.size == 512);
-    CHECK(calls.size() == 1 && calls[0].second == 320);
+    CHECK(calls.size() == 1 && calls[0].first == 96 && calls[0].second == 320);
+    // G66: an aligned 16-byte view at the end of its 4 KiB buffer, for a 128-byte block: no room
+    // to extend, so it is bound as a relocated copy of its 16 bytes, zero-extended to the block.
+    calls.clear();
+    const GpuBindGroupEntry2 tail = bind_uniform_view(0xF00, 16, 512, &calls);
+    CHECK(tail.resource_id == 777 && tail.offset == 512 && tail.size == 512);
+    CHECK(calls.size() == 1 && calls[0].first == 16 && calls[0].second == 512);
+    // No reflected minimum: the 256-byte rule, extended in place when the buffer has the room
+    // (here exactly 256 bytes are left) ...
+    calls.clear();
+    const GpuBindGroupEntry2 room = bind_uniform_view(0xF00, 16, 0, &calls);
+    CHECK(room.resource_id == 300 && room.offset == 0xF00 && room.size == 256 && calls.empty());
+    // ... and with less room than the block, relocated and zero-extended.
+    const GpuBindGroupEntry2 short_room = bind_uniform_view(0xF00, 16, 384, &calls);
+    CHECK(short_room.resource_id == 777 && short_room.size == 512);
+    CHECK(calls.size() == 1 && calls[0].first == 16 && calls[0].second == 384);
+    // G66: a whole 16-byte buffer whose WebGPU buffer is padded to 256 bytes (Resource::initialize)
+    // binds in place for a 128-byte block (and for the 256-byte rule): the padding is zero.
+    calls.clear();
+    const GpuBindGroupEntry2 padded = bind_uniform_view(0, 16, 128, &calls, 16, 256);
+    CHECK(padded.resource_id == 300 && padded.offset == 0 && padded.size == 128 && calls.empty());
+    const GpuBindGroupEntry2 padded_pc = bind_uniform_view(0, 16, 0, &calls, 16, 256);
+    CHECK(padded_pc.resource_id == 300 && padded_pc.size == 256 && calls.empty());
+    // Without the padding the same view has no room: relocated and zero-extended.
+    const GpuBindGroupEntry2 unpadded = bind_uniform_view(0, 16, 128, &calls, 16, 0);
+    CHECK(unpadded.resource_id == 777 && unpadded.size == 256);
+    CHECK(calls.size() == 1 && calls[0].first == 16 && calls[0].second == 128);
+    // A CBV in a slot the conventional layout calls a texture (the translated stage reads it as a
+    // uniform block of unknown size): 256 bytes, in place in a padded buffer, else relocated.
+    calls.clear();
+    const GpuBindGroupEntry2 cbv_in_place = bind_uniform_view(0, 16, 0, &calls, 16, 256, true);
+    CHECK(cbv_in_place.resource_id == 300 && cbv_in_place.offset == 0 && cbv_in_place.size == 256 && calls.empty());
+    const GpuBindGroupEntry2 cbv_moved = bind_uniform_view(0, 16, 0, &calls, 16, 0, true);
+    CHECK(cbv_moved.resource_id == 777 && cbv_moved.size == 256);
+    CHECK(calls.size() == 1 && calls[0].first == 16 && calls[0].second == 256);
 }
 
 // G48: a slot source over test-owned "descriptor memory" for one heap.
@@ -1270,7 +1309,8 @@ void test_memory_backed_tables() {
     CHECK(enc.size() == before && prelude.size() == 0);
     uint32_t id2 = 0;
     e = last_bind_group_entry(enc, &id2);
-    CHECK(id2 == id && e.resource_id == kCb && e.offset == 0x100 && e.size == 256);  // widened to 256 bytes
+    // Widened through to the end of the 4 KiB buffer (no reflected block size: the bytes that follow).
+    CHECK(id2 == id && e.resource_id == kCb && e.offset == 0x100 && e.size == 4096 - 0x100);
     CHECK(list.refresh_memory_bind_groups(prelude) == 0);
 
     // Words the runtime cannot read as a descriptor bind null.
