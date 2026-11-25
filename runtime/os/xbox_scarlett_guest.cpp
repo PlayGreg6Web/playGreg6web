@@ -116,6 +116,7 @@ struct Counters {
     std::atomic<uint64_t> decompressed_requests{0};
     std::atomic<uint64_t> submits{0};
     std::atomic<uint64_t> live_queues{0};
+    std::atomic<uint64_t> flag21_requests{0};
 
     std::atomic<uint32_t> worker_threads{1};
     std::atomic<uint64_t> max_gap{64 * 1024};
@@ -1095,7 +1096,25 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             continue;
         }
         const DStorageRequest& r = item.req;
-        const uint64_t unknown_bits = r.options & ~(kDStorageOptionFormatMask | kDStorageOptionSourceMemory);
+        const uint64_t unknown_bits =
+            r.options & ~(kDStorageOptionFormatMask | kDStorageOptionSourceMemory | kDStorageOptionIgnoredFlag21);
+        if ((r.options & kDStorageOptionIgnoredFlag21) != 0) {
+            const uint64_t n = counters().flag21_requests.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                std::string name;
+                read_guest_string<char>(r.name, 259, &name);
+                std::string path;
+                if (item.file) {
+                    for (char16_t c : item.file->path()) {
+                        path.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+                    }
+                }
+                diag("XCRDAPI: request options " + hex64(r.options) + " (bit 21 ignored): '" + path + "' +" +
+                     hex64(r.source_offset) + " " + std::to_string(r.source_size) + " -> " +
+                     std::to_string(r.uncompressed_size) + "/" + std::to_string(r.destination_size) + " bytes, name '" +
+                     name + "'");
+            }
+        }
         const uint32_t format = static_cast<uint32_t>(r.options & kDStorageOptionFormatMask);
         if (unknown_bits != 0) {
             diag_once(once().bad_options, "XCRDAPI: request options " + hex64(r.options) +
@@ -1458,6 +1477,7 @@ DStorageStats dstorage_stats() {
     s.decompressed_requests = c.decompressed_requests.load();
     s.submits = c.submits.load();
     s.live_queues = c.live_queues.load();
+    s.flag21_requests = c.flag21_requests.load();
     return s;
 }
 

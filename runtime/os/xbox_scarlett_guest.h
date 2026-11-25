@@ -173,6 +173,10 @@ inline constexpr HResult kHrHandle = static_cast<HResult>(0x80070006u);
 
 inline constexpr uint64_t kDStorageOptionFormatMask = 0xFFu;
 inline constexpr uint64_t kDStorageOptionSourceMemory = 1ull << 22;
+// Bit 21: set by the title on zlib file requests (options 0x200001) of ttdb graphics/map pages
+// (4-64 KiB destinations, uncompressed size 0). The payloads inflate to exactly the destination
+// size, so the bit is accepted and ignored; before R40 these requests failed with E_NOTIMPL.
+inline constexpr uint64_t kDStorageOptionIgnoredFlag21 = 1ull << 21;
 inline constexpr uint32_t kDStorageFormatNone = 0;
 inline constexpr uint32_t kDStorageFormatZlib = 1;
 
@@ -260,6 +264,7 @@ struct DStorageStats {
     uint64_t decompressed_requests = 0;
     uint64_t submits = 0;             // explicit + automatic
     uint64_t live_queues = 0;
+    uint64_t flag21_requests = 0;     // requests carrying option bit 21 (accepted, ignored)
 };
 
 DStorageStats dstorage_stats();

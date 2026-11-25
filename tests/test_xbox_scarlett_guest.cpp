@@ -793,6 +793,20 @@ void test_compressed_and_memory_sources() {
     CHECK(guest_bytes(dest2, 64) == mem);
     CHECK(ga::dstorage_stats().decompressed_requests == 1);
 
+    // Option bit 21 on a zlib file request (the title's 0x200001, R40) is accepted and ignored.
+    const uint64_t dest4 = com::guest_alloc(65536);
+    ga::DStorageRequest f21 = file_request(file, 100, sizeof(kZlibPage64k), dest4, 65536);
+    f21.options = ga::kDStorageFormatZlib | ga::kDStorageOptionIgnoredFlag21;
+    CHECK(f21.options == 0x200001u);
+    const uint64_t flag21_before = ga::dstorage_stats().flag21_requests;
+    fx.enqueue(queue, f21);
+    fx.vcall(queue, 4, {I(status), I(3)});
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 3));
+    CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == 0);
+    CHECK(guest_bytes(dest4, 65536) == pattern_data(65536));
+    CHECK(ga::dstorage_stats().flag21_requests == flag21_before + 1);
+
     // Unsupported compression format and option bits.
     ga::DStorageRequest f2 = file_request(file, 100, 16, dest, 65536);
     f2.options = 2;
