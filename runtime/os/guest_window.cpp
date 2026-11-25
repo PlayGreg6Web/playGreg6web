@@ -13,6 +13,8 @@
 
 extern "C" {
 alignas(64) int64_t __playgta6_window_table[playgta6::os::guest_window::kWindowSlots];
+// O37: write marks, one per slot plus the spare entry branch-free window checks store to.
+alignas(64) uint8_t __playgta6_window_dirty[playgta6::os::guest_window::kWindowSlots + 1];
 }
 
 namespace playgta6::os::guest_window {

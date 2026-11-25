@@ -861,6 +861,14 @@ extern uint64_t __playgta6_guest_base;
 // straddle two slots and for bulk copies / fills over translated ranges. An unmapped slot raises a
 // guest fault in the helpers.
 extern int64_t __playgta6_window_table[];
+// Write marks of the translated window (O37): one byte per slot plus one spare entry at index
+// kGuestWindowSize / kGuestWindowSlotBytes. Lifted code that stores into a window slot sets the
+// slot's byte to 1 after the store (an atomic release store of one byte); a branch-free window
+// check stores the spare entry for addresses outside the window. Host code that writes window
+// memory marks the slots too. Readers that keep a copy of window memory (the GPU bridge's shadows
+// of CPU-visible buffers) clear a slot's mark before comparing it, so a write racing with the
+// comparison is reported again.
+extern uint8_t __playgta6_window_dirty[];
 void* __playgta6_guest_read(uint64_t va, uint64_t n);   // n <= 64; returns per-thread scratch
 void* __playgta6_guest_scratch();
 void __playgta6_guest_write(uint64_t va, uint64_t n);   // scratch -> guest
