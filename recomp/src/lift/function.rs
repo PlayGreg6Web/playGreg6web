@@ -39,7 +39,7 @@ mod unwind;
 #[path = "flag_liveness.rs"]
 pub(super) mod flag_liveness;
 
-use flag_liveness::{ALL_FLAGS, FlagMask, FlagSummaries};
+use flag_liveness::{ALL_FLAGS, ALL_STATE, FlagMask, FlagSummaries, OTHER_STATE, StateMask};
 
 pub(super) use atomics::CMPXCHG16B_IR;
 pub(super) use bit_ops::{PDEP_IR, PEXT_IR};
@@ -405,8 +405,9 @@ struct FunctionLifter<'a> {
     has_shared_ret: bool,
     /// Calls followed by a resume-protocol check (see `unwind`).
     unwind_sites: u32,
-    /// Flags each known direct callee may observe on entry (`flag_liveness`); without it every
-    /// call and tail jump stores every tracked flag.
+    /// Flags each known direct callee may observe on entry and the state it may touch
+    /// (`flag_liveness`); without it every call and tail jump stores every tracked flag and
+    /// register and every call reloads them.
     flag_summaries: Option<&'a FlagSummaries>,
 }
 
@@ -572,7 +573,7 @@ impl FunctionLifter<'_> {
             let exit = exit_label(target);
             self.start_block(&exit);
             let flags = self.flags_needed_by(target);
-            self.sync_out_flags(flags);
+            self.sync_out_parts(ALL_STATE, flags);
             self.emit(&format!(
                 "tail call void @{}(ptr %state)",
                 function_symbol(target)
@@ -816,8 +817,14 @@ impl FunctionLifter<'_> {
 
     /// Loads all tracked registers and flags from `%state` into their allocas.
     fn sync_in(&mut self) {
+        self.sync_in_parts(ALL_STATE);
+    }
+
+    /// [`Self::sync_in`] loading only the registers in `state` (and the vector registers when it
+    /// has [`OTHER_STATE`]); the flags are always loaded.
+    fn sync_in_parts(&mut self, state: StateMask) {
         for idx in 0..16 {
-            if self.regs[idx] {
+            if self.regs[idx] && state & (1 << idx) != 0 {
                 let ptr = self.state_gpr_ptr(idx);
                 let v = self.val(&format!("load i64, ptr {ptr}"));
                 self.emit(&format!("store i64 {v}, ptr %{}", GPR_NAMES[idx]));
@@ -831,12 +838,14 @@ impl FunctionLifter<'_> {
                 self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
             }
         }
-        self.sync_xmm_in();
+        if state & OTHER_STATE != 0 {
+            self.sync_xmm_in();
+        }
     }
 
     /// Stores all tracked registers and flags from their allocas back into `%state`.
     fn sync_out(&mut self) {
-        self.sync_out_flags(ALL_FLAGS);
+        self.sync_out_parts(ALL_STATE, ALL_FLAGS);
     }
 
     /// Flags a direct call or tail jump to `target` has to store (see `flag_liveness`).
@@ -845,11 +854,19 @@ impl FunctionLifter<'_> {
             .map_or(ALL_FLAGS, |summaries| summaries.needed_by(target))
     }
 
-    /// [`Self::sync_out`] storing only the tracked flags in `flags`: the others are dead because
-    /// the callee overwrites them before anything can observe them.
-    fn sync_out_flags(&mut self, flags: FlagMask) {
+    /// Guest state a direct call to `target` may touch (see `flag_liveness`).
+    fn state_touched_by(&self, target: u64) -> StateMask {
+        self.flag_summaries
+            .map_or(ALL_STATE, |summaries| summaries.touched_by(target))
+    }
+
+    /// [`Self::sync_out`] storing only the tracked registers in `state` (the vector registers when
+    /// it has [`OTHER_STATE`]) and the tracked flags in `flags`. The flags left out are dead
+    /// because the callee overwrites them before anything can observe them; the registers left out
+    /// are never touched by the callee, so the caller keeps them in its allocas across the call.
+    fn sync_out_parts(&mut self, state: StateMask, flags: FlagMask) {
         for idx in 0..16 {
-            if self.regs[idx] {
+            if self.regs[idx] && state & (1 << idx) != 0 {
                 let v = self.val(&format!("load i64, ptr %{}", GPR_NAMES[idx]));
                 let ptr = self.state_gpr_ptr(idx);
                 self.emit(&format!("store i64 {v}, ptr {ptr}"));
@@ -863,7 +880,9 @@ impl FunctionLifter<'_> {
                 self.emit(&format!("store i8 {byte}, ptr {ptr}"));
             }
         }
-        self.sync_xmm_out();
+        if state & OTHER_STATE != 0 {
+            self.sync_xmm_out();
+        }
     }
 
     fn segment_base(&mut self, field: u32) -> String {
@@ -1939,12 +1958,14 @@ impl FunctionLifter<'_> {
                 return Ok(());
             }
             let flags = self.flags_needed_by(target);
-            self.sync_out_flags(flags);
+            let state = self.state_touched_by(target);
+            self.sync_out_parts(state, flags);
             self.guest_call(&format!(
                 "call void @{}(ptr %state)",
                 function_symbol(target)
             ));
             self.callees.push(target);
+            self.sync_in_parts(state);
         } else {
             // The target is read before the return address is pushed (`call [rsp+8]`).
             let target = self.indirect_target(ins)?;
@@ -1953,8 +1974,8 @@ impl FunctionLifter<'_> {
             self.guest_call(&format!(
                 "call void @{HELPER_INDIRECT_CALL}(ptr %state, i64 {target})"
             ));
+            self.sync_in();
         }
-        self.sync_in();
         Ok(())
     }
 

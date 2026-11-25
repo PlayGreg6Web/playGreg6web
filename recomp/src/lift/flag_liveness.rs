@@ -27,10 +27,27 @@
 //! Calls to functions outside the analysed set, indirect transfers, returns and traps read every
 //! flag. The summaries are the least fixed point over the call graph (a may-analysis: they only
 //! grow), which is sound for every execution that returns.
+//!
+//! # Registers a callee never touches
+//!
+//! The same summaries also record, per function, the guest state a call to it may touch: the
+//! general purpose registers read or written by any instruction it or a direct callee may execute,
+//! plus one bit ([`OTHER_STATE`]) for everything else (vector registers, and any way the state can
+//! be observed as a whole: an instruction the pass does not model, an indirect call or jump, a
+//! call outside the analysed set, a trap, invalid code, a non-returning call). The analysis is
+//! flow-insensitive (the union over every block of the function) and the least fixed point over
+//! the call graph. A register outside that set is neither read nor written by the callee, and
+//! nothing can look at `%state` while it runs, since every such place sets every bit: a caller
+//! keeps the register in SSA across a direct call instead of storing it before and reloading it
+//! after, and skips the vector registers when [`OTHER_STATE`] is clear. The stale copy in
+//! `%state` is refreshed by the caller's next full write-back (its return, tail jump, indirect
+//! call, helper or trap) or by the store before a call that may touch it. A host fault (wasm
+//! out-of-bounds access, native access violation) inside such a callee is fatal, not a guest
+//! exception, so no unwinder or handler ever reads the stale copy.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, Instruction, InstructionInfoFactory, Mnemonic, OpKind, Register};
 
 use super::{FLAGS, ends_in_transfer};
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
@@ -41,16 +58,29 @@ pub(super) type FlagMask = u8;
 /// Every arithmetic flag.
 pub(super) const ALL_FLAGS: FlagMask = (1 << FLAGS.len()) - 1;
 
-/// Per-function flags whose value at entry may be observed (see the module docs).
+/// Bit `n` per general purpose register `n` (`rax` = 0 ... `r15` = 15) plus [`OTHER_STATE`].
+pub(super) type StateMask = u32;
+
+/// Vector registers and any whole-state observation (see "Registers a callee never touches").
+pub(super) const OTHER_STATE: StateMask = 1 << 16;
+
+/// Everything a call may touch.
+pub(super) const ALL_STATE: StateMask = (OTHER_STATE << 1) - 1;
+
+/// Per-function flags whose value at entry may be observed, and the guest state a call may touch
+/// (see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlagSummaries {
     live_in: BTreeMap<u64, FlagMask>,
+    touched: BTreeMap<u64, StateMask>,
 }
 
 impl FlagSummaries {
     /// Analyses `functions` together: calls between them use each other's summaries, calls to
     /// anything else count as reading every flag.
     pub fn compute<'a>(functions: impl IntoIterator<Item = &'a cfg::Function>) -> Self {
+        let functions: Vec<&cfg::Function> = functions.into_iter().collect();
+        let touched = touched_state(&functions);
         let functions: BTreeMap<u64, Model> = functions
             .into_iter()
             .map(|f| (f.entry, Model::new(f)))
@@ -81,12 +111,23 @@ impl FlagSummaries {
                 }
             }
         }
-        Self { live_in }
+        Self { live_in, touched }
     }
 
     /// Flags the function at `entry` may observe on entry; `None` for a function outside the set.
     pub fn live_in(&self, entry: u64) -> Option<u8> {
         self.live_in.get(&entry).copied()
+    }
+
+    /// Guest state a call to the function at `entry` may read or write: register `n` as bit `n`,
+    /// everything else as bit 16. `None` for a function outside the set.
+    pub fn touched(&self, entry: u64) -> Option<u32> {
+        self.touched.get(&entry).copied()
+    }
+
+    /// Guest state a direct call to `target` must store before it and reload after it.
+    pub(super) fn touched_by(&self, target: u64) -> StateMask {
+        self.touched(target).unwrap_or(ALL_STATE)
     }
 
     /// Flags a direct call or tail jump to `target` must store first.
@@ -331,6 +372,125 @@ fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
         }
         _ => None,
     }
+}
+
+/// [`FlagSummaries::touched`] for every function: least fixed point of "own effects plus the
+/// effects of every direct callee and tail-jump target".
+fn touched_state(functions: &[&cfg::Function]) -> BTreeMap<u64, StateMask> {
+    let mut factory = InstructionInfoFactory::new();
+    let own: BTreeMap<u64, (StateMask, BTreeSet<u64>)> = functions
+        .iter()
+        .map(|f| (f.entry, own_effects(f, &mut factory)))
+        .collect();
+    let mut touched: BTreeMap<u64, StateMask> = own.keys().map(|&entry| (entry, 0)).collect();
+    let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (&entry, (_, callees)) in &own {
+        for &callee in callees {
+            if own.contains_key(&callee) {
+                callers.entry(callee).or_default().insert(entry);
+            }
+        }
+    }
+    let mut queued: BTreeSet<u64> = own.keys().copied().collect();
+    let mut work: VecDeque<u64> = own.keys().copied().collect();
+    while let Some(entry) = work.pop_front() {
+        queued.remove(&entry);
+        let (mask, callees) = &own[&entry];
+        let old = touched[&entry];
+        let mut new = old | mask;
+        for callee in callees {
+            new |= touched.get(callee).copied().unwrap_or(ALL_STATE);
+        }
+        if new != old {
+            touched.insert(entry, new);
+            for &caller in callers.get(&entry).into_iter().flatten() {
+                if queued.insert(caller) {
+                    work.push_back(caller);
+                }
+            }
+        }
+    }
+    touched
+}
+
+/// The state one function touches itself, and its direct callees and tail-jump targets.
+fn own_effects(
+    func: &cfg::Function,
+    factory: &mut InstructionInfoFactory,
+) -> (StateMask, BTreeSet<u64>) {
+    let mut callees = BTreeSet::new();
+    if !func.blocks.contains_key(&func.entry) {
+        return (ALL_STATE, callees);
+    }
+    let rsp: StateMask = 1 << Register::RSP.number();
+    let mut mask: StateMask = 0;
+    for block in func.blocks.values() {
+        let (body, transfer) = match block.instructions.split_last() {
+            Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+            _ => (&block.instructions[..], None),
+        };
+        for ins in body {
+            mask |= match instruction_step(block, ins) {
+                // The call pushes the return address; the callee's own effects come from its
+                // summary.
+                Step::Call(target) => {
+                    callees.insert(target);
+                    rsp
+                }
+                Step::Effect { .. } if ins.mnemonic() == Mnemonic::Call => ALL_STATE,
+                Step::Effect { .. } if flag_effect(ins).is_none() => ALL_STATE,
+                Step::Effect { .. } => used_gprs(ins, factory),
+            };
+        }
+        mask |= match (block.terminator, transfer) {
+            (Terminator::Fallthrough | Terminator::Jump, _) => 0,
+            (Terminator::Branch, Some(ins)) if ins.is_jcc_short_or_near() => 0,
+            (Terminator::Return, Some(ins))
+                if matches!(ins.code(), Code::Retnq | Code::Retnq_imm16) =>
+            {
+                rsp
+            }
+            // Indirect jumps (the dispatcher), traps, non-returning calls, invalid code, `loop`,
+            // `jrcxz`, `xbegin`, far returns.
+            _ => ALL_STATE,
+        };
+        if matches!(
+            block.terminator,
+            Terminator::Fallthrough | Terminator::Jump | Terminator::Branch
+        ) {
+            if block.successors.is_empty() {
+                mask = ALL_STATE;
+            }
+            for edge in &block.successors {
+                match *edge {
+                    Edge::TailCall(target) => {
+                        callees.insert(target);
+                    }
+                    _ => match edge.intra_target() {
+                        Some(target) if func.blocks.contains_key(&target) => {}
+                        _ => mask = ALL_STATE,
+                    },
+                }
+            }
+        }
+    }
+    (mask, callees)
+}
+
+/// General purpose registers a modelled instruction reads or writes (explicitly, implicitly or in
+/// an address, like the lifter's own register tracking); any other non-segment register sets
+/// [`OTHER_STATE`].
+fn used_gprs(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateMask {
+    let mut mask = 0;
+    for used in factory.info(ins).used_registers() {
+        let reg = used.register();
+        if reg.is_gpr() {
+            mask |= 1 << reg.full_register().number();
+        } else if !reg.is_segment_register() {
+            mask |= OTHER_STATE;
+        }
+    }
+    mask
 }
 
 fn mask_of(flags: &[usize]) -> FlagMask {
