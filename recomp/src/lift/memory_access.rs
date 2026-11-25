@@ -495,9 +495,9 @@ impl FunctionLifter<'_> {
 
     /// O37: a store under the branching window check. The flat path stores directly; the window
     /// path stores and then marks the slot written (and, when runs are kept contiguous and the store
-    /// may leave its slot, the slot of its last byte); a store that may leave its slot otherwise
-    /// takes the runtime helper, which marks. No branch beyond the window check and the straddle
-    /// check the loads have too.
+    /// leaves its slot, the slot of its last byte, behind a rarely taken branch); a store that may leave its slot otherwise
+    /// takes the runtime helper, which marks. No hot branch beyond the window check and the
+    /// straddle check the loads have too.
     fn window_store(&mut self, addr: &str, bytes: u64, w: Window, access: &Access<'_>) {
         let (inside, rel) = self.window_test(addr, w);
         let win = self.new_label("gw");
@@ -533,8 +533,17 @@ impl FunctionLifter<'_> {
         self.access_at(&ptr, access);
         self.window_mark(&index);
         if bytes > 1 && self.contiguous_runs() {
+            // The slot of the last byte needs its own mark only when the store crosses into it
+            // (rare). Re-marking the same slot is a second atomic store (an `xchg` on x86 hosts)
+            // that the consumer cannot tell apart from the first: skip it behind a cold branch.
             let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
             let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
+            let crosses = self.val(&format!("icmp ne i64 {last_index}, {index}"));
+            let mark_last = self.new_label("gm");
+            self.emit(&format!(
+                "br i1 {crosses}, label %{mark_last}, label %{join}, {UNLIKELY}"
+            ));
+            self.start_block(&mark_last);
             self.window_mark(&last_index);
         }
         self.emit(&format!("br label %{join}"));

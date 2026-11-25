@@ -133,6 +133,50 @@ fn table_entries_are_ordinary_loads_and_the_base_stays_invariant() {
     }
 }
 
+#[test]
+fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
+    // `mov [rcx], rax` under window-runs: one unconditional mark of the store's slot; the mark of
+    // the last byte's slot sits in its own block behind `icmp ne` (taken only by a store that
+    // leaves its slot), not on the hot path.
+    use iced_x86::code_asm::*;
+    let f = super::asm_function(0x1000, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.ret()
+    });
+    let ir = lift_module_with([&f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    // Labels of the blocks holding a mark.
+    let mut label = "";
+    let mut marked = Vec::new();
+    for line in ir.lines() {
+        if let Some(l) = line.strip_suffix(':') {
+            label = l;
+        } else if line.contains("store atomic i8 1, ptr ") {
+            marked.push(label);
+        }
+    }
+    assert_eq!(marked.len(), 2, "{ir}");
+    assert_ne!(marked[0], marked[1], "both marks on the hot path:\n{ir}");
+    let cold = marked[1];
+    assert!(cold.starts_with("gm"), "{ir}");
+    // The cold mark block is entered only by an `icmp ne` of the two slot indices.
+    let branch = ir
+        .lines()
+        .find(|l| l.contains(&format!("label %{cold},")))
+        .expect("branch to the cold mark");
+    let cond = branch
+        .split_whitespace()
+        .nth(2)
+        .expect("condition")
+        .trim_end_matches(',');
+    assert!(
+        ir.lines()
+            .any(|l| l.trim_start().starts_with(&format!("{cond} = icmp ne i64"))),
+        "{ir}"
+    );
+}
+
 /// FNV-1a 64 of a byte string (stable fingerprint of emitted IR).
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
