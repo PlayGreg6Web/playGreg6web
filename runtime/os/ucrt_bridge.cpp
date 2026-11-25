@@ -6,6 +6,7 @@
 #endif
 
 #include "os/ucrt_bridge.h"
+#include "os/vmem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1802,6 +1803,7 @@ size_t pg6_crt_fread(void* buffer, size_t size, size_t count, FILE* stream) {
         g_crt_errno = PG6_CRT_EINVAL;
         return 0;
     }
+    const playgta6::os::HostWriteScope host_write(buffer, static_cast<uint64_t>(size) * count);  // R40: kernel write
     return std::fread(buffer, size, count, stream);
 }
 

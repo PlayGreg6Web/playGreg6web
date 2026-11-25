@@ -20,11 +20,17 @@ bool decommit(uint8_t* p, uint64_t len);
 // Applies a protection to committed pages (no-op where protections cannot be enforced).
 bool protect(uint8_t* p, uint64_t len, PageProtect protect);
 bool enforces_protection();
-// See playgta6::os::take_written_pages (vmem.h). Windows reservations carry MEM_WRITE_WATCH;
-// other platforms return false.
-bool take_written_pages(const uint8_t* p, uint64_t len, std::vector<uint64_t>* offsets);
+// See playgta6::os::take_written_pages (vmem.h). Windows reservations carry MEM_WRITE_WATCH and
+// shared page views are tracked by write protection (R40); other platforms return false.
+// `view_clock`: the caller's position for shared page views (null: report them all written).
+bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets);
 // Whether later reserve() calls ask for write tracking (where the platform has it).
 void set_write_watch(bool on);
+// R40: writes caught on armed shared page views (Windows; 0 elsewhere).
+uint64_t tracked_view_faults();
+// R40: pins (or unpins) the shared page views overlapping [lo, hi) for a host write: a pinned
+// page is never armed and is reported written (see os::HostWriteScope).
+void pin_views(uintptr_t lo, uintptr_t hi, bool pin);
 
 // O36: shared pages - memory objects one process can see at several addresses at once (the
 // console's physical pages mapped at several virtual addresses). Native hosts only.

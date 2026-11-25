@@ -437,6 +437,128 @@ void test_native_shared_page_aliases() {
     reset();
 }
 
+// R40: shared page views carry no MEM_WRITE_WATCH; take_written_pages tracks them by write
+// protection instead. A page with one address reports its written 4 KiB pages; a second address
+// keeps the contents, both addresses stay one memory, and a write through either is reported to a
+// caller watching the other. Overlapping callers each see a write; each write interval costs one
+// fault per page, and nothing is reported (or faults) while nothing is written.
+void test_native_shared_view_write_tracking() {
+    if (!arena().has_shared_zone()) {
+        return;
+    }
+#if defined(_WIN32)
+    reset();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    void* res = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * k64K, kWindowType, 0x23u, kCpuProtect);
+    void* other = pg6_xbox_XMemVirtualAlloc(nullptr, 8 * k64K, kWindowType, 0x23u, kCpuProtect);
+    CHECK(res != nullptr && other != nullptr && arena().is_shared(va_of(res)) && arena().is_shared(va_of(other)));
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+    const uint64_t R = va_of(res), O = va_of(other);
+    const uint64_t at[] = {R, R + k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at, 2, pfn) == 1);
+    uint8_t* a = arena().translate(R);
+    std::vector<uint64_t> pages;
+    WriteCursor cur;
+    auto take = [&](WriteCursor& c, const uint8_t* p, uint64_t len) {
+        pages.clear();
+        return take_written_pages(p, len, &c, &pages);
+    };
+    // Single address: the first call reports the new mapping, then only what is written.
+    CHECK(take(cur, a, 2 * k64K));
+    CHECK(pages.size() == 2 * k64K / kWrittenPageSize);
+    CHECK(take(cur, a, 2 * k64K) && pages.empty());
+    const uint64_t faults0 = shared_view_write_faults();
+    a[3 * kWrittenPageSize + 5] = 0x11;
+    a[3 * kWrittenPageSize + 6] = 0x12;  // (same interval: no second fault)
+    CHECK(shared_view_write_faults() == faults0 + 1);
+    CHECK(take(cur, a, 2 * k64K));
+    // A write is reported per view (a 64 KiB page): its 16 4 KiB pages, none of the other view's.
+    CHECK(pages.size() == k64K / kWrittenPageSize && pages.front() == 0 && pages.back() == k64K - kWrittenPageSize);
+    CHECK(take(cur, a, 2 * k64K) && pages.empty());
+    CHECK(shared_view_write_faults() == faults0 + 1);
+    a[k64K + 9] = 0x13;  // the second page only
+    CHECK(take(cur, a, 2 * k64K) && pages.size() == k64K / kWrittenPageSize && pages.front() == k64K);
+    // A second address of the first page: contents kept, one memory, writes through either seen.
+    const uint64_t alias[] = {O + 2 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(alias, 1, &pfn[0]) == 1);
+    uint8_t* c = arena().translate(O + 2 * k64K);
+    CHECK(c[3 * kWrittenPageSize + 5] == 0x11 && c[3 * kWrittenPageSize + 6] == 0x12);
+    CHECK(take(cur, a, 2 * k64K) && !pages.empty());  // (a new mapping counts as written)
+    CHECK(take(cur, a, 2 * k64K) && pages.empty());
+    c[100] = 0x21;  // through the alias: reported for the first address
+    CHECK(a[100] == 0x21);
+    CHECK(take(cur, a, 2 * k64K) && pages.size() == k64K / kWrittenPageSize && pages.front() == 0);
+    a[200] = 0x22;
+    CHECK(c[200] == 0x22);
+    // Two callers whose ranges overlap (one through the alias): both see the next write once.
+    WriteCursor cur2;
+    CHECK(take(cur2, c, k64K));
+    CHECK(take(cur2, c, k64K) && pages.empty());
+    CHECK(take(cur, a, k64K) && !pages.empty());  // a[200]
+    a[300] = 0x23;
+    CHECK(take(cur, a, k64K) && pages.size() == k64K / kWrittenPageSize);
+    CHECK(take(cur2, c, k64K) && pages.size() == k64K / kWrittenPageSize);
+    CHECK(take(cur, a, k64K) && pages.empty());
+    CHECK(take(cur2, c, k64K) && pages.empty());
+    // Host writers (memcpy into guest memory) are caught the same way.
+    const uint32_t v = 0x31;
+    CHECK(arena().write(R + k64K + 0x40, &v, sizeof(v)));
+    CHECK(take(cur, a, 2 * k64K) && pages.size() == k64K / kWrittenPageSize && pages.front() == k64K);
+    // Kernel writers (ReadFile into a guest buffer) cannot fault into the tracker: an armed view
+    // makes them fail, so they write inside a HostWriteScope, which keeps the page writable and
+    // reported written, and stamps it written again when it ends.
+    {
+        const char* path = "test_xmem_windows_r40.tmp";
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            const std::vector<uint8_t> fill(64, 0x5a);
+            std::fwrite(fill.data(), 1, fill.size(), f);
+            std::fclose(f);
+        }
+        std::FILE* f = std::fopen(path, "rb");
+        CHECK(f != nullptr);
+        if (f != nullptr) {
+            std::setvbuf(f, nullptr, _IONBF, 0);  // (fread straight from the kernel into the buffer)
+            CHECK(take(cur, a, 2 * k64K) && pages.empty());  // (armed)
+            CHECK(std::fread(a + 0x80, 1, 64, f) == 0);
+            std::clearerr(f);
+            {
+                const HostWriteScope host_write(a + 0x80, 64);
+                CHECK(take(cur, a, 2 * k64K) && pages.size() == k64K / kWrittenPageSize && pages.front() == 0);
+                CHECK(std::fseek(f, 0, SEEK_SET) == 0);
+                CHECK(std::fread(a + 0x80, 1, 64, f) == 64);
+            }
+            std::fclose(f);
+            CHECK(a[0x80] == 0x5a && a[0x80 + 63] == 0x5a && c[0x80] == 0x5a);
+            CHECK(take(cur, a, 2 * k64K) && pages.size() == k64K / kWrittenPageSize && pages.front() == 0);
+            CHECK(take(cur, a, 2 * k64K) && pages.empty());
+        }
+        std::remove(path);
+    }
+    // Unmapping the alias leaves the first address tracked; remapping a slot counts as written.
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(alias, 1, nullptr) == 1);
+    a[400] = 0x24;
+    CHECK(take(cur, a, 2 * k64K) && !pages.empty() && pages.front() == 0);
+    const uint64_t swap[] = {R};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(swap, 1, &pfn[1]) == 1);
+    CHECK(a[k64K + 9] == 0x13 && a[0x40] == 0x31);
+    CHECK(take(cur, a, 2 * k64K) && pages.size() == 2 * k64K / kWrittenPageSize);
+    CHECK(take(cur, a, 2 * k64K) && pages.empty());
+    // A guest protection change leaves the page untracked: always reported, never faulting.
+    PageProtect old{};
+    CHECK(arena().protect(R + k64K, k64K, PageProtect::ReadOnly, &old));
+    CHECK(arena().protect(R + k64K, k64K, PageProtect::ReadWrite, &old));
+    const uint64_t faults1 = shared_view_write_faults();
+    a[k64K + 1] = 0x25;
+    CHECK(shared_view_write_faults() == faults1);
+    CHECK(take(cur, a, 2 * k64K) && pages.size() == 2 * k64K / kWrittenPageSize);
+    CHECK(xmem_virtual_free(res) && xmem_virtual_free(other));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+    reset();
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -450,6 +572,7 @@ int main() {
     test_browser_budget_replay();
     test_native_full_size_sequence();
     test_native_shared_page_aliases();
+    test_native_shared_view_write_tracking();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xmem_windows: %d failure(s)\n", g_failures);
         return 1;

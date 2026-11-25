@@ -232,7 +232,7 @@ private:
     // The arena's write tracking covers this buffer and was reset at a full comparison: later
     // flushes compare only the pages reported written since (os::take_written_pages).
     bool write_tracked_ = false;
-    uint64_t commit_seq_ = 0;  // os::take_written_pages' commit log position
+    os::WriteCursor write_cursor_;  // os::take_written_pages' position (commit log, view stamps)
     // O37: the translated window's write marks cover this buffer and were taken at a full
     // comparison: later flushes compare only the pages of slots marked since.
     bool window_marked_ = false;

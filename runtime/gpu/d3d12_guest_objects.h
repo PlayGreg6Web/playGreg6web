@@ -635,6 +635,9 @@ struct DeviceStats {
     // memory) and the bytes allocated for them (lazy chunks written so far).
     uint64_t shadow_bytes = 0;
     uint64_t shadow_resident_bytes = 0;
+    // R40: bytes of CPU-visible buffers compared with their shadow (all of a buffer without write
+    // tracking, only the pages written since the last flush with it).
+    uint64_t shadow_compared_bytes = 0;
     // Lazy GPU objects (DeviceOptions::defer_gpu_objects): create packets held now, written on first
     // use so far, and dropped at release without ever being written.
     uint64_t gpu_objects_pending = 0;
@@ -918,6 +921,7 @@ public:
         shadow_bytes_.fetch_add(static_cast<uint64_t>(covered), std::memory_order_relaxed);
         shadow_resident_bytes_.fetch_add(static_cast<uint64_t>(resident), std::memory_order_relaxed);
     }
+    void note_shadow_compared(uint64_t bytes) { shadow_compared_bytes_.fetch_add(bytes, std::memory_order_relaxed); }
     void note_texture_upload(uint64_t count = 1) { textures_uploaded_.fetch_add(count, std::memory_order_relaxed); }
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
@@ -1161,6 +1165,7 @@ private:
     std::atomic<uint64_t> upload_bytes_{0};
     std::atomic<uint64_t> shadow_bytes_{0};
     std::atomic<uint64_t> shadow_resident_bytes_{0};
+    std::atomic<uint64_t> shadow_compared_bytes_{0};
     std::atomic<uint64_t> textures_uploaded_{0};
     std::array<std::atomic<uint64_t>, 7> descriptor_words_{};
     std::atomic<uint32_t> descriptor_words_reported_{0};  // bit per WordsStatus already logged

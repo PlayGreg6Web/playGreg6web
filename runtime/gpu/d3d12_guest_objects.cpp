@@ -854,6 +854,7 @@ DeviceStats Device::stats() const {
     s.unsupported_copies = unsupported_copies_.load();
     s.shadow_bytes = shadow_bytes_.load();
     s.shadow_resident_bytes = shadow_resident_bytes_.load();
+    s.shadow_compared_bytes = shadow_compared_bytes_.load();
     return s;
 }
 

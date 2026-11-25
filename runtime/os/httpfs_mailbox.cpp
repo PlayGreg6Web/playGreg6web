@@ -1,4 +1,5 @@
 #include "os/httpfs_mailbox.h"
+#include "os/vmem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -167,6 +168,8 @@ int64_t HttpfsMailboxClient::read(int32_t handle, uint64_t offset, void* dst, si
         return -1;
     }
 
+    // R40: the direct backend (and a host responder) may write `dst` from the kernel.
+    const HostWriteScope host_write(dst, len);
     uint8_t* out = static_cast<uint8_t*>(dst);
     uint64_t cur_offset = offset;
     size_t remaining = len;

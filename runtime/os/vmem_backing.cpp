@@ -108,7 +108,210 @@ const PlaceholderApi& placeholder_api() {
 std::mutex g_zone_mutex;
 std::map<uintptr_t, std::pair<uintptr_t, uintptr_t>> g_zones;  // reservation base -> [zone start, end)
 
+bool in_zone(uintptr_t addr) {
+    std::lock_guard<std::mutex> lock(g_zone_mutex);
+    for (const auto& [base, zone] : g_zones) {
+        if (addr >= zone.first && addr < zone.second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// R40: write tracking of shared page views. A view of a file mapping cannot carry
+// MEM_WRITE_WATCH, so take_written_pages tracks them itself: every view of a page (one memory
+// object) is made read-only ("armed") when a caller takes its written pages, and the first write
+// through any of them faults into track_fault, which marks every view of the page written and
+// makes them writable again (one fault per page and taking interval, none for pages no caller
+// tracks). A write is stamped on every view of the page (a write through one changes what the
+// others show) with a clock each caller compares with its own (WriteCursor::view_clock), so callers
+// whose ranges overlap all see it. Lock order: the arena's mutex, then g_track_mutex (a leaf:
+// nothing here writes guest memory while holding it).
+struct TrackedView {
+    uint64_t size = 0;
+    void* page = nullptr;
+    uint64_t stamp = 0;  // g_track_clock at the last write seen (or mapping: new contents)
+};
+struct TrackedPage {
+    std::vector<uintptr_t> views;
+    bool armed = false;      // its views are read-only: the next write faults
+    bool untracked = false;  // a view got a guest protection: always reported written, never armed
+    uint32_t pins = 0;       // host writes in flight (pin_views): never armed, reported written
+};
+std::mutex g_track_mutex;
+std::map<uintptr_t, TrackedView> g_views;  // view base -> view, guarded by g_track_mutex
+std::map<void*, TrackedPage> g_tracked_pages;
+uint64_t g_track_clock = 1;  // guarded by g_track_mutex
+std::once_flag g_track_handler_once;
+std::atomic<uint64_t> g_track_faults{0};
+
+void protect_views_locked(const TrackedPage& page, DWORD protect) {
+    for (uintptr_t v : page.views) {
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(v), static_cast<SIZE_T>(g_views[v].size), protect, &old);
+    }
+}
+
+// The page's views become writable, each stamped written.
+void disarm_locked(TrackedPage& page) {
+    ++g_track_clock;
+    for (uintptr_t v : page.views) {
+        g_views[v].stamp = g_track_clock;
+    }
+    if (page.armed) {
+        page.armed = false;
+        protect_views_locked(page, PAGE_READWRITE);
+    }
+}
+
+void arm_locked(TrackedPage& page) {
+    if (page.pins != 0) {
+        return;  // a host write is in flight: the kernel cannot fault into track_fault
+    }
+    for (uintptr_t v : page.views) {
+        DWORD old = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(v), static_cast<SIZE_T>(g_views[v].size), PAGE_READONLY, &old)) {
+            page.armed = true;  // (so disarm restores the views armed so far)
+            disarm_locked(page);
+            page.untracked = true;
+            return;
+        }
+    }
+    page.armed = true;
+}
+
+LONG CALLBACK track_fault(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* rec = info->ExceptionRecord;
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2 ||
+        rec->ExceptionInformation[0] != 1) {  // a write
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uintptr_t addr = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
+    {
+        std::lock_guard<std::mutex> lock(g_track_mutex);
+        auto it = g_views.upper_bound(addr);
+        if (it != g_views.begin() && addr - std::prev(it)->first < std::prev(it)->second.size) {
+            auto pit = g_tracked_pages.find(std::prev(it)->second.page);
+            if (pit != g_tracked_pages.end() && pit->second.armed) {
+                disarm_locked(pit->second);
+                g_track_faults.fetch_add(1, std::memory_order_relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
+    // Another thread disarmed the page (or unmapped the view after disarming it) meanwhile: the
+    // write goes through now. Anything else is a real fault.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (in_zone(addr) && VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) != 0 &&
+        mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void forget_view_locked(uintptr_t at) {
+    auto it = g_views.find(at);
+    if (it == g_views.end()) {
+        return;
+    }
+    if (auto pit = g_tracked_pages.find(it->second.page); pit != g_tracked_pages.end()) {
+        TrackedPage& page = pit->second;
+        disarm_locked(page);  // a write racing with the unmap reaches the page's other views
+        page.views.erase(std::remove(page.views.begin(), page.views.end(), at), page.views.end());
+        if (page.views.empty()) {
+            g_tracked_pages.erase(pit);
+        }
+    }
+    g_views.erase(it);
+}
+
+void track_view(uint8_t* at, void* page, uint64_t size) {
+    const uintptr_t v = reinterpret_cast<uintptr_t>(at);
+    std::lock_guard<std::mutex> lock(g_track_mutex);
+    forget_view_locked(v);
+    TrackedPage& tp = g_tracked_pages[page];
+    tp.views.push_back(v);
+    g_views[v] = TrackedView{size, page, 0};
+    disarm_locked(tp);  // the new view is writable: so are the others until the next take
+}
+
+void untrack_view(uint8_t* at) {
+    std::lock_guard<std::mutex> lock(g_track_mutex);
+    forget_view_locked(reinterpret_cast<uintptr_t>(at));
+}
+
+void untrack_range(uintptr_t lo, uintptr_t hi) {
+    std::lock_guard<std::mutex> lock(g_track_mutex);
+    for (auto it = g_views.lower_bound(lo); it != g_views.end() && it->first < hi;) {
+        const uintptr_t v = it->first;
+        ++it;
+        forget_view_locked(v);
+    }
+}
+
+// A guest protection of [p, p + len): views it touches become writable and their pages
+// untracked unless it is plain read/write.
+void track_protect(uint8_t* p, uint64_t len, bool read_write) {
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(len);
+    std::lock_guard<std::mutex> lock(g_track_mutex);
+    auto it = g_views.upper_bound(lo);
+    if (it != g_views.begin()) {
+        --it;
+    }
+    for (; it != g_views.end() && it->first < hi; ++it) {
+        if (it->first + it->second.size <= lo) {
+            continue;
+        }
+        if (auto pit = g_tracked_pages.find(it->second.page); pit != g_tracked_pages.end()) {
+            disarm_locked(pit->second);
+            pit->second.untracked = pit->second.untracked || !read_write;
+        }
+    }
+}
+
+void all_written(uintptr_t lo, uintptr_t hi, uintptr_t origin, std::vector<uint64_t>* offsets) {
+    for (uintptr_t page = lo & ~(uintptr_t{kWrittenPageSize} - 1); page < hi; page += kWrittenPageSize) {
+        offsets->push_back(static_cast<uint64_t>(page - origin));
+    }
+}
+
 }  // namespace
+
+uint64_t tracked_view_faults() {
+    return g_track_faults.load(std::memory_order_relaxed);
+}
+
+void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
+    std::lock_guard<std::mutex> lock(g_track_mutex);
+    if (g_views.empty()) {
+        return;
+    }
+    auto it = g_views.upper_bound(lo);
+    if (it != g_views.begin()) {
+        --it;
+    }
+    void* last = nullptr;  // (consecutive views of one page: pinned once)
+    for (; it != g_views.end() && it->first < hi; ++it) {
+        if (it->first + it->second.size <= lo || it->second.page == last) {
+            continue;
+        }
+        last = it->second.page;
+        auto pit = g_tracked_pages.find(it->second.page);
+        if (pit == g_tracked_pages.end()) {
+            continue;
+        }
+        TrackedPage& page = pit->second;
+        if (pin) {
+            ++page.pins;
+        } else if (page.pins != 0) {
+            --page.pins;
+        }
+        // Writable for the kernel before the write, stamped written again after it (a take
+        // between the two saw the page pinned, i.e. written, and left it unarmed).
+        disarm_locked(page);
+    }
+}
 
 void release(uint8_t* base, uint64_t /*size*/) {
     std::pair<uintptr_t, uintptr_t> zone{0, 0};
@@ -118,6 +321,9 @@ void release(uint8_t* base, uint64_t /*size*/) {
             zone = it->second;
             g_zones.erase(it);
         }
+    }
+    if (zone.second != 0) {
+        untrack_range(zone.first, zone.second);
     }
     if (zone.first != 0 && zone.first == reinterpret_cast<uintptr_t>(base)) {
         zone.first = 0;  // (no lower part)
@@ -225,13 +431,21 @@ bool map_shared_page(uint8_t* at, void* page, uint64_t size) {
             return false;
         }
     }
-    return api.map_view3(page, GetCurrentProcess(), at, 0, static_cast<SIZE_T>(size), MEM_REPLACE_PLACEHOLDER,
-                         PAGE_READWRITE, nullptr, 0) == at;
+    if (api.map_view3(page, GetCurrentProcess(), at, 0, static_cast<SIZE_T>(size), MEM_REPLACE_PLACEHOLDER,
+                      PAGE_READWRITE, nullptr, 0) != at) {
+        return false;
+    }
+    track_view(at, page, size);
+    return true;
 }
 
 bool unmap_shared_page(uint8_t* at, uint64_t /*size*/) {
     const PlaceholderApi& api = placeholder_api();
-    return api.ok() && api.unmap_view2(GetCurrentProcess(), at, MEM_PRESERVE_PLACEHOLDER) != 0;
+    if (!api.ok()) {
+        return false;
+    }
+    untrack_view(at);
+    return api.unmap_view2(GetCurrentProcess(), at, MEM_PRESERVE_PLACEHOLDER) != 0;
 }
 
 uint8_t* view_shared_page(void* page, uint64_t size) {
@@ -254,6 +468,7 @@ bool decommit(uint8_t* p, uint64_t len) {
 }
 
 bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
+    track_protect(p, len, win_protect(protect) == PAGE_READWRITE);
     DWORD old = 0;
     return VirtualProtect(p, static_cast<SIZE_T>(len), win_protect(protect), &old) != 0;
 }
@@ -266,11 +481,13 @@ void set_write_watch(bool on) {
     g_write_watch.store(on, std::memory_order_relaxed);
 }
 
-bool take_written_pages(const uint8_t* p, uint64_t len, std::vector<uint64_t>* offsets) {
-    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t{kWrittenPageSize} - 1);
-    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + static_cast<uintptr_t>(len);
+namespace {
+
+// MEM_WRITE_WATCH pages of [start, end) (one reservation), as offsets from `origin`.
+bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, std::vector<uint64_t>* offsets) {
     const uint64_t pages = (end - start + kWrittenPageSize - 1) / kWrittenPageSize;
     std::vector<PVOID> written(static_cast<size_t>(std::min<uint64_t>(pages, 65536)));
+    const size_t before = offsets->size();
     for (;;) {
         ULONG_PTR count = written.size();
         DWORD granularity = 0;
@@ -278,15 +495,65 @@ bool take_written_pages(const uint8_t* p, uint64_t len, std::vector<uint64_t>* o
         if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<PVOID>(start), static_cast<SIZE_T>(end - start),
                           written.data(), &count, &granularity) != 0 ||
             granularity != kWrittenPageSize) {
+            offsets->resize(before);
             return false;
         }
         for (ULONG_PTR i = 0; i < count; ++i) {
-            offsets->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(written[i]) - start));
+            offsets->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(written[i]) - origin));
         }
         if (count < written.size()) {
             return true;
         }
     }
+}
+
+}  // namespace
+
+bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t{kWrittenPageSize} - 1);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + static_cast<uintptr_t>(len);
+    {
+        // R40: shared page views in the range (see TrackedView): those stamped after the caller's
+        // previous call, and the pages they show armed for the next interval. Pieces of the range
+        // between views (unmapped zone slots, or arena memory) are taken from MEM_WRITE_WATCH
+        // where it covers them, else reported written.
+        std::lock_guard<std::mutex> lock(g_track_mutex);
+        auto it = g_views.upper_bound(start);
+        if (it != g_views.begin() && std::prev(it)->first + std::prev(it)->second.size > start) {
+            --it;
+        }
+        if (it != g_views.end() && it->first < end) {
+            // Installed before anything is armed, and called first, ahead of handlers installed
+            // earlier (the harness' fault reporter).
+            std::call_once(g_track_handler_once, [] { AddVectoredExceptionHandler(1, &track_fault); });
+            uintptr_t at = start;
+            for (; it != g_views.end() && it->first < end; ++it) {
+                const uintptr_t lo = std::max<uintptr_t>(it->first, start);
+                const uintptr_t hi = std::min<uintptr_t>(it->first + static_cast<uintptr_t>(it->second.size), end);
+                if (at < lo && !written_pages_by_watch(at, lo, start, offsets)) {
+                    all_written(at, lo, start, offsets);
+                }
+                auto pit = g_tracked_pages.find(it->second.page);
+                const bool untracked =
+                    pit == g_tracked_pages.end() || pit->second.untracked || pit->second.pins != 0;
+                if (view_clock == nullptr || it->second.stamp > *view_clock || untracked) {
+                    all_written(lo, hi, start, offsets);
+                }
+                if (!untracked && !pit->second.armed) {
+                    arm_locked(pit->second);
+                }
+                at = hi;
+            }
+            if (at < end && !written_pages_by_watch(at, end, start, offsets)) {
+                all_written(at, end, start, offsets);
+            }
+            if (view_clock != nullptr) {
+                *view_clock = g_track_clock;
+            }
+            return true;
+        }
+    }
+    return written_pages_by_watch(start, end, start, offsets);
 }
 
 #elif defined(__EMSCRIPTEN__)
@@ -428,9 +695,15 @@ bool enforces_protection() {
     return false;
 }
 
-bool take_written_pages(const uint8_t*, uint64_t, std::vector<uint64_t>*) {
+bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_t>*) {
     return false;  // no write tracking in linear memory
 }
+
+uint64_t tracked_view_faults() {
+    return 0;
+}
+
+void pin_views(uintptr_t, uintptr_t, bool) {}
 
 void set_write_watch(bool) {}
 
@@ -511,9 +784,15 @@ bool enforces_protection() {
     return true;
 }
 
-bool take_written_pages(const uint8_t*, uint64_t, std::vector<uint64_t>*) {
+bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_t>*) {
     return false;  // not tracked on POSIX hosts
 }
+
+uint64_t tracked_view_faults() {
+    return 0;
+}
+
+void pin_views(uintptr_t, uintptr_t, bool) {}
 
 void set_write_watch(bool) {}
 

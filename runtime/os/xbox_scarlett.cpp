@@ -1388,6 +1388,8 @@ public:
         if (closed_) {
             return gdk::E_HANDLE_HR;
         }
+        // R40: the host callback / httpfs backends may write the destination from the kernel.
+        const HostWriteScope host_write(dst, size);
 
         switch (backend_) {
             case DStorageFileBackend::VirtualTable: {

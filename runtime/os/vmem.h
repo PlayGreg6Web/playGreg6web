@@ -399,7 +399,34 @@ inline constexpr uint64_t kWrittenPageSize = 4096;
 // Write tracking is opt-in: reservations made after set_write_tracking(true) carry it (Windows).
 // Tracking a large reservation costs the memory manager a bitmap and time on reserve/release, so
 // processes that create many arenas (tests) leave it off unless they need it.
+// R40: shared page views (the shared zone, Windows) are always tracked, without MEM_WRITE_WATCH: a
+// call covering a view makes every view of its page read-only until the next write through any of
+// them, which faults once, stamps them all written and makes them writable again. A caller's
+// cursor remembers the stamps it has seen, so callers whose ranges overlap all see a write (the
+// `commit_seq` form has no such position: it reports every view in the range written).
 void set_write_tracking(bool on);
+struct WriteCursor {
+    uint64_t commit_seq = 0;
+    uint64_t view_clock = 0;
+};
+bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);
+// R40: writes to shared page views caught so far (one per page and take interval).
+uint64_t shared_view_write_faults();
+// R40: a host or kernel call about to write [p, p + len) itself (ReadFile/fread into a guest
+// buffer, DirectStorage destinations). A kernel write to an armed (read-only) view fails instead
+// of faulting into the tracker, so while the scope lives the views it covers stay writable and are
+// reported written, and they are stamped written again when it ends.
+class HostWriteScope {
+public:
+    HostWriteScope(const void* p, uint64_t len);
+    ~HostWriteScope();
+    HostWriteScope(const HostWriteScope&) = delete;
+    HostWriteScope& operator=(const HostWriteScope&) = delete;
+
+private:
+    uintptr_t lo_ = 0;
+    uintptr_t hi_ = 0;
+};
 
 }  // namespace playgta6::os

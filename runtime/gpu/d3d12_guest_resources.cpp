@@ -209,10 +209,10 @@ bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n) {
 
 namespace {
 
-// R40: helper threads for the shadow comparison. XMem physical pages are file views in the arena's
-// shared zone, which cannot carry MEM_WRITE_WATCH, so the CPU-visible buffers placed there are
-// compared whole at every submission: a memory-bandwidth-bound memcmp on the submitting (guest
-// render) thread, ~72% of its time in the menu flow (several GB per second of comparison). Split
+// R40: helper threads for the shadow comparison. Buffers without write tracking are compared whole
+// at every submission: a memory-bandwidth-bound memcmp on the submitting (guest render) thread
+// (before shared page views were tracked, os::take_written_pages, ~72% of its time in the menu
+// flow: XMem physical pages are file views, which cannot carry MEM_WRITE_WATCH). Split
 // across the caller and three helpers it runs ~1.7x faster in the boot (3.7 -> 6.1 GB/s; ~2x on
 // an idle machine). run() hands out parts to the helpers and the caller alike and returns when all
 // are done; concurrent callers take turns.
@@ -1898,7 +1898,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
     // from the shadow. The tracking is reset before the comparison, so a write racing with it is
     // reported again at the next flush.
     std::vector<uint64_t> written;
-    const bool tracked = copy.empty() && os::take_written_pages(live, size, &commit_seq_, &written);
+    const bool tracked = copy.empty() && os::take_written_pages(live, size, &write_cursor_, &written);
     const uint64_t skew = reinterpret_cast<uintptr_t>(live) & (os::kWrittenPageSize - 1);
     std::vector<bool> candidate;
     if (tracked && write_tracked_) {
@@ -1954,10 +1954,12 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
         // O36: only the listed pages (a buffer of 100k pages with a handful written costs a
         // handful of comparisons, not a walk over every page).
         uint64_t run_end = 0;
+        uint64_t compared = 0;
         for (auto it = std::find(candidate.begin(), candidate.end(), true); it != candidate.end();
              it = std::find(it + 1, candidate.end(), true)) {
             const uint64_t page = static_cast<uint64_t>(it - candidate.begin()) * kShadowPage;
             const uint64_t n = std::min(kShadowPage, size - page);
+            compared += n;
             if (shadow_same(page, live + page, n)) {
                 continue;
             }
@@ -1975,6 +1977,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
         if (in_run) {
             emit(run_start, run_end);
         }
+        device_->note_shadow_compared(compared);
         if (uploaded != 0) {
             device_->note_upload(uploaded);
         }
@@ -1989,6 +1992,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
                       return shadow_same(page, live + page, std::min(kShadowPage, size - page));
                   },
                   &differs);
+    device_->note_shadow_compared(size);
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
         const bool changed = differs[static_cast<size_t>(page / kShadowPage)] != 0;

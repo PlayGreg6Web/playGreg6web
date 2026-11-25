@@ -230,7 +230,11 @@ struct Fixture {
 
     // `defer_gpu_objects` off: every resource's create packet is written at creation (the tests
     // that inspect creation payloads); on (the default): on first use (DeviceOptions).
-    explicit Fixture(bool defer_gpu_objects = true) {
+    // `shared_zone`: a shared zone in the fixture's arena (os/vmem.h, O36), for XMem physical pages
+    // as native hosts place them (the test then installs the arena as the process arena).
+    explicit Fixture(bool defer_gpu_objects = true, uint64_t shared_zone = 0)
+        : arena(playgta6::os::kDefaultArenaBase, playgta6::os::kDefaultGuestSpaceSize,
+                playgta6::os::ArenaPlacement::Anywhere, shared_zone) {
         reset_guest_runtime();
         com::reset_com_bridge();
         dx::reset_for_tests();
@@ -5975,6 +5979,114 @@ void test_window_write_marks_flush() {
     playgta6::os::set_write_tracking(true);
 }
 
+// R40: native CPU-window pages are shared page views (O36), which carry no MEM_WRITE_WATCH: their
+// writes are tracked by write protection (os::take_written_pages). After the first flush only
+// pages written since are compared and uploaded, including writes through another address of the
+// same page; overlapping buffers both see a write; nothing written, nothing compared.
+void test_shared_view_write_tracking_flush() {
+#if defined(_WIN32)
+    namespace xw = playgta6::os::xmem_windows;
+    namespace sc = playgta6::os::scarlett;
+    if (playgta6::os::kProcessSharedZoneSize == 0) {
+        return;
+    }
+    constexpr uint64_t k64K = 64ull << 10, k16G = 16ull << 30;
+    constexpr uint32_t kType = 0x20402000u;
+    Fixture fx(true, playgta6::os::kProcessSharedZoneSize);
+    playgta6::os::VirtualMemoryArena* arena = &fx.arena;
+    CHECK(arena->has_shared_zone());
+    if (!arena->has_shared_zone()) {
+        return;
+    }
+    playgta6::os::win32::set_vmem_arena(arena);  // XMem places its reservations in the process arena
+    sc::xmem_reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuWindows);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x21u, 0x4u);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x3u, 0x801u);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 8 * k64K, kType, 0x23u, 0x4u);  // a second address
+    const uint64_t C = arena->guest_address(cpu);
+    const uint64_t G = arena->guest_address(gpu);
+    const uint64_t P = arena->guest_address(pool);
+    CHECK(cpu != nullptr && gpu != nullptr && pool != nullptr && arena->is_shared(C) && arena->is_shared(P));
+    size_t count = 4;
+    uint64_t pfn[4] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 4);
+    // Pages 0 and 1 in the pool view first (as the title maps them), then in the CPU window.
+    const uint64_t pool_slots[] = {P, P + k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(pool_slots, 2, pfn) == 1);
+    const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K, C + 6 * k64K, C + 7 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 4, pfn) == 1);
+    {
+        Scene scene(fx);
+        int32_t result = -1;
+        const uint64_t buf = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                       {I(G + 4 * k64K), I(put(buffer_desc(4 * k64K))), I(0), I(0)},
+                                       dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(buf)->cpu_address() == C + 4 * k64K);
+        const uint32_t id = object_of<dg::Resource>(buf)->id();
+        auto writes = [&](size_t mark, uint32_t which) {
+            std::vector<uint32_t> offsets;
+            for (const Packet& p : packets_since(fx, mark)) {
+                if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == which) {
+                    offsets.push_back(payload_as<GpuWriteBufferPayload>(p).dst_offset);
+                }
+            }
+            return offsets;
+        };
+        auto compared = [&] { return host_device(scene.device)->stats().shadow_compared_bytes; };
+        const uint64_t list = scene.new_list();
+        scene.execute({list});  // first flush: everything compared
+        scene.execute({list});  // (the first tracked one too: nothing was tracked before)
+        // Nothing written: nothing compared, nothing uploaded.
+        uint64_t before = compared();
+        size_t mark = fx.captured.size();
+        scene.execute({list});
+        CHECK(writes(mark, id).empty() && compared() == before);
+        // A write through the CPU window: its 64 KiB page compared, its 4 KiB page uploaded.
+        const uint32_t one = 1;
+        CHECK(com::write_guest(C + 6 * k64K + 0x2000, one));
+        before = compared();
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark, id) == std::vector<uint32_t>{static_cast<uint32_t>(2 * k64K + 0x2000)}));
+        CHECK(compared() - before == k64K);
+        // A write through the pool view (another address of page 1) is seen at the CPU window.
+        const uint32_t two = 2;
+        CHECK(com::write_guest(P + k64K + 0x100, two));
+        mark = fx.captured.size();
+        before = compared();
+        scene.execute({list});
+        CHECK((writes(mark, id) == std::vector<uint32_t>{static_cast<uint32_t>(k64K)}));
+        CHECK(compared() - before == k64K);
+        // A buffer inside the first: both see the next write in their range.
+        const uint64_t buf2 = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                        {I(G + 4 * k64K + 0x8000), I(put(buffer_desc(0x1000))), I(0), I(0)},
+                                        dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t id2 = object_of<dg::Resource>(buf2)->id();
+        scene.execute({list});
+        scene.execute({list});
+        CHECK(com::write_guest(C + 4 * k64K + 0x8010, two));
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark, id) == std::vector<uint32_t>{0x8000}));
+        CHECK((writes(mark, id2) == std::vector<uint32_t>{0}));
+        // Remapping a slot: other bytes appear there and are compared and uploaded.
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&slots[3], 1, &pfn[1]) == 1);
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark, id) == std::vector<uint32_t>{static_cast<uint32_t>(3 * k64K)}));
+        fx.vcall(buf2, Slot::Release);
+        fx.vcall(buf, Slot::Release);
+        fx.vcall(list, Slot::Release);
+        scene.release_all();
+    }
+    sc::xmem_reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    playgta6::os::win32::set_vmem_arena(nullptr);
+#endif
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -5982,6 +6094,7 @@ int main() {
     test_same_bytes();
     test_compare_shadow_pages();
     test_window_write_marks_flush();
+    test_shared_view_write_tracking_flush();
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();
