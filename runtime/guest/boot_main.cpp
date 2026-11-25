@@ -22,6 +22,8 @@
 //   --max-ms <n>         stop after n ms, checked at dispatches (0 = unbounded)
 //   --watchdog-ms <n>    hard limit: report and terminate even without dispatches (default 0)
 //   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
+//   --no-xmem-shared-pages  physical pages mapped at several addresses get per-address copies
+//                        (the pre-O36 behaviour; A/B runs, os/xbox_scarlett.h)
 //   --stack <bytes>      guest stack size (default: the image's SizeOfStackReserve)
 //   --host-stack-mb <n>  host stack of the boot thread (default 4096: lifted guest calls nest
 //                        host calls, so deep guest recursion needs a deep host stack)
@@ -197,7 +199,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet]\n"
+                 "                     [--no-entry] [--quiet] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
                  "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
@@ -233,6 +235,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.quiet = true;
         } else if (a == "--no-present-pacing") {
             o.present_pacing = false;
+        } else if (a == "--no-xmem-shared-pages") {
+            playgta6::os::win32::set_process_shared_zone(false);
         } else if (a == "--gpu-capture-payloads") {
             o.gpu_capture_payloads = true;
         } else if (a == "--native-pipelines") {

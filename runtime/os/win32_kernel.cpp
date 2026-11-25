@@ -469,12 +469,18 @@ Handle create_file_impl(std::string_view raw_path,
 // Injectable backends & overlay helpers
 // ---------------------------------------------------------------------------
 
+std::atomic<bool> g_process_shared_zone{true};  // set_process_shared_zone
+
+void set_process_shared_zone(bool on) {
+    g_process_shared_zone.store(on, std::memory_order_relaxed);
+}
+
 VirtualMemoryArena& default_vmem_arena() {
     // The process guest address space: identity-mapped where the platform allows it, and the
     // translation base lifted code uses unless set_vmem_arena() installs another arena.
     struct ProcessArena {
-        VirtualMemoryArena arena{kDefaultArenaBase, kProcessGuestSpaceSize,
-                                 ArenaPlacement::PreferIdentity};
+        VirtualMemoryArena arena{kDefaultArenaBase, kProcessGuestSpaceSize, ArenaPlacement::PreferIdentity,
+                                 g_process_shared_zone.load(std::memory_order_relaxed) ? kProcessSharedZoneSize : 0};
         ProcessArena() {
             if (g_vmem_arena.load(std::memory_order_acquire) == nullptr) {
                 publish_guest_address_space(arena);

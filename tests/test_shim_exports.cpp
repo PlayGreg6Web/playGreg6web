@@ -93,13 +93,10 @@ void test_table_counts_and_lookup() {
         const Pg6Handle mod = pg6_loader_register_virtual_module(e.module, 1);
         CHECK(mod != 0);
         // The WS2_32 ordinal family (registered after this table) owns the names it exports.
-        // So does a guest-callable thunk (xbox_scarlett_guest.cpp) registered for the same export.
         const bool winsock_override =
             std::strcmp(e.module, "WS2_32.dll") == 0 && winsock_family_name(e.name);
-        const bool guest_override =
-            std::strcmp(e.module, "combase.dll") == 0 && std::strcmp(e.name, "CoCreateInstance") == 0;
-        const Pg6ProcAddress expected = winsock_override || guest_override ? by_name(mod, e.name) : e.address;
-        CHECK(winsock_override || guest_override ? expected != e.address : true);
+        const Pg6ProcAddress expected = winsock_override ? by_name(mod, e.name) : e.address;
+        CHECK(winsock_override ? expected != e.address : true);
         CHECK(by_name(mod, e.name) == expected);
         CHECK(pg6_loader_resolve_import(e.module, e.name) == expected);
     }
@@ -268,7 +265,6 @@ void test_families_and_guest_callable_precedence() {
         {"GameInput.dll", "GameInputCreate", thunk(&pg6_gthunk_game_input_create)},
         {"xg_xs.dll", "XGCreateTextureComputer", thunk(&pg6_gthunk_xg_create_texture_computer)},
         {"xg_xs.dll", "XGSuggestSwizzleMode", thunk(&pg6_gthunk_xg_suggest_swizzle_mode)},
-        {"combase.dll", "CoCreateInstance", thunk(&pg6_gthunk_co_create_instance)},
     };
     for (const Sample& s : guest_callable) {
         CHECK(pg6_loader_resolve_import(s.module, s.name) == s.expected);

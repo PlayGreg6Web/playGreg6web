@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 #include <iterator>
+#include <unordered_map>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -40,6 +41,11 @@ struct State {
         uint8_t* host = nullptr;
     };
     std::map<uint64_t, RuntimeRange> runtime_ranges;
+    // O36: alias groups, by host page: the slots showing that page when at least one of them was
+    // mapped with map_alias_slot (the page's own slot first). alias_of: alias slot -> its host page.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> alias_groups;
+    std::unordered_map<uint64_t, uint64_t> alias_of;
+    std::atomic<size_t> alias_group_count{0};
 };
 
 State& state() {
@@ -65,6 +71,32 @@ void fill_unmapped_locked() {
     }
     state().reverse.clear();
     state().reverse_entries.store(0, std::memory_order_release);
+    state().alias_groups.clear();
+    state().alias_of.clear();
+    state().alias_group_count.store(0, std::memory_order_release);
+}
+
+// O36: `slot` stops showing `host` (it is remapped or unmapped): it leaves that page's alias group.
+void leave_alias_group_locked(State& s, uint64_t slot, uint64_t host) {
+    s.alias_of.erase(slot);
+    auto it = s.alias_groups.find(host);
+    if (it == s.alias_groups.end()) {
+        return;
+    }
+    auto& slots = it->second;
+    slots.erase(std::remove(slots.begin(), slots.end(), slot), slots.end());
+    // A group of one is no group; its last member may be an alias still (its page's own slot was
+    // remapped): keep it as an alias of nobody until it is remapped too.
+    if (slots.size() <= 1) {
+        s.alias_groups.erase(it);
+        s.alias_group_count.store(s.alias_groups.size(), std::memory_order_release);
+    }
+}
+
+// The host page `slot` shows (0 when unmapped).
+uint64_t slot_host_locked(uint64_t slot) {
+    const uint64_t delta = static_cast<uint64_t>(entry(slot).load(std::memory_order_relaxed));
+    return delta == kTrapDelta ? 0 : slot_va(slot) + delta;
 }
 
 // Forgets the reverse entry of `slot`'s current host page (if it still names this slot).
@@ -170,10 +202,35 @@ bool MarkPass::take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets
         pass_ = 1;
     }
     const uint64_t last_va = std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1);
+    // O36: slots showing one physical page (alias groups) share their marks: a write through any
+    // of them is a write for every reader of the page.
+    State& s = state();
+    std::unique_lock<std::mutex> lock(s.mutex, std::defer_lock);
+    if (s.alias_group_count.load(std::memory_order_acquire) != 0) {
+        lock.lock();
+    }
     for (uint64_t slot = slot_of(va); slot <= slot_of(last_va); ++slot) {
         if (pass_of_[slot] != pass_) {
-            pass_of_[slot] = pass_;
-            marked_[slot] = mark(slot).exchange(0, std::memory_order_acq_rel) != 0 ? 1 : 0;
+            const auto git = lock.owns_lock() ? s.alias_groups.find(slot_host_locked(slot)) : s.alias_groups.end();
+            if (lock.owns_lock() && git != s.alias_groups.end()) {
+                uint8_t any = 0;
+                for (const uint64_t g : git->second) {
+                    if (pass_of_[g] == pass_) {
+                        any |= marked_[g];
+                    } else {
+                        any |= mark(g).exchange(0, std::memory_order_acq_rel) != 0 ? 1 : 0;
+                    }
+                }
+                for (const uint64_t g : git->second) {
+                    pass_of_[g] = pass_;
+                    marked_[g] = any;
+                }
+                pass_of_[slot] = pass_;
+                marked_[slot] = any;
+            } else {
+                pass_of_[slot] = pass_;
+                marked_[slot] = mark(slot).exchange(0, std::memory_order_acq_rel) != 0 ? 1 : 0;
+            }
         }
         if (marked_[slot] != 0 && slot_offsets != nullptr) {
             const uint64_t start = slot_va(slot);
@@ -287,6 +344,9 @@ bool map_slot(uint64_t window_va, void* host_page) {
     const uint64_t slot = slot_of(window_va);
     // Other bytes appear at the slot (or none): a reader's copy of it is stale.
     mark(slot).store(1, std::memory_order_release);
+    if (const uint64_t prev = slot_host_locked(slot); prev != 0 && !s.alias_groups.empty()) {
+        leave_alias_group_locked(s, slot, prev);
+    }
     forget_reverse_locked(s, slot);
     if (host_page == nullptr) {
         ++s.unmap_calls;
@@ -303,6 +363,42 @@ bool map_slot(uint64_t window_va, void* host_page) {
 
 bool unmap_slot(uint64_t window_va) {
     return map_slot(window_va, nullptr);
+}
+
+bool map_alias_slot(uint64_t window_va, void* host_page) {
+    if (!in_window(window_va) || host_page == nullptr) {
+        return false;
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    const uint64_t slot = slot_of(window_va);
+    const uint64_t host = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_page));
+    mark(slot).store(1, std::memory_order_release);
+    if (const uint64_t prev = slot_host_locked(slot); prev != 0) {
+        leave_alias_group_locked(s, slot, prev);
+    }
+    forget_reverse_locked(s, slot);
+    ++s.map_calls;
+    entry(slot).store(static_cast<int64_t>(host - slot_va(slot)), std::memory_order_release);
+    auto& group = s.alias_groups[host];
+    if (group.empty()) {
+        // The page's own slot (the one host pointers name) joins first.
+        if (const auto it = s.reverse.find(host); it != s.reverse.end() && it->second != slot) {
+            group.push_back(it->second);
+        }
+    }
+    if (std::find(group.begin(), group.end(), slot) == group.end()) {
+        group.push_back(slot);
+    }
+    s.alias_of[slot] = host;
+    s.alias_group_count.store(s.alias_groups.size(), std::memory_order_release);
+    return true;
+}
+
+size_t alias_slot_count() {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.alias_of.size();
 }
 
 void* slot_host(uint64_t window_va) {

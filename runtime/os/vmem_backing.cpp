@@ -13,6 +13,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <utility>
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten/heap.h>
 #include <unistd.h>
@@ -24,7 +27,13 @@
 #include <map>
 #include <mutex>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
 #endif
 
 namespace playgta6::os::backing {
@@ -57,8 +66,174 @@ uint8_t* reserve(uint64_t size, uint64_t preferred) {
     return static_cast<uint8_t*>(p);
 }
 
+// O36: shared zones (placeholders for shared page views). VirtualAlloc2, MapViewOfFile3 and
+// UnmapViewOfFile2 are looked up at run time (Windows 10 1803+), so older hosts keep working
+// without shared pages.
+namespace {
+
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+using UnmapViewOfFile2Fn = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
+
+struct PlaceholderApi {
+    VirtualAlloc2Fn virtual_alloc2 = nullptr;
+    MapViewOfFile3Fn map_view3 = nullptr;
+    UnmapViewOfFile2Fn unmap_view2 = nullptr;
+    bool ok() const { return virtual_alloc2 != nullptr && map_view3 != nullptr && unmap_view2 != nullptr; }
+};
+
+const PlaceholderApi& placeholder_api() {
+    static const PlaceholderApi api = [] {
+        PlaceholderApi a;
+        if (HMODULE k = GetModuleHandleW(L"kernelbase.dll")) {
+            a.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(k, "VirtualAlloc2"));
+            a.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(k, "MapViewOfFile3"));
+            a.unmap_view2 = reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(k, "UnmapViewOfFile2"));
+        }
+        return a;
+    }();
+    return api;
+}
+
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+
+std::mutex g_zone_mutex;
+std::map<uintptr_t, std::pair<uintptr_t, uintptr_t>> g_zones;  // reservation base -> [zone start, end)
+
+}  // namespace
+
 void release(uint8_t* base, uint64_t /*size*/) {
+    std::pair<uintptr_t, uintptr_t> zone{0, 0};
+    {
+        std::lock_guard<std::mutex> lock(g_zone_mutex);
+        if (auto it = g_zones.find(reinterpret_cast<uintptr_t>(base)); it != g_zones.end()) {
+            zone = it->second;
+            g_zones.erase(it);
+        }
+    }
+    if (zone.first != 0 && zone.first == reinterpret_cast<uintptr_t>(base)) {
+        zone.first = 0;  // (no lower part)
+    }
+    if (zone.second != 0) {
+        // The zone: views (unmapped, then their placeholders) and placeholders, piece by piece.
+        uintptr_t at = zone.first != 0 ? zone.first : reinterpret_cast<uintptr_t>(base);
+        while (at < zone.second) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof(mbi)) == 0 || mbi.RegionSize == 0) {
+                break;
+            }
+            if (mbi.Type == MEM_MAPPED) {
+                UnmapViewOfFile(mbi.BaseAddress);
+            } else if (mbi.State != MEM_FREE) {
+                VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE);
+            }
+            at = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        }
+        if (zone.first == 0) {
+            return;
+        }
+    }
     VirtualFree(base, 0, MEM_RELEASE);
+}
+
+bool shared_pages_supported() {
+    return placeholder_api().ok();
+}
+
+uint8_t* reserve_with_shared_zone(uint64_t size, uint64_t preferred, uint64_t zone_offset) {
+    const PlaceholderApi& api = placeholder_api();
+    if (!api.ok() || zone_offset >= size || zone_offset % (64u << 10) != 0) {
+        return reserve(size, preferred);
+    }
+    void* p = api.virtual_alloc2(GetCurrentProcess(), reinterpret_cast<void*>(static_cast<uintptr_t>(preferred)),
+                                 static_cast<SIZE_T>(size), MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                                 nullptr, 0);
+    if (p == nullptr) {
+        return nullptr;
+    }
+    if (preferred != 0 && reinterpret_cast<uintptr_t>(p) != preferred) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    uint8_t* base = static_cast<uint8_t*>(p);
+    if (zone_offset != 0) {
+        // Split off the lower part and make it an ordinary reservation (with write tracking when
+        // asked for and the host allows it on a replaced placeholder).
+        if (!VirtualFree(base, static_cast<SIZE_T>(zone_offset), MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            VirtualFree(base, 0, MEM_RELEASE);
+            return nullptr;
+        }
+        const ULONG ww = g_write_watch.load(std::memory_order_relaxed) ? MEM_WRITE_WATCH : 0;
+        void* lower = api.virtual_alloc2(GetCurrentProcess(), base, static_cast<SIZE_T>(zone_offset),
+                                         MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | ww, PAGE_NOACCESS, nullptr, 0);
+        if (lower == nullptr && ww != 0) {
+            lower = api.virtual_alloc2(GetCurrentProcess(), base, static_cast<SIZE_T>(zone_offset),
+                                       MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        }
+        if (lower == nullptr) {
+            VirtualFree(base, 0, MEM_RELEASE);
+            VirtualFree(base + zone_offset, 0, MEM_RELEASE);
+            return nullptr;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_zone_mutex);
+    g_zones[reinterpret_cast<uintptr_t>(base)] = {reinterpret_cast<uintptr_t>(base + zone_offset),
+                                                  reinterpret_cast<uintptr_t>(base + size)};
+    return base;
+}
+
+void* create_shared_page(uint64_t size) {
+    HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(size >> 32),
+                                  static_cast<DWORD>(size & 0xFFFFFFFFu), nullptr);
+    return h;
+}
+
+void release_shared_page(void* page) {
+    if (page != nullptr) {
+        CloseHandle(page);
+    }
+}
+
+bool map_shared_page(uint8_t* at, void* page, uint64_t size) {
+    const PlaceholderApi& api = placeholder_api();
+    if (!api.ok() || page == nullptr) {
+        return false;
+    }
+    // [at, at + size) must be a placeholder of its own: split it out of a larger one.
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(at, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_RESERVE) {
+        return false;
+    }
+    if (mbi.AllocationBase != at || mbi.RegionSize != size) {  // (BaseAddress is always `at`)
+        if (!VirtualFree(at, static_cast<SIZE_T>(size), MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            return false;
+        }
+    }
+    return api.map_view3(page, GetCurrentProcess(), at, 0, static_cast<SIZE_T>(size), MEM_REPLACE_PLACEHOLDER,
+                         PAGE_READWRITE, nullptr, 0) == at;
+}
+
+bool unmap_shared_page(uint8_t* at, uint64_t /*size*/) {
+    const PlaceholderApi& api = placeholder_api();
+    return api.ok() && api.unmap_view2(GetCurrentProcess(), at, MEM_PRESERVE_PLACEHOLDER) != 0;
+}
+
+uint8_t* view_shared_page(void* page, uint64_t size) {
+    return static_cast<uint8_t*>(MapViewOfFile(page, FILE_MAP_ALL_ACCESS, 0, 0, static_cast<SIZE_T>(size)));
+}
+
+void unview_shared_page(uint8_t* view, uint64_t /*size*/) {
+    if (view != nullptr) {
+        UnmapViewOfFile(view);
+    }
 }
 
 bool commit(uint8_t* p, uint64_t len, PageProtect protect) {
@@ -251,6 +426,28 @@ bool take_written_pages(const uint8_t*, uint64_t, std::vector<uint64_t>*) {
 
 void set_write_watch(bool) {}
 
+// One linear memory: no second view of anything (the translated window aliases instead).
+bool shared_pages_supported() {
+    return false;
+}
+uint8_t* reserve_with_shared_zone(uint64_t size, uint64_t preferred, uint64_t) {
+    return reserve(size, preferred);
+}
+void* create_shared_page(uint64_t) {
+    return nullptr;
+}
+void release_shared_page(void*) {}
+bool map_shared_page(uint8_t*, void*, uint64_t) {
+    return false;
+}
+bool unmap_shared_page(uint8_t*, uint64_t) {
+    return false;
+}
+uint8_t* view_shared_page(void*, uint64_t) {
+    return nullptr;
+}
+void unview_shared_page(uint8_t*, uint64_t) {}
+
 #else  // POSIX
 
 namespace {
@@ -311,6 +508,73 @@ bool take_written_pages(const uint8_t*, uint64_t, std::vector<uint64_t>*) {
 }
 
 void set_write_watch(bool) {}
+
+// O36: shared pages are memfd / POSIX shared memory objects mapped MAP_SHARED | MAP_FIXED over
+// reserved pages; any reserved range can hold them.
+bool shared_pages_supported() {
+    return true;
+}
+
+uint8_t* reserve_with_shared_zone(uint64_t size, uint64_t preferred, uint64_t) {
+    return reserve(size, preferred);
+}
+
+void* create_shared_page(uint64_t size) {
+    int fd = -1;
+#if defined(__linux__)
+    fd = static_cast<int>(syscall(SYS_memfd_create, "pg6-page", 0u));
+#endif
+    if (fd < 0) {
+        char name[64];
+        static std::atomic<unsigned> counter{0};
+        std::snprintf(name, sizeof(name), "/pg6-page-%d-%u", static_cast<int>(getpid()), counter.fetch_add(1));
+        fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            shm_unlink(name);
+        }
+    }
+    if (fd < 0) {
+        return nullptr;
+    }
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        close(fd);
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(static_cast<intptr_t>(fd) + 1);
+}
+
+void release_shared_page(void* page) {
+    if (page != nullptr) {
+        close(static_cast<int>(reinterpret_cast<intptr_t>(page) - 1));
+    }
+}
+
+bool map_shared_page(uint8_t* at, void* page, uint64_t size) {
+    if (page == nullptr) {
+        return false;
+    }
+    const int fd = static_cast<int>(reinterpret_cast<intptr_t>(page) - 1);
+    return mmap(at, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == at;
+}
+
+bool unmap_shared_page(uint8_t* at, uint64_t size) {
+    return mmap(at, static_cast<size_t>(size), PROT_NONE, kReserveFlags | MAP_FIXED, -1, 0) == at;
+}
+
+uint8_t* view_shared_page(void* page, uint64_t size) {
+    if (page == nullptr) {
+        return nullptr;
+    }
+    const int fd = static_cast<int>(reinterpret_cast<intptr_t>(page) - 1);
+    void* p = mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    return p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
+}
+
+void unview_shared_page(uint8_t* view, uint64_t size) {
+    if (view != nullptr) {
+        munmap(view, static_cast<size_t>(size));
+    }
+}
 
 #endif
 

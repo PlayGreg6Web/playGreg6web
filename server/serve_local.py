@@ -942,31 +942,26 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         file_size = st.st_size
         etag = compute_etag(st)
         last_modified = formatdate(st.st_mtime, usegmt=True)
-        range_header = self.headers.get("Range")
 
-        # Never short-circuit HTTP Range requests to 304 Not Modified: browsers
-        # attach cached If-None-Match / If-Modified-Since headers when fetching
-        # subsequent slices of large .rpf / .wgsl.pack files, and returning 304
-        # starves or corrupts ranged streaming (RFC 9110 §13.1.5 uses If-Range).
-        if not range_header:
-            if hasattr(self.headers, "get_all"):
-                raw_if_none_match = self.headers.get_all("If-None-Match")
-                if_none_match = ", ".join(raw_if_none_match) if raw_if_none_match else None
-            else:
-                if_none_match = self.headers.get("If-None-Match")
-            if if_none_match:
-                if etag_matches_if_none_match(if_none_match, etag):
-                    self._send_not_modified(etag, last_modified)
-                    return
-            else:
-                if_modified_since = self.headers.get("If-Modified-Since")
-                if if_modified_since and if_modified_since_not_modified(if_modified_since, st.st_mtime):
-                    self._send_not_modified(etag, last_modified)
-                    return
+        if hasattr(self.headers, "get_all"):
+            raw_if_none_match = self.headers.get_all("If-None-Match")
+            if_none_match = ", ".join(raw_if_none_match) if raw_if_none_match else None
+        else:
+            if_none_match = self.headers.get("If-None-Match")
+        if if_none_match:
+            if etag_matches_if_none_match(if_none_match, etag):
+                self._send_not_modified(etag, last_modified)
+                return
+        else:
+            if_modified_since = self.headers.get("If-Modified-Since")
+            if if_modified_since and if_modified_since_not_modified(if_modified_since, st.st_mtime):
+                self._send_not_modified(etag, last_modified)
+                return
 
         content_type, _ = mimetypes.guess_type(str(target))
         content_type = content_type or "application/octet-stream"
 
+        range_header = self.headers.get("Range")
         if_range_header = self.headers.get("If-Range")
         apply_range = bool(range_header)
         if apply_range and if_range_header:

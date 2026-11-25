@@ -1487,7 +1487,6 @@ void register_xbox_scarlett_guest_exports() {
         {"xapu.dll", "XApuDisconnect", 0, &pg6_gthunk_xapu_disconnect},
         {"xapu.dll", "XApuEnqueueCommand", 0, &pg6_gthunk_xapu_enqueue_command},
         {"xapu.dll", "XApuGetResultCount", 0, &pg6_gthunk_xapu_get_result_count},
-        {"combase.dll", "CoCreateInstance", 0, &pg6_gthunk_co_create_instance},
     };
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -1503,7 +1502,6 @@ void register_xbox_scarlett_guest_exports() {
 void reset_xbox_scarlett_guest() {
     scheduler().shutdown();
     detail::reset_input_guest();
-    reset_audio_endpoint();
     {
         ModuleState& st = module_state();
         std::lock_guard<std::mutex> lock(st.mutex);

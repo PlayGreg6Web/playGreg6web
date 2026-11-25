@@ -121,6 +121,13 @@ inline constexpr uint64_t kProcessGuestSpaceSize = uint64_t{12} << 30;
 #else
 inline constexpr uint64_t kProcessGuestSpaceSize = uint64_t{64} << 30;
 #endif
+// O36: the process arena's shared zone (native hosts): room at the top of the space for the XMem
+// physical-page reservations, whose pages the title maps at several addresses (its CPU window and
+// pool views, os/xmem_windows.h: 16 GiB plus about 6 GiB of views on the largest profile; GPU
+// windows stay in the arena: D3D12 reads their pages through the CPU window). With the default
+// space that is guest VAs [40 GiB, 68 GiB), above the translated window's range. Spaces smaller
+// than 64 GiB get none.
+inline constexpr uint64_t kProcessSharedZoneSize = kProcessGuestSpaceSize >= (uint64_t{64} << 30) ? uint64_t{28} << 30 : 0;
 
 // Win32 / Xbox VirtualAlloc & VirtualFree flags.
 inline constexpr uint32_t kMemCommit = 0x00001000u;
@@ -205,9 +212,12 @@ public:
     // Manages guest VAs [default_base, default_base + space_size) (default_base rounded up to
     // 64 KiB, space_size to 64 KiB). If no host backing can be reserved the arena is !valid() and
     // every reserve fails cleanly.
+    // O36: `shared_zone` bytes at the top of the space (rounded to 64 KiB) are kept for shared
+    // page views (reserve_shared) where the host supports them (native); 0: none.
     explicit VirtualMemoryArena(uint64_t default_base = kDefaultArenaBase,
                                 uint64_t space_size = kDefaultGuestSpaceSize,
-                                ArenaPlacement placement = ArenaPlacement::Anywhere);
+                                ArenaPlacement placement = ArenaPlacement::Anywhere,
+                                uint64_t shared_zone = 0);
     ~VirtualMemoryArena();
 
     VirtualMemoryArena(const VirtualMemoryArena&) = delete;
@@ -240,6 +250,17 @@ public:
 
     // Release an entire reservation by its exact base VA.
     bool release(uint64_t base_addr);
+
+    // O36: shared page views - one memory object (a physical page) shown at several guest VAs.
+    // reserve_shared reserves in the shared zone (0 when there is none or no room); its pages are
+    // never committed: map_shared shows a shared page (backing::create_shared_page, `size` a
+    // multiple of 64 KiB) read/write at a 64 KiB aligned VA in it, unmap_shared takes it away
+    // (the pages are reserved again). Releasing the reservation unmaps what is still mapped.
+    bool has_shared_zone() const { return shared_zone_size_ != 0; }
+    uint64_t reserve_shared(uint64_t size);
+    bool map_shared(uint64_t va, void* page, uint64_t size);
+    bool unmap_shared(uint64_t va, uint64_t size);
+    bool is_shared(uint64_t va) const;
 
     // Unified Win32/Xbox VirtualAlloc wrapper (kMemReserve, kMemCommit, or both).
     // Placeholders: kMemReserve | kMemReservePlaceholder with NoAccess reserves one (64 KiB
@@ -305,6 +326,7 @@ private:
         std::vector<PageMeta> pages;
         bool placeholder = false;            // a placeholder (see virtual_alloc / virtual_free)
         bool replaced_placeholder = false;   // a reservation made by replacing a placeholder
+        bool shared = false;                 // O36: in the shared zone (pages are views)
     };
 
     bool split_placeholder_locked(uint64_t addr, uint64_t size);
@@ -331,11 +353,20 @@ private:
     uint64_t guest_base_ = 0;     // host = guest_base_ + va
     uint8_t* backing_ = nullptr;  // host start of the backing reservation
     uint64_t backing_size_ = 0;
+    uint64_t shared_zone_base_ = 0;  // O36: guest VA of the shared zone (top of the space)
+    uint64_t shared_zone_size_ = 0;
     mutable std::mutex mutex_;
     std::map<uint64_t, Reservation> reservations_;
     uint64_t reserved_bytes_ = 0;
     uint64_t committed_bytes_ = 0;
 };
+
+// O36: shared page objects for VirtualMemoryArena::map_shared (native hosts; nullptr elsewhere).
+// view_shared_page gives the runtime its own view of the page's bytes.
+void* create_shared_page(uint64_t size);
+void release_shared_page(void* page);
+uint8_t* view_shared_page(void* page, uint64_t size);
+void unview_shared_page(uint8_t* view, uint64_t size);
 
 // Publishes `arena` as the guest address space lifted code and the import bridge use:
 // sets __playgta6_guest_base = arena.guest_base(). Must not run while guest code runs.

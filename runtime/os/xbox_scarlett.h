@@ -377,6 +377,10 @@ struct XMemWindowContiguity {
     uint64_t run_breaks = 0;
     uint64_t run_relocations = 0;  // whole runs moved to fresh frames to merge with a neighbour
     uint64_t run_bytes_moved = 0;
+    // O36: physical pages mapped at a further real address: as an alias of their bytes (window
+    // model, native shared views) / as a copy, the newer address becoming the home (conflicts).
+    uint64_t alias_slots = 0;
+    uint64_t alias_conflicts = 0;
     struct Region {
         uint64_t base = 0;
         uint64_t size = 0;

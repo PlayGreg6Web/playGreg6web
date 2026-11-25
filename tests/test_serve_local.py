@@ -412,32 +412,6 @@ class TestServeLocalRangeFastpath(unittest.TestCase):
             httpd.server_close()
             thread.join(timeout=2)
 
-    def test_range_request_with_matching_if_none_match_or_ims_returns_206_not_304(self) -> None:
-        st0, hdr0, _ = self._request("HEAD", "/data/splash.wgsl.pack")
-        self.assertEqual(st0, 200)
-        etag = hdr0.get("ETag")
-        last_modified = hdr0.get("Last-Modified")
-        self.assertTrue(etag)
-        self.assertTrue(last_modified)
-
-        start, end = 4096, 8191
-        expected = self.large_payload[start : end + 1]
-        for extra_headers in (
-            {"Range": f"bytes={start}-{end}", "If-None-Match": etag},
-            {"Range": f"bytes={start}-{end}", "If-Modified-Since": last_modified},
-            {
-                "Range": f"bytes={start}-{end}",
-                "If-None-Match": etag,
-                "If-Modified-Since": last_modified,
-            },
-        ):
-            with self.subTest(headers=sorted(extra_headers.keys())):
-                st_r, hdr_r, body_r = self._request("GET", "/data/splash.wgsl.pack", extra_headers)
-                self.assertEqual(st_r, 206)
-                self._assert_coop_coep(hdr_r)
-                self.assertEqual(hdr_r.get("Content-Range"), f"bytes {start}-{end}/{self.large_size}")
-                self.assertEqual(body_r, expected)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -183,6 +183,11 @@ struct PhysicalPage {
     uint32_t mapped_slots = 0;  // real and phantom mappings
     // R19: translated-window slots this page is mapped at (they alias the page's bytes).
     std::vector<uint64_t> window_slots;
+    // O36: native hosts: the page's shared memory object (one per page once it is mapped into a
+    // shared reservation) and the runtime's own view of it. While it exists the page's bytes live
+    // there, seen at every shared slot it is mapped at; home_va and store_va are unused.
+    void* shared = nullptr;
+    uint8_t* view = nullptr;
     // O29: the page's first real mapping (the title maps every pool page into its pool view
     // first), 0 if none. A CPU-window slot of a page whose pool_va lies outside that window
     // aliases those bytes under the translated window, so two such window slots are
@@ -200,6 +205,7 @@ struct VirtualRegion {
     bool phantom = false;     // O27: placed in the phantom space (no guest memory)
     bool cpu_window = false;  // O27: a CPU window (xmem_windows.h)
     bool translated = false;  // R19: the CPU window at os/guest_window.h's translated range
+    bool shared = false;      // O36: in the arena's shared zone (slots are views of shared pages)
 };
 
 // A guest heap block that XMemMapPhysicalPages(nullptr, ...) created for its pages.
@@ -231,6 +237,8 @@ struct XMemState {
     uint64_t mapped_physical_bytes = 0;
     uint64_t peak_working_set_bytes = 0;
     uint64_t alias_conflicts = 0;  // a page mapped at a second real address while it had a home
+    uint64_t alias_slots = 0;      // O36: ... mapped as an alias of its bytes instead (one memory)
+    bool shared_exhausted_logged = false;
     bool translated_window_live = false;  // R19: the one translated window is in use
     // O29: CPU-window mappings of pages that live elsewhere (their pool view), and how often such
     // a mapping lands next to a mapped slot whose page is its pool-view neighbour
@@ -320,8 +328,13 @@ XMemState& xmem_state() {
 // page at a new real slot moves the bytes there; unmapping its home moves them back to the store.
 // Slots in phantom reservations (xmem_windows.h: GPU windows) never become homes and hold no
 // bytes, so mapping a page into the CPU window and the GPU window keeps one copy. Mapping a page
-// at two real slots at once cannot alias in one address space: the newer slot becomes the home
-// and the older keeps a stale copy (counted in alias_conflicts).
+// at two real slots at once (the title does: the same page at several addresses of a CPU window)
+// must alias, as on the console: a write through one address is seen through the others. O36:
+// under the window memory models a slot of a reservation handed out at a window range (mirrors,
+// O37) shows the page's bytes through the window table (an alias slot, guest_window::
+// map_alias_slot) instead of a copy; native arenas back such reservations with shared page
+// views (see shared_page below). Anything else (an arena slot of a page that already has a home)
+// still gets a copy and the newer slot becomes the home (counted in alias_conflicts).
 VirtualRegion* XMemState::region_containing_locked(uint64_t va, uint64_t len) {
     auto it = region_index.upper_bound(va);
     if (it == region_index.begin()) {
@@ -368,6 +381,9 @@ void release_virtual_region(const VirtualRegion& region) {
 // R19: host bytes of `page` (its home, else its store; a zeroed store is created for a page that
 // has neither, so a translated window slot always has backing).
 uint8_t* page_bytes_locked(PhysicalPage& page) {
+    if (page.view != nullptr) {
+        return page.view;
+    }
     if (page.home_va != 0) {
         return static_cast<uint8_t*>(host_of(page.home_va));
     }
@@ -383,6 +399,45 @@ uint8_t* page_bytes_locked(PhysicalPage& page) {
     return static_cast<uint8_t*>(host_of(page.store_va));
 }
 
+// O36: the page's shared memory object (native hosts), created on first use with the page's
+// current bytes (its home's or store's), which from then on live only there. An arena slot that
+// was its home keeps a copy (as any second real mapping does). Null when the host has none.
+uint8_t* shared_bytes_locked(XMemState& st, PhysicalPage& page) {
+    if (page.view != nullptr) {
+        return page.view;
+    }
+    const uint64_t ps = page.page_size;
+    void* object = create_shared_page(ps);
+    uint8_t* view = object != nullptr ? view_shared_page(object, ps) : nullptr;
+    if (view == nullptr) {
+        release_shared_page(object);
+        return nullptr;
+    }
+    if (page.home_va != 0) {
+        std::memcpy(view, host_of(page.home_va), static_cast<size_t>(ps));
+        page.home_va = 0;
+        ++st.alias_conflicts;  // the old home keeps a copy
+    } else if (page.store_va != 0) {
+        std::memcpy(view, host_of(page.store_va), static_cast<size_t>(ps));
+        default_guest_heap().free(page.store_va);
+        page.store_va = 0;
+    }
+    page.shared = object;
+    page.view = view;
+    return view;
+}
+
+void release_shared_locked(PhysicalPage& page) {
+    if (page.view != nullptr) {
+        unview_shared_page(page.view, page.page_size);
+        page.view = nullptr;
+    }
+    if (page.shared != nullptr) {
+        release_shared_page(page.shared);
+        page.shared = nullptr;
+    }
+}
+
 // R19: points every translated-window slot of `page` at the page's current bytes (after its home
 // or store moved).
 void retarget_window_slots_locked(PhysicalPage& page) {
@@ -391,6 +446,11 @@ void retarget_window_slots_locked(PhysicalPage& page) {
     }
     uint8_t* bytes = page_bytes_locked(page);
     for (uint64_t slot : page.window_slots) {
+        if (slot >= guest_window::kRuntimeRangeBase) {
+            // O36: an alias slot of a mirrored reservation: it shows the page wherever it lives.
+            guest_window::map_alias_slot(slot, bytes);
+            continue;
+        }
         guest_window::map_slot(slot, bytes);
         // O29: the bytes moved (their home was unmapped or the page was mapped elsewhere): with
         // contiguous runs required, the slot's neighbours must still be host-adjacent.
@@ -472,6 +532,20 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         --page.mapped_slots;
     }
     st.mapped_physical_bytes -= ps;
+    // O36: a view of the page in a shared reservation (native): it goes, the page stays.
+    if (VirtualRegion* sr = st.region_containing_locked(va, ps); sr != nullptr && sr->shared) {
+        xmem_arena().unmap_shared(va, ps);
+        return;
+    }
+    // O36: an alias slot of a mirrored reservation: it shows its own (uncommitted) range memory
+    // again; the page's bytes stay where they are.
+    if (const uint64_t w = mirror_window_va_locked(st, va);
+        w != 0 && std::find(page.window_slots.begin(), page.window_slots.end(), w) != page.window_slots.end()) {
+        page.window_slots.erase(std::remove(page.window_slots.begin(), page.window_slots.end(), w),
+                                page.window_slots.end());
+        guest_window::map_slot(w, host_of(va));
+        return;
+    }
     if (VirtualRegion* tr = st.region_containing_locked(va, ps); tr != nullptr && tr->translated) {
         // R19: an alias of the page's bytes; nothing moves.
         page.window_slots.erase(std::remove(page.window_slots.begin(), page.window_slots.end(), va),
@@ -790,6 +864,40 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
         note_cpu_window_map_locked(st, va, page, *region);
         return true;
     }
+    // O36: the page already lives at another real slot and this slot belongs to a mirrored
+    // reservation: its window VA shows those bytes (one copy, aliased as on the console).
+    if (page.home_va != 0 && page.home_va != va) {
+        if (const uint64_t w = mirror_window_va_locked(st, va)) {
+            uint8_t* bytes = page_bytes_locked(page);
+            page.window_slots.push_back(w);
+            guest_window::map_alias_slot(w, bytes);
+            ++st.alias_slots;
+            return true;
+        }
+    }
+    // O36: a shared reservation (native): the slot is a view of the page's shared memory object,
+    // one memory for every address the page is mapped at.
+    if (region != nullptr && region->shared) {
+        uint8_t* bytes = (ps % kXMemPageSize64K) == 0 ? shared_bytes_locked(st, page) : nullptr;
+        if (bytes == nullptr || !xmem_arena().map_shared(va, page.shared, ps)) {
+            st.page_slots.erase(va);
+            --page.mapped_slots;
+            st.mapped_physical_bytes -= ps;
+            return false;
+        }
+        if (page.mapped_slots > 1) {
+            ++st.alias_slots;
+        }
+        if (page.pool_va == 0) {
+            page.pool_va = va;
+        }
+        if (region->cpu_window) {
+            xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
+            note_cpu_window_map_locked(st, va, page, *region);
+        }
+        retarget_window_slots_locked(page);
+        return true;
+    }
     if (region != nullptr && !region->committed) {
         PageProtect pp = PageProtect::ReadWrite;
         xmem_protect(region->protect, pp);
@@ -805,6 +913,15 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
         st.virtual_committed_bytes += ps;
     }
     auto* dst = static_cast<uint8_t*>(host_of(va));
+    if (page.view != nullptr) {
+        // O36: the page lives in its shared memory object: this arena slot gets a copy.
+        std::memcpy(dst, page.view, static_cast<size_t>(ps));
+        ++st.alias_conflicts;
+        if (page.pool_va == 0) {
+            page.pool_va = va;
+        }
+        return true;
+    }
     if (page.home_va != 0 && page.home_va != va) {
         std::memcpy(dst, host_of(page.home_va), static_cast<size_t>(ps));
         ++st.alias_conflicts;
@@ -2283,6 +2400,8 @@ XMemWindowContiguity xmem_window_contiguity() {
     c.run_breaks = st.run_breaks;
     c.run_relocations = st.run_relocations;
     c.run_bytes_moved = st.run_bytes_moved;
+    c.alias_slots = st.alias_slots;
+    c.alias_conflicts = st.alias_conflicts;
     for (const auto& [key, region] : st.virtual_regions) {
         if (!region.cpu_window || region.phantom) {
             continue;
@@ -2349,6 +2468,8 @@ void xmem_reset_for_testing() {
     st.virtual_regions.clear();
     st.region_index.clear();
     st.alias_conflicts = 0;
+    st.alias_slots = 0;
+    st.shared_exhausted_logged = false;
     st.cpu_window_maps = 0;
     st.cpu_window_neighbour_pairs = 0;
     st.cpu_window_neighbour_pairs_contiguous = 0;
@@ -2368,6 +2489,7 @@ void xmem_reset_for_testing() {
         if (page->store_va != 0) {
             default_guest_heap().free(page->store_va);
         }
+        release_shared_locked(*page);
     }
     st.physical_pages.clear();
     st.next_page_handle = 0x1000ULL;
@@ -2650,6 +2772,7 @@ int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_ar
             if (it->second->store_va != 0) {
                 playgta6::os::default_guest_heap().free(it->second->store_va);
             }
+            release_shared_locked(*it->second);  // views still mapped keep the memory alive
             st.physical_pages.erase(it);
         }
     }
@@ -2810,16 +2933,40 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     const uint32_t arena_type =
         (want_reserve ? os::kMemReserve : 0u) | (want_commit ? os::kMemCommit : 0u) | placeholder_bits;
     uint64_t va = 0;
+    bool shared = false;
     if (phantom) {
         va = playgta6::os::xmem_windows::reserve_phantom(aligned_size);
     } else if (translated) {
         va = os::guest_window::kWindowBase;
         st.translated_window_live = true;
     } else {
-        try {
-            va = arena.virtual_alloc(guest_of(address), aligned_size, arena_type, pp);
-        } catch (const std::bad_alloc&) {
-            va = 0;
+        // O36: native hosts: physical-page reservations (CPU windows, pool views and smaller ones:
+        // the title maps its physical pages into them, the same page at several addresses) go to
+        // the arena's shared zone, where every slot is a view of the page's own memory. GPU
+        // windows stay in the arena (D3D12 reads their pages through the CPU window); placeholders
+        // are the arena's.
+        const bool physical_reserve = !want_commit && placeholder_bits == 0 &&
+                                      (allocation_type & playgta6::os::xmem_windows::kMemPhysical) != 0;
+        const bool gpu_window = window && window_kind == playgta6::os::xmem_windows::WindowKind::Gpu;
+        if (physical_reserve && !gpu_window && address == nullptr && !os::guest_window::enabled() &&
+            arena.has_shared_zone() && (aligned_size % kXMemPageSize64K) == 0) {
+            va = arena.reserve_shared(aligned_size);
+            if (va != 0) {
+                shared = true;
+            } else if (!st.shared_exhausted_logged) {
+                st.shared_exhausted_logged = true;
+                std::fprintf(stderr,
+                             "[xmem] no shared-zone room for a %llu-byte window: it is placed in the arena "
+                             "(its pages mapped at several addresses get copies)\n",
+                             static_cast<unsigned long long>(aligned_size));
+            }
+        }
+        if (va == 0) {
+            try {
+                va = arena.virtual_alloc(guest_of(address), aligned_size, arena_type, pp);
+            } catch (const std::bad_alloc&) {
+                va = 0;
+            }
         }
     }
     if (va == 0) {
@@ -2875,6 +3022,7 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     region.phantom = phantom;
     region.cpu_window = window && window_kind == playgta6::os::xmem_windows::WindowKind::Cpu;
     region.translated = translated;
+    region.shared = shared;
 
     if (!phantom && !translated) {
         st.virtual_reserved_bytes += aligned_size;

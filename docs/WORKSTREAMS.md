@@ -76,7 +76,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add the missing fields to the harness's report JSON (additive, versioned) and make the comparison tool use them.
 - [x] **R43 — One-Command Native Boot Runner (`tools/run_native_boot.py`)** — `DONE` (PR #681, closes #680)
   - Rebuild only what is stale, boot with named presets, collect the run folder and compare against a baseline.
-- [x] **R44 — Recompile the Title's Bink Video Library Instead of Shimming It, So Splash and Intro Movies Decode** — `DONE` (closes #699)
+- [ ] **R44 — Recompile the Title's Bink Video Library Instead of Shimming It, So Splash and Intro Movies Decode** — `IN PROGRESS` (#699, @Timon-ok)
   - Recompile the packaged Bink module like the runtime DLLs, bind its exports as guest code ahead of the shims, and get the first decoded frames of the splash movie.
 
 ---
@@ -154,9 +154,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement provider init, containers and blobs on a configurable host directory mapped to the browser's /userdata; cloud sync reported unavailable.
 - [x] **O35 — Full Sanitizer Sweep of the Runtime Suites (ASan, UBSan, TSan) and Fix What It Finds** — `DONE` (PR #701, closes #669)
   - Run and loop every runtime suite under ASan+UBSan and TSan, fix findings by cause with regression tests, and close the thread-pool submission leak left by O32.
-- [x] **O36 — Browser Boot Parity: Run the Real Program's wasm64 Boot Locally in Chrome and Close the Gap to the Native Boot** — `DONE` (closes #687) *(coordinated with the browser pipeline's owner)*
+- [ ] **O36 — Browser Boot Parity: Run the Real Program's wasm64 Boot Locally in Chrome and Close the Gap to the Native Boot** — `IN PROGRESS` (#687, @Timon-ok) *(coordinated with the browser pipeline's owner)*
   - Run the browser boot end to end locally, compare it with a native run of the same commit, and fix wasm-only runtime gaps; web and build-tool items go to their owner first.
-- [x] **O37 — Write Tracking for the Translated CPU Window in the Browser: Per-Slot Dirty Bits From Lifted Stores and Copy Helpers** — `DONE` (closes #716) *(O36 follow-up)*
+- [ ] **O37 — Write Tracking for the Translated CPU Window in the Browser: Per-Slot Dirty Bits From Lifted Stores and Copy Helpers** — `IN PROGRESS` (#716, @Timon-ok) *(O36 follow-up)*
   - Lifted window stores and runtime copy helpers set per-slot dirty bits so the GPU shadow flush compares only written slots in the browser.
 
 ---

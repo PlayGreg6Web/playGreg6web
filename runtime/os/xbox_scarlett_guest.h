@@ -440,32 +440,6 @@ struct XApuStats {
 };
 XApuStats xapu_stats();
 
-// The default audio render endpoint (mmdevice_guest.cpp): combase!CoCreateInstance(
-// CLSID_MMDeviceEnumerator) -> IMMDeviceEnumerator with one active eRender endpoint, its
-// IAudioClient (48 kHz float32 stereo mix format, 10 ms period) and ISpatialAudioClient (7.1.4
-// static objects, 48 kHz float32 mono, 480 frames per pass). Rendered audio is consumed at the
-// real-time rate and discarded; a sink set here receives each pass's PCM (interleaved float32,
-// `channels` per frame; object_type 0 for an IAudioRenderClient buffer, else the
-// AudioObjectType of one spatial static object). Called on the guest's audio thread: copy, do
-// not block.
-using AudioRenderSink = void (*)(void* user, uint32_t object_type, const float* pcm, uint32_t frames,
-                                 uint32_t channels, uint32_t sample_rate);
-void set_audio_render_sink(AudioRenderSink sink, void* user);
-
-struct AudioEndpointStats {
-    uint64_t activations = 0;     // IMMDevice::Activate calls that returned a client
-    uint64_t spatial_passes = 0;  // completed Begin/EndUpdatingAudioObjects passes
-    uint64_t render_frames = 0;   // frames released through IAudioRenderClient
-};
-AudioEndpointStats audio_endpoint_stats();
-
-// Tests only: with a manual clock the 10 ms period thread is stopped and audio_engine_tick()
-// advances every started stream by one period (padding drains, the stream's event is set).
-void audio_engine_manual_clock(bool manual);
-void audio_engine_tick();
-// Tests only: stops the period thread, forgets the streams, the sink and the statistics.
-void reset_audio_endpoint();
-
 // Tests only: stops the DirectStorage workers (waiting for running work), forgets the factory
 // singleton and zeroes the statistics. Call before reset_com_bridge().
 void reset_xbox_scarlett_guest();
@@ -500,8 +474,5 @@ void pg6_gthunk_xapu_disconnect(void* state);
 void pg6_gthunk_xapu_enqueue_command(void* state);
 void pg6_gthunk_xapu_get_result_count(void* state);
 void pg6_gthunk_xapu_dequeue_result(void* state);
-// combase.dll!CoCreateInstance(REFCLSID, IUnknown*, DWORD, REFIID, void**) -> HRESULT
-// (CLSID_MMDeviceEnumerator: mmdevice_guest.cpp; every other class: the host shim's answer)
-void pg6_gthunk_co_create_instance(void* state);
 
 }  // extern "C"

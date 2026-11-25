@@ -55,6 +55,13 @@ inline constexpr bool in_window(uint64_t va) {
 // unmaps). Returns false outside the window.
 bool map_slot(uint64_t window_va, void* host_page);
 bool unmap_slot(uint64_t window_va);
+// O36: maps a slot onto a host page that another slot already shows (an alias of the same
+// physical page, e.g. a page the title maps at two addresses): like map_slot, but host pointers
+// keep naming the page's own slot (guest_address), and a write mark on any slot of the group is
+// a write mark on all of them (MarkPass). Remapping or unmapping the slot ends the alias.
+bool map_alias_slot(uint64_t window_va, void* host_page);
+// Slots currently mapped as aliases (diagnostics, tests).
+size_t alias_slot_count();
 // Host page backing the slot of `window_va`, or nullptr if unmapped / outside.
 void* slot_host(uint64_t window_va);
 

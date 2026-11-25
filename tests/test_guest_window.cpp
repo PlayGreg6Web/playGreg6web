@@ -739,6 +739,80 @@ void test_xmem_committed_regions_in_the_window() {
     gw::reset_for_testing();
 }
 
+// O36: a physical page the title maps at two addresses of a mirrored reservation (and one it maps
+// in the pool view and again in a mirrored window) is ONE page: a write through either address is
+// seen through the other, write marks of either address reach readers of both, and unmapping the
+// page's first address keeps the other showing its bytes.
+void test_xmem_aliases_in_the_window() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kWindowType, 0x23u, kCpuProtect);  // pool view
+    void* second = pg6_xbox_XMemVirtualAlloc(nullptr, GiB, kWindowType, 0x23u, kCpuProtect);    // mirrored
+    const uint64_t S = va_of(second);
+    CHECK(cpu != nullptr && pool != nullptr && !gw::in_window(va_of(pool)) && S >= gw::kRuntimeRangeBase);
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+
+    // One page at slots 0 and 3 of the mirrored window.
+    const uint64_t at[] = {S, S + 3 * k64K};
+    const uint64_t same[] = {pfn[0], pfn[0]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at, 2, same) == 1);
+    CHECK(gw::alias_slot_count() == 1);
+    const uint32_t a = 0xA11A5ED1u;
+    CHECK(gw::copy_to_guest(S + 3 * k64K + 0x40, &a, 4));
+    uint32_t back = 0;
+    CHECK(gw::copy_from_guest(&back, S + 0x40, 4) && back == a);  // written at slot 3, read at slot 0
+    const uint32_t b = 0xB0B0B0B0u;
+    CHECK(gw::copy_to_guest(S + 0x80, &b, 4));
+    CHECK(gw::copy_from_guest(&back, S + 3 * k64K + 0x80, 4) && back == b);
+    // A write through one address is a write mark for readers of the other.
+    {
+        gw::MarkPass pass;
+        pass.begin();
+        std::vector<uint64_t> none;
+        CHECK(pass.take(S, 4 * k64K, &none));
+        pass.begin();
+        CHECK(gw::copy_to_guest(S + 3 * k64K + 0x10, &a, 4));
+        std::vector<uint64_t> marked;
+        CHECK(pass.take(S, k64K, &marked) && (marked == std::vector<uint64_t>{0}));
+    }
+    // Unmapping the page's first address: the other keeps showing its bytes.
+    const uint64_t first[] = {S};
+    const uint64_t zero[] = {0};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(first, 1, zero) == 1);
+    CHECK(gw::copy_from_guest(&back, S + 3 * k64K + 0x40, 4) && back == a);
+    CHECK(gw::copy_from_guest(&back, S + 3 * k64K + 0x80, 4) && back == b);
+    // ... and mapping it back makes slot 0 its address again, still one page.
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(first, 1, &pfn[0]) == 1);
+    CHECK(gw::copy_to_guest(S + 0x40, &b, 4));
+    CHECK(gw::copy_from_guest(&back, S + 3 * k64K + 0x40, 4) && back == b);
+
+    // A page in the pool view (arena memory) mapped again in the mirrored window: the same bytes.
+    CHECK(pg6_xbox_XMemMapPhysicalPages(pool, 1, &pfn[1]) == pool);
+    const uint64_t at2[] = {S + 8 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at2, 1, &pfn[1]) == 1);
+    CHECK(gw::copy_to_guest(S + 8 * k64K + 4, &a, 4));
+    uint32_t pooled = 0;
+    std::memcpy(&pooled, static_cast<uint8_t*>(pool) + 4, 4);
+    CHECK(pooled == a);
+    // Unmapping the alias leaves the pool view page alone, and the slot no longer shows it.
+    const uint64_t zero1[] = {0};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at2, 1, zero1) == 1);
+    std::memcpy(&pooled, static_cast<uint8_t*>(pool) + 4, 4);
+    CHECK(pooled == a);
+
+    CHECK(xmem_virtual_free(second));
+    CHECK(xmem_virtual_free(pool));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(gw::alias_slot_count() == 0);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -752,6 +826,7 @@ int main() {
     test_write_marks();
     test_xmem_physical_reservations_in_the_window();
     test_xmem_committed_regions_in_the_window();
+    test_xmem_aliases_in_the_window();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;

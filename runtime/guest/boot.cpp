@@ -1921,7 +1921,9 @@ std::string build_report() {
              ", \"run_kept\": " + std::to_string(c.run_kept) + ", \"run_moves\": " + std::to_string(c.run_moves) +
              ", \"run_breaks\": " + std::to_string(c.run_breaks) +
              ", \"run_relocations\": " + std::to_string(c.run_relocations) +
-             ", \"run_bytes_moved\": " + std::to_string(c.run_bytes_moved) + ", \"regions\": [";
+             ", \"run_bytes_moved\": " + std::to_string(c.run_bytes_moved) +
+             ", \"alias_slots\": " + std::to_string(c.alias_slots) +
+             ", \"alias_conflicts\": " + std::to_string(c.alias_conflicts) + ", \"regions\": [";
         for (size_t k = 0; k < c.regions.size(); ++k) {
             const auto& r = c.regions[k];
             o += std::string(k == 0 ? "" : ", ") + "{\"base\": " + hex(r.base) + ", \"size\": " + hex(r.size) +

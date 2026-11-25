@@ -133,6 +133,10 @@ inline constexpr uint32_t ERROR_NO_MORE_ITEMS = 259u;
 // ---------------------------------------------------------------------------
 
 VirtualMemoryArena& default_vmem_arena();
+// O36: whether the process arena keeps its shared zone (vmem.h kProcessSharedZoneSize: XMem
+// physical pages are one memory at every address they are mapped at). On by default; takes effect
+// only before the process arena is first used (playgta6_boot --no-xmem-shared-pages: A/B runs).
+void set_process_shared_zone(bool on);
 void set_vmem_arena(VirtualMemoryArena* arena);
 VirtualMemoryArena* get_vmem_arena();
 

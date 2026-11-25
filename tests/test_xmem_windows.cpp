@@ -385,6 +385,58 @@ void test_native_full_size_sequence() {
     reset();
 }
 
+// O36: a physical page mapped at several addresses is ONE page (native shared views): a write
+// through any address is seen through the others, at once, and unmapping one address leaves the
+// others showing the page. Native process arena only (the browser aliases through the window
+// table, test_guest_window).
+void test_native_shared_page_aliases() {
+    if (!arena().has_shared_zone()) {
+        return;
+    }
+    reset();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    void* res = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * k64K, kWindowType, 0x23u, kCpuProtect);
+    void* other = pg6_xbox_XMemVirtualAlloc(nullptr, 8 * k64K, kWindowType, 0x23u, kCpuProtect);
+    CHECK(res != nullptr && other != nullptr && arena().is_shared(va_of(res)) && arena().is_shared(va_of(other)));
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+    const uint64_t R = va_of(res), O = va_of(other);
+    // One page at three addresses: slots 0 and 5 of one reservation, slot 2 of another.
+    const uint64_t at[] = {R, R + 5 * k64K, O + 2 * k64K};
+    const uint64_t same[] = {pfn[0], pfn[0], pfn[0]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at, 3, same) == 1);
+    auto* a = arena().translate(R);
+    auto* b = arena().translate(R + 5 * k64K);
+    auto* c = arena().translate(O + 2 * k64K);
+    a[100] = 0x11;
+    CHECK(b[100] == 0x11 && c[100] == 0x11);
+    c[k64K - 1] = 0x22;
+    CHECK(a[k64K - 1] == 0x22 && b[k64K - 1] == 0x22);
+    // Unmapping one address: the others keep the page; the address is reserved again.
+    const uint64_t first[] = {R};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(first, 1, nullptr) == 1);
+    CHECK(arena().query(R).state == MemState::Reserve);
+    b[7] = 0x33;
+    CHECK(c[7] == 0x33 && c[100] == 0x11);
+    // Mapping it back: still the same page.
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(first, 1, &pfn[0]) == 1);
+    CHECK(a[7] == 0x33 && a[100] == 0x11);
+    // The last 64 KiB of a larger unmapped stretch (slots 1..4 are one piece after the maps above).
+    const uint64_t tail[] = {R + 4 * k64K, O + 3 * k64K};
+    const uint64_t second[] = {pfn[1], pfn[1]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(tail, 2, second) == 1);
+    arena().translate(R + 4 * k64K)[1] = 0x44;
+    CHECK(arena().translate(O + 3 * k64K)[1] == 0x44);
+    // Another page at an address replaces the view; the first page is unchanged elsewhere.
+    const uint64_t replace[] = {R + 5 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(replace, 1, &pfn[1]) == 1);
+    CHECK(b[1] == 0x44 && a[100] == 0x11);
+    CHECK(xmem_virtual_free(res) && xmem_virtual_free(other));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+    reset();
+}
+
 }  // namespace
 
 int main() {
@@ -397,6 +449,7 @@ int main() {
     test_exhaustion();
     test_browser_budget_replay();
     test_native_full_size_sequence();
+    test_native_shared_page_aliases();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xmem_windows: %d failure(s)\n", g_failures);
         return 1;

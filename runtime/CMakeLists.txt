@@ -76,7 +76,6 @@ add_library(playgta6_core STATIC
     guest/shard_dispatch.cpp
     os/xbox_scarlett_guest_input.cpp
     os/acp_hal_guest.cpp
-    os/mmdevice_guest.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

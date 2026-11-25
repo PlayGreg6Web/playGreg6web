@@ -96,7 +96,8 @@ ArenaObserver set_arena_observer(ArenaObserver observer) {
 
 VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
                                        uint64_t space_size,
-                                       ArenaPlacement placement) {
+                                       ArenaPlacement placement,
+                                       uint64_t shared_zone) {
     uint64_t aligned = kDefaultArenaBase;
     if (default_base >= kAllocationGranularity &&
         align_up_checked(default_base, kAllocationGranularity, aligned) &&
@@ -114,8 +115,20 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
     }
     space_size_ = size;
 
+    // O36: the shared zone is the top of the space; the backing keeps it able to hold views.
+    uint64_t zone = 0;
+    if (shared_zone != 0 && backing::shared_pages_supported() &&
+        align_up_checked(shared_zone, kAllocationGranularity, zone) && zone < size) {
+        shared_zone_size_ = zone;
+        shared_zone_base_ = space_base_ + size - zone;
+    }
+    auto reserve_backing = [&](uint64_t bytes, uint64_t preferred, uint64_t zone_start_offset) -> uint8_t* {
+        return shared_zone_size_ != 0 ? backing::reserve_with_shared_zone(bytes, preferred, zone_start_offset)
+                                      : backing::reserve(bytes, preferred);
+    };
+
     if (placement == ArenaPlacement::PreferIdentity) {
-        if (uint8_t* host = backing::reserve(size, space_base_)) {
+        if (uint8_t* host = reserve_backing(size, space_base_, size - shared_zone_size_)) {
             backing_ = host;
             backing_size_ = size;
             guest_base_ = 0;
@@ -128,7 +141,8 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
         // One extra granule so that the base can be 64 KiB aligned (mmap only aligns to 4 KiB):
         // guest 64 KiB alignment then carries over to host pointers.
         const uint64_t total = space_base_ + size + kAllocationGranularity;
-        if (uint8_t* host = backing::reserve(total, 0)) {
+        // (Hosts with shared zones return 64 KiB aligned reservations: guest_base_ == host.)
+        if (uint8_t* host = reserve_backing(total, 0, space_base_ + size - shared_zone_size_)) {
             backing_ = host;
             backing_size_ = total;
             uint64_t aligned = 0;
@@ -136,10 +150,14 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
                              kAllocationGranularity, aligned);
             guest_base_ = aligned;
         }
-    } else if (uint8_t* host = backing::reserve(size, 0)) {
+    } else if (uint8_t* host = reserve_backing(size, 0, size - shared_zone_size_)) {
         backing_ = host;
         backing_size_ = size;
         guest_base_ = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host)) - space_base_;
+    }
+    if (backing_ == nullptr) {
+        shared_zone_size_ = 0;
+        shared_zone_base_ = 0;
     }
 }
 
@@ -239,7 +257,7 @@ bool VirtualMemoryArena::range_overlaps_locked(uint64_t start, uint64_t end) con
 }
 
 uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) const {
-    const uint64_t space_end = space_base_ + space_size_;
+    const uint64_t space_end = shared_zone_size_ != 0 ? shared_zone_base_ : space_base_ + space_size_;
     uint64_t candidate = default_base_;
     for (const auto& [base, res] : reservations_) {
         const uint64_t res_end = res.base + res.granularity_size;
@@ -290,9 +308,13 @@ uint64_t VirtualMemoryArena::reserve_locked(uint64_t hint_addr,
         if (base > UINT64_MAX - gran_size) {
             return 0;
         }
-        // Only addresses inside the backed space can be handed out.
+        // Only addresses inside the backed space can be handed out (and, O36, not in the shared
+        // zone: its pages can only be views).
         if (base < space_base_ || gran_size > space_size_ ||
             base - space_base_ > space_size_ - gran_size) {
+            return 0;
+        }
+        if (shared_zone_size_ != 0 && base + gran_size > shared_zone_base_) {
             return 0;
         }
         if (range_overlaps_locked(base, base + gran_size)) {
@@ -333,8 +355,8 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
     }
 
     Reservation* res = find_reservation_locked(addr);
-    if (!res || res->placeholder) {
-        return false;  // placeholders are never committed
+    if (!res || res->placeholder || res->shared) {
+        return false;  // placeholders and shared-zone reservations are never committed
     }
 
     const uint64_t start = align_down(addr, kPageSize);
@@ -400,8 +422,8 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
 
 bool VirtualMemoryArena::decommit_locked(uint64_t addr, uint64_t size) {
     Reservation* res = find_reservation_locked(addr);
-    if (!res) {
-        return false;
+    if (!res || res->shared) {
+        return false;  // shared-zone pages are views: unmap_shared
     }
 
     uint64_t start = 0;
@@ -455,13 +477,123 @@ bool VirtualMemoryArena::release_locked(uint64_t base_addr) {
             res_committed += kPageSize;
         }
     }
-    if (res_committed != 0) {
+    if (res.shared) {
+        // O36: views still mapped go away (64 KiB at a time, as they were mapped).
+        constexpr size_t kPagesPerView = static_cast<size_t>(kAllocationGranularity / kPageSize);
+        for (size_t p = 0; p < res.pages.size(); p += kPagesPerView) {
+            if (res.pages[p].state == MemState::Commit) {
+                backing::unmap_shared_page(translate(res.base + p * kPageSize), kAllocationGranularity);
+            }
+        }
+    } else if (res_committed != 0) {
         backing::decommit(translate(res.base), res.size);
     }
     reserved_bytes_ -= res.size;
     committed_bytes_ -= res_committed;
     reservations_.erase(it);
     return true;
+}
+
+void* create_shared_page(uint64_t size) {
+    return backing::shared_pages_supported() ? backing::create_shared_page(size) : nullptr;
+}
+
+void release_shared_page(void* page) {
+    backing::release_shared_page(page);
+}
+
+uint8_t* view_shared_page(void* page, uint64_t size) {
+    return backing::view_shared_page(page, size);
+}
+
+void unview_shared_page(uint8_t* view, uint64_t size) {
+    backing::unview_shared_page(view, size);
+}
+
+uint64_t VirtualMemoryArena::reserve_shared(uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t gran_size = 0;
+    if (shared_zone_size_ == 0 || size == 0 || !align_up_checked(size, kAllocationGranularity, gran_size)) {
+        notify(*this, ArenaEvent::Reserve, 0, size, PageProtect::NoAccess, false);
+        return 0;
+    }
+    // First fit in the zone.
+    const uint64_t zone_end = shared_zone_base_ + shared_zone_size_;
+    uint64_t candidate = shared_zone_base_;
+    for (auto it = reservations_.lower_bound(shared_zone_base_); it != reservations_.end(); ++it) {
+        if (candidate + gran_size <= it->second.base) {
+            break;
+        }
+        candidate = std::max(candidate, it->second.base + it->second.granularity_size);
+    }
+    if (candidate > zone_end || gran_size > zone_end - candidate) {
+        notify(*this, ArenaEvent::Reserve, 0, size, PageProtect::NoAccess, false);
+        return 0;
+    }
+    Reservation res;
+    res.base = candidate;
+    res.size = gran_size;
+    res.granularity_size = gran_size;
+    res.allocation_protect = PageProtect::NoAccess;
+    res.pages.assign(static_cast<size_t>(gran_size / kPageSize), PageMeta{MemState::Reserve, PageProtect::NoAccess});
+    res.shared = true;
+    reservations_.emplace(candidate, std::move(res));
+    reserved_bytes_ += gran_size;
+    notify(*this, ArenaEvent::Reserve, candidate, size, PageProtect::NoAccess, true);
+    return candidate;
+}
+
+bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Reservation* res = find_reservation_locked(va);
+    if (res == nullptr || !res->shared || page == nullptr || size == 0 || (va % kAllocationGranularity) != 0 ||
+        (size % kAllocationGranularity) != 0 || va - res->base > res->size - size) {
+        return false;
+    }
+    const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
+    const size_t count = static_cast<size_t>(size / kPageSize);
+    if (res->pages[first].state == MemState::Commit) {
+        backing::unmap_shared_page(translate(va), size);  // another page was shown here
+        committed_bytes_ -= size;
+    }
+    if (!backing::map_shared_page(translate(va), page, size)) {
+        for (size_t p = first; p < first + count; ++p) {
+            res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
+        }
+        return false;
+    }
+    for (size_t p = first; p < first + count; ++p) {
+        res->pages[p] = PageMeta{MemState::Commit, PageProtect::ReadWrite};
+    }
+    committed_bytes_ += size;
+    notify(*this, ArenaEvent::Commit, va, size, PageProtect::ReadWrite, true);
+    return true;
+}
+
+bool VirtualMemoryArena::unmap_shared(uint64_t va, uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Reservation* res = find_reservation_locked(va);
+    if (res == nullptr || !res->shared || size == 0 || va - res->base > res->size - size) {
+        return false;
+    }
+    const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
+    const size_t count = static_cast<size_t>(size / kPageSize);
+    if (res->pages[first].state != MemState::Commit) {
+        return true;
+    }
+    backing::unmap_shared_page(translate(va), size);
+    for (size_t p = first; p < first + count; ++p) {
+        res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
+    }
+    committed_bytes_ -= size;
+    notify(*this, ArenaEvent::Decommit, va, size, PageProtect::NoAccess, true);
+    return true;
+}
+
+bool VirtualMemoryArena::is_shared(uint64_t va) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const Reservation* res = find_reservation_locked(va);
+    return res != nullptr && res->shared;
 }
 
 uint64_t VirtualMemoryArena::reserve(uint64_t hint_addr,
