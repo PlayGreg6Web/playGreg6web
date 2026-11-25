@@ -694,6 +694,10 @@ const WgpuTextureFormatInfo& texture_format_info(WgpuTextureFormat format) noexc
 bool is_color_renderable(WgpuTextureFormat format, uint32_t features) noexcept;
 bool is_blendable(WgpuTextureFormat format, uint32_t features) noexcept;
 bool has_depth_aspect(WgpuTextureFormat format) noexcept;
+// The format that differs from `format` only in sRGB-ness (rgba8unorm <-> rgba8unorm-srgb, ...),
+// or Undefined. WebGPU lets a texture list it in viewFormats without a feature; D3D12 views of
+// the same resource switch freely between the two.
+WgpuTextureFormat srgb_sibling(WgpuTextureFormat format) noexcept;
 bool has_stencil_aspect(WgpuTextureFormat format) noexcept;
 bool has_alpha_channel(WgpuTextureFormat format) noexcept;
 

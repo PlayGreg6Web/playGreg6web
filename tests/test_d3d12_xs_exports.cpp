@@ -1680,6 +1680,42 @@ void test_bc_upload_needs_feature() {
     }
 }
 
+// G62: a texture whose format has an sRGB / linear sibling lists it in viewFormats, so a UNORM
+// RTV of an _SRGB resource (and the reverse) is a valid WebGPU view.
+void test_srgb_sibling_view_formats() {
+    namespace pso = playgta6::gpu::pso;
+    Fixture fx;
+    Scene scene(fx);
+    struct Case {
+        uint32_t dxgi;
+        pso::WgpuTextureFormat format, sibling;
+    };
+    const Case cases[] = {{29, pso::WgpuTextureFormat::Rgba8UnormSrgb, pso::WgpuTextureFormat::Rgba8Unorm},
+                          {28, pso::WgpuTextureFormat::Rgba8Unorm, pso::WgpuTextureFormat::Rgba8UnormSrgb},
+                          {41, pso::WgpuTextureFormat::R32Float, pso::WgpuTextureFormat::Undefined}};
+    std::vector<uint64_t> textures;
+    for (const Case& c : cases) {
+        const size_t mark = fx.captured.size();
+        const uint64_t tex = committed(fx, scene.device, 1, texture_desc(64, 32, c.dxgi, 1 /* ALLOW_RENDER_TARGET */), 0x4);
+        const std::vector<Packet> ps = packets_since(fx, mark);
+        const Packet* create = find_op(ps, GpuOpcode::CreateTexture2);
+        CHECK(create != nullptr);
+        if (create != nullptr) {
+            const auto p = payload_as<GpuCreateTexture2Payload>(*create);
+            CHECK(p.format == static_cast<uint8_t>(c.format));
+            if (c.sibling == pso::WgpuTextureFormat::Undefined) {
+                CHECK(p.view_format_count == 0);
+            } else {
+                CHECK(p.view_format_count == 1 && p.view_formats[0] == static_cast<uint8_t>(c.sibling));
+            }
+        }
+        textures.push_back(tex);
+    }
+    scene.release_all({textures[0], textures[1], textures[2]});
+    CHECK(pso::srgb_sibling(pso::WgpuTextureFormat::Bc7RgbaUnormSrgb) == pso::WgpuTextureFormat::Bc7RgbaUnorm);
+    CHECK(pso::srgb_sibling(pso::WgpuTextureFormat::Bgra8Unorm) == pso::WgpuTextureFormat::Bgra8UnormSrgb);
+}
+
 void test_copies_and_barriers() {
     Fixture fx;
     Scene scene(fx);
@@ -5143,6 +5179,7 @@ int main() {
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();
+    test_srgb_sibling_view_formats();
     test_bc_upload_needs_feature();
     test_concurrent_recording();
     test_compute_views_and_public_list();

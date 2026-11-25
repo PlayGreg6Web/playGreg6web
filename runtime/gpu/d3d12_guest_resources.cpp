@@ -640,6 +640,11 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         payload.usage_flags |= GpuTextureUsage::StorageBinding;
     }
     payload.format = static_cast<uint8_t>(mapping.format);
+    if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(mapping.format);
+        sibling != pso::WgpuTextureFormat::Undefined) {
+        payload.view_format_count = 1;  // other descriptors may view it sRGB / linear
+        payload.view_formats[0] = static_cast<uint8_t>(sibling);
+    }
 
     CommandEncoder enc;
     enc.emit_packet(GpuOpcode::CreateTexture2, &payload, sizeof(payload));
@@ -1254,6 +1259,13 @@ bool Resource::initialize() {
                 }
             }
             p.format = static_cast<uint8_t>(m.format);
+            // Views of a D3D12 resource may switch between the sRGB and the linear format (an
+            // _SRGB texture rendered through a UNORM RTV, and the reverse): list the sibling.
+            if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(m.format);
+                sibling != pso::WgpuTextureFormat::Undefined) {
+                p.view_format_count = 1;
+                p.view_formats[0] = static_cast<uint8_t>(sibling);
+            }
             CommandEncoder enc;
             enc.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
             dev.submit(enc);

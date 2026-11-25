@@ -453,6 +453,25 @@ bool is_blendable(WgpuTextureFormat format, uint32_t features) noexcept {
     return info.blendable_feature != 0 && (features & info.blendable_feature) != 0;
 }
 
+WgpuTextureFormat srgb_sibling(WgpuTextureFormat format) noexcept {
+    using F = WgpuTextureFormat;
+    switch (format) {
+        case F::Rgba8Unorm: return F::Rgba8UnormSrgb;
+        case F::Rgba8UnormSrgb: return F::Rgba8Unorm;
+        case F::Bgra8Unorm: return F::Bgra8UnormSrgb;
+        case F::Bgra8UnormSrgb: return F::Bgra8Unorm;
+        case F::Bc1RgbaUnorm: return F::Bc1RgbaUnormSrgb;
+        case F::Bc1RgbaUnormSrgb: return F::Bc1RgbaUnorm;
+        case F::Bc2RgbaUnorm: return F::Bc2RgbaUnormSrgb;
+        case F::Bc2RgbaUnormSrgb: return F::Bc2RgbaUnorm;
+        case F::Bc3RgbaUnorm: return F::Bc3RgbaUnormSrgb;
+        case F::Bc3RgbaUnormSrgb: return F::Bc3RgbaUnorm;
+        case F::Bc7RgbaUnorm: return F::Bc7RgbaUnormSrgb;
+        case F::Bc7RgbaUnormSrgb: return F::Bc7RgbaUnorm;
+        default: return F::Undefined;
+    }
+}
+
 bool has_depth_aspect(WgpuTextureFormat format) noexcept {
     return (texture_format_info(format).caps & C::Depth) != 0;
 }
