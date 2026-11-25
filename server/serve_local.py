@@ -658,8 +658,13 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                     chunk = f.read(min(256 * 1024, remaining))
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
                     remaining -= len(chunk)
+                    if remaining == 0:
+                        # Release the file before the last bytes reach the client: once the
+                        # response is complete the file can be replaced or deleted (Windows
+                        # refuses to delete a file that is still open).
+                        f.close()
+                    self.wfile.write(chunk)
         except CLIENT_DISCONNECT_ERRORS:
             return
 
