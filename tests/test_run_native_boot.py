@@ -122,7 +122,7 @@ class StalenessTests(unittest.TestCase):
             self.assertEqual([s["stage"] for s in plan.steps], ["harness"])
             cmd = plan.steps[0]["cmd"]
             self.assertTrue(cmd[1].endswith("build_native_boot.py"))
-            for flag in ("--cache-dir", "--keep-going", "--delete-ir"):
+            for flag in ("--cache-dir", "--keep-going", "--delete-ir", "--debug-info"):
                 self.assertIn(flag, cmd)
             touch(harness, fx.base + 1000)
             plan, *_ = rnb.make_plan(fx.repo, fx.build, fx.exe, fx.pkg, 3, False, None)

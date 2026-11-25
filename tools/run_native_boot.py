@@ -11,9 +11,9 @@ What it does, in order:
    workspace crates; the program (`<build-dir>/program`, `playgta6-recomp build-program <exe>
    --out ... --dll-dir <game-dir> --target native`) when its `program-manifest.json` is missing
    or older than the recompiler or the exe; the harness (`python tools/build_native_boot.py
-   <build-dir>/program --cache-dir <build-dir>/obj-cache --keep-going --delete-ir`) when the
-   binary is missing or older than the program manifest, any `runtime/` source or
-   `tools/build_native_boot.py`. Only stale stages run, in dependency order (a rebuilt stage makes
+   <build-dir>/program --cache-dir <build-dir>/obj-cache --keep-going --delete-ir --debug-info`;
+   the PDB lets `--profile` name runtime functions) when the binary is missing or older than the
+   program manifest, any `runtime/` source or `tools/build_native_boot.py`. Only stale stages run, in dependency order (a rebuilt stage makes
    the later ones stale). `--rebuild` forces all, `--no-build` fails instead of building,
    `--dry-run` prints the plan and stops, `--trust-build` skips the checks and uses the existing
    program and harness as they are (for a build made elsewhere, e.g. from another checkout).
@@ -182,7 +182,7 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
         if reason:
             plan.add("harness", reason, [sys.executable, str(repo / "tools" / "build_native_boot.py"), str(program),
                                          "--cache-dir", str(build_dir / "obj-cache"), "--jobs", str(jobs),
-                                         "--keep-going", "--delete-ir"])
+                                         "--keep-going", "--delete-ir", "--debug-info"])
     return plan, program, harness
 
 
