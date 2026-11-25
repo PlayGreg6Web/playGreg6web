@@ -42,6 +42,7 @@
 //                        working directory); saves persist there between runs, no cloud sync
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
+//   --audio-dump <file.wav>  write the stereo float32 48 kHz mix (os/audio_downmix) to a WAV file, max 10 minutes
 //   --gpu-capture-frames <n>  frames to capture (default 10)
 //   --gpu-capture-thin-uploads <n>  with payloads: keep only every nth write of a texture/buffer > 4 MiB
 //   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
@@ -91,6 +92,7 @@
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
+#include "os/audio_wav_dump.h"
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -178,6 +180,7 @@ struct Options {
     bool no_fence_lag = false;      // d3d12 DeviceOptions::fence_publish_lag = false
     std::string profile;            // --profile: per-thread host PC samples (Windows)
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
+    std::string audio_dump;         // --audio-dump: WAV of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     std::string input_script;       // --input-script: timed controller buttons (guest/input_script.h)
@@ -206,7 +209,7 @@ void usage() {
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
                  "                     [--native-pipelines] [--no-fence-lag] [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
-                 "                     [--wgpu-features <mask>]\n"
+                 "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
 
@@ -253,7 +256,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" || a == "--input-script" || a == "--watch-gpu-va" ||
-                   a == "--user-age-group" || a == "--profile" || a == "--save-dir") {
+                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump") {
             if (!value(v)) {
                 return false;
             }
@@ -266,6 +269,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--watch-gpu-va" ? o.watch_gpu_va
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
+                                  : a == "--audio-dump" ? o.audio_dump
                                   : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
@@ -622,8 +626,14 @@ void finish_profile() {}
 #endif
 
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
+playgta6::os::audio_wav_dump::Writer g_audio_dump;
+
 void write_outputs(bool print_summary) {
     finish_profile();
+    if (!g_options.audio_dump.empty()) {
+        playgta6::os::audio_downmix::set_stereo_sink(nullptr, nullptr);
+        g_audio_dump.close();
+    }
     if (!g_options.watch_gpu_va.empty()) {
         std::fprintf(stderr, "%s", gpu::va_watch::summary().c_str());
     }
@@ -1064,6 +1074,13 @@ int main(int argc, char** argv) {
             return kExitUsage;
         }
         std::fprintf(stderr, "[harness] watching GPU addresses: %s\n", g_options.watch_gpu_va.c_str());
+    }
+    if (!g_options.audio_dump.empty()) {
+        if (!g_audio_dump.open(g_options.audio_dump)) {
+            std::fprintf(stderr, "[harness] cannot write %s\n", g_options.audio_dump.c_str());
+            return kExitUsage;
+        }
+        playgta6::os::audio_downmix::set_stereo_sink(&playgta6::os::audio_wav_dump::Writer::sink, &g_audio_dump);
     }
     if (!g_options.input_script.empty()) {
         std::ifstream in(g_options.input_script, std::ios::binary);

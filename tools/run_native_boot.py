@@ -315,6 +315,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="with payloads: keep only every Nth write of a texture/buffer > 4 MiB")
     p.add_argument("--import-trace", action="store_true", help="write import-trace.txt")
     p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory under work/)")
+    p.add_argument("--audio-dump", help="harness --audio-dump: WAV file of the stereo mix")
     p.add_argument("--baseline", help="earlier run (name in the runs directory, or a directory) to compare with")
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")
     p.add_argument("--time-tolerance", type=float, metavar="REL")
@@ -386,6 +387,8 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         cmd += ["--import-trace", str(run_dir / "import-trace.txt")]
     if args.dump_pipelines:
         cmd += ["--dump-pipelines", args.dump_pipelines]
+    if args.audio_dump:
+        cmd += ["--audio-dump", args.audio_dump]
     cmd += extra
 
     for step in plan.steps:

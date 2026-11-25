@@ -300,6 +300,10 @@ else()
     target_link_libraries(test_audio_downmix PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_downmix_tests COMMAND test_audio_downmix)
 
+    add_executable(test_audio_wav_dump ../tests/test_audio_wav_dump.cpp)
+    target_link_libraries(test_audio_wav_dump PRIVATE playgta6_core)
+    add_test(NAME playgta6_audio_wav_dump_tests COMMAND test_audio_wav_dump)
+
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
     add_test(NAME playgta6_xbox_scarlett_guest_tests COMMAND test_xbox_scarlett_guest)
