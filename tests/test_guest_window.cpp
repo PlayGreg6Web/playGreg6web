@@ -632,6 +632,17 @@ void test_xmem_physical_reservations_in_the_window() {
     // window (here, with the CPU window taken, in the arena), as before.
     void* second_window = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kPhysicalReserve, 0x23u, kCpuProtect);
     CHECK(second_window != nullptr && !gw::in_window(va_of(second_window)));
+    // O36: that first one is the page pool's view; a later CPU window (the title places GPU
+    // buffers in it) is handed out at a window range, and mapping into it marks.
+    void* third_window = pg6_xbox_XMemVirtualAlloc(nullptr, GiB, kPhysicalReserve, 0x23u, kCpuProtect);
+    const uint64_t T = va_of(third_window);
+    CHECK(third_window != nullptr && T >= gw::kRuntimeRangeBase && gw::in_window(T));
+    CHECK(gw::take_written(T, 2 * k64K, &none));
+    CHECK(pg6_xbox_XMemMapPhysicalPages(third_window, 1, &pfn[1]) == third_window);
+    marked.clear();
+    CHECK(gw::take_written(T, 2 * k64K, &marked) && (marked == std::vector<uint64_t>{0}));
+    CHECK(xmem_virtual_free(third_window));
+    CHECK(gw::runtime_range_host(T) == nullptr);
     // Exhaustion: what does not fit in the 8 GiB above the CPU window stays in the arena.
     void* big = pg6_xbox_XMemVirtualAlloc(nullptr, 7 * GiB, kPlaceholder, 0x7u, 0x1u);
     CHECK(big != nullptr && gw::in_window(va_of(big)));
@@ -642,6 +653,68 @@ void test_xmem_physical_reservations_in_the_window() {
     CHECK(xmem_virtual_free(heap));
     CHECK(xmem_virtual_free(early));
     CHECK(xmem_virtual_free(cpu));
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
+// O36: the title's committed XMemVirtualAlloc regions (it sub-allocates GPU buffers from them) are
+// handed out at window ranges too; reserve-then-commit keeps the window form, and freeing a region
+// gives its window range back. Without the window model nothing moves.
+void test_xmem_committed_regions_in_the_window() {
+    constexpr uint32_t kCommitLarge = 0x20003000u;  // MEM_RESERVE | MEM_COMMIT | large pages
+    constexpr uint32_t kReserve = 0x2000u;
+    constexpr uint32_t kCommit = 0x1000u;
+    for (const bool windowed : {false, true}) {
+        xmem_reset_for_testing();
+        gw::reset_for_testing();
+        gw::set_enabled(windowed);
+        xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+        void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+        CHECK(cpu != nullptr && gw::in_window(va_of(cpu)) == windowed);
+        void* heap = pg6_xbox_XMemVirtualAlloc(nullptr, 5 * k64K, kCommitLarge, 0x183u, kCpuProtect);
+        const uint64_t H = va_of(heap);
+        CHECK(heap != nullptr && gw::in_window(H) == windowed);
+        if (!windowed) {
+            CHECK(xmem_virtual_free(heap));
+            CHECK(xmem_virtual_free(cpu));
+            continue;
+        }
+        CHECK(H >= gw::kRuntimeRangeBase);
+        // A store into the region (as lifted code makes it) lands in its memory and marks its slot.
+        std::vector<uint64_t> marked;
+        CHECK(gw::take_written(H, 5 * k64K, &marked));
+        const uint64_t v = 0x0123456789ABCDEFull;
+        CHECK(gw::copy_to_guest(H + 3 * k64K + 8, &v, sizeof(v)));
+        marked.clear();
+        CHECK(gw::take_written(H, 5 * k64K, &marked) && (marked == std::vector<uint64_t>{3 * k64K}));
+        uint64_t back = 0;
+        CHECK(gw::copy_from_guest(&back, H + 3 * k64K + 8, sizeof(back)) && back == v);
+        CHECK(gw::contiguous(H, 5 * k64K) != nullptr);
+        // A plain reservation (as a pool view is) stays in the arena.
+        void* plain = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * k64K, kReserve, 0x3u, kCpuProtect);
+        CHECK(plain != nullptr && !gw::in_window(va_of(plain)));
+        CHECK(xmem_virtual_free(plain));
+        // A physical reservation committed in place at its window VA: the commit answers with it.
+        void* res = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * k64K, 0x20402000u, 0x3u, kCpuProtect);
+        const uint64_t R = va_of(res);
+        CHECK(res != nullptr && R >= H + 5 * k64K);
+        void* committed = pg6_xbox_XMemVirtualAlloc(res, 2 * k64K, kCommit, 0x3u, kCpuProtect);
+        CHECK(committed == res);
+        CHECK(gw::copy_to_guest(R + k64K, &v, sizeof(v)));
+        // A region whose size is not a whole number of slots still gives its range back when freed.
+        void* odd = pg6_xbox_XMemVirtualAlloc(nullptr, 3 * 4096, kReserve | kCommit, 0x3u, kCpuProtect);
+        const uint64_t O = va_of(odd);
+        CHECK(odd != nullptr && gw::in_window(O));
+        CHECK(xmem_virtual_free(odd));
+        CHECK(gw::runtime_range_host(O) == nullptr);
+        CHECK(xmem_virtual_free(res));
+        CHECK(xmem_virtual_free(heap));
+        CHECK(gw::runtime_range_host(H) == nullptr);
+        void* again = pg6_xbox_XMemVirtualAlloc(nullptr, 5 * k64K, kCommitLarge, 0x183u, kCpuProtect);
+        CHECK(va_of(again) == H);  // the freed range is handed out again
+        CHECK(xmem_virtual_free(again));
+        CHECK(xmem_virtual_free(cpu));
+    }
     xmem_reset_for_testing();
     gw::reset_for_testing();
 }
@@ -658,6 +731,7 @@ int main() {
     test_xmem_run_keeper_stays_in_the_pool();
     test_write_marks();
     test_xmem_physical_reservations_in_the_window();
+    test_xmem_committed_regions_in_the_window();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;

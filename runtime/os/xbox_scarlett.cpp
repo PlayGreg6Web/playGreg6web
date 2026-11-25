@@ -259,6 +259,7 @@ struct XMemState {
     };
     std::map<uint64_t, Mirror> mirrors;
     bool mirror_exhausted_logged = false;
+    bool pool_view_placed = false;  // O36: the first CPU window past the translated one was placed
 
     void update_peak_locked() {
         const uint64_t current =
@@ -2217,7 +2218,8 @@ bool xmem_virtual_free(void* address) {
         st.translated_window_live = false;
     }
     xmem_windows::forget_window(base_va);
-    if (auto mit = st.mirrors.find(base_va); mit != st.mirrors.end() && mit->second.bytes == it->second.size) {
+    const auto mit = st.mirrors.find(base_va);
+    if (mit != st.mirrors.end() && mit->second.bytes == align_up_u64(it->second.size, kXMemPageSize64K)) {
         guest_window::unmap_runtime_range(mit->second.window_va, mit->second.bytes);  // O37
         st.mirrors.erase(mit);
     }
@@ -2344,6 +2346,7 @@ void xmem_reset_for_testing() {
     st.moved_homes.clear();
     st.mirrors.clear();
     st.mirror_exhausted_logged = false;
+    st.pool_view_placed = false;
     st.translated_window_live = false;
     xmem_windows::reset_for_testing();
     for (auto& [handle, page] : st.physical_pages) {
@@ -2754,6 +2757,9 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
                 st.virtual_committed_bytes += existing->size;
                 st.update_peak_locked();
             }
+            if (const uint64_t w = mirror_window_va_locked(st, guest_of(existing->base))) {
+                return host_of(w);  // O37: a mirrored region, in the title's form
+            }
             return existing->base;
         }
         // Not one of ours: plain VirtualAlloc semantics on whatever the arena has reserved there.
@@ -2762,6 +2768,9 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
         if (committed == 0) {
             os::win32::SetLastError(os::win32::ERROR_INVALID_PARAMETER);
             return nullptr;
+        }
+        if (const uint64_t w = mirror_window_va_locked(st, committed)) {
+            return host_of(w);
         }
         return host_of(committed);
     }
@@ -2802,16 +2811,26 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
         os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
-    // O37: under the window memory models the title's physical-page reservations (and the
-    // placeholders it splits into such reservations) are handed out at a window range above the
-    // CPU window, backed by this arena reservation slot for slot: stores into them carry write
-    // marks. XMem keeps using the arena VA; its result is the window VA's form. Without room the
-    // reservation stays where it is (logged once).
+    // O37: under the window memory models the title's XMemVirtualAlloc regions are handed out at
+    // a window range above the CPU window, backed by this arena reservation slot for slot: stores
+    // into them carry write marks. That covers its physical-page reservations, the placeholders it
+    // splits into them, and (O36) its committed regions and the CPU windows past the translated one,
+    // which it sub-allocates GPU buffers from. The first of those CPU windows is the page pool's
+    // view (xmem_windows.h): the title never reads it and the keeper's frames live in it, so it
+    // stays in the arena, as do plain reservations. XMem keeps using the arena VA; its result is
+    // the window VA's form. Without room a region stays where it is (logged once).
     uint64_t mirror = 0;
-    const bool physical_reservation =
-        (allocation_type & os::kMemReservePlaceholder) != 0 ||
-        (!want_commit && (allocation_type & playgta6::os::xmem_windows::kMemPhysical) != 0);
-    if (address == nullptr && !window && physical_reservation && st.translated_window_live &&
+    bool mirrored_window = false;
+    if (window && window_kind == playgta6::os::xmem_windows::WindowKind::Cpu && !translated && !phantom &&
+        st.translated_window_live) {
+        mirrored_window = st.pool_view_placed;
+        st.pool_view_placed = true;
+    }
+    const bool mirrored_kind =
+        mirrored_window ||
+        (!window && (want_commit || (allocation_type & os::kMemReservePlaceholder) != 0 ||
+                     (allocation_type & playgta6::os::xmem_windows::kMemPhysical) != 0));
+    if (address == nullptr && mirrored_kind && st.translated_window_live &&
         os::guest_window::enabled() && (va & (kXMemPageSize64K - 1)) == 0) {
         const uint64_t bytes = align_up_u64(aligned_size, kXMemPageSize64K);
         mirror = os::guest_window::map_runtime_range(host_of(va), bytes);
@@ -2820,8 +2839,8 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
         } else if (!st.mirror_exhausted_logged) {
             st.mirror_exhausted_logged = true;
             std::fprintf(stderr,
-                         "[xmem] no window range left for a %llu-byte physical reservation: it stays in "
-                         "the arena at 0x%llx (stores into it carry no write marks)\n",
+                         "[xmem] no window range left for a %llu-byte region: it stays in the arena at "
+                         "0x%llx (stores into it carry no write marks)\n",
                          static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(va));
         }
     }
