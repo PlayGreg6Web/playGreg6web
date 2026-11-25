@@ -311,6 +311,7 @@ Engine& engine() {
 }
 
 std::atomic<uint64_t> g_endpoint_activations{0};
+std::atomic<bool> g_endpoint_enabled{true};
 std::atomic<uint64_t> g_spatial_passes{0};
 std::atomic<uint64_t> g_render_frames{0};
 std::atomic<uint64_t> g_spatial_object_buffers{0};   // object buffers read at EndUpdatingAudioObjects
@@ -1339,7 +1340,7 @@ HResult co_create_instance(const com::Guid& clsid, uint64_t outer, uint32_t clsc
         return com::E_POINTER_HR;
     }
     out.write(0);
-    if (!(clsid == kClsidMMDeviceEnumerator)) {
+    if (!(clsid == kClsidMMDeviceEnumerator) || !g_endpoint_enabled.load()) {
         // Every other class: the host shim's answer (logs each unknown CLSID once).
         Pg6Guid host_clsid{};
         Pg6Guid host_iid{};
@@ -1388,6 +1389,9 @@ AudioEndpointStats audio_endpoint_stats() {
 
 void audio_engine_manual_clock(bool manual) { engine().set_manual(manual); }
 void audio_engine_tick() { engine().tick(); }
+
+void set_audio_endpoint_enabled(bool on) { g_endpoint_enabled.store(on); }
+bool audio_endpoint_enabled() { return g_endpoint_enabled.load(); }
 
 void reset_audio_endpoint() {
     engine().reset();

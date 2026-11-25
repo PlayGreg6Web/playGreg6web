@@ -44,6 +44,7 @@ namespace com = playgta6::guest::com;
 
 // Options for the device the next D3D12XboxCreateDevice creates (tests: packet sink).
 void set_device_options(d3d12_guest::DeviceOptions options);
+d3d12_guest::DeviceOptions device_options();
 
 // The live device (one per process, like D3D12 per adapter), or an empty Ref.
 com::Ref<d3d12_guest::Device> current_device();

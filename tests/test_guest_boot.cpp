@@ -1696,6 +1696,31 @@ void test_boot_options_and_report_sink() {
     CHECK(apply_boot_options_json("{\"report_to_log\": false, \"max_wall_ms\": \"x\"}", cfg));
     CHECK(!cfg.report_sink && cfg.max_wall_ms == 300000);
 
+    // O36: runtime switches default on; each key flips only its own field.
+    {
+        BootConfig d;
+        CHECK(apply_boot_options_json("{}", d));
+        CHECK(d.fence_publish_lag && d.defer_gpu_objects && d.xmem_shared_pages && d.present_frame_waits &&
+              d.audio_endpoint);
+        const char* keys[] = {"fence_publish_lag", "defer_gpu_objects", "xmem_shared_pages",
+                              "present_frame_waits", "audio_endpoint"};
+        for (int i = 0; i < 5; ++i) {
+            BootConfig c;
+            CHECK(apply_boot_options_json(std::string("{\"") + keys[i] + "\": false}", c));
+            const bool v[] = {c.fence_publish_lag, c.defer_gpu_objects, c.xmem_shared_pages,
+                              c.present_frame_waits, c.audio_endpoint};
+            for (int j = 0; j < 5; ++j) {
+                CHECK(v[j] == (i != j));
+            }
+            CHECK(apply_boot_options_json(std::string("{\"") + keys[i] + "\": \"x\"}", c));  // junk keeps it
+            CHECK(!c.fence_publish_lag + !c.defer_gpu_objects + !c.xmem_shared_pages + !c.present_frame_waits +
+                      !c.audio_endpoint == 1);
+            CHECK(apply_boot_options_json(std::string("{\"") + keys[i] + "\": true}", c));
+            CHECK(c.fence_publish_lag && c.defer_gpu_objects && c.xmem_shared_pages && c.present_frame_waits &&
+                  c.audio_endpoint);
+        }
+    }
+
     // Chunks split on UTF-8 boundaries and concatenate back to the text.
     const std::string text = "{\"a\": \"\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80 \xC3\xA9\"}\n{}";
     std::vector<std::string> lines;

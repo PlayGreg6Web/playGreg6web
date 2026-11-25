@@ -28,6 +28,20 @@ runtime lib via `emcmake cmake -S runtime -G Ninja -DCMAKE_BUILD_TYPE=Release` w
 shader pack via `playgta6-shaders pack-rdna2` + `tools/stage_reflection_sidecar.py`; then `tools/stage_browser_boot.py`.
 `run_browser_boot.py` does all of this for you.
 
+## Boot options (bisecting a browser regression)
+`boot-options.json` (next to the staged boot) accepts these switches. All are optional booleans and default to true
+unless noted; they mirror the `playgta6_boot` harness flags, so a regression can be bisected without a rebuild.
+
+| Option | Default | Effect when false (harness flag) |
+|---|---|---|
+| `present_pacing` | true | presents do not wait for the 60 Hz vblank (`--no-present-pacing`) |
+| `verify_window_marks` | false | true: readers also compare unmarked window slots |
+| `fence_publish_lag` | true | fences complete at once instead of at the next present (`--no-fence-lag`) |
+| `defer_gpu_objects` | true | GPU objects are written at creation, not on first use (`--eager-gpu-objects`) |
+| `xmem_shared_pages` | true | XMem pages mapped at several addresses get per-address copies (`--no-xmem-shared-pages`) |
+| `present_frame_waits` | true | `WaitFrameEventX(PRESENT, token)` takes the pacer tick instead of waiting for the token's present |
+| `audio_endpoint` | true | the MMDevice enumerator is not registered (no default render endpoint) |
+
 ## Expected timings
 First frame about 30 s after load; the intro follows later. The first build takes a long time (Wasm link); later runs reuse the cache.
 

@@ -523,11 +523,14 @@ bool FramePacer::is_shut_down() const {
 // ---------------------------------------------------------------------------------------------
 
 namespace {
+std::atomic<bool> g_present_token_waits{true};
 std::atomic<uint64_t> g_frame_waits{0};
 std::atomic<uint64_t> g_frame_wait_us{0};
 std::atomic<uint64_t> g_frame_polls{0};
 std::atomic<uint64_t> g_frame_timeouts{0};
 }  // namespace
+
+void xbox::set_present_token_waits(bool on) { g_present_token_waits.store(on, std::memory_order_relaxed); }
 
 xbox::FrameWaitTotals xbox::frame_wait_totals() {
     FrameWaitTotals t;
@@ -575,7 +578,7 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         // pacer tick below and is counted. Other waits (ORIGIN, ...) take at most one interval.
         const auto started = std::chrono::steady_clock::now();
         uint64_t after = pacer_.current_frame();
-        if (type == 2 && in != 0) {
+        if (type == 2 && in != 0 && g_present_token_waits.load(std::memory_order_relaxed)) {
             const uint64_t completed = last_present_token.load(std::memory_order_acquire);
             if (completed != 0 && in <= completed) {
                 after = 0;

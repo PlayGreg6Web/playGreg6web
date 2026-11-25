@@ -404,6 +404,9 @@ struct FrameWaitTotals {
     uint64_t timeouts = 0;
 };
 FrameWaitTotals frame_wait_totals();
+// Process-wide, on by default (boot option present_frame_waits): off, WaitFrameEventX(PRESENT, token)
+// no longer waits for that token's present and takes the pacer tick instead.
+void set_present_token_waits(bool on);
 
 class FramePacer {
 public:

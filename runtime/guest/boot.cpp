@@ -16,6 +16,8 @@
 #include <utility>
 
 #include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_xs_exports.h"
+#include "gpu/d3d12_xs_xbox.h"
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
 #include "guest/com_bridge.h"
@@ -30,6 +32,7 @@
 #include "os/win32_loader.h"
 #include "os/win32_sync.h"
 #include "os/xbox_scarlett.h"
+#include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime_provider.h"
 
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND) || defined(__EXCEPTIONS)
@@ -2551,6 +2554,17 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     if (pacing == "true" || pacing == "false") {
         config.present_pacing = pacing == "true";
     }
+    const auto read_bool = [&](const char* key, bool& out) {
+        const std::string_view v = json_value(json, key);
+        if (v == "true" || v == "false") {
+            out = v == "true";
+        }
+    };
+    read_bool("fence_publish_lag", config.fence_publish_lag);
+    read_bool("defer_gpu_objects", config.defer_gpu_objects);
+    read_bool("xmem_shared_pages", config.xmem_shared_pages);
+    read_bool("present_frame_waits", config.present_frame_waits);
+    read_bool("audio_endpoint", config.audio_endpoint);
     const std::string_view to_log = json_value(json, "report_to_log");
     if (to_log == "true") {
         config.report_sink = [](std::string_view report) { log_report_json(report); };
@@ -2795,6 +2809,22 @@ BootResult run_boot(const BootConfig& config) {
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
+    // Only a switched-off option changes anything: the harness sets its own device options.
+    if (!config.fence_publish_lag || !config.defer_gpu_objects) {
+        gpu::d3d12_guest::DeviceOptions device_options = gpu::d3d12_xs_exports::device_options();
+        device_options.fence_publish_lag = device_options.fence_publish_lag && config.fence_publish_lag;
+        device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
+        gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
+    }
+    if (!config.xmem_shared_pages) {
+        os::win32::set_process_shared_zone(false);
+    }
+    if (!config.present_frame_waits) {
+        gpu::xbox::set_present_token_waits(false);
+    }
+    if (!config.audio_endpoint) {
+        os::scarlett::guest_api::set_audio_endpoint_enabled(false);
+    }
     // Every present marks the first one (report first_present, FIRST_PRESENT milestone), with or
     // without a GPU capture.
     gpu::present_pacer().set_observer(&record_present);

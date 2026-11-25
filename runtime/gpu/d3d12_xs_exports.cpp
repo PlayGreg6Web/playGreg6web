@@ -56,6 +56,11 @@ void set_device_options(dg::DeviceOptions options) {
     state().options = std::move(options);
 }
 
+dg::DeviceOptions device_options() {
+    std::lock_guard<std::mutex> lock(state().mutex);
+    return state().options;
+}
+
 com::Ref<dg::Device> current_device() {
     std::lock_guard<std::mutex> lock(state().mutex);
     return live_device_locked(state());

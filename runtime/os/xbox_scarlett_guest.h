@@ -475,6 +475,10 @@ void audio_engine_manual_clock(bool manual);
 void audio_engine_tick();
 // Tests only: stops the period thread, forgets the streams, the sink and the statistics.
 void reset_audio_endpoint();
+// Boot option audio_endpoint (on by default): off, CoCreateInstance(CLSID_MMDeviceEnumerator)
+// answers REGDB_E_CLASSNOTREG like any unknown class. Survives reset_audio_endpoint.
+void set_audio_endpoint_enabled(bool on);
+bool audio_endpoint_enabled();
 
 // Tests only: stops the DirectStorage workers (waiting for running work), forgets the factory
 // singleton and zeroes the statistics. Call before reset_com_bridge().

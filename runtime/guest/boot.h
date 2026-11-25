@@ -483,6 +483,13 @@ struct BootConfig {
     // O36: presents wait for the title's sync interval on a 60 Hz display (gpu/present_pacing.h);
     // off for benchmarks (report: present_pacing).
     bool present_pacing = true;
+    // O36: runtime switches mirroring the playgta6_boot harness flags (A/B runs of a browser
+    // regression without a rebuild). All on by default.
+    bool fence_publish_lag = true;    // d3d12 DeviceOptions::fence_publish_lag (--no-fence-lag)
+    bool defer_gpu_objects = true;    // d3d12 DeviceOptions::defer_gpu_objects (--eager-gpu-objects)
+    bool xmem_shared_pages = true;    // os::win32::set_process_shared_zone (--no-xmem-shared-pages)
+    bool present_frame_waits = true;  // WaitFrameEventX(PRESENT, token) waits for the token's present
+    bool audio_endpoint = true;       // CLSID_MMDeviceEnumerator resolves (default render endpoint)
 };
 
 struct BootResult {
@@ -499,7 +506,8 @@ BootResult run_boot(const BootConfig& config);
 // O36: run options of a boot that has no command line (the browser boot), as a JSON object:
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
 //    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false,
-//    "present_pacing": true}
+//    "present_pacing": true, "fence_publish_lag": true, "defer_gpu_objects": true,
+//    "xmem_shared_pages": true, "present_frame_waits": true, "audio_endpoint": true}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to
 // log_report_json. False (config unchanged) if `json` is not a JSON object.
 bool apply_boot_options_json(std::string_view json, BootConfig& config);
