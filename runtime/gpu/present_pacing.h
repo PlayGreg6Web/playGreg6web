@@ -10,6 +10,7 @@
 // host can present. Pacing is on by default; boot option "present_pacing": false (browser) or
 // --no-present-pacing (native harness) turns it off for benchmarks.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -45,6 +46,11 @@ public:
     void set_enabled(bool on);
     bool enabled() const;
 
+    // Called at the start of every present, paced or not (the boot report's first_present and
+    // FIRST_PRESENT milestone, guest/boot.h mark_first_present); nullptr: none.
+    using Observer = void (*)();
+    void set_observer(Observer observer);
+
     // Tests: the clock, its origin and the wait (default: steady_clock and sleep_until).
     void set_clock_for_testing(std::function<Clock::time_point()> now,
                                std::function<void(Clock::time_point)> sleep_until,
@@ -56,6 +62,7 @@ private:
     Clock::time_point origin_;
     std::function<Clock::time_point()> now_;
     std::function<void(Clock::time_point)> sleep_until_;
+    std::atomic<Observer> observer_{nullptr};
     bool enabled_ = true;
     bool have_last_ = false;
     uint64_t last_flip_ = 0;

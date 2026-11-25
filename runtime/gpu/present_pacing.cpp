@@ -46,6 +46,9 @@ PresentPacer::Clock::time_point PresentPacer::vblank_start(uint64_t v) const {
 }
 
 uint64_t PresentPacer::present(uint32_t interval) {
+    if (Observer observer = observer_.load(std::memory_order_acquire)) {
+        observer();
+    }
     std::unique_lock<std::mutex> lock(mutex_);
     const Clock::time_point now = now_();
     const uint64_t current = vblank_at(now);
@@ -92,6 +95,10 @@ void PresentPacer::set_enabled(bool on) {
 bool PresentPacer::enabled() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return enabled_;
+}
+
+void PresentPacer::set_observer(Observer observer) {
+    observer_.store(observer, std::memory_order_release);
 }
 
 PresentPacer& present_pacer() {
