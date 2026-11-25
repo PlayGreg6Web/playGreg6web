@@ -83,6 +83,8 @@ impl FunctionLifter<'_> {
     /// release store of one byte). Emitted after the store it reports.
     fn window_mark(&mut self, index: &str) {
         self.support.insert(Support::Memory(Decl::WindowDirty));
+        // An atomic store: the module needs the atomics target feature (shared memory).
+        self.support.insert(Support::Atomics);
         let m = self.val(&format!(
             "getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 {index}"
         ));
@@ -220,6 +222,7 @@ impl FunctionLifter<'_> {
                 self.support
                     .insert(Support::Memory(Decl::WindowStore { bytes: width, base }));
                 self.support.insert(Support::Memory(Decl::WindowDirty));
+                self.support.insert(Support::Atomics);
                 let name = window_helper(true, bytes, base);
                 let raw = if *ty == vty {
                     (*value).to_string()

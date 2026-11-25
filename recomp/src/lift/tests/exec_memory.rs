@@ -657,4 +657,17 @@ fn default_output_has_no_write_marks() {
         .ir;
     assert!(!ir.contains("__playgta6_window_dirty"), "{ir}");
     assert!(!ir.contains("store atomic i8 1"), "{ir}");
+    // A window store's mark is an atomic store: the module needs the atomics target feature
+    // (shared memory), even without any guest atomics.
+    let store_only = asm_function(CODE_BASE, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.ret()
+    });
+    let windowed = lift_module_with(
+        [&store_only],
+        MemoryModel::from_name("window-runs").expect("model"),
+    )
+    .expect("lifts");
+    assert!(windowed.ir.contains("store atomic i8 1"), "{}", windowed.ir);
+    assert!(windowed.requires_shared_memory());
 }
