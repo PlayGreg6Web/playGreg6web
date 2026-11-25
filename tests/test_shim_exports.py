@@ -150,6 +150,7 @@ AUDITED_FAMILY_INTERNALS: dict[str, str] = {
     "pg6_crt_get_last_exit_code": "test hook",
     "pg6_crt_errno_from_host": "host helper: host errno -> MSVC errno",
     "pg6_ws2_WSASetLastError": "declared, not registered by winsock_ordinals.cpp",
+    "pg6_mw_xma_context_census": "host helper: boot report / audio trace census of XMA contexts",
 }
 AUDIT_ROW_RE = re.compile(r'\bX\((pg6_\w+),\s*(ok|deny|pending),\s*"([^"]*)"\)')
 EXPORTED_RE = re.compile(r'"([^"]+)",[\s\\]*(?:\w+\(\s*)?&?(pg6_\w+)')
