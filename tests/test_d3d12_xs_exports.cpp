@@ -2215,6 +2215,102 @@ void test_xbox_frame_loop_present_and_pacing() {
 // PresentX with two alternating back buffers (whose render-target views exist before the first
 // present): each present draws that frame's texture into the canvas. The blit objects are created
 // once, one bind group per back buffer; a format that cannot be sampled is counted, not drawn.
+// G66 (#691): a title reuses a frame's CPU-written memory (upload ring) once the frame is done:
+// after a PRESENT wait (WaitFrameEventX type 2) on its token, or after its fence. The runtime reads
+// that memory at ExecuteCommandLists, so neither may complete before the frame's submission: a
+// worker that overwrites the ring after the wait must not change what the submission uploads.
+void test_ring_reuse_waits_for_the_frame() {
+    Fixture fx;
+    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+    const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
+    // The first float of the WriteBuffer packets for the vertex buffer in `ps` (NaN when none).
+    auto uploaded_first = [&](const std::vector<Packet>& ps) {
+        float v = std::numeric_limits<float>::quiet_NaN();
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
+                payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
+                v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+            }
+        }
+        return v;
+    };
+    GuestThread worker{};
+    CHECK(create_guest_thread(fx.arena, 512 * 1024, worker));
+
+    // Frame event: the worker waits for frame T's present, then reuses the ring.
+    const uint64_t tok_slot = put<uint64_t>(0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+    const uint64_t frame_token = load64(tok_slot);
+    const uint64_t wait_slot = put<uint64_t>(frame_token);
+    std::atomic<bool> reused{false};
+    std::thread title_worker([&] {
+        CHECK(hr(fx.vcall_on(worker, scene.device, XSlot::WaitFrameEvent,
+                             {I(2), I(0xFFFFFFFFu), I(0), I(0), I(wait_slot)})) == 0);
+        const float next = 222.0f;
+        CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
+        reused = true;
+    });
+    const float data = 111.0f;  // the frame's data, written while recording it
+    CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
+    scene.record(fx.thread, list);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));  // several pacer intervals
+    CHECK(!reused);  // the frame has not been presented
+    size_t mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
+    dg::xbox::GuestPresentPlaneX plane{};
+    plane.Token = frame_token;
+    plane.ResourceCount = 1;
+    plane.ppResources = put<uint64_t>(scene.rt);
+    CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+    title_worker.join();
+    CHECK(reused && counter(dev, dg::xbox::Counter::PresentWaitsSatisfied) == 1);
+    // The next submission uploads the reused bytes.
+    scene.record(fx.thread, list);
+    mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(uploaded_first(packets_since(fx, mark)) == 222.0f);
+
+    // Fence: the worker waits for the frame's fence value (as the title does through the fence's
+    // completed-value word), then reuses the ring; the queue signal follows the submission.
+    int32_t result = -1;
+    const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+    CHECK(result == 0 && fence != 0);
+    reused = false;
+    std::thread fence_worker([&] {
+        CHECK(hr(fx.vcall_on(worker, fence, Slot::SetEventOnCompletion, {I(1), I(0)})) == 0);
+        const float next = 444.0f;
+        CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
+        reused = true;
+    });
+    const float data2 = 333.0f;
+    CHECK(com::write_guest(scene.vb_cpu, &data2, sizeof(data2)));
+    scene.record(fx.thread, list);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(!reused);
+    mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(uploaded_first(packets_since(fx, mark)) == 333.0f);
+    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+    fence_worker.join();
+    CHECK(reused);
+
+    // A PRESENT wait on a token the caller would present itself later does not deadlock: it falls
+    // back to the pacer after the cap and is counted.
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+    store64(wait_slot, load64(tok_slot));
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(2), I(0xFFFFFFFFu), I(0), I(0), I(wait_slot)})) == 0);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+    CHECK(counter(dev, dg::xbox::Counter::PresentWaitsUnpresented) == 1);
+
+    destroy_guest_thread(fx.arena, worker);
+    CHECK(t_balanced);
+    scene.release_all({list, fence});
+}
+
 void test_present_alternating_back_buffers() {
     Fixture fx;
     Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
@@ -5571,6 +5667,7 @@ int main() {
     test_xbox_inlined_list_fields_and_staged_pso();
     test_xbox_frame_loop_present_and_pacing();
     test_present_alternating_back_buffers();
+    test_ring_reuse_waits_for_the_frame();
     test_frame_pacer_unit();
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_native_pipelines();

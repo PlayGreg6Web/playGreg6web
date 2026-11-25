@@ -27,6 +27,9 @@ namespace playgta6::gpu::d3d12_guest {
 namespace {
 
 constexpr uint32_t kInfinite = 0xFFFFFFFFu;
+// Longest a PRESENT wait (WaitFrameEventX type 2) waits for its token's PresentX before it falls
+// back to the pacer tick (a token the caller itself would present later never arrives).
+constexpr uint32_t kPresentWaitCapMs = 500;
 constexpr uint64_t kMaxStreamBytes = 64u << 10;
 constexpr uint32_t kMaxOverrides = 16;
 constexpr uint32_t kMaxPlanes = 8;
@@ -563,15 +566,35 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         g_frame_polls.fetch_add(1, std::memory_order_relaxed);
         frame = pacer_.current_frame();
     } else {
-        // Type 2 (PRESENT) with a token already completed by PresentX returns immediately;
-        // otherwise wait at most one pacer interval so valid ORIGIN / PRESENT waits never stall.
-        const uint64_t pacer_now = pacer_.current_frame();
-        uint64_t after = pacer_now;
+        // Type 2 (PRESENT) for a token: completes once PresentX has presented that token, as on
+        // the console, where the event means the frame's GPU work is done. Titles reuse that
+        // frame's CPU-written memory (upload rings) on it, and our side reads that memory at
+        // ExecuteCommandLists, before the frame's PresentX: completing earlier hands the title a
+        // region the frame's submissions have not read yet (G66, #691). A token nobody presents
+        // within kPresentWaitCapMs (a wait on the caller's own future present) falls back to the
+        // pacer tick below and is counted. Other waits (ORIGIN, ...) take at most one interval.
+        const auto started = std::chrono::steady_clock::now();
+        uint64_t after = pacer_.current_frame();
         if (type == 2 && in != 0) {
             const uint64_t completed = last_present_token.load(std::memory_order_acquire);
-            after = (completed != 0 && in <= completed) ? uint64_t{0} : std::min(in, pacer_now);
+            if (completed != 0 && in <= completed) {
+                after = 0;
+            } else if (in > last_frame_token_.load(std::memory_order_acquire)) {
+                // A token never handed out (ahead of every frame): nothing will present it.
+                after = std::min(in, pacer_.current_frame());
+            } else {
+                const uint32_t bound = timeout_ms == kInfinite
+                                           ? kPresentWaitCapMs
+                                           : std::min<uint32_t>(timeout_ms, kPresentWaitCapMs);
+                if (wait_present_token(in, bound)) {
+                    after = 0;
+                    count(xbox::Counter::PresentWaitsSatisfied);
+                } else {
+                    after = std::min(in, pacer_.current_frame());
+                    count(xbox::Counter::PresentWaitsUnpresented);
+                }
+            }
         }
-        const auto started = std::chrono::steady_clock::now();
         const auto r = pacer_.wait_after(after, timeout_ms, &frame);
         g_frame_waits.fetch_add(1, std::memory_order_relaxed);
         g_frame_wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -600,6 +623,30 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
     }
     token.write(out_tok);
     return kSOk;
+}
+
+void Device::note_present_token(uint64_t token) {
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        uint64_t prev = last_present_token.load(std::memory_order_relaxed);
+        if (token > prev) {
+            last_present_token.store(token, std::memory_order_release);
+        }
+    }
+    present_cv_.notify_all();
+}
+
+bool Device::wait_present_token(uint64_t token, uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(present_mutex_);
+    auto presented = [&] {
+        return present_shutdown_ || last_present_token.load(std::memory_order_acquire) >= token;
+    };
+    if (timeout_ms == kInfiniteFrameWait) {
+        present_cv_.wait(lock, presented);
+    } else if (!present_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), presented)) {
+        return false;
+    }
+    return last_present_token.load(std::memory_order_acquire) >= token;
 }
 
 HResult Device::QueryFrameStatistics_unverified(uint64_t, uint32_t, GuestPtr<uint32_t> count_out, uint64_t) {
@@ -1203,12 +1250,6 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
         device_->note_bad_argument("PresentX: unreadable plane array (" + std::to_string(plane_count) + " planes)");
         return kEInvalidArg;
     }
-    if (plane.Token != 0) {
-        uint64_t prev = device_->last_present_token.load(std::memory_order_relaxed);
-        while (plane.Token > prev && !device_->last_present_token.compare_exchange_weak(
-                                         prev, plane.Token, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        }
-    }
     // Every plane's texture is drawn into the canvas at the Present (Device::present), every
     // frame: titles alternate back buffers whose render-target views predate the present, and
     // compose the frame from several planes (e.g. a 4K scene plane under a 1080p overlay plane).
@@ -1238,6 +1279,11 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
     }
     device_->count(xbox::Counter::PresentsWithPlanes);
     const uint32_t drawn = device_->present(std::span<const uint32_t>(textures.data(), plane_count));
+    // The frame is done on our side once its Present has been handed off (its submissions and their
+    // CPU-visible buffer snapshots came before): PRESENT waits for this token may complete now.
+    if (plane.Token != 0) {
+        device_->note_present_token(plane.Token);
+    }
     device_->count(xbox::Counter::PresentPlanesDrawn, drawn);
     device_->count(xbox::Counter::PresentPlanesNotDrawn, plane_count - drawn);
     // O36: the flip waits for the title's sync interval on the 60 Hz display (gpu/present_pacing.h):

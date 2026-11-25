@@ -708,7 +708,21 @@ public:
         return std::max<uint32_t>(1, (us + 8333) / 16667);
     }
     // Wakes every WaitFrameEventX and makes later ones return at once (shutdown, tests).
-    void shutdown_frame_events() { pacer_.shutdown(); }
+    void shutdown_frame_events() {
+        pacer_.shutdown();
+        {
+            std::lock_guard<std::mutex> lock(present_mutex_);
+            present_shutdown_ = true;
+        }
+        present_cv_.notify_all();
+    }
+    // PresentX of a frame token: on our side the frame's submissions (and their CPU-visible
+    // buffer snapshots) are done. Wakes PRESENT waits (WaitFrameEventX type 2) for that token.
+    void note_present_token(uint64_t token);
+    // Blocks until the frame token has been presented (true), the timeout passes or the frame
+    // events shut down (false). `timeout_ms` = kInfiniteFrameWait waits without a bound.
+    bool wait_present_token(uint64_t token, uint32_t timeout_ms);
+    static constexpr uint32_t kInfiniteFrameWait = 0xFFFFFFFFu;
     void count(xbox::Counter c, uint64_t n = 1) { xbox_counters_[static_cast<size_t>(c)].fetch_add(n); }
     uint64_t counter(xbox::Counter c) const { return xbox_counters_[static_cast<size_t>(c)].load(); }
     // Last frame token passed to ExecuteCommandLists / a present plane (0 = none).
@@ -1104,6 +1118,9 @@ private:
     mutable std::atomic<uint32_t> slot_reads_reported_{0};  // bit per (kind, status) already logged
     std::atomic<uint64_t> skipped_draws_{0};
     std::atomic<uint64_t> unsupported_copies_{0};
+    std::mutex present_mutex_;
+    std::condition_variable present_cv_;
+    bool present_shutdown_ = false;
     xbox::FramePacer pacer_;
     std::atomic<uint64_t> xbox_counters_[static_cast<size_t>(xbox::Counter::Count)] = {};
     std::atomic<uint64_t> last_frame_token_{0};

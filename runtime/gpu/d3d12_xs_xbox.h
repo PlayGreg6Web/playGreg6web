@@ -447,6 +447,8 @@ private:
 enum class Counter : size_t {
     FrameWaits,
     FrameWaitTimeouts,
+    PresentWaitsSatisfied,      // PRESENT waits (WaitFrameEventX type 2) that waited for the present
+    PresentWaitsUnpresented,    // ... whose token was not presented within the cap (pacer fallback)
     FrameIntervalChanges,
     FrameEventsScheduled,
     PresentsWithPlanes,
