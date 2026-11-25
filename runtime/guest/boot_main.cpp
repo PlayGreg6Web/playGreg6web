@@ -1060,8 +1060,7 @@ int main(int argc, char** argv) {
                 t.xapu_decoded_packets = x.decoded_packets;
                 t.xapu_failed_packets = x.failed_packets;
                 t.xapu_results_posted = x.type3_results;
-                o += ",
-  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
+                o += ",\n  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
             }
             if (s_with_presents) {
                 o += ",\n  \"presents\": " + gpu::frame_capture_presents_json();
