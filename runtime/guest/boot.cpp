@@ -1260,8 +1260,14 @@ void boot_terminate_process_handler(uint32_t exit_code, void* /*user*/) {
     request_exit(static_cast<int32_t>(exit_code));
 }
 
+// Guest return address of this thread's latest dispatched call (PG6_EVENT_TRACE callers).
+uint64_t boot_current_guest_caller() {
+    return t_dispatch_count != 0 ? t_dispatch_ring[(t_dispatch_count - 1) % kDispatchRing].return_address : 0;
+}
+
 void install_hooks() {
     BootState& b = boot();
+    os::win32::set_event_trace_caller(&boot_current_guest_caller);
     b.previous_fault_handler = set_fault_handler(&boot_fault_handler);
     b.previous_observer = set_dispatch_observer(&boot_dispatch_observer);
     b.previous_exit_hook = pg6_crt_set_exit_hook(&boot_exit_hook);
@@ -1278,6 +1284,7 @@ void remove_hooks() {
     set_dispatch_observer(b.previous_observer);
     pg6_crt_set_exit_hook(b.previous_exit_hook);
     os::win32::set_process_exit_handler(nullptr, nullptr);
+    os::win32::set_event_trace_caller(nullptr);
     b.hooks_installed = false;
 }
 

@@ -58,6 +58,15 @@ inline constexpr uint32_t RESUME_THREAD_FAILED = 0xFFFFFFFFu;
 // GetCurrentThread() pseudo-handle ((HANDLE)-2); never stored in the handle table.
 inline constexpr Handle kCurrentThreadPseudoHandle = ~uint64_t{1};
 
+// PG6_EVENT_TRACE=1 (handles from PG6_EVENT_TRACE_HANDLES, default 0x15f): log SetEvent, ReleaseSemaphore,
+// ResetEvent and satisfied waits on those handles to stderr with thread, guest caller and time.
+// The boot installs `caller`, which returns the guest return address of the calling thread's
+// latest import call (0 on host threads).
+void set_event_trace_caller(uint64_t (*caller)());
+bool event_trace_enabled(Handle handle);
+// Extra trace line for a traced handle (e.g. a fence wait registered on it).
+void event_trace_note(const char* op, Handle handle, const char* detail);
+
 // SleepConditionVariableSRW flags.
 inline constexpr uint32_t CONDITION_VARIABLE_LOCKMODE_SHARED = 0x1u;
 

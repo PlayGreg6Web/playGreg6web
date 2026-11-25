@@ -14,6 +14,7 @@
 #include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
+#include "os/win32_sync.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -1963,8 +1964,18 @@ HResult Fence::SetEventOnCompletion(uint64_t value, uint64_t event_handle) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (value_.load(std::memory_order_acquire) < value) {
             waits_.emplace(value, event_handle);
+            if (os::win32::event_trace_enabled(event_handle)) {
+                char detail[96];
+                std::snprintf(detail, sizeof(detail), "fence=%p wants %llu, executed %llu", static_cast<void*>(this),
+                              static_cast<unsigned long long>(value),
+                              static_cast<unsigned long long>(value_.load(std::memory_order_acquire)));
+                os::win32::event_trace_note("fence", event_handle, detail);
+            }
             return kSOk;
         }
+    }
+    if (os::win32::event_trace_enabled(event_handle)) {
+        os::win32::event_trace_note("fence", event_handle, "already reached");
     }
     if (publish_for_wait(value)) {
         device_->count(xbox::Counter::FencePublishesByWait);

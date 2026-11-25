@@ -5,6 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -147,7 +150,106 @@ ThreadInfo& current_thread_info() {
     return *t_thread.info;
 }
 
+// PG6_EVENT_TRACE=1: SetEvent / ResetEvent / ReleaseSemaphore / waits on chosen handles, with thread, guest caller
+// and time, to find who signals an event a thread is blocked on and how late.
+// PG6_EVENT_TRACE_HANDLES=0x15f,0x160 picks the handles (default 0x15f). Timed-out polls are
+// counted, not logged: the satisfied wait reports how many polls and how long it took.
+struct EventTrace {
+    bool enabled = false;
+    std::vector<Handle> handles;
+    Clock::time_point start = Clock::now();
+};
+
+std::atomic<uint64_t (*)()> g_event_trace_caller{nullptr};
+
+const EventTrace& event_trace_config() {
+    static const EventTrace config = [] {
+        EventTrace t;
+        const char* on = std::getenv("PG6_EVENT_TRACE");
+        t.enabled = on != nullptr && on[0] != '\0' && on[0] != '0';
+        if (!t.enabled) {
+            return t;
+        }
+        const char* list = std::getenv("PG6_EVENT_TRACE_HANDLES");
+        std::string text = list != nullptr ? list : "0x15f";
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t end = text.find(',', pos);
+            if (end == std::string::npos) {
+                end = text.size();
+            }
+            const std::string item = text.substr(pos, end - pos);
+            if (!item.empty()) {
+                t.handles.push_back(static_cast<Handle>(std::strtoull(item.c_str(), nullptr, 0)));
+            }
+            pos = end + 1;
+        }
+        return t;
+    }();
+    return config;
+}
+
+bool event_traced(Handle handle) {
+    const EventTrace& t = event_trace_config();
+    return t.enabled && std::find(t.handles.begin(), t.handles.end(), handle) != t.handles.end();
+}
+
+// Timed-out polls of a traced handle by this thread since its last satisfied wait.
+struct PollRun {
+    Handle handle = 0;
+    uint32_t polls = 0;
+    Clock::time_point first{};
+};
+thread_local PollRun t_poll_run;
+
+void event_trace_line(const char* op, Handle handle, const char* detail) {
+    const auto caller_fn = g_event_trace_caller.load(std::memory_order_relaxed);
+    const uint64_t caller = caller_fn != nullptr ? caller_fn() : 0;
+    const double ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - event_trace_config().start).count();
+    std::fprintf(stderr, "[event-trace] %10.3f ms tid=%u %-6s h=0x%" PRIx64 " caller=0x%" PRIx64 "%s%s\n",
+                 ms, current_thread_info().id, op, static_cast<uint64_t>(handle), caller,
+                 detail[0] != '\0' ? " " : "", detail);
+}
+
+void event_trace_wait(Handle handle, uint32_t timeout_ms, uint32_t result) {
+    if (!event_traced(handle)) {
+        return;
+    }
+    PollRun& run = t_poll_run;
+    if (run.handle != handle) {
+        run = PollRun{handle, 0, Clock::now()};
+    }
+    if (result == WAIT_TIMEOUT && timeout_ms == 0) {
+        if (run.polls++ == 0) {
+            run.first = Clock::now();
+        }
+        return;
+    }
+    char detail[128];
+    const double waited =
+        run.polls != 0 ? std::chrono::duration<double, std::milli>(Clock::now() - run.first).count() : 0.0;
+    std::snprintf(detail, sizeof(detail), "timeout=%d result=0x%x after %u polls / %.3f ms",
+                  static_cast<int32_t>(timeout_ms), result, run.polls, waited);
+    event_trace_line("wait", handle, detail);
+    run.polls = 0;
+}
+
 }  // namespace
+
+void set_event_trace_caller(uint64_t (*caller)()) {
+    g_event_trace_caller.store(caller, std::memory_order_relaxed);
+}
+
+bool event_trace_enabled(Handle handle) {
+    return event_traced(handle);
+}
+
+void event_trace_note(const char* op, Handle handle, const char* detail) {
+    if (event_traced(handle)) {
+        event_trace_line(op, handle, detail != nullptr ? detail : "");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Dispatcher objects
@@ -905,6 +1007,9 @@ bool SetEvent(Handle event_handle) {
         SetLastError(ERROR_INVALID_HANDLE);
         return false;
     }
+    if (event_traced(event_handle)) {
+        event_trace_line("set", event_handle, "");
+    }
     std::lock_guard<std::mutex> lock(event->lock);
     event->signaled = true;
     event->wake_waiters_locked();
@@ -916,6 +1021,9 @@ bool ResetEvent(Handle event_handle) {
     if (!event) {
         SetLastError(ERROR_INVALID_HANDLE);
         return false;
+    }
+    if (event_traced(event_handle)) {
+        event_trace_line("reset", event_handle, "");
     }
     std::lock_guard<std::mutex> lock(event->lock);
     event->signaled = false;
@@ -962,6 +1070,11 @@ bool ReleaseSemaphore(Handle semaphore, int32_t release_count, int32_t* previous
     }
     sem->count += release_count;
     sem->wake_waiters_locked();
+    if (event_traced(semaphore)) {
+        char detail[48];
+        std::snprintf(detail, sizeof(detail), "+%d -> %d", release_count, sem->count);
+        event_trace_line("release", semaphore, detail);
+    }
     return true;
 }
 
@@ -1000,12 +1113,16 @@ bool ReleaseMutex(Handle mutex) {
 // ---------------------------------------------------------------------------
 
 uint32_t WaitForSingleObject(Handle handle, uint32_t timeout_ms) {
-    return wait_for_objects(1, &handle, false, timeout_ms);
+    const uint32_t result = wait_for_objects(1, &handle, false, timeout_ms);
+    event_trace_wait(handle, timeout_ms, result);
+    return result;
 }
 
 uint32_t WaitForSingleObjectEx(Handle handle, uint32_t timeout_ms, bool alertable) {
     (void)alertable;
-    return wait_for_objects(1, &handle, false, timeout_ms);
+    const uint32_t result = wait_for_objects(1, &handle, false, timeout_ms);
+    event_trace_wait(handle, timeout_ms, result);
+    return result;
 }
 
 uint32_t WaitForMultipleObjects(uint32_t count,

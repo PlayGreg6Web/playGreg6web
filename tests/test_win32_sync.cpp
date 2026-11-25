@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -1385,7 +1386,36 @@ void test_critical_section_guest_storage() {
     CHECK(GetLastError() == ERROR_INVALID_HANDLE);
 }
 
+// PG6_EVENT_TRACE: only the listed handles are traced, and a traced line asks the boot's hook for
+// the guest caller. The environment is read once, on the first traced call, so main sets it first.
+std::atomic<int> g_trace_caller_calls{0};
+
+uint64_t fake_guest_caller() {
+    g_trace_caller_calls.fetch_add(1);
+    return 0x140001234u;
+}
+
+void test_event_trace_selection() {
+    CHECK(event_trace_enabled(0x7ffff001u));
+    CHECK(event_trace_enabled(0x7ffff002u));
+    CHECK(!event_trace_enabled(0x7ffff003u));
+    set_event_trace_caller(&fake_guest_caller);
+    event_trace_note("test", 0x7ffff003u, "untraced");
+    CHECK(g_trace_caller_calls.load() == 0);
+    event_trace_note("test", 0x7ffff001u, "traced");
+    CHECK(g_trace_caller_calls.load() == 1);
+    set_event_trace_caller(nullptr);
+}
+
 int main() {
+#if defined(_WIN32)
+    _putenv_s("PG6_EVENT_TRACE", "1");
+    _putenv_s("PG6_EVENT_TRACE_HANDLES", "0x7ffff001,0x7ffff002");
+#else
+    setenv("PG6_EVENT_TRACE", "1", 1);
+    setenv("PG6_EVENT_TRACE_HANDLES", "0x7ffff001,0x7ffff002", 1);
+#endif
+    test_event_trace_selection();
     test_critical_section_guest_storage();
     test_sync_microbench();
     test_sync_contention_microbench();
