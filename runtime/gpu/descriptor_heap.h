@@ -812,6 +812,11 @@ struct ShaderBinding {
     uint32_t heap_index_parameter = kNoIndex;
     uint32_t heap_index_dword = 0;
     uint32_t heap_shift = 0;
+    // Direct table slot (register/space unused): descriptor `table_slot` of descriptor-table
+    // parameter `table_parameter`, whether or not the root signature declares a range there. Console
+    // stages read their tables as memory, past the ranges a title's root signature declares (G62).
+    uint32_t table_parameter = kNoIndex;
+    uint32_t table_slot = 0;
 };
 
 enum class PlanSource : uint32_t {

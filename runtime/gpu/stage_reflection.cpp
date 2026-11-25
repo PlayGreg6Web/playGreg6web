@@ -500,7 +500,8 @@ bool same_binding(const bridge::LayoutBinding& a, const bridge::LayoutBinding& b
            a.join.shader_register == b.join.shader_register && a.join.register_space == b.join.register_space &&
            a.join.root_constants == b.join.root_constants && a.join.heap == b.join.heap &&
            a.join.heap_index_parameter == b.join.heap_index_parameter &&
-           a.join.heap_index_dword == b.join.heap_index_dword && a.join.heap_shift == b.join.heap_shift;
+           a.join.heap_index_dword == b.join.heap_index_dword && a.join.heap_shift == b.join.heap_shift &&
+           a.join.table_parameter == b.join.table_parameter && a.join.table_slot == b.join.table_slot;
 }
 
 pso::WgpuVertexFormat element_class(pso::WgpuVertexFormat f, ReflectedComponentType* cls) {
@@ -619,13 +620,16 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.heap_index_dword = dword;
                 lb.join.heap_shift = b.heap_shift;
             } else if (b.source == ReflectedSource::StaticSampler) {
-                if (b.static_sampler >= rs.static_samplers.size()) {
-                    fail(b, "no static sampler " + std::to_string(b.static_sampler));
-                    continue;
-                }
                 cls = d3d::DescriptorRangeType::Sampler;
-                reg = rs.static_samplers[b.static_sampler].shader_register;
-                space = rs.static_samplers[b.static_sampler].register_space;
+                if (b.static_sampler < rs.static_samplers.size()) {
+                    reg = rs.static_samplers[b.static_sampler].shader_register;
+                    space = rs.static_samplers[b.static_sampler].register_space;
+                } else {
+                    // A sampler the console stage builds from constants in its code: the root
+                    // signature has no static sampler for it. Bound as the default sampler (an
+                    // unresolved join binds null, i.e. the worker's default), not a join failure.
+                    reg = space = d3d::kNoIndex;
+                }
             } else {
                 const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr);
                 if (pi < 0) {
@@ -635,17 +639,49 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
                 const std::string pname = "root parameter " + std::to_string(pi);
                 switch (b.source) {
-                    case ReflectedSource::Table:
+                    case ReflectedSource::Table: {
                         if (p.parameter_type != d3d::RootParameterType::DescriptorTable) {
                             fail(b, pname + " is not a descriptor table");
                             continue;
                         }
-                        if (b.table_byte_offset % kTableSlotBytes != 0 ||
-                            !table_slot_register(p, b.table_byte_offset / kTableSlotBytes, &cls, &reg, &space)) {
-                            fail(b, pname + " has no descriptor at byte offset " + std::to_string(b.table_byte_offset));
+                        if (b.table_byte_offset % kTableSlotBytes != 0) {
+                            fail(b, pname + ": byte offset " + std::to_string(b.table_byte_offset) +
+                                        " is not a descriptor boundary");
                             continue;
                         }
+                        const bool read_only_kind = b.kind != ReflectedBindingKind::Storage &&
+                                                    b.kind != ReflectedBindingKind::StorageTexture;
+                        if (!table_slot_register(p, b.table_byte_offset / kTableSlotBytes, &cls, &reg, &space) ||
+                            (read_only_kind && !kind_accepts(b.kind, cls))) {
+                            // A slot the root signature does not declare, or declares as another class
+                            // for a read-only binding: console stages read their tables as memory, past
+                            // and regardless of the declared ranges. Join the slot itself, with the class
+                            // the stage reads. (A writable binding over a declared SRV / CBV stays a
+                            // failure: binding it would make the whole submission invalid.)
+                            const bool sampler_kind = b.kind == ReflectedBindingKind::Sampler ||
+                                                      b.kind == ReflectedBindingKind::ComparisonSampler;
+                            bool sampler_table = false;
+                            for (const d3d::DescriptorRangeDesc& r : p.ranges) {
+                                sampler_table = sampler_table || r.range_type == d3d::DescriptorRangeType::Sampler;
+                            }
+                            if (sampler_kind != sampler_table) {
+                                fail(b, pname + " has no descriptor at byte offset " +
+                                            std::to_string(b.table_byte_offset) + " and is a " +
+                                            (sampler_table ? "sampler" : "resource") + " table");
+                                continue;
+                            }
+                            cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                                  : sampler_kind                         ? d3d::DescriptorRangeType::Sampler
+                                  : (b.kind == ReflectedBindingKind::Storage ||
+                                     b.kind == ReflectedBindingKind::StorageTexture)
+                                      ? d3d::DescriptorRangeType::Uav
+                                      : d3d::DescriptorRangeType::Srv;
+                            reg = space = 0;
+                            lb.join.table_parameter = static_cast<uint32_t>(pi);
+                            lb.join.table_slot = b.table_byte_offset / kTableSlotBytes;
+                        }
                         break;
+                    }
                     case ReflectedSource::RootConstants:
                         if (p.parameter_type != d3d::RootParameterType::Constants32Bit) {
                             fail(b, pname + " is not root constants");

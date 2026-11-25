@@ -1820,6 +1820,23 @@ BindGroupPlan BindGroupPlan::build(
             plan.entries_.push_back(e);
             continue;
         }
+        if (b.table_parameter != kNoIndex) {
+            // Direct table slot: the descriptor at that offset from the table's base, whatever
+            // ranges the root signature declares (the heap type must match the class).
+            const bool sampler = b.register_class == DescriptorRangeType::Sampler;
+            if (b.table_parameter < signature.parameter_count() &&
+                signature.parameter(b.table_parameter).type == RootParameterType::DescriptorTable &&
+                (signature.parameter(b.table_parameter).table_heap_type == DescriptorHeapType::Sampler) == sampler) {
+                e.source = PlanSource::DescriptorTable;
+                e.root_parameter_index = b.table_parameter;
+                e.table_offset = b.table_slot;
+                plan.parameter_mask_ |= 1ull << e.root_parameter_index;
+            } else {
+                ++plan.unresolved_;
+            }
+            plan.entries_.push_back(e);
+            continue;
+        }
         const BindingSlot* slot = nullptr;
         uint32_t table_offset = 0;
         if (b.root_constants) {

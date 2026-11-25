@@ -301,12 +301,46 @@ void test_layout_join() {
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad}}, &untouched, &report));
     CHECK(untouched.groups.empty());
     CHECK(report.find("@group(0) @binding(0) <- table at s12 + 0: no root parameter starts at s12") != std::string::npos);
-    CHECK(report.find("@group(0) @binding(1) <- table at s8 + 64: root parameter 0 has no descriptor at byte offset 64") !=
-          std::string::npos);
-    CHECK(report.find("@group(0) @binding(2) <- table at s8 + 32: a texture binding cannot take a CBV") !=
-          std::string::npos);
+    // A slot declared as another class joins the slot itself (no failure).
+    CHECK(report.find("@binding(2)") == std::string::npos);
     CHECK(report.find("byte offset 16") != std::string::npos);
-    CHECK(report.find("no static sampler 5") != std::string::npos);
+    // Undeclared slots and samplers the root signature lacks are not failures (below).
+    CHECK(report.find("@binding(1)") == std::string::npos && report.find("@binding(4)") == std::string::npos);
+
+    // G62: a slot past the table's declared ranges joins the slot itself (console stages read their
+    // tables as memory); a static sampler the root signature lacks binds the default sampler.
+    StageReflection extra;
+    extra.bindings = {off, sampler};
+    extra.bindings[0].kind = ReflectedBindingKind::Texture;
+    report.clear();
+    bridge::PipelineLayoutDesc slots;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &extra}}, &slots, &report));
+    CHECK(report.empty() && slots.groups.size() == 1 && slots.groups[0].bindings.size() == 2);
+    if (slots.groups.size() == 1 && slots.groups[0].bindings.size() == 2) {
+        const auto& t = slots.groups[0].bindings[0].join;
+        CHECK(t.table_parameter == 0 && t.table_slot == 2 && t.register_class == d3d::DescriptorRangeType::Srv);
+        const auto& s = slots.groups[0].bindings[1].join;
+        CHECK(s.register_class == d3d::DescriptorRangeType::Sampler && s.shader_register == d3d::kNoIndex &&
+              s.table_parameter == d3d::kNoIndex);
+    }
+    // A sampler cannot come from an undeclared slot of a resource table.
+    StageReflection wrong;
+    ReflectedBinding smp_slot = off;
+    smp_slot.kind = ReflectedBindingKind::Sampler;
+    wrong.bindings = {smp_slot};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &wrong}}, &slots, &report));
+    CHECK(report.find("is a resource table") != std::string::npos);
+
+    // A writable binding over a declared read-only slot is still a failure.
+    StageReflection writable;
+    ReflectedBinding st = tex;
+    st.kind = ReflectedBindingKind::StorageTexture;
+    st.storage_format = 18;
+    writable.bindings = {st};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &writable}}, &untouched, &report));
+    CHECK(report.find("cannot take a CBV") != std::string::npos);
 
     // Two stages that disagree on one binding.
     StageReflection a, b;
@@ -385,6 +419,31 @@ void test_heap_sources() {
     CHECK(report.find("cannot come from the sampler heap") != std::string::npos);
 }
 
+// G62: a direct table-slot join compiles to that table offset, past the declared ranges; a slot
+// of a table of the other heap type stays unresolved.
+void test_plan_direct_slot() {
+    const d3d::RootSignatureDesc desc = ui_root_signature();
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(desc, &rs).ok());
+    d3d::ShaderBinding tex;
+    tex.binding = 1;
+    tex.register_class = d3d::DescriptorRangeType::Srv;
+    tex.table_parameter = 0;
+    tex.table_slot = 5;
+    d3d::ShaderBinding smp = tex;
+    smp.binding = 2;
+    smp.register_class = d3d::DescriptorRangeType::Sampler;
+    const d3d::ShaderBinding bindings[] = {tex, smp};
+    const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(rs, bindings, d3d::WebGpuStage::Fragment);
+    CHECK(plan.entries().size() == 2 && plan.unresolved_count() == 1);
+    if (plan.entries().size() == 2) {
+        CHECK(plan.entries()[0].source == d3d::PlanSource::DescriptorTable && plan.entries()[0].root_parameter_index == 0 &&
+              plan.entries()[0].table_offset == 5);
+        CHECK(plan.entries()[1].source == d3d::PlanSource::Unresolved);
+    }
+    CHECK(plan.table_windows().size() == 1 && plan.table_windows()[0].first_offset == 5);
+}
+
 }  // namespace
 
 int main() {
@@ -392,6 +451,7 @@ int main() {
     test_user_data_rule();
     test_vertex_join();
     test_layout_join();
+    test_plan_direct_slot();
     test_heap_sources();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);

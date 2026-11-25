@@ -290,7 +290,8 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
                                a.shader_register == b.shader_register && a.register_space == b.register_space &&
                                a.root_constants == b.root_constants && a.heap == b.heap &&
                                a.heap_index_parameter == b.heap_index_parameter &&
-                               a.heap_index_dword == b.heap_index_dword && a.heap_shift == b.heap_shift;
+                               a.heap_index_dword == b.heap_index_dword && a.heap_shift == b.heap_shift &&
+                               a.table_parameter == b.table_parameter && a.table_slot == b.table_slot;
                     });
                 if (same_joins) {
                     found = existing.get();
