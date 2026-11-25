@@ -15,7 +15,9 @@
 #include <thread>
 #include <utility>
 
+#include "gpu/d3d12_guest_objects.h"
 #include "gpu/present_pacing.h"
+#include "gpu/present_samples.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
@@ -271,6 +273,7 @@ struct BootState {
     bool present_seen = false;                                  // guarded by `mutex`
     uint64_t present_import_seq = 0;
     uint64_t present_elapsed_ms = 0;
+    gpu::PresentSampleRing present_samples;  // guarded by `mutex` (R40)
     std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
     std::vector<std::string> trace_strings;  // string arguments of each trace entry
     struct CallableCalls {
@@ -1978,6 +1981,20 @@ std::string build_report() {
             o += rows.empty() ? "]},\n" : "\n  ]},\n";
         }
     }
+    // R40: per-present samples without a GPU capture (the last gpu::PresentSampleRing::kDefaultCapacity).
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        o += "  \"present_samples_total\": " + std::to_string(b.present_samples.total()) + ",\n";
+        o += "  \"present_samples\": [";
+        const std::vector<gpu::PresentSample> samples = b.present_samples.snapshot();
+        for (size_t k = 0; k < samples.size(); ++k) {
+            const gpu::PresentSample& ps = samples[k];
+            o += (k == 0 ? "" : ",");
+            o += "{\"index\": " + std::to_string(ps.index) + ", \"wall_ms\": " + std::to_string(ps.wall_ms) +
+                 ", \"draws\": " + std::to_string(ps.draws) + ", \"resources\": " + std::to_string(ps.resources) + "}";
+        }
+        o += "],\n";
+    }
     if (const ReportExtension extension = g_report_extension.load(std::memory_order_acquire)) {
         const std::string members = extension();
         if (!members.empty()) {
@@ -2588,6 +2605,19 @@ void set_report_extension(ReportExtension extension) {
     g_report_extension.store(extension, std::memory_order_release);
 }
 
+// The present pacer's observer: every PresentX records a sample (R40); the first marks first_present.
+static void record_present() {
+    namespace d3d = gpu::d3d12_guest;
+    const uint64_t draws = d3d::work_total(d3d::Work::DrawsIssued);
+    const uint64_t resources = d3d::work_total(d3d::Work::ResourcesCreated);
+    {
+        BootState& b = boot();
+        std::lock_guard<std::mutex> lock(b.mutex);
+        b.present_samples.record(elapsed_ms(), draws, resources);
+    }
+    mark_first_present();
+}
+
 void mark_first_present() {
     BootState& b = boot();
     uint64_t seq = 0;
@@ -2713,6 +2743,7 @@ void reset_boot() {
     b.present_seen = false;
     b.present_import_seq = 0;
     b.present_elapsed_ms = 0;
+    b.present_samples.clear();
     b.trace.clear();
     b.trace_strings.clear();
     {
@@ -2766,7 +2797,7 @@ BootResult run_boot(const BootConfig& config) {
     gpu::present_pacer().set_enabled(config.present_pacing);
     // Every present marks the first one (report first_present, FIRST_PRESENT milestone), with or
     // without a GPU capture.
-    gpu::present_pacer().set_observer(&mark_first_present);
+    gpu::present_pacer().set_observer(&record_present);
     b.guest_thread_started = config.guest_thread_started;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);

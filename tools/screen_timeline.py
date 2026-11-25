@@ -43,6 +43,19 @@ def _num(v: Any) -> int:
     return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
 
 
+def presents_from_samples(samples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Capture-style presents (cumulative counters) from the runtime's `present_samples`
+    ({index, wall_ms, draws, resources}: per-present deltas), for runs without a GPU capture."""
+    out: list[dict[str, Any]] = []
+    draws = res = 0
+    for s in samples:
+        draws += _num(s.get("draws"))
+        res += _num(s.get("resources"))
+        out.append({"wall_ms": s.get("wall_ms") or 0,
+                    "counters": {"draws_issued": draws, "resources_created": res}})
+    return out
+
+
 def parse_input_times(text: str) -> list[float]:
     """Event times (ms) of an input script (`<time_ms> <buttons> [hold_ms]`, `#` comments)."""
     out: list[float] = []

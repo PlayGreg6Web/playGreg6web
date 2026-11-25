@@ -232,6 +232,13 @@ class RunTests(unittest.TestCase):
         report["first_present"] = None
         self.assertIn("presents: 0\n", rnb.digest(report, 7))
 
+    def test_timeline_presents_fallback(self):
+        samples = [{"index": 0, "wall_ms": 1, "draws": 3, "resources": 1}]
+        self.assertEqual(rnb.timeline_presents({"present_samples": samples})[0]["counters"]["draws_issued"], 3)
+        cap = [{"wall_ms": 5, "counters": {}}]
+        self.assertEqual(rnb.timeline_presents({"presents": cap, "present_samples": samples}), cap)
+        self.assertEqual(rnb.timeline_presents({}), [])
+
     def test_menu_flow_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow"]["max_ms"], 240_000)
         script = rnb.input_script_text(240_000, "menu-flow").splitlines()

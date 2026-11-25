@@ -49,6 +49,16 @@ class ScreenTimeline(unittest.TestCase):
         self.assertEqual(segs[2]["new_resources_at_start"], 4)
         self.assertEqual([s["input_events_in_segment"] for s in segs], [3, 1, 0])
 
+    def test_present_samples_fallback(self):
+        samples = [{"index": i, "wall_ms": 10 * i, "draws": d, "resources": r}
+                   for i, (d, r) in enumerate([(10, 5), (10, 0), (11, 0), (50, 0), (50, 4)])]
+        segs = st.build_timeline(st.presents_from_samples(samples))
+        self.assertEqual([s["first_present"] for s in segs], [0, 3, 4])
+        self.assertEqual(segs[0]["presents"], 3)
+        self.assertEqual(segs[0]["new_resources_at_start"], 5)
+        self.assertEqual(segs[2]["new_resources_at_start"], 4)
+        self.assertEqual(st.presents_from_samples([]), [])
+
     def test_cap(self):
         ps = [present(i, i * (i + 1) * 5, 0) for i in range(1, 50)]
         segs = st.build_timeline(ps, max_segments=5)

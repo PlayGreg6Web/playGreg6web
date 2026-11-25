@@ -808,6 +808,10 @@ void test_report_import_fields() {
     CHECK(run.result.status == BootStatus::Exited);
     CHECK(run.report["presents"].type == Json::Array && run.report["presents"].items.size() == 1);
     CHECK(run.report["presents"][0]["index"].number == 0);
+    // R40: the two paced presents are sampled without any capture.
+    CHECK(run.report["present_samples"].type == Json::Array && run.report["present_samples"].items.size() == 2);
+    CHECK(run.report["present_samples"][1]["index"].number == 1);
+    CHECK(run.report["present_samples"][1].has("wall_ms") && run.report["present_samples"][1].has("draws"));
     const Json& fp = run.report["first_present"];
     CHECK(fp.type == Json::Object);
     CHECK(fp["import_seq"].number == 2);

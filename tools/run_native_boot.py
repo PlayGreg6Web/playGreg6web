@@ -277,6 +277,11 @@ def load_report(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def timeline_presents(report: dict) -> list:
+    """Capture samples, else the runtime's own per-present samples (R40: no GPU capture needed)."""
+    return report.get("presents") or screen_timeline.presents_from_samples(report.get("present_samples") or [])
+
+
 def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     lines = [f"status: {report.get('status')} (phase {report.get('phase')}, exit_code {report.get('exit_code')}, "
              f"harness exit {exit_code}), {report.get('elapsed_ms')} ms"]
@@ -452,7 +457,7 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if report is None:
         print(f"error: the harness (exit {code}) wrote no report; see {run_dir / 'boot.log'}", file=sys.stderr)
         return 3
-    presents = report.get("presents") or []
+    presents = timeline_presents(report)
     if presents and "screen_timeline" not in report:
         times: list[float] = []
         ipath = Path(args.input_script) if args.input_script else script_path
