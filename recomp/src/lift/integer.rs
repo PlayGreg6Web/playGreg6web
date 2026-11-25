@@ -131,6 +131,12 @@ impl FunctionLifter<'_> {
                 self.emit("fence seq_cst");
                 Ok(())
             }
+            // `pause` marks a spin-wait: a compiler barrier, like every loop header (see
+            // `LOOP_BARRIER`).
+            M::Pause => {
+                self.emit(crate::lift::LOOP_BARRIER);
+                Ok(())
+            }
             // Hints without an architectural effect on registers, flags or memory contents.
             M::Prefetchnta
             | M::Prefetcht0

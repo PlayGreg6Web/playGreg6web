@@ -59,8 +59,9 @@
 //! bextr`, BMI2 `bzhi pdep pext`), string instructions (`movs stos lods cmps scas` with
 //! `rep`/`repe`/`repne`, both DF directions; see `string_ops`), `movbe`, `xlat`, `adcx`/`adox`,
 //! `crc32` (CRC-32C), AMD `clzero`, the runtime-provided `cpuid rdtsc rdtscp xgetbv`, fences
-//! (`mfence lfence sfence` -> `fence seq_cst`), and no-op hints (`nop` forms, `pause`,
-//! `endbr64`, `prefetch*`, `clflush*`, `clwb`, `cldemote`, `monitorx`, `mwaitx`). Control flow:
+//! (`mfence lfence sfence` -> `fence seq_cst`; `pause` and every loop head -> the compiler
+//! barrier [`LOOP_BARRIER`], which keeps the loads of a spin-wait inside its loop), and no-op
+//! hints (`nop` forms, `endbr64`, `prefetch*`, `clflush*`, `clwb`, `cldemote`, `monitorx`, `mwaitx`). Control flow:
 //! `jmp`, `jcc`, `loop`/`loope`/`loopne`, `jrcxz`/`jecxz`, `call`, `ret`.
 //!
 //! Choices for architecturally undefined results: `bsf`/`bsr` with a zero source leave the whole
@@ -206,6 +207,14 @@ pub const WASM64_DATALAYOUT: &str =
 /// scalarised. Consumers must run the module on an engine with wasm SIMD (every engine with
 /// memory64 has it).
 pub const LIFTED_FUNCTION_ATTRIBUTES: &str = "\"target-features\"=\"+simd128\"";
+
+/// Compiler-only barrier at the head of every guest loop (a block entered by a backward edge)
+/// and at `pause`. Guest loads are plain LLVM loads, so a wait such as `while (*flag != 8);` or
+/// `while (*p < 0x100) pause;` has a loop-invariant load that LLVM hoists, turning the wait into
+/// `jmp .`; the guest relied on x86 reloading memory each iteration. A single-thread fence is a
+/// memory clobber to the optimizer but emits no instruction (x86 and wasm alike), and the guest
+/// compiler already left only the loads it could not hoist inside its loops.
+pub const LOOP_BARRIER: &str = "fence syncscope(\"singlethread\") acquire";
 
 /// [`LIFTED_FUNCTION_ATTRIBUTES`] with extra target features appended.
 fn module_attributes(extra: &str) -> String {

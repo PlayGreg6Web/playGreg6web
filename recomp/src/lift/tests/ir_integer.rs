@@ -183,6 +183,88 @@ fn loop_and_jrcxz_become_llvm_branches() {
     assert!(lifted.ir.contains("br i1 %t"), "{}", lifted.ir);
 }
 
+/// `while (*(u16*)rcx < 0x100) pause;`: the shape of the title's page-commit wait.
+fn pause_spin_module() -> String {
+    module_ir(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top)?;
+        a.pause()?;
+        a.movzx(eax, word_ptr(rcx))?;
+        a.cmp(ax, 0x100)?;
+        a.jb(top)?;
+        a.ret()
+    })
+}
+
+/// `lock inc [rax]; while (*(u32*)(rsp + 0x48) != 8);`: a join wait without `pause`.
+fn plain_spin_module() -> String {
+    module_ir(|a| {
+        let mut top = a.create_label();
+        a.lock().inc(dword_ptr(rax))?;
+        a.set_label(&mut top)?;
+        a.mov(eax, dword_ptr(rsp + 0x48))?;
+        a.cmp(eax, 8)?;
+        a.jne(top)?;
+        a.ret()
+    })
+}
+
+#[test]
+fn pause_and_loop_heads_are_compiler_barriers() {
+    for ir in [pause_spin_module(), plain_spin_module()] {
+        assert!(ir.contains(crate::lift::LOOP_BARRIER), "{ir}");
+    }
+    // Straight-line code gets none, and the barrier needs no wasm atomics.
+    let straight = module_ir(|a| {
+        a.mov(eax, dword_ptr(rcx))?;
+        a.ret()
+    });
+    assert!(!straight.contains("fence"), "{straight}");
+    assert!(!pause_spin_module().contains(ATOMICS_TARGET_FEATURES));
+}
+
+/// After the middle-end a spin loop must still reload the guest word on every iteration: a
+/// plain load in a loop without stores is loop-invariant and LLVM turns the wait into `jmp .`.
+#[test]
+fn spin_waits_keep_their_load_inside_the_loop_after_optimisation() {
+    for ir in [pause_spin_module(), plain_spin_module()] {
+        spin_wait_reloads(&ir);
+    }
+}
+
+fn spin_wait_reloads(ir: &str) {
+    let Some(crate::lift::compile::LlvmTool::Llc { opt: Some(opt), .. }) =
+        crate::lift::compile::find_llvm_tool()
+    else {
+        eprintln!("skipping: no LLVM opt found");
+        return;
+    };
+    let ll = std::env::temp_dir().join(format!("playgta6_recomp_spin_{}.ll", std::process::id()));
+    std::fs::write(&ll, ir).expect("write ll");
+    let out = std::process::Command::new(opt)
+        .args(["-O2", "-S"])
+        .arg(&ll)
+        .output()
+        .expect("runs opt");
+    let _ = std::fs::remove_file(&ll);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let optimized = String::from_utf8_lossy(&out.stdout);
+    // The basic block holding the fence must load before it branches back.
+    let mut in_fence_block = false;
+    let mut load_after_fence = false;
+    for line in optimized.lines() {
+        let line = line.trim();
+        if line.starts_with(crate::lift::LOOP_BARRIER) {
+            in_fence_block = true;
+        } else if in_fence_block && line.contains(" = load ") {
+            load_after_fence = true;
+        } else if in_fence_block && line.starts_with("br ") {
+            break;
+        }
+    }
+    assert!(load_after_fence, "{optimized}");
+}
+
 #[test]
 fn unsupported_integer_forms_trap_with_precise_reasons() {
     let cases: [(&[u8], &str, &str); 9] = [

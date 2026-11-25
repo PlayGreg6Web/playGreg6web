@@ -413,9 +413,23 @@ impl FunctionLifter<'_> {
 
     fn lift_blocks(&mut self) -> Result<(), LiftError> {
         let func = self.func;
+        // Loop heads: targets of a backward (or self) edge in guest address order.
+        let loop_heads: BTreeSet<u64> = func
+            .blocks
+            .iter()
+            .flat_map(|(&start, block)| {
+                block
+                    .successors
+                    .iter()
+                    .filter_map(move |edge| edge.intra_target().filter(|&target| target <= start))
+            })
+            .collect();
         for (&start, block) in &func.blocks {
             let label = block_label(start);
             self.start_block(&label);
+            if loop_heads.contains(&start) {
+                self.emit(crate::lift::LOOP_BARRIER);
+            }
             let (body, transfer) = match block.instructions.split_last() {
                 Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
                 _ => (&block.instructions[..], None),
@@ -1174,7 +1188,7 @@ impl FunctionLifter<'_> {
             return result;
         }
         match ins.mnemonic() {
-            M::Nop | M::Pause | M::Endbr64 => {}
+            M::Nop | M::Endbr64 => {}
             M::Mov => {
                 let bits = self.op_bits(ins, 0)?;
                 let v = self.read_op(ins, 1, bits)?;
