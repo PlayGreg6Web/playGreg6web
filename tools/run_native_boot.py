@@ -346,7 +346,8 @@ def audio_line(report: dict) -> str | None:
     return (f"audio: {a.get('render_frames', 0)} frames, {fraction * 100:.1f}% non-silent "
             f"({live}/{len(windows)} windows), spatial passes {a.get('spatial_passes', 0)}, "
             f"xapu decoded {a.get('xapu_decoded_packets', 0)} / failed {a.get('xapu_failed_packets', 0)} "
-            f"/ results {a.get('xapu_results_posted', 0)}")
+            f"/ results {a.get('xapu_results_posted', 0)}"
+            + (f" / unhandled commands {a['xapu_unhandled_commands']}" if a.get('xapu_unhandled_commands') else ""))
 
 
 def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:

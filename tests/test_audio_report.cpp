@@ -56,6 +56,14 @@ int main() {
     t.spatial_passes = 10;
     t.spatial_nonzero_passes = 5;
     CHECK(ar::non_silent_fraction(t) == (250.0 + 2400.0) / (1000.0 + 4800.0));
+    t.xapu_commands = 12;
+    t.xapu_unhandled_commands = 1;
+    t.xapu_type1 = 2;
+    t.xapu_type2 = 2;
+    t.xapu_type3 = 7;
+    const std::string json2 = ar::to_json(t, {}, 0);
+    CHECK(json2.find("\"xapu_commands\": 12, \"xapu_unhandled_commands\": 1") != std::string::npos);
+    CHECK(json2.find("\"xapu_commands_by_type\": {\"1\": 2, \"2\": 2, \"3\": 7, \"5\": 0}") != std::string::npos);
     CHECK(ar::to_json(ar::Totals{}, {}, 0).find("\"non_silent_fraction\": 0.000000") != std::string::npos);
 
     if (g_failures == 0) std::printf("test_audio_report: ok\n");

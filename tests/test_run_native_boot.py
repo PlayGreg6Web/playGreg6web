@@ -461,6 +461,10 @@ class AudioLineTests(unittest.TestCase):
             "xapu decoded 9 / failed 1 / results 10")
         self.assertIn(line, rnb.digest(report, 0))
 
+    def test_audio_line_flags_unhandled_xapu_commands(self):
+        report = {"audio": {"xapu_results_posted": 2, "xapu_unhandled_commands": 3}}
+        self.assertTrue(rnb.audio_line(report).endswith("/ results 2 / unhandled commands 3"))
+
     def test_no_audio_section_no_line(self):
         self.assertIsNone(rnb.audio_line({}))
         self.assertNotIn("audio:", rnb.digest({}, 0))

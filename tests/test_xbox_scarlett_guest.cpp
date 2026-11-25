@@ -1938,6 +1938,10 @@ void test_xapu() {
     CHECK(load32(result) == 2 && load32(result + 4) == 7);
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) < 0);  // empty
     CHECK(ga::xapu_stats().commands == 3 && ga::xapu_stats().pending_results == 0);
+    // Per-type census: the unknown type 9 is counted as unhandled and posts nothing.
+    const ga::XApuStats census = ga::xapu_stats();
+    CHECK(census.type5_commands == 1 && census.type2_commands == 1 && census.type1_commands == 0);
+    CHECK(census.unhandled_commands == 1 && census.results_posted == 2 && census.type3_results == 0);
     CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
     CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
 }
@@ -2086,6 +2090,11 @@ void test_xapu_decode() {
     CHECK(after.failed_packets - before.failed_packets == (xapu_opus_available() ? 2u : 1u));
     CHECK(after.decoded_bytes - before.decoded_bytes == (4 * 960 * 4 + (960 - 312) * 4) + 3 * 0x1E00);
     CHECK(after.pending_results == 0);
+    // Every decode command posts exactly one type-3 result, decoded or not.
+    CHECK(after.type3_results - before.type3_results == after.type3_commands - before.type3_commands);
+    CHECK(after.type3_results - before.type3_results ==
+          (after.decoded_packets - before.decoded_packets) + (after.failed_packets - before.failed_packets));
+    CHECK(after.unhandled_commands == before.unhandled_commands);
     CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
 }
 

@@ -1061,6 +1061,12 @@ int main(int argc, char** argv) {
                 t.xapu_decoded_packets = x.decoded_packets;
                 t.xapu_failed_packets = x.failed_packets;
                 t.xapu_results_posted = x.type3_results;
+                t.xapu_commands = x.commands;
+                t.xapu_unhandled_commands = x.unhandled_commands;
+                t.xapu_type1 = x.type1_commands;
+                t.xapu_type2 = x.type2_commands;
+                t.xapu_type3 = x.type3_commands;
+                t.xapu_type5 = x.type5_commands;
                 o += ",\n  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
             }
             if (s_with_presents) {

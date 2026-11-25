@@ -441,6 +441,9 @@ struct XApuStats {
     uint64_t failed_packets = 0;
     uint64_t decoded_bytes = 0;
     uint64_t type3_results = 0;  // type-3 results posted (one per decode command)
+    uint64_t results_posted = 0;  // results of every type posted
+    uint64_t type1_commands = 0, type2_commands = 0, type3_commands = 0, type5_commands = 0;
+    uint64_t unhandled_commands = 0;  // commands of an unknown type (accepted, no result)
 };
 XApuStats xapu_stats();
 

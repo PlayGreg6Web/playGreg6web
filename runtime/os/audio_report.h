@@ -78,6 +78,9 @@ struct Totals {
     uint64_t render_frames = 0, render_nonzero_frames = 0, render_silent_releases = 0;
     uint64_t spatial_passes = 0, spatial_object_buffers = 0, spatial_nonzero_buffers = 0, spatial_nonzero_passes = 0;
     uint64_t xapu_decoded_packets = 0, xapu_failed_packets = 0, xapu_results_posted = 0;
+    uint64_t xapu_commands = 0, xapu_unhandled_commands = 0;
+    // Commands per type the model knows: 1 (start), 2 (free), 3 (Opus decode), 5.
+    uint64_t xapu_type1 = 0, xapu_type2 = 0, xapu_type3 = 0, xapu_type5 = 0;
 };
 
 // Non-silent share of everything the title released: render-client frames plus spatial passes
@@ -107,6 +110,11 @@ inline std::string to_json(const Totals& t, const std::vector<uint64_t>& windows
     add("xapu_decoded_packets", t.xapu_decoded_packets);
     add("xapu_failed_packets", t.xapu_failed_packets);
     add("xapu_results_posted", t.xapu_results_posted);
+    add("xapu_commands", t.xapu_commands);
+    add("xapu_unhandled_commands", t.xapu_unhandled_commands);
+    o += "\"xapu_commands_by_type\": {\"1\": " + std::to_string(t.xapu_type1) + ", \"2\": " +
+         std::to_string(t.xapu_type2) + ", \"3\": " + std::to_string(t.xapu_type3) + ", \"5\": " +
+         std::to_string(t.xapu_type5) + "}, ";
     add("window_ms", kWindowMs);
     add("windows_clamped", clamped);
     o += "\"non_silent_frames_per_window\": [";

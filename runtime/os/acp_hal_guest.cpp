@@ -269,6 +269,14 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 // state, reset by commands 1 and 2), the float32 PCM written to the output address, and a result
 // {3, voice index, zeros, +0x34 bytes written} queued (0 bytes when the packet does not decode).
 // Other command types are accepted without a result (counted, the first logged).
+//
+// Codec census (R40, menu-flow run of 420 s): the executable sends XApu only types 1, 2 and 3
+// (5 is wired but was not seen); every decode command carries one Opus packet (287 decoded, 0
+// failed, 287 type-3 results). No other codec reaches a hardware model: AcpHalAllocateShapeContexts
+// is called with every count but kind 4 zeroed (xbox_middleware.cpp), so no SHAPE/XMA decoder
+// contexts exist, XDspActivate is never reached, and the executable imports no XAudio2/XMA API;
+// PCM and ADPCM are decoded by the title's own code. The boot report's audio section carries the
+// per-type counts and `xapu_unhandled_commands` so a new codec path shows up there first.
 // ---------------------------------------------------------------------------
 
 constexpr size_t kXApuResultBytes = 0x38;
@@ -288,6 +296,9 @@ struct XApuState {
     uint64_t decoded_packets = 0;
     uint64_t failed_packets = 0;
     uint64_t decoded_bytes = 0;
+    uint64_t type3_results = 0;   // type-3 results queued (one per decode command)
+    uint64_t results_posted = 0;  // results of every type queued
+    uint64_t unhandled = 0;       // commands of a type the model does not know (no result)
     bool decode_logged = false;
     bool failure_logged = false;
 };
@@ -465,8 +476,14 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     }
     if (type == 3) {
         it->second.push_back(decode_command(handle, decode));
+        ++xapu().type3_results;
     } else if (acknowledged) {
         it->second.push_back(make_result(type, head[1]));
+    } else {
+        ++xapu().unhandled;
+    }
+    if (acknowledged) {
+        ++xapu().results_posted;
     }
     return kOk;
 }
@@ -512,9 +529,17 @@ XApuStats xapu_stats() {
     s.decoded_packets = xapu().decoded_packets;
     s.failed_packets = xapu().failed_packets;
     s.decoded_bytes = xapu().decoded_bytes;
-    if (const auto t3 = xapu().commands.find(3); t3 != xapu().commands.end()) {
-        s.type3_results = t3->second;
-    }
+    auto count = [](uint32_t type) {
+        const auto it = xapu().commands.find(type);
+        return it != xapu().commands.end() ? it->second : uint64_t{0};
+    };
+    s.type1_commands = count(1);
+    s.type2_commands = count(2);
+    s.type3_commands = count(3);
+    s.type5_commands = count(5);
+    s.unhandled_commands = xapu().unhandled;
+    s.type3_results = xapu().type3_results;
+    s.results_posted = xapu().results_posted;
     return s;
 }
 
