@@ -6,14 +6,18 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Sequence
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
@@ -290,7 +294,191 @@ class CompileTests(unittest.TestCase):
             self.assertTrue(all(r.cached for r in again))
 
 
+class CacheTests(unittest.TestCase):
+    KEY = "ab" * 32
+
+    def test_default_dir_is_machine_wide_and_overridable(self) -> None:
+        win = nb.default_cache_dir({"LOCALAPPDATA": r"C:\Users\u\AppData\Local"}, windows=True)
+        self.assertEqual(win, Path(r"C:\Users\u\AppData\Local") / "playgta6" / "objcache")
+        self.assertEqual(nb.default_cache_dir({"XDG_CACHE_HOME": "/x/cache"}, windows=False),
+                         Path("/x/cache") / "playgta6" / "objcache")
+        self.assertEqual(nb.default_cache_dir({}, windows=False), Path.home() / ".cache" / "playgta6" / "objcache")
+        env = {nb.CACHE_ENV: "/elsewhere", "LOCALAPPDATA": "C:/l"}
+        self.assertEqual(nb.default_cache_dir(env, windows=True), Path("/elsewhere"))
+        # Never inside the repository.
+        self.assertNotIn(REPO_ROOT, nb.default_cache_dir().resolve().parents)
+        self.assertEqual(nb.default_cache_max_gb({}), 40.0)
+        self.assertEqual(nb.default_cache_max_gb({nb.CACHE_MAX_ENV: "2.5"}), 2.5)
+        with self.assertRaises(nb.NativeBootError):
+            nb.default_cache_max_gb({nb.CACHE_MAX_ENV: "lots"})
+
+    def test_key_to_path(self) -> None:
+        root = Path("cache")
+        self.assertEqual(nb.cache_entry_path(root, self.KEY, ".obj"), root / f"{self.KEY}.obj")
+        self.assertEqual(nb.cache_entry_path(root, self.KEY, ".o"), root / f"{self.KEY}.o")
+        for key in ("ab" * 31, "AB" * 32, "../" + "a" * 61):
+            with self.assertRaises(ValueError):
+                nb.cache_entry_path(root, key, ".obj")
+        with self.assertRaises(ValueError):
+            nb.cache_entry_path(root, self.KEY, ".tmp.obj")
+        # The key covers the retargeting code, not just its version number.
+        self.assertRegex(nb.RETARGET_FINGERPRINT, r"^[0-9a-f]{16}$")
+
+    def test_two_writers_publish_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / f"{self.KEY}.obj"
+            temps = [root / f"{self.KEY}.{i}.tmp.obj" for i in range(2)]
+            for i, t in enumerate(temps):
+                t.write_bytes(b"OBJ" * 1000)
+            barrier = threading.Barrier(2)
+            won: list[bool] = []
+
+            def writer(t: Path) -> None:
+                barrier.wait()
+                won.append(nb.publish(t, dest))
+
+            threads = [threading.Thread(target=writer, args=(t,)) for t in temps]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(dest.read_bytes(), b"OBJ" * 1000)
+            self.assertGreaterEqual(won.count(True), 1)
+            self.assertEqual([p.name for p in root.iterdir()], [dest.name])  # no temporaries left
+            # A late writer never replaces a published entry (it may be being linked).
+            late = root / "late.tmp.obj"
+            late.write_bytes(b"NEW")
+            self.assertFalse(nb.publish(late, dest))
+            self.assertEqual(dest.read_bytes(), b"OBJ" * 1000)
+            self.assertFalse(late.exists())
+
+    def test_two_processes_compile_a_key_once(self) -> None:
+        # Two build processes (two checkouts) compile the same unit into one shared cache: one
+        # holds the entry's lock and compiles, the other waits and takes the published object.
+        script = textwrap.dedent(
+            """
+            import sys, time
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            import build_native_boot as nb
+            root, cache, marks = Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
+            nb.LOCK_POLL_S = 0.05
+            def runner(argv, stdin):
+                if argv[-1] == "--version":
+                    return nb.CommandResult(0, "LLVM version 99.0.0-test")
+                if Path(argv[0]).stem == "llc":
+                    (marks / f"llc-{sys.argv[5]}").write_text("x")
+                    time.sleep(0.5)
+                out = Path(argv[argv.index("-o") + 1])
+                out.write_bytes(b"OBJ" * 10)
+                return nb.CommandResult(0)
+            unit = nb.load_module(root / "out" / "main").units[0]
+            cfg = nb.CompileConfig("x86_64-pc-windows-msvc", "x86-64-v3", "1", cache, root / "logs",
+                                   nb.find_llvm_tools(root / "llvm", runner))
+            res = nb.compile_unit(unit, cfg, runner)
+            assert res.error is None and res.obj.is_file(), res.error
+            print("cached" if res.cached else "compiled")
+            """
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_module(root, shards=1)
+            fake_tools(root)
+            cache, marks = root / "cache", root / "marks"
+            cache.mkdir()
+            marks.mkdir()
+            procs = [
+                subprocess.Popen(
+                    [sys.executable, "-c", script, str(REPO_ROOT / "tools"), str(root), str(cache), str(marks), str(i)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                for i in range(2)
+            ]
+            outs = [p.communicate(timeout=60) for p in procs]
+            for p, (_, err) in zip(procs, outs):
+                self.assertEqual(p.returncode, 0, err)
+            self.assertEqual(sorted(o.strip() for o, _ in outs), ["cached", "compiled"])
+            self.assertEqual(len(list(marks.iterdir())), 1)
+            self.assertEqual([p.suffix for p in cache.iterdir()], [".obj"])
+
+    def test_stale_lock_is_broken(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / f"{self.KEY}.obj.lock"
+            self.assertTrue(nb.try_lock(lock))
+            self.assertFalse(nb.try_lock(lock))  # held
+            nb._HEARTBEAT.discard(lock)  # its owner "dies": no more heartbeats
+            old = time.time() - nb.LOCK_STALE_S - 10
+            os.utime(lock, (old, old))
+            self.assertFalse(nb.try_lock(lock))  # breaks the stale lock...
+            self.assertTrue(nb.try_lock(lock))  # ...so the next attempt takes it
+            nb.release_lock(lock)
+            self.assertFalse(lock.exists())
+
+    def test_trim_removes_least_recently_used_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = 1_000_000_000.0
+            day = 86_400.0
+            paths = []
+            for i in range(5):  # entry i was last used i days ago, 100 bytes each
+                p = root / f"{i:064x}.obj"
+                p.write_bytes(b"x" * 100)
+                os.utime(p, (now - i * day, now - 10 * day))
+                paths.append(p)
+            # A hit refreshes the access time only: entry 4 becomes the most recently used.
+            os.utime(paths[4], (now - 0.5 * day, now - 20 * day))
+            stale_tmp = root / f"{0:064x}.abc.tmp.obj"
+            stale_tmp.write_bytes(b"t")
+            os.utime(stale_tmp, (now - 2 * day, now - 2 * day))
+            fresh_lock = root / f"{1:064x}.obj.lock"
+            fresh_lock.write_text("1")
+            os.utime(fresh_lock, (now, now))
+
+            res = nb.trim_cache(root, 250, grace_s=3600, now=now)
+            self.assertEqual((res.entries, res.bytes_before, res.removed, res.bytes_after), (5, 500, 3, 200))
+            self.assertEqual(sorted(p.name for p in root.iterdir()),
+                             sorted([paths[0].name, paths[4].name, fresh_lock.name]))
+            # Under the cap: nothing to do.
+            self.assertEqual(nb.trim_cache(root, 250, grace_s=3600, now=now).removed, 0)
+            # Entries used within the grace period survive even over the cap.
+            res = nb.trim_cache(root, 0, grace_s=2 * day, now=now)
+            self.assertEqual((res.removed, res.recent_kept), (0, 2))
+
+    def test_mark_used_keeps_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / f"{self.KEY}.obj"
+            p.write_bytes(b"x")
+            os.utime(p, (1000.0, 1000.0))
+            nb.mark_used(p)
+            st = p.stat()
+            self.assertEqual(st.st_mtime, 1000.0)
+            self.assertGreater(st.st_atime, 1000.0)
+
+    def test_cli_cache_trim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            cache.mkdir()
+            old = cache / f"{1:064x}.obj"
+            old.write_bytes(b"x" * 2048)
+            os.utime(old, (1000.0, 1000.0))
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = nb.main(["--cache-trim", "--cache-dir", str(cache), "--cache-max-gb", "0.000001", "--json"])
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertFalse(old.exists())
+            self.assertEqual(json.loads(out.getvalue())["cache"]["trim"]["removed"], 1)
+
+
 class HarnessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # CLI runs without --cache-dir use the machine-wide cache: point it at a temporary.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {nb.CACHE_ENV: str(Path(tmp.name) / "objcache")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_cmakelists_links_objects_at_a_high_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

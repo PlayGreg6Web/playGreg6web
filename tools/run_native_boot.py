@@ -13,7 +13,8 @@ What it does, in order:
    or older than the recompiler, the exe or the runtime files it binds imports from
    (`runtime/os/*.h|*.cpp`, `runtime/gpu/d3d12_xs.h`, `d3d12_xs_exports.*`,
    `runtime/guest/guest_callbacks.h`); the harness (`python tools/build_native_boot.py
-   <build-dir>/program --cache-dir <build-dir>/obj-cache --keep-going --delete-ir --debug-info`;
+   <build-dir>/program --keep-going --delete-ir --debug-info`, objects from the machine-wide cache
+   shared by all checkouts, or `--cache-dir DIR` / `PLAYGTA6_OBJ_CACHE`;
    the PDB lets `--profile` name runtime functions) when the binary is missing or older than the
    program manifest, any `runtime/` source or `tools/build_native_boot.py`. Only stale stages run, in dependency order (a rebuilt stage makes
    the later ones stale). `--rebuild` forces all, `--no-build` fails instead of building,
@@ -186,8 +187,9 @@ def choose_build_dir(repo: Path, requested: Path | None, env: Mapping[str, str],
 
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
               force: bool, harness_override: Path | None,
-              rebuild_program: bool = False) -> tuple[Plan, Path, Path]:
-    """Returns the build plan, the program directory and the harness path."""
+              rebuild_program: bool = False, cache_dir: Path | None = None) -> tuple[Plan, Path, Path]:
+    """Returns the build plan, the program directory and the harness path. Objects go to
+    `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts)."""
     program = build_dir / "program"
     recomp = repo / "target" / "release" / ("playgta6-recomp" + EXE_SUFFIX)
     harness = harness_override or program / "native" / "bin" / ("playgta6_boot" + EXE_SUFFIX)
@@ -231,9 +233,9 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
         if reason is None and plan.has("program"):
             reason = "the program is rebuilt"
         if reason:
+            cache = ["--cache-dir", str(cache_dir.resolve())] if cache_dir is not None else []
             plan.add("harness", reason, [sys.executable, str(repo / "tools" / "build_native_boot.py"), str(program),
-                                         "--cache-dir", str(build_dir / "obj-cache"), "--jobs", str(jobs),
-                                         "--keep-going", "--delete-ir", "--debug-info"])
+                                         *cache, "--jobs", str(jobs), "--keep-going", "--delete-ir", "--debug-info"])
     return plan, program, harness
 
 
@@ -358,6 +360,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--build-dir", type=Path, help="build outputs (default work/native-boot)")
     p.add_argument("--runs-dir", type=Path, help="run directories (default <build-dir>/runs)")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    p.add_argument("--cache-dir", type=Path,
+                   help="object cache (default: build_native_boot's machine-wide cache, $PLAYGTA6_OBJ_CACHE)")
     p.add_argument("--rebuild", action="store_true", help="rebuild every stage")
     p.add_argument("--rebuild-program", action="store_true",
                    help="regenerate the lifted program even when the stamps say it is current")
@@ -425,7 +429,7 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(f"run directory {run_dir} already exists (pick another --name)")
 
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
-                                      args.rebuild_program)
+                                      args.rebuild_program, args.cache_dir)
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]

@@ -139,8 +139,13 @@ class StalenessTests(unittest.TestCase):
             self.assertEqual([s["stage"] for s in plan.steps], ["harness"])
             cmd = plan.steps[0]["cmd"]
             self.assertTrue(cmd[1].endswith("build_native_boot.py"))
-            for flag in ("--cache-dir", "--keep-going", "--delete-ir", "--debug-info"):
+            for flag in ("--keep-going", "--delete-ir", "--debug-info"):
                 self.assertIn(flag, cmd)
+            # Objects come from the machine-wide cache shared by all checkouts unless one is given.
+            self.assertNotIn("--cache-dir", cmd)
+            plan, *_ = rnb.make_plan(fx.repo, fx.build, fx.exe, fx.pkg, 3, False, None, cache_dir=fx.build / "c")
+            cmd = plan.steps[0]["cmd"]
+            self.assertEqual(cmd[cmd.index("--cache-dir") + 1], str((fx.build / "c").resolve()))
             touch(harness, fx.base + 1000)
             plan, *_ = rnb.make_plan(fx.repo, fx.build, fx.exe, fx.pkg, 3, False, None)
             self.assertEqual(plan.steps, [])

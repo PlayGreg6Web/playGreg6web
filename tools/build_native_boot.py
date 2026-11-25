@@ -8,8 +8,9 @@ executable that boots the guest in an ordinary, debuggable process
 1. every lifted shard (`lift/shard-NNNNN.ll`) and the registration table (`lift/functions.ll`) is
    compiled to a host object with the LLVM tools (`opt -O<n>` then `llc -O<n>`), in parallel,
    cached by content: the cache key is SHA-256 over the IR (or the build manifest's FNV-1a hash
-   of it, which lets `--delete-ir` drop compiled IR and still rebuild nothing), the flags and
-   the tool versions. A wasm64 build is accepted too: its IR is retargeted on the fly exactly like
+   of it, which lets `--delete-ir` drop compiled IR and still rebuild nothing), the flags,
+   the tool versions and the retargeting code. The cache is machine-wide and shared by every
+   checkout (see "Object cache" below). A wasm64 build is accepted too: its IR is retargeted on the fly exactly like
    `playgta6-recomp build --target native` would emit it (`recomp/src/lift/target.rs`: the
    datalayout line is dropped, the triple replaced, `attributes #0` set to
    `uwtable "target-cpu"="<cpu>"`).
@@ -30,11 +31,23 @@ Linker notes for multi-GB object sets: the MSVC link uses `/INCREMENTAL:NO`, `/O
 4 GiB). Objects are passed as CMake external-object sources (MSBuild hands them to `link`
 through its own response file).
 
+Object cache: `--cache-dir`, else `PLAYGTA6_OBJ_CACHE`, else `%LOCALAPPDATA%/playgta6/objcache`
+on Windows and `$XDG_CACHE_HOME/playgta6/objcache` (`~/.cache/...`) elsewhere: outside every
+checkout (game-derived objects never land in a repository), so agent worktrees reuse each
+other's objects. Entries are `<sha256 key>.obj|.o`, written to a unique temporary and renamed
+into place; a `<entry>.lock` file (kept fresh by a heartbeat, broken when stale) makes
+concurrent builds in other processes wait for an entry being compiled instead of compiling it
+twice. A hit refreshes the entry's access time. After a build, and with `--cache-trim` alone,
+the least recently used entries are removed until the cache fits `--cache-max-gb` (default
+40, `PLAYGTA6_OBJ_CACHE_MAX_GB`; 0 = never trim); entries used in the last 6 hours are kept
+(another build may be linking them).
+
 Pure Python 3 standard library. Usage:
 
     python tools/build_native_boot.py <recomp-out>/<module> [--out <dir>] [-O 1] [--jobs N]
         [--cpu x86-64-v3] [--triple <t>] [--llvm-bin <dir>] [--cache-dir <dir>] [--sample N]
-        [--delete-ir] [--no-link] [--debug-info] [--keep-going] [--json]
+        [--cache-max-gb N] [--delete-ir] [--no-link] [--debug-info] [--keep-going] [--json]
+    python tools/build_native_boot.py --cache-trim [--cache-dir <dir>] [--cache-max-gb N]
 
 Outputs go to `<module-dir>/native/` by default (inside the gitignored build output). Prints
 progress with per-shard timings and an ETA, a summary with object bytes and times, and the
@@ -47,9 +60,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -57,7 +73,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 SCHEMA_VERSION = 1
 # Bump whenever retarget_ir changes its output (part of the object cache key).
@@ -286,6 +302,207 @@ def find_llvm_tools(llvm_bin: Path | None, runner: CommandRunner = run_command) 
 
 
 # ---------------------------------------------------------------------------
+# Object cache (machine-wide, shared by all checkouts)
+# ---------------------------------------------------------------------------
+
+CACHE_ENV = "PLAYGTA6_OBJ_CACHE"
+CACHE_MAX_ENV = "PLAYGTA6_OBJ_CACHE_MAX_GB"
+DEFAULT_CACHE_MAX_GB = 40.0
+OBJ_SUFFIXES = (".obj", ".o")
+LOCK_SUFFIX = ".lock"
+TMP_MARK = ".tmp"
+LOCK_HEARTBEAT_S = 15.0  # a held lock's mtime is refreshed this often...
+LOCK_STALE_S = 120.0  # ...so one older than this belongs to a dead process
+LOCK_POLL_S = 0.5
+TRIM_GRACE_S = 6 * 3600.0  # entries used this recently are never trimmed (a build may be linking them)
+TMP_STALE_S = 24 * 3600.0  # temporaries of a killed compile are removed by a trim after this
+
+
+def default_cache_dir(env: Mapping[str, str] | None = None, windows: bool | None = None) -> Path:
+    """`PLAYGTA6_OBJ_CACHE`, else `%LOCALAPPDATA%/playgta6/objcache` (Windows) or
+    `$XDG_CACHE_HOME/playgta6/objcache`, `~/.cache/playgta6/objcache` (elsewhere)."""
+    env = os.environ if env is None else env
+    if env.get(CACHE_ENV):
+        return Path(env[CACHE_ENV]).expanduser()
+    windows = (os.name == "nt") if windows is None else windows
+    if windows:
+        root = Path(env["LOCALAPPDATA"]) if env.get("LOCALAPPDATA") else Path.home() / "AppData" / "Local"
+    else:
+        root = Path(env["XDG_CACHE_HOME"]) if env.get("XDG_CACHE_HOME") else Path.home() / ".cache"
+    return root / "playgta6" / "objcache"
+
+
+def default_cache_max_gb(env: Mapping[str, str] | None = None) -> float:
+    env = os.environ if env is None else env
+    raw = env.get(CACHE_MAX_ENV)
+    if not raw:
+        return DEFAULT_CACHE_MAX_GB
+    try:
+        return float(raw)
+    except ValueError as err:
+        raise NativeBootError(f"{CACHE_MAX_ENV}={raw!r} is not a number") from err
+
+
+def cache_entry_path(cache_dir: Path, key: str, suffix: str) -> Path:
+    """The cache file of `key` (a SHA-256 hex digest) with an object suffix."""
+    if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+        raise ValueError(f"not a cache key: {key!r}")
+    if suffix not in OBJ_SUFFIXES:
+        raise ValueError(f"not an object suffix: {suffix!r}")
+    return cache_dir / f"{key}{suffix}"
+
+
+def publish(tmp: Path, dest: Path) -> bool:
+    """Moves a finished temporary into the cache under its final name (atomic rename). Returns
+    False when another writer published the key first: its file (same content) is kept and
+    `tmp` dropped, so a reader never sees a partial object or one replaced while it links."""
+    try:
+        if not dest.exists():
+            os.replace(tmp, dest)
+            return True
+    except OSError:
+        if not dest.is_file():
+            tmp.unlink(missing_ok=True)
+            raise
+    tmp.unlink(missing_ok=True)
+    return False
+
+
+def mark_used(path: Path) -> None:
+    """Refreshes the access time (the LRU clock); the mtime, which link steps watch, is kept."""
+    try:
+        os.utime(path, (time.time(), path.stat().st_mtime))
+    except OSError:
+        pass
+
+
+class _LockHeartbeat:
+    """Refreshes the mtime of every lock this process holds, so other processes can tell the
+    lock of a live compile from one left behind by a killed process."""
+
+    def __init__(self) -> None:
+        self._paths: set[Path] = set()
+        self._guard = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def add(self, path: Path) -> None:
+        with self._guard:
+            self._paths.add(path)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="objcache-heartbeat", daemon=True)
+                self._thread.start()
+
+    def discard(self, path: Path) -> None:
+        with self._guard:
+            self._paths.discard(path)
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(LOCK_HEARTBEAT_S)
+            with self._guard:
+                paths = list(self._paths)
+            for path in paths:
+                try:
+                    os.utime(path)
+                except OSError:
+                    pass
+
+
+_HEARTBEAT = _LockHeartbeat()
+
+
+def try_lock(lock: Path, stale_s: float | None = None) -> bool:
+    """Creates `lock` exclusively. False when another process holds it; a stale lock (its
+    heartbeat stopped) is removed so that the next attempt can take it."""
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return False  # released meanwhile: the caller looks again
+        if age > (LOCK_STALE_S if stale_s is None else stale_s):
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        return False
+    except PermissionError:  # Windows: the previous lock file is still being deleted
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"{os.getpid()} {socket.gethostname()}\n")
+    _HEARTBEAT.add(lock)
+    return True
+
+
+def release_lock(lock: Path) -> None:
+    _HEARTBEAT.discard(lock)
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+
+
+@dataclass(frozen=True)
+class TrimResult:
+    entries: int
+    bytes_before: int
+    removed: int
+    bytes_removed: int
+    recent_kept: int  # entries kept over the cap because they were used within the grace period
+
+    @property
+    def bytes_after(self) -> int:
+        return self.bytes_before - self.bytes_removed
+
+
+def trim_cache(
+    cache_dir: Path, max_bytes: int, grace_s: float = TRIM_GRACE_S, now: float | None = None
+) -> TrimResult:
+    """Removes the least recently used entries (by the newer of access time and mtime) until the
+    cache holds at most `max_bytes`. Entries used within `grace_s` and files in use (Windows)
+    are kept. Also removes temporaries and locks left behind by killed compiles."""
+    now = time.time() if now is None else now
+    if not cache_dir.is_dir():
+        return TrimResult(0, 0, 0, 0, 0)
+    entries: list[tuple[float, int, Path]] = []
+    for entry in os.scandir(cache_dir):
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        name = entry.name
+        if name.endswith(LOCK_SUFFIX) or TMP_MARK in name:
+            if now - st.st_mtime > (LOCK_STALE_S if name.endswith(LOCK_SUFFIX) else TMP_STALE_S):
+                try:
+                    os.unlink(entry.path)
+                except OSError:
+                    pass
+            continue
+        if name.endswith(OBJ_SUFFIXES):
+            entries.append((max(st.st_atime, st.st_mtime), st.st_size, Path(entry.path)))
+    entries.sort(key=lambda e: e[0])
+    before = total = sum(size for _, size, _ in entries)
+    removed = bytes_removed = recent = 0
+    for i, (used, size, path) in enumerate(entries):
+        if total <= max_bytes:
+            break
+        if now - used < grace_s:
+            recent = len(entries) - i  # oldest first: all the rest is newer still
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue  # in use (being linked) or already removed by another trim
+        total -= size
+        removed += 1
+        bytes_removed += size
+    return TrimResult(len(entries), before, removed, bytes_removed, recent)
+
+
+# ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
 
@@ -325,9 +542,25 @@ class UnitResult:
         return self.obj.stat().st_size if self.obj is not None and self.obj.is_file() else 0
 
 
+def _retarget_fingerprint() -> str:
+    """Hash of the retargeting code: the shared cache outlives branches, so a retarget_ir change
+    without a RETARGET_VERSION bump must not reuse objects built by another checkout."""
+    try:
+        parts = [inspect.getsource(retarget_ir), inspect.getsource(_linkonce_global_with_comdat)]
+    except (OSError, TypeError):
+        parts = []
+    parts += [NATIVE_SWIZZLE_IR, WASM_SWIZZLE_CALL, NATIVE_SWIZZLE_CALL]
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+RETARGET_FINGERPRINT = _retarget_fingerprint()
+
+
 def cache_key(unit: Unit, cfg: CompileConfig, content: bytes | None) -> str:
     h = hashlib.sha256()
-    h.update(f"playgta6-native-obj v{SCHEMA_VERSION} retarget {RETARGET_VERSION}\n".encode())
+    h.update(
+        f"playgta6-native-obj v{SCHEMA_VERSION} retarget {RETARGET_VERSION} {RETARGET_FINGERPRINT}\n".encode()
+    )
     h.update(("\n".join(cfg.flags()) + "\n" + cfg.tools.version + "\n").encode())
     if content is not None:
         h.update(hashlib.sha256(content).digest())
@@ -359,15 +592,37 @@ def _key_lock(key: str) -> threading.Lock:
 
 
 def _compile_keyed(unit: Unit, cfg: CompileConfig, runner: CommandRunner, key: str, start: float) -> UnitResult:
-    obj = cfg.cache_dir / f"{key}{cfg.obj_suffix}"
-    if obj.is_file():
-        return UnitResult(unit, obj, True, time.monotonic() - start)
+    obj = cache_entry_path(cfg.cache_dir, key, cfg.obj_suffix)
+    lock = obj.with_name(obj.name + LOCK_SUFFIX)
+    # Another process (another checkout) may be compiling the same key: wait for its object.
+    while not obj.is_file():
+        if try_lock(lock):
+            try:
+                if not obj.is_file():  # not published between the check and the lock
+                    return _compile_locked(unit, cfg, runner, key, obj, start)
+            finally:
+                release_lock(lock)
+            break
+        time.sleep(LOCK_POLL_S)
+    mark_used(obj)
+    return UnitResult(unit, obj, True, time.monotonic() - start)
+
+
+def _compile_locked(
+    unit: Unit, cfg: CompileConfig, runner: CommandRunner, key: str, obj: Path, start: float
+) -> UnitResult:
     if not unit.ll.is_file():
-        return UnitResult(unit, None, False, 0.0, f"{unit.ll.name} is missing (deleted IR?)")
+        return UnitResult(
+            unit, None, False, 0.0,
+            f"{unit.ll.name} is missing and its object is not cached (IR deleted by --delete-ir and the "
+            "object trimmed from the cache?): regenerate the program (run_native_boot.py --rebuild)",
+        )
     # Idempotent: wasm64 IR is retargeted, native IR gets the requested CPU.
     text = retarget_ir(_read(unit.ll).decode("utf-8"), cfg.triple, cfg.cpu)
-    bc = cfg.cache_dir / f"{key}.tmp.bc"
-    tmp_obj = cfg.cache_dir / f"{key}.tmp{cfg.obj_suffix}"
+    # Unique temporaries: a writer in another process never shares them.
+    token = secrets.token_hex(6)
+    bc = cfg.cache_dir / f"{key}.{token}{TMP_MARK}.bc"
+    tmp_obj = cfg.cache_dir / f"{key}.{token}{TMP_MARK}{cfg.obj_suffix}"
     opt = runner([str(cfg.tools.opt), f"-O{cfg.opt_level}", "-", "-o", str(bc)], text.encode("utf-8"))
     del text
     if opt.returncode != 0:
@@ -385,7 +640,8 @@ def _compile_keyed(unit: Unit, cfg: CompileConfig, runner: CommandRunner, key: s
     if llc.returncode != 0:
         return _failed(unit, cfg, start, "llc", llc, bc, tmp_obj)
     bc.unlink(missing_ok=True)
-    os.replace(tmp_obj, obj)
+    publish(tmp_obj, obj)
+    mark_used(obj)
     if cfg.delete_ir and unit.manifest_hash is not None:
         unit.ll.unlink(missing_ok=True)
     return UnitResult(unit, obj, False, time.monotonic() - start)
@@ -649,12 +905,27 @@ def _mib(n: int) -> str:
     return f"{n / (1 << 20):.1f} MiB"
 
 
+def _trim(cache_dir: Path, max_gb: float, say: Callable[[str], None], verbose: bool = False) -> dict | None:
+    """Trims the cache to `max_gb` (<= 0: never) and says what was removed."""
+    if max_gb <= 0:
+        if verbose:
+            say(f"cache {cache_dir}: no size cap (--cache-max-gb {max_gb:g}), nothing trimmed")
+        return None
+    res = trim_cache(cache_dir, int(max_gb * (1 << 30)))
+    if verbose or res.removed or res.recent_kept:
+        kept = f"; {res.recent_kept} recently used entries kept over the cap" if res.recent_kept else ""
+        say(f"cache {cache_dir}: {res.entries} entries, {_mib(res.bytes_before)}; removed {res.removed} "
+            f"least recently used ({_mib(res.bytes_removed)}), {_mib(res.bytes_after)} left "
+            f"(cap {max_gb:g} GB){kept}")
+    return {**dataclasses.asdict(res), "bytes_after": res.bytes_after, "max_gb": max_gb}
+
+
 def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command) -> int:
     parser = argparse.ArgumentParser(
         description="Compile a native-target recomp build and link the first-boot harness."
     )
     parser.add_argument(
-        "module_dir", type=Path,
+        "module_dir", type=Path, nargs="?",
         help="<recomp-out>/<module> of `build`, or the <out> directory of `build-program`",
     )
     parser.add_argument("--out", type=Path, help="output directory (default <input-dir>/native)")
@@ -663,7 +934,17 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
     parser.add_argument("--cpu", default=NATIVE_DEFAULT_CPU)
     parser.add_argument("--triple", default=None, help="default: the build's native triple or the host's")
     parser.add_argument("--llvm-bin", type=Path, default=None)
-    parser.add_argument("--cache-dir", type=Path, default=None, help="default <out>/obj-cache")
+    parser.add_argument(
+        "--cache-dir", type=Path, default=None,
+        help=f"object cache shared by all checkouts (default ${CACHE_ENV}, else "
+        "%%LOCALAPPDATA%%/playgta6/objcache on Windows, ~/.cache/playgta6/objcache elsewhere)",
+    )
+    parser.add_argument(
+        "--cache-max-gb", type=float, default=None,
+        help=f"trim the cache to this size after a build (default ${CACHE_MAX_ENV} or "
+        f"{DEFAULT_CACHE_MAX_GB:g}; 0 = never)",
+    )
+    parser.add_argument("--cache-trim", action="store_true", help="only trim the cache to --cache-max-gb, then exit")
     parser.add_argument("--sample", type=int, default=0, help="compile N spread shards and extrapolate")
     parser.add_argument("--delete-ir", action="store_true", help="delete each .ll once compiled")
     parser.add_argument("--no-link", action="store_true")
@@ -676,6 +957,15 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
         print(msg, file=sys.stderr, flush=True)
 
     try:
+        cache_dir = (args.cache_dir or default_cache_dir()).resolve()
+        max_gb = args.cache_max_gb if args.cache_max_gb is not None else default_cache_max_gb()
+        if args.cache_trim:
+            trimmed = _trim(cache_dir, max_gb, say, verbose=True)
+            if args.json:
+                print(json.dumps({"cache": {"dir": str(cache_dir), "trim": trimmed}}, indent=2))
+            return 0
+        if args.module_dir is None:
+            parser.error("module_dir is required (unless --cache-trim)")
         inputs = load_inputs(args.module_dir)
         triple = args.triple
         if triple is None:
@@ -688,7 +978,7 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
             triple=triple,
             cpu=args.cpu,
             opt_level=args.opt_level,
-            cache_dir=(args.cache_dir or out_dir / "obj-cache").resolve(),
+            cache_dir=cache_dir,
             log_dir=out_dir / "logs",
             tools=tools,
             delete_ir=args.delete_ir,
@@ -696,11 +986,12 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
         units = sample_units(inputs.units, args.sample) if args.sample > 0 else inputs.units
         say(
             f"{inputs.label} ({inputs.target}): {len(units)} unit(s) -> {triple} "
-            f"cpu {args.cpu} -O{args.opt_level}, {args.jobs} job(s); {tools.version}"
+            f"cpu {args.cpu} -O{args.opt_level}, {args.jobs} job(s); {tools.version}; cache {cache_dir}"
         )
         t0 = time.monotonic()
         results = compile_all(units, cfg, args.jobs, runner, args.keep_going, say)
         compile_s = time.monotonic() - t0
+        trimmed = _trim(cache_dir, max_gb, say)
         failed = [r for r in results if r.error]
         built = [r for r in results if not r.error and not r.cached]
         obj_bytes = sum(r.obj_bytes for r in results)
@@ -715,6 +1006,7 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
             "compile_seconds": round(compile_s, 1),
             "cpu_seconds": round(sum(r.seconds for r in results), 1),
             "object_bytes": obj_bytes,
+            "cache": {"dir": str(cache_dir), "trim": trimmed},
         }
         say(
             f"compiled {len(built)}, cached {summary['cached']}, failed {len(failed)} in "
