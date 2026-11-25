@@ -103,6 +103,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// After windows.h.
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #else
 #include <execinfo.h>
 #include <pthread.h>
@@ -473,6 +476,38 @@ void profile_thread_started(uint32_t thread_id) {
     }
 }
 
+// Host function containing `pc` from the harness PDB (build_native_boot.py --debug-info) or a
+// system module's exports, or "" (no symbols). Only the sampler thread calls it (DbgHelp is
+// single-threaded); results are cached per PC.
+std::string profile_symbol(uint64_t pc) {
+    static bool initialized = false;
+    static bool available = false;
+    static std::unordered_map<uint64_t, std::string> cache;
+    if (!initialized) {
+        initialized = true;
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        available = SymInitialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+    }
+    if (!available) {
+        return {};
+    }
+    const auto it = cache.find(pc);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 256] = {};
+    auto* info = reinterpret_cast<SYMBOL_INFO*>(storage);
+    info->SizeOfStruct = sizeof(SYMBOL_INFO);
+    info->MaxNameLen = 255;
+    DWORD64 displacement = 0;
+    std::string name;
+    if (SymFromAddr(GetCurrentProcess(), pc, &displacement, info)) {
+        name.assign(info->Name, info->NameLen);
+    }
+    cache.emplace(pc, name);
+    return name;
+}
+
 std::string profile_label(uint64_t pc, uint32_t thread_id) {
     uint64_t offset = 0;
     if (const uint64_t fn = guest::guest_function_for_host_pc(pc, &offset)) {
@@ -489,6 +524,10 @@ std::string profile_label(uint64_t pc, uint32_t thread_id) {
         GetModuleFileNameA(module, path, MAX_PATH);
         const char* base = std::strrchr(path, '\\');
         where = std::string("os ") + (base != nullptr ? base + 1 : path);
+    }
+    const std::string symbol = profile_symbol(pc);
+    if (!symbol.empty()) {
+        where += " " + symbol;
     }
     const std::string last = guest::guest_thread_last_import(thread_id);
     return where + " (last import " + (last.empty() ? "none" : last) + ")";
