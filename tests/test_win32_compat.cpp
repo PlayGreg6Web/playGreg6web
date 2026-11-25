@@ -1286,7 +1286,74 @@ void test_windows() {
 
 }  // namespace
 
+// Game data on HTTPFS: attribute queries only open the file, and a file's size is probed once
+// (the probe is ~2*log2(size) range reads) and reused by later handles to the same path.
+void test_httpfs_size_cache() {
+    using playgta6::os::HttpfsMailbox;
+    using playgta6::os::HttpfsMailboxClient;
+    using playgta6::os::HttpfsOp;
+    using playgta6::os::HttpfsStatus;
+    HttpfsMailbox mailbox{};
+    HttpfsMailboxClient::init_mailbox(mailbox);
+    const uint64_t kSize = 123457;
+    int opens = 0;
+    int reads = 0;
+    HttpfsMailboxClient client(&mailbox, [&](HttpfsMailbox& mb) {
+        if (mb.op == static_cast<uint32_t>(HttpfsOp::Open)) {
+            const std::string path(reinterpret_cast<const char*>(mb.payload),
+                                   static_cast<size_t>(mb.length));
+            ++opens;
+            if (path.size() >= 7 && path.compare(path.size() - 7, 7, "big.rpf") == 0) {
+                HttpfsMailboxClient::complete_response(mb, 3);
+            } else {
+                HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
+            }
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Read)) {
+            ++reads;
+            const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
+            std::memset(mb.payload, 0x5A, static_cast<size_t>(n));
+            HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
+        } else {
+            HttpfsMailboxClient::complete_response(mb, 0);
+        }
+    });
+    set_httpfs_client(&client);
+
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\big.rpf") == FILE_ATTRIBUTE_READONLY);
+    CHECK(opens == 1 && reads == 0);
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\missing.rpf") == kInvalidAttrs);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+
+    const Handle a = CreateFileW(u"G:\\data\\big.rpf", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    CHECK(a != INVALID_HANDLE_VALUE);
+    int64_t size = 0;
+    CHECK(GetFileSizeEx(a, &size) && static_cast<uint64_t>(size) == kSize);
+    const int probe_reads = reads;
+    CHECK(probe_reads > 2);
+    CloseHandle(a);
+
+    const Handle b = CreateFileW(u"G:\\data\\big.rpf", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    CHECK(b != INVALID_HANDLE_VALUE);
+    size = 0;
+    CHECK(GetFileSizeEx(b, &size) && static_cast<uint64_t>(size) == kSize);
+    CHECK(reads == probe_reads);  // served from the per-path cache
+    CloseHandle(b);
+
+    // A new client starts with an empty cache.
+    set_httpfs_client(nullptr);
+    set_httpfs_client(&client);
+    const Handle c = CreateFileW(u"G:\\data\\big.rpf", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    CHECK(GetFileSizeEx(c, &size) && static_cast<uint64_t>(size) == kSize);
+    CHECK(reads == 2 * probe_reads);
+    CloseHandle(c);
+    set_httpfs_client(nullptr);
+}
+
 int main() {
+    test_httpfs_size_cache();
     test_directories_and_attributes();
     test_find_files();
     test_file_times_and_handles();

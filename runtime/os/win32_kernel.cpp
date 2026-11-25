@@ -114,6 +114,7 @@ struct FileObject final : KernelObject {
     std::string userdata_key;
     HttpfsMailboxClient* httpfs_client = nullptr;
     int32_t httpfs_handle = -1;
+    std::string httpfs_key;  // normalized path of a read-only HTTPFS file (size cache key)
     bool has_cached_size = false;
     uint64_t cached_size = 0;
 };
@@ -289,6 +290,40 @@ bool equals_ascii_ci(std::string_view a, std::string_view b) {
     return true;
 }
 
+// Sizes of read-only HTTPFS game files by normalized path. The size probe below costs about
+// 2*log2(size) mailbox roundtrips (each one an HTTP range read in the browser), and the guest
+// asks again for every handle (GetFileAttributes* / GetFileSizeEx open, probe and close the
+// file each time), so a file's size is resolved once per client. Cleared when the client changes.
+struct HttpfsSizeCache {
+    std::mutex mutex;
+    std::unordered_map<std::string, uint64_t> sizes;
+};
+
+HttpfsSizeCache& httpfs_size_cache() {
+    static HttpfsSizeCache cache;
+    return cache;
+}
+
+bool lookup_httpfs_size(const std::string& key, uint64_t& out_size) {
+    HttpfsSizeCache& cache = httpfs_size_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    const auto it = cache.sizes.find(key);
+    if (it == cache.sizes.end()) {
+        return false;
+    }
+    out_size = it->second;
+    return true;
+}
+
+void remember_httpfs_size(const FileObject& file, uint64_t size) {
+    if (file.httpfs_key.empty() || file.httpfs_client != g_httpfs_client.load(std::memory_order_acquire)) {
+        return;
+    }
+    HttpfsSizeCache& cache = httpfs_size_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.sizes[file.httpfs_key] = size;
+}
+
 bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
     if (file.has_cached_size) {
         out_size = file.cached_size;
@@ -296,6 +331,11 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
     }
     if (file.httpfs_client == nullptr || file.httpfs_handle < 0) {
         return false;
+    }
+    if (!file.httpfs_key.empty() && lookup_httpfs_size(file.httpfs_key, out_size)) {
+        file.cached_size = out_size;
+        file.has_cached_size = true;
+        return true;
     }
 
     uint8_t probe = 0;
@@ -307,6 +347,7 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
         file.cached_size = 0;
         file.has_cached_size = true;
         out_size = 0;
+        remember_httpfs_size(file, 0);
         return true;
     }
 
@@ -344,6 +385,7 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
     file.cached_size = lo;
     file.has_cached_size = true;
     out_size = lo;
+    remember_httpfs_size(file, lo);
     return true;
 }
 
@@ -459,6 +501,7 @@ Handle create_file_impl(std::string_view raw_path,
     file->desired_access = desired_access;
     file->httpfs_client = client;
     file->httpfs_handle = hfs_handle;
+    file->httpfs_key = normalized;
     SetLastError(ERROR_SUCCESS);
     return handle_table().insert(std::move(file));
 }
@@ -510,6 +553,9 @@ TlsTable* get_tls_table() {
 }
 
 void set_httpfs_client(HttpfsMailboxClient* client) {
+    HttpfsSizeCache& cache = httpfs_size_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.sizes.clear();
     g_httpfs_client.store(client, std::memory_order_release);
 }
 

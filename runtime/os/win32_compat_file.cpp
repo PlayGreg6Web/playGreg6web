@@ -57,14 +57,20 @@ Query query_from_entry(const UserdataEntry& e) {
     return q;
 }
 
-// Probes a read-only game-data file through the file backend (CreateFileA/GetFileSizeEx), keeping
-// the caller's last error intact. Returns ERROR_SUCCESS or the open error.
+// Probes a read-only game-data file through the file backend (CreateFileA, plus GetFileSizeEx when
+// `size` is non-null), keeping the caller's last error intact. Returns ERROR_SUCCESS or the open
+// error. Callers that only need existence/attributes pass null: on HTTPFS the size probe is a
+// series of range reads, far more than the open.
 uint32_t probe_game_file(const std::string& key, uint64_t* size) {
     const Handle h = CreateFileA(key.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, kNullHandle);
     if (h == INVALID_HANDLE_VALUE) {
         const uint32_t err = GetLastError();
         return err == ERROR_SUCCESS ? ERROR_FILE_NOT_FOUND : err;
+    }
+    if (size == nullptr) {
+        CloseHandle(h);
+        return ERROR_SUCCESS;
     }
     int64_t file_size = 0;
     const bool ok = GetFileSizeEx(h, &file_size);
@@ -73,7 +79,8 @@ uint32_t probe_game_file(const std::string& key, uint64_t* size) {
     return ERROR_SUCCESS;
 }
 
-uint32_t query_resolved(const ResolvedPath& rp, Query* q) {
+// `need_size` false leaves q->size 0 for game data (attribute/existence queries).
+uint32_t query_resolved(const ResolvedPath& rp, Query* q, bool need_size = true) {
     *q = Query{};
     if (rp.is_userdata) {
         UserdataEntry e;
@@ -91,7 +98,7 @@ uint32_t query_resolved(const ResolvedPath& rp, Query* q) {
         return ERROR_SUCCESS;
     }
     uint64_t size = 0;
-    const uint32_t err = probe_game_file(rp.key, &size);
+    const uint32_t err = probe_game_file(rp.key, need_size ? &size : nullptr);
     if (err != ERROR_SUCCESS) {
         return err;
     }
@@ -212,7 +219,7 @@ int32_t pg6_win32_delete_file_w(const char16_t* file_name) {
             err = win32::userdata_delete_file(rp.key);
         } else {
             win32::Query q;
-            const uint32_t qerr = win32::query_resolved(rp, &q);
+            const uint32_t qerr = win32::query_resolved(rp, &q, false);
             err = qerr == win32::ERROR_SUCCESS ? win32::ERROR_ACCESS_DENIED : qerr;
         }
     }
@@ -225,7 +232,7 @@ uint32_t pg6_win32_get_file_attributes_w(const char16_t* file_name) {
     uint32_t err = cd::resolve_path(file_name, &rp);
     win32::Query q;
     if (err == win32::ERROR_SUCCESS) {
-        err = win32::query_resolved(rp, &q);
+        err = win32::query_resolved(rp, &q, false);
     }
     if (err != win32::ERROR_SUCCESS) {
         win32::SetLastError(err);
@@ -244,7 +251,7 @@ uint32_t pg6_win32_get_file_attributes_a(const char* file_name) {
     uint32_t err = cd::resolve_path_utf8(file_name, &rp);
     win32::Query q;
     if (err == win32::ERROR_SUCCESS) {
-        err = win32::query_resolved(rp, &q);
+        err = win32::query_resolved(rp, &q, false);
     }
     if (err != win32::ERROR_SUCCESS) {
         win32::SetLastError(err);
@@ -291,7 +298,7 @@ int32_t pg6_win32_set_file_attributes_w(const char16_t* file_name, uint32_t file
             err = win32::userdata_set_attributes(rp.key, file_attributes);
         } else {
             win32::Query q;
-            const uint32_t qerr = win32::query_resolved(rp, &q);
+            const uint32_t qerr = win32::query_resolved(rp, &q, false);
             err = qerr == win32::ERROR_SUCCESS ? win32::ERROR_ACCESS_DENIED : qerr;
         }
     }
@@ -550,7 +557,7 @@ int32_t pg6_win32_get_disk_free_space_ex_w(const char16_t* directory_name,
         uint32_t err = cd::resolve_path(directory_name, &rp);
         win32::Query q;
         if (err == win32::ERROR_SUCCESS) {
-            err = win32::query_resolved(rp, &q);
+            err = win32::query_resolved(rp, &q, false);
         }
         if (err != win32::ERROR_SUCCESS) {
             win32::SetLastError(err == win32::ERROR_FILE_NOT_FOUND ? win32::ERROR_PATH_NOT_FOUND : err);
@@ -591,7 +598,7 @@ int32_t pg6_win32_move_file_ex_w(const char16_t* existing_file_name,
     if (err == win32::ERROR_SUCCESS) {
         if (!from.is_userdata) {
             win32::Query q;
-            const uint32_t qerr = win32::query_resolved(from, &q);
+            const uint32_t qerr = win32::query_resolved(from, &q, false);
             err = qerr == win32::ERROR_SUCCESS ? win32::ERROR_ACCESS_DENIED : qerr;
         } else if (!to.is_userdata) {
             err = win32::ERROR_ACCESS_DENIED;
