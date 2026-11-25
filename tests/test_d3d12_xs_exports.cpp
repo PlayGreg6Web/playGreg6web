@@ -1229,6 +1229,17 @@ void test_resources() {
     const dg::TextureProbeTotals probe1 = dg::probe_texture_contents(1 << 20);
     CHECK(probe1.with_data == probe0.with_data + 1);
     CHECK(dg::probe_texture_contents(1 << 20).with_data == probe1.with_data);
+    // G66: a texture known only by a view at an address is counted too (in both totals and in the
+    // view-only part), once its memory holds data.
+    const uint64_t view_memory = com::guest_alloc(65536);
+    CHECK(dev->ensure_address_texture(view_memory, 77, 64, 64, 1, 1, 0x105, GpuTextureDimension::Dim2D, false) != 0);
+    const dg::TextureProbeTotals probe2 = dg::probe_texture_contents(1 << 20);
+    CHECK(probe2.views_registered == probe1.views_registered + 1 && probe2.registered == probe1.registered + 1);
+    CHECK(probe2.views_with_data == probe1.views_with_data && probe2.with_data == probe1.with_data);
+    CHECK(com::write_guest(view_memory + 4000, uint32_t{0x12345678}));
+    const dg::TextureProbeTotals probe3 = dg::probe_texture_contents(1 << 20);
+    CHECK(probe3.views_with_data == probe2.views_with_data + 1 && probe3.with_data == probe2.with_data + 1);
+    CHECK(dg::probe_texture_contents(1 << 20).views_with_data == probe3.views_with_data);
     // An Xbox D16_UNORM_S8_UINT (118) depth-stencil texture at title memory is accepted.
     dg::GuestResourceDesc d16s8 = texture_desc(256, 256, 118, 0x2);
     const uint64_t ds16 = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(d16s8)), I(0), I(0)},

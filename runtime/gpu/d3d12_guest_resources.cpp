@@ -16,11 +16,22 @@ namespace playgta6::gpu::d3d12_guest {
 
 namespace {
 
+// A texture known only by a view at an address (Device::ensure_address_texture): the first 64 KiB
+// of its memory, read through the CPU window.
+struct ViewProbe {
+    uint64_t cpu = 0;
+    uint64_t len = 0;
+    bool seen_data = false;
+};
+
 struct TextureProbe {
     std::mutex mutex;
     std::vector<Resource*> textures;
     size_t cursor = 0;
     uint64_t with_data = 0;
+    std::vector<ViewProbe> views;
+    size_t view_cursor = 0;
+    uint64_t views_with_data = 0;
 };
 
 TextureProbe& texture_probe() {
@@ -720,6 +731,20 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
                                                                 : ResourceDimension::Texture2D);
         tt.sample_count = 1;
         track_guest_texture(tt);
+        // "Textures with data" counter: the surface's bytes (console layouts), else the tight mip 0.
+        const bool is3d = dim == GpuTextureDimension::Dim3D;
+        uint64_t size = tiled_surface_bytes(d3d12_layout, dxgi_format, width, safe_height, is3d ? safe_depth : 1u,
+                                            safe_mips, is3d ? 1u : safe_depth);
+        if (size == 0) {
+            const DxgiFormatLayout l = dxgi_format_layout(dxgi_format);
+            size = l.known && l.block_width != 0 && l.block_height != 0
+                       ? uint64_t{(width + l.block_width - 1u) / l.block_width} *
+                             ((safe_height + l.block_height - 1u) / l.block_height) * l.block_bytes
+                       : 0u;
+        }
+        if (size != 0) {
+            register_view_texture_probe(cpu_address_for_gpu(gpu_va), size);
+        }
     }
 
     address_textures_.emplace(key, id);
@@ -1372,7 +1397,7 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
         }
         r->probe_seen_data_ = true;
         ++p.with_data;
-        if (p.with_data <= 64) {
+        if (p.with_data <= 64) {  // the log names resource textures; view-only ones are counted only
             const GuestResourceDesc& d = r->desc_;
             char line[256];
             std::snprintf(line, sizeof(line),
@@ -1383,10 +1408,34 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
             os::log(line);
         }
     }
+    for (size_t n = 0; n < budget && !p.views.empty(); ++n) {
+        p.view_cursor %= p.views.size();
+        ViewProbe& v = p.views[p.view_cursor++];
+        if (v.seen_data) {
+            continue;
+        }
+        const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(v.cpu, static_cast<size_t>(v.len)));
+        if (bytes == nullptr || std::all_of(bytes, bytes + v.len, [](uint8_t b) { return b == 0; })) {
+            continue;
+        }
+        v.seen_data = true;
+        ++p.views_with_data;
+    }
     TextureProbeTotals t;
-    t.registered = p.textures.size();
-    t.with_data = p.with_data;
+    t.views_registered = p.views.size();
+    t.views_with_data = p.views_with_data;
+    t.registered = p.textures.size() + t.views_registered;
+    t.with_data = p.with_data + t.views_with_data;
     return t;
+}
+
+void register_view_texture_probe(uint64_t cpu_address, uint64_t size) {
+    if (cpu_address == 0) {
+        return;
+    }
+    TextureProbe& p = texture_probe();
+    std::lock_guard<std::mutex> lock(p.mutex);
+    p.views.push_back(ViewProbe{cpu_address, std::min<uint64_t>(64u << 10, std::max<uint64_t>(1, size)), false});
 }
 
 void Resource::mark_back_buffer() {

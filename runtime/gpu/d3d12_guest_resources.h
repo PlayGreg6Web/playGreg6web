@@ -85,11 +85,17 @@ uint64_t native_stage_identity(const void* code, size_t code_size, const void* m
 // with readable guest memory is registered; probe_texture_contents() looks at up to `budget` of
 // them (round robin) and reports each the first time its first 64 KiB are not all zero (format,
 // size, mips, layout; once, through the log). Nothing is uploaded.
+// Textures known only by a view at an address (Xbox slots 70/71 and views decoded from descriptor
+// memory) are registered too and counted in both totals; most streamed textures are such views.
 struct TextureProbeTotals {
-    uint64_t registered = 0;  // live textures with guest memory
+    uint64_t registered = 0;  // live resource textures with guest memory + view-only textures
     uint64_t with_data = 0;   // of all registered so far, seen with non-zero memory
+    uint64_t views_registered = 0;  // the view-only part of `registered`
+    uint64_t views_with_data = 0;   // the view-only part of `with_data`
 };
 TextureProbeTotals probe_texture_contents(size_t budget);
+// Registers a view-only texture's memory (CPU address, surface size) with the probe.
+void register_view_texture_probe(uint64_t cpu_address, uint64_t size);
 
 class Heap final : public ChildBase<IHeapHost> {
 public:

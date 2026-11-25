@@ -963,10 +963,13 @@ int main(int argc, char** argv) {
             sample->counters.emplace_back("dstorage_bytes_delivered", ds.bytes_delivered);
             sample->counters.emplace_back("dstorage_decompressed_requests", ds.decompressed_requests);
             sample->counters.emplace_back("dstorage_file_reads", ds.file_reads);
-            // Textures the title fills by writing their memory (no upload call).
+            // Textures the title fills by writing their memory (no upload call): resource textures
+            // and view-only textures (the streamed ones), with the view-only part on its own too.
             const gpu::d3d12_guest::TextureProbeTotals probe = gpu::d3d12_guest::probe_texture_contents(256);
             sample->counters.emplace_back("textures_with_memory", probe.registered);
             sample->counters.emplace_back("textures_with_data", probe.with_data);
+            sample->counters.emplace_back("view_textures_with_memory", probe.views_registered);
+            sample->counters.emplace_back("view_textures_with_data", probe.views_with_data);
         });
     }
     // --input-script: a test tool that presses buttons on a schedule through the same InputState
