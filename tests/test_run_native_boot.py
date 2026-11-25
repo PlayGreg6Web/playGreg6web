@@ -181,7 +181,7 @@ class RunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))
             code, out, _, _ = fx.run("--preset", "start-screen", "--name", "s1", "--gpu-capture-frames", "3",
-                                     "--gpu-capture-payloads", "--shader-pack", "p.wgsl.pack",
+                                     "--gpu-capture-payloads", "--gpu-capture-thin-uploads", "4", "--shader-pack", "p.wgsl.pack",
                                      "--dump-pipelines", "work/dump", "--", "--survey")
             self.assertEqual(code, 0)
             run = fx.build / "runs" / "s1"
@@ -192,6 +192,7 @@ class RunTests(unittest.TestCase):
                            "--input-script"):
                 self.assertIn(expect, args)
             self.assertEqual(args[args.index("--gpu-capture-frames") + 1], "3")
+            self.assertEqual(args[args.index("--gpu-capture-thin-uploads") + 1], "4")
             self.assertEqual(args[args.index("--max-ms") + 1], "120000")
             script = (run / "input-script.txt").read_text().splitlines()
             self.assertEqual(script[1], "5000 A 100")

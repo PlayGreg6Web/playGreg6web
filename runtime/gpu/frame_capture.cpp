@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -47,6 +48,9 @@ struct CaptureState {
     std::vector<PresentSample> presents;
     std::vector<Omitted> omitted;
     uint64_t omitted_bytes = 0;
+    uint64_t thinned_packets = 0;
+    uint64_t thinned_bytes = 0;
+    std::map<uint64_t, uint64_t> big_writes;  // (opcode, id) -> large writes seen
     std::chrono::steady_clock::time_point start;
     std::atomic<FrameCaptureCounters> counters{nullptr};
 };
@@ -126,6 +130,27 @@ void write_packet(CaptureState& s, const GpuPacketHeader& h, const uint8_t* pack
         std::memcpy(head.data() + len_off, &zero, sizeof(zero));
         write_bytes(s, &out, sizeof(out));
         write_bytes(s, head.data(), head.size());
+    } else if (s.config.thin_uploads > 1 && len_off >= 0 && h.payload_bytes > fixed &&
+               (h.opcode == static_cast<uint16_t>(GpuOpcode::WriteBuffer) ||
+                h.opcode == static_cast<uint16_t>(GpuOpcode::WriteTexture)) &&
+               h.payload_bytes - fixed > s.config.thin_min_bytes) {
+        uint32_t id = 0;  // id / texture_id is the first field of both payloads
+        std::memcpy(&id, payload, sizeof(id));
+        const uint64_t n = s.big_writes[(static_cast<uint64_t>(h.opcode) << 32) | id]++;
+        if (n % s.config.thin_uploads == 0) {
+            write_bytes(s, packet, sizeof(h) + h.payload_bytes);
+        } else {
+            s.thinned_packets++;
+            s.thinned_bytes += h.payload_bytes - fixed;
+            GpuPacketHeader out = h;
+            out.payload_bytes = static_cast<uint32_t>(fixed);
+            std::vector<uint8_t> head(payload, payload + fixed);
+            const uint32_t zero = 0;
+            std::memcpy(head.data() + len_off, &zero, sizeof(zero));
+            std::memcpy(head.data() + fixed - sizeof(uint32_t), &kThinUploadMarker, sizeof(uint32_t));  // reserved
+            write_bytes(s, &out, sizeof(out));
+            write_bytes(s, head.data(), head.size());
+        }
     } else {
         write_bytes(s, packet, sizeof(h) + h.payload_bytes);
     }
@@ -219,6 +244,8 @@ bool frame_capture_start(const FrameCaptureConfig& config) {
     s.open = true;
     s.active = true;
     s.bytes = s.packets = s.omitted_bytes = 0;
+    s.thinned_packets = s.thinned_bytes = 0;
+    s.big_writes.clear();
     s.current = FrameRecord{};
     s.frames.clear();
     s.presents.clear();
@@ -264,9 +291,10 @@ void frame_capture_finish() {
                  "{\n  \"schema\": \"playgta6-frame-capture\",\n  \"schema_version\": 1,\n  \"trace\": \"%s\",\n"
                  "  \"payloads\": \"%s\",\n  \"frames_requested\": %u,\n  \"frames_complete\": %zu,\n"
                  "  \"presents_seen\": %zu,\n  \"packets\": %" PRIu64 ",\n  \"bytes\": %" PRIu64 ",\n"
-                 "  \"omitted_bytes\": %" PRIu64 ",\n  \"frames\": [",
+                 "  \"omitted_bytes\": %" PRIu64 ",\n  \"thinned_packets\": %" PRIu64 ",\n  \"thinned_bytes\": %" PRIu64
+                 ",\n  \"frames\": [",
                  json_escape(name).c_str(), s.config.keep_payloads ? "kept" : "omitted", s.config.frames,
-                 s.frames.size(), s.presents.size(), s.packets, s.bytes, s.omitted_bytes);
+                 s.frames.size(), s.presents.size(), s.packets, s.bytes, s.omitted_bytes, s.thinned_packets, s.thinned_bytes);
     for (size_t i = 0; i < s.frames.size(); ++i) {
         const FrameRecord& f = s.frames[i];
         std::fprintf(side,

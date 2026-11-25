@@ -32,10 +32,18 @@
 
 namespace playgta6::gpu {
 
+constexpr uint32_t kThinUploadMarker = 0x6e696874u;  // 'thin' in the reserved field
+
 struct FrameCaptureConfig {
     std::string path;          // .pg6trace output; the sidecar is path + ".json"
     uint32_t frames = 10;      // complete frames to capture (>= 1)
     bool keep_payloads = false;
+    // keep_payloads only: for a WriteTexture/WriteBuffer whose data is larger than thin_min_bytes, store
+    // the payload of every thin_uploads-th write to the same texture/buffer (the first one included);
+    // the others become a marker packet (data_len 0, reserved == kThinUploadMarker) so the frame
+    // structure stays intact and a replay keeps the last stored contents. 0 or 1 = off.
+    uint32_t thin_uploads = 0;
+    uint32_t thin_min_bytes = 4u << 20;
     bool attach = true;        // install the os::wgpu_submit observer (tests feed frame_capture_observe)
 };
 

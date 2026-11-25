@@ -165,11 +165,60 @@ void test_capture_keeps_payloads_on_request() {
     std::filesystem::remove(path + ".json");
 }
 
+void test_capture_thins_large_uploads() {
+    const std::string path = (std::filesystem::temp_directory_path() / "pg6_test_capture_thin.pg6trace").string();
+    fc::FrameCaptureConfig config;
+    config.path = path;
+    config.frames = 1;
+    config.keep_payloads = true;
+    config.thin_uploads = 3;
+    config.thin_min_bytes = 100;
+    CHECK(fc::frame_capture_start(config));
+    const std::vector<uint8_t> big(1000, 7), small(50, 9);
+    CommandEncoder e;
+    e.begin_frame();
+    for (int i = 0; i < 7; ++i) {
+        e.write_buffer(5, 0, big.data(), static_cast<uint32_t>(big.size()));
+    }
+    e.write_buffer(6, 0, big.data(), static_cast<uint32_t>(big.size()));  // other buffer: first write kept
+    for (int i = 0; i < 4; ++i) {
+        e.write_buffer(7, 0, small.data(), static_cast<uint32_t>(small.size()));  // below threshold: all kept
+    }
+    e.present();
+    submit(e);
+    fc::frame_capture_finish();
+    bool ok = false;
+    const std::vector<uint8_t> trace = read_file(path);
+    const std::vector<Packet> ps = packets_of(trace, &ok);
+    CHECK(ok && ps.size() == 14);
+    const uint32_t full = sizeof(GpuWriteBufferPayload) + 1000;
+    for (int i = 0; i < 7; ++i) {
+        const Packet& p = ps[1 + i];
+        const bool kept = i % 3 == 0;  // writes 0, 3, 6
+        CHECK(p.payload_bytes == (kept ? full : sizeof(GpuWriteBufferPayload)));
+        GpuWriteBufferPayload wb{};
+        std::memcpy(&wb, trace.data() + p.offset + sizeof(GpuPacketHeader), sizeof(wb));
+        CHECK(wb.id == 5 && wb.data_len == (kept ? 1000u : 0u));
+        CHECK(wb.reserved == (kept ? 0u : fc::kThinUploadMarker));
+    }
+    CHECK(ps[8].payload_bytes == full);
+    for (int i = 9; i < 13; ++i) {
+        CHECK(ps[i].payload_bytes == sizeof(GpuWriteBufferPayload) + 50);
+    }
+    const std::vector<uint8_t> side_bytes = read_file(path + ".json");
+    const std::string side(side_bytes.begin(), side_bytes.end());
+    CHECK(side.find("\"thinned_packets\": 4") != std::string::npos);
+    CHECK(side.find("\"thinned_bytes\": 4000") != std::string::npos);
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".json");
+}
+
 }  // namespace
 
 int main() {
     test_capture_omits_payloads_and_stops();
     test_capture_keeps_payloads_on_request();
+    test_capture_thins_large_uploads();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_frame_capture: %d failure(s)\n", g_failures);
         return 1;

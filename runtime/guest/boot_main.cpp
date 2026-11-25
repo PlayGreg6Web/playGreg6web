@@ -43,6 +43,7 @@
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --gpu-capture-frames <n>  frames to capture (default 10)
+//   --gpu-capture-thin-uploads <n>  with payloads: keep only every nth write of a texture/buffer > 4 MiB
 //   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
 //   --arena-log-limit <n>     address-space events kept in the report log (default 4096)
 //   --no-tls-callbacks / --no-entry / --quiet
@@ -172,6 +173,7 @@ struct Options {
     std::string gpu_capture;          // --gpu-capture: .pg6trace path
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
+    uint64_t gpu_capture_thin_uploads = 0;
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
     bool no_fence_lag = false;      // d3d12 DeviceOptions::fence_publish_lag = false
     std::string profile;            // --profile: per-thread host PC samples (Windows)
@@ -276,13 +278,14 @@ bool parse(int argc, char** argv, Options& o) {
             target = v;
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
-                   a == "--console-mode" || a == "--gpu-capture-frames" || a == "--arena-log-limit" ||
+                   a == "--console-mode" || a == "--gpu-capture-frames" || a == "--gpu-capture-thin-uploads" || a == "--arena-log-limit" ||
                    a == "--dstorage-workers" || a == "--profile-interval-us" || a == "--wgpu-features") {
             if (!value(v)) {
                 return false;
             }
             uint64_t& target = a == "--max-calls"     ? o.max_calls
                                : a == "--gpu-capture-frames" ? o.gpu_capture_frames
+                               : a == "--gpu-capture-thin-uploads" ? o.gpu_capture_thin_uploads
                                : a == "--arena-log-limit" ? o.arena_log_limit
                                : a == "--console-mode" ? o.console_mode
                                : a == "--dstorage-workers" ? o.dstorage_workers
@@ -974,6 +977,7 @@ int main(int argc, char** argv) {
         capture.path = g_options.gpu_capture;
         capture.frames = static_cast<uint32_t>(std::max<uint64_t>(1, g_options.gpu_capture_frames));
         capture.keep_payloads = g_options.gpu_capture_payloads;
+        capture.thin_uploads = static_cast<uint32_t>(g_options.gpu_capture_thin_uploads);
         if (!gpu::frame_capture_start(capture)) {
             std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
             return kExitUsage;

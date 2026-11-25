@@ -23,7 +23,7 @@ What it does, in order:
    (240 s limit; A every 2.5 s from 20 s, then D-pad Down, Down, A through LEGAL NOTICES), `long`
    (600 s limit, 630 s watchdog). `--max-ms`, `--watchdog-ms`, `--input-script FILE`,
    `--shader-pack FILE`, `--gpu-capture-frames N` (captures into the run directory),
-   `--gpu-capture-payloads`, `--dump-pipelines DIR` and everything after `--` are passed through.
+   `--gpu-capture-payloads`, `--gpu-capture-thin-uploads N`, `--dump-pipelines DIR` and everything after `--` are passed through.
 3. The run lands in `<runs-dir>/<name>/`: `boot-report.json`, `summary.txt` (the harness text
    summary), `boot.log` (stdout and stderr), `capture.pg6trace` (+ `.json`, with a GPU capture),
    `input-script.txt` (with an input script), `import-trace.txt` (`--import-trace`),
@@ -288,6 +288,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--shader-pack", type=Path, help="WGPK shader pack")
     p.add_argument("--gpu-capture-frames", type=int, metavar="N", help="capture N frames into the run directory")
     p.add_argument("--gpu-capture-payloads", action="store_true", help="keep payloads in the capture")
+    p.add_argument("--gpu-capture-thin-uploads", type=int, metavar="N",
+                   help="with payloads: keep only every Nth write of a texture/buffer > 4 MiB")
     p.add_argument("--import-trace", action="store_true", help="write import-trace.txt")
     p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory under work/)")
     p.add_argument("--baseline", help="earlier run (name in the runs directory, or a directory) to compare with")
@@ -355,6 +357,8 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
                 "--gpu-capture-frames", str(args.gpu_capture_frames or 10)]
         if args.gpu_capture_payloads:
             cmd += ["--gpu-capture-payloads"]
+            if args.gpu_capture_thin_uploads:
+                cmd += ["--gpu-capture-thin-uploads", str(args.gpu_capture_thin_uploads)]
     if args.import_trace:
         cmd += ["--import-trace", str(run_dir / "import-trace.txt")]
     if args.dump_pipelines:
