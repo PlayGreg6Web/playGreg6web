@@ -44,6 +44,7 @@ const char* work_name(Work w) {
     case Work::CopiesSkipped: return "copies_skipped";
     case Work::ResourcesCreated: return "resources_created";
     case Work::ResourcesDestroyed: return "resources_destroyed";
+    case Work::ReflectionTableSlotsOutsideRs: return "reflection_table_slots_outside_rs";
     case Work::Count: break;
     }
     return "?";

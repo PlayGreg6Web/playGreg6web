@@ -298,8 +298,10 @@ void test_layout_join() {
     bad.bindings = {nb, off, tex, odd, sampler};
     report.clear();
     bridge::PipelineLayoutDesc untouched;
-    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad}}, &untouched, &report));
+    JoinStats failed_stats;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad}}, &untouched, &report, &failed_stats));
     CHECK(untouched.groups.empty());
+    CHECK(failed_stats.table_slots_outside_rs == 0);  // counted only when the join succeeds
     CHECK(report.find("@group(0) @binding(0) <- table at s12 + 0: no root parameter starts at s12") != std::string::npos);
     // A slot declared as another class joins the slot itself (no failure).
     CHECK(report.find("@binding(2)") == std::string::npos);
@@ -314,8 +316,10 @@ void test_layout_join() {
     extra.bindings[0].kind = ReflectedBindingKind::Texture;
     report.clear();
     bridge::PipelineLayoutDesc slots;
-    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &extra}}, &slots, &report));
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &extra}}, &slots, &report, &stats));
     CHECK(report.empty() && slots.groups.size() == 1 && slots.groups[0].bindings.size() == 2);
+    CHECK(stats.table_slots_outside_rs == 1);  // the slot past the ranges; the sampler is not a table slot
     if (slots.groups.size() == 1 && slots.groups[0].bindings.size() == 2) {
         const auto& t = slots.groups[0].bindings[0].join;
         CHECK(t.table_parameter == 0 && t.table_slot == 2 && t.register_class == d3d::DescriptorRangeType::Srv);

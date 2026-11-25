@@ -1322,6 +1322,9 @@ enum class Work : size_t {
     CopiesSkipped,
     ResourcesCreated,
     ResourcesDestroyed,
+    // Reflected descriptor-table bindings joined by table slot because the root signature does not
+    // declare that slot as their class (stage_reflection.h, #482), per pipeline state created.
+    ReflectionTableSlotsOutsideRs,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

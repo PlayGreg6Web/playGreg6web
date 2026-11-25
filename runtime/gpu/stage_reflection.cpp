@@ -607,8 +607,9 @@ int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute,
 }
 
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
-                          bridge::PipelineLayoutDesc* out, std::string* report) {
+                          bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats) {
     std::map<std::pair<uint32_t, uint32_t>, bridge::LayoutBinding> joined;
+    uint64_t outside_rs = 0;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -725,6 +726,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                             reg = space = 0;
                             lb.join.table_parameter = static_cast<uint32_t>(pi);
                             lb.join.table_slot = b.table_byte_offset / kTableSlotBytes;
+                            ++outside_rs;
                         }
                         break;
                     }
@@ -845,6 +847,9 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         layout.groups.resize(1);  // stages that bind nothing still get one (empty) group
     }
     *out = std::move(layout);
+    if (stats != nullptr) {
+        stats->table_slots_outside_rs += outside_rs;
+    }
     return true;
 }
 

@@ -141,8 +141,14 @@ struct ReflectedStageRef {
     uint32_t visibility = 0;  // GpuShaderStageBits
     const StageReflection* reflection = nullptr;
 };
+// Join statistics (added to on success only).
+struct JoinStats {
+    // Table bindings joined by slot (ShaderBinding::table_parameter): the root signature does not
+    // declare the slot, or declares it as another class.
+    uint64_t table_slots_outside_rs = 0;
+};
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
-                          bridge::PipelineLayoutDesc* out, std::string* report);
+                          bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats = nullptr);
 
 // Vertex attributes for a pack-resolved vertex stage: each reflected input is matched to the input
 // element of its slot that covers its byte offset. An element starting at that offset gives its own

@@ -2753,8 +2753,12 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
             if (ps_refl != nullptr) {
                 stages.push_back({GpuShaderStageBits::Fragment, ps_refl});
             }
+            JoinStats join_stats;
             ok = join_pipeline_layout(src.root_signature->signature().desc(), /*compute=*/false, stages,
-                                      &reflected_layout, &report) && ok;
+                                      &reflected_layout, &report, &join_stats) && ok;
+            if (ok) {
+                count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
+            }
         }
         if (!ok) {
             const uint64_t rs_hash = src.root_signature ? src.root_signature->signature().hash() : 0;
@@ -2980,12 +2984,14 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
         if (const StageReflectionIndex* refl = options_.stage_reflection.get(); refl != nullptr && pack_key != 0) {
             if (auto rit = refl->find(pack_key); rit != refl->end()) {
                 std::string report;
+                JoinStats join_stats;
                 const bool ok = static_cast<bool>(rs) &&
                                 join_pipeline_layout(rs->signature().desc(), /*compute=*/true,
                                                      {{GpuShaderStageBits::Compute, &rit->second}}, &reflected_layout,
-                                                     &report);
+                                                     &report, &join_stats);
                 if (ok) {
                     reflected = true;
+                    count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
                 } else {
                     const uint64_t rs_hash = rs ? rs->signature().hash() : 0;
                     std::lock_guard<std::mutex> lock(pack_mutex_);
