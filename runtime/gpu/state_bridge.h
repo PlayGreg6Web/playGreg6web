@@ -144,6 +144,7 @@ inline constexpr uint64_t NoComputePipeline = 1ull << 12;       // Dispatch with
 inline constexpr uint64_t CommandListClosed = 1ull << 13;       // call on a closed list ignored
 inline constexpr uint64_t ComponentMappingIgnored = 1ull << 14; // non-identity SRV swizzle
 inline constexpr uint64_t UnalignedUniform = 1ull << 15;        // uniform binding offset % 256, not relocated
+inline constexpr uint64_t UnalignedStorage = 1ull << 16;        // storage binding offset % 256, not relocated
 }  // namespace BridgeDiag
 
 // =====================================================================================================
@@ -166,6 +167,12 @@ struct BridgeOptions {
     // (false: no relocation, the binding is emitted as it is and diagnosed).
     std::function<bool(uint64_t gpu_va, uint64_t size, uint64_t binding_size, uint32_t* buffer_id, uint64_t* offset)>
         relocate_uniform;
+    // Read-only storage bindings whose offset is not a multiple of kStorageOffsetAlignment (WebGPU's
+    // minStorageBufferOffsetAlignment) are relocated through this hook: given the binding's GPU
+    // address and size it returns a buffer id and a 256-aligned offset holding the same bytes, kept
+    // current with guest memory (false: no relocation; the binding is emitted as it is, which
+    // WebGPU rejects, and diagnosed). Writable storage bindings are never relocated.
+    std::function<bool(uint64_t gpu_va, uint64_t size, uint32_t* buffer_id, uint64_t* offset)> relocate_storage;
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
@@ -177,6 +184,7 @@ struct BridgeOptions {
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
+inline constexpr uint64_t kStorageOffsetAlignment = 256;  // minStorageBufferOffsetAlignment
 // WebGPU's default maxUniformBufferBindingSize (also D3D12's 4096 x 16-byte constant buffer limit).
 inline constexpr uint64_t kMaxUniformBindingSize = 65536;
 
@@ -371,6 +379,10 @@ struct BridgeStats {
     // Uniform bindings smaller than the stage's block with no room in their buffer, bound as a
     // relocated copy zero-extended to the block size.
     uint64_t uniforms_zero_extended = 0;
+    // Read-only storage bindings at an offset that is not a multiple of 256, bound as a relocated
+    // copy at an aligned offset (relocated) or left as they are (unaligned: WebGPU rejects them).
+    uint64_t storage_relocated = 0;
+    uint64_t storage_unaligned = 0;
     // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
     // the bound heap: bound as null.
     uint64_t heap_index_misses = 0;

@@ -1053,6 +1053,115 @@ GpuBindGroupEntry2 bind_uniform_view(uint64_t view_offset, uint32_t view_size, u
     return out;
 }
 
+// A structured-buffer SRV / UAV whose first element is not 256-byte aligned, bound to a storage
+// layout entry: read-only storage is bound as a relocated copy (the hook gets the view's address
+// and bytes), writable storage is left as it is and diagnosed.
+GpuBindGroupEntry2 bind_storage_view(bool read_only, bool with_hook, uint64_t first_element,
+                                     std::vector<std::pair<uint64_t, uint64_t>>* calls, uint64_t* diagnostics,
+                                     bridge::BridgeStats* stats) {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    bridge::BridgeOptions options = counting_options(6000);
+    if (with_hook) {
+        options.relocate_storage = [calls](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+            calls->emplace_back(va, size);
+            *id = 888;
+            *offset = 1024;
+            return true;
+        };
+    }
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kBuf = 301;
+    constexpr uint64_t kVs = 0xD1, kPs = 0xD2, kBufVa = 0x20000;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_buffer(kBuf, kBufVa, 65536);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc vd;
+    vd.dimension = d3d::ViewDimension::Buffer;
+    vd.first_element = first_element;
+    vd.num_elements = 36;
+    vd.structure_byte_stride = 16;
+    if (read_only) {
+        CHECK(heaps.create_shader_resource_view(kBuf, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+    } else {
+        CHECK(heaps.create_unordered_access_view(kBuf, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+    }
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = read_only ? d3d::DescriptorRangeType::Srv : d3d::DescriptorRangeType::Uav;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    GpuBindGroupLayoutEntry entry = layout_entry(
+        0, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+        static_cast<uint8_t>(read_only ? GpuBufferBindingType::ReadOnlyStorage : GpuBufferBindingType::Storage));
+    group.bindings.push_back(
+        {entry, join(0, read_only ? d3d::DescriptorRangeType::Srv : d3d::DescriptorRangeType::Uav, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {view_heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+    list.IASetVertexBuffers(0, 1, &vb);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+    *diagnostics = list.diagnostics();
+    *stats = list.stats();
+    GpuBindGroupEntry2 out{};
+    for (const Packet& packet : decode(enc)) {
+        if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
+            out = pod<GpuBindGroupEntry2>(packet, sizeof(GpuCreateBindGroup2Payload));
+        }
+    }
+    return out;
+}
+
+void test_unaligned_storage_relocated() {
+    std::vector<std::pair<uint64_t, uint64_t>> calls;
+    uint64_t diag = 0;
+    bridge::BridgeStats stats;
+    // Element 8 of 16 bytes = byte 128: relocated, the hook copies the view's 36 x 16 bytes.
+    const GpuBindGroupEntry2 moved = bind_storage_view(true, true, 8, &calls, &diag, &stats);
+    CHECK(moved.resource_id == 888 && moved.offset == 1024 && moved.size == 576);
+    CHECK(calls.size() == 1 && calls[0].first == 0x20000 + 128 && calls[0].second == 576);
+    CHECK((diag & bridge::BridgeDiag::UnalignedStorage) == 0 && stats.storage_relocated == 1);
+    // Element 16 = byte 256: aligned, bound in place.
+    calls.clear();
+    const GpuBindGroupEntry2 aligned = bind_storage_view(true, true, 16, &calls, &diag, &stats);
+    CHECK(aligned.resource_id == 301 && aligned.offset == 256 && calls.empty() && stats.storage_relocated == 0);
+    // No hook: emitted as it is, diagnosed.
+    const GpuBindGroupEntry2 kept = bind_storage_view(true, false, 8, &calls, &diag, &stats);
+    CHECK(kept.resource_id == 301 && kept.offset == 128);
+    CHECK((diag & bridge::BridgeDiag::UnalignedStorage) != 0 && stats.storage_unaligned == 1);
+    // Writable storage is never relocated (a copy would lose the shader's writes).
+    const GpuBindGroupEntry2 rw = bind_storage_view(false, true, 8, &calls, &diag, &stats);
+    CHECK(rw.resource_id == 301 && rw.offset == 128 && calls.empty());
+    CHECK((diag & bridge::BridgeDiag::UnalignedStorage) != 0 && stats.storage_unaligned == 1);
+}
+
 void test_reflected_uniform_min_size() {
     std::vector<std::pair<uint64_t, uint64_t>> calls;
     // Aligned view of 96 bytes: no minimum -> the rest of the buffer (the block size is unknown;
@@ -2318,6 +2427,7 @@ int main() {
     test_representative_command_list();
     test_unaligned_uniform_relocation();
     test_reflected_uniform_min_size();
+    test_unaligned_storage_relocated();
     test_bind_group_rebuild_and_retire();
     test_usage_conflict_is_diagnosed();
     test_barrier_flushes_pending_clears();

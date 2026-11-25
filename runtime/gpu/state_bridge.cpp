@@ -1220,6 +1220,32 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             out.resource_id = e.resource_id;
             out.offset = e.offset;
             out.size = e.size;
+            // Storage buffers too (minStorageBufferOffsetAlignment); the title's buffer views start at
+            // any element. Read-only ones are bound as a relocated copy at an aligned offset; a
+            // misaligned binding would invalidate the bind group and the whole command buffer.
+            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                (layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage) ||
+                 layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage)) &&
+                e.offset % kStorageOffsetAlignment != 0) {
+                const uint64_t base = device_.buffer_gpu_va(e.resource_id);
+                // Size 0 binds to the end of the buffer: relocate that much (the hook bounds it).
+                const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                const uint64_t size = e.size != 0 ? e.size : (allocated > e.offset ? allocated - e.offset : 0);
+                uint32_t id = 0;
+                uint64_t offset = 0;
+                if (layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage) &&
+                    base != 0 && size != 0 && device_.options().relocate_storage &&
+                    device_.options().relocate_storage(base + e.offset, size, &id, &offset) &&
+                    offset % kStorageOffsetAlignment == 0) {
+                    out.resource_id = id;
+                    out.offset = offset;
+                    out.size = size;
+                    ++stats_.storage_relocated;
+                } else {
+                    diagnostics_ |= BridgeDiag::UnalignedStorage;
+                    ++stats_.storage_unaligned;
+                }
+            }
             // WebGPU binds uniform buffers only at 256-byte aligned offsets; the title's constant
             // buffers are 16-byte aligned (Xbox). Relocate to a copy at an aligned offset.
             if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
