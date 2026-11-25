@@ -42,6 +42,7 @@ Tolerances: a value pair matches when |a - b| <= max(floor, rel * max(|a|, |b|))
   --count-tolerance REL                        for wall-clock dependent counts (default 0.05)
 Everything else must match exactly. `--ignore PATTERN` (repeatable, fnmatch on the field path,
 e.g. `milestones.*.elapsed_ms` or `address_space.*`) drops known-different fields.
+The report's `screen_timeline` (R40, tools/screen_timeline.py) is informational and never compared.
 
 Output is text by default and `--json` for automation. When GPU/draw/frame-pacing metrics (including
 `FIRST_VISIBLE_FRAME` and `black_loading_ms` / `blackLoadingMs`) are present in both reports, an

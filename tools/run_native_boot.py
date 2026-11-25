@@ -60,6 +60,7 @@ from typing import Callable, Mapping, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
+import screen_timeline  # noqa: E402
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".c", ".cmake", ".txt", ".rs", ".toml"}
@@ -312,6 +313,8 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     else:
         lines.append("stop: no fault")
     lines.append(f"import calls: {(report.get('counters') or {}).get('import_calls')}")
+    if report.get("screen_timeline"):
+        lines += screen_timeline.format_table(report["screen_timeline"])
     return "\n".join(lines)
 
 
@@ -449,6 +452,14 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if report is None:
         print(f"error: the harness (exit {code}) wrote no report; see {run_dir / 'boot.log'}", file=sys.stderr)
         return 3
+    presents = report.get("presents") or []
+    if presents and "screen_timeline" not in report:
+        times: list[float] = []
+        ipath = Path(args.input_script) if args.input_script else script_path
+        if ipath.is_file():
+            times = screen_timeline.parse_input_times(ipath.read_text(encoding="utf-8"))
+        report["screen_timeline"] = screen_timeline.build_timeline(presents, times)
+        (run_dir / "boot-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     text = digest(report, code)
     (run_dir / "digest.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
