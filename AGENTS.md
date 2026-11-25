@@ -43,6 +43,6 @@ Multiple humans and AI agents work on this repository in parallel across tracks 
 - `shaders/` — **Rust** offline `RDNA2 -> SPIR-V -> WGSL` (`naga`) translation and shader packing.
 - `server/` — Lightweight local HTTP server with `COOP`/`COEP` headers and HTTP `Range` (`206 Partial Content`) support.
 - `tools/` — **Rust + Python** local setup (`tools/local_env.py`), manifest/bootset builders, and diagnostics.
-- `docs/` — End goal, parallel workstreams, ABI contracts, and WebGPU/Wasm64 findings.
+- `docs/` — End goal, parallel workstreams, ABI contracts, and WebGPU/Wasm64 findings. Store/licence/user hard stops (owner decisions, do not implement): [docs/HARD_STOPS.md](./docs/HARD_STOPS.md).
 - `tests/` — Automated unit and integration tests.
 - `third_party/` — Open-source submodules/dependencies only (never game files).
