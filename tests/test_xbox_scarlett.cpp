@@ -1,8 +1,10 @@
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -246,6 +248,103 @@ void test_xmem_physical_virtual_and_transfer() {
     CHECK(pg6_xbox_XMemFreePhysicalPages(3, handles) == 1);
     // Double free fails cleanly.
     CHECK(pg6_xbox_XMemFreePhysicalPages(3, handles) == 0);
+}
+
+// R40: XMemMapPhysicalPages / unmap from many threads at once (their data work runs outside the
+// XMem lock): disjoint slots keep every thread's bytes, and threads fighting over the same slots
+// and pages leave every page's bytes intact and the accounting balanced. Both reservation kinds:
+// a physical one (native: the arena's shared zone) and a plain one (committed slot by slot).
+void test_xmem_concurrent_map_unmap() {
+    constexpr int kThreads = 8;
+    constexpr size_t kOwn = 4;     // slots (and pages) per thread, disjoint
+    constexpr size_t kShared = 3;  // slots every thread maps into
+    constexpr size_t kPool = 6;    // pages every thread maps
+    constexpr int kRounds = 40;
+    auto* arena = win32::get_vmem_arena();
+    for (const uint32_t type : {0x20400000u | win32::MEM_RESERVE, kXMemFlagLargePages | win32::MEM_RESERVE}) {
+        xmem_reset_for_testing();
+        const size_t slots = kThreads * kOwn + kShared + kPool;
+        void* res = pg6_xbox_XMemVirtualAlloc(nullptr, slots * kXMemPageSize64K, type, 0x21u, win32::PAGE_READWRITE);
+        CHECK(res != nullptr);
+        if (res == nullptr) {
+            continue;
+        }
+        const uint64_t base = arena->guest_address(res);
+        auto slot_va = [&](size_t i) { return base + i * kXMemPageSize64K; };
+        auto bytes = [&](size_t i) { return arena->translate(slot_va(i)); };
+        size_t n = kThreads * kOwn + kPool;
+        std::vector<uint64_t> pfn(n);
+        CHECK(pg6_xbox_XMemAllocatePhysicalPages(kXMemFlagPage64K, &n, pfn.data()) == 1);
+        const uint64_t* pool = pfn.data() + kThreads * kOwn;
+        // The pool pages' bytes: a marker per page, written through a slot of their own.
+        const size_t pool_slot = kThreads * kOwn + kShared;
+        for (size_t p = 0; p < kPool; ++p) {
+            CHECK(pg6_xbox_XMemMapPhysicalPages(bytes(pool_slot + p), 1, &pool[p]) != nullptr);
+            std::memset(bytes(pool_slot + p), static_cast<int>(0xA0 + p), kXMemPageSize64K);
+            CHECK(pg6_xbox_XMemMapPhysicalPages(bytes(pool_slot + p), 1, nullptr) != nullptr);
+        }
+        std::atomic<int> bad{0};
+        std::vector<std::thread> workers;
+        for (int t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&, t] {
+                for (int r = 0; r < kRounds; ++r) {
+                    // Own slots: map, write, unmap (bytes to the store), map back, check.
+                    for (size_t k = 0; k < kOwn; ++k) {
+                        const size_t s = t * kOwn + k;
+                        const uint64_t page = pfn[s];
+                        const auto mark = static_cast<uint8_t>(t * 31 + r * 7 + k);
+                        if (pg6_xbox_XMemMapPhysicalPages(bytes(s), 1, &page) == nullptr) {
+                            ++bad;
+                            continue;
+                        }
+                        bytes(s)[r * 97 + k] = mark;
+                        pg6_xbox_XMemMapPhysicalPages(bytes(s), 1, nullptr);
+                        pg6_xbox_XMemMapPhysicalPages(bytes(s), 1, &page);
+                        bad += bytes(s)[r * 97 + k] == mark ? 0 : 1;
+                        const uint64_t at[] = {slot_va(s)};
+                        const uint64_t none[] = {0};
+                        pg6_xbox_XMemMapPhysicalPagesScatter(at, 1, none);
+                    }
+                    // Shared slots and pages: map over whatever is there, unmap whatever is there.
+                    const size_t s = kThreads * kOwn + static_cast<size_t>(t + r) % kShared;
+                    const uint64_t page = pool[static_cast<size_t>(t * 5 + r) % kPool];
+                    bad += pg6_xbox_XMemMapPhysicalPages(bytes(s), 1, &page) != nullptr ? 0 : 1;
+                    if ((r & 1) != 0) {
+                        pg6_xbox_XMemMapPhysicalPages(bytes(s), 1, nullptr);
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+        CHECK(bad.load() == 0);
+        for (size_t k = 0; k < kShared; ++k) {
+            pg6_xbox_XMemMapPhysicalPages(bytes(kThreads * kOwn + k), 1, nullptr);
+        }
+        Pg6XMemWorkingSetStats stats{};
+        CHECK(pg6_xbox_XMemGetWorkingSetStatistics(&stats) == S_OK_HR);
+        CHECK(stats.live_virtual_mappings == 0);
+        CHECK(stats.mapped_physical_bytes == 0);
+        // Every page still holds its bytes: the threads' last marks, the pool's markers.
+        for (int t = 0; t < kThreads; ++t) {
+            for (size_t k = 0; k < kOwn; ++k) {
+                const size_t s = t * kOwn + k;
+                CHECK(pg6_xbox_XMemMapPhysicalPages(bytes(s), 1, &pfn[s]) != nullptr);
+                for (int r = 0; r < kRounds; ++r) {
+                    CHECK(bytes(s)[r * 97 + k] == static_cast<uint8_t>(t * 31 + r * 7 + k));
+                }
+            }
+        }
+        for (size_t p = 0; p < kPool; ++p) {
+            CHECK(pg6_xbox_XMemMapPhysicalPages(bytes(pool_slot + p), 1, &pool[p]) != nullptr);
+            const uint8_t* b = bytes(pool_slot + p);
+            CHECK(b[0] == 0xA0 + p && b[kXMemPageSize64K / 2] == 0xA0 + p && b[kXMemPageSize64K - 1] == 0xA0 + p);
+        }
+        CHECK(xmem_virtual_free(res));
+        CHECK(pg6_xbox_XMemFreePhysicalPages(pfn.size(), pfn.data()) == 1);
+    }
+    xmem_reset_for_testing();
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +802,7 @@ void test_module_registry_resolution() {
 int main() {
     test_xmem_heap_and_hooks();
     test_xmem_physical_virtual_and_transfer();
+    test_xmem_concurrent_map_unmap();
     test_dstorage_virtual_and_httpfs();
     test_surface_blocks();
     test_xg_xs_texture_computer();

@@ -543,27 +543,41 @@ uint64_t VirtualMemoryArena::reserve_shared(uint64_t size) {
     return candidate;
 }
 
+// R40: the host calls (view placement, placeholder splits) run outside the arena lock, so slots of
+// one shared reservation map and unmap in parallel. Callers serialize work on the same slot and
+// keep the reservation alive meanwhile (XMem: its in-flight slots, os/xbox_scarlett.cpp).
 bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
+    bool was_shown = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Reservation* res = find_reservation_locked(va);
+        if (res == nullptr || !res->shared || page == nullptr || size == 0 || (va % kAllocationGranularity) != 0 ||
+            (size % kAllocationGranularity) != 0 || va - res->base > res->size - size) {
+            return false;
+        }
+        was_shown = res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state == MemState::Commit;
+    }
+    if (was_shown) {
+        backing::unmap_shared_page(translate(va), size);  // another page was shown here
+    }
+    const bool ok = backing::map_shared_page(translate(va), page, size);
     std::lock_guard<std::mutex> lock(mutex_);
     Reservation* res = find_reservation_locked(va);
-    if (res == nullptr || !res->shared || page == nullptr || size == 0 || (va % kAllocationGranularity) != 0 ||
-        (size % kAllocationGranularity) != 0 || va - res->base > res->size - size) {
-        return false;
+    if (res == nullptr || !res->shared) {
+        return false;  // released meanwhile (a caller's bug)
     }
     const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
     const size_t count = static_cast<size_t>(size / kPageSize);
-    if (res->pages[first].state == MemState::Commit) {
-        backing::unmap_shared_page(translate(va), size);  // another page was shown here
+    if (was_shown) {
         committed_bytes_ -= size;
     }
-    if (!backing::map_shared_page(translate(va), page, size)) {
-        for (size_t p = first; p < first + count; ++p) {
-            res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
-        }
-        return false;
-    }
+    const PageMeta meta = ok ? PageMeta{MemState::Commit, PageProtect::ReadWrite}
+                             : PageMeta{MemState::Reserve, PageProtect::NoAccess};
     for (size_t p = first; p < first + count; ++p) {
-        res->pages[p] = PageMeta{MemState::Commit, PageProtect::ReadWrite};
+        res->pages[p] = meta;
+    }
+    if (!ok) {
+        return false;
     }
     committed_bytes_ += size;
     notify(*this, ArenaEvent::Commit, va, size, PageProtect::ReadWrite, true);
@@ -571,17 +585,24 @@ bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
 }
 
 bool VirtualMemoryArena::unmap_shared(uint64_t va, uint64_t size) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Reservation* res = find_reservation_locked(va);
+        if (res == nullptr || !res->shared || size == 0 || va - res->base > res->size - size) {
+            return false;
+        }
+        if (res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state != MemState::Commit) {
+            return true;
+        }
+    }
+    backing::unmap_shared_page(translate(va), size);
     std::lock_guard<std::mutex> lock(mutex_);
     Reservation* res = find_reservation_locked(va);
-    if (res == nullptr || !res->shared || size == 0 || va - res->base > res->size - size) {
+    if (res == nullptr || !res->shared) {
         return false;
     }
     const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
     const size_t count = static_cast<size_t>(size / kPageSize);
-    if (res->pages[first].state != MemState::Commit) {
-        return true;
-    }
-    backing::unmap_shared_page(translate(va), size);
     for (size_t p = first; p < first + count; ++p) {
         res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
     }

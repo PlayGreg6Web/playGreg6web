@@ -207,13 +207,21 @@ bool map_shared_page(uint8_t* at, void* page, uint64_t size) {
     if (!api.ok() || page == nullptr) {
         return false;
     }
-    // [at, at + size) must be a placeholder of its own: split it out of a larger one.
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(at, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_RESERVE) {
-        return false;
-    }
-    if (mbi.AllocationBase != at || mbi.RegionSize != size) {  // (BaseAddress is always `at`)
-        if (!VirtualFree(at, static_cast<SIZE_T>(size), MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+    // [at, at + size) must be a placeholder of its own: split it out of a larger one. Other
+    // threads split the same placeholder concurrently (R40: no lock around this), so a split that
+    // fails is retried against what the range has become.
+    for (int attempt = 0;; ++attempt) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(at, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_RESERVE) {
+            return false;
+        }
+        if (mbi.AllocationBase == at && mbi.RegionSize == size) {  // (BaseAddress is always `at`)
+            break;
+        }
+        if (VirtualFree(at, static_cast<SIZE_T>(size), MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            break;
+        }
+        if (attempt == 16) {
             return false;
         }
     }

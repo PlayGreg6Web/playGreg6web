@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <new>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -269,6 +271,17 @@ struct XMemState {
     bool mirror_exhausted_logged = false;
     bool pool_view_placed = false;  // O36: the first CPU window past the translated one was placed
 
+    // R40: map/unmap data work outside the lock (map_slots). A plain map or unmap does its
+    // bookkeeping under the lock, marks its slot (and the page whose bytes move) in flight, drops
+    // the lock for the commit / copy / zeroing / shared-view work, and retakes it to finish. An
+    // operation on an in-flight slot or page waits for it; anything else that touches page bytes
+    // (the other map/unmap shapes, VirtualFree, XMemFreePhysicalPages, ...) waits until nothing is
+    // in flight (wait_idle_locked), and new in-flight work waits while such an operation does.
+    std::condition_variable idle_cv;
+    std::unordered_set<uint64_t> busy_slots;  // guest VAs
+    std::unordered_set<uint64_t> busy_pages;  // page handles
+    uint32_t idle_waiters = 0;
+
     void update_peak_locked() {
         const uint64_t current =
             heap_allocated_bytes + physical_pages_bytes + virtual_committed_bytes;
@@ -352,23 +365,29 @@ VirtualRegion* XMemState::region_containing_locked(uint64_t va, uint64_t len) {
     return &r;
 }
 
-void save_page_contents(PhysicalPage& page, const uint8_t* bytes) {
+// A store block holding a copy of `n` bytes (0 when they are all zero: no store needed). Needs no
+// XMem lock.
+uint64_t copy_to_store(const uint8_t* bytes, uint64_t n) {
+    const size_t len = static_cast<size_t>(n);
+    if (std::none_of(bytes, bytes + len, [](uint8_t b) { return b != 0; })) {
+        return 0;
+    }
     GuestHeap& heap = default_guest_heap();
-    if (page.store_va != 0) {
-        heap.free(page.store_va);
-        page.store_va = 0;
-    }
-    const size_t n = static_cast<size_t>(page.page_size);
-    if (std::none_of(bytes, bytes + n, [](uint8_t b) { return b != 0; })) {
-        return;
-    }
-    const uint64_t va = heap.alloc(n, kPageSize, HeapFamily::XMem);
+    const uint64_t va = heap.alloc(len, kPageSize, HeapFamily::XMem);
     if (va == 0) {
         std::fprintf(stderr, "[xmem] out of guest memory saving a physical page; contents lost\n");
-        return;
+        return 0;
     }
-    std::memcpy(heap.to_host(va), bytes, n);
-    page.store_va = va;
+    std::memcpy(heap.to_host(va), bytes, len);
+    return va;
+}
+
+void save_page_contents(PhysicalPage& page, const uint8_t* bytes) {
+    if (page.store_va != 0) {
+        default_guest_heap().free(page.store_va);
+        page.store_va = 0;
+    }
+    page.store_va = copy_to_store(bytes, page.page_size);
 }
 
 void release_virtual_region(const VirtualRegion& region) {
@@ -945,11 +964,247 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
     return true;
 }
 
+// R40: waits (dropping the lock meanwhile) until no map/unmap has data work in flight; new
+// in-flight work waits while this does. For anything that touches page bytes or slots other
+// than through the in-flight paths below.
+void wait_idle_locked(XMemState& st, std::unique_lock<std::mutex>& lock) {
+    if (st.busy_slots.empty()) {
+        return;
+    }
+    ++st.idle_waiters;
+    st.idle_cv.wait(lock, [&] { return st.busy_slots.empty(); });
+    if (--st.idle_waiters == 0) {
+        st.idle_cv.notify_all();  // in-flight work held back by this wait may start
+    }
+}
+
+void finish_in_flight_locked(XMemState& st, uint64_t va, uint64_t handle) {
+    st.busy_slots.erase(va);
+    if (handle != 0) {
+        st.busy_pages.erase(handle);
+    }
+    st.idle_cv.notify_all();
+}
+
+enum class FastResult { NotTaken, Ok, Failed };
+
+// R40: maps `page` at slot `va` with the data work outside the lock, for the plain shapes: a
+// free slot of an arena reservation (commit + the page's bytes from its store, or zeroes) or of a
+// shared reservation (the page's shared view, created on first use, mapped at the slot), the page
+// living in no real slot (no home) and shown in no window slot. Anything else is NotTaken
+// (map_slot_locked handles it). The caller waited until neither `va` nor the page is in flight.
+FastResult map_slot_fast(XMemState& st, std::unique_lock<std::mutex>& lock, uint64_t va,
+                         const std::shared_ptr<PhysicalPage>& page_ref) {
+    PhysicalPage& page = *page_ref;
+    const uint64_t ps = page.page_size;
+    if ((va % std::min<uint64_t>(ps, kXMemPageSize64K)) != 0) {
+        return FastResult::NotTaken;
+    }
+    VirtualRegion* region = st.region_containing_locked(va, ps);
+    if (region == nullptr || region->phantom || region->translated || st.page_slots.count(va) != 0 ||
+        page.home_va != 0 || !page.window_slots.empty()) {
+        return FastResult::NotTaken;
+    }
+    const bool shared = region->shared;
+    if (shared ? (ps % kXMemPageSize64K) != 0 : page.view != nullptr) {
+        return FastResult::NotTaken;
+    }
+    const bool cpu_window = region->cpu_window;
+    const uint64_t handle = page.handle;
+    st.page_slots[va] = handle;
+    ++page.mapped_slots;
+    st.mapped_physical_bytes += ps;
+    const uint64_t old_pool = page.pool_va;
+    // Shared: the page's view, or the store its new view starts from. Arena: the store the slot's
+    // bytes come from (zeroes without one).
+    void* object = page.shared;
+    const bool create = shared && page.view == nullptr;
+    const uint64_t store = shared && !create ? 0 : page.store_va;
+    page.store_va = shared && !create ? page.store_va : 0;
+    const bool commit = !shared && !region->committed;
+    PageProtect pp = PageProtect::ReadWrite;
+    if (commit) {
+        xmem_protect(region->protect, pp);
+        if (pp == PageProtect::NoAccess) {
+            pp = PageProtect::ReadWrite;
+        }
+        st.virtual_committed_bytes += ps;
+    }
+    if (!shared) {
+        if (page.pool_va == 0) {
+            page.pool_va = va;
+        }
+        page.home_va = va;
+    }
+    st.busy_slots.insert(va);
+    st.busy_pages.insert(handle);
+    lock.unlock();
+
+    bool ok = true;
+    uint8_t* view = nullptr;
+    if (shared) {
+        if (create) {
+            object = create_shared_page(ps);
+            view = object != nullptr ? view_shared_page(object, ps) : nullptr;
+            if (view == nullptr) {
+                release_shared_page(object);
+                object = nullptr;
+                ok = false;
+            } else if (store != 0) {
+                std::memcpy(view, host_of(store), static_cast<size_t>(ps));
+                default_guest_heap().free(store);
+            }
+        }
+        ok = ok && xmem_arena().map_shared(va, object, ps);
+    } else {
+        ok = !commit || xmem_arena().commit(va, ps, pp);
+        if (ok) {
+            auto* dst = static_cast<uint8_t*>(host_of(va));
+            if (store != 0) {
+                std::memcpy(dst, host_of(store), static_cast<size_t>(ps));
+                default_guest_heap().free(store);
+            } else {
+                std::memset(dst, 0, static_cast<size_t>(ps));
+            }
+        }
+    }
+
+    lock.lock();
+    if (create && view != nullptr) {
+        page.shared = object;  // kept even if the slot could not show it (as shared_bytes_locked)
+        page.view = view;
+    } else if (create || (!shared && !ok)) {
+        page.store_va = store;  // nothing moved
+    }
+    if (!ok) {
+        st.page_slots.erase(va);
+        --page.mapped_slots;
+        st.mapped_physical_bytes -= ps;
+        if (commit) {
+            st.virtual_committed_bytes -= ps;
+        }
+        if (!shared) {
+            page.home_va = 0;
+            page.pool_va = old_pool;
+        }
+        finish_in_flight_locked(st, va, handle);
+        return FastResult::Failed;
+    }
+    if (shared) {
+        if (page.mapped_slots > 1) {
+            ++st.alias_slots;
+        }
+        if (page.pool_va == 0) {
+            page.pool_va = va;
+        }
+    } else {
+        mark_mirror_locked(st, va, ps);  // O37: the page's bytes appeared here
+    }
+    if (cpu_window) {
+        xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
+        if (const VirtualRegion* r = st.region_containing_locked(va, ps)) {
+            note_cpu_window_map_locked(st, va, page, *r);
+        }
+    }
+    finish_in_flight_locked(st, va, handle);
+    return FastResult::Ok;
+}
+
+// R40: unmaps slot `va` with the data work outside the lock, for the plain shapes: a slot of a
+// shared reservation (its view goes), or an arena slot that is its page's home (the bytes go to a
+// store, the slot is decommitted) or a copy of a page living elsewhere. Anything else (alias and
+// window slots, frame swaps, a pool-view page going back to its pool slot) is NotTaken.
+FastResult unmap_slot_fast(XMemState& st, std::unique_lock<std::mutex>& lock, uint64_t va) {
+    auto sit = st.page_slots.find(va);
+    if (sit == st.page_slots.end()) {
+        return FastResult::Ok;
+    }
+    auto pit = st.physical_pages.find(sit->second);
+    if (pit == st.physical_pages.end()) {
+        return FastResult::NotTaken;
+    }
+    PhysicalPage& page = *pit->second;
+    const uint64_t ps = page.page_size;
+    VirtualRegion* region = st.region_containing_locked(va, ps);
+    if (region == nullptr || region->phantom || region->translated) {
+        return FastResult::NotTaken;
+    }
+    const bool shared = region->shared;
+    bool owner = false;
+    if (!shared) {
+        if (const uint64_t w = mirror_window_va_locked(st, va);
+            w != 0 && std::find(page.window_slots.begin(), page.window_slots.end(), w) != page.window_slots.end()) {
+            return FastResult::NotTaken;  // an alias slot
+        }
+        if (page.home_va == va) {
+            const uint64_t back = page.pool_va;
+            const auto still = back != 0 && back != va ? st.page_slots.find(back) : st.page_slots.end();
+            if (!page.window_slots.empty() ||
+                (still != st.page_slots.end() && still->second == page.handle && home_owner_locked(st, back) == nullptr)) {
+                return FastResult::NotTaken;  // window slots to retarget, or back to the pool slot (O30)
+            }
+            owner = true;
+        } else if (home_owner_locked(st, va) != nullptr) {
+            return FastResult::NotTaken;  // another page's bytes live here (O29)
+        }
+    }
+    const uint64_t handle = owner ? page.handle : 0;
+    st.page_slots.erase(sit);
+    if (page.mapped_slots > 0) {
+        --page.mapped_slots;
+    }
+    st.mapped_physical_bytes -= ps;
+    uint64_t old_store = 0;
+    if (owner) {
+        page.home_va = 0;
+        old_store = page.store_va;
+        page.store_va = 0;
+    }
+    const bool decommit = !shared && !region->committed;
+    if (decommit) {
+        st.virtual_committed_bytes -= ps;
+    }
+    if (!shared && region->cpu_window) {
+        xmem_windows::note_cpu_window_mapping(-static_cast<int64_t>(ps));
+    }
+    st.busy_slots.insert(va);
+    if (owner) {
+        st.busy_pages.insert(handle);
+    }
+    lock.unlock();
+
+    uint64_t new_store = 0;
+    if (shared) {
+        xmem_arena().unmap_shared(va, ps);
+    } else {
+        if (owner) {
+            if (old_store != 0) {
+                default_guest_heap().free(old_store);
+            }
+            new_store = copy_to_store(static_cast<const uint8_t*>(host_of(va)), ps);
+        }
+        if (decommit) {
+            xmem_arena().decommit(va, ps);
+        }
+    }
+
+    lock.lock();
+    if (owner) {
+        page.store_va = new_store;  // the page is in flight: it still exists
+    }
+    if (!shared) {
+        mark_mirror_locked(st, va, ps);  // O37: the title's view of the slot loses its bytes
+    }
+    finish_in_flight_locked(st, va, handle);
+    return FastResult::Ok;
+}
+
 // Maps (pfn != 0) or unmaps (pfn == 0 / null array) one slot per entry of `vas`; all-or-nothing
-// validation of the page handles first.
+// validation of the page handles first. R40: plain entries do their data work outside the lock
+// (map_slot_fast / unmap_slot_fast); the rest runs under it with nothing in flight.
 bool map_slots(const uint64_t* vas, size_t count, const uint64_t* pfns) {
     auto& st = xmem_state();
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
     if (pfns != nullptr) {
         for (size_t i = 0; i < count; ++i) {
             if (pfns[i] != 0 && st.physical_pages.find(pfns[i]) == st.physical_pages.end()) {
@@ -961,11 +1216,44 @@ bool map_slots(const uint64_t* vas, size_t count, const uint64_t* pfns) {
     bool ok = true;
     for (size_t i = 0; i < count; ++i) {
         const uint64_t va = unmirror(vas[i]);  // O37: a mirrored reservation's window VA
-        if (pfns == nullptr || pfns[i] == 0) {
-            unmap_slot_locked(st, va);
+        const uint64_t handle = pfns == nullptr ? 0 : pfns[i];
+        // Wait until this slot, the page going there and the page leaving it are out of flight,
+        // and no operation is waiting for everything to be.
+        st.idle_cv.wait(lock, [&] {
+            if (st.idle_waiters != 0) {
+                return false;  // they wake once nothing is in flight, and notify when done
+            }
+            if (st.busy_slots.empty()) {
+                return true;
+            }
+            if (st.busy_slots.count(va) != 0 ||
+                (handle != 0 && st.busy_pages.count(handle) != 0)) {
+                return false;
+            }
+            const auto sit = st.page_slots.find(va);
+            return sit == st.page_slots.end() || st.busy_pages.count(sit->second) == 0;
+        });
+        if (handle == 0) {
+            if (unmap_slot_fast(st, lock, va) == FastResult::NotTaken) {
+                wait_idle_locked(st, lock);
+                unmap_slot_locked(st, va);
+            }
             continue;
         }
-        if (!map_slot_locked(st, va, *st.physical_pages[pfns[i]])) {
+        auto pit = st.physical_pages.find(handle);
+        if (pit == st.physical_pages.end()) {
+            ok = false;  // freed meanwhile
+            continue;
+        }
+        const std::shared_ptr<PhysicalPage> page = pit->second;
+        const FastResult fast = map_slot_fast(st, lock, va, page);
+        if (fast == FastResult::NotTaken) {
+            wait_idle_locked(st, lock);
+            pit = st.physical_pages.find(handle);
+            if (pit == st.physical_pages.end() || !map_slot_locked(st, va, *pit->second)) {
+                ok = false;
+            }
+        } else if (fast == FastResult::Failed) {
             ok = false;
         }
     }
@@ -2325,7 +2613,8 @@ bool xmem_virtual_free(void* address) {
         return false;
     }
     auto& st = xmem_state();
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
+    wait_idle_locked(st, lock);  // R40
     auto it = st.virtual_regions.find(address);
     if (it == st.virtual_regions.end()) {
         // The translated window, as the import thunk handed its base over (O29), or a mirrored
@@ -2366,7 +2655,8 @@ bool xmem_unmap_physical_pages(void* virtual_address) {
         return false;
     }
     auto& st = xmem_state();
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
+    wait_idle_locked(st, lock);  // R40
     const uint64_t base = guest_of(virtual_address);
     auto bit = st.owned_blocks.find(base);
     if (bit != st.owned_blocks.end()) {
@@ -2447,7 +2737,8 @@ XMemWindowContiguity xmem_window_contiguity() {
 
 void xmem_reset_for_testing() {
     auto& st = xmem_state();
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
+    wait_idle_locked(st, lock);  // R40
     st.alloc_hook = nullptr;
     st.free_hook = nullptr;
     st.guest_hook_table = 0;
@@ -2753,7 +3044,8 @@ int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_ar
     }
 
     auto& st = xmem_state();
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
+    wait_idle_locked(st, lock);  // R40
     for (size_t i = 0; i < num_pages; ++i) {
         if (st.physical_pages.find(page_array[i]) == st.physical_pages.end()) {
             playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
@@ -2763,8 +3055,10 @@ int32_t pg6_xbox_XMemFreePhysicalPages(size_t num_pages, const uint64_t* page_ar
     for (size_t i = 0; i < num_pages; ++i) {
         auto it = st.physical_pages.find(page_array[i]);
         if (it != st.physical_pages.end()) {
-            // Freed while mapped: the slots stop referring to it (their memory stays as is).
-            for (auto sit = st.page_slots.begin(); sit != st.page_slots.end();) {
+            // Freed while mapped: the slots stop referring to it (their memory stays as is). R40:
+            // only then: a walk over every mapped slot per freed page, under the lock, stalled
+            // every other thread's map/unmap.
+            for (auto sit = st.page_slots.begin(); it->second->mapped_slots > 0 && sit != st.page_slots.end();) {
                 sit = sit->second == page_array[i] ? st.page_slots.erase(sit) : std::next(sit);
             }
             st.mapped_physical_bytes -= it->second->mapped_slots * it->second->page_size;
@@ -2869,7 +3163,8 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     }
 
     auto& st = xmem_state();
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
+    wait_idle_locked(st, lock);  // R40: commits in place, replaces placeholders under mapped slots
     os::VirtualMemoryArena& arena = xmem_arena();
     // O37: an address inside a reservation handed out at a window range means its arena VA (the
     // import thunk passes the window VA's host page; a direct caller may pass the window VA).

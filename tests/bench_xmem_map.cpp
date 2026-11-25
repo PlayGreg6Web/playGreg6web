@@ -122,7 +122,9 @@ int main(int argc, char** argv) {
         }
         std::printf("%d thread(s), %zu x 64 KiB pages each: map fresh %.1f us, unmap %.1f us, remap %.1f us per call\n",
                     t, pages, avg.map_fresh_us, avg.unmap_us, avg.remap_us);
-        win32::VirtualFree(base, 0, win32::MEM_RELEASE);
+        // Through XMem, so the next pass's reservation (which may land at the same address) is not
+        // shadowed by this one's stale region record.
+        xmem_virtual_free(reservation);
         if (threads == 1) {
             break;
         }

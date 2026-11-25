@@ -4,10 +4,12 @@
 // address space, pool pages scattered across it, aliasing the pool view. Synthetic data only.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "guest/com_bridge.h"
@@ -850,6 +852,103 @@ void test_xmem_aliases_in_the_window() {
     gw::reset_for_testing();
 }
 
+// R40: under the window model, XMem map/unmap from many threads at once (plain slots do their
+// data work outside the XMem lock): a mirrored physical reservation's disjoint slots keep every
+// thread's bytes, while threads fighting over the same slots and pages - some in the translated
+// CPU window, which take the locked path, next to the in-flight ones - leave every page's bytes
+// intact and the accounting balanced.
+void test_xmem_concurrent_map_unmap_in_the_window() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    constexpr int kThreads = 8;
+    constexpr uint64_t kOwn = 4;
+    constexpr uint64_t kShared = 3;
+    constexpr uint64_t kPool = 6;
+    constexpr int kRounds = 30;
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    CHECK(cpu != nullptr && va_of(cpu) == W);
+    const uint64_t slots = kThreads * kOwn + kShared + kPool;
+    void* heap = pg6_xbox_XMemVirtualAlloc(nullptr, slots * k64K, 0x20402000u, 0x23u, kCpuProtect);
+    const uint64_t H = va_of(heap);
+    CHECK(heap != nullptr && H >= gw::kRuntimeRangeBase);
+    auto host = [&](uint64_t slot) { return static_cast<uint8_t*>(gw::runtime_range_host(H + slot * k64K)); };
+    auto map = [](uint64_t va, uint64_t page) {
+        const uint64_t at[] = {va};
+        const uint64_t pg[] = {page};
+        return pg6_xbox_XMemMapPhysicalPagesScatter(at, 1, pg) == 1;
+    };
+    size_t n = kThreads * kOwn + kPool;
+    std::vector<uint64_t> pfn(n);
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &n, pfn.data()) == 1);
+    const uint64_t* pool = pfn.data() + kThreads * kOwn;
+    const uint64_t pool_slot = kThreads * kOwn + kShared;
+    for (uint64_t p = 0; p < kPool; ++p) {
+        CHECK(map(H + (pool_slot + p) * k64K, pool[p]));
+        std::memset(host(pool_slot + p), static_cast<int>(0xA0 + p), k64K);
+        CHECK(map(H + (pool_slot + p) * k64K, 0));
+    }
+    std::atomic<int> bad{0};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t] {
+            for (int r = 0; r < kRounds; ++r) {
+                for (uint64_t k = 0; k < kOwn; ++k) {
+                    const uint64_t s = t * kOwn + k;
+                    const auto mark = static_cast<uint8_t>(t * 31 + r * 7 + k);
+                    if (!map(H + s * k64K, pfn[s])) {
+                        ++bad;
+                        continue;
+                    }
+                    host(s)[r * 97 + k] = mark;
+                    map(H + s * k64K, 0);
+                    map(H + s * k64K, pfn[s]);
+                    bad += host(s)[r * 97 + k] == mark ? 0 : 1;
+                    map(H + s * k64K, 0);
+                }
+                // A shared slot of the reservation, or one of the translated CPU window.
+                const uint64_t i = static_cast<uint64_t>(t + r) % kShared;
+                const uint64_t va = (r % 3) == 0 ? W + i * k64K : H + (kThreads * kOwn + i) * k64K;
+                bad += map(va, pool[static_cast<uint64_t>(t * 5 + r) % kPool]) ? 0 : 1;
+                if ((r & 1) != 0) {
+                    map(va, 0);
+                }
+            }
+        });
+    }
+    for (auto& w : workers) {
+        w.join();
+    }
+    CHECK(bad.load() == 0);
+    for (uint64_t i = 0; i < kShared; ++i) {
+        map(W + i * k64K, 0);
+        map(H + (kThreads * kOwn + i) * k64K, 0);
+    }
+    Pg6XMemWorkingSetStats stats{};
+    CHECK(pg6_xbox_XMemGetWorkingSetStatistics(&stats) == gdk::S_OK_HR);
+    CHECK(stats.live_virtual_mappings == 0 && stats.mapped_physical_bytes == 0);
+    for (int t = 0; t < kThreads; ++t) {
+        for (uint64_t k = 0; k < kOwn; ++k) {
+            const uint64_t s = t * kOwn + k;
+            CHECK(map(H + s * k64K, pfn[s]));
+            for (int r = 0; r < kRounds; ++r) {
+                CHECK(host(s)[r * 97 + k] == static_cast<uint8_t>(t * 31 + r * 7 + k));
+            }
+        }
+    }
+    for (uint64_t p = 0; p < kPool; ++p) {
+        CHECK(map(H + (pool_slot + p) * k64K, pool[p]));
+        const uint8_t* b = host(pool_slot + p);
+        CHECK(b[0] == 0xA0 + p && b[k64K / 2] == 0xA0 + p && b[k64K - 1] == 0xA0 + p);
+    }
+    CHECK(xmem_virtual_free(heap));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(pfn.size(), pfn.data()) == 1);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -864,6 +963,7 @@ int main() {
     test_xmem_physical_reservations_in_the_window();
     test_xmem_committed_regions_in_the_window();
     test_xmem_aliases_in_the_window();
+    test_xmem_concurrent_map_unmap_in_the_window();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
