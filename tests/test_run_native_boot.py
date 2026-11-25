@@ -294,5 +294,40 @@ class RunTests(unittest.TestCase):
             self.assertEqual(code, 2)
 
 
+
+class ChooseBuildDirTest(unittest.TestCase):
+    def test_explicit_dir_wins(self):
+        d, note = rnb.choose_build_dir(Path("C:/" + "a" * 300), Path("H:/nb1"), {}, windows=True)
+        self.assertEqual(d, Path("H:/nb1").resolve())
+        self.assertIsNone(note)
+
+    def test_short_repo_keeps_default(self):
+        d, note = rnb.choose_build_dir(Path("H:/r"), None, {"LOCALAPPDATA": "C:/L"}, windows=True)
+        self.assertEqual(d, (Path("H:/r") / "work" / "native-boot").resolve())
+        self.assertIsNone(note)
+
+    def test_non_windows_keeps_default(self):
+        repo = Path("/" + "a" * 300)
+        d, note = rnb.choose_build_dir(repo, None, {}, windows=False)
+        self.assertEqual(d, (repo / "work" / "native-boot").resolve())
+        self.assertIsNone(note)
+
+    def test_deep_repo_falls_back_to_localappdata(self):
+        repo = Path("H:/" + "/".join(["deep"] * 30))
+        d, note = rnb.choose_build_dir(repo, None, {"LOCALAPPDATA": "C:/L"}, windows=True)
+        self.assertEqual(d.parent, Path("C:/L") / "playgta6")
+        self.assertTrue(d.name.startswith("nb-"))
+        self.assertIn(str(d), note)
+        self.assertLess(len(str(d)) + rnb.BUILD_SUBPATH_BUDGET, rnb.WINDOWS_PATH_LIMIT)
+
+    def test_fallback_without_localappdata_uses_drive_and_is_stable(self):
+        repo = Path("H:/" + "/".join(["deep"] * 30))
+        d1, _ = rnb.choose_build_dir(repo, None, {}, windows=True)
+        d2, _ = rnb.choose_build_dir(repo, None, {}, windows=True)
+        other, _ = rnb.choose_build_dir(Path("H:/" + "/".join(["deeper"] * 30)), None, {}, windows=True)
+        self.assertEqual(d1, d2)
+        self.assertNotEqual(d1, other)
+        self.assertEqual(d1.parent.name, "pg6b")
+
 if __name__ == "__main__":
     unittest.main()

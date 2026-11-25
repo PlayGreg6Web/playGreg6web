@@ -47,6 +47,7 @@ The harness' own exit code (fault, watchdog, guest exit code) is in command.json
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -152,6 +153,34 @@ class Plan:
 
     def has(self, stage: str) -> bool:
         return any(s["stage"] == stage for s in self.steps)
+
+
+# Longest path below the build dir that the native build produces (MSBuild/CMake nesting under
+# harness-build plus a hash-named cache object); the object names themselves are already short hashes.
+BUILD_SUBPATH_BUDGET = 130
+WINDOWS_PATH_LIMIT = 200
+
+
+def choose_build_dir(repo: Path, requested: Path | None, env: Mapping[str, str], windows: bool | None = None,
+                     limit: int = WINDOWS_PATH_LIMIT) -> tuple[Path, str | None]:
+    """The build directory, and a note when the default was replaced by a short per-checkout one.
+
+    An explicit --build-dir is always honored. On Windows the default `<repo>/work/native-boot` is
+    replaced by `%LOCALAPPDATA%/playgta6/nb-<hash of repo path>` (or `<drive>:/pg6b/<hash>`) when
+    its deepest generated path would exceed `limit` (MAX_PATH trouble in deep agent worktrees).
+    """
+    if requested is not None:
+        return requested.resolve(), None
+    default = (repo / "work" / "native-boot").resolve()
+    windows = (os.name == "nt") if windows is None else windows
+    if not windows or len(str(default)) + BUILD_SUBPATH_BUDGET <= limit:
+        return default, None
+    digest = hashlib.sha256(str(repo.resolve()).lower().encode("utf-8")).hexdigest()[:10]
+    local = env.get("LOCALAPPDATA")
+    short = Path(local) / "playgta6" / f"nb-{digest}" if local else Path(f"{default.drive or 'C:'}/pg6b") / digest
+    note = (f"note: default build dir {default} is too long for Windows "
+            f"({len(str(default)) + BUILD_SUBPATH_BUDGET} > {limit} chars); using {short}")
+    return short, note
 
 
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
@@ -348,7 +377,9 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(f"exe not found: {exe}")
     if not args.dry_run and not game_dir.is_dir():
         raise RunnerError(f"game directory not found: {game_dir}")
-    build_dir = (args.build_dir or repo / "work" / "native-boot").resolve()
+    build_dir, note = choose_build_dir(repo, args.build_dir, env)
+    if note:
+        print(note, file=sys.stderr)
     runs_dir = (args.runs_dir or build_dir / "runs").resolve()
     preset = PRESETS[args.preset]
     name = args.name or f"{args.preset}-{time.strftime('%Y%m%d-%H%M%S')}"
