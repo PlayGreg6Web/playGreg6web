@@ -446,6 +446,11 @@ void test_create_device() {
 
 void test_queue_allocator_fence() {
     Fixture fx;
+    // Immediate completion; the lagged publish is covered by test_fence_publish_lag.
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.fence_publish_lag = false;
+    dx::set_device_options(options);
     const uint64_t device = fx.create_device();
     dg::Device* dev = host_device(device);
 
