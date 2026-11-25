@@ -1259,6 +1259,44 @@ void test_heap_indexed_bind_groups() {
     CHECK(no_heap.bind_group->entries[1].resource_id == 701 && cache.heap_index_misses() == 3);
 }
 
+// Inline samplers (#482): the plan entry carries the decoded sampler; the bind group binds it with no
+// root-signature sampler, table or heap involved, and the plan hash tells two samplers apart.
+void test_inline_sampler_plan() {
+    RootSignatureDesc d;
+    d.parameters.push_back(constants(0, 1));
+    RootSignature rs;
+    CHECK(RootSignature::build(d, &rs).ok());
+    ShaderBinding s;
+    s.binding = 34;
+    s.register_class = DescriptorRangeType::Sampler;
+    s.inline_sampler = true;
+    s.sampler.filter = 0x15;
+    s.sampler.address_u = s.sampler.address_v = s.sampler.address_w = 3;
+    s.sampler.max_lod = 15.0f;
+    const ShaderBinding one[] = {s};
+    const BindGroupPlan plan = BindGroupPlan::build(rs, one, WebGpuStage::Fragment);
+    CHECK(plan.unresolved_count() == 0 && plan.parameter_mask() == 0);
+    CHECK(plan.entries().size() == 1 && plan.entries()[0].source == PlanSource::InlineSampler);
+    ShaderBinding other = s;
+    other.sampler.filter = 0x80;
+    other.sampler.comparison_func = 4;
+    const ShaderBinding two[] = {other};
+    CHECK(BindGroupPlan::build(rs, two, WebGpuStage::Fragment).hash() != plan.hash());
+
+    RootArgumentState st;
+    BindGroupCache cache;
+    CHECK(st.set_root_signature(BindPoint::Graphics, &rs) == Status::Ok);
+    CHECK(st.set_root_constant(BindPoint::Graphics, 0, 0, 0) == Status::Ok);
+    BindGroupLookup g = cache.get_or_build(st, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(g.status == Status::Ok && g.bind_group != nullptr && g.bind_group->entries.size() == 1);
+    if (g.bind_group != nullptr && g.bind_group->entries.size() == 1) {
+        const BindGroupEntry& e = g.bind_group->entries[0];
+        CHECK(e.binding == 34 && e.kind == BindResourceKind::Sampler && e.sampler.filter == 0x15 &&
+              e.sampler.address_u == 3 && e.sampler.max_lod == 15.0f && g.bind_group->null_entries == 0);
+    }
+    CHECK(!cache.get_or_build(st, BindPoint::Graphics, plan, 1, test_resolver, nullptr).rebuilt);
+}
+
 void test_bind_group_cache() {
     DescriptorHeapRegistry reg;
     DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 256, true);
@@ -1884,6 +1922,7 @@ int main() {
     test_bind_group_plan();
     test_bind_group_cache();
     test_heap_indexed_bind_groups();
+    test_inline_sampler_plan();
     test_state_tracker_basic();
     test_state_tracker_subresources_and_split();
     test_state_tracker_execute();

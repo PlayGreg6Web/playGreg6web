@@ -7,7 +7,9 @@ stage) or a `playgta6-shaders pack-rdna2 --json` summary (its `entries` list). A
 sidecar only when its reflection carries the join keys the runtime needs:
   - every binding has a `source` ({user_sgpr, table_byte_offset} | {user_sgpr, root_constants} |
     {user_sgpr, root_descriptor} | {static_sampler} | {sampler_heap | resource_heap: {base_user_sgpr,
-    stride, index: {user_sgpr, shift}}} (S34: a directly indexed heap, index from a root constant));
+    stride, index: {user_sgpr, shift}}} (S34: a directly indexed heap, index from a root constant) |
+    {inline_sampler: {sdwords: [d0, d1, d2, d3]}} (#482: the four GFX10 S# dwords of a sampler the
+    stage builds from constants; the runtime decodes them));
   - a vertex stage that fetches attributes lists `vertex_inputs` ({location, vb_slot, byte_offset,
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
@@ -66,6 +68,16 @@ def heap_source_ok(source: dict[str, Any]) -> bool | None:
     return all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in ints) and ints[3] < 32
 
 
+def inline_sampler_ok(source: dict[str, Any]) -> bool | None:
+    """None: not an inline sampler; else whether sdwords is four 32-bit unsigned integers."""
+    if "inline_sampler" not in source:
+        return None
+    sampler = source["inline_sampler"]
+    words = sampler.get("sdwords") if isinstance(sampler, dict) else None
+    return (isinstance(words, list) and len(words) == 4 and
+            all(isinstance(w, int) and not isinstance(w, bool) and 0 <= w <= 0xFFFFFFFF for w in words))
+
+
 def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, str]:
     """(key, sidecar stage, reason it was skipped)."""
     key = entry.get("hash_fnv1a64")
@@ -79,6 +91,8 @@ def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, s
             return key, None, "binding without source"
         if heap_source_ok(source) is False:
             return key, None, "malformed heap source"
+        if inline_sampler_ok(source) is False:
+            return key, None, "malformed inline sampler"
         kind = KIND_MAP.get(str(b.get("kind", "")))
         if kind is None:
             return key, None, f"unknown binding kind {b.get('kind')!r}"

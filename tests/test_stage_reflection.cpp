@@ -444,6 +444,81 @@ void test_plan_direct_slot() {
     CHECK(plan.table_windows().size() == 1 && plan.table_windows()[0].first_offset == 5);
 }
 
+// #482 contract: a sampler the stage builds from constants in its code comes as its four S# dwords
+// ("inline_sampler": {"sdwords": [...]}) and is bound as the decoded sampler, whatever the root
+// signature declares. Hand-made GFX10 S# words: clamp-to-edge bilinear with linear mips (filter 0x15),
+// and a LESS_EQUAL comparison sampler with point filtering (filter 0x80).
+void test_inline_sampler() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 1,
+  "stages": {
+    "0x00000000000000d4": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 34, "kind": "sampler",
+         "source": {"inline_sampler": {"sdwords": [146, 15728640, 139460608, 0]}}},
+        {"group": 0, "binding": 36, "kind": "comparison_sampler",
+         "source": {"inline_sampler": {"sdwords": [12288, 15728640, 67108864, 0]}}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    const StageReflection& ps = index.at(0xd4);
+    CHECK(ps.bindings.size() == 2 && ps.bindings[0].source == ReflectedSource::InlineSampler);
+    CHECK(ps.bindings[0].sampler_words[0] == 0x92 && ps.bindings[0].sampler_words[1] == 0x00F00000 &&
+          ps.bindings[0].sampler_words[2] == 0x08500000 && ps.bindings[0].sampler_words[3] == 0);
+
+    // A root signature without static samplers: the inline samplers join anyway.
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc constants;
+    constants.parameter_type = d3d::RootParameterType::Constants32Bit;
+    constants.num_32bit_values = 1;
+    rs.parameters = {constants};
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report));
+    CHECK(report.empty());
+    const bridge::LayoutBinding* lin = find(layout, 0, 34);
+    CHECK(lin != nullptr && lin->join.inline_sampler && lin->join.register_class == d3d::DescriptorRangeType::Sampler);
+    if (lin != nullptr) {
+        CHECK(lin->join.sampler.filter == 0x15 && lin->join.sampler.address_u == 3 && lin->join.sampler.address_v == 3 &&
+              lin->join.sampler.max_lod == 15.0f && lin->join.sampler.comparison_func == 0);
+        CHECK(lin->entry.binding_type == static_cast<uint8_t>(GpuSamplerBindingType::Filtering));
+    }
+    const bridge::LayoutBinding* cmp = find(layout, 0, 36);
+    CHECK(cmp != nullptr && cmp->join.inline_sampler);
+    if (cmp != nullptr) {
+        CHECK(cmp->join.sampler.filter == 0x80 && cmp->join.sampler.comparison_func == 4 &&
+              cmp->join.sampler.address_u == 1);
+        CHECK(cmp->entry.binding_type == static_cast<uint8_t>(GpuSamplerBindingType::Comparison));
+    }
+
+    // Words that are not a sampler (dword 3 bits 12..29 are zero in every S#) and a texture binding
+    // with an inline sampler source fail the join, with the words in the key.
+    StageReflection bad = ps;
+    bad.bindings[0].sampler_words[3] = 0x1000;
+    bad.bindings[1].kind = ReflectedBindingKind::Texture;
+    report.clear();
+    bridge::PipelineLayoutDesc untouched;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad}}, &untouched, &report));
+    CHECK(report.find("@group(0) @binding(34) <- inline sampler 00000092 00f00000 08500000 00001000: the inline "
+                      "sampler words do not decode") != std::string::npos);
+    CHECK(report.find("a texture binding cannot take an inline sampler") != std::string::npos);
+
+    // Malformed sdwords are rejected by the parser.
+    for (const char* words : {"[1, 2, 3]", "[1, 2, 3, -1]", "[1, 2, 3, 4294967296]", "[1, 2, 3, 0.5]", "7"}) {
+        const std::string bad_doc = std::string(R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {
+            "0x1": {"stage": "fragment", "bindings": [{"group": 0, "binding": 0, "kind": "sampler",
+            "source": {"inline_sampler": {"sdwords": )") + words + "}}}]}}}";
+        StageReflectionIndex rejected;
+        CHECK(!parse_stage_reflection_json(bad_doc, &rejected, &error));
+        CHECK(error.find("inline_sampler needs sdwords") != std::string::npos);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -453,6 +528,7 @@ int main() {
     test_layout_join();
     test_plan_direct_slot();
     test_heap_sources();
+    test_inline_sampler();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;

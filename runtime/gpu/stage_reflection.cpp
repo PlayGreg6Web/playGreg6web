@@ -1,8 +1,12 @@
 #include "gpu/stage_reflection.h"
 
+#include "gpu/descriptor_words.h"
+
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 
@@ -371,6 +375,23 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                              " needs base_user_sgpr, stride and index {user_sgpr, shift}";
                     return false;
                 }
+            } else if (const Json* inline_sampler = src->get("inline_sampler"); inline_sampler != nullptr) {
+                r.source = ReflectedSource::InlineSampler;
+                const Json* words =
+                    inline_sampler->type == Json::Type::Object ? inline_sampler->get("sdwords") : nullptr;
+                bool ok = words != nullptr && words->type == Json::Type::Array && words->array.size() == 4;
+                for (size_t i = 0; ok && i < 4; ++i) {
+                    const Json& w = words->array[i];
+                    ok = w.type == Json::Type::Number && w.number >= 0 && w.number <= 4294967295.0 &&
+                         w.number == static_cast<double>(static_cast<uint32_t>(w.number));
+                    if (ok) {
+                        r.sampler_words[i] = static_cast<uint32_t>(w.number);
+                    }
+                }
+                if (!ok) {
+                    *error = "inline_sampler needs sdwords: four 32-bit unsigned integers";
+                    return false;
+                }
             } else if (src->get("static_sampler") != nullptr) {
                 r.source = ReflectedSource::StaticSampler;
                 if (!get_u32(*src, "static_sampler", &r.static_sampler)) {
@@ -427,6 +448,13 @@ std::string binding_key(const ReflectedBinding& b) {
         case ReflectedSource::RootConstants: k += " <- root constants at s" + std::to_string(b.user_sgpr); break;
         case ReflectedSource::RootDescriptor: k += " <- root descriptor at s" + std::to_string(b.user_sgpr); break;
         case ReflectedSource::StaticSampler: k += " <- static sampler " + std::to_string(b.static_sampler); break;
+        case ReflectedSource::InlineSampler: {
+            char w[64];
+            std::snprintf(w, sizeof(w), " <- inline sampler %08x %08x %08x %08x", b.sampler_words[0], b.sampler_words[1],
+                          b.sampler_words[2], b.sampler_words[3]);
+            k += w;
+            break;
+        }
         case ReflectedSource::SamplerHeap:
         case ReflectedSource::ResourceHeap:
             k += std::string(" <- ") + (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") +
@@ -501,7 +529,9 @@ bool same_binding(const bridge::LayoutBinding& a, const bridge::LayoutBinding& b
            a.join.root_constants == b.join.root_constants && a.join.heap == b.join.heap &&
            a.join.heap_index_parameter == b.join.heap_index_parameter &&
            a.join.heap_index_dword == b.join.heap_index_dword && a.join.heap_shift == b.join.heap_shift &&
-           a.join.table_parameter == b.join.table_parameter && a.join.table_slot == b.join.table_slot;
+           a.join.table_parameter == b.join.table_parameter && a.join.table_slot == b.join.table_slot &&
+           a.join.inline_sampler == b.join.inline_sampler &&
+           std::memcmp(&a.join.sampler, &b.join.sampler, sizeof(a.join.sampler)) == 0;
 }
 
 pso::WgpuVertexFormat element_class(pso::WgpuVertexFormat f, ReflectedComponentType* cls) {
@@ -619,6 +649,22 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
                 lb.join.heap_index_dword = dword;
                 lb.join.heap_shift = b.heap_shift;
+            } else if (b.source == ReflectedSource::InlineSampler) {
+                if (b.kind != ReflectedBindingKind::Sampler && b.kind != ReflectedBindingKind::ComparisonSampler) {
+                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take an inline sampler");
+                    continue;
+                }
+                d3d::SamplerDesc desc;
+                const bridge::DecodeStatus st = bridge::decode_sampler_words(b.sampler_words, &desc);
+                if (st != bridge::DecodeStatus::Ok) {
+                    fail(b, std::string("the inline sampler words do not decode (") + bridge::decode_status_name(st) +
+                                ")");
+                    continue;
+                }
+                cls = d3d::DescriptorRangeType::Sampler;
+                reg = space = d3d::kNoIndex;
+                lb.join.inline_sampler = true;
+                lb.join.sampler = desc;
             } else if (b.source == ReflectedSource::StaticSampler) {
                 cls = d3d::DescriptorRangeType::Sampler;
                 if (b.static_sampler < rs.static_samplers.size()) {
@@ -709,6 +755,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     case ReflectedSource::StaticSampler:
                     case ReflectedSource::SamplerHeap:
                     case ReflectedSource::ResourceHeap:
+                    case ReflectedSource::InlineSampler:
                         break;
                 }
             }

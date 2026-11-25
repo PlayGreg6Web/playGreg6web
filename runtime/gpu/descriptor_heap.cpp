@@ -1802,6 +1802,13 @@ BindGroupPlan BindGroupPlan::build(
         PlanEntry e;
         e.binding = b.binding;
         e.register_class = b.root_constants ? DescriptorRangeType::Cbv : b.register_class;
+        if (b.inline_sampler) {
+            e.source = PlanSource::InlineSampler;
+            e.register_class = DescriptorRangeType::Sampler;
+            e.sampler = b.sampler;
+            plan.entries_.push_back(e);
+            continue;
+        }
         if (b.heap != HeapAccess::None) {
             // Heap-indexed: the index is a root constant; the descriptor comes from the bound heap.
             if (b.heap_index_parameter < signature.parameter_count() &&
@@ -1907,6 +1914,13 @@ BindGroupPlan BindGroupPlan::build(
         h.u32(e.table_offset);
         h.u32(e.heap_dword);
         h.u32(e.heap_shift);
+        if (e.source == PlanSource::InlineSampler) {
+            uint32_t words[sizeof(SamplerDesc) / 4] = {};
+            std::memcpy(words, &e.sampler, sizeof(words));
+            for (uint32_t w : words) {
+                h.u32(w);
+            }
+        }
     }
     plan.hash_ = h.h;
     return plan;
@@ -2003,6 +2017,11 @@ void BindGroupCache::build_entries(
             e.kind = BindResourceKind::Sampler;
             e.root_parameter_index = kNoIndex;
             e.sampler = static_sampler_to_desc(desc.static_samplers[p.root_parameter_index]);
+            break;
+        case PlanSource::InlineSampler:
+            e.kind = BindResourceKind::Sampler;
+            e.root_parameter_index = kNoIndex;
+            e.sampler = p.sampler;
             break;
         case PlanSource::HeapIndexed: {
             DescriptorHeap* heap = nullptr;

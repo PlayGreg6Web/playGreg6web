@@ -88,6 +88,31 @@ class SidecarTests(unittest.TestCase):
             self.assertEqual(doc["stages"], {}, source)
             self.assertEqual(skipped, {"malformed heap source": 1}, source)
 
+    def test_inline_sampler_is_kept(self):
+        # Hand-made GFX10 S#: clamp-to-edge bilinear, linear mips, max LOD 15.
+        source = {"inline_sampler": {"sdwords": [0x92, 0x00F00000, 0x08500000, 0]}}
+        entry = {"hash_fnv1a64": "0x00000000000000d4", "stage": "fragment",
+                 "bindings": [{"group": 0, "binding": 34, "kind": "sampler", "source": source}]}
+        doc, skipped = sidecar.build([entry])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["stages"]["0x00000000000000d4"]["bindings"][0]["source"], source)
+
+    def test_malformed_inline_sampler_is_skipped(self):
+        bad = [
+            {"inline_sampler": {"sdwords": [1, 2, 3]}},
+            {"inline_sampler": {"sdwords": [1, 2, 3, -1]}},
+            {"inline_sampler": {"sdwords": [1, 2, 3, 0x100000000]}},
+            {"inline_sampler": {"sdwords": [1, 2, 3, "4"]}},
+            {"inline_sampler": {"sdwords": [1, 2, 3, True]}},
+            {"inline_sampler": [1, 2, 3, 4]},
+        ]
+        for i, source in enumerate(bad):
+            entry = {"hash_fnv1a64": f"0x{i + 16:016x}", "stage": "fragment",
+                     "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": source}]}
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, source)
+            self.assertEqual(skipped, {"malformed inline sampler": 1}, source)
+
     def test_merge_existing_preserves_and_overrides(self):
         existing_doc = {
             "schema": "playgta6-stage-reflection",

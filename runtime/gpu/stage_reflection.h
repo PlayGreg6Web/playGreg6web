@@ -31,7 +31,11 @@
 //                 "source": {"user_sgpr", "table_byte_offset"} | {"user_sgpr", "root_constants": true} |
 //                           {"user_sgpr", "root_descriptor": true} | {"static_sampler": <index>} |
 //                           {"sampler_heap" | "resource_heap": {"base_user_sgpr", "stride",
-//                                                               "index": {"user_sgpr", "shift"}}}}]}}}
+//                                                               "index": {"user_sgpr", "shift"}}} |
+//                           {"inline_sampler": {"sdwords": [d0, d1, d2, d3]}}}]}}}
+// An inline sampler (#482): the stage builds the sampler from constants in its code; "sdwords" are
+// the four GFX10 S# dwords, decoded at the join (bridge::decode_sampler_words) and bound as that
+// sampler. Words that do not decode as a sampler fail the join.
 // A heap source (S34; SM 6.6 SamplerDescriptorHeap[i] / ResourceDescriptorHeap[i] under the root-
 // signature flags SAMPLER_HEAP_DIRECTLY_INDEXED / CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED): the index is
 // a root constant (the user SGPR inside a constants parameter); the descriptor is the one at byte
@@ -75,7 +79,15 @@ enum class ReflectedBindingKind : uint8_t {
     ComparisonSampler,
 };
 
-enum class ReflectedSource : uint8_t { Table = 0, RootConstants, RootDescriptor, StaticSampler, SamplerHeap, ResourceHeap };
+enum class ReflectedSource : uint8_t {
+    Table = 0,
+    RootConstants,
+    RootDescriptor,
+    StaticSampler,
+    SamplerHeap,
+    ResourceHeap,
+    InlineSampler,  // the stage builds the S# from constants in its code (sampler_words)
+};
 
 struct ReflectedBinding {
     uint32_t group = 0;
@@ -97,6 +109,8 @@ struct ReflectedBinding {
     uint32_t heap_stride = 0;
     uint32_t heap_index_sgpr = 0;
     uint32_t heap_shift = 0;
+    // InlineSampler: the four GFX10 S# dwords the stage builds in SGPRs (decoded at the join).
+    uint32_t sampler_words[4] = {0, 0, 0, 0};
 };
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };

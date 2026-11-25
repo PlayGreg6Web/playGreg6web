@@ -817,6 +817,10 @@ struct ShaderBinding {
     // stages read their tables as memory, past the ranges a title's root signature declares (G62).
     uint32_t table_parameter = kNoIndex;
     uint32_t table_slot = 0;
+    // Inline sampler (register/space unused): the sampler the stage builds from constants in its
+    // code, decoded from its S# words at the join (stage_reflection.h).
+    bool inline_sampler = false;
+    SamplerDesc sampler{};
 };
 
 enum class PlanSource : uint32_t {
@@ -826,6 +830,7 @@ enum class PlanSource : uint32_t {
     RootConstants = 3,
     StaticSampler = 4,
     HeapIndexed = 5,  // ShaderBinding::heap: root_parameter_index is the constants parameter
+    InlineSampler = 6,  // ShaderBinding::inline_sampler: PlanEntry::sampler
 };
 
 struct PlanEntry {
@@ -836,6 +841,7 @@ struct PlanEntry {
     uint32_t table_offset = 0;                 // DescriptorTable: descriptor offset from the table start
     uint32_t heap_dword = 0;                   // HeapIndexed: the index constant within the parameter
     uint32_t heap_shift = 0;                   // HeapIndexed: byte offset = index << heap_shift
+    SamplerDesc sampler{};                     // InlineSampler
 };
 
 // The (root signature x bind group layout) join, computed once and reused for
