@@ -295,6 +295,21 @@ class RunTests(unittest.TestCase):
             args = json.loads((fx.build / "runs" / "mf" / "boot-report.json").read_text())["args"]
             self.assertEqual(args[args.index("--max-ms") + 1], "240000")
 
+    def test_menu_flow_2_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow-2"]["max_ms"], 360_000)
+        script = rnb.input_script_text(360_000, "menu-flow-2").splitlines()
+        events = [line.split() for line in script if not line.startswith("#")]
+        self.assertEqual(events[0], ["20000", "A", "100"])
+        times = [int(e[0]) for e in events]
+        self.assertEqual(times, sorted(times))
+        self.assertLess(times[-1], 360_000)
+        # Each cycle: Up x6 reset, then Down, Down, A (the list screen's third entry).
+        i = events.index(["64000", "DUp", "100"])
+        self.assertEqual([e[1] for e in events[i:i + 9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(events[i + 8], ["70500", "A", "100"])
+        self.assertIn(["78000", "DUp", "100"], events)
+        self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown"})
+
     def test_presets(self):
         self.assertEqual(rnb.PRESETS["long"]["max_ms"], 600_000)
         self.assertFalse(rnb.PRESETS["smoke"]["input"])

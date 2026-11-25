@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-command native boot runner: rebuild what is stale, run `playgta6_boot`, keep the run.
 
-    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|long] [--name NAME]
+    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|long] [--name NAME]
         [--exe PATH] [--game-dir DIR] [options] [-- extra playgta6_boot options]
 
 What it does, in order:
@@ -23,7 +23,8 @@ What it does, in order:
 2. Run `playgta6_boot --program-dir <program> --name <exe name> --game-dir <game-dir>` with a
    preset or explicit options. Presets: `smoke` (60 s limit, 90 s watchdog), `start-screen`
    (120 s limit; an input script pressing A for 100 ms once a second from 5 s on), `menu-flow`
-   (240 s limit; A every 2.5 s from 20 s, then D-pad Down, Down, A through LEGAL NOTICES), `long`
+   (240 s limit; A every 2.5 s from 20 s, then D-pad Down, Down, A through LEGAL NOTICES), `menu-flow-2` (360 s limit; the same, then
+   every 14 s Up x6 + Down, Down, A: leaves the list screen), `long`
    (600 s limit, 630 s watchdog). `--max-ms`, `--watchdog-ms`, `--input-script FILE`,
    `--shader-pack FILE`, `--gpu-capture-frames N` (captures into the run directory),
    `--gpu-capture-payloads`, `--gpu-capture-thin-uploads N`, `--dump-pipelines DIR` and everything after `--` are passed through.
@@ -71,6 +72,7 @@ PRESETS: dict[str, dict] = {
     "smoke": {"max_ms": 60_000, "watchdog_ms": 90_000, "input": None},
     "start-screen": {"max_ms": 120_000, "watchdog_ms": 150_000, "input": "start-screen"},
     "menu-flow": {"max_ms": 240_000, "watchdog_ms": 270_000, "input": "menu-flow"},
+    "menu-flow-2": {"max_ms": 360_000, "watchdog_ms": 390_000, "input": "menu-flow-2"},
     "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
@@ -259,7 +261,25 @@ def menu_flow_script_text(duration_ms: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def menu_flow_2_script_text(duration_ms: int) -> str:
+    """The menu-flow-2 preset: A every 2.5 s from 20 s (intro, start screen, loading, UI TEXT SIZE),
+    then every 14 s from 64 s a cursor reset (D-pad Up x6) + Down, Down, A. Measured (#663): the
+    list screen (4 draws/frame) is left by exactly that Down x2 + A, to the 20 draws/frame screen;
+    a second Down x2 + A cycle leads on to the 30 draws/frame screen (Down x0/x1 + A and RDown + A
+    did nothing). Later cycles keep the cursor deterministic whatever the arrival time."""
+    lines = ["# menu-flow-2 (tools/run_native_boot.py): A every 2.5 s from 20 s; every 14 s from 64 s:",
+             "# Up x6 (cursor reset), Down, Down, A (the list screen's third entry)"]
+    events = [(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)]
+    for t in range(64_000, duration_ms - 8_000, 14_000):
+        events += [(t + i * 400, "DUp", 100) for i in range(6)]
+        events += [(t + 3_000, "DDown", 150), (t + 4_500, "DDown", 150), (t + 6_500, "A", INPUT_HOLD_MS)]
+    lines += [f"{t} {b} {h}" for t, b, h in events if t < duration_ms]
+    return "\n".join(lines) + "\n"
+
+
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-flow-2":
+        return menu_flow_2_script_text(duration_ms)
     if kind == "menu-flow":
         return menu_flow_script_text(duration_ms)
     lines = ["# A pressed once a second from 5 s (tools/run_native_boot.py, start-screen preset)"]
