@@ -189,6 +189,7 @@ mod function;
 pub mod memory;
 pub mod target;
 
+pub use function::flag_liveness::FlagSummaries;
 pub use memory::MemoryModel;
 
 use std::collections::{BTreeSet, HashSet};
@@ -486,10 +487,23 @@ pub fn lift_function_with(
     func: &cfg::Function,
     model: impl Into<MemoryModel>,
 ) -> Result<LiftedFunction, LiftError> {
-    function::lift(func, model.into())
+    function::lift(func, model.into(), None)
 }
 
-/// Lifts a set of functions into one deterministic module (see [`emit_module`]).
+/// [`lift_function_with`] knowing which flags each function of the program may observe on
+/// entry ([`FlagSummaries::compute`] over every function the program links). Direct calls and
+/// tail jumps then store only the flags their callee can observe; the others are provably
+/// overwritten first, so their computation folds away in the caller.
+pub fn lift_function_in(
+    func: &cfg::Function,
+    model: impl Into<MemoryModel>,
+    flag_summaries: &FlagSummaries,
+) -> Result<LiftedFunction, LiftError> {
+    function::lift(func, model.into(), Some(flag_summaries))
+}
+
+/// Lifts a set of functions into one deterministic module (see [`emit_module`]). Calls between
+/// them use each other's [`FlagSummaries`].
 pub fn lift_module<'a>(
     functions: impl IntoIterator<Item = &'a cfg::Function>,
 ) -> Result<LiftedModule, LiftError> {
@@ -503,9 +517,11 @@ pub fn lift_module_with<'a>(
     model: impl Into<MemoryModel>,
 ) -> Result<LiftedModule, LiftError> {
     let model = model.into();
+    let functions: Vec<&cfg::Function> = functions.into_iter().collect();
+    let flag_summaries = FlagSummaries::compute(functions.iter().copied());
     let mut lifted = Vec::new();
     for func in functions {
-        lifted.push(lift_function_with(func, model)?);
+        lifted.push(lift_function_in(func, model, &flag_summaries)?);
     }
     lifted.sort_by_key(|f| f.entry);
     let ir = emit_module(&lifted)?;

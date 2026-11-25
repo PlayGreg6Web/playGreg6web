@@ -36,6 +36,10 @@ mod memory_access;
 mod string_ops;
 #[path = "unwind.rs"]
 mod unwind;
+#[path = "flag_liveness.rs"]
+pub(super) mod flag_liveness;
+
+use flag_liveness::{ALL_FLAGS, FlagMask, FlagSummaries};
 
 pub(super) use atomics::CMPXCHG16B_IR;
 pub(super) use bit_ops::{PDEP_IR, PEXT_IR};
@@ -225,7 +229,11 @@ fn is_immediate(kind: OpKind) -> bool {
 }
 
 /// Lifts one function (see `super::lift_function`).
-pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFunction, LiftError> {
+pub(super) fn lift(
+    func: &cfg::Function,
+    memory: MemoryModel,
+    flag_summaries: Option<&FlagSummaries>,
+) -> Result<LiftedFunction, LiftError> {
     if !func.blocks.contains_key(&func.entry) {
         return Err(LiftError::MissingEntryBlock { entry: func.entry });
     }
@@ -331,6 +339,7 @@ pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFu
         share_ret: return_blocks > 1,
         has_shared_ret: false,
         unwind_sites: 0,
+        flag_summaries,
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
@@ -396,6 +405,9 @@ struct FunctionLifter<'a> {
     has_shared_ret: bool,
     /// Calls followed by a resume-protocol check (see `unwind`).
     unwind_sites: u32,
+    /// Flags each known direct callee may observe on entry (`flag_liveness`); without it every
+    /// call and tail jump stores every tracked flag.
+    flag_summaries: Option<&'a FlagSummaries>,
 }
 
 struct Checkpoint {
@@ -559,7 +571,8 @@ impl FunctionLifter<'_> {
         for &target in &exits {
             let exit = exit_label(target);
             self.start_block(&exit);
-            self.sync_out();
+            let flags = self.flags_needed_by(target);
+            self.sync_out_flags(flags);
             self.emit(&format!(
                 "tail call void @{}(ptr %state)",
                 function_symbol(target)
@@ -823,6 +836,18 @@ impl FunctionLifter<'_> {
 
     /// Stores all tracked registers and flags from their allocas back into `%state`.
     fn sync_out(&mut self) {
+        self.sync_out_flags(ALL_FLAGS);
+    }
+
+    /// Flags a direct call or tail jump to `target` has to store (see `flag_liveness`).
+    fn flags_needed_by(&self, target: u64) -> FlagMask {
+        self.flag_summaries
+            .map_or(ALL_FLAGS, |summaries| summaries.needed_by(target))
+    }
+
+    /// [`Self::sync_out`] storing only the tracked flags in `flags`: the others are dead because
+    /// the callee overwrites them before anything can observe them.
+    fn sync_out_flags(&mut self, flags: FlagMask) {
         for idx in 0..16 {
             if self.regs[idx] {
                 let v = self.val(&format!("load i64, ptr %{}", GPR_NAMES[idx]));
@@ -831,7 +856,7 @@ impl FunctionLifter<'_> {
             }
         }
         for flag in FLAGS {
-            if self.flags[flag as usize] {
+            if self.flags[flag as usize] && flags & (1 << flag as usize) != 0 {
                 let bit = self.val(&format!("load i1, ptr {}", flag.slot()));
                 let byte = self.val(&format!("zext i1 {bit} to i8"));
                 let ptr = self.state_flag_ptr(flag);
@@ -1913,7 +1938,8 @@ impl FunctionLifter<'_> {
                 self.start_block(&dead);
                 return Ok(());
             }
-            self.sync_out();
+            let flags = self.flags_needed_by(target);
+            self.sync_out_flags(flags);
             self.guest_call(&format!(
                 "call void @{}(ptr %state)",
                 function_symbol(target)

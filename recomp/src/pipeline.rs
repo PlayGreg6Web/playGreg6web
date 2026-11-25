@@ -759,6 +759,8 @@ pub fn lift_shards_with_dispatch(
         IndirectDispatch::Table => None,
         IndirectDispatch::Shard => Some(compute_cross_shard_callees(functions, shards)),
     };
+    // Whole-program flag summaries: direct calls across shards link to the same functions.
+    let flag_summaries = lift::FlagSummaries::compute(functions.iter().copied());
     let lift_dir = out_dir.join(LIFT_DIR);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -784,6 +786,7 @@ pub fn lift_shards_with_dispatch(
                     let result = lift_shard(
                         target,
                         memory,
+                        &flag_summaries,
                         dispatch,
                         index,
                         &functions[range.clone()],
@@ -806,9 +809,11 @@ pub fn lift_shards_with_dispatch(
     results.into_iter().map(|(_, result)| result).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lift_shard(
     target: &LiftTarget,
     memory: &MemoryModel,
+    flag_summaries: &lift::FlagSummaries,
     dispatch: Option<ShardDispatch<'_>>,
     index: usize,
     functions: &[&Function],
@@ -820,9 +825,11 @@ fn lift_shard(
     for function in functions {
         instructions += function.instruction_count();
         lifted.push(
-            lift::lift_function_with(function, *memory).map_err(|error| PipelineError::Lift {
-                entry: function.entry,
-                error,
+            lift::lift_function_in(function, *memory, flag_summaries).map_err(|error| {
+                PipelineError::Lift {
+                    entry: function.entry,
+                    error,
+                }
             })?,
         );
     }
