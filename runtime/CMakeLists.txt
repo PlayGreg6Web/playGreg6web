@@ -345,6 +345,12 @@ else()
     add_executable(bench_indirect_call ../tests/bench_indirect_call.cpp)
     target_link_libraries(bench_indirect_call PRIVATE playgta6_core)
     add_test(NAME bench_indirect_call_smoke COMMAND bench_indirect_call)
+
+    # XMem physical-page commit path micro-benchmark (R40); CTest runs the smoke variant
+    # (`bench_xmem_map --full [--threads N]` for numbers).
+    add_executable(bench_xmem_map ../tests/bench_xmem_map.cpp)
+    target_link_libraries(bench_xmem_map PRIVATE playgta6_core)
+    add_test(NAME bench_xmem_map_smoke COMMAND bench_xmem_map)
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)
