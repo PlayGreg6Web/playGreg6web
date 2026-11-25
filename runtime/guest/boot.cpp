@@ -2820,7 +2820,7 @@ BootResult run_boot(const BootConfig& config) {
         os::win32::set_process_shared_zone(false);
     }
     if (!config.present_frame_waits) {
-        gpu::xbox::set_present_token_waits(false);
+        gpu::d3d12_guest::xbox::set_present_token_waits(false);
     }
     if (!config.audio_endpoint) {
         os::scarlett::guest_api::set_audio_endpoint_enabled(false);
