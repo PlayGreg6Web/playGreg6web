@@ -115,6 +115,18 @@ class TestReplayCapture(unittest.TestCase):
         self.assertEqual(dropped, 2 * (48 + 4))
         self.assertEqual(out, frames[0] + pkt(7) + pkt(7) + pkt(7) + b"".join(f + pkt(7) for f in frames[3:]))
 
+    def test_trim_keeps_writes_rewritten_only_much_later(self) -> None:
+        # #691: an atlas band written at frame 1 and rewritten (with more glyphs) only at frame 30
+        # must survive: dropping it leaves the replay without its glyphs for 29 frames.
+        def write(y, h):
+            return pkt(13, struct.pack("<12I", 9, 0, 0, y, 0, 64, h, 1, 256, h, 4, 0) + b"abcd")
+        data = write(0, 256) + pkt(7) + write(0, 64) + pkt(7) * 29 + write(0, 64) + pkt(7) + write(0, 64) + pkt(7)
+        late = len(write(0, 256)) + 8 + len(write(0, 64)) + 8 * 29
+        self.assertEqual(replay_capture.superseded_writes(data, [9]), {late})
+        self.assertEqual(replay_capture.superseded_writes(data, [9], horizon=40), {len(write(0, 256)) + 8, late})
+        out, n, dropped = replay_capture.trim_trace(data, 100, [9])
+        self.assertEqual((n, dropped), (32, 48 + 4))
+
     def test_thin_marker_is_skipped(self) -> None:
         tex_marker = pkt(13, struct.pack("<I", 1) + b"\0" * 36 + struct.pack("<II", 0, 0x6E696874))
         buf_marker = pkt(4, struct.pack("<IIII", 7, 0, 0, 0x6E696874))

@@ -13,8 +13,8 @@ Example:
 --replay-dir holds the trace and the wgsl pack (served at /data/). With --trim-every N the
 --trim-largest textures (by total uploaded bytes) keep only the uploads in frames where
 frame % N == 0, and the trimmed copy <trace>.trimmed is replayed instead. An upload is dropped only
-when a later upload of the same texture and mip rewrites its whole region, so incremental sub-rect
-writes (a glyph atlas filled band by band, #691) survive the trim.
+when a later upload of the same texture and mip rewrites its whole region within a few frames, so
+incremental sub-rect writes (a glyph atlas filled band by band, #691) survive the trim.
 Writes <out>-swap<frame>.png thumbnails and <out>.log.txt.
 """
 import argparse
@@ -116,26 +116,35 @@ def largest_textures(data, count):
     return [t for t, _ in sorted(sizes.items(), key=lambda kv: -kv[1])[:count]]
 
 
-def superseded_writes(data, ids):
+# A write is dropped only when its rewrite follows within this many presents: otherwise the replay
+# shows the stale texture until then (#691: an atlas band written at frame 819 and rewritten at
+# 1084 was dropped, so the UI TEXT SIZE screen drew glyphs that were never uploaded).
+SUPERSEDE_HORIZON_FRAMES = 4
+
+
+def superseded_writes(data, ids, horizon=SUPERSEDE_HORIZON_FRAMES):
     """Offsets of the WriteTexture packets for `ids` whose region (origin + extent) a later
-    WriteTexture of the same texture and mip lies around completely. Only those are safe to drop:
-    any other write (a sub-rect update nothing rewrites later, e.g. new glyphs in an atlas, #691)
-    would leave the texture stale for the rest of the replay."""
+    WriteTexture of the same texture and mip lies around completely, at most `horizon` presents
+    later. Only those are safe to drop: any other write (a sub-rect update nothing rewrites soon,
+    e.g. new glyphs in an atlas, #691) would leave the texture stale in the replay."""
     ids = set(ids)
     writes = []
+    frame = 0
     for off, op, ln in iter_packets(data):
         if op == OP_WRITE_TEXTURE and ln >= 48 and not is_thin_marker(data, off, op, ln):
             tex, mip, ox, oy, oz, w, h, d = struct.unpack_from("<8I", data, off + 8)
             if tex in ids:
-                writes.append((off, (tex, mip), (ox, oy, oz, ox + w, oy + h, oz + d)))
-    later = defaultdict(set)  # (texture, mip) -> distinct regions written after the current packet
+                writes.append((off, frame, (tex, mip), (ox, oy, oz, ox + w, oy + h, oz + d)))
+        elif op == OP_PRESENT:
+            frame += 1
+    later = defaultdict(dict)  # (texture, mip) -> region -> earliest frame it is written after the current packet
     out = set()
-    for off, key, r in reversed(writes):
+    for off, frame, key, r in reversed(writes):
         seen = later[key]
         if any(o[0] <= r[0] and o[1] <= r[1] and o[2] <= r[2] and o[3] >= r[3] and o[4] >= r[4] and o[5] >= r[5]
-               for o in seen):
+               and f - frame <= horizon for o, f in seen.items()):
             out.add(off)
-        seen.add(r)
+        seen[r] = frame
     return out
 
 
