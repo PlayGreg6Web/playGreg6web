@@ -697,6 +697,8 @@ DeviceStats Device::stats() const {
     s.textures_uploaded = textures_uploaded_.load();
     s.skipped_draws = skipped_draws_.load();
     s.unsupported_copies = unsupported_copies_.load();
+    s.shadow_bytes = shadow_bytes_.load();
+    s.shadow_resident_bytes = shadow_resident_bytes_.load();
     return s;
 }
 

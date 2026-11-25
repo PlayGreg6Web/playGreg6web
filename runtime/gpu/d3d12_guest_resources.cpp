@@ -1362,6 +1362,7 @@ Resource::~Resource() {
     }
     if (tracked_) {
         device_->untrack_cpu_buffer(this);
+        device_->note_shadow_bytes(-static_cast<int64_t>(shadow_size_), -static_cast<int64_t>(shadow_resident_));
     }
     if (texture_tracked_) {
         device_->untrack_guest_texture(id_);
@@ -1461,7 +1462,10 @@ bool Resource::initialize() {
         dev.submit(enc);
         dev.state_bridge().register_buffer(id_, gpu_va_, size, allocated);
         if (cpu_va_ != 0) {
-            shadow_.assign(static_cast<size_t>(size), 0);
+            // O36: no host memory yet (see shadow_chunks_): the chunks come with the first uploads.
+            shadow_size_ = size;
+            shadow_chunks_.resize(static_cast<size_t>((size + kShadowChunk - 1) / kShadowChunk));
+            dev.note_shadow_bytes(static_cast<int64_t>(size), 0);
             dev.track_cpu_buffer(this);
             tracked_ = true;
         }
@@ -1681,17 +1685,53 @@ void Resource::mark_back_buffer() {
     back_buffer_.store(true);
 }
 
+bool Resource::shadow_same(uint64_t off, const uint8_t* live, uint64_t n) const {
+    const uint8_t* chunk = shadow_chunks_[static_cast<size_t>(off / kShadowChunk)].get();
+    if (chunk == nullptr) {
+        return all_zero_bytes(live, static_cast<size_t>(n));
+    }
+    return same_bytes(chunk + off % kShadowChunk, live, static_cast<size_t>(n));
+}
+
+void Resource::shadow_store(uint64_t off, const uint8_t* src, uint64_t n) {
+    while (n != 0) {
+        const size_t index = static_cast<size_t>(off / kShadowChunk);
+        const uint64_t in_chunk = off % kShadowChunk;
+        const uint64_t take = std::min(n, kShadowChunk - in_chunk);
+        std::unique_ptr<uint8_t[]>& chunk = shadow_chunks_[index];
+        if (chunk == nullptr && !all_zero_bytes(src, static_cast<size_t>(take))) {
+            const uint64_t chunk_bytes = std::min(kShadowChunk, shadow_size_ - index * kShadowChunk);
+            chunk = std::make_unique<uint8_t[]>(static_cast<size_t>(chunk_bytes));  // zeroed
+            shadow_resident_ += chunk_bytes;
+            device_->note_shadow_bytes(0, static_cast<int64_t>(chunk_bytes));
+        }
+        if (chunk != nullptr) {
+            std::memcpy(chunk.get() + in_chunk, src, static_cast<size_t>(take));
+        }
+        off += take;
+        src += take;
+        n -= take;
+    }
+}
+
 void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks) {
-    if (cpu_va_ == 0 || shadow_.empty()) {
+    if (cpu_va_ == 0 || shadow_size_ == 0) {
         return;
     }
-    const uint64_t size = shadow_.size();
+    const uint64_t size = shadow_size_;
     const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu_va_, static_cast<size_t>(size)));
     std::vector<uint8_t> copy;
     if (live == nullptr) {
         // Not mapped in one piece (e.g. an alias-window buffer whose pages are mapped one by one):
         // unreadable pages keep their shadow contents, i.e. count as unchanged.
-        copy.assign(shadow_.begin(), shadow_.end());
+        copy.assign(static_cast<size_t>(size), 0);
+        for (size_t i = 0; i < shadow_chunks_.size(); ++i) {
+            if (shadow_chunks_[i] != nullptr) {
+                const uint64_t off = i * kShadowChunk;
+                std::memcpy(copy.data() + off, shadow_chunks_[i].get(),
+                            static_cast<size_t>(std::min(kShadowChunk, size - off)));
+            }
+        }
         if (!com::read_guest(cpu_va_, copy.data(), copy.size())) {
             for (uint64_t page = 0; page < size; page += kShadowPage) {
                 const uint64_t n = std::min(kShadowPage, size - page);
@@ -1752,7 +1792,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
             const uint64_t n = std::min(kMaxWriteChunk, end - off);
             count_work(Work::BufferUploads);
         encoder.write_buffer(id_, static_cast<uint32_t>(off), live + off, static_cast<uint32_t>(n));
-            std::memcpy(shadow_.data() + off, live + off, static_cast<size_t>(n));
+            shadow_store(off, live + off, n);
             uploaded += n;
         }
     };
@@ -1764,7 +1804,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
              it = std::find(it + 1, candidate.end(), true)) {
             const uint64_t page = static_cast<uint64_t>(it - candidate.begin()) * kShadowPage;
             const uint64_t n = std::min(kShadowPage, size - page);
-            if (same_bytes(shadow_.data() + page, live + page, static_cast<size_t>(n))) {
+            if (shadow_same(page, live + page, n)) {
                 continue;
             }
             if (in_run && run_end == page) {
@@ -1789,8 +1829,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const uint64_t n = std::min(kShadowPage, size - page);
         const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
-        const bool changed = (listed || verify) &&
-                             !same_bytes(shadow_.data() + page, live + page, static_cast<size_t>(n));
+        const bool changed = (listed || verify) && !shadow_same(page, live + page, n);
         if (changed && !listed && !os::guest_window::write_marked(cpu_va_ + page)) {
             // (A slot marked by now was written while this flush compared: not missed, and its
             // mark reports it again.)

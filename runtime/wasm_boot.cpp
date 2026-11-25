@@ -872,7 +872,9 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
                             "psos=" + std::to_string(s.pipeline_states) +
                                 " submissions=" + std::to_string(s.submissions) +
                                 " presents=" + std::to_string(s.presents) +
-                                " skipped_draws=" + std::to_string(s.skipped_draws));
+                                " skipped_draws=" + std::to_string(s.skipped_draws) +
+                                " shadow_bytes=" + std::to_string(s.shadow_bytes) +
+                                " shadow_resident_bytes=" + std::to_string(s.shadow_resident_bytes));
     }
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;

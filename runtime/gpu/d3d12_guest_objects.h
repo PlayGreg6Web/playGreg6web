@@ -623,6 +623,10 @@ struct DeviceStats {
     uint64_t presents = 0;
     uint64_t submissions = 0;
     uint64_t bad_arguments = 0;  // malformed guest structs / pointers (diagnosed, E_INVALIDARG)
+    // O36: the live CPU-visible buffers' shadows: the bytes they cover (an eager shadow's host
+    // memory) and the bytes allocated for them (lazy chunks written so far).
+    uint64_t shadow_bytes = 0;
+    uint64_t shadow_resident_bytes = 0;
 };
 
 class Resource;
@@ -897,6 +901,10 @@ public:
     void register_gpu_alias(uint64_t gpu_base, uint64_t cpu_base, uint64_t size);
     uint64_t cpu_address_for_gpu(uint64_t gpu_va) const;  // gpu_va itself outside every window
     void note_upload(uint64_t bytes) { upload_bytes_.fetch_add(bytes, std::memory_order_relaxed); }
+    void note_shadow_bytes(int64_t covered, int64_t resident) {
+        shadow_bytes_.fetch_add(static_cast<uint64_t>(covered), std::memory_order_relaxed);
+        shadow_resident_bytes_.fetch_add(static_cast<uint64_t>(resident), std::memory_order_relaxed);
+    }
     void note_texture_upload(uint64_t count = 1) { textures_uploaded_.fetch_add(count, std::memory_order_relaxed); }
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
@@ -1120,6 +1128,8 @@ private:
     mutable std::mutex detile_mutex_;
     DetileFn detile_texture_;
     std::atomic<uint64_t> upload_bytes_{0};
+    std::atomic<uint64_t> shadow_bytes_{0};
+    std::atomic<uint64_t> shadow_resident_bytes_{0};
     std::atomic<uint64_t> textures_uploaded_{0};
     std::array<std::atomic<uint64_t>, 7> descriptor_words_{};
     std::atomic<uint32_t> descriptor_words_reported_{0};  // bit per WordsStatus already logged

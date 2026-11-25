@@ -1501,6 +1501,8 @@ void test_frame_end_to_end() {
     CHECK(count_op(ps3, GpuOpcode::WriteBuffer) == 1);
     CHECK(count_op(ps3, GpuOpcode::Draw) == 1);  // a closed list can be executed again
     CHECK(dev->stats().upload_bytes == 72);
+    // O36: the written buffer's (one, short) shadow chunk was allocated by its first upload.
+    CHECK(object_of<dg::Resource>(scene.vb)->shadow_resident_bytes() == object_of<dg::Resource>(scene.vb)->shadow_bytes());
     // A plain store through the translated pointer (how lifted code writes) is found as well, and
     // only its page is compared and uploaded.
     auto* vb_host = static_cast<float*>(com::guest_to_host(scene.vb_cpu, 36));
@@ -5672,11 +5674,34 @@ void test_window_write_marks_flush() {
         };
         const uint64_t list = scene.new_list();
         const uint32_t one = 1;
-        // First flush: everything compared (the marks of the mapping are taken here too).
+        // O36: the shadow is lazy: no host memory before an upload, nor after a flush that found
+        // only zeros (an untouched buffer).
+        dg::Resource* res = object_of<dg::Resource>(buf);
+        CHECK(res->shadow_bytes() == 2 * k64K && res->shadow_resident_bytes() == 0);
+        {
+            // First flush: everything compared (the marks of the mapping are taken here too).
+            size_t m = fx.captured.size();
+            scene.execute({list});
+            CHECK(writes(m).empty() && res->shadow_resident_bytes() == 0);
+        }
+        // A marked write is uploaded; only the written 64 KiB chunk of the shadow gets host memory.
         CHECK(com::write_guest(C + 5 * k64K + 0x2000, one));
         size_t mark = fx.captured.size();
         scene.execute({list});
         CHECK((writes(mark) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x2000)}));
+        CHECK(res->shadow_resident_bytes() == k64K);
+        // A write back to zero in an allocated chunk is still seen.
+        {
+            const uint32_t zero = 0;
+            CHECK(com::write_guest(C + 5 * k64K + 0x2000, zero));
+            size_t m = fx.captured.size();
+            scene.execute({list});
+            CHECK((writes(m) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x2000)}));
+            CHECK(com::write_guest(C + 5 * k64K + 0x2000, one));
+            m = fx.captured.size();
+            scene.execute({list});
+            CHECK((writes(m) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x2000)}));
+        }
         // Nothing marked: nothing compared, nothing uploaded.
         mark = fx.captured.size();
         scene.execute({list});
@@ -5714,6 +5739,7 @@ void test_window_write_marks_flush() {
         CHECK(result == 0 && object_of<dg::Resource>(buf2)->cpu_address() == C + 4 * k64K + 0x8000);
         const uint32_t id2 = object_of<dg::Resource>(buf2)->id();
         scene.execute({list});  // buf2's first flush (everything compared)
+        CHECK(object_of<dg::Resource>(buf2)->shadow_resident_bytes() == 0);  // zeros: nothing allocated
         CHECK(com::write_guest(C + 4 * k64K + 0x200, one));
         CHECK(com::write_guest(C + 4 * k64K + 0x8010, two));
         mark = fx.captured.size();
@@ -5721,9 +5747,15 @@ void test_window_write_marks_flush() {
         CHECK((writes(mark) == std::vector<uint32_t>{0, 0x8000}));  // (the second buffer lies inside the first)
         bool second_uploaded = false;
         for (const Packet& p : packets_since(fx, mark)) {
-            second_uploaded |= p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == id2;
+            second_uploaded |= p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == id2 &&
+                               payload_as<GpuWriteBufferPayload>(p).dst_offset == 0;
         }
         CHECK(second_uploaded);
+        CHECK(object_of<dg::Resource>(buf2)->shadow_resident_bytes() == 0x1000);  // its one (short) chunk
+        {
+            const dg::DeviceStats s = host_device(scene.device)->stats();
+            CHECK(s.shadow_bytes >= 2 * k64K + 0x1000 && s.shadow_resident_bytes <= s.shadow_bytes);
+        }
         fx.vcall(buf2, Slot::Release);
         fx.vcall(buf, Slot::Release);
         fx.vcall(list, Slot::Release);

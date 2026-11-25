@@ -31,7 +31,9 @@
 //    device compares each tracked buffer with its shadow in 4 KiB pages and emits WriteBuffer for
 //    the changed runs (before the command lists' packets). Map/Unmap need no bookkeeping, so
 //    persistently mapped buffers and memory the guest writes without Map work the same way. Cost:
-//    one memcmp of every tracked buffer per submission.
+//    one memcmp of every tracked buffer per submission (only written pages where the arena or
+//    the window tracks writes). The shadow's host memory is allocated lazily per 64 KiB chunk on
+//    the first upload into it; an unallocated chunk compares as zeros.
 //  * CopyBufferRegion / CopyResource from a CPU-visible buffer and CopyTextureRegion from a placed
 //    footprint in a CPU-visible buffer become WriteBuffer / WriteTexture packets built from guest
 //    memory at ExecuteCommandLists time (the source holds what the GPU would read when the list
@@ -181,8 +183,12 @@ public:
     void flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks = nullptr);
     // O36: the flush indexes a buffer by window slot once its write marks are in use; it is then
     // only flushed when one of its slots is marked.
-    bool window_marks_in_use() const { return window_marked_ && cpu_va_ != 0 && !shadow_.empty(); }
-    uint64_t shadow_bytes() const { return shadow_.size(); }
+    bool window_marks_in_use() const { return window_marked_ && cpu_va_ != 0 && shadow_size_ != 0; }
+    // The bytes the shadow covers (the buffer's size) and the part of it backed by host memory
+    // (O36: lazy chunks, see shadow_chunks_).
+    uint64_t shadow_bytes() const { return shadow_size_; }
+    uint64_t shadow_resident_bytes() const { return shadow_resident_; }
+    static constexpr uint64_t kShadowChunk = 64u << 10;
     bool slot_indexed() const { return slot_indexed_; }
     void set_slot_indexed(bool v) { slot_indexed_ = v; }
     // Marks the texture as the presented back buffer (Device::set_back_buffer).
@@ -204,7 +210,16 @@ private:
     bool tracked_ = false;
     bool texture_tracked_ = false;
     std::atomic<bool> back_buffer_{false};
-    std::vector<uint8_t> shadow_;
+    // O36: the shadow is allocated lazily in kShadowChunk chunks. A chunk without storage holds
+    // zeros (what the GPU buffer was created with), so a buffer the guest never writes non-zero
+    // bytes into costs no host memory; a chunk is allocated by the first upload into it.
+    uint64_t shadow_size_ = 0;
+    uint64_t shadow_resident_ = 0;
+    std::vector<std::unique_ptr<uint8_t[]>> shadow_chunks_;
+    // Whether the shadow's `n` bytes at `off` (one 4 KiB page, inside one chunk) equal `live`.
+    bool shadow_same(uint64_t off, const uint8_t* live, uint64_t n) const;
+    // Copies `n` bytes from `src` into the shadow at `off`, allocating the chunks it reaches.
+    void shadow_store(uint64_t off, const uint8_t* src, uint64_t n);
     // The arena's write tracking covers this buffer and was reset at a full comparison: later
     // flushes compare only the pages reported written since (os::take_written_pages).
     bool write_tracked_ = false;
