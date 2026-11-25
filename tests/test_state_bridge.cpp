@@ -1951,6 +1951,78 @@ void test_bc_texture_upload_needs_feature() {
     com::set_guest_memory(nullptr);
 }
 
+// G66: a view-only R16_UNORM texture (sampled only as unfilterable-float in WebGPU) is created in a
+// filterable float format and its texels are converted on upload: r32float (exact) with
+// float32-filterable, r16float (rounded) without. Its SRV view names the same format.
+void test_norm16_address_texture_upload() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace pso = playgta6::gpu::pso;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        // 4x2 R16_UNORM, linear 0x100: 4 texels x 2 B = 8 B rows at a 256 B pitch.
+        const uint16_t row0[4] = {0, 65535, 32768, 1};
+        const uint16_t row1[4] = {100, 200, 300, 400};
+        const uint64_t mem = arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(com::write_guest(mem, row0, sizeof(row0)) && com::write_guest(mem + 256, row1, sizeof(row1)));
+        const uint32_t tier1 = pso::WgpuFeature::TextureFormatsTier1;
+        for (const uint32_t features : {tier1 | pso::WgpuFeature::Float32Filterable, tier1}) {
+            const bool f32 = (features & pso::WgpuFeature::Float32Filterable) != 0;
+            std::vector<uint8_t> submitted;
+            dg::DeviceOptions dev_opts;
+            dev_opts.sink = [&submitted](const uint8_t* data, size_t size) {
+                submitted.insert(submitted.end(), data, data + size);
+            };
+            dev_opts.bridge.features = features;
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+            const uint32_t id = device->ensure_address_texture(mem, 56, 4, 2, 1, 1, 0x100,
+                                                               GpuTextureDimension::Dim2D, false);
+            CHECK(id != 0);
+            bool created = false;
+            for (const Packet& pk : decode_bytes(submitted)) {
+                if (pk.opcode == GpuOpcode::CreateTexture2) {
+                    const auto ct = pod<GpuCreateTexture2Payload>(pk);
+                    created = ct.id == id && ct.format == static_cast<uint8_t>(f32 ? pso::WgpuTextureFormat::R32Float
+                                                                                    : pso::WgpuTextureFormat::R16Float);
+                }
+            }
+            CHECK(created);
+            gpu::CommandEncoder enc;
+            CHECK(device->sync_bound_texture_memory(id, enc));
+            std::vector<Packet> writes;
+            for (const Packet& pk : decode(enc)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    writes.push_back(pk);
+                }
+            }
+            CHECK(writes.size() == 1);
+            if (writes.size() == 1) {
+                const auto wt = pod<GpuWriteTexturePayload>(writes[0]);
+                CHECK(wt.width == 4 && wt.height == 2 && wt.bytes_per_row == 256);
+                const uint8_t* rows = writes[0].payload.data() + sizeof(GpuWriteTexturePayload);
+                if (f32) {
+                    float v[4] = {};
+                    std::memcpy(v, rows, sizeof(v));
+                    CHECK(v[0] == 0.0f && v[1] == 1.0f && v[2] == 32768.0f / 65535.0f && v[3] == 1.0f / 65535.0f);
+                    std::memcpy(v, rows + 256, sizeof(v));
+                    CHECK(v[0] == 100.0f / 65535.0f && v[3] == 400.0f / 65535.0f);
+                } else {
+                    uint16_t hv[4] = {};
+                    std::memcpy(hv, rows, sizeof(hv));
+                    CHECK(hv[0] == 0x0000 && hv[1] == 0x3C00 && hv[2] == 0x3800 && hv[3] == 0x0100);
+                }
+            }
+        }
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
 // ------------------------------------------------------------------------------------------------
 // G49b: GPU Fence completion audit & ExecuteCommandLists / PresentX com::Ref lifetime audit
 // ------------------------------------------------------------------------------------------------
@@ -2152,6 +2224,7 @@ int main() {
     test_dirty_texture_memory_upload();
     test_all_subresource_uploads();
     test_bc_texture_upload_needs_feature();
+    test_norm16_address_texture_upload();
     test_fence_completion_and_ref_lifetime();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

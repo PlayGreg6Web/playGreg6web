@@ -645,7 +645,8 @@ inline constexpr uint32_t Rg11b10UfloatRenderable = 1u << 4; // "rg11b10ufloat-r
 inline constexpr uint32_t DualSourceBlending = 1u << 5;      // "dual-source-blending"
 inline constexpr uint32_t TextureFormatsTier1 = 1u << 6;     // "texture-formats-tier1"
 inline constexpr uint32_t Bgra8UnormStorage = 1u << 7;       // "bgra8unorm-storage"
-inline constexpr uint32_t All = (1u << 8) - 1u;
+inline constexpr uint32_t Float32Filterable = 1u << 8;       // "float32-filterable"
+inline constexpr uint32_t All = (1u << 9) - 1u;
 }  // namespace WgpuFeature
 
 const char* texture_format_name(WgpuTextureFormat format) noexcept;
@@ -710,6 +711,10 @@ enum class FormatUsage : uint8_t {
     RenderTarget,
     DepthStencil,
     Sampled,
+    // A texture that is only ever sampled or written as storage, never a render target (and its
+    // views): as Sampled, except that formats WebGPU samples only as unfilterable-float get a
+    // filterable representation whose texels the upload converts (see map_texture_format).
+    SampledOnly,
 };
 
 namespace FormatDiag {
@@ -719,6 +724,7 @@ inline constexpr uint32_t FeatureFallback = 1u << 2;    // feature missing: prom
 inline constexpr uint32_t NeedsCpuConversion = 1u << 3; // uploads must be converted (BC decode, widening)
 inline constexpr uint32_t AlphaIgnored = 1u << 4;       // X8 channel formats: alpha must read as 1
 inline constexpr uint32_t NeedsViewReinterpretation = 1u << 5;  // typeless resource viewed as other types
+inline constexpr uint32_t LossyConversion = 1u << 6;  // the converted texels lose precision (reported)
 }  // namespace FormatDiag
 
 struct TextureFormatMapping {
@@ -742,7 +748,22 @@ struct TextureFormatMapping {
 //   rgba8unorm (FeatureFallback | NeedsCpuConversion: uploads widen 16bpp -> 32bpp, channels swizzled).
 // * Xbox D16_UNORM_S8_UINT (and its R16_UNORM_X8 / X16_G8 views) has no 16-bit depth + stencil WebGPU format:
 //   it promotes to depth24plus-stencil8 (FeatureFallback), with the depth/stencil aspect for the views.
+// * SampledOnly: the 16-bit normalized formats (R16/R16G16/R16G16B16A16 UNORM and SNORM) are sampleable
+//   only as unfilterable-float in WebGPU (r16unorm & co., and their r32float & co. fallbacks without
+//   "float32-filterable"), so a stage that samples them with a filtering sampler cannot bind them. They
+//   become r32float / rg32float / rgba32float with "float32-filterable" (exact: every 16-bit normalized
+//   value is a float32), else r16float / rg16float / rgba16float (LossyConversion: 11-bit mantissa).
+//   Both are filterable and also bind where the layout asks for unfilterable-float. NeedsCpuConversion:
+//   the upload converts the texels (convert_norm16_texels).
 TextureFormatMapping map_texture_format(DxgiFormat format, FormatUsage usage, uint32_t features) noexcept;
+
+// Converts tightly packed texels of a 16-bit normalized DXGI format (R16 / R16G16 / R16G16B16A16, UNORM
+// or SNORM) to the SampledOnly representation `to` (r/rg/rgba 32float or 16float with the same component
+// count): `count` components from `src` (2 bytes each) to `dst` (4 or 2 bytes each). UNORM maps v to
+// v / 65535, SNORM to max(v / 32767, -1) (D3D/WebGPU conversion); 16float rounds to nearest even.
+// False (nothing written) if the pair is not such a conversion.
+bool convert_norm16_texels(DxgiFormat from, WgpuTextureFormat to, const uint8_t* src, size_t count,
+                           uint8_t* dst) noexcept;
 
 struct VertexFormatMapping {
     WgpuVertexFormat format = WgpuVertexFormat::Undefined;

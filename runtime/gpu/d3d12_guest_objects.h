@@ -1000,6 +1000,7 @@ private:
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
     std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
     std::unordered_set<uint32_t> conversion_skipped_;  // under tracked_textures_mutex_: reported once
+    std::unordered_set<uint32_t> lossy_reported_;      // under tracked_textures_mutex_: DXGI formats
     struct AddressTextureKey {
         uint64_t gpu_va = 0;
         uint32_t dxgi_format = 0;

@@ -1022,10 +1022,14 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     GpuTextureViewDesc d{};
     const uint32_t features = device_.options().features;
     pso::WgpuTextureAspect aspect = pso::WgpuTextureAspect::All;
+    TextureInfo tex{};
+    const bool known = device_.texture_info(v.resource_id, &tex);
+    // Views of a SampledOnly texture map the same way, so they name the format it was created with.
+    const pso::FormatUsage usage = known && tex.sampled_only ? pso::FormatUsage::SampledOnly : pso::FormatUsage::Sampled;
     if (v.format != 0) {
-        d.format = texture_format_code(to_dxgi(v.format), pso::FormatUsage::Sampled, features, &aspect);
-    } else if (TextureInfo tex{}; device_.texture_info(v.resource_id, &tex)) {
-        texture_format_code(tex.format, pso::FormatUsage::Sampled, features, &aspect);  // aspect of default views
+        d.format = texture_format_code(to_dxgi(v.format), usage, features, &aspect);
+    } else if (known) {
+        texture_format_code(tex.format, usage, features, &aspect);  // aspect of default views
     } else {
         diagnostics_ |= BridgeDiag::UnknownTexture;
     }

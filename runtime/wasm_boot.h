@@ -20,14 +20,14 @@ inline constexpr char kPgimMagic[4] = {'P', 'G', 'I', 'M'};
 inline constexpr size_t kPgimMagicBytes = 4;
 
 // Default pso::WgpuFeature bitmask matching the optional WebGPU adapter features negotiated by
-// web/workers/wgpu_worker.js (W92) that the C++ GPU bridge gates on. (float32-filterable is also
-// negotiated on the JS side but has no C++ pso::WgpuFeature gate bit.)
+// web/workers/wgpu_worker.js (W92) that the C++ GPU bridge gates on.
 inline constexpr uint32_t kDefaultWasmWgpuFeatures =
     gpu::pso::WgpuFeature::TextureCompressionBc |
     gpu::pso::WgpuFeature::Depth32FloatStencil8 |
     gpu::pso::WgpuFeature::Rg11b10UfloatRenderable |
     gpu::pso::WgpuFeature::TextureFormatsTier1 |
-    gpu::pso::WgpuFeature::Bgra8UnormStorage;
+    gpu::pso::WgpuFeature::Bgra8UnormStorage |
+    gpu::pso::WgpuFeature::Float32Filterable;
 inline constexpr uint32_t kDefaultDStorageWorkerThreads = 4;
 
 using HttpfsOpenFn = std::function<int32_t(std::string_view rel_path)>;

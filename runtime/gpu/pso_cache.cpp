@@ -427,6 +427,7 @@ const char* feature_name(uint32_t single_feature_bit) noexcept {
         case WgpuFeature::DualSourceBlending: return "dual-source-blending";
         case WgpuFeature::TextureFormatsTier1: return "texture-formats-tier1";
         case WgpuFeature::Bgra8UnormStorage: return "bgra8unorm-storage";
+        case WgpuFeature::Float32Filterable: return "float32-filterable";
         default: return nullptr;
     }
 }
@@ -502,7 +503,107 @@ uint32_t vertex_format_byte_size(WgpuVertexFormat format) noexcept {
     return i < std::size(kVertexFormatInfo) ? kVertexFormatInfo[i].byte_size : 0u;
 }
 
+namespace {
+
+// The 16-bit normalized formats WebGPU samples only as unfilterable-float: components, signedness.
+struct Norm16Info {
+    uint32_t components = 0;  // 0: not such a format
+    bool snorm = false;
+};
+
+Norm16Info norm16_info(WgpuTextureFormat f) noexcept {
+    switch (f) {
+        case F::R16Unorm: return {1, false};
+        case F::R16Snorm: return {1, true};
+        case F::Rg16Unorm: return {2, false};
+        case F::Rg16Snorm: return {2, true};
+        case F::Rgba16Unorm: return {4, false};
+        case F::Rgba16Snorm: return {4, true};
+        default: return {};
+    }
+}
+
+WgpuTextureFormat norm16_representation(uint32_t components, bool float32) noexcept {
+    switch (components) {
+        case 1: return float32 ? F::R32Float : F::R16Float;
+        case 2: return float32 ? F::Rg32Float : F::Rg16Float;
+        case 4: return float32 ? F::Rgba32Float : F::Rgba16Float;
+        default: return F::Undefined;
+    }
+}
+
+// IEEE 754 binary32 -> binary16, round to nearest even (normal, subnormal and zero; no inf/NaN input
+// arises from normalized values).
+uint16_t to_half(float value) noexcept {
+    uint32_t x = 0;
+    std::memcpy(&x, &value, 4);
+    const uint16_t sign = static_cast<uint16_t>((x >> 16) & 0x8000u);
+    const int32_t exp = static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp >= 31) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+    if (exp <= 0) {
+        if (exp < -10) {
+            return sign;
+        }
+        mant |= 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - exp);
+        uint32_t half = mant >> shift;
+        const uint32_t rem = mant & ((1u << shift) - 1u);
+        const uint32_t mid = 1u << (shift - 1u);
+        if (rem > mid || (rem == mid && (half & 1u))) {
+            ++half;
+        }
+        return static_cast<uint16_t>(sign | half);
+    }
+    uint32_t half = (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+    const uint32_t rem = mant & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) {
+        ++half;  // may carry into the exponent, which is the correct rounding
+    }
+    return static_cast<uint16_t>(sign | half);
+}
+
+}  // namespace
+
+bool convert_norm16_texels(DxgiFormat from, WgpuTextureFormat to, const uint8_t* src, size_t count,
+                           uint8_t* dst) noexcept {
+    const Norm16Info n = norm16_info(describe_dxgi(from).color);
+    if (n.components == 0 || src == nullptr || dst == nullptr) {
+        return false;
+    }
+    const bool f32 = to == norm16_representation(n.components, true);
+    if (!f32 && to != norm16_representation(n.components, false)) {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        uint16_t raw = 0;
+        std::memcpy(&raw, src + i * 2, 2);
+        const float v = n.snorm ? std::max(static_cast<float>(static_cast<int16_t>(raw)) / 32767.0f, -1.0f)
+                                : static_cast<float>(raw) / 65535.0f;
+        if (f32) {
+            std::memcpy(dst + i * 4, &v, 4);
+        } else {
+            const uint16_t h = to_half(v);
+            std::memcpy(dst + i * 2, &h, 2);
+        }
+    }
+    return true;
+}
+
 TextureFormatMapping map_texture_format(DxgiFormat format, FormatUsage usage, uint32_t features) noexcept {
+    if (usage == FormatUsage::SampledOnly) {
+        TextureFormatMapping m = map_texture_format(format, FormatUsage::Sampled, features);
+        const Norm16Info n = norm16_info(describe_dxgi(format).color);
+        if (m.supported() && n.components != 0 && m.aspect == WgpuTextureAspect::All) {
+            const bool float32 = (features & WgpuFeature::Float32Filterable) != 0;
+            m.format = norm16_representation(n.components, float32);
+            m.required_features = float32 ? WgpuFeature::Float32Filterable : 0u;
+            m.diagnostics |= FormatDiag::NeedsCpuConversion | (float32 ? 0u : FormatDiag::LossyConversion);
+        }
+        return m;
+    }
     TextureFormatMapping m{};
     const DxgiDescription d = describe_dxgi(format);
 

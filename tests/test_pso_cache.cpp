@@ -210,8 +210,9 @@ void test_enum_tables() {
             features.insert(feature_name(bit));
         }
     }
-    CHECK(features.size() == 8);
+    CHECK(features.size() == 9);
     CHECK(feature_name(WgpuFeature::All + 1) == nullptr);
+    CHECK(std::string(feature_name(WgpuFeature::Float32Filterable)) == "float32-filterable");
     CHECK(std::string(feature_name(WgpuFeature::Bgra8UnormStorage)) == "bgra8unorm-storage");
     CHECK((WgpuFeature::All & WgpuFeature::Bgra8UnormStorage) == WgpuFeature::Bgra8UnormStorage);
     CHECK(WgpuFeature::Bgra8UnormStorage == (WgpuFeature::TextureFormatsTier1 << 1));
@@ -462,6 +463,60 @@ void test_texture_format_mapping() {
 // ---------------------------------------------------------------------------
 // 3. DXGI -> vertex format mapping
 // ---------------------------------------------------------------------------
+
+// G66: 16-bit normalized formats are only unfilterable-float in WebGPU. A SampledOnly texture gets a
+// filterable float representation: float32 (exact) with float32-filterable, else float16 (lossy).
+void test_sampled_only_norm16() {
+    using D = DxgiFormat;
+    const uint32_t tier1 = WgpuFeature::TextureFormatsTier1;
+    const uint32_t with_f32 = tier1 | WgpuFeature::Float32Filterable;
+    struct Case {
+        D dxgi;
+        TF f32, f16;
+    };
+    for (const Case& c : {Case{D::R16_UNORM, TF::R32Float, TF::R16Float}, Case{D::R16_SNORM, TF::R32Float, TF::R16Float},
+                          Case{D::R16G16_UNORM, TF::Rg32Float, TF::Rg16Float},
+                          Case{D::R16G16B16A16_SNORM, TF::Rgba32Float, TF::Rgba16Float}}) {
+        // Sampled (render targets and their views) keeps the native format.
+        CHECK(map_texture_format(c.dxgi, FormatUsage::Sampled, tier1).format != c.f32);
+        const TextureFormatMapping exact = map_texture_format(c.dxgi, FormatUsage::SampledOnly, with_f32);
+        CHECK(exact.format == c.f32 && exact.required_features == WgpuFeature::Float32Filterable);
+        CHECK((exact.diagnostics & FormatDiag::NeedsCpuConversion) != 0);
+        CHECK((exact.diagnostics & FormatDiag::LossyConversion) == 0);
+        const TextureFormatMapping lossy = map_texture_format(c.dxgi, FormatUsage::SampledOnly, tier1);
+        CHECK(lossy.format == c.f16 && lossy.required_features == 0);
+        CHECK((lossy.diagnostics & (FormatDiag::NeedsCpuConversion | FormatDiag::LossyConversion)) ==
+              (FormatDiag::NeedsCpuConversion | FormatDiag::LossyConversion));
+        CHECK(map_texture_format(c.dxgi, FormatUsage::SampledOnly, 0).format == c.f16);
+    }
+    // Other formats: SampledOnly is Sampled.
+    for (D d : {D::R8G8B8A8_UNORM, D::R16_FLOAT, D::R32_FLOAT, D::BC7_UNORM}) {
+        const TextureFormatMapping a = map_texture_format(d, FormatUsage::Sampled, WgpuFeature::All);
+        const TextureFormatMapping b = map_texture_format(d, FormatUsage::SampledOnly, WgpuFeature::All);
+        CHECK(a.format == b.format && a.diagnostics == b.diagnostics && a.required_features == b.required_features);
+    }
+
+    // Texel conversion.
+    const uint16_t unorm[4] = {0, 65535, 32768, 1};
+    float f[4] = {};
+    CHECK(convert_norm16_texels(D::R16_UNORM, TF::R32Float, reinterpret_cast<const uint8_t*>(unorm), 4,
+                                reinterpret_cast<uint8_t*>(f)));
+    CHECK(f[0] == 0.0f && f[1] == 1.0f && f[2] == 32768.0f / 65535.0f && f[3] == 1.0f / 65535.0f);
+    const int16_t snorm[4] = {-32768, -32767, 32767, 0};
+    CHECK(convert_norm16_texels(D::R16_SNORM, TF::R32Float, reinterpret_cast<const uint8_t*>(snorm), 4,
+                                reinterpret_cast<uint8_t*>(f)));
+    CHECK(f[0] == -1.0f && f[1] == -1.0f && f[2] == 1.0f && f[3] == 0.0f);
+    uint16_t h[4] = {};
+    CHECK(convert_norm16_texels(D::R16_UNORM, TF::R16Float, reinterpret_cast<const uint8_t*>(unorm), 4,
+                                reinterpret_cast<uint8_t*>(h)));
+    // 0 -> 0x0000, 1.0 -> 0x3C00, 0.500007 -> 0x3800 (rounded), 1/65535 -> subnormal 0x0100 (256 x 2^-24).
+    CHECK(h[0] == 0x0000 && h[1] == 0x3C00 && h[2] == 0x3800 && h[3] == 0x0100);
+    // Mismatched pairs are refused.
+    CHECK(!convert_norm16_texels(D::R16_UNORM, TF::Rg32Float, reinterpret_cast<const uint8_t*>(unorm), 4,
+                                 reinterpret_cast<uint8_t*>(f)));
+    CHECK(!convert_norm16_texels(D::R8G8B8A8_UNORM, TF::R32Float, reinterpret_cast<const uint8_t*>(unorm), 4,
+                                 reinterpret_cast<uint8_t*>(f)));
+}
 
 void test_vertex_format_mapping() {
     std::set<uint32_t> covered;
@@ -1856,6 +1911,7 @@ void test_tracker_pipeline_failures() {
 }  // namespace
 
 int main() {
+    test_sampled_only_norm16();
     test_enum_tables();
     test_texture_format_mapping();
     test_vertex_format_mapping();

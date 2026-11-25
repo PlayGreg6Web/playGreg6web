@@ -377,13 +377,35 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     if (!l.known || l.block_bytes == 0 || l.block_width == 0 || l.block_height == 0 || l.planes > 1) {
         return false;
     }
-    const pso::TextureFormatMapping mapping =
-        pso::map_texture_format(static_cast<pso::DxgiFormat>(tt.dxgi_format), pso::FormatUsage::Sampled,
-                                bridge_->options().features);
+    bridge::TextureInfo created{};
+    const bool sampled_only = bridge_->texture_info(resource_id, &created) && created.sampled_only;
+    const pso::TextureFormatMapping mapping = pso::map_texture_format(
+        static_cast<pso::DxgiFormat>(tt.dxgi_format),
+        sampled_only ? pso::FormatUsage::SampledOnly : pso::FormatUsage::Sampled, bridge_->options().features);
     if (!mapping.supported() || pso::has_depth_aspect(mapping.format) || pso::has_stencil_aspect(mapping.format)) {
         return false;
     }
-    if ((mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0) {
+    // 16-bit normalized texels for a SampledOnly texture: converted to its float representation
+    // (pso::convert_norm16_texels; exact as float32, reported once when it is float16).
+    uint8_t probe_dst[4] = {};
+    const uint8_t probe_src[2] = {};
+    const bool convert_norm16 = (mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 &&
+                                pso::convert_norm16_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format),
+                                                           mapping.format, probe_src, 1, probe_dst);
+    if (convert_norm16 && (mapping.diagnostics & pso::FormatDiag::LossyConversion) != 0) {
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+            first = lossy_reported_.insert(tt.dxgi_format).second;
+        }
+        if (first) {
+            os::log(std::string("d3d12_xs: DXGI format ") + std::to_string(tt.dxgi_format) +
+                    " is sampled as " + pso::texture_format_name(mapping.format) +
+                    " (16-bit normalized formats are not filterable in WebGPU and float32-filterable is not "
+                    "enabled): uploads round each value to float16 (11-bit mantissa)");
+        }
+    }
+    if ((mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 && !convert_norm16) {
         // The GPU texture has a substitute format (e.g. rgba8unorm for BC without the feature):
         // the guest's texels do not fit it and are not converted. Skip, reported once per texture.
         bool first = false;
@@ -539,6 +561,24 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                             raw.data() + static_cast<size_t>(slice_off + r * row_bytes), static_cast<size_t>(row_bytes));
             }
         }
+        if (convert_norm16) {
+            // Widen each row of 16-bit normalized components into the texture's float format.
+            const size_t comps = static_cast<size_t>(row_bytes / 2u);
+            const size_t out_bpc = mapping.format == pso::WgpuTextureFormat::R32Float ||
+                                           mapping.format == pso::WgpuTextureFormat::Rg32Float ||
+                                           mapping.format == pso::WgpuTextureFormat::Rgba32Float
+                                       ? 4u
+                                       : 2u;
+            const uint64_t out_pitch = align_up(comps * out_bpc, 256u);
+            std::vector<uint8_t> converted(static_cast<size_t>(out_pitch * by * md), 0);
+            for (uint32_t r = 0; r < by * md; ++r) {
+                pso::convert_norm16_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
+                                           st.bytes.data() + static_cast<size_t>(r) * row_pitch, comps,
+                                           converted.data() + static_cast<size_t>(r) * out_pitch);
+            }
+            st.bytes = std::move(converted);
+            st.row_pitch = static_cast<uint32_t>(out_pitch);
+        }
         st.hash = shader_identity(st.bytes.data(), st.bytes.size());
         staged.push_back(std::move(st));
     }
@@ -604,8 +644,9 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     }
     const uint32_t safe_mips = mip_levels == 0u ? max_mips : std::min<uint32_t>(mip_levels, max_mips);
 
+    // A texture known only by a view is never a render target: SampledOnly.
     const pso::TextureFormatMapping mapping = pso::map_texture_format(
-        static_cast<pso::DxgiFormat>(dxgi_format), pso::FormatUsage::Sampled, bridge_->options().features);
+        static_cast<pso::DxgiFormat>(dxgi_format), pso::FormatUsage::SampledOnly, bridge_->options().features);
     if (!mapping.supported() || pso::has_depth_aspect(mapping.format) || pso::has_stencil_aspect(mapping.format)) {
         return 0;
     }
@@ -660,6 +701,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     info.dimension = dim;
     info.gpu_va = gpu_va;
     info.layout = d3d12_layout;
+    info.sampled_only = true;
     bridge_->register_texture(id, info);
 
     if (gpu_va < kFakeGpuVaBase) {

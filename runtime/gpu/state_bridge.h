@@ -101,6 +101,8 @@ struct TextureInfo {
     // Guest D3D12_TEXTURE_LAYOUT / Xbox swizzle layout (0 = unknown/linear, 1 = row-major,
     // 0x100 = XG linear, >= 0x101 = tiled console swizzle mode).
     uint32_t layout = 0;
+    // Created with pso::FormatUsage::SampledOnly (never a render target): its views map with it too.
+    bool sampled_only = false;
 };
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
