@@ -631,6 +631,27 @@ const char* class_name(ReflectedComponentType c) {
     return c == ReflectedComponentType::U32 ? "u32" : c == ReflectedComponentType::I32 ? "i32" : "f32";
 }
 
+// 32-bit component count of a Float32/Uint32/Sint32 format (0 for any other format).
+uint32_t dword_components(pso::WgpuVertexFormat f) {
+    using F = pso::WgpuVertexFormat;
+    switch (f) {
+        case F::Float32: case F::Uint32: case F::Sint32: return 1;
+        case F::Float32x2: case F::Uint32x2: case F::Sint32x2: return 2;
+        case F::Float32x3: case F::Uint32x3: case F::Sint32x3: return 3;
+        case F::Float32x4: case F::Uint32x4: case F::Sint32x4: return 4;
+        default: return 0;
+    }
+}
+
+pso::WgpuVertexFormat dword_format(ReflectedComponentType cls, uint32_t n) {
+    using F = pso::WgpuVertexFormat;
+    static constexpr F kF32[] = {F::Float32, F::Float32x2, F::Float32x3, F::Float32x4};
+    static constexpr F kU32[] = {F::Uint32, F::Uint32x2, F::Uint32x3, F::Uint32x4};
+    static constexpr F kI32[] = {F::Sint32, F::Sint32x2, F::Sint32x3, F::Sint32x4};
+    const F* t = cls == ReflectedComponentType::U32 ? kU32 : cls == ReflectedComponentType::I32 ? kI32 : kF32;
+    return t[n - 1];
+}
+
 }  // namespace
 
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error) {
@@ -1126,6 +1147,33 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         f.location = in.location;
         if (in.byte_offset == hit->offset && in.fetch_format == pso::WgpuVertexFormat::Undefined) {
             f.format = hit->format;
+            // A dword fetch wider than its element (#691: one 4-dword load of TEXCOORD float2 @4 plus
+            // POSITION float2 @12) spans the following 32-bit elements of the same class; widen the
+            // attribute over them, or the extra components read WebGPU's (0, 1) defaults.
+            const uint32_t have = dword_components(hit->format);
+            if (have != 0 && in.components > have && in.components <= 4) {
+                ReflectedComponentType hit_cls;
+                element_class(hit->format, &hit_cls);
+                uint32_t covered = have;
+                bool extended = true;
+                while (covered < in.components && extended) {
+                    extended = false;
+                    for (const Element& el : placed) {
+                        ReflectedComponentType el_cls;
+                        element_class(el.format, &el_cls);
+                        const uint32_t n = dword_components(el.format);
+                        if (el.slot == hit->slot && el.offset == hit->offset + covered * 4u && n != 0 &&
+                            el_cls == hit_cls) {
+                            covered += n;
+                            extended = true;
+                            break;
+                        }
+                    }
+                }
+                if (covered >= in.components) {
+                    f.format = dword_format(hit_cls, in.components);
+                }
+            }
         } else if (in.fetch_format != pso::WgpuVertexFormat::Undefined) {
             f.format = in.fetch_format;  // the stage's own fetch (inside an element, or a reinterpretation)
         } else {

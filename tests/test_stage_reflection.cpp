@@ -207,6 +207,36 @@ void test_vertex_join() {
     CHECK((t.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::MissingVertexInput)) == 0);
 }
 
+// #691: menu glyph quads (COLOR unorm8x4 @0, TEXCOORD float2 @4, POSITION float2 @12, stride 20)
+// whose stage reads UV and position as one 4-dword fetch at +4. The attribute must be float32x4,
+// not TEXCOORD's float32x2 (position would read the (0, 1) defaults and every quad collapse).
+void test_vertex_join_wide_fetch() {
+    std::vector<pso::D3D12InputElementDesc> e(3);
+    e[0].SemanticName = "COLOR";
+    e[0].Format = pso::DxgiFormat::R8G8B8A8_UNORM;
+    e[1].SemanticName = "TEXCOORD";
+    e[1].Format = pso::DxgiFormat::R32G32_FLOAT;
+    e[1].AlignedByteOffset = 4;
+    e[2].SemanticName = "POSITION";
+    e[2].Format = pso::DxgiFormat::R32G32_FLOAT;
+    e[2].AlignedByteOffset = 12;
+    StageReflection vs;
+    vs.vertex_inputs = {{0, 0, 0, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+                        {1, 0, 4, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
+    std::vector<pso::VertexInputFetch> fetches;
+    std::string report;
+    CHECK(join_vertex_inputs(vs, e.data(), 3, &fetches, &report));
+    CHECK(fetches.size() == 2);
+    if (fetches.size() == 2) {
+        CHECK(fetches[0].format == pso::WgpuVertexFormat::Unorm8x4);
+        CHECK(fetches[1].offset == 4 && fetches[1].format == pso::WgpuVertexFormat::Float32x4);
+    }
+    // Without a following element the fetch keeps the element's own format.
+    report.clear();
+    CHECK(join_vertex_inputs(vs, e.data(), 2, &fetches, &report));
+    CHECK(fetches.size() == 2 && fetches[1].format == pso::WgpuVertexFormat::Float32x2);
+}
+
 const bridge::LayoutBinding* find(const bridge::PipelineLayoutDesc& l, uint32_t group, uint32_t binding) {
     if (group >= l.groups.size()) {
         return nullptr;
@@ -773,6 +803,7 @@ int main() {
     test_parse();
     test_user_data_rule();
     test_vertex_join();
+    test_vertex_join_wide_fetch();
     test_layout_join();
     test_plan_direct_slot();
     test_heap_sources();
