@@ -52,6 +52,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -327,6 +328,69 @@ def digest(report: dict, exit_code: int, max_counters: int = 12) -> str:
     return "\n".join(lines)
 
 
+THUMB_MIN_SEGMENT_MS = 1000.0
+
+
+def thumbnail_frames(segs: Sequence[dict], min_ms: float = THUMB_MIN_SEGMENT_MS,
+                     total_presents: int | None = None) -> list[tuple[int, int, int, float]]:
+    """(segment number, middle present index, draws/frame, start seconds) of every segment spanning
+    more than `min_ms` (first to last sampled present)."""
+    out = []
+    for n, s in enumerate(segs):
+        if float(s["end_time"]) - float(s["start_time"]) <= min_ms:
+            continue
+        frame = int(s["first_present"]) + (int(s["presents"]) - 1) // 2
+        if total_presents is not None and frame >= total_presents:
+            continue
+        out.append((n, frame, int(s["draws_per_frame"]), float(s["start_time"]) / 1000.0))
+    return out
+
+
+def thumbnail_name(seg: int, start_s: float, draws: int) -> str:
+    return f"seg{seg:02d}_{start_s:.0f}s_{draws}d.png"
+
+
+def replay_command(chrome: str, run_dir: Path, pack: str, frames: Sequence[int], out_prefix: Path,
+                   timeout: int = 900) -> list[str]:
+    return [sys.executable, str(REPO_ROOT / "tools" / "replay_capture.py"), "--chrome", chrome,
+            "--replay-dir", str(run_dir), "--trace", "capture.pg6trace", "--pack", pack,
+            "--thumbat", ",".join(str(f) for f in frames), "--out", str(out_prefix),
+            "--timeout", str(timeout)]
+
+
+def make_thumbnails(args, run_dir: Path, report: dict, env: Mapping[str, str],
+                    call: Callable[[list[str]], int] | None = None) -> list[str]:
+    """Replay the capture and save one image per screen segment into <run>/thumbs; returns digest lines."""
+    capture = run_dir / "capture.pg6trace"
+    if not capture.is_file() or not args.gpu_capture_payloads:
+        return ["thumbnails: need a GPU capture with payloads (--gpu-capture-frames N --gpu-capture-payloads, "
+                "ideally --gpu-capture-thin-uploads N); none made"]
+    chrome = args.chrome or env.get("PLAYGTA6_CHROME")
+    pack = args.replay_pack
+    if not chrome or not pack:
+        return ["thumbnails: pass --chrome (or $PLAYGTA6_CHROME) and --replay-pack (the wgsl pack)"]
+    picks = thumbnail_frames(report.get("screen_timeline") or [], total_presents=len(report.get("presents") or []) or None)
+    if not picks:
+        return ["thumbnails: no screen segment longer than 1 s within the captured frames"]
+    thumbs = run_dir / "thumbs"
+    thumbs.mkdir(exist_ok=True)
+    pack_path = Path(pack)
+    if pack_path.parent.resolve() != run_dir.resolve():
+        shutil.copyfile(pack_path, run_dir / pack_path.name)
+    cmd = replay_command(chrome, run_dir, pack_path.name, [p[1] for p in picks], thumbs / "replay")
+    code = (call or (lambda c: subprocess.call(c)))(cmd)  # replay_capture always closes Chrome
+    lines = [f"thumbnails: {len(picks)} segment(s), replay exit {code}"]
+    for seg, frame, draws, start_s in picks:
+        src = thumbs / f"replay-swap{frame}.png"
+        dst = thumbs / thumbnail_name(seg, start_s, draws)
+        if src.is_file():
+            src.replace(dst)
+            lines.append(f"  {dst}")
+        else:
+            lines.append(f"  segment {seg}: no image for frame {frame}")
+    return lines
+
+
 def shader_pack_hint(report: dict, shader_pack: Path | None) -> str | None:
     """One line when no shader pack was given and most draws were dropped for want of a shader module."""
     if shader_pack:
@@ -378,6 +442,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-capture-payloads", action="store_true", help="keep payloads in the capture")
     p.add_argument("--gpu-capture-thin-uploads", type=int, metavar="N",
                    help="with payloads: keep only every Nth write of a texture/buffer > 4 MiB")
+    p.add_argument("--thumbnails", action="store_true",
+                   help="after a payload GPU capture, replay it in Chrome and save one image per screen segment")
+    p.add_argument("--chrome", help="Chrome executable for --thumbnails (default $PLAYGTA6_CHROME)")
+    p.add_argument("--replay-pack", help="wgsl pack file for --thumbnails")
     p.add_argument("--import-trace", action="store_true", help="write import-trace.txt")
     p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory under work/)")
     p.add_argument("--audio-dump", help="harness --audio-dump: WAV file of the stereo mix")
@@ -502,6 +570,14 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     hint = shader_pack_hint(report, args.shader_pack)
     if hint:
         print(hint)
+    if args.thumbnails:
+        tlines = make_thumbnails(args, run_dir, report, env)
+        with (run_dir / "digest.txt").open("a", encoding="utf-8") as f:
+            f.write("
+".join(tlines) + "
+")
+        print("
+".join(tlines))
     if args.baseline:
         return compare_with_baseline(args, run_dir, runs_dir)
     return 0

@@ -371,5 +371,55 @@ class ChooseBuildDirTest(unittest.TestCase):
         self.assertNotEqual(d1, other)
         self.assertEqual(d1.parent.name, "pg6b")
 
+class ThumbnailTests(unittest.TestCase):
+    SEGS = [
+        {"start_time": 0.0, "end_time": 500.0, "first_present": 0, "presents": 5, "draws_per_frame": 3},
+        {"start_time": 2000.0, "end_time": 5000.0, "first_present": 5, "presents": 10, "draws_per_frame": 120},
+        {"start_time": 6000.0, "end_time": 6200.0, "first_present": 15, "presents": 2, "draws_per_frame": 9},
+    ]
+
+    def test_selection_middle_of_long_segments(self):
+        self.assertEqual(rnb.thumbnail_frames(self.SEGS), [(1, 9, 120, 2.0)])
+
+    def test_selection_skips_uncaptured_frames(self):
+        self.assertEqual(rnb.thumbnail_frames(self.SEGS, total_presents=9), [])
+
+    def test_name(self):
+        self.assertEqual(rnb.thumbnail_name(1, 2.0, 120), "seg01_2s_120d.png")
+
+    def test_replay_command(self):
+        cmd = rnb.replay_command("chrome.exe", Path("run"), "p.pack", [9, 20], Path("run/thumbs/replay"))
+        self.assertEqual(cmd[1].replace("\\", "/").split("/")[-1], "replay_capture.py")
+        for flag, val in (("--chrome", "chrome.exe"), ("--pack", "p.pack"), ("--thumbat", "9,20"),
+                          ("--trace", "capture.pg6trace")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], val)
+
+    def test_make_thumbnails_renames_and_lists(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "capture.pg6trace").write_bytes(b"x")
+            pack = run / "s.pack"
+            pack.write_bytes(b"x")
+            args = argparse.Namespace(gpu_capture_payloads=True, chrome="c", replay_pack=str(pack))
+            calls = []
+
+            def fake(cmd):
+                calls.append(cmd)
+                (run / "thumbs" / "replay-swap9.png").write_bytes(b"png")
+                return 0
+            lines = rnb.make_thumbnails(args, run, {"screen_timeline": self.SEGS}, {}, call=fake)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue((run / "thumbs" / "seg01_2s_120d.png").is_file())
+            self.assertIn("seg01_2s_120d.png", lines[1])
+
+    def test_hint_without_capture(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(gpu_capture_payloads=False, chrome=None, replay_pack=None)
+            lines = rnb.make_thumbnails(args, Path(d), {}, {})
+            self.assertIn("--gpu-capture-payloads", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()
