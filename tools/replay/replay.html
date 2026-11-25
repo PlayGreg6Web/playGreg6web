@@ -18,14 +18,31 @@
 const log = (s) => { document.getElementById('log').textContent += s + '\n'; };
 const q = new URLSearchParams(location.search);
 window.__thumbs = {};
+function concat(parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.byteLength; }
+  return out;
+}
 function splitFrames(bytes) {
   const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const frames = []; let start = 0, off = 0;
+  // Thinned uploads (--gpu-capture-thin-uploads): WriteBuffer(4)/WriteTexture(13) with data_len 0 and
+  // reserved == 'thin' mean "keep the previous contents", so they are dropped from the stream.
+  const THIN = 0x6e696874, FIXED = { 4: [16, 8], 13: [48, 40] };
+  const frames = []; let parts = [], start = 0, off = 0;
   while (off + 8 <= bytes.byteLength) {
-    const op = v.getUint16(off, true); off += 8 + v.getUint32(off + 4, true);
-    if (op === 7) { frames.push(bytes.slice(start, off)); start = off; }
+    const at = off, op = v.getUint16(off, true), ln = v.getUint32(off + 4, true); off += 8 + ln;
+    const f = FIXED[op];
+    if (f && ln === f[0] && v.getUint32(at + 8 + f[1], true) === 0 && v.getUint32(at + 8 + f[0] - 4, true) === THIN) {
+      if (at > start) parts.push(bytes.subarray(start, at));
+      start = off;
+    }
+    if (op === 7) {
+      if (off > start) parts.push(bytes.subarray(start, off));
+      frames.push(concat(parts)); parts = []; start = off;
+    }
   }
-  if (start < bytes.byteLength) frames.push(bytes.slice(start));
+  if (start < bytes.byteLength) parts.push(bytes.subarray(start));
+  if (parts.length) frames.push(concat(parts));
   return frames;
 }
 (async () => {

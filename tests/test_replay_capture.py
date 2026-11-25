@@ -32,6 +32,17 @@ class TestReplayCapture(unittest.TestCase):
         self.assertEqual(dropped, 2 * 104)
         self.assertEqual(len(out), len(data) - 2 * (8 + 104))
 
+    def test_thin_marker_is_skipped(self) -> None:
+        tex_marker = pkt(13, struct.pack("<I", 1) + b"\0" * 36 + struct.pack("<II", 0, 0x6E696874))
+        buf_marker = pkt(4, struct.pack("<IIII", 7, 0, 0, 0x6E696874))
+        real_buf = pkt(4, struct.pack("<IIII", 7, 0, 2, 0) + b"ab")
+        data = upload(1, 100) + tex_marker + buf_marker + real_buf + pkt(7)
+        self.assertEqual(replay_capture.strip_thin_markers(data), upload(1, 100) + real_buf + pkt(7))
+        self.assertEqual(replay_capture.largest_textures(data, 1), [1])
+        out, frames, dropped = replay_capture.trim_trace(tex_marker + pkt(7), 2, [1])
+        self.assertEqual((frames, dropped), (1, 0))
+        self.assertEqual(out, tex_marker + pkt(7))
+
     def test_parse_replay_log(self) -> None:
         text = "swapchain frame 5 (3840x2160 bgra8unorm): non-black 10/100 (10.00%), distinct 7\n"
         (s,) = replay_capture.parse_replay_log(text)

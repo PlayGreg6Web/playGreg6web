@@ -35,7 +35,11 @@ from collections import defaultdict
 from pathlib import Path
 
 OP_WRITE_TEXTURE = 13
+OP_WRITE_BUFFER = 4
 OP_PRESENT = 7
+THIN_MARKER = 0x6E696874  # 'thin': reserved field of a WriteBuffer/WriteTexture whose payload was thinned out
+# opcode -> (fixed payload size, offset of data_len); the reserved u32 is the last field.
+_UPLOAD_LAYOUT = {OP_WRITE_BUFFER: (16, 8), OP_WRITE_TEXTURE: (48, 40)}
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPLAY_PAGE = REPO_ROOT / "tools" / "replay" / "replay.html"
 
@@ -62,11 +66,31 @@ def iter_packets(data):
         off += 8 + ln
 
 
+def is_thin_marker(data, off, op, ln):
+    """True for a thinned upload marker (data_len 0, reserved == 'thin'): the replay must skip the
+    write and keep the destination's previous contents."""
+    layout = _UPLOAD_LAYOUT.get(op)
+    if layout is None or ln != layout[0]:
+        return False
+    fixed, len_off = layout
+    return (struct.unpack_from("<I", data, off + 8 + len_off)[0] == 0
+            and struct.unpack_from("<I", data, off + 8 + fixed - 4)[0] == THIN_MARKER)
+
+
+def strip_thin_markers(data):
+    """Return `data` without thinned upload markers (skipping them == keeping the previous contents)."""
+    out = bytearray()
+    for off, op, ln in iter_packets(data):
+        if not is_thin_marker(data, off, op, ln):
+            out += data[off:off + 8 + ln]
+    return bytes(out)
+
+
 def largest_textures(data, count):
     """Texture ids with the most WriteTexture bytes, largest first."""
     sizes = defaultdict(int)
     for off, op, ln in iter_packets(data):
-        if op == OP_WRITE_TEXTURE and ln >= 4:
+        if op == OP_WRITE_TEXTURE and ln >= 4 and not is_thin_marker(data, off, op, ln):
             sizes[struct.unpack_from("<I", data, off + 8)[0]] += ln
     return [t for t, _ in sorted(sizes.items(), key=lambda kv: -kv[1])[:count]]
 
@@ -79,10 +103,13 @@ def trim_trace(data, every, ids):
     frame = dropped = 0
     for off, op, ln in iter_packets(data):
         end = off + 8 + ln
-        if (op == OP_WRITE_TEXTURE and ln >= 4 and frame % every != 0
+        if is_thin_marker(data, off, op, ln):
+            pass  # marker: nothing to drop, the replay skips it
+        elif (op == OP_WRITE_TEXTURE and ln >= 4 and frame % every != 0
                 and struct.unpack_from("<I", data, off + 8)[0] in ids):
             dropped += ln
-        else:
+            end = None
+        if end is not None:
             out += data[off:end]
         if op == OP_PRESENT:
             frame += 1
