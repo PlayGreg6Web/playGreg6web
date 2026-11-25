@@ -1120,6 +1120,15 @@ namespace {
 // mapped through the window table, not the arena (which only holds a no-access reservation over
 // the range natively, or nothing in the browser). VirtualAlloc / VirtualProtect / VirtualFree
 // there would act on that reservation instead, so they are refused.
+// O37: the arena VA behind a window VA of a runtime-owned range (the XMem layer's physical-page
+// reservations handed out at window ranges); any other address as it is.
+uint64_t unmirror_va(uint64_t address) {
+    if (void* h = guest_window::runtime_range_host(address)) {
+        return get_vmem_arena()->guest_address(h);
+    }
+    return address;
+}
+
 bool touches_translated_window(uint64_t address, uint64_t size) {
     if (!guest_window::enabled()) {
         return false;
@@ -1142,11 +1151,16 @@ uint64_t VirtualAlloc(uint64_t address,
         return 0;
     }
 
+    const uint64_t window_address = address;
+    address = unmirror_va(address);
     if (address != 0 && touches_translated_window(address, size)) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return 0;
     }
-    const uint64_t result = get_vmem_arena()->virtual_alloc(address, size, allocation_type, pp);
+    uint64_t result = get_vmem_arena()->virtual_alloc(address, size, allocation_type, pp);
+    if (result != 0 && window_address != address) {
+        result = window_address - address + result;  // the title's form of the address
+    }
     if (result == 0) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
     }
@@ -1163,6 +1177,7 @@ bool VirtualProtect(uint64_t address,
         return false;
     }
 
+    address = unmirror_va(address);
     if (touches_translated_window(address, size)) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
@@ -1188,6 +1203,7 @@ bool VirtualFree(uint64_t address, uint64_t size, uint32_t free_type) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
+    address = unmirror_va(address);
     if (touches_translated_window(address, size)) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return false;
@@ -1205,7 +1221,14 @@ size_t VirtualQuery(uint64_t address, MemoryBasicInformation* buffer, size_t len
         return 0;
     }
 
-    MemoryBasicInfo info = get_vmem_arena()->query(address);
+    const uint64_t backing = unmirror_va(address);
+    MemoryBasicInfo info = get_vmem_arena()->query(backing);
+    if (backing != address) {
+        // O37: a mirrored reservation reads like its arena reservation, at the title's addresses.
+        const uint64_t shift = address - backing;
+        info.base_address += shift;
+        info.allocation_base += shift;
+    }
     xmem_windows::Window phantom;
     xmem_windows::Window window;
     if (guest_window::translated(address) && xmem_windows::find_window(address, 1, &window)) {

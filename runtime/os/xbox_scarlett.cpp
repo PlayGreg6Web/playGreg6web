@@ -249,6 +249,16 @@ struct XMemState {
     // Guest VA -> handle of the page whose bytes live there after a frame swap (validated on use:
     // the page must still exist and have that home).
     std::unordered_map<uint64_t, uint64_t> moved_homes;
+    // O37: physical-page reservations handed to the title at a window range (guest_window
+    // runtime ranges) under the window memory models: arena (backing) VA -> {window VA, bytes}.
+    // XMem keeps working on the arena VAs; the title only sees the window VAs, so its stores into
+    // the memory carry write marks. XMem's own writes there mark through mark_mirror_locked.
+    struct Mirror {
+        uint64_t window_va = 0;
+        uint64_t bytes = 0;
+    };
+    std::map<uint64_t, Mirror> mirrors;
+    bool mirror_exhausted_logged = false;
 
     void update_peak_locked() {
         const uint64_t current =
@@ -414,6 +424,36 @@ PhysicalPage* home_owner_locked(XMemState& st, uint64_t va) {
     return nullptr;
 }
 
+// O37: the window VA the title knows arena VA `va` of a mirrored reservation by (0: none).
+uint64_t mirror_window_va_locked(const XMemState& st, uint64_t va) {
+    auto it = st.mirrors.upper_bound(va);
+    if (it == st.mirrors.begin()) {
+        return 0;
+    }
+    --it;
+    return va - it->first < it->second.bytes ? it->second.window_va + (va - it->first) : 0;
+}
+
+// O37: XMem changed the bytes at arena VA [va, va + len) itself (a page mapped, unmapped or moved
+// there): marks the window slots the title sees them at.
+void mark_mirror_locked(const XMemState& st, uint64_t va, uint64_t len) {
+    if (st.mirrors.empty()) {
+        return;
+    }
+    if (const uint64_t w = mirror_window_va_locked(st, va)) {
+        guest_window::mark_written(w, static_cast<size_t>(len));
+    }
+}
+
+// O37: the arena VA behind a guest VA the title passed: a window VA of a mirrored reservation
+// becomes its arena VA; anything else is returned as it is.
+uint64_t unmirror(uint64_t va) {
+    if (void* h = guest_window::runtime_range_host(va)) {
+        return guest_of(h);
+    }
+    return va;
+}
+
 // Removes the page mapped at slot `va` (guest VA); the caller holds the lock.
 void unmap_slot_locked(XMemState& st, uint64_t va) {
     auto sit = st.page_slots.find(va);
@@ -450,6 +490,7 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         if (still != st.page_slots.end() && still->second == owner->handle &&
             home_owner_locked(st, back) == nullptr) {
             std::memcpy(host_of(back), host_of(va), static_cast<size_t>(owner->page_size));
+            mark_mirror_locked(st, back, owner->page_size);
             owner->home_va = back;
         } else {
             save_page_contents(*owner, static_cast<const uint8_t*>(host_of(va)));
@@ -457,6 +498,7 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         }
         retarget_window_slots_locked(*owner);
     }
+    mark_mirror_locked(st, va, ps);  // O37: the title's view of the slot loses its bytes
     VirtualRegion* region = st.region_containing_locked(va, ps);
     if (region != nullptr && !region->phantom) {
         if (!region->committed) {
@@ -538,6 +580,8 @@ void swap_frames_locked(XMemState& st, PhysicalPage& page, PhysicalPage& other, 
     std::memcpy(tmp.data(), host_of(want), tmp.size());
     std::memcpy(host_of(want), host_of(from), tmp.size());
     std::memcpy(host_of(from), tmp.data(), tmp.size());
+    mark_mirror_locked(st, want, ps);
+    mark_mirror_locked(st, from, ps);
     other.home_va = page.home_va;  // 0 when `page` lived in a store
     if (page.home_va == 0) {
         other.store_va = page.store_va;  // the store block now holds `other`'s bytes
@@ -774,6 +818,7 @@ bool map_slot_locked(XMemState& st, uint64_t va, PhysicalPage& page) {
         page.pool_va = va;
     }
     page.home_va = va;
+    mark_mirror_locked(st, va, ps);  // O37: the page's bytes appeared here
     if (region != nullptr && region->cpu_window) {
         xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
         note_cpu_window_map_locked(st, va, page, *region);
@@ -797,11 +842,12 @@ bool map_slots(const uint64_t* vas, size_t count, const uint64_t* pfns) {
     }
     bool ok = true;
     for (size_t i = 0; i < count; ++i) {
+        const uint64_t va = unmirror(vas[i]);  // O37: a mirrored reservation's window VA
         if (pfns == nullptr || pfns[i] == 0) {
-            unmap_slot_locked(st, vas[i]);
+            unmap_slot_locked(st, va);
             continue;
         }
-        if (!map_slot_locked(st, vas[i], *st.physical_pages[pfns[i]])) {
+        if (!map_slot_locked(st, va, *st.physical_pages[pfns[i]])) {
             ok = false;
         }
     }
@@ -2149,8 +2195,9 @@ bool xmem_virtual_free(void* address) {
     std::lock_guard<std::mutex> lock(st.mutex);
     auto it = st.virtual_regions.find(address);
     if (it == st.virtual_regions.end()) {
-        // The translated window, as the import thunk handed its base over (O29).
-        address = host_of(guest_of_arg(address));
+        // The translated window, as the import thunk handed its base over (O29), or a mirrored
+        // reservation's window VA (O37).
+        address = host_of(unmirror(guest_of_arg(address)));
         it = st.virtual_regions.find(address);
     }
     if (it == st.virtual_regions.end()) {
@@ -2170,6 +2217,10 @@ bool xmem_virtual_free(void* address) {
         st.translated_window_live = false;
     }
     xmem_windows::forget_window(base_va);
+    if (auto mit = st.mirrors.find(base_va); mit != st.mirrors.end() && mit->second.bytes == it->second.size) {
+        guest_window::unmap_runtime_range(mit->second.window_va, mit->second.bytes);  // O37
+        st.mirrors.erase(mit);
+    }
     release_virtual_region(it->second);
     st.region_index.erase(base_va);
     st.virtual_regions.erase(it);
@@ -2291,6 +2342,8 @@ void xmem_reset_for_testing() {
     st.run_relocations = 0;
     st.run_bytes_moved = 0;
     st.moved_homes.clear();
+    st.mirrors.clear();
+    st.mirror_exhausted_logged = false;
     st.translated_window_live = false;
     xmem_windows::reset_for_testing();
     for (auto& [handle, page] : st.physical_pages) {
@@ -2618,6 +2671,7 @@ void* pg6_xbox_XMemMapPhysicalPages(void* virtual_address, size_t num_pages, con
     }
     // A caller's address may be a translated-window VA (O29: guest_of_arg decodes the thunk's form).
     const uint64_t base_va = virtual_address != nullptr ? guest_of_arg(virtual_address) : guest_of(base);
+    // (map_slots turns a mirrored reservation's window VAs into its arena VAs, O37.)
     std::vector<uint64_t> vas(num_pages);
     for (size_t i = 0; i < num_pages; ++i) {
         vas[i] = base_va + i * page_size;
@@ -2676,6 +2730,14 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
     os::VirtualMemoryArena& arena = xmem_arena();
+    // O37: an address inside a reservation handed out at a window range means its arena VA (the
+    // import thunk passes the window VA's host page; a direct caller may pass the window VA).
+    if (address != nullptr && !st.mirrors.empty()) {
+        const uint64_t g = unmirror(guest_of_arg(address));
+        if (mirror_window_va_locked(st, g) != 0) {
+            address = host_of(g);
+        }
+    }
 
     // Committing an existing XMemVirtualAlloc reservation in place.
     if (address != nullptr && !want_reserve && want_commit) {
@@ -2740,10 +2802,33 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
         os::win32::SetLastError(os::win32::ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
+    // O37: under the window memory models the title's physical-page reservations (and the
+    // placeholders it splits into such reservations) are handed out at a window range above the
+    // CPU window, backed by this arena reservation slot for slot: stores into them carry write
+    // marks. XMem keeps using the arena VA; its result is the window VA's form. Without room the
+    // reservation stays where it is (logged once).
+    uint64_t mirror = 0;
+    const bool physical_reservation =
+        (allocation_type & os::kMemReservePlaceholder) != 0 ||
+        (!want_commit && (allocation_type & playgta6::os::xmem_windows::kMemPhysical) != 0);
+    if (address == nullptr && !window && physical_reservation && st.translated_window_live &&
+        os::guest_window::enabled() && (va & (kXMemPageSize64K - 1)) == 0) {
+        const uint64_t bytes = align_up_u64(aligned_size, kXMemPageSize64K);
+        mirror = os::guest_window::map_runtime_range(host_of(va), bytes);
+        if (mirror != 0) {
+            st.mirrors[va] = {mirror, bytes};
+        } else if (!st.mirror_exhausted_logged) {
+            st.mirror_exhausted_logged = true;
+            std::fprintf(stderr,
+                         "[xmem] no window range left for a %llu-byte physical reservation: it stays in "
+                         "the arena at 0x%llx (stores into it carry no write marks)\n",
+                         static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(va));
+        }
+    }
     if ((allocation_type & os::kMemReservePlaceholder) != 0) {
         // A placeholder is not usable memory: it is split with VirtualFree and its pieces are
         // replaced by XMemVirtualAlloc(MEM_REPLACE_PLACEHOLDER), which become regions here.
-        return host_of(va);
+        return mirror != 0 ? host_of(mirror) : host_of(va);
     }
 
     VirtualRegion region;
@@ -2774,6 +2859,12 @@ void* pg6_xbox_XMemVirtualAlloc(void* address,
         w.protect = protect;
         w.phantom = phantom;
         playgta6::os::xmem_windows::note_window(w);  // may call alias listeners (they must not call back into xmem)
+    }
+    if (mirror != 0) {
+        return host_of(mirror);  // the window VA (the thunk hands the title this address)
+    }
+    if (const uint64_t w = mirror_window_va_locked(st, va)) {
+        return host_of(w);  // a piece replacing part of a mirrored placeholder
     }
     return region.base;
 }

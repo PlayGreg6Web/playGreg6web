@@ -116,12 +116,30 @@ bool fill_guest(uint64_t dst, uint8_t value, size_t len);
 // range outside the window or with the window off: such memory has no marks.
 void mark_written(uint64_t va, size_t len);
 bool take_written(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets);
+// Runtime-owned window ranges (O37): the XMem layer hands the title its physical-page
+// reservations at window VAs (their arena memory mapped slot by slot, in order), so the title's
+// stores into them are marked like stores into its CPU window. Ranges come from
+// [kRuntimeRangeBase, kWindowBase + kWindowMaxSize), the part of the window the 16 GiB console
+// profile leaves free; a range whose slots are already mapped (a title window that large) is never
+// handed out. `host` must be kSlotBytes-aligned and stay valid until unmap_runtime_range. Returns
+// the window VA, or 0 (window off, misaligned, no room).
+inline constexpr uint64_t kRuntimeRangeBase = kWindowBase + (uint64_t{16} << 30);
+uint64_t map_runtime_range(void* host, uint64_t bytes);
+void unmap_runtime_range(uint64_t va, uint64_t bytes);
+// Host address behind window VA `va` of a runtime-owned range (the range's host memory, mapped or
+// not), or nullptr when `va` lies in no such range.
+void* runtime_range_host(uint64_t va);
+
 // Verification (tests, and real-program runs): a reader that uses the marks also compares the
 // unmarked slots and reports changes found there (note_verify_miss): a miss is a writer that did
 // not mark.
 void set_write_marks_verified(bool on);
 bool write_marks_verified();
 void note_verify_miss(uint64_t va);
+// Whether the slot of `va` is marked written right now (no change to the mark): a change found in
+// an unmarked page whose slot is marked by now was written while the reader compared (it is
+// reported again), not missed.
+bool write_marked(uint64_t va);
 uint64_t verify_misses();
 
 // (pointer, length) marshaling for host code called with guest buffers (O29; the generated

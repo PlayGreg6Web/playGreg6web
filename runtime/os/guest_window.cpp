@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -33,6 +34,12 @@ struct State {
     // size so the common case (nothing mapped) needs no lock.
     std::map<uint64_t, uint64_t> reverse;
     std::atomic<size_t> reverse_entries{0};
+    // Runtime-owned ranges handed out (va -> {bytes, host}), kept apart from the title's mappings.
+    struct RuntimeRange {
+        uint64_t bytes = 0;
+        uint8_t* host = nullptr;
+    };
+    std::map<uint64_t, RuntimeRange> runtime_ranges;
 };
 
 State& state() {
@@ -144,6 +151,81 @@ bool take_written(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets) 
     return true;
 }
 
+uint64_t map_runtime_range(void* host, uint64_t bytes) {
+    const auto h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
+    if (!enabled() || host == nullptr || bytes == 0 || (h & (kSlotBytes - 1)) != 0 ||
+        (bytes & (kSlotBytes - 1)) != 0) {
+        return 0;
+    }
+    State& s = state();
+    uint64_t va = 0;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        // First fit after the handed-out ranges; slots mapped by anyone else are skipped.
+        uint64_t at = kRuntimeRangeBase;
+        const uint64_t end = kWindowBase + kWindowMaxSize;
+        while (at + bytes <= end && va == 0) {
+            auto next = s.runtime_ranges.lower_bound(at);
+            if (next != s.runtime_ranges.begin()) {
+                auto prev = std::prev(next);
+                if (prev->first + prev->second.bytes > at) {
+                    at = prev->first + prev->second.bytes;
+                    continue;
+                }
+            }
+            if (next != s.runtime_ranges.end() && next->first < at + bytes) {
+                at = next->first + next->second.bytes;
+                continue;
+            }
+            bool free = true;
+            for (uint64_t off = 0; off < bytes; off += kSlotBytes) {
+                if (static_cast<uint64_t>(entry(slot_of(at + off)).load(std::memory_order_acquire)) != kTrapDelta) {
+                    at = at + off + kSlotBytes;
+                    free = false;
+                    break;
+                }
+            }
+            if (free) {
+                va = at;
+            }
+        }
+        if (va == 0) {
+            return 0;
+        }
+        s.runtime_ranges[va] = {bytes, static_cast<uint8_t*>(host)};
+    }
+    for (uint64_t off = 0; off < bytes; off += kSlotBytes) {
+        map_slot(va + off, static_cast<uint8_t*>(host) + off);
+    }
+    return va;
+}
+
+void* runtime_range_host(uint64_t va) {
+    if (!in_window(va) || va < kRuntimeRangeBase) {
+        return nullptr;
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto it = s.runtime_ranges.upper_bound(va);
+    if (it == s.runtime_ranges.begin()) {
+        return nullptr;
+    }
+    --it;
+    if (va - it->first >= it->second.bytes) {
+        return nullptr;
+    }
+    return it->second.host + (va - it->first);
+}
+
+void unmap_runtime_range(uint64_t va, uint64_t bytes) {
+    for (uint64_t off = 0; off < bytes; off += kSlotBytes) {
+        unmap_slot(va + off);
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.runtime_ranges.erase(va);
+}
+
 void set_write_marks_verified(bool on) {
     g_verify.store(on, std::memory_order_relaxed);
 }
@@ -154,6 +236,10 @@ bool write_marks_verified() {
 
 void note_verify_miss(uint64_t) {
     g_verify_misses.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool write_marked(uint64_t va) {
+    return in_window(va) && mark(slot_of(va)).load(std::memory_order_acquire) != 0;
 }
 
 uint64_t verify_misses() {
@@ -492,6 +578,7 @@ void reset_for_testing() {
     s.enabled.store(false, std::memory_order_release);
     s.map_calls = 0;
     s.unmap_calls = 0;
+    s.runtime_ranges.clear();
     for (uint64_t i = 0; i <= kWindowSlots; ++i) {
         mark(i).store(0, std::memory_order_relaxed);
     }

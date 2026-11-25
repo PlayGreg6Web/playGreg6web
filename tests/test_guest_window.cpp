@@ -546,6 +546,12 @@ void test_write_marks() {
     __playgta6_guest_write(W + k64K - 4, 8);
     CHECK((taken(W, 3 * k64K) == std::vector<uint64_t>{0, k64K}));
 
+    // write_marked peeks at a mark without taking it.
+    gw::mark_written(W + 5, 1);
+    CHECK(gw::write_marked(W + 0xFFFF) && !gw::write_marked(W + k64K));
+    CHECK((taken(W, k64K) == std::vector<uint64_t>{0}));
+    CHECK(!gw::write_marked(W));
+
     // Verification counters.
     CHECK(!gw::write_marks_verified() && gw::verify_misses() == 0);
     gw::set_write_marks_verified(true);
@@ -553,6 +559,91 @@ void test_write_marks() {
     CHECK(gw::write_marks_verified() && gw::verify_misses() == 1);
     gw::reset_for_testing();
     CHECK(!gw::write_marks_verified() && gw::verify_misses() == 0);
+}
+
+// O37: under the window memory model the title's physical-page reservations (and placeholders) are
+// handed out at window ranges above the CPU window, backed slot for slot by their arena
+// reservation, so stores into them carry write marks; XMem itself keeps working on the arena VA.
+void test_xmem_physical_reservations_in_the_window() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    constexpr uint32_t kPhysicalReserve = 0x20402000u;  // MEM_RESERVE | MEM_PHYSICAL | large pages
+    constexpr uint32_t kPlaceholder = 0x42000u;         // MEM_RESERVE | MEM_RESERVE_PLACEHOLDER
+    // Before the CPU window exists (or with the window off) nothing moves.
+    void* early = pg6_xbox_XMemVirtualAlloc(nullptr, 4 * k64K, kPhysicalReserve, 0x23u, kCpuProtect);
+    CHECK(early != nullptr && !gw::in_window(va_of(early)));
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    CHECK(cpu != nullptr && va_of(cpu) == W);
+
+    // A physical reservation: a window VA in the runtime-owned part of the window.
+    void* heap = pg6_xbox_XMemVirtualAlloc(nullptr, 4 * k64K, kPhysicalReserve, 0x23u, kCpuProtect);
+    const uint64_t H = va_of(heap);
+    CHECK(H >= gw::kRuntimeRangeBase && gw::in_window(H));
+    CHECK(gw::runtime_range_host(H + 5) != nullptr);
+    std::vector<uint64_t> none;
+    CHECK(gw::take_written(H, 4 * k64K, &none));  // clear the marks of the range's mapping
+    // Mapping pages through the window VA (direct caller form and the thunk's host-page form).
+    size_t count = 3;
+    uint64_t pfn[3] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 3);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(heap, 2, pfn) == heap);
+    std::vector<uint64_t> marked;
+    CHECK(gw::take_written(H, 4 * k64K, &marked));
+    CHECK((marked == std::vector<uint64_t>{0, k64K}));  // mapping marks the slots
+    // The title writes through the window (as lifted code does) and reads its bytes back; the
+    // bytes are the region's arena memory, contiguous over the run.
+    const uint32_t marker = 0x5EED1234u;
+    CHECK(gw::copy_to_guest(H + k64K - 2, &marker, 4));  // straddles slots 0 | 1, both marked
+    uint32_t back = 0;
+    CHECK(gw::copy_from_guest(&back, H + k64K - 2, 4) && back == marker);
+    CHECK(gw::contiguous(H, 2 * k64K) != nullptr);
+    marked.clear();
+    CHECK(gw::take_written(H, 4 * k64K, &marked) && (marked == std::vector<uint64_t>{0, k64K}));
+    // Scatter with window VAs, unmap and remap: every change of a slot's bytes marks it.
+    const uint64_t at[] = {H + 2 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at, 1, &pfn[2]) == 1);
+    const uint64_t zero[] = {0};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at, 1, zero) == 1);  // unmap
+    marked.clear();
+    CHECK(gw::take_written(H, 4 * k64K, &marked) && (marked == std::vector<uint64_t>{2 * k64K}));
+    const uint64_t remap[] = {H};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(remap, 1, &pfn[2]) == 1);  // other bytes at slot 0
+    marked.clear();
+    CHECK(gw::take_written(H, 4 * k64K, &marked) && (marked == std::vector<uint64_t>{0}));
+    // VirtualQuery reads the reservation at the title's addresses.
+    playgta6::os::win32::MemoryBasicInformation mbi{};
+    CHECK(playgta6::os::win32::VirtualQuery(H + 0x100, &mbi, sizeof(mbi)) == sizeof(mbi));
+    CHECK(mbi.allocation_base == H);
+
+    // A placeholder: split with VirtualFree at window VAs and replaced piece by piece, as the
+    // title does; the pieces keep the window VAs.
+    void* ph = pg6_xbox_XMemVirtualAlloc(nullptr, 8 * k64K, kPlaceholder, 0x7u, 0x1u);
+    const uint64_t P = va_of(ph);
+    CHECK(P >= gw::kRuntimeRangeBase && P >= H + 4 * k64K);
+    CHECK(playgta6::os::win32::VirtualFree(P, 2 * k64K, 0x8002u));  // MEM_RELEASE | PRESERVE_PLACEHOLDER
+    void* piece = pg6_xbox_XMemVirtualAlloc(ph, 2 * k64K, 0x20406000u, 0x27u, kCpuProtect);
+    CHECK(piece != nullptr && va_of(piece) == P);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(piece, 1, &pfn[0]) == piece);
+    CHECK(gw::copy_from_guest(&back, P + k64K - 2, 2));  // pfn[0] holds the marker's low half
+
+    // A reservation large enough to be a window (>= 1 GiB) is not one of these: it is placed as a
+    // window (here, with the CPU window taken, in the arena), as before.
+    void* second_window = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kPhysicalReserve, 0x23u, kCpuProtect);
+    CHECK(second_window != nullptr && !gw::in_window(va_of(second_window)));
+    // Exhaustion: what does not fit in the 8 GiB above the CPU window stays in the arena.
+    void* big = pg6_xbox_XMemVirtualAlloc(nullptr, 7 * GiB, kPlaceholder, 0x7u, 0x1u);
+    CHECK(big != nullptr && gw::in_window(va_of(big)));
+    void* over = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kPlaceholder, 0x7u, 0x1u);
+    CHECK(over != nullptr && !gw::in_window(va_of(over)));
+
+    CHECK(xmem_virtual_free(second_window));
+    CHECK(xmem_virtual_free(heap));
+    CHECK(xmem_virtual_free(early));
+    CHECK(xmem_virtual_free(cpu));
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
 }
 
 }  // namespace
@@ -566,6 +657,7 @@ int main() {
     test_xmem_window_run_keeper();
     test_xmem_run_keeper_stays_in_the_pool();
     test_write_marks();
+    test_xmem_physical_reservations_in_the_window();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;

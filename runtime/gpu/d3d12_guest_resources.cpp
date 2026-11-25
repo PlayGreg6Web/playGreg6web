@@ -1668,7 +1668,9 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
         const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
         const bool changed = (listed || verify) &&
                              !same_bytes(shadow_.data() + page, live + page, static_cast<size_t>(n));
-        if (changed && !listed) {
+        if (changed && !listed && !os::guest_window::write_marked(cpu_va_ + page)) {
+            // (A slot marked by now was written while this flush compared: not missed, and its
+            // mark reports it again.)
             os::guest_window::note_verify_miss(cpu_va_ + page);
         }
         if (changed && !in_run) {
