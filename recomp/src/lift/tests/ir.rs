@@ -585,6 +585,26 @@ fn division_has_a_divide_error_path_and_wide_ops_use_internal_helpers() {
     );
 }
 
+#[test]
+fn truncating_imul64_result_is_a_plain_mul() {
+    let func = asm_function(0x1000, |a| {
+        a.imul_2(rax, rcx)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    // RAX gets a plain `mul i64`; the 128-bit helper only feeds CF/OF (dead here, so LLVM drops
+    // it and its four 32-bit multiplies).
+    let mul = ir
+        .lines()
+        .find(|l| l.contains(" = mul i64 "))
+        .expect("plain mul");
+    let r = mul.trim().split(' ').next().expect("name");
+    assert!(ir.contains(&format!("store i64 {r}, ptr %rax")), "{ir}");
+    // CF/OF still use the high half.
+    assert!(ir.contains("@__playgta6_umul128("), "{ir}");
+}
+
 /// A block built by hand (for CFG shapes discovery never produces).
 fn block(
     start: u64,

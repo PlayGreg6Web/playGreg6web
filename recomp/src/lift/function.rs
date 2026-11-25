@@ -1730,10 +1730,13 @@ impl FunctionLifter<'_> {
             (self.read_op(ins, 0, bits)?, self.read_op(ins, 1, bits)?)
         };
         let (r, overflow) = if bits == 64 {
-            let (lo, hi) = self.mul128(&a, &b, true);
-            let sign = self.val(&format!("ashr i64 {lo}, 63"));
+            // The truncated product is a plain `mul`: only CF/OF need the 128-bit high half, so
+            // when they are dead (nearly always) the 32-bit-halves helper folds away entirely.
+            let r = self.val(&format!("mul i64 {a}, {b}"));
+            let (_, hi) = self.mul128(&a, &b, true);
+            let sign = self.val(&format!("ashr i64 {r}, 63"));
             let ov = self.val(&format!("icmp ne i64 {hi}, {sign}"));
-            (lo, ov)
+            (r, ov)
         } else {
             let wa = self.val(&format!("sext {t} {a} to i64"));
             let wb = self.val(&format!("sext {t} {b} to i64"));
@@ -2011,13 +2014,15 @@ impl FunctionLifter<'_> {
 /// (and therefore no compiler-rt libcall) is needed on wasm64. The empty inline-asm copy of
 /// `a`'s high half hides the pattern from LLVM's multiply-high recognition (LLVM 20+), which
 /// would otherwise turn a high-half-only use (`mul` for a division by a constant, `mulx` with
-/// equal destinations) back into an `i128` multiply, i.e. a `__multi3` import.
+/// equal destinations) back into an `i128` multiply, i.e. a `__multi3` import. The copy is
+/// `readnone`, so it folds away with the rest of the helper when a caller drops both halves
+/// (a truncating `imul` whose CF/OF are dead).
 pub(super) const UMUL128_IR: &str = "\
 define internal { i64, i64 } @__playgta6_umul128(i64 %a, i64 %b) unnamed_addr #0 {
 entry:
   %a0 = and i64 %a, 4294967295
   %a1.raw = lshr i64 %a, 32
-  %a1 = call i64 asm \"\", \"=r,0\"(i64 %a1.raw)
+  %a1 = call i64 asm \"\", \"=r,0\"(i64 %a1.raw) nounwind readnone willreturn
   %b0 = and i64 %b, 4294967295
   %b1 = lshr i64 %b, 32
   %p00 = mul i64 %a0, %b0
