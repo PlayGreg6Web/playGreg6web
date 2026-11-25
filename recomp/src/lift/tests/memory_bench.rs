@@ -18,19 +18,19 @@ use crate::lift::{GuestBase, STATE_GPR_OFFSET};
 
 const BENCH_JS: &str = include_str!("bench.js");
 
-const SUM: u64 = CODE_BASE;
-const CHASE: u64 = CODE_BASE + 0x100;
-const COPY: u64 = CODE_BASE + 0x200;
-const STRUCTS: u64 = CODE_BASE + 0x300;
-const LEAF: u64 = CODE_BASE + 0x400;
-const REP_COPY: u64 = CODE_BASE + 0x500;
+pub(super) const SUM: u64 = CODE_BASE;
+pub(super) const CHASE: u64 = CODE_BASE + 0x100;
+pub(super) const COPY: u64 = CODE_BASE + 0x200;
+pub(super) const STRUCTS: u64 = CODE_BASE + 0x300;
+pub(super) const LEAF: u64 = CODE_BASE + 0x400;
+pub(super) const REP_COPY: u64 = CODE_BASE + 0x500;
 
 /// Guest VA of data outside the harness window (linear 0xC0_0000 under the base translation).
 const FLAT_DATA: u64 = 0x40_0000;
 /// Guest stack top outside the window.
 const BENCH_STACK: u64 = 0x3F_0000;
 
-fn program() -> Program {
+pub(super) fn program() -> Program {
     Program::new()
         // rax = sum of rcx qwords at rdx
         .asm(SUM, |a| {

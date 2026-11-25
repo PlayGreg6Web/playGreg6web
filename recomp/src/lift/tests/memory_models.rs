@@ -45,7 +45,7 @@ fn window(check: WindowCheck, stack_flat: bool, contiguous_runs: bool) -> Memory
 }
 
 /// The models measured, by name.
-fn models() -> Vec<(&'static str, MemoryModel)> {
+pub(super) fn models() -> Vec<(&'static str, MemoryModel)> {
     vec![
         ("identity", GuestBase::Constant(0).into()),
         ("symbol", GuestBase::Symbol.into()),

@@ -23,6 +23,7 @@ mod host_diff_simd;
 #[cfg(target_arch = "x86_64")]
 mod host_diff_simd_int;
 mod ir;
+mod ir_budget;
 mod ir_integer;
 mod ir_simd;
 mod memory_bench;
