@@ -983,7 +983,8 @@ void test_unaligned_uniform_relocation() {
 // an R8G8B8A8_UNORM_SRGB texture becomes rgba8unorm); one created without it is bound null and
 // counted, instead of a view WebGPU rejects with the whole command buffer.
 void test_storage_texture_needs_storage_usage() {
-    for (const bool with_usage : {true, false}) {
+    for (const int variant : {0, 1, 2}) {  // 0: storage usage, 1: no storage usage, 2: other format
+        const bool with_usage = variant != 1;
         d3d::DescriptorHeapRegistry heaps;
         d3d::ResourceStateRegistry states;
         bridge::StateBridgeDevice device(heaps, counting_options(7000), &states);
@@ -991,8 +992,8 @@ void test_storage_texture_needs_storage_usage() {
         constexpr uint64_t kVs = 0xE1, kPs = 0xE2;
         device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
                                           GpuTextureDimension::Dim2D, false});
-        bridge::TextureInfo tex{pso::DxgiFormat::R8G8B8A8_UNORM_SRGB, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D,
-                                false};
+        bridge::TextureInfo tex{variant == 2 ? pso::DxgiFormat::R16G16B16A16_FLOAT : pso::DxgiFormat::R8G8B8A8_UNORM_SRGB,
+                                32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
         tex.storage = with_usage;
         device.register_texture(kTex, tex);
         device.register_shader_module(kVs, 1);
@@ -1001,7 +1002,7 @@ void test_storage_texture_needs_storage_usage() {
         d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
         CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
         d3d::ViewDesc vd;
-        vd.format = static_cast<uint32_t>(pso::DxgiFormat::R8G8B8A8_UNORM_SRGB);
+        vd.format = static_cast<uint32_t>(tex.format);
         vd.dimension = d3d::ViewDimension::Texture2D;
         CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
         d3d::RootSignatureDesc rs;
@@ -1053,15 +1054,16 @@ void test_storage_texture_needs_storage_usage() {
             }
         }
         CHECK(found);
-        if (with_usage) {
+        if (variant == 0) {
             CHECK(out.resource_id == kTex &&
                   out.view.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm));
-            CHECK(list.stats().storage_views_without_usage == 0 &&
+            CHECK(list.stats().storage_views_without_usage == 0 && list.stats().storage_views_format_mismatch == 0 &&
                   (list.diagnostics() & bridge::BridgeDiag::StorageViewNoUsage) == 0);
         } else {
             CHECK(out.resource_id == 0);
-            CHECK(list.stats().storage_views_without_usage == 1 &&
-                  (list.diagnostics() & bridge::BridgeDiag::StorageViewNoUsage) != 0);
+            CHECK(list.stats().storage_views_without_usage == (variant == 1 ? 1u : 0u));
+            CHECK(list.stats().storage_views_format_mismatch == (variant == 2 ? 1u : 0u));
+            CHECK((list.diagnostics() & bridge::BridgeDiag::StorageViewNoUsage) != 0);
         }
     }
 }

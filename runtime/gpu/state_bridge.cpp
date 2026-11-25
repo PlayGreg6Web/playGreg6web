@@ -1332,11 +1332,30 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 // A storage view needs a texture created with STORAGE_BINDING; binding one of a
                 // texture without it would invalidate the whole command buffer. Bound null instead.
                 TextureInfo info;
-                if (e.resource_id != 0 && (!device_.texture_info(e.resource_id, &info) || !info.storage)) {
+                const bool known = e.resource_id != 0 && device_.texture_info(e.resource_id, &info);
+                // The texture's own format (or its sRGB sibling) must be the stage's storage format.
+                const uint8_t own =
+                    known ? texture_format_code(info.format,
+                                                info.sampled_only ? pso::FormatUsage::SampledOnly
+                                                                  : pso::FormatUsage::Sampled,
+                                                device_.options().features, nullptr)
+                          : 0;
+                const bool format_ok =
+                    layout.storage_format == 0 || own == layout.storage_format ||
+                    own == static_cast<uint8_t>(
+                               pso::srgb_sibling(static_cast<pso::WgpuTextureFormat>(layout.storage_format)));
+                if (e.resource_id != 0 && (!known || !info.storage)) {
                     out.resource_id = 0;
                     out.view = GpuTextureViewDesc{};
                     diagnostics_ |= BridgeDiag::StorageViewNoUsage;
                     ++stats_.storage_views_without_usage;
+                } else if (e.resource_id != 0 && !format_ok) {
+                    // WebGPU requires the storage format to be the texture's: another format
+                    // invalidates the bind group and the whole command buffer. Bound null instead.
+                    out.resource_id = 0;
+                    out.view = GpuTextureViewDesc{};
+                    diagnostics_ |= BridgeDiag::StorageViewNoUsage;
+                    ++stats_.storage_views_format_mismatch;
                 } else if (e.resource_id != 0 && layout.storage_format != 0 &&
                            (out.view.format == 0 ||
                             out.view.format == static_cast<uint8_t>(pso::srgb_sibling(

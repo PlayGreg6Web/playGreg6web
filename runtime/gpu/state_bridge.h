@@ -148,6 +148,7 @@ inline constexpr uint64_t ComponentMappingIgnored = 1ull << 14; // non-identity 
 inline constexpr uint64_t UnalignedUniform = 1ull << 15;        // uniform binding offset % 256, not relocated
 inline constexpr uint64_t UnalignedStorage = 1ull << 16;        // storage binding offset % 256, not relocated
 inline constexpr uint64_t StorageViewNoUsage = 1ull << 17;      // storage view of a texture without storage usage
+                                                                // or of another format than the stage's: null
 }  // namespace BridgeDiag
 
 // =====================================================================================================
@@ -387,6 +388,8 @@ struct BridgeStats {
     // Storage-texture bindings of a texture created without STORAGE_BINDING usage, bound as null
     // (a storage view of it would invalidate the bind group and the whole command buffer).
     uint64_t storage_views_without_usage = 0;
+    // ... of a texture whose format is not the stage's storage format, bound as null too.
+    uint64_t storage_views_format_mismatch = 0;
     // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
     // the bound heap: bound as null.
     uint64_t heap_index_misses = 0;
