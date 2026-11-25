@@ -45,6 +45,23 @@ namespace {
 
 std::atomic<bool> g_write_watch{false};
 
+// O33: the reservations made with MEM_WRITE_WATCH (base -> end). A take asks GetWriteWatch only
+// inside one of them: anywhere else (zone placeholders, untracked arenas) the call fails anyway,
+// and a failing call costs as much as a successful one. A leaf lock.
+std::shared_mutex g_watched_mutex;
+std::map<uintptr_t, uintptr_t> g_watched;
+
+void note_watched(const void* base, uint64_t size) {
+    std::unique_lock<std::shared_mutex> lock(g_watched_mutex);
+    g_watched[reinterpret_cast<uintptr_t>(base)] = reinterpret_cast<uintptr_t>(base) + static_cast<uintptr_t>(size);
+}
+
+bool watched_covers(uintptr_t lo, uintptr_t hi) {
+    std::shared_lock<std::shared_mutex> lock(g_watched_mutex);
+    auto it = g_watched.upper_bound(lo);
+    return it != g_watched.begin() && hi <= std::prev(it)->second;
+}
+
 DWORD win_protect(PageProtect protect) {
     if (is_writable(protect)) {
         return PAGE_READWRITE;
@@ -63,6 +80,9 @@ uint8_t* reserve(uint64_t size, uint64_t preferred) {
     if (p != nullptr && preferred != 0 && reinterpret_cast<uintptr_t>(p) != preferred) {
         VirtualFree(p, 0, MEM_RELEASE);
         return nullptr;
+    }
+    if (p != nullptr && (type & MEM_WRITE_WATCH) != 0) {
+        note_watched(p, size);
     }
     return static_cast<uint8_t*>(p);
 }
@@ -301,8 +321,15 @@ void track_protect(uint8_t* p, uint64_t len, bool read_write) {
 }
 
 void all_written(uintptr_t lo, uintptr_t hi, uintptr_t origin, std::vector<uint64_t>* offsets) {
-    for (uintptr_t page = lo & ~(uintptr_t{kWrittenPageSize} - 1); page < hi; page += kWrittenPageSize) {
-        offsets->push_back(static_cast<uint64_t>(page - origin));
+    const uintptr_t first = lo & ~(uintptr_t{kWrittenPageSize} - 1);
+    if (first >= hi) {
+        return;
+    }
+    const size_t at = offsets->size();
+    offsets->resize(at + static_cast<size_t>((hi - first + kWrittenPageSize - 1) / kWrittenPageSize));
+    uint64_t* out = offsets->data() + at;
+    for (uintptr_t page = first; page < hi; page += kWrittenPageSize) {
+        *out++ = static_cast<uint64_t>(page - origin);
     }
 }
 
@@ -341,6 +368,10 @@ void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
 }
 
 void release(uint8_t* base, uint64_t /*size*/) {
+    {
+        std::unique_lock<std::shared_mutex> lock(g_watched_mutex);
+        g_watched.erase(reinterpret_cast<uintptr_t>(base));
+    }
     std::pair<uintptr_t, uintptr_t> zone{0, 0};
     {
         std::unique_lock<std::shared_mutex> lock(g_zone_mutex);
@@ -407,7 +438,9 @@ uint8_t* reserve_with_shared_zone(uint64_t size, uint64_t preferred, uint64_t zo
         const ULONG ww = g_write_watch.load(std::memory_order_relaxed) ? MEM_WRITE_WATCH : 0;
         void* lower = api.virtual_alloc2(GetCurrentProcess(), base, static_cast<SIZE_T>(zone_offset),
                                          MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | ww, PAGE_NOACCESS, nullptr, 0);
-        if (lower == nullptr && ww != 0) {
+        if (lower != nullptr && ww != 0) {
+            note_watched(base, zone_offset);
+        } else if (lower == nullptr && ww != 0) {
             lower = api.virtual_alloc2(GetCurrentProcess(), base, static_cast<SIZE_T>(zone_offset),
                                        MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
         }
@@ -511,24 +544,37 @@ void set_write_watch(bool on) {
 namespace {
 
 // MEM_WRITE_WATCH pages of [start, end) (one reservation), as offsets from `origin`.
+// O33: GetWriteWatch's output buffer is kept per thread (it was up to 512 KiB allocated and zeroed
+// on every take), and the pages it reports are appended in one go.
 bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, std::vector<uint64_t>* offsets) {
+    if (!watched_covers(start, end)) {
+        return false;
+    }
+    thread_local std::vector<PVOID> written;
     const uint64_t pages = (end - start + kWrittenPageSize - 1) / kWrittenPageSize;
-    std::vector<PVOID> written(static_cast<size_t>(std::min<uint64_t>(pages, 65536)));
+    const size_t cap = static_cast<size_t>(std::min<uint64_t>(pages, 65536));
+    if (written.size() < cap) {
+        written.resize(cap);
+    }
     const size_t before = offsets->size();
     for (;;) {
-        ULONG_PTR count = written.size();
+        ULONG_PTR count = cap;
         DWORD granularity = 0;
-        // Each call resets what it reports; a full buffer may leave more pages, so call again.
+        // Each call resets what it reports (WRITE_WATCH_FLAG_RESET, no separate ResetWriteWatch);
+        // a full buffer may leave more pages, so call again.
         if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<PVOID>(start), static_cast<SIZE_T>(end - start),
                           written.data(), &count, &granularity) != 0 ||
             granularity != kWrittenPageSize) {
             offsets->resize(before);
             return false;
         }
+        const size_t at = offsets->size();
+        offsets->resize(at + static_cast<size_t>(count));
+        uint64_t* out = offsets->data() + at;
         for (ULONG_PTR i = 0; i < count; ++i) {
-            offsets->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(written[i]) - origin));
+            out[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(written[i]) - origin);
         }
-        if (count < written.size()) {
+        if (count < cap) {
             return true;
         }
     }
