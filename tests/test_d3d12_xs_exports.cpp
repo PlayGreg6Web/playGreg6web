@@ -2126,16 +2126,18 @@ void test_xbox_frame_loop_present_and_pacing() {
     // Paced: four frames take at least ~3 intervals, and nothing spins for long.
     CHECK(elapsed >= std::chrono::milliseconds(12));
     CHECK(elapsed < std::chrono::seconds(5));
-    // The first present names the back buffer: frame 0 rendered into the texture, later frames
-    // into the canvas; every frame ends with Present.
-    CHECK(counter(dev, dg::xbox::Counter::BackBufferMarks) == 1);
-    CHECK(object_of<dg::Resource>(scene.rt)->is_back_buffer());
+    // Every frame renders into the texture, then PresentX draws it into the canvas (the texture is
+    // never retargeted), then Present.
+    CHECK(counter(dev, dg::xbox::Counter::PresentBlits) == 4);
+    CHECK(counter(dev, dg::xbox::Counter::PresentsNotBlitted) == 0);
+    CHECK(!object_of<dg::Resource>(scene.rt)->is_back_buffer());
     for (size_t i = 0; i < frames.size(); ++i) {
         const Packet* pass = find_op(frames[i], GpuOpcode::BeginRenderPass);
-        CHECK(pass != nullptr);
-        if (pass != nullptr) {
-            const uint32_t target = payload_as<GpuBeginRenderPassPayload>(*pass).color[0].texture_id;
-            CHECK(target == (i == 0 ? rt_id : kGpuSwapchainTextureId));
+        const Packet* blit = find_op(frames[i], GpuOpcode::BeginRenderPass, 1);
+        CHECK(pass != nullptr && blit != nullptr);
+        if (pass != nullptr && blit != nullptr) {
+            CHECK(payload_as<GpuBeginRenderPassPayload>(*pass).color[0].texture_id == rt_id);
+            CHECK(payload_as<GpuBeginRenderPassPayload>(*blit).color[0].texture_id == kGpuSwapchainTextureId);
         }
         CHECK(!frames[i].empty() && frames[i].back().opcode == GpuOpcode::Present);
     }
@@ -2170,6 +2172,76 @@ void test_xbox_frame_loop_present_and_pacing() {
     destroy_guest_thread(fx.arena, other);
     CHECK(t_balanced);
     scene.release_all({list});
+}
+
+// PresentX with two alternating back buffers (whose render-target views exist before the first
+// present): each present draws that frame's texture into the canvas. The blit objects are created
+// once, one bind group per back buffer; a format that cannot be sampled is counted, not drawn.
+void test_present_alternating_back_buffers() {
+    Fixture fx;
+    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t rt2 = committed(fx, scene.device, 1, texture_desc(64, 64, 87, 1), 4);  // B8G8R8A8_UNORM
+    const uint64_t r32 = committed(fx, scene.device, 1, texture_desc(64, 64, 41, 1), 4);  // R32_FLOAT
+    const uint32_t ids[2] = {object_of<dg::Resource>(scene.rt)->id(), object_of<dg::Resource>(rt2)->id()};
+    const uint64_t slot = put<uint64_t>(0);
+    auto present = [&](uint64_t resource, uint64_t token) {
+        store64(slot, resource);
+        dg::xbox::GuestPresentPlaneX plane{};
+        plane.Token = token;
+        plane.ResourceCount = 1;
+        plane.ppResources = slot;
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+        return packets_since(fx, mark);
+    };
+
+    std::vector<Packet> all;
+    for (uint64_t frame = 0; frame < 4; ++frame) {
+        const std::vector<Packet> ps = present(frame % 2 == 0 ? scene.rt : rt2, frame + 1);
+        all.insert(all.end(), ps.begin(), ps.end());
+        CHECK(!ps.empty() && ps.back().opcode == GpuOpcode::Present);
+        // The canvas pass samples this frame's back buffer through its bind group.
+        const Packet* pass = find_op(ps, GpuOpcode::BeginRenderPass);
+        const Packet* set = find_op(ps, GpuOpcode::SetBindGroup2);
+        const Packet* draw = find_op(ps, GpuOpcode::Draw);
+        CHECK(pass != nullptr && set != nullptr && draw != nullptr);
+        if (pass == nullptr || set == nullptr || draw == nullptr) {
+            continue;
+        }
+        const GpuBeginRenderPassPayload p = payload_as<GpuBeginRenderPassPayload>(*pass);
+        CHECK(p.color_count == 1 && p.color[0].texture_id == kGpuSwapchainTextureId);
+        CHECK(p.color[0].view.format == static_cast<uint8_t>(playgta6::gpu::pso::WgpuTextureFormat::Bgra8Unorm));
+        CHECK(payload_as<GpuDrawPayload>(*draw).vertex_count == 3);
+        const uint32_t group = payload_as<GpuSetBindGroup2Payload>(*set).bind_group_id;
+        bool found = false;
+        for (const Packet& c : all) {
+            if (c.opcode == GpuOpcode::CreateBindGroup2 && payload_as<GpuCreateBindGroup2Payload>(c).id == group) {
+                const GpuBindGroupEntry2 tex = payload_as<GpuBindGroupEntry2>(c, sizeof(GpuCreateBindGroup2Payload));
+                CHECK(tex.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView));
+                CHECK(tex.resource_id == ids[frame % 2]);
+                found = true;
+            }
+        }
+        CHECK(found);
+    }
+    CHECK(count_op(all, GpuOpcode::CreateShaderModule) == 2);
+    CHECK(count_op(all, GpuOpcode::CreateRenderPipeline2) == 1);
+    CHECK(count_op(all, GpuOpcode::CreateBindGroup2) == 2);
+    CHECK(count_op(all, GpuOpcode::BeginRenderPass) == 4);
+    CHECK(counter(dev, dg::xbox::Counter::PresentBlits) == 4);
+    CHECK(!object_of<dg::Resource>(scene.rt)->is_back_buffer() && !object_of<dg::Resource>(rt2)->is_back_buffer());
+
+    // Not a filterable colour format: Present only, counted.
+    const std::vector<Packet> ps = present(r32, 5);
+    CHECK(ps.size() >= 1 && ps.back().opcode == GpuOpcode::Present && find_op(ps, GpuOpcode::BeginRenderPass) == nullptr);
+    CHECK(counter(dev, dg::xbox::Counter::PresentsNotBlitted) == 1);
+    // A host-named back buffer already renders into the canvas: no blit.
+    CHECK(dev->set_back_buffer(rt2));
+    CHECK(find_op(present(rt2, 6), GpuOpcode::BeginRenderPass) == nullptr);
+    CHECK(counter(dev, dg::xbox::Counter::PresentsNotBlitted) == 2);
+    CHECK(t_balanced);
+    scene.release_all({rt2, r32});
 }
 
 void test_frame_pacer_unit() {
@@ -5388,6 +5460,7 @@ int main() {
     test_compute_views_and_public_list();
     test_xbox_inlined_list_fields_and_staged_pso();
     test_xbox_frame_loop_present_and_pacing();
+    test_present_alternating_back_buffers();
     test_frame_pacer_unit();
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_native_pipelines();

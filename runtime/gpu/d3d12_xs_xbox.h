@@ -112,9 +112,9 @@
 // timeout blocks (condition variable, no spinning) until the next tick, which bounds the frame
 // rate; a zero timeout returns the current tick at once (the title traps if it fails). Shutdown
 // (Device::shutdown_frame_events) releases every waiter and makes later waits return at once.
-// Present emits Present (and BeginFrame before the next submission, G24); plane 0's resource is
-// marked as the back buffer the first time it is presented, so render passes into it target the
-// canvas from then on (one lost frame per back buffer). Further planes are counted, not composed.
+// Present emits Present (and BeginFrame before the next submission, G24); before it, plane 0's
+// texture is drawn into the canvas by a fullscreen pass (Device::present), every frame, so titles
+// that alternate back buffers show each one. Further planes are counted, not composed.
 //
 // Command-list slots (Xbox order, from the two context-owned lists and the pools)
 // -------------------------------------------------------------------------------
@@ -448,7 +448,9 @@ enum class Counter : size_t {
     FrameEventsScheduled,
     PresentsWithPlanes,
     PresentsWithoutPlanes,
-    BackBufferMarks,
+    PresentBlits,                // PresentX drew plane 0's texture into the canvas
+    PresentsNotBlitted,          // ... could not (no texture, not a filterable colour format, or
+                                 // already the canvas through Device::set_back_buffer)
     ExtraPlanesIgnored,
     ExecutesWithToken,
     IndirectSkipped,

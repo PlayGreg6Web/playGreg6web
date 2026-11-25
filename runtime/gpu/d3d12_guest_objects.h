@@ -840,8 +840,9 @@ public:
                                     uint32_t depth, uint32_t mip_levels, uint32_t d3d12_layout,
                                     GpuTextureDimension dim, bool uav);
     // Designates a texture as the presented back buffer: render passes that target it write the
-    // canvas texture (kGpuSwapchainTextureId). PresentX calls it for plane 0's resource the first
-    // time that resource is presented (d3d12_xs_xbox.h). False if `resource` is not a 2D texture.
+    // canvas texture (kGpuSwapchainTextureId). For hosts that own the swapchain; PresentX does not
+    // call it (it draws the presented texture into the canvas instead, Device::present). False if
+    // `resource` is not a 2D texture.
     bool set_back_buffer(uint64_t resource_interface_pointer);
     // GPU address windows aliasing CPU memory (the executable reserves a CPU window and a GPU window
     // of equal size and maps the same pages into both; d3d12_xs_xbox.h). A buffer created at a GPU
@@ -890,8 +891,12 @@ public:
     void submit(const CommandEncoder& encoder) { submit(encoder.data(), encoder.size()); }
     // Several byte ranges as one submission (no other submission in between).
     void submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts);
-    // Present packet (and BeginFrame before the next frame's first submission).
-    void present();
+    // Present packet (and BeginFrame before the next frame's first submission). A non-zero
+    // `source_texture_id` (the presented plane's texture, PresentX) is first drawn into the canvas
+    // texture (kGpuSwapchainTextureId) by a fullscreen pass, scaled to the canvas, so every
+    // presented back buffer reaches the screen whenever its render-target views were created.
+    // Returns true when that blit was emitted.
+    bool present(uint32_t source_texture_id = 0);
     void set_sink(PacketSink sink);
 
     DeviceStats stats() const;
@@ -916,6 +921,14 @@ private:
     bool frame_open_ = false;
     uint64_t presents_ = 0;
     uint64_t submissions_ = 0;
+    // Present blit objects (under submit_mutex_), created on first use: shader modules, layouts,
+    // sampler, one pipeline per canvas format, one bind group per presented texture.
+    bool emit_present_blit(uint32_t source_texture_id, CommandEncoder& enc);
+    struct PresentBlit {
+        uint32_t vs = 0, fs = 0, group_layout = 0, pipeline_layout = 0, sampler = 0;
+        std::unordered_map<uint8_t, uint32_t> pipelines;   // canvas view format code -> pipeline
+        std::unordered_map<uint32_t, uint32_t> groups;     // presented texture id -> bind group
+    } present_blit_;
 
     mutable std::mutex diag_mutex_;
     std::vector<std::string> diags_;

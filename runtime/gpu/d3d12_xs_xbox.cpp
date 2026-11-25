@@ -1207,19 +1207,20 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t) 
                                          prev, plane.Token, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         }
     }
+    // Plane 0's texture is drawn into the canvas at the Present (Device::present), every frame:
+    // titles alternate several back buffers, and their render-target views predate the present.
+    uint32_t source_texture = 0;
     uint64_t resource = 0;
     if (plane.ResourceCount != 0 && plane.ppResources != 0 &&
         com::read_guest(plane.ppResources, &resource, sizeof(resource)) && resource != 0) {
         com::detail::Resolved r;
         if (com::detail::lookup_interface(resource, &r) && r.iface == &kID3D12Resource.info) {
             auto* res = static_cast<Resource*>(static_cast<IResourceHost*>(r.host));
-            if (!res->is_back_buffer()) {
-                if (device_->set_back_buffer(resource)) {
-                    device_->count(xbox::Counter::BackBufferMarks);
-                } else {
-                    device_->note_bad_argument("PresentX: plane 0 resource " + hex(resource) +
-                                               " is not a 2D texture with a GPU object");
-                }
+            if (res->desc().Dimension == ResourceDimension::Texture2D && res->has_gpu_texture()) {
+                source_texture = res->id();
+            } else {
+                device_->note_bad_argument("PresentX: plane 0 resource " + hex(resource) +
+                                           " is not a 2D texture with a GPU object");
             }
         } else {
             device_->note_bad_argument("PresentX: plane 0 resource " + hex(resource) + " is not a resource");
@@ -1231,7 +1232,7 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t) 
         device_->count(xbox::Counter::ExtraPlanesIgnored, plane_count - 1);
     }
     device_->count(xbox::Counter::PresentsWithPlanes);
-    device_->present();
+    device_->count(device_->present(source_texture) ? xbox::Counter::PresentBlits : xbox::Counter::PresentsNotBlitted);
     return kSOk;
 }
 

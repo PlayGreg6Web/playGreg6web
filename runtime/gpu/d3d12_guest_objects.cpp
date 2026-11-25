@@ -405,13 +405,162 @@ void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& 
     ++submissions_;
 }
 
-void Device::present() {
+namespace {
+
+// Fullscreen triangle sampling the presented texture (uv (0,0) = top left).
+constexpr std::string_view kPresentBlitVs = R"(struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+  let x = f32((i << 1u) & 2u);
+  let y = f32(i & 2u);
+  var o: VsOut;
+  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+  o.uv = vec2<f32>(x, y);
+  return o;
+}
+)";
+constexpr std::string_view kPresentBlitFs = R"(@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+  return textureSampleLevel(src, smp, uv, 0.0);
+}
+)";
+
+// Canvas view format for a presented texture format (0: not blittable: not a filterable colour
+// format). The canvas takes rgba8unorm, bgra8unorm or rgba16float, -srgb as a view format.
+uint8_t present_canvas_format(pso::WgpuTextureFormat f) {
+    using F = pso::WgpuTextureFormat;
+    switch (f) {
+    case F::Rgba8Unorm:
+    case F::Rgba8UnormSrgb:
+    case F::Bgra8Unorm:
+    case F::Bgra8UnormSrgb:
+    case F::Rgba16Float:
+        return static_cast<uint8_t>(f);
+    case F::Rgb10a2Unorm:
+    case F::Rg11b10Ufloat:
+        return static_cast<uint8_t>(F::Rgba8Unorm);
+    default:
+        return 0;
+    }
+}
+
+}  // namespace
+
+bool Device::emit_present_blit(uint32_t source_texture_id, CommandEncoder& enc) {
+    bridge::TextureInfo info;
+    if (!bridge_->texture_info(source_texture_id, &info) || info.swapchain ||
+        info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
+        return false;  // gone, already the canvas (set_back_buffer), or not a plain 2D texture
+    }
+    const pso::TextureFormatMapping m =
+        pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features);
+    const uint8_t canvas_format = present_canvas_format(m.format);
+    if (canvas_format == 0) {
+        return false;
+    }
+    PresentBlit& b = present_blit_;
+    if (b.vs == 0) {
+        b.vs = allocate_id();
+        b.fs = allocate_id();
+        enc.create_shader_module(b.vs, GpuShaderStage::Vertex, kPresentBlitVs);
+        enc.create_shader_module(b.fs, GpuShaderStage::Fragment, kPresentBlitFs);
+        GpuBindGroupLayoutEntry entries[2] = {};
+        entries[0].binding = 0;
+        entries[0].visibility = GpuShaderStageBits::Fragment;
+        entries[0].type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entries[0].binding_type = static_cast<uint8_t>(GpuTextureSampleType::Float);
+        entries[0].view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        entries[1].binding = 1;
+        entries[1].visibility = GpuShaderStageBits::Fragment;
+        entries[1].type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
+        entries[1].binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Filtering);
+        b.group_layout = allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = b.group_layout;
+        layout.entry_count = 2;
+        enc.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        b.pipeline_layout = allocate_id();
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = b.pipeline_layout;
+        pl.bind_group_layout_count = 1;
+        enc.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &b.group_layout, sizeof(uint32_t));
+        b.sampler = allocate_id();
+        GpuCreateSampler2Payload s{};
+        s.id = b.sampler;
+        s.mag_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+        s.min_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+        s.mipmap_filter = static_cast<uint8_t>(GpuFilterMode::Nearest);
+        s.max_anisotropy = 1;
+        s.lod_max_clamp = 32.0f;
+        enc.emit_packet(GpuOpcode::CreateSampler2, &s, sizeof(s));
+    }
+    uint32_t& pipeline = b.pipelines[canvas_format];
+    if (pipeline == 0) {
+        pipeline = allocate_id();
+        GpuCreateRenderPipeline2Payload p{};
+        p.id = pipeline;
+        p.vs_module_id = b.vs;
+        p.fs_module_id = b.fs;
+        p.pipeline_layout_id = b.pipeline_layout;
+        p.key.color_target_count = 1;
+        p.key.color_targets[0].format = canvas_format;
+        p.key.color_targets[0].write_mask = 0xF;
+        p.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+        p.key.multisample.count = 1;
+        p.key.multisample.mask = 0xFFFFFFFFu;
+        enc.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
+    }
+    uint32_t& group = b.groups[source_texture_id];
+    if (group == 0) {
+        group = allocate_id();
+        GpuBindGroupEntry2 e[2] = {};
+        e[0].binding = 0;
+        e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+        e[0].resource_id = source_texture_id;
+        e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        e[0].view.mip_level_count = 1;
+        e[0].view.array_layer_count = 1;
+        e[1].binding = 1;
+        e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
+        e[1].resource_id = b.sampler;
+        GpuCreateBindGroup2Payload g{};
+        g.id = group;
+        g.layout_id = b.group_layout;
+        g.entry_count = 2;
+        enc.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+    }
+    GpuBeginRenderPassPayload pass{};
+    pass.color_count = 1;
+    pass.color[0].texture_id = kGpuSwapchainTextureId;
+    pass.color[0].load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+    pass.color[0].store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    pass.color[0].view.format = canvas_format;
+    pass.color[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+    pass.color[0].view.mip_level_count = 1;
+    pass.color[0].view.array_layer_count = 1;
+    pass.color[0].clear_value[3] = 1.0f;
+    enc.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
+    enc.set_pipeline(pipeline);
+    GpuSetBindGroup2Payload set{};
+    set.group_index = 0;
+    set.bind_group_id = group;
+    enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    enc.draw(3);
+    enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    return true;
+}
+
+bool Device::present(uint32_t source_texture_id) {
     if (dump_ && dump_presents_.fetch_add(1) % 60 == 59) {
         dump_->write_manifest();
     }
-    CommandEncoder enc;
-    enc.present();
     std::lock_guard<std::mutex> lock(submit_mutex_);
+    CommandEncoder enc;
+    const bool blitted = source_texture_id != 0 && emit_present_blit(source_texture_id, enc);
+    enc.present();
     CommandEncoder begin;
     if (!frame_open_) {
         begin.begin_frame();
@@ -429,6 +578,7 @@ void Device::present() {
     frame_open_ = false;
     ++presents_;
     va_watch::set_frame(presents_);
+    return blitted;
 }
 
 DeviceStats Device::stats() const {
