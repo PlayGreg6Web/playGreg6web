@@ -279,8 +279,10 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
         for (const auto& existing : group_layouts_) {
             if (existing->header.content_id == record->header.content_id &&
                 existing->entries.size() == record->entries.size() &&
-                std::memcmp(existing->entries.data(), record->entries.data(),
-                            record->entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0) {
+                // memcmp with null pointers is undefined even for size 0 (both vectors empty).
+                (record->entries.empty() ||
+                 std::memcmp(existing->entries.data(), record->entries.data(),
+                             record->entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0)) {
                 const bool same_joins = std::equal(
                     existing->joins.begin(), existing->joins.end(), record->joins.begin(),
                     [](const d3d::ShaderBinding& a, const d3d::ShaderBinding& b) {
