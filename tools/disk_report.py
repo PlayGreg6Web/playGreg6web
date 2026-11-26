@@ -79,6 +79,36 @@ def git_worktrees(repo: Path) -> list[str]:
     return [line[9:].strip() for line in out.splitlines() if line.startswith("worktree ")]
 
 
+def registry_user_env() -> dict:
+    """User-level environment variables (HKCU\Environment); empty off Windows or on error.
+    The process env of a tool/agent often lacks vars set via SetEnvironmentVariable(..., "User")."""
+    try:
+        import winreg  # type: ignore
+    except ImportError:
+        return {}
+    out: dict = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            i = 0
+            while True:
+                try:
+                    name, val, _t = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                if isinstance(val, str):
+                    out[name] = os.path.expandvars(val)
+    except OSError:
+        pass
+    return out
+
+
+def merged_env(environ: dict, registry: "dict | None" = None) -> dict:
+    """Registry user vars first, the process env wins on conflicts."""
+    reg = registry_user_env() if registry is None else registry
+    return {**reg, **environ}
+
+
 def env_references(environ: dict) -> dict:
     """path -> env var name, for every PLAYGTA6_* / GTA6_* variable whose value is an existing path."""
     refs: dict = {}
@@ -96,6 +126,41 @@ def _listing(path: str, limit: int = 400) -> list:
         return []
 
 
+def _is_hex64(stem: str) -> bool:
+    return len(stem) == 64 and all(c in "0123456789abcdef" for c in stem)
+
+
+def _looks_like_objcache(path: str, low: list) -> bool:
+    """Layout of tools/build_native_boot.py's --cache-dir: flat `<sha256>.obj|.o` (+ .lock/.tmp)."""
+    name = os.path.basename(path.rstrip("\/")).lower()
+    if "objcache" in name:
+        return True
+    hits = sum(1 for n in low if _is_hex64(n.split(".", 1)[0]) and n.endswith((".obj", ".o")))
+    return hits >= 1 and hits * 2 >= len(low)
+
+
+def shader_pack_files(path: str) -> list:
+    """*.wgsl.pack files in the top two levels of `path` (dir itself and its child dirs)."""
+    found: list = []
+    for n in _listing(path):
+        full = os.path.join(path, n)
+        if n.lower().endswith(".wgsl.pack"):
+            found.append(full)
+        elif os.path.isdir(full) and not os.path.islink(full):
+            found += [os.path.join(full, m) for m in _listing(full) if m.lower().endswith(".wgsl.pack")]
+    return found
+
+
+def _newest_mtime(files: list) -> float:
+    best = 0.0
+    for f in files:
+        try:
+            best = max(best, os.stat(f).st_mtime)
+        except OSError:
+            pass
+    return best
+
+
 def classify(path: str, worktrees: Iterable[str] = ()) -> str:
     name = os.path.basename(path.rstrip("\\/")).lower()
     if any(_norm(w) == _norm(path) for w in worktrees):
@@ -104,7 +169,9 @@ def classify(path: str, worktrees: Iterable[str] = ()) -> str:
     gitp = os.path.join(path, ".git")
     if os.path.exists(gitp):
         return "git worktree" if os.path.isfile(gitp) else "git clone"
-    if any(n.endswith((".wgsl.pack", ".reflect")) for n in low):
+    if _looks_like_objcache(path, low):
+        return "object cache"
+    if shader_pack_files(path) or any(n.endswith((".wgsl.pack", ".reflect")) for n in low):
         return "shader pack"
     if "boot-report.json" in low or name == "runs":
         return "run dir"
@@ -133,6 +200,8 @@ def hint(kind: str, path: str, refs: list) -> tuple:
         return "NO (worktree)", f"git worktree remove {quote(path)}   # only after its branch is merged/abandoned"
     if kind == "git clone":
         return "NO (git clone)", ""
+    if kind == "object cache":
+        return "NO (in use, keep)", ""
     if refs:
         return "NO (in use)", ""
     rm = f"Remove-Item -Recurse -Force -LiteralPath {quote(path)}"
@@ -162,16 +231,32 @@ def candidates(roots: list, pattern: str, every: bool) -> list:
     return out
 
 
-def build_report(cands: list, worktrees: list, envrefs: dict, workers: int = 16) -> list:
+def build_report(cands: list, worktrees: list, envrefs: dict, workers: int = 16,
+                 work_dir: "str | None" = None) -> list:
+    """`work_dir`: the dir play_native.ps1 auto-picks the newest *.wgsl.pack from (repo work/)."""
     with ThreadPoolExecutor(max_workers=workers) as ex:
         sizes = list(ex.map(dir_size, cands))
+    kinds = [classify(c, worktrees) for c in cands]
+    std = [(_newest_mtime(shader_pack_files(c)), c) for c, k in zip(cands, kinds)
+           if k == "shader pack" and os.path.basename(c.rstrip("\/")).lower().startswith("pg6nb-std")]
+    newest_std = _norm(max(std)[1]) if std else None
+    auto = None
+    if work_dir and os.path.isdir(work_dir):
+        packs = shader_pack_files(work_dir)
+        if packs:
+            auto = _norm(max(packs, key=lambda f: _newest_mtime([f])))
     rows = []
-    for path, (size, files) in zip(cands, sizes):
-        kind = classify(path, worktrees)
+    for path, (size, files), kind in zip(cands, sizes, kinds):
         refs = [f"env:{k}" for p, k in envrefs.items() if _inside(p, path)]
+        if kind == "shader pack" and auto and _inside(auto, path):
+            refs.append("auto-pick")
         refs += ["worktree:" + os.path.basename(w) for w in worktrees
                  if _inside(w, path) and _norm(w) != _norm(path) and _norm(w) != _norm(REPO)]
         safe, cmd = hint(kind, path, refs)
+        if kind == "shader pack" and not refs and newest_std == _norm(path):
+            safe = "keep (standard pack)"
+            cmd = ""
+            refs = ["std pack"]
         if kind == "git worktree" and refs:
             safe = "NO (worktree, in use)"
         rows.append(dict(path=path, size=size, files=files, kind=kind, refs=refs, safe=safe, cmd=cmd))
@@ -212,7 +297,8 @@ def main(argv: "list | None" = None) -> int:
     seen: set = set()
     cands = [c for c in cands if not (_norm(c) in seen or seen.add(_norm(c)))]
     cands = [c for c in cands if _norm(c) != _norm(REPO)]
-    rows = build_report(cands, git_worktrees(REPO), env_references(dict(os.environ)), a.workers)
+    rows = build_report(cands, git_worktrees(REPO), env_references(merged_env(dict(os.environ))), a.workers,
+                        str(REPO / "work"))
     print(render(rows, a.top))
     return 0
 

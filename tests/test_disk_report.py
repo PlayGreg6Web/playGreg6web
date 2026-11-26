@@ -63,6 +63,34 @@ class DiskReportTest(unittest.TestCase):
         self.assertTrue((self.root / "pg6pack" / "a.wgsl.pack").exists())
         self.assertIn("nothing was deleted", dr.render(rows, 10))
 
+    def test_objcache_stdpack_registry(self):
+        h = "a" * 64
+        mk(self.root, f"pg6nb-objcache/{h}.obj", 10)
+        mk(self.root, f"pg6nb-objcache-lift/{h}.o", 10)
+        mk(self.root, "pg6nb-std/sub/x.wgsl.pack", 100)
+        mk(self.root, "pg6nb-std2/y.wgsl.pack", 100)
+        mk(self.root, "pg6nb-pk7/runs/r1/boot-report.json", 5)
+        mk(self.root, "pg6nb-pk7/z.wgsl.pack", 50)
+        mk(self.root, "pg6ab/q.wgsl.pack", 50)
+        os.utime(self.root / "pg6nb-std" / "sub" / "x.wgsl.pack", (1, 1))
+        for n in ("pg6nb-objcache", "pg6nb-objcache-lift"):
+            self.assertEqual(dr.classify(str(self.root / n)), "object cache")
+        self.assertEqual(dr.classify(str(self.root / "pg6nb-pk7")), "shader pack")
+        reg = {"PLAYGTA6_SHADER_PACK": str(self.root / "pg6ab" / "q.wgsl.pack")}
+        env = dr.merged_env({}, reg)
+        self.assertIn("PLAYGTA6_SHADER_PACK", env)
+        self.assertEqual(dr.merged_env({"A": "1", "B": "p"}, {"B": "r"})["B"], "p")
+        c = dr.candidates([str(self.root)], "pg6*", False)
+        rows = dr.build_report(c, [], dr.env_references(env), workers=2)
+        by = {os.path.basename(r["path"]): r for r in rows}
+        self.assertEqual(by["pg6nb-objcache"]["safe"], "NO (in use, keep)")
+        self.assertEqual(by["pg6nb-objcache-lift"]["safe"], "NO (in use, keep)")
+        self.assertEqual(by["pg6ab"]["safe"], "NO (in use)")
+        self.assertEqual(by["pg6nb-std2"]["safe"], "keep (standard pack)")
+        self.assertEqual(by["pg6nb-std"]["kind"], "shader pack")
+        self.assertTrue(by["pg6nb-std"]["safe"].startswith("maybe"))
+        self.assertEqual(by["pg6nb-pk7"]["kind"], "shader pack")
+
     def test_symlink_skipped(self):
         link = self.root / "pg6pack" / "lnk"
         try:
