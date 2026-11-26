@@ -110,10 +110,10 @@
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
 #include "guest/input_record.h"
+#include "gpu/native_exec/present_model.h"
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
-#include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/native_executor.h"
 #endif
 #include "guest/input_script.h"
