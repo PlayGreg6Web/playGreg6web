@@ -461,6 +461,19 @@ GuestRangeView::GuestRangeView(uint64_t va, size_t len) {
     }
     if (os::guest_window::translated(va)) [[unlikely]] {
         data_ = static_cast<const uint8_t*>(os::guest_window::contiguous(va, len == 0 ? 1 : len));
+        if (data_ != nullptr) {
+            // The window shows arena pages: another guest thread decommitting them mid-read would
+            // fault the host, so hold the arena lock over the view like the flat path below does
+            // (the pages are re-checked under it; a decommitted range reads as not mapped).
+            // Runtime-owned window ranges live outside the arena and need no lock.
+            os::VirtualMemoryArena& arena = guest_memory();
+            const uint64_t arena_va = arena.guest_address(data_);
+            if (arena_va >= arena.space_base() && arena_va - arena.space_base() < arena.space_size()) {
+                if (arena.host_ptr_const_held(arena_va, len == 0 ? 1 : len, hold_) != data_) {
+                    data_ = nullptr;
+                }
+            }
+        }
         return;
     }
     data_ = guest_memory().host_ptr_const_held(va, len == 0 ? 1 : len, hold_);

@@ -1337,6 +1337,34 @@ void test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap() {
 
 }  // namespace
 
+// A GuestRangeView over a window range holds the arena lock (a concurrent decommit of the arena
+// pages behind the window must wait for the view, then the range reads as unmapped).
+void test_range_view_holds_the_arena_lock_in_the_window() {
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    Pages pages;
+    CHECK(pages.host != nullptr);
+    CHECK(gw::map_slot(W, pages.page(0)));
+    std::atomic<bool> decommitted{false};
+    std::thread decommitter;
+    {
+        const playgta6::guest::com::GuestRangeView view(W + 64, 4096);
+        CHECK(view.data() == pages.page(0) + 64);
+        CHECK(view.held());
+        decommitter = std::thread([&] {
+            CHECK(arena().decommit(pages.va, k64K));
+            decommitted.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(!decommitted.load());  // blocked while the view is alive
+    }
+    decommitter.join();
+    CHECK(decommitted.load());
+    const playgta6::guest::com::GuestRangeView after(W + 64, 4096);
+    CHECK(after.data() == nullptr);  // decommitted: not mapped, no fault
+    gw::reset_for_testing();
+}
+
 int main() {
     std::printf("test_guest_window\n");
     test_table_translation_and_copies();
@@ -1354,6 +1382,7 @@ int main() {
     test_xmem_concurrent_relocation_no_torn_reads();
     test_xmem_concurrent_write_pin_and_relocation();
     test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap();
+    test_range_view_holds_the_arena_lock_in_the_window();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
