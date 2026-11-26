@@ -9,11 +9,22 @@ docs. No game files are in this repo; the executable and package stay outside (s
 $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 .	ools\play_native.ps1 -FreshSetup  # new empty save dir so the setup screens appear
 .	ools\play_native.ps1              # later runs: builds what is stale, live window with audio and input
+.\tools\update_prebuilt.ps1          # build once into a folder (atomic swap, prebuilt.json), incremental after
+.\tools\play_native.ps1 -Prebuilt   # start that build in seconds: never compiles, prints its commit and how far behind main it is
 ```
 
 - Env vars: `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `PLAYGTA6_NATIVE_SHADER_PACK` (else the newest `*.wgsl.pack`
-  under `work/` is picked and printed; the std pack is picked automatically). Flags: `-MaxMs`, `-SaveDir`,
-  `-InputScript`, `-NoBuild`, `-DryRun`.
+  under `work/` is picked and printed; the std pack is picked automatically), `PLAYGTA6_PREBUILT_DIR` (native
+  prebuilt, default `%LOCALAPPDATA%\playgta6\prebuilt`), `PLAYGTA6_PREBUILT_WEB_DIR` (browser prebuilt, default
+  `...\prebuilt-web`). Flags: `-Prebuilt` (#1854, #1866), `-ConsoleTiming`, `-MaxMs`, `-SaveDir`, `-InputScript`, `-NoBuild`, `-DryRun`.
+- `-ConsoleTiming` (#1861) honors the title's present sync interval: menus run at the console's 30 fps instead of
+  about 60 (default `--present-interval min1`); gameplay at interval 1 is the same.
+- F3 toggles a stats overlay (fps, frame-time graph, present mode, draws, GPU ms, underruns, fault text; #1852).
+  All window hotkeys sit in one table, rebindable in `keymap.ini [hotkeys]`; `--show-target` keys are Ctrl+F7..F10 (#1844).
+- A GPU device loss is recovered by the native executor instead of ending the run (#1836). Headless run of the same
+  live path: `run_native_boot.py --live-executor` (#1847), no window.
+- Build speed: runtime libs build while shards compile, precompiled headers (#1853); the default object pass list is
+  tuned (`build_native_boot.py -O t`; `-O f` is faster codegen; #1878).
 - Controls: keyboard and the first XInput pad; the key table is in [PLAY_LOCALLY.md](PLAY_LOCALLY.md)
   (Enter/Space = A, Backspace = B, WASD = left stick, arrows = D-pad, Esc = Menu). F11 toggles fullscreen, F12 saves a PNG screenshot (#1827).
 - Mouse look is opt-in: `keymap.ini` `[mouse] look = on` captures the cursor via Raw Input; F8 releases it (all window hotkeys: keymap.ini `[hotkeys]`), a click
@@ -38,6 +49,10 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 
 - Needs Emscripten: the script finds `emcc` on PATH, `EMSDK`, or an install under `work/**/emsdk` and prints
   a fix hint otherwise (#1651). Also needs a shader pack (`work/splash.wgsl.pack` is picked up automatically).
+- `.\tools\update_prebuilt.ps1 -Web` then `.\tools\play_local.ps1 -Prebuilt` plays a prebuilt browser build without
+  compiling (#1862, #1877). With `PLAYGTA6_NATIVE_SHADER_PACK` pointing at a v2 std pack it streams the whole pack
+  with HTTP Range by default (`-StreamShaders`, `-NoStreamShaders`; #1876); otherwise `update_prebuilt -Web` derives a
+  v1 subset from the std pack (#1873). Dir: `PLAYGTA6_PREBUILT_WEB_DIR`.
 - Default `-InputScript` is `calibration-skip`; `none` turns scripting off. Details and the boot options are in
   [PLAY_LOCALLY.md](PLAY_LOCALLY.md).
 
@@ -50,15 +65,17 @@ Setup screens, loading, then the Bink videos decode and play. A headless run rea
 has been seen. Music has not started yet; the audio probe counters in the boot report (#1737) are the way to
 diagnose that. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
 
-Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). The decision
-brief recommends, and both are still pending (options and consequences in
-[HARD_STOPS.md section 7](HARD_STOPS.md#7-pending-owner-decisions-device-id-and-xuser-sign-in-state)):
+Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). All three are
+still pending; options and consequences in
+[HARD_STOPS.md section 7](HARD_STOPS.md#7-pending-owner-decisions-device-id-and-xuser-sign-in-state):
 
-1. `XSystemGetAppSpecificDeviceId` answers with an error instead of a device id (recommended).
-2. `XUser` sign-in succeeds for an offline local user (recommended).
+1. Device ID (`XSystemGetAppSpecificDeviceId`): answer with an error, no id (recommended).
+2. `XUser` sign-in state: "signed in" for the single offline local user, no tokens (recommended).
+3. Store licence (`XStoreAcquireLicenseForDurables` 71/72, slots 20/21/22/65/68): the store brief recommends
+   truthful offline / not-found answers and no ownership claims.
 
-Further open items: `XUserGetTokenAndSignatureResult` (slot 25) offline HRESULT, the long-term HRESULT of
-`XStoreAcquireLicenseForDurables` (slots 71/72), and the other XStore licence slots (20/21/22/65/68).
+Also open: `XUserGetTokenAndSignatureResult` (slot 25) offline HRESULT. `XNetworking` slots 3/4/5/8/9/10/14 already
+answer offline (network unreachable, #1872); the security/certificate ones are hard stops and never vouch for a server.
 
 ## Ray tracing
 
@@ -86,5 +103,10 @@ Runtime pieces are merged (residency of BVH/address sources, fault readback, WGS
 | `playgta6-recomp opcode-census <exe>` | Instruction mix of the executable, to prioritise lifter work |
 | `tools/boot_summary.py <report|run dir>` | Short human summary of a boot report (ending incl. fault symbols and hard-stop status, screens, fps percentiles, GPU errors, shader pack, drops, audio, bink, memory, prewarm); `--compare A B` shows deltas; `run_native_boot.py` / `play_native.ps1` print it after every run |
 | `tools/run_history.py --root H:/ [--pattern 'pg6*'] [--since 3d] [--group-by commit] [--fail-on-regression]` | Read-only time-sorted table of past boot runs (commit from report/prebuilt.json, preset, duration, ending + hard-stop status, max screen, fps p50/p5, GPU errors, pack misses, underruns, private peak); `--group-by commit` compares commits per preset, `--fail-on-regression` exits 1 for scripted use |
+
+Also: `tools/surface_survey.py` (static ranked survey of trapping COM slots and unresolved imports reachable from boot, #1870),
+`tools/minidump_stack.py` (host stack of a fault minidump, #1858). Boot reports carry build/run metadata (commit, dirty,
+profile, executor, preset; #1864) and a whole-run per-phase frame-time histogram with 1%/0.1% lows (`frame_times`, #1879)
+that `boot_summary.py` and `run_history.py` print; both also read browser run dirs (#1874).
 
 Reports hold hashes, addresses and counts only, never game bytes.
