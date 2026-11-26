@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same PR branch; never cancel runs on main.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   hygiene:
     name: No Game Files Guard
@@ -40,6 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Report LLVM tools (which llc/opt the recompiler will use)
         run: |
           which -a llc opt clang || true
@@ -53,10 +61,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: runtime-cpp
+          save: ${{ github.ref == 'refs/heads/main' }}
       - run: |
-          cmake -S runtime -B runtime/build-host -DCMAKE_BUILD_TYPE=Release
+          cmake -S runtime -B runtime/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build runtime/build-host --parallel
-          ctest --test-dir runtime/build-host --output-on-failure
+          ctest --test-dir runtime/build-host --output-on-failure --parallel 4
 
   native-executor-windows:
     name: Native Executor Build (Dawn, Windows)
