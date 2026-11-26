@@ -55,6 +55,8 @@
 //                        "Late start"); objects and the newest writes are kept, commands dropped
 //   --gpu-capture-start-at-script  start the capture's frames at the input script's `capture` step
 //   --live-digest <file>  (with --window, tools/live_vs_replay.py) per-frame replay digests of the live executor
+//   --screenshot-at N[,N...]  with --window: save those present indices (0-based) as PNG; F12 saves the current frame
+//                to %LOCALAPPDATA%\playgta6\screenshots
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
 //   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
@@ -112,6 +114,7 @@
 #include "guest/host_input.h"
 #include "guest/input_record.h"
 #include "gpu/native_exec/present_model.h"
+#include "gpu/native_exec/screenshot_model.h"
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
@@ -239,6 +242,7 @@ struct Options {
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
     uint32_t max_fps = 0;           // --max-fps: host-side present cap (0 = off)
+    std::vector<uint64_t> screenshot_at;  // --screenshot-at: present indices saved as PNG (F12 always works)
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
     std::string record_input;       // --record-input: write the real --host-input readings (guest/input_record.h)
     std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
@@ -335,6 +339,12 @@ bool parse(int argc, char** argv, Options& o) {
             o.dawn_cache_max_mb = std::strtoull(argv[++i], nullptr, 10);
         } else if (a == "--present-mode" && i + 1 < argc) {
             if (!playgta6::gpu::native_exec::parse_present_choice(argv[++i], &o.present_mode)) return false;
+        } else if (a == "--screenshot-at" && i + 1 < argc) {
+            std::string err;
+            if (!playgta6::gpu::native_exec::parse_screenshot_at(argv[++i], &o.screenshot_at, &err)) {
+                std::fprintf(stderr, "%s\n", err.c_str());
+                return false;
+            }
         } else if (a == "--max-fps" && i + 1 < argc) {
             char* end = nullptr;
             const unsigned long v = std::strtoul(argv[++i], &end, 10);
@@ -866,6 +876,7 @@ bool start_live_window() {
     options.height = g_options.window_height;
     options.present_mode = g_options.present_mode;
     options.max_fps = g_options.max_fps;
+    options.screenshot_at = g_options.screenshot_at;
     // Persistent Dawn blob cache per title / Dawn build / adapter (repeat runs skip the DXC and driver
     // compiles), and pipelines compiled on Dawn's worker threads while the pump keeps consuming packets.
     if (g_options.dawn_cache != "off") {

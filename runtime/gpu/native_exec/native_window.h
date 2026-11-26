@@ -27,6 +27,8 @@ public:
     virtual bool focused() const { return false; }
     // Sets the title bar text (UTF-8). Window thread only. Default: no-op.
     virtual void set_title(const std::string&) {}
+    // True once after F12 was pressed (consumed by the call). Callable from any thread. Default: never.
+    virtual bool take_screenshot_request() { return false; }
     // Current client area size (0 x 0 while minimized).
     virtual void client_size(uint32_t* width, uint32_t* height) const = 0;
     // Where the executor should draw a src_w x src_h frame inside the client area: the largest

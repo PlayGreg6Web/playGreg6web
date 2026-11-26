@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,7 @@
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/native_executor.h"
 #include "gpu/native_exec/reflection_model.h"
+#include "png_stored_decode.h"
 
 namespace {
 int g_failures = 0;
@@ -1283,6 +1286,50 @@ void test_depth_texture_float_layout(NativeExecutor& ex) {
     }
 }
 
+// --screenshot-at on a headless executor: present 1 is read back asynchronously, converted from the
+// bgra8 swapchain and written as a PNG whose pixels are the frame (no letterbox, no blit re-encode).
+void test_screenshot() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "pg6_shot_gpu_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.screenshot_at = {1};
+    opts.screenshot_dir = dir.string();
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+        return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        gpu::CommandEncoder f;
+        f.begin_frame();
+        f.clear_color(i == 1 ? 1.0f : 0.0f, i == 1 ? 0.5f : 1.0f, 0.0f, 1.0f);  // present 1 is orange, others green
+        f.present();
+        run(*ex, f);
+    }
+    ex->wait_idle();
+    CHECK(ex->stats().screenshots_saved == 1 && ex->stats().screenshots_failed == 0);
+    const std::string path = ex->last_screenshot_path();
+    CHECK(!path.empty());
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> rgb;
+    CHECK(png_test_decode_rgb(png, &w, &h, &rgb));
+    CHECK(w == kW && h == kH && rgb.size() == size_t{kW} * kH * 3);
+    bool all = !rgb.empty();
+    for (size_t i = 0; i + 2 < rgb.size(); i += 3) all = all && rgb[i] == 255 && rgb[i + 1] >= 126 && rgb[i + 1] <= 129 && rgb[i + 2] == 0;
+    CHECK(all);
+    ex.reset();
+    in.close();
+    ec.clear();
+    std::filesystem::remove_all(dir, ec);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -1316,6 +1363,7 @@ int main() {
     test_blit();
     test_depth_texture_float_layout(*ex);
     test_async_pipelines_and_blob_cache();
+    test_screenshot();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

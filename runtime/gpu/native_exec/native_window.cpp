@@ -9,6 +9,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <atomic>
 #include <windows.h>
 
 #include <fstream>
@@ -161,6 +162,7 @@ public:
         return !closed_;
     }
     bool closed() const override { return closed_; }
+    bool take_screenshot_request() override { return shot_request_.exchange(false); }
     void set_title(const std::string& title) override {
         if (!hwnd_ || closed_) return;
         const int n = MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, nullptr, 0);
@@ -288,6 +290,10 @@ private:
             self->toggle_fullscreen();
             return 0;
         }
+        if (self && msg == WM_KEYDOWN && wp == VK_F12 && (lp & (1 << 30)) == 0) {
+            self->shot_request_ = true;  // the executor saves the next presented frame
+            return 0;
+        }
         if (self) {
             switch (msg) {
                 case WM_SETFOCUS:
@@ -346,6 +352,7 @@ private:
     bool fullscreen_ = false;
     bool start_maximized_ = false;
     bool focus_ = false;
+    std::atomic<bool> shot_request_{false};
     bool cursor_hidden_ = false;
     WINDOWPLACEMENT placement_{};
 };

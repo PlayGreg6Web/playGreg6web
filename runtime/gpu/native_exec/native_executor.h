@@ -73,6 +73,10 @@ struct ExecutorOptions {
     // mode falls back (logged); the guest's own pacing is not changed.
     PresentChoice present_mode = PresentChoice::Auto;
     uint32_t max_fps = 0;
+    // Screenshots: F12 in the window, and these 0-based present indices (--screenshot-at) save the presented
+    // stream image (before the letterbox) as a PNG into screenshot_dir (empty: %LOCALAPPDATA%/playgta6/screenshots).
+    std::vector<uint64_t> screenshot_at;
+    std::string screenshot_dir;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;
@@ -98,6 +102,7 @@ struct ExecutorStats {
     uint64_t surface_acquire_retries = 0;    // acquires retried after Outdated / Lost / Error
     uint64_t window_actions = 0;             // --window-script actions applied
     uint64_t probes = 0;                     // letterbox probes run
+    uint64_t screenshots_saved = 0, screenshots_failed = 0;  // F12 / --screenshot-at PNGs written / failed
     uint64_t probes_failed = 0;              // ... whose bars were not black or whose picture was blank
     // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`
     // (a v2 / texture packet it rejects); op errors above are its `_recordOpValidationError`.
@@ -250,6 +255,8 @@ public:
     void set_window_title(const std::string& title);
     // Present mode in effect once the surface is configured ("" before / headless).
     std::string present_mode_name() const;
+    // Path of the newest screenshot written (wait_idle() first), "" if none.
+    std::string last_screenshot_path() const;
     // Blocks until the GPU finished all submitted work and every pending read-back / timestamp
     // read was delivered.
     void wait_idle();

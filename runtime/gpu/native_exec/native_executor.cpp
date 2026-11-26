@@ -8,6 +8,7 @@
 #include <dawn/native/DawnNative.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
+#include "gpu/native_exec/screenshot_model.h"
 #include "gpu/native_exec/stream_model.h"
 
 namespace playgta6::gpu::native_exec {
@@ -469,6 +471,19 @@ struct NativeExecutor::Impl {
     WindowScriptRunner script;
     uint64_t script_start_ns = 0;
     bool probe_pending = false;
+    // Screenshots (F12 / --screenshot-at): the stream image of a present is copied into a read-back buffer
+    // inside that frame's submit, mapped asynchronously (delivered by ProcessEvents, never waited for), then
+    // converted / PNG-encoded / written on a short-lived worker thread. The pump thread only ever sets the
+    // window title.
+    std::filesystem::path shot_dir;
+    size_t shot_next = 0;  // index into options.screenshot_at
+    std::mutex shot_mu;
+    std::vector<std::thread> shot_threads;
+    std::atomic<uint64_t> shot_saved{0}, shot_failed{0};
+    std::atomic<bool> shot_done{false};
+    std::string shot_last_path;  // under shot_mu
+    std::string last_title;
+    uint64_t shot_title_until_ns = 0;
     wgpu::Texture offscreen;
     // The stream's own render target (WgpuSwapchain `_streamFormat` + intermediate texture): used when the
     // stream format is not a canvas format, or the stream size differs from the canvas size. Presenting
@@ -631,6 +646,7 @@ struct NativeExecutor::Impl {
             }
             script.set(std::move(actions));
         }
+        shot_dir = options.screenshot_dir.empty() ? default_screenshot_dir() : std::filesystem::path(options.screenshot_dir);
         if (options.window) {
             window = NativeWindow::create(options.title, swap_width, swap_height, error);
             if (!window) {
@@ -937,7 +953,7 @@ struct NativeExecutor::Impl {
         cfg.device = device;
         cfg.format = swap_format;
         cfg.usage = wgpu::TextureUsage::RenderAttachment;
-        if (!options.frame_digest_path.empty() || !options.window_script.empty()) cfg.usage |= wgpu::TextureUsage::CopySrc;
+        cfg.usage |= wgpu::TextureUsage::CopySrc;  // F12 / --screenshot-at read the stream image back (also the digest / probe)
         cfg.width = w;
         cfg.height = h;
         cfg.alphaMode = wgpu::CompositeAlphaMode::Opaque;  // the worker's DEFAULT_ALPHA_MODE
@@ -4180,6 +4196,32 @@ struct NativeExecutor::Impl {
                 e.enc.CopyTextureToBuffer(&src, &dst, &extent);
             }
         }
+        wgpu::Buffer shot_buf;
+        uint32_t shot_row = 0, shot_w = 0, shot_h = 0;
+        ShotFormat shot_fmt = ShotFormat::Unsupported;
+        if (shot_wanted() && target.texture) {
+            shot_fmt = shot_format_of(stream_format);
+            shot_w = target.blit ? stream_w : swap_width;
+            shot_h = target.blit ? stream_h : swap_height;
+            if (shot_fmt == ShotFormat::Unsupported || shot_w == 0 || shot_h == 0) {
+                ++shot_failed;
+                std::fprintf(stderr, "[native_exec] screenshot: stream format not supported\n");
+            } else {
+                shot_row = (shot_w * static_cast<uint32_t>(shot_format_bytes(shot_fmt)) + 255u) & ~255u;
+                wgpu::BufferDescriptor bd{};
+                bd.size = uint64_t{shot_row} * shot_h;
+                bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+                shot_buf = device.CreateBuffer(&bd);
+                wgpu::TexelCopyTextureInfo src{};
+                src.texture = target.texture;
+                wgpu::TexelCopyBufferInfo dst{};
+                dst.buffer = shot_buf;
+                dst.layout.bytesPerRow = shot_row;
+                dst.layout.rowsPerImage = shot_h;
+                wgpu::Extent3D extent{shot_w, shot_h, 1};
+                e.enc.CopyTextureToBuffer(&src, &dst, &extent);
+            }
+        }
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
         const uint64_t tp1 = now_ns();
@@ -4187,6 +4229,7 @@ struct NativeExecutor::Impl {
         queue.Submit(1, &cb);
         timer_collect(e);
         start_recorded_readbacks(true);
+        if (shot_buf) shot_collect(shot_buf, shot_row, shot_w, shot_h, shot_fmt);
         if (digest_buf) write_frame_digest(digest_buf, digest_padded_row, digest_w, digest_h, digest_format);
         if (probe_buf) run_probe(probe_buf, probe_row, probe_w, probe_h, probe_rect, target.blit);
         ++frame_count;
@@ -4199,6 +4242,117 @@ struct NativeExecutor::Impl {
         frame_target.reset();
         early_flushed = false;
         reset_frame_state();
+    }
+
+    // ---- screenshots ----
+
+    static ShotFormat shot_format_of(wgpu::TextureFormat f) {
+        switch (f) {
+            case wgpu::TextureFormat::RGBA8Unorm:
+            case wgpu::TextureFormat::RGBA8UnormSrgb: return ShotFormat::Rgba8;
+            case wgpu::TextureFormat::BGRA8Unorm:
+            case wgpu::TextureFormat::BGRA8UnormSrgb: return ShotFormat::Bgra8;
+            case wgpu::TextureFormat::RGB10A2Unorm: return ShotFormat::Rgb10a2;
+            case wgpu::TextureFormat::RGBA16Float: return ShotFormat::Rgba16Float;
+            default: return ShotFormat::Unsupported;
+        }
+    }
+
+    // True when the frame being presented (index frame_count) is to be captured: F12 pressed since the
+    // last present, or a --screenshot-at index. Consumes the request.
+    bool shot_wanted() {
+        bool want = window && window->take_screenshot_request();
+        while (shot_next < options.screenshot_at.size() && options.screenshot_at[shot_next] <= frame_count) {
+            if (options.screenshot_at[shot_next] == frame_count) want = true;
+            ++shot_next;
+        }
+        return want;
+    }
+
+    // After queue.Submit(): maps the buffer; ProcessEvents delivers it once the GPU is done.
+    void shot_collect(wgpu::Buffer buf, uint32_t row, uint32_t w, uint32_t h, ShotFormat fmt) {
+        struct Pending {
+            Impl* self;
+            wgpu::Buffer buf;
+            uint32_t row, w, h;
+            ShotFormat fmt;
+        };
+        auto* pend = new Pending{this, buf, row, w, h, fmt};
+        ++pending_maps;
+        const size_t size = static_cast<size_t>(uint64_t{row} * h);
+        buf.MapAsync(
+            wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::AllowProcessEvents,
+            [](wgpu::MapAsyncStatus st, wgpu::StringView, Pending* pd) {
+                Impl& s = *pd->self;
+                if (st == wgpu::MapAsyncStatus::Success) {
+                    const size_t sz = static_cast<size_t>(uint64_t{pd->row} * pd->h);
+                    const auto* mapped = static_cast<const uint8_t*>(pd->buf.GetConstMappedRange(0, sz));
+                    std::vector<uint8_t> copy(mapped, mapped + sz);
+                    pd->buf.Unmap();
+                    s.shot_spawn(std::move(copy), pd->row, pd->w, pd->h, pd->fmt);
+                } else {
+                    ++s.shot_failed;
+                    std::fprintf(stderr, "[native_exec] screenshot: read-back map failed\n");
+                }
+                --s.pending_maps;
+                delete pd;
+            },
+            pend);
+    }
+
+    void shot_spawn(std::vector<uint8_t> data, uint32_t row, uint32_t w, uint32_t h, ShotFormat fmt) {
+        const std::filesystem::path dir = shot_dir;
+        const std::string stamp = screenshot_timestamp(std::chrono::system_clock::now());
+        std::lock_guard<std::mutex> lock(shot_mu);
+        shot_threads.emplace_back([this, dir, stamp, d = std::move(data), row, w, h, fmt]() {
+            std::vector<uint8_t> rgb = shot_to_rgb8(d.data(), row, w, h, fmt);
+            const std::vector<uint8_t> png = png_encode_rgb(rgb.data(), w, h);
+            std::error_code ec;
+            if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+            std::string path;
+            bool ok = !png.empty() && !dir.empty();
+            if (ok) {
+                std::lock_guard<std::mutex> l(shot_mu);  // one writer at a time picks a free file name
+                const std::filesystem::path p = screenshot_unique_path(dir, stamp);
+                std::ofstream f(p, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+                f.flush();
+                ok = static_cast<bool>(f);
+                if (ok) {
+                    shot_last_path = p.string();
+                    path = shot_last_path;
+                }
+            }
+            if (ok) {
+                ++shot_saved;
+                shot_done = true;
+                std::fprintf(stderr, "[native_exec] screenshot saved: %s (%ux%u)\n", path.c_str(), w, h);
+            } else {
+                ++shot_failed;
+                std::fprintf(stderr, "[native_exec] screenshot: could not write into '%s'\n", dir.string().c_str());
+            }
+        });
+    }
+
+    void shot_join() {
+        std::vector<std::thread> t;
+        {
+            std::lock_guard<std::mutex> lock(shot_mu);
+            t.swap(shot_threads);
+        }
+        for (auto& th : t) th.join();
+    }
+
+    // Pump thread: shows "saved" in the title for a moment after a screenshot, then restores it.
+    void shot_title_tick() {
+        if (!window) return;
+        if (shot_done.exchange(false)) {
+            shot_title_until_ns = now_ns() + 2500000000ull;
+            window->set_title(last_title + " | screenshot saved");
+        } else if (shot_title_until_ns && now_ns() >= shot_title_until_ns) {
+            shot_title_until_ns = 0;
+            window->set_title(last_title);
+        }
     }
 
     // --window-script `probe`: the presented canvas (after the blit) is read back and the letterbox bars
@@ -4320,6 +4474,7 @@ std::unique_ptr<NativeExecutor> NativeExecutor::create(const ExecutorOptions& op
 NativeExecutor::NativeExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 NativeExecutor::~NativeExecutor() {
+    if (impl_) impl_->shot_join();
     if (impl_ && impl_->device) {
         impl_->pass_cmds.clear();
         impl_->buffers.clear();
@@ -4375,12 +4530,19 @@ bool NativeExecutor::poll() {
     impl_->instance.ProcessEvents();
     const bool open = impl_->window ? impl_->window->pump() : true;
     impl_->run_window_script();
+    impl_->shot_title_tick();
     impl_->stats.ns_poll += Impl::now_ns() - t0;
     return open;
 }
 
 void NativeExecutor::set_window_title(const std::string& title) {
-    if (impl_->window) impl_->window->set_title(title);
+    impl_->last_title = title;
+    if (impl_->window) impl_->window->set_title(impl_->shot_title_until_ns ? title + " | screenshot saved" : title);
+}
+
+std::string NativeExecutor::last_screenshot_path() const {
+    std::lock_guard<std::mutex> lock(impl_->shot_mu);
+    return impl_->shot_last_path;
 }
 
 std::string NativeExecutor::present_mode_name() const { return impl_->present_mode_name; }
@@ -4398,6 +4560,9 @@ void NativeExecutor::wait_idle() {
         s.instance.ProcessEvents();
         if (s.pending_maps > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    s.shot_join();  // screenshot files are on disk when this returns
+    s.stats.screenshots_saved = s.shot_saved;
+    s.stats.screenshots_failed = s.shot_failed;
 }
 
 void NativeExecutor::attach_guest_memory(const GuestMemory& memory) { impl_->guest_mem = memory; }
@@ -4454,6 +4619,8 @@ std::string NativeExecutor::stats_json() const {
     num("surface_acquire_retries", st.surface_acquire_retries);
     num("window_actions", st.window_actions);
     num("probes", st.probes);
+    num("screenshots_saved", impl_->shot_saved);
+    num("screenshots_failed", impl_->shot_failed);
     num("probes_failed", st.probes_failed);
     num("packet_errors", st.packet_errors);
     num("shader_modules", st.shader_modules);
