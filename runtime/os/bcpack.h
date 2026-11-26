@@ -2,7 +2,7 @@
 
 // BCPack: the lossless packing of BC block streams that the console's DirectStorage hardware
 // unpacks (DSTORAGE_REQUEST_OPTIONS bits 1-4 name the BC format: 1 BC1, 3 BC3, 4 BC4, 5 BC5,
-// 7 BC7). Decode only; BC2 and BC6H are not supported. See docs/BCPACK.md.
+// 6 BC6H, 7 BC7). Decode only; BC2 is not supported. See docs/BCPACK.md.
 //
 // The algorithm lives here; the format's constant tables (rANS models, lane layouts, index rank
 // tables, BC7 control words, per-format dictionaries) do not. They are loaded at run time from a
@@ -19,7 +19,7 @@
 // Table file (all integers little-endian):
 //   header   char magic[8] = "PG6BCPAK", u32 version = 1, u32 section_count
 //   sections section_count x { char tag[4], u32 version = 1, u32 offset, u32 size }
-//   tags     MODL (required), LANE (required), RANK, BC7C, DIC1, DIC3, DIC4, DIC5, DIC7.
+//   tags     MODL (required), LANE (required), RANK, BC7C, DIC1, DIC3, DIC4, DIC5, DIC6, DIC7.
 //            Unknown tags are ignored. Payload layouts: docs/BCPACK.md.
 
 #include <cstddef>

@@ -1209,7 +1209,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
                                   "PLAYGTA6_BCPACK_TABLES (the repository does not ship them; docs/BCPACK.md)"
                                 : "the loaded BCPack tables cannot decode mode " + std::to_string(opts.bcpack_mode) +
                                       " (they support: " + bcpack::supported_formats(*tables) +
-                                      "; BC2 and BC6H are not implemented)";
+                                      "; BC2 has no BCPack decoder)";
                     diag("XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
                          std::to_string(opts.bcpack_mode) + ", " + std::to_string(r.source_size) + " -> " +
                          std::to_string(r.destination_size) + " bytes, request '" + name + "'); " + why +

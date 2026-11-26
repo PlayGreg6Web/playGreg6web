@@ -1105,9 +1105,9 @@ void test_bcpack_requests() {
     CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before + 1);
 
     // A format the tables (and this decoder) do not cover: still E_NOTIMPL.
-    ga::DStorageRequest bc6 = r;
-    bc6.options = 6ull << 1;
-    CHECK(run(bc6, 2) == com::E_NOTIMPL_HR);
+    ga::DStorageRequest bc2 = r;
+    bc2.options = 2ull << 1;
+    CHECK(run(bc2, 2) == com::E_NOTIMPL_HR);
 
     // Physical-page destination (the title's 0x2000xx options).
     size_t page_count = 2;

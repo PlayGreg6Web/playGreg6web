@@ -12,7 +12,8 @@ BCPack is the console's lossless packing of BC block streams. The decoder lives 
 | 4 | BC4 | decoded |
 | 5 | BC5 | decoded |
 | 7 | BC7 | decoded |
-| 2, 6 | BC2, BC6H | not implemented: E_NOTIMPL |
+| 6 | BC6H | decoded |
+| 2 | BC2 | not a BCPack format here: E_NOTIMPL (see below) |
 
 Decoded blocks go to the request's destination, whether that is a contiguous buffer or the
 physical-page array of `DestinationIsPhysicalPages` (bit 21). When zlib (bit 0) is also set, the
@@ -79,6 +80,7 @@ The loader handles tags like this:
 - `MODL` and `LANE` are required.
 - A format is decoded only if it has a `LANE` entry and every section it uses:
   - BC1, BC3, BC4 and BC5 need `RANK` and their own `DICn`.
+  - BC6H needs `DIC6` (no `RANK`, no `BC7C`).
   - BC7 needs `BC7C` and `DIC7`.
 
 ### `MODL`: rANS models (2304 bytes)
@@ -99,14 +101,14 @@ The section starts with a `u32 count`, followed by `count` entries:
 
 | Offset | Type | Meaning |
 |--------|------|---------|
-| 0 | `u8` | BC format (1, 3, 4, 5, 7; other formats are ignored) |
+| 0 | `u8` | BC format (1, 3, 4, 5, 6, 7; other formats are ignored) |
 | 1 | `u8` | lane count (1-16) |
 | 2 | `u8` | symbols per lane per block (1 or 2) |
 | 3 | `u8` | reserved, 0 |
 | 4 | `u8[16]` | width of each lane (3-7); unused entries 0 |
 
 - `lanes × symbols per block` must equal the format's record length: BC1 12, BC3 24, BC4 12,
-  BC5 24, BC7 32.
+  BC5 24, BC6H 32, BC7 32.
 - Lane `j` contributes the record symbols `j × per .. j × per + per - 1` of every block.
 - A fragment header byte `h` on a lane of width `w` selects model `(w - (h >> 6)) × 16 + (h & 15)`.
 
@@ -154,6 +156,26 @@ Each section holds 255 entries. Each entry gives the endpoints, then the index v
 
 A block `i` that names reference `r > i` uses dictionary entry `r - i - 1`.
 
+### `DIC6`: BC6H dictionary (255 × 58 bytes)
+
+Each entry holds these fields:
+- `u8` mode of the endpoint half (ignored).
+- `4 × 3 u16` endpoints, R G B of endpoints 0 to 3. Each value is left-aligned to 16 bits at its
+  stored precision, with the top bit flipped (a field `f` at `n` bits is `(f << (16 - n)) ^ 0x8000`).
+- `u8` BC6H mode (0-14) of the index half. It sets the precision of the index values.
+- `16 × i16` index values, signed at the index bits (3 for modes 1-10, 4 for modes 11-14): the stored
+  index minus half the range.
+
+A BC6H record has 32 symbols (16 lanes × 2). The mode is symbol 30 plus one (1-14, else the block
+is corrupt) and the partition is symbol 31. A one-subset mode (11-14) leaves endpoints 2 and 3 as
+endpoint 0 re-expressed at the delta precision and endpoint 1, for later blocks to predict from.
+Modes 13 and 14 write the high base bits lowest first.
+
+### BC2
+
+BC2 is not decoded: no known BCPack encoding exists for it (the format covers BC1, BC3, BC4, BC5,
+BC6H and BC7). Requests for it fail with E_NOTIMPL.
+
 ### `DIC7`: BC7 dictionary (255 × 116 bytes)
 
 Each entry holds these fields:
@@ -175,8 +197,8 @@ The decoder logic was written for this repository from a description of the form
 We worked out that description by reading VIctory's GPL-3.0 decoder. We copied no code, constants
 or tables from it.
 
-The only tables in the source come from the public BC7 specification: mode bit counts and anchor
-indices. The anchor indices are as published in Microsoft's MIT-licensed DirectXTex.
+The only tables in the source come from the public BC6H and BC7 specifications: mode bit counts,
+header layouts and anchor indices. The anchor indices are as published in Microsoft's MIT-licensed DirectXTex.
 
 Tests (`tests/test_bcpack.cpp`, and the DirectStorage cases in
 `tests/test_xbox_scarlett_guest.cpp`) use only synthetic tables and streams from a test-only

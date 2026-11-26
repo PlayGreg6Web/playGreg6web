@@ -88,11 +88,11 @@ void test_table_parsing() {
         std::fprintf(stderr, "  parse error: %s\n", error.c_str());
         return;
     }
-    for (uint32_t bc : {1u, 3u, 4u, 5u, 7u}) {
+    for (uint32_t bc : {1u, 3u, 4u, 5u, 6u, 7u}) {
         CHECK(bp::supports(*t, bc));
     }
-    CHECK(!bp::supports(*t, 2) && !bp::supports(*t, 6) && !bp::supports(*t, 0) && !bp::supports(*t, 15));
-    CHECK(bp::supported_formats(*t) == "BC1, BC3, BC4, BC5, BC7");
+    CHECK(!bp::supports(*t, 2) && !bp::supports(*t, 0) && !bp::supports(*t, 15));
+    CHECK(bp::supported_formats(*t) == "BC1, BC3, BC4, BC5, BC6H, BC7");
 
     auto parses = [](const sy::Builder& b, std::string* why = nullptr) {
         const std::vector<uint8_t> f = b.file();
@@ -111,8 +111,14 @@ void test_table_parsing() {
         const std::vector<uint8_t> f = no_dic7.file();
         const auto t2 = bp::parse_tables(f.data(), f.size(), nullptr);
         CHECK(t2 != nullptr && !bp::supports(*t2, 7) && bp::supports(*t2, 4));
-        CHECK(t2 && bp::supported_formats(*t2) == "BC1, BC3, BC4, BC5");
+        CHECK(t2 && bp::supported_formats(*t2) == "BC1, BC3, BC4, BC5, BC6H");
     }
+    sy::Builder bad_dic6 = full;
+    bad_dic6.sections["DIC6"].pop_back();
+    CHECK(!parses(bad_dic6, &error) && error.find("DIC6") != std::string::npos);
+    bad_dic6 = full;
+    bad_dic6.sections["DIC6"][25] = 15;  // entry 0's index-half mode
+    CHECK(!parses(bad_dic6, &error) && error.find("mode 15") != std::string::npos);
     // Required sections, sizes, model tiling, lane widths.
     sy::Builder no_lane = full;
     no_lane.sections.erase("LANE");
@@ -715,6 +721,201 @@ void test_bc7_references() {
 }
 
 // ---------------------------------------------------------------------------
+// BC6H
+// ---------------------------------------------------------------------------
+
+// Reads `n` bits at bit `at` of a 128-bit block (little-endian bit order).
+uint32_t block_bits(const uint8_t* blk, uint32_t at, uint32_t n) {
+    uint32_t v = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        v |= static_cast<uint32_t>((blk[(at + k) / 8] >> ((at + k) % 8)) & 1u) << k;
+    }
+    return v;
+}
+
+// A block record for a BC6H block with no references: endpoint fields f[endpoint w x y z][R G B]
+// at the mode's precision, stored indices (0 .. 2^bits-1) and the partition (two-subset modes).
+Record bc6_record(uint32_t mode, const uint32_t f[4][3], const uint32_t* idx, uint32_t partition) {
+    static const uint8_t bits[15][4] = {{0, 0, 0, 0},  {10, 5, 5, 5}, {7, 6, 6, 6},   {11, 5, 4, 4},
+                                        {11, 4, 5, 4}, {11, 4, 4, 5}, {9, 5, 5, 5},   {8, 6, 5, 5},
+                                        {8, 5, 6, 5},  {8, 5, 5, 6},  {6, 6, 6, 6},   {10, 10, 10, 10},
+                                        {11, 9, 9, 9}, {12, 8, 8, 8}, {16, 4, 4, 4}};
+    const bool two = mode < 11;
+    // Residual symbol: the working value (field, top bit flipped, left-aligned) taken as a signed
+    // 16-bit number, zigzagged.
+    auto symbol = [](uint32_t field, uint32_t sh) {
+        const uint32_t ep = ((field << sh) ^ 0x8000u) & 0xFFFFu;
+        const int32_t s = static_cast<int16_t>(ep >> sh);
+        return static_cast<uint32_t>(s >= 0 ? 2 * s : -2 * s - 1) & 0xFFFFu;
+    };
+    auto split = [](uint32_t v, uint8_t* even, uint8_t* odd) {  // the inverse of merging two bytes
+        uint32_t a = 0;
+        uint32_t b = 0;
+        for (uint32_t k = 0; k < 8; ++k) {
+            a |= ((v >> (2 * k)) & 1u) << k;
+            b |= ((v >> (2 * k + 1)) & 1u) << k;
+        }
+        *even = static_cast<uint8_t>(a);
+        *odd = static_cast<uint8_t>(b);
+    };
+    Record r(32, 0);
+    for (uint32_t c = 0; c < 3; ++c) {
+        split(symbol(f[0][c], 16 - bits[mode][0]), &r[4 + 2 * c], &r[5 + 2 * c]);
+        split(symbol(f[1][c], 16 - bits[mode][1 + c]), &r[10 + 2 * c], &r[11 + 2 * c]);
+        if (two) {
+            r[16 + 2 * c] = static_cast<uint8_t>(symbol(f[2][c], 16 - bits[mode][1 + c]));
+            r[17 + 2 * c] = static_cast<uint8_t>(symbol(f[3][c], 16 - bits[mode][1 + c]));
+        }
+    }
+    const int ib = mode < 11 ? 3 : 4;
+    for (uint32_t k = 0; k < 8; ++k) {
+        uint8_t half[2];  // zigzagged signed residuals of pixels 2k and 2k + 1
+        for (uint32_t h = 0; h < 2; ++h) {
+            half[h] = sy::zigzag(static_cast<int>(idx[2 * k + h]) - (1 << (ib - 1)));
+        }
+        // Odd bits carry pixel 2k in the first six bytes, even bits in the last two.
+        const uint8_t even = k < 6 ? half[1] : half[0];
+        const uint8_t odd = k < 6 ? half[0] : half[1];
+        uint8_t byte = 0;
+        for (uint32_t b = 0; b < 4; ++b) {
+            byte = static_cast<uint8_t>(byte | (((even >> b) & 1u) << (2 * b)) | (((odd >> b) & 1u) << (2 * b + 1)));
+        }
+        r[22 + k] = byte;
+    }
+    r[30] = static_cast<uint8_t>(mode - 1);
+    r[31] = static_cast<uint8_t>(partition);
+    return r;
+}
+
+void test_bc6h() {
+    const auto t = sy::Builder::full().tables();
+    CHECK(t != nullptr);
+    if (!t) {
+        return;
+    }
+    // Mode 11 (one subset, 10-bit endpoints, 4-bit indices): mode bits 00011, then rw gw bw rx gx
+    // bx at 10 bits each from bit 5, then the indices from bit 65 (the first one in 3 bits).
+    {
+        const uint32_t f[4][3] = {{0x155, 0x2AA, 0x0F0}, {0x3FF, 0, 0x201}, {}, {}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = p == 0 ? 5 : (p * 5 + 1) % 16;
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 6, {bc6_record(11, f, ix, 0)});
+        CHECK(block_bits(dst.data(), 0, 5) == 3);
+        for (uint32_t k = 0; k < 6; ++k) {
+            CHECK(block_bits(dst.data(), 5 + 10 * k, 10) == f[k / 3][k % 3]);
+        }
+        uint32_t at = 65;
+        for (uint32_t p = 0; p < 16; ++p) {
+            const uint32_t n = p == 0 ? 3 : 4;
+            CHECK(block_bits(dst.data(), at, n) == (ix[p] & ((1u << n) - 1)));
+            at += n;
+        }
+        CHECK(at == 128);
+    }
+    // Mode 1 (two subsets, 10/5/5/5 bits), partition 17 (second anchor at pixel 2): the scattered
+    // header fields at their public positions, then 3-bit indices (2 bits at the anchors).
+    {
+        const uint32_t f[4][3] = {{0x155, 0x2AA, 0x0F0}, {17, 3, 30}, {1, 2, 3}, {31, 0, 16}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = (p == 0 || p == 2) ? p + 1 : (p * 3 + 2) % 8;
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 6, {bc6_record(1, f, ix, 17)});
+        const uint8_t* b = dst.data();
+        auto bit = [&](uint32_t at) { return block_bits(b, at, 1); };
+        CHECK(block_bits(b, 0, 2) == 0);
+        CHECK(bit(2) == (f[2][1] >> 4) && bit(3) == (f[2][2] >> 4) && bit(4) == (f[3][2] >> 4));
+        CHECK(block_bits(b, 5, 10) == f[0][0] && block_bits(b, 15, 10) == f[0][1] && block_bits(b, 25, 10) == f[0][2]);
+        CHECK(block_bits(b, 35, 5) == f[1][0] && bit(40) == (f[3][1] >> 4) && block_bits(b, 41, 4) == (f[2][1] & 15));
+        CHECK(block_bits(b, 45, 5) == f[1][1] && bit(50) == (f[3][2] & 1) && block_bits(b, 51, 4) == (f[3][1] & 15));
+        CHECK(block_bits(b, 55, 5) == f[1][2] && bit(60) == ((f[3][2] >> 1) & 1) &&
+              block_bits(b, 61, 4) == (f[2][2] & 15));
+        CHECK(block_bits(b, 65, 5) == f[2][0] && bit(70) == ((f[3][2] >> 2) & 1) && block_bits(b, 71, 5) == f[3][0]);
+        CHECK(bit(76) == ((f[3][2] >> 3) & 1) && block_bits(b, 77, 5) == 17);
+        uint32_t at = 82;
+        for (uint32_t p = 0; p < 16; ++p) {
+            const uint32_t n = (p == 0 || p == 2) ? 2 : 3;
+            CHECK(block_bits(b, at, n) == ix[p]);
+            at += n;
+        }
+        CHECK(at == 128);
+    }
+    // Mode 14 (one subset, 16-bit base, 4-bit deltas): the base's high bits follow the delta.
+    {
+        const uint32_t f[4][3] = {{0xABCD, 0x1234, 0xFFFF}, {9, 15, 0}, {}, {}};
+        uint32_t ix[16] = {};
+        for (uint32_t p = 1; p < 16; ++p) {
+            ix[p] = p;
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 6, {bc6_record(14, f, ix, 0)});
+        const uint8_t* b = dst.data();
+        CHECK(block_bits(b, 0, 5) == 15);
+        CHECK(block_bits(b, 5, 10) == (f[0][0] & 0x3FF) && block_bits(b, 15, 10) == (f[0][1] & 0x3FF) &&
+              block_bits(b, 25, 10) == (f[0][2] & 0x3FF));
+        CHECK(block_bits(b, 35, 4) == f[1][0] && block_bits(b, 39, 6) == (f[0][0] >> 10));
+        CHECK(block_bits(b, 45, 4) == f[1][1] && block_bits(b, 49, 6) == (f[0][1] >> 10));
+        CHECK(block_bits(b, 55, 4) == f[1][2] && block_bits(b, 59, 6) == (f[0][2] >> 10));
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(block_bits(b, 65 + 4 * p - (p > 0 ? 1 : 0), p == 0 ? 3 : 4) == ix[p]);
+        }
+    }
+    // References. Block 0 (mode 11) takes both references from dictionary entry 0 (reference 1);
+    // block 1 (mode 1) predicts its endpoints from block 0 and adds +1 to the R of endpoint 1.
+    // Dictionary entry 0: endpoint j channel c = (3 j + c) << 10, indices p % 8 - 4 at 4 bits.
+    {
+        const uint32_t zero_f[4][3] = {};
+        const uint32_t zero_ix[16] = {};
+        Record b0 = bc6_record(11, zero_f, zero_ix, 0);
+        std::fill(b0.begin() + 4, b0.begin() + 30, uint8_t{0});  // no residuals
+        b0[2] = 1;  // index reference 1 (merged nibbles 1, 0); endpoint reference = 1 + delta 0
+        Record b1(32, 0);
+        b1[1] = 1;   // endpoint reference: delta symbol 2 = +1 on index reference 0 -> block 0
+        b1[11] = 1;  // R of endpoint 1: residual symbol 2 = +1 (odd byte's bit 0)
+        b1[30] = 0;  // mode 1
+        b1[31] = 17;
+        const std::vector<uint8_t> dst = decode_records(*t, 6, {b0, b1});
+        const uint8_t* b = dst.data();
+        // Block 0: mode 11, 10-bit fields ((raw ^ 0x8000) >> 6) of the entry's endpoints 0 and 1,
+        // where endpoint j channel c holds (3 j + c) << 10, i.e. k << 10 for field k.
+        CHECK(block_bits(b, 0, 5) == 3);
+        for (uint32_t k = 0; k < 6; ++k) {
+            CHECK(block_bits(b, 5 + 10 * k, 10) == (((k << 10) ^ 0x8000u) >> 6));
+        }
+        // Dictionary index p % 8 - 4 at 4 bits, stored as p % 8 + 4 (3 bits at the anchor).
+        uint32_t at = 65;
+        for (uint32_t p = 0; p < 16; ++p) {
+            const uint32_t n = p == 0 ? 3 : 4;
+            CHECK(block_bits(b, at, n) == (((p % 8) + 4) & ((1u << n) - 1)));
+            at += n;
+        }
+        // Block 1: mode 1. Endpoint 0 as block 0's; the others at 5 bits from the previous
+        // block's endpoints (cut to the 5-bit field) plus the residual.
+        const uint8_t* c = dst.data() + 16;
+        CHECK(block_bits(c, 0, 2) == 0 && block_bits(c, 77, 5) == 17);
+        CHECK(block_bits(c, 5, 10) == ((0u ^ 0x8000u) >> 6) && block_bits(c, 15, 10) == (((1u << 10) ^ 0x8000u) >> 6));
+        auto five = [](uint32_t raw, uint32_t plus) {
+            return ((((raw & 0xF800u) + (plus << 11)) & 0xFFFFu) ^ 0x8000u) >> 11;
+        };
+        CHECK(block_bits(c, 35, 5) == five(3u << 10, 1));  // rx
+        CHECK(block_bits(c, 45, 5) == five(4u << 10, 0));  // gx
+        CHECK(block_bits(c, 55, 5) == five(5u << 10, 0));  // bx
+        // Block 0 (one subset) left ep2 = ep0 (re-expressed) and ep3 = ep1.
+        CHECK(block_bits(c, 65, 5) == five(0u << 10, 0));  // ry
+        CHECK(block_bits(c, 71, 5) == five(3u << 10, 0));  // rz
+    }
+    // Modes outside 1-14 are corrupt.
+    for (uint32_t s30 : {14u, 15u, 255u}) {
+        Record r(32, 0);
+        r[30] = static_cast<uint8_t>(s30);
+        bp::DecodeStatus st = bp::DecodeStatus::Ok;
+        decode_records(*t, 6, {r}, &st);
+        CHECK(st == bp::DecodeStatus::Corrupt);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -744,7 +945,7 @@ void test_errors() {
     CHECK(bp::decode(*t, 4, src.data(), src.size(), dst.data(), 12) == bp::DecodeStatus::BadSize);
     CHECK(bp::decode(*t, 4, src.data(), src.size(), dst.data(), 0) == bp::DecodeStatus::BadSize);
     CHECK(bp::decode(*t, 2, src.data(), src.size(), dst.data(), dst.size()) == bp::DecodeStatus::Unsupported);
-    CHECK(bp::decode(*t, 6, src.data(), src.size(), dst.data(), dst.size()) == bp::DecodeStatus::Unsupported);
+    CHECK(bp::decode(*t, 2, src.data(), src.size(), dst.data(), dst.size()) == bp::DecodeStatus::Unsupported);
     // Fragment headers promising more payload than there is.
     const std::vector<uint8_t> headers(16, 0x30);
     CHECK(bp::decode(*t, 4, headers.data(), headers.size(), dst.data(), 8) == bp::DecodeStatus::Truncated);
@@ -767,7 +968,7 @@ void test_errors() {
             seed ^= seed << 17;
             b = static_cast<uint8_t>(seed);
         }
-        for (uint32_t bc : {1u, 3u, 4u, 5u, 7u}) {
+        for (uint32_t bc : {1u, 3u, 4u, 5u, 6u, 7u}) {
             std::vector<uint8_t> out(16 * (1 + round % 40) + 16, 0xA5);
             const size_t n = out.size() - 16;
             (void)bp::decode(*t, bc, noise.data(), noise.size(), out.data(), n);
@@ -788,6 +989,7 @@ int main() {
     test_bc4_bc5_bc3();
     test_bc7_modes();
     test_bc7_references();
+    test_bc6h();
     test_errors();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

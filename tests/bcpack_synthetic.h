@@ -56,6 +56,7 @@ inline std::vector<LaneSpec> default_layouts() {
             {3, 12, 2, std::vector<uint8_t>(12, 7)},
             {4, 12, 1, std::vector<uint8_t>(12, 7)},
             {5, 12, 2, std::vector<uint8_t>(12, 7)},
+            {6, 16, 2, std::vector<uint8_t>(16, 7)},
             {7, 16, 2, std::vector<uint8_t>(16, 7)}};
 }
 
@@ -109,6 +110,19 @@ struct Builder {
                 for (uint32_t e = 0; e < shapes[bc][0] + shapes[bc][1]; ++e) {
                     d.push_back(static_cast<uint8_t>((k * 3 + e) & (e < shapes[bc][0] ? 0x1F : 0x03)));
                 }
+            }
+        }
+        // BC6H dictionary: entry k has endpoint j, channel c = ((k + 3 j + c) & 63) << 10, index
+        // mode 11 (4-bit indices) and index p = (k + p) % 8 - 4.
+        std::vector<uint8_t>& d6 = b.sections["DIC6"];
+        for (uint32_t k = 0; k < 255; ++k) {
+            d6.push_back(0);
+            for (uint32_t e = 0; e < 12; ++e) {
+                put16(d6, ((k + 3 * (e / 3) + e % 3) & 63) << 10);
+            }
+            d6.push_back(11);
+            for (uint32_t p = 0; p < 16; ++p) {
+                put16(d6, static_cast<uint16_t>(static_cast<int>((k + p) % 8) - 4));
             }
         }
         std::vector<uint8_t>& d7 = b.sections["DIC7"];
