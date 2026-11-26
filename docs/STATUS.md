@@ -39,6 +39,8 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 
 ## How far the boot gets
 
+How to run it: [quick start](PLAY_LOCALLY.md#quick-start-play-natively-windows).
+
 Setup screens, loading, then the Bink videos decode and play. A headless run reaches about 110 s and
 **stops on `XSystemGetAppSpecificDeviceId`** (a trapping stub on purpose, an owner decision). Nothing past it
 has been seen. Music has not started yet; the audio probe counters in the boot report (#1737) are the way to

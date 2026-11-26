@@ -1,3 +1,64 @@
+# Play locally
+
+## Quick start: play natively (Windows)
+
+**One-time setup.** Set three user environment variables (System Properties > Environment Variables, or `setx`), then
+open a **new** PowerShell window so they are picked up:
+
+| Variable | Value |
+|---|---|
+| `PLAYGTA6_EXE` | full path to your game `.exe` |
+| `GTA6_GAME_DIR` | your game package directory |
+| `PLAYGTA6_NATIVE_SHADER_PACK` | full path to the standard `*.wgsl.pack` shader pack |
+
+**Play.** From the repo folder, in PowerShell:
+
+```powershell
+.\tools\play_native.ps1 -Update
+```
+
+`-Update` first fast-forwards the checkout to the latest `main` (it never discards local changes), then builds what is
+stale and opens the game window. Add `-FreshSetup` to see the setup screens again (uses an empty save dir).
+`.\tools\play_native.ps1 -Help` prints a short summary of the switches.
+
+**Controls** (full table and `keymap.ini` details further down):
+
+| Key | Action |
+|---|---|
+| Enter / Space | A |
+| Backspace | B |
+| Arrow keys | D-pad |
+| W A S D | Left stick |
+| I J K L | Right stick |
+| R / F | X / Y |
+| Q / E | LB / RB |
+| Z / C | LT / RT |
+| Tab / Esc | View / Menu |
+| F11 | Toggle borderless fullscreen |
+
+Rebind anything in `%LOCALAPPDATA%\playgta6\keymap.ini` (written on first run; see "Rebinding keys" below), or point at
+another file with `-Keymap <file>`. There is no screenshot or mouse-release key yet.
+
+**Useful switches:** `-PresentMode auto|fifo|mailbox|immediate`, `-MaxFps N` (cap the window present rate, 0 = off),
+`-Record` (save your real input to `%LOCALAPPDATA%\playgta6\recordings\`), `-Keymap <file>`, `-FreshSetup`, `-NoBuild`,
+`-DryRun`, `-Name <run name>`.
+
+**What to expect today.** Setup screens, loading, then the Bink videos. After about 110 s the game stops at the
+device-ID owner decision (`XSystemGetAppSpecificDeviceId`, see [HARD_STOPS.md](HARD_STOPS.md)). The window stays open
+on the last frame with the title `GUEST FAULT ...`, and the console prints the fault report. Close the window to exit.
+Nothing past that point has been seen yet.
+
+**Troubleshooting**
+- Use **PowerShell**, not `cmd.exe` (the `.ps1` scripts and `$env:` variables do not work in cmd).
+- "Pass -Exe and -GameDir": the variables are not visible; set them and open a new PowerShell window.
+- Warning that the checkout is **detached** or **behind origin/main**: run with `-Update`.
+- Browser build says **emsdk not found**: see Prerequisites below (clone emsdk into `work/emsdk`, `emsdk install 7.0.1`,
+  `emsdk activate 7.0.1`). The native path does not need emsdk.
+- `run directory ... already exists`: that run name was used before; drop `-Name` (a unique name is generated) or pick
+  another.
+
+---
+
 # Play the browser build locally
 
 Build and watch the game in a headed Chrome on your own machine. Game files stay outside the repo.

@@ -32,9 +32,25 @@ param(
     [switch]$NoBuild,
     [switch]$TrustBuild,
     [switch]$Update,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Help
 )
 $ErrorActionPreference = "Stop"
+if ($Help) {
+    @"
+play_native.ps1: build (if stale) and play natively.
+  Setup once (new PowerShell window after): PLAYGTA6_EXE, GTA6_GAME_DIR, PLAYGTA6_NATIVE_SHADER_PACK
+  Play:     .	ools\play_native.ps1 -Update
+  -Update        fast-forward to origin/main first (never discards local changes)
+  -FreshSetup    empty save dir so the setup screens appear
+  -PresentMode   auto|fifo|mailbox|immediate     -MaxFps N  (0 = off)
+  -Record        save real input to %LOCALAPPDATA%\playgta6ecordings   -Keymap <file>  rebind keys
+  -NoBuild / -TrustBuild / -DryRun / -Name <run>
+  Keys: WASD stick, Enter/Space A, Backspace B, Tab View, Esc Menu, F11 fullscreen.
+  Docs: docs/PLAY_LOCALLY.md
+"@ | Write-Host
+    exit 0
+}
 $repo = Split-Path -Parent $PSScriptRoot
 if ($Update) { & python (Join-Path $PSScriptRoot "repo_update.py") update --repo $repo }
 & python (Join-Path $PSScriptRoot "repo_update.py") check --repo $repo
