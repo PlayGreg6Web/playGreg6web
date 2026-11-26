@@ -33,6 +33,17 @@ def load(path: str | Path) -> dict[str, Any]:
     data = json.loads(p.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("not a boot report")
+    tele = p.with_name("telemetry.json")
+    if tele.is_file():  # browser run dir: fill what the report lacks from the telemetry
+        try:
+            t = json.loads(tele.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            t = None
+        if isinstance(t, dict):
+            for k, v in t.items():
+                data.setdefault(k, v)
+            for k, v in _d(t.get("summary")).items():
+                data.setdefault(k, v)
     return data
 
 
@@ -78,16 +89,75 @@ def percentile(values: list[float], q: float) -> float:
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
 
 
-def fps_percentiles(report: dict[str, Any]) -> dict[str, float] | None:
-    """fps of consecutive presents (from wall_ms); p1/p5 are the slow tail."""
+def present_series(report: dict[str, Any]) -> list[tuple[float, float, float]]:
+    """(wall_ms, cumulative presents, cumulative real draws or -1) per sample.
+
+    Native samples are one present each (no present_count); browser samples are sparse (about one per 0.5 s)
+    and carry the running present_count, so fps must come from the count delta, not from the sample spacing."""
     samples = report.get("presents") or report.get("present_samples") or []
-    t = [_n(s.get("wall_ms")) for s in samples if isinstance(s, dict) and "wall_ms" in s]
-    dts = [b - a for a, b in zip(t, t[1:]) if b > a]
-    if len(dts) < 2:
+    out: list[tuple[float, float, float]] = []
+    for i, s in enumerate(x for x in samples if isinstance(x, dict) and "wall_ms" in x):
+        cnt = s.get("present_count")
+        cum = _n(cnt) if isinstance(cnt, (int, float)) and not isinstance(cnt, bool) else float(i + 1)
+        d = _d(s.get("counters")).get("draws_real_pack")
+        out.append((_n(s.get("wall_ms")), cum, _n(d) if isinstance(d, (int, float)) else -1.0))
+    return out
+
+
+def fps_percentiles(report: dict[str, Any]) -> dict[str, float] | None:
+    """fps between consecutive samples (presents delta / wall time delta); p1/p5 are the slow tail."""
+    ser = present_series(report)
+    fps = [1000.0 * (c2 - c1) / (t2 - t1) for (t1, c1, _), (t2, c2, _) in zip(ser, ser[1:])
+           if t2 > t1 and c2 > c1]
+    if len(fps) < 2:
         return None
-    fps = [1000.0 / d for d in dts]
     return {"p1": percentile(fps, 0.01), "p5": percentile(fps, 0.05), "p50": percentile(fps, 0.5),
             "p95": percentile(fps, 0.95), "n": float(len(fps))}
+
+
+def screen_segments(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Native screen_timeline, or for browser runs segments derived from the presents' draw counters
+    (a new segment when draws/frame leaves +-35% of the running segment mean)."""
+    segs = [s for s in (report.get("screen_timeline") or []) if isinstance(s, dict)]
+    if segs:
+        return segs
+    ser = present_series(report)
+    out: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for (t1, c1, d1), (t2, c2, d2) in zip(ser, ser[1:]):
+        if d1 < 0 or d2 < 0 or c2 <= c1:
+            continue
+        dpf = (d2 - d1) / (c2 - c1)
+        if cur is not None:
+            mean = cur["_draws"] / max(cur["presents"], 1)
+            if abs(dpf - mean) <= 0.35 * max(mean, 1.0):
+                cur["end_time"] = t2
+                cur["presents"] += c2 - c1
+                cur["_draws"] += d2 - d1
+                continue
+        cur = {"start_time": t1, "end_time": t2, "presents": c2 - c1, "_draws": d2 - d1}
+        out.append(cur)
+    for s in out:
+        s["draws_per_frame"] = round(s.pop("_draws") / max(s["presents"], 1), 1)
+    return out
+
+
+def fault_info(report: dict[str, Any]) -> dict[str, Any] | None:
+    """The fault: a native fault_record, or a browser `fault` block (WASM_TRAP ...); None if the run did not fault."""
+    rec = report.get("fault_record")
+    if isinstance(rec, dict):
+        return rec
+    f = _d(report.get("fault"))
+    if f and (report.get("status") == "fault" or f.get("trap_kind") or f.get("exception_code")):
+        return {"kind": f.get("trap_kind") or f.get("kind"), "elapsed_ms": report.get("elapsed_ms"),
+                "rip": f.get("va"), "target": f.get("va"), "function": f.get("function"),
+                "code_miss": "INDIRECT_CALL_MISS" in str(f.get("detail") or report.get("message") or "")}
+    return None
+
+
+def _total_presents(report: dict[str, Any]) -> float:
+    return (_n(report.get("present_samples_total")) or _n(_d(report.get("present_pacing")).get("presents"))
+            or _n(_d(report.get("counters")).get("presents")) or len(report.get("presents") or []))
 
 
 def drops_top(report: dict[str, Any], n: int = 5) -> list[tuple[str, int]]:
@@ -99,8 +169,8 @@ def drops_top(report: dict[str, Any], n: int = 5) -> list[tuple[str, int]]:
 def _ending(report: dict[str, Any], syms: "gs.PeSymbols | None", hard_stops: str | None) -> list[str]:
     out: list[str] = []
     status = report.get("status")
-    rec = report.get("fault_record")
-    if isinstance(rec, dict):
+    rec = fault_info(report)
+    if rec is not None:
         def named(v: Any) -> str:
             try:
                 a = int(v, 16)
@@ -151,8 +221,10 @@ def _identity(report: dict[str, Any]) -> list[str]:
 def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_stops: str | None = None) -> str:
     L: list[str] = []
     L += _identity(report)
+    c = _d(report.get("counters"))
     L.append(f"run: {_dur(report.get('elapsed_ms'))}, phase {report.get('phase')}, "
-             f"{_i(_d(report.get('counters')).get('dispatches'))} dispatches")
+             + (f"browser {report.get('preset')}, {_i(c.get('presents'))} presents"
+                if report.get("runner") == "browser" else f"{_i(c.get('dispatches'))} dispatches"))
     L += _ending(report, syms, hard_stops)
     ms = report.get("milestones") or []
     if ms:
@@ -161,9 +233,8 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
             if isinstance(m, dict):
                 seen.setdefault(str(m.get("milestone")), m.get("elapsed_ms"))
         L.append("milestones: " + ", ".join(f"{k} {_dur(v)}" for k, v in seen.items()))
-    pres = _n(report.get("present_samples_total")) or _n(_d(report.get("present_pacing")).get("presents")) \
-        or len(report.get("presents") or [])
-    segs = [s for s in (report.get("screen_timeline") or []) if isinstance(s, dict)]
+    pres = _total_presents(report)
+    segs = screen_segments(report)
     L.append(f"screens: {int(pres)} presents, {len(segs)} timeline segments")
     for s in segs[-6:]:
         L.append(f"  {_dur(s.get('start_time'))}-{_dur(s.get('end_time'))}: {_i(s.get('presents'))} presents, "
@@ -172,6 +243,13 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
     if f:
         L.append(f"fps: p1 {f['p1']:.1f}  p5 {f['p5']:.1f}  p50 {f['p50']:.1f}  p95 {f['p95']:.1f} "
                  f"({int(f['n'])} samples)")
+    if report.get("present_fps_avg") is not None:
+        L.append(f"browser fps: avg {_n(report.get('present_fps_avg')):.1f}, steady {_n(report.get('fps_steady_avg')):.1f}, "
+                 f"p50 window {_n(report.get('fps_p50_window')):.1f}, max window {_n(report.get('fps_max_window')):.1f}, "
+                 f">=30 fps in {_n(report.get('windows_ge_30fps_pct')):.0f}% of windows")
+        L.append(f"browser: first visible frame {_n(report.get('first_visible_frame_s')):.1f}s, black loading "
+                 f"{_n(report.get('black_loading_s')):.1f}s, heap {_n(report.get('js_heap_used_mb')):.0f}/"
+                 f"{_n(report.get('js_heap_total_mb')):.0f} MB, adapter {report.get('gpu_adapter')}")
     ne = _d(report.get("native_executor"))
     gw = _d(report.get("gpu_work"))
     errs = {k: ne.get(k) for k in ("device_errors", "device_lost", "op_errors", "packet_errors", "present_failures")
@@ -188,7 +266,11 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
     if top:
         L.append("drops by program (top 5): " + ", ".join(f"{k}={_i(v)}" for k, v in top))
     a = _d(report.get("audio"))
-    if a:
+    if a and "xapu_decoded_packets" not in a and "frames_drained" in a:
+        L.append(f"audio: ring {'attached' if a.get('ring_attached') else 'detached'}, {_i(a.get('frames_drained'))} "
+                 f"frames drained, context {a.get('context_state')}, output {a.get('output_state')}, "
+                 f"{_i(a.get('sample_rate'))} Hz")
+    elif a:
         L.append(f"audio: xapu {_i(a.get('xapu_decoded_packets'))} packets ({_i(a.get('xapu_failed_packets'))} failed), "
                  f"{_i(a.get('xapu_commands'))} cmds, non-silent {_n(a.get('non_silent_fraction')) * 100:.2f}%")
     ap = _d(report.get("audio_probes"))
@@ -226,8 +308,7 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
 def numeric_facts(report: dict[str, Any]) -> dict[str, float]:
     facts: dict[str, float] = {"elapsed_ms": _n(report.get("elapsed_ms")),
                                "dispatches": _n(_d(report.get("counters")).get("dispatches")),
-                               "presents": _n(report.get("present_samples_total"))
-                               or _n(_d(report.get("present_pacing")).get("presents"))}
+                               "presents": _total_presents(report)}
     f = fps_percentiles(report)
     if f:
         facts.update({f"fps_{k}": v for k, v in f.items() if k != "n"})

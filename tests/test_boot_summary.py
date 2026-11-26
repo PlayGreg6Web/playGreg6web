@@ -32,6 +32,29 @@ def base():
     }
 
 
+def browser_report():
+    """Shaped like a browser boot-report.json (sparse present samples carrying present_count)."""
+    samples = []
+    for i in range(41):  # 500 ms apart, 20 presents each = 40 fps; 10 draws/present from sample 20 on
+        draws = 0 if i < 20 else (i - 20) * 200
+        samples.append({"index": i, "wall_ms": 1000 + i * 500.0, "present_count": 1 + i * 20,
+                        "counters": {"draws_real_pack": draws}})
+    return {
+        "schema": "playgta6-boot-report", "runner": "browser", "preset": "long", "status": "fault",
+        "phase": "FIRST_VISIBLE_FRAME", "exit_code": 0, "elapsed_ms": 30000.0,
+        "message": "[trap] INDIRECT_CALL_MISS at 0x0 (unknown_target, (no lifted function))",
+        "fault": {"kind": "WASM_TRAP", "trap_kind": "WASM_TRAP", "va": "0x0", "exception_code": None,
+                  "detail": "[trap] INDIRECT_CALL_MISS at 0x0 (unknown_target)"},
+        "counters": {"presents": 801, "import_calls": 0},
+        "milestones": [{"milestone": "FIRST_PRESENT", "elapsed_ms": 1000.0}],
+        "presents": samples,
+        "present_fps_avg": 39.11, "fps_steady_avg": 37.45, "fps_p50_window": 30.03, "fps_max_window": 67.96,
+        "windows_ge_30fps_pct": 72.3, "first_visible_frame_s": 7.1, "black_loading_s": 5.0,
+        "audio": {"ring_attached": True, "frames_drained": 16922400, "context_state": "running",
+                  "output_state": "active", "sample_rate": 48000},
+    }
+
+
 class BootSummaryTest(unittest.TestCase):
     def test_limit_run(self):
         out = bs.summarize(base())
@@ -80,6 +103,39 @@ class BootSummaryTest(unittest.TestCase):
         self.assertIn("launch: preset menu-flow, name n1", out)
         self.assertIn("com slot: XSystem slot 7 XSystemGetAppSpecificDeviceId", out)
         self.assertIn("hard stop: XSystemGetAppSpecificDeviceId -> Trapping stub", out)
+
+    def test_browser_report(self):
+        r = browser_report()
+        f = bs.fps_percentiles(r)
+        self.assertAlmostEqual(f["p50"], 40.0)
+        self.assertAlmostEqual(f["p1"], 40.0)
+        out = bs.summarize(r)
+        self.assertIn("ended: FAULT WASM_TRAP (recompiler gap)", out)
+        self.assertNotIn("no fault record", out)
+        self.assertIn("rip 0x0", out)
+        self.assertIn("fps: p1 40.0", out)
+        self.assertIn("(40 samples)", out)
+        self.assertIn("2 timeline segments", out)
+        self.assertIn("10.0 draws/frame", out)
+        self.assertIn("801 presents", out)
+        self.assertIn("browser fps: avg 39.1", out)
+        self.assertIn("16,922,400 frames drained", out)
+        self.assertNotIn("xapu", out)
+
+    def test_native_fps_is_one_present_per_sample(self):
+        f = bs.fps_percentiles(base())
+        self.assertAlmostEqual(f["p50"], 1000 / 33, places=1)
+
+    def test_browser_run_dir_merges_telemetry(self):
+        r = browser_report()
+        r.pop("first_visible_frame_s")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "boot-report.json").write_text(json.dumps(r), encoding="utf-8")
+            (Path(d) / "telemetry.json").write_text(
+                json.dumps({"summary": {"first_visible_frame_s": 9.5}, "headless": False}), encoding="utf-8")
+            loaded = bs.load(d)
+        self.assertEqual(loaded["first_visible_frame_s"], 9.5)
+        self.assertIn("first visible frame 9.5s", bs.summarize(loaded))
 
     def test_compare_and_cli(self):
         a, b = base(), base()

@@ -62,6 +62,20 @@ class RunHistoryTests(unittest.TestCase):
         self.assertIn("37 draws/frame", r["max_screen"])
         self.assertTrue(r["ended"].startswith("limit"))
 
+    def test_browser_run_dir_row(self):
+        samples = [{"wall_ms": 1000 + i * 500.0, "present_count": 1 + i * 20,
+                    "counters": {"draws_real_pack": i * 200}} for i in range(10)]
+        rep = {"runner": "browser", "preset": "long", "status": "fault", "elapsed_ms": 9000.0,
+               "fault": {"kind": "WASM_TRAP", "trap_kind": "WASM_TRAP", "va": "0x0",
+                         "detail": "[trap] INDIRECT_CALL_MISS at 0x0"},
+               "presents": samples, "present_fps_avg": 39.1}
+        make_run(self.b, "browser", rep, 3000)
+        row = next(r for r in self.rows() if r["run"] == "browser")
+        self.assertEqual(row["ended"], "FAULT WASM_TRAP (code miss)")
+        self.assertEqual(row["fps_p50"], 40.0)
+        self.assertEqual(row["max_screen"], "- / 10 draws/frame")
+        self.assertTrue(row["_fault"])
+
     def test_since_filters(self):
         self.assertEqual([r["run"] for r in self.rows(since=1500)], ["r2"])
         self.assertEqual(rh.parse_since("2d", now=200000), 200000 - 172800)

@@ -64,9 +64,8 @@ def find_commit(report: dict[str, Any], build_dir: Path | None) -> str:
 
 def _max_draws(report: dict[str, Any]) -> float:
     best = 0.0
-    for s in report.get("screen_timeline") or []:
-        if isinstance(s, dict):
-            best = max(best, bs._n(s.get("draws_per_frame")))
+    for s in bs.screen_segments(report):
+        best = max(best, bs._n(s.get("draws_per_frame")))
     return best
 
 
@@ -77,9 +76,9 @@ def _last_milestone(report: dict[str, Any]) -> str:
 
 def ending(report: dict[str, Any], hard_stops: str | None = None) -> tuple[str, str]:
     """(short ending text, hard-stop status or '')."""
-    rec = report.get("fault_record")
-    if isinstance(rec, dict):
-        what = str(rec.get("kind"))
+    rec = bs.fault_info(report)
+    if rec is not None:
+        what = str(rec.get("kind")) + (" (code miss)" if rec.get("code_miss") else "")
         fn = rec.get("function")
         sym = fn.get("symbol") if isinstance(fn, dict) else None
         if isinstance(sym, dict) and sym.get("name"):
