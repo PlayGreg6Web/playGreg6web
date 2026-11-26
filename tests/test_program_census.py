@@ -110,6 +110,13 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(sum(w.values()), 26)
         self.assertEqual(c["runtime"]["top_dropped_programs"][0]["hash"], h(2))
 
+    def test_boot_report_drops_by_program(self):
+        report = {"gpu_work": {"draws_no_shader_module": 12, "drops_by_program": {h(2): 10, h(5): 2}}, "gpu_drop_table": {"entries": []}}
+        c = pc.build_census(pack_report=REPORT, boot_report=report)
+        top = c["runtime"]["top_dropped_programs"]
+        self.assertEqual([(t["hash"], t["draws_lost"]) for t in top], [(h(2), 10), (h(5), 2)])
+        self.assertNotIn("per_program_drop_counts", c["runtime"])
+
     def test_cli_writes_json_and_markdown_without_payloads(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

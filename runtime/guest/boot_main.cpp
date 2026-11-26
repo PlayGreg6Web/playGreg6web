@@ -87,6 +87,7 @@
 #include <vector>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/drop_table.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/frame_capture.h"
@@ -1099,7 +1100,10 @@ int main(int argc, char** argv) {
                 const dg::Work w = static_cast<dg::Work>(i);
                 o += std::string(i == 0 ? "" : ", ") + "\"" + dg::work_name(w) + "\": " + std::to_string(dg::work_total(w));
             }
+            o += ", \"drops_by_program\": " + dg::drop_table().by_program_json();
             o += "}";
+            o += ",
+  \"gpu_drop_table\": " + dg::drop_table().detail_json();
             {
                 namespace ar = os::audio_report;
                 const os::scarlett::guest_api::AudioEndpointStats a = os::scarlett::guest_api::audio_endpoint_stats();

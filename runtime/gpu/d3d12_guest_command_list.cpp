@@ -10,6 +10,7 @@
 #include <map>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/drop_table.h"
 #include "gpu/gpu_va_watch.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -95,13 +96,30 @@ public:
             count_work(Work::DrawsEmitted);
         } else if (bridge_.stats().draws_skipped != dropped_) {
             count_work(Work::DrawsDroppedByBridge);
+            note_drop(DropTable::Reason::Bridge);
         } else {
             count_work(fallback);
+            note_drop(fallback == Work::DrawsNoShaderModule ? DropTable::Reason::NoModule
+                      : fallback == Work::DrawsMeshPipeline ? DropTable::Reason::MeshRefused
+                      : fallback == Work::DrawsRectList     ? DropTable::Reason::RectList
+                                                            : DropTable::Reason::Bridge);
         }
     }
     Work fallback = Work::DrawsDroppedByBridge;
+    // Shader identities of the bound pipeline state (null: none); drops are tabled per identity.
+    const std::vector<uint64_t>* identities = nullptr;
 
 private:
+    void note_drop(DropTable::Reason r) const {
+        if (identities == nullptr) {
+            return;
+        }
+        for (uint64_t id : *identities) {
+            if (id != 0) {
+                drop_table().record(id, r, false);
+            }
+        }
+    }
     const bridge::CommandListBridge& bridge_;
     uint64_t drawn_;
     uint64_t dropped_;
@@ -624,6 +642,7 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
     note_draw_for_dump();
     DrawOutcome outcome(bridge_);
     outcome.fallback = Work::DrawsRectList;
+    outcome.identities = graphics_pso_ != nullptr ? &graphics_pso_->shader_identities() : nullptr;
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         outcome.fallback = graphics_pso_->unsupported_reason().empty() ? Work::DrawsNoShaderModule
                                                                        : Work::DrawsMeshPipeline;
@@ -928,6 +947,7 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
     note_draw_for_dump();
     DrawOutcome outcome(bridge_);
     outcome.fallback = Work::DrawsRectList;
+    outcome.identities = graphics_pso_ != nullptr ? &graphics_pso_->shader_identities() : nullptr;
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         outcome.fallback = graphics_pso_->unsupported_reason().empty() ? Work::DrawsNoShaderModule
                                                                        : Work::DrawsMeshPipeline;
@@ -958,6 +978,9 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
     count_work(Work::DispatchesIssued);
     if (compute_pso_ != nullptr && !compute_pso_->resolved()) {
         count_work(Work::DispatchesNoShaderModule);
+        for (uint64_t id : compute_pso_->shader_identities()) {
+            drop_table().record(id, DropTable::Reason::NoModule, true);
+        }
         device_->note_skipped_draw();
         return;
     }
@@ -965,7 +988,16 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
     const bridge::BridgeStats before = bridge_.stats();
     bridge_.Dispatch(x, y, z);
     count_object_reuse(before, bridge_.stats());
-    count_work(bridge_.stats().dispatches != emitted ? Work::DispatchesEmitted : Work::DispatchesDroppedByBridge);
+    if (bridge_.stats().dispatches != emitted) {
+        count_work(Work::DispatchesEmitted);
+    } else {
+        count_work(Work::DispatchesDroppedByBridge);
+        if (compute_pso_ != nullptr) {
+            for (uint64_t id : compute_pso_->shader_identities()) {
+                drop_table().record(id, DropTable::Reason::Bridge, true);
+            }
+        }
+    }
 }
 
 // ---- Copies ----
