@@ -98,6 +98,73 @@ InputState merge(const InputState& pad, const InputState& kb) {
     return s;
 }
 
+void RumbleForwarder::send(uint16_t low, uint16_t high, uint64_t now_ms) {
+    ++stats_.sends;
+    if (fn_(static_cast<uint32_t>(pad_), low, high) != 0) {
+        ++stats_.send_failures;
+    }
+    if (low == 0 && high == 0) {
+        ++stats_.stops;
+    }
+    low_ = low;
+    high_ = high;
+    last_send_ms_ = now_ms;
+    sent_any_ = true;
+    running_ = low != 0 || high != 0;
+}
+
+void RumbleForwarder::update(const playgta6::os::RumbleTelemetry& t, int pad, bool allowed, uint64_t now_ms) {
+    if (pad < 0) {
+        // Pad gone: nothing to drive (the motors stop with the device); resume cleanly on reconnect.
+        running_ = false;
+        low_ = high_ = 0;
+        pad_ = -1;
+        return;
+    }
+    if (pad != pad_) {
+        pad_ = pad;
+        low_ = high_ = 0;
+        running_ = false;
+    }
+    auto motor = [](float v) {
+        const float c = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        return static_cast<uint16_t>(c * 65535.0f + 0.5f);
+    };
+    const uint16_t low = allowed ? motor(t.last_low_frequency) : 0;
+    const uint16_t high = allowed ? motor(t.last_high_frequency) : 0;
+    if (allowed && (t.last_left_trigger > 0.0f || t.last_right_trigger > 0.0f)) {
+        ++stats_.trigger_unsupported;
+    }
+    if (low == low_ && high == high_) {
+        return;
+    }
+    const bool stopping = low == 0 && high == 0;
+    if (!stopping && sent_any_ && now_ms - last_send_ms_ < min_interval_ms_) {
+        ++stats_.rate_limited;
+        return;
+    }
+    send(low, high, now_ms);
+}
+
+void RumbleForwarder::stop() {
+    if (running_ && pad_ >= 0) {
+        send(0, 0, last_send_ms_);
+    }
+}
+
+namespace {
+std::atomic<XInputSetStateFn> g_silence_fn{nullptr};
+std::atomic<int> g_silence_pad{-1};
+}  // namespace
+
+void silence_host_rumble() {
+    const XInputSetStateFn fn = g_silence_fn.load();
+    const int pad = g_silence_pad.load();
+    if (fn != nullptr && pad >= 0) {
+        fn(static_cast<uint32_t>(pad), 0, 0);
+    }
+}
+
 void HostInputSource::start() {
 #ifdef _WIN32
     stop_.store(false);
@@ -124,6 +191,15 @@ struct RawState {
     RawPad pad;
 };
 using GetStateFn = DWORD(WINAPI*)(DWORD, RawState*);
+struct RawVibration {
+    WORD left, right;
+};
+using SetStateFn = DWORD(WINAPI*)(DWORD, RawVibration*);
+SetStateFn g_set_state = nullptr;
+uint32_t xinput_set_state(uint32_t pad, uint16_t low, uint16_t high) {
+    RawVibration v{low, high};
+    return g_set_state != nullptr ? g_set_state(pad, &v) : 1;
+}
 
 uint32_t read_keys() {
     struct K {
@@ -155,9 +231,14 @@ void HostInputSource::run() {
         if (HMODULE m = LoadLibraryA(dll)) {
             get_state = reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState"));
             if (get_state != nullptr) {
+                g_set_state = reinterpret_cast<SetStateFn>(GetProcAddress(m, "XInputSetState"));
                 break;
             }
         }
+    }
+    RumbleForwarder rumble(&xinput_set_state);
+    if (g_set_state != nullptr) {
+        g_silence_fn.store(&xinput_set_state);
     }
     int pad_index = -1;
     while (!stop_.load()) {
@@ -183,6 +264,13 @@ void HostInputSource::run() {
                 }
             }
         }
+        if (g_set_state != nullptr) {
+            // Rumble only while the window has focus (the same gate as the keyboard).
+            const uint64_t now_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            rumble.update(playgta6::os::game_input_rumble_telemetry(), have_pad ? pad_index : -1, keyboard_enabled_.load(), now_ms);
+            g_silence_pad.store(have_pad ? pad_index : -1);
+        }
         const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, convert_keyboard(keyboard_enabled_.load() ? read_keys() : 0));
         if (recorder_ != nullptr) {
             recorder_->record(values);
@@ -191,6 +279,8 @@ void HostInputSource::run() {
         writes_.fetch_add(1);
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }
+    rumble.stop();
+    g_silence_pad.store(-1);
     const InputState zero{};
     playgta6::os::GameInputReader::write_monotonic(*state_, zero);
 #endif

@@ -774,9 +774,81 @@ void test_guest_game_input_3d_gameplay() {
     CHECK(fx.vcall(gi, 2) >= 1);
 }
 
+struct FakeXInput {
+    struct Call { uint32_t pad; uint16_t low, high; };
+    std::vector<Call> calls;
+};
+FakeXInput g_fake;
+uint32_t fake_set_state(uint32_t pad, uint16_t low, uint16_t high) {
+    g_fake.calls.push_back({pad, low, high});
+    return 0;
+}
+
+void test_rumble_forwarder() {
+    os::RumbleTelemetry t{};
+    hi::RumbleForwarder f(&fake_set_state, 16);
+
+    // No pad: nothing is sent.
+    t.last_low_frequency = 0.5f;
+    f.update(t, -1, true, 0);
+    CHECK(g_fake.calls.empty());
+
+    // Pad present: motors follow the request (low -> left motor, high -> right motor).
+    t.last_low_frequency = 1.0f;
+    t.last_high_frequency = 0.5f;
+    f.update(t, 0, true, 100);
+    CHECK(g_fake.calls.size() == 1);
+    CHECK(g_fake.calls[0].pad == 0 && g_fake.calls[0].low == 65535 && g_fake.calls[0].high == 32768);
+
+    // Unchanged: no resend. Changed inside the interval: held back, sent once the interval passed.
+    f.update(t, 0, true, 110);
+    CHECK(g_fake.calls.size() == 1);
+    t.last_low_frequency = 0.25f;
+    f.update(t, 0, true, 105 + 0);
+    CHECK(g_fake.calls.size() == 1 && f.stats().rate_limited == 1);
+    f.update(t, 0, true, 120);
+    CHECK(g_fake.calls.size() == 2 && g_fake.calls[1].low == 16384);
+
+    // Triggers cannot be driven on XInput: counted only.
+    t.last_left_trigger = 0.8f;
+    f.update(t, 0, true, 200);
+    CHECK(f.stats().trigger_unsupported == 1 && g_fake.calls.size() == 2);
+
+    // A stop is never rate limited.
+    t.last_low_frequency = 0.0f;
+    t.last_high_frequency = 0.0f;
+    f.update(t, 0, true, 201);
+    CHECK(g_fake.calls.size() == 3 && g_fake.calls[2].low == 0 && g_fake.calls[2].high == 0);
+    CHECK(f.stats().stops == 1);
+
+    // Focus loss forces the motors off even though the title still asks for rumble; refocus resumes.
+    t.last_low_frequency = 1.0f;
+    f.update(t, 0, true, 300);
+    CHECK(g_fake.calls.size() == 4);
+    f.update(t, 0, false, 301);
+    CHECK(g_fake.calls.size() == 5 && g_fake.calls[4].low == 0 && g_fake.calls[4].high == 0);
+    f.update(t, 0, true, 400);
+    CHECK(g_fake.calls.size() == 6 && g_fake.calls[5].low == 65535);
+
+    // Exit/fault: stop() silences a running motor once.
+    f.stop();
+    CHECK(g_fake.calls.size() == 7 && g_fake.calls[6].low == 0);
+    f.stop();
+    CHECK(g_fake.calls.size() == 7);
+
+    // Values are clamped.
+    g_fake.calls.clear();
+    hi::RumbleForwarder g(&fake_set_state, 0);
+    t.last_low_frequency = 3.0f;
+    t.last_high_frequency = -1.0f;
+    g.update(t, 1, true, 0);
+    CHECK(g_fake.calls.size() == 1 && g_fake.calls[0].pad == 1 && g_fake.calls[0].low == 65535 && g_fake.calls[0].high == 0);
+}
+
 }  // namespace
 
 int main() {
+    test_rumble_forwarder();
     test_host_input_mapping();
     test_deadzone_curves_and_mouse_look();
     test_guest_game_input_3d_gameplay();

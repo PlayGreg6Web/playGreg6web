@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "abi/playgta6_abi.h"
+#include "os/game_input.h"
 
 namespace playgta6::guest {
 class InputRecorder;
@@ -57,6 +58,45 @@ InputState convert_keyboard(uint32_t keys);
 
 // Pad wins per axis when it is deflected more than the keyboard; buttons are ORed.
 InputState merge(const InputState& pad, const InputState& keyboard);
+
+// Forwards the title's GameInput rumble requests (os::RumbleTelemetry::last_*) to the host pad's
+// motors through XInputSetState. XInput has no trigger motors: non-zero trigger requests are only
+// counted. Rate limited; a stop (both motors 0) is always sent at once. Pure logic over an injectable
+// set-state function so it is testable without a pad.
+using XInputSetStateFn = uint32_t (*)(uint32_t pad, uint16_t low_motor, uint16_t high_motor);  // 0 = ok
+
+struct RumbleForwardStats {
+    uint64_t sends = 0;                // XInputSetState calls that succeeded or failed
+    uint64_t send_failures = 0;
+    uint64_t rate_limited = 0;         // updates held back by the rate limit
+    uint64_t trigger_unsupported = 0;  // updates with a non-zero trigger request (no XInput motor)
+    uint64_t stops = 0;                // zero sends
+};
+
+class RumbleForwarder {
+public:
+    explicit RumbleForwarder(XInputSetStateFn fn, uint64_t min_interval_ms = 16) : fn_(fn), min_interval_ms_(min_interval_ms) {}
+    // Call regularly. `pad` < 0 = no pad; `allowed` false (focus lost) forces the motors off.
+    void update(const playgta6::os::RumbleTelemetry& t, int pad, bool allowed, uint64_t now_ms);
+    // Motors off if they may be running (exit, fault, shutdown).
+    void stop();
+    const RumbleForwardStats& stats() const { return stats_; }
+
+private:
+    void send(uint16_t low, uint16_t high, uint64_t now_ms);
+
+    XInputSetStateFn fn_;
+    uint64_t min_interval_ms_;
+    int pad_ = -1;          // pad the motors were last set on
+    bool running_ = false;  // non-zero motors sent and not yet stopped
+    uint16_t low_ = 0, high_ = 0;
+    uint64_t last_send_ms_ = 0;
+    bool sent_any_ = false;
+    RumbleForwardStats stats_;
+};
+
+// Best-effort motors-off from any thread (fault/terminate path). No-op when nothing was driven.
+void silence_host_rumble();
 
 // Polls the host (Windows: first connected XInput pad plus GetAsyncKeyState) on its own
 // thread and publishes into `state`. A no-op on other hosts.
