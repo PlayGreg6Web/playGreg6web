@@ -2060,7 +2060,7 @@ std::string bink_json() {
     const BootState& b = boot();
     uint64_t shim_opens = 0;
     uint64_t shim_refused = 0;
-    pg6_mw_bink_shim_stats(&shim_opens, &shim_refused);
+    pg6_bink_shim_stats(&shim_opens, &shim_refused);
     uint64_t imports_to_shim = 0;
     for (const ImportRecord& rec : b.imports) {
         if (rec.import.dll != nullptr && os::win32::canonical_module_name(rec.import.dll) == "bink2scarlett.dll" &&

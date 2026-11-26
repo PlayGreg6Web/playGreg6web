@@ -172,7 +172,7 @@ uint32_t pg6_xbox_middleware_register_all(void);
 
 // How often the Bink2Scarlett.dll fallback shim answered BinkOpenWithOptions (all calls, and the
 // ones refused with no movie). Non-zero means the shim, not the lifted DLL, took the call.
-void pg6_mw_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens);
+void pg6_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens);
 
 // ---------------------------------------------------------------------------
 // 1. libHttpClient.GDK.dll (38 symbols)

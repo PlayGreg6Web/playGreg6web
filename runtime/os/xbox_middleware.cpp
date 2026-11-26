@@ -607,7 +607,7 @@ uint32_t pg6_xbox_middleware_register_all(void) {
     return registered_count;
 }
 
-void pg6_mw_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens) {
+void pg6_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens) {
     auto& g = mw::bink_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
     if (open_calls != nullptr) {
