@@ -77,6 +77,14 @@ struct ExecutorStats {
     uint64_t dispatches_clamped = 0;
     uint64_t auto_layout_pipelines = 0;  // layout 0 ("auto"): the worker's WGSL remap is not mirrored
     uint64_t manifest_layouts_unavailable = 0;
+    // layout:'auto' bind group remap (the worker's _getOrCreateRemappedBindGroup).
+    uint64_t auto_layout_remap_pipelines = 0;  // an explicit layout that did not fit the WGSL @group(0) bindings
+    uint64_t remapped_bind_groups = 0;         // group 0 bind groups built for such pipelines
+    uint64_t remap_cache_hits = 0;
+    uint64_t remap_dynamic_offsets = 0;        // dynamic offsets folded into static buffer offsets
+    uint64_t remap_dynamic_clamps = 0;         // folded offsets clamped to the buffer / out of bounds (dummy)
+    uint64_t remap_fallback_samplers = 0;      // sampler bindings no resource matched: default sampler
+    uint64_t remap_dummies = 0;                // bindings no resource matched: dummy resource
     // Milestone 2: read-backs (39/40), v1 pipelines / bind groups (8/15/16/19), pass timestamps.
     uint64_t readbacks_requested = 0;
     uint64_t readbacks_delivered = 0;  // bytes written to guest memory

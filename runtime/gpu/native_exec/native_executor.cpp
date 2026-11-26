@@ -20,6 +20,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "gpu/gpu_time.h"
+#include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
@@ -233,6 +234,34 @@ struct BglEntry {
 struct PlEntry {
     wgpu::PipelineLayout layout;
     bool group0_has_entries = false;
+    // The worker's `pipelineLayoutMeta.group0Entries`: nullopt for a manifest layout or an empty slot.
+    std::optional<std::vector<Group0LayoutEntry>> group0_entries;
+};
+
+// A bind group's recorded descriptor (`bindGroupDescriptors`): the real (non-dummy) resources with
+// the facts the layout:'auto' remap matches on, and the handles to bind.
+struct BgHandles {
+    wgpu::Buffer buffer;
+    wgpu::TextureView view;
+    wgpu::Sampler sampler;
+};
+struct BgDesc {
+    std::vector<RemapResource> model;
+    std::vector<BgHandles> handles;  // parallel to `model`
+};
+
+// `renderPipelineAutoLayoutMeta` / `computePipelineMeta`: a pipeline whose explicit layout did not
+// fit its WGSL gets layout:'auto' and the worker's group 0 bind group remap.
+struct AutoLayoutMeta {
+    bool remap = false;
+    std::vector<WgslBinding> bindings;
+    uint64_t gen = 0;  // bumps when the pipeline id is (re)created: invalidates cached remapped groups
+};
+
+struct RemapCacheEntry {
+    wgpu::BindGroup group;  // null: the remap came out empty
+    const BgDesc* desc = nullptr;
+    uint64_t gen = 0;
 };
 
 struct ShaderEntry {
@@ -245,6 +274,7 @@ struct ShaderEntry {
 
 struct RenderPipelineEntry {
     wgpu::RenderPipeline pipeline;
+    AutoLayoutMeta auto_meta;
     bool expects_group0 = false;
     uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
 };
@@ -333,6 +363,8 @@ struct SetBindGroup2Cmd {
     uint32_t group;
     wgpu::BindGroup bind_group;  // resolved at packet time
     std::vector<uint32_t> offsets;
+    uint32_t bind_group_id = 0;
+    std::shared_ptr<BgDesc> desc;  // the recorded descriptor at packet time (the layout:'auto' remap reads it)
 };
 // v1 SetBindGroup: the group is resolved by id when the frame is encoded (`this.bindGroups.get(id)`
 // with the packet-time handle as fallback), and goes to whichever pass is open.
@@ -420,6 +452,28 @@ struct NativeExecutor::Impl {
     std::unordered_map<uint32_t, uint64_t> compute_hash;  // GPU-time key of a compute pipeline
     std::unordered_set<uint32_t> compute_bind_groups;     // v1 bind groups made for a compute pipeline
     wgpu::Sampler default_filtering_sampler;  // getOrCreateDefaultSampler('filtering')
+    // layout:'auto' bind group remap (_getOrCreateRemappedBindGroup)
+    std::unordered_map<uint32_t, std::shared_ptr<BgDesc>> bg_descs;
+    std::unordered_map<uint32_t, AutoLayoutMeta> compute_meta;
+    std::unordered_set<uint32_t> comparison_samplers;
+    std::unordered_map<std::string, RemapCacheEntry> remap_cache;
+    uint64_t pipeline_gen_counter = 0;
+    wgpu::Sampler fallback_samplers[3];  // getOrCreateDefaultSampler: filtering, non-filtering, comparison
+    struct Group0Src {
+        uint32_t id = 0;
+        std::shared_ptr<BgDesc> desc;
+        std::vector<uint32_t> dyn;
+    };
+    struct RemapState {  // _preparePassCommandsForFlush's per-flush state
+        int mode = 0;    // 0 none, 1 render, 2 compute
+        uint32_t render_pipe = 0;
+        bool render_auto = false, group0_render = false, has_last_render = false;
+        Group0Src last_render;
+        uint32_t compute_pipe = 0;
+        bool compute_valid = false, compute_auto = false, group0_compute = false, has_last_compute = false;
+        Group0Src last_compute;
+        bool had_explicit_compute = false;
+    } remap;
     d3d12_guest::GpuTimeTable* time_table = nullptr;
     std::unique_ptr<d3d12_guest::GpuTimeRing> time_ring;
     std::vector<TimerSlot> timer_slots;
@@ -710,6 +764,7 @@ struct NativeExecutor::Impl {
     void reset_frame_state() {
         clear_color = kDefaultClearColor;
         pass_cmds.clear();
+        remap = RemapState{};
     }
 
     // The worker's `_packetError` (a rejected v2 / texture packet), counted per opcode.
@@ -1027,6 +1082,9 @@ struct NativeExecutor::Impl {
         compute_bind_groups.erase(id);
         bgls.erase(id);
         pipeline_layouts.erase(id);
+        bg_descs.erase(id);
+        compute_meta.erase(id);
+        comparison_samplers.erase(id);
     }
 
     // ---- shaders (wgpu_worker.js _handleCreateShaderModule / _resolveShaderPayload) ----
@@ -1281,6 +1339,7 @@ struct NativeExecutor::Impl {
         sd.mipmapFilter = c.mipmap_filter == 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
         sd.maxAnisotropy = static_cast<uint16_t>(std::min<uint32_t>(std::max<uint32_t>(1, c.max_anisotropy), 65535));
         samplers[c.id] = device.CreateSampler(&sd);
+        comparison_samplers.erase(c.id);
         ++stats.samplers_created;
     }
 
@@ -1298,6 +1357,8 @@ struct NativeExecutor::Impl {
         sd.maxAnisotropy = std::max<uint16_t>(1, c.max_anisotropy);
         if (c.compare != 0) sd.compare = wgpu_compare(c.compare);
         samplers[c.id] = device.CreateSampler(&sd);
+        if (c.compare != 0) comparison_samplers.insert(c.id);
+        else comparison_samplers.erase(c.id);
         ++stats.samplers_created;
     }
 
@@ -1433,6 +1494,11 @@ struct NativeExecutor::Impl {
         PlEntry e;
         e.layout = device.CreatePipelineLayout(&d);
         e.group0_has_entries = group0 && (!group0->entries_known || !group0->entries.empty());
+        if (group0 && group0->entries_known) {
+            std::vector<Group0LayoutEntry> g0;
+            for (const LayoutEntry& le : group0->entries) g0.push_back({le.binding, le.kind, le.subtype});
+            e.group0_entries = std::move(g0);
+        }
         pipeline_layouts[h.id] = std::move(e);
         ++stats.pipeline_layouts;
         return true;
@@ -1446,11 +1512,13 @@ struct NativeExecutor::Impl {
         wgpu::PipelineLayout layout;
         bool auto_layout = h.pipeline_layout_id == 0;
         bool group0_has_entries = false;
+        const std::optional<std::vector<Group0LayoutEntry>>* group0_entries = nullptr;
         if (!auto_layout) {
             auto lit = pipeline_layouts.find(h.pipeline_layout_id);
             if (lit == pipeline_layouts.end()) return fail("unknown pipeline layout " + std::to_string(h.pipeline_layout_id));
             layout = lit->second.layout;
             group0_has_entries = lit->second.group0_has_entries;
+            group0_entries = &lit->second.group0_entries;
         } else {
             ++stats.auto_layout_pipelines;
         }
@@ -1592,7 +1660,20 @@ struct NativeExecutor::Impl {
         rd.multisample.mask = key.multisample.mask;
         rd.multisample.alphaToCoverageEnabled = key.multisample.alpha_to_coverage_enabled != 0;
 
-        rd.layout = auto_layout ? nullptr : layout;
+        // An explicit layout that does not satisfy the statically referenced @group(0) bindings of the
+        // WGSL becomes layout:'auto' with the worker's bind group remap (isExplicitLayoutCompatibleWithWgsl).
+        AutoLayoutMeta auto_meta;
+        if (!auto_layout && group0_entries) {
+            std::vector<WgslBinding> wb = merge_wgsl_group0_bindings(
+                parse_wgsl_group0_bindings(vs.code), fs ? parse_wgsl_group0_bindings(fs->code) : std::vector<WgslBinding>{});
+            if (!explicit_layout_compatible(group0_entries->has_value() ? &**group0_entries : nullptr, wb)) {
+                auto_meta.remap = true;
+                auto_meta.bindings = std::move(wb);
+                ++stats.auto_layout_remap_pipelines;
+            }
+        }
+        auto_meta.gen = ++pipeline_gen_counter;
+        rd.layout = auto_layout || auto_meta.remap ? nullptr : layout;
         rd.vertex.module = vs.module;
         const std::string vep = resolve_shader_entry_point(vs.code, vs.explicit_ep, "vertex");
         rd.vertex.entryPoint = {vep.data(), vep.size()};
@@ -1604,6 +1685,7 @@ struct NativeExecutor::Impl {
         bool expects = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
         if (!expects && !auto_layout && group0_has_entries) expects = true;
         e.expects_group0 = expects;
+        e.auto_meta = std::move(auto_meta);
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         render_pipelines[h.id] = std::move(e);
         ++stats.render_pipelines;
@@ -1615,10 +1697,12 @@ struct NativeExecutor::Impl {
         const auto h = read_payload<GpuCreateComputePipeline2Payload>(p);
         wgpu::PipelineLayout layout;
         const bool auto_layout = h.pipeline_layout_id == 0;
+        const std::optional<std::vector<Group0LayoutEntry>>* group0_entries = nullptr;
         if (!auto_layout) {
             auto lit = pipeline_layouts.find(h.pipeline_layout_id);
             if (lit == pipeline_layouts.end()) return fail("unknown pipeline layout " + std::to_string(h.pipeline_layout_id));
             layout = lit->second.layout;
+            group0_entries = &lit->second.group0_entries;
         } else {
             ++stats.auto_layout_pipelines;
         }
@@ -1626,11 +1710,22 @@ struct NativeExecutor::Impl {
         if (cit == shaders.end()) return fail("unknown compute shader module " + std::to_string(h.cs_module_id));
         const ShaderEntry& cs = cit->second;
         const std::string ep = resolve_shader_entry_point(cs.code, cs.explicit_ep, "compute");
+        AutoLayoutMeta auto_meta;
+        if (!auto_layout && group0_entries) {
+            std::vector<WgslBinding> wb = parse_wgsl_group0_bindings(cs.code);
+            if (!explicit_layout_compatible(group0_entries->has_value() ? &**group0_entries : nullptr, wb)) {
+                auto_meta.remap = true;
+                auto_meta.bindings = std::move(wb);
+                ++stats.auto_layout_remap_pipelines;
+            }
+        }
+        auto_meta.gen = ++pipeline_gen_counter;
         wgpu::ComputePipelineDescriptor cd{};
-        cd.layout = auto_layout ? nullptr : layout;
+        cd.layout = auto_layout || auto_meta.remap ? nullptr : layout;
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {ep.data(), ep.size()};
         compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        compute_meta[h.id] = std::move(auto_meta);
         compute_hash[h.id] = cs.hash;
         ++stats.compute_pipelines;
         return true;
@@ -1697,6 +1792,7 @@ struct NativeExecutor::Impl {
         RenderPipelineEntry e;
         e.pipeline = device.CreateRenderPipeline(&rd);
         e.expects_group0 = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
+        e.auto_meta.gen = ++pipeline_gen_counter;
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         render_pipelines[h.id] = std::move(e);
         ++stats.render_pipelines;
@@ -1714,6 +1810,7 @@ struct NativeExecutor::Impl {
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {"cs_main", 7};
         compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        compute_meta.erase(h.id);
         compute_hash[h.id] = cs.hash;
         ++stats.compute_pipelines;
         ++stats.v1_compute_pipelines;
@@ -1898,6 +1995,12 @@ struct NativeExecutor::Impl {
         };
         std::vector<Pending> entries;
         std::vector<uint32_t> seen;
+        auto desc = std::make_shared<BgDesc>();
+        // dynamicOffsetIndicesForLayoutEntries: the rank of a dynamic-offset buffer binding
+        std::vector<uint32_t> dyn_bindings;
+        for (const LayoutEntry& x : rec.entries)
+            if (x.kind == 0 && x.dynamic) dyn_bindings.push_back(x.binding);
+        std::sort(dyn_bindings.begin(), dyn_bindings.end());
         for (uint32_t i = 0; i < h.entry_count; ++i) {
             const auto e = read_payload<GpuBindGroupEntry2>(p, 16 + size_t{i} * 48);
             if (std::find(seen.begin(), seen.end(), e.binding) != seen.end())
@@ -1915,6 +2018,12 @@ struct NativeExecutor::Impl {
             Pending pe;
             pe.binding = e.binding;
             bool have = false;
+            // The descriptor entry the layout:'auto' remap matches on (`descriptorResources`): only
+            // real resources are recorded; a dummy entry is never picked.
+            bool rec_real = false;
+            RemapResource rm;
+            BgHandles rh;
+            rm.binding = e.binding;
             auto use_dummy = [&](const LayoutEntry& l) {
                 const Dummy d = dummy_resource(l);
                 pe.buffer = d.buffer;
@@ -1952,13 +2061,35 @@ struct NativeExecutor::Impl {
                         }
                         if (undersized) {
                             use_dummy(*le);
-                        } else if (kind_mismatch || usage_mismatch) {
-                            use_dummy(*le);
                         } else {
-                            pe.buffer = b.buffer;
-                            pe.offset = buf_offset;
-                            pe.size = eff > 0 ? eff : wgpu::kWholeSize;
-                            have = true;
+                            rec_real = true;  // realResource is set even when the entry itself is a dummy
+                            if (!kind_mismatch && !usage_mismatch && le && le->kind == 0)
+                                rm.kind = le->subtype == 0   ? WgslBindingKind::Uniform
+                                          : le->subtype == 1 ? WgslBindingKind::Storage
+                                                             : WgslBindingKind::ReadOnlyStorage;
+                            else
+                                rm.kind = (b.usage & 0x80u) && !(b.usage & 0x40u) ? WgslBindingKind::Storage
+                                                                                   : WgslBindingKind::Uniform;
+                            rm.buffer_usage = b.usage;
+                            rm.buffer_offset = buf_offset;
+                            rm.buffer_size = eff;
+                            rm.buffer_total = buf_size;
+                            if (le && le->kind == 0) {
+                                const auto rank = std::lower_bound(dyn_bindings.begin(), dyn_bindings.end(), e.binding);
+                                if (rank != dyn_bindings.end() && *rank == e.binding) {
+                                    rm.has_dynamic_offset = true;
+                                    rm.dynamic_offset_index = static_cast<uint32_t>(rank - dyn_bindings.begin());
+                                }
+                            }
+                            rh.buffer = b.buffer;
+                            if (kind_mismatch || usage_mismatch) {
+                                use_dummy(*le);
+                            } else {
+                                pe.buffer = b.buffer;
+                                pe.offset = buf_offset;
+                                pe.size = eff > 0 ? eff : wgpu::kWholeSize;
+                                have = true;
+                            }
                         }
                     }
                 }
@@ -1968,7 +2099,9 @@ struct NativeExecutor::Impl {
                 if (tit != textures.end()) {
                     TextureEntry& t = tit->second;
                     uint8_t tex_format = e.view.format ? e.view.format : t.geom.format;
+                    uint8_t rec_format = 0;  // the descriptor's textureFormat (0 = unknown)
                     if (e.view.format && t.bc3d_fallback && format_is_bc(e.view.format)) tex_format = t.geom.format;
+                    rec_format = tex_format;
                     if (!kind_mismatch && le && le->kind == 3 && tex_format) {
                         const StorageResolution sr = resolve_storage_format(tex_format, features);
                         if (!sr.supported || !sr.storage_format) {
@@ -1980,11 +2113,13 @@ struct NativeExecutor::Impl {
                             pe.view = texture_view(t, &lv);
                             have = static_cast<bool>(pe.view);
                             if (!have) use_dummy(*le);
+                            else { rec_real = true; rec_format = sr.storage_format; rh.view = pe.view; }
                         } else {
                             GpuTextureViewDesc sv = e.view;
                             sv.mip_level_count = 1;
                             pe.view = texture_view(t, e.view.mip_level_count == 1 ? vd : &sv);
                             have = static_cast<bool>(pe.view);
+                            if (have) { rec_real = true; rh.view = pe.view; }
                         }
                     } else if (!kind_mismatch && le && le->kind == 2 && le->subtype == 0 && tex_format &&
                                format_is_float32(tex_format) && !features.float32_filterable) {
@@ -1992,14 +2127,43 @@ struct NativeExecutor::Impl {
                     } else {
                         pe.view = texture_view(t, vd);
                         if (pe.view) {
+                            rec_real = true;
+                            rh.view = pe.view;
                             if (kind_mismatch) use_dummy(*le);
                             else have = true;
                         }
+                    }
+                    if (rec_real) {
+                        if (!kind_mismatch && le && le->kind == 3) rm.kind = WgslBindingKind::StorageTexture;
+                        else if (!kind_mismatch && le && le->kind == 2) rm.kind = WgslBindingKind::Texture;
+                        else
+                            rm.kind = (t.usage & 0x8u) && !(t.usage & 0x4u) ? WgslBindingKind::StorageTexture
+                                                                             : WgslBindingKind::Texture;
+                        rm.texture_usage = t.usage;
+                        if (rec_format) rm.format = rec_format;
+                        // textureViewDimension: the view's, with the 1d <-> 2d promotion rules, else the texture's
+                        const uint8_t vdim = e.view.dimension;
+                        const bool actual_1d = t.geom.dimension == 0;
+                        uint8_t dim;
+                        if (vdim != 0) {
+                            if (vdim == 1 && (t.geom.dimension == 1 || t.promoted_1d)) dim = 2;
+                            else if (actual_1d && vdim != 1) dim = 1;
+                            else dim = vdim;
+                        } else {
+                            const uint8_t base = t.geom.dimension == 0 ? 1 : t.geom.dimension == 2 ? 6 : 2;
+                            dim = base == 2 && t.geom.depth_or_layers > 1 ? 3 : base;
+                        }
+                        rm.view_dim = dim;
+                        rm.multisampled = t.sample_count > 1;
                     }
                 }
             } else if (type == 2) {
                 auto sit = samplers.find(e.resource_id);
                 if (sit != samplers.end()) {
+                    rec_real = true;
+                    rm.kind = WgslBindingKind::Sampler;
+                    rm.comparison = comparison_samplers.count(e.resource_id) != 0;
+                    rh.sampler = sit->second;
                     if (kind_mismatch) {
                         use_dummy(*le);
                     } else {
@@ -2011,6 +2175,10 @@ struct NativeExecutor::Impl {
             if (!have)
                 return fail("bind group " + std::to_string(h.id) + ": binding " + std::to_string(e.binding) +
                             " resource " + std::to_string(e.resource_id) + " unavailable");
+            if (rec_real) {
+                desc->model.push_back(rm);
+                desc->handles.push_back(std::move(rh));
+            }
             entries.push_back(std::move(pe));
         }
         std::vector<wgpu::BindGroupEntry> wes(entries.size());
@@ -2027,6 +2195,7 @@ struct NativeExecutor::Impl {
         bd.entryCount = wes.size();
         bd.entries = wes.data();
         bind_groups[h.id] = device.CreateBindGroup(&bd);
+        bg_descs[h.id] = std::move(desc);
         compute_bind_groups.erase(h.id);  // a v2 group of the same id is not a v1 compute group
         ++stats.bind_groups;
         return true;
@@ -2041,6 +2210,8 @@ struct NativeExecutor::Impl {
         SetBindGroup2Cmd c;
         c.group = h.group_index;
         c.bind_group = it->second;
+        c.bind_group_id = h.bind_group_id;
+        if (auto dit = bg_descs.find(h.bind_group_id); dit != bg_descs.end()) c.desc = dit->second;
         for (uint32_t i = 0; i < h.dynamic_offset_count; ++i) c.offsets.push_back(read_payload<uint32_t>(p, 16 + size_t{i} * 4));
         pass_cmds.emplace_back(std::move(c));
         return true;
@@ -2310,13 +2481,16 @@ struct NativeExecutor::Impl {
 
     void run_cmd(Encoder& e, const PassCmd& cmd) {
         if (const auto* b = std::get_if<BeginPassCmd>(&cmd)) {
+            remap_pass_boundary(true);
             begin_explicit_pass(e, *b);
         } else if (std::get_if<EndPassCmd>(&cmd)) {
+            remap_pass_boundary(false);
             if (e.rpass) e.end_active();  // EndRenderPass: `if (ctl.passKind === 'render') ctl.endPass()`
             e.explicit_pass = false;
             e.had_explicit_compute = false;
             e.compute_valid = false;
         } else if (const auto* sp = std::get_if<SetPipelineCmd>(&cmd)) {
+            remap_set_render_pipeline(sp->id);
             e.ensure_render();
             e.active_pipeline = sp->id;
             e.had_explicit_compute = false;
@@ -2339,6 +2513,7 @@ struct NativeExecutor::Impl {
         } else if (const auto* d = std::get_if<DrawCmd>(&cmd)) {
             e.had_explicit_compute = false;
             e.compute_valid = false;
+            remap_before_draw(e);
             if (draw_allowed(e)) {
                 e.rpass.Draw(d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
                 ++stats.draws;
@@ -2346,6 +2521,7 @@ struct NativeExecutor::Impl {
         } else if (const auto* di = std::get_if<DrawIndexedCmd>(&cmd)) {
             e.had_explicit_compute = false;
             e.compute_valid = false;
+            remap_before_draw(e);
             if (draw_allowed(e)) {
                 e.rpass.DrawIndexed(di->index_count, di->instance_count, di->first_index, di->base_vertex,
                                     di->first_instance);
@@ -2367,6 +2543,7 @@ struct NativeExecutor::Impl {
                 ++stats.draws;
             }
         } else if (const auto* sc = std::get_if<SetComputePipelineCmd>(&cmd)) {
+            remap_set_compute_pipeline(sc->id);
             e.ensure_compute();
             e.had_explicit_compute = true;
             auto it = compute_pipelines.find(sc->id);
@@ -2389,6 +2566,7 @@ struct NativeExecutor::Impl {
                 y = std::min(y, max_workgroups_per_dim);
                 z = std::min(z, max_workgroups_per_dim);
             }
+            remap_before_dispatch(e);
             e.ensure_compute();
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
@@ -2413,6 +2591,7 @@ struct NativeExecutor::Impl {
             if (!e.rpass) return;
             e.rpass.SetStencilReference(st->ref);
         } else if (const auto* bg = std::get_if<SetBindGroup2Cmd>(&cmd)) {
+            if (bg->group == 0 && remap_set_group0(e, *bg)) return;  // layout:'auto' remap
             if (!e.rpass && !e.cpass) return;  // `if (!ctl.pass) return`
             if (e.rpass) e.rpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             else e.cpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
@@ -2436,6 +2615,254 @@ struct NativeExecutor::Impl {
             e.end_active();  // _recordReadbackCopy: pc.endPass()
             record_readback_copy(e.enc, rb->req);
         }
+    }
+
+
+    // ---- layout:'auto' bind group remap (_getOrCreateRemappedBindGroup / _preparePassCommandsForFlush) ----
+
+    // pipelineCache.getOrCreateDefaultSampler('filtering' | 'comparison')
+    wgpu::Sampler fallback_sampler(bool comparison) {
+        wgpu::Sampler& s = fallback_samplers[comparison ? 2 : 0];
+        if (!s) {
+            wgpu::SamplerDescriptor sd{};
+            sd.magFilter = wgpu::FilterMode::Linear;
+            sd.minFilter = wgpu::FilterMode::Linear;
+            sd.mipmapFilter = comparison ? wgpu::MipmapFilterMode::Nearest : wgpu::MipmapFilterMode::Linear;
+            if (comparison) sd.compare = wgpu::CompareFunction::LessEqual;
+            s = device.CreateSampler(&sd);
+        }
+        return s;
+    }
+
+    struct RemapResult {
+        enum class Status { Ok, Empty, Unsupported } status = Status::Unsupported;
+        wgpu::BindGroup group;
+    };
+
+    // Builds (or reuses) the bind group for the auto layout's group 0 from the recorded descriptor of
+    // the group the stream bound: each WGSL binding takes the first matching real resource, else a
+    // default sampler / a dummy. Dynamic offsets are folded into the static buffer offsets.
+    RemapResult get_remapped(bool compute, uint32_t pipeline_id, const AutoLayoutMeta& meta, uint32_t bg_id,
+                             const std::shared_ptr<BgDesc>& desc, const std::vector<uint32_t>& dyn) {
+        RemapResult out;
+        const bool has_pipeline = compute ? compute_pipelines.count(pipeline_id) != 0 : render_pipelines.count(pipeline_id) != 0;
+        if (!has_pipeline) return out;  // 'unsupported': the original command stays
+        out.status = RemapResult::Status::Empty;
+        if (meta.bindings.empty()) return out;
+
+        static const std::vector<RemapResource> kNone;
+        const std::vector<RemapResource>& av = desc ? desc->model : kNone;
+        std::string dyn_key;
+        {
+            bool any = false;
+            for (uint32_t v : dyn) any = any || v > 0;
+            if (any) {
+                bool non_zero = false;
+                std::string parts;
+                for (const RemapResource& r : av) {
+                    if (!r.has_dynamic_offset || r.is_dummy) continue;
+                    const uint32_t v = r.dynamic_offset_index < dyn.size() ? dyn[r.dynamic_offset_index] : 0;
+                    if (v > 0) non_zero = true;
+                    if (!parts.empty()) parts += ',';
+                    parts += std::to_string(r.binding) + "=" + std::to_string(v);
+                }
+                if (non_zero) dyn_key = parts;
+            }
+        }
+        auto dit = bg_descs.find(bg_id);
+        const bool live = bg_id == 0 || (dit != bg_descs.end() && dit->second == desc);
+        const std::string key = std::string(compute ? "c:" : "r:") + std::to_string(pipeline_id) + ":" +
+                                std::to_string(bg_id) + (dyn_key.empty() ? "" : "@" + dyn_key);
+        if (live) {
+            auto cit = remap_cache.find(key);
+            if (cit != remap_cache.end() && cit->second.desc == desc.get() && cit->second.gen == meta.gen) {
+                ++stats.remap_cache_hits;
+                if (cit->second.group) {
+                    out.status = RemapResult::Status::Ok;
+                    out.group = cit->second.group;
+                }
+                return out;
+            }
+        }
+
+        wgpu::BindGroupLayout auto_bgl = compute ? compute_pipelines.find(pipeline_id)->second.GetBindGroupLayout(0)
+                                                 : render_pipelines.find(pipeline_id)->second.pipeline.GetBindGroupLayout(0);
+        wgpu::BindGroup group;
+        if (auto_bgl) {
+            RemapPicker picker(av, dyn, features.float32_filterable);
+            std::vector<wgpu::BindGroupEntry> wes(meta.bindings.size());
+            for (size_t i = 0; i < meta.bindings.size(); ++i) {
+                const WgslBinding& b = meta.bindings[i];
+                wgpu::BindGroupEntry& w = wes[i];
+                w.binding = b.binding;
+                const PickResult r = picker.pick(b);
+                if (r.kind == PickResult::Kind::Resource) {
+                    const BgHandles& hnd = desc->handles[r.index];
+                    w.buffer = hnd.buffer;
+                    w.textureView = hnd.view;
+                    w.sampler = hnd.sampler;
+                    if (hnd.buffer) {
+                        w.offset = r.offset;
+                        w.size = r.size > 0 ? r.size : wgpu::kWholeSize;
+                        if (r.folded) ++stats.remap_dynamic_offsets;
+                        if (r.dyn_clamped) ++stats.remap_dynamic_clamps;
+                    }
+                } else if (r.kind == PickResult::Kind::FallbackSampler) {
+                    w.sampler = fallback_sampler(b.comparison);
+                    ++stats.remap_fallback_samplers;
+                } else {
+                    if (r.dyn_oob) ++stats.remap_dynamic_clamps;
+                    const SynthLayoutEntry se = synth_layout_entry(b);
+                    LayoutEntry le;
+                    le.binding = se.binding;
+                    le.kind = se.kind;
+                    le.subtype = se.subtype;
+                    le.view_dim = se.view_dim;
+                    le.storage_format = se.storage_format;
+                    le.multisampled = se.multisampled;
+                    le.min_binding_size = se.min_binding_size;
+                    const Dummy d = dummy_resource(le);
+                    w.buffer = d.buffer;
+                    w.sampler = d.sampler;
+                    w.textureView = d.view;
+                    w.offset = 0;
+                    w.size = wgpu::kWholeSize;
+                    ++stats.remap_dummies;
+                }
+            }
+            wgpu::BindGroupDescriptor bd{};
+            bd.layout = auto_bgl;
+            bd.entryCount = wes.size();
+            bd.entries = wes.data();
+            group = device.CreateBindGroup(&bd);
+            ++stats.remapped_bind_groups;
+        }
+        if (live) {
+            if (remap_cache.size() >= 8192) remap_cache.clear();
+            remap_cache[key] = RemapCacheEntry{group, desc.get(), meta.gen};
+        }
+        if (group) {
+            out.status = RemapResult::Status::Ok;
+            out.group = group;
+        }
+        return out;
+    }
+
+    // RemappedSetBindGroupCommand.run: `if (!ctl.pass) return`.
+    void apply_remapped(Encoder& e, const wgpu::BindGroup& g) {
+        if (!e.rpass && !e.cpass) return;
+        if (e.rpass) {
+            e.rpass.SetBindGroup(0, g, 0, nullptr);
+            e.group0_bound = true;  // _recordPassBindGroup
+        } else {
+            e.cpass.SetBindGroup(0, g, 0, nullptr);
+        }
+    }
+
+    void remap_reset_compute() {
+        remap.compute_pipe = 0;
+        remap.compute_valid = false;
+        remap.compute_auto = false;
+        remap.had_explicit_compute = false;
+        remap.group0_compute = false;
+        remap.has_last_compute = false;
+    }
+    void remap_reset_render() {
+        remap.render_pipe = 0;
+        remap.render_auto = false;
+        remap.group0_render = false;
+        remap.has_last_render = false;
+    }
+    void remap_pass_boundary(bool begin) {
+        remap.mode = begin ? 1 : 0;
+        remap_reset_compute();
+        remap_reset_render();
+    }
+    void remap_set_render_pipeline(uint32_t id) {
+        remap.mode = 1;
+        remap_reset_compute();
+        remap.render_pipe = id;
+        auto it = render_pipelines.find(id);
+        remap.render_auto = it != render_pipelines.end() && it->second.auto_meta.remap;
+        remap.group0_render = false;
+    }
+    void remap_set_compute_pipeline(uint32_t id) {
+        remap.mode = 2;
+        remap_reset_render();
+        remap.had_explicit_compute = true;
+        remap.compute_pipe = id;
+        remap.compute_valid = compute_pipelines.count(id) != 0;
+        auto it = compute_meta.find(id);
+        remap.compute_auto = remap.compute_valid && it != compute_meta.end() && it->second.remap;
+        remap.group0_compute = false;
+    }
+
+    // SetBindGroup2 of group 0: true = the command was replaced (the original is not run).
+    bool remap_set_group0(Encoder& e, const SetBindGroup2Cmd& c) {
+        const Group0Src src{c.bind_group_id, c.desc, c.offsets};
+        if (remap.mode == 2) {
+            remap.last_compute = src;
+            remap.has_last_compute = true;
+            if (remap.compute_valid && remap.compute_auto) {
+                auto mit = compute_meta.find(remap.compute_pipe);
+                const RemapResult r = get_remapped(true, remap.compute_pipe, mit->second, c.bind_group_id, c.desc, c.offsets);
+                remap.group0_compute = true;
+                if (r.status == RemapResult::Status::Ok) {
+                    apply_remapped(e, r.group);
+                    return true;
+                }
+                if (r.status == RemapResult::Status::Empty) return true;
+            }
+        } else if (remap.mode == 1) {
+            remap.last_render = src;
+            remap.has_last_render = true;
+            if (remap.render_auto) {
+                auto pit = render_pipelines.find(remap.render_pipe);
+                if (pit != render_pipelines.end()) {
+                    const RemapResult r =
+                        get_remapped(false, remap.render_pipe, pit->second.auto_meta, c.bind_group_id, c.desc, c.offsets);
+                    remap.group0_render = true;
+                    if (r.status == RemapResult::Status::Ok) {
+                        apply_remapped(e, r.group);
+                        return true;
+                    }
+                    if (r.status == RemapResult::Status::Empty) return true;  // NoopRenderGroup0Command
+                } else {
+                    remap.group0_render = true;
+                }
+            }
+        } else {
+            remap.last_render = src;
+            remap.has_last_render = true;
+            remap.last_compute = src;
+            remap.has_last_compute = true;
+        }
+        return false;
+    }
+
+    // A draw / dispatch of an auto-layout pipeline with no group 0 set yet in this pass binds the
+    // remap of the last group 0 the stream bound (or none: dummies).
+    void remap_before_draw(Encoder& e) {
+        remap.mode = 1;
+        remap_reset_compute();
+        if (!remap.render_auto || remap.group0_render) return;
+        auto pit = render_pipelines.find(remap.render_pipe);
+        const Group0Src none;
+        const Group0Src& src = remap.has_last_render ? remap.last_render : none;
+        remap.group0_render = true;
+        if (pit == render_pipelines.end()) return;
+        const RemapResult r = get_remapped(false, remap.render_pipe, pit->second.auto_meta, src.id, src.desc, src.dyn);
+        if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
+    }
+    void remap_before_dispatch(Encoder& e) {
+        if (!remap.compute_auto || remap.group0_compute) return;
+        auto mit = compute_meta.find(remap.compute_pipe);
+        const Group0Src none;
+        const Group0Src& src = remap.has_last_compute ? remap.last_compute : none;
+        remap.group0_compute = true;
+        if (mit == compute_meta.end()) return;
+        const RemapResult r = get_remapped(true, remap.compute_pipe, mit->second, src.id, src.desc, src.dyn);
+        if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
     }
 
     // ---- GPU pass timestamps (gpu_timer.js, #1608) ----
@@ -2921,6 +3348,13 @@ std::string NativeExecutor::stats_json() const {
     num("dispatches_clamped", st.dispatches_clamped);
     num("auto_layout_pipelines", st.auto_layout_pipelines);
     num("manifest_layouts_unavailable", st.manifest_layouts_unavailable);
+    num("auto_layout_remap_pipelines", st.auto_layout_remap_pipelines);
+    num("remapped_bind_groups", st.remapped_bind_groups);
+    num("remap_cache_hits", st.remap_cache_hits);
+    num("remap_dynamic_offsets", st.remap_dynamic_offsets);
+    num("remap_dynamic_clamps", st.remap_dynamic_clamps);
+    num("remap_fallback_samplers", st.remap_fallback_samplers);
+    num("remap_dummies", st.remap_dummies);
     num("readbacks_requested", st.readbacks_requested);
     num("readbacks_delivered", st.readbacks_delivered);
     num("readbacks_failed", st.readbacks_failed);
@@ -2965,6 +3399,21 @@ std::string NativeExecutor::stats_json() const {
     j += ", ";
     table("packet_errors_by_opcode", st.packet_errors_by_opcode);
     j += ", \"adapter\": {\"backend\": \"" + impl_->adapter.backend + "\"}";
+    j += ", \"device_error_log\": [";
+    for (size_t i = 0; i < st.device_error_log.size(); ++i) {
+        if (i) j += ", ";
+        j += "\"";
+        for (char c : st.device_error_log[i]) {
+            if (c == '"' || c == '\\') {
+                j += '\\';
+                j += c;
+            } else if (static_cast<unsigned char>(c) >= 0x20) {
+                j += c;
+            }
+        }
+        j += "\"";
+    }
+    j += "]";
     j += "}";
     return j;
 }

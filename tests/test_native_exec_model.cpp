@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
+#include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -638,6 +639,127 @@ static void test_negotiated_limits() {
     CHECK(kOptionalLimitCount == 9);
 }
 
+
+void test_layout_remap() {
+    // parseWgslGroup0Bindings: comments stripped, both attribute orders, usage filter, kinds.
+    const char* wgsl = R"(
+// @group(0) @binding(9) var<uniform> commented: vec4<f32>;
+@group(0) @binding(0) var<uniform> u: Params;
+@binding(1) @group(0) var<storage, read> ro: array<f32>;
+@group(0) @binding(2) var<storage, read_write> rw: array<f32>;
+@group(0) @binding(3) var smp: sampler;
+@group(0) @binding(4) var cmp: sampler_comparison;
+@group(0) @binding(5) var t2: texture_2d<f32>;
+@group(0) @binding(6) var tu: texture_2d_array<u32>;
+@group(0) @binding(7) var td: texture_depth_multisampled_2d;
+@group(0) @binding(8) var st: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(10) var unused: texture_cube<f32>;
+@group(1) @binding(0) var<uniform> other: Params;
+@vertex fn vs_main() -> @builtin(position) vec4<f32> {
+  let a = u.x + ro[0] + rw[0] + textureSample(t2, smp, vec2<f32>(0.0)).x;
+  let b = textureLoad(tu, vec2<i32>(0), 0, 0).x; let c = textureLoad(td, vec2<i32>(0), 0);
+  let d = textureSampleCompare(t2, cmp, vec2<f32>(0.0), 0.5); textureStore(st, vec3<i32>(0), vec4<f32>(0.0));
+  return vec4<f32>(0.0);
+})";
+    const auto b = parse_wgsl_group0_bindings(wgsl);
+    CHECK(b.size() == 9);
+    if (b.size() == 9) {
+        CHECK(b[0].binding == 0 && b[0].kind == WgslBindingKind::Uniform);
+        CHECK(b[1].kind == WgslBindingKind::ReadOnlyStorage);
+        CHECK(b[2].kind == WgslBindingKind::Storage);
+        CHECK(b[3].kind == WgslBindingKind::Sampler && !b[3].comparison);
+        CHECK(b[4].kind == WgslBindingKind::Sampler && b[4].comparison);
+        CHECK(b[5].kind == WgslBindingKind::Texture && b[5].view_dim == 2 && b[5].sample_type == WgslSampleType::Float);
+        CHECK(b[6].view_dim == 3 && b[6].sample_type == WgslSampleType::Uint);
+        CHECK(b[7].sample_type == WgslSampleType::Depth && b[7].multisampled);
+        CHECK(b[8].kind == WgslBindingKind::StorageTexture && b[8].view_dim == 6 && b[8].storage_format == "rgba16float");
+    }
+    // No function: every declaration counts (the worker's `hasFunction` false branch).
+    CHECK(parse_wgsl_group0_bindings("@group(0) @binding(3) var<uniform> z: vec4<f32>;").size() == 1);
+    CHECK(parse_wgsl_group0_bindings("@group(1) @binding(3) var<uniform> z: vec4<f32>;").empty());
+    CHECK(parse_wgsl_group0_bindings("").empty());
+    // A name used only as a member (`.u`) or inside another identifier is not a reference.
+    CHECK(parse_wgsl_group0_bindings("@group(0) @binding(0) var<uniform> u: P;\nfn f() { let a = x.u + uu + u_; }").empty());
+
+    // merge: vertex first, a fragment `storage` upgrades a vertex `read-only-storage`.
+    std::vector<WgslBinding> vs(2), fs(2);
+    vs[0].binding = 0; vs[0].kind = WgslBindingKind::ReadOnlyStorage;
+    vs[1].binding = 2; vs[1].kind = WgslBindingKind::Uniform;
+    fs[0].binding = 0; fs[0].kind = WgslBindingKind::Storage;
+    fs[1].binding = 1; fs[1].kind = WgslBindingKind::Sampler;
+    const auto m = merge_wgsl_group0_bindings(vs, fs);
+    CHECK(m.size() == 3 && m[0].binding == 0 && m[0].kind == WgslBindingKind::Storage && m[1].binding == 1);
+
+    // explicit layout compatibility
+    std::vector<WgslBinding> need(2);
+    need[0].binding = 0; need[0].kind = WgslBindingKind::ReadOnlyStorage;
+    need[1].binding = 1; need[1].kind = WgslBindingKind::Sampler;
+    std::vector<Group0LayoutEntry> have = {{0, 0, 1}, {1, 1, 0}};
+    CHECK(explicit_layout_compatible(&have, need));  // read-only-storage accepts a storage layout
+    have[0].subtype = 0;  // uniform
+    CHECK(!explicit_layout_compatible(&have, need));
+    CHECK(explicit_layout_compatible(nullptr, need));
+    CHECK(explicit_layout_compatible(&have, {}));
+    have = {{0, 0, 2}};
+    CHECK(!explicit_layout_compatible(&have, need));  // binding 1 missing
+
+    // texture sample types
+    CHECK(texture_sample_type(22, true) == WgslSampleType::Float);
+    CHECK(texture_sample_type(48, true) == WgslSampleType::Depth);
+    CHECK(texture_sample_type(25, true) == WgslSampleType::Uint);  // rgba8uint
+    CHECK(texture_sample_type(26, true) == WgslSampleType::Sint);  // rgba8sint
+    CHECK(texture_sample_type(44, true) == WgslSampleType::Uint);  // stencil8
+    CHECK(texture_sample_type(43, true) == WgslSampleType::Float && texture_sample_type(43, false) == WgslSampleType::UnfilterableFloat);
+
+    // picker: pass 0 prefers the exact kind, pass 1 relaxes buffers; dynamic offsets fold in.
+    std::vector<RemapResource> av(4);
+    av[0].binding = 5; av[0].kind = WgslBindingKind::Storage; av[0].buffer_usage = 0x80 | 0x40;
+    av[0].buffer_total = 1024;
+    av[1].binding = 6; av[1].kind = WgslBindingKind::Uniform; av[1].buffer_usage = 0x40;
+    av[1].buffer_total = 1024; av[1].buffer_offset = 16; av[1].buffer_size = 512;
+    av[1].has_dynamic_offset = true; av[1].dynamic_offset_index = 0;
+    av[2].binding = 7; av[2].kind = WgslBindingKind::Texture; av[2].format = 22; av[2].view_dim = 2; av[2].multisampled = false;
+    av[3].binding = 8; av[3].kind = WgslBindingKind::Sampler; av[3].comparison = false;
+    std::vector<uint32_t> dyn = {256};
+    RemapPicker pk(av, dyn, true);
+    WgslBinding wu; wu.kind = WgslBindingKind::Uniform;
+    PickResult r = pk.pick(wu);
+    CHECK(r.kind == PickResult::Kind::Resource && r.index == 1 && r.folded && r.offset == 16 + 256 && r.size == 512);
+    CHECK(!r.dyn_clamped);
+    WgslBinding wr; wr.kind = WgslBindingKind::ReadOnlyStorage;
+    r = pk.pick(wr);
+    CHECK(r.kind == PickResult::Kind::Resource && r.index == 0 && !r.folded);  // storage serves read-only
+    WgslBinding wt; wt.kind = WgslBindingKind::Texture; wt.sample_type = WgslSampleType::Depth;
+    CHECK(pk.pick(wt).kind == PickResult::Kind::Dummy);  // a float texture does not serve a depth binding
+    wt.sample_type = WgslSampleType::Float;
+    CHECK(pk.pick(wt).index == 2);
+    WgslBinding ws; ws.kind = WgslBindingKind::Sampler; ws.comparison = true;
+    CHECK(pk.pick(ws).kind == PickResult::Kind::FallbackSampler);  // comparison mismatch: default sampler
+    ws.comparison = false;
+    CHECK(pk.pick(ws).index == 3);
+    CHECK(pk.pick(wu).kind == PickResult::Kind::Dummy);  // all buffers used
+
+    // dynamic offset clamping and out-of-bounds
+    std::vector<RemapResource> one(1);
+    one[0].binding = 0; one[0].kind = WgslBindingKind::Uniform; one[0].buffer_usage = 0x40;
+    one[0].buffer_total = 300; one[0].buffer_size = 200;
+    one[0].has_dynamic_offset = true;
+    std::vector<uint32_t> d2 = {200};
+    RemapPicker p2(one, d2, true);
+    r = p2.pick(wu);
+    CHECK(r.folded && r.dyn_clamped && r.offset == 200 && r.size == 100);
+    std::vector<uint32_t> d3 = {300};
+    RemapPicker p3(one, d3, true);
+    r = p3.pick(wu);
+    CHECK(r.kind == PickResult::Kind::Dummy && r.dyn_oob);
+
+    // synthesized layout entries for dummies
+    WgslBinding sb; sb.kind = WgslBindingKind::StorageTexture; sb.storage_format = "r32float"; sb.view_dim = 2;
+    const SynthLayoutEntry se = synth_layout_entry(sb);
+    CHECK(se.kind == 3 && se.storage_format == format_code_by_name("r32float"));
+    CHECK(synth_layout_entry(wu).min_binding_size == 4096);
+}
+
 int main() {
     test_shader_payloads();
     test_pack();
@@ -655,6 +777,7 @@ int main() {
     test_readback_deliver();
     test_v1_vertex_layout();
     test_negotiated_limits();
+    test_layout_remap();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

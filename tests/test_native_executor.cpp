@@ -410,6 +410,56 @@ void test_compute(NativeExecutor& ex) {
     CHECK(ex.stats().device_errors == before.device_errors);
 }
 
+// An explicit layout that does not fit the WGSL (binding 0 in the layout, binding 3 in the shader) gets
+// layout:'auto' and the worker's group 0 remap: the buffer bound at 0 serves binding 3, with the
+// dynamic offset folded into the static offset.
+const char* kComputeBinding3 = R"(
+@group(0) @binding(3) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = i * 3u + 2u; }
+)";
+
+void test_auto_layout_remap(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(110, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 512);
+    setup.create_shader_module(111, GpuShaderStage::Compute, kComputeBinding3);
+    GpuBindGroupLayoutEntry le = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1);
+    le.flags = 1;  // hasDynamicOffset
+    create_layouts(setup, 112, 113, {le});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 114;
+    cp.cs_module_id = 111;
+    cp.pipeline_layout_id = 113;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::Buffer, 110);
+    be.size = 16;
+    create_bind_group(setup, 115, 112, {be});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(114);
+    std::vector<uint8_t> sb;
+    append(sb, GpuSetBindGroup2Payload{0, 115, 1, 0});
+    append(sb, uint32_t{256});
+    emit(frame, GpuOpcode::SetBindGroup2, sb);
+    frame.dispatch_compute(1, 1, 1);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(110, 256, 16, &out, &err));
+    const uint32_t want[4] = {2, 5, 8, 11};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.auto_layout_remap_pipelines == before.auto_layout_remap_pipelines + 1);
+    CHECK(s.remapped_bind_groups == before.remapped_bind_groups + 1);
+    CHECK(s.remap_dynamic_offsets == before.remap_dynamic_offsets + 1);
+    CHECK(s.device_errors == before.device_errors);
+}
+
 const char* kPackPath = "test_native_executor.wgsl.pack";
 
 void test_pack_and_formats(NativeExecutor& ex) {
@@ -849,6 +899,7 @@ int main() {
     test_buffers(*ex);
     test_textured_draw(*ex);
     test_compute(*ex);
+    test_auto_layout_remap(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
     test_readbacks(*ex);

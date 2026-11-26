@@ -114,11 +114,17 @@ Known divergences, to be closed or documented as they come up:
   order (features + limits, features only, bare), plus `timestamp-query` for the GPU pass timer (with
   Dawn's timestamp quantization toggle off: Chrome rounds timestamps to 100 us, the native table gets
   exact values).
-- A pipeline with `pipeline_layout_id == 0` ("auto") or whose explicit layout does not match the WGSL
-  `@group(0)` bindings gets Dawn's `layout: auto` without the worker's bind-group remap
-  (`_getOrCreateRemappedBindGroup`); `auto_layout_pipelines` counts the first case. Manifest layouts
-  (`layout-manifest.json`, flag `ManifestReference`) are unavailable, as in the replay page
-  (`manifest_layouts_unavailable`). The remap, the manifest layouts and the reflection loader stay open.
+- A pipeline whose explicit layout does not satisfy the statically referenced WGSL `@group(0)` bindings
+  gets Dawn's `layout: auto` plus the worker's group 0 bind-group remap (`layout_model.h`:
+  `parseWgslGroup0Bindings`, `isExplicitLayoutCompatibleWithWgsl`, the resource matching and dynamic
+  offset folding of `_getOrCreateRemappedBindGroup`, dummies, default samplers; applied while the pass
+  commands run, like `_preparePassCommandsForFlush`). Counted as `auto_layout_remap_pipelines`,
+  `remapped_bind_groups`, `remap_*`. Not ported: the PresentX plane bind-group cache (a cache only), the
+  async-compile retry with `layout:'auto'`, v1 `SetBindGroup` on a remapped pipeline, indirect draws
+  (the worker does not remap them either). `pipeline_layout_id == 0` pipelines are not remapped (as in the
+  worker); `auto_layout_pipelines` counts them. Manifest layouts (`layout-manifest.json`, flag
+  `ManifestReference`) are unavailable, as in the replay page (`manifest_layouts_unavailable`). The
+  manifest layouts, the reflection loader (`.reflect.json`) and the swapchain blit stay open.
 - v1 pipelines (`8`/`19`) and bind groups (`15`/`16`) take the worker's path for "no reflection registry
   loaded" (the replay page's and the producer's situation): layout `auto`, entry points `vs_main` /
   `fs_main` / `cs_main`, one `float32xN` attribute at location 0 for a non-zero stride, the canvas format
@@ -166,7 +172,8 @@ Known divergences, to be closed or documented as they come up:
 | `8`/`19` v1 pipelines, `15`/`16` v1 bind groups (the no-reflection path, see the divergences) | `_handleCreateRenderPipeline`, `_handleCreateComputePipeline`, `_handleCreateBindGroup` | **M2 (done)** |
 | `39`/`40` read-back into producer memory + completion counter, early read-back flush | `_recordReadbackCopy`, `_startRecordedReadbacks`, `_flushReadbacksNow` | **M2 (done)** |
 | GPU pass timestamps feeding `runtime/gpu/gpu_time` (#1608), `gpu_time` in the boot report | `gpu_timer.js` | **M2 (done)** |
-| `layout-manifest.json` layouts, the reflection loader, the layout:auto bind-group remap | `reflection_loader.js`, `_getOrCreateRemappedBindGroup` | M2b (open) |
+| the layout:auto bind-group remap | `_getOrCreateRemappedBindGroup`, `_preparePassCommandsForFlush` | **M2b (done)** |
+| `layout-manifest.json` layouts, the reflection loader | `reflection_loader.js` | M2b (open) |
 | `requestNegotiatedDevice` limit negotiation | `requestNegotiatedDevice` | **M2b (done)** |
 | Swapchain blit fallback | `wgpu_swapchain.js` | M2b (open) |
 | Live boot: `playgta6_boot --native-gpu [--window]`, present any target | `os::wgpu_submit` observer | M3 |
