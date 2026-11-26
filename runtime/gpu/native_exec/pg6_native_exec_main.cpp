@@ -173,13 +173,11 @@ int main(int argc, char** argv) {
                 std::ofstream po(path, std::ios::binary);
                 const std::vector<uint8_t> png = rgb.empty() ? std::vector<uint8_t>() : png_encode_rgb(rgb.data(), img.width, img.height);
                 if (png.empty() || !po.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()))) {
-                    std::fprintf(stderr, "pg6_native_exec: frame %llu: cannot write %s (format %s)
-",
+                    std::fprintf(stderr, "pg6_native_exec: frame %llu: cannot write %s (format %s)\n",
                                  static_cast<unsigned long long>(i), path.c_str(), img.format.c_str());
                     rc = 1;
                 } else {
-                    std::printf("dump frame %llu: %s
-", static_cast<unsigned long long>(i), path.c_str());
+                    std::printf("dump frame %llu: %s\n", static_cast<unsigned long long>(i), path.c_str());
                 }
             }
             if (!digest_at.count(i)) continue;
