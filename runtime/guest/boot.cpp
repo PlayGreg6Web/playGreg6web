@@ -1065,6 +1065,7 @@ void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t de
 }
 
 void log_trap();
+void log_fault_brief();
 void finish_report();
 
 [[noreturn]] void stop_boot() {
@@ -3101,6 +3102,45 @@ void log_trap() {
     }
 }
 
+// One compact "[fault-record] {...}" log line, emitted AFTER the report chunks: a browser run keeps only the
+// tail of the log (the HUD cap drops the head of the chunked report, which is where the fault lives), so
+// this line is what lets the runner name the fault (kind, function, import, unimplemented COM slot).
+void log_fault_brief() {
+    BootState& b = boot();
+    const FaultRecord& f = b.fault;
+    if (!f.present || !b.fault_record || !b.log_progress) {
+        return;
+    }
+    // The kind's first character is \u-escaped (still valid JSON): web/telemetry/boot_tracer.js turns any
+    // wasm-tagged line with the bare word "trap" (kind "trap") into a fatal WASM_TRAP, which would
+    // overwrite the real trap line.
+    char lead[8];
+    std::snprintf(lead, sizeof(lead), "\\u%04x",
+                  f.kind.empty() ? 0u : static_cast<unsigned>(static_cast<unsigned char>(f.kind[0])));
+    const std::string kind_json = "\"" + std::string(lead) + (f.kind.empty() ? std::string() : f.kind.substr(1)) + "\"";
+    std::string o = "{\"kind\": " + kind_json + ", \"va\": " + hex(f.va) + ", \"detail\": " + hex(f.detail) +
+                    ", \"rip\": " + (f.has_registers ? hex(f.registers.rip) : std::string("null")) +
+                    ", \"thread\": " + std::to_string(f.thread_id) +
+                    ", \"elapsed_ms\": " + std::to_string(f.elapsed_ms) +
+                    ", \"function\": " + function_json(f.va) + ", \"import\": ";
+    if (f.import_index >= 0) {
+        const ImportRecord& rec = b.imports[static_cast<size_t>(f.import_index)];
+        o += "{" + import_name_json(rec.import) + ", \"module\": " + json_string(b.modules[rec.module].name) + "}";
+    } else {
+        o += "null";
+    }
+    o += ", \"unimplemented_slot\": ";
+    const std::string slot = f.kind == "unimplemented_slot" ? com::last_unimplemented_slot_json() : std::string();
+    o += slot.empty() ? std::string("null") : slot;
+    o += ", \"callers\": [";
+    const size_t callers = std::min<size_t>(f.frames.size(), 4);
+    for (size_t i = 0; i < callers; ++i) {
+        o += (i == 0 ? "" : ", ") + code_location_json(f.frames[i].return_address);
+    }
+    o += "]}";
+    os::log("[fault-record] " + o);
+}
+
 void finish_report() {
     BootState& b = boot();
     t_observer.flush_indirect_targets();
@@ -3112,6 +3152,7 @@ void finish_report() {
     if (b.report_sink) {
         b.report_sink(b.last_report);
     }
+    log_fault_brief();
 }
 
 BootStats collect_stats() {

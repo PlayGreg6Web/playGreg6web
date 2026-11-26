@@ -90,6 +90,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
+import guest_symbols  # noqa: E402
 import clean_build_dirs  # noqa: E402
 import lift_cache  # noqa: E402
 
@@ -4531,6 +4532,35 @@ def build_warm_boot_summary(
     )
 
 
+FAULT_RECORD_PREFIX = "[fault-record] "
+HARD_STOPS_MD = Path(__file__).resolve().parent.parent / "docs" / "HARD_STOPS.md"
+
+
+def extract_fault_record(lines: Sequence[str] | None, hard_stops: str | None = None) -> dict[str, Any] | None:
+    """The newest `[fault-record] {json}` line the wasm runtime logs after the chunked boot report (the HUD
+    keeps only the log tail, so the report's own fault block is usually gone). Adds the docs/HARD_STOPS.md
+    status to an unimplemented COM slot, exactly like tools/run_native_boot.py."""
+    found: dict[str, Any] | None = None
+    for line in lines or ():
+        idx = str(line).find(FAULT_RECORD_PREFIX)
+        if idx < 0:
+            continue
+        try:
+            rec = json.loads(str(line)[idx + len(FAULT_RECORD_PREFIX):])
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("kind"):
+            found = rec
+    if found is None:
+        return None
+    slot = found.get("unimplemented_slot")
+    if isinstance(slot, dict) and hard_stops and isinstance(slot.get("slot"), int) and slot.get("interface"):
+        status = guest_symbols.hard_stop_status(hard_stops, slot["interface"], slot["slot"], slot.get("name"))
+        if status:
+            slot["hard_stop"] = status
+    return found
+
+
 def build_boot_report(
     session: BrowserSessionResult,
     *,
@@ -4630,6 +4660,25 @@ def build_boot_report(
             "function": None,
             "import": last_trap.get("import"),
         }
+    fault_record: dict[str, Any] | None = None
+    if fault is not None:
+        try:
+            hard_stops = HARD_STOPS_MD.read_text(encoding="utf-8")
+        except OSError:
+            hard_stops = None
+        hud_lines = hud.get("logLines") if isinstance(hud.get("logLines"), list) else []
+        fault_record = extract_fault_record([*session.console_lines, *hud_lines], hard_stops)
+    if fault is not None and fault_record is not None:
+        fault["kind"] = str(fault_record["kind"])
+        fault["function"] = fault_record.get("function")
+        fault["import"] = fault_record.get("import") or fault["import"]
+        if fault_record.get("va") is not None:
+            fault["va"] = fault_record["va"]
+        slot = fault_record.get("unimplemented_slot")
+        if isinstance(slot, dict):
+            fault["detail"] = sanitize_text(
+                f"unimplemented COM slot: {slot.get('interface')} slot {slot.get('slot')} {slot.get('name')}"
+            )
 
     boot_mode = str(boot_state.get("bootMode") or ("smoke-demo" if smoke else "idle"))
     phase = str(
@@ -4744,6 +4793,7 @@ def build_boot_report(
         "milestones": milestones,
         "first_calls": [],
         "fault": fault,
+        "fault_record": fault_record,
         "backtrace": {"method": "browser", "frames": []},
         "counters": {
             "import_calls": 0,

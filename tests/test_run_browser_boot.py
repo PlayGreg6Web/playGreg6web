@@ -4690,6 +4690,36 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
         self.assertEqual(cmp_res.failures(), [])
 
 
+class FaultRecordLineTests(unittest.TestCase):
+    """The wasm runtime logs `[fault-record] {json}` after the chunked report; the runner names the fault from it."""
+
+    SLOT = {"interface": "xgameruntime.XSystem", "guid": "g", "slot": 5, "name": "XSystemGetAppSpecificDeviceId"}
+    LINE = "[23:07:45][wasm] [fault-record] " + json.dumps(
+        {"kind": "unimplemented_slot", "va": "0x5047000000000040", "function": None, "import": None,
+         "unimplemented_slot": SLOT, "callers": []})
+
+    def _report(self, lines):
+        trap = {"seq": 1, "kind": "WASM_TRAP", "guestVa": "0x0", "dll": None, "symbol": None, "import": None,
+                "message": "[trap] INDIRECT_CALL_MISS at 0x0", "fatal": True}
+        probe = make_sample_probe(last_trap=trap, hud_log=lines)
+        return rbb.build_boot_report(make_fake_session_result(ok=False, status="fault", probe=probe),
+                                     smoke=False, preset="real")
+
+    def test_unimplemented_slot_is_named_with_hard_stop(self):
+        rep = self._report(["[boot-report 205/206] x", self.LINE, "[boot] off-thread guest fault captured"])
+        self.assertEqual(rep["fault"]["kind"], "unimplemented_slot")
+        self.assertIn("XSystemGetAppSpecificDeviceId", rep["fault"]["detail"])
+        slot = rep["fault_record"]["unimplemented_slot"]
+        self.assertEqual(slot["slot"], 5)
+        self.assertIn("Trapping stub", slot.get("hard_stop", ""))
+        self.assertEqual(rbb.guest_symbols.find_unimplemented(rep)["name"], "XSystemGetAppSpecificDeviceId")
+
+    def test_without_record_keeps_tracer_fault(self):
+        rep = self._report(["[boot-report 205/206] x"])
+        self.assertEqual(rep["fault"]["kind"], "WASM_TRAP")
+        self.assertIsNone(rep["fault_record"])
+
+
 class PlayLocalPresetParityTests(unittest.TestCase):
     def test_play_local_validate_set_matches_run_browser_boot_presets(self) -> None:
         text = (Path(__file__).resolve().parents[1] / "tools" / "play_local.ps1").read_text(encoding="utf-8")

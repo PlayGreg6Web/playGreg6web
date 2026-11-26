@@ -2451,6 +2451,12 @@ void test_fault_log_gprs_and_callers() {
         CHECK(fault_line.find(" caller=sub_140001100+0x20 callers=sub_140001100+0x20,sub_140001000+0x10") !=
               std::string::npos);
         CHECK(regs_line.rfind("[fault-regs] rax=0x", 0) == 0);
+        // The compact `[fault-record]` line comes after the report; the kind's first char is \u-escaped
+        // so web/telemetry/boot_tracer.js does not read the bare word "trap" as a wasm trap.
+        const std::string brief = find_log_line(logs, "[fault-record] ");
+        CHECK(brief.find("{\"kind\": \"\\u0074rap\"") != std::string::npos);
+        CHECK(brief.find("\"unimplemented_slot\": null") != std::string::npos);
+        CHECK(brief.find("\"callers\": [") != std::string::npos);
     }
 
     // 3. Off-thread trap: both `[fault]` and `[fault-regs]` must be flushed BEFORE `off_thread_fault` runs.
@@ -2487,6 +2493,7 @@ void test_fault_log_gprs_and_callers() {
         const std::string regs_line = find_log_line(flushed_before_hook, "[fault-regs] ");
         CHECK(!fault_line.empty());
         CHECK(!regs_line.empty());
+        CHECK(!find_log_line(flushed_before_hook, "[fault-record] ").empty());
         CHECK(fault_line.find(" target=0x140001184 fn=sub_140001180+0x4 thread=") != std::string::npos);
         CHECK(fault_line.find(" caller=sub_140001100+0x20 callers=sub_140001100+0x20,sub_140001000+0x10") !=
               std::string::npos);
