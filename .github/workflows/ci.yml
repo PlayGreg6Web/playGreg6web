@@ -58,6 +58,23 @@ jobs:
           cmake --build runtime/build-host --parallel
           ctest --test-dir runtime/build-host --output-on-failure
 
+  native-executor-windows:
+    name: Native Executor Build (Dawn, Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned Dawn + DXC prebuilts
+        uses: actions/cache@v4
+        with:
+          path: .fc-cache
+          key: fc-dawn-7435fd87c506-dxc-1.9.2609
+      - name: Configure (PLAYGTA6_NATIVE_EXECUTOR=ON)
+        run: cmake -S runtime -B build-native-exec -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_NATIVE_EXECUTOR=ON "-DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.fc-cache"
+      - name: Build boot harness, executor and model tests
+        run: cmake --build build-native-exec --config Release --parallel --target playgta6_boot pg6_native_exec test_native_executor test_native_exec_model
+      - name: Run GPU-free tests (GPU tests skip without an adapter)
+        run: ctest --test-dir build-native-exec -C Release --output-on-failure -R "test_native_exec"
+
   python-and-web:
     name: Server, Local Env & Web JS Checks
     runs-on: ubuntu-latest
