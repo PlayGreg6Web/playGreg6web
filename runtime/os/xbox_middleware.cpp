@@ -1830,21 +1830,6 @@ Pg6HResult pg6_mw_xapu_connect(const void* params, Pg6XApuHandle* handle) {
     if (handle == nullptr) {
         return gdk::E_INVALIDARG_HR;
     }
-    // PG6_AUDIO_TRACE=1: the first connect logs the raw bytes of the parameter struct (the field
-    // layout {streams, commands per stream, memory bytes, options} is an assumption, not seen).
-    static std::atomic<bool> logged{false};
-    const char* trace = std::getenv("PG6_AUDIO_TRACE");
-    if (params != nullptr && trace != nullptr && trace[0] == '1' && !logged.exchange(true)) {
-        const auto* b = static_cast<const uint8_t*>(params);
-        std::string hex;
-        char tmp[4];
-        for (int i = 0; i < 64; ++i) {
-            std::snprintf(tmp, sizeof(tmp), "%02x", b[i]);
-            hex += tmp;
-            if ((i & 3) == 3) hex += ' ';
-        }
-        std::fprintf(stderr, "xapu: XApuConnect params %p raw[64]: %s\n", params, hex.c_str());
-    }
     auto& g = mw::xapu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
     const uint64_t id = g.next_handle;

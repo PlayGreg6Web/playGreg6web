@@ -692,6 +692,26 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
     if (params == 0 || shared.is_null()) {
         return com::E_INVALIDARG_HR;
     }
+    // PG6_AUDIO_TRACE=1: the first connect logs the raw bytes of the parameter struct (the field
+    // layout {streams, commands per stream, memory bytes, options} is an assumption, not seen).
+    {
+        static std::atomic<bool> logged{false};
+        const char* trace = std::getenv("PG6_AUDIO_TRACE");
+        if (trace != nullptr && trace[0] == '1' && !logged.exchange(true)) {
+            uint8_t b[64] = {};
+            if (com::read_guest(params, b, sizeof(b))) {
+                std::string hex;
+                char tmp[4];
+                for (size_t i = 0; i < sizeof(b); ++i) {
+                    std::snprintf(tmp, sizeof(tmp), "%02x", b[i]);
+                    hex += tmp;
+                    if ((i & 3) == 3) hex += ' ';
+                }
+                std::fprintf(stderr, "xapu: XApuConnect params 0x%" PRIx64 " len %zu raw: %s\n",
+                             params, sizeof(b), hex.c_str());
+            }
+        }
+    }
     const uint64_t handle = com::guest_alloc(64);
     const XApuConnectParams cp = parse_connect_params(params);
     const uint64_t memory = alloc_zeroed(cp.memory_bytes);
