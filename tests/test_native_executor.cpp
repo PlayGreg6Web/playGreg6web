@@ -1731,6 +1731,120 @@ void test_show_target_bad_option() {
     CHECK(error.find("--show-target") != std::string::npos);
 }
 
+// Device loss (simulated with Device::ForceLoss): the executor rebuilds adapter / device and the journaled
+// resources (buffer + texture contents come back byte for byte), drops only the frame under construction,
+// keeps presenting, and counts it; where it cannot rebuild it ends the run with a fault record.
+void test_device_loss() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    CHECK(ex != nullptr);
+    if (!ex) return;
+    std::vector<uint8_t> tex(4 * 4 * 4);
+    for (size_t i = 0; i < tex.size(); ++i) tex[i] = static_cast<uint8_t>(i * 7 + 3);
+    const uint8_t bdata[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    gpu::CommandEncoder setup;
+    setup.create_buffer(21, GpuBufferUsage::CopySrc | GpuBufferUsage::CopyDst, 16);
+    setup.write_buffer(21, 0, bdata, 8);
+    setup.write_buffer(21, 0, bdata, 8);  // the same range again: one journal entry
+    setup.create_buffer(22, GpuBufferUsage::CopySrc | GpuBufferUsage::CopyDst, 16);
+    setup.write_buffer(22, 0, bdata, 8);
+    setup.destroy_resource(22);  // pruned from the journal: must not come back
+    setup.create_texture(23, 4, 4, 1, 1, GpuTextureFormat::Rgba8Unorm,
+                         GpuTextureUsage::CopySrc | GpuTextureUsage::CopyDst | GpuTextureUsage::TextureBinding);
+    setup.write_texture(23, 0, 0, 0, 0, 4, 4, 1, 16, 4, tex.data(), static_cast<uint32_t>(tex.size()));
+    run(*ex, setup);
+    gpu::CommandEncoder red;
+    red.begin_frame();
+    red.clear_color(1.f, 0.f, 0.f, 1.f);
+    red.present();
+    CHECK(run(*ex, red) == 1);
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+
+    ex->debug_force_device_lost("simulated driver reset");
+    CHECK(ex->stats().device_lost_events == 1);
+    // A frame under construction is dropped; the next whole frame presents again.
+    gpu::CommandEncoder partial;
+    partial.begin_frame();
+    partial.clear_color(0.f, 1.f, 0.f, 1.f);
+    run(*ex, partial);
+    CHECK(ex->stats().recoveries == 1);
+    CHECK(ex->stats().recovery_failures == 0 && !ex->faulted());
+    CHECK(ex->stats().recovery_replayed_packets >= 4);
+    CHECK(ex->stats().recovery_replay_errors == 0);
+    gpu::CommandEncoder rest;
+    rest.present();
+    run(*ex, rest);  // the loss was found between frames: nothing was lost with it, this frame presents
+    CHECK(ex->stats().recovery_frames_dropped == 0);
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));
+    gpu::CommandEncoder green;
+    green.begin_frame();
+    green.clear_color(0.f, 1.f, 0.f, 1.f);
+    green.present();
+    CHECK(run(*ex, green) == 1);
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));
+    std::vector<uint8_t> got;
+    std::string err;
+    CHECK(ex->read_buffer(21, 0, 8, &got, &err) && got == std::vector<uint8_t>(bdata, bdata + 8));
+    CHECK(!ex->read_buffer(22, 0, 8, &got, &err));
+    uint32_t tw = 0, th = 0;
+    CHECK(ex->read_texture(23, 0, &got, &tw, &th, &err) && tw == 4 && th == 4 && got == tex);
+
+    // A loss while draw commands are queued: that frame is dropped (counted), later frames are fine.
+    gpu::CommandEncoder queued;
+    queued.begin_frame();
+    GpuBeginRenderPassPayload bp = swapchain_pass(GpuLoadOp::Clear, 0.f, 0.f, 1.f, 1.f);
+    queued.emit_packet(GpuOpcode::BeginRenderPass, &bp, sizeof bp);
+    queued.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    run(*ex, queued);
+    ex->debug_force_device_lost("second reset");
+    gpu::CommandEncoder present_only;
+    present_only.present();
+    run(*ex, present_only);
+    CHECK(ex->stats().recoveries == 2);
+    CHECK(ex->stats().recovery_frames_dropped == 1);
+    CHECK(run(*ex, green) == 1);
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));
+    CHECK(ex->read_buffer(21, 0, 8, &got, &err) && got == std::vector<uint8_t>(bdata, bdata + 8));
+    CHECK(ex->stats_json().find("\"recoveries\": 2") != std::string::npos);
+    CHECK(ex->stats_json().find("fault_record") == std::string::npos);
+
+    // Without a journal nothing can be rebuilt: a clean end with a fault record, no crash.
+    ExecutorOptions nj = opts;
+    nj.recovery_journal_bytes = 0;
+    auto ex2 = NativeExecutor::create(nj, &status, &error);
+    CHECK(ex2 != nullptr);
+    if (!ex2) return;
+    CHECK(run(*ex2, red) == 1);
+    ex2->debug_force_device_lost("simulated gpu removal");
+    CHECK(run(*ex2, red) == 0);
+    CHECK(ex2->faulted());
+    CHECK(!ex2->poll());
+    CHECK(ex2->stats().recovery_failures == 1 && ex2->stats().recoveries == 0);
+    const std::string js = ex2->stats_json();
+    CHECK(js.find("\"fault_record\": {\"kind\": \"gpu_device_lost\"") != std::string::npos);
+    CHECK(js.find("simulated gpu removal") != std::string::npos);
+    CHECK(ex2->stats().dropped_while_lost >= 1);
+
+    // A journal over its budget cannot rebuild either.
+    ExecutorOptions small = opts;
+    small.recovery_journal_bytes = 64;
+    auto ex3 = NativeExecutor::create(small, &status, &error);
+    CHECK(ex3 != nullptr);
+    if (!ex3) return;
+    gpu::CommandEncoder big;
+    big.create_buffer(1, GpuBufferUsage::CopyDst, 256);
+    std::vector<uint8_t> blob(200, 9);
+    big.write_buffer(1, 0, blob.data(), 200);
+    run(*ex3, big);
+    CHECK(ex3->stats().journal_overflows >= 1);
+    ex3->debug_force_device_lost("reset");
+    CHECK(run(*ex3, red) == 0 && ex3->faulted());
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
