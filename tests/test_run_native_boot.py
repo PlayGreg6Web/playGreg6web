@@ -465,20 +465,21 @@ class RunTests(unittest.TestCase):
         self.assertEqual(rnb.PRESETS["menu-to-ingame"]["max_ms"], 900_000)
         script = rnb.input_script_text(900_000, "menu-to-ingame")
         lines = [x.strip() for x in script.splitlines() if x.strip() and not x.startswith("#")]
-        i = lines.index("repeat every 14s until draws_per_frame==37 for 1500ms timeout 240s")
+        i = lines.index("repeat every 14s until draws_per_frame==37 for 500ms timeout 240s")
         self.assertEqual(lines[i + 1:i + 3], ["0 A 100", "end"])
-        self.assertEqual(lines[i + 3:i + 10],
-                         ["repeat every 8s until draws_per_frame!=37 for 2s timeout 120s",
-                          "0 DDown 150", "1500 DDown 150", "3500 A 100", "end", "capture",
-                          "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s"])
-        after = lines[i + 10:]
-        self.assertEqual(after[:4], ["0 A 600", "2500 Menu 150", "4500 A 100", "end"])
-        tail = [line.split() for line in after[4:]]
-        self.assertEqual([e[1] for e in tail[:4]], ["A"] * 4)
-        self.assertIn("Up+RT", {e[1] for e in tail})
-        times = [int(e[0]) for e in tail]
-        self.assertEqual(times, sorted(times))
-        self.assertLess(times[-1], 900_000)
+        # No A between reaching LEGAL NOTICES and Down, Down, A: a plain wait, B only while not 37.
+        self.assertEqual(lines[i + 3:i + 11],
+                         ["wait draws_per_frame==37 for 2s timeout 30s",
+                          "repeat every 3s until draws_per_frame==37 for 1s timeout 30s", "0 B 150", "end",
+                          "500 DDown 150", "1200 DDown 150", "1900 A 100",
+                          "wait draws_per_frame!=37 for 2s timeout 60s"])
+        self.assertEqual(lines[i + 11], "capture")
+        after = lines[i + 12:]
+        self.assertEqual(after[:5], ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+                                     "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
+        self.assertTrue(after[5].startswith("repeat every 12s until presents>="))
+        self.assertIn("7000 Up+RT 1000", after)
+        self.assertEqual(after[-1], "end")
 
     def test_logged_input_times_and_wait_line(self):
         log = ("[harness] input script x: 12 event(s)\n"

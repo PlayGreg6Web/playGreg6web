@@ -394,26 +394,25 @@ def _viewer_round() -> list[tuple[int, str, int]]:
 
 
 def menu_to_ingame_script_text(duration_ms: int) -> str:
-    """The menu-to-ingame preset: A to LEGAL NOTICES (37 draws/frame, steady 1.5 s), then D-pad Down x2 + A
-    on its "Next >" every 8 s until the screen leaves 37 draws/frame (R40 run: the wait was met at
-    194 s and the screen then stayed on LEGAL NOTICES with Copyright selected, so this is not yet
-    enough), then the steps of the browser preset of the same name (web/input/input_bridge.js, #1228): a
-    hold-A (600 ms) / Menu skip + A, repeated every 15 s until the screen leaves 34 draws/frame (steady 3 s,
-    120 s timeout); A every 2.5 s x4; then every 12 s A, left stick forward, right stick, LT, RT."""
+    """The menu-to-ingame preset: A (every 14 s) to LEGAL NOTICES (37 draws/frame), then a plain wait until it
+    is steady (no A may go out there: a round-start A opened Copyright and the R40 run stayed in the
+    viewer to 900 s); B every 3 s only while the screen is not 37 (a document viewer that got opened
+    closes); then D-pad Down, Down, A on "Next >" with short gaps and a wait until 37 is left. After that
+    everything is screen-synced: the browser preset's skip / confirm round (A hold, Menu, A) until the
+    screen leaves 34 draws/frame, then the movement round (A, left stick forward, right stick, LT, RT)
+    every 12 s until the time limit."""
     lines = ["# menu-to-ingame (tools/run_native_boot.py): A to LEGAL NOTICES (" + LEGAL_SCREEN + " draws/frame),",
-             "# Down, Down, A on its \"Next >\" until it is left; then the browser",
-             "# menu-to-ingame skip / confirm / movement phases"]
+             "# wait (no A), B if a viewer is open, Down, Down, A on \"Next >\", then screen-synced rounds"]
     lines += _lines([(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)])
-    lines += [f"repeat every 14s until draws_per_frame=={LEGAL_SCREEN} for 1500ms timeout 240s", "  0 A 100", "end",
-              f"repeat every 8s until draws_per_frame!={LEGAL_SCREEN} for 2s timeout 120s",
-              "  0 DDown 150", "  1500 DDown 150", "  3500 A 100", "end", "capture"]
+    lines += [f"repeat every 14s until draws_per_frame=={LEGAL_SCREEN} for 500ms timeout 240s", "  0 A 100", "end",
+              f"wait draws_per_frame=={LEGAL_SCREEN} for 2s timeout 30s",
+              f"repeat every 3s until draws_per_frame=={LEGAL_SCREEN} for 1s timeout 30s", "  0 B 150", "end",
+              "500 DDown 150", "1200 DDown 150", "1900 A 100",
+              f"wait draws_per_frame!={LEGAL_SCREEN} for 2s timeout 60s", "capture"]
     lines += ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
-              "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end"]
-    events: list[tuple[int, str, int]] = [(t, "A", INPUT_HOLD_MS) for t in range(1_000, 11_000, 2_500)]
-    for t in range(12_000, duration_ms, 12_000):
-        events += [(t, "A", INPUT_HOLD_MS), (t + 1_500, "Up", 1_500), (t + 3_500, "RRight", 1_200),
-                   (t + 5_500, "LT", 1_000), (t + 7_000, "Up+RT", 1_000)]
-    lines += _lines(events, duration_ms)
+              "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end",
+              "repeat every 12s until presents>=999999999 timeout 800s",
+              "  0 A 100", "  1500 Up 1500", "  3500 RRight 1200", "  5500 LT 1000", "  7000 Up+RT 1000", "end"]
     return "\n".join(lines) + "\n"
 
 
