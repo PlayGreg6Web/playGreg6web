@@ -188,8 +188,9 @@ class CompileTests(unittest.TestCase):
             runner = FakeRunner()
             unit = nb.Unit("shard-00000", Path("0.ll"), None)
             keys = {nb.cache_key(unit, self._cfg(root, runner, **kw), b"ir") for kw in
-                    ({}, {"opt_level": "2"}, {"triple": "x86_64-unknown-linux-gnu"})}
-            self.assertEqual(len(keys), 3)
+                    ({}, {"opt_level": "2"}, {"opt_level": "t"}, {"opt_level": "f"},
+                     {"triple": "x86_64-unknown-linux-gnu"})}
+            self.assertEqual(len(keys), 5)
     def _cfg(self, root: Path, runner: FakeRunner, **kw) -> nb.CompileConfig:
         tools = nb.find_llvm_tools(fake_tools(root), runner)
         return nb.CompileConfig(
@@ -247,6 +248,7 @@ class CompileTests(unittest.TestCase):
             self.assertEqual(len(llc_calls), 7)
             # opt reads the retargeted IR from stdin.
             self.assertTrue(all(c[0][1:3] == ["-O1", "-"] for c in opt_calls))
+            self.assertTrue(all("-O1" in c[0] for c in llc_calls))
             stdin = opt_calls[0][1].decode()
             self.assertIn('target triple = "x86_64-pc-windows-msvc"', stdin)
             self.assertNotIn("wasm64", stdin)

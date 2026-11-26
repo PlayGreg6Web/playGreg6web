@@ -45,7 +45,7 @@ the least recently used entries are removed until the cache fits `--cache-max-gb
 
 Pure Python 3 standard library. Usage:
 
-    python tools/build_native_boot.py <recomp-out>/<module> [--out <dir>] [-O 1] [--jobs N]
+    python tools/build_native_boot.py <recomp-out>/<module> [--out <dir>] [-O t|f|0..3] [--jobs N]
         [--cpu x86-64-v3] [--triple <t>] [--llvm-bin <dir>] [--cache-dir <dir>] [--sample N]
         [--cache-max-gb N] [--delete-ir] [--no-link] [--debug-info] [--keep-going] [--json]
     python tools/build_native_boot.py --cache-trim [--cache-dir <dir>] [--cache-max-gb N]
@@ -81,7 +81,14 @@ SCHEMA_VERSION = 1
 RETARGET_VERSION = 2
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NATIVE_DEFAULT_CPU = "x86-64-v3"
-DEFAULT_OPT_LEVEL = "1"
+# "t" (tuned, the default): the lifter's IR is per-register allocas, so opt only needs the passes that
+# turn them into SSA and clean up (sroa, early-cse, instcombine, simplifycfg: ~10x faster than `opt -O1`,
+# same object size) and llc runs at -O1. "f" (fast): "t" plus llc -fast-isel -regalloc=basic (about
+# half the llc time again, objects ~15% larger; for throwaway local builds). "0".."3": plain
+# `opt -O<n>` + `llc -O<n>`.
+DEFAULT_OPT_LEVEL = "t"
+TUNED_OPT_PASSES = "-passes=sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg"
+FAST_CODEGEN_FLAGS = ("-fast-isel", "-regalloc=basic")
 WINDOWS_HARNESS_BASE = "0x7E0000000000"
 HARNESS_TARGET = "playgta6_boot_guest"
 HARNESS_OUTPUT = "playgta6_boot"
@@ -627,7 +634,8 @@ def _compile_locked(
     token = secrets.token_hex(6)
     bc = cfg.cache_dir / f"{key}.{token}{TMP_MARK}.bc"
     tmp_obj = cfg.cache_dir / f"{key}.{token}{TMP_MARK}{cfg.obj_suffix}"
-    opt = runner([str(cfg.tools.opt), f"-O{cfg.opt_level}", "-", "-o", str(bc)], text.encode("utf-8"))
+    opt_flag = TUNED_OPT_PASSES if cfg.opt_level in ("t", "f") else f"-O{cfg.opt_level}"
+    opt = runner([str(cfg.tools.opt), opt_flag, "-", "-o", str(bc)], text.encode("utf-8"))
     del text
     if opt.returncode != 0:
         return _failed(unit, cfg, start, "opt", opt, bc, tmp_obj)
@@ -635,9 +643,11 @@ def _compile_locked(
         str(cfg.tools.llc),
         f"-mtriple={cfg.triple}",
         f"-mcpu={cfg.cpu}",
-        f"-O{cfg.opt_level}",
+        "-O1" if cfg.opt_level in ("t", "f") else f"-O{cfg.opt_level}",
         "-filetype=obj",
     ]
+    if cfg.opt_level == "f":
+        llc_argv.extend(FAST_CODEGEN_FLAGS)
     if cfg.pic:
         llc_argv.append("-relocation-model=pic")
     llc = runner(llc_argv + [str(bc), "-o", str(tmp_obj)], None)
@@ -1076,7 +1086,9 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
         help="<recomp-out>/<module> of `build`, or the <out> directory of `build-program`",
     )
     parser.add_argument("--out", type=Path, help="output directory (default <input-dir>/native)")
-    parser.add_argument("-O", dest="opt_level", default=DEFAULT_OPT_LEVEL, choices=["0", "1", "2", "3"])
+    parser.add_argument("-O", dest="opt_level", default=DEFAULT_OPT_LEVEL, choices=["t", "f", "0", "1", "2", "3"],
+                        help="t = tuned pass list + llc -O1 (default), f = t with fast-isel/basic regalloc, "
+                        "0-3 = opt/llc -O<n>")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--cpu", default=NATIVE_DEFAULT_CPU)
     parser.add_argument("--triple", default=None, help="default: the build's native triple or the host's")
