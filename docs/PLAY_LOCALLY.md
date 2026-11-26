@@ -48,8 +48,8 @@ A connected XInput pad also gets the game's rumble.
 **Screenshots:** F12 saves the presented frame as a PNG; `--screenshot-at` does it at a chosen time in scripted runs.
 
 **Saves tools:** `python tools/saves.py list|export|import` lists native saves or moves them as a zip (format in
-[SAVE_ZIP_FORMAT.md](SAVE_ZIP_FORMAT.md)); native saves live in `%LOCALAPPDATA%\playgta6\saves`, so pass
-`--root` to point it there. `python tools/disk_report.py` is a read-only report of what `pg6*` dirs and `work/` use
+[SAVE_ZIP_FORMAT.md](SAVE_ZIP_FORMAT.md)); it reads `%LOCALAPPDATA%\playgta6\saves` by default (older builds used `...\playgta6web\saves`;
+`saves.py migrate --from <old> --to <new>` copies them over). `python tools/disk_report.py` is a read-only report of what `pg6*` dirs and `work/` use
 (it never deletes).
 
 **Useful switches:** `-PresentMode auto|fifo|mailbox|immediate`, `-MaxFps N` (cap the window present rate, 0 = off),

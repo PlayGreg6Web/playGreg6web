@@ -5,11 +5,15 @@ On-disk layout (runtime/os/xgamesave_local.cpp):
   <root>/<config-id>/local/c-<container>/b-<blob>       blob bytes
   <root>/<config-id>/local/c-<container>/.display-name  optional UTF-8 text
 Names use the store encoding: [a-z0-9_-] stay, 'A'-'Z' -> '^a'-'^z', others -> %XX.
-<root> defaults to %LOCALAPPDATA%\\playgta6web\\saves. The zip format is in docs/SAVE_ZIP_FORMAT.md.
+<root> defaults to %LOCALAPPDATA%\\playgta6\\saves (the native runtime's default; ~/Library/Application
+Support/playgta6/saves, $XDG_DATA_HOME or ~/.local/share/playgta6/saves elsewhere). list/export fall back
+to the legacy %LOCALAPPDATA%\\playgta6web\\saves when the canonical root has no saves (and say so).
+The zip format is in docs/SAVE_ZIP_FORMAT.md.
 
   saves.py list   [--root DIR]
   saves.py export OUT.zip [--root DIR] [--config-id ID] [--force]
   saves.py import IN.zip  [--root DIR] [--config-id ID] [--force] [--dry-run]
+  saves.py migrate --from OLD --to NEW [--force] [--dry-run]   (copies, verifies, never deletes OLD)
 
 Only c-*/b-*/.display-name files are ever read or written. Import validates the whole zip first,
 refuses to overwrite anything without --force, and swaps each container in atomically.
@@ -91,17 +95,41 @@ def valid_name(name, max_bytes):
     return len(encode(name)) <= MAX_ENCODED
 
 
-def default_root():
+def _app_data_base():
     if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA")
-    elif sys.platform == "darwin":
+        return os.environ.get("LOCALAPPDATA")
+    if sys.platform == "darwin":
         h = os.environ.get("HOME")
-        base = h and os.path.join(h, "Library", "Application Support")
-    else:
-        base = os.environ.get("XDG_DATA_HOME")
-        if not base and os.environ.get("HOME"):
-            base = os.path.join(os.environ["HOME"], ".local", "share")
-    return os.path.join(base, "playgta6web", "saves") if base else "pg6-saves"
+        return h and os.path.join(h, "Library", "Application Support")
+    base = os.environ.get("XDG_DATA_HOME")
+    if not base and os.environ.get("HOME"):
+        base = os.path.join(os.environ["HOME"], ".local", "share")
+    return base
+
+
+def default_root():
+    """Canonical save root; must match default_save_dir() in runtime/os/xgamesave_local.cpp."""
+    base = _app_data_base()
+    return os.path.join(base, "playgta6", "saves") if base else "pg6-saves"
+
+
+def legacy_root():
+    """Old default (#1811 / early runtime builds); only ever read, or the source of `migrate`."""
+    base = _app_data_base()
+    return os.path.join(base, "playgta6web", "saves") if base else None
+
+
+def resolve_root(explicit, fallback=True):
+    """--root wins; else the canonical root, or the legacy one when only that holds saves."""
+    if explicit:
+        return explicit
+    root = default_root()
+    legacy = legacy_root()
+    if fallback and legacy and not scan(root) and scan(legacy):
+        print("note: no saves under %s; using legacy location %s (see `saves.py migrate`)" % (root, legacy),
+              file=sys.stderr)
+        return legacy
+    return root
 
 
 def _iso(ts):
@@ -161,6 +189,7 @@ def scan(root, config_id=None):
 
 
 def cmd_list(args):
+    args.root = resolve_root(args.root)
     titles = scan(args.root)
     if not titles:
         print("no saves under %s" % args.root)
@@ -176,6 +205,7 @@ def cmd_list(args):
 
 
 def cmd_export(args):
+    args.root = resolve_root(args.root)
     titles = scan(args.root, args.config_id)
     if not titles:
         raise SaveError("nothing to export under %s" % args.root)
@@ -332,13 +362,45 @@ def _title_used(local):
     return sum(_container_bytes(os.path.join(local, cd)) for cd in os.listdir(local) if cd.startswith("c-"))
 
 
+def _install(root, cfg, name, disp, blobs):
+    """Atomically (re)place one container under root."""
+    local = os.path.join(root, encode(cfg), "local")
+    os.makedirs(local, exist_ok=True)
+    base = "c-" + encode(name)
+    _counter[0] += 1
+    tag = "-%d%d" % (os.getpid(), _counter[0])
+    fresh = os.path.join(local, ".new-" + base + tag)  # same names the runtime's crash recovery knows
+    aside = os.path.join(local, ".old-" + base + tag)
+    dest = os.path.join(local, base)
+    shutil.rmtree(fresh, ignore_errors=True)
+    os.mkdir(fresh)
+    try:
+        for bn, data in blobs.items():
+            _write_file(os.path.join(fresh, "b-" + encode(bn)), data)
+        if disp:
+            _write_file(os.path.join(fresh, DISPLAY_FILE), disp.encode("utf-8"))
+        had = os.path.isdir(dest)
+        if had:
+            os.rename(dest, aside)
+        try:
+            os.rename(fresh, dest)
+        except OSError:
+            if had:
+                os.rename(aside, dest)
+            raise
+        if had:
+            shutil.rmtree(aside, ignore_errors=True)
+    finally:
+        shutil.rmtree(fresh, ignore_errors=True)
+
+
 def cmd_import(args):
     items = read_zip(args.zip)
     if args.config_id is not None:
         items = [i for i in items if i[0] == args.config_id]
     if not items:
         raise SaveError("no matching containers in %s" % args.zip)
-    root = args.root
+    root = args.root = resolve_root(args.root, fallback=False)
 
     def dest_of(cfg, name):
         return os.path.join(root, encode(cfg), "local", "c-" + encode(name))
@@ -358,35 +420,41 @@ def cmd_import(args):
             print("would import %s/%s (%d blobs)%s" % (c, n, len(bl), " [replace]" if (c, n) in conflicts else ""))
         return 0
     for cfg, name, disp, blobs in items:
-        local = os.path.join(root, encode(cfg), "local")
-        os.makedirs(local, exist_ok=True)
-        base = "c-" + encode(name)
-        _counter[0] += 1
-        tag = "-%d%d" % (os.getpid(), _counter[0])
-        fresh = os.path.join(local, ".new-" + base + tag)  # same names the runtime's crash recovery knows
-        aside = os.path.join(local, ".old-" + base + tag)
-        dest = os.path.join(local, base)
-        shutil.rmtree(fresh, ignore_errors=True)
-        os.mkdir(fresh)
-        try:
-            for bn, data in blobs.items():
-                _write_file(os.path.join(fresh, "b-" + encode(bn)), data)
-            if disp:
-                _write_file(os.path.join(fresh, DISPLAY_FILE), disp.encode("utf-8"))
-            had = os.path.isdir(dest)
-            if had:
-                os.rename(dest, aside)
-            try:
-                os.rename(fresh, dest)
-            except OSError:
-                if had:
-                    os.rename(aside, dest)
-                raise
-            if had:
-                shutil.rmtree(aside, ignore_errors=True)
-        finally:
-            shutil.rmtree(fresh, ignore_errors=True)
+        _install(root, cfg, name, disp, blobs)
         print("imported %s/%s (%d blobs)" % (cfg, name, len(blobs)))
+    return 0
+
+
+def cmd_migrate(args):
+    src, dst = args.src, args.dst
+    if os.path.abspath(src) == os.path.abspath(dst):
+        raise SaveError("--from and --to are the same directory")
+    titles = scan(src)
+    if not titles:
+        raise SaveError("no saves under %s" % src)
+    done = skipped = 0
+    for t in titles:
+        for c in t["containers"]:
+            dest = os.path.join(dst, t["dir"], "local", "c-" + encode(c["name"]))
+            if os.path.exists(dest) and not args.force:
+                print("skip %s/%s (exists in %s; use --force to replace)" % (t["config_id"], c["name"], dst))
+                skipped += 1
+                continue
+            blobs = {}
+            for b in c["blobs"]:
+                with open(b["path"], "rb") as fh:
+                    blobs[b["name"]] = fh.read()
+            if args.dry_run:
+                print("would copy %s/%s (%d blobs)" % (t["config_id"], c["name"], len(blobs)))
+                continue
+            _install(dst, t["config_id"], c["name"], c["display_name"], blobs)
+            for bn, data in blobs.items():  # verify what landed on disk
+                with open(os.path.join(dest, "b-" + encode(bn)), "rb") as fh:
+                    if _sha(fh.read()) != _sha(data):
+                        raise SaveError("verification failed for %s/%s/%s" % (t["config_id"], c["name"], bn))
+            print("copied %s/%s (%d blobs, verified)" % (t["config_id"], c["name"], len(blobs)))
+            done += 1
+    print("%d copied, %d skipped; %s was left untouched" % (done, skipped, src))
     return 0
 
 
@@ -395,7 +463,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("list", "export", "import"):
         s = sub.add_parser(name)
-        s.add_argument("--root", default=default_root())
+        s.add_argument("--root", default=None, help="save root (default: %s)" % default_root())
         if name == "export":
             s.add_argument("out")
             s.add_argument("--config-id")
@@ -405,9 +473,14 @@ def main(argv=None):
             s.add_argument("--config-id")
             s.add_argument("--force", action="store_true")
             s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("migrate", help="copy saves from one root to another (never deletes the source)")
+    s.add_argument("--from", dest="src", required=True)
+    s.add_argument("--to", dest="dst", required=True)
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     try:
-        return {"list": cmd_list, "export": cmd_export, "import": cmd_import}[args.cmd](args)
+        return {"list": cmd_list, "export": cmd_export, "import": cmd_import, "migrate": cmd_migrate}[args.cmd](args)
     except SaveError as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

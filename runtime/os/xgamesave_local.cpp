@@ -292,7 +292,7 @@ std::string default_save_dir() {
     if (base.empty()) {
         return "pg6-saves";
     }
-    return (fs::path(base) / "playgta6web" / "saves").string();
+    return (fs::path(base) / "playgta6" / "saves").string();
 #endif
 }
 

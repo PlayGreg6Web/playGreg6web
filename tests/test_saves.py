@@ -138,6 +138,31 @@ class Saves(unittest.TestCase):
         self.run_main("export", self.zip, "--root", self.a)
         self.assertEqual(self.run_main("export", self.zip, "--root", self.a), 1)
 
+    def test_default_root_is_canonical(self):
+        self.assertEqual(os.path.basename(os.path.dirname(saves.default_root())), "playgta6")
+        self.assertEqual(os.path.basename(os.path.dirname(saves.legacy_root())), "playgta6web")
+
+    def test_legacy_fallback_and_migrate(self):
+        base = os.path.join(self.tmp.name, "appdata")
+        env = {"LOCALAPPDATA": base, "XDG_DATA_HOME": base, "HOME": base}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            legacy = saves.legacy_root()
+            make(legacy, "T", "s1", {"d": b"abc"}, "Disp")
+            self.assertEqual(saves.resolve_root(None), legacy)
+            self.assertEqual(self.run_main("migrate", "--from", legacy, "--to", saves.default_root()), 0)
+            self.assertEqual(saves.resolve_root(None), saves.default_root())
+            self.assertTrue(saves.scan(legacy))  # source untouched
+            self.assertEqual(saves.scan(saves.default_root())[0]["containers"][0]["display_name"], "Disp")
+            self.assertEqual(self.run_main("migrate", "--from", legacy, "--to", saves.default_root()), 0)  # skips
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_list(self):
         self.assertEqual(self.run_main("list", "--root", self.a), 0)
 

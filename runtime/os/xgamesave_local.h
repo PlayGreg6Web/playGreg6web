@@ -40,8 +40,8 @@ inline constexpr uint64_t kMaxUpdateBytes = kMaxBlobBytes;
 inline constexpr size_t kMaxDisplayNameChars = 255;
 
 // Host directory that holds all saves. Default: a stable directory outside the run dir, under the
-// user's app data (%LOCALAPPDATA%\playgta6web\saves, ~/Library/Application Support/playgta6web/saves,
-// $XDG_DATA_HOME or ~/.local/share/playgta6web/saves); "pg6-saves" in the browser build or when no
+// user's app data (%LOCALAPPDATA%\playgta6\saves, ~/Library/Application Support/playgta6/saves,
+// $XDG_DATA_HOME or ~/.local/share/playgta6/saves); "pg6-saves" in the browser build or when no
 // app-data location exists. Each title has its own sub-directory (configuration id), so a second
 // process start with the same configuration finds the first one's saves.
 void set_save_dir(const std::string& dir);  // "" = default

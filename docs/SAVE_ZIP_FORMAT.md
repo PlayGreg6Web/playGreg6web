@@ -70,4 +70,6 @@ python tools/saves.py export saves.zip [--config-id ID] [--force]
 python tools/saves.py import saves.zip [--config-id ID] [--force] [--dry-run]
 ```
 
-`--root DIR` overrides the default `%LOCALAPPDATA%\playgta6web\saves`.
+`--root DIR` overrides the default `%LOCALAPPDATA%\playgta6\saves` (the runtime's default). `list`/`export` fall
+back to the legacy `%LOCALAPPDATA%\playgta6web\saves` when the default holds no saves; to move old saves over run
+`python tools/saves.py migrate --from <old> --to <new>` (copies and verifies, never deletes the source).
