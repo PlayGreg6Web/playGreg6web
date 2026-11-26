@@ -194,6 +194,7 @@ BridgeLiveCounts bridge_live_counts() noexcept {
 }
 
 StateBridgeDevice::~StateBridgeDevice() {
+    rt_arena::clear_report_provider(this);
     adjust_gauge(g_live_views, views_tracked_, 0);
     adjust_gauge(g_live_samplers, samplers_tracked_, 0);
 }
@@ -729,6 +730,44 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
         groups.push_back(found);
     }
 
+    if (desc.rt_arena) {
+        if (groups.size() > rt_arena::kBindGroup) {
+            return nullptr;  // the runtime owns group 3
+        }
+        while (groups.size() < rt_arena::kBindGroup) {
+            if (empty_group_layout_ == nullptr) {
+                auto record = std::make_unique<GroupLayoutRecord>();
+                record->id = allocate_id();
+                record->header.id = record->id;
+                record->runtime_owned = false;
+                empty_group_layout_ = record.get();
+                group_layouts_.push_back(std::move(record));
+            }
+            groups.push_back(empty_group_layout_);
+        }
+        if (rt_group_layout_ == nullptr) {
+            auto record = std::make_unique<GroupLayoutRecord>();
+            record->id = allocate_id();
+            record->header.id = record->id;
+            for (uint32_t b = rt_arena::kBindArena0; b <= rt_arena::kBindStats; ++b) {
+                GpuBindGroupLayoutEntry entry{};
+                entry.binding = b;
+                entry.visibility = GpuShaderStageBits::Compute;
+                entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+                entry.binding_type = static_cast<uint8_t>(b == rt_arena::kBindDirectory
+                                                              ? GpuBufferBindingType::ReadOnlyStorage
+                                                              : GpuBufferBindingType::Storage);
+                record->entries.push_back(entry);
+                record->layout_entries.push_back(entry);
+                record->joins.push_back(d3d::ShaderBinding{});
+            }
+            record->header.entry_count = static_cast<uint32_t>(record->layout_entries.size());
+            record->runtime_owned = true;
+            rt_group_layout_ = record.get();
+            group_layouts_.push_back(std::move(record));
+        }
+        groups.push_back(rt_group_layout_);
+    }
     PipelineLayoutRecord* layout = nullptr;
     for (const auto& existing : pipeline_layouts_) {
         if (existing->groups == groups && existing->content_id == desc.content_id) {
@@ -741,6 +780,7 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
         record->id = allocate_id();
         record->content_id = desc.content_id;
         record->groups = std::move(groups);
+        record->rt_arena = desc.rt_arena;
         layout = record.get();
         pipeline_layouts_.push_back(std::move(record));
     }
@@ -814,6 +854,106 @@ uint32_t StateBridgeDevice::ensure_root_constant_ring(CommandEncoder& encoder) {
                               options_.root_constant_ring_bytes);
     }
     return ring_buffer_id_;
+}
+
+uint32_t StateBridgeDevice::rt_prepare_dispatch(const GroupLayoutRecord& group,
+                                                const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                                                CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    if (rt_arena_ == nullptr) {
+        // Bookkeeping only (no GPU buffers yet): the counters work with RT off.
+        rt_arena_ = std::make_unique<rt_arena::Arena>(options_.rt_arenas, options_.rt_pages_per_arena);
+        rt_arena::set_report_provider(this, [this] { return rt_report_json(); });
+    }
+    rt_arena::Arena& arena = *rt_arena_;
+    if (!options_.rt_enabled) {
+        arena.note_skip(rt_arena::SkipReason::RtOff);
+        return 0;
+    }
+    arena.begin_dispatch();
+    for (const auto& [addr, size] : ranges) {
+        const rt_arena::Ensure e = arena.ensure_range(addr, size);
+        if (e == rt_arena::Ensure::ArenaFull || e == rt_arena::Ensure::TableFull) {
+            arena.note_skip(rt_arena::SkipReason::ArenaFull);
+            return 0;
+        }
+        if (e == rt_arena::Ensure::OutOfRange) {
+            arena.note_skip(rt_arena::SkipReason::NotResident);
+            return 0;
+        }
+    }
+    if (rt_dir_buffer_ == 0) {
+        const uint64_t arena_bytes = static_cast<uint64_t>(options_.rt_pages_per_arena) * rt_arena::kPageBytes;
+        const uint32_t arenas = std::min(std::max(options_.rt_arenas, 1u), rt_arena::kArenaCount);
+        for (uint32_t i = 0; i < arenas; ++i) {  // unused arenas stay unbound (null bindings)
+            rt_buffers_[i] = allocate_id();
+            encoder.create_buffer(rt_buffers_[i], GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, arena_bytes);
+        }
+        rt_dir_buffer_ = allocate_id();
+        encoder.create_buffer(rt_dir_buffer_, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst,
+                              (static_cast<uint64_t>(rt_arena::kTopEntries) +
+                               static_cast<uint64_t>(rt_arena::kMaxL2Tables) * rt_arena::kL2Entries) * 4u);
+        rt_stats_buffer_ = allocate_id();
+        encoder.create_buffer(rt_stats_buffer_, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 256);
+    }
+    // Pages first, then the directory that points at them.
+    static thread_local std::vector<uint8_t> page;
+    page.resize(rt_arena::kPageBytes);
+    for (const rt_arena::Upload& u : arena.take_uploads()) {
+        const bool ok = options_.rt_page_reader &&
+                        options_.rt_page_reader(u.page << rt_arena::kPageShift, page.data(), page.size());
+        if (!ok) {
+            std::fill(page.begin(), page.end(), uint8_t{0});
+            arena.note_unreadable();
+        }
+        encoder.write_buffer(rt_buffers_[u.arena], static_cast<uint32_t>(rt_arena::slot_byte_offset(u.slot)),
+                             page.data(), static_cast<uint32_t>(page.size()));
+    }
+    uint32_t first = 0, last = 0;
+    if (arena.take_dir_dirty(&first, &last)) {
+        encoder.write_buffer(rt_dir_buffer_, first * 4u, arena.directory().data() + first, (last - first + 1u) * 4u);
+    }
+    uint32_t& id = rt_groups_[group.id];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e[6]{};
+        for (uint32_t i = 0; i < 6; ++i) {
+            e[i].binding = rt_arena::kBindArena0 + i;
+            e[i].resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+            e[i].resource_id = i < rt_arena::kArenaCount ? rt_buffers_[i]
+                               : i == 4                   ? rt_dir_buffer_
+                                                          : rt_stats_buffer_;
+        }
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = group.id;
+        g.entry_count = 6;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+    }
+    arena.note_dispatch();
+    return id;
+}
+
+void StateBridgeDevice::rt_mark_cpu_dirty(uint64_t addr, uint64_t size) {
+    std::lock_guard lock(objects_mutex_);
+    if (rt_arena_ == nullptr || size == 0) {
+        return;
+    }
+    for (uint64_t p = rt_arena::page_of(addr); p <= rt_arena::page_of(addr + size - 1); ++p) {
+        rt_arena_->mark_cpu_dirty(p);
+    }
+}
+
+void StateBridgeDevice::rt_mark_cpu_remapped(uint64_t addr, uint64_t size) {
+    std::lock_guard lock(objects_mutex_);
+    if (rt_arena_ != nullptr) {
+        rt_arena_->mark_cpu_remapped(addr, size);
+    }
+}
+
+std::string StateBridgeDevice::rt_report_json() {
+    std::lock_guard lock(objects_mutex_);
+    return rt_arena_ != nullptr ? rt_arena_->json() : std::string("{}");
 }
 
 uint32_t StateBridgeDevice::ensure_default_vertex_buffer(CommandEncoder& encoder) {
@@ -2039,6 +2179,10 @@ std::unique_ptr<ComputePipelineState> StateBridgeDevice::create_compute_pipeline
         state->diagnostics_ |= BridgeDiag::BindGroupBuildFailed;
     } else {
         for (const GroupLayoutRecord* group : state->layout_->groups) {
+            if (group->runtime_owned) {
+                state->plans_.emplace_back();  // bound by the runtime (RT arena group)
+                continue;
+            }
             state->plans_.push_back(d3d::BindGroupPlan::build(*root_signature, group->joins, d3d::WebGpuStage::Compute));
         }
     }
@@ -2323,6 +2467,7 @@ void CommandListBridge::note_bind_group_used_locked(const d3d::CachedBindGroup& 
 }
 
 void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
+    rt_ranges_.clear();
     clamp_batch_.close();
     // O36: bound the per-list bind group cache. Its keys change per draw (ring-allocated root CBVs,
     // descriptor table bases), so it grew for the whole run, each entry a live WebGPU bind group,
@@ -3984,7 +4129,32 @@ ComputePipelineState* CommandListBridge::prepare_compute_dispatch(ComputePipelin
         !apply_bind_groups(bind_point, state->layout_, state->plans_, &compute_groups_, false)) {
         return nullptr;
     }
+    if (bind_point == d3d::BindPoint::Compute && state->layout_ != nullptr && state->layout_->rt_arena &&
+        !prepare_rt_dispatch(state)) {
+        return nullptr;
+    }
     return state;
+}
+
+bool CommandListBridge::prepare_rt_dispatch(ComputePipelineState* state) {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.swap(rt_ranges_);
+    const uint32_t group = device_.rt_prepare_dispatch(*state->layout_->groups[rt_arena::kBindGroup], ranges, encoder_);
+    if (group == 0) {
+        ++stats_.rt_skipped;
+        return false;
+    }
+    const GpuSetBindGroup2Payload set{rt_arena::kBindGroup, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    if (compute_groups_.size() > rt_arena::kBindGroup) {
+        compute_groups_[rt_arena::kBindGroup].bind_group_id = group;
+    }
+    ++stats_.rt_dispatches;
+    return true;
+}
+
+void CommandListBridge::RtRequireRange(uint64_t addr, uint64_t size) {
+    rt_ranges_.emplace_back(addr, size);
 }
 
 bool CommandListBridge::prepare_mesh_stage() {

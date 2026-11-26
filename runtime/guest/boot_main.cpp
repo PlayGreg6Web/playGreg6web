@@ -89,6 +89,7 @@
 #include <vector>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/rt_arena.h"
 #include "gpu/drop_table.h"
 #include "gpu/pipeline_prewarm_host.h"
 #include "gpu/gpu_time.h"
@@ -1168,6 +1169,7 @@ int main(int argc, char** argv) {
             o += ", \"drops_by_program\": " + dg::drop_table().by_program_json();
             o += "}";
             o += ",\n  \"pipeline_prewarm\": " + gpu::prewarm_host_report_json();
+            o += ",\n  \"rt\": " + gpu::rt_arena::report_json();
             o += ",\n  \"gpu_drop_table\": " + dg::drop_table().detail_json();
             {
                 namespace ar = os::audio_report;

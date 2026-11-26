@@ -5007,7 +5007,147 @@ void test_prewarm_title_first_and_concurrent_single_build() {
     gpu::pipeline_prewarm().reset();
 }
 
+// Design sections 3 and 5: an RT-class compute pipeline (layout with the arena group) creates the
+// arena, directory and stats buffers on its first dispatch, uploads the resident pages and the
+// directory, and binds group 3, in that order; RT off or an unsatisfiable range skips and counts.
+struct RtRig {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    std::vector<uint64_t> reads;
+    std::unique_ptr<bridge::StateBridgeDevice> device;
+    d3d::RootSignature signature;
+    std::unique_ptr<bridge::ComputePipelineState> pso;
+    explicit RtRig(bool enabled, uint32_t first_id) {
+        bridge::BridgeOptions o = counting_options(first_id);
+        o.rt_enabled = enabled;
+        o.rt_arenas = 2;
+        o.rt_pages_per_arena = 4;  // 8 pages
+        o.rt_page_reader = [this](uint64_t addr, void* dst, size_t n) {
+            reads.push_back(addr);
+            std::memset(dst, 0xAB, n);
+            return true;
+        };
+        device = std::make_unique<bridge::StateBridgeDevice>(heaps, o, &states);
+        constexpr uint64_t kCs = 0xC7;
+        device->register_shader_module(kCs, 8);
+        d3d::RootSignatureDesc rs;
+        CHECK(d3d::RootSignature::build(rs, &signature).ok());
+        bridge::PipelineLayoutDesc layout;
+        layout.rt_arena = true;
+        device->register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc desc;
+        desc.cs = kCs;
+        desc.root_signature_id = 9;
+        pso = device->create_compute_pipeline_state(desc, &signature);
+    }
+};
+
+void test_rt_arena_dispatch() {
+    using O = GpuOpcode;
+    RtRig rig(true, 21000);
+    CHECK(rig.pso != nullptr && rig.pso->diagnostics() == 0);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(*rig.device, enc);
+    CHECK(list.SetComputeRootSignature(&rig.signature) == d3d::Status::Ok);
+    list.SetComputePipelineState(rig.pso.get());
+    CHECK(rig.device->rt_report_json() == "{}");  // nothing before the first RT-class dispatch
+
+    list.RtRequireRange(0x1000, 1);        // page 0
+    list.RtRequireRange(0x20000, 0x20000);  // pages 2 and 3
+    list.Dispatch(1, 1, 1);
+    CHECK(list.stats().rt_dispatches == 1 && list.stats().rt_skipped == 0);
+    {
+        const std::vector<Packet> p = decode(enc);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        CHECK(dispatch < p.size());
+        // Four buffers (two arenas, directory, stats), then three page writes, one directory write, the
+        // bind group, group 3 set, the dispatch.
+        std::vector<uint32_t> created;
+        size_t last_create = 0, first_write = p.size(), last_write = 0, pages = 0, dir_writes = 0;
+        uint32_t dir_id = 0;
+        for (size_t i = 0; i < dispatch; ++i) {
+            if (p[i].opcode == O::CreateBuffer) {
+                created.push_back(pod<GpuCreateBufferPayload>(p[i]).id);
+                last_create = i;
+                if (pod<GpuCreateBufferPayload>(p[i]).byte_size == (4096u + 56u * 4096u) * 4u) {
+                    dir_id = pod<GpuCreateBufferPayload>(p[i]).id;
+                }
+            } else if (p[i].opcode == O::WriteBuffer) {
+                first_write = std::min(first_write, i);
+                last_write = i;
+                const auto w = pod<GpuWriteBufferPayload>(p[i]);
+                if (w.data_len == 65536) {
+                    ++pages;
+                    CHECK(w.id == created[0] || w.id == created[1]);
+                } else {
+                    ++dir_writes;
+                    CHECK(w.id == dir_id && dir_id != 0);
+                }
+            }
+        }
+        CHECK(created.size() == 4 && pages == 3 && dir_writes == 1);
+        CHECK(last_create < first_write);
+        const size_t group = find_op(p, O::CreateBindGroup2, last_write);
+        CHECK(group < dispatch);
+        const auto g = pod<GpuCreateBindGroup2Payload>(p[group]);
+        CHECK(g.entry_count == 6);
+        for (uint32_t i = 0; i < 6; ++i) {
+            const auto e = pod<GpuBindGroupEntry2>(p[group], sizeof(GpuCreateBindGroup2Payload) + i * sizeof(GpuBindGroupEntry2));
+            // Arenas 2 and 3 do not exist with two arenas: null bindings; then directory and stats.
+            const uint32_t want = i < 2 ? created[i] : i < 4 ? 0u : created[i - 2];
+            CHECK(e.binding == 16 + i && e.resource_id == want);
+        }
+        const auto set = pod<GpuSetBindGroup2Payload>(p[dispatch - 1]);
+        CHECK(p[dispatch - 1].opcode == O::SetBindGroup2 && set.group_index == 3 && set.bind_group_id == g.id);
+        CHECK(group < dispatch - 1);
+        // The pages were read from guest memory at their page addresses.
+        CHECK((rig.reads == std::vector<uint64_t>{0x0, 0x20000, 0x30000}));
+    }
+    // A second dispatch over resident pages uploads nothing and only rebinds group 3.
+    const size_t mark = enc.size();
+    list.RtRequireRange(0x1000, 1);
+    list.Dispatch(1, 1, 1);
+    {
+        const std::vector<Packet> p = decode(enc, mark);
+        CHECK(find_op(p, O::CreateBuffer) == p.size() && find_op(p, O::WriteBuffer) == p.size() &&
+              find_op(p, O::CreateBindGroup2) == p.size());
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        CHECK(dispatch < p.size() && p[dispatch - 1].opcode == O::SetBindGroup2 &&
+              pod<GpuSetBindGroup2Payload>(p[dispatch - 1]).group_index == 3);
+    }
+    // 9 pages in one dispatch cannot fit 8 slots (the dispatch's own pages are not evictable): skipped.
+    const size_t mark2 = enc.size();
+    list.RtRequireRange(0x100000, 9 * 65536);
+    list.Dispatch(1, 1, 1);
+    CHECK(find_op(decode(enc, mark2), O::DispatchCompute) == decode(enc, mark2).size());
+    CHECK(list.stats().rt_dispatches == 2 && list.stats().rt_skipped == 1);
+    const std::string json = rig.device->rt_report_json();
+    CHECK(json.find("\"dispatches\": 2") != std::string::npos && json.find("\"arena_full\": 1") != std::string::npos &&
+          json.find("\"pages_resident\": ") != std::string::npos);
+    CHECK(playgta6::gpu::rt_arena::report_json() == json);  // what the boot report prints
+}
+
+void test_rt_off_skips_and_counts() {
+    using O = GpuOpcode;
+    RtRig rig(false, 22000);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(*rig.device, enc);
+    CHECK(list.SetComputeRootSignature(&rig.signature) == d3d::Status::Ok);
+    list.SetComputePipelineState(rig.pso.get());
+    list.RtRequireRange(0x1000, 1);
+    list.Dispatch(1, 1, 1);
+    list.Dispatch(1, 1, 1);
+    const std::vector<Packet> p = decode(enc);
+    CHECK(find_op(p, O::DispatchCompute) == p.size());  // a skipped dispatch is not recorded
+    CHECK(find_op(p, O::CreateBuffer) == p.size() && find_op(p, O::WriteBuffer) == p.size());  // no buffers made
+    CHECK(list.stats().rt_skipped == 2 && list.stats().rt_dispatches == 0 && list.stats().dispatches == 0);
+    CHECK(rig.device->rt_report_json().find("\"rt_off\": 2") != std::string::npos);
+    CHECK(rig.reads.empty());
+}
+
 int main() {
+    test_rt_arena_dispatch();
+    test_rt_off_skips_and_counts();
     test_partly_held_mip_chain_clamps_views();
     test_view_table_bounded();
     test_unregister_texture_invalidates_cached_bind_groups();

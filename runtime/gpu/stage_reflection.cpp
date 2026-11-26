@@ -1,6 +1,7 @@
 #include "gpu/stage_reflection.h"
 
 #include "gpu/descriptor_words.h"
+#include "gpu/rt_arena.h"
 
 #include <algorithm>
 #include <cctype>
@@ -317,6 +318,9 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
         }
         out->has_mesh_output = true;
     }
+    if (get_bool(s, "rt_arena")) {
+        out->rt_arena_mask = 0x3fu;
+    }
     if (const Json* inputs = s.get("vertex_inputs"); inputs != nullptr && inputs->type == Json::Type::Array) {
         for (const Json& in : inputs->array) {
             ReflectedVertexInput v;
@@ -343,6 +347,16 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
             if (!get_u32(b, "group", &r.group) || !get_u32(b, "binding", &r.binding)) {
                 *error = "binding needs group and binding";
                 return false;
+            }
+            if (const Json* rt_src = b.get("source");
+                rt_src != nullptr && rt_src->type == Json::Type::Object && get_bool(*rt_src, "rt_arena")) {
+                if (r.group != rt_arena::kBindGroup || r.binding < rt_arena::kBindArena0 ||
+                    r.binding > rt_arena::kBindStats) {
+                    *error = "an rt_arena binding must be group 3, binding 16..21";
+                    return false;
+                }
+                out->rt_arena_mask |= 1u << (r.binding - rt_arena::kBindArena0);
+                continue;  // runtime-owned: not joined
             }
             const std::string kind = get_string(b, "kind");
             static const std::pair<std::string_view, ReflectedBindingKind> kKinds[] = {
@@ -817,6 +831,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     uint64_t lane_arrays = 0;
     uint64_t root_tables = 0;
     uint64_t unresolved = 0;
+    bool rt_arena = false;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -825,6 +840,9 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     for (const ReflectedStageRef& st : stages) {
         if (st.reflection == nullptr) {
             continue;
+        }
+        if (st.reflection->rt_arena_mask != 0) {
+            rt_arena = true;
         }
         for (const ReflectedBinding& b : st.reflection->bindings) {
             bridge::LayoutBinding lb;
@@ -1180,6 +1198,14 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     }
     if (layout.groups.empty()) {
         layout.groups.resize(1);  // stages that bind nothing still get one (empty) group
+    }
+    if (rt_arena) {
+        if (layout.groups.size() > rt_arena::kBindGroup) {
+            *report += "rt_arena stage: the runtime owns group 3, the stage joined " +
+                       std::to_string(layout.groups.size()) + " groups\n";
+            return false;
+        }
+        layout.rt_arena = true;
     }
     *out = std::move(layout);
     if (stats != nullptr) {

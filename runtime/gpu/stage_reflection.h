@@ -189,6 +189,11 @@ struct StageReflection {
     // "vertex_words"} (see bridge::MeshOutputLayout; validated by bridge::valid_mesh_output_layout).
     bool has_mesh_output = false;
     bridge::MeshOutputLayout mesh_output{};
+    // RT arena bindings (docs/RAYTRACING_DESIGN.md C3): the stage uses the runtime-owned prelude
+    // (group 3, bindings 16-21). Bit i = binding 16 + i. Set by a stage-level "rt_arena": true (all
+    // six) or by bindings {"group": 3, "binding": 16..21, "source": {"rt_arena": true}}; those
+    // bindings are runtime-owned and are not joined to the root signature.
+    uint32_t rt_arena_mask = 0;
 };
 
 // Pack key (stage identity) -> reflection.

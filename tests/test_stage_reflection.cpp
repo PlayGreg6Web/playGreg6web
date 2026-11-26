@@ -1125,7 +1125,52 @@ void test_unresolved_source() {
     }
 }
 
+// docs/RAYTRACING_DESIGN.md C3: a stage that reflects the arena bindings (group 3, 16..21) gets the
+// runtime-owned group appended; the arena bindings are not joined to the root signature.
+void test_rt_arena_bindings() {
+    const char* doc = R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {
+      "0x7a": {"stage": "compute", "bindings": [
+        {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": true}},
+        {"group": 3, "binding": 20, "kind": "read_only_storage", "source": {"rt_arena": true}},
+        {"group": 3, "binding": 21, "kind": "storage", "source": {"rt_arena": true}},
+        {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 4, "root_constants": true}}]},
+      "0x7b": {"stage": "compute", "rt_arena": true, "bindings": []},
+      "0x7c": {"stage": "compute", "bindings": []}}})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    CHECK(index.at(0x7a).rt_arena_mask == ((1u << 0) | (1u << 4) | (1u << 5)));
+    CHECK(index.at(0x7a).bindings.size() == 1);  // the arena bindings are runtime-owned
+    CHECK(index.at(0x7b).rt_arena_mask == 0x3f && index.at(0x7c).rt_arena_mask == 0);
+
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc rc;
+    rc.parameter_type = d3d::RootParameterType::Constants32Bit;
+    rc.num_32bit_values = 4;
+    rs.parameters.push_back(rc);
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    CHECK(join_pipeline_layout(rs, true, {{GpuShaderStageBits::Compute, &index.at(0x7a)}}, &layout, &report));
+    CHECK(layout.rt_arena && layout.groups.size() == 1);  // the runtime appends group 3 itself
+    bridge::PipelineLayoutDesc plain;
+    CHECK(join_pipeline_layout(rs, true, {{GpuShaderStageBits::Compute, &index.at(0x7c)}}, &plain, &report));
+    CHECK(!plain.rt_arena);
+
+    // Only group 3, bindings 16..21 may be arena bindings.
+    StageReflectionIndex bad;
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 3, "binding": 22, "kind": "storage", "source": {"rt_arena": true}}]}}})",
+        &bad, &error));
+    CHECK(error.find("rt_arena binding") != std::string::npos);
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 2, "binding": 16, "kind": "storage", "source": {"rt_arena": true}}]}}})",
+        &bad, &error));
+}
+
 int main() {
+    test_rt_arena_bindings();
     test_mesh_output();
     test_parse();
     test_user_data_rule();

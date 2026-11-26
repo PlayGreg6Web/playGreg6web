@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include <utility>
 
 namespace playgta6::gpu::rt_arena {
@@ -233,18 +234,18 @@ Stats Arena::stats() const {
 
 std::string Arena::json() const {
     const Stats s = stats();
-    char buf[640];
+    char buf[768];
     std::snprintf(buf, sizeof buf,
                   "{\"arena_bytes\": %llu, \"pages_resident\": %llu, \"pages_pinned\": %llu, "
                   "\"pages_gpu_owned\": %llu, \"uploads\": %llu, \"evictions\": %llu, "
                   "\"skipped_gpu_owned\": %llu, \"arena_full\": %llu, \"table_full\": %llu, "
-                  "\"out_of_range\": %llu, \"rt_fault\": %llu, \"dir_words\": %zu, \"skips\": {",
+                  "\"out_of_range\": %llu, \"rt_fault\": %llu, \"dispatches\": %llu, \"unreadable_pages\": %llu, \"dir_words\": %zu, \"skips\": {",
                   (unsigned long long)capacity_bytes(), (unsigned long long)s.resident,
                   (unsigned long long)s.pinned, (unsigned long long)s.gpu_owned,
                   (unsigned long long)s.uploads, (unsigned long long)s.evictions,
                   (unsigned long long)s.skipped_gpu_owned, (unsigned long long)s.arena_full,
                   (unsigned long long)s.table_full, (unsigned long long)s.out_of_range,
-                  (unsigned long long)s.faults, dir_.size());
+                  (unsigned long long)s.faults, (unsigned long long)s.dispatches, (unsigned long long)s.unreadable_pages, dir_.size());
     std::string out = buf;
     for (size_t i = 0; i < static_cast<size_t>(SkipReason::Count); ++i) {
         if (i) out += ", ";
@@ -253,6 +254,35 @@ std::string Arena::json() const {
         out += buf;
     }
     return out + "}}";
+}
+
+namespace {
+std::mutex g_report_mutex;
+const void* g_report_owner = nullptr;
+std::function<std::string()> g_report_provider;
+}  // namespace
+
+void set_report_provider(const void* owner, std::function<std::string()> provider) {
+    std::lock_guard<std::mutex> lock(g_report_mutex);
+    g_report_owner = owner;
+    g_report_provider = std::move(provider);
+}
+
+void clear_report_provider(const void* owner) {
+    std::lock_guard<std::mutex> lock(g_report_mutex);
+    if (g_report_owner == owner) {
+        g_report_owner = nullptr;
+        g_report_provider = nullptr;
+    }
+}
+
+std::string report_json() {
+    std::function<std::string()> provider;
+    {
+        std::lock_guard<std::mutex> lock(g_report_mutex);
+        provider = g_report_provider;
+    }
+    return provider ? provider() : std::string("{}");
 }
 
 }  // namespace playgta6::gpu::rt_arena

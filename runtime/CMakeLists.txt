@@ -59,6 +59,7 @@ add_library(playgta6_core STATIC
     gpu/gpu_va_watch.cpp
     gpu/drop_table.cpp
     gpu/rt_arena.cpp
+    gpu/rt_bvh.cpp
     gpu/gpu_time.cpp
     gpu/d3d12_readback.cpp
     gpu/gfx10_descriptors.cpp
@@ -258,6 +259,10 @@ else()
     add_executable(test_rt_arena ../tests/test_rt_arena.cpp)
     target_link_libraries(test_rt_arena PRIVATE playgta6_core)
     add_test(NAME test_rt_arena COMMAND test_rt_arena)
+    add_executable(test_rt_bvh ../tests/test_rt_bvh.cpp)
+    target_link_libraries(test_rt_bvh PRIVATE playgta6_core)
+    target_include_directories(test_rt_bvh PRIVATE ../tests)
+    add_test(NAME test_rt_bvh COMMAND test_rt_bvh)
     add_executable(test_gpu_time ../tests/test_gpu_time.cpp)
     target_link_libraries(test_gpu_time PRIVATE playgta6_core)
     add_test(NAME test_gpu_time COMMAND test_gpu_time)

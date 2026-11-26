@@ -55,6 +55,7 @@
 #include "gpu/descriptor_heap.h"
 #include "gpu/indirect_clamp_batch.h"
 #include "gpu/pso_cache.h"
+#include "gpu/rt_arena.h"
 
 namespace playgta6::gpu {
 struct PrewarmPipelineDesc;  // prewarm_pipeline_desc.h
@@ -158,6 +159,9 @@ struct GroupLayoutDesc {
 struct PipelineLayoutDesc {
     uint64_t content_id = 0;  // S6 pipeline layout id (0 = not from the manifest)
     std::vector<GroupLayoutDesc> groups;  // group 0..n-1
+    // RT-class stage (reflection asked for the arena bindings): the runtime appends its own group 3
+    // (rt_arena bindings 16-21) after the padded groups. Refused when `groups` has more than three.
+    bool rt_arena = false;
 };
 
 // =====================================================================================================
@@ -197,6 +201,15 @@ struct BridgeOptions {
     // Drop dispatches that have a null writable storage binding (counted, never faked as done).
     bool drop_null_storage_dispatch = true;
     uint32_t features = 0;  // pso::WgpuFeature bits enabled on the WebGPU device
+    // Ray tracing (docs/RAYTRACING_DESIGN.md section 5): RT-class dispatches (layouts with the arena
+    // group) run only when rt_enabled (off by default); otherwise they are skipped and counted
+    // (`rt_off`). The arena is created on the first RT-class dispatch with this geometry.
+    bool rt_enabled = false;
+    uint32_t rt_arenas = rt_arena::kArenaCount;
+    uint32_t rt_pages_per_arena = rt_arena::kPagesPerArena;
+    // Copies `bytes` of guest memory at the 40-bit address `addr` into `dst` (a 64 KiB page upload).
+    // False: unreadable (a zero page is uploaded and counted).
+    std::function<bool(uint64_t addr, void* dst, size_t bytes)> rt_page_reader;
     pso::MidPassClearPolicy mid_pass_clear = pso::MidPassClearPolicy::SplitPass;
     uint32_t max_texture_dimension_2d = 8192;
     // Uniform ring for root constants (bound with dynamic offsets). Must hold one frame's worth.
@@ -353,6 +366,11 @@ public:
                                BridgeOptions options = {},
                                const d3d::ResourceStateRegistry* resource_states = nullptr);
     ~StateBridgeDevice() override;
+    // The guest changed or released memory the RT arena may hold (no-ops without an arena).
+    void rt_mark_cpu_dirty(uint64_t addr, uint64_t size);
+    void rt_mark_cpu_remapped(uint64_t addr, uint64_t size);
+    // The arena's counters as the boot report's "rt" block ("{}" before the first RT-class dispatch).
+    std::string rt_report_json();
     StateBridgeDevice(const StateBridgeDevice&) = delete;
     StateBridgeDevice& operator=(const StateBridgeDevice&) = delete;
 
@@ -501,6 +519,7 @@ private:
         std::vector<GroupLayoutRecord*> groups;
         bool emitted = false;
         bool emitted_by_prewarm = false;
+        bool rt_arena = false;  // group 3 is the runtime's arena group (rt_arena bindings 16-21)
     };
 
     uint32_t intern_view(const ViewRecord& record) const;
@@ -562,6 +581,13 @@ private:
     bool indirect_clamp_group_known(uint32_t args, uint32_t count);
     uint32_t allocate_indirect_window();
 
+    // RT-class dispatch preparation (design sections 3 and 5): applies the gate, makes `ranges` (guest
+    // address, size) resident, and emits through `encoder`, in this order: the arena / directory /
+    // stats buffers on first use, the page uploads, the directory update, and the group's bind group
+    // on first use. Returns the bind group for group 3, or 0 when the dispatch must be skipped
+    // (counted per reason in the arena's counters).
+    uint32_t rt_prepare_dispatch(const GroupLayoutRecord& group, const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                                 CommandEncoder& encoder);
     // G66 mesh pipelines: `base` (at most kMeshOutputGroup groups) padded with empty groups and
     // followed by the runtime-owned output group (binding 0, `visibility`, `binding_type`); null
     // when `base` has more groups.
@@ -655,8 +681,15 @@ private:
     uint32_t indirect_cursor_ = 0;
     std::map<std::pair<PipelineLayoutRecord*, uint32_t>, PipelineLayoutRecord*> mesh_layouts_;
     GroupLayoutRecord* empty_group_layout_ = nullptr;
+    GroupLayoutRecord* rt_group_layout_ = nullptr;  // the runtime-owned RT arena group (bindings 16-21)
     uint32_t mesh_output_buffer_ = 0;
     std::map<uint32_t, uint32_t> mesh_output_groups_;  // runtime group layout id -> bind group
+    // RT arena (created lazily by the first RT-class dispatch).
+    std::unique_ptr<rt_arena::Arena> rt_arena_;
+    uint32_t rt_buffers_[rt_arena::kArenaCount] = {};
+    uint32_t rt_dir_buffer_ = 0;
+    uint32_t rt_stats_buffer_ = 0;
+    std::map<uint32_t, uint32_t> rt_groups_;  // runtime group layout id -> bind group
 
     mutable std::mutex bridges_mutex_;
     std::vector<CommandListBridge*> bridges_;
@@ -806,6 +839,9 @@ struct BridgeStats {
     // skipped (no mesh pipeline state bound, invalid group counts, bindings that cannot be built).
     uint64_t mesh_dispatches = 0;
     uint64_t mesh_skipped = 0;
+    // RT-class compute dispatches recorded / skipped (reasons in the device's rt_arena counters).
+    uint64_t rt_dispatches = 0;
+    uint64_t rt_skipped = 0;
     // G66 partly-held mip chains: sampled texture bindings emitted with their base mip level raised
     // to the texture's first held level or the view's min-LOD clamp, and cached bind groups
     // re-created because a bound texture's held levels changed.
@@ -830,6 +866,11 @@ public:
     void flush_invalidations();
     size_t cached_bind_group_count() const;
     bool is_open() const noexcept { return open_; }
+
+    // RT-class compute pipelines (layout with the arena group): guest address ranges (addr, size) the
+    // next dispatch's trace programs read, made resident before it. Cleared by every RT dispatch (run
+    // or skipped) and by Reset.
+    void RtRequireRange(uint64_t addr, uint64_t size);
 
     // Pipeline state.
     void SetPipelineState(GraphicsPipelineState* pso);
@@ -923,6 +964,9 @@ public:
 
 private:
     friend class StateBridgeDevice;
+    // Applies the RT gate and binds the arena group (3) for an RT-class compute pipeline; false: skipped.
+    bool prepare_rt_dispatch(ComputePipelineState* state);
+    std::vector<std::pair<uint64_t, uint64_t>> rt_ranges_;
     struct BoundGroup {
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> dynamic_offsets;

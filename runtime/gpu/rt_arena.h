@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <string>
 #include <unordered_map>
@@ -63,6 +64,8 @@ struct Stats {
     uint64_t uploads = 0, evictions = 0, skipped_gpu_owned = 0;
     uint64_t arena_full = 0, table_full = 0, out_of_range = 0;
     uint64_t faults = 0;  // last value read back from pg6_rt_stats[0]
+    uint64_t dispatches = 0;  // RT-class dispatches recorded
+    uint64_t unreadable_pages = 0;  // uploads whose guest memory could not be read (zero page sent)
     uint64_t skips[static_cast<size_t>(SkipReason::Count)] = {};
 };
 
@@ -110,6 +113,8 @@ public:
     bool take_dir_dirty(uint32_t* first, uint32_t* last);
 
     void note_skip(SkipReason r) { ++stats_.skips[static_cast<size_t>(r)]; }
+    void note_dispatch() { ++stats_.dispatches; }
+    void note_unreadable() { ++stats_.unreadable_pages; }
     void set_fault_count(uint64_t f) { stats_.faults = f; }
     Stats stats() const;
     std::string json() const;
@@ -139,5 +144,12 @@ private:
     std::vector<Upload> uploads_;
     Stats stats_;
 };
+
+// Boot-report plumbing: a bridge device registers a provider for its arena's json() (owner = the
+// device, replaced on re-register, removed on destruction); the report asks for the current one.
+// "{}" when none is registered (no RT-class dispatch has happened yet).
+void set_report_provider(const void* owner, std::function<std::string()> provider);
+void clear_report_provider(const void* owner);
+std::string report_json();
 
 }  // namespace playgta6::gpu::rt_arena
