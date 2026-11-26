@@ -541,7 +541,7 @@ private:
     DepthTwinPipelines depth_twin_pipelines(uint8_t depth_format, uint8_t twin_format, CommandEncoder& encoder);
     // Bind group of the compute copy (depth texture sampled, twin stored) or of the draw (twin read).
     uint32_t depth_twin_group(uint32_t layout, uint32_t depth_texture, uint32_t twin, bool into_twin,
-                              uint8_t twin_format, CommandEncoder& encoder);
+                              uint8_t twin_format, uint32_t mip, uint32_t layer, CommandEncoder& encoder);
     void flush_retired_locked(CommandEncoder& encoder);
 
     d3d::DescriptorHeapRegistry& heaps_;
@@ -960,6 +960,11 @@ private:
     // Depth plane -> twin (compute), skipped while the twin is known equal; twin -> depth plane (draw).
     bool emit_depth_twin_in(const StorageRedirect& r);
     void emit_depth_twin_out(const StorageRedirect& r);
+    void emit_depth_twin_out_sub(const StorageRedirect& r, uint32_t mip, uint32_t layer);
+    // Writes the twin's pending subresources of `texture` back into it (before a copy out of it).
+    void flush_depth_twin(uint32_t texture);
+    // The last redirect that twinned each depth texture (its twin and formats), for flush_depth_twin.
+    std::unordered_map<uint32_t, StorageRedirect> depth_twin_flush_;
     DepthTwinTracker depth_twin_;
     // Fragment-stage redirects of the open render pass: converted out when the pass ends.
     std::vector<StorageRedirect> pass_redirects_;

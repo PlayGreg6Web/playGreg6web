@@ -3947,6 +3947,96 @@ void test_depth_storage_twin() {
     }
 }
 
+// Backlog 35 follow-up: a mipped, layered depth texture twins per subresource. A 2D-array storage
+// view of mip 1, layers 1..2 copies exactly those two subresources in (once), writes them back one
+// draw each into the matching mip / layer, and a render pass that writes the depth of one of them
+// makes only that one stale again.
+void test_depth_storage_twin_subresources() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    bridge::BridgeOptions options = counting_options(9500);
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTex = 313;
+    constexpr uint64_t kCs = 0xE6;
+    bridge::TextureInfo tex{pso::DxgiFormat::D32_FLOAT, 32, 16, 4, 3, 1, GpuTextureDimension::Dim2D, false};
+    device.register_texture(kTex, tex);
+    device.register_shader_module(kCs, 3);
+    d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    d3d::ViewDesc vd;
+    vd.format = static_cast<uint32_t>(pso::DxgiFormat::D32_FLOAT);
+    vd.dimension = d3d::ViewDimension::Texture2DArray;
+    vd.first_mip = 1;
+    vd.mip_levels = 1;
+    vd.first_array_slice = 1;
+    vd.array_size = 2;
+    CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Uav;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    group.content_id = 0x5EEF;
+    GpuBindGroupLayoutEntry entry = layout_entry(
+        0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+        static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly), static_cast<uint8_t>(GpuTextureViewDimension::Dim2DArray));
+    entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::R32Float);
+    group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kCs, 0, layout);
+    pso::D3D12ComputePsoDesc desc;
+    desc.cs = kCs;
+    auto cpso = device.create_compute_pipeline_state(desc, &root);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {view_heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+    list.SetComputePipelineState(cpso.get());
+    CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list.Dispatch(1, 1, 1);
+    list.Dispatch(1, 1, 1);
+    // A read-back of the depth texture finds nothing pending: both writes are already back in it.
+    const size_t before_readback = decode(enc).size();
+    GpuReadbackTexturePayload rb{};
+    rb.texture_id = kTex;
+    CHECK(list.Readback(GpuOpcode::ReadbackTexture, &rb, sizeof(rb), kTex) != SIZE_MAX);
+    list.Close();
+
+    uint32_t passes = 0, bad_view = 0;
+    bool layer1 = false, layer2 = false;
+    size_t readback_at = 0, i = 0;
+    for (const Packet& pk : decode(enc)) {
+        if (pk.opcode == GpuOpcode::BeginRenderPass) {
+            const auto p = pod<GpuBeginRenderPassPayload>(pk);
+            ++passes;
+            bad_view += (p.depth_stencil.texture_id != kTex || p.depth_stencil.view.base_mip_level != 1 ||
+                         p.depth_stencil.view.array_layer_count != 1)
+                            ? 1u
+                            : 0u;
+            layer1 |= p.depth_stencil.view.base_array_layer == 1;
+            layer2 |= p.depth_stencil.view.base_array_layer == 2;
+        }
+        if (pk.opcode == GpuOpcode::ReadbackTexture) {
+            readback_at = i;
+        }
+        ++i;
+    }
+    const bridge::BridgeStats& st = list.stats();
+    CHECK(st.storage_views_depth_untwinned == 0u);
+    CHECK(st.depth_twin_bindings == 1u);
+    CHECK(st.depth_twin_copies_in == 2u);   // layers 1 and 2 of mip 1, once
+    CHECK(st.depth_twin_copies_out == 4u);  // two layers after each of the two dispatches
+    CHECK(passes == 4u && bad_view == 0u && layer1 && layer2);
+    CHECK(readback_at >= before_readback);
+}
+
 // #482: a fragment-stage storage binding of a mismatched float format goes through an intermediate
 // too: copied in (read-write) before the draw in a pass of its own, converted out when the pass ends.
 void test_fragment_storage_texture_format_conversion() {
@@ -4697,6 +4787,7 @@ int main() {
     test_storage_texture_format_conversion();
     test_null_storage_dispatch_dropped();
     test_depth_storage_twin();
+    test_depth_storage_twin_subresources();
     test_fragment_storage_texture_format_conversion();
     test_vertex_mixed_storage_and_attachment_alias();
     test_seam_conversions();

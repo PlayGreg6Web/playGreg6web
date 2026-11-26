@@ -72,6 +72,61 @@ void test_forget_and_reset() {
     t.reset();
     CHECK(t.needs_copy_in(2) && t.tracked() == 0);
 }
+// Subresources (mip x layer) are independent: copying one in leaves the others stale.
+void test_subresources_independent() {
+    DepthTwinTracker t;
+    t.note_copied_in(9, 2, 3);
+    CHECK(!t.needs_copy_in(9, 2, 3));
+    CHECK(t.needs_copy_in(9, 2, 4));
+    CHECK(t.needs_copy_in(9, 3, 3));
+    CHECK(t.needs_copy_in(9));  // mip 0 / layer 0 untouched
+    t.note_twin_written(9, 2, 3);
+    CHECK(t.needs_copy_out(9, 2, 3) && !t.needs_copy_out(9, 2, 4));
+    const auto pending = t.pending_out(9);
+    CHECK(pending.size() == 1 && pending[0].mip == 2 && pending[0].layer == 3);
+    t.note_copied_out(9, 2, 3);
+    CHECK(t.pending_out(9).empty());
+    CHECK(t.tracked() == 1);
+}
+
+// A depth write (render pass view, clear, copy or upload) stales only the subresources it covers;
+// a count of 0 is "all remaining".
+void test_range_invalidation() {
+    DepthTwinTracker t;
+    for (uint32_t mip = 0; mip < 3; ++mip) {
+        for (uint32_t layer = 0; layer < 4; ++layer) {
+            t.note_copied_in(4, mip, layer);
+        }
+    }
+    t.note_depth_written(4, 1, 1, 2, 1);  // mip 1, layer 2
+    CHECK(t.needs_copy_in(4, 1, 2));
+    CHECK(!t.needs_copy_in(4, 1, 1) && !t.needs_copy_in(4, 0, 2) && !t.needs_copy_in(4, 2, 2));
+    t.note_copied_in(4, 1, 2);
+    t.note_depth_written(4, 0, 1, 1, 0);  // mip 0, layers 1..end
+    CHECK(t.needs_copy_in(4, 0, 1) && t.needs_copy_in(4, 0, 3));
+    CHECK(!t.needs_copy_in(4, 0, 0) && !t.needs_copy_in(4, 1, 1));
+    t.note_depth_written(4, 0, 0, 0, 0);  // everything
+    for (uint32_t mip = 0; mip < 3; ++mip) {
+        for (uint32_t layer = 0; layer < 4; ++layer) {
+            CHECK(t.needs_copy_in(4, mip, layer));
+        }
+    }
+}
+
+// Pending twin writes survive a range write, and stay listed for the flush before a copy out.
+void test_pending_survives_range_write() {
+    DepthTwinTracker t;
+    t.note_copied_in(6, 0, 0);
+    t.note_copied_in(6, 0, 1);
+    t.note_twin_written(6, 0, 1);
+    t.note_depth_written_all(6);
+    CHECK(t.needs_copy_in(6, 0, 0));
+    CHECK(t.needs_copy_out(6, 0, 1));
+    CHECK(t.pending_out(6).size() == 1);
+    CHECK(t.pending_out(77).empty());
+    t.forget(6);
+    CHECK(t.tracked() == 0);
+}
 }  // namespace
 
 int main() {
@@ -80,6 +135,9 @@ int main() {
     test_depth_write_invalidates();
     test_pending_write_kept();
     test_forget_and_reset();
+    test_subresources_independent();
+    test_range_invalidation();
+    test_pending_survives_range_write();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
