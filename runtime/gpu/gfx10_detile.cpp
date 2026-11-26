@@ -1035,6 +1035,31 @@ MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept
     return p;
 }
 
+TileMap tile_map(const TextureLayoutDesc& desc) noexcept {
+    TileMap t{};
+    if (is_linear_layout(desc)) {
+        return t;
+    }
+    const ChainLayout c = build_chain(desc);
+    if (!c.ok) {
+        return t;
+    }
+    t.mips = std::min(c.mips, kMaxTileMapMips);
+    t.block_bytes = c.linear ? kConsoleLinearAlignment : uint64_t{1} << c.shape.blk_size_log2;
+    t.standard_mips = 0;
+    while (t.standard_mips < t.mips && !c.in_tail[t.standard_mips]) {
+        t.start_tile[t.standard_mips] = c.macro_offset[t.standard_mips] / t.block_bytes;
+        ++t.standard_mips;
+    }
+    t.packed_mips = t.mips - t.standard_mips;
+    t.tail_tiles = t.packed_mips != 0u ? 1u : 0u;
+    t.tail_start_tile = t.packed_mips != 0u ? c.macro_offset[t.standard_mips] / t.block_bytes : 0u;
+    t.total_tiles = c.total_bytes / t.block_bytes;
+    t.slice_tiles = (c.shape.thick_3d || desc.array_size <= 1u) ? t.total_tiles : t.total_tiles / desc.array_size;
+    t.ok = true;
+    return t;
+}
+
 uint64_t surface_element_offset(const TextureLayoutDesc& desc, uint32_t mip, uint32_t x, uint32_t y,
                                 uint32_t z) noexcept {
     if (is_linear_layout(desc)) {

@@ -133,6 +133,28 @@ struct MipPlacement {
 };
 MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept;
 
+// Tile view of a whole surface (single source for GetResourceTiling-style answers): GFX10 starts the
+// mip tail by addrlib's rule (every mip that fits the tail region and the tail's mip budget), not by
+// the D3D12 packed-mip rule (smaller than a tile in one dimension). A 2:1 mip such as 64x32 BC7
+// blocks is therefore still a standard mip with a block of its own. Tile = one swizzle block
+// (block_bytes), numbered in memory order from the resource base (tail block first, then the
+// larger mips smallest-first). Only blocks of 4 KiB and up have a tail; 256 B modes and console
+// linear report no tail (standard_mips == mips).
+constexpr uint32_t kMaxTileMapMips = 16;
+struct TileMap {
+    bool ok = false;
+    uint64_t block_bytes = 0;
+    uint32_t mips = 0;
+    uint32_t standard_mips = 0;  // mips before the tail
+    uint32_t packed_mips = 0;    // mips inside the tail block (0 = no tail)
+    uint32_t tail_tiles = 0;     // 1 when packed_mips > 0
+    uint64_t tail_start_tile = 0;
+    uint64_t start_tile[kMaxTileMapMips] = {};  // first block of each standard mip (slice 0)
+    uint64_t slice_tiles = 0;                   // blocks per array slice (3D: the whole surface)
+    uint64_t total_tiles = 0;                   // surface_bytes / block_bytes
+};
+TileMap tile_map(const TextureLayoutDesc& desc) noexcept;
+
 // Byte offset from the resource base of element (x, y) of mip `mip` (elements: texels, or 4x4
 // blocks for BC formats) in slice `z` (3D: the depth slice of that mip; arrays: the array slice,
 // which must be < desc.array_size), using exactly the address the surface detiler reads

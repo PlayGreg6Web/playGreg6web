@@ -901,6 +901,69 @@ void test_bounds_and_error_rejection() {
 
 }  // namespace
 
+// tile_map: the GFX10 tail rule across formats, aspect ratios, arrays and swizzle modes.
+void test_tile_map() {
+    // 2:1 BC7 (16 B blocks): 256x128 texels = 64x32 blocks. 64KB block is 64x... a mip with an
+    // aspect of 2:1 keeps a block of its own and the tail follows (the D3D12 rule would pack it).
+    for (const uint32_t layout : {0x109u, 0x10Au}) {
+        for (const uint32_t fmt : {98u, 77u, 71u, 28u, 61u}) {
+            for (const uint32_t wh : {64u, 128u, 256u, 1024u, 2048u}) {
+                for (const uint32_t aspect : {1u, 2u, 4u}) {
+                    for (const bool tall : {false, true}) {
+                        const uint32_t w = tall ? wh : wh * aspect;
+                        const uint32_t h = tall ? wh * aspect : wh;
+                        for (const uint32_t arr : {1u, 3u}) {
+                            TextureLayoutDesc d{fmt, w, h, 1u, 12u, layout, 0u, arr};
+                            const TileMap t = tile_map(d);
+                            CHECK(t.ok && t.block_bytes == 65536u);
+                            CHECK(t.mips == 12u && t.standard_mips + t.packed_mips == 12u);
+                            CHECK(t.total_tiles * 65536u == surface_bytes(d));
+                            CHECK(t.slice_tiles * arr == t.total_tiles);
+                            for (uint32_t m = 0; m < t.mips; ++m) {
+                                const MipPlacement p = mip_placement(d, m);
+                                CHECK(p.in_tail == (m >= t.standard_mips));
+                                if (m < t.standard_mips) {
+                                    CHECK(t.start_tile[m] * 65536u == p.macro_block_offset);
+                                }
+                            }
+                            if (t.packed_mips != 0u) {
+                                CHECK(t.tail_tiles == 1u && t.tail_start_tile < t.slice_tiles);
+                            } else {
+                                CHECK(t.tail_tiles == 0u);
+                            }
+                            // Memory order: the tail is first, mips follow smallest-first.
+                            if (t.standard_mips > 1u && t.packed_mips != 0u) {
+                                CHECK(t.tail_start_tile == 0u);
+                                for (uint32_t m = 1; m < t.standard_mips; ++m) {
+                                    CHECK(t.start_tile[m] < t.start_tile[m - 1]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // BC7 64x32 blocks (256x128 texels) at 64KB: mip 0 is a standard mip, mip 1 (32x16 blocks,
+    // 2:1) too; the tail starts only once both dimensions fit the tail region.
+    const TileMap bc7 = tile_map({98u, 256u, 128u, 1u, 9u, 0x10Au, 0u, 1u});
+    CHECK(bc7.ok && bc7.standard_mips >= 1u && bc7.packed_mips >= 1u);
+    // Smaller blocks and non-tail modes.
+    const TileMap k4 = tile_map({28u, 256u, 256u, 1u, 9u, 0x105u, 0u, 1u});
+    CHECK(k4.ok && k4.block_bytes == 4096u && k4.standard_mips == 4u && k4.packed_mips == 5u);
+    CHECK(k4.start_tile[0] * 4096u == 90112u && k4.tail_start_tile == 0u);
+    const TileMap b256 = tile_map({28u, 64u, 64u, 1u, 4u, 0x101u, 0u, 1u});
+    CHECK(b256.ok && b256.packed_mips == 0u && b256.standard_mips == 4u);
+    // 3D keeps the whole surface as one slice; whole chain in the tail (1 tile).
+    const TileMap v = tile_map({28u, 16u, 16u, 16u, 5u, 0x109u, 0u, 1u});
+    CHECK(v.ok && v.slice_tiles == v.total_tiles);
+    const TileMap tiny = tile_map({77u, 32u, 32u, 1u, 4u, 0x105u, 0u, 1u});
+    CHECK(tiny.ok && tiny.standard_mips == 0u && tiny.packed_mips == 4u && tiny.total_tiles == 1u);
+    // Not tiled layouts or bad input: not ok.
+    CHECK(!tile_map({28u, 64u, 64u, 1u, 1u, 1u, 0u, 1u}).ok);
+    CHECK(!tile_map({0u, 64u, 64u, 1u, 1u, 0x109u, 0u, 1u}).ok);
+}
+
 int main() {
     test_decode_d3d12_layout();
     test_format_geometry();
@@ -911,6 +974,7 @@ int main() {
     test_addrlib_equations_2d();
     test_addrlib_equations_3d();
     test_mip_chain_placement();
+    test_tile_map();
     test_mip_chain_round_trips();
     test_console_linear_chain();
     test_console_linear_fast_path();
