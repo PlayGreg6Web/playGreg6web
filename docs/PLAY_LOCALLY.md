@@ -110,6 +110,17 @@ Useful switches: `-NoBuild` (fail on stale), `-TrustBuild` (reuse artifacts), `-
 legal-notices, chrome-menu-flow, chrome-menu-flow-2, chrome-menu-flow-4, chrome-menu-flow-5, chrome-full-boot,
 menu-to-ingame, chrome-to-ingame (every preset `tools/run_browser_boot.py` accepts; `chrome-to-ingame` goes through
 the LEGAL NOTICES and ROCKSTAR GAMES LEGAL TERMS screens automatically, then into the Main Menu / in-game). Defaults come from the env vars `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `CHROME_PATH` and `PLAYGTA6_SHADER_PACK`.
+
+### Prebuilt (no compiling when you just want to play)
+Build once (hours the first time, incremental after; never starts Chrome), then start in seconds:
+```powershell
+.\tools\update_prebuilt.ps1 -Web          # builds into a temp dir, swaps it in atomically on success
+.\tools\play_local.ps1 -Prebuilt         # never builds; prints the source commit and how far behind origin/main it is
+```
+The directory is `-PrebuiltDir`, else `$env:PLAYGTA6_PREBUILT_WEB_DIR`, else `%LOCALAPPDATA%\playgta6\prebuilt-web`; it holds
+`web/`, `boot/`, `build/` (staged shader pack, caches) and `prebuilt.json` (the source commit). It reuses the lift cache and
+the previous object cache, so refreshes are incremental. `tools/run_browser_boot.py --build-only` runs just the build stages
+(no server, no Chrome); `--web-dir` serves a web root other than `<repo>/web`.
 `-InputScript` defaults to `calibration-skip` (`-InputScript none` turns it off). `-ShaderPack` defaults to
 `$env:PLAYGTA6_SHADER_PACK`, else `work/splash.wgsl.pack`; if none exists the script prints the build command and stops.
 Each run gets a unique name (`play-local-YYYYMMDD-HHMMSS`, override with `-Name`), so reruns never collide.

@@ -4,7 +4,7 @@
     python tools/run_browser_boot.py [--preset smoke|start-screen|long] [--name NAME]
         [--smoke] [--boot-dir DIR] [--game-dir DIR] [--shader-pack FILE] [--out-dir DIR]
         [--runs-dir DIR] [--port PORT] [--duration-s N] [--headless | --headed]
-        [--chrome PATH] [--trust-build] [--rebuild] [--no-build] [--dry-run]
+        [--chrome PATH] [--trust-build] [--rebuild] [--no-build] [--dry-run] [--build-only] [--web-dir DIR]
         [--capture-frames [DIR]] [--capture-interval-sec SEC] [--mp4] [--mp4-fps FPS]
         [--mp4-skip-black] [--hide-hud] [--hold-until-visible auto|on|off]
         [--baseline NAME|DIR]
@@ -4008,6 +4008,7 @@ def run_browser_session(
     user_data_dir: Path | None = None,
     cleanup_user_data_dir: bool = True,
     log_prefix: str = "",
+    web_dir: Path | None = None,
     runner: CommandRunner = run_command,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     cdp_factory: Callable[[str], CdpClient] = CdpClient,
@@ -4090,7 +4091,7 @@ def run_browser_session(
         effective_game_dir = game_dir
 
     data_dir = repo / "local-data"
-    web_dir = repo / "web"
+    web_dir = web_dir if web_dir is not None else repo / "web"
     server_cmd = build_server_cmd(
         repo=repo,
         host=host,
@@ -5381,6 +5382,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-build", action="store_true", help="fail instead of building any stale stage")
     p.add_argument("--dry-run", action="store_true", help="print sanitized build/launch plan as JSON and exit")
     p.add_argument(
+        "--build-only",
+        action="store_true",
+        help="run the build stages and stage the shader pack, then exit: no server, no Chrome, no run directory",
+    )
+    p.add_argument("--web-dir", type=Path, help="web root served at / (default <repo>/web; --out-dir should live in it)")
+    p.add_argument(
         "--capture-frames",
         nargs="?",
         const=True,
@@ -5594,6 +5601,7 @@ def _run(
     runs_dir = resolve_against_repo(args.runs_dir or (build_dir / "runs"), repo)
     boot_dir = resolve_against_repo(args.boot_dir or DEFAULT_BOOT_DIR_REL, repo)
     out_dir = resolve_against_repo(args.out_dir or DEFAULT_OUT_DIR_REL, repo)
+    web_dir = resolve_against_repo(args.web_dir, repo) if args.web_dir else repo / "web"
     runtime_lib_override = resolve_against_repo(args.runtime_lib, repo) if args.runtime_lib else None
 
     exe: Path | None = None
@@ -5639,7 +5647,7 @@ def _run(
         )
 
     shader_plan = plan_shader_staging(shader_pack, shader_stage_dir) if shader_pack is not None else []
-    chrome_path = chrome_discoverer(args.chrome, env=env)
+    chrome_path = None if args.build_only else chrome_discoverer(args.chrome, env=env)
     sanitized_plan = plan.sanitized(repo)
 
     for step in sanitized_plan:
@@ -5655,7 +5663,7 @@ def _run(
             repo=repo,
             host="127.0.0.1",
             port=preview_port,
-            web_dir=repo / "web",
+            web_dir=web_dir,
             data_dir=repo / "local-data",
             boot_dir=None if args.smoke else boot_dir,
             game_dir=game_dir,
@@ -5740,7 +5748,7 @@ def _run(
     if plan.steps and args.no_build:
         raise RunnerError("stale stages with --no-build: " + ", ".join(s["stage"] for s in plan.steps))
 
-    if chrome_path is None:
+    if chrome_path is None and not args.build_only:
         raise RunnerError(
             "Chrome/Chromium/Edge executable not found (pass --chrome PATH or set CHROME_PATH)"
         )
@@ -5781,6 +5789,11 @@ def _run(
             f"runtime.wasm not found in {repo_relative_label(out_dir, repo)} after build "
             "(build Wasm64 runtime or pass --smoke)"
         )
+
+    if args.build_only:
+        clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
+        print("[build-only] build stages and shader staging complete", file=sys.stderr, flush=True)
+        return 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
     clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
@@ -5831,6 +5844,8 @@ def _run(
             cold_kwargs["user_data_dir"] = shared_profile_dir
             cold_kwargs["cleanup_user_data_dir"] = False
 
+        if args.web_dir:
+            cold_kwargs["web_dir"] = web_dir
         session = session_runner(**cold_kwargs)
 
         cold_has_report = bool(
@@ -5886,6 +5901,8 @@ def _run(
                 "log_prefix": "warm-",
                 "runner": runner,
             }
+            if args.web_dir:
+                warm_kwargs["web_dir"] = web_dir
             warm_session = session_runner(**warm_kwargs)
             warm_console_lines = list(warm_session.console_lines)
             warm_hud_lines = ((warm_session.final_probe or {}).get("hud") or {}).get("logLines")

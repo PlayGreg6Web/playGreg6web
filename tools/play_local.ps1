@@ -6,6 +6,7 @@
   .\tools\play_local.ps1 -Exe D:\game\game.exe -GameDir D:\game\package
 .NOTES
   Stop: close the Chrome window or press Ctrl+C here; the server stops with this script.
+  -Prebuilt: play the build made by tools/update_prebuilt.ps1 -Web (dir: -PrebuiltDir, else $env:PLAYGTA6_PREBUILT_WEB_DIR, else %LOCALAPPDATA%\playgta6\prebuilt-web; -BuildDir is ignored). Never builds (-TrustBuild semantics); prints its source commit and how far behind origin/main it is.
   -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues). Every start warns when behind origin/main.
   See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
 #>
@@ -22,6 +23,8 @@ param(
     [int]$DurationS = 7200,
     [switch]$NoBuild,
     [switch]$TrustBuild,
+    [switch]$Prebuilt,
+    [string]$PrebuiltDir = $env:PLAYGTA6_PREBUILT_WEB_DIR,
     [switch]$Update,
     [switch]$DryRun
 )
@@ -29,6 +32,19 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 if ($Update) { & python (Join-Path $PSScriptRoot "repo_update.py") update --repo $repo }
 & python (Join-Path $PSScriptRoot "repo_update.py") check --repo $repo
+if ($Prebuilt) {
+    if (-not $PrebuiltDir) { $PrebuiltDir = Join-Path $env:LOCALAPPDATA "playgta6\prebuilt-web" }
+    $PrebuiltDir = [System.IO.Path]::GetFullPath($PrebuiltDir)
+    if (-not (Test-Path -LiteralPath (Join-Path $PrebuiltDir "prebuilt.json"))) {
+        throw "No prebuilt build in $PrebuiltDir. Create it with: .\tools\update_prebuilt.ps1 -Web"
+    }
+    $TrustBuild = $true
+    & python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $PrebuiltDir --repo $repo
+    if (-not $ShaderPack) {
+        $staged = Get-ChildItem -LiteralPath (Join-Path $PrebuiltDir "build\staged-shaders") -Filter *.pack -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($staged) { $ShaderPack = $staged.FullName }
+    }
+}
 if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
 if (-not $ShaderPack) {
     $default = Join-Path $repo "work/splash.wgsl.pack"
@@ -54,6 +70,10 @@ $argv = @("tools/run_browser_boot.py", "--preset", "long", "--name", $Name, "--h
 if ($Chrome) { $argv += @("--chrome", $Chrome) }
 if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
 if ($InputScript -and $InputScript -ne "none") { $argv += @("--input-script", $InputScript) }
+if ($Prebuilt) {
+    $argv[$argv.IndexOf("--build-dir") + 1] = (Join-Path $PrebuiltDir "build")
+    $argv += @("--boot-dir", (Join-Path $PrebuiltDir "boot"), "--out-dir", (Join-Path $PrebuiltDir "web\dist"), "--web-dir", (Join-Path $PrebuiltDir "web"))
+}
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
 if ($DryRun) { $argv += "--dry-run" }

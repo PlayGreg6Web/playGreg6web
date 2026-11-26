@@ -289,6 +289,19 @@ class DryRunAndStalenessTests(unittest.TestCase):
             self.assertNotRegex(raw_json, r"(?<![A-Za-z0-9_])[A-Za-z]:[/\\]")
             self.assertNotIn(str(Path(d)), raw_json)
 
+    def test_build_only_builds_without_chrome_session_or_run_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            os.utime(fx.runtime_wasm, (fx.base - 5, fx.base - 5))  # stale guest wasm
+            code, out, err, cmd_calls, session_calls = fx.run_cli(
+                "--build-only", "--exe", str(fx.exe), "--game-dir", str(fx.game_dir), "--name", "b1",
+                chrome_discoverer=lambda *a, **k: None,
+            )
+            self.assertEqual(code, 0, err)
+            self.assertEqual(session_calls, [])
+            self.assertTrue(any("build_guest_wasm.py" in " ".join(c) for c in cmd_calls))
+            self.assertFalse((fx.build / "runs" / "b1").exists())
+
     def test_nothing_stale_runs_zero_build_commands(self):
         with tempfile.TemporaryDirectory() as d:
             fx = RepoFixture(Path(d))
