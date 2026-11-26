@@ -2406,13 +2406,15 @@ void test_xapu() {
         CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
     };
     command(5, 7);
-    command(9, 3);  // not acknowledged
+    command(9, 3);  // unknown type: still acknowledged
     command(2, 7);
-    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 2);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 3);
     const uint64_t result = com::guest_alloc(0x38);
     CHECK(com::write_guest(result + 0x30, uint64_t{~0ull}));
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
     CHECK(load32(result) == 5 && load32(result + 4) == 7 && load64(result + 0x30) == 0);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+    CHECK(load32(result) == 9 && load32(result + 4) == 3);
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
     CHECK(load32(result) == 2 && load32(result + 4) == 7);
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) < 0);  // empty
@@ -2420,9 +2422,55 @@ void test_xapu() {
     // Per-type census: the unknown type 9 is counted as unhandled and posts nothing.
     const ga::XApuStats census = ga::xapu_stats();
     CHECK(census.type5_commands == 1 && census.type2_commands == 1 && census.type1_commands == 0);
-    CHECK(census.unhandled_commands == 1 && census.results_posted == 2 && census.type3_results == 0);
+    CHECK(census.unhandled_commands == 1 && census.results_posted == 3 && census.type3_results == 0);
     CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
     CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
+}
+
+// R40: connect parameters {streams, commands per stream, memory bytes, options}: a result event in
+// the second qword of the output struct (set for every result), the requested memory size, and
+// queue-full past streams * commands outstanding results.
+void test_xapu_connect_params() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t dequeue = fx.export_address("xapu.dll", "XApuDequeueResult");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint32_t words[4] = {1, 3, 0x400000, 1};
+    CHECK(com::write_guest(params, words, sizeof(words)));
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    const uint64_t shared = load64(p2);
+    const uint64_t event = load64(p2 + 8);
+    CHECK(handle != 0 && shared != 0 && event != 0);
+    // The requested 4 MiB is allocated and zeroed.
+    CHECK(load64(shared + 0x400000 - 8) == 0);
+    namespace w32 = playgta6::os::win32;
+    CHECK(w32::WaitForSingleObject(static_cast<w32::Handle>(event), 0) != 0);  // not signalled yet
+    const uint64_t c = com::guest_alloc(0x40);
+    auto send = [&](uint32_t type, uint32_t voice) {
+        const uint32_t head[2] = {type, voice};
+        CHECK(com::write_guest(c, head, sizeof(head)));
+        return as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)}));
+    };
+    CHECK(send(4, 1) == 0);  // reset-style type without a model: still a result and a wake-up
+    CHECK(w32::WaitForSingleObject(static_cast<w32::Handle>(event), 0) == 0);
+    CHECK(w32::WaitForSingleObject(static_cast<w32::Handle>(event), 0) != 0);  // auto-reset
+    CHECK(send(1, 2) == 0 && send(5, 2) == 0);
+    CHECK(send(2, 2) < 0);  // 3 outstanding: queue full
+    const uint64_t result = com::guest_alloc(0x38);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0 && load32(result) == 4);
+    CHECK(send(2, 2) == 0);  // room again
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+
+    // Zero parameters keep the fixed layout and no event.
+    const uint64_t zero = com::guest_alloc(0x18);
+    const uint64_t q2 = com::guest_alloc(0x10);
+    CHECK(as_hr(fx.dcall(connect, {I(zero), I(q2), I(fx.out_slot())})) == 0);
+    CHECK(load64(q2) != 0 && load64(q2 + 8) == 0);
 }
 
 // O36: a title that never dequeues cannot grow the result queue without limit.
@@ -2624,6 +2672,7 @@ int main() {
     test_acp_hal_xma_decode_worker();
     test_xdsp();
     test_xapu();
+    test_xapu_connect_params();
     test_xapu_bounded_queue();
     test_xapu_decode();
     test_mmdevice();

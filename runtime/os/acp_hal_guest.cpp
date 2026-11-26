@@ -52,6 +52,7 @@
 #include "os/xapu_opus.h"
 #include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
+#include "os/win32_kernel.h"
 #include "os/xma_decoder.h"
 
 namespace playgta6::os::scarlett::guest_api {
@@ -606,6 +607,8 @@ struct XApuState {
     std::map<uint64_t, std::deque<XApuResult>> queues;  // handle -> pending results
     std::map<uint32_t, uint64_t> commands;              // command type -> count
     std::map<uint64_t, uint64_t> memory;                // handle -> shared memory
+    std::map<uint64_t, uint64_t> events;                // handle -> auto-reset result event (when asked for)
+    std::map<uint64_t, size_t> limits;                  // handle -> max outstanding results (0 = unlimited)
     std::map<std::pair<uint64_t, uint32_t>, std::unique_ptr<xapu_opus::VoiceDecoder>> decoders;  // (handle, voice)
     uint64_t decoded_packets = 0;
     uint64_t failed_packets = 0;
@@ -642,6 +645,46 @@ uint64_t alloc_zeroed(uint64_t bytes) {
     return va;
 }
 
+// Connect parameters (R40), read defensively: {u32 streams, u32 commands per stream, u32 memory
+// bytes, u32 options}. Options bit 0 asks for an auto-reset result event, written to the second
+// qword of the output struct. Zero or implausible values fall back to the fixed 128-slot layout
+// with no queue limit and no event.
+constexpr uint32_t kXApuOptionResultEvent = 1;
+constexpr uint32_t kXApuMaxStreams = 4096;
+constexpr uint32_t kXApuMaxCommandsPerStream = 4096;
+constexpr uint32_t kXApuMaxMemoryBytes = 64u << 20;
+constexpr HResult kXApuQueueFull = static_cast<HResult>(0x8007006Cu);
+
+struct XApuConnectParams {
+    uint64_t memory_bytes = kXApuSharedBytes;
+    size_t outstanding_limit = 0;
+    bool result_event = false;
+};
+
+XApuConnectParams parse_connect_params(uint64_t params) {
+    XApuConnectParams r;
+    uint32_t w[4] = {};
+    if (!com::read_guest(params, w, sizeof(w))) {
+        return r;
+    }
+    if (w[0] != 0 && w[0] <= kXApuMaxStreams && w[1] != 0 && w[1] <= kXApuMaxCommandsPerStream) {
+        r.outstanding_limit = size_t{w[0]} * w[1];
+    }
+    // The voice slots are addressed at fixed offsets, so never go below the fixed layout.
+    if (w[2] > kXApuSharedBytes && w[2] <= kXApuMaxMemoryBytes) {
+        r.memory_bytes = w[2];
+    }
+    r.result_event = (w[3] & kXApuOptionResultEvent) != 0;
+    return r;
+}
+
+void signal_result_event(uint64_t handle) {  // the caller holds the lock
+    const auto e = xapu().events.find(handle);
+    if (e != xapu().events.end()) {
+        win32::SetEvent(static_cast<win32::Handle>(e->second));
+    }
+}
+
 HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
     if (out.is_null() || !out.write(0)) {
         return com::E_POINTER_HR;
@@ -650,7 +693,8 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
         return com::E_INVALIDARG_HR;
     }
     const uint64_t handle = com::guest_alloc(64);
-    const uint64_t memory = alloc_zeroed(kXApuSharedBytes);
+    const XApuConnectParams cp = parse_connect_params(params);
+    const uint64_t memory = alloc_zeroed(cp.memory_bytes);
     if (handle == 0 || memory == 0) {
         if (handle != 0) {
             com::guest_free(handle);
@@ -660,18 +704,28 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
         }
         return com::E_OUTOFMEMORY_HR;
     }
+    uint64_t event = 0;
     {
         std::lock_guard<std::mutex> lock(xapu().mutex);
         xapu().queues[handle];
         xapu().memory[handle] = memory;
+        xapu().limits[handle] = cp.outstanding_limit;
+        if (cp.result_event) {
+            xapu().events[handle] = static_cast<uint64_t>(win32::CreateEventA(nullptr, false, false, nullptr));
+        }
+        event = cp.result_event ? xapu().events[handle] : 0;
     }
     shared.write(memory);
+    if (cp.result_event) {
+        com::write_guest(shared.va() + 8, &event, sizeof(event));
+    }
     out.write(handle);
     return kOk;
 }
 
 HResult xapu_disconnect(uint64_t handle) {
     uint64_t memory = 0;
+    uint64_t event = 0;
     {
         std::lock_guard<std::mutex> lock(xapu().mutex);
         if (xapu().queues.erase(handle) == 0) {
@@ -679,8 +733,16 @@ HResult xapu_disconnect(uint64_t handle) {
         }
         memory = xapu().memory[handle];
         xapu().memory.erase(handle);
+        xapu().limits.erase(handle);
+        if (const auto e = xapu().events.find(handle); e != xapu().events.end()) {
+            event = e->second;
+            xapu().events.erase(e);
+        }
         auto& decoders = xapu().decoders;
         decoders.erase(decoders.lower_bound({handle, 0u}), decoders.upper_bound({handle, ~0u}));
+    }
+    if (event != 0) {
+        win32::CloseHandle(static_cast<win32::Handle>(event));
     }
     com::guest_free(handle);
     if (memory != 0) {
@@ -803,7 +865,11 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (it == xapu().queues.end()) {
         return com::E_INVALIDARG_HR;
     }
-    const bool acknowledged = type == 1 || type == 2 || type == 3 || type == 5;
+    if (const size_t limit = xapu().limits[handle]; limit != 0 && it->second.size() >= limit) {
+        return kXApuQueueFull;
+    }
+    // Every command type is acknowledged with a result, in command order.
+    const bool acknowledged = true;
     if (++xapu().commands[type] == 1) {
         diag("XApu: first command of type " + std::to_string(type) +
              (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
@@ -821,14 +887,15 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (type == 3) {
         push_bounded(it->second, decode_command(handle, decode));
         ++xapu().type3_results;
-    } else if (acknowledged) {
-        push_bounded(it->second, make_result(type, head[1]));
     } else {
-        ++xapu().unhandled;
+        push_bounded(it->second, make_result(type, head[1]));
     }
-    if (acknowledged) {
-        ++xapu().results_posted;
+    if (type != 1 && type != 2 && type != 3 && type != 5) {
+        ++xapu().unhandled;  // no behaviour modelled for this type (still acknowledged)
     }
+    ++xapu().results_posted;
+    // The result is ready now: wake the title's audio thread (auto-reset event, if connected with one).
+    signal_result_event(handle);
     return kOk;
 }
 
