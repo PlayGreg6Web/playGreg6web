@@ -1709,9 +1709,9 @@ uint64_t console_layout_size(const GuestResourceDesc& d) {
         // stencil plane starts at a swizzle block boundary after the depth plane. (Not the tight
         // texel estimate: partial blocks, mip chains and tails round up per plane.)
         uint64_t total = 0;
+        const gfx10::PlanarSplit split = gfx10::depth_stencil_planes(d.Format);
         for (uint32_t plane = 0; plane < 2; ++plane) {
-            const uint32_t pbytes = plane_block_bytes(d.Format, plane);
-            g.dxgi_format = pbytes == 1 ? 62u : pbytes == 2 ? 56u : 41u;  // R8_UINT / R16_UNORM / R32_FLOAT
+            g.dxgi_format = split.format[plane];
             const uint64_t surface = gfx10::surface_bytes(g) * slices;
             if (surface == 0) {
                 return 0;

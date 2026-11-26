@@ -1412,5 +1412,80 @@ bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, con
     return tile_surface_impl(desc, mip, kAllSlices, linear_src, linear_src_bytes, surface.data(), surface.size());
 }
 
-}  // namespace playgta6::gpu::gfx10
+PlanarSplit depth_stencil_planes(uint32_t f) noexcept {
+    PlanarSplit r;
+    if ((f >= 19u && f <= 22u) || (f >= 44u && f <= 47u)) {
+        r.planes = 2;
+        r.format[0] = 41u;  // R32_FLOAT
+        r.format[1] = 62u;  // R8_UINT
+    } else if (f >= 118u && f <= 120u) {
+        r.planes = 2;
+        r.format[0] = 56u;  // R16_UNORM
+        r.format[1] = 62u;
+    }
+    return r;
+}
 
+uint32_t suggest_swizzle_mode(const SuggestSwizzleDesc& s) noexcept {
+    const uint32_t linear = kConsoleLinearLayout;
+    if (s.dimension != 2u && s.dimension != 3u) {
+        return linear;  // 1D (and anything unknown): console linear
+    }
+    if (s.width == 0u || s.height == 0u || s.depth_or_array_size == 0u) {
+        return linear;
+    }
+    const PlanarSplit split = depth_stencil_planes(s.dxgi_format);
+    const bool depth = s.depth_stencil || split.planes == 2u || s.dxgi_format == 40u || s.dxgi_format == 55u;
+    const bool is3d = s.dimension == 3u;
+    const bool msaa = s.sample_count > 1u;
+    TextureLayoutDesc g;
+    g.dxgi_format = split.planes == 2u ? split.format[0] : s.dxgi_format;
+    g.width = s.width;
+    g.height = s.height;
+    g.depth = is3d ? s.depth_or_array_size : 1u;
+    g.mip_levels = s.mip_levels;
+    if (g.mip_levels == 0u) {
+        uint32_t m = std::max({g.width, g.height, g.depth});
+        g.mip_levels = 1u;
+        while (m > 1u) {
+            m >>= 1;
+            ++g.mip_levels;
+        }
+    }
+    // Candidate S blocks (256 B, 4 KiB, 64 KiB); the padded size of a surface depends on the block
+    // shape only, not on the family.
+    const uint32_t base[3] = {0x101u, 0x105u, 0x109u};
+    uint64_t pad[3] = {};
+    uint64_t best = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (i == 0 && (is3d || msaa || depth)) {
+            continue;  // no thick / MSAA / depth 256 B block
+        }
+        g.d3d12_layout = base[i];
+        pad[i] = surface_bytes(g);
+        if (pad[i] != 0u && (best == 0u || pad[i] < best)) {
+            best = pad[i];
+        }
+    }
+    if (best == 0u) {
+        return linear;  // unsupported format
+    }
+    int pick = -1;
+    for (int i = 2; i >= 0 && pick < 0; --i) {
+        if (pad[i] != 0u && pad[i] <= 2u * best) {
+            pick = i;
+        }
+    }
+    if (is3d) {
+        return base[pick];
+    }
+    if (depth) {
+        return base[pick] - 1u;  // 4KB_Z = 0x104, 64KB_Z = 0x108
+    }
+    if (s.render_target || msaa) {
+        return base[pick] + 2u;  // 256B_R = 0x103, 4KB_R = 0x107, 64KB_R = 0x10B
+    }
+    return base[pick];
+}
+
+}  // namespace playgta6::gpu::gfx10

@@ -518,7 +518,7 @@ public:
         }
         std::vector<uint8_t> bytes(kXgResourceLayoutSize, 0);
         const uint32_t mips = std::min<uint32_t>(layout_.mip_levels, kXgMaxMips);
-        const uint32_t planes = 1;
+        const uint32_t planes = planar_ ? 2u : 1u;
         const uint64_t total = tiled_ ? surface_bytes_ : layout_.size_bytes;
         const uint64_t base_alignment = tiled_ ? std::max<uint64_t>(layout_.base_alignment_bytes, tiled_block_bytes_)
                                                : layout_.base_alignment_bytes;
@@ -526,49 +526,60 @@ public:
         std::memcpy(bytes.data() + 0x08, &base_alignment, 8);
         std::memcpy(bytes.data() + 0x10, &mips, 4);
         std::memcpy(bytes.data() + 0x14, &planes, 4);
-        uint8_t* plane = bytes.data() + kXgLayoutPlaneOffset;
-        // Plane header (hypothesis): +0x04 bytes per element, +0x08 size, +0x18 base alignment.
-        const ElementInfo e = element_info(desc_.format);
-        std::memcpy(plane + 0x04, &e.bytes, 4);
-        std::memcpy(plane + 0x08, &total, 8);
-        std::memcpy(plane + 0x18, &base_alignment, 8);
-        for (uint32_t m = 0; m < mips; ++m) {
-            const Pg6XgMipLevelLayout& hm = layout_.mips[m];
-            XgMipLayout gm{};
-            if (tiled_) {
-                // GFX10 placement (gpu/gfx10_detile.h): the same source the detiler and
-                // CopyIntoSubresource use.
-                const playgta6::gpu::gfx10::MipPlacement mp = playgta6::gpu::gfx10::mip_placement(tiled_desc_, m);
-                gm.size_bytes = mp.size_bytes * slices_;
-                gm.offset_bytes = mp.offset_bytes;
-                gm.slice_2d_size_bytes = mp.slice_bytes;
-                gm.pitch_bytes = mp.pitch_elements * e.bytes;
-                gm.pitch_pixels = mp.pitch_elements * e.block;
-                gm.alignment_bytes = static_cast<uint32_t>(mp.block_bytes);
-                gm.padded_width_elements = mp.pitch_elements;
-                gm.padded_height_elements = mp.height_elements;
+        for (uint32_t p = 0; p < planes; ++p) {
+            uint8_t* plane = bytes.data() + kXgLayoutPlaneOffset + p * kXgLayoutPlaneSize;
+            // Plane header (hypothesis): +0x00 usage (planar: 1 depth, 2 stencil), +0x04 bytes per
+            // element, +0x08 size, +0x10 offset from the resource base, +0x18 base alignment.
+            const playgta6::gpu::gfx10::TextureLayoutDesc& td = planar_ ? plane_desc_[p] : tiled_desc_;
+            const ElementInfo e = planar_ ? plane_element(p) : element_info(desc_.format);
+            const uint64_t plane_size = planar_ ? plane_bytes_[p] : total;
+            const uint64_t plane_offset = planar_ ? plane_offset_[p] : 0;
+            if (planar_) {
+                const uint32_t usage = p + 1;
+                std::memcpy(plane + 0x00, &usage, 4);
+            }
+            std::memcpy(plane + 0x04, &e.bytes, 4);
+            std::memcpy(plane + 0x08, &plane_size, 8);
+            std::memcpy(plane + 0x10, &plane_offset, 8);
+            std::memcpy(plane + 0x18, &base_alignment, 8);
+            for (uint32_t m = 0; m < mips; ++m) {
+                const Pg6XgMipLevelLayout& hm = layout_.mips[m];
+                XgMipLayout gm{};
+                if (tiled_) {
+                    // GFX10 placement (gpu/gfx10_detile.h): the same source the detiler and
+                    // CopyIntoSubresource use. Mip offsets are relative to the plane.
+                    const playgta6::gpu::gfx10::MipPlacement mp = playgta6::gpu::gfx10::mip_placement(td, m);
+                    gm.size_bytes = mp.size_bytes * slices_;
+                    gm.offset_bytes = mp.offset_bytes;
+                    gm.slice_2d_size_bytes = mp.slice_bytes;
+                    gm.pitch_bytes = mp.pitch_elements * e.bytes;
+                    gm.pitch_pixels = mp.pitch_elements * e.block;
+                    gm.alignment_bytes = static_cast<uint32_t>(mp.block_bytes);
+                    gm.padded_width_elements = mp.pitch_elements;
+                    gm.padded_height_elements = mp.height_elements;
+                    gm.padded_depth_or_array_size = desc_.dimension == 4 ? hm.depth : layout_.array_size;
+                    gm.width_elements = ceil_div(hm.width, e.block);
+                    gm.height_elements = ceil_div(hm.height, e.block);
+                    gm.depth_or_array_size = gm.padded_depth_or_array_size;
+                    gm.sample_count = 1;
+                    std::memcpy(plane + kXgPlaneMipOffset + m * kXgMipLayoutSize, &gm, sizeof(gm));
+                    continue;
+                }
+                gm.size_bytes = hm.size_bytes;
+                gm.offset_bytes = hm.offset_bytes;
+                gm.slice_2d_size_bytes = hm.slice_size_bytes;
+                gm.pitch_bytes = hm.row_pitch_bytes;
+                gm.pitch_pixels = hm.row_pitch_bytes / e.bytes * e.block;
+                gm.alignment_bytes = 256;
+                gm.padded_width_elements = hm.row_pitch_bytes / e.bytes;
+                gm.padded_height_elements = hm.padded_rows;
                 gm.padded_depth_or_array_size = desc_.dimension == 4 ? hm.depth : layout_.array_size;
                 gm.width_elements = ceil_div(hm.width, e.block);
                 gm.height_elements = ceil_div(hm.height, e.block);
                 gm.depth_or_array_size = gm.padded_depth_or_array_size;
-                gm.sample_count = 1;
+                gm.sample_count = std::max<uint32_t>(desc_.sample_count, 1);
                 std::memcpy(plane + kXgPlaneMipOffset + m * kXgMipLayoutSize, &gm, sizeof(gm));
-                continue;
             }
-            gm.size_bytes = hm.size_bytes;
-            gm.offset_bytes = hm.offset_bytes;
-            gm.slice_2d_size_bytes = hm.slice_size_bytes;
-            gm.pitch_bytes = hm.row_pitch_bytes;
-            gm.pitch_pixels = hm.row_pitch_bytes / e.bytes * e.block;
-            gm.alignment_bytes = 256;
-            gm.padded_width_elements = hm.row_pitch_bytes / e.bytes;
-            gm.padded_height_elements = hm.padded_rows;
-            gm.padded_depth_or_array_size = desc_.dimension == 4 ? hm.depth : layout_.array_size;
-            gm.width_elements = ceil_div(hm.width, e.block);
-            gm.height_elements = ceil_div(hm.height, e.block);
-            gm.depth_or_array_size = gm.padded_depth_or_array_size;
-            gm.sample_count = std::max<uint32_t>(desc_.sample_count, 1);
-            std::memcpy(plane + kXgPlaneMipOffset + m * kXgMipLayoutSize, &gm, sizeof(gm));
         }
         return com::write_guest(out, bytes.data(), bytes.size()) ? kOk : com::E_POINTER_HR;
     }
@@ -630,7 +641,7 @@ public:
         if (!bit_offset.is_null()) {
             bit_offset.write(0);
         }
-        if (plane != 0 || mip >= layout_.mip_levels || x > 0xFFFFFFFFull) {
+        if (plane >= (planar_ ? 2u : 1u) || mip >= layout_.mip_levels || x > 0xFFFFFFFFull) {
             return UINT64_MAX;
         }
         if (tiled_) {
@@ -638,9 +649,12 @@ public:
             if (!is_3d && z >= slices_) {
                 return UINT64_MAX;
             }
+            const uint64_t chain = planar_ ? plane_chain_[plane] : chain_bytes_;
             const uint64_t offset = playgta6::gpu::gfx10::surface_element_offset(
-                tiled_desc_, mip, static_cast<uint32_t>(x), y, is_3d ? z : 0u);
-            return offset == UINT64_MAX ? offset : (is_3d ? 0u : uint64_t{z} * chain_bytes_) + offset;
+                planar_ ? plane_desc_[plane] : tiled_desc_, mip, static_cast<uint32_t>(x), y, is_3d ? z : 0u);
+            return offset == UINT64_MAX
+                       ? offset
+                       : (planar_ ? plane_offset_[plane] : 0u) + (is_3d ? 0u : uint64_t{z} * chain) + offset;
         }
         const Pg6XgMipLevelLayout& ml = layout_.mips[mip];
         const ElementInfo e = element_info(desc_.format);
@@ -779,6 +793,31 @@ private:
         tiled_desc_.d3d12_layout = desc_.swizzle_mode;
         // 1D/2D arrays repeat the chain per slice (addrlib: slice stride = mip-chain slice size).
         slices_ = desc_.dimension != 4 ? std::max<uint32_t>(desc_.depth_or_array_size, 1u) : 1u;
+        // Depth/stencil formats: two tiled surfaces, depth then stencil (the allocation sizing's
+        // plane rule, gfx10::depth_stencil_planes), each its own mip chain x slices.
+        const gfx10::PlanarSplit split = gfx10::depth_stencil_planes(desc_.format);
+        if (split.planes == 2) {
+            uint64_t offset = 0;
+            for (uint32_t p = 0; p < 2; ++p) {
+                plane_desc_[p] = tiled_desc_;
+                plane_desc_[p].dxgi_format = split.format[p];
+                plane_chain_[p] = gfx10::surface_bytes(plane_desc_[p]);
+                plane_bytes_[p] = plane_chain_[p] * slices_;
+                if (plane_bytes_[p] == 0) {
+                    xg_linear_answers().fetch_add(1);
+                    return;
+                }
+                plane_offset_[p] = offset;
+                offset += plane_bytes_[p];  // whole swizzle blocks: the next plane stays aligned
+            }
+            tiled_desc_ = plane_desc_[0];
+            chain_bytes_ = plane_chain_[0];
+            surface_bytes_ = static_cast<size_t>(offset);
+            tiled_block_bytes_ = gfx10::mip_placement(plane_desc_[0], 0).block_bytes;
+            planar_ = true;
+            tiled_ = true;
+            return;
+        }
         chain_bytes_ = gfx10::surface_bytes(tiled_desc_);
         const size_t bytes = chain_bytes_ * slices_;
         if (bytes == 0) {
@@ -798,15 +837,20 @@ private:
     HResult copy_into_tiled(uint64_t dst, uint32_t plane, uint32_t subresource, uint64_t src, uint32_t row_pitch,
                             uint32_t slice_pitch) {
         namespace gfx10 = playgta6::gpu::gfx10;
-        if (plane != 0 || subresource >= tiled_desc_.mip_levels * slices_) {
+        if (plane >= (planar_ ? 2u : 1u) || subresource >= tiled_desc_.mip_levels * slices_) {
             return com::E_INVALIDARG_HR;
         }
-        const gfx10::FormatGeometry g = gfx10::format_geometry(tiled_desc_.dxgi_format);
+        const gfx10::TextureLayoutDesc& td = planar_ ? plane_desc_[plane] : tiled_desc_;
+        const uint64_t chain_bytes = planar_ ? plane_chain_[plane] : chain_bytes_;
+        if (planar_) {
+            dst += plane_offset_[plane];
+        }
+        const gfx10::FormatGeometry g = gfx10::format_geometry(td.dxgi_format);
         const uint32_t mip = subresource % tiled_desc_.mip_levels;
-        dst += uint64_t{subresource / tiled_desc_.mip_levels} * chain_bytes_;
-        const uint32_t w = std::max(1u, tiled_desc_.width >> mip);
-        const uint32_t h = std::max(1u, tiled_desc_.height >> mip);
-        const uint32_t d = std::max(1u, tiled_desc_.depth >> mip);
+        dst += uint64_t{subresource / td.mip_levels} * chain_bytes;
+        const uint32_t w = std::max(1u, td.width >> mip);
+        const uint32_t h = std::max(1u, td.height >> mip);
+        const uint32_t d = std::max(1u, td.depth >> mip);
         const uint32_t row_bytes = (w + g.block_width - 1u) / g.block_width * g.bytes_per_block;
         const uint32_t rows = (h + g.block_height - 1u) / g.block_height;
         if (row_pitch < row_bytes || (d > 1 && slice_pitch < uint64_t{row_pitch} * rows)) {
@@ -821,9 +865,9 @@ private:
                 }
             }
         }
-        std::vector<uint8_t> surface(chain_bytes_);
+        std::vector<uint8_t> surface(chain_bytes);
         if (!com::read_guest(dst, surface.data(), surface.size()) ||
-            !gfx10::tile_into_surface(tiled_desc_, mip, linear.data(), linear.size(), surface.data(), surface.size()) ||
+            !gfx10::tile_into_surface(td, mip, linear.data(), linear.size(), surface.data(), surface.size()) ||
             !com::write_guest(dst, surface.data(), surface.size())) {
             return com::E_INVALIDARG_HR;
         }
@@ -845,6 +889,17 @@ private:
     uint32_t slices_ = 1;
     uint64_t tiled_block_bytes_ = 0;
     bool tiled_ = false;
+    // Depth/stencil: plane 0 = depth, plane 1 = stencil (tiled_desc_ / chain_bytes_ describe plane 0).
+    bool planar_ = false;
+    playgta6::gpu::gfx10::TextureLayoutDesc plane_desc_[2]{};
+    uint64_t plane_chain_[2] = {};   // one slice's mip chain per plane
+    uint64_t plane_bytes_[2] = {};   // chain x slices per plane
+    uint64_t plane_offset_[2] = {};  // from the resource base
+
+    ElementInfo plane_element(uint32_t p) const {
+        const playgta6::gpu::gfx10::FormatGeometry g = playgta6::gpu::gfx10::format_geometry(plane_desc_[p].dxgi_format);
+        return {g.block_width, g.bytes_per_block};
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1037,11 +1092,30 @@ HResult xg_create_texture_computer(uint64_t desc_va, OutPtr out) {
     return kOk;
 }
 
-HResult xg_suggest_swizzle_mode(uint64_t /*desc*/, uint32_t /*flags*/, GuestPtr<uint32_t> mode) {
+HResult xg_suggest_swizzle_mode(uint64_t desc, uint32_t /*flags*/, GuestPtr<uint32_t> mode) {
     if (mode.is_null()) {
         return com::E_POINTER_HR;
     }
-    return mode.write(kXgDefaultSwizzleMode) ? kOk : com::E_POINTER_HR;
+    // The title builds the descriptor itself (dimension 2 / 3 / 4 = 1D / 2D / 3D; flags +0x30:
+    // bit 0 render target, bit 1 depth-stencil, bit 2 UAV, the D3D12 resource flags) and calls this
+    // only for per-texture mode 0xFF; what it reads is the shape, format, mips, samples and flags.
+    XgResourceDesc d{};
+    uint32_t picked = kXgDefaultSwizzleMode;
+    if (desc != 0 && com::read_guest(desc, &d, kXgResourceDescBytes) && d.dimension >= 2 && d.dimension <= 4) {
+        playgta6::gpu::gfx10::SuggestSwizzleDesc s;
+        s.dimension = d.dimension - 1;
+        s.dxgi_format = d.format;
+        s.width = static_cast<uint32_t>(std::min<uint64_t>(d.width, 0xFFFFFFFFull));
+        s.height = d.height;
+        s.depth_or_array_size = d.depth_or_array_size;
+        s.mip_levels = d.mip_levels;
+        s.sample_count = d.sample_count;
+        s.render_target = (d.flags & 1u) != 0;
+        s.depth_stencil = (d.flags & 2u) != 0;
+        s.unordered_access = (d.flags & 4u) != 0;
+        picked = playgta6::gpu::gfx10::suggest_swizzle_mode(s);
+    }
+    return mode.write(picked) ? kOk : com::E_POINTER_HR;
 }
 
 }  // namespace

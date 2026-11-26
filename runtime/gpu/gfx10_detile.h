@@ -208,4 +208,38 @@ bool tile_into_surface_for_test(const TextureLayoutDesc& desc, uint32_t mip, con
 bool tile_subresource_for_test(const TextureLayoutDesc& desc, uint32_t mip, const uint8_t* linear_src,
                                size_t linear_src_bytes, std::vector<uint8_t>& tiled_out);
 
+// Depth/stencil formats are two separate surfaces on GFX10 (a depth plane of 2 or 4 bytes, an
+// 8-bit stencil plane), each placed on its own with the same swizzle mode; the stencil plane
+// starts at a swizzle block boundary after the depth plane (surface sizes are whole blocks).
+// One rule for D3D12 allocation sizes and XG GetResourceLayout. Planar formats: D32_FLOAT_S8X24
+// family (19-22), D24_UNORM_S8_UINT family (44-47: 4-byte depth plane) and the Xbox D16_UNORM_S8
+// family (118-120: 2-byte depth plane). planes == 1 for every other format.
+struct PlanarSplit {
+    uint32_t planes = 1;
+    uint32_t format[2] = {};  // DXGI format of each plane (R32_FLOAT / R16_UNORM, R8_UINT)
+};
+PlanarSplit depth_stencil_planes(uint32_t dxgi_format) noexcept;
+
+// What GFX10 would pick for a texture (XG XGSuggestSwizzleMode). Returns the 0x100 | swizzle mode
+// value the title stores at XG_RESOURCE_DESC +0x2C. dimension: 1 = 1D, 2 = 2D, 3 = 3D. Rules, from
+// AMD addrlib's public behaviour: 1D and degenerate descriptions stay console linear (0x100); 3D is
+// thick _S; 2D picks the block size (256 B / 4 KiB / 64 KiB) that wastes the least: the largest
+// whose padded surface is within twice the tightest block's (MSAA and depth never use 256 B);
+// the family follows the usage: depth (flag, or a depth format) _Z, render target or MSAA colour
+// _R, anything else _S (a UAV-only texture too). The _X pipe-bank XOR variants are not chosen: the
+// runtime's detiler has no verified XOR term.
+struct SuggestSwizzleDesc {
+    uint32_t dimension = 2;
+    uint32_t dxgi_format = 0;
+    uint32_t width = 0;
+    uint32_t height = 1;
+    uint32_t depth_or_array_size = 1;
+    uint32_t mip_levels = 1;  // 0 = the full chain
+    uint32_t sample_count = 1;
+    bool render_target = false;   // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET (desc flags bit 0)
+    bool depth_stencil = false;   // ALLOW_DEPTH_STENCIL (bit 1)
+    bool unordered_access = false;  // ALLOW_UNORDERED_ACCESS (bit 2)
+};
+uint32_t suggest_swizzle_mode(const SuggestSwizzleDesc& desc) noexcept;
+
 }  // namespace playgta6::gpu::gfx10

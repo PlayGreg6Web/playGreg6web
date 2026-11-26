@@ -1632,7 +1632,37 @@ void test_xg() {
     CHECK(as_hr(fx.dcall(suggest, {I(desc), I(0), I(desc + 0x2C)})) == 0);
     uint32_t mode = 0;
     CHECK(com::read_guest(desc + 0x2C, mode));
-    CHECK(mode == ga::kXgDefaultSwizzleMode);
+    {
+        // GFX10 picks by shape, format, usage flags (desc +0x30: bit 0 RT, bit 1 DS, bit 2 UAV):
+        // the same answer the shared gfx10 helper gives for the same description. A plain texture
+        // is _S (a 256x256 RGBA8 chain fits 64 KiB blocks: 64KB_S), a render target _R, a depth
+        // format _Z, 1D console linear.
+        namespace gx = playgta6::gpu::gfx10;
+        gx::SuggestSwizzleDesc sd;
+        sd.dxgi_format = 28;
+        sd.width = 256;
+        sd.height = 256;
+        CHECK(mode == gx::suggest_swizzle_mode(sd) && mode == 0x109);
+        auto suggest_for = [&](uint32_t dim, uint32_t w, uint32_t h, uint16_t depth, uint16_t mips, uint32_t fmt,
+                               uint32_t flags, uint32_t samples) {
+            const uint64_t d = xg_desc(dim, w, h, depth, mips, fmt);
+            CHECK(com::write_guest(d + 0x30, flags));
+            CHECK(com::write_guest(d + 0x24, samples));
+            CHECK(as_hr(fx.dcall(suggest, {I(d), I(0), I(d + 0x2C)})) == 0);
+            uint32_t m = 0;
+            CHECK(com::read_guest(d + 0x2C, m));
+            return m;
+        };
+        CHECK(suggest_for(3, 256, 256, 1, 1, 28, 1, 1) == 0x10B);     // render target: 64KB_R
+        CHECK(suggest_for(3, 1920, 1080, 1, 1, 118, 2, 1) == 0x108);  // D16_S8 depth: 64KB_Z
+        CHECK(suggest_for(3, 16, 16, 1, 1, 28, 0, 1) == 0x101);       // tiny: 256B_S
+        CHECK(suggest_for(2, 4096, 1, 1, 1, 28, 0, 1) == 0x100);      // 1D: console linear
+        CHECK(suggest_for(4, 64, 64, 64, 1, 28, 0, 1) == 0x109);      // 3D: thick 64KB_S
+        CHECK(suggest_for(3, 256, 256, 1, 1, 28, 1, 4) == 0x10B);     // MSAA colour: _R
+    }
+    // The descriptor the rest of the test uses keeps the default linear mode.
+    const uint64_t desc_lin = desc;
+    CHECK(com::write_guest(desc_lin + 0x2C, ga::kXgDefaultSwizzleMode));
 
     const uint64_t out = fx.out_slot();
     CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
@@ -1844,6 +1874,65 @@ void test_xg() {
         CHECK(fx.vcall(tc, 6, {I(0), I(0), I(128), I(0), I(0), I(0), I(0)}) == UINT64_MAX);  // x (128 blocks)
         CHECK(fx.vcall(tc, 6, {I(0), I(0), I(0), I(0), I(2), I(0), I(0)}) == UINT64_MAX);    // slice
         CHECK(fx.vcall(tc, 1) == 0);
+    }
+
+    // Depth/stencil (D16_UNORM_S8 under 4KB_S, 1000x600, 3 mips): two tiled planes, depth (2 B) then
+    // stencil (1 B), each a GFX10 surface of its own. The header reports 2 planes, the total is the
+    // allocation size, plane 1 starts at plane 0 size, mip offsets are plane-relative, the
+    // element offsets and CopyIntoSubresource address the right plane.
+    {
+        namespace gx = playgta6::gpu::gfx10;
+        const uint64_t dd = xg_desc(3, 1000, 600, 1, 3, 118);
+        CHECK(com::write_guest(dd + 0x2C, uint32_t{0x105}));
+        const uint64_t dout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(dd), I(dout)})) == 0);
+        const uint64_t dc = load64(dout);
+        const uint64_t dl = com::guest_alloc(ga::kXgResourceLayoutSize);
+        CHECK(as_hr(fx.vcall(dc, 2, {I(dl)})) == 0);
+        const std::vector<uint8_t> lb = guest_bytes(dl, ga::kXgResourceLayoutSize);
+        const gx::TextureLayoutDesc dp{56u, 1000u, 600u, 1u, 3u, 0x105u, 0u};
+        const gx::TextureLayoutDesc st{62u, 1000u, 600u, 1u, 3u, 0x105u, 0u};
+        const uint64_t depth_bytes = gx::surface_bytes(dp);
+        const uint64_t stencil_bytes = gx::surface_bytes(st);
+        CHECK(depth_bytes > 0 && stencil_bytes > 0);
+        uint64_t total = 0;
+        uint32_t planes = 0;
+        std::memcpy(&total, lb.data(), 8);
+        std::memcpy(&planes, lb.data() + 0x14, 4);
+        CHECK(planes == 2 && total == depth_bytes + stencil_bytes);
+        for (uint32_t p = 0; p < 2; ++p) {
+            const uint8_t* ph = lb.data() + ga::kXgLayoutPlaneOffset + p * ga::kXgLayoutPlaneSize;
+            uint32_t usage = 0, bpe = 0;
+            uint64_t size = 0, offset = 0;
+            std::memcpy(&usage, ph, 4);
+            std::memcpy(&bpe, ph + 4, 4);
+            std::memcpy(&size, ph + 8, 8);
+            std::memcpy(&offset, ph + 0x10, 8);
+            CHECK(usage == p + 1 && bpe == (p == 0 ? 2u : 1u));
+            CHECK(size == (p == 0 ? depth_bytes : stencil_bytes) && offset == (p == 0 ? 0u : depth_bytes));
+            const gx::MipPlacement mp = gx::mip_placement(p == 0 ? dp : st, 1);
+            ga::XgMipLayout m1{};
+            std::memcpy(&m1, ph + ga::kXgPlaneMipOffset + ga::kXgMipLayoutSize, sizeof(m1));
+            CHECK(m1.offset_bytes == mp.offset_bytes && m1.pitch_bytes == mp.pitch_elements * bpe);
+        }
+        CHECK(fx.vcall(dc, 6, {I(0), I(0), I(5), I(7), I(0), I(0), I(0)}) == gx::surface_element_offset(dp, 0, 5, 7, 0));
+        CHECK(fx.vcall(dc, 6, {I(1), I(0), I(5), I(7), I(0), I(0), I(0)}) ==
+              depth_bytes + gx::surface_element_offset(st, 0, 5, 7, 0));
+        CHECK(fx.vcall(dc, 6, {I(2), I(0), I(0), I(0), I(0), I(0), I(0)}) == UINT64_MAX);
+        // CopyIntoSubresource plane 1, mip 0: tight 1000x600 stencil bytes land at the stencil
+        // plane addresses.
+        std::vector<uint8_t> src(1000u * 600u);
+        for (size_t i = 0; i < src.size(); ++i) {
+            src[i] = static_cast<uint8_t>(i * 7u + 3u);
+        }
+        const uint64_t sva = com::guest_alloc(src.size());
+        CHECK(com::write_guest(sva, src.data(), src.size()));
+        const uint64_t dva = com::guest_alloc(total + 0x1000);
+        CHECK(as_hr(fx.vcall(dc, 8, {I(dva), I(1), I(0), I(sva), I(1000), I(1000u * 600u)})) == 0);
+        const std::vector<uint8_t> img = guest_bytes(dva, total);
+        const uint64_t at = depth_bytes + gx::surface_element_offset(st, 0, 5, 7, 0);
+        CHECK(img[at] == src[7u * 1000u + 5u]);
+        CHECK(fx.vcall(dc, 1) == 0);
     }
 
     // An unsupported dimension fails.

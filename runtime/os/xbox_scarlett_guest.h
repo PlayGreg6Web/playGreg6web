@@ -141,7 +141,11 @@
 //   +0x20 u32 DXGI format, +0x24 u32 sample count, +0x28 u32 sample quality, +0x2C u32 swizzle
 //   mode (0x100 | n), +0x30 u32 flags.
 // xg_xs.dll!XGSuggestSwizzleMode(const XG_RESOURCE_DESC*, UINT32 (0), UINT32* mode) -> HRESULT
-//   1 call site, writing desc +0x2C; the one-argument host shim (O12) does not match it.
+//   1 call site, writing desc +0x2C; the one-argument host shim (O12) does not match it. The title
+//   builds the descriptor itself (flags +0x30 = D3D12 resource flags: RT 1, DS 2, UAV 4, plus its own
+//   bits) and calls this for per-texture mode 0xFF; the answer follows gfx10::suggest_swizzle_mode
+//   (dimension, format, size, usage flags, samples: 256 B / 4 KiB / 64 KiB block by padding, _S / _R /
+//   _Z by usage, 1D console linear). Depth/stencil formats: GetResourceLayout reports two planes.
 // Fidelity: for swizzle modes verified against AMD addrlib (256B/4KB/64KB _S and _D, thick 3D
 // for _S) GetResourceLayout reports the GFX10 surface (sizes, mip offsets, pitches) and
 // CopyIntoSubresource writes that layout (gpu/gfx10_detile.h, the placement the runtime's detiler

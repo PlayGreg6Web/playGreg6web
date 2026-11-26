@@ -970,7 +970,58 @@ void test_tile_map() {
     CHECK(!tile_map({0u, 64u, 64u, 1u, 1u, 0x109u, 0u, 1u}).ok);
 }
 
+void test_planes_and_suggest() {
+    const PlanarSplit d32 = depth_stencil_planes(20);
+    CHECK(d32.planes == 2 && d32.format[0] == 41 && d32.format[1] == 62);
+    const PlanarSplit d24 = depth_stencil_planes(45);
+    CHECK(d24.planes == 2 && d24.format[0] == 41 && d24.format[1] == 62);
+    const PlanarSplit d16 = depth_stencil_planes(118);
+    CHECK(d16.planes == 2 && d16.format[0] == 56 && d16.format[1] == 62);
+    CHECK(depth_stencil_planes(28).planes == 1 && depth_stencil_planes(40).planes == 1);
+
+    auto sug = [](uint32_t dim, uint32_t fmt, uint32_t w, uint32_t h, uint32_t d, uint32_t mips, uint32_t samples,
+                  bool rt, bool ds, bool uav) {
+        SuggestSwizzleDesc s;
+        s.dimension = dim;
+        s.dxgi_format = fmt;
+        s.width = w;
+        s.height = h;
+        s.depth_or_array_size = d;
+        s.mip_levels = mips;
+        s.sample_count = samples;
+        s.render_target = rt;
+        s.depth_stencil = ds;
+        s.unordered_access = uav;
+        return suggest_swizzle_mode(s);
+    };
+    // Size: large textures use 64 KiB blocks, tiny ones the 256 B block (a 64 KiB block would pad a
+    // 16x16 RGBA8 to 64 KiB for 1 KiB of texels); mid sizes fall in between.
+    CHECK(sug(2, 28, 2048, 2048, 1, 0, 1, false, false, false) == 0x109);
+    CHECK(sug(2, 28, 16, 16, 1, 1, 1, false, false, false) == 0x101);
+    CHECK(sug(2, 28, 64, 64, 1, 1, 1, false, false, false) == 0x105);
+    // Usage: RT and MSAA colour _R, depth _Z (never 256 B), UAV-only _S.
+    CHECK(sug(2, 28, 2048, 2048, 1, 1, 1, true, false, false) == 0x10B);
+    CHECK(sug(2, 28, 2048, 2048, 1, 1, 4, false, false, false) == 0x10B);
+    CHECK(sug(2, 28, 2048, 2048, 1, 1, 1, false, false, true) == 0x109);
+    CHECK(sug(2, 40, 1920, 1080, 1, 1, 1, false, true, false) == 0x108);
+    CHECK(sug(2, 45, 1920, 1080, 1, 1, 1, false, false, false) == 0x108);  // depth format alone
+    CHECK((sug(2, 55, 8, 8, 1, 1, 1, false, true, false) & ~0x100u) == 4u);  // tiny depth: 4KB_Z
+    // Dimension: 1D linear; 3D thick _S; degenerate / unknown format linear.
+    CHECK(sug(1, 28, 4096, 1, 1, 1, 1, false, false, false) == 0x100);
+    CHECK(sug(3, 28, 64, 64, 64, 1, 1, false, false, false) == 0x109);
+    CHECK(sug(3, 28, 4, 4, 4, 1, 1, false, false, false) == 0x105);
+    CHECK(sug(2, 28, 0, 16, 1, 1, 1, false, false, false) == 0x100);
+    CHECK(sug(2, 0, 64, 64, 1, 1, 1, false, false, false) == 0x100);
+    // Array slices do not change the choice (slices repeat the chain).
+    CHECK(sug(2, 28, 256, 256, 6, 0, 1, false, false, false) == sug(2, 28, 256, 256, 1, 0, 1, false, false, false));
+    for (uint32_t w : {1u, 7u, 100u, 1000u, 4096u}) {
+        const uint32_t m = sug(2, 71, w, w, 1, 0, 1, false, false, false);
+        CHECK(m == 0x100 || (m & ~0x100u) == 1 || (m & ~0x100u) == 5 || (m & ~0x100u) == 9);
+    }
+}
+
 int main() {
+    test_planes_and_suggest();
     test_decode_d3d12_layout();
     test_format_geometry();
     test_tile_bijectivity_2d();
