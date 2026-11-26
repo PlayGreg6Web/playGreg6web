@@ -2074,8 +2074,7 @@ std::string build_report() {
              ", \"bind_group_slots\": {\"budget\": " + std::to_string(dc.bind_group_slot_budget) +
              ", \"peak_per_epoch\": " + std::to_string(dc.peak_bind_groups_per_epoch) +
              ", \"budget_overflows\": " + std::to_string(dc.bind_group_budget_overflows) +
-             ", \"draws_dropped\": " + std::to_string(dc.draws_dropped_no_slot) + "}},
-";
+             ", \"draws_dropped\": " + std::to_string(dc.draws_dropped_no_slot) + "}},\n";
     }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
     // Present was reported through mark_first_present), then the extension's members (per-Present samples).
