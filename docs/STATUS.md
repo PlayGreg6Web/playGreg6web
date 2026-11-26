@@ -23,6 +23,7 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 - At a guest fault the window stays open on the last frame, titled `GUEST FAULT ...`, and the console prints
   the `fault_report.py` output right away. Close the window to finish the report.
 - Saves persist under `%LOCALAPPDATA%\playgta6\saves`.
+- `-Update` (native and browser scripts) fast-forwards the checkout to `origin/main` when it has no uncommitted tracked changes; otherwise it says why and continues. Every start warns when behind `origin/main`.
 
 ## Play in the browser
 

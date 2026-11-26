@@ -98,6 +98,15 @@ Builds what is stale (recompiler, lift, harness with the Dawn executor on, all f
 then runs `playgta6_boot --window --audio-out --host-input --shader-pack <pack>`: a window with the live frames, WASAPI
 audio, keyboard and pad.
 
+### Staying current: `-Update`
+
+Both `play_native.ps1` and `play_local.ps1` warn at every start when the checkout is N commits behind `origin/main`.
+Pass `-Update` to fast-forward: with no uncommitted tracked changes it switches to `main` if HEAD is detached, runs
+`git fetch origin` and `git merge --ff-only origin/main`, and prints `old -> new`. With local changes, on another branch,
+or if `main` cannot fast-forward it prints why and continues with the current code; it never resets or discards anything.
+Logic: `tools/repo_update.py` (tests: `tests/test_repo_update.py`).
+
+
 - **Shader pack.** `-ShaderPack` wins, then `$env:PLAYGTA6_NATIVE_SHADER_PACK`, then the newest `*.wgsl.pack` found under
   `work/` (and under `$env:PLAYGTA6_SHADER_PACK_DIR` if set). The chosen file is printed (`[play] shader pack: ...`).
   With none, the run stops before building (nothing would be drawn).

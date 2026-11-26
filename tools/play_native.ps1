@@ -9,7 +9,7 @@
   env PLAYGTA6_SHADER_PACK_DIR); the pick is printed. Saves persist under %LOCALAPPDATA%\playgta6\saves;
   -Record writes your real keyboard/pad input to %LOCALAPPDATA%/playgta6/recordings/<name>.txt (-RecordFile: another
   path); replay it with run_native_boot.py --input-script <file>. -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. -PresentMode auto|fifo|mailbox|immediate picks the window present mode (auto: mailbox, immediate, fifo; unsupported falls back, logged); -MaxFps N caps the host present rate (0 = off, guest pacing unchanged). Stop: close the window or Ctrl+C;
-  without -MaxMs the run lasts 2 h. See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
+  without -MaxMs the run lasts 2 h. -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues); every start warns when behind origin/main. See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
 #>
 param(
     [string]$Exe = $env:PLAYGTA6_EXE,
@@ -29,10 +29,13 @@ param(
     [string]$RecordFile = "",
     [switch]$NoBuild,
     [switch]$TrustBuild,
+    [switch]$Update,
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+if ($Update) { & python (Join-Path $PSScriptRoot "repo_update.py") update --repo $repo }
+& python (Join-Path $PSScriptRoot "repo_update.py") check --repo $repo
 if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
 if ($ShaderPack -and -not (Test-Path -LiteralPath $ShaderPack)) { throw "Shader pack not found: $ShaderPack" }
 if (-not $Name) { $Name = "play-native-" + (Get-Date -Format "yyyyMMdd-HHmmss") }

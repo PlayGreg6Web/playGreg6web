@@ -6,6 +6,7 @@
   .\tools\play_local.ps1 -Exe D:\game\game.exe -GameDir D:\game\package
 .NOTES
   Stop: close the Chrome window or press Ctrl+C here; the server stops with this script.
+  -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues). Every start warns when behind origin/main.
   See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
 #>
 param(
@@ -21,10 +22,13 @@ param(
     [int]$DurationS = 7200,
     [switch]$NoBuild,
     [switch]$TrustBuild,
+    [switch]$Update,
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+if ($Update) { & python (Join-Path $PSScriptRoot "repo_update.py") update --repo $repo }
+& python (Join-Path $PSScriptRoot "repo_update.py") check --repo $repo
 if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
 if (-not $ShaderPack) {
     $default = Join-Path $repo "work/splash.wgsl.pack"
