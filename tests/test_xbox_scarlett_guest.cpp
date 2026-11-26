@@ -1628,6 +1628,58 @@ void test_acp_hal() {
     CHECK(as_hr(fx.dcall(create, {I(0)})) == com::E_POINTER_HR);
 }
 
+// R40: the AcpHal XMA context commands against 40 kind-4 contexts: 5 / 7 enable / disable one,
+// 6 / 8 enable / disable by bitmask, 18 advances the output read offset modulo the block count.
+void test_acp_hal_xma_commands() {
+    Fixture fx;
+    ga::reset_xma_commands();
+    // The contexts AcpHalAllocateShapeContexts would hand out (its own test is in
+    // test_xbox_middleware), here in the fixture's guest memory.
+    const uint64_t contexts = com::guest_alloc(40 * 64);
+    CHECK(contexts != 0);
+    ga::set_xma_contexts_for_tests(contexts, 40);
+
+    const uint64_t create = fx.export_address("AcpHal.dll", "AcpHalCreate");
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(out)})) == 0);
+    const uint64_t hal = load64(out);
+    CHECK(as_hr(fx.vcall(hal, 0, {I(0x1000), I(0x1000)})) == 0);
+    const uint64_t payload = com::guest_alloc(16);
+    auto submit = [&](uint32_t command, uint32_t w0, uint32_t w1) {
+        const uint32_t words[2] = {w0, w1};
+        CHECK(com::write_guest(payload, words, sizeof(words)));
+        CHECK(as_hr(fx.vcall(hal, 2, {I(command), I(0xF6F6F6F6u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    };
+
+    submit(5, 3, 0);
+    CHECK(ga::xma_context_enabled(3) && !ga::xma_context_enabled(4));
+    submit(5, 40, 0);  // out of range
+    CHECK(ga::xma_command_stats().rejected == 1);
+    submit(6, 0x5u, 1u << 1);  // contexts 0, 2 and 33
+    CHECK(ga::xma_context_enabled(0) && ga::xma_context_enabled(2) && ga::xma_context_enabled(33));
+    CHECK(ga::xma_command_stats().enabled_now == 4);
+    submit(7, 3, 0);
+    submit(8, 0x1u, 0);
+    CHECK(!ga::xma_context_enabled(3) && !ga::xma_context_enabled(0) && ga::xma_context_enabled(2));
+    CHECK(ga::xma_command_stats().enabled_now == 2);
+
+    // Context 2: an output ring of 4 blocks, read offset 3; taking 2 blocks wraps to 1.
+    const uint32_t d0 = 4u << 22;
+    const uint32_t d9 = 0xABCD0000u | 3u;
+    CHECK(com::write_guest(contexts + 2 * 64, d0));
+    CHECK(com::write_guest(contexts + 2 * 64 + 0x24, d9));
+    submit(18, 2, 2);
+    CHECK(load32(contexts + 2 * 64 + 0x24) == (0xABCD0000u | 1u));
+    CHECK(ga::xma_command_stats().read_advances == 1);
+    const ga::XmaCommandStats st = ga::xma_command_stats();
+    CHECK(st.enables == 1 && st.disables == 1 && st.mask_enables == 1 && st.mask_disables == 1);
+
+    CHECK(as_hr(fx.vcall(hal, 1)) == 0);
+    CHECK(fx.vcall(hal, 5) == 0);
+    ga::set_xma_contexts_for_tests(0, 0);
+    ga::reset_xma_commands();
+}
+
 // ---------------------------------------------------------------------------
 // MMDevice: the default audio render endpoint
 // ---------------------------------------------------------------------------
@@ -2251,6 +2303,7 @@ int main() {
     test_game_input_devices();
     test_xg();
     test_acp_hal();
+    test_acp_hal_xma_commands();
     test_xdsp();
     test_xapu();
     test_xapu_bounded_queue();

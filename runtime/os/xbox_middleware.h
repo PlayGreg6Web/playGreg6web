@@ -312,6 +312,8 @@ struct Pg6XmaContextCensus {
     uint32_t output_pending = 0;  // output write offset != read offset (decoded data not yet consumed)
 };
 Pg6XmaContextCensus pg6_mw_xma_context_census(void);
+// The live kind-4 (XMA) context array: its guest address (0 when none) and context count.
+uint64_t pg6_mw_xma_contexts(uint32_t* count);
 Pg6HResult pg6_mw_apu_create_heap(uint32_t cached_size_in_bytes,
                                   uint32_t non_cached_size_in_bytes);
 Pg6HResult pg6_mw_apu_alloc(void** virtual_address,

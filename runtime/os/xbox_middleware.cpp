@@ -1647,6 +1647,15 @@ Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void) {
     return gdk::S_OK_HR;
 }
 
+uint64_t pg6_mw_xma_contexts(uint32_t* count) {
+    auto& g = mw::apu_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    if (count != nullptr) {
+        *count = g.xma_context_count;
+    }
+    return g.xma_contexts;
+}
+
 Pg6XmaContextCensus pg6_mw_xma_context_census(void) {
     Pg6XmaContextCensus c;
     auto& g = mw::apu_globals();

@@ -12,9 +12,19 @@
 //   5  () at shutdown, after which the title clears its pointer: release.
 //   3, 4 and the rest: never called by the executable; they trap.
 //
-// Model: there is no audio hardware. Commands are accepted while connected and discarded
-// (counted per command id, the first of each logged); nothing is written back, because the
-// title reads nothing back from these calls.
+// Model: there is no audio hardware. Commands are accepted while connected (counted per command
+// id, the first of each logged). The XMA context commands (behaviour of the SHAPE XMA block,
+// reimplemented here) keep the per-context state the title can observe:
+//   5 / 7   enable / disable one XMA context; the payload's first u32 is the context index.
+//   6 / 8   enable / disable many; the payload is a bitmask of u32 words, bit i = context i,
+//           as many words as the allocated contexts need.
+//   18      (0x12, tag 0xF1F1F1F1, sent by the stream consumer 0x140078120) the title took
+//           `blocks` 256-byte output blocks of context `index` (payload {u32 index, u32 blocks}):
+//           its output read offset (dword 9 bits 0-4) moves forward modulo the output buffer's
+//           block count (dword 0 bits 22-26, 0 = 32).
+// No XMA decoder exists yet, so an enabled context's output write offset never moves; the
+// enable state is what a decode worker will act on. Other commands are discarded; the title
+// reads nothing back but the HRESULT.
 
 #include <algorithm>
 #include <array>
@@ -33,6 +43,7 @@
 #include <vector>
 
 #include "os/xapu_opus.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
 
 namespace playgta6::os::scarlett::guest_api {
@@ -47,6 +58,102 @@ constexpr HResult kEUnexpected = static_cast<HResult>(0x8000FFFFu);
 
 void diag(const std::string& message) {
     com::detail::diagnostic(message.c_str());
+}
+
+// The XMA side of the AcpHal commands (contexts are global, allocated by
+// AcpHalAllocateShapeContexts in xbox_middleware.cpp).
+struct XmaState {
+    std::mutex mutex;
+    std::vector<bool> enabled;
+    XmaCommandStats stats;
+    uint64_t test_contexts = 0;  // set_xma_contexts_for_tests
+    uint32_t test_count = 0;
+};
+XmaState& xma() {
+    static XmaState s;
+    return s;
+}
+
+constexpr uint32_t kXmaContextBytes = 64;
+constexpr uint32_t kAcpEnableXma = 5, kAcpEnableXmaMask = 6, kAcpDisableXma = 7, kAcpDisableXmaMask = 8,
+                   kAcpXmaReadAdvance = 18;
+
+void handle_xma_command(uint32_t command, uint64_t payload) {
+    if (command != kAcpEnableXma && command != kAcpEnableXmaMask && command != kAcpDisableXma &&
+        command != kAcpDisableXmaMask && command != kAcpXmaReadAdvance) {
+        return;
+    }
+    uint32_t count = 0;
+    uint64_t contexts = pg6_mw_xma_contexts(&count);
+    if (xma().test_contexts != 0) {
+        contexts = xma().test_contexts;
+        count = xma().test_count;
+    }
+    auto& x = xma();
+    std::lock_guard<std::mutex> lock(x.mutex);
+    if (x.enabled.size() != count) {
+        x.enabled.assign(count, false);
+        x.stats.enabled_now = 0;
+    }
+    auto set = [&x](uint32_t i, bool on) {
+        if (x.enabled[i] != on) {
+            x.enabled[i] = on;
+            if (on) {
+                ++x.stats.enabled_now;
+            } else {
+                --x.stats.enabled_now;
+            }
+        }
+    };
+    uint32_t word[2] = {};
+    if (payload == 0 || count == 0 || !com::read_guest(payload, word, sizeof(uint32_t))) {
+        ++x.stats.rejected;
+        return;
+    }
+    switch (command) {
+        case kAcpEnableXma:
+        case kAcpDisableXma:
+            if (word[0] >= count) {
+                ++x.stats.rejected;
+                return;
+            }
+            set(word[0], command == kAcpEnableXma);
+            ++(command == kAcpEnableXma ? x.stats.enables : x.stats.disables);
+            return;
+        case kAcpEnableXmaMask:
+        case kAcpDisableXmaMask: {
+            std::vector<uint32_t> mask((count + 31) / 32);
+            if (!com::read_guest(payload, mask.data(), mask.size() * sizeof(uint32_t))) {
+                ++x.stats.rejected;
+                return;
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                if (((mask[i / 32] >> (i % 32)) & 1u) != 0) {
+                    set(i, command == kAcpEnableXmaMask);
+                }
+            }
+            ++(command == kAcpEnableXmaMask ? x.stats.mask_enables : x.stats.mask_disables);
+            return;
+        }
+        default: {  // 18: the title consumed output blocks; advance the read offset
+            if (!com::read_guest(payload, word, sizeof(word)) || word[0] >= count) {
+                ++x.stats.rejected;
+                return;
+            }
+            const uint64_t ctx = contexts + uint64_t{word[0]} * kXmaContextBytes;
+            uint32_t d0 = 0, d9 = 0;
+            if (!com::read_guest(ctx, &d0, 4) || !com::read_guest(ctx + 0x24, &d9, 4)) {
+                ++x.stats.rejected;
+                return;
+            }
+            const uint32_t blocks = (d0 >> 22) & 0x1Fu;
+            const uint32_t ring = blocks != 0 ? blocks : 32u;
+            d9 = (d9 & ~0x1Fu) | (((d9 & 0x1Fu) + word[1]) % ring);
+            com::write_guest(ctx + 0x24, &d9, 4);
+            ++x.stats.read_advances;
+            return;
+        }
+    }
 }
 
 class AcpHalObj : public com::ComObject {
@@ -80,6 +187,7 @@ public:
             diag("AcpHal: command " + std::to_string(command) + " submitted while not connected");
             return kEUnexpected;
         }
+        handle_xma_command(command, payload);
         if (++commands_[command] == 1) {
             char line[200];
             std::snprintf(line, sizeof(line),
@@ -598,6 +706,28 @@ XApuStats xapu_stats() {
     s.type3_results = xapu().type3_results;
     s.results_posted = xapu().results_posted;
     return s;
+}
+
+XmaCommandStats xma_command_stats() {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    return xma().stats;
+}
+
+bool xma_context_enabled(uint32_t index) {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    return index < xma().enabled.size() && xma().enabled[index];
+}
+
+void reset_xma_commands() {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    xma().enabled.clear();
+    xma().stats = {};
+}
+
+void set_xma_contexts_for_tests(uint64_t va, uint32_t count) {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    xma().test_contexts = va;
+    xma().test_count = va != 0 ? count : 0;
 }
 
 XDspStats xdsp_stats() {

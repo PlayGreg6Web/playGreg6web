@@ -85,6 +85,8 @@ struct Totals {
     // the title, with an input buffer marked valid, and with decoded output not yet consumed.
     // There is no XMA decoder, so input_valid > 0 means XMA voices (music, ambience) wait forever.
     uint64_t xma_contexts = 0, xma_contexts_touched = 0, xma_contexts_input_valid = 0, xma_contexts_output_pending = 0;
+    // AcpHal XMA commands: contexts enabled now, enable (5 and 6) / read-advance (18) commands.
+    uint64_t xma_contexts_enabled = 0, xma_enable_commands = 0, xma_read_advances = 0;
 };
 
 // Non-silent share of everything the title released: render-client frames plus spatial passes
@@ -123,6 +125,9 @@ inline std::string to_json(const Totals& t, const std::vector<uint64_t>& windows
     add("xma_contexts_touched", t.xma_contexts_touched);
     add("xma_contexts_input_valid", t.xma_contexts_input_valid);
     add("xma_contexts_output_pending", t.xma_contexts_output_pending);
+    add("xma_contexts_enabled", t.xma_contexts_enabled);
+    add("xma_enable_commands", t.xma_enable_commands);
+    add("xma_read_advances", t.xma_read_advances);
     add("window_ms", kWindowMs);
     add("windows_clamped", clamped);
     o += "\"non_silent_frames_per_window\": [";
