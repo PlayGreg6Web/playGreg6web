@@ -125,6 +125,26 @@ class CensusTests(unittest.TestCase):
             self.assertEqual(json.loads((d / "o.json").read_text())["schema"], pc.SCHEMA)
             self.assertIn("# Program census", (d / "o.md").read_text())
 
+    def test_sidecar_unresolved_heap_and_missing_stages(self):
+        def sb(kind, **src):
+            return {"group": 0, "binding": 0, "kind": kind, "source": src}
+        reflect = {"stages": {
+            h(1): {"stage": "fragment", "bindings": [sb("texture", unresolved=True), sb("sampler", unresolved=True),
+                                                      sb("texture", cbv_indexed_resource_heap={"cb": 1})]},
+            h(2): {"stage": "compute", "bindings": [sb("texture", unresolved=True), sb("storage", lane_indexed_resource_heap={})]},
+        }}
+        toc = {h(1): "fragment", h(2): "compute", h(3): "compute"}
+        c = pc.build_census(reflect=reflect, pack_toc=toc, drop_counts={h(1): 7, h(2): 3})
+        un = {u["kind"]: (u["bindings"], u["programs"]) for u in c["sidecar_unresolved_by_kind"]}
+        self.assertEqual(un, {"texture": (2, 2), "sampler": (1, 1)})
+        heap = {u["kind"]: u["bindings"] for u in c["sidecar_heap_sourced_by_kind"]}
+        self.assertEqual(heap, {"texture:cbv_indexed_resource_heap": 1, "storage:lane_indexed_resource_heap": 1})
+        self.assertEqual(c["sidecar_missing_stages"]["total"], 1)
+        self.assertEqual(c["sidecar_missing_stages"]["by_stage"], {"compute": 1})
+        w = {r["kind"]: r["draws_lost"] for r in c["runtime"]["drops_weighted_by_sidecar_unresolved_kind"]}
+        self.assertEqual(w, {"texture": 10, "sampler": 7})
+        self.assertIn("Sidecar unresolved bindings by kind", pc.render_markdown(c))
+
 
 if __name__ == "__main__":
     unittest.main()

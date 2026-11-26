@@ -140,6 +140,19 @@ def collect_stages(
             reflect_keys.add(h)
             st = stages.setdefault(h, {"stage": s.get("stage", "unknown"), "reasons": set(), "unresolved": Counter(),
                                        "mesh": False, "mesh_output": None})
+            st["sc_unresolved"] = Counter()
+            st["sc_heap"] = Counter()
+            for sb in s.get("bindings", []) or []:
+                src = sb.get("source")
+                if not isinstance(src, dict):
+                    continue
+                kind = _norm_kind(str(sb.get("kind", "unknown")))
+                if "unresolved" in src:
+                    st["sc_unresolved"][kind] += 1
+                else:
+                    for sk in src:
+                        if sk.endswith("_heap"):
+                            st["sc_heap"][f"{kind}:{sk}"] += 1
             mesh = s.get("mesh_output")
             if isinstance(mesh, dict):
                 st["mesh"] = True
@@ -296,6 +309,29 @@ def build_census(
     census["unresolved_bindings_by_kind"] = [
         {"kind": k, "bindings": n, "programs": unresolved_programs[k]} for k, n in unresolved_kinds.most_common()
     ]
+    sc_kinds: Counter[str] = Counter()
+    sc_progs: Counter[str] = Counter()
+    sc_heap: Counter[str] = Counter()
+    sc_heap_progs: Counter[str] = Counter()
+    for st in stages.values():
+        for k, n in st.get("sc_unresolved", {}).items():
+            sc_kinds[k] += n
+            sc_progs[k] += 1
+        for k, n in st.get("sc_heap", {}).items():
+            sc_heap[k] += n
+            sc_heap_progs[k] += 1
+    if reflect is not None:
+        census["sidecar_unresolved_by_kind"] = [
+            {"kind": k, "bindings": n, "programs": sc_progs[k]} for k, n in sc_kinds.most_common()]
+        census["sidecar_heap_sourced_by_kind"] = [
+            {"kind": k, "bindings": n, "programs": sc_heap_progs[k]} for k, n in sc_heap.most_common()]
+        missing = Counter(st["stage"] for st in stages.values() if "no_reflection_entry" in st["reasons"])
+        census["sidecar_missing_stages"] = {
+            "total": sum(missing.values()), "by_stage": dict(missing),
+            "writable_binding_without_source": sum(
+                1 for st in stages.values()
+                if "no_reflection_entry" in st["reasons"] and "writable_binding_without_source" in st["reasons"]),
+        }
     meshes = [s["mesh_output"] for s in stages.values() if s["mesh_output"] and mesh_problem(s["mesh_output"], 1 << 62) is None]
     census["mesh"] = {
         "programs": sum(1 for s in stages.values() if s["mesh"]),
@@ -327,6 +363,12 @@ def build_census(
         weighted: Counter[str] = Counter()
         for h, n in drops.items():
             weighted[reason_of(h)] += n
+        if reflect is not None:
+            wk: Counter[str] = Counter()
+            for h, n in drops.items():
+                for k in (stages.get(h) or {}).get("sc_unresolved", {}):
+                    wk[k] += n
+            runtime["drops_weighted_by_sidecar_unresolved_kind"] = [{"kind": k, "draws_lost": n} for k, n in wk.most_common()]
         runtime["drops_weighted_by_reason"] = [{"reason": r, "draws_lost": n} for r, n in weighted.most_common()]
         runtime["top_dropped_programs"] = [
             {"hash": h, "draws_lost": n, "stage": (stages.get(h) or {}).get("stage"), "reason": reason_of(h)}
@@ -356,6 +398,15 @@ def render_markdown(c: dict[str, Any]) -> str:
         L.append(f"| {r['reason']} | {r['primary_count']} | {r['tagged_count']} | {bs} | {r['explain']} |")
     L += ["", "## Unresolved bindings by kind", "", "| kind | bindings | programs |", "|---|---:|---:|"]
     L += [f"| {u['kind']} | {u['bindings']} | {u['programs']} |" for u in c["unresolved_bindings_by_kind"]]
+    if "sidecar_unresolved_by_kind" in c:
+        L += ["", "## Sidecar unresolved bindings by kind", "", "| kind | bindings | programs |", "|---|---:|---:|"]
+        L += [f"| {u['kind']} | {u['bindings']} | {u['programs']} |" for u in c["sidecar_unresolved_by_kind"]]
+        L += ["", "## Sidecar heap-indexed sources (resolved to a heap, not a table slot)", "",
+              "| kind:source | bindings | programs |", "|---|---:|---:|"]
+        L += [f"| {u['kind']} | {u['bindings']} | {u['programs']} |" for u in c["sidecar_heap_sourced_by_kind"]]
+        ms = c["sidecar_missing_stages"]
+        L += ["", f"Stages missing from the sidecar: {ms['total']} ({', '.join(f'{k} {v}' for k, v in sorted(ms['by_stage'].items()))}); "
+              f"{ms['writable_binding_without_source']} with a writable binding without source (needs --pack-report)."]
     m = c["mesh"]
     L += ["", "## Mesh programs", "", f"{m['programs']} mesh programs, {m['over_limit']} over the {c['mesh_record_limit_bytes']} B output limit."]
     rt = c.get("runtime", {})
@@ -371,6 +422,9 @@ def render_markdown(c: dict[str, Any]) -> str:
                   f"({bl['join_failed_mesh_programs']} mesh), not in the pack: {bl['join_failed_programs_not_in_pack']}.", "",
                   "| join failure reason | bindings | programs |", "|---|---:|---:|"]
             L += [f"| {r['reason']} | {r['bindings']} | {r['programs']} |" for r in bl["join_failure_reasons"]] + [""]
+        if rt.get("drops_weighted_by_sidecar_unresolved_kind"):
+            L += ["| sidecar unresolved kind | draws lost (programs with it) |", "|---|---:|"]
+            L += [f"| {r['kind']} | {r['draws_lost']} |" for r in rt["drops_weighted_by_sidecar_unresolved_kind"]] + [""]
         if "drops_weighted_by_reason" in rt:
             L += ["| reason | draws lost |", "|---|---:|"] + [f"| {r['reason']} | {r['draws_lost']} |" for r in rt["drops_weighted_by_reason"]] + [""]
             L += ["| program | stage | reason | draws lost |", "|---|---|---|---:|"]
