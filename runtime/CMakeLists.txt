@@ -493,6 +493,76 @@ else()
     add_executable(bench_xmem_contention ../tests/bench_xmem_contention.cpp)
     target_link_libraries(bench_xmem_contention PRIVATE playgta6_core)
     add_test(NAME bench_xmem_contention_smoke COMMAND bench_xmem_contention)
+
+    # Native executor stream model (gpu/native_exec/stream_model.h, replay_frames.h): no WebGPU,
+    # so it runs on every host build.
+    add_executable(test_native_exec_model ../tests/test_native_exec_model.cpp)
+    target_link_libraries(test_native_exec_model PRIVATE playgta6_core)
+    add_test(NAME test_native_exec_model COMMAND test_native_exec_model)
+
+    # Native WebGPU executor (docs/NATIVE_EXECUTOR_DESIGN.md): consumes the packet stream with Dawn,
+    # the WebGPU implementation inside Chrome (BSD-3-Clause). Off by default; when on, the official
+    # prebuilt Dawn release for the host is fetched at configure time (pinned by SHA-256, nothing
+    # is vendored). The prebuilt libraries are Release builds: use a Release or RelWithDebInfo
+    # configuration.
+    option(PLAYGTA6_NATIVE_EXECUTOR "Build the Dawn-backed native GPU executor (prebuilt Dawn fetched at configure time)" OFF)
+    if(PLAYGTA6_NATIVE_EXECUTOR AND NOT EMSCRIPTEN)
+        set(_pg6_dawn_release "https://github.com/google/dawn/releases/download/v20261109.214834")
+        set(_pg6_dawn_commit "7435fd87c506828e9b119c0052bfa19a8ba589c5")
+        if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(_pg6_dawn_url "${_pg6_dawn_release}/Dawn-${_pg6_dawn_commit}-windows-latest-Release.tar.gz")
+            set(_pg6_dawn_sha256 "7570acce74fef379c477a634e8ff86f882ec9bb8f51218a9a1e0930393cb6196")
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+            set(_pg6_dawn_url "${_pg6_dawn_release}/Dawn-${_pg6_dawn_commit}-ubuntu-latest-Release.tar.gz")
+            set(_pg6_dawn_sha256 "2125482707ba81132ecd356b78418f72d02b55007abc51d4335a91b8b4cae266")
+        else()
+            message(FATAL_ERROR "PLAYGTA6_NATIVE_EXECUTOR: no pinned prebuilt Dawn for this host")
+        endif()
+        include(FetchContent)
+        FetchContent_Declare(dawn_prebuilt
+            URL "${_pg6_dawn_url}"
+            URL_HASH SHA256=${_pg6_dawn_sha256}
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(dawn_prebuilt)
+        find_package(Threads REQUIRED)
+        find_package(Dawn CONFIG REQUIRED PATHS "${dawn_prebuilt_SOURCE_DIR}" NO_DEFAULT_PATH)
+
+        add_library(playgta6_native_exec STATIC
+            gpu/native_exec/native_executor.cpp
+            gpu/native_exec/native_window.cpp
+        )
+        target_include_directories(playgta6_native_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(playgta6_native_exec PUBLIC dawn::webgpu_dawn)
+
+        add_executable(pg6_native_exec gpu/native_exec/pg6_native_exec_main.cpp)
+        target_link_libraries(pg6_native_exec PRIVATE playgta6_native_exec)
+
+        # Runs on the host's GPU; exits 77 (skipped) when there is no WebGPU adapter.
+        add_executable(test_native_executor ../tests/test_native_executor.cpp)
+        target_link_libraries(test_native_executor PRIVATE playgta6_native_exec playgta6_core)
+        add_test(NAME test_native_executor COMMAND test_native_executor)
+        set_tests_properties(test_native_executor PROPERTIES SKIP_RETURN_CODE 77)
+
+        # Dawn's D3D12 backend compiles shaders with DXC (as Chrome does) and loads dxcompiler.dll /
+        # dxil.dll from the executable's directory: fetch the official DXC release (NCSA/MIT, dxil.dll
+        # under Microsoft's redistributable licence) and copy both next to every executable.
+        if(WIN32)
+            FetchContent_Declare(dxc_prebuilt
+                URL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip"
+                URL_HASH SHA256=ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1
+                DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+            )
+            FetchContent_MakeAvailable(dxc_prebuilt)
+            foreach(_t pg6_native_exec test_native_executor)
+                add_custom_command(TARGET ${_t} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${dxc_prebuilt_SOURCE_DIR}/bin/x64/dxcompiler.dll"
+                        "${dxc_prebuilt_SOURCE_DIR}/bin/x64/dxil.dll"
+                        "$<TARGET_FILE_DIR:${_t}>")
+            endforeach()
+        endif()
+    endif()
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)
