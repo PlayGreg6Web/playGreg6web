@@ -465,7 +465,8 @@ struct NativeExecutor::Impl {
     DeviceFeatures features;
     uint32_t max_workgroups_per_dim = 65535;
     uint64_t frame_count = 0;
-    bool lost = false;
+    std::atomic<bool> lost{false};  // set by Dawn's device-lost callback (any thread)
+    bool blob_cache_opened = false;
 
     // Swapchain: an offscreen texture headless, a configured surface with a window.
     std::unique_ptr<NativeWindow> window;
@@ -674,6 +675,14 @@ struct NativeExecutor::Impl {
             }
         }
 
+        return acquire_device(status, error);
+    }
+
+    // Adapter + device (+ offscreen canvas, timers): the first creation and every device-loss recovery.
+    bool acquire_device(CreateStatus* status, std::string* error) {
+        features = DeviceFeatures{};
+        timer_slots.clear();
+        time_ring.reset();
         wgpu::RequestAdapterOptions aopts{};
         aopts.compatibleSurface = surface;
         struct AdapterResult {
@@ -747,8 +756,9 @@ struct NativeExecutor::Impl {
                                             std::to_string(BlobCache::fnv1a(adapter.description.data(), adapter.description.size()) & 0xffffffffu) +
                                             "-" + std::to_string(info.vendorID) + "-" + std::to_string(info.deviceID);
             const std::string dir = BlobCache::versioned_dir(options.blob_cache_root, options.blob_cache_title, dawn_build, adapter_key);
-            if (blob_cache.open(dir, options.blob_cache_max_bytes)) {
-                BlobCache::prune_stale_siblings((std::filesystem::path(dir).parent_path()).string(), dir, 30);
+            if (blob_cache_opened || blob_cache.open(dir, options.blob_cache_max_bytes)) {
+                if (!blob_cache_opened) BlobCache::prune_stale_siblings((std::filesystem::path(dir).parent_path()).string(), dir, 30);
+                blob_cache_opened = true;
                 have_cache = true;
                 iso_key = "pg6-" + BlobCache::sanitize(options.blob_cache_title);
                 cache_desc.isolationKey = {iso_key.data(), iso_key.size()};  // iso outlives RequestDevice (below)
@@ -838,8 +848,9 @@ struct NativeExecutor::Impl {
                 [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView msg, Impl* self) {
                     if (reason == wgpu::DeviceLostReason::Destroyed) return;  // our own teardown
                     ++self->stats.device_lost;
-                    self->lost = true;
+                    ++self->stats.device_lost_events;
                     self->stats.last_device_error = to_string(msg);
+                    self->lost = true;
                 },
                 this);
             dr = DeviceResult{};
@@ -1307,6 +1318,275 @@ struct NativeExecutor::Impl {
         }
     }
 
+    // ---- device loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss") ----
+    //
+    // Everything the executor owns on the GPU is built from packets, so the packets that build it are the
+    // recoverable state: creations and buffer / texture writes are journaled (a destroyed id's entries are
+    // pruned, a rewrite of the same range replaces the old write), and after a loss the journal is
+    // re-dispatched onto a fresh adapter / device / surface. Pipelines come back through the blob cache,
+    // shader modules from the pack. What the GPU itself produced (render targets, compute / storage
+    // output) is re-created empty and counted; the next frame writes it again. A state the journal
+    // cannot rebuild (disabled, over budget, device without the old features, no device) ends the run
+    // with a fault record instead.
+    struct JournalEntry {
+        uint16_t opcode = 0;
+        uint16_t flags = 0;
+        uint32_t id = 0;
+        std::string key;  // write dedup key ("" for creations)
+        std::vector<uint8_t> payload;
+        bool live = true;
+    };
+    std::vector<JournalEntry> journal;
+    std::unordered_map<std::string, size_t> journal_write_keys;
+    std::unordered_map<uint32_t, std::vector<size_t>> journal_by_id;
+    size_t journal_dead = 0;
+    bool journal_overflowed = false;
+    bool fatal = false;
+    bool drop_next_present = false;
+    bool replaying = false;
+
+    static bool journaled_opcode(uint16_t op) {
+        switch (op) {
+            case 3: case 4: case 5: case 8: case 12: case 13: case 14: case 15: case 19:
+            case 22: case 23: case 24: case 25: case 32: case 34: case 35:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void journal_record(const Packet& p) {
+        if (!journaled_opcode(p.opcode) || options.recovery_journal_bytes == 0 || p.payload_bytes < 4 || !p.payload) return;
+        uint32_t id;
+        std::memcpy(&id, p.payload, 4);
+        std::string key;
+        if (p.opcode == 4 && p.payload_bytes >= 16) key = std::string("b") + std::string(reinterpret_cast<const char*>(p.payload), 12);
+        else if (p.opcode == 13 && p.payload_bytes >= 48) key = std::string("t") + std::string(reinterpret_cast<const char*>(p.payload), 44);
+        if (!key.empty()) {
+            auto it = journal_write_keys.find(key);
+            if (it != journal_write_keys.end() && journal[it->second].live) {
+                JournalEntry& e = journal[it->second];
+                const uint64_t after = stats.journal_bytes - e.payload.size() + p.payload_bytes;
+                if (after > options.recovery_journal_bytes) {
+                    ++stats.journal_overflows;
+                    journal_overflowed = true;
+                    return;
+                }
+                stats.journal_bytes = after;
+                e.payload.assign(p.payload, p.payload + p.payload_bytes);
+                e.flags = p.flags;
+                return;
+            }
+        }
+        if (stats.journal_bytes + p.payload_bytes > options.recovery_journal_bytes) {
+            ++stats.journal_overflows;
+            journal_overflowed = true;
+            return;
+        }
+        JournalEntry e;
+        e.opcode = p.opcode;
+        e.flags = p.flags;
+        e.id = id;
+        e.key = key;
+        e.payload.assign(p.payload, p.payload + p.payload_bytes);
+        stats.journal_bytes += p.payload_bytes;
+        if (!key.empty()) journal_write_keys[key] = journal.size();
+        journal_by_id[id].push_back(journal.size());
+        journal.push_back(std::move(e));
+    }
+
+    void journal_prune(uint32_t id) {
+        auto it = journal_by_id.find(id);
+        if (it == journal_by_id.end()) return;
+        for (size_t idx : it->second) {
+            JournalEntry& e = journal[idx];
+            if (!e.live) continue;
+            stats.journal_bytes -= e.payload.size();
+            if (!e.key.empty()) journal_write_keys.erase(e.key);
+            std::vector<uint8_t>().swap(e.payload);
+            e.live = false;
+            ++journal_dead;
+        }
+        journal_by_id.erase(it);
+        if (journal_dead > 4096 && journal_dead * 2 > journal.size()) journal_compact();
+    }
+
+    void journal_compact() {
+        std::vector<JournalEntry> kept;
+        kept.reserve(journal.size() - journal_dead);
+        journal_write_keys.clear();
+        journal_by_id.clear();
+        for (JournalEntry& e : journal) {
+            if (!e.live) continue;
+            if (!e.key.empty()) journal_write_keys[e.key] = kept.size();
+            journal_by_id[e.id].push_back(kept.size());
+            kept.push_back(std::move(e));
+        }
+        journal = std::move(kept);
+        journal_dead = 0;
+    }
+
+    // Drops every object of the lost device (the executor's own state; the journal stays).
+    void release_device_objects() {
+        pass_cmds.clear();
+        recorded_readbacks.clear();
+        readback_flush_wanted = false;
+        frame_target.reset();
+        early_flushed = false;
+        remap = RemapState{};
+        buffers.clear();
+        textures.clear();
+        samplers.clear();
+        shaders.clear();
+        bgls.clear();
+        pipeline_layouts.clear();
+        layouts_by_content.clear();
+        render_pipelines.clear();
+        compute_pipelines.clear();
+        bind_groups.clear();
+        dummy_buffers.clear();
+        dummy_samplers.clear();
+        dummy_views.clear();
+        dummy_textures.clear();
+        depth_twin_sources.clear();
+        depth_copy_pipeline = nullptr;
+        empty_layout = nullptr;
+        empty_fragment = nullptr;
+        error_vertex_module = nullptr;
+        error_compute_module = nullptr;
+        reflected_render.clear();
+        reflected_compute.clear();
+        manifest_bgls.clear();
+        compute_hash.clear();
+        compute_bind_groups.clear();
+        bg_descs.clear();
+        compute_meta.clear();
+        comparison_samplers.clear();
+        remap_cache.clear();
+        default_filtering_sampler = nullptr;
+        for (auto& s : fallback_samplers) s = nullptr;
+        offscreen = nullptr;
+        intermediate = nullptr;
+        intermediate_view = nullptr;
+        intermediate_format = wgpu::TextureFormat::Undefined;
+        intermediate_w = intermediate_h = 0;
+        blit_module = nullptr;
+        blit_sampler = nullptr;
+        blit_pipeline = nullptr;
+        blit_pipeline_format = wgpu::TextureFormat::Undefined;
+        blit_bind_group = nullptr;
+        timer_slots.clear();
+        time_ring.reset();
+        if (surface && surface_configured) surface.Unconfigure();
+        surface_configured = false;
+        if (device) device.Destroy();
+        device = nullptr;
+        queue = nullptr;
+        adapter_handle = nullptr;
+    }
+
+    static std::string json_escape(const std::string& s) {
+        std::string o;
+        for (char ch : s) {
+            if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
+            else if (static_cast<unsigned char>(ch) < 0x20) o += ' ';
+            else o += ch;
+        }
+        return o;
+    }
+
+    // The run cannot continue: a clear fault record (stats_json), poll() returns false.
+    bool fail_fatal(const std::string& why) {
+        fatal = true;
+        lost = true;
+        ++stats.recovery_failures;
+        stats.faulted = true;
+        stats.fault_record = "{\"kind\": \"gpu_device_lost\", \"reason\": \"" + json_escape(why) + "\", \"device_error\": \"" +
+                             json_escape(stats.last_device_error) + "\", \"device_lost_events\": " +
+                             std::to_string(stats.device_lost_events) + ", \"recoveries\": " + std::to_string(stats.recoveries) +
+                             ", \"frames_submitted\": " + std::to_string(stats.frames_submitted) +
+                             ", \"packets\": " + std::to_string(stats.packets) + ", \"adapter\": \"" +
+                             json_escape(adapter.description) + "\", \"backend\": \"" + json_escape(adapter.backend) + "\"}";
+        std::fprintf(stderr, "[native_exec] fatal: GPU device lost and not recoverable: %s\n", why.c_str());
+        return false;
+    }
+
+    static bool features_equal(const DeviceFeatures& a, const DeviceFeatures& b) {
+        return a.bc == b.bc && a.depth32_stencil8 == b.depth32_stencil8 && a.float32_filterable == b.float32_filterable &&
+               a.bgra8_storage == b.bgra8_storage && a.rg11b10_renderable == b.rg11b10_renderable && a.tier1 == b.tier1 &&
+               a.timestamp_query == b.timestamp_query;
+    }
+
+    // True: the device is usable (nothing was lost, or the recovery worked); false: fatal, the run is over.
+    bool ensure_device() {
+        if (fatal) return false;
+        if (!lost) return true;
+        return recover();
+    }
+
+    bool recover() {
+        const uint64_t t0 = now_ns();
+        if (options.recovery_journal_bytes == 0) return fail_fatal("the resource journal is disabled (recovery_journal_bytes = 0)");
+        if (journal_overflowed)
+            return fail_fatal("the resource journal outgrew its budget (" + std::to_string(options.recovery_journal_bytes) +
+                              " bytes): resources cannot be rebuilt");
+        std::fprintf(stderr, "[native_exec] GPU device lost (%s): recovering\n", stats.last_device_error.c_str());
+        // The frame being built is gone; its read-backs complete as failed so no fence stays held.
+        const bool partial_frame = !pass_cmds.empty() || early_flushed;
+        fail_dropped_readbacks();
+        start_recorded_readbacks(false);
+        const DeviceFeatures before = features;
+        const ClearValue keep_clear = clear_color;
+        const uint64_t replayed_before = stats.recovery_replayed_packets;
+        std::string last_error = "no attempt";
+        bool ok = false;
+        for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
+            release_device_objects();
+            if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            lost = false;
+            CreateStatus st = CreateStatus::Failed;
+            std::string err;
+            if (!acquire_device(&st, &err)) {
+                last_error = err;
+                continue;
+            }
+            if (!features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
+            const uint64_t errors_before = stats.packet_errors;
+            replaying = true;
+            for (const JournalEntry& e : journal) {
+                if (!e.live) continue;
+                Packet p;
+                p.opcode = e.opcode;
+                p.flags = e.flags;
+                p.payload_bytes = static_cast<uint32_t>(e.payload.size());
+                p.payload = e.payload.data();
+                dispatch_op(p);
+                ++stats.recovery_replayed_packets;
+                if (lost) break;
+            }
+            replaying = false;
+            stats.recovery_replay_errors += stats.packet_errors - errors_before;
+            if (lost) {
+                last_error = "the device was lost again while the resources were rebuilt";
+                continue;
+            }
+            ok = true;
+        }
+        if (!ok) return fail_fatal("could not create a new device: " + last_error);
+        clear_color = keep_clear;
+        for (const auto& b : buffers)
+            if (b.second.usage & 0x0080u) ++stats.recovery_gpu_resources_reset;  // Storage
+        for (const auto& t : textures)
+            if (t.second.usage & 0x0018u) ++stats.recovery_gpu_resources_reset;  // StorageBinding | RenderAttachment
+        if (partial_frame) drop_next_present = true;
+        ++stats.recoveries;
+        stats.recovery_ns_total += now_ns() - t0;
+        std::fprintf(stderr, "[native_exec] device recovered in %llu ms (%llu packet(s) replayed)\n",
+                     static_cast<unsigned long long>((now_ns() - t0) / 1000000ull),
+                     static_cast<unsigned long long>(stats.recovery_replayed_packets - replayed_before));
+        return true;
+    }
+
     // ---- packets ----
 
     void reset_frame_state() {
@@ -1330,6 +1610,14 @@ struct NativeExecutor::Impl {
     }
 
     bool dispatch(const Packet& p) {
+        if (lost || fatal) {
+            if (!ensure_device()) {
+                ++stats.dropped_while_lost;
+                return false;
+            }
+        }
+        journal_record(p);
+        if (p.opcode == static_cast<uint16_t>(GpuOpcode::DestroyResource) && p.payload_bytes >= 4) journal_prune(read_payload<uint32_t>(p));
         const uint64_t t0 = now_ns();
         bool r;
         if (options.gpu_validation) {
@@ -1580,7 +1868,7 @@ struct NativeExecutor::Impl {
         if (op >= kOpcodeSlots) ++stats.unknown_opcodes;
         else if (handled) ++stats.handled[op];
         else ++stats.unhandled[op];
-        return !lost;
+        return !fatal;
     }
 
     std::string packet_error_text;
@@ -4390,10 +4678,13 @@ struct NativeExecutor::Impl {
 
     void present() {
         const uint64_t ta = now_ns();
-        const bool have_target = !lost && acquire_target();
+        const bool recovery_drop = drop_next_present;  // the frame under construction when the device was lost
+        drop_next_present = false;
+        const bool have_target = !lost && !recovery_drop && acquire_target();
         stats.ns_present_acquire += now_ns() - ta;
         if (!have_target) {
             ++stats.present_failures;
+            if (recovery_drop) ++stats.recovery_frames_dropped;
             fail_dropped_readbacks();
             reset_frame_state();
             frame_target.reset();
@@ -4780,7 +5071,7 @@ bool NativeExecutor::load_reflection_text(const std::string& json, std::string* 
 uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
     Impl& s = *impl_;
     ++s.stats.batches;
-    if (s.lost) {
+    if (s.lost && !s.ensure_device()) {
         ++s.stats.dropped_while_lost;
         return 0;
     }
@@ -4790,10 +5081,12 @@ uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
     s.stats.packets += r.packets;
     s.stats.bytes += r.bytes;
     if (r.truncated) ++s.stats.truncated_batches;
+    if (s.lost) s.ensure_device();  // lost during this batch: rebuild before the read-back flush
     const uint64_t t1 = Impl::now_ns();
     if (s.readback_flush_wanted) s.flush_readbacks_now();  // at the end of every batch, like the worker
     const uint64_t t2 = Impl::now_ns();
     s.instance.ProcessEvents();
+    if (s.lost) s.ensure_device();  // the loss callback arrives here
     const uint64_t t3 = Impl::now_ns();
     s.stats.ns_execute += t1 - t0;
     s.stats.ns_flush_readbacks += t2 - t1;
@@ -4804,6 +5097,8 @@ uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
 bool NativeExecutor::poll() {
     const uint64_t t0 = Impl::now_ns();
     impl_->instance.ProcessEvents();
+    if (impl_->lost) impl_->ensure_device();  // a driver reset between batches: rebuild now, not at the next packet
+    if (impl_->fatal) return false;           // not recoverable: end the run (fault record in stats_json)
     const bool open = impl_->window ? impl_->window->pump() : true;
     if (impl_->window && impl_->show_spec) impl_->show_hotkeys(impl_->window->take_hotkeys());
     impl_->run_window_script();
@@ -4852,6 +5147,13 @@ std::vector<ShowTargetCandidate> NativeExecutor::shown_target_candidates() const
 }
 
 std::string NativeExecutor::present_mode_name() const { return impl_->present_mode_name; }
+
+void NativeExecutor::debug_force_device_lost(const std::string& message) {
+    if (impl_->device) impl_->device.ForceLoss(wgpu::DeviceLostReason::Unknown, {message.data(), message.size()});
+    impl_->instance.ProcessEvents();  // delivers the lost callback
+}
+
+bool NativeExecutor::faulted() const { return impl_->fatal; }
 
 bool NativeExecutor::window_focused() const { return impl_->window && impl_->window->focused(); }
 
@@ -4916,6 +5218,17 @@ std::string NativeExecutor::stats_json() const {
     num("device_errors", st.device_errors);
     num("device_lost", st.device_lost);
     num("dropped_while_lost", st.dropped_while_lost);
+    num("device_lost_events", st.device_lost_events);
+    num("recoveries", st.recoveries);
+    num("recovery_failures", st.recovery_failures);
+    num("recovery_ms", st.recovery_ns_total / 1000000ull);
+    num("recovery_replayed_packets", st.recovery_replayed_packets);
+    num("recovery_replay_errors", st.recovery_replay_errors);
+    num("recovery_frames_dropped", st.recovery_frames_dropped);
+    num("recovery_gpu_resources_reset", st.recovery_gpu_resources_reset);
+    num("journal_bytes", st.journal_bytes);
+    num("journal_overflows", st.journal_overflows);
+    if (st.faulted) j += "\"fault_record\": " + st.fault_record + ", ";
     num("render_pass_missing_texture", st.render_pass_missing_texture);
     num("render_pass_dropped_colors", st.render_pass_dropped_colors);
     num("swapchain_format_unsupported", st.swapchain_format_unsupported);

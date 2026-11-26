@@ -67,6 +67,13 @@ struct ExecutorOptions {
     // immediate error handling, and an error scope around every packet. Errors are deduped by text in
     // stats_json()'s "validation" block with the first packet index / opcode. Slower; diagnosis only.
     bool gpu_validation = false;
+    // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
+    // that create resources and fill them (creations, buffer / texture writes; destroyed ids are pruned,
+    // a repeated write of the same range replaces the older one) so a lost device can be rebuilt and the
+    // resources re-created with their uploaded contents. Journal budget in bytes; 0 = no journal, so a
+    // device loss ends the run with a fault record instead of a recovery. A journal that outgrew the
+    // budget cannot rebuild the state either: the same clean end.
+    uint64_t recovery_journal_bytes = 512ull << 20;
     // Live-vs-replay check (tools/live_vs_replay.py): when non-empty, every presented frame's stream image
     // (before the blit; 4-byte formats) is read back and a line `digest frame N: <16 hex> WxH <format>` is
     // appended here, N counting presents from 0 - the same digest pg6_native_exec --digest-at prints.
@@ -99,6 +106,20 @@ struct ExecutorStats {
     uint64_t op_errors = 0;          // the worker's _recordOpValidationError for payload checks
     uint64_t device_errors = 0;      // uncaptured WebGPU errors (validation / OOM / internal)
     uint64_t device_lost = 0;
+    // Device loss recovery. device_lost_events counts every loss that was not our own teardown;
+    // recoveries the ones that ended with a rebuilt device, recovery_failures the ones that ended the run.
+    uint64_t device_lost_events = 0;
+    uint64_t recoveries = 0;
+    uint64_t recovery_failures = 0;
+    uint64_t recovery_ns_total = 0;
+    uint64_t recovery_replayed_packets = 0;   // journal packets re-dispatched onto the new device
+    uint64_t recovery_replay_errors = 0;      // ... that the executor rejected (packet errors during the replay)
+    uint64_t recovery_frames_dropped = 0;     // the frame that was being built when the device was lost
+    uint64_t recovery_gpu_resources_reset = 0;  // render-target / storage resources re-created empty (GPU-written)
+    uint64_t journal_bytes = 0;               // live journal size
+    uint64_t journal_overflows = 0;           // packets that did not fit the budget (recovery is then impossible)
+    bool faulted = false;                     // the run cannot continue (see fault_record); poll() returns false
+    std::string fault_record;                 // JSON object, empty unless faulted
     uint64_t dropped_while_lost = 0;  // batches ignored after device loss
     uint64_t render_pass_missing_texture = 0;  // BeginRenderPass dropped: unknown attachment texture
     uint64_t render_pass_dropped_colors = 0;   // attachments dropped for a size mismatch
@@ -292,6 +313,11 @@ public:
     // attachGuestMemory. Without it a read-back writes nothing and does not move its counter.
     // The memory must outlive the executor's pending read-backs (wait_idle() drains them).
     void attach_guest_memory(const GuestMemory& memory);
+
+    // Test hook: loses the device now (wgpu Device::ForceLoss, reason Unknown) so the recovery runs on
+    // the next packet / poll exactly as for a driver reset.
+    void debug_force_device_lost(const std::string& message);
+    bool faulted() const;
 
     uint64_t frame_count() const;
     const ExecutorStats& stats() const;

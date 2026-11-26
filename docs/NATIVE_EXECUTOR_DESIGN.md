@@ -293,6 +293,43 @@ pass selectors, hotkey cycling, digest equality with and without the option).
   or absolute host addresses). The completion needs the executor's `poll()` (WebGPU map callbacks): the
   live pump already polls after every batch.
 
+## Device loss
+
+A driver reset, TDR or GPU removal loses the Dawn device. The browser worker (`wgpu_worker.js`, TM9) handles
+`device.lost` with a watchdog and a leak-free teardown; the native executor mirrors the semantics and goes
+one step further, it rebuilds.
+
+- **Detect.** The device-lost callback (any reason but our own `Destroyed`) sets `lost` and counts
+  `device_lost_events`. The executor reacts at the next packet, at the end of a batch, and in `poll()`,
+  so a loss between batches is repaired without waiting for the guest. Nothing is submitted to a lost
+  device: the existing `lost` gates stay.
+- **Journal.** Every packet that creates a resource or fills one (buffers, shader modules, textures,
+  samplers, layouts, pipelines v1 / v2, bind groups, `WriteBuffer`, `WriteTexture`) is copied into a
+  journal. `DestroyResource` prunes that id's entries; a write of the same range replaces the older one.
+  Budget: `ExecutorOptions::recovery_journal_bytes` (default 512 MiB).
+- **Recover.** `recover()` fails the read-backs of the frame under construction (their fence counters
+  advance as failed), destroys the old device, requests adapter + device again (the same feature / limit
+  negotiation, the blob cache stays open, up to 5 attempts 250 ms apart), unconfigures the surface (it is
+  reconfigured by the next present), and re-dispatches the journal in order. Pipelines are rebuilt through
+  the blob cache, shader modules from the pack. The new device must offer the features the old one had.
+- **What is not rebuilt.** Resources the GPU wrote itself (render targets, storage output) come back
+  empty and are counted (`recovery_gpu_resources_reset`); the next frame writes them again. A frame that
+  was being built when the device died is dropped (`recovery_frames_dropped`, also `present_failures`);
+  the clear colour carries over. Nothing is faked: the output after recovery is what the same packets
+  produce on a healthy device, a differing replay is visible as `recovery_replay_errors`.
+- **Cannot rebuild, so end cleanly.** Journal disabled or over budget, no device after the retries, a
+  device with fewer features, or a loss during the replay on every attempt: `faulted()` becomes true,
+  `stats_json()` carries `"fault_record": {"kind": "gpu_device_lost", "reason", "device_error", counters}`,
+  later batches are dropped (`dropped_while_lost`) and `poll()` returns false, which ends the live run
+  the same way closing the window does. No crash.
+- **Counters** (`stats_json`): `device_lost_events`, `recoveries`, `recovery_failures`, `recovery_ms`,
+  `recovery_replayed_packets`, `recovery_replay_errors`, `recovery_frames_dropped`,
+  `recovery_gpu_resources_reset`, `journal_bytes`, `journal_overflows`.
+- **Test.** `test_native_executor` loses the device with `NativeExecutor::debug_force_device_lost`
+  (Dawn `Device::ForceLoss`): buffer and texture contents compare equal after the rebuild, a pruned
+  resource stays gone, a queued frame is dropped, and the no-journal / over-budget cases end with the
+  fault record.
+
 ## Test strategy
 
 1. **Model tests (CI, every host build):** `tests/test_native_exec_model.cpp` pins the packet walk,
