@@ -67,6 +67,10 @@ const char* work_name(Work w) {
     case Work::ReadbackSignalsHeld: return "readback_signals_held";
     case Work::ReadbackTimeouts: return "readback_timeouts";
     case Work::MipClampedBinds: return "mip_clamped_binds";
+    case Work::StorageViewsDepthUntwinned: return "storage_views_depth_untwinned";
+    case Work::DepthTwinBindings: return "depth_twin_bindings";
+    case Work::DepthTwinCopiesIn: return "depth_twin_copies_in";
+    case Work::DepthTwinCopiesOut: return "depth_twin_copies_out";
     case Work::Count: break;
     }
     return "?";
@@ -79,6 +83,10 @@ void count_object_reuse(const bridge::BridgeStats& a, const bridge::BridgeStats&
     count_work(Work::BindGroupsCreated, b.bind_groups_created - a.bind_groups_created);
     count_work(Work::PipelinesCreated, b.pipelines_created - a.pipelines_created);
     count_work(Work::MipClampedBinds, b.mip_clamped_binds - a.mip_clamped_binds);
+    count_work(Work::StorageViewsDepthUntwinned, b.storage_views_depth_untwinned - a.storage_views_depth_untwinned);
+    count_work(Work::DepthTwinBindings, b.depth_twin_bindings - a.depth_twin_bindings);
+    count_work(Work::DepthTwinCopiesIn, b.depth_twin_copies_in - a.depth_twin_copies_in);
+    count_work(Work::DepthTwinCopiesOut, b.depth_twin_copies_out - a.depth_twin_copies_out);
 }
 
 // Counts the outcome of one recorded draw from the state bridge's statistics: emitted if the

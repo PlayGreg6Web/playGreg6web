@@ -1591,6 +1591,12 @@ enum class Work : size_t {
     // G66 partly-held mip chains: sampled texture bindings emitted with their base mip level raised
     // to the first level the title holds (streamed in / mapped) or to the view's min-LOD clamp.
     MipClampedBinds,
+    // Backlog 35: storage-texture bindings of a depth texture that got no colour twin (their writes
+    // are lost), those bound to a twin, and the depth -> twin / twin -> depth copies emitted.
+    StorageViewsDepthUntwinned,
+    DepthTwinBindings,
+    DepthTwinCopiesIn,
+    DepthTwinCopiesOut,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

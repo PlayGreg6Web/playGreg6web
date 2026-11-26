@@ -3862,6 +3862,91 @@ void test_null_storage_dispatch_dropped() {
     }
 }
 
+// Backlog 35: a compute storage view of a depth texture is bound to a colour twin: the depth plane is
+// copied into it once (while the twin may differ), and back after each dispatch that writes it
+// (a fullscreen draw writing frag_depth); a read-only binding is never copied back.
+// variant 0: write-only r32float, 1: read-only r32float, 2: write-only r32uint, 3: rgba8unorm (no twin).
+void test_depth_storage_twin() {
+    for (int variant = 0; variant < 4; ++variant) {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions options = counting_options(9000);
+        options.drop_null_storage_dispatch = true;
+        bridge::StateBridgeDevice device(heaps, options, &states);
+        constexpr uint32_t kTex = 312;
+        constexpr uint64_t kCs = 0xE5;
+        bridge::TextureInfo tex{pso::DxgiFormat::D32_FLOAT, 32, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        tex.storage = false;
+        device.register_texture(kTex, tex);
+        device.register_shader_module(kCs, 3);
+        d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        d3d::ViewDesc vd;
+        vd.format = static_cast<uint32_t>(pso::DxgiFormat::D32_FLOAT);
+        vd.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Uav;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs.parameters.push_back(table);
+        d3d::RootSignature root;
+        CHECK(d3d::RootSignature::build(rs, &root).ok());
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        group.content_id = 0x5EEE;
+        GpuBindGroupLayoutEntry entry = layout_entry(
+            0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+            static_cast<uint8_t>(variant == 1 ? GpuStorageTextureAccess::ReadOnly : GpuStorageTextureAccess::WriteOnly),
+            static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+        entry.storage_format = static_cast<uint8_t>(variant == 3   ? pso::WgpuTextureFormat::Rgba8Unorm
+                                                    : variant == 2 ? pso::WgpuTextureFormat::R32Uint
+                                                                   : pso::WgpuTextureFormat::R32Float);
+        group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc desc;
+        desc.cs = kCs;
+        auto cpso = device.create_compute_pipeline_state(desc, &root);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {view_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+        list.SetComputePipelineState(cpso.get());
+        CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.Dispatch(2, 2, 1);
+        list.Dispatch(1, 1, 1);
+        list.Close();
+
+        uint32_t render_passes = 0, draws = 0, compute = 0, bad_view = 0;
+        for (const Packet& pk : decode(enc)) {
+            render_passes += pk.opcode == GpuOpcode::BeginRenderPass ? 1u : 0u;
+            draws += pk.opcode == GpuOpcode::Draw ? 1u : 0u;
+            compute += pk.opcode == GpuOpcode::DispatchCompute ? 1u : 0u;
+            if (pk.opcode == GpuOpcode::BeginRenderPass) {
+                const auto p = pod<GpuBeginRenderPassPayload>(pk);
+                bad_view += (p.depth_stencil.texture_id != kTex || p.color_count != 0 ||
+                             p.depth_stencil.view.aspect != static_cast<uint8_t>(GpuTextureAspect::All))
+                                ? 1u
+                                : 0u;
+            }
+        }
+        const bool twinned = variant != 3;
+        const bool writes = variant != 1;
+        const bridge::BridgeStats& st = list.stats();
+        CHECK(st.storage_views_depth_untwinned == (twinned ? 0u : 1u));
+        CHECK(st.depth_twin_bindings == (twinned ? 1u : 0u));
+        CHECK(st.depth_twin_copies_in == (twinned ? 1u : 0u));  // once: the twin stays equal afterwards
+        CHECK(st.depth_twin_copies_out == (twinned && writes ? 2u : 0u));
+        CHECK(render_passes == st.depth_twin_copies_out && draws == st.depth_twin_copies_out && bad_view == 0);
+        CHECK(compute == (twinned ? 2u + st.depth_twin_copies_in : 0u));  // the stages' own + the copy in
+        CHECK(st.dispatches == (twinned ? 2u : 0u));
+    }
+}
+
 // #482: a fragment-stage storage binding of a mismatched float format goes through an intermediate
 // too: copied in (read-write) before the draw in a pass of its own, converted out when the pass ends.
 void test_fragment_storage_texture_format_conversion() {
@@ -4611,6 +4696,7 @@ int main() {
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
     test_null_storage_dispatch_dropped();
+    test_depth_storage_twin();
     test_fragment_storage_texture_format_conversion();
     test_vertex_mixed_storage_and_attachment_alias();
     test_seam_conversions();

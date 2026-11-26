@@ -51,6 +51,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_xs.h"
+#include "gpu/depth_twin.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/indirect_clamp_batch.h"
 #include "gpu/pso_cache.h"
@@ -526,6 +527,21 @@ private:
     // Drops the intermediates and conversion bind groups of `resource_id` (queued for frame-safe destroy)
     // and returns the retired intermediate texture ids so cached bind groups can be invalidated too.
     std::vector<uint32_t> retire_intermediates(uint32_t resource_id);
+
+    // Backlog 35: depth <-> colour twin copies. `twin_format` is the storage format (R32Float or
+    // R32Uint), `depth_format` the depth texture's WebGPU format. The pipelines (a compute pass
+    // sampling the depth aspect into the twin; a fullscreen draw writing frag_depth from it) and
+    // their bind groups are created through `encoder` on first use.
+    struct DepthTwinPipelines {
+        uint32_t in_layout = 0;
+        uint32_t in_pipeline = 0;
+        uint32_t out_layout = 0;
+        uint32_t out_pipeline = 0;
+    };
+    DepthTwinPipelines depth_twin_pipelines(uint8_t depth_format, uint8_t twin_format, CommandEncoder& encoder);
+    // Bind group of the compute copy (depth texture sampled, twin stored) or of the draw (twin read).
+    uint32_t depth_twin_group(uint32_t layout, uint32_t depth_texture, uint32_t twin, bool into_twin,
+                              uint8_t twin_format, CommandEncoder& encoder);
     void flush_retired_locked(CommandEncoder& encoder);
 
     d3d::DescriptorHeapRegistry& heaps_;
@@ -564,6 +580,7 @@ private:
     uint32_t default_vertex_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;
     std::map<std::pair<uint32_t, uint8_t>, uint32_t> intermediates_;     // (texture, format) -> texture
+    std::map<uint32_t, DepthTwinPipelines> depth_twin_pipelines_;  // depth format << 8 | twin format
     std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension
     std::map<std::array<uint32_t, 6>, uint32_t> conversion_groups_;      // (layout, src, dst, mip, layers)
     std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
@@ -688,10 +705,18 @@ struct BridgeStats {
     uint64_t storage_views_converted = 0;
     // Conversion dispatches emitted for them (intermediate <-> real texture).
     uint64_t storage_conversions = 0;
-    // Storage-texture bindings of a depth/stencil-format texture, bound null because WebGPU has no
-    // storage access on depth formats (backlog 35). The colour-format "twin" with a copy into the
-    // real depth plane is NOT implemented: these writes are lost, counted here, never faked.
+    // Storage-texture bindings of a depth/stencil-format texture that could NOT be given a twin
+    // (backlog 35): bound null because WebGPU has no storage access on depth formats, so their
+    // writes are lost. Counted here, never faked. A twin needs a compute-only 2D binding of the
+    // depth aspect in the storage format r32float or r32uint; the stencil plane has no twin (a
+    // fragment cannot write the stencil value per pixel).
     uint64_t storage_views_depth_untwinned = 0;
+    // Backlog 35: storage-texture bindings of a depth texture bound to a colour-format twin
+    // instead, the depth -> twin copies (compute) and twin -> depth copies (a fullscreen draw
+    // writing frag_depth) emitted for them. Copies in are skipped while the twin is known equal.
+    uint64_t depth_twin_bindings = 0;
+    uint64_t depth_twin_copies_in = 0;
+    uint64_t depth_twin_copies_out = 0;
     // Dispatches (direct and indirect) dropped because a writable storage binding is null: reads
     // would give zero and atomics no progress, so work-queue / spin-wait loops can hang the device
     // (backlog 39). Their other writes are lost. Counted per dispatch; the distinct pipelines hit
@@ -915,6 +940,8 @@ private:
         uint32_t base_layer = 0;
         uint32_t layer_count = 1;
         uint32_t extent[3] = {1, 1, 1};  // texels of the view (z: depth or layers)
+        bool depth_twin = false;     // backlog 35: `intermediate` is the colour twin of a depth plane
+        uint8_t depth_format = 0;    // depth_twin: the depth texture's WebGPU format
         bool same_target(const StorageRedirect& o) const noexcept {
             return entry == o.entry && texture == o.texture && intermediate == o.intermediate &&
                    format == o.format && storage_format == o.storage_format && dimension == o.dimension &&
@@ -926,6 +953,14 @@ private:
                           StorageRedirect* out);
     // Emits one conversion dispatch: real -> intermediate (`into_intermediate`) or back.
     void emit_storage_conversion(const StorageRedirect& r, bool into_intermediate);
+    // Backlog 35: a compute storage binding of a depth texture bound to a colour twin. True (and
+    // `out` filled) when the binding can be twinned.
+    bool depth_twin_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id, const TextureInfo& info,
+                             const GpuTextureViewDesc& view, CommandEncoder& side, StorageRedirect* out);
+    // Depth plane -> twin (compute), skipped while the twin is known equal; twin -> depth plane (draw).
+    bool emit_depth_twin_in(const StorageRedirect& r);
+    void emit_depth_twin_out(const StorageRedirect& r);
+    DepthTwinTracker depth_twin_;
     // Fragment-stage redirects of the open render pass: converted out when the pass ends.
     std::vector<StorageRedirect> pass_redirects_;
 

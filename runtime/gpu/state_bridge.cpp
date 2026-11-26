@@ -968,6 +968,200 @@ uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipe
     return id;
 }
 
+// ---- Backlog 35: colour twins of depth planes written by compute ----
+
+namespace {
+
+bool twin_storage_format_ok(uint8_t code) noexcept {
+    return code == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Float) ||
+           code == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Uint);
+}
+
+// What the twin holds for a depth value d: the value itself (r32float), or the unsigned integer of
+// the same memory (r32uint: a 16-bit unorm plane is the integer n of d = n / 65535; a 32-bit float
+// plane is the float's bits).
+std::string depth_twin_encode(uint8_t depth_format, uint8_t twin_format) {
+    if (twin_format == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Float)) {
+        return "d";
+    }
+    return depth_format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth16Unorm)
+               ? "u32(round(clamp(d, 0.0, 1.0) * 65535.0))"
+               : "bitcast<u32>(d)";
+}
+
+std::string depth_twin_in_wgsl(uint8_t depth_format, uint8_t twin_format) {
+    const bool uint_twin = twin_format == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Uint);
+    std::string s =
+        "@group(0) @binding(0) var src: texture_depth_2d;\n"
+        "@group(0) @binding(1) var dst: texture_storage_2d<FMT, write>;\n"
+        "@compute @workgroup_size(8, 8, 1)\n"
+        "fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+        "  if (any(id.xy >= textureDimensions(dst))) { return; }\n"
+        "  let d = textureLoad(src, id.xy, 0);\n"
+        "  textureStore(dst, id.xy, VEC(ENC, 0, 0, 0));\n"
+        "}\n";
+    const auto replace = [&](const char* what, const std::string& with) {
+        s.replace(s.find(what), std::string(what).size(), with);
+    };
+    replace("FMT", uint_twin ? "r32uint" : "r32float");
+    replace("VEC", uint_twin ? "vec4<u32>" : "vec4<f32>");
+    replace("ENC", depth_twin_encode(depth_format, twin_format));
+    return s;
+}
+
+std::string depth_twin_out_wgsl(uint8_t depth_format, uint8_t twin_format) {
+    const bool uint_twin = twin_format == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Uint);
+    std::string decode;
+    if (!uint_twin) {
+        decode = "v.x";
+    } else if (depth_format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth16Unorm)) {
+        decode = "f32(v.x) / 65535.0";
+    } else {
+        decode = "bitcast<f32>(v.x)";
+    }
+    std::string s =
+        "@group(0) @binding(0) var src: texture_2d<TY>;\n"
+        "struct VsOut { @builtin(position) pos: vec4<f32> };\n"
+        "struct FsOut { @builtin(frag_depth) depth: f32 };\n"
+        "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {\n"
+        "  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+        "  return VsOut(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0));\n"
+        "}\n"
+        "@fragment fn fs_main(in: VsOut) -> FsOut {\n"
+        "  let v = textureLoad(src, vec2<i32>(in.pos.xy), 0);\n"
+        "  return FsOut(clamp(DEC, 0.0, 1.0));\n"
+        "}\n";
+    s.replace(s.find("TY"), 2, uint_twin ? "u32" : "f32");
+    s.replace(s.find("DEC"), 3, decode);
+    return s;
+}
+
+}  // namespace
+
+StateBridgeDevice::DepthTwinPipelines StateBridgeDevice::depth_twin_pipelines(uint8_t depth_format,
+                                                                              uint8_t twin_format,
+                                                                              CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    DepthTwinPipelines& c = depth_twin_pipelines_[uint32_t{depth_format} << 8 | twin_format];
+    if (c.in_pipeline != 0) {
+        return c;
+    }
+    const bool uint_twin = twin_format == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Uint);
+    // depth -> twin: a compute pass sampling the depth aspect, storing into the twin.
+    {
+        const uint32_t module = allocate_id();
+        encoder.create_shader_module(module, GpuShaderStage::Compute, depth_twin_in_wgsl(depth_format, twin_format));
+        GpuBindGroupLayoutEntry entries[2] = {};
+        entries[0].binding = 0;
+        entries[0].visibility = GpuShaderStageBits::Compute;
+        entries[0].type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entries[0].binding_type = static_cast<uint8_t>(GpuTextureSampleType::Depth);
+        entries[0].view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        entries[1].binding = 1;
+        entries[1].visibility = GpuShaderStageBits::Compute;
+        entries[1].type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
+        entries[1].binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
+        entries[1].view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        entries[1].storage_format = twin_format;
+        c.in_layout = allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.in_layout;
+        layout.entry_count = 2;
+        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = allocate_id();
+        pl.bind_group_layout_count = 1;
+        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.in_layout, sizeof(uint32_t));
+        GpuCreateComputePipeline2Payload p{};
+        p.id = allocate_id();
+        p.cs_module_id = module;
+        p.pipeline_layout_id = pl.id;
+        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &p, sizeof(p));
+        c.in_pipeline = p.id;
+    }
+    // twin -> depth: a fullscreen triangle whose fragment writes frag_depth from the twin.
+    {
+        const std::string wgsl = depth_twin_out_wgsl(depth_format, twin_format);
+        const uint32_t vs = allocate_id();
+        const uint32_t fs = allocate_id();
+        encoder.create_shader_module(vs, GpuShaderStage::Vertex, wgsl);
+        encoder.create_shader_module(fs, GpuShaderStage::Fragment, wgsl);
+        GpuBindGroupLayoutEntry entry{};
+        entry.binding = 0;
+        entry.visibility = GpuShaderStageBits::Fragment;
+        entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entry.binding_type = static_cast<uint8_t>(uint_twin ? GpuTextureSampleType::Uint
+                                                            : GpuTextureSampleType::UnfilterableFloat);
+        entry.view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        c.out_layout = allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.out_layout;
+        layout.entry_count = 1;
+        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), &entry, sizeof(entry));
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = allocate_id();
+        pl.bind_group_layout_count = 1;
+        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.out_layout, sizeof(uint32_t));
+        GpuCreateRenderPipeline2Payload p{};
+        p.id = allocate_id();
+        p.vs_module_id = vs;
+        p.fs_module_id = fs;
+        p.pipeline_layout_id = pl.id;
+        GpuRenderPipelineKey& k = p.key;
+        k.ps_shader = 1;
+        k.color_target_count = 0;
+        k.depth_stencil.format = depth_format;
+        k.depth_stencil.depth_write_enabled = 1;
+        k.depth_stencil.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+        k.depth_stencil.stencil_front.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+        k.depth_stencil.stencil_back.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+        k.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+        k.multisample.count = 1;
+        k.multisample.mask = 0xFFFFFFFFu;
+        encoder.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
+        c.out_pipeline = p.id;
+    }
+    return c;
+}
+
+uint32_t StateBridgeDevice::depth_twin_group(uint32_t layout, uint32_t depth_texture, uint32_t twin,
+                                             bool into_twin, uint8_t twin_format, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    // Shares the conversion groups' map (so retiring either texture drops it): the key's mip /
+    // layer slots are unused here, and the layout id tells the two directions apart.
+    uint32_t& id = conversion_groups_[{layout, into_twin ? depth_texture : twin, into_twin ? twin : depth_texture, 0,
+                                       0, 1}];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e[2] = {};
+        uint32_t count = 1;
+        e[0].binding = 0;
+        e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+        e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        e[0].view.mip_level_count = 1;
+        e[0].view.array_layer_count = 1;
+        if (into_twin) {
+            e[0].resource_id = depth_texture;
+            e[0].view.aspect = static_cast<uint8_t>(GpuTextureAspect::DepthOnly);
+            e[1] = e[0];
+            e[1].binding = 1;
+            e[1].resource_id = twin;
+            e[1].view.format = twin_format;
+            e[1].view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+            count = 2;
+        } else {
+            e[0].resource_id = twin;
+            e[0].view.format = twin_format;
+        }
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = layout;
+        g.entry_count = count;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, count * sizeof(GpuBindGroupEntry2));
+    }
+    return id;
+}
+
 // ---- G66: ExecuteIndirect clamp pass ----
 
 const char* indirect_clamp_wgsl() noexcept {
@@ -2305,6 +2499,9 @@ void CommandListBridge::emit_begin_render_pass(const pso::RenderPassDesc& pass) 
             a.stencil_clear_value = d.stencil_clear_value;
             a.depth_read_only = d.depth_read_only ? 1 : 0;
             a.stencil_read_only = d.stencil_read_only ? 1 : 0;
+            if (!d.depth_read_only) {
+                depth_twin_.note_depth_written(v->resource_id);  // a colour twin of it is behind now
+            }
             usage_scope_.add(v->resource_id, v->range, v->usage);
             note_recorded_resource(v->texture_id);
             note_recorded_resource(v->resource_id);
@@ -2893,10 +3090,27 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     layout.storage_format == 0 || own == layout.storage_format ||
                     own == static_cast<uint8_t>(
                                pso::srgb_sibling(static_cast<pso::WgpuTextureFormat>(layout.storage_format)));
-                if (e.resource_id != 0 && known && is_depth_stencil_format(info.format)) {
-                    ++stats_.storage_views_depth_untwinned;  // see the counter: no twin plane yet
-                }
-                if (e.resource_id != 0 && (!known || !info.storage)) {
+                const bool depth_texture = e.resource_id != 0 && known && is_depth_stencil_format(info.format);
+                StorageRedirect twin;
+                if (depth_texture && depth_twin_redirect(layout, e.resource_id, info, out.view, side, &twin)) {
+                    // Backlog 35: WebGPU has no storage access on depth formats. The stage's
+                    // writes go to a colour twin, copied into the depth plane after the dispatch.
+                    twin.entry = i;
+                    out.resource_id = twin.intermediate;
+                    out.view = GpuTextureViewDesc{};
+                    out.view.format = twin.storage_format;
+                    out.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+                    out.view.mip_level_count = 1;
+                    out.view.array_layer_count = 1;
+                    pending_redirects_.push_back(twin);
+                    ++stats_.depth_twin_bindings;
+                } else if (depth_texture) {
+                    ++stats_.storage_views_depth_untwinned;  // no twin possible: the writes are lost
+                    out.resource_id = 0;
+                    out.view = GpuTextureViewDesc{};
+                    diagnostics_ |= BridgeDiag::StorageViewNoUsage;
+                    ++stats_.storage_views_without_usage;
+                } else if (e.resource_id != 0 && (!known || !info.storage)) {
                     out.resource_id = 0;
                     out.view = GpuTextureViewDesc{};
                     diagnostics_ |= BridgeDiag::StorageViewNoUsage;
@@ -3040,6 +3254,97 @@ bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, 
     r.intermediate = device_.intermediate_storage_texture(resource_id, info, layout.storage_format, side);
     *out = r;
     return true;
+}
+
+bool CommandListBridge::depth_twin_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id,
+                                            const TextureInfo& info, const GpuTextureViewDesc& view,
+                                            CommandEncoder& side, StorageRedirect* out) {
+    using D = GpuTextureViewDimension;
+    // Compute-only, a single-sample 2D plane (one layer, base mip), stored as r32float or r32uint.
+    // The stencil plane and array/volume/mipped views have no twin (counted as untwinned).
+    if (layout.visibility == 0 || (layout.visibility & ~GpuShaderStageBits::Compute) != 0 ||
+        info.sample_count > 1 || info.dimension != GpuTextureDimension::Dim2D || info.depth_or_array_size > 1 ||
+        view.base_mip_level != 0 || !twin_storage_format_ok(layout.storage_format) ||
+        (layout.view_dimension != static_cast<uint8_t>(D::Undefined) &&
+         layout.view_dimension != static_cast<uint8_t>(D::Dim2D)) ||
+        view.aspect == static_cast<uint8_t>(GpuTextureAspect::StencilOnly)) {
+        return false;
+    }
+    const uint8_t depth_format =
+        texture_format_code(info.format, pso::FormatUsage::DepthStencil, device_.options().features, nullptr);
+    if (!pso::has_depth_aspect(static_cast<pso::WgpuTextureFormat>(depth_format))) {
+        return false;
+    }
+    StorageRedirect r;
+    r.texture = resource_id;
+    r.format = depth_format;
+    r.storage_format = layout.storage_format;
+    r.dimension = static_cast<uint8_t>(D::Dim2D);
+    r.access = layout.binding_type;
+    r.extent[0] = std::max(info.width, 1u);
+    r.extent[1] = std::max(info.height, 1u);
+    r.depth_twin = true;
+    r.depth_format = depth_format;
+    r.intermediate = device_.intermediate_storage_texture(resource_id, info, layout.storage_format, side);
+    *out = r;
+    return true;
+}
+
+bool CommandListBridge::emit_depth_twin_in(const StorageRedirect& r) {
+    if (!depth_twin_.needs_copy_in(r.texture)) {
+        return false;
+    }
+    const StateBridgeDevice::DepthTwinPipelines p = device_.depth_twin_pipelines(r.depth_format, r.storage_format, encoder_);
+    const uint32_t group =
+        device_.depth_twin_group(p.in_layout, r.texture, r.intermediate, true, r.storage_format, encoder_);
+    encoder_.set_compute_pipeline(p.in_pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    note_recorded_resource(r.texture);
+    note_recorded_resource(r.intermediate);
+    note_recorded_resource(group);
+    encoder_.dispatch_compute((r.extent[0] + 7u) / 8u, (r.extent[1] + 7u) / 8u, 1u);
+    depth_twin_.note_copied_in(r.texture);
+    ++stats_.depth_twin_copies_in;
+    return true;
+}
+
+void CommandListBridge::emit_depth_twin_out(const StorageRedirect& r) {
+    if (!depth_twin_.needs_copy_out(r.texture)) {
+        return;
+    }
+    const StateBridgeDevice::DepthTwinPipelines p = device_.depth_twin_pipelines(r.depth_format, r.storage_format, encoder_);
+    const uint32_t group =
+        device_.depth_twin_group(p.out_layout, r.texture, r.intermediate, false, r.storage_format, encoder_);
+    GpuBeginRenderPassPayload pass{};
+    pass.color_count = 0;
+    GpuRenderPassDepthStencilAttachment& a = pass.depth_stencil;
+    a.texture_id = r.texture;
+    a.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Load);
+    a.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    if (pso::has_stencil_aspect(static_cast<pso::WgpuTextureFormat>(r.depth_format))) {
+        a.stencil_read_only = 1;  // the stencil plane is untouched
+    }
+    a.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+    a.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+    a.view.mip_level_count = 1;
+    a.view.array_layer_count = 1;
+    encoder_.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
+    ++stats_.render_passes;
+    encoder_.set_pipeline(p.out_pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    note_recorded_resource(r.texture);
+    note_recorded_resource(r.intermediate);
+    note_recorded_resource(group);
+    encoder_.draw(3, 1, 0, 0);
+    encoder_.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    depth_twin_.note_copied_out(r.texture);
+    ++stats_.depth_twin_copies_out;
+    invalidate_pass_bindings();
+    compute_pass_valid_ = false;
+    compute_pipeline_bound_ = 0;
+    compute_groups_.clear();
 }
 
 void CommandListBridge::emit_storage_conversion(const StorageRedirect& r, bool into_intermediate) {
@@ -3506,7 +3811,11 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
     bool copied_in = false;
     for (const StorageRedirect& r : active) {
-        if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly)) {
+        if (r.depth_twin) {
+            // Backlog 35: the twin must hold the depth plane (unwritten texels survive the copy
+            // back), whatever the stage's access; only while it may differ.
+            copied_in |= emit_depth_twin_in(r);
+        } else if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly)) {
             emit_storage_conversion(r, true);  // the stage reads it: real texture -> intermediate
             copied_in = true;
         }
@@ -3525,7 +3834,12 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     ++stats_.dispatches;
     for (const StorageRedirect& r : active) {
         if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly)) {
-            emit_storage_conversion(r, false);  // what the stage wrote: intermediate -> real texture
+            if (r.depth_twin) {
+                depth_twin_.note_twin_written(r.texture);
+                emit_depth_twin_out(r);  // the twin -> the depth plane (a draw writing frag_depth)
+            } else {
+                emit_storage_conversion(r, false);  // what the stage wrote: intermediate -> real texture
+            }
         }
     }
     if (!active.empty()) {  // the next dispatch sets the stage's pipeline and bind groups again
