@@ -74,7 +74,16 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(rec, dict):
         print("triage_fault: no fault_record in this report")
         return 1
-    sys.stdout.write(fr.render(report, 4))
+    syms = None
+    try:
+        syms = fr.gs.PeSymbols.from_path(args.pe)
+    except (OSError, ValueError, fr.struct.error):
+        pass  # names are best effort; explain-site below reports an unreadable PE
+    try:
+        hs = fr.HARD_STOPS.read_text(encoding="utf-8")
+    except OSError:
+        hs = None
+    sys.stdout.write(fr.render(report, 4, syms, hs))
     site = pick_site(rec)
     if site is None:
         print("\ntriage_fault: the record names no indirect site or lifted function to explain")

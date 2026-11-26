@@ -20,9 +20,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
+from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import guest_symbols as gs  # noqa: E402
+
+HARD_STOPS = Path(__file__).resolve().parent.parent / "docs" / "HARD_STOPS.md"
 RECOMP = "cargo run -p playgta6-recomp --release --"
 
 
@@ -51,9 +57,33 @@ def _loc(loc: Any) -> str:
     return " ".join(parts) if parts else "(no lifted function)"
 
 
+_SYMS: "gs.PeSymbols | None" = None  # set by render(); names come from the PE tables only
+
+
 def _addr(value: Any) -> str:
     v = _hex(value)
     return "-" if v is None else f"0x{v:016x}"
+
+
+def _named(value: Any) -> str:
+    """`0x... (module fn 0x..+0x.. export Name+0x..)` when the address lies in the supplied PE."""
+    v = _hex(value)
+    text = _addr(value)
+    if v is not None and _SYMS is not None:
+        d = _SYMS.describe(v)
+        if d:
+            text += f" ({d})"
+    return text
+
+
+def next_step(report: dict[str, Any], rec: dict[str, Any], slot: dict[str, Any] | None) -> str:
+    kind = rec.get("kind")
+    if kind == "unimplemented_slot" or slot is not None:
+        return ("next step: unimplemented COM slot -> owner decision (docs/HARD_STOPS.md) or implement the slot "
+                "in runtime/os/xgameruntime_provider.cpp")
+    if rec.get("code_miss") or kind in ("unknown_target", "unknown_resume_target", "trap"):
+        return "next step: recompiler gap -> tools/triage_fault.py <report> --pe <game.exe>"
+    return "next step: not a recompiler gap or COM slot; inspect the call stack and recent entries above"
 
 
 def suggestions(rec: dict[str, Any]) -> list[str]:
@@ -99,7 +129,10 @@ def suggestions(rec: dict[str, Any]) -> list[str]:
     return out
 
 
-def render(report: dict[str, Any], entries: int = 16) -> str:
+def render(report: dict[str, Any], entries: int = 16, syms: "gs.PeSymbols | None" = None,
+           hard_stops: str | None = None, log_lines: Any = ()) -> str:
+    global _SYMS
+    _SYMS = syms
     rec = report.get("fault_record")
     if not isinstance(rec, dict):
         return ""
@@ -109,17 +142,17 @@ def render(report: dict[str, Any], entries: int = 16) -> str:
     lines.append(f"FAULT {kind}{flag}  status={report.get('status')}  phase={report.get('phase')}")
     if report.get("message"):
         lines.append(f"  message : {report['message']}")
-    lines.append(f"  rip     : {_addr(rec.get('rip'))}")
-    lines.append(f"  target  : {_addr(rec.get('target'))}  detail={_addr(rec.get('detail'))}")
+    lines.append(f"  rip     : {_named(rec.get('rip'))}")
+    lines.append(f"  target  : {_named(rec.get('target'))}  detail={_addr(rec.get('detail'))}")
     lines.append(f"  function: {_loc(rec.get('function'))}")
     src = rec.get("source")
     if isinstance(src, dict):
         if "return_address" in src:
             lines.append(
-                f"  source  : indirect call, return address {_addr(src['return_address'])} in {_loc(src.get('location'))}"
+                f"  source  : indirect call, return address {_named(src['return_address'])} in {_loc(src.get('location'))}"
             )
         elif "resume_rip" in src:
-            lines.append(f"  source  : resume rip {_addr(src['resume_rip'])} in {_loc(src.get('location'))}")
+            lines.append(f"  source  : resume rip {_named(src['resume_rip'])} in {_loc(src.get('location'))}")
     lines.append(f"  thread  : {rec.get('thread')}   elapsed: {rec.get('elapsed_ms')} ms")
     present = rec.get("present")
     if isinstance(present, dict):
@@ -136,7 +169,7 @@ def render(report: dict[str, Any], entries: int = 16) -> str:
     frames = stack.get("frames") or []
     lines.append(f"  call stack ({stack.get('method', 'none')}), innermost caller first:")
     for i, fr in enumerate(frames):
-        addr = _addr(fr.get("address")) if isinstance(fr, dict) else "-"
+        addr = _named(fr.get("address")) if isinstance(fr, dict) else "-"
         lines.append(f"    #{i:<2} {addr} {_loc(fr)}")
     if not frames:
         lines.append("    (none)")
@@ -145,7 +178,14 @@ def render(report: dict[str, Any], entries: int = 16) -> str:
     lines.append(f"  last {len(shown)} of {len(recent)} dispatched entries on the faulting thread (oldest first):")
     for e in shown:
         name = f" {e['name']}" if e.get("name") else ""
-        lines.append(f"    -> {_addr(e.get('target'))}{name}  from {_addr(e.get('from'))}")
+        lines.append(f"    -> {_named(e.get('target'))}{name}  from {_named(e.get('from'))}")
+    slot = gs.find_unimplemented(report, log_lines)
+    if slot is not None:
+        lines.append(f"  com slot: {slot['iface']} {slot['guid']} slot {slot['slot']}"
+                     f"{' ' + slot['name'] if slot.get('name') else ''}")
+        status = gs.hard_stop_status(hard_stops, slot["iface"], slot["slot"], slot.get("name")) if hard_stops else None
+        lines.append(f"  hard stop: {status}" if status else "  hard stop: not listed in docs/HARD_STOPS.md")
+    lines.append("  " + next_step(report, rec, slot))
     sug = suggestions(rec)
     if sug:
         lines.append("  next steps:")
@@ -162,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Print the fault record of a playgta6_boot report.")
     ap.add_argument("report", help="boot report JSON ('-' for stdin)")
     ap.add_argument("--entries", type=int, default=16, help="dispatched entries to show (default 16)")
+    ap.add_argument("--pe", help="game PE (read-only): annotate addresses with export/import/.pdata names")
+    ap.add_argument("--log", help="boot log file: also search it for the COM-bridge unimplemented-slot line")
     ap.add_argument("--json", action="store_true", help="print the raw fault_record object instead")
     args = ap.parse_args(argv)
     try:
@@ -176,7 +218,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(report["fault_record"], indent=2))
     else:
-        sys.stdout.write(render(report, args.entries))
+        syms = None
+        if args.pe:
+            try:
+                syms = gs.PeSymbols.from_path(args.pe)
+            except (OSError, ValueError, struct.error) as err:
+                print(f"fault_report: cannot read PE symbols: {err}", file=sys.stderr)
+        try:
+            hs = HARD_STOPS.read_text(encoding="utf-8")
+            log = open(args.log, encoding="utf-8", errors="replace").read().splitlines() if args.log else ()
+        except OSError:
+            hs, log = None, ()
+        sys.stdout.write(render(report, args.entries, syms, hs, log))
     return 0
 
 

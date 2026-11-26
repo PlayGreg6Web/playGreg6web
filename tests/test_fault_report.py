@@ -99,5 +99,88 @@ class FaultReportTests(unittest.TestCase):
             self.assertEqual(json.loads(j.stdout)["kind"], "unknown_target")
 
 
+def synthetic_pe() -> bytes:
+    """Minimal PE32+ (base 0x140000000): one export, one import, two .pdata entries. No real code."""
+    import struct as st
+
+    img = bytearray(0x800)
+    img[0:2] = b"MZ"
+    st.pack_into("<I", img, 0x3C, 0x40)
+    img[0x40:0x44] = b"PE\0\0"
+    st.pack_into("<HH", img, 0x44, 0x8664, 1)
+    st.pack_into("<H", img, 0x40 + 20, 240)
+    opt = 0x58
+    st.pack_into("<H", img, opt, 0x20B)
+    st.pack_into("<Q", img, opt + 24, 0x140000000)
+    st.pack_into("<I", img, opt + 56, 0x3000)
+    dd = opt + 112
+    st.pack_into("<II", img, dd, 0x1100, 0x40)  # exports
+    st.pack_into("<II", img, dd + 8, 0x1200, 0x28)  # imports
+    st.pack_into("<II", img, dd + 24, 0x1400, 24)  # .pdata
+    sec = opt + 240
+    img[sec : sec + 5] = b".text"
+    st.pack_into("<IIII", img, sec + 8, 0x2000, 0x1000, 0x400, 0x200)  # raw 0x200 -> rva 0x1000
+    raw = lambda rva: rva - 0x1000 + 0x200
+    e = raw(0x1100)
+    st.pack_into("<I", img, e + 12, 0x1180)
+    st.pack_into("<III", img, e + 16, 1, 1, 1)
+    st.pack_into("<III", img, e + 28, 0x1140, 0x1150, 0x1160)
+    st.pack_into("<I", img, raw(0x1140), 0x1010)  # export function rva
+    st.pack_into("<I", img, raw(0x1150), 0x1170)  # name rva
+    img[raw(0x1170) : raw(0x1170) + 8] = b"Exported"
+    img[raw(0x1180) : raw(0x1180) + 9] = b"game.exe\0"
+    i = raw(0x1200)
+    st.pack_into("<IIIII", img, i, 0x1240, 0, 0, 0x1280, 0x1260)
+    st.pack_into("<Q", img, raw(0x1240), 0x12A0)
+    st.pack_into("<Q", img, raw(0x1260), 0x12A0)
+    img[raw(0x1280) : raw(0x1280) + 13] = b"KERNEL32.dll\0"
+    img[raw(0x12A0) + 2 : raw(0x12A0) + 8] = b"Sleep\0"
+    st.pack_into("<III", img, raw(0x1400), 0x1010, 0x1080, 0)
+    st.pack_into("<III", img, raw(0x1400) + 12, 0x1100, 0x1110, 0)
+    return bytes(img)
+
+
+HARD = """## 1. XStore (`xgameruntime.XStore`)
+| Slot | Function | Today | Set by |
+|---|---|---|---|
+| 68 / 69 | XStoreRegisterPackageLicenseLost | Trapping stub | #235 |
+## 4. XSystem, XGame
+| Slot | Function | Today | Set by |
+|---|---|---|---|
+| XSystem 5 | XSystemGetAppSpecificDeviceId | **Trapping stub** (owner decision) | #235 |
+"""
+
+
+class SymbolTests(unittest.TestCase):
+    def test_pe_names(self):
+        import guest_symbols as gs
+
+        syms = gs.PeSymbols(synthetic_pe(), "game.exe")
+        d = syms.describe(0x140001020)
+        self.assertIn("fn 0x140001010+0x10", d)
+        self.assertIn("export Exported+0x10", d)
+        self.assertEqual(syms.describe(0x140001260), "game.exe import thunk KERNEL32.dll!Sleep")
+        self.assertEqual(syms.describe(0x150000000), "")
+
+    def test_render_annotates_and_hints(self):
+        import guest_symbols as gs
+
+        out = fr.render(report(), 4, gs.PeSymbols(synthetic_pe(), "game.exe"), HARD)
+        self.assertIn("export Exported", out)
+        self.assertIn("recompiler gap -> tools/triage_fault.py", out)
+
+    def test_unimplemented_slot(self):
+        rep = report("trap")
+        rep["fault_record"].update(kind="unimplemented_slot", code_miss=False, detail="0x5")
+        guid = "{12345678-1234-1234-1234-123456789ABC}"
+        rep["message"] = f"com bridge: unimplemented XSystem {guid} slot 5 (XSystemGetAppSpecificDeviceId) called"
+        out = fr.render(rep, 4, None, HARD)
+        self.assertIn(f"XSystem {guid} slot 5 XSystemGetAppSpecificDeviceId", out)
+        self.assertIn("owner decision", out)
+        self.assertIn("hard stop: XSystemGetAppSpecificDeviceId -> **Trapping stub**", out)
+        rep["message"] = rep["message"].replace("slot 5", "slot 9").replace("XSystemGetAppSpecificDeviceId", "Other")
+        self.assertIn("not listed", fr.render(rep, 4, None, HARD))
+
+
 if __name__ == "__main__":
     unittest.main()
