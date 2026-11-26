@@ -40,6 +40,7 @@
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/screenshot_model.h"
+#include "gpu/native_exec/show_target_model.h"
 #include "gpu/native_exec/stream_model.h"
 
 namespace playgta6::gpu::native_exec {
@@ -353,6 +354,7 @@ struct TextureEntry {
 struct ColorAtt {
     uint32_t texture_id = 0;
     wgpu::TextureView view;  // resolved at packet time
+    uint32_t base_mip = 0, base_layer = 0;  // the attachment view's subresource (--show-target default)
     bool swapchain = false;
     AttachmentSize size;  // texture attachments; a swapchain attachment's size is read at encode time
     LoadOp load = LoadOp::Load;
@@ -1072,6 +1074,215 @@ struct NativeExecutor::Impl {
         ++stats.blit_frames;
     }
 
+    // ---- --show-target: present any render target / texture instead of the swapchain image ----
+    // Read-only: the frame is encoded and the digest copy taken exactly as without it; afterwards one more
+    // pass draws the chosen texture over the canvas (letterboxed, black bars). The guest's frame is unchanged.
+    std::optional<ShowTargetSpec> show_spec;        // --show-target / set_show_target
+    std::vector<PassTarget> frame_passes;           // the render passes encoded for the presented frame
+    uint32_t frame_pass_count = 0;
+    std::vector<TargetRef> show_candidates;         // the hotkey cycle list (render targets of the last frame)
+    bool show_manual = false;                       // a hotkey took over from the selector
+    std::optional<TargetRef> show_manual_target;    // nullopt = off (swapchain)
+    int64_t show_manual_layer = -1, show_manual_mip = -1;
+    std::optional<TargetRef> show_last;             // what the last present showed
+    ShowTexture show_last_tex;
+    ShowSubresource show_last_sub;
+    std::string show_label;                         // title overlay text of the last present ("" = nothing shown)
+    wgpu::RenderPipeline show_pipe[2];
+    wgpu::BindGroupLayout show_bgl[2];
+    wgpu::Buffer show_ub;
+    wgpu::TextureFormat show_pipe_format = wgpu::TextureFormat::Undefined;
+
+    bool ensure_show_pipeline(bool ms) {
+        if (show_pipe_format != swap_format) {
+            show_pipe[0] = show_pipe[1] = nullptr;
+            show_bgl[0] = show_bgl[1] = nullptr;
+            show_pipe_format = swap_format;
+        }
+        if (show_pipe[ms]) return true;
+        const std::string code = show_target_wgsl(ms);
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = {code.data(), code.size()};
+        wgpu::ShaderModuleDescriptor md{};
+        md.nextInChain = &wgsl;
+        md.label = {"playgta6-show-target-wgsl", WGPU_STRLEN};
+        wgpu::ShaderModule mod = device.CreateShaderModule(&md);
+        wgpu::BindGroupLayoutEntry le[2]{};
+        le[0].binding = 0;
+        le[0].visibility = wgpu::ShaderStage::Fragment;
+        le[0].texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+        le[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+        le[0].texture.multisampled = ms;
+        le[1].binding = 1;
+        le[1].visibility = wgpu::ShaderStage::Fragment;
+        le[1].buffer.type = wgpu::BufferBindingType::Uniform;
+        le[1].buffer.minBindingSize = 48;
+        wgpu::BindGroupLayoutDescriptor bgd{};
+        bgd.entryCount = 2;
+        bgd.entries = le;
+        show_bgl[ms] = device.CreateBindGroupLayout(&bgd);
+        wgpu::PipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &show_bgl[ms];
+        wgpu::ColorTargetState ct{};
+        ct.format = swap_format;
+        wgpu::FragmentState fs{};
+        fs.module = mod;
+        fs.entryPoint = "fs";
+        fs.targetCount = 1;
+        fs.targets = &ct;
+        wgpu::RenderPipelineDescriptor rd{};
+        rd.label = {"playgta6-show-target-pipeline", WGPU_STRLEN};
+        rd.layout = device.CreatePipelineLayout(&pld);
+        rd.vertex.module = mod;
+        rd.vertex.entryPoint = "vs";
+        rd.fragment = &fs;
+        show_pipe[ms] = device.CreateRenderPipeline(&rd);
+        if (!show_ub) {
+            wgpu::BufferDescriptor bd{};
+            bd.size = 48;
+            bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+            show_ub = device.CreateBuffer(&bd);
+        }
+        return static_cast<bool>(show_pipe[ms]);
+    }
+
+    // The title bar: the host's title + what --show-target shows + the screenshot notice.
+    std::string window_title() const {
+        std::string t = show_target_title(last_title.empty() ? options.title : last_title, show_label);
+        return shot_title_until_ns ? t + " | screenshot saved" : t;
+    }
+
+    void set_show_label(const std::string& label) {
+        if (label == show_label) return;
+        show_label = label;
+        if (window) window->set_title(window_title());
+    }
+
+    // True when the chosen target was drawn into the canvas.
+    bool encode_show_target(wgpu::CommandEncoder& enc, const wgpu::TextureView& canvas_view) {
+        show_candidates = playgta6::gpu::native_exec::show_target_candidates(frame_passes);
+        ShowTargetSpec spec = *show_spec;
+        TargetResolution res;
+        if (show_manual) {
+            spec.layer = show_manual_layer;
+            spec.mip = show_manual_mip;
+            if (show_manual_target) res.target = show_manual_target;
+            else res.reason = "off";
+        } else {
+            res = resolve_show_target(spec, frame_passes);
+        }
+        show_last.reset();
+        if (!res.target) {
+            const bool quiet = res.reason == "off" || spec.kind == ShowTargetSpec::Kind::Cycle;
+            if (!quiet) ++stats.show_target_unavailable;
+            set_show_label(quiet ? std::string() : "unavailable: " + res.reason);
+            return false;
+        }
+        const TargetRef ref = *res.target;
+        auto fail = [&](const std::string& why) {
+            ++stats.show_target_unavailable;
+            set_show_label("tex " + std::to_string(ref.id) + (ref.depth ? " depth" : "") + ": " + why);
+            return false;
+        };
+        auto tit = textures.find(ref.id);
+        if (tit == textures.end()) return fail("no such texture (not created or destroyed)");
+        TextureEntry& t = tit->second;
+        ShowTexture st;
+        st.format = t.geom.format;
+        st.dimension = t.geom.dimension;
+        st.usage = t.usage;
+        st.sample_count = t.sample_count;
+        st.width = t.geom.width;
+        st.height = t.geom.height;
+        st.layers = t.geom.depth_or_layers;
+        st.mips = t.geom.mips;
+        if (t.bc3d_fallback) st.dimension = 2;
+        const std::string why = show_target_unsupported(st, ref.depth);
+        if (!why.empty()) return fail("cannot be shown: " + why);
+        const ShowSubresource sub = show_target_subresource(spec, ref, st);
+        wgpu::TextureViewDescriptor vd{};
+        vd.dimension = wgpu::TextureViewDimension::e2D;
+        vd.baseMipLevel = sub.mip;
+        vd.mipLevelCount = 1;
+        vd.baseArrayLayer = sub.layer;
+        vd.arrayLayerCount = 1;
+        wgpu::TextureView view;
+        if (ref.depth) {
+            if (!depth_twin(ref.id, t)) return fail("depth twin could not be created");
+            refresh_depth_twins(enc);
+            vd.format = wgpu::TextureFormat::R32Float;
+            view = t.twin.CreateView(&vd);
+        } else {
+            view = t.texture.CreateView(&vd);
+        }
+        const bool ms = t.sample_count > 1 && !ref.depth;
+        if (!view || !ensure_show_pipeline(ms)) return fail("display pipeline unavailable");
+        const uint32_t mw = show_target_mip_extent(st.width, sub.mip), mh = show_target_mip_extent(st.height, sub.mip);
+        const PresentRect r = window ? window->present_rect(mw, mh) : letterbox_rect(mw, mh, swap_width, swap_height);
+        if (!r.w || !r.h) return false;  // minimized
+        const float u[8] = {static_cast<float>(r.x), static_cast<float>(r.y), static_cast<float>(r.w),
+                            static_cast<float>(r.h), static_cast<float>(mw), static_cast<float>(mh), spec.lo, spec.hi};
+        uint32_t ubits[12] = {};
+        std::memcpy(ubits, u, sizeof u);
+        ubits[8] = ref.depth ? 1u : 0u;
+        queue.WriteBuffer(show_ub, 0, ubits, sizeof ubits);
+        wgpu::BindGroupEntry be[2]{};
+        be[0].binding = 0;
+        be[0].textureView = view;
+        be[1].binding = 1;
+        be[1].buffer = show_ub;
+        be[1].size = 48;
+        wgpu::BindGroupDescriptor bd{};
+        bd.layout = show_bgl[ms];
+        bd.entryCount = 2;
+        bd.entries = be;
+        wgpu::BindGroup group = device.CreateBindGroup(&bd);
+        wgpu::RenderPassColorAttachment a{};
+        a.view = canvas_view;
+        a.loadOp = wgpu::LoadOp::Clear;
+        a.storeOp = wgpu::StoreOp::Store;
+        a.clearValue = {0, 0, 0, 1};
+        wgpu::RenderPassDescriptor rp{};
+        rp.label = {"playgta6-show-target-pass", WGPU_STRLEN};
+        rp.colorAttachmentCount = 1;
+        rp.colorAttachments = &a;
+        wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+        pass.SetViewport(static_cast<float>(r.x), static_cast<float>(r.y), static_cast<float>(r.w),
+                         static_cast<float>(r.h), 0.0f, 1.0f);
+        pass.SetPipeline(show_pipe[ms]);
+        pass.SetBindGroup(0, group);
+        pass.Draw(3);
+        pass.End();
+        ++stats.show_target_frames;
+        TargetRef shown = ref;
+        shown.mip = sub.mip;
+        shown.layer = sub.layer;
+        show_last = shown;
+        show_last_tex = st;
+        show_last_sub = sub;
+        set_show_label(playgta6::gpu::native_exec::show_target_label(ref, st, sub, spec));
+        return true;
+    }
+
+    // F7 / F8 / F9 / F10 (show_target_model.h kHotkey*): the first one takes over from the selector.
+    void show_hotkeys(uint32_t bits) {
+        if (!show_spec || !bits) return;
+        if (!show_manual) {
+            show_manual = true;
+            show_manual_target = show_last;
+            show_manual_layer = show_manual_mip = -1;
+        }
+        if (bits & (kHotkeyPrev | kHotkeyNext)) {
+            show_manual_target = show_target_cycle(show_candidates, show_manual_target, (bits & kHotkeyNext) != 0);
+            show_manual_layer = show_manual_mip = -1;
+        }
+        if (show_last) {
+            if (bits & kHotkeyMip) show_manual_mip = show_target_step(show_last_sub.mip, show_last_tex.mips);
+            if (bits & kHotkeyLayer) show_manual_layer = show_target_step(show_last_sub.layer, show_last_tex.layers);
+        }
+    }
+
     // WgpuSwapchain.configureForStreamFormat for canvas formats (#709).
     void set_swapchain_format(uint8_t code) {
         wgpu::TextureFormat f;
@@ -1099,6 +1310,8 @@ struct NativeExecutor::Impl {
     // ---- packets ----
 
     void reset_frame_state() {
+        frame_passes.clear();
+        frame_pass_count = 0;
         clear_color = kDefaultClearColor;
         pass_cmds.clear();
         remap = RemapState{};
@@ -3223,6 +3436,8 @@ struct NativeExecutor::Impl {
                 ++stats.render_pass_missing_texture;
                 return fail("render pass: unknown texture " + std::to_string(c.texture_id));
             }
+            a.base_mip = c.view.base_mip_level;
+            a.base_layer = c.view.base_array_layer;
             a.view = texture_view(it->second, &c.view);
             if (!a.view) {
                 ++stats.render_pass_missing_texture;
@@ -3417,6 +3632,22 @@ struct NativeExecutor::Impl {
     };
 
     void begin_explicit_pass(Encoder& e, const BeginPassCmd& b) {
+        if (show_spec) {
+            PassTarget pt;
+            pt.pass = frame_pass_count++;
+            for (uint32_t i = 0; i < b.color_count && !pt.color_id; ++i) {
+                if (b.colors[i].swapchain || b.colors[i].texture_id == 0) continue;
+                pt.color_id = b.colors[i].texture_id;
+                pt.color_mip = b.colors[i].base_mip;
+                pt.color_layer = b.colors[i].base_layer;
+            }
+            if (b.has_ds && b.ds.texture_id != 0) {
+                pt.depth_id = b.ds.texture_id;
+                pt.depth_mip = b.ds.view.base_mip_level;
+                pt.depth_layer = b.ds.view.base_array_layer;
+            }
+            frame_passes.push_back(pt);
+        }
         e.end_active();
         refresh_depth_twins(e.enc);
         if (b.has_ds && !b.ds.depth_read_only && b.ds.depth_load_op != 0) {
@@ -4209,7 +4440,8 @@ struct NativeExecutor::Impl {
             wgpu::Extent3D extent{digest_w, digest_h, 1};
             e.enc.CopyTextureToBuffer(&src, &dst, &extent);
         }
-        if (target.blit) encode_blit(e.enc, target.canvas_view);
+        const bool shown = show_spec.has_value() && encode_show_target(e.enc, target.canvas_view);
+        if (target.blit && !shown) encode_blit(e.enc, target.canvas_view);
         wgpu::Buffer probe_buf;
         uint32_t probe_row = 0, probe_w = 0, probe_h = 0;
         PresentRect probe_rect;
@@ -4387,10 +4619,10 @@ struct NativeExecutor::Impl {
         if (!window) return;
         if (shot_done.exchange(false)) {
             shot_title_until_ns = now_ns() + 2500000000ull;
-            window->set_title(last_title + " | screenshot saved");
+            window->set_title(window_title());
         } else if (shot_title_until_ns && now_ns() >= shot_title_until_ns) {
             shot_title_until_ns = 0;
-            window->set_title(last_title);
+            window->set_title(window_title());
         }
     }
 
@@ -4507,7 +4739,12 @@ std::unique_ptr<NativeExecutor> NativeExecutor::create(const ExecutorOptions& op
     auto impl = std::make_unique<Impl>();
     impl->options = options;
     if (!impl->init(status, error)) return nullptr;
-    return std::unique_ptr<NativeExecutor>(new NativeExecutor(std::move(impl)));
+    std::unique_ptr<NativeExecutor> ex(new NativeExecutor(std::move(impl)));
+    if (!options.show_target.empty() && !ex->set_show_target(options.show_target, error)) {
+        *status = CreateStatus::Failed;
+        return nullptr;
+    }
+    return ex;
 }
 
 NativeExecutor::NativeExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -4568,6 +4805,7 @@ bool NativeExecutor::poll() {
     const uint64_t t0 = Impl::now_ns();
     impl_->instance.ProcessEvents();
     const bool open = impl_->window ? impl_->window->pump() : true;
+    if (impl_->window && impl_->show_spec) impl_->show_hotkeys(impl_->window->take_hotkeys());
     impl_->run_window_script();
     impl_->shot_title_tick();
     impl_->stats.ns_poll += Impl::now_ns() - t0;
@@ -4576,12 +4814,41 @@ bool NativeExecutor::poll() {
 
 void NativeExecutor::set_window_title(const std::string& title) {
     impl_->last_title = title;
-    if (impl_->window) impl_->window->set_title(impl_->shot_title_until_ns ? title + " | screenshot saved" : title);
+    if (impl_->window) impl_->window->set_title(impl_->window_title());
 }
 
 std::string NativeExecutor::last_screenshot_path() const {
     std::lock_guard<std::mutex> lock(impl_->shot_mu);
     return impl_->shot_last_path;
+}
+
+bool NativeExecutor::set_show_target(const std::string& selector, std::string* error) {
+    Impl& s = *impl_;
+    if (selector.empty()) {
+        s.show_spec.reset();
+        s.show_manual = false;
+        s.set_show_label("");
+        if (s.window) s.window->enable_hotkeys(false);
+        return true;
+    }
+    ShowTargetSpec spec;
+    if (!parse_show_target(selector, &spec, error)) return false;
+    s.show_spec = spec;
+    s.show_manual = false;
+    s.show_manual_target.reset();
+    s.show_manual_layer = s.show_manual_mip = -1;
+    if (s.window) s.window->enable_hotkeys(true);
+    return true;
+}
+
+void NativeExecutor::show_target_hotkeys(uint32_t bits) { impl_->show_hotkeys(bits); }
+
+std::string NativeExecutor::shown_target_label() const { return impl_->show_label; }
+
+std::vector<ShowTargetCandidate> NativeExecutor::shown_target_candidates() const {
+    std::vector<ShowTargetCandidate> v;
+    for (const TargetRef& t : impl_->show_candidates) v.push_back({t.id, t.depth});
+    return v;
 }
 
 std::string NativeExecutor::present_mode_name() const { return impl_->present_mode_name; }
@@ -4713,6 +4980,8 @@ std::string NativeExecutor::stats_json() const {
     num("depth_int_twins_created", st.depth_int_twins_created);
     num("depth_half_twins_created", st.depth_half_twins_created);
     num("depth_stencil_direct_binds", st.depth_stencil_direct_binds);
+    num("show_target_frames", st.show_target_frames);
+    num("show_target_unavailable", st.show_target_unavailable);
     num("manifest_layouts_resolved", st.manifest_layouts_resolved);
     num("v1_synth_samplers", st.v1_synth_samplers);
     num("timer_frames", st.timer_frames);

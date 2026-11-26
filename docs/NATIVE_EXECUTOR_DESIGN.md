@@ -238,6 +238,41 @@ playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gp
   counted, nothing lost), byte bound and oversized batch, close unblocking a blocked submitter,
   focus forwarding, creation failure, stop draining.
 
+## Present any target: `--show-target`
+
+A read-only diagnostic for black or garbled screens: instead of the swapchain image the window (or the
+headless offscreen swapchain) shows any render target or texture of the stream, so one can see which
+pass produced nothing. `pg6_native_exec --show-target <selector>` and `playgta6_boot --window --show-target
+<selector>` (through `run_native_boot.py --play ... -- --show-target ...`) take it; `ExecutorOptions::show_target`
+and `NativeExecutor::set_show_target()` set it in code. The model (selector grammar, resolution, cycling, which
+textures can be shown, the shader and its CPU twin) is `runtime/gpu/native_exec/show_target_model.h`, unit
+tested without a GPU in `tests/test_native_exec_model.cpp`.
+
+| Selector | Shows |
+|---|---|
+| `<id>`, `tex:<id>` | the texture with that stream id as colour (rgb, alpha forced to 1) |
+| `depth:<id>` | a depth texture as grey, through its r32float depth twin (backlog 35's `depth_twin`; created on demand, refreshed before the frame's passes and the display pass) |
+| `pass:<N>` / `pass:<N>:depth` | the colour (else depth) / depth target of the N-th render pass of the presented frame, 0-based in encode order; the attachment's own mip and layer are the default |
+| `last` | the colour target of the last pass that rendered to a texture |
+| `cycle` | nothing until a hotkey picks |
+
+Suffixes: `@layer=L`, `@mip=M` (clamped into the texture; the mip is shown at its own size), `@range=LO:HI`
+(value to 0..1 as `(v-LO)/(HI-LO)`: reverse-Z depth, HDR colour). Hotkeys (only when `--show-target` is given;
+they are swallowed by the window): **F10** next / **F9** previous render target of the last frame (sorted by id, colour
+before depth, then back to the swapchain image), **F8** next array layer, **F7** next mip. The title bar names what
+is shown (`tex 12 depth 1280x720 depth32float mip 0/1 layer 0/1`) or why it cannot be (`unavailable: pass 9 does not
+exist`), also in the live window where the boot title tick appends it.
+
+How it stays read-only: the frame is encoded exactly as without it, the `--live-digest` copy of the stream image is
+taken first, and only then one extra pass draws the chosen texture over the canvas (`textureLoad` with nearest
+sampling, letterboxed like the normal blit, black bars; multisampled targets show sample 0). The guest's resources,
+its pass list and its present are untouched; the depth twin is the only object created for the guest's textures
+and is not read by the guest unless it already would be. Not shown, reported in the label and counted in
+`show_target_unavailable`: 3D, integer, stencil-only and multisampled-depth textures and textures created without
+`TextureBinding` (they cannot be sampled). Stats: `show_target_frames`, `show_target_unavailable`.
+GPU tests: `tests/test_native_executor.cpp` (`test_show_target*`: colour, layers, mips, msaa, depth ranges,
+pass selectors, hotkey cycling, digest equality with and without the option).
+
 ## Threading
 
 - **M0:** single-threaded. The executor, its device and its window belong to the thread that

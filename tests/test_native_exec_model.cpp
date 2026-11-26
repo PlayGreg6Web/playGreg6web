@@ -15,6 +15,7 @@
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/replay_frames.h"
+#include "gpu/native_exec/show_target_model.h"
 #include "gpu/native_exec/stream_model.h"
 
 namespace {
@@ -872,6 +873,133 @@ void test_present_model() {
     CHECK(frame_cap_next_anchor(100, 1000, 15000000ull) == 10001000ull);        // slightly late: keep cadence
 }
 
+void test_show_target_model() {
+    ShowTargetSpec s;
+    std::string err;
+    CHECK(parse_show_target("42", &s, &err) && s.kind == ShowTargetSpec::Kind::Tex && s.id == 42 && s.layer == -1 && s.mip == -1);
+    CHECK(parse_show_target("tex:7@layer=2@mip=1", &s, &err) && s.id == 7 && s.layer == 2 && s.mip == 1);
+    CHECK(parse_show_target("depth:9@range=0.25:0.75", &s, &err) && s.kind == ShowTargetSpec::Kind::Depth && s.lo == 0.25f && s.hi == 0.75f);
+    CHECK(parse_show_target("pass:3", &s, &err) && s.kind == ShowTargetSpec::Kind::Pass && s.pass == 3);
+    CHECK(parse_show_target("pass:0:depth", &s, &err) && s.kind == ShowTargetSpec::Kind::PassDepth && s.pass == 0);
+    CHECK(parse_show_target("last", &s, &err) && s.kind == ShowTargetSpec::Kind::Last);
+    CHECK(parse_show_target("cycle", &s, &err) && s.kind == ShowTargetSpec::Kind::Cycle);
+    for (const char* bad : {"", "tex:", "0", "tex:0", "depth:x", "pass:", "pass:1:color", "pass:-1", "12@layer", "12@layer=-1",
+                            "12@range=1:1", "12@range=1", "12@bogus=1", "foo", "99999999999", "12@mip=x"}) {
+        err.clear();
+        CHECK(!parse_show_target(bad, &s, &err));
+        CHECK(!err.empty());
+    }
+
+    // Resolution against a frame: pass 0 colour 10 (mip 1 layer 2), pass 1 depth-only 11, pass 2 swapchain only,
+    // pass 3 colour 12 + depth 11.
+    std::vector<PassTarget> passes(4);
+    passes[0] = {0, 10, 1, 2, 0, 0, 0};
+    passes[1] = {1, 0, 0, 0, 11, 0, 0};
+    passes[2] = {2, 0, 0, 0, 0, 0, 0};
+    passes[3] = {3, 12, 0, 0, 11, 0, 0};
+    auto res = [&](const char* sel) {
+        ShowTargetSpec sp;
+        std::string e;
+        CHECK(parse_show_target(sel, &sp, &e));
+        return resolve_show_target(sp, passes);
+    };
+    CHECK(res("pass:0").target && res("pass:0").target->id == 10 && res("pass:0").target->mip == 1 && res("pass:0").target->layer == 2);
+    CHECK(res("pass:1").target && res("pass:1").target->id == 11 && res("pass:1").target->depth);
+    CHECK(!res("pass:2").target && !res("pass:2").reason.empty());
+    CHECK(!res("pass:3:depth").reason.empty() == false && res("pass:3:depth").target->depth);
+    CHECK(!res("pass:2:depth").target);
+    CHECK(!res("pass:9").target && res("pass:9").reason.find("4 passes") != std::string::npos);
+    CHECK(res("last").target && res("last").target->id == 12 && !res("last").target->depth);
+    CHECK(res("depth:5").target && res("depth:5").target->depth && res("5").target && !res("5").target->depth);
+    CHECK(!res("cycle").target);
+    CHECK(!resolve_show_target(ShowTargetSpec{ShowTargetSpec::Kind::Last}, {}).target);
+
+    // Cycle list: distinct, sorted by id, colour before depth; next / previous walk it with an "off" stop.
+    const auto c = show_target_candidates(passes);
+    CHECK(c.size() == 3);
+    CHECK(c.size() == 3 && c[0].id == 10 && c[1].id == 11 && c[1].depth && c[2].id == 12 && !c[2].depth);
+    std::optional<TargetRef> cur;
+    cur = show_target_cycle(c, cur, true);
+    CHECK(cur && cur->id == 10);
+    cur = show_target_cycle(c, cur, true);
+    CHECK(cur && cur->id == 11 && cur->depth);
+    cur = show_target_cycle(c, cur, true);
+    CHECK(cur && cur->id == 12);
+    cur = show_target_cycle(c, cur, true);
+    CHECK(!cur);
+    cur = show_target_cycle(c, cur, false);  // previous from off: the last one
+    CHECK(cur && cur->id == 12);
+    cur = show_target_cycle(c, cur, false);
+    CHECK(cur && cur->id == 11);
+    CHECK(!show_target_cycle(c, TargetRef{10, false, 0, 0}, false));  // before the first: off
+    CHECK(show_target_cycle(c, TargetRef{500, false, 0, 0}, true) == std::nullopt);
+    CHECK(show_target_cycle(c, TargetRef{11, false, 0, 0}, true)->id == 11);  // not in the list as colour: the next larger key
+    CHECK(!show_target_cycle({}, std::nullopt, true));
+    CHECK(show_target_step(0, 3) == 1 && show_target_step(2, 3) == 0 && show_target_step(0, 0) == 0);
+
+    // What can be shown.
+    ShowTexture t;
+    t.format = 22;  // rgba8unorm
+    t.usage = 0x14;
+    CHECK(show_target_unsupported(t, false).empty());
+    t.usage = 0x10;
+    CHECK(show_target_unsupported(t, false).find("TextureBinding") != std::string::npos);
+    t.usage = 0x14;
+    t.format = 14;  // r32uint
+    CHECK(show_target_unsupported(t, false).find("integer") != std::string::npos);
+    t.format = 48;  // depth32float
+    CHECK(show_target_unsupported(t, false).find("depth") != std::string::npos);
+    CHECK(show_target_unsupported(t, true).empty());
+    t.sample_count = 4;
+    CHECK(show_target_unsupported(t, true).find("multisampled") != std::string::npos);
+    t.sample_count = 1;
+    t.format = 22;
+    CHECK(show_target_unsupported(t, true) == "not a depth format");
+    t.dimension = 2;
+    CHECK(show_target_unsupported(t, false) == "3d texture");
+    t.dimension = 1;
+    t.sample_count = 4;
+    CHECK(show_target_unsupported(t, false).empty());  // msaa colour is shown (sample 0)
+
+    // Subresource: the selector wins over the attachment's own, both are clamped.
+    t.sample_count = 1;
+    t.layers = 4;
+    t.mips = 3;
+    ShowTargetSpec sp;
+    sp.layer = -1;
+    sp.mip = -1;
+    TargetRef ref{1, false, 1, 2};
+    ShowSubresource sub = show_target_subresource(sp, ref, t);
+    CHECK(sub.mip == 1 && sub.layer == 2 && !sub.clamped);
+    sp.layer = 3;
+    sp.mip = 0;
+    sub = show_target_subresource(sp, ref, t);
+    CHECK(sub.mip == 0 && sub.layer == 3 && !sub.clamped);
+    sp.layer = 9;
+    sp.mip = 7;
+    sub = show_target_subresource(sp, ref, t);
+    CHECK(sub.mip == 2 && sub.layer == 3 && sub.clamped);
+    CHECK(show_target_mip_extent(64, 0) == 64 && show_target_mip_extent(64, 2) == 16 && show_target_mip_extent(3, 5) == 1);
+
+    // The display transform and the shader text.
+    CHECK(show_target_map(0.5f, 0, 1) == 0.5f && show_target_map(2.0f, 0, 1) == 1.0f && show_target_map(-1.0f, 0, 1) == 0.0f);
+    CHECK(show_target_map(0.5f, 0.5f, 1.5f) == 0.0f && show_target_map(0.5f, 0, 0.5f) == 1.0f);
+    CHECK(show_target_wgsl(false).find("texture_2d<f32>") != std::string::npos);
+    CHECK(show_target_wgsl(true).find("texture_multisampled_2d<f32>") != std::string::npos);
+
+    // Title text.
+    t.width = 1920;
+    t.height = 1080;
+    t.format = 48;
+    sub = ShowSubresource{0, 1, false};
+    sp = ShowTargetSpec{};
+    const std::string label = show_target_label(TargetRef{7, true, 0, 0}, t, sub, sp);
+    CHECK(label.find("tex 7 depth 1920x1080 depth32float") == 0);
+    CHECK(label.find("mip 0/3 layer 1/4") != std::string::npos);
+    CHECK(show_target_title("base", "") == "base");
+    CHECK(show_target_title("base", label).find("base | SHOWING tex 7") == 0);
+}
+
 int main() {
     test_present_model();
     test_shader_payloads();
@@ -892,6 +1020,7 @@ int main() {
     test_negotiated_limits();
     test_layout_remap();
     test_blit_model();
+    test_show_target_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

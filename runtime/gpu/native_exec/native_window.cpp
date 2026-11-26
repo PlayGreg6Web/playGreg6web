@@ -190,6 +190,12 @@ public:
     }
     // Keyboard focus, not just foreground: a minimized window reports false so --host-input
     // releases held keys instead of leaving them stuck.
+    void enable_hotkeys(bool on) override { hotkeys_on_ = on; }
+    uint32_t take_hotkeys() override {
+        const uint32_t r = hotkeys_pending_;
+        hotkeys_pending_ = 0;
+        return r;
+    }
     bool focused() const override {
         return hwnd_ != nullptr && !closed_ && !IsIconic(hwnd_) && GetForegroundWindow() == hwnd_;
     }
@@ -336,6 +342,14 @@ private:
             self->toggle_fullscreen();
             return 0;
         }
+        // --show-target hotkeys (F7 mip, F8 layer, F9 previous, F10 next target). F10 arrives as WM_SYSKEYDOWN.
+        if (self && self->hotkeys_on_ && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (lp & (1 << 30)) == 0) {
+            const uint32_t bit = wp == VK_F7 ? 1u : wp == VK_F8 ? 2u : wp == VK_F9 ? 4u : wp == VK_F10 ? 8u : 0u;
+            if (bit) {
+                self->hotkeys_pending_ |= bit;
+                return 0;
+            }
+        }
         if (self && msg == WM_KEYDOWN && wp == VK_F12 && (lp & (1 << 30)) == 0) {
             self->shot_request_ = true;  // the executor saves the next presented frame
             return 0;
@@ -429,6 +443,8 @@ private:
     bool start_maximized_ = false;
     bool focus_ = false;
     std::atomic<bool> shot_request_{false};
+    bool hotkeys_on_ = false;
+    uint32_t hotkeys_pending_ = 0;
     bool cursor_hidden_ = false;
     bool capturing_ = false;
     bool capture_released_ = false;

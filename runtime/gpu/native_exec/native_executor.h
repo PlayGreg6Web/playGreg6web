@@ -80,6 +80,10 @@ struct ExecutorOptions {
     // stream image (before the letterbox) as a PNG into screenshot_dir (empty: %LOCALAPPDATA%/playgta6/screenshots).
     std::vector<uint64_t> screenshot_at;
     std::string screenshot_dir;
+    // --show-target <selector> (show_target_model.h): present this render target / texture instead of the
+    // swapchain image. Read-only, the guest's frame is unchanged. Empty = off. With a window F7 / F8 / F9 /
+    // F10 (mip, layer, previous, next target) take over; set_show_target changes it at run time.
+    std::string show_target;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;
@@ -107,6 +111,8 @@ struct ExecutorStats {
     uint64_t probes = 0;                     // letterbox probes run
     uint64_t screenshots_saved = 0, screenshots_failed = 0;  // F12 / --screenshot-at PNGs written / failed
     uint64_t probes_failed = 0;              // ... whose bars were not black or whose picture was blank
+    uint64_t show_target_frames = 0;         // presents that drew the --show-target texture instead of the swapchain image
+    uint64_t show_target_unavailable = 0;    // presents where the chosen target could not be shown (the swapchain image stays)
     // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`
     // (a v2 / texture packet it rejects); op errors above are its `_recordOpValidationError`.
     uint64_t packet_errors = 0;
@@ -205,6 +211,11 @@ struct ExecutorStats {
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
 };
 
+struct ShowTargetCandidate {
+    uint32_t id = 0;
+    bool depth = false;
+};
+
 struct AdapterDescription {
     std::string backend;
     std::string vendor;
@@ -259,6 +270,16 @@ public:
     bool window_focused() const;
     // Title bar text of the live window (no-op without one). Call from the pump thread.
     void set_window_title(const std::string& title);
+    // --show-target at run time: selector grammar in show_target_model.h; "" switches it off. False + *error
+    // for a selector that does not parse.
+    bool set_show_target(const std::string& selector, std::string* error);
+    // The hotkeys as bits (show_target_model.h kHotkeyMip / Layer / Prev / Next): what poll() does with F7..F10.
+    void show_target_hotkeys(uint32_t bits);
+    // What the last present showed ("tex 12 depth 1280x720 depth32float mip 0/1 layer 0/1"), the reason it could
+    // not ("unavailable: ..."), "" when the swapchain image was shown.
+    std::string shown_target_label() const;
+    // Render targets of the last presented frame (the hotkey cycle list), sorted by id.
+    std::vector<ShowTargetCandidate> shown_target_candidates() const;
     // Present mode in effect once the surface is configured ("" before / headless).
     std::string present_mode_name() const;
     // Path of the newest screenshot written (wait_idle() first), "" if none.

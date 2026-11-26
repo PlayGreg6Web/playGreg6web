@@ -215,6 +215,17 @@ when reached), `-NoBuild`, `-TrustBuild`, `-DryRun`, `-BuildDir`. The report lan
 Same thing from Python: `python tools/run_native_boot.py --play [--fresh-setup] [--save-dir DIR] ...`
 (or `--native-executor` for just the build).
 
+### Debugging a black or garbled screen: `--show-target`
+
+`playgta6_boot --window ... --show-target <selector>` (from `run_native_boot.py --play`: `-- --show-target <selector>`)
+shows any render target instead of the swapchain image, read-only (the game's frame is not changed). Start with
+`--show-target cycle` and press **F10** / **F9** to walk the frame's render targets (the title bar names the
+current one), **F8** for the next array layer, **F7** for the next mip. Or pick directly: `pass:12` (the colour
+target of the 12th render pass of the frame), `last`, `<texture id>`, `depth:<id>` (grey; add `@range=0.9:1` for
+reverse-Z or tight depth), `@layer=2`, `@mip=1`. Offline: `pg6_native_exec --trace f.pg6trace --show-target pass:5
+--digest-at 30` runs headless and the digest / non-black counts it prints are those of the shown target (the headless swapchain).
+Details: `docs/NATIVE_EXECUTOR_DESIGN.md`, "Present any target".
+
 ## Native boot: fast, safe repeat builds
 
 `python tools/run_native_boot.py --build-only ...` runs only the (timed) build stages

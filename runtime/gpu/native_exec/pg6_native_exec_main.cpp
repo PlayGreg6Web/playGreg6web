@@ -10,6 +10,11 @@
 // --digest-at   headless: print the replay page's `digest frame` / `swapchain frame` lines for these
 //               frames, so the output compares line by line with tools/replay_capture.py
 // --window      present to a native window (Win32) instead; closing it stops the replay
+// --show-target <selector>  present this render target / texture instead of the swapchain image (read-only
+//               diagnostic for black / garbled screens): <id>, tex:ID, depth:ID, pass:N[:depth], last, cycle, with
+//               @layer=L @mip=M @range=LO:HI (gpu/native_exec/show_target_model.h). --window: F7 mip, F8 layer,
+//               F9 / F10 previous / next render target; the title names what is shown. Headless it shows in
+//               the swapchain that --digest-at reads.
 // --gpu-validation  strict mode: backend validation + an error scope per packet (stats "validation")
 // --report      write executor statistics (packets handled / not yet handled by opcode) as JSON
 //
@@ -32,7 +37,8 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: pg6_native_exec --trace <file.pg6trace> [--window] [--size WxH] [--frames N]\n"
-                 "                       [--digest-at 0,10,...] [--report <file.json>]\n");
+                 "                       [--digest-at 0,10,...] [--report <file.json>]\n"
+                 "                       [--show-target <id|tex:ID|depth:ID|pass:N[:depth]|last|cycle>[@layer=L][@mip=M][@range=LO:HI]]\n");
     return 1;
 }
 
@@ -69,6 +75,8 @@ int main(int argc, char** argv) {
         const char* v = nullptr;
         if (a == "--window") {
             opts.window = true;
+        } else if (a == "--show-target" && (v = next())) {
+            opts.show_target = v;
         } else if (a == "--gpu-validation") {
             opts.gpu_validation = true;
         } else if (a == "--trace" && (v = next())) {

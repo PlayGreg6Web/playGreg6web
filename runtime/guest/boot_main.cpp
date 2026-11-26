@@ -58,6 +58,7 @@
 //   --screenshot-at N[,N...]  with --window: save those present indices (0-based) as PNG; F12 saves the current frame
 //                to %LOCALAPPDATA%\playgta6\screenshots
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
+//   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; F7 mip, F8 layer, F9/F10 target; gpu/native_exec/show_target_model.h)
 //   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
 //                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.
@@ -115,6 +116,7 @@
 #include "guest/input_record.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/screenshot_model.h"
+#include "gpu/native_exec/show_target_model.h"
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
@@ -240,6 +242,7 @@ struct Options {
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
+    std::string show_target;        // --show-target <selector>
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
     uint32_t max_fps = 0;           // --max-fps: host-side present cap (0 = off)
@@ -344,6 +347,14 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--screenshot-at" && i + 1 < argc) {
             std::string err;
             if (!playgta6::gpu::native_exec::parse_screenshot_at(argv[++i], &o.screenshot_at, &err)) {
+                std::fprintf(stderr, "%s\n", err.c_str());
+                return false;
+            }
+        } else if (a == "--show-target" && i + 1 < argc) {
+            o.show_target = argv[++i];
+            playgta6::gpu::native_exec::ShowTargetSpec spec;
+            std::string err;
+            if (!playgta6::gpu::native_exec::parse_show_target(o.show_target, &spec, &err)) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return false;
             }
@@ -878,6 +889,7 @@ bool start_live_window() {
     options.width = g_options.window_width;
     options.height = g_options.window_height;
     options.present_mode = g_options.present_mode;
+    options.show_target = g_options.show_target;
     options.max_fps = g_options.max_fps;
     options.screenshot_at = g_options.screenshot_at;
     // Persistent Dawn blob cache per title / Dawn build / adapter (repeat runs skip the DXC and driver

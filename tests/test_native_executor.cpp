@@ -16,6 +16,7 @@
 #include "gpu/native_exec/native_executor.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "png_stored_decode.h"
+#include "gpu/native_exec/show_target_model.h"
 
 namespace {
 int g_failures = 0;
@@ -1488,6 +1489,248 @@ void test_screenshot() {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// ---- --show-target (present any target): the chosen texture is drawn instead of the swapchain image ----
+
+GpuBeginRenderPassPayload texture_pass(uint32_t id, float r, float g, float b, float a, uint16_t mip = 0,
+                                       uint32_t layer = 0) {
+    GpuBeginRenderPassPayload bp = swapchain_pass(GpuLoadOp::Clear, r, g, b, a);
+    bp.color[0].texture_id = id;
+    bp.color[0].view.dimension = 2;  // 2d: a single mip / layer, whatever the texture's array size
+    bp.color[0].view.base_mip_level = mip;
+    bp.color[0].view.mip_level_count = 1;
+    bp.color[0].view.base_array_layer = layer;
+    bp.color[0].view.array_layer_count = 1;
+    return bp;
+}
+
+void end_pass(gpu::CommandEncoder& e, const GpuBeginRenderPassPayload& bp) {
+    e.emit_packet(GpuOpcode::BeginRenderPass, &bp, sizeof bp);
+    e.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+}
+
+GpuCreateTexture2Payload show_texture(uint32_t id, uint8_t format, uint32_t layers = 1, uint32_t mips = 1,
+                                      uint32_t samples = 1,
+                                      uint32_t usage = GpuTextureUsage::RenderAttachment | GpuTextureUsage::TextureBinding) {
+    GpuCreateTexture2Payload ct = texture2(id, kW, kH, usage, format);
+    ct.depth_or_layers = layers;
+    ct.mip_levels = mips;
+    ct.sample_count = samples;
+    return ct;
+}
+
+// Every pixel of the last frame is `want` (bgra), within tol.
+bool frame_all_near(NativeExecutor& ex, Px want, int tol = 1) {
+    FrameImage img;
+    std::string err;
+    if (!ex.read_last_frame(&img, &err) || img.width != kW || img.height != kH) return false;
+    for (uint32_t i = 0; i < kW * kH; ++i)
+        if (!px_near(img, i % kW, i / kW, want.b, want.g, want.r, want.a, tol)) return false;
+    return true;
+}
+
+// The frame: textures 100 (rgba8unorm, green), 101 (2 layers: blue, yellow), 102 (2 mips; mip 1 magenta),
+// 103 (depth32float cleared to 0.5), 104 (4x msaa, cyan), 105 (r32uint), 106 (no TextureBinding), then the
+// swapchain red. Resources are created once (the first call), each later call just draws and presents.
+void show_frame(NativeExecutor& ex, bool create) {
+    gpu::CommandEncoder e;
+    e.begin_frame();
+    if (create) {
+        emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(100, 22)));
+        emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(101, 22, 2)));
+        emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(102, 22, 1, 2)));
+        emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(103, 48)));
+        emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(104, 22, 1, 1, 4)));
+        emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(105, 14)));
+        emit(e, GpuOpcode::CreateTexture2,
+             bytes_of(show_texture(106, 22, 1, 1, 1, GpuTextureUsage::RenderAttachment)));
+    }
+    end_pass(e, texture_pass(100, 0, 1, 0, 1));                         // pass 0
+    end_pass(e, texture_pass(101, 0, 0, 1, 1, 0, 0));                   // pass 1
+    end_pass(e, texture_pass(101, 1, 1, 0, 1, 0, 1));                   // pass 2
+    end_pass(e, texture_pass(102, 1, 0, 1, 1, 1, 0));                   // pass 3 (mip 1)
+    GpuBeginRenderPassPayload dp;                                        // pass 4: depth only
+    std::memset(&dp, 0, sizeof dp);
+    dp.depth_stencil.texture_id = 103;
+    dp.depth_stencil.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+    dp.depth_stencil.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    dp.depth_stencil.depth_clear_value = 0.5f;
+    end_pass(e, dp);
+    end_pass(e, texture_pass(104, 0, 1, 1, 1));                         // pass 5
+    end_pass(e, texture_pass(105, 0, 0, 0, 0));                         // pass 6 (a uint target)
+    end_pass(e, texture_pass(106, 0, 0, 0, 0));                         // pass 7
+    end_pass(e, swapchain_pass(GpuLoadOp::Clear, 1, 0, 0, 1));          // pass 8: swapchain red
+    e.present();
+    run(ex, e);
+}
+
+bool show(NativeExecutor& ex, const char* selector) {
+    std::string err;
+    if (!ex.set_show_target(selector, &err)) {
+        std::fprintf(stderr, "set_show_target(%s): %s\n", selector, err.c_str());
+        return false;
+    }
+    show_frame(ex, false);
+    return true;
+}
+
+void test_show_target() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: show-target NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    show_frame(*ex, true);
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));  // no selector: the swapchain image (red)
+    CHECK(ex->stats().show_target_frames == 0);
+
+    CHECK(show(*ex, "100"));
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));
+    CHECK(ex->shown_target_label().find("tex 100 ") == 0);
+    CHECK(show(*ex, "tex:101@layer=0"));
+    CHECK(frame_is(*ex, {255, 0, 0, 255}));  // blue
+    CHECK(show(*ex, "101@layer=1"));
+    CHECK(frame_is(*ex, {0, 255, 255, 255}));  // yellow
+    CHECK(show(*ex, "101@layer=9"));  // clamped to the last layer
+    CHECK(frame_is(*ex, {0, 255, 255, 255}));
+    CHECK(show(*ex, "102@mip=1"));
+    CHECK(frame_is(*ex, {255, 0, 255, 255}));  // magenta, the mip is shown at its own size (32x16, same aspect)
+    CHECK(ex->shown_target_label().find("32x16") != std::string::npos);
+
+    // By pass: pass 2 rendered layer 1 of texture 101 (its own layer is the default), last = the last texture pass.
+    CHECK(show(*ex, "pass:2"));
+    CHECK(frame_is(*ex, {0, 255, 255, 255}));
+    CHECK(show(*ex, "pass:1"));
+    CHECK(frame_is(*ex, {255, 0, 0, 255}));
+    CHECK(show(*ex, "pass:5"));  // the 4x msaa target (sample 0)
+    CHECK(frame_is(*ex, {255, 255, 0, 255}));
+    CHECK(show(*ex, "pass:8"));  // renders only to the swapchain: nothing to show, the swapchain image stays
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+    CHECK(ex->shown_target_label().find("unavailable") == 0);
+    CHECK(show(*ex, "pass:99"));
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+    CHECK(show(*ex, "last"));  // pass 7 renders to texture 106: no TextureBinding
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+    CHECK(ex->shown_target_label().find("TextureBinding") != std::string::npos);
+    CHECK(show(*ex, "105"));
+    CHECK(ex->shown_target_label().find("integer") != std::string::npos);
+    CHECK(show(*ex, "9999"));
+    CHECK(ex->shown_target_label().find("no such texture") != std::string::npos);
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+
+    // Depth through the depth twin: 0.5 -> grey 128 on the default range, 255 / 0 on shifted ranges.
+    CHECK(show(*ex, "depth:103"));
+    CHECK(frame_all_near(*ex, {128, 128, 128, 255}, 1));
+    CHECK(ex->stats().depth_twins_created >= 1);
+    CHECK(show(*ex, "pass:4"));  // a depth-only pass shows its depth target
+    CHECK(frame_all_near(*ex, {128, 128, 128, 255}, 1));
+    CHECK(show(*ex, "pass:4:depth@range=0:0.5"));
+    CHECK(frame_all_near(*ex, {255, 255, 255, 255}, 0));
+    CHECK(show(*ex, "depth:103@range=0.5:1"));
+    CHECK(frame_all_near(*ex, {0, 0, 0, 255}, 0));
+    CHECK(show(*ex, "103"));  // a depth texture asked for as colour
+    CHECK(ex->shown_target_label().find("depth/stencil") != std::string::npos);
+    CHECK(show(*ex, "100@range=0:2"));  // green 1.0 -> 0.5
+    CHECK(frame_all_near(*ex, {0, 128, 0, 255}, 1));
+
+    // Hotkey cycling over the frame's render targets: cycle starts on the swapchain, next walks the targets
+    // by id (colour before depth), past the last one it returns to the swapchain, previous goes backwards.
+    CHECK(show(*ex, "cycle"));
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+    const auto cands = ex->shown_target_candidates();
+    CHECK(cands.size() == 7);  // 100 101 102 103(depth) 104 105 106
+    CHECK(cands.size() == 7 && cands[3].id == 103 && cands[3].depth);
+    ex->show_target_hotkeys(kHotkeyNext);
+    show_frame(*ex, false);
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));  // 100
+    ex->show_target_hotkeys(kHotkeyNext);
+    show_frame(*ex, false);
+    CHECK(frame_is(*ex, {255, 0, 0, 255}));  // 101, its own layer from pass 1 (blue)
+    ex->show_target_hotkeys(kHotkeyLayer);
+    show_frame(*ex, false);
+    CHECK(frame_is(*ex, {0, 255, 255, 255}));  // layer 1 (yellow)
+    ex->show_target_hotkeys(kHotkeyPrev);
+    show_frame(*ex, false);
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));  // back to 100
+    ex->show_target_hotkeys(kHotkeyPrev);
+    show_frame(*ex, false);
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));  // off: the swapchain
+    CHECK(ex->shown_target_label().empty());
+    ex->show_target_hotkeys(kHotkeyPrev);  // wraps to the last candidate (106: cannot be shown)
+    show_frame(*ex, false);
+    CHECK(ex->shown_target_label().find("TextureBinding") != std::string::npos);
+
+    // Off again: the guest's own frame.
+    std::string err;
+    CHECK(ex->set_show_target("", &err));
+    show_frame(*ex, false);
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));
+    CHECK(!ex->set_show_target("bogus", &err) && !err.empty());
+    CHECK(!ex->set_show_target("12@layer", &err));
+    CHECK(!ex->set_show_target("12@range=1:1", &err));
+    CHECK(ex->stats().show_target_frames > 10);
+    CHECK(ex->stats().show_target_unavailable > 3);
+    CHECK(ex->stats().device_errors == 0);
+    CHECK(ex->stats().device_lost == 0);
+}
+
+// Read-only: with --show-target the per-frame digest of the guest's stream image is the same as without.
+void test_show_target_read_only() {
+    const char* paths[2] = {"test_show_target_digest_a.txt", "test_show_target_digest_b.txt"};
+    for (int i = 0; i < 2; ++i) {
+        std::remove(paths[i]);
+        ExecutorOptions opts;
+        opts.width = kW;
+        opts.height = kH;
+        opts.frame_digest_path = paths[i];
+        if (i == 1) opts.show_target = "pass:0";
+        NativeExecutor::CreateStatus status;
+        std::string error;
+        auto ex = NativeExecutor::create(opts, &status, &error);
+        if (!ex) {
+            std::fprintf(stderr, "FAIL: read-only NativeExecutor::create: %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+        show_frame(*ex, true);
+        show_frame(*ex, false);
+        CHECK(i == 0 || ex->stats().show_target_frames == 2);
+        ex->wait_idle();
+    }
+    auto slurp = [](const char* p) {
+        std::FILE* f = std::fopen(p, "rb");
+        std::string s;
+        char buf[512];
+        size_t n;
+        while (f && (n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+        if (f) std::fclose(f);
+        return s;
+    };
+    const std::string a = slurp(paths[0]), b = slurp(paths[1]);
+    CHECK(!a.empty() && a == b);
+    std::remove(paths[0]);
+    std::remove(paths[1]);
+}
+
+// A bad selector fails the creation.
+void test_show_target_bad_option() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.show_target = "pass:x";
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    CHECK(!ex);
+    CHECK(error.find("--show-target") != std::string::npos);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -1522,6 +1765,9 @@ int main() {
     test_depth_texture_float_layout(*ex);
     test_depth_read_variants(*ex);
     test_depth_read_no_float32_filterable();
+    test_show_target();
+    test_show_target_read_only();
+    test_show_target_bad_option();
     test_async_pipelines_and_blob_cache();
     test_screenshot();
     if (g_failures) {
