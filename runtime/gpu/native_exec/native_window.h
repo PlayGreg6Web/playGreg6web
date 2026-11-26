@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+#include "gpu/native_exec/window_layout.h"
+
 namespace playgta6::gpu::native_exec {
 
 class NativeWindow {
@@ -26,6 +28,14 @@ public:
     virtual void set_title(const std::string&) {}
     // Current client area size (0 x 0 while minimized).
     virtual void client_size(uint32_t* width, uint32_t* height) const = 0;
+    // Where the executor should draw a src_w x src_h frame inside the client area: the largest
+    // aspect-preserving rect, centred (letterbox / pillarbox). The executor clears the bars and
+    // blits into this rect; empty while minimized.
+    PresentRect present_rect(uint32_t src_w, uint32_t src_h) const {
+        uint32_t w = 0, h = 0;
+        client_size(&w, &h);
+        return letterbox_rect(src_w, src_h, w, h);
+    }
     // Native handles for the WebGPU surface (Win32: HINSTANCE, HWND).
     virtual void* native_instance() const = 0;
     virtual void* native_handle() const = 0;
