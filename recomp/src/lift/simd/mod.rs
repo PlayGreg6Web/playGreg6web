@@ -47,6 +47,8 @@
 //!   `palignr`, `pblendw/vpblendd/pblendvb`, `phadd*/phsub*`, `pextr*/pinsr*`,
 //!   `pmovsx*/pmovzx*`, `vpbroadcast*`, `vbroadcasti128`, `vinserti128/vextracti128`,
 //!   `vperm2i128`, `vpermd/vpermq`;
+//! - SSE4.2 string compares `pcmp{i,e}str{i,m}` (every immediate, also VEX; `strcmp.rs`);
+//! - AVX-512VL `vpmin/vpmax{s,u}q` on XMM/YMM registers without opmask or broadcast;
 //! - AES-NI `aesenc/aesenclast/aesdec/aesdeclast/aesimc/aeskeygenassist` (also VAES 256-bit),
 //!   `pclmulqdq` (also VPCLMULQDQ 256-bit), `phminposuw`;
 //! - SSE4a `extrq/insertq` (immediate and register forms; the architecturally undefined upper
@@ -54,7 +56,7 @@
 //! - `ldmxcsr/stmxcsr`, `vzeroupper/vzeroall`.
 //!
 //! Everything else that touches vector registers traps with a precise reason: AVX-512 (EVEX),
-//! XOP/FMA4, MMX, x87 (not routed here), SSE4.2 string compares, SHA, gathers, `mpsadbw`,
+//! XOP/FMA4, MMX, x87 (not routed here), SHA, gathers, `mpsadbw`,
 //! `maskmovdqu`.
 //!
 //! # Floating point semantics
@@ -102,6 +104,7 @@ mod float;
 mod helpers;
 mod int;
 mod moves;
+mod strcmp;
 
 use std::fmt::Write as _;
 
@@ -309,6 +312,8 @@ pub(in crate::lift) enum Intr {
     Clmul,
     /// The AES S-box tables.
     AesTables,
+    /// Internal helper `@__playgta6_pcmpstr` (SSE4.2 string compare core).
+    PcmpStr,
 }
 
 /// One module-level declaration required by lifted SIMD code (see `Support::Simd`).
@@ -346,6 +351,7 @@ impl Decl {
             Intr::FmaF64 => return "__playgta6_fma_f64".to_string(),
             Intr::Clmul => return "__playgta6_clmul".to_string(),
             Intr::AesTables => return "__playgta6_aes_sbox".to_string(),
+            Intr::PcmpStr => return "__playgta6_pcmpstr".to_string(),
         };
         format!("llvm.{base}.{}", self.ty.suffix())
     }
@@ -374,6 +380,7 @@ impl Decl {
             Intr::FmaF64 => return helpers::fma_f64_ir(),
             Intr::Clmul => return helpers::CLMUL_IR.to_string(),
             Intr::AesTables => return helpers::aes_tables_ir(),
+            Intr::PcmpStr => return helpers::PCMPSTR_IR.to_string(),
             _ => {}
         }
         format!(
@@ -498,9 +505,17 @@ pub(super) fn note_instruction(ins: &Instruction, info: &InstructionInfo, regs: 
         Mnemonic::Blendvps | Mnemonic::Blendvpd | Mnemonic::Pblendvb => {
             regs.xmm[0] = true;
         }
+        Mnemonic::Pcmpistrm
+        | Mnemonic::Pcmpestrm
+        | Mnemonic::Pcmpestrm64
+        | Mnemonic::Vpcmpistrm
+        | Mnemonic::Vpcmpestrm
+        | Mnemonic::Vpcmpestrm64 => {
+            regs.xmm[0] = true;
+        }
         _ => {}
     }
-    if ins.encoding() == EncodingKind::VEX
+    if is_vex_encoded(ins)
         && ins.op_count() > 0
         && ins.op_kind(0) == OpKind::Register
         && ins.op_register(0).is_xmm()
@@ -522,12 +537,46 @@ pub(super) fn note_instruction(ins: &Instruction, info: &InstructionInfo, regs: 
     }
 }
 
+/// AVX-512VL 128/256-bit encodings that compute exactly what their VEX form does: the 64-bit
+/// element `vpmin/vpmax` without an opmask, zeroing, broadcast, rounding or a register above 15
+/// (those operands are rejected by [`FunctionLifter::check_encoding`]).
+pub(super) fn is_plain_evex(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    ins.encoding() == EncodingKind::EVEX
+        && matches!(
+            ins.mnemonic(),
+            M::Vpminsq | M::Vpminuq | M::Vpmaxsq | M::Vpmaxuq
+        )
+        && ins.op_mask() == Register::None
+        && !ins.zeroing_masking()
+        && !ins.is_broadcast()
+        && !ins.suppress_all_exceptions()
+        && ins.rounding_control() == iced_x86::RoundingControl::None
+}
+
+/// VEX encodings and the EVEX ones of [`is_plain_evex`].
+pub(super) fn is_vex_encoded(ins: &Instruction) -> bool {
+    ins.encoding() == EncodingKind::VEX || is_plain_evex(ins)
+}
+
 /// Whether a VEX instruction with an XMM first operand reads it without writing it.
 pub(super) fn reads_only_first_operand(m: Mnemonic) -> bool {
     use Mnemonic as M;
     matches!(
         m,
-        M::Vcomiss | M::Vucomiss | M::Vcomisd | M::Vucomisd | M::Vptest | M::Vtestps | M::Vtestpd
+        M::Vcomiss
+            | M::Vucomiss
+            | M::Vcomisd
+            | M::Vucomisd
+            | M::Vptest
+            | M::Vtestps
+            | M::Vtestpd
+            | M::Vpcmpistri
+            | M::Vpcmpistrm
+            | M::Vpcmpestri
+            | M::Vpcmpestri64
+            | M::Vpcmpestrm
+            | M::Vpcmpestrm64
     )
 }
 
@@ -537,7 +586,7 @@ pub(super) fn reads_only_first_operand(m: Mnemonic) -> bool {
 /// register sources).
 pub(super) fn is_zeroing_idiom(ins: &Instruction) -> bool {
     use Mnemonic as M;
-    let vex = ins.encoding() == EncodingKind::VEX;
+    let vex = is_vex_encoded(ins);
     let f = Form::of(vex);
     matches!(
         ins.mnemonic(),
@@ -668,7 +717,7 @@ pub(super) fn xmm_rw_masks(ins: &Instruction, info: &InstructionInfo) -> (u16, u
         let r0 = ins.op_register(0);
         if (r0.is_xmm() || r0.is_ymm()) && r0.number() < 16 {
             let bit = 1u16 << r0.number();
-            let vex = ins.encoding() == EncodingKind::VEX;
+            let vex = is_vex_encoded(ins);
             let pure_full_write = info.op_access(0) == OpAccess::Write
                 && !reads_only_first_operand(ins.mnemonic())
                 && (vex || legacy_full_xmm_overwrite(ins));
@@ -729,7 +778,7 @@ pub(in crate::lift) fn is_supported_non_trapping_simd(ins: &Instruction) -> bool
         }
         _ => {}
     }
-    if !matches!(ins.encoding(), EncodingKind::Legacy | EncodingKind::VEX) {
+    if !(ins.encoding() == EncodingKind::Legacy || is_vex_encoded(ins)) {
         return false;
     }
     for i in 0..ins.op_count() {
@@ -760,6 +809,7 @@ pub(in crate::lift) fn is_supported_non_trapping_simd(ins: &Instruction) -> bool
             || float::is_float_supported(m)
             || int::is_int_supported(m)
             || crypto::is_crypto_supported(m)
+            || strcmp::is_strcmp_supported(m)
     }
 }
 
@@ -1212,6 +1262,10 @@ impl FunctionLifter<'_> {
             intr,
             ty: Ty::s(Elem::I64),
         }));
+        if intr == Intr::PcmpStr {
+            self.support
+                .insert(Support::BitIntrinsic(super::super::BitIntrinsic::Cttz, 32));
+        }
         if intr == Intr::FmaF64 {
             self.support.insert(Support::Umul128);
             self.support
@@ -1296,6 +1350,7 @@ impl FunctionLifter<'_> {
             || self.lift_float(ins, vex)?
             || self.lift_int(ins, vex)?
             || self.lift_crypto(ins, vex)?
+            || self.lift_strcmp(ins, vex)?
         {
             return Ok(());
         }
@@ -1357,6 +1412,7 @@ impl FunctionLifter<'_> {
         let vex = match ins.encoding() {
             EncodingKind::Legacy => false,
             EncodingKind::VEX => true,
+            EncodingKind::EVEX if is_plain_evex(ins) => true,
             EncodingKind::EVEX => {
                 return unsupported("AVX-512 (EVEX) instructions are not supported");
             }

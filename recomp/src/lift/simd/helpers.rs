@@ -341,3 +341,199 @@ pub(super) fn aes_tables_ir() -> String {
         text(&inv)
     )
 }
+
+/// `{ result, flags } __playgta6_pcmpstr(imm8, a, b, len_a, len_b, implicit)`: the SSE4.2 string
+/// compare core shared by `pcmp{i,e}str{i,m}` (Intel SDM "Packed Compare Implicit/Explicit Length
+/// Strings"). `a` is the first operand, `b` the second (the string). With `implicit` the lengths
+/// are the positions of the first zero element (or the element count); otherwise `len_a`/`len_b`
+/// are the signed register values, taken as absolute values and clamped to the element count.
+/// `result` is IntRes2 (one bit per element), `flags` holds CF (bit 0), ZF (1), SF (2), OF (3).
+/// Needs `@llvm.cttz.i32`.
+pub(super) const PCMPSTR_IR: &str = "\
+define internal { i32, i32 } @__playgta6_pcmpstr(i32 %imm, <2 x i64> %a, <2 x i64> %b, i64 %la0, i64 %lb0, i1 %implicit) unnamed_addr #0 {
+entry:
+  %A = alloca [16 x i32], align 4
+  %B = alloca [16 x i32], align 4
+  store [16 x i32] zeroinitializer, ptr %A, align 4
+  store [16 x i32] zeroinitializer, ptr %B, align 4
+  %w = and i32 %imm, 1
+  %isword = icmp ne i32 %w, 0
+  %sg = and i32 %imm, 2
+  %issigned = icmp ne i32 %sg, 0
+  %n = select i1 %isword, i32 8, i32 16
+  %n64 = zext i32 %n to i64
+  %aggs = lshr i32 %imm, 2
+  %agg = and i32 %aggs, 3
+  %pols = lshr i32 %imm, 4
+  %pol = and i32 %pols, 3
+  %acc0 = icmp eq i32 %agg, 3
+  %a8 = bitcast <2 x i64> %a to <16 x i8>
+  %a16 = bitcast <2 x i64> %a to <8 x i16>
+  %b8 = bitcast <2 x i64> %b to <16 x i8>
+  %b16 = bitcast <2 x i64> %b to <8 x i16>
+  %nbit = shl i32 1, %n
+  %za = icmp eq <16 x i8> %a8, zeroinitializer
+  %zab = bitcast <16 x i1> %za to i16
+  %zab32 = zext i16 %zab to i32
+  %zaw = icmp eq <8 x i16> %a16, zeroinitializer
+  %zawb = bitcast <8 x i1> %zaw to i8
+  %zawb32 = zext i8 %zawb to i32
+  %zam = select i1 %isword, i32 %zawb32, i32 %zab32
+  %zal = or i32 %zam, %nbit
+  %lai = call i32 @llvm.cttz.i32(i32 %zal, i1 true)
+  %zb = icmp eq <16 x i8> %b8, zeroinitializer
+  %zbb = bitcast <16 x i1> %zb to i16
+  %zbb32 = zext i16 %zbb to i32
+  %zbw = icmp eq <8 x i16> %b16, zeroinitializer
+  %zbwb = bitcast <8 x i1> %zbw to i8
+  %zbwb32 = zext i8 %zbwb to i32
+  %zbm = select i1 %isword, i32 %zbwb32, i32 %zbb32
+  %zbl = or i32 %zbm, %nbit
+  %lbi = call i32 @llvm.cttz.i32(i32 %zbl, i1 true)
+  %lan = icmp slt i64 %la0, 0
+  %laneg = sub i64 0, %la0
+  %laabs = select i1 %lan, i64 %laneg, i64 %la0
+  %labig = icmp ugt i64 %laabs, %n64
+  %lac = select i1 %labig, i64 %n64, i64 %laabs
+  %lae = trunc i64 %lac to i32
+  %la = select i1 %implicit, i32 %lai, i32 %lae
+  %lbn = icmp slt i64 %lb0, 0
+  %lbneg = sub i64 0, %lb0
+  %lbabs = select i1 %lbn, i64 %lbneg, i64 %lb0
+  %lbbig = icmp ugt i64 %lbabs, %n64
+  %lbc = select i1 %lbbig, i64 %n64, i64 %lbabs
+  %lbe = trunc i64 %lbc to i32
+  %lb = select i1 %implicit, i32 %lbi, i32 %lbe
+  br label %fill
+fill:
+  %fi = phi i32 [ 0, %entry ], [ %fi.n, %fill ]
+  %fi7 = and i32 %fi, 7
+  %fi15 = and i32 %fi, 15
+  %xa8 = extractelement <16 x i8> %a8, i32 %fi15
+  %xa16 = extractelement <8 x i16> %a16, i32 %fi7
+  %xa8z = zext i8 %xa8 to i32
+  %xa8s = sext i8 %xa8 to i32
+  %xa16z = zext i16 %xa16 to i32
+  %xa16s = sext i16 %xa16 to i32
+  %xa8v = select i1 %issigned, i32 %xa8s, i32 %xa8z
+  %xa16v = select i1 %issigned, i32 %xa16s, i32 %xa16z
+  %xav = select i1 %isword, i32 %xa16v, i32 %xa8v
+  %pxa = getelementptr [16 x i32], ptr %A, i32 0, i32 %fi15
+  store i32 %xav, ptr %pxa, align 4
+  %xb8 = extractelement <16 x i8> %b8, i32 %fi15
+  %xb16 = extractelement <8 x i16> %b16, i32 %fi7
+  %xb8z = zext i8 %xb8 to i32
+  %xb8s = sext i8 %xb8 to i32
+  %xb16z = zext i16 %xb16 to i32
+  %xb16s = sext i16 %xb16 to i32
+  %xb8v = select i1 %issigned, i32 %xb8s, i32 %xb8z
+  %xb16v = select i1 %issigned, i32 %xb16s, i32 %xb16z
+  %xbv = select i1 %isword, i32 %xb16v, i32 %xb8v
+  %pxb = getelementptr [16 x i32], ptr %B, i32 0, i32 %fi15
+  store i32 %xbv, ptr %pxb, align 4
+  %fi.n = add i32 %fi, 1
+  %fdone = icmp uge i32 %fi.n, %n
+  br i1 %fdone, label %outer, label %fill
+outer:
+  %j = phi i32 [ 0, %fill ], [ %j.n, %jend ]
+  %r1 = phi i32 [ 0, %fill ], [ %r1.n, %jend ]
+  %skip = icmp eq i32 %agg, 2
+  br i1 %skip, label %jend, label %inner
+inner:
+  %i = phi i32 [ 0, %outer ], [ %i.n, %inner ]
+  %acc = phi i1 [ %acc0, %outer ], [ %acc.n, %inner ]
+  %i15 = and i32 %i, 15
+  %i1 = add i32 %i, 1
+  %i1m = and i32 %i1, 15
+  %pai = getelementptr [16 x i32], ptr %A, i32 0, i32 %i15
+  %ai = load i32, ptr %pai, align 4
+  %pai1 = getelementptr [16 x i32], ptr %A, i32 0, i32 %i1m
+  %ai1 = load i32, ptr %pai1, align 4
+  %j15 = and i32 %j, 15
+  %pbj = getelementptr [16 x i32], ptr %B, i32 0, i32 %j15
+  %bj = load i32, ptr %pbj, align 4
+  %k = add i32 %j, %i
+  %kin = icmp ult i32 %k, %n
+  %k15 = and i32 %k, 15
+  %pbk = getelementptr [16 x i32], ptr %B, i32 0, i32 %k15
+  %bk = load i32, ptr %pbk, align 4
+  %iv = icmp ult i32 %i, %la
+  %i1v = icmp ult i32 %i1, %la
+  %jv = icmp ult i32 %j, %lb
+  %kv = icmp ult i32 %k, %lb
+  %eqij = icmp eq i32 %ai, %bj
+  %t0 = and i1 %iv, %jv
+  %anyt = and i1 %t0, %eqij
+  %par = and i32 %i, 1
+  %even = icmp eq i32 %par, 0
+  %ge = icmp sge i32 %bj, %ai
+  %le = icmp sle i32 %bj, %ai1
+  %rg0 = and i1 %t0, %i1v
+  %rg1 = and i1 %rg0, %even
+  %rg2 = and i1 %ge, %le
+  %rngt = and i1 %rg1, %rg2
+  %eqik = icmp eq i32 %ai, %bk
+  %o0 = and i1 %kv, %eqik
+  %niv = xor i1 %iv, true
+  %ordt = or i1 %niv, %o0
+  %ordacc = and i1 %acc, %ordt
+  %ordnext = select i1 %kin, i1 %ordacc, i1 %acc
+  %anyacc = or i1 %acc, %anyt
+  %rngacc = or i1 %acc, %rngt
+  %is0 = icmp eq i32 %agg, 0
+  %is1 = icmp eq i32 %agg, 1
+  %s1 = select i1 %is1, i1 %rngacc, i1 %ordnext
+  %acc.n = select i1 %is0, i1 %anyacc, i1 %s1
+  %i.n = add i32 %i, 1
+  %idone = icmp uge i32 %i.n, %n
+  br i1 %idone, label %jend, label %inner
+jend:
+  %accx = phi i1 [ false, %outer ], [ %acc.n, %inner ]
+  %jj15 = and i32 %j, 15
+  %pej = getelementptr [16 x i32], ptr %A, i32 0, i32 %jj15
+  %aj = load i32, ptr %pej, align 4
+  %pbj2 = getelementptr [16 x i32], ptr %B, i32 0, i32 %jj15
+  %bj2 = load i32, ptr %pbj2, align 4
+  %jva = icmp ult i32 %j, %la
+  %jvb = icmp ult i32 %j, %lb
+  %jeq = icmp eq i32 %aj, %bj2
+  %bothv = and i1 %jva, %jvb
+  %eqv = and i1 %bothv, %jeq
+  %nova = xor i1 %jva, true
+  %novb = xor i1 %jvb, true
+  %bothn = and i1 %nova, %novb
+  %each = or i1 %eqv, %bothn
+  %bit = select i1 %skip, i1 %each, i1 %accx
+  %bit32 = zext i1 %bit to i32
+  %bsh = shl i32 %bit32, %j
+  %r1.n = or i32 %r1, %bsh
+  %j.n = add i32 %j, 1
+  %jdone = icmp uge i32 %j.n, %n
+  br i1 %jdone, label %fin, label %outer
+fin:
+  %nm1 = sub i32 %nbit, 1
+  %vb = shl i32 1, %lb
+  %vm = sub i32 %vb, 1
+  %p1 = icmp eq i32 %pol, 1
+  %p3 = icmp eq i32 %pol, 3
+  %x3 = select i1 %p3, i32 %vm, i32 0
+  %x = select i1 %p1, i32 %nm1, i32 %x3
+  %res = xor i32 %r1.n, %x
+  %cfb = icmp ne i32 %res, 0
+  %cf = zext i1 %cfb to i32
+  %zfb = icmp ult i32 %lb, %n
+  %zf0 = zext i1 %zfb to i32
+  %zf = shl i32 %zf0, 1
+  %sfb = icmp ult i32 %la, %n
+  %sf0 = zext i1 %sfb to i32
+  %sf = shl i32 %sf0, 2
+  %of0 = and i32 %res, 1
+  %of = shl i32 %of0, 3
+  %f1 = or i32 %cf, %zf
+  %f2 = or i32 %f1, %sf
+  %flags = or i32 %f2, %of
+  %r.0 = insertvalue { i32, i32 } poison, i32 %res, 0
+  %r.1 = insertvalue { i32, i32 } %r.0, i32 %flags, 1
+  ret { i32, i32 } %r.1
+}
+";

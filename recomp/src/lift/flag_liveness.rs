@@ -51,8 +51,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use iced_x86::{
-    Code, ConditionCode, EncodingKind, Instruction, InstructionInfoFactory, Mnemonic, OpKind,
-    Register,
+    Code, ConditionCode, Instruction, InstructionInfoFactory, Mnemonic, OpKind, Register,
 };
 
 use super::memory_access::WindowBurst;
@@ -814,7 +813,19 @@ fn simd_flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
         | M::Ptest
         | M::Vptest
         | M::Vtestps
-        | M::Vtestpd => Some((0, ALL_FLAGS)),
+        | M::Vtestpd
+        | M::Pcmpistri
+        | M::Vpcmpistri
+        | M::Pcmpistrm
+        | M::Vpcmpistrm
+        | M::Pcmpestri
+        | M::Pcmpestri64
+        | M::Vpcmpestri
+        | M::Vpcmpestri64
+        | M::Pcmpestrm
+        | M::Pcmpestrm64
+        | M::Vpcmpestrm
+        | M::Vpcmpestrm64 => Some((0, ALL_FLAGS)),
         _ => Some((0, 0)),
     }
 }
@@ -947,6 +958,15 @@ fn used_state(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateM
         }
     }
     match ins.mnemonic() {
+        Mnemonic::Pcmpistrm
+        | Mnemonic::Pcmpestrm
+        | Mnemonic::Pcmpestrm64
+        | Mnemonic::Vpcmpistrm
+        | Mnemonic::Vpcmpestrm
+        | Mnemonic::Vpcmpestrm64 => {
+            // The byte/word mask result goes to XMM0.
+            mask |= xmm_state_bit(0);
+        }
         Mnemonic::Blendvps | Mnemonic::Blendvpd | Mnemonic::Pblendvb => {
             // Legacy SSE4.1 variable blends implicitly read XMM0 as the mask.
             mask |= xmm_state_bit(0);
@@ -957,7 +977,7 @@ fn used_state(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateM
         _ => {}
     }
     // VEX encodings with an XMM destination register zero bits 128..255 (`ymmhN`).
-    if ins.encoding() == EncodingKind::VEX
+    if simd::is_vex_encoded(ins)
         && ins.op_count() > 0
         && ins.op_kind(0) == OpKind::Register
         && ins.op_register(0).is_xmm()

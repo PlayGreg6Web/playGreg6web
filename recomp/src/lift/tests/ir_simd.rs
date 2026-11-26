@@ -586,8 +586,8 @@ fn unsupported_vector_forms_trap_with_precise_reasons() {
         ),
         (super::assemble(0x1000, |a| a.emms()), "MMX instructions"),
         (
-            super::assemble(0x1000, |a| a.pcmpistri(xmm0, xmm1, 0)),
-            "Pcmpistri is not supported yet",
+            super::assemble(0x1000, |a| a.mpsadbw(xmm0, xmm1, 0)),
+            "Mpsadbw is not supported yet",
         ),
         (
             super::assemble(0x1000, |a| a.maskmovdqu(xmm0, xmm1)),

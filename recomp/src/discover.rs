@@ -230,6 +230,47 @@ fn par_map<T: Sync, R: Send>(threads: usize, items: &[T], f: impl Fn(&T) -> R + 
 }
 
 /// Relocations of a resolved table: the table and index-table reads plus one per entry.
+/// An inferred table (no proven index bound) is read as far as its entries stay inside the
+/// function, which runs over into the next table when tables are packed back to back: the
+/// entries past the neighbour's base are that table's, and decode to addresses in the middle of
+/// instructions. Cuts the extent at the lowest known table base inside it, keeping at least two
+/// entries. Tables with a proven bound and two-level tables are left alone.
+fn clip_inferred(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    mut table: JumpTable,
+    bases: &BTreeSet<u64>,
+) -> JumpTable {
+    if !table.inferred || table.index.is_some() {
+        return table;
+    }
+    let stride = blocks
+        .range(..=table.load_site)
+        .next_back()
+        .and_then(|(_, b)| b.instructions.iter().find(|i| i.ip() == table.load_site))
+        .filter(|i| i.memory_index() != Register::None)
+        .map(|i| u64::from(i.memory_index_scale()));
+    let Some(stride @ (4 | 8)) = stride else {
+        return table;
+    };
+    let Some(end) = u64::try_from(table.targets.len())
+        .ok()
+        .and_then(|n| n.checked_mul(stride))
+        .and_then(|n| table.table.checked_add(n))
+    else {
+        return table;
+    };
+    let Some(&next) = bases.range(table.table.saturating_add(1)..end).next() else {
+        return table;
+    };
+    let keep = (next - table.table) / stride;
+    if keep >= 2
+        && let Ok(keep) = usize::try_from(keep)
+    {
+        table.targets.truncate(keep);
+    }
+    table
+}
+
 fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Vec<Relocation>) {
     let mut push = |site, kind, target| {
         out.push(Relocation {
@@ -868,8 +909,25 @@ impl<'i, 'a> Discovery<'i, 'a> {
         Some((entry, next))
     }
 
+    /// Base address of every resolved jump table.
+    fn table_bases(&self) -> BTreeSet<u64> {
+        self.jump_tables.values().map(|t| t.table).collect()
+    }
+
+    /// [`Self::match_jump_table_raw`] with an inferred extent cut at the start of the next known
+    /// table ([`clip_inferred`]).
+    fn match_jump_table(
+        &self,
+        site: u64,
+        preds: &BTreeMap<u64, Pred>,
+        bases: &BTreeSet<u64>,
+    ) -> Option<JumpTable> {
+        let table = self.match_jump_table_raw(site, preds)?;
+        Some(clip_inferred(&self.blocks, table, bases))
+    }
+
     /// Slice the jump at `site` together with its chain of sole predecessors.
-    fn match_jump_table(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<JumpTable> {
+    fn match_jump_table_raw(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<JumpTable> {
         let (trace, first_block) = self.jump_trace(site, preds)?;
         let leaf = self.leaf_extent(site);
         let direct = jump_table::resolve_in(self.image, &trace, leaf);
@@ -984,12 +1042,19 @@ impl<'i, 'a> Discovery<'i, 'a> {
         // One predecessor snapshot per round keeps the outcome independent of visiting order.
         let preds = self.predecessors();
         let pending: Vec<u64> = pending.into_iter().collect();
-        let resolved: Vec<JumpTable> = par_map(self.threads, &pending, |&site| {
-            self.match_jump_table(site, &preds)
+        let matched: Vec<JumpTable> = par_map(self.threads, &pending, |&site| {
+            self.match_jump_table_raw(site, &preds)
         })
         .into_iter()
         .flatten()
         .collect();
+        // Tables found in the same round bound each other's inferred extents too.
+        let mut bases = self.table_bases();
+        bases.extend(matched.iter().map(|t| t.table));
+        let resolved: Vec<JumpTable> = matched
+            .into_iter()
+            .map(|t| clip_inferred(&self.blocks, t, &bases))
+            .collect();
         let progress = !resolved.is_empty();
         for table in resolved {
             if let Some(block) = self
@@ -1022,8 +1087,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 self.table_revisions.get(site).copied().unwrap_or(0) < MAX_TABLE_REVISIONS
             })
             .collect();
+        let bases = self.table_bases();
         let changed: Vec<JumpTable> = par_map(self.threads, &candidates, |&(site, table)| {
-            let now = self.match_jump_table(*site, &preds)?;
+            let now = self.match_jump_table(*site, &preds, &bases)?;
             (now != *table).then_some(now)
         })
         .into_iter()
@@ -1054,8 +1120,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
         loop {
             let preds = self.predecessors();
             let tables: Vec<(&u64, &JumpTable)> = self.jump_tables.iter().collect();
+            let bases = self.table_bases();
             let stale: Vec<u64> = par_map(self.threads, &tables, |&(site, table)| {
-                (self.match_jump_table(*site, &preds).as_ref() != Some(table)).then_some(*site)
+                (self.match_jump_table(*site, &preds, &bases).as_ref() != Some(table))
+                    .then_some(*site)
             })
             .into_iter()
             .flatten()
@@ -1227,6 +1295,45 @@ mod tests {
     use super::*;
     use crate::code_image::{CodeSection, Region};
     use crate::reloc::{RelocKind, Relocation};
+
+    /// An inferred extent that runs into the next table is cut at that table's base.
+    #[test]
+    fn inferred_extent_is_clipped_at_the_next_table() {
+        let mut load =
+            Decoder::with_ip(64, &[0x48, 0x63, 0x04, 0x81], TEXT, DecoderOptions::NONE).decode(); // movsxd rax, dword ptr [rcx+rax*4]
+        load.set_ip(TEXT);
+        let mut block = BasicBlock::new(TEXT);
+        block.instructions.push(load);
+        let blocks = BTreeMap::from([(TEXT, block)]);
+        let table = |n: usize, inferred: bool| JumpTable {
+            site: TEXT + 4,
+            load_site: TEXT,
+            table: DATA,
+            targets: (0..n as u64).map(|i| TEXT + 0x100 + i).collect(),
+            index: None,
+            inferred,
+        };
+        let bases = BTreeSet::from([DATA, DATA + 0x10, DATA + 0x20]);
+        let clipped = clip_inferred(&blocks, table(20, true), &bases);
+        assert_eq!(clipped.targets.len(), 4);
+        // A proven extent, and one without a neighbour inside, are untouched.
+        assert_eq!(
+            clip_inferred(&blocks, table(20, false), &bases)
+                .targets
+                .len(),
+            20
+        );
+        assert_eq!(
+            clip_inferred(&blocks, table(3, true), &bases).targets.len(),
+            3
+        );
+        // Fewer than two entries would remain: keep the table as inferred.
+        let near = BTreeSet::from([DATA + 4]);
+        assert_eq!(
+            clip_inferred(&blocks, table(20, true), &near).targets.len(),
+            20
+        );
+    }
 
     const BASE: u64 = 0x1_4000_0000;
     const TEXT: u64 = BASE + 0x1000;

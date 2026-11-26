@@ -22,7 +22,7 @@ use iced_x86::code_asm::CodeAssembler;
 use iced_x86::{Decoder, Formatter, IcedError, IntelFormatter};
 
 use super::exec::{
-    CODE_BASE, Case, DATA_ADDR, RAX, RBX, RSP, STACK_TOP, STATE_ADDR, build, exec_or_skip, run,
+    CODE_BASE, Case, DATA_ADDR, RAX, RBX, RDX, RSP, STACK_TOP, STATE_ADDR, build, exec_or_skip, run,
 };
 use super::ir::Lcg;
 use super::{Program, assemble};
@@ -598,11 +598,18 @@ pub(super) struct Op {
     pub cases: usize,
     /// Put a shift count (around every lane width) into the low quadword of `xmm2`/`[rbx]`.
     pub shift_count: bool,
+    /// Also draw `rdx` from the `gpr` pool (the explicit string lengths of `pcmpestr*`).
+    pub lengths: bool,
 }
 
 impl Op {
     pub fn cases(mut self, n: usize) -> Self {
         self.cases = n;
+        self
+    }
+
+    pub fn lengths(mut self) -> Self {
+        self.lengths = true;
         self
     }
 
@@ -656,6 +663,7 @@ pub(super) fn op(
         check,
         cases: 48,
         shift_count: false,
+        lengths: false,
     }
 }
 
@@ -732,6 +740,12 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
     // Sign-extend narrow integer pools so 32-bit GPR forms also see "negative" upper halves.
     if op.gpr.bytes() < 8 && k % 3 == 1 {
         gpr[RAX] |= 0xFFFF_FFFF_0000_0000;
+    }
+    if op.lengths {
+        gpr[RDX] = gpool[(k / 3 + 1) % gpool.len()];
+        if op.gpr.bytes() < 8 && k % 4 == 1 {
+            gpr[RDX] |= 0xFFFF_FFFF_0000_0000;
+        }
     }
     let f = rng.next();
     Input {

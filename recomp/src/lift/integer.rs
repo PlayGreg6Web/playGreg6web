@@ -154,6 +154,9 @@ impl FunctionLifter<'_> {
             | M::Clwb
             | M::Cldemote
             | M::Reservednop
+            // No shadow stack (CET off): `rdssp` leaves its destination unchanged.
+            | M::Rdsspd
+            | M::Rdsspq
             // `monitorx` only arms an address monitor; `mwaitx` may return at any time
             // (spurious wake-ups are architectural), so returning at once is exact.
             | M::Monitorx

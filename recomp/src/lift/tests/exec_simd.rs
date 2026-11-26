@@ -658,3 +658,141 @@ fn r59_wasm64_simd128_codegen_and_edge_cases() {
         "phminposuw tie-breaking"
     );
 }
+
+/// AVX-512VL `vpmin/vpmax{s,u}q` on XMM and YMM registers (no opmask, no broadcast) compute their
+/// VEX-style lane-wise result and zero the upper half of an XMM destination.
+#[test]
+fn evex_quadword_min_max_execute() {
+    if !exec_or_skip("evex_quadword_min_max_execute") {
+        return;
+    }
+    const YMMH_STATE: u64 = STATE_ADDR + crate::lift::STATE_YMM_HI_OFFSET;
+    let f_minsq = CODE_BASE;
+    let f_minuq = CODE_BASE + 0x100;
+    let f_maxsq = CODE_BASE + 0x200;
+    let f_maxuq = CODE_BASE + 0x300;
+    let f_ymm = CODE_BASE + 0x400;
+    let program = Program::new()
+        .asm(f_minsq, |a| {
+            a.vpminsq(xmm1, xmm1, xmm2)?;
+            a.ret()
+        })
+        .asm(f_minuq, |a| {
+            a.vpminuq(xmm1, xmm1, xmm2)?;
+            a.ret()
+        })
+        .asm(f_maxsq, |a| {
+            a.vpmaxsq(xmm1, xmm1, xmm2)?;
+            a.ret()
+        })
+        .asm(f_maxuq, |a| {
+            a.vpmaxuq(xmm1, xmm0, xmm2)?;
+            a.ret()
+        })
+        .asm(f_ymm, |a| {
+            a.vpminuq(ymm1, ymm1, ymm2)?;
+            a.ret()
+        });
+    let functions = program.discover();
+    let built = build("evex_qword_minmax", functions.values());
+
+    let a = [i64::MIN as u64, 5, u64::MAX, 0x8000_0000_0000_0001];
+    let b = [i64::MAX as u64, (-3i64) as u64, 7, 0x8000_0000_0000_0000];
+    // Registers xmm0..2 (16 bytes each), then the upper halves ymmh0..2.
+    let state = |x0: [u64; 2], x1: [u64; 2], x2: [u64; 2]| {
+        [x0, x1, x2]
+            .iter()
+            .flat_map(|x| xmm_bytes(x[0], x[1]))
+            .collect::<Vec<u8>>()
+    };
+    let case = |func: u64| {
+        let mut c = Case::new(func);
+        c.mem
+            .push((XMM_STATE, state([a[2], b[2]], [a[0], a[1]], [b[0], b[1]])));
+        c.mem.push((YMMH_STATE, vec![0xA5u8; 3 * 16]));
+        c.read.push((XMM_STATE + 16, 16));
+        c.read.push((YMMH_STATE + 16, 16));
+        c
+    };
+    let mut cases = vec![case(f_minsq), case(f_minuq), case(f_maxsq), case(f_maxuq)];
+    // 256-bit: both halves are processed.
+    let mut wide = Case::new(f_ymm);
+    wide.mem
+        .push((XMM_STATE, state([0, 0], [a[0], a[1]], [b[0], b[1]])));
+    wide.mem.push((
+        YMMH_STATE,
+        [
+            xmm_bytes(0, 0),
+            xmm_bytes(a[2], a[3]),
+            xmm_bytes(b[2], b[3]),
+        ]
+        .concat(),
+    ));
+    wide.read.push((XMM_STATE + 16, 16));
+    wide.read.push((YMMH_STATE + 16, 16));
+    cases.push(wide);
+    let out = run(&built, &cases);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+    let lanes =
+        |f: fn(u64, u64) -> u64, x: [u64; 2], y: [u64; 2]| xmm_bytes(f(x[0], y[0]), f(x[1], y[1]));
+    let (x1, x2) = ([a[0], a[1]], [b[0], b[1]]);
+    assert_eq!(
+        out[0].mem[0],
+        lanes(|p, q| (p as i64).min(q as i64) as u64, x1, x2),
+        "vpminsq"
+    );
+    assert_eq!(out[1].mem[0], lanes(u64::min, x1, x2), "vpminuq");
+    assert_eq!(
+        out[2].mem[0],
+        lanes(|p, q| (p as i64).max(q as i64) as u64, x1, x2),
+        "vpmaxsq"
+    );
+    // vpmaxuq xmm1, xmm0, xmm2: first source is xmm0.
+    assert_eq!(
+        out[3].mem[0],
+        lanes(u64::max, [a[2], b[2]], x2),
+        "vpmaxuq (three operand)"
+    );
+    for o in &out[..4] {
+        assert_eq!(
+            o.mem[1],
+            vec![0u8; 16],
+            "VEX/EVEX-128 zeroes the upper half"
+        );
+    }
+    assert_eq!(
+        out[4].mem[0],
+        lanes(u64::min, x1, x2),
+        "vpminuq ymm low half"
+    );
+    assert_eq!(
+        out[4].mem[1],
+        lanes(u64::min, [a[2], a[3]], [b[2], b[3]]),
+        "vpminuq ymm high half"
+    );
+}
+
+/// `rdsspq` / `rdsspd` without an enabled shadow stack leave the destination register unchanged.
+#[test]
+fn rdssp_without_shadow_stack_is_a_nop() {
+    if !exec_or_skip("rdssp_without_shadow_stack_is_a_nop") {
+        return;
+    }
+    let f = CODE_BASE;
+    let program = Program::new().asm(f, |a| {
+        a.rdsspq(r10)?;
+        a.rdsspd(r11d)?;
+        a.ret()
+    });
+    let functions = program.discover();
+    let built = build("rdssp_nop", functions.values());
+    let c = Case::new(f)
+        .reg(10, 0x1122_3344_5566_7788)
+        .reg(11, 0x99AA_BBCC_DDEE_FF00);
+    let out = run(&built, &[c]);
+    assert!(out[0].error.is_empty(), "trapped: {}", out[0].error);
+    assert_eq!(out[0].regs[10], 0x1122_3344_5566_7788);
+    assert_eq!(out[0].regs[11], 0x99AA_BBCC_DDEE_FF00);
+}

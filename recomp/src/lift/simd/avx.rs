@@ -165,6 +165,10 @@ pub(super) fn in_lane(m: Mnemonic) -> bool {
             | M::Vpmaxub
             | M::Vpmaxuw
             | M::Vpmaxud
+            | M::Vpminsq
+            | M::Vpminuq
+            | M::Vpmaxsq
+            | M::Vpmaxuq
             | M::Vpavgb
             | M::Vpavgw
             | M::Vpsignb
