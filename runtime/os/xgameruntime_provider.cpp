@@ -991,7 +991,30 @@ private:
     std::atomic<bool> result_logged_{false};
 };
 
-void ignore_connectivity_change(void* /*context*/, const Pg6XNetworkingConnectivityHint* /*hint*/) {}
+// The guest callback of one connectivity registration. The O8 shim calls it at most once (the
+// initial notification; the offline state never changes), so it frees itself when called. A
+// registration removed before its notification was dispatched leaks this 16-byte record.
+struct GuestConnectivityCallback {
+    uint64_t function = 0;
+    uint64_t context = 0;
+};
+
+// Guest-readable copy of the hint handed to guest callbacks (the offline hint is constant).
+uint64_t guest_connectivity_hint() {
+    static const uint64_t va = com::guest_alloc(sizeof(Pg6XNetworkingConnectivityHint));
+    return va;
+}
+
+void forward_connectivity_change(void* context, const Pg6XNetworkingConnectivityHint* hint) {
+    std::unique_ptr<GuestConnectivityCallback> cb(static_cast<GuestConnectivityCallback*>(context));
+    const uint64_t va = guest_connectivity_hint();
+    if (va == 0 || hint == nullptr || !com::write_guest(va, *hint)) {
+        com::detail::log_bad_pointer("XNetworkingConnectivityHint (guest copy)", va);
+        return;
+    }
+    // XNetworkingConnectivityHintChangedCallback(void* context, const XNetworkingConnectivityHint*).
+    com::GuestFunction<void(uint64_t, uint64_t)>(cb->function).call_top_level(cb->context, va);
+}
 
 // {37e56907-...}/{bf2346b2-...}: XNetworking.
 class NetworkingApi : public com::ComObject {
@@ -1008,15 +1031,20 @@ public:
         return hr;
     }
 
-    // The O8 shim never fires change notifications, so the guest callback is not kept.
-    int32_t RegisterConnectivityHintChanged(uint64_t queue, uint64_t /*context*/, uint64_t callback,
+    // The O8 shim sends the documented initial notification (offline, network initialized) to
+    // the queue's completion port; it is forwarded to the guest callback.
+    int32_t RegisterConnectivityHintChanged(uint64_t queue, uint64_t context, uint64_t callback,
                                             GuestPtr<uint64_t> token) {
         if (callback == 0 || token.is_null() || !optional_queue_ok(queue)) {
             return E_INVALIDARG_HR;
         }
+        auto cb = std::make_unique<GuestConnectivityCallback>(GuestConnectivityCallback{callback, context});
         Pg6XTaskQueueRegistrationToken host_token{};
         const int32_t hr = pg6_gdk_xnetworking_register_connectivity_hint_changed(
-            from_guest<Pg6XTaskQueue>(queue), nullptr, &ignore_connectivity_change, &host_token);
+            from_guest<Pg6XTaskQueue>(queue), cb.get(), &forward_connectivity_change, &host_token);
+        if (hr >= 0) {
+            cb.release();  // owned by the queued notification now
+        }
         token.write(host_token.token);
         return hr;
     }

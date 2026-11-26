@@ -273,7 +273,12 @@ void test_winhttp() {
 
 std::atomic<int> g_connectivity_notifications{0};
 
-void connectivity_changed(void*, const Pg6XNetworkingConnectivityHint*) {
+std::atomic<uint32_t> g_last_level{0};
+std::atomic<bool> g_last_initialized{false};
+
+void connectivity_changed(void*, const Pg6XNetworkingConnectivityHint* hint) {
+    g_last_level = hint->connectivity_level;
+    g_last_initialized = hint->network_initialized;
     g_connectivity_notifications.fetch_add(1);
 }
 
@@ -306,10 +311,25 @@ void test_xnetworking() {
               nullptr, nullptr, &connectivity_changed, &token_b) == S_OK_HR);
     CHECK(token_a.token != 0 && token_b.token != 0 && token_a.token != token_b.token);
 
-    // Never fires.
+    // One initial notification per registration (GDK contract), on the completion port; the
+    // offline state never changes, so nothing follows it. token_b's went to the process queue.
     CHECK(pg6_gdk_xtask_queue_dispatch(queue, 0, 0) == 0);
+    CHECK(pg6_gdk_xtask_queue_dispatch(queue, 1, 0) == 1);
     CHECK(pg6_gdk_xtask_queue_dispatch(queue, 1, 0) == 0);
-    CHECK(g_connectivity_notifications.load() == 0);
+    for (int i = 0; i < 200 && g_connectivity_notifications.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(g_connectivity_notifications.load() == 2);
+    CHECK(g_last_level.load() == static_cast<uint32_t>(ConnectivityLevel::None));
+    CHECK(g_last_initialized.load());
+
+    // Unregistered before its notification is dispatched: no callback.
+    Pg6XTaskQueueRegistrationToken token_c{};
+    CHECK(pg6_gdk_xnetworking_register_connectivity_hint_changed(
+              queue, nullptr, &connectivity_changed, &token_c) == S_OK_HR);
+    CHECK(pg6_gdk_xnetworking_unregister_connectivity_hint_changed(token_c, 0) == 1);
+    CHECK(pg6_gdk_xtask_queue_dispatch(queue, 1, 0) == 1);
+    CHECK(g_connectivity_notifications.load() == 2);
 
     CHECK(pg6_gdk_xnetworking_unregister_connectivity_hint_changed(token_a, 1) == 1);
     CHECK(pg6_gdk_xnetworking_unregister_connectivity_hint_changed(token_a, 1) == 0);

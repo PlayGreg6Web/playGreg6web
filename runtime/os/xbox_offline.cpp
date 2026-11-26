@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -408,6 +409,33 @@ uint32_t drop_event(const char* import_name, const void* event_descriptor) {
     }
     dropped_events().fetch_add(1, std::memory_order_relaxed);
     return ETW_ERROR_SUCCESS;
+}
+
+void get_offline_connectivity_hint(Pg6XNetworkingConnectivityHint* hint) {
+    *hint = Pg6XNetworkingConnectivityHint{};
+    hint->connectivity_level = static_cast<uint32_t>(ConnectivityLevel::None);
+    hint->connectivity_cost = static_cast<uint32_t>(ConnectivityCost::Unknown);
+    // Initialized: the network stack is up, there just is no connection (cable unplugged).
+    hint->network_initialized = true;
+}
+
+// One queued initial notification. Owned by the queued item, so a registration that is removed
+// before the queue dispatches it leaves nothing dangling.
+struct ConnectivityNotification {
+    uint64_t token = 0;
+    void* context = nullptr;
+    Pg6XNetworkingConnectivityHintChangedCallback callback = nullptr;
+};
+
+void deliver_connectivity_notification(void* raw, bool canceled) {
+    std::unique_ptr<ConnectivityNotification> note(static_cast<ConnectivityNotification*>(raw));
+    // A registration removed before dispatch gets no callback (as after Unregister on a console).
+    if (canceled || !handles().lookup(note->token, HandleKind::ConnectivityRegistration)) {
+        return;
+    }
+    Pg6XNetworkingConnectivityHint hint{};
+    get_offline_connectivity_hint(&hint);
+    note->callback(note->context, &hint);
 }
 
 }  // namespace
@@ -901,23 +929,53 @@ Pg6HResult pg6_gdk_xnetworking_get_connectivity_hint(Pg6XNetworkingConnectivityH
     if (hint == nullptr) {
         return gdk::E_INVALIDARG_HR;
     }
-    *hint = Pg6XNetworkingConnectivityHint{};
-    hint->connectivity_level = static_cast<uint32_t>(off::ConnectivityLevel::None);
-    hint->connectivity_cost = static_cast<uint32_t>(off::ConnectivityCost::Unknown);
-    // Initialized, so titles do not wait for a change notification that will never arrive.
-    hint->network_initialized = true;
+    off::get_offline_connectivity_hint(hint);
     return gdk::S_OK_HR;
 }
 
+// GDK: "registers a connectivity hint changed notification and sends an initial notification
+// callback". The offline state never changes afterwards, so that initial one is the only call.
+// It goes to the completion port of `queue` (the process task queue when null).
 Pg6HResult pg6_gdk_xnetworking_register_connectivity_hint_changed(
-    Pg6XTaskQueueHandle,
-    void*,
+    Pg6XTaskQueueHandle queue,
+    void* context,
     Pg6XNetworkingConnectivityHintChangedCallback callback,
     Pg6XTaskQueueRegistrationToken* token) {
-    return off::register_silent("XNetworkingRegisterConnectivityHintChanged",
-                                off::HandleKind::ConnectivityRegistration,
-                                callback != nullptr,
-                                token);
+    const Pg6HResult hr = off::register_silent("XNetworkingRegisterConnectivityHintChanged",
+                                               off::HandleKind::ConnectivityRegistration,
+                                               callback != nullptr,
+                                               token);
+    if (gdk::failed(hr)) {
+        return hr;
+    }
+    Pg6XTaskQueueHandle target = queue;
+    bool close_target = false;
+    if (target == nullptr) {
+        close_target = pg6_gdk_xtask_queue_get_current_process_task_queue(&target) != 0;
+    }
+    auto note = std::make_unique<off::ConnectivityNotification>();
+    note->token = token->token;
+    note->context = context;
+    note->callback = callback;
+    const Pg6HResult submitted =
+        target != nullptr
+            ? pg6_gdk_xtask_queue_submit_callback(target,
+                                                  static_cast<uint32_t>(gdk::XTaskQueuePort::Completion),
+                                                  note.get(),
+                                                  &off::deliver_connectivity_notification)
+            : gdk::E_INVALIDARG_HR;
+    if (gdk::succeeded(submitted)) {
+        note.release();  // owned by the queued callback now
+    }
+    if (close_target) {
+        pg6_gdk_xtask_queue_close_handle(target);
+    }
+    if (gdk::failed(submitted)) {
+        off::handles().release(token->token, {off::HandleKind::ConnectivityRegistration});
+        token->token = 0;
+        return submitted;
+    }
+    return hr;
 }
 
 int32_t pg6_gdk_xnetworking_unregister_connectivity_hint_changed(

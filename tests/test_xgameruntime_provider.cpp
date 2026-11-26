@@ -227,6 +227,19 @@ void sub_blob_cb(GuestState* s) {
     ret(s);
 }
 
+// void callback(void* context, const XNetworkingConnectivityHint* hint): records the hint.
+constexpr uint64_t kHintCb = 0x140020700ULL;
+std::atomic<int> g_hint_calls{0};
+std::atomic<uint64_t> g_hint_ctx{0};
+uint32_t g_hint_words[4] = {};
+
+void sub_hint_cb(GuestState* s) {
+    g_hint_ctx = s->gpr[GuestReg::Rcx];
+    CHECK(g_arena->read(s->gpr[GuestReg::Rdx], g_hint_words, sizeof(g_hint_words)));
+    g_hint_calls.fetch_add(1);
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kRecord, sub_record},
     {kAsyncDone, sub_async_done},
@@ -234,6 +247,7 @@ const LiftedFunctionEntry kFunctions[] = {
     {kWorkFn, sub_work},
     {kEnumCb, sub_enum_cb},
     {kBlobCb, sub_blob_cb},
+    {kHintCb, sub_hint_cb},
 };
 
 struct GuestFault {
@@ -286,6 +300,8 @@ constexpr Guid kUnmappedProvider = com::make_guid("dfcd4649-4ff8-4043-ba07-35d60
 constexpr Guid kUnmappedIid = com::make_guid("eaf669df-5542-4590-99a3-8dc061f837cc");
 constexpr Guid kGameProvider = com::make_guid("973a344e-24bf-4d0f-8457-56c534892b29");
 constexpr Guid kGameIid = com::make_guid("2549f142-6419-4a06-97b5-931aab7c2f34");
+constexpr Guid kNetworkingProvider = com::make_guid("37e56907-2f10-41e8-b72f-36edb185331a");
+constexpr Guid kNetworkingIid = com::make_guid("bf2346b2-39af-4658-b5ea-44713c7e83b3");
 constexpr Guid kBogus = com::make_guid("12345678-1234-1234-1234-123456789abc");
 
 struct Fixture {
@@ -879,6 +895,53 @@ void test_task_queue_slots() {
     CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
 }
 
+// XNetworking: the hint reports an initialized network with no connectivity, and each
+// registration gets exactly one initial notification with that hint on its completion port.
+void test_networking_slots() {
+    Fixture fx;
+    const uint64_t async = fx.query(kAsyncQueue, kAsyncQueue);
+    const uint64_t net = fx.query(kNetworkingProvider, kNetworkingIid);
+    const uint64_t hint = fx.alloc(16);
+    CHECK(hr32(fx.vcall(net, 15, {hint})) == 0);  // XNetworkingGetConnectivityHint
+    uint32_t words[4] = {};
+    CHECK(com::read_guest(hint, words, sizeof(words)));
+    CHECK(words[0] == 1u);            // connectivityLevel = None
+    CHECK(words[1] == 0u);            // connectivityCost = Unknown
+    CHECK((words[3] & 0xFFu) == 1u);  // networkInitialized
+    CHECK((words[3] >> 8) == 0u);     // no data limit / roaming flags
+
+    const uint64_t out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(async, 12, {0, 0, out})) == 0);  // Manual / Manual queue
+    const uint64_t queue = load64(out);
+    g_hint_calls = 0;
+    std::memset(g_hint_words, 0xFF, sizeof(g_hint_words));
+    CHECK(hr32(fx.vcall(net, 16, {queue, 0x4E7, kHintCb, out})) == 0);
+    const uint64_t token = load64(out);
+    CHECK(token != 0);
+    CHECK(g_hint_calls == 0);                                // queued, not inline
+    CHECK((fx.vcall(async, 16, {queue, 0, 0}) & 0xFF) == 0);  // nothing on the work port
+    CHECK((fx.vcall(async, 16, {queue, 1, 0}) & 0xFF) == 1);  // initial notification
+    CHECK(g_hint_calls == 1);
+    CHECK(g_hint_ctx == 0x4E7);
+    CHECK(g_hint_words[0] == 1u && g_hint_words[1] == 0u && (g_hint_words[3] & 0xFFu) == 1u);
+    CHECK((fx.vcall(async, 16, {queue, 1, 0}) & 0xFF) == 0);  // only once
+    CHECK((fx.vcall(net, 17, {token, 1}) & 0xFF) == 1);
+
+    // Unregistered before dispatch: no callback.
+    CHECK(hr32(fx.vcall(net, 16, {queue, 0, kHintCb, out})) == 0);
+    CHECK((fx.vcall(net, 17, {load64(out), 0}) & 0xFF) == 1);
+    fx.vcall(async, 16, {queue, 1, 0});
+    CHECK(g_hint_calls == 1);
+
+    // Null queue: delivered on the process task queue.
+    CHECK(hr32(fx.vcall(net, 16, {0, 0x9, kHintCb, out})) == 0);
+    CHECK(wait_for([] { return g_hint_calls.load() == 2; }));
+    CHECK(g_hint_ctx == 0x9);
+    CHECK((fx.vcall(net, 17, {load64(out), 1}) & 0xFF) == 1);
+    CHECK(hr32(fx.vcall(net, 16, {queue, 0, 0, out})) == com::E_INVALIDARG_HR);
+    fx.vcall(async, 17, {queue});
+}
+
 void test_user_slots() {
     Fixture fx;
     const uint64_t async = fx.query(kAsyncQueue, kAsyncQueue);
@@ -1309,6 +1372,7 @@ int main() {
     test_query_api();
     test_task_queue_slots();
     test_user_slots();
+    test_networking_slots();
     test_unimplemented_slots();
     test_async_provider_slots();
     test_http_client_thunks();
