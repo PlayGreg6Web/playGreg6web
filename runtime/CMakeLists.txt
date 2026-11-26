@@ -560,6 +560,13 @@ else()
         add_test(NAME test_native_executor COMMAND test_native_executor)
         set_tests_properties(test_native_executor PROPERTIES SKIP_RETURN_CODE 77)
 
+        # The WGSL prelude (gpu/rt_bvh.h) compiled by Dawn/Tint and run on the GPU against the CPU twin.
+        add_executable(test_rt_bvh_gpu ../tests/test_rt_bvh_gpu.cpp)
+        target_link_libraries(test_rt_bvh_gpu PRIVATE playgta6_native_exec playgta6_core)
+        target_include_directories(test_rt_bvh_gpu PRIVATE ../tests)
+        add_test(NAME test_rt_bvh_gpu COMMAND test_rt_bvh_gpu)
+        set_tests_properties(test_rt_bvh_gpu PROPERTIES SKIP_RETURN_CODE 77)
+
         # Dawn's D3D12 backend compiles shaders with DXC (as Chrome does) and loads dxcompiler.dll /
         # dxil.dll from the executable's directory: fetch the official DXC release (NCSA/MIT, dxil.dll
         # under Microsoft's redistributable licence) and copy both next to every executable.
@@ -570,7 +577,7 @@ else()
                 DOWNLOAD_EXTRACT_TIMESTAMP TRUE
             )
             FetchContent_MakeAvailable(dxc_prebuilt)
-            foreach(_t pg6_native_exec test_native_executor playgta6_boot)
+            foreach(_t pg6_native_exec test_native_executor test_rt_bvh_gpu playgta6_boot)
                 add_custom_command(TARGET ${_t} POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
                         "${dxc_prebuilt_SOURCE_DIR}/bin/x64/dxcompiler.dll"
