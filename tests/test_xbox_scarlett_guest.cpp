@@ -809,7 +809,96 @@ void test_physical_page_scatter() {
     auto* p0 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
     CHECK(p0 != nullptr && std::memcmp(p0, data.data() + 65536, 65536) == 0);
     CHECK(xmem_unmap_physical_pages(p0));
+
+    // A start offset into the first page (small resources share a page): the bytes before it stay,
+    // the first page takes only its remaining room and the rest spills into the next entry.
+    std::vector<uint8_t> small(70000);
+    for (size_t i = 0; i < small.size(); ++i) {
+        small[i] = static_cast<uint8_t>(i * 13 + 5);
+    }
+    const std::vector<uint64_t> two = {pfn[1], pfn[2] << 12};
+    auto two_at = [&](size_t i, uint64_t* e) {
+        if (i >= two.size()) {
+            return false;
+        }
+        *e = two[i];
+        return true;
+    };
+    constexpr size_t kSkip = 0x3000;
+    CHECK(xmem_write_physical_pages(two_at, small.data(), small.size(), kSkip));
+    {
+        auto* a = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[1]));
+        std::vector<uint8_t> head(kSkip, 0);  // untouched: the last 100 bytes of `data`, then zeros
+        std::copy(data.begin() + 2 * 65536, data.end(), head.begin());
+        CHECK(a != nullptr && std::memcmp(a, head.data(), kSkip) == 0);
+        CHECK(std::memcmp(a + kSkip, small.data(), 65536 - kSkip) == 0);
+        CHECK(xmem_unmap_physical_pages(a));
+        auto* b = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[2]));
+        CHECK(b != nullptr && std::memcmp(b, small.data() + (65536 - kSkip), small.size() - (65536 - kSkip)) == 0);
+        CHECK(xmem_unmap_physical_pages(b));
+    }
+    CHECK(!xmem_write_physical_pages(two_at, small.data(), 16, 65536));  // offset past the first page
     CHECK(pg6_xbox_XMemFreePhysicalPages(3, pfn) == 1);
+}
+
+// Requests start only at Submit (the title fills physical-page lists inside its own Submit), and
+// a physical-page destination honours the start offset into its first page.
+void test_requests_wait_for_submit() {
+    Fixture fx;
+    const std::vector<uint8_t> data = pattern_data(8192);
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\late.bin", data);
+    const uint64_t factory = fx.factory();
+    const uint64_t file = fx.open_file(factory, u"G:\\data\\late.bin");
+    const uint64_t queue = fx.create_queue(factory, 8);
+    const uint64_t status = fx.create_status(factory, 1);
+
+    size_t page_count = 1;
+    uint64_t pfn[1] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &page_count, pfn) == 1);
+    const uint64_t page_array = com::guest_alloc(8);
+    const uint64_t zero = 0;
+    CHECK(com::write_guest(page_array, &zero, 8));  // not filled in yet
+    ga::DStorageRequest pp = file_request(file, 0, 1000, page_array, 1000);
+    pp.options = ga::kDStorageOptionDestinationIsPhysicalPages;
+    pp.destination_reserved = 0x2000;
+    const uint64_t dest = com::guest_alloc(8 * 1000);
+    std::vector<uint8_t> zeros(8 * 1000, 0);
+    CHECK(com::write_guest(dest, zeros.data(), zeros.size()));
+
+    const uint64_t submits_before = ga::dstorage_stats().submits;
+    fx.enqueue(queue, pp);
+    for (int i = 0; i < 6; ++i) {  // past half capacity: still nothing may start
+        fx.enqueue(queue, file_request(file, 1000 + i * 1000, 1000, dest + i * 1000, 1000));
+    }
+    fx.vcall(queue, 4, {I(status), I(0)});  // the 8th entry fills the queue exactly
+    CHECK(ga::dstorage_stats().submits == submits_before);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(guest_bytes(dest, zeros.size()) == zeros);
+    CHECK((fx.vcall(status, 3, {I(0)}) & 0xFF) == 0);
+
+    const uint64_t entry = pfn[0] << 12;  // the title fills the page list just before Submit
+    CHECK(com::write_guest(page_array, &entry, 8));
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 0));
+    CHECK(as_hr(fx.vcall(status, 4, {I(0)})) == 0);
+    CHECK(ga::dstorage_stats().submits == submits_before + 1);
+    for (int i = 0; i < 6; ++i) {
+        CHECK(std::memcmp(guest_bytes(dest + i * 1000, 1000).data(), data.data() + 1000 + i * 1000, 1000) == 0);
+    }
+    {
+        auto* p = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
+        CHECK(p != nullptr);
+        CHECK(std::all_of(p, p + 0x2000, [](uint8_t b) { return b == 0; }));
+        CHECK(std::memcmp(p + 0x2000, data.data(), 1000) == 0);
+        CHECK(os::scarlett::xmem_unmap_physical_pages(p));
+    }
+    CHECK(pg6_xbox_XMemFreePhysicalPages(1, pfn) == 1);
+
+    fx.vcall(queue, 8);
+    CHECK(fx.vcall(status, 2) == 0);
+    CHECK(fx.vcall(queue, 2) == 0);
+    CHECK(fx.vcall(file, 2) == 0);
+    CHECK(fx.vcall(factory, 2) == 1);
 }
 
 void test_compressed_and_memory_sources() {
@@ -1033,7 +1122,7 @@ void test_backpressure_and_leaks() {
     CHECK(std::memcmp(guest_bytes(dest, 1000000).data(), data.data(), 1000000) == 0);
     const ga::DStorageStats st = ga::dstorage_stats();
     CHECK(st.requests_completed == 1000);
-    CHECK(st.submits > 100);  // auto-submits at half capacity
+    CHECK(st.submits > 100);  // auto-submits when an enqueue finds the queue full
 
     CHECK(fx.vcall(status, 2) == 0);
     CHECK(fx.vcall(queue, 2) == 0);
@@ -2242,6 +2331,7 @@ int main() {
     test_requests_round_trip();
     test_dstorage_option_parsing();
     test_physical_page_scatter();
+    test_requests_wait_for_submit();
     test_compressed_and_memory_sources();
     test_errors_and_error_record();
     test_cancel_close_and_signal();

@@ -688,7 +688,6 @@ public:
 
     DStorageQueue(const DStorageQueueDesc& desc, std::string name) : desc_(desc), name_(std::move(name)) {
         capacity_ = desc.capacity;
-        auto_submit_ = std::max<size_t>(1, capacity_ / 2);
         counters().live_queues.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -821,8 +820,8 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             const size_t used = occupancy_locked();
             info.empty_slot_count = static_cast<uint16_t>(used >= capacity_ ? 0 : capacity_ - used);
-            info.request_count_until_auto_submit =
-                static_cast<uint16_t>(pending_.size() >= auto_submit_ ? 0 : auto_submit_ - pending_.size());
+            // Auto-submit happens only when an enqueue finds the queue full.
+            info.request_count_until_auto_submit = info.empty_slot_count;
         }
         if (!out.is_null()) {
             out.write(info);
@@ -856,6 +855,9 @@ private:
         }
     }
 
+    // Work starts only at Submit: the title fills a request's page list after EnqueueRequest and
+    // before its own Submit, so running earlier writes into stale pages. The one exception is an
+    // enqueue that finds the queue full, which must submit to make progress.
     void enqueue(Item&& item) {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!closed_ && occupancy_locked() >= capacity_) {
@@ -871,9 +873,6 @@ private:
             return;
         }
         pending_.push_back(std::move(item));
-        if (pending_.size() >= auto_submit_) {
-            submit_locked();
-        }
     }
 
     void submit_locked() {
@@ -921,7 +920,6 @@ private:
     DStorageQueueDesc desc_;
     std::string name_;
     size_t capacity_ = 0;
-    size_t auto_submit_ = 1;
 
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -1057,7 +1055,8 @@ HResult DStorageQueue::write_destination(const DStorageRequest& r, const uint8_t
     }
     const uint64_t array = r.destination;
     auto entry_at = [array](size_t i, uint64_t* entry) { return com::read_guest(array + i * 8, entry, 8); };
-    if (!scarlett::xmem_write_physical_pages(entry_at, data, len)) {
+    // destination_reserved: the start offset into the first page (small textures share a page).
+    if (!scarlett::xmem_write_physical_pages(entry_at, data, len, r.destination_reserved)) {
         diag_once(once().bad_pages, "XCRDAPI: DestinationIsPhysicalPages request: page array " + hex64(array) +
                                         " names no live physical pages for " + std::to_string(len) + " bytes");
         return com::E_INVALIDARG_HR;

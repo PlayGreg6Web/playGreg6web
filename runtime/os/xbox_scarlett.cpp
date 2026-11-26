@@ -2706,7 +2706,8 @@ bool xmem_virtual_free(void* address) {
 
 bool xmem_write_physical_pages(const std::function<bool(size_t index, uint64_t* entry)>& entry_at,
                                const uint8_t* data,
-                               size_t len) {
+                               size_t len,
+                               uint64_t first_offset) {
     auto& st = xmem_state();
     std::unique_lock<std::mutex> lock(st.mutex);
     wait_idle_locked(st, lock);  // no page bytes in flight while they are written
@@ -2730,23 +2731,29 @@ bool xmem_write_physical_pages(const std::function<bool(size_t index, uint64_t* 
         if (page == nullptr) {
             return false;
         }
+        const uint64_t skip = pages.empty() ? first_offset : 0;
+        if (skip >= page->page_size) {
+            return false;
+        }
         pages.push_back(page);
-        done += static_cast<size_t>(std::min<uint64_t>(page->page_size, len - done));
+        done += static_cast<size_t>(std::min<uint64_t>(page->page_size - skip, len - done));
     }
     size_t off = 0;
-    for (PhysicalPage* page : pages) {
-        const size_t n = static_cast<size_t>(std::min<uint64_t>(page->page_size, len - off));
+    for (size_t i = 0; i < pages.size(); ++i) {
+        PhysicalPage* page = pages[i];
+        const uint64_t skip = i == 0 ? first_offset : 0;
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(page->page_size - skip, len - off));
         uint8_t* bytes = page_bytes_locked(*page);
         if (bytes == nullptr) {
             return false;
         }
-        std::memcpy(bytes, data + off, n);
+        std::memcpy(bytes + skip, data + off, n);
         if (page->home_va != 0) {
-            guest_window::mark_written(page->home_va, n);
-            mark_mirror_locked(st, page->home_va, n);
+            guest_window::mark_written(page->home_va + skip, n);
+            mark_mirror_locked(st, page->home_va + skip, n);
         }
         for (const uint64_t w : page->window_slots) {
-            guest_window::mark_written(w, n);
+            guest_window::mark_written(w + skip, n);
         }
         off += n;
     }

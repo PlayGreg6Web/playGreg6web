@@ -401,11 +401,14 @@ void xmem_reset_for_testing();
 // Writes `len` bytes into physical pages, page after page (DirectStorage
 // DestinationIsPhysicalPages). `entry_at(i, &e)` yields the i-th page entry: a physical address
 // (frame number << 12, page-aligned) or, failing that, a frame number as XMemAllocatePhysicalPages
-// returns it. Each entry takes min(page size, bytes left). All entries are resolved before any
-// byte is written: false (nothing written) when an entry cannot be read or names no live page.
+// returns it. Writing starts `first_offset` bytes into the first page (small resources share a
+// page); each entry then takes min(room left in the page, bytes left). All entries are resolved
+// before any byte is written: false (nothing written) when an entry cannot be read, names no live
+// page, or `first_offset` is not inside the first page.
 bool xmem_write_physical_pages(const std::function<bool(size_t index, uint64_t* entry)>& entry_at,
                                const uint8_t* data,
-                               size_t len);
+                               size_t len,
+                               uint64_t first_offset = 0);
 
 // DirectStorage backing hooks (in-memory virtual file table + host read callback + HTTPFS fallback).
 using DStorageHostOpenCallback = std::function<int64_t(std::string_view normalized_path)>;
