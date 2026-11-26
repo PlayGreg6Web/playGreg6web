@@ -109,13 +109,32 @@ Every handler names the worker function it mirrors.
 Known divergences, to be closed or documented as they come up:
 
 - Device creation mirrors the replay page (the six optional features it requests, when the adapter has
-  them, and default limits); the worker's `requestNegotiatedDevice` (raised limits, more features) is
-  milestone 2.
+  them, and default limits) plus `timestamp-query` for the GPU pass timer (with Dawn's timestamp
+  quantization toggle off: Chrome rounds timestamps to 100 us, the native table gets exact values); the
+  worker's `requestNegotiatedDevice` (raised limits, more features) is not mirrored yet.
 - A pipeline with `pipeline_layout_id == 0` ("auto") or whose explicit layout does not match the WGSL
   `@group(0)` bindings gets Dawn's `layout: auto` without the worker's bind-group remap
   (`_getOrCreateRemappedBindGroup`); `auto_layout_pipelines` counts the first case. Manifest layouts
   (`layout-manifest.json`, flag `ManifestReference`) are unavailable, as in the replay page
-  (`manifest_layouts_unavailable`).
+  (`manifest_layouts_unavailable`). The remap, the manifest layouts and the reflection loader stay open.
+- v1 pipelines (`8`/`19`) and bind groups (`15`/`16`) take the worker's path for "no reflection registry
+  loaded" (the replay page's and the producer's situation): layout `auto`, entry points `vs_main` /
+  `fs_main` / `cs_main`, one `float32xN` attribute at location 0 for a non-zero stride, the canvas format
+  as the only target, bind group layouts from `pipeline.getBindGroupLayout(group)`, a missing
+  `resource_id == 0` sampler replaced by the default linear sampler. Counted as `reflection_unavailable`.
+  A stream that depends on a loaded reflection registry (explicit S6 layouts, reflected vertex
+  attributes) or on the G34 fallback shader profiles (the worker's shader router) is not reproduced.
+- Read-backs (`39`/`40`) write to the memory given by `attach_guest_memory`: a base pointer + size (the
+  browser's wasm memory offsets) or absolute host addresses (what the native `ReadbackGate` hands
+  out). Nothing attached: nothing is written and the counter does not move (the worker's `!memory`).
+  The live boot (`--window`) does not attach memory yet: how a guest address maps to a host pointer is
+  settled in M3. A frame that cannot be presented completes its queued read-backs as failed (the worker
+  would leave the counter standing, and the producer's fence hold with it).
+- GPU pass timestamps time a pass as a whole (WebGPU has no timestamp writes inside a pass). A pass is
+  keyed by the pipeline its first `SetPipeline` / `SetComputePipeline` selects: the fragment shader's
+  hash for a render pipeline (else the vertex shader's), the compute shader's hash for a compute
+  pipeline, `0` for a pass without a pipeline (the v1 clearing pass) or an inline-WGSL shader. A pass
+  that switches pipelines is attributed entirely to the first one; nothing is split or estimated.
 - WGSL that the pack does not hold and the fallback router would replace: the replay page has no router,
   so the hash text is compiled and rejected on both sides (`shader_pack_misses`); the router itself is not
   mirrored.
@@ -124,12 +143,12 @@ Known divergences, to be closed or documented as they come up:
   change how the same texels reach the texture and are not mirrored.
 - Non-canvas stream swapchain formats (sRGB, others) use the worker's intermediate texture + blit
   (`WgpuSwapchain`); the executor counts them (`swapchain_format_unsupported`) and keeps the canvas
-  format: milestone 2.
+  format: not mirrored yet.
 - `CreateBuffer` with `byte_size` above 2^53 throws a `TypeError` in the worker (WebIDL
   `[EnforceRange]`); natively it is a WebGPU validation error.
 - Worker-only machinery with no GPU-visible effect on a healthy run is not mirrored: device-loss
-  recovery and resource replay (W100/W104), early read-back flushes, first-visible-frame probes,
-  telemetry. A lost device stops the executor (later batches are counted as dropped).
+  recovery and resource replay (W100/W104), first-visible-frame probes, telemetry. (The early read-back
+  flush is mirrored: it is what lets a title that waits on a read-back fence make progress.) A lost device stops the executor (later batches are counted as dropped).
 
 ## Packet coverage plan
 
@@ -142,9 +161,11 @@ Known divergences, to be closed or documented as they come up:
 | `14`/`34` samplers, `5` CreateShaderModule (inline WGSL and WGSL pack lookup) | `_handleCreateShaderModule`, `wgsl_pack_loader.js` | **M1 (done)** |
 | `22`/`23` layouts, `24`/`25` pipelines, `32`/`33` bind groups | `render_state_packets.js` | **M1 (done)** |
 | `6`/`18` draws, `9`/`10`/`17` state, `20`/`21` compute, `28`-`31` dynamic state, `36`-`38` indirect | `_flushPresent` pass commands | **M1 (done)** |
-| `8`/`19` v1 pipelines, `15`/`16` v1 bind groups (need the reflection loader), `layout-manifest.json` layouts, the layout:auto bind-group remap | `reflection_loader.js`, `_getOrCreateRemappedBindGroup` | M2 |
-| `39`/`40` read-back into producer memory + completion counter | `_startRecordedReadbacks` | M2 |
-| Swapchain blit fallback, `requestNegotiatedDevice` feature/limit negotiation, GPU pass timestamps (#1608) | `wgpu_swapchain.js`, `requestNegotiatedDevice`, `gpu_timer.js` | M2 |
+| `8`/`19` v1 pipelines, `15`/`16` v1 bind groups (the no-reflection path, see the divergences) | `_handleCreateRenderPipeline`, `_handleCreateComputePipeline`, `_handleCreateBindGroup` | **M2 (done)** |
+| `39`/`40` read-back into producer memory + completion counter, early read-back flush | `_recordReadbackCopy`, `_startRecordedReadbacks`, `_flushReadbacksNow` | **M2 (done)** |
+| GPU pass timestamps feeding `runtime/gpu/gpu_time` (#1608), `gpu_time` in the boot report | `gpu_timer.js` | **M2 (done)** |
+| `layout-manifest.json` layouts, the reflection loader, the layout:auto bind-group remap | `reflection_loader.js`, `_getOrCreateRemappedBindGroup` | M2b (open) |
+| Swapchain blit fallback, `requestNegotiatedDevice` feature/limit negotiation | `wgpu_swapchain.js`, `requestNegotiatedDevice` | M2b (open) |
 | Live boot: `playgta6_boot --native-gpu [--window]`, present any target | `os::wgpu_submit` observer | M3 |
 
 The order follows what a real capture needs to draw anything: M1 is the first milestone at which
@@ -198,9 +219,11 @@ playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gp
   GPU side paces the title the way the browser's GPU ring does (`gpu/gpu_ring.h`), and present
   pacing (`gpu/present_pacing.h`) keeps its meaning. Read-backs (`39`/`40`) are completed by the
   executor thread writing the bytes to `dst_addr` and incrementing the `u32` at `done_addr`
-  (`std::atomic_ref`), the native equivalent of the worker's `Atomics.add`; the producer already
-  waits on that counter (`gpu/d3d12_readback.cpp`), and how `dst_addr` maps to a host pointer in the
-  native harness is settled in that milestone.
+  (`std::atomic_ref`, M2: `attach_guest_memory`), the native equivalent of the worker's `Atomics.add`;
+  the producer already waits on that counter (`gpu/d3d12_readback.cpp`), and how `dst_addr` maps to a
+  host pointer in the native harness is settled in that milestone (M2 supports a base pointer + size
+  or absolute host addresses). The completion needs the executor's `poll()` (WebGPU map callbacks): the
+  live pump already polls after every batch.
 
 ## Test strategy
 
@@ -213,7 +236,13 @@ playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gp
    passes, the fresh-canvas rule, an unknown attachment dropping the pass, the padded `WriteBuffer`
    path byte for byte, the rejection of an unaligned write (a device error, contents unchanged),
    buffer re-creation and destruction, and the per-opcode accounting of truncated and unhandled
-   packets. Without an adapter it exits 77 and CTest reports it as skipped. CI has no GPU and keeps
+   packets. Milestone 2 adds, all read back from the GPU into a host buffer standing in for the guest
+   memory: a compute result and a texture region (rows repacked to a 16-byte guest pitch, the gap
+   untouched), the early flush (nothing presented, the data and counter arrive), failed copies (counter
+   advances, nothing written), no memory attached, v1 pipelines / bind groups (a textured draw, a compute
+   dispatch), and the GPU timer (a pack-keyed compute pass lands in a private `GpuTimeTable` with its
+   hash, a non-zero duration and the right pass counts). Without an adapter it exits 77 and CTest
+   reports it as skipped. CI has no GPU and keeps
    the option off.
 3. **Differential replay against Chrome:** replay the same `.pg6trace` with
    `tools/replay_capture.py --thumbat F...` and `pg6_native_exec --digest-at F...`; both cut the trace

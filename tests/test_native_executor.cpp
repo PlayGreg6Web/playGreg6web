@@ -1,6 +1,6 @@
-// Native executor milestones 0 and 1 on the host's real GPU (headless): device, offscreen swapchain,
-// clear/present, buffers, textures, shaders, layouts, pipelines, draws and dispatches, with every
-// result read back from the GPU. Exits 77
+// Native executor milestones 0 to 2 on the host's real GPU (headless): device, offscreen swapchain,
+// clear/present, buffers, textures, shaders, layouts, pipelines, draws and dispatches, v1 pipelines,
+// GPU -> CPU read-backs into (host) memory and GPU pass timestamps, with every result read back from the GPU. Exits 77
 // (CTest: skipped) when the host has no WebGPU adapter. Built with -DPLAYGTA6_NATIVE_EXECUTOR=ON.
 #include <cstdio>
 #include <cstring>
@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
+#include "gpu/gpu_time.h"
 #include "gpu/native_exec/native_executor.h"
 
 namespace {
@@ -166,7 +167,8 @@ void test_buffers(NativeExecutor& ex) {
 void test_stream_accounting(NativeExecutor& ex) {
     const ExecutorStats before = ex.stats();
     gpu::CommandEncoder enc;
-    enc.set_bind_group(0, 1);  // v1 SetBindGroup (needs the reflection loader): skipped and counted
+    const uint32_t zero = 0;
+    enc.emit_packet(static_cast<GpuOpcode>(50), &zero, 4);  // an opcode no milestone implements: skipped and counted
     enc.nop();
     std::vector<uint8_t> bytes(enc.data(), enc.data() + enc.size());
     const GpuPacketHeader truncated{static_cast<uint16_t>(GpuOpcode::WriteBuffer), 0, 64};
@@ -175,13 +177,12 @@ void test_stream_accounting(NativeExecutor& ex) {
     std::memcpy(bytes.data() + at, &truncated, 8);
     CHECK(ex.execute(bytes.data(), bytes.size()) == 0);
     const ExecutorStats& after = ex.stats();
-    CHECK(after.unhandled[static_cast<size_t>(GpuOpcode::SetBindGroup)] ==
-          before.unhandled[static_cast<size_t>(GpuOpcode::SetBindGroup)] + 1);
+    CHECK(after.unhandled[50] == before.unhandled[50] + 1);
     CHECK(after.handled[0] == before.handled[0] + 1);
     CHECK(after.truncated_batches == before.truncated_batches + 1);
     CHECK(after.packets == before.packets + 2);
     const std::string json = ex.stats_json();
-    CHECK(json.find("\"unhandled\": {\"16\": 1}") != std::string::npos);
+    CHECK(json.find("\"unhandled\": {\"50\": 1}") != std::string::npos);
 }
 
 // ---- milestone 1: textures, shaders, layouts, pipelines, draws, dispatches ----
@@ -466,6 +467,339 @@ void test_pack_and_formats(NativeExecutor& ex) {
     CHECK(ex.stats().device_errors == errors_before_bc);
 }
 
+// ---- milestone 2: read-backs, v1 pipelines, GPU pass timestamps ----
+
+uint32_t u32_at(const std::vector<uint8_t>& mem, size_t off) {
+    uint32_t v;
+    std::memcpy(&v, mem.data() + off, 4);
+    return v;
+}
+
+GpuReadbackBufferPayload rb_buffer(uint32_t id, uint64_t src, uint64_t size, uint64_t dst, uint64_t done) {
+    GpuReadbackBufferPayload r;
+    std::memset(&r, 0, sizeof r);
+    r.seq = 1;
+    r.buffer_id = id;
+    r.src_offset = src;
+    r.size = size;
+    r.dst_addr = dst;
+    r.done_addr = done;
+    return r;
+}
+
+void test_readbacks(NativeExecutor& ex) {
+    std::vector<uint8_t> mem(8192, 0xEE);
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+    std::memset(mem.data(), 0, 16);  // the done counters
+    ex.attach_guest_memory(gm);
+    const ExecutorStats before = ex.stats();
+
+    // A compute dispatch and the read-backs of its result, in one batch with no Present: the executor
+    // submits the recorded work at the end of the batch (the worker's early read-back flush).
+    gpu::CommandEncoder enc;
+    enc.create_buffer(100, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    enc.create_shader_module(101, GpuShaderStage::Compute, kCompute);
+    create_layouts(enc, 102, 103, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 104;
+    cp.cs_module_id = 101;
+    cp.pipeline_layout_id = 103;
+    emit(enc, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(enc, 105, 102, {bg_entry(0, GpuBindResourceType::Buffer, 100)});
+    enc.set_compute_pipeline(104);
+    set_bind_group2(enc, 0, 105);
+    enc.dispatch_compute(1);
+    emit(enc, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(100, 4, 8, 256, 0)));
+    emit(enc, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(100, 5, 6, 512, 4)));  // unaligned source range
+    CHECK(run(ex, enc) == 0);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& a = ex.stats();
+    CHECK(a.frames_submitted == before.frames_submitted);  // no frame was presented
+    CHECK(a.early_readback_flushes == before.early_readback_flushes + 1);
+    CHECK(a.readbacks_requested == before.readbacks_requested + 2);
+    CHECK(a.readbacks_delivered == before.readbacks_delivered + 2);
+    CHECK(a.readback_bytes == before.readback_bytes + 14);
+    const uint8_t want0[8] = {3, 0, 0, 0, 5, 0, 0, 0};
+    const uint8_t want1[6] = {0, 0, 0, 5, 0, 0};
+    CHECK(std::memcmp(mem.data() + 256, want0, 8) == 0);
+    CHECK(mem[255] == 0xEE && mem[264] == 0xEE);
+    CHECK(std::memcmp(mem.data() + 512, want1, 6) == 0);
+    CHECK(mem[511] == 0xEE && mem[518] == 0xEE);
+    CHECK(u32_at(mem, 0) == 1 && u32_at(mem, 4) == 1);
+
+    // A texture region lands in the guest's footprint: rows 16 bytes apart, the gap untouched.
+    gpu::CommandEncoder tex;
+    emit(tex, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(110, 2, 2, GpuTextureUsage::CopySrc | GpuTextureUsage::CopyDst, 22)));
+    std::vector<uint8_t> texels(256 + 8, 0);
+    for (int i = 0; i < 8; ++i) texels[i] = static_cast<uint8_t>(1 + i);
+    for (int i = 0; i < 8; ++i) texels[256 + i] = static_cast<uint8_t>(9 + i);
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 110;
+    wt.width = 2;
+    wt.height = 2;
+    wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 2;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(tex, GpuOpcode::WriteTexture, wtv);
+    GpuReadbackTexturePayload rt;
+    std::memset(&rt, 0, sizeof rt);
+    rt.seq = 3;
+    rt.texture_id = 110;
+    rt.width = 2;
+    rt.height = 2;
+    rt.depth_or_layers = 1;
+    rt.bytes_per_row = 16;
+    rt.rows_per_image = 2;
+    rt.dst_addr = 1024;
+    rt.done_addr = 8;
+    rt.dst_size = 24;
+    emit(tex, GpuOpcode::ReadbackTexture, bytes_of(rt));
+    run(ex, tex);
+    ex.wait_idle();
+    ex.poll();
+    for (int i = 0; i < 8; ++i) CHECK(mem[1024 + i] == 1 + i);
+    for (int i = 0; i < 8; ++i) CHECK(mem[1040 + i] == 9 + i);
+    for (int i = 8; i < 16; ++i) CHECK(mem[1024 + i] == 0xEE);
+    CHECK(u32_at(mem, 8) == 1);
+    CHECK(ex.stats().readbacks_delivered == before.readbacks_delivered + 3);
+
+    // Failed copies advance the counter without writing: an unknown buffer, and a destination that
+    // does not fit in the memory. A counter address that is not 4-aligned is left alone (the data
+    // still lands).
+    gpu::CommandEncoder bad;
+    emit(bad, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(9999, 0, 4, 2048, 12)));
+    emit(bad, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(100, 0, 8, 8190, 12)));
+    emit(bad, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(100, 0, 4, 2056, 14)));  // data lands, the counter does not move
+    run(ex, bad);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(mem[2048] == 0xEE && mem[8190] == 0xEE && mem[2056] == 1);
+    CHECK(u32_at(mem, 12) == 2);
+    CHECK(ex.stats().readbacks_failed == before.readbacks_failed + 2);
+
+    // No memory attached: nothing is written and the counter does not move.
+    ex.attach_guest_memory(GuestMemory{});
+    gpu::CommandEncoder none;
+    emit(none, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(100, 0, 4, 3000, 12)));
+    run(ex, none);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(u32_at(mem, 12) == 2 && mem[3000] == 0xEE);
+    CHECK(ex.stats().readbacks_failed == before.readbacks_failed + 3);
+
+    // A truncated payload is an op error, nothing is recorded.
+    const uint64_t errors = ex.stats().op_errors;
+    gpu::CommandEncoder trunc;
+    trunc.emit_packet(GpuOpcode::ReadbackBuffer, &gm, 16);
+    run(ex, trunc);
+    CHECK(ex.stats().op_errors == errors + 1);
+    CHECK(ex.stats().device_errors == before.device_errors);
+}
+
+void test_v1(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    std::vector<uint8_t> mem(256, 0);
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+    ex.attach_guest_memory(gm);
+
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(120, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    std::vector<uint8_t> texels(256 + 8, 0);
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x) {
+            texels[y * 256 + x * 4 + 0] = 10;
+            texels[y * 256 + x * 4 + 1] = 200;
+            texels[y * 256 + x * 4 + 2] = 30;
+            texels[y * 256 + x * 4 + 3] = 255;
+        }
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 120;
+    wt.width = 2;
+    wt.height = 2;
+    wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 2;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(setup, GpuOpcode::WriteTexture, wtv);
+    setup.create_sampler(121);
+    setup.create_shader_module(122, GpuShaderStage::Vertex, kTexturedTriangle);
+    setup.create_shader_module(123, GpuShaderStage::Fragment, kTexturedTriangle);
+    setup.create_render_pipeline(124, 122, 123, 0);  // v1: layout 'auto', vs_main / fs_main
+    const GpuBindGroupEntry entries[2] = {
+        {0, static_cast<uint32_t>(GpuBindResourceType::TextureView), 120, 0, 0, 0},
+        {1, static_cast<uint32_t>(GpuBindResourceType::Sampler), 121, 0, 0, 0},
+    };
+    setup.create_bind_group(125, 124, 0, entries, 2);
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_pipeline(124);
+    frame.set_bind_group(0, 125);
+    frame.draw(3);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+    CHECK(ex.stats().v1_render_pipelines == before.v1_render_pipelines + 1);
+    CHECK(ex.stats().v1_bind_groups == before.v1_bind_groups + 1);
+    CHECK(ex.stats().draws == before.draws + 1);
+    CHECK(frame_is(ex, {30, 200, 10, 255}));
+
+    // A v1 draw without its bind group is skipped like the v2 one.
+    gpu::CommandEncoder skip;
+    skip.begin_frame();
+    skip.set_pipeline(124);
+    skip.draw(3);
+    skip.present();
+    run(ex, skip);
+    CHECK(ex.stats().draws_skipped == before.draws_skipped + 1);
+
+    // v1 compute pipeline + bind group (buffer binding), result read back into memory.
+    gpu::CommandEncoder comp;
+    comp.create_buffer(130, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    comp.create_shader_module(131, GpuShaderStage::Compute, kCompute);
+    comp.create_compute_pipeline(132, 131);
+    const GpuBindGroupEntry bge = {0, static_cast<uint32_t>(GpuBindResourceType::Buffer), 130, 0, 0, 0};
+    comp.create_bind_group(133, 132, 0, &bge, 1);
+    comp.begin_frame();
+    comp.set_compute_pipeline(132);
+    comp.set_bind_group(0, 133);
+    comp.dispatch_compute(1);
+    emit(comp, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(130, 0, 16, 64, 0)));
+    comp.present();
+    run(ex, comp);
+    ex.wait_idle();
+    ex.poll();
+    const uint32_t want[4] = {1, 3, 5, 7};
+    CHECK(std::memcmp(mem.data() + 64, want, 16) == 0);
+    CHECK(u32_at(mem, 0) == 1);
+    CHECK(ex.stats().v1_compute_pipelines == before.v1_compute_pipelines + 1);
+    CHECK(ex.stats().dispatches == before.dispatches + 1);
+    CHECK(ex.stats().device_errors == before.device_errors);
+
+    // Unknown shader / unknown resources are validation errors that create nothing.
+    const uint64_t errors = ex.stats().op_errors;
+    gpu::CommandEncoder bad;
+    bad.create_render_pipeline(140, 9999, 0, 0);
+    const GpuBindGroupEntry missing = {0, static_cast<uint32_t>(GpuBindResourceType::Buffer), 8888, 0, 0, 0};
+    bad.create_bind_group(141, 132, 0, &missing, 1);
+    run(ex, bad);
+    CHECK(ex.stats().op_errors == errors + 2);
+    ex.attach_guest_memory(GuestMemory{});
+}
+
+const char* kHeavyCompute = R"(
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(64) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+  var a = id.x;
+  for (var i = 0u; i < 60000u; i = i + 1u) { a = a * 1664525u + 1013904223u; }
+  out[id.x] = a;
+}
+)";
+
+// GPU pass timestamps feed a GpuTimeTable with the pipeline's shader hash as the key.
+void test_timers() {
+    gpu::d3d12_guest::GpuTimeTable table;
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.gpu_time = &table;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: second NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    if (!ex->stats().timer_supported) {
+        std::printf("test_native_executor: adapter lacks timestamp-query: timer checks skipped\n");
+        CHECK(table.support() == gpu::d3d12_guest::GpuTimeTable::Support::Unavailable);
+        return;
+    }
+    const uint64_t kHash = 0x00c0ffee0badf00dull;
+    const std::string wgsl = kHeavyCompute;
+    std::vector<uint8_t> pack = {'W', 'G', 'P', 'K', 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+    append(pack, kHash);
+    pack.push_back(3);
+    pack.insert(pack.end(), 3, 0);
+    append(pack, static_cast<uint32_t>(16 + 20));
+    append(pack, static_cast<uint32_t>(wgsl.size()));
+    pack.insert(pack.end(), wgsl.begin(), wgsl.end());
+    const std::string path = "test_native_executor_timer.wgsl.pack";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        if (f) {
+            std::fwrite(pack.data(), 1, pack.size(), f);
+            std::fclose(f);
+        }
+    }
+    std::string err;
+    CHECK(ex->load_wgsl_pack(path, &err));
+
+    gpu::CommandEncoder setup;
+    setup.create_buffer(200, GpuBufferUsage::Storage, 64 * 64 * 4);
+    setup.create_shader_module(201, GpuShaderStage::Compute, "0x00c0ffee0badf00d");
+    create_layouts(setup, 202, 203, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 204;
+    cp.cs_module_id = 201;
+    cp.pipeline_layout_id = 203;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 205, 202, {bg_entry(0, GpuBindResourceType::Buffer, 200)});
+    run(*ex, setup);
+    for (int f = 0; f < 3; ++f) {
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        frame.set_compute_pipeline(204);
+        set_bind_group2(frame, 0, 205);
+        frame.dispatch_compute(64);
+        frame.present();
+        run(*ex, frame);
+        ex->wait_idle();  // one frame in flight at a time: no slot is skipped
+    }
+    ex->poll();
+    CHECK(ex->stats().device_errors == 0);
+    CHECK(ex->stats().timer_frames == 3);
+    CHECK(ex->stats().timer_passes == 6);  // the compute pass and the v1 clearing pass of each frame
+    CHECK(table.support() == gpu::d3d12_guest::GpuTimeTable::Support::Available);
+    bool found = false;
+    uint64_t compute_ns = 0;
+    for (const auto& e : table.top(16)) {
+        if (e.hash == kHash && e.kind == gpu::d3d12_guest::GpuPassKind::Compute) {
+            found = true;
+            compute_ns = e.stats.total_ns;
+            CHECK(e.stats.passes == 3);
+        }
+    }
+    CHECK(found);
+    CHECK(compute_ns > 0);
+    const std::string json = table.json();
+    CHECK(json.find("\"frames_measured\": 3") != std::string::npos);
+    std::printf("timer: %llu ns of compute over 3 passes\n", static_cast<unsigned long long>(compute_ns));
+    ex.reset();  // closes the pack
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -490,7 +824,10 @@ int main() {
     test_compute(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
+    test_readbacks(*ex);
+    test_v1(*ex);
     CHECK(ex->stats().device_lost == 0);
+    test_timers();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

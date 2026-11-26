@@ -16,6 +16,12 @@
 #include <string>
 #include <vector>
 
+#include "gpu/native_exec/m2_model.h"
+
+namespace playgta6::gpu::d3d12_guest {
+class GpuTimeTable;
+}
+
 namespace playgta6::gpu::native_exec {
 
 struct ExecutorOptions {
@@ -23,6 +29,11 @@ struct ExecutorOptions {
     uint32_t width = 1280;  // swapchain (and initial client area) size
     uint32_t height = 720;
     std::string title = "playgta6 native executor";
+    // GPU pass timestamps (#1608): measured with timestamp queries when the adapter has the
+    // feature and fed into this table (nullptr = the process-wide gpu_time_table(), the one the
+    // boot report prints). Nothing is estimated: without the feature the table says unavailable.
+    bool gpu_timing = true;
+    d3d12_guest::GpuTimeTable* gpu_time = nullptr;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;
@@ -66,6 +77,20 @@ struct ExecutorStats {
     uint64_t dispatches_clamped = 0;
     uint64_t auto_layout_pipelines = 0;  // layout 0 ("auto"): the worker's WGSL remap is not mirrored
     uint64_t manifest_layouts_unavailable = 0;
+    // Milestone 2: read-backs (39/40), v1 pipelines / bind groups (8/15/16/19), pass timestamps.
+    uint64_t readbacks_requested = 0;
+    uint64_t readbacks_delivered = 0;  // bytes written to guest memory
+    uint64_t readbacks_failed = 0;     // counter advanced without data (copy / map failed, no memory, out of range)
+    uint64_t readback_bytes = 0;
+    uint64_t early_readback_flushes = 0;  // submits that ran the recorded work up to a read-back (no present)
+    uint64_t v1_render_pipelines = 0;
+    uint64_t v1_compute_pipelines = 0;
+    uint64_t v1_bind_groups = 0;
+    uint64_t reflection_unavailable = 0;  // v1 pipelines built without the reflection registry (layout:auto)
+    uint64_t timer_frames = 0;            // submits with timestamp queries attached
+    uint64_t timer_passes = 0;            // passes that carried timestamp writes
+    uint64_t timer_frames_skipped = 0;    // no free query slot (the previous one was still in flight)
+    bool timer_supported = false;
     std::array<uint64_t, kOpcodeSlots> handled{};    // by opcode
     std::array<uint64_t, kOpcodeSlots> unhandled{};  // by opcode: not implemented yet, skipped
     uint64_t unknown_opcodes = 0;                    // opcode >= kOpcodeSlots
@@ -116,8 +141,14 @@ public:
     bool poll();
     // True while the presenting window has keyboard focus (false headless).
     bool window_focused() const;
-    // Blocks until the GPU finished all submitted work.
+    // Blocks until the GPU finished all submitted work and every pending read-back / timestamp
+    // read was delivered.
     void wait_idle();
+
+    // Where read-back results (ReadbackBuffer / ReadbackTexture) are written: the worker's
+    // attachGuestMemory. Without it a read-back writes nothing and does not move its counter.
+    // The memory must outlive the executor's pending read-backs (wait_idle() drains them).
+    void attach_guest_memory(const GuestMemory& memory);
 
     uint64_t frame_count() const;
     const ExecutorStats& stats() const;

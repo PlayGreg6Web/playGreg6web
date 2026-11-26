@@ -543,7 +543,7 @@ else()
             gpu/native_exec/native_window.cpp
         )
         target_include_directories(playgta6_native_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-        target_link_libraries(playgta6_native_exec PUBLIC dawn::webgpu_dawn)
+        target_link_libraries(playgta6_native_exec PUBLIC dawn::webgpu_dawn PRIVATE playgta6_core)  # PRIVATE: gpu/gpu_time.cpp (the GPU-time table the boot report prints)
 
         # `playgta6_boot --window`: the live packet stream goes to the executor (gpu/native_exec/live_pump.h).
         if(TARGET playgta6_boot)

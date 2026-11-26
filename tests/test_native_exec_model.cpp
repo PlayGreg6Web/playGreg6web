@@ -9,6 +9,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/native_exec/m1_model.h"
+#include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/stream_model.h"
 
@@ -399,6 +400,231 @@ void test_clamps() {
     CHECK(r.x == 1 && r.width == 3 && r.height == 4);
 }
 
+// ---- milestone 2: read-backs and v1 pipeline rules (m2_model.h) ----
+
+Packet readback_packet(std::vector<uint8_t>& storage, GpuOpcode op, const void* payload, uint32_t bytes) {
+    gpu::CommandEncoder enc;
+    enc.emit_packet(op, payload, bytes);
+    storage.assign(enc.data(), enc.data() + enc.size());
+    auto v = walk_all(storage.data(), storage.size());
+    return v.empty() ? Packet{} : v[0];
+}
+
+void test_readback_decode() {
+    GpuReadbackBufferPayload b{};
+    b.seq = 7;
+    b.buffer_id = 11;
+    b.src_offset = 5;
+    b.size = 6;
+    b.dst_addr = 0x1000;
+    b.done_addr = 0x2000;
+    std::vector<uint8_t> st;
+    Packet p = readback_packet(st, GpuOpcode::ReadbackBuffer, &b, sizeof b);
+    auto r = decode_readback(p);
+    CHECK(r && r->kind == ReadbackRequest::Kind::Buffer && r->seq == 7 && r->id == 11);
+    CHECK(r && r->src_offset == 5 && r->size == 6 && r->dst_addr == 0x1000 && r->done_addr == 0x2000);
+
+    GpuReadbackTexturePayload t{};
+    t.seq = 8;
+    t.texture_id = 12;
+    t.mip_level = 1;
+    t.origin_x = 2;
+    t.origin_y = 3;
+    t.origin_z = 4;
+    t.width = 5;
+    t.height = 6;
+    t.depth_or_layers = 7;
+    t.bytes_per_row = 8;
+    t.rows_per_image = 9;
+    t.dst_addr = 0x3000;
+    t.done_addr = 0x4000;
+    t.dst_size = 99;
+    p = readback_packet(st, GpuOpcode::ReadbackTexture, &t, sizeof t);
+    r = decode_readback(p);
+    CHECK(r && r->kind == ReadbackRequest::Kind::Texture && r->id == 12 && r->mip_level == 1);
+    CHECK(r && r->origin_x == 2 && r->origin_y == 3 && r->origin_z == 4 && r->width == 5 && r->height == 6);
+    CHECK(r && r->depth_or_layers == 7 && r->bytes_per_row == 8 && r->rows_per_image == 9);
+    CHECK(r && r->dst_addr == 0x3000 && r->done_addr == 0x4000 && r->size == 99);
+
+    // Truncated payloads are the worker's validation error (nullopt).
+    p = readback_packet(st, GpuOpcode::ReadbackBuffer, &b, sizeof b - 1);
+    CHECK(!decode_readback(p));
+    p = readback_packet(st, GpuOpcode::ReadbackTexture, &t, sizeof t - 1);
+    CHECK(!decode_readback(p));
+    p = readback_packet(st, GpuOpcode::Nop, &b, sizeof b);
+    CHECK(!decode_readback(p));
+}
+
+void test_readback_layout() {
+    // Buffer: the copy starts at the 4-aligned offset below src_offset and ends 4-aligned.
+    ReadbackRequest b;
+    b.kind = ReadbackRequest::Kind::Buffer;
+    b.src_offset = 5;
+    b.size = 6;
+    ReadbackLayout l = readback_staging_layout(b);
+    CHECK(l.valid && l.copy_offset == 4 && l.skip == 1 && l.staging_size == 8);
+    b.src_offset = 8;
+    b.size = 8;
+    l = readback_staging_layout(b);
+    CHECK(l.copy_offset == 8 && l.skip == 0 && l.staging_size == 8);
+    b.size = 0;
+    l = readback_staging_layout(b);
+    CHECK(l.staging_size == 4);  // Math.max(4, ...)
+    b.src_offset = uint64_t{1} << 60;
+    CHECK(!readback_staging_layout(b).valid);
+
+    // Texture: 2x2 rgba8 into a guest footprint of pitch 16 (24 bytes in all): rows of 8 bytes.
+    ReadbackRequest t;
+    t.kind = ReadbackRequest::Kind::Texture;
+    t.width = 2;
+    t.height = 2;
+    t.depth_or_layers = 1;
+    t.bytes_per_row = 16;
+    t.rows_per_image = 2;
+    t.size = 24;
+    l = readback_staging_layout(t);
+    CHECK(l.valid && l.rows == 2 && l.depth == 1 && l.row_bytes == 8);
+    CHECK(l.staging_row == 256 && l.staging_rows_per_image == 2 && l.staging_size == 512);
+    auto pieces = readback_pieces(t, l);
+    CHECK(pieces.size() == 2);
+    CHECK(pieces.size() == 2 && pieces[0].dst_offset == 0 && pieces[0].src_offset == 0 && pieces[0].length == 8);
+    CHECK(pieces.size() == 2 && pieces[1].dst_offset == 16 && pieces[1].src_offset == 256 && pieces[1].length == 8);
+
+    // A block-compressed region reads 4-row blocks: 8x8 bc7 = 2 block rows of 2 blocks (32 bytes).
+    t.width = 8;
+    t.height = 8;
+    t.bytes_per_row = 32;
+    t.rows_per_image = 2;
+    t.size = 32 * 2;
+    l = readback_staging_layout(t, readback_block_height(62, false));
+    CHECK(l.rows == 2 && l.row_bytes == 32);
+    CHECK(readback_block_height(62, false) == 4 && readback_block_height(62, true) == 1 && readback_block_height(22, false) == 1);
+    // 3D: two slices, rows_per_image 3 (one more than the 2 rows read).
+    t.width = 2;
+    t.height = 2;
+    t.depth_or_layers = 2;
+    t.bytes_per_row = 16;
+    t.rows_per_image = 3;
+    t.size = (1 * 3 + 1) * 16 + 8;
+    l = readback_staging_layout(t);
+    CHECK(l.row_bytes == 8 && l.staging_size == 256 * 2 * 2);
+    pieces = readback_pieces(t, l);
+    CHECK(pieces.size() == 4 && pieces[2].dst_offset == 3 * 16 && pieces[2].src_offset == 2 * 256);
+    // A footprint pitch smaller than the row, or a size that cuts the last row: nothing / what fits.
+    t.bytes_per_row = 4;
+    t.size = (1 * 3 + 1) * 4 + 8;
+    l = readback_staging_layout(t);
+    CHECK(readback_pieces(t, l).empty());  // row_bytes (8) > pitch
+    t.bytes_per_row = 16;
+    t.rows_per_image = 3;
+    t.size = (1 * 3 + 1) * 16 + 4;  // the last row's 8 bytes do not fit: row_bytes = 4 < the copy
+    l = readback_staging_layout(t);
+    CHECK(l.row_bytes == 4);
+}
+
+void test_readback_deliver() {
+    std::vector<uint8_t> mem(256, 0xEE);
+    std::memset(mem.data(), 0, 8);  // two counters
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+
+    ReadbackRequest b;
+    b.kind = ReadbackRequest::Kind::Buffer;
+    b.src_offset = 5;
+    b.size = 6;
+    b.dst_addr = 64;
+    b.done_addr = 0;
+    const ReadbackLayout l = readback_staging_layout(b);
+    const uint8_t staged[8] = {10, 11, 12, 13, 14, 15, 16, 17};  // bytes [4, 12) of the buffer
+    CHECK(deliver_readback(gm, b, l, staged, sizeof staged));
+    const uint8_t want[6] = {11, 12, 13, 14, 15, 16};  // bytes [5, 11)
+    CHECK(std::memcmp(mem.data() + 64, want, 6) == 0);
+    CHECK(mem[63] == 0xEE && mem[70] == 0xEE);
+    uint32_t counter;
+    std::memcpy(&counter, mem.data(), 4);
+    CHECK(counter == 1);
+
+    // A failed copy (no mapped bytes) writes nothing and still advances the counter.
+    CHECK(!deliver_readback(gm, b, l, nullptr, 0));
+    std::memcpy(&counter, mem.data(), 4);
+    CHECK(counter == 2);
+
+    // A destination outside the memory: no data, counter advances. An unaligned or outside counter
+    // does not move.
+    ReadbackRequest far = b;
+    far.dst_addr = 255;
+    far.done_addr = 4;
+    CHECK(!deliver_readback(gm, far, l, staged, sizeof staged));
+    std::memcpy(&counter, mem.data() + 4, 4);
+    CHECK(counter == 1);
+    far.dst_addr = 64;
+    far.done_addr = 6;
+    CHECK(deliver_readback(gm, far, l, staged, sizeof staged));
+    std::memcpy(&counter, mem.data() + 4, 4);
+    CHECK(counter == 1);
+    far.done_addr = 254;  // 4 bytes do not fit
+    CHECK(deliver_readback(gm, far, l, staged, sizeof staged));
+    far.dst_addr = ~uint64_t{0} - 2;  // address arithmetic must not wrap
+    CHECK(!deliver_readback(gm, far, l, staged, sizeof staged));
+
+    // Nothing attached: nothing at all happens (the worker's `!memory`).
+    CHECK(!GuestMemory{}.attached());
+    std::memcpy(&counter, mem.data(), 4);
+    CHECK(!deliver_readback(GuestMemory{}, b, l, staged, sizeof staged));
+    uint32_t after;
+    std::memcpy(&after, mem.data(), 4);
+    CHECK(after == counter);
+
+    // Host-address mode: dst_addr / done_addr are absolute pointers (the native ReadbackGate's).
+    std::vector<uint8_t> host(32, 0xEE);
+    uint32_t done = 0;
+    GuestMemory abs;
+    abs.host_addresses = true;
+    ReadbackRequest h = b;
+    h.dst_addr = reinterpret_cast<uintptr_t>(host.data());
+    h.done_addr = reinterpret_cast<uintptr_t>(&done);
+    CHECK(abs.attached());
+    CHECK(deliver_readback(abs, h, l, staged, sizeof staged));
+    CHECK(std::memcmp(host.data(), want, 6) == 0 && host[6] == 0xEE && done == 1);
+
+    // Texture rows are repacked into the guest pitch; a short mapped range copies what exists.
+    ReadbackRequest t;
+    t.kind = ReadbackRequest::Kind::Texture;
+    t.width = 2;
+    t.height = 2;
+    t.depth_or_layers = 1;
+    t.bytes_per_row = 16;
+    t.rows_per_image = 2;
+    t.size = 24;
+    t.dst_addr = 128;
+    t.done_addr = 8;
+    std::memset(mem.data() + 8, 0, 4);
+    const ReadbackLayout tl = readback_staging_layout(t);
+    std::vector<uint8_t> tstage(tl.staging_size, 0);
+    for (int i = 0; i < 8; ++i) tstage[i] = static_cast<uint8_t>(1 + i);
+    for (int i = 0; i < 8; ++i) tstage[256 + i] = static_cast<uint8_t>(9 + i);
+    CHECK(deliver_readback(gm, t, tl, tstage.data(), tstage.size()));
+    for (int i = 0; i < 8; ++i) CHECK(mem[128 + i] == 1 + i && mem[144 + i] == 9 + i);
+    CHECK(mem[136] == 0xEE && mem[143] == 0xEE);
+    std::memcpy(&counter, mem.data() + 8, 4);
+    CHECK(counter == 1);
+}
+
+void test_v1_vertex_layout() {
+    CHECK(!plan_v1_vertex_layout(0).has_buffer);
+    auto l = plan_v1_vertex_layout(4);
+    CHECK(l.has_buffer && l.stride == 4 && l.components == 1);
+    l = plan_v1_vertex_layout(8);
+    CHECK(l.components == 2);
+    l = plan_v1_vertex_layout(11);
+    CHECK(l.components == 2);
+    l = plan_v1_vertex_layout(12);
+    CHECK(l.components == 3);
+    l = plan_v1_vertex_layout(24);
+    CHECK(l.stride == 24 && l.components == 3);
+}
+
 int main() {
     test_shader_payloads();
     test_pack();
@@ -411,6 +637,10 @@ int main() {
     test_write_buffer();
     test_split_frames();
     test_digest();
+    test_readback_decode();
+    test_readback_layout();
+    test_readback_deliver();
+    test_v1_vertex_layout();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

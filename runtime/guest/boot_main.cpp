@@ -1296,6 +1296,9 @@ int main(int argc, char** argv) {
             }
 #endif
             o += ",\n  \"rt\": " + gpu::rt_arena::report_json();
+            // Per-pipeline GPU time (#1608): fed by the native executor's timestamp queries
+            // (--window); "available": false with the reason when nothing was measured.
+            o += ",\n  \"gpu_time\": " + dg::gpu_time_table().json();
             o += ",\n  \"gpu_drop_table\": " + dg::drop_table().detail_json();
             {
                 namespace ar = os::audio_report;

@@ -6,16 +6,22 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 #include "abi/playgta6_abi.h"
+#include "gpu/gpu_time.h"
 #include "gpu/native_exec/m1_model.h"
+#include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
 #include "gpu/native_exec/stream_model.h"
 
@@ -159,7 +165,8 @@ struct StorageResolution {
 
 struct DeviceFeatures {
     bool bc = false, bc_sliced_3d = false, depth32_stencil8 = false, float32_filterable = false,
-         float32_blendable = false, bgra8_storage = false, rg11b10_renderable = false, tier1 = false;
+         float32_blendable = false, bgra8_storage = false, rg11b10_renderable = false, tier1 = false,
+         timestamp_query = false;
 };
 
 StorageResolution resolve_storage_format(uint8_t f, const DeviceFeatures& d) {
@@ -233,11 +240,13 @@ struct ShaderEntry {
     std::string code;
     std::optional<std::string> explicit_ep;
     uint32_t stage = 0;
+    uint64_t hash = 0;  // the pack hash of a hash-only payload (0 = inline WGSL): the GPU-time key
 };
 
 struct RenderPipelineEntry {
     wgpu::RenderPipeline pipeline;
     bool expects_group0 = false;
+    uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
 };
 
 struct BufferEntry {
@@ -325,9 +334,36 @@ struct SetBindGroup2Cmd {
     wgpu::BindGroup bind_group;  // resolved at packet time
     std::vector<uint32_t> offsets;
 };
+// v1 SetBindGroup: the group is resolved by id when the frame is encoded (`this.bindGroups.get(id)`
+// with the packet-time handle as fallback), and goes to whichever pass is open.
+struct SetBindGroup1Cmd {
+    uint32_t group, id;
+    wgpu::BindGroup at_packet;
+};
+// ReadbackBuffer / ReadbackTexture: runs in stream order with the frame's passes.
+struct ReadbackCmd {
+    ReadbackRequest req;
+};
 using PassCmd = std::variant<BeginPassCmd, EndPassCmd, SetPipelineCmd, SetVertexBufferCmd, SetIndexBufferCmd,
                              DrawCmd, DrawIndexedCmd, IndirectCmd, SetComputePipelineCmd, DispatchCmd, ViewportCmd,
-                             ScissorCmd, BlendConstantCmd, StencilRefCmd, SetBindGroup2Cmd>;
+                             ScissorCmd, BlendConstantCmd, StencilRefCmd, SetBindGroup2Cmd, SetBindGroup1Cmd,
+                             ReadbackCmd>;
+
+// One query set per frame in flight (GpuTimeRing slot): pass begin / end timestamps, resolved into a
+// buffer and copied to a mappable one at the end of the submit.
+constexpr size_t kTimerSlots = 4;
+constexpr size_t kTimerMaxPasses = 256;
+struct TimerSlot {
+    wgpu::QuerySet queries;
+    wgpu::Buffer resolve;
+    wgpu::Buffer staging;
+};
+
+struct Impl_ReadbackEntry {
+    ReadbackRequest req;
+    ReadbackLayout layout;
+    wgpu::Buffer staging;  // null: the copy was not recorded (the counter still advances)
+};
 
 }  // namespace
 
@@ -373,6 +409,19 @@ struct NativeExecutor::Impl {
     wgpu::BindGroupLayout empty_layout;
     wgpu::ShaderModule empty_fragment;
     std::unique_ptr<WgslPack> pack;
+
+    // ---- milestone 2 state ----
+    GuestMemory guest_mem;
+    std::vector<Impl_ReadbackEntry> recorded_readbacks;  // recorded into the encoder being built
+    bool readback_flush_wanted = false;
+    uint64_t pending_maps = 0;  // read-back / timer map callbacks not delivered yet
+    bool early_flushed = false;  // a read-back flush already submitted work of this frame
+    std::unordered_map<uint32_t, uint64_t> compute_hash;  // GPU-time key of a compute pipeline
+    std::unordered_set<uint32_t> compute_bind_groups;     // v1 bind groups made for a compute pipeline
+    wgpu::Sampler default_filtering_sampler;  // getOrCreateDefaultSampler('filtering')
+    d3d12_guest::GpuTimeTable* time_table = nullptr;
+    std::unique_ptr<d3d12_guest::GpuTimeRing> time_ring;
+    std::vector<TimerSlot> timer_slots;
 
     // ---- setup ----
 
@@ -460,7 +509,20 @@ struct NativeExecutor::Impl {
                 features.*(w.flag) = true;
             }
         }
+        // GPU pass timestamps (gpu_timer.js requests 'timestamp-query' when the adapter has it).
+        // Chrome quantizes timestamp queries to 100 us; native Dawn gets exact values (the toggle
+        // is turned off), which is what per-pass GPU time needs.
+        wgpu::DawnTogglesDescriptor toggles{};
+        static const char* const kDisabledToggles[] = {"timestamp_quantization"};
+        const bool want_timing = options.gpu_timing && adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery);
+        if (want_timing) {
+            required.push_back(wgpu::FeatureName::TimestampQuery);
+            features.timestamp_query = true;
+            toggles.disabledToggleCount = 1;
+            toggles.disabledToggles = kDisabledToggles;
+        }
         wgpu::DeviceDescriptor ddesc{};
+        if (want_timing) ddesc.nextInChain = &toggles;
         ddesc.requiredFeatureCount = required.size();
         ddesc.requiredFeatures = required.data();
         ddesc.SetUncapturedErrorCallback(
@@ -503,8 +565,35 @@ struct NativeExecutor::Impl {
         if (device.GetLimits(&limits) == wgpu::Status::Success && limits.maxComputeWorkgroupsPerDimension >= 1)
             max_workgroups_per_dim = limits.maxComputeWorkgroupsPerDimension;
         if (!surface) create_offscreen();
+        if (options.gpu_timing) setup_timers(adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery));
         *status = CreateStatus::Ok;
         return true;
+    }
+
+    void setup_timers(bool adapter_has_feature) {
+        time_table = options.gpu_time ? options.gpu_time : &d3d12_guest::gpu_time_table();
+        stats.timer_supported = features.timestamp_query;
+        if (!adapter_has_feature) {
+            time_table->set_support(d3d12_guest::GpuTimeTable::Support::Unavailable, "adapter lacks timestamp-query");
+            return;
+        }
+        time_ring = std::make_unique<d3d12_guest::GpuTimeRing>(kTimerSlots, kTimerMaxPasses);
+        for (size_t i = 0; i < kTimerSlots; ++i) {
+            TimerSlot slot;
+            wgpu::QuerySetDescriptor qd{};
+            qd.type = wgpu::QueryType::Timestamp;
+            qd.count = static_cast<uint32_t>(kTimerMaxPasses * 2);
+            slot.queries = device.CreateQuerySet(&qd);
+            wgpu::BufferDescriptor rb{};
+            rb.size = kTimerMaxPasses * 2 * 8;
+            rb.usage = wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc;
+            slot.resolve = device.CreateBuffer(&rb);
+            wgpu::BufferDescriptor sb{};
+            sb.size = rb.size;
+            sb.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+            slot.staging = device.CreateBuffer(&sb);
+            timer_slots.push_back(std::move(slot));
+        }
     }
 
     void create_offscreen() {
@@ -736,6 +825,39 @@ struct NativeExecutor::Impl {
             case GpuOpcode::SetBindGroup2:
                 if (!set_bind_group2(p)) packet_error(op, pending_error("malformed or truncated v2 packet"));
                 break;
+            // v1 pipelines and bind groups (wgpu_worker.js, no reflection registry loaded).
+            case GpuOpcode::CreateRenderPipeline:
+                if (n >= sizeof(GpuCreateRenderPipelinePayload)) create_render_pipeline1(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::CreateComputePipeline:
+                if (n >= sizeof(GpuCreateComputePipelinePayload)) create_compute_pipeline1(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::CreateBindGroup:
+                if (n >= sizeof(GpuCreateBindGroupPayload)) create_bind_group1(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::SetBindGroup:
+                if (n >= sizeof(GpuSetBindGroupPayload)) {
+                    const auto v = read_payload<GpuSetBindGroupPayload>(p);
+                    auto it = bind_groups.find(v.bind_group_id);
+                    pass_cmds.emplace_back(SetBindGroup1Cmd{v.group_index, v.bind_group_id,
+                                                            it != bind_groups.end() ? it->second : wgpu::BindGroup()});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            case GpuOpcode::ReadbackBuffer:
+            case GpuOpcode::ReadbackTexture:
+                if (auto r = decode_readback(p)) {
+                    ++stats.readbacks_requested;
+                    readback_flush_wanted = true;
+                    pass_cmds.emplace_back(ReadbackCmd{*r});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
             default:
                 handled = false;
                 break;
@@ -818,6 +940,8 @@ struct NativeExecutor::Impl {
         shaders.erase(id);
         render_pipelines.erase(id);
         compute_pipelines.erase(id);
+        compute_hash.erase(id);
+        compute_bind_groups.erase(id);
         bgls.erase(id);
         pipeline_layouts.erase(id);
     }
@@ -840,10 +964,12 @@ struct NativeExecutor::Impl {
         const std::string raw(reinterpret_cast<const char*>(p.payload) + 16, h.code_len);
         const std::string_view trimmed = trim_view(raw);
         std::string code = raw;
+        uint64_t shader_hash = 0;
         if (trimmed.empty()) {
             // The worker looks up a synthetic `empty:<stage>:<id>` hash, which no pack holds: the empty
             // text compiles as an (empty) module.
         } else if (auto hash = parse_hash_only_shader_payload(trimmed)) {
+            shader_hash = *hash;
             std::optional<std::string> hit = pack ? pack->get(*hash) : std::nullopt;
             if (hit && !hit->empty()) {
                 code = std::move(*hit);
@@ -855,6 +981,7 @@ struct NativeExecutor::Impl {
         const char* stage_name = h.stage == 0 ? "vertex" : h.stage == 1 ? "fragment" : h.stage == 2 ? "compute" : "";
         ShaderEntry e;
         e.stage = h.stage;
+        e.hash = shader_hash;
         e.explicit_ep = extract_wgsl_entry_point(code, stage_name);
         e.module = make_module(code);
         e.code = std::move(code);
@@ -1394,6 +1521,7 @@ struct NativeExecutor::Impl {
         bool expects = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
         if (!expects && !auto_layout && group0_has_entries) expects = true;
         e.expects_group0 = expects;
+        e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         render_pipelines[h.id] = std::move(e);
         ++stats.render_pipelines;
         return true;
@@ -1420,8 +1548,186 @@ struct NativeExecutor::Impl {
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {ep.data(), ep.size()};
         compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        compute_hash[h.id] = cs.hash;
         ++stats.compute_pipelines;
         return true;
+    }
+
+    // ---- v1 pipelines and bind groups (wgpu_worker.js _handleCreateRenderPipeline / ...ComputePipeline /
+    // _handleCreateBindGroup) ----
+    //
+    // The worker consults its reflection registry (S6 `reflection.json`) for an explicit layout, the
+    // entry points and the vertex attributes; the registry is empty unless a stream loader fills it,
+    // and then `_resolveShaderReflection` returns null: layout 'auto', `vs_main` / `fs_main` /
+    // `cs_main`, one float vertex attribute. That is the path implemented (counted as
+    // `reflection_unavailable`); the reflection loader itself is not ported. The G34 fallback shader
+    // profiles belong to the worker's shader router, which has no native counterpart.
+
+    void create_render_pipeline1(const Packet& p) {
+        const auto h = read_payload<GpuCreateRenderPipelinePayload>(p);
+        auto vit = shaders.find(h.vs_shader_id);
+        if (vit == shaders.end()) {
+            ++stats.op_errors;  // unknown vertex shader module
+            return;
+        }
+        const ShaderEntry& vs = vit->second;
+        const ShaderEntry* fs = nullptr;
+        if (h.fs_shader_id != 0) {
+            auto fit = shaders.find(h.fs_shader_id);
+            if (fit == shaders.end()) {
+                ++stats.op_errors;  // unknown fragment shader module
+                return;
+            }
+            fs = &fit->second;
+        }
+        ++stats.reflection_unavailable;
+        const V1VertexLayout vl = plan_v1_vertex_layout(h.vertex_stride);
+        wgpu::VertexAttribute attr{};
+        attr.shaderLocation = 0;
+        attr.offset = 0;
+        attr.format = vl.components == 3   ? wgpu::VertexFormat::Float32x3
+                      : vl.components == 2 ? wgpu::VertexFormat::Float32x2
+                                           : wgpu::VertexFormat::Float32;
+        wgpu::VertexBufferLayout vb{};
+        vb.arrayStride = vl.stride;
+        vb.stepMode = wgpu::VertexStepMode::Vertex;
+        vb.attributeCount = 1;
+        vb.attributes = &attr;
+
+        wgpu::RenderPipelineDescriptor rd{};
+        rd.layout = nullptr;  // 'auto'
+        rd.vertex.module = vs.module;
+        rd.vertex.entryPoint = {"vs_main", 7};
+        rd.vertex.bufferCount = vl.has_buffer ? 1 : 0;
+        rd.vertex.buffers = &vb;
+        rd.primitive.topology = wgpu_topology(static_cast<uint8_t>(std::min<uint32_t>(h.topology, 255)));
+        wgpu::ColorTargetState target{};
+        target.format = swap_format;  // _getRenderTargetFormat()
+        wgpu::FragmentState fragment{};
+        if (fs) {
+            fragment.module = fs->module;
+            fragment.entryPoint = {"fs_main", 7};
+            fragment.targetCount = 1;
+            fragment.targets = &target;
+            rd.fragment = &fragment;
+        }
+        RenderPipelineEntry e;
+        e.pipeline = device.CreateRenderPipeline(&rd);
+        e.expects_group0 = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
+        e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
+        render_pipelines[h.id] = std::move(e);
+        ++stats.render_pipelines;
+        ++stats.v1_render_pipelines;
+    }
+
+    void create_compute_pipeline1(const Packet& p) {
+        const auto h = read_payload<GpuCreateComputePipelinePayload>(p);
+        auto cit = shaders.find(h.cs_shader_id);
+        if (cit == shaders.end()) return;  // `_buildComputePipelineDescriptorV1` returns null silently
+        const ShaderEntry& cs = cit->second;
+        ++stats.reflection_unavailable;
+        wgpu::ComputePipelineDescriptor cd{};
+        cd.layout = nullptr;  // 'auto'
+        cd.compute.module = cs.module;
+        cd.compute.entryPoint = {"cs_main", 7};
+        compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        compute_hash[h.id] = cs.hash;
+        ++stats.compute_pipelines;
+        ++stats.v1_compute_pipelines;
+    }
+
+    void create_bind_group1(const Packet& p) {
+        const auto h = read_payload<GpuCreateBindGroupPayload>(p);
+        if (uint64_t{16} + uint64_t{h.entry_count} * sizeof(GpuBindGroupEntry) > p.payload_bytes) {
+            ++stats.op_errors;  // truncated payload
+            return;
+        }
+        wgpu::BindGroupLayout layout;
+        bool compute = false;
+        auto rit = render_pipelines.find(h.pipeline_id);
+        auto cit = compute_pipelines.find(h.pipeline_id);
+        if (rit != render_pipelines.end()) {
+            layout = rit->second.pipeline.GetBindGroupLayout(h.group_index);
+        } else if (cit != compute_pipelines.end()) {
+            layout = cit->second.GetBindGroupLayout(h.group_index);
+            compute = true;
+        } else {
+            auto bit = bgls.find(h.pipeline_id);  // a v2 bind group layout id works here too
+            if (bit == bgls.end()) {
+                ++stats.op_errors;  // unknown pipeline or bind group layout
+                return;
+            }
+            layout = bit->second.layout;
+        }
+        struct Entry {
+            uint32_t binding;
+            wgpu::Buffer buffer;
+            uint64_t offset = 0, size = wgpu::kWholeSize;
+            wgpu::TextureView view;
+            wgpu::Sampler sampler;
+        };
+        std::vector<Entry> entries;
+        for (uint32_t i = 0; i < h.entry_count; ++i) {
+            const auto e = read_payload<GpuBindGroupEntry>(p, 16 + size_t{i} * sizeof(GpuBindGroupEntry));
+            Entry pe;
+            pe.binding = e.binding;
+            if (e.resource_type == static_cast<uint32_t>(GpuBindResourceType::Buffer)) {
+                auto it = buffers.find(e.resource_id);
+                if (it == buffers.end()) {
+                    ++stats.op_errors;  // unknown buffer
+                    return;
+                }
+                pe.buffer = it->second.buffer;
+                pe.offset = e.offset;
+                if (e.size > 0) pe.size = e.size;
+            } else if (e.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView)) {
+                auto it = textures.find(e.resource_id);
+                if (it == textures.end() || !it->second.default_view) {
+                    ++stats.op_errors;  // unknown texture
+                    return;
+                }
+                pe.view = it->second.default_view;
+            } else if (e.resource_type == static_cast<uint32_t>(GpuBindResourceType::Sampler)) {
+                auto it = samplers.find(e.resource_id);
+                if (it != samplers.end()) {
+                    pe.sampler = it->second;
+                } else if (e.resource_id == 0) {
+                    if (!default_filtering_sampler) {
+                        wgpu::SamplerDescriptor sd{};
+                        sd.magFilter = wgpu::FilterMode::Linear;
+                        sd.minFilter = wgpu::FilterMode::Linear;
+                        sd.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+                        default_filtering_sampler = device.CreateSampler(&sd);
+                    }
+                    pe.sampler = default_filtering_sampler;
+                } else {
+                    ++stats.op_errors;  // unknown sampler
+                    return;
+                }
+            } else {
+                ++stats.op_errors;  // invalid resourceType
+                return;
+            }
+            entries.push_back(std::move(pe));
+        }
+        std::vector<wgpu::BindGroupEntry> wes(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            wes[i].binding = entries[i].binding;
+            wes[i].buffer = entries[i].buffer;
+            wes[i].offset = entries[i].offset;
+            wes[i].size = entries[i].size;
+            wes[i].sampler = entries[i].sampler;
+            wes[i].textureView = entries[i].view;
+        }
+        wgpu::BindGroupDescriptor bd{};
+        bd.layout = layout;
+        bd.entryCount = wes.size();
+        bd.entries = wes.data();
+        bind_groups[h.id] = device.CreateBindGroup(&bd);
+        if (compute) compute_bind_groups.insert(h.id);
+        else compute_bind_groups.erase(h.id);
+        ++stats.bind_groups;
+        ++stats.v1_bind_groups;
     }
 
     // ---- bind groups (RenderStatePackets._createBindGroup / _dummyResource / _setBindGroup) ----
@@ -1638,6 +1944,7 @@ struct NativeExecutor::Impl {
         bd.entryCount = wes.size();
         bd.entries = wes.data();
         bind_groups[h.id] = device.CreateBindGroup(&bd);
+        compute_bind_groups.erase(h.id);  // a v2 group of the same id is not a v1 compute group
         ++stats.bind_groups;
         return true;
     }
@@ -1721,6 +2028,16 @@ struct NativeExecutor::Impl {
         bool written = false;  // the canvas texture starts each frame as transparent black
     };
 
+    // The canvas texture of the current frame: kept across an early read-back flush, released by Present.
+    std::optional<FrameTarget> frame_target;
+    bool acquire_target() {
+        if (frame_target) return true;
+        FrameTarget t;
+        if (!acquire(&t)) return false;
+        frame_target = std::move(t);
+        return true;
+    }
+
     bool acquire(FrameTarget* t) {
         if (!surface) {
             t->texture = offscreen;
@@ -1782,6 +2099,12 @@ struct NativeExecutor::Impl {
         std::optional<uint32_t> active_pipeline;
         // _preparePassCommandsForFlush compute filter state
         bool had_explicit_compute = false, compute_valid = false;
+        // GPU pass timestamps: the commands being encoded (for the pass's pipeline look-ahead) and
+        // the ring slot of this submit (-2: not opened yet, -1: no free slot).
+        const std::vector<PassCmd>* cmds = nullptr;
+        size_t idx = 0;
+        int timer_slot = -2;
+        size_t timer_passes = 0;
 
         void end_active() {
             if (rpass) { rpass.End(); rpass = nullptr; }
@@ -1798,13 +2121,20 @@ struct NativeExecutor::Impl {
             wgpu::RenderPassDescriptor rp{};
             rp.colorAttachmentCount = 1;
             rp.colorAttachments = &a;
+            wgpu::PassTimestampWrites tw{};
+            if (s.timer_pass(*this, d3d12_guest::GpuPassKind::Render, s.lookahead_hash(*this, idx, false), &tw))
+                rp.timestampWrites = &tw;
             rpass = enc.BeginRenderPass(&rp);
             render_pass_opened = true;
         }
         void ensure_compute() {
             if (cpass) return;
             end_active();
-            cpass = enc.BeginComputePass();
+            wgpu::ComputePassDescriptor cd{};
+            wgpu::PassTimestampWrites tw{};
+            if (s.timer_pass(*this, d3d12_guest::GpuPassKind::Compute, s.lookahead_hash(*this, idx, true), &tw))
+                cd.timestampWrites = &tw;
+            cpass = enc.BeginComputePass(&cd);
         }
         std::optional<AttachmentSize> swapchain_size() const { return AttachmentSize{s.swap_width, s.swap_height}; }
         // _getActivePassTargetSize
@@ -1880,6 +2210,9 @@ struct NativeExecutor::Impl {
         } else if (drop_ds) {
             ++stats.render_pass_dropped_colors;
         }
+        wgpu::PassTimestampWrites tw{};
+        if (timer_pass(e, d3d12_guest::GpuPassKind::Render, lookahead_hash(e, e.idx + 1, false), &tw))
+            rp.timestampWrites = &tw;
         e.rpass = e.enc.BeginRenderPass(&rp);
         e.render_pass_opened = true;
         e.explicit_pass = true;
@@ -2001,7 +2334,271 @@ struct NativeExecutor::Impl {
             if (e.rpass) e.rpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             else e.cpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             if (bg->group == 0) e.group0_bound = true;
+        } else if (const auto* b1 = std::get_if<SetBindGroup1Cmd>(&cmd)) {
+            // `this.bindGroups.get(id) || cmd.bindGroup`; a missing group is a validation error.
+            auto it = bind_groups.find(b1->id);
+            wgpu::BindGroup bg = it != bind_groups.end() ? it->second : b1->at_packet;
+            if (!bg) {
+                ++stats.op_errors;  // bind group not found
+                return;
+            }
+            if (!e.rpass && !e.cpass) {
+                if (compute_bind_groups.count(b1->id)) e.ensure_compute();
+                else e.ensure_render();
+            }
+            if (e.rpass) e.rpass.SetBindGroup(b1->group, bg, 0, nullptr);
+            else e.cpass.SetBindGroup(b1->group, bg, 0, nullptr);
+            if (b1->group == 0) e.group0_bound = true;
+        } else if (const auto* rb = std::get_if<ReadbackCmd>(&cmd)) {
+            e.end_active();  // _recordReadbackCopy: pc.endPass()
+            record_readback_copy(e.enc, rb->req);
         }
+    }
+
+    // ---- GPU pass timestamps (gpu_timer.js, #1608) ----
+
+    // The key of the pass that is about to open: the pipeline its first SetPipeline /
+    // SetComputePipeline selects (a pass can only be timed as a whole; WebGPU has no timestamp
+    // writes inside a pass). Render pipelines count under the fragment shader's hash (else the
+    // vertex shader's), compute pipelines under the compute shader's; 0 = no pipeline or an inline
+    // WGSL shader. `from` is the first command that belongs to the pass.
+    uint64_t lookahead_hash(const Encoder& e, size_t from, bool compute) const {
+        if (!e.cmds) return 0;
+        const std::vector<PassCmd>& cmds = *e.cmds;
+        for (size_t j = from; j < cmds.size(); ++j) {
+            const PassCmd& c = cmds[j];
+            if (std::get_if<BeginPassCmd>(&c) || std::get_if<EndPassCmd>(&c) || std::get_if<ReadbackCmd>(&c)) break;
+            const auto* ind = std::get_if<IndirectCmd>(&c);
+            const bool compute_op = std::get_if<SetComputePipelineCmd>(&c) || std::get_if<DispatchCmd>(&c) ||
+                                    (ind && ind->kind == 2);
+            const bool render_op = std::get_if<SetPipelineCmd>(&c) || std::get_if<SetVertexBufferCmd>(&c) ||
+                                   std::get_if<SetIndexBufferCmd>(&c) || std::get_if<DrawCmd>(&c) ||
+                                   std::get_if<DrawIndexedCmd>(&c) || (ind && ind->kind != 2);
+            if (compute ? render_op : compute_op) break;
+            if (compute) {
+                if (const auto* sc = std::get_if<SetComputePipelineCmd>(&c)) {
+                    auto it = compute_hash.find(sc->id);
+                    return it != compute_hash.end() ? it->second : 0;
+                }
+            } else if (const auto* sp = std::get_if<SetPipelineCmd>(&c)) {
+                auto it = render_pipelines.find(sp->id);
+                return it != render_pipelines.end() ? it->second.perf_hash : 0;
+            }
+        }
+        return 0;
+    }
+
+    // Reserves the query pair of one pass in this submit's ring slot; false = the pass goes untimed.
+    bool timer_pass(Encoder& e, d3d12_guest::GpuPassKind kind, uint64_t hash, wgpu::PassTimestampWrites* out) {
+        if (!time_ring) return false;
+        if (e.timer_slot == -2) {
+            e.timer_slot = time_ring->begin_frame();
+            if (e.timer_slot < 0) {
+                ++stats.timer_frames_skipped;
+                time_table->note_skipped_frame();
+            }
+        }
+        if (e.timer_slot < 0) return false;
+        uint32_t b = 0, en = 0;
+        if (!time_ring->add_pass(hash, kind, &b, &en)) return false;
+        out->querySet = timer_slots[static_cast<size_t>(e.timer_slot)].queries;
+        out->beginningOfPassWriteIndex = b;
+        out->endOfPassWriteIndex = en;
+        ++e.timer_passes;
+        ++stats.timer_passes;
+        return true;
+    }
+
+    // Before encoder.Finish(): resolves the slot's queries and copies them to the mappable buffer.
+    void timer_resolve(Encoder& e) {
+        if (e.timer_slot < 0) return;
+        const size_t n = time_ring->end_frame(e.timer_slot);
+        if (n == 0) {
+            time_ring->abandon(e.timer_slot, *time_table);
+            e.timer_slot = -1;
+            return;
+        }
+        TimerSlot& ts = timer_slots[static_cast<size_t>(e.timer_slot)];
+        e.enc.ResolveQuerySet(ts.queries, 0, static_cast<uint32_t>(n * 2), ts.resolve, 0);
+        e.enc.CopyBufferToBuffer(ts.resolve, 0, ts.staging, 0, n * 2 * 8);
+        ++stats.timer_frames;
+        e.timer_passes = n;
+    }
+
+    // After queue.Submit(): maps the slot; the table is fed when the GPU is done (poll / wait_idle).
+    void timer_collect(const Encoder& e) {
+        if (e.timer_slot < 0) return;
+        struct Pending {
+            Impl* self;
+            int slot;
+            size_t count;
+        };
+        auto* pend = new Pending{this, e.timer_slot, e.timer_passes * 2};
+        TimerSlot& ts = timer_slots[static_cast<size_t>(e.timer_slot)];
+        ++pending_maps;
+        ts.staging.MapAsync(
+            wgpu::MapMode::Read, 0, pend->count * 8, wgpu::CallbackMode::AllowProcessEvents,
+            [](wgpu::MapAsyncStatus st, wgpu::StringView, Pending* pd) {
+                Impl& s = *pd->self;
+                TimerSlot& slot = s.timer_slots[static_cast<size_t>(pd->slot)];
+                if (st == wgpu::MapAsyncStatus::Success) {
+                    const auto* ticks = static_cast<const uint64_t*>(slot.staging.GetConstMappedRange(0, pd->count * 8));
+                    // Dawn resolves timestamps to nanoseconds: the period is 1.
+                    s.time_ring->complete(pd->slot, ticks, ticks ? pd->count : 0, 1.0, *s.time_table);
+                    slot.staging.Unmap();
+                } else {
+                    s.time_ring->abandon(pd->slot, *s.time_table);
+                }
+                --s.pending_maps;
+                delete pd;
+            },
+            pend);
+    }
+
+    // ---- read-backs (wgpu_worker.js _recordReadbackCopy / _startRecordedReadbacks) ----
+
+    void record_readback_copy(wgpu::CommandEncoder& enc, const ReadbackRequest& req) {
+        Impl_ReadbackEntry entry;
+        entry.req = req;
+        wgpu::BufferDescriptor sd{};
+        sd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+        if (req.kind == ReadbackRequest::Kind::Buffer) {
+            auto it = buffers.find(req.id);
+            ReadbackLayout l = readback_staging_layout(req);
+            if (it != buffers.end() && l.valid) {
+                const uint64_t src_size = it->second.size;
+                if (l.copy_offset + l.staging_size > src_size)
+                    l.staging_size = (src_size > l.copy_offset ? src_size - l.copy_offset : 0) & ~uint64_t{3};
+                if (l.staging_size > 0 && l.skip + req.size <= l.staging_size) {
+                    sd.size = l.staging_size;
+                    entry.staging = device.CreateBuffer(&sd);
+                    enc.CopyBufferToBuffer(it->second.buffer, l.copy_offset, entry.staging, 0, l.staging_size);
+                    entry.layout = l;
+                }
+            }
+        } else {
+            auto it = textures.find(req.id);
+            if (it != textures.end()) {
+                TextureEntry& t = it->second;
+                const ReadbackLayout l = readback_staging_layout(req, readback_block_height(t.geom.format, false));
+                if (l.valid && l.row_bytes > 0 && static_cast<uint64_t>(l.row_bytes) <= req.bytes_per_row &&
+                    l.staging_row <= 0xffffffffull) {
+                    sd.size = l.staging_size;
+                    entry.staging = device.CreateBuffer(&sd);
+                    wgpu::TexelCopyTextureInfo src{};
+                    src.texture = t.texture;
+                    src.mipLevel = req.mip_level;
+                    src.origin = {req.origin_x, req.origin_y, req.origin_z};
+                    wgpu::TexelCopyBufferInfo dst{};
+                    dst.buffer = entry.staging;
+                    dst.layout.bytesPerRow = static_cast<uint32_t>(l.staging_row);
+                    dst.layout.rowsPerImage = static_cast<uint32_t>(l.staging_rows_per_image);
+                    const wgpu::Extent3D extent{req.width, req.height, std::max<uint32_t>(1, req.depth_or_layers)};
+                    enc.CopyTextureToBuffer(&src, &dst, &extent);
+                    entry.layout = l;
+                }
+            }
+        }
+        recorded_readbacks.push_back(std::move(entry));
+    }
+
+    void finish_readback(const Impl_ReadbackEntry& e, const uint8_t* mapped, size_t len) {
+        if (deliver_readback(guest_mem, e.req, e.layout, mapped, len)) {
+            ++stats.readbacks_delivered;
+            stats.readback_bytes += e.req.size;
+        } else {
+            ++stats.readbacks_failed;
+        }
+    }
+
+    // After the submit: map every staging buffer, then deliver (or fail) each read-back.
+    void start_recorded_readbacks(bool submitted) {
+        std::vector<Impl_ReadbackEntry> entries = std::move(recorded_readbacks);
+        recorded_readbacks.clear();
+        for (Impl_ReadbackEntry& e : entries) {
+            if (!submitted || !e.staging) {
+                finish_readback(e, nullptr, 0);
+                if (e.staging) e.staging.Destroy();
+                continue;
+            }
+            struct Pending {
+                Impl* self;
+                Impl_ReadbackEntry entry;
+            };
+            auto* pend = new Pending{this, std::move(e)};
+            ++pending_maps;
+            const uint64_t size = pend->entry.staging.GetSize();
+            pend->entry.staging.MapAsync(
+                wgpu::MapMode::Read, 0, static_cast<size_t>(size), wgpu::CallbackMode::AllowProcessEvents,
+                [](wgpu::MapAsyncStatus st, wgpu::StringView, Pending* pd) {
+                    Impl& s = *pd->self;
+                    wgpu::Buffer& staging = pd->entry.staging;
+                    if (st == wgpu::MapAsyncStatus::Success) {
+                        const size_t n = static_cast<size_t>(staging.GetSize());
+                        const auto* mapped = static_cast<const uint8_t*>(staging.GetConstMappedRange(0, n));
+                        s.finish_readback(pd->entry, mapped, mapped ? n : 0);
+                        staging.Unmap();
+                    } else {
+                        s.finish_readback(pd->entry, nullptr, 0);
+                    }
+                    staging.Destroy();
+                    --s.pending_maps;
+                    delete pd;
+                },
+                pend);
+        }
+    }
+
+    // A frame that cannot be presented is dropped (the worker's `_resetFrameState`); its read-backs
+    // complete as failed so the producer's fence hold is released.
+    void fail_dropped_readbacks() {
+        for (const PassCmd& c : pass_cmds) {
+            if (const auto* rb = std::get_if<ReadbackCmd>(&c)) {
+                Impl_ReadbackEntry e;
+                e.req = rb->req;
+                finish_readback(e, nullptr, 0);
+            }
+        }
+    }
+
+    // _flushReadbacksNow: submits everything recorded up to the last read-back (no present, no frame
+    // accounting) so the maps can start while the title waits on the fence that guards the read-back.
+    // The commands after it stay queued for the frame.
+    void flush_readbacks_now() {
+        readback_flush_wanted = false;
+        if (lost) return;
+        size_t last = pass_cmds.size();
+        for (size_t i = pass_cmds.size(); i-- > 0;) {
+            if (std::get_if<ReadbackCmd>(&pass_cmds[i])) {
+                last = i;
+                break;
+            }
+        }
+        if (last == pass_cmds.size()) return;
+        if (!acquire_target()) {  // `_notePresentSubmitFailure`: the commands stay queued
+            start_recorded_readbacks(false);
+            return;
+        }
+        std::vector<PassCmd> head(std::make_move_iterator(pass_cmds.begin()),
+                                  std::make_move_iterator(pass_cmds.begin() + static_cast<std::ptrdiff_t>(last + 1)));
+        std::vector<PassCmd> tail(std::make_move_iterator(pass_cmds.begin() + static_cast<std::ptrdiff_t>(last + 1)),
+                                  std::make_move_iterator(pass_cmds.end()));
+        Encoder e{*this, *frame_target, device.CreateCommandEncoder()};
+        e.render_pass_opened = true;  // readbackOnly: the canvas already holds this frame's work
+        e.cmds = &head;
+        for (size_t i = 0; i < head.size(); ++i) {
+            e.idx = i;
+            run_cmd(e, head[i]);
+        }
+        e.end_active();
+        timer_resolve(e);
+        wgpu::CommandBuffer cb = e.enc.Finish();
+        queue.Submit(1, &cb);
+        timer_collect(e);
+        start_recorded_readbacks(true);
+        ++stats.early_readback_flushes;
+        early_flushed = true;
+        pass_cmds = std::move(tail);
     }
 
     // _executePresentRenderDraw: opens the lazy render pass, then skips a draw whose pipeline is
@@ -2025,14 +2622,22 @@ struct NativeExecutor::Impl {
     }
 
     void present() {
-        FrameTarget target;
-        if (lost || !acquire(&target)) {
+        if (lost || !acquire_target()) {
             ++stats.present_failures;
+            fail_dropped_readbacks();
             reset_frame_state();
+            frame_target.reset();
+            early_flushed = false;
             return;
         }
+        FrameTarget& target = *frame_target;
         Encoder e{*this, target, device.CreateCommandEncoder()};
-        for (const PassCmd& cmd : pass_cmds) run_cmd(e, cmd);
+        e.render_pass_opened = early_flushed;  // `ps.renderPassOpened = readbackOnly || earlyFlushedThisFrame`
+        e.cmds = &pass_cmds;
+        for (size_t i = 0; i < pass_cmds.size(); ++i) {
+            e.idx = i;
+            run_cmd(e, pass_cmds[i]);
+        }
         e.end_active();
         if (!e.render_pass_opened) {
             // The v1 clearing swapchain pass (_ensurePresentRenderPass with renderPassOpened false).
@@ -2040,13 +2645,20 @@ struct NativeExecutor::Impl {
             wgpu::RenderPassDescriptor rp{};
             rp.colorAttachmentCount = 1;
             rp.colorAttachments = &a;
+            wgpu::PassTimestampWrites tw{};
+            if (timer_pass(e, d3d12_guest::GpuPassKind::Render, 0, &tw)) rp.timestampWrites = &tw;
             e.enc.BeginRenderPass(&rp).End();
         }
+        timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
         queue.Submit(1, &cb);
+        timer_collect(e);
+        start_recorded_readbacks(true);
         ++frame_count;
         ++stats.frames_submitted;
         if (surface) surface.Present();
+        frame_target.reset();
+        early_flushed = false;
         reset_frame_state();
     }
 
@@ -2111,6 +2723,9 @@ NativeExecutor::~NativeExecutor() {
         impl_->buffers.clear();
         impl_->textures.clear();
         impl_->device.Destroy();
+        // Maps that were still pending complete (as failures) now: their read-backs still advance
+        // the producer's counter and their callback state is freed.
+        for (int i = 0; i < 100 && impl_->pending_maps > 0; ++i) impl_->instance.ProcessEvents();
     }
 }
 
@@ -2131,6 +2746,7 @@ uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
     s.stats.packets += r.packets;
     s.stats.bytes += r.bytes;
     if (r.truncated) ++s.stats.truncated_batches;
+    if (s.readback_flush_wanted) s.flush_readbacks_now();  // at the end of every batch, like the worker
     s.instance.ProcessEvents();
     return static_cast<uint32_t>(s.stats.present_packets - presents_before);
 }
@@ -2148,7 +2764,15 @@ void NativeExecutor::wait_idle() {
     s.instance.WaitAny(s.queue.OnSubmittedWorkDone(wgpu::CallbackMode::WaitAnyOnly,
                                                    [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}),
                        kWaitForever);
+    // Read-back and timer maps complete in ProcessEvents once the GPU is done.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (s.pending_maps > 0 && std::chrono::steady_clock::now() < deadline) {
+        s.instance.ProcessEvents();
+        if (s.pending_maps > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
+
+void NativeExecutor::attach_guest_memory(const GuestMemory& memory) { impl_->guest_mem = memory; }
 
 uint64_t NativeExecutor::frame_count() const { return impl_->frame_count; }
 const ExecutorStats& NativeExecutor::stats() const { return impl_->stats; }
@@ -2196,6 +2820,19 @@ std::string NativeExecutor::stats_json() const {
     num("dispatches_clamped", st.dispatches_clamped);
     num("auto_layout_pipelines", st.auto_layout_pipelines);
     num("manifest_layouts_unavailable", st.manifest_layouts_unavailable);
+    num("readbacks_requested", st.readbacks_requested);
+    num("readbacks_delivered", st.readbacks_delivered);
+    num("readbacks_failed", st.readbacks_failed);
+    num("readback_bytes", st.readback_bytes);
+    num("early_readback_flushes", st.early_readback_flushes);
+    num("v1_render_pipelines", st.v1_render_pipelines);
+    num("v1_compute_pipelines", st.v1_compute_pipelines);
+    num("v1_bind_groups", st.v1_bind_groups);
+    num("reflection_unavailable", st.reflection_unavailable);
+    num("timer_frames", st.timer_frames);
+    num("timer_passes", st.timer_passes);
+    num("timer_frames_skipped", st.timer_frames_skipped);
+    num("timer_supported", st.timer_supported ? 1 : 0);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
         j += "\"";
