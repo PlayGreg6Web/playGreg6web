@@ -912,4 +912,104 @@ void reset_com_bridge() {
     t_lazy_thread.created = false;
 }
 
+
+// ---------------------------------------------------------------------------
+// COM call trace
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_com_trace{[] {
+    const char* e = std::getenv("PG6_COM_TRACE");
+    return e != nullptr && e[0] != 0 && e[0] != '0';
+}()};
+
+namespace {
+struct TraceKey {
+    const InterfaceInfo* iface;
+    uint32_t slot;
+    bool operator<(const TraceKey& o) const {
+        return iface != o.iface ? iface < o.iface : slot < o.slot;
+    }
+};
+struct TraceEntry {
+    uint64_t count = 0;
+    int32_t hresult = 0;
+};
+std::mutex g_trace_mutex;
+std::map<TraceKey, TraceEntry>& trace_map() {
+    static std::map<TraceKey, TraceEntry> m;
+    return m;
+}
+uint32_t g_trace_next_fn = 0;
+}  // namespace
+
+void set_trace_enabled(bool on) { g_com_trace.store(on, std::memory_order_relaxed); }
+
+void trace_reset() {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    trace_map().clear();
+}
+
+uint32_t trace_next_function_id() {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    return ++g_trace_next_fn;
+}
+
+TraceSnap trace_snap(const GuestState& state) {
+    TraceSnap s;
+    s.rip = state.rip;
+    s.rsp = state.gpr[GuestReg::Rsp];
+    s.args[0] = state.gpr[GuestReg::Rcx];
+    s.args[1] = state.gpr[GuestReg::Rdx];
+    s.args[2] = state.gpr[GuestReg::R8];
+    s.args[3] = state.gpr[GuestReg::R9];
+    return s;
+}
+
+void trace_record(const InterfaceInfo* iface, uint32_t fn_id, const TraceSnap& snap, int32_t hresult) {
+    uint32_t slot = fn_id;
+    if (iface != nullptr) {
+        slot = 0xFFFFFFFFu;
+        Bridge& b = bridge();
+        std::lock_guard<std::mutex> lock(b.vtable_mutex);
+        if (auto it = b.vtables.find(iface); it != b.vtables.end()) {
+            for (uint32_t i = 0; i < it->second.slots.size(); ++i) {
+                if (it->second.slots[i] == snap.rip) {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+    }
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lock(g_trace_mutex);
+        TraceEntry& e = trace_map()[TraceKey{iface, slot}];
+        first = (e.count++ == 0);
+        e.hresult = hresult;
+    }
+    if (first) {
+        uint64_t caller = 0;
+        read_guest(snap.rsp, caller);
+        report("com trace: " + (iface != nullptr ? iface_label(*iface) + " " + format_guid(iface->iid)
+                                                : std::string("function")) +
+               " slot " + std::to_string(slot) + " caller " + hex(caller) + " args " + hex(snap.args[0]) +
+               " " + hex(snap.args[1]) + " " + hex(snap.args[2]) + " " + hex(snap.args[3]) +
+               " hresult " + hex(static_cast<uint32_t>(hresult)));
+    }
+}
+
+std::vector<TraceRow> trace_report() {
+    std::vector<TraceRow> rows;
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    for (const auto& [k, v] : trace_map()) {
+        TraceRow r;
+        r.interface_name = k.iface != nullptr ? iface_label(*k.iface) + " " + format_guid(k.iface->iid)
+                                              : "function";
+        r.slot = k.slot;
+        r.count = v.count;
+        r.hresult = v.hresult;
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
 }  // namespace playgta6::guest::com

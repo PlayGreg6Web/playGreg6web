@@ -1785,6 +1785,19 @@ std::string build_report() {
         o += hits.empty() ? "],\n" : "\n  ],\n";
     }
 
+    o += "  \"com_calls\": [";
+    {
+        const std::vector<com::TraceRow> rows = com::trace_report();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const com::TraceRow& r = rows[i];
+            o += (i == 0 ? "\n    " : ",\n    ");
+            o += "{\"interface\": " + json_string(r.interface_name) + ", \"slot\": " +
+                 std::to_string(r.slot) + ", \"count\": " + std::to_string(r.count) +
+                 ", \"hresult\": " + hex(static_cast<uint32_t>(r.hresult)) + "}";
+        }
+        o += rows.empty() ? "],\n" : "\n  ],\n";
+    }
+
     if (f.has_host_frames) {
         o += "  \"host_frames\": [";
         for (size_t i = 0; i < f.host_frames.size(); ++i) {

@@ -1114,6 +1114,28 @@ void test_get_proc_address_thunk() {
     CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
 }
 
+void test_com_trace() {
+    Fixture fx;
+    com::trace_reset();
+    com::set_trace_enabled(false);
+    com::Ref<Calc> calc = com::create_object<Calc>(com::implements(kICalc, kIOther), 42);
+    const uint64_t obj = calc->interface_pointer(kICalc);
+    fx.vcall(obj, 3, {I(40), I(2)});
+    CHECK(com::trace_report().empty());  // off: nothing recorded
+    com::set_trace_enabled(true);
+    CHECK(fx.vcall(obj, 3, {I(40), I(2)}) == 42);
+    fx.vcall(obj, 3, {I(1), I(2)});
+    com::set_trace_enabled(false);
+    const auto rows = com::trace_report();
+    CHECK(rows.size() == 1);
+    if (!rows.empty()) {
+        CHECK(rows[0].slot == 3);
+        CHECK(rows[0].count == 2);
+        CHECK(rows[0].interface_name.find("ICalc") != std::string::npos);
+    }
+    com::trace_reset();
+}
+
 }  // namespace
 
 int main() {
@@ -1132,6 +1154,7 @@ int main() {
     test_crt_callbacks();
     test_async_shadow();
     test_get_proc_address_thunk();
+    test_com_trace();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_com_bridge: %d failure(s)\n", g_failures);
         return 1;
