@@ -130,6 +130,10 @@ the previous object cache, so refreshes are incremental. `tools/run_browser_boot
 (no server, no Chrome); `--web-dir` serves a web root other than `<repo>/web`.
 `-InputScript` defaults to `calibration-skip` (`-InputScript none` turns it off). `-ShaderPack` defaults to
 `$env:PLAYGTA6_SHADER_PACK`, else `work/splash.wgsl.pack`; if none exists the script prints the build command and stops.
+`tools/update_prebuilt.ps1 -Web` derives its browser pack from the full native pack (`-StdPack` / `PLAYGTA6_NATIVE_SHADER_PACK`) with
+`tools/subset_wgsl_pack.py`: same stages, WGPK v1 (the web preloader reads v1 only and holds the pack in memory), per-shader cap
+256 KiB, total cap 1.6 GB, stages of `PLAYGTA6_SHADER_PACK` kept first, plus the filtered `.reflect.json`. An explicit `-ShaderPack` wins.
+A browser pack built only from `pack-rdna2 --max-wgsl-bytes` can miss shaders the title uses after the terms (black loading screen with a spinner).
 Each run gets a unique name (`play-local-YYYYMMDD-HHMMSS`, override with `-Name`), so reruns never collide.
 
 ## Troubleshooting: stuck on loading artwork

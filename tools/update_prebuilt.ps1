@@ -5,7 +5,7 @@
   playable copy is renamed aside and only deleted after the new one is in place, so a failed build never
   breaks it. Writes prebuilt.json (source commit) into the build. Play it with: .\tools\play_native.ps1 -Prebuilt
   With -Web: the same for the browser build (tools/play_local.ps1 -Prebuilt); dir -Dir, else $env:PLAYGTA6_PREBUILT_WEB_DIR,
-  else %LOCALAPPDATA%\playgta6\prebuilt-web. Also needs a shader pack (-ShaderPack / PLAYGTA6_SHADER_PACK) and emsdk;
+  else %LOCALAPPDATA%\playgta6\prebuilt-web. Also needs a shader pack: -ShaderPack, else derived from the std pack (-StdPack / PLAYGTA6_NATIVE_SHADER_PACK, tools/subset_wgsl_pack.py), else PLAYGTA6_SHADER_PACK; and emsdk;
   reuses the lift cache and the previous object cache.
 .EXAMPLE
   .\tools\update_prebuilt.ps1            # builds the checked-out commit
@@ -19,7 +19,8 @@ param(
     [string]$Exe = $env:PLAYGTA6_EXE,
     [string]$GameDir = $env:GTA6_GAME_DIR,
     [switch]$Web,
-    [string]$ShaderPack = $env:PLAYGTA6_SHADER_PACK
+    [string]$ShaderPack = $env:PLAYGTA6_SHADER_PACK,
+    [string]$StdPack = $env:PLAYGTA6_NATIVE_SHADER_PACK
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -27,11 +28,30 @@ if ($Web) {
     $PrebuiltDir = if ($PSBoundParameters.ContainsKey("Dir")) { $Dir } else { $env:PLAYGTA6_PREBUILT_WEB_DIR }
     if (-not $PrebuiltDir) { $PrebuiltDir = Join-Path $env:LOCALAPPDATA "playgta6\prebuilt-web" }
     if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
+    # Browser pack: explicit -ShaderPack wins. Else derive one from the full native (std) pack: same stages, v1 (the web
+    # preloader reads v1 only and holds the pack in memory), per-shader cap 256 KiB, total cap 1.6 GB, stages of the
+    # PLAYGTA6_SHADER_PACK pack kept first. Cached in work/web-pack/ (rebuilt when the std pack changes).
+    if (-not $PSBoundParameters.ContainsKey("ShaderPack") -and $StdPack -and (Test-Path -LiteralPath $StdPack)) {
+        $outDir = Join-Path $repo "work/web-pack"
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+        $derived = Join-Path $outDir "splash.wgsl.pack"
+        $stamp = "$derived.src"
+        $srcInfo = (Get-Item -LiteralPath $StdPack)
+        $srcKey = "$($srcInfo.FullName)|$($srcInfo.Length)|$($srcInfo.LastWriteTimeUtc.Ticks)"
+        if (-not (Test-Path -LiteralPath $derived) -or -not (Test-Path -LiteralPath $stamp) -or (Get-Content -LiteralPath $stamp -Raw).Trim() -ne $srcKey) {
+            $subsetArgs = @((Join-Path $PSScriptRoot "subset_wgsl_pack.py"), $StdPack, "--out", $derived)
+            if ($ShaderPack -and (Test-Path -LiteralPath $ShaderPack)) { $subsetArgs += @("--priority-pack", $ShaderPack) }
+            & python @subsetArgs
+            if ($LASTEXITCODE -ne 0) { throw "subset_wgsl_pack failed" }
+            Set-Content -LiteralPath $stamp -Value $srcKey
+        }
+        $ShaderPack = $derived
+    }
     if (-not $ShaderPack) {
         $default = Join-Path $repo "work/splash.wgsl.pack"
         if (Test-Path -LiteralPath $default) { $ShaderPack = $default }
     }
-    if (-not $ShaderPack -or -not (Test-Path -LiteralPath $ShaderPack)) { throw "No shader pack: pass -ShaderPack or set PLAYGTA6_SHADER_PACK." }
+    if (-not $ShaderPack -or -not (Test-Path -LiteralPath $ShaderPack)) { throw "No shader pack: pass -ShaderPack, or set PLAYGTA6_NATIVE_SHADER_PACK (std pack; a browser pack is derived) / PLAYGTA6_SHADER_PACK." }
     if (-not (Get-Command emcc -ErrorAction SilentlyContinue) -and -not $env:EMSDK) {
         & python (Join-Path $PSScriptRoot "emsdk_locator.py")
         if ($LASTEXITCODE -ne 0) { throw "No Emscripten found (emcc not on PATH, EMSDK unset, no work/**/emsdk)." }
@@ -53,7 +73,7 @@ if ($Web) {
             --out-dir (Join-Path $tmp "web\dist") --web-dir (Join-Path $tmp "web")
         if ($LASTEXITCODE -ne 0) { throw "build failed (existing prebuilt left untouched; partial build in $tmp)" }
     } finally { Pop-Location }
-    & python (Join-Path $PSScriptRoot "prebuilt_web.py") stamp --repo $repo --dest $tmp
+    & python (Join-Path $PSScriptRoot "prebuilt_web.py") stamp --repo $repo --dest $tmp --shader-pack (Join-Path $tmp "build\staged-shaders\$(Split-Path -Leaf $ShaderPack)")
     if ($LASTEXITCODE -ne 0) { throw "stamp failed" }
     & python (Join-Path $PSScriptRoot "prebuilt_web.py") swap --new $tmp --target $target
     if ($LASTEXITCODE -ne 0) { throw "swap failed" }

@@ -8,7 +8,7 @@ A prebuilt directory is self-contained (no game bytes in git, it lives outside t
     prebuilt.json   {"commit": ..., "built_at": ...}
 
     prebuilt_web.py prepare --repo R --dest D [--seed-from OLD]   copy web/ (without dist), hard-link the object cache from OLD
-    prebuilt_web.py stamp   --repo R --dest D                     write prebuilt.json (commit of R's HEAD)
+    prebuilt_web.py stamp   --repo R --dest D [--shader-pack F]                  write prebuilt.json (commit of R's HEAD)
     prebuilt_web.py info    --prebuilt D [--repo R]               print the source commit and how far behind origin/main
     prebuilt_web.py swap    --new N --target T                    replace T by N (the old one is removed after the rename)
 """
@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -56,7 +57,7 @@ def prepare(repo: Path, dest: Path, seed_from: Path | None) -> None:
             print(f"seeded wasm_obj_cache from {old}")
 
 
-def stamp(repo: Path, dest: Path) -> None:
+def stamp(repo: Path, dest: Path, shader_pack: Path | None = None) -> None:
     commit = _git(repo, "rev-parse", "HEAD")
     if not commit:
         raise SystemExit("cannot read the source commit")
@@ -64,6 +65,10 @@ def stamp(repo: Path, dest: Path) -> None:
         "commit": commit,
         "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
+    if shader_pack is not None and shader_pack.is_file():
+        with open(shader_pack, "rb") as f:
+            _magic, version, count, _flags = struct.unpack("<4sIII", f.read(16))
+        data["shader_pack"] = {"name": shader_pack.name, "bytes": shader_pack.stat().st_size, "wgpk_version": version, "stages": count}
     (dest / MANIFEST).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
@@ -74,6 +79,9 @@ def info(prebuilt: Path, repo: Path | None) -> str:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     commit = str(data.get("commit", ""))
     line = f"prebuilt: commit {commit[:9]} built {data.get('built_at', '?')}"
+    sp = data.get("shader_pack")
+    if isinstance(sp, dict):
+        line += f", shader pack {sp.get('stages')} stages / {int(sp.get('bytes', 0)) >> 20} MiB"
     if repo is not None:
         _git(repo, "fetch", "--quiet", "origin", "main")
         behind = _git(repo, "rev-list", "--count", f"{commit}..origin/main")
@@ -111,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("stamp")
     a.add_argument("--repo", type=Path, required=True)
     a.add_argument("--dest", type=Path, required=True)
+    a.add_argument("--shader-pack", type=Path)
     a = sub.add_parser("info")
     a.add_argument("--prebuilt", type=Path, required=True)
     a.add_argument("--repo", type=Path)
@@ -121,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "prepare":
         prepare(args.repo, args.dest, args.seed_from)
     elif args.cmd == "stamp":
-        stamp(args.repo, args.dest)
+        stamp(args.repo, args.dest, args.shader_pack)
     elif args.cmd == "info":
         print(info(args.prebuilt, args.repo))
     else:
