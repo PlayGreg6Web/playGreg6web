@@ -47,6 +47,13 @@ inline constexpr size_t kMaxDisplayNameChars = 255;
 void set_save_dir(const std::string& dir);  // "" = default
 std::string save_dir();
 std::string default_save_dir();
+std::string legacy_save_dir();  // pre-#1838 default (...\playgta6web\saves)
+// True when <root>/<configuration>/local holds at least one container.
+bool root_has_containers(const std::string& root, const std::string& configuration_id);
+// Root for this run: an explicit dir always wins; else the canonical root, except when it has no containers for
+// the configuration but the legacy root does (then legacy, *used_legacy = true). Never moves data.
+std::string resolve_save_root(const std::string& explicit_dir, const std::string& canonical,
+                              const std::string& legacy, const std::string& configuration_id, bool* used_legacy);
 
 // fsync of everything below the save root (suspend / exit / XLaunchNewGame). Every update is already
 // flushed when it completes, so this only covers late writes.

@@ -350,6 +350,33 @@ void test_o52_atomic_story_mode_and_crash3(const fs::path& base) {
     }
 }
 
+void test_legacy_root_fallback(const fs::path& base) {
+    const std::string canon = (base / "lg_new").string();
+    const std::string legacy = (base / "lg_old").string();
+    const std::string explicit_dir = (base / "lg_explicit").string();
+    bool used = true;
+    // Nothing anywhere: canonical.
+    CHECK(gs::resolve_save_root("", canon, legacy, "title", &used) == canon && !used);
+    {
+        gs::Store old_store((fs::path(legacy) / "title" / "local").string());
+        CHECK(old_store.create_container("Slot1") == S_OK_HR);
+    }
+    // Canonical empty + legacy present: legacy, and nothing is moved.
+    CHECK(gs::resolve_save_root("", canon, legacy, "title", &used) == legacy && used);
+    CHECK(!fs::exists(canon));
+    // Other configuration id has no legacy containers: canonical.
+    CHECK(gs::resolve_save_root("", canon, legacy, "other", &used) == canon && !used);
+    // Explicit dir always wins.
+    CHECK(gs::resolve_save_root(explicit_dir, canon, legacy, "title", &used) == explicit_dir && !used);
+    {
+        gs::Store new_store((fs::path(canon) / "title" / "local").string());
+        CHECK(new_store.create_container("Slot2") == S_OK_HR);
+    }
+    // Both present: canonical.
+    CHECK(gs::resolve_save_root("", canon, legacy, "title", &used) == canon && !used);
+    CHECK(fs::exists(fs::path(legacy) / "title"));
+}
+
 int main() {
     const fs::path base = fs::temp_directory_path() / "pg6_o34_store_test";
     fs::remove_all(base);
@@ -363,6 +390,7 @@ int main() {
     test_crash_between_swap_steps(base);
     test_save_dir_survives_restart(base);
     test_o52_atomic_story_mode_and_crash3(base);
+    test_legacy_root_fallback(base);
     fs::remove_all(base);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

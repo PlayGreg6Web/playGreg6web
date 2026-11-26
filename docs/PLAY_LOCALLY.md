@@ -49,7 +49,7 @@ A connected XInput pad also gets the game's rumble.
 
 **Saves tools:** `python tools/saves.py list|export|import` lists native saves or moves them as a zip (format in
 [SAVE_ZIP_FORMAT.md](SAVE_ZIP_FORMAT.md)); it reads `%LOCALAPPDATA%\playgta6\saves` by default (older builds used `...\playgta6web\saves`;
-`saves.py migrate --from <old> --to <new>` copies them over). `python tools/disk_report.py` is a read-only report of what `pg6*` dirs and `work/` use
+`saves.py migrate --from <old> --to <new>` copies them over). The runtime itself falls back to the older folder for a run when the new one has no saves for the title yet (it prints the `migrate` command; nothing is moved; `--save-dir` always wins). `python tools/disk_report.py` is a read-only report of what `pg6*` dirs and `work/` use
 (it never deletes).
 
 **Useful switches:** `-PresentMode auto|fifo|mailbox|immediate`, `-MaxFps N` (cap the window present rate, 0 = off),

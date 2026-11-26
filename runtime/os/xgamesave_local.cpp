@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -28,6 +29,7 @@ namespace {
 
 std::mutex g_mutex;  // one operation at a time: updates are short and rare
 std::string g_save_dir;  // "" = default_save_dir()
+std::string g_legacy_root;  // set when the default root fell back to the legacy one (never with an explicit dir)
 std::set<std::string> g_changed;  // paths changed since the host last took them (browser persistence)
 std::atomic<uint64_t> g_dirty_generation{0};
 std::atomic<uint64_t> g_temp_counter{0};
@@ -271,39 +273,69 @@ bool valid_blob_name(const std::string& name) {
 void set_save_dir(const std::string& dir) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_save_dir = dir;
+    g_legacy_root.clear();
 }
 
-std::string default_save_dir() {
+namespace {
+std::string app_data_base() {
 #if defined(__EMSCRIPTEN__)
-    return "pg6-saves";
-#else
-    std::string base;
-#if defined(_WIN32)
-    if (const char* v = std::getenv("LOCALAPPDATA")) base = v;
+    return "";
+#elif defined(_WIN32)
+    const char* v = std::getenv("LOCALAPPDATA");
+    return v ? v : "";
 #elif defined(__APPLE__)
-    if (const char* v = std::getenv("HOME")) base = std::string(v) + "/Library/Application Support";
+    const char* v = std::getenv("HOME");
+    return v ? std::string(v) + "/Library/Application Support" : "";
 #else
-    if (const char* v = std::getenv("XDG_DATA_HOME")) {
-        base = v;
-    } else if (const char* h = std::getenv("HOME")) {
-        base = std::string(h) + "/.local/share";
-    }
+    if (const char* v = std::getenv("XDG_DATA_HOME")) return v;
+    if (const char* h = std::getenv("HOME")) return std::string(h) + "/.local/share";
+    return "";
 #endif
-    if (base.empty()) {
-        return "pg6-saves";
+}
+
+std::string root_under_base(const char* app) {
+    const std::string base = app_data_base();
+    return base.empty() ? "pg6-saves" : (fs::path(base) / app / "saves").string();
+}
+}  // namespace
+
+std::string default_save_dir() { return root_under_base("playgta6"); }
+
+std::string legacy_save_dir() { return root_under_base("playgta6web"); }
+
+bool root_has_containers(const std::string& root, const std::string& configuration_id) {
+    const std::string cfg = configuration_id.empty() ? "default" : encode(configuration_id);
+    std::error_code ec;
+    for (fs::directory_iterator it(fs::path(root) / cfg / "local", ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().filename().string().compare(0, 2, "c-") == 0 && it->is_directory(ec)) {
+            return true;
+        }
     }
-    return (fs::path(base) / "playgta6" / "saves").string();
-#endif
+    return false;
+}
+
+std::string resolve_save_root(const std::string& explicit_dir, const std::string& canonical,
+                              const std::string& legacy, const std::string& configuration_id, bool* used_legacy) {
+    if (used_legacy != nullptr) *used_legacy = false;
+    if (!explicit_dir.empty()) return explicit_dir;
+    if (canonical != legacy && !root_has_containers(canonical, configuration_id) &&
+        root_has_containers(legacy, configuration_id)) {
+        if (used_legacy != nullptr) *used_legacy = true;
+        return legacy;
+    }
+    return canonical;
 }
 
 std::string save_dir() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_save_dir.empty() ? default_save_dir() : g_save_dir;
+    if (!g_save_dir.empty()) return g_save_dir;
+    return g_legacy_root.empty() ? default_save_dir() : g_legacy_root;
 }
 
 void flush_all() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    const fs::path root = g_save_dir.empty() ? fs::path(default_save_dir()) : fs::path(g_save_dir);
+    const fs::path root = !g_save_dir.empty() ? fs::path(g_save_dir)
+                          : !g_legacy_root.empty() ? fs::path(g_legacy_root) : fs::path(default_save_dir());
     std::error_code ec;
     for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         const bool dir = it->is_directory(ec);
@@ -695,7 +727,25 @@ HResult Store::set_display_name(const std::string& container, const std::string&
 }
 
 Store open_store(const std::string& configuration_id) {
-    const std::string root = save_dir();
+    std::string explicit_dir;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        explicit_dir = g_save_dir;
+    }
+    const std::string canonical = default_save_dir();
+    bool used_legacy = false;
+    const std::string root =
+        resolve_save_root(explicit_dir, canonical, legacy_save_dir(), configuration_id, &used_legacy);
+    if (used_legacy) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_legacy_root.empty()) {
+            g_legacy_root = root;
+            std::fprintf(stderr,
+                         "[saves] no saves in %s, using the older save folder %s for this run; copy them over with: "
+                         "python tools/saves.py migrate --from \"%s\" --to \"%s\"\n",
+                         canonical.c_str(), root.c_str(), root.c_str(), canonical.c_str());
+        }
+    }
     const std::string cfg = configuration_id.empty() ? "default" : encode(configuration_id);
     return Store((fs::path(root) / cfg / "local").string());
 }
