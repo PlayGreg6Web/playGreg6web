@@ -102,6 +102,35 @@ int main() {
         CHECK(near(eval(m, {0x26, 'W'}).left_stick_y, 1.0f));
     }
 
+    // Raw-delta -> stick mapping: tracks the movement, decays like a stick once the mouse stops.
+    {
+        const float s = 0.05f;
+        CHECK(near(km::mouse_stick_step(0.0f, 10.0f, s), 0.5f));
+        CHECK(near(km::mouse_stick_step(0.0f, -10.0f, s), -0.5f));
+        CHECK(near(km::mouse_stick_step(0.0f, 1000.0f, s), 1.0f));          // clamped
+        CHECK(near(km::mouse_stick_step(0.8f, 0.0f, s), 0.8f * km::kMouseDecay));  // decay, no snap
+        float v = 1.0f;
+        for (int i = 0; i < 30; ++i) v = km::mouse_stick_step(v, 0.0f, s);
+        CHECK(v == 0.0f);                                                    // reaches exactly zero
+        CHECK(near(km::mouse_stick_step(0.9f, 4.0f, s), 0.9f * km::kMouseDecay));  // weaker input does not cut the decay
+        CHECK(near(km::mouse_stick_step(0.2f, 10.0f, s), 0.5f));            // stronger input takes over
+        CHECK(near(km::mouse_stick_step(0.8f, -4.0f, s), -0.2f));           // reversal switches at once
+        km::Keymap m;
+        std::vector<std::string> e;
+        CHECK(parse("[mouse]
+look = on
+", m, e));
+        const auto st = km::evaluate_look(m, [](int) { return false; }, 0.4f, -0.3f);
+        CHECK(near(st.right_stick_x, 0.4f) && near(st.right_stick_y, -0.3f));
+        CHECK(m.mouse_release_vk == 0x77);
+        CHECK(parse("[mouse]
+release_key = Alt
+", m, e) && m.mouse_release_vk == 0x12);
+        CHECK(!parse("[mouse]
+release_key = bogus
+", m, e));
+    }
+
     // Mouse look: right stick, sensitivity, invert, clamping, off by default.
     {
         km::Keymap m;

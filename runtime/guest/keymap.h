@@ -13,6 +13,7 @@
 //   look = on              # mouse movement drives the right stick (default off)
 //   sensitivity = 0.05     # stick deflection per pixel per 8 ms poll, 0.001..10
 //   invert_y = off
+//   release_key = F8       # toggles the cursor capture of the live window (a click also re-captures)
 
 #include <cstdint>
 #include <string>
@@ -41,6 +42,7 @@ struct Keymap {
     bool mouse_look = false;
     float mouse_sensitivity = 0.05f;
     bool mouse_invert_y = false;
+    int mouse_release_vk = 0x77;  // F8
 };
 
 // The built-in table (same as convert_keyboard).
@@ -59,10 +61,26 @@ bool load_keymap(const std::string& explicit_path, Keymap& out, std::vector<std:
 
 inline float clamp_axis(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+// Mouse -> stick like a real stick: the deflection follows the movement of this poll (pixels * sensitivity)
+// and, once the mouse stops, decays geometrically instead of snapping to zero.
+inline constexpr float kMouseDecay = 0.55f;
+inline float mouse_stick_step(float prev, float delta_px, float sensitivity, float decay = kMouseDecay) {
+    float decayed = prev * decay;
+    if (decayed > -0.01f && decayed < 0.01f) decayed = 0.0f;
+    const float inst = delta_px * sensitivity;
+    float out = decayed;
+    if (inst != 0.0f) {
+        const bool same = (inst > 0) == (decayed > 0) && decayed != 0.0f;
+        out = (!same || (inst > 0 ? inst > decayed : inst < decayed)) ? inst : decayed;
+    }
+    return clamp_axis(out, -1.0f, 1.0f);
+}
+
 // Pure mapping: `is_down(vk)` reports a held key; mouse_dx/dy are the pixel movement since the last poll
 // (screen coordinates, y down). Sticks clamp to [-1,1], opposite keys cancel.
+// `look_x/look_y` are right-stick contributions already in stick units (up = +y).
 template <typename DownFn>
-InputState evaluate(const Keymap& map, DownFn&& is_down, float mouse_dx, float mouse_dy) {
+InputState evaluate_look(const Keymap& map, DownFn&& is_down, float look_x, float look_y) {
     InputState s{};
     float lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0;
     for (const Binding& b : map.keys) {
@@ -81,8 +99,8 @@ InputState evaluate(const Keymap& map, DownFn&& is_down, float mouse_dx, float m
         }
     }
     if (map.mouse_look) {
-        rx += mouse_dx * map.mouse_sensitivity;
-        ry += (map.mouse_invert_y ? mouse_dy : -mouse_dy) * map.mouse_sensitivity;
+        rx += look_x;
+        ry += look_y;
     }
     s.left_stick_x = clamp_axis(lx, -1.0f, 1.0f);
     s.left_stick_y = clamp_axis(ly, -1.0f, 1.0f);
@@ -91,6 +109,12 @@ InputState evaluate(const Keymap& map, DownFn&& is_down, float mouse_dx, float m
     s.left_trigger = lt;
     s.right_trigger = rt;
     return s;
+}
+
+template <typename DownFn>
+InputState evaluate(const Keymap& map, DownFn&& is_down, float mouse_dx, float mouse_dy) {
+    return evaluate_look(map, is_down, mouse_dx * map.mouse_sensitivity,
+                         (map.mouse_invert_y ? mouse_dy : -mouse_dy) * map.mouse_sensitivity);
 }
 
 }  // namespace playgta6::guest::keymap

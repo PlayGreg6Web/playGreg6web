@@ -1,6 +1,7 @@
 #include "gpu/native_exec/native_window.h"
 
 #include "gpu/native_exec/window_layout.h"
+#include "os/raw_mouse.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -101,6 +102,8 @@ class Win32Window final : public NativeWindow {
 public:
     ~Win32Window() override {
         if (!closed_) save_placement();
+        release_capture();
+        playgta6::os::raw_mouse::state().window_ready.store(false);
         if (hwnd_) DestroyWindow(hwnd_);
     }
 
@@ -149,6 +152,16 @@ public:
             return false;
         }
         ShowWindow(hwnd_, start_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        // Raw mouse input for mouse look. No RIDEV_INPUTSINK: WM_INPUT only arrives while this window is
+        // in the foreground. Deltas are only kept while the cursor is captured (see update_capture()).
+        RAWINPUTDEVICE rid{};
+        rid.usUsagePage = 0x01;  // generic desktop
+        rid.usUsage = 0x02;      // mouse
+        rid.dwFlags = 0;
+        rid.hwndTarget = hwnd_;
+        if (RegisterRawInputDevices(&rid, 1, sizeof rid)) {
+            playgta6::os::raw_mouse::state().window_ready.store(true);
+        }
         UpdateWindow(hwnd_);
         return true;
     }
@@ -158,6 +171,10 @@ public:
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        // Mouse look may be switched on (keymap loaded) after the window already has focus.
+        if (!capturing_ && !capture_released_ && focus_ && playgta6::os::raw_mouse::state().look_enabled.load()) {
+            update_capture();
         }
         return !closed_;
     }
@@ -241,9 +258,38 @@ private:
         save_state(st);
     }
 
-    // Fullscreen hides the cursor while the window has focus; windowed mode keeps the arrow.
+    // Mouse look: while the window has focus, is not minimised, mouse look is on and the user has not
+    // released it, the cursor is hidden and confined to the client rect and Raw Input deltas are kept.
+    void update_capture() {
+        namespace rm = playgta6::os::raw_mouse;
+        const bool want = hwnd_ != nullptr && !closed_ && focus_ && !IsIconic(hwnd_) && !capture_released_ &&
+                          rm::state().look_enabled.load();
+        if (want) {
+            RECT r{};
+            POINT tl{0, 0};
+            if (GetClientRect(hwnd_, &r) && ClientToScreen(hwnd_, &tl)) {
+                RECT clip{tl.x, tl.y, tl.x + r.right, tl.y + r.bottom};
+                if (r.right > 0 && r.bottom > 0) ClipCursor(&clip);
+            }
+        } else if (capturing_) {
+            ClipCursor(nullptr);
+        }
+        capturing_ = want;
+        rm::state().capturing.store(want);
+        if (!want) {
+            int32_t dx, dy;
+            rm::take(&dx, &dy);
+        }
+        update_cursor();
+    }
+    void release_capture() {
+        capture_released_ = true;
+        update_capture();
+    }
+
+    // Fullscreen or mouse capture hides the cursor while the window has focus; windowed mode keeps the arrow.
     void update_cursor() {
-        if (fullscreen_ && focus_) {
+        if ((fullscreen_ || capturing_) && focus_) {
             if (!cursor_hidden_) {
                 while (ShowCursor(FALSE) >= 0) {}
                 cursor_hidden_ = true;
@@ -294,16 +340,45 @@ private:
             self->shot_request_ = true;  // the executor saves the next presented frame
             return 0;
         }
+        if (self && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (lp & (1 << 30)) == 0 &&
+            static_cast<int>(wp) == playgta6::os::raw_mouse::state().release_vk.load() &&
+            playgta6::os::raw_mouse::state().look_enabled.load()) {
+            // Configurable release key (keymap.ini [mouse] release_key) toggles the cursor capture.
+            self->capture_released_ = !self->capture_released_;
+            self->update_capture();
+            if (msg == WM_SYSKEYDOWN) return 0;  // keep Alt from opening the system menu
+        }
         if (self) {
             switch (msg) {
                 case WM_SETFOCUS:
                     self->focus_ = true;
-                    self->update_cursor();
+                    self->update_capture();
                     break;
                 case WM_KILLFOCUS:
                     self->focus_ = false;
-                    self->update_cursor();
+                    self->update_capture();
                     break;
+                case WM_SIZE:
+                case WM_MOVE:
+                case WM_SHOWWINDOW:
+                    self->update_capture();  // minimise releases, resize/move re-fits the clip rect
+                    break;
+                case WM_LBUTTONDOWN:
+                    if (self->capture_released_) {
+                        self->capture_released_ = false;
+                        self->update_capture();
+                    }
+                    break;
+                case WM_INPUT: {
+                    RAWINPUT in{};
+                    UINT size = sizeof in;
+                    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &in, &size,
+                                        sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+                        in.header.dwType == RIM_TYPEMOUSE && (in.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                        playgta6::os::raw_mouse::add(in.data.mouse.lLastX, in.data.mouse.lLastY);
+                    }
+                    break;  // DefWindowProc must still run for cleanup
+                }
                 case WM_ERASEBKGND:
                     return 1;  // the swapchain covers the client area; no GDI flicker on resize
                 case WM_GETMINMAXINFO: {
@@ -326,7 +401,7 @@ private:
                     return 0;
                 }
                 case WM_SETCURSOR:
-                    if (LOWORD(lp) == HTCLIENT && self->fullscreen_ && self->focus_) {
+                    if (LOWORD(lp) == HTCLIENT && (self->fullscreen_ || self->capturing_) && self->focus_) {
                         SetCursor(nullptr);
                         return TRUE;
                     }
@@ -337,7 +412,8 @@ private:
         }
         if (self && msg == WM_CLOSE) {
             self->save_placement();
-            self->update_cursor();
+            self->capture_released_ = true;
+            self->update_capture();
             // Keep the HWND alive (the surface still references it); the owner stops presenting.
             self->closed_ = true;
             ShowWindow(hwnd, SW_HIDE);
@@ -354,6 +430,8 @@ private:
     bool focus_ = false;
     std::atomic<bool> shot_request_{false};
     bool cursor_hidden_ = false;
+    bool capturing_ = false;
+    bool capture_released_ = false;
     WINDOWPLACEMENT placement_{};
 };
 

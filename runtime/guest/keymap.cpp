@@ -262,8 +262,15 @@ bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>
                     continue;
                 }
                 out.mouse_sensitivity = f;
+            } else if (k == "release_key") {
+                int vk = 0;
+                if (!key_from_name(value, vk)) {
+                    err("unknown key '" + value + "' for release_key");
+                    continue;
+                }
+                out.mouse_release_vk = vk;
             } else {
-                err("unknown mouse setting '" + key + "' (expected look, sensitivity, invert_y)");
+                err("unknown mouse setting '" + key + "' (expected look, sensitivity, invert_y, release_key)");
             }
         }
     }

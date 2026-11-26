@@ -84,8 +84,13 @@ the pad wins per axis when it is deflected more. `--input-script` takes preceden
 `--host-input` loads `%LOCALAPPDATA%\playgta6\keymap.ini` (written with the documented defaults on the first run) or the
 file given by `--keymap <file>` (`play_native.ps1 -Keymap`). Lines are `Key = target` under `[keys]` (e.g. `Enter = a`,
 `X = right_trigger`, `Mouse_Left = right_trigger`); the file is applied on top of the table above, `Key = none` unbinds,
-and each key may appear once. `[mouse]` has `look = on|off` (real mouse movement drives the right stick, no cursor
-re-centring), `sensitivity` (stick deflection per pixel per 8 ms poll, default 0.05) and `invert_y`. A bad file stops the
+and each key may appear once. `[mouse]` has `look = on|off` (real mouse movement drives the right stick),
+`sensitivity` (stick deflection per pixel per 8 ms poll, default 0.05), `invert_y` and `release_key` (default `F8`).
+With mouse look on, the live window uses Win32 Raw Input (relative deltas, only while the window is focused) and
+captures the cursor: it is hidden and confined to the window, so looking never stops at the screen edge. The deflection
+decays after the mouse stops, like a released stick. The capture is released on focus loss and when minimised; the
+release key toggles it by hand and a click in the window re-captures. Esc stays the pad Menu button. Without a live
+window the old cursor-delta path is used. A bad file stops the
 run with `file: line N: ...` messages. Only real host input is mapped.
 
 ### Recording and replaying a session: `--record-input`

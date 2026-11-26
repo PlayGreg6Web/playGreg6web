@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "os/game_input.h"
+#include "os/raw_mouse.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -254,23 +255,37 @@ void HostInputSource::run() {
             rumble.update(playgta6::os::game_input_rumble_telemetry(), have_pad ? pad_index : -1, keyboard_enabled_.load(), now_ms);
             g_silence_pad.store(have_pad ? pad_index : -1);
         }
-        float mdx = 0.0f, mdy = 0.0f;
+        float look_x = 0.0f, look_y = 0.0f;
         const bool kb = keyboard_enabled_.load();
-        if (kb && keymap_.mouse_look) {
-            // Real cursor movement since the last poll; the first poll after (re)gaining focus has no delta.
-            POINT p{};
-            if (GetCursorPos(&p)) {
-                if (have_cursor) {
-                    mdx = static_cast<float>(p.x - last_cursor.x);
-                    mdy = static_cast<float>(p.y - last_cursor.y);
+        if (keymap_.mouse_look) {
+            namespace rm = playgta6::os::raw_mouse;
+            float mdx = 0.0f, mdy = 0.0f;
+            if (kb && rm::state().window_ready.load()) {
+                // Live window: relative Raw Input deltas (zero while the cursor is released).
+                int32_t dx = 0, dy = 0;
+                rm::take(&dx, &dy);
+                mdx = static_cast<float>(dx);
+                mdy = static_cast<float>(dy);
+            } else if (kb) {
+                // No window to capture the cursor: real cursor movement since the last poll.
+                POINT p{};
+                if (GetCursorPos(&p)) {
+                    if (have_cursor) {
+                        mdx = static_cast<float>(p.x - last_cursor.x);
+                        mdy = static_cast<float>(p.y - last_cursor.y);
+                    }
+                    last_cursor = p;
+                    have_cursor = true;
                 }
-                last_cursor = p;
-                have_cursor = true;
+            } else {
+                have_cursor = false;
             }
-        } else {
-            have_cursor = false;
+            look_x = keymap::mouse_stick_step(look_x_, mdx, keymap_.mouse_sensitivity);
+            look_y = keymap::mouse_stick_step(look_y_, keymap_.mouse_invert_y ? mdy : -mdy, keymap_.mouse_sensitivity);
+            look_x_ = look_x;
+            look_y_ = look_y;
         }
-        const InputState keys = kb ? keymap::evaluate(keymap_, key_down, mdx, mdy) : InputState{};
+        const InputState keys = kb ? keymap::evaluate_look(keymap_, key_down, look_x, look_y) : InputState{};
         const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, keys);
         if (recorder_ != nullptr) {
             recorder_->record(values);
