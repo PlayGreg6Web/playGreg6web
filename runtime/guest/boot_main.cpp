@@ -1103,8 +1103,7 @@ int main(int argc, char** argv) {
                 in_repo = std::filesystem::exists(p / ".git", ec);
             }
             if (ec || (in_repo && !under_work)) {
-                std::fprintf(stderr, "[harness] --dump-pipelines must not name a directory inside a repository checkout (use a path outside it, or under a `work` directory)
-");
+                std::fprintf(stderr, "[harness] --dump-pipelines must not name a directory inside a repository checkout (use a path outside it, or under a `work` directory)\n");
                 return kExitUsage;
             }
             device_options.dump_dir = dir.string();
