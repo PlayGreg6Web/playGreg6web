@@ -52,6 +52,7 @@ add_library(playgta6_core STATIC
     gpu/small_texture_pool.cpp
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
+    gpu/pipeline_prewarm.cpp
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
     gpu/drop_table.cpp
@@ -323,6 +324,9 @@ else()
     add_executable(test_small_texture_pool ../tests/test_small_texture_pool.cpp)
     target_link_libraries(test_small_texture_pool PRIVATE playgta6_core)
     add_test(NAME playgta6_small_texture_pool_tests COMMAND test_small_texture_pool)
+    add_executable(test_pipeline_prewarm ../tests/test_pipeline_prewarm.cpp)
+    target_link_libraries(test_pipeline_prewarm PRIVATE playgta6_core)
+    add_test(NAME playgta6_pipeline_prewarm_tests COMMAND test_pipeline_prewarm)
     add_executable(test_present_pacing ../tests/test_present_pacing.cpp)
     target_link_libraries(test_present_pacing PRIVATE playgta6_core)
     add_test(NAME playgta6_present_pacing_tests COMMAND test_present_pacing)

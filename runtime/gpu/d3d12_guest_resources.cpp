@@ -1,5 +1,6 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/pipeline_prewarm.h"
 #include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
 #include "gpu/xbox_embedded_native.h"
@@ -3785,6 +3786,7 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
         pack_modules_.emplace(key, id);
         return id;
     };
+    pipeline_prewarm().note_title_pipeline(kPrewarmKindGraphics, *vs_key, d.ps != 0 ? *ps_key : 0);
     register_shader_module(d.vs, module_for(*vs_key, GpuShaderStage::Vertex));
     if (d.ps != 0) {
         register_shader_module(d.ps, module_for(*ps_key, GpuShaderStage::Fragment));
@@ -4163,6 +4165,7 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
                 submit(enc);
                 pack_modules_.emplace(pack_key, module_id);
             }
+            pipeline_prewarm().note_title_pipeline(kPrewarmKindCompute, pack_key, 0);
             register_shader_module(d.cs, module_id);
             if (rs && pack_layouts_.insert({d.cs, 0}).second) {
                 bridge::PipelineLayoutDesc layout =

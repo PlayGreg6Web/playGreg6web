@@ -10,6 +10,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "gpu/pipeline_prewarm.h"
 #include "gpu/shader_pack_index.h"
 #include "gpu/stage_reflection.h"
 #include "guest/boot.h"
@@ -876,6 +877,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     }
 
     gpu::d3d12_guest::DeviceOptions device_options;
+    gpu::pipeline_prewarm().set_pack_index(shader_pack);
     device_options.shader_pack = std::move(shader_pack);
     device_options.stage_reflection = std::move(stage_reflection);
     device_options.dump_dir = dump_dir;
@@ -1032,6 +1034,40 @@ void attach_default_input_state() {
 }
 
 }  // namespace playgta6::boot
+
+// Pipeline prewarm queue (backlog 27). The host stores the warm list outside git, loads it with
+// playgta6_prewarm_load_list, pulls tasks, builds shader modules / pipelines, and reports back.
+extern "C" PG6_WASM_BOOT_EXPORT int32_t playgta6_prewarm_load_list(const uint8_t* data, uint64_t size) {
+    uint32_t queued = 0;
+    std::string error;
+    if (!playgta6::gpu::pipeline_prewarm().load_warm_list(data, static_cast<size_t>(size), &error, &queued)) {
+        return -1;
+    }
+    return static_cast<int32_t>(queued);
+}
+
+// Writes up to `max` 24-byte PrewarmTask records to `out`; returns how many.
+extern "C" PG6_WASM_BOOT_EXPORT int32_t playgta6_prewarm_take(playgta6::gpu::PrewarmTask* out, uint32_t max) {
+    return static_cast<int32_t>(playgta6::gpu::pipeline_prewarm().take(out, max));
+}
+
+extern "C" PG6_WASM_BOOT_EXPORT int32_t playgta6_prewarm_complete(uint32_t id, int32_t ok, uint64_t build_ns) {
+    return playgta6::gpu::pipeline_prewarm().complete(id, ok != 0, build_ns) ? 1 : 0;
+}
+
+// Writes the 48-byte PrewarmProgress to `out`.
+extern "C" PG6_WASM_BOOT_EXPORT void playgta6_prewarm_progress(playgta6::gpu::PrewarmProgress* out) {
+    *out = playgta6::gpu::pipeline_prewarm().progress();
+}
+
+// Returns the byte size of the warm list (pipelines this run created); copies it to `out` when cap fits.
+extern "C" PG6_WASM_BOOT_EXPORT uint64_t playgta6_prewarm_save_list(uint8_t* out, uint64_t cap) {
+    const std::vector<uint8_t> bytes = playgta6::gpu::pipeline_prewarm().save_warm_list();
+    if (out != nullptr && cap >= bytes.size()) {
+        std::memcpy(out, bytes.data(), bytes.size());
+    }
+    return bytes.size();
+}
 
 extern "C" PG6_WASM_BOOT_EXPORT uintptr_t playgta6_get_input_state_ptr(void) {
     return reinterpret_cast<uintptr_t>(playgta6::boot::input_state_ptr());
