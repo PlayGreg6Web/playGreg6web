@@ -44,7 +44,7 @@ play_native.ps1: build (if stale) and play natively.
   -Update        fast-forward to origin/main first (never discards local changes)
   -FreshSetup    empty save dir so the setup screens appear
   -PresentMode   auto|fifo|mailbox|immediate     -MaxFps N  (0 = off)
-  -Record        save real input to %LOCALAPPDATA%\playgta6ecordings   -Keymap <file>  rebind keys
+  -Record        save real input to %LOCALAPPDATA%\playgta6\recordings   -Keymap <file>  rebind keys
   -NoBuild / -TrustBuild / -DryRun / -Name <run>
   Keys: WASD stick, Enter/Space A, Backspace B, Tab View, Esc Menu, F11 fullscreen, F12 screenshot (PNG).
   Mouse look: keymap.ini [mouse] look = on; F8 releases/re-captures the cursor, a click re-captures.
