@@ -43,6 +43,18 @@ struct ExecutorOptions {
     // boot report prints). Nothing is estimated: without the feature the table says unavailable.
     bool gpu_timing = true;
     d3d12_guest::GpuTimeTable* gpu_time = nullptr;
+    // Persistent Dawn blob cache (blob_cache.h): compiled shaders / pipelines are stored under
+    // <blob_cache_root>/<blob_cache_title>/<Dawn build>-<adapter>/ and loaded by later runs, so DXC and
+    // the driver compile each pipeline once per machine instead of once per run. Empty root = off
+    // (the default: tests and tools never touch the user's cache); boot_main passes the default root.
+    std::string blob_cache_root;
+    std::string blob_cache_title = "title";
+    uint64_t blob_cache_max_bytes = uint64_t{2} << 30;  // LRU-trimmed to this (0 = unbounded)
+    // Live play: v2 render / compute pipelines are created with CreateRenderPipelineAsync /
+    // CreateComputePipelineAsync, so Dawn compiles them on its own worker threads while the executor
+    // keeps consuming packets (the prewarm batches create hundreds ahead of use). The pipeline is
+    // awaited, never skipped, when a pass first uses it, so output is identical to sync creation.
+    bool async_pipelines = false;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;
@@ -117,6 +129,24 @@ struct ExecutorStats {
     std::array<uint64_t, kOpcodeSlots> opcode_ns{};
     uint64_t ns_execute = 0, ns_process_events = 0, ns_flush_readbacks = 0, ns_poll = 0;
     uint64_t ns_present_acquire = 0, ns_present_encode = 0, ns_present_submit = 0, ns_present_swap = 0;
+    // Persistent blob cache (blob_cache.h; a snapshot taken when stats() is read).
+    bool blob_cache_enabled = false;
+    std::string blob_cache_dir;
+    uint64_t blob_hits = 0;       // Dawn loads served from disk (shader / pipeline compiles skipped)
+    uint64_t blob_misses = 0;     // lookups Dawn had to compile for
+    uint64_t blob_stores = 0;
+    uint64_t blob_bytes_loaded = 0;
+    uint64_t blob_bytes_stored = 0;
+    uint64_t blob_evictions = 0;  // LRU removals to stay under the cap
+    uint64_t blob_corrupt = 0;
+    uint64_t blob_entries = 0;
+    uint64_t blob_total_bytes = 0;
+    uint64_t blob_max_bytes = 0;
+    // Async pipeline creation (ExecutorOptions::async_pipelines).
+    uint64_t async_pipelines = 0;          // pipelines handed to Dawn's worker threads
+    uint64_t async_pipeline_waits = 0;     // first uses that still had to wait for the compile
+    uint64_t async_pipeline_wait_ns = 0;
+    uint64_t async_pipeline_failures = 0;  // creation failed: the pipeline became an error object
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
 };

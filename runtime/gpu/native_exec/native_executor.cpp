@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -21,6 +22,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/blit_model.h"
+#include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
@@ -278,11 +280,32 @@ struct ShaderEntry {
     mutable bool pending = false;  // pack-backed and not yet materialized
 };
 
-struct RenderPipelineEntry {
-    wgpu::RenderPipeline pipeline;
+// Result of an asynchronous pipeline creation (ExecutorOptions::async_pipelines), shared with the
+// completion callback. The callback runs on the executor thread (ProcessEvents / WaitAny).
+struct PendingPipe {
+    bool done = false;
+    wgpu::CreatePipelineAsyncStatus status = wgpu::CreatePipelineAsyncStatus::Success;
+    std::string message;
+    wgpu::RenderPipeline render;
+    wgpu::ComputePipeline compute;
+};
+
+// A pipeline whose compile may still be running on a Dawn worker thread: `pipeline` is only valid
+// once Impl::resolve() has returned it.
+struct AsyncSlot {
+    mutable std::shared_ptr<PendingPipe> pending;  // null: created synchronously / already resolved
+    mutable wgpu::Future future;
+};
+
+struct RenderPipelineEntry : AsyncSlot {
+    mutable wgpu::RenderPipeline pipeline;
     AutoLayoutMeta auto_meta;
     bool expects_group0 = false;
     uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
+};
+
+struct ComputePipelineEntry : AsyncSlot {
+    mutable wgpu::ComputePipeline pipeline;
 };
 
 struct BufferEntry {
@@ -407,6 +430,7 @@ struct Impl_ReadbackEntry {
 
 struct NativeExecutor::Impl {
     ExecutorOptions options;
+    BlobCache blob_cache;  // before the device: Dawn may call the hooks until the device is gone
     wgpu::Instance instance;
     wgpu::Adapter adapter_handle;
     wgpu::Device device;
@@ -452,7 +476,7 @@ struct NativeExecutor::Impl {
     std::unordered_map<uint32_t, PlEntry> pipeline_layouts;
     std::unordered_map<uint64_t, wgpu::BindGroupLayout> layouts_by_content;
     std::unordered_map<uint32_t, RenderPipelineEntry> render_pipelines;
-    std::unordered_map<uint32_t, wgpu::ComputePipeline> compute_pipelines;
+    std::unordered_map<uint32_t, ComputePipelineEntry> compute_pipelines;
     std::unordered_map<uint32_t, wgpu::BindGroup> bind_groups;
     std::unordered_map<std::string, wgpu::Buffer> dummy_buffers;
     std::unordered_map<std::string, wgpu::Sampler> dummy_samplers;
@@ -497,6 +521,8 @@ struct NativeExecutor::Impl {
     d3d12_guest::GpuTimeTable* time_table = nullptr;
     std::unique_ptr<d3d12_guest::GpuTimeRing> time_ring;
     std::vector<TimerSlot> timer_slots;
+
+    void snapshot_blob_stats();
 
     // ---- setup ----
 
@@ -595,6 +621,40 @@ struct NativeExecutor::Impl {
         // is turned off), which is what per-pass GPU time needs.
         wgpu::DawnTogglesDescriptor toggles{};
         static const char* const kDisabledToggles[] = {"timestamp_quantization"};
+        // Persistent blob cache: Dawn asks for / hands over its compiled shader and pipeline blobs
+        // through these hooks; the store lives under <root>/<title>/<Dawn build>-<adapter>.
+        // (The C++ wrapper has no callback converters for these raw-pointer hooks: the C struct is
+        // filled directly; wgpu::ChainedStruct has the layout of WGPUChainedStruct.)
+        WGPUDawnCacheDeviceDescriptor cache_desc = WGPU_DAWN_CACHE_DEVICE_DESCRIPTOR_INIT;
+        bool have_cache = false;
+        std::string iso_key;
+        if (!options.blob_cache_root.empty()) {
+#ifdef PG6_DAWN_COMMIT
+            const std::string dawn_build = std::string(PG6_DAWN_COMMIT).substr(0, 12);
+#else
+            const std::string dawn_build = "dawn";
+#endif
+            const std::string adapter_key = adapter.vendor + "-" + adapter.device + "-" + adapter.backend + "-" +
+                                            std::to_string(BlobCache::fnv1a(adapter.description.data(), adapter.description.size()) & 0xffffffffu) +
+                                            "-" + std::to_string(info.vendorID) + "-" + std::to_string(info.deviceID);
+            const std::string dir = BlobCache::versioned_dir(options.blob_cache_root, options.blob_cache_title, dawn_build, adapter_key);
+            if (blob_cache.open(dir, options.blob_cache_max_bytes)) {
+                BlobCache::prune_stale_siblings((std::filesystem::path(dir).parent_path()).string(), dir, 30);
+                have_cache = true;
+                iso_key = "pg6-" + BlobCache::sanitize(options.blob_cache_title);
+                cache_desc.isolationKey = {iso_key.data(), iso_key.size()};  // iso outlives RequestDevice (below)
+                cache_desc.dawnLoadCacheDataCallbackInfo.callback = [](size_t key_size, const uint8_t* key, size_t value_size,
+                                                                       uint8_t* value, void* c, void*) -> size_t {
+                    return static_cast<BlobCache*>(c)->load(key, key_size, value, value_size);
+                };
+                cache_desc.dawnLoadCacheDataCallbackInfo.userdata1 = &blob_cache;
+                cache_desc.dawnStoreCacheDataCallbackInfo.callback = [](size_t key_size, const uint8_t* key, size_t value_size,
+                                                                        const uint8_t* value, void* c, void*) {
+                    static_cast<BlobCache*>(c)->store(key, key_size, value, value_size);
+                };
+                cache_desc.dawnStoreCacheDataCallbackInfo.userdata1 = &blob_cache;
+            }
+        }
         const bool want_timing = options.gpu_timing && adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery);
         if (want_timing) {
             required.push_back(wgpu::FeatureName::TimestampQuery);
@@ -641,6 +701,10 @@ struct NativeExecutor::Impl {
             wgpu::DeviceDescriptor ddesc{};
             const bool with_features = attempt != kBare;
             if (with_features && want_timing) ddesc.nextInChain = &toggles;
+            if (have_cache) {
+                cache_desc.chain.next = const_cast<WGPUChainedStruct*>(reinterpret_cast<const WGPUChainedStruct*>(ddesc.nextInChain));
+                ddesc.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&cache_desc.chain);
+            }
             if (with_features) {
                 ddesc.requiredFeatureCount = required.size();
                 ddesc.requiredFeatures = required.data();
@@ -976,7 +1040,7 @@ struct NativeExecutor::Impl {
                 if (n >= 4) {
                     const uint32_t id = read_payload<uint32_t>(p);
                     auto it = render_pipelines.find(id);
-                    pass_cmds.emplace_back(SetPipelineCmd{id, it != render_pipelines.end() ? it->second.pipeline
+                    pass_cmds.emplace_back(SetPipelineCmd{id, it != render_pipelines.end() ? resolve(it->second)
                                                                                            : wgpu::RenderPipeline()});
                 } else {
                     ++stats.op_errors;
@@ -1841,7 +1905,11 @@ struct NativeExecutor::Impl {
         rd.vertex.buffers = vbs.data();
 
         RenderPipelineEntry e;
-        e.pipeline = device.CreateRenderPipeline(&rd);
+        if (options.async_pipelines) {
+            create_render_async(rd, &e);
+        } else {
+            e.pipeline = device.CreateRenderPipeline(&rd);
+        }
         bool expects = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
         if (!expects && !auto_layout && group0_has_entries) expects = true;
         e.expects_group0 = expects;
@@ -1852,6 +1920,86 @@ struct NativeExecutor::Impl {
         return true;
     }
     std::string fragment_ep_storage;
+
+    // ---- async pipeline creation (live mode) ----
+
+    void create_render_async(const wgpu::RenderPipelineDescriptor& rd, RenderPipelineEntry* e) {
+        auto state = std::make_shared<PendingPipe>();
+        e->future = device.CreateRenderPipelineAsync(
+            &rd, wgpu::CallbackMode::AllowProcessEvents,
+            [state](wgpu::CreatePipelineAsyncStatus s, wgpu::RenderPipeline pl, wgpu::StringView msg) {
+                state->done = true;
+                state->status = s;
+                if (s == wgpu::CreatePipelineAsyncStatus::Success) state->render = std::move(pl);
+                else state->message = to_string(msg);
+            });
+        e->pending = std::move(state);
+        ++stats.async_pipelines;
+    }
+
+    void create_compute_async(const wgpu::ComputePipelineDescriptor& cd, ComputePipelineEntry* e) {
+        auto state = std::make_shared<PendingPipe>();
+        e->future = device.CreateComputePipelineAsync(
+            &cd, wgpu::CallbackMode::AllowProcessEvents,
+            [state](wgpu::CreatePipelineAsyncStatus s, wgpu::ComputePipeline pl, wgpu::StringView msg) {
+                state->done = true;
+                state->status = s;
+                if (s == wgpu::CreatePipelineAsyncStatus::Success) state->compute = std::move(pl);
+                else state->message = to_string(msg);
+            });
+        e->pending = std::move(state);
+        ++stats.async_pipelines;
+    }
+
+    // Blocks until the entry's compile finished (the first use of a pipeline the prewarm did not
+    // finish in time; a pipeline built ahead of use is already done and costs nothing here).
+    void await_pipe(const AsyncSlot& slot) {
+        if (!slot.pending->done) {
+            ++stats.async_pipeline_waits;
+            const uint64_t t0 = now_ns();
+            instance.WaitAny(slot.future, kWaitForever);
+            stats.async_pipeline_wait_ns += now_ns() - t0;
+        }
+    }
+
+    void pipe_failed(const PendingPipe& st, const char* what) {
+        ++stats.async_pipeline_failures;
+        const std::string msg = std::string("async ") + what + " pipeline: " + st.message;
+        stats.last_device_error = msg;
+        if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(msg);
+    }
+
+    const wgpu::RenderPipeline& resolve(const RenderPipelineEntry& e) {
+        if (e.pending) {
+            await_pipe(e);
+            if (e.pending->render) {
+                e.pipeline = e.pending->render;
+            } else {
+                pipe_failed(*e.pending, "render");
+                // What sync creation yields for an invalid descriptor: an error pipeline (the draw
+                // that uses it is then dropped by validation), not a null handle.
+                wgpu::RenderPipelineDescriptor bad{};
+                e.pipeline = device.CreateRenderPipeline(&bad);
+            }
+            e.pending.reset();
+        }
+        return e.pipeline;
+    }
+
+    const wgpu::ComputePipeline& resolve(const ComputePipelineEntry& e) {
+        if (e.pending) {
+            await_pipe(e);
+            if (e.pending->compute) {
+                e.pipeline = e.pending->compute;
+            } else {
+                pipe_failed(*e.pending, "compute");
+                wgpu::ComputePipelineDescriptor bad{};
+                e.pipeline = device.CreateComputePipeline(&bad);
+            }
+            e.pending.reset();
+        }
+        return e.pipeline;
+    }
 
     bool create_compute_pipeline2(const Packet& p) {
         const auto h = read_payload<GpuCreateComputePipeline2Payload>(p);
@@ -1885,7 +2033,13 @@ struct NativeExecutor::Impl {
         cd.layout = auto_layout || auto_meta.remap ? nullptr : layout;
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {ep.data(), ep.size()};
-        compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        ComputePipelineEntry ce;
+        if (options.async_pipelines) {
+            create_compute_async(cd, &ce);
+        } else {
+            ce.pipeline = device.CreateComputePipeline(&cd);
+        }
+        compute_pipelines[h.id] = std::move(ce);
         compute_meta[h.id] = std::move(auto_meta);
         compute_hash[h.id] = cs.hash;
         ++stats.compute_pipelines;
@@ -1973,7 +2127,7 @@ struct NativeExecutor::Impl {
         cd.layout = nullptr;  // 'auto'
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {"cs_main", 7};
-        compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        compute_pipelines[h.id].pipeline = device.CreateComputePipeline(&cd);
         compute_meta.erase(h.id);
         compute_hash[h.id] = cs.hash;
         ++stats.compute_pipelines;
@@ -1991,9 +2145,9 @@ struct NativeExecutor::Impl {
         auto rit = render_pipelines.find(h.pipeline_id);
         auto cit = compute_pipelines.find(h.pipeline_id);
         if (rit != render_pipelines.end()) {
-            layout = rit->second.pipeline.GetBindGroupLayout(h.group_index);
+            layout = resolve(rit->second).GetBindGroupLayout(h.group_index);
         } else if (cit != compute_pipelines.end()) {
-            layout = cit->second.GetBindGroupLayout(h.group_index);
+            layout = resolve(cit->second).GetBindGroupLayout(h.group_index);
             compute = true;
         } else {
             auto bit = bgls.find(h.pipeline_id);  // a v2 bind group layout id works here too
@@ -2675,7 +2829,7 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = false;
             e.compute_valid = false;
             auto it = render_pipelines.find(sp->id);
-            const wgpu::RenderPipeline& pl = it != render_pipelines.end() ? it->second.pipeline : sp->at_packet;
+            const wgpu::RenderPipeline& pl = it != render_pipelines.end() ? resolve(it->second) : sp->at_packet;
             if (pl) e.rpass.SetPipeline(pl);
             else ++stats.op_errors;  // SetPipeline: render pipeline not found
         } else if (const auto* vb = std::get_if<SetVertexBufferCmd>(&cmd)) {
@@ -2727,7 +2881,7 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = true;
             auto it = compute_pipelines.find(sc->id);
             e.compute_valid = it != compute_pipelines.end();
-            if (e.compute_valid) e.cpass.SetPipeline(it->second);
+            if (e.compute_valid) e.cpass.SetPipeline(resolve(it->second));
         } else if (const auto* dc = std::get_if<DispatchCmd>(&cmd)) {
             if (e.had_explicit_compute && !e.compute_valid) {
                 ++stats.dispatches_skipped;
@@ -2864,8 +3018,8 @@ struct NativeExecutor::Impl {
             }
         }
 
-        wgpu::BindGroupLayout auto_bgl = compute ? compute_pipelines.find(pipeline_id)->second.GetBindGroupLayout(0)
-                                                 : render_pipelines.find(pipeline_id)->second.pipeline.GetBindGroupLayout(0);
+        wgpu::BindGroupLayout auto_bgl = compute ? resolve(compute_pipelines.find(pipeline_id)->second).GetBindGroupLayout(0)
+                                                 : resolve(render_pipelines.find(pipeline_id)->second).GetBindGroupLayout(0);
         wgpu::BindGroup group;
         if (auto_bgl) {
             RemapPicker picker(av, dyn, features.float32_filterable);
@@ -3487,10 +3641,30 @@ void NativeExecutor::wait_idle() {
 void NativeExecutor::attach_guest_memory(const GuestMemory& memory) { impl_->guest_mem = memory; }
 
 uint64_t NativeExecutor::frame_count() const { return impl_->frame_count; }
-const ExecutorStats& NativeExecutor::stats() const { return impl_->stats; }
+void NativeExecutor::Impl::snapshot_blob_stats() {
+    const BlobCacheStats b = blob_cache.stats();
+    stats.blob_cache_enabled = b.enabled;
+    stats.blob_cache_dir = b.dir;
+    stats.blob_hits = b.hits;
+    stats.blob_misses = b.misses;
+    stats.blob_stores = b.stores;
+    stats.blob_bytes_loaded = b.bytes_loaded;
+    stats.blob_bytes_stored = b.bytes_stored;
+    stats.blob_evictions = b.evictions;
+    stats.blob_corrupt = b.corrupt;
+    stats.blob_entries = b.entries;
+    stats.blob_total_bytes = b.total_bytes;
+    stats.blob_max_bytes = b.max_bytes;
+}
+
+const ExecutorStats& NativeExecutor::stats() const {
+    impl_->snapshot_blob_stats();
+    return impl_->stats;
+}
 const AdapterDescription& NativeExecutor::adapter() const { return impl_->adapter; }
 
 std::string NativeExecutor::stats_json() const {
+    impl_->snapshot_blob_stats();
     const ExecutorStats& st = impl_->stats;
     std::string j = "{";
     auto num = [&](const char* k, uint64_t v) {
@@ -3554,6 +3728,10 @@ std::string NativeExecutor::stats_json() const {
     num("timer_frames_skipped", st.timer_frames_skipped);
     num("timer_supported", st.timer_supported ? 1 : 0);
     num("limits_raised", st.limits_raised ? 1 : 0);
+    num("async_pipelines", st.async_pipelines);
+    num("async_pipeline_waits", st.async_pipeline_waits);
+    num("async_pipeline_wait_ns", st.async_pipeline_wait_ns);
+    num("async_pipeline_failures", st.async_pipeline_failures);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
         j += "\"";
@@ -3583,7 +3761,31 @@ std::string NativeExecutor::stats_json() const {
     table("unhandled", st.unhandled);
     j += ", ";
     table("packet_errors_by_opcode", st.packet_errors_by_opcode);
-    j += ", \"adapter\": {\"backend\": \"" + impl_->adapter.backend + "\"}";
+    {
+        // Persistent Dawn blob cache (blob_cache.h): hits are shader / pipeline compiles a previous run
+        // already paid for; misses were compiled now (and stored).
+        std::string dir;
+        for (char c : st.blob_cache_dir) {
+            if (c == '"' || c == '\\') dir += '\\';
+            dir += c;
+        }
+        j += ", \"blob_cache\": {\"enabled\": ";
+        j += st.blob_cache_enabled ? "true" : "false";
+        j += ", \"dir\": \"" + dir + "\"";
+        auto bn = [&](const char* k, uint64_t v) { j += std::string(", \"") + k + "\": " + std::to_string(v); };
+        bn("hits", st.blob_hits);
+        bn("misses", st.blob_misses);
+        bn("stores", st.blob_stores);
+        bn("bytes_loaded", st.blob_bytes_loaded);
+        bn("bytes_stored", st.blob_bytes_stored);
+        bn("evictions", st.blob_evictions);
+        bn("corrupt", st.blob_corrupt);
+        bn("entries", st.blob_entries);
+        bn("total_bytes", st.blob_total_bytes);
+        bn("max_bytes", st.blob_max_bytes);
+        j += "}, ";
+    }
+    j += "\"adapter\": {\"backend\": \"" + impl_->adapter.backend + "\"}";
     j += ", \"device_error_log\": [";
     for (size_t i = 0; i < st.device_error_log.size(); ++i) {
         if (i) j += ", ";

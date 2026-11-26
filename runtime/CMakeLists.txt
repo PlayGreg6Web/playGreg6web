@@ -517,6 +517,9 @@ else()
     add_executable(test_native_exec_model ../tests/test_native_exec_model.cpp)
     target_link_libraries(test_native_exec_model PRIVATE playgta6_core)
     add_test(NAME test_native_exec_model COMMAND test_native_exec_model)
+    add_executable(test_blob_cache ../tests/test_blob_cache.cpp)
+    target_link_libraries(test_blob_cache PRIVATE playgta6_core)
+    add_test(NAME test_blob_cache COMMAND test_blob_cache)
 
     # Native WebGPU executor (docs/NATIVE_EXECUTOR_DESIGN.md): consumes the packet stream with Dawn,
     # the WebGPU implementation inside Chrome (BSD-3-Clause). Off by default; when on, the official
@@ -551,6 +554,7 @@ else()
             gpu/native_exec/native_window.cpp
         )
         target_include_directories(playgta6_native_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(playgta6_native_exec PRIVATE PG6_DAWN_COMMIT="${_pg6_dawn_commit}")
         target_link_libraries(playgta6_native_exec PUBLIC dawn::webgpu_dawn PRIVATE playgta6_core)  # PRIVATE: gpu/gpu_time.cpp (the GPU-time table the boot report prints)
 
         # `playgta6_boot --window`: the live packet stream goes to the executor (gpu/native_exec/live_pump.h).

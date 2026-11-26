@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -955,6 +956,52 @@ void test_blit() {
     }
 }
 
+// Live-mode options: pipelines are created asynchronously (awaited at first use, same output) and
+// Dawn's compiled blobs persist in an on-disk cache that a second executor reuses.
+void test_async_pipelines_and_blob_cache() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "pg6_native_exec_blob_test";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.blob_cache_root = root.string();
+    opts.blob_cache_title = "native-exec-test";
+    opts.async_pipelines = true;
+    uint64_t first_stores = 0;
+    for (int run_index = 0; run_index < 2; ++run_index) {
+        NativeExecutor::CreateStatus status;
+        std::string error;
+        auto ex = NativeExecutor::create(opts, &status, &error);
+        if (!ex) {
+            CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+            return;
+        }
+        CHECK(ex->stats().blob_cache_enabled);
+        test_textured_draw(*ex);  // checks the frame pixels: async creation must not change output
+        test_compute(*ex);
+        test_auto_layout_remap(*ex);
+        ex->wait_idle();
+        const ExecutorStats& st = ex->stats();
+        CHECK(st.async_pipelines > 0);
+        CHECK(st.async_pipeline_failures == 0);
+        CHECK(st.device_errors == 0);
+        CHECK(ex->stats_json().find("\"blob_cache\": {\"enabled\": true") != std::string::npos);
+        std::printf("blob cache run %d: hits=%llu misses=%llu stores=%llu entries=%llu bytes=%llu (async waits %llu)\n",
+                    run_index, static_cast<unsigned long long>(st.blob_hits), static_cast<unsigned long long>(st.blob_misses),
+                    static_cast<unsigned long long>(st.blob_stores), static_cast<unsigned long long>(st.blob_entries),
+                    static_cast<unsigned long long>(st.blob_total_bytes), static_cast<unsigned long long>(st.async_pipeline_waits));
+        if (run_index == 0) {
+            first_stores = st.blob_stores;
+        } else if (first_stores > 0) {
+            // The backend wrote blobs the first time: the second device must be served from disk.
+            CHECK(st.blob_hits > 0);
+        }
+    }
+    fs::remove_all(root, ec);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -985,6 +1032,7 @@ int main() {
     CHECK(ex->stats().device_lost == 0);
     test_timers();
     test_blit();
+    test_async_pipelines_and_blob_cache();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

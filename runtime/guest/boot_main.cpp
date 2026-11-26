@@ -107,6 +107,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
+#include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
 #include "gpu/native_exec/native_executor.h"
 #endif
@@ -218,6 +219,9 @@ struct Options {
     bool audio_out = false;         // --audio-out: live WASAPI playback of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
+    std::string dawn_cache;         // --dawn-cache: Dawn blob cache root ("off" disables; default %LOCALAPPDATA%/playgta6/dawn-cache)
+    uint64_t dawn_cache_max_mb = 2048;  // --dawn-cache-max-mb: LRU cap of the title's cache directory (0 = unbounded)
+    bool no_async_pipelines = false;    // --no-async-pipelines: live executor creates pipelines synchronously
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
@@ -252,6 +256,7 @@ void usage() {
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
                  "                     [--dump-pipelines <dir outside the repo, or under work/>]\n"
                  "                     [--pipeline-warm-list <file|off>]\n"
+                 "                     [--dawn-cache <dir|off>] [--dawn-cache-max-mb N] [--no-async-pipelines]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
                  "                     [--bcpack-tables <file>]\n"
@@ -302,6 +307,10 @@ bool parse(int argc, char** argv, Options& o) {
             o.eager_gpu_objects = true;
         } else if (a == "--window") {
             o.window = true;
+        } else if (a == "--no-async-pipelines") {
+            o.no_async_pipelines = true;
+        } else if (a == "--dawn-cache-max-mb" && i + 1 < argc) {
+            o.dawn_cache_max_mb = std::strtoull(argv[++i], nullptr, 10);
         } else if (a == "--window-size" && i + 1 < argc) {
             unsigned w = 0, h = 0;
             if (std::sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w == 0 || h == 0) return false;
@@ -319,7 +328,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--input-script" || a == "--watch-gpu-va" ||
+                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--input-script" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
                    a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
@@ -331,6 +340,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--shader-pack" ? o.shader_pack
                                   : a == "--pipeline-warm-list" ? o.pipeline_warm_list
+                                  : a == "--dawn-cache" ? o.dawn_cache
                                   : a == "--input-script" ? o.input_script
                                   : a == "--watch-gpu-va" ? o.watch_gpu_va
                                   : a == "--user-age-group" ? o.user_age_group
@@ -820,6 +830,14 @@ bool start_live_window() {
     options.window = true;
     options.width = g_options.window_width;
     options.height = g_options.window_height;
+    // Persistent Dawn blob cache per title / Dawn build / adapter (repeat runs skip the DXC and driver
+    // compiles), and pipelines compiled on Dawn's worker threads while the pump keeps consuming packets.
+    if (g_options.dawn_cache != "off") {
+        options.blob_cache_root = g_options.dawn_cache.empty() ? ne::BlobCache::default_root() : g_options.dawn_cache;
+        options.blob_cache_title = g_options.name.empty() ? "title" : g_options.name;
+        options.blob_cache_max_bytes = g_options.dawn_cache_max_mb << 20;
+    }
+    options.async_pipelines = !g_options.no_async_pipelines;
     g_live.set_tick_hook(&live_title_tick, 250);
     g_live.set_finish_hook([](ne::NativeExecutor& exec) {
         std::lock_guard<std::mutex> lock(g_live_final_mutex);
