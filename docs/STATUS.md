@@ -3,18 +3,22 @@
 Short and kept current: update the numbers below whenever a PR changes them. Details live in the linked
 docs. No game files are in this repo; the executable and package stay outside (see [PLAY_LOCALLY.md](PLAY_LOCALLY.md)).
 
-## Play natively (Windows, Dawn executor)
+## Play natively (Windows, Dawn executor): the recommended way
 
 ```
 $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
-.\tools\play_native.ps1            # builds what is stale, opens a live window with audio and input
-.\tools\play_native.ps1 -FreshSetup  # new empty save dir so the setup screens appear
+.	ools\play_native.ps1 -FreshSetup  # new empty save dir so the setup screens appear
+.	ools\play_native.ps1              # later runs: builds what is stale, live window with audio and input
 ```
 
 - Env vars: `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `PLAYGTA6_NATIVE_SHADER_PACK` (else the newest `*.wgsl.pack`
-  under `work/` is picked and printed). Flags: `-MaxMs`, `-SaveDir`, `-InputScript`, `-NoBuild`, `-DryRun`.
+  under `work/` is picked and printed; the std pack is picked automatically). Flags: `-MaxMs`, `-SaveDir`,
+  `-InputScript`, `-NoBuild`, `-DryRun`.
 - Controls: keyboard and the first XInput pad; the key table is in [PLAY_LOCALLY.md](PLAY_LOCALLY.md)
   (Enter/Space = A, Backspace = B, WASD = left stick, arrows = D-pad, Esc = Menu). F11 toggles fullscreen.
+- The window scales per monitor DPI, keeps a minimum size, restores its last size and position, and the frame
+  is letterboxed into it (#1736, #1739). Timer resolution is raised and `[live]` fps telemetry is printed (#1743).
+- A persistent Dawn blob cache makes later starts faster (#1750). A live-mode stall is fixed (#1733).
 - Window title shows `fps | frame | draws/frame`. Close the window or press Ctrl+C to stop.
 - At a guest fault the window stays open on the last frame, titled `GUEST FAULT ...`, and the console prints
   the `fault_report.py` output right away. Close the window to finish the report.
@@ -34,32 +38,36 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 
 ## How far the boot gets
 
-Setup screens, then loading, then the run **stops at about 64 s on the device-ID hard stop**
-(`XSystemGetAppSpecificDeviceId`, a trapping stub on purpose). Nothing past it has been seen.
+Setup screens, loading, then the Bink videos decode and play. A headless run reaches about 110 s and
+**stops on `XSystemGetAppSpecificDeviceId`** (a trapping stub on purpose, an owner decision). Nothing past it
+has been seen. Music has not started yet; the audio probe counters in the boot report (#1737) are the way to
+diagnose that. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
 
-Pending owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them):
+Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). The decision
+brief recommends, and both are still pending:
 
-1. Whether `XUserGetTokenAndSignatureResult` (slot 25) answers with the offline HRESULT like slots 23/24 instead of trapping.
-2. What `XSystemGetAppSpecificDeviceId` returns, if anything (this is the current stop).
-3. Which HRESULT `XStoreAcquireLicenseForDurables` (slots 71/72) settles on long term.
-4. Any policy for the other XStore licence slots (20/21/22/65/68) if the boot reaches them.
+1. `XSystemGetAppSpecificDeviceId` answers with an error instead of a device id (recommended).
+2. `XUser` sign-in succeeds for an offline local user (recommended).
+
+Further open items: `XUserGetTokenAndSignatureResult` (slot 25) offline HRESULT, the long-term HRESULT of
+`XStoreAcquireLicenseForDurables` (slots 71/72), and the other XStore licence slots (20/21/22/65/68).
 
 ## Speed today
 
-- Native live window: about 40 to 55 fps.
+- Native live window: about 55 to 60 fps in the menus.
 - Native headless: about 58 fps.
-- These are rough, scene-dependent figures; refresh them from a boot report (`gpu_time_top.py`, window title).
+- Rough, scene-dependent figures; refresh them from a boot report (`gpu_time_top.py`, `[live]` lines, window title).
 
 ## Diagnostic tools
 
 | Tool | Use it for |
 |---|---|
 | `tools/fault_report.py <boot-report.json>` | Compact fault record: rip, lifted function, call stack, last dispatched entries |
-| `tools/triage_fault.py <boot-report.json> --pe <exe>` | Fault to recompiler explanation of the faulting indirect site and a fix category |
-| `tools/program_census.py` | Why shader programs cannot run, by reason and count ([PROGRAM_CENSUS.md](PROGRAM_CENSUS.md)) |
+| `tools/triage_fault.py <boot-report.json> --pe <exe>` | Fault to recompiler explanation of the faulting indirect site and a fix category (triage, #1688) |
+| `tools/program_census.py` | Why shader programs cannot run, by reason, count and unresolved binding kind ([PROGRAM_CENSUS.md](PROGRAM_CENSUS.md), #1738) |
 | `tools/gpu_time_top.py <boot-report.json>` | Top GPU-time pipelines from the report |
 | `tools/replay_compare.py` | Same capture through two builds, to prove identical rendering ([REPLAY_COMPARE.md](REPLAY_COMPARE.md)) |
-| `playgta6-recomp survey-jumps <exe>` | Census of unresolved indirect jumps ([INDIRECT_JUMP_SURVEY.md](INDIRECT_JUMP_SURVEY.md)) |
+| `playgta6-recomp survey-jumps <exe>` | Census of unresolved indirect jumps, classified; recorded targets extend reachability ([INDIRECT_JUMP_SURVEY.md](INDIRECT_JUMP_SURVEY.md), #1770) |
 | `playgta6-recomp opcode-census <exe>` | Instruction mix of the executable, to prioritise lifter work |
 
 Reports hold hashes, addresses and counts only, never game bytes.
