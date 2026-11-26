@@ -246,6 +246,7 @@ class GuestRangeView {
 public:
     GuestRangeView(uint64_t va, size_t len);
     const uint8_t* data() const { return data_; }
+    bool held() const { return hold_.owns_lock(); }  // the arena lock is held (false for window ranges)
 
 private:
     const uint8_t* data_ = nullptr;

@@ -6,6 +6,7 @@
 #include "gpu/texture_budget.h"
 #include "gpu/xbox_embedded_native.h"
 
+#include <optional>
 #include <algorithm>
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
@@ -1051,17 +1052,20 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // G68 (#663): inspect contiguous guest memory in place (zero allocation / copy when unchanged),
     // falling back to a segmented com::read_guest copy only when window slots are non-adjacent.
     std::vector<uint8_t> raw;
+    std::optional<com::GuestRangeView> view;  // arena lock held while src_data points into guest memory
     const uint8_t* src_data = nullptr;
     size_t src_size = 0;
     auto try_map_or_read = [&](uint64_t size) -> bool {
         if (size == 0) {
             return false;
         }
-        if (const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu_va, static_cast<size_t>(size)))) {
+        view.emplace(cpu_va, static_cast<size_t>(size));
+        if (const uint8_t* live = view->data()) {
             src_data = live;
             src_size = static_cast<size_t>(size);
             return true;
         }
+        view.reset();
         raw.resize(static_cast<size_t>(size));
         if (com::read_guest(cpu_va, raw.data(), raw.size())) {
             src_data = raw.data();
@@ -1147,6 +1151,14 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     if (unmarked && verify_marks && !any_window_slot_marked(cpu_va, primary_size)) {
         os::guest_window::note_verify_miss(cpu_va);
     }
+
+    // Past the check: the staging below runs long, so take a private copy and release the arena lock
+    // (a concurrent decommit must not fault the detile / upload reads).
+    if (view && view->held()) {
+        raw.assign(src_data, src_data + src_size);
+        src_data = raw.data();
+    }
+    view.reset();
 
     // Stage every placed subresource; only those whose texels changed since their last upload
     // are written (per-subresource dirty tracking), so one changed mip costs one upload. Inside a
@@ -2804,7 +2816,8 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
         const uint64_t len = std::min<uint64_t>(kProbeBytes, std::max<uint64_t>(1, resource_size_estimate(r->desc_)));
         // GPU-window addresses read their bytes from the CPU window (Device::register_gpu_alias).
         const uint64_t cpu = r->device_->cpu_address_for_gpu(r->gpu_va_);
-        const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(len)));
+        const com::GuestRangeView view(cpu, static_cast<size_t>(len));
+        const uint8_t* bytes = view.data();
         if (bytes == nullptr || all_zero_bytes(bytes, static_cast<size_t>(len))) {
             continue;
         }
@@ -2827,7 +2840,8 @@ TextureProbeTotals probe_texture_contents(size_t budget) {
         if (v.seen_data) {
             continue;
         }
-        const auto* bytes = static_cast<const uint8_t*>(com::guest_to_host(v.cpu, static_cast<size_t>(v.len)));
+        const com::GuestRangeView view(v.cpu, static_cast<size_t>(v.len));
+        const uint8_t* bytes = view.data();
         if (bytes == nullptr || all_zero_bytes(bytes, static_cast<size_t>(v.len))) {
             continue;
         }
@@ -2918,7 +2932,9 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
         return;
     }
     const uint64_t size = shadow_size_;
-    const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu_va_, static_cast<size_t>(size)));
+    // Held for the whole compare / upload-copy below so a concurrent decommit cannot fault it.
+    const com::GuestRangeView view(cpu_va_, static_cast<size_t>(size));
+    const uint8_t* live = view.data();
     std::vector<uint8_t> copy;
     if (live == nullptr) {
         // Not mapped in one piece (e.g. an alias-window buffer whose pages are mapped one by one):
