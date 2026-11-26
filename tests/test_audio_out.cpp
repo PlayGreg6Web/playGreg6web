@@ -105,6 +105,10 @@ int main() {
         const std::string j = ao::report_json(false, 0, ao::Stats{}, "no \"device\"");
         CHECK(j.find("\"underruns\": 0") != std::string::npos);
         CHECK(j.find("\"device_open\": false") != std::string::npos);
+        CHECK(j.find("\"render_channels\": 2") != std::string::npos);
+        const std::string k = ao::report_json(true, 48000, ao::Stats{}, "", 6, 0x3F);
+        CHECK(k.find("\"device_channels\": 6") != std::string::npos);
+        CHECK(k.find("\"device_channel_mask\": 63") != std::string::npos);
     }
 
     if (g_failures == 0) std::printf("test_audio_out: all passed\n");

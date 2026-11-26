@@ -1504,7 +1504,9 @@ int main(int argc, char** argv) {
                 if (g_options.audio_out) {
                     o += ",\n  \"audio_out\": " + playgta6::os::audio_out::report_json(
                                                       g_audio_wasapi.open(), g_audio_wasapi.device_rate(),
-                                                      g_audio_feed.buffer().stats(), g_audio_out_error);
+                                                      g_audio_feed.buffer().stats(), g_audio_out_error,
+                                                      g_audio_wasapi.device_channels(),
+                                                      g_audio_wasapi.device_channel_mask());
                 }
             }
             if (s_with_presents) {

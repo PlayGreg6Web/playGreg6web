@@ -54,6 +54,13 @@ struct Wasapi::Impl {
         hr = client_->GetMixFormat(&mix);
         if (FAILED(hr) || !mix) return fail(err, "GetMixFormat failed", hr);
         const uint32_t dev_rate = mix->nSamplesPerSec ? mix->nSamplesPerSec : kSourceRate;
+        dev_channels_ = mix->nChannels;
+        dev_mask_ = 0;
+        if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix->cbSize >= 22) {
+            dev_mask_ = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix)->dwChannelMask;
+        } else if (mix->nChannels == 2) {
+            dev_mask_ = 0x3;
+        }
         CoTaskMemFree(mix);
         WAVEFORMATEX fmt = {};
         fmt.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
@@ -123,6 +130,8 @@ struct Wasapi::Impl {
     std::atomic<bool> running_{false};
     std::thread thread_;
     uint32_t device_rate_ = 0;
+    uint32_t dev_channels_ = 0;
+    uint32_t dev_mask_ = 0;
 
     bool start(Feed& feed, std::string* error) {
 #ifdef _WIN32
@@ -164,5 +173,7 @@ bool Wasapi::start(Feed& feed, std::string* error) { return impl_->start(feed, e
 void Wasapi::stop() { impl_->stop(); }
 bool Wasapi::open() const { return impl_->device_rate_ != 0; }
 uint32_t Wasapi::device_rate() const { return impl_->device_rate_; }
+uint32_t Wasapi::device_channels() const { return impl_->dev_channels_; }
+uint32_t Wasapi::device_channel_mask() const { return impl_->dev_mask_; }
 
 }  // namespace playgta6::os::audio_out

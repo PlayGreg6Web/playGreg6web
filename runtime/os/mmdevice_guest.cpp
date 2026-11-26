@@ -195,7 +195,9 @@ bool is_mix_format(uint64_t va) {
         return true;
     }
     WaveFormatExtensible x{};
-    return f.format_tag == 0xFFFE && com::read_guest(va, x) && x.sub_format == kSubtypeIeeeFloat;
+    // A 5.1/7.1 mask on a 2-channel format is not what we mix: only FL|FR (or unspecified) fits.
+    return f.format_tag == 0xFFFE && com::read_guest(va, x) && x.sub_format == kSubtypeIeeeFloat &&
+           (x.channel_mask == 0 || x.channel_mask == 0x3);
 }
 
 // ---------------------------------------------------------------------------

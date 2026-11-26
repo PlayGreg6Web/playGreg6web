@@ -165,10 +165,15 @@ private:
     uint32_t rate_ = kSourceRate;
 };
 
-inline std::string report_json(bool device_open, uint32_t device_rate, const Stats& s, const std::string& error) {
+inline std::string report_json(bool device_open, uint32_t device_rate, const Stats& s, const std::string& error,
+                        uint32_t device_channels = 0, uint32_t device_channel_mask = 0) {
     std::string o = "{\"enabled\": true, \"device_open\": ";
     o += device_open ? "true" : "false";
     o += ", \"device_rate\": " + std::to_string(device_rate);
+    // The device's real mix layout; we always render stereo into it (the engine up-mixes).
+    o += ", \"device_channels\": " + std::to_string(device_channels);
+    o += ", \"device_channel_mask\": " + std::to_string(device_channel_mask);
+    o += ", \"render_channels\": 2";
     o += ", \"frames_in\": " + std::to_string(s.frames_in);
     o += ", \"frames_played\": " + std::to_string(s.frames_played);
     o += ", \"underruns\": " + std::to_string(s.underruns);

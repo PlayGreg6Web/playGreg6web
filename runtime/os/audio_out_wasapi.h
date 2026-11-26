@@ -22,6 +22,8 @@ public:
     void stop();
     bool open() const;
     uint32_t device_rate() const;
+    uint32_t device_channels() const;
+    uint32_t device_channel_mask() const;
 
 private:
     struct Impl;

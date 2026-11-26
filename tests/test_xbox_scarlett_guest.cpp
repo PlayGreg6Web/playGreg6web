@@ -2338,6 +2338,18 @@ void audio_client_render_cycle(AudioFixture& fx) {
     const uint64_t fmt = load64(out);
     CHECK((load32(fmt) & 0xFFFF) == 0xFFFE && (load32(fmt) >> 16) == 2 && load32(fmt + 4) == 48000);
     CHECK(as_hr(fx.vcall(client, 7, {I(0), I(fmt), I(out)})) == 0 && load64(out) == 0);  // IsFormatSupported
+    {   // a 5.1 channel mask on the stereo format is not the endpoint's layout: S_FALSE + stereo closest
+        const uint64_t bad = com::guest_alloc(40);
+        uint8_t raw[40];
+        CHECK(com::read_guest(fmt, raw, sizeof(raw)));
+        const uint32_t mask51 = 0x3F;
+        std::memcpy(raw + 20, &mask51, 4);
+        CHECK(com::write_guest(bad, raw, sizeof(raw)));
+        CHECK(as_hr(fx.vcall(client, 7, {I(0), I(bad), I(out)})) == 1);
+        const uint64_t closest = load64(out);
+        CHECK(closest != 0 && load32(closest + 20) == 0x3);
+        pg6_win32_co_task_mem_free(closest);
+    }
     const uint64_t periods = com::guest_alloc(16);
     CHECK(as_hr(fx.vcall(client, 9, {I(periods), I(periods + 8)})) == 0 && load64(periods) == 100000);
 
