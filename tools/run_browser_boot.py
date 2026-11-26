@@ -28,7 +28,7 @@ What it does, in order:
    - `runtime_configure` / `runtime_lib`: Release PIC `libplaygta6_core.a` built via
      `emcmake cmake` (`-sMEMORY64=1 -pthread -fPIC`) when missing or older than `runtime/`.
    - `guest_wasm`: `python tools/build_guest_wasm.py <boot-dir> --out-dir <out-dir> ...`
-     with the proven asymmetric split flags (`--split-modules 2 --split-strategy asymmetric
+     with the capped split flags (`--split-modules 2 --split-strategy capped
      --link-guest-boot --browser-boot-exports --proxy-to-pthread --strip --no-link-opt`)
      when `runtime.wasm`/`runtime.js` is missing or stale.
    - Optional `--shader-pack FILE`: atomically stages `<pack>` and any sibling
@@ -721,7 +721,7 @@ def make_build_plan(
                 ],
             )
 
-    # Stage 3: Guest Wasm64 + asymmetric split side modules via build_guest_wasm.py
+    # Stage 3: Guest Wasm64 + capped split side modules via build_guest_wasm.py
     runtime_wasm = out_dir / "runtime.wasm"
     runtime_js = out_dir / "runtime.js"
     build_guest_script = repo / "tools" / "build_guest_wasm.py"
@@ -753,7 +753,7 @@ def make_build_plan(
             "--split-modules",
             "2",
             "--split-strategy",
-            "asymmetric",
+            "capped",
             "--proxy-to-pthread",
             "--strip",
             "--no-link-opt",

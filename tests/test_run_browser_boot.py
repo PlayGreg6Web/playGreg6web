@@ -301,7 +301,7 @@ class DryRunAndStalenessTests(unittest.TestCase):
             self.assertNotIn("[plan]", err)
             self.assertIn("FIRST_PRESENT", out)
 
-    def test_full_staleness_plan_uses_proven_asymmetric_split_and_pic_flags(self):
+    def test_full_staleness_plan_uses_capped_split_and_pic_flags(self):
         with tempfile.TemporaryDirectory() as d:
             fx = RepoFixture(Path(d))
             plan, runtime_lib = rbb.make_build_plan(
@@ -339,7 +339,7 @@ class DryRunAndStalenessTests(unittest.TestCase):
             for expected_flag in (
                 "--split-modules",
                 "--split-strategy",
-                "asymmetric",
+                "capped",
                 "--link-guest-boot",
                 "--browser-boot-exports",
                 "--proxy-to-pthread",

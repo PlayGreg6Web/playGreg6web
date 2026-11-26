@@ -39,7 +39,7 @@ Stop: close the Chrome window or press Ctrl+C in the script's terminal (the serv
 ## Build recipe (issue #687, manual)
 `build-program --memory-model window-runs --indirect-dispatch shard --shard-size 2048 --shard-instructions 65536`;
 runtime lib via `emcmake cmake -S runtime -G Ninja -DCMAKE_BUILD_TYPE=Release` with
-`-sMEMORY64=1 -pthread -fwasm-exceptions -fPIC`; `tools/build_guest_wasm.py --split-modules 2 --split-strategy asymmetric
+`-sMEMORY64=1 -pthread -fwasm-exceptions -fPIC`; `tools/build_guest_wasm.py --split-modules 2 --split-strategy capped
 --wasm-exceptions --proxy-to-pthread --link-guest-boot --browser-boot-exports --pthread-pool-size 8`;
 shader pack via `playgta6-shaders pack-rdna2` + `tools/stage_reflection_sidecar.py`; then `tools/stage_browser_boot.py`.
 `run_browser_boot.py` does all of this for you.
