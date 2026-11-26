@@ -46,6 +46,8 @@
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --audio-dump <file.wav>  write the stereo float32 48 kHz mix (os/audio_downmix) to a WAV file, max 10 minutes
+//   --audio-out          play the stereo mix live (Windows WASAPI shared mode, default render endpoint);
+//                        off by default; no device = warning only; underruns are counted in the report
 //   --gpu-capture-frames <n>  frames to capture (default 10)
 //   --gpu-capture-thin-uploads <n>  with payloads: keep only every nth write of a texture/buffer > 4 MiB
 //   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
@@ -106,6 +108,8 @@
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/audio_report.h"
+#include "os/audio_out.h"
+#include "os/audio_out_wasapi.h"
 #include "os/audio_wav_dump.h"
 #include "os/bcpack.h"
 #include "os/os_shim.h"
@@ -202,6 +206,7 @@ struct Options {
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
     uint64_t profile_start_ms = 0;        // --profile-start-ms: sample only from this time on (a screen's window)
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
+    bool audio_out = false;         // --audio-out: live WASAPI playback of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
@@ -237,7 +242,7 @@ void usage() {
                  "                     [--dump-pipelines <dir outside the repo, or under work/>]\n"
                  "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
-                 "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
+                 "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
                  "                     [--bcpack-tables <file>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
@@ -288,6 +293,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.host_input = true;
         } else if (a == "--native-pipelines") {
             o.native_pipelines = true;
+        } else if (a == "--audio-out") {
+            o.audio_out = true;
         } else if (a == "-h" || a == "--help") {
             return false;
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
@@ -723,6 +730,16 @@ void finish_profile() {}
 
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
 playgta6::os::audio_wav_dump::Writer g_audio_dump;
+playgta6::os::audio_out::Feed g_audio_feed;
+playgta6::os::audio_out::Wasapi g_audio_wasapi;
+bool g_audio_out_active = false;  // device opened and feeding
+std::string g_audio_out_error;
+
+// --audio-dump and --audio-out share the single stereo sink slot.
+void audio_fanout_sink(void*, const float* stereo, uint32_t frames, uint32_t sample_rate) {
+    if (!g_options.audio_dump.empty()) g_audio_dump.append(stereo, frames, sample_rate);
+    if (g_audio_out_active) g_audio_feed.push(stereo, frames, sample_rate);
+}
 
 void write_outputs(bool print_summary) {
     finish_profile();
@@ -739,9 +756,13 @@ void write_outputs(bool print_summary) {
                      static_cast<unsigned long long>(heap.total_allocs),
                      static_cast<unsigned long long>(heap.total_frees));
     }
-    if (!g_options.audio_dump.empty()) {
+    if (!g_options.audio_dump.empty() || g_options.audio_out) {
         playgta6::os::audio_downmix::set_stereo_sink(nullptr, nullptr);
         g_audio_dump.close();
+    }
+    if (g_options.audio_out) {
+        g_audio_wasapi.stop();
+        g_audio_out_active = false;
     }
     if (!g_options.watch_gpu_va.empty()) {
         std::fprintf(stderr, "%s", gpu::va_watch::summary().c_str());
@@ -1213,6 +1234,11 @@ int main(int argc, char** argv) {
                 t.xma_blocks_written = xc.blocks_written;
                 t.xma_input_exhausted = xc.input_exhausted;
                 o += ",\n  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
+                if (g_options.audio_out) {
+                    o += ",\n  \"audio_out\": " + playgta6::os::audio_out::report_json(
+                                                      g_audio_wasapi.open(), g_audio_wasapi.device_rate(),
+                                                      g_audio_feed.buffer().stats(), g_audio_out_error);
+                }
             }
             if (s_with_presents) {
                 o += ",\n  \"presents\": " + gpu::frame_capture_presents_json();
@@ -1319,7 +1345,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[harness] cannot write %s\n", g_options.audio_dump.c_str());
             return kExitUsage;
         }
-        playgta6::os::audio_downmix::set_stereo_sink(&playgta6::os::audio_wav_dump::Writer::sink, &g_audio_dump);
+    }
+    if (g_options.audio_out) {
+        g_audio_out_active = g_audio_wasapi.start(g_audio_feed, &g_audio_out_error);
+        if (!g_audio_out_active) {
+            std::fprintf(stderr, "[harness] --audio-out: no audio device, continuing silent (%s)\n",
+                         g_audio_out_error.c_str());
+        }
+    }
+    if (!g_options.audio_dump.empty() || g_audio_out_active) {
+        playgta6::os::audio_downmix::set_stereo_sink(&audio_fanout_sink, nullptr);
     }
     if (!g_options.input_script.empty()) {
         std::ifstream in(g_options.input_script, std::ios::binary);

@@ -335,8 +335,11 @@ else()
     add_test(NAME playgta6_cpu_helpers_tests COMMAND test_cpu_helpers)
 
     # Native first-boot harness without lifted code (tools/build_native_boot.py links the full one).
-    add_executable(playgta6_boot guest/boot_main.cpp)
+    add_executable(playgta6_boot guest/boot_main.cpp os/audio_out_wasapi.cpp)
     target_link_libraries(playgta6_boot PRIVATE playgta6_core)
+    if(WIN32)
+        target_link_libraries(playgta6_boot PRIVATE ole32)
+    endif()
 
     add_executable(test_memory_budget ../tests/test_memory_budget.cpp)
     target_link_libraries(test_memory_budget PRIVATE playgta6_core)
@@ -406,6 +409,10 @@ else()
     add_executable(test_audio_wav_dump ../tests/test_audio_wav_dump.cpp)
     target_link_libraries(test_audio_wav_dump PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_wav_dump_tests COMMAND test_audio_wav_dump)
+
+    add_executable(test_audio_out ../tests/test_audio_out.cpp)
+    target_link_libraries(test_audio_out PRIVATE playgta6_core)
+    add_test(NAME playgta6_audio_out_tests COMMAND test_audio_out)
 
     add_executable(test_audio_report ../tests/test_audio_report.cpp)
     target_link_libraries(test_audio_report PRIVATE playgta6_core)
