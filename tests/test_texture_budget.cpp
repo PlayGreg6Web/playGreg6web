@@ -43,7 +43,7 @@ void test_pressure_tiers() {
     CHECK(cap_for_pressure(700, b, 256) == 256);        // the tighter of base and tier wins
     CHECK(cap_for_pressure(850, b, 512) == kTextureCapHigh);
     CHECK(cap_for_pressure(100, b, 1024) == 1024);
-    CHECK(cap_for_pressure(UINT64_MAX / 2, UINT64_MAX, 0) == kTextureCapMedium);  // no overflow
+    CHECK(cap_for_pressure(UINT64_MAX / 10 * 8, UINT64_MAX, 0) == kTextureCapMedium);  // no overflow
 }
 
 void test_tracker() {
