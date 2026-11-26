@@ -120,6 +120,7 @@
 #include "os/guest_heap.h"
 #include "os/host_sleep.h"
 #include "guest/boot.h"
+#include "guest/minidump.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/audio_report.h"
@@ -244,11 +245,13 @@ struct Options {
     bool entry = true;
     bool quiet = false;
     std::string record_indirect_targets;  // --record-indirect-targets <file>
+    bool dump_on_fault = false;  // --dump-on-fault: also write a minidump on a guest fault
     bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
 
 Options g_options;
+std::string g_minidump_path;  // set once a fault minidump was written (recorded in fault_record)
 std::atomic<bool> g_finishing{false};
 int g_result = 0;
 
@@ -258,7 +261,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet] [--no-fault-record] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages]\n"
+                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
@@ -298,6 +301,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.entry = false;
         } else if (a == "--quiet") {
             o.quiet = true;
+        } else if (a == "--dump-on-fault") {
+            o.dump_on_fault = true;
         } else if (a == "--no-fault-record") {
             o.fault_record = false;
         } else if (a == "--no-present-pacing") {
@@ -1022,7 +1027,15 @@ void write_outputs(bool print_summary) {
         }
         std::fprintf(stderr, "[harness] pipeline dump written to %s\n", g_options.dump_pipelines.c_str());
     }
-    const std::string report = guest::last_report_json();
+    std::string report = guest::last_report_json();
+#ifdef _WIN32
+    if (g_options.dump_on_fault && g_minidump_path.empty() && report.find("\"fault_record\": {") != std::string::npos) {
+        const std::string path = guest::minidump::select_path(g_options.report, "guest", "fault",
+                                                              static_cast<uint32_t>(GetCurrentProcessId()));
+        if (guest::minidump::write(path, nullptr)) g_minidump_path = path;
+    }
+#endif
+    report = guest::minidump::annotate_report(report, g_minidump_path);
     const std::string summary = guest::last_summary();
     write_text(g_options.report, report);
     write_text(g_options.summary, summary);
@@ -1155,6 +1168,15 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
     }
     const uint64_t pc = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
     print_host_stack_hint(info->ContextRecord->Rsp);
+    if (code != EXCEPTION_BREAKPOINT && !g_finishing.load()) {
+        const std::string path = guest::minidump::select_path(g_options.report, "host", kind,
+                                                              static_cast<uint32_t>(GetCurrentProcessId()));
+        if (guest::minidump::write(path, info)) {
+            g_minidump_path = path;
+            std::fprintf(stderr, "[host-stack] minidump written to %s
+", path.c_str());
+        }
+    }
     host_fault(kind, address, pc, kExitHostFault);
 }
 
