@@ -117,7 +117,7 @@ Build once (hours the first time, incremental after; never starts Chrome), then 
 .\tools\update_prebuilt.ps1 -Web          # builds into a temp dir, swaps it in atomically on success
 .\tools\play_local.ps1 -Prebuilt         # never builds; prints the source commit and how far behind origin/main it is
 ```
-The directory is `-PrebuiltDir`, else `$env:PLAYGTA6_PREBUILT_WEB_DIR`, else `%LOCALAPPDATA%\playgta6\prebuilt-web`; it holds
+The directory is `-Dir` (update) / `-PrebuiltDir` (play), else `$env:PLAYGTA6_PREBUILT_WEB_DIR`, else `%LOCALAPPDATA%\playgta6\prebuilt-web`; it holds
 `web/`, `boot/`, `build/` (staged shader pack, caches) and `prebuilt.json` (the source commit). It reuses the lift cache and
 the previous object cache, so refreshes are incremental. `tools/run_browser_boot.py --build-only` runs just the build stages
 (no server, no Chrome); `--web-dir` serves a web root other than `<repo>/web`.
