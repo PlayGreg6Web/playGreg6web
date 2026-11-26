@@ -183,6 +183,40 @@ public:
             *width = *height = 0;
         }
     }
+    bool apply_action(const WindowAction& a) override {
+        if (!hwnd_ || closed_) return false;
+        switch (a.kind) {
+            case WindowActionKind::Resize: {
+                if (fullscreen_) toggle_fullscreen();
+                if (IsIconic(hwnd_) || IsZoomed(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+                const UINT dpi = dpi_of(hwnd_);
+                RECT r{0, 0, static_cast<LONG>(a.w), static_cast<LONG>(a.h)};  // physical client pixels
+                adjust_rect_for_dpi(&r, WS_OVERLAPPEDWINDOW, dpi);
+                return SetWindowPos(hwnd_, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+                                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) != 0;
+            }
+            case WindowActionKind::Minimize:
+                ShowWindow(hwnd_, SW_MINIMIZE);
+                return true;
+            case WindowActionKind::Restore:
+                ShowWindow(hwnd_, SW_RESTORE);
+                return true;
+            case WindowActionKind::Maximize:
+                if (fullscreen_) toggle_fullscreen();
+                ShowWindow(hwnd_, SW_MAXIMIZE);
+                return true;
+            case WindowActionKind::Fullscreen:
+                if (IsIconic(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+                if (!fullscreen_) toggle_fullscreen();
+                return fullscreen_;
+            case WindowActionKind::Windowed:
+                if (fullscreen_) toggle_fullscreen();
+                return !fullscreen_;
+            case WindowActionKind::Probe:
+                break;
+        }
+        return false;
+    }
     void* native_instance() const override { return instance_; }
     void* native_handle() const override { return hwnd_; }
 

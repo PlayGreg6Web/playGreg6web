@@ -7,6 +7,7 @@
 #include <string>
 
 #include "gpu/native_exec/window_layout.h"
+#include "gpu/native_exec/window_script.h"
 
 namespace playgta6::gpu::native_exec {
 
@@ -36,6 +37,9 @@ public:
         client_size(&w, &h);
         return letterbox_rect(src_w, src_h, w, h);
     }
+    // Test hook (--window-script): performs a resize / minimize / restore / maximize / fullscreen action
+    // on the window thread. False when the host cannot (default). Probe is not a window action.
+    virtual bool apply_action(const WindowAction&) { return false; }
     // Native handles for the WebGPU surface (Win32: HINSTANCE, HWND).
     virtual void* native_instance() const = 0;
     virtual void* native_handle() const = 0;

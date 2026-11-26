@@ -56,6 +56,7 @@
 //   --gpu-capture-start-at-script  start the capture's frames at the input script's `capture` step
 //   --live-digest <file>  (with --window, tools/live_vs_replay.py) per-frame replay digests of the live executor
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
+//   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
 //                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.
 //                        Only in builds with -DPLAYGTA6_NATIVE_EXECUTOR=ON. Works together with
@@ -227,6 +228,7 @@ struct Options {
     bool audio_out = false;         // --audio-out: live WASAPI playback of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
+    std::string window_script;      // --window-script <script>
     std::string live_digest;        // --live-digest <file>: per-frame replay digests from the live executor
     std::string dawn_cache;         // --dawn-cache: Dawn blob cache root ("off" disables; default %LOCALAPPDATA%/playgta6/dawn-cache)
     uint64_t dawn_cache_max_mb = 2048;  // --dawn-cache-max-mb: LRU cap of the title's cache directory (0 = unbounded)
@@ -355,7 +357,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--input-script" || a == "--record-input" || a == "--watch-gpu-va" ||
+                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--window-script" || a == "--input-script" || a == "--record-input" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
                    a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
@@ -369,6 +371,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--pipeline-warm-list" ? o.pipeline_warm_list
                                   : a == "--dawn-cache" ? o.dawn_cache
                                   : a == "--live-digest" ? o.live_digest
+                                  : a == "--window-script" ? o.window_script
                                   : a == "--input-script" ? o.input_script
                                   : a == "--record-input" ? o.record_input
                                   : a == "--watch-gpu-va" ? o.watch_gpu_va
@@ -873,6 +876,9 @@ bool start_live_window() {
     options.async_pipelines = !g_options.no_async_pipelines;
     options.gpu_validation = g_options.gpu_validation;
     options.frame_digest_path = g_options.live_digest;
+    options.window_script = g_options.window_script;
+    // The guest renders at a fixed resolution: a window resize letterboxes the stream instead of stretching it.
+    options.fixed_stream_size = true;
     g_live.set_tick_hook(&live_title_tick, 250);
     g_live.set_finish_hook([](ne::NativeExecutor& exec) {
         std::lock_guard<std::mutex> lock(g_live_final_mutex);

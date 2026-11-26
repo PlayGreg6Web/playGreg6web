@@ -28,6 +28,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/blit_model.h"
+#include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
@@ -458,6 +459,10 @@ struct NativeExecutor::Impl {
     wgpu::TextureFormat swap_format = wgpu::TextureFormat::BGRA8Unorm;  // Chrome's preferred canvas format on Windows
     uint32_t swap_width = 0, swap_height = 0;  // the canvas (surface / offscreen texture) size
     bool surface_configured = false;
+    SurfaceState surface_state;  // reconfigure state machine (window_script.h)
+    WindowScriptRunner script;
+    uint64_t script_start_ns = 0;
+    bool probe_pending = false;
     wgpu::Texture offscreen;
     // The stream's own render target (WgpuSwapchain `_streamFormat` + intermediate texture): used when the
     // stream format is not a canvas format, or the stream size differs from the canvas size. Presenting
@@ -609,6 +614,14 @@ struct NativeExecutor::Impl {
         if (!options.window && options.present_width && options.present_height) {
             swap_width = options.present_width;  // headless canvas of its own size: the stream is blitted into it
             swap_height = options.present_height;
+        }
+        if (!options.window_script.empty()) {
+            std::vector<TimedWindowAction> actions;
+            if (!parse_window_script(options.window_script, &actions, error)) {
+                *status = CreateStatus::Failed;
+                return false;
+            }
+            script.set(std::move(actions));
         }
         if (options.window) {
             window = NativeWindow::create(options.title, swap_width, swap_height, error);
@@ -916,7 +929,7 @@ struct NativeExecutor::Impl {
         cfg.device = device;
         cfg.format = swap_format;
         cfg.usage = wgpu::TextureUsage::RenderAttachment;
-        if (!options.frame_digest_path.empty()) cfg.usage |= wgpu::TextureUsage::CopySrc;
+        if (!options.frame_digest_path.empty() || !options.window_script.empty()) cfg.usage |= wgpu::TextureUsage::CopySrc;
         cfg.width = w;
         cfg.height = h;
         cfg.alphaMode = wgpu::CompositeAlphaMode::Opaque;  // the worker's DEFAULT_ALPHA_MODE
@@ -929,6 +942,8 @@ struct NativeExecutor::Impl {
             stream_h = h;
         }
         surface_configured = true;
+        surface_state.on_configured(w, h);
+        ++stats.surface_configures;
     }
 
     bool blit_active() const {
@@ -1044,8 +1059,12 @@ struct NativeExecutor::Impl {
         stream_format = f;
         if (f == swap_format) return;
         swap_format = f;
-        if (surface) surface_configured = false;
-        else create_offscreen();
+        if (surface) {
+            surface_configured = false;
+            surface_state.invalidate();
+        } else {
+            create_offscreen();
+        }
     }
 
     // ---- packets ----
@@ -3058,6 +3077,7 @@ struct NativeExecutor::Impl {
         wgpu::Texture texture;
         wgpu::TextureView view;  // what the stream renders into (the canvas, or the intermediate texture)
         wgpu::TextureView canvas_view;  // the canvas the frame is presented to
+        wgpu::Texture canvas_texture;   // its texture (the probe reads it back); empty headless
         bool blit = false;  // view is the intermediate texture: Present blits it into canvas_view
         bool written = false;  // the render target starts each frame as transparent black
     };
@@ -3088,26 +3108,50 @@ struct NativeExecutor::Impl {
     bool acquire_canvas(FrameTarget* t) {
         if (!surface) {
             t->texture = offscreen;
+            t->canvas_texture = offscreen;
             t->canvas_view = offscreen.CreateView();
             return true;
         }
         uint32_t w = 0, h = 0;
         window->client_size(&w, &h);
-        if (w == 0 || h == 0) return false;  // minimized
-        if (!surface_configured || w != swap_width || h != swap_height) configure_surface(w, h);
+        const SurfacePlan plan = surface_state.plan(w, h);
+        if (plan == SurfacePlan::SkipMinimized) {
+            ++stats.surface_minimized_skips;  // the frame is dropped; the surface keeps its configuration
+            return false;
+        }
+        if (plan == SurfacePlan::Configure || !surface_configured) configure_surface(w, h);
         for (int attempt = 0; attempt < 2; ++attempt) {
             wgpu::SurfaceTexture st;
             surface.GetCurrentTexture(&st);
-            if (st.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
-                st.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
-                t->texture = st.texture;
-                t->canvas_view = st.texture.CreateView();
-                return true;
+            AcquireStatus as = AcquireStatus::Error;
+            switch (st.status) {
+                case wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal: as = AcquireStatus::Optimal; break;
+                case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal: as = AcquireStatus::Suboptimal; break;
+                case wgpu::SurfaceGetCurrentTextureStatus::Timeout: as = AcquireStatus::Timeout; break;
+                case wgpu::SurfaceGetCurrentTextureStatus::Outdated: as = AcquireStatus::Outdated; break;
+                case wgpu::SurfaceGetCurrentTextureStatus::Lost: as = AcquireStatus::Lost; break;
+                case wgpu::SurfaceGetCurrentTextureStatus::Error: as = AcquireStatus::Error; break;
+                default: as = AcquireStatus::Error; break;
             }
-            if (st.status != wgpu::SurfaceGetCurrentTextureStatus::Outdated &&
-                st.status != wgpu::SurfaceGetCurrentTextureStatus::Lost)
-                return false;
-            configure_surface(w, h);
+            switch (surface_state.on_acquire(as, attempt)) {
+                case AcquireNext::Use:
+                    t->texture = st.texture;
+                    t->canvas_texture = st.texture;
+                    t->canvas_view = st.texture.CreateView();
+                    return true;
+                case AcquireNext::Reconfigure:
+                    ++stats.surface_acquire_retries;
+                    window->client_size(&w, &h);  // the size may have changed since the plan
+                    if (w == 0 || h == 0) {
+                        ++stats.surface_minimized_skips;
+                        return false;
+                    }
+                    configure_surface(w, h);
+                    break;
+                case AcquireNext::Drop:
+                case AcquireNext::Fatal:
+                    return false;
+            }
         }
         return false;
     }
@@ -3980,6 +4024,31 @@ struct NativeExecutor::Impl {
             e.enc.CopyTextureToBuffer(&src, &dst, &extent);
         }
         if (target.blit) encode_blit(e.enc, target.canvas_view);
+        wgpu::Buffer probe_buf;
+        uint32_t probe_row = 0, probe_w = 0, probe_h = 0;
+        PresentRect probe_rect;
+        if (probe_pending && surface && target.canvas_texture) {
+            probe_pending = false;
+            if (format_bytes(swap_format) == 4) {
+                probe_w = swap_width;
+                probe_h = swap_height;
+                probe_row = (probe_w * 4 + 255u) & ~255u;
+                probe_rect = target.blit ? window->present_rect(stream_w, stream_h)
+                                         : PresentRect{0, 0, probe_w, probe_h};
+                wgpu::BufferDescriptor bd{};
+                bd.size = uint64_t{probe_row} * probe_h;
+                bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+                probe_buf = device.CreateBuffer(&bd);
+                wgpu::TexelCopyTextureInfo src{};
+                src.texture = target.canvas_texture;
+                wgpu::TexelCopyBufferInfo dst{};
+                dst.buffer = probe_buf;
+                dst.layout.bytesPerRow = probe_row;
+                dst.layout.rowsPerImage = probe_h;
+                wgpu::Extent3D extent{probe_w, probe_h, 1};
+                e.enc.CopyTextureToBuffer(&src, &dst, &extent);
+            }
+        }
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
         const uint64_t tp1 = now_ns();
@@ -3988,6 +4057,7 @@ struct NativeExecutor::Impl {
         timer_collect(e);
         start_recorded_readbacks(true);
         if (digest_buf) write_frame_digest(digest_buf, digest_padded_row, digest_w, digest_h, digest_format);
+        if (probe_buf) run_probe(probe_buf, probe_row, probe_w, probe_h, probe_rect, target.blit);
         ++frame_count;
         ++stats.frames_submitted;
         const uint64_t tp2 = now_ns();
@@ -3998,6 +4068,49 @@ struct NativeExecutor::Impl {
         frame_target.reset();
         early_flushed = false;
         reset_frame_state();
+    }
+
+    // --window-script `probe`: the presented canvas (after the blit) is read back and the letterbox bars
+    // must be black with a lit picture inside the present rect.
+    void run_probe(wgpu::Buffer& buf, uint32_t padded_row, uint32_t w, uint32_t h, const PresentRect& r, bool blitted) {
+        std::string err;
+        const uint64_t size = uint64_t{padded_row} * h;
+        ++stats.probes;
+        if (!map_read(buf, size, &err)) {
+            ++stats.probes_failed;
+            std::fprintf(stderr, "[native_exec] window probe: %s\n", err.c_str());
+            return;
+        }
+        const auto* mapped = static_cast<const uint8_t*>(buf.GetConstMappedRange(0, static_cast<size_t>(size)));
+        const LetterboxProbe p = probe_letterbox(mapped, padded_row, w, h, r);
+        buf.Unmap();
+        if (!p.ok()) ++stats.probes_failed;
+        std::fprintf(stderr,
+                     "[native_exec] window probe %s: canvas %ux%u stream %ux%u blit=%d rect %d,%d %ux%u bars %llu nonblack %llu "
+                     "inner %llu nonblack %llu\n",
+                     p.ok() ? (p.blank() ? "OK(blank picture)" : "OK") : "FAIL", w, h, stream_w, stream_h, blitted ? 1 : 0, r.x, r.y, r.w, r.h,
+                     static_cast<unsigned long long>(p.bar_pixels), static_cast<unsigned long long>(p.bar_nonblack),
+                     static_cast<unsigned long long>(p.inner_pixels), static_cast<unsigned long long>(p.inner_nonblack));
+    }
+
+    // Drives the --window-script from poll(): actions come due relative to the first presented frame.
+    void run_window_script() {
+        if (script.finished() || !window) return;
+        if (frame_count == 0) return;
+        if (!script_start_ns) script_start_ns = now_ns();
+        const uint64_t elapsed_ms = (now_ns() - script_start_ns) / 1000000;
+        WindowAction a;
+        while (script.pop_due(elapsed_ms, &a)) {
+            if (a.kind == WindowActionKind::Probe) {
+                probe_pending = true;
+                continue;
+            }
+            const bool ok = window->apply_action(a);
+            ++stats.window_actions;
+            std::fprintf(stderr, "[native_exec] window script @%llu ms: action %d %ux%u -> %s\n",
+                         static_cast<unsigned long long>(elapsed_ms), static_cast<int>(a.kind), a.w, a.h,
+                         ok ? "ok" : "failed");
+        }
     }
 
     // frame_digest_path: the replay digest of the frame just submitted (see ExecutorOptions).
@@ -4130,6 +4243,7 @@ bool NativeExecutor::poll() {
     const uint64_t t0 = Impl::now_ns();
     impl_->instance.ProcessEvents();
     const bool open = impl_->window ? impl_->window->pump() : true;
+    impl_->run_window_script();
     impl_->stats.ns_poll += Impl::now_ns() - t0;
     return open;
 }
@@ -4204,6 +4318,12 @@ std::string NativeExecutor::stats_json() const {
     num("render_pass_dropped_colors", st.render_pass_dropped_colors);
     num("swapchain_format_unsupported", st.swapchain_format_unsupported);
     num("blit_frames", st.blit_frames);
+    num("surface_configures", st.surface_configures);
+    num("surface_minimized_skips", st.surface_minimized_skips);
+    num("surface_acquire_retries", st.surface_acquire_retries);
+    num("window_actions", st.window_actions);
+    num("probes", st.probes);
+    num("probes_failed", st.probes_failed);
     num("packet_errors", st.packet_errors);
     num("shader_modules", st.shader_modules);
     num("shader_pack_hits", st.shader_pack_hits);

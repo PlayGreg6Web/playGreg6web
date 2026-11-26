@@ -40,6 +40,9 @@ struct ExecutorOptions {
     uint32_t present_width = 0;
     uint32_t present_height = 0;
     bool fixed_stream_size = false;
+    // Test hook (--window-script, window_script.h): timed resize / minimize / restore / fullscreen
+    // actions and read-back probes driven from poll(), counted from the first presented frame.
+    std::string window_script;
     // GPU pass timestamps (#1608): measured with timestamp queries when the adapter has the
     // feature and fed into this table (nullptr = the process-wide gpu_time_table(), the one the
     // boot report prints). Nothing is estimated: without the feature the table says unavailable.
@@ -90,6 +93,12 @@ struct ExecutorStats {
     uint64_t render_pass_dropped_colors = 0;   // attachments dropped for a size mismatch
     uint64_t swapchain_format_unsupported = 0;  // stream asked for a swapchain format that is no colour format
     uint64_t blit_frames = 0;  // frames presented through the intermediate texture + blit
+    uint64_t surface_configures = 0;         // surface (re)configurations (resize, format change, lost surface)
+    uint64_t surface_minimized_skips = 0;    // presents skipped because the client area was empty (minimized)
+    uint64_t surface_acquire_retries = 0;    // acquires retried after Outdated / Lost / Error
+    uint64_t window_actions = 0;             // --window-script actions applied
+    uint64_t probes = 0;                     // letterbox probes run
+    uint64_t probes_failed = 0;              // ... whose bars were not black or whose picture was blank
     // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`
     // (a v2 / texture packet it rejects); op errors above are its `_recordOpValidationError`.
     uint64_t packet_errors = 0;
