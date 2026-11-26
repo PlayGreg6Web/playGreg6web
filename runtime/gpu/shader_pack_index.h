@@ -17,7 +17,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <functional>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace playgta6::gpu {
 
@@ -58,5 +61,27 @@ bool parse_shader_pack_index(const uint8_t* data, size_t size, ShaderPackIndex* 
 
 // The hash-only CreateShaderModule code for a pack key ("0x" + 16 lowercase hex digits).
 std::string pack_key_code(uint64_t key);
+
+// Deterministic CreateShaderModule ids for pack modules. A pack key's id is kPackModuleIdBase + its rank
+// among the pack's keys in ascending order, so it does not depend on which thread (the pipeline prewarm
+// thread or the title) reaches the module first: captures of two runs carry the same module ids.
+// Ids below kPackModuleIdBase belong to the Device's sequential allocator.
+inline constexpr uint32_t kPackModuleIdBase = 0x40000000u;
+
+class PackModuleTable {
+public:
+    explicit PackModuleTable(const ShaderPackIndex& pack);
+    // Id of `key`'s module, building it with `create(id)` exactly once (the first caller runs it, a
+    // concurrent caller waits and gets the same id). 0 when `key` is not a pack key.
+    uint32_t get_or_create(uint64_t key, const std::function<void(uint32_t id)>& create);
+    // Deterministic id of `key` without creating it; 0 when not a pack key.
+    uint32_t id_of(uint64_t key) const;
+    size_t created() const;
+
+private:
+    std::unordered_map<uint64_t, uint32_t> ids_;
+    mutable std::mutex mutex_;
+    std::unordered_set<uint64_t> built_;
+};
 
 }  // namespace playgta6::gpu

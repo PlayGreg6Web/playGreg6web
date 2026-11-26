@@ -2,6 +2,9 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <thread>
+#include <atomic>
+#include "gpu/shader_pack_index.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -90,6 +93,46 @@ void test_pack_filter() {
     CHECK(added == 1);
     CHECK(q.progress().skipped == 2);
     CHECK(q.load_warm_list(bytes.data(), bytes.size(), nullptr, &added) && added == 0);
+}
+
+ShaderPackIndex make_pack() {
+    ShaderPackIndex p;
+    for (uint64_t k : {900ull, 5ull, 77ull, 31ull, 1000000007ull}) p[k] = PackStage::Vertex;
+    return p;
+}
+
+// Ids depend only on the key, not on whether the prewarm thread or the title reaches a module first.
+void test_module_ids_order_independent() {
+    const ShaderPackIndex pack = make_pack();
+    PackModuleTable on_demand(pack), warmed(pack);
+    std::vector<uint32_t> a, b;
+    std::vector<uint32_t> created;
+    const auto mk = [&](uint32_t id) { created.push_back(id); };
+    const uint64_t title_order[] = {77, 5, 900, 31};
+    for (uint64_t k : title_order) a.push_back(on_demand.get_or_create(k, mk));
+    // prewarm builds in a different order first, the title then reaches the same keys
+    for (uint64_t k : {31ull, 900ull, 1000000007ull, 5ull}) warmed.get_or_create(k, mk);
+    for (uint64_t k : title_order) b.push_back(warmed.get_or_create(k, mk));
+    CHECK(a == b);
+    CHECK(a[0] == kPackModuleIdBase + 2 && a[1] == kPackModuleIdBase + 0);  // rank in ascending key order
+    CHECK(on_demand.get_or_create(12345, mk) == 0);                         // not a pack key
+    CHECK(warmed.created() == 5);
+}
+
+void test_module_concurrent_single_build() {
+    const ShaderPackIndex pack = make_pack();
+    PackModuleTable t(pack);
+    std::atomic<int> builds{0};
+    std::vector<uint32_t> got(8);
+    std::vector<std::thread> th;
+    for (int i = 0; i < 8; ++i) {
+        th.emplace_back([&, i] {
+            got[i] = t.get_or_create(77, [&](uint32_t) { ++builds; std::this_thread::yield(); });
+        });
+    }
+    for (auto& x : th) x.join();
+    CHECK(builds.load() == 1);
+    for (uint32_t g : got) CHECK(g == got[0] && g != 0);
 }
 
 void test_malformed() {
@@ -194,6 +237,8 @@ int main() {
     test_title_beats_queue();
     test_pack_filter();
     test_malformed();
+    test_module_ids_order_independent();
+    test_module_concurrent_single_build();
     test_file_roundtrip_and_ordering();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_pipeline_prewarm: %d failure(s)\n", g_failures);

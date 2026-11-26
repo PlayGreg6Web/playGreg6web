@@ -3759,17 +3759,34 @@ size_t Device::reflection_join_failures() const {
     return reflection_failures_.size();
 }
 
-uint32_t Device::pack_module_locked(uint64_t key, GpuShaderStage stage) {
+uint32_t Device::module_locked(uint64_t key, GpuShaderStage stage, const std::string& code) {
+    if (options_.shader_pack && !pack_table_) {
+        pack_table_ = std::make_unique<PackModuleTable>(*options_.shader_pack);
+    }
+    if (pack_table_) {
+        const uint32_t id = pack_table_->get_or_create(key, [&](uint32_t new_id) {
+            CommandEncoder enc;
+            enc.create_shader_module(new_id, stage, code);
+            submit(enc);
+        });
+        if (id != 0) {
+            return id;
+        }
+    }
     auto it = pack_modules_.find(key);
     if (it != pack_modules_.end()) {
         return it->second;
     }
     const uint32_t id = allocate_id();
     CommandEncoder enc;
-    enc.create_shader_module(id, stage, pack_key_code(key));
+    enc.create_shader_module(id, stage, code);
     submit(enc);
     pack_modules_.emplace(key, id);
     return id;
+}
+
+uint32_t Device::pack_module_locked(uint64_t key, GpuShaderStage stage) {
+    return module_locked(key, stage, pack_key_code(key));
 }
 
 bool Device::prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1) {
@@ -4003,24 +4020,13 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
     const uint64_t draw_vs = bridge::mesh_draw_vertex_identity(output);
     {
         std::lock_guard<std::mutex> lock(pack_mutex_);
-        CommandEncoder enc;
         const auto module_for = [&](uint64_t key, GpuShaderStage stage, const std::string& code) {
-            auto it = pack_modules_.find(key);
-            if (it != pack_modules_.end()) {
-                return it->second;
-            }
-            const uint32_t id = allocate_id();
-            enc.create_shader_module(id, stage, code);
-            pack_modules_.emplace(key, id);
-            return id;
+            return module_locked(key, stage, code);
         };
         register_shader_module(stage_identity, module_for(ms_key, GpuShaderStage::Compute, pack_key_code(ms_key)));
         register_shader_module(draw_vs, module_for(draw_vs, GpuShaderStage::Vertex, bridge::mesh_draw_vertex_wgsl(output)));
         if (ps_id != 0) {
             register_shader_module(ps_id, module_for(ps_key, GpuShaderStage::Fragment, pack_key_code(ps_key)));
-        }
-        if (enc.size() != 0) {
-            submit(enc);
         }
         if (pack_layouts_.insert({stage_identity, 0}).second) {
             bridge_->register_pipeline_layout(stage_identity, 0, std::move(stage_layout));
@@ -4244,17 +4250,7 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
         }
         if (pack_key != 0) {
             std::lock_guard<std::mutex> lock(pack_mutex_);
-            uint32_t module_id = 0;
-            auto it = pack_modules_.find(pack_key);
-            if (it != pack_modules_.end()) {
-                module_id = it->second;
-            } else {
-                module_id = allocate_id();
-                CommandEncoder enc;
-                enc.create_shader_module(module_id, GpuShaderStage::Compute, pack_key_code(pack_key));
-                submit(enc);
-                pack_modules_.emplace(pack_key, module_id);
-            }
+            const uint32_t module_id = pack_module_locked(pack_key, GpuShaderStage::Compute);
             pipeline_prewarm().note_title_pipeline(kPrewarmKindCompute, pack_key, 0);
             register_shader_module(d.cs, module_id);
             if (rs && pack_layouts_.insert({d.cs, 0}).second) {

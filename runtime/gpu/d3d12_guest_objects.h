@@ -935,6 +935,8 @@ public:
     // Safe from any thread. False when there is no pack or it cannot resolve a key.
     bool prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1);
     uint32_t pack_module_locked(uint64_t key, GpuShaderStage stage);  // pack_mutex_ held
+    // Module for a pack key (deterministic id, built once) or, for a non-pack key, a sequential id. pack_mutex_ held.
+    uint32_t module_locked(uint64_t key, GpuShaderStage stage, const std::string& code);
     // Reflection join failures reported so far (once per pipeline: stage keys + root signature).
     size_t reflection_join_failures() const;
     void flush_pipeline_dump();
@@ -1186,7 +1188,8 @@ private:
     uint64_t ia_relocation_bytes_ = 0;
     uint64_t ia_relocation_seq_ = 0;
     mutable std::mutex pack_mutex_;
-    std::unordered_map<uint64_t, uint32_t> pack_modules_;                 // pack key -> module id
+    std::unordered_map<uint64_t, uint32_t> pack_modules_;                 // non-pack key -> module id (sequential ids)
+    std::unique_ptr<PackModuleTable> pack_table_;                         // pack key -> deterministic module id
     std::set<std::pair<uint64_t, uint64_t>> pack_layouts_;                // (vs, ps) identities
     std::set<std::tuple<uint64_t, uint64_t, uint64_t>> reflection_failures_;  // (vs key, ps key, root signature)
     uint32_t relocation_buffer_ = 0;  // current GPU buffer id (CreateBuffer packet only, no COM object)

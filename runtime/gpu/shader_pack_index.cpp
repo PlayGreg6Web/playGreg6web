@@ -3,7 +3,9 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <limits>
+#include <vector>
 
 namespace playgta6::gpu {
 
@@ -132,6 +134,41 @@ std::string pack_key_code(uint64_t key) {
     char b[24];
     std::snprintf(b, sizeof(b), "0x%016" PRIx64, key);
     return b;
+}
+
+PackModuleTable::PackModuleTable(const ShaderPackIndex& pack) {
+    std::vector<uint64_t> keys;
+    keys.reserve(pack.size());
+    for (const auto& kv : pack) {
+        keys.push_back(kv.first);
+    }
+    std::sort(keys.begin(), keys.end());
+    ids_.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ids_.emplace(keys[i], kPackModuleIdBase + static_cast<uint32_t>(i));
+    }
+}
+
+uint32_t PackModuleTable::id_of(uint64_t key) const {
+    auto it = ids_.find(key);
+    return it == ids_.end() ? 0u : it->second;
+}
+
+uint32_t PackModuleTable::get_or_create(uint64_t key, const std::function<void(uint32_t id)>& create) {
+    const uint32_t id = id_of(key);
+    if (id == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);  // held across create: a concurrent caller waits for the one build
+    if (built_.insert(key).second) {
+        create(id);
+    }
+    return id;
+}
+
+size_t PackModuleTable::created() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return built_.size();
 }
 
 }  // namespace playgta6::gpu
