@@ -4714,6 +4714,42 @@ class FaultRecordLineTests(unittest.TestCase):
         self.assertIn("Trapping stub", slot.get("hard_stop", ""))
         self.assertEqual(rbb.guest_symbols.find_unimplemented(rep)["name"], "XSystemGetAppSpecificDeviceId")
 
+    @staticmethod
+    def _line(kind, **rec):
+        # Same keys as runtime/guest/boot.cpp log_fault_brief() (there the kind's first char is \u-escaped).
+        base = {"kind": kind, "va": "0x0", "detail": "0x0", "rip": None, "thread": 7, "elapsed_ms": 1200,
+                "function": None, "import": None, "unimplemented_slot": None, "callers": []}
+        base.update(rec)
+        return "[23:07:45][wasm] [fault-record] " + json.dumps(base)
+
+    def test_null_indirect_call_off_thread(self):
+        # The browser run that motivated this: INDIRECT_CALL_MISS at 0x0 on a non-boot thread.
+        rep = self._report([self._line("unknown_target"), "[boot] off-thread guest fault captured"])
+        self.assertEqual(rep["fault"]["kind"], "unknown_target")
+        self.assertEqual(rep["fault"]["va"], "0x0")
+        self.assertIsNone(rep["fault"]["function"])
+        self.assertEqual(rep["fault_record"]["thread"], 7)
+
+    def test_unknown_target_names_function(self):
+        fn = {"entry": "0x140001000", "offset": "0x34"}
+        rep = self._report([self._line("unknown_target", va="0x140001034", function=fn)])
+        self.assertEqual(rep["fault"]["function"], fn)
+        self.assertEqual(rep["fault"]["va"], "0x140001034")
+
+    def test_unresolved_import_is_named(self):
+        imp = {"dll": "kernel32.dll", "symbol": "SomeMissingApi", "module": "game.exe"}
+        rep = self._report([self._line("unresolved_import", **{"import": imp})])
+        self.assertEqual(rep["fault"]["kind"], "unresolved_import")
+        self.assertEqual(rep["fault"]["import"], imp)
+
+    def test_escaped_kind_newest_record_wins_and_garbage_is_skipped(self):
+        escaped = self._line("trap").replace('"trap"', '"\u0074rap"')
+        self.assertIn("\u0074rap", escaped)
+        rep = self._report([escaped, "[wasm] [fault-record] {not json", self._line("unknown_target")])
+        self.assertEqual(rep["fault"]["kind"], "unknown_target")
+        rep = self._report([escaped])
+        self.assertEqual(rep["fault"]["kind"], "trap")
+
     def test_without_record_keeps_tracer_fault(self):
         rep = self._report(["[boot-report 205/206] x"])
         self.assertEqual(rep["fault"]["kind"], "WASM_TRAP")

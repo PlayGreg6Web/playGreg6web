@@ -123,6 +123,14 @@ void attach_default_input_state();
 // `PG6_BOOT_PROGRAM`) or returns a smoke-shell diagnostic when shards are not linked.
 WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg);
 
+// BootConfig::off_thread_fault of the wasm boot: the boot has already recorded the fault of a
+// non-boot guest thread (report + `[fault-record]` line are logged); this logs a marker and ends the
+// run (std::abort by default). Public so the wasm64 tests can drive it with `exit` replaced.
+void wasm_off_thread_fault();
+using WasmFaultExit = void (*)();
+// Replaces what wasm_off_thread_fault() does last (null restores std::abort). Test hook.
+void set_wasm_off_thread_fault_exit(WasmFaultExit exit_fn);
+
 }  // namespace playgta6::boot
 
 // C-ABI / Emscripten export returning the linear-memory address of the static InputState struct.

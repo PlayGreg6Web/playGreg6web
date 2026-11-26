@@ -58,7 +58,18 @@ ActiveHttpfsLease acquire_httpfs_client() {
 
 }  // namespace
 
+namespace {
+std::atomic<LogTap> g_log_tap{nullptr};
+}  // namespace
+
+void set_log_tap(LogTap tap) {
+    g_log_tap.store(tap, std::memory_order_release);
+}
+
 void log(std::string_view message) {
+    if (const LogTap tap = g_log_tap.load(std::memory_order_acquire)) {
+        tap(message);
+    }
 #ifdef __EMSCRIPTEN__
     host_log(message.data(), message.size());
 #else

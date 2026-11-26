@@ -325,15 +325,7 @@ static_assert(alignof(AlignedWasmInputState) == 64,
 static_assert(offsetof(AlignedWasmInputState, state) == 0,
               "InputState must sit at offset 0 of AlignedWasmInputState");
 
-void wasm_off_thread_fault() {
-    const WasmBootConfig* active = g_active_boot_cfg.load(std::memory_order_acquire);
-    if (active != nullptr) {
-        write_log(*active, "[boot] off-thread guest fault captured");
-    } else {
-        os::log("[boot] off-thread guest fault captured");
-    }
-    std::abort();
-}
+std::atomic<WasmFaultExit> g_fault_exit{nullptr};
 
 struct ScopedActiveBootConfig {
     const WasmBootConfig* prev = nullptr;
@@ -589,6 +581,25 @@ std::string resolve_pipeline_dump_dir(const WasmBootConfig& cfg) {
 }
 
 }  // namespace
+
+void set_wasm_off_thread_fault_exit(WasmFaultExit exit_fn) {
+    g_fault_exit.store(exit_fn, std::memory_order_release);
+}
+
+void wasm_off_thread_fault() {
+    const WasmBootConfig* active = g_active_boot_cfg.load(std::memory_order_acquire);
+    if (active != nullptr) {
+        write_log(*active, "[boot] off-thread guest fault captured");
+    } else {
+        os::log("[boot] off-thread guest fault captured");
+    }
+    if (const WasmFaultExit exit_fn = g_fault_exit.load(std::memory_order_acquire)) {
+        exit_fn();
+        return;
+    }
+    std::abort();
+}
+
 
 bool try_load_stage_reflection(const WasmBootConfig& cfg,
                                const std::string& pack_path,

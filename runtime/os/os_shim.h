@@ -11,6 +11,12 @@ class HttpfsMailboxClient;
 
 void log(std::string_view message);
 
+// Test hook: every log() line is also handed to `tap` (any thread; null removes it). Lets the
+// native and the wasm64 test builds read the runtime's log lines without capturing stderr / the
+// Node-side host_log.
+using LogTap = void (*)(std::string_view message);
+void set_log_tap(LogTap tap);
+
 // Optionally attach an in-process or shared-memory HTTPFS mailbox (or client).
 // When attached, httpfs_open / httpfs_read / httpfs_close route through the
 // mailbox protocol; otherwise they fall back to Emscripten EM_IMPORT(env)

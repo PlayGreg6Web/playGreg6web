@@ -8,8 +8,10 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -29,10 +31,12 @@
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/present_pacing.h"
 #include "guest/boot.h"
+#include "wasm_boot.h"
 #include "guest/com_bridge.h"
 #include "guest/minidump.h"
 #include "guest/guest_runtime.h"
 #include "os/image_loader.h"
+#include "os/os_shim.h"
 #include "os/ucrt_bridge.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -403,6 +407,17 @@ std::vector<uint8_t> build_image(bool with_tls = true, uint64_t base = kBase,
 
 VirtualMemoryArena* g_arena = nullptr;
 
+// A COM interface whose slot 7 has no implementation (policy Trap): calling it is an
+// unimplemented-slot fault, named in the fault record.
+struct IFaultProbeHost {
+    virtual int32_t Known() = 0;
+};
+constexpr com::Guid kIidFaultProbe = com::make_guid("5a1f0c11-7436-11ce-8034-00aa006009fa");
+using FaultProbeM = com::Methods<IFaultProbeHost>;
+constexpr com::MethodDesc kFaultProbeMethods[] = {FaultProbeM::method<&IFaultProbeHost::Known>("Known")};
+constexpr auto kIFaultProbe = com::declare_interface<IFaultProbeHost>("IFaultProbe", kIidFaultProbe,
+                                                                      kFaultProbeMethods, {.slot_count = 12});
+
 enum class Scenario {
     ReturnCode,
     ExitViaCrt,
@@ -428,6 +443,9 @@ enum class Scenario {
     O42PostPresentConcurrent,
     DeepTrapWithRegs,
     OffThreadTrapWithRegs,
+    OffThreadNullIndirect,
+    OffThreadUnknownTarget,
+    OffThreadComSlot,
 };
 
 // HostCallable: the entry calls a named host callable (like a COM method) twice.
@@ -679,6 +697,27 @@ void sub_entry(GuestState* s) {
             std::thread([] {
                 GuestState& state = com::current_guest_state();
                 __playgta6_unimplemented(&state, kWorker + 4);
+            }).detach();
+            for (int i = 0; i < 5000 && !g_off_thread_reported.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            reg(s, GuestReg::Rax) = 0;
+            ret(s);
+            return;
+        }
+        case Scenario::OffThreadNullIndirect:
+        case Scenario::OffThreadUnknownTarget:
+        case Scenario::OffThreadComSlot: {
+            // A worker's indirect call that cannot be dispatched (the browser run's INDIRECT_CALL_MISS at
+            // 0x0 was one of these on a non-boot thread). The hook parks it; the worker is detached.
+            static uint64_t target = 0;
+            target = g_scenario == Scenario::OffThreadNullIndirect      ? 0
+                     : g_scenario == Scenario::OffThreadUnknownTarget   ? kUnknownInsideEntry
+                                                                        : com::slot_address(kIFaultProbe.info, 7);
+            std::thread([] {
+                GuestState& state = com::current_guest_state();
+                push(&state, kWorker + 4);
+                __playgta6_indirect_call(&state, target);
             }).detach();
             for (int i = 0; i < 5000 && !g_off_thread_reported.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1427,6 +1466,114 @@ void test_off_thread_unresolved_import() {
     CHECK(report["message"].text.find("call to unresolved import") != std::string::npos);
     CHECK(report["message"].text.find("on guest thread") != std::string::npos);
     (void)run;
+}
+
+// Log lines of the runtime (os::log tap), read by the fault-record tests below. Works the same on the
+// native build and the wasm64 build (where os::log goes to the host_log import, not stderr).
+std::mutex g_tap_mutex;
+std::vector<std::string> g_tap_lines;
+void tap_line(std::string_view line) {
+    std::lock_guard<std::mutex> lock(g_tap_mutex);
+    g_tap_lines.emplace_back(line);
+}
+std::vector<std::string> tap_snapshot() {
+    std::lock_guard<std::mutex> lock(g_tap_mutex);
+    return g_tap_lines;
+}
+size_t tap_find(const std::vector<std::string>& lines, const char* prefix) {
+    for (size_t i = lines.size(); i-- > 0;) {
+        if (lines[i].rfind(prefix, 0) == 0) {
+            return i;
+        }
+    }
+    return lines.size();
+}
+
+// The tail of the wasm boot's off-thread path: the boot records the fault and logs the report and the
+// `[fault-record]` line, then calls wasm_off_thread_fault (the browser build's BootConfig hook), which logs
+// a marker and ends the run. Here the run's end is replaced by parking the worker.
+std::vector<std::string> g_hook_lines;
+Json g_hook_record;
+std::atomic<bool> g_hook_exit_called{false};
+void hook_exit_park() {
+    g_hook_lines = tap_snapshot();
+    g_hook_exit_called = true;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::hours(1));
+    }
+}
+
+Json run_off_thread_record(Scenario scenario, std::vector<std::string>* lines_out = nullptr) {
+    g_off_thread_reported = false;
+    g_hook_exit_called = false;
+    g_hook_lines.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_tap_mutex);
+        g_tap_lines.clear();
+    }
+    os::set_log_tap(&tap_line);
+    boot::set_wasm_off_thread_fault_exit(&hook_exit_park);
+    const Run run = boot_scenario(scenario, [](BootConfig& cfg) {
+        cfg.log_progress = true;
+        cfg.fault_record = true;
+        cfg.off_thread_fault = &boot::wasm_off_thread_fault;
+    });
+    (void)run;
+    boot::set_wasm_off_thread_fault_exit(nullptr);
+    os::set_log_tap(nullptr);
+    CHECK(g_hook_exit_called.load());
+    const std::vector<std::string>& lines = g_hook_lines;
+    if (lines_out != nullptr) {
+        *lines_out = lines;
+    }
+    const size_t rec = tap_find(lines, "[fault-record] ");
+    const size_t marker = tap_find(lines, "[boot] off-thread guest fault captured");
+    CHECK(rec < lines.size());
+    CHECK(marker < lines.size());
+    CHECK(rec < marker);  // the record is logged before the run ends
+    if (rec >= lines.size()) {
+        return Json{};
+    }
+    bool ok = false;
+    const Json j = parse_json(lines[rec].substr(std::strlen("[fault-record] ")), &ok);
+    CHECK(ok);
+    return j;
+}
+
+// Off-thread guest faults end in wasm_off_thread_fault with a `[fault-record]` line that names the
+// fault (what tools/run_browser_boot.py reads from the tail of a browser log).
+void test_wasm_off_thread_fault_records() {
+    {
+        const Json j = run_off_thread_record(Scenario::OffThreadNullIndirect);
+        CHECK(j["kind"].text == "unknown_target");
+        CHECK(j["va"].hex() == 0);
+        CHECK(j["unimplemented_slot"].type == Json::Null);
+        CHECK(j["callers"].type == Json::Array);
+    }
+    {
+        const Json j = run_off_thread_record(Scenario::OffThreadUnknownTarget);
+        CHECK(j["kind"].text == "unknown_target");
+        CHECK(j["va"].hex() == kUnknownInsideEntry);
+    }
+    {
+        const Json j = run_off_thread_record(Scenario::OffThreadComSlot);
+        CHECK(j["kind"].text == "unimplemented_slot");
+        CHECK(j["unimplemented_slot"]["interface"].text == "IFaultProbe");
+        CHECK(j["unimplemented_slot"]["slot"].number == 7);
+    }
+    {
+        const Json j = run_off_thread_record(Scenario::OffThreadUnresolved);
+        CHECK(j["kind"].text == "unresolved_import");
+        CHECK(j["import"].type == Json::Object);
+        CHECK(!j["import"]["symbol"].text.empty());
+        CHECK(!j["import"]["dll"].text.empty());
+    }
+    {
+        const Json j = run_off_thread_record(Scenario::OffThreadFault);
+        CHECK(j["kind"].text == "unimplemented");
+        CHECK(j["va"].hex() == kWorker + 4);
+        CHECK(j["function"].type == Json::Object);  // names the lifted function containing the va
+    }
 }
 
 void test_second_thread() {
@@ -2586,6 +2733,7 @@ int main() {
     test_fence_lag_and_present_max_interval();
     test_lockfree_dispatch_observer();
     test_fault_log_gprs_and_callers();
+    test_wasm_off_thread_fault_records();
 
     reset_boot();
     os::win32::set_vmem_arena(nullptr);
