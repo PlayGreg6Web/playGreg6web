@@ -885,6 +885,50 @@ def find_cmake() -> str:
     raise NativeBootError("cmake not found (put it on PATH)")
 
 
+def _harness_steps(
+    cmake: str, project: Path, build: Path, config: str, native_executor: bool, jobs: int, *targets: str
+) -> list[list[str]]:
+    return [
+        [cmake, "-S", str(project), "-B", str(build), f"-DCMAKE_BUILD_TYPE={config}",
+         f"-DPLAYGTA6_NATIVE_EXECUTOR={'ON' if native_executor else 'OFF'}"],
+        [cmake, "--build", str(build), "--config", config, "--target", *targets,
+         "--parallel", str(max(1, jobs))],
+    ]
+
+
+def prebuild_runtime(
+    out_dir: Path,
+    repo_root: Path,
+    inputs: BuildInputs,
+    debug_info: bool,
+    jobs: int,
+    runner: CommandRunner = run_command,
+    native_executor: bool = False,
+) -> float:
+    """Configure the harness project and build the runtime libraries (everything but the harness
+    link) without the shard objects, so it can overlap with the shard compile: the objects are
+    only needed by the final link, and the runtime does not depend on them. The harness CMakeLists
+    is rewritten with the objects afterwards; cmake regenerates, the up-to-date libraries stay.
+    Returns the seconds taken; raises NativeBootError on failure (callers may ignore it, the
+    final build repeats whatever is missing)."""
+    t0 = time.monotonic()
+    project = out_dir / "harness"
+    build = out_dir / "harness-build"
+    project.mkdir(parents=True, exist_ok=True)
+    text = harness_cmakelists(repo_root, inputs, [], out_dir / "bin", debug_info)
+    cml = project / "CMakeLists.txt"
+    if not cml.is_file() or cml.read_text(encoding="utf-8") != text:
+        cml.write_text(text, encoding="utf-8")
+    config = "RelWithDebInfo" if debug_info else "Release"
+    targets = ["playgta6_core"] + (["playgta6_native_exec"] if native_executor else [])
+    for argv in _harness_steps(find_cmake(), project, build, config, native_executor, jobs, *targets):
+        res = runner(argv, None)
+        if res.returncode != 0:
+            tail = "\n".join((res.stdout + res.stderr).splitlines()[-10:])
+            raise NativeBootError(f"runtime prebuild failed:\n{tail}")
+    return time.monotonic() - t0
+
+
 def build_harness(
     out_dir: Path,
     repo_root: Path,
@@ -906,12 +950,7 @@ def build_harness(
         cml.write_text(text, encoding="utf-8")
     cmake = find_cmake()
     config = "RelWithDebInfo" if debug_info else "Release"
-    steps = [
-        [cmake, "-S", str(project), "-B", str(build), f"-DCMAKE_BUILD_TYPE={config}",
-         f"-DPLAYGTA6_NATIVE_EXECUTOR={'ON' if native_executor else 'OFF'}"],
-        [cmake, "--build", str(build), "--config", config, "--target", HARNESS_TARGET,
-         "--parallel", str(max(1, jobs))],
-    ]
+    steps = _harness_steps(cmake, project, build, config, native_executor, jobs, HARNESS_TARGET)
     for argv in steps:
         if progress is not None:
             progress("$ " + " ".join(argv[:4]) + " ...")
@@ -930,6 +969,26 @@ def build_harness(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+class _Prebuild:
+    """Runs `fn` on a background thread; `join()` reports how it went (never raises)."""
+
+    def __init__(self, fn: Callable[[], float]) -> None:
+        self._fn = fn
+        self._msg = "runtime prebuild: not finished"
+        self._thread = threading.Thread(target=self._run, name="runtime-prebuild", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self._msg = f"runtime prebuild (overlapped with the shard compile): {self._fn():.0f}s"
+        except Exception as err:  # noqa: BLE001 - advisory; the harness build repeats it
+            self._msg = f"runtime prebuild skipped ({err}); the harness build will do it"
+
+    def join(self) -> str:
+        self._thread.join()
+        return self._msg
 
 
 def _mib(n: int) -> str:
@@ -1022,8 +1081,17 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
             f"cpu {args.cpu} -O{args.opt_level}, {args.jobs} job(s); {tools.version}; cache {cache_dir}"
         )
         t0 = time.monotonic()
+        prebuild = None
+        if args.sample == 0 and not args.no_link:
+            # The runtime libraries do not depend on the shard objects: build them while the shards
+            # compile (the tail of the shard compile leaves cores idle, a warm cache leaves all idle).
+            prebuild = _Prebuild(
+                lambda: prebuild_runtime(out_dir, REPO_ROOT, inputs, args.debug_info, args.jobs, runner,
+                                         args.native_executor))
         results = compile_all(units, cfg, args.jobs, runner, args.keep_going, say)
         compile_s = time.monotonic() - t0
+        if prebuild is not None:
+            say(prebuild.join())
         trimmed = _trim(cache_dir, max_gb, say)
         failed = [r for r in results if r.error]
         built = [r for r in results if not r.error and not r.cached]

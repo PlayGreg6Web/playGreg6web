@@ -105,6 +105,16 @@ target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# Precompiled standard headers (MSVC only, standard library only: no project or Windows headers,
+# so no TU's macro setup is affected). The ~70 core TUs spend most of their compile time parsing
+# the same STL headers; a fresh build directory (every agent worktree, every harness build) pays it.
+if(MSVC)
+    target_precompile_headers(playgta6_core PRIVATE
+        <algorithm> <array> <atomic> <chrono> <cstddef> <cstdint> <cstdio> <cstdlib> <cstring>
+        <functional> <map> <memory> <mutex> <string> <string_view> <thread> <unordered_map>
+        <utility> <vector>)
+endif()
+
 # XApu decode commands carry Opus packets (os/xapu_opus.h). libopus (BSD-3-Clause, Xiph.Org
 # Foundation) is fetched at configure time from the release tarball, pinned by hash; with the
 # option off the XApu model posts silence instead.

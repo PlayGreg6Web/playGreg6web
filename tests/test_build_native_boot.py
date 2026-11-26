@@ -542,8 +542,10 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(summary["harness"].endswith(nb._exe(nb.HARNESS_OUTPUT)))
             self.assertIn("run: ", err.getvalue())
             cmake_calls = [c[0] for c in runner.calls if c[0][0] == "cmake"]
-            self.assertEqual(len(cmake_calls), 2)
-            self.assertIn(nb.HARNESS_TARGET, cmake_calls[1])
+            # configure + runtime prebuild (overlapped with the shard compile), then configure + harness build
+            self.assertEqual(len(cmake_calls), 4)
+            self.assertIn("playgta6_core", cmake_calls[1])
+            self.assertIn(nb.HARNESS_TARGET, cmake_calls[3])
             self.assertTrue((module / "native" / "harness" / "CMakeLists.txt").is_file())
 
     def test_cli_sample_extrapolates_without_linking(self) -> None:
