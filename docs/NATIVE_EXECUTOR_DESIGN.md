@@ -124,7 +124,7 @@ Known divergences, to be closed or documented as they come up:
   (the worker does not remap them either). `pipeline_layout_id == 0` pipelines are not remapped (as in the
   worker); `auto_layout_pipelines` counts them. Manifest layouts (`layout-manifest.json`, flag
   `ManifestReference`) are unavailable, as in the replay page (`manifest_layouts_unavailable`). The
-  manifest layouts, the reflection loader (`.reflect.json`) and the swapchain blit stay open.
+  manifest layouts and the reflection loader (`.reflect.json`) stay open.
 - v1 pipelines (`8`/`19`) and bind groups (`15`/`16`) take the worker's path for "no reflection registry
   loaded" (the replay page's and the producer's situation): layout `auto`, entry points `vs_main` /
   `fs_main` / `cs_main`, one `float32xN` attribute at location 0 for a non-zero stride, the canvas format
@@ -149,9 +149,12 @@ Known divergences, to be closed or documented as they come up:
 - Uploads: `WriteTexture` takes the worker's effective layout (row pitch inference, block clamping, mip
   bounds clamp) and a direct `queue.WriteTexture`; the worker's staging pool and 8 MiB strip chunking only
   change how the same texels reach the texture and are not mirrored.
-- Non-canvas stream swapchain formats (sRGB, others) use the worker's intermediate texture + blit
-  (`WgpuSwapchain`); the executor counts them (`swapchain_format_unsupported`) and keeps the canvas
-  format: not mirrored yet.
+- Non-canvas stream swapchain formats (sRGB, packed, others) use the worker's intermediate texture + the
+  worker's fullscreen blit (`blit_model.h`, `blit_frames`); the canvas keeps its format and an sRGB source is
+  decoded by the sampler and written as is, exactly like the worker. Beyond the worker, a stream size that
+  differs from the canvas (`present_width/height` headless, `fixed_stream_size` with a window) is
+  letterboxed into the canvas (`window_layout.h` `letterbox_rect`, the window's `present_rect`), bars black.
+  Only depth/stencil and block-compressed codes still count as `swapchain_format_unsupported`.
 - `CreateBuffer` with `byte_size` above 2^53 throws a `TypeError` in the worker (WebIDL
   `[EnforceRange]`); natively it is a WebGPU validation error.
 - Worker-only machinery with no GPU-visible effect on a healthy run is not mirrored: device-loss
@@ -175,7 +178,7 @@ Known divergences, to be closed or documented as they come up:
 | the layout:auto bind-group remap | `_getOrCreateRemappedBindGroup`, `_preparePassCommandsForFlush` | **M2b (done)** |
 | `layout-manifest.json` layouts, the reflection loader | `reflection_loader.js` | M2b (open) |
 | `requestNegotiatedDevice` limit negotiation | `requestNegotiatedDevice` | **M2b (done)** |
-| Swapchain blit fallback | `wgpu_swapchain.js` | M2b (open) |
+| Swapchain blit fallback (+ letterbox) | `wgpu_swapchain.js` | **M2b (done)** |
 | Live boot: `playgta6_boot --native-gpu [--window]`, present any target | `os::wgpu_submit` observer | M3 |
 
 The order follows what a real capture needs to draw anything: M1 is the first milestone at which

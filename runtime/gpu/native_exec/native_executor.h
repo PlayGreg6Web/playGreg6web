@@ -29,6 +29,15 @@ struct ExecutorOptions {
     uint32_t width = 1280;  // swapchain (and initial client area) size
     uint32_t height = 720;
     std::string title = "playgta6 native executor";
+    // Swapchain blit (WgpuSwapchain's intermediate texture + fullscreen blit, plus letterboxing):
+    // headless, a canvas of present_width x present_height (both non-zero) receives the stream
+    // (width x height) scaled into the largest centred aspect-preserving rectangle, black bars
+    // around it. With a window, fixed_stream_size keeps the stream at width x height and does the same
+    // into the window's client area (default: the stream follows the window size). A stream format
+    // that is not a canvas format (e.g. rgba8unorm-srgb) always goes through the blit.
+    uint32_t present_width = 0;
+    uint32_t present_height = 0;
+    bool fixed_stream_size = false;
     // GPU pass timestamps (#1608): measured with timestamp queries when the adapter has the
     // feature and fed into this table (nullptr = the process-wide gpu_time_table(), the one the
     // boot report prints). Nothing is estimated: without the feature the table says unavailable.
@@ -52,7 +61,8 @@ struct ExecutorStats {
     uint64_t dropped_while_lost = 0;  // batches ignored after device loss
     uint64_t render_pass_missing_texture = 0;  // BeginRenderPass dropped: unknown attachment texture
     uint64_t render_pass_dropped_colors = 0;   // attachments dropped for a size mismatch
-    uint64_t swapchain_format_unsupported = 0;  // stream asked for a non-canvas swapchain format
+    uint64_t swapchain_format_unsupported = 0;  // stream asked for a swapchain format that is no colour format
+    uint64_t blit_frames = 0;  // frames presented through the intermediate texture + blit
     // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`
     // (a v2 / texture packet it rejects); op errors above are its `_recordOpValidationError`.
     uint64_t packet_errors = 0;

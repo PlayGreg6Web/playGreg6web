@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
+#include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
@@ -786,6 +788,36 @@ void test_layout_remap() {
     CHECK(synth_layout_entry(wu).min_binding_size == 4096);
 }
 
+void test_blit_model() {
+    // Which stream formats need the blit (WgpuSwapchain isValidCanvasFormat).
+    CHECK(is_canvas_format_code(22) && is_canvas_format_code(27) && is_canvas_format_code(40));
+    CHECK(!is_blit_stream_format_code(22) && !is_blit_stream_format_code(27) && !is_blit_stream_format_code(40));
+    CHECK(is_blit_stream_format_code(23) && is_blit_stream_format_code(28) && is_blit_stream_format_code(31) &&
+          is_blit_stream_format_code(32) && is_blit_stream_format_code(36));
+    CHECK(!is_blit_stream_format_code(0) && !is_blit_stream_format_code(44) && !is_blit_stream_format_code(45) &&
+          !is_blit_stream_format_code(49) && !is_blit_stream_format_code(255));
+    CHECK(!blit_needed(true, 64, 32, 64, 32));
+    CHECK(blit_needed(false, 64, 32, 64, 32));
+    CHECK(blit_needed(true, 64, 32, 128, 128));
+
+    // Letterbox: largest centred rectangle of the stream's aspect ratio.
+    CHECK(letterbox_rect(64, 32, 64, 32) == (PresentRect{0, 0, 64, 32}));
+    CHECK(letterbox_rect(64, 32, 128, 128) == (PresentRect{0, 32, 128, 64}));    // bars top and bottom
+    CHECK(letterbox_rect(64, 32, 100, 20) == (PresentRect{30, 0, 40, 20}));      // limited by height
+    CHECK(letterbox_rect(1920, 1080, 3840, 2160) == (PresentRect{0, 0, 3840, 2160}));
+    CHECK(letterbox_rect(1920, 1080, 1280, 1024) == (PresentRect{0, 152, 1280, 720}));
+    CHECK(letterbox_rect(1280, 720, 1000, 1000) == (PresentRect{0, 218, 1000, 563}));
+    CHECK(letterbox_rect(16, 9, 1, 1).w == 1 && letterbox_rect(16, 9, 1, 1).h == 1);  // never an empty rect
+    CHECK(letterbox_rect(0, 9, 100, 100) == PresentRect{});
+    CHECK(letterbox_rect(16, 9, 0, 100) == PresentRect{});
+    // Extreme aspect: the short side clamps to at least one pixel and stays inside the target.
+    const PresentRect thin = letterbox_rect(10000, 1, 100, 100);
+    CHECK(thin.w == 100 && thin.h == 1 && thin.y == 49);
+    const PresentRect big = letterbox_rect(4000000000u, 3000000000u, 4000000000u - 1, 3000000000u);
+    CHECK(big.w <= 4000000000u - 1 && big.h <= 3000000000u && big.w >= 1 && big.h >= 1);
+    CHECK(std::string(kBlitWgsl).find("textureSample(blit_tex, blit_sampler, in.uv)") != std::string::npos);
+}
+
 int main() {
     test_shader_payloads();
     test_pack();
@@ -804,6 +836,7 @@ int main() {
     test_v1_vertex_layout();
     test_negotiated_limits();
     test_layout_remap();
+    test_blit_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

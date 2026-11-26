@@ -20,6 +20,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "gpu/gpu_time.h"
+#include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
@@ -421,9 +422,23 @@ struct NativeExecutor::Impl {
     std::unique_ptr<NativeWindow> window;
     wgpu::Surface surface;
     wgpu::TextureFormat swap_format = wgpu::TextureFormat::BGRA8Unorm;  // Chrome's preferred canvas format on Windows
-    uint32_t swap_width = 0, swap_height = 0;
+    uint32_t swap_width = 0, swap_height = 0;  // the canvas (surface / offscreen texture) size
     bool surface_configured = false;
     wgpu::Texture offscreen;
+    // The stream's own render target (WgpuSwapchain `_streamFormat` + intermediate texture): used when the
+    // stream format is not a canvas format, or the stream size differs from the canvas size. Presenting
+    // then blits it into the canvas (blit_model.h). Otherwise the stream renders into the canvas directly.
+    wgpu::TextureFormat stream_format = wgpu::TextureFormat::BGRA8Unorm;
+    uint32_t stream_w = 0, stream_h = 0;
+    wgpu::Texture intermediate;
+    wgpu::TextureView intermediate_view;
+    wgpu::TextureFormat intermediate_format = wgpu::TextureFormat::Undefined;
+    uint32_t intermediate_w = 0, intermediate_h = 0;
+    wgpu::ShaderModule blit_module;
+    wgpu::Sampler blit_sampler;
+    wgpu::RenderPipeline blit_pipeline;
+    wgpu::TextureFormat blit_pipeline_format = wgpu::TextureFormat::Undefined;
+    wgpu::BindGroup blit_bind_group;
 
     // Per-frame state (wgpu_worker.js _resetFrameState).
     ClearValue clear_color = kDefaultClearColor;
@@ -498,6 +513,12 @@ struct NativeExecutor::Impl {
         }
         swap_width = options.width ? options.width : 1;
         swap_height = options.height ? options.height : 1;
+        stream_w = swap_width;
+        stream_h = swap_height;
+        if (!options.window && options.present_width && options.present_height) {
+            swap_width = options.present_width;  // headless canvas of its own size: the stream is blitted into it
+            swap_height = options.present_height;
+        }
         if (options.window) {
             window = NativeWindow::create(options.title, swap_width, swap_height, error);
             if (!window) {
@@ -748,16 +769,124 @@ struct NativeExecutor::Impl {
         surface.Configure(&cfg);
         swap_width = w;
         swap_height = h;
+        if (!options.fixed_stream_size) {
+            stream_w = w;
+            stream_h = h;
+        }
         surface_configured = true;
+    }
+
+    bool blit_active() const {
+        return stream_format != swap_format || stream_w != swap_width || stream_h != swap_height;
+    }
+
+    void ensure_intermediate() {
+        if (intermediate && intermediate_format == stream_format && intermediate_w == stream_w &&
+            intermediate_h == stream_h)
+            return;
+        if (intermediate) intermediate.Destroy();  // before the new allocation, like the worker (no VRAM leak)
+        blit_bind_group = nullptr;
+        wgpu::TextureDescriptor td{};
+        td.label = {"playgta6-swapchain-intermediate", WGPU_STRLEN};
+        td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
+                   wgpu::TextureUsage::CopySrc;
+        td.dimension = wgpu::TextureDimension::e2D;
+        td.size = {stream_w, stream_h, 1};
+        td.format = stream_format;
+        intermediate = device.CreateTexture(&td);
+        intermediate_view = intermediate.CreateView();
+        intermediate_format = stream_format;
+        intermediate_w = stream_w;
+        intermediate_h = stream_h;
+    }
+
+    // WgpuSwapchain._ensureBlitPipeline / _ensureBlitBindGroup / blitToCanvasIfNeeded: a fullscreen
+    // triangle sampling the intermediate texture into the canvas, inside the letterbox viewport.
+    void encode_blit(wgpu::CommandEncoder& enc, const wgpu::TextureView& canvas_view) {
+        if (!blit_module) {
+            wgpu::ShaderSourceWGSL wgsl{};
+            wgsl.code = {kBlitWgsl, WGPU_STRLEN};
+            wgpu::ShaderModuleDescriptor md{};
+            md.nextInChain = &wgsl;
+            md.label = {"playgta6-swapchain-blit-wgsl", WGPU_STRLEN};
+            blit_module = device.CreateShaderModule(&md);
+            wgpu::SamplerDescriptor sd{};
+            sd.magFilter = wgpu::FilterMode::Linear;
+            sd.minFilter = wgpu::FilterMode::Linear;
+            sd.addressModeU = wgpu::AddressMode::ClampToEdge;
+            sd.addressModeV = wgpu::AddressMode::ClampToEdge;
+            blit_sampler = device.CreateSampler(&sd);
+        }
+        if (!blit_pipeline || blit_pipeline_format != swap_format) {
+            wgpu::ColorTargetState ct{};
+            ct.format = swap_format;
+            wgpu::FragmentState fs{};
+            fs.module = blit_module;
+            fs.entryPoint = {"fs_main", 7};
+            fs.targetCount = 1;
+            fs.targets = &ct;
+            wgpu::RenderPipelineDescriptor rd{};
+            rd.label = {"playgta6-swapchain-blit-pipeline", WGPU_STRLEN};
+            rd.vertex.module = blit_module;
+            rd.vertex.entryPoint = {"vs_main", 7};
+            rd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+            rd.primitive.cullMode = wgpu::CullMode::None;
+            rd.fragment = &fs;
+            blit_pipeline = device.CreateRenderPipeline(&rd);
+            blit_pipeline_format = swap_format;
+            blit_bind_group = nullptr;
+        }
+        if (!blit_bind_group) {
+            wgpu::BindGroupEntry e[2]{};
+            e[0].binding = 0;
+            e[0].textureView = intermediate_view;
+            e[1].binding = 1;
+            e[1].sampler = blit_sampler;
+            wgpu::BindGroupDescriptor bd{};
+            bd.label = {"playgta6-swapchain-blit-bg", WGPU_STRLEN};
+            bd.layout = blit_pipeline.GetBindGroupLayout(0);
+            bd.entryCount = 2;
+            bd.entries = e;
+            blit_bind_group = device.CreateBindGroup(&bd);
+        }
+        wgpu::RenderPassColorAttachment a{};
+        a.view = canvas_view;
+        a.loadOp = wgpu::LoadOp::Clear;
+        a.storeOp = wgpu::StoreOp::Store;
+        a.clearValue = {0, 0, 0, 1};
+        wgpu::RenderPassDescriptor rp{};
+        rp.label = {"playgta6-swapchain-blit-pass", WGPU_STRLEN};
+        rp.colorAttachmentCount = 1;
+        rp.colorAttachments = &a;
+        wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+        // With a window the rect is the window's own (DPI-aware) present rect, headless the plain letterbox.
+        const PresentRect r = window ? window->present_rect(stream_w, stream_h)
+                                     : letterbox_rect(stream_w, stream_h, swap_width, swap_height);
+        if (r.w && r.h) {
+            pass.SetViewport(static_cast<float>(r.x), static_cast<float>(r.y), static_cast<float>(r.w),
+                             static_cast<float>(r.h), 0.0f, 1.0f);
+            pass.SetPipeline(blit_pipeline);
+            pass.SetBindGroup(0, blit_bind_group);
+            pass.Draw(3);
+        }
+        pass.End();
+        ++stats.blit_frames;
     }
 
     // WgpuSwapchain.configureForStreamFormat for canvas formats (#709).
     void set_swapchain_format(uint8_t code) {
         wgpu::TextureFormat f;
         if (!canvas_format_for_code(code, &f)) {
-            ++stats.swapchain_format_unsupported;
+            // Not a canvas format: the canvas keeps its format and the stream renders into an intermediate
+            // texture of this one, blitted on present (configureForStreamFormat's blit fallback).
+            if (!is_blit_stream_format_code(code)) {
+                ++stats.swapchain_format_unsupported;
+                return;
+            }
+            stream_format = wgpu_format(code);
             return;
         }
+        stream_format = f;
         if (f == swap_format) return;
         swap_format = f;
         if (surface) surface_configured = false;
@@ -1814,7 +1943,7 @@ struct NativeExecutor::Impl {
         rd.vertex.buffers = &vb;
         rd.primitive.topology = wgpu_topology(static_cast<uint8_t>(std::min<uint32_t>(h.topology, 255)));
         wgpu::ColorTargetState target{};
-        target.format = swap_format;  // _getRenderTargetFormat()
+        target.format = stream_format;  // _getRenderTargetFormat()
         wgpu::FragmentState fragment{};
         if (fs) {
             fragment.module = fs->module;
@@ -2313,8 +2442,10 @@ struct NativeExecutor::Impl {
 
     struct FrameTarget {
         wgpu::Texture texture;
-        wgpu::TextureView view;
-        bool written = false;  // the canvas texture starts each frame as transparent black
+        wgpu::TextureView view;  // what the stream renders into (the canvas, or the intermediate texture)
+        wgpu::TextureView canvas_view;  // the canvas the frame is presented to
+        bool blit = false;  // view is the intermediate texture: Present blits it into canvas_view
+        bool written = false;  // the render target starts each frame as transparent black
     };
 
     // The canvas texture of the current frame: kept across an early read-back flush, released by Present.
@@ -2328,9 +2459,22 @@ struct NativeExecutor::Impl {
     }
 
     bool acquire(FrameTarget* t) {
+        if (!acquire_canvas(t)) return false;
+        t->blit = blit_active();
+        if (t->blit) {
+            ensure_intermediate();
+            t->texture = intermediate;
+            t->view = intermediate_view;
+        } else {
+            t->view = t->canvas_view;
+        }
+        return true;
+    }
+
+    bool acquire_canvas(FrameTarget* t) {
         if (!surface) {
             t->texture = offscreen;
-            t->view = offscreen.CreateView();
+            t->canvas_view = offscreen.CreateView();
             return true;
         }
         uint32_t w = 0, h = 0;
@@ -2343,7 +2487,7 @@ struct NativeExecutor::Impl {
             if (st.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
                 st.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
                 t->texture = st.texture;
-                t->view = st.texture.CreateView();
+                t->canvas_view = st.texture.CreateView();
                 return true;
             }
             if (st.status != wgpu::SurfaceGetCurrentTextureStatus::Outdated &&
@@ -2425,7 +2569,7 @@ struct NativeExecutor::Impl {
                 cd.timestampWrites = &tw;
             cpass = enc.BeginComputePass(&cd);
         }
-        std::optional<AttachmentSize> swapchain_size() const { return AttachmentSize{s.swap_width, s.swap_height}; }
+        std::optional<AttachmentSize> swapchain_size() const { return AttachmentSize{s.stream_w, s.stream_h}; }
         // _getActivePassTargetSize
         std::optional<AttachmentSize> target_size() const {
             if (explicit_pass) return explicit_size;
@@ -2440,7 +2584,7 @@ struct NativeExecutor::Impl {
         plan.color_count = b.color_count;
         for (uint32_t i = 0; i < b.color_count; ++i) {
             plan.colors[i].texture_id = b.colors[i].texture_id;
-            sizes[i] = b.colors[i].swapchain ? AttachmentSize{swap_width, swap_height} : b.colors[i].size;
+            sizes[i] = b.colors[i].swapchain ? AttachmentSize{stream_w, stream_h} : b.colors[i].size;
         }
         plan.has_depth_stencil = b.has_ds;
         const uint32_t dropped = drop_mismatched_colors(plan, sizes, b.ds_size);
@@ -3198,6 +3342,7 @@ struct NativeExecutor::Impl {
             if (timer_pass(e, d3d12_guest::GpuPassKind::Render, 0, &tw)) rp.timestampWrites = &tw;
             e.enc.BeginRenderPass(&rp).End();
         }
+        if (target.blit) encode_blit(e.enc, target.canvas_view);
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
         const uint64_t tp1 = now_ns();
@@ -3367,6 +3512,7 @@ std::string NativeExecutor::stats_json() const {
     num("render_pass_missing_texture", st.render_pass_missing_texture);
     num("render_pass_dropped_colors", st.render_pass_dropped_colors);
     num("swapchain_format_unsupported", st.swapchain_format_unsupported);
+    num("blit_frames", st.blit_frames);
     num("packet_errors", st.packet_errors);
     num("shader_modules", st.shader_modules);
     num("shader_pack_hits", st.shader_pack_hits);

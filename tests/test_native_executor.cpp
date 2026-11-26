@@ -878,6 +878,83 @@ void test_readbacks_host_addresses(NativeExecutor& ex) {
     ex.attach_guest_memory(GuestMemory{});
 }
 
+// Swapchain blit (WgpuSwapchain intermediate texture + blit, letterboxed): a 64x32 stream presented to a
+// 128x128 canvas lands in a 128x64 band with black bars; a non-canvas (sRGB) stream format goes through the
+// same path and comes out as the colour that was cleared (sampler decode, no re-encode).
+bool px_near(const FrameImage& img, uint32_t x, uint32_t y, int b, int g, int r, int a, int tol) {
+    const uint8_t* p = &img.pixels[(size_t{y} * img.width + x) * 4];
+    auto close_to = [&](int got, int want) { return got >= want - tol && got <= want + tol; };
+    const bool ok = close_to(p[0], b) && close_to(p[1], g) && close_to(p[2], r) && close_to(p[3], a);
+    if (!ok)
+        std::fprintf(stderr, "pixel (%u,%u) = %u,%u,%u,%u (bgra), want %d,%d,%d,%d\n", x, y, p[0], p[1], p[2], p[3], b,
+                     g, r, a);
+    return ok;
+}
+
+void test_blit() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.present_width = 128;
+    opts.present_height = 128;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: blit NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    gpu::CommandEncoder f;
+    f.begin_frame();
+    f.clear_color(1.0f, 0.0f, 0.0f, 1.0f);
+    f.present();
+    CHECK(run(*ex, f) == 1);
+    CHECK(ex->stats().blit_frames == 1);
+    FrameImage img;
+    CHECK(ex->read_last_frame(&img, &error));
+    CHECK(img.width == 128 && img.height == 128 && img.format == "bgra8unorm");
+    if (img.pixels.size() == 128u * 128u * 4u) {
+        CHECK(px_near(img, 64, 5, 0, 0, 0, 255, 0));     // top bar
+        CHECK(px_near(img, 64, 122, 0, 0, 0, 255, 0));   // bottom bar
+        CHECK(px_near(img, 64, 64, 0, 0, 255, 255, 1));  // inside the band: the cleared red
+        CHECK(px_near(img, 2, 40, 0, 0, 255, 255, 1));
+        CHECK(px_near(img, 125, 90, 0, 0, 255, 255, 1));
+    }
+
+    // sRGB stream format (code 28 bgra8unorm-srgb): clear 0.5 is stored encoded and sampled decoded.
+    GpuBeginRenderPassPayload bp = swapchain_pass(GpuLoadOp::Clear, 0.5f, 0.5f, 0.5f, 1.0f);
+    bp.color[0].view.format = 28;
+    gpu::CommandEncoder g;
+    g.begin_frame();
+    g.emit_packet(GpuOpcode::BeginRenderPass, &bp, sizeof bp);
+    g.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    g.present();
+    CHECK(run(*ex, g) == 1);
+    CHECK(ex->stats().blit_frames == 2);
+    CHECK(ex->stats().swapchain_format_unsupported == 0);
+    CHECK(ex->read_last_frame(&img, &error));
+    if (img.pixels.size() == 128u * 128u * 4u) {
+        CHECK(px_near(img, 64, 5, 0, 0, 0, 255, 0));
+        CHECK(px_near(img, 64, 64, 128, 128, 128, 255, 2));
+    }
+    CHECK(ex->stats().device_errors == 0);
+    CHECK(ex->stats().device_lost == 0);
+
+    // A same-size stream in a canvas format does not blit.
+    ExecutorOptions plain;
+    plain.width = kW;
+    plain.height = kH;
+    auto ex2 = NativeExecutor::create(plain, &status, &error);
+    if (ex2) {
+        gpu::CommandEncoder h;
+        h.begin_frame();
+        h.present();
+        run(*ex2, h);
+        CHECK(ex2->stats().blit_frames == 0);
+    }
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -907,6 +984,7 @@ int main() {
     test_v1(*ex);
     CHECK(ex->stats().device_lost == 0);
     test_timers();
+    test_blit();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
