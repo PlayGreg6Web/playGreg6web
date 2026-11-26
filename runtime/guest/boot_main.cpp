@@ -55,6 +55,7 @@
 //                        "Late start"); objects and the newest writes are kept, commands dropped
 //   --gpu-capture-start-at-script  start the capture's frames at the input script's `capture` step
 //   --live-digest <file>  (with --window, tools/live_vs_replay.py) per-frame replay digests of the live executor
+//   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
 //                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.
 //                        Only in builds with -DPLAYGTA6_NATIVE_EXECUTOR=ON. Works together with
@@ -112,6 +113,7 @@
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
+#include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/native_executor.h"
 #endif
 #include "guest/input_script.h"
@@ -232,6 +234,8 @@ struct Options {
     bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
+    playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
+    uint32_t max_fps = 0;           // --max-fps: host-side present cap (0 = off)
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
     std::string record_input;       // --record-input: write the real --host-input readings (guest/input_record.h)
     std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
@@ -322,6 +326,13 @@ bool parse(int argc, char** argv, Options& o) {
             o.no_async_pipelines = true;
         } else if (a == "--dawn-cache-max-mb" && i + 1 < argc) {
             o.dawn_cache_max_mb = std::strtoull(argv[++i], nullptr, 10);
+        } else if (a == "--present-mode" && i + 1 < argc) {
+            if (!playgta6::gpu::native_exec::parse_present_choice(argv[++i], &o.present_mode)) return false;
+        } else if (a == "--max-fps" && i + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(argv[++i], &end, 10);
+            if (!end || *end || v > 100000) return false;
+            o.max_fps = static_cast<uint32_t>(v);
         } else if (a == "--window-size" && i + 1 < argc) {
             unsigned w = 0, h = 0;
             if (std::sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w == 0 || h == 0) return false;
@@ -813,13 +824,14 @@ void live_title_tick(ne::NativeExecutor& exec) {
     last.t = now;
     last.presents = st.present_packets;
     last.draws = st.draws;
-    char buf[200];
+    const std::string mode = exec.present_mode_name();
+    char buf[240];
     if (g_guest_faulted.load()) {
         std::snprintf(buf, sizeof buf, "playgta6 | GUEST FAULT - last frame kept, details in the console | frame %llu | close the window to exit",
                       static_cast<unsigned long long>(st.present_packets));
     } else {
-        std::snprintf(buf, sizeof buf, "playgta6 | %.0f fps | frame %llu | %.0f draws/frame | ok | F11 fullscreen",
-                      last.fps, static_cast<unsigned long long>(st.present_packets), last.draws_per_frame);
+        std::snprintf(buf, sizeof buf, "playgta6 | %.0f fps | frame %llu | %.0f draws/frame | %s | cap %u | ok | F11 fullscreen",
+                      last.fps, static_cast<unsigned long long>(st.present_packets), last.draws_per_frame, mode.empty() ? "?" : mode.c_str(), g_options.max_fps);
     }
     exec.set_window_title(buf);
 }
@@ -844,6 +856,8 @@ bool start_live_window() {
     options.window = true;
     options.width = g_options.window_width;
     options.height = g_options.window_height;
+    options.present_mode = g_options.present_mode;
+    options.max_fps = g_options.max_fps;
     // Persistent Dawn blob cache per title / Dawn build / adapter (repeat runs skip the DXC and driver
     // compiles), and pipelines compiled on Dawn's worker threads while the pump keeps consuming packets.
     if (g_options.dawn_cache != "off") {

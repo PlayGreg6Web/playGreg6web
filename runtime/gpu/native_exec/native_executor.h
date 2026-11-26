@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+
+#include "gpu/native_exec/present_model.h"
 #include <vector>
 
 #include "gpu/native_exec/m2_model.h"
@@ -64,6 +66,10 @@ struct ExecutorOptions {
     // appended here, N counting presents from 0 - the same digest pg6_native_exec --digest-at prints.
     // Slow (one synchronous read-back per frame); a window surface then gets CopySrc usage.
     std::string frame_digest_path;
+    // Window present mode (--present-mode) and host-side frame cap (--max-fps, 0 = off). An unsupported
+    // mode falls back (logged); the guest's own pacing is not changed.
+    PresentChoice present_mode = PresentChoice::Auto;
+    uint32_t max_fps = 0;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;
@@ -230,6 +236,8 @@ public:
     bool window_focused() const;
     // Title bar text of the live window (no-op without one). Call from the pump thread.
     void set_window_title(const std::string& title);
+    // Present mode in effect once the surface is configured ("" before / headless).
+    std::string present_mode_name() const;
     // Blocks until the GPU finished all submitted work and every pending read-back / timestamp
     // read was delivered.
     void wait_idle();

@@ -13,6 +13,7 @@
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
+#include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/stream_model.h"
 
@@ -818,7 +819,35 @@ void test_blit_model() {
     CHECK(std::string(kBlitWgsl).find("textureSample(blit_tex, blit_sampler, in.uv)") != std::string::npos);
 }
 
+void test_present_model() {
+    PresentChoice c = PresentChoice::Fifo;
+    CHECK(parse_present_choice("mailbox", &c) && c == PresentChoice::Mailbox);
+    CHECK(parse_present_choice("auto", &c) && c == PresentChoice::Auto);
+    CHECK(!parse_present_choice("vsync", &c));
+    const uint8_t all = kModeFifo | kModeMailbox | kModeImmediate;
+    CHECK(select_present_mode(PresentChoice::Auto, all).actual == PresentChoice::Mailbox);
+    CHECK(select_present_mode(PresentChoice::Auto, kModeFifo | kModeImmediate).actual == PresentChoice::Immediate);
+    CHECK(select_present_mode(PresentChoice::Auto, 0).actual == PresentChoice::Fifo);
+    PresentSelection s = select_present_mode(PresentChoice::Immediate, all);
+    CHECK(s.actual == PresentChoice::Immediate && !s.fell_back && s.note.empty());
+    s = select_present_mode(PresentChoice::Mailbox, kModeFifo | kModeImmediate);
+    CHECK(s.fell_back && s.actual == PresentChoice::Immediate && !s.note.empty());
+    s = select_present_mode(PresentChoice::Immediate, kModeFifo);
+    CHECK(s.fell_back && s.actual == PresentChoice::Fifo);
+    s = select_present_mode(PresentChoice::Fifo, 0);
+    CHECK(!s.fell_back && s.actual == PresentChoice::Fifo);
+    // 100 fps = 10 ms interval.
+    CHECK(frame_cap_wait_ns(0, 5, 6) == 0);
+    CHECK(frame_cap_wait_ns(100, 0, 6) == 0);
+    CHECK(frame_cap_wait_ns(100, 1000, 4000) == 10000000ull - 3000);
+    CHECK(frame_cap_wait_ns(100, 1000, 20000000ull) == 0);
+    CHECK(frame_cap_next_anchor(100, 1000, 10001000ull) == 10001000ull);        // on schedule
+    CHECK(frame_cap_next_anchor(100, 1000, 100000000ull) == 100000000ull);      // very late: no burst
+    CHECK(frame_cap_next_anchor(100, 1000, 15000000ull) == 10001000ull);        // slightly late: keep cadence
+}
+
 int main() {
+    test_present_model();
     test_shader_payloads();
     test_pack();
     test_formats();

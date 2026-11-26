@@ -33,6 +33,7 @@
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
+#include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/stream_model.h"
@@ -870,24 +871,42 @@ struct NativeExecutor::Impl {
     }
 
     // Fifo makes GetCurrentTexture block for the vertical blank (and far longer behind a busy compositor):
-    // the guest's frame pacing is its own, so prefer Mailbox (no tearing), then Immediate; Fifo is the
-    // always-supported fallback. Rendering is unchanged, only when a frame reaches the screen.
+    // the guest's frame pacing is its own, so auto prefers Mailbox (no tearing), then Immediate; Fifo is the
+    // always-supported fallback. --present-mode forces one (validated against the surface, falls back with a
+    // log line). Rendering is unchanged, only when a frame reaches the screen.
     wgpu::PresentMode pick_present_mode() {
         if (!present_mode_known) {
             present_mode_known = true;
-            present_mode = wgpu::PresentMode::Fifo;
+            uint8_t mask = 0;
             wgpu::SurfaceCapabilities caps{};
             if (surface.GetCapabilities(adapter_handle, &caps) == wgpu::Status::Success) {
-                bool mailbox = false, immediate = false;
                 for (size_t i = 0; i < caps.presentModeCount; ++i) {
-                    mailbox |= caps.presentModes[i] == wgpu::PresentMode::Mailbox;
-                    immediate |= caps.presentModes[i] == wgpu::PresentMode::Immediate;
+                    if (caps.presentModes[i] == wgpu::PresentMode::Fifo) mask |= kModeFifo;
+                    if (caps.presentModes[i] == wgpu::PresentMode::Mailbox) mask |= kModeMailbox;
+                    if (caps.presentModes[i] == wgpu::PresentMode::Immediate) mask |= kModeImmediate;
                 }
-                if (mailbox) present_mode = wgpu::PresentMode::Mailbox;
-                else if (immediate) present_mode = wgpu::PresentMode::Immediate;
             }
+            const PresentSelection sel = select_present_mode(options.present_mode, mask);
+            if (!sel.note.empty()) std::fprintf(stderr, "[native_exec] %s\n", sel.note.c_str());
+            present_mode_name = present_choice_name(sel.actual);
+            present_mode = sel.actual == PresentChoice::Mailbox ? wgpu::PresentMode::Mailbox
+                         : sel.actual == PresentChoice::Immediate ? wgpu::PresentMode::Immediate
+                                                                  : wgpu::PresentMode::Fifo;
+            std::fprintf(stderr, "[native_exec] present mode: %s (requested %s)\n", present_mode_name.c_str(),
+                         present_choice_name(options.present_mode));
         }
         return present_mode;
+    }
+    std::string present_mode_name;
+    uint64_t cap_anchor_ns = 0;
+    // --max-fps: sleep (then yield-spin the last 0.5 ms) until the next present is due.
+    void apply_frame_cap() {
+        if (options.max_fps == 0) return;
+        const uint64_t now = now_ns();
+        const uint64_t wait = frame_cap_wait_ns(options.max_fps, cap_anchor_ns, now);
+        if (wait > 600000ull) std::this_thread::sleep_for(std::chrono::nanoseconds(wait - 500000ull));
+        while (now_ns() < now + wait) std::this_thread::yield();
+        cap_anchor_ns = frame_cap_next_anchor(options.max_fps, cap_anchor_ns, now_ns());
     }
     bool present_mode_known = false;
     wgpu::PresentMode present_mode = wgpu::PresentMode::Fifo;
@@ -3970,6 +3989,7 @@ struct NativeExecutor::Impl {
         const uint64_t tp2 = now_ns();
         stats.ns_present_submit += tp2 - tp1;
         if (surface) surface.Present();
+        if (options.window) apply_frame_cap();
         stats.ns_present_swap += now_ns() - tp2;
         frame_target.reset();
         early_flushed = false;
@@ -4114,6 +4134,8 @@ void NativeExecutor::set_window_title(const std::string& title) {
     if (impl_->window) impl_->window->set_title(title);
 }
 
+std::string NativeExecutor::present_mode_name() const { return impl_->present_mode_name; }
+
 bool NativeExecutor::window_focused() const { return impl_->window && impl_->window->focused(); }
 
 void NativeExecutor::wait_idle() {
@@ -4257,6 +4279,9 @@ std::string NativeExecutor::stats_json() const {
     num("ns_present_encode", st.ns_present_encode);
     num("ns_present_submit", st.ns_present_submit);
     num("ns_present_swap", st.ns_present_swap);
+    j += "\"present_mode_requested\": \"" + std::string(present_choice_name(impl_->options.present_mode)) +
+         "\", \"present_mode_actual\": \"" + impl_->present_mode_name + "\", ";
+    num("max_fps", impl_->options.max_fps);
     table("opcode_ns", st.opcode_ns);
     j += ", ";
     table("handled", st.handled);
