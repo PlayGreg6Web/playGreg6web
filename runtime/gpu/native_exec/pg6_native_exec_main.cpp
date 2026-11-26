@@ -1,9 +1,10 @@
 // pg6_native_exec: replays a .pg6trace (gpu/frame_capture.h) through the native executor, frame by
 // frame like tools/replay/replay.html, headless or in a window.
 //
-//   pg6_native_exec --trace <file.pg6trace> [--window] [--size WxH] [--frames N]
-//                   [--digest-at 0,10,...] [--report <file.json>]
+//   pg6_native_exec --trace <file.pg6trace> [--pack <file.wgsl.pack>] [--window] [--size WxH]
+//                   [--frames N] [--digest-at 0,10,...] [--report <file.json>]
 //
+// --pack        WGSL pack for hash-only CreateShaderModule payloads (the replay page's --pack)
 // --size        swapchain size (default 3840x2160, the replay page's canvas)
 // --frames N    stop after frame N (default: all)
 // --digest-at   headless: print the replay page's `digest frame` / `swapchain frame` lines for these
@@ -54,7 +55,7 @@ bool parse_list(const std::string& text, std::set<uint64_t>* out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string trace, report;
+    std::string trace, report, pack;
     ExecutorOptions opts;
     opts.width = 3840;
     opts.height = 2160;
@@ -68,6 +69,8 @@ int main(int argc, char** argv) {
             opts.window = true;
         } else if (a == "--trace" && (v = next())) {
             trace = v;
+        } else if (a == "--pack" && (v = next())) {
+            pack = v;
         } else if (a == "--report" && (v = next())) {
             report = v;
         } else if (a == "--frames" && (v = next())) {
@@ -105,6 +108,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "pg6_native_exec: %s\n", error.c_str());
         return status == NativeExecutor::CreateStatus::NoAdapter ? 77 : 1;
     }
+    if (!pack.empty() && !exec->load_wgsl_pack(pack, &error)) {
+        std::fprintf(stderr, "pg6_native_exec: %s\n", error.c_str());
+        return 1;
+    }
     const AdapterDescription& ad = exec->adapter();
     std::printf("adapter: %s (%s)\n", ad.description.empty() ? ad.device.c_str() : ad.description.c_str(),
                 ad.backend.c_str());
@@ -137,6 +144,9 @@ int main(int argc, char** argv) {
         }
     }
     exec->wait_idle();
+    for (const std::string& e : exec->stats().device_error_log) std::printf("VALIDATION: %s\n", e.c_str());
+    if (!exec->stats().last_packet_error.empty())
+        std::printf("last packet error: %s\n", exec->stats().last_packet_error.c_str());
     const std::string json = exec->stats_json();
     std::printf("stats: %s\n", json.c_str());
     if (!report.empty()) {

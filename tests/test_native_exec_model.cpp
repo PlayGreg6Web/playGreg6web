@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
+#include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/stream_model.h"
 
@@ -221,7 +222,189 @@ void test_digest() {
 
 }  // namespace
 
+// ---- milestone 1 (m1_model.h) ----
+
+void test_shader_payloads() {
+    // parseHashOnlyShaderPayload
+    CHECK(parse_hash_only_shader_payload("0x006d0f6d4b911457") == 0x006d0f6d4b911457ull);
+    CHECK(parse_hash_only_shader_payload("hash:0xFF") == 0xffull);
+    CHECK(parse_hash_only_shader_payload("WGPK : 12ab") == 0x12abull);
+    CHECK(parse_hash_only_shader_payload("0123456789abcdef") == 0x0123456789abcdefull);
+    CHECK(!parse_hash_only_shader_payload("0123456789abcde"));  // bare hex needs exactly 16 digits
+    CHECK(!parse_hash_only_shader_payload("0x"));
+    CHECK(!parse_hash_only_shader_payload("0x12345678901234567"));  // 17 digits
+    CHECK(!parse_hash_only_shader_payload("@vertex fn vs_main() {}"));
+    CHECK(!parse_hash_only_shader_payload(""));
+    CHECK(trim_view("  \t x \n") == "x");
+
+    // Entry points: comments are ignored by the declared-entry scan, not by the recorded one.
+    const std::string code =
+        "// @vertex fn commented() {}\n"
+        "/* @vertex fn block() {} */\n"
+        "@group(0) @binding(0) var<uniform> u: vec4f;\n"
+        "@vertex\nfn vs_other(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return u; }\n"
+        "@fragment @must_use fn fs_main() -> @location(0) vec4f { return u; }\n"
+        "@vertex @invariant(x) fn vs_main() -> @builtin(position) vec4f { return u; }\n";
+    const auto vs = find_wgsl_stage_entry_points(code, "vertex");
+    CHECK(vs.size() == 2 && vs[0] == "vs_other" && vs[1] == "vs_main");
+    CHECK((find_wgsl_stage_entry_points(code, "fragment") == std::vector<std::string>{"fs_main"}));
+    CHECK(find_wgsl_stage_entry_points(code, "compute").empty());
+    CHECK(extract_wgsl_entry_point(code, "vertex") == std::string("commented"));  // regex over raw text
+    CHECK(extract_wgsl_entry_point("fn helper() {}\n@compute fn cs() {}", "") == std::string("helper"));
+    CHECK(!extract_wgsl_entry_point("", "vertex"));
+    // resolveShaderEntryPoint: the default name wins among several; else the explicit one when
+    // declared; else the first declared.
+    CHECK(resolve_shader_entry_point(code, std::string("vs_other"), "vertex") == "vs_other");
+    CHECK(resolve_shader_entry_point(code, std::string("commented"), "vertex") == "vs_main");
+    CHECK(resolve_shader_entry_point("@vertex fn only() {}", std::nullopt, "vertex") == "only");
+    CHECK(resolve_shader_entry_point("", std::nullopt, "compute") == "cs_main");
+    CHECK(resolve_shader_entry_point("", std::string("custom"), "fragment") == "custom");
+    CHECK(wgsl_declares_group0("@group( 0 ) @binding(1) var s: sampler;"));
+    CHECK(!wgsl_declares_group0("@group(1) @binding(0) var s: sampler;"));
+    CHECK(strip_wgsl_comments("a /* b /* c */ d */ e // f\ng") == "a    e \ng");
+}
+
+void test_pack() {
+    const std::string a = "@vertex fn vs_main() {}", b = "@fragment fn fs_main() {}";
+    std::vector<uint8_t> pack = {'W', 'G', 'P', 'K', 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) pack.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto u64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) pack.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const uint32_t data_start = 16 + 2 * 20;
+    u64(0x1111); pack.push_back(1); pack.insert(pack.end(), 3, 0); u32(data_start); u32(static_cast<uint32_t>(a.size()));
+    u64(0x2222); pack.push_back(2); pack.insert(pack.end(), 3, 0); u32(data_start + static_cast<uint32_t>(a.size()));
+    u32(static_cast<uint32_t>(b.size()));
+    pack.insert(pack.end(), a.begin(), a.end());
+    pack.insert(pack.end(), b.begin(), b.end());
+    const char* path = "test_native_exec_model.wgsl.pack";
+    FILE* f = std::fopen(path, "wb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::fwrite(pack.data(), 1, pack.size(), f);
+    std::fclose(f);
+    {
+        WgslPack p;
+        std::string err;
+        CHECK(p.load(path, &err));
+        CHECK(p.size() == 2 && p.has(0x1111) && p.has(0x2222) && !p.has(0x3333));
+        CHECK(p.get(0x2222) == b);
+        CHECK(p.get(0x1111) == a);
+        CHECK(!p.get(0x3333));
+        WgslPack bad;
+        CHECK(!bad.load("test_native_exec_model.does-not-exist", &err));
+    }
+    std::remove(path);
+}
+
+void test_formats() {
+    CHECK(std::string(format_info(22).name) == "rgba8unorm" && std::string(format_info(62).name) == "bc7-rgba-unorm");
+    CHECK(std::string(format_info(63).name) == "bc7-rgba-unorm-srgb" && std::string(format_info(49).name) == "depth32float-stencil8");
+    CHECK(format_info(62).compressed && format_info(62).block_w == 4 && format_info(62).bytes == 16);
+    CHECK(format_info(50).bytes == 8 && format_info(43).bytes == 16 && format_info(1).bytes == 1);
+    CHECK(!format_valid(0) && format_valid(63) && !format_valid(64));
+    CHECK(format_is_bc(50) && format_is_bc(63) && !format_is_bc(49));
+    CHECK(format_is_srgb(23) && format_is_srgb(63) && !format_is_srgb(22));
+    CHECK(format_is_depth(46) && format_is_depth(49) && !format_is_depth(44) && format_is_depth_or_stencil(44));
+    CHECK(format_is_float32(43) && !format_is_float32(40));
+    CHECK(format_is_integer(25) && format_is_integer(30) && !format_is_integer(31) && !format_is_integer(22));
+    CHECK(srgb_sibling(22) == 23 && srgb_sibling(23) == 22 && srgb_sibling(62) == 63 && srgb_sibling(40) == 0);
+    CHECK(v1_format_code(5) == 62 && v1_format_code(3) == 46 && v1_format_code(99) == 22);
+    // resolveCompatibleViewFormats
+    bool added = false;
+    auto v = resolve_compatible_view_formats(22, {}, &added);
+    CHECK((v == std::vector<uint8_t>{23}) && added);
+    v = resolve_compatible_view_formats(22, {22, 40, 23, 22}, &added);
+    CHECK((v == std::vector<uint8_t>{22, 23}) && !added);
+    CHECK(resolve_compatible_view_formats(40, {40, 22}).size() == 1);
+    CHECK(resolve_compatible_view_formats(40, {}).empty());
+    // Mips and samples
+    CHECK(max_mip_levels(256, 64, 1, 1) == 9 && max_mip_levels(8, 8, 32, 2) == 6 && max_mip_levels(5, 5, 1, 0) == 1);
+    CHECK(clamp_mip_levels(0, 16, 16, 1, 1) == 1 && clamp_mip_levels(99, 16, 16, 1, 1) == 5);
+    CHECK(clamp_sample_count(4, 1, 1, 1) == 4 && clamp_sample_count(4, 2, 1, 1) == 1 && clamp_sample_count(4, 1, 2, 1) == 1);
+    CHECK(mip_dimension(100, 0) == 100 && mip_dimension(100, 3) == 12 && mip_dimension(1, 5) == 1 && mip_dimension(8, 40) == 1);
+}
+
+void test_write_texture_plan() {
+    TextureGeometry g;
+    g.width = 64;
+    g.height = 64;
+    g.mips = 7;
+    g.format = 22;  // rgba8unorm
+    WriteTextureArgs a;
+    a.width = 64; a.height = 64; a.data_len = 64 * 64 * 4;
+    // No pitch sent: inferred from the data length, rows_per_image only for multi-slice uploads.
+    WriteTexturePlan p = plan_write_texture(a, g);
+    CHECK(p.status == WriteTexturePlan::Status::Write && p.bytes_per_row == 256 && p.rows_per_image == 0);
+    CHECK(p.width == 64 && p.height == 64 && p.depth == 1);
+    // Explicit pitch and rows per image.
+    a.bytes_per_row = 512; a.rows_per_image = 64; a.data_len = 512 * 64;
+    p = plan_write_texture(a, g);
+    CHECK(p.status == WriteTexturePlan::Status::Write && p.bytes_per_row == 512 && p.rows_per_image == 64);
+    // A region past the mip bounds is clamped (mip 1 is 32x32).
+    a = WriteTextureArgs{};
+    a.mip = 1; a.ox = 16; a.width = 64; a.height = 64; a.data_len = 64 * 64 * 4; a.bytes_per_row = 256;
+    p = plan_write_texture(a, g);
+    CHECK(p.status == WriteTexturePlan::Status::Write && p.clamped && p.width == 16 && p.height == 32 && p.mip == 1);
+    // Mip out of range / origin outside the mip / empty region.
+    a.mip = 7;
+    CHECK(plan_write_texture(a, g).status == WriteTexturePlan::Status::BadMip);
+    a.mip = 1; a.ox = 40;
+    CHECK(plan_write_texture(a, g).status == WriteTexturePlan::Status::Skip);
+    a = WriteTextureArgs{};
+    CHECK(plan_write_texture(a, g).status == WriteTexturePlan::Status::Skip);
+
+    // BC7 4x4 tail mip of an 8x8 texture: the copy extent is one 4x4 block, 16 bytes per row.
+    TextureGeometry bc;
+    bc.width = 8; bc.height = 8; bc.mips = 4; bc.format = 62;
+    a = WriteTextureArgs{};
+    a.mip = 2; a.width = 2; a.height = 2; a.bytes_per_row = 16; a.rows_per_image = 2; a.data_len = 16;
+    p = plan_write_texture(a, bc);
+    CHECK(p.status == WriteTexturePlan::Status::Write && p.width == 4 && p.height == 4 && p.bytes_per_row == 16);
+    CHECK(p.rows_per_image == 1);  // one block row
+    // Compressed, no pitch sent: derived from the data (2x2 blocks of 16 bytes = 32 bytes per row).
+    a = WriteTextureArgs{};
+    a.width = 8; a.height = 8; a.data_len = 64;
+    p = plan_write_texture(a, bc);
+    CHECK(p.status == WriteTexturePlan::Status::Write && p.bytes_per_row == 32);
+    // A compressed pitch below one row of blocks is an error.
+    a.bytes_per_row = 16; a.data_len = 128;
+    CHECK(plan_write_texture(a, bc).status == WriteTexturePlan::Status::BadRowBytes);
+    // 1D (promoted) textures: height 0 means 1.
+    TextureGeometry one;
+    one.width = 256; one.height = 1; one.dimension = 1; one.requested_1d = true; one.format = 9;  // r16float
+    a = WriteTextureArgs{};
+    a.width = 256; a.height = 0; a.data_len = 512;
+    p = plan_write_texture(a, one);
+    CHECK(p.status == WriteTexturePlan::Status::Write && p.height == 1 && p.width == 256);
+}
+
+void test_clamps() {
+    // clampViewportToTarget: inside, partly outside, depth range swap, no target.
+    Viewport v{0, 0, 1280, 720, 0, 1};
+    Viewport c = clamp_viewport_to_target(v, 1920, 1080);
+    CHECK(c.x == 0 && c.width == 1280 && c.height == 720 && c.min_depth == 0 && c.max_depth == 1);
+    v = Viewport{-10, 100, 4000, 4000, 0.9, 0.1};
+    c = clamp_viewport_to_target(v, 1920, 1080);
+    CHECK(c.x == 0 && c.y == 100 && c.width == 1920 && c.height == 980 && c.min_depth == 0.1 && c.max_depth == 0.9);
+    v = Viewport{5, 5, std::nan(""), 10, 0, 1};
+    c = clamp_viewport_to_target(v, 0, 0);
+    CHECK(c.x == 5 && c.width == 0 && c.height == 10);
+    // clampScissorToTarget
+    Rect r = clamp_scissor_to_target(10, 10, 100, 100, 640, 480);
+    CHECK(r.x == 10 && r.width == 100 && r.height == 100);
+    r = clamp_scissor_to_target(600, 400, 100, 100, 640, 480);
+    CHECK(r.x == 600 && r.width == 40 && r.y == 400 && r.height == 80);
+    r = clamp_scissor_to_target(700, 10, 5, 5, 640, 480);
+    CHECK(r.x == 640 && r.width == 0);
+    r = clamp_scissor_to_target(1, 2, 3, 4, 0, 0);
+    CHECK(r.x == 1 && r.width == 3 && r.height == 4);
+}
+
 int main() {
+    test_shader_payloads();
+    test_pack();
+    test_formats();
+    test_write_texture_plan();
+    test_clamps();
     test_walk();
     test_clear_color();
     test_begin_render_pass();

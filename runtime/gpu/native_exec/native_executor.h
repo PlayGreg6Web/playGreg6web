@@ -42,10 +42,35 @@ struct ExecutorStats {
     uint64_t render_pass_missing_texture = 0;  // BeginRenderPass dropped: unknown attachment texture
     uint64_t render_pass_dropped_colors = 0;   // attachments dropped for a size mismatch
     uint64_t swapchain_format_unsupported = 0;  // stream asked for a non-canvas swapchain format
+    // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`
+    // (a v2 / texture packet it rejects); op errors above are its `_recordOpValidationError`.
+    uint64_t packet_errors = 0;
+    std::array<uint64_t, kOpcodeSlots> packet_errors_by_opcode{};
+    std::string last_packet_error;
+    uint64_t shader_modules = 0;
+    uint64_t shader_pack_hits = 0;
+    uint64_t shader_pack_misses = 0;  // a hash-only shader the pack does not hold (compiled as text: invalid)
+    uint64_t textures_created = 0;
+    uint64_t texture_uploads = 0;
+    uint64_t texture_upload_bytes = 0;
+    uint64_t samplers_created = 0;
+    uint64_t bind_group_layouts = 0;
+    uint64_t pipeline_layouts = 0;
+    uint64_t render_pipelines = 0;
+    uint64_t compute_pipelines = 0;
+    uint64_t bind_groups = 0;
+    uint64_t draws = 0;
+    uint64_t draws_skipped = 0;        // _executePresentRenderDraw skips (no pipeline / group 0 unbound)
+    uint64_t dispatches = 0;
+    uint64_t dispatches_skipped = 0;   // zero-size or missing pipeline (_preparePassCommandsForFlush)
+    uint64_t dispatches_clamped = 0;
+    uint64_t auto_layout_pipelines = 0;  // layout 0 ("auto"): the worker's WGSL remap is not mirrored
+    uint64_t manifest_layouts_unavailable = 0;
     std::array<uint64_t, kOpcodeSlots> handled{};    // by opcode
     std::array<uint64_t, kOpcodeSlots> unhandled{};  // by opcode: not implemented yet, skipped
     uint64_t unknown_opcodes = 0;                    // opcode >= kOpcodeSlots
     std::string last_device_error;
+    std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
 };
 
 struct AdapterDescription {
@@ -82,6 +107,10 @@ public:
     // Present packets in it (the worker's `presents`).
     uint32_t execute(const uint8_t* data, size_t len);
 
+    // Loads a .wgsl.pack (WGPK v1) for hash-only CreateShaderModule payloads, like the replay page's
+    // `processor.loadWgslPack`. Only the entry table is read now; WGSL is read on demand.
+    bool load_wgsl_pack(const std::string& path, std::string* error);
+
     // Processes WebGPU callbacks and, with a window, window messages. Returns false once the window
     // was closed (always true headless).
     bool poll();
@@ -97,6 +126,10 @@ public:
 
     // Headless only: the swapchain contents after the last submitted frame.
     bool read_last_frame(FrameImage* out, std::string* error);
+    // Reads back mip `mip` of a stream texture (needs COPY_SRC), tightly packed rows. Uncompressed
+    // 2D textures only.
+    bool read_texture(uint32_t id, uint32_t mip, std::vector<uint8_t>* out, uint32_t* width, uint32_t* height,
+                      std::string* error);
     // Reads a stream buffer (it needs COPY_SRC usage; WebGPU rejects the copy otherwise).
     bool read_buffer(uint32_t id, uint64_t offset, uint64_t size, std::vector<uint8_t>* out, std::string* error);
 

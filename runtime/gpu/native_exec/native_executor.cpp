@@ -1,4 +1,5 @@
-// Dawn-backed native executor (milestone 0). Every handler names the worker function it mirrors;
+// Dawn-backed native executor (milestones 0 and 1). Every handler names the worker function it
+// mirrors (web/workers/wgpu_worker.js, render_state_packets.js, texture_packets.js);
 // docs/NATIVE_EXECUTOR_DESIGN.md has the coverage table.
 #include "gpu/native_exec/native_executor.h"
 
@@ -7,11 +8,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <variant>
 
 #include "abi/playgta6_abi.h"
+#include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/native_window.h"
 #include "gpu/native_exec/stream_model.h"
 
@@ -38,7 +42,7 @@ const char* backend_name(wgpu::BackendType b) {
 }
 
 // Canvas formats (WgpuSwapchain isValidCanvasFormat): the stream may switch the swapchain to them
-// directly (#709). Other formats need the worker's intermediate texture + blit (not in M0).
+// directly (#709). Other formats need the worker's intermediate texture + blit (not yet).
 // Codes: docs/gpu_commands.md "WebGPU enum codes".
 bool canvas_format_for_code(uint8_t code, wgpu::TextureFormat* out) {
     switch (code) {
@@ -62,17 +66,268 @@ uint32_t format_bytes(wgpu::TextureFormat f) { return f == wgpu::TextureFormat::
 
 constexpr uint64_t kWaitForever = UINT64_MAX;
 
-struct BeginPassCmd {
-    RenderPassPlan plan;
+// ---- code tables (docs/gpu_commands.md "WebGPU enum codes") ----
+
+wgpu::TextureFormat wgpu_format(uint8_t code) {
+    using F = wgpu::TextureFormat;
+    static const F kT[kFormatCodeCount] = {
+        F::Undefined, F::R8Unorm, F::R8Snorm, F::R8Uint, F::R8Sint, F::R16Unorm, F::R16Snorm, F::R16Uint,
+        F::R16Sint, F::R16Float, F::RG8Unorm, F::RG8Snorm, F::RG8Uint, F::RG8Sint, F::R32Uint, F::R32Sint,
+        F::R32Float, F::RG16Unorm, F::RG16Snorm, F::RG16Uint, F::RG16Sint, F::RG16Float, F::RGBA8Unorm,
+        F::RGBA8UnormSrgb, F::RGBA8Snorm, F::RGBA8Uint, F::RGBA8Sint, F::BGRA8Unorm, F::BGRA8UnormSrgb,
+        F::RGB9E5Ufloat, F::RGB10A2Uint, F::RGB10A2Unorm, F::RG11B10Ufloat, F::RG32Uint, F::RG32Sint,
+        F::RG32Float, F::RGBA16Unorm, F::RGBA16Snorm, F::RGBA16Uint, F::RGBA16Sint, F::RGBA16Float,
+        F::RGBA32Uint, F::RGBA32Sint, F::RGBA32Float, F::Stencil8, F::Depth16Unorm, F::Depth24Plus,
+        F::Depth24PlusStencil8, F::Depth32Float, F::Depth32FloatStencil8, F::BC1RGBAUnorm,
+        F::BC1RGBAUnormSrgb, F::BC2RGBAUnorm, F::BC2RGBAUnormSrgb, F::BC3RGBAUnorm, F::BC3RGBAUnormSrgb,
+        F::BC4RUnorm, F::BC4RSnorm, F::BC5RGUnorm, F::BC5RGSnorm, F::BC6HRGBUfloat, F::BC6HRGBFloat,
+        F::BC7RGBAUnorm, F::BC7RGBAUnormSrgb};
+    return kT[code < kFormatCodeCount ? code : 0];
+}
+
+wgpu::VertexFormat wgpu_vertex_format(uint8_t code, uint32_t* bytes) {
+    using V = wgpu::VertexFormat;
+    struct E {
+        V f;
+        uint32_t b;
+    };
+    static const E kT[42] = {
+        {V::Uint8, 0},      {V::Uint8, 1},      {V::Uint8x2, 2},    {V::Uint8x4, 4},    {V::Sint8, 1},
+        {V::Sint8x2, 2},    {V::Sint8x4, 4},    {V::Unorm8, 1},     {V::Unorm8x2, 2},   {V::Unorm8x4, 4},
+        {V::Snorm8, 1},     {V::Snorm8x2, 2},   {V::Snorm8x4, 4},   {V::Uint16, 2},     {V::Uint16x2, 4},
+        {V::Uint16x4, 8},   {V::Sint16, 2},     {V::Sint16x2, 4},   {V::Sint16x4, 8},   {V::Unorm16, 2},
+        {V::Unorm16x2, 4},  {V::Unorm16x4, 8},  {V::Snorm16, 2},    {V::Snorm16x2, 4},  {V::Snorm16x4, 8},
+        {V::Float16, 2},    {V::Float16x2, 4},  {V::Float16x4, 8},  {V::Float32, 4},    {V::Float32x2, 8},
+        {V::Float32x3, 12}, {V::Float32x4, 16}, {V::Uint32, 4},     {V::Uint32x2, 8},   {V::Uint32x3, 12},
+        {V::Uint32x4, 16},  {V::Sint32, 4},     {V::Sint32x2, 8},   {V::Sint32x3, 12},  {V::Sint32x4, 16},
+        {V::Unorm10_10_10_2, 4}, {V::Unorm8x4BGRA, 4}};
+    if (code == 0 || code >= 42) {
+        *bytes = 0;
+        return V::Uint8;
+    }
+    *bytes = kT[code].b;
+    return kT[code].f;
+}
+
+wgpu::BlendFactor wgpu_blend_factor(uint8_t c) {
+    using B = wgpu::BlendFactor;
+    static const B kT[17] = {B::Zero, B::One, B::Src, B::OneMinusSrc, B::SrcAlpha, B::OneMinusSrcAlpha, B::Dst,
+                             B::OneMinusDst, B::DstAlpha, B::OneMinusDstAlpha, B::SrcAlphaSaturated, B::Constant,
+                             B::OneMinusConstant, B::Src1, B::OneMinusSrc1, B::Src1Alpha, B::OneMinusSrc1Alpha};
+    return c < 17 ? kT[c] : B::One;  // decodeBlendComponent: `|| 'one'`
+}
+wgpu::BlendFactor wgpu_blend_dst_factor(uint8_t c) { return c < 17 ? wgpu_blend_factor(c) : wgpu::BlendFactor::Zero; }
+wgpu::BlendOperation wgpu_blend_op(uint8_t c) {
+    using O = wgpu::BlendOperation;
+    static const O kT[5] = {O::Add, O::Subtract, O::ReverseSubtract, O::Min, O::Max};
+    return c < 5 ? kT[c] : O::Add;
+}
+// COMPARE_FUNCTION_NAMES; 0 / out of range -> Undefined.
+wgpu::CompareFunction wgpu_compare(uint8_t c) {
+    using C = wgpu::CompareFunction;
+    static const C kT[9] = {C::Undefined, C::Never, C::Less, C::Equal, C::LessEqual, C::Greater, C::NotEqual,
+                            C::GreaterEqual, C::Always};
+    return c < 9 ? kT[c] : C::Undefined;
+}
+wgpu::StencilOperation wgpu_stencil_op(uint8_t c) {
+    using S = wgpu::StencilOperation;
+    static const S kT[8] = {S::Keep, S::Zero, S::Replace, S::Invert, S::IncrementClamp, S::DecrementClamp,
+                            S::IncrementWrap, S::DecrementWrap};
+    return c < 8 ? kT[c] : S::Keep;
+}
+wgpu::PrimitiveTopology wgpu_topology(uint8_t c) {
+    using T = wgpu::PrimitiveTopology;
+    static const T kT[5] = {T::TriangleList, T::TriangleStrip, T::LineList, T::LineStrip, T::PointList};
+    return c < 5 ? kT[c] : T::TriangleList;
+}
+wgpu::TextureViewDimension wgpu_view_dim(uint8_t c) {
+    using D = wgpu::TextureViewDimension;
+    static const D kT[7] = {D::Undefined, D::e1D, D::e2D, D::e2DArray, D::Cube, D::CubeArray, D::e3D};
+    return c < 7 ? kT[c] : D::Undefined;
+}
+wgpu::AddressMode wgpu_address(uint32_t c) {
+    using A = wgpu::AddressMode;
+    return c == 1 ? A::Repeat : c == 2 ? A::MirrorRepeat : A::ClampToEdge;
+}
+
+// resolveStorageTextureFormat (built-in tables; texture_formats.js is not loaded in the replay page).
+struct StorageResolution {
+    uint8_t storage_format = 0;  // 0 = none
+    bool supported = false;
+    bool linear_sibling = false;
 };
-struct EndPassCmd {};
-using PassCmd = std::variant<BeginPassCmd, EndPassCmd>;
+
+struct DeviceFeatures {
+    bool bc = false, bc_sliced_3d = false, depth32_stencil8 = false, float32_filterable = false,
+         float32_blendable = false, bgra8_storage = false, rg11b10_renderable = false, tier1 = false;
+};
+
+StorageResolution resolve_storage_format(uint8_t f, const DeviceFeatures& d) {
+    StorageResolution r;
+    if (!format_valid(f) || format_is_depth_or_stencil(f) || format_is_bc(f)) return r;
+    switch (f) {
+        case 22: case 24: case 25: case 26: case 38: case 39: case 40: case 14: case 15: case 16: case 33:
+        case 34: case 35: case 41: case 42: case 43:
+            r.storage_format = f;
+            r.supported = true;
+            return r;
+        case 27:
+            if (d.bgra8_storage) { r.storage_format = 27; r.supported = true; }
+            return r;
+        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12:
+        case 13: case 17: case 18: case 19: case 20: case 21: case 30: case 31: case 32: case 36: case 37:
+            if (d.tier1) { r.storage_format = f; r.supported = true; }
+            return r;
+        case 23:
+            r.storage_format = 22; r.supported = true; r.linear_sibling = true;
+            return r;
+        case 28:
+            if (d.bgra8_storage) { r.storage_format = 27; r.supported = true; r.linear_sibling = true; }
+            return r;
+        default: return r;
+    }
+}
+
+bool render_attachment_supported(uint8_t f, const DeviceFeatures& d) {
+    if (!format_valid(f) || format_is_bc(f)) return false;
+    if (f == 29 || f == 2 || f == 11 || f == 24) return false;  // NON_RENDERABLE_CORE_FORMATS
+    if (f == 32) return d.rg11b10_renderable;
+    if (f == 5 || f == 6 || f == 17 || f == 18 || f == 36 || f == 37) return d.tier1;
+    return true;
+}
+
+// isBlendableTextureFormat
+bool blendable(uint8_t f, const DeviceFeatures& d) {
+    if (!format_valid(f)) return false;
+    if (format_is_integer(f) || format_is_depth_or_stencil(f) || format_is_bc(f)) return false;
+    switch (f) {
+        case 1: case 9: case 10: case 21: case 22: case 23: case 27: case 28: case 31: case 40: return true;
+        default: break;
+    }
+    if (format_is_float32(f)) return d.float32_blendable;
+    if (f == 32) return d.rg11b10_renderable;
+    if (f == 5 || f == 6 || f == 17 || f == 18 || f == 36 || f == 37) return d.tier1;
+    return false;
+}
+
+struct LayoutEntry {  // decodeBindGroupLayoutEntry (kind: 0 buffer, 1 sampler, 2 texture, 3 storage texture)
+    uint32_t binding = 0, visibility = 0;
+    uint8_t kind = 0, subtype = 0, view_dim = 2, storage_format = 0;
+    bool dynamic = false, multisampled = false;
+    uint64_t min_binding_size = 0;
+};
+
+struct BglEntry {
+    wgpu::BindGroupLayout layout;
+    std::vector<LayoutEntry> entries;
+    bool entries_known = true;
+};
+
+struct PlEntry {
+    wgpu::PipelineLayout layout;
+    bool group0_has_entries = false;
+};
+
+struct ShaderEntry {
+    wgpu::ShaderModule module;
+    std::string code;
+    std::optional<std::string> explicit_ep;
+    uint32_t stage = 0;
+};
+
+struct RenderPipelineEntry {
+    wgpu::RenderPipeline pipeline;
+    bool expects_group0 = false;
+};
 
 struct BufferEntry {
     wgpu::Buffer buffer;
     uint64_t size = 0;  // descriptor size (GPUBuffer.size, also for an invalid buffer)
     uint32_t usage = 0;
 };
+
+struct TextureEntry {
+    wgpu::Texture texture;
+    wgpu::TextureView default_view;
+    TextureGeometry geom;
+    uint32_t usage = 0;
+    uint32_t sample_count = 1;
+    bool promoted_1d = false;
+    bool bc3d_fallback = false;  // 3D BC texture created as rgba8unorm: uploads are skipped
+    std::unordered_map<uint64_t, wgpu::TextureView> views;
+};
+
+// ---- pass commands (wgpu_worker.js `_passCommands`) ----
+
+struct ColorAtt {
+    uint32_t texture_id = 0;
+    wgpu::TextureView view;  // resolved at packet time
+    bool swapchain = false;
+    AttachmentSize size;  // texture attachments; a swapchain attachment's size is read at encode time
+    LoadOp load = LoadOp::Load;
+    StoreOp store = StoreOp::Store;
+    ClearValue clear;
+};
+struct BeginPassCmd {
+    uint32_t color_count = 0;
+    std::array<ColorAtt, kGpuMaxColorAttachments> colors;
+    bool has_ds = false;
+    wgpu::TextureView ds_view;
+    AttachmentSize ds_size;
+    GpuRenderPassDepthStencilAttachment ds{};
+};
+struct EndPassCmd {};
+struct SetPipelineCmd {
+    uint32_t id;
+    wgpu::RenderPipeline at_packet;
+};
+struct SetVertexBufferCmd {
+    uint32_t slot, id;
+    uint64_t offset;
+};
+struct SetIndexBufferCmd {
+    uint32_t id, format;
+    uint64_t offset;
+};
+struct DrawCmd {
+    uint32_t vertex_count, instance_count, first_vertex, first_instance;
+};
+struct DrawIndexedCmd {
+    uint32_t index_count, instance_count, first_index;
+    int32_t base_vertex;
+    uint32_t first_instance;
+};
+struct IndirectCmd {
+    uint8_t kind;  // 0 draw, 1 drawIndexed, 2 dispatch
+    uint32_t id;
+    uint64_t offset;
+};
+struct SetComputePipelineCmd {
+    uint32_t id;
+};
+struct DispatchCmd {
+    uint32_t x, y, z;
+};
+struct ViewportCmd {
+    Viewport vp;
+};
+struct ScissorCmd {
+    uint32_t x, y, w, h;
+};
+struct BlendConstantCmd {
+    float r, g, b, a;
+};
+struct StencilRefCmd {
+    uint32_t ref;
+};
+struct SetBindGroup2Cmd {
+    uint32_t group;
+    wgpu::BindGroup bind_group;  // resolved at packet time
+    std::vector<uint32_t> offsets;
+};
+using PassCmd = std::variant<BeginPassCmd, EndPassCmd, SetPipelineCmd, SetVertexBufferCmd, SetIndexBufferCmd,
+                             DrawCmd, DrawIndexedCmd, IndirectCmd, SetComputePipelineCmd, DispatchCmd, ViewportCmd,
+                             ScissorCmd, BlendConstantCmd, StencilRefCmd, SetBindGroup2Cmd>;
 
 }  // namespace
 
@@ -84,6 +339,8 @@ struct NativeExecutor::Impl {
     wgpu::Queue queue;
     AdapterDescription adapter;
     ExecutorStats stats;
+    DeviceFeatures features;
+    uint32_t max_workgroups_per_dim = 65535;
     uint64_t frame_count = 0;
     bool lost = false;
 
@@ -100,6 +357,22 @@ struct NativeExecutor::Impl {
     std::vector<PassCmd> pass_cmds;
 
     std::unordered_map<uint32_t, BufferEntry> buffers;
+    std::unordered_map<uint32_t, TextureEntry> textures;
+    std::unordered_map<uint32_t, wgpu::Sampler> samplers;
+    std::unordered_map<uint32_t, ShaderEntry> shaders;
+    std::unordered_map<uint32_t, BglEntry> bgls;
+    std::unordered_map<uint32_t, PlEntry> pipeline_layouts;
+    std::unordered_map<uint64_t, wgpu::BindGroupLayout> layouts_by_content;
+    std::unordered_map<uint32_t, RenderPipelineEntry> render_pipelines;
+    std::unordered_map<uint32_t, wgpu::ComputePipeline> compute_pipelines;
+    std::unordered_map<uint32_t, wgpu::BindGroup> bind_groups;
+    std::unordered_map<std::string, wgpu::Buffer> dummy_buffers;
+    std::unordered_map<std::string, wgpu::Sampler> dummy_samplers;
+    std::unordered_map<std::string, wgpu::TextureView> dummy_views;
+    std::vector<wgpu::Texture> dummy_textures;
+    wgpu::BindGroupLayout empty_layout;
+    wgpu::ShaderModule empty_fragment;
+    std::unique_ptr<WgslPack> pack;
 
     // ---- setup ----
 
@@ -166,13 +439,35 @@ struct NativeExecutor::Impl {
         adapter.device = to_string(info.device);
         adapter.description = to_string(info.description);
 
-        // M0: a bare device, like the worker's last fallback in requestNegotiatedDevice (feature
-        // and limit negotiation is milestone 1).
+        // The features tools/replay/replay.html requests (those the adapter has), default limits:
+        // the replay page is the reference the executor is compared against.
+        struct Want {
+            wgpu::FeatureName name;
+            bool DeviceFeatures::*flag;
+        };
+        const Want wants[] = {
+            {wgpu::FeatureName::TextureCompressionBC, &DeviceFeatures::bc},
+            {wgpu::FeatureName::Depth32FloatStencil8, &DeviceFeatures::depth32_stencil8},
+            {wgpu::FeatureName::Float32Filterable, &DeviceFeatures::float32_filterable},
+            {wgpu::FeatureName::BGRA8UnormStorage, &DeviceFeatures::bgra8_storage},
+            {wgpu::FeatureName::RG11B10UfloatRenderable, &DeviceFeatures::rg11b10_renderable},
+            {wgpu::FeatureName::TextureFormatsTier1, &DeviceFeatures::tier1},
+        };
+        std::vector<wgpu::FeatureName> required;
+        for (const Want& w : wants) {
+            if (adapter_handle.HasFeature(w.name)) {
+                required.push_back(w.name);
+                features.*(w.flag) = true;
+            }
+        }
         wgpu::DeviceDescriptor ddesc{};
+        ddesc.requiredFeatureCount = required.size();
+        ddesc.requiredFeatures = required.data();
         ddesc.SetUncapturedErrorCallback(
             [](const wgpu::Device&, wgpu::ErrorType, wgpu::StringView msg, Impl* self) {
                 ++self->stats.device_errors;
                 self->stats.last_device_error = to_string(msg);
+                if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
             },
             this);
         ddesc.SetDeviceLostCallback(
@@ -204,6 +499,9 @@ struct NativeExecutor::Impl {
         }
         device = dr.device;
         queue = device.GetQueue();
+        wgpu::Limits limits{};
+        if (device.GetLimits(&limits) == wgpu::Status::Success && limits.maxComputeWorkgroupsPerDimension >= 1)
+            max_workgroups_per_dim = limits.maxComputeWorkgroupsPerDimension;
         if (!surface) create_offscreen();
         *status = CreateStatus::Ok;
         return true;
@@ -254,9 +552,17 @@ struct NativeExecutor::Impl {
         pass_cmds.clear();
     }
 
+    // The worker's `_packetError` (a rejected v2 / texture packet), counted per opcode.
+    void packet_error(uint16_t op, const std::string& message) {
+        ++stats.packet_errors;
+        if (op < kOpcodeSlots) ++stats.packet_errors_by_opcode[op];
+        stats.last_packet_error = message;
+    }
+
     bool dispatch(const Packet& p) {
         const uint16_t op = p.opcode;
         bool handled = true;
+        const uint32_t n = p.payload_bytes;
         switch (static_cast<GpuOpcode>(op)) {
             case GpuOpcode::Nop:
                 break;
@@ -272,7 +578,11 @@ struct NativeExecutor::Impl {
                 else ++stats.op_errors;
                 break;
             case GpuOpcode::WriteBuffer:
-                if (p.payload_bytes >= sizeof(GpuWriteBufferPayload)) write_buffer(p);
+                if (n >= sizeof(GpuWriteBufferPayload)) write_buffer(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::CreateShaderModule:
+                if (n >= 16) create_shader_module(p);
                 else ++stats.op_errors;
                 break;
             case GpuOpcode::Present:
@@ -280,13 +590,151 @@ struct NativeExecutor::Impl {
                 present();
                 break;
             case GpuOpcode::DestroyResource:
-                if (p.payload_bytes >= 4) destroy_resource(read_payload<uint32_t>(p));
+                if (n >= 4) destroy_resource(read_payload<uint32_t>(p));
+                break;
+            case GpuOpcode::CreateTexture:
+                if (n >= 32) create_texture_v1(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::CreateTexture2:
+                create_texture_v2(p);
+                break;
+            case GpuOpcode::WriteTexture:
+                if (n >= 48) write_texture(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::CreateSampler:
+                if (n >= 32) create_sampler_v1(p);
+                else ++stats.op_errors;
+                break;
+            case GpuOpcode::CreateSampler2:
+                if (n >= 24) create_sampler_v2(p);
+                else packet_error(op, "CreateSampler2: malformed or truncated v2 packet");
+                break;
+            case GpuOpcode::SetPipeline:
+                if (n >= 4) {
+                    const uint32_t id = read_payload<uint32_t>(p);
+                    auto it = render_pipelines.find(id);
+                    pass_cmds.emplace_back(SetPipelineCmd{id, it != render_pipelines.end() ? it->second.pipeline
+                                                                                           : wgpu::RenderPipeline()});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            case GpuOpcode::SetVertexBuffer:
+                if (n >= 16) {
+                    const auto v = read_payload<GpuSetVertexBufferPayload>(p);
+                    pass_cmds.emplace_back(SetVertexBufferCmd{v.slot, v.buffer_id, v.offset});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            case GpuOpcode::SetIndexBuffer:
+                if (n >= 16) {
+                    const auto v = read_payload<GpuSetIndexBufferPayload>(p);
+                    pass_cmds.emplace_back(SetIndexBufferCmd{v.buffer_id, v.index_format, v.offset});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            case GpuOpcode::Draw:
+                if (n >= 16) {
+                    const auto v = read_payload<GpuDrawPayload>(p);
+                    pass_cmds.emplace_back(DrawCmd{v.vertex_count, v.instance_count, v.first_vertex, v.first_instance});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            case GpuOpcode::DrawIndexed:
+                if (n >= 20) {
+                    const auto v = read_payload<GpuDrawIndexedPayload>(p);
+                    pass_cmds.emplace_back(
+                        DrawIndexedCmd{v.index_count, v.instance_count, v.first_index, v.base_vertex, v.first_instance});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            case GpuOpcode::SetComputePipeline:
+                if (n >= 4) pass_cmds.emplace_back(SetComputePipelineCmd{read_payload<uint32_t>(p)});
+                break;
+            case GpuOpcode::DispatchCompute:
+                if (n >= 12) {
+                    const auto v = read_payload<GpuDispatchComputePayload>(p);
+                    pass_cmds.emplace_back(DispatchCmd{v.workgroup_x, v.workgroup_y, v.workgroup_z});
+                }
+                break;
+            case GpuOpcode::DrawIndirect:
+            case GpuOpcode::DrawIndexedIndirect:
+            case GpuOpcode::DispatchIndirect:
+                if (n >= 16) {
+                    const auto v = read_payload<GpuIndirectPayload>(p);
+                    pass_cmds.emplace_back(IndirectCmd{
+                        static_cast<uint8_t>(op == static_cast<uint16_t>(GpuOpcode::DrawIndirect)          ? 0
+                                             : op == static_cast<uint16_t>(GpuOpcode::DrawIndexedIndirect) ? 1
+                                                                                                           : 2),
+                        v.buffer_id, v.offset});
+                } else {
+                    ++stats.op_errors;
+                }
+                break;
+            // ABI v2 (render_state_packets.js handlePacket). A rejected packet is counted as a
+            // packet error and is still "handled" (the worker counts it too).
+            case GpuOpcode::CreateBindGroupLayout:
+                if (!create_bind_group_layout(p)) packet_error(op, pending_error("malformed bind group layout"));
+                break;
+            case GpuOpcode::CreatePipelineLayout:
+                if (!create_pipeline_layout(p)) packet_error(op, pending_error("malformed pipeline layout"));
+                break;
+            case GpuOpcode::CreateRenderPipeline2:
+                if (!(n >= 16 + sizeof(GpuRenderPipelineKey) && create_render_pipeline2(p)))
+                    packet_error(op, pending_error("malformed or truncated v2 packet"));
+                break;
+            case GpuOpcode::CreateComputePipeline2:
+                if (!(n >= 32 && create_compute_pipeline2(p))) packet_error(op, pending_error("malformed or truncated v2 packet"));
                 break;
             case GpuOpcode::BeginRenderPass:
-                if (auto plan = decode_begin_render_pass(p)) begin_render_pass(*plan);
+                if (!(n >= sizeof(GpuBeginRenderPassPayload) && begin_render_pass(p)))
+                    packet_error(op, pending_error("malformed or truncated v2 packet"));
                 break;
             case GpuOpcode::EndRenderPass:
                 pass_cmds.emplace_back(EndPassCmd{});
+                break;
+            case GpuOpcode::SetViewport:
+                if (n >= 24) {
+                    const auto v = read_payload<GpuSetViewportPayload>(p);
+                    Viewport vp;
+                    vp.x = v.x; vp.y = v.y; vp.width = v.width; vp.height = v.height;
+                    vp.min_depth = v.min_depth; vp.max_depth = v.max_depth;
+                    pass_cmds.emplace_back(ViewportCmd{vp});
+                } else {
+                    packet_error(op, "malformed or truncated v2 packet");
+                }
+                break;
+            case GpuOpcode::SetScissorRect:
+                if (n >= 16) {
+                    const auto v = read_payload<GpuSetScissorRectPayload>(p);
+                    pass_cmds.emplace_back(ScissorCmd{v.x, v.y, v.width, v.height});
+                } else {
+                    packet_error(op, "malformed or truncated v2 packet");
+                }
+                break;
+            case GpuOpcode::SetBlendConstant:
+                if (n >= 16) {
+                    const auto v = read_payload<GpuSetBlendConstantPayload>(p);
+                    pass_cmds.emplace_back(BlendConstantCmd{v.r, v.g, v.b, v.a});
+                } else {
+                    packet_error(op, "malformed or truncated v2 packet");
+                }
+                break;
+            case GpuOpcode::SetStencilReference:
+                if (n >= 4) pass_cmds.emplace_back(StencilRefCmd{read_payload<uint32_t>(p)});
+                else packet_error(op, "malformed or truncated v2 packet");
+                break;
+            case GpuOpcode::CreateBindGroup2:
+                if (!create_bind_group2(p)) packet_error(op, pending_error("malformed or truncated v2 packet"));
+                break;
+            case GpuOpcode::SetBindGroup2:
+                if (!set_bind_group2(p)) packet_error(op, pending_error("malformed or truncated v2 packet"));
                 break;
             default:
                 handled = false;
@@ -297,6 +745,21 @@ struct NativeExecutor::Impl {
         else ++stats.unhandled[op];
         return !lost;
     }
+
+    std::string packet_error_text;
+    bool packet_error_set = false;
+    bool fail(const std::string& message) {
+        packet_error_text = message;
+        packet_error_set = true;
+        return false;
+    }
+    std::string pending_error(const char* fallback) {
+        std::string s = packet_error_set ? packet_error_text : std::string(fallback);
+        packet_error_set = false;
+        return s;
+    }
+
+    // ---- buffers (M0) ----
 
     // _handleCreateBuffer: re-creating an id replaces the buffer.
     void create_buffer(const GpuCreateBufferPayload& c) {
@@ -345,26 +808,909 @@ struct NativeExecutor::Impl {
     }
 
     // _handleDestroyResource: the id leaves every table; Dawn keeps the object alive until the GPU
-    // is done with it (the worker's deferred destroy).
-    void destroy_resource(uint32_t id) { buffers.erase(id); }
+    // is done with it (the worker's deferred destroy). Bind groups and pass commands that already
+    // hold a handle keep it (the worker resolves SetBindGroup2 / SetPipeline at packet time too).
+    void destroy_resource(uint32_t id) {
+        buffers.erase(id);
+        textures.erase(id);
+        samplers.erase(id);
+        bind_groups.erase(id);
+        shaders.erase(id);
+        render_pipelines.erase(id);
+        compute_pipelines.erase(id);
+        bgls.erase(id);
+        pipeline_layouts.erase(id);
+    }
 
-    // render_state_packets.js _beginRenderPass: every attachment must resolve now (else the packet
-    // is dropped); the pass itself is encoded at Present.
-    void begin_render_pass(const RenderPassPlan& plan) {
-        for (uint32_t i = 0; i < plan.color_count; ++i) {
-            const ColorAttachmentPlan& c = plan.colors[i];
-            if (c.texture_id == 0) continue;
-            if (c.texture_id != kGpuSwapchainTextureId) {
-                ++stats.render_pass_missing_texture;  // M0 creates no textures
-                return;
-            }
-            if (c.view.format != 0) set_swapchain_format(c.view.format);
-        }
-        if (plan.has_depth_stencil) {
-            ++stats.render_pass_missing_texture;
+    // ---- shaders (wgpu_worker.js _handleCreateShaderModule / _resolveShaderPayload) ----
+
+    bool load_pack(const std::string& path, std::string* error) {
+        auto p = std::make_unique<WgslPack>();
+        if (!p->load(path, error)) return false;
+        pack = std::move(p);
+        return true;
+    }
+
+    void create_shader_module(const Packet& p) {
+        const auto h = read_payload<GpuCreateShaderModulePayload>(p);
+        if (uint64_t{16} + h.code_len > p.payload_bytes) {
+            ++stats.op_errors;  // truncated payload
             return;
         }
-        pass_cmds.emplace_back(BeginPassCmd{plan});
+        const std::string raw(reinterpret_cast<const char*>(p.payload) + 16, h.code_len);
+        const std::string_view trimmed = trim_view(raw);
+        std::string code = raw;
+        if (trimmed.empty()) {
+            // The worker looks up a synthetic `empty:<stage>:<id>` hash, which no pack holds: the empty
+            // text compiles as an (empty) module.
+        } else if (auto hash = parse_hash_only_shader_payload(trimmed)) {
+            std::optional<std::string> hit = pack ? pack->get(*hash) : std::nullopt;
+            if (hit && !hit->empty()) {
+                code = std::move(*hit);
+                ++stats.shader_pack_hits;
+            } else {
+                ++stats.shader_pack_misses;  // the hash text itself is compiled (and rejected)
+            }
+        }
+        const char* stage_name = h.stage == 0 ? "vertex" : h.stage == 1 ? "fragment" : h.stage == 2 ? "compute" : "";
+        ShaderEntry e;
+        e.stage = h.stage;
+        e.explicit_ep = extract_wgsl_entry_point(code, stage_name);
+        e.module = make_module(code);
+        e.code = std::move(code);
+        shaders[h.id] = std::move(e);
+        ++stats.shader_modules;
+    }
+
+    wgpu::ShaderModule make_module(const std::string& code) {
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = {code.data(), code.size()};
+        wgpu::ShaderModuleDescriptor desc{};
+        desc.nextInChain = &wgsl;
+        return device.CreateShaderModule(&desc);
+    }
+
+    // ---- textures (texture_packets.js TexturePackets._create / handleWriteTexture) ----
+
+    void create_texture_v1(const Packet& p) {
+        const auto c = read_payload<GpuCreateTexturePayload>(p);
+        const uint8_t dimension = c.dimension <= 2 ? static_cast<uint8_t>(c.dimension) : 1;
+        const uint32_t w = std::max<uint32_t>(1, c.width);
+        const uint32_t h = dimension == 0 ? 1 : std::max<uint32_t>(1, c.height);
+        const uint32_t d = dimension == 0 ? 1 : std::max<uint32_t>(1, c.depth_or_layers);
+        const uint8_t fmt = v1_format_code(c.format);
+        std::vector<uint8_t> views;
+        if (uint8_t sib = srgb_sibling(fmt)) views.push_back(sib);
+        create_texture(static_cast<uint16_t>(GpuOpcode::CreateTexture), c.id, w, h, d,
+                       clamp_mip_levels(c.mip_levels, w, h, d, dimension), 1, c.usage_flags, dimension, fmt, views);
+    }
+
+    void create_texture_v2(const Packet& p) {
+        const uint16_t op = static_cast<uint16_t>(GpuOpcode::CreateTexture2);
+        if (p.payload_bytes < sizeof(GpuCreateTexture2Payload)) {
+            packet_error(op, "CreateTexture2: payload too short");
+            return;
+        }
+        const auto c = read_payload<GpuCreateTexture2Payload>(p);
+        if (!format_valid(c.format)) {
+            packet_error(op, "CreateTexture2 " + std::to_string(c.id) + ": invalid texture format code");
+            return;
+        }
+        if (c.dimension > 2) {
+            packet_error(op, "CreateTexture2 " + std::to_string(c.id) + ": invalid dimension");
+            return;
+        }
+        if (c.view_format_count > kGpuMaxTextureViewFormats) {
+            packet_error(op, "CreateTexture2 " + std::to_string(c.id) + ": view_format_count too large");
+            return;
+        }
+        std::vector<uint8_t> views;
+        for (uint32_t i = 0; i < c.view_format_count; ++i) {
+            if (!format_valid(c.view_formats[i])) {
+                packet_error(op, "CreateTexture2 " + std::to_string(c.id) + ": invalid view format code");
+                return;
+            }
+            views.push_back(c.view_formats[i]);
+        }
+        const uint32_t w = std::max<uint32_t>(1, c.width);
+        const uint32_t h = c.dimension == 0 ? 1 : std::max<uint32_t>(1, c.height);
+        const uint32_t d = c.dimension == 0 ? 1 : std::max<uint32_t>(1, c.depth_or_layers);
+        const uint32_t mips = clamp_mip_levels(c.mip_levels, w, h, d, c.dimension);
+        const uint32_t samples = clamp_sample_count(c.sample_count, mips, c.dimension, d);
+        create_texture(op, c.id, w, h, d, mips, samples, c.usage_flags, c.dimension, c.format, views);
+    }
+
+    // TexturePackets._create: sRGB sibling view formats, 3D-BC fallback, 1D -> 2D promotion.
+    void create_texture(uint16_t op, uint32_t id, uint32_t w, uint32_t h, uint32_t d, uint32_t mips,
+                        uint32_t samples, uint32_t usage, uint8_t dimension, uint8_t format,
+                        const std::vector<uint8_t>& requested_views) {
+        textures.erase(id);
+        std::vector<uint8_t> view_formats;
+        uint8_t eff_format = format;
+        bool bc3d = false;
+        if (dimension == 2 && format_is_bc(format) && !features.bc_sliced_3d) {
+            bc3d = true;
+            eff_format = 22;
+            for (uint8_t v : requested_views)
+                if (!format_is_bc(v)) view_formats.push_back(v);
+        } else {
+            view_formats = resolve_compatible_view_formats(format, requested_views);
+        }
+        bool promoted = false;
+        uint32_t eff_h = h, eff_d = d, eff_mips = mips, eff_samples = samples;
+        uint8_t eff_dim = dimension;
+        if (dimension == 0) {  // promote1DTo2D (default on)
+            eff_dim = 1;
+            eff_h = 1;
+            eff_d = 1;
+            eff_mips = 1;
+            eff_samples = 1;
+            promoted = true;
+        }
+        wgpu::TextureDescriptor td{};
+        td.usage = static_cast<wgpu::TextureUsage>(usage);
+        td.dimension = eff_dim == 0 ? wgpu::TextureDimension::e1D
+                       : eff_dim == 2 ? wgpu::TextureDimension::e3D
+                                      : wgpu::TextureDimension::e2D;
+        td.size = {w, eff_h, eff_d};
+        td.format = wgpu_format(eff_format);
+        td.mipLevelCount = eff_mips;
+        td.sampleCount = eff_samples;
+        std::vector<wgpu::TextureFormat> vf;
+        for (uint8_t v : view_formats) vf.push_back(wgpu_format(v));
+        td.viewFormatCount = vf.size();
+        td.viewFormats = vf.data();
+        TextureEntry e;
+        e.texture = device.CreateTexture(&td);
+        if (!e.texture) {
+            packet_error(op, "CreateTexture " + std::to_string(id) + ": createTexture failed");
+            return;
+        }
+        e.default_view = e.texture.CreateView();
+        e.geom.width = w;
+        e.geom.height = eff_h;
+        e.geom.depth_or_layers = eff_d;
+        e.geom.mips = eff_mips;
+        e.geom.dimension = eff_dim;
+        e.geom.requested_1d = dimension == 0;
+        e.geom.format = eff_format;
+        e.usage = usage;
+        e.sample_count = eff_samples;
+        e.promoted_1d = promoted;
+        e.bc3d_fallback = bc3d;
+        textures[id] = std::move(e);
+        ++stats.textures_created;
+    }
+
+    // WriteTexture (opcode 13): the effective upload of TexturePackets.handleWriteTexture.
+    void write_texture(const Packet& p) {
+        const auto w = read_payload<GpuWriteTexturePayload>(p);
+        if (uint64_t{48} + w.data_len > p.payload_bytes) return;
+        auto it = textures.find(w.texture_id);
+        if (it == textures.end()) return;
+        TextureEntry& t = it->second;
+        if (t.bc3d_fallback) return;
+        WriteTextureArgs a;
+        a.mip = w.mip_level; a.ox = w.origin_x; a.oy = w.origin_y; a.oz = w.origin_z;
+        a.width = w.width; a.height = w.height; a.depth = w.depth_or_layers;
+        a.bytes_per_row = w.bytes_per_row; a.rows_per_image = w.rows_per_image; a.data_len = w.data_len;
+        const WriteTexturePlan plan = plan_write_texture(a, t.geom);
+        if (plan.status == WriteTexturePlan::Status::BadMip) {
+            packet_error(static_cast<uint16_t>(GpuOpcode::WriteTexture), "WriteTexture: mipLevel out of bounds");
+            return;
+        }
+        if (plan.status == WriteTexturePlan::Status::BadRowBytes) {
+            packet_error(static_cast<uint16_t>(GpuOpcode::WriteTexture), "WriteTexture: compressed bytesPerRow too small");
+            return;
+        }
+        if (plan.status != WriteTexturePlan::Status::Write || w.data_len == 0) return;
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = t.texture;
+        dst.mipLevel = plan.mip;
+        dst.origin = {plan.ox, plan.oy, plan.oz};
+        dst.aspect = wgpu::TextureAspect::All;
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.offset = 0;
+        layout.bytesPerRow = plan.bytes_per_row ? plan.bytes_per_row : wgpu::kCopyStrideUndefined;
+        layout.rowsPerImage = plan.rows_per_image ? plan.rows_per_image : wgpu::kCopyStrideUndefined;
+        const wgpu::Extent3D size{plan.width, plan.height, plan.depth};
+        queue.WriteTexture(&dst, p.payload + 48, w.data_len, &layout, &size);
+        ++stats.texture_uploads;
+        stats.texture_upload_bytes += w.data_len;
+    }
+
+    // TexturePackets / RenderStatePackets.getOrCreateTextureView (W347 1D promotion, 3D-BC fallback).
+    wgpu::TextureView texture_view(TextureEntry& t, const GpuTextureViewDesc* d) {
+        uint8_t fmt = d ? d->format : 0, dim = d ? d->dimension : 0, aspect = d ? d->aspect : 0;
+        uint32_t base_mip = d ? d->base_mip_level : 0, mip_count = d ? d->mip_level_count : 0;
+        uint32_t base_layer = d ? d->base_array_layer : 0, layer_count = d ? d->array_layer_count : 0;
+        if (fmt && t.bc3d_fallback && format_is_bc(fmt)) fmt = t.geom.format;
+        if (dim == 1 && (t.geom.dimension == 1 || t.promoted_1d)) {  // explicit 1d view of a 2d / promoted texture
+            dim = 2;
+            base_layer = 0;
+            layer_count = 1;
+            if (t.promoted_1d || t.geom.mips == 1) {
+                base_mip = 0;
+                mip_count = 1;
+            }
+        }
+        if (!fmt && !dim && !aspect && !base_mip && !mip_count && !base_layer && !layer_count) return t.default_view;
+        const uint64_t key = uint64_t{fmt} | (uint64_t{dim} << 8) | (uint64_t{aspect} << 16) |
+                             (uint64_t{base_mip & 0xffff} << 24) | (uint64_t{mip_count & 0xffff} << 40) |
+                             (uint64_t{base_layer & 0xff} << 56);
+        const uint64_t key2 = key ^ (uint64_t{layer_count} * 0x9E3779B97F4A7C15ull) ^
+                              (uint64_t{base_layer >> 8} * 0xC2B2AE3D27D4EB4Full);
+        auto vit = t.views.find(key2);
+        if (vit != t.views.end()) return vit->second;
+        wgpu::TextureViewDescriptor vd{};
+        if (fmt) vd.format = wgpu_format(fmt);
+        if (dim) vd.dimension = wgpu_view_dim(dim);
+        vd.aspect = aspect == 1 ? wgpu::TextureAspect::DepthOnly
+                    : aspect == 2 ? wgpu::TextureAspect::StencilOnly
+                                  : wgpu::TextureAspect::Undefined;
+        vd.baseMipLevel = base_mip;
+        if (mip_count) vd.mipLevelCount = mip_count;
+        vd.baseArrayLayer = base_layer;
+        if (layer_count) vd.arrayLayerCount = layer_count;
+        wgpu::TextureView v = t.texture.CreateView(&vd);
+        if (t.views.size() >= 64) t.views.erase(t.views.begin());
+        t.views[key2] = v;
+        return v;
+    }
+
+    // ---- samplers ----
+
+    void create_sampler_v1(const Packet& p) {  // _handleCreateSampler
+        const auto c = read_payload<GpuCreateSamplerPayload>(p);
+        wgpu::SamplerDescriptor sd{};
+        sd.addressModeU = wgpu_address(c.address_u);
+        sd.addressModeV = wgpu_address(c.address_v);
+        sd.addressModeW = wgpu_address(c.address_w);
+        sd.magFilter = c.mag_filter == 1 ? wgpu::FilterMode::Linear : wgpu::FilterMode::Nearest;
+        sd.minFilter = c.min_filter == 1 ? wgpu::FilterMode::Linear : wgpu::FilterMode::Nearest;
+        sd.mipmapFilter = c.mipmap_filter == 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
+        sd.maxAnisotropy = static_cast<uint16_t>(std::min<uint32_t>(std::max<uint32_t>(1, c.max_anisotropy), 65535));
+        samplers[c.id] = device.CreateSampler(&sd);
+        ++stats.samplers_created;
+    }
+
+    void create_sampler_v2(const Packet& p) {  // RenderStatePackets._createSampler / decodeSampler2Packet
+        const auto c = read_payload<GpuCreateSampler2Payload>(p);
+        wgpu::SamplerDescriptor sd{};
+        sd.addressModeU = wgpu_address(c.address_u);
+        sd.addressModeV = wgpu_address(c.address_v);
+        sd.addressModeW = wgpu_address(c.address_w);
+        sd.magFilter = c.mag_filter == 1 ? wgpu::FilterMode::Linear : wgpu::FilterMode::Nearest;
+        sd.minFilter = c.min_filter == 1 ? wgpu::FilterMode::Linear : wgpu::FilterMode::Nearest;
+        sd.mipmapFilter = c.mipmap_filter == 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
+        sd.lodMinClamp = c.lod_min_clamp;
+        sd.lodMaxClamp = c.lod_max_clamp;
+        sd.maxAnisotropy = std::max<uint16_t>(1, c.max_anisotropy);
+        if (c.compare != 0) sd.compare = wgpu_compare(c.compare);
+        samplers[c.id] = device.CreateSampler(&sd);
+        ++stats.samplers_created;
+    }
+
+    // ---- layouts (RenderStatePackets._createBindGroupLayout / _createPipelineLayout) ----
+
+    wgpu::BindGroupLayout empty_bgl() {
+        if (!empty_layout) {
+            wgpu::BindGroupLayoutDescriptor d{};
+            empty_layout = device.CreateBindGroupLayout(&d);
+        }
+        return empty_layout;
+    }
+
+    bool create_bind_group_layout(const Packet& p) {
+        if (p.payload_bytes < sizeof(GpuCreateBindGroupLayoutPayload)) return false;
+        const auto h = read_payload<GpuCreateBindGroupLayoutPayload>(p);
+        if (h.flags & GpuLayoutFlags::ManifestReference) {
+            ++stats.manifest_layouts_unavailable;  // layout-manifest.json is not loaded by the replay page either
+            return fail("manifest bind group layout unavailable");
+        }
+        if (uint64_t{24} + uint64_t{h.entry_count} * 24 > p.payload_bytes) return false;
+        std::vector<LayoutEntry> entries;
+        std::vector<bool> seen_dummy;
+        for (uint32_t i = 0; i < h.entry_count; ++i) {
+            const auto e = read_payload<GpuBindGroupLayoutEntry>(p, 24 + size_t{i} * 24);
+            LayoutEntry le;
+            le.binding = e.binding;
+            le.visibility = e.visibility & 0x7;
+            le.kind = e.type;
+            le.subtype = e.binding_type;
+            le.dynamic = (e.flags & 0x1) != 0;
+            le.multisampled = (e.flags & 0x2) != 0;
+            le.view_dim = e.view_dimension != 0 ? e.view_dimension : 2;
+            le.storage_format = e.storage_format;
+            le.min_binding_size = e.min_binding_size;
+            if (le.kind == 0) {
+                if (le.subtype > 2) return false;
+                if (le.subtype == 1 && (le.visibility & 0x1)) le.visibility &= ~0x1u;
+            } else if (le.kind == 1) {
+                if (le.subtype > 2) return false;
+            } else if (le.kind == 2) {
+                if (le.subtype > 4 || le.view_dim > 6) return false;
+            } else if (le.kind == 3) {
+                if (le.subtype > 2 || !format_valid(le.storage_format) || le.view_dim > 6) return false;
+                if ((le.subtype == 0 || le.subtype == 2) && (le.visibility & 0x1)) le.visibility &= ~0x1u;
+            } else {
+                return false;
+            }
+            for (const LayoutEntry& prev : entries)
+                if (prev.binding == le.binding) return fail("bind group layout: duplicate binding");
+            if (le.kind == 3) {
+                const StorageResolution sr = resolve_storage_format(le.storage_format, features);
+                le.storage_format = sr.supported && sr.storage_format ? sr.storage_format : 22;
+                if (le.view_dim == 4 || le.view_dim == 5) le.view_dim = 3;
+            }
+            entries.push_back(le);
+        }
+        wgpu::BindGroupLayout layout;
+        const uint64_t content = h.content_id;
+        auto cit = content ? layouts_by_content.find(content) : layouts_by_content.end();
+        if (cit != layouts_by_content.end()) {
+            layout = cit->second;
+        } else {
+            std::vector<wgpu::BindGroupLayoutEntry> wes(entries.size());
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const LayoutEntry& le = entries[i];
+                wgpu::BindGroupLayoutEntry& w = wes[i];
+                w.binding = le.binding;
+                w.visibility = static_cast<wgpu::ShaderStage>(le.visibility);
+                if (le.kind == 0) {
+                    w.buffer.type = le.subtype == 0   ? wgpu::BufferBindingType::Uniform
+                                    : le.subtype == 1 ? wgpu::BufferBindingType::Storage
+                                                      : wgpu::BufferBindingType::ReadOnlyStorage;
+                    w.buffer.hasDynamicOffset = le.dynamic;
+                    w.buffer.minBindingSize = le.min_binding_size;
+                } else if (le.kind == 1) {
+                    w.sampler.type = le.subtype == 0   ? wgpu::SamplerBindingType::Filtering
+                                     : le.subtype == 1 ? wgpu::SamplerBindingType::NonFiltering
+                                                       : wgpu::SamplerBindingType::Comparison;
+                } else if (le.kind == 2) {
+                    static const wgpu::TextureSampleType kS[5] = {
+                        wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
+                        wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
+                    w.texture.sampleType = kS[le.subtype];
+                    w.texture.viewDimension = wgpu_view_dim(le.view_dim);
+                    w.texture.multisampled = le.multisampled;
+                } else {
+                    w.storageTexture.access = le.subtype == 0   ? wgpu::StorageTextureAccess::WriteOnly
+                                              : le.subtype == 1 ? wgpu::StorageTextureAccess::ReadOnly
+                                                                : wgpu::StorageTextureAccess::ReadWrite;
+                    w.storageTexture.format = wgpu_format(le.storage_format);
+                    w.storageTexture.viewDimension = wgpu_view_dim(le.view_dim);
+                }
+            }
+            wgpu::BindGroupLayoutDescriptor d{};
+            d.entryCount = wes.size();
+            d.entries = wes.data();
+            layout = device.CreateBindGroupLayout(&d);
+            if (content) layouts_by_content[content] = layout;
+        }
+        BglEntry b;
+        b.layout = layout;
+        b.entries = std::move(entries);
+        bgls[h.id] = std::move(b);
+        ++stats.bind_group_layouts;
+        return true;
+    }
+
+    bool create_pipeline_layout(const Packet& p) {
+        if (p.payload_bytes < sizeof(GpuCreatePipelineLayoutPayload)) return false;
+        const auto h = read_payload<GpuCreatePipelineLayoutPayload>(p);
+        if (h.flags & GpuLayoutFlags::ManifestReference) {
+            ++stats.manifest_layouts_unavailable;
+            return fail("manifest pipeline layout unavailable");
+        }
+        if (uint64_t{24} + uint64_t{h.bind_group_layout_count} * 4 > p.payload_bytes) return false;
+        std::vector<wgpu::BindGroupLayout> layouts;
+        const BglEntry* group0 = nullptr;
+        for (uint32_t g = 0; g < h.bind_group_layout_count; ++g) {
+            const uint32_t bgl_id = read_payload<uint32_t>(p, 24 + size_t{g} * 4);
+            const BglEntry* rec = nullptr;
+            if (bgl_id != 0) {
+                auto it = bgls.find(bgl_id);
+                if (it == bgls.end()) return fail("pipeline layout: unknown bind group layout " + std::to_string(bgl_id));
+                rec = &it->second;
+            }
+            if (g == 0) group0 = rec;
+            layouts.push_back(rec ? rec->layout : empty_bgl());
+        }
+        wgpu::PipelineLayoutDescriptor d{};
+        d.bindGroupLayoutCount = layouts.size();
+        d.bindGroupLayouts = layouts.data();
+        PlEntry e;
+        e.layout = device.CreatePipelineLayout(&d);
+        e.group0_has_entries = group0 && (!group0->entries_known || !group0->entries.empty());
+        pipeline_layouts[h.id] = std::move(e);
+        ++stats.pipeline_layouts;
+        return true;
+    }
+
+    // ---- pipelines ----
+
+    bool create_render_pipeline2(const Packet& p) {
+        const auto h = read_payload<GpuCreateRenderPipeline2Payload>(p);
+        const GpuRenderPipelineKey& key = h.key;
+        wgpu::PipelineLayout layout;
+        bool auto_layout = h.pipeline_layout_id == 0;
+        bool group0_has_entries = false;
+        if (!auto_layout) {
+            auto lit = pipeline_layouts.find(h.pipeline_layout_id);
+            if (lit == pipeline_layouts.end()) return fail("unknown pipeline layout " + std::to_string(h.pipeline_layout_id));
+            layout = lit->second.layout;
+            group0_has_entries = lit->second.group0_has_entries;
+        } else {
+            ++stats.auto_layout_pipelines;
+        }
+        auto vit = shaders.find(h.vs_module_id);
+        if (vit == shaders.end()) return fail("unknown vertex shader module " + std::to_string(h.vs_module_id));
+        const ShaderEntry& vs = vit->second;
+
+        // decodeRenderPipelineKey + validateVertexBufferLayouts
+        const uint32_t target_count = std::min<uint32_t>(key.color_target_count, 8);
+        const uint32_t buffer_count = std::min<uint32_t>(key.vertex_buffer_count, 8);
+        const uint32_t attr_count = std::min<uint32_t>(key.vertex_attribute_count, 16);
+        std::vector<wgpu::VertexAttribute> attrs[8];
+        bool used_location[16] = {};
+        uint32_t attached = 0;
+        for (uint32_t i = 0; i < attr_count; ++i) {
+            const GpuVertexAttributeKey& a = key.vertex_attributes[i];
+            if (a.buffer_index >= buffer_count) continue;
+            if (key.vertex_buffers[a.buffer_index].step_mode == 0) continue;
+            uint32_t bytes = 0;
+            wgpu::VertexAttribute va{};
+            va.format = wgpu_vertex_format(a.format, &bytes);
+            if (!bytes) return fail("render pipeline vertex layout invalid: bad vertex format");
+            if (a.shader_location >= 16) return fail("render pipeline vertex layout invalid: shaderLocation");
+            if (used_location[a.shader_location])
+                return fail("render pipeline vertex layout invalid: duplicate shaderLocation");
+            used_location[a.shader_location] = true;
+            const uint32_t stride = key.vertex_buffers[a.buffer_index].array_stride;
+            if (stride > 0 && a.offset + bytes > stride)
+                return fail("render pipeline vertex layout invalid: attribute exceeds arrayStride");
+            va.offset = a.offset;
+            va.shaderLocation = a.shader_location;
+            attrs[a.buffer_index].push_back(va);
+            ++attached;
+        }
+        std::vector<wgpu::VertexBufferLayout> vbs(buffer_count);
+        for (uint32_t i = 0; i < buffer_count; ++i) {
+            const GpuVertexBufferKey& b = key.vertex_buffers[i];
+            if (b.step_mode == 0) continue;  // null slot
+            if (b.step_mode > 2) return fail("render pipeline vertex layout invalid: stepMode");
+            if (b.array_stride % 4 != 0) return fail("render pipeline vertex layout invalid: arrayStride");
+            vbs[i].stepMode = b.step_mode == 1 ? wgpu::VertexStepMode::Vertex : wgpu::VertexStepMode::Instance;
+            vbs[i].arrayStride = b.array_stride;
+            vbs[i].attributeCount = attrs[i].size();
+            vbs[i].attributes = attrs[i].data();
+        }
+        if (attached != attr_count) return fail("render pipeline vertex layout dropped attributes");
+
+        std::vector<wgpu::ColorTargetState> targets(target_count);
+        std::vector<wgpu::BlendState> blends(target_count);
+        for (uint32_t i = 0; i < target_count; ++i) {
+            const GpuColorTargetKey& t = key.color_targets[i];
+            if (t.format == 0) continue;  // null target
+            if (!format_valid(t.format)) return fail("render pipeline target: invalid texture format");
+            targets[i].format = wgpu_format(t.format);
+            targets[i].writeMask = static_cast<wgpu::ColorWriteMask>(t.write_mask & 0x0f);
+        }
+
+        wgpu::RenderPipelineDescriptor rd{};
+        wgpu::FragmentState fragment{};
+        const ShaderEntry* fs = nullptr;
+        if (h.fs_module_id != 0) {
+            auto fit = shaders.find(h.fs_module_id);
+            if (fit == shaders.end()) return fail("unknown fragment shader module " + std::to_string(h.fs_module_id));
+            fs = &fit->second;
+            for (uint32_t i = 0; i < target_count; ++i) {
+                const GpuColorTargetKey& t = key.color_targets[i];
+                if (t.format == 0 || !t.blend_enabled) continue;
+                if (!blendable(t.format, features)) continue;  // sanitizeColorTargetBlendState strips the blend
+                blends[i].color.operation = wgpu_blend_op(t.color.operation);
+                blends[i].color.srcFactor = wgpu_blend_factor(t.color.src_factor);
+                blends[i].color.dstFactor = wgpu_blend_dst_factor(t.color.dst_factor);
+                blends[i].alpha.operation = wgpu_blend_op(t.alpha.operation);
+                blends[i].alpha.srcFactor = wgpu_blend_factor(t.alpha.src_factor);
+                blends[i].alpha.dstFactor = wgpu_blend_dst_factor(t.alpha.dst_factor);
+                targets[i].blend = &blends[i];
+            }
+            fragment.module = fs->module;
+            const std::string ep = resolve_shader_entry_point(fs->code, fs->explicit_ep, "fragment");
+            fragment.entryPoint = {ep.data(), ep.size()};
+            fragment.targetCount = targets.size();
+            fragment.targets = targets.data();
+            rd.fragment = &fragment;
+            fragment_ep_storage = ep;
+            fragment.entryPoint = {fragment_ep_storage.data(), fragment_ep_storage.size()};
+        } else if (target_count > 0) {
+            if (!empty_fragment) empty_fragment = make_module("@fragment fn fs_main() {}\n");
+            for (uint32_t i = 0; i < target_count; ++i) targets[i].writeMask = wgpu::ColorWriteMask::None;
+            fragment.module = empty_fragment;
+            fragment_ep_storage = "fs_main";
+            fragment.entryPoint = {fragment_ep_storage.data(), fragment_ep_storage.size()};
+            fragment.targetCount = targets.size();
+            fragment.targets = targets.data();
+            rd.fragment = &fragment;
+        }
+
+        wgpu::DepthStencilState ds{};
+        const GpuDepthStencilKey& dk = key.depth_stencil;
+        if (dk.format != 0 && format_valid(dk.format)) {
+            const bool has_depth = format_is_depth(dk.format);
+            ds.format = wgpu_format(dk.format);
+            ds.depthWriteEnabled = has_depth && dk.depth_write_enabled ? wgpu::OptionalBool::True : wgpu::OptionalBool::False;
+            auto face = [](const GpuStencilFaceKey& f) {
+                wgpu::StencilFaceState s{};
+                s.compare = f.compare != 0 && f.compare < 9 ? wgpu_compare(f.compare) : wgpu::CompareFunction::Always;
+                s.failOp = wgpu_stencil_op(f.fail_op);
+                s.depthFailOp = wgpu_stencil_op(f.depth_fail_op);
+                s.passOp = wgpu_stencil_op(f.pass_op);
+                return s;
+            };
+            ds.stencilFront = face(dk.stencil_front);
+            ds.stencilBack = face(dk.stencil_back);
+            ds.stencilReadMask = dk.stencil_read_mask;
+            ds.stencilWriteMask = dk.stencil_write_mask;
+            ds.depthBias = dk.depth_bias;
+            float slope, clamp;
+            std::memcpy(&slope, &dk.depth_bias_slope_scale_bits, 4);
+            std::memcpy(&clamp, &dk.depth_bias_clamp_bits, 4);
+            ds.depthBiasSlopeScale = std::isfinite(slope) ? slope : 0.f;
+            ds.depthBiasClamp = std::isfinite(clamp) ? clamp : 0.f;
+            const wgpu::CompareFunction cmp = wgpu_compare(dk.depth_compare);
+            if (has_depth) ds.depthCompare = cmp != wgpu::CompareFunction::Undefined ? cmp : wgpu::CompareFunction::Always;
+            else if (cmp == wgpu::CompareFunction::Always) ds.depthCompare = wgpu::CompareFunction::Always;
+            rd.depthStencil = &ds;
+        }
+
+        const GpuPrimitiveKey& pk = key.primitive;
+        rd.primitive.topology = wgpu_topology(pk.topology);
+        rd.primitive.frontFace = pk.front_face == 1 ? wgpu::FrontFace::CW : wgpu::FrontFace::CCW;
+        rd.primitive.cullMode = pk.cull_mode == 1 ? wgpu::CullMode::Front : pk.cull_mode == 2 ? wgpu::CullMode::Back
+                                                                                               : wgpu::CullMode::None;
+        if (pk.strip_index_format != 0 && (pk.topology == 1 || pk.topology == 3))
+            rd.primitive.stripIndexFormat = pk.strip_index_format == 1   ? wgpu::IndexFormat::Uint16
+                                            : pk.strip_index_format == 2 ? wgpu::IndexFormat::Uint32
+                                                                         : wgpu::IndexFormat::Undefined;
+        // GPUPrimitiveState.unclippedDepth needs the depth-clip-control feature, which the replay
+        // page does not request: the worker's pipeline fails validation, and so does Dawn's.
+        if (pk.unclipped_depth) rd.primitive.unclippedDepth = true;
+        rd.multisample.count = key.multisample.count ? key.multisample.count : 1;
+        rd.multisample.mask = key.multisample.mask;
+        rd.multisample.alphaToCoverageEnabled = key.multisample.alpha_to_coverage_enabled != 0;
+
+        rd.layout = auto_layout ? nullptr : layout;
+        rd.vertex.module = vs.module;
+        const std::string vep = resolve_shader_entry_point(vs.code, vs.explicit_ep, "vertex");
+        rd.vertex.entryPoint = {vep.data(), vep.size()};
+        rd.vertex.bufferCount = vbs.size();
+        rd.vertex.buffers = vbs.data();
+
+        RenderPipelineEntry e;
+        e.pipeline = device.CreateRenderPipeline(&rd);
+        bool expects = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
+        if (!expects && !auto_layout && group0_has_entries) expects = true;
+        e.expects_group0 = expects;
+        render_pipelines[h.id] = std::move(e);
+        ++stats.render_pipelines;
+        return true;
+    }
+    std::string fragment_ep_storage;
+
+    bool create_compute_pipeline2(const Packet& p) {
+        const auto h = read_payload<GpuCreateComputePipeline2Payload>(p);
+        wgpu::PipelineLayout layout;
+        const bool auto_layout = h.pipeline_layout_id == 0;
+        if (!auto_layout) {
+            auto lit = pipeline_layouts.find(h.pipeline_layout_id);
+            if (lit == pipeline_layouts.end()) return fail("unknown pipeline layout " + std::to_string(h.pipeline_layout_id));
+            layout = lit->second.layout;
+        } else {
+            ++stats.auto_layout_pipelines;
+        }
+        auto cit = shaders.find(h.cs_module_id);
+        if (cit == shaders.end()) return fail("unknown compute shader module " + std::to_string(h.cs_module_id));
+        const ShaderEntry& cs = cit->second;
+        const std::string ep = resolve_shader_entry_point(cs.code, cs.explicit_ep, "compute");
+        wgpu::ComputePipelineDescriptor cd{};
+        cd.layout = auto_layout ? nullptr : layout;
+        cd.compute.module = cs.module;
+        cd.compute.entryPoint = {ep.data(), ep.size()};
+        compute_pipelines[h.id] = device.CreateComputePipeline(&cd);
+        ++stats.compute_pipelines;
+        return true;
+    }
+
+    // ---- bind groups (RenderStatePackets._createBindGroup / _dummyResource / _setBindGroup) ----
+
+    struct Dummy {
+        wgpu::Buffer buffer;
+        wgpu::Sampler sampler;
+        wgpu::TextureView view;
+    };
+
+    Dummy dummy_resource(const LayoutEntry& le) {
+        Dummy d;
+        if (le.kind == 0) {
+            const uint64_t size = std::max<uint64_t>(256, (le.min_binding_size + 3) / 4 * 4);
+            const std::string key = "buffer:" + std::to_string(size);
+            auto it = dummy_buffers.find(key);
+            if (it == dummy_buffers.end()) {
+                wgpu::BufferDescriptor bd{};
+                bd.size = size;
+                bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+                it = dummy_buffers.emplace(key, device.CreateBuffer(&bd)).first;
+            }
+            d.buffer = it->second;
+            return d;
+        }
+        if (le.kind == 1) {
+            const std::string key = "sampler:" + std::to_string(le.subtype);
+            auto it = dummy_samplers.find(key);
+            if (it == dummy_samplers.end()) {
+                wgpu::SamplerDescriptor sd{};
+                if (le.subtype == 2) sd.compare = wgpu::CompareFunction::Always;
+                it = dummy_samplers.emplace(key, device.CreateSampler(&sd)).first;
+            }
+            d.sampler = it->second;
+            return d;
+        }
+        const bool storage = le.kind == 3;
+        uint8_t format = 22;
+        if (storage) {
+            const StorageResolution sr = resolve_storage_format(le.storage_format, features);
+            format = sr.supported && sr.storage_format ? sr.storage_format : 22;
+        } else {
+            static const uint8_t kByType[5] = {22, 16, 48, 26, 25};  // float, unfilterable, depth, sint, uint
+            format = kByType[le.subtype < 5 ? le.subtype : 0];
+        }
+        const bool ms = !storage && le.multisampled;
+        if (ms && (!render_attachment_supported(format, features) || format_is_float32(format) || format_is_integer(format)))
+            format = 22;
+        const std::string key = "tex:" + std::to_string(format) + ":" + std::to_string(le.view_dim) + ":" +
+                                std::to_string(ms) + ":" + std::to_string(storage);
+        auto it = dummy_views.find(key);
+        if (it == dummy_views.end()) {
+            const uint32_t layers = le.view_dim == 4 || le.view_dim == 5 ? 6 : 1;
+            wgpu::TextureDescriptor td{};
+            td.dimension = le.view_dim == 1 ? wgpu::TextureDimension::e1D
+                           : le.view_dim == 6 ? wgpu::TextureDimension::e3D
+                                              : wgpu::TextureDimension::e2D;
+            td.size = {1, 1, layers};
+            td.format = wgpu_format(format);
+            td.usage = storage ? wgpu::TextureUsage::StorageBinding : wgpu::TextureUsage::TextureBinding;
+            td.sampleCount = ms && td.dimension == wgpu::TextureDimension::e2D && layers == 1 ? 4 : 1;
+            wgpu::Texture tex = device.CreateTexture(&td);
+            dummy_textures.push_back(tex);
+            wgpu::TextureViewDescriptor vd{};
+            vd.dimension = wgpu_view_dim(le.view_dim);
+            it = dummy_views.emplace(key, tex.CreateView(&vd)).first;
+        }
+        d.view = it->second;
+        return d;
+    }
+
+    bool create_bind_group2(const Packet& p) {
+        if (p.payload_bytes < 16) return false;
+        const auto h = read_payload<GpuCreateBindGroup2Payload>(p);
+        if (uint64_t{16} + uint64_t{h.entry_count} * 48 > p.payload_bytes) return false;
+        auto lit = bgls.find(h.layout_id);
+        if (lit == bgls.end()) return fail("bind group " + std::to_string(h.id) + ": unknown bind group layout");
+        const BglEntry& rec = lit->second;
+        struct Pending {
+            uint32_t binding;
+            wgpu::Buffer buffer;
+            uint64_t offset = 0, size = wgpu::kWholeSize;
+            wgpu::Sampler sampler;
+            wgpu::TextureView view;
+        };
+        std::vector<Pending> entries;
+        std::vector<uint32_t> seen;
+        for (uint32_t i = 0; i < h.entry_count; ++i) {
+            const auto e = read_payload<GpuBindGroupEntry2>(p, 16 + size_t{i} * 48);
+            if (std::find(seen.begin(), seen.end(), e.binding) != seen.end())
+                return fail("bind group: duplicate binding " + std::to_string(e.binding));
+            seen.push_back(e.binding);
+            const LayoutEntry* le = nullptr;
+            for (const LayoutEntry& x : rec.entries)
+                if (x.binding == e.binding) { le = &x; break; }
+            const bool expects_buffer = le && le->kind == 0, expects_texture = le && (le->kind == 2 || le->kind == 3),
+                       expects_sampler = le && le->kind == 1;
+            const uint32_t type = e.resource_type;
+            const bool kind_mismatch = e.resource_id != 0 && le &&
+                                       ((expects_buffer && type != 0) || (expects_texture && type != 1) ||
+                                        (expects_sampler && type != 2));
+            Pending pe;
+            pe.binding = e.binding;
+            bool have = false;
+            auto use_dummy = [&](const LayoutEntry& l) {
+                const Dummy d = dummy_resource(l);
+                pe.buffer = d.buffer;
+                pe.offset = 0;
+                pe.size = wgpu::kWholeSize;
+                pe.sampler = d.sampler;
+                pe.view = d.view;
+                have = true;
+            };
+            if (e.resource_id == 0) {
+                if (le) use_dummy(*le);
+            } else if (type == 0) {
+                auto bit = buffers.find(e.resource_id);
+                if (bit != buffers.end()) {
+                    const BufferEntry& b = bit->second;
+                    const uint64_t buf_offset = e.offset, requested = e.size;
+                    const uint64_t buf_size = b.size > 0 ? b.size : 0;
+                    uint32_t required_usage = 0;
+                    if (expects_buffer) required_usage = le->subtype == 0 ? 0x40u : 0x80u;
+                    const bool usage_mismatch = expects_buffer && required_usage && !(b.usage & required_usage);
+                    uint64_t min_binding = expects_buffer && !usage_mismatch ? le->min_binding_size : 0;
+                    if (buf_size && buf_offset >= buf_size) {
+                        if (le) use_dummy(*le);
+                    } else {
+                        uint64_t eff = requested;
+                        if (buf_size && eff > 0 && buf_offset + eff > buf_size) eff = buf_size - buf_offset;
+                        const uint64_t remaining = buf_size ? buf_size - buf_offset : 0;
+                        bool undersized = false;
+                        if (min_binding > 0) {
+                            const uint64_t bound = eff > 0 ? eff : remaining;
+                            if (buf_size && bound < min_binding) {
+                                if (remaining >= min_binding) eff = min_binding;
+                                else if (le) undersized = true;
+                            }
+                        }
+                        if (undersized) {
+                            use_dummy(*le);
+                        } else if (kind_mismatch || usage_mismatch) {
+                            use_dummy(*le);
+                        } else {
+                            pe.buffer = b.buffer;
+                            pe.offset = buf_offset;
+                            pe.size = eff > 0 ? eff : wgpu::kWholeSize;
+                            have = true;
+                        }
+                    }
+                }
+            } else if (type == 1) {
+                auto tit = textures.find(e.resource_id);
+                const GpuTextureViewDesc* vd = &e.view;
+                if (tit != textures.end()) {
+                    TextureEntry& t = tit->second;
+                    uint8_t tex_format = e.view.format ? e.view.format : t.geom.format;
+                    if (e.view.format && t.bc3d_fallback && format_is_bc(e.view.format)) tex_format = t.geom.format;
+                    if (!kind_mismatch && le && le->kind == 3 && tex_format) {
+                        const StorageResolution sr = resolve_storage_format(tex_format, features);
+                        if (!sr.supported || !sr.storage_format) {
+                            use_dummy(*le);
+                        } else if (sr.linear_sibling) {
+                            GpuTextureViewDesc lv = e.view;
+                            lv.format = sr.storage_format;
+                            lv.mip_level_count = 1;
+                            pe.view = texture_view(t, &lv);
+                            have = static_cast<bool>(pe.view);
+                            if (!have) use_dummy(*le);
+                        } else {
+                            GpuTextureViewDesc sv = e.view;
+                            sv.mip_level_count = 1;
+                            pe.view = texture_view(t, e.view.mip_level_count == 1 ? vd : &sv);
+                            have = static_cast<bool>(pe.view);
+                        }
+                    } else if (!kind_mismatch && le && le->kind == 2 && le->subtype == 0 && tex_format &&
+                               format_is_float32(tex_format) && !features.float32_filterable) {
+                        use_dummy(*le);
+                    } else {
+                        pe.view = texture_view(t, vd);
+                        if (pe.view) {
+                            if (kind_mismatch) use_dummy(*le);
+                            else have = true;
+                        }
+                    }
+                }
+            } else if (type == 2) {
+                auto sit = samplers.find(e.resource_id);
+                if (sit != samplers.end()) {
+                    if (kind_mismatch) {
+                        use_dummy(*le);
+                    } else {
+                        pe.sampler = sit->second;
+                        have = true;
+                    }
+                }
+            }
+            if (!have)
+                return fail("bind group " + std::to_string(h.id) + ": binding " + std::to_string(e.binding) +
+                            " resource " + std::to_string(e.resource_id) + " unavailable");
+            entries.push_back(std::move(pe));
+        }
+        std::vector<wgpu::BindGroupEntry> wes(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            wes[i].binding = entries[i].binding;
+            wes[i].buffer = entries[i].buffer;
+            wes[i].offset = entries[i].offset;
+            wes[i].size = entries[i].size;
+            wes[i].sampler = entries[i].sampler;
+            wes[i].textureView = entries[i].view;
+        }
+        wgpu::BindGroupDescriptor bd{};
+        bd.layout = rec.layout;
+        bd.entryCount = wes.size();
+        bd.entries = wes.data();
+        bind_groups[h.id] = device.CreateBindGroup(&bd);
+        ++stats.bind_groups;
+        return true;
+    }
+
+    bool set_bind_group2(const Packet& p) {
+        if (p.payload_bytes < sizeof(GpuSetBindGroup2Payload)) return false;
+        const auto h = read_payload<GpuSetBindGroup2Payload>(p);
+        if (uint64_t{16} + uint64_t{h.dynamic_offset_count} * 4 > p.payload_bytes) return false;
+        auto it = bind_groups.find(h.bind_group_id);
+        if (it == bind_groups.end()) return fail("unknown bind group " + std::to_string(h.bind_group_id));
+        SetBindGroup2Cmd c;
+        c.group = h.group_index;
+        c.bind_group = it->second;
+        for (uint32_t i = 0; i < h.dynamic_offset_count; ++i) c.offsets.push_back(read_payload<uint32_t>(p, 16 + size_t{i} * 4));
+        pass_cmds.emplace_back(std::move(c));
+        return true;
+    }
+
+    // ---- BeginRenderPass (render_state_packets.js _beginRenderPass) ----
+
+    // _textureAttachmentSize
+    AttachmentSize texture_attachment_size(const TextureEntry& t, const GpuTextureViewDesc& v) {
+        return mip_size(AttachmentSize{t.geom.width, t.geom.height}, v.base_mip_level);
+    }
+
+    bool begin_render_pass(const Packet& p) {
+        const auto plan = decode_begin_render_pass(p);
+        if (!plan) return false;
+        BeginPassCmd cmd;
+        cmd.color_count = plan->color_count;
+        for (uint32_t i = 0; i < plan->color_count; ++i) {
+            const ColorAttachmentPlan& c = plan->colors[i];
+            if (c.texture_id == 0) continue;
+            ColorAtt& a = cmd.colors[i];
+            a.texture_id = c.texture_id;
+            a.load = c.load;
+            a.store = c.store;
+            a.clear = c.clear;
+            if (c.texture_id == kGpuSwapchainTextureId) {
+                a.swapchain = true;
+                if (c.view.format != 0) set_swapchain_format(c.view.format);  // #709
+                continue;
+            }
+            auto it = textures.find(c.texture_id);
+            if (it == textures.end()) {
+                ++stats.render_pass_missing_texture;
+                return fail("render pass: unknown texture " + std::to_string(c.texture_id));
+            }
+            a.view = texture_view(it->second, &c.view);
+            if (!a.view) {
+                ++stats.render_pass_missing_texture;
+                return fail("render pass: texture " + std::to_string(c.texture_id) + " createView failed");
+            }
+            a.size = texture_attachment_size(it->second, c.view);
+        }
+        if (plan->has_depth_stencil) {
+            const GpuRenderPassDepthStencilAttachment& d = plan->depth_stencil;
+            auto it = d.texture_id == kGpuSwapchainTextureId ? textures.end() : textures.find(d.texture_id);
+            if (it == textures.end()) {
+                ++stats.render_pass_missing_texture;
+                return fail("render pass: unknown texture " + std::to_string(d.texture_id));
+            }
+            cmd.has_ds = true;
+            cmd.ds = d;
+            cmd.ds_view = texture_view(it->second, &d.view);
+            if (!cmd.ds_view) {
+                ++stats.render_pass_missing_texture;
+                return fail("render pass: depth texture createView failed");
+            }
+            cmd.ds_size = texture_attachment_size(it->second, d.view);
+        }
+        pass_cmds.emplace_back(std::move(cmd));
+        return true;
     }
 
     // ---- Present (wgpu_worker.js _flushPresent) ----
@@ -422,6 +1768,262 @@ struct NativeExecutor::Impl {
         return a;
     }
 
+    // The encode-time state of _flushPresent (`_presentState`) plus _preparePassCommandsForFlush.
+    struct Encoder {
+        Impl& s;
+        FrameTarget& target;
+        wgpu::CommandEncoder enc;
+        wgpu::RenderPassEncoder rpass;
+        wgpu::ComputePassEncoder cpass;
+        bool render_pass_opened = false;
+        bool explicit_pass = false;       // the active render pass came from BeginRenderPass
+        std::optional<AttachmentSize> explicit_size;
+        bool group0_bound = false;
+        std::optional<uint32_t> active_pipeline;
+        // _preparePassCommandsForFlush compute filter state
+        bool had_explicit_compute = false, compute_valid = false;
+
+        void end_active() {
+            if (rpass) { rpass.End(); rpass = nullptr; }
+            if (cpass) { cpass.End(); cpass = nullptr; }
+            explicit_pass = false;
+            group0_bound = false;
+            active_pipeline.reset();
+        }
+        void ensure_render() {  // _ensurePresentRenderPass
+            if (rpass) return;
+            end_active();
+            wgpu::RenderPassColorAttachment a = s.swapchain_attachment(
+                target, render_pass_opened ? LoadOp::Load : LoadOp::Clear, StoreOp::Store, s.clear_color);
+            wgpu::RenderPassDescriptor rp{};
+            rp.colorAttachmentCount = 1;
+            rp.colorAttachments = &a;
+            rpass = enc.BeginRenderPass(&rp);
+            render_pass_opened = true;
+        }
+        void ensure_compute() {
+            if (cpass) return;
+            end_active();
+            cpass = enc.BeginComputePass();
+        }
+        std::optional<AttachmentSize> swapchain_size() const { return AttachmentSize{s.swap_width, s.swap_height}; }
+        // _getActivePassTargetSize
+        std::optional<AttachmentSize> target_size() const {
+            if (explicit_pass) return explicit_size;
+            return swapchain_size();
+        }
+    };
+
+    void begin_explicit_pass(Encoder& e, const BeginPassCmd& b) {
+        e.end_active();
+        std::array<AttachmentSize, kGpuMaxColorAttachments> sizes{};
+        RenderPassPlan plan;
+        plan.color_count = b.color_count;
+        for (uint32_t i = 0; i < b.color_count; ++i) {
+            plan.colors[i].texture_id = b.colors[i].texture_id;
+            sizes[i] = b.colors[i].swapchain ? AttachmentSize{swap_width, swap_height} : b.colors[i].size;
+        }
+        plan.has_depth_stencil = b.has_ds;
+        const uint32_t dropped = drop_mismatched_colors(plan, sizes, b.ds_size);
+        // sanitizeRenderPassAttachments reference size: first color with a known size, else depth.
+        AttachmentSize ref{};
+        for (uint32_t i = 0; i < b.color_count; ++i)
+            if (b.colors[i].texture_id != 0 && sizes[i].known()) { ref = sizes[i]; break; }
+        if (!ref.known() && b.has_ds) ref = b.ds_size;
+        bool drop_ds = b.has_ds && ref.known() && b.ds_size.known() && !(b.ds_size == ref);
+
+        std::array<wgpu::RenderPassColorAttachment, kGpuMaxColorAttachments> colors{};
+        for (uint32_t i = 0; i < b.color_count; ++i) {
+            const ColorAtt& c = b.colors[i];
+            if (c.texture_id == 0 || (dropped & (1u << i))) {
+                if (dropped & (1u << i)) ++stats.render_pass_dropped_colors;
+                continue;
+            }
+            if (c.swapchain) {
+                colors[i] = swapchain_attachment(e.target, c.load, c.store, c.clear);
+            } else {
+                colors[i].view = c.view;
+                colors[i].loadOp = c.load == LoadOp::Clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+                colors[i].storeOp = c.store == StoreOp::Discard ? wgpu::StoreOp::Discard : wgpu::StoreOp::Store;
+                if (c.load == LoadOp::Clear) colors[i].clearValue = {c.clear.r, c.clear.g, c.clear.b, c.clear.a};
+            }
+        }
+        wgpu::RenderPassDepthStencilAttachment ds{};
+        wgpu::RenderPassDescriptor rp{};
+        rp.colorAttachmentCount = b.color_count;
+        rp.colorAttachments = colors.data();
+        if (b.has_ds && !drop_ds) {
+            const GpuRenderPassDepthStencilAttachment& d = b.ds;
+            auto lop = [](uint8_t v) {
+                return v == 1 ? wgpu::LoadOp::Load : v == 2 ? wgpu::LoadOp::Clear : wgpu::LoadOp::Undefined;
+            };
+            auto sop = [](uint8_t v) {
+                return v == 1 ? wgpu::StoreOp::Store : v == 2 ? wgpu::StoreOp::Discard : wgpu::StoreOp::Undefined;
+            };
+            ds.view = b.ds_view;
+            if (d.depth_load_op != 0 && !d.depth_read_only) {
+                ds.depthLoadOp = lop(d.depth_load_op);
+                ds.depthStoreOp = sop(d.depth_store_op);
+                if (ds.depthLoadOp == wgpu::LoadOp::Clear) {
+                    const double c = std::min(1.0, std::max(0.0, finite_or(d.depth_clear_value, 1)));
+                    ds.depthClearValue = static_cast<float>(or_zero(c));
+                }
+            }
+            if (d.stencil_load_op != 0 && !d.stencil_read_only) {
+                ds.stencilLoadOp = lop(d.stencil_load_op);
+                ds.stencilStoreOp = sop(d.stencil_store_op);
+                if (ds.stencilLoadOp == wgpu::LoadOp::Clear) ds.stencilClearValue = d.stencil_clear_value;
+            }
+            if (d.depth_read_only) ds.depthReadOnly = true;
+            if (d.stencil_read_only) ds.stencilReadOnly = true;
+            rp.depthStencilAttachment = &ds;
+        } else if (drop_ds) {
+            ++stats.render_pass_dropped_colors;
+        }
+        e.rpass = e.enc.BeginRenderPass(&rp);
+        e.render_pass_opened = true;
+        e.explicit_pass = true;
+        // BeginRenderPassCommand.run: the pass's target size is the sanitized reference size, else the
+        // swapchain size (swapchain target) or the static attachment size.
+        if (ref.known()) e.explicit_size = ref;
+        else e.explicit_size = std::nullopt;
+        // A new pass resets the compute filter state (_preparePassCommandsForFlush).
+        e.had_explicit_compute = false;
+        e.compute_valid = false;
+    }
+
+    void run_cmd(Encoder& e, const PassCmd& cmd) {
+        if (const auto* b = std::get_if<BeginPassCmd>(&cmd)) {
+            begin_explicit_pass(e, *b);
+        } else if (std::get_if<EndPassCmd>(&cmd)) {
+            if (e.rpass) e.end_active();  // EndRenderPass: `if (ctl.passKind === 'render') ctl.endPass()`
+            e.explicit_pass = false;
+            e.had_explicit_compute = false;
+            e.compute_valid = false;
+        } else if (const auto* sp = std::get_if<SetPipelineCmd>(&cmd)) {
+            e.ensure_render();
+            e.active_pipeline = sp->id;
+            e.had_explicit_compute = false;
+            e.compute_valid = false;
+            auto it = render_pipelines.find(sp->id);
+            const wgpu::RenderPipeline& pl = it != render_pipelines.end() ? it->second.pipeline : sp->at_packet;
+            if (pl) e.rpass.SetPipeline(pl);
+            else ++stats.op_errors;  // SetPipeline: render pipeline not found
+        } else if (const auto* vb = std::get_if<SetVertexBufferCmd>(&cmd)) {
+            e.ensure_render();
+            auto it = buffers.find(vb->id);
+            if (it != buffers.end()) e.rpass.SetVertexBuffer(vb->slot, it->second.buffer, vb->offset, wgpu::kWholeSize);
+        } else if (const auto* ib = std::get_if<SetIndexBufferCmd>(&cmd)) {
+            e.ensure_render();
+            auto it = buffers.find(ib->id);
+            if (it != buffers.end())
+                e.rpass.SetIndexBuffer(it->second.buffer,
+                                       ib->format == 1 ? wgpu::IndexFormat::Uint32 : wgpu::IndexFormat::Uint16, ib->offset,
+                                       wgpu::kWholeSize);
+        } else if (const auto* d = std::get_if<DrawCmd>(&cmd)) {
+            e.had_explicit_compute = false;
+            e.compute_valid = false;
+            if (draw_allowed(e)) {
+                e.rpass.Draw(d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
+                ++stats.draws;
+            }
+        } else if (const auto* di = std::get_if<DrawIndexedCmd>(&cmd)) {
+            e.had_explicit_compute = false;
+            e.compute_valid = false;
+            if (draw_allowed(e)) {
+                e.rpass.DrawIndexed(di->index_count, di->instance_count, di->first_index, di->base_vertex,
+                                    di->first_instance);
+                ++stats.draws;
+            }
+        } else if (const auto* in = std::get_if<IndirectCmd>(&cmd)) {
+            auto it = buffers.find(in->id);
+            if (it == buffers.end()) {
+                ++stats.op_errors;  // indirect buffer not found
+                return;
+            }
+            if (in->kind == 2) {
+                e.ensure_compute();
+                e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
+                ++stats.dispatches;
+            } else if (draw_allowed(e)) {
+                if (in->kind == 1) e.rpass.DrawIndexedIndirect(it->second.buffer, in->offset);
+                else e.rpass.DrawIndirect(it->second.buffer, in->offset);
+                ++stats.draws;
+            }
+        } else if (const auto* sc = std::get_if<SetComputePipelineCmd>(&cmd)) {
+            e.ensure_compute();
+            e.had_explicit_compute = true;
+            auto it = compute_pipelines.find(sc->id);
+            e.compute_valid = it != compute_pipelines.end();
+            if (e.compute_valid) e.cpass.SetPipeline(it->second);
+        } else if (const auto* dc = std::get_if<DispatchCmd>(&cmd)) {
+            if (e.had_explicit_compute && !e.compute_valid) {
+                ++stats.dispatches_skipped;
+                return;
+            }
+            // validateComputeDispatch
+            if (dc->x == 0 || dc->y == 0 || dc->z == 0) {
+                ++stats.dispatches_skipped;
+                return;
+            }
+            uint32_t x = dc->x, y = dc->y, z = dc->z;
+            if (x > max_workgroups_per_dim || y > max_workgroups_per_dim || z > max_workgroups_per_dim) {
+                ++stats.dispatches_clamped;
+                x = std::min(x, max_workgroups_per_dim);
+                y = std::min(y, max_workgroups_per_dim);
+                z = std::min(z, max_workgroups_per_dim);
+            }
+            e.ensure_compute();
+            e.cpass.DispatchWorkgroups(x, y, z);
+            ++stats.dispatches;
+        } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {
+            if (!e.rpass) return;
+            const auto ts = e.target_size();
+            const Viewport c = clamp_viewport_to_target(vp->vp, ts ? ts->width : 0, ts ? ts->height : 0);
+            e.rpass.SetViewport(static_cast<float>(c.x), static_cast<float>(c.y), static_cast<float>(c.width),
+                                static_cast<float>(c.height), static_cast<float>(c.min_depth),
+                                static_cast<float>(c.max_depth));
+        } else if (const auto* sr = std::get_if<ScissorCmd>(&cmd)) {
+            if (!e.rpass) return;
+            const auto ts = e.target_size();
+            const Rect c = clamp_scissor_to_target(sr->x, sr->y, sr->w, sr->h, ts ? ts->width : 0, ts ? ts->height : 0);
+            e.rpass.SetScissorRect(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y), static_cast<uint32_t>(c.width),
+                                   static_cast<uint32_t>(c.height));
+        } else if (const auto* bc = std::get_if<BlendConstantCmd>(&cmd)) {
+            if (!e.rpass) return;
+            const wgpu::Color color{bc->r, bc->g, bc->b, bc->a};
+            e.rpass.SetBlendConstant(&color);
+        } else if (const auto* st = std::get_if<StencilRefCmd>(&cmd)) {
+            if (!e.rpass) return;
+            e.rpass.SetStencilReference(st->ref);
+        } else if (const auto* bg = std::get_if<SetBindGroup2Cmd>(&cmd)) {
+            if (!e.rpass && !e.cpass) return;  // `if (!ctl.pass) return`
+            if (e.rpass) e.rpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
+            else e.cpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
+            if (bg->group == 0) e.group0_bound = true;
+        }
+    }
+
+    // _executePresentRenderDraw: opens the lazy render pass, then skips a draw whose pipeline is
+    // unavailable or whose expected @group(0) bind group is not bound.
+    bool draw_allowed(Encoder& e) {
+        e.ensure_render();
+        if (e.active_pipeline) {
+            auto it = render_pipelines.find(*e.active_pipeline);
+            if (it == render_pipelines.end()) {
+                ++stats.draws_skipped;
+                ++stats.op_errors;
+                return false;
+            }
+            if (it->second.expects_group0 && !e.group0_bound) {
+                ++stats.draws_skipped;
+                ++stats.op_errors;
+                return false;
+            }
+        }
+        return true;
+    }
+
     void present() {
         FrameTarget target;
         if (lost || !acquire(&target)) {
@@ -429,53 +2031,18 @@ struct NativeExecutor::Impl {
             reset_frame_state();
             return;
         }
-        wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
-        wgpu::RenderPassEncoder active;
-        bool render_pass_opened = false;
-        auto end_active = [&] {
-            if (active) {
-                active.End();
-                active = nullptr;
-            }
-        };
-        for (const PassCmd& cmd : pass_cmds) {
-            if (const auto* b = std::get_if<BeginPassCmd>(&cmd)) {
-                end_active();
-                const RenderPassPlan& plan = b->plan;
-                std::array<AttachmentSize, kGpuMaxColorAttachments> sizes{};
-                for (uint32_t i = 0; i < plan.color_count; ++i) {
-                    if (plan.colors[i].texture_id == kGpuSwapchainTextureId) sizes[i] = {swap_width, swap_height};
-                }
-                const uint32_t dropped = drop_mismatched_colors(plan, sizes, AttachmentSize{});
-                std::array<wgpu::RenderPassColorAttachment, kGpuMaxColorAttachments> colors{};
-                for (uint32_t i = 0; i < plan.color_count; ++i) {
-                    const ColorAttachmentPlan& c = plan.colors[i];
-                    if (c.texture_id == 0 || (dropped & (1u << i))) {
-                        if (dropped & (1u << i)) ++stats.render_pass_dropped_colors;
-                        colors[i] = wgpu::RenderPassColorAttachment{};  // null attachment
-                        continue;
-                    }
-                    colors[i] = swapchain_attachment(target, c.load, c.store, c.clear);
-                }
-                wgpu::RenderPassDescriptor rp{};
-                rp.colorAttachmentCount = plan.color_count;
-                rp.colorAttachments = colors.data();
-                active = encoder.BeginRenderPass(&rp);
-                render_pass_opened = true;
-            } else {
-                end_active();  // EndRenderPass
-            }
-        }
-        end_active();
-        if (!render_pass_opened) {
+        Encoder e{*this, target, device.CreateCommandEncoder()};
+        for (const PassCmd& cmd : pass_cmds) run_cmd(e, cmd);
+        e.end_active();
+        if (!e.render_pass_opened) {
             // The v1 clearing swapchain pass (_ensurePresentRenderPass with renderPassOpened false).
             wgpu::RenderPassColorAttachment a = swapchain_attachment(target, LoadOp::Clear, StoreOp::Store, clear_color);
             wgpu::RenderPassDescriptor rp{};
             rp.colorAttachmentCount = 1;
             rp.colorAttachments = &a;
-            encoder.BeginRenderPass(&rp).End();
+            e.enc.BeginRenderPass(&rp).End();
         }
-        wgpu::CommandBuffer cb = encoder.Finish();
+        wgpu::CommandBuffer cb = e.enc.Finish();
         queue.Submit(1, &cb);
         ++frame_count;
         ++stats.frames_submitted;
@@ -540,9 +2107,16 @@ NativeExecutor::NativeExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(imp
 
 NativeExecutor::~NativeExecutor() {
     if (impl_ && impl_->device) {
+        impl_->pass_cmds.clear();
         impl_->buffers.clear();
+        impl_->textures.clear();
         impl_->device.Destroy();
     }
+}
+
+bool NativeExecutor::load_wgsl_pack(const std::string& path, std::string* error) {
+    std::string local;
+    return impl_->load_pack(path, error ? error : &local);
 }
 
 uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
@@ -602,6 +2176,26 @@ std::string NativeExecutor::stats_json() const {
     num("render_pass_missing_texture", st.render_pass_missing_texture);
     num("render_pass_dropped_colors", st.render_pass_dropped_colors);
     num("swapchain_format_unsupported", st.swapchain_format_unsupported);
+    num("packet_errors", st.packet_errors);
+    num("shader_modules", st.shader_modules);
+    num("shader_pack_hits", st.shader_pack_hits);
+    num("shader_pack_misses", st.shader_pack_misses);
+    num("textures_created", st.textures_created);
+    num("texture_uploads", st.texture_uploads);
+    num("texture_upload_bytes", st.texture_upload_bytes);
+    num("samplers_created", st.samplers_created);
+    num("bind_group_layouts", st.bind_group_layouts);
+    num("pipeline_layouts", st.pipeline_layouts);
+    num("render_pipelines", st.render_pipelines);
+    num("compute_pipelines", st.compute_pipelines);
+    num("bind_groups", st.bind_groups);
+    num("draws", st.draws);
+    num("draws_skipped", st.draws_skipped);
+    num("dispatches", st.dispatches);
+    num("dispatches_skipped", st.dispatches_skipped);
+    num("dispatches_clamped", st.dispatches_clamped);
+    num("auto_layout_pipelines", st.auto_layout_pipelines);
+    num("manifest_layouts_unavailable", st.manifest_layouts_unavailable);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
         j += "\"";
@@ -619,6 +2213,8 @@ std::string NativeExecutor::stats_json() const {
     table("handled", st.handled);
     j += ", ";
     table("unhandled", st.unhandled);
+    j += ", ";
+    table("packet_errors_by_opcode", st.packet_errors_by_opcode);
     j += ", \"adapter\": {\"backend\": \"" + impl_->adapter.backend + "\"}";
     j += "}";
     return j;
@@ -664,6 +2260,53 @@ bool NativeExecutor::read_last_frame(FrameImage* out, std::string* error) {
         std::memcpy(out->pixels.data() + size_t{row} * y, mapped + size_t{padded_row} * y, row);
     }
     staging.Unmap();
+    return true;
+}
+
+bool NativeExecutor::read_texture(uint32_t id, uint32_t mip, std::vector<uint8_t>* out, uint32_t* width,
+                                  uint32_t* height, std::string* error) {
+    Impl& s = *impl_;
+    auto it = s.textures.find(id);
+    if (it == s.textures.end()) {
+        if (error) *error = "read_texture: unknown texture " + std::to_string(id);
+        return false;
+    }
+    const TextureEntry& t = it->second;
+    const FormatInfo& fi = format_info(t.geom.format);
+    if (fi.compressed || t.geom.dimension == 2) {
+        if (error) *error = "read_texture: uncompressed 2D textures only";
+        return false;
+    }
+    const uint32_t w = mip_dimension(t.geom.width, mip), h = mip_dimension(t.geom.height, mip);
+    const uint32_t row = w * fi.bytes, padded = (row + 255u) & ~255u;
+    const uint64_t size = uint64_t{padded} * h;
+    wgpu::BufferDescriptor bd{};
+    bd.size = size;
+    bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+    wgpu::Buffer staging = s.device.CreateBuffer(&bd);
+    const bool ok = s.validated(
+        [&] {
+            wgpu::CommandEncoder enc = s.device.CreateCommandEncoder();
+            wgpu::TexelCopyTextureInfo src{};
+            src.texture = t.texture;
+            src.mipLevel = mip;
+            wgpu::TexelCopyBufferInfo dst{};
+            dst.buffer = staging;
+            dst.layout.bytesPerRow = padded;
+            dst.layout.rowsPerImage = h;
+            wgpu::Extent3D extent{w, h, 1};
+            enc.CopyTextureToBuffer(&src, &dst, &extent);
+            wgpu::CommandBuffer cb = enc.Finish();
+            s.queue.Submit(1, &cb);
+        },
+        error);
+    if (!ok || !s.map_read(staging, size, error)) return false;
+    const auto* mapped = static_cast<const uint8_t*>(staging.GetConstMappedRange(0, static_cast<size_t>(size)));
+    out->resize(size_t{row} * h);
+    for (uint32_t y = 0; y < h; ++y) std::memcpy(out->data() + size_t{row} * y, mapped + size_t{padded} * y, row);
+    staging.Unmap();
+    if (width) *width = w;
+    if (height) *height = h;
     return true;
 }
 

@@ -52,8 +52,10 @@ ctest --test-dir build-native-exec -C Release -R native_exec
 `PLAYGTA6_NATIVE_EXECUTOR` is `OFF` by default; CI and every other build are unchanged.
 `test_native_exec_model` (the GPU-independent part) is built on every host build and runs in CI.
 
-`pg6_native_exec --trace <file.pg6trace> [--window] [--size WxH] [--frames N] [--digest-at 0,10]
-[--report stats.json]` replays a capture. It cuts the trace into frames exactly like
+`pg6_native_exec --trace <file.pg6trace> [--pack <file.wgsl.pack>] [--window] [--size WxH] [--frames N]
+[--digest-at 0,10] [--report stats.json]` replays a capture (`--pack` is the replay page's WGSL pack for
+hash-only shader payloads; only its entry table is read up front, WGSL is read on demand, so a 1 GiB pack
+costs a few MiB). It cuts the trace into frames exactly like
 `tools/replay/replay.html` (`splitFrames`, thinned uploads dropped), uses the replay page's
 3840x2160 canvas size by default, and with `--digest-at` prints the page's own `digest frame N:` and
 `swapchain frame N (...): non-black ..., distinct ...` lines, so its output diffs line by line
@@ -64,6 +66,7 @@ against `replay_capture.py`'s log.
 | File | Role |
 | :--- | :--- |
 | `runtime/gpu/native_exec/stream_model.h` | Packet walk + payload decoding with the worker's rules. No WebGPU types; unit-tested in CI. |
+| `runtime/gpu/native_exec/m1_model.h` | M1 rules that decide what reaches the GPU: WGSL pack index, hash-only payloads, entry point resolution, texture format tables, WriteTexture layout planning, viewport / scissor clamps. No WebGPU types; unit-tested in CI. |
 | `runtime/gpu/native_exec/replay_frames.h` | `splitFrames`, frame digest and sampled stats of `tools/replay/replay.html`. No WebGPU types. |
 | `runtime/gpu/native_exec/native_executor.{h,cpp}` | Dawn device, swapchain (offscreen texture or surface), packet handlers, Present. |
 | `runtime/gpu/native_exec/native_window.{h,cpp}` | Optional Win32 window (other hosts: headless only for now). |
@@ -105,8 +108,20 @@ Every handler names the worker function it mirrors.
 
 Known divergences, to be closed or documented as they come up:
 
-- Device creation is bare (the worker negotiates optional features and raised limits in
-  `requestNegotiatedDevice`): milestone 1.
+- Device creation mirrors the replay page (the six optional features it requests, when the adapter has
+  them, and default limits); the worker's `requestNegotiatedDevice` (raised limits, more features) is
+  milestone 2.
+- A pipeline with `pipeline_layout_id == 0` ("auto") or whose explicit layout does not match the WGSL
+  `@group(0)` bindings gets Dawn's `layout: auto` without the worker's bind-group remap
+  (`_getOrCreateRemappedBindGroup`); `auto_layout_pipelines` counts the first case. Manifest layouts
+  (`layout-manifest.json`, flag `ManifestReference`) are unavailable, as in the replay page
+  (`manifest_layouts_unavailable`).
+- WGSL that the pack does not hold and the fallback router would replace: the replay page has no router,
+  so the hash text is compiled and rejected on both sides (`shader_pack_misses`); the router itself is not
+  mirrored.
+- Uploads: `WriteTexture` takes the worker's effective layout (row pitch inference, block clamping, mip
+  bounds clamp) and a direct `queue.WriteTexture`; the worker's staging pool and 8 MiB strip chunking only
+  change how the same texels reach the texture and are not mirrored.
 - Non-canvas stream swapchain formats (sRGB, others) use the worker's intermediate texture + blit
   (`WgpuSwapchain`); the executor counts them (`swapchain_format_unsupported`) and keeps the canvas
   format: milestone 2.
@@ -123,16 +138,18 @@ Known divergences, to be closed or documented as they come up:
 | `0` Nop, `1` BeginFrame, `2` ClearColor, `7` Present | `wgpu_worker.js` `_dispatchPacket`, `_flushPresent` | **M0 (done)** |
 | `3` CreateBuffer, `4` WriteBuffer, `11` DestroyResource (buffers) | `_handleCreateBuffer`, `_handleWriteBuffer`, `_handleDestroyResource` | **M0 (done)** |
 | `26` BeginRenderPass, `27` EndRenderPass (swapchain colour attachments) | `render_state_packets.js` `_beginRenderPass`, `buildRenderPassDescriptor` | **M0 (done)** |
-| `12` CreateTexture, `35` CreateTexture2, `13` WriteTexture, texture attachments + depth-stencil in `26` | `_handleCreateTexture`, `render_state_packets.js` `_createTexture2`, `texture_packets.js` | M1 |
-| `14`/`34` samplers, `5` CreateShaderModule (inline WGSL and WGSL pack lookup) | `_handleCreateShaderModule`, `wgsl_pack_loader.js` | M1 |
-| `22`/`23` layouts (packet and `layout-manifest.json`), `24`/`25`, `8`/`19` pipelines, `15`/`16`/`32`/`33` bind groups | `render_state_packets.js`, `reflection_loader.js` | M1 |
-| `6`/`18` draws, `9`/`10`/`17` state, `20`/`21` compute, `28`-`31` dynamic state | `_flushPresent` pass commands | M1 |
-| `36`-`38` indirect, `39`/`40` read-back into producer memory + completion counter | `indirect_draw.js`, `_startRecordedReadbacks` | M2 |
-| Swapchain blit fallback, feature/limit negotiation, GPU pass timestamps (#1608) | `wgpu_swapchain.js`, `requestNegotiatedDevice`, `gpu_timer.js` | M2 |
+| `12` CreateTexture, `35` CreateTexture2, `13` WriteTexture (BC included), texture attachments + depth-stencil in `26` | `texture_packets.js` `_create` / `handleWriteTexture` | **M1 (done)** |
+| `14`/`34` samplers, `5` CreateShaderModule (inline WGSL and WGSL pack lookup) | `_handleCreateShaderModule`, `wgsl_pack_loader.js` | **M1 (done)** |
+| `22`/`23` layouts, `24`/`25` pipelines, `32`/`33` bind groups | `render_state_packets.js` | **M1 (done)** |
+| `6`/`18` draws, `9`/`10`/`17` state, `20`/`21` compute, `28`-`31` dynamic state, `36`-`38` indirect | `_flushPresent` pass commands | **M1 (done)** |
+| `8`/`19` v1 pipelines, `15`/`16` v1 bind groups (need the reflection loader), `layout-manifest.json` layouts, the layout:auto bind-group remap | `reflection_loader.js`, `_getOrCreateRemappedBindGroup` | M2 |
+| `39`/`40` read-back into producer memory + completion counter | `_startRecordedReadbacks` | M2 |
+| Swapchain blit fallback, `requestNegotiatedDevice` feature/limit negotiation, GPU pass timestamps (#1608) | `wgpu_swapchain.js`, `requestNegotiatedDevice`, `gpu_timer.js` | M2 |
 | Live boot: `playgta6_boot --native-gpu [--window]`, present any target | `os::wgpu_submit` observer | M3 |
 
 The order follows what a real capture needs to draw anything: M1 is the first milestone at which
-title frames render natively.
+title frames render natively. The two real captures below contain only M1 opcodes (plus `3`/`4`/`11`/`26`/`27`):
+every packet is handled, none skipped.
 
 ## Live play: `playgta6_boot --window`
 
@@ -206,3 +223,12 @@ playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gp
    gives identical digests on all four frames. From M1 on the same comparison runs on sanitized
    real captures (local only; captures never enter the repository); a mismatch is bisected by frame,
    then by pass, with `--report` naming the opcodes the executor skipped.
+
+   Milestone 1 check (NVIDIA GPU, D3D12, Chrome stable, the replay page's 3840x2160 `rgba8unorm` canvas):
+   two sanitized boot captures of 2500 presented frames each (a 671 MB and a 607 MB trace, 1.04 M and
+   0.56 M packets, 3085 shader modules from a 1.2 GB pack, 649 textures incl. BC, 98 k / 81 k draws,
+   5000 dispatches). Native digests equal Chrome's on every compared frame (frames 0, 63, 500, 1000, 1500,
+   2000, 2499 of the first; 0, 700, 1600, 2499 of the second), with no device error and no packet error;
+   the executor handled 100% of the packets (`unhandled` empty). Replaying the first trace natively takes
+   about 20 s. The GPU unit test covers a textured draw, a compute dispatch (direct and indirect), a
+   pack lookup and a BC7 upload with read-back.
