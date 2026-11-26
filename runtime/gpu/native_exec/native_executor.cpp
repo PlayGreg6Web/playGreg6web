@@ -1449,7 +1449,7 @@ struct NativeExecutor::Impl {
         dummy_views.clear();
         dummy_textures.clear();
         depth_twin_sources.clear();
-        depth_copy_pipeline = nullptr;
+        depth_copy_pipelines.clear();
         empty_layout = nullptr;
         empty_fragment = nullptr;
         error_vertex_module = nullptr;
