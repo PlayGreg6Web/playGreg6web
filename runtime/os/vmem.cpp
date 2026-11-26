@@ -694,7 +694,19 @@ bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
             (size % kAllocationGranularity) != 0 || va - res->base > res->size - size) {
             return false;
         }
-        was_shown = res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state() == MemState::Commit;
+        const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
+        was_shown = res->pages[first].state() == MemState::Commit;
+        if (was_shown) {
+            // The pages stop reading as committed before the host view goes away: a reader holding
+            // the arena lock (host_ptr_const_held) must never see Commit over a view that is being
+            // unmapped below (outside the lock), or it faults the host.
+            const size_t count = static_cast<size_t>(size / kPageSize);
+            for (size_t p = first; p < first + count; ++p) {
+                res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
+            }
+            committed_bytes_ -= size;
+            decommitted_bytes_total_ += size;
+        }
     }
     if (was_shown) {
         backing::unmap_shared_page(translate(va), size);  // another page was shown here
@@ -707,10 +719,6 @@ bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
     }
     const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
     const size_t count = static_cast<size_t>(size / kPageSize);
-    if (was_shown) {
-        committed_bytes_ -= size;
-        decommitted_bytes_total_ += size;
-    }
     const PageMeta meta = ok ? PageMeta{MemState::Commit, PageProtect::ReadWrite}
                              : PageMeta{MemState::Reserve, PageProtect::NoAccess};
     for (size_t p = first; p < first + count; ++p) {
@@ -734,24 +742,21 @@ bool VirtualMemoryArena::unmap_shared(uint64_t va, uint64_t size) {
         if (res == nullptr || !res->shared || size == 0 || va - res->base > res->size - size) {
             return false;
         }
-        if (res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state() != MemState::Commit) {
+        const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
+        if (res->pages[first].state() != MemState::Commit) {
             return true;
         }
+        // The pages stop reading as committed before the host view goes away (below, outside the
+        // lock): a reader holding the arena lock must never see Commit over a vanishing view.
+        const size_t count = static_cast<size_t>(size / kPageSize);
+        for (size_t p = first; p < first + count; ++p) {
+            res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
+        }
+        committed_bytes_ -= size;
+        decommitted_bytes_total_ += size;
+        notify(*this, ArenaEvent::Decommit, va, size, PageProtect::NoAccess, true);
     }
     backing::unmap_shared_page(translate(va), size);
-    std::lock_guard<std::mutex> lock(mutex_);
-    Reservation* res = find_reservation_locked(va);
-    if (res == nullptr || !res->shared) {
-        return false;
-    }
-    const size_t first = static_cast<size_t>((va - res->base) / kPageSize);
-    const size_t count = static_cast<size_t>(size / kPageSize);
-    for (size_t p = first; p < first + count; ++p) {
-        res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
-    }
-    committed_bytes_ -= size;
-    decommitted_bytes_total_ += size;
-    notify(*this, ArenaEvent::Decommit, va, size, PageProtect::NoAccess, true);
     return true;
 }
 

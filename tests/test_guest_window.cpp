@@ -1426,6 +1426,60 @@ void test_range_view_holds_the_arena_lock_in_the_window() {
     gw::reset_for_testing();
 }
 
+// A shared page view that is unmapped or re-pointed while readers hold the arena lock over it
+// (host_ptr_const_held, what GuestRangeView does) must read as not mapped from the moment the
+// pages leave the Commit state: the host unmap runs outside the lock, and a reader that saw Commit
+// over a vanishing view faulted the host (flush_cpu_buffers hashing a window range).
+void test_shared_view_unmap_never_faults_a_locked_reader() {
+    if (!arena().has_shared_zone()) {
+        return;
+    }
+    const uint64_t va = arena().reserve_shared(2 * k64K);
+    void* page_a = create_shared_page(k64K);
+    void* page_b = create_shared_page(k64K);
+    CHECK(va != 0 && page_a != nullptr && page_b != nullptr);
+    if (va == 0 || page_a == nullptr || page_b == nullptr) {
+        return;
+    }
+    CHECK(arena().map_shared(va, page_a, k64K));
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> reads{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 3; ++r) {
+        readers.emplace_back([&] {
+            uint64_t sink = 0;
+            while (!stop.load()) {
+                std::unique_lock<std::mutex> hold;
+                const uint8_t* p = arena().host_ptr_const_held(va, k64K, hold);
+                if (p != nullptr) {
+                    sink += *static_cast<const volatile uint8_t*>(p);  // the first byte: a read of an unmapped view faults
+                    reads.fetch_add(1);
+                }
+            }
+            (void)sink;
+        });
+    }
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (std::chrono::steady_clock::now() < until) {
+        CHECK(arena().map_shared(va, page_b, k64K));  // another page shown: unmap, then map
+        CHECK(arena().unmap_shared(va, k64K));
+        CHECK(arena().map_shared(va, page_a, k64K));
+    }
+    stop.store(true);
+    for (std::thread& r : readers) {
+        r.join();
+    }
+    CHECK(reads.load() > 0);
+    CHECK(arena().unmap_shared(va, k64K));
+    {
+        std::unique_lock<std::mutex> hold;
+        CHECK(arena().host_ptr_const_held(va, k64K, hold) == nullptr);
+    }
+    CHECK(arena().release(va));
+    release_shared_page(page_a);
+    release_shared_page(page_b);
+}
+
 int main() {
     std::printf("test_guest_window\n");
     test_table_translation_and_copies();
@@ -1445,6 +1499,7 @@ int main() {
     test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap();
     test_range_view_holds_the_arena_lock_in_the_window();
     test_xmem_mirrored_2mb_page_maps_all_32_slots();
+    test_shared_view_unmap_never_faults_a_locked_reader();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
