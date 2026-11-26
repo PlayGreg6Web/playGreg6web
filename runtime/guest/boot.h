@@ -459,6 +459,10 @@ struct BootConfig {
     // stack, the last 64 dispatched function entries of the faulting thread, elapsed time and the
     // newest present's draws. Off: the entry ring keeps one slot and no record is written.
     bool fault_record = true;
+    // Non-empty: append every distinct (call site, target) pair of guest code the run dispatched
+    // through the indirect-call path to this file (guest/indirect_targets.h), at the end of the
+    // run and at a fault. Feed it back with `playgta6-recomp build-program --seed-targets`.
+    std::string record_indirect_targets;
     bool log_progress = true;       // phase lines through os::log
     // The generated export table (`pg6_export_thunks`, guest/export_thunks.h): guest-callable
     // entries for every shim export, registered after the IAT slots are bound so that

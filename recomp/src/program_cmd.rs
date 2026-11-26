@@ -32,9 +32,12 @@ pub struct ProgramArgs {
     pub memory: MemoryModel,
     /// Indirect-call dispatch mode of every module (`--indirect-dispatch`).
     pub indirect_dispatch: IndirectDispatch,
+    /// Recorded indirect-call targets to seed (`--seed-targets`) and the report file (`--seed-report`).
+    pub seed_targets: Option<PathBuf>,
+    pub seed_report: Option<PathBuf>,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
@@ -47,6 +50,8 @@ pub const OPTIONS: &[&str] = &[
     "  --bind <rule>          build-program: binding rule <dll>!<symbol-pattern>=guest|host|prefer-host (first match wins)",
     "  --policy <file>        build-program: rules from a file (<dll>!<symbol>=<action>, <dll>=guest|host, # comments)",
     "  --allow-allocator-split build-program: report heap functions bound to different allocators instead of failing",
+    "  --seed-targets <file>  build-program: indirect-call targets recorded by a boot (playgta6_boot --record-indirect-targets); validated, then lifted as function entries",
+    "  --seed-report <file>   build-program: with --seed-targets, a JSON line per module: rejected targets and targets inside functions with unresolved jump tables",
     "  --address-pool <lo>-<hi> build-program: hex range every module image must lie in (default 0x100000000-0x400000000)",
 ];
 
@@ -71,6 +76,8 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         codegen: LiftTarget::Wasm64,
         memory: MemoryModel::default(),
         indirect_dispatch: IndirectDispatch::default(),
+        seed_targets: None,
+        seed_report: None,
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -134,6 +141,14 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
                             "--address-pool expects <lo>-<hi> in hex, e.g. 0x100000000-0x400000000",
                         )?,
                 );
+            }
+            "--seed-targets" => {
+                i += 1;
+                parsed.seed_targets = Some(PathBuf::from(value(i, flag, "<file>")?));
+            }
+            "--seed-report" => {
+                i += 1;
+                parsed.seed_report = Some(PathBuf::from(value(i, flag, "<file>")?));
             }
             "--policy" => {
                 i += 1;
@@ -248,6 +263,16 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
     if let Some(n) = args.shard_instructions {
         build.shard_instructions = n;
     }
+    if let Some(file) = &args.seed_targets {
+        build.trace_seeds = Some(playgta6_recomp::trace_seed::load(file)?);
+        build.trace_seed_report = args.seed_report.clone();
+        if let Some(report) = &args.seed_report {
+            fs::write(report, "")
+                .map_err(|e| format!("failed to write '{}': {e}", report.display()))?;
+        }
+    } else if args.seed_report.is_some() {
+        return Err("--seed-report needs --seed-targets".to_string());
+    }
     let start = Instant::now();
     let report = program::build_program(&options, &mut |module, stage| {
         let module = if module.is_empty() { "program" } else { module };
@@ -272,6 +297,20 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_seed_options() {
+        let a = parse_program_args(&args(&[
+            "a.exe", "--out", "x", "--seed-targets", "t.txt", "--seed-report", "r.jsonl",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(a.seed_targets, Some(PathBuf::from("t.txt")));
+        assert_eq!(a.seed_report, Some(PathBuf::from("r.jsonl")));
+        assert!(parse_program_args(&args(&["a.exe", "--out", "x", "--seed-targets"])).is_err());
+        let none = parse_program_args(&args(&["a.exe", "--out", "x"])).unwrap().unwrap();
+        assert_eq!(none.seed_targets, None);
     }
 
     #[test]

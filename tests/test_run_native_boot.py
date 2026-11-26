@@ -67,6 +67,7 @@ class Fixture:
         touch(self.manifest, base + 20)
         self.base = base
         self.lift_cache = root / "liftcache"
+        self.targets = root / "targets" / "indirect-targets.txt"
 
     def run(self, *argv, runner=None, env=None):
         calls = []
@@ -83,7 +84,8 @@ class Fixture:
                 ["--exe", str(self.exe), "--game-dir", str(self.pkg), "--build-dir", str(self.build),
                  "--harness", str(self.harness), *argv],
                 runner=runner or default_runner,
-                env=env or {rnb.LIFT_CACHE_ENV: str(self.lift_cache), "PLAYGTA6_RECOMP_CACHE": "off"},
+                env={rnb.TARGETS_ENV: str(self.targets),
+                     **(env or {rnb.LIFT_CACHE_ENV: str(self.lift_cache), "PLAYGTA6_RECOMP_CACHE": "off"})},
                 repo_root=self.repo)
         return code, out.getvalue(), err.getvalue(), calls
 
@@ -402,6 +404,51 @@ class RunTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIn("[plan] program: forced (--rebuild-program)", err)
             self.assertNotIn("[plan] recomp", err)
+
+    def test_records_indirect_targets_by_default_and_can_opt_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            code, _, err, calls = fx.run("--name", "t1")
+            self.assertEqual(code, 0, err)
+            cmd = calls[-1]
+            self.assertEqual(cmd[cmd.index("--record-indirect-targets") + 1], str(fx.targets.resolve()))
+            self.assertTrue(fx.targets.parent.is_dir())
+            code, _, err, calls = fx.run("--name", "t2", "--no-record-targets")
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("--record-indirect-targets", calls[-1])
+
+    def test_default_targets_path_is_per_title_and_outside_the_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            cache = Path(d) / "objcache"
+            path = rnb.indirect_targets_path(cache, {}, fx.exe)
+            self.assertEqual(path.name, rnb.TARGETS_FILE)
+            self.assertEqual(path.parent.parent.name, "objcache-targets")
+            self.assertTrue(path.parent.name.startswith("game-"))
+            self.assertFalse(str(path).startswith(str(fx.repo)))
+            self.assertIsNone(rnb.indirect_targets_path(cache, {rnb.TARGETS_ENV: "off"}, fx.exe))
+            self.assertIsNone(rnb.indirect_targets_path(cache, {}, Path(d) / "missing.exe"))
+
+    def test_seed_targets_reach_the_lift_and_its_cache_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            code, _, err, _ = fx.run("--name", "s0", "--seed-targets", "--dry-run")
+            self.assertEqual(code, 2)
+            self.assertIn("run the title once first", err)
+            seeds = Path(d) / "seeds.txt"
+            seeds.write_text("0x1 0x2\n")
+            fx.manifest.unlink()
+            code, out, err, _ = fx.run("--name", "s1", "--seed-targets", str(seeds), "--dry-run")
+            self.assertEqual(code, 0, err)
+            plan = json.loads(out)["plan"]
+            prog = [s for s in plan if s["stage"] == "program"][0]["cmd"]
+            self.assertEqual(prog[prog.index("--seed-targets") + 1], str(seeds))
+            self.assertIn("--seed-report", prog)
+            k = lambda: rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg,  # noqa: E731
+                                            ["--target", "native", "seed-targets", rnb.file_digest(seeds)])
+            before = k()
+            seeds.write_text("0x1 0x3\n")
+            self.assertNotEqual(before, k())
 
     def test_shader_pack_hint(self):
         work = {"draws_issued": 100, "draws_emitted": 10, "draws_no_shader_module": 90}

@@ -19,3 +19,4 @@ pub mod reloc;
 pub mod stubs;
 pub mod summary;
 pub mod survey;
+pub mod trace_seed;

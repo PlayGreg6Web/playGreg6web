@@ -39,6 +39,7 @@
 #include "os/win32_loader.h"
 #include "os/win32_sync.h"
 #include "gpu/pipeline_prewarm_host.h"
+#include "guest/indirect_targets.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime_provider.h"
@@ -362,6 +363,7 @@ struct BootState {
     size_t recent_capacity = 32;
     size_t max_frames = 32;
     bool fault_record = true;  // BootConfig::fault_record
+    std::shared_ptr<IndirectTargetLog> indirect_log;  // BootConfig::record_indirect_targets (null: off)
     CaptureHostStackFn capture_host_stack = nullptr;
     HostFunctionStartFn host_function_start = nullptr;
     OffThreadFaultFn off_thread_fault = nullptr;
@@ -491,8 +493,20 @@ struct ThreadLocalObserver {
     uint32_t dispatch_pending = 0;
     std::shared_ptr<DispatchBatchTarget> dispatch_target;
     std::shared_ptr<ThreadSlot> slot;
+    std::shared_ptr<IndirectTargetLog> indirect_log;  // null unless recording
+    IndirectTargetCollector indirect_targets;
+
+    void flush_indirect_targets() noexcept {
+        if (indirect_log && indirect_targets.has_pending()) {
+            try {
+                indirect_log->merge(indirect_targets.take_pending());
+            } catch (...) {
+            }
+        }
+    }
 
     void flush_dispatches() noexcept {
+        flush_indirect_targets();
         if (dispatch_pending != 0) {
             if (dispatch_target && dispatch_target->active.load(std::memory_order_relaxed)) {
                 dispatch_target->dispatches.fetch_add(dispatch_pending, std::memory_order_relaxed);
@@ -506,6 +520,8 @@ struct ThreadLocalObserver {
         generation = 0;
         dispatch_target.reset();
         slot.reset();
+        indirect_log.reset();
+        indirect_targets.reset();
     }
 
     void snapshot_state_on_exit() noexcept {
@@ -532,6 +548,8 @@ void bind_thread_observer(BootState& b) {
     std::lock_guard<std::mutex> lock(b.mutex);
     const uint64_t gen = b.generation.load(std::memory_order_acquire);
     t_observer.dispatch_target = b.dispatch_target;
+    t_observer.indirect_log = b.indirect_log;
+    t_observer.indirect_targets.reset();
     t_observer.slot = std::make_shared<ThreadSlot>();
     b.thread_slots.push_back(t_observer.slot);
     t_observer.generation = gen;
@@ -1247,6 +1265,9 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
             read_u64(*b.arena, rsp, return_address);
         }
         d.return_address = return_address;
+        if (t_observer.indirect_log && !is_synthetic_address(target)) {
+            t_observer.indirect_targets.note(return_address, target);
+        }
     }
     if (is_synthetic_address(target)) {
         // Fast O(1) lookup for statically bound IAT slots; only fall back to describe_synthetic
@@ -2840,6 +2861,10 @@ void log_trap() {
 
 void finish_report() {
     BootState& b = boot();
+    t_observer.flush_indirect_targets();
+    if (b.indirect_log) {
+        b.indirect_log->flush();
+    }
     b.last_report = build_report();
     b.last_summary = build_summary();
     if (b.report_sink) {
@@ -3573,6 +3598,9 @@ BootResult run_boot(const BootConfig& config) {
     b.recent_capacity = config.recent_import_count;
     b.max_frames = config.max_backtrace_frames;
     b.fault_record = config.fault_record;
+    b.indirect_log = config.record_indirect_targets.empty()
+                         ? nullptr
+                         : std::make_shared<IndirectTargetLog>(config.record_indirect_targets);
     b.capture_host_stack = config.capture_host_stack;
     b.trace_limit = config.import_trace_limit;
     b.previous_arena_observer = os::set_arena_observer(&boot_arena_observer);

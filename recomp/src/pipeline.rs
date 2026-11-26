@@ -283,6 +283,11 @@ pub struct PipelineOptions {
     pub include_root: Option<PathBuf>,
     /// Extra discovery entry points (VAs).
     pub extra_entries: Vec<u64>,
+    /// Recorded indirect-call targets (`--seed-targets`, see [`crate::trace_seed`]): validated
+    /// against this module's image and added as function entries.
+    pub trace_seeds: Option<crate::trace_seed::TraceSeeds>,
+    /// Appended one JSON line per module with the seeding outcome (`--seed-report`).
+    pub trace_seed_report: Option<PathBuf>,
     /// Compile every shard and the registration table to wasm64 objects.
     pub emit_obj: bool,
     /// Worker threads for lifting/compiling (does not affect any output).
@@ -313,6 +318,8 @@ impl PipelineOptions {
             shim_headers: Vec::new(),
             include_root: None,
             extra_entries: Vec::new(),
+            trace_seeds: None,
+            trace_seed_report: None,
             emit_obj: false,
             jobs: thread::available_parallelism().map_or(1, |n| n.get()),
             shard_size: DEFAULT_SHARD_SIZE,
@@ -1499,7 +1506,33 @@ pub fn run_module(
         .extend(options.extra_entries.iter().copied());
     seeded.image.entry_points.sort_unstable();
     seeded.image.entry_points.dedup();
-    let (analysis, code_pointers) = refine::discover_refined(&mut seeded.image, &guest.image);
+    let (mut analysis, mut code_pointers) =
+        refine::discover_refined(&mut seeded.image, &guest.image);
+    if let Some(seeds) = &options.trace_seeds {
+        let outcome = crate::trace_seed::evaluate(&seeded.image, &analysis, seeds);
+        let accepted = outcome.accepted();
+        if let Some(path) = &options.trace_seed_report
+            && outcome.pairs_in_range > 0
+        {
+            use std::io::Write as _;
+            let line = crate::trace_seed::report_line(&options.module, &outcome);
+            let written = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| writeln!(f, "{line}"));
+            written.map_err(io_error(format!(
+                "failed to write seed report '{}'",
+                path.display()
+            )))?;
+        }
+        if !accepted.is_empty() {
+            seeded.image.entry_points.extend(accepted);
+            seeded.image.entry_points.sort_unstable();
+            seeded.image.entry_points.dedup();
+            (analysis, code_pointers) = refine::discover_refined(&mut seeded.image, &guest.image);
+        }
+    }
     let discovery = DiscoveryStats::new(&seeded.image, &analysis, code_pointers.rounds);
     let pdata = PdataStats::new(&seeded.pdata, &seeded.image);
     let slots = refine::check_import_slots(&pe, &plan, &analysis);

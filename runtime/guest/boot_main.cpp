@@ -214,6 +214,7 @@ struct Options {
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
+    std::string record_indirect_targets;  // --record-indirect-targets <file>
     bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
@@ -228,7 +229,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet] [--no-fault-record] [--no-present-pacing] [--no-xmem-shared-pages]\n"
+                 "                     [--no-entry] [--quiet] [--no-fault-record] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
@@ -294,7 +295,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--input-script" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
-                   a == "--bcpack-tables") {
+                   a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
                 return false;
             }
@@ -310,6 +311,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--save-dir" ? o.save_dir
                                   : a == "--audio-dump" ? o.audio_dump
                                   : a == "--bcpack-tables" ? o.bcpack_tables
+                                  : a == "--record-indirect-targets" ? o.record_indirect_targets
                                   : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
@@ -973,6 +975,7 @@ void run_boot_thread() {
     cfg.call_entry = g_options.entry;
     cfg.log_progress = !g_options.quiet;
     cfg.fault_record = g_options.fault_record;
+    cfg.record_indirect_targets = g_options.record_indirect_targets;
     cfg.capture_host_stack = &capture_host_stack;
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
     cfg.arena_log_limit = static_cast<size_t>(g_options.arena_log_limit);

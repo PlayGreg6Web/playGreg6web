@@ -51,6 +51,13 @@ What it does, in order:
    summary), `boot.log` (stdout and stderr), `capture.pg6trace` (+ `.json`, with a GPU capture),
    `input-script.txt` (with an input script), `import-trace.txt` (`--import-trace`),
    `command.json` (the command line, the staleness plan and the exit code) and `digest.txt`.
+   Every run also appends the indirect-call targets it dispatched to a per-title file outside the
+   repository (`<object cache>-targets/<exe>-<hash>/indirect-targets.txt`, `PLAYGTA6_INDIRECT_TARGETS`
+   overrides, `off` or `--no-record-targets` disables); `--seed-targets [FILE]` lifts the program
+   with those targets as function entries (validated by the recompiler; the lift report lands in
+   `<build-dir>/seed-report.jsonl`: rejected targets and targets inside functions with unresolved
+   jump tables, for `survey-jumps`). A stop on an unresolved indirect call: rerun, then
+   `--seed-targets`, and the next boot goes past it if the code was reached.
 4. `--baseline NAME|DIR` compares the run with an earlier run through
    `tools/compare_boot_reports.py` (capture and import trace are included when both runs have
    them; `--ignore`, `--time-tolerance` and `--count-tolerance` are passed on).
@@ -91,6 +98,9 @@ from lift_cache import (  # noqa: E402,F401 (re-exported for the tests)
     clear_program, file_digest, lift_cache_dir, lift_cache_keep, lift_cache_restore, lift_cache_store,
     lift_inputs_key, lift_key, read_stamp, recomp_source_files, shim_inputs, workspace_dirs,
 )
+
+TARGETS_ENV = "PLAYGTA6_INDIRECT_TARGETS"
+TARGETS_FILE = "indirect-targets.txt"
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".c", ".cmake", ".txt", ".rs", ".toml"}
@@ -207,11 +217,26 @@ def choose_build_dir(repo: Path, requested: Path | None, env: Mapping[str, str],
     return short, note
 
 
+def indirect_targets_path(cache_dir: Path | None, env: Mapping[str, str], exe: Path | None) -> Path | None:
+    """Where a title's recorded indirect-call targets live: `$PLAYGTA6_INDIRECT_TARGETS` (`off`
+    disables), else `<object cache>-targets/<exe stem>-<exe hash>/indirect-targets.txt`. Never in
+    the repository (the addresses are derived from the game)."""
+    value = env.get(TARGETS_ENV)
+    if value:
+        return None if value.lower() in ("0", "off", "no") else Path(value).expanduser().resolve()
+    if exe is None or not exe.is_file():
+        return None
+    import build_native_boot  # noqa: PLC0415 (only for the default object cache location)
+    obj = (cache_dir if cache_dir is not None else build_native_boot.default_cache_dir(env)).resolve()
+    return obj.with_name(obj.name + "-targets") / f"{exe.stem}-{file_digest(exe)[:12]}" / TARGETS_FILE
+
+
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
               force: bool, harness_override: Path | None,
               rebuild_program: bool = False, cache_dir: Path | None = None,
               lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP,
-              recomp_cache: Path | None = None, toolchain: str | None = None) -> tuple[Plan, Path, Path]:
+              recomp_cache: Path | None = None, toolchain: str | None = None,
+              seed_targets: Path | None = None) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path. Objects go to
     `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts). With
     `lift_cache`, a stale program is first looked up there by the hash of its inputs: a hit is
@@ -259,14 +284,21 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
     # thunk (e.g. combase!CoCreateInstance) is only bound once the program is generated again.
     shim_time = max([mtime(p) or 0.0 for p in shim_inputs(repo)] + [0.0])
     reason = "forced (--rebuild-program)" if rebuild_program else None
+    seed_time = (mtime(seed_targets) or 0.0) if seed_targets else 0.0
     reason = reason or stale("program", manifest, [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0),
-                                         ("the runtime shim headers or export tables", shim_time)])
+                                         ("the runtime shim headers or export tables", shim_time),
+                                         ("the recorded targets", seed_time)])
     if reason is None and plan.has("recomp"):
         reason = "the recompiler is rebuilt"
     lift_options = list(NATIVE_LIFT_OPTIONS)
+    key_options = list(lift_options)
+    if seed_targets is not None:
+        # The lift depends on the file's content: it is part of the cache key (the report path is not).
+        key_options += ["seed-targets", file_digest(seed_targets)]
+        lift_options += ["--seed-targets", str(seed_targets), "--seed-report", str(build_dir / "seed-report.jsonl")]
     key = None
     if reason and lift_cache is not None and exe is not None and exe.is_file() and game_dir is not None:
-        key = lift_inputs_key(repo, exe, game_dir, lift_options)
+        key = lift_inputs_key(repo, exe, game_dir, key_options)
         if not (force or rebuild_program):
             if read_stamp(program) == key and manifest.is_file():
                 reason = None  # the program there is this exact lift (only mtimes moved)
@@ -714,6 +746,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--chrome", help="Chrome executable for --thumbnails (default $PLAYGTA6_CHROME, then auto-detected)")
     p.add_argument("--replay-pack", help="wgsl pack file for --thumbnails")
     p.add_argument("--import-trace", action="store_true", help="write import-trace.txt")
+    p.add_argument("--seed-targets", nargs="?", const="auto", metavar="FILE",
+                   help="lift with the recorded indirect-call targets as function entries (default file: this "
+                        "title's recorded targets, see PLAYGTA6_INDIRECT_TARGETS)")
+    p.add_argument("--no-record-targets", action="store_true",
+                   help="do not record the indirect-call targets this run dispatches")
     p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory under work/)")
     p.add_argument("--audio-dump", help="harness --audio-dump: WAV file of the stereo mix")
     p.add_argument("--baseline", help="earlier run (name in the runs directory, or a directory) to compare with")
@@ -818,9 +855,15 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
 
 def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset, run_dir,
                 lift_cache, recomp_cache) -> int:
+    targets_file = None if args.no_record_targets and not args.seed_targets else         indirect_targets_path(args.cache_dir, env, exe)
+    seed_file = None
+    if args.seed_targets:
+        seed_file = targets_file if args.seed_targets == "auto" else Path(args.seed_targets)
+        if seed_file is None or not seed_file.is_file():
+            raise RunnerError(f"--seed-targets: no recorded targets at {seed_file} (run the title once first)")
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
                                       args.rebuild_program, args.cache_dir, lift_cache,
-                                      lift_cache_keep(env), recomp_cache)
+                                      lift_cache_keep(env), recomp_cache, seed_targets=seed_file)
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
@@ -850,6 +893,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
             cmd += ["--gpu-capture-start-at-script"]
     if args.import_trace:
         cmd += ["--import-trace", str(run_dir / "import-trace.txt")]
+    if targets_file is not None and not args.no_record_targets:
+        cmd += ["--record-indirect-targets", str(targets_file)]
     if args.dump_pipelines:
         cmd += ["--dump-pipelines", args.dump_pipelines]
     if args.audio_dump:
@@ -861,6 +906,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     if args.dry_run:
         print(json.dumps({"plan": plan.steps, "command": cmd}, indent=2))
         return 0
+    if targets_file is not None and not args.no_record_targets:
+        targets_file.parent.mkdir(parents=True, exist_ok=True)
     if plan.steps and args.no_build:
         raise RunnerError("stale stages with --no-build: " + ", ".join(s["stage"] for s in plan.steps))
     if args.harness is not None and not args.harness.is_file():
