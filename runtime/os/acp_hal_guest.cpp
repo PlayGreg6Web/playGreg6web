@@ -573,8 +573,10 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 // asks for 350 contexts of kind 4 (XMA, 64 bytes each, xbox_middleware.cpp), and the stream
 // consumer at 0x140078120 reads the XMA context's output write / read offsets and only copies PCM
 // out (then sends AcpHal command 0x12, tag 0xF1F1F1F1) once the hardware has advanced the write
-// offset. There is no XMA decoder here, so those voices never produce a sample; the boot report's
-// `xma_contexts*` fields count the contexts with queued input. The streamed banks themselves load
+// offset. The decode worker above moves that offset, but writes silence (no WMA Pro frame decoder
+// yet). A menu-flow run (R40, 238 s) never set up or enabled one XMA context (xma_contexts_touched
+// and xma_enable_commands 0), so the menus' music does not come this way; the boot report's
+// `xma_*` fields show when a later screen does. The streamed banks themselves load
 // fine: in that run all 1043 XCRDAPI requests on audio.rpf (zlib) and 557 ReadFile calls succeed
 // within 1 ms. XDspActivate is never reached and the executable imports no XAudio2 API; PCM and
 // ADPCM are decoded by the title's own code. The boot report's audio section carries the
