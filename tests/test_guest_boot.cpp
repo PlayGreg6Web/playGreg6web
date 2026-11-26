@@ -2250,14 +2250,14 @@ void test_lockfree_dispatch_observer() {
 
 void test_minidump_paths() {
     namespace md = playgta6::guest::minidump;
-    check(md::select_path("C:/runs/a/boot-report.json", "host", "host_access_violation", 42) ==
+    CHECK(md::select_path("C:/runs/a/boot-report.json", "host", "host_access_violation", 42) ==
           "C:/runs/a/host-fault-host_access_violation-42.dmp");
-    check(md::select_path("boot-report.json", "guest", "a b/c", 7) == "guest-fault-a_b_c-7.dmp");
-    check(md::select_path("out/r.json", "host", "", 1) == "out/host-fault-unknown-1.dmp");
+    CHECK(md::select_path("boot-report.json", "guest", "a b/c", 7) == "guest-fault-a_b_c-7.dmp");
+    CHECK(md::select_path("out/r.json", "host", "", 1) == "out/host-fault-unknown-1.dmp");
     const std::string r = "{\"fault_record\": {\"kind\": \"x\"}}";
-    check(md::annotate_report(r, "C:/d.dmp") == "{\"fault_record\": {\"minidump\": \"C:/d.dmp\", \"kind\": \"x\"}}");
-    check(md::annotate_report("{}", "p") == "{}");
-    check(md::annotate_report(r, "") == r);
+    CHECK(md::annotate_report(r, "C:/d.dmp") == "{\"fault_record\": {\"minidump\": \"C:/d.dmp\", \"kind\": \"x\"}}");
+    CHECK(md::annotate_report("{}", "p") == "{}");
+    CHECK(md::annotate_report(r, "") == r);
 }
 
 int main() {

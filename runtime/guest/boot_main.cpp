@@ -990,6 +990,10 @@ void audio_fanout_sink(void*, const float* stereo, uint32_t frames, uint32_t sam
     if (g_audio_out_active) g_audio_feed.push(stereo, frames, sample_rate);
 }
 
+#ifdef _WIN32
+bool write_minidump(const std::string& path, EXCEPTION_POINTERS* info);
+#endif
+
 void write_outputs(bool print_summary) {
     finish_profile();
     gpu::prewarm_host_stop();
@@ -1201,8 +1205,7 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
                                                               static_cast<uint32_t>(GetCurrentProcessId()));
         if (write_minidump(path, info)) {
             g_minidump_path = path;
-            std::fprintf(stderr, "[host-stack] minidump written to %s
-", path.c_str());
+            std::fprintf(stderr, "[host-stack] minidump written to %s\n", path.c_str());
         }
     }
     host_fault(kind, address, pc, kExitHostFault);
