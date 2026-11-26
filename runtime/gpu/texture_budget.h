@@ -12,6 +12,13 @@
 // frees and the cap loosens, the dropped levels are uploaded again the next time the texture is
 // bound.
 //
+// A capped texture whose host allocation can be replaced is also *reallocated* at the capped size
+// (fewer levels, smaller base; the bridge maps guest mip indices onto the host levels), so the
+// dropped levels cost no GPU memory; the budget counts the smaller chain. Loosening reallocates at
+// the larger size and re-uploads from guest memory, but only when the restored use still stays
+// below the pressure tier the cap came from (cap_with_extra / restore_fits), so a texture does not
+// flap between the sizes as its own shrinking moves the use across a threshold.
+//
 // Pure bookkeeping, thread-safe, no GPU packets.
 
 #include <atomic>
@@ -48,6 +55,8 @@ struct TextureBudgetStats {
     uint64_t mips_dropped = 0;        // top levels not uploaded, summed over those passes
     uint64_t bytes_not_uploaded = 0;  // texel bytes those levels would have taken
     uint64_t textures_restored = 0;   // textures that got dropped levels back after the cap loosened
+    uint64_t host_reallocs = 0;       // host textures re-created at another size by the cap
+    uint64_t host_bytes_saved = 0;    // bytes the currently shrunk host textures are below full size
 };
 
 class TextureBudget {
@@ -67,6 +76,21 @@ public:
     void note_capped(uint32_t mips, uint64_t bytes) noexcept;
     void note_restored() noexcept { restored_.fetch_add(1, std::memory_order_relaxed); }
 
+    // The cap that would be in force if `extra_bytes` more were in use (a restore that grows a texture).
+    uint32_t cap_with_extra(uint64_t extra_bytes) const noexcept;
+    // True when growing a width x height x mips texture to start at level `target_floor`, costing
+    // `extra_bytes` more, still leaves a cap that allows that floor (hysteresis for restores).
+    bool restore_fits(uint32_t width, uint32_t height, uint32_t mips, uint32_t target_floor,
+                      uint64_t extra_bytes) const noexcept;
+
+    // A host texture was re-created at another size: `saved_delta` is the change of its bytes below
+    // full size (positive = shrunk further). The used bytes move by the same amount.
+    void note_host_realloc(int64_t saved_delta) noexcept;
+
+    // A shrunk texture goes away: its caller then note_destroyed()s the full size, so the saved bytes
+    // are counted back in first (net: the shrunk bytes leave the use).
+    void note_shrunk_released(uint64_t saved_bytes) noexcept;
+
     TextureBudgetStats stats() const noexcept;
 
 private:
@@ -80,6 +104,8 @@ private:
     std::atomic<uint64_t> mips_dropped_{0};
     std::atomic<uint64_t> bytes_skipped_{0};
     std::atomic<uint64_t> restored_{0};
+    std::atomic<uint64_t> reallocs_{0};
+    std::atomic<uint64_t> saved_{0};
 };
 
 TextureBudget& texture_budget() noexcept;

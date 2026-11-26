@@ -29,6 +29,7 @@
 #include "gpu/gfx10_detile.h"
 #include "gpu/shader_pack_index.h"
 #include "gpu/stage_reflection.h"
+#include "gpu/texture_budget.h"
 #include "gpu/gpu_va_watch.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
@@ -5060,6 +5061,111 @@ void test_g49c_slot70_address_texture_draw() {
     xb::clear_address_texture_views();
 }
 
+// Texture size cap (backlog 37 follow-up): a capped BC texture is re-created at the capped size
+// (fewer levels, smaller base) so the dropped levels cost no GPU memory; the uploads shift onto the
+// host levels, the budget counts the smaller chain, and loosening re-creates it at full size once the
+// larger texture still fits the pressure tier.
+void test_texture_cap_reallocates_host_texture() {
+    Fixture fx;
+    dg::DeviceOptions opts;
+    opts.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    opts.bridge.features = playgta6::gpu::pso::WgpuFeature::TextureCompressionBc;
+    dx::set_device_options(opts);
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    gpu::TextureBudget& budget = gpu::texture_budget();
+    budget.reset();
+    constexpr uint32_t kBc1 = 71, kLayout = 0x102, kW = 512, kH = 512, kMips = 10;
+    const uint64_t mem = com::guest_alloc(4u << 20);
+    std::vector<uint8_t> texels(2u << 20, 0x5au);
+    CHECK(com::write_guest(mem, texels.data(), texels.size()));
+    const uint64_t full = gpu::texture_chain_bytes(kW, kH, 1, kMips, 4, 4, 8);
+    const uint64_t capped = gpu::texture_chain_bytes(kW, kH, 1, kMips, 4, 4, 8, 1);
+    budget.set_budget_bytes(full * 100 / 87 + 1);  // the texture alone is at the high-pressure tier
+    const uint32_t id = dev->ensure_address_texture(mem, kBc1, kW, kH, 1, kMips, kLayout, GpuTextureDimension::Dim2D, false);
+    if (id == 0) {
+        std::puts("test_texture_cap_reallocates_host_texture: BC1 address texture unsupported here, skipped");
+        budget.reset();
+        scene.release_all();
+        return;
+    }
+    CHECK(budget.stats().used_bytes == full);
+
+    gpu::CommandEncoder enc;
+    dev->begin_submission();
+    CHECK(dev->sync_bound_texture_memory(id, enc));
+    dev->end_submission();
+    bool created_small = false;
+    bool wrote_mip0 = false;
+    size_t writes = 0;
+    {
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            Packet p;
+            p.opcode = static_cast<GpuOpcode>(h.opcode);
+            p.payload.assign(enc.data() + off, enc.data() + off + h.payload_bytes);
+            off += h.payload_bytes;
+            if (p.opcode == GpuOpcode::CreateTexture2) {
+                const auto c = payload_as<GpuCreateTexture2Payload>(p);
+                created_small = c.id == id && c.width == kW / 2 && c.height == kH / 2 && c.mip_levels == kMips - 1;
+            } else if (p.opcode == GpuOpcode::WriteTexture) {
+                const auto w = payload_as<GpuWriteTexturePayload>(p);
+                ++writes;
+                wrote_mip0 = wrote_mip0 || (w.texture_id == id && w.mip_level == 0 && w.width == kW / 2);
+            }
+        }
+    }
+    CHECK(created_small);          // the host texture lacks the top level
+    CHECK(wrote_mip0 && writes == kMips - 1);  // guest level 1 is host level 0; level 0 is not uploaded
+    CHECK(budget.stats().used_bytes == capped && budget.stats().host_bytes_saved == full - capped);
+    CHECK(budget.stats().host_reallocs == 1);
+    gpu::TextureBudgetStats st0 = budget.stats();
+    gpu::bridge::TextureInfo info{};
+    CHECK(dev->state_bridge().texture_info(id, &info) && info.host_mip_offset == 1 && info.mip_levels == kMips);
+
+    // The cap would loosen on its own (the shrunk texture is at ~33%), but the full texture would be back at
+    // the high tier: it stays shrunk, nothing is re-created.
+    gpu::CommandEncoder enc2;
+    dev->begin_submission();
+    dev->sync_bound_texture_memory(id, enc2);
+    dev->end_submission();
+    CHECK(budget.stats().host_reallocs == st0.host_reallocs && budget.stats().used_bytes == capped);
+
+    // Memory frees (a bigger budget): the texture grows back to full size and is uploaded again.
+    budget.set_budget_bytes(full * 20);
+    gpu::CommandEncoder enc3;
+    dev->begin_submission();
+    CHECK(dev->sync_bound_texture_memory(id, enc3));
+    dev->end_submission();
+    CHECK(budget.stats().used_bytes == full && budget.stats().host_bytes_saved == 0);
+    CHECK(budget.stats().host_reallocs == 2 && budget.stats().textures_restored == 1);
+    CHECK(dev->state_bridge().texture_info(id, &info) && info.host_mip_offset == 0);
+    size_t full_writes = 0;
+    bool created_full = false;
+    {
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc3.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc3.data() + off, sizeof(h));
+            off += sizeof(h);
+            if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::CreateTexture2) {
+                GpuCreateTexture2Payload c{};
+                std::memcpy(&c, enc3.data() + off, sizeof(c));
+                created_full = c.id == id && c.width == kW && c.height == kH && c.mip_levels == kMips;
+            } else if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteTexture) {
+                ++full_writes;
+            }
+            off += h.payload_bytes;
+        }
+    }
+    CHECK(created_full && full_writes == kMips);
+    budget.reset();
+    scene.release_all();
+}
+
 // G49c Test 3: Raw GFX10 T# image descriptor written directly into shader-visible descriptor heap
 // memory (with sw_mode = 2 / 0x102, no ID3D12Resource, no Slot-70 call) resolves via
 // MemorySlotSource::view -> ensure_address_texture, detiles guest memory, and emits WriteTexture.
@@ -7567,6 +7673,7 @@ int main() {
     test_g49c_default_detile_rgba8_and_bc7();
     test_g49c_slot70_address_texture_draw();
     test_g49c_raw_tsharp_descriptor_memory_draw();
+    test_texture_cap_reallocates_host_texture();
     test_g51_slot70_unaligned_buffer_views();
     test_g51_slot70_address_only_buffer_view();
     test_g53_compute_meta_tail_28_digest_join();

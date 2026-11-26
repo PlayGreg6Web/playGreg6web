@@ -70,6 +70,37 @@ void test_tracker() {
     t.reset();
     CHECK(t.stats().cap_changes == 0 && t.stats().budget_bytes == 0);
 }
+
+void test_host_realloc() {
+    TextureBudget t;
+    t.set_budget_bytes(1000);
+    t.note_created(900);  // 90%: cap 256
+    CHECK(t.current_cap() == kTextureCapHigh);
+    // A 1024x1024 BC1-like texture (4x4 blocks of 8 bytes): shrinking it by 2 levels saves its top two.
+    const uint64_t full = texture_chain_bytes(1024, 1024, 1, 11, 4, 4, 8);
+    const uint64_t capped = texture_chain_bytes(1024, 1024, 1, 11, 4, 4, 8, 2);
+    CHECK(full - capped == texture_chain_bytes(1024, 1024, 1, 2, 4, 4, 8));
+    // The capped host texture has the chain of a 256x256 texture with 9 levels.
+    CHECK(capped == texture_chain_bytes(256, 256, 1, 9, 4, 4, 8));
+    t.note_host_realloc(static_cast<int64_t>(300));
+    CHECK(t.stats().used_bytes == 600 && t.stats().host_bytes_saved == 300 && t.stats().host_reallocs == 1);
+    CHECK(t.stats().peak_used_bytes == 900);
+    CHECK(t.current_cap() == 0);
+    // Restore hysteresis: growing back by 300 would return to 90%, so it does not fit a 0-level floor.
+    CHECK(!t.restore_fits(1024, 1024, 11, 0, 300));
+    CHECK(t.cap_with_extra(300) == kTextureCapHigh);
+    CHECK(t.restore_fits(1024, 1024, 11, 0, 50));  // 65% stays below the medium tier
+    CHECK(t.restore_fits(1024, 1024, 11, 2, 300));  // the capped size itself is allowed
+    t.note_host_realloc(-300);  // restored
+    CHECK(t.stats().used_bytes == 900 && t.stats().host_bytes_saved == 0 && t.stats().host_reallocs == 2);
+    // A shrunk texture destroyed: released bytes are counted back, then its full size leaves.
+    t.note_host_realloc(300);
+    t.note_shrunk_released(300);
+    t.note_destroyed(300 + 0);
+    CHECK(t.stats().used_bytes == 600 && t.stats().host_bytes_saved == 0);
+    t.reset();
+    CHECK(t.stats().host_reallocs == 0 && t.stats().host_bytes_saved == 0);
+}
 }  // namespace
 
 int main() {
@@ -77,6 +108,7 @@ int main() {
     test_chain_bytes();
     test_pressure_tiers();
     test_tracker();
+    test_host_realloc();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

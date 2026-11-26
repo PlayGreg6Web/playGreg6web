@@ -1327,19 +1327,23 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
             device_->note_bad_argument("ExecuteCommandLists: copy source " + hex(w.src) + " no longer readable");
             continue;
         }
+        uint32_t host_mip = w.texture ? w.tex.mip_level : 0u;
+        if (w.texture && !device_->state_bridge().translate_host_mip(w.tex.texture_id, &host_mip)) {
+            continue;  // a level the capped host texture lacks (gpu/texture_budget.h)
+        }
         if (w.texture && w.widen_a8) {
             count_work(Work::TextureUploads);
             std::vector<uint8_t> wide;
             uint32_t pitch = 0;
             if (widen_a8_rows(bytes.data(), bytes.size(), w.tex.width, w.tex.height, w.tex.depth_or_layers,
                               w.tex.bytes_per_row, uint64_t{w.tex.rows_per_image} * w.tex.bytes_per_row, &wide, &pitch)) {
-                out.write_texture(w.tex.texture_id, w.tex.mip_level, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
+                out.write_texture(w.tex.texture_id, host_mip, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
                                   w.tex.width, w.tex.height, w.tex.depth_or_layers, pitch, w.tex.height, wide.data(),
                                   static_cast<uint32_t>(wide.size()));
             }
         } else if (w.texture) {
             count_work(Work::TextureUploads);
-            out.write_texture(w.tex.texture_id, w.tex.mip_level, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
+            out.write_texture(w.tex.texture_id, host_mip, w.tex.origin_x, w.tex.origin_y, w.tex.origin_z,
                               w.tex.width, w.tex.height, w.tex.depth_or_layers, w.tex.bytes_per_row,
                               w.tex.rows_per_image, bytes.data(), static_cast<uint32_t>(bytes.size()));
         } else {

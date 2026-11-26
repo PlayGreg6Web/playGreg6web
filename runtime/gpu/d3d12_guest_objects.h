@@ -564,6 +564,13 @@ struct TrackedTexture {
     uint64_t last_upload_hash = 0;  // whole source surface
     bool ever_uploaded = false;
     uint32_t cap_floor_applied = 0;  // top mip levels dropped by the texture size cap (gpu/texture_budget.h)
+    // Host reallocation under the cap (gpu/texture_budget.h): `create` is the packet the full-size host
+    // texture was made with (has_create), `host_floor` the top levels the host texture currently
+    // lacks (it is allocated at the capped size), `host_saved_bytes` the bytes that saves.
+    bool has_create = false;
+    GpuCreateTexture2Payload create{};
+    uint32_t host_floor = 0;
+    uint64_t host_saved_bytes = 0;
     bool streamable = false;  // created as a reserved (tiled) resource: unmapped levels are not loaded
     // Submission (Device::begin_submission) that last looked at this texture: a texture bound in
     // several bind groups or lists of one ExecuteCommandLists is read and hashed once.
@@ -1064,6 +1071,9 @@ public:
     // submitted packet that references `id` (submit, submit_parts and present all check), or at once
     // when deferral is off.
     void defer_create(uint32_t id, const CommandEncoder& create);
+    // Re-creates texture `p.id` (the id's create packet replaces the texture): rewrites its held create
+    // when that was never written, else appends a CreateTexture2 to `encoder` (stream order).
+    void replace_host_texture(const GpuCreateTexture2Payload& p, CommandEncoder& encoder);
     // Resource `id` is released: true if its create packet was never written (it is dropped; the
     // GPU object never existed, so no DestroyResource must be sent).
     bool release_deferred(uint32_t id);

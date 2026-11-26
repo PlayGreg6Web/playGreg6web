@@ -621,13 +621,27 @@ void Device::track_guest_texture(const TrackedTexture& tex) {
     }
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
     texture_slot_index_.remove(texture_slot_key(tex.resource_id));
-    tracked_textures_[tex.resource_id] = tex;
+    TrackedTexture& slot = tracked_textures_[tex.resource_id];
+    const TrackedTexture prev = slot;
+    slot = tex;
+    if (prev.resource_id != 0 && prev.host_floor != 0 && prev.width == tex.width && prev.height == tex.height &&
+        prev.mip_levels == tex.mip_levels && prev.dxgi_format == tex.dxgi_format && prev.has_create) {
+        // Tracked again after a cap shrink: the host texture is still the shrunk one.
+        slot.has_create = true;
+        slot.create = prev.create;
+        slot.host_floor = prev.host_floor;
+        slot.host_saved_bytes = prev.host_saved_bytes;
+    }
 }
 
 void Device::untrack_guest_texture(uint32_t resource_id) {
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
     texture_slot_index_.remove(texture_slot_key(resource_id));
-    tracked_textures_.erase(resource_id);
+    if (const auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
+        // A shrunk host texture is counted at its capped size; its owner note_destroyed()s the full size.
+        texture_budget().note_shrunk_released(it->second.host_saved_bytes);
+        tracked_textures_.erase(it);
+    }
     copy_destinations_.erase(resource_id);
 }
 
@@ -844,6 +858,13 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // G68 (#663): when the texture lives in the translated CPU window, skip reading, zero-scanning
     // and hashing altogether if none of its 64 KiB slots were marked written since the last check
     // (either via flush_cpu_buffers's shared MarkPass or directly since then).
+    // A host-reallocatable texture whose allocation does not match the cap in force is due a pass even
+    // when its memory is unchanged (the cap moved, or a restore was held back by the hysteresis).
+    const auto host_unsettled = [&](const TrackedTexture& cur) {
+        return cur.has_create && cur.layout >= gfx10::kConsoleLinearLayout &&
+               cap_floor_for(cur.width, cur.height, std::max(cur.mip_levels, 1u), texture_budget().current_cap()) !=
+                   cur.host_floor;
+    };
     const bool in_window = os::guest_window::translated(cpu_va);
     const bool verify_marks = in_window && os::guest_window::write_marks_verified();
     bool unmarked = false;
@@ -857,7 +878,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         TrackedTexture& cur = it->second;
         const bool same_range = cur.window_indexed && cur.window_indexed_va == cpu_va &&
                                 cur.window_indexed_size == primary_size;
-        const bool dirty_now = !same_range || cur.window_dirty || any_window_slot_marked(cpu_va, primary_size);
+        const bool dirty_now = !same_range || cur.window_dirty || any_window_slot_marked(cpu_va, primary_size) ||
+                               host_unsettled(cur);
         if (!same_range) {
             texture_slot_index_.add(texture_slot_key(resource_id), cpu_va, primary_size);
             cur.window_indexed = true;
@@ -913,8 +935,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 }
                 TrackedTexture& cur = it->second;
                 // a changed texture-budget cap (#1596) is never skipped: dropped levels may be due
-                skip = tracked && same_range && cur.view_checked && pages.empty() &&
-                       cur.view_checked_cap == texture_budget().current_cap();
+                const uint32_t cap_now = texture_budget().current_cap();
+                skip = tracked && same_range && cur.view_checked && pages.empty() && cur.view_checked_cap == cap_now &&
+                       !host_unsettled(cur);
                 if (!skip) {
                     cur.view_checked = false;  // set again once a full check of this call completes
                 }
@@ -1040,7 +1063,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     } else {
         hash = content_hash(src_data, src_size);
     }
-    if (!skip_streaming_hash && tt.ever_uploaded && tt.last_upload_hash != 0 && hash == tt.last_upload_hash) {
+    if (!skip_streaming_hash && tt.ever_uploaded && tt.last_upload_hash != 0 && hash == tt.last_upload_hash &&
+        !host_unsettled(tt)) {
         if (streaming_eligible && tt.streaming_full_frames != 0) {
             std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
             if (auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
@@ -1218,9 +1242,16 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // Backlog 37: under memory pressure a block-compressed 2D texture with its whole mip chain placed
     // drops the levels above the size cap (see gpu/texture_budget.h).
     uint32_t cap_floor = 0;
-    if (whole_surface && tt.dimension == ResourceDimension::Texture2D && l.block_width > 1u && mips > 1u) {
+    const bool cap_eligible =
+        whole_surface && tt.dimension == ResourceDimension::Texture2D && l.block_width > 1u && mips > 1u;
+    if (cap_eligible) {
         cap_floor = cap_floor_for(w, h, mips, texture_budget().current_cap());
     }
+    // Host reallocation (see gpu/texture_budget.h): set below when the host texture is re-created.
+    bool host_recreate = false;
+    GpuCreateTexture2Payload recreate{};
+    uint32_t host_floor_now = 0;
+    int64_t saved_delta = 0;
     const bool single_known_nonzero =
         !tt.ever_uploaded &&
         (single_linear_direct || (single_console_linear_direct && src_size == console_linear_bytes));
@@ -1231,6 +1262,40 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             return false;
         }
         TrackedTexture& cur = it->second;
+        if (cur.has_create && cur.host_floor != 0 && !cap_eligible) {
+            cap_floor = cur.host_floor;  // a partial pass cannot refill a shrunk host texture: keep it
+        }
+        if (cur.has_create && cap_eligible && cap_floor != cur.host_floor) {
+            bool change = true;
+            const auto chain = [&](uint32_t floor) {
+                return texture_chain_bytes(w, h, 1u, mips, l.block_width, l.block_height, l.block_bytes, floor);
+            };
+            if (cap_floor < cur.host_floor) {
+                // Hysteresis: grow back only while the larger texture still fits the tier its cap came from.
+                const uint64_t extra = chain(cap_floor) - chain(cur.host_floor);
+                change = texture_budget().restore_fits(w, h, mips, cap_floor, extra);
+            }
+            if (change) {
+                const uint64_t saved = chain(0) - chain(cap_floor);
+                saved_delta = static_cast<int64_t>(saved) - static_cast<int64_t>(cur.host_saved_bytes);
+                cur.host_saved_bytes = saved;
+                cur.host_floor = cap_floor;
+                recreate = cur.create;
+                recreate.width = std::max(1u, w >> cap_floor);
+                recreate.height = std::max(1u, h >> cap_floor);
+                recreate.mip_levels = mips - cap_floor;
+                host_recreate = true;
+                // The new allocation is empty: every held level is uploaded again.
+                std::fill(cur.subresource_hashes.begin(), cur.subresource_hashes.end(), 0u);
+                for (auto& b : cur.subresource_bands) {
+                    b.clear();
+                }
+                cur.last_upload_hash = 0;
+            } else {
+                cap_floor = cur.host_floor;
+            }
+        }
+        host_floor_now = cur.has_create ? cur.host_floor : 0u;
         // Backlog 37: the size cap loosened since the last pass, so dropped top levels are due again.
         const bool cap_restore = cap_floor < cur.cap_floor_applied;
         const bool was_ever_uploaded = cur.ever_uploaded;
@@ -1342,6 +1407,11 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             }
         }
     }
+    if (host_recreate) {
+        replace_host_texture(recreate, encoder);
+        bridge_->set_host_mip_offset(resource_id, host_floor_now);
+        texture_budget().note_host_realloc(saved_delta);
+    }
     // G66 partly-held mip chains: views of the texture start at its first held level.
     bridge_->set_resident_mip_floor(resource_id, held_floor);
 
@@ -1367,6 +1437,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     bool used_pad_scratch = false;
 
     for (const Staged& st : staged) {
+        if (st.sub.mip < host_floor_now) {
+            continue;  // a level the capped host texture lacks
+        }
         for (const auto& [first, count] : st.runs) {
             const uint32_t bh = st.copy_h / st.rows;  // block height (copy_h is whole blocks)
             const uint8_t* data = nullptr;
@@ -1393,7 +1466,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 len = static_cast<uint32_t>(
                     count == st.rows ? st.size() : size_t{count} * st.row_pitch);
             }
-            encoder.write_texture(resource_id, st.sub.mip, 0u, first * bh, st.sub.slice, st.copy_w, count * bh,
+            encoder.write_texture(resource_id, st.sub.mip - host_floor_now, 0u, first * bh, st.sub.slice, st.copy_w, count * bh,
                                   st.copy_d, st.row_pitch, count, data, len);
             count_work(Work::TextureUploads);
             note_upload(len);
@@ -1594,6 +1667,12 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
                            : (dim == GpuTextureDimension::Dim3D ? ResourceDimension::Texture3D
                                                                 : ResourceDimension::Texture2D);
         tt.sample_count = 1;
+        if (dim == GpuTextureDimension::Dim2D && safe_depth == 1u && safe_mips > 1u && shape_layout.known &&
+            shape_layout.block_width > 1u && chain_bytes > kSmallTextureMaxBytes &&
+            (payload.usage_flags & (GpuTextureUsage::RenderAttachment | GpuTextureUsage::StorageBinding)) == 0) {
+            tt.has_create = true;  // the host allocation may be replaced at a capped size
+            tt.create = payload;
+        }
         track_guest_texture(tt);
         // "Textures with data" counter: the surface's bytes (console layouts), else the tight mip 0.
         const bool is3d = dim == GpuTextureDimension::Dim3D;
@@ -2454,6 +2533,14 @@ bool Resource::initialize() {
                 tt.layout = desc_.Layout;
                 tt.dimension = desc_.Dimension;
                 tt.sample_count = p.sample_count;
+                if (const DxgiFormatLayout bl2 = dxgi_format_layout(desc_.Format);
+                    p.dimension == static_cast<uint8_t>(GpuTextureDimension::Dim2D) && p.depth_or_layers == 1u &&
+                    p.sample_count == 1u && mips_ > 1u && bl2.known && bl2.block_width > 1u &&
+                    budget_bytes_ > kSmallTextureMaxBytes &&
+                    (p.usage_flags & (GpuTextureUsage::RenderAttachment | GpuTextureUsage::StorageBinding)) == 0) {
+                    tt.has_create = true;  // the host allocation may be replaced at a capped size
+                    tt.create = p;
+                }
                 dev.track_guest_texture(tt);
                 texture_tracked_ = true;
             }
@@ -2783,6 +2870,10 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
     }
     const uint32_t mip = sub % mips_;
     const uint32_t layer = (sub / mips_) % array_layers();
+    uint32_t host_mip = mip;
+    if (!device_->state_bridge().translate_host_mip(id_, &host_mip)) {
+        return kSOk;  // a level the capped host texture lacks (gpu/texture_budget.h): lower resolution
+    }
     const uint32_t w = std::max<uint32_t>(1, static_cast<uint32_t>(desc_.Width >> mip));
     const uint32_t h = std::max<uint32_t>(1, desc_.Height >> mip);
     const uint32_t d = desc_.Dimension == ResourceDimension::Texture3D ? std::max<uint32_t>(1, desc_.DepthOrArraySize >> mip) : 1u;
@@ -2818,14 +2909,14 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
             device_->note_bad_argument("WriteToSubresource: A8 source smaller than its box");
             return kEInvalidArg;
         }
-        enc.write_texture(id_, mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, pitch, rows, wide.data(),
+        enc.write_texture(id_, host_mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, pitch, rows, wide.data(),
                           static_cast<uint32_t>(wide.size()));
         device_->submit(enc);
         device_->note_upload(wide.size());
         device_->note_texture_upload();
         return kSOk;
     }
-    enc.write_texture(id_, mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, row_pitch,
+    enc.write_texture(id_, host_mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, row_pitch,
                       row_pitch != 0 ? depth_pitch / row_pitch : rows, bytes.data(), static_cast<uint32_t>(len));
     device_->submit(enc);
     device_->note_upload(len);

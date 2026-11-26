@@ -116,7 +116,16 @@ struct TextureInfo {
     // Sampled views start no lower than it. 0 = the whole chain is held. Set with
     // StateBridgeDevice::set_resident_mip_floor, kept when the same description is registered again.
     uint32_t resident_mip_floor = 0;
+    // Texture size cap (gpu/texture_budget.h): top mip levels the host texture lacks because it was
+    // allocated at the capped size (its level 0 is guest level host_mip_offset). The fields above
+    // stay in guest terms; views and writes are shifted by this. Set with set_host_mip_offset.
+    uint32_t host_mip_offset = 0;
 };
+
+// Shifts a view's guest mip range onto a host texture that lacks the top `offset` levels: the view
+// starts no lower than guest level `offset` (at least the view's last level stays) and its base and
+// count become host terms. `levels` is the guest level count; count 0 = all remaining levels.
+void shift_view_to_host_mips(uint32_t levels, uint32_t offset, uint16_t* base, uint16_t* count) noexcept;
 
 // The sampled-view mip range clamped to the held levels: `base` / `count` (count 0 = all remaining
 // levels) of a view of a texture with `mip_levels` levels, raised so the view starts no lower than
@@ -410,6 +419,13 @@ public:
     // this start there; cached bind groups over the texture are re-created when it changes.
     // Returns false for an unknown texture.
     bool set_resident_mip_floor(uint32_t resource_id, uint32_t first_resident_mip);
+    // Records that the host texture of `resource_id` was re-created without its top `offset` levels
+    // (0 = full size). Views and cached bind groups over it are retired so they are made again
+    // against the new allocation. Returns false for an unknown texture.
+    bool set_host_mip_offset(uint32_t resource_id, uint32_t offset);
+    // Maps guest mip `*mip` of the texture onto its host level. False when the host texture lacks
+    // that level (a write to it is skipped); unknown textures map unchanged.
+    bool translate_host_mip(uint32_t resource_id, uint32_t* mip) const;
     // Bumped whenever a texture's resident mip floor changes.
     uint64_t residency_epoch() const noexcept { return residency_epoch_.load(std::memory_order_acquire); }
     // G66 (#691): ids of textures / buffers unregistered since they were registered (destroyed by the

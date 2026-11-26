@@ -65,6 +65,8 @@ void TextureBudget::reset() noexcept {
     mips_dropped_ = 0;
     bytes_skipped_ = 0;
     restored_ = 0;
+    reallocs_ = 0;
+    saved_ = 0;
 }
 
 void TextureBudget::note_created(uint64_t bytes) noexcept {
@@ -101,6 +103,41 @@ void TextureBudget::note_capped(uint32_t mips, uint64_t bytes) noexcept {
     bytes_skipped_.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+uint32_t TextureBudget::cap_with_extra(uint64_t extra_bytes) const noexcept {
+    return cap_for_pressure(used_.load(std::memory_order_relaxed) + extra_bytes, budget_.load(std::memory_order_relaxed),
+                            base_cap_.load(std::memory_order_relaxed));
+}
+
+bool TextureBudget::restore_fits(uint32_t width, uint32_t height, uint32_t mips, uint32_t target_floor,
+                                 uint64_t extra_bytes) const noexcept {
+    return cap_floor_for(width, height, mips, cap_with_extra(extra_bytes)) <= target_floor;
+}
+
+void TextureBudget::note_host_realloc(int64_t saved_delta) noexcept {
+    reallocs_.fetch_add(1, std::memory_order_relaxed);
+    if (saved_delta > 0) {
+        const uint64_t d = static_cast<uint64_t>(saved_delta);
+        note_destroyed(d);
+        saved_.fetch_add(d, std::memory_order_relaxed);
+    } else if (saved_delta < 0) {
+        const uint64_t d = static_cast<uint64_t>(-saved_delta);
+        note_created(d);
+        uint64_t cur = saved_.load(std::memory_order_relaxed);
+        while (!saved_.compare_exchange_weak(cur, cur > d ? cur - d : 0, std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void TextureBudget::note_shrunk_released(uint64_t saved_bytes) noexcept {
+    if (saved_bytes == 0) {
+        return;
+    }
+    used_.fetch_add(saved_bytes, std::memory_order_relaxed);  // no peak: the full size leaves right after
+    uint64_t cur = saved_.load(std::memory_order_relaxed);
+    while (!saved_.compare_exchange_weak(cur, cur > saved_bytes ? cur - saved_bytes : 0, std::memory_order_relaxed)) {
+    }
+}
+
 TextureBudgetStats TextureBudget::stats() const noexcept {
     TextureBudgetStats s;
     s.budget_bytes = budget_.load(std::memory_order_relaxed);
@@ -113,6 +150,8 @@ TextureBudgetStats TextureBudget::stats() const noexcept {
     s.mips_dropped = mips_dropped_.load(std::memory_order_relaxed);
     s.bytes_not_uploaded = bytes_skipped_.load(std::memory_order_relaxed);
     s.textures_restored = restored_.load(std::memory_order_relaxed);
+    s.host_reallocs = reallocs_.load(std::memory_order_relaxed);
+    s.host_bytes_saved = saved_.load(std::memory_order_relaxed);
     return s;
 }
 

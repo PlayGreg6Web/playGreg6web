@@ -647,6 +647,21 @@ void Device::defer_create(uint32_t id, const CommandEncoder& create) {
     count_work(Work::GpuObjectsDeferred);
 }
 
+void Device::replace_host_texture(const GpuCreateTexture2Payload& p, CommandEncoder& encoder) {
+    CommandEncoder create;
+    create.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
+    {
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        const auto it = deferred_creates_.find(p.id);
+        if (it != deferred_creates_.end()) {
+            it->second.assign(create.data(), create.data() + create.size());
+            return;
+        }
+    }
+    // In stream order with the caller's pending packets, which may still use the old texture.
+    encoder.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
+}
+
 bool Device::release_deferred(uint32_t id) {
     std::lock_guard<std::mutex> lock(submit_mutex_);
     const auto it = deferred_creates_.find(id);

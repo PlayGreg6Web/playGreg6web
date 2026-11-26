@@ -624,6 +624,27 @@ void test_cached_bind_group_drops_destroyed_texture() {
 void test_partly_held_mip_chain_clamps_views() {
     // The clamp itself.
     uint16_t base = 0, count = 0;
+    {
+        // Host texture lacking the top 2 of 9 levels: guest level N is host level N - 2.
+        uint16_t b = 0, c = 0;
+        bridge::shift_view_to_host_mips(9, 2, &b, &c);
+        CHECK(b == 0 && c == 0);  // whole chain stays whole
+        b = 3; c = 0;
+        bridge::shift_view_to_host_mips(9, 2, &b, &c);
+        CHECK(b == 1 && c == 0);
+        b = 2; c = 4;
+        bridge::shift_view_to_host_mips(9, 2, &b, &c);
+        CHECK(b == 0 && c == 4);
+        b = 0; c = 4;  // levels 0..3: raised to 2..3
+        bridge::shift_view_to_host_mips(9, 2, &b, &c);
+        CHECK(b == 0 && c == 2);
+        b = 0; c = 1;  // only dropped level: the first held level stays
+        bridge::shift_view_to_host_mips(9, 2, &b, &c);
+        CHECK(b == 0 && c == 1);
+        b = 1; c = 0;
+        bridge::shift_view_to_host_mips(9, 0, &b, &c);
+        CHECK(b == 1 && c == 0);  // no offset: unchanged
+    }
     CHECK(bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 3 && count == 0);
     base = 1, count = 4;  // levels 1..4
     CHECK(bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 3 && count == 2);
@@ -717,6 +738,28 @@ void test_partly_held_mip_chain_clamps_views() {
     p = draw();
     CHECK(texture_entry(p, &e) && e.view.base_mip_level == 4 && e.view.mip_level_count == 0);
     CHECK(list.stats().mip_clamped_binds == 3);
+
+    // Texture size cap: the host texture was re-created without its top 2 levels. The view (clamped
+    // to guest level 4 by min-LOD) starts at host level 2; the cached group is re-created; writes
+    // of dropped levels are refused and the others shift.
+    CHECK(!scene.device.set_host_mip_offset(9999, 2));
+    uint32_t m = 1;
+    CHECK(scene.device.translate_host_mip(Scene::kAlbedo, &m) && m == 1);
+    CHECK(scene.device.set_host_mip_offset(Scene::kAlbedo, 2));
+    m = 1;
+    CHECK(!scene.device.translate_host_mip(Scene::kAlbedo, &m));
+    m = 5;
+    CHECK(scene.device.translate_host_mip(Scene::kAlbedo, &m) && m == 3);
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 2 && e.view.mip_level_count == 0);
+    CHECK(scene.device.texture_info(Scene::kAlbedo, &info) && info.host_mip_offset == 2 && info.mip_levels == 9);
+    // Registering the same description again keeps the offset.
+    scene.device.register_texture(Scene::kAlbedo, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 9, 1,
+                                                   GpuTextureDimension::Dim2D, false});
+    CHECK(scene.device.texture_info(Scene::kAlbedo, &info) && info.host_mip_offset == 2);
+    CHECK(scene.device.set_host_mip_offset(Scene::kAlbedo, 0));
+    m = 1;
+    CHECK(scene.device.translate_host_mip(Scene::kAlbedo, &m) && m == 1);
     list.Close();
 }
 
