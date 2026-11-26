@@ -2745,6 +2745,19 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     ++stats_.uniforms_zero_extended;
                 }
             }
+            // G66 (#691): WebGPU binds uniform and storage buffers only at 256-byte aligned
+            // offsets; any other offset invalidates the bind group and every draw using it (a
+            // zero-record console view at a 16-byte offset turned a whole capture black). What is
+            // still unaligned here (no relocated copy) is bound null: a zero resource, as the
+            // console reads a view without records.
+            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && out.resource_id != 0 &&
+                out.offset % kUniformOffsetAlignment != 0) {
+                diagnostics_ |= (uniform_layout ? BridgeDiag::UnalignedUniform : BridgeDiag::UnalignedStorage) |
+                                BridgeDiag::NullBinding;
+                out.resource_id = 0;
+                out.offset = 0;
+                out.size = 0;
+            }
             break;
         }
         case d3d::BindResourceKind::TextureView: {

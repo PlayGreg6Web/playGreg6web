@@ -1936,7 +1936,9 @@ void test_unaligned_storage_relocation() {
                 CHECK(calls.size() == 1 && calls[0].first == kBufVa + 0x40 && calls[0].second == 128);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedStorage) == 0);
             } else {
-                CHECK(entry.resource_id == kBuf && entry.offset == 0x40);
+                // G66 (#691): bound null, never at the unaligned offset (it would invalidate the
+                // bind group and every draw using it).
+                CHECK(entry.resource_id == 0 && entry.offset == 0);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedStorage) != 0);
             }
         }
