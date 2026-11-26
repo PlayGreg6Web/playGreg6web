@@ -51,7 +51,8 @@ has been seen. Music has not started yet; the audio probe counters in the boot r
 diagnose that. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
 
 Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). The decision
-brief recommends, and both are still pending:
+brief recommends, and both are still pending (options and consequences in
+[HARD_STOPS.md section 7](HARD_STOPS.md#7-pending-owner-decisions-device-id-and-xuser-sign-in-state)):
 
 1. `XSystemGetAppSpecificDeviceId` answers with an error instead of a device id (recommended).
 2. `XUser` sign-in succeeds for an offline local user (recommended).

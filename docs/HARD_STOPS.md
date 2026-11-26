@@ -101,3 +101,56 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
 2. What XSystemGetAppSpecificDeviceId should return, if anything.
 3. Which HRESULT slot 71/72 should settle on long term (see section 2).
 4. Any policy for XStore slots 20/21/22/65/68 if the boot reaches them.
+
+## 7. Pending owner decisions: device id and XUser sign-in state
+
+Behaviour-only summary of a static analysis of the title's call sites. No addresses, bytes or extracted data
+are recorded. **Nothing below is implemented until the owner decides**; both slots still trap today.
+
+### 7.1 XSystemGetAppSpecificDeviceId (XSystem slot 5)
+
+What the title does:
+- One call site, inside a step that builds a single text value from four parts. The fourth part is the console
+  id if that equals the title's all-zero placeholder, otherwise the app-specific device id.
+- Any error return (including "not implemented") or a missing interface: the step returns quietly and adds
+  nothing. No retry, no abort, no fallback.
+- On success it adds the id only if it equals an all-zero placeholder; any other value is read and discarded.
+- No hashing, network send, save or key use was found for the id (static analysis; an indirect read cannot be
+  fully excluded). Reference runtimes return fixed or per-configuration ids, which the title discards.
+
+| Option | Consequence |
+|---|---|
+| A. Return a documented error, write nothing (recommended) | Boot continues, no device identity is claimed; matches the offline "nothing to report" pattern. |
+| B. Fixed fake id | Same visible result; puts a made-up identity value into the runtime, identical for every player. |
+| C. Per-installation derived id | Same visible result; introduces a stable machine identifier for no benefit. |
+| D. All-zero placeholder | No benefit; feeds a value nobody reads. |
+| E. Leave the trap | Boot stops (not viable). |
+
+Recommendation: **A**. The only caller ignores errors by design.
+
+### 7.2 XUser sign-in state for an offline local user (slots 14, 10, 12, 5; backlog item 17)
+
+What the title does (all four are purely local lookups; none leads to a network call, and every online path
+needs a token from slot 23, which already fails offline):
+- Slot 14 (get sign-in state): polled from the user manager's update routine. Success with "signed in" keeps
+  the user; an error or "signed out" makes the title treat the user as signed out and clear that user's
+  pending items.
+- Slots 10 / 12 (find user by local id / by XUID): return codes are ignored; an empty reference is tolerated.
+- Slot 5 (compare users): "same user" on 0. Our duplicate-handle call yields a new handle object, so the
+  answer must compare the underlying user, not the handle value.
+
+| Item | Option | Consequence |
+|---|---|---|
+| Slot 14 | A. "Signed in" for the single local user, invalid-handle error otherwise (recommended) | Local session claim only; no tokens, no online access (slot 23 still fails offline). Matches all reference runtimes. |
+| | B. "Signed out" or an error | Title keeps treating the user as signed out and clearing its items; likely breaks saves/settings (not verified dynamically). |
+| | C. Leave the trap | Boot stops soon after the user is added. |
+| Slots 10 / 12 | A. Handle on match with our local id / XUID, else "no such user" (recommended) | Consistent with slots 9 and 11. |
+| | B. Always "no such user" | Tolerated, but the user manager cannot rebuild the record for our own user. |
+| Slot 5 | A. "Same" when both handles are the same local user, by id (recommended) | Correct with duplicate handles. |
+| | B. Compare by handle value | Duplicates count as different users; possible spurious "user changed" handling. |
+
+Recommendation: slot 14 = signed in for the single local offline user, 10/12/5 as in the recommended rows;
+no tokens, no online services.
+
+Confidence: high for the call sites and error handling; medium for "the built text is never read" and the exact
+meaning of the cleared list. No dynamic run backs this.
