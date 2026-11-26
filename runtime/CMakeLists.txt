@@ -79,6 +79,7 @@ add_library(playgta6_core STATIC
     guest/shard_dispatch.cpp
     os/xbox_scarlett_guest_input.cpp
     os/acp_hal_guest.cpp
+    os/xma_decoder.cpp
     os/mmdevice_guest.cpp
     os/audio_downmix.cpp
     os/xapu_opus.cpp
@@ -339,6 +340,10 @@ else()
     add_executable(test_audio_downmix ../tests/test_audio_downmix.cpp)
     target_link_libraries(test_audio_downmix PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_downmix_tests COMMAND test_audio_downmix)
+
+    add_executable(test_xma_decoder ../tests/test_xma_decoder.cpp)
+    target_link_libraries(test_xma_decoder PRIVATE playgta6_core)
+    add_test(NAME playgta6_xma_decoder_tests COMMAND test_xma_decoder)
 
     add_executable(test_audio_wav_dump ../tests/test_audio_wav_dump.cpp)
     target_link_libraries(test_audio_wav_dump PRIVATE playgta6_core)

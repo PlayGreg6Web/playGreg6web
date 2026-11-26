@@ -1119,6 +1119,9 @@ int main(int argc, char** argv) {
                 t.xma_contexts_enabled = xc.enabled_now;
                 t.xma_enable_commands = xc.enables + xc.mask_enables;
                 t.xma_read_advances = xc.read_advances;
+                t.xma_frames = xc.frames;
+                t.xma_blocks_written = xc.blocks_written;
+                t.xma_input_exhausted = xc.input_exhausted;
                 o += ",\n  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
             }
             if (s_with_presents) {

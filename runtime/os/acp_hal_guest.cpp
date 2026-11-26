@@ -22,8 +22,12 @@
 //           `blocks` 256-byte output blocks of context `index` (payload {u32 index, u32 blocks}):
 //           its output read offset (dword 9 bits 0-4) moves forward modulo the output buffer's
 //           block count (dword 0 bits 22-26, 0 = 32).
-// No XMA decoder exists yet, so an enabled context's output write offset never moves; the
-// enable state is what a decode worker will act on. Other commands are discarded; the title
+// Taking blocks also re-arms the context's "output writable" bit (dword 1 bit 31). Enabled contexts
+// are decoded by a worker thread into their output rings (os/xma_decoder.h): it walks the XMA2
+// packets of both input buffers, moves the write block and clears "writable" when the ring is full,
+// handles loops and subframe skips, and sets the "input ran out" error once both inputs are used
+// up. There is no WMA Pro frame decoder yet, so every frame is written as 512 samples of silence:
+// voices run at their real pace and end, but stay silent. Other commands are discarded; the title
 // reads nothing back but the HRESULT.
 
 #include <algorithm>
@@ -31,6 +35,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,18 +43,22 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "os/xapu_opus.h"
 #include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
+#include "os/xma_decoder.h"
 
 namespace playgta6::os::scarlett::guest_api {
 
 using com::GuestPtr;
 using com::OutPtr;
+namespace xd = playgta6::os::xma;
 
 namespace {
 
@@ -61,22 +70,203 @@ void diag(const std::string& message) {
 }
 
 // The XMA side of the AcpHal commands (contexts are global, allocated by
-// AcpHalAllocateShapeContexts in xbox_middleware.cpp).
+// AcpHalAllocateShapeContexts in xbox_middleware.cpp). Each enabled context has a voice
+// (os/xma_decoder.h) behind its own lock: commands arrive from the title's time-critical mixer
+// thread and must never wait behind another voice's decode. A worker thread, started by the first
+// enable, fills every enabled context's output ring every 2 ms or when a command wakes it.
+struct XmaSlot {
+    std::mutex mutex;
+    std::optional<xd::Voice> voice;  // set while enabled
+};
+
 struct XmaState {
     std::mutex mutex;
+    std::condition_variable wake;
+    bool woken = false;
+    bool worker_started = false;
+    bool worker_allowed = true;  // tests pump by hand
     std::vector<bool> enabled;
+    std::vector<std::shared_ptr<XmaSlot>> slots;
+    uint64_t contexts = 0;  // guest address of the live context array
     XmaCommandStats stats;
     uint64_t test_contexts = 0;  // set_xma_contexts_for_tests
     uint32_t test_count = 0;
+    xd::ApuMap test_map;  // set_xma_apu_map_for_tests
+    uint32_t dumped = 0;
+    uint32_t trace_lines = 0;
+    // Filled by the worker (atomics: read by xma_command_stats without the voice locks).
+    std::atomic<uint64_t> frames{0}, blocks_written{0}, loops{0}, exhausted{0}, bad_frames{0};
 };
 XmaState& xma() {
     static XmaState s;
     return s;
 }
 
-constexpr uint32_t kXmaContextBytes = 64;
 constexpr uint32_t kAcpEnableXma = 5, kAcpEnableXmaMask = 6, kAcpDisableXma = 7, kAcpDisableXmaMask = 8,
                    kAcpXmaReadAdvance = 18;
+
+uint32_t* xma_context_words(uint64_t contexts, uint32_t index) {
+    return static_cast<uint32_t*>(com::guest_to_host(contexts + uint64_t{index} * xd::kContextBytes,
+                                                     xd::kContextBytes));
+}
+
+// APU address range -> host memory, through the APU heap (xbox_middleware.cpp).
+uint8_t* map_apu_range(uint32_t apu, size_t bytes) {
+    if (apu == 0 || bytes == 0 || uint64_t{apu} + bytes > 0x100000000ull) {
+        return nullptr;
+    }
+    auto* first = static_cast<uint8_t*>(pg6_mw_apu_map_apu_address(apu));
+    auto* last = static_cast<uint8_t*>(pg6_mw_apu_map_apu_address(static_cast<uint32_t>(apu + bytes - 1)));
+    return first != nullptr && last == first + (bytes - 1) ? first : nullptr;
+}
+
+xd::ApuMap apu_map_locked() {
+    if (xma().test_map) {
+        return xma().test_map;
+    }
+    return [](uint32_t apu, size_t bytes) { return map_apu_range(apu, bytes); };
+}
+
+void xma_trace(const std::string& line) {
+    if (audio_trace_enabled() && xma().trace_lines++ < 400) {
+        diag("audio-trace: " + line);
+    }
+}
+
+// PG6_XMA_DUMP=<dir>: the context words (<n>-<index>.ctx) and input buffer 0 (<n>-<index>.xma)
+// of the first 32 contexts enabled, to test the decoder on the title's streams offline.
+void dump_enabled_context(uint32_t index, xd::Context ctx, const xd::ApuMap& map) {
+    static const char* dir = std::getenv("PG6_XMA_DUMP");
+    if (dir == nullptr || dir[0] == '\0' || xma().dumped >= 32) {
+        return;
+    }
+    const uint32_t n = xma().dumped++;
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%02u-%u.ctx", dir, n, index);
+    if (FILE* f = std::fopen(path, "wb")) {
+        uint32_t words[xd::kContextWords];
+        for (unsigned i = 0; i < xd::kContextWords; ++i) {
+            words[i] = ctx.word(i);
+        }
+        std::fwrite(words, sizeof(words), 1, f);
+        std::fclose(f);
+    }
+    const uint32_t packets = ctx.input_packets(0);
+    const uint8_t* data =
+        packets != 0 ? map(ctx.input_address(0) & ~(xd::kPacketBytes - 1), size_t{packets} * xd::kPacketBytes)
+                     : nullptr;
+    std::snprintf(path, sizeof(path), "%s/%02u-%u.xma", dir, n, index);
+    if (FILE* f = std::fopen(path, "wb")) {
+        if (data != nullptr) {
+            std::fwrite(data, xd::kPacketBytes, packets, f);
+        }
+        std::fclose(f);
+    }
+}
+
+// Folds a voice's counters into the totals (the caller holds the voice lock).
+void account(const xd::VoiceStats& before, const xd::VoiceStats& after) {
+    auto& x = xma();
+    x.frames += after.frames - before.frames;
+    x.blocks_written += after.blocks_written - before.blocks_written;
+    x.loops += after.loops - before.loops;
+    x.exhausted += after.exhausted - before.exhausted;
+    x.bad_frames += after.bad_frames - before.bad_frames;
+}
+
+// One pass over the enabled contexts.
+void pump_enabled_voices() {
+    std::vector<std::pair<uint32_t, std::shared_ptr<XmaSlot>>> active;
+    uint64_t contexts = 0;
+    xd::ApuMap map;
+    {
+        auto& x = xma();
+        std::lock_guard<std::mutex> lock(x.mutex);
+        contexts = x.contexts;
+        map = apu_map_locked();
+        for (uint32_t i = 0; i < x.slots.size(); ++i) {
+            if (x.enabled[i]) {
+                active.emplace_back(i, x.slots[i]);
+            }
+        }
+    }
+    for (auto& [index, slot] : active) {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        uint32_t* words = xma_context_words(contexts, index);
+        if (!slot->voice || words == nullptr) {
+            continue;
+        }
+        const xd::VoiceStats before = slot->voice->stats;
+        xd::pump(xd::Context(words), *slot->voice, map);
+        account(before, slot->voice->stats);
+    }
+}
+
+void xma_worker() {
+    auto& x = xma();
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(x.mutex);
+            // A 256-byte block of mono 16-bit PCM lasts 2.7 ms at 48 kHz.
+            x.wake.wait_for(lock, std::chrono::milliseconds(2), [&x] { return x.woken; });
+            x.woken = false;
+        }
+        pump_enabled_voices();
+    }
+}
+
+// The caller holds xma().mutex.
+void wake_worker_locked() {
+    auto& x = xma();
+    x.woken = true;
+    if (!x.worker_started && x.worker_allowed) {
+        x.worker_started = true;
+        std::thread(xma_worker).detach();
+    }
+    x.wake.notify_one();
+}
+
+// The caller holds xma().mutex.
+void set_voice_enabled_locked(uint32_t index, bool on) {
+    auto& x = xma();
+    if (x.enabled[index] != on) {
+        x.enabled[index] = on;
+        if (on) {
+            ++x.stats.enabled_now;
+        } else {
+            --x.stats.enabled_now;
+        }
+    }
+    uint32_t* words = xma_context_words(x.contexts, index);
+    std::lock_guard<std::mutex> lock(x.slots[index]->mutex);
+    auto& voice = x.slots[index]->voice;
+    if (on) {
+        voice.emplace();
+        if (words != nullptr) {
+            xd::Context ctx(words);
+            xd::enable(ctx, *voice, xd::make_silence_decoder());
+            if (x.trace_lines < 400 && audio_trace_enabled()) {
+                char line[300];
+                std::snprintf(line, sizeof(line),
+                              "XMA context %u enabled: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", index,
+                              ctx.word(0), ctx.word(1), ctx.word(2), ctx.word(3), ctx.word(4), ctx.word(5),
+                              ctx.word(6), ctx.word(7), ctx.word(8), ctx.word(9));
+                xma_trace(line);
+            }
+            dump_enabled_context(index, ctx, apu_map_locked());
+        }
+        wake_worker_locked();
+    } else if (voice) {
+        const xd::VoiceStats& s = voice->stats;
+        char line[300];
+        std::snprintf(line, sizeof(line),
+                      "XMA context %u disabled: %" PRIu64 " frames, %" PRIu64 " blocks, %" PRIu64
+                      " loops, %" PRIu64 " input switches, ran dry %" PRIu64 "x",
+                      index, s.frames, s.blocks_written, s.loops, s.input_switches, s.exhausted);
+        xma_trace(line);
+        voice.reset();
+    }
+}
 
 void handle_xma_command(uint32_t command, uint64_t payload) {
     if (command != kAcpEnableXma && command != kAcpEnableXmaMask && command != kAcpDisableXma &&
@@ -85,26 +275,21 @@ void handle_xma_command(uint32_t command, uint64_t payload) {
     }
     uint32_t count = 0;
     uint64_t contexts = pg6_mw_xma_contexts(&count);
-    if (xma().test_contexts != 0) {
-        contexts = xma().test_contexts;
-        count = xma().test_count;
-    }
     auto& x = xma();
     std::lock_guard<std::mutex> lock(x.mutex);
-    if (x.enabled.size() != count) {
+    if (x.test_contexts != 0) {
+        contexts = x.test_contexts;
+        count = x.test_count;
+    }
+    if (x.enabled.size() != count || x.contexts != contexts) {
         x.enabled.assign(count, false);
+        x.slots.clear();
+        for (uint32_t i = 0; i < count; ++i) {
+            x.slots.push_back(std::make_shared<XmaSlot>());
+        }
+        x.contexts = contexts;
         x.stats.enabled_now = 0;
     }
-    auto set = [&x](uint32_t i, bool on) {
-        if (x.enabled[i] != on) {
-            x.enabled[i] = on;
-            if (on) {
-                ++x.stats.enabled_now;
-            } else {
-                --x.stats.enabled_now;
-            }
-        }
-    };
     uint32_t word[2] = {};
     if (payload == 0 || count == 0 || !com::read_guest(payload, word, sizeof(uint32_t))) {
         ++x.stats.rejected;
@@ -117,7 +302,7 @@ void handle_xma_command(uint32_t command, uint64_t payload) {
                 ++x.stats.rejected;
                 return;
             }
-            set(word[0], command == kAcpEnableXma);
+            set_voice_enabled_locked(word[0], command == kAcpEnableXma);
             ++(command == kAcpEnableXma ? x.stats.enables : x.stats.disables);
             return;
         case kAcpEnableXmaMask:
@@ -129,28 +314,28 @@ void handle_xma_command(uint32_t command, uint64_t payload) {
             }
             for (uint32_t i = 0; i < count; ++i) {
                 if (((mask[i / 32] >> (i % 32)) & 1u) != 0) {
-                    set(i, command == kAcpEnableXmaMask);
+                    set_voice_enabled_locked(i, command == kAcpEnableXmaMask);
                 }
             }
             ++(command == kAcpEnableXmaMask ? x.stats.mask_enables : x.stats.mask_disables);
             return;
         }
         default: {  // 18: the title consumed output blocks; advance the read offset
-            if (!com::read_guest(payload, word, sizeof(word)) || word[0] >= count) {
+            uint32_t* words = nullptr;
+            if (!com::read_guest(payload, word, sizeof(word)) || word[0] >= count ||
+                (words = xma_context_words(contexts, word[0])) == nullptr) {
                 ++x.stats.rejected;
                 return;
             }
-            const uint64_t ctx = contexts + uint64_t{word[0]} * kXmaContextBytes;
-            uint32_t d0 = 0, d9 = 0;
-            if (!com::read_guest(ctx, &d0, 4) || !com::read_guest(ctx + 0x24, &d9, 4)) {
-                ++x.stats.rejected;
-                return;
+            {
+                // The decoder writes the same words.
+                std::lock_guard<std::mutex> voice_lock(x.slots[word[0]]->mutex);
+                xd::advance_read(xd::Context(words), word[1]);
             }
-            const uint32_t blocks = (d0 >> 22) & 0x1Fu;
-            const uint32_t ring = blocks != 0 ? blocks : 32u;
-            d9 = (d9 & ~0x1Fu) | (((d9 & 0x1Fu) + word[1]) % ring);
-            com::write_guest(ctx + 0x24, &d9, 4);
             ++x.stats.read_advances;
+            if (x.enabled[word[0]]) {
+                wake_worker_locked();
+            }
             return;
         }
     }
@@ -709,8 +894,15 @@ XApuStats xapu_stats() {
 }
 
 XmaCommandStats xma_command_stats() {
-    std::lock_guard<std::mutex> lock(xma().mutex);
-    return xma().stats;
+    auto& x = xma();
+    std::lock_guard<std::mutex> lock(x.mutex);
+    XmaCommandStats s = x.stats;
+    s.frames = x.frames;
+    s.blocks_written = x.blocks_written;
+    s.loops = x.loops;
+    s.input_exhausted = x.exhausted;
+    s.bad_frames = x.bad_frames;
+    return s;
 }
 
 bool xma_context_enabled(uint32_t index) {
@@ -719,9 +911,31 @@ bool xma_context_enabled(uint32_t index) {
 }
 
 void reset_xma_commands() {
+    auto& x = xma();
+    std::lock_guard<std::mutex> lock(x.mutex);
+    x.enabled.clear();
+    x.slots.clear();
+    x.contexts = 0;
+    x.stats = {};
+    x.frames = 0;
+    x.blocks_written = 0;
+    x.loops = 0;
+    x.exhausted = 0;
+    x.bad_frames = 0;
+}
+
+void set_xma_apu_map_for_tests(std::function<uint8_t*(uint32_t, size_t)> map) {
     std::lock_guard<std::mutex> lock(xma().mutex);
-    xma().enabled.clear();
-    xma().stats = {};
+    xma().test_map = std::move(map);
+}
+
+void set_xma_worker_allowed_for_tests(bool allowed) {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    xma().worker_allowed = allowed;
+}
+
+void pump_xma_for_tests() {
+    pump_enabled_voices();
 }
 
 void set_xma_contexts_for_tests(uint64_t va, uint32_t count) {

@@ -1861,6 +1861,7 @@ void test_acp_hal() {
 void test_acp_hal_xma_commands() {
     Fixture fx;
     ga::reset_xma_commands();
+    ga::set_xma_worker_allowed_for_tests(false);
     // The contexts AcpHalAllocateShapeContexts would hand out (its own test is in
     // test_xbox_middleware), here in the fixture's guest memory.
     const uint64_t contexts = com::guest_alloc(40 * 64);
@@ -1904,6 +1905,92 @@ void test_acp_hal_xma_commands() {
 
     CHECK(as_hr(fx.vcall(hal, 1)) == 0);
     CHECK(fx.vcall(hal, 5) == 0);
+    ga::set_xma_contexts_for_tests(0, 0);
+    ga::reset_xma_commands();
+}
+
+// R40: an enabled XMA context is decoded into its output ring (silence until a WMA Pro decoder
+// exists): the write block moves, "writable" drops when the ring is full, and command 18 re-arms
+// it. Input / output buffers sit in a fake APU address space.
+void test_acp_hal_xma_decode_worker() {
+    Fixture fx;
+    ga::reset_xma_commands();
+    ga::set_xma_worker_allowed_for_tests(false);
+    const uint64_t contexts = com::guest_alloc(2 * 64);
+    CHECK(contexts != 0);
+    ga::set_xma_contexts_for_tests(contexts, 2);
+
+    // One packet: two frames of 3000 bits at the start of the payload, then padding.
+    std::vector<uint8_t> input(2048, 0xFF);
+    const uint32_t header = (2u << 26) | (0u << 11);
+    input[0] = static_cast<uint8_t>(header >> 24);
+    input[1] = static_cast<uint8_t>(header >> 16);
+    input[2] = static_cast<uint8_t>(header >> 8);
+    input[3] = static_cast<uint8_t>(header);
+    auto put_length = [&](uint32_t bit, uint32_t len) {
+        for (uint32_t j = 0; j < 15; ++j) {
+            const uint32_t a = bit + j;
+            const uint8_t m = static_cast<uint8_t>(0x80u >> (a % 8));
+            input[a / 8] = ((len >> (14 - j)) & 1u) != 0 ? (input[a / 8] | m) : (input[a / 8] & ~m);
+        }
+    };
+    put_length(32, 3000);
+    put_length(32 + 3000, 3000);
+    std::vector<uint8_t> output(4 * 256, 0x77);
+    ga::set_xma_apu_map_for_tests([&](uint32_t apu, size_t bytes) -> uint8_t* {
+        if (apu >= 0x1000 && apu + bytes <= 0x1000 + input.size()) {
+            return input.data() + (apu - 0x1000);
+        }
+        if (apu >= 0x9000 && apu + bytes <= 0x9000 + output.size()) {
+            return output.data() + (apu - 0x9000);
+        }
+        return nullptr;
+    });
+    uint32_t words[16] = {};
+    words[0] = 1u | (1u << 20) | (4u << 22);  // 1 packet, input 0 valid, ring of 4 blocks
+    words[1] = (3u << 27) | (1u << 31);       // 48 kHz mono, output writable
+    words[5] = 0x1000;
+    words[7] = 0x9000;
+    const uint64_t ctx = contexts + 64;
+    CHECK(com::write_guest(ctx, words, sizeof(words)));
+
+    const uint64_t create = fx.export_address("AcpHal.dll", "AcpHalCreate");
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(out)})) == 0);
+    const uint64_t hal = load64(out);
+    CHECK(as_hr(fx.vcall(hal, 0, {I(0x1000), I(0x1000)})) == 0);
+    const uint64_t payload = com::guest_alloc(16);
+    auto submit = [&](uint32_t command, uint32_t w0, uint32_t w1) {
+        const uint32_t p[2] = {w0, w1};
+        CHECK(com::write_guest(payload, p, sizeof(p)));
+        CHECK(as_hr(fx.vcall(hal, 2, {I(command), I(0xF6F6F6F6u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    };
+    submit(5, 1, 0);
+    ga::pump_xma_for_tests();
+    // A frame is 512 mono samples = 4 blocks: the ring is full, write block back at the read block.
+    uint32_t d0 = load32(ctx), d1 = load32(ctx + 4);
+    CHECK((d0 >> 27) == 0 && (d1 >> 31) == 0);
+    CHECK(output[0] == 0 && output[4 * 256 - 1] == 0);
+    CHECK(ga::xma_command_stats().blocks_written == 4 && ga::xma_command_stats().frames == 1);
+
+    submit(18, 1, 3);  // the title took 3 blocks
+    CHECK((load32(ctx + 4) >> 31) == 1 && (load32(ctx + 0x24) & 0x1F) == 3);
+    ga::pump_xma_for_tests();
+    CHECK((load32(ctx) >> 27) == 3);
+    CHECK(ga::xma_command_stats().blocks_written == 7);
+    submit(18, 1, 4);
+    ga::pump_xma_for_tests();
+    // Both frames written (8 blocks); input 0 used up, then the "input ran out" error.
+    const ga::XmaCommandStats st = ga::xma_command_stats();
+    CHECK(st.blocks_written == 8 && st.frames == 2 && st.input_exhausted == 1);
+    d0 = load32(ctx);
+    const uint32_t d2 = load32(ctx + 8);
+    CHECK(((d0 >> 20) & 1u) == 0 && ((d2 >> 26) & 0x1Fu) == 4 && (d2 >> 31) == 1);
+
+    submit(7, 1, 0);
+    CHECK(as_hr(fx.vcall(hal, 1)) == 0);
+    CHECK(fx.vcall(hal, 5) == 0);
+    ga::set_xma_apu_map_for_tests(nullptr);
     ga::set_xma_contexts_for_tests(0, 0);
     ga::reset_xma_commands();
 }
@@ -2534,6 +2621,7 @@ int main() {
     test_xg();
     test_acp_hal();
     test_acp_hal_xma_commands();
+    test_acp_hal_xma_decode_worker();
     test_xdsp();
     test_xapu();
     test_xapu_bounded_queue();

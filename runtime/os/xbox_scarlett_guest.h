@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <type_traits>
 
 #include "guest/com_bridge.h"
@@ -461,17 +462,26 @@ AcpHalState acp_hal_state(uint64_t hal);
 
 // The AcpHal XMA context commands (acp_hal_guest.cpp): 5 / 7 enable / disable one context
 // (payload word: index), 6 / 8 enable / disable many (payload: bitmask words, bit i = context i),
-// 18 advance a context's output read offset (payload: index, blocks consumed).
+// 18 advance a context's output read offset (payload: index, blocks consumed). A worker thread
+// fills enabled contexts' output rings (os/xma_decoder.h; silence until a WMA Pro decoder exists).
 struct XmaCommandStats {
     uint64_t enables = 0, disables = 0, mask_enables = 0, mask_disables = 0, read_advances = 0;
     uint64_t rejected = 0;     // bad payload or context index
     uint32_t enabled_now = 0;  // contexts enabled at the moment
+    // The decode worker: XMA frames walked, 256-byte output blocks written, loops taken, times a
+    // voice ran out of input, frames or buffers it could not walk.
+    uint64_t frames = 0, blocks_written = 0, loops = 0, input_exhausted = 0, bad_frames = 0;
 };
 XmaCommandStats xma_command_stats();
 bool xma_context_enabled(uint32_t index);
 void reset_xma_commands();  // tests only
 // Tests only: use this context array instead of AcpHalAllocateShapeContexts' (va 0: back to it).
 void set_xma_contexts_for_tests(uint64_t va, uint32_t count);
+// Tests only: resolve APU addresses with `map` (empty: the APU heap again), keep the worker
+// thread from starting, and run one decode pass on the calling thread.
+void set_xma_apu_map_for_tests(std::function<uint8_t*(uint32_t, size_t)> map);
+void set_xma_worker_allowed_for_tests(bool allowed);
+void pump_xma_for_tests();
 
 // chad.dll XDsp guest model (acp_hal_guest.cpp): open connections and commands accepted.
 struct XDspStats {
