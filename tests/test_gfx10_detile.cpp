@@ -952,6 +952,12 @@ void test_tile_map() {
     const TileMap k4 = tile_map({28u, 256u, 256u, 1u, 9u, 0x105u, 0u, 1u});
     CHECK(k4.ok && k4.block_bytes == 4096u && k4.standard_mips == 4u && k4.packed_mips == 5u);
     CHECK(k4.start_tile[0] * 4096u == 90112u && k4.tail_start_tile == 0u);
+    // Tile shape = the swizzle block in elements, whose area is the block size (not 64 KiB).
+    CHECK(uint64_t{k4.block_width} * k4.block_height * k4.block_depth * 4u == 4096u);
+    const TileMap k64 = tile_map({28u, 512u, 512u, 1u, 1u, 0x109u, 0u, 1u});
+    CHECK(k64.block_width == 128u && k64.block_height == 128u && k64.block_depth == 1u);
+    const TileMap bc7s = tile_map({98u, 256u, 128u, 1u, 1u, 0x109u, 0u, 1u});
+    CHECK(bc7s.block_width == 64u && bc7s.block_height == 64u);
     const TileMap b256 = tile_map({28u, 64u, 64u, 1u, 4u, 0x101u, 0u, 1u});
     CHECK(b256.ok && b256.packed_mips == 0u && b256.standard_mips == 4u);
     // 3D keeps the whole surface as one slice; whole chain in the tail (1 tile).

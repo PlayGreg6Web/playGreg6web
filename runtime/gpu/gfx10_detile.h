@@ -144,6 +144,12 @@ constexpr uint32_t kMaxTileMapMips = 16;
 struct TileMap {
     bool ok = false;
     uint64_t block_bytes = 0;
+    // Swizzle block shape in elements (BC: 4x4 texel blocks), i.e. the console tile shape that
+    // GetResourceTiling reports: 64 KiB modes give the D3D12 standard shape, 4 KiB and 256 B modes
+    // a block of their own size (not 64 KiB).
+    uint32_t block_width = 0;
+    uint32_t block_height = 0;
+    uint32_t block_depth = 0;
     uint32_t mips = 0;
     uint32_t standard_mips = 0;  // mips before the tail
     uint32_t packed_mips = 0;    // mips inside the tail block (0 = no tail)

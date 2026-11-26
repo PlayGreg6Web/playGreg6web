@@ -1046,6 +1046,9 @@ TileMap tile_map(const TextureLayoutDesc& desc) noexcept {
     }
     t.mips = std::min(c.mips, kMaxTileMapMips);
     t.block_bytes = c.linear ? kConsoleLinearAlignment : uint64_t{1} << c.shape.blk_size_log2;
+    t.block_width = c.bw;
+    t.block_height = c.bh;
+    t.block_depth = c.bd;
     t.standard_mips = 0;
     while (t.standard_mips < t.mips && !c.in_tail[t.standard_mips]) {
         t.start_tile[t.standard_mips] = c.macro_offset[t.standard_mips] / t.block_bytes;

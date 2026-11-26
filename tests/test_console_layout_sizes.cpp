@@ -74,7 +74,18 @@ void test_sizes() {
     dg::GuestResourceDesc msaa = texture(3, 256, 256, 1, 1, 28, 0x105);
     msaa.SampleCount = 4;
     CHECK(dg::resource_size_estimate(msaa) == lin_rx * 4u);
-    // Depth/stencil (planar) keeps its per-plane estimate.
+    // Depth/stencil (planar) under a verified mode: two tiled surfaces (depth, stencil), each
+    // rounded up to whole swizzle blocks. 1000x600 D16_S8: 4 KiB_S blocks are 64x32 (2 B depth)
+    // and 64x64 (1 B stencil).
+    {
+        const gfx10::TextureLayoutDesc dp{56u, 1000u, 600u, 1u, 1u, 0x105u, 0u};
+        const gfx10::TextureLayoutDesc st{62u, 1000u, 600u, 1u, 1u, 0x105u, 0u};
+        const uint64_t want = gfx10::surface_bytes(dp) + gfx10::surface_bytes(st);
+        CHECK(gfx10::surface_bytes(dp) > 0 && gfx10::surface_bytes(st) > 0);
+        CHECK(dg::resource_size_estimate(texture(3, 1000, 600, 1, 1, 118, 0x105)) == want);
+        CHECK(want > 1000ull * 600ull * 3ull);  // more than the tight estimate (partial blocks)
+        CHECK(dg::resource_size_estimate(texture(3, 1000, 600, 1, 1, 118, 0)) == 1000ull * 600ull * 3ull);
+    }
     CHECK(dg::resource_size_estimate(texture(3, 1024, 1024, 1, 1, 118, 0x105)) == 1024ull * 1024ull * 3ull);
     // Buffers are their width.
     dg::GuestResourceDesc buffer{};

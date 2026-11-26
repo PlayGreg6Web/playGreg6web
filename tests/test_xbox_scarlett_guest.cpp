@@ -1789,6 +1789,36 @@ void test_xg() {
         CHECK(fx.vcall(t64, 1) == 0);
     }
 
+    // GetResourceTiling for a 4 KiB mode (0x105): a tile is one 4 KiB swizzle block (32x32 RGBA8
+    // texels), not the D3D12 64 KiB standard tile (128x128), and tile numbers are in 4 KiB units.
+    {
+        namespace gx = playgta6::gpu::gfx10;
+        const uint64_t tdesc = xg_desc(3, 256, 256, 1, 9, 28);
+        CHECK(com::write_guest(tdesc + 0x2C, uint32_t{0x105}));
+        const uint64_t tout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
+        const uint64_t t4 = load64(tout);
+        uint32_t tcap = 16;
+        CHECK(com::write_guest(count, tcap));
+        fx.vcall(t4, 10, {I(num_tiles), I(packed), I(shape), I(count), I(0), I(tilings)});
+        const gx::TextureLayoutDesc chain{28u, 256u, 256u, 1u, 9u, 0x105u, 0u};
+        const gx::TileMap tm = gx::tile_map(chain);
+        ga::XgTileShape sh{};
+        CHECK(com::read_guest(shape, sh));
+        CHECK(sh.width_in_texels == 32 && sh.height_in_texels == 32 && sh.depth_in_texels == 1);
+        ga::XgPackedMipInfo tp{};
+        CHECK(com::read_guest(packed, tp));
+        CHECK(tm.ok && tp.num_standard_mips == tm.standard_mips && tp.num_tiles_for_packed_mips == tm.tail_tiles);
+        uint32_t ttiles = 0;
+        CHECK(com::read_guest(num_tiles, ttiles));
+        CHECK(uint64_t{ttiles} * 4096u == gx::surface_bytes(chain));
+        ga::XgSubresourceTiling m0{};
+        CHECK(com::read_guest(tilings, m0));
+        CHECK(m0.width_in_tiles == 8 && m0.height_in_tiles == 8);
+        CHECK(m0.start_tile_index_in_overall_resource == tm.start_tile[0]);
+        CHECK(fx.vcall(t4, 1) == 0);
+    }
+
     // GetTexelElementOffsetBytes (slot 6): the GFX10 address of an element (the detiler's), plus
     // the slice's chain; bit offset 0; invalid plane / mip / coordinate -> UINT64_MAX.
     {

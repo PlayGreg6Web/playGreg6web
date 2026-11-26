@@ -1684,7 +1684,7 @@ uint64_t console_layout_size(const GuestResourceDesc& d) {
             return 0;
     }
     const DxgiFormatLayout l = dxgi_format_layout(d.Format);
-    if (d.SampleCount > 1 || !l.known || l.planes != 1) {
+    if (d.SampleCount > 1 || !l.known || l.planes > 2) {
         return 0;
     }
     const bool is_3d = d.Dimension == ResourceDimension::Texture3D;
@@ -1702,8 +1702,25 @@ uint64_t console_layout_size(const GuestResourceDesc& d) {
     g.depth = is_3d ? std::max<uint32_t>(1u, d.DepthOrArraySize) : 1u;
     g.mip_levels = mips;
     g.d3d12_layout = d.Layout;
-    const uint64_t surface = gfx10::surface_bytes(g);
-    return surface * (is_3d ? 1u : std::max<uint32_t>(1u, d.DepthOrArraySize));
+    const uint64_t slices = is_3d ? 1u : std::max<uint32_t>(1u, d.DepthOrArraySize);
+    if (l.planes == 2) {
+        // Depth/stencil on GFX10 are two separate surfaces (a depth plane of 2 or 4 bytes and an
+        // 8-bit stencil plane), each tiled and placed on its own with the same swizzle mode; the
+        // stencil plane starts at a swizzle block boundary after the depth plane. (Not the tight
+        // texel estimate: partial blocks, mip chains and tails round up per plane.)
+        uint64_t total = 0;
+        for (uint32_t plane = 0; plane < 2; ++plane) {
+            const uint32_t pbytes = plane_block_bytes(d.Format, plane);
+            g.dxgi_format = pbytes == 1 ? 62u : pbytes == 2 ? 56u : 41u;  // R8_UINT / R16_UNORM / R32_FLOAT
+            const uint64_t surface = gfx10::surface_bytes(g) * slices;
+            if (surface == 0) {
+                return 0;
+            }
+            total += surface;  // surface sizes are whole swizzle blocks: the next plane stays aligned
+        }
+        return total;
+    }
+    return gfx10::surface_bytes(g) * slices;
 }
 
 // D3D12 small-resource placement (D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, 4 KiB): a texture

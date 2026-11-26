@@ -653,22 +653,26 @@ public:
                            GuestPtr<XgTileShape> shape, GuestPtr<uint32_t> num_tilings, uint32_t first,
                            uint64_t tilings) {
         const ElementInfo e = element_info(desc_.format);
-        const XgTileShape t = tile_shape(desc_.dimension, e);
+        XgTileShape t = tile_shape(desc_.dimension, e);
         const uint32_t mips = layout_.mip_levels;
         const uint32_t slices = desc_.dimension == 4 ? 1u : std::max<uint32_t>(layout_.array_size, 1);
         namespace gfx10 = playgta6::gpu::gfx10;
-        const bool gfx10_64kb = tiled_ && tiled_block_bytes_ == 65536;
+        // Every verified GFX10 swizzle mode (256 B / 4 KiB / 64 KiB), not only 64 KiB: a tile is
+        // one swizzle block of that mode, not the D3D12 64 KiB standard tile.
+        const bool gfx10_tiled = tiled_ && tiled_desc_.d3d12_layout != gfx10::kConsoleLinearLayout;
         // GFX10 64KB modes take the standard/packed split and tile numbers from the shared
         // gfx10::tile_map (addrlib mip tail rule, not the D3D12 packed-mip rule: a 2:1 mip such as
         // 64x32 BC7 blocks keeps a block of its own and the tail follows it; the title streams each
         // standard mip and the tail as separate reads matching the archive's per-block chunks).
         gfx10::TileMap tm{};
-        if (gfx10_64kb) {
+        if (gfx10_tiled) {
             tm = gfx10::tile_map(tiled_desc_);
         }
         uint32_t standard = 0;
         if (tm.ok) {
             standard = tm.standard_mips;
+            t = XgTileShape{tm.block_width * e.block, tm.block_height * e.block,
+                            desc_.dimension == 4 ? tm.block_depth : 1u};
         }
         while (!tm.ok && standard < mips) {
             const Pg6XgMipLevelLayout& m = layout_.mips[standard];
@@ -694,7 +698,8 @@ public:
             per_mip[m] = XgSubresourceTiling{0, 0, 0, kXgPackedTile};
             packed_bytes += layout_.mips[m].slice_size_bytes * (desc_.dimension == 4 ? layout_.mips[m].depth : 1u);
         }
-        uint32_t packed_tiles = standard < mips ? std::max<uint32_t>(1, ceil_div(packed_bytes, 65536)) : 0;
+        uint32_t packed_tiles =
+            standard < mips ? std::max<uint32_t>(1, ceil_div(packed_bytes, tm.ok ? tm.block_bytes : 65536)) : 0;
         uint32_t packed_start = tiles_per_slice;
         // GFX10 64KB modes (verified placement): a tile is one 64 KiB block, and the tiles are
         // numbered in memory order. addrlib puts the mip tail (one block) first and the larger
