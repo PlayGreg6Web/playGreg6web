@@ -30,6 +30,33 @@ python tools/replay_compare.py --ref-a origin/main~1 --ref-b origin/main \
   that flips between two runs of the *same* build points at such a path; run the same build twice first
   (`--ref-a X --ref-b X`) to establish the noise floor.
 - Trimmed traces (`--trim-every`, automatic for traces over 1.5 GiB) change contents deterministically.
-- The native replayer is not covered; this tool compares the web runtime only.
+- The native replayer is covered by `tools/native_replay_compare.py` (below).
 
 Unit tests: `python -m unittest tests.test_replay_compare` (no browser needed).
+
+## Native executor: `tools/native_replay_compare.py`
+
+Same idea for the Dawn executor (`pg6_native_exec`): replay one capture with two binaries and compare the
+per-frame digests (`digest frame N: <16 hex>`, headless `--digest-at`).
+
+```
+python tools/native_replay_compare.py --ref-a origin/main~1 --ref-b origin/main     --trace capture.pg6trace --pack shaders.wgsl.pack --frames 600 --every 10 --out work/ncmp
+python tools/native_replay_compare.py --exe-a build/pg6_native_exec --exe-b other/pg6_native_exec     --trace capture.pg6trace --frames 100 --size 1280x720
+python tools/native_replay_compare.py --exe-a build/pg6_native_exec --self-check     --trace capture.pg6trace --frames 100
+```
+
+- A side is a binary (`--exe-a/--exe-b`) or a git ref (`--ref-a/--ref-b`). A ref's `runtime/` is exported with
+  `git archive`, configured with `-DPLAYGTA6_NATIVE_EXECUTOR=ON` (Release) and built for the target
+  `pg6_native_exec`; the binary (plus `dxcompiler.dll`/`dxil.dll` on Windows) is cached per commit in
+  `<objcache>/../native-exec/<sha16>/` (`--cache-dir` or `PLAYGTA6_NATIVE_EXEC_CACHE` override), the temporary
+  source and build trees are deleted. Later runs for the same commit reuse it.
+- `--pack`, `--reflection` (repeatable), `--size`, `--frames`, `--every` are passed to both sides.
+- On a digest difference the tool re-runs both binaries with `--dump-frame N --dump-dir D` (the screenshot PNG
+  encoder, `gpu/native_exec/screenshot_model.h`; writes `D/frame-N.png`) for the first differing frame and
+  writes `<out>-A-frameN.png`, `<out>-B-frameN.png` and `<out>-frameN.diff.png` (grey = same, red = differs).
+- `--self-check` replays twice with side A's binary: `DETERMINISTIC` (exit 0) or `NONDETERMINISTIC: ... first N`
+  (exit 2). Run it before trusting an A-vs-B difference.
+- Exit codes: 0 identical, 1 replay failure, 2 differs, 77 no WebGPU adapter. Logs: `<out>-A.log.txt`, `<out>-B.log.txt`.
+
+Unit tests: `python -m unittest tests.test_native_replay_compare` (a fake executor script and a synthetic text
+trace; no GPU, no game bytes).

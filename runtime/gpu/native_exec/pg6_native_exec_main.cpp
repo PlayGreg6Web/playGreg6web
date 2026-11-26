@@ -9,6 +9,9 @@
 // --frames N    stop after frame N (default: all)
 // --digest-at   headless: print the replay page's `digest frame` / `swapchain frame` lines for these
 //               frames, so the output compares line by line with tools/replay_capture.py
+// --dump-frame 0,10,...  headless: write those frames' swapchain image as <dump-dir>/frame-<N>.png (the screenshot
+//               PNG encoder, gpu/native_exec/screenshot_model.h; tools/native_replay_compare.py diffs these)
+// --dump-dir D  where --dump-frame writes (default: the current directory)
 // --window      present to a native window (Win32) instead; closing it stops the replay
 // --show-target <selector>  present this render target / texture instead of the swapchain image (read-only
 //               diagnostic for black / garbled screens): <id>, tex:ID, depth:ID, pass:N[:depth], last, cycle, with
@@ -29,6 +32,7 @@
 
 #include "gpu/native_exec/native_executor.h"
 #include "gpu/native_exec/replay_frames.h"
+#include "gpu/native_exec/screenshot_model.h"
 
 using namespace playgta6::gpu::native_exec;
 
@@ -59,6 +63,14 @@ bool parse_list(const std::string& text, std::set<uint64_t>* out) {
     return true;
 }
 
+ShotFormat shot_format_from_name(const std::string& n) {
+    if (n == "rgba8unorm" || n == "rgba8unorm-srgb") return ShotFormat::Rgba8;
+    if (n == "bgra8unorm" || n == "bgra8unorm-srgb") return ShotFormat::Bgra8;
+    if (n == "rgb10a2unorm") return ShotFormat::Rgb10a2;
+    if (n == "rgba16float") return ShotFormat::Rgba16Float;
+    return ShotFormat::Unsupported;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -68,7 +80,8 @@ int main(int argc, char** argv) {
     opts.height = 2160;
     std::vector<std::string> reflections;
     uint64_t max_frames = UINT64_MAX;
-    std::set<uint64_t> digest_at;
+    std::set<uint64_t> digest_at, dump_at;
+    std::string dump_dir = ".";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -91,6 +104,10 @@ int main(int argc, char** argv) {
             max_frames = std::strtoull(v, nullptr, 10);
         } else if (a == "--digest-at" && (v = next())) {
             if (!parse_list(v, &digest_at)) return usage();
+        } else if (a == "--dump-frame" && (v = next())) {
+            if (!parse_list(v, &dump_at)) return usage();
+        } else if (a == "--dump-dir" && (v = next())) {
+            dump_dir = v;
         } else if (a == "--size" && (v = next())) {
             unsigned w = 0, h = 0;
             if (std::sscanf(v, "%ux%u", &w, &h) != 2 || !w || !h) return usage();
@@ -101,8 +118,8 @@ int main(int argc, char** argv) {
         }
     }
     if (trace.empty()) return usage();
-    if (opts.window && !digest_at.empty()) {
-        std::fprintf(stderr, "pg6_native_exec: --digest-at reads the headless swapchain; drop --window\n");
+    if (opts.window && (!digest_at.empty() || !dump_at.empty())) {
+        std::fprintf(stderr, "pg6_native_exec: --digest-at / --dump-frame read the headless swapchain; drop --window\n");
         return 1;
     }
 
@@ -140,7 +157,7 @@ int main(int argc, char** argv) {
     for (uint64_t i = 0; i < frames.size() && i <= max_frames; ++i) {
         exec->execute(frames[i].data(), frames[i].size());
         if (!exec->poll()) break;  // window closed
-        if (digest_at.count(i)) {
+        if (digest_at.count(i) || dump_at.count(i)) {
             FrameImage img;
             if (!exec->read_last_frame(&img, &error)) {
                 std::fprintf(stderr, "pg6_native_exec: frame %llu: %s\n", static_cast<unsigned long long>(i),
@@ -148,6 +165,24 @@ int main(int argc, char** argv) {
                 rc = 1;
                 continue;
             }
+            if (dump_at.count(i)) {
+                const ShotFormat sf = shot_format_from_name(img.format);
+                const std::vector<uint8_t> rgb =
+                    shot_to_rgb8(img.pixels.data(), size_t{img.width} * img.bytes_per_pixel, img.width, img.height, sf);
+                const std::string path = dump_dir + "/frame-" + std::to_string(i) + ".png";
+                std::ofstream po(path, std::ios::binary);
+                const std::vector<uint8_t> png = rgb.empty() ? std::vector<uint8_t>() : png_encode_rgb(rgb.data(), img.width, img.height);
+                if (png.empty() || !po.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()))) {
+                    std::fprintf(stderr, "pg6_native_exec: frame %llu: cannot write %s (format %s)
+",
+                                 static_cast<unsigned long long>(i), path.c_str(), img.format.c_str());
+                    rc = 1;
+                } else {
+                    std::printf("dump frame %llu: %s
+", static_cast<unsigned long long>(i), path.c_str());
+                }
+            }
+            if (!digest_at.count(i)) continue;
             if (img.bytes_per_pixel != 4) {
                 std::printf("frame %llu: %s swapchain, no replay digest\n", static_cast<unsigned long long>(i),
                             img.format.c_str());
