@@ -871,6 +871,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--count-tolerance", type=float, metavar="REL")
     p.add_argument("--native-executor", action="store_true",
                    help="build the harness with --window support (Dawn executor; needs a Dawn checkout/cache)")
+    p.add_argument("--live-executor", action="store_true",
+                   help="headless live run: --native-executor build, then run with --live-executor (the live Dawn "
+                        "executor presenting into an offscreen swapchain texture: --live-digest, --screenshot-at, "
+                        "--gpu-validation, gpu_time all work, no window opens). A `--window` in the extra options is "
+                        "turned into --live-executor unless --show-window is given")
+    p.add_argument("--show-window", action="store_true",
+                   help="keep an extra-option `--window` as a real window (agents and diagnostics default to headless)")
     p.add_argument("--play", action="store_true",
                    help="live native play: --native-executor build, then run with --window --audio-out --host-input")
     p.add_argument("--record-input", nargs="?", const="auto", metavar="FILE",
@@ -982,8 +989,24 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(str(exc)) from exc
 
 
+def resolve_live_mode(args, extra: list[str]) -> tuple[list[str], bool]:
+    """(extra options, needs the native-executor build). Only --play (a person playing) and --show-window
+    open a window; every other live run (--live-executor, or a `--window` in the extra options) is headless:
+    the same LivePump + executor + present, into the executor's offscreen swapchain texture."""
+    extra = list(extra)
+    if not args.play and not args.show_window and "--window" in extra:
+        extra = ["--live-executor" if a == "--window" else a for a in extra]
+        print("[play] --window in the extra options runs headless as --live-executor (--show-window keeps the window)",
+              file=sys.stderr)
+    if args.live_executor and "--live-executor" not in extra and "--window" not in extra and not args.play:
+        extra.append("--live-executor")
+    live = args.play or args.live_executor or any(a in ("--window", "--live-executor") for a in extra)
+    return extra, live
+
+
 def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset, run_dir,
                 lift_cache, recomp_cache) -> int:
+    extra, live_run = resolve_live_mode(args, extra)
     targets_file = None if args.no_record_targets and not args.seed_targets else         indirect_targets_path(args.cache_dir, env, exe)
     seed_file = None
     if args.seed_targets:
@@ -993,7 +1016,7 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
                                       args.rebuild_program, args.cache_dir, lift_cache,
                                       lift_cache_keep(env), recomp_cache, seed_targets=seed_file,
-                                      native_executor=args.native_executor or args.play,
+                                      native_executor=args.native_executor or args.play or live_run,
                                       probe_functions=args.probe_functions)
     if args.trust_build:
         plan.steps = []

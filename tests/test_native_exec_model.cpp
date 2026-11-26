@@ -827,6 +827,12 @@ void test_blit_model() {
     CHECK(!blit_needed(true, 64, 32, 64, 32));
     CHECK(blit_needed(false, 64, 32, 64, 32));
     CHECK(blit_needed(true, 64, 32, 128, 128));
+    // --live-executor (headless): the offscreen canvas is the --window-size, the stream the same size, so a
+    // canvas-format stream presents without a blit exactly like the window's fixed-size surface; a 1:1 aspect
+    // canvas letterboxes the stream the way the window's client area does.
+    CHECK(!blit_needed(true, 1280, 720, 1280, 720));
+    CHECK(letterbox_rect(1280, 720, 1280, 720) == (PresentRect{0, 0, 1280, 720}));
+    CHECK(letterbox_rect(1280, 720, 1920, 1080) == (PresentRect{0, 0, 1920, 1080}));
 
     // Letterbox: largest centred rectangle of the stream's aspect ratio.
     CHECK(letterbox_rect(64, 32, 64, 32) == (PresentRect{0, 0, 64, 32}));

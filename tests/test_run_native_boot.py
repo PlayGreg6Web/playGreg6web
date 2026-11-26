@@ -873,6 +873,46 @@ class PlayConvenienceTests(unittest.TestCase):
             self.assertIn("/playgta6/fresh-", save)
             self.assertIn("shader pack:", err.getvalue())
 
+    def _dry_command(self, extra_argv):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            fx = Fixture(root)
+            out, err = io.StringIO(), io.StringIO()
+            argv = ["--dry-run", "--exe", str(fx.exe), "--game-dir", str(fx.pkg), "--build-dir", str(fx.build),
+                    "--harness", str(fx.harness)] + extra_argv
+            with redirect_stdout(out), redirect_stderr(err):
+                code = rnb.main(argv, env={"LOCALAPPDATA": str(root / "local")}, repo_root=fx.repo)
+            self.assertEqual(code, 0, err.getvalue())
+            return json.loads(out.getvalue())
+
+    def test_live_executor_flag_is_headless_and_builds_native(self):
+        plan = self._dry_command(["--live-executor"])
+        cmd = plan["command"]
+        self.assertIn("--live-executor", cmd)
+        self.assertNotIn("--window", cmd)
+
+    def test_extra_window_becomes_live_executor_unless_shown(self):
+        cmd = self._dry_command(["--", "--window", "--live-digest", "d.txt"])["command"]
+        self.assertIn("--live-executor", cmd)
+        self.assertNotIn("--window", cmd)
+        self.assertEqual(cmd[cmd.index("--live-digest") + 1], "d.txt")
+        cmd = self._dry_command(["--show-window", "--", "--window"])["command"]
+        self.assertIn("--window", cmd)
+        self.assertNotIn("--live-executor", cmd)
+
+    def test_resolve_live_mode(self):
+        class A:
+            play = False
+            live_executor = False
+            show_window = False
+        a = A()
+        self.assertEqual(rnb.resolve_live_mode(a, ["--max-ms", "1"]), (["--max-ms", "1"], False))
+        a.live_executor = True
+        self.assertEqual(rnb.resolve_live_mode(a, []), (["--live-executor"], True))
+        a.live_executor = False
+        a.play = True
+        self.assertEqual(rnb.resolve_live_mode(a, ["--window"]), (["--window"], True))
+
     def test_play_record_input_default_and_explicit(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

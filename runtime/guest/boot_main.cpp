@@ -60,6 +60,9 @@
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
 //   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; F7 mip, F8 layer, F9/F10 target; gpu/native_exec/show_target_model.h)
 //   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
+//   --live-executor [--window-size WxH]  the same live path as --window (LivePump + native executor, the guest's GPU stream,
+//                        --live-digest / --screenshot-at / --gpu-validation / gpu_time / --gpu-capture / --host-input), but
+//                        presenting into the executor's offscreen swapchain texture (same format, size and blit): no window.
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
 //                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.
 //                        Only in builds with -DPLAYGTA6_NATIVE_EXECUTOR=ON. Works together with
@@ -241,6 +244,7 @@ struct Options {
     bool no_async_pipelines = false;    // --no-async-pipelines: live executor creates pipelines synchronously
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
+    bool live_executor = false;     // --live-executor: --window's live path into the offscreen swapchain (no window)
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     std::string show_target;        // --show-target <selector>
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
@@ -336,6 +340,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.eager_gpu_objects = true;
         } else if (a == "--window") {
             o.window = true;
+        } else if (a == "--live-executor") {
+            o.live_executor = true;
         } else if (a == "--gpu-validation") {
             o.gpu_validation = true;
         } else if (a == "--no-async-pipelines") {
@@ -885,9 +891,11 @@ void apply_window_focus(bool focused) {
 // Starts the pump; false (after printing why) when the executor cannot be created.
 bool start_live_window() {
     ne::ExecutorOptions options;
-    options.window = true;
+    options.window = g_options.window;  // --live-executor: the offscreen swapchain, same size / format / blit
     options.width = g_options.window_width;
     options.height = g_options.window_height;
+    options.present_width = g_options.window_width;
+    options.present_height = g_options.window_height;
     options.present_mode = g_options.present_mode;
     options.show_target = g_options.show_target;
     options.max_fps = g_options.max_fps;
@@ -993,7 +1001,7 @@ bool start_live_window() {
 // fault report from it), flip the title to the fault state and keep the last frame up until the
 // user closes the window (or the watchdog fires).
 void hold_window_on_fault(bool faulted) {
-    if (!faulted || !g_live_started || g_live.window_closed()) return;
+    if (!faulted || !g_live_started || !g_options.window || g_live.window_closed()) return;
     write_text(g_options.report, guest::last_report_json());
     std::fprintf(stderr, "[harness] guest fault: window kept open on the last frame; close it to exit\n");
     std::fflush(stderr);
@@ -1664,7 +1672,7 @@ int main(int argc, char** argv) {
         capture.keep_payloads = g_options.gpu_capture_payloads;
         capture.thin_uploads = static_cast<uint32_t>(g_options.gpu_capture_thin_uploads);
         capture.start_ms = g_options.gpu_capture_start_ms;
-        capture.attach = !g_options.window;  // with --window the live observer feeds the capture
+        capture.attach = !(g_options.window || g_options.live_executor);  // with --window / --live-executor the live observer feeds the capture
         capture.deferred = g_options.gpu_capture_start_ms != 0 || g_options.gpu_capture_start_at_script;
         if (capture.deferred) {
             std::fprintf(stderr, "[harness] GPU capture deferred until %s\n",
@@ -1740,13 +1748,17 @@ int main(int argc, char** argv) {
             sample->counters.emplace_back("view_textures_with_data", probe.views_with_data);
         });
     }
-    if (g_options.window) {
+    if (g_options.window && g_options.live_executor) {
+        std::fprintf(stderr, "[harness] --window and --live-executor are exclusive\n");
+        return kExitUsage;
+    }
+    if (g_options.window || g_options.live_executor) {
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
         if (!start_live_window()) {
             return kExitUsage;
         }
 #else
-        std::fprintf(stderr, "[harness] --window needs a build with -DPLAYGTA6_NATIVE_EXECUTOR=ON\n");
+        std::fprintf(stderr, "[harness] --window / --live-executor needs a build with -DPLAYGTA6_NATIVE_EXECUTOR=ON\n");
         return kExitUsage;
 #endif
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Does the native LIVE executor render exactly what a capture replay renders?
 
-One live boot (`playgta6_boot --window`, via tools/run_native_boot.py) writes a GPU capture
+One live boot (`playgta6_boot --live-executor`, headless, or `--window` with --show-window; via tools/run_native_boot.py) writes a GPU capture
 (--gpu-capture, with payloads, not thinned) and, from the live executor itself, one replay digest per
 presented frame (`--live-digest`: the stream image before the blit, hashed like replay.html's
 `digest frame N:`). The capture is then replayed headless with pg6_native_exec at the live stream size
@@ -69,6 +69,7 @@ def main() -> int:
     ap.add_argument("--build-dir", type=Path, default=REPO / "work" / "native-boot")
     ap.add_argument("--name", default="livecmp")
     ap.add_argument("--window-size", default="1280x720")
+    ap.add_argument("--show-window", action="store_true", help="run the live side with a real window (default: headless --live-executor)")
     ap.add_argument("--run-dir", type=Path, help="skip the live run: compare this finished run directory")
     ap.add_argument("--native-exec", type=Path, help="pg6_native_exec binary (default: found under --build-dir)")
     ap.add_argument("--keep", action="store_true", help="keep the capture and the lifted program/")
@@ -89,7 +90,8 @@ def main() -> int:
                *(["--max-ms", str(a.max_ms), "--watchdog-ms", str(a.max_ms + 60000)] if a.max_ms else []),
                *({"boot": [], "script": ["--gpu-capture-start-at-script"]}.get(
                    a.capture_start, ["--gpu-capture-start-ms", a.capture_start])),
-               "--", "--window", "--window-size", a.window_size, "--live-digest", str(digest_file)]
+               *(["--show-window"] if a.show_window else []),
+               "--", *(["--window"] if a.show_window else ["--live-executor"]), "--window-size", a.window_size, "--live-digest", str(digest_file)]
         print("live run:", " ".join(cmd), flush=True)
         subprocess.run(cmd, check=False)
         shutil.move(str(digest_file), run_dir / "live-digest.txt") if digest_file.is_file() else None

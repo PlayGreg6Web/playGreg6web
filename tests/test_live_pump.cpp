@@ -64,7 +64,8 @@ bool start(Pump& pump, Shared& sh, std::function<void()> on_close = {}, std::fun
                       std::move(on_focus), &error);
 }
 
-void submit_byte(Pump& p, uint8_t b, size_t len = 2) {
+template <class P>
+void submit_byte(P& p, uint8_t b, size_t len = 2) {
     std::vector<uint8_t> v(len, b);
     p.submit(v.data(), v.size());
 }
@@ -279,6 +280,43 @@ void test_abort_releases_blocked_submit() {
     CHECK(sh.destroyed.load());
     CHECK(sh.first_bytes.size() == 1);  // nothing queued ran after the abort
 }
+
+// --live-executor: the executor has no window (no window_focused(), poll() never reports a close).
+// The pump must run the same path: order, presents counted, no close, on_focus never called, clean stop.
+struct HeadlessExecutor {
+    explicit HeadlessExecutor(Shared* s) : sh(s) {}
+    uint32_t execute(const uint8_t* data, size_t len) {
+        std::lock_guard<std::mutex> lock(sh->m);
+        sh->first_bytes.push_back(data[0]);
+        return len > 1 ? 1u : 0u;
+    }
+    bool poll() { return true; }
+    void wait_idle() { ++sh->waits; }
+    Shared* sh;
+};
+
+void test_headless_live_executor() {
+    Shared sh;
+    LivePump<HeadlessExecutor> pump;
+    std::atomic<int> closes{0}, focus_calls{0};
+    std::string error;
+    CHECK(pump.start([&sh](std::string*) { return std::make_unique<HeadlessExecutor>(&sh); }, [&] { ++closes; },
+                     [&](bool) { ++focus_calls; }, &error));
+    for (uint8_t i = 0; i < 20; ++i) submit_byte(pump, i, (i % 4 == 0) ? 1 : 2);  // 15 of the 20 carry a Present
+    pump.flush();
+    std::this_thread::sleep_for(50ms);
+    CHECK(!pump.window_closed());
+    CHECK(closes.load() == 0);
+    CHECK(focus_calls.load() == 0);
+    pump.stop();
+    const LivePumpStats s = pump.stats();
+    CHECK(s.executed == 20);
+    CHECK(s.presents == 15);
+    CHECK(!s.window_closed);
+    CHECK(s.discarded_on_close == 0 && s.dropped_after_close == 0);
+    CHECK(sh.first_bytes.size() == 20);
+    for (size_t i = 0; i < sh.first_bytes.size(); ++i) CHECK(sh.first_bytes[i] == i);
+}
 }  // namespace
 
 int main() {
@@ -291,6 +329,7 @@ int main() {
     test_stop_drains_and_stats_json();
     test_tick_hook_runs_on_pump_thread();
     test_abort_releases_blocked_submit();
+    test_headless_live_executor();
     if (g_failures == 0) std::printf("test_live_pump: ok\n");
     return g_failures == 0 ? 0 : 1;
 }

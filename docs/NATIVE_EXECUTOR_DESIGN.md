@@ -215,6 +215,15 @@ the option `--window` exits with a usage error).
 playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gpu-capture f.pg6trace]
 ```
 
+- **Headless live: `--live-executor`** runs exactly this path (same LivePump, executor, async pipelines, blob
+  cache, `--live-digest`, `--screenshot-at`, `--gpu-validation`, gpu_time, `--gpu-capture`, `--host-input`) but
+  presents into the executor's offscreen swapchain texture (BGRA8Unorm, `--window-size`, the same blit and
+  letterbox) and opens no window, so agents and CI-like runs can test the live executor without taking over the
+  screen. Differences: no window messages (no F12, no `--window-script`, no present-mode / title; `--max-fps`
+  still applies), nothing can close it (end it with `--max-ms` or the guest), a guest fault is not held open.
+  `tools/run_native_boot.py --live-executor` builds with the native executor and passes it; a `--window` in its
+  extra options is turned into `--live-executor` unless `--show-window` is given (only `--play` and
+  `--show-window` open a window). `--window` and `--live-executor` are mutually exclusive.
 - **Hand-off** (`runtime/gpu/native_exec/live_pump.h`, `LivePump<Executor>`): the harness installs one
   `os::wgpu_submit` observer that feeds the capture (when `--gpu-capture` is given, which then does
   not attach itself) and copies the batch into the pump. The pump thread creates the executor (so
@@ -330,7 +339,7 @@ pass selectors, hotkey cycling, digest equality with and without the option).
    about 20 s. The GPU unit test covers a textured draw, a compute dispatch (direct and indirect), a
    pack lookup and a BC7 upload with read-back.
 
-4. **Live vs replay (`tools/live_vs_replay.py`):** one live `playgta6_boot --window` run writes a GPU
+4. **Live vs replay (`tools/live_vs_replay.py`):** one live `playgta6_boot --live-executor` (headless; `--window` with `--show-window`) run writes a GPU
    capture (`--gpu-capture-payloads`, not thinned) and, from the live executor itself, one replay digest
    per presented frame (`--live-digest FILE`, `ExecutorOptions::frame_digest_path`: the stream image
    before the blit, hashed exactly like `pg6_native_exec --digest-at`). The script then replays the capture
