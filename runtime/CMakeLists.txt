@@ -410,6 +410,14 @@ else()
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_boot_tests COMMAND test_guest_boot)
 
+    if(WIN32)
+        add_executable(test_minidump_fault ../tests/test_minidump_fault.cpp)
+        target_include_directories(test_minidump_fault PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME playgta6_minidump_fault_tests COMMAND test_minidump_fault)
+        set_tests_properties(playgta6_minidump_fault_tests PROPERTIES
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+    endif()
+
     add_executable(test_winsock_ordinals ../tests/test_winsock_ordinals.cpp)
     target_link_libraries(test_winsock_ordinals PRIVATE playgta6_core)
     add_test(NAME playgta6_winsock_ordinals_tests COMMAND test_winsock_ordinals)

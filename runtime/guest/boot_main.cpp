@@ -135,6 +135,7 @@
 #include "os/host_sleep.h"
 #include "guest/boot.h"
 #include "guest/minidump.h"
+#include "guest/minidump_writer.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/audio_report.h"
@@ -1185,33 +1186,11 @@ void off_thread_fault() {
 }
 
 #ifdef _WIN32
-// Writes the dump; `info` may be null (guest faults: the current thread's context). Returns true
-// on success. Never throws; safe to call from the vectored handler.
+// Writes the dump via the dedicated dumper thread (guest/minidump_writer.h); `info` may be null
+// (guest faults). Returns true on success. Never throws; safe to call from the vectored handler.
 bool write_minidump(const std::string& path, EXCEPTION_POINTERS* info) {
-    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-    if (dbghelp == nullptr) return false;
-    using WriteFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, DWORD, void*, void*, void*);
-    auto fn = reinterpret_cast<WriteFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
-    HANDLE file = fn != nullptr ? CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                              FILE_ATTRIBUTE_NORMAL, nullptr)
-                                : INVALID_HANDLE_VALUE;
-    bool ok = false;
-    if (file != INVALID_HANDLE_VALUE) {
-        struct ExceptionInfo {  // MINIDUMP_EXCEPTION_INFORMATION (packed on x86 only)
-            DWORD thread_id;
-            EXCEPTION_POINTERS* pointers;
-            BOOL client_pointers;
-        } ex{GetCurrentThreadId(), info, FALSE};
-        constexpr DWORD kWithIndirectlyReferencedMemory = 0x00000040;
-        constexpr DWORD kWithThreadInfo = 0x00001000;
-        ok = fn(GetCurrentProcess(), GetCurrentProcessId(), file, kWithIndirectlyReferencedMemory | kWithThreadInfo,
-                info != nullptr ? &ex : nullptr, nullptr, nullptr) != FALSE;
-        CloseHandle(file);
-    }
-    FreeLibrary(dbghelp);
-    return ok;
+    return guest::minidump::Writer::init() && guest::minidump::Writer::dump(path.c_str(), info);
 }
-
 
 // Start of the host function containing pc, from the image's unwind table (.pdata).
 uint64_t host_function_start(uint64_t pc) {
@@ -1303,6 +1282,7 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
 }
 
 void install_host_fault_handlers() {
+    guest::minidump::Writer::init();  // dbghelp + dumper thread before any fault
     AddVectoredExceptionHandler(1, &vectored_handler);
 }
 #else
