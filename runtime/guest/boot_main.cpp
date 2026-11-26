@@ -21,6 +21,7 @@
 //   --max-calls <n>      stop after n dispatched calls (0 = unbounded)
 //   --max-ms <n>         stop after n ms, checked at dispatches (0 = unbounded)
 //   --watchdog-ms <n>    hard limit: report and terminate even without dispatches (default 0)
+//   --present-interval honor|min1  title-driven present gap: honor = the title's sync interval (30 fps menus like the console), min1 = 1 vblank (default)
 //   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
 //   --no-xmem-shared-pages  physical pages mapped at several addresses get per-address copies
 //                        (the pre-O36 behaviour; A/B runs, os/xbox_scarlett.h)
@@ -272,6 +273,7 @@ struct Options {
     std::string record_indirect_targets;  // --record-indirect-targets <file>
     bool dump_on_fault = false;  // --dump-on-fault: also write a minidump on a guest fault
     bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
+    bool present_honor_interval = false;  // --present-interval honor|min1 (default min1)
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
 
@@ -330,6 +332,10 @@ bool parse(int argc, char** argv, Options& o) {
             o.dump_on_fault = true;
         } else if (a == "--no-fault-record") {
             o.fault_record = false;
+        } else if (a == "--present-interval" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "honor" && v != "min1") return false;
+            o.present_honor_interval = v == "honor";
         } else if (a == "--no-present-pacing") {
             o.present_pacing = false;
         } else if (a == "--no-xmem-shared-pages") {
@@ -884,8 +890,9 @@ void live_title_tick(ne::NativeExecutor& exec) {
         std::snprintf(buf, sizeof buf, "playgta6 | GUEST FAULT - last frame kept, details in the console | frame %llu | close the window to exit",
                       static_cast<unsigned long long>(st.present_packets));
     } else {
-        std::snprintf(buf, sizeof buf, "playgta6 | %.0f fps | frame %llu | %.0f draws/frame | %s | cap %u | ok | F11 fullscreen",
-                      last.fps, static_cast<unsigned long long>(st.present_packets), last.draws_per_frame, mode.empty() ? "?" : mode.c_str(), g_options.max_fps);
+        std::snprintf(buf, sizeof buf, "playgta6 | %.0f fps | frame %llu | %.0f draws/frame | %s | cap %u | interval %s | ok | F11 fullscreen",
+                      last.fps, static_cast<unsigned long long>(st.present_packets), last.draws_per_frame, mode.empty() ? "?" : mode.c_str(), g_options.max_fps,
+                      g_options.present_honor_interval ? "honor" : "min1");
     }
     exec.set_window_title(buf);
     // Overlay extras (F3): live-audio underruns and why the guest stopped.
@@ -1390,6 +1397,7 @@ void run_boot_thread() {
     cfg.max_dispatches = g_options.max_calls;
     cfg.max_wall_ms = g_options.max_ms;
     cfg.present_pacing = g_options.present_pacing;
+    cfg.present_honor_interval = g_options.present_honor_interval;
     cfg.fence_publish_lag = g_options.fence_lag;  // run_boot applies it to the device options
     cfg.run_tls_callbacks = g_options.tls_callbacks;
     cfg.call_entry = g_options.entry;

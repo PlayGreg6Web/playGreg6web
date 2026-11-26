@@ -8,7 +8,7 @@
   Shader pack: -ShaderPack, env PLAYGTA6_NATIVE_SHADER_PACK, else the newest *.wgsl.pack under work/ (or
   env PLAYGTA6_SHADER_PACK_DIR); the pick is printed. Saves persist under %LOCALAPPDATA%\playgta6\saves;
   -Record writes your real keyboard/pad input to %LOCALAPPDATA%/playgta6/recordings/<name>.txt (-RecordFile: another
-  path); replay it with run_native_boot.py --input-script <file>. -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. -PresentMode auto|fifo|mailbox|immediate picks the window present mode (auto: mailbox, immediate, fifo; unsupported falls back, logged); -MaxFps N caps the host present rate (0 = off, guest pacing unchanged). Stop: close the window or Ctrl+C;
+  path); replay it with run_native_boot.py --input-script <file>. -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. -PresentMode auto|fifo|mailbox|immediate picks the window present mode (auto: mailbox, immediate, fifo; unsupported falls back, logged); -MaxFps N caps the host present rate (0 = off, guest pacing unchanged). -ConsoleTiming honors the title's sync interval (30 fps menus). Stop: close the window or Ctrl+C;
   without -MaxMs the run lasts 2 h. -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues); every start warns when behind origin/main. See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
   -Prebuilt: play the ready-made build in $env:PLAYGTA6_PREBUILT_DIR (default %LOCALAPPDATA%\playgta6\prebuilt, made by tools/update_prebuilt.ps1) with -TrustBuild; never builds, prints its source commit and how far behind origin/main it is.
   -Keymap <file> rebinds keys/mouse (default %LOCALAPPDATA%\playgta6\keymap.ini, written on first run; see docs).
@@ -26,6 +26,7 @@ param(
     [ValidateSet("auto", "fifo", "mailbox", "immediate")]
     [string]$PresentMode = "auto",
     [int]$MaxFps = 0,
+    [switch]$ConsoleTiming,
     [switch]$FreshSetup,
     [switch]$Record,
     [string]$RecordFile = "",
@@ -46,6 +47,7 @@ play_native.ps1: build (if stale) and play natively.
   -Update        fast-forward to origin/main first (never discards local changes)
   -FreshSetup    empty save dir so the setup screens appear
   -PresentMode   auto|fifo|mailbox|immediate     -MaxFps N  (0 = off)
+  -ConsoleTiming honor the title's sync interval (menus at the console's 30 fps instead of 60)
   -Record        save real input to %LOCALAPPDATA%\playgta6\recordings   -Keymap <file>  rebind keys
   -Prebuilt      play the ready-made build (no compile; refresh it with tools\update_prebuilt.ps1)
   -NoBuild / -TrustBuild / -DryRun / -Name <run>
@@ -87,6 +89,7 @@ if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
 if ($Record -or $RecordFile) { $argv += "--record-input"; if ($RecordFile) { $argv += $RecordFile } }
 if ($Keymap) { $argv += @("--keymap", $Keymap) }
 if ($PresentMode -ne "auto") { $argv += @("--present-mode", $PresentMode) }
+if ($ConsoleTiming) { $argv += @("--present-interval", "honor") }
 if ($MaxFps -gt 0) { $argv += @("--max-fps", $MaxFps) }
 if ($FreshSetup) { $argv += "--fresh-setup" }
 if ($NoBuild) { $argv += "--no-build" }

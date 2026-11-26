@@ -2745,7 +2745,8 @@ std::string build_report() {
     {
         const gpu::PresentPacer::Stats ps = gpu::present_pacer().stats();
         o += std::string("  \"present_pacing\": {\"enabled\": ") +
-             (gpu::present_pacer().enabled() ? "true" : "false") + ", \"presents\": " + std::to_string(ps.presents) +
+             (gpu::present_pacer().enabled() ? "true" : "false") + ", \"present_interval\": \"" +
+             (gpu::present_pacer().honor_interval() ? "honor" : "min1") + "\", \"presents\": " + std::to_string(ps.presents) +
              ", \"immediate\": " + std::to_string(ps.immediate) + ", \"vblank_waits\": " + std::to_string(ps.waits) +
              ", \"wait_ms\": " + std::to_string(ps.wait_us / 1000) +
              ", \"missed_vblanks\": " + std::to_string(ps.missed_vblanks) +
@@ -3552,6 +3553,10 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     if (pacing == "true" || pacing == "false") {
         config.present_pacing = pacing == "true";
     }
+    const std::string_view pace_interval = json_value(json, "present_interval");
+    if (pace_interval == "honor" || pace_interval == "min1") {
+        config.present_honor_interval = pace_interval == "honor";
+    }
     const auto read_bool = [&](const char* key, bool& out) {
         const std::string_view v = json_value(json, key);
         if (v == "true" || v == "false") {
@@ -3844,6 +3849,7 @@ BootResult run_boot(const BootConfig& config) {
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
+    gpu::present_pacer().set_honor_interval(config.present_honor_interval);
     gpu::texture_budget().set_budget_bytes(uint64_t{config.gpu_memory_budget_mb} << 20);
     gpu::texture_budget().set_base_cap(config.texture_size_cap);
     gpu::d3d12_state::set_bind_group_slot_budget(config.bind_group_slot_budget);

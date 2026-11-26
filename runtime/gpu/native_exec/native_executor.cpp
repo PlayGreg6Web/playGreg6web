@@ -29,6 +29,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "gpu/gpu_time.h"
+#include "gpu/present_pacing.h"
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
@@ -1071,6 +1072,7 @@ struct NativeExecutor::Impl {
         s.gpu_ms = ov_gpu_ms;
         s.audio_underruns = ov_underruns;
         s.present_mode = present_mode_name;
+        if (gpu::present_pacer().honor_interval()) s.present_mode += " HONOR";
         s.fault = ov_fault;
         return s;
     }

@@ -154,6 +154,46 @@ void test_title_driven_caps_unpaced_bursts_at_60hz() {
     CHECK(s.presents == 13 && s.immediate == 1 && s.waits == 12 && s.wait_us > 0);
 }
 
+void test_title_driven_honor_interval() {
+    CHECK(PresentPacer::title_gap_vblanks(2, false) == 1);
+    CHECK(PresentPacer::title_gap_vblanks(2, true) == 2);
+    CHECK(PresentPacer::title_gap_vblanks(1, true) == 1);
+    CHECK(PresentPacer::title_gap_vblanks(0, true) == 1);
+    PresentPacer p;
+    FakeClock c;
+    c.install(p);
+    p.set_title_driven(true);
+    CHECK(!p.honor_interval());
+    p.set_honor_interval(true);
+    CHECK(p.honor_interval());
+    const auto t0 = c.origin + std::chrono::milliseconds(5);
+    c.now = t0;
+    (void)p.present(2);  // first present is immediate
+    CHECK(c.sleeps.empty());
+    // A burst at interval 2 is held to 2 vblanks apart (30 fps).
+    (void)p.present(2);
+    CHECK(c.now == t0 + 2 * kV);
+    (void)p.present(2);
+    CHECK(c.now == t0 + 4 * kV);
+    // Interval 1 in honor mode still paces at 1 vblank.
+    (void)p.present(1);
+    CHECK(c.now == t0 + 5 * kV);
+    // Interval 0 stays immediate.
+    const auto before = c.sleeps.size();
+    (void)p.present(0);
+    CHECK(c.sleeps.size() == before);
+    // Default (min1) at interval 2 is 1 vblank apart.
+    PresentPacer q;
+    FakeClock d;
+    d.install(q);
+    q.set_title_driven(true);
+    d.now = d.origin + std::chrono::milliseconds(5);
+    const auto s0 = d.now;
+    (void)q.present(2);
+    (void)q.present(2);
+    CHECK(d.now == s0 + kV);
+}
+
 void test_title_driven_interval_zero_remains_immediate() {
     PresentPacer p;
     FakeClock c;
@@ -243,6 +283,7 @@ int main() {
     test_immediate_and_off();
     test_title_driven_no_phase_beat_at_or_below_60hz();
     test_title_driven_caps_unpaced_bursts_at_60hz();
+    test_title_driven_honor_interval();
     test_title_driven_interval_zero_remains_immediate();
     test_present_samples_ring();
     test_host_sleep_is_precise();

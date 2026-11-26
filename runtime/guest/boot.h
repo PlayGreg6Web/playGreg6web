@@ -492,6 +492,9 @@ struct BootConfig {
     // O36: presents wait for the title's sync interval on a 60 Hz display (gpu/present_pacing.h);
     // off for benchmarks (report: present_pacing).
     bool present_pacing = true;
+    // Title-driven present gap: false = 1 vblank minimum (60 fps menus), true = the title's sync
+    // interval in vblanks (console 30 fps menus). --present-interval honor|min1; report: present_pacing.present_interval.
+    bool present_honor_interval = false;
     // Backlog 37 / 34 (gpu/texture_budget.h, gpu/descriptor_heap.h): host GPU memory budget in MiB
     // (0 = unknown: only the base cap applies), base size cap in texels for streamed block-compressed
     // 2D textures (0 = none; tighter caps of 512 / 256 apply at 70 / 85 percent of the budget), and

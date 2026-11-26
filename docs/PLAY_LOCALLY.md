@@ -59,6 +59,13 @@ A connected XInput pad also gets the game's rumble.
 
 **Overlay:** F3 draws a small box top-left (fps and frame time, a graph of the last 120 frames, present mode, draws per frame, GPU ms when the adapter has timestamps, live-audio underruns). When the guest stops on a fault the box also shows the reason, so it is readable in fullscreen where the title bar is not. It is drawn after the game's frame is copied for `--live-digest` and screenshots, so those never contain it.
 
+**Present interval (60 vs 30 fps in menus):** the title presents with sync interval 2 in menus (30 Hz on the console) and sets
+SetFrameIntervalX(33333 us, period 3). By default (`--present-interval min1`) the runtime only enforces a 1-vblank (16.7 ms) minimum
+gap between presents in title-driven mode, so menus run at about 60 fps, faster than the console. `-ConsoleTiming` (`--present-interval honor`)
+waits interval x vblank between presents, so those menus run at 30 fps like the console. Gameplay at interval 1 is the same in both.
+The active mode shows in the window title (`interval honor|min1`), the overlay (`HONOR` after the present mode) and the boot report
+(`present_pacing.present_interval`).
+
 **Screenshots:** F12 saves the presented frame as a PNG; `--screenshot-at` does it at a chosen time in scripted runs.
 
 **Saves tools:** `python tools/saves.py list|export|import` lists native saves or moves them as a zip (format in
@@ -67,7 +74,7 @@ A connected XInput pad also gets the game's rumble.
 (it never deletes).
 
 **Useful switches:** `-PresentMode auto|fifo|mailbox|immediate`, `-MaxFps N` (cap the window present rate, 0 = off),
-`-Record` (save your real input to `%LOCALAPPDATA%\playgta6\recordings\`), `-Keymap <file>`, `-FreshSetup`, `-NoBuild`,
+`-ConsoleTiming` (honor the title's present sync interval, `--present-interval honor`), `-Record` (save your real input to `%LOCALAPPDATA%\playgta6\recordings\`), `-Keymap <file>`, `-FreshSetup`, `-NoBuild`,
 `-DryRun`, `-Name <run name>`.
 
 **Ray tracing** is wired in the runtime (residency, BVH helper, fault readback) but stays off until the translator

@@ -893,6 +893,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-dir", type=Path, help="with --play: save directory (default: persistent, see docs)")
     p.add_argument("--present-mode", choices=["auto", "fifo", "mailbox", "immediate"],
                    help="with --play: window present mode (default auto: mailbox, immediate, fifo; unsupported falls back)")
+    p.add_argument("--present-interval", choices=["honor", "min1"], help="title-driven present gap: honor = the title's sync interval (console timing), min1 = 1 vblank (default)")
     p.add_argument("--max-fps", type=int, help="with --play: host-side present cap (0 = off); guest pacing is unchanged")
     p.add_argument("extra", nargs=argparse.REMAINDER, help="after `--`: further playgta6_boot options")
     return p
@@ -1078,6 +1079,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
         cmd += ["--window", "--audio-out", "--host-input"]
         if args.present_mode:
             cmd += ["--present-mode", args.present_mode]
+        if args.present_interval:
+            cmd += ["--present-interval", args.present_interval]
         if args.max_fps:
             cmd += ["--max-fps", str(args.max_fps)]
     cmd += extra

@@ -50,6 +50,17 @@ public:
     void set_title_driven(bool on);
     bool title_driven() const;
 
+    // Title-driven minimum gap between interval > 0 presents. false ("min1", default): one vblank
+    // whatever the interval (menus the title paces at interval 2 run at 60 fps, faster than the
+    // console). true ("honor", --present-interval honor): interval vblanks, so interval 2 (SetFrameIntervalX
+    // 33333 us, period 3) gives the console's 30 fps.
+    void set_honor_interval(bool on);
+    bool honor_interval() const;
+    // The gap in vblanks title-driven mode enforces for `interval` (> 0) in each mode.
+    static uint32_t title_gap_vblanks(uint32_t interval, bool honor) {
+        return honor ? (interval < 1 ? 1u : interval) : 1u;
+    }
+
     void set_enabled(bool on);
     bool enabled() const;
 
@@ -72,6 +83,7 @@ private:
     std::atomic<Observer> observer_{nullptr};
     bool enabled_ = true;
     bool title_driven_ = false;
+    bool honor_interval_ = false;
     bool have_last_ = false;
     bool have_last_present_time_ = false;
     uint64_t last_flip_ = 0;

@@ -45,6 +45,16 @@ void PresentPacer::set_title_driven(bool on) {
     last_present_time_ = Clock::time_point{};
 }
 
+void PresentPacer::set_honor_interval(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    honor_interval_ = on;
+}
+
+bool PresentPacer::honor_interval() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return honor_interval_;
+}
+
 bool PresentPacer::title_driven() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return title_driven_;
@@ -81,14 +91,14 @@ uint64_t PresentPacer::present(uint32_t interval) {
             have_last_present_time_ = true;
             return current;
         }
-        if (!have_last_present_time_ ||
-            now >= last_present_time_ + std::chrono::nanoseconds(kVblankNs)) {
+        const std::chrono::nanoseconds gap(static_cast<int64_t>(title_gap_vblanks(interval, honor_interval_)) * kVblankNs);
+        if (!have_last_present_time_ || now >= last_present_time_ + gap) {
             ++stats_.immediate;
             last_present_time_ = now;
             have_last_present_time_ = true;
             return current;
         }
-        const Clock::time_point until = last_present_time_ + std::chrono::nanoseconds(kVblankNs);
+        const Clock::time_point until = last_present_time_ + gap;
         last_present_time_ = until;
         have_last_present_time_ = true;
         auto sleep_until = sleep_until_;
