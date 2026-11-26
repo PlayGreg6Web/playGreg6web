@@ -135,7 +135,6 @@
 #include "os/host_sleep.h"
 #include "guest/boot.h"
 #include "guest/minidump.h"
-#include "guest/minidump_writer.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/audio_report.h"
@@ -164,6 +163,7 @@
 // After windows.h.
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
+#include "guest/minidump_writer.h"
 #else
 #include <execinfo.h>
 #include <pthread.h>
