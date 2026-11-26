@@ -943,5 +943,24 @@ class PlayConvenienceTests(unittest.TestCase):
             self.assertIn("guest faulted", out.getvalue())
 
 
+class AnnotateReportTests(unittest.TestCase):
+    def test_run_block_build_fallback_and_hard_stop(self):
+        md = ("## 1. XSystem\n\n| Slot | Function | Today | Set by |\n|---|---|---|---|\n"
+             "| 7 | XSystemGetAppSpecificDeviceId | Trapping stub | #1 |\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "bin" / "h.exe"
+            exe.parent.mkdir()
+            (exe.parent / "build-info.json").write_text(json.dumps({"source_commit": "abc", "dirty": False}))
+            rep = {"fault_record": {"kind": "unimplemented_slot", "unimplemented_slot": {
+                "interface": "XSystem", "guid": "g", "slot": 7, "name": "XSystemGetAppSpecificDeviceId"}}}
+            self.assertTrue(rnb.annotate_report(rep, "smoke", "smoke-1", ["--max-ms", "5"], exe, md))
+            self.assertEqual(rep["run"], {"preset": "smoke", "name": "smoke-1", "args": ["--max-ms", "5"]})
+            self.assertEqual(rep["build"]["source_commit"], "abc")
+            self.assertIn("Trapping stub", rep["fault_record"]["unimplemented_slot"]["hard_stop"])
+            rep2 = {"build": {"source_commit": "zzz"}}
+            rnb.annotate_report(rep2, "smoke", "n", [], exe, md)
+            self.assertEqual(rep2["build"]["source_commit"], "zzz")
+
+
 if __name__ == "__main__":
     unittest.main()

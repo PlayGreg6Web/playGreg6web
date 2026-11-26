@@ -192,6 +192,17 @@ static_assert(offsetof(Pg6ImportThunk, shim) == offsetof(Pg6BootImport, shim), "
 extern "C" const Pg6Program pg6_program;  // pg6_program.cpp of the program build
 #endif
 
+// Build metadata written by tools/build_native_boot.py beside the harness (build-info.json has the same
+// content). Absent when the harness is built by hand.
+#if defined(__has_include)
+#if __has_include("pg6_build_info.h")
+#include "pg6_build_info.h"
+#endif
+#endif
+#ifndef PG6_BUILD_INFO_JSON
+#define PG6_BUILD_INFO_JSON "{\"source_commit\": null}"
+#endif
+
 namespace {
 
 using namespace playgta6;
@@ -1456,6 +1467,7 @@ int main(int argc, char** argv) {
         usage();
         return kExitUsage;
     }
+    guest::set_build_info_json(PG6_BUILD_INFO_JSON);
     os::host_sleep::raise_timer_resolution();  // guest timed waits otherwise wake on the 15.6 ms tick
     os::scarlett::guest_api::set_dstorage_worker_threads(static_cast<uint32_t>(g_options.dstorage_workers));
     {

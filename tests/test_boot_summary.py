@@ -65,6 +65,22 @@ class BootSummaryTest(unittest.TestCase):
         self.assertIn("slot 66", out)
         self.assertIn("hard stop: Reg -> Trapping stub", out)
 
+    def test_structured_slot_and_identity(self):
+        r = base()
+        r["status"] = "fault"
+        r["build"] = {"source_commit": "abcdef0123456789", "dirty": True, "profile": "Release", "executor": True,
+                      "recomp_hash": "0011"}
+        r["run"] = {"preset": "menu-flow", "name": "n1"}
+        r["fault_record"] = {"kind": "unimplemented_slot", "elapsed_ms": 5000, "rip": "0x1", "target": "0x0",
+                             "unimplemented_slot": {"interface": "XSystem", "guid": "g", "slot": 7,
+                                                    "name": "XSystemGetAppSpecificDeviceId"}}
+        md = "## 1. XSystem\n\n| Slot | Function | Today | Set by |\n|---|---|---|---|\n| 7 | XSystemGetAppSpecificDeviceId | Trapping stub | #1 |\n"
+        out = bs.summarize(r, None, md)
+        self.assertIn("build: abcdef0123+dirty, Release, executor, recomp 0011", out)
+        self.assertIn("launch: preset menu-flow, name n1", out)
+        self.assertIn("com slot: XSystem slot 7 XSystemGetAppSpecificDeviceId", out)
+        self.assertIn("hard stop: XSystemGetAppSpecificDeviceId -> Trapping stub", out)
+
     def test_compare_and_cli(self):
         a, b = base(), base()
         b["native_executor"]["device_errors"] = 0

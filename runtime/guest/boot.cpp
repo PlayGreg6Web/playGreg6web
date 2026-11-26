@@ -364,6 +364,12 @@ struct Milestone {
 };
 
 std::atomic<ReportExtension> g_report_extension{nullptr};
+// Set before boot (set_build_info_json), possibly from a static initializer: function-local so the
+// order of translation-unit initialisation does not matter.
+std::string& build_info_json() {
+    static std::string json;
+    return json;
+}
 
 struct BootState {
     std::mutex mutex;  // recent ring, survey list
@@ -2334,6 +2340,12 @@ std::string fault_record_json(const FaultRecord& f) {
                  ", \"location\": " + code_location_json(regs->resume_rip) + "}";
     }
     o += ", \"source\": " + source;
+    if (f.kind == "unimplemented_slot") {
+        const std::string slot = com::last_unimplemented_slot_json();
+        if (!slot.empty()) {
+            o += ", \"unimplemented_slot\": " + slot;
+        }
+    }
     o += ", \"registers\": ";
     if (regs != nullptr) {
         o += "{";
@@ -2856,6 +2868,9 @@ std::string build_report() {
                  ", \"draws\": " + std::to_string(ps.draws) + ", \"resources\": " + std::to_string(ps.resources) + "}";
         }
         o += "],\n";
+    }
+    if (!build_info_json().empty()) {
+        o += "  \"build\": " + build_info_json() + ",\n";
     }
     if (const ReportExtension extension = g_report_extension.load(std::memory_order_acquire)) {
         const std::string members = extension();
@@ -3616,6 +3631,10 @@ bool load_boot_options(BootConfig& config, const BootFileReader& read, const std
     const bool ok = apply_boot_options_json(text, config);
     os::log(ok ? "[boot] BOOT_OPTIONS " + path + " applied" : "[boot] BOOT_OPTIONS " + path + " ignored (not a JSON object)");
     return ok;
+}
+
+void set_build_info_json(std::string json) {
+    build_info_json() = std::move(json);
 }
 
 void set_report_extension(ReportExtension extension) {

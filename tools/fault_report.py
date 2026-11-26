@@ -183,7 +183,7 @@ def render(report: dict[str, Any], entries: int = 16, syms: "gs.PeSymbols | None
     if slot is not None:
         lines.append(f"  com slot: {slot['iface']} {slot['guid']} slot {slot['slot']}"
                      f"{' ' + slot['name'] if slot.get('name') else ''}")
-        status = gs.hard_stop_status(hard_stops, slot["iface"], slot["slot"], slot.get("name")) if hard_stops else None
+        status = gs.slot_hard_stop(hard_stops, slot)
         lines.append(f"  hard stop: {status}" if status else "  hard stop: not listed in docs/HARD_STOPS.md")
     lines.append("  " + next_step(report, rec, slot))
     sug = suggestions(rec)

@@ -220,6 +220,11 @@ inline constexpr Guid IID_IUnknown_GUID = make_guid("00000000-0000-0000-c000-000
 // "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
 std::string format_guid(const Guid& guid);
 
+// JSON object {"interface","guid","slot","name"} of the newest unimplemented-slot stub that was
+// entered (the one a UnimplementedSlot fault came from), or "" when none was. Feeds the report's
+// fault_record.unimplemented_slot (tools/guest_symbols.find_unimplemented).
+std::string last_unimplemented_slot_json();
+
 // ---------------------------------------------------------------------------
 // Guest memory seam
 // ---------------------------------------------------------------------------

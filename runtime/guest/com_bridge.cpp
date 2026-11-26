@@ -28,6 +28,9 @@ constexpr uint64_t kLargeBlock = 64 * 1024;
 constexpr size_t kMaxDiagnostics = 256;
 constexpr uint32_t kReleasedVtableSlots = 128;
 
+std::mutex g_last_unimpl_mutex;
+std::string g_last_unimpl_json;
+
 std::atomic<os::VirtualMemoryArena*> g_arena{nullptr};
 // Bumped by reset_com_bridge(): objects and lazy guest threads of an older generation no longer
 // touch guest memory.
@@ -899,6 +902,22 @@ void stub_thunk(void* raw) {
                " (return address " + hex(return_address) + ")");
         raise_fault(FaultKind::Trap, &state, state.rip, state.gpr[GuestReg::Rcx]);
     }
+    {
+        auto esc = [](const std::string& in) {
+            std::string out;
+            for (const char c : in) {
+                if (c == '"' || c == '\\') out += '\\';
+                if (static_cast<unsigned char>(c) >= 0x20) out += c;
+            }
+            return out;
+        };
+        std::string json = "{\"interface\": \"" + esc(iface_label(*stub->iface)) + "\", \"guid\": \"" +
+                           esc(format_guid(stub->iface->iid)) + "\", \"slot\": " + std::to_string(stub->slot) +
+                           ", \"name\": " +
+                           (stub->method_name.empty() ? std::string("null") : "\"" + esc(stub->method_name) + "\"") + "}";
+        std::lock_guard<std::mutex> lock(g_last_unimpl_mutex);
+        g_last_unimpl_json = std::move(json);
+    }
     if (hits == 1) {
         std::string message = "com bridge: unimplemented " + iface_label(*stub->iface) + " " +
                               format_guid(stub->iface->iid) + " slot " + std::to_string(stub->slot);
@@ -1281,6 +1300,11 @@ std::vector<TraceRow> trace_report() {
         rows.push_back(std::move(r));
     }
     return rows;
+}
+
+std::string last_unimplemented_slot_json() {
+    std::lock_guard<std::mutex> lock(g_last_unimpl_mutex);
+    return g_last_unimpl_json;
 }
 
 }  // namespace playgta6::guest::com

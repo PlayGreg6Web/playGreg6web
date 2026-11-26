@@ -95,5 +95,22 @@ class RunHistoryTests(unittest.TestCase):
         self.assertEqual(rh.main(["--root", str(self.root), "--prebuilt-dir", "", "--since", "1000000d"]), 0)
 
 
+class BuildMetadataTests(unittest.TestCase):
+    def test_commit_preset_dirty_and_slot_come_from_the_report_blocks(self):
+        rep = report(fault=True)
+        rep.pop("preset")
+        rep["build"] = {"source_commit": "abcdef0123456789", "dirty": True}
+        rep["run"] = {"preset": "menu-flow", "name": "x"}
+        rep["fault_record"]["kind"] = "unimplemented_slot"
+        rep["fault_record"]["unimplemented_slot"] = {
+            "interface": "XSystem", "guid": "{00000000-0000-0000-0000-000000000001}", "slot": 7,
+            "name": "XSystemGetAppSpecificDeviceId", "hard_stop": "XSystemGetAppSpecificDeviceId -> Trapping stub"}
+        row = rh.row_from_report(rep, "r", 1000.0, rh.find_commit(rep, None))
+        self.assertEqual(row["commit"], "abcdef0123*")
+        self.assertEqual(row["preset"], "menu-flow")
+        self.assertIn("XSystem[7] XSystemGetAppSpecificDeviceId", row["ended"])
+        self.assertEqual(row["hard_stop"], "XSystemGetAppSpecificDeviceId -> Trapping stub")
+
+
 if __name__ == "__main__":
     unittest.main()

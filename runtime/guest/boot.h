@@ -604,6 +604,9 @@ void mark_first_present();
 // trailing comma; empty for none), called whenever the report is built. nullptr removes it.
 using ReportExtension = std::string (*)();
 void set_report_extension(ReportExtension extension);
+// Build metadata (a JSON object: source commit, dirty flag, recomp hash, profile, executor) the report
+// carries as `build`. Set once before boot by the harness / wasm entry; empty means no block.
+void set_build_info_json(std::string json);
 std::string last_summary();
 
 // The import trace of the last boot (BootConfig::import_trace_limit): one line per import call,

@@ -122,7 +122,7 @@ def _ending(report: dict[str, Any], syms: "gs.PeSymbols | None", hard_stops: str
         if slot:
             out.append(f"  com slot: {slot['iface']} slot {slot['slot']}"
                        f"{' ' + slot['name'] if slot.get('name') else ''}")
-            st = gs.hard_stop_status(hard_stops, slot["iface"], slot["slot"], slot.get("name")) if hard_stops else None
+            st = gs.slot_hard_stop(hard_stops, slot)
             out.append(f"  hard stop: {st}" if st else "  hard stop: not listed in docs/HARD_STOPS.md")
     elif "limit" in str(status) or status is None:
         out.append(f"ended: limit ({_d(report.get('fault')).get('kind') or status}), no fault")
@@ -133,8 +133,24 @@ def _ending(report: dict[str, Any], syms: "gs.PeSymbols | None", hard_stops: str
     return out
 
 
+def _identity(report: dict[str, Any]) -> list[str]:
+    """`build:` and `launch:` lines from the report's build / run blocks (absent in older reports)."""
+    out: list[str] = []
+    b, r = _d(report.get("build")), _d(report.get("run"))
+    if b:
+        commit = str(b.get("source_commit") or "?")[:10] + ("+dirty" if b.get("dirty") else "")
+        bits = [commit, str(b.get("profile") or "?"), "executor" if b.get("executor") else "no executor"]
+        if b.get("recomp_hash"):
+            bits.append(f"recomp {b['recomp_hash']}")
+        out.append("build: " + ", ".join(bits))
+    if r:
+        out.append(f"launch: preset {r.get('preset')}, name {r.get('name')}")
+    return out
+
+
 def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_stops: str | None = None) -> str:
     L: list[str] = []
+    L += _identity(report)
     L.append(f"run: {_dur(report.get('elapsed_ms'))}, phase {report.get('phase')}, "
              f"{_i(_d(report.get('counters')).get('dispatches'))} dispatches")
     L += _ending(report, syms, hard_stops)

@@ -622,5 +622,23 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("error:", err.getvalue())
 
 
+class BuildInfoTests(unittest.TestCase):
+    def test_header_and_json_written_beside_the_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = nb.module_inputs(nb.load_module(make_module(root, shards=1)))
+            info = nb.build_info(REPO_ROOT, inputs, debug_info=True, native_executor=True)
+            self.assertEqual(info["profile"], "RelWithDebInfo")
+            self.assertTrue(info["executor"])
+            self.assertTrue(info["recomp_hash"])
+            project, bin_dir = root / "harness", root / "bin"
+            project.mkdir()
+            nb.write_build_info(project, bin_dir, info)
+            header = (project / nb.BUILD_INFO_HEADER).read_text(encoding="utf-8")
+            self.assertIn("PG6_BUILD_INFO_JSON", header)
+            self.assertEqual(json.loads((bin_dir / nb.BUILD_INFO_JSON).read_text(encoding="utf-8")), info)
+            self.assertIn("CMAKE_CURRENT_SOURCE_DIR", nb.harness_cmakelists(REPO_ROOT, inputs, [], bin_dir, False))
+
+
 if __name__ == "__main__":
     unittest.main()

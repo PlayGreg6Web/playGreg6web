@@ -54,7 +54,7 @@ def find_commit(report: dict[str, Any], build_dir: Path | None) -> str:
         for k in ("source_commit", "git_commit", "commit"):
             v = src.get(k)
             if isinstance(v, str) and v:
-                return v[:10]
+                return v[:10] + ("*" if src.get("dirty") is True else "")
     if build_dir is not None:
         v = _read_json(build_dir / "prebuilt.json").get("commit")
         if isinstance(v, str) and v:
@@ -88,8 +88,7 @@ def ending(report: dict[str, Any], hard_stops: str | None = None) -> tuple[str, 
         st = ""
         if slot:
             what += f" {slot['iface']}[{slot['slot']}]" + (f" {slot['name']}" if slot.get("name") else "")
-            st = (gs.hard_stop_status(hard_stops, slot["iface"], slot["slot"], slot.get("name"))
-                  if hard_stops else None) or "unlisted"
+            st = gs.slot_hard_stop(hard_stops, slot) or "unlisted"
         return "FAULT " + what, st
     status = report.get("status")
     fk = bs._d(report.get("fault")).get("kind")
@@ -116,7 +115,7 @@ def row_from_report(report: dict[str, Any], name: str, when: float, commit: str,
     ms = _last_milestone(report)
     return {
         "time": dt.datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M"), "_t": when,
-        "run": name, "commit": commit, "preset": str(report.get("preset") or "-"),
+        "run": name, "commit": commit, "preset": str(bs._d(report.get("run")).get("preset") or report.get("preset") or "-"),
         "duration": bs._dur(report.get("elapsed_ms")) if report.get("elapsed_ms") is not None else "-",
         "ended": end, "hard_stop": hs,
         "max_screen": f"{ms} / {draws:g} draws/frame" if draws else ms,

@@ -145,6 +145,28 @@ if(PLAYGTA6_OPUS)
     target_compile_definitions(playgta6_core PUBLIC PLAYGTA6_HAVE_OPUS=1)
 endif()
 
+# Build metadata for the browser build's boot report (`build` block, wasm_boot.cpp). Configure-time
+# git state: the commit and whether the tree had uncommitted changes.
+find_package(Git QUIET)
+set(_pg6_commit "unknown")
+set(_pg6_dirty 0)
+if(GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" OUTPUT_VARIABLE _pg6_rev
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _pg6_rev_rc)
+    if(_pg6_rev_rc EQUAL 0 AND _pg6_rev)
+        set(_pg6_commit "${_pg6_rev}")
+        execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" OUTPUT_VARIABLE _pg6_status
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(_pg6_status)
+            set(_pg6_dirty 1)
+        endif()
+    endif()
+endif()
+set_source_files_properties(wasm_boot.cpp PROPERTIES COMPILE_DEFINITIONS
+    "PG6_BUILD_COMMIT=\"${_pg6_commit}\";PG6_BUILD_DIRTY=${_pg6_dirty};PG6_BUILD_PROFILE=\"$<CONFIG>\"")
+
 # Local-only wasm64 test build (tools/run_wasm_tests.py): keeps the CTest executables below enabled
 # under Emscripten instead of building the browser `runtime` target. Off by default.
 option(PLAYGTA6_WASM_TESTS "Build the CTest executables as wasm64 + pthreads Node tests (Emscripten only)" OFF)

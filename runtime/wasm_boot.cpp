@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "abi/playgta6_abi.h"
@@ -30,6 +31,26 @@
 #else
 #define PG6_WASM_BOOT_EXPORT
 #endif
+
+// Build metadata for the report's `build` block (runtime/CMakeLists.txt sets the PG6_BUILD_* defines).
+namespace {
+#ifndef PG6_BUILD_COMMIT
+#define PG6_BUILD_COMMIT "unknown"
+#endif
+#ifndef PG6_BUILD_DIRTY
+#define PG6_BUILD_DIRTY 0
+#endif
+#ifndef PG6_BUILD_PROFILE
+#define PG6_BUILD_PROFILE "unknown"
+#endif
+[[maybe_unused]] const bool g_build_info_set = [] {
+    playgta6::guest::set_build_info_json(
+        std::string("{\"source_commit\": \"") + PG6_BUILD_COMMIT + "\", \"dirty\": " +
+        (PG6_BUILD_DIRTY ? "true" : "false") + ", \"profile\": \"" + PG6_BUILD_PROFILE +
+        "\", \"target\": \"wasm\", \"executor\": false}");
+    return true;
+}();
+}  // namespace
 
 #if defined(PG6_BOOT_LINKED_GUEST) && defined(PG6_BOOT_PROGRAM)
 extern "C" const Pg6Program pg6_program;

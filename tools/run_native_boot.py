@@ -92,6 +92,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boot_summary  # noqa: E402
 import compare_boot_reports  # noqa: E402
 import find_chrome  # noqa: E402
+import guest_symbols  # noqa: E402
 import screen_timeline  # noqa: E402
 import clean_build_dirs  # noqa: E402
 import build_guard  # noqa: E402
@@ -624,6 +625,30 @@ def harness_command(harness: Path) -> list[str]:
     return [sys.executable, str(harness)] if harness.suffix == ".py" else [str(harness)]
 
 
+HARD_STOPS_MD = REPO_ROOT / "docs" / "HARD_STOPS.md"
+
+
+def annotate_report(report: dict, preset: str, name: str, args: Sequence[str], harness: Path,
+                    hard_stops: str | None = None) -> bool:
+    """Add what the harness cannot know: the `run` block (preset, name, args), the build block from
+    build-info.json beside the exe when the harness predates the embedded one, and the HARD_STOPS.md
+    status of an unimplemented-slot fault. Returns whether the report changed."""
+    before = json.dumps(report, sort_keys=True)
+    report["run"] = {"preset": preset, "name": name, "args": list(args)}
+    if "build" not in report:
+        try:
+            report["build"] = json.loads((harness.parent / "build-info.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    slot = guest_symbols.find_unimplemented(report)
+    rec = report.get("fault_record")
+    if slot and isinstance(rec, dict) and isinstance(rec.get("unimplemented_slot"), dict) and hard_stops:
+        status = guest_symbols.hard_stop_status(hard_stops, slot["iface"], slot["slot"], slot.get("name"))
+        if status:
+            rec["unimplemented_slot"]["hard_stop"] = status
+    return json.dumps(report, sort_keys=True) != before
+
+
 def load_report(path: Path) -> dict | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -1137,6 +1162,12 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     if report is None:
         print(f"error: the harness (exit {code}) wrote no report; see {run_dir / 'boot.log'}", file=sys.stderr)
         return 3
+    try:
+        hs_md = HARD_STOPS_MD.read_text(encoding="utf-8") if HARD_STOPS_MD.is_file() else None
+    except OSError:
+        hs_md = None
+    if annotate_report(report, args.preset, run_dir.name, cmd[len(harness_command(harness)):], harness, hs_md):
+        (run_dir / "boot-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     presents = timeline_presents(report)
     log_text = ""
     try:

@@ -147,7 +147,14 @@ class PeSymbols:
 
 
 def find_unimplemented(report: Any, extra_lines: Iterable[str] = ()) -> dict[str, Any] | None:
-    """Newest `com bridge: unimplemented ...` message anywhere in the report (or in extra log lines)."""
+    """The unimplemented COM slot of a fault: the structured `fault_record.unimplemented_slot` the runtime
+    writes (interface, guid, slot, name, optional hard_stop), else the newest `com bridge: unimplemented ...`
+    message anywhere in the report (or in extra log lines)."""
+    rec = report.get("fault_record") if isinstance(report, dict) else None
+    st = rec.get("unimplemented_slot") if isinstance(rec, dict) else None
+    if isinstance(st, dict) and isinstance(st.get("slot"), int) and st.get("interface"):
+        return {"iface": st["interface"], "guid": st.get("guid"), "slot": st["slot"],
+                "name": st.get("name"), "hard_stop": st.get("hard_stop")}
     found: list[dict[str, Any]] = []
 
     def scan(s: str) -> None:
@@ -168,6 +175,13 @@ def find_unimplemented(report: Any, extra_lines: Iterable[str] = ()) -> dict[str
     for line in extra_lines:
         scan(line)
     return found[-1] if found else None
+
+
+def slot_hard_stop(md: str | None, slot: dict[str, Any]) -> str | None:
+    """The slot's recorded hard_stop (written into the report by tools/run_native_boot.py), else looked up in `md`."""
+    if slot.get("hard_stop"):
+        return str(slot["hard_stop"])
+    return hard_stop_status(md, slot["iface"], slot["slot"], slot.get("name")) if md else None
 
 
 def hard_stop_status(md: str, iface: str, slot: int, name: str | None) -> str | None:
