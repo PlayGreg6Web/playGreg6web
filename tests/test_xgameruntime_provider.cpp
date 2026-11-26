@@ -1026,6 +1026,18 @@ void test_task_queue_slots() {
 
 // XNetworking: the hint reports an initialized network with no connectivity, and each
 // registration gets exactly one initial notification with that hint on its completion port.
+void test_networking_offline_failures() {
+    Fixture fx;
+    const uint64_t net = fx.query(kNetworkingProvider, kNetworkingIid);
+    const uint64_t out = fx.alloc(8);
+    for (uint32_t slot : {3u, 4u, 5u, 8u, 9u, 10u, 14u}) {
+        const uint64_t sentinel = 0x1122334455667788ull;
+        CHECK(com::write_guest(out, sentinel));
+        CHECK(hr32(fx.vcall(net, slot, {out, out, out})) == static_cast<int32_t>(0x800704CFu));
+        CHECK(load64(out) == 0x1122334455667788ull);  // nothing written
+    }
+}
+
 void test_networking_slots() {
     Fixture fx;
     const uint64_t async = fx.query(kAsyncQueue, kAsyncQueue);
@@ -1710,6 +1722,7 @@ int main() {
     test_task_queue_slots();
     test_user_slots();
     test_networking_slots();
+    test_networking_offline_failures();
     test_unimplemented_slots();
     test_async_provider_slots();
     test_http_client_thunks();

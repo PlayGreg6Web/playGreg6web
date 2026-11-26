@@ -1234,6 +1234,20 @@ class NetworkingApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XNetworking";
 
+    // Slots 3/4/5 (preferred local UDP multiplayer port, sync/async/result), 8/9/10 (security
+    // information for a URL, async/result size/result) and 14 (server certificate verification):
+    // an unplugged console has no network, so the preferred port is unknown and no URL or server
+    // can be reached, vouched for or verified. Every one answers HRESULT_FROM_WIN32(
+    // ERROR_NETWORK_UNREACHABLE) without touching a guest argument, without queueing completion
+    // and without any host network call. Security/certificate answers are never invented.
+    int32_t NetworkUnreachable() {
+        if (!unreachable_logged_.exchange(true)) {
+            os::log("xgameruntime: XNetworking port/security/certificate query: offline mode; "
+                    "returning HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)");
+        }
+        return static_cast<int32_t>(0x800704CFu);
+    }
+
     int32_t GetConnectivityHint(GuestPtr<Pg6XNetworkingConnectivityHint> hint) {
         Pg6XNetworkingConnectivityHint value{};
         const int32_t hr = pg6_gdk_xnetworking_get_connectivity_hint(&value);
@@ -1293,6 +1307,9 @@ public:
         }
         return ok;
     }
+
+private:
+    std::atomic<bool> unreachable_logged_{false};
 };
 
 // XPackageInstallationProgress (x64): totalBytes, installedBytes, launchable, completed.
@@ -2840,13 +2857,13 @@ constexpr auto kIStore =
 
 using NW = M<NetworkingApi>;
 constexpr auto kNetworkingTable = slot_table<15>({
-    {3, NW::stub("XNetworkingQueryPreferredLocalUdpMultiplayerPort")},
-    {4, NW::stub("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync")},
-    {5, NW::stub("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult")},
-    {8, NW::stub("XNetworkingQuerySecurityInformationForUrlAsync")},
-    {9, NW::stub("XNetworkingQuerySecurityInformationForUrlAsyncResultSize")},
-    {10, NW::stub("XNetworkingQuerySecurityInformationForUrlAsyncResult")},
-    {14, NW::stub("XNetworkingVerifyServerCertificate")},
+    {3, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingQueryPreferredLocalUdpMultiplayerPort")},
+    {4, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync")},
+    {5, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult")},
+    {8, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingQuerySecurityInformationForUrlAsync")},
+    {9, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingQuerySecurityInformationForUrlAsyncResultSize")},
+    {10, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingQuerySecurityInformationForUrlAsyncResult")},
+    {14, NW::method<&NetworkingApi::NetworkUnreachable>("XNetworkingVerifyServerCertificate")},
     {15, NW::method<&NetworkingApi::GetConnectivityHint>("XNetworkingGetConnectivityHint")},
     {16, NW::method<&NetworkingApi::RegisterConnectivityHintChanged>("XNetworkingRegisterConnectivityHintChanged")},
     {17, NW::method<&NetworkingApi::UnregisterConnectivityHintChanged>(
