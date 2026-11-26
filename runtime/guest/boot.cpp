@@ -18,7 +18,9 @@
 
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "guest/audio_probes.h"
 #include "guest/export_counters.h"
+#include "os/audio_file_stats.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/present_pacing.h"
@@ -467,6 +469,7 @@ struct BootState {
 
     // B2: call counters for the exports of the lifted Bink2Scarlett.dll and how its exports bound.
     ExportCounters bink;
+    AudioProbes audio_probes;  // A4: title audio-stack call counters (main executable addresses)
     bool bink_present = false;        // a loaded module named Bink2Scarlett.dll
     uint64_t bink_exports_lifted = 0; // registry exports that are guest (lifted) code
     uint64_t bink_exports_shim = 0;   // registry exports that are host shims (would shadow the DLL)
@@ -1287,6 +1290,32 @@ void setup_bink_counters(BootState& b) {
     }
 }
 
+// A4: the title's audio stack as guest addresses (main executable, linked at 0x140000000). The
+// decoder factory is reached by vtable, so the dispatch observer sees it; a direct call between
+// two lifted functions would not show (the report says "indirect_calls_only").
+void setup_audio_probes(BootState& b) {
+    b.audio_probes.clear();
+    if (b.modules.empty() || !b.modules[0].loaded || b.modules[0].image.base == 0) {
+        return;
+    }
+    constexpr uint64_t kLinkBase = 0x140000000ull;
+    const uint64_t base = b.modules[0].image.base;
+    struct Def { const char* name; uint64_t va; };
+    static const Def kDefs[] = {
+        {"decoder_factory", 0x144ee95f0ull},          // codec 11 Opus, 5 XMA, 0..3 PCM/ADPCM
+        {"decoder_factory_caller_a", 0x140078560ull},
+        {"decoder_factory_caller_b", 0x144ee8a10ull},
+        {"music_controller_init", 0x145b67eb0ull},
+        {"stream_decoder_create", 0x140078f00ull},
+        {"stream_consumer", 0x140078120ull},
+    };
+    std::vector<AudioProbe> probes;
+    for (const Def& d : kDefs) {
+        probes.push_back(AudioProbe{d.name, base + (d.va - kLinkBase)});
+    }
+    b.audio_probes.configure(std::move(probes));
+}
+
 // First call of a counted Bink2Scarlett.dll export: BinkOpenWithOptions is the BINK_OPEN milestone
 // (the import-name milestone cannot see a guest-to-guest call), the others are logged.
 void bink_first_call(BootState& b, size_t index) {
@@ -1315,6 +1344,15 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
         const long bink_index = b.bink.hit(target, &first);
         if (first && bink_index >= 0) {
             bink_first_call(b, static_cast<size_t>(bink_index));
+        }
+    }
+    if (b.audio_probes.active()) {
+        const uint64_t args[AudioProbes::kArgs] = {state->gpr[GuestReg::Rcx], state->gpr[GuestReg::Rdx],
+                                                   state->gpr[GuestReg::R8], state->gpr[GuestReg::R9]};
+        bool first = false;
+        const long idx = b.audio_probes.hit(target, args, &first);
+        if (first && idx >= 0 && b.log_progress) {
+            os::log(("[audio-probe] first call of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
         }
     }
     const uint64_t rsp = state->gpr[GuestReg::Rsp];
@@ -2481,6 +2519,8 @@ std::string build_report() {
         o += ordered.empty() ? "]},\n" : "\n  ]},\n";
 
         o += bink_json() + ",\n";
+        o += "  \"audio_probes\": " + b.audio_probes.to_json() + ",\n";
+        o += "  \"audio_files\": " + os::audio_files::stats().to_json() + ",\n";
         o += "  \"survey\": {\"enabled\": " + std::string(b.survey ? "true" : "false") +
              ", \"unresolved_called\": [";
         for (size_t k = 0; k < b.survey_called.size(); ++k) {
@@ -3668,6 +3708,8 @@ void reset_boot() {
     b.bink_present = false;
     b.bink_exports_lifted = 0;
     b.bink_exports_shim = 0;
+    b.audio_probes.clear();
+    os::audio_files::stats().reset();
     b.process_reservation = 0;
     b.peb = 0;
     b.process_parameters = 0;
@@ -4013,6 +4055,7 @@ BootResult run_boot(const BootConfig& config) {
     // After after_load: the guest modules and their exports enter the module registry there, so the
     // lifted/shim classification of Bink2Scarlett.dll's exports is only meaningful from here on.
     setup_bink_counters(b);
+    setup_audio_probes(b);
     // R11 unwinder: every image's .pdata (RtlLookupFunctionEntry, exception dispatch, backtraces),
     // unless after_load (R12's register_program_modules) registered it already.
     for (ModuleState& m : b.modules) {

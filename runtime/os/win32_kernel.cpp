@@ -1,5 +1,6 @@
 #include "os/win32_kernel.h"
 
+#include "os/audio_file_stats.h"
 #include "os/guest_window.h"
 #include "os/xmem_windows.h"
 
@@ -436,7 +437,7 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
     return true;
 }
 
-Handle create_file_impl(std::string_view raw_path,
+Handle create_file_impl_inner(std::string_view raw_path,
                         uint32_t desired_access,
                         uint32_t creation_disposition) {
     if (raw_path.empty()) {
@@ -551,6 +552,12 @@ Handle create_file_impl(std::string_view raw_path,
     file->httpfs_key = normalized;
     SetLastError(ERROR_SUCCESS);
     return handle_table().insert(std::move(file));
+}
+
+Handle create_file_impl(std::string_view raw_path, uint32_t desired_access, uint32_t creation_disposition) {
+    const Handle h = create_file_impl_inner(raw_path, desired_access, creation_disposition);
+    audio_files::stats().record(raw_path, h != INVALID_HANDLE_VALUE);
+    return h;
 }
 
 }  // namespace
