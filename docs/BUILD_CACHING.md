@@ -7,6 +7,7 @@ their caches, outermost first:
 |---|---|---|---|
 | `recomp` (cargo release build) | `<object cache>-recomp` | every workspace crate's sources + `rustc -vV` | no cargo build |
 | `program` (whole) | `<object cache>-lift` (#1475) | recompiler sources, exe, DLLs, shim headers, lift options | no discovery, no lift |
+| `program` (discovery, per module) | `<shard lift cache>/discovery` (this page) | discovery sources + `rustc -vV`, module bytes, guest image bytes, seeds | no discovery |
 | `program` (per shard) | `<object cache>-lift-shards` (this page) | per shard: its functions' CFGs + callee flag summaries + lifter version + target/memory/dispatch/probes | that shard is not lifted |
 | `harness` (per shard object) | `<object cache>` (`build_native_boot.py`) | per shard: IR hash, triple, CPU, `-O`, PIC, LLVM version, retarget code | that shard is not compiled |
 
@@ -91,6 +92,61 @@ the known cache roots, and keeps the newest entry of each cache, anything used i
 fresh lock or temporary. The builders call it on their own (log line `disk low: ...`) when free disk is below
 `PLAYGTA6_MIN_FREE_GB` (default 20, 0 disables).
 
+## Discovery cache (`build-program --discovery-cache <dir>|off`)
+
+`recomp/src/pipeline/discovery_cache.rs` stores the whole discovery stage of a module (the
+`refine::discover_refined` fixpoint: `discover::Analysis`, the code-pointer outcome, the final
+entry points and no-return slots) as `<module>-<key>.disc`. The default directory is
+`<lift cache>/discovery` whenever `--lift-cache` is given, so `tools/run_native_boot.py` and
+`tools/run_browser_boot.py` use it without new options (the shard trim and `tools/trim_caches.py` leave the subdirectory alone; the cache keeps
+its own 3 newest entries per module).
+
+Key (FNV-1a 128):
+
+- `DISCOVERY_CODE` from `recomp/build.rs`: every non-test source of the crate except
+  `src/lift/**` and `src/pipeline/shard_lift.rs` (they run after discovery), plus `build.rs`,
+  the manifest, `Cargo.lock` (iced-x86) and `rustc -vV`;
+- the module bytes as `seed` reads them (rebased), the guest image bytes after the IAT pre-fill
+  (the refinement reads base relocations from them), the image options, and the seeded entry
+  points and no-return slots (`.pdata`, EH, exports, `--entry`);
+- the trace-seed re-run (#1654) has its own entry: the first stage's key plus the accepted seed
+  entries, the only new input of that run. A seed file that accepts the same entries hits; a
+  different one re-runs only the second stage.
+
+It is one entry per module, not per function, on purpose. Discovery is a single global fixpoint:
+jump-table slices cross into predecessor blocks of other functions, a resolved table adds leaders
+that split blocks elsewhere, tail calls depend on which addresses are entries, and the pointer-slot,
+vtable and code-pointer rounds add entries from the whole block map. A per-function fact is only
+valid together with every cross-function fact that produced it, which is the whole analysis, and
+a change to any discovery rule (`jump_table.rs`, `discover.rs`, `reach.rs`, ...) can change any
+function, so no fact computed by the old code can be reused without deriving it again. Reusing
+parts of the fixpoint after a rule change would need the fixpoint itself to be incremental (inside
+`discover.rs`), not a cache around it.
+
+Instructions are stored as lengths and decoded again from the image bytes on load, on all
+threads (a decode that does not reproduce a stored length is a miss). The header carries the key,
+the payload length and an FNV-1a 64 of the payload; a truncated or damaged entry is a miss.
+Writes go through a temporary and a rename; the newest 3 entries per module are kept (a hit
+touches its entry). The game executable's entry is 126 MB.
+
+`--verify-discovery-cache` runs discovery anyway, compares it with the stored entry (every field,
+every instruction with `eq_all_bits`, since `Instruction`'s `PartialEq` ignores IP and length) and
+with its own encode/decode round trip, and fails the build on a difference. Verified on the game
+executable (435,719 functions, 23.5M instructions): identical. The pipeline tests check that the
+outputs are byte-identical cold, warm, verified and after damaged entries
+(`pipeline::tests::discovery_cache_*`).
+
+Measured on the game executable's `main` module (24 threads; discovery alone, no lift):
+
+| Change | Discovery before | Discovery after |
+|---|---|---|
+| none (rebuild after a change outside the recompiler, e.g. a shim header) | 147 s | 1.1 s (hit) |
+| one lifter instruction (`popcnt` ZF `icmp eq x, 0` -> `icmp ult x, 1`) | 147 s | 0.9 s (hit) |
+| one jump-table rule (`MAX_INFERRED_ENTRIES` 4096 -> 256) | 147 s | 155 s (miss, +~10 s to store) |
+
+A miss costs the uncached time plus the encode and write (about 10 to 20 s, within the run to run
+noise of discovery itself).
+
 ## Measurements
 
 Game executable `main` module: 435,719 functions, 23.5M instructions. 24 hardware threads,
@@ -126,8 +182,10 @@ What this shows:
 
 ## Limits and next steps
 
-- Discovery is not cached: every recompiler change pays it (2 to 6 minutes). Caching the
-  analysis would need a serialized `discover::Analysis` keyed by the discovery sources.
+- Discovery is cached per module, but any change to the discovery sources (the jump-table,
+  reach, CFG or refinement rules, and conservatively every other non-lifter source such as the
+  reports) re-runs it in full. Narrower keys (per source file actually reached) or an incremental
+  fixpoint would be the next step.
 - Lifter edits re-lift everything (cheap) because the codegen version is crate-wide; per-module
   versions (for example SIMD lowering only for functions with vector instructions) would need the
   lifter to report which modules a function used.

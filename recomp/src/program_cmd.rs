@@ -39,9 +39,24 @@ pub struct ProgramArgs {
     pub probe_functions: Option<PathBuf>,
     /// Shard lift cache directory (`--lift-cache`).
     pub lift_cache: Option<PathBuf>,
+    /// Discovery cache (`--discovery-cache <dir>|off`): `None` is the default,
+    /// `<lift cache>/discovery` with `--lift-cache` and none without; `Some(None)` is `off`.
+    pub discovery_cache: Option<Option<PathBuf>>,
+    /// `--verify-discovery-cache`.
+    pub verify_discovery_cache: bool,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>] [--lift-cache <dir>]";
+impl ProgramArgs {
+    /// The discovery cache directory in effect (see [`Self::discovery_cache`]).
+    pub fn discovery_cache_dir(&self) -> Option<PathBuf> {
+        match &self.discovery_cache {
+            Some(dir) => dir.clone(),
+            None => self.lift_cache.as_ref().map(|d| d.join("discovery")),
+        }
+    }
+}
+
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>] [--lift-cache <dir>] [--discovery-cache <dir>|off] [--verify-discovery-cache]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
@@ -58,6 +73,8 @@ pub const OPTIONS: &[&str] = &[
     "  --seed-report <file>   build-program: with --seed-targets, a JSON line per module: rejected targets and targets inside functions with unresolved jump tables",
     "  --probe-functions <file> build-program: hex function entry VAs (one per line) that call the runtime's __playgta6_probe_hit on entry, so direct calls are counted too; keep the file outside git",
     "  --lift-cache <dir>     build-program: reuse lifted shards whose functions, flag summaries and lifter version are unchanged (content-keyed, outside git; see docs/BUILD_CACHING.md)",
+    "  --discovery-cache <dir>|off build-program: skip discovery for a module whose input bytes, seeds and discovery sources are unchanged (default <lift cache>/discovery with --lift-cache; see docs/BUILD_CACHING.md)",
+    "  --verify-discovery-cache build-program: run discovery anyway and fail if the discovery cache entry differs from it",
     "  --address-pool <lo>-<hi> build-program: hex range every module image must lie in (default 0x100000000-0x400000000)",
 ];
 
@@ -86,6 +103,8 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         seed_report: None,
         probe_functions: None,
         lift_cache: None,
+        discovery_cache: None,
+        verify_discovery_cache: false,
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -162,6 +181,15 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
                 i += 1;
                 parsed.lift_cache = Some(PathBuf::from(value(i, flag, "<dir>")?));
             }
+            "--discovery-cache" => {
+                i += 1;
+                let dir = value(i, flag, "<dir>|off")?;
+                parsed.discovery_cache = Some(match dir.to_ascii_lowercase().as_str() {
+                    "off" | "none" | "0" => None,
+                    _ => Some(PathBuf::from(dir)),
+                });
+            }
+            "--verify-discovery-cache" => parsed.verify_discovery_cache = true,
             "--seed-report" => {
                 i += 1;
                 parsed.seed_report = Some(PathBuf::from(value(i, flag, "<file>")?));
@@ -296,6 +324,11 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
             .map_err(|e| format!("{}: {e}", file.display()))?;
     }
     build.lift_cache = args.lift_cache.clone();
+    build.discovery_cache = args.discovery_cache_dir();
+    build.verify_discovery_cache = args.verify_discovery_cache;
+    if build.verify_discovery_cache && build.discovery_cache.is_none() {
+        return Err("--verify-discovery-cache needs a discovery cache (--discovery-cache or --lift-cache)".into());
+    }
     let start = Instant::now();
     let report = program::build_program(&options, &mut |module, stage| {
         let module = if module.is_empty() { "program" } else { module };

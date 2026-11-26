@@ -112,6 +112,7 @@
 //! shared by several functions is lifted into, and counted for, each), terminator and diagnostic
 //! counts are per unique block. Hashes are 64-bit FNV-1a (the [`image::fnv1a_64`] parameters).
 
+pub mod discovery_cache;
 mod hygiene;
 pub mod program;
 pub mod refine;
@@ -312,6 +313,13 @@ pub struct PipelineOptions {
     /// Shard lift cache directory (`--lift-cache`, see [`shard_lift`]): shards whose key is
     /// there are linked in instead of lifted. Never affects the outputs.
     pub lift_cache: Option<PathBuf>,
+    /// Discovery cache directory (`--discovery-cache`, see [`discovery_cache`]): a module whose
+    /// discovery inputs and discovery sources are unchanged skips discovery. Never affects the
+    /// outputs.
+    pub discovery_cache: Option<PathBuf>,
+    /// With [`Self::discovery_cache`]: run discovery anyway and fail when the stored entry (or
+    /// the encode/decode round trip) differs from it (`--verify-discovery-cache`).
+    pub verify_discovery_cache: bool,
 }
 
 /// Parses a `--probe-functions` file: one hexadecimal VA per line (optional `0x`), anything after
@@ -356,6 +364,8 @@ impl PipelineOptions {
             memory: MemoryModel::default(),
             indirect_dispatch: IndirectDispatch::default(),
             lift_cache: None,
+            discovery_cache: None,
+            verify_discovery_cache: false,
         }
     }
 
@@ -1518,8 +1528,29 @@ pub fn run_module(
         .extend(options.extra_entries.iter().copied());
     seeded.image.entry_points.sort_unstable();
     seeded.image.entry_points.dedup();
-    let (mut analysis, mut code_pointers) =
-        refine::discover_refined(&mut seeded.image, &guest.image);
+    let cache = options.discovery_cache.as_ref().map(|dir| {
+        discovery_cache::DiscoveryCache::new(dir, &options.module, options.verify_discovery_cache)
+    });
+    let cache_key = cache.as_ref().map(|_| {
+        discovery_cache::stage_key(
+            &input.bytes,
+            prefilled.as_deref(),
+            &options.image,
+            &seeded.image,
+        )
+    });
+    let mut cache_outcomes = Vec::new();
+    let mut refined = |image: &mut CodeImage<'_>, key: Option<u128>| match (&cache, key) {
+        (Some(cache), Some(key)) => {
+            let (analysis, code_pointers, outcome) = cache
+                .discover_refined(key, image, &guest.image)
+                .map_err(PipelineError::Options)?;
+            cache_outcomes.push(outcome.as_str());
+            Ok::<_, PipelineError>((analysis, code_pointers))
+        }
+        _ => Ok(refine::discover_refined(image, &guest.image)),
+    };
+    let (mut analysis, mut code_pointers) = refined(&mut seeded.image, cache_key)?;
     if let Some(seeds) = &options.trace_seeds {
         let outcome = crate::trace_seed::evaluate(&seeded.image, &analysis, seeds);
         let accepted = outcome.accepted();
@@ -1539,11 +1570,16 @@ pub fn run_module(
             )))?;
         }
         if !accepted.is_empty() {
+            let key = cache_key.map(|k| discovery_cache::seeded_key(k, &accepted));
             seeded.image.entry_points.extend(accepted);
             seeded.image.entry_points.sort_unstable();
             seeded.image.entry_points.dedup();
-            (analysis, code_pointers) = refine::discover_refined(&mut seeded.image, &guest.image);
+            (analysis, code_pointers) = refined(&mut seeded.image, key)?;
         }
+    }
+    drop(refined);
+    if !cache_outcomes.is_empty() {
+        progress(&format!("discovery cache: {};", cache_outcomes.join(", ")));
     }
     let discovery = DiscoveryStats::new(&seeded.image, &analysis, code_pointers.rounds);
     let pdata = PdataStats::new(&seeded.pdata, &seeded.image);

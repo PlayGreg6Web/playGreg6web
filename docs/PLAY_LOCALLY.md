@@ -285,6 +285,7 @@ object cache (`<object cache>-lift`, `<object cache>-recomp`):
 |---|---|---|
 | `recomp` (cargo release build, cold in a fresh worktree) | a binary for the same recompiler sources is cached; or the stamp `target/release/playgta6-recomp.key` matches | sha256 of every workspace crate's `src/`, manifests, `build.rs`, `Cargo.lock`, plus `rustc -vV` |
 | `program` (discovery + lift) | the lift cache has the entry, or `program/.lift-key` matches (#1475) | recompiler sources, exe, offered DLLs, shim headers, lift options |
+| `program`, discovery per module (on a whole-program miss) | `<shard lift cache>/discovery` has the module's entry | discovery sources (all but the lifter) + `rustc -vV`, module and guest image bytes, seeds ([BUILD_CACHING.md](BUILD_CACHING.md)) |
 | `program`, per shard (on a whole-program miss) | the shard lift cache `<object cache>-lift-shards` has the shard | per shard: its functions' CFGs and callee flag summaries, lifter source hash, target, memory model, dispatch, probes ([BUILD_CACHING.md](BUILD_CACHING.md)) |
 | `harness` (~389 shards) | the object cache has every shard object | per shard: IR hash, target triple, CPU, `-O` level, PIC mode, LLVM tool version, retarget code fingerprint |
 

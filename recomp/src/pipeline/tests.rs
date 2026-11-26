@@ -2177,3 +2177,175 @@ fn stable_shard_plan_confines_a_change_to_its_neighbourhood() {
         }
     }
 }
+
+/// Runs `options`, returning the `discovery cache: ...` progress line (empty without a cache).
+fn run_discovery_cached(options: &PipelineOptions) -> String {
+    let mut line = String::new();
+    run_with_progress(options, &mut |stage| {
+        if stage.starts_with("discovery cache:") {
+            line = stage.to_string();
+        }
+    })
+    .expect("build succeeds");
+    line
+}
+
+fn discovery_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    out.retain(|p| p.extension().is_some_and(|e| e == "disc"));
+    out.sort();
+    out
+}
+
+#[test]
+fn discovery_cache_hits_with_byte_identical_outputs() {
+    let tmp = TempDir::new("discovery_cache");
+    let cache = tmp.path().join("discovery");
+    let (pe, _) = basic_fixture(true);
+
+    let mut plain = options_for(tmp.path(), &pe);
+    plain.out_dir = tmp.path().join("plain");
+    assert_eq!(run_discovery_cached(&plain), "");
+    let expected = read_tree(&plain.module_dir());
+
+    let mut cached = options_for(tmp.path(), &pe);
+    cached.out_dir = tmp.path().join("cached");
+    cached.discovery_cache = Some(cache.clone());
+    assert_eq!(run_discovery_cached(&cached), "discovery cache: miss;");
+    assert_eq!(read_tree(&cached.module_dir()), expected, "cold run");
+    assert_eq!(discovery_entries(&cache).len(), 1);
+    assert_eq!(run_discovery_cached(&cached), "discovery cache: hit;");
+    assert_eq!(read_tree(&cached.module_dir()), expected, "warm run");
+
+    cached.verify_discovery_cache = true;
+    assert_eq!(
+        run_discovery_cached(&cached),
+        "discovery cache: verified against the stored entry;"
+    );
+    assert_eq!(read_tree(&cached.module_dir()), expected, "verified run");
+    cached.verify_discovery_cache = false;
+
+    // Different input bytes are a different key.
+    let other = chain_fixture(40, true);
+    let mut changed = options_for(&tmp.path().join("other"), &other);
+    changed.discovery_cache = Some(cache.clone());
+    assert_eq!(run_discovery_cached(&changed), "discovery cache: miss;");
+    assert_eq!(discovery_entries(&cache).len(), 2);
+
+    // A damaged entry (truncated, or a flipped payload byte) is a miss, never a wrong analysis.
+    for (n, damage) in [
+        |b: &mut Vec<u8>| b.truncate(b.len() / 2),
+        |b: &mut Vec<u8>| {
+            let last = b.len() - 1;
+            b[last] ^= 1;
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for path in discovery_entries(&cache) {
+            let mut bytes = fs::read(&path).expect("read entry");
+            damage(&mut bytes);
+            fs::write(&path, bytes).expect("damage entry");
+        }
+        assert_eq!(run_discovery_cached(&cached), "discovery cache: miss;", "damage {n}");
+        assert_eq!(read_tree(&cached.module_dir()), expected, "damage {n}");
+        assert_eq!(run_discovery_cached(&cached), "discovery cache: hit;", "damage {n}");
+    }
+}
+
+#[test]
+fn discovery_cache_keeps_the_newest_entries_per_module() {
+    let tmp = TempDir::new("discovery_cache_trim");
+    let cache = tmp.path().join("discovery");
+    for i in 0..(discovery_cache::KEEP_PER_MODULE + 2) {
+        let pe = chain_fixture(4 + i, false);
+        let mut options = options_for(&tmp.path().join(format!("v{i}")), &pe);
+        options.discovery_cache = Some(cache.clone());
+        assert_eq!(run_discovery_cached(&options), "discovery cache: miss;");
+    }
+    assert_eq!(
+        discovery_entries(&cache).len(),
+        discovery_cache::KEEP_PER_MODULE
+    );
+}
+
+#[test]
+fn discovery_cache_round_trips_every_field() {
+    use crate::cfg::{JumpTable, JumpTableIndex, UnresolvedJump};
+    use crate::code_image::CodeSection;
+    use discovery_cache::{Discovered, decode, encode, same};
+
+    // push rbx; mov eax, [rcx+8]; lea rdx, [rip+0x10]; cmp eax, 3; ja +2; jmp rax; int3; ret
+    let code: &[u8] = &[
+        0x53, 0x8B, 0x41, 0x08, 0x48, 0x8D, 0x15, 0x10, 0x00, 0x00, 0x00, 0x83, 0xF8, 0x03,
+        0x77, 0x02, 0xFF, 0xE0, 0xCC, 0xC3, 0xC3,
+    ];
+    let image = CodeImage::new(0x1000, vec![CodeSection::new(T, code, true)], vec![T]);
+    let mut analysis = discover(&image);
+    assert!(!analysis.functions.is_empty());
+    let table = JumpTable {
+        site: T + 0x10,
+        load_site: T + 1,
+        table: D + 0x20,
+        targets: vec![T + 0x12, T + 0x13, T + 0x12],
+        index: Some(JumpTableIndex {
+            load_site: T + 4,
+            table: D,
+            len: 7,
+        }),
+        inferred: true,
+        alternates: vec![JumpTable {
+            site: T + 0x10,
+            load_site: T + 1,
+            table: D + 0x40,
+            targets: vec![T],
+            index: None,
+            inferred: false,
+            alternates: Vec::new(),
+        }],
+    };
+    analysis.jump_tables.insert(T + 0x10, table);
+    for (i, why) in UnresolvedJump::ALL.into_iter().enumerate() {
+        analysis.unresolved_jumps.insert(T + i as u64, why);
+    }
+    analysis.pointer_slots.insert(T + 0x10, (D + 8, T + 0x13));
+    // A block whose instructions are not stored back to back (explicit IPs).
+    let f = analysis.functions.values_mut().next().expect("function");
+    let block = f.blocks.values_mut().next().expect("block");
+    if block.instructions.len() >= 2 {
+        block.instructions.remove(0);
+    }
+    let code_pointers = refine::CodePointerOutcome {
+        rounds: 3,
+        round_limit_hit: true,
+        no_return_thunks: vec![T + 0x13],
+        pointers: vec![refine::CodePointer {
+            va: T + 0x13,
+            sources: [PointerSource::Lea, PointerSource::BaseReloc].into(),
+            status: PointerStatus::Implausible,
+            lifted: false,
+        }],
+    };
+    let d = Discovered {
+        analysis,
+        code_pointers,
+        entry_points: vec![T, T + 0x13],
+        no_return: vec![D + 8],
+    };
+    let payload = encode(&d);
+    let back = decode(&payload, &image).expect("decodes");
+    same(&d, &back).expect("identical");
+    assert_eq!(d, back);
+    // Truncated payloads never decode to something else.
+    for cut in 0..payload.len() {
+        assert!(decode(&payload[..cut], &image).is_none(), "cut {cut}");
+    }
+    // Different code bytes under the stored lengths do not decode.
+    let other: Vec<u8> = code.iter().map(|_| 0x90).collect();
+    let other_image = CodeImage::new(0x1000, vec![CodeSection::new(T, &other, true)], vec![T]);
+    let mismatch = decode(&payload, &other_image);
+    assert!(mismatch.is_none_or(|m| same(&d, &m).is_err()));
+}
