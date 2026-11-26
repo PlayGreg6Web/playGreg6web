@@ -55,6 +55,7 @@ use crate::cfg::{
 };
 use crate::code_image::CodeImage;
 use crate::jump_table::{self, Step};
+use crate::pointer_slot;
 use crate::reach;
 use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
 
@@ -103,6 +104,11 @@ pub struct Analysis {
     /// Why each indirect `jmp` without an import slot that is left to run-time dispatch did not
     /// resolve, keyed by its VA.
     pub unresolved_jumps: BTreeMap<u64, UnresolvedJump>,
+    /// Unresolved tail-call `jmp`s whose pointer is loaded from a statically initialised,
+    /// relocated slot (`mov reg, [rip+slot]` ... `jmp reg`), keyed by the jump's VA. The value is
+    /// `(slot, initial code target)`; the target was seeded as a function entry. The jump itself
+    /// still leaves through the run-time dispatcher, since the slot can be rewritten.
+    pub pointer_slots: BTreeMap<u64, (u64, u64)>,
 }
 
 impl Analysis {
@@ -147,13 +153,16 @@ pub fn discover_with_threads(image: &CodeImage<'_>, threads: usize) -> Analysis 
         while state.resolve_jump_tables() || state.revise_jump_tables() {
             state.run();
         }
-        if !state.add_late_resume_targets() {
+        let late = state.add_late_resume_targets();
+        let seeded = state.seed_pointer_slots();
+        if !late && !seeded {
             break;
         }
         state.run();
     }
     state.verify_jump_tables();
     let unresolved_jumps = state.classify_unresolved_jumps();
+    let pointer_slots = std::mem::take(&mut state.pointer_slots);
 
     let blocks: Vec<&BasicBlock> = state.blocks.values().collect();
     let mut relocations: Vec<Relocation> = par_map(threads, &blocks, |block| {
@@ -177,6 +186,7 @@ pub fn discover_with_threads(image: &CodeImage<'_>, threads: usize) -> Analysis 
         relocations,
         jump_tables,
         unresolved_jumps,
+        pointer_slots,
     }
 }
 
@@ -269,6 +279,10 @@ struct Discovery<'i, 'a> {
     deferred_resume_targets: BTreeSet<(u64, u64)>,
     /// Return sites of `setjmp`-family calls (owned by every function containing the block).
     return_sites: BTreeSet<u64>,
+    /// Pointer-slot tail calls seen so far: jump VA -> `(slot, seeded target)`.
+    pointer_slots: BTreeMap<u64, (u64, u64)>,
+    /// Unresolved jumps whose pointer slot was already seeded by `seed_pointer_slots`.
+    slot_checked: BTreeSet<u64>,
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
@@ -289,6 +303,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             resume_targets: BTreeSet::new(),
             deferred_resume_targets: BTreeSet::new(),
             return_sites: BTreeSet::new(),
+            pointer_slots: BTreeMap::new(),
+            slot_checked: BTreeSet::new(),
         }
     }
 
@@ -901,6 +917,44 @@ impl<'i, 'a> Discovery<'i, 'a> {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// Tail calls through a pointer loaded from a statically initialised slot: when the slot
+    /// holds a relocated code address, that address is a real function entry, so seed it ahead
+    /// of time. The jump stays on run-time dispatch. Returns whether any new entry was added.
+    fn seed_pointer_slots(&mut self) -> bool {
+        let preds = self.predecessors();
+        let jumps: Vec<u64> = self
+            .blocks
+            .values()
+            .filter(|block| {
+                block.terminator == Terminator::IndirectJump
+                    && block
+                        .successors
+                        .contains(&Edge::IndirectJump { slot: None })
+            })
+            .filter_map(|block| block.instructions.last().map(Instruction::ip))
+            .filter(|site| !self.slot_checked.contains(site))
+            .collect();
+        let found: Vec<(u64, Option<(u64, u64)>)> = par_map(self.threads, &jumps, |&site| {
+            let hit = self.jump_trace(site, &preds).and_then(|(trace, _)| {
+                let instrs: Vec<&Instruction> = trace.iter().map(|s| s.instr).collect();
+                pointer_slot::static_target(self.image, &instrs)
+            });
+            (site, hit)
+        });
+        let mut progress = false;
+        for (site, hit) in found {
+            if let Some((slot, target)) = hit {
+                self.slot_checked.insert(site);
+                self.pointer_slots.insert(site, (slot, target));
+                if !self.entries.contains(&target) {
+                    self.add_function(target);
+                    progress = true;
+                }
+            }
+        }
+        progress
     }
 
     /// Try every jump decoded since the last round. Returns whether any table was resolved.

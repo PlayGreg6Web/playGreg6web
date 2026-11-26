@@ -94,6 +94,8 @@ pub struct JumpSurvey {
     pub reachable_unresolved: usize,
     pub functions_total: usize,
     pub functions_reachable: usize,
+    /// Unresolved jumps whose pointer slot is statically initialised (target seeded as an entry).
+    pub pointer_slot_jumps: usize,
     pub by_reason: BTreeMap<&'static str, usize>,
     /// Ranked: reachable desc, total desc, label.
     pub patterns: Vec<(Pattern, Group)>,
@@ -413,6 +415,7 @@ pub fn survey_jumps(layout: &Layout, analysis: &Analysis, roots: &[u64], top: us
     let mut survey = JumpSurvey {
         functions_total: analysis.functions.len(),
         functions_reachable: depth.len(),
+        pointer_slot_jumps: analysis.pointer_slots.len(),
         ..Default::default()
     };
     let mut groups: BTreeMap<Pattern, Group> = BTreeMap::new();
@@ -491,6 +494,11 @@ pub fn render(s: &JumpSurvey, examples: usize) -> String {
         o,
         "unresolved jumps: {} total, {} in functions reachable from boot ({} of {} functions, direct calls and tail calls only)",
         s.total_unresolved, s.reachable_unresolved, s.functions_reachable, s.functions_total
+    );
+    let _ = writeln!(
+        o,
+        "pointer-slot tail calls with a statically seeded target: {}",
+        s.pointer_slot_jumps
     );
     let _ = writeln!(o, "by lifter reason:");
     for (k, v) in &s.by_reason {

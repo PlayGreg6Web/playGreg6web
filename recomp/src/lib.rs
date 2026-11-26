@@ -8,6 +8,7 @@ pub mod eh;
 pub mod image;
 pub mod jump_survey;
 mod jump_table;
+mod pointer_slot;
 mod reach;
 pub mod lift;
 pub mod pdata;

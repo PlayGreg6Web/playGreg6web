@@ -168,6 +168,10 @@ pub struct CodeImage<'a> {
     /// Exception-handling seeds (resume targets, `setjmp` slots; see
     /// [`crate::eh::EhMetadata::seed`]); empty when unknown.
     pub eh: EhSeeds,
+    /// VAs of 64-bit base-relocation (`DIR64`) sites in non-executable sections: the pointer
+    /// slots the loader rewrites. Empty when unknown (see [`Self::from_pe`]); a pointer slot
+    /// whose initial value is a code address is only trusted when it is listed here.
+    pub data_relocs: std::collections::BTreeSet<u64>,
 }
 
 impl<'a> CodeImage<'a> {
@@ -209,6 +213,7 @@ impl<'a> CodeImage<'a> {
             no_return: Vec::new(),
             function_table: FunctionTable::default(),
             eh: EhSeeds::default(),
+            data_relocs: Default::default(),
         }
     }
 
@@ -275,6 +280,16 @@ impl<'a> CodeImage<'a> {
         entries.sort_unstable();
         entries.dedup();
         image.entry_points = entries;
+        if let Ok(table) = crate::reloc::BaseRelocTable::from_pe(pe, file) {
+            let relocs: std::collections::BTreeSet<u64> = table
+                .sites()
+                .iter()
+                .filter(|site| site.kind == crate::reloc::BaseRelocType::Dir64)
+                .filter_map(|site| site.checked_va(base))
+                .filter(|&va| image.region_of(va) == Region::Data)
+                .collect();
+            image.data_relocs = relocs;
+        }
         image
     }
 

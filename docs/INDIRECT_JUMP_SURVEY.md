@@ -37,3 +37,16 @@ Equality guards are null/sentinel checks of lazily initialised function pointers
 Shallowest boot-reachable functions holding such jumps (entry, call depth): 0x144eacc70 (4),
 0x1428cb1e0 (5), 0x140093420 (7, 247 callers), 0x140104070 (7), 0x144fc2180 (8, 650 callers),
 0x14321dc10 (8), 0x141148da0 (9), 0x1402e5b80 (11, 1,986 callers, 3 sites).
+
+## Pointer-slot tail calls (backlog 43)
+
+The lifter already lowers every unresolved `jmp` as a tail call through the run-time dispatcher
+(lifted-function lookup by the runtime target, existing unknown-target path). Discovery additionally
+looks for `mov reg, [rip+slot]` ... `jmp reg` where `slot` is a base-relocated `DIR64` pointer in a
+data section holding a code address, and seeds that address as a function entry
+(`Analysis::pointer_slots`, `recomp/src/pointer_slot.rs`). Slots without a base relocation or with a
+non-code value are ignored; the jump stays on run-time dispatch because the slot can be rewritten.
+On the target executable 4 jumps have such a slot, and their targets were already entries through
+the refined relocated-pointer seeding (function count unchanged at 435,718); the survey prints the
+count as `pointer-slot tail calls with a statically seeded target`. The other ~8,200 go through
+pointers loaded via another loaded pointer or a register, which no static slot describes.

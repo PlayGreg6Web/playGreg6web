@@ -685,6 +685,7 @@ pub fn discover_refined_with_max_rounds(
             relocations: RelocationMap::default(),
             jump_tables: BTreeMap::new(),
             unresolved_jumps: BTreeMap::new(),
+            pointer_slots: BTreeMap::new(),
         };
         let outcome = CodePointerOutcome {
             rounds: 0,
@@ -1226,6 +1227,7 @@ mod probe_tests {
             }]),
             jump_tables: BTreeMap::new(),
             unresolved_jumps: BTreeMap::new(),
+            pointer_slots: BTreeMap::new(),
         };
         let slot_check = check_import_slots(&pe, &plan, &analysis);
         assert_eq!(slot_check.slot_reads, 1);
@@ -1297,6 +1299,7 @@ mod probe_tests {
             relocations: RelocationMap::default(),
             jump_tables: BTreeMap::new(),
             unresolved_jumps: BTreeMap::new(),
+            pointer_slots: BTreeMap::new(),
         };
         let outer = JumpTable {
             site: TEXT,
@@ -1344,6 +1347,7 @@ mod probe_tests {
             relocations: RelocationMap::default(),
             jump_tables: BTreeMap::new(),
             unresolved_jumps: BTreeMap::new(),
+            pointer_slots: BTreeMap::new(),
         };
         // Insert with swapped keys to change iteration order.
         let mut outer_swapped = outer;
@@ -1445,6 +1449,7 @@ mod probe_tests {
             ]),
             jump_tables: BTreeMap::new(),
             unresolved_jumps: BTreeMap::new(),
+            pointer_slots: BTreeMap::new(),
         };
         let check_a = check_import_slots(&pe_a, &plan, &analysis);
         let check_b = check_import_slots(&pe_b, &plan, &analysis);
