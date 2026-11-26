@@ -46,7 +46,7 @@ play_native.ps1: build (if stale) and play natively.
   -PresentMode   auto|fifo|mailbox|immediate     -MaxFps N  (0 = off)
   -Record        save real input to %LOCALAPPDATA%\playgta6ecordings   -Keymap <file>  rebind keys
   -NoBuild / -TrustBuild / -DryRun / -Name <run>
-  Keys: WASD stick, Enter/Space A, Backspace B, Tab View, Esc Menu, F11 fullscreen.
+  Keys: WASD stick, Enter/Space A, Backspace B, Tab View, Esc Menu, F11 fullscreen, F12 screenshot.
   Docs: docs/PLAY_LOCALLY.md
 "@ | Write-Host
     exit 0

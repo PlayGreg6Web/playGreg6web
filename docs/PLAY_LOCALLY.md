@@ -35,9 +35,10 @@ stale and opens the game window. Add `-FreshSetup` to see the setup screens agai
 | Z / C | LT / RT |
 | Tab / Esc | View / Menu |
 | F11 | Toggle borderless fullscreen |
+| F12 | Save a screenshot (PNG) to `%LOCALAPPDATA%\playgta6\screenshots` |
 
 Rebind anything in `%LOCALAPPDATA%\playgta6\keymap.ini` (written on first run; see "Rebinding keys" below), or point at
-another file with `-Keymap <file>`. There is no screenshot or mouse-release key yet.
+another file with `-Keymap <file>`. There is no mouse-release key yet.
 
 **Useful switches:** `-PresentMode auto|fifo|mailbox|immediate`, `-MaxFps N` (cap the window present rate, 0 = off),
 `-Record` (save your real input to `%LOCALAPPDATA%\playgta6\recordings\`), `-Keymap <file>`, `-FreshSetup`, `-NoBuild`,
