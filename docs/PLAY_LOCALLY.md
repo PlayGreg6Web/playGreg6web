@@ -285,9 +285,13 @@ object cache (`<object cache>-lift`, `<object cache>-recomp`):
 |---|---|---|
 | `recomp` (cargo release build, cold in a fresh worktree) | a binary for the same recompiler sources is cached; or the stamp `target/release/playgta6-recomp.key` matches | sha256 of every workspace crate's `src/`, manifests, `build.rs`, `Cargo.lock`, plus `rustc -vV` |
 | `program` (discovery + lift) | the lift cache has the entry, or `program/.lift-key` matches (#1475) | recompiler sources, exe, offered DLLs, shim headers, lift options |
+| `program`, per shard (on a whole-program miss) | the shard lift cache `<object cache>-lift-shards` has the shard | per shard: its functions' CFGs and callee flag summaries, lifter source hash, target, memory model, dispatch, probes ([BUILD_CACHING.md](BUILD_CACHING.md)) |
 | `harness` (~389 shards) | the object cache has every shard object | per shard: IR hash, target triple, CPU, `-O` level, PIC mode, LLVM tool version, retarget code fingerprint |
 
-Overrides: `PLAYGTA6_RECOMP_CACHE=<dir>|off`, `PLAYGTA6_LIFT_CACHE=<dir>|off`, `--cache-dir`.
+Overrides: `PLAYGTA6_RECOMP_CACHE=<dir>|off`, `PLAYGTA6_LIFT_CACHE=<dir>|off`,
+`PLAYGTA6_SHARD_LIFT_CACHE=<dir>|off` (size cap `PLAYGTA6_SHARD_LIFT_CACHE_GB`, default 24), `--cache-dir`.
+Shards are cut at hash-chosen anchor functions, so a recompiler change recompiles only the shard objects
+whose functions it changed ([BUILD_CACHING.md](BUILD_CACHING.md)).
 Caches hold only hashes, binaries and generated IR, never game bytes in git.
 
 **Build-dir lock.** A run holds `<build-dir>/.build.lock` (heartbeat-kept, taken over after

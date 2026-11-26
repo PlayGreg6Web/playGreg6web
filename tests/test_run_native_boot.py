@@ -127,6 +127,38 @@ class LiftCacheTests(unittest.TestCase):
             self.assertEqual(len(seen), 5)
             self.assertEqual(rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg, ["--target", "native"]), key())
 
+    def test_a_lift_uses_and_trims_the_shard_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 100)
+            shards = Path(d) / "shards"
+            seen = []
+
+            def lifting_runner(cmd, cwd, log, timeout):
+                if len(cmd) > 1 and cmd[1] == "build-program":
+                    seen.append(cmd)
+                    out = Path(cmd[cmd.index("--out") + 1])
+                    (out / "main" / "lift").mkdir(parents=True)
+                    (out / "program-manifest.json").write_text("{}")
+                    cache = Path(cmd[cmd.index("--lift-cache") + 1])
+                    cache.mkdir(parents=True, exist_ok=True)
+                    (cache / ("0" * 32 + ".tmp")).write_text("x")
+                    os.utime(cache / ("0" * 32 + ".tmp"), (1, 1))  # a stale temporary: trimmed
+                return 0 if log is None else rnb.run_command(cmd, cwd, log, timeout)
+
+            env = {rnb.LIFT_CACHE_ENV: str(fx.lift_cache), "PLAYGTA6_RECOMP_CACHE": "off",
+                   rnb.SHARD_CACHE_ENV: str(shards)}
+            code, _, err, _ = fx.run("--name", "s1", runner=lifting_runner, env=env)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][seen[0].index("--lift-cache") + 1], str(shards.resolve()))
+            self.assertEqual(list(shards.iterdir()), [])
+            # Default: beside the lift cache; "off" drops the option.
+            self.assertEqual(rnb.shard_cache_dir(Path("/c/objcache-lift"), {}), Path("/c/objcache-lift-shards"))
+            self.assertIsNone(rnb.shard_cache_dir(Path("/c/objcache-lift"), {rnb.SHARD_CACHE_ENV: "off"}))
+            self.assertIsNone(rnb.shard_cache_dir(None, {}))
+            self.assertEqual(rnb.shard_cache_args(None), [])
+
     def test_miss_stores_and_a_hit_skips_recomp_and_lift(self):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))

@@ -37,9 +37,11 @@ pub struct ProgramArgs {
     pub seed_report: Option<PathBuf>,
     /// File of function entry VAs that count their executions (`--probe-functions`).
     pub probe_functions: Option<PathBuf>,
+    /// Shard lift cache directory (`--lift-cache`).
+    pub lift_cache: Option<PathBuf>,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>] [--lift-cache <dir>]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
@@ -55,6 +57,7 @@ pub const OPTIONS: &[&str] = &[
     "  --seed-targets <file>  build-program: indirect-call targets recorded by a boot (playgta6_boot --record-indirect-targets); validated, then lifted as function entries",
     "  --seed-report <file>   build-program: with --seed-targets, a JSON line per module: rejected targets and targets inside functions with unresolved jump tables",
     "  --probe-functions <file> build-program: hex function entry VAs (one per line) that call the runtime's __playgta6_probe_hit on entry, so direct calls are counted too; keep the file outside git",
+    "  --lift-cache <dir>     build-program: reuse lifted shards whose functions, flag summaries and lifter version are unchanged (content-keyed, outside git; see docs/BUILD_CACHING.md)",
     "  --address-pool <lo>-<hi> build-program: hex range every module image must lie in (default 0x100000000-0x400000000)",
 ];
 
@@ -82,6 +85,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         seed_targets: None,
         seed_report: None,
         probe_functions: None,
+        lift_cache: None,
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -153,6 +157,10 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
             "--probe-functions" => {
                 i += 1;
                 parsed.probe_functions = Some(PathBuf::from(value(i, flag, "<file>")?));
+            }
+            "--lift-cache" => {
+                i += 1;
+                parsed.lift_cache = Some(PathBuf::from(value(i, flag, "<dir>")?));
             }
             "--seed-report" => {
                 i += 1;
@@ -287,6 +295,7 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
         build.probe_functions = playgta6_recomp::pipeline::parse_probe_functions(&text)
             .map_err(|e| format!("{}: {e}", file.display()))?;
     }
+    build.lift_cache = args.lift_cache.clone();
     let start = Instant::now();
     let report = program::build_program(&options, &mut |module, stage| {
         let module = if module.is_empty() { "program" } else { module };

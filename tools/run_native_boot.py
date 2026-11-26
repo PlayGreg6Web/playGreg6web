@@ -100,6 +100,7 @@ from lift_cache import (  # noqa: E402,F401 (re-exported for the tests)
     LIFT_CACHE_ENV, LIFT_CACHE_KEEP, LIFT_CACHE_KEEP_ENV, LIFT_CACHE_VERSION, LIFT_STAMP, PROGRAM_KEEP,
     clear_program, file_digest, lift_cache_dir, lift_cache_keep, lift_cache_restore, lift_cache_store,
     lift_inputs_key, lift_key, read_stamp, recomp_source_files, shim_inputs, workspace_dirs,
+    SHARD_CACHE_ENV, shard_cache_args, shard_cache_dir, shard_cache_max_bytes, trim_shard_cache,
 )
 
 TARGETS_ENV = "PLAYGTA6_INDIRECT_TARGETS"
@@ -334,11 +335,14 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
               lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP,
               recomp_cache: Path | None = None, toolchain: str | None = None,
               seed_targets: Path | None = None, native_executor: bool = False,
-              probe_functions: Path | None = None) -> tuple[Plan, Path, Path]:
+              probe_functions: Path | None = None, shard_cache: Path | None = None,
+              shard_cache_bytes: int = 0) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path. Objects go to
     `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts). With
     `lift_cache`, a stale program is first looked up there by the hash of its inputs: a hit is
-    linked in instead of building the recompiler and running discovery and the lift."""
+    linked in instead of building the recompiler and running discovery and the lift. With
+    `shard_cache`, a lift reuses every unchanged shard from it (`build-program --lift-cache`) and
+    trims it to `shard_cache_bytes` (<= 0: never) afterwards."""
     program = build_dir / "program"
     recomp = repo / "target" / "release" / ("playgta6-recomp" + EXE_SUFFIX)
     harness = harness_override or program / "native" / "bin" / ("playgta6_boot" + EXE_SUFFIX)
@@ -416,10 +420,19 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
     if reason:
         hooks = {}
         if key is not None:
-            hooks = {"before": lambda: clear_program(program),
-                     "after": lambda: lift_cache_store(lift_cache, key, program, keep)}
+            hooks = {"before": lambda: clear_program(program)}
+
+        def after() -> None:
+            if key is not None:
+                lift_cache_store(lift_cache, key, program, keep)
+            if shard_cache is not None and shard_cache_bytes > 0:
+                trim_shard_cache(shard_cache, shard_cache_bytes)
+
+        if key is not None or shard_cache is not None:
+            hooks["after"] = after
         plan.add("program", reason, [str(recomp), "build-program", str(exe), "--out", str(program),
-                                     "--dll-dir", str(game_dir), *lift_options, "--jobs", str(jobs)], **hooks)
+                                     "--dll-dir", str(game_dir), *lift_options, *shard_cache_args(shard_cache),
+                                     "--jobs", str(jobs)], **hooks)
 
     if harness_override is None:
         runtime_newest = newest_mtime(repo / "runtime", [repo / "tools" / "build_native_boot.py"])
@@ -1044,7 +1057,9 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
                                       args.rebuild_program, args.cache_dir, lift_cache,
                                       lift_cache_keep(env), recomp_cache, seed_targets=seed_file,
                                       native_executor=args.native_executor or args.play or live_run,
-                                      probe_functions=args.probe_functions)
+                                      probe_functions=args.probe_functions,
+                                      shard_cache=None if args.dry_run else shard_cache_dir(lift_cache, env),
+                                      shard_cache_bytes=shard_cache_max_bytes(env))
     if args.trust_build:
         plan.steps = []
     if args.play:

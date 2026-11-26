@@ -1445,7 +1445,11 @@ fn many_small_functions() {
     let report = run(&options).expect("build");
     assert_eq!(report.discovery.functions, count);
     assert_eq!(report.pdata.functions, count);
-    assert_eq!(report.lift.shards.len(), count.div_ceil(256));
+    // At most 256 functions per shard; an anchor (shard_lift::plan_shards_stable) may cut earlier.
+    let shards = &report.lift.shards;
+    assert!(shards.len() >= count.div_ceil(256) && shards.len() <= count.div_ceil(256) + 2);
+    assert!(shards.iter().all(|s| s.functions <= 256));
+    assert_eq!(shards.iter().map(|s| s.functions).sum::<usize>(), count);
     assert_eq!(report.lift.unsupported_total(), 0);
     let table =
         fs::read_to_string(options.module_dir().join(LIFT_DIR).join("functions.ll")).unwrap();
@@ -1868,4 +1872,308 @@ fn probe_function_list_parses_addresses_and_rejects_garbage() {
     assert!(super::parse_probe_functions("0x10
 nothex
 ").unwrap_err().contains("line 2"));
+}
+
+// ----- incremental lifting (shard_lift) ----------------------------------------------------------
+
+/// [`chain_fixture`] with function `changed` loading `value` instead of its index.
+fn chain_fixture_changed(count: usize, changed: usize, value: u32) -> Vec<u8> {
+    let mut a = Asm::new(T);
+    for i in 0..count {
+        a.mov_eax(if i == changed { value } else { i as u32 });
+        if i + 1 < count {
+            a.call(T + 16 * (i as u64 + 1));
+        }
+        a.ret();
+        a.pad_to(16 * (i as u64 + 1));
+    }
+    TestPe {
+        text: a.bytes,
+        ..TestPe::default()
+    }
+    .build()
+}
+
+/// Runs `options`, returning the report and the `lift cache: ...` progress line.
+fn run_cached(options: &PipelineOptions) -> (PipelineReport, String) {
+    let mut line = String::new();
+    let report = run_with_progress(options, &mut |stage| {
+        if stage.starts_with("lift cache:") {
+            line = stage.to_string();
+        }
+    })
+    .expect("build succeeds");
+    (report, line)
+}
+
+#[test]
+fn shard_lift_cache_reuses_unchanged_shards_with_identical_outputs() {
+    let tmp = TempDir::new("shard_cache");
+    let cache = tmp.path().join("shards");
+    let pe = chain_fixture(600, false);
+
+    let mut plain = options_for(tmp.path(), &pe);
+    plain.out_dir = tmp.path().join("plain");
+    plain.shard_size = 64;
+    run(&plain).expect("uncached build");
+
+    let mut cached = options_for(tmp.path(), &pe);
+    cached.out_dir = tmp.path().join("cached");
+    cached.shard_size = 64;
+    cached.lift_cache = Some(cache.clone());
+    let (_, cold) = run_cached(&cached);
+    assert!(
+        cold.contains(" 0/10 shards reused, 600 of 600 functions lifted"),
+        "{cold}"
+    );
+    assert_eq!(
+        read_tree(&plain.module_dir()),
+        read_tree(&cached.module_dir()),
+        "cold run"
+    );
+    let (_, warm) = run_cached(&cached);
+    assert!(
+        warm.contains(" 10/10 shards reused, 0 of 600 functions lifted"),
+        "{warm}"
+    );
+    assert_eq!(
+        read_tree(&plain.module_dir()),
+        read_tree(&cached.module_dir()),
+        "warm run"
+    );
+
+    // One function changes: only its shard is lifted again, the rest stays byte-identical.
+    let changed = chain_fixture_changed(600, 300, 0xdead);
+    let mut edit = options_for(&tmp.path().join("changed"), &changed);
+    edit.out_dir = tmp.path().join("edit");
+    edit.shard_size = 64;
+    edit.lift_cache = Some(cache.clone());
+    let (report, line) = run_cached(&edit);
+    assert!(
+        line.contains(" 9/10 shards reused, 64 of 600 functions lifted"),
+        "{line}"
+    );
+    let before = read_tree(&plain.module_dir());
+    let after = read_tree(&edit.module_dir());
+    let differing: Vec<&String> = report
+        .lift
+        .shards
+        .iter()
+        .map(|s| &s.ll.path)
+        .filter(|p| before.get(*p) != after.get(*p))
+        .collect();
+    assert_eq!(differing, [&"lift/shard-00004.ll".to_string()]);
+
+    // A damaged entry (IR shorter than recorded) is a miss, never a wrong shard.
+    for item in fs::read_dir(&cache).expect("list cache") {
+        let path = item.expect("entry").path();
+        if path.extension().is_some_and(|e| e == "ll") {
+            fs::remove_file(&path).expect("unlink");
+            fs::write(&path, b"truncated").expect("damage");
+        }
+    }
+    let (_, damaged) = run_cached(&cached);
+    assert!(damaged.contains(" 0/10 shards reused"), "{damaged}");
+    let (a, b) = (
+        read_tree(&plain.module_dir()),
+        read_tree(&cached.module_dir()),
+    );
+    let diff: Vec<&String> = a
+        .keys()
+        .chain(b.keys())
+        .filter(|k| a.get(*k) != b.get(*k))
+        .collect();
+    assert!(diff.is_empty(), "damaged cache: {diff:?}");
+}
+
+/// Discovers `pieces` (`(va, bytes)`, each an entry) as one code image.
+fn discover_pieces(pieces: &[(u64, &[u8])]) -> Analysis {
+    use crate::code_image::CodeSection;
+    let sections = pieces
+        .iter()
+        .map(|(va, bytes)| CodeSection::new(*va, bytes, true))
+        .collect();
+    let entries = pieces.iter().map(|(va, _)| *va).collect();
+    discover(&CodeImage::new(0x1000, sections, entries))
+}
+
+fn keys_of(analysis: &Analysis) -> BTreeMap<u64, u128> {
+    let summaries = lift::FlagSummaries::compute(analysis.functions.values());
+    analysis
+        .functions
+        .values()
+        .map(|f| (f.entry, shard_lift::function_key(f, &summaries)))
+        .collect()
+}
+
+#[test]
+fn function_keys_follow_the_cfg_and_the_callee_summaries_only() {
+    const A: u64 = 0x1000; // callee
+    const F: u64 = 0x2000; // caller: cmp eax, 1; call A; ret
+    const B: u64 = 0x3000; // unrelated
+    let rel = (A as i64 - (F as i64 + 3 + 5)) as i32;
+    let mut caller = vec![0x83, 0xF8, 0x01, 0xE8];
+    caller.extend_from_slice(&rel.to_le_bytes());
+    caller.push(0xC3);
+    let plain_ret: &[u8] = &[0xC3];
+    let reads_zf: &[u8] = &[0x0F, 0x94, 0xC0, 0xC3]; // setz al; ret
+    let b1: &[u8] = &[0xB8, 1, 0, 0, 0, 0xC3];
+    let b2: &[u8] = &[0xB8, 2, 0, 0, 0, 0xC3];
+
+    let base = keys_of(&discover_pieces(&[(A, plain_ret), (F, &caller), (B, b1)]));
+    assert_eq!(base.len(), 3);
+    assert_eq!(
+        base,
+        keys_of(&discover_pieces(&[(A, plain_ret), (F, &caller), (B, b1)])),
+        "deterministic"
+    );
+
+    // An unrelated function's code: only its own key moves.
+    let other = keys_of(&discover_pieces(&[(A, plain_ret), (F, &caller), (B, b2)]));
+    assert_eq!(other[&A], base[&A]);
+    assert_eq!(other[&F], base[&F]);
+    assert_ne!(other[&B], base[&B]);
+
+    // The callee now observes ZF on entry: the caller must store it before the call, so the
+    // caller's key moves too (its CFG is unchanged).
+    let callee = keys_of(&discover_pieces(&[(A, reads_zf), (F, &caller), (B, b1)]));
+    assert_ne!(callee[&A], base[&A]);
+    assert_ne!(
+        callee[&F], base[&F],
+        "callee summary is part of the caller's key"
+    );
+    assert_eq!(callee[&B], base[&B]);
+}
+
+#[test]
+fn shard_keys_cover_the_lifter_context() {
+    let analysis = discover_pieces(&[(0x1000, &[0xC3]), (0x2000, &[0xB8, 1, 0, 0, 0, 0xC3])]);
+    let functions: Vec<&Function> = analysis.functions.values().collect();
+    let keys: Vec<u128> = keys_of(&analysis).into_values().collect();
+    let none = BTreeSet::new();
+    let probed = BTreeSet::from([0x2000]);
+    let wasm = LiftTarget::Wasm64;
+    let native = LiftTarget::native_host();
+    let memory = MemoryModel::default();
+    let ctx = |target, probes| shard_lift::ShardContext {
+        target,
+        memory: &memory,
+        dispatch: None,
+        probes,
+    };
+    let base = shard_lift::shard_key(&ctx(&wasm, &none), &functions, &keys);
+    assert_eq!(
+        base,
+        shard_lift::shard_key(&ctx(&wasm, &none), &functions, &keys)
+    );
+    assert_ne!(
+        base,
+        shard_lift::shard_key(&ctx(&native, &none), &functions, &keys)
+    );
+    assert_ne!(
+        base,
+        shard_lift::shard_key(&ctx(&wasm, &probed), &functions, &keys)
+    );
+    assert_ne!(
+        base,
+        shard_lift::shard_key(&ctx(&wasm, &none), &functions[..1], &keys[..1])
+    );
+    let external = HashSet::from([0x1000]);
+    let with_dispatch = shard_lift::ShardContext {
+        dispatch: Some(ShardDispatch {
+            dispatcher_symbol: "__d0",
+            external_entries: &external,
+        }),
+        ..ctx(&wasm, &none)
+    };
+    assert_ne!(
+        base,
+        shard_lift::shard_key(&with_dispatch, &functions, &keys)
+    );
+    assert_eq!(shard_lift::LIFT_CODEGEN.len(), 32);
+}
+
+/// Deterministic pseudo-random function weights (mostly small, a few large).
+fn synthetic_weights(n: usize, seed: u64) -> Vec<usize> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (x >> 33) as usize;
+            if r % 50 == 0 {
+                500 + r % 4000
+            } else {
+                1 + r % 100
+            }
+        })
+        .collect()
+}
+
+fn shard_spans(entries: &[u64], plan: &[Range<usize>]) -> BTreeSet<(u64, u64)> {
+    plan.iter()
+        .map(|r| (entries[r.start], entries[r.end - 1]))
+        .collect()
+}
+
+#[test]
+fn stable_shard_plan_covers_every_function_within_the_budgets() {
+    assert!(shard_lift::plan_shards_stable(&[], &[], 8, 100).is_empty());
+    let n = 40_000;
+    let entries: Vec<u64> = (0..n as u64).map(|i| 0x1_4000_1000 + 16 * i).collect();
+    let weights = synthetic_weights(n, 7);
+    let plan = shard_lift::plan_shards_stable(&entries, &weights, 2048, 65536);
+    let mut next = 0;
+    for r in &plan {
+        assert_eq!(r.start, next);
+        assert!(r.end > r.start);
+        let total: usize = weights[r.clone()].iter().sum();
+        assert!(r.len() <= 2048);
+        assert!(total <= 65536 || r.len() == 1, "{r:?} {total}");
+        next = r.end;
+    }
+    assert_eq!(next, n);
+    // A heavier function gets a shard of its own, as with plan_shards.
+    let plan = shard_lift::plan_shards_stable(&[1, 2, 3], &[10, 500, 10], 8, 100);
+    assert_eq!(plan, [0..1, 1..2, 2..3]);
+}
+
+#[test]
+fn stable_shard_plan_confines_a_change_to_its_neighbourhood() {
+    let n = 40_000;
+    let entries: Vec<u64> = (0..n as u64).map(|i| 0x1_4000_1000 + 16 * i).collect();
+    let weights = synthetic_weights(n, 11);
+    let stable =
+        |e: &[u64], w: &[usize]| shard_spans(e, &shard_lift::plan_shards_stable(e, w, 2048, 65536));
+    let greedy = |e: &[u64], w: &[usize]| shard_spans(e, &plan_shards(w, 2048, 65536));
+    let base_stable = stable(&entries, &weights);
+    let base_greedy = greedy(&entries, &weights);
+    assert!(base_stable.len() > 20);
+
+    let changed = |a: &BTreeSet<(u64, u64)>, b: &BTreeSet<(u64, u64)>| a.difference(b).count();
+    // One function grows (say a jump table resolved to more cases), one is added, one removed.
+    let mut grown = weights.clone();
+    grown[n / 4] += 3000;
+    let mut added_e = entries.clone();
+    let mut added_w = weights.clone();
+    added_e.insert(n / 2, entries[n / 2] - 8);
+    added_w.insert(n / 2, 40);
+    let mut removed_e = entries.clone();
+    let mut removed_w = weights.clone();
+    removed_e.remove(3 * n / 4);
+    removed_w.remove(3 * n / 4);
+    for (label, e, w) in [
+        ("grown", &entries, &grown),
+        ("added", &added_e, &added_w),
+        ("removed", &removed_e, &removed_w),
+    ] {
+        let s = changed(&base_stable, &stable(e, w));
+        let g = changed(&base_greedy, &greedy(e, w));
+        assert!(s <= 4, "{label}: {s} stable shards changed");
+        if label == "grown" {
+            // The greedy plan moves every later boundary.
+            assert!(g > 10, "{label}: greedy plan moved only {g} shards");
+        }
+    }
 }

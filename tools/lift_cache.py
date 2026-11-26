@@ -7,6 +7,12 @@ lift options, so the native and the browser lift of the same inputs are separate
 same cache directory (`<object cache>-lift`, or `PLAYGTA6_LIFT_CACHE`; `off` disables). Entries
 are hard-linked in and out (copied across volumes); the `keep` most recent are kept. Only hashes
 are kept outside the cache entries: never any game bytes.
+
+When the whole-program entry misses (any recompiler source changed), `build-program` still reuses
+every shard whose functions and lifter version are unchanged from the shard lift cache
+(`build-program --lift-cache`, recomp `pipeline::shard_lift`): `<lift cache>-shards`, or
+`PLAYGTA6_SHARD_LIFT_CACHE` (`off` disables), trimmed to `PLAYGTA6_SHARD_LIFT_CACHE_GB` (default
+24) least recently used first. See docs/BUILD_CACHING.md.
 """
 
 from __future__ import annotations
@@ -23,6 +29,10 @@ LIFT_CACHE_KEEP_ENV = "PLAYGTA6_LIFT_CACHE_KEEP"
 LIFT_CACHE_KEEP = 2  # entries are GiBs of IR each
 LIFT_CACHE_VERSION = 1
 LIFT_STAMP = ".lift-key"
+SHARD_CACHE_ENV = "PLAYGTA6_SHARD_LIFT_CACHE"  # directory, or "off"
+SHARD_CACHE_GB_ENV = "PLAYGTA6_SHARD_LIFT_CACHE_GB"
+SHARD_CACHE_GB = 24.0  # about three full sets of shard IR of the game executable
+SHARD_TRIM_GRACE_S = 3600.0  # never trim entries used within the last hour (a build in flight)
 PROGRAM_KEEP = frozenset({"native", LIFT_STAMP})  # the harness build below the program dir is not lift output
 
 
@@ -180,3 +190,72 @@ def read_stamp(program: Path) -> str | None:
         return (program / LIFT_STAMP).read_text(encoding="utf-8").strip() or None
     except OSError:
         return None
+
+
+# ---------------------------------------------------------------------------------------------
+# Shard lift cache (build-program --lift-cache)
+# ---------------------------------------------------------------------------------------------
+
+
+def shard_cache_dir(lift_cache: Path | None, env: Mapping[str, str]) -> Path | None:
+    """`PLAYGTA6_SHARD_LIFT_CACHE` ("off" disables), else `<lift cache>-shards` (none when the
+    lift cache itself is off)."""
+    value = env.get(SHARD_CACHE_ENV)
+    if value:
+        return None if value.lower() in ("0", "off", "no") else Path(value).expanduser().resolve()
+    return None if lift_cache is None else lift_cache.with_name(lift_cache.name + "-shards")
+
+
+def shard_cache_max_bytes(env: Mapping[str, str]) -> int:
+    return int(float(env.get(SHARD_CACHE_GB_ENV) or SHARD_CACHE_GB) * (1 << 30))
+
+
+def shard_cache_args(cache: Path | None) -> list[str]:
+    """The `build-program` arguments that use `cache` (not part of any cache key: the shard
+    cache never changes the output)."""
+    return [] if cache is None else ["--lift-cache", str(cache)]
+
+
+def trim_shard_cache(cache: Path, max_bytes: int, grace_s: float = SHARD_TRIM_GRACE_S,
+                     now: float | None = None) -> tuple[int, int]:
+    """Removes the least recently used entries (`<key>.ll` + `<key>.meta`, by the newest mtime of
+    the pair; a hit touches both) until the cache holds at most `max_bytes`; entries used within
+    `grace_s` are kept. Stale temporaries (older than `grace_s`) always go. Returns (entries
+    removed, bytes left)."""
+    import time  # noqa: PLC0415
+
+    now = time.time() if now is None else now
+    if not cache.is_dir():
+        return 0, 0
+    entries: dict[str, list] = {}
+    for item in cache.iterdir():
+        try:
+            st = item.stat()
+        except OSError:
+            continue
+        if item.name.endswith(".tmp"):
+            if now - st.st_mtime > grace_s:
+                item.unlink(missing_ok=True)
+            continue
+        stem, _, ext = item.name.rpartition(".")
+        if ext not in ("ll", "meta"):
+            continue
+        e = entries.setdefault(stem, [0.0, 0, []])
+        e[0] = max(e[0], st.st_mtime)
+        e[1] += st.st_size
+        e[2].append(item)
+    total = sum(e[1] for e in entries.values())
+    removed = 0
+    for _, (used, size, files) in sorted(entries.items(), key=lambda kv: kv[1][0]):
+        if total <= max_bytes:
+            break
+        if now - used < grace_s:
+            continue
+        for f in sorted(files, key=lambda f: f.suffix != ".meta"):  # .meta first: no half entry counts
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        total -= size
+        removed += 1
+    return removed, total

@@ -708,13 +708,16 @@ def make_build_plan(
     smoke: bool,
     lift_cache_dir: Path | None = None,
     lift_cache_keep: int = lift_cache.LIFT_CACHE_KEEP,
+    shard_cache: Path | None = None,
+    shard_cache_bytes: int = 0,
 ) -> tuple[Plan, Path]:
     """Compute the staleness build plan for browser Wasm64 artifacts.
 
     With `lift_cache_dir`, a stale program is first looked up there by the content hash of its
     inputs (tools/lift_cache.py; the wasm64 lift options are part of the key, so native entries
     never match): a hit hard-links the cached lift in instead of building the recompiler and
-    running the lift; a miss lifts and stores the result.
+    running the lift; a miss lifts and stores the result. With `shard_cache`, a lift reuses every
+    unchanged shard from it (`build-program --lift-cache`) and trims it to `shard_cache_bytes`.
 
     Returns `(plan, runtime_lib_path)`.
     """
@@ -791,6 +794,7 @@ def make_build_plan(
                 "--out",
                 str(boot_dir),
                 *BROWSER_LIFT_OPTIONS,
+                *lift_cache.shard_cache_args(shard_cache),
                 "--jobs",
                 str(jobs),
             ]
@@ -798,12 +802,16 @@ def make_build_plan(
                 prog_cmd += ["--dll-dir", str(game_dir)]
             hooks: dict[str, Callable[[], None]] = {}
             if key is not None:
-                hooks = {
-                    "before": lambda: lift_cache.clear_program(boot_dir, BOOT_DIR_KEEP),
-                    "after": lambda: lift_cache.lift_cache_store(
-                        lift_cache_dir, key, boot_dir, lift_cache_keep, BOOT_DIR_KEEP
-                    ),
-                }
+                hooks["before"] = lambda: lift_cache.clear_program(boot_dir, BOOT_DIR_KEEP)
+
+            def after() -> None:
+                if key is not None:
+                    lift_cache.lift_cache_store(lift_cache_dir, key, boot_dir, lift_cache_keep, BOOT_DIR_KEEP)
+                if shard_cache is not None and shard_cache_bytes > 0:
+                    lift_cache.trim_shard_cache(shard_cache, shard_cache_bytes)
+
+            if key is not None or shard_cache is not None:
+                hooks["after"] = after
             plan.add("program", prog_reason, prog_cmd, **hooks)
 
     # Stage 2: Release PIC libplaygta6_core.a
@@ -5710,6 +5718,9 @@ def _run(
             smoke=args.smoke,
             lift_cache_dir=None if args.dry_run else lift_cache.lift_cache_dir(None, env),
             lift_cache_keep=lift_cache.lift_cache_keep(env),
+            shard_cache=None if args.dry_run else lift_cache.shard_cache_dir(
+                lift_cache.lift_cache_dir(None, env), env),
+            shard_cache_bytes=lift_cache.shard_cache_max_bytes(env),
         )
 
     shader_plan = plan_shader_staging(shader_pack, shader_stage_dir) if shader_pack is not None else []

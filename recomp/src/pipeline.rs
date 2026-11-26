@@ -115,6 +115,7 @@
 mod hygiene;
 pub mod program;
 pub mod refine;
+pub mod shard_lift;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Write as _};
@@ -308,6 +309,9 @@ pub struct PipelineOptions {
     pub memory: MemoryModel,
     /// How indirect calls reach lifted functions ([`IndirectDispatch::Table`] by default).
     pub indirect_dispatch: IndirectDispatch,
+    /// Shard lift cache directory (`--lift-cache`, see [`shard_lift`]): shards whose key is
+    /// there are linked in instead of lifted. Never affects the outputs.
+    pub lift_cache: Option<PathBuf>,
 }
 
 /// Parses a `--probe-functions` file: one hexadecimal VA per line (optional `0x`), anything after
@@ -351,6 +355,7 @@ impl PipelineOptions {
             target: LiftTarget::Wasm64,
             memory: MemoryModel::default(),
             indirect_dispatch: IndirectDispatch::default(),
+            lift_cache: None,
         }
     }
 
@@ -787,6 +792,38 @@ pub fn lift_shards_with_dispatch(
     tool: Option<&LlvmTool>,
     jobs: usize,
 ) -> Result<Vec<ShardRecord>, PipelineError> {
+    lift_shards_cached(
+        target,
+        memory,
+        module,
+        indirect_dispatch,
+        probes,
+        None,
+        functions,
+        shards,
+        out_dir,
+        tool,
+        jobs,
+    )
+    .map(|(records, _)| records)
+}
+
+/// [`lift_shards_with_dispatch`] reusing the shards found in `cache` ([`shard_lift`]); also
+/// returns, per shard, whether its IR came from the cache.
+#[allow(clippy::too_many_arguments)]
+pub fn lift_shards_cached(
+    target: &LiftTarget,
+    memory: &MemoryModel,
+    module: &str,
+    indirect_dispatch: IndirectDispatch,
+    probes: &BTreeSet<u64>,
+    cache: Option<&shard_lift::ShardCache>,
+    functions: &[&Function],
+    shards: &[Range<usize>],
+    out_dir: &Path,
+    tool: Option<&LlvmTool>,
+    jobs: usize,
+) -> Result<(Vec<ShardRecord>, Vec<bool>), PipelineError> {
     let cross_shard_callees = match indirect_dispatch {
         IndirectDispatch::Table => None,
         IndirectDispatch::Shard => Some(compute_cross_shard_callees(functions, shards)),
@@ -805,22 +842,24 @@ pub fn lift_shards_with_dispatch(
                     let Some(range) = shards.get(index) else {
                         break;
                     };
-                    let dispatcher_symbol =
-                        (indirect_dispatch == IndirectDispatch::Shard).then(|| {
-                            shard_dispatcher_symbol(module, index)
-                        });
+                    let dispatcher_symbol = (indirect_dispatch == IndirectDispatch::Shard)
+                        .then(|| shard_dispatcher_symbol(module, index));
                     let dispatch = dispatcher_symbol.as_deref().map(|sym| ShardDispatch {
                         dispatcher_symbol: sym,
                         external_entries: cross_shard_callees
                             .as_ref()
                             .expect("cross-shard callees computed in Shard mode"),
                     });
-                    let result = lift_shard(
+                    let context = shard_lift::ShardContext {
                         target,
                         memory,
-                        &flag_summaries,
                         dispatch,
                         probes,
+                    };
+                    let result = shard_lift::lift_shard(
+                        &context,
+                        &flag_summaries,
+                        cache,
                         index,
                         &functions[range.clone()],
                         &lift_dir,
@@ -839,70 +878,14 @@ pub fn lift_shards_with_dispatch(
     });
     let mut results = results.into_inner().expect("shard results lock");
     results.sort_by_key(|(index, _)| *index);
-    results.into_iter().map(|(_, result)| result).collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lift_shard(
-    target: &LiftTarget,
-    memory: &MemoryModel,
-    flag_summaries: &lift::FlagSummaries,
-    dispatch: Option<ShardDispatch<'_>>,
-    probes: &BTreeSet<u64>,
-    index: usize,
-    functions: &[&Function],
-    lift_dir: &Path,
-    tool: Option<&LlvmTool>,
-) -> Result<ShardRecord, PipelineError> {
-    let mut lifted = Vec::with_capacity(functions.len());
-    let mut instructions = 0;
-    for function in functions {
-        instructions += function.instruction_count();
-        let mut one = lift::lift_function_in(function, *memory, flag_summaries).map_err(
-            |error| PipelineError::Lift {
-                entry: function.entry,
-                error,
-            },
-        )?;
-        if probes.contains(&function.entry) {
-            one.insert_entry_probe();
-        }
-        lifted.push(one);
+    let mut records = Vec::with_capacity(results.len());
+    let mut hits = Vec::with_capacity(results.len());
+    for (_, result) in results {
+        let (record, hit) = result?;
+        records.push(record);
+        hits.push(hit);
     }
-    let mut unsupported = BTreeMap::new();
-    for u in lifted.iter().flat_map(|f| f.unsupported.iter()) {
-        *unsupported.entry(u.mnemonic.clone()).or_insert(0) += 1;
-    }
-    let ir = lift::emit_module_with_dispatch(&lifted, dispatch)
-        .map(|ir| target.retarget(ir))
-        .map_err(|error| PipelineError::Lift {
-            entry: lifted.first().map_or(0, |f| f.entry),
-            error,
-        })?;
-    drop(lifted);
-    let ll_name = shard_file_name(index, "ll");
-    let ll_path = lift_dir.join(&ll_name);
-    fs::write(&ll_path, &ir)
-        .map_err(io_error(format!("failed to write '{}'", ll_path.display())))?;
-    let ll = OutputFile {
-        path: format!("{LIFT_DIR}/{ll_name}"),
-        size: ir.len() as u64,
-        hash: image::fnv1a_64(ir.as_bytes()),
-    };
-    drop(ir);
-    let obj = tool
-        .map(|tool| compile(tool, target, lift_dir, &ll_name, &shard_file_name(index, "o")))
-        .transpose()?;
-    Ok(ShardRecord {
-        index,
-        first: functions.first().map_or(0, |f| f.entry),
-        last: functions.last().map_or(0, |f| f.entry),
-        functions: functions.len(),
-        instructions,
-        unsupported,
-        ll,
-        obj,
-    })
+    Ok((records, hits))
 }
 
 /// Compiles `lift_dir/ll_name` to `lift_dir/obj_name` and records the object.
@@ -1580,19 +1563,43 @@ pub fn run_module(
     // Lift.
     let functions: Vec<&Function> = analysis.functions.values().collect();
     let weights: Vec<usize> = functions.iter().map(|f| f.instruction_count()).collect();
-    let shard_ranges = plan_shards(&weights, options.shard_size, options.shard_instructions);
-    let shards = lift_shards_with_dispatch(
+    let entries: Vec<u64> = functions.iter().map(|f| f.entry).collect();
+    let shard_ranges = shard_lift::plan_shards_stable(
+        &entries,
+        &weights,
+        options.shard_size,
+        options.shard_instructions,
+    );
+    let cache = options.lift_cache.as_ref().map(shard_lift::ShardCache::new);
+    let (shards, hits) = lift_shards_cached(
         &options.target,
         &options.memory,
         &options.module,
         options.indirect_dispatch,
         &options.probe_functions,
+        cache.as_ref(),
         &functions,
         &shard_ranges,
         out,
         tool.as_ref(),
         options.jobs,
     )?;
+    if cache.is_some() {
+        let reused: Vec<&ShardRecord> = shards
+            .iter()
+            .zip(&hits)
+            .filter(|(_, h)| **h)
+            .map(|(s, _)| s)
+            .collect();
+        let reused_functions: usize = reused.iter().map(|s| s.functions).sum();
+        progress(&format!(
+            "lift cache: {}/{} shards reused, {} of {} functions lifted;",
+            reused.len(),
+            shards.len(),
+            functions.len() - reused_functions,
+            functions.len()
+        ));
+    }
     progress("lift");
     let entries: Vec<u64> = analysis.functions.keys().copied().collect();
     let registration_name = format!("{REGISTRATION_STEM}.ll");
