@@ -867,6 +867,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="with --play: record the real keyboard/pad input as an --input-script file (replay it with "
                         "--input-script; deterministic by present index). Without FILE: "
                         "%%LOCALAPPDATA%%/playgta6/recordings/<name>.txt")
+    p.add_argument("--keymap", metavar="FILE",
+                   help="with --play: key/mouse rebinding file (default: %%LOCALAPPDATA%%/playgta6/keymap.ini, "
+                        "written with the defaults on first run)")
     p.add_argument("--fresh-setup", action="store_true",
                    help="with --play: a new empty save directory, so the setup screens appear again")
     p.add_argument("--save-dir", type=Path, help="with --play: save directory (default: persistent, see docs)")
@@ -996,6 +999,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
             rec = (default_recordings_dir(env) / f"{args.name or 'play'}.txt") if args.record_input == "auto" else Path(args.record_input)
             extra = ["--record-input", str(rec)] + list(extra)
             print(f"[play] recording input to {rec} (replay: --input-script)", file=sys.stderr)
+        if args.keymap:
+            extra = ["--keymap", args.keymap] + list(extra)
         if "--save-dir" not in extra:
             save = play_save_dir(args.fresh_setup, args.save_dir, env, time.strftime("%Y%m%d-%H%M%S"))
             extra = ["--save-dir", str(save)] + list(extra)

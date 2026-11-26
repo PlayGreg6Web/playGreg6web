@@ -118,6 +118,7 @@
 #include "gpu/native_exec/native_executor.h"
 #endif
 #include "guest/input_script.h"
+#include "guest/keymap.h"
 #include "gpu/gpu_va_watch.h"
 #include "gpu/present_pacing.h"
 #include "os/guest_heap.h"
@@ -240,6 +241,7 @@ struct Options {
     playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
     uint32_t max_fps = 0;           // --max-fps: host-side present cap (0 = off)
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
+    std::string keymap_file;        // --keymap: key/mouse rebinding file for --host-input (guest/keymap.h)
     std::string record_input;       // --record-input: write the real --host-input readings (guest/input_record.h)
     std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
     std::string watch_gpu_va;       // --watch-gpu-va: GPU address ranges to report references to (gpu/gpu_va_watch.h)
@@ -275,7 +277,7 @@ void usage() {
                  "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--dawn-cache <dir|off>] [--dawn-cache-max-mb N] [--no-async-pipelines]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
-                 "                     [--record-input <file>]\n"
+                 "                     [--record-input <file>] [--keymap <file>]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
                  "                     [--bcpack-tables <file>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
@@ -357,7 +359,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--window-script" || a == "--input-script" || a == "--record-input" || a == "--watch-gpu-va" ||
+                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--window-script" || a == "--input-script" || a == "--record-input" || a == "--keymap" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
                    a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
@@ -374,6 +376,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--window-script" ? o.window_script
                                   : a == "--input-script" ? o.input_script
                                   : a == "--record-input" ? o.record_input
+                                  : a == "--keymap" ? o.keymap_file
                                   : a == "--watch-gpu-va" ? o.watch_gpu_va
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
@@ -1789,6 +1792,20 @@ int main(int argc, char** argv) {
     } else if (g_options.host_input) {
         static playgta6::InputState host_state{};
         static playgta6::guest::host_input::HostInputSource host_source(&host_state);
+        {
+            playgta6::guest::keymap::Keymap map;
+            std::vector<std::string> errors;
+            std::string used;
+            if (!playgta6::guest::keymap::load_keymap(g_options.keymap_file, map, errors, used)) {
+                for (const std::string& e : errors) {
+                    std::fprintf(stderr, "[harness] keymap: %s\n", e.c_str());
+                }
+                return kExitUsage;
+            }
+            host_source.set_keymap(map);
+            std::fprintf(stderr, "[harness] keymap: %s%s\n", used.empty() ? "built-in table" : used.c_str(),
+                         map.mouse_look ? " (mouse look on)" : "");
+        }
         playgta6::os::scarlett::set_game_input_state(&host_state);
         playgta6::os::scarlett::set_game_input_press_sampler(true);
         static playgta6::guest::InputRecorder recorder;

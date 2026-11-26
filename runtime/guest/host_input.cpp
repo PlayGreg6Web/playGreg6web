@@ -201,26 +201,7 @@ uint32_t xinput_set_state(uint32_t pad, uint16_t low, uint16_t high) {
     return g_set_state != nullptr ? g_set_state(pad, &v) : 1;
 }
 
-uint32_t read_keys() {
-    struct K {
-        int vk;
-        uint32_t key;
-    };
-    static const K keys[] = {
-        {'W', kKeyW}, {'A', kKeyA}, {'S', kKeyS}, {'D', kKeyD}, {'I', kKeyI}, {'J', kKeyJ}, {'K', kKeyK},
-        {'L', kKeyL}, {VK_UP, kKeyUp}, {VK_DOWN, kKeyDown}, {VK_LEFT, kKeyLeft}, {VK_RIGHT, kKeyRight},
-        {VK_SPACE, kKeySpace}, {VK_RETURN, kKeyEnter}, {VK_BACK, kKeyBackspace}, {'F', kKeyF}, {'R', kKeyR},
-        {'Q', kKeyQ}, {'E', kKeyE}, {VK_ESCAPE, kKeyEscape}, {VK_TAB, kKeyTab}, {VK_SHIFT, kKeyShift},
-        {VK_CONTROL, kKeyCtrl}, {'Z', kKeyZ}, {'C', kKeyC},
-    };
-    uint32_t mask = 0;
-    for (const K& k : keys) {
-        if ((GetAsyncKeyState(k.vk) & 0x8000) != 0) {
-            mask |= k.key;
-        }
-    }
-    return mask;
-}
+bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 }  // namespace
 #endif
 
@@ -241,6 +222,8 @@ void HostInputSource::run() {
         g_silence_fn.store(&xinput_set_state);
     }
     int pad_index = -1;
+    POINT last_cursor{};
+    bool have_cursor = false;
     while (!stop_.load()) {
         XPadSample sample;
         bool have_pad = false;
@@ -271,7 +254,24 @@ void HostInputSource::run() {
             rumble.update(playgta6::os::game_input_rumble_telemetry(), have_pad ? pad_index : -1, keyboard_enabled_.load(), now_ms);
             g_silence_pad.store(have_pad ? pad_index : -1);
         }
-        const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, convert_keyboard(keyboard_enabled_.load() ? read_keys() : 0));
+        float mdx = 0.0f, mdy = 0.0f;
+        const bool kb = keyboard_enabled_.load();
+        if (kb && keymap_.mouse_look) {
+            // Real cursor movement since the last poll; the first poll after (re)gaining focus has no delta.
+            POINT p{};
+            if (GetCursorPos(&p)) {
+                if (have_cursor) {
+                    mdx = static_cast<float>(p.x - last_cursor.x);
+                    mdy = static_cast<float>(p.y - last_cursor.y);
+                }
+                last_cursor = p;
+                have_cursor = true;
+            }
+        } else {
+            have_cursor = false;
+        }
+        const InputState keys = kb ? keymap::evaluate(keymap_, key_down, mdx, mdy) : InputState{};
+        const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, keys);
         if (recorder_ != nullptr) {
             recorder_->record(values);
         }

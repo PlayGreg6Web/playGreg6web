@@ -80,6 +80,14 @@ no window of its own, so the flag is opt-in and keys are read globally. It uses 
 stick), Shift / Ctrl (L3 / R3) and Z / C (LT / RT). Raw values pass through; the title's adapter applies the deadzones;
 the pad wins per axis when it is deflected more. `--input-script` takes precedence when both are given.
 
+### Rebinding keys and mouse look: `keymap.ini`
+`--host-input` loads `%LOCALAPPDATA%\playgta6\keymap.ini` (written with the documented defaults on the first run) or the
+file given by `--keymap <file>` (`play_native.ps1 -Keymap`). Lines are `Key = target` under `[keys]` (e.g. `Enter = a`,
+`X = right_trigger`, `Mouse_Left = right_trigger`); the file is applied on top of the table above, `Key = none` unbinds,
+and each key may appear once. `[mouse]` has `look = on|off` (real mouse movement drives the right stick, no cursor
+re-centring), `sensitivity` (stick deflection per pixel per 8 ms poll, default 0.05) and `invert_y`. A bad file stops the
+run with `file: line N: ...` messages. Only real host input is mapped.
+
 ### Recording and replaying a session: `--record-input`
 `playgta6_boot --host-input --record-input <file>` writes every real keyboard/pad reading (each change of the
 state, nothing synthesized) in the `--input-script` format: a `# playgta6-input-script v2` line, then

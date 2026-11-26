@@ -84,6 +84,7 @@ add_library(playgta6_core STATIC
     guest/audio_probes.cpp
     guest/input_script.cpp
     guest/host_input.cpp
+    guest/keymap.cpp
     guest/input_record.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp
@@ -382,6 +383,9 @@ else()
     add_executable(test_host_input ../tests/test_host_input.cpp)
     target_link_libraries(test_host_input PRIVATE playgta6_core)
     add_test(NAME playgta6_host_input_tests COMMAND test_host_input)
+    add_executable(test_keymap ../tests/test_keymap.cpp)
+    target_link_libraries(test_keymap PRIVATE playgta6_core)
+    add_test(NAME playgta6_keymap_tests COMMAND test_keymap)
 
     add_executable(test_audio_probes ../tests/test_audio_probes.cpp)
     target_link_libraries(test_audio_probes PRIVATE playgta6_core)

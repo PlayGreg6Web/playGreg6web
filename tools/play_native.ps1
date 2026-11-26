@@ -10,6 +10,7 @@
   -Record writes your real keyboard/pad input to %LOCALAPPDATA%/playgta6/recordings/<name>.txt (-RecordFile: another
   path); replay it with run_native_boot.py --input-script <file>. -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. -PresentMode auto|fifo|mailbox|immediate picks the window present mode (auto: mailbox, immediate, fifo; unsupported falls back, logged); -MaxFps N caps the host present rate (0 = off, guest pacing unchanged). Stop: close the window or Ctrl+C;
   without -MaxMs the run lasts 2 h. -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues); every start warns when behind origin/main. See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
+  -Keymap <file> rebinds keys/mouse (default %LOCALAPPDATA%\playgta6\keymap.ini, written on first run; see docs).
 #>
 param(
     [string]$Exe = $env:PLAYGTA6_EXE,
@@ -27,6 +28,7 @@ param(
     [switch]$FreshSetup,
     [switch]$Record,
     [string]$RecordFile = "",
+    [string]$Keymap = "",
     [switch]$NoBuild,
     [switch]$TrustBuild,
     [switch]$Update,
@@ -46,6 +48,7 @@ $argv = @("tools/run_native_boot.py", "--preset", $preset, "--name", $Name, "--p
 # Without -ShaderPack run_native_boot.py picks one (env var, then the newest *.wgsl.pack under work/) and prints it.
 if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
 if ($Record -or $RecordFile) { $argv += "--record-input"; if ($RecordFile) { $argv += $RecordFile } }
+if ($Keymap) { $argv += @("--keymap", $Keymap) }
 if ($PresentMode -ne "auto") { $argv += @("--present-mode", $PresentMode) }
 if ($MaxFps -gt 0) { $argv += @("--max-fps", $MaxFps) }
 if ($FreshSetup) { $argv += "--fresh-setup" }

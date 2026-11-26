@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "abi/playgta6_abi.h"
+#include "guest/keymap.h"
 #include "os/game_input.h"
 
 namespace playgta6::guest {
@@ -115,6 +116,8 @@ public:
     void set_keyboard_enabled(bool enabled) { keyboard_enabled_.store(enabled); }
     // Every reading (after the keyboard gate and pad merge) is also handed to `recorder` (--record-input).
     void set_recorder(InputRecorder* recorder) { recorder_ = recorder; }
+    // Rebinding table (keymap.h); call before start(). Without it the built-in table is used.
+    void set_keymap(const keymap::Keymap& map) { keymap_ = map; }
     bool keyboard_enabled() const { return keyboard_enabled_.load(); }
 
 private:
@@ -123,6 +126,7 @@ private:
     playgta6::InputState* state_;
     std::thread thread_;
     InputRecorder* recorder_ = nullptr;
+    keymap::Keymap keymap_ = keymap::default_keymap();
     std::atomic<bool> stop_{false};
     std::atomic<bool> keyboard_enabled_{true};
     std::atomic<uint64_t> writes_{0};
