@@ -321,10 +321,10 @@ class CacheTests(unittest.TestCase):
 
     def test_default_dir_is_machine_wide_and_overridable(self) -> None:
         win = nb.default_cache_dir({"LOCALAPPDATA": r"C:\Users\u\AppData\Local"}, windows=True)
-        self.assertEqual(win, Path(r"C:\Users\u\AppData\Local") / "playgta6" / "objcache")
+        self.assertEqual(win, Path(r"C:\Users\u\AppData\Local") / "playgta6" / "cache" / "objcache")
         self.assertEqual(nb.default_cache_dir({"XDG_CACHE_HOME": "/x/cache"}, windows=False),
-                         Path("/x/cache") / "playgta6" / "objcache")
-        self.assertEqual(nb.default_cache_dir({}, windows=False), Path.home() / ".cache" / "playgta6" / "objcache")
+                         Path("/x/cache") / "playgta6" / "cache" / "objcache")
+        self.assertEqual(nb.default_cache_dir({}, windows=False), Path.home() / ".cache" / "playgta6" / "cache" / "objcache")
         env = {nb.CACHE_ENV: "/elsewhere", "LOCALAPPDATA": "C:/l"}
         self.assertEqual(nb.default_cache_dir(env, windows=True), Path("/elsewhere"))
         # Never inside the repository.

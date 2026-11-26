@@ -677,6 +677,15 @@ class Plan:
 
 
 # The browser lift: the key includes these, so it never collides with the native lift's entries.
+def _wasm_obj_cache(build_dir: Path) -> Path:
+    """The shared guest-object cache (<cache root>/wasm_obj_cache, PLAYGTA6_WASM_CACHE); `off` keeps
+    it per build dir. Entries are keyed by content, so sharing across builds is safe."""
+    import cache_root  # noqa: PLC0415
+    if os.environ.get(cache_root.WASM_ENV, "").lower() in ("0", "off", "no"):
+        return build_dir / "wasm_obj_cache"
+    return cache_root.wasm_cache()
+
+
 BROWSER_LIFT_OPTIONS = ("--target", "wasm64", "--memory-model", "window-runs", "--indirect-dispatch", "shard")
 # Files in the boot dir that are not lift output (kept across a cache restore, never stored).
 BOOT_DIR_KEEP = frozenset({lift_cache.LIFT_STAMP, BOOT_OPTIONS_NAME})
@@ -875,7 +884,7 @@ def make_build_plan(
             "--out-dir",
             str(out_dir),
             "--cache-dir",
-            str(build_dir / "wasm_obj_cache"),
+            str(_wasm_obj_cache(build_dir)),
             "--runtime-lib",
             str(runtime_lib),
             "--jobs",
@@ -5611,6 +5620,8 @@ def main(
         return 0 if exc.code in (0, None) else 2
     if env_map is os.environ and runner is run_command:  # real runs only: free disk under PLAYGTA6_MIN_FREE_GB trims the caches first
         import trim_caches  # noqa: PLC0415
+        import cache_root  # noqa: PLC0415
+        cache_root.legacy_hint(env_map, lambda m: print(m, file=sys.stderr, flush=True))
         trim_caches.auto_trim_if_low(env_map, repo_root)
     try:
         return _run(

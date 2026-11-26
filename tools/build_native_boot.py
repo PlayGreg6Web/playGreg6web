@@ -32,8 +32,8 @@ Linker notes for multi-GB object sets: the MSVC link uses `/INCREMENTAL:NO`, `/O
 through its own response file). C++ sources compile with `/MP` (MSBuild is otherwise serial
 within a project), and `--delete-ir` drops the IR of cache hits too.
 
-Object cache: `--cache-dir`, else `PLAYGTA6_OBJ_CACHE`, else `%LOCALAPPDATA%/playgta6/objcache`
-on Windows and `$XDG_CACHE_HOME/playgta6/objcache` (`~/.cache/...`) elsewhere: outside every
+Object cache: `--cache-dir`, else `PLAYGTA6_OBJ_CACHE`, else `<cache root>/objcache` (`PLAYGTA6_CACHE_ROOT`, default
+`%LOCALAPPDATA%/playgta6/cache`; `$XDG_CACHE_HOME`/`~/.cache` elsewhere): outside every
 checkout (game-derived objects never land in a repository), so agent worktrees reuse each
 other's objects. Entries are `<sha256 key>.obj|.o`, written to a unique temporary and renamed
 into place; a `<entry>.lock` file (kept fresh by a heartbeat, broken when stale) makes
@@ -327,17 +327,10 @@ TMP_STALE_S = 24 * 3600.0  # temporaries of a killed compile are removed by a tr
 
 
 def default_cache_dir(env: Mapping[str, str] | None = None, windows: bool | None = None) -> Path:
-    """`PLAYGTA6_OBJ_CACHE`, else `%LOCALAPPDATA%/playgta6/objcache` (Windows) or
-    `$XDG_CACHE_HOME/playgta6/objcache`, `~/.cache/playgta6/objcache` (elsewhere)."""
-    env = os.environ if env is None else env
-    if env.get(CACHE_ENV):
-        return Path(env[CACHE_ENV]).expanduser()
-    windows = (os.name == "nt") if windows is None else windows
-    if windows:
-        root = Path(env["LOCALAPPDATA"]) if env.get("LOCALAPPDATA") else Path.home() / "AppData" / "Local"
-    else:
-        root = Path(env["XDG_CACHE_HOME"]) if env.get("XDG_CACHE_HOME") else Path.home() / ".cache"
-    return root / "playgta6" / "objcache"
+    """`PLAYGTA6_OBJ_CACHE`, else `<cache root>/objcache` (tools/cache_root.py: `PLAYGTA6_CACHE_ROOT`,
+    default `%LOCALAPPDATA%/playgta6/cache`, `$XDG_CACHE_HOME`/`~/.cache` elsewhere)."""
+    import cache_root  # noqa: PLC0415
+    return cache_root.obj_cache(env, windows)
 
 
 def default_cache_max_gb(env: Mapping[str, str] | None = None) -> float:
@@ -1119,6 +1112,8 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
 
     try:
         cache_dir = (args.cache_dir or default_cache_dir()).resolve()
+        import cache_root  # noqa: PLC0415
+        cache_root.legacy_hint(os.environ, say, explicit=args.cache_dir is not None)
         max_gb = args.cache_max_gb if args.cache_max_gb is not None else default_cache_max_gb()
         if args.cache_trim:
             trimmed = _trim(cache_dir, max_gb, say, verbose=True)

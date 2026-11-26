@@ -16,6 +16,18 @@ function used to be lifted again, and any change that altered a function's size 
 tables, CFG rules) shifted every later shard boundary, so most shard objects were compiled again.
 Two pieces in `recomp/src/pipeline/shard_lift.rs` fix that.
 
+## One cache root
+
+Every tool (`build_native_boot.py`, `run_native_boot.py`, `run_browser_boot.py`, `update_prebuilt.ps1`,
+`play_native`/`play_local`, `trim_caches.py`) derives its cache dirs from one root, `tools/cache_root.py`:
+`PLAYGTA6_CACHE_ROOT` (a directory, or `auto` = `<drive with most free space>:\playgta6-cache`), else
+`%LOCALAPPDATA%\playgta6\cache`. Below it: `objcache`, `objcache-lift`, `objcache-lift-shards`,
+`objcache-recomp`, `objcache-targets` and `wasm_obj_cache` (`PLAYGTA6_WASM_CACHE`, `off` = per build dir).
+Explicit `--cache-dir` / `PLAYGTA6_OBJ_CACHE` / per-cache env vars still win. Earlier locations
+(`%LOCALAPPDATA%\playgta6\objcache*`, `<drive>:\pg6nb-objcache*`) are never moved or deleted automatically:
+a one-time hint names them; `python tools/trim_caches.py` sizes them (it still scans them), and the
+`%LOCALAPPDATA%` ones can be moved into the root by name. `PLAYGTA6_NO_CACHE_HINT=1` silences the hint.
+
 ## Stable shard plan
 
 The old plan (`plan_shards`) filled shards greedily in entry order up to 65536 instructions. A

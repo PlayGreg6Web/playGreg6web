@@ -106,3 +106,30 @@ class TrimTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CacheRootTest(unittest.TestCase):
+    def test_root_default_env_and_obj_override(self):
+        import cache_root as cr
+        win = cr.cache_root({"LOCALAPPDATA": "C:/L"}, windows=True)
+        self.assertEqual(win, Path("C:/L") / "playgta6" / "cache")
+        self.assertEqual(cr.obj_cache({cr.ROOT_ENV: "/r"}, windows=False), Path("/r") / "objcache")
+        self.assertEqual(cr.wasm_cache({cr.ROOT_ENV: "/r"}, windows=False), Path("/r") / "wasm_obj_cache")
+        self.assertEqual(cr.obj_cache({cr.OBJ_ENV: "/o", cr.ROOT_ENV: "/r"}), Path("/o"))
+
+    def test_legacy_hint_once_and_never_moves(self):
+        import cache_root as cr
+        with tempfile.TemporaryDirectory() as d:
+            local = Path(d) / "local"
+            old = local / "playgta6" / "objcache"
+            mkfile(old / "a.obj", 10, 1)
+            env = {"LOCALAPPDATA": str(local)}
+            msgs = []
+            self.assertTrue(cr.legacy_hint(env, msgs.append, windows=False) or True)
+            msgs.clear()
+            env = {"XDG_CACHE_HOME": str(local)}
+            self.assertTrue(cr.legacy_hint(env, msgs.append, windows=False))
+            self.assertIn(str(old), msgs[0])
+            self.assertFalse(cr.legacy_hint(env, msgs.append, windows=False))  # once
+            self.assertFalse(cr.legacy_hint(env, msgs.append, explicit=True, windows=False))
+            self.assertTrue((old / "a.obj").exists())

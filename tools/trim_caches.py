@@ -10,7 +10,7 @@ directory), never the root itself and never anything in a protected set:
   - anything holding a fresh lock (`*.lock`, `.build.lock`, #1639) or being written (`.tmp*`).
 
 Caches (kind: root, entry, default budget):
-  obj      object cache (PLAYGTA6_OBJ_CACHE, --cache-dir, <drive>:/pg6nb-objcache*)   file      40 GB
+  obj      object cache (<cache root>/objcache, PLAYGTA6_OBJ_CACHE, --cache-dir, <drive>:/pg6nb-objcache*)   file      40 GB
   lift     <obj>-lift, PLAYGTA6_LIFT_CACHE (#1475)                                    key dir   20 GB
   shard    <obj>-lift-shards, PLAYGTA6_SHARD_LIFT_CACHE (#1885)                       .ll pair  24 GB
   recomp   <obj>-recomp, PLAYGTA6_RECOMP_CACHE (#1639)                                key dir    5 GB
@@ -120,6 +120,12 @@ def discover(env: Mapping[str, str], repo: Path = REPO_ROOT, extra_objs: Sequenc
         roots.append(CacheRoot("targets", Path(env["PLAYGTA6_INDIRECT_TARGETS"]).expanduser().parent.parent))
     for rel in ("work/browser-boot/wasm_obj_cache", "work/wasm_obj_cache"):
         roots.append(CacheRoot("wasm", repo / rel))
+    import cache_root  # noqa: PLC0415
+    roots.append(CacheRoot("wasm", cache_root.wasm_cache(env)))
+    for legacy in cache_root.legacy_roots(env):  # earlier default locations (deduplicated by path below)
+        if legacy.name == "objcache":
+            roots.append(CacheRoot("obj", legacy))
+            roots += _siblings(legacy)
     local = env.get("LOCALAPPDATA")
     base = Path(local) if local else (Path(env["XDG_CACHE_HOME"]) if env.get("XDG_CACHE_HOME")
                                       else Path.home() / ".cache")
