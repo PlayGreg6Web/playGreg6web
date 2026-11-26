@@ -88,6 +88,7 @@
 
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/drop_table.h"
+#include "gpu/pipeline_prewarm_host.h"
 #include "gpu/gpu_time.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
@@ -198,6 +199,7 @@ struct Options {
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
+    std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
     std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
@@ -227,6 +229,7 @@ void usage() {
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
                  "                     [--dump-pipelines <dir under work/>]\n"
+                 "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
                  "                     [--bcpack-tables <file>]\n"
@@ -283,7 +286,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--input-script" || a == "--watch-gpu-va" ||
+                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--input-script" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
                    a == "--bcpack-tables") {
             if (!value(v)) {
@@ -294,6 +297,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--sandbox-id" ? o.sandbox_id
                                   : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--shader-pack" ? o.shader_pack
+                                  : a == "--pipeline-warm-list" ? o.pipeline_warm_list
                                   : a == "--input-script" ? o.input_script
                                   : a == "--watch-gpu-va" ? o.watch_gpu_va
                                   : a == "--user-age-group" ? o.user_age_group
@@ -706,6 +710,8 @@ playgta6::os::audio_wav_dump::Writer g_audio_dump;
 
 void write_outputs(bool print_summary) {
     finish_profile();
+    gpu::prewarm_host_stop();
+    gpu::prewarm_host_save();
     {
         const os::GuestHeapStats heap = os::default_guest_heap().stats();
         std::fprintf(stderr,
@@ -1090,6 +1096,24 @@ int main(int argc, char** argv) {
                 device_options.stage_reflection = std::move(reflection);
             }
         }
+        // Pipeline prewarm: warm list from the per-title cache, built ahead of first use in the background.
+        if (device_options.shader_pack) {
+            gpu::pipeline_prewarm().set_pack_index(device_options.shader_pack);
+            const std::string warm_path = g_options.pipeline_warm_list.empty()
+                                              ? gpu::default_warm_list_path(g_options.name.empty() ? "title" : g_options.name)
+                                              : g_options.pipeline_warm_list;
+            std::string message;
+            const uint32_t queued = gpu::prewarm_host_configure(warm_path, &message);
+            std::fprintf(stderr, "[harness] pipeline warm list %s: %s (%u queued)\n", warm_path.c_str(), message.c_str(), queued);
+            if (queued != 0) {
+                gpu::prewarm_host_start(
+                    {[]() { return static_cast<bool>(gpu::d3d12_xs_exports::current_device()); },
+                     [](uint32_t kind, uint64_t k0, uint64_t k1) {
+                         auto device = gpu::d3d12_xs_exports::current_device();
+                         return device && device->prewarm_pack_modules(kind, k0, k1);
+                     }});
+            }
+        }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
     }
     // R40: the report always carries the D3D12 layer's work totals (draws / dispatches emitted vs
@@ -1107,6 +1131,7 @@ int main(int argc, char** argv) {
             }
             o += ", \"drops_by_program\": " + dg::drop_table().by_program_json();
             o += "}";
+            o += ",\n  \"pipeline_prewarm\": " + gpu::prewarm_host_report_json();
             o += ",\n  \"gpu_drop_table\": " + dg::drop_table().detail_json();
             {
                 namespace ar = os::audio_report;

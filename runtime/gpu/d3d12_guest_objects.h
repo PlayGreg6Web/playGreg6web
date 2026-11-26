@@ -929,6 +929,12 @@ public:
     // descriptors and root constants one each, then static samplers). Returns the keys used
     // (0 = stage absent); false when a stage has no key.
     bool resolve_with_pack(GraphicsPsoSource& source, uint64_t* vs_key, uint64_t* ps_key);
+
+    // Native prewarm (pipeline_prewarm_host.h): creates the shader modules of a warm-list entry ahead of
+    // the title's first use, through the same path as on-demand creation (the pack module cache).
+    // Safe from any thread. False when there is no pack or it cannot resolve a key.
+    bool prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1);
+    uint32_t pack_module_locked(uint64_t key, GpuShaderStage stage);  // pack_mutex_ held
     // Reflection join failures reported so far (once per pipeline: stage keys + root signature).
     size_t reflection_join_failures() const;
     void flush_pipeline_dump();

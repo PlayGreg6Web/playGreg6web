@@ -104,6 +104,8 @@ bool PipelinePrewarm::note_title_pipeline(uint32_t kind, uint64_t key0, uint64_t
         Slot& s = slots_[it->second - 1];
         if (s.state == State::Queued) {
             s.state = State::Skipped;  // the title got there first; dropped from the queue on take()
+        } else if (s.state == State::Done) {
+            s.state = State::Used;  // built ahead of the title's first use
         }
     }
     return true;
@@ -129,7 +131,7 @@ bool PipelinePrewarm::complete(uint32_t id, bool ok, uint64_t build_ns) {
     if (id == 0 || id > slots_.size()) return false;
     Slot& s = slots_[id - 1];
     if (s.state != State::InFlight) return false;
-    s.state = ok ? State::Done : State::Failed;
+    s.state = !ok ? State::Failed : observed_set_.count(s.id) != 0 ? State::Used : State::Done;  // used while building
     --in_flight_;
     longest_ns_ = std::max(longest_ns_, build_ns);
     total_ns_ += build_ns;
@@ -144,7 +146,8 @@ PrewarmProgress PipelinePrewarm::progress() const {
         switch (s.state) {
             case State::Queued: ++p.queued; break;
             case State::InFlight: ++p.in_flight; break;
-            case State::Done: ++p.done; break;
+            case State::Done:
+            case State::Used: ++p.done; break;
             case State::Failed: ++p.failed; break;
             case State::Skipped: ++p.skipped; break;
         }
@@ -153,6 +156,17 @@ PrewarmProgress PipelinePrewarm::progress() const {
     p.longest_ns = longest_ns_;
     p.total_ns = total_ns_;
     return p;
+}
+
+PrewarmUse PipelinePrewarm::use_stats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    PrewarmUse u;
+    for (const Slot& s : slots_) {
+        if (s.state == State::Done) ++u.wasted;
+        if (s.state == State::Used) ++u.hit;
+    }
+    u.prewarmed = u.hit + u.wasted;
+    return u;
 }
 
 void PipelinePrewarm::reset() {

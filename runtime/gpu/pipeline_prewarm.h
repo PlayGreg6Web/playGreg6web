@@ -64,6 +64,14 @@ struct PrewarmProgress {
 };
 static_assert(sizeof(PrewarmProgress) == 48, "PrewarmProgress is part of the host ABI");
 
+// Prewarm payoff counters (boot report): `prewarmed` built ahead of the title, `hit` of those the title
+// then used (the pipeline was ready before first use), `wasted` built but never used (so far).
+struct PrewarmUse {
+    uint32_t prewarmed = 0;
+    uint32_t hit = 0;
+    uint32_t wasted = 0;
+};
+
 class PipelinePrewarm {
 public:
     // Pack used to drop entries it cannot resolve. May be null (then nothing is dropped).
@@ -89,6 +97,7 @@ public:
     bool complete(uint32_t id, bool ok, uint64_t build_ns);
 
     PrewarmProgress progress() const;
+    PrewarmUse use_stats() const;
 
     void reset();
 
@@ -106,7 +115,7 @@ private:
             return static_cast<size_t>(h ^ i.kind);
         }
     };
-    enum class State : uint8_t { Queued, InFlight, Done, Failed, Skipped };
+    enum class State : uint8_t { Queued, InFlight, Done, Used, Failed, Skipped };  // Used: Done, then the title used it
     struct Slot {
         Identity id;
         State state;

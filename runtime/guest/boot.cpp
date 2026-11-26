@@ -38,6 +38,7 @@
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/win32_sync.h"
+#include "gpu/pipeline_prewarm_host.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
 #include "os/xgameruntime_provider.h"
@@ -1282,6 +1283,7 @@ void boot_relaunch_prepare(void* /*user*/) {
     os::win32::run_relaunch_suspend_sequence(&boot_relaunch_invoke, nullptr, &boot_relaunch_grace, nullptr);
     // Saves the title wrote during the suspend routines must be on disk before the process is replaced.
     os::gdk::gamesave::flush_all();
+    gpu::prewarm_host_save();  // the pipelines this run created, for the next launch's prewarm
 }
 
 // Guest return address of this thread's latest dispatched call (PG6_EVENT_TRACE callers).

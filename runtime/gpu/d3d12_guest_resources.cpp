@@ -3759,6 +3759,39 @@ size_t Device::reflection_join_failures() const {
     return reflection_failures_.size();
 }
 
+uint32_t Device::pack_module_locked(uint64_t key, GpuShaderStage stage) {
+    auto it = pack_modules_.find(key);
+    if (it != pack_modules_.end()) {
+        return it->second;
+    }
+    const uint32_t id = allocate_id();
+    CommandEncoder enc;
+    enc.create_shader_module(id, stage, pack_key_code(key));
+    submit(enc);
+    pack_modules_.emplace(key, id);
+    return id;
+}
+
+bool Device::prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1) {
+    if (!options_.shader_pack || key0 == 0) {
+        return false;
+    }
+    const ShaderPackIndex& pack = *options_.shader_pack;
+    if (pack.find(key0) == pack.end() || (key1 != 0 && pack.find(key1) == pack.end())) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pack_mutex_);
+    if (kind == kPrewarmKindCompute) {
+        pack_module_locked(key0, GpuShaderStage::Compute);
+        return true;
+    }
+    pack_module_locked(key0, GpuShaderStage::Vertex);
+    if (key1 != 0) {
+        pack_module_locked(key1, GpuShaderStage::Fragment);
+    }
+    return true;
+}
+
 bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_t* ps_key) {
     *vs_key = *ps_key = 0;
     src.reflected = false;
@@ -3842,18 +3875,7 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
         src.fix_pointers();
     }
     std::lock_guard<std::mutex> lock(pack_mutex_);
-    auto module_for = [&](uint64_t key, GpuShaderStage stage) {
-        auto it = pack_modules_.find(key);
-        if (it != pack_modules_.end()) {
-            return it->second;
-        }
-        const uint32_t id = allocate_id();
-        CommandEncoder enc;
-        enc.create_shader_module(id, stage, pack_key_code(key));
-        submit(enc);
-        pack_modules_.emplace(key, id);
-        return id;
-    };
+    auto module_for = [&](uint64_t key, GpuShaderStage stage) { return pack_module_locked(key, stage); };
     pipeline_prewarm().note_title_pipeline(kPrewarmKindGraphics, *vs_key, d.ps != 0 ? *ps_key : 0);
     register_shader_module(d.vs, module_for(*vs_key, GpuShaderStage::Vertex));
     if (d.ps != 0) {
