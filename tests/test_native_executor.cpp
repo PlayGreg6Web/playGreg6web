@@ -1275,15 +1275,173 @@ void test_depth_texture_float_layout(NativeExecutor& ex) {
     CHECK(st.device_errors == errors_before);
     std::printf("depth-as-float: twins=%llu copies=%llu dummies=%llu\n", (unsigned long long)st.depth_twins_created,
                 (unsigned long long)st.depth_float_copies, (unsigned long long)st.bind_group_depth_layout_dummies);
-    if (st.depth_twins_created > twins_before) {
-        // float32-filterable device: the float entry reads a real r32float copy, no dummy
-        CHECK(st.depth_twins_created == twins_before + 1);
-        CHECK(st.bind_group_depth_layout_dummies == before);
-        CHECK(st.depth_float_copies > copies_before);
-    } else {
-        CHECK(st.bind_group_depth_layout_dummies == before + 1);  // no float32-filterable: dummy
-        CHECK(st.depth_float_copies == copies_before);
+    // The float entry always reads a real twin: r32float, or r16float without float32-filterable.
+    CHECK(st.depth_twins_created == twins_before + 1);
+    CHECK(st.bind_group_depth_layout_dummies == before);
+    CHECK(st.depth_float_copies > copies_before);
+}
+
+// ---- depth read variants ----
+// A depth texture (cleared by an explicit depth-only pass) read through a layout entry of each sample
+// type; the fragment shader turns the value into a color, the swapchain pixel is checked. Every step
+// re-clears the depth, so a stale twin (invalidation) would show the previous step's value.
+struct DepthStep {
+    float depth;
+    uint32_t stencil;
+    int r, g, b;  // expected pixel (tolerance `tol`)
+};
+
+const char* kDepthVs = R"(
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+)";
+
+bool depth_read_case(NativeExecutor& ex, const char* name, uint32_t base, uint8_t format, uint32_t samples,
+                     uint8_t layout_type, bool layout_ms, uint8_t view_aspect, const std::string& fs_body,
+                     const std::vector<DepthStep>& steps, int tol) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    GpuCreateTexture2Payload ct = texture2(base, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::RenderAttachment, format);
+    ct.sample_count = samples;
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(ct));
+    GpuBindGroupLayoutEntry le = layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, layout_type, 2);
+    if (layout_ms) le.flags |= 2;
+    create_layouts(setup, base + 1, base + 2, {le});
+    GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::TextureView, base);
+    be.view.aspect = view_aspect;
+    create_bind_group(setup, base + 3, base + 1, {be});
+    const std::string src = std::string(kDepthVs) + fs_body;
+    setup.create_shader_module(base + 4, GpuShaderStage::Vertex, src.c_str());
+    setup.create_shader_module(base + 5, GpuShaderStage::Fragment, src.c_str());
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(base + 6, base + 4, base + 5, base + 2)));
+    run(ex, setup);
+    bool ok = true;
+    const bool has_stencil = format == 47 || format == 49;
+    for (const DepthStep& st : steps) {
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        GpuBeginRenderPassPayload dp;
+        std::memset(&dp, 0, sizeof dp);
+        dp.depth_stencil.texture_id = base;
+        dp.depth_stencil.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+        dp.depth_stencil.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+        dp.depth_stencil.depth_clear_value = st.depth;
+        if (has_stencil) {
+            dp.depth_stencil.stencil_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+            dp.depth_stencil.stencil_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+            dp.depth_stencil.stencil_clear_value = st.stencil;
+        }
+        frame.emit_packet(GpuOpcode::BeginRenderPass, &dp, sizeof dp);
+        frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        GpuBeginRenderPassPayload pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+        frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+        frame.set_pipeline(base + 6);
+        set_bind_group2(frame, 0, base + 3);
+        frame.draw(3);
+        frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        frame.present();
+        run(ex, frame);
+        ex.wait_idle();
+        ex.poll();
+        FrameImage img;
+        std::string err;
+        const bool got = ex.read_last_frame(&img, &err);
+        const bool px = got && px_near(img, 1, 1, st.b, st.g, st.r, 255, tol);
+        if (!px) std::fprintf(stderr, "  depth read case '%s' (depth %.3f stencil %u)\n", name, st.depth, st.stencil);
+        ok = ok && px;
     }
+    const ExecutorStats& after = ex.stats();
+    if (after.device_errors != before.device_errors) std::fprintf(stderr, "  depth read case '%s': device errors\n", name);
+    ok = ok && after.device_errors == before.device_errors && after.packet_errors == before.packet_errors;
+    CHECK(ok);
+    return ok;
+}
+
+void test_depth_read_variants(NativeExecutor& ex) {
+    // The raw bytes 31..8 of the u32 -> r, g, b.
+    const std::string bytes_u =
+        "  return vec4f(f32((v >> 24u) & 255u) / 255.0, f32((v >> 16u) & 255u) / 255.0, f32((v >> 8u) & 255u) / 255.0, 1.0);\n}\n";
+    const ExecutorStats s0 = ex.stats();
+
+    // float entry: the depth value itself (r32float; r16float without float32-filterable, hence tolerance 2)
+    depth_read_case(ex, "float entry / depth32float", 1000, 48, 1, 0, false, 0,
+                    "@group(0) @binding(0) var t: texture_2d<f32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                    "  return vec4f(textureLoad(t, vec2i(1, 1), 0).x, 0.0, 0.0, 1.0);\n}\n",
+                    {{0.25f, 0, 64, 0, 0}, {0.75f, 0, 191, 0, 0}, {0.5f, 0, 128, 0, 0}}, 2);
+    // uint entry: depth32float's f32 bit pattern (D3D12 R32_UINT view of the R32_TYPELESS family)
+    const std::string u32_src = "@group(0) @binding(0) var t: texture_2d<u32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                                "  let v = textureLoad(t, vec2i(1, 1), 0).x;\n" + bytes_u;
+    depth_read_case(ex, "uint entry / depth32float bits", 1010, 48, 1, 4, false, 0, u32_src,
+                    {{0.5f, 0, 63, 0, 0}, {0.25f, 0, 62, 128, 0}, {1.0f, 0, 63, 128, 0}}, 1);
+    // sint entry: the same 32 bits as i32
+    depth_read_case(ex, "sint entry / depth32float bits", 1020, 48, 1, 3, false, 0,
+                    "@group(0) @binding(0) var t: texture_2d<i32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                    "  let v = bitcast<u32>(textureLoad(t, vec2i(1, 1), 0).x);\n" + bytes_u,
+                    {{0.5f, 0, 63, 0, 0}, {0.25f, 0, 62, 128, 0}}, 1);
+    // depth16unorm / depth24plus through uint: the raw unorm (1.0 -> all ones, 0.0 -> 0)
+    depth_read_case(ex, "uint entry / depth16unorm raw", 1030, 45, 1, 4, false, 0, u32_src,
+                    {{1.0f, 0, 0, 0, 255}, {0.0f, 0, 0, 0, 0}, {1.0f, 0, 0, 0, 255}}, 1);
+    depth_read_case(ex, "uint entry / depth24plus raw", 1040, 46, 1, 4, false, 0, u32_src,
+                    {{1.0f, 0, 0, 255, 255}, {0.0f, 0, 0, 0, 0}}, 1);
+    // stencil plane of depth24plus-stencil8 / depth32float-stencil8 through a uint entry (direct stencil-aspect view)
+    const std::string stencil_src = "@group(0) @binding(0) var t: texture_2d<u32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                                    "  return vec4f(f32(textureLoad(t, vec2i(1, 1), 0).x) / 255.0, 0.0, 0.0, 1.0);\n}\n";
+    depth_read_case(ex, "uint entry / stencil aspect (24+8)", 1050, 47, 1, 4, false, 2, stencil_src,
+                    {{0.5f, 7, 7, 0, 0}, {0.5f, 200, 200, 0, 0}}, 1);
+    depth_read_case(ex, "uint entry / all aspect (32+8)", 1060, 49, 1, 4, false, 0, stencil_src,
+                    {{0.5f, 9, 9, 0, 0}, {0.5f, 33, 33, 0, 0}}, 1);
+    // multisampled depth, unfilterable-float multisampled entry (and a 'float' ms entry, created unfilterable): per-sample loads
+    const std::string ms_src = "@group(0) @binding(0) var t: texture_multisampled_2d<f32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                               "  return vec4f(textureLoad(t, vec2i(1, 1), 2).x, textureLoad(t, vec2i(1, 1), 3).x, 0.0, 1.0);\n}\n";
+    depth_read_case(ex, "unfilterable ms entry / ms depth", 1070, 48, 4, 1, true, 0, ms_src,
+                    {{0.25f, 0, 64, 64, 0}, {0.75f, 0, 191, 191, 0}}, 2);
+    depth_read_case(ex, "float ms entry / ms depth", 1080, 48, 4, 0, true, 0, ms_src, {{0.5f, 0, 128, 128, 0}}, 2);
+
+    const ExecutorStats& s1 = ex.stats();
+    std::printf("depth variants: twins=%llu int=%llu half=%llu stencil_direct=%llu copies=%llu dummies=%llu\n",
+                (unsigned long long)(s1.depth_twins_created - s0.depth_twins_created),
+                (unsigned long long)(s1.depth_int_twins_created - s0.depth_int_twins_created),
+                (unsigned long long)(s1.depth_half_twins_created - s0.depth_half_twins_created),
+                (unsigned long long)(s1.depth_stencil_direct_binds - s0.depth_stencil_direct_binds),
+                (unsigned long long)(s1.depth_float_copies - s0.depth_float_copies),
+                (unsigned long long)(s1.bind_group_depth_layout_dummies - s0.bind_group_depth_layout_dummies));
+    CHECK(s1.depth_int_twins_created == s0.depth_int_twins_created + 4);  // u32 x3 (32/16/24) + s32
+    CHECK(s1.depth_stencil_direct_binds == s0.depth_stencil_direct_binds + 2);
+    CHECK(s1.bind_group_depth_layout_dummies == s0.bind_group_depth_layout_dummies);  // every case read real data
+}
+
+// A device without float32-filterable (the feature is withheld): a float entry reads the depth through a
+// real r16float twin (the only filterable float format), so the value is correct to half precision.
+void test_depth_read_no_float32_filterable() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.disable_float32_filterable = true;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: no-float32-filterable NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    const ExecutorStats s0 = ex->stats();
+    depth_read_case(*ex, "float entry / depth32float / no float32-filterable", 1100, 48, 1, 0, false, 0,
+                    "@group(0) @binding(0) var t: texture_2d<f32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                    "  return vec4f(textureLoad(t, vec2i(1, 1), 0).x, 0.0, 0.0, 1.0);\n}\n",
+                    {{0.25f, 0, 64, 0, 0}, {0.75f, 0, 191, 0, 0}, {0.5f, 0, 128, 0, 0}}, 2);
+    const ExecutorStats& s1 = ex->stats();
+    CHECK(s1.depth_half_twins_created == s0.depth_half_twins_created + 1);
+    CHECK(s1.bind_group_depth_layout_dummies == s0.bind_group_depth_layout_dummies);
+    // the uint path does not depend on the feature
+    depth_read_case(*ex, "uint entry / depth32float bits / no float32-filterable", 1110, 48, 1, 4, false, 0,
+                    "@group(0) @binding(0) var t: texture_2d<u32>;\n@fragment fn fs_main() -> @location(0) vec4f {\n"
+                    "  let v = textureLoad(t, vec2i(1, 1), 0).x;\n"
+                    "  return vec4f(f32((v >> 24u) & 255u) / 255.0, f32((v >> 16u) & 255u) / 255.0, 0.0, 1.0);\n}\n",
+                    {{0.5f, 0, 63, 0, 0}, {0.25f, 0, 62, 128, 0}}, 1);
+    std::printf("no float32-filterable: half twins=%llu\n", (unsigned long long)s1.depth_half_twins_created);
 }
 
 // --screenshot-at on a headless executor: present 1 is read back asynchronously, converted from the
@@ -1362,6 +1520,8 @@ int main() {
     test_timers();
     test_blit();
     test_depth_texture_float_layout(*ex);
+    test_depth_read_variants(*ex);
+    test_depth_read_no_float32_filterable();
     test_async_pipelines_and_blob_cache();
     test_screenshot();
     if (g_failures) {

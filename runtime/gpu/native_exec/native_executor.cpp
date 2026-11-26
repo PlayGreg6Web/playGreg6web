@@ -328,6 +328,11 @@ struct BufferEntry {
     uint32_t usage = 0;
 };
 
+struct TwinSlot {
+    wgpu::Texture tex;
+    uint64_t gen = 0;  // depth_gen the twin was last copied at
+};
+
 struct TextureEntry {
     wgpu::Texture texture;
     wgpu::TextureView default_view;
@@ -337,11 +342,10 @@ struct TextureEntry {
     bool promoted_1d = false;
     bool bc3d_fallback = false;  // 3D BC texture created as rgba8unorm: uploads are skipped
     std::unordered_map<uint64_t, wgpu::TextureView> views;
-    // Depth-as-float twin (an r32float copy of the depth aspect bound where a float layout entry
-    // meets a depth texture): refreshed when depth_gen moved past twin_gen.
-    wgpu::Texture twin;
+    // Depth twins (color copies of the depth plane bound where a layout entry cannot take a depth
+    // view, see depth_twin below): each refreshed when depth_gen moved past its slot's gen.
+    std::array<TwinSlot, kDepthReadCount> twins;  // indexed by DepthRead (Twin* kinds only)
     uint64_t depth_gen = 1;  // bumps on every write to the depth texture
-    uint64_t twin_gen = 0;   // depth_gen the twin was last copied at
 };
 
 // ---- pass commands (wgpu_worker.js `_passCommands`) ----
@@ -518,8 +522,8 @@ struct NativeExecutor::Impl {
     std::unordered_map<std::string, wgpu::Sampler> dummy_samplers;
     std::unordered_map<std::string, wgpu::TextureView> dummy_views;
     std::vector<wgpu::Texture> dummy_textures;
-    std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth-as-float twin
-    wgpu::RenderPipeline depth_copy_pipeline;
+    std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth twin
+    std::unordered_map<uint32_t, wgpu::RenderPipeline> depth_copy_pipelines;  // DepthRead * 256 + source format
     wgpu::BindGroupLayout empty_layout;
     wgpu::ShaderModule empty_fragment;
     wgpu::ShaderModule error_vertex_module;
@@ -713,6 +717,7 @@ struct NativeExecutor::Impl {
         };
         std::vector<wgpu::FeatureName> required;
         for (const Want& w : wants) {
+            if (w.name == wgpu::FeatureName::Float32Filterable && options.disable_float32_filterable) continue;
             if (adapter_handle.HasFeature(w.name)) {
                 required.push_back(w.name);
                 features.*(w.flag) = true;
@@ -1533,6 +1538,9 @@ struct NativeExecutor::Impl {
                         wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
                         wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
                     w.texture.sampleType = kS[le.sample_type < 5 ? le.sample_type : 0];
+                    // 'float' + multisampled is invalid in WebGPU (a Texture2DMS<float4> SRV): non-filterable
+                    if (le.multisampled && w.texture.sampleType == wgpu::TextureSampleType::Float)
+                        w.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
                     w.texture.viewDimension = wgpu_view_dim(le.view_dim);
                     w.texture.multisampled = le.multisampled;
                     break;
@@ -1827,53 +1835,67 @@ struct NativeExecutor::Impl {
         stats.texture_upload_bytes += w.data_len;
     }
 
-    // ---- depth-as-float twins ----
+    // ---- depth twins ----
+    //
+    // A depth texture bound where the layout entry's sample type cannot take a depth view is served by
+    // a twin: a same-extent color texture refreshed from the depth plane by a fullscreen pass (depth
+    // textures cannot be copied to color formats). Kinds (layout_model.h DepthRead):
+    //   F32 r32float, F16 r16float (device without float32-filterable: the only filterable float
+    //   format), U32 r32uint / S32 r32sint (the raw stored value, see depth_twin_wgsl).
 
-    // The twin of a depth texture (created on first need): r32float, the same extent/mips/layers.
-    wgpu::Texture depth_twin(uint32_t id, TextureEntry& t) {
-        if (t.twin) return t.twin;
+    static wgpu::TextureFormat twin_format(DepthRead k) {
+        switch (k) {
+            case DepthRead::TwinF16: return wgpu::TextureFormat::R16Float;
+            case DepthRead::TwinU32: return wgpu::TextureFormat::R32Uint;
+            case DepthRead::TwinS32: return wgpu::TextureFormat::R32Sint;
+            default: return wgpu::TextureFormat::R32Float;
+        }
+    }
+
+    // The twin of kind `k` of a depth texture (created on first need): same extent/mips/layers.
+    wgpu::Texture depth_twin(uint32_t id, TextureEntry& t, DepthRead k) {
+        TwinSlot& slot = t.twins[static_cast<size_t>(k)];
+        if (slot.tex) return slot.tex;
         wgpu::TextureDescriptor td{};
         td.dimension = wgpu::TextureDimension::e2D;
         td.size = {t.geom.width, t.geom.height, t.geom.depth_or_layers};
-        td.format = wgpu::TextureFormat::R32Float;
+        td.format = twin_format(k);
         td.mipLevelCount = t.geom.mips;
         td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment;
-        t.twin = device.CreateTexture(&td);
-        if (t.twin) {
+        slot.tex = device.CreateTexture(&td);
+        if (slot.tex) {
             depth_twin_sources.insert(id);
-            t.twin_gen = 0;
+            slot.gen = 0;
             ++stats.depth_twins_created;
+            if (k == DepthRead::TwinU32 || k == DepthRead::TwinS32) ++stats.depth_int_twins_created;
+            if (k == DepthRead::TwinF16) ++stats.depth_half_twins_created;
         }
-        return t.twin;
+        return slot.tex;
     }
 
-    wgpu::TextureView depth_twin_view(TextureEntry& t, const GpuTextureViewDesc& d) {
+    wgpu::TextureView depth_twin_view(TextureEntry& t, DepthRead k, const GpuTextureViewDesc& d) {
         wgpu::TextureViewDescriptor vd{};
-        vd.format = wgpu::TextureFormat::R32Float;
+        vd.format = twin_format(k);
         if (d.dimension) vd.dimension = wgpu_view_dim(d.dimension);
         vd.baseMipLevel = d.base_mip_level;
         if (d.mip_level_count) vd.mipLevelCount = d.mip_level_count;
         vd.baseArrayLayer = d.base_array_layer;
         if (d.array_layer_count) vd.arrayLayerCount = d.array_layer_count;
-        return t.twin.CreateView(&vd);
+        return t.twins[static_cast<size_t>(k)].tex.CreateView(&vd);
     }
 
-    void ensure_depth_copy_pipeline() {
-        if (depth_copy_pipeline) return;
-        static const char kWgsl[] =
-            "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
-            "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
-            "  return vec4f(p[i], 0.0, 1.0);\n}\n"
-            "@group(0) @binding(0) var src: texture_depth_2d;\n"
-            "@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) f32 {\n"
-            "  return textureLoad(src, vec2i(pos.xy), 0);\n}\n";
+    wgpu::RenderPipeline depth_copy_pipeline_for(DepthRead k, uint8_t src_format) {
+        const uint32_t key = static_cast<uint32_t>(k) * 256u + src_format;
+        auto it = depth_copy_pipelines.find(key);
+        if (it != depth_copy_pipelines.end()) return it->second;
+        const std::string code = depth_twin_wgsl(k, src_format);
         wgpu::ShaderSourceWGSL wgsl{};
-        wgsl.code = kWgsl;
+        wgsl.code = code.c_str();
         wgpu::ShaderModuleDescriptor md{};
         md.nextInChain = &wgsl;
         wgpu::ShaderModule mod = device.CreateShaderModule(&md);
         wgpu::ColorTargetState ct{};
-        ct.format = wgpu::TextureFormat::R32Float;
+        ct.format = twin_format(k);
         wgpu::FragmentState fs{};
         fs.module = mod;
         fs.entryPoint = "fs";
@@ -1883,54 +1905,60 @@ struct NativeExecutor::Impl {
         pd.vertex.module = mod;
         pd.vertex.entryPoint = "vs";
         pd.fragment = &fs;
-        depth_copy_pipeline = device.CreateRenderPipeline(&pd);
+        wgpu::RenderPipeline p = device.CreateRenderPipeline(&pd);
+        depth_copy_pipelines[key] = p;
+        return p;
     }
 
-    // Before every pass begins (no pass open): re-copy the depth aspect of each stale twin source,
-    // one fullscreen pass per mip/layer, so the pass about to run reads the depth written so far.
+    // Before every pass begins (no pass open): re-copy the depth plane of each stale twin, one
+    // fullscreen pass per mip/layer, so the pass about to run reads the depth written so far.
     void refresh_depth_twins(wgpu::CommandEncoder& enc) {
         for (auto sit = depth_twin_sources.begin(); sit != depth_twin_sources.end();) {
             auto tit = textures.find(*sit);
-            if (tit == textures.end() || !tit->second.twin) { sit = depth_twin_sources.erase(sit); continue; }
+            if (tit == textures.end()) { sit = depth_twin_sources.erase(sit); continue; }
             ++sit;
             TextureEntry& t = tit->second;
-            if (t.twin_gen == t.depth_gen) continue;
-            ensure_depth_copy_pipeline();
-            if (!depth_copy_pipeline) continue;
-            const wgpu::BindGroupLayout bgl = depth_copy_pipeline.GetBindGroupLayout(0);
-            for (uint32_t m = 0; m < t.geom.mips; ++m) {
-                for (uint32_t l = 0; l < t.geom.depth_or_layers; ++l) {
-                    wgpu::TextureViewDescriptor sv{};
-                    sv.dimension = wgpu::TextureViewDimension::e2D;
-                    sv.aspect = wgpu::TextureAspect::DepthOnly;
-                    sv.baseMipLevel = m; sv.mipLevelCount = 1;
-                    sv.baseArrayLayer = l; sv.arrayLayerCount = 1;
-                    wgpu::TextureViewDescriptor dv = sv;
-                    dv.format = wgpu::TextureFormat::R32Float;
-                    dv.aspect = wgpu::TextureAspect::All;
-                    wgpu::BindGroupEntry be{};
-                    be.binding = 0;
-                    be.textureView = t.texture.CreateView(&sv);
-                    wgpu::BindGroupDescriptor bd{};
-                    bd.layout = bgl;
-                    bd.entryCount = 1;
-                    bd.entries = &be;
-                    wgpu::RenderPassColorAttachment ca{};
-                    ca.view = t.twin.CreateView(&dv);
-                    ca.loadOp = wgpu::LoadOp::Clear;
-                    ca.storeOp = wgpu::StoreOp::Store;
-                    wgpu::RenderPassDescriptor rp{};
-                    rp.colorAttachmentCount = 1;
-                    rp.colorAttachments = &ca;
-                    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
-                    pass.SetPipeline(depth_copy_pipeline);
-                    pass.SetBindGroup(0, device.CreateBindGroup(&bd));
-                    pass.Draw(3);
-                    pass.End();
+            for (size_t ki = 0; ki < t.twins.size(); ++ki) {
+                TwinSlot& slot = t.twins[ki];
+                if (!slot.tex || slot.gen == t.depth_gen) continue;
+                const DepthRead k = static_cast<DepthRead>(ki);
+                wgpu::RenderPipeline pipe = depth_copy_pipeline_for(k, t.geom.format);
+                if (!pipe) continue;
+                const wgpu::BindGroupLayout bgl = pipe.GetBindGroupLayout(0);
+                for (uint32_t m = 0; m < t.geom.mips; ++m) {
+                    for (uint32_t l = 0; l < t.geom.depth_or_layers; ++l) {
+                        wgpu::TextureViewDescriptor sv{};
+                        sv.dimension = wgpu::TextureViewDimension::e2D;
+                        sv.aspect = wgpu::TextureAspect::DepthOnly;
+                        sv.baseMipLevel = m; sv.mipLevelCount = 1;
+                        sv.baseArrayLayer = l; sv.arrayLayerCount = 1;
+                        wgpu::TextureViewDescriptor dv = sv;
+                        dv.format = twin_format(k);
+                        dv.aspect = wgpu::TextureAspect::All;
+                        wgpu::BindGroupEntry be{};
+                        be.binding = 0;
+                        be.textureView = t.texture.CreateView(&sv);
+                        wgpu::BindGroupDescriptor bd{};
+                        bd.layout = bgl;
+                        bd.entryCount = 1;
+                        bd.entries = &be;
+                        wgpu::RenderPassColorAttachment ca{};
+                        ca.view = slot.tex.CreateView(&dv);
+                        ca.loadOp = wgpu::LoadOp::Clear;
+                        ca.storeOp = wgpu::StoreOp::Store;
+                        wgpu::RenderPassDescriptor rp{};
+                        rp.colorAttachmentCount = 1;
+                        rp.colorAttachments = &ca;
+                        wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+                        pass.SetPipeline(pipe);
+                        pass.SetBindGroup(0, device.CreateBindGroup(&bd));
+                        pass.Draw(3);
+                        pass.End();
+                    }
                 }
+                slot.gen = t.depth_gen;
+                ++stats.depth_float_copies;
             }
-            t.twin_gen = t.depth_gen;
-            ++stats.depth_float_copies;
         }
     }
 
@@ -2126,6 +2154,9 @@ struct NativeExecutor::Impl {
                         wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
                         wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
                     w.texture.sampleType = kS[le.subtype];
+                    // 'float' + multisampled is invalid in WebGPU (a Texture2DMS<float4> SRV): non-filterable
+                    if (le.multisampled && w.texture.sampleType == wgpu::TextureSampleType::Float)
+                        w.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
                     w.texture.viewDimension = wgpu_view_dim(le.view_dim);
                     w.texture.multisampled = le.multisampled;
                 } else {
@@ -3049,12 +3080,20 @@ struct NativeExecutor::Impl {
                     } else if (!kind_mismatch && le && le->kind == 2 && le->subtype == 0 && tex_format &&
                                format_is_float32(tex_format) && !features.float32_filterable) {
                         use_dummy(*le);
-                    } else if (!kind_mismatch && le && le->kind == 2 && tex_format &&
-                               depth_sample_type_mismatch(le->subtype, tex_format)) {
-                        if (depth_float_twin_eligible(le->subtype, tex_format, t.sample_count, t.geom.dimension,
-                                                      features.float32_filterable) &&
-                            depth_twin(e.resource_id, t)) {
-                            pe.view = depth_twin_view(t, e.view);
+                    } else if (!kind_mismatch && le && le->kind == 2 && tex_format && format_is_depth(tex_format) &&
+                               pick_depth_read(le->subtype, le->multisampled, tex_format, e.view.aspect,
+                                               t.sample_count, t.geom.dimension, features.float32_filterable) !=
+                                   DepthRead::Direct) {
+                        const DepthRead dr = pick_depth_read(le->subtype, le->multisampled, tex_format, e.view.aspect,
+                                                             t.sample_count, t.geom.dimension, features.float32_filterable);
+                        if (dr == DepthRead::StencilDirect) {
+                            GpuTextureViewDesc sv = e.view;
+                            sv.aspect = 2;  // the stencil plane (a uint entry); Dawn rejects an all-aspect view
+                            pe.view = texture_view(t, &sv);
+                            have = static_cast<bool>(pe.view);
+                            if (have) ++stats.depth_stencil_direct_binds;
+                        } else if (dr != DepthRead::Dummy && depth_twin(e.resource_id, t, dr)) {
+                            pe.view = depth_twin_view(t, dr, e.view);
                             have = static_cast<bool>(pe.view);
                         }
                         if (!have) {
@@ -4671,6 +4710,9 @@ std::string NativeExecutor::stats_json() const {
     num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
     num("depth_float_copies", st.depth_float_copies);
     num("depth_twins_created", st.depth_twins_created);
+    num("depth_int_twins_created", st.depth_int_twins_created);
+    num("depth_half_twins_created", st.depth_half_twins_created);
+    num("depth_stencil_direct_binds", st.depth_stencil_direct_binds);
     num("manifest_layouts_resolved", st.manifest_layouts_resolved);
     num("v1_synth_samplers", st.v1_synth_samplers);
     num("timer_frames", st.timer_frames);

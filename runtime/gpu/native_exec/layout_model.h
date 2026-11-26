@@ -463,13 +463,74 @@ inline bool depth_sample_type_mismatch(uint8_t layout_sample_type, uint8_t forma
     return is_depth && layout_sample_type != 1;
 }
 
-// Depth bound to a float layout entry can be served by an r32float copy of the depth aspect
-// (depth-as-float twin) when the layout is plain 'float' (code 0), the texture is single-sampled 2D
-// and r32float is filterable. sint/uint entries (and stencil) keep the dummy.
-inline bool depth_float_twin_eligible(uint8_t layout_sample_type, uint8_t format, uint32_t sample_count,
-                                      uint8_t dimension, bool float32_filterable) {
-    return layout_sample_type == 0 && format_valid(format) && format_is_depth(format) && sample_count == 1 &&
-           dimension == 1 && float32_filterable;
+// How a depth-format texture is read through a layout entry (`pick_depth_read`).
+//   Direct         the depth view binds as is (depth entry, or unfilterable-float entry)
+//   StencilDirect  a stencil-aspect view binds as is to a uint entry (WebGPU: the stencil aspect's
+//                  sample type is uint, so no copy is needed; D3D12 reads the stencil plane the same way)
+//   Twin*          a color copy of the depth plane (see NativeExecutor::depth_twin)
+//   Dummy          no real read exists; the entry's dummy is bound (counted)
+enum class DepthRead : uint8_t {
+    Dummy = 0,
+    Direct,
+    StencilDirect,
+    TwinF32,  // r32float: float entry on a float32-filterable device
+    TwinF16,  // r16float: float entry without float32-filterable (the only filterable float format; the
+              // depth value is rounded to half precision, 11 bit mantissa)
+    TwinU32,  // r32uint: uint entry
+    TwinS32,  // r32sint: sint entry
+};
+constexpr size_t kDepthReadCount = 7;
+
+// layout_sample_type: the entry's code (0 float, 1 unfilterable-float, 2 depth, 3 sint, 4 uint).
+// aspect: the view's GpuTextureAspect (0 all, 1 depth, 2 stencil). A float entry that is multisampled
+// is a WebGPU-invalid combination (Dawn rejects the layout); the executor creates such an entry as
+// unfilterable-float, so it is treated as code 1 here.
+inline DepthRead pick_depth_read(uint8_t layout_sample_type, bool layout_multisampled, uint8_t format,
+                                 uint8_t aspect, uint32_t sample_count, uint8_t dimension,
+                                 bool float32_filterable) {
+    if (!format_valid(format) || !format_is_depth(format)) return DepthRead::Dummy;
+    const bool has_stencil = format == 47 || format == 49;
+    if (layout_sample_type == 0 && layout_multisampled) layout_sample_type = 1;
+    // Stencil-aspect view (or an all-aspect view of a stencil-bearing format on a uint entry: D3D12
+    // X24_TYPELESS_G8_UINT): only a uint entry takes the stencil plane, directly.
+    const bool stencil_plane = aspect == 2 || (aspect == 0 && has_stencil && layout_sample_type == 4);
+    if (stencil_plane) return has_stencil && layout_sample_type == 4 ? DepthRead::StencilDirect : DepthRead::Dummy;
+    if (layout_sample_type == 4)  // depth plane through an integer view: raw stored bits
+        return sample_count == 1 && dimension == 1 ? DepthRead::TwinU32 : DepthRead::Dummy;
+    switch (layout_sample_type) {
+        case 1:
+        case 2: return DepthRead::Direct;
+        case 0:
+            if (sample_count != 1 || dimension != 1) return DepthRead::Dummy;
+            return float32_filterable ? DepthRead::TwinF32 : DepthRead::TwinF16;
+        default: break;  // 3: sint
+    }
+    // sint: the depth plane's raw value through an integer view (not defined for multisampled r32 targets)
+    if (layout_sample_type == 3 && sample_count == 1 && dimension == 1) return DepthRead::TwinS32;
+    return DepthRead::Dummy;
+}
+
+// The twin copy shader: one fullscreen triangle, @fragment fn fs writes the twin texel from the depth
+// texel at the same coordinate (textureLoad, mip 0 of the single-mip/layer source view).
+//   float kinds   the depth value (f16: rounded to half precision by the r16float target)
+//   int kinds     the raw stored value, as D3D12 reads a depth resource through an R32_UINT / R32_SINT
+//                 view of its typeless family: depth32float -> the f32 bit pattern; depth16unorm ->
+//                 round(d * 65535); depth24plus(-stencil8) -> round(d * 16777215) (24-bit unorm).
+//                 r32sint is the same 32 bits reinterpreted as i32 (a bit-cast, never a value conversion).
+inline std::string depth_twin_wgsl(DepthRead kind, uint8_t src_format) {
+    std::string raw;
+    if (src_format == 45) raw = "u32(round(d * 65535.0))";
+    else if (src_format == 46 || src_format == 47) raw = "u32(round(d * 16777215.0))";
+    else raw = "bitcast<u32>(d)";
+    std::string out_ty = "f32", expr = "d";
+    if (kind == DepthRead::TwinU32) { out_ty = "u32"; expr = raw; }
+    else if (kind == DepthRead::TwinS32) { out_ty = "i32"; expr = "bitcast<i32>(" + raw + ")"; }
+    return std::string("@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+                       "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
+                       "  return vec4f(p[i], 0.0, 1.0);\n}\n"
+                       "@group(0) @binding(0) var src: texture_depth_2d;\n"
+                       "@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) ") +
+           out_ty + " {\n  let d = textureLoad(src, vec2i(pos.xy), 0);\n  return " + expr + ";\n}\n";
 }
 
 struct PickResult {

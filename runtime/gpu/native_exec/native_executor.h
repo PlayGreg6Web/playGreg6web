@@ -46,6 +46,9 @@ struct ExecutorOptions {
     // GPU pass timestamps (#1608): measured with timestamp queries when the adapter has the
     // feature and fed into this table (nullptr = the process-wide gpu_time_table(), the one the
     // boot report prints). Nothing is estimated: without the feature the table says unavailable.
+    // Test hook: do not request float32-filterable even when the adapter has it, so the code paths of a
+    // device without it (r16float depth twins, r32float dummies) run on real hardware.
+    bool disable_float32_filterable = false;
     bool gpu_timing = true;
     d3d12_guest::GpuTimeTable* gpu_time = nullptr;
     // Persistent Dawn blob cache (blob_cache.h): compiled shaders / pipelines are stored under
@@ -160,7 +163,10 @@ struct ExecutorStats {
     uint64_t reflection_binding_conflicts = 0; // ... of which two stages disagreed on a binding
     uint64_t bind_group_depth_layout_dummies = 0;  // depth view vs float/sint/uint layout entry (or the reverse): dummy bound
     uint64_t depth_float_copies = 0;       // depth aspect re-copied into an r32float twin (float layout entry meets a depth texture)
-    uint64_t depth_twins_created = 0;
+    uint64_t depth_twins_created = 0;      // ... of which r32uint/r32sint (uint/sint entry on a depth texture): depth_int_twins_created
+    uint64_t depth_int_twins_created = 0;
+    uint64_t depth_half_twins_created = 0; // r16float twins (float entry, device without float32-filterable): half-precision depth
+    uint64_t depth_stencil_direct_binds = 0;  // stencil-aspect views bound to a uint entry (no twin: the stencil aspect is uint)
     uint64_t reflection_layout_unsupported = 0;  // layout entries Dawn cannot take (externalTexture, unknown storage format)
     uint64_t manifest_layouts_resolved = 0;    // ManifestReference layouts served from a loaded layout-manifest.json
     uint64_t v1_synth_samplers = 0;            // v1 bind group samplers synthesized from the layout (default samplers)

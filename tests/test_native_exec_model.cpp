@@ -738,10 +738,29 @@ void test_layout_remap() {
     CHECK(depth_sample_type_mismatch(0, 48) && depth_sample_type_mismatch(3, 48) && depth_sample_type_mismatch(4, 48));
     CHECK(!depth_sample_type_mismatch(1, 48) && !depth_sample_type_mismatch(2, 48));  // unfilterable-float / depth take it
     CHECK(depth_sample_type_mismatch(2, 22) && !depth_sample_type_mismatch(0, 22));
-    CHECK(depth_float_twin_eligible(0, 48, 1, 1, true));  // float layout + single-sampled 2D depth + filterable r32float
-    CHECK(!depth_float_twin_eligible(0, 48, 1, 1, false) && !depth_float_twin_eligible(0, 48, 4, 1, true));
-    CHECK(!depth_float_twin_eligible(3, 48, 1, 1, true) && !depth_float_twin_eligible(4, 48, 1, 1, true));  // sint/uint keep the dummy
-    CHECK(!depth_float_twin_eligible(0, 22, 1, 1, true) && !depth_float_twin_eligible(0, 48, 1, 2, true));
+    // pick_depth_read(layout type, layout ms, format, aspect, samples, dim, float32_filterable)
+    CHECK(pick_depth_read(0, false, 48, 0, 1, 1, true) == DepthRead::TwinF32);  // float entry, filterable r32float
+    CHECK(pick_depth_read(0, false, 48, 0, 1, 1, false) == DepthRead::TwinF16);  // no float32-filterable: r16float
+    CHECK(pick_depth_read(0, false, 48, 0, 4, 1, true) == DepthRead::Dummy);  // non-ms entry vs ms texture
+    CHECK(pick_depth_read(0, true, 48, 0, 4, 1, true) == DepthRead::Direct);  // ms float entry is created unfilterable
+    CHECK(pick_depth_read(1, true, 49, 1, 4, 1, false) == DepthRead::Direct &&
+          pick_depth_read(2, false, 45, 0, 1, 1, false) == DepthRead::Direct);
+    CHECK(pick_depth_read(4, false, 48, 0, 1, 1, true) == DepthRead::TwinU32);  // depth plane through uint: raw bits
+    CHECK(pick_depth_read(3, false, 45, 1, 1, 1, true) == DepthRead::TwinS32);
+    CHECK(pick_depth_read(3, true, 48, 0, 4, 1, true) == DepthRead::Dummy &&
+          pick_depth_read(4, true, 48, 0, 4, 1, true) == DepthRead::Dummy);
+    CHECK(pick_depth_read(4, false, 47, 2, 1, 1, true) == DepthRead::StencilDirect);  // stencil plane: direct, also ms
+    CHECK(pick_depth_read(4, true, 49, 0, 4, 1, true) == DepthRead::StencilDirect);
+    CHECK(pick_depth_read(4, false, 49, 1, 1, 1, true) == DepthRead::TwinU32);  // explicit depth aspect: depth bits
+    CHECK(pick_depth_read(2, false, 47, 2, 1, 1, true) == DepthRead::Dummy &&
+          pick_depth_read(0, false, 47, 2, 1, 1, true) == DepthRead::Dummy);
+    CHECK(pick_depth_read(4, false, 48, 2, 1, 1, true) == DepthRead::Dummy);  // depth32float has no stencil plane
+    CHECK(pick_depth_read(0, false, 22, 0, 1, 1, true) == DepthRead::Dummy &&
+          pick_depth_read(0, false, 48, 0, 1, 2, true) == DepthRead::Dummy);
+    CHECK(depth_twin_wgsl(DepthRead::TwinU32, 48).find("bitcast<u32>(d)") != std::string::npos);
+    CHECK(depth_twin_wgsl(DepthRead::TwinU32, 45).find("65535.0") != std::string::npos);
+    CHECK(depth_twin_wgsl(DepthRead::TwinS32, 47).find("@location(0) i32") != std::string::npos &&
+          depth_twin_wgsl(DepthRead::TwinS32, 47).find("bitcast<i32>(u32(round(d * 16777215.0)))") != std::string::npos);
     CHECK(texture_sample_type(25, true) == WgslSampleType::Uint);  // rgba8uint
     CHECK(texture_sample_type(26, true) == WgslSampleType::Sint);  // rgba8sint
     CHECK(texture_sample_type(44, true) == WgslSampleType::Uint);  // stencil8
