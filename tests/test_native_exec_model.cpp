@@ -625,6 +625,19 @@ void test_v1_vertex_layout() {
     CHECK(l.stride == 24 && l.components == 3);
 }
 
+static void test_negotiated_limits() {
+    const LimitSpec& tex = kOptionalLimitSpecs[0];  // maxSampledTexturesPerShaderStage: 16 / cap 256
+    CHECK(!negotiated_limit(tex, 16));              // at the default: nothing requested
+    CHECK(!negotiated_limit(tex, 8));
+    CHECK(negotiated_limit(tex, 17) == 17u);
+    CHECK(negotiated_limit(tex, 1000000) == 256u);  // capped
+    const LimitSpec& buf = kOptionalLimitSpecs[6];  // maxBufferSize: 256 MiB / cap 1 GiB
+    CHECK(!negotiated_limit(buf, 256ull << 20));
+    CHECK(negotiated_limit(buf, 4ull << 30) == (1ull << 30));
+    CHECK(negotiated_limit(buf, 512ull << 20) == (512ull << 20));
+    CHECK(kOptionalLimitCount == 9);
+}
+
 int main() {
     test_shader_payloads();
     test_pack();
@@ -641,6 +654,7 @@ int main() {
     test_readback_layout();
     test_readback_deliver();
     test_v1_vertex_layout();
+    test_negotiated_limits();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

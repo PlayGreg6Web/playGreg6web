@@ -217,4 +217,35 @@ inline V1VertexLayout plan_v1_vertex_layout(uint32_t vertex_stride) {
     return l;
 }
 
+// ---- Device negotiation (wgpu_worker.js `requestNegotiatedDevice`) ----
+
+// OPTIONAL_ADAPTER_LIMIT_SPECS: a limit is requested (at min(supported, cap)) only when that is
+// above the WebGPU default the spec pins, so an adapter at the default asks for nothing.
+struct LimitSpec {
+    const char* name;
+    uint64_t default_min;
+    uint64_t cap;
+};
+
+inline constexpr LimitSpec kOptionalLimitSpecs[] = {
+    {"maxSampledTexturesPerShaderStage", 16, 256},
+    {"maxSamplersPerShaderStage", 16, 64},
+    {"maxStorageBuffersPerShaderStage", 8, 32},
+    {"maxUniformBuffersPerShaderStage", 12, 32},
+    {"maxStorageTexturesPerShaderStage", 4, 16},
+    {"maxBindingsPerBindGroup", 1000, 4096},
+    {"maxBufferSize", 256ull * 1024 * 1024, 1024ull * 1024 * 1024},
+    {"maxStorageBufferBindingSize", 128ull * 1024 * 1024, 512ull * 1024 * 1024},
+    {"maxComputeWorkgroupStorageSize", 16384, 65536},
+};
+inline constexpr size_t kOptionalLimitCount = sizeof(kOptionalLimitSpecs) / sizeof(kOptionalLimitSpecs[0]);
+
+// selectSupportedAdapterLimits for one limit: the value to require, or nullopt (the worker's
+// `clamped > defaultMin` test; a non-supported value is never requested).
+inline std::optional<uint64_t> negotiated_limit(const LimitSpec& spec, uint64_t adapter_supported) {
+    const uint64_t clamped = std::min(adapter_supported, spec.cap);
+    if (clamped > spec.default_min) return clamped;
+    return std::nullopt;
+}
+
 }  // namespace playgta6::gpu::native_exec

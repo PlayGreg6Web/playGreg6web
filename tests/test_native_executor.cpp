@@ -2,6 +2,7 @@
 // clear/present, buffers, textures, shaders, layouts, pipelines, draws and dispatches, v1 pipelines,
 // GPU -> CPU read-backs into (host) memory and GPU pass timestamps, with every result read back from the GPU. Exits 77
 // (CTest: skipped) when the host has no WebGPU adapter. Built with -DPLAYGTA6_NATIVE_EXECUTOR=ON.
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -802,6 +803,31 @@ void test_timers() {
 
 }  // namespace
 
+// The live boot (--window) attaches absolute host addresses: the native producer's ReadbackGate
+// hands out host pointers for dst_addr / done_addr. The bytes are the compute result still in
+// buffer 100 (bytes 4..12: 3, 5 as u32), read back from the GPU.
+void test_readbacks_host_addresses(NativeExecutor& ex) {
+    alignas(8) uint8_t dst[16];
+    std::memset(dst, 0xEE, sizeof dst);
+    alignas(8) uint32_t done = 0;
+    GuestMemory gm;
+    gm.host_addresses = true;
+    ex.attach_guest_memory(gm);
+    const uint64_t before = ex.stats().readbacks_delivered;
+    gpu::CommandEncoder enc;
+    emit(enc, GpuOpcode::ReadbackBuffer,
+         bytes_of(rb_buffer(100, 4, 8, reinterpret_cast<uintptr_t>(dst), reinterpret_cast<uintptr_t>(&done))));
+    run(ex, enc);
+    ex.wait_idle();
+    ex.poll();
+    const uint8_t want[8] = {3, 0, 0, 0, 5, 0, 0, 0};
+    CHECK(std::memcmp(dst, want, 8) == 0);
+    CHECK(dst[8] == 0xEE);
+    CHECK(std::atomic_ref<uint32_t>(done).load() == 1);
+    CHECK(ex.stats().readbacks_delivered == before + 1);
+    ex.attach_guest_memory(GuestMemory{});
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -818,6 +844,7 @@ int main() {
         return 1;
     }
     std::printf("adapter: %s (%s)\n", ex->adapter().description.c_str(), ex->adapter().backend.c_str());
+    std::printf("limits_raised: %d\n", ex->stats().limits_raised ? 1 : 0);
     test_clear_present(*ex);
     test_buffers(*ex);
     test_textured_draw(*ex);
@@ -825,6 +852,7 @@ int main() {
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
     test_readbacks(*ex);
+    test_readbacks_host_addresses(*ex);
     test_v1(*ex);
     CHECK(ex->stats().device_lost == 0);
     test_timers();

@@ -91,6 +91,7 @@ struct ExecutorStats {
     uint64_t timer_passes = 0;            // passes that carried timestamp writes
     uint64_t timer_frames_skipped = 0;    // no free query slot (the previous one was still in flight)
     bool timer_supported = false;
+    bool limits_raised = false;  // device created with requestNegotiatedDevice's raised limits
     std::array<uint64_t, kOpcodeSlots> handled{};    // by opcode
     std::array<uint64_t, kOpcodeSlots> unhandled{};  // by opcode: not implemented yet, skipped
     uint64_t unknown_opcodes = 0;                    // opcode >= kOpcodeSlots

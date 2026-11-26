@@ -412,6 +412,7 @@ struct NativeExecutor::Impl {
 
     // ---- milestone 2 state ----
     GuestMemory guest_mem;
+    bool negotiated_limits_applied = false;  // the device was created with the raised limits
     std::vector<Impl_ReadbackEntry> recorded_readbacks;  // recorded into the encoder being built
     bool readback_flush_wanted = false;
     uint64_t pending_maps = 0;  // read-back / timer map callbacks not delivered yet
@@ -521,39 +522,86 @@ struct NativeExecutor::Impl {
             toggles.disabledToggleCount = 1;
             toggles.disabledToggles = kDisabledToggles;
         }
-        wgpu::DeviceDescriptor ddesc{};
-        if (want_timing) ddesc.nextInChain = &toggles;
-        ddesc.requiredFeatureCount = required.size();
-        ddesc.requiredFeatures = required.data();
-        ddesc.SetUncapturedErrorCallback(
-            [](const wgpu::Device&, wgpu::ErrorType, wgpu::StringView msg, Impl* self) {
-                ++self->stats.device_errors;
-                self->stats.last_device_error = to_string(msg);
-                if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
-            },
-            this);
-        ddesc.SetDeviceLostCallback(
-            wgpu::CallbackMode::AllowSpontaneous,
-            [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView msg, Impl* self) {
-                if (reason == wgpu::DeviceLostReason::Destroyed) return;  // our own teardown
-                ++self->stats.device_lost;
-                self->lost = true;
-                self->stats.last_device_error = to_string(msg);
-            },
-            this);
+        // Limits (requestNegotiatedDevice): each optional limit above the WebGPU default, capped.
+        wgpu::Limits adapter_limits{};
+        wgpu::Limits required_limits{};
+        bool have_limits = false;
+        if (adapter_handle.GetLimits(&adapter_limits) == wgpu::Status::Success) {
+            const uint64_t supported[kOptionalLimitCount] = {
+                adapter_limits.maxSampledTexturesPerShaderStage, adapter_limits.maxSamplersPerShaderStage,
+                adapter_limits.maxStorageBuffersPerShaderStage,  adapter_limits.maxUniformBuffersPerShaderStage,
+                adapter_limits.maxStorageTexturesPerShaderStage, adapter_limits.maxBindingsPerBindGroup,
+                adapter_limits.maxBufferSize,                    adapter_limits.maxStorageBufferBindingSize,
+                adapter_limits.maxComputeWorkgroupStorageSize};
+            uint64_t want[kOptionalLimitCount];
+            for (size_t i = 0; i < kOptionalLimitCount; ++i) {
+                const auto v = negotiated_limit(kOptionalLimitSpecs[i], supported[i]);
+                want[i] = v ? *v : 0;
+                have_limits = have_limits || v.has_value();
+            }
+            required_limits.maxSampledTexturesPerShaderStage = want[0] ? static_cast<uint32_t>(want[0]) : WGPU_LIMIT_U32_UNDEFINED;
+            required_limits.maxSamplersPerShaderStage = want[1] ? static_cast<uint32_t>(want[1]) : WGPU_LIMIT_U32_UNDEFINED;
+            required_limits.maxStorageBuffersPerShaderStage = want[2] ? static_cast<uint32_t>(want[2]) : WGPU_LIMIT_U32_UNDEFINED;
+            required_limits.maxUniformBuffersPerShaderStage = want[3] ? static_cast<uint32_t>(want[3]) : WGPU_LIMIT_U32_UNDEFINED;
+            required_limits.maxStorageTexturesPerShaderStage = want[4] ? static_cast<uint32_t>(want[4]) : WGPU_LIMIT_U32_UNDEFINED;
+            required_limits.maxBindingsPerBindGroup = want[5] ? static_cast<uint32_t>(want[5]) : WGPU_LIMIT_U32_UNDEFINED;
+            required_limits.maxBufferSize = want[6] ? want[6] : WGPU_LIMIT_U64_UNDEFINED;
+            required_limits.maxStorageBufferBindingSize = want[7] ? want[7] : WGPU_LIMIT_U64_UNDEFINED;
+            required_limits.maxComputeWorkgroupStorageSize = want[8] ? static_cast<uint32_t>(want[8]) : WGPU_LIMIT_U32_UNDEFINED;
+        }
+        // Features + limits, then features only, then a bare device (the worker's order; the
+        // timestamp feature rides along with the features and is dropped with them).
         struct DeviceResult {
             wgpu::Device device;
             std::string message;
         } dr;
-        instance.WaitAny(
-            adapter_handle.RequestDevice(
-                &ddesc, wgpu::CallbackMode::WaitAnyOnly,
-                [](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView msg, DeviceResult* out) {
-                    if (s == wgpu::RequestDeviceStatus::Success) out->device = std::move(d);
-                    else out->message = to_string(msg);
+        enum Attempt { kFeaturesAndLimits, kFeaturesOnly, kBare };
+        for (const Attempt attempt : {kFeaturesAndLimits, kFeaturesOnly, kBare}) {
+            if (attempt == kFeaturesAndLimits && !have_limits) continue;
+            wgpu::DeviceDescriptor ddesc{};
+            const bool with_features = attempt != kBare;
+            if (with_features && want_timing) ddesc.nextInChain = &toggles;
+            if (with_features) {
+                ddesc.requiredFeatureCount = required.size();
+                ddesc.requiredFeatures = required.data();
+            }
+            if (attempt == kFeaturesAndLimits) ddesc.requiredLimits = &required_limits;
+            ddesc.SetUncapturedErrorCallback(
+                [](const wgpu::Device&, wgpu::ErrorType, wgpu::StringView msg, Impl* self) {
+                    ++self->stats.device_errors;
+                    self->stats.last_device_error = to_string(msg);
+                    if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
                 },
-                &dr),
-            kWaitForever);
+                this);
+            ddesc.SetDeviceLostCallback(
+                wgpu::CallbackMode::AllowSpontaneous,
+                [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView msg, Impl* self) {
+                    if (reason == wgpu::DeviceLostReason::Destroyed) return;  // our own teardown
+                    ++self->stats.device_lost;
+                    self->lost = true;
+                    self->stats.last_device_error = to_string(msg);
+                },
+                this);
+            dr = DeviceResult{};
+            instance.WaitAny(
+                adapter_handle.RequestDevice(
+                    &ddesc, wgpu::CallbackMode::WaitAnyOnly,
+                    [](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView msg, DeviceResult* out) {
+                        if (s == wgpu::RequestDeviceStatus::Success) out->device = std::move(d);
+                        else out->message = to_string(msg);
+                    },
+                    &dr),
+                kWaitForever);
+            if (dr.device) {
+                negotiated_limits_applied = attempt == kFeaturesAndLimits;
+                stats.limits_raised = negotiated_limits_applied;
+                if (attempt == kBare) {  // the features were dropped with the request
+                    features = DeviceFeatures{};
+                    required.clear();
+                }
+                break;
+            }
+        }
         if (!dr.device) {
             *status = CreateStatus::Failed;
             *error = "RequestDevice failed: " + dr.message;
@@ -2833,6 +2881,7 @@ std::string NativeExecutor::stats_json() const {
     num("timer_passes", st.timer_passes);
     num("timer_frames_skipped", st.timer_frames_skipped);
     num("timer_supported", st.timer_supported ? 1 : 0);
+    num("limits_raised", st.limits_raised ? 1 : 0);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
         j += "\"";

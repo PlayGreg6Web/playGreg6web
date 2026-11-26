@@ -108,10 +108,12 @@ Every handler names the worker function it mirrors.
 
 Known divergences, to be closed or documented as they come up:
 
-- Device creation mirrors the replay page (the six optional features it requests, when the adapter has
-  them, and default limits) plus `timestamp-query` for the GPU pass timer (with Dawn's timestamp
-  quantization toggle off: Chrome rounds timestamps to 100 us, the native table gets exact values); the
-  worker's `requestNegotiatedDevice` (raised limits, more features) is not mirrored yet.
+- Device creation mirrors the worker's `requestNegotiatedDevice`: the six optional features it requests
+  (when the adapter has them) and the nine optional limits raised to `min(adapter, cap)` when that is
+  above the WebGPU default (`kOptionalLimitSpecs`, `limits_raised` in the stats), with the same fallback
+  order (features + limits, features only, bare), plus `timestamp-query` for the GPU pass timer (with
+  Dawn's timestamp quantization toggle off: Chrome rounds timestamps to 100 us, the native table gets
+  exact values).
 - A pipeline with `pipeline_layout_id == 0` ("auto") or whose explicit layout does not match the WGSL
   `@group(0)` bindings gets Dawn's `layout: auto` without the worker's bind-group remap
   (`_getOrCreateRemappedBindGroup`); `auto_layout_pipelines` counts the first case. Manifest layouts
@@ -127,8 +129,8 @@ Known divergences, to be closed or documented as they come up:
 - Read-backs (`39`/`40`) write to the memory given by `attach_guest_memory`: a base pointer + size (the
   browser's wasm memory offsets) or absolute host addresses (what the native `ReadbackGate` hands
   out). Nothing attached: nothing is written and the counter does not move (the worker's `!memory`).
-  The live boot (`--window`) does not attach memory yet: how a guest address maps to a host pointer is
-  settled in M3. A frame that cannot be presented completes its queued read-backs as failed (the worker
+  The live boot (`--window`) attaches absolute host addresses (the producer's `CommandList::readback_target`
+  already hands out host pointers), so read-backs land in the running guest. A frame that cannot be presented completes its queued read-backs as failed (the worker
   would leave the counter standing, and the producer's fence hold with it).
 - GPU pass timestamps time a pass as a whole (WebGPU has no timestamp writes inside a pass). A pass is
   keyed by the pipeline its first `SetPipeline` / `SetComputePipeline` selects: the fragment shader's
@@ -165,7 +167,8 @@ Known divergences, to be closed or documented as they come up:
 | `39`/`40` read-back into producer memory + completion counter, early read-back flush | `_recordReadbackCopy`, `_startRecordedReadbacks`, `_flushReadbacksNow` | **M2 (done)** |
 | GPU pass timestamps feeding `runtime/gpu/gpu_time` (#1608), `gpu_time` in the boot report | `gpu_timer.js` | **M2 (done)** |
 | `layout-manifest.json` layouts, the reflection loader, the layout:auto bind-group remap | `reflection_loader.js`, `_getOrCreateRemappedBindGroup` | M2b (open) |
-| Swapchain blit fallback, `requestNegotiatedDevice` feature/limit negotiation | `wgpu_swapchain.js`, `requestNegotiatedDevice` | M2b (open) |
+| `requestNegotiatedDevice` limit negotiation | `requestNegotiatedDevice` | **M2b (done)** |
+| Swapchain blit fallback | `wgpu_swapchain.js` | M2b (open) |
 | Live boot: `playgta6_boot --native-gpu [--window]`, present any target | `os::wgpu_submit` observer | M3 |
 
 The order follows what a real capture needs to draw anything: M1 is the first milestone at which

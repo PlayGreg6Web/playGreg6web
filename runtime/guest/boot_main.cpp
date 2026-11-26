@@ -783,7 +783,15 @@ bool start_live_window() {
     const bool ok = g_live.start(
         [options](std::string* err) -> std::unique_ptr<ne::NativeExecutor> {
             ne::NativeExecutor::CreateStatus status;
-            return ne::NativeExecutor::create(options, &status, err);
+            auto exec = ne::NativeExecutor::create(options, &status, err);
+            if (exec) {
+                // The producer's read-back packets carry absolute host addresses (ReadbackGate /
+                // CommandList::readback_target), so the results land straight in the running guest.
+                ne::GuestMemory mem;
+                mem.host_addresses = true;
+                exec->attach_guest_memory(mem);
+            }
+            return exec;
         },
         [] {
             std::fprintf(stderr, "[harness] window closed: stopping the boot\n");
