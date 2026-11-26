@@ -8,10 +8,6 @@
 #include <cstdint>
 #include <string>
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
 namespace playgta6::guest::minidump {
 
 // "<report dir>/<scope>-fault-<kind>-<pid>.dmp"; kind is reduced to [A-Za-z0-9_-].
@@ -44,34 +40,5 @@ inline std::string annotate_report(const std::string& report, const std::string&
     const size_t after = at + sizeof(kKey) - 1;
     return report.substr(0, after) + "\"minidump\": \"" + esc + "\", " + report.substr(after);
 }
-
-#ifdef _WIN32
-// Writes the dump; `info` may be null (guest faults: the current thread's context). Returns true
-// on success. Never throws; safe to call from the vectored handler.
-inline bool write(const std::string& path, EXCEPTION_POINTERS* info) {
-    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-    if (dbghelp == nullptr) return false;
-    using WriteFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, DWORD, void*, void*, void*);
-    auto fn = reinterpret_cast<WriteFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
-    HANDLE file = fn != nullptr ? CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                              FILE_ATTRIBUTE_NORMAL, nullptr)
-                                : INVALID_HANDLE_VALUE;
-    bool ok = false;
-    if (file != INVALID_HANDLE_VALUE) {
-        struct ExceptionInfo {  // MINIDUMP_EXCEPTION_INFORMATION (packed on x86 only)
-            DWORD thread_id;
-            EXCEPTION_POINTERS* pointers;
-            BOOL client_pointers;
-        } ex{GetCurrentThreadId(), info, FALSE};
-        constexpr DWORD kWithIndirectlyReferencedMemory = 0x00000040;
-        constexpr DWORD kWithThreadInfo = 0x00001000;
-        ok = fn(GetCurrentProcess(), GetCurrentProcessId(), file, kWithIndirectlyReferencedMemory | kWithThreadInfo,
-                info != nullptr ? &ex : nullptr, nullptr, nullptr) != FALSE;
-        CloseHandle(file);
-    }
-    FreeLibrary(dbghelp);
-    return ok;
-}
-#endif
 
 }  // namespace playgta6::guest::minidump
