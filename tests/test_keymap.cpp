@@ -117,18 +117,12 @@ int main() {
         CHECK(near(km::mouse_stick_step(0.8f, -4.0f, s), -0.2f));           // reversal switches at once
         km::Keymap m;
         std::vector<std::string> e;
-        CHECK(parse("[mouse]
-look = on
-", m, e));
+        CHECK(parse("[mouse]\nlook = on\n", m, e));
         const auto st = km::evaluate_look(m, [](int) { return false; }, 0.4f, -0.3f);
         CHECK(near(st.right_stick_x, 0.4f) && near(st.right_stick_y, -0.3f));
         CHECK(m.mouse_release_vk == 0x77);
-        CHECK(parse("[mouse]
-release_key = Alt
-", m, e) && m.mouse_release_vk == 0x12);
-        CHECK(!parse("[mouse]
-release_key = bogus
-", m, e));
+        CHECK(parse("[mouse]\nrelease_key = Alt\n", m, e) && m.mouse_release_vk == 0x12);
+        CHECK(!parse("[mouse]\nrelease_key = bogus\n", m, e));
     }
 
     // Mouse look: right stick, sensitivity, invert, clamping, off by default.

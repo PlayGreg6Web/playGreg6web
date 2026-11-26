@@ -174,11 +174,14 @@ std::string default_keymap_text() {
     }
     s +=
         "\n[mouse]\n"
-        "# Real mouse movement drives the right stick. The cursor is not re-centred, so it stops at the screen edge.\n"
+        "# Real mouse movement drives the right stick. In the live window the cursor is captured (Raw Input,\n"
+        "# hidden and confined to the window) while it has focus; release_key toggles the capture, a click\n"
+        "# in the window re-captures. Focus loss and minimising release it too.\n"
         "look = off\n"
         "# Stick deflection per pixel moved per 8 ms poll (0.001 .. 10).\n"
         "sensitivity = 0.05\n"
-        "invert_y = off\n";
+        "invert_y = off\n"
+        "release_key = F8\n";
     return s;
 }
 
