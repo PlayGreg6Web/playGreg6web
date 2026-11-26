@@ -377,6 +377,10 @@ def menu_flow_4_script_text(duration_ms: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+# LEGAL NOTICES (Copyright, Photosensitivity Health Warning, "Next >", BACK): 37 draws/frame; A on
+# "Copyright" opens the document viewer (the old preset looped there). Down x2 reaches "Next >".
+LEGAL_SCREEN = "37"
+
 # The legal-document viewer (the list screen): 50 / 33 draws/frame on its list, 51 with a document open.
 VIEWER_SCREEN = "33|50|51"
 
@@ -390,21 +394,20 @@ def _viewer_round() -> list[tuple[int, str, int]]:
 
 
 def menu_to_ingame_script_text(duration_ms: int) -> str:
-    """The menu-to-ingame preset: to the legal-document viewer after LEGAL NOTICES (_to_list_screen),
-    then the viewer rounds (_viewer_round, every 20 s until the screen is no longer the viewer, steady
-    3 s, 240 s timeout; #663: the run stayed on the viewer, which no preset had pressed B on), then
-    the steps of the browser preset of the same name (web/input/input_bridge.js, #1228): a hold-A
-    (600 ms) / Menu skip + A, repeated every 15 s until the screen leaves 34 draws/frame (steady 3 s,
-    120 s timeout); A every 2.5 s x4 (Story / New Game / Continue confirmations); then every 12 s A,
-    left stick forward, right stick, LT, RT (in-game movement)."""
-    lines = ["# menu-to-ingame (tools/run_native_boot.py): to the legal-document viewer (" + LIST_SCREEN + "),",
-             "# B / open, scroll, close each entry until it is dismissed; then the browser",
+    """The menu-to-ingame preset: A to LEGAL NOTICES (37 draws/frame, steady 1.5 s), then D-pad Down x2 + A
+    on its "Next >" every 8 s until the screen leaves 37 draws/frame (R40 run: the wait was met at
+    194 s and the screen then stayed on LEGAL NOTICES with Copyright selected, so this is not yet
+    enough), then the steps of the browser preset of the same name (web/input/input_bridge.js, #1228): a
+    hold-A (600 ms) / Menu skip + A, repeated every 15 s until the screen leaves 34 draws/frame (steady 3 s,
+    120 s timeout); A every 2.5 s x4; then every 12 s A, left stick forward, right stick, LT, RT."""
+    lines = ["# menu-to-ingame (tools/run_native_boot.py): A to LEGAL NOTICES (" + LEGAL_SCREEN + " draws/frame),",
+             "# Down, Down, A on its \"Next >\" until it is left; then the browser",
              "# menu-to-ingame skip / confirm / movement phases"]
-    lines += _to_list_screen()
-    lines.append(f"repeat every 20s until draws_per_frame!={VIEWER_SCREEN} for 3s timeout 240s")
-    lines += ["  " + line for line in _lines(_viewer_round())]
-    lines += ["end",
-              "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+    lines += _lines([(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)])
+    lines += [f"repeat every 14s until draws_per_frame=={LEGAL_SCREEN} for 1500ms timeout 240s", "  0 A 100", "end",
+              f"repeat every 8s until draws_per_frame!={LEGAL_SCREEN} for 2s timeout 120s",
+              "  0 DDown 150", "  1500 DDown 150", "  3500 A 100", "end", "capture"]
+    lines += ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
               "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end"]
     events: list[tuple[int, str, int]] = [(t, "A", INPUT_HOLD_MS) for t in range(1_000, 11_000, 2_500)]
     for t in range(12_000, duration_ms, 12_000):
