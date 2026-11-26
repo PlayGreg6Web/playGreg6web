@@ -497,12 +497,26 @@ fn r59_wasm64_simd128_codegen_and_edge_cases() {
                     assert!(!asm.contains("i64x2.extract_lane"), "vptest extracted lanes:\n{asm}");
                 }
                 "pmuludq" => {
-                    assert!(asm.contains("i64x2.extmul_low_i32x4_u"), "{asm}");
-                    assert!(!asm.contains("i64x2.mul"), "{asm}");
+                    // Newer LLVM (23+) `opt -O2` canonicalizes zext(shuffle) into an `and` with
+                    // 0xFFFFFFFF that the wasm backend no longer folds back into `extmul`; the
+                    // masked `i64x2.mul` is still a pure SIMD128 sequence (no scalarization).
+                    assert!(
+                        asm.contains("i64x2.extmul_low_i32x4_u")
+                            || (asm.contains("v128.and") && asm.contains("4294967295")),
+                        "{asm}"
+                    );
+                    assert!(!asm.contains("extract_lane"), "pmuludq scalarized:
+{asm}");
                 }
                 "pmuldq" => {
-                    assert!(asm.contains("i64x2.extmul_low_i32x4_s"), "{asm}");
-                    assert!(!asm.contains("i64x2.mul"), "{asm}");
+                    // See pmuludq: newer LLVM may keep a shl/shr_s sign-extension + `i64x2.mul`.
+                    assert!(
+                        asm.contains("i64x2.extmul_low_i32x4_s")
+                            || (asm.contains("i64x2.shr_s") && asm.contains("i64x2.mul")),
+                        "{asm}"
+                    );
+                    assert!(!asm.contains("extract_lane"), "pmuldq scalarized:
+{asm}");
                 }
                 "cvtpd2ps" => {
                     assert!(asm.contains("f32x4.demote_f64x2_zero"), "{asm}");
