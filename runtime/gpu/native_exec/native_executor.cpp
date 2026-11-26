@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -31,6 +33,7 @@
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
+#include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/stream_model.h"
 
 namespace playgta6::gpu::native_exec {
@@ -281,6 +284,7 @@ struct ShaderEntry {
     mutable std::optional<std::string> explicit_ep;
     uint32_t stage = 0;
     uint64_t hash = 0;  // the pack hash of a hash-only payload (0 = inline WGSL): the GPU-time key
+    uint64_t reflect_hash = 0;  // the worker's `hashHex`: the pack hash, else FNV-1a 64 of the WGSL text
     mutable bool pending = false;  // pack-backed and not yet materialized
 };
 
@@ -489,6 +493,16 @@ struct NativeExecutor::Impl {
     wgpu::BindGroupLayout empty_layout;
     wgpu::ShaderModule empty_fragment;
     std::unique_ptr<WgslPack> pack;
+    // Reflection loader (web/workers/reflection_loader.js ReflectionRegistry) and the layouts a v1
+    // pipeline was built with (`_pipelineBindGroupLayouts` / `_pipelineReflectionGroups` and the compute twins).
+    reflect::ReflectionRegistry reflection;
+    struct ReflectedLayout {
+        wgpu::PipelineLayout pipeline_layout;
+        std::vector<wgpu::BindGroupLayout> bgls;
+        std::vector<std::vector<reflect::LayoutEntryDesc>> groups;
+    };
+    std::unordered_map<uint32_t, ReflectedLayout> reflected_render, reflected_compute;
+    std::unordered_map<std::string, wgpu::BindGroupLayout> manifest_bgls;  // by layout id hex
 
     // ---- milestone 2 state ----
     GuestMemory guest_mem;
@@ -1357,6 +1371,8 @@ struct NativeExecutor::Impl {
         shaders.erase(id);
         render_pipelines.erase(id);
         compute_pipelines.erase(id);
+        reflected_render.erase(id);
+        reflected_compute.erase(id);
         compute_hash.erase(id);
         compute_bind_groups.erase(id);
         bgls.erase(id);
@@ -1372,6 +1388,145 @@ struct NativeExecutor::Impl {
         auto p = std::make_unique<WgslPack>();
         if (!p->load(path, error)) return false;
         pack = std::move(p);
+        // The boot orchestrator's deriveReflectionSidecarUrl: `<pack>.reflect.json`, optional.
+        std::error_code ec;
+        const std::string sidecar = path + ".reflect.json";
+        if (std::filesystem::is_regular_file(sidecar, ec)) {
+            std::string rerr;
+            if (!load_reflection_file(sidecar, &rerr)) stats.last_reflection_error = sidecar + ": " + rerr;
+        }
+        return true;
+    }
+
+    bool load_reflection_text(const std::string& text, std::string* error) {
+        const std::string err = reflection.load(text);
+        stats.reflection_shaders = reflection.shader_count();
+        if (!err.empty()) {
+            ++stats.reflection_load_errors;
+            stats.last_reflection_error = err;
+            if (error) *error = err;
+            return false;
+        }
+        ++stats.reflection_documents;
+        return true;
+    }
+
+    bool load_reflection_file(const std::string& path, std::string* error) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            ++stats.reflection_load_errors;
+            if (error) *error = "cannot open the reflection document";
+            return false;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return load_reflection_text(ss.str(), error);
+    }
+
+    // _resolveShaderReflection: the registry record of a shader by its hash, then by "<stage>:<entry>".
+    // (`registerShaderReflectionKey` has no native producer, so no explicit key.)
+    const reflect::StageRecord* resolve_shader_reflection(const ShaderEntry& e, const char* stage_name) {
+        if (reflection.shader_count() == 0) return nullptr;
+        if (const auto* r = reflection.lookup_hash(e.reflect_hash)) return r;
+        if (e.explicit_ep && !e.explicit_ep->empty())
+            if (const auto* r = reflection.lookup_name(std::string(stage_name) + ":" + *e.explicit_ep)) return r;
+        return nullptr;
+    }
+
+    static std::optional<uint8_t> format_code_by_name(const std::string& name) {
+        for (uint8_t c = 1; c < kFormatCodeCount; ++c)
+            if (name == format_info(c).name) return c;
+        return std::nullopt;
+    }
+
+    // `pipelineCache.createBindGroupLayoutFromReflection(desc)` / `device.createBindGroupLayout`.
+    // false: an entry Dawn cannot take (counted; the worker's createBindGroupLayout would throw).
+    bool make_bgl_from_entries(const std::vector<reflect::LayoutEntryDesc>& entries, wgpu::BindGroupLayout* out) {
+        using K = reflect::LayoutEntryDesc::Kind;
+        std::vector<wgpu::BindGroupLayoutEntry> wes(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const reflect::LayoutEntryDesc& le = entries[i];
+            wgpu::BindGroupLayoutEntry& w = wes[i];
+            w.binding = le.binding;
+            w.visibility = static_cast<wgpu::ShaderStage>(le.visibility);
+            switch (le.kind) {
+                case K::Buffer:
+                    w.buffer.type = le.buffer_type == 0   ? wgpu::BufferBindingType::Uniform
+                                    : le.buffer_type == 1 ? wgpu::BufferBindingType::Storage
+                                                          : wgpu::BufferBindingType::ReadOnlyStorage;
+                    w.buffer.hasDynamicOffset = le.has_dynamic_offset;
+                    w.buffer.minBindingSize = le.min_binding_size;
+                    break;
+                case K::Sampler:
+                    w.sampler.type = le.sampler_type == 0   ? wgpu::SamplerBindingType::Filtering
+                                     : le.sampler_type == 1 ? wgpu::SamplerBindingType::NonFiltering
+                                                            : wgpu::SamplerBindingType::Comparison;
+                    break;
+                case K::Texture: {
+                    static const wgpu::TextureSampleType kS[5] = {
+                        wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
+                        wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
+                    w.texture.sampleType = kS[le.sample_type < 5 ? le.sample_type : 0];
+                    w.texture.viewDimension = wgpu_view_dim(le.view_dim);
+                    w.texture.multisampled = le.multisampled;
+                    break;
+                }
+                case K::StorageTexture: {
+                    const auto fc = format_code_by_name(le.storage_format);
+                    if (!fc) {
+                        ++stats.reflection_layout_unsupported;
+                        return false;
+                    }
+                    w.storageTexture.access = le.access == 0   ? wgpu::StorageTextureAccess::WriteOnly
+                                              : le.access == 1 ? wgpu::StorageTextureAccess::ReadOnly
+                                                               : wgpu::StorageTextureAccess::ReadWrite;
+                    w.storageTexture.format = wgpu_format(*fc);
+                    w.storageTexture.viewDimension = wgpu_view_dim(le.view_dim);
+                    break;
+                }
+                case K::ExternalTexture:  // the pinned Dawn has no ExternalTextureBindingLayout
+                    ++stats.reflection_layout_unsupported;
+                    return false;
+            }
+        }
+        wgpu::BindGroupLayoutDescriptor d{};
+        d.entryCount = wes.size();
+        d.entries = wes.data();
+        *out = device.CreateBindGroupLayout(&d);
+        return true;
+    }
+
+    // _buildReflectedPipelineLayout: false + !*error for no reflection record at all (the pipeline
+    // stays on layout:'auto'); false + *error when the loader's merge or Dawn rejects it (the
+    // worker's op error, the pipeline is not created).
+    bool build_reflected_layout(const std::vector<const reflect::StageRecord*>& refls, ReflectedLayout* out, bool* error) {
+        *error = false;
+        if (refls.empty()) return false;
+        reflect::LayoutBuildResult r = reflect::build_bind_group_layout_descriptors(refls);
+        if (!r.ok) {
+            ++stats.reflection_layout_errors;
+            if (r.conflict) ++stats.reflection_binding_conflicts;
+            stats.last_reflection_error = r.error;
+            ++stats.op_errors;
+            *error = true;
+            return false;
+        }
+        ReflectedLayout l;
+        for (auto& g : r.groups) {
+            wgpu::BindGroupLayout bgl;
+            if (!make_bgl_from_entries(g, &bgl)) {
+                ++stats.op_errors;
+                *error = true;
+                return false;
+            }
+            l.bgls.push_back(std::move(bgl));
+        }
+        wgpu::PipelineLayoutDescriptor pd{};
+        pd.bindGroupLayoutCount = l.bgls.size();
+        pd.bindGroupLayouts = l.bgls.data();
+        l.pipeline_layout = device.CreatePipelineLayout(&pd);
+        l.groups = std::move(r.groups);
+        *out = std::move(l);
         return true;
     }
 
@@ -1385,6 +1540,7 @@ struct NativeExecutor::Impl {
         const std::string_view trimmed = trim_view(raw);
         std::string code = raw;
         uint64_t shader_hash = 0;
+        const uint64_t text_hash = reflect::fnv1a64(raw);
         if (trimmed.empty()) {
             // The worker looks up a synthetic `empty:<stage>:<id>` hash, which no pack holds: the empty
             // text compiles as an (empty) module.
@@ -1395,6 +1551,7 @@ struct NativeExecutor::Impl {
                 ShaderEntry e;
                 e.stage = h.stage;
                 e.hash = shader_hash;
+                e.reflect_hash = shader_hash;
                 e.pending = true;
                 shaders[h.id] = std::move(e);
                 ++stats.shader_modules;
@@ -1407,6 +1564,7 @@ struct NativeExecutor::Impl {
         ShaderEntry e;
         e.stage = h.stage;
         e.hash = shader_hash;
+        e.reflect_hash = text_hash;
         e.explicit_ep = extract_wgsl_entry_point(code, stage_name);
         e.module = make_module(code);
         e.code = std::move(code);
@@ -1696,12 +1854,39 @@ struct NativeExecutor::Impl {
         return empty_layout;
     }
 
+    // The layout object a manifest id resolves to (one per id, shared by every reference).
+    bool manifest_bgl(const std::string& hex, const std::vector<reflect::LayoutEntryDesc>& entries, wgpu::BindGroupLayout* out) {
+        auto it = manifest_bgls.find(hex);
+        if (it != manifest_bgls.end()) {
+            *out = it->second;
+            return true;
+        }
+        if (!make_bgl_from_entries(entries, out)) return false;
+        manifest_bgls[hex] = *out;
+        return true;
+    }
+
     bool create_bind_group_layout(const Packet& p) {
         if (p.payload_bytes < sizeof(GpuCreateBindGroupLayoutPayload)) return false;
         const auto h = read_payload<GpuCreateBindGroupLayoutPayload>(p);
         if (h.flags & GpuLayoutFlags::ManifestReference) {
-            ++stats.manifest_layouts_unavailable;  // layout-manifest.json is not loaded by the replay page either
-            return fail("manifest bind group layout unavailable");
+            // `resolveManifestLayout('bindGroupLayout', contentId)`: the loaded layout-manifest.json's
+            // bind_group_layouts[contentId] (nothing loaded: unavailable, as in the replay page).
+            const auto* entries = reflection.manifest_bind_group_layout(h.content_id);
+            if (!entries) {
+                ++stats.manifest_layouts_unavailable;
+                return fail("manifest bind group layout unavailable");
+            }
+            wgpu::BindGroupLayout layout;
+            if (!manifest_bgl(reflect::format_hash(h.content_id), *entries, &layout))
+                return fail("manifest bind group layout unavailable");
+            BglEntry b;
+            b.layout = layout;
+            b.entries_known = false;  // `entries: null`
+            bgls[h.id] = std::move(b);
+            ++stats.bind_group_layouts;
+            ++stats.manifest_layouts_resolved;
+            return true;
         }
         if (uint64_t{24} + uint64_t{h.entry_count} * 24 > p.payload_bytes) return false;
         std::vector<LayoutEntry> entries;
@@ -1795,8 +1980,29 @@ struct NativeExecutor::Impl {
         if (p.payload_bytes < sizeof(GpuCreatePipelineLayoutPayload)) return false;
         const auto h = read_payload<GpuCreatePipelineLayoutPayload>(p);
         if (h.flags & GpuLayoutFlags::ManifestReference) {
-            ++stats.manifest_layouts_unavailable;
-            return fail("manifest pipeline layout unavailable");
+            // `resolveManifestLayout('pipelineLayout', contentId)`: pipeline_layouts[contentId] of the
+            // loaded manifest; its meta is the worker's default (no group 0 entries).
+            const auto* ids = reflection.manifest_pipeline_layout(h.content_id);
+            if (!ids) {
+                ++stats.manifest_layouts_unavailable;
+                return fail("manifest pipeline layout unavailable");
+            }
+            std::vector<wgpu::BindGroupLayout> layouts;
+            for (const std::string& hex : *ids) {
+                wgpu::BindGroupLayout l;
+                const auto* entries = reflection.manifest_bind_group_layout_hex(hex);
+                if (!entries || !manifest_bgl(hex, *entries, &l)) return fail("manifest pipeline layout unavailable");
+                layouts.push_back(l);
+            }
+            wgpu::PipelineLayoutDescriptor d{};
+            d.bindGroupLayoutCount = layouts.size();
+            d.bindGroupLayouts = layouts.data();
+            PlEntry e;
+            e.layout = device.CreatePipelineLayout(&d);
+            pipeline_layouts[h.id] = std::move(e);
+            ++stats.pipeline_layouts;
+            ++stats.manifest_layouts_resolved;
+            return true;
         }
         if (uint64_t{24} + uint64_t{h.bind_group_layout_count} * 4 > p.payload_bytes) return false;
         std::vector<wgpu::BindGroupLayout> layouts;
@@ -2151,12 +2357,12 @@ struct NativeExecutor::Impl {
     // ---- v1 pipelines and bind groups (wgpu_worker.js _handleCreateRenderPipeline / ...ComputePipeline /
     // _handleCreateBindGroup) ----
     //
-    // The worker consults its reflection registry (S6 `reflection.json`) for an explicit layout, the
-    // entry points and the vertex attributes; the registry is empty unless a stream loader fills it,
-    // and then `_resolveShaderReflection` returns null: layout 'auto', `vs_main` / `fs_main` /
-    // `cs_main`, one float vertex attribute. That is the path implemented (counted as
-    // `reflection_unavailable`); the reflection loader itself is not ported. The G34 fallback shader
-    // profiles belong to the worker's shader router, which has no native counterpart.
+    // The worker consults its reflection registry for an explicit layout, the entry points and the
+    // vertex attributes. The registry (reflection_model.h) is filled by `load_reflection` / a
+    // `<pack>.reflect.json` next to the pack; a shader it has no record of takes the path of an empty
+    // registry (`_resolveShaderReflection` returns null): layout 'auto', `vs_main` / `fs_main` /
+    // `cs_main`, one float vertex attribute (counted as `reflection_unavailable`). The G34 fallback
+    // shader profiles belong to the worker's shader router, which has no native counterpart.
 
     void create_render_pipeline1(const Packet& p) {
         const auto h = read_payload<GpuCreateRenderPipelinePayload>(p);
@@ -2177,7 +2383,21 @@ struct NativeExecutor::Impl {
             fs = &fit->second;
             ensure_shader(*fs);
         }
-        ++stats.reflection_unavailable;
+        const reflect::StageRecord* vs_refl = resolve_shader_reflection(vs, "vertex");
+        const reflect::StageRecord* fs_refl = fs ? resolve_shader_reflection(*fs, "fragment") : nullptr;
+        std::vector<const reflect::StageRecord*> matched;
+        if (vs_refl) matched.push_back(vs_refl);
+        if (fs_refl) matched.push_back(fs_refl);
+        ReflectedLayout reflected;
+        bool layout_error = false;
+        const bool has_reflected = build_reflected_layout(matched, &reflected, &layout_error);
+        if (layout_error) return;  // the worker's exception: op error, no pipeline
+        if (has_reflected) {
+            ++stats.reflected_render_pipelines;
+        } else {
+            ++stats.reflection_unavailable;
+        }
+
         const V1VertexLayout vl = plan_v1_vertex_layout(h.vertex_stride);
         wgpu::VertexAttribute attr{};
         attr.shaderLocation = 0;
@@ -2190,12 +2410,39 @@ struct NativeExecutor::Impl {
         vb.stepMode = wgpu::VertexStepMode::Vertex;
         vb.attributeCount = 1;
         vb.attributes = &attr;
+        bool has_buffer = vl.has_buffer;
+
+        // buildVertexBufferLayouts(vsRefl, vertexStride): a rejected layout keeps the default.
+        std::vector<wgpu::VertexAttribute> reflected_attrs;
+        if (vs_refl && h.vertex_stride > 0 && !vs_refl->vertex_inputs.empty()) {
+            std::vector<reflect::VertexBufferLayoutDesc> vbl;
+            std::string verr;
+            if (reflect::build_vertex_buffer_layouts(*vs_refl, h.vertex_stride, &vbl, &verr) && !vbl.empty()) {
+                for (const auto& a : vbl[0].attributes) {
+                    uint32_t bytes = 0;
+                    wgpu::VertexAttribute va{};
+                    va.format = wgpu_vertex_format(a.format, &bytes);
+                    va.offset = a.offset;
+                    va.shaderLocation = a.location;
+                    reflected_attrs.push_back(va);
+                }
+                vb.arrayStride = vbl[0].array_stride;
+                vb.attributeCount = reflected_attrs.size();
+                vb.attributes = reflected_attrs.data();
+                has_buffer = true;
+                ++stats.reflected_vertex_layouts;
+            } else {
+                ++stats.reflection_vertex_fallbacks;
+            }
+        }
+        const std::string vs_ep = vs_refl && !vs_refl->entry_point.empty() ? vs_refl->entry_point : "vs_main";
+        const std::string fs_ep = fs_refl && !fs_refl->entry_point.empty() ? fs_refl->entry_point : "fs_main";
 
         wgpu::RenderPipelineDescriptor rd{};
-        rd.layout = nullptr;  // 'auto'
+        if (has_reflected) rd.layout = reflected.pipeline_layout;  // else nullptr: 'auto'
         rd.vertex.module = vs.module;
-        rd.vertex.entryPoint = {"vs_main", 7};
-        rd.vertex.bufferCount = vl.has_buffer ? 1 : 0;
+        rd.vertex.entryPoint = {vs_ep.data(), vs_ep.size()};
+        rd.vertex.bufferCount = has_buffer ? 1 : 0;
         rd.vertex.buffers = &vb;
         rd.primitive.topology = wgpu_topology(static_cast<uint8_t>(std::min<uint32_t>(h.topology, 255)));
         wgpu::ColorTargetState target{};
@@ -2203,7 +2450,7 @@ struct NativeExecutor::Impl {
         wgpu::FragmentState fragment{};
         if (fs) {
             fragment.module = fs->module;
-            fragment.entryPoint = {"fs_main", 7};
+            fragment.entryPoint = {fs_ep.data(), fs_ep.size()};
             fragment.targetCount = 1;
             fragment.targets = &target;
             rd.fragment = &fragment;
@@ -2214,6 +2461,8 @@ struct NativeExecutor::Impl {
         e.auto_meta.gen = ++pipeline_gen_counter;
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         render_pipelines[h.id] = std::move(e);
+        if (has_reflected) reflected_render[h.id] = std::move(reflected);
+        else reflected_render.erase(h.id);
         ++stats.render_pipelines;
         ++stats.v1_render_pipelines;
     }
@@ -2224,12 +2473,24 @@ struct NativeExecutor::Impl {
         if (cit == shaders.end()) return;  // `_buildComputePipelineDescriptorV1` returns null silently
         const ShaderEntry& cs = cit->second;
         ensure_shader(cs);
-        ++stats.reflection_unavailable;
+        const reflect::StageRecord* cs_refl = resolve_shader_reflection(cs, "compute");
+        ReflectedLayout reflected;
+        bool layout_error = false;
+        const bool has_reflected = cs_refl && build_reflected_layout({cs_refl}, &reflected, &layout_error);
+        if (layout_error) return;
+        if (has_reflected) {
+            ++stats.reflected_compute_pipelines;
+        } else {
+            ++stats.reflection_unavailable;
+        }
+        const std::string cs_ep = cs_refl && !cs_refl->entry_point.empty() ? cs_refl->entry_point : "cs_main";
         wgpu::ComputePipelineDescriptor cd{};
-        cd.layout = nullptr;  // 'auto'
+        if (has_reflected) cd.layout = reflected.pipeline_layout;  // else nullptr: 'auto'
         cd.compute.module = cs.module;
-        cd.compute.entryPoint = {"cs_main", 7};
+        cd.compute.entryPoint = {cs_ep.data(), cs_ep.size()};
         compute_pipelines[h.id].pipeline = device.CreateComputePipeline(&cd);
+        if (has_reflected) reflected_compute[h.id] = std::move(reflected);
+        else reflected_compute.erase(h.id);
         compute_meta.erase(h.id);
         compute_hash[h.id] = cs.hash;
         ++stats.compute_pipelines;
@@ -2244,12 +2505,21 @@ struct NativeExecutor::Impl {
         }
         wgpu::BindGroupLayout layout;
         bool compute = false;
+        // getBindGroupLayout: the reflected layout of the pipeline first, else pipeline.getBindGroupLayout.
+        const std::vector<reflect::LayoutEntryDesc>* synth_entries = nullptr;
+        std::vector<reflect::LayoutEntryDesc> synth_from_bgl;
+        auto reflected_group = [&](const std::unordered_map<uint32_t, ReflectedLayout>& m) -> const ReflectedLayout* {
+            auto it = m.find(h.pipeline_id);
+            return it != m.end() && h.group_index < it->second.bgls.size() ? &it->second : nullptr;
+        };
+        const ReflectedLayout* rl = reflected_group(reflected_render);
+        const ReflectedLayout* cl = reflected_group(reflected_compute);
         auto rit = render_pipelines.find(h.pipeline_id);
         auto cit = compute_pipelines.find(h.pipeline_id);
         if (rit != render_pipelines.end()) {
-            layout = resolve(rit->second).GetBindGroupLayout(h.group_index);
+            layout = rl ? rl->bgls[h.group_index] : cl ? cl->bgls[h.group_index] : resolve(rit->second).GetBindGroupLayout(h.group_index);
         } else if (cit != compute_pipelines.end()) {
-            layout = resolve(cit->second).GetBindGroupLayout(h.group_index);
+            layout = rl ? rl->bgls[h.group_index] : cl ? cl->bgls[h.group_index] : resolve(cit->second).GetBindGroupLayout(h.group_index);
             compute = true;
         } else {
             auto bit = bgls.find(h.pipeline_id);  // a v2 bind group layout id works here too
@@ -2258,6 +2528,25 @@ struct NativeExecutor::Impl {
                 return;
             }
             layout = bit->second.layout;
+        }
+        // _getBindGroupLayoutEntriesForSynthesis: the reflected group, else the v2 layout record's entries.
+        if (rl) {
+            synth_entries = &rl->groups[h.group_index];
+        } else if (cl) {
+            synth_entries = &cl->groups[h.group_index];
+        } else if (rit == render_pipelines.end() && cit == compute_pipelines.end()) {
+            auto bit = bgls.find(h.pipeline_id);
+            if (bit != bgls.end() && bit->second.entries_known && !bit->second.entries.empty()) {
+                for (const LayoutEntry& le : bit->second.entries) {
+                    if (le.kind != 1) continue;
+                    reflect::LayoutEntryDesc d;
+                    d.kind = reflect::LayoutEntryDesc::Kind::Sampler;
+                    d.binding = le.binding;
+                    d.sampler_type = le.subtype;
+                    synth_from_bgl.push_back(d);
+                }
+                synth_entries = &synth_from_bgl;
+            }
         }
         struct Entry {
             uint32_t binding;
@@ -2309,6 +2598,30 @@ struct NativeExecutor::Impl {
                 return;
             }
             entries.push_back(std::move(pe));
+        }
+        // synthesizeFallbackSamplerEntries: a sampler slot of the layout nothing is bound to gets the
+        // default sampler of its kind; the entries then come back keyed (last wins) and sorted by binding.
+        if (synth_entries) {
+            std::vector<uint32_t> bound;
+            for (const Entry& pe : entries) bound.push_back(pe.binding);
+            std::vector<Entry> added;
+            for (const reflect::LayoutEntryDesc& le : *synth_entries) {
+                if (le.kind != reflect::LayoutEntryDesc::Kind::Sampler) continue;
+                if (std::find(bound.begin(), bound.end(), le.binding) != bound.end()) continue;
+                Entry se;
+                se.binding = le.binding;
+                se.sampler = fallback_sampler_kind(le.sampler_type < 3 ? le.sampler_type : 0);
+                added.push_back(std::move(se));
+                bound.push_back(le.binding);
+                ++stats.v1_synth_samplers;
+            }
+            if (!added.empty()) {
+                std::map<uint32_t, Entry> by_binding;
+                for (Entry& pe : entries) by_binding[pe.binding] = std::move(pe);
+                for (Entry& se : added) by_binding[se.binding] = std::move(se);
+                entries.clear();
+                for (auto& kv : by_binding) entries.push_back(std::move(kv.second));
+            }
         }
         std::vector<wgpu::BindGroupEntry> wes(entries.size());
         for (size_t i = 0; i < entries.size(); ++i) {
@@ -3056,14 +3369,17 @@ struct NativeExecutor::Impl {
     // ---- layout:'auto' bind group remap (_getOrCreateRemappedBindGroup / _preparePassCommandsForFlush) ----
 
     // pipelineCache.getOrCreateDefaultSampler('filtering' | 'comparison')
-    wgpu::Sampler fallback_sampler(bool comparison) {
-        wgpu::Sampler& s = fallback_samplers[comparison ? 2 : 0];
+    wgpu::Sampler fallback_sampler(bool comparison) { return fallback_sampler_kind(comparison ? 2 : 0); }
+    // kind: 0 filtering, 1 non-filtering, 2 comparison (DEFAULT_SAMPLER_DESCRIPTORS)
+    wgpu::Sampler fallback_sampler_kind(int kind) {
+        wgpu::Sampler& s = fallback_samplers[kind];
         if (!s) {
             wgpu::SamplerDescriptor sd{};
-            sd.magFilter = wgpu::FilterMode::Linear;
-            sd.minFilter = wgpu::FilterMode::Linear;
-            sd.mipmapFilter = comparison ? wgpu::MipmapFilterMode::Nearest : wgpu::MipmapFilterMode::Linear;
-            if (comparison) sd.compare = wgpu::CompareFunction::LessEqual;
+            const bool nearest = kind == 1;
+            sd.magFilter = nearest ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
+            sd.minFilter = nearest ? wgpu::FilterMode::Nearest : wgpu::FilterMode::Linear;
+            sd.mipmapFilter = kind == 0 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
+            if (kind == 2) sd.compare = wgpu::CompareFunction::LessEqual;
             s = device.CreateSampler(&sd);
         }
         return s;
@@ -3689,6 +4005,16 @@ bool NativeExecutor::load_wgsl_pack(const std::string& path, std::string* error)
     return impl_->load_pack(path, error ? error : &local);
 }
 
+bool NativeExecutor::load_reflection(const std::string& path, std::string* error) {
+    std::string local;
+    return impl_->load_reflection_file(path, error ? error : &local);
+}
+
+bool NativeExecutor::load_reflection_text(const std::string& json, std::string* error) {
+    std::string local;
+    return impl_->load_reflection_text(json, error ? error : &local);
+}
+
 uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
     Impl& s = *impl_;
     ++s.stats.batches;
@@ -3825,6 +4151,18 @@ std::string NativeExecutor::stats_json() const {
     num("v1_compute_pipelines", st.v1_compute_pipelines);
     num("v1_bind_groups", st.v1_bind_groups);
     num("reflection_unavailable", st.reflection_unavailable);
+    num("reflection_documents", st.reflection_documents);
+    num("reflection_load_errors", st.reflection_load_errors);
+    num("reflection_shaders", st.reflection_shaders);
+    num("reflected_render_pipelines", st.reflected_render_pipelines);
+    num("reflected_compute_pipelines", st.reflected_compute_pipelines);
+    num("reflected_vertex_layouts", st.reflected_vertex_layouts);
+    num("reflection_vertex_fallbacks", st.reflection_vertex_fallbacks);
+    num("reflection_layout_errors", st.reflection_layout_errors);
+    num("reflection_binding_conflicts", st.reflection_binding_conflicts);
+    num("reflection_layout_unsupported", st.reflection_layout_unsupported);
+    num("manifest_layouts_resolved", st.manifest_layouts_resolved);
+    num("v1_synth_samplers", st.v1_synth_samplers);
     num("timer_frames", st.timer_frames);
     num("timer_passes", st.timer_passes);
     num("timer_frames_skipped", st.timer_frames_skipped);

@@ -67,12 +67,14 @@ against `replay_capture.py`'s log.
 | :--- | :--- |
 | `runtime/gpu/native_exec/stream_model.h` | Packet walk + payload decoding with the worker's rules. No WebGPU types; unit-tested in CI. |
 | `runtime/gpu/native_exec/m1_model.h` | M1 rules that decide what reaches the GPU: WGSL pack index, hash-only payloads, entry point resolution, texture format tables, WriteTexture layout planning, viewport / scissor clamps. No WebGPU types; unit-tested in CI. |
+| `runtime/gpu/native_exec/reflection_model.h` | Reflection loader: the `.reflect.json` sidecar (v1..v3), `layout-manifest.json`, registry lookups, merged bind group layouts, reflected vertex layout (`reflection_loader.js`). No WebGPU types; unit-tested in CI. |
 | `runtime/gpu/native_exec/replay_frames.h` | `splitFrames`, frame digest and sampled stats of `tools/replay/replay.html`. No WebGPU types. |
 | `runtime/gpu/native_exec/native_executor.{h,cpp}` | Dawn device, swapchain (offscreen texture or surface), packet handlers, Present. |
 | `runtime/gpu/native_exec/native_window.{h,cpp}` | Optional Win32 window (other hosts: headless only for now). |
 | `runtime/gpu/native_exec/live_pump.h` | Bounded queue + executor thread for live play (`--window`); executor-agnostic, unit-tested. |
 | `runtime/gpu/native_exec/pg6_native_exec_main.cpp` | Trace replay tool. |
 | `tests/test_native_exec_model.cpp` | Model tests (CI). |
+| `tests/test_native_exec_reflection.cpp` | Reflection loader model tests (CI). |
 | `tests/test_live_pump.cpp` | Live pump tests with a fake executor (CI). |
 | `tests/test_native_executor.cpp` | GPU tests, headless; exit 77 (CTest skip) without an adapter. |
 
@@ -122,16 +124,34 @@ Known divergences, to be closed or documented as they come up:
   `remapped_bind_groups`, `remap_*`. Not ported: the PresentX plane bind-group cache (a cache only), the
   async-compile retry with `layout:'auto'`, v1 `SetBindGroup` on a remapped pipeline, indirect draws
   (the worker does not remap them either). `pipeline_layout_id == 0` pipelines are not remapped (as in the
-  worker); `auto_layout_pipelines` counts them. Manifest layouts (`layout-manifest.json`, flag
-  `ManifestReference`) are unavailable, as in the replay page (`manifest_layouts_unavailable`). The
-  manifest layouts and the reflection loader (`.reflect.json`) stay open.
-- v1 pipelines (`8`/`19`) and bind groups (`15`/`16`) take the worker's path for "no reflection registry
-  loaded" (the replay page's and the producer's situation): layout `auto`, entry points `vs_main` /
+  worker); `auto_layout_pipelines` counts them.
+- Reflection loader (`reflection_model.h`, a port of `web/workers/reflection_loader.js`):
+  `NativeExecutor::load_reflection` (`pg6_native_exec --reflection`) takes a `playgta6-stage-reflection`
+  sidecar (versions 1..3) or an S6 `layout-manifest.json`; `load_wgsl_pack` also loads an existing
+  `<pack>.reflect.json` (the boot orchestrator's `deriveReflectionSidecarUrl`; WGPK v1 and v2 packs alike,
+  the sidecar is keyed by the shader's pack hash). Validation is the loader's: a rejected document registers
+  nothing (`reflection_load_errors`). Binding sources (user SGPRs, heaps, static samplers, ...) are
+  validated and dropped, they never reach WebGPU; `diagnoseStageBindings`, the root-signature join and
+  `synthesizeMissingStaticSamplers` are producer-side and not ported. `_resolveShaderReflection` looks a
+  shader up by its hash (the pack hash, else FNV-1a 64 of the WGSL text, the worker's `hashHex`), then by
+  `"<stage>:<entryPoint>"` (manifest shaders); `registerShaderReflectionKey` has no native producer.
+  A record gives a v1 pipeline its layout (`buildPipelineLayout`: the stages' layouts merged per
+  group, conflicts and groups >= 4 are op errors that create no pipeline), its entry points and, with a
+  non-zero stride, the vertex layout of `buildVertexBufferLayouts` (a rejected one keeps the single
+  attribute default: `reflection_vertex_fallbacks`). v1 bind groups take the reflected group layout and
+  synthesize default samplers for unbound sampler slots (`v1_synth_samplers`, also for v2 layout ids
+  with known entries, like `_getBindGroupLayoutEntriesForSynthesis`). `ManifestReference` layouts
+  (flag `0x1`) resolve to the loaded manifest's `bind_group_layouts` / `pipeline_layouts` under `content_id`
+  (`web/` leaves the `resolveManifestLayout` hook unbound; the manifest tables are what its doc comment
+  names); without a manifest they stay unavailable (`manifest_layouts_unavailable`). Not reproduced: an
+  `externalTexture` layout entry (the pinned Dawn has no `ExternalTextureBindingLayout`:
+  `reflection_layout_unsupported`) and a storage texture format Dawn does not know by name.
+- v1 pipelines (`8`/`19`) and bind groups (`15`/`16`) of a shader without a registry record take the
+  worker's path for "no reflection": layout `auto`, entry points `vs_main` /
   `fs_main` / `cs_main`, one `float32xN` attribute at location 0 for a non-zero stride, the canvas format
   as the only target, bind group layouts from `pipeline.getBindGroupLayout(group)`, a missing
   `resource_id == 0` sampler replaced by the default linear sampler. Counted as `reflection_unavailable`.
-  A stream that depends on a loaded reflection registry (explicit S6 layouts, reflected vertex
-  attributes) or on the G34 fallback shader profiles (the worker's shader router) is not reproduced.
+  The G34 fallback shader profiles (the worker's shader router) are not reproduced.
 - Read-backs (`39`/`40`) write to the memory given by `attach_guest_memory`: a base pointer + size (the
   browser's wasm memory offsets) or absolute host addresses (what the native `ReadbackGate` hands
   out). Nothing attached: nothing is written and the counter does not move (the worker's `!memory`).
@@ -176,7 +196,7 @@ Known divergences, to be closed or documented as they come up:
 | `39`/`40` read-back into producer memory + completion counter, early read-back flush | `_recordReadbackCopy`, `_startRecordedReadbacks`, `_flushReadbacksNow` | **M2 (done)** |
 | GPU pass timestamps feeding `runtime/gpu/gpu_time` (#1608), `gpu_time` in the boot report | `gpu_timer.js` | **M2 (done)** |
 | the layout:auto bind-group remap | `_getOrCreateRemappedBindGroup`, `_preparePassCommandsForFlush` | **M2b (done)** |
-| `layout-manifest.json` layouts, the reflection loader | `reflection_loader.js` | M2b (open) |
+| `layout-manifest.json` layouts, the reflection loader (`.reflect.json` v1..v3 sidecar incl. WGPK v2 packs) | `reflection_loader.js` | **M2b (done)** |
 | `requestNegotiatedDevice` limit negotiation | `requestNegotiatedDevice` | **M2b (done)** |
 | Swapchain blit fallback (+ letterbox) | `wgpu_swapchain.js` | **M2b (done)** |
 | Live boot: `playgta6_boot --native-gpu [--window]`, present any target | `os::wgpu_submit` observer | M3 |

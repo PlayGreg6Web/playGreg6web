@@ -1,7 +1,7 @@
 // pg6_native_exec: replays a .pg6trace (gpu/frame_capture.h) through the native executor, frame by
 // frame like tools/replay/replay.html, headless or in a window.
 //
-//   pg6_native_exec --trace <file.pg6trace> [--pack <file.wgsl.pack>] [--window] [--size WxH]
+//   pg6_native_exec --trace <file.pg6trace> [--pack <file.wgsl.pack>] [--reflection <file.reflect.json|layout-manifest.json>]... [--window] [--size WxH]
 //                   [--frames N] [--digest-at 0,10,...] [--report <file.json>]
 //
 // --pack        WGSL pack for hash-only CreateShaderModule payloads (the replay page's --pack)
@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
     ExecutorOptions opts;
     opts.width = 3840;
     opts.height = 2160;
+    std::vector<std::string> reflections;
     uint64_t max_frames = UINT64_MAX;
     std::set<uint64_t> digest_at;
     for (int i = 1; i < argc; ++i) {
@@ -74,6 +75,8 @@ int main(int argc, char** argv) {
             trace = v;
         } else if (a == "--pack" && (v = next())) {
             pack = v;
+        } else if (a == "--reflection" && (v = next())) {
+            reflections.push_back(v);
         } else if (a == "--report" && (v = next())) {
             report = v;
         } else if (a == "--frames" && (v = next())) {
@@ -114,6 +117,12 @@ int main(int argc, char** argv) {
     if (!pack.empty() && !exec->load_wgsl_pack(pack, &error)) {
         std::fprintf(stderr, "pg6_native_exec: %s\n", error.c_str());
         return 1;
+    }
+    for (const std::string& r : reflections) {
+        if (!exec->load_reflection(r, &error)) {
+            std::fprintf(stderr, "pg6_native_exec: %s: %s\n", r.c_str(), error.c_str());
+            return 1;
+        }
     }
     const AdapterDescription& ad = exec->adapter();
     std::printf("adapter: %s (%s)\n", ad.description.empty() ? ad.device.c_str() : ad.description.c_str(),

@@ -12,6 +12,7 @@
 #include "gpu/cmd_encoder.h"
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/native_executor.h"
+#include "gpu/native_exec/reflection_model.h"
 
 namespace {
 int g_failures = 0;
@@ -757,6 +758,223 @@ void test_v1(NativeExecutor& ex) {
     ex.attach_guest_memory(GuestMemory{});
 }
 
+// Reflection loader (reflection_model.h): a `.reflect.json` sidecar keyed by the hash the worker gives an
+// inline shader (FNV-1a 64 of its text) names the entry points, the vertex attributes and the layout of
+// v1 pipelines; a layout-manifest.json serves ManifestReference layouts. Each case only works because of
+// the reflection record (the WGSL has no vs_main / cs_main, location 2 / group 1 do not exist in the
+// default layout), and every result is read back from the GPU.
+const char* kReflVs = R"(
+struct Scale { v: vec4f };
+@group(1) @binding(0) var<uniform> scale: Scale;
+struct VOut { @builtin(position) p: vec4f, @location(0) c: vec4f };
+@vertex fn vtx(@location(0) pos: vec2f, @location(2) col: vec4f) -> VOut {
+  var o: VOut;
+  o.p = vec4f(pos * scale.v.x, 0.0, 1.0);
+  o.c = col;
+  return o;
+}
+)";
+const char* kReflFs = R"(
+struct Tint { v: vec4f };
+@group(1) @binding(1) var<uniform> tint: Tint;
+@fragment fn frg(@location(0) c: vec4f) -> @location(0) vec4f { return c * tint.v; }
+)";
+const char* kReflCs = R"(
+@group(1) @binding(2) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(4) fn my_cs(@builtin(local_invocation_index) i: u32) { out[i] = i * 5u + 3u; }
+)";
+// Same bindings as kReflFs but a storage buffer where kReflVs has a uniform: the merge must reject.
+const char* kReflFsConflict = R"(
+@group(1) @binding(0) var<storage, read> tint: array<vec4f>;
+@fragment fn frg(@location(0) c: vec4f) -> @location(0) vec4f { return c * tint[0]; }
+)";
+
+std::string hash_hex_of(const char* wgsl) { return gpu::native_exec::reflect::format_hash(gpu::native_exec::reflect::fnv1a64(wgsl)); }
+
+std::string reflection_sidecar() {
+    return std::string(R"({"schema":"playgta6-stage-reflection","version":3,"stages":{")") + hash_hex_of(kReflVs) +
+           R"(":{"stage":"vertex","entry_point":"vtx",
+  "vertex_inputs":[
+    {"location":2,"vb_slot":0,"byte_offset":8,"components":4,"component_type":"f32","fetch_format":"unorm8x4"},
+    {"location":0,"vb_slot":0,"byte_offset":0,"components":2,"component_type":"f32","fetch_format":"float32x2"}],
+  "bindings":[{"group":1,"binding":0,"kind":"uniform","min_binding_size_bytes":16,"source":{"user_sgpr":8,"table_byte_offset":0}}]},")" +
+           hash_hex_of(kReflFs) + R"(":{"stage":"fragment","entry_point":"frg",
+  "bindings":[{"group":1,"binding":1,"kind":"uniform","min_binding_size_bytes":16,"source":{"user_sgpr":8,"table_byte_offset":32}}]},")" +
+           hash_hex_of(kReflCs) + R"(":{"stage":"compute","entry_point":"my_cs",
+  "bindings":[{"group":1,"binding":2,"kind":"storage","source":{"user_sgpr":4,"table_byte_offset":0}}]},")" +
+           hash_hex_of(kReflFsConflict) + R"(":{"stage":"fragment","entry_point":"frg",
+  "bindings":[{"group":1,"binding":0,"kind":"read_only_storage","source":{"user_sgpr":8,"table_byte_offset":0}}]}}})";
+}
+
+const char* kLayoutManifest = R"({
+  "schema_version": 1,
+  "bind_group_layouts": {"0x00000000000000aa": {"entries": [{"binding": 0, "visibility": 4, "buffer": {"type": "storage"}}]}},
+  "pipeline_layouts": {"0x00000000000000bb": {"bindGroupLayouts": ["0xaa"]}},
+  "shaders": {}
+})";
+
+void test_reflection() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto exu = NativeExecutor::create(opts, &status, &error);
+    if (!exu) {
+        CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+        return;
+    }
+    NativeExecutor& ex = *exu;
+
+    // ManifestReference layouts need a loaded layout-manifest.json: without one they are unavailable.
+    auto manifest_packets = [](gpu::CommandEncoder& enc) {
+        std::vector<uint8_t> bgl;
+        append(bgl, GpuCreateBindGroupLayoutPayload{300, 0, GpuLayoutFlags::ManifestReference, 0, 0xaa});
+        emit(enc, GpuOpcode::CreateBindGroupLayout, bgl);
+        std::vector<uint8_t> pl;
+        append(pl, GpuCreatePipelineLayoutPayload{301, 1, GpuLayoutFlags::ManifestReference, 0, 0xbb});
+        emit(enc, GpuOpcode::CreatePipelineLayout, pl);
+    };
+    gpu::CommandEncoder before_load;
+    manifest_packets(before_load);
+    run(ex, before_load);
+    CHECK(ex.stats().manifest_layouts_unavailable == 2 && ex.stats().manifest_layouts_resolved == 0);
+    CHECK(ex.stats().packet_errors >= 2);
+
+    std::string err;
+    CHECK(!ex.load_reflection_text("{", &err) && !err.empty());
+    CHECK(!ex.load_reflection_text(R"({"schema_version":1,"shaders":{},"bind_group_layouts":{"0xaa":{"entries":[{"binding":0,"visibility":9,"buffer":{}}]}}})", &err));
+    CHECK(ex.stats().reflection_load_errors == 2 && ex.stats().reflection_documents == 0 && ex.stats().reflection_shaders == 0);
+    CHECK(ex.load_reflection_text(kLayoutManifest, &err));
+    CHECK(ex.stats().reflection_documents == 1);
+
+    gpu::CommandEncoder setup;
+    manifest_packets(setup);
+    setup.create_buffer(70, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(72, GpuShaderStage::Compute, kCompute);
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 75;
+    cp.cs_module_id = 72;
+    cp.pipeline_layout_id = 301;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 76, 300, {bg_entry(0, GpuBindResourceType::Buffer, 70)});
+    run(ex, setup);
+    CHECK(ex.stats().manifest_layouts_resolved == 2 && ex.stats().manifest_layouts_unavailable == 2);
+    gpu::CommandEncoder mframe;
+    mframe.begin_frame();
+    mframe.set_compute_pipeline(75);
+    set_bind_group2(mframe, 0, 76);
+    mframe.dispatch_compute(1, 1, 1);
+    mframe.present();
+    run(ex, mframe);
+    ex.wait_idle();
+    std::vector<uint8_t> out;
+    CHECK(ex.read_buffer(70, 0, 16, &out, &err));
+    const uint32_t want_m[4] = {1, 3, 5, 7};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want_m, 16) == 0);
+
+    // The sidecar: no record yet, so a v1 compute pipeline on kReflCs would look for cs_main and fail.
+    CHECK(ex.load_reflection_text(reflection_sidecar(), &err));
+    CHECK(ex.stats().reflection_documents == 2 && ex.stats().reflection_shaders == 4);
+
+    const ExecutorStats before = ex.stats();
+    // v1 compute: entry point `my_cs`, layout group 1 binding 2 from the record.
+    gpu::CommandEncoder comp;
+    comp.create_buffer(80, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    comp.create_shader_module(81, GpuShaderStage::Compute, kReflCs);
+    comp.create_compute_pipeline(82, 81);
+    const GpuBindGroupEntry cbe = {2, static_cast<uint32_t>(GpuBindResourceType::Buffer), 80, 0, 0, 0};
+    comp.create_bind_group(83, 82, 1, &cbe, 1);
+    comp.begin_frame();
+    comp.set_compute_pipeline(82);
+    comp.set_bind_group(1, 83);
+    comp.dispatch_compute(1);
+    comp.present();
+    run(ex, comp);
+    ex.wait_idle();
+    CHECK(ex.read_buffer(80, 0, 16, &out, &err));
+    const uint32_t want_c[4] = {3, 8, 13, 18};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want_c, 16) == 0);
+    CHECK(ex.stats().reflected_compute_pipelines == before.reflected_compute_pipelines + 1);
+    CHECK(ex.stats().reflection_unavailable == before.reflection_unavailable);
+
+    // v1 render: entry points vtx / frg, attributes at locations 0 (float32x2) and 2 (unorm8x4) of one
+    // 12-byte vertex, uniforms at group 1. Colour (1, 1, 0, 1) * tint (0, 1, 1, 1) = green everywhere.
+    struct Vtx {
+        float x, y;
+        uint8_t c[4];
+    };
+    const Vtx verts[3] = {{-1, -1, {255, 255, 0, 255}}, {3, -1, {255, 255, 0, 255}}, {-1, 3, {255, 255, 0, 255}}};
+    static_assert(sizeof(Vtx) == 12, "vertex layout");
+    const float scale[4] = {1, 1, 1, 1};
+    const float tint[4] = {0, 1, 1, 1};
+    gpu::CommandEncoder rs;
+    rs.create_buffer(90, GpuBufferUsage::Vertex | GpuBufferUsage::CopyDst, sizeof verts);
+    rs.write_buffer(90, 0, verts, sizeof verts);
+    rs.create_buffer(91, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 16);
+    rs.write_buffer(91, 0, scale, 16);
+    rs.create_buffer(92, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 16);
+    rs.write_buffer(92, 0, tint, 16);
+    rs.create_shader_module(93, GpuShaderStage::Vertex, kReflVs);
+    rs.create_shader_module(94, GpuShaderStage::Fragment, kReflFs);
+    rs.create_render_pipeline(95, 93, 94, sizeof(Vtx));
+    const GpuBindGroupEntry rbe[2] = {
+        {0, static_cast<uint32_t>(GpuBindResourceType::Buffer), 91, 0, 0, 0},
+        {1, static_cast<uint32_t>(GpuBindResourceType::Buffer), 92, 0, 0, 0},
+    };
+    rs.create_bind_group(96, 95, 1, rbe, 2);
+    rs.begin_frame();
+    rs.set_pipeline(95);
+    rs.set_bind_group(1, 96);
+    rs.set_vertex_buffer(0, 90);
+    rs.draw(3);
+    rs.present();
+    run(ex, rs);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().reflected_render_pipelines == before.reflected_render_pipelines + 1);
+    CHECK(ex.stats().reflected_vertex_layouts == before.reflected_vertex_layouts + 1);
+    CHECK(ex.stats().reflection_vertex_fallbacks == before.reflection_vertex_fallbacks);
+    CHECK(ex.stats().draws == before.draws + 1 && ex.stats().draws_skipped == before.draws_skipped);
+    CHECK(frame_is(ex, {0, 255, 0, 255}));
+
+    // A merge conflict (uniform in the vertex stage, storage in the fragment stage at the same slot) is
+    // the worker's thrown BindingConflictError: an op error, no pipeline, no draw.
+    // (Control: a draw on a pipeline id that does not exist costs what it costs; the rejected layout adds one.)
+    const uint64_t op_errors0 = ex.stats().op_errors;
+    gpu::CommandEncoder control;
+    control.begin_frame();
+    control.set_pipeline(98);
+    control.draw(3);
+    control.present();
+    run(ex, control);
+    const uint64_t missing_cost = ex.stats().op_errors - op_errors0;
+    const uint64_t op_errors = ex.stats().op_errors;
+    gpu::CommandEncoder bad;
+    bad.create_shader_module(97, GpuShaderStage::Fragment, kReflFsConflict);
+    bad.create_render_pipeline(98, 93, 97, sizeof(Vtx));
+    bad.begin_frame();
+    bad.set_pipeline(98);
+    bad.draw(3);
+    bad.present();
+    run(ex, bad);
+    CHECK(ex.stats().op_errors == op_errors + missing_cost + 1);
+    CHECK(ex.stats().reflection_layout_errors == 1 && ex.stats().reflection_binding_conflicts == 1);
+    CHECK(ex.stats().draws_skipped == before.draws_skipped + 2);  // the control's and the conflict's draw
+
+    // A shader without a record keeps the empty-registry path.
+    gpu::CommandEncoder plain;
+    plain.create_buffer(99, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    plain.create_shader_module(100, GpuShaderStage::Compute, kCompute);
+    plain.create_compute_pipeline(101, 100);
+    run(ex, plain);
+    CHECK(ex.stats().reflection_unavailable == before.reflection_unavailable + 1);
+    ex.wait_idle();
+    CHECK(ex.stats().device_errors == 0);
+    CHECK(ex.stats().device_lost == 0);
+}
+
 const char* kHeavyCompute = R"(
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 @compute @workgroup_size(64) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
@@ -1029,6 +1247,7 @@ int main() {
     test_readbacks(*ex);
     test_readbacks_host_addresses(*ex);
     test_v1(*ex);
+    test_reflection();
     CHECK(ex->stats().device_lost == 0);
     test_timers();
     test_blit();

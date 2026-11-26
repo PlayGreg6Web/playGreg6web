@@ -120,7 +120,23 @@ struct ExecutorStats {
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;
     uint64_t v1_bind_groups = 0;
-    uint64_t reflection_unavailable = 0;  // v1 pipelines built without the reflection registry (layout:auto)
+    uint64_t reflection_unavailable = 0;  // v1 pipelines built without a matching reflection record (layout:auto)
+    // Reflection loader (reflection_model.h: web/workers/reflection_loader.js): .reflect.json sidecars
+    // (v1..v3) and layout-manifest.json documents feed v1 pipelines (layout, entry points, vertex
+    // attributes), v1 bind groups (layouts, fallback samplers) and ManifestReference layouts.
+    uint64_t reflection_documents = 0;      // documents loaded (sidecars + manifests)
+    uint64_t reflection_load_errors = 0;    // documents the loader rejected (nothing of them is registered)
+    uint64_t reflection_shaders = 0;        // stage / shader records in the registry
+    uint64_t reflected_render_pipelines = 0;   // v1 render pipelines built with a reflected layout
+    uint64_t reflected_compute_pipelines = 0;  // v1 compute pipelines built with a reflected layout
+    uint64_t reflected_vertex_layouts = 0;     // v1 render pipelines with the reflected vertex buffer layout
+    uint64_t reflection_vertex_fallbacks = 0;  // reflected vertex layout rejected: the single-attribute default
+    uint64_t reflection_layout_errors = 0;     // a reflected layout the loader's merge rejected (pipeline not created)
+    uint64_t reflection_binding_conflicts = 0; // ... of which two stages disagreed on a binding
+    uint64_t reflection_layout_unsupported = 0;  // layout entries Dawn cannot take (externalTexture, unknown storage format)
+    uint64_t manifest_layouts_resolved = 0;    // ManifestReference layouts served from a loaded layout-manifest.json
+    uint64_t v1_synth_samplers = 0;            // v1 bind group samplers synthesized from the layout (default samplers)
+    std::string last_reflection_error;
     uint64_t timer_frames = 0;            // submits with timestamp queries attached
     uint64_t timer_passes = 0;            // passes that carried timestamp writes
     uint64_t timer_frames_skipped = 0;    // no free query slot (the previous one was still in flight)
@@ -191,7 +207,16 @@ public:
 
     // Loads a .wgsl.pack (WGPK v1) for hash-only CreateShaderModule payloads, like the replay page's
     // `processor.loadWgslPack`. Only the entry table is read now; WGSL is read on demand.
+    // A `<path>.reflect.json` sidecar next to the pack is loaded too (the replay page / boot
+    // orchestrator derive the same URL); a bad sidecar is counted (reflection_load_errors), it does
+    // not fail the pack.
     bool load_wgsl_pack(const std::string& path, std::string* error);
+
+    // Loads a reflection document: a `playgta6-stage-reflection` sidecar (`*.reflect.json`, versions
+    // 1..3) or an S6 `layout-manifest.json`, like `processor.loadReflectionManifest`. Later documents
+    // overwrite records with the same hash. False + *error when the loader rejects the document.
+    bool load_reflection(const std::string& path, std::string* error);
+    bool load_reflection_text(const std::string& json, std::string* error);
 
     // Processes WebGPU callbacks and, with a window, window messages. Returns false once the window
     // was closed (always true headless).
