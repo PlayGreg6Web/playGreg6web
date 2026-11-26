@@ -1250,6 +1250,8 @@ void test_depth_texture_float_layout(NativeExecutor& ex) {
     // A float layout entry with a depth texture bound: the executor binds the entry's dummy instead
     // of letting Dawn reject the bind group; the 'depth' layout entry takes the real view.
     const uint64_t before = ex.stats().bind_group_depth_layout_dummies;
+    const uint64_t twins_before = ex.stats().depth_twins_created, copies_before = ex.stats().depth_float_copies;
+    const uint64_t errors_before = ex.stats().device_errors;
     gpu::CommandEncoder e;
     e.begin_frame();
     emit(e, GpuOpcode::CreateTexture2,
@@ -1258,10 +1260,27 @@ void test_depth_texture_float_layout(NativeExecutor& ex) {
     create_bind_group(e, 903, 901, {bg_entry(0, GpuBindResourceType::TextureView, 900)});
     create_layouts(e, 904, 905, {layout_entry(0, 2, GpuBindingLayoutType::Texture, 2, 2)});
     create_bind_group(e, 906, 904, {bg_entry(0, GpuBindResourceType::TextureView, 900)});
+    // A pass begins: a stale depth twin is re-copied into the encoder before it.
+    GpuBeginRenderPassPayload bp = swapchain_pass(GpuLoadOp::Clear, 0.0f, 0.0f, 0.0f, 1.0f);
+    e.emit_packet(GpuOpcode::BeginRenderPass, &bp, sizeof bp);
+    e.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
     e.present();
     run(ex, e);
-    CHECK(ex.stats().bind_group_depth_layout_dummies == before + 1);
-    CHECK(ex.stats().bind_groups >= 2);
+    ex.wait_idle();
+    const ExecutorStats& st = ex.stats();
+    CHECK(st.bind_groups >= 2);
+    CHECK(st.device_errors == errors_before);
+    std::printf("depth-as-float: twins=%llu copies=%llu dummies=%llu\n", (unsigned long long)st.depth_twins_created,
+                (unsigned long long)st.depth_float_copies, (unsigned long long)st.bind_group_depth_layout_dummies);
+    if (st.depth_twins_created > twins_before) {
+        // float32-filterable device: the float entry reads a real r32float copy, no dummy
+        CHECK(st.depth_twins_created == twins_before + 1);
+        CHECK(st.bind_group_depth_layout_dummies == before);
+        CHECK(st.depth_float_copies > copies_before);
+    } else {
+        CHECK(st.bind_group_depth_layout_dummies == before + 1);  // no float32-filterable: dummy
+        CHECK(st.depth_float_copies == copies_before);
+    }
 }
 
 int main() {

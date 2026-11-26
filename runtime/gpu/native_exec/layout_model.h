@@ -463,6 +463,15 @@ inline bool depth_sample_type_mismatch(uint8_t layout_sample_type, uint8_t forma
     return is_depth && layout_sample_type != 1;
 }
 
+// Depth bound to a float layout entry can be served by an r32float copy of the depth aspect
+// (depth-as-float twin) when the layout is plain 'float' (code 0), the texture is single-sampled 2D
+// and r32float is filterable. sint/uint entries (and stencil) keep the dummy.
+inline bool depth_float_twin_eligible(uint8_t layout_sample_type, uint8_t format, uint32_t sample_count,
+                                      uint8_t dimension, bool float32_filterable) {
+    return layout_sample_type == 0 && format_valid(format) && format_is_depth(format) && sample_count == 1 &&
+           dimension == 1 && float32_filterable;
+}
+
 struct PickResult {
     enum class Kind : uint8_t { Resource, FallbackSampler, Dummy } kind = Kind::Dummy;
     size_t index = 0;          // Resource: index into the available list

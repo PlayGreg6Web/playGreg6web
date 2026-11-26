@@ -738,6 +738,10 @@ void test_layout_remap() {
     CHECK(depth_sample_type_mismatch(0, 48) && depth_sample_type_mismatch(3, 48) && depth_sample_type_mismatch(4, 48));
     CHECK(!depth_sample_type_mismatch(1, 48) && !depth_sample_type_mismatch(2, 48));  // unfilterable-float / depth take it
     CHECK(depth_sample_type_mismatch(2, 22) && !depth_sample_type_mismatch(0, 22));
+    CHECK(depth_float_twin_eligible(0, 48, 1, 1, true));  // float layout + single-sampled 2D depth + filterable r32float
+    CHECK(!depth_float_twin_eligible(0, 48, 1, 1, false) && !depth_float_twin_eligible(0, 48, 4, 1, true));
+    CHECK(!depth_float_twin_eligible(3, 48, 1, 1, true) && !depth_float_twin_eligible(4, 48, 1, 1, true));  // sint/uint keep the dummy
+    CHECK(!depth_float_twin_eligible(0, 22, 1, 1, true) && !depth_float_twin_eligible(0, 48, 1, 2, true));
     CHECK(texture_sample_type(25, true) == WgslSampleType::Uint);  // rgba8uint
     CHECK(texture_sample_type(26, true) == WgslSampleType::Sint);  // rgba8sint
     CHECK(texture_sample_type(44, true) == WgslSampleType::Uint);  // stencil8

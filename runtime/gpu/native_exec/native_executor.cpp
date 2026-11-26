@@ -16,6 +16,7 @@
 #include <sstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -333,6 +334,11 @@ struct TextureEntry {
     bool promoted_1d = false;
     bool bc3d_fallback = false;  // 3D BC texture created as rgba8unorm: uploads are skipped
     std::unordered_map<uint64_t, wgpu::TextureView> views;
+    // Depth-as-float twin (an r32float copy of the depth aspect bound where a float layout entry
+    // meets a depth texture): refreshed when depth_gen moved past twin_gen.
+    wgpu::Texture twin;
+    uint64_t depth_gen = 1;  // bumps on every write to the depth texture
+    uint64_t twin_gen = 0;   // depth_gen the twin was last copied at
 };
 
 // ---- pass commands (wgpu_worker.js `_passCommands`) ----
@@ -492,6 +498,8 @@ struct NativeExecutor::Impl {
     std::unordered_map<std::string, wgpu::Sampler> dummy_samplers;
     std::unordered_map<std::string, wgpu::TextureView> dummy_views;
     std::vector<wgpu::Texture> dummy_textures;
+    std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth-as-float twin
+    wgpu::RenderPipeline depth_copy_pipeline;
     wgpu::BindGroupLayout empty_layout;
     wgpu::ShaderModule empty_fragment;
     wgpu::ShaderModule error_vertex_module;
@@ -1779,8 +1787,116 @@ struct NativeExecutor::Impl {
         layout.rowsPerImage = plan.rows_per_image ? plan.rows_per_image : wgpu::kCopyStrideUndefined;
         const wgpu::Extent3D size{plan.width, plan.height, plan.depth};
         queue.WriteTexture(&dst, p.payload + 48, w.data_len, &layout, &size);
+        ++t.depth_gen;
         ++stats.texture_uploads;
         stats.texture_upload_bytes += w.data_len;
+    }
+
+    // ---- depth-as-float twins ----
+
+    // The twin of a depth texture (created on first need): r32float, the same extent/mips/layers.
+    wgpu::Texture depth_twin(uint32_t id, TextureEntry& t) {
+        if (t.twin) return t.twin;
+        wgpu::TextureDescriptor td{};
+        td.dimension = wgpu::TextureDimension::e2D;
+        td.size = {t.geom.width, t.geom.height, t.geom.depth_or_layers};
+        td.format = wgpu::TextureFormat::R32Float;
+        td.mipLevelCount = t.geom.mips;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment;
+        t.twin = device.CreateTexture(&td);
+        if (t.twin) {
+            depth_twin_sources.insert(id);
+            t.twin_gen = 0;
+            ++stats.depth_twins_created;
+        }
+        return t.twin;
+    }
+
+    wgpu::TextureView depth_twin_view(TextureEntry& t, const GpuTextureViewDesc& d) {
+        wgpu::TextureViewDescriptor vd{};
+        vd.format = wgpu::TextureFormat::R32Float;
+        if (d.dimension) vd.dimension = wgpu_view_dim(d.dimension);
+        vd.baseMipLevel = d.base_mip_level;
+        if (d.mip_level_count) vd.mipLevelCount = d.mip_level_count;
+        vd.baseArrayLayer = d.base_array_layer;
+        if (d.array_layer_count) vd.arrayLayerCount = d.array_layer_count;
+        return t.twin.CreateView(&vd);
+    }
+
+    void ensure_depth_copy_pipeline() {
+        if (depth_copy_pipeline) return;
+        static const char kWgsl[] =
+            "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+            "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
+            "  return vec4f(p[i], 0.0, 1.0);\n}\n"
+            "@group(0) @binding(0) var src: texture_depth_2d;\n"
+            "@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) f32 {\n"
+            "  return textureLoad(src, vec2i(pos.xy), 0);\n}\n";
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = kWgsl;
+        wgpu::ShaderModuleDescriptor md{};
+        md.nextInChain = &wgsl;
+        wgpu::ShaderModule mod = device.CreateShaderModule(&md);
+        wgpu::ColorTargetState ct{};
+        ct.format = wgpu::TextureFormat::R32Float;
+        wgpu::FragmentState fs{};
+        fs.module = mod;
+        fs.entryPoint = "fs";
+        fs.targetCount = 1;
+        fs.targets = &ct;
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.vertex.module = mod;
+        pd.vertex.entryPoint = "vs";
+        pd.fragment = &fs;
+        depth_copy_pipeline = device.CreateRenderPipeline(&pd);
+    }
+
+    // Before every pass begins (no pass open): re-copy the depth aspect of each stale twin source,
+    // one fullscreen pass per mip/layer, so the pass about to run reads the depth written so far.
+    void refresh_depth_twins(wgpu::CommandEncoder& enc) {
+        for (auto sit = depth_twin_sources.begin(); sit != depth_twin_sources.end();) {
+            auto tit = textures.find(*sit);
+            if (tit == textures.end() || !tit->second.twin) { sit = depth_twin_sources.erase(sit); continue; }
+            ++sit;
+            TextureEntry& t = tit->second;
+            if (t.twin_gen == t.depth_gen) continue;
+            ensure_depth_copy_pipeline();
+            if (!depth_copy_pipeline) continue;
+            const wgpu::BindGroupLayout bgl = depth_copy_pipeline.GetBindGroupLayout(0);
+            for (uint32_t m = 0; m < t.geom.mips; ++m) {
+                for (uint32_t l = 0; l < t.geom.depth_or_layers; ++l) {
+                    wgpu::TextureViewDescriptor sv{};
+                    sv.dimension = wgpu::TextureViewDimension::e2D;
+                    sv.aspect = wgpu::TextureAspect::DepthOnly;
+                    sv.baseMipLevel = m; sv.mipLevelCount = 1;
+                    sv.baseArrayLayer = l; sv.arrayLayerCount = 1;
+                    wgpu::TextureViewDescriptor dv = sv;
+                    dv.format = wgpu::TextureFormat::R32Float;
+                    dv.aspect = wgpu::TextureAspect::All;
+                    wgpu::BindGroupEntry be{};
+                    be.binding = 0;
+                    be.textureView = t.texture.CreateView(&sv);
+                    wgpu::BindGroupDescriptor bd{};
+                    bd.layout = bgl;
+                    bd.entryCount = 1;
+                    bd.entries = &be;
+                    wgpu::RenderPassColorAttachment ca{};
+                    ca.view = t.twin.CreateView(&dv);
+                    ca.loadOp = wgpu::LoadOp::Clear;
+                    ca.storeOp = wgpu::StoreOp::Store;
+                    wgpu::RenderPassDescriptor rp{};
+                    rp.colorAttachmentCount = 1;
+                    rp.colorAttachments = &ca;
+                    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+                    pass.SetPipeline(depth_copy_pipeline);
+                    pass.SetBindGroup(0, device.CreateBindGroup(&bd));
+                    pass.Draw(3);
+                    pass.End();
+                }
+            }
+            t.twin_gen = t.depth_gen;
+            ++stats.depth_float_copies;
+        }
     }
 
     // TexturePackets / RenderStatePackets.getOrCreateTextureView (W347 1D promotion, 3D-BC fallback).
@@ -2900,8 +3016,16 @@ struct NativeExecutor::Impl {
                         use_dummy(*le);
                     } else if (!kind_mismatch && le && le->kind == 2 && tex_format &&
                                depth_sample_type_mismatch(le->subtype, tex_format)) {
-                        ++stats.bind_group_depth_layout_dummies;
-                        use_dummy(*le);
+                        if (depth_float_twin_eligible(le->subtype, tex_format, t.sample_count, t.geom.dimension,
+                                                      features.float32_filterable) &&
+                            depth_twin(e.resource_id, t)) {
+                            pe.view = depth_twin_view(t, e.view);
+                            have = static_cast<bool>(pe.view);
+                        }
+                        if (!have) {
+                            ++stats.bind_group_depth_layout_dummies;
+                            use_dummy(*le);
+                        }
                     } else {
                         pe.view = texture_view(t, vd);
                         if (pe.view) {
@@ -3163,6 +3287,7 @@ struct NativeExecutor::Impl {
         void ensure_render() {  // _ensurePresentRenderPass
             if (rpass) return;
             end_active();
+            s.refresh_depth_twins(enc);
             wgpu::RenderPassColorAttachment a = s.swapchain_attachment(
                 target, render_pass_opened ? LoadOp::Load : LoadOp::Clear, StoreOp::Store, s.clear_color);
             wgpu::RenderPassDescriptor rp{};
@@ -3177,6 +3302,7 @@ struct NativeExecutor::Impl {
         void ensure_compute() {
             if (cpass) return;
             end_active();
+            s.refresh_depth_twins(enc);
             wgpu::ComputePassDescriptor cd{};
             wgpu::PassTimestampWrites tw{};
             if (s.timer_pass(*this, d3d12_guest::GpuPassKind::Compute, s.lookahead_hash(*this, idx, true), &tw))
@@ -3193,6 +3319,11 @@ struct NativeExecutor::Impl {
 
     void begin_explicit_pass(Encoder& e, const BeginPassCmd& b) {
         e.end_active();
+        refresh_depth_twins(e.enc);
+        if (b.has_ds && !b.ds.depth_read_only && b.ds.depth_load_op != 0) {
+            auto wit = textures.find(b.ds.texture_id);
+            if (wit != textures.end()) ++wit->second.depth_gen;
+        }
         std::array<AttachmentSize, kGpuMaxColorAttachments> sizes{};
         RenderPassPlan plan;
         plan.color_count = b.color_count;
@@ -4251,6 +4382,8 @@ std::string NativeExecutor::stats_json() const {
     num("reflection_binding_conflicts", st.reflection_binding_conflicts);
     num("reflection_layout_unsupported", st.reflection_layout_unsupported);
     num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
+    num("depth_float_copies", st.depth_float_copies);
+    num("depth_twins_created", st.depth_twins_created);
     num("manifest_layouts_resolved", st.manifest_layouts_resolved);
     num("v1_synth_samplers", st.v1_synth_samplers);
     num("timer_frames", st.timer_frames);
