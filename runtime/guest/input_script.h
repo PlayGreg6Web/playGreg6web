@@ -31,6 +31,11 @@
 //     end
 //         Plays the body every <dur> until <cond> has held for its <dur> (or the timeout). No press
 //         is sent while <cond> holds, so the body stops pressing once the target screen is up.
+//     state <present> <buttons> <left_x> <left_y> <right_x> <right_y> <lt> <rt>
+//         A recorded host reading (`playgta6_boot --record-input`, guest/input_record.h; the file starts
+//         with `# playgta6-input-script v2`): written as the whole input state once the present counter
+//         has reached <present>, and held until the next state line. <buttons> is a number (hex with
+//         0x), axes and triggers are floats (sticks up = +y). Replays by present index, not wall time.
 //     capture
 //         Starts a deferred GPU capture here (playgta6_boot --gpu-capture-start-at-script).
 //
@@ -50,7 +55,7 @@
 
 namespace playgta6::guest {
 
-enum class InputStepKind : uint8_t { Press, Wait, RepeatBegin, RepeatEnd, Capture };
+enum class InputStepKind : uint8_t { Press, Wait, RepeatBegin, RepeatEnd, Capture, State };
 
 struct InputCondition {
     enum class Metric : uint8_t { DrawsPerFrame, Presents };
@@ -93,6 +98,8 @@ struct InputScriptEvent {
     uint32_t buttons = 0;
     uint64_t hold_ms = 100;
     // Analog axes held for the event (up = +y, like the shared InputState); 0 when not named.
+    float left_stick_x = 0.0f;  // State only (recorded readings)
+    float left_stick_y = 0.0f;
     float right_stick_x = 0.0f;
     float right_stick_y = 0.0f;
     float left_trigger = 0.0f;
@@ -103,6 +110,7 @@ struct InputScriptEvent {
     uint64_t for_ms = 0;      // Wait, RepeatBegin: the condition must hold this long
     uint64_t timeout_ms = 0;  // Wait, RepeatBegin: 0 = none
     uint64_t every_ms = 0;    // RepeatBegin: round period
+    uint64_t present = 0;     // State: written once the present counter reaches this
     size_t end_index = 0;     // RepeatBegin: index of its RepeatEnd
 };
 

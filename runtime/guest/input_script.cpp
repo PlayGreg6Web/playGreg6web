@@ -260,7 +260,7 @@ bool parse_input_script(const std::string& text, std::vector<InputScriptEvent>& 
         }
         const std::string where = "line " + std::to_string(number) + ": ";
         InputScriptEvent e;
-        if (time_text == "wait" || time_text == "repeat" || time_text == "end" || time_text == "capture") {
+        if (time_text == "wait" || time_text == "repeat" || time_text == "end" || time_text == "capture" || time_text == "state") {
             sort_presses(out, run_start);
             if (time_text == "wait") {
                 e.kind = InputStepKind::Wait;
@@ -285,6 +285,31 @@ bool parse_input_script(const std::string& text, std::vector<InputScriptEvent>& 
                     return false;
                 }
                 open_repeat = out.size();
+            } else if (time_text == "state") {
+                e.kind = InputStepKind::State;
+                std::string tok[8];
+                for (std::string& t : tok) {
+                    fields >> t;
+                }
+                float* axes[] = {&e.left_stick_x, &e.left_stick_y, &e.right_stick_x, &e.right_stick_y, &e.left_trigger,
+                                 &e.right_trigger};
+                uint64_t buttons = 0;
+                bool ok = parse_number(tok[0], e.present) && parse_number(tok[1], buttons) && buttons <= 0xffffffffull;
+                for (int k = 0; ok && k < 6; ++k) {
+                    char* end = nullptr;
+                    *axes[k] = std::strtof(tok[2 + k].c_str(), &end);
+                    ok = !tok[2 + k].empty() && end != nullptr && *end == '\0';
+                }
+                std::string trailing;
+                if (!ok || (fields >> trailing)) {
+                    error = where + "expected 'state <present> <buttons> <lx> <ly> <rx> <ry> <lt> <rt>'";
+                    return false;
+                }
+                if (open_repeat != SIZE_MAX) {
+                    error = where + "'state' inside repeat";
+                    return false;
+                }
+                e.buttons = static_cast<uint32_t>(buttons);
             } else {
                 std::string extra;
                 if (fields >> extra) {
@@ -365,6 +390,8 @@ void InputScriptPlayer::write(const InputScriptEvent* held) {
     playgta6::InputState values{};
     if (held != nullptr) {
         values.buttons = held->buttons;
+        values.left_stick_x = held->left_stick_x;
+        values.left_stick_y = held->left_stick_y;
         values.right_stick_x = held->right_stick_x;
         values.right_stick_y = held->right_stick_y;
         values.left_trigger = held->left_trigger;
@@ -388,7 +415,7 @@ void InputScriptPlayer::run() {
     enum class Until { Reached, Met, Stopped };
     // Sleeps until `at` in short steps so stop() takes effect promptly; with a tracker, also
     // samples the live status every step and returns Met as soon as its condition is met.
-    auto wait_until = [&](clock::time_point at, ConditionTracker* tracker) {
+    auto wait_until = [&](clock::time_point at, ConditionTracker* tracker, int tracker_step_ms = 10) {
         while (!stop_.load()) {
             if (tracker != nullptr && tracker->update(ms_since_start(), status())) {
                 return Until::Met;
@@ -397,7 +424,7 @@ void InputScriptPlayer::run() {
             if (now >= at) {
                 return Until::Reached;
             }
-            const auto step = std::chrono::milliseconds(tracker != nullptr ? 10 : 20);
+            const auto step = std::chrono::milliseconds(tracker != nullptr ? tracker_step_ms : 20);
             std::this_thread::sleep_for(std::min<clock::duration>(at - now, step));
         }
         return Until::Stopped;
@@ -473,6 +500,21 @@ void InputScriptPlayer::run() {
                 finish_wait(e, u == Until::Met, "repeat (" + std::to_string(rounds) + " round(s))");
                 base = clock::now();
                 i = e.end_index;
+                break;
+            }
+            case InputStepKind::State: {
+                InputCondition reached;
+                reached.metric = InputCondition::Metric::Presents;
+                reached.op = InputCondition::Op::Ge;
+                reached.values = {e.present};
+                ConditionTracker tracker(reached, 0);
+                if (wait_until(clock::time_point::max(), &tracker, 1) == Until::Stopped) {
+                    return;
+                }
+                if (log_) {
+                    log("state " + hex(e.buttons) + " at present " + std::to_string(e.present));
+                }
+                write(&e);
                 break;
             }
             case InputStepKind::Capture:

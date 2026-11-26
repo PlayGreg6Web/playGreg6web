@@ -13,6 +13,10 @@
 
 #include "abi/playgta6_abi.h"
 
+namespace playgta6::guest {
+class InputRecorder;
+}
+
 namespace playgta6::guest::host_input {
 
 // XInput wButtons bits (XINPUT_GAMEPAD_*).
@@ -69,6 +73,8 @@ public:
     // The keyboard is read globally (GetAsyncKeyState); with a live window the harness enables it only
     // while that window has focus, so typing elsewhere does not drive the game. The pad is unaffected.
     void set_keyboard_enabled(bool enabled) { keyboard_enabled_.store(enabled); }
+    // Every reading (after the keyboard gate and pad merge) is also handed to `recorder` (--record-input).
+    void set_recorder(InputRecorder* recorder) { recorder_ = recorder; }
     bool keyboard_enabled() const { return keyboard_enabled_.load(); }
 
 private:
@@ -76,6 +82,7 @@ private:
 
     playgta6::InputState* state_;
     std::thread thread_;
+    InputRecorder* recorder_ = nullptr;
     std::atomic<bool> stop_{false};
     std::atomic<bool> keyboard_enabled_{true};
     std::atomic<uint64_t> writes_{0};

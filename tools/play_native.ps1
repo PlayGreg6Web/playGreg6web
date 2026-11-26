@@ -7,7 +7,8 @@
 .NOTES
   Shader pack: -ShaderPack, env PLAYGTA6_NATIVE_SHADER_PACK, else the newest *.wgsl.pack under work/ (or
   env PLAYGTA6_SHADER_PACK_DIR); the pick is printed. Saves persist under %LOCALAPPDATA%\playgta6\saves;
-  -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. Stop: close the window or Ctrl+C;
+  -Record writes your real keyboard/pad input to %LOCALAPPDATA%/playgta6/recordings/<name>.txt (-RecordFile: another
+  path); replay it with run_native_boot.py --input-script <file>. -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. Stop: close the window or Ctrl+C;
   without -MaxMs the run lasts 2 h. See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
 #>
 param(
@@ -21,6 +22,8 @@ param(
     [string]$Name = "",
     [int]$MaxMs = 7200000,
     [switch]$FreshSetup,
+    [switch]$Record,
+    [string]$RecordFile = "",
     [switch]$NoBuild,
     [switch]$TrustBuild,
     [switch]$DryRun
@@ -36,6 +39,7 @@ $argv = @("tools/run_native_boot.py", "--preset", $preset, "--name", $Name, "--p
           "--max-ms", $MaxMs, "--watchdog-ms", ($MaxMs + 30000))
 # Without -ShaderPack run_native_boot.py picks one (env var, then the newest *.wgsl.pack under work/) and prints it.
 if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
+if ($Record -or $RecordFile) { $argv += "--record-input"; if ($RecordFile) { $argv += $RecordFile } }
 if ($FreshSetup) { $argv += "--fresh-setup" }
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }

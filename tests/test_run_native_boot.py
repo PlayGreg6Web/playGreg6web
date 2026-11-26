@@ -854,6 +854,23 @@ class PlayConvenienceTests(unittest.TestCase):
             self.assertIn("/playgta6/fresh-", save)
             self.assertIn("shader pack:", err.getvalue())
 
+    def test_play_record_input_default_and_explicit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            fx = Fixture(root)
+            touch(fx.repo / "work" / "p.wgsl.pack", 5000.0)
+            env = {"LOCALAPPDATA": str(root / "local")}
+            for extra, check in (([], lambda v: v.replace(chr(92), "/").endswith("/playgta6/recordings/r1.txt")),
+                                 (["x/y.txt"], lambda v: v.replace(chr(92), "/") == "x/y.txt")):
+                out, err = io.StringIO(), io.StringIO()
+                argv = ["--play", "--dry-run", "--name", "r1", "--exe", str(fx.exe), "--game-dir", str(fx.pkg),
+                        "--build-dir", str(fx.build), "--harness", str(fx.harness), "--record-input"] + extra
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = rnb.main(argv, env=env, repo_root=fx.repo)
+                self.assertEqual(code, 0, err.getvalue())
+                cmd = json.loads(out.getvalue())["command"]
+                self.assertTrue(check(cmd[cmd.index("--record-input") + 1]), cmd)
+
     def test_watch_for_fault_prints_fault_report(self):
         import threading
         with tempfile.TemporaryDirectory() as d:

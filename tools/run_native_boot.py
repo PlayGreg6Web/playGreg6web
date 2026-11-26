@@ -191,6 +191,13 @@ def default_save_root(env: Mapping[str, str]) -> Path:
     return base / "playgta6" / "saves"
 
 
+def default_recordings_dir(env: Mapping[str, str]) -> Path:
+    """Where --record-input recordings go: %LOCALAPPDATA%/playgta6/recordings."""
+    local = env.get("LOCALAPPDATA")
+    base = Path(local) if local else Path.home() / ".local" / "share"
+    return base / "playgta6" / "recordings"
+
+
 def play_save_dir(fresh: bool, explicit: Path | None, env: Mapping[str, str], now: str) -> Path:
     """--save-dir wins; --fresh-setup gives a new empty directory next to the persistent one (so the
     setup screens appear); otherwise the persistent default."""
@@ -856,6 +863,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="build the harness with --window support (Dawn executor; needs a Dawn checkout/cache)")
     p.add_argument("--play", action="store_true",
                    help="live native play: --native-executor build, then run with --window --audio-out --host-input")
+    p.add_argument("--record-input", nargs="?", const="auto", metavar="FILE",
+                   help="with --play: record the real keyboard/pad input as an --input-script file (replay it with "
+                        "--input-script; deterministic by present index). Without FILE: "
+                        "%%LOCALAPPDATA%%/playgta6/recordings/<name>.txt")
     p.add_argument("--fresh-setup", action="store_true",
                    help="with --play: a new empty save directory, so the setup screens appear again")
     p.add_argument("--save-dir", type=Path, help="with --play: save directory (default: persistent, see docs)")
@@ -978,6 +989,10 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
                                   "without one nothing is drawn")
             args.shader_pack = found
             print(f"[play] shader pack: {found} ({why})", file=sys.stderr)
+        if args.record_input:
+            rec = (default_recordings_dir(env) / f"{args.name or 'play'}.txt") if args.record_input == "auto" else Path(args.record_input)
+            extra = ["--record-input", str(rec)] + list(extra)
+            print(f"[play] recording input to {rec} (replay: --input-script)", file=sys.stderr)
         if "--save-dir" not in extra:
             save = play_save_dir(args.fresh_setup, args.save_dir, env, time.strftime("%Y%m%d-%H%M%S"))
             extra = ["--save-dir", str(save)] + list(extra)

@@ -107,6 +107,7 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
+#include "guest/input_record.h"
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
@@ -229,6 +230,7 @@ struct Options {
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
+    std::string record_input;       // --record-input: write the real --host-input readings (guest/input_record.h)
     std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
     std::string watch_gpu_va;       // --watch-gpu-va: GPU address ranges to report references to (gpu/gpu_va_watch.h)
     // --wgpu-features: pso::WgpuFeature bits of the WebGPU device that replays the run. The bridge
@@ -261,6 +263,7 @@ void usage() {
                  "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--dawn-cache <dir|off>] [--dawn-cache-max-mb N] [--no-async-pipelines]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
+                 "                     [--record-input <file>]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
                  "                     [--bcpack-tables <file>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
@@ -331,7 +334,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--input-script" || a == "--watch-gpu-va" ||
+                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--input-script" || a == "--record-input" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
                    a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
@@ -345,6 +348,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--pipeline-warm-list" ? o.pipeline_warm_list
                                   : a == "--dawn-cache" ? o.dawn_cache
                                   : a == "--input-script" ? o.input_script
+                                  : a == "--record-input" ? o.record_input
                                   : a == "--watch-gpu-va" ? o.watch_gpu_va
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
@@ -1673,8 +1677,22 @@ int main(int argc, char** argv) {
         static playgta6::guest::host_input::HostInputSource host_source(&host_state);
         playgta6::os::scarlett::set_game_input_state(&host_state);
         playgta6::os::scarlett::set_game_input_press_sampler(true);
+        static playgta6::guest::InputRecorder recorder;
+        if (!g_options.record_input.empty()) {
+            std::string error;
+            if (!recorder.open(g_options.record_input, [] { return guest::present_status().presents; }, error)) {
+                std::fprintf(stderr, "[harness] --record-input: %s\n", error.c_str());
+                return kExitUsage;
+            }
+            host_source.set_recorder(&recorder);
+            std::fprintf(stderr, "[harness] recording host input to %s\n", g_options.record_input.c_str());
+        }
         host_source.start();
         std::fprintf(stderr, "[harness] host input: XInput pad + keyboard\n");
+    }
+    if (!g_options.record_input.empty() && !g_options.host_input) {
+        std::fprintf(stderr, "[harness] --record-input needs --host-input\n");
+        return kExitUsage;
     }
     start_watchdog();
     start_profile();

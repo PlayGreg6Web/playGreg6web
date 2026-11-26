@@ -83,6 +83,7 @@ add_library(playgta6_core STATIC
     guest/audio_probes.cpp
     guest/input_script.cpp
     guest/host_input.cpp
+    guest/input_record.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp
     os/xgamesave_local.cpp

@@ -80,6 +80,13 @@ no window of its own, so the flag is opt-in and keys are read globally. It uses 
 stick), Shift / Ctrl (L3 / R3) and Z / C (LT / RT). Raw values pass through; the title's adapter applies the deadzones;
 the pad wins per axis when it is deflected more. `--input-script` takes precedence when both are given.
 
+### Recording and replaying a session: `--record-input`
+`playgta6_boot --host-input --record-input <file>` writes every real keyboard/pad reading (each change of the
+state, nothing synthesized) in the `--input-script` format: a `# playgta6-input-script v2` line, then
+`state <present> <buttons> <lx> <ly> <rx> <ry> <lt> <rt>   # <ms> ms` lines. `--input-script <file>` replays it: each
+state is written once the present counter reaches its index, so the sequence is the same however fast the run is.
+`play_native.ps1 -Record` records to `%LOCALAPPDATA%/playgta6/recordings/<name>.txt` (`-RecordFile` for a path).
+
 ## Native play: one command
 
 ```powershell

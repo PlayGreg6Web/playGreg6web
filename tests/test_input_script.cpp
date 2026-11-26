@@ -2,11 +2,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
+#include "guest/input_record.h"
 #include "guest/input_script.h"
 #include "os/game_input.h"
 #include "os/xbox_scarlett.h"
@@ -296,6 +301,85 @@ void test_title_reads_the_script_through_game_input() {
     playgta6::os::scarlett::set_game_input_state(nullptr);
 }
 
+
+// record -> replay: the recorded host readings come back identical, in order, at their present index.
+void test_record_replay_round_trip() {
+    namespace fs = std::filesystem;
+    const std::string path = (fs::temp_directory_path() / "playgta6_input_record_test.txt").string();
+    std::atomic<uint64_t> presents{0};
+    std::vector<std::pair<uint64_t, playgta6::InputState>> truth;
+    {
+        playgta6::guest::InputRecorder rec;
+        std::string error;
+        CHECK(rec.open(path, [&] { return presents.load(); }, error));
+        auto feed = [&](uint64_t at, playgta6::InputState s) {
+            presents = at;
+            rec.record(s);
+            rec.record(s);  // an unchanged reading is not recorded again
+            truth.emplace_back(at, s);
+        };
+        playgta6::InputState a{};
+        a.buttons = button::kGamepadA;
+        feed(5, a);
+        a.left_stick_x = 0.123456789f;
+        a.left_stick_y = -0.75f;
+        a.right_trigger = 1.0f;
+        feed(5, a);  // two changes within one present both survive
+        playgta6::InputState b{};
+        b.buttons = button::kMenu | button::kDPadUp;
+        b.right_stick_x = -1.0f;
+        feed(40, b);
+        feed(41, playgta6::InputState{});
+        CHECK(rec.lines() == 4);
+    }
+    std::ifstream in(path, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(text.rfind(playgta6::guest::kInputScriptVersionLine, 0) == 0);
+    std::vector<InputScriptEvent> ev;
+    std::string error;
+    CHECK(parse_input_script(text, ev, error));
+    CHECK(ev.size() == truth.size());
+    for (size_t i = 0; i < ev.size() && i < truth.size(); ++i) {
+        const playgta6::InputState& s = truth[i].second;
+        CHECK(ev[i].kind == InputStepKind::State && ev[i].present == truth[i].first);
+        CHECK(ev[i].buttons == s.buttons && ev[i].left_stick_x == s.left_stick_x && ev[i].left_stick_y == s.left_stick_y &&
+              ev[i].right_stick_x == s.right_stick_x && ev[i].right_stick_y == s.right_stick_y &&
+              ev[i].left_trigger == s.left_trigger && ev[i].right_trigger == s.right_trigger);
+    }
+    CHECK(!parse_input_script("state 3 0x1 0 0 0 0\n", ev, error));  // too few fields
+    CHECK(!parse_input_script("state 3 zz 0 0 0 0 0 0\n", ev, error));
+
+    // Replay: the player writes each state once its present index is reached, nothing earlier.
+    parse_input_script(text, ev, error);
+    playgta6::InputState out{};
+    std::atomic<uint64_t> live{0};
+    playgta6::guest::InputScriptPlayer player(ev, &out);
+    player.set_status_probe([&] { return InputStatus{live.load(), 0}; });
+    player.start();
+    auto wait_writes = [&](uint64_t n) {
+        for (int i = 0; i < 2000 && player.writes() < n; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return player.writes() == n;
+    };
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(player.writes() == 0);
+    live = 4;
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(player.writes() == 0);
+    live = 5;
+    CHECK(wait_writes(2));
+    CHECK(out.buttons == truth[1].second.buttons && out.left_stick_x == truth[1].second.left_stick_x &&
+          out.right_trigger == 1.0f);
+    live = 40;
+    CHECK(wait_writes(3));
+    CHECK(out.buttons == truth[2].second.buttons && out.right_stick_x == -1.0f && out.left_stick_x == 0.0f);
+    live = 41;
+    CHECK(wait_writes(4));
+    CHECK(out.buttons == 0 && out.right_stick_x == 0.0f);
+    player.stop();
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +390,7 @@ int main() {
     test_player_waits_for_the_screen();
     test_player_repeat_stops_on_the_target_screen();
     test_title_reads_the_script_through_game_input();
+    test_record_replay_round_trip();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_input_script: %d failure(s)\n", g_failures);
         return 1;

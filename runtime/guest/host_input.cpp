@@ -1,4 +1,5 @@
 #include "guest/host_input.h"
+#include "guest/input_record.h"
 
 #include <chrono>
 #include <cmath>
@@ -183,6 +184,9 @@ void HostInputSource::run() {
             }
         }
         const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, convert_keyboard(keyboard_enabled_.load() ? read_keys() : 0));
+        if (recorder_ != nullptr) {
+            recorder_->record(values);
+        }
         playgta6::os::GameInputReader::write_monotonic(*state_, values);
         writes_.fetch_add(1);
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
