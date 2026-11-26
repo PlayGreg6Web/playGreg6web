@@ -2441,6 +2441,7 @@ BindGroupLookup BindGroupCache::get_or_build(
         result.retired_gpu_id = cached.gpu_id;
         cached.gpu_id = 0;
         build_entries(state, bind_point, *signature, plan, resolver, resolver_user, &cached);
+        note_group_ids(cached);
         return result;
     }
     ++misses_;
@@ -2456,6 +2457,7 @@ BindGroupLookup BindGroupCache::get_or_build(
         entry->key_hash = h;
         entry->last_used_epoch = epoch_;
         build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
+        note_group_ids(*entry);
         CachedBindGroup* ptr = entry.get();
         result.bind_group = ptr;
         result.rebuilt = true;
@@ -2473,6 +2475,7 @@ BindGroupLookup BindGroupCache::get_or_build(
     entry->key_hash = h;
     entry->last_used_epoch = epoch_;
     build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
+        note_group_ids(*entry);
     CachedBindGroup* ptr = entry.get();
     result.bind_group = ptr;
     result.rebuilt = true;
@@ -2620,6 +2623,8 @@ void BindGroupCache::clear(std::vector<uint32_t>* retired) {
     tombstones_ = 0;
     last_hash_ = 0;
     last_entry_ = nullptr;
+    std::fill(id_filter_.begin(), id_filter_.end(), uint64_t{0});
+    filter_notes_ = 0;
     track_size();
 }
 
@@ -2670,12 +2675,58 @@ size_t BindGroupCache::evict_resource(uint32_t resource_id, std::vector<uint32_t
     return evict_resources_and_views(std::span<const uint32_t>(&resource_id, 1), {}, retired);
 }
 
+void BindGroupCache::note_group_ids(const CachedBindGroup& g) noexcept {
+    auto set = [this](uint32_t id, bool view) noexcept {
+        if (id != 0) {
+            const size_t b = id_filter_bit(id, view);
+            id_filter_[b >> 6] |= uint64_t{1} << (b & 63);
+        }
+    };
+    for (const BindGroupEntry& e : g.entries) {
+        set(e.resource_id, false);
+        set(e.view.resource_id, false);
+        set(e.view.counter_resource_id, false);
+    }
+    for (const CachedBindGroup::Relocation& r : g.relocations) {
+        set(r.buffer_id, false);
+    }
+    for (const uint32_t vid : g.view_ids) {
+        set(vid, true);
+    }
+    ++filter_notes_;
+}
+
+void BindGroupCache::rebuild_id_filter() noexcept {
+    std::fill(id_filter_.begin(), id_filter_.end(), uint64_t{0});
+    for (const Slot& s : table_) {
+        if (s.state == kBindSlotOccupied) {
+            note_group_ids(*s.entry);
+        }
+    }
+    filter_notes_ = 0;
+}
+
 size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resource_ids,
                                                  std::span<const uint32_t> view_ids,
                                                  std::vector<uint32_t>* retired,
                                                  std::vector<uint64_t>* evicted_key_hashes) {
     if (size_ == 0 || (resource_ids.empty() && view_ids.empty())) {
         return 0;
+    }
+    {
+        bool maybe = false;
+        for (const uint32_t id : resource_ids) {
+            if (id != 0 && filter_may_hold(id, false)) {
+                maybe = true;
+                break;
+            }
+        }
+        for (size_t i = 0; !maybe && i < view_ids.size(); ++i) {
+            maybe = view_ids[i] != 0 && filter_may_hold(view_ids[i], true);
+        }
+        if (!maybe) {
+            return 0;  // no cached group references any of the ids
+        }
     }
     auto contains = [](std::span<const uint32_t> ids, uint32_t id) noexcept -> bool {
         if (id == 0) {
@@ -2741,6 +2792,9 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
     } else if (tombstones_ > size_ && !table_.empty() && (size_ + tombstones_) * 10 >= table_.size() * 7) {
         rehash(table_.size());
     }
+    if (dropped != 0 && filter_notes_ > 2 * size_ + 256) {
+        rebuild_id_filter();  // the dropped groups' bits are stale
+    }
     track_size();
     return dropped;
 }
@@ -2776,6 +2830,9 @@ size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* reti
         } else if (tombstones_ > size_ && !table_.empty()) {
             rehash(table_.size());
         }
+    }
+    if (filter_notes_ > 2 * size_ + 256) {
+        rebuild_id_filter();
     }
     track_size();
     peak_epoch_entries_ = size_;  // the next epoch's peak starts from what survived

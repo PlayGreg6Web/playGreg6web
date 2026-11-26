@@ -4504,6 +4504,7 @@ void test_unregister_texture_invalidates_cached_bind_groups() {
         CHECK(lk.status == d3d::Status::Ok && lk.bind_group != nullptr);
         lk.bind_group->gpu_id = 7777u;
         lk.bind_group->view_ids.push_back(42u);
+        cache.note_group_ids(*lk.bind_group);  // ids added after the lookup go through the eviction filter
         CHECK(cache.size() == 1);
 
         const uint32_t retired_view = 42u;

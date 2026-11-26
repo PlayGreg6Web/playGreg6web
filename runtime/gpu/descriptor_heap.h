@@ -1130,6 +1130,11 @@ public:
                                      std::span<const uint32_t> view_ids,
                                      std::vector<uint32_t>* retired = nullptr,
                                      std::vector<uint64_t>* evicted_key_hashes = nullptr);
+    // Records every resource, view and relocation buffer id `group` references in the eviction
+    // filter. Call it after anything that adds ids to a group the cache holds (the cache does it
+    // for its own builds; the bridge after it fills in relocations and view ids). Ids are only
+    // ever added between rebuilds, so the filter may over-report but never miss a referenced id.
+    void note_group_ids(const CachedBindGroup& group) noexcept;
     // Bounds the cache between recordings (O36). Keys carry root-view GPU addresses and table base
     // indices, which ring allocators change per draw, so without a bound the cache (and the WebGPU
     // bind groups behind it) grows for the whole run. When more than `max_entries` are cached, drops
@@ -1178,6 +1183,21 @@ private:
     // Words of the plan's memory-backed windows under the current arguments (false: none).
     bool memory_words(const RootArgumentState& state, BindPoint bind_point, const BindGroupPlan& plan,
                       std::vector<uint8_t>* out) const;
+
+    // Eviction filter: one bit per (hashed) resource id and view id some cached group references.
+    // A retire of an id that is not set cannot match any group, which skips the full table scan
+    // (a title retires far more resources than its bind groups ever bind).
+    static constexpr size_t kIdFilterBits = size_t{1} << 16;
+    static size_t id_filter_bit(uint32_t id, bool view) noexcept {
+        return static_cast<size_t>(((id + (view ? 0x5bd1e995u : 0u)) * 0x9E3779B1u) >> 16) & (kIdFilterBits - 1);
+    }
+    bool filter_may_hold(uint32_t id, bool view) const noexcept {
+        const size_t b = id_filter_bit(id, view);
+        return ((id_filter_[b >> 6] >> (b & 63)) & 1u) != 0;
+    }
+    void rebuild_id_filter() noexcept;
+    std::vector<uint64_t> id_filter_ = std::vector<uint64_t>(kIdFilterBits / 64, 0);
+    size_t filter_notes_ = 0;  // note_group_ids calls since the filter was last rebuilt
 
     std::vector<Slot> table_;
     size_t size_ = 0;

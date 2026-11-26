@@ -3029,6 +3029,7 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     cached->residency_key = residency_key(*cached);
     cached->view_ids = pending_view_ids_;
     cached->null_write_entries = pending_null_writes_;
+    bind_groups_.note_group_ids(*cached);
     GpuCreateBindGroup2Payload header{};
     header.id = device_.allocate_id();
     header.layout_id = group.id;
