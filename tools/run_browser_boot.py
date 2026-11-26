@@ -4568,6 +4568,11 @@ def extract_fault_record(lines: Sequence[str] | None, hard_stops: str | None = N
             found = rec
     if found is None:
         return None
+    # The brief line carries `va`; tools/fault_report.py / boot_summary.py read the native record's keys.
+    if found.get("target") is None and found.get("va") is not None:
+        found["target"] = found["va"]
+    if "code_miss" not in found:
+        found["code_miss"] = found.get("kind") in ("unknown_target", "unknown_resume_target", "trap")
     slot = found.get("unimplemented_slot")
     if isinstance(slot, dict) and hard_stops and isinstance(slot.get("slot"), int) and slot.get("interface"):
         status = guest_symbols.hard_stop_status(hard_stops, slot["interface"], slot["slot"], slot.get("name"))
@@ -4689,6 +4694,8 @@ def build_boot_report(
         fault["import"] = fault_record.get("import") or fault["import"]
         if fault_record.get("va") is not None:
             fault["va"] = fault_record["va"]
+        if isinstance(fault_record.get("source"), dict):
+            fault["source"] = fault_record["source"]
         slot = fault_record.get("unimplemented_slot")
         if isinstance(slot, dict):
             fault["detail"] = sanitize_text(

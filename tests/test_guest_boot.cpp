@@ -1549,6 +1549,17 @@ void test_wasm_off_thread_fault_records() {
         CHECK(j["va"].hex() == 0);
         CHECK(j["unimplemented_slot"].type == Json::Null);
         CHECK(j["callers"].type == Json::Array);
+        // Locating info: the worker pushed return address kWorker + 4 before the null call.
+        CHECK(j["source"].type == Json::Object);
+        CHECK(j["source"]["return_address"].hex() == kWorker + 4);
+        CHECK(j["source"]["location"]["entry"].hex() == kWorker);
+        CHECK(j["registers"].type == Json::Object);
+        CHECK(j["registers"]["rsp"].hex() != 0);
+        CHECK(j["call_stack"]["frames"].type == Json::Array);
+        CHECK(j["recent_entries"].type == Json::Array);
+        CHECK(!j["recent_entries"].items.empty());
+        CHECK(j["recent_entries"].items.back()["target"].hex() == 0);
+        CHECK(j["recent_entries"].items.back()["from"].hex() == kWorker + 4);
     }
     {
         const Json j = run_off_thread_record(Scenario::OffThreadUnknownTarget);

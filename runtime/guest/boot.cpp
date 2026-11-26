@@ -3144,6 +3144,45 @@ void log_fault_brief() {
     for (size_t i = 0; i < callers; ++i) {
         o += (i == 0 ? "" : ", ") + code_location_json(f.frames[i].return_address);
     }
+    o += "]";
+    // Locating info, same keys as the report's fault_record (tools/fault_report.py renders either), bounded:
+    // the source site of the indirect call, the 16 GPRs, up to 16 guest stack frames (unwind info, else a
+    // stack scan) and the faulting thread's last (up to 64) dispatches as bare target/from pairs.
+    const GuestState* regs = f.has_registers ? &f.registers : nullptr;
+    std::string source = "null";
+    if (f.kind == "unknown_target") {
+        for (size_t i = f.recent_dispatches.size(); i-- > 0;) {
+            if (f.recent_dispatches[i].target == f.va) {
+                source = "{\"return_address\": " + hex(f.recent_dispatches[i].return_address) +
+                         ", \"location\": " + code_location_json(f.recent_dispatches[i].return_address) + "}";
+                break;
+            }
+        }
+    } else if (f.kind == "unknown_resume_target" && regs != nullptr) {
+        source = "{\"resume_rip\": " + hex(regs->resume_rip) +
+                 ", \"location\": " + code_location_json(regs->resume_rip) + "}";
+    }
+    o += ", \"source\": " + source + ", \"registers\": ";
+    if (regs != nullptr) {
+        o += "{";
+        for (unsigned i = 0; i < 16; ++i) {
+            o += (i == 0 ? "" : ", ") + json_string(kGprNames[i]) + ": " + hex(regs->gpr[i]);
+        }
+        o += "}";
+    } else {
+        o += "null";
+    }
+    o += ", \"call_stack\": {\"method\": " + json_string(f.backtrace_method) + ", \"frames\": [";
+    const size_t nframes = std::min<size_t>(f.frames.size(), 16);
+    for (size_t i = 0; i < nframes; ++i) {
+        o += (i == 0 ? "" : ", ") + code_location_json(f.frames[i].return_address);
+    }
+    o += "]}, \"recent_entries\": [";
+    for (size_t i = 0; i < f.recent_dispatches.size(); ++i) {
+        const DispatchRecord& d = f.recent_dispatches[i];
+        o += (i == 0 ? "" : ", ") + std::string("{\"target\": ") + hex(d.target) + ", \"from\": " +
+             hex(d.return_address) + "}";
+    }
     o += "]}";
     os::log("[fault-record] " + o);
 }

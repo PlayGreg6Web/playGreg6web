@@ -4730,6 +4730,23 @@ class FaultRecordLineTests(unittest.TestCase):
         self.assertIsNone(rep["fault"]["function"])
         self.assertEqual(rep["fault_record"]["thread"], 7)
 
+    def test_null_call_source_site_and_stack_reach_fault_report(self):
+        import fault_report as fr
+        loc = {"address": "0x140001010", "entry": "0x140001000", "offset": "0x10", "symbol": None}
+        rec = dict(source={"return_address": "0x140001010", "location": loc},
+                   registers={"rax": "0x0", "rsp": "0x7ff0"}, call_stack={"method": "unwind", "frames": [loc]},
+                   recent_entries=[{"target": "0x0", "from": "0x140001010"}])
+        rep = self._report([self._line("unknown_target", **rec)])
+        self.assertEqual(rep["fault"]["source"]["return_address"], "0x140001010")
+        fr_rec = rep["fault_record"]
+        self.assertEqual(fr_rec["target"], "0x0")
+        self.assertTrue(fr_rec["code_miss"])
+        text = fr.render(rep)
+        self.assertIn("source  : indirect call, return address", text)
+        self.assertIn("sub_140001000", text.replace("0x140001000", "sub_140001000"))
+        self.assertIn("call stack (unwind)", text)
+        self.assertIn("from", text)
+
     def test_unknown_target_names_function(self):
         fn = {"entry": "0x140001000", "offset": "0x34"}
         rep = self._report([self._line("unknown_target", va="0x140001034", function=fn)])
