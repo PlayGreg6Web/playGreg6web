@@ -1053,8 +1053,7 @@ extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_relaunch_args_ptr(void) {
 // filesystem; the host (web/) mirrors them to IndexedDB/OPFS. After any completed save write
 // playgta6_storage_generation() increases. The host polls it (or on visibilitychange/pagehide) and,
 // when it changed, calls playgta6_storage_take_changed() which returns the container directories
-// changed since the last take as '
-'-separated paths (clears the list; pointer valid until the next
+// changed since the last take as newline-separated paths (clears the list; pointer valid until the next
 // call), then persists those trees; removed paths show up as paths that no longer exist.
 extern "C" PG6_WASM_BOOT_EXPORT uint64_t playgta6_storage_generation(void) {
     return playgta6::os::gdk::gamesave::storage_generation();
