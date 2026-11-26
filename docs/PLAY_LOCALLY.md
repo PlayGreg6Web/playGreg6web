@@ -159,8 +159,8 @@ state is written once the present counter reaches its index, so the sequence is 
 ## Native play: one command
 
 ```powershell
-.	ools\play_native.ps1            # PLAYGTA6_EXE / GTA6_GAME_DIR as for play_local.ps1
-.	ools\play_native.ps1 -FreshSetup  # new empty save dir: the setup screens appear again
+.\tools\play_native.ps1            # PLAYGTA6_EXE / GTA6_GAME_DIR as for play_local.ps1
+.\tools\play_native.ps1 -FreshSetup  # new empty save dir: the setup screens appear again
 ```
 
 Builds what is stale (recompiler, lift, harness with the Dawn executor on, all from the content-keyed caches below),

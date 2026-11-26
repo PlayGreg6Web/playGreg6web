@@ -40,7 +40,7 @@ if ($Help) {
     @"
 play_native.ps1: build (if stale) and play natively.
   Setup once (new PowerShell window after): PLAYGTA6_EXE, GTA6_GAME_DIR, PLAYGTA6_NATIVE_SHADER_PACK
-  Play:     .	ools\play_native.ps1 -Update
+  Play:     .\tools\play_native.ps1 -Update
   -Update        fast-forward to origin/main first (never discards local changes)
   -FreshSetup    empty save dir so the setup screens appear
   -PresentMode   auto|fifo|mailbox|immediate     -MaxFps N  (0 = off)
