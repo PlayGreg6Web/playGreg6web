@@ -1441,14 +1441,14 @@ public:
                 return S_OK_HR;
             }
             case DStorageFileBackend::UserdataOverlay: {
-                std::vector<uint8_t> data;
-                if (!win32::read_userdata_file(path_, data)) {
+                uint64_t file_size = 0;
+                if (!win32::userdata_file_size(path_, &file_size)) {
                     return E_FILE_NOT_FOUND_HR;
                 }
-                if (offset > data.size() || size > data.size() - offset) {
+                if (offset > file_size || size > file_size - offset ||
+                    !win32::read_userdata_range(path_, offset, dst, size)) {
                     return E_EOF_HR;
                 }
-                std::memcpy(dst, data.data() + offset, size);
                 return S_OK_HR;
             }
         }
@@ -1902,10 +1902,10 @@ public:
 
         // 4. /userdata overlay fallback.
         if (win32::userdata_file_exists(normalized)) {
-            std::vector<uint8_t> data;
-            if (win32::read_userdata_file(normalized, data)) {
+            uint64_t overlay_size = 0;
+            if (win32::userdata_file_size(normalized, &overlay_size)) {
                 auto* file = new (std::nothrow) DStorageFileImpl(
-                    normalized, DStorageFileBackend::UserdataOverlay, data.size());
+                    normalized, DStorageFileBackend::UserdataOverlay, overlay_size);
                 if (file == nullptr) {
                     return E_OUTOFMEMORY_HR;
                 }
@@ -2844,6 +2844,37 @@ XMemWindowContiguity xmem_window_contiguity() {
     std::sort(c.regions.begin(), c.regions.end(),
               [](const XMemWindowContiguity::Region& a, const XMemWindowContiguity::Region& b) { return a.base < b.base; });
     return c;
+}
+
+XMemMemorySummary xmem_memory_summary() {
+    auto& st = xmem_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    XMemMemorySummary m;
+    m.heap_allocated_bytes = st.heap_allocated_bytes;
+    m.physical_pages_bytes = st.physical_pages_bytes;
+    m.virtual_committed_bytes = st.virtual_committed_bytes;
+    m.virtual_reserved_bytes = st.virtual_reserved_bytes;
+    m.mapped_physical_bytes = st.mapped_physical_bytes;
+    m.peak_working_set_bytes = st.peak_working_set_bytes;
+    m.pages = st.physical_pages.size();
+    for (const auto& [handle, page] : st.physical_pages) {
+        if (page->shared != nullptr) {
+            ++m.pages_shared;
+        } else if (page->store_va != 0) {
+            ++m.pages_in_store;
+            m.store_bytes += page->page_size;
+        } else if (page->home_va != 0) {
+            ++m.pages_at_home;
+        } else {
+            ++m.pages_unbacked;
+            continue;
+        }
+        m.resident_page_bytes += page->page_size;
+    }
+    for (const auto& [base, block] : st.owned_blocks) {
+        m.owned_block_bytes += block.size;
+    }
+    return m;
 }
 
 void xmem_reset_for_testing() {

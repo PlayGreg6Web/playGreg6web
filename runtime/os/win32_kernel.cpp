@@ -663,6 +663,42 @@ bool read_userdata_file(std::string_view path, std::vector<uint8_t>& out) {
     return true;
 }
 
+bool userdata_file_size(std::string_view path, uint64_t* size) {
+    bool is_ud = false;
+    const std::string key = normalize_path(path, &is_ud);
+    if (!is_ud || key.empty()) {
+        return false;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    auto it = overlay.files.find(key);
+    if (it == overlay.files.end()) {
+        return false;
+    }
+    if (size != nullptr) {
+        *size = it->second.size();
+    }
+    return true;
+}
+
+bool read_userdata_range(std::string_view path, uint64_t offset, void* dst, size_t len) {
+    bool is_ud = false;
+    const std::string key = normalize_path(path, &is_ud);
+    if (!is_ud || key.empty()) {
+        return false;
+    }
+    auto& overlay = userdata_overlay();
+    std::lock_guard<std::mutex> lock(overlay.mutex);
+    auto it = overlay.files.find(key);
+    if (it == overlay.files.end() || offset > it->second.size() || len > it->second.size() - offset) {
+        return false;
+    }
+    if (len != 0) {
+        std::memcpy(dst, it->second.data() + offset, len);
+    }
+    return true;
+}
+
 void write_userdata_file(std::string_view path, std::vector<uint8_t> data) {
     bool is_ud = false;
     const std::string key = normalize_path(path, &is_ud);

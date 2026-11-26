@@ -397,6 +397,28 @@ struct XMemWindowContiguity {
     std::vector<Region> regions;
 };
 XMemWindowContiguity xmem_window_contiguity();
+
+// Backlog 29: the guest-visible XMem memory by kind, for the boot report's memory budget. The
+// first group is what the title asked for (the numbers XMemGetWorkingSetStatistics reports); the
+// second says where the physical pages' bytes actually live on the host (a page nobody touched
+// costs nothing: its bytes are "all zero").
+struct XMemMemorySummary {
+    uint64_t heap_allocated_bytes = 0;     // XMemAlloc / XMemAllocDefault blocks
+    uint64_t physical_pages_bytes = 0;     // nominal bytes of XMemAllocatePhysicalPages pages
+    uint64_t virtual_committed_bytes = 0;  // XMemVirtualAlloc commits
+    uint64_t virtual_reserved_bytes = 0;   // XMemVirtualAlloc reservations (address space only)
+    uint64_t mapped_physical_bytes = 0;    // page bytes currently mapped at some slot
+    uint64_t peak_working_set_bytes = 0;
+    uint64_t pages = 0;                    // live physical pages
+    uint64_t pages_unbacked = 0;           // no bytes anywhere (all zero, nothing committed)
+    uint64_t pages_at_home = 0;            // bytes live at a mapped guest address
+    uint64_t pages_in_store = 0;           // unmapped, bytes parked in a guest heap block
+    uint64_t pages_shared = 0;             // bytes live in a shared memory object (native)
+    uint64_t resident_page_bytes = 0;      // page_size summed over the three backed groups
+    uint64_t store_bytes = 0;              // ... of which the parked stores
+    uint64_t owned_block_bytes = 0;        // guest heap blocks created for XMemMapPhysicalPages(null)
+};
+XMemMemorySummary xmem_memory_summary();
 void xmem_reset_for_testing();
 // Writes `len` bytes into physical pages, page after page (DirectStorage
 // DestinationIsPhysicalPages). `entry_at(i, &e)` yields the i-th page entry: a physical address

@@ -175,6 +175,11 @@ std::shared_ptr<void> remove_opaque_object(Handle handle, uint32_t tag);
 void clear_userdata_overlay();
 bool userdata_file_exists(std::string_view path);
 bool read_userdata_file(std::string_view path, std::vector<uint8_t>& out);
+// Backlog 29: size / ranged read without copying the whole overlay file (a DirectStorage read of a
+// few KiB used to copy the file first). Range: false when the file is missing or the range is
+// outside it.
+bool userdata_file_size(std::string_view path, uint64_t* size);
+bool read_userdata_range(std::string_view path, uint64_t offset, void* dst, size_t len);
 void write_userdata_file(std::string_view path, std::vector<uint8_t> data);
 
 // Path conversion and normalization helpers.

@@ -24,6 +24,8 @@
 #include "gpu/present_samples.h"
 #include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
+#include "os/guest_heap.h"
+#include "os/memory_budget.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
@@ -2093,6 +2095,31 @@ std::string build_report() {
              ", \"parked_total\": " + std::to_string(sp.parked_total) +
              ", \"evicted\": " + std::to_string(sp.evicted) + ", \"rejected\": " + std::to_string(sp.rejected) +
              "},\n";
+    }
+    // Backlog 29: committed memory by kind (os/memory_budget.h).
+    {
+        os::MemoryBudgetInput mb;
+        mb.arena_reserved = b.arena != nullptr ? b.arena->reserved_bytes() : 0;
+        mb.arena_committed = b.arena != nullptr ? b.arena->committed_bytes() : 0;
+        const os::GuestHeapStats hs = os::default_guest_heap().stats();
+        mb.guest_heap_committed = hs.committed_bytes;
+        mb.guest_heap_live = hs.live_bytes;
+        const os::scarlett::XMemMemorySummary xm = os::scarlett::xmem_memory_summary();
+        mb.xmem_heap_bytes = xm.heap_allocated_bytes;
+        mb.xmem_virtual_committed = xm.virtual_committed_bytes;
+        mb.xmem_pages_nominal = xm.physical_pages_bytes;
+        mb.xmem_pages_resident = xm.resident_page_bytes;
+        mb.xmem_pages_store = xm.store_bytes;
+        mb.xmem_pages_unbacked = xm.pages_unbacked;
+        mb.xmem_owned_blocks = xm.owned_block_bytes;
+        if (const auto device = gpu::d3d12_xs_exports::current_device()) {
+            const gpu::d3d12_guest::DeviceStats ds = device->stats();
+            mb.shadow_covered = ds.shadow_bytes;
+            mb.shadow_resident = ds.shadow_resident_bytes;
+        }
+        mb.gpu_texture_bytes = gpu::texture_budget().stats().used_bytes;
+        mb.gpu_parked_bytes = gpu::small_texture_pool().stats().parked_bytes;
+        o += "  \"memory_budget\": " + os::memory_budget_json(mb) + ",\n";
     }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
     // Present was reported through mark_first_present), then the extension's members (per-Present samples).
