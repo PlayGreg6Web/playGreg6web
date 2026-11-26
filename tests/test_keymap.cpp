@@ -120,9 +120,40 @@ int main() {
         CHECK(parse("[mouse]\nlook = on\n", m, e));
         const auto st = km::evaluate_look(m, [](int) { return false; }, 0.4f, -0.3f);
         CHECK(near(st.right_stick_x, 0.4f) && near(st.right_stick_y, -0.3f));
-        CHECK(m.mouse_release_vk == 0x77);
-        CHECK(parse("[mouse]\nrelease_key = Alt\n", m, e) && m.mouse_release_vk == 0x12);
+        namespace wh = playgta6::os::window_hotkeys;
+        const auto rel = [](const km::Keymap& k) { return k.hotkeys[static_cast<size_t>(wh::Action::MouseRelease)]; };
+        CHECK(rel(m).vk == 0x77 && !rel(m).ctrl);
+        CHECK(parse("[mouse]\nrelease_key = Alt\n", m, e) && rel(m).vk == 0x12);
         CHECK(!parse("[mouse]\nrelease_key = bogus\n", m, e));
+    }
+
+    // [hotkeys]: central window hotkey table, rebinding, duplicate detection.
+    {
+        namespace wh = playgta6::os::window_hotkeys;
+        const auto at = [](const km::Keymap& k, wh::Action a) { return k.hotkeys[static_cast<size_t>(a)]; };
+        km::Keymap m;
+        std::vector<std::string> e;
+        CHECK(wh::find_duplicate(wh::defaults()).empty());  // the defaults never collide
+        CHECK(at(m, wh::Action::Fullscreen).vk == 0x7A && at(m, wh::Action::Screenshot).vk == 0x7B);
+        CHECK(at(m, wh::Action::TargetMip) == (wh::Chord{0x76, true}));
+        CHECK(at(m, wh::Action::TargetNext) == (wh::Chord{0x79, true}));
+        CHECK(at(m, wh::Action::MouseRelease) == (wh::Chord{0x77, false}));
+        CHECK(parse("[hotkeys]\nscreenshot = F9\ntarget_mip = ctrl+G\n", m, e));
+        CHECK(at(m, wh::Action::Screenshot).vk == 0x78 && !at(m, wh::Action::Screenshot).ctrl);
+        CHECK(at(m, wh::Action::TargetMip) == (wh::Chord{'G', true}));
+        CHECK(parse("[hotkeys]\nfullscreen = F12\nscreenshot = F11\n", m, e));  // swap is fine
+        CHECK(!parse("[hotkeys]\nscreenshot = F11\n", m, e));                     // duplicate of fullscreen
+        CHECK(!e.empty() && e[0].find("fullscreen") != std::string::npos && e[0].find("screenshot") != std::string::npos);
+        CHECK(!parse("[hotkeys]\ntarget_prev = Ctrl+F10\n", m, e));               // duplicate of target_next
+        CHECK(parse("[hotkeys]\ntarget_prev = F10\n", m, e));                     // plain vs Ctrl is distinct
+        CHECK(!parse("[mouse]\nrelease_key = F11\n", m, e));                      // alias is checked too
+        CHECK(!parse("[hotkeys]\nbogus = F1\n", m, e));
+        CHECK(!parse("[hotkeys]\nfullscreen = nokey\n", m, e));
+        CHECK(!parse("[keys]\nF11 = a\n", m, e));                                 // clashes with a [keys] binding
+        CHECK(parse("[keys]\nF11 = a\n[hotkeys]\nfullscreen = Ctrl+F11\n", m, e));
+        CHECK(wh::chord_name(wh::Chord{0x79, true}) == "Ctrl+F10");
+        CHECK(wh::help_text(wh::defaults()).find("target_next = Ctrl+F10") != std::string::npos);
+        CHECK(parse(km::default_keymap_text(), m, e));  // the written default file round-trips
     }
 
     // Mouse look: right stick, sensitivity, invert, clamping, off by default.
@@ -160,7 +191,7 @@ int main() {
         CHECK(!parse("[keys]\nQ = a\nq = b\n", m, e));
         CHECK(has_error(e, "line 3: key 'q' is already bound on line 2"));
         CHECK(!parse("W = a\n", m, e));
-        CHECK(has_error(e, "outside a [keys] or [mouse] section"));
+        CHECK(has_error(e, "outside a [keys], [mouse] or [hotkeys] section"));
         CHECK(!parse("[mouse]\nsensitivity = 0\n", m, e));
         CHECK(!parse("[mouse]\nsensitivity = 11\n", m, e));
         CHECK(!parse("[keys]\nF13 = a\n", m, e));

@@ -13,7 +13,6 @@ struct State {
     std::atomic<bool> look_enabled{false};  // keymap.ini [mouse] look = on (set by the host input)
     std::atomic<bool> window_ready{false};  // a live window registered for raw input
     std::atomic<bool> capturing{false};     // cursor currently captured (focused, not released/minimised)
-    std::atomic<int> release_vk{0x77};      // toggles the capture (default F8)
     std::atomic<int32_t> dx{0}, dy{0};      // accumulated since the last take()
 };
 

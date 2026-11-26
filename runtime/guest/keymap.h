@@ -13,13 +13,16 @@
 //   look = on              # mouse movement drives the right stick (default off)
 //   sensitivity = 0.05     # stick deflection per pixel per 8 ms poll, 0.001..10
 //   invert_y = off
-//   release_key = F8       # toggles the cursor capture of the live window (a click also re-captures)
+//   release_key = F8       # same as [hotkeys] mouse_release (a click also re-captures)
+//   [hotkeys]              # live-window keys, 'Key' or 'Ctrl+Key'; duplicates are a load error
+//   fullscreen = F11  screenshot = F12  mouse_release = F8  target_mip/target_layer/target_prev/target_next = Ctrl+F7..F10
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
+#include "os/window_hotkeys.h"
 
 namespace playgta6::guest::keymap {
 
@@ -42,7 +45,8 @@ struct Keymap {
     bool mouse_look = false;
     float mouse_sensitivity = 0.05f;
     bool mouse_invert_y = false;
-    int mouse_release_vk = 0x77;  // F8
+    // Live-window hotkeys (os/window_hotkeys.h): fullscreen, screenshot, mouse release, --show-target keys.
+    playgta6::os::window_hotkeys::Table hotkeys = playgta6::os::window_hotkeys::defaults();
 };
 
 // The built-in table (same as convert_keyboard).

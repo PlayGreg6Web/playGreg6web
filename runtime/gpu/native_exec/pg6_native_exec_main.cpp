@@ -12,8 +12,8 @@
 // --window      present to a native window (Win32) instead; closing it stops the replay
 // --show-target <selector>  present this render target / texture instead of the swapchain image (read-only
 //               diagnostic for black / garbled screens): <id>, tex:ID, depth:ID, pass:N[:depth], last, cycle, with
-//               @layer=L @mip=M @range=LO:HI (gpu/native_exec/show_target_model.h). --window: F7 mip, F8 layer,
-//               F9 / F10 previous / next render target; the title names what is shown. Headless it shows in
+//               @layer=L @mip=M @range=LO:HI (gpu/native_exec/show_target_model.h). --window: Ctrl+F7 mip, Ctrl+F8 layer,
+//               Ctrl+F9 / Ctrl+F10 previous / next render target (keymap.ini [hotkeys]); the title names what is shown. Headless it shows in
 //               the swapchain that --digest-at reads.
 // --gpu-validation  strict mode: backend validation + an error scope per packet (stats "validation")
 // --report      write executor statistics (packets handled / not yet handled by opcode) as JSON

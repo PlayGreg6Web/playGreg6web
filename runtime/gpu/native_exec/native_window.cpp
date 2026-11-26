@@ -2,6 +2,7 @@
 
 #include "gpu/native_exec/window_layout.h"
 #include "os/raw_mouse.h"
+#include "os/window_hotkeys.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -336,28 +337,38 @@ private:
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
         }
         auto* self = reinterpret_cast<Win32Window*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        // F11 toggles borderless fullscreen. Esc (and every other key) is left alone: the title's
-        // Menu button reads it through the host input.
-        if (self && msg == WM_KEYDOWN && wp == VK_F11 && (lp & (1 << 30)) == 0) {
-            self->toggle_fullscreen();
-            return 0;
-        }
-        // --show-target hotkeys (F7 mip, F8 layer, F9 previous, F10 next target). F10 arrives as WM_SYSKEYDOWN.
-        if (self && self->hotkeys_on_ && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (lp & (1 << 30)) == 0) {
-            const uint32_t bit = wp == VK_F7 ? 1u : wp == VK_F8 ? 2u : wp == VK_F9 ? 4u : wp == VK_F10 ? 8u : 0u;
-            if (bit) {
-                self->hotkeys_pending_ |= bit;
+        // Window hotkeys come from the central table (os/window_hotkeys.h, rebindable in keymap.ini
+        // [hotkeys]). Esc and every other key are left alone: the title's Menu button reads it through
+        // the host input. F10 arrives as WM_SYSKEYDOWN.
+        if (self && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (lp & (1 << 30)) == 0) {
+            namespace wh = playgta6::os::window_hotkeys;
+            const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const int vk = static_cast<int>(wp);
+            if (wh::matches(wh::Action::Fullscreen, vk, ctrl)) {
+                self->toggle_fullscreen();
                 return 0;
             }
-        }
-        if (self && msg == WM_KEYDOWN && wp == VK_F12 && (lp & (1 << 30)) == 0) {
-            self->shot_request_ = true;  // the executor saves the next presented frame
-            return 0;
+            if (wh::matches(wh::Action::Screenshot, vk, ctrl)) {
+                self->shot_request_ = true;  // the executor saves the next presented frame
+                return 0;
+            }
+            if (self->hotkeys_on_) {
+                const uint32_t bit = wh::matches(wh::Action::TargetMip, vk, ctrl)     ? 1u
+                                     : wh::matches(wh::Action::TargetLayer, vk, ctrl) ? 2u
+                                     : wh::matches(wh::Action::TargetPrev, vk, ctrl)  ? 4u
+                                     : wh::matches(wh::Action::TargetNext, vk, ctrl)  ? 8u
+                                                                                      : 0u;
+                if (bit) {
+                    self->hotkeys_pending_ |= bit;
+                    return 0;
+                }
+            }
         }
         if (self && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (lp & (1 << 30)) == 0 &&
-            static_cast<int>(wp) == playgta6::os::raw_mouse::state().release_vk.load() &&
+            playgta6::os::window_hotkeys::matches(playgta6::os::window_hotkeys::Action::MouseRelease,
+                                                  static_cast<int>(wp), (GetKeyState(VK_CONTROL) & 0x8000) != 0) &&
             playgta6::os::raw_mouse::state().look_enabled.load()) {
-            // Configurable release key (keymap.ini [mouse] release_key) toggles the cursor capture.
+            // Configurable release key (keymap.ini [hotkeys] mouse_release) toggles the cursor capture.
             self->capture_released_ = !self->capture_released_;
             self->update_capture();
             if (msg == WM_SYSKEYDOWN) return 0;  // keep Alt from opening the system menu

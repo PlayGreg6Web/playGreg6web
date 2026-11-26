@@ -27,9 +27,9 @@ public:
     virtual bool focused() const { return false; }
     // Sets the title bar text (UTF-8). Window thread only. Default: no-op.
     virtual void set_title(const std::string&) {}
-    // True once after F12 was pressed (consumed by the call). Callable from any thread. Default: never.
+    // True once after the screenshot hotkey (F12) was pressed (consumed by the call). Callable from any thread. Default: never.
     virtual bool take_screenshot_request() { return false; }
-    // --show-target hotkeys: when enabled, F7 / F8 / F9 / F10 are swallowed and reported as bits
+    // --show-target hotkeys: when enabled, the target_* hotkeys (default Ctrl+F7..F10, os/window_hotkeys.h) are swallowed and reported as bits
     // (show_target_model.h kHotkey*) by take_hotkeys(), which clears them. Window thread only.
     virtual void enable_hotkeys(bool) {}
     virtual uint32_t take_hotkeys() { return 0; }

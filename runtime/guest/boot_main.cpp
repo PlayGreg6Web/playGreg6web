@@ -58,7 +58,7 @@
 //   --screenshot-at N[,N...]  with --window: save those present indices (0-based) as PNG; F12 saves the current frame
 //                to %LOCALAPPDATA%\playgta6\screenshots
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
-//   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; F7 mip, F8 layer, F9/F10 target; gpu/native_exec/show_target_model.h)
+//   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; Ctrl+F7 mip, Ctrl+F8 layer, Ctrl+F9/F10 target, rebindable in keymap.ini [hotkeys]; gpu/native_exec/show_target_model.h)
 //   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
 //                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.

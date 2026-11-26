@@ -258,8 +258,8 @@ tested without a GPU in `tests/test_native_exec_model.cpp`.
 
 Suffixes: `@layer=L`, `@mip=M` (clamped into the texture; the mip is shown at its own size), `@range=LO:HI`
 (value to 0..1 as `(v-LO)/(HI-LO)`: reverse-Z depth, HDR colour). Hotkeys (only when `--show-target` is given;
-they are swallowed by the window): **F10** next / **F9** previous render target of the last frame (sorted by id, colour
-before depth, then back to the swapchain image), **F8** next array layer, **F7** next mip. The title bar names what
+they are swallowed by the window): **Ctrl+F10** next / **Ctrl+F9** previous render target of the last frame (sorted by id, colour
+before depth, then back to the swapchain image), **Ctrl+F8** next array layer, **Ctrl+F7** next mip (rebindable: keymap.ini `[hotkeys]`). The title bar names what
 is shown (`tex 12 depth 1280x720 depth32float mip 0/1 layer 0/1`) or why it cannot be (`unavailable: pass 9 does not
 exist`), also in the live window where the boot title tick appends it.
 

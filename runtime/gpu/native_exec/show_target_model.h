@@ -11,7 +11,7 @@
 //                          encode order; the first colour attachment that is a texture, else its depth)
 //   pass:<N>:depth         the depth target of that pass
 //   last                   the colour target of the last pass that rendered to a texture
-//   cycle                  nothing yet: the hotkeys pick (F10 next / F9 previous, F8 layer, F7 mip)
+//   cycle                  nothing yet: the hotkeys pick (Ctrl+F10 next / Ctrl+F9 previous, Ctrl+F8 layer, Ctrl+F7 mip)
 // Suffixes, any order: @layer=L  @mip=M  @range=LO:HI (value -> 0..1 as (v-LO)/(HI-LO), default 0:1)
 // A selector that names a pass without an explicit @layer/@mip uses the attachment's own layer and mip.
 #pragma once
@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "gpu/native_exec/m1_model.h"
+#include "os/window_hotkeys.h"
 
 namespace playgta6::gpu::native_exec {
 
@@ -147,7 +148,7 @@ inline TargetResolution resolve_show_target(const ShowTargetSpec& s, const std::
     TargetResolution r;
     switch (s.kind) {
         case ShowTargetSpec::Kind::Cycle:
-            r.reason = "cycle: nothing chosen yet (F10 / F9)";
+            r.reason = "cycle: nothing chosen yet (Ctrl+F10 / Ctrl+F9)";
             break;
         case ShowTargetSpec::Kind::Tex:
             r.target = TargetRef{s.id, false, 0, 0};
@@ -226,7 +227,7 @@ inline std::optional<TargetRef> show_target_cycle(const std::vector<TargetRef>& 
     return std::nullopt;
 }
 
-// F7 / F8: step a mip or layer index through count entries, wrapping.
+// target_mip / target_layer: step a mip or layer index through count entries, wrapping.
 inline uint32_t show_target_step(uint32_t cur, uint32_t count) { return count ? (cur + 1) % count : 0; }
 
 // Why a texture cannot be shown, "" when it can. usage is the WebGPU usage mask (TextureBinding = 4).
@@ -319,7 +320,7 @@ inline std::string show_target_label(const TargetRef& t, const ShowTexture& tex,
 
 // The title bar text while a target is shown (or why it cannot be).
 inline std::string show_target_title(const std::string& base, const std::string& label) {
-    return label.empty() ? base : base + " | SHOWING " + label + " | F7 mip F8 layer F9/F10 target";
+    return label.empty() ? base : base + " | SHOWING " + label + " | " + playgta6::os::window_hotkeys::target_hint(playgta6::os::window_hotkeys::active().table());
 }
 
 // Hotkey bits (NativeWindow::take_hotkeys).

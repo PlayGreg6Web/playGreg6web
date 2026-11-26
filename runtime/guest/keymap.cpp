@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include "os/game_input.h"
+#include "os/window_hotkeys.h"
 
 namespace playgta6::guest::keymap {
 
@@ -168,6 +169,8 @@ std::string default_keymap_text() {
         "# Targets: a b x y lb rb menu view l3 r3 dpad_up dpad_down dpad_left dpad_right, left_stick_up/down/left/right,\n"
         "#          right_stick_up/down/left/right, left_trigger right_trigger, none.\n"
         "# Each key can be bound once per file. Keys and mouse only act while the game window has focus.\n"
+        "# [hotkeys] rebinds the live window's own keys (value: Key or Ctrl+Key); two actions cannot share a key,\n"
+        "# and a plain hotkey cannot reuse a key bound in [keys].\n"
         "\n[keys]\n";
     for (const DefaultKey& d : kDefaults) {
         s += std::string(d.key) + " = " + d.target + "\n";
@@ -181,14 +184,28 @@ std::string default_keymap_text() {
         "# Stick deflection per pixel moved per 8 ms poll (0.001 .. 10).\n"
         "sensitivity = 0.05\n"
         "invert_y = off\n"
-        "release_key = F8\n";
+        "# release_key is kept for old files; it is the same as [hotkeys] mouse_release.\n"
+        "release_key = F8\n"
+        "\n[hotkeys]\n";
+    for (const auto& h : playgta6::os::window_hotkeys::kTable) {
+        s += std::string("# ") + h.help + "\n";
+        s += std::string(h.name) + " = " + playgta6::os::window_hotkeys::chord_name(h.def) + "\n";
+    }
     return s;
+}
+
+static std::string dup_key_hint(const playgta6::os::window_hotkeys::Table& t) {
+    namespace wh = playgta6::os::window_hotkeys;
+    for (size_t a = 0; a < wh::kCount; ++a)
+        for (size_t b = a + 1; b < wh::kCount; ++b)
+            if (t[a] == t[b]) return wh::chord_name(t[a]);
+    return "";
 }
 
 bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>& errors) {
     out = default_keymap();
     errors.clear();
-    enum class Section { None, Keys, Mouse } section = Section::None;
+    enum class Section { None, Keys, Mouse, Hotkeys } section = Section::None;
     std::map<int, int> seen;  // vk -> line first bound in this file
     int line_no = 0;
     size_t pos = 0;
@@ -209,8 +226,10 @@ bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>
                 section = Section::Keys;
             } else if (name == "mouse") {
                 section = Section::Mouse;
+            } else if (name == "hotkeys") {
+                section = Section::Hotkeys;
             } else {
-                err("unknown section '" + line + "' (expected [keys] or [mouse])");
+                err("unknown section '" + line + "' (expected [keys], [mouse] or [hotkeys])");
                 section = Section::None;
             }
             continue;
@@ -227,7 +246,7 @@ bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>
             continue;
         }
         if (section == Section::None) {
-            err("'" + line + "' is outside a [keys] or [mouse] section");
+            err("'" + line + "' is outside a [keys], [mouse] or [hotkeys] section");
             continue;
         }
         if (section == Section::Keys) {
@@ -248,6 +267,27 @@ bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>
             }
             seen[vk] = line_no;
             set_binding(out, vk, t);
+        } else if (section == Section::Hotkeys) {
+            namespace wh = playgta6::os::window_hotkeys;
+            const wh::Info* info = wh::find_by_name(lower(key));
+            if (!info) {
+                std::string names;
+                for (const auto& h : wh::kTable) names += std::string(names.empty() ? "" : ", ") + h.name;
+                err("unknown hotkey '" + key + "' (expected " + names + ")");
+                continue;
+            }
+            std::string keyname = value;
+            bool ctrl = false;
+            if (lower(keyname).rfind("ctrl+", 0) == 0) {
+                ctrl = true;
+                keyname = trim(keyname.substr(5));
+            }
+            int vk = 0;
+            if (!key_from_name(keyname, vk)) {
+                err("unknown key '" + value + "' for hotkey " + key);
+                continue;
+            }
+            out.hotkeys[static_cast<size_t>(info->action)] = wh::Chord{vk, ctrl};
         } else {
             const std::string k = lower(key);
             if (k == "look" || k == "invert_y") {
@@ -271,9 +311,26 @@ bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>
                     err("unknown key '" + value + "' for release_key");
                     continue;
                 }
-                out.mouse_release_vk = vk;
+                out.hotkeys[static_cast<size_t>(playgta6::os::window_hotkeys::Action::MouseRelease)] =
+                    playgta6::os::window_hotkeys::Chord{vk, false};
             } else {
                 err("unknown mouse setting '" + key + "' (expected look, sensitivity, invert_y, release_key)");
+            }
+        }
+    }
+    if (errors.empty()) {
+        namespace wh = playgta6::os::window_hotkeys;
+        const std::string dup = wh::find_duplicate(out.hotkeys);
+        if (!dup.empty()) errors.push_back("[hotkeys]: " + dup + " (" + dup_key_hint(out.hotkeys) + ")");
+        for (size_t i = 0; i < wh::kCount; ++i) {
+            const wh::Chord& c = out.hotkeys[i];
+            if (c.ctrl) continue;
+            for (const Binding& b : out.keys) {
+                if (b.vk == c.vk && !b.target.none()) {
+                    errors.push_back(std::string("[hotkeys]: ") + wh::kTable[i].name + " uses " + wh::chord_name(c) +
+                                     ", which is also bound in [keys]");
+                    break;
+                }
             }
         }
     }

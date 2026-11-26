@@ -121,7 +121,7 @@ public:
     void set_keymap(const keymap::Keymap& map) {
         keymap_ = map;
         auto& rm = playgta6::os::raw_mouse::state();
-        rm.release_vk.store(map.mouse_release_vk);
+        playgta6::os::window_hotkeys::active().set(map.hotkeys);
         rm.look_enabled.store(map.mouse_look);
     }
     bool keyboard_enabled() const { return keyboard_enabled_.load(); }

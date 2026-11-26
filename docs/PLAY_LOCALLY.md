@@ -36,6 +36,11 @@ stale and opens the game window. Add `-FreshSetup` to see the setup screens agai
 | Tab / Esc | View / Menu |
 | F11 | Toggle borderless fullscreen |
 | F12 | Save a screenshot (PNG) to `%LOCALAPPDATA%\playgta6\screenshots` |
+| F8 | Release / re-capture the mouse-look cursor |
+| Ctrl+F7 / F8 / F9 / F10 | `--show-target` only: next mip / next layer / previous target / next target |
+
+These window hotkeys live in one table (`runtime/os/window_hotkeys.h`) and are rebindable in `keymap.ini` `[hotkeys]`
+(see "Rebinding keys"); `play_native.ps1 -Help` lists them. Esc stays the pad Menu button.
 
 Rebind anything in `%LOCALAPPDATA%\playgta6\keymap.ini` (written on first run; see "Rebinding keys" below), or point at
 another file with `-Keymap <file>`.
@@ -162,7 +167,11 @@ the pad wins per axis when it is deflected more. `--input-script` takes preceden
 file given by `--keymap <file>` (`play_native.ps1 -Keymap`). Lines are `Key = target` under `[keys]` (e.g. `Enter = a`,
 `X = right_trigger`, `Mouse_Left = right_trigger`); the file is applied on top of the table above, `Key = none` unbinds,
 and each key may appear once. `[mouse]` has `look = on|off` (real mouse movement drives the right stick),
-`sensitivity` (stick deflection per pixel per 8 ms poll, default 0.05), `invert_y` and `release_key` (default `F8`).
+`sensitivity` (stick deflection per pixel per 8 ms poll, default 0.05), `invert_y` and `release_key` (default `F8`, same as `[hotkeys] mouse_release`).
+`[hotkeys]` rebinds the live window's own keys as `name = Key` or `name = Ctrl+Key`: `fullscreen` (F11), `screenshot` (F12),
+`mouse_release` (F8), `target_mip` / `target_layer` / `target_prev` / `target_next` (Ctrl+F7..F10). Two hotkeys cannot share
+a key and a plain hotkey cannot reuse a key bound in `[keys]`; either is a clear load error (`[hotkeys]: hotkeys 'a' and
+'b' are bound to the same key`).
 With mouse look on, the live window uses Win32 Raw Input (relative deltas, only while the window is focused) and
 captures the cursor: it is hidden and confined to the window, so looking never stops at the screen edge. The deflection
 decays after the mouse stops, like a released stick. The capture is released on focus loss and when minimised; the
@@ -219,8 +228,9 @@ Same thing from Python: `python tools/run_native_boot.py --play [--fresh-setup] 
 
 `playgta6_boot --window ... --show-target <selector>` (from `run_native_boot.py --play`: `-- --show-target <selector>`)
 shows any render target instead of the swapchain image, read-only (the game's frame is not changed). Start with
-`--show-target cycle` and press **F10** / **F9** to walk the frame's render targets (the title bar names the
-current one), **F8** for the next array layer, **F7** for the next mip. Or pick directly: `pass:12` (the colour
+`--show-target cycle` and press **Ctrl+F10** / **Ctrl+F9** to walk the frame's render targets (the title bar names the
+current one), **Ctrl+F8** for the next array layer, **Ctrl+F7** for the next mip (they only act with `--show-target`, so
+plain F8 stays the mouse release; rebind via `[hotkeys]` `target_*`). Or pick directly: `pass:12` (the colour
 target of the 12th render pass of the frame), `last`, `<texture id>`, `depth:<id>` (grey; add `@range=0.9:1` for
 reverse-Z or tight depth), `@layer=2`, `@mip=1`. Offline: `pg6_native_exec --trace f.pg6trace --show-target pass:5
 --digest-at 30` runs headless and the digest / non-black counts it prints are those of the shown target (the headless swapchain).
