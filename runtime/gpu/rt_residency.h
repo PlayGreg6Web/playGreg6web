@@ -43,11 +43,17 @@ struct AddressSource {
 
 bool parse_address_sources(const std::string& json, std::vector<AddressSource>* out, std::string* error);
 
+// Why a source did not resolve to an address (counted per reason in Plan::unresolved_by_reason).
+enum class Unresolved : uint8_t { NoInput, Unbound, Null, DescriptorTable, OutOfRange, Count };
+const char* unresolved_name(Unresolved r);
+
 // Bound state of one dispatch. Any callback may be empty (the source is then unresolved).
 struct DispatchInputs {
     std::function<bool(uint32_t index, uint64_t* va)> root_param;
     std::function<bool(uint32_t index, uint32_t dword, uint32_t* value)> root_constant;
     std::function<bool(uint32_t index, uint32_t* value)> user_data;
+    // Optional: why user_data(index) failed (default Unbound).
+    std::function<Unresolved(uint32_t index)> user_data_failure;
     // Guest memory read (bytes at a 40-bit address).
     std::function<bool(uint64_t addr, void* dst, size_t bytes)> read_guest;
 };
@@ -55,6 +61,7 @@ struct DispatchInputs {
 struct Plan {
     std::vector<std::pair<uint64_t, uint64_t>> ranges;  // (address, size) to make resident
     uint32_t unresolved = 0;                            // sources the dispatch did not bind (or null)
+    uint32_t unresolved_by_reason[static_cast<size_t>(Unresolved::Count)] = {};
     uint32_t structures = 0;                            // BVH structures walked
     uint32_t bad_headers = 0;                           // bvh_root addresses without a valid header
     bool structures_unavailable = false;                // GPU-written or unreadable structure

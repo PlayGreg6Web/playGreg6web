@@ -5,6 +5,7 @@
 #include <cstring>
 #include <utility>
 
+#include "gpu/stage_reflection.h"
 #include "gpu/pipeline_prewarm.h"
 #include "gpu/prewarm_pipeline_desc.h"
 
@@ -1362,6 +1363,9 @@ uint32_t StateBridgeDevice::rt_prepare_dispatch(const GroupLayoutRecord& group,
         const rt_residency::Outcome out = rt_residency::prepare_dispatch(arena, *sources, *inputs, &plan);
         ++rt_plans_;
         rt_unresolved_ += plan.unresolved;
+        for (size_t i = 0; i < static_cast<size_t>(rt_residency::Unresolved::Count); ++i) {
+            rt_unresolved_by_reason_[i] += plan.unresolved_by_reason[i];
+        }
         rt_structures_ += plan.structures;
         rt_bad_headers_ += plan.bad_headers;
         if (!out.ok) {
@@ -1487,11 +1491,23 @@ std::string StateBridgeDevice::rt_report_json() {
     }
     std::string out = rt_arena_->json();
     if (!out.empty() && out.back() == '}') {
-        char buf[256];
+        char buf[640];
         std::snprintf(buf, sizeof buf,
-                      ", \"residency\": {\"plans\": %llu, \"unresolved_sources\": %llu, \"structures\": %llu, "
+                      ", \"residency\": {\"plans\": %llu, \"unresolved_sources\": %llu, "
+                      "\"unresolved_by_reason\": {\"%s\": %llu, \"%s\": %llu, \"%s\": %llu, \"%s\": %llu, \"%s\": %llu}, "
+                      "\"structures\": %llu, "
                       "\"bad_headers\": %llu, \"fault_readbacks_issued\": %u, \"fault\": ",
                       (unsigned long long)rt_plans_, (unsigned long long)rt_unresolved_,
+                      rt_residency::unresolved_name(rt_residency::Unresolved::NoInput),
+                      (unsigned long long)rt_unresolved_by_reason_[0],
+                      rt_residency::unresolved_name(rt_residency::Unresolved::Unbound),
+                      (unsigned long long)rt_unresolved_by_reason_[1],
+                      rt_residency::unresolved_name(rt_residency::Unresolved::Null),
+                      (unsigned long long)rt_unresolved_by_reason_[2],
+                      rt_residency::unresolved_name(rt_residency::Unresolved::DescriptorTable),
+                      (unsigned long long)rt_unresolved_by_reason_[3],
+                      rt_residency::unresolved_name(rt_residency::Unresolved::OutOfRange),
+                      (unsigned long long)rt_unresolved_by_reason_[4],
                       (unsigned long long)rt_structures_, (unsigned long long)rt_bad_headers_, rt_fault_issued_);
         out.pop_back();
         out += buf;
@@ -4800,6 +4816,35 @@ bool CommandListBridge::prepare_rt_dispatch(ComputePipelineState* state) {
             }
             *value = c[dword];
             return true;
+        };
+        // User SGPR dword -> root signature slot (compute user data starts at kComputeUserDataBase).
+        in.user_data = [this, rs](uint32_t sgpr, uint32_t* value) {
+            uint32_t dword = 0;
+            if (rs == nullptr) return false;
+            const int pi = root_parameter_containing_user_sgpr(rs->desc(), true, sgpr, &dword, 0);
+            if (pi < 0) return false;
+            const d3d::RootParameterDesc& p = rs->desc().parameters[static_cast<size_t>(pi)];
+            if (p.parameter_type == d3d::RootParameterType::Constants32Bit) {
+                const auto c = root_args_.root_constants(kBp, static_cast<uint32_t>(pi));
+                if (dword >= c.size()) return false;
+                *value = c[dword];
+                return true;
+            }
+            if (p.parameter_type == d3d::RootParameterType::DescriptorTable) return false;
+            const d3d::RootArgument& a = root_args_.argument(kBp, static_cast<uint32_t>(pi));
+            if (!a.is_set || a.gpu_address == 0 || dword > 1) return false;
+            *value = dword == 0 ? static_cast<uint32_t>(a.gpu_address) : static_cast<uint32_t>(a.gpu_address >> 32);
+            return true;
+        };
+        in.user_data_failure = [rs](uint32_t sgpr) {
+            if (rs == nullptr) return rt_residency::Unresolved::NoInput;
+            uint32_t dword = 0;
+            const int pi = root_parameter_containing_user_sgpr(rs->desc(), true, sgpr, &dword, 0);
+            if (pi < 0) return rt_residency::Unresolved::OutOfRange;
+            if (rs->desc().parameters[static_cast<size_t>(pi)].parameter_type == d3d::RootParameterType::DescriptorTable) {
+                return rt_residency::Unresolved::DescriptorTable;
+            }
+            return rt_residency::Unresolved::Unbound;
         };
         in.read_guest = [this](uint64_t addr, void* dst, size_t bytes) {
             return device_.rt_read_guest(addr, dst, bytes);

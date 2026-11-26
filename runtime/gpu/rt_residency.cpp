@@ -106,37 +106,55 @@ private:
     std::set<uint64_t> visited_;
 };
 
-bool resolve(const AddressSource& s, const DispatchInputs& in, uint64_t* addr) {
+Unresolved resolve(const AddressSource& s, const DispatchInputs& in, uint64_t* addr) {
     switch (s.kind) {
     case SourceKind::RootParam:
-        return in.root_param && in.root_param(s.index, addr);
+        if (!in.root_param) return Unresolved::NoInput;
+        return in.root_param(s.index, addr) ? Unresolved::Count : Unresolved::Unbound;
     case SourceKind::RootConstants: {
         uint32_t lo = 0, hi = 0;
-        if (!in.root_constant || !in.root_constant(s.index, s.dword, &lo) ||
-            !in.root_constant(s.index, s.dword + 1, &hi)) {
-            return false;
+        if (!in.root_constant) return Unresolved::NoInput;
+        if (!in.root_constant(s.index, s.dword, &lo) || !in.root_constant(s.index, s.dword + 1, &hi)) {
+            return Unresolved::Unbound;
         }
         *addr = (static_cast<uint64_t>(hi) << 32) | lo;
-        return true;
+        return Unresolved::Count;
     }
     case SourceKind::UserData: {
         uint32_t lo = 0, hi = 0;
-        if (!in.user_data || !in.user_data(s.index, &lo) || !in.user_data(s.index + 1, &hi)) return false;
+        if (!in.user_data) return Unresolved::NoInput;
+        if (!in.user_data(s.index, &lo) || !in.user_data(s.index + 1, &hi)) {
+            return in.user_data_failure ? in.user_data_failure(s.index) : Unresolved::Unbound;
+        }
         *addr = (static_cast<uint64_t>(hi) << 32) | lo;
-        return true;
+        return Unresolved::Count;
     }
     }
-    return false;
+    return Unresolved::Unbound;
 }
 }  // namespace
+
+const char* unresolved_name(Unresolved r) {
+    switch (r) {
+    case Unresolved::NoInput: return "no_input";
+    case Unresolved::Unbound: return "unbound";
+    case Unresolved::Null: return "null";
+    case Unresolved::DescriptorTable: return "descriptor_table";
+    case Unresolved::OutOfRange: return "out_of_range";
+    default: return "?";
+    }
+}
 
 Plan plan_dispatch(const std::vector<AddressSource>& sources, const DispatchInputs& in, const rt_arena::Arena* arena) {
     Plan plan;
     Walker walker(in, arena, &plan);
     for (const AddressSource& s : sources) {
         uint64_t addr = 0;
-        if (!resolve(s, in, &addr) || addr == 0) {
+        Unresolved why = resolve(s, in, &addr);
+        if (why == Unresolved::Count && addr == 0) why = Unresolved::Null;
+        if (why != Unresolved::Count) {
             ++plan.unresolved;
+            ++plan.unresolved_by_reason[static_cast<size_t>(why)];
             continue;
         }
         if (s.bvh_root) {

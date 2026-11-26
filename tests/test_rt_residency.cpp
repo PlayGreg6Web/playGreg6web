@@ -122,6 +122,26 @@ void test_plan_and_prepare() {
     CHECK(arena.is_resident(rt_arena::page_of(0x700000)));
 }
 
+void test_unresolved_reasons() {
+    std::vector<AddressSource> s;
+    std::string err;
+    CHECK(parse_address_sources(
+        R"([{"kind":"root_param","index":2},{"kind":"root_param","index":9},
+            {"kind":"user_data","index":20},{"kind":"user_data","index":30},{"kind":"user_data","index":8}])", &s, &err));
+    const Guest g = make_guest();
+    DispatchInputs in = inputs(g);
+    in.user_data_failure = [](uint32_t i) { return i == 30 ? Unresolved::DescriptorTable : Unresolved::OutOfRange; };
+    const Plan plan = plan_dispatch(s, in, nullptr);
+    CHECK(plan.unresolved == 4);
+    CHECK(plan.unresolved_by_reason[static_cast<size_t>(Unresolved::Null)] == 1);
+    CHECK(plan.unresolved_by_reason[static_cast<size_t>(Unresolved::Unbound)] == 1);
+    CHECK(plan.unresolved_by_reason[static_cast<size_t>(Unresolved::OutOfRange)] == 1);
+    CHECK(plan.unresolved_by_reason[static_cast<size_t>(Unresolved::DescriptorTable)] == 1);
+    CHECK(plan.ranges.size() == 1 && plan.ranges[0].first == 0x700000);
+    const Plan none = plan_dispatch(s, DispatchInputs{}, nullptr);
+    CHECK(none.unresolved_by_reason[static_cast<size_t>(Unresolved::NoInput)] == 5);
+}
+
 void test_unavailable_and_bad() {
     Guest g = make_guest();
     std::vector<AddressSource> s;
@@ -197,6 +217,7 @@ void test_faults() {
 int main() {
     test_parse();
     test_plan_and_prepare();
+    test_unresolved_reasons();
     test_unavailable_and_bad();
     test_arena_full();
     test_faults();

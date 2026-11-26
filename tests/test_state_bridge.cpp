@@ -5261,6 +5261,75 @@ void test_rt_residency_wiring() {
     CHECK(json.find("\"fault_readbacks_issued\": 2") != std::string::npos);
 }
 
+// User-data address sources resolve through the root signature's user-SGPR layout (compute base s4):
+// root constants, a root descriptor's VA; tables and out-of-range dwords count by reason.
+void test_rt_residency_user_data_sources() {
+    bridge::BridgeOptions o = counting_options(25000);
+    o.rt_enabled = true;
+    o.rt_arenas = 2;
+    o.rt_pages_per_arena = 8;
+    std::vector<uint64_t> reads;
+    o.rt_page_reader = [&reads](uint64_t addr, void* dst, size_t n) {
+        reads.push_back(addr);
+        std::memset(dst, 0xAB, n);
+        return true;
+    };
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    bridge::StateBridgeDevice device(heaps, o, &states);
+    constexpr uint64_t kCs = 0xC9;
+    device.register_shader_module(kCs, 8);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc c;
+    c.parameter_type = d3d::RootParameterType::Constants32Bit;
+    c.num_32bit_values = 4;  // s4..s7
+    rs.parameters.push_back(c);
+    d3d::RootParameterDesc cbv;
+    cbv.parameter_type = d3d::RootParameterType::Cbv;  // s8, s9
+    cbv.shader_register = 1;
+    rs.parameters.push_back(cbv);
+    d3d::RootParameterDesc uav;
+    uav.parameter_type = d3d::RootParameterType::Uav;  // s10, s11 (never set)
+    uav.shader_register = 1;
+    rs.parameters.push_back(uav);
+    d3d::RootParameterDesc tbl;
+    tbl.parameter_type = d3d::RootParameterType::DescriptorTable;  // s12
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Srv;
+    range.num_descriptors = 1;
+    tbl.ranges.push_back(range);
+    rs.parameters.push_back(tbl);
+    d3d::RootSignature signature;
+    CHECK(d3d::RootSignature::build(rs, &signature).ok());
+    bridge::PipelineLayoutDesc layout;
+    layout.rt_arena = true;
+    using SK = gpu::rt_residency::SourceKind;
+    layout.rt_address_sources.push_back({SK::UserData, 5, 0, 1, false});   // constants dwords 1,2
+    layout.rt_address_sources.push_back({SK::UserData, 8, 0, 1, false});   // root CBV
+    layout.rt_address_sources.push_back({SK::UserData, 10, 0, 1, false});  // root UAV, unbound
+    layout.rt_address_sources.push_back({SK::UserData, 12, 0, 1, false});  // descriptor table
+    layout.rt_address_sources.push_back({SK::UserData, 40, 0, 1, false});  // beyond the signature
+    device.register_pipeline_layout(kCs, 0, layout);
+    pso::D3D12ComputePsoDesc desc;
+    desc.cs = kCs;
+    desc.root_signature_id = 9;
+    auto pso = device.create_compute_pipeline_state(desc, &signature);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    CHECK(list.SetComputeRootSignature(&signature) == d3d::Status::Ok);
+    list.SetComputePipelineState(pso.get());
+    const uint32_t vals[4] = {0, 0x50000, 0, 0};
+    CHECK(list.SetComputeRoot32BitConstants(0, 4, vals, 0) == d3d::Status::Ok);
+    CHECK(list.SetComputeRootConstantBufferView(1, 0x30000) == d3d::Status::Ok);
+    list.Dispatch(1, 1, 1);
+    CHECK(list.stats().rt_dispatches == 1);
+    CHECK((reads == std::vector<uint64_t>{0x50000, 0x30000}));
+    const std::string json = device.rt_report_json();
+    CHECK(json.find("\"unresolved_sources\": 3") != std::string::npos);
+    CHECK(json.find("\"unbound\": 1") != std::string::npos && json.find("\"descriptor_table\": 1") != std::string::npos &&
+          json.find("\"out_of_range\": 1") != std::string::npos);
+}
+
 void test_rt_residency_structures_unavailable_skips() {
     using O = GpuOpcode;
     RtSrcRig rig(24000, true);
@@ -6269,6 +6338,7 @@ int main() {
     test_rt_off_skips_and_counts();
     test_rt_residency_wiring();
     test_rt_residency_structures_unavailable_skips();
+    test_rt_residency_user_data_sources();
     test_partly_held_mip_chain_clamps_views();
     test_view_table_bounded();
     test_unregister_texture_invalidates_cached_bind_groups();
