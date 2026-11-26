@@ -227,6 +227,7 @@ struct Options {
     uint64_t dawn_cache_max_mb = 2048;  // --dawn-cache-max-mb: LRU cap of the title's cache directory (0 = unbounded)
     bool no_async_pipelines = false;    // --no-async-pipelines: live executor creates pipelines synchronously
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
+    bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
@@ -313,6 +314,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.eager_gpu_objects = true;
         } else if (a == "--window") {
             o.window = true;
+        } else if (a == "--gpu-validation") {
+            o.gpu_validation = true;
         } else if (a == "--no-async-pipelines") {
             o.no_async_pipelines = true;
         } else if (a == "--dawn-cache-max-mb" && i + 1 < argc) {
@@ -846,6 +849,7 @@ bool start_live_window() {
         options.blob_cache_max_bytes = g_options.dawn_cache_max_mb << 20;
     }
     options.async_pipelines = !g_options.no_async_pipelines;
+    options.gpu_validation = g_options.gpu_validation;
     g_live.set_tick_hook(&live_title_tick, 250);
     g_live.set_finish_hook([](ne::NativeExecutor& exec) {
         std::lock_guard<std::mutex> lock(g_live_final_mutex);

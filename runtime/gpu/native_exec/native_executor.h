@@ -55,6 +55,10 @@ struct ExecutorOptions {
     // keeps consuming packets (the prewarm batches create hundreds ahead of use). The pipeline is
     // awaited, never skipped, when a pass first uses it, so output is identical to sync creation.
     bool async_pipelines = false;
+    // Strict validation (--gpu-validation): Dawn backend validation (D3D12 debug layer when installed),
+    // immediate error handling, and an error scope around every packet. Errors are deduped by text in
+    // stats_json()'s "validation" block with the first packet index / opcode. Slower; diagnosis only.
+    bool gpu_validation = false;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;

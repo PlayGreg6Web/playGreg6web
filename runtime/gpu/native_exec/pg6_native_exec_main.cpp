@@ -10,6 +10,7 @@
 // --digest-at   headless: print the replay page's `digest frame` / `swapchain frame` lines for these
 //               frames, so the output compares line by line with tools/replay_capture.py
 // --window      present to a native window (Win32) instead; closing it stops the replay
+// --gpu-validation  strict mode: backend validation + an error scope per packet (stats "validation")
 // --report      write executor statistics (packets handled / not yet handled by opcode) as JSON
 //
 // Exit codes: 0 ok, 1 error, 77 no WebGPU adapter.
@@ -67,6 +68,8 @@ int main(int argc, char** argv) {
         const char* v = nullptr;
         if (a == "--window") {
             opts.window = true;
+        } else if (a == "--gpu-validation") {
+            opts.gpu_validation = true;
         } else if (a == "--trace" && (v = next())) {
             trace = v;
         } else if (a == "--pack" && (v = next())) {

@@ -5,13 +5,17 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <dawn/native/DawnNative.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -524,6 +528,35 @@ struct NativeExecutor::Impl {
 
     void snapshot_blob_stats();
 
+    // ---- strict validation (--gpu-validation) ----
+    struct ValidationEntry {
+        uint64_t count = 0;
+        uint64_t first_packet = 0;
+        uint16_t first_opcode = 0;
+        std::string kind;  // scope-validation / scope-internal / uncaptured / log
+        std::map<uint16_t, uint64_t> by_opcode;
+    };
+    std::mutex validation_mutex;
+    std::map<std::string, ValidationEntry> validation_errors;
+    uint64_t validation_total = 0;
+    uint64_t validation_scoped_packets = 0;
+    uint64_t validation_packet_index = 0;
+    uint64_t validation_cur_packet = 0;
+    uint16_t validation_cur_opcode = 0;
+
+    void record_validation(const char* kind, const std::string& text, uint64_t packet, uint16_t opcode) {
+        std::string key = text.size() > 700 ? text.substr(0, 700) : text;
+        std::lock_guard<std::mutex> lock(validation_mutex);
+        ++validation_total;
+        ValidationEntry& e = validation_errors[key];
+        if (e.count++ == 0) {
+            e.first_packet = packet;
+            e.first_opcode = opcode;
+            e.kind = kind;
+        }
+        ++e.by_opcode[opcode];
+    }
+
     // ---- setup ----
 
     bool init(CreateStatus* status, std::string* error) {
@@ -531,6 +564,20 @@ struct NativeExecutor::Impl {
         wgpu::InstanceDescriptor idesc{};
         idesc.requiredFeatureCount = 1;
         idesc.requiredFeatures = kFeatures;
+        // Strict mode: Dawn backend validation (the D3D12 debug layer where installed); its messages
+        // arrive through the logging callback and are counted with the packet being executed.
+        dawn::native::DawnInstanceDescriptor dawn_idesc;
+        if (options.gpu_validation) {
+            dawn_idesc.backendValidationLevel = dawn::native::BackendValidationLevel::Full;
+            dawn_idesc.SetLoggingCallback(
+                [](wgpu::LoggingType type, wgpu::StringView msg, Impl* self) {
+                    if (type != wgpu::LoggingType::Error && type != wgpu::LoggingType::Warning) return;
+                    self->record_validation("log", std::string(type == wgpu::LoggingType::Error ? "[error] " : "[warning] ") + to_string(msg),
+                                            self->validation_cur_packet, self->validation_cur_opcode);
+                },
+                this);
+            idesc.nextInChain = &dawn_idesc;
+        }
         instance = wgpu::CreateInstance(&idesc);
         if (!instance) {
             *status = CreateStatus::Failed;
@@ -655,6 +702,11 @@ struct NativeExecutor::Impl {
                 cache_desc.dawnStoreCacheDataCallbackInfo.userdata1 = &blob_cache;
             }
         }
+        static const char* const kValidationToggles[] = {"enable_immediate_error_handling", "use_user_defined_labels_in_backend"};
+        if (options.gpu_validation) {
+            toggles.enabledToggleCount = 2;
+            toggles.enabledToggles = kValidationToggles;
+        }
         const bool want_timing = options.gpu_timing && adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery);
         if (want_timing) {
             required.push_back(wgpu::FeatureName::TimestampQuery);
@@ -700,7 +752,7 @@ struct NativeExecutor::Impl {
             if (attempt == kFeaturesAndLimits && !have_limits) continue;
             wgpu::DeviceDescriptor ddesc{};
             const bool with_features = attempt != kBare;
-            if (with_features && want_timing) ddesc.nextInChain = &toggles;
+            if ((with_features && want_timing) || options.gpu_validation) ddesc.nextInChain = &toggles;
             if (have_cache) {
                 cache_desc.chain.next = const_cast<WGPUChainedStruct*>(reinterpret_cast<const WGPUChainedStruct*>(ddesc.nextInChain));
                 ddesc.nextInChain = reinterpret_cast<const wgpu::ChainedStruct*>(&cache_desc.chain);
@@ -715,6 +767,8 @@ struct NativeExecutor::Impl {
                     ++self->stats.device_errors;
                     self->stats.last_device_error = to_string(msg);
                     if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
+                    if (self->options.gpu_validation)
+                        self->record_validation("uncaptured", to_string(msg), self->validation_cur_packet, self->validation_cur_opcode);
                 },
                 this);
             ddesc.SetDeviceLostCallback(
@@ -979,7 +1033,34 @@ struct NativeExecutor::Impl {
 
     bool dispatch(const Packet& p) {
         const uint64_t t0 = now_ns();
-        const bool r = dispatch_op(p);
+        bool r;
+        if (options.gpu_validation) {
+            validation_cur_packet = validation_packet_index++;
+            validation_cur_opcode = p.opcode;
+            ++validation_scoped_packets;
+            device.PushErrorScope(wgpu::ErrorFilter::Internal);
+            device.PushErrorScope(wgpu::ErrorFilter::Validation);
+            r = dispatch_op(p);
+            for (const char* kind : {"scope-validation", "scope-internal"}) {
+                struct Ctx {
+                    Impl* self;
+                    uint64_t packet;
+                    uint16_t opcode;
+                    const char* kind;
+                };
+                auto* ctx = new Ctx{this, validation_cur_packet, p.opcode, kind};
+                device.PopErrorScope(
+                    wgpu::CallbackMode::AllowSpontaneous,
+                    [](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg, Ctx* c) {
+                        if (type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown)
+                            c->self->record_validation(c->kind, to_string(msg), c->packet, c->opcode);
+                        delete c;
+                    },
+                    ctx);
+            }
+        } else {
+            r = dispatch_op(p);
+        }
         if (p.opcode < kOpcodeSlots) stats.opcode_ns[p.opcode] += now_ns() - t0;
         return r;
     }
@@ -1494,6 +1575,18 @@ struct NativeExecutor::Impl {
             return;
         }
         if (plan.status != WriteTexturePlan::Status::Write || w.data_len == 0) return;
+        {
+            // WebGPU requires bytesPerRow >= the row's bytes for a multi-row / multi-slice copy; Dawn
+            // rejects such a write whole (nothing is written). Reject it here, counted, instead of
+            // handing Dawn an invalid call (found by --gpu-validation: 128-wide writes with a
+            // 32-texel pitch on a 128x128 mip chain).
+            const FormatInfo& fi = format_info(t.geom.format);
+            if (!fi.compressed && fi.bytes > 0 && plan.bytes_per_row > 0 && (plan.height > 1 || plan.depth > 1) &&
+                plan.bytes_per_row < uint64_t{plan.width} * fi.bytes) {
+                packet_error(static_cast<uint16_t>(GpuOpcode::WriteTexture), "WriteTexture: bytesPerRow smaller than the row");
+                return;
+            }
+        }
         wgpu::TexelCopyTextureInfo dst{};
         dst.texture = t.texture;
         dst.mipLevel = plan.mip;
@@ -1542,6 +1635,15 @@ struct NativeExecutor::Impl {
         if (mip_count) vd.mipLevelCount = mip_count;
         vd.baseArrayLayer = base_layer;
         if (layer_count) vd.arrayLayerCount = layer_count;
+        // An aspect view's format must be that aspect's own format (WebGPU "Texture view format
+        // compatibility"): depth-only of a depth+stencil texture is its depth format, stencil-only is stencil8.
+        if (vd.aspect == wgpu::TextureAspect::DepthOnly) {
+            if (vd.format == wgpu::TextureFormat::Depth32FloatStencil8) vd.format = wgpu::TextureFormat::Depth32Float;
+            else if (vd.format == wgpu::TextureFormat::Depth24PlusStencil8) vd.format = wgpu::TextureFormat::Depth24Plus;
+        } else if (vd.aspect == wgpu::TextureAspect::StencilOnly) {
+            if (vd.format == wgpu::TextureFormat::Depth32FloatStencil8 || vd.format == wgpu::TextureFormat::Depth24PlusStencil8)
+                vd.format = wgpu::TextureFormat::Stencil8;
+        }
         wgpu::TextureView v = t.texture.CreateView(&vd);
         if (t.views.size() >= 64) t.views.erase(t.views.begin());
         t.views[key2] = v;
@@ -3784,6 +3886,41 @@ std::string NativeExecutor::stats_json() const {
         bn("total_bytes", st.blob_total_bytes);
         bn("max_bytes", st.blob_max_bytes);
         j += "}, ";
+    }
+    if (impl_->options.gpu_validation) {
+        auto esc = [](const std::string& in) {
+            std::string o;
+            for (char c : in) {
+                if (c == '"' || c == '\\') {
+                    o += '\\';
+                    o += c;
+                } else if (static_cast<unsigned char>(c) >= 0x20) {
+                    o += c;
+                }
+            }
+            return o;
+        };
+        std::lock_guard<std::mutex> lock(impl_->validation_mutex);
+        std::vector<const std::pair<const std::string, Impl::ValidationEntry>*> rows;
+        for (const auto& kv : impl_->validation_errors) rows.push_back(&kv);
+        std::sort(rows.begin(), rows.end(), [](auto* a, auto* b) { return a->second.count > b->second.count; });
+        j += "\"validation\": {\"scoped_packets\": " + std::to_string(impl_->validation_scoped_packets) +
+             ", \"total_errors\": " + std::to_string(impl_->validation_total) +
+             ", \"unique_errors\": " + std::to_string(rows.size()) + ", \"errors\": [";
+        for (size_t i = 0; i < rows.size() && i < 60; ++i) {
+            const auto& e = rows[i]->second;
+            if (i) j += ", ";
+            j += "{\"count\": " + std::to_string(e.count) + ", \"kind\": \"" + e.kind + "\", \"first_packet\": " +
+                 std::to_string(e.first_packet) + ", \"first_opcode\": " + std::to_string(e.first_opcode) + ", \"opcodes\": {";
+            bool first = true;
+            for (const auto& oc : e.by_opcode) {
+                if (!first) j += ", ";
+                first = false;
+                j += "\"" + std::to_string(oc.first) + "\": " + std::to_string(oc.second);
+            }
+            j += "}, \"text\": \"" + esc(rows[i]->first) + "\"}";
+        }
+        j += "]}, ";
     }
     j += "\"adapter\": {\"backend\": \"" + impl_->adapter.backend + "\"}";
     j += ", \"device_error_log\": [";
