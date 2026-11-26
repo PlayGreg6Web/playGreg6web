@@ -229,6 +229,26 @@ void test_stop_drains_and_stats_json() {
     CHECK(json.find("\"submitted\": 6") != std::string::npos);
     CHECK(json.find("\"window_closed\": false") != std::string::npos);
 }
+
+void test_tick_hook_runs_on_pump_thread() {
+    Shared sh;
+    Pump pump;
+    std::atomic<int> ticks{0};
+    std::thread::id tick_thread;
+    std::mutex m;
+    pump.set_tick_hook(
+        [&](FakeExecutor&) {
+            std::lock_guard<std::mutex> lock(m);
+            tick_thread = std::this_thread::get_id();
+            ++ticks;
+        },
+        5);
+    CHECK(start(pump, sh));
+    std::this_thread::sleep_for(100ms);
+    pump.stop();
+    CHECK(ticks.load() >= 2);
+    CHECK(tick_thread == sh.create_thread);
+}
 }  // namespace
 
 int main() {
@@ -239,6 +259,7 @@ int main() {
     test_focus_forwarding();
     test_create_failure();
     test_stop_drains_and_stats_json();
+    test_tick_hook_runs_on_pump_thread();
     if (g_failures == 0) std::printf("test_live_pump: ok\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -22,6 +22,8 @@ public:
     virtual bool closed() const = 0;
     // True while this is the foreground (keyboard-focused) window. Callable from any thread.
     virtual bool focused() const { return false; }
+    // Sets the title bar text (UTF-8). Window thread only. Default: no-op.
+    virtual void set_title(const std::string&) {}
     // Current client area size (0 x 0 while minimized).
     virtual void client_size(uint32_t* width, uint32_t* height) const = 0;
     // Native handles for the WebGPU surface (Win32: HINSTANCE, HWND).

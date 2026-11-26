@@ -5,7 +5,9 @@
 .EXAMPLE
   .\tools\play_native.ps1 -MaxMs 120000
 .NOTES
-  Needs the shader pack (-ShaderPack or env PLAYGTA6_NATIVE_SHADER_PACK). Stop: close the window or Ctrl+C;
+  Shader pack: -ShaderPack, env PLAYGTA6_NATIVE_SHADER_PACK, else the newest *.wgsl.pack under work/ (or
+  env PLAYGTA6_SHADER_PACK_DIR); the pick is printed. Saves persist under %LOCALAPPDATA%\playgta6\saves;
+  -FreshSetup uses a new empty save dir so the setup screens appear. F11 toggles fullscreen. Stop: close the window or Ctrl+C;
   without -MaxMs the run lasts 2 h. See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
 #>
 param(
@@ -18,6 +20,7 @@ param(
     [string]$BuildDir = "work/native-boot",
     [string]$Name = "",
     [int]$MaxMs = 7200000,
+    [switch]$FreshSetup,
     [switch]$NoBuild,
     [switch]$TrustBuild,
     [switch]$DryRun
@@ -25,17 +28,18 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
-if (-not $ShaderPack -or -not (Test-Path -LiteralPath $ShaderPack)) {
-    throw "No shader pack: pass -ShaderPack <std.wgsl.pack> or set PLAYGTA6_NATIVE_SHADER_PACK (without one nothing is drawn)."
-}
+if ($ShaderPack -and -not (Test-Path -LiteralPath $ShaderPack)) { throw "Shader pack not found: $ShaderPack" }
 if (-not $Name) { $Name = "play-native-" + (Get-Date -Format "yyyyMMdd-HHmmss") }
 $preset = if ($InputScript -eq "none") { "long" } else { $InputScript }
 $argv = @("tools/run_native_boot.py", "--preset", $preset, "--name", $Name, "--play",
           "--exe", $Exe, "--game-dir", $GameDir, "--build-dir", $BuildDir,
-          "--max-ms", $MaxMs, "--watchdog-ms", ($MaxMs + 30000), "--shader-pack", $ShaderPack)
+          "--max-ms", $MaxMs, "--watchdog-ms", ($MaxMs + 30000))
+# Without -ShaderPack run_native_boot.py picks one (env var, then the newest *.wgsl.pack under work/) and prints it.
+if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
+if ($FreshSetup) { $argv += "--fresh-setup" }
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
 if ($DryRun) { $argv += "--dry-run" }
-if ($SaveDir) { $argv += @("--", "--save-dir", $SaveDir) }
+if ($SaveDir) { $argv += @("--save-dir", $SaveDir) }
 Push-Location $repo
 try { & python @argv; exit $LASTEXITCODE } finally { Pop-Location }

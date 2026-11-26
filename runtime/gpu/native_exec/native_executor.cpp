@@ -3285,6 +3285,10 @@ bool NativeExecutor::poll() {
     return open;
 }
 
+void NativeExecutor::set_window_title(const std::string& title) {
+    if (impl_->window) impl_->window->set_title(title);
+}
+
 bool NativeExecutor::window_focused() const { return impl_->window && impl_->window->focused(); }
 
 void NativeExecutor::wait_idle() {

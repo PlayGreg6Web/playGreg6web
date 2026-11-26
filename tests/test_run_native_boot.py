@@ -794,5 +794,78 @@ class AudioLineTests(unittest.TestCase):
         self.assertNotIn("audio:", rnb.digest({}, 0))
 
 
+class PlayConvenienceTests(unittest.TestCase):
+    def test_pack_env_wins_and_missing_env_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pack = root / "a.wgsl.pack"
+            pack.write_bytes(b"x")
+            got, why = rnb.find_shader_pack(root, {rnb.SHADER_PACK_ENV: str(pack)})
+            self.assertEqual(got, pack)
+            got, why = rnb.find_shader_pack(root, {rnb.SHADER_PACK_ENV: str(root / "nope.pack")})
+            self.assertIsNone(got)
+            self.assertIn("missing", why)
+
+    def test_pack_discovery_picks_newest_under_work_and_extra_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old = root / "work" / "x" / "old.wgsl.pack"
+            new = root / "work" / "y" / "new.wgsl.pack"
+            extra = root / "extra" / "newest.wgsl.pack"
+            for path, when in ((old, 1000.0), (new, 2000.0)):
+                touch(path, when)
+            (root / "work" / "z.txt").write_text("not a pack")
+            got, _ = rnb.find_shader_pack(root, {})
+            self.assertEqual(got, new)
+            touch(extra, 3000.0)
+            got, _ = rnb.find_shader_pack(root, {rnb.SHADER_PACK_DIR_ENV: str(root / "extra")})
+            self.assertEqual(got, extra)
+
+    def test_no_pack_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            got, why = rnb.find_shader_pack(Path(d), {})
+            self.assertIsNone(got)
+            self.assertIn("no *.wgsl.pack", why)
+
+    def test_save_dir_choice(self):
+        env = {"LOCALAPPDATA": "L"}
+        persistent = Path("L") / "playgta6" / "saves"
+        self.assertEqual(rnb.play_save_dir(False, None, env, "t"), persistent)
+        self.assertEqual(rnb.play_save_dir(True, None, env, "t"), Path("L") / "playgta6" / "fresh-t")
+        self.assertEqual(rnb.play_save_dir(True, Path("mine"), env, "t"), Path("mine"))
+        self.assertEqual(rnb.play_save_dir(False, None, {rnb.SAVE_DIR_ENV: "S"}, "t"), Path("S"))
+
+    def test_play_dry_run_picks_pack_and_save_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            fx = Fixture(root)
+            pack = fx.repo / "work" / "p.wgsl.pack"
+            touch(pack, 5000.0)
+            env = {"LOCALAPPDATA": str(root / "local")}
+            out, err = io.StringIO(), io.StringIO()
+            argv = ["--play", "--dry-run", "--exe", str(fx.exe), "--game-dir", str(fx.pkg),
+                    "--build-dir", str(fx.build), "--fresh-setup", "--harness", str(fx.harness)]
+            with redirect_stdout(out), redirect_stderr(err):
+                code = rnb.main(argv, env=env, repo_root=fx.repo)
+            self.assertEqual(code, 0, err.getvalue())
+            cmd = json.loads(out.getvalue())["command"]
+            self.assertEqual(cmd[cmd.index("--shader-pack") + 1], str(pack))
+            save = cmd[cmd.index("--save-dir") + 1].replace("\\", "/")
+            self.assertIn("/playgta6/fresh-", save)
+            self.assertIn("shader pack:", err.getvalue())
+
+    def test_watch_for_fault_prints_fault_report(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / "boot-report.json").write_text(json.dumps({"fault_record": {"kind": "trap", "va": "0x10"}}))
+            out = io.StringIO()
+            done = threading.Event()
+            threading.Timer(5.0, done.set).start()
+            rnb.watch_for_fault(run, done, out=out, poll_s=0.01)
+            done.set()
+            self.assertIn("guest faulted", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

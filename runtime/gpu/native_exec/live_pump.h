@@ -151,6 +151,13 @@ public:
     // destroyed (the only safe moment to read its stats). Set before start().
     void set_finish_hook(std::function<void(Executor&)> hook) { finish_hook_ = std::move(hook); }
 
+    // Runs on the pump thread at most every `interval_ms` (checked after each poll): window title
+    // updates and the like. Set before start().
+    void set_tick_hook(std::function<void(Executor&)> hook, uint32_t interval_ms = 250) {
+        tick_hook_ = std::move(hook);
+        tick_interval_ms_ = interval_ms;
+    }
+
     // One-line JSON for the boot report.
     std::string stats_json() const {
         const LivePumpStats s = stats();
@@ -187,8 +194,16 @@ private:
 
         bool focus = false;
         bool focus_known = false;
+        auto last_tick = std::chrono::steady_clock::time_point{};
         auto poll_once = [&]() -> bool {
             const bool open = exec->poll();
+            if (tick_hook_ && open) {
+                const auto now_t = std::chrono::steady_clock::now();
+                if (now_t - last_tick >= std::chrono::milliseconds(tick_interval_ms_)) {
+                    last_tick = now_t;
+                    tick_hook_(*exec);
+                }
+            }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.polls;
@@ -262,6 +277,8 @@ private:
     std::function<void()> on_close_;
     std::function<void(bool)> on_focus_;
     std::function<void(Executor&)> finish_hook_;
+    std::function<void(Executor&)> tick_hook_;
+    uint32_t tick_interval_ms_ = 250;
     std::thread thread_;
 };
 

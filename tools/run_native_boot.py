@@ -82,6 +82,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -137,6 +138,85 @@ def run_command(cmd: list[str], cwd: Path, log: Path | None = None, timeout: flo
         return 124
     except OSError as exc:
         raise RunnerError(f"cannot run {cmd[0]}: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Native play (--play) conveniences
+# ---------------------------------------------------------------------------
+
+SHADER_PACK_ENV = "PLAYGTA6_NATIVE_SHADER_PACK"
+SHADER_PACK_DIR_ENV = "PLAYGTA6_SHADER_PACK_DIR"  # extra directory searched for *.wgsl.pack when no pack is given
+SAVE_DIR_ENV = "PLAYGTA6_SAVE_DIR"
+
+
+def find_shader_pack(repo: Path, env: Mapping[str, str]) -> tuple[Path | None, str]:
+    """The shader pack for --play when --shader-pack is absent: $PLAYGTA6_NATIVE_SHADER_PACK if it names a
+    file, else the newest `*.wgsl.pack` below $PLAYGTA6_SHADER_PACK_DIR and `<repo>/work`. Returns
+    (path or None, a one-line description of where it came from)."""
+    named = env.get(SHADER_PACK_ENV)
+    if named:
+        if Path(named).is_file():
+            return Path(named), f"${SHADER_PACK_ENV}"
+        return None, f"${SHADER_PACK_ENV} names a missing file: {named}"
+    roots = []
+    if env.get(SHADER_PACK_DIR_ENV):
+        roots.append(Path(env[SHADER_PACK_DIR_ENV]))
+    roots.append(repo / "work")
+    best: tuple[float, Path] | None = None
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f.endswith(".wgsl.pack"):
+                    path = Path(dirpath) / f
+                    try:
+                        mtime = path.stat().st_mtime
+                    except OSError:
+                        continue
+                    if best is None or mtime > best[0]:
+                        best = (mtime, path)
+    if best is None:
+        return None, "no *.wgsl.pack found"
+    return best[1], "newest *.wgsl.pack under " + " / ".join(str(r) for r in roots)
+
+
+def default_save_root(env: Mapping[str, str]) -> Path:
+    """Persistent save directory for --play: $PLAYGTA6_SAVE_DIR, else %LOCALAPPDATA%/playgta6/saves
+    (~/.local/share/playgta6/saves elsewhere)."""
+    if env.get(SAVE_DIR_ENV):
+        return Path(env[SAVE_DIR_ENV])
+    local = env.get("LOCALAPPDATA")
+    base = Path(local) if local else Path.home() / ".local" / "share"
+    return base / "playgta6" / "saves"
+
+
+def play_save_dir(fresh: bool, explicit: Path | None, env: Mapping[str, str], now: str) -> Path:
+    """--save-dir wins; --fresh-setup gives a new empty directory next to the persistent one (so the
+    setup screens appear); otherwise the persistent default."""
+    if explicit is not None:
+        return explicit
+    root = default_save_root(env)
+    return root.parent / f"fresh-{now}" if fresh else root
+
+
+def watch_for_fault(run_dir: Path, done, out=None, poll_s: float = 0.5) -> None:
+    """While the window is held open on a guest fault the harness has already written the report:
+    print tools/fault_report.py's output to the console once it shows up."""
+    out = out or sys.stdout
+    report = run_dir / "boot-report.json"
+    while not done.wait(poll_s):
+        data = load_report(report)
+        if data and isinstance(data.get("fault_record"), dict):
+            print("[play] the guest faulted; the window stays open on the last frame (close it to exit)",
+                  file=out, flush=True)
+            try:
+                proc = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "fault_report.py"), str(report)],
+                                      capture_output=True, text=True, timeout=60)
+                print(proc.stdout or proc.stderr, file=out, flush=True)
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"[play] fault_report failed: {exc}", file=out, flush=True)
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +856,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="build the harness with --window support (Dawn executor; needs a Dawn checkout/cache)")
     p.add_argument("--play", action="store_true",
                    help="live native play: --native-executor build, then run with --window --audio-out --host-input")
+    p.add_argument("--fresh-setup", action="store_true",
+                   help="with --play: a new empty save directory, so the setup screens appear again")
+    p.add_argument("--save-dir", type=Path, help="with --play: save directory (default: persistent, see docs)")
     p.add_argument("extra", nargs=argparse.REMAINDER, help="after `--`: further playgta6_boot options")
     return p
 
@@ -886,6 +969,20 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
                                       native_executor=args.native_executor or args.play)
     if args.trust_build:
         plan.steps = []
+    if args.play:
+        if not args.shader_pack:
+            found, why = find_shader_pack(repo, env)
+            if found is None:
+                raise RunnerError(f"no shader pack ({why}): pass --shader-pack <std.wgsl.pack>, set "
+                                  f"{SHADER_PACK_ENV}, or put one under work/ (or ${SHADER_PACK_DIR_ENV}); "
+                                  "without one nothing is drawn")
+            args.shader_pack = found
+            print(f"[play] shader pack: {found} ({why})", file=sys.stderr)
+        if "--save-dir" not in extra:
+            save = play_save_dir(args.fresh_setup, args.save_dir, env, time.strftime("%Y%m%d-%H%M%S"))
+            extra = ["--save-dir", str(save)] + list(extra)
+            print(f"[play] save dir: {save}" + (" (fresh: setup screens appear)" if args.fresh_setup else ""),
+                  file=sys.stderr)
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
     watchdog_ms = resolve_watchdog_ms(preset, args.max_ms, args.watchdog_ms)
 
@@ -962,7 +1059,13 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     if preset["input"] and not args.input_script:
         script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)
-    code, report, relaunches = run_with_relaunch(cmd, repo, run_dir, runner, watchdog_ms / 1000 + 60)
+    watch_done = threading.Event()
+    if args.play and not args.dry_run:
+        threading.Thread(target=watch_for_fault, args=(run_dir, watch_done), daemon=True).start()
+    try:
+        code, report, relaunches = run_with_relaunch(cmd, repo, run_dir, runner, watchdog_ms / 1000 + 60)
+    finally:
+        watch_done.set()
     (run_dir / "command.json").write_text(json.dumps({
         "preset": args.preset, "command": cmd, "plan": plan.steps, "harness_exit": code,
         "relaunches": relaunches}, indent=2), encoding="utf-8")

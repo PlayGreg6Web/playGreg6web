@@ -754,6 +754,42 @@ std::atomic<bool> g_window_focused{true};
 std::atomic<playgta6::guest::host_input::HostInputSource*> g_host_source{nullptr};
 std::mutex g_live_final_mutex;
 std::string g_live_final_stats = "null";  // the executor's stats_json, captured when the pump stops
+std::atomic<bool> g_guest_faulted{false};  // set before the window is held open on a fault
+
+// Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
+// of the newest interval, and the fault state.
+void live_title_tick(ne::NativeExecutor& exec) {
+    struct Sample {
+        std::chrono::steady_clock::time_point t{};
+        uint64_t presents = 0, draws = 0;
+        double fps = 0, draws_per_frame = 0;
+    };
+    static Sample last;
+    const ne::ExecutorStats& st = exec.stats();
+    const auto now = std::chrono::steady_clock::now();
+    if (last.t.time_since_epoch().count() != 0) {
+        const double dt = std::chrono::duration<double>(now - last.t).count();
+        const uint64_t dp = st.present_packets - last.presents;
+        if (dt > 0 && dp > 0) {
+            last.fps = static_cast<double>(dp) / dt;
+            last.draws_per_frame = static_cast<double>(st.draws - last.draws) / static_cast<double>(dp);
+        } else if (dt > 1.0) {
+            last.fps = 0;
+        }
+    }
+    last.t = now;
+    last.presents = st.present_packets;
+    last.draws = st.draws;
+    char buf[200];
+    if (g_guest_faulted.load()) {
+        std::snprintf(buf, sizeof buf, "playgta6 | GUEST FAULT - last frame kept, details in the console | frame %llu | close the window to exit",
+                      static_cast<unsigned long long>(st.present_packets));
+    } else {
+        std::snprintf(buf, sizeof buf, "playgta6 | %.0f fps | frame %llu | %.0f draws/frame | ok | F11 fullscreen",
+                      last.fps, static_cast<unsigned long long>(st.present_packets), last.draws_per_frame);
+    }
+    exec.set_window_title(buf);
+}
 
 void live_observer(const uint8_t* data, size_t len) {
     if (!g_options.gpu_capture.empty()) {
@@ -775,6 +811,7 @@ bool start_live_window() {
     options.window = true;
     options.width = g_options.window_width;
     options.height = g_options.window_height;
+    g_live.set_tick_hook(&live_title_tick, 250);
     g_live.set_finish_hook([](ne::NativeExecutor& exec) {
         std::lock_guard<std::mutex> lock(g_live_final_mutex);
         g_live_final_stats = exec.stats_json();
@@ -805,6 +842,21 @@ bool start_live_window() {
     g_live_started = true;
     playgta6::os::set_wgpu_submit_observer(&live_observer);
     return true;
+}
+
+// A guest fault must not close the window at once: write the report now (the launcher prints the
+// fault report from it), flip the title to the fault state and keep the last frame up until the
+// user closes the window (or the watchdog fires).
+void hold_window_on_fault(bool faulted) {
+    if (!faulted || !g_live_started || g_live.window_closed()) return;
+    write_text(g_options.report, guest::last_report_json());
+    std::fprintf(stderr, "[harness] guest fault: window kept open on the last frame; close it to exit
+");
+    std::fflush(stderr);
+    g_guest_faulted.store(true);
+    while (!g_live.window_closed()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 // After the boot: detach, drain the queue, destroy the executor on its thread.
@@ -1107,6 +1159,7 @@ void run_boot_thread() {
     cfg.guest_thread_started = &profile_thread_started;
     const guest::BootResult result = guest::run_boot(cfg);
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
+    hold_window_on_fault(result.status == guest::BootStatus::Fault);
     stop_live_window();
 #endif
     playgta6::os::gdk::gamesave::flush_all();  // exit: nothing the title saved stays only in cache

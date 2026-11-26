@@ -83,17 +83,31 @@ the pad wins per axis when it is deflected more. `--input-script` takes preceden
 ## Native play: one command
 
 ```powershell
-$env:PLAYGTA6_NATIVE_SHADER_PACK = "H:\path	o\std.wgsl.pack"   # once
 .	ools\play_native.ps1            # PLAYGTA6_EXE / GTA6_GAME_DIR as for play_local.ps1
+.	ools\play_native.ps1 -FreshSetup  # new empty save dir: the setup screens appear again
 ```
 
 Builds what is stale (recompiler, lift, harness with the Dawn executor on, all from the content-keyed caches below),
 then runs `playgta6_boot --window --audio-out --host-input --shader-pack <pack>`: a window with the live frames, WASAPI
-audio, keyboard and pad. Options: `-InputScript none|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|menu-to-ingame`
-(scripted setup input instead of waiting for you; default `none`), `-SaveDir`, `-MaxMs` (default 2 h; closes the window
+audio, keyboard and pad.
+
+- **Shader pack.** `-ShaderPack` wins, then `$env:PLAYGTA6_NATIVE_SHADER_PACK`, then the newest `*.wgsl.pack` found under
+  `work/` (and under `$env:PLAYGTA6_SHADER_PACK_DIR` if set). The chosen file is printed (`[play] shader pack: ...`).
+  With none, the run stops before building (nothing would be drawn).
+- **Saves.** Persistent by default in `%LOCALAPPDATA%\playgta6\saves` (`$env:PLAYGTA6_SAVE_DIR` overrides, `-SaveDir`
+  wins). `-FreshSetup` uses a new empty `%LOCALAPPDATA%\playgta6resh-<timestamp>` so the setup screens appear; the
+  persistent saves are left alone.
+- **Window title** shows `fps | frame N | draws/frame | ok`. **F11** toggles borderless fullscreen. Esc is not
+  handled by the window: it reaches the title as Menu (see the keyboard table).
+- **Guest fault.** The window stays open on the last frame with the title `GUEST FAULT ...`; the console prints the
+  `tools/fault_report.py` output right away. Close the window to exit (the report is then finalised as usual).
+
+Other options: `-InputScript none|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|menu-to-ingame`
+(scripted setup input instead of waiting for you; default `none`), `-MaxMs` (default 2 h; closes the window
 when reached), `-NoBuild`, `-TrustBuild`, `-DryRun`, `-BuildDir`. The report lands in `<build-dir>/runs/<name>/`
 (`boot-report.json`: presents, `audio_out` counters). Stop with Ctrl+C or by closing the window.
-Same thing from Python: `python tools/run_native_boot.py --play ...` (or `--native-executor` for just the build).
+Same thing from Python: `python tools/run_native_boot.py --play [--fresh-setup] [--save-dir DIR] ...`
+(or `--native-executor` for just the build).
 
 ## Native boot: fast, safe repeat builds
 

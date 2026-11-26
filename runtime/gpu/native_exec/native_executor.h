@@ -154,6 +154,8 @@ public:
     bool poll();
     // True while the presenting window has keyboard focus (false headless).
     bool window_focused() const;
+    // Title bar text of the live window (no-op without one). Call from the pump thread.
+    void set_window_title(const std::string& title);
     // Blocks until the GPU finished all submitted work and every pending read-back / timestamp
     // read was delivered.
     void wait_idle();
