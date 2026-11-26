@@ -57,6 +57,8 @@ struct WasmBootConfig {
     uint32_t wgpu_features = kDefaultWasmWgpuFeatures;
     // DirectStorage worker thread count (clamped to [1, 16] by set_dstorage_worker_threads).
     uint32_t dstorage_worker_threads = kDefaultDStorageWorkerThreads;
+    // Title arguments appended to the guest command line (a relaunch passes the title's new ones).
+    std::string title_args;
 };
 
 struct WasmBootResult {
@@ -67,6 +69,10 @@ struct WasmBootResult {
     size_t modules_loaded = 0;
     uint64_t total_bytes_loaded = 0;
     int32_t exit_code = 0;
+    // XLaunchNewGame: the title asked for a restart (exit_code is kRelaunchSelfExitCode) with these
+    // new arguments; the host re-execs (native) or tears the worker down and boots again (browser).
+    bool relaunch_requested = false;
+    std::string relaunch_args;
 };
 
 // Reads `rel_path` in bounded chunks. Always closes a successfully opened handle.

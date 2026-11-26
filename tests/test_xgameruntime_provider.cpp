@@ -1361,6 +1361,9 @@ void test_launch_new_game() {
     CHECK(g_exit_calls == 1 && g_exit_code == playgta6::os::win32::kRelaunchSelfExitCode);
     uint32_t code = 0;
     CHECK(playgta6::os::win32::process_exit_requested(&code) && code == playgta6::os::win32::kRelaunchSelfExitCode);
+    std::string relaunch_args;
+    CHECK(playgta6::os::win32::relaunch_requested(&relaunch_args) && relaunch_args == "-mode 2");
+    playgta6::os::win32::reset_relaunch_request();
 
     playgta6::os::win32::set_process_exit_handler(nullptr, nullptr);
     playgta6::os::win32::reset_process_exit_state();

@@ -385,6 +385,24 @@ size_t dispatch_app_resume(AppNotificationInvoker invoker, void* user);
 // ASCII "RELN" so it cannot collide with a title's own exit codes in practice.
 inline constexpr uint32_t kRelaunchSelfExitCode = 0x52454C4Eu;
 
+// Guest restart (XLaunchNewGame of the running title): the new arguments are recorded, the hook
+// (the boot installs one that runs the guest's suspend routines) runs, then the process stops with
+// kRelaunchSelfExitCode. The host (native main, browser loader) restarts with the same options plus
+// these arguments. Cleared by reset_relaunch_request.
+using RelaunchPrepareHook = void (*)(void* user);
+void set_relaunch_prepare_hook(RelaunchPrepareHook hook, void* user);
+// Records `args` and runs the prepare hook (no-op without one).
+void begin_guest_relaunch(std::string_view args);
+bool relaunch_requested(std::string* args_out);
+void reset_relaunch_request();
+// The relaunch suspend sequence: constrained-change routines, then app-state routines (suspend order,
+// dispatch_app_suspend), then `grace` (sleep for the grace period, ~1 s). Returns routines called.
+using RelaunchGraceFn = void (*)(uint32_t grace_ms, void* user);
+inline constexpr uint32_t kRelaunchGraceMs = 1000;
+size_t run_relaunch_suspend_sequence(AppNotificationInvoker invoker, void* invoker_user,
+                                     RelaunchGraceFn grace, void* grace_user,
+                                     uint32_t grace_ms = kRelaunchGraceMs);
+
 // In-memory registry (empty by default). Keys are "HKLM\\Software\\Vendor" style paths (root names
 // HKCR, HKCU, HKLM, HKU or their long forms; case-insensitive); values are stored per key.
 void registry_set_value(std::string_view key_path,

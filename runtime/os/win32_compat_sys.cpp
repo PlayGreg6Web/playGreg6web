@@ -269,6 +269,68 @@ size_t dispatch_app_resume(AppNotificationInvoker invoker, void* user) {
     return n;
 }
 
+namespace {
+struct RelaunchState {
+    std::mutex mutex;
+    RelaunchPrepareHook hook = nullptr;
+    void* hook_user = nullptr;
+    bool requested = false;
+    std::string args;
+};
+RelaunchState& relaunch_state() {
+    static RelaunchState s;
+    return s;
+}
+}  // namespace
+
+void set_relaunch_prepare_hook(RelaunchPrepareHook hook, void* user) {
+    auto& s = relaunch_state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.hook = hook;
+    s.hook_user = user;
+}
+
+void begin_guest_relaunch(std::string_view args) {
+    auto& s = relaunch_state();
+    RelaunchPrepareHook hook = nullptr;
+    void* user = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.requested = true;
+        s.args.assign(args);
+        hook = s.hook;
+        user = s.hook_user;
+    }
+    if (hook != nullptr) {
+        hook(user);
+    }
+}
+
+bool relaunch_requested(std::string* args_out) {
+    auto& s = relaunch_state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.requested && args_out != nullptr) {
+        *args_out = s.args;
+    }
+    return s.requested;
+}
+
+void reset_relaunch_request() {
+    auto& s = relaunch_state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.requested = false;
+    s.args.clear();
+}
+
+size_t run_relaunch_suspend_sequence(AppNotificationInvoker invoker, void* invoker_user,
+                                     RelaunchGraceFn grace, void* grace_user, uint32_t grace_ms) {
+    const size_t n = dispatch_app_suspend(invoker, invoker_user);
+    if (grace != nullptr) {
+        grace(grace_ms, grace_user);
+    }
+    return n;
+}
+
 namespace compat_detail {
 
 bool ticks_to_system_time(uint64_t ticks, Pg6SystemTime* out) {

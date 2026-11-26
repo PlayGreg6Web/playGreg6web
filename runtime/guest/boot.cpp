@@ -1261,6 +1261,21 @@ void boot_terminate_process_handler(uint32_t exit_code, void* /*user*/) {
     request_exit(static_cast<int32_t>(exit_code));
 }
 
+// XLaunchNewGame of the running title: the guest's constrained-change then app-state routines run
+// with TRUE on the calling guest thread, then a ~1 s grace period for work they started.
+void boot_relaunch_invoke(const os::win32::AppNotification& call, void* /*user*/) {
+    com::GuestFunction<void(bool, uint64_t)> routine(call.routine);
+    routine(call.flag != 0, call.context);
+}
+
+void boot_relaunch_grace(uint32_t grace_ms, void* /*user*/) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+}
+
+void boot_relaunch_prepare(void* /*user*/) {
+    os::win32::run_relaunch_suspend_sequence(&boot_relaunch_invoke, nullptr, &boot_relaunch_grace, nullptr);
+}
+
 // Guest return address of this thread's latest dispatched call (PG6_EVENT_TRACE callers).
 uint64_t boot_current_guest_caller() {
     return t_dispatch_count != 0 ? t_dispatch_ring[(t_dispatch_count - 1) % kDispatchRing].return_address : 0;
@@ -1273,6 +1288,7 @@ void install_hooks() {
     b.previous_observer = set_dispatch_observer(&boot_dispatch_observer);
     b.previous_exit_hook = pg6_crt_set_exit_hook(&boot_exit_hook);
     os::win32::set_process_exit_handler(&boot_terminate_process_handler, nullptr);
+    os::win32::set_relaunch_prepare_hook(&boot_relaunch_prepare, nullptr);
     b.hooks_installed = true;
 }
 
@@ -1285,6 +1301,7 @@ void remove_hooks() {
     set_dispatch_observer(b.previous_observer);
     pg6_crt_set_exit_hook(b.previous_exit_hook);
     os::win32::set_process_exit_handler(nullptr, nullptr);
+    os::win32::set_relaunch_prepare_hook(nullptr, nullptr);
     os::win32::set_event_trace_caller(nullptr);
     b.hooks_installed = false;
 }

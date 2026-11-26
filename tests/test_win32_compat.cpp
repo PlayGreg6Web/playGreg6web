@@ -944,6 +944,36 @@ void test_debug_and_lifecycle() {
         CHECK(calls[1].routine == 0x5300 && calls[1].flag == 0);
         CHECK(calls[2].routine == 0x5200 && calls[2].flag == 0);
         CHECK(dispatch_app_suspend(nullptr, nullptr) == 0);
+
+        // XLaunchNewGame sequence: constrained routines, then app-state routines, then the grace wait.
+        {
+            struct Trace {
+                std::vector<std::string> events;
+            } trace;
+            const auto note = [](const AppNotification& n, void* user) {
+                if (n.routine >= 0x5100 && n.routine <= 0x5300) {
+                    static_cast<Trace*>(user)->events.push_back(
+                        (n.kind == AppNotificationKind::Constrained ? "constrained:" : "state:") +
+                        std::to_string(n.routine) + ":" + std::to_string(n.flag));
+                }
+            };
+            const auto grace = [](uint32_t ms, void* user) {
+                static_cast<Trace*>(user)->events.push_back("grace:" + std::to_string(ms));
+            };
+            CHECK(run_relaunch_suspend_sequence(note, &trace, grace, &trace) >= 3);
+            CHECK(trace.events.size() == 4);
+            CHECK(trace.events[0] == "constrained:" + std::to_string(0x5200) + ":1");
+            CHECK(trace.events[1] == "state:" + std::to_string(0x5100) + ":1");
+            CHECK(trace.events[2] == "state:" + std::to_string(0x5300) + ":1");
+            CHECK(trace.events[3] == "grace:1000");
+            reset_relaunch_request();
+            std::string args;
+            CHECK(!relaunch_requested(&args));
+            begin_guest_relaunch("-lang de");
+            CHECK(relaunch_requested(&args) && args == "-lang de");
+            reset_relaunch_request();
+            CHECK(!relaunch_requested(nullptr));
+        }
         pg6_win32_unregister_app_state_change_notification(s1);
         pg6_win32_unregister_app_state_change_notification(s2);
         pg6_win32_unregister_app_constrained_change_notification(c1);

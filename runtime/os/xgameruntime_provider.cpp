@@ -917,6 +917,9 @@ public:
         }
         os::log(std::string("xgameruntime: XLaunchNewGame(\"") + exe_path + "\", args \"" +
                 (args != nullptr ? args : "") + "\"): relaunch of the running title requested");
+        // Constrained-change then suspend routines (and the ~1 s grace) run in the prepare hook the
+        // boot installs; the new arguments travel to the host through win32::relaunch_requested.
+        win32::begin_guest_relaunch(args != nullptr ? args : "");
         pg6_win32_terminate_process(win32::kCurrentProcessPseudoHandle, win32::kRelaunchSelfExitCode);
         return S_OK_HR;
     }
