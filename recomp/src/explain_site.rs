@@ -12,16 +12,21 @@ use std::fmt::Write as _;
 use iced_x86::{Formatter, Instruction, IntelFormatter, Mnemonic, OpKind, Register};
 
 use crate::cfg::{Function, UnresolvedJump};
+use crate::code_image::CodeImage;
 use crate::discover::Analysis;
-use crate::jump_survey::{classify, window, Ctx, Layout};
+use crate::jump_survey::{classify, is_win64_volatile, window, Ctx, Layout, TableProbe};
 use crate::pe::Pe64;
 
-pub const USAGE: &str = "explain-site <pe-path> <addr> [--return-address] [--no-refine]";
+pub const USAGE: &str =
+    "explain-site <pe-path> <addr>[,<addr>...] [--return-address] [--no-refine]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub pe_path: std::path::PathBuf,
     pub addr: u64,
+    /// Further sites from a comma-separated `<addr>` list, explained after `addr` with the same
+    /// (single) discovery run.
+    pub more: Vec<u64>,
     /// `addr` is the return address of an indirect call (the site is the instruction before it).
     pub return_address: bool,
     pub no_refine: bool,
@@ -41,6 +46,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let mut out = Args {
         pe_path: Default::default(),
         addr: 0,
+        more: Vec::new(),
         return_address: false,
         no_refine: false,
     };
@@ -54,7 +60,14 @@ pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             }
             p if path.is_none() => path = Some(p.into()),
             p if addr.is_none() => {
-                addr = Some(parse_addr(p).ok_or_else(|| format!("bad address '{p}'"))?);
+                for (n, part) in p.split(',').filter(|t| !t.trim().is_empty()).enumerate() {
+                    let v = parse_addr(part).ok_or_else(|| format!("bad address '{part}'"))?;
+                    if n == 0 {
+                        addr = Some(v);
+                    } else {
+                        out.more.push(v);
+                    }
+                }
             }
             p => return Err(format!("unexpected extra positional argument '{p}'")),
         }
@@ -77,12 +90,25 @@ pub fn run(args: &Args) -> Result<String, String> {
                 .map_err(|e| format!("failed to build the guest image: {e:?}"))?;
         crate::pipeline::refine::discover_refined(&mut seeded.image, &guest.image).0
     };
-    Ok(explain(
-        &Layout::from_pe(&pe),
-        &analysis,
-        args.addr,
-        args.return_address,
-    ))
+    let layout = Layout::from_pe(&pe);
+    let mut text = String::new();
+    for (n, &addr) in std::iter::once(&args.addr).chain(&args.more).enumerate() {
+        if n > 0 {
+            text.push_str(
+                "
+----
+",
+            );
+        }
+        text.push_str(&explain_probed(
+            &layout,
+            &analysis,
+            addr,
+            args.return_address,
+            Some(&seeded.image),
+        ));
+    }
+    Ok(text)
 }
 
 fn is_indirect(i: &Instruction) -> Option<&'static str> {
@@ -134,6 +160,10 @@ fn read_regs(i: &Instruction) -> Vec<Register> {
 }
 
 fn writes_reg(i: &Instruction, reg: Register) -> bool {
+    if is_indirect(i) == Some("call") || i.mnemonic() == Mnemonic::Call {
+        // Win64: a call returns in RAX and may clobber every other volatile register.
+        return is_win64_volatile(reg);
+    }
     !matches!(
         i.mnemonic(),
         Mnemonic::Cmp
@@ -153,6 +183,15 @@ fn defs(o: &mut String, ins: &[&Instruction], upto: usize, reg: Register, depth:
     for idx in (0..upto).rev() {
         let i = ins[idx];
         if writes_reg(i, reg) {
+            if i.mnemonic() == Mnemonic::Call {
+                let what = if reg == Register::RAX {
+                    "return value"
+                } else {
+                    "clobbered"
+                };
+                let _ = writeln!(o, "{pad}{reg:?} <- {:#x}: {} ({what})", i.ip(), fmt(i));
+                return;
+            }
             let _ = writeln!(o, "{pad}{reg:?} <- {:#x}: {}", i.ip(), fmt(i));
             let zeroing = i.mnemonic() == Mnemonic::Xor
                 && i.op1_kind() == OpKind::Register
@@ -240,6 +279,18 @@ fn locate(analysis: &Analysis, addr: u64, ret: bool) -> Option<(&Function, u64, 
 }
 
 pub fn explain(layout: &Layout, analysis: &Analysis, addr: u64, ret: bool) -> String {
+    explain_probed(layout, analysis, addr, ret, None)
+}
+
+/// [`explain`] that reads the leading entries of a constant table from `image`, so a tail call
+/// through a function-pointer or run-time data table is not reported as a switch gap.
+pub fn explain_probed(
+    layout: &Layout,
+    analysis: &Analysis,
+    addr: u64,
+    ret: bool,
+    image: Option<&CodeImage<'_>>,
+) -> String {
     let mut o = String::new();
     let Some((func, bstart, site)) = locate(analysis, addr, ret) else {
         let _ = writeln!(
@@ -309,7 +360,13 @@ pub fn explain(layout: &Layout, analysis: &Analysis, addr: u64, ret: bool) -> St
     for r in regs {
         defs(&mut o, &ins, pos, r, 0);
     }
-    let ctx = Ctx { layout };
+    let ctx = Ctx {
+        layout,
+        probe: image.map(|image| TableProbe {
+            image,
+            functions: &analysis.functions,
+        }),
+    };
     let reason = if kind == "jmp" {
         analysis.unresolved_jumps.get(&site).copied()
     } else {
@@ -320,8 +377,35 @@ pub fn explain(layout: &Layout, analysis: &Analysis, addr: u64, ret: bool) -> St
     match reason {
         Some(r) => {
             let (why, c) = rule(r);
-            cat = c;
             let _ = writeln!(o, "jump_table: not resolved, reason {}: {why}", r.name());
+            cat = match pat.role {
+                "fn_table" => {
+                    let _ = writeln!(
+                        o,
+                        "table: read-only, its leading entries are function entries (a handler table, not case labels)"
+                    );
+                    "runtime-dispatch"
+                }
+                "ptr_array" => {
+                    let _ = writeln!(
+                        o,
+                        "table: base loaded from object/global memory (a vtable slot or pointer array picked by an index, not a switch table)"
+                    );
+                    "runtime-dispatch"
+                }
+                "data_table" => {
+                    let _ = writeln!(
+                        o,
+                        "table: in a writable section (pointers stored at run time, not a switch table)"
+                    );
+                    "runtime-dispatch"
+                }
+                _ if pat.form == "jmp reg<-call" => {
+                    let _ = writeln!(o, "target: returned by the preceding call");
+                    "runtime-dispatch"
+                }
+                _ => c,
+            };
         }
         None if kind == "jmp" => {
             if let Some(t) = analysis.jump_tables.get(&site) {
@@ -398,7 +482,7 @@ mod tests {
     #[test]
     fn unbounded_loaded_table_reports_reason_defs_and_category() {
         let an = analyse(|a| {
-            a.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+            a.mov(rdx, qword_ptr(rsp + 0x8)).unwrap();
             a.mov(rax, qword_ptr(rdx + rax * 8)).unwrap();
             a.jmp(rax).unwrap();
         });
@@ -465,5 +549,10 @@ mod tests {
         assert_eq!(a.addr, 0x1_4000_10a0);
         assert!(a.return_address);
         assert!(parse_args(&["x.exe".into()]).is_err());
+        let m = parse_args(&["x.exe".into(), "0x10,0x20,0x30".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!((m.addr, m.more.as_slice()), (0x10, &[0x20, 0x30][..]));
+        assert!(parse_args(&["x.exe".into(), "0x10,zz".into()]).is_err());
     }
 }

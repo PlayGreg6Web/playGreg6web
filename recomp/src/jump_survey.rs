@@ -13,9 +13,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
-use iced_x86::{ConditionCode, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, Register};
 
 use crate::cfg::{Edge, Function, Terminator, UnresolvedJump};
+use crate::code_image::CodeImage;
 use crate::discover::Analysis;
 use crate::pe::Pe64;
 
@@ -318,15 +319,48 @@ impl JumpSurvey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Def {
-    Load { scale: u8, loc: String },
-    RelOffset { scale: u8, loc: String },
+    Load {
+        scale: u8,
+        loc: String,
+    },
+    RelOffset {
+        scale: u8,
+        loc: String,
+    },
     Anchor(u64),
+    /// Return value (or clobber) of a `call` in the window: the target comes from a function.
+    CallResult,
     LiveIn,
     Other,
 }
 
+/// Win64 volatile GPRs: a `call` returns in RAX and may clobber the others.
+pub(crate) fn is_win64_volatile(reg: Register) -> bool {
+    matches!(
+        reg.full_register(),
+        Register::RAX
+            | Register::RCX
+            | Register::RDX
+            | Register::R8
+            | Register::R9
+            | Register::R10
+            | Register::R11
+    )
+}
+
+/// Image bytes and function entries, used to read the leading entries of a constant table.
+#[derive(Clone, Copy)]
+pub(crate) struct TableProbe<'a> {
+    pub(crate) image: &'a CodeImage<'a>,
+    pub(crate) functions: &'a BTreeMap<u64, Function>,
+}
+
+/// Leading entries read to tell a function-pointer table from a switch table.
+const PROBE_ENTRIES: u64 = 4;
+
 pub(crate) struct Ctx<'a> {
     pub(crate) layout: &'a Layout,
+    pub(crate) probe: Option<TableProbe<'a>>,
 }
 
 impl Ctx<'_> {
@@ -373,6 +407,7 @@ impl Ctx<'_> {
             Def::Anchor(a) => format!("anchor:{}", self.section_label(a)),
             Def::Load { .. } => "loaded_pointer".into(),
             Def::RelOffset { .. } => "computed_pointer".into(),
+            Def::CallResult => "call_result".into(),
             Def::LiveIn => "live_in_reg".into(),
             Def::Other => "other_reg".into(),
         }
@@ -383,6 +418,15 @@ impl Ctx<'_> {
         let reg = reg.full_register();
         for idx in (0..upto).rev() {
             let i = ins[idx];
+            if matches!(
+                i.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall
+            ) {
+                if is_win64_volatile(reg) {
+                    return Def::CallResult;
+                }
+                continue;
+            }
             if matches!(
                 i.mnemonic(),
                 Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push | Mnemonic::Jmp | Mnemonic::Bt
@@ -437,6 +481,156 @@ impl Ctx<'_> {
             };
         }
         Def::LiveIn
+    }
+}
+
+/// What a scale-8 table read through a constant base holds, when that is not a switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointerTable {
+    /// Read-only table whose leading non-null entries are all discovered function entries: a
+    /// tail call through a function-pointer table (handler array). Its targets are functions,
+    /// which the run-time dispatcher already knows; a switch's targets are case labels.
+    Functions,
+    /// Table in a writable section: pointers stored at run time (callback arrays), never a
+    /// compiled switch table.
+    Writable,
+    /// Base loaded from object or global memory (`mov r, [obj]` then `[r+i*8+d]`): a vtable
+    /// slot or pointer array picked by an index. A compiled switch's table base is a constant
+    /// (`lea`), a non-volatile register holding one, or at most a stack spill of it.
+    Loaded,
+}
+
+impl Ctx<'_> {
+    /// Constant base VA of the 8-byte table read by the jump ending `ins` (`jmp [base+i*8+d]` or
+    /// `mov r, [base+i*8+d]; jmp r`, across register copies), when the base is a `lea` of a
+    /// fixed address.
+    fn table_base(&self, ins: &[&Instruction], at: usize, jmp: &Instruction) -> Option<u64> {
+        let (pos, read) = if jmp.op0_kind() == OpKind::Memory {
+            (at, jmp)
+        } else {
+            self.load_of(ins, at, jmp.op0_register())?
+        };
+        if read.memory_size().size() != 8
+            || read.memory_index() == Register::None
+            || read.memory_index_scale() != 8
+            || read.memory_base() == Register::None
+            || read.is_ip_rel_memory_operand()
+        {
+            return None;
+        }
+        match self.describe(ins, pos, read.memory_base(), MAX_DEPTH) {
+            Def::Anchor(a) => Some(a.wrapping_add(read.memory_displacement64())),
+            _ => None,
+        }
+    }
+
+    /// Whether the base register of the 8-byte table read by the jump ending `ins` was loaded
+    /// from non-stack memory (an object field, a vtable pointer or a global) in the window.
+    fn base_loaded_from_memory(&self, ins: &[&Instruction], at: usize, jmp: &Instruction) -> bool {
+        let (pos, read) = if jmp.op0_kind() == OpKind::Memory {
+            (at, jmp)
+        } else {
+            match self.load_of(ins, at, jmp.op0_register()) {
+                Some(found) => found,
+                None => return false,
+            }
+        };
+        if read.memory_index() == Register::None || read.memory_index_scale() != 8 {
+            return false;
+        }
+        let base = read.memory_base();
+        if base == Register::None || base == Register::RIP {
+            return false;
+        }
+        match self.load_of(ins, pos, base) {
+            Some((_, load)) => !matches!(
+                load.memory_base().full_register(),
+                Register::RSP | Register::RBP
+            ),
+            None => false,
+        }
+    }
+
+    /// The `mov reg, [mem]` defining `reg` before `ins[upto]`, following `mov` register copies.
+    fn load_of<'i>(
+        &self,
+        ins: &[&'i Instruction],
+        upto: usize,
+        reg: Register,
+    ) -> Option<(usize, &'i Instruction)> {
+        let mut reg = reg.full_register();
+        let mut before = upto;
+        for _ in 0..MAX_DEPTH {
+            let idx = (0..before).rev().find(|&idx| {
+                let i = ins[idx];
+                matches!(
+                    i.flow_control(),
+                    FlowControl::Call | FlowControl::IndirectCall
+                ) || (i.op_count() >= 1
+                    && i.op0_kind() == OpKind::Register
+                    && i.op0_register().full_register() == reg
+                    && !matches!(
+                        i.mnemonic(),
+                        Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Bt | Mnemonic::Push
+                    ))
+            })?;
+            let i = ins[idx];
+            if i.mnemonic() != Mnemonic::Mov || i.op_count() != 2 {
+                return None;
+            }
+            match i.op1_kind() {
+                OpKind::Register if i.op1_register().is_gpr64() => {
+                    reg = i.op1_register().full_register();
+                    before = idx;
+                }
+                OpKind::Memory if i.op0_register().is_gpr64() => return Some((idx, i)),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Classifies the table read by the jump ending `ins` as a function-pointer or run-time data
+    /// table; `None` keeps it a switch candidate (no probe, unknown base, or any leading entry
+    /// that is neither null nor a discovered function entry).
+    fn pointer_table(
+        &self,
+        ins: &[&Instruction],
+        at: usize,
+        jmp: &Instruction,
+    ) -> Option<PointerTable> {
+        if self.base_loaded_from_memory(ins, at, jmp) {
+            return Some(PointerTable::Loaded);
+        }
+        let probe = self.probe?;
+        let base = self.table_base(ins, at, jmp)?;
+        let rva = base.checked_sub(self.layout.image_base)?;
+        let (_, _, _, ch) = self
+            .layout
+            .sections
+            .iter()
+            .find(|(_, start, size, _)| rva >= *start && rva < start + size)?;
+        if ch & 0x8000_0000 != 0 {
+            return Some(PointerTable::Writable);
+        }
+        let mut functions = 0;
+        for n in 0..PROBE_ENTRIES {
+            let Some(bytes) = base
+                .checked_add(n * 8)
+                .and_then(|va| probe.image.bytes_at(va, 8))
+            else {
+                break;
+            };
+            let v = u64::from_le_bytes(bytes.try_into().ok()?);
+            if v == 0 {
+                continue;
+            }
+            if !probe.functions.contains_key(&v) {
+                return None;
+            }
+            functions += 1;
+        }
+        (functions > 0).then_some(PointerTable::Functions)
     }
 }
 
@@ -537,6 +731,7 @@ pub(crate) fn classify(ctx: &Ctx<'_>, reason: UnresolvedJump, ins: &[&Instructio
                 ("jmp reg<-base+offset", scale.to_string(), loc, scale > 0)
             }
             Def::Anchor(a) => ("jmp reg<-lea", "0".into(), ctx.section_label(a), false),
+            Def::CallResult => ("jmp reg<-call", "0".into(), "call_result".into(), false),
             Def::LiveIn => ("jmp reg<-live_in", "0".into(), "none".into(), false),
             Def::Other => ("jmp reg<-computed", "0".into(), "none".into(), false),
         };
@@ -545,9 +740,22 @@ pub(crate) fn classify(ctx: &Ctx<'_>, reason: UnresolvedJump, ins: &[&Instructio
         location = l;
         indexed = ix;
     }
-    let role = if indexed {
-        "switch"
-    } else if form.starts_with("jmp [") || form.contains("load") || form.contains("live_in") {
+    // Compiled switch tables are read with a scale of 4 (offsets) or 8 (pointers); `[reg+reg]`
+    // with scale 1/2 is pointer arithmetic on an object, not a table index.
+    let table_scale = matches!(scale.as_str(), "4" | "8");
+    let role = if indexed && table_scale {
+        match ctx.pointer_table(ins, at, jmp) {
+            Some(PointerTable::Functions) => "fn_table",
+            Some(PointerTable::Writable) => "data_table",
+            Some(PointerTable::Loaded) => "ptr_array",
+            None => "switch",
+        }
+    } else if indexed
+        || form.starts_with("jmp [")
+        || form.contains("load")
+        || form.contains("live_in")
+        || form.contains("call")
+    {
         "tail_call"
     } else {
         "computed"
@@ -607,7 +815,26 @@ fn window_with_merge<'a>(
 /// Builds the survey from a finished analysis. `roots` are the VAs the boot starts at;
 /// `top` bounds the number of listed locations.
 pub fn survey_jumps(layout: &Layout, analysis: &Analysis, roots: &[u64], top: usize) -> JumpSurvey {
-    let ctx = Ctx { layout };
+    survey_jumps_probed(layout, analysis, roots, top, None)
+}
+
+/// [`survey_jumps`] that also reads the leading entries of constant 8-byte tables from `image`
+/// to tell function-pointer tables (`fn_table`) and run-time data tables (`data_table`) apart
+/// from switch candidates.
+pub fn survey_jumps_probed(
+    layout: &Layout,
+    analysis: &Analysis,
+    roots: &[u64],
+    top: usize,
+    image: Option<&CodeImage<'_>>,
+) -> JumpSurvey {
+    let ctx = Ctx {
+        layout,
+        probe: image.map(|image| TableProbe {
+            image,
+            functions: &analysis.functions,
+        }),
+    };
     let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
     let mut succ: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
     for (entry, f) in &analysis.functions {
@@ -1075,6 +1302,14 @@ pub fn boot_roots(pe: &Pe64) -> Vec<u64> {
     v
 }
 
+/// Extra reachability roots from a boot's recorded indirect-call targets: a recorded target is code
+/// the boot actually ran, so everything it calls directly is boot-reachable too. Targets that are
+/// not function entries are ignored by [`survey_jumps`].
+pub fn recorded_roots(seeds: &crate::trace_seed::TraceSeeds) -> Vec<u64> {
+    let set: BTreeSet<u64> = seeds.pairs.iter().map(|p| p.target).collect();
+    set.into_iter().collect()
+}
+
 /// `survey-jumps <pe-path> [--top N] [--examples N] [--no-refine] [--json] [--switches-only] [--seed-targets <file>] [--out <file>]`.
 pub const USAGE: &str = "survey-jumps <pe-path> [--top N] [--examples N] [--no-refine] [--json] [--switches-only] [--seed-targets <file>] [--out <file>]";
 
@@ -1163,7 +1398,21 @@ pub fn run(args: &Args) -> Result<String, String> {
                 .map_err(|e| format!("failed to build the guest image: {e:?}"))?;
         crate::pipeline::refine::discover_refined(&mut seeded.image, &guest.image).0
     };
-    let full_survey = survey_jumps(&Layout::from_pe(&pe), &analysis, &boot_roots(&pe), args.top);
+    let seeds = match &args.seed_targets {
+        Some(path) => Some(crate::trace_seed::load(path)?),
+        None => None,
+    };
+    let mut roots = boot_roots(&pe);
+    if let Some(seeds) = &seeds {
+        roots.extend(recorded_roots(seeds));
+    }
+    let full_survey = survey_jumps_probed(
+        &Layout::from_pe(&pe),
+        &analysis,
+        &roots,
+        args.top,
+        Some(&seeded.image),
+    );
     let survey = if args.switches_only {
         full_survey.switches_only()
     } else {
@@ -1171,9 +1420,8 @@ pub fn run(args: &Args) -> Result<String, String> {
     };
 
     let module = crate::summary::sanitize_label(&args.pe_path.to_string_lossy());
-    let trace_data = if let Some(seed_path) = &args.seed_targets {
-        let seeds = crate::trace_seed::load(seed_path)?;
-        let outcome = crate::trace_seed::evaluate(&seeded.image, &analysis, &seeds);
+    let trace_data = if let Some(seeds) = &seeds {
+        let outcome = crate::trace_seed::evaluate(&seeded.image, &analysis, seeds);
         let diag = outcome.diagnostics();
         let correlated = crate::trace_seed::correlate_with_survey(&outcome, &survey);
         Some((diag, correlated))
@@ -1241,6 +1489,142 @@ mod tests {
         }
     }
 
+    /// Image with `.rdata` holding `rdata` (writable when `writable`), the jump's role probed.
+    fn probed_role(
+        build: impl FnOnce(&mut CodeAssembler),
+        rdata: Vec<u8>,
+        writable: bool,
+    ) -> &'static str {
+        let mut a = CodeAssembler::new(64).unwrap();
+        build(&mut a);
+        let code = a.assemble(TEXT).unwrap();
+        let text: &'static [u8] = Box::leak([code, vec![0xCC; 16]].concat().into_boxed_slice());
+        let rdata: &'static [u8] = Box::leak(rdata.into_boxed_slice());
+        let image = Box::leak(Box::new(CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, text, true),
+                CodeSection::new(BASE + 0x2000, rdata, false),
+            ],
+            vec![TEXT],
+        )));
+        let an = discover(image);
+        let mut l = layout();
+        if writable {
+            l.sections[1].3 |= 0x8000_0000;
+        }
+        let s = survey_jumps_probed(&l, &an, &[TEXT], 5, Some(image));
+        assert_eq!(s.total_unresolved, 1);
+        s.patterns[0].0.role
+    }
+
+    fn table_of(entries: &[u64]) -> Vec<u8> {
+        let mut v: Vec<u8> = entries.iter().flat_map(|e| e.to_le_bytes()).collect();
+        v.resize(0x100, 0);
+        v
+    }
+
+    fn lea_table_jump(a: &mut CodeAssembler) {
+        a.movsxd(rax, ecx).unwrap();
+        let lea = iced_x86::Instruction::with2(
+            iced_x86::Code::Lea_r64_m,
+            Register::RCX,
+            iced_x86::MemoryOperand::with_base_displ(Register::RIP, (BASE + 0x2000) as i64),
+        )
+        .unwrap();
+        a.add_instruction(lea).unwrap();
+        a.jmp(qword_ptr(rcx + rax * 8)).unwrap();
+    }
+
+    #[test]
+    fn read_only_table_of_function_entries_is_a_fn_table() {
+        assert_eq!(
+            probed_role(lea_table_jump, table_of(&[TEXT, 0, TEXT]), false),
+            "fn_table"
+        );
+    }
+
+    #[test]
+    fn read_only_table_of_case_labels_stays_a_switch() {
+        // An entry that is not a function entry (inside the function) keeps the switch label.
+        assert_eq!(
+            probed_role(lea_table_jump, table_of(&[TEXT + 4, TEXT]), false),
+            "switch"
+        );
+        // No probe: never reclassified.
+        let an = analyse(lea_table_jump);
+        assert_eq!(
+            survey_jumps(&layout(), &an, &[TEXT], 5).patterns[0].0.role,
+            "switch"
+        );
+    }
+
+    #[test]
+    fn writable_table_is_a_data_table() {
+        assert_eq!(
+            probed_role(lea_table_jump, table_of(&[]), true),
+            "data_table"
+        );
+    }
+
+    #[test]
+    fn index_into_a_loaded_vtable_is_a_pointer_array() {
+        let role = probed_role(
+            |a| {
+                a.mov(rdx, qword_ptr(rcx)).unwrap();
+                a.movzx(eax, al).unwrap();
+                a.jmp(qword_ptr(rdx + rax * 8 + 0x38)).unwrap();
+            },
+            table_of(&[]),
+            false,
+        );
+        assert_eq!(role, "ptr_array");
+    }
+
+    #[test]
+    fn unscaled_pointer_read_and_call_result_are_tail_calls() {
+        let an = analyse(|a| {
+            a.mov(rdx, qword_ptr(rcx)).unwrap();
+            a.jmp(qword_ptr(rdx + rax)).unwrap();
+        });
+        let s = survey_jumps(&layout(), &an, &[TEXT], 5);
+        assert_eq!(s.patterns[0].0.role, "tail_call");
+        let an = analyse(|a| {
+            a.sub(rsp, 0x28).unwrap();
+            a.call(TEXT + 0x40).unwrap();
+            a.add(rsp, 0x28).unwrap();
+            a.jmp(rax).unwrap();
+        });
+        let s = survey_jumps(&layout(), &an, &[TEXT], 5);
+        let p = &s
+            .patterns
+            .iter()
+            .find(|(p, _)| p.form == "jmp reg<-call")
+            .unwrap()
+            .0;
+        assert_eq!((p.role, p.location.as_str()), ("tail_call", "call_result"));
+    }
+
+    #[test]
+    fn recorded_targets_extend_boot_reachability() {
+        let an = analyse(|a| {
+            a.jmp(qword_ptr(rax + 0x10)).unwrap();
+        });
+        let seeds = crate::trace_seed::TraceSeeds {
+            pairs: vec![crate::trace_seed::TracePair {
+                site: 0x1234,
+                target: TEXT,
+            }],
+        };
+        let roots = recorded_roots(&seeds);
+        assert_eq!(roots, vec![TEXT]);
+        assert_eq!(survey_jumps(&layout(), &an, &[], 5).reachable_unresolved, 0);
+        assert_eq!(
+            survey_jumps(&layout(), &an, &roots, 5).reachable_unresolved,
+            1
+        );
+    }
+
     #[test]
     fn vtable_tail_call_is_grouped_as_tail_call() {
         let an = analyse(|a| {
@@ -1257,9 +1641,9 @@ mod tests {
     }
 
     #[test]
-    fn scaled_load_from_loaded_pointer_is_a_switch() {
+    fn scaled_load_from_spilled_pointer_is_a_switch() {
         let an = analyse(|a| {
-            a.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+            a.mov(rdx, qword_ptr(rsp + 0x8)).unwrap();
             a.mov(rax, qword_ptr(rdx + rax * 8)).unwrap();
             a.jmp(rax).unwrap();
         });
@@ -1548,10 +1932,10 @@ mod tests {
             let mut merge = a.create_label();
             a.test(ecx, ecx).unwrap();
             a.jz(alt).unwrap();
-            a.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+            a.mov(rdx, qword_ptr(rsp + 0x8)).unwrap();
             a.jmp(merge).unwrap();
             a.set_label(&mut alt).unwrap();
-            a.mov(rdx, qword_ptr(rcx + 0x10)).unwrap();
+            a.mov(rdx, qword_ptr(rsp + 0x10)).unwrap();
             a.set_label(&mut merge).unwrap();
             a.shr(rax, 2).unwrap();
             a.jmp(qword_ptr(rdx + rax * 8)).unwrap();
@@ -1615,7 +1999,7 @@ mod tests {
         }
 
         let b4 = assemble_at(fn4, |a| {
-            a.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+            a.mov(rdx, qword_ptr(rsp + 0x8)).unwrap();
             a.mov(rax, qword_ptr(rdx + rax * 8)).unwrap();
             a.jmp(rax).unwrap();
         });
@@ -1623,7 +2007,7 @@ mod tests {
         buf.resize((fn5 - TEXT) as usize, 0xCC);
 
         let b5 = assemble_at(fn5, |a| {
-            a.mov(rdx, qword_ptr(rcx + 0x10)).unwrap();
+            a.mov(rdx, qword_ptr(rsp + 0x10)).unwrap();
             a.shr(rax, 1).unwrap();
             a.jmp(qword_ptr(rdx + rax * 8)).unwrap();
         });

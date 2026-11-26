@@ -1075,7 +1075,7 @@ mod tests {
         let mut lbl_case = a1.create_label();
         a1.cmp(eax, 8).unwrap();
         a1.ja(lbl_case).unwrap();
-        a1.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+        a1.mov(rdx, qword_ptr(rsp + 0x8)).unwrap();
         a1.jmp(qword_ptr(rdx + rax * 8)).unwrap();
         a1.set_label(&mut lbl_case).unwrap();
         a1.nop().unwrap();
