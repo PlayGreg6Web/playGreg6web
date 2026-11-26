@@ -38,11 +38,26 @@ stale and opens the game window. Add `-FreshSetup` to see the setup screens agai
 | F12 | Save a screenshot (PNG) to `%LOCALAPPDATA%\playgta6\screenshots` |
 
 Rebind anything in `%LOCALAPPDATA%\playgta6\keymap.ini` (written on first run; see "Rebinding keys" below), or point at
-another file with `-Keymap <file>`. There is no mouse-release key yet.
+another file with `-Keymap <file>`.
+
+**Mouse look** (off by default): set `look = on` under `[mouse]` in `keymap.ini`. The window then captures the cursor
+(Raw Input, hidden and clipped) and the mouse drives the right stick. **F8** (`release_key`) releases or re-captures it
+by hand; a click in the window re-captures. Focus loss releases it automatically. Details in "Rebinding keys" below.
+A connected XInput pad also gets the game's rumble.
+
+**Screenshots:** F12 saves the presented frame as a PNG; `--screenshot-at` does it at a chosen time in scripted runs.
+
+**Saves tools:** `python tools/saves.py list|export|import` lists native saves or moves them as a zip (format in
+[SAVE_ZIP_FORMAT.md](SAVE_ZIP_FORMAT.md)); native saves live in `%LOCALAPPDATA%\playgta6\saves`, so pass
+`--root` to point it there. `python tools/disk_report.py` is a read-only report of what `pg6*` dirs and `work/` use
+(it never deletes).
 
 **Useful switches:** `-PresentMode auto|fifo|mailbox|immediate`, `-MaxFps N` (cap the window present rate, 0 = off),
 `-Record` (save your real input to `%LOCALAPPDATA%\playgta6\recordings\`), `-Keymap <file>`, `-FreshSetup`, `-NoBuild`,
 `-DryRun`, `-Name <run name>`.
+
+**Ray tracing** is wired in the runtime (residency, BVH helper, fault readback) but stays off until the translator
+emits RT shaders ([RAYTRACING_DESIGN.md](RAYTRACING_DESIGN.md)).
 
 **What to expect today.** Setup screens, loading, then the Bink videos. After about 110 s the game stops at the
 device-ID owner decision (`XSystemGetAppSpecificDeviceId`, see [HARD_STOPS.md](HARD_STOPS.md)). The window stays open

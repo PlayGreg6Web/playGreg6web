@@ -15,14 +15,18 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
   under `work/` is picked and printed; the std pack is picked automatically). Flags: `-MaxMs`, `-SaveDir`,
   `-InputScript`, `-NoBuild`, `-DryRun`.
 - Controls: keyboard and the first XInput pad; the key table is in [PLAY_LOCALLY.md](PLAY_LOCALLY.md)
-  (Enter/Space = A, Backspace = B, WASD = left stick, arrows = D-pad, Esc = Menu). F11 toggles fullscreen.
+  (Enter/Space = A, Backspace = B, WASD = left stick, arrows = D-pad, Esc = Menu). F11 toggles fullscreen, F12 saves a PNG screenshot (#1827).
+- Mouse look is opt-in: `keymap.ini` `[mouse] look = on` captures the cursor via Raw Input; F8 releases it, a click
+  re-captures (#1828). Also: key rebinding via `keymap.ini` (#1822), `-PresentMode`/`-MaxFps` (#1812), `-Record`
+  (#1801), rumble forwarded to the XInput pad (#1809).
 - The window scales per monitor DPI, keeps a minimum size, restores its last size and position, and the frame
   is letterboxed into it (#1736, #1739). Timer resolution is raised and `[live]` fps telemetry is printed (#1743).
 - A persistent Dawn blob cache makes later starts faster (#1750). A live-mode stall is fixed (#1733).
 - Window title shows `fps | frame | draws/frame`. Close the window or press Ctrl+C to stop.
 - At a guest fault the window stays open on the last frame, titled `GUEST FAULT ...`, and the console prints
   the `fault_report.py` output right away. Close the window to finish the report.
-- Saves persist under `%LOCALAPPDATA%\playgta6\saves`.
+- Saves persist under `%LOCALAPPDATA%\playgta6\saves`; `tools/saves.py` exports/imports them as a zip (#1811).
+- Stability: concurrent-decommit faults in GPU buffer hashing and flush are fixed (#1817, #1818).
 - `-Update` (native and browser scripts) fast-forwards the checkout to `origin/main` when it has no uncommitted tracked changes; otherwise it says why and continues. Every start warns when behind `origin/main`.
 
 ## Play in the browser
@@ -54,6 +58,12 @@ brief recommends, and both are still pending:
 
 Further open items: `XUserGetTokenAndSignatureResult` (slot 25) offline HRESULT, the long-term HRESULT of
 `XStoreAcquireLicenseForDurables` (slots 71/72), and the other XStore licence slots (20/21/22/65/68).
+
+## Ray tracing
+
+Runtime pieces are merged (residency of BVH/address sources, fault readback, WGSL helper with CPU twin;
+#1802, #1808, #1815, #1823) but RT stays **off** until the translator emits RT shaders. See
+[RAYTRACING_DESIGN.md](RAYTRACING_DESIGN.md).
 
 ## Speed today
 
