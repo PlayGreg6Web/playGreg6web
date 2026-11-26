@@ -72,6 +72,34 @@ def stamp(repo: Path, dest: Path, shader_pack: Path | None = None) -> None:
     (dest / MANIFEST).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def stream_pack_problem(pack: Path) -> str | None:
+    """Why `pack` cannot be served for `?streamShaders=1` (a WGPK v2 file with a `.reflect.json` sidecar), else None."""
+    if not pack.is_file():
+        return f"{pack} does not exist"
+    try:
+        with open(pack, "rb") as f:
+            magic, version, _count, _flags = struct.unpack("<4sIII", f.read(16))
+    except (OSError, struct.error):
+        return f"{pack} is not readable as a WGPK pack"
+    if magic != b"WGPK" or version != 2:
+        return f"{pack} is not a WGPK v2 pack (version {version})"
+    if not Path(str(pack) + ".reflect.json").is_file():
+        return f"{pack}.reflect.json (reflection sidecar) is missing"
+    return None
+
+
+def resolve_stream_pack(explicit: str | None, env_value: str | None) -> Path | None:
+    """The full pack to stream: `explicit` (must be valid, else SystemExit), else `env_value` when valid, else None."""
+    if explicit:
+        problem = stream_pack_problem(Path(explicit))
+        if problem:
+            raise SystemExit(f"-StreamShaders: {problem}")
+        return Path(explicit)
+    if env_value and stream_pack_problem(Path(env_value)) is None:
+        return Path(env_value)
+    return None
+
+
 def info(prebuilt: Path, repo: Path | None) -> str:
     manifest = prebuilt / MANIFEST
     if not manifest.is_file():
@@ -123,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("info")
     a.add_argument("--prebuilt", type=Path, required=True)
     a.add_argument("--repo", type=Path)
+    a = sub.add_parser("stream-pack")
+    a.add_argument("--explicit", default=None)
+    a.add_argument("--env", default=None)
     a = sub.add_parser("swap")
     a.add_argument("--new", type=Path, required=True)
     a.add_argument("--target", type=Path, required=True)
@@ -133,6 +164,9 @@ def main(argv: list[str] | None = None) -> int:
         stamp(args.repo, args.dest, args.shader_pack)
     elif args.cmd == "info":
         print(info(args.prebuilt, args.repo))
+    elif args.cmd == "stream-pack":
+        found = resolve_stream_pack(args.explicit, args.env)
+        print(found if found else "")
     else:
         swap(args.new, args.target)
     return 0

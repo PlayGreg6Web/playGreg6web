@@ -134,6 +134,13 @@ the previous object cache, so refreshes are incremental. `tools/run_browser_boot
 `tools/subset_wgsl_pack.py`: same stages, WGPK v1 (the web preloader reads v1 only and holds the pack in memory), per-shader cap
 256 KiB, total cap 1.6 GB, stages of `PLAYGTA6_SHADER_PACK` kept first, plus the filtered `.reflect.json`. An explicit `-ShaderPack` wins.
 A browser pack built only from `pack-rdna2 --max-wgsl-bytes` can miss shaders the title uses after the terms (black loading screen with a spinner).
+**Full shader pack (default for `-Prebuilt`).** When `$env:PLAYGTA6_NATIVE_SHADER_PACK` names a WGPK **v2** std pack with its
+`.reflect.json` sidecar, `-Prebuilt` serves that whole pack (no 256 KiB cap, all stages) instead of the staged v1 subset and opens the page with
+`?streamShaders=1`: the worker reads the v2 TOC and fetches shaders on demand with HTTP `Range` (the local server `server/serve_local.py` answers 206).
+The pack is hard-linked (else copied) into its own `build/staged-shaders-stream/` so `/shaders/` holds only that pack. `-StreamPack <file>` picks another
+pack, `-StreamShaders` forces it without `-Prebuilt` (stage dir `work/staged-shaders-stream`), `-NoStreamShaders` forces the v1 subset; an explicit
+`-ShaderPack` also wins. A missing/v1 pack or missing sidecar silently falls back to the subset (an explicit `-StreamPack` errors instead).
+`.	ools\play_local.ps1 -Prebuilt -Exe ... -GameDir ...` is all you need.
 Each run gets a unique name (`play-local-YYYYMMDD-HHMMSS`, override with `-Name`), so reruns never collide.
 
 ## Troubleshooting: stuck on loading artwork

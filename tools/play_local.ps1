@@ -7,6 +7,7 @@
 .NOTES
   Stop: close the Chrome window or press Ctrl+C here; the server stops with this script.
   -Prebuilt: play the build made by tools/update_prebuilt.ps1 -Web (dir: -PrebuiltDir, else $env:PLAYGTA6_PREBUILT_WEB_DIR, else %LOCALAPPDATA%\playgta6\prebuilt-web; -BuildDir is ignored). Never builds (-TrustBuild semantics); prints its source commit and how far behind origin/main it is.
+  -StreamShaders [-StreamPack file]: serve the FULL std pack (WGPK v2 + .reflect.json; -StreamPack, else $env:PLAYGTA6_NATIVE_SHADER_PACK) with HTTP Range and open the page with ?streamShaders=1 (staged by hard link into a separate dir). With -Prebuilt this is the default when that pack exists; -NoStreamShaders forces the staged v1 subset.
   -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues). Every start warns when behind origin/main.
   See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
 #>
@@ -24,6 +25,9 @@ param(
     [switch]$NoBuild,
     [switch]$TrustBuild,
     [switch]$Prebuilt,
+    [switch]$StreamShaders,
+    [switch]$NoStreamShaders,
+    [string]$StreamPack = $env:PLAYGTA6_NATIVE_SHADER_PACK,
     [string]$PrebuiltDir = $env:PLAYGTA6_PREBUILT_WEB_DIR,
     [switch]$Update,
     [switch]$DryRun
@@ -40,10 +44,22 @@ if ($Prebuilt) {
     }
     $TrustBuild = $true
     & python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $PrebuiltDir --repo $repo
-    if (-not $ShaderPack) {
+    # Full std pack (WGPK v2) streamed with HTTP Range (?streamShaders=1); the staged v1 subset is the fallback.
+    if (-not $NoStreamShaders -and -not $ShaderPack -and -not $StreamShaders) {
+        $found = (& python (Join-Path $PSScriptRoot "prebuilt_web.py") stream-pack --env "$StreamPack") | Select-Object -Last 1
+        if ($found) { $StreamShaders = $true; $StreamPack = $found }
+    }
+    if (-not $ShaderPack -and -not $StreamShaders) {
         $staged = Get-ChildItem -LiteralPath (Join-Path $PrebuiltDir "build\staged-shaders") -Filter *.pack -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($staged) { $ShaderPack = $staged.FullName }
     }
+}
+if ($StreamShaders -and $NoStreamShaders) { throw "-StreamShaders and -NoStreamShaders are exclusive." }
+if ($StreamShaders) {
+    if (-not $StreamPack) { throw "-StreamShaders needs a v2 pack: pass -StreamPack <file> or set PLAYGTA6_NATIVE_SHADER_PACK." }
+    $ShaderPack = (& python (Join-Path $PSScriptRoot "prebuilt_web.py") stream-pack --explicit "$StreamPack") | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0 -or -not $ShaderPack) { throw "-StreamShaders: no usable WGPK v2 pack ($StreamPack)." }
+    Write-Host "Streaming the full shader pack $ShaderPack (WGPK v2, HTTP Range, ?streamShaders=1)."
 }
 if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
 if (-not $ShaderPack) {
@@ -70,6 +86,10 @@ $argv = @("tools/run_browser_boot.py", "--preset", "long", "--name", $Name, "--h
 if ($Chrome) { $argv += @("--chrome", $Chrome) }
 if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
 if ($InputScript -and $InputScript -ne "none") { $argv += @("--input-script", $InputScript) }
+if ($StreamShaders) {
+    $argv += @("--stream-shaders", "--shader-stage-dir", (Join-Path $repo "work\staged-shaders-stream"))
+    if ($Prebuilt) { $argv[$argv.IndexOf("--shader-stage-dir") + 1] = (Join-Path $PrebuiltDir "build\staged-shaders-stream") }
+}
 if ($Prebuilt) {
     $argv[$argv.IndexOf("--build-dir") + 1] = (Join-Path $PrebuiltDir "build")
     $argv += @("--boot-dir", (Join-Path $PrebuiltDir "boot"), "--out-dir", (Join-Path $PrebuiltDir "web\dist"), "--web-dir", (Join-Path $PrebuiltDir "web"))

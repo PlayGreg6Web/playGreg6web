@@ -8,7 +8,7 @@
         [--capture-frames [DIR]] [--capture-interval-sec SEC] [--mp4] [--mp4-fps FPS]
         [--mp4-skip-black] [--hide-hud] [--hold-until-visible auto|on|off]
         [--baseline NAME|DIR]
-        [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
+        [--input-script PRESET] [--shader-stage-dir DIR] [--stream-shaders] [--stream-threshold-mb MB]
         [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS] [--dump-pipelines]
         [--quiet-server] [--warm-boot-check] [--warm-duration-s N]
 
@@ -958,7 +958,14 @@ def stage_shader_pack(shader_pack: Path, stage_dir: Path) -> list[dict[str, Any]
             except OSError:
                 needs_copy = True
         if needs_copy:
-            atomic_copy_file(src, dst)
+            # Multi-GB std packs: hard-link when on the same volume (instant, no extra disk), else copy.
+            try:
+                tmp_link = dst.with_name(f".{dst.name}.lnk")
+                tmp_link.unlink(missing_ok=True)
+                os.link(src, tmp_link)
+                os.replace(tmp_link, dst)
+            except OSError:
+                atomic_copy_file(src, dst)
         staged.append({"kind": item["kind"], "name": item["name"], "copied": needs_copy})
     return staged
 
@@ -5496,6 +5503,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--shader-stage-dir",
+        type=Path,
+        default=None,
+        help="stage --shader-pack here instead of <build-dir>/staged-shaders (the server serves it at /shaders/; "
+        "use a separate dir for a full WGPK v2 pack so it is not mixed with another pack)",
+    )
+    p.add_argument(
         "--stream-shaders",
         action="store_true",
         help="append streamShaders=1 to the target URL to enable ranged WGSL pack streaming",
@@ -5661,7 +5675,9 @@ def _run(
         exe = resolve_against_repo(env["PLAYGTA6_EXE"], repo)
     game_dir = None if args.smoke else _resolve_game_dir(args, env, repo)
     shader_pack = resolve_against_repo(args.shader_pack, repo) if args.shader_pack else None
-    shader_stage_dir = build_dir / "staged-shaders"
+    shader_stage_dir = (
+        resolve_against_repo(args.shader_stage_dir, repo) if args.shader_stage_dir else build_dir / "staged-shaders"
+    )
 
     name = args.name or f"{'smoke' if args.smoke and args.preset == 'smoke' else args.preset}-{time.strftime('%Y%m%d-%H%M%S')}"
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
