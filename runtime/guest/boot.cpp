@@ -2434,8 +2434,7 @@ std::string build_report() {
         }
         o += ordered.empty() ? "]},\n" : "\n  ]},\n";
 
-        o += bink_json() + ",
-";
+        o += bink_json() + ",\n";
         o += "  \"survey\": {\"enabled\": " + std::string(b.survey ? "true" : "false") +
              ", \"unresolved_called\": [";
         for (size_t k = 0; k < b.survey_called.size(); ++k) {
