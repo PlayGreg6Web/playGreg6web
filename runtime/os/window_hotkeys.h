@@ -20,6 +20,7 @@ enum class Action : int {
     TargetLayer,     // --show-target: next array layer
     TargetPrev,      // --show-target: previous render target
     TargetNext,      // --show-target: next render target
+    Overlay,         // toggle the on-screen stats overlay
     Count
 };
 inline constexpr size_t kCount = static_cast<size_t>(Action::Count);
@@ -45,6 +46,7 @@ inline constexpr Info kTable[kCount] = {
     {Action::TargetLayer, "target_layer", "--show-target: next array layer", {0x77, true}},           // Ctrl+F8
     {Action::TargetPrev, "target_prev", "--show-target: previous render target", {0x78, true}},       // Ctrl+F9
     {Action::TargetNext, "target_next", "--show-target: next render target", {0x79, true}},           // Ctrl+F10
+    {Action::Overlay, "overlay", "toggle the on-screen stats overlay (fps, frame graph, fault)", {0x72, false}},  // F3
 };
 
 using Table = std::array<Chord, kCount>;

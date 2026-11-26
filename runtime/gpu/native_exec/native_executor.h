@@ -96,6 +96,9 @@ struct ExecutorOptions {
     // swapchain image. Read-only, the guest's frame is unchanged. Empty = off. With a window F7 / F8 / F9 /
     // F10 (mip, layer, previous, next target) take over; set_show_target changes it at run time.
     std::string show_target;
+    // On-screen stats overlay (overlay_model.h) at start; F3 toggles it in a window, set_overlay() at run time.
+    // Drawn after every copy of the guest's frame: digests and screenshots are unchanged.
+    bool overlay = false;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;
@@ -134,6 +137,7 @@ struct ExecutorStats {
     uint64_t surface_minimized_skips = 0;    // presents skipped because the client area was empty (minimized)
     uint64_t surface_acquire_retries = 0;    // acquires retried after Outdated / Lost / Error
     uint64_t window_actions = 0;             // --window-script actions applied
+    uint64_t overlay_frames = 0;             // presents / idle redraws that drew the stats overlay
     uint64_t probes = 0;                     // letterbox probes run
     uint64_t screenshots_saved = 0, screenshots_failed = 0;  // F12 / --screenshot-at PNGs written / failed
     uint64_t probes_failed = 0;              // ... whose bars were not black or whose picture was blank
@@ -298,6 +302,12 @@ public:
     bool window_focused() const;
     // Title bar text of the live window (no-op without one). Call from the pump thread.
     void set_window_title(const std::string& title);
+    // Stats overlay (F3): on / off, and the two things only the host knows: live-audio underruns (< 0: no audio) and
+    // the reason the guest stopped ("": running; non-empty is drawn in red and the last frame is redrawn with it).
+    // Call from the pump thread.
+    void set_overlay(bool on);
+    bool overlay_enabled() const;
+    void set_overlay_extra(int64_t audio_underruns, const std::string& fault);
     // --show-target at run time: selector grammar in show_target_model.h; "" switches it off. False + *error
     // for a selector that does not parse.
     bool set_show_target(const std::string& selector, std::string* error);

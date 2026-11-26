@@ -1830,6 +1830,72 @@ void test_show_target_read_only() {
     std::remove(paths[1]);
 }
 
+// The stats overlay (F3) is drawn after every copy of the guest's frame: the digest of a run with it on equals the
+// one without, the canvas shows the box top-left (a 65 % black over the red frame; it covers this tiny canvas), and
+// switching it off restores the plain frame.
+void test_overlay_read_only() {
+    const char* paths[2] = {"test_overlay_digest_a.txt", "test_overlay_digest_b.txt"};
+    for (int i = 0; i < 2; ++i) {
+        std::remove(paths[i]);
+        ExecutorOptions opts;
+        opts.width = kW;
+        opts.height = kH;
+        opts.frame_digest_path = paths[i];
+        opts.overlay = i == 1;
+        NativeExecutor::CreateStatus status;
+        std::string error;
+        auto ex = NativeExecutor::create(opts, &status, &error);
+        if (!ex) {
+            std::fprintf(stderr, "FAIL: overlay NativeExecutor::create: %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+        for (int f = 0; f < 3; ++f) {
+            gpu::CommandEncoder e;
+            e.begin_frame();
+            e.clear_color(1.0f, 0.0f, 0.0f, 1.0f);
+            e.present();
+            run(*ex, e);
+        }
+        FrameImage img;
+        std::string err;
+        CHECK(ex->read_last_frame(&img, &err));
+        if (img.pixels.size() >= 4) {
+            if (i == 1) {
+                CHECK(ex->overlay_enabled() && ex->stats().overlay_frames == 3);
+                CHECK(img.pixels[0] == 0 && img.pixels[1] == 0 && img.pixels[2] == 89 && img.pixels[3] == 255);  // bgra: red * 35 %
+            } else {
+                CHECK(!ex->overlay_enabled() && ex->stats().overlay_frames == 0);
+                CHECK(frame_is(*ex, {0, 0, 255, 255}));
+            }
+        }
+        if (i == 1) {
+            ex->set_overlay(false);
+            gpu::CommandEncoder e;
+            e.begin_frame();
+            e.clear_color(1.0f, 0.0f, 0.0f, 1.0f);
+            e.present();
+            run(*ex, e);
+            CHECK(frame_is(*ex, {0, 0, 255, 255}));
+        }
+        ex->wait_idle();
+    }
+    auto slurp = [](const char* p) {
+        std::FILE* f = std::fopen(p, "rb");
+        std::string s;
+        char buf[512];
+        size_t n;
+        while (f && (n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+        if (f) std::fclose(f);
+        return s;
+    };
+    const std::string a = slurp(paths[0]), b = slurp(paths[1]);
+    CHECK(!a.empty());
+    CHECK(b.compare(0, a.size(), a) == 0);  // the overlay run has the same digests (plus its extra off frame)
+    std::remove(paths[0]);
+    std::remove(paths[1]);
+}
+
 // A bad selector fails the creation.
 void test_show_target_bad_option() {
     ExecutorOptions opts;
@@ -1994,6 +2060,7 @@ int main() {
     test_depth_read_no_float32_filterable();
     test_show_target();
     test_show_target_read_only();
+    test_overlay_read_only();
     test_show_target_bad_option();
     test_async_pipelines_and_blob_cache();
     test_screenshot();

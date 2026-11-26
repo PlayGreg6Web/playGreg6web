@@ -37,6 +37,7 @@ stale and opens the game window. Add `-FreshSetup` to see the setup screens agai
 | F11 | Toggle borderless fullscreen |
 | F12 | Save a screenshot (PNG) to `%LOCALAPPDATA%\playgta6\screenshots` |
 | F8 | Release / re-capture the mouse-look cursor |
+| F3 | Stats overlay on / off (fps, frame-time graph, present mode, draws, GPU ms, audio underruns, fault text); `--overlay` starts with it on |
 | Ctrl+F7 / F8 / F9 / F10 | `--show-target` only: next mip / next layer / previous target / next target |
 
 These window hotkeys live in one table (`runtime/os/window_hotkeys.h`) and are rebindable in `keymap.ini` `[hotkeys]`
@@ -49,6 +50,8 @@ another file with `-Keymap <file>`.
 (Raw Input, hidden and clipped) and the mouse drives the right stick. **F8** (`release_key`) releases or re-captures it
 by hand; a click in the window re-captures. Focus loss releases it automatically. Details in "Rebinding keys" below.
 A connected XInput pad also gets the game's rumble.
+
+**Overlay:** F3 draws a small box top-left (fps and frame time, a graph of the last 120 frames, present mode, draws per frame, GPU ms when the adapter has timestamps, live-audio underruns). When the guest stops on a fault the box also shows the reason, so it is readable in fullscreen where the title bar is not. It is drawn after the game's frame is copied for `--live-digest` and screenshots, so those never contain it.
 
 **Screenshots:** F12 saves the presented frame as a PNG; `--screenshot-at` does it at a chosen time in scripted runs.
 
@@ -169,7 +172,7 @@ file given by `--keymap <file>` (`play_native.ps1 -Keymap`). Lines are `Key = ta
 and each key may appear once. `[mouse]` has `look = on|off` (real mouse movement drives the right stick),
 `sensitivity` (stick deflection per pixel per 8 ms poll, default 0.05), `invert_y` and `release_key` (default `F8`, same as `[hotkeys] mouse_release`).
 `[hotkeys]` rebinds the live window's own keys as `name = Key` or `name = Ctrl+Key`: `fullscreen` (F11), `screenshot` (F12),
-`mouse_release` (F8), `target_mip` / `target_layer` / `target_prev` / `target_next` (Ctrl+F7..F10). Two hotkeys cannot share
+`mouse_release` (F8), `overlay` (F3), `target_mip` / `target_layer` / `target_prev` / `target_next` (Ctrl+F7..F10). Two hotkeys cannot share
 a key and a plain hotkey cannot reuse a key bound in `[keys]`; either is a clear load error (`[hotkeys]: hotkeys 'a' and
 'b' are bound to the same key`).
 With mouse look on, the live window uses Win32 Raw Input (relative deltas, only while the window is focused) and

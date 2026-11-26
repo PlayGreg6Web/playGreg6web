@@ -29,6 +29,8 @@ public:
     virtual void set_title(const std::string&) {}
     // True once after the screenshot hotkey (F12) was pressed (consumed by the call). Callable from any thread. Default: never.
     virtual bool take_screenshot_request() { return false; }
+    // True once after the overlay hotkey (F3) was pressed (consumed by the call). Callable from any thread. Default: never.
+    virtual bool take_overlay_toggle() { return false; }
     // --show-target hotkeys: when enabled, the target_* hotkeys (default Ctrl+F7..F10, os/window_hotkeys.h) are swallowed and reported as bits
     // (show_target_model.h kHotkey*) by take_hotkeys(), which clears them. Window thread only.
     virtual void enable_hotkeys(bool) {}

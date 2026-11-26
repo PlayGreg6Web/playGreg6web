@@ -49,7 +49,7 @@ play_native.ps1: build (if stale) and play natively.
   Keys: WASD stick, Enter/Space A, Backspace B, Tab View, Esc Menu, F11 fullscreen, F12 screenshot (PNG).
   Mouse look: keymap.ini [mouse] look = on; F8 releases/re-captures the cursor, a click re-captures.
   Window hotkeys (rebind in keymap.ini [hotkeys]; duplicates are a load error): fullscreen F11, screenshot F12,
-  mouse_release F8; --show-target only: target_mip Ctrl+F7, target_layer Ctrl+F8, target_prev Ctrl+F9, target_next Ctrl+F10.
+  mouse_release F8, overlay F3; --show-target only: target_mip Ctrl+F7, target_layer Ctrl+F8, target_prev Ctrl+F9, target_next Ctrl+F10.
   Docs: docs/PLAY_LOCALLY.md
 "@ | Write-Host
     exit 0

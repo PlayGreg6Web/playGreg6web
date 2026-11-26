@@ -36,6 +36,7 @@
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
+#include "gpu/native_exec/overlay_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -1008,8 +1009,165 @@ struct NativeExecutor::Impl {
         ++stats.surface_configures;
     }
 
+    // With the overlay on in a window the frame always goes through the intermediate texture, so the last frame
+    // survives the present and can be redrawn with the overlay (fault text after the guest stopped).
     bool blit_active() const {
-        return stream_format != swap_format || stream_w != swap_width || stream_h != swap_height;
+        return stream_format != swap_format || stream_w != swap_width || stream_h != swap_height || (window && overlay_on);
+    }
+
+    // ---- stats overlay (overlay_model.h): drawn after every copy of the guest's frame, never read back ----
+    bool overlay_on = false;
+    bool overlay_dirty = false;
+    bool have_last_frame = false;  // the intermediate texture holds the last presented stream image
+    OverlayHistory ov_hist;
+    uint64_t ov_last_present_ns = 0, ov_last_draws = 0, ov_redraw_ns = 0, ov_gpu_sample_ns = 0;
+    uint64_t ov_gpu_frames = 0, ov_gpu_total_ns = 0;
+    double ov_gpu_ms = -1;
+    int64_t ov_underruns = -1;
+    std::string ov_fault;
+    wgpu::Texture ov_tex;
+    wgpu::TextureView ov_view;
+    uint32_t ov_tex_w = 0, ov_tex_h = 0;
+    wgpu::Sampler ov_sampler;
+    wgpu::RenderPipeline ov_pipeline;
+    wgpu::TextureFormat ov_pipeline_format = wgpu::TextureFormat::Undefined;
+    wgpu::BindGroup ov_bg;
+
+    OverlayStatus overlay_status() {
+        OverlayStatus s;
+        const uint64_t now = now_ns();
+        const size_t n = 30;
+        s.frame_ms = ov_hist.avg_ms(n);
+        const bool recent = ov_last_present_ns && now - ov_last_present_ns < 500000000ull && s.frame_ms > 0;
+        s.fps = recent ? 1000.0 / s.frame_ms : 0.0;
+        s.draws_per_frame = ov_hist.avg_draws(n);
+        if (time_table && now - ov_gpu_sample_ns >= 250000000ull) {
+            ov_gpu_sample_ns = now;
+            uint64_t fr = 0, ns = 0;
+            time_table->measured_totals(&fr, &ns);
+            if (fr > ov_gpu_frames) ov_gpu_ms = static_cast<double>(ns - ov_gpu_total_ns) / static_cast<double>(fr - ov_gpu_frames) / 1e6;
+            ov_gpu_frames = fr;
+            ov_gpu_total_ns = ns;
+        }
+        s.gpu_ms = ov_gpu_ms;
+        s.audio_underruns = ov_underruns;
+        s.present_mode = present_mode_name;
+        s.fault = ov_fault;
+        return s;
+    }
+
+    // Draws the box on top of the canvas (load, alpha blend). Nothing here touches the guest's frame.
+    void encode_overlay(wgpu::CommandEncoder& enc, const wgpu::TextureView& canvas_view) {
+        const OverlayBitmap bm = render_overlay(overlay_status(), ov_hist);
+        if (!ov_tex || ov_tex_w != bm.w || ov_tex_h != bm.h) {
+            wgpu::TextureDescriptor td{};
+            td.label = {"playgta6-overlay", WGPU_STRLEN};
+            td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+            td.dimension = wgpu::TextureDimension::e2D;
+            td.size = {bm.w, bm.h, 1};
+            td.format = wgpu::TextureFormat::RGBA8Unorm;
+            ov_tex = device.CreateTexture(&td);
+            ov_view = ov_tex.CreateView();
+            ov_tex_w = bm.w;
+            ov_tex_h = bm.h;
+            ov_bg = nullptr;
+        }
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = ov_tex;
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.bytesPerRow = bm.w * 4;
+        layout.rowsPerImage = bm.h;
+        const wgpu::Extent3D size{bm.w, bm.h, 1};
+        queue.WriteTexture(&dst, bm.rgba.data(), bm.rgba.size(), &layout, &size);
+        if (!blit_module) {
+            wgpu::ShaderSourceWGSL wgsl{};
+            wgsl.code = {kBlitWgsl, WGPU_STRLEN};
+            wgpu::ShaderModuleDescriptor md{};
+            md.nextInChain = &wgsl;
+            md.label = {"playgta6-swapchain-blit-wgsl", WGPU_STRLEN};
+            blit_module = device.CreateShaderModule(&md);
+        }
+        if (!ov_sampler) {
+            wgpu::SamplerDescriptor sd{};
+            sd.magFilter = wgpu::FilterMode::Nearest;
+            sd.minFilter = wgpu::FilterMode::Nearest;
+            ov_sampler = device.CreateSampler(&sd);
+        }
+        if (!ov_pipeline || ov_pipeline_format != swap_format) {
+            wgpu::BlendState blend{};  // premultiplied source: One / OneMinusSrcAlpha
+            blend.color = {wgpu::BlendOperation::Add, wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrcAlpha};
+            blend.alpha = {wgpu::BlendOperation::Add, wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrcAlpha};
+            wgpu::ColorTargetState ct{};
+            ct.format = swap_format;
+            ct.blend = &blend;
+            wgpu::FragmentState fs{};
+            fs.module = blit_module;
+            fs.entryPoint = {"fs_main", 7};
+            fs.targetCount = 1;
+            fs.targets = &ct;
+            wgpu::RenderPipelineDescriptor rd{};
+            rd.label = {"playgta6-overlay-pipeline", WGPU_STRLEN};
+            rd.vertex.module = blit_module;
+            rd.vertex.entryPoint = {"vs_main", 7};
+            rd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+            rd.primitive.cullMode = wgpu::CullMode::None;
+            rd.fragment = &fs;
+            ov_pipeline = device.CreateRenderPipeline(&rd);
+            ov_pipeline_format = swap_format;
+            ov_bg = nullptr;
+        }
+        if (!ov_bg) {
+            wgpu::BindGroupEntry e[2]{};
+            e[0].binding = 0;
+            e[0].textureView = ov_view;
+            e[1].binding = 1;
+            e[1].sampler = ov_sampler;
+            wgpu::BindGroupDescriptor bd{};
+            bd.label = {"playgta6-overlay-bg", WGPU_STRLEN};
+            bd.layout = ov_pipeline.GetBindGroupLayout(0);
+            bd.entryCount = 2;
+            bd.entries = e;
+            ov_bg = device.CreateBindGroup(&bd);
+        }
+        const uint32_t scale = overlay_scale(swap_height);
+        const uint32_t vw = std::min(bm.w * scale, swap_width), vh = std::min(bm.h * scale, swap_height);
+        if (!vw || !vh) return;
+        wgpu::RenderPassColorAttachment a{};
+        a.view = canvas_view;
+        a.loadOp = wgpu::LoadOp::Load;
+        a.storeOp = wgpu::StoreOp::Store;
+        wgpu::RenderPassDescriptor rp{};
+        rp.label = {"playgta6-overlay-pass", WGPU_STRLEN};
+        rp.colorAttachmentCount = 1;
+        rp.colorAttachments = &a;
+        wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+        pass.SetViewport(0.0f, 0.0f, static_cast<float>(bm.w * scale), static_cast<float>(bm.h * scale), 0.0f, 1.0f);
+        pass.SetScissorRect(0, 0, vw, vh);
+        pass.SetPipeline(ov_pipeline);
+        pass.SetBindGroup(0, ov_bg);
+        pass.Draw(3);
+        pass.End();
+        ++stats.overlay_frames;
+    }
+
+    // poll(): with the guest not presenting (stopped on a fault, loading) the last frame is redrawn from the
+    // intermediate texture when the overlay was toggled, the fault text changed, or every 250 ms for a resize.
+    void overlay_idle_redraw() {
+        if (!window || !surface || lost || fatal || show_spec || !have_last_frame || !intermediate || frame_target) return;
+        const uint64_t now = now_ns();
+        const bool due = overlay_dirty || (overlay_on && now - ov_last_present_ns > 250000000ull &&
+                                           now - ov_redraw_ns > 250000000ull);
+        if (!due) return;
+        overlay_dirty = false;
+        ov_redraw_ns = now;
+        FrameTarget t;
+        if (!acquire_canvas(&t)) return;
+        wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+        encode_blit(enc, t.canvas_view);
+        if (overlay_on) encode_overlay(enc, t.canvas_view);
+        wgpu::CommandBuffer cb = enc.Finish();
+        queue.Submit(1, &cb);
+        surface.Present();
     }
 
     void ensure_intermediate() {
@@ -1017,6 +1175,7 @@ struct NativeExecutor::Impl {
             intermediate_h == stream_h)
             return;
         if (intermediate) intermediate.Destroy();  // before the new allocation, like the worker (no VRAM leak)
+        have_last_frame = false;
         blit_bind_group = nullptr;
         wgpu::TextureDescriptor td{};
         td.label = {"playgta6-swapchain-intermediate", WGPU_STRLEN};
@@ -1495,6 +1654,14 @@ struct NativeExecutor::Impl {
         blit_pipeline = nullptr;
         blit_pipeline_format = wgpu::TextureFormat::Undefined;
         blit_bind_group = nullptr;
+        have_last_frame = false;
+        ov_tex = nullptr;
+        ov_view = nullptr;
+        ov_tex_w = ov_tex_h = 0;
+        ov_sampler = nullptr;
+        ov_pipeline = nullptr;
+        ov_pipeline_format = wgpu::TextureFormat::Undefined;
+        ov_bg = nullptr;
         timer_slots.clear();
         time_ring.reset();
         if (surface && surface_configured) surface.Unconfigure();
@@ -4850,6 +5017,7 @@ struct NativeExecutor::Impl {
                 e.enc.CopyTextureToBuffer(&src, &dst, &extent);
             }
         }
+        if (overlay_on) encode_overlay(e.enc, target.canvas_view);  // after every copy of the guest's frame
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
         const uint64_t tp1 = now_ns();
@@ -4862,6 +5030,13 @@ struct NativeExecutor::Impl {
         if (probe_buf) run_probe(probe_buf, probe_row, probe_w, probe_h, probe_rect, target.blit);
         ++frame_count;
         ++stats.frames_submitted;
+        {
+            const uint64_t pn = now_ns();
+            if (ov_last_present_ns) ov_hist.push(static_cast<double>(pn - ov_last_present_ns) / 1e6, static_cast<uint32_t>(stats.draws - ov_last_draws));
+            ov_last_present_ns = pn;
+            ov_last_draws = stats.draws;
+            have_last_frame = target.blit;
+        }
         const uint64_t tp2 = now_ns();
         stats.ns_present_submit += tp2 - tp1;
         if (surface) surface.Present();
@@ -5095,6 +5270,7 @@ std::unique_ptr<NativeExecutor> NativeExecutor::create(const ExecutorOptions& op
     if (!error) error = &local_error;
     auto impl = std::make_unique<Impl>();
     impl->options = options;
+    impl->overlay_on = options.overlay;
     if (!impl->init(status, error)) return nullptr;
     std::unique_ptr<NativeExecutor> ex(new NativeExecutor(std::move(impl)));
     if (!options.show_target.empty() && !ex->set_show_target(options.show_target, error)) {
@@ -5168,9 +5344,28 @@ bool NativeExecutor::poll() {
     const bool open = impl_->window ? impl_->window->pump() : true;
     if (impl_->window && impl_->show_spec) impl_->show_hotkeys(impl_->window->take_hotkeys());
     impl_->run_window_script();
+    if (impl_->window && impl_->window->take_overlay_toggle()) set_overlay(!impl_->overlay_on);
+    impl_->overlay_idle_redraw();
     impl_->shot_title_tick();
     impl_->stats.ns_poll += Impl::now_ns() - t0;
     return open;
+}
+
+void NativeExecutor::set_overlay(bool on) {
+    if (impl_->overlay_on == on) return;
+    impl_->overlay_on = on;
+    impl_->overlay_dirty = true;
+}
+
+bool NativeExecutor::overlay_enabled() const { return impl_->overlay_on; }
+
+void NativeExecutor::set_overlay_extra(int64_t audio_underruns, const std::string& fault) {
+    Impl& s = *impl_;
+    s.ov_underruns = audio_underruns;
+    if (fault != s.ov_fault) {
+        s.ov_fault = fault;
+        s.overlay_dirty = true;
+    }
 }
 
 void NativeExecutor::set_window_title(const std::string& title) {
@@ -5304,6 +5499,7 @@ std::string NativeExecutor::stats_json() const {
     num("surface_acquire_retries", st.surface_acquire_retries);
     num("window_actions", st.window_actions);
     num("probes", st.probes);
+    num("overlay_frames", st.overlay_frames);
     num("screenshots_saved", impl_->shot_saved);
     num("screenshots_failed", impl_->shot_failed);
     num("probes_failed", st.probes_failed);

@@ -83,6 +83,12 @@ void GpuTimeTable::note_measured_frame(uint64_t gpu_ns) {
     frame_ns_ += gpu_ns;
 }
 
+void GpuTimeTable::measured_totals(uint64_t* frames, uint64_t* gpu_ns) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    *frames = frames_measured_;
+    *gpu_ns = frame_ns_;
+}
+
 void GpuTimeTable::reset() {
     std::lock_guard<std::mutex> lock(mu_);
     support_ = Support::Unknown;

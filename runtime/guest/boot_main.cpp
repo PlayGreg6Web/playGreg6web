@@ -58,6 +58,7 @@
 //   --screenshot-at N[,N...]  with --window: save those present indices (0-based) as PNG; F12 saves the current frame
 //                to %LOCALAPPDATA%\playgta6\screenshots
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
+//   --overlay            (with --window) start with the on-screen stats overlay on (F3 toggles it, rebindable [hotkeys] overlay; gpu/native_exec/overlay_model.h)
 //   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; Ctrl+F7 mip, Ctrl+F8 layer, Ctrl+F9/F10 target, rebindable in keymap.ini [hotkeys]; gpu/native_exec/show_target_model.h)
 //   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
 //   --live-executor [--window-size WxH]  the same live path as --window (LivePump + native executor, the guest's GPU stream,
@@ -250,6 +251,7 @@ struct Options {
     bool live_executor = false;     // --live-executor: --window's live path into the offscreen swapchain (no window)
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     std::string show_target;        // --show-target <selector>
+    bool overlay = false;           // --overlay: start with the stats overlay on (F3 toggles)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
     uint32_t max_fps = 0;           // --max-fps: host-side present cap (0 = off)
@@ -359,6 +361,8 @@ bool parse(int argc, char** argv, Options& o) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return false;
             }
+        } else if (a == "--overlay") {
+            o.overlay = true;
         } else if (a == "--show-target" && i + 1 < argc) {
             o.show_target = argv[++i];
             playgta6::gpu::native_exec::ShowTargetSpec spec;
@@ -824,6 +828,10 @@ void start_profile() {}
 void finish_profile() {}
 #endif
 
+playgta6::os::audio_out::Feed g_audio_feed;
+playgta6::os::audio_out::Wasapi g_audio_wasapi;
+bool g_audio_out_active = false;  // device opened and feeding
+std::string g_audio_out_error;
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 namespace ne = playgta6::gpu::native_exec;
 ne::LivePump<ne::NativeExecutor> g_live;
@@ -835,6 +843,7 @@ std::string g_live_final_stats = "null";  // the executor's stats_json, captured
 std::atomic<bool> g_live_deadline_active{false};
 std::atomic<bool> g_live_stats_active{false};  // the 5 s [live] fps line thread  // the --max-ms watcher thread of a live run
 std::atomic<bool> g_guest_faulted{false};  // set before the window is held open on a fault
+std::string g_fault_text;                  // one-line fault summary for the overlay, written before g_guest_faulted
 
 // Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
 // of the newest interval, and the fault state.
@@ -878,6 +887,9 @@ void live_title_tick(ne::NativeExecutor& exec) {
                       last.fps, static_cast<unsigned long long>(st.present_packets), last.draws_per_frame, mode.empty() ? "?" : mode.c_str(), g_options.max_fps);
     }
     exec.set_window_title(buf);
+    // Overlay extras (F3): live-audio underruns and why the guest stopped.
+    exec.set_overlay_extra(g_audio_out_active ? static_cast<int64_t>(g_audio_feed.buffer().stats().underruns) : -1,
+                           g_guest_faulted.load() ? g_fault_text : std::string());
 }
 
 void live_observer(const uint8_t* data, size_t len) {
@@ -904,6 +916,7 @@ bool start_live_window() {
     options.present_height = g_options.window_height;
     options.present_mode = g_options.present_mode;
     options.show_target = g_options.show_target;
+    options.overlay = g_options.overlay;
     options.max_fps = g_options.max_fps;
     options.screenshot_at = g_options.screenshot_at;
     // Persistent Dawn blob cache per title / Dawn build / adapter (repeat runs skip the DXC and driver
@@ -1026,8 +1039,9 @@ bool start_live_window() {
 // A guest fault must not close the window at once: write the report now (the launcher prints the
 // fault report from it), flip the title to the fault state and keep the last frame up until the
 // user closes the window (or the watchdog fires).
-void hold_window_on_fault(bool faulted) {
+void hold_window_on_fault(bool faulted, const std::string& summary) {
     if (!faulted || !g_live_started || !g_options.window || g_live.window_closed()) return;
+    g_fault_text = summary.substr(0, summary.find('\n'));
     write_text(g_options.report, guest::last_report_json());
     std::fprintf(stderr, "[harness] guest fault: window kept open on the last frame; close it to exit\n");
     std::fflush(stderr);
@@ -1059,10 +1073,6 @@ void stop_live_window() {
 
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
 playgta6::os::audio_wav_dump::Writer g_audio_dump;
-playgta6::os::audio_out::Feed g_audio_feed;
-playgta6::os::audio_out::Wasapi g_audio_wasapi;
-bool g_audio_out_active = false;  // device opened and feeding
-std::string g_audio_out_error;
 
 // --audio-dump and --audio-out share the single stereo sink slot.
 void audio_fanout_sink(void*, const float* stereo, uint32_t frames, uint32_t sample_rate) {
@@ -1418,7 +1428,7 @@ void run_boot_thread() {
     cfg.guest_thread_started = &profile_thread_started;
     const guest::BootResult result = guest::run_boot(cfg);
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
-    hold_window_on_fault(result.status == guest::BootStatus::Fault);
+    hold_window_on_fault(result.status == guest::BootStatus::Fault, result.summary);
     stop_live_window();
 #endif
     playgta6::os::gdk::gamesave::flush_all();  // exit: nothing the title saved stays only in cache

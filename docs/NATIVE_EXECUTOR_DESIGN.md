@@ -247,6 +247,23 @@ playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gp
   counted, nothing lost), byte bound and oversized batch, close unblocking a blocked submitter,
   focus forwarding, creation failure, stop draining.
 
+## On-screen overlay (F3)
+
+An optional stats box for the live window, because the title bar is not visible in fullscreen. Toggle with the
+`overlay` hotkey (default F3, `runtime/os/window_hotkeys.h`, rebindable in `keymap.ini` `[hotkeys]`), start with it on
+via `playgta6_boot --overlay` / `ExecutorOptions::overlay`, switch at run time with `NativeExecutor::set_overlay()`.
+Content: fps and frame time, a graph of the last 120 frames (green, orange above 20 ms, red above 33 ms, 50 ms at the
+top), present mode, draws per frame, GPU ms per frame (gpu_time table; "N/A" without `timestamp-query`), audio
+underruns (host feed, `set_overlay_extra`) and, once the guest stopped, `STOPPED: <summary>` in red.
+
+It is digest-neutral by construction: `present()` encodes the digest copy, the screenshot copy and the probe copy
+first and the overlay pass last (blend over the canvas, premultiplied, nearest-scaled 1x/2x/3x by canvas height), and
+nothing reads the canvas after it. With the overlay on in a window the frame always goes through the intermediate
+texture, so after a fault (no more presents) `poll()` redraws the kept last frame with the fault text. The font
+(5x7, ASCII, own glyph table), history, text and the CPU twin of the composite are `gpu/native_exec/overlay_model.h`
+(`tests/test_overlay_model.cpp`); `test_native_executor` checks that digests are identical with the overlay on and the
+box is on the canvas.
+
 ## Present any target: `--show-target`
 
 A read-only diagnostic for black or garbled screens: instead of the swapchain image the window (or the

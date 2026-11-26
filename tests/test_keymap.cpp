@@ -138,6 +138,9 @@ int main() {
         CHECK(at(m, wh::Action::TargetMip) == (wh::Chord{0x76, true}));
         CHECK(at(m, wh::Action::TargetNext) == (wh::Chord{0x79, true}));
         CHECK(at(m, wh::Action::MouseRelease) == (wh::Chord{0x77, false}));
+        CHECK(at(m, wh::Action::Overlay) == (wh::Chord{0x72, false}));  // F3
+        CHECK(parse("[hotkeys]\noverlay = F4\n", m, e) && at(m, wh::Action::Overlay).vk == 0x73);
+        CHECK(!parse("[hotkeys]\noverlay = F12\n", m, e));  // duplicate of screenshot
         CHECK(parse("[hotkeys]\nscreenshot = F9\ntarget_mip = ctrl+G\n", m, e));
         CHECK(at(m, wh::Action::Screenshot).vk == 0x78 && !at(m, wh::Action::Screenshot).ctrl);
         CHECK(at(m, wh::Action::TargetMip) == (wh::Chord{'G', true}));

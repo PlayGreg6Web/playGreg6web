@@ -45,6 +45,8 @@ public:
     void note_skipped_frame();
     void note_skipped_passes(uint64_t n);
     void note_measured_frame(uint64_t gpu_ns);
+    // Frames measured so far and their summed GPU time (the overlay averages the difference of two samples).
+    void measured_totals(uint64_t* frames, uint64_t* gpu_ns) const;
     void reset();
     size_t tracked() const;
     // Top n keys by total time.

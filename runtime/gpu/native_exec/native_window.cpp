@@ -181,6 +181,7 @@ public:
     }
     bool closed() const override { return closed_; }
     bool take_screenshot_request() override { return shot_request_.exchange(false); }
+    bool take_overlay_toggle() override { return overlay_request_.exchange(false); }
     void set_title(const std::string& title) override {
         if (!hwnd_ || closed_) return;
         const int n = MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, nullptr, 0);
@@ -352,6 +353,10 @@ private:
                 self->shot_request_ = true;  // the executor saves the next presented frame
                 return 0;
             }
+            if (wh::matches(wh::Action::Overlay, vk, ctrl)) {
+                self->overlay_request_ = true;  // the executor toggles the overlay
+                return 0;
+            }
             if (self->hotkeys_on_) {
                 const uint32_t bit = wh::matches(wh::Action::TargetMip, vk, ctrl)     ? 1u
                                      : wh::matches(wh::Action::TargetLayer, vk, ctrl) ? 2u
@@ -454,6 +459,7 @@ private:
     bool start_maximized_ = false;
     bool focus_ = false;
     std::atomic<bool> shot_request_{false};
+    std::atomic<bool> overlay_request_{false};
     bool hotkeys_on_ = false;
     uint32_t hotkeys_pending_ = 0;
     bool cursor_hidden_ = false;
