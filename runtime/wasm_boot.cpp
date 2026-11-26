@@ -1064,8 +1064,7 @@ extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_storage_take_changed(void) 
     joined.clear();
     for (const std::string& p : playgta6::os::gdk::gamesave::take_changed_paths()) {
         joined += p;
-        joined += '
-';
+        joined += '\n';
     }
     return joined.c_str();
 }
