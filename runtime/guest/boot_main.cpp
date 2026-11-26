@@ -952,6 +952,7 @@ void run_boot_thread() {
     cfg.off_thread_fault = &off_thread_fault;
     cfg.guest_thread_started = &profile_thread_started;
     const guest::BootResult result = guest::run_boot(cfg);
+    playgta6::os::gdk::gamesave::flush_all();  // exit: nothing the title saved stays only in cache
     if (!g_finishing.exchange(true)) {
         write_outputs(g_options.quiet);
     }

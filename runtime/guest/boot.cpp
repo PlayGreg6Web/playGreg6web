@@ -27,6 +27,7 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
+#include "os/xgamesave_local.h"
 #include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/shim_exports.h"
@@ -1277,6 +1278,8 @@ void boot_relaunch_grace(uint32_t grace_ms, void* /*user*/) {
 
 void boot_relaunch_prepare(void* /*user*/) {
     os::win32::run_relaunch_suspend_sequence(&boot_relaunch_invoke, nullptr, &boot_relaunch_grace, nullptr);
+    // Saves the title wrote during the suspend routines must be on disk before the process is replaced.
+    os::gdk::gamesave::flush_all();
 }
 
 // Guest return address of this thread's latest dispatched call (PG6_EVENT_TRACE callers).

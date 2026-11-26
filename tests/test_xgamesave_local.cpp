@@ -1,4 +1,4 @@
-// Synthetic tests of the local XGameSave store (O34): containers, blobs, atomic updates, deletes,
+﻿// Synthetic tests of the local XGameSave store (O34): containers, blobs, atomic updates, deletes,
 // quota, persistence across provider re-init and error codes.
 
 #include <cstdint>
@@ -175,7 +175,7 @@ void test_persistence_and_stale_temps(const fs::path& base) {
         CHECK(store.read_blob("Persist", "b", &out) == S_OK_HR && out == bytes("kept"));
     }
     gs::set_save_dir("");
-    CHECK(gs::save_dir() == "pg6-saves");
+    CHECK(gs::save_dir() == gs::default_save_dir());
 }
 
 void test_display_name(const fs::path& base) {
@@ -242,6 +242,33 @@ void test_crash_between_swap_steps(const fs::path& base) {
     }
 }
 
+// Save dir outside the run dir, "simulated exit" (everything dropped, flush) and a second start that
+// opens the same dir finds the first one's saves; the dirty signal lists the changed container.
+void test_save_dir_survives_restart(const fs::path& base) {
+    const std::string dir = (base / "persist").string();
+    gs::set_save_dir(dir);
+    CHECK(gs::save_dir() == dir);
+    const uint64_t gen0 = gs::storage_generation();
+    {
+        gs::Store store = gs::open_store("title-1");
+        CHECK(store.create_container("slot") == S_OK_HR);
+        CHECK(store.submit_update("slot", {{"data", bytes("saved")}}, {}) == S_OK_HR);
+    }
+    CHECK(gs::storage_dirty() && gs::storage_generation() > gen0);
+    const std::vector<std::string> changed = gs::take_changed_paths();
+    CHECK(!changed.empty());
+    CHECK(gs::take_changed_paths().empty());
+    gs::flush_all();  // exit / XLaunchNewGame
+    gs::set_save_dir("");  // process gone: the next start configures again
+    CHECK(!gs::save_dir().empty() && gs::save_dir() == gs::default_save_dir());
+    gs::set_save_dir(dir);
+    gs::Store second = gs::open_store("title-1");
+    std::vector<uint8_t> out;
+    CHECK(second.read_blob("slot", "data", &out) == S_OK_HR && out == bytes("saved"));
+    CHECK(count_temps(dir) == 0);
+    gs::set_save_dir("");
+}
+
 int main() {
     const fs::path base = fs::temp_directory_path() / "pg6_o34_store_test";
     fs::remove_all(base);
@@ -253,6 +280,7 @@ int main() {
     test_display_name(base);
     test_container_info(base);
     test_crash_between_swap_steps(base);
+    test_save_dir_survives_restart(base);
     fs::remove_all(base);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

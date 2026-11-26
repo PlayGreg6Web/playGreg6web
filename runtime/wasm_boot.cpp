@@ -19,6 +19,7 @@
 #include "os/os_shim.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
+#include "os/xgamesave_local.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
 
@@ -1046,4 +1047,26 @@ extern "C" PG6_WASM_BOOT_EXPORT int32_t playgta6_relaunch_requested(void) {
 
 extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_relaunch_args_ptr(void) {
     return playgta6::boot::g_relaunch_args.c_str();
+}
+
+// Browser storage contract (saves). The runtime writes saves below the save dir of the in-memory
+// filesystem; the host (web/) mirrors them to IndexedDB/OPFS. After any completed save write
+// playgta6_storage_generation() increases. The host polls it (or on visibilitychange/pagehide) and,
+// when it changed, calls playgta6_storage_take_changed() which returns the container directories
+// changed since the last take as '
+'-separated paths (clears the list; pointer valid until the next
+// call), then persists those trees; removed paths show up as paths that no longer exist.
+extern "C" PG6_WASM_BOOT_EXPORT uint64_t playgta6_storage_generation(void) {
+    return playgta6::os::gdk::gamesave::storage_generation();
+}
+
+extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_storage_take_changed(void) {
+    static std::string joined;
+    joined.clear();
+    for (const std::string& p : playgta6::os::gdk::gamesave::take_changed_paths()) {
+        joined += p;
+        joined += '
+';
+    }
+    return joined.c_str();
 }

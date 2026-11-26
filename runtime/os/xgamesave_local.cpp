@@ -6,8 +6,19 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace playgta6::os::gdk::gamesave {
 
@@ -16,9 +27,41 @@ namespace fs = std::filesystem;
 namespace {
 
 std::mutex g_mutex;  // one operation at a time: updates are short and rare
-std::string g_save_dir = "pg6-saves";
+std::string g_save_dir;  // "" = default_save_dir()
+std::set<std::string> g_changed;  // paths changed since the host last took them (browser persistence)
+std::atomic<uint64_t> g_dirty_generation{0};
 std::atomic<uint64_t> g_temp_counter{0};
 std::atomic<int> g_crash_point{0};
+
+// Flushes a file's data to stable storage (best effort; false when it could not be opened).
+bool sync_path(const fs::path& p, bool directory) {
+#if defined(_WIN32)
+    if (directory) {
+        return true;  // NTFS journals renames; directories cannot be flushed through the Win32 file API
+    }
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const bool ok = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    return ok;
+#else
+    const int fd = ::open(p.c_str(), directory ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
+
+void mark_changed(const fs::path& p) {
+    g_changed.insert(p.generic_string());
+    g_dirty_generation.fetch_add(1);
+}
 
 constexpr size_t kMaxEncodedChars = 240;  // keeps "c-"/"b-" + name inside a path component
 
@@ -190,12 +233,57 @@ bool valid_blob_name(const std::string& name) {
 
 void set_save_dir(const std::string& dir) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_save_dir = dir.empty() ? "pg6-saves" : dir;
+    g_save_dir = dir;
+}
+
+std::string default_save_dir() {
+#if defined(__EMSCRIPTEN__)
+    return "pg6-saves";
+#else
+    std::string base;
+#if defined(_WIN32)
+    if (const char* v = std::getenv("LOCALAPPDATA")) base = v;
+#elif defined(__APPLE__)
+    if (const char* v = std::getenv("HOME")) base = std::string(v) + "/Library/Application Support";
+#else
+    if (const char* v = std::getenv("XDG_DATA_HOME")) {
+        base = v;
+    } else if (const char* h = std::getenv("HOME")) {
+        base = std::string(h) + "/.local/share";
+    }
+#endif
+    if (base.empty()) {
+        return "pg6-saves";
+    }
+    return (fs::path(base) / "playgta6web" / "saves").string();
+#endif
 }
 
 std::string save_dir() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_save_dir;
+    return g_save_dir.empty() ? default_save_dir() : g_save_dir;
+}
+
+void flush_all() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const fs::path root = g_save_dir.empty() ? fs::path(default_save_dir()) : fs::path(g_save_dir);
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        const bool dir = it->is_directory(ec);
+        if (dir || it->is_regular_file(ec)) {
+            sync_path(it->path(), dir);
+        }
+    }
+}
+
+bool storage_dirty() { return g_dirty_generation.load() != 0; }
+uint64_t storage_generation() { return g_dirty_generation.load(); }
+
+std::vector<std::string> take_changed_paths() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::vector<std::string> out(g_changed.begin(), g_changed.end());
+    g_changed.clear();
+    return out;
 }
 
 Store::Store(const std::string& root, uint64_t quota_bytes) : root_(root), quota_(quota_bytes) {
@@ -224,6 +312,7 @@ HResult Store::create_container(const std::string& name) {
         return E_FAIL_HR;
     }
     remove_stale_temps(path);
+    mark_changed(path);
     return S_OK_HR;
 }
 
@@ -238,6 +327,9 @@ HResult Store::delete_container(const std::string& name) {
         return S_OK_HR;  // deleting a container that is not there succeeds
     }
     fs::remove_all(path, ec);
+    if (!ec) {
+        mark_changed(path);
+    }
     return ec ? E_FAIL_HR : S_OK_HR;
 }
 
@@ -416,6 +508,7 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
                 ok = static_cast<bool>(out);
             }
         }
+        ok = ok && sync_path(blob_path(fresh, w.name), false);
         if (!ok) {
             return fail();
         }
@@ -441,7 +534,10 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
         fs::rename(aside, dir, undo);
         return fail();
     }
+    sync_path(dir, true);
+    sync_path(fs::path(root_), true);
     fs::remove_all(aside, ec);
+    mark_changed(dir);
     return S_OK_HR;
 }
 
@@ -466,6 +562,10 @@ HResult Store::set_display_name(const std::string& container, const std::string&
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         out.write(display_name.data(), static_cast<std::streamsize>(display_name.size()));
         out.flush();
+        if (out) {
+            out.close();
+            sync_path(temp, false);
+        }
         if (!out) {
             out.close();
             fs::remove(temp, ec);
@@ -477,6 +577,8 @@ HResult Store::set_display_name(const std::string& container, const std::string&
         fs::remove(temp, ec);
         return E_FAIL_HR;
     }
+    sync_path(dir / kDisplayNameFile, false);
+    mark_changed(dir);
     return S_OK_HR;
 }
 
