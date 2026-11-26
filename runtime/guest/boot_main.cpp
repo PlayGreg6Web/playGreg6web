@@ -1102,8 +1102,7 @@ int main(int argc, char** argv) {
             }
             o += ", \"drops_by_program\": " + dg::drop_table().by_program_json();
             o += "}";
-            o += ",
-  \"gpu_drop_table\": " + dg::drop_table().detail_json();
+            o += ",\n  \"gpu_drop_table\": " + dg::drop_table().detail_json();
             {
                 namespace ar = os::audio_report;
                 const os::scarlett::guest_api::AudioEndpointStats a = os::scarlett::guest_api::audio_endpoint_stats();
