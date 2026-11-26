@@ -3,7 +3,7 @@
 // Pipeline dump (G37): local files for the shader track, written while the title runs.
 //
 // Off unless DeviceOptions::dump_dir is set (boot harness: --dump-pipelines <dir>, which must lie
-// under a `work` directory). The files are derived from the running title, like captures: keep
+// outside a repository checkout, or under a `work` directory). The files are derived from the running title, like captures: keep
 // them out of the repository.
 //
 // Layout of <dir>:

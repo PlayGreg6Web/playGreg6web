@@ -751,7 +751,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "title's recorded targets, see PLAYGTA6_INDIRECT_TARGETS)")
     p.add_argument("--no-record-targets", action="store_true",
                    help="do not record the indirect-call targets this run dispatches")
-    p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory under work/)")
+    p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory outside the repo, or under work/)")
     p.add_argument("--audio-dump", help="harness --audio-dump: WAV file of the stereo mix")
     p.add_argument("--baseline", help="earlier run (name in the runs directory, or a directory) to compare with")
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")

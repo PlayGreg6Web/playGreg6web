@@ -202,7 +202,7 @@ struct Options {
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
     uint64_t profile_start_ms = 0;        // --profile-start-ms: sample only from this time on (a screen's window)
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
-    std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
+    std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
@@ -234,7 +234,7 @@ void usage() {
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
-                 "                     [--dump-pipelines <dir under work/>]\n"
+                 "                     [--dump-pipelines <dir outside the repo, or under work/>]\n"
                  "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
@@ -1090,15 +1090,21 @@ int main(int argc, char** argv) {
         device_options.bridge.features = static_cast<uint32_t>(g_options.wgpu_features & gpu::pso::WgpuFeature::All);
         std::fprintf(stderr, "[harness] WebGPU features 0x%x\n", device_options.bridge.features);
         if (!g_options.dump_pipelines.empty()) {
-            // The dump is derived from the title: only under a `work` directory (gitignored).
+            // The dump is derived from the title: any directory, but never inside a repository
+            // checkout (an ancestor holding `.git`) unless it sits under a gitignored `work` dir.
             std::error_code ec;
             const std::filesystem::path dir = std::filesystem::absolute(g_options.dump_pipelines, ec);
             bool under_work = false;
             for (const auto& part : dir) {
                 under_work = under_work || part == "work";
             }
-            if (ec || !under_work) {
-                std::fprintf(stderr, "[harness] --dump-pipelines must name a directory under a `work` directory\n");
+            bool in_repo = false;
+            for (std::filesystem::path p = dir; !ec && !in_repo && p.has_relative_path(); p = p.parent_path()) {
+                in_repo = std::filesystem::exists(p / ".git", ec);
+            }
+            if (ec || (in_repo && !under_work)) {
+                std::fprintf(stderr, "[harness] --dump-pipelines must not name a directory inside a repository checkout (use a path outside it, or under a `work` directory)
+");
                 return kExitUsage;
             }
             device_options.dump_dir = dir.string();

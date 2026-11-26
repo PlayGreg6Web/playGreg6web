@@ -1188,7 +1188,7 @@ class SidecarTests(unittest.TestCase):
         bad_packs: list[tuple[str, bytes]] = [
             ("truncated_header", b"WGPK\x01\x00"),
             ("bad_magic", sidecar.WGPK_HEADER_STRUCT.pack(b"NOPE", 1, 0, 0)),
-            ("unsupported_version", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 2, 0, 0)),
+            ("unsupported_version", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 3, 0, 0)),
             ("truncated_toc", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)),
             ("toc_u32_overflow", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 0x10000000, 0)),
             (
@@ -1785,6 +1785,31 @@ class SidecarTests(unittest.TestCase):
                 rc = sidecar.main([str(empty), "--out", str(merged), "--merge-existing", str(bad)])
             self.assertEqual(rc, 1)
             self.assertIn("malformed unresolved source", stderr.getvalue())
+
+
+class WgpkV2Tests(unittest.TestCase):
+    def _v2_pack(self, entries):
+        import inspect_wgsl_pack as w
+        return w.build_wgpk(list(entries), version=2)
+
+    def test_v2_toc_parses_and_verifies(self):
+        raw = self._v2_pack([(1, "vertex", b"// a"), (2, "compute", b"// bb")])
+        toc = sidecar.parse_wgpk_toc_bytes(raw)
+        self.assertEqual([(e["hash"], e["stage"], e["length"]) for e in toc],
+                         [("0x0000000000000001", "vertex", 4), ("0x0000000000000002", "compute", 5)])
+        res = sidecar.verify_sidecar_against_pack(toc, {"0x0000000000000001": {"stage": "vertex"}})
+        self.assertEqual(res["matched_hashes"], 1)
+
+    def test_v2_load_from_disk(self):
+        with tempfile.TemporaryDirectory() as t:
+            pack = Path(t) / "p.wgsl.pack"
+            pack.write_bytes(self._v2_pack([(1, "vertex", b"// a")]))
+            self.assertEqual(sidecar.load_wgpk_toc(pack)[0]["hash"], "0x0000000000000001")
+
+    def test_v2_bounds_checked(self):
+        raw = self._v2_pack([(1, "vertex", b"// a")])
+        with self.assertRaises(ValueError):
+            sidecar.parse_wgpk_toc_bytes(raw[:-2])
 
 
 if __name__ == "__main__":

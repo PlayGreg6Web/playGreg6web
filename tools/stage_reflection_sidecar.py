@@ -59,7 +59,11 @@ WGPK_HEADER_STRUCT = struct.Struct("<4sIII")
 WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
 WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
 WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes
+WGPK_VERSION_V2 = 2
+WGPK_ENTRY_STRUCT_V2 = struct.Struct("<QB3sIQ")  # hash, stage, reserved, length, offset (u64)
+WGPK_ENTRY_BYTES_V2 = WGPK_ENTRY_STRUCT_V2.size  # 24 bytes
 WGPK_U32_MAX = 0xFFFFFFFF
+WGPK_U64_MAX = 0xFFFFFFFFFFFFFFFF
 WGPK_STAGE_NAMES: dict[int, str] = {
     1: "vertex",
     2: "fragment",
@@ -363,53 +367,65 @@ def _normalize_hash_key(key: str) -> str:
     return key
 
 
-def _validate_wgpk_header(header: bytes | bytearray | memoryview, total_len: int) -> tuple[int, int]:
-    """Validate a 16-byte WGPK v1 header against total_len; returns (entry_count, data_start)."""
+def _wgpk_entry_bytes(version: int) -> int:
+    return WGPK_ENTRY_BYTES_V2 if version == WGPK_VERSION_V2 else WGPK_ENTRY_BYTES
+
+
+def _validate_wgpk_header(
+    header: bytes | bytearray | memoryview, total_len: int
+) -> tuple[int, int, int]:
+    """Validate a 16-byte WGPK (v1 or v2) header against total_len; returns (version, entry_count, data_start)."""
     if total_len < WGPK_HEADER_BYTES or len(header) < WGPK_HEADER_BYTES:
         raise ValueError(
             f"WGPK pack truncated: {total_len} bytes (minimum header size: {WGPK_HEADER_BYTES})"
         )
-    if total_len > WGPK_U32_MAX:
-        raise ValueError(f"WGPK pack size {total_len} exceeds u32 max ({WGPK_U32_MAX})")
     magic, version, entry_count, _flags = WGPK_HEADER_STRUCT.unpack_from(header, 0)
     if magic != WGPK_MAGIC:
         magic_hex = " ".join(f"0x{b:02x}" for b in magic)
         raise ValueError(f"invalid WGPK pack magic [{magic_hex}] (expected 'WGPK')")
-    if version != WGPK_VERSION:
-        raise ValueError(f"unsupported WGPK pack version {version} (expected {WGPK_VERSION})")
-    table_bytes = entry_count * WGPK_ENTRY_BYTES
+    if version not in (WGPK_VERSION, WGPK_VERSION_V2):
+        raise ValueError(f"unsupported WGPK pack version {version} (expected {WGPK_VERSION} or {WGPK_VERSION_V2})")
+    if version == WGPK_VERSION and total_len > WGPK_U32_MAX:
+        raise ValueError(f"WGPK pack size {total_len} exceeds u32 max ({WGPK_U32_MAX})")
+    table_bytes = entry_count * _wgpk_entry_bytes(version)
     data_start = WGPK_HEADER_BYTES + table_bytes
-    if data_start > WGPK_U32_MAX:
+    if version == WGPK_VERSION and data_start > WGPK_U32_MAX:
         raise ValueError(f"WGPK entry table size overflows u32 for {entry_count} entries")
     if total_len < data_start:
         raise ValueError(
             f"WGPK pack truncated: {total_len} bytes "
             f"(header + {entry_count} entries require {data_start} bytes)"
         )
-    return entry_count, data_start
+    return version, entry_count, data_start
 
 
 def _parse_wgpk_toc_entries(
     toc_bytes: bytes | bytearray | memoryview,
     *,
+    version: int = WGPK_VERSION,
     entry_count: int,
     data_start: int,
     total_len: int,
 ) -> list[dict[str, Any]]:
-    """Decode and bounds-check all WGPK v1 TOC records."""
+    """Decode and bounds-check all WGPK TOC records (v1: 20-byte, v2: 24-byte with a u64 offset)."""
     entries: list[dict[str, Any]] = []
     seen_hashes: dict[int, int] = {}
     spans: list[tuple[int, int, int]] = []
+    entry_bytes = _wgpk_entry_bytes(version)
+    limit = WGPK_U64_MAX if version == WGPK_VERSION_V2 else WGPK_U32_MAX
 
     for idx in range(entry_count):
-        base = idx * WGPK_ENTRY_BYTES
-        hash_int, stage_code, _reserved, offset, length = WGPK_ENTRY_STRUCT.unpack_from(toc_bytes, base)
+        base = idx * entry_bytes
+        if version == WGPK_VERSION_V2:
+            hash_int, stage_code, _reserved, length, offset = WGPK_ENTRY_STRUCT_V2.unpack_from(toc_bytes, base)
+        else:
+            hash_int, stage_code, _reserved, offset, length = WGPK_ENTRY_STRUCT.unpack_from(toc_bytes, base)
         stage = WGPK_STAGE_NAMES.get(stage_code)
         if stage is None:
             raise ValueError(f"invalid WGPK shader stage code {stage_code} at entry {idx} (expected 1..3)")
         end = offset + length
-        if end > WGPK_U32_MAX:
-            raise ValueError(f"WGPK entry {idx} payload [{offset}..+{length}] overflows u32")
+        if end > limit:
+            raise ValueError(f"WGPK entry {idx} payload [{offset}..+{length}] overflows u{64 if limit == WGPK_U64_MAX else 32}")
         if offset < data_start:
             raise ValueError(
                 f"WGPK entry {idx} payload offset {offset} overlaps header/TOC (data_start={data_start})"
@@ -449,9 +465,10 @@ def parse_wgpk_toc_bytes(data: bytes | bytearray | memoryview) -> list[dict[str,
     """Parse and bounds-check a WGPK v1 header and TOC from an in-memory buffer."""
     view = memoryview(data)
     total_len = len(view)
-    entry_count, data_start = _validate_wgpk_header(view, total_len)
+    version, entry_count, data_start = _validate_wgpk_header(view, total_len)
     return _parse_wgpk_toc_entries(
         view[WGPK_HEADER_BYTES:data_start],
+        version=version,
         entry_count=entry_count,
         data_start=data_start,
         total_len=total_len,
@@ -475,7 +492,7 @@ def load_wgpk_toc(path: Path) -> list[dict[str, Any]]:
                 )
             f.seek(0)
             header = f.read(WGPK_HEADER_BYTES)
-            entry_count, data_start = _validate_wgpk_header(header, total_len)
+            version, entry_count, data_start = _validate_wgpk_header(header, total_len)
             table_bytes = data_start - WGPK_HEADER_BYTES
             toc_bytes = f.read(table_bytes)
             if len(toc_bytes) < table_bytes:
@@ -487,6 +504,7 @@ def load_wgpk_toc(path: Path) -> list[dict[str, Any]]:
         raise ValueError(f"failed to read WGPK pack {label}: {reason}") from None
     return _parse_wgpk_toc_entries(
         toc_bytes,
+        version=version,
         entry_count=entry_count,
         data_start=data_start,
         total_len=total_len,
