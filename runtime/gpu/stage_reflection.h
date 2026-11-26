@@ -194,6 +194,8 @@ struct StageReflection {
     // six) or by bindings {"group": 3, "binding": 16..21, "source": {"rt_arena": true}}; those
     // bindings are runtime-owned and are not joined to the root signature.
     uint32_t rt_arena_mask = 0;
+    // C2 "address_sources" (rt_residency.h): which root params / constants hold guest addresses.
+    std::vector<rt_residency::AddressSource> address_sources;
 };
 
 // Pack key (stage identity) -> reflection.

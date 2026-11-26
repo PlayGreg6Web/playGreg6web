@@ -329,6 +329,33 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
     if (get_bool(s, "rt_arena")) {
         out->rt_arena_mask = 0x3fu;
     }
+    if (const Json* srcs = s.get("address_sources"); srcs != nullptr) {
+        if (srcs->type != Json::Type::Array) {
+            *error = "address_sources must be an array";
+            return false;
+        }
+        for (const Json& e : srcs->array) {
+            rt_residency::AddressSource a;
+            const Json* kind = e.get("kind");
+            if (kind == nullptr || kind->type != Json::Type::String || !get_u32(e, "index", &a.index)) {
+                *error = "an address source needs a string kind and a numeric index";
+                return false;
+            }
+            if (kind->string == "root_param") a.kind = rt_residency::SourceKind::RootParam;
+            else if (kind->string == "root_constants") a.kind = rt_residency::SourceKind::RootConstants;
+            else if (kind->string == "user_data") a.kind = rt_residency::SourceKind::UserData;
+            else {
+                *error = "unknown address source kind \"" + kind->string + "\"";
+                return false;
+            }
+            get_u32(e, "dword", &a.dword, false);
+            if (const Json* x = e.get("extent"); x != nullptr && x->type == Json::Type::Number && x->number >= 1) {
+                a.extent = static_cast<uint64_t>(x->number);
+            }
+            a.bvh_root = get_bool(e, "bvh_root");
+            out->address_sources.push_back(a);
+        }
+    }
     if (const Json* inputs = s.get("vertex_inputs"); inputs != nullptr && inputs->type == Json::Type::Array) {
         for (const Json& in : inputs->array) {
             ReflectedVertexInput v;
@@ -866,6 +893,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     std::map<std::pair<uint32_t, uint32_t>, JoinedBinding> joined;
     uint64_t lane_indexed = 0;
     bool rt_arena = false;
+    std::vector<rt_residency::AddressSource> rt_sources;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -882,6 +910,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         if (st.reflection->rt_arena_mask != 0) {
             rt_arena = true;
         }
+        rt_sources.insert(rt_sources.end(), st.reflection->address_sources.begin(), st.reflection->address_sources.end());
         for (const ReflectedBinding& b : st.reflection->bindings) {
             bridge::LayoutBinding lb;
             lb.entry.binding = b.binding;
@@ -1309,6 +1338,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
             return false;
         }
         layout.rt_arena = true;
+        layout.rt_address_sources = std::move(rt_sources);
     }
     *out = std::move(layout);
     if (stats != nullptr) {

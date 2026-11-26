@@ -56,6 +56,7 @@
 #include "gpu/indirect_clamp_batch.h"
 #include "gpu/pso_cache.h"
 #include "gpu/rt_arena.h"
+#include "gpu/rt_residency.h"
 
 namespace playgta6::gpu {
 struct PrewarmPipelineDesc;  // prewarm_pipeline_desc.h
@@ -222,6 +223,9 @@ struct PipelineLayoutDesc {
     // RT-class stage (reflection asked for the arena bindings): the runtime appends its own group 3
     // (rt_arena bindings 16-21) after the padded groups. Refused when `groups` has more than three.
     bool rt_arena = false;
+    // Reflection `address_sources` of the RT stage (rt_residency.h): which root params / constants hold
+    // guest addresses; the bridge plans residency from them before each dispatch.
+    std::vector<rt_residency::AddressSource> rt_address_sources;
 };
 
 // =====================================================================================================
@@ -432,6 +436,8 @@ public:
     ~StateBridgeDevice() override;
     // The guest changed or released memory the RT arena may hold (no-ops without an arena).
     void rt_mark_cpu_dirty(uint64_t addr, uint64_t size);
+    // Guest memory read through BridgeOptions::rt_page_reader (address-source planning, BVH walks).
+    bool rt_read_guest(uint64_t addr, void* dst, size_t bytes) const;
     void rt_mark_cpu_remapped(uint64_t addr, uint64_t size);
     // The arena's counters as the boot report's "rt" block ("{}" before the first RT-class dispatch).
     std::string rt_report_json();
@@ -588,6 +594,7 @@ private:
         bool emitted = false;
         bool emitted_by_prewarm = false;
         bool rt_arena = false;  // group 3 is the runtime's arena group (rt_arena bindings 16-21)
+        std::vector<rt_residency::AddressSource> rt_address_sources;
     };
 
     // Zero-alloc deterministic POD keys for hot-path hash maps (G81).
@@ -776,8 +783,16 @@ private:
     // stats buffers on first use, the page uploads, the directory update, and the group's bind group
     // on first use. Returns the bind group for group 3, or 0 when the dispatch must be skipped
     // (counted per reason in the arena's counters).
+    // With `sources` (the stage's address_sources, resolved through `inputs`) the order is: consume the
+    // previous fault readback (pages the GPU missed become resident), plan from the sources, ensure,
+    // then the uploads above; structures the CPU cannot walk skip the dispatch (structures_unavailable).
     uint32_t rt_prepare_dispatch(const GroupLayoutRecord& group, const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
-                                 CommandEncoder& encoder);
+                                 CommandEncoder& encoder, const std::vector<rt_residency::AddressSource>* sources = nullptr,
+                                 const rt_residency::DispatchInputs* inputs = nullptr);
+    // After an RT dispatch: when no fault readback is in flight, fills `payload` with a ReadbackBuffer of
+    // the first words of pg6_rt_stats into device-owned staging (non-blocking; the next prepare consumes
+    // it once the consumer's completion counter moved). False: nothing to issue.
+    bool rt_fault_readback_begin(GpuReadbackBufferPayload* payload, uint32_t* stats_buffer_id);
     // G66 mesh pipelines: `base` (at most kMeshOutputGroup groups) padded with empty groups and
     // followed by the runtime-owned output group (binding 0, `visibility`, `binding_type`); null
     // when `base` has more groups.
@@ -882,6 +897,14 @@ private:
     uint32_t rt_buffers_[rt_arena::kArenaCount] = {};
     uint32_t rt_dir_buffer_ = 0;
     uint32_t rt_stats_buffer_ = 0;
+    // Fault readback (rt_residency::FaultTracker): staging the consumer writes, its completion counter.
+    rt_residency::FaultTracker rt_faults_;
+    std::unique_ptr<uint32_t[]> rt_fault_words_;
+    std::atomic<uint32_t> rt_fault_done_{0};
+    uint32_t rt_fault_issued_ = 0;
+    uint32_t rt_fault_consumed_ = 0;
+    bool rt_fault_zero_pending_ = false;
+    uint64_t rt_plans_ = 0, rt_unresolved_ = 0, rt_structures_ = 0, rt_bad_headers_ = 0;
     std::unordered_map<uint32_t, uint32_t, SplitMix32Hash> rt_groups_;  // runtime group layout id -> bind group
 
     mutable std::mutex bridges_mutex_;

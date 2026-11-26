@@ -1134,7 +1134,7 @@ void test_rt_arena_bindings() {
         {"group": 3, "binding": 20, "kind": "read_only_storage", "source": {"rt_arena": true}},
         {"group": 3, "binding": 21, "kind": "storage", "source": {"rt_arena": true}},
         {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 4, "root_constants": true}}]},
-      "0x7b": {"stage": "compute", "rt_arena": true, "bindings": []},
+      "0x7b": {"stage": "compute", "rt_arena": true, "bindings": [], "address_sources": [{"kind": "root_param", "index": 3, "extent": 4096}, {"kind": "root_constants", "index": 0, "dword": 2, "bvh_root": true}]},
       "0x7c": {"stage": "compute", "bindings": []}}})";
     StageReflectionIndex index;
     std::string error;
@@ -1142,6 +1142,11 @@ void test_rt_arena_bindings() {
     CHECK(index.at(0x7a).rt_arena_mask == ((1u << 0) | (1u << 4) | (1u << 5)));
     CHECK(index.at(0x7a).bindings.size() == 1);  // the arena bindings are runtime-owned
     CHECK(index.at(0x7b).rt_arena_mask == 0x3f && index.at(0x7c).rt_arena_mask == 0);
+    {
+        const auto& a = index.at(0x7b).address_sources;
+        CHECK(a.size() == 2 && a[0].index == 3 && a[0].extent == 4096 && !a[0].bvh_root);
+        CHECK(a[1].dword == 2 && a[1].bvh_root && index.at(0x7a).address_sources.empty());
+    }
 
     d3d::RootSignatureDesc rs;
     d3d::RootParameterDesc rc;

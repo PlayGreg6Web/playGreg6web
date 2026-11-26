@@ -1232,6 +1232,7 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
         record->content_hash = pl_hash;
         record->groups = std::move(groups);
         record->rt_arena = desc.rt_arena;
+        record->rt_address_sources = desc.rt_address_sources;
         layout = record.get();
         pipeline_layouts_by_hash_[pl_hash].push_back(layout);
         pipeline_layouts_.push_back(std::move(record));
@@ -1333,7 +1334,9 @@ uint32_t StateBridgeDevice::ensure_root_constant_ring(CommandEncoder& encoder) {
 
 uint32_t StateBridgeDevice::rt_prepare_dispatch(const GroupLayoutRecord& group,
                                                 const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
-                                                CommandEncoder& encoder) {
+                                                CommandEncoder& encoder,
+                                                const std::vector<rt_residency::AddressSource>* sources,
+                                                const rt_residency::DispatchInputs* inputs) {
     std::lock_guard lock(objects_mutex_);
     if (rt_arena_ == nullptr) {
         // Bookkeeping only (no GPU buffers yet): the counters work with RT off.
@@ -1346,6 +1349,25 @@ uint32_t StateBridgeDevice::rt_prepare_dispatch(const GroupLayoutRecord& group,
         return 0;
     }
     arena.begin_dispatch();
+    if (sources != nullptr && !sources->empty() && inputs != nullptr) {
+        // 1. Faults the GPU logged for earlier dispatches become resident now (uploaded below).
+        if (rt_fault_issued_ != rt_fault_consumed_ && rt_fault_done_.load(std::memory_order_acquire) >= rt_fault_issued_) {
+            rt_fault_consumed_ = rt_fault_issued_;
+            if (rt_faults_.consume(rt_fault_words_.get(), rt_residency::kStatsWords, arena)) {
+                rt_fault_zero_pending_ = true;  // words 1..31 are zeroed on the GPU before this dispatch
+            }
+        }
+        // 2. Plan from the stage's address sources and ensure (a counted skip leaves nothing recorded).
+        rt_residency::Plan plan;
+        const rt_residency::Outcome out = rt_residency::prepare_dispatch(arena, *sources, *inputs, &plan);
+        ++rt_plans_;
+        rt_unresolved_ += plan.unresolved;
+        rt_structures_ += plan.structures;
+        rt_bad_headers_ += plan.bad_headers;
+        if (!out.ok) {
+            return 0;
+        }
+    }
     for (const auto& [addr, size] : ranges) {
         const rt_arena::Ensure e = arena.ensure_range(addr, size);
         if (e == rt_arena::Ensure::ArenaFull || e == rt_arena::Ensure::TableFull) {
@@ -1369,7 +1391,16 @@ uint32_t StateBridgeDevice::rt_prepare_dispatch(const GroupLayoutRecord& group,
                               (static_cast<uint64_t>(rt_arena::kTopEntries) +
                                static_cast<uint64_t>(rt_arena::kMaxL2Tables) * rt_arena::kL2Entries) * 4u);
         rt_stats_buffer_ = allocate_id();
-        encoder.create_buffer(rt_stats_buffer_, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 256);
+        encoder.create_buffer(rt_stats_buffer_,
+                              GpuBufferUsage::Storage | GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc, 256);
+    }
+    if (rt_fault_words_ == nullptr) {
+        rt_fault_words_ = std::make_unique<uint32_t[]>(rt_residency::kStatsWords);
+    }
+    if (rt_fault_zero_pending_) {
+        static const uint32_t zeros[rt_residency::kStatsWords - 1] = {};
+        encoder.write_buffer(rt_stats_buffer_, 4u, zeros, sizeof(zeros));
+        rt_fault_zero_pending_ = false;
     }
     // Pages first, then the directory that points at them.
     static thread_local std::vector<uint8_t> page;
@@ -1426,9 +1457,48 @@ void StateBridgeDevice::rt_mark_cpu_remapped(uint64_t addr, uint64_t size) {
     }
 }
 
+bool StateBridgeDevice::rt_fault_readback_begin(GpuReadbackBufferPayload* payload, uint32_t* stats_buffer_id) {
+    std::lock_guard lock(objects_mutex_);
+    if (!options_.rt_enabled || rt_stats_buffer_ == 0 || rt_fault_words_ == nullptr) {
+        return false;
+    }
+    if (rt_fault_issued_ != rt_fault_consumed_) {
+        return false;  // one in flight or landed but not consumed yet (the next prepare does): never queue
+    }
+    ++rt_fault_issued_;
+    payload->seq = rt_fault_issued_;
+    payload->buffer_id = rt_stats_buffer_;
+    payload->src_offset = 0;
+    payload->size = rt_residency::kStatsWords * 4u;
+    payload->dst_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rt_fault_words_.get()));
+    payload->done_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&rt_fault_done_));
+    *stats_buffer_id = rt_stats_buffer_;
+    return true;
+}
+
+bool StateBridgeDevice::rt_read_guest(uint64_t addr, void* dst, size_t bytes) const {
+    return options_.rt_page_reader && options_.rt_page_reader(addr, dst, bytes);
+}
+
 std::string StateBridgeDevice::rt_report_json() {
     std::lock_guard lock(objects_mutex_);
-    return rt_arena_ != nullptr ? rt_arena_->json() : std::string("{}");
+    if (rt_arena_ == nullptr) {
+        return "{}";
+    }
+    std::string out = rt_arena_->json();
+    if (!out.empty() && out.back() == '}') {
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      ", \"residency\": {\"plans\": %llu, \"unresolved_sources\": %llu, \"structures\": %llu, "
+                      "\"bad_headers\": %llu, \"fault_readbacks_issued\": %u, \"fault\": ",
+                      (unsigned long long)rt_plans_, (unsigned long long)rt_unresolved_,
+                      (unsigned long long)rt_structures_, (unsigned long long)rt_bad_headers_, rt_fault_issued_);
+        out.pop_back();
+        out += buf;
+        out += rt_faults_.json();
+        out += "}}";
+    }
+    return out;
 }
 
 uint32_t StateBridgeDevice::ensure_default_vertex_buffer(CommandEncoder& encoder) {
@@ -4704,7 +4774,40 @@ ComputePipelineState* CommandListBridge::prepare_compute_dispatch(ComputePipelin
 bool CommandListBridge::prepare_rt_dispatch(ComputePipelineState* state) {
     std::vector<std::pair<uint64_t, uint64_t>> ranges;
     ranges.swap(rt_ranges_);
-    const uint32_t group = device_.rt_prepare_dispatch(*state->layout_->groups[rt_arena::kBindGroup], ranges, encoder_);
+    const std::vector<rt_residency::AddressSource>& sources = state->layout_->rt_address_sources;
+    rt_residency::DispatchInputs in;
+    if (!sources.empty()) {
+        constexpr d3d::BindPoint kBp = d3d::BindPoint::Compute;
+        const d3d::RootSignature* rs = root_args_.root_signature(kBp);
+        in.root_param = [this, rs](uint32_t index, uint64_t* va) {
+            if (rs == nullptr || index >= rs->parameter_count()) {
+                return false;
+            }
+            const d3d::RootArgument& a = root_args_.argument(kBp, index);
+            if (!a.is_set || a.gpu_address == 0) {
+                return false;
+            }
+            *va = a.gpu_address;
+            return true;
+        };
+        in.root_constant = [this, rs](uint32_t index, uint32_t dword, uint32_t* value) {
+            if (rs == nullptr || index >= rs->parameter_count()) {
+                return false;
+            }
+            const auto c = root_args_.root_constants(kBp, index);
+            if (dword >= c.size()) {
+                return false;
+            }
+            *value = c[dword];
+            return true;
+        };
+        in.read_guest = [this](uint64_t addr, void* dst, size_t bytes) {
+            return device_.rt_read_guest(addr, dst, bytes);
+        };
+    }
+    const uint32_t group = device_.rt_prepare_dispatch(*state->layout_->groups[rt_arena::kBindGroup], ranges, encoder_,
+                                                       sources.empty() ? nullptr : &sources,
+                                                       sources.empty() ? nullptr : &in);
     if (group == 0) {
         ++stats_.rt_skipped;
         return false;
@@ -4849,6 +4952,13 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
     encoder_.dispatch_compute(thread_group_count_x, thread_group_count_y, thread_group_count_z);
     ++stats_.dispatches;
+    if (state->layout_ != nullptr && state->layout_->rt_arena && !state->layout_->rt_address_sources.empty()) {
+        GpuReadbackBufferPayload rb{};
+        uint32_t stats_buffer = 0;
+        if (device_.rt_fault_readback_begin(&rb, &stats_buffer)) {
+            Readback(GpuOpcode::ReadbackBuffer, &rb, sizeof(rb), stats_buffer);
+        }
+    }
     for (const StorageRedirect& r : active) {
         if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly)) {
             if (r.depth_twin) {

@@ -5148,6 +5148,136 @@ void test_rt_off_skips_and_counts() {
     CHECK(rig.reads.empty());
 }
 
+// C2 wiring (rt_residency): plan from the stage's address_sources -> upload -> bind -> dispatch -> fault
+// readback; the logged pages are resident (uploaded) by the next dispatch; unwalkable structures skip.
+struct RtSrcRig {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    std::vector<uint64_t> reads;
+    uint64_t unreadable_addr = ~0ull;
+    std::unique_ptr<bridge::StateBridgeDevice> device;
+    d3d::RootSignature signature;
+    std::unique_ptr<bridge::ComputePipelineState> pso;
+    RtSrcRig(uint32_t first_id, bool with_bvh_root) {
+        bridge::BridgeOptions o = counting_options(first_id);
+        o.rt_enabled = true;
+        o.rt_arenas = 2;
+        o.rt_pages_per_arena = 4;
+        o.rt_page_reader = [this](uint64_t addr, void* dst, size_t n) {
+            if (addr == unreadable_addr) return false;
+            reads.push_back(addr);
+            std::memset(dst, 0xAB, n);
+            return true;
+        };
+        device = std::make_unique<bridge::StateBridgeDevice>(heaps, o, &states);
+        constexpr uint64_t kCs = 0xC8;
+        device->register_shader_module(kCs, 8);
+        d3d::RootSignatureDesc rs;
+        for (int i = 0; i < 2; ++i) {
+            d3d::RootParameterDesc p;
+            p.parameter_type = d3d::RootParameterType::Cbv;
+            p.shader_register = static_cast<uint32_t>(i);
+            rs.parameters.push_back(p);
+        }
+        CHECK(d3d::RootSignature::build(rs, &signature).ok());
+        bridge::PipelineLayoutDesc layout;
+        layout.rt_arena = true;
+        layout.rt_address_sources.push_back({gpu::rt_residency::SourceKind::RootParam, 0, 0, 0x20000, false});
+        if (with_bvh_root) {
+            layout.rt_address_sources.push_back({gpu::rt_residency::SourceKind::RootParam, 1, 0, 1, true});
+        }
+        device->register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc desc;
+        desc.cs = kCs;
+        desc.root_signature_id = 9;
+        pso = device->create_compute_pipeline_state(desc, &signature);
+    }
+};
+
+void test_rt_residency_wiring() {
+    using O = GpuOpcode;
+    RtSrcRig rig(23000, false);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(*rig.device, enc);
+    CHECK(list.SetComputeRootSignature(&rig.signature) == d3d::Status::Ok);
+    list.SetComputePipelineState(rig.pso.get());
+    CHECK(list.SetComputeRootConstantBufferView(0, 0x10000) == d3d::Status::Ok);  // pages 1 and 2
+    CHECK(list.SetComputeRootConstantBufferView(1, 0) == d3d::Status::Ok);
+    list.Dispatch(1, 1, 1);
+    CHECK(list.stats().rt_dispatches == 1 && list.stats().rt_skipped == 0);
+    GpuReadbackBufferPayload rb{};
+    {
+        const std::vector<Packet> p = decode(enc);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        const size_t last_write = [&] {
+            size_t w = 0;
+            for (size_t i = 0; i < dispatch; ++i) if (p[i].opcode == O::WriteBuffer) w = i;
+            return w;
+        }();
+        const size_t group = find_op(p, O::CreateBindGroup2, last_write);
+        const size_t readback = find_op(p, O::ReadbackBuffer);
+        // plan -> upload (pages from the address source's extent) -> bind -> dispatch -> fault readback
+        CHECK((rig.reads == std::vector<uint64_t>{0x10000, 0x20000}));
+        CHECK(last_write < group && group < dispatch && dispatch < readback && readback + 1 == p.size());
+        rb = pod<GpuReadbackBufferPayload>(p[readback]);
+        CHECK(rb.size == 128 && rb.dst_addr != 0 && rb.done_addr != 0 && rb.seq == 1);
+    }
+    // A second dispatch while the readback is in flight issues no second one and does not block.
+    list.Dispatch(1, 1, 1);
+    CHECK(find_op(decode(enc), O::ReadbackBuffer, find_op(decode(enc), O::ReadbackBuffer) + 1) == decode(enc).size());
+    // The consumer lands the stats: 2 faults, pages 7 and 6 (page + 1 encoded), then completes.
+    auto* words = reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(rb.dst_addr));
+    std::memset(words, 0, 128);
+    words[0] = 2;
+    words[1] = 2;
+    words[2] = 8;
+    words[3] = 7;
+    reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(rb.done_addr))->fetch_add(1);
+    rig.reads.clear();
+    const size_t mark = enc.size();
+    list.Dispatch(1, 1, 1);
+    {
+        const std::vector<Packet> p = decode(enc, mark);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        CHECK(dispatch < p.size());
+        // The faulted pages were made resident before this dispatch (uploaded), the fault words 1..31
+        // were reset on the GPU, the arena group was bound, and a fresh readback follows.
+        CHECK((rig.reads == std::vector<uint64_t>{0x70000, 0x60000}));
+        bool zeroed = false;
+        size_t uploads = 0;
+        for (size_t i = 0; i < dispatch; ++i) {
+            if (p[i].opcode != O::WriteBuffer) continue;
+            const auto w = pod<GpuWriteBufferPayload>(p[i]);
+            zeroed |= w.data_len == 124 && w.dst_offset == 4;
+            uploads += w.data_len == 65536;
+        }
+        CHECK(zeroed && uploads == 2);
+        CHECK(p[dispatch - 1].opcode == O::SetBindGroup2);
+        CHECK(find_op(p, O::ReadbackBuffer) > dispatch);
+    }
+    const std::string json = rig.device->rt_report_json();
+    CHECK(json.find("\"rt_fault\": 2") != std::string::npos && json.find("\"pages_serviced\": 2") != std::string::npos);
+    CHECK(json.find("\"residency\": {\"plans\": 3") != std::string::npos);
+    CHECK(json.find("\"fault_readbacks_issued\": 2") != std::string::npos);
+}
+
+void test_rt_residency_structures_unavailable_skips() {
+    using O = GpuOpcode;
+    RtSrcRig rig(24000, true);
+    rig.unreadable_addr = 0x500000;  // the BVH header cannot be read: GPU-written or unmapped
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(*rig.device, enc);
+    CHECK(list.SetComputeRootSignature(&rig.signature) == d3d::Status::Ok);
+    list.SetComputePipelineState(rig.pso.get());
+    CHECK(list.SetComputeRootConstantBufferView(0, 0x10000) == d3d::Status::Ok);
+    CHECK(list.SetComputeRootConstantBufferView(1, 0x500000) == d3d::Status::Ok);
+    list.Dispatch(1, 1, 1);
+    const std::vector<Packet> p = decode(enc);
+    CHECK(find_op(p, O::DispatchCompute) == p.size() && find_op(p, O::ReadbackBuffer) == p.size());
+    CHECK(list.stats().rt_skipped == 1 && list.stats().rt_dispatches == 0);
+    CHECK(rig.device->rt_report_json().find("\"structures_unavailable\": 1") != std::string::npos);
+}
+
 // =================================================================================================
 // G81: Full 3D pipeline StateBridge tests
 // =================================================================================================
@@ -6137,6 +6267,8 @@ int main() {
     test_g81_zero_alloc_deterministic_hashing();
     test_rt_arena_dispatch();
     test_rt_off_skips_and_counts();
+    test_rt_residency_wiring();
+    test_rt_residency_structures_unavailable_skips();
     test_partly_held_mip_chain_clamps_views();
     test_view_table_bounded();
     test_unregister_texture_invalidates_cached_bind_groups();
