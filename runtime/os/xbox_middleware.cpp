@@ -239,6 +239,7 @@ struct BinkGlobals {
     uintptr_t sound_param = 0;
     std::unordered_set<int32_t> active_threads;
     std::unordered_set<Pg6HBink> live_handles;
+    uint64_t open_calls = 0;     // every BinkOpenWithOptions call that reached this shim
     uint64_t refused_opens = 0;  // BinkOpenWithOptions calls answered with no movie
     std::unordered_map<Pg6HBink, BinkClock> clocks;  // playback clock per open movie
 };
@@ -604,6 +605,17 @@ uint32_t pg6_xbox_middleware_register_all(void) {
     });
 
     return registered_count;
+}
+
+void pg6_mw_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens) {
+    auto& g = mw::bink_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    if (open_calls != nullptr) {
+        *open_calls = g.open_calls;
+    }
+    if (refused_opens != nullptr) {
+        *refused_opens = g.refused_opens;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,6 +1261,11 @@ Pg6HBink pg6_mw_bink_open_with_options(const char* name,
     // file name, or memory without a valid Bink 2 header, is refused as Bink refuses a file it
     // cannot open: no handle (the title checks it).
     mw::BinkHeader h{};
+    {
+        auto& g = mw::bink_globals();
+        std::lock_guard<std::mutex> lock(g.mutex);
+        ++g.open_calls;
+    }
     const bool from_memory = (flags & mw::kBinkFromMemory) != 0;
     if (name == nullptr || !from_memory || !mw::parse_bink2_header(name, &h)) {
         auto& g = mw::bink_globals();

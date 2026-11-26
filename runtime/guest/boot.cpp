@@ -18,6 +18,7 @@
 
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "guest/export_counters.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/present_pacing.h"
@@ -33,6 +34,7 @@
 #include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/shim_exports.h"
+#include "os/xbox_middleware.h"
 #include "os/ucrt_bridge.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
@@ -459,6 +461,12 @@ struct BootState {
 
     std::string last_report;
     std::string last_summary;
+
+    // B2: call counters for the exports of the lifted Bink2Scarlett.dll and how its exports bound.
+    ExportCounters bink;
+    bool bink_present = false;        // a loaded module named Bink2Scarlett.dll
+    uint64_t bink_exports_lifted = 0; // registry exports that are guest (lifted) code
+    uint64_t bink_exports_shim = 0;   // registry exports that are host shims (would shadow the DLL)
 
     // Hooks to restore.
     FaultHandler previous_fault_handler = nullptr;
@@ -1212,6 +1220,53 @@ std::string dispatch_label(uint64_t target) {
     return index >= 0 ? import_label(boot().imports[static_cast<size_t>(index)].import) : std::string();
 }
 
+// B2: finds the lifted Bink2Scarlett.dll, counts calls to every named export, and records which
+// of the module registry's exports are guest code (lifted) and which are host shims (B1: a shim
+// binding would silently refuse every movie).
+void setup_bink_counters(BootState& b) {
+    b.bink.clear();
+    b.bink_present = false;
+    b.bink_exports_lifted = 0;
+    b.bink_exports_shim = 0;
+    if (b.arena == nullptr) {
+        return;
+    }
+    for (const ModuleState& m : b.modules) {
+        if (!m.loaded || m.image.base == 0 || os::win32::canonical_module_name(m.name) != "bink2scarlett.dll") {
+            continue;
+        }
+        b.bink_present = true;
+        std::vector<PeExport> exports;
+        VirtualMemoryArena& arena = *b.arena;
+        enumerate_pe_exports([&arena](uint64_t va, void* dst, size_t n) { return arena.read(va, dst, n); },
+                             m.image.base, exports);
+        const os::win32::Handle handle = os::win32::find_module_by_address(m.image.base);
+        for (const PeExport& e : exports) {
+            const os::win32::ExportLookup lookup =
+                handle != 0 ? os::win32::LookupExport(handle, e.name) : os::win32::ExportLookup{};
+            (lookup.guest ? b.bink_exports_lifted : b.bink_exports_shim) += 1;
+        }
+        const size_t n = exports.size();
+        b.bink.configure(m.name, std::move(exports));
+        logf("guest boot: %s is lifted: %zu named exports counted, %" PRIu64 " bind to lifted code, %" PRIu64
+             " to a host shim%s",
+             m.name.c_str(), n, b.bink_exports_lifted, b.bink_exports_shim,
+             b.bink_exports_shim != 0 ? " (WARNING: the no-decoder shim shadows the DLL)" : "");
+        return;
+    }
+}
+
+// First call of a counted Bink2Scarlett.dll export: BinkOpenWithOptions is the BINK_OPEN milestone
+// (the import-name milestone cannot see a guest-to-guest call), the others are logged.
+void bink_first_call(BootState& b, size_t index) {
+    const std::string& name = b.bink.name(index);
+    if (name == "BinkOpenWithOptions") {
+        milestone("BINK_OPEN", "first %s call (lifted %s)", name.c_str(), b.bink.module().c_str());
+    } else if (b.log_progress) {
+        os::log(("[bink] first call of lifted export " + name).c_str());
+    }
+}
+
 void boot_dispatch_observer(GuestState* state, uint64_t target) {
     BootState& b = boot();
     if (!b.running.load(std::memory_order_relaxed)) {
@@ -1223,6 +1278,13 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     }
     if (++t_observer.dispatch_pending >= kDispatchBatchSize) {
         t_observer.flush_dispatches();
+    }
+    if (b.bink.active()) {
+        bool first = false;
+        const long bink_index = b.bink.hit(target, &first);
+        if (first && bink_index >= 0) {
+            bink_first_call(b, static_cast<size_t>(bink_index));
+        }
     }
     const uint64_t rsp = state->gpr[GuestReg::Rsp];
     uint64_t return_address = 0;
@@ -1974,6 +2036,57 @@ std::string import_name_json(const BootImport& imp) {
     return "\"dll\": " + json_cstr(imp.dll) + ", \"symbol\": " + json_string(import_symbol(imp));
 }
 
+// "dll!symbol" names of a module's imports with no shim and no runtime thunk (capped), so an
+// unresolved import is named in the report instead of only counted.
+std::string unresolved_names_json(size_t module) {
+    constexpr size_t kCap = 64;
+    const BootState& b = boot();
+    std::string o = "[";
+    size_t listed = 0;
+    for (const ImportRecord& rec : b.imports) {
+        if (rec.module != module || import_resolved(rec.import)) {
+            continue;
+        }
+        if (listed++ < kCap) {
+            o += (listed == 1 ? "" : ", ") + json_string(import_label(rec.import));
+        }
+    }
+    return o + "]";
+}
+
+// B1/B2: the lifted Bink2Scarlett.dll's per-export call counts, how its exports bound, and the
+// fallback shim's own call count (non-zero: the shim, not the DLL, answered an open).
+std::string bink_json() {
+    const BootState& b = boot();
+    uint64_t shim_opens = 0;
+    uint64_t shim_refused = 0;
+    pg6_mw_bink_shim_stats(&shim_opens, &shim_refused);
+    uint64_t imports_to_shim = 0;
+    for (const ImportRecord& rec : b.imports) {
+        if (rec.import.dll != nullptr && os::win32::canonical_module_name(rec.import.dll) == "bink2scarlett.dll" &&
+            rec.import.shim != nullptr && import_resolved(rec.import)) {
+            ++imports_to_shim;
+        }
+    }
+    const char* binding = !b.bink_present ? "absent"
+                          : b.bink_exports_shim != 0 ? (b.bink_exports_lifted != 0 ? "mixed" : "shim")
+                                                      : "lifted";
+    std::string o = "  \"bink\": {\"module_loaded\": " + std::string(b.bink_present ? "true" : "false") +
+                    ", \"binding\": \"" + binding + "\", \"exports_lifted\": " +
+                    std::to_string(b.bink_exports_lifted) + ", \"exports_shim\": " +
+                    std::to_string(b.bink_exports_shim) + ", \"imports_to_shim\": " +
+                    std::to_string(imports_to_shim) + ", \"shim_open_calls\": " + std::to_string(shim_opens) +
+                    ", \"shim_refused_opens\": " + std::to_string(shim_refused) + ", \"exports\": [";
+    uint64_t total = 0;
+    for (size_t i = 0; i < b.bink.size(); ++i) {
+        const uint64_t calls = b.bink.calls(i);
+        total += calls;
+        o += (i == 0 ? "" : ", ") + std::string("{\"name\": ") + json_string(b.bink.name(i)) +
+             ", \"address\": " + hex(b.bink.address(i)) + ", \"calls\": " + std::to_string(calls) + "}";
+    }
+    return o + "], \"total_calls\": " + std::to_string(total) + "}";
+}
+
 std::string tls_json(const ModuleState& m) {
     const TlsInfo& tls = m.tls;
     std::string o = "{\"present\": " + std::string(tls.present ? "true" : "false");
@@ -2321,6 +2434,8 @@ std::string build_report() {
         }
         o += ordered.empty() ? "]},\n" : "\n  ]},\n";
 
+        o += bink_json() + ",
+";
         o += "  \"survey\": {\"enabled\": " + std::string(b.survey ? "true" : "false") +
              ", \"unresolved_called\": [";
         for (size_t k = 0; k < b.survey_called.size(); ++k) {
@@ -2446,7 +2561,8 @@ std::string build_report() {
              std::to_string(m.functions) + ", \"imports\": {\"total\": " +
              std::to_string(m.import_count) + ", \"bound\": " + std::to_string(m.imports_bound) +
              ", \"unresolved\": " + std::to_string(m.imports_unresolved) + ", \"runtime_thunks\": " +
-             std::to_string(m.imports_runtime) + "}, \"pdata\": " + (m.pdata ? "true" : "false") +
+             std::to_string(m.imports_runtime) + ", \"unresolved_names\": " + unresolved_names_json(k) +
+             "}, \"pdata\": " + (m.pdata ? "true" : "false") +
              ", \"tls\": " + tls_json(m) + "}";
     }
     o += b.modules.empty() ? "],\n" : "\n  ],\n";
@@ -3497,6 +3613,10 @@ void reset_boot() {
     b.import_counts.reset();
     b.imports_bound = 0;
     b.imports_unresolved = 0;
+    b.bink.clear();
+    b.bink_present = false;
+    b.bink_exports_lifted = 0;
+    b.bink_exports_shim = 0;
     b.process_reservation = 0;
     b.peb = 0;
     b.process_parameters = 0;
@@ -3821,6 +3941,7 @@ BootResult run_boot(const BootConfig& config) {
          b.functions_registered, b.tables.size(), b.shard_table_count, shard_dispatch_shard_count(),
          b.imports.size(), b.imports_bound, b.imports_unresolved,
          b.survey ? " [survey mode]" : "");
+    setup_bink_counters(b);
     if (!config.export_thunks.empty()) {
         const ExportThunkStats exports = register_export_thunks(config.export_thunks);
         logf("guest boot: %zu export thunks: %zu new guest-callable entries, %zu sharing an existing "

@@ -78,6 +78,7 @@ add_library(playgta6_core STATIC
     guest/guest_memory.cpp
     guest/memory_model.cpp
     guest/boot.cpp
+    guest/export_counters.cpp
     guest/input_script.cpp
     guest/host_input.cpp
     wasm_boot.cpp
@@ -356,6 +357,10 @@ else()
     add_executable(test_host_input ../tests/test_host_input.cpp)
     target_link_libraries(test_host_input PRIVATE playgta6_core)
     add_test(NAME playgta6_host_input_tests COMMAND test_host_input)
+
+    add_executable(test_export_counters ../tests/test_export_counters.cpp)
+    target_link_libraries(test_export_counters PRIVATE playgta6_core)
+    add_test(NAME playgta6_export_counters_tests COMMAND test_export_counters)
 
     add_executable(test_guest_boot ../tests/test_guest_boot.cpp)
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)

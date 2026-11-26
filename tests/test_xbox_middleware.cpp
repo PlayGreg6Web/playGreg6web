@@ -381,7 +381,16 @@ void test_bink2() {
     // Bink 2 header. The per-movie calls tolerate the null handle a title may still pass.
     Pg6BinkOptions opts{};
     opts.total_size = 123456u;
+    uint64_t shim_opens_before = 0, shim_refused_before = 0;
+    pg6_mw_bink_shim_stats(&shim_opens_before, &shim_refused_before);
     CHECK(pg6_mw_bink_open_with_options("movies/intro.bk2", &opts, 0x10u) == nullptr);
+    {
+        // The boot report reads these: a file-name open reaches the shim and is counted as refused.
+        uint64_t opens = 0, refused = 0;
+        pg6_mw_bink_shim_stats(&opens, &refused);
+        CHECK(opens == shim_opens_before + 1);
+        CHECK(refused == shim_refused_before + 1);
+    }
     static const uint8_t junk[64] = {'K', 'B', '1', 'j'};
     CHECK(pg6_mw_bink_open_with_options(reinterpret_cast<const char*>(junk), nullptr, 0x04000000u) == nullptr);
     Pg6BinkFrameBuffers fb{};
