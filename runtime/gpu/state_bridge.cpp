@@ -2612,7 +2612,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             out.array_index = static_cast<uint16_t>(group.joins[i].array_index);  // 0 outside binding arrays
         }
         switch (e.kind) {
-        case d3d::BindResourceKind::Buffer:
+        case d3d::BindResourceKind::Buffer: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
             if (e.resource_id != 0 && device_.retired(e.resource_id)) {
                 diagnostics_ |= BridgeDiag::NullBinding;  // G66 (#691): destroyed buffer, see TextureView
@@ -2621,27 +2621,46 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             }
             out.resource_id = e.resource_id;
             out.offset = e.offset;
-            out.size = e.size;
+            const bool uniform_layout =
+                layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform);
+            // G66 (#691): a constant-buffer view with no size (a console descriptor of zero
+            // records) would bind "to the end of the buffer": past WebGPU's 64 KiB uniform limit,
+            // and at the view's 16-byte offset it skipped the relocation below and invalidated the
+            // bind group (every draw using it). Bind the stage's block (or the 64 KiB a uniform
+            // binding may cover) from the view's start, within the buffer.
+            uint64_t view_size = e.size;
+            if (uniform_layout && view_size == 0) {
+                const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                const uint64_t room = allocated > e.offset ? allocated - e.offset : 0;
+                const uint64_t block = layout.min_binding_size != 0 ? align_up(layout.min_binding_size, 16u)
+                                                                    : kMaxUniformBindingSize;
+                view_size = std::min<uint64_t>({room, block, kMaxUniformBindingSize});
+            }
+            out.size = view_size;
             // WebGPU binds uniform buffers only at 256-byte aligned offsets; the title's constant
             // buffers are 16-byte aligned (Xbox). Relocate to a copy at an aligned offset.
-            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
-                layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
-                e.offset % kUniformOffsetAlignment != 0) {
+            if (uniform_layout && e.offset % kUniformOffsetAlignment != 0) {
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
                 // A reflected stage (G62) gives the binding's minimum size: the home covers it,
                 // zero past the view's bytes.
-                const uint64_t home = std::max<uint64_t>(e.size, layout.min_binding_size);
-                if (base != 0 && e.size != 0 && device_.options().relocate_uniform &&
-                    device_.options().relocate_uniform(base + e.offset, e.size, home, &id, &offset)) {
-                    relocated(i, false, base + e.offset, e.size, home, id, offset);
+                const uint64_t home = std::max<uint64_t>(view_size, layout.min_binding_size);
+                if (base != 0 && view_size != 0 && device_.options().relocate_uniform &&
+                    device_.options().relocate_uniform(base + e.offset, view_size, home, &id, &offset)) {
+                    relocated(i, false, base + e.offset, view_size, home, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     // The relocated home is a whole multiple of 256 bytes (zero past the view).
                     out.size = align_up(home, kUniformOffsetAlignment);
                 } else {
-                    diagnostics_ |= BridgeDiag::UnalignedUniform;
+                    // No copy (GPU-only memory, no bytes): an unaligned uniform offset would
+                    // invalidate the bind group and every draw using it. Bound null instead.
+                    diagnostics_ |= BridgeDiag::UnalignedUniform | BridgeDiag::NullBinding;
+                    out.resource_id = 0;
+                    out.offset = 0;
+                    out.size = 0;
                 }
             } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
                        layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage) &&
@@ -2652,21 +2671,21 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
-                if (base != 0 && e.size != 0 && device_.options().relocate_storage &&
-                    device_.options().relocate_storage(base + e.offset, e.size, &id, &offset)) {
-                    relocated(i, true, base + e.offset, e.size, 0, id, offset);
+                if (base != 0 && view_size != 0 && device_.options().relocate_storage &&
+                    device_.options().relocate_storage(base + e.offset, view_size, &id, &offset)) {
+                    relocated(i, true, base + e.offset, view_size, 0, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
-                    out.size = align_up(e.size, 4u);
+                    out.size = align_up(view_size, 4u);
                     ++stats_.storage_relocated;
                 } else {
                     diagnostics_ |= BridgeDiag::UnalignedStorage;
                 }
-            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && e.size != 0 &&
+            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && view_size != 0 &&
                        (layout.min_binding_size != 0
-                            ? layout.min_binding_size > e.size
+                            ? layout.min_binding_size > view_size
                             : layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
-                                  e.size % kUniformOffsetAlignment != 0)) {
+                                  view_size % kUniformOffsetAlignment != 0)) {
                 // Xbox constant-buffer views are 16-byte multiples, and a stage may declare a larger
                 // uniform block than the view (on the console it reads whatever memory follows).
                 // WebGPU needs the binding to cover the block: bind up to the stage's reflected
@@ -2676,7 +2695,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 // Extend the range when the buffer has the room; otherwise bind a relocated copy
                 // whose bytes past the view are zero (the zero-extension WebGPU needs, not data).
                 const uint64_t target = layout.min_binding_size != 0 ? layout.min_binding_size
-                                                                     : align_up(e.size, kUniformOffsetAlignment);
+                                                                     : align_up(view_size, kUniformOffsetAlignment);
                 // Room: the WebGPU buffer behind the view, including the zero padding a buffer
                 // smaller than a uniform block is allocated with (Resource::initialize).
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
@@ -2692,8 +2711,8 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 uint32_t id = 0;
                 uint64_t offset = 0;
                 if (uniform && room < target && base != 0 && device_.options().relocate_uniform &&
-                    device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
-                    relocated(i, false, base + e.offset, e.size, target, id, offset);
+                    device_.options().relocate_uniform(base + e.offset, view_size, target, &id, &offset)) {
+                    relocated(i, false, base + e.offset, view_size, target, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     out.size = align_up(target, kUniformOffsetAlignment);
@@ -2727,6 +2746,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 }
             }
             break;
+        }
         case d3d::BindResourceKind::TextureView: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
             if (e.resource_id != 0 && device_.retired(e.resource_id)) {

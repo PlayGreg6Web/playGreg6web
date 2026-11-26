@@ -1643,9 +1643,13 @@ void test_concurrent_command_lists() {
 
 // A constant-buffer view at a 16-byte aligned address (Xbox) bound through a descriptor table:
 // WebGPU cannot bind a uniform buffer at that offset, so the bridge asks the relocate hook for an
-// aligned copy and binds that; without the hook the binding is diagnosed.
+// aligned copy and binds that; without the hook the binding is diagnosed and bound null. G66
+// (#691): a view of zero size (a console descriptor of zero records) is relocated too. Every
+// uniform binding the bridge emits sits at a 256-byte aligned offset, within the 64 KiB limit.
 void test_unaligned_uniform_relocation() {
-    for (const bool with_hook : {true, false}) {
+    for (const int variant : {0, 1, 2}) {  // 0: hook, 1: no hook, 2: hook + zero-size view
+        const bool with_hook = variant != 1;
+        const bool zero_size = variant == 2;
         d3d::DescriptorHeapRegistry heaps;
         heaps.set_cbv_alignment(16);
         d3d::ResourceStateRegistry states;
@@ -1672,7 +1676,7 @@ void test_unaligned_uniform_relocation() {
         CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
         d3d::ConstantBufferViewDesc cbv;
         cbv.buffer_location = kCbVa + 0x40;
-        cbv.size_in_bytes = 96;
+        cbv.size_in_bytes = zero_size ? 0 : 96;
         CHECK(heaps.create_constant_buffer_view(&cbv, cbv_heap->cpu_handle(0)) == d3d::Status::Ok);
 
         d3d::RootSignatureDesc rs;
@@ -1691,6 +1695,9 @@ void test_unaligned_uniform_relocation() {
                                                GpuBindingLayoutType::Buffer,
                                                static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
                                   join(0, d3d::DescriptorRangeType::Cbv, 0)});
+        if (zero_size) {
+            group.bindings.back().entry.min_binding_size = 16;  // the stage's reflected block (as in the trace)
+        }
         layout.groups.push_back(group);
         device.register_pipeline_layout(kVs, kPs, layout);
         pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
@@ -1720,6 +1727,17 @@ void test_unaligned_uniform_relocation() {
         for (const Packet& packet : p) {
             if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
                 bind_group = &packet;
+                // Every buffer binding emitted: a 256-byte aligned offset, within the 64 KiB
+                // uniform limit (or null).
+                const auto g = pod<GpuCreateBindGroup2Payload>(packet, 0);
+                for (uint32_t k = 0; k < g.entry_count; ++k) {
+                    const auto be = pod<GpuBindGroupEntry2>(
+                        packet, sizeof(GpuCreateBindGroup2Payload) + size_t{k} * sizeof(GpuBindGroupEntry2));
+                    if (be.resource_type == static_cast<uint32_t>(GpuBindResourceType::Buffer)) {
+                        CHECK(be.offset % bridge::kUniformOffsetAlignment == 0);
+                        CHECK(be.resource_id == 0 || (be.size != 0 && be.size <= bridge::kMaxUniformBindingSize));
+                    }
+                }
             }
         }
         CHECK(bind_group != nullptr);
@@ -1727,10 +1745,13 @@ void test_unaligned_uniform_relocation() {
             const auto entry = pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload));
             if (with_hook) {
                 CHECK(entry.resource_id == 777 && entry.offset == 512 && entry.size == 256);  // whole relocated slot
-                CHECK(calls.size() == 1 && calls[0].first == kCbVa + 0x40 && calls[0].second == 96);
+                // A zero-size view is relocated at the stage's reflected block (16 bytes).
+                CHECK(calls.size() == 1 && calls[0].first == kCbVa + 0x40 &&
+                      calls[0].second == (zero_size ? 16u : 96u));
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedUniform) == 0);
             } else {
-                CHECK(entry.resource_id == kCb && entry.offset == 0x40);
+                // Bound null: an unaligned offset would invalidate the bind group and its draws.
+                CHECK(entry.resource_id == 0 && entry.offset == 0);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedUniform) != 0);
             }
         }
@@ -2294,7 +2315,7 @@ void test_memory_backed_tables() {
 
     // A CBV table whose slot only exists in memory (the title copied it there).
     uint32_t cb[4];
-    bridge::constant_buffer_words(kCbVa + 0x40, 96, cb);
+    bridge::constant_buffer_words(kCbVa + 0x400, 96, cb);
     memory.write(3, cb, sizeof(cb));
     CHECK(heap->view(3)->kind == d3d::DescriptorKind::Empty);  // nothing in the registry
     d3d::RootSignatureDesc rs;
@@ -2337,7 +2358,9 @@ void test_memory_backed_tables() {
     list.Close();
     uint32_t id = 0;
     GpuBindGroupEntry2 e = last_bind_group_entry(enc, &id);
-    CHECK(e.resource_id == kCb && e.offset == 0x40 && e.size == 96);
+    // (A 256-byte aligned view: bound in place, widened through the buffer as below; an unaligned
+    // one without a relocate hook binds null, see test_unaligned_uniform_relocation.)
+    CHECK(e.resource_id == kCb && e.offset == 0x400 && e.size == 4096 - 0x400);
     CHECK(list.stats().bind_groups_created == 1 && list.stats().memory_bind_groups == 1);
 
     // Unchanged at execution: nothing to do. Changed: the recorded entries are rewritten in place.
