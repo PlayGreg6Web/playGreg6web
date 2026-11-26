@@ -1441,6 +1441,111 @@ void test_httpfs_size_cache() {
     set_httpfs_client(nullptr);
 }
 
+// Item 30: package archives are tens of GB. A synthetic sparse 80 GiB host file (content is a
+// pure function of the offset, nothing stored) is read at offsets above 4/16/64 GiB through the
+// kernel file API; transient host failures are retried by the host layer, a persistent failure
+// is reported as an error and leaves the caller's buffer untouched (no zero-fill, no short read).
+static uint8_t sparse_byte(uint64_t off) {
+    return static_cast<uint8_t>((off * 0x9E3779B97F4A7C15ull) >> 56);
+}
+
+static void test_httpfs_sparse_64bit_and_retry() {
+    using playgta6::os::HttpfsMailbox;
+    using playgta6::os::HttpfsMailboxClient;
+    using playgta6::os::HttpfsOp;
+    using playgta6::os::HttpfsStatus;
+    constexpr uint64_t kGiB = 1ull << 30;
+    constexpr uint64_t kSize = 80 * kGiB;
+    int fail_next_reads = 0;
+    uint64_t max_chunk = 0;
+    HttpfsMailbox mailbox{};
+    HttpfsMailboxClient::init_mailbox(mailbox);
+    HttpfsMailboxClient client(&mailbox, [&](HttpfsMailbox& mb) {
+        if (mb.op == static_cast<uint32_t>(HttpfsOp::Open)) {
+            HttpfsMailboxClient::complete_response(mb, 7);
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Read)) {
+            if (fail_next_reads > 0) {
+                --fail_next_reads;
+                HttpfsMailboxClient::complete_response(mb, -5, HttpfsStatus::Error);
+                return;
+            }
+            max_chunk = std::max<uint64_t>(max_chunk, mb.length);
+            const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
+            for (uint64_t i = 0; i < n; ++i) {
+                mb.payload[i] = sparse_byte(mb.offset + i);
+            }
+            HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
+        } else {
+            HttpfsMailboxClient::complete_response(mb, 0);
+        }
+    });
+    std::vector<uint32_t> sleeps;
+    HttpfsMailboxClient::RetryPolicy policy;
+    policy.sleep = [&](uint32_t ms) { sleeps.push_back(ms); };
+    client.set_retry_policy(policy);
+    set_httpfs_client(&client);
+
+    const Handle h = CreateFileW(u"G:\\data\\levels.rpf", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    int64_t size = 0;
+    CHECK(GetFileSizeEx(h, &size) && static_cast<uint64_t>(size) == kSize);
+
+    const uint64_t offsets[] = {4 * kGiB - 8, 5 * kGiB + 3, 16 * kGiB + 1, 70 * kGiB + 12345};
+    for (const uint64_t off : offsets) {
+        int64_t pos = 0;
+        CHECK(SetFilePointerEx(h, static_cast<int64_t>(off), &pos, 0) && static_cast<uint64_t>(pos) == off);
+        uint8_t buf[32];
+        uint32_t got = 0;
+        CHECK(ReadFile(h, buf, sizeof(buf), &got, nullptr) && got == sizeof(buf));
+        bool ok = true;
+        for (uint32_t i = 0; i < got; ++i) {
+            ok = ok && buf[i] == sparse_byte(off + i);
+        }
+        CHECK(ok);
+    }
+    CHECK(max_chunk <= playgta6::os::kHttpfsPayloadBytes);  // ranged reads, never a whole archive
+
+    // One transient failure is retried by the host layer and invisible to the title.
+    sleeps.clear();
+    fail_next_reads = 1;
+    {
+        const uint64_t off = 70 * kGiB;
+        uint8_t buf[16];
+        uint32_t got = 0;
+        CHECK(SetFilePointerEx(h, static_cast<int64_t>(off), nullptr, 0));
+        CHECK(ReadFile(h, buf, sizeof(buf), &got, nullptr) && got == sizeof(buf));
+        CHECK(buf[0] == sparse_byte(off));
+        CHECK(sleeps.size() == 1 && sleeps[0] == 20);
+        CHECK(client.retried_chunks() == 1);
+    }
+
+    // A persistent failure is bounded, backs off exponentially, and surfaces as a read error with
+    // the buffer left as the caller had it.
+    sleeps.clear();
+    fail_next_reads = 1000;
+    {
+        uint8_t buf[16];
+        std::memset(buf, 0xCC, sizeof(buf));
+        uint32_t got = 99;
+        CHECK(SetFilePointerEx(h, static_cast<int64_t>(5 * kGiB), nullptr, 0));
+        CHECK(!ReadFile(h, buf, sizeof(buf), &got, nullptr));
+        CHECK(GetLastError() == ERROR_READ_FAULT);
+        CHECK(got == 0);
+        CHECK(buf[0] == 0xCC && buf[15] == 0xCC);
+        CHECK((sleeps == std::vector<uint32_t>{20, 40, 80}));
+        CHECK(fail_next_reads == 1000 - 4);
+    }
+    // Reading at the very end is a clean EOF (0 bytes, success), not an error.
+    fail_next_reads = 0;
+    uint8_t eof_buf[4];
+    uint32_t got = 7;
+    CHECK(SetFilePointerEx(h, static_cast<int64_t>(kSize), nullptr, 0));
+    CHECK(ReadFile(h, eof_buf, sizeof(eof_buf), &got, nullptr) && got == 0);
+    CloseHandle(h);
+    set_httpfs_client(nullptr);
+}
+
 static void test_stall_compensation() {
     using namespace playgta6::os::win32;
     ResetHostStallForTesting();
@@ -1471,6 +1576,7 @@ static void test_stall_compensation() {
 int main() {
     test_stall_compensation();
     test_httpfs_size_cache();
+    test_httpfs_sparse_64bit_and_retry();
     test_directories_and_attributes();
     test_find_files();
     test_file_times_and_handles();

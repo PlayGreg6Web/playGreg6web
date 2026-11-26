@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -109,6 +110,18 @@ public:
     explicit HttpfsMailboxClient(HttpfsDirectBackend backend);
 
     void set_responder(ResponderCallback responder);
+
+    // Bounded retry for transient host read failures (a failed range request). A failed chunk is
+    // re-issued up to `max_retries` times with exponential backoff (initial_backoff_ms, doubling,
+    // capped at 1 s); only then does read() return < 0 so the title sees a real error, never a
+    // short read or zero-filled data. Not retried: a mailbox shutdown, or a malformed response.
+    struct RetryPolicy {
+        uint32_t max_retries = 3;
+        uint32_t initial_backoff_ms = 20;
+        std::function<void(uint32_t ms)> sleep;  // test hook; default sleeps the thread
+    };
+    void set_retry_policy(RetryPolicy policy);
+    uint64_t retried_chunks() const { return retried_chunks_.load(std::memory_order_relaxed); }
     size_t payload_capacity() const;
 
     // Opens a relative path (e.g. "update/x64/dlc.rpf"). Returns handle >= 0 or < 0 on error.
@@ -136,12 +149,15 @@ private:
     size_t effective_capacity_locked() const;
     // One chunk (min(remaining, capacity) bytes, stored in *asked) under the lock: bytes read
     // (>= 0) or < 0 on error.
-    int64_t read_chunk(int32_t handle, uint64_t offset, uint8_t* dst, size_t remaining, size_t* asked);
+    int64_t read_chunk(int32_t handle, uint64_t offset, uint8_t* dst, size_t remaining, size_t* asked,
+                       bool* retryable);
 
     HttpfsMailbox* mailbox_ = nullptr;
     ResponderCallback responder_;
     HttpfsDirectBackend direct_;
     bool direct_mode_ = false;
+    RetryPolicy retry_;
+    std::atomic<uint64_t> retried_chunks_{0};
     mutable HttpfsFairMutex mutex_;
 };
 

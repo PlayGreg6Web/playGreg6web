@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 namespace playgta6::os {
 
@@ -34,6 +36,11 @@ HttpfsMailboxClient::HttpfsMailboxClient(HttpfsDirectBackend backend)
 void HttpfsMailboxClient::set_responder(ResponderCallback responder) {
     std::lock_guard<HttpfsFairMutex> lock(mutex_);
     responder_ = std::move(responder);
+}
+
+void HttpfsMailboxClient::set_retry_policy(RetryPolicy policy) {
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    retry_ = std::move(policy);
 }
 
 size_t HttpfsMailboxClient::effective_capacity_locked() const {
@@ -179,9 +186,31 @@ int64_t HttpfsMailboxClient::read(int32_t handle, uint64_t offset, void* dst, si
         // The lock is taken per chunk (FIFO), so other threads' requests interleave with a bulk
         // read instead of waiting for all of it.
         size_t asked = 0;
-        const int64_t got_or_error = read_chunk(handle, cur_offset, out, remaining, &asked);
+        bool retryable = false;
+        int64_t got_or_error = read_chunk(handle, cur_offset, out, remaining, &asked, &retryable);
+        if (got_or_error < 0 && retryable) {
+            RetryPolicy policy;
+            {
+                std::lock_guard<HttpfsFairMutex> lock(mutex_);
+                policy = retry_;
+            }
+            uint32_t backoff = policy.initial_backoff_ms;
+            for (uint32_t attempt = 0; attempt < policy.max_retries && got_or_error < 0 && retryable;
+                 ++attempt) {
+                // Backoff outside the lock so other threads' requests are not stalled by it.
+                if (policy.sleep) {
+                    policy.sleep(backoff);
+                } else if (backoff > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(backoff));
+                }
+                backoff = std::min<uint32_t>(backoff * 2, 1000);
+                retried_chunks_.fetch_add(1, std::memory_order_relaxed);
+                retryable = false;
+                got_or_error = read_chunk(handle, cur_offset, out, remaining, &asked, &retryable);
+            }
+        }
         if (got_or_error < 0) {
-            return got_or_error;
+            return got_or_error;  // surfaced to the title as a failed read, never zero-filled
         }
         const size_t got = static_cast<size_t>(got_or_error);
 
@@ -203,8 +232,10 @@ int64_t HttpfsMailboxClient::read_chunk(int32_t handle,
                                         uint64_t offset,
                                         uint8_t* dst,
                                         size_t remaining,
-                                        size_t* asked) {
+                                        size_t* asked,
+                                        bool* retryable) {
     std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    *retryable = false;
     const size_t cap = effective_capacity_locked();
     if (cap == 0) {
         return -1;
@@ -218,6 +249,7 @@ int64_t HttpfsMailboxClient::read_chunk(int32_t handle,
         }
         const int64_t n = direct_.read(handle, offset, dst, chunk);
         if (n < 0) {
+            *retryable = true;
             return n;
         }
         return static_cast<uint64_t>(n) > chunk ? -1 : n;
@@ -239,6 +271,7 @@ int64_t HttpfsMailboxClient::read_chunk(int32_t handle,
             status_ref.store(static_cast<int32_t>(HttpfsStatus::Idle), std::memory_order_release);
             status_ref.notify_one();
         }
+        *retryable = status != HttpfsStatus::Shutdown && chunk_res < 0;
         return chunk_res < 0 ? chunk_res : -1;
     }
 
