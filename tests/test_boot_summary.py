@@ -70,6 +70,22 @@ class BootSummaryTest(unittest.TestCase):
         self.assertIn("6 hit before use", out)
         self.assertIn("fps:", out)
 
+    def test_frame_times_printed_per_phase(self):
+        r = base()
+        r["frame_times"] = {"phases": [
+            {"name": "all", "frames": 1000, "mean_ms": 17.2, "p50_ms": 16.7, "p99_ms": 33.3, "p999_ms": 100.0,
+             "max_ms": 120.0, "low1_fps": 30.0, "low01_fps": 10.0, "missed_vblanks": 42, "late_frames": 30},
+            {"name": "draws_100_999", "frames": 900, "mean_ms": 16.9, "p50_ms": 16.7, "p99_ms": 20.0, "p999_ms": 40.0,
+             "max_ms": 60.0, "low1_fps": 50.0, "low01_fps": 25.0, "missed_vblanks": 2, "late_frames": 2}]}
+        out = bs.summarize(r)
+        self.assertIn("frame times (whole run, ms):", out)
+        self.assertRegex(out, r"all\s+1,000 frames.*p99 33\.3.*low1% 30 fps.*missed vblanks 42 \(30 late frames\)")
+        self.assertIn("draws_100_999", out)
+        s = bs.frame_time_summary(r)
+        self.assertEqual((s["low1_fps"], s["missed_vblanks"]), (30.0, 42.0))
+        self.assertAlmostEqual(s["late_pct"], 3.0)
+        self.assertNotIn("frame times", bs.summarize(base() | {"frame_times": {"phases": []}}))
+
     def test_missing_sections_skipped(self):
         out = bs.summarize({"status": "limit_reached", "elapsed_ms": 1000})
         self.assertIn("gpu errors: none", out)

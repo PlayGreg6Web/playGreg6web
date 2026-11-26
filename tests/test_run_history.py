@@ -62,6 +62,14 @@ class RunHistoryTests(unittest.TestCase):
         self.assertIn("37 draws/frame", r["max_screen"])
         self.assertTrue(r["ended"].startswith("limit"))
 
+    def test_frame_time_columns(self):
+        rep = report()
+        rep["frame_times"] = {"phases": [{"name": "all", "frames": 200, "low1_fps": 28.5, "low01_fps": 9.0,
+                                          "missed_vblanks": 10, "late_frames": 10}]}
+        row = rh.row_from_report(rep, "x", 0.0, "abc")
+        self.assertEqual((row["low1_fps"], row["late_pct"]), (28.5, 5.0))
+        self.assertIsNone(rh.row_from_report(report(), "x", 0.0, "abc")["low1_fps"])
+
     def test_browser_run_dir_row(self):
         samples = [{"wall_ms": 1000 + i * 500.0, "present_count": 1 + i * 20,
                     "counters": {"draws_real_pack": i * 200}} for i in range(10)]

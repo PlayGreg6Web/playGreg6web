@@ -23,6 +23,7 @@
 #include "os/audio_file_stats.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
+#include "gpu/frame_time_hist.h"
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
 #include "gpu/small_texture_pool.h"
@@ -445,6 +446,8 @@ struct BootState {
     uint64_t present_import_seq = 0;
     uint64_t present_elapsed_ms = 0;
     gpu::PresentSampleRing present_samples;  // guarded by `mutex` (R40)
+    gpu::FrameTimeStats frame_times;         // guarded by `mutex`: whole-run frame-time histogram
+    int64_t last_present_us = -1;            // guarded by `mutex`: steady clock of the previous present
     std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
     std::vector<std::string> trace_strings;  // string arguments of each trace entry
     struct CallableCalls {
@@ -2856,6 +2859,10 @@ std::string build_report() {
             o += rows.empty() ? "]},\n" : "\n  ]},\n";
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        o += "  \"frame_times\": " + b.frame_times.to_json() + ",\n";
+    }
     // R40: per-present samples without a GPU capture (the last gpu::PresentSampleRing::kDefaultCapacity).
     {
         std::lock_guard<std::mutex> lock(b.mutex);
@@ -3687,10 +3694,22 @@ static void record_present() {
     namespace d3d = gpu::d3d12_guest;
     const uint64_t draws = d3d::work_total(d3d::Work::DrawsIssued);
     const uint64_t resources = d3d::work_total(d3d::Work::ResourcesCreated);
+    // The interval the previous present asked for (its wait is what this gap contains).
+    const gpu::PresentPacer::Stats ps = gpu::present_pacer().stats();
+    const uint32_t gap = ps.presents == 0 || ps.last_interval == 0
+                             ? 0u
+                             : gpu::PresentPacer::title_gap_vblanks(ps.last_interval, gpu::present_pacer().honor_interval());
+    const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count();
     {
         BootState& b = boot();
         std::lock_guard<std::mutex> lock(b.mutex);
         b.present_samples.record(elapsed_ms(), draws, resources);
+        if (b.last_present_us >= 0 && now_us >= b.last_present_us) {
+            b.frame_times.add(static_cast<uint64_t>(now_us - b.last_present_us), b.present_samples.last().draws, gap,
+                              elapsed_ms());
+        }
+        b.last_present_us = now_us;
     }
     mark_first_present();
 }
@@ -3854,6 +3873,8 @@ void reset_boot() {
     b.present_import_seq = 0;
     b.present_elapsed_ms = 0;
     b.present_samples.clear();
+    b.frame_times.clear();
+    b.last_present_us = -1;
     b.trace.clear();
     b.trace_strings.clear();
     {

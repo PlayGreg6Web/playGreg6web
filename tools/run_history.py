@@ -35,7 +35,7 @@ import boot_summary as bs  # noqa: E402
 import guest_symbols as gs  # noqa: E402
 
 COLUMNS = ["time", "run", "commit", "preset", "duration", "ended", "hard_stop", "max_screen", "fps_p50", "fps_p5",
-           "gpu_errors", "pack_misses", "underruns", "private_peak_mib"]
+           "low1_fps", "late_pct", "gpu_errors", "pack_misses", "underruns", "private_peak_mib"]
 GROUP_COLUMNS = ["time", "preset", "commit", "runs", "faults", "max_draws", "fps_p50", "fps_p5", "gpu_errors",
                  "pack_misses", "underruns", "private_peak_mib", "change"]
 GPU_ERR_KEYS = ("device_errors", "device_lost", "op_errors", "packet_errors", "present_failures")
@@ -97,6 +97,7 @@ def ending(report: dict[str, Any], hard_stops: str | None = None) -> tuple[str, 
 def row_from_report(report: dict[str, Any], name: str, when: float, commit: str,
                     hard_stops: str | None = None) -> dict[str, Any]:
     f = bs.fps_percentiles(report)
+    ft = bs.frame_time_summary(report)
     p50 = f["p50"] if f else (bs._n(report.get("present_fps_avg")) or None)
     ne = bs._d(report.get("native_executor"))
     end, hs = ending(report, hard_stops)
@@ -119,6 +120,7 @@ def row_from_report(report: dict[str, Any], name: str, when: float, commit: str,
         "ended": end, "hard_stop": hs,
         "max_screen": f"{ms} / {draws:g} draws/frame" if draws else ms,
         "fps_p50": round(p50, 1) if p50 else None, "fps_p5": round(f["p5"], 1) if f else None,
+        "low1_fps": round(ft["low1_fps"], 1) if ft else None, "late_pct": round(ft["late_pct"], 1) if ft else None,
         "gpu_errors": int(sum(bs._n(ne.get(k)) for k in GPU_ERR_KEYS)) if ne else None,
         "pack_misses": int(bs._n(ne.get("shader_pack_misses"))) if "shader_pack_misses" in ne else None,
         "underruns": int(bs._n(ao.get("underruns"))) if "underruns" in ao else None,

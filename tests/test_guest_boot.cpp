@@ -970,6 +970,7 @@ void test_report_import_fields() {
     CHECK(run.report["present_samples"].type == Json::Array && run.report["present_samples"].items.size() == 2);
     CHECK(run.report["present_samples"][1]["index"].number == 1);
     CHECK(run.report["present_samples"][1].has("wall_ms") && run.report["present_samples"][1].has("draws"));
+    CHECK(run.report.has("frame_times") && run.report["frame_times"]["phases"].type == Json::Array);
     const Json& fp = run.report["first_present"];
     CHECK(fp.type == Json::Object);
     CHECK(fp["import_seq"].number == 2);

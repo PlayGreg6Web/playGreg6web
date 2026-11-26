@@ -115,6 +115,33 @@ def fps_percentiles(report: dict[str, Any]) -> dict[str, float] | None:
             "p95": percentile(fps, 0.95), "n": float(len(fps))}
 
 
+def frame_time_lines(report: dict[str, Any]) -> list[str]:
+    """Whole-run frame-time stats per phase (boot report `frame_times`): mean/p50/p99/p99.9/max ms, the 1% and 0.1%
+    lows as fps, and vblank intervals missed relative to the title's requested interval."""
+    ft = _d(report.get("frame_times"))
+    phases = [p for p in (ft.get("phases") or []) if isinstance(p, dict) and _n(p.get("frames")) > 0]
+    if not phases:
+        return []
+    out = ["frame times (whole run, ms):"]
+    for p in phases:
+        out.append(f"  {str(p.get('name')):<16} {_i(p.get('frames')):>8} frames  mean {_n(p.get('mean_ms')):.1f}  "
+                   f"p50 {_n(p.get('p50_ms')):.1f}  p99 {_n(p.get('p99_ms')):.1f}  p99.9 {_n(p.get('p999_ms')):.1f}  "
+                   f"max {_n(p.get('max_ms')):.1f}  low1% {_n(p.get('low1_fps')):.0f} fps  "
+                   f"low0.1% {_n(p.get('low01_fps')):.0f} fps  missed vblanks {_i(p.get('missed_vblanks'))} "
+                   f"({_i(p.get('late_frames'))} late frames)")
+    return out
+
+
+def frame_time_summary(report: dict[str, Any]) -> dict[str, float] | None:
+    """The `all` phase of `frame_times`: {low1_fps, low01_fps, missed_vblanks, late_pct}, None if absent."""
+    for p in _d(report.get("frame_times")).get("phases") or []:
+        if isinstance(p, dict) and p.get("name") == "all" and _n(p.get("frames")) > 0:
+            fr = _n(p.get("frames"))
+            return {"low1_fps": _n(p.get("low1_fps")), "low01_fps": _n(p.get("low01_fps")),
+                    "missed_vblanks": _n(p.get("missed_vblanks")), "late_pct": 100.0 * _n(p.get("late_frames")) / fr}
+    return None
+
+
 def screen_segments(report: dict[str, Any]) -> list[dict[str, Any]]:
     """Native screen_timeline, or for browser runs segments derived from the presents' draw counters
     (a new segment when draws/frame leaves +-35% of the running segment mean)."""
@@ -243,6 +270,7 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
     if f:
         L.append(f"fps: p1 {f['p1']:.1f}  p5 {f['p5']:.1f}  p50 {f['p50']:.1f}  p95 {f['p95']:.1f} "
                  f"({int(f['n'])} samples)")
+    L += frame_time_lines(report)
     if report.get("present_fps_avg") is not None:
         L.append(f"browser fps: avg {_n(report.get('present_fps_avg')):.1f}, steady {_n(report.get('fps_steady_avg')):.1f}, "
                  f"p50 window {_n(report.get('fps_p50_window')):.1f}, max window {_n(report.get('fps_max_window')):.1f}, "

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "gpu/frame_time_hist.h"
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
 #include "os/host_sleep.h"
@@ -215,6 +216,34 @@ void test_title_driven_interval_zero_remains_immediate() {
 
 }  // namespace
 
+void test_frame_time_hist() {
+    using playgta6::gpu::FrameTimeStats;
+    CHECK(FrameTimeStats::bucket_for_us(500) == 0);
+    CHECK(FrameTimeStats::bucket_for_us(1000) == 1);
+    CHECK(FrameTimeStats::bucket_for_us(16667) > FrameTimeStats::bucket_for_us(8000));
+    CHECK(FrameTimeStats::bucket_for_us(600000) == FrameTimeStats::kBuckets - 1);
+    CHECK(FrameTimeStats::phase_for_draws(0) == FrameTimeStats::kNoDraws);
+    CHECK(FrameTimeStats::phase_for_draws(5000) == FrameTimeStats::kVeryHeavy);
+    FrameTimeStats h;
+    for (int i = 0; i < 98; ++i) {
+        h.add(16667, 200, 1, 1000 + i);  // on time at 60 fps
+    }
+    h.add(33333, 200, 1, 2000);   // one missed vblank
+    h.add(100000, 200, 1, 2100);  // a hitch: 6 vblanks -> 5 missed
+    h.add(16667, 0, 0, 2200);     // unpaced, other phase
+    const auto& all = h.phase(FrameTimeStats::kAll);
+    CHECK(all.frames == 101 && all.max_us == 100000 && all.first_ms == 1000 && all.last_ms == 2200);
+    CHECK(all.late_frames == 2 && all.missed_vblanks == 6 && all.unpaced_frames == 1);
+    CHECK(h.phase(FrameTimeStats::kHeavy).frames == 100 && h.phase(FrameTimeStats::kNoDraws).frames == 1);
+    CHECK(all.quantile_us(0.5) < 20000 && all.quantile_us(0.5) >= 16667 * 0.8);
+    CHECK(all.quantile_us(0.999) == 100000);  // clamped to the observed max
+    CHECK(all.quantile_us(0.99) <= 40000);
+    const std::string j = h.to_json();
+    CHECK(j.find("\"name\": \"all\"") != std::string::npos && j.find("\"missed_vblanks\": 6") != std::string::npos);
+    h.clear();
+    CHECK(h.phase(FrameTimeStats::kAll).frames == 0 && h.to_json().find("\"phases\": []") != std::string::npos);
+}
+
 void test_present_samples_ring() {
     playgta6::gpu::PresentSampleRing r(3);
     CHECK(r.last().index == 0 && r.last().draws == 0);
@@ -286,6 +315,7 @@ int main() {
     test_title_driven_honor_interval();
     test_title_driven_interval_zero_remains_immediate();
     test_present_samples_ring();
+    test_frame_time_hist();
     test_host_sleep_is_precise();
     test_timer_resolution_raised();
     if (g_failures != 0) {
