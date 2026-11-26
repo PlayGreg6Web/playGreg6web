@@ -87,6 +87,16 @@ function splitFrames(bytes) {
         const o = y * s.bpr + x * 4, k = px[o] | (px[o + 1] << 8) | (px[o + 2] << 16);
         ++total; if (k) ++nz; hist.add(k);
       }
+      // Exact full-resolution digest (two FNV-1a 32 lanes over every row's pixels, padding excluded) so
+      // build-vs-build comparisons do not depend on the lossy 960px thumbnail.
+      let h1 = 0x811c9dc5, h2 = 0x01000193;
+      for (let y = 0; y < s.h; ++y) {
+        const row = new Uint32Array(px.buffer, px.byteOffset + y * s.bpr, s.w);
+        for (let x = 0; x < s.w; ++x) {
+          const v = row[x]; h1 = Math.imul(h1 ^ v, 0x01000193); h2 = Math.imul(h2 ^ (v >>> 16 | v << 16), 0x85ebca6b);
+        }
+      }
+      log('digest frame ' + s.frame + ': ' + (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0'));
       log('swapchain frame ' + s.frame + ' (' + s.w + 'x' + s.h + ' ' + s.fmt + '): non-black ' + nz + '/' + total +
           ' (' + (100 * nz / total).toFixed(2) + '%), distinct ' + hist.size);
       const tw = 960, th = Math.round(s.h * tw / s.w), c = document.createElement('canvas');
