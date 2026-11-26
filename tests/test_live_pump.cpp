@@ -249,6 +249,36 @@ void test_tick_hook_runs_on_pump_thread() {
     CHECK(ticks.load() >= 2);
     CHECK(tick_thread == sh.create_thread);
 }
+
+// A guest blocked behind a stuck executor (backpressure) must be released by abort(): the --max-ms
+// deadline of a live run cannot wait for the executor.
+void test_abort_releases_blocked_submit() {
+    Shared sh;
+    sh.gate = false;
+    LivePumpOptions opt;
+    opt.max_queued_batches = 2;
+    Pump pump(opt);
+    CHECK(start(pump, sh));
+    std::atomic<int> returned{0};
+    std::thread producer([&] {
+        for (uint8_t i = 0; i < 10; ++i) {
+            submit_byte(pump, i);
+            ++returned;
+        }
+    });
+    std::this_thread::sleep_for(100ms);
+    CHECK(returned.load() == 3);  // 1 inside execute(), 2 queued, the 4th is blocked
+    pump.abort();
+    producer.join();              // would hang without abort()
+    CHECK(returned.load() == 10);
+    const LivePumpStats s = pump.stats();
+    CHECK(s.discarded_on_close == 2);
+    CHECK(s.dropped_after_close >= 1);
+    sh.gate = true;               // the batch inside execute() finishes, then the pump exits
+    pump.stop();
+    CHECK(sh.destroyed.load());
+    CHECK(sh.first_bytes.size() == 1);  // nothing queued ran after the abort
+}
 }  // namespace
 
 int main() {
@@ -260,6 +290,7 @@ int main() {
     test_create_failure();
     test_stop_drains_and_stats_json();
     test_tick_hook_runs_on_pump_thread();
+    test_abort_releases_blocked_submit();
     if (g_failures == 0) std::printf("test_live_pump: ok\n");
     return g_failures == 0 ? 0 : 1;
 }

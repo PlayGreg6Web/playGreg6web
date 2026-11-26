@@ -264,12 +264,17 @@ struct RemapCacheEntry {
     uint64_t gen = 0;
 };
 
+// A shader whose WGSL comes from the pack is materialized (read from the pack, entry point scanned,
+// module compiled) on first use by a pipeline: a title creates ~1400 modules of which only a few
+// are ever used, and compiling each synchronously (about 50 ms for multi-MB WGSL) stalled the
+// executor for over a minute. Fields are mutable: ensure_shader() fills them through const refs.
 struct ShaderEntry {
-    wgpu::ShaderModule module;
-    std::string code;
-    std::optional<std::string> explicit_ep;
+    mutable wgpu::ShaderModule module;
+    mutable std::string code;
+    mutable std::optional<std::string> explicit_ep;
     uint32_t stage = 0;
     uint64_t hash = 0;  // the pack hash of a hash-only payload (0 = inline WGSL): the GPU-time key
+    mutable bool pending = false;  // pack-backed and not yet materialized
 };
 
 struct RenderPipelineEntry {
@@ -1111,10 +1116,15 @@ struct NativeExecutor::Impl {
             // text compiles as an (empty) module.
         } else if (auto hash = parse_hash_only_shader_payload(trimmed)) {
             shader_hash = *hash;
-            std::optional<std::string> hit = pack ? pack->get(*hash) : std::nullopt;
-            if (hit && !hit->empty()) {
-                code = std::move(*hit);
+            if (pack && pack->has(*hash)) {
                 ++stats.shader_pack_hits;
+                ShaderEntry e;
+                e.stage = h.stage;
+                e.hash = shader_hash;
+                e.pending = true;
+                shaders[h.id] = std::move(e);
+                ++stats.shader_modules;
+                return;
             } else {
                 ++stats.shader_pack_misses;  // the hash text itself is compiled (and rejected)
             }
@@ -1128,6 +1138,25 @@ struct NativeExecutor::Impl {
         e.code = std::move(code);
         shaders[h.id] = std::move(e);
         ++stats.shader_modules;
+    }
+
+    // Materializes a pack-backed shader (see ShaderEntry). An entry the pack cannot deliver any more
+    // falls back to the hash text, which compiles (and is rejected) like a pack miss.
+    void ensure_shader(const ShaderEntry& e) {
+        if (!e.pending) return;
+        e.pending = false;
+        std::optional<std::string> hit = pack ? pack->get(e.hash) : std::nullopt;
+        if (hit && !hit->empty()) {
+            e.code = std::move(*hit);
+        } else {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "hash:%llx", static_cast<unsigned long long>(e.hash));
+            e.code = buf;
+            ++stats.shader_pack_misses;
+        }
+        const char* stage_name = e.stage == 0 ? "vertex" : e.stage == 1 ? "fragment" : e.stage == 2 ? "compute" : "";
+        e.explicit_ep = extract_wgsl_entry_point(e.code, stage_name);
+        e.module = make_module(e.code);
     }
 
     wgpu::ShaderModule make_module(const std::string& code) {
@@ -1525,6 +1554,7 @@ struct NativeExecutor::Impl {
         auto vit = shaders.find(h.vs_module_id);
         if (vit == shaders.end()) return fail("unknown vertex shader module " + std::to_string(h.vs_module_id));
         const ShaderEntry& vs = vit->second;
+        ensure_shader(vs);
 
         // decodeRenderPipelineKey + validateVertexBufferLayouts
         const uint32_t target_count = std::min<uint32_t>(key.color_target_count, 8);
@@ -1583,6 +1613,7 @@ struct NativeExecutor::Impl {
             auto fit = shaders.find(h.fs_module_id);
             if (fit == shaders.end()) return fail("unknown fragment shader module " + std::to_string(h.fs_module_id));
             fs = &fit->second;
+            ensure_shader(*fs);
             for (uint32_t i = 0; i < target_count; ++i) {
                 const GpuColorTargetKey& t = key.color_targets[i];
                 if (t.format == 0 || !t.blend_enabled) continue;
@@ -1709,6 +1740,7 @@ struct NativeExecutor::Impl {
         auto cit = shaders.find(h.cs_module_id);
         if (cit == shaders.end()) return fail("unknown compute shader module " + std::to_string(h.cs_module_id));
         const ShaderEntry& cs = cit->second;
+        ensure_shader(cs);
         const std::string ep = resolve_shader_entry_point(cs.code, cs.explicit_ep, "compute");
         AutoLayoutMeta auto_meta;
         if (!auto_layout && group0_entries) {
@@ -1749,6 +1781,7 @@ struct NativeExecutor::Impl {
             return;
         }
         const ShaderEntry& vs = vit->second;
+        ensure_shader(vs);
         const ShaderEntry* fs = nullptr;
         if (h.fs_shader_id != 0) {
             auto fit = shaders.find(h.fs_shader_id);
@@ -1757,6 +1790,7 @@ struct NativeExecutor::Impl {
                 return;
             }
             fs = &fit->second;
+            ensure_shader(*fs);
         }
         ++stats.reflection_unavailable;
         const V1VertexLayout vl = plan_v1_vertex_layout(h.vertex_stride);
@@ -1804,6 +1838,7 @@ struct NativeExecutor::Impl {
         auto cit = shaders.find(h.cs_shader_id);
         if (cit == shaders.end()) return;  // `_buildComputePipelineDescriptorV1` returns null silently
         const ShaderEntry& cs = cit->second;
+        ensure_shader(cs);
         ++stats.reflection_unavailable;
         wgpu::ComputePipelineDescriptor cd{};
         cd.layout = nullptr;  // 'auto'

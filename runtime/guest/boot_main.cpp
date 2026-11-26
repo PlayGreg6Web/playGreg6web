@@ -754,6 +754,7 @@ std::atomic<bool> g_window_focused{true};
 std::atomic<playgta6::guest::host_input::HostInputSource*> g_host_source{nullptr};
 std::mutex g_live_final_mutex;
 std::string g_live_final_stats = "null";  // the executor's stats_json, captured when the pump stops
+std::atomic<bool> g_live_deadline_active{false};  // the --max-ms watcher thread of a live run
 std::atomic<bool> g_guest_faulted{false};  // set before the window is held open on a fault
 
 // Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
@@ -857,6 +858,21 @@ bool start_live_window() {
     }
     g_live_started = true;
     playgta6::os::set_wgpu_submit_observer(&live_observer);
+    // --max-ms must end a live run even while the guest is blocked behind the executor (the boot's own
+    // limit is only checked on indirect dispatches, which a thread stuck in submit never reaches).
+    if (g_options.max_ms != 0) {
+        g_live_deadline_active.store(true);
+        std::thread([] {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(g_options.max_ms);
+            while (g_live_deadline_active.load() && std::chrono::steady_clock::now() < end)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (!g_live_deadline_active.load()) return;
+            std::fprintf(stderr, "[harness] --max-ms %llu reached: stopping the live run\n",
+                         static_cast<unsigned long long>(g_options.max_ms));
+            guest::request_boot_stop();
+            g_live.abort();
+        }).detach();
+    }
     return true;
 }
 
@@ -877,6 +893,7 @@ void hold_window_on_fault(bool faulted) {
 // After the boot: detach, drain the queue, destroy the executor on its thread.
 void stop_live_window() {
     if (!g_live_started) return;
+    g_live_deadline_active.store(false);
     playgta6::os::set_wgpu_submit_observer(nullptr);
     g_live.stop();
     const ne::LivePumpStats s = g_live.stats();

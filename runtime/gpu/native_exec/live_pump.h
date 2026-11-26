@@ -136,6 +136,22 @@ public:
         thread_.join();
     }
 
+    // Ends the run now: queued batches are discarded, a submit() blocked on backpressure returns
+    // (and later ones discard), and the pump thread exits after the batch it is executing. For a
+    // wall-clock limit that must hold even while the guest is blocked behind a slow executor.
+    void abort() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.discarded_on_close += queue_.size();
+            queue_.clear();
+            queued_bytes_ = 0;
+            stopping_ = true;
+        }
+        work_cv_.notify_all();
+        room_cv_.notify_all();
+        idle_cv_.notify_all();
+    }
+
     bool window_closed() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return closed_;
