@@ -66,6 +66,10 @@ public:
     void start();
     void stop();
     uint64_t writes() const { return writes_.load(); }
+    // The keyboard is read globally (GetAsyncKeyState); with a live window the harness enables it only
+    // while that window has focus, so typing elsewhere does not drive the game. The pad is unaffected.
+    void set_keyboard_enabled(bool enabled) { keyboard_enabled_.store(enabled); }
+    bool keyboard_enabled() const { return keyboard_enabled_.load(); }
 
 private:
     void run();
@@ -73,6 +77,7 @@ private:
     playgta6::InputState* state_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> keyboard_enabled_{true};
     std::atomic<uint64_t> writes_{0};
 };
 

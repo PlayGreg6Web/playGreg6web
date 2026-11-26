@@ -85,6 +85,8 @@ public:
     // Processes WebGPU callbacks and, with a window, window messages. Returns false once the window
     // was closed (always true headless).
     bool poll();
+    // True while the presenting window has keyboard focus (false headless).
+    bool window_focused() const;
     // Blocks until the GPU finished all submitted work.
     void wait_idle();
 

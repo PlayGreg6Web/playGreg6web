@@ -496,6 +496,9 @@ else()
 
     # Native executor stream model (gpu/native_exec/stream_model.h, replay_frames.h): no WebGPU,
     # so it runs on every host build.
+    add_executable(test_live_pump ../tests/test_live_pump.cpp)
+    target_link_libraries(test_live_pump PRIVATE playgta6_core)
+    add_test(NAME test_live_pump COMMAND test_live_pump)
     add_executable(test_native_exec_model ../tests/test_native_exec_model.cpp)
     target_link_libraries(test_native_exec_model PRIVATE playgta6_core)
     add_test(NAME test_native_exec_model COMMAND test_native_exec_model)
@@ -535,6 +538,12 @@ else()
         target_include_directories(playgta6_native_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(playgta6_native_exec PUBLIC dawn::webgpu_dawn)
 
+        # `playgta6_boot --window`: the live packet stream goes to the executor (gpu/native_exec/live_pump.h).
+        if(TARGET playgta6_boot)
+            target_link_libraries(playgta6_boot PRIVATE playgta6_native_exec)
+            target_compile_definitions(playgta6_boot PRIVATE PLAYGTA6_NATIVE_EXECUTOR=1)
+        endif()
+
         add_executable(pg6_native_exec gpu/native_exec/pg6_native_exec_main.cpp)
         target_link_libraries(pg6_native_exec PRIVATE playgta6_native_exec)
 
@@ -554,7 +563,7 @@ else()
                 DOWNLOAD_EXTRACT_TIMESTAMP TRUE
             )
             FetchContent_MakeAvailable(dxc_prebuilt)
-            foreach(_t pg6_native_exec test_native_executor)
+            foreach(_t pg6_native_exec test_native_executor playgta6_boot)
                 add_custom_command(TARGET ${_t} POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
                         "${dxc_prebuilt_SOURCE_DIR}/bin/x64/dxcompiler.dll"

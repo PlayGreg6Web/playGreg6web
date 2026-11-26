@@ -60,6 +60,7 @@ public:
         return !closed_;
     }
     bool closed() const override { return closed_; }
+    bool focused() const override { return hwnd_ != nullptr && !closed_ && GetForegroundWindow() == hwnd_; }
     void client_size(uint32_t* width, uint32_t* height) const override {
         RECT r{};
         if (hwnd_ && GetClientRect(hwnd_, &r)) {

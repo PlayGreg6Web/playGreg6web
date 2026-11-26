@@ -67,8 +67,10 @@ against `replay_capture.py`'s log.
 | `runtime/gpu/native_exec/replay_frames.h` | `splitFrames`, frame digest and sampled stats of `tools/replay/replay.html`. No WebGPU types. |
 | `runtime/gpu/native_exec/native_executor.{h,cpp}` | Dawn device, swapchain (offscreen texture or surface), packet handlers, Present. |
 | `runtime/gpu/native_exec/native_window.{h,cpp}` | Optional Win32 window (other hosts: headless only for now). |
+| `runtime/gpu/native_exec/live_pump.h` | Bounded queue + executor thread for live play (`--window`); executor-agnostic, unit-tested. |
 | `runtime/gpu/native_exec/pg6_native_exec_main.cpp` | Trace replay tool. |
 | `tests/test_native_exec_model.cpp` | Model tests (CI). |
+| `tests/test_live_pump.cpp` | Live pump tests with a fake executor (CI). |
 | `tests/test_native_executor.cpp` | GPU tests, headless; exit 77 (CTest skip) without an adapter. |
 
 Every handler names the worker function it mirrors.
@@ -131,6 +133,39 @@ Known divergences, to be closed or documented as they come up:
 
 The order follows what a real capture needs to draw anything: M1 is the first milestone at which
 title frames render natively.
+
+## Live play: `playgta6_boot --window`
+
+Built only with `-DPLAYGTA6_NATIVE_EXECUTOR=ON` (`playgta6_boot` links `playgta6_native_exec` then;
+`tools/build_native_boot.py --native-executor` does the same for the generated full harness; without
+the option `--window` exits with a usage error).
+
+```
+playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gpu-capture f.pg6trace]
+```
+
+- **Hand-off** (`runtime/gpu/native_exec/live_pump.h`, `LivePump<Executor>`): the harness installs one
+  `os::wgpu_submit` observer that feeds the capture (when `--gpu-capture` is given, which then does
+  not attach itself) and copies the batch into the pump. The pump thread creates the executor (so
+  the Dawn device and the window belong to it), executes queued batches in order and polls (window
+  messages, WebGPU callbacks) after every batch and every `idle_poll_ms` (8) while idle.
+- **Backpressure:** the queue is bounded (64 batches / 256 MiB; a single larger batch is admitted
+  into an empty queue). When the executor falls behind, `submit()` blocks the submitting guest
+  thread until room is made, like the browser worker's ring; nothing is dropped. Blocked submits
+  and their total wait are counted (`blocked_submits`, `blocked_ms`) and appear with `submitted`,
+  `executed`, `presents`, `max_queue_depth` in the boot report under `native_executor`.
+- **Close = clean shutdown:** closing the window makes the pump discard the queue, release any
+  blocked submitter and call `guest::request_boot_stop()`; the boot stops at its next dispatch like
+  a bound (`stop_requested`), the pump is drained and joined, and the normal report and summary are
+  written. After close `submit()` drops and returns at once (`dropped_after_close`), so the guest
+  can never deadlock behind a dead consumer.
+- **Focus and `--host-input`:** the pump forwards window focus changes. The XInput pad is always
+  read; the keyboard (read globally with `GetAsyncKeyState`) only counts while the window has focus
+  (`HostInputSource::set_keyboard_enabled`).
+- **Tests:** `tests/test_live_pump.cpp` (CI, every host build) drives the pump with a fake executor:
+  order, executor created/used/destroyed on the pump thread, backpressure (blocks at the bound,
+  counted, nothing lost), byte bound and oversized batch, close unblocking a blocked submitter,
+  focus forwarding, creation failure, stop draining.
 
 ## Threading
 

@@ -567,6 +567,8 @@ bool NativeExecutor::poll() {
     return true;
 }
 
+bool NativeExecutor::window_focused() const { return impl_->window && impl_->window->focused(); }
+
 void NativeExecutor::wait_idle() {
     Impl& s = *impl_;
     s.instance.WaitAny(s.queue.OnSubmittedWorkDone(wgpu::CallbackMode::WaitAnyOnly,

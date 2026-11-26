@@ -585,6 +585,11 @@ bool request_exit(int32_t exit_code);
 // terminates the process: execution cannot resume after a host fault.
 bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc);
 
+// Asks the running boot to stop cleanly (thread-safe, any thread, e.g. the live window's close):
+// the boot thread stops at its next dispatch like a bound (status limit, kind "stop_requested")
+// and the harness writes the normal report. Sticky until the process ends.
+void request_boot_stop();
+
 // Report / summary of the last boot (also after report_host_fault).
 std::string last_report_json();
 

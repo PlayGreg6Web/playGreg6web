@@ -52,6 +52,11 @@
 //   --gpu-capture-start-ms <n>  start the capture's frames late, n ms after boot (gpu/frame_capture.h
 //                        "Late start"); objects and the newest writes are kept, commands dropped
 //   --gpu-capture-start-at-script  start the capture's frames at the input script's `capture` step
+//   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
+//                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.
+//                        Only in builds with -DPLAYGTA6_NATIVE_EXECUTOR=ON. Works together with
+//                        --gpu-capture and --host-input (keyboard only while the window has focus).
+//                        Closing the window stops the boot cleanly (normal report, stop_requested).
 //   --arena-log-limit <n>     address-space events kept in the report log (default 4096)
 //   --no-tls-callbacks / --no-entry / --quiet
 //
@@ -99,6 +104,10 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
+#include "gpu/native_exec/live_pump.h"
+#include "gpu/native_exec/native_executor.h"
+#endif
 #include "guest/input_script.h"
 #include "gpu/gpu_va_watch.h"
 #include "os/guest_heap.h"
@@ -205,6 +214,8 @@ struct Options {
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
+    bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
+    uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
     std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
     std::string watch_gpu_va;       // --watch-gpu-va: GPU address ranges to report references to (gpu/gpu_va_watch.h)
@@ -284,6 +295,13 @@ bool parse(int argc, char** argv, Options& o) {
             o.fence_lag = false;  // the default since #663; kept for old command lines
         } else if (a == "--eager-gpu-objects") {
             o.eager_gpu_objects = true;
+        } else if (a == "--window") {
+            o.window = true;
+        } else if (a == "--window-size" && i + 1 < argc) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w == 0 || h == 0) return false;
+            o.window_width = w;
+            o.window_height = h;
         } else if (a == "--host-input") {
             o.host_input = true;
         } else if (a == "--native-pipelines") {
@@ -721,6 +739,77 @@ void start_profile() {}
 void finish_profile() {}
 #endif
 
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
+namespace ne = playgta6::gpu::native_exec;
+ne::LivePump<ne::NativeExecutor> g_live;
+bool g_live_started = false;
+std::atomic<bool> g_window_focused{true};
+std::atomic<playgta6::guest::host_input::HostInputSource*> g_host_source{nullptr};
+std::mutex g_live_final_mutex;
+std::string g_live_final_stats = "null";  // the executor's stats_json, captured when the pump stops
+
+void live_observer(const uint8_t* data, size_t len) {
+    if (!g_options.gpu_capture.empty()) {
+        gpu::frame_capture_observe(data, len);
+    }
+    g_live.submit(data, len);  // blocks while the executor is behind (bounded queue, counted)
+}
+
+void apply_window_focus(bool focused) {
+    g_window_focused.store(focused);
+    if (auto* source = g_host_source.load()) {
+        source->set_keyboard_enabled(focused);
+    }
+}
+
+// Starts the pump; false (after printing why) when the executor cannot be created.
+bool start_live_window() {
+    ne::ExecutorOptions options;
+    options.window = true;
+    options.width = g_options.window_width;
+    options.height = g_options.window_height;
+    g_live.set_finish_hook([](ne::NativeExecutor& exec) {
+        std::lock_guard<std::mutex> lock(g_live_final_mutex);
+        g_live_final_stats = exec.stats_json();
+    });
+    std::string error;
+    const bool ok = g_live.start(
+        [options](std::string* err) -> std::unique_ptr<ne::NativeExecutor> {
+            ne::NativeExecutor::CreateStatus status;
+            return ne::NativeExecutor::create(options, &status, err);
+        },
+        [] {
+            std::fprintf(stderr, "[harness] window closed: stopping the boot\n");
+            guest::request_boot_stop();
+        },
+        [](bool focused) { apply_window_focus(focused); }, &error);
+    if (!ok) {
+        std::fprintf(stderr, "[harness] --window: %s\n", error.c_str());
+        return false;
+    }
+    g_live_started = true;
+    playgta6::os::set_wgpu_submit_observer(&live_observer);
+    return true;
+}
+
+// After the boot: detach, drain the queue, destroy the executor on its thread.
+void stop_live_window() {
+    if (!g_live_started) return;
+    playgta6::os::set_wgpu_submit_observer(nullptr);
+    g_live.stop();
+    const ne::LivePumpStats s = g_live.stats();
+    std::fprintf(stderr,
+                 "[harness] native executor: %llu batch(es), %llu present(s), submit blocked %llu time(s) / %llu ms\n",
+                 static_cast<unsigned long long>(s.executed), static_cast<unsigned long long>(s.presents),
+                 static_cast<unsigned long long>(s.blocked_submits), static_cast<unsigned long long>(s.blocked_ns / 1000000));
+    {
+        std::lock_guard<std::mutex> lock(g_live_final_mutex);
+        std::fprintf(stderr, "[harness] native executor stats: %s\n", g_live_final_stats.c_str());
+    }
+    g_live_started = false;
+}
+#endif
+
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
 playgta6::os::audio_wav_dump::Writer g_audio_dump;
 
@@ -988,6 +1077,9 @@ void run_boot_thread() {
     cfg.off_thread_fault = &off_thread_fault;
     cfg.guest_thread_started = &profile_thread_started;
     const guest::BootResult result = guest::run_boot(cfg);
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
+    stop_live_window();
+#endif
     playgta6::os::gdk::gamesave::flush_all();  // exit: nothing the title saved stays only in cache
     if (!g_finishing.exchange(true)) {
         write_outputs(g_options.quiet);
@@ -1177,6 +1269,11 @@ int main(int argc, char** argv) {
             o += ", \"drops_by_program\": " + dg::drop_table().by_program_json();
             o += "}";
             o += ",\n  \"pipeline_prewarm\": " + gpu::prewarm_host_report_json();
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
+            if (g_live_started) {
+                o += ",\n  \"native_executor\": " + g_live.stats_json();
+            }
+#endif
             o += ",\n  \"rt\": " + gpu::rt_arena::report_json();
             o += ",\n  \"gpu_drop_table\": " + dg::drop_table().detail_json();
             {
@@ -1227,6 +1324,7 @@ int main(int argc, char** argv) {
         capture.keep_payloads = g_options.gpu_capture_payloads;
         capture.thin_uploads = static_cast<uint32_t>(g_options.gpu_capture_thin_uploads);
         capture.start_ms = g_options.gpu_capture_start_ms;
+        capture.attach = !g_options.window;  // with --window the live observer feeds the capture
         capture.deferred = g_options.gpu_capture_start_ms != 0 || g_options.gpu_capture_start_at_script;
         if (capture.deferred) {
             std::fprintf(stderr, "[harness] GPU capture deferred until %s\n",
@@ -1301,6 +1399,16 @@ int main(int argc, char** argv) {
             sample->counters.emplace_back("view_textures_with_memory", probe.views_registered);
             sample->counters.emplace_back("view_textures_with_data", probe.views_with_data);
         });
+    }
+    if (g_options.window) {
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
+        if (!start_live_window()) {
+            return kExitUsage;
+        }
+#else
+        std::fprintf(stderr, "[harness] --window needs a build with -DPLAYGTA6_NATIVE_EXECUTOR=ON\n");
+        return kExitUsage;
+#endif
     }
     // --input-script: a test tool that presses buttons on a schedule through the same InputState
     // the browser's input bridge writes (the title reads it through the GameInput adapter).

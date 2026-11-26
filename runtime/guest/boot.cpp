@@ -55,6 +55,7 @@
 namespace playgta6::guest {
 
 namespace {
+std::atomic<bool> g_stop_requested{false};  // request_boot_stop
 
 using os::PageProtect;
 using os::VirtualMemoryArena;
@@ -1454,6 +1455,10 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     }
     if (!t_running_boot) {
         return;  // bounds can only stop the boot's own thread
+    }
+    if (g_stop_requested.load(std::memory_order_relaxed)) {
+        t_observer.flush_dispatches();
+        stop_on_limit(state, "stop_requested", target);
     }
     if (b.max_dispatches != 0) {
         const uint64_t total =
@@ -3286,6 +3291,8 @@ bool request_exit(int32_t exit_code) {
     b.message = "guest requested process exit (" + std::to_string(exit_code) + ")";
     stop_boot();
 }
+
+void request_boot_stop() { g_stop_requested.store(true, std::memory_order_relaxed); }
 
 bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc) {
     BootState& b = boot();

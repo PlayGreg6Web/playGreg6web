@@ -182,7 +182,7 @@ void HostInputSource::run() {
                 }
             }
         }
-        const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, convert_keyboard(read_keys()));
+        const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, convert_keyboard(keyboard_enabled_.load() ? read_keys() : 0));
         playgta6::os::GameInputReader::write_monotonic(*state_, values);
         writes_.fetch_add(1);
         std::this_thread::sleep_for(std::chrono::milliseconds(8));

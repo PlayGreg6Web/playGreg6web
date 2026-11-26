@@ -20,6 +20,8 @@ public:
     // false once the user has closed the window.
     virtual bool pump() = 0;
     virtual bool closed() const = 0;
+    // True while this is the foreground (keyboard-focused) window. Callable from any thread.
+    virtual bool focused() const { return false; }
     // Current client area size (0 x 0 while minimized).
     virtual void client_size(uint32_t* width, uint32_t* height) const = 0;
     // Native handles for the WebGPU surface (Win32: HINSTANCE, HWND).

@@ -841,6 +841,18 @@ set_source_files_properties(
 target_compile_definitions({HARNESS_TARGET} PRIVATE {defines})
 target_include_directories({HARNESS_TARGET} PRIVATE {includes})
 target_link_libraries({HARNESS_TARGET} PRIVATE playgta6_core)
+# --window (live play through the Dawn-backed native executor): only with -DPLAYGTA6_NATIVE_EXECUTOR=ON.
+if(TARGET playgta6_native_exec)
+    target_link_libraries({HARNESS_TARGET} PRIVATE playgta6_native_exec)
+    target_compile_definitions({HARNESS_TARGET} PRIVATE PLAYGTA6_NATIVE_EXECUTOR=1)
+    if(WIN32 AND DEFINED dxc_prebuilt_SOURCE_DIR)
+        add_custom_command(TARGET {HARNESS_TARGET} POST_BUILD
+            COMMAND ${{CMAKE_COMMAND}} -E copy_if_different
+                "${{dxc_prebuilt_SOURCE_DIR}}/bin/x64/dxcompiler.dll"
+                "${{dxc_prebuilt_SOURCE_DIR}}/bin/x64/dxil.dll"
+                "$<TARGET_FILE_DIR:{HARNESS_TARGET}>")
+    endif()
+endif()
 set_target_properties({HARNESS_TARGET} PROPERTIES
     OUTPUT_NAME {HARNESS_OUTPUT}
     RUNTIME_OUTPUT_DIRECTORY "{_cmake_path(bin_dir)}"
@@ -874,6 +886,7 @@ def build_harness(
     jobs: int,
     runner: CommandRunner = run_command,
     progress: Callable[[str], None] | None = None,
+    native_executor: bool = False,
 ) -> Path:
     project = out_dir / "harness"
     build = out_dir / "harness-build"
@@ -886,7 +899,8 @@ def build_harness(
     cmake = find_cmake()
     config = "RelWithDebInfo" if debug_info else "Release"
     steps = [
-        [cmake, "-S", str(project), "-B", str(build), f"-DCMAKE_BUILD_TYPE={config}"],
+        [cmake, "-S", str(project), "-B", str(build), f"-DCMAKE_BUILD_TYPE={config}",
+         f"-DPLAYGTA6_NATIVE_EXECUTOR={'ON' if native_executor else 'OFF'}"],
         [cmake, "--build", str(build), "--config", config, "--target", HARNESS_TARGET,
          "--parallel", str(max(1, jobs))],
     ]
@@ -957,6 +971,8 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
     parser.add_argument("--sample", type=int, default=0, help="compile N spread shards and extrapolate")
     parser.add_argument("--delete-ir", action="store_true", help="delete each .ll once compiled")
     parser.add_argument("--no-link", action="store_true")
+    parser.add_argument("--native-executor", action="store_true",
+                        help="build the harness with --window support (Dawn-backed native GPU executor)")
     parser.add_argument("--debug-info", action="store_true")
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--json", action="store_true", help="print a JSON summary")
@@ -1044,7 +1060,8 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
         elif not args.no_link:
             t1 = time.monotonic()
             objects = [r.obj for r in results if r.obj is not None]
-            exe = build_harness(out_dir, REPO_ROOT, inputs, objects, args.debug_info, args.jobs, runner, say)
+            exe = build_harness(out_dir, REPO_ROOT, inputs, objects, args.debug_info, args.jobs, runner, say,
+                                 native_executor=args.native_executor)
             summary["link_seconds"] = round(time.monotonic() - t1, 1)
             summary["harness"] = str(exe)
             summary["harness_bytes"] = exe.stat().st_size
