@@ -111,8 +111,8 @@ enum Def {
     Other,
 }
 
-struct Ctx<'a> {
-    layout: &'a Layout,
+pub(crate) struct Ctx<'a> {
+    pub(crate) layout: &'a Layout,
 }
 
 impl Ctx<'_> {
@@ -296,7 +296,7 @@ fn guard_shape(ins: &[&Instruction]) -> String {
 }
 
 /// Classifies the jump at the end of `ins`.
-fn classify(ctx: &Ctx<'_>, reason: UnresolvedJump, ins: &[&Instruction]) -> Pattern {
+pub(crate) fn classify(ctx: &Ctx<'_>, reason: UnresolvedJump, ins: &[&Instruction]) -> Pattern {
     let at = ins.len() - 1;
     let jmp = ins[at];
     let guard = guard_shape(ins);
@@ -350,7 +350,7 @@ fn classify(ctx: &Ctx<'_>, reason: UnresolvedJump, ins: &[&Instruction]) -> Patt
 
 /// Instruction window for the jump ending the block at `start`: the block, then sole-predecessor
 /// blocks.
-fn window<'a>(
+pub(crate) fn window<'a>(
     func: &'a Function,
     preds: &BTreeMap<u64, Vec<u64>>,
     start: u64,

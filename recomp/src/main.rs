@@ -84,6 +84,7 @@ enum Command {
     Lift(lift_cmd::LiftArgs),
     SurveyInterfaces(playgta6_recomp::survey::cli::Args),
     SurveyJumps(playgta6_recomp::jump_survey::Args),
+    ExplainSite(playgta6_recomp::explain_site::Args),
     OpcodeCensus(PathBuf),
     Build(BuildArgs),
     BuildProgram(program_cmd::ProgramArgs),
@@ -125,6 +126,7 @@ fn print_usage() {
     eprintln!("  playgta6-recomp opcode-census <pe-path>");
     eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
     eprintln!("  playgta6-recomp {}", playgta6_recomp::jump_survey::USAGE);
+    eprintln!("  playgta6-recomp {}", playgta6_recomp::explain_site::USAGE);
     eprintln!(
         "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard]"
     );
@@ -199,13 +201,15 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
             .map(|a| a.map_or(Command::Help, Command::SurveyInterfaces)),
         "survey-jumps" => playgta6_recomp::jump_survey::parse_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::SurveyJumps)),
+        "explain-site" => playgta6_recomp::explain_site::parse_args(&args[1..])
+            .map(|a| a.map_or(Command::Help, Command::ExplainSite)),
         "build" => parse_build_args(&args[1..]),
         "build-program" => program_cmd::parse_program_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::BuildProgram)),
         "export-thunks" => export_cmd::parse_export_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::ExportThunks)),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'opcode-census', 'survey-interfaces', 'survey-jumps', 'build', 'build-program' or 'export-thunks'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'opcode-census', 'survey-interfaces', 'survey-jumps', 'explain-site', 'build', 'build-program' or 'export-thunks'. Run with --help for usage."
         )),
     }
 }
@@ -1030,6 +1034,16 @@ fn main() -> ExitCode {
             }
         },
         Ok(Command::SurveyJumps(a)) => match playgta6_recomp::jump_survey::run(&a) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::ExplainSite(a)) => match playgta6_recomp::explain_site::run(&a) {
             Ok(report) => {
                 print!("{report}");
                 ExitCode::SUCCESS
