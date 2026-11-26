@@ -1728,7 +1728,9 @@ int main(int argc, char** argv) {
             host_source.set_recorder(&recorder);
             std::fprintf(stderr, "[harness] recording host input to %s\n", g_options.record_input.c_str());
         }
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
         g_host_source.store(&host_source);
+#endif
         host_source.start();
         std::fprintf(stderr, "[harness] host input: XInput pad + keyboard\n");
     }
