@@ -17,6 +17,33 @@ function used to be lifted again, and any change that altered a function's size 
 tables, CFG rules) shifted every later shard boundary, so most shard objects were compiled again.
 Two pieces in `recomp/src/pipeline/shard_lift.rs` fix that.
 
+## What a rebuild costs now
+
+Game executable, 24 threads, warm caches unless noted. Numbers are from the PR descriptions (rounded;
+discovery varies with load). The recompiler cargo build itself is not included (not measured).
+
+| You changed | Recompiler cache | Discovery | Lift | Shards compiled | Harness (runtime libs + link) | Expected wall time |
+|---|---|---|---|---|---|---|
+| Runtime / host C++ only (no recompiler or shim input) | hit | skipped | skipped (whole-program hit) | 0 | ~18 s link (core 30-60 s if it changed) | ~20-60 s |
+| Shim header / anything outside the recompiler that feeds the whole-program key | hit | 1 s (hit) | ~21 s, 0 functions re-lifted | 0 (compile ~2 s) | ~18 s | ~1 min |
+| Lifter (`recomp/src/lift/**`, `cfg.rs`) | cargo rebuild | 1 s (hit) | ~36-40 s, all functions re-lifted | few (7 of 845 for one instruction, ~8 s) | ~18 s | ~1.5-2 min + cargo |
+| Discovery rule (`jump_table.rs`, `discover.rs`, `reach.rs`) | cargo rebuild | ~155 s (miss) | ~24 s, only affected functions | 1 of 845 for one jump-table rule (~8 s) | ~18 s | ~3.5-4 min + cargo |
+| The game executable / DLLs (or a cold cache) | cargo rebuild | ~147 s | ~48 s | all 845, ~281 s with `-O t` (was 348 s) | ~18 s (runtime libs hidden behind the compile) | ~8-9 min |
+
+Players never compile: `tools/update_prebuilt.ps1` (and `-Web`) builds once into a folder and
+`play_native.ps1 -Prebuilt` / `play_local.ps1 -Prebuilt` start it without any build (#1854, #1862).
+
+What produced these numbers:
+
+| PR | Effect |
+|---|---|
+| #1639 | prebuilt recompiler cache + per-build-dir lock; cold 9m29s -> 1m36s with a lift cache hit |
+| #1853 | runtime libs build during the shard compile, PCH for `playgta6_core`: harness step ~72 s -> ~18 s |
+| #1878 | `-O t` default pass list: cold full compile 348 s -> 281 s (`-O f`: faster, ~15% larger objects) |
+| #1885 | per-shard lift cache + stable shard plan: a jump-table rule change recompiles 1 shard instead of 64; no-op 0 shards |
+| #1908 | discovery cache: 147 s -> ~1 s on no-op / lifter change; a discovery rule change still pays ~155 s |
+| #1898 / #1900 | `trim_caches.py` and auto-trim on low disk; one cache root (`PLAYGTA6_CACHE_ROOT`) |
+
 ## One cache root
 
 Every tool (`build_native_boot.py`, `run_native_boot.py`, `run_browser_boot.py`, `update_prebuilt.ps1`,

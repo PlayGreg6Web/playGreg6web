@@ -29,6 +29,9 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
   live path: `run_native_boot.py --live-executor` (#1847), no window.
 - Build speed: runtime libs build while shards compile, precompiled headers (#1853); the default object pass list is
   tuned (`build_native_boot.py -O t`; `-O f` is faster codegen; #1878).
+- Build times (game exe, warm caches; details in [BUILD_CACHING.md](BUILD_CACHING.md)): runtime-only change ~20-60 s;
+  shim/no-op ~1 min; lifter change ~1.5-2 min + cargo (discovery cache hit, few shards); discovery rule change ~3.5-4 min
+  (discovery ~155 s, 1 shard); new exe or cold cache ~8-9 min (compile 281 s). Players use `-Prebuilt` and never compile.
 - Controls: keyboard and the first XInput pad; the key table is in [PLAY_LOCALLY.md](PLAY_LOCALLY.md)
   (Enter/Space = A, Backspace = B, WASD = left stick, arrows = D-pad, Esc = Menu). F11 toggles fullscreen, F12 saves a PNG screenshot (#1827).
 - Mouse look is opt-in: `keymap.ini` `[mouse] look = on` captures the cursor via Raw Input; F8 releases it (all window hotkeys: keymap.ini `[hotkeys]`), a click
