@@ -1086,6 +1086,35 @@ size_t capture_host_stack(void** frames, size_t max_frames) {
     return RtlCaptureStackBackTrace(0, static_cast<DWORD>(std::min<size_t>(max_frames, 62)), frames, nullptr);
 }
 
+// Prints the first return-address-looking words on the faulting thread's stack as module+offset
+// (a call through a null pointer has pc 0 and no unwind info, so the caller is at [rsp]).
+void print_host_stack_hint(uint64_t rsp) {
+    std::fprintf(stderr, "[host-stack] fault thread %lu, rsp 0x%" PRIx64 ":", GetCurrentThreadId(), rsp);
+    int printed = 0;
+    for (int i = 0; i < 256 && printed < 12; ++i) {
+        uint64_t word = 0;
+        __try {
+            word = *reinterpret_cast<const uint64_t*>(rsp + static_cast<uint64_t>(i) * 8);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+        HMODULE module = nullptr;
+        if (word < 0x10000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                  reinterpret_cast<LPCSTR>(word), &module)) {
+            continue;
+        }
+        char name[MAX_PATH] = {};
+        GetModuleFileNameA(module, name, MAX_PATH);
+        const char* base = std::strrchr(name, '\\');
+        std::fprintf(stderr, " %s+0x%" PRIx64, base != nullptr ? base + 1 : name,
+                     word - reinterpret_cast<uint64_t>(module));
+        ++printed;
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
     const DWORD code = info->ExceptionRecord->ExceptionCode;
     const char* kind = nullptr;
@@ -1121,6 +1150,7 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
         address = static_cast<uint64_t>(info->ExceptionRecord->ExceptionInformation[1]);
     }
     const uint64_t pc = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
+    print_host_stack_hint(info->ContextRecord->Rsp);
     host_fault(kind, address, pc, kExitHostFault);
 }
 

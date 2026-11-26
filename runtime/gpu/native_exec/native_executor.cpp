@@ -492,6 +492,8 @@ struct NativeExecutor::Impl {
     std::vector<wgpu::Texture> dummy_textures;
     wgpu::BindGroupLayout empty_layout;
     wgpu::ShaderModule empty_fragment;
+    wgpu::ShaderModule error_vertex_module;
+    wgpu::ShaderModule error_compute_module;
     std::unique_ptr<WgslPack> pack;
     // Reflection loader (web/workers/reflection_loader.js ReflectionRegistry) and the layouts a v1
     // pipeline was built with (`_pipelineBindGroupLayouts` / `_pipelineReflectionGroups` and the compute twins).
@@ -2277,6 +2279,26 @@ struct NativeExecutor::Impl {
         if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(msg);
     }
 
+    // An invalid-by-validation pipeline (the entry point does not exist in a valid module). The
+    // descriptors must carry a real module: Dawn dereferences a null module while validating it
+    // (ObjectBase::GetDevice on null: a host access violation that killed live runs).
+    wgpu::RenderPipeline make_error_render_pipeline() {
+        if (!error_vertex_module)
+            error_vertex_module = make_module("@vertex fn vs_main() -> @builtin(position) vec4f { return vec4f(); }\n");
+        wgpu::RenderPipelineDescriptor bad{};
+        bad.vertex.module = error_vertex_module;
+        bad.vertex.entryPoint = {"pg6_missing_entry", WGPU_STRLEN};
+        return device.CreateRenderPipeline(&bad);
+    }
+
+    wgpu::ComputePipeline make_error_compute_pipeline() {
+        if (!error_compute_module) error_compute_module = make_module("@compute @workgroup_size(1) fn cs_main() {}\n");
+        wgpu::ComputePipelineDescriptor bad{};
+        bad.compute.module = error_compute_module;
+        bad.compute.entryPoint = {"pg6_missing_entry", WGPU_STRLEN};
+        return device.CreateComputePipeline(&bad);
+    }
+
     const wgpu::RenderPipeline& resolve(const RenderPipelineEntry& e) {
         if (e.pending) {
             await_pipe(e);
@@ -2286,8 +2308,7 @@ struct NativeExecutor::Impl {
                 pipe_failed(*e.pending, "render");
                 // What sync creation yields for an invalid descriptor: an error pipeline (the draw
                 // that uses it is then dropped by validation), not a null handle.
-                wgpu::RenderPipelineDescriptor bad{};
-                e.pipeline = device.CreateRenderPipeline(&bad);
+                e.pipeline = make_error_render_pipeline();
             }
             e.pending.reset();
         }
@@ -2301,8 +2322,7 @@ struct NativeExecutor::Impl {
                 e.pipeline = e.pending->compute;
             } else {
                 pipe_failed(*e.pending, "compute");
-                wgpu::ComputePipelineDescriptor bad{};
-                e.pipeline = device.CreateComputePipeline(&bad);
+                e.pipeline = make_error_compute_pipeline();
             }
             e.pending.reset();
         }

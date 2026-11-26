@@ -1174,6 +1174,31 @@ void test_blit() {
     }
 }
 
+// A pipeline whose async creation fails (invalid WGSL) resolves to an error pipeline at first use:
+// the draw is dropped, nothing crashes (a null module in the placeholder descriptor used to be a
+// host access violation inside Dawn's validation).
+void test_failed_async_pipeline_resolves(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_shader_module(80, GpuShaderStage::Vertex, "this is not wgsl");
+    setup.create_shader_module(81, GpuShaderStage::Fragment, "this is not wgsl");
+    create_layouts(setup, 82, 83, {});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(84, 80, 81, 83)));
+    run(ex, setup);
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(84);
+    frame.draw(3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().async_pipeline_failures > before.async_pipeline_failures);
+}
+
 // Live-mode options: pipelines are created asynchronously (awaited at first use, same output) and
 // Dawn's compiled blobs persist in an on-disk cache that a second executor reuses.
 void test_async_pipelines_and_blob_cache() {
@@ -1205,6 +1230,7 @@ void test_async_pipelines_and_blob_cache() {
         CHECK(st.async_pipelines > 0);
         CHECK(st.async_pipeline_failures == 0);
         CHECK(st.device_errors == 0);
+        if (run_index == 0) test_failed_async_pipeline_resolves(*ex);
         CHECK(ex->stats_json().find("\"blob_cache\": {\"enabled\": true") != std::string::npos);
         std::printf("blob cache run %d: hits=%llu misses=%llu stores=%llu entries=%llu bytes=%llu (async waits %llu)\n",
                     run_index, static_cast<unsigned long long>(st.blob_hits), static_cast<unsigned long long>(st.blob_misses),
