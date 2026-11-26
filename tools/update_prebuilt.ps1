@@ -66,7 +66,8 @@ $Dir = [IO.Path]::GetFullPath($Dir)
 $tmp = "$Dir.new"; $old = "$Dir.old"
 if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
 if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old }
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dir) | Out-Null
+$parent = Split-Path -Parent $Dir
+if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 $commit = (& git -C $repo rev-parse HEAD).Trim()
 $dirty = [bool](& git -C $repo status --porcelain --untracked-files=no)
 Push-Location $repo
@@ -82,6 +83,11 @@ try {
 foreach ($n in @("runs", "program\native\harness-build", "program\native\bin\playgta6_boot.pdb")) { $p = Join-Path $tmp $n; if (Test-Path -LiteralPath $p) { Remove-Item -Recurse -Force -LiteralPath $p } }
 @{ commit = $commit; dirty = $dirty; built_utc = (Get-Date).ToUniversalTime().ToString("o") } |
     ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $tmp "prebuilt.json")
+$busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$Dir\*" })
+if ($busy) {
+    Write-Host "[prebuilt] $Dir is in use (pid $($busy.Id -join ',')); new build kept at $tmp. Close the game, then: Rename-Item '$Dir' '$(Split-Path -Leaf $old)'; Rename-Item '$tmp' '$(Split-Path -Leaf $Dir)'; Remove-Item -Recurse -Force '$old'"
+    exit 2
+}
 if (Test-Path -LiteralPath $Dir) { Rename-Item -LiteralPath $Dir -NewName (Split-Path -Leaf $old) }
 try { Rename-Item -LiteralPath $tmp -NewName (Split-Path -Leaf $Dir) }
 catch { if (Test-Path -LiteralPath $old) { Rename-Item -LiteralPath $old -NewName (Split-Path -Leaf $Dir) }; throw }
