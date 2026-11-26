@@ -50,6 +50,9 @@ struct ExecutorOptions {
     // device without it (r16float depth twins, r32float dummies) run on real hardware.
     bool disable_float32_filterable = false;
     bool gpu_timing = true;
+    // Software adapter (--adapter warp): request Dawn's fallback adapter (D3D12 WARP on Windows) instead of a GPU,
+    // so GPU-less hosts (CI runners) can replay for real. Default off (the high-performance GPU).
+    bool force_fallback_adapter = false;
     // Per-pipeline attribution inside a pass (--gpu-time-split): a pass is timed as segments, one per
     // run of the same pipeline, with a timestamp written inside the pass at every pipeline change
     // (Dawn's chromium-experimental-timestamp-query-inside-passes). Off: a pass is one measurement,

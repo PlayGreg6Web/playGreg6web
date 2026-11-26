@@ -18,6 +18,7 @@
 //               @layer=L @mip=M @range=LO:HI (gpu/native_exec/show_target_model.h). --window: Ctrl+F7 mip, Ctrl+F8 layer,
 //               Ctrl+F9 / Ctrl+F10 previous / next render target (keymap.ini [hotkeys]); the title names what is shown. Headless it shows in
 //               the swapchain that --digest-at reads.
+// --adapter warp|gpu  warp: Dawn's software fallback adapter (D3D12 WARP; no GPU needed, for CI smoke tests); gpu (default)
 // --gpu-validation  strict mode: backend validation + an error scope per packet (stats "validation")
 // --report      write executor statistics (packets handled / not yet handled by opcode) as JSON
 //
@@ -41,7 +42,7 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: pg6_native_exec --trace <file.pg6trace> [--window] [--size WxH] [--frames N]\n"
-                 "                       [--digest-at 0,10,...] [--report <file.json>]\n"
+                 "                       [--adapter warp|gpu] [--dump-frame 0,10,...] [--dump-dir D] [--digest-at 0,10,...] [--report <file.json>]\n"
                  "                       [--show-target <id|tex:ID|depth:ID|pass:N[:depth]|last|cycle>[@layer=L][@mip=M][@range=LO:HI]]\n");
     return 1;
 }
@@ -90,6 +91,10 @@ int main(int argc, char** argv) {
             opts.window = true;
         } else if (a == "--show-target" && (v = next())) {
             opts.show_target = v;
+        } else if (a == "--adapter" && (v = next())) {
+            const std::string w = v;
+            if (w != "warp" && w != "gpu") return usage();
+            opts.force_fallback_adapter = (w == "warp");
         } else if (a == "--gpu-validation") {
             opts.gpu_validation = true;
         } else if (a == "--trace" && (v = next())) {

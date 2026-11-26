@@ -600,6 +600,10 @@ else()
         add_executable(pg6_native_exec gpu/native_exec/pg6_native_exec_main.cpp)
         target_link_libraries(pg6_native_exec PRIVATE playgta6_native_exec)
 
+        # Writes a tiny synthetic .pg6trace (swapchain clears only, no game data) for tests/native_exec_warp_smoke.py.
+        add_executable(gen_native_exec_trace ../tests/gen_native_exec_trace.cpp)
+        target_link_libraries(gen_native_exec_trace PRIVATE playgta6_core)
+
         # Runs on the host's GPU; exits 77 (skipped) when there is no WebGPU adapter.
         add_executable(test_native_executor ../tests/test_native_executor.cpp)
         target_link_libraries(test_native_executor PRIVATE playgta6_native_exec playgta6_core)

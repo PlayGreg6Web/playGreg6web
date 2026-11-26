@@ -51,6 +51,8 @@ def replay_args(a, frames, extra=()):
         args += ["--reflection", r]
     if a.size:
         args += ["--size", a.size]
+    if getattr(a, "adapter", None):
+        args += ["--adapter", a.adapter]
     return args + list(extra)
 
 
@@ -168,6 +170,7 @@ def build_parser():
     p.add_argument("--size", help="WxH swapchain size (default: the executor's)")
     p.add_argument("--frames", type=int, required=True, help="last frame to replay")
     p.add_argument("--every", type=int, default=1, help="digest every Nth frame (default 1 = all)")
+    p.add_argument("--adapter", choices=("gpu", "warp"), help="pass --adapter to pg6_native_exec (warp = software adapter)")
     p.add_argument("--out", default="native-cmp", help="output prefix")
     p.add_argument("--cache-dir", type=Path, help="binary cache for --ref-* (default: next to the object cache)")
     return p

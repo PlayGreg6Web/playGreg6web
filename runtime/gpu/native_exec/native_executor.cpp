@@ -458,6 +458,7 @@ struct NativeExecutor::Impl {
     ExecutorOptions options;
     BlobCache blob_cache;  // before the device: Dawn may call the hooks until the device is gone
     wgpu::Instance instance;
+    std::unique_ptr<dawn::native::Instance> native_instance;  // --adapter warp: enumerates the CPU adapter
     wgpu::Adapter adapter_handle;
     wgpu::Device device;
     wgpu::Queue queue;
@@ -632,7 +633,13 @@ struct NativeExecutor::Impl {
                 this);
             idesc.nextInChain = &dawn_idesc;
         }
-        instance = wgpu::CreateInstance(&idesc);
+        if (options.force_fallback_adapter) {
+            native_instance = std::make_unique<dawn::native::Instance>(&idesc);
+            wgpuInstanceAddRef(native_instance->Get());
+            instance = wgpu::Instance::Acquire(native_instance->Get());
+        } else {
+            instance = wgpu::CreateInstance(&idesc);
+        }
         if (!instance) {
             *status = CreateStatus::Failed;
             *error = "wgpuCreateInstance failed";
@@ -698,7 +705,19 @@ struct NativeExecutor::Impl {
             wgpu::Adapter adapter;
             std::string message;
         } ar;
-        instance.WaitAny(
+        if (native_instance) {
+            // --adapter warp: Dawn's forceFallbackAdapter finds no D3D12 WARP (it is listed as a CPU adapter by plain
+            // enumeration), so pick the CPU adapter from the enumeration of this very instance.
+            for (dawn::native::Adapter& cand : native_instance->EnumerateAdapters(&aopts)) {
+                wgpu::AdapterInfo ci;
+                wgpu::Adapter(cand.Get()).GetInfo(&ci);
+                if (ci.adapterType != wgpu::AdapterType::CPU) continue;
+                wgpuAdapterAddRef(cand.Get());
+                ar.adapter = wgpu::Adapter::Acquire(cand.Get());
+                break;
+            }
+            if (!ar.adapter) ar.message = "no software (CPU) adapter";
+        } else instance.WaitAny(
             instance.RequestAdapter(
                 &aopts, wgpu::CallbackMode::WaitAnyOnly,
                 [](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView msg, AdapterResult* out) {
