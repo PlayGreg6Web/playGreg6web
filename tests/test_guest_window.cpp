@@ -1229,7 +1229,7 @@ void test_xmem_concurrent_write_pin_and_relocation() {
     CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(init_vas, 3, init_pgs) == 1);
 
     std::atomic<bool> pinned{false};
-    std::atomic<bool> writer_done{false};
+    std::atomic<bool> copied{false};
     std::vector<uint8_t> payload(2 * k64K);
     payload[0] = 'P';
     payload[1] = 'S';
@@ -1248,8 +1248,9 @@ void test_xmem_concurrent_write_pin_and_relocation() {
         if (dst != nullptr) {
             std::memcpy(dst, payload.data(), payload.size());
         }
+        // Set BEFORE the pin is released: the remap may only return after this point.
+        copied.store(true, std::memory_order_release);
         bufs.finish();
-        writer_done.store(true, std::memory_order_release);
     });
 
     while (!pinned.load(std::memory_order_acquire)) {
@@ -1260,7 +1261,9 @@ void test_xmem_concurrent_write_pin_and_relocation() {
     const uint64_t third_va = run_va + 2 * k64K;
     const uint64_t third_pg = pfn[10];
     CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&third_va, 1, &third_pg) == 1);
-    CHECK(writer_done.load(std::memory_order_acquire));
+    // The remap returns only once the pin is released, which happens after the copy completed.
+    // (Checking "writer thread fully finished" here would race with the thread's tail after finish().)
+    CHECK(copied.load(std::memory_order_acquire));
     writer.join();
 
     // Every byte written by `writer` must be intact in the relocated run!
