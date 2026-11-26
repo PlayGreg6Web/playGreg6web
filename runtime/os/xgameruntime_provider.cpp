@@ -1356,7 +1356,7 @@ public:
                 return false;
             }
         }
-        return id[kIdentifierChars] == ' ';
+        return id[kIdentifierChars] == '\0';
     }
 
     // s37: XPackageMountWithUiAsync(packageIdentifier, XAsyncBlock*). No UI is ever needed.
@@ -1409,11 +1409,13 @@ public:
         }
     }
 
-    // s34: XPackageUninstallPackage(id): refused, the title's own package cannot be removed.
-    int32_t UninstallPackage(uint64_t identifier) {
-        constexpr int32_t kAccessDenied = static_cast<int32_t>(0x80070005u);
-        return identifier == 0 ? E_INVALIDARG_HR : kAccessDenied;
-    }
+    // s34 (not an uninstall): bool(const char* name). Call site (static survey): the title's wrapper
+    // passes one string and uses the low byte of the result; true skips a "start installing /
+    // report progress" branch, false takes it, i.e. the question is "is this already installed".
+    // The public GDK API this is cannot be named with certainty. Truthful answer without any
+    // licence or entitlement claim: true only for the title's own, fully installed package
+    // identifier; null, empty or any other name is false (nothing else is claimed present).
+    bool IsPackageInstalled(uint64_t identifier) { return is_own_package(identifier); }
 
     // XPackageGetInstallationProgress(monitor, progress*): complete and launchable.
     void GetInstallationProgress(uint64_t monitor, GuestPtr<GuestInstallationProgress> progress) {
@@ -2590,7 +2592,7 @@ constexpr auto kPackageTable = slot_table<37>({
     {19, PK::method<&PackageApi::UninstallChunks>("XPackageUninstallChunks")},
     {25, PK::method<&PackageApi::GetMountPath>("XPackageGetMountPath")},
     {26, PK::method<&PackageApi::CloseMountHandle>("XPackageCloseMountHandle")},
-    {34, PK::method<&PackageApi::UninstallPackage>("XPackageUninstallPackage")},
+    {34, PK::method<&PackageApi::IsPackageInstalled>("XPackage slot 34 (bool(name), installed query)")},
     {37, PK::method<&PackageApi::MountWithUiAsync>("XPackageMountWithUiAsync")},
     {38, PK::method<&PackageApi::MountWithUiResult>("XPackageMountWithUiResult")},
     {39, PK::method<&PackageApi::EnumeratePackages>("XPackageEnumeratePackages")},

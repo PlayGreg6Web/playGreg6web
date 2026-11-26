@@ -526,7 +526,10 @@ void test_query_api() {
         CHECK(com::read_guest(out + 8, confirm) && confirm == 0);
         CHECK(hr32(fx.vcall(package, 18, {ident, 1, sel, 0, 0})) == com::E_POINTER_HR);
         CHECK(hr32(fx.vcall(package, 19, {ident, 1, sel})) == 0);
-        CHECK(hr32(fx.vcall(package, 34, {ident})) == static_cast<int32_t>(0x80070005u));
+        // s34: bool(name): installed query, true only for the title's own package identifier.
+        CHECK((fx.vcall(package, 34, {ident}) & 0xFF) == 1);
+        CHECK((fx.vcall(package, 34, {0}) & 0xFF) == 0);
+        CHECK((fx.vcall(package, 34, {sel}) & 0xFF) == 0);
         {
             // s16 / s17 install chunks: completes, hands out a finished monitor.
             const uint64_t queue_api = fx.query(kAsyncQueue, kAsyncQueue);
