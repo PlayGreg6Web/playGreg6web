@@ -1023,7 +1023,7 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     if args.trust_build:
         plan.steps = []
     if args.play:
-        if not args.shader_pack:
+        if not args.shader_pack and not args.build_only:
             found, why = find_shader_pack(repo, env)
             if found is None:
                 raise RunnerError(f"no shader pack ({why}): pass --shader-pack <std.wgsl.pack>, set "
