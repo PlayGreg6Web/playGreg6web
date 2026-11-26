@@ -85,5 +85,6 @@ Runtime pieces are merged (residency of BVH/address sources, fault readback, WGS
 | `playgta6-recomp survey-jumps <exe>` | Census of unresolved indirect jumps, classified; recorded targets extend reachability ([INDIRECT_JUMP_SURVEY.md](INDIRECT_JUMP_SURVEY.md), #1770) |
 | `playgta6-recomp opcode-census <exe>` | Instruction mix of the executable, to prioritise lifter work |
 | `tools/boot_summary.py <report|run dir>` | Short human summary of a boot report (ending incl. fault symbols and hard-stop status, screens, fps percentiles, GPU errors, shader pack, drops, audio, bink, memory, prewarm); `--compare A B` shows deltas; `run_native_boot.py` / `play_native.ps1` print it after every run |
+| `tools/run_history.py --root H:/ [--pattern 'pg6*'] [--since 3d] [--group-by commit] [--fail-on-regression]` | Read-only time-sorted table of past boot runs (commit from report/prebuilt.json, preset, duration, ending + hard-stop status, max screen, fps p50/p5, GPU errors, pack misses, underruns, private peak); `--group-by commit` compares commits per preset, `--fail-on-regression` exits 1 for scripted use |
 
 Reports hold hashes, addresses and counts only, never game bytes.
