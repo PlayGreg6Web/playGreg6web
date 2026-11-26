@@ -473,8 +473,21 @@ struct DescriptorLiveCounts {
     uint64_t heaps = 0;               // live descriptor heaps
     uint64_t heap_slots = 0;          // descriptor slots across them (capacity)
     uint64_t cached_bind_groups = 0;  // BindGroupCache entries, each a live WebGPU bind group
+    // Backlog 34: most bind-group entries one cache held within a single recording epoch (the peak
+    // of per-draw tables a frame needed), the soft slot budget (0 = none), and the entries made
+    // past that budget. The cache grows instead of dropping a draw, so draws dropped for lack of
+    // slots stays 0 by construction; the overflow counter is what shows a budget was too small.
+    uint64_t peak_bind_groups_per_epoch = 0;
+    uint64_t bind_group_slot_budget = 0;
+    uint64_t bind_group_budget_overflows = 0;
+    uint64_t draws_dropped_no_slot = 0;
 };
 DescriptorLiveCounts descriptor_live_counts() noexcept;
+// Soft per-cache budget of bind-group slots (0 = unlimited). Exceeding it never drops a draw: the
+// entry is still built and counted in bind_group_budget_overflows.
+void set_bind_group_slot_budget(uint64_t slots) noexcept;
+// Resets the peak and overflow counters (tests, per-run reports).
+void reset_bind_group_slot_counters() noexcept;
 
 // Device-level owner of all descriptor heaps; resolves opaque handles.
 //
@@ -1148,6 +1161,7 @@ private:
     std::vector<uint8_t> scratch_words_;
     const DescriptorSlotSource* slot_source_ = nullptr;
     uint64_t epoch_ = 1;
+    size_t peak_epoch_entries_ = 0;  // largest entries_.size() in the open epoch
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
     uint64_t heap_index_misses_ = 0;

@@ -1,5 +1,6 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/texture_budget.h"
 #include "gpu/xbox_embedded_native.h"
 
 #include <algorithm>
@@ -1170,6 +1171,12 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     uint32_t held_floor = 0;
+    // Backlog 37: under memory pressure a block-compressed 2D texture with its whole mip chain placed
+    // drops the levels above the size cap (see gpu/texture_budget.h).
+    uint32_t cap_floor = 0;
+    if (whole_surface && tt.dimension == ResourceDimension::Texture2D && l.block_width > 1u && mips > 1u) {
+        cap_floor = cap_floor_for(w, h, mips, texture_budget().current_cap());
+    }
     const bool single_known_nonzero =
         !tt.ever_uploaded &&
         (single_linear_direct || (single_console_linear_direct && src_size == console_linear_bytes));
@@ -1180,7 +1187,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             return false;
         }
         TrackedTexture& cur = it->second;
-        if (cur.ever_uploaded && cur.last_upload_hash == hash) {
+        // Backlog 37: the size cap loosened since the last pass, so dropped top levels are due again.
+        const bool cap_restore = cap_floor < cur.cap_floor_applied;
+        if (cur.ever_uploaded && cur.last_upload_hash == hash && !cap_restore) {
             if (view_tracked) {
                 cur.view_checked = true;
             }
@@ -1201,10 +1210,18 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
         cur.subresource_hashes.resize(size_t{mips} * layers, 0);
         cur.subresource_bands.resize(size_t{mips} * layers);
+        if (cap_restore) {
+            texture_budget().note_restored();
+        }
+        const uint32_t prev_cap_floor = cur.cap_floor_applied;
+        cur.cap_floor_applied = cap_floor;
         auto out = staged.begin();
         for (Staged& st : staged) {
             const size_t index = st.sub.mip + size_t{st.sub.slice} * mips;
             uint64_t& seen = cur.subresource_hashes[index];
+            if (st.sub.mip < cap_floor && seen == 0) {
+                continue;  // dropped top level under memory pressure: lower resolution, never uploaded
+            }
             if (seen == st.hash) {
                 continue;  // unchanged
             }
@@ -1238,6 +1255,15 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
         staged.erase(out, staged.end());
         held_floor = bridge::held_mip_floor(cur.subresource_hashes, mips, layers, cur.streamable);
+        if (cap_floor != 0) {
+            held_floor = std::max(held_floor, cap_floor);
+            if (cap_floor > prev_cap_floor) {
+                texture_budget().note_capped(
+                    cap_floor - prev_cap_floor,
+                    texture_chain_bytes(w, h, 1u, cap_floor, l.block_width, l.block_height, l.block_bytes,
+                                        prev_cap_floor));
+            }
+        }
     }
     // G66 partly-held mip chains: views of the texture start at its first held level.
     bridge_->set_resident_mip_floor(resource_id, held_floor);
@@ -2026,6 +2052,10 @@ Resource::~Resource() {
     if (texture_tracked_) {
         device_->untrack_guest_texture(id_);
     }
+    if (budget_bytes_ != 0) {
+        texture_budget().note_destroyed(budget_bytes_);
+        budget_bytes_ = 0;
+    }
     if (id_ != 0) {
         device_->state_bridge().unregister_resource(id_);
         device_->resource_states().unregister_resource(id_);
@@ -2247,6 +2277,11 @@ bool Resource::initialize() {
             info.storage = (p.usage_flags & GpuTextureUsage::StorageBinding) != 0;
             dev.state_bridge().register_texture(id_, info);
             va_watch::note_texture(descriptor_va_, committed_memory_size(desc_), p.width, p.height, desc_.Format, id_);
+            if (const DxgiFormatLayout bl = dxgi_format_layout(desc_.Format); bl.known && bl.block_bytes != 0) {
+                budget_bytes_ = texture_chain_bytes(p.width, p.height, p.depth_or_layers, mips_, bl.block_width,
+                                                    bl.block_height, bl.block_bytes);
+                texture_budget().note_created(budget_bytes_);
+            }
             if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {
                 TrackedTexture tt{};
                 tt.resource_id = id_;

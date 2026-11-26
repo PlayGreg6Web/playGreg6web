@@ -19,8 +19,10 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
+#include "gpu/descriptor_heap.h"
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
+#include "gpu/texture_budget.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
@@ -2055,6 +2057,26 @@ std::string build_report() {
              ", \"missed_vblanks\": " + std::to_string(ps.missed_vblanks) +
              ", \"last_interval\": " + std::to_string(ps.last_interval) + "},\n";
     }
+    // Backlog 37: host texture memory in use against the budget, the size cap in force and what it
+    // dropped. Backlog 34: peak per-draw bind-group slots of one recording epoch and budget overflows.
+    {
+        const gpu::TextureBudgetStats tb = gpu::texture_budget().stats();
+        const gpu::d3d12_state::DescriptorLiveCounts dc = gpu::d3d12_state::descriptor_live_counts();
+        o += "  \"texture_budget\": {\"budget_mb\": " + std::to_string(tb.budget_bytes >> 20) +
+             ", \"used_mb\": " + std::to_string(tb.used_bytes >> 20) +
+             ", \"peak_used_mb\": " + std::to_string(tb.peak_used_bytes >> 20) +
+             ", \"base_cap\": " + std::to_string(tb.base_cap) + ", \"current_cap\": " + std::to_string(tb.current_cap) +
+             ", \"cap_changes\": " + std::to_string(tb.cap_changes) +
+             ", \"textures_capped\": " + std::to_string(tb.textures_capped) +
+             ", \"mips_dropped\": " + std::to_string(tb.mips_dropped) +
+             ", \"mb_not_uploaded\": " + std::to_string(tb.bytes_not_uploaded >> 20) +
+             ", \"textures_restored\": " + std::to_string(tb.textures_restored) +
+             ", \"bind_group_slots\": {\"budget\": " + std::to_string(dc.bind_group_slot_budget) +
+             ", \"peak_per_epoch\": " + std::to_string(dc.peak_bind_groups_per_epoch) +
+             ", \"budget_overflows\": " + std::to_string(dc.bind_group_budget_overflows) +
+             ", \"draws_dropped\": " + std::to_string(dc.draws_dropped_no_slot) + "}},
+";
+    }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
     // Present was reported through mark_first_present), then the extension's members (per-Present samples).
     {
@@ -2685,6 +2707,15 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     if (json_uint32(json, "fence_publish_cap_ms", u32)) {
         config.fence_publish_cap_ms = u32;
     }
+    if (json_uint32(json, "gpu_memory_budget_mb", u32)) {
+        config.gpu_memory_budget_mb = u32;
+    }
+    if (json_uint32(json, "texture_size_cap", u32)) {
+        config.texture_size_cap = u32;
+    }
+    if (json_uint32(json, "bind_group_slot_budget", u32)) {
+        config.bind_group_slot_budget = u32;
+    }
     if (json_uint32(json, "present_max_interval", u32)) {
         config.present_max_interval = u32;
     }
@@ -2965,6 +2996,9 @@ BootResult run_boot(const BootConfig& config) {
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
+    gpu::texture_budget().set_budget_bytes(uint64_t{config.gpu_memory_budget_mb} << 20);
+    gpu::texture_budget().set_base_cap(config.texture_size_cap);
+    gpu::d3d12_state::set_bind_group_slot_budget(config.bind_group_slot_budget);
     gpu::d3d12_guest::xbox::set_present_max_interval(config.present_max_interval);
     // Only a switched-off bool option disables a harness setting; lag tuning fields are wired
     // through from BootConfig (defaults match DeviceOptions: 1 frame, 33 ms).

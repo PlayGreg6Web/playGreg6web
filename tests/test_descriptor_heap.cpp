@@ -1321,6 +1321,27 @@ void test_heap_indexed_bind_groups() {
         cache.clear(nullptr);
         CHECK(descriptor_live_counts().cached_bind_groups == others);
     }
+    // Backlog 34: a tiny slot budget never drops a lookup (the cache grows), it counts the overflow;
+    // the per-epoch peak tracks the most entries one recording needed.
+    {
+        reset_bind_group_slot_counters();
+        cache.clear(nullptr);
+        set_bind_group_slot_budget(2);
+        const uint32_t consts[4][2] = {{1, 1}, {2, 2}, {3, 3}, {4, 4}};
+        for (const auto& c : consts) {
+            CHECK(st.set_root_constants(G, 0, 2, c, 0) == Status::Ok);
+            CHECK(cache.get_or_build(st, G, plan, 1, test_resolver, nullptr).bind_group != nullptr);
+        }
+        DescriptorLiveCounts c = descriptor_live_counts();
+        CHECK(cache.size() == 4);
+        CHECK(c.bind_group_slot_budget == 2 && c.bind_group_budget_overflows == 2);
+        CHECK(c.peak_bind_groups_per_epoch >= 4 && c.draws_dropped_no_slot == 0);
+        cache.end_epoch(0, nullptr);
+        set_bind_group_slot_budget(0);
+        CHECK(cache.get_or_build(st, G, plan, 1, test_resolver, nullptr).bind_group != nullptr);
+        CHECK(descriptor_live_counts().bind_group_budget_overflows == 2);
+        cache.clear(nullptr);
+    }
 }
 
 // Binding array elements (G62, lane-indexed heap windows): element k reads the heap index plus k;

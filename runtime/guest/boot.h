@@ -483,6 +483,13 @@ struct BootConfig {
     // O36: presents wait for the title's sync interval on a 60 Hz display (gpu/present_pacing.h);
     // off for benchmarks (report: present_pacing).
     bool present_pacing = true;
+    // Backlog 37 / 34 (gpu/texture_budget.h, gpu/descriptor_heap.h): host GPU memory budget in MiB
+    // (0 = unknown: only the base cap applies), base size cap in texels for streamed block-compressed
+    // 2D textures (0 = none; tighter caps of 512 / 256 apply at 70 / 85 percent of the budget), and
+    // the soft per-cache bind-group slot budget (0 = unlimited; exceeding it only counts).
+    uint32_t gpu_memory_budget_mb = 0;
+    uint32_t texture_size_cap = 0;
+    uint32_t bind_group_slot_budget = 0;
     // G71 (#663, #1508): optional cap on PresentX sync interval in 60 Hz vblanks (0 = no clamp,
     // honor the title's SetFrameIntervalX interval; > 0 clamps interval = min(interval, cap),
     // e.g. 1 for 60 Hz cap).
@@ -512,7 +519,8 @@ BootResult run_boot(const BootConfig& config);
 // O36/G71: run options of a boot that has no command line (the browser boot), as a JSON object:
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
 //    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false,
-//    "present_pacing": true, "present_max_interval": 0, "fence_publish_lag": true,
+//    "present_pacing": true, "gpu_memory_budget_mb": 0, "texture_size_cap": 0,
+//    "bind_group_slot_budget": 0, "present_max_interval": 0, "fence_publish_lag": true,
 //    "fence_publish_lag_frames": 1, "fence_publish_cap_ms": 33, "defer_gpu_objects": true,
 //    "xmem_shared_pages": true, "present_frame_waits": true, "audio_endpoint": true}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to

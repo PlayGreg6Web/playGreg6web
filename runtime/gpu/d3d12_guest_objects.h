@@ -562,6 +562,7 @@ struct TrackedTexture {
     uint32_t sample_count = 1;
     uint64_t last_upload_hash = 0;  // whole source surface
     bool ever_uploaded = false;
+    uint32_t cap_floor_applied = 0;  // top mip levels dropped by the texture size cap (gpu/texture_budget.h)
     bool streamable = false;  // created as a reserved (tiled) resource: unmapped levels are not loaded
     // Submission (Device::begin_submission) that last looked at this texture: a texture bound in
     // several bind groups or lists of one ExecuteCommandLists is read and hashed once.

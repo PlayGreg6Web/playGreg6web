@@ -218,6 +218,7 @@ private:
     bool gpu_texture_ = false;
     bool tracked_ = false;
     bool texture_tracked_ = false;
+    uint64_t budget_bytes_ = 0;  // host texture bytes counted in the GPU memory budget (gpu/texture_budget.h)
     std::atomic<bool> back_buffer_{false};
     // O36: the shadow is allocated lazily in kShadowChunk chunks. A chunk without storage holds
     // zeros (what the GPU buffer was created with), so a buffer the guest never writes non-zero

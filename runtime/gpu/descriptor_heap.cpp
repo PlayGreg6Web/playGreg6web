@@ -219,13 +219,34 @@ namespace {
 std::atomic<uint64_t> g_live_heaps{0};
 std::atomic<uint64_t> g_live_heap_slots{0};
 std::atomic<uint64_t> g_live_cached_bind_groups{0};
+std::atomic<uint64_t> g_peak_bind_groups_epoch{0};
+std::atomic<uint64_t> g_bind_group_slot_budget{0};
+std::atomic<uint64_t> g_bind_group_budget_overflows{0};
+
+void raise_peak(uint64_t value) noexcept {
+    uint64_t cur = g_peak_bind_groups_epoch.load(std::memory_order_relaxed);
+    while (value > cur && !g_peak_bind_groups_epoch.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {
+    }
+}
 }  // namespace
+
+void set_bind_group_slot_budget(uint64_t slots) noexcept {
+    g_bind_group_slot_budget.store(slots, std::memory_order_relaxed);
+}
+
+void reset_bind_group_slot_counters() noexcept {
+    g_peak_bind_groups_epoch.store(0, std::memory_order_relaxed);
+    g_bind_group_budget_overflows.store(0, std::memory_order_relaxed);
+}
 
 DescriptorLiveCounts descriptor_live_counts() noexcept {
     DescriptorLiveCounts c;
     c.heaps = g_live_heaps.load(std::memory_order_relaxed);
     c.heap_slots = g_live_heap_slots.load(std::memory_order_relaxed);
     c.cached_bind_groups = g_live_cached_bind_groups.load(std::memory_order_relaxed);
+    c.peak_bind_groups_per_epoch = g_peak_bind_groups_epoch.load(std::memory_order_relaxed);
+    c.bind_group_slot_budget = g_bind_group_slot_budget.load(std::memory_order_relaxed);
+    c.bind_group_budget_overflows = g_bind_group_budget_overflows.load(std::memory_order_relaxed);
     return c;
 }
 
@@ -2301,7 +2322,13 @@ BindGroupLookup BindGroupCache::get_or_build(
     build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
     result.bind_group = entry.get();
     result.rebuilt = true;
+    const uint64_t budget = g_bind_group_slot_budget.load(std::memory_order_relaxed);
+    if (budget != 0 && entries_.size() >= budget) {
+        g_bind_group_budget_overflows.fetch_add(1, std::memory_order_relaxed);  // grows, never drops the draw
+    }
     entries_.emplace(h, std::move(entry));
+    peak_epoch_entries_ = std::max(peak_epoch_entries_, entries_.size());
+    raise_peak(peak_epoch_entries_);
     track_size();
     return result;
 }
@@ -2548,6 +2575,7 @@ size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* reti
         }
     }
     track_size();
+    peak_epoch_entries_ = entries_.size();  // the next epoch's peak starts from what survived
     ++epoch_;
     return dropped;
 }

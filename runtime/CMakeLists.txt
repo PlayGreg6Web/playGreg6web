@@ -48,6 +48,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_xs_xbox.cpp
     gpu/xbox_embedded_native.cpp
     gpu/present_pacing.cpp
+    gpu/texture_budget.cpp
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
     gpu/stage_reflection.cpp
@@ -306,6 +307,9 @@ else()
     add_executable(playgta6_boot guest/boot_main.cpp)
     target_link_libraries(playgta6_boot PRIVATE playgta6_core)
 
+    add_executable(test_texture_budget ../tests/test_texture_budget.cpp)
+    target_link_libraries(test_texture_budget PRIVATE playgta6_core)
+    add_test(NAME playgta6_texture_budget_tests COMMAND test_texture_budget)
     add_executable(test_present_pacing ../tests/test_present_pacing.cpp)
     target_link_libraries(test_present_pacing PRIVATE playgta6_core)
     add_test(NAME playgta6_present_pacing_tests COMMAND test_present_pacing)
