@@ -1209,10 +1209,10 @@ struct NativeExecutor::Impl {
         vd.arrayLayerCount = 1;
         wgpu::TextureView view;
         if (ref.depth) {
-            if (!depth_twin(ref.id, t)) return fail("depth twin could not be created");
+            if (!depth_twin(ref.id, t, DepthRead::TwinF32)) return fail("depth twin could not be created");
             refresh_depth_twins(enc);
             vd.format = wgpu::TextureFormat::R32Float;
-            view = t.twin.CreateView(&vd);
+            view = t.twins[static_cast<size_t>(DepthRead::TwinF32)].tex.CreateView(&vd);
         } else {
             view = t.texture.CreateView(&vd);
         }
