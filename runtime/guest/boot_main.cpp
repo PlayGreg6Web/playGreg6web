@@ -850,8 +850,7 @@ bool start_live_window() {
 void hold_window_on_fault(bool faulted) {
     if (!faulted || !g_live_started || g_live.window_closed()) return;
     write_text(g_options.report, guest::last_report_json());
-    std::fprintf(stderr, "[harness] guest fault: window kept open on the last frame; close it to exit
-");
+    std::fprintf(stderr, "[harness] guest fault: window kept open on the last frame; close it to exit\n");
     std::fflush(stderr);
     g_guest_faulted.store(true);
     while (!g_live.window_closed()) {
