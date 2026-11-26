@@ -47,6 +47,21 @@ bool parse_address_sources(const std::string& json, std::vector<AddressSource>* 
 enum class Unresolved : uint8_t { NoInput, Unbound, Null, DescriptorTable, OutOfRange, Count };
 const char* unresolved_name(Unresolved r);
 
+// A descriptor table a user_data dword points at: `count` 32-byte-stride slots of GFX10 buffer
+// descriptors (V#) starting at guest address `address`. Every buffer slot adds its range to the plan.
+struct DescriptorTableRef {
+    uint64_t address = 0;
+    uint32_t stride = 32;
+    uint32_t count = 0;
+    bool truncated = false;  // the table has more slots than were offered (the caller clamped it)
+};
+constexpr uint32_t kMaxTableDescriptors = 64;
+constexpr uint32_t kMaxTableSlotBytes = 64;
+
+// Why a table slot added no range (Plan::table_skips).
+enum class TableSkip : uint8_t { Zero, NotBuffer, Unreadable, NullBase, Truncated, Count };
+const char* table_skip_name(TableSkip r);
+
 // Bound state of one dispatch. Any callback may be empty (the source is then unresolved).
 struct DispatchInputs {
     std::function<bool(uint32_t index, uint64_t* va)> root_param;
@@ -54,6 +69,9 @@ struct DispatchInputs {
     std::function<bool(uint32_t index, uint32_t* value)> user_data;
     // Optional: why user_data(index) failed (default Unbound).
     std::function<Unresolved(uint32_t index)> user_data_failure;
+    // Optional: the descriptor table user_data(index) points at (when user_data_failure says
+    // DescriptorTable). False = not resolvable (stays counted as descriptor_table).
+    std::function<bool(uint32_t index, DescriptorTableRef* table)> descriptor_table;
     // Guest memory read (bytes at a 40-bit address).
     std::function<bool(uint64_t addr, void* dst, size_t bytes)> read_guest;
 };
@@ -62,6 +80,9 @@ struct Plan {
     std::vector<std::pair<uint64_t, uint64_t>> ranges;  // (address, size) to make resident
     uint32_t unresolved = 0;                            // sources the dispatch did not bind (or null)
     uint32_t unresolved_by_reason[static_cast<size_t>(Unresolved::Count)] = {};
+    uint32_t tables_followed = 0;                       // descriptor tables walked (not counted unresolved)
+    uint32_t table_buffers = 0;                         // buffer descriptors that added a range
+    uint32_t table_skips[static_cast<size_t>(TableSkip::Count)] = {};
     uint32_t structures = 0;                            // BVH structures walked
     uint32_t bad_headers = 0;                           // bvh_root addresses without a valid header
     bool structures_unavailable = false;                // GPU-written or unreadable structure

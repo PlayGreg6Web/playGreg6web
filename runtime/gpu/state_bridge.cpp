@@ -1366,6 +1366,11 @@ uint32_t StateBridgeDevice::rt_prepare_dispatch(const GroupLayoutRecord& group,
         for (size_t i = 0; i < static_cast<size_t>(rt_residency::Unresolved::Count); ++i) {
             rt_unresolved_by_reason_[i] += plan.unresolved_by_reason[i];
         }
+        rt_tables_followed_ += plan.tables_followed;
+        rt_table_buffers_ += plan.table_buffers;
+        for (size_t i = 0; i < static_cast<size_t>(rt_residency::TableSkip::Count); ++i) {
+            rt_table_skips_[i] += plan.table_skips[i];
+        }
         rt_structures_ += plan.structures;
         rt_bad_headers_ += plan.bad_headers;
         if (!out.ok) {
@@ -1491,11 +1496,13 @@ std::string StateBridgeDevice::rt_report_json() {
     }
     std::string out = rt_arena_->json();
     if (!out.empty() && out.back() == '}') {
-        char buf[640];
+        char buf[1024];
         std::snprintf(buf, sizeof buf,
                       ", \"residency\": {\"plans\": %llu, \"unresolved_sources\": %llu, "
                       "\"unresolved_by_reason\": {\"%s\": %llu, \"%s\": %llu, \"%s\": %llu, \"%s\": %llu, \"%s\": %llu}, "
                       "\"structures\": %llu, "
+                      "\"tables_followed\": %llu, \"table_buffers\": %llu, "
+                      "\"table_skips\": {\"%s\": %llu, \"%s\": %llu, \"%s\": %llu, \"%s\": %llu, \"%s\": %llu}, "
                       "\"bad_headers\": %llu, \"fault_readbacks_issued\": %u, \"fault\": ",
                       (unsigned long long)rt_plans_, (unsigned long long)rt_unresolved_,
                       rt_residency::unresolved_name(rt_residency::Unresolved::NoInput),
@@ -1508,7 +1515,18 @@ std::string StateBridgeDevice::rt_report_json() {
                       (unsigned long long)rt_unresolved_by_reason_[3],
                       rt_residency::unresolved_name(rt_residency::Unresolved::OutOfRange),
                       (unsigned long long)rt_unresolved_by_reason_[4],
-                      (unsigned long long)rt_structures_, (unsigned long long)rt_bad_headers_, rt_fault_issued_);
+                      (unsigned long long)rt_structures_, (unsigned long long)rt_tables_followed_,
+                      (unsigned long long)rt_table_buffers_,
+                      rt_residency::table_skip_name(rt_residency::TableSkip::Zero), (unsigned long long)rt_table_skips_[0],
+                      rt_residency::table_skip_name(rt_residency::TableSkip::NotBuffer),
+                      (unsigned long long)rt_table_skips_[1],
+                      rt_residency::table_skip_name(rt_residency::TableSkip::Unreadable),
+                      (unsigned long long)rt_table_skips_[2],
+                      rt_residency::table_skip_name(rt_residency::TableSkip::NullBase),
+                      (unsigned long long)rt_table_skips_[3],
+                      rt_residency::table_skip_name(rt_residency::TableSkip::Truncated),
+                      (unsigned long long)rt_table_skips_[4],
+                      (unsigned long long)rt_bad_headers_, rt_fault_issued_);
         out.pop_back();
         out += buf;
         out += rt_faults_.json();
@@ -4845,6 +4863,29 @@ bool CommandListBridge::prepare_rt_dispatch(ComputePipelineState* state) {
                 return rt_residency::Unresolved::DescriptorTable;
             }
             return rt_residency::Unresolved::Unbound;
+        };
+        // A user_data dword holding a descriptor table: its slots sit in guest descriptor memory
+        // (heap cpu_address + index * increment), 32-byte GFX10 descriptors.
+        in.descriptor_table = [this, rs](uint32_t sgpr, rt_residency::DescriptorTableRef* t) {
+            uint32_t dword = 0;
+            if (rs == nullptr) return false;
+            const int pi = root_parameter_containing_user_sgpr(rs->desc(), true, sgpr, &dword, 0);
+            if (pi < 0) return false;
+            const d3d::RootParameterDesc& p = rs->desc().parameters[static_cast<size_t>(pi)];
+            if (p.parameter_type != d3d::RootParameterType::DescriptorTable) return false;
+            const d3d::RootArgument& a = root_args_.argument(kBp, static_cast<uint32_t>(pi));
+            if (!a.is_set || a.heap == nullptr || a.heap->desc().cpu_address == 0 || a.base_index >= a.heap->capacity() ||
+                a.heap->increment() < 32) {
+                return false;
+            }
+            uint64_t slots = 0;
+            for (const d3d::DescriptorRangeDesc& r : p.ranges) slots += r.num_descriptors;
+            const uint64_t avail = a.heap->capacity() - a.base_index;
+            t->truncated = slots > avail;
+            t->count = static_cast<uint32_t>(std::min<uint64_t>(std::min(slots, avail), rt_residency::kMaxTableDescriptors + 1));
+            t->stride = a.heap->increment();
+            t->address = a.heap->desc().cpu_address + uint64_t{a.base_index} * t->stride;
+            return true;
         };
         in.read_guest = [this](uint64_t addr, void* dst, size_t bytes) {
             return device_.rt_read_guest(addr, dst, bytes);

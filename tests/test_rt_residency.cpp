@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "gpu/gfx10_descriptors.h"
 #include "gpu/rt_arena.h"
 #include "gpu/rt_bvh.h"
 #include "gpu/rt_residency.h"
@@ -142,6 +143,63 @@ void test_unresolved_reasons() {
     CHECK(none.unresolved_by_reason[static_cast<size_t>(Unresolved::NoInput)] == 5);
 }
 
+void test_descriptor_table() {
+    Guest g = make_guest();
+    const uint64_t table = 0x900000;
+    const auto put = [&](uint32_t slot, const uint32_t* w, int n) {
+        for (int i = 0; i < n; ++i) g.dw[table + slot * 32 + i * 4] = w[i];
+    };
+    gfx10::BufferResource b;
+    b.format = gfx10::Fmt::F32;
+    uint32_t w[8] = {};
+    b.base = 0x700000;
+    b.stride = 16;
+    b.num_records = 256;
+    gfx10::encode(b, w);
+    CHECK(gfx10::classify_slot(w) == gfx10::SlotContent::Buffer);
+    put(0, w, 8);
+    // slot 1 stays zero; slot 2 is garbage (not a buffer); slot 3 a second buffer; slot 4 unreadable.
+    const uint32_t junk[8] = {1, 2, 3, 0x7fffffffu, 5, 6, 7, 8};
+    put(2, junk, 8);
+    b.base = 0x710000;
+    b.stride = 0;
+    b.num_records = 4096;
+    gfx10::encode(b, w);
+    put(3, w, 8);
+    std::vector<AddressSource> s;
+    std::string err;
+    CHECK(parse_address_sources(R"([{"kind":"user_data","index":30}])", &s, &err));
+    DispatchInputs in = inputs(g);
+    in.user_data_failure = [](uint32_t) { return Unresolved::DescriptorTable; };
+    in.read_guest = [&](uint64_t a, void* dst, size_t n) { return a < table + 4 * 32 ? g.read(a, dst, n) : false; };
+    in.descriptor_table = [&](uint32_t idx, DescriptorTableRef* t) {
+        if (idx != 30) return false;
+        t->address = table;
+        t->count = 5;
+        return true;
+    };
+    Plan plan = plan_dispatch(s, in, nullptr);
+    CHECK(plan.unresolved == 0 && plan.tables_followed == 1 && plan.table_buffers == 2);
+    CHECK(plan.ranges.size() == 2 && plan.ranges[0].first == 0x700000 && plan.ranges[0].second == 4096);
+    CHECK(plan.ranges[1].first == 0x710000 && plan.ranges[1].second == 4096);
+    CHECK(plan.table_skips[static_cast<size_t>(TableSkip::Zero)] == 1);
+    CHECK(plan.table_skips[static_cast<size_t>(TableSkip::NotBuffer)] == 1);
+    CHECK(plan.table_skips[static_cast<size_t>(TableSkip::Unreadable)] == 1);
+    // Bounded: a huge table is clamped to kMaxTableDescriptors and counted.
+    in.descriptor_table = [&](uint32_t, DescriptorTableRef* t) {
+        t->address = table;
+        t->count = 100000;
+        return true;
+    };
+    plan = plan_dispatch(s, in, nullptr);
+    CHECK(plan.table_skips[static_cast<size_t>(TableSkip::Truncated)] == 1);
+    CHECK(plan.table_skips[static_cast<size_t>(TableSkip::Unreadable)] == kMaxTableDescriptors - 4);
+    // A table the bridge cannot resolve stays descriptor_table.
+    in.descriptor_table = [](uint32_t, DescriptorTableRef*) { return false; };
+    plan = plan_dispatch(s, in, nullptr);
+    CHECK(plan.unresolved_by_reason[static_cast<size_t>(Unresolved::DescriptorTable)] == 1 && plan.ranges.empty());
+}
+
 void test_unavailable_and_bad() {
     Guest g = make_guest();
     std::vector<AddressSource> s;
@@ -218,6 +276,7 @@ int main() {
     test_parse();
     test_plan_and_prepare();
     test_unresolved_reasons();
+    test_descriptor_table();
     test_unavailable_and_bad();
     test_arena_full();
     test_faults();

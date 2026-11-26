@@ -5,6 +5,7 @@
 #include <cstring>
 #include <set>
 
+#include "gpu/gfx10_descriptors.h"
 #include "gpu/rt_bvh.h"
 #include "gpu/rt_json.h"
 
@@ -145,6 +146,52 @@ const char* unresolved_name(Unresolved r) {
     }
 }
 
+const char* table_skip_name(TableSkip r) {
+    switch (r) {
+    case TableSkip::Zero: return "zero";
+    case TableSkip::NotBuffer: return "not_buffer";
+    case TableSkip::Unreadable: return "unreadable";
+    case TableSkip::NullBase: return "null_base";
+    case TableSkip::Truncated: return "truncated";
+    default: return "?";
+    }
+}
+
+namespace {
+// Follows `t` into buffer descriptors; true when the table could be walked at all.
+bool follow_table(const DescriptorTableRef& t, const AddressSource& s, const DispatchInputs& in, Walker& walker, Plan& plan) {
+    if (!in.read_guest || t.address == 0 || t.stride < 32 || t.stride > kMaxTableSlotBytes) return false;
+    ++plan.tables_followed;
+    const uint32_t count = std::min(t.count, kMaxTableDescriptors);
+    if (t.truncated || t.count > kMaxTableDescriptors) ++plan.table_skips[static_cast<size_t>(TableSkip::Truncated)];
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t w[kMaxTableSlotBytes / 4] = {};
+        if (!in.read_guest(t.address + uint64_t{i} * t.stride, w, 32)) {
+            ++plan.table_skips[static_cast<size_t>(TableSkip::Unreadable)];
+            continue;
+        }
+        switch (gfx10::classify_slot(w)) {
+        case gfx10::SlotContent::Zero: ++plan.table_skips[static_cast<size_t>(TableSkip::Zero)]; continue;
+        case gfx10::SlotContent::Buffer: break;
+        default: ++plan.table_skips[static_cast<size_t>(TableSkip::NotBuffer)]; continue;
+        }
+        const gfx10::BufferResource b = gfx10::decode_buffer(w);
+        if (b.base == 0) {
+            ++plan.table_skips[static_cast<size_t>(TableSkip::NullBase)];
+            continue;
+        }
+        ++plan.table_buffers;
+        if (s.bvh_root) {
+            walker.walk(b.base, 0);
+        } else {
+            const uint64_t bytes = std::min<uint64_t>(uint64_t{b.num_records} * std::max<uint32_t>(b.stride, 1u), kMaxStructureBytes);
+            plan.ranges.emplace_back(b.base, std::max<uint64_t>(bytes, 1));
+        }
+    }
+    return true;
+}
+}  // namespace
+
 Plan plan_dispatch(const std::vector<AddressSource>& sources, const DispatchInputs& in, const rt_arena::Arena* arena) {
     Plan plan;
     Walker walker(in, arena, &plan);
@@ -152,6 +199,10 @@ Plan plan_dispatch(const std::vector<AddressSource>& sources, const DispatchInpu
         uint64_t addr = 0;
         Unresolved why = resolve(s, in, &addr);
         if (why == Unresolved::Count && addr == 0) why = Unresolved::Null;
+        if (why == Unresolved::DescriptorTable && in.descriptor_table) {
+            DescriptorTableRef table;
+            if (in.descriptor_table(s.index, &table) && follow_table(table, s, in, walker, plan)) continue;
+        }
         if (why != Unresolved::Count) {
             ++plan.unresolved;
             ++plan.unresolved_by_reason[static_cast<size_t>(why)];

@@ -905,6 +905,8 @@ private:
     uint32_t rt_fault_consumed_ = 0;
     bool rt_fault_zero_pending_ = false;
     uint64_t rt_plans_ = 0, rt_unresolved_ = 0, rt_structures_ = 0, rt_bad_headers_ = 0;
+    uint64_t rt_tables_followed_ = 0, rt_table_buffers_ = 0;
+    uint64_t rt_table_skips_[static_cast<size_t>(rt_residency::TableSkip::Count)] = {};
     uint64_t rt_unresolved_by_reason_[static_cast<size_t>(rt_residency::Unresolved::Count)] = {};
     std::unordered_map<uint32_t, uint32_t, SplitMix32Hash> rt_groups_;  // runtime group layout id -> bind group
 
