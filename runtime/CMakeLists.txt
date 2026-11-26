@@ -54,6 +54,7 @@ add_library(playgta6_core STATIC
     gpu/shader_pack_index.cpp
     gpu/pipeline_prewarm.cpp
     gpu/pipeline_prewarm_host.cpp
+    gpu/prewarm_pipeline_desc.cpp
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
     gpu/drop_table.cpp

@@ -5,6 +5,9 @@
 #include <cstring>
 #include <utility>
 
+#include "gpu/pipeline_prewarm.h"
+#include "gpu/prewarm_pipeline_desc.h"
+
 namespace playgta6::gpu::bridge {
 
 // =====================================================================================================
@@ -592,13 +595,20 @@ uint32_t StateBridgeDevice::module_id(uint64_t shader_identity, bool* known) con
 
 void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t second_shader, PipelineLayoutDesc desc) {
     std::lock_guard lock(objects_mutex_);
+    PipelineLayoutRecord* layout = intern_pipeline_layout_locked(desc);
+    if (layout != nullptr) {
+        layouts_by_shaders_[{first_shader, second_shader}] = layout;
+    }
+}
+
+StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layout_locked(PipelineLayoutDesc& desc) {
     // Binding arrays (G62) only for a consumer that binds them: otherwise the layout is refused
     // (no layout registered: the pipeline falls back like an unknown one).
     for (const GroupLayoutDesc& g : desc.groups) {
         for (const LayoutBinding& b : g.bindings) {
             if (b.entry.binding_array_size != 0 &&
                 (!options_.binding_arrays || b.entry.binding_array_size > kGpuMaxBindingArraySize)) {
-                return;
+                return nullptr;
             }
         }
     }
@@ -681,7 +691,7 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
         layout = record.get();
         pipeline_layouts_.push_back(std::move(record));
     }
-    layouts_by_shaders_[{first_shader, second_shader}] = layout;
+    return layout;
 }
 
 StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::find_layout(uint64_t first_shader, uint64_t second_shader) {
@@ -694,6 +704,12 @@ void StateBridgeDevice::ensure_layout_emitted(PipelineLayoutRecord* layout, Comm
     if (layout == nullptr) {
         return;
     }
+    prewarm_barrier();  // a layout the prewarm is emitting right now is complete (and submitted) once this returns
+    ensure_layout_emitted_impl(layout, encoder, false);
+}
+
+void StateBridgeDevice::ensure_layout_emitted_impl(PipelineLayoutRecord* layout, CommandEncoder& encoder,
+                                                   bool by_prewarm) {
     std::lock_guard lock(objects_mutex_);
     if (layout->emitted) {
         return;
@@ -705,6 +721,7 @@ void StateBridgeDevice::ensure_layout_emitted(PipelineLayoutRecord* layout, Comm
                                 group->layout_entries.data(),
                                 static_cast<uint32_t>(group->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)));
             group->emitted = true;
+            group->emitted_by_prewarm = by_prewarm;
         }
         group_ids.push_back(group->id);
     }
@@ -715,6 +732,7 @@ void StateBridgeDevice::ensure_layout_emitted(PipelineLayoutRecord* layout, Comm
     encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &header, sizeof(header), group_ids.data(),
                         static_cast<uint32_t>(group_ids.size() * sizeof(uint32_t)));
     layout->emitted = true;
+    layout->emitted_by_prewarm = by_prewarm;
 }
 
 uint32_t StateBridgeDevice::intern_sampler(const d3d::SamplerDesc& desc, CommandEncoder& encoder, uint64_t* diagnostics) {
@@ -773,8 +791,164 @@ uint32_t StateBridgeDevice::allocate_root_constants(uint32_t bytes, bool* wrappe
 }
 
 bool StateBridgeDevice::claim_compute_creation(uint32_t pipeline_id) {
+    prewarm_barrier();
     std::lock_guard lock(objects_mutex_);
     return emitted_compute_.insert(pipeline_id).second;
+}
+
+// ---- Native pipeline prewarm ----
+
+void StateBridgeDevice::set_module_pack_key_resolver(std::function<uint64_t(uint32_t)> resolver) {
+    module_pack_key_ = std::move(resolver);
+}
+
+void StateBridgeDevice::prewarm_barrier() {
+    if (prewarm_sync_.load(std::memory_order_acquire)) {
+        std::lock_guard lock(prewarm_mutex_);
+    }
+}
+
+void StateBridgeDevice::note_pipeline_reached(uint32_t pipeline_id) {
+    if (!prewarm_sync_.load(std::memory_order_acquire)) {
+        return;
+    }
+    uint32_t task = 0;
+    {
+        std::lock_guard lock(prewarm_mutex_);  // also waits for a build in progress
+        const auto it = prewarm_pipelines_.find(pipeline_id);
+        if (it == prewarm_pipelines_.end()) {
+            return;
+        }
+        task = it->second;
+        prewarm_pipelines_.erase(it);
+    }
+    pipeline_prewarm().note_task_used(task);
+}
+
+bool StateBridgeDevice::describe_layout(const PipelineLayoutRecord* layout, PrewarmPipelineDesc* desc) {
+    if (layout == nullptr) {
+        desc->has_layout = false;
+        return true;
+    }
+    std::lock_guard lock(objects_mutex_);
+    desc->has_layout = true;
+    desc->layout.content_id = layout->content_id;
+    for (const GroupLayoutRecord* g : layout->groups) {
+        if (g->runtime_owned) {
+            return false;  // bound by the runtime itself (mesh output): not replayable from a warm list
+        }
+        GroupLayoutDesc gd;
+        gd.content_id = g->header.content_id;
+        size_t join = 0;
+        for (const GpuBindGroupLayoutEntry& e : g->layout_entries) {
+            if (join >= g->joins.size()) {
+                return false;
+            }
+            gd.bindings.push_back(LayoutBinding{e, g->joins[join]});
+            join += e.binding_array_size != 0 ? e.binding_array_size : 1;  // arrays hold one join per element
+        }
+        desc->layout.groups.push_back(std::move(gd));
+    }
+    return true;
+}
+
+void StateBridgeDevice::record_graphics_pipeline(const pso::GraphicsPipelineKey& key, uint32_t vs_module,
+                                                 uint32_t fs_module, const PipelineLayoutRecord* layout) {
+    if (!module_pack_key_) {
+        return;
+    }
+    PrewarmPipelineDesc d;
+    d.kind = kPrewarmKindGraphics;
+    d.pack_key0 = module_pack_key_(vs_module);
+    d.pack_key1 = fs_module != 0 ? module_pack_key_(fs_module) : 0;
+    if (d.pack_key0 == 0 || (fs_module != 0 && d.pack_key1 == 0) || !describe_layout(layout, &d)) {
+        return;  // a stage that is not a pack module cannot be rebuilt from the warm list
+    }
+    d.graphics = key;
+    pipeline_prewarm().note_title_pipeline_full(d.kind, d.pack_key0, d.pack_key1, encode_prewarm_pipeline_desc(d));
+}
+
+void StateBridgeDevice::record_compute_pipeline(const pso::ComputePipelineKey& key, uint32_t cs_module,
+                                                const PipelineLayoutRecord* layout) {
+    if (!module_pack_key_) {
+        return;
+    }
+    PrewarmPipelineDesc d;
+    d.kind = kPrewarmKindCompute;
+    d.pack_key0 = module_pack_key_(cs_module);
+    if (d.pack_key0 == 0 || !describe_layout(layout, &d)) {
+        return;
+    }
+    d.compute = key;
+    pipeline_prewarm().note_title_pipeline_full(d.kind, d.pack_key0, 0, encode_prewarm_pipeline_desc(d));
+}
+
+PrewarmPipelineResult StateBridgeDevice::prewarm_pipeline(const PrewarmPipelineDesc& desc, uint32_t vs_module_id,
+                                                          uint32_t fs_module_id, uint32_t task_id,
+                                                          const std::function<void(CommandEncoder&)>& submit) {
+    const bool compute = desc.kind == kPrewarmKindCompute;
+    if (vs_module_id == 0 || (!compute && desc.pack_key1 != 0 && fs_module_id == 0)) {
+        return PrewarmPipelineResult::Failed;
+    }
+    // Held from the pipeline cache lookup to the submit of the creation packets: a title request that finds
+    // the pipeline (or its layout) already there waits here first (prewarm_barrier / note_pipeline_reached).
+    std::lock_guard prewarm_lock(prewarm_mutex_);
+    PipelineLayoutRecord* layout = nullptr;
+    if (desc.has_layout) {
+        PipelineLayoutDesc copy = desc.layout;
+        std::lock_guard lock(objects_mutex_);
+        layout = intern_pipeline_layout_locked(copy);
+        if (layout == nullptr) {
+            return PrewarmPipelineResult::Failed;
+        }
+        // A layout (or one of its groups) a title list already emitted may still sit unsubmitted in that
+        // list: a pipeline creation submitted now could reach the worker before it. The title got there
+        // first anyway.
+        if ((layout->emitted && !layout->emitted_by_prewarm) ||
+            std::any_of(layout->groups.begin(), layout->groups.end(),
+                        [](const GroupLayoutRecord* g) { return g->emitted && !g->emitted_by_prewarm; })) {
+            return PrewarmPipelineResult::Lost;
+        }
+    }
+    uint32_t pipeline_id = 0;
+    if (compute) {
+        pipeline_id = pipeline_cache_->acquire(desc.compute).pipeline_id;
+        std::lock_guard lock(objects_mutex_);
+        if (pipeline_id == 0 || !emitted_compute_.insert(pipeline_id).second) {
+            return pipeline_id == 0 ? PrewarmPipelineResult::Failed : PrewarmPipelineResult::Lost;
+        }
+    } else {
+        const pso::CacheLookup lookup = pipeline_cache_->acquire(desc.graphics);
+        if (!lookup.created) {
+            pipeline_cache_->release(desc.graphics);  // the title (or an earlier build) created it
+            return PrewarmPipelineResult::Lost;
+        }
+        pipeline_id = lookup.pipeline_id;
+    }
+    CommandEncoder enc;
+    if (layout != nullptr) {
+        ensure_layout_emitted_impl(layout, enc, true);
+    }
+    const uint32_t layout_id = layout != nullptr ? layout->id : 0;
+    if (compute) {
+        GpuCreateComputePipeline2Payload payload{};
+        payload.id = pipeline_id;
+        payload.cs_module_id = vs_module_id;
+        payload.pipeline_layout_id = layout_id;
+        std::memcpy(&payload.key, &desc.compute, sizeof(payload.key));
+        enc.emit_packet(GpuOpcode::CreateComputePipeline2, &payload, sizeof(payload));
+    } else {
+        GpuCreateRenderPipeline2Payload payload{};
+        payload.id = pipeline_id;
+        payload.vs_module_id = vs_module_id;
+        payload.fs_module_id = fs_module_id;
+        payload.pipeline_layout_id = layout_id;
+        std::memcpy(&payload.key, &desc.graphics, sizeof(payload.key));
+        enc.emit_packet(GpuOpcode::CreateRenderPipeline2, &payload, sizeof(payload));
+    }
+    submit(enc);
+    prewarm_pipelines_[pipeline_id] = task_id;
+    return PrewarmPipelineResult::Built;
 }
 
 // ---- #482: storage views through an intermediate texture of the stage's storage format ----
@@ -2432,6 +2606,10 @@ void CommandListBridge::drain_events() {
                 encoder_.emit_packet(GpuOpcode::CreateRenderPipeline2, &payload, sizeof(payload));
                 ++stats_.pipelines_created;
                 diagnostics_ |= graphics_pso_->diagnostics_;
+                device_.record_graphics_pipeline(*e.pipeline_key, graphics_pso_->vs_module_id_,
+                                                 graphics_pso_->fs_module_id_, graphics_pso_->layout_);
+            } else if (e.pipeline_key == nullptr) {
+                device_.note_pipeline_reached(e.pipeline_id);  // may be a pipeline the prewarm built
             }
             encoder_.set_pipeline(e.pipeline_id);
             break;
@@ -3734,6 +3912,9 @@ ComputePipelineState* CommandListBridge::prepare_compute_dispatch(ComputePipelin
         encoder_.emit_packet(GpuOpcode::CreateComputePipeline2, &payload, sizeof(payload));
         ++stats_.pipelines_created;
         diagnostics_ |= state->diagnostics_;
+        device_.record_compute_pipeline(state->key_, state->cs_module_id_, state->layout_);
+    } else {
+        device_.note_pipeline_reached(state->pipeline_id_);  // may be a pipeline the prewarm built
     }
     if (!compute_pass_valid_ || compute_pipeline_bound_ != state->pipeline_id_) {
         encoder_.set_compute_pipeline(state->pipeline_id_);

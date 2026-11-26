@@ -112,10 +112,21 @@ void prewarm_host_start(PrewarmBuilder builder) {
             if (n == 0) break;  // queue drained
             for (size_t i = 0; i < n; ++i) {
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = b.build(tasks[i].kind, tasks[i].key0, tasks[i].key1);
+                PrewarmBuild result;
+                const PrewarmDetail detail = pipeline_prewarm().detail_of(tasks[i].id);
+                if (detail && b.build_pipeline) {
+                    result = b.build_pipeline(tasks[i].id, tasks[i].kind, tasks[i].key0, tasks[i].key1, *detail);
+                } else {
+                    result = b.build(tasks[i].kind, tasks[i].key0, tasks[i].key1) ? PrewarmBuild::Built
+                                                                                   : PrewarmBuild::Failed;
+                }
                 const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now() - t0).count();
-                pipeline_prewarm().complete(tasks[i].id, ok, static_cast<uint64_t>(ns));
+                if (result == PrewarmBuild::Lost) {
+                    pipeline_prewarm().complete_lost(tasks[i].id);
+                } else {
+                    pipeline_prewarm().complete(tasks[i].id, result == PrewarmBuild::Built, static_cast<uint64_t>(ns));
+                }
             }
         }
     });
@@ -143,11 +154,13 @@ bool prewarm_host_save() {
 std::string prewarm_host_report_json() {
     const PrewarmProgress p = pipeline_prewarm().progress();
     const PrewarmUse u = pipeline_prewarm().use_stats();
-    char buf[320];
+    char buf[512];
     std::snprintf(buf, sizeof(buf),
                   "{\"queued_total\": %u, \"prewarmed\": %u, \"hit_before_use\": %u, \"wasted\": %u, \"failed\": %u, "
-                  "\"skipped\": %u, \"observed\": %u, \"build_ms\": %llu}",
-                  p.total, u.prewarmed, u.hit, u.wasted, p.failed, p.skipped, p.observed,
+                  "\"skipped\": %u, \"observed\": %u, \"pipelines_prewarmed\": %u, "
+                  "\"pipelines_hit_before_use\": %u, \"pipelines_wasted\": %u, \"build_ms\": %llu}",
+                  p.total, u.prewarmed, u.hit, u.wasted, p.failed, p.skipped, p.observed, u.pipelines_prewarmed,
+                  u.pipelines_hit, u.pipelines_wasted,
                   static_cast<unsigned long long>(p.total_ns / 1000000));
     return buf;
 }

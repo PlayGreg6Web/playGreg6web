@@ -934,6 +934,11 @@ public:
     // the title's first use, through the same path as on-demand creation (the pack module cache).
     // Safe from any thread. False when there is no pack or it cannot resolve a key.
     bool prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1);
+    // Full pipeline of a warm-list entry (pipeline_prewarm.h, list version 2): its modules, layout and host
+    // pipeline are created ahead of the title with the ids the title's own request for the same pipeline
+    // would use (one build, under the lock a concurrent title request takes). Safe from any thread.
+    bridge::PrewarmPipelineResult prewarm_pipeline(uint32_t task_id, uint32_t kind, uint64_t key0, uint64_t key1,
+                                                   const std::vector<uint8_t>& detail);
     uint32_t pack_module_locked(uint64_t key, GpuShaderStage stage);  // pack_mutex_ held
     // Module for a pack key (deterministic id, built once) or, for a non-pack key, a sequential id. pack_mutex_ held.
     uint32_t module_locked(uint64_t key, GpuShaderStage stage, const std::string& code);

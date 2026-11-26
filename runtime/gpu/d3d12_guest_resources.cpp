@@ -1,6 +1,7 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/gpu_va_watch.h"
 #include "gpu/pipeline_prewarm.h"
+#include "gpu/prewarm_pipeline_desc.h"
 #include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
 #include "gpu/xbox_embedded_native.h"
@@ -3807,6 +3808,29 @@ bool Device::prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1) {
         pack_module_locked(key1, GpuShaderStage::Fragment);
     }
     return true;
+}
+
+bridge::PrewarmPipelineResult Device::prewarm_pipeline(uint32_t task_id, uint32_t kind, uint64_t key0, uint64_t key1,
+                                                       const std::vector<uint8_t>& detail) {
+    using Result = bridge::PrewarmPipelineResult;
+    PrewarmPipelineDesc desc;
+    if (!options_.shader_pack || !decode_prewarm_pipeline_desc(detail.data(), detail.size(), &desc) ||
+        desc.kind != kind || desc.pack_key0 != key0 || desc.pack_key1 != key1) {
+        return Result::Failed;
+    }
+    if (!prewarm_pack_modules(kind, key0, key1)) {
+        return Result::Failed;
+    }
+    uint32_t vs_module = 0;
+    uint32_t fs_module = 0;
+    {
+        std::lock_guard<std::mutex> lock(pack_mutex_);
+        if (pack_table_) {
+            vs_module = pack_table_->id_of(key0);
+            fs_module = key1 != 0 ? pack_table_->id_of(key1) : 0;
+        }
+    }
+    return bridge_->prewarm_pipeline(desc, vs_module, fs_module, task_id, [this](CommandEncoder& enc) { submit(enc); });
 }
 
 bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_t* ps_key) {

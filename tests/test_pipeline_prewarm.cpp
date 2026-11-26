@@ -2,6 +2,8 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstring>
+#include <utility>
 #include <thread>
 #include <atomic>
 #include "gpu/shader_pack_index.h"
@@ -11,6 +13,7 @@
 
 #include "gpu/pipeline_prewarm.h"
 #include "gpu/pipeline_prewarm_host.h"
+#include "gpu/prewarm_pipeline_desc.h"
 
 namespace {
 int g_failures = 0;
@@ -229,6 +232,214 @@ void test_file_roundtrip_and_ordering() {
     fs::remove_all(dir);
 }
 
+std::vector<uint8_t> blob(uint8_t seed, size_t n = 40) {
+    std::vector<uint8_t> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(seed + i);
+    return v;
+}
+
+// Version 2 carries full pipeline descriptions; a list without any is still written as version 1, and
+// old module-only lists load unchanged.
+void test_full_list_roundtrip_and_v1_compat() {
+    PipelinePrewarm src;
+    src.note_title_pipeline(kPrewarmKindGraphics, 10, 11);       // module-only: redundant with the full ones
+    src.note_title_pipeline_full(kPrewarmKindGraphics, 10, 11, blob(1));
+    src.note_title_pipeline_full(kPrewarmKindGraphics, 10, 11, blob(2));  // another state of the same shaders
+    CHECK(!src.note_title_pipeline_full(kPrewarmKindGraphics, 10, 11, blob(2)));  // same pipeline again
+    src.note_title_pipeline(kPrewarmKindCompute, 20, 0);          // no full entry: stays module-only
+    src.note_title_pipeline_full(kPrewarmKindCompute, 30, 0, blob(3, 7));
+    CHECK(src.progress().observed == 5);
+    const std::vector<uint8_t> bytes = src.save_warm_list();
+    CHECK(bytes[4] == kPrewarmListVersionPipelines);
+    CHECK(bytes.size() == kPrewarmListHeaderBytes + 4 * kPrewarmListEntryBytes + 40 + 40 + 7);  // entry 10/11 module-only elided
+
+    PipelinePrewarm q;
+    std::string err;
+    uint32_t added = 0;
+    CHECK(q.load_warm_list(bytes.data(), bytes.size(), &err, &added));
+    CHECK(added == 4);
+    PrewarmTask t[8];
+    CHECK(q.take(t, 8) == 4);
+    CHECK(t[0].key0 == 10 && t[1].key0 == 10 && t[2].key0 == 20 && t[3].key0 == 30);
+    CHECK(q.detail_of(t[0].id) != nullptr && *q.detail_of(t[0].id) == blob(1));
+    CHECK(*q.detail_of(t[1].id) == blob(2));
+    CHECK(q.detail_of(t[2].id) == nullptr);  // module-only entry
+    CHECK(*q.detail_of(t[3].id) == blob(3, 7));
+    CHECK(q.detail_of(99) == nullptr);
+    // Loading again adds nothing; the order and details survive a second save only through observation.
+    CHECK(q.load_warm_list(bytes.data(), bytes.size(), nullptr, &added) && added == 0);
+
+    // A list with no detail stays version 1 (readable by older builds).
+    PipelinePrewarm plain;
+    plain.note_title_pipeline(0, 1, 2);
+    const std::vector<uint8_t> v1 = plain.save_warm_list();
+    CHECK(v1[4] == kPrewarmListVersionModules && v1.size() == kPrewarmListHeaderBytes + kPrewarmListEntryBytes);
+    PipelinePrewarm r;
+    CHECK(r.load_warm_list(v1.data(), v1.size(), nullptr, &added) && added == 1);
+    CHECK(r.take(t, 8) == 1 && r.detail_of(t[0].id) == nullptr);
+
+    // Truncated or oversized detail is refused and leaves the queue unchanged.
+    PipelinePrewarm bad;
+    CHECK(!bad.load_warm_list(bytes.data(), bytes.size() - 1, &err));
+    std::vector<uint8_t> huge = bytes;
+    huge[kPrewarmListHeaderBytes + 7] = 0x7f;  // detail_len of the first entry: far past the end
+    CHECK(!bad.load_warm_list(huge.data(), huge.size(), &err));
+    CHECK(bad.progress().total == 0);
+    std::vector<uint8_t> v3 = bytes;
+    v3[4] = 3;
+    CHECK(!bad.load_warm_list(v3.data(), v3.size(), &err));
+}
+
+// pipelines_prewarmed / hit_before_use / wasted count full pipelines apart from modules.
+void test_full_pipeline_counters() {
+    PipelinePrewarm src;
+    for (uint8_t i = 1; i <= 3; ++i) src.note_title_pipeline_full(kPrewarmKindGraphics, 5, 6, blob(i));
+    src.note_title_pipeline(kPrewarmKindCompute, 7, 0);
+    const std::vector<uint8_t> bytes = src.save_warm_list();
+
+    PipelinePrewarm q;
+    CHECK(q.load_warm_list(bytes.data(), bytes.size(), nullptr));
+    PrewarmTask t[8];
+    CHECK(q.take(t, 8) == 4);
+    CHECK(q.complete(t[0].id, true, 10));  // pipeline 1: built, then reached by the title (hit)
+    CHECK(q.complete(t[1].id, true, 10));  // pipeline 2: built, never reached (wasted)
+    CHECK(q.complete_lost(t[2].id));       // pipeline 3: the title created it first
+    CHECK(!q.complete_lost(t[2].id));
+    CHECK(q.complete(t[3].id, true, 10));  // module-only compute entry: built
+    CHECK(q.note_task_used(t[0].id));      // the title reached the prewarmed pipeline
+    CHECK(!q.note_task_used(t[0].id));
+    const PrewarmUse u = q.use_stats();
+    CHECK(u.pipelines_prewarmed == 2 && u.pipelines_hit == 1 && u.pipelines_wasted == 1);
+    CHECK(u.prewarmed == 1 && u.hit == 0 && u.wasted == 1);
+    CHECK(q.progress().skipped == 1);
+    // The reached pipeline enters the next run's list even though the title did not create it.
+    CHECK(q.progress().observed == 1);
+    const std::vector<uint8_t> next = q.save_warm_list();
+    PipelinePrewarm r;
+    uint32_t added = 0;
+    CHECK(r.load_warm_list(next.data(), next.size(), nullptr, &added) && added == 1);
+}
+
+void test_desc_codec() {
+    PrewarmPipelineDesc d;
+    d.kind = kPrewarmKindGraphics;
+    d.pack_key0 = 0x1111;
+    d.pack_key1 = 0x2222;
+    std::memset(&d.graphics, 0, sizeof(d.graphics));
+    d.graphics.vs_shader = 0xA1;
+    d.graphics.ps_shader = 0xB2;
+    d.graphics.color_target_count = 1;
+    d.graphics.vertex_buffer_count = 1;
+    d.graphics.vertex_attribute_count = 1;
+    d.graphics.vertex_attributes[0].offset = 12;
+    d.has_layout = true;
+    d.layout.content_id = 0x99;
+    bridge::GroupLayoutDesc g;
+    g.content_id = 0x77;
+    bridge::LayoutBinding b;
+    b.entry.binding = 3;
+    b.entry.visibility = 2;
+    b.entry.binding_array_size = 4;
+    b.entry.min_binding_size = 64;
+    b.join.binding = 3;
+    b.join.shader_register = 5;
+    b.join.register_class = d3d12_state::DescriptorRangeType::Uav;
+    b.join.root_constants = true;
+    b.join.cb_mask = 0xff;
+    b.join.inline_sampler = true;
+    b.join.sampler.max_anisotropy = 8;
+    g.bindings.push_back(b);
+    g.bindings.push_back(bridge::LayoutBinding{});
+    d.layout.groups.push_back(g);
+    d.layout.groups.push_back(bridge::GroupLayoutDesc{});
+
+    const std::vector<uint8_t> bytes = encode_prewarm_pipeline_desc(d);
+    PrewarmPipelineDesc back;
+    CHECK(decode_prewarm_pipeline_desc(bytes.data(), bytes.size(), &back));
+    CHECK(back.kind == d.kind && back.pack_key0 == 0x1111 && back.pack_key1 == 0x2222);
+    CHECK(std::memcmp(&back.graphics, &d.graphics, sizeof(d.graphics)) == 0);
+    CHECK(back.has_layout && back.layout.content_id == 0x99 && back.layout.groups.size() == 2);
+    CHECK(back.layout.groups[0].content_id == 0x77 && back.layout.groups[0].bindings.size() == 2);
+    const bridge::LayoutBinding& bb = back.layout.groups[0].bindings[0];
+    CHECK(std::memcmp(&bb.entry, &b.entry, sizeof(b.entry)) == 0);
+    CHECK(d3d12_state::same_join(bb.join, b.join));
+    CHECK(back.layout.groups[1].bindings.empty());
+    CHECK(encode_prewarm_pipeline_desc(back) == bytes);  // stable: identical descriptions hash identically
+
+    // Compute, with layout "auto".
+    PrewarmPipelineDesc c;
+    c.kind = kPrewarmKindCompute;
+    c.pack_key0 = 0x3333;
+    c.compute.cs_shader = 0xC5;
+    c.compute.root_signature_id = 9;
+    const std::vector<uint8_t> cb = encode_prewarm_pipeline_desc(c);
+    PrewarmPipelineDesc cback;
+    CHECK(decode_prewarm_pipeline_desc(cb.data(), cb.size(), &cback));
+    CHECK(cback.kind == kPrewarmKindCompute && cback.compute.cs_shader == 0xC5 && !cback.has_layout);
+
+    // Truncation at any point, trailing bytes and a foreign version are refused.
+    for (size_t n = 0; n < bytes.size(); n += 7) {
+        PrewarmPipelineDesc x;
+        CHECK(!decode_prewarm_pipeline_desc(bytes.data(), n, &x));
+    }
+    std::vector<uint8_t> extra = bytes;
+    extra.push_back(0);
+    PrewarmPipelineDesc x;
+    CHECK(!decode_prewarm_pipeline_desc(extra.data(), extra.size(), &x));
+    std::vector<uint8_t> v = bytes;
+    v[0] = 9;
+    CHECK(!decode_prewarm_pipeline_desc(v.data(), v.size(), &x));
+    CHECK(!decode_prewarm_pipeline_desc(nullptr, 0, &x));
+
+    // Pack module ids map back to their key.
+    const ShaderPackIndex pack = make_pack();
+    PackModuleTable t(pack);
+    CHECK(t.key_of(t.id_of(77)) == 77 && t.key_of(t.id_of(1000000007ull)) == 1000000007ull);
+    CHECK(t.key_of(5) == 0 && t.key_of(kPackModuleIdBase + 5) == 0);
+}
+
+// The host thread hands detailed entries to build_pipeline (with their detail and task id) and module-only
+// ones to build; a lost race is counted as skipped, not as built.
+void test_host_builds_pipelines() {
+    PipelinePrewarm src;
+    src.note_title_pipeline_full(kPrewarmKindGraphics, 40, 41, blob(1));
+    src.note_title_pipeline_full(kPrewarmKindGraphics, 42, 43, blob(2));
+    src.note_title_pipeline_full(kPrewarmKindGraphics, 44, 45, blob(3));
+    src.note_title_pipeline(kPrewarmKindCompute, 46, 0);
+    const std::vector<uint8_t> bytes = src.save_warm_list();
+    pipeline_prewarm().reset();
+    CHECK(pipeline_prewarm().load_warm_list(bytes.data(), bytes.size(), nullptr));
+
+    std::vector<uint64_t> modules;
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> pipelines;
+    prewarm_host_start(
+        {[] { return true; },
+         [&modules](uint32_t, uint64_t k0, uint64_t) {
+             modules.push_back(k0);
+             return true;
+         },
+         [&pipelines](uint32_t task, uint32_t, uint64_t k0, uint64_t, const std::vector<uint8_t>& detail) {
+             CHECK(task != 0);
+             pipelines.emplace_back(k0, detail);
+             if (k0 == 42) return PrewarmBuild::Lost;
+             if (k0 == 44) return PrewarmBuild::Failed;
+             return PrewarmBuild::Built;
+         }});
+    prewarm_host_wait();
+    CHECK(modules == std::vector<uint64_t>{46});
+    CHECK(pipelines.size() == 3 && pipelines[0].first == 40 && pipelines[0].second == blob(1));
+    CHECK(pipelines[1].second == blob(2) && pipelines[2].second == blob(3));
+    const PrewarmProgress p = pipeline_prewarm().progress();
+    CHECK(p.done == 2 && p.skipped == 1 && p.failed == 1);
+    const PrewarmUse u = pipeline_prewarm().use_stats();
+    CHECK(u.pipelines_prewarmed == 1 && u.pipelines_wasted == 1 && u.wasted == 1);
+    const std::string json = prewarm_host_report_json();
+    CHECK(json.find("\"pipelines_prewarmed\": 1") != std::string::npos);
+    CHECK(json.find("\"pipelines_wasted\": 1") != std::string::npos);
+    CHECK(json.find("\"pipelines_hit_before_use\": 0") != std::string::npos);
+    pipeline_prewarm().reset();
+}
+
 }  // namespace
 
 int main() {
@@ -240,6 +451,10 @@ int main() {
     test_module_ids_order_independent();
     test_module_concurrent_single_build();
     test_file_roundtrip_and_ordering();
+    test_full_list_roundtrip_and_v1_compat();
+    test_full_pipeline_counters();
+    test_desc_codec();
+    test_host_builds_pipelines();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_pipeline_prewarm: %d failure(s)\n", g_failures);
         return 1;

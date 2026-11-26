@@ -12,6 +12,7 @@
 
 #include "gpu/descriptor_words.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/pipeline_prewarm.h"
 #include "gpu/gfx10_descriptors.h"
 #include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
@@ -310,6 +311,12 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     slot_source_ = std::make_unique<MemorySlotSource>(*this);
     bo.slot_source = slot_source_.get();
     bridge_ = std::make_unique<bridge::StateBridgeDevice>(heaps_, std::move(bo), &resource_states_);
+    // Pipeline prewarm: the bridge describes pipelines by pack key; an id of the deterministic pack range
+    // exists only once pack_table_ does, and is never reassigned afterwards.
+    bridge_->set_module_pack_key_resolver([this](uint32_t module_id) -> uint64_t {
+        return module_id >= kPackModuleIdBase && pack_table_ ? pack_table_->key_of(module_id) : 0;
+    });
+    bridge_->set_prewarm_sync(pipeline_prewarm().progress().total != 0);
     sink_ = options_.sink;
     // O27: the XMem CPU/GPU window pairs, whether reserved before or after this device.
     alias_listener_ = os::xmem_windows::add_alias_listener([this](const os::xmem_windows::AliasPair& p) {

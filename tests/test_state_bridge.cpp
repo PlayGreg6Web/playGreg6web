@@ -20,6 +20,8 @@
 #include "gpu/descriptor_words.h"
 #include "gpu/gfx10_detile.h"
 #include "gpu/indirect_clamp_batch.h"
+#include "gpu/pipeline_prewarm.h"
+#include "gpu/prewarm_pipeline_desc.h"
 #include "gpu/pso_cache.h"
 #include "wasm_boot.h"
 #include "gpu/state_bridge.h"
@@ -4778,6 +4780,190 @@ void test_evicted_texture_destroy_deferred_until_after_present() {
     }
 }
 
+// Native pipeline prewarm: a pipeline built from a recorded warm-list entry is the pipeline on-demand
+// creation makes (same state key, modules, layout packets), the title then reuses it without emitting
+// anything, and the pipeline is built exactly once whichever side gets there first.
+struct PrewarmFixture {
+    static uint64_t pack_key(uint32_t module) {
+        return module == Scene::kVsModule ? 0x5101ull : module == Scene::kFsModule ? 0x5102ull : 0ull;
+    }
+    static void attach(Scene& scene, bool sync) {
+        scene.device.set_module_pack_key_resolver(pack_key);
+        scene.device.set_prewarm_sync(sync);
+    }
+    static std::vector<Packet> draw(Scene& scene) {
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        return decode(enc);
+    }
+    static std::vector<Packet> only(const std::vector<Packet>& all, GpuOpcode a, GpuOpcode b, GpuOpcode c) {
+        std::vector<Packet> out;
+        for (const Packet& p : all) {
+            if (p.opcode == a || p.opcode == b || p.opcode == c) out.push_back(p);
+        }
+        return out;
+    }
+    static size_t count(const std::vector<Packet>& all, GpuOpcode op) {
+        return static_cast<size_t>(std::count_if(all.begin(), all.end(), [op](const Packet& p) { return p.opcode == op; }));
+    }
+};
+
+void test_prewarm_pipeline_matches_on_demand() {
+    using O = GpuOpcode;
+    gpu::pipeline_prewarm().reset();
+    std::vector<Packet> on_demand;
+    {
+        Scene scene;
+        PrewarmFixture::attach(scene, false);
+        on_demand = PrewarmFixture::draw(scene);
+    }
+    const std::vector<uint8_t> warm = gpu::pipeline_prewarm().save_warm_list();
+    CHECK(warm.size() > gpu::kPrewarmListHeaderBytes && warm[4] == gpu::kPrewarmListVersionPipelines);
+    const std::vector<Packet> creates =
+        PrewarmFixture::only(on_demand, O::CreateBindGroupLayout, O::CreatePipelineLayout, O::CreateRenderPipeline2);
+    CHECK(PrewarmFixture::count(on_demand, O::CreateRenderPipeline2) == 1);
+
+    gpu::pipeline_prewarm().reset();
+    CHECK(gpu::pipeline_prewarm().load_warm_list(warm.data(), warm.size(), nullptr));
+    gpu::PrewarmTask task[2];
+    CHECK(gpu::pipeline_prewarm().take(task, 2) == 1);
+    const gpu::PrewarmDetail detail = gpu::pipeline_prewarm().detail_of(task[0].id);
+    CHECK(detail != nullptr);
+    gpu::PrewarmPipelineDesc desc;
+    CHECK(gpu::decode_prewarm_pipeline_desc(detail->data(), detail->size(), &desc));
+    CHECK(desc.kind == gpu::kPrewarmKindGraphics && desc.pack_key0 == 0x5101 && desc.pack_key1 == 0x5102);
+
+    Scene scene;
+    PrewarmFixture::attach(scene, true);
+    std::vector<Packet> built;
+    auto submit = [&](gpu::CommandEncoder& enc) { built = decode(enc); };
+    CHECK(scene.device.prewarm_pipeline(desc, Scene::kVsModule, Scene::kFsModule, task[0].id, submit) ==
+          bridge::PrewarmPipelineResult::Built);
+    // Identical to what the title's own first draw creates (ids included: both devices allocate alike).
+    const std::vector<Packet> pre =
+        PrewarmFixture::only(built, O::CreateBindGroupLayout, O::CreatePipelineLayout, O::CreateRenderPipeline2);
+    CHECK(built.size() == pre.size() && pre.size() == creates.size());
+    for (size_t i = 0; i < pre.size() && i < creates.size(); ++i) {
+        CHECK(pre[i].opcode == creates[i].opcode);
+        if (pre[i].opcode == O::CreateRenderPipeline2) {
+            // The pipeline id differs (the cache hands out ids in request order); everything else is equal.
+            CHECK(pre[i].payload.size() == creates[i].payload.size());
+            CHECK(std::memcmp(pre[i].payload.data() + 4, creates[i].payload.data() + 4, pre[i].payload.size() - 4) == 0);
+        } else {
+            CHECK(pre[i].payload == creates[i].payload);
+        }
+    }
+    const uint32_t built_id = pre.empty() ? 0 : pod<uint32_t>(pre.back());
+    CHECK(built_id != 0);
+    CHECK(gpu::pipeline_prewarm().complete(task[0].id, true, 1));
+
+    // The same pipeline again: lost to the earlier build, nothing emitted.
+    built.clear();
+    CHECK(scene.device.prewarm_pipeline(desc, Scene::kVsModule, Scene::kFsModule, task[0].id, submit) ==
+          bridge::PrewarmPipelineResult::Lost);
+    CHECK(built.empty());
+
+    // The title's draw finds the pipeline and its layout ready: no creation packets, same pipeline id.
+    const std::vector<Packet> list = PrewarmFixture::draw(scene);
+    CHECK(PrewarmFixture::only(list, O::CreateBindGroupLayout, O::CreatePipelineLayout, O::CreateRenderPipeline2).empty());
+    bool set = false;
+    for (const Packet& p : list) {
+        if (p.opcode == O::SetPipeline) {
+            set = true;
+            CHECK(pod<uint32_t>(p) == built_id);
+        }
+    }
+    CHECK(set);
+    const gpu::PrewarmUse use = gpu::pipeline_prewarm().use_stats();
+    CHECK(use.pipelines_prewarmed == 1 && use.pipelines_hit == 1 && use.pipelines_wasted == 0);
+    gpu::pipeline_prewarm().reset();
+}
+
+void test_prewarm_title_first_and_concurrent_single_build() {
+    using O = GpuOpcode;
+    gpu::pipeline_prewarm().reset();
+    std::vector<Packet> first;
+    {
+        Scene scene;
+        PrewarmFixture::attach(scene, false);
+        first = PrewarmFixture::draw(scene);
+    }
+    const std::vector<uint8_t> warm = gpu::pipeline_prewarm().save_warm_list();
+    gpu::PrewarmPipelineDesc desc;
+    {
+        gpu::PipelinePrewarm q;
+        CHECK(q.load_warm_list(warm.data(), warm.size(), nullptr));
+        gpu::PrewarmTask t[2];
+        CHECK(q.take(t, 2) == 1);
+        const gpu::PrewarmDetail d = q.detail_of(t[0].id);
+        CHECK(d != nullptr && gpu::decode_prewarm_pipeline_desc(d->data(), d->size(), &desc));
+    }
+    gpu::pipeline_prewarm().reset();
+
+    // The title creates the pipeline first: the prewarm finds it taken and emits nothing.
+    {
+        Scene scene;
+        PrewarmFixture::attach(scene, true);
+        const std::vector<Packet> list = PrewarmFixture::draw(scene);
+        CHECK(PrewarmFixture::count(list, O::CreateRenderPipeline2) == 1);
+        size_t submitted = 0;
+        CHECK(scene.device.prewarm_pipeline(desc, Scene::kVsModule, Scene::kFsModule, 1,
+                                            [&](gpu::CommandEncoder&) { ++submitted; }) ==
+              bridge::PrewarmPipelineResult::Lost);
+        CHECK(submitted == 0);
+    }
+
+    // Race: the prewarm thread and a recording title thread request the same pipeline. Exactly one creation
+    // packet exists across both streams, and the title draws with that pipeline's id.
+    size_t built_count = 0;
+    for (int round = 0; round < 40; ++round) {
+        Scene scene;
+        PrewarmFixture::attach(scene, true);
+        std::vector<Packet> pre;
+        std::vector<Packet> list;
+        bridge::PrewarmPipelineResult result = bridge::PrewarmPipelineResult::Failed;
+        std::atomic<bool> go{false};
+        std::thread prewarm([&] {
+            while (!go.load()) std::this_thread::yield();
+            result = scene.device.prewarm_pipeline(desc, Scene::kVsModule, Scene::kFsModule, 1,
+                                                   [&](gpu::CommandEncoder& enc) { pre = decode(enc); });
+        });
+        std::thread title([&] {
+            while (!go.load()) std::this_thread::yield();
+            list = PrewarmFixture::draw(scene);
+        });
+        go = true;
+        prewarm.join();
+        title.join();
+        const size_t creations =
+            PrewarmFixture::count(pre, O::CreateRenderPipeline2) + PrewarmFixture::count(list, O::CreateRenderPipeline2);
+        CHECK(creations == 1);
+        if (result == bridge::PrewarmPipelineResult::Built) {
+            ++built_count;
+            CHECK(PrewarmFixture::count(list, O::CreateRenderPipeline2) == 0);
+            uint32_t built_id = 0;
+            for (const Packet& p : pre) {
+                if (p.opcode == O::CreateRenderPipeline2) built_id = pod<uint32_t>(p);
+            }
+            for (const Packet& p : list) {
+                if (p.opcode == O::SetPipeline) CHECK(pod<uint32_t>(p) == built_id);
+            }
+            // Layout packets exist exactly once as well.
+            CHECK(PrewarmFixture::count(pre, O::CreatePipelineLayout) + PrewarmFixture::count(list, O::CreatePipelineLayout) == 1);
+        } else {
+            CHECK(result == bridge::PrewarmPipelineResult::Lost);
+            CHECK(pre.empty());
+        }
+    }
+    (void)built_count;  // either side may win a round
+    gpu::pipeline_prewarm().reset();
+}
+
 int main() {
     test_partly_held_mip_chain_clamps_views();
     test_view_table_bounded();
@@ -4821,6 +5007,8 @@ int main() {
     test_bc_texture_upload_needs_feature();
     test_norm16_address_texture_upload();
     test_fence_completion_and_ref_lifetime();
+    test_prewarm_pipeline_matches_on_demand();
+    test_prewarm_title_first_and_concurrent_single_build();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

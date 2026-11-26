@@ -1111,6 +1111,15 @@ int main(int argc, char** argv) {
                      [](uint32_t kind, uint64_t k0, uint64_t k1) {
                          auto device = gpu::d3d12_xs_exports::current_device();
                          return device && device->prewarm_pack_modules(kind, k0, k1);
+                     },
+                     [](uint32_t task, uint32_t kind, uint64_t k0, uint64_t k1, const std::vector<uint8_t>& detail) {
+                         auto device = gpu::d3d12_xs_exports::current_device();
+                         if (!device) return gpu::PrewarmBuild::Failed;
+                         switch (device->prewarm_pipeline(task, kind, k0, k1, detail)) {
+                             case gpu::bridge::PrewarmPipelineResult::Built: return gpu::PrewarmBuild::Built;
+                             case gpu::bridge::PrewarmPipelineResult::Lost: return gpu::PrewarmBuild::Lost;
+                             default: return gpu::PrewarmBuild::Failed;
+                         }
                      }});
             }
         }

@@ -56,6 +56,10 @@
 #include "gpu/indirect_clamp_batch.h"
 #include "gpu/pso_cache.h"
 
+namespace playgta6::gpu {
+struct PrewarmPipelineDesc;  // prewarm_pipeline_desc.h
+}
+
 namespace playgta6::gpu::bridge {
 
 namespace pso = playgta6::gpu::pso;
@@ -326,6 +330,13 @@ struct ViewRecord {
     d3d::ResourceUsage usage = d3d::ResourceUsage::RenderTarget;
 };
 
+// Outcome of building one warm-list pipeline ahead of the title (StateBridgeDevice::prewarm_pipeline).
+enum class PrewarmPipelineResult : uint8_t {
+    Built,   // created and emitted ahead of the title
+    Lost,    // the title created (or is creating) it, or owns a layout packet still in its own list
+    Failed,  // the description could not be replayed
+};
+
 class StateBridgeDevice final : public pso::DescriptorViewResolver {
 public:
     // `resource_states` (optional) is the queue-level registry the per-list barrier trackers report to.
@@ -408,6 +419,22 @@ public:
     bool retired(uint32_t resource_id) const;
     uint64_t retire_epoch() const noexcept { return retire_epoch_.load(std::memory_order_acquire); }
 
+    // ---- Native pipeline prewarm (pipeline_prewarm.h) ----
+    // Pack key of a pack shader module id (0 = not a pack module); set by the Device. Needed to describe a
+    // pipeline the title creates so the next run can build it ahead of time.
+    void set_module_pack_key_resolver(std::function<uint64_t(uint32_t module_id)> resolver);
+    // Turn the title-side hand-off on: with a warm list that carries full pipelines, title paths that
+    // might meet a prewarmed object wait for an in-progress build first (see prewarm_pipeline()).
+    void set_prewarm_sync(bool on) noexcept { prewarm_sync_.store(on, std::memory_order_release); }
+    // Builds the host pipeline `desc` describes: interns and emits its layout, takes the pipeline from the
+    // pipeline cache (the very id the title's own request for the same state gets) and emits its creation
+    // packet through `submit` (called with the packets while the hand-off lock is held, so a concurrent
+    // title request that sees the pipeline also sees its packets submitted). One build per pipeline.
+    // Safe from any thread.
+    PrewarmPipelineResult prewarm_pipeline(const PrewarmPipelineDesc& desc, uint32_t vs_module_id,
+                                           uint32_t fs_module_id, uint32_t task_id,
+                                           const std::function<void(CommandEncoder&)>& submit);
+
     // ---- Frame-safe resource lifetime & deferred DestroyResource (G70, #691) ----
     // Records that GPU resource `resource_id` (texture, buffer, intermediate, or bind group) is
     // referenced by commands in the current frame (since the last Present) and updates its LRU tick.
@@ -448,6 +475,7 @@ private:
         // The emitted GpuBindGroupLayoutEntry list: one per binding (arrays not expanded).
         std::vector<GpuBindGroupLayoutEntry> layout_entries;
         bool emitted = false;
+        bool emitted_by_prewarm = false;  // its packets went out with a prewarm submit, not in a title list
         // G66 mesh pipelines: a group the caller binds itself (the mesh output buffer).
         bool runtime_owned = false;
     };
@@ -456,6 +484,7 @@ private:
         uint64_t content_id = 0;
         std::vector<GroupLayoutRecord*> groups;
         bool emitted = false;
+        bool emitted_by_prewarm = false;
     };
 
     uint32_t intern_view(const ViewRecord& record) const;
@@ -476,6 +505,22 @@ private:
     uint32_t module_id(uint64_t shader_identity, bool* known) const;
     // Emits the layout's creation packets the first time any list needs them.
     void ensure_layout_emitted(PipelineLayoutRecord* layout, CommandEncoder& encoder);
+    void ensure_layout_emitted_impl(PipelineLayoutRecord* layout, CommandEncoder& encoder, bool by_prewarm);
+    // Interns `desc` (sorts its bindings) into group / pipeline layout records; objects_mutex_ held.
+    // Null when the layout is refused.
+    PipelineLayoutRecord* intern_pipeline_layout_locked(PipelineLayoutDesc& desc);
+    // Title-side hand-off with the prewarm thread: waits for a build in progress (no-op without a
+    // prewarm warm list).
+    void prewarm_barrier();
+    // The title reached pipeline `pipeline_id` without creating it: when the prewarm built it, counts the
+    // hit and enters it into the observed list.
+    void note_pipeline_reached(uint32_t pipeline_id);
+    // The title created a pipeline: describes it into the warm list.
+    void record_graphics_pipeline(const pso::GraphicsPipelineKey& key, uint32_t vs_module, uint32_t fs_module,
+                                  const PipelineLayoutRecord* layout);
+    void record_compute_pipeline(const pso::ComputePipelineKey& key, uint32_t cs_module,
+                                 const PipelineLayoutRecord* layout);
+    bool describe_layout(const PipelineLayoutRecord* layout, PrewarmPipelineDesc* desc);
     // Returns the sampler id for `desc`, emitting CreateSampler2 on first use.
     uint32_t intern_sampler(const d3d::SamplerDesc& desc, CommandEncoder& encoder, uint64_t* diagnostics);
     // Root constant ring buffer id; emits its CreateBuffer on first use.
@@ -576,6 +621,11 @@ private:
     std::map<std::pair<uint64_t, uint64_t>, PipelineLayoutRecord*> layouts_by_shaders_;
     std::unordered_map<std::string, uint32_t> samplers_;
     std::unordered_set<uint32_t> emitted_compute_;
+    // Pipeline prewarm hand-off. Lock order: prewarm_mutex_, then objects_mutex_.
+    std::function<uint64_t(uint32_t)> module_pack_key_;
+    std::atomic<bool> prewarm_sync_{false};
+    std::mutex prewarm_mutex_;
+    std::unordered_map<uint32_t, uint32_t> prewarm_pipelines_;  // pipeline id -> prewarm task id, until the title reaches it
     uint32_t ring_buffer_id_ = 0;
     uint32_t default_vertex_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;

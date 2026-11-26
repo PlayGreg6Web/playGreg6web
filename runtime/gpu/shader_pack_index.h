@@ -21,6 +21,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace playgta6::gpu {
 
@@ -76,9 +77,12 @@ public:
     uint32_t get_or_create(uint64_t key, const std::function<void(uint32_t id)>& create);
     // Deterministic id of `key` without creating it; 0 when not a pack key.
     uint32_t id_of(uint64_t key) const;
+    // Pack key of module id `id` (the inverse of id_of); 0 when `id` is not a pack module id.
+    uint64_t key_of(uint32_t id) const;
     size_t created() const;
 
 private:
+    std::vector<uint64_t> keys_;  // ascending: keys_[id - kPackModuleIdBase]
     std::unordered_map<uint64_t, uint32_t> ids_;
     mutable std::mutex mutex_;
     std::unordered_set<uint64_t> built_;

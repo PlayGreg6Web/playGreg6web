@@ -143,6 +143,7 @@ PackModuleTable::PackModuleTable(const ShaderPackIndex& pack) {
         keys.push_back(kv.first);
     }
     std::sort(keys.begin(), keys.end());
+    keys_ = keys;
     ids_.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         ids_.emplace(keys[i], kPackModuleIdBase + static_cast<uint32_t>(i));
@@ -152,6 +153,14 @@ PackModuleTable::PackModuleTable(const ShaderPackIndex& pack) {
 uint32_t PackModuleTable::id_of(uint64_t key) const {
     auto it = ids_.find(key);
     return it == ids_.end() ? 0u : it->second;
+}
+
+uint64_t PackModuleTable::key_of(uint32_t id) const {
+    if (id < kPackModuleIdBase) {
+        return 0;
+    }
+    const size_t index = id - kPackModuleIdBase;
+    return index < keys_.size() ? keys_[index] : 0;
 }
 
 uint32_t PackModuleTable::get_or_create(uint64_t key, const std::function<void(uint32_t id)>& create) {
