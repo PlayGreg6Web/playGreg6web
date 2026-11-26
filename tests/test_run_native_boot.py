@@ -464,15 +464,16 @@ class RunTests(unittest.TestCase):
     def test_menu_to_ingame_preset(self):
         self.assertEqual(rnb.PRESETS["menu-to-ingame"]["max_ms"], 900_000)
         script = rnb.input_script_text(900_000, "menu-to-ingame")
-        before, header, body, after = self._sections(script)
-        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
-        self.assertEqual(after[:15], ["capture",
-                                      "repeat every 20s until draws_per_frame!=33|50|51 for 3s timeout 240s",
-                                      "0 B 150", "3000 A 100", "5000 RDown 1200", "7000 RDown 1200",
-                                      "9000 RDown 1200", "12000 B 150", "15000 DDown 150", "end",
-                                      "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
-                                      "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
-        tail = [line.split() for line in after[15:]]
+        lines = [x.strip() for x in script.splitlines() if x.strip() and not x.startswith("#")]
+        i = lines.index("repeat every 14s until draws_per_frame==37 for 1500ms timeout 240s")
+        self.assertEqual(lines[i + 1:i + 3], ["0 A 100", "end"])
+        self.assertEqual(lines[i + 3:i + 10],
+                         ["repeat every 8s until draws_per_frame!=37 for 2s timeout 120s",
+                          "0 DDown 150", "1500 DDown 150", "3500 A 100", "end", "capture",
+                          "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s"])
+        after = lines[i + 10:]
+        self.assertEqual(after[:4], ["0 A 600", "2500 Menu 150", "4500 A 100", "end"])
+        tail = [line.split() for line in after[4:]]
         self.assertEqual([e[1] for e in tail[:4]], ["A"] * 4)
         self.assertIn("Up+RT", {e[1] for e in tail})
         times = [int(e[0]) for e in tail]
