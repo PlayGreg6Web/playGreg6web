@@ -1108,18 +1108,73 @@ const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uint32
     *rows = by;
     *slices = nz;
     *linear_size = size_t{*row_pitch} * by * nz;
+    // chain_address, split by axis: every bit of the block equation (or _R mask) takes one
+    // coordinate bit, so the x part of the block-local address and of the block index is computed
+    // once per column and the y / z part once per row; the XOR swizzle is applied to their union
+    // per element as chain_address applies it. Same addresses, without the per-element equation.
+    const TileShape& s = c.shape;
+    std::vector<uint32_t> col_intra;
+    std::vector<uint64_t> col_block;
+    if (!c.linear) {
+        col_intra.resize(bx);
+        col_block.resize(bx);
+        for (uint32_t x = 0; x < bx; ++x) {
+            const uint32_t tx = x + c.tail_x[mip];
+            col_intra[x] = s.eq != nullptr ? apply_equation(s.eq, s.blk_size_log2, tx, 0u, 0u)
+                                           : deposit_bits((tx & (c.bw - 1u)) << c.bpp_log2, s.x_mask);
+            col_block[x] = c.in_tail[mip] ? 0u : uint64_t{x / c.bw} << s.blk_size_log2;
+        }
+    }
     for (uint32_t z = 0; z < nz; ++z) {
+        const uint32_t zz = z0 + z;
         for (uint32_t y = 0; y < by; ++y) {
+            const size_t lin_row = (size_t{z} * by + y) * *row_pitch;
+            if (c.linear) {
+                const uint64_t row = c.slice_stride * zz + c.offset[mip] + uint64_t{y} * c.pitch[mip] * bpe;
+                for (uint32_t x = 0; x < bx; ++x) {
+                    const uint64_t addr = row + uint64_t{x} * bpe;
+                    if (addr > surface_size || bpe > surface_size - addr) {
+                        return "tiled source offset out of bounds";
+                    }
+                    fn(lin_row + size_t{x} * bpe, static_cast<size_t>(addr), bpe);
+                }
+                continue;
+            }
+            const uint32_t ty = y + c.tail_y[mip];
+            const uint32_t row_intra = s.eq != nullptr
+                                           ? apply_equation(s.eq, s.blk_size_log2, 0u, ty, s.thick_3d ? zz : 0u)
+                                           : deposit_bits(ty & (c.bh - 1u), s.y_mask);
+            const uint64_t slice = s.thick_3d ? zz / c.bd : zz;
+            const uint64_t row_block =
+                c.in_tail[mip] ? 0u : (uint64_t{y / c.bh} * (c.pitch[mip] / c.bw)) << s.blk_size_log2;
+            const uint64_t row = c.slice_stride * slice + c.macro_offset[mip] + row_block;
             for (uint32_t x = 0; x < bx; ++x) {
-                const uint64_t addr = chain_address(c, mip, x, y, z0 + z);
+                uint32_t intra = col_intra[x] | row_intra;
+                if (s.xor_mode) {
+                    intra = apply_gfx10_xor_64k(intra);
+                }
+                const uint64_t addr = row + col_block[x] + intra;
                 if (addr > surface_size || bpe > surface_size - addr) {
                     return "tiled source offset out of bounds";
                 }
-                fn((size_t{z} * by + y) * *row_pitch + size_t{x} * bpe, static_cast<size_t>(addr), bpe);
+                fn(lin_row + size_t{x} * bpe, static_cast<size_t>(addr), bpe);
             }
         }
     }
     return nullptr;
+}
+
+// One element copy; the element sizes of the supported formats get a fixed-size copy the
+// compiler inlines instead of a memcpy call per element.
+inline void copy_element(uint8_t* dst, const uint8_t* src, uint32_t n) noexcept {
+    switch (n) {
+        case 1: std::memcpy(dst, src, 1); break;
+        case 2: std::memcpy(dst, src, 2); break;
+        case 4: std::memcpy(dst, src, 4); break;
+        case 8: std::memcpy(dst, src, 8); break;
+        case 16: std::memcpy(dst, src, 16); break;
+        default: std::memcpy(dst, src, n); break;
+    }
 }
 
 // Linear layouts: mip 0 at the base. Array slices only where every candidate linear rule gives
@@ -1188,16 +1243,23 @@ DetileResult detile_surface_impl(const TextureLayoutDesc& desc, uint32_t mip, ui
     }
     size_t linear_size = 0;
     uint32_t row_pitch = 0, rows = 0, slices = 0;
-    // First pass validates and sizes; the walk is cheap compared with the copy.
+    // One walk validates and copies: the walk sets linear_size before its first element, and on
+    // an out-of-bounds element the partial output is dropped (the same result as validating first).
+    uint8_t* out = nullptr;
     const char* err = walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
-                                       [](size_t, size_t, uint32_t) {});
+                                       [&](size_t lin, size_t src, uint32_t n) {
+                                           if (out == nullptr) {
+                                               linear_out.resize(linear_size);
+                                               out = linear_out.data();
+                                           }
+                                           copy_element(out + lin, surface + src, n);
+                                       });
     if (err != nullptr) {
+        linear_out.clear();
         res.error = err;
         return res;
     }
     linear_out.resize(linear_size);
-    walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
-                     [&](size_t lin, size_t src, uint32_t n) { std::memcpy(linear_out.data() + lin, surface + src, n); });
     res.ok = true;
     res.row_pitch_bytes = row_pitch;
     res.rows = rows;
@@ -1219,7 +1281,7 @@ bool tile_surface_impl(const TextureLayoutDesc& desc, uint32_t mip, uint32_t arr
         return false;
     }
     walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
-                     [&](size_t lin, size_t dst, uint32_t n) { std::memcpy(surface + dst, linear_src + lin, n); });
+                     [&](size_t lin, size_t dst, uint32_t n) { copy_element(surface + dst, linear_src + lin, n); });
     return true;
 }
 
