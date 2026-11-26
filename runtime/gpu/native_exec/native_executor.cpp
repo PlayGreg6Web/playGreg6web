@@ -2879,6 +2879,10 @@ struct NativeExecutor::Impl {
                     } else if (!kind_mismatch && le && le->kind == 2 && le->subtype == 0 && tex_format &&
                                format_is_float32(tex_format) && !features.float32_filterable) {
                         use_dummy(*le);
+                    } else if (!kind_mismatch && le && le->kind == 2 && tex_format &&
+                               depth_sample_type_mismatch(le->subtype, tex_format)) {
+                        ++stats.bind_group_depth_layout_dummies;
+                        use_dummy(*le);
                     } else {
                         pe.view = texture_view(t, vd);
                         if (pe.view) {
@@ -4224,6 +4228,7 @@ std::string NativeExecutor::stats_json() const {
     num("reflection_layout_errors", st.reflection_layout_errors);
     num("reflection_binding_conflicts", st.reflection_binding_conflicts);
     num("reflection_layout_unsupported", st.reflection_layout_unsupported);
+    num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
     num("manifest_layouts_resolved", st.manifest_layouts_resolved);
     num("v1_synth_samplers", st.v1_synth_samplers);
     num("timer_frames", st.timer_frames);

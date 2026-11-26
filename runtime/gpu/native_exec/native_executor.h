@@ -138,6 +138,7 @@ struct ExecutorStats {
     uint64_t reflection_vertex_fallbacks = 0;  // reflected vertex layout rejected: the single-attribute default
     uint64_t reflection_layout_errors = 0;     // a reflected layout the loader's merge rejected (pipeline not created)
     uint64_t reflection_binding_conflicts = 0; // ... of which two stages disagreed on a binding
+    uint64_t bind_group_depth_layout_dummies = 0;  // depth view vs float/sint/uint layout entry (or the reverse): dummy bound
     uint64_t reflection_layout_unsupported = 0;  // layout entries Dawn cannot take (externalTexture, unknown storage format)
     uint64_t manifest_layouts_resolved = 0;    // ManifestReference layouts served from a loaded layout-manifest.json
     uint64_t v1_synth_samplers = 0;            // v1 bind group samplers synthesized from the layout (default samplers)

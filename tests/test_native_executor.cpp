@@ -1246,6 +1246,24 @@ void test_async_pipelines_and_blob_cache() {
     fs::remove_all(root, ec);
 }
 
+void test_depth_texture_float_layout(NativeExecutor& ex) {
+    // A float layout entry with a depth texture bound: the executor binds the entry's dummy instead
+    // of letting Dawn reject the bind group; the 'depth' layout entry takes the real view.
+    const uint64_t before = ex.stats().bind_group_depth_layout_dummies;
+    gpu::CommandEncoder e;
+    e.begin_frame();
+    emit(e, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(900, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::RenderAttachment, 48)));
+    create_layouts(e, 901, 902, {layout_entry(0, 2, GpuBindingLayoutType::Texture, 0, 2)});
+    create_bind_group(e, 903, 901, {bg_entry(0, GpuBindResourceType::TextureView, 900)});
+    create_layouts(e, 904, 905, {layout_entry(0, 2, GpuBindingLayoutType::Texture, 2, 2)});
+    create_bind_group(e, 906, 904, {bg_entry(0, GpuBindResourceType::TextureView, 900)});
+    e.present();
+    run(ex, e);
+    CHECK(ex.stats().bind_group_depth_layout_dummies == before + 1);
+    CHECK(ex.stats().bind_groups >= 2);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -1277,6 +1295,7 @@ int main() {
     CHECK(ex->stats().device_lost == 0);
     test_timers();
     test_blit();
+    test_depth_texture_float_layout(*ex);
     test_async_pipelines_and_blob_cache();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

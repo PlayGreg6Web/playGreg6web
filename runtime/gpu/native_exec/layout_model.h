@@ -453,6 +453,16 @@ inline WgslSampleType texture_sample_type(uint8_t format, bool float32_filterabl
     return WgslSampleType::Float;
 }
 
+// A depth-format view bound to a layout entry whose sampleType cannot take it (float/sint/uint), or
+// a non-depth view bound to a 'depth' entry: Dawn rejects the bind group. Mirrors the worker's
+// other sample-type fallbacks (substitute the entry's dummy resource) instead of a validation error.
+// layout_sample_type: the entry's code (0 float, 1 unfilterable-float, 2 depth, 3 sint, 4 uint).
+inline bool depth_sample_type_mismatch(uint8_t layout_sample_type, uint8_t format) {
+    const bool is_depth = format_valid(format) && format_is_depth(format);
+    if (layout_sample_type == 2) return !is_depth;
+    return is_depth && layout_sample_type != 1;
+}
+
 struct PickResult {
     enum class Kind : uint8_t { Resource, FallbackSampler, Dummy } kind = Kind::Dummy;
     size_t index = 0;          // Resource: index into the available list
