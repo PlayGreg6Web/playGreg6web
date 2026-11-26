@@ -22,11 +22,13 @@
 #endif
 
 #include "abi/playgta6_abi.h"
+#include "bcpack_synthetic.h"
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/gfx10_detile.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
+#include "os/bcpack.h"
 #include "os/vmem.h"
 #include "os/xapu_opus.h"
 #include "os/win32_compat.h"
@@ -1009,6 +1011,143 @@ void test_compressed_and_memory_sources() {
     fx.vcall(queue, 6);
     CHECK(fx.wait_complete(status, 3));
     CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
+}
+
+// BCPack (option bits 1-4) with SYNTHETIC tables (tests/bcpack_synthetic.h; the real format
+// tables are user-supplied and never in the repository): without tables E_NOTIMPL, then unpacked
+// into a buffer, into physical pages and after a zlib stage, and a truncated stream.
+std::vector<uint8_t> zlib_stored(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> out = {0x78, 0x01};
+    size_t at = 0;
+    do {
+        const size_t n = std::min<size_t>(65535, data.size() - at);
+        const bool last = at + n == data.size();
+        out.push_back(last ? 1 : 0);
+        out.push_back(static_cast<uint8_t>(n));
+        out.push_back(static_cast<uint8_t>(n >> 8));
+        out.push_back(static_cast<uint8_t>(~n));
+        out.push_back(static_cast<uint8_t>(~n >> 8));
+        out.insert(out.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
+                   data.begin() + static_cast<std::ptrdiff_t>(at + n));
+        at += n;
+    } while (at < data.size());
+    uint32_t a = 1;
+    uint32_t b = 0;
+    for (uint8_t v : data) {
+        a = (a + v) % 65521;
+        b = (b + a) % 65521;
+    }
+    const uint32_t adler = (b << 16) | a;
+    for (int k = 3; k >= 0; --k) {
+        out.push_back(static_cast<uint8_t>(adler >> (8 * k)));
+    }
+    return out;
+}
+
+void test_bcpack_requests() {
+    namespace bp = playgta6::os::bcpack;
+    namespace sy = bcpack_synthetic;
+    bp::set_active_tables(nullptr);
+    const std::shared_ptr<const bp::Tables> tables = sy::Builder::full().tables();
+    CHECK(tables != nullptr);
+    if (!tables) {
+        return;
+    }
+    constexpr uint32_t kBlocks = 10000;  // 80000 bytes of BC4: more than one 64 KiB page
+    std::vector<std::vector<uint8_t>> records;
+    for (uint32_t i = 0; i < kBlocks; ++i) {
+        std::vector<uint8_t> r(12, 0);
+        r[1] = static_cast<uint8_t>(i % 3);  // none, the previous block, two back
+        r[2] = static_cast<uint8_t>(i * 7);
+        r[3] = static_cast<uint8_t>(i * 13 + 5);
+        for (uint32_t k = 4; k < 12; ++k) {
+            r[k] = static_cast<uint8_t>((i + k) % 64);
+        }
+        records.push_back(r);
+    }
+    const std::vector<uint8_t> packed = sy::stream(*tables, sy::default_layouts()[2], records);
+    CHECK(!packed.empty());
+    std::vector<uint8_t> want(kBlocks * 8);
+    CHECK(bp::decode(*tables, 4, packed.data(), packed.size(), want.data(), want.size()) == bp::DecodeStatus::Ok);
+    const std::vector<uint8_t> zpacked = zlib_stored(packed);
+    std::vector<uint8_t> blob(100, 0xEE);
+    blob.insert(blob.end(), packed.begin(), packed.end());
+    Fixture fx;
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\bcpack.ttpf", blob);
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\bcpack_z.ttpf", zpacked);
+    const uint64_t factory = fx.factory();
+    const uint64_t file = fx.open_file(factory, u"G:\\data\\bcpack.ttpf");
+    const uint64_t zfile = fx.open_file(factory, u"G:\\data\\bcpack_z.ttpf");
+    const uint64_t queue = fx.create_queue(factory, 64);
+    const uint64_t status = fx.create_status(factory, 8);
+    const uint64_t dest = com::guest_alloc(want.size());
+    const uint32_t size = static_cast<uint32_t>(want.size());
+    auto run = [&](const ga::DStorageRequest& req, uint32_t index) {
+        fx.enqueue(queue, req);
+        fx.vcall(queue, 4, {I(status), I(index)});
+        fx.vcall(queue, 6);
+        CHECK(fx.wait_complete(status, index));
+        return as_hr(fx.vcall(status, 4, {I(index)}));
+    };
+    const uint64_t requests_before = ga::dstorage_stats().bcpack_requests;
+    const uint64_t decoded_before = ga::dstorage_stats().bcpack_decoded;
+
+    // No tables: fails truthfully and says how to supply them.
+    ga::DStorageRequest r = file_request(file, 100, static_cast<uint32_t>(packed.size()), dest, size);
+    r.options = 4ull << 1;
+    CHECK(run(r, 0) == com::E_NOTIMPL_HR);
+    CHECK(diag_contains("--bcpack-tables"));
+    CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before);
+
+    bp::set_active_tables(tables);
+    CHECK(run(r, 1) == 0);
+    CHECK(guest_bytes(dest, want.size()) == want);
+    CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before + 1);
+
+    // A format the tables (and this decoder) do not cover: still E_NOTIMPL.
+    ga::DStorageRequest bc6 = r;
+    bc6.options = 6ull << 1;
+    CHECK(run(bc6, 2) == com::E_NOTIMPL_HR);
+
+    // Physical-page destination (the title's 0x2000xx options).
+    size_t page_count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &page_count, pfn) == 1);
+    const uint64_t page_array = com::guest_alloc(16);
+    const uint64_t entries[2] = {pfn[1] << 12, pfn[0] << 12};
+    CHECK(com::write_guest(page_array, entries, sizeof(entries)));
+    ga::DStorageRequest pp = file_request(file, 100, static_cast<uint32_t>(packed.size()), page_array, size);
+    pp.options = (4ull << 1) | ga::kDStorageOptionDestinationIsPhysicalPages;
+    CHECK(run(pp, 3) == 0);
+    {
+        auto* p1 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[1]));
+        auto* p0 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
+        CHECK(p1 != nullptr && p0 != nullptr);
+        if (p1 != nullptr && p0 != nullptr) {
+            CHECK(std::memcmp(p1, want.data(), 65536) == 0);
+            CHECK(std::memcmp(p0, want.data() + 65536, want.size() - 65536) == 0);
+            CHECK(os::scarlett::xmem_unmap_physical_pages(p1));
+            CHECK(os::scarlett::xmem_unmap_physical_pages(p0));
+        }
+    }
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+
+    // zlib, then BCPack: uncompressed_size is the intermediate (packed) size.
+    const uint64_t dest2 = com::guest_alloc(want.size());
+    ga::DStorageRequest z = file_request(zfile, 0, static_cast<uint32_t>(zpacked.size()), dest2, size);
+    z.options = ga::kDStorageOptionZlib | (4ull << 1);
+    z.uncompressed_size = static_cast<uint32_t>(packed.size());
+    CHECK(run(z, 4) == 0);
+    CHECK(guest_bytes(dest2, want.size()) == want);
+
+    // A truncated stream fails with ERROR_INVALID_DATA.
+    ga::DStorageRequest cut = r;
+    cut.source_size = static_cast<uint32_t>(packed.size() / 2);
+    CHECK(run(cut, 5) == ga::kHrInvalidData);
+    CHECK(diag_contains("BCPack request (mode 4"));
+    CHECK(ga::dstorage_stats().bcpack_requests == requests_before + 6);
+    CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before + 3);
+    bp::set_active_tables(nullptr);
 }
 
 void test_errors_and_error_record() {
@@ -2333,6 +2472,7 @@ int main() {
     test_physical_page_scatter();
     test_requests_wait_for_submit();
     test_compressed_and_memory_sources();
+    test_bcpack_requests();
     test_errors_and_error_record();
     test_cancel_close_and_signal();
     test_backpressure_and_leaks();

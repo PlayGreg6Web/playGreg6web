@@ -32,6 +32,9 @@
 //   --import-trace <file> write every import call (sequence, thread, DLL!symbol, rcx rdx r8 r9
 //                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
 //   --dstorage-workers <n>  DirectStorage (XCRDAPI) worker threads, 1..16 (default 1)
+//   --bcpack-tables <file>  BCPack format tables for DirectStorage texture requests (default: the
+//                        PLAYGTA6_BCPACK_TABLES environment variable; none = BCPack requests fail
+//                        E_NOTIMPL). User-supplied, never shipped: docs/BCPACK.md
 //   --console-mode <n>   console-mode registry value the title reads to pick its console type
 //                        (default 0x60 = Xbox Series X; 0 = leave it unset)
 //   --sandbox-id <text>  Xbox Live sandbox the emulated console reports (default RETAIL, a retail
@@ -98,6 +101,7 @@
 #include "os/image_loader.h"
 #include "os/audio_report.h"
 #include "os/audio_wav_dump.h"
+#include "os/bcpack.h"
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -172,6 +176,7 @@ struct Options {
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
     uint64_t dstorage_workers = 1;  // --dstorage-workers: DirectStorage worker threads (1..16)
+    std::string bcpack_tables;      // --bcpack-tables: user-supplied BCPack table file (os/bcpack.h)
     uint64_t arena_log_limit = 4096;  // --arena-log-limit
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
@@ -221,6 +226,7 @@ void usage() {
                  "                     [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
+                 "                     [--bcpack-tables <file>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
 
@@ -273,7 +279,8 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" || a == "--input-script" || a == "--watch-gpu-va" ||
-                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump") {
+                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
+                   a == "--bcpack-tables") {
             if (!value(v)) {
                 return false;
             }
@@ -287,6 +294,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
                                   : a == "--audio-dump" ? o.audio_dump
+                                  : a == "--bcpack-tables" ? o.bcpack_tables
                                   : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
@@ -965,6 +973,26 @@ int main(int argc, char** argv) {
         return kExitUsage;
     }
     os::scarlett::guest_api::set_dstorage_worker_threads(static_cast<uint32_t>(g_options.dstorage_workers));
+    {
+        // BCPack tables: user-supplied only (docs/BCPACK.md). A bad --bcpack-tables file is a usage
+        // error; a bad PLAYGTA6_BCPACK_TABLES only warns (BCPack requests then fail E_NOTIMPL).
+        const char* env = std::getenv("PLAYGTA6_BCPACK_TABLES");
+        const bool from_flag = !g_options.bcpack_tables.empty();
+        const std::string path = from_flag ? g_options.bcpack_tables : (env != nullptr ? env : "");
+        if (!path.empty()) {
+            std::string error;
+            if (os::bcpack::load_tables_file(path, &error)) {
+                std::fprintf(stderr, "[harness] BCPack tables loaded from %s (%s)\n", path.c_str(),
+                             os::bcpack::supported_formats(*os::bcpack::active_tables()).c_str());
+            } else {
+                std::fprintf(stderr, "[harness] %s: BCPack tables not loaded: %s\n", from_flag ? "error" : "warning",
+                             error.c_str());
+                if (from_flag) {
+                    return kExitUsage;
+                }
+            }
+        }
+    }
     // Write tracking on the guest address space (Windows): the GPU layer then compares only the
     // written pages of CPU-visible buffers at each ExecuteCommandLists instead of whole buffers.
     os::set_write_tracking(true);
@@ -1146,6 +1174,7 @@ int main(int argc, char** argv) {
             sample->counters.emplace_back("dstorage_requests_completed", ds.requests_completed);
             sample->counters.emplace_back("dstorage_requests_failed", ds.requests_failed);
             sample->counters.emplace_back("dstorage_bcpack_requests", ds.bcpack_requests);
+            sample->counters.emplace_back("dstorage_bcpack_decoded", ds.bcpack_decoded);
             sample->counters.emplace_back("dstorage_bytes_delivered", ds.bytes_delivered);
             sample->counters.emplace_back("dstorage_decompressed_requests", ds.decompressed_requests);
             sample->counters.emplace_back("dstorage_file_reads", ds.file_reads);

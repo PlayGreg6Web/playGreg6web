@@ -13,6 +13,9 @@ game/
 *.dxbc
 *.wgsl.pack
 *.pgim
+# User-supplied BCPack format tables (docs/BCPACK.md): never committed
+*.pg6bcpak
+bcpack-tables*
 
 # Build outputs
 /target/

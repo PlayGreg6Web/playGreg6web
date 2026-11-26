@@ -173,7 +173,9 @@ inline constexpr HResult kHrHandle = static_cast<HResult>(0x80070006u);
 
 // DSTORAGE_REQUEST_OPTIONS, public GDK layout:
 //   bit 0      ZlibDecompress
-//   bits 1-4   BcpackMode (BCPack: proprietary, no decoder here; such requests fail E_NOTIMPL)
+//   bits 1-4   BcpackMode: the BC format of a BCPack stream (os/bcpack.h). Decoded only with
+//              user-supplied format tables (docs/BCPACK.md); without them the request fails
+//              E_NOTIMPL. With bit 0 too, zlib runs first into uncompressed_size bytes.
 //   bit 21     DestinationIsPhysicalPages: `destination` is a guest array of physical page
 //              addresses (one per page of the destination) instead of a contiguous buffer
 //   bit 22     source is memory (not an IDStorageFile)
@@ -291,7 +293,8 @@ struct DStorageStats {
     uint64_t submits = 0;             // explicit + automatic
     uint64_t live_queues = 0;
     uint64_t physical_page_requests = 0;  // requests with DestinationIsPhysicalPages (option bit 21)
-    uint64_t bcpack_requests = 0;  // BCPack requests (option bits 1-4), all failed E_NOTIMPL (no decoder)
+    uint64_t bcpack_requests = 0;  // BCPack requests (option bits 1-4)
+    uint64_t bcpack_decoded = 0;   // ... unpacked into their destination (needs the user's tables)
 };
 
 DStorageStats dstorage_stats();

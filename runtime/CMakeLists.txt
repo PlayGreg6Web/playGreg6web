@@ -74,6 +74,7 @@ add_library(playgta6_core STATIC
     os/xgameruntime_provider.cpp
     os/xgamesave_local.cpp
     os/xbox_scarlett_guest.cpp
+    os/bcpack.cpp
     guest/program_loader.cpp
     guest/shard_dispatch.cpp
     os/xbox_scarlett_guest_input.cpp
@@ -346,6 +347,10 @@ else()
     add_executable(test_audio_report ../tests/test_audio_report.cpp)
     target_link_libraries(test_audio_report PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_report_tests COMMAND test_audio_report)
+
+    add_executable(test_bcpack ../tests/test_bcpack.cpp)
+    target_link_libraries(test_bcpack PRIVATE playgta6_core)
+    add_test(NAME playgta6_bcpack_tests COMMAND test_bcpack)
 
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)

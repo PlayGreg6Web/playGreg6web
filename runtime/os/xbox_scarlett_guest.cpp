@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "guest/guest_runtime.h"
+#include "os/bcpack.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -55,6 +56,7 @@ struct OnceFlags {
     std::atomic<bool> bad_request{false};
     std::atomic<bool> read_failed{false};
     std::atomic<bool> inflate_failed{false};
+    std::atomic<bool> bcpack_failed{false};
     std::atomic<bool> bad_signal{false};
     std::atomic<bool> closed_queue{false};
 };
@@ -118,7 +120,8 @@ struct Counters {
     std::atomic<uint64_t> submits{0};
     std::atomic<uint64_t> live_queues{0};
     std::atomic<uint64_t> physical_page_requests{0};
-    std::atomic<uint64_t> bcpack_requests{0};  // failed E_NOTIMPL: no BCPack decoder
+    std::atomic<uint64_t> bcpack_requests{0};  // all BCPack requests (option bits 1-4)
+    std::atomic<uint64_t> bcpack_decoded{0};   // ... of which unpacked into their destination
 
     std::atomic<uint32_t> worker_threads{1};
     std::atomic<uint64_t> max_gap{64 * 1024};
@@ -1067,26 +1070,60 @@ HResult DStorageQueue::write_destination(const DStorageRequest& r, const uint8_t
 HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len, std::vector<uint8_t>& scratch) {
     const DStorageRequest& r = item.req;
     const DStorageOptions opts = parse_dstorage_options(r.options);
-    if (!opts.zlib) {
+    if (!opts.compressed()) {
         const HResult hr = write_destination(r, data, len);
         if (gdk::succeeded(hr)) {
             counters().bytes_delivered.fetch_add(len, std::memory_order_relaxed);
         }
         return hr;
     }
-    const size_t expected = r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size;
+    const bool unpack_bc = opts.bcpack_mode != 0;
+    // zlib and BCPack together: the console inflates first (to uncompressed_size bytes, the
+    // intermediate size), then unpacks the BC blocks into the destination.
+    std::vector<uint8_t> intermediate;
+    if (unpack_bc && opts.zlib) {
+        size_t produced = 0;
+        intermediate.resize(r.uncompressed_size);
+        const InflateStatus st = r.uncompressed_size == 0
+                                     ? InflateStatus::OutputTooSmall
+                                     : inflate_stream(data, len, intermediate.data(), intermediate.size(), &produced);
+        if (st != InflateStatus::Ok) {
+            diag_once(once().inflate_failed, "XCRDAPI: zlib stage of a zlib+BCPack request failed (status " +
+                                                 std::to_string(static_cast<int>(st)) + ", intermediate size " +
+                                                 std::to_string(r.uncompressed_size) + ")");
+            return kHrInvalidData;
+        }
+        intermediate.resize(produced);
+        data = intermediate.data();
+        len = intermediate.size();
+    }
+    const size_t expected =
+        unpack_bc ? r.destination_size : (r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size);
     uint8_t* out = opts.physical_pages ? nullptr : static_cast<uint8_t*>(com::guest_to_host(r.destination, expected));
     if (out == nullptr) {
         scratch.resize(expected);
         out = scratch.data();
     }
-    size_t produced = 0;
-    const InflateStatus st = inflate_stream(data, len, out, expected, &produced);
-    if (st != InflateStatus::Ok || produced != expected) {
-        diag_once(once().inflate_failed, "XCRDAPI: zlib request failed (status " +
-                                             std::to_string(static_cast<int>(st)) + ", produced " +
-                                             std::to_string(produced) + " of " + std::to_string(expected) + ")");
-        return kHrInvalidData;
+    if (unpack_bc) {
+        const std::shared_ptr<const bcpack::Tables> tables = bcpack::active_tables();
+        const bcpack::DecodeStatus st = tables ? bcpack::decode(*tables, opts.bcpack_mode, data, len, out, expected)
+                                               : bcpack::DecodeStatus::Unsupported;
+        if (st != bcpack::DecodeStatus::Ok) {
+            diag_once(once().bcpack_failed, "XCRDAPI: BCPack request (mode " + std::to_string(opts.bcpack_mode) +
+                                                ", " + std::to_string(len) + " -> " + std::to_string(expected) +
+                                                " bytes) failed: " + bcpack::decode_status_name(st));
+            return kHrInvalidData;
+        }
+        counters().bcpack_decoded.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        size_t produced = 0;
+        const InflateStatus st = inflate_stream(data, len, out, expected, &produced);
+        if (st != InflateStatus::Ok || produced != expected) {
+            diag_once(once().inflate_failed, "XCRDAPI: zlib request failed (status " +
+                                                 std::to_string(static_cast<int>(st)) + ", produced " +
+                                                 std::to_string(produced) + " of " + std::to_string(expected) + ")");
+            return kHrInvalidData;
+        }
     }
     if (out == scratch.data()) {
         const HResult hr = write_destination(r, out, expected);
@@ -1125,22 +1162,31 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         }
         if (opts.bcpack_mode != 0) {
             const uint64_t n = counters().bcpack_requests.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((n & (n - 1)) == 0) {  // the 1st, 2nd, 4th, ... (they fail by the hundred: say which)
-                std::string name;
-                read_guest_string(r.name, 96, &name);
-                diag("XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
-                     std::to_string(opts.bcpack_mode) + ", " + std::to_string(r.source_size) + " -> " +
-                     std::to_string(r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size) +
-                     " bytes, request '" + name + "'); BCPack decompression is not supported, failing with " +
-                     "E_NOTIMPL (BCPack request " + std::to_string(n) + ")");
+            const std::shared_ptr<const bcpack::Tables> tables = bcpack::active_tables();
+            if (!tables || !bcpack::supports(*tables, opts.bcpack_mode)) {
+                if ((n & (n - 1)) == 0) {  // the 1st, 2nd, 4th, ... (they fail by the hundred: say which)
+                    std::string name;
+                    read_guest_string(r.name, 96, &name);
+                    const std::string why =
+                        !tables ? "no BCPack tables are loaded: pass --bcpack-tables <file> or set "
+                                  "PLAYGTA6_BCPACK_TABLES (the repository does not ship them; docs/BCPACK.md)"
+                                : "the loaded BCPack tables cannot decode mode " + std::to_string(opts.bcpack_mode) +
+                                      " (they support: " + bcpack::supported_formats(*tables) +
+                                      "; BC2 and BC6H are not implemented)";
+                    diag("XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
+                         std::to_string(opts.bcpack_mode) + ", " + std::to_string(r.source_size) + " -> " +
+                         std::to_string(r.destination_size) + " bytes, request '" + name + "'); " + why +
+                         ", failing with E_NOTIMPL (BCPack request " + std::to_string(n) + ")");
+                }
+                results[i] = com::E_NOTIMPL_HR;
+                continue;
             }
-            results[i] = com::E_NOTIMPL_HR;
-            continue;
         }
         if (opts.physical_pages) {
             counters().physical_page_requests.fetch_add(1, std::memory_order_relaxed);
         }
-        const size_t out_size = !opts.zlib
+        const size_t out_size = opts.bcpack_mode != 0 ? r.destination_size
+                                : !opts.zlib
                                     ? r.source_size
                                     : (r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size);
         if ((out_size != 0 && r.destination == 0) || out_size > r.destination_size) {
@@ -1182,7 +1228,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         const Item& item = items[i];
         const DStorageRequest& r = item.req;
         const DStorageOptions opts = parse_dstorage_options(r.options);
-        const bool plain = !opts.zlib && !opts.physical_pages;
+        const bool plain = !opts.compressed() && !opts.physical_pages;
         void* direct = plain ? com::guest_to_host(r.destination, r.source_size) : nullptr;
         if (direct != nullptr) {
             const HResult hr = reader.read(item.file->host(), r.source_offset, direct, r.source_size);
@@ -1493,6 +1539,7 @@ DStorageStats dstorage_stats() {
     s.live_queues = c.live_queues.load();
     s.physical_page_requests = c.physical_page_requests.load();
     s.bcpack_requests = c.bcpack_requests.load();
+    s.bcpack_decoded = c.bcpack_decoded.load();
     return s;
 }
 
@@ -1555,6 +1602,7 @@ void reset_xbox_scarlett_guest() {
     c.submits = 0;
     c.physical_page_requests = 0;
     c.bcpack_requests = 0;
+    c.bcpack_decoded = 0;
     c.worker_threads = 1;
     c.max_gap = 64 * 1024;
     c.max_span = 4 * 1024 * 1024;
@@ -1566,6 +1614,7 @@ void reset_xbox_scarlett_guest() {
     f.bad_request = false;
     f.read_failed = false;
     f.inflate_failed = false;
+    f.bcpack_failed = false;
     f.bad_signal = false;
     f.closed_queue = false;
 }
