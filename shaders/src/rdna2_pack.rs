@@ -34,8 +34,9 @@ use crate::pack::{
 };
 use crate::reflect::{SidecarBuildOptions, SidecarStageInput, StageReflectionSidecar};
 use crate::rdna2_to_wgsl::{
-    Rdna2StageOverride, Rdna2TranslateOptions, Rdna2WgslOutput, WgslBindingInfo,
-    WgslVertexInputInfo, translate_rdna2_to_wgsl, write_mesh_output_json, write_wgsl_bindings_json,
+    FssmStageMetadata, Rdna2StageOverride, Rdna2TranslateOptions, Rdna2WgslOutput, WgslBindingInfo,
+    WgslStageParamInfo, WgslVertexInputInfo, parse_fssm_stage_metadata, translate_rdna2_to_wgsl,
+    write_mesh_output_json, write_wgsl_bindings_json, write_wgsl_stage_params_json,
     write_wgsl_vertex_inputs_json,
 };
 pub use crate::rdna2_to_wgsl::{MESH_COMPUTE_KEY_SALT, MeshOutputLayout, mesh_compute_pack_key};
@@ -66,6 +67,8 @@ pub struct PipelineDumpNativeStage {
     pub is_mesh: bool,
     pub code_file: String,
     pub code_bytes: Option<u64>,
+    /// Optional relative path to an Xbox Series `FSSM` `.meta` sidecar blob.
+    pub metadata_file: Option<String>,
 }
 
 /// Parsed `playgta6-pipeline-dump` `manifest.json` (fields needed for RDNA2 packing).
@@ -94,6 +97,8 @@ pub struct Rdna2BlobInput {
     pub stage_override: Rdna2StageOverride,
     /// Explicit 64-bit hash override; when `None`, filename hash hints or FNV-1a apply.
     pub hash_override: Option<u64>,
+    /// Optional parsed Xbox Series `FSSM` stage metadata (from a sibling `.meta` file).
+    pub fssm_meta: Option<FssmStageMetadata>,
 }
 
 impl Rdna2BlobInput {
@@ -104,6 +109,7 @@ impl Rdna2BlobInput {
             bytes,
             stage_override: Rdna2StageOverride::Auto,
             hash_override: None,
+            fssm_meta: None,
         }
     }
 
@@ -116,6 +122,12 @@ impl Rdna2BlobInput {
     /// Set an explicit 64-bit hash override on this blob input.
     pub fn with_hash(mut self, hash: u64) -> Self {
         self.hash_override = Some(hash);
+        self
+    }
+
+    /// Attach parsed Xbox Series `FSSM` stage metadata to this blob input.
+    pub fn with_fssm_meta(mut self, fssm_meta: FssmStageMetadata) -> Self {
+        self.fssm_meta = Some(fssm_meta);
         self
     }
 }
@@ -233,6 +245,8 @@ pub struct Rdna2PackEntrySummary {
     pub vertex_input_mode: String,
     pub bindings: Vec<WgslBindingInfo>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
+    pub vs_outputs: Vec<WgslStageParamInfo>,
+    pub ps_inputs: Vec<WgslStageParamInfo>,
     pub mesh_output: Option<MeshOutputLayout>,
     pub rt_arena: bool,
     pub rt_prelude_version: Option<u32>,
@@ -375,6 +389,14 @@ impl Rdna2PackSummary {
                 if !entry.vertex_inputs.is_empty() {
                     out.push_str(",\n      \"vertex_inputs\": ");
                     write_wgsl_vertex_inputs_json(&mut out, &entry.vertex_inputs, "      ");
+                }
+                if !entry.vs_outputs.is_empty() {
+                    out.push_str(",\n      \"vs_outputs\": ");
+                    write_wgsl_stage_params_json(&mut out, &entry.vs_outputs, "      ");
+                }
+                if !entry.ps_inputs.is_empty() {
+                    out.push_str(",\n      \"ps_inputs\": ");
+                    write_wgsl_stage_params_json(&mut out, &entry.ps_inputs, "      ");
                 }
                 if let Some(mesh_output) = entry.mesh_output {
                     out.push_str(",\n      \"mesh_output\": ");
@@ -1258,6 +1280,14 @@ pub fn parse_pipeline_dump_manifest(
             None => None,
         };
 
+        let metadata_file = match item.get("metadata_file").and_then(JsonValue::as_str) {
+            Some(s) if !s.is_empty() => {
+                let _ = validate_manifest_relative_path(s)?;
+                Some(s.to_string())
+            }
+            _ => None,
+        };
+
         native_stages.push(PipelineDumpNativeStage {
             code_identity,
             identity,
@@ -1265,6 +1295,7 @@ pub fn parse_pipeline_dump_manifest(
             is_mesh,
             code_file: code_file.to_string(),
             code_bytes,
+            metadata_file,
         });
     }
 
@@ -1628,6 +1659,8 @@ struct TranslatedStageData {
     vertex_input_mode: String,
     bindings: Vec<WgslBindingInfo>,
     vertex_inputs: Vec<WgslVertexInputInfo>,
+    vs_outputs: Vec<WgslStageParamInfo>,
+    ps_inputs: Vec<WgslStageParamInfo>,
     mesh_output: Option<MeshOutputLayout>,
     rt_arena: bool,
     rt_prelude_version: Option<u32>,
@@ -1648,6 +1681,8 @@ impl TranslatedStageData {
             vertex_input_mode: output.binding_summary.vertex_input_mode,
             bindings: output.bindings,
             vertex_inputs: output.vertex_inputs,
+            vs_outputs: output.vs_outputs,
+            ps_inputs: output.ps_inputs,
             mesh_output: output.mesh_output,
             rt_arena: output.rt_arena,
             rt_prelude_version: output.rt_prelude_version,
@@ -1675,6 +1710,8 @@ impl TranslatedStageData {
             vertex_input_mode: self.vertex_input_mode,
             bindings: self.bindings,
             vertex_inputs: self.vertex_inputs,
+            vs_outputs: self.vs_outputs,
+            ps_inputs: self.ps_inputs,
             mesh_output: self.mesh_output,
             rt_arena: self.rt_arena,
             rt_prelude_version: self.rt_prelude_version,
@@ -1792,6 +1829,7 @@ struct BlobCandidate<'a> {
 struct BlobTranslateTask<'a> {
     bytes: &'a [u8],
     stage: Rdna2StageOverride,
+    fssm_meta: Option<&'a FssmStageMetadata>,
 }
 
 fn translate_blob_task(
@@ -1805,6 +1843,10 @@ fn translate_blob_task(
         workgroup_size: options.translate.workgroup_size,
         workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
         preserve_fragment_interpolation: options.translate.preserve_fragment_interpolation,
+        fssm_meta: task
+            .fssm_meta
+            .cloned()
+            .or_else(|| options.translate.fssm_meta.clone()),
     };
 
     match translate_rdna2_to_wgsl(task.bytes, &translate_opts) {
@@ -1878,10 +1920,10 @@ fn pack_blobs_into_map(
         } else {
             let key = (content_hash, stage_override_key(stage));
             let bucket = dedup_map.entry(key).or_default();
-            let existing = bucket
-                .iter()
-                .copied()
-                .find(|&task_idx| unique_tasks[task_idx].bytes == blob.bytes.as_slice());
+            let existing = bucket.iter().copied().find(|&task_idx| {
+                unique_tasks[task_idx].bytes == blob.bytes.as_slice()
+                    && unique_tasks[task_idx].fssm_meta == blob.fssm_meta.as_ref()
+            });
             let assigned = match existing {
                 Some(task_idx) => task_idx,
                 None => {
@@ -1889,6 +1931,7 @@ fn pack_blobs_into_map(
                     unique_tasks.push(BlobTranslateTask {
                         bytes: &blob.bytes,
                         stage,
+                        fssm_meta: blob.fssm_meta.as_ref(),
                     });
                     task_uses.push(0);
                     bucket.push(task_idx);
@@ -2108,7 +2151,17 @@ fn collect_directory_blobs(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| rel_key.clone());
-                blobs.push(Rdna2BlobInput::new(name, bytes));
+                let mut blob = Rdna2BlobInput::new(name, bytes);
+                let meta_path = path.with_extension("meta");
+                if let Ok(sm) = fs::symlink_metadata(&meta_path)
+                    && !sm.file_type().is_symlink()
+                    && sm.is_file()
+                    && let Ok(meta_bytes) = fs::read(&meta_path)
+                    && let Some(meta) = parse_fssm_stage_metadata(&meta_bytes)
+                {
+                    blob = blob.with_fssm_meta(meta);
+                }
+                blobs.push(blob);
             }
             Err(_) => {
                 read_failures += 1;
@@ -2233,6 +2286,20 @@ fn translate_manifest_stage(
         ));
     }
 
+    let fssm_meta = entry
+        .metadata_file
+        .as_deref()
+        .and_then(|meta_rel| validate_manifest_relative_path(meta_rel).ok())
+        .map(|rel| canonical_parent.join(rel))
+        .or_else(|| Some(canonical_file.with_extension("meta")))
+        .and_then(|candidate| fs::canonicalize(candidate).ok())
+        .filter(|canon| {
+            canon.starts_with(canonical_parent) && fs::metadata(canon).is_ok_and(|m| m.is_file())
+        })
+        .and_then(|canon| fs::read(canon).ok())
+        .and_then(|meta_bytes| parse_fssm_stage_metadata(&meta_bytes))
+        .or_else(|| options.translate.fssm_meta.clone());
+
     let translate_opts = Rdna2TranslateOptions {
         stage: stage_to_override(entry.stage, entry.is_mesh),
         entry_point: options.translate.entry_point.clone(),
@@ -2240,6 +2307,7 @@ fn translate_manifest_stage(
         workgroup_size: options.translate.workgroup_size,
         workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
         preserve_fragment_interpolation: options.translate.preserve_fragment_interpolation,
+        fssm_meta,
     };
 
     match translate_rdna2_to_wgsl(&bytes, &translate_opts) {
@@ -3363,10 +3431,10 @@ fn stream_blobs_into_spill(
             } else {
                 let key = (content_hash, stage_override_key(stage));
                 let bucket = dedup_map.entry(key).or_default();
-                let existing = bucket
-                    .iter()
-                    .copied()
-                    .find(|&task_idx| unique_tasks[task_idx].bytes == blob.bytes.as_slice());
+                let existing = bucket.iter().copied().find(|&task_idx| {
+                    unique_tasks[task_idx].bytes == blob.bytes.as_slice()
+                        && unique_tasks[task_idx].fssm_meta == blob.fssm_meta.as_ref()
+                });
                 let assigned = match existing {
                     Some(task_idx) => task_idx,
                     None => {
@@ -3374,6 +3442,7 @@ fn stream_blobs_into_spill(
                         unique_tasks.push(BlobTranslateTask {
                             bytes: &blob.bytes,
                             stage,
+                            fssm_meta: blob.fssm_meta.as_ref(),
                         });
                         task_uses.push(0);
                         bucket.push(task_idx);
@@ -3670,6 +3739,8 @@ impl Rdna2PackSummary {
                 bindings: &e.bindings,
                 vertex_inputs: &e.vertex_inputs,
                 vertex_input_mode: &e.vertex_input_mode,
+                vs_outputs: &e.vs_outputs,
+                ps_inputs: &e.ps_inputs,
                 mesh_output: e.mesh_output,
                 rt_arena: e.rt_arena,
             })

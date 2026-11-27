@@ -141,8 +141,8 @@ use crate::lower::{LoweringReport, WEBGPU_MAX_BINDINGS_PER_GROUP, lower_module_f
 use crate::pack::write_json_string;
 use crate::rdna2_to_wgsl::{
     CbvIndexedHeapSource, CbvRefSource, LaneIndexedHeapSource, MAX_LANE_INDEXED_WINDOW,
-    MeshOutputLayout, WgslBindingInfo, WgslBindingSource, WgslVertexInputInfo,
-    write_mesh_output_json, write_wgsl_vertex_inputs_json,
+    MeshOutputLayout, WgslBindingInfo, WgslBindingSource, WgslStageParamInfo, WgslVertexInputInfo,
+    write_mesh_output_json, write_wgsl_stage_params_json, write_wgsl_vertex_inputs_json,
 };
 
 /// Layout manifest schema version (`schema_version`).
@@ -3804,6 +3804,10 @@ pub struct SidecarStageEntry {
     pub stage: ShaderStage,
     pub bindings: Vec<SidecarBinding>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
+    /// Optional VS inter-stage output semantic mapping (`OSG1` `semantic_reg` -> `@location(N)`).
+    pub vs_outputs: Vec<WgslStageParamInfo>,
+    /// Optional PS inter-stage input semantic mapping (`ISG1` `semantic_reg` -> `@location(N)`).
+    pub ps_inputs: Vec<WgslStageParamInfo>,
     pub mesh_output: Option<MeshOutputLayout>,
     pub rt_arena: bool,
 }
@@ -3816,6 +3820,8 @@ pub struct SidecarStageInput<'a> {
     pub bindings: &'a [WgslBindingInfo],
     pub vertex_inputs: &'a [WgslVertexInputInfo],
     pub vertex_input_mode: &'a str,
+    pub vs_outputs: &'a [WgslStageParamInfo],
+    pub ps_inputs: &'a [WgslStageParamInfo],
     pub mesh_output: Option<MeshOutputLayout>,
     pub rt_arena: bool,
 }
@@ -3963,6 +3969,16 @@ impl StageReflectionSidecar {
                 bindings: sidecar_bindings,
                 vertex_inputs: if input.stage == ShaderStage::Vertex {
                     input.vertex_inputs.to_vec()
+                } else {
+                    Vec::new()
+                },
+                vs_outputs: if input.stage == ShaderStage::Vertex {
+                    input.vs_outputs.to_vec()
+                } else {
+                    Vec::new()
+                },
+                ps_inputs: if input.stage == ShaderStage::Fragment {
+                    input.ps_inputs.to_vec()
                 } else {
                     Vec::new()
                 },
@@ -4227,6 +4243,14 @@ impl StageReflectionSidecar {
             if !entry.vertex_inputs.is_empty() {
                 out.push_str(",\n      \"vertex_inputs\": ");
                 write_wgsl_vertex_inputs_json(out, &entry.vertex_inputs, "      ");
+            }
+            if !entry.vs_outputs.is_empty() {
+                out.push_str(",\n      \"vs_outputs\": ");
+                write_wgsl_stage_params_json(out, &entry.vs_outputs, "      ");
+            }
+            if !entry.ps_inputs.is_empty() {
+                out.push_str(",\n      \"ps_inputs\": ");
+                write_wgsl_stage_params_json(out, &entry.ps_inputs, "      ");
             }
             if let Some(mo) = entry.mesh_output {
                 out.push_str(",\n      \"mesh_output\": ");

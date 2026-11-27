@@ -32,7 +32,7 @@ use playgta6_shaders::rdna2_pack::{
     pack_rdna2_sources_to_file,
 };
 use playgta6_shaders::rdna2_to_wgsl::{
-    Rdna2StageOverride, Rdna2TranslateOptions, translate_rdna2_to_wgsl,
+    Rdna2StageOverride, Rdna2TranslateOptions, parse_fssm_stage_metadata, translate_rdna2_to_wgsl,
 };
 use playgta6_shaders::reflect::{
     LAYOUT_MANIFEST_FILE_NAME, ReflectError, RegisterConvention, build_layout_manifest,
@@ -1235,8 +1235,19 @@ fn format_translate_rdna2(
     let source = sanitize_source_path(file_path, None);
     let bytes = fs::read(file_path)
         .map_err(|err| format!("failed to read RDNA2 shader file {source}: {err}"))?;
+    let fssm_meta = {
+        let meta_path = file_path.with_extension("meta");
+        if meta_path != file_path && fs::metadata(&meta_path).is_ok_and(|m| m.is_file()) {
+            fs::read(&meta_path)
+                .ok()
+                .and_then(|meta_bytes| parse_fssm_stage_metadata(&meta_bytes))
+        } else {
+            None
+        }
+    };
     let options = Rdna2TranslateOptions {
         stage,
+        fssm_meta,
         ..Rdna2TranslateOptions::default()
     };
     let output = translate_rdna2_to_wgsl(&bytes, &options)

@@ -225,6 +225,156 @@ const LDS_WORKGROUP_DWORDS: u32 = 4096;
 /// Mask applied to LDS dword indices (`4095 = 0x0FFF`) so workgroup memory accesses never trap.
 const LDS_WORKGROUP_INDEX_MASK: u32 = LDS_WORKGROUP_DWORDS - 1;
 
+/// One vertex input element entry parsed from an Xbox Series `FSSM` VS metadata table
+/// (`vs_rec + 0x54 + 0x24`, 5 bytes/entry, count at `vs_rec + 0x54 + 0xc4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FssmVertexInput {
+    /// DXBC `ISG1` input signature register index (`rec[1]`).
+    pub semantic_reg: u8,
+    /// 4-bit active component bitmask (`rec[2]`, e.g. `0x7` = xyz, `0xf` = xyzw, `0x3` = xy).
+    pub mask: u8,
+    /// Starting VGPR populated by the driver-generated fetch shader (`rec[3]`, e.g. `4`, `8`, `12`).
+    pub base_vgpr: u8,
+    /// Highest active component index `0..=3` (`rec[4]`).
+    pub max_comp: u8,
+}
+
+/// Inter-stage parameter semantic mapping entry extracted from Xbox Series `FSSM` stage metadata
+/// (used for `OSG1` <-> `ISG1` / `SPI_PS_INPUT_CNTL` `@location` remapping).
+///
+/// * On a vertex stage (`vs_outputs`): maps `OSG1` `semantic_reg` -> `exp param<location>`.
+/// * On a fragment stage (`ps_inputs`): maps `ISG1` `semantic_reg` -> `v_interp attr<location>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WgslStageParamInfo {
+    pub semantic_reg: u8,
+    pub location: u32,
+    pub mask: Option<u8>,
+}
+
+/// Parsed Xbox Series `FSSM` stage metadata (from a `.meta` sidecar or embedded native blob).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FssmStageMetadata {
+    /// FSSM VS fetch-shader input assignments (`s_swappc_b64`).
+    pub vs_inputs: Vec<FssmVertexInput>,
+    /// FSSM VS output parameter semantic map (`OSG1` `semantic_reg` -> `exp param<location>`).
+    pub vs_outputs: Vec<WgslStageParamInfo>,
+    /// FSSM PS input parameter semantic map (`ISG1` `semantic_reg` -> `v_interp attr<location>`).
+    pub ps_inputs: Vec<WgslStageParamInfo>,
+}
+
+/// Parse an Xbox Series `FSSM` (`version == 0x101`) metadata blob into [`FssmStageMetadata`].
+///
+/// Strictly bounds-checked and panic-free on arbitrary, truncated, or non-FSSM inputs; returns
+/// `None` if the bytes do not form a valid `FSSM` v0x101 container.
+pub fn parse_fssm_stage_metadata(bytes: &[u8]) -> Option<FssmStageMetadata> {
+    const FSSM_HEADER: usize = 0x10;
+    const FSSM_VERSION: u32 = 0x101;
+    const FSSM_GRAPHICS_SLOTS: u64 = 6;
+    const FSSM_ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+    const FSSM_RECORD_BYTES: usize = 0x54;
+    const FSSM_MAX_TABLE_ENTRIES: usize = 32;
+
+    let read_u32 = |buf: &[u8], off: usize| -> Option<u32> {
+        let slice = buf.get(off..off.checked_add(4)?)?;
+        Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    };
+    let read_u64 = |buf: &[u8], off: usize| -> Option<u64> {
+        let slice = buf.get(off..off.checked_add(8)?)?;
+        Some(u64::from_le_bytes([
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+        ]))
+    };
+
+    if bytes.len() < FSSM_HEADER + 0x68 || bytes.get(0..4)? != b"FSSM" {
+        return None;
+    }
+    if read_u32(bytes, 4)? != FSSM_VERSION {
+        return None;
+    }
+    let pl = bytes.get(FSSM_HEADER..)?;
+    if read_u64(bytes, 8)? != pl.len() as u64 {
+        return None;
+    }
+    if read_u64(pl, 0)? != FSSM_GRAPHICS_SLOTS {
+        return None;
+    }
+
+    let mut meta = FssmStageMetadata::default();
+
+    // VS slot at pl + 0x28
+    let vs_rec_u64 = read_u64(pl, 0x28)?;
+    if vs_rec_u64 != FSSM_ABSENT
+        && let Ok(vs_rec) = usize::try_from(vs_rec_u64)
+        && let Some(ext) = vs_rec.checked_add(FSSM_RECORD_BYTES)
+    {
+        if let Some(in_cnt_raw) = read_u32(pl, ext.checked_add(0xc4)?) {
+            let in_cnt = (in_cnt_raw as usize).min(FSSM_MAX_TABLE_ENTRIES);
+            if let Some(table_start) = ext.checked_add(0x24)
+                && let Some(table_end) = table_start.checked_add(in_cnt * 5)
+                && let Some(table) = pl.get(table_start..table_end)
+            {
+                for chunk in table.chunks_exact(5) {
+                    let mask = chunk[2] & 0x0F;
+                    if chunk[0] == 0 && mask == 0 {
+                        continue;
+                    }
+                    meta.vs_inputs.push(FssmVertexInput {
+                        semantic_reg: chunk[1],
+                        mask,
+                        base_vgpr: chunk[3],
+                        max_comp: chunk[4].min(3),
+                    });
+                }
+            }
+        }
+        if let Some(out_cnt_raw) = read_u32(pl, ext.checked_add(0x188)?) {
+            let out_cnt = (out_cnt_raw as usize).min(FSSM_MAX_TABLE_ENTRIES);
+            if let Some(table_start) = ext.checked_add(0xc8)
+                && let Some(table_end) = table_start.checked_add(out_cnt * 6)
+                && let Some(table) = pl.get(table_start..table_end)
+            {
+                for chunk in table.chunks_exact(6) {
+                    if chunk[0] == 0 {
+                        continue;
+                    }
+                    meta.vs_outputs.push(WgslStageParamInfo {
+                        semantic_reg: chunk[1],
+                        location: u32::from(chunk[2]),
+                        mask: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // PS slot at pl + 0x30
+    let ps_rec_u64 = read_u64(pl, 0x30)?;
+    if ps_rec_u64 != FSSM_ABSENT
+        && let Ok(ps_rec) = usize::try_from(ps_rec_u64)
+        && let Some(ext) = ps_rec.checked_add(FSSM_RECORD_BYTES)
+        && let Some(in_cnt_raw) = read_u32(pl, ext.checked_add(0x124)?)
+    {
+        let in_cnt = (in_cnt_raw as usize).min(FSSM_MAX_TABLE_ENTRIES);
+        if let Some(table_start) = ext.checked_add(0x24)
+            && let Some(table_end) = table_start.checked_add(in_cnt * 8)
+            && let Some(table) = pl.get(table_start..table_end)
+        {
+            for chunk in table.chunks_exact(8) {
+                if chunk[0] == 0 {
+                    continue;
+                }
+                meta.ps_inputs.push(WgslStageParamInfo {
+                    semantic_reg: chunk[1],
+                    location: u32::from(chunk[3]),
+                    mask: Some(chunk[2] & 0x0F),
+                });
+            }
+        }
+    }
+
+    Some(meta)
+}
+
 /// Options controlling RDNA2 -> WGSL translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rdna2TranslateOptions {
@@ -247,6 +397,9 @@ pub struct Rdna2TranslateOptions {
     /// always emits default `perspective, center` interpolation. Emitting non-default `@interpolate`
     /// on `FragIn` causes Dawn/Tint to reject the VS↔PS pipeline interface.
     pub preserve_fragment_interpolation: bool,
+    /// Optional parsed Xbox Series `FSSM` stage metadata (from a `.meta` sidecar) supplying exact
+    /// `s_swappc_b64` vertex fetch VGPR assignments and inter-stage `OSG1`/`ISG1` semantic maps.
+    pub fssm_meta: Option<FssmStageMetadata>,
 }
 
 impl Default for Rdna2TranslateOptions {
@@ -258,6 +411,7 @@ impl Default for Rdna2TranslateOptions {
             workgroup_size: DEFAULT_COMPUTE_WORKGROUP_SIZE,
             workgroup_id_sgpr_base: None,
             preserve_fragment_interpolation: false,
+            fssm_meta: None,
         }
     }
 }
@@ -628,6 +782,36 @@ pub(crate) fn write_wgsl_vertex_inputs_json(
     out.push(']');
 }
 
+/// Write a JSON array of [`WgslStageParamInfo`] entries with the given leading indentation.
+pub(crate) fn write_wgsl_stage_params_json(
+    out: &mut String,
+    params: &[WgslStageParamInfo],
+    indent: &str,
+) {
+    if params.is_empty() {
+        out.push_str("[]");
+        return;
+    }
+    out.push_str("[\n");
+    for (i, p) in params.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{indent}  {{\"semantic_reg\": {}, \"location\": {}",
+            p.semantic_reg, p.location
+        );
+        if let Some(mask) = p.mask {
+            let _ = write!(out, ", \"mask\": {mask}");
+        }
+        out.push('}');
+        if i + 1 < params.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push(']');
+}
+
 /// Summary of WebGPU bindings and stage I/O synthesized for a translated RDNA2 shader.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Rdna2BindingSummary {
@@ -660,6 +844,10 @@ pub struct Rdna2WgslOutput {
     pub naga_validated: bool,
     pub bindings: Vec<WgslBindingInfo>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
+    /// Optional VS inter-stage output semantic mapping (`OSG1` `semantic_reg` -> `@location(N)`).
+    pub vs_outputs: Vec<WgslStageParamInfo>,
+    /// Optional PS inter-stage input semantic mapping (`ISG1` `semantic_reg` -> `@location(N)`).
+    pub ps_inputs: Vec<WgslStageParamInfo>,
     pub mesh_output: Option<MeshOutputLayout>,
     pub rt_arena: bool,
     pub rt_prelude_version: Option<u32>,
@@ -715,6 +903,16 @@ impl Rdna2WgslOutput {
         if !self.vertex_inputs.is_empty() {
             out.push_str("  \"vertex_inputs\": ");
             write_wgsl_vertex_inputs_json(&mut out, &self.vertex_inputs, "  ");
+            out.push_str(",\n");
+        }
+        if !self.vs_outputs.is_empty() {
+            out.push_str("  \"vs_outputs\": ");
+            write_wgsl_stage_params_json(&mut out, &self.vs_outputs, "  ");
+            out.push_str(",\n");
+        }
+        if !self.ps_inputs.is_empty() {
+            out.push_str("  \"ps_inputs\": ");
+            write_wgsl_stage_params_json(&mut out, &self.ps_inputs, "  ");
             out.push_str(",\n");
         }
 
@@ -845,6 +1043,389 @@ struct VertexFetchPlan {
     components: u8,
     component_type: &'static str,
     fetch_format: Option<&'static str>,
+}
+
+/// Synthesized vertex fetch attribute populated at an unlinked Xbox `FSSM` `s_swappc_b64`
+/// fetch-shader call site in a vertex shader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwappcFetchAttr {
+    location: u32,
+    base_vgpr: u8,
+    mask: u8,
+    components: u8,
+    component_type: &'static str,
+}
+
+/// Packed byte stride for conventional RAGE / Scaleform `FSSM` vertex attributes:
+/// 1-comp (`u32`/`f32`/`R8G8B8A8_UINT` batch idx) = 4B, 2-comp (`float2`) = 8B,
+/// 3-comp (`float3`) = 12B, 4-comp (`R8G8B8A8_UNORM` color) = 4B.
+#[inline]
+const fn fssm_attr_packed_byte_stride(components: u8) -> u16 {
+    match components {
+        1 => 4,
+        2 => 8,
+        3 => 12,
+        _ => 4,
+    }
+}
+
+/// Scan vertex-shader instructions starting after `swappc_idx` to classify VGPRs read before
+/// being written (`reg >= 4`) by float vs unsigned-int vs signed-int usage.
+fn classify_swappc_vgpr_reads(
+    active: &[Rdna2Instruction],
+    swappc_idx: usize,
+) -> (BTreeSet<u8>, BTreeSet<u8>, BTreeSet<u8>, BTreeSet<u8>) {
+    #[derive(Clone, Copy)]
+    enum ReadKind {
+        Float,
+        Uint,
+        Sint,
+        Neutral,
+    }
+
+    let mut written: BTreeSet<u8> = BTreeSet::new();
+    let mut rbw: BTreeSet<u8> = BTreeSet::new();
+    let mut as_float: BTreeSet<u8> = BTreeSet::new();
+    let mut as_uint: BTreeSet<u8> = BTreeSet::new();
+    let mut as_sint: BTreeSet<u8> = BTreeSet::new();
+
+    let mut note_read = |written: &BTreeSet<u8>, src: u16, kind: ReadKind| {
+        if (256..=511).contains(&src) {
+            let reg = (src - 256) as u8;
+            if reg >= 4 && !written.contains(&reg) {
+                rbw.insert(reg);
+                match kind {
+                    ReadKind::Float => {
+                        as_float.insert(reg);
+                    }
+                    ReadKind::Uint => {
+                        as_uint.insert(reg);
+                    }
+                    ReadKind::Sint => {
+                        as_sint.insert(reg);
+                    }
+                    ReadKind::Neutral => {}
+                }
+            }
+        }
+    };
+
+    for inst in active.iter().skip(swappc_idx.saturating_add(1)) {
+        if inst.truncated {
+            continue;
+        }
+        match &inst.detail {
+            Rdna2Detail::Vop1 { op, vdst, src0, .. } => {
+                if matches!(op, 0x00 | 0x1B | 0x41) {
+                    continue;
+                }
+                let kind = match *op {
+                    0x01 => ReadKind::Neutral, // v_mov_b32
+                    0x02 | 0x06 => ReadKind::Uint, // v_readfirstlane_b32 / v_cvt_f32_u32
+                    0x05 => ReadKind::Sint, // v_cvt_f32_i32
+                    0x07..=0x11 | 0x1E..=0x35 => ReadKind::Float,
+                    0x65 => ReadKind::Neutral, // v_swap_b32
+                    _ => ReadKind::Neutral,
+                };
+                note_read(&written, *src0, kind);
+                if *op == 0x65 {
+                    note_read(&written, 256 + u16::from(*vdst), ReadKind::Neutral);
+                    written.insert(*vdst);
+                    if (256..=511).contains(src0) {
+                        written.insert((*src0 - 256) as u8);
+                    }
+                } else if *op != 0x02 {
+                    written.insert(*vdst);
+                }
+            }
+            Rdna2Detail::Vopc { op, vsrc1, src0, .. } => {
+                let kind = match *op {
+                    0x40..=0x5F | 0xC0..=0xDF => ReadKind::Float,
+                    0x80..=0x8F => ReadKind::Sint,
+                    0x90..=0x9F => ReadKind::Uint,
+                    _ => ReadKind::Neutral,
+                };
+                note_read(&written, *src0, kind);
+                note_read(&written, 256 + u16::from(*vsrc1), kind);
+            }
+            Rdna2Detail::Vop2 {
+                op,
+                vdst,
+                vsrc1,
+                src0,
+                ..
+            } => {
+                let kind = match *op {
+                    0x00 | 0x01 => ReadKind::Neutral, // v_cndmask_b32
+                    0x03..=0x08 | 0x0F..=0x10 | 0x1F | 0x2B..=0x38 | 0x3B..=0x3D => ReadKind::Float,
+                    0x11..=0x12 | 0x18 => ReadKind::Sint,
+                    0x13..=0x17 | 0x1A..=0x1E | 0x25..=0x26 | 0x28..=0x2A => ReadKind::Uint,
+                    _ => ReadKind::Neutral,
+                };
+                note_read(&written, *src0, kind);
+                note_read(&written, 256 + u16::from(*vsrc1), kind);
+                if matches!(op, 0x02 | 0x06 | 0x1F | 0x2B | 0x36 | 0x3C) {
+                    note_read(&written, 256 + u16::from(*vdst), kind);
+                }
+                written.insert(*vdst);
+            }
+            Rdna2Detail::Vop3 {
+                op,
+                vdst,
+                src0,
+                src1,
+                src2,
+                ..
+            } => {
+                if matches!(*op, 0x180 | 0x19B | 0x1C1) {
+                    continue;
+                }
+                let kind = match *op {
+                    0x100 | 0x101 | 0x181 | 0x1E5 => ReadKind::Neutral,
+                    0x103..=0x108
+                    | 0x10F..=0x110
+                    | 0x11F
+                    | 0x12B..=0x138
+                    | 0x13B..=0x13D
+                    | 0x140..=0x141
+                    | 0x144..=0x147
+                    | 0x14B..=0x14C
+                    | 0x150..=0x151
+                    | 0x154
+                    | 0x157
+                    | 0x15E..=0x164
+                    | 0x187..=0x191
+                    | 0x19E..=0x1B5
+                    | 0x34B
+                    | 0x364
+                    | 0x367..=0x368 => ReadKind::Float,
+                    0x111..=0x112
+                    | 0x118
+                    | 0x142
+                    | 0x149
+                    | 0x152
+                    | 0x155
+                    | 0x158
+                    | 0x16C
+                    | 0x171
+                    | 0x185
+                    | 0x301
+                    | 0x35E => ReadKind::Sint,
+                    0x113..=0x117
+                    | 0x11A..=0x11E
+                    | 0x125..=0x126
+                    | 0x128..=0x12A
+                    | 0x143
+                    | 0x148
+                    | 0x14A
+                    | 0x14D..=0x14F
+                    | 0x153
+                    | 0x156
+                    | 0x159..=0x15D
+                    | 0x165
+                    | 0x169..=0x16A
+                    | 0x170
+                    | 0x178
+                    | 0x182
+                    | 0x186
+                    | 0x2FF..=0x300
+                    | 0x30F..=0x319
+                    | 0x340
+                    | 0x344..=0x347
+                    | 0x360
+                    | 0x36D..=0x372 => ReadKind::Uint,
+                    _ => ReadKind::Neutral,
+                };
+                note_read(&written, *src0, kind);
+                if !(0x180..=0x1FF).contains(op) {
+                    note_read(&written, *src1, kind);
+                }
+                if matches!(
+                    *op,
+                    0x100
+                        | 0x101
+                        | 0x128..=0x12A
+                        | 0x140..=0x165
+                        | 0x16D..=0x171
+                        | 0x178
+                        | 0x340..=0x35F
+                        | 0x36D..=0x372
+                        | 0x377
+                        | 0x378
+                ) {
+                    note_read(&written, *src2, kind);
+                }
+                if matches!(*op, 0x102 | 0x106 | 0x11F | 0x12B | 0x136 | 0x13C | 0x1E5) {
+                    note_read(&written, 256 + u16::from(*vdst), kind);
+                }
+                if *op > 0xFF && *op != 0x360 && *op != 0x182 {
+                    written.insert(*vdst);
+                    if *op == 0x1E5 && (256..=511).contains(src0) {
+                        written.insert((*src0 - 256) as u8);
+                    }
+                    if matches!(*op, 0x2FF..=0x301 | 0x364) && *vdst < 255 {
+                        written.insert(*vdst + 1);
+                    }
+                }
+            }
+            Rdna2Detail::Vop3P {
+                op,
+                vdst,
+                src0,
+                src1,
+                src2,
+                ..
+            } => {
+                note_read(&written, *src0, ReadKind::Neutral);
+                note_read(&written, *src1, ReadKind::Neutral);
+                if vop3p_is_ternary(*op) {
+                    note_read(&written, *src2, ReadKind::Neutral);
+                }
+                written.insert(*vdst);
+            }
+            Rdna2Detail::Mubuf {
+                op,
+                offen,
+                idxen,
+                vaddr,
+                vdata,
+                ..
+            } => {
+                if *offen || *idxen {
+                    note_read(&written, 256 + u16::from(*vaddr), ReadKind::Uint);
+                }
+                if *offen
+                    && *idxen
+                    && let Some(v1) = checked_vgpr_reg(*vaddr, 1)
+                {
+                    note_read(&written, 256 + u16::from(v1), ReadKind::Uint);
+                }
+                if let Some(buf_op) = mubuf_storage_op(*op) {
+                    let cnt = buf_op.vdata_count();
+                    if buf_op.is_store() {
+                        for d in 0..cnt {
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                note_read(&written, 256 + u16::from(reg), ReadKind::Neutral);
+                            }
+                        }
+                    } else {
+                        for d in 0..cnt {
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                written.insert(reg);
+                            }
+                        }
+                    }
+                }
+            }
+            Rdna2Detail::Mtbuf {
+                op,
+                offen,
+                idxen,
+                vaddr,
+                vdata,
+                ..
+            } => {
+                if *offen || *idxen {
+                    note_read(&written, 256 + u16::from(*vaddr), ReadKind::Uint);
+                }
+                if *offen
+                    && *idxen
+                    && let Some(v1) = checked_vgpr_reg(*vaddr, 1)
+                {
+                    note_read(&written, 256 + u16::from(v1), ReadKind::Uint);
+                }
+                if let Some(buf_op) = mtbuf_storage_op(*op) {
+                    let cnt = buf_op.vdata_count();
+                    if buf_op.is_store() {
+                        for d in 0..cnt {
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                note_read(&written, 256 + u16::from(reg), ReadKind::Neutral);
+                            }
+                        }
+                    } else {
+                        for d in 0..cnt {
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                written.insert(reg);
+                            }
+                        }
+                    }
+                }
+            }
+            Rdna2Detail::Mimg {
+                op,
+                dmask,
+                dim,
+                d16,
+                nsize,
+                vaddr,
+                nsa_vaddrs,
+                vdata,
+                ..
+            } => {
+                if let Some(layout) = mimg_addr_layout(*op) {
+                    let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
+                    let comp_cnt = if layout.is_gather4 {
+                        4
+                    } else {
+                        eff_mask.count_ones()
+                    };
+                    let data_vgprs = if *d16 { comp_cnt.div_ceil(2) } else { comp_cnt } as u8;
+                    let tex_dim = if layout.is_store || layout.is_load {
+                        TexDim::from_storage_mimg_dim(*dim)
+                    } else {
+                        TexDim::from_mimg_dim(*dim)
+                    };
+                    let extra_grad = if layout.grad_off.is_some() && tex_dim.has_3d_grad() {
+                        2u8
+                    } else {
+                        0u8
+                    };
+                    let addr_vgprs = layout
+                        .total_vgprs
+                        .saturating_add(extra_grad)
+                        .saturating_add(tex_dim.extra_coord_vgprs());
+                    let addr_kind = if layout.is_load || layout.is_store {
+                        ReadKind::Uint
+                    } else {
+                        ReadKind::Float
+                    };
+                    for a in 0..addr_vgprs {
+                        if let Some(reg) = mimg_addr_vgpr(*vaddr, *nsize, nsa_vaddrs, a) {
+                            note_read(&written, 256 + u16::from(reg), addr_kind);
+                        }
+                    }
+                    if !layout.is_store {
+                        for d in 0..data_vgprs {
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                written.insert(reg);
+                            }
+                        }
+                    }
+                }
+            }
+            Rdna2Detail::Exp {
+                en, compr, vsrc, ..
+            } => {
+                if *compr {
+                    if (*en & 0b0001) != 0 {
+                        note_read(&written, 256 + u16::from(vsrc[0]), ReadKind::Float);
+                    }
+                    if (*en & 0b0100) != 0 {
+                        note_read(&written, 256 + u16::from(vsrc[1]), ReadKind::Float);
+                    }
+                } else {
+                    for (idx, &reg) in vsrc.iter().enumerate() {
+                        if (*en & (1 << idx)) != 0 {
+                            note_read(&written, 256 + u16::from(reg), ReadKind::Float);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (rbw, as_float, as_uint, as_sint)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1152,6 +1733,7 @@ struct ProgramPlan {
     active_inst_count: usize,
     vertex_input_mode: VertexInputMode,
     vertex_attrs: Vec<VertexInputAttr>,
+    swappc_fetch_attrs: Vec<SwappcFetchAttr>,
     has_buffer_fetch: bool,
     legacy_uv_attr_index: Option<usize>,
     vsharp_fetch_insts: BTreeSet<usize>,
@@ -9975,6 +10557,7 @@ fn plan_program(
     let mut storage_tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
     let mut uses_lds = false;
     let mut has_buffer_fetch = false;
+    let mut first_swappc_idx: Option<usize> = None;
     let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
     let mut frag_attr_interp: BTreeMap<u8, FragAttrInterp> = BTreeMap::new();
@@ -10062,6 +10645,13 @@ fn plan_program(
             Rdna2Detail::Sop1 {
                 op, sdst, ssrc0, ..
             } => {
+                if stage == ShaderStage::Vertex && *op == 0x21 {
+                    // `s_swappc_b64`: Xbox FSSM vertex fetch shader call. Handled directly by
+                    // synthesized `@location(k)` VsIn attribute loads; do not pollute SGPRs with
+                    // the fetch-shader pointer pair (`s[4:5]`).
+                    first_swappc_idx.get_or_insert(inst_idx);
+                    continue;
+                }
                 record_src_usage(
                     u16::from(*ssrc0),
                     &mut vgprs,
@@ -10402,6 +10992,10 @@ fn plan_program(
                 literal,
                 ..
             } => {
+                if matches!(*op, 0x180 | 0x19B | 0x1C1) {
+                    // v_nop / v_pipeflush / v_clrexcp promoted to VOP3 carry no register operands.
+                    continue;
+                }
                 if vop3_is_interp_f16(*op) {
                     let (attr, attrchan, high) = decode_vop3_interp_attr(*src0);
                     if stage == ShaderStage::Fragment {
@@ -11194,6 +11788,7 @@ fn plan_program(
     }
 
     let mut vertex_attrs: Vec<VertexInputAttr> = Vec::new();
+    let mut swappc_fetch_attrs: Vec<SwappcFetchAttr> = Vec::new();
     let mut legacy_uv_attr_index: Option<usize> = None;
     let vertex_input_mode = if stage == ShaderStage::Vertex {
         if has_buffer_fetch && !vertex_buf_fetches.is_empty() {
@@ -11285,6 +11880,114 @@ fn plan_program(
             } else {
                 vertex_attrs.clear();
                 legacy_uv_attr_index = None;
+                vgprs.insert(0);
+                VertexInputMode::VertexIndex
+            }
+        } else if let Some(swappc_idx) = first_swappc_idx {
+            // Unlinked Xbox Series FSSM vertex shader calling driver-generated fetch shader via
+            // `s_swappc_b64`. Prefer exact FSSM `.meta` VS input table when supplied; otherwise
+            // infer 4-VGPR attribute groups (`v4..v7`, `v8..v11`, ...) from VGPRs read before
+            // being written after `s_swappc_b64`.
+            let (rbw_after_swappc, as_float, as_uint, as_sint) =
+                classify_swappc_vgpr_reads(active, swappc_idx);
+            let infer_comp_type = |base_vgpr: u8, mask: u8| -> &'static str {
+                let mut saw_float = false;
+                let mut saw_uint = false;
+                let mut saw_sint = false;
+                for lane in 0..4u8 {
+                    if (mask & (1u8 << lane)) == 0 {
+                        continue;
+                    }
+                    if let Some(reg) = checked_vgpr_reg(base_vgpr, lane) {
+                        saw_float |= as_float.contains(&reg);
+                        saw_uint |= as_uint.contains(&reg);
+                        saw_sint |= as_sint.contains(&reg);
+                    }
+                }
+                if saw_float {
+                    "f32"
+                } else if saw_uint {
+                    "u32"
+                } else if saw_sint {
+                    "i32"
+                } else {
+                    "f32"
+                }
+            };
+
+            let raw_specs: Vec<(u8, u8, u8)> = if let Some(meta) = options.fssm_meta.as_ref()
+                && !meta.vs_inputs.is_empty()
+            {
+                meta.vs_inputs
+                    .iter()
+                    .map(|inp| {
+                        let mask = if inp.mask == 0 { 0x01 } else { inp.mask & 0x0F };
+                        let comps = (inp.max_comp + 1).clamp(1, 4);
+                        (inp.base_vgpr, mask, comps)
+                    })
+                    .collect()
+            } else {
+                // Fallback heuristic: group read-before-write VGPRs (`reg >= 4`) into 4-VGPR
+                // fetch-shader output slots `slot = (reg - 4) / 4` (`v4..v7`, `v8..v11`, ...).
+                let mut buckets: BTreeMap<u8, u8> = BTreeMap::new();
+                for &reg in &rbw_after_swappc {
+                    if reg < 4 {
+                        continue;
+                    }
+                    let slot = (reg - 4) / 4;
+                    if u32::from(slot) >= u32::from(MAX_WEBGPU_LOCATIONS) {
+                        continue;
+                    }
+                    let lane = (reg - 4) % 4;
+                    *buckets.entry(slot).or_insert(0) |= 1u8 << lane;
+                }
+                buckets
+                    .into_iter()
+                    .map(|(slot, mask)| {
+                        let base_vgpr = 4u8.saturating_add(slot.saturating_mul(4));
+                        let highest_lane = (0..4u8).rev().find(|&c| (mask & (1u8 << c)) != 0).unwrap_or(0);
+                        (base_vgpr, mask, highest_lane + 1)
+                    })
+                    .collect()
+            };
+
+            let mut cur_byte_offset: u16 = 0;
+            for (loc_idx, (base_vgpr, mask, components)) in raw_specs.into_iter().enumerate() {
+                let location = loc_idx as u32;
+                if location >= u32::from(MAX_WEBGPU_LOCATIONS) {
+                    break;
+                }
+                let component_type = infer_comp_type(base_vgpr, mask);
+                for lane in 0..components {
+                    if (mask & (1u8 << lane)) != 0
+                        && let Some(reg) = checked_vgpr_reg(base_vgpr, lane)
+                    {
+                        vgprs.insert(reg);
+                    }
+                }
+                swappc_fetch_attrs.push(SwappcFetchAttr {
+                    location,
+                    base_vgpr,
+                    mask,
+                    components,
+                    component_type,
+                });
+                vertex_attrs.push(VertexInputAttr {
+                    vb_slot: 0,
+                    byte_offset: Some(cur_byte_offset),
+                    location,
+                    name: format!("attr_{location}"),
+                    components,
+                    component_type,
+                    fetch_format: None,
+                });
+                cur_byte_offset =
+                    cur_byte_offset.saturating_add(fssm_attr_packed_byte_stride(components));
+            }
+
+            if !swappc_fetch_attrs.is_empty() {
+                VertexInputMode::Attributes
+            } else {
                 vgprs.insert(0);
                 VertexInputMode::VertexIndex
             }
@@ -11470,6 +12173,7 @@ fn plan_program(
         active_inst_count,
         vertex_input_mode,
         vertex_attrs,
+        swappc_fetch_attrs,
         has_buffer_fetch,
         legacy_uv_attr_index,
         vsharp_fetch_insts,
@@ -11618,6 +12322,8 @@ struct IrEmitter {
     vs_in_arg: Option<u32>,
     /// Map from `(vb_slot, vertex buffer byte offset)` -> `(VsIn member_index, attr_components, scalar_kind)`.
     vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8, ScalarKind)>,
+    /// Synthesized `(VsIn member_index, SwappcFetchAttr)` list loaded at `s_swappc_b64` in FSSM VS.
+    swappc_fetch_loads: Vec<(u32, SwappcFetchAttr)>,
     has_buffer_fetch: bool,
     legacy_uv_member_index: Option<u32>,
     vertex_input_mode: VertexInputMode,
@@ -12342,6 +13048,7 @@ impl IrEmitter {
 
         let mut vs_in_arg = None;
         let mut vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8, ScalarKind)> = BTreeMap::new();
+        let mut swappc_fetch_loads: Vec<(u32, SwappcFetchAttr)> = Vec::new();
         let mut legacy_uv_member_index: Option<u32> = None;
         let mut frag_in_arg = None;
         let mut frag_attr_member_index = BTreeMap::new();
@@ -12428,6 +13135,13 @@ impl IrEmitter {
                                     (attr.vb_slot, byte_off),
                                     (member_idx, attr.components, scalar_kind),
                                 );
+                            }
+                            if let Some(&sw_attr) = plan
+                                .swappc_fetch_attrs
+                                .iter()
+                                .find(|a| a.location == attr.location)
+                            {
+                                swappc_fetch_loads.push((member_idx, sw_attr));
                             }
                             if plan.legacy_uv_attr_index == Some(attr_idx) {
                                 legacy_uv_member_index = Some(member_idx);
@@ -12796,6 +13510,7 @@ impl IrEmitter {
             frag_attr_f16_high_channels: plan.frag_attr_f16_high_channels.clone(),
             vs_in_arg,
             vs_attr_by_offset,
+            swappc_fetch_loads,
             has_buffer_fetch: plan.has_buffer_fetch,
             legacy_uv_member_index,
             vertex_input_mode: plan.vertex_input_mode,
@@ -14520,8 +15235,8 @@ impl IrEmitter {
                         }
                         VertexInputMode::Attributes => {
                             let vs_in = self.raw_expr(Expression::FunctionArgument(arg_idx));
-                            if self.has_buffer_fetch {
-                                // Provide SV_VertexID in v0 prior to buffer attribute fetches.
+                            if self.has_buffer_fetch || !self.swappc_fetch_loads.is_empty() {
+                                // Provide SV_VertexID in v0 prior to buffer/fetch-shader attribute loads.
                                 if self.vgpr_locals.contains_key(&0) {
                                     let vi = self.emit_expr(Expression::AccessIndex {
                                         base: vs_in,
@@ -16036,6 +16751,51 @@ impl IrEmitter {
                     self.emit_bin(BinaryOperator::And, cur, nbit)
                 };
                 self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_swappc_b64: Xbox FSSM driver-generated vertex fetch shader call.
+            // Populate the target VGPRs from synthesized `VsIn` `@location(k)` attributes.
+            0x21 if self.stage == ShaderStage::Vertex => {
+                if let Some(arg_idx) = self.vs_in_arg
+                    && !self.swappc_fetch_loads.is_empty()
+                {
+                    let vs_in = self.raw_expr(Expression::FunctionArgument(arg_idx));
+                    let loads = self.swappc_fetch_loads.clone();
+                    for (member_idx, attr) in loads {
+                        let attr_val = self.emit_expr(Expression::AccessIndex {
+                            base: vs_in,
+                            index: member_idx,
+                        });
+                        if attr.components == 1 {
+                            if self.vgpr_locals.contains_key(&attr.base_vgpr) {
+                                match attr.component_type {
+                                    "u32" => self.store_vgpr_u32(attr.base_vgpr, attr_val),
+                                    "i32" => self.store_vgpr_i32(attr.base_vgpr, attr_val),
+                                    _ => self.store_vgpr_f32(attr.base_vgpr, attr_val),
+                                }
+                            }
+                        } else {
+                            for lane in 0..attr.components {
+                                if (attr.mask & (1u8 << lane)) == 0 {
+                                    continue;
+                                }
+                                if let Some(reg) = checked_vgpr_reg(attr.base_vgpr, lane)
+                                    && self.vgpr_locals.contains_key(&reg)
+                                {
+                                    let comp = self.emit_expr(Expression::AccessIndex {
+                                        base: attr_val,
+                                        index: u32::from(lane),
+                                    });
+                                    match attr.component_type {
+                                        "u32" => self.store_vgpr_u32(reg, comp),
+                                        "i32" => self.store_vgpr_i32(reg, comp),
+                                        _ => self.store_vgpr_f32(reg, comp),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 true
             }
             // s_quadmask_b32: bit q (0..7) = (any bit in src0[4q+3:4q] != 0); scc = (res != 0)
@@ -24552,6 +25312,25 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
     };
     vertex_inputs.sort_by_key(|v| (v.location, v.vb_slot, v.byte_offset));
 
+    let vs_outputs = if plan.stage == ShaderStage::Vertex {
+        options
+            .fssm_meta
+            .as_ref()
+            .map(|m| m.vs_outputs.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let ps_inputs = if plan.stage == ShaderStage::Fragment {
+        options
+            .fssm_meta
+            .as_ref()
+            .map(|m| m.ps_inputs.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     Ok(Rdna2WgslOutput {
         wgsl,
         stage: plan.stage,
@@ -24562,6 +25341,8 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
         naga_validated: true,
         bindings,
         vertex_inputs,
+        vs_outputs,
+        ps_inputs,
         mesh_output: plan.mesh_output,
         rt_arena: plan.rt_arena,
         rt_prelude_version: if plan.rt_arena {

@@ -4629,6 +4629,8 @@ pub fn match_dxil_to_root_signature(
         stage: fallback.stage,
         bindings: sidecar_bindings,
         vertex_inputs,
+        vs_outputs: Vec::new(),
+        ps_inputs: Vec::new(),
         mesh_output: None,
         rt_arena: false,
     };

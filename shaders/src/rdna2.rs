@@ -3012,10 +3012,14 @@ fn decode_vop3(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let src0 = (w1 & 0x1FF) as u16;
 
     let is_interp_f16 = vop3_is_interp_f16(op);
+    // In GFX10.3 / Xbox Series Scarlett, `v_nop_e64` (`VOP3 op=0x180`) is used as a 3-dword
+    // metadata carrier with `src2 = 0xFF` (literal constant in the 3rd dword) even though
+    // `v_nop` takes no real ALU operands. Always consume the literal word when `op == 0x180`
+    // encodes `0xFF` in `src0`, `src1`, or `src2`.
     let uses_lit = !truncated
         && ((!is_interp_f16 && src0 == 0xFF)
-            || (num_srcs >= 2 && src1 == 0xFF)
-            || (num_srcs >= 3 && src2 == 0xFF));
+            || ((num_srcs >= 2 || op == 0x180) && src1 == 0xFF)
+            || ((num_srcs >= 3 || op == 0x180) && src2 == 0xFF));
     let literal = if uses_lit {
         match read_inst_word(bytes, offset, 2) {
             Some(lit) => {
@@ -3883,6 +3887,13 @@ const XBOX_SHADER_PREAMBLE_TAIL: [u32; 3] = [0xd580_0000, 0x03fe_0100, 0x0000_0a
 /// `s_inst_prefetch 0x3`: the first real instruction following the Xbox preamble.
 const XBOX_SHADER_ENTRY_INST: u32 = 0xbfa0_0003;
 
+/// Whether `word` encodes `s_swappc_b64 sdst, ssrc0` (SOP1 `[31:23]=0b101111101`, `op=0x21`).
+/// Unlinked Xbox Series FSSM vertex shaders emit this fetch-shader call at `+0x18` right
+/// before `s_inst_prefetch 0x3` at `+0x1c`.
+const fn is_s_swappc_b64_word(word: u32) -> bool {
+    (word & 0xFF80_FF00) == 0xBE80_2100
+}
+
 /// Whether `bytes[offset..offset + 12]` matches one 3-dword Xbox Scarlett `v_nop_e64`
 /// preamble metadata carrier record.
 fn is_xbox_preamble_record(bytes: &[u8], offset: usize) -> bool {
@@ -3911,7 +3922,8 @@ fn is_xbox_preamble_record(bytes: &[u8], offset: usize) -> bool {
 /// * A 24-byte (`0x18`) 2-record header consisting of two 12-byte `v_nop_e64` metadata carrier
 ///   records (`(w0 & 0xffff0000) == 0xd5800000`, `(w1 & 0xfffe0100) == 0x03fe0100`, arbitrary
 ///   32-bit literal `w2`) at `0x00..0x0c` and `0x0c..0x18`, followed directly by
-///   `s_inst_prefetch 0x3` (`0xbfa00003`) at `0x18`.
+///   `s_inst_prefetch 0x3` (`0xbfa00003`) at `0x18`, OR by an unlinked FSSM vertex fetch call
+///   `s_swappc_b64` at `0x18` + `s_inst_prefetch 0x3` at `0x1c`.
 ///
 /// Decoding either header as instructions would misdecode metadata payload words as bogus
 /// instructions (clobbering registers or fabricating inputs), so it is skipped when the exact
@@ -3931,9 +3943,15 @@ pub fn rdna2_code_start_offset(bytes: &[u8]) -> usize {
     if bytes.len() >= XBOX_SHADER_SHORT_PREAMBLE_LEN + MIN_RDNA2_INST_BYTES
         && is_xbox_preamble_record(bytes, 0)
         && is_xbox_preamble_record(bytes, XBOX_PREAMBLE_RECORD_LEN)
-        && read_u32_le(bytes, XBOX_SHADER_SHORT_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
     {
-        return XBOX_SHADER_SHORT_PREAMBLE_LEN;
+        let at_18 = read_u32_le(bytes, XBOX_SHADER_SHORT_PREAMBLE_LEN);
+        if at_18 == Some(XBOX_SHADER_ENTRY_INST)
+            || (at_18.is_some_and(is_s_swappc_b64_word)
+                && read_u32_le(bytes, XBOX_SHADER_SHORT_PREAMBLE_LEN + 4)
+                    == Some(XBOX_SHADER_ENTRY_INST))
+        {
+            return XBOX_SHADER_SHORT_PREAMBLE_LEN;
+        }
     }
     0
 }
@@ -4204,6 +4222,10 @@ pub fn analyze_instructions(
                 src2,
                 ..
             } => {
+                if matches!(*op, 0x180 | 0x19B | 0x1C1) {
+                    // v_nop / v_pipeflush / v_clrexcp promoted to VOP3 carry no register operands.
+                    continue;
+                }
                 let (_, num_srcs, _) = vop3_info(*op);
                 let is_interp_f16 = vop3_is_interp_f16(*op);
                 if is_interp_f16 {
