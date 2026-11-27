@@ -545,7 +545,9 @@ test('W359: 120 frames x 50 draws reuses pooled pass commands, binding maps/slot
   assert.equal(mock.counts.drawIndexed, FRAMES * 25);
   assert.equal(mock.counts.dispatchWorkgroups, FRAMES);
   assert.equal(mock.counts.setPipeline, FRAMES);
-  assert.equal(mock.counts.setVertexBuffer, FRAMES * 26);
+  // #2177: d=0 repeats setVertexBuffer(0, 1, 0) immediately after line 488 -> 1 redundant call elided per frame.
+  assert.equal(mock.counts.setVertexBuffer, FRAMES * 25);
+  assert.equal(processor.getStats().redundantStateCallsSkipped, FRAMES);
   assert.equal(mock.counts.setIndexBuffer, FRAMES);
   assert.equal(mock.counts.setBindGroup, FRAMES);
   assert.equal(mock.counts.submits, FRAMES);

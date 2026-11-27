@@ -28,6 +28,7 @@ import {
 } from './telemetry/perf_monitor.js';
 import { CrashReporter, sanitizeString } from './telemetry/crash_report.js';
 import { BootTracer, FAST_BOOT_MILESTONES, sanitizeGpuAdapter } from './telemetry/boot_tracer.js';
+import './workers/perf_profile.js';
 
 export const GUEST_RELAUNCH_MESSAGE_TYPE = 'guest-relaunch';
 export const MAX_GUEST_RELAUNCHES = 3;
@@ -1455,6 +1456,445 @@ function resolveViewportMetrics(canvas, windowObj, overrides = {}) {
   return { width, height, dpr };
 }
 
+function resolvePerfProfileApi(options = null, windowObj = null) {
+  if (
+    options &&
+    typeof options === 'object' &&
+    options.perfProfileApi &&
+    typeof options.perfProfileApi.resolvePerfProfile === 'function'
+  ) {
+    return options.perfProfileApi;
+  }
+  if (
+    windowObj &&
+    typeof windowObj === 'object' &&
+    windowObj.PlayGta6PerfProfile &&
+    typeof windowObj.PlayGta6PerfProfile.resolvePerfProfile === 'function'
+  ) {
+    return windowObj.PlayGta6PerfProfile;
+  }
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6PerfProfile &&
+    typeof globalThis.PlayGta6PerfProfile.resolvePerfProfile === 'function'
+  ) {
+    return globalThis.PlayGta6PerfProfile;
+  }
+  return null;
+}
+
+function cloneDisplayBounds(bounds) {
+  if (!bounds || typeof bounds !== 'object') {
+    return null;
+  }
+  return Object.freeze({
+    width: bounds.width,
+    height: bounds.height,
+    maxDisplayWidth: bounds.maxDisplayWidth,
+    maxDisplayHeight: bounds.maxDisplayHeight,
+    screenWidth: bounds.screenWidth,
+    screenHeight: bounds.screenHeight,
+    devicePixelRatio: bounds.devicePixelRatio,
+    maxTextureDimension2D:
+      bounds.maxTextureDimension2D !== undefined ? bounds.maxTextureDimension2D : null,
+    clampedToMaxTextureDimension: Boolean(bounds.clampedToMaxTextureDimension),
+  });
+}
+
+function displayBoundsKey(bounds) {
+  if (!bounds || typeof bounds !== 'object') {
+    return '';
+  }
+  return `${bounds.maxDisplayWidth}x${bounds.maxDisplayHeight}@${bounds.devicePixelRatio}:${bounds.screenWidth}x${bounds.screenHeight}`;
+}
+
+/**
+ * Safely resolves display-native physical pixel bounds from `window.screen` and
+ * `window.devicePixelRatio` (with safe guards when `window`/`screen` are absent in Node/worker tests).
+ *
+ * @param {object} [params]
+ * @returns {Readonly<{
+ *   width: number,
+ *   height: number,
+ *   maxDisplayWidth: number,
+ *   maxDisplayHeight: number,
+ *   screenWidth: number,
+ *   screenHeight: number,
+ *   devicePixelRatio: number,
+ *   maxTextureDimension2D: number | null,
+ *   clampedToMaxTextureDimension: boolean,
+ * }> | null}
+ */
+export function resolveDisplayBounds(params = {}) {
+  if (!params || typeof params !== 'object') {
+    return null;
+  }
+  const windowObj =
+    params.windowObj && typeof params.windowObj === 'object' ? params.windowObj : null;
+  const screenObj =
+    params.screenObj && typeof params.screenObj === 'object'
+      ? params.screenObj
+      : windowObj && windowObj.screen && typeof windowObj.screen === 'object'
+        ? windowObj.screen
+        : null;
+  const api = resolvePerfProfileApi(params, windowObj);
+
+  const explicit = params.displayBounds;
+  if (explicit === null) {
+    return null;
+  }
+
+  let screenWidth = null;
+  let screenHeight = null;
+  let dpr = null;
+  let maxTextureDimension2D = isPositiveFinite(params.maxTextureDimension2D)
+    ? Math.floor(params.maxTextureDimension2D)
+    : null;
+
+  if (explicit && typeof explicit === 'object') {
+    if (isPositiveFinite(explicit.maxTextureDimension2D)) {
+      maxTextureDimension2D = Math.floor(explicit.maxTextureDimension2D);
+    }
+    if (isPositiveFinite(explicit.maxDisplayWidth) && isPositiveFinite(explicit.maxDisplayHeight)) {
+      const explicitDpr = isPositiveFinite(explicit.devicePixelRatio)
+        ? explicit.devicePixelRatio
+        : isPositiveFinite(explicit.dpr)
+          ? explicit.dpr
+          : 1;
+      const maxW = Math.max(1, Math.round(explicit.maxDisplayWidth));
+      const maxH = Math.max(1, Math.round(explicit.maxDisplayHeight));
+      const sw = isPositiveFinite(explicit.screenWidth)
+        ? explicit.screenWidth
+        : Math.max(1, Math.round(maxW / explicitDpr));
+      const sh = isPositiveFinite(explicit.screenHeight)
+        ? explicit.screenHeight
+        : Math.max(1, Math.round(maxH / explicitDpr));
+      let width = maxW;
+      let height = maxH;
+      let clampedToMaxTextureDimension = Boolean(explicit.clampedToMaxTextureDimension);
+      if (maxTextureDimension2D !== null) {
+        if (width > maxTextureDimension2D) {
+          width = maxTextureDimension2D;
+          clampedToMaxTextureDimension = true;
+        }
+        if (height > maxTextureDimension2D) {
+          height = maxTextureDimension2D;
+          clampedToMaxTextureDimension = true;
+        }
+      }
+      return Object.freeze({
+        width,
+        height,
+        maxDisplayWidth: width,
+        maxDisplayHeight: height,
+        screenWidth: sw,
+        screenHeight: sh,
+        devicePixelRatio: explicitDpr,
+        maxTextureDimension2D,
+        clampedToMaxTextureDimension,
+      });
+    }
+    if (isPositiveFinite(explicit.screenWidth) && isPositiveFinite(explicit.screenHeight)) {
+      screenWidth = explicit.screenWidth;
+      screenHeight = explicit.screenHeight;
+      dpr = isPositiveFinite(explicit.devicePixelRatio)
+        ? explicit.devicePixelRatio
+        : isPositiveFinite(explicit.dpr)
+          ? explicit.dpr
+          : null;
+    } else if (isPositiveFinite(explicit.width) && isPositiveFinite(explicit.height)) {
+      screenWidth = explicit.width;
+      screenHeight = explicit.height;
+      dpr = isPositiveFinite(explicit.devicePixelRatio)
+        ? explicit.devicePixelRatio
+        : isPositiveFinite(explicit.dpr)
+          ? explicit.dpr
+          : 1;
+    }
+  }
+
+  if (screenWidth === null || screenHeight === null) {
+    const rawW =
+      params.screenWidth !== undefined
+        ? params.screenWidth
+        : screenObj && screenObj.width !== undefined
+          ? screenObj.width
+          : null;
+    const rawH =
+      params.screenHeight !== undefined
+        ? params.screenHeight
+        : screenObj && screenObj.height !== undefined
+          ? screenObj.height
+          : null;
+    if (isPositiveFinite(rawW) && isPositiveFinite(rawH)) {
+      screenWidth = rawW;
+      screenHeight = rawH;
+    }
+  }
+
+  if (screenWidth === null || screenHeight === null) {
+    return null;
+  }
+
+  if (dpr === null) {
+    const rawDpr =
+      params.devicePixelRatio !== undefined
+        ? params.devicePixelRatio
+        : windowObj && isPositiveFinite(windowObj.devicePixelRatio)
+          ? windowObj.devicePixelRatio
+          : 1;
+    dpr = isPositiveFinite(rawDpr) ? rawDpr : 1;
+  }
+
+  if (api && typeof api.computeDisplayNativeBounds === 'function') {
+    const computed = api.computeDisplayNativeBounds({
+      screenWidth,
+      screenHeight,
+      devicePixelRatio: dpr,
+      maxTextureDimension2D,
+    });
+    return cloneDisplayBounds(computed);
+  }
+
+  let width = Math.max(1, Math.round(screenWidth * dpr));
+  let height = Math.max(1, Math.round(screenHeight * dpr));
+  let clampedToMaxTextureDimension = false;
+  if (maxTextureDimension2D !== null) {
+    if (width > maxTextureDimension2D) {
+      width = maxTextureDimension2D;
+      clampedToMaxTextureDimension = true;
+    }
+    if (height > maxTextureDimension2D) {
+      height = maxTextureDimension2D;
+      clampedToMaxTextureDimension = true;
+    }
+  }
+  return Object.freeze({
+    width,
+    height,
+    maxDisplayWidth: width,
+    maxDisplayHeight: height,
+    screenWidth,
+    screenHeight,
+    devicePixelRatio: dpr,
+    maxTextureDimension2D,
+    clampedToMaxTextureDimension,
+  });
+}
+
+function toCloneablePerfProfile(profile, displayBounds = null) {
+  if (!profile || typeof profile !== 'object') {
+    return null;
+  }
+  const cleanDisplayBounds = cloneDisplayBounds(
+    displayBounds !== undefined ? displayBounds : profile.displayNativeBounds || null
+  );
+  const cleanHardware =
+    profile.hardware && typeof profile.hardware === 'object'
+      ? Object.freeze({
+          deviceMemoryGb: profile.hardware.deviceMemoryGb ?? null,
+          hardwareConcurrency: profile.hardware.hardwareConcurrency ?? null,
+          maxBufferSize: profile.hardware.maxBufferSize ?? null,
+          maxStorageBufferBindingSize: profile.hardware.maxStorageBufferBindingSize ?? null,
+          maxTextureDimension2D: profile.hardware.maxTextureDimension2D ?? null,
+          isSoftwareAdapter: Boolean(profile.hardware.isSoftwareAdapter),
+          isLowPowerAdapter: Boolean(profile.hardware.isLowPowerAdapter),
+        })
+      : null;
+
+  return Object.freeze({
+    name: typeof profile.name === 'string' ? profile.name : 'balanced',
+    preset: typeof profile.preset === 'string' ? profile.preset : profile.name || 'balanced',
+    requestedPreset:
+      typeof profile.requestedPreset === 'string' ? profile.requestedPreset : 'auto',
+    source: typeof profile.source === 'string' ? profile.source : 'auto',
+    rtPoolMaxBytes: profile.rtPoolMaxBytes,
+    rtPoolMaxIdleFrames: profile.rtPoolMaxIdleFrames,
+    vramBudgetBytes: profile.vramBudgetBytes,
+    vramReclaimTriggerRatio: profile.vramReclaimTriggerRatio,
+    vramReclaimTargetRatio: profile.vramReclaimTargetRatio,
+    gcDeferFrames: profile.gcDeferFrames,
+    ioSlabCacheBytes: profile.ioSlabCacheBytes,
+    ioMaxConcurrentLanes: profile.ioMaxConcurrentLanes,
+    // Always preserve full visual quality (lossless textureMipCap: 0).
+    textureMipCap: 0,
+    dprCap: profile.dprCap ?? null,
+    preserveFullQuality: true,
+    clampToDisplayResolution: profile.clampToDisplayResolution !== false,
+    clampToDisplayNative: profile.clampToDisplayNative !== false,
+    prewarmMaxInFlight: profile.prewarmMaxInFlight,
+    shaderCompileConcurrency: profile.shaderCompileConcurrency,
+    displayNativeBounds: cleanDisplayBounds,
+    reasons: Object.freeze(Array.isArray(profile.reasons) ? profile.reasons.slice() : []),
+    hardware: cleanHardware,
+    overridesApplied: Object.freeze(
+      Array.isArray(profile.overridesApplied) ? profile.overridesApplied.slice() : []
+    ),
+  });
+}
+
+/**
+ * Resolves the hardware-adaptive, full-visual-quality (`textureMipCap: 0`) performance profile
+ * and display-native physical pixel bounds safely across browsers and headless Node environments.
+ *
+ * @param {object} [params]
+ * @returns {Readonly<{ perfProfile: Readonly<object>, displayBounds: Readonly<object> | null }>}
+ */
+export function resolveBootstrapPerfProfile(params = {}) {
+  const opts = params && typeof params === 'object' ? params : {};
+  const bootstrapOpts =
+    opts.options && typeof opts.options === 'object' ? opts.options : opts;
+  const windowObj =
+    opts.windowObj !== undefined
+      ? opts.windowObj
+      : typeof window !== 'undefined'
+        ? window
+        : null;
+  const navigatorObj =
+    opts.navigatorObj !== undefined
+      ? opts.navigatorObj
+      : windowObj && windowObj.navigator
+        ? windowObj.navigator
+        : null;
+  const urlSearch =
+    opts.urlSearch !== undefined
+      ? opts.urlSearch
+      : windowObj && windowObj.location
+        ? typeof windowObj.location.search === 'string'
+          ? windowObj.location.search
+          : typeof windowObj.location.href === 'string'
+            ? windowObj.location.href
+            : ''
+        : '';
+
+  const api = resolvePerfProfileApi(opts.perfProfileApi ? opts : bootstrapOpts, windowObj);
+  const displayBounds = resolveDisplayBounds({
+    windowObj,
+    screenObj: opts.screenObj ?? bootstrapOpts.screenObj,
+    screenWidth: opts.screenWidth ?? bootstrapOpts.screenWidth,
+    screenHeight: opts.screenHeight ?? bootstrapOpts.screenHeight,
+    devicePixelRatio: opts.devicePixelRatio ?? bootstrapOpts.devicePixelRatio,
+    maxTextureDimension2D: opts.maxTextureDimension2D ?? bootstrapOpts.maxTextureDimension2D,
+    displayBounds:
+      opts.displayBounds !== undefined ? opts.displayBounds : bootstrapOpts.displayBounds,
+    perfProfileApi: api,
+  });
+
+  const explicitProfile =
+    opts.perfProfile !== undefined ? opts.perfProfile : bootstrapOpts.perfProfile;
+  const resolveInput = {
+    queryString: urlSearch,
+    useNavigator: Boolean(navigatorObj && typeof navigatorObj === 'object'),
+    navigator: navigatorObj && typeof navigatorObj === 'object' ? navigatorObj : null,
+  };
+
+  if (navigatorObj && typeof navigatorObj === 'object') {
+    if (isPositiveFinite(navigatorObj.deviceMemory)) {
+      resolveInput.deviceMemoryGb = navigatorObj.deviceMemory;
+    }
+    if (isPositiveFinite(navigatorObj.hardwareConcurrency)) {
+      resolveInput.hardwareConcurrency = navigatorObj.hardwareConcurrency;
+    }
+  }
+  if (isPositiveFinite(bootstrapOpts.deviceMemoryGb)) {
+    resolveInput.deviceMemoryGb = bootstrapOpts.deviceMemoryGb;
+  }
+  if (isPositiveFinite(bootstrapOpts.hardwareConcurrency)) {
+    resolveInput.hardwareConcurrency = bootstrapOpts.hardwareConcurrency;
+  }
+  if (bootstrapOpts.adapterInfo !== undefined) {
+    resolveInput.adapterInfo = bootstrapOpts.adapterInfo;
+  }
+  if (bootstrapOpts.adapterLimits !== undefined) {
+    resolveInput.adapterLimits = bootstrapOpts.adapterLimits;
+  }
+  if (displayBounds) {
+    resolveInput.screenWidth = displayBounds.screenWidth;
+    resolveInput.screenHeight = displayBounds.screenHeight;
+    resolveInput.devicePixelRatio = displayBounds.devicePixelRatio;
+    if (displayBounds.maxTextureDimension2D !== null) {
+      resolveInput.maxTextureDimension2D = displayBounds.maxTextureDimension2D;
+    }
+  }
+
+  if (typeof explicitProfile === 'string') {
+    resolveInput.preset = explicitProfile;
+  } else if (explicitProfile && typeof explicitProfile === 'object') {
+    if (typeof explicitProfile.preset === 'string') {
+      resolveInput.preset = explicitProfile.preset;
+    } else if (typeof explicitProfile.name === 'string') {
+      resolveInput.preset = explicitProfile.name;
+    }
+    resolveInput.overrides = {
+      ...explicitProfile,
+      textureMipCap: 0,
+      preserveFullQuality: true,
+    };
+  } else if (typeof bootstrapOpts.quality === 'string') {
+    resolveInput.preset = bootstrapOpts.quality;
+  }
+
+  let resolvedRaw = null;
+  if (api && typeof api.resolvePerfProfile === 'function') {
+    resolvedRaw = api.resolvePerfProfile(resolveInput);
+  } else {
+    const MiB = 1024 * 1024;
+    resolvedRaw = {
+      name: 'balanced',
+      preset: 'balanced',
+      requestedPreset: 'auto',
+      source: 'auto',
+      rtPoolMaxBytes: 256 * MiB,
+      rtPoolMaxIdleFrames: 16,
+      vramBudgetBytes: 3072 * MiB,
+      vramReclaimTriggerRatio: 0.78,
+      vramReclaimTargetRatio: 0.65,
+      gcDeferFrames: 2,
+      ioSlabCacheBytes: 128 * MiB,
+      ioMaxConcurrentLanes: 6,
+      textureMipCap: 0,
+      dprCap: null,
+      preserveFullQuality: true,
+      clampToDisplayResolution: true,
+      clampToDisplayNative: true,
+      prewarmMaxInFlight: 2,
+      shaderCompileConcurrency: 2,
+      displayNativeBounds: displayBounds,
+      reasons: ['fallback:balanced'],
+      hardware: null,
+      overridesApplied: [],
+    };
+  }
+
+  const finalBounds = displayBounds || cloneDisplayBounds(resolvedRaw.displayNativeBounds || null);
+  const perfProfile = toCloneablePerfProfile(resolvedRaw, finalBounds);
+  return Object.freeze({ perfProfile, displayBounds: finalBounds });
+}
+
+/**
+ * Builds structured-clone-safe worker init fields for `ioWorker` and `gpuWorker` from a
+ * resolved `perfProfile` and optional `displayBounds`.
+ */
+export function buildWorkerPerfInitPayloads(perfProfile, displayBounds = null) {
+  const cleanBounds = cloneDisplayBounds(
+    displayBounds !== undefined && displayBounds !== null
+      ? displayBounds
+      : perfProfile && perfProfile.displayNativeBounds
+        ? perfProfile.displayNativeBounds
+        : null
+  );
+  const cleanProfile = toCloneablePerfProfile(perfProfile, cleanBounds);
+  return Object.freeze({
+    ioWorker: Object.freeze({
+      ...(cleanProfile ? { perfProfile: cleanProfile } : {}),
+    }),
+    gpuWorker: Object.freeze({
+      ...(cleanProfile ? { perfProfile: cleanProfile } : {}),
+      ...(cleanBounds ? { displayBounds: cleanBounds } : {}),
+    }),
+  });
+}
+
 function createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory }) {
   return () => {
     const g = typeof globalThis !== 'undefined' ? globalThis : {};
@@ -1688,6 +2128,12 @@ export class PlayGta6AppHandle {
     this.bootOrchestrator = components.bootOrchestrator || null;
     this.bootUrlOptions = components.bootUrlOptions || null;
 
+    this._perfProfileFallback = components.perfProfile || null;
+    this._displayBoundsFallback = components.displayBounds || null;
+    this._getPerfProfile = components.getPerfProfile || (() => this._perfProfileFallback);
+    this._getDisplayBounds = components.getDisplayBounds || (() => this._displayBoundsFallback);
+    this._setPerfProfile = components.setPerfProfile || (() => this._perfProfileFallback);
+    this._setDisplayBounds = components.setDisplayBounds || (() => this._displayBoundsFallback);
     this._getSmokeRunner = components.getSmokeRunner;
     this._getWasmWorker = components.getWasmWorker;
     this._getDiagnosticsSnapshot = components.getDiagnosticsSnapshot || (() => null);
@@ -1717,8 +2163,36 @@ export class PlayGta6AppHandle {
     return this._isDestroyed();
   }
 
+  get perfProfile() {
+    return this._getPerfProfile();
+  }
+
+  get displayBounds() {
+    return this._getDisplayBounds();
+  }
+
   getSmokeRunner() {
     return this._getSmokeRunner();
+  }
+
+  getPerfProfile() {
+    return this._getPerfProfile();
+  }
+
+  getDisplayBounds() {
+    return this._getDisplayBounds();
+  }
+
+  setPerfProfile(profileOrName) {
+    const next = this._setPerfProfile(profileOrName);
+    this._perfProfileFallback = next;
+    return next;
+  }
+
+  setDisplayBounds(boundsOrWidth, screenHeight, dpr) {
+    const next = this._setDisplayBounds(boundsOrWidth, screenHeight, dpr);
+    this._displayBoundsFallback = next;
+    return next;
   }
 
   getWasmWorker() {
@@ -1939,6 +2413,19 @@ export function bootstrapPlayGta6App(options = {}) {
         : '';
   const parsedUrlOptions = parseBootUrlOptions(rawUrlSearch);
   const parsedSplashHold = parseSplashHoldQuery(rawUrlSearch);
+  const initialPerfResolution = resolveBootstrapPerfProfile({
+    options,
+    windowObj,
+    navigatorObj,
+    urlSearch: rawUrlSearch,
+  });
+  let activePerfProfile = initialPerfResolution.perfProfile;
+  let activeDisplayBounds = initialPerfResolution.displayBounds;
+  let lastSentDisplayBoundsKey = displayBoundsKey(activeDisplayBounds);
+  const externalIoWorker =
+    options.ioWorker && typeof options.ioWorker === 'object' ? options.ioWorker : null;
+  const externalGpuWorker =
+    options.gpuWorker && typeof options.gpuWorker === 'object' ? options.gpuWorker : null;
   // #1077: `?opfsL2=0` bypasses the io_worker OPFS L2 hot-file cache (#1238). Off by default.
   const opfsL2Disabled = (() => {
     try {
@@ -2486,6 +2973,12 @@ export function bootstrapPlayGta6App(options = {}) {
       fields.requireNonBlackFrame = options.requireNonBlackFrame;
     } else if (holdUntilVisibleExplicit && resolvedHoldUntilVisible === false) {
       fields.requireNonBlackFrame = false;
+    }
+    if (activePerfProfile) {
+      fields.perfProfile = activePerfProfile;
+    }
+    if (activeDisplayBounds) {
+      fields.displayBounds = activeDisplayBounds;
     }
     return fields;
   }
@@ -7094,7 +7587,23 @@ export function bootstrapPlayGta6App(options = {}) {
     if (launchContext && launchContext.serverStatus) {
       recordDiscoveredBootAssets(launchContext.serverStatus);
     }
+    const liveBoundsBeforeLaunch = resolveDisplayBounds({
+      windowObj,
+      screenObj: options.screenObj,
+      maxTextureDimension2D: options.maxTextureDimension2D,
+      displayBounds: options.displayBounds,
+      perfProfileApi: options.perfProfileApi,
+    });
+    if (liveBoundsBeforeLaunch) {
+      activeDisplayBounds = liveBoundsBeforeLaunch;
+      activePerfProfile = toCloneablePerfProfile(activePerfProfile, activeDisplayBounds);
+    }
+    lastSentDisplayBoundsKey = displayBoundsKey(activeDisplayBounds);
     const bootForwardFields = resolveBootForwardFields(launchContext);
+    const workerPerfInitPayloads = buildWorkerPerfInitPayloads(
+      activePerfProfile,
+      activeDisplayBounds
+    );
 
     let worker;
     if (createWasmWorker) {
@@ -7420,6 +7929,35 @@ export function bootstrapPlayGta6App(options = {}) {
         worker.postMessage(initPayload, transferList);
       } else {
         worker.postMessage(initPayload);
+      }
+    }
+
+    if (externalIoWorker && typeof externalIoWorker.postMessage === 'function' && activePerfProfile) {
+      try {
+        externalIoWorker.postMessage({
+          type: 'apply-perf-profile',
+          perfProfile: workerPerfInitPayloads.ioWorker.perfProfile,
+        });
+      } catch {
+        // Non-fatal external ioWorker perf profile forwarding error.
+      }
+    }
+    if (externalGpuWorker && typeof externalGpuWorker.postMessage === 'function') {
+      try {
+        if (activePerfProfile) {
+          externalGpuWorker.postMessage({
+            type: 'apply-perf-profile',
+            perfProfile: workerPerfInitPayloads.gpuWorker.perfProfile,
+          });
+        }
+        if (activeDisplayBounds) {
+          externalGpuWorker.postMessage({
+            type: 'set-display-bounds',
+            displayBounds: workerPerfInitPayloads.gpuWorker.displayBounds,
+          });
+        }
+      } catch {
+        // Non-fatal external gpuWorker perf profile / display bounds forwarding error.
       }
     }
 
@@ -7952,6 +8490,141 @@ export function bootstrapPlayGta6App(options = {}) {
   }
 
   // 8. Viewport resize handler (manual API + optional window resize & ResizeObserver listeners).
+  function notifyWorkersDisplayBounds(nextBounds) {
+    const key = displayBoundsKey(nextBounds);
+    if (key === lastSentDisplayBoundsKey) {
+      return false;
+    }
+    lastSentDisplayBoundsKey = key;
+    const msg = {
+      type: 'set-display-bounds',
+      displayBounds: nextBounds,
+    };
+    let posted = false;
+    const loaderWorker =
+      activeWasmHandle && activeWasmHandle.worker && typeof activeWasmHandle.worker.postMessage === 'function'
+        ? activeWasmHandle.worker
+        : null;
+    if (loaderWorker) {
+      try {
+        loaderWorker.postMessage(msg);
+        posted = true;
+      } catch {
+        // Non-fatal display bounds forwarding error.
+      }
+    }
+    if (externalGpuWorker && typeof externalGpuWorker.postMessage === 'function') {
+      try {
+        externalGpuWorker.postMessage(msg);
+        posted = true;
+      } catch {
+        // Non-fatal external gpuWorker display bounds forwarding error.
+      }
+    }
+    return posted;
+  }
+
+  function syncDisplayBoundsFromWindow(explicitDpr) {
+    if (destroyed) {
+      return false;
+    }
+    const nextBounds = resolveDisplayBounds({
+      windowObj,
+      screenObj: options.screenObj,
+      devicePixelRatio: isPositiveFinite(windowObj && windowObj.devicePixelRatio)
+        ? windowObj.devicePixelRatio
+        : isPositiveFinite(explicitDpr)
+          ? explicitDpr
+          : undefined,
+      maxTextureDimension2D: options.maxTextureDimension2D,
+      displayBounds: options.displayBounds,
+      perfProfileApi: options.perfProfileApi,
+    });
+    if (!nextBounds) {
+      return false;
+    }
+    const prevKey = displayBoundsKey(activeDisplayBounds);
+    const nextKey = displayBoundsKey(nextBounds);
+    activeDisplayBounds = nextBounds;
+    if (activePerfProfile) {
+      activePerfProfile = toCloneablePerfProfile(activePerfProfile, activeDisplayBounds);
+    }
+    if (nextKey !== prevKey || nextKey !== lastSentDisplayBoundsKey) {
+      return notifyWorkersDisplayBounds(activeDisplayBounds);
+    }
+    return false;
+  }
+
+  function setPerfProfile(profileOrName) {
+    if (destroyed) {
+      return activePerfProfile;
+    }
+    const resolved = resolveBootstrapPerfProfile({
+      options: {
+        ...options,
+        perfProfile: profileOrName,
+      },
+      windowObj,
+      navigatorObj,
+      urlSearch: '',
+      displayBounds: activeDisplayBounds,
+    });
+    activePerfProfile = resolved.perfProfile;
+    if (resolved.displayBounds) {
+      activeDisplayBounds = resolved.displayBounds;
+    }
+    const msg = {
+      type: 'apply-perf-profile',
+      perfProfile: activePerfProfile,
+    };
+    const loaderWorker =
+      activeWasmHandle && activeWasmHandle.worker && typeof activeWasmHandle.worker.postMessage === 'function'
+        ? activeWasmHandle.worker
+        : null;
+    for (const target of [loaderWorker, externalIoWorker, externalGpuWorker]) {
+      if (target && typeof target.postMessage === 'function') {
+        try {
+          target.postMessage(msg);
+        } catch {
+          // Non-fatal perf profile forwarding error.
+        }
+      }
+    }
+    return activePerfProfile;
+  }
+
+  function setDisplayBounds(boundsOrWidth, screenHeight, dpr) {
+    if (destroyed) {
+      return activeDisplayBounds;
+    }
+    let nextBounds = null;
+    if (boundsOrWidth === null || boundsOrWidth === undefined) {
+      nextBounds = null;
+    } else if (typeof boundsOrWidth === 'object') {
+      nextBounds = resolveDisplayBounds({
+        windowObj,
+        displayBounds: boundsOrWidth,
+        maxTextureDimension2D: options.maxTextureDimension2D,
+        perfProfileApi: options.perfProfileApi,
+      });
+    } else {
+      nextBounds = resolveDisplayBounds({
+        windowObj,
+        screenWidth: boundsOrWidth,
+        screenHeight,
+        devicePixelRatio: dpr,
+        maxTextureDimension2D: options.maxTextureDimension2D,
+        perfProfileApi: options.perfProfileApi,
+      });
+    }
+    activeDisplayBounds = nextBounds;
+    if (activePerfProfile) {
+      activePerfProfile = toCloneablePerfProfile(activePerfProfile, activeDisplayBounds);
+    }
+    notifyWorkersDisplayBounds(activeDisplayBounds);
+    return activeDisplayBounds;
+  }
+
   function resize(nextWidth, nextHeight, nextDpr) {
     if (destroyed) {
       return false;
@@ -7970,13 +8643,14 @@ export function bootstrapPlayGta6App(options = {}) {
     viewportHeight = nextHeight;
     viewportDpr = resolvedDpr;
 
+    let handled = false;
     if (activeSmokeRunner && !activeSmokeRunner.destroyed) {
-      return activeSmokeRunner.resize(nextWidth, nextHeight, resolvedDpr);
+      handled = activeSmokeRunner.resize(nextWidth, nextHeight, resolvedDpr);
+    } else if (activeWasmHandle) {
+      handled = activeWasmHandle.resize(nextWidth, nextHeight, resolvedDpr);
     }
-    if (activeWasmHandle) {
-      return activeWasmHandle.resize(nextWidth, nextHeight, resolvedDpr);
-    }
-    return false;
+    syncDisplayBoundsFromWindow(isPositiveFinite(nextDpr) ? nextDpr : undefined);
+    return handled;
   }
 
   let resizeListenerAttached = false;
@@ -7994,6 +8668,8 @@ export function bootstrapPlayGta6App(options = {}) {
         : windowObj && windowObj.innerHeight;
     if (isPositiveFinite(w) && isPositiveFinite(h)) {
       resize(w, h);
+    } else {
+      syncDisplayBoundsFromWindow();
     }
   };
 
@@ -10120,6 +10796,12 @@ export function bootstrapPlayGta6App(options = {}) {
     pgimPreloader,
     bootOrchestrator,
     bootUrlOptions: resolvedBootUrlOptions,
+    perfProfile: activePerfProfile,
+    displayBounds: activeDisplayBounds,
+    getPerfProfile: () => activePerfProfile,
+    getDisplayBounds: () => activeDisplayBounds,
+    setPerfProfile,
+    setDisplayBounds,
     getSmokeRunner: () => activeSmokeRunner,
     getWasmWorker: () => activeWasmWorker,
     getDiagnosticsSnapshot,

@@ -204,10 +204,12 @@ function createPassCommandSlot() {
     slot: 0,
     bufferId: 0,
     offset: 0,
+    size: undefined,
     indexFormat: 'uint16',
     groupIndex: 0,
     bindGroupId: 0,
     bindGroup: null,
+    dynamicOffsets: null,
     vertexCount: 0,
     instanceCount: 0,
     firstVertex: 0,
@@ -218,6 +220,17 @@ function createPassCommandSlot() {
     workgroupX: 0,
     workgroupY: 0,
     workgroupZ: 0,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    minDepth: 0,
+    maxDepth: 1,
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 0,
+    reference: 0,
     _wgpuMeta: null,
   };
 }
@@ -1544,6 +1557,130 @@ function resolvePrewarmBridgeApi(injectedApi) {
     }
   }
   return null;
+}
+
+function resolvePerfProfileApi(injectedApi) {
+  if (injectedApi && typeof injectedApi === 'object' && typeof injectedApi.coercePerfProfile === 'function') {
+    return injectedApi;
+  }
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6PerfProfile &&
+    typeof globalThis.PlayGta6PerfProfile.coercePerfProfile === 'function'
+  ) {
+    return globalThis.PlayGta6PerfProfile;
+  }
+  if (typeof importScripts === 'function') {
+    try {
+      importScripts('./perf_profile.js');
+      if (
+        typeof globalThis !== 'undefined' &&
+        globalThis.PlayGta6PerfProfile &&
+        typeof globalThis.PlayGta6PerfProfile.coercePerfProfile === 'function'
+      ) {
+        return globalThis.PlayGta6PerfProfile;
+      }
+    } catch (_) {
+      // Optional perf_profile.js unavailable in this worker environment.
+    }
+  }
+  if (typeof require === 'function') {
+    try {
+      const mod = require('./perf_profile.js');
+      if (mod && typeof mod.coercePerfProfile === 'function') {
+        return mod;
+      }
+    } catch (_) {
+      // Optional perf_profile.js unavailable.
+    }
+  }
+  return null;
+}
+
+function coerceWgpuPerfProfile(profileOrName, injectedApi) {
+  const api = resolvePerfProfileApi(injectedApi);
+  if (api && typeof api.coercePerfProfile === 'function') {
+    return api.coercePerfProfile(profileOrName);
+  }
+  if (profileOrName && typeof profileOrName === 'object') {
+    return Object.freeze({ ...profileOrName });
+  }
+  throw new TypeError(
+    'perfProfile must be a preset name ("low" | "balanced" | "high" | "auto") or profile object'
+  );
+}
+
+function normalizeWgpuDisplayBounds(raw, fallbackDpr = 1) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw !== 'object') {
+    throw new TypeError('displayBounds must be an object or null');
+  }
+  const posNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
+  const rawDpr =
+    posNum(raw.devicePixelRatio) ?? posNum(raw.dpr) ?? posNum(fallbackDpr) ?? 1;
+  const maxDim =
+    posNum(raw.maxTextureDimension2D) !== null && Math.floor(raw.maxTextureDimension2D) >= 1
+      ? Math.floor(raw.maxTextureDimension2D)
+      : null;
+
+  let maxW = null;
+  let maxH = null;
+  let screenW = null;
+  let screenH = null;
+
+  const explicitMaxW = posNum(raw.maxDisplayWidth);
+  const explicitMaxH = posNum(raw.maxDisplayHeight);
+  const explicitScreenW = posNum(raw.screenWidth);
+  const explicitScreenH = posNum(raw.screenHeight);
+  const explicitW = posNum(raw.width);
+  const explicitH = posNum(raw.height);
+
+  if (explicitMaxW !== null && explicitMaxH !== null) {
+    maxW = Math.max(1, Math.round(explicitMaxW));
+    maxH = Math.max(1, Math.round(explicitMaxH));
+    screenW = explicitScreenW !== null ? explicitScreenW : Math.max(1, Math.round(maxW / rawDpr));
+    screenH = explicitScreenH !== null ? explicitScreenH : Math.max(1, Math.round(maxH / rawDpr));
+  } else if (explicitScreenW !== null && explicitScreenH !== null) {
+    screenW = explicitScreenW;
+    screenH = explicitScreenH;
+    maxW = Math.max(1, Math.round(screenW * rawDpr));
+    maxH = Math.max(1, Math.round(screenH * rawDpr));
+  } else if (explicitW !== null && explicitH !== null) {
+    maxW = Math.max(1, Math.round(explicitW));
+    maxH = Math.max(1, Math.round(explicitH));
+    screenW = Math.max(1, Math.round(maxW / rawDpr));
+    screenH = Math.max(1, Math.round(maxH / rawDpr));
+  } else {
+    throw new RangeError(
+      'displayBounds must provide positive maxDisplayWidth/maxDisplayHeight, screenWidth/screenHeight, or width/height'
+    );
+  }
+
+  let clampedToMaxTextureDimension = Boolean(raw.clampedToMaxTextureDimension);
+  if (maxDim !== null) {
+    if (maxW > maxDim) {
+      maxW = maxDim;
+      clampedToMaxTextureDimension = true;
+    }
+    if (maxH > maxDim) {
+      maxH = maxDim;
+      clampedToMaxTextureDimension = true;
+    }
+  }
+
+  return Object.freeze({
+    width: maxW,
+    height: maxH,
+    maxDisplayWidth: maxW,
+    maxDisplayHeight: maxH,
+    screenWidth: screenW,
+    screenHeight: screenH,
+    devicePixelRatio: rawDpr,
+    maxTextureDimension2D: maxDim,
+    clampedToMaxTextureDimension,
+  });
 }
 
 function resolvePipelineCacheHelper(exportName) {
@@ -3561,6 +3698,52 @@ class WgpuCommandProcessor {
     this._boundVertexBuffers = new Map();
     this._boundBindGroupSlots = new Map();
     this._boundVertexBufferSlots = new Map();
+    // #2177: Zero-alloc per-pass WebGPU state-diff tracker (reset on every pass begin/end/split).
+    this._activePassState = {
+      pipeline: null,
+      bindGroups: [null, null, null, null],
+      bindGroupDynamicOffsets: [
+        { count: 0, values: [] },
+        { count: 0, values: [] },
+        { count: 0, values: [] },
+        { count: 0, values: [] },
+      ],
+      extraBindGroups: new Map(),
+      vertexBuffers: Array.from({ length: 8 }, () => ({
+        valid: false,
+        buffer: null,
+        offset: 0,
+        size: undefined,
+      })),
+      extraVertexBuffers: new Map(),
+      indexBuffer: { valid: false, buffer: null, format: '', offset: 0, size: undefined },
+      viewport: { valid: false, x: 0, y: 0, w: 0, h: 0, minDepth: 0, maxDepth: 1 },
+      scissor: { valid: false, x: 0, y: 0, w: 0, h: 0 },
+      hasStencilRef: false,
+      stencilRef: 0,
+      blendConstant: { valid: false, r: 0, g: 0, b: 0, a: 0 },
+    };
+    this._redundantStateCallsSkipped = 0;
+    this._redundantStateSkippedBreakdown = {
+      pipeline: 0,
+      bindGroup: 0,
+      vertexBuffer: 0,
+      indexBuffer: 0,
+      viewport: 0,
+      scissor: 0,
+      stencilRef: 0,
+      blendConstant: 0,
+    };
+    this._perfProfileApi = options.perfProfileApi || null;
+    this._perfProfile = null;
+    this._perfProfileName = null;
+    this._displayBounds = null;
+    this._hasExplicitMaxConcurrentShaderCompiles =
+      options.maxConcurrentShaderCompiles !== undefined;
+    this._hasExplicitPipelineCacheSourceProvider = Boolean(
+      options.pipelineCacheOptions &&
+        options.pipelineCacheOptions.wgslSourceProvider !== undefined
+    );
     this._fallbackProfileStateScratch = {
       vertexCount: 0,
       instanceCount: 0,
@@ -4122,6 +4305,7 @@ class WgpuCommandProcessor {
       this.wgslPackCache = new InlineWgslPackCache();
       this._ownsWgslPackCache = true;
     }
+    this._syncPipelineCacheWgslSourceProvider();
 
     this._ownsShaderFallbackRouter = false;
     this.shaderFallbackRouter = null;
@@ -4331,6 +4515,13 @@ class WgpuCommandProcessor {
       this._hookDeviceUncapturedError(this.device);
     }
 
+    if (options.displayBounds !== undefined && options.displayBounds !== null) {
+      this.setDisplayBounds(options.displayBounds);
+    }
+    if (options.perfProfile !== undefined && options.perfProfile !== null) {
+      this.applyPerfProfile(options.perfProfile);
+    }
+
     // W100: observe `device.lost` for the initial device.
     this._hookDeviceLost(this.device);
 
@@ -4416,6 +4607,160 @@ class WgpuCommandProcessor {
         // Non-fatal: ignore custom mock pipelineCache registry errors.
       }
     }
+  }
+
+  /**
+   * #2170 / #2177: Wire `wgslPackCache` as `wgslSourceProvider` on `WebGpuPipelineCache`
+   * so post-compile WGSL text eviction can lazily re-decode raw WGSL on demand whenever
+   * inter-stage `@location` / `@interpolate(flat)` patching needs source text.
+   */
+  _syncPipelineCacheWgslSourceProvider(force = false) {
+    if (
+      !this.pipelineCache ||
+      typeof this.pipelineCache.setWgslSourceProvider !== 'function'
+    ) {
+      return;
+    }
+    if (!force && this._hasExplicitPipelineCacheSourceProvider) {
+      return;
+    }
+    if (
+      !force &&
+      this.pipelineCache._wgslSourceProvider !== undefined &&
+      this.pipelineCache._wgslSourceProvider !== null &&
+      this.pipelineCache._wgslSourceProvider !== this.wgslPackCache &&
+      !this._ownsPipelineCache
+    ) {
+      return;
+    }
+    try {
+      this.pipelineCache.setWgslSourceProvider(this.wgslPackCache || null);
+    } catch (_) {
+      // Non-fatal: ignore custom mock pipelineCache provider errors.
+    }
+  }
+
+  /**
+   * #2177: Apply a lossless hardware-adaptive performance profile across `rtPool`,
+   * `resourceRegistry`, `prewarmBridge`, and display-native swapchain bounds (if present).
+   */
+  applyPerfProfile(profileOrName) {
+    const profile = coerceWgpuPerfProfile(profileOrName, this._perfProfileApi);
+    this._perfProfile = profile;
+    this._perfProfileName = typeof profile.name === 'string' ? profile.name : null;
+
+    const applied = {
+      rtPool: false,
+      resourceRegistry: false,
+      prewarmBridge: false,
+      swapchain: false,
+    };
+
+    if (
+      this.rtPool &&
+      !this.rtPool._destroyed &&
+      typeof this.rtPool.applyPerfProfile === 'function'
+    ) {
+      try {
+        this.rtPool.applyPerfProfile(profile);
+        applied.rtPool = true;
+      } catch (_) {
+        // Non-fatal: isolate custom mock rtPool errors.
+      }
+    }
+
+    if (
+      this.resourceRegistry &&
+      !this.resourceRegistry._destroyed &&
+      typeof this.resourceRegistry.applyPerfProfile === 'function'
+    ) {
+      try {
+        this.resourceRegistry.applyPerfProfile(profile);
+        applied.resourceRegistry = true;
+      } catch (_) {
+        // Non-fatal: isolate custom mock resourceRegistry errors.
+      }
+    }
+
+    if (this.prewarmBridge && typeof this.prewarmBridge === 'object') {
+      try {
+        if (typeof this.prewarmBridge.applyPerfProfile === 'function') {
+          this.prewarmBridge.applyPerfProfile(profile);
+          applied.prewarmBridge = true;
+        } else if (
+          typeof this.prewarmBridge.setMaxInFlight === 'function' &&
+          Number.isInteger(profile.prewarmMaxInFlight) &&
+          profile.prewarmMaxInFlight >= 1
+        ) {
+          this.prewarmBridge.setMaxInFlight(profile.prewarmMaxInFlight);
+          applied.prewarmBridge = true;
+        }
+      } catch (_) {
+        // Non-fatal: isolate custom prewarmBridge errors.
+      }
+    }
+
+    if (
+      !this._hasExplicitMaxConcurrentShaderCompiles &&
+      Number.isInteger(profile.shaderCompileConcurrency) &&
+      profile.shaderCompileConcurrency >= 1
+    ) {
+      this._maxConcurrentShaderCompiles = profile.shaderCompileConcurrency;
+    }
+
+    if (
+      this._displayBounds === null &&
+      profile.displayNativeBounds &&
+      typeof profile.displayNativeBounds === 'object'
+    ) {
+      try {
+        this.setDisplayBounds(profile.displayNativeBounds);
+        applied.swapchain = Boolean(this._swapchain);
+      } catch (_) {
+        // Ignore invalid optional displayNativeBounds on custom profile objects.
+      }
+    }
+
+    return {
+      profile: this._perfProfileName,
+      perfProfile: this._perfProfile,
+      applied,
+    };
+  }
+
+  /**
+   * #2177: Update display-native physical pixel bounds and forward them to `swapchain.setDisplayBounds(...)`.
+   */
+  setDisplayBounds(boundsOrWidth, screenHeight, dpr = 1) {
+    let normalized = null;
+    if (boundsOrWidth === null || boundsOrWidth === undefined) {
+      normalized = null;
+    } else if (typeof boundsOrWidth === 'object') {
+      normalized = normalizeWgpuDisplayBounds(boundsOrWidth, dpr);
+    } else {
+      normalized = normalizeWgpuDisplayBounds(
+        {
+          screenWidth: boundsOrWidth,
+          screenHeight,
+          devicePixelRatio: dpr,
+        },
+        dpr
+      );
+    }
+
+    this._displayBounds = normalized;
+    let reconfigured = false;
+    if (
+      this._swapchain &&
+      !this._swapchain.isDestroyed &&
+      typeof this._swapchain.setDisplayBounds === 'function'
+    ) {
+      reconfigured = Boolean(this._swapchain.setDisplayBounds(normalized));
+    }
+    return {
+      displayBounds: normalized ? { ...normalized } : null,
+      reconfigured,
+    };
   }
 
   /**
@@ -4872,6 +5217,18 @@ class WgpuCommandProcessor {
       this._swapchainValidationAttached = true;
     } else {
       this._hookDeviceUncapturedError(this.device);
+    }
+
+    if (
+      this._displayBounds !== null &&
+      !swapchain.isDestroyed &&
+      typeof swapchain.setDisplayBounds === 'function'
+    ) {
+      try {
+        swapchain.setDisplayBounds(this._displayBounds);
+      } catch (_) {
+        // Non-fatal: ignore custom mock swapchain display bounds errors.
+      }
     }
 
     return this._swapchain;
@@ -6885,6 +7242,8 @@ class WgpuCommandProcessor {
       const slot = pool[i];
       slot.pipeline = null;
       slot.bindGroup = null;
+      slot.dynamicOffsets = null;
+      slot.size = undefined;
       slot._wgpuMeta = null;
     }
     this._passCommandPoolUsed = 0;
@@ -9252,6 +9611,14 @@ class WgpuCommandProcessor {
       }
       try {
         this[key] = factory(device);
+        if (
+          key === 'rtPool' &&
+          this._perfProfile &&
+          this.rtPool &&
+          typeof this.rtPool.applyPerfProfile === 'function'
+        ) {
+          this.rtPool.applyPerfProfile(this._perfProfile);
+        }
       } catch (err) {
         this[key] = null;
         this[ownsKey] = false;
@@ -9650,6 +10017,7 @@ class WgpuCommandProcessor {
       }
     }
     this._syncPipelineCacheReflectionRegistry();
+    this._syncPipelineCacheWgslSourceProvider();
     // W103: drop in-flight compiles of the dead device; late results are discarded as stale.
     this._resetAsyncPipelineCache(newDevice);
     if (newCtx && typeof newCtx === 'object') {
@@ -10053,6 +10421,7 @@ class WgpuCommandProcessor {
         if (nextCache) {
           this.wgslPackCache = nextCache;
           syncRouterPackLoader(prevCache);
+          this._syncPipelineCacheWgslSourceProvider(true);
           if (confirmedOverThreshold && typeof nextCache.loadIndexFromUrl === 'function') {
             return await nextCache.loadIndexFromUrl(resolvedUrl, buildPackLoadOpts(false));
           }
@@ -14614,7 +14983,259 @@ class WgpuCommandProcessor {
     return reflected && reflected[groupIndex] ? reflected[groupIndex] : null;
   }
 
+  _resetActivePassState() {
+    const s = this._activePassState;
+    s.pipeline = null;
+    for (let i = 0; i < 4; i += 1) {
+      s.bindGroups[i] = null;
+      s.bindGroupDynamicOffsets[i].count = 0;
+    }
+    if (s.extraBindGroups.size > 0) {
+      s.extraBindGroups.clear();
+    }
+    for (let i = 0; i < 8; i += 1) {
+      const vb = s.vertexBuffers[i];
+      vb.valid = false;
+      vb.buffer = null;
+      vb.offset = 0;
+      vb.size = undefined;
+    }
+    if (s.extraVertexBuffers.size > 0) {
+      s.extraVertexBuffers.clear();
+    }
+    const ib = s.indexBuffer;
+    ib.valid = false;
+    ib.buffer = null;
+    ib.format = '';
+    ib.offset = 0;
+    ib.size = undefined;
+    s.viewport.valid = false;
+    s.scissor.valid = false;
+    s.hasStencilRef = false;
+    s.stencilRef = 0;
+    s.blendConstant.valid = false;
+  }
+
+  _invalidateActivePassBindGroup(slot) {
+    const s = this._activePassState;
+    if (slot >= 0 && slot < 4) {
+      s.bindGroups[slot] = null;
+      s.bindGroupDynamicOffsets[slot].count = 0;
+    } else if (s.extraBindGroups.has(slot)) {
+      s.extraBindGroups.delete(slot);
+    }
+  }
+
+  _passSetPipeline(pass, pipeline) {
+    const s = this._activePassState;
+    if (s.pipeline === pipeline) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.pipeline += 1;
+      return false;
+    }
+    pass.setPipeline(pipeline);
+    s.pipeline = pipeline;
+    return true;
+  }
+
+  _passSetBindGroup(pass, slot, bindGroup, dynamicOffsets) {
+    const s = this._activePassState;
+    const hasDyn =
+      dynamicOffsets !== undefined &&
+      dynamicOffsets !== null &&
+      (Array.isArray(dynamicOffsets) || ArrayBuffer.isView(dynamicOffsets));
+    const dynLen = hasDyn ? dynamicOffsets.length : 0;
+
+    if (slot >= 0 && slot < 4) {
+      const prevBg = s.bindGroups[slot];
+      const prevDyn = s.bindGroupDynamicOffsets[slot];
+      if (prevBg === bindGroup && prevDyn.count === dynLen) {
+        let sameOffsets = true;
+        for (let k = 0; k < dynLen; k += 1) {
+          if (prevDyn.values[k] !== (dynamicOffsets[k] >>> 0)) {
+            sameOffsets = false;
+            break;
+          }
+        }
+        if (sameOffsets) {
+          this._redundantStateCallsSkipped += 1;
+          this._redundantStateSkippedBreakdown.bindGroup += 1;
+          return false;
+        }
+      }
+      if (dynamicOffsets !== undefined && dynamicOffsets !== null) {
+        pass.setBindGroup(slot, bindGroup, dynamicOffsets);
+      } else {
+        pass.setBindGroup(slot, bindGroup);
+      }
+      s.bindGroups[slot] = bindGroup;
+      prevDyn.count = dynLen;
+      for (let k = 0; k < dynLen; k += 1) {
+        prevDyn.values[k] = dynamicOffsets[k] >>> 0;
+      }
+      return true;
+    }
+
+    let extra = s.extraBindGroups.get(slot);
+    if (extra && extra.bindGroup === bindGroup && extra.count === dynLen) {
+      let sameOffsets = true;
+      for (let k = 0; k < dynLen; k += 1) {
+        if (extra.values[k] !== (dynamicOffsets[k] >>> 0)) {
+          sameOffsets = false;
+          break;
+        }
+      }
+      if (sameOffsets) {
+        this._redundantStateCallsSkipped += 1;
+        this._redundantStateSkippedBreakdown.bindGroup += 1;
+        return false;
+      }
+    }
+    if (dynamicOffsets !== undefined && dynamicOffsets !== null) {
+      pass.setBindGroup(slot, bindGroup, dynamicOffsets);
+    } else {
+      pass.setBindGroup(slot, bindGroup);
+    }
+    if (!extra) {
+      extra = { bindGroup: null, count: 0, values: [] };
+      s.extraBindGroups.set(slot, extra);
+    }
+    extra.bindGroup = bindGroup;
+    extra.count = dynLen;
+    for (let k = 0; k < dynLen; k += 1) {
+      extra.values[k] = dynamicOffsets[k] >>> 0;
+    }
+    return true;
+  }
+
+  _passSetVertexBuffer(pass, slot, buffer, offset, size) {
+    const s = this._activePassState;
+    let vb;
+    if (slot >= 0 && slot < 8) {
+      vb = s.vertexBuffers[slot];
+    } else {
+      vb = s.extraVertexBuffers.get(slot);
+      if (!vb) {
+        vb = { valid: false, buffer: null, offset: 0, size: undefined };
+        s.extraVertexBuffers.set(slot, vb);
+      }
+    }
+    if (vb.valid && vb.buffer === buffer && vb.offset === offset && vb.size === size) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.vertexBuffer += 1;
+      return false;
+    }
+    if (size !== undefined) {
+      pass.setVertexBuffer(slot, buffer, offset, size);
+    } else {
+      pass.setVertexBuffer(slot, buffer, offset);
+    }
+    vb.valid = true;
+    vb.buffer = buffer;
+    vb.offset = offset;
+    vb.size = size;
+    return true;
+  }
+
+  _passSetIndexBuffer(pass, buffer, format, offset, size) {
+    const ib = this._activePassState.indexBuffer;
+    if (
+      ib.valid &&
+      ib.buffer === buffer &&
+      ib.format === format &&
+      ib.offset === offset &&
+      ib.size === size
+    ) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.indexBuffer += 1;
+      return false;
+    }
+    if (size !== undefined) {
+      pass.setIndexBuffer(buffer, format, offset, size);
+    } else {
+      pass.setIndexBuffer(buffer, format, offset);
+    }
+    ib.valid = true;
+    ib.buffer = buffer;
+    ib.format = format;
+    ib.offset = offset;
+    ib.size = size;
+    return true;
+  }
+
+  _passSetViewport(pass, x, y, w, h, minDepth, maxDepth) {
+    const vp = this._activePassState.viewport;
+    if (
+      vp.valid &&
+      vp.x === x &&
+      vp.y === y &&
+      vp.w === w &&
+      vp.h === h &&
+      vp.minDepth === minDepth &&
+      vp.maxDepth === maxDepth
+    ) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.viewport += 1;
+      return false;
+    }
+    pass.setViewport(x, y, w, h, minDepth, maxDepth);
+    vp.valid = true;
+    vp.x = x;
+    vp.y = y;
+    vp.w = w;
+    vp.h = h;
+    vp.minDepth = minDepth;
+    vp.maxDepth = maxDepth;
+    return true;
+  }
+
+  _passSetScissorRect(pass, x, y, w, h) {
+    const sc = this._activePassState.scissor;
+    if (sc.valid && sc.x === x && sc.y === y && sc.w === w && sc.h === h) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.scissor += 1;
+      return false;
+    }
+    pass.setScissorRect(x, y, w, h);
+    sc.valid = true;
+    sc.x = x;
+    sc.y = y;
+    sc.w = w;
+    sc.h = h;
+    return true;
+  }
+
+  _passSetStencilReference(pass, ref) {
+    const s = this._activePassState;
+    if (s.hasStencilRef && s.stencilRef === ref) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.stencilRef += 1;
+      return false;
+    }
+    pass.setStencilReference(ref);
+    s.hasStencilRef = true;
+    s.stencilRef = ref;
+    return true;
+  }
+
+  _passSetBlendConstant(pass, r, g, b, a) {
+    const bc = this._activePassState.blendConstant;
+    if (bc.valid && bc.r === r && bc.g === g && bc.b === b && bc.a === a) {
+      this._redundantStateCallsSkipped += 1;
+      this._redundantStateSkippedBreakdown.blendConstant += 1;
+      return false;
+    }
+    pass.setBlendConstant({ r, g, b, a });
+    bc.valid = true;
+    bc.r = r;
+    bc.g = g;
+    bc.b = b;
+    bc.a = a;
+    return true;
+  }
+
   _clearPresentPassBindings() {
+    this._resetActivePassState();
     const ps = this._presentState;
     ps.activePipelineId = null;
     ps.activePipeline = null;
@@ -14730,6 +15351,7 @@ class WgpuCommandProcessor {
     ps.activePass = ps.encoder.beginRenderPass(passDesc);
     ps.activePassKind = 'render';
     ps.renderPassOpened = true;
+    this._resetActivePassState();
     return ps.activePass;
   }
 
@@ -14754,6 +15376,7 @@ class WgpuCommandProcessor {
       ps.activePass = ps.encoder.beginComputePass();
     }
     ps.activePassKind = 'compute';
+    this._resetActivePassState();
     return ps.activePass;
   }
 
@@ -14777,6 +15400,7 @@ class WgpuCommandProcessor {
     ps.activePass = ps.encoder.beginRenderPass(descriptor);
     ps.activePassKind = 'render';
     ps.renderPassOpened = true;
+    this._resetActivePassState();
     return ps.activePass;
   }
 
@@ -14806,7 +15430,7 @@ class WgpuCommandProcessor {
     }
     const key = `${pipeMeta.id}|${desiredProfile}`;
     if (ps.specializedActiveKey !== key) {
-      pass.setPipeline(spec.pipeline);
+      this._passSetPipeline(pass, spec.pipeline);
       for (const [groupIndex, boundBg] of this._boundBindGroups.entries()) {
         if (boundBg && boundBg.meta) {
           const specBg = this._getOrCreateSpecializedBindGroup(
@@ -14817,7 +15441,7 @@ class WgpuCommandProcessor {
             boundBg.meta
           );
           if (specBg) {
-            pass.setBindGroup(groupIndex, specBg);
+            this._passSetBindGroup(pass, groupIndex, specBg);
             boundBg.bindGroup = specBg;
           }
         }
@@ -15046,21 +15670,24 @@ class WgpuCommandProcessor {
         case 'setPipeline': {
           const pass = this._ensurePresentRenderPass(cmd.pipelineId);
           ps.activePipelineId = cmd.pipelineId;
-          ps.activePipeline = null;
           ps.specializedActiveKey = null;
           const pipeline = this.pipelines.get(cmd.pipelineId) || cmd.pipeline || null;
           if (pipeline) {
             try {
-              pass.setPipeline(pipeline);
+              this._passSetPipeline(pass, pipeline);
               ps.activePipeline = pipeline;
             } catch (err) {
+              ps.activePipeline = null;
               this._recordOpValidationError('SetPipeline', err);
             }
-          } else if (!this.isAsyncPipelinePending(cmd.pipelineId)) {
-            this._recordOpValidationError(
-              'SetPipeline',
-              `render pipeline ${cmd.pipelineId} not found`
-            );
+          } else {
+            ps.activePipeline = null;
+            if (!this.isAsyncPipelinePending(cmd.pipelineId)) {
+              this._recordOpValidationError(
+                'SetPipeline',
+                `render pipeline ${cmd.pipelineId} not found`
+              );
+            }
           }
           break;
         }
@@ -15070,7 +15697,7 @@ class WgpuCommandProcessor {
           if (buffer) {
             this._bindPresentVertexBuffer(cmd.slot, cmd.bufferId, buffer, cmd.offset);
             try {
-              pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
+              this._passSetVertexBuffer(pass, cmd.slot, buffer, cmd.offset, cmd.size);
             } catch (err) {
               this._recordOpValidationError('SetVertexBuffer', err);
             }
@@ -15082,7 +15709,7 @@ class WgpuCommandProcessor {
           const buffer = this.buffers.get(cmd.bufferId);
           if (buffer) {
             try {
-              pass.setIndexBuffer(buffer, cmd.indexFormat, cmd.offset);
+              this._passSetIndexBuffer(pass, buffer, cmd.indexFormat, cmd.offset, cmd.size);
             } catch (err) {
               this._recordOpValidationError('SetIndexBuffer', err);
             }
@@ -15107,10 +15734,54 @@ class WgpuCommandProcessor {
                 ? this._ensurePresentComputePass()
                 : this._ensurePresentRenderPass());
             try {
-              pass.setBindGroup(cmd.groupIndex, bindGroup);
+              this._passSetBindGroup(pass, cmd.groupIndex, bindGroup, cmd.dynamicOffsets);
             } catch (err) {
               this._recordOpValidationError('SetBindGroup', err);
             }
+          }
+          break;
+        }
+        case 'setViewport': {
+          const pass = this._ensurePresentRenderPass();
+          try {
+            this._passSetViewport(
+              pass,
+              cmd.x,
+              cmd.y,
+              cmd.width,
+              cmd.height,
+              cmd.minDepth,
+              cmd.maxDepth
+            );
+          } catch (err) {
+            this._recordOpValidationError('SetViewport', err);
+          }
+          break;
+        }
+        case 'setScissorRect': {
+          const pass = this._ensurePresentRenderPass();
+          try {
+            this._passSetScissorRect(pass, cmd.x, cmd.y, cmd.width, cmd.height);
+          } catch (err) {
+            this._recordOpValidationError('SetScissorRect', err);
+          }
+          break;
+        }
+        case 'setBlendConstant': {
+          const pass = this._ensurePresentRenderPass();
+          try {
+            this._passSetBlendConstant(pass, cmd.r, cmd.g, cmd.b, cmd.a);
+          } catch (err) {
+            this._recordOpValidationError('SetBlendConstant', err);
+          }
+          break;
+        }
+        case 'setStencilReference': {
+          const pass = this._ensurePresentRenderPass();
+          try {
+            this._passSetStencilReference(pass, cmd.reference);
+          } catch (err) {
+            this._recordOpValidationError('SetStencilReference', err);
           }
           break;
         }
@@ -15128,7 +15799,7 @@ class WgpuCommandProcessor {
           const pipeline = this.computePipelines.get(cmd.pipelineId);
           if (pipeline) {
             try {
-              pass.setPipeline(pipeline);
+              this._passSetPipeline(pass, pipeline);
             } catch (err) {
               this._recordOpValidationError('SetComputePipeline', err);
             }
@@ -15207,6 +15878,7 @@ class WgpuCommandProcessor {
             try {
               cmd.run(passControl);
               if (meta && meta.kind === 'setBindGroup2' && ps.activePass) {
+                this._invalidateActivePassBindGroup(meta.groupIndex);
                 const bg = this.bindGroups.get(meta.bindGroupId) || null;
                 const bgMeta = this._bindGroupMeta.get(meta.bindGroupId) || null;
                 this._bindPresentBindGroup(
@@ -15926,6 +16598,7 @@ class WgpuCommandProcessor {
               computePassIdx += 1;
               computePass = encoder.beginComputePass();
             }
+            this._resetActivePassState();
           }
           return computePass;
         };
@@ -15935,13 +16608,13 @@ class WgpuCommandProcessor {
             activeComputePipelineId = cmd.pipelineId;
             const pipeline = this.computePipelines.get(cmd.pipelineId);
             if (pipeline) {
-              ensureCompute(cmd.pipelineId).setPipeline(pipeline);
+              this._passSetPipeline(ensureCompute(cmd.pipelineId), pipeline);
             }
           } else if (cmd.type === 'setBindGroup') {
             if (computePass || this._bindGroupKinds.get(cmd.bindGroupId) === 'compute') {
               const bg = this.bindGroups.get(cmd.bindGroupId) || cmd.bindGroup || null;
               if (bg) {
-                ensureCompute().setBindGroup(cmd.groupIndex, bg);
+                this._passSetBindGroup(ensureCompute(), cmd.groupIndex, bg, cmd.dynamicOffsets);
               }
             }
           } else if (cmd.type === 'dispatchCompute') {
@@ -15963,12 +16636,14 @@ class WgpuCommandProcessor {
             if (computePass && typeof computePass.end === 'function') {
               computePass.end();
               computePass = null;
+              this._resetActivePassState();
             }
             this._encodeCopyTextureOnEncoder(encoder, cmd.copyParams);
           }
         }
         if (computePass && typeof computePass.end === 'function') {
           computePass.end();
+          this._resetActivePassState();
         }
         let timerResolved = false;
         if (timerSupported && typeof this.passTimer.resolveFrame === 'function') {
@@ -16665,6 +17340,65 @@ class WgpuCommandProcessor {
           this._recordOpValidationError(OPCODE_NAMES[opcode], `truncated payload (${payloadBytes}B < 16B)`);
         }
         break;
+      case OPCODES.SET_VIEWPORT:
+        if (this.extension) {
+          this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+        } else if (payloadBytes >= 24) {
+          const cmd = this._acquirePassCommand('setViewport');
+          cmd.x = view.getFloat32(payloadOffset, true);
+          cmd.y = view.getFloat32(payloadOffset + 4, true);
+          cmd.width = view.getFloat32(payloadOffset + 8, true);
+          cmd.height = view.getFloat32(payloadOffset + 12, true);
+          cmd.minDepth = view.getFloat32(payloadOffset + 16, true);
+          cmd.maxDepth = view.getFloat32(payloadOffset + 20, true);
+          this._passCommands.push(cmd);
+        } else {
+          this._recordOpValidationError('SetViewport', `truncated payload (${payloadBytes}B < 24B)`);
+        }
+        break;
+      case OPCODES.SET_SCISSOR_RECT:
+        if (this.extension) {
+          this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+        } else if (payloadBytes >= 16) {
+          const cmd = this._acquirePassCommand('setScissorRect');
+          cmd.x = view.getUint32(payloadOffset, true);
+          cmd.y = view.getUint32(payloadOffset + 4, true);
+          cmd.width = view.getUint32(payloadOffset + 8, true);
+          cmd.height = view.getUint32(payloadOffset + 12, true);
+          this._passCommands.push(cmd);
+        } else {
+          this._recordOpValidationError('SetScissorRect', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.SET_BLEND_CONSTANT:
+        if (this.extension) {
+          this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+        } else if (payloadBytes >= 16) {
+          const rawR = view.getFloat32(payloadOffset, true);
+          const rawG = view.getFloat32(payloadOffset + 4, true);
+          const rawB = view.getFloat32(payloadOffset + 8, true);
+          const rawA = view.getFloat32(payloadOffset + 12, true);
+          const cmd = this._acquirePassCommand('setBlendConstant');
+          cmd.r = Number.isFinite(rawR) ? rawR || 0 : 0;
+          cmd.g = Number.isFinite(rawG) ? rawG || 0 : 0;
+          cmd.b = Number.isFinite(rawB) ? rawB || 0 : 0;
+          cmd.a = Number.isFinite(rawA) ? rawA || 0 : 0;
+          this._passCommands.push(cmd);
+        } else {
+          this._recordOpValidationError('SetBlendConstant', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.SET_STENCIL_REFERENCE:
+        if (this.extension) {
+          this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+        } else if (payloadBytes >= 4) {
+          const cmd = this._acquirePassCommand('setStencilReference');
+          cmd.reference = view.getUint32(payloadOffset, true);
+          this._passCommands.push(cmd);
+        } else {
+          this._recordOpValidationError('SetStencilReference', `truncated payload (${payloadBytes}B < 4B)`);
+        }
+        break;
       default:
         if (this.extension) {
           this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
@@ -16938,6 +17672,41 @@ class WgpuCommandProcessor {
       zeroAllocDrains: this._zeroAllocDrains,
     });
 
+    const renderStateExt = this._getRenderStateExtension();
+    const rsTel =
+      renderStateExt && renderStateExt.telemetry && typeof renderStateExt.telemetry === 'object'
+        ? renderStateExt.telemetry
+        : null;
+    const redundantStateSkippedBreakdown = {
+      pipeline: this._redundantStateSkippedBreakdown.pipeline,
+      bindGroup:
+        this._redundantStateSkippedBreakdown.bindGroup +
+        toNonNegativeInt(rsTel && rsTel.elidedBindGroupSets, 0),
+      vertexBuffer: this._redundantStateSkippedBreakdown.vertexBuffer,
+      indexBuffer: this._redundantStateSkippedBreakdown.indexBuffer,
+      viewport:
+        this._redundantStateSkippedBreakdown.viewport +
+        toNonNegativeInt(rsTel && rsTel.elidedViewportSets, 0),
+      scissor:
+        this._redundantStateSkippedBreakdown.scissor +
+        toNonNegativeInt(rsTel && rsTel.elidedScissorSets, 0),
+      stencilRef:
+        this._redundantStateSkippedBreakdown.stencilRef +
+        toNonNegativeInt(rsTel && rsTel.elidedStencilRefSets, 0),
+      blendConstant:
+        this._redundantStateSkippedBreakdown.blendConstant +
+        toNonNegativeInt(rsTel && rsTel.elidedBlendConstantSets, 0),
+    };
+    const redundantStateCallsSkipped =
+      redundantStateSkippedBreakdown.pipeline +
+      redundantStateSkippedBreakdown.bindGroup +
+      redundantStateSkippedBreakdown.vertexBuffer +
+      redundantStateSkippedBreakdown.indexBuffer +
+      redundantStateSkippedBreakdown.viewport +
+      redundantStateSkippedBreakdown.scissor +
+      redundantStateSkippedBreakdown.stencilRef +
+      redundantStateSkippedBreakdown.blendConstant;
+
     return {
       frameCount: this.frameCount,
       framesPresented: this.frameCount,
@@ -17071,6 +17840,10 @@ class WgpuCommandProcessor {
       replayLogOverflowCount: this._replayLogOverflowCount,
       clearTextureStats: { ...this._clearTextureStats },
       copyTextureStats: { ...this._copyTextureStats },
+      perfProfile: this._perfProfileName,
+      displayBounds: this._displayBounds ? { ...this._displayBounds } : null,
+      redundantStateCallsSkipped,
+      redundantStateSkippedBreakdown,
     };
   }
 
@@ -18154,6 +18927,12 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     snapshot.shaderPackStats = resolveShaderPackTelemetry(processor, stats);
     snapshot.oversizedWgslFallbacks = oversizedWgslFallbacks;
     snapshot.coalescedPresents = coalescedPresents;
+    snapshot.redundantStateCallsSkipped = toNonNegativeInt(
+      stats && stats.redundantStateCallsSkipped !== undefined
+        ? stats.redundantStateCallsSkipped
+        : processor && processor._redundantStateCallsSkipped,
+      0
+    );
     // W257: first-visible-frame readiness & sanitized GPU adapter metadata.
     snapshot.firstVisibleFrame = Boolean(stats && stats.firstVisibleFrame === true);
     snapshot.firstVisibleFrameMs =
@@ -18847,6 +19626,8 @@ function createWgpuWorkerHandler(options = {}) {
   let boundPrewarmProcessor = null;
   let prewarmMsgRequestType = 'prewarm-task';
   const pendingPrewarmMessages = [];
+  let pendingPerfProfile = options.perfProfile !== undefined ? options.perfProfile : null;
+  let pendingDisplayBounds = options.displayBounds !== undefined ? options.displayBounds : null;
 
   function detachWorkerPrewarmBridge() {
     const prevBridge = prewarmBridge;
@@ -18935,6 +19716,23 @@ function createWgpuWorkerHandler(options = {}) {
       }
       if (typeof mergedOpts.now !== 'function') {
         mergedOpts.now = telemetryNow;
+      }
+      if (mergedOpts.maxInFlight === undefined) {
+        const activeProf =
+          (initPayload && initPayload.perfProfile && typeof initPayload.perfProfile === 'object'
+            ? initPayload.perfProfile
+            : null) ||
+          (targetProcessor && targetProcessor._perfProfile) ||
+          (pendingPerfProfile && typeof pendingPerfProfile === 'object'
+            ? pendingPerfProfile
+            : null);
+        if (
+          activeProf &&
+          Number.isInteger(activeProf.prewarmMaxInFlight) &&
+          activeProf.prewarmMaxInFlight >= 1
+        ) {
+          mergedOpts.maxInFlight = activeProf.prewarmMaxInFlight;
+        }
       }
       try {
         prewarmBridge = api.attachPrewarmBridge(targetProcessor, mergedOpts);
@@ -19683,10 +20481,43 @@ function createWgpuWorkerHandler(options = {}) {
       options.requireNonBlackFrame !== false &&
       options.requireNonBlackPixels !== false;
 
+    const resolvedInitPerfProfile =
+      initPayload.perfProfile !== undefined
+        ? initPayload.perfProfile
+        : pendingPerfProfile !== null
+          ? pendingPerfProfile
+          : options.perfProfile !== undefined
+            ? options.perfProfile
+            : null;
+    const resolvedInitDisplayBounds =
+      initPayload.displayBounds !== undefined
+        ? initPayload.displayBounds
+        : pendingDisplayBounds !== null
+          ? pendingDisplayBounds
+          : initPayload.swapchainOptions && initPayload.swapchainOptions.displayBounds !== undefined
+            ? initPayload.swapchainOptions.displayBounds
+            : resolvedInitPerfProfile &&
+                typeof resolvedInitPerfProfile === 'object' &&
+                resolvedInitPerfProfile.displayNativeBounds
+              ? resolvedInitPerfProfile.displayNativeBounds
+              : options.displayBounds !== undefined
+                ? options.displayBounds
+                : null;
+
     let activeSwapchain = null;
     let ownsSwapchain = false;
     if (injectedSwapchain) {
       activeSwapchain = injectedSwapchain;
+      if (
+        resolvedInitDisplayBounds !== null &&
+        typeof activeSwapchain.setDisplayBounds === 'function'
+      ) {
+        try {
+          activeSwapchain.setDisplayBounds(resolvedInitDisplayBounds);
+        } catch (_) {
+          // Ignore best-effort displayBounds application on injected swapchain.
+        }
+      }
       if (
         !activeSwapchain.isConfigured &&
         typeof activeSwapchain.configure === 'function'
@@ -19727,6 +20558,11 @@ function createWgpuWorkerHandler(options = {}) {
           const swapOpts = {
             ...(options.swapchainOptions || {}),
             ...(initPayload.swapchainOptions || {}),
+            ...(resolvedInitDisplayBounds !== null &&
+            !(initPayload.swapchainOptions && initPayload.swapchainOptions.displayBounds !== undefined) &&
+            !(options.swapchainOptions && options.swapchainOptions.displayBounds !== undefined)
+              ? { displayBounds: resolvedInitDisplayBounds }
+              : {}),
             canvas,
             device,
             context: ctx,
@@ -20064,6 +20900,9 @@ function createWgpuWorkerHandler(options = {}) {
         initPayload.promote1DTo2D !== undefined
           ? initPayload.promote1DTo2D
           : options.promote1DTo2D,
+      perfProfile: resolvedInitPerfProfile,
+      perfProfileApi: initPayload.perfProfileApi ?? options.perfProfileApi,
+      displayBounds: resolvedInitDisplayBounds,
     });
     bindProcessorValidationErrors(processor);
     bindProcessorPrewarmBridge(processor, initPayload);
@@ -20262,6 +21101,37 @@ function createWgpuWorkerHandler(options = {}) {
       }
       if (
         processor &&
+        payload.displayBounds !== undefined &&
+        typeof processor.setDisplayBounds === 'function'
+      ) {
+        pendingDisplayBounds = payload.displayBounds;
+        processor.setDisplayBounds(payload.displayBounds);
+      } else if (
+        processor &&
+        pendingDisplayBounds !== null &&
+        processor._displayBounds === null &&
+        typeof processor.setDisplayBounds === 'function'
+      ) {
+        processor.setDisplayBounds(pendingDisplayBounds);
+      }
+      if (
+        processor &&
+        payload.perfProfile !== undefined &&
+        payload.perfProfile !== null &&
+        typeof processor.applyPerfProfile === 'function'
+      ) {
+        pendingPerfProfile = payload.perfProfile;
+        processor.applyPerfProfile(payload.perfProfile);
+      } else if (
+        processor &&
+        pendingPerfProfile !== null &&
+        processor._perfProfile === null &&
+        typeof processor.applyPerfProfile === 'function'
+      ) {
+        processor.applyPerfProfile(pendingPerfProfile);
+      }
+      if (
+        processor &&
         payload.enableResourceReplay !== undefined &&
         typeof processor.setEnableResourceReplay === 'function'
       ) {
@@ -20315,6 +21185,18 @@ function createWgpuWorkerHandler(options = {}) {
   async function handleAsyncInitExisting(payload) {
     try {
       await ensureRtBvhPreludeLoaded();
+      if (payload.displayBounds !== undefined && typeof processor.setDisplayBounds === 'function') {
+        pendingDisplayBounds = payload.displayBounds;
+        processor.setDisplayBounds(payload.displayBounds);
+      }
+      if (
+        payload.perfProfile !== undefined &&
+        payload.perfProfile !== null &&
+        typeof processor.applyPerfProfile === 'function'
+      ) {
+        pendingPerfProfile = payload.perfProfile;
+        processor.applyPerfProfile(payload.perfProfile);
+      }
       if (
         payload.enableResourceReplay !== undefined &&
         typeof processor.setEnableResourceReplay === 'function'
@@ -20384,6 +21266,17 @@ function createWgpuWorkerHandler(options = {}) {
       } else if (payload.resize && canvas) {
         const nextW = Math.max(1, payload.width | 0);
         const nextH = Math.max(1, payload.height | 0);
+        if (payload.displayBounds !== undefined) {
+          pendingDisplayBounds = payload.displayBounds;
+          if (processor && typeof processor.setDisplayBounds === 'function') {
+            processor.setDisplayBounds(payload.displayBounds);
+          } else {
+            const boundSwap = (processor && processor.swapchain) || swapchain;
+            if (boundSwap && !boundSwap.isDestroyed && typeof boundSwap.setDisplayBounds === 'function') {
+              boundSwap.setDisplayBounds(payload.displayBounds);
+            }
+          }
+        }
         const activeSwapchain = (processor && processor.swapchain) || swapchain;
         if (
           activeSwapchain &&
@@ -20803,6 +21696,95 @@ function createWgpuWorkerHandler(options = {}) {
           maybeEmitFrameTelemetry(prevFrames, framesPresented);
           pumpWorkerPrewarmBridge();
         }
+      } else if (payload.type === 'apply-perf-profile' || payload.applyPerfProfile !== undefined) {
+        const rawProfile =
+          payload.applyPerfProfile !== undefined &&
+          payload.applyPerfProfile !== true
+            ? payload.applyPerfProfile
+            : payload.perfProfile !== undefined
+              ? payload.perfProfile
+              : payload.profile !== undefined
+                ? payload.profile
+                : payload.preset !== undefined
+                  ? payload.preset
+                  : payload;
+        const coerced = coerceWgpuPerfProfile(rawProfile, options.perfProfileApi);
+        pendingPerfProfile = coerced;
+        let result = null;
+        if (processor && typeof processor.applyPerfProfile === 'function') {
+          result = processor.applyPerfProfile(coerced);
+        } else if (prewarmBridge && typeof prewarmBridge === 'object') {
+          if (typeof prewarmBridge.applyPerfProfile === 'function') {
+            prewarmBridge.applyPerfProfile(coerced);
+          } else if (
+            typeof prewarmBridge.setMaxInFlight === 'function' &&
+            Number.isInteger(coerced.prewarmMaxInFlight) &&
+            coerced.prewarmMaxInFlight >= 1
+          ) {
+            prewarmBridge.setMaxInFlight(coerced.prewarmMaxInFlight);
+          }
+        }
+        const reply = {
+          type: 'perf-profile-applied',
+          ok: true,
+          profile: (result && result.profile) || coerced.name || null,
+          perfProfile: coerced,
+        };
+        if (payload.id !== undefined) {
+          reply.id = payload.id;
+        }
+        postMessage(reply);
+      } else if (payload.type === 'set-display-bounds' || payload.setDisplayBounds !== undefined) {
+        let rawBounds = null;
+        if (payload.displayBounds !== undefined) {
+          rawBounds = payload.displayBounds;
+        } else if (
+          payload.setDisplayBounds !== undefined &&
+          payload.setDisplayBounds !== true
+        ) {
+          rawBounds = payload.setDisplayBounds;
+        } else if (
+          payload.screenWidth !== undefined ||
+          payload.screenHeight !== undefined ||
+          payload.maxDisplayWidth !== undefined ||
+          payload.maxDisplayHeight !== undefined
+        ) {
+          rawBounds = {
+            screenWidth: payload.screenWidth,
+            screenHeight: payload.screenHeight,
+            devicePixelRatio: payload.devicePixelRatio ?? payload.dpr,
+            maxDisplayWidth: payload.maxDisplayWidth,
+            maxDisplayHeight: payload.maxDisplayHeight,
+            maxTextureDimension2D: payload.maxTextureDimension2D,
+          };
+        }
+        const normalizedBounds =
+          rawBounds === null ? null : normalizeWgpuDisplayBounds(rawBounds);
+        pendingDisplayBounds = normalizedBounds;
+        let reconfigured = false;
+        if (processor && typeof processor.setDisplayBounds === 'function') {
+          const res = processor.setDisplayBounds(normalizedBounds);
+          reconfigured = Boolean(res && res.reconfigured);
+        } else {
+          const activeSwapchain = (processor && processor.swapchain) || swapchain;
+          if (
+            activeSwapchain &&
+            !activeSwapchain.isDestroyed &&
+            typeof activeSwapchain.setDisplayBounds === 'function'
+          ) {
+            reconfigured = Boolean(activeSwapchain.setDisplayBounds(normalizedBounds));
+          }
+        }
+        const reply = {
+          type: 'display-bounds-updated',
+          ok: true,
+          displayBounds: normalizedBounds ? { ...normalizedBounds } : null,
+          reconfigured,
+        };
+        if (payload.id !== undefined) {
+          reply.id = payload.id;
+        }
+        postMessage(reply);
       } else if (payload.type === 'attach-guest-memory') {
         pendingGuestMemory = payload.buffer || null;
         if (processor && typeof processor.attachGuestMemory === 'function') {
