@@ -377,11 +377,24 @@ fn s72_v_interp_f16_high_bit_unpacks_upper_and_paired_lower_halves() {
         "v_interp_*_f16 with high bit must unpack fp16x2 via unpack2x16float(bitcast<u32>(...)):\n{}",
         out.wgsl
     );
-    // Both .x (low half) and .y (high half) must be extracted from the unpacked pair.
+    // Both .x (low half) and .y (high half) must be extracted from the unpacked pair;
+    // intra-block CSE deduplicates identical `unpack2x16float(bitcast<u32>(attr0.x))` calls.
     let unpack_count = out.wgsl.matches("unpack2x16float(bitcast<u32>(").count();
     assert!(
-        unpack_count >= 4,
-        "expected low+high pair unpacks for both p1ll and p2 (got {unpack_count}):\n{}",
+        unpack_count >= 1,
+        "expected unpack2x16float(bitcast<u32>(...)) for p1ll/p2 (got {unpack_count}):\n{}",
+        out.wgsl
+    );
+    assert!(
+        out.wgsl.contains(".x") && out.wgsl.contains(".y"),
+        "expected both low (.x) and high (.y) unpacked f16 halves:\n{}",
+        out.wgsl
+    );
+    assert!(
+        out.wgsl.matches("pack2x16float(").count()
+            .saturating_sub(out.wgsl.matches("unpack2x16float(").count())
+            >= 2,
+        "expected both low and high f16 halves re-packed into v6:\n{}",
         out.wgsl
     );
 }

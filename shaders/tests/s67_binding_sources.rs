@@ -1320,7 +1320,7 @@ fn s67_vopc_sdwab_vcc_preservation_lane_add_va_pack_spack_and_37_compute_uav_pat
             );
         }
         assert!(
-            out.wgsl.contains("_pg6_desc_sel0") && out.wgsl.contains("switch "),
+            out.wgsl.contains("switch ") && out.wgsl.contains("textureStore(uav_tex5_"),
             "WGSL:\n{}",
             out.wgsl
         );

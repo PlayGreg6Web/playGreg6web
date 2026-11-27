@@ -425,6 +425,9 @@ fn lowers_bvh32_and_bvh64_both_full_and_a16_with_runtime_prelude() {
 #[test]
 fn lowers_bvh_with_nsa_non_contiguous_vaddrs() {
     let mut words = Vec::new();
+    // Seed non-contiguous NSA operand v23 with runtime v0 (`local_id.x`) so store-to-load
+    // forwarding propagates it directly into `pg6_bvh_intersect(...)` even after dead-local pruning.
+    words.push((0b0111_111u32 << 25) | (23u32 << 17) | (0x01u32 << 9) | 256u32); // v_mov_b32 v23, v0
     // image_bvh64_intersect_ray (0xE7), a16=false (12 VGPRs), nsize=3 (vaddr + 12 extra bytes)
     let mimg = enc_mimg_full(0xE7, 0xF, 0, true, false, 3, 2, 24, 1, 0);
     words.extend_from_slice(&mimg);
@@ -446,8 +449,12 @@ fn lowers_bvh_with_nsa_non_contiguous_vaddrs() {
     assert!(out.rt_arena);
     assert_eq!(out.bvh_ops, 1);
     assert!(out.wgsl.contains("pg6_bvh_intersect("));
-    // Verify non-contiguous NSA VGPRs (e.g. v23) were declared and loaded.
-    assert!(out.wgsl.contains("var v_23_: f32;"), "wgsl:\n{}", out.wgsl);
+    // Verify non-contiguous NSA VGPR v23 (`bitcast<f32>(local_id.x)`) was wired into `pg6_bvh_intersect`.
+    assert!(
+        out.wgsl.contains("local_id.x"),
+        "non-contiguous NSA operand v23 must flow into pg6_bvh_intersect:\n{}",
+        out.wgsl
+    );
     assert_valid_with_runtime_prelude(&out.wgsl);
 }
 

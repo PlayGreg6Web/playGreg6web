@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Post-lowering semantics-preserving Naga IR optimization pass (`#2137`, Refs `#663`, `#482`).
+//! Post-lowering semantics-preserving Naga IR optimization pass (`#2137`, `#2164`, Refs `#663`, `#482`).
 //!
 //! Runs after `compact_module_bindings` and before `naga::valid::Validator` / WGSL emission to
 //! shrink emitted WGSL size, reduce Dawn/Tint compilation latency, and lower GPU VGPR register
@@ -30,7 +30,19 @@
 //!    * `select(a, a, c)` -> `a`.
 //!    * `!!b` -> `b`.
 //!    * Never folds float `x * 0.0` or `x + 0.0` (`NaN` / `-0.0` preserved).
-//! 4. **Dead local-variable pruning & unreferenced pure `Emit` trimming + arena compaction:**
+//! 4. **Intra-block Store-to-Load local variable forwarding (`#2164`):**
+//!    * Tracks non-escaped `LocalVariable`s across straight-line `Block`s (including pre-emitted
+//!      `LocalVariable.init` values at function entry), resetting state inside `If`/`Loop`/`Switch`
+//!      sub-blocks and invalidating written locals and load-dependent values across intervening
+//!      stores, calls, atomics, barriers, and control flow.
+//!    * Forwards dominating SSA values directly into `Expression::Load { pointer: LocalVariable }`,
+//!      enabling dead-local pruning and further bitcast/constant simplification on the next pass.
+//! 5. **Intra-block Common Subexpression Elimination (CSE) for pure expressions (`#2164`):**
+//!    * Scoped dominance-respecting value numbering over pure value expressions (`Binary`, `Unary`,
+//!      `As`, `Splat`, `Compose`, `Swizzle`, value `Access`/`AccessIndex`, `Select`, `Math`,
+//!      `Relational`), normalizing commutative integer/boolean binary operators while never CSEing
+//!      memory loads, texture samples/loads, derivatives, or statement-result expressions.
+//! 6. **Dead local-variable pruning & unreferenced pure `Emit` trimming + arena compaction:**
 //!    * Removes `LocalVariable`s that are never loaded and never escaped by pointer (`Call`,
 //!      `Atomic`, `WorkGroupUniformLoad`, `RayQuery`, etc.) and whose `Store`s have transitively
 //!      pure values/indices.
@@ -48,11 +60,11 @@ use naga::{
     GatherMode, GlobalVariable, Handle, ImageClass, ImageQuery, Literal, LocalVariable,
     MathFunction, Module, Override, Range, RayPipelineFunction, RayQueryFunction,
     RelationalFunction, SampleLevel, Scalar, ScalarKind, Span, Statement, StorageFormat,
-    SwitchCase, Type, TypeInner, UnaryOperator, UniqueArena, VectorSize,
+    SwitchCase, SwizzleComponent, Type, TypeInner, UnaryOperator, UniqueArena, VectorSize,
 };
 
 /// Maximum fixed-point optimization iterations per function.
-const MAX_OPT_PASSES: usize = 4;
+const MAX_OPT_PASSES: usize = 8;
 
 /// Sanitized counters summarizing Naga IR optimizations applied to a shader module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -63,6 +75,10 @@ pub struct IrOptStats {
     pub constants_folded: usize,
     /// Safe integer/boolean algebraic identities simplified (`x + 0`, `x * 1`, `x | 0`, `x ^ 0`, `x & ~0`, `x << 0`, `x >> 0`, `x ^ x`, `x & x`, `x | x`, `select(a, a, c)`, `!!b`).
     pub identities_simplified: usize,
+    /// Local variable `Load` expressions forwarded directly from dominating intra-block stores or initializers.
+    pub locals_forwarded: usize,
+    /// Duplicate pure expressions deduplicated by intra-block Common Subexpression Elimination (CSE).
+    pub cse_eliminated: usize,
     /// Dead `LocalVariable` declarations removed along with their pure stores.
     pub dead_locals_removed: usize,
     /// Unreferenced pure expressions pruned from `Statement::Emit` ranges.
@@ -75,6 +91,8 @@ impl IrOptStats {
         self.bitcasts_cancelled
             + self.constants_folded
             + self.identities_simplified
+            + self.locals_forwarded
+            + self.cse_eliminated
             + self.dead_locals_removed
             + self.dead_emits_trimmed
     }
@@ -84,6 +102,8 @@ impl IrOptStats {
         self.bitcasts_cancelled == 0
             && self.constants_folded == 0
             && self.identities_simplified == 0
+            && self.locals_forwarded == 0
+            && self.cse_eliminated == 0
             && self.dead_locals_removed == 0
             && self.dead_emits_trimmed == 0
     }
@@ -93,6 +113,8 @@ impl IrOptStats {
         self.bitcasts_cancelled += other.bitcasts_cancelled;
         self.constants_folded += other.constants_folded;
         self.identities_simplified += other.identities_simplified;
+        self.locals_forwarded += other.locals_forwarded;
+        self.cse_eliminated += other.cse_eliminated;
         self.dead_locals_removed += other.dead_locals_removed;
         self.dead_emits_trimmed += other.dead_emits_trimmed;
     }
@@ -173,11 +195,17 @@ fn optimize_function_with_ctx(ctx: &ModuleContext<'_>, func: &mut Function) -> I
         // 1. Algebraic simplification, bitcast cancellation, and constant folding.
         simplify_expressions(ctx, func, &mut pass);
 
-        // 2. Dead local-variable pruning (locals never loaded or escaped by pointer, whose
+        // 2. Intra-block Store-to-Load local variable forwarding (#2164).
+        forward_local_loads(ctx, func, &mut pass);
+
+        // 3. Intra-block Common Subexpression Elimination (CSE) for pure expressions (#2164).
+        eliminate_common_subexpressions(ctx, func, &mut pass);
+
+        // 4. Dead local-variable pruning (locals never loaded or escaped by pointer, whose
         //    stores have transitively pure values and indices).
         prune_dead_locals(func, &mut pass);
 
-        // 3. Dead pure-expression Emit trimming and order-preserving expression arena compaction.
+        // 5. Dead pure-expression Emit trimming and order-preserving expression arena compaction.
         compact_live_expressions_and_emits(func, &mut pass);
 
         total.merge_from(pass);
@@ -1669,7 +1697,1280 @@ fn simplify_integer_binary_identity(
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: Dead local-variable pruning
+// Pass 2: Intra-block Store-to-Load local variable forwarding (#2164)
+// ---------------------------------------------------------------------------
+
+/// Maximum distinct non-escaped locals tracked precisely per expression before falling back to
+/// the conservative `reads_any_local` flag (keeps per-expression dependency propagation O(1)).
+const MAX_TRACKED_LOCALS: usize = 16;
+
+/// Follow a remapping table to its canonical root handle (bounded to prevent cycles).
+#[inline]
+fn resolve_remap(remap: &[Handle<Expression>], mut h: Handle<Expression>) -> Handle<Expression> {
+    for _ in 0..remap.len() {
+        let next = remap[h.index()];
+        if next == h {
+            return h;
+        }
+        h = next;
+    }
+    h
+}
+
+/// Infer the [`TypeInner`] of every expression in `func` in ascending arena order.
+fn infer_all_expr_types(ctx: &ModuleContext<'_>, func: &Function) -> Vec<Option<TypeInner>> {
+    let mut resolved: Vec<Option<TypeInner>> = vec![None; func.expressions.len()];
+    for (h, expr) in func.expressions.iter() {
+        resolved[h.index()] = infer_single_expr_type(ctx, func, &resolved, expr);
+    }
+    resolved
+}
+
+/// Compute whether each expression handle is a pointer rooted in an immutable `Uniform` global.
+fn compute_uniform_ptr_origins(ctx: &ModuleContext<'_>, func: &Function) -> Vec<bool> {
+    let mut is_uniform = vec![false; func.expressions.len()];
+    for (h, expr) in func.expressions.iter() {
+        is_uniform[h.index()] = match expr {
+            Expression::GlobalVariable(g) => {
+                ctx.global_variables[*g].space == AddressSpace::Uniform
+            }
+            Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
+                is_uniform[base.index()]
+            }
+            _ => false,
+        };
+    }
+    is_uniform
+}
+
+/// Identify all `LocalVariable`s whose address escapes into ANY non-`Load`/`Store`/`Access`
+/// position (e.g., `Call` arguments, `Atomic`, `WorkGroupUniformLoad`, `RayQuery`,
+/// `RayPipelineFunction`, `CooperativeStore`, `CooperativeLoad`, `ArrayLength`, etc.).
+///
+/// Escaped locals may be mutated indirectly and are NEVER tracked or forwarded.
+fn compute_escaped_locals(
+    func: &Function,
+    local_origins: &[Option<Handle<LocalVariable>>],
+) -> HashSet<Handle<LocalVariable>> {
+    let mut escaped: HashSet<Handle<LocalVariable>> = HashSet::new();
+
+    let mut mark_if_local = |h: Handle<Expression>| {
+        if let Some(lv) = local_origins[h.index()] {
+            escaped.insert(lv);
+        }
+    };
+
+    // 1. Expression operands: only `Access.base`, `AccessIndex.base`, and `Load.pointer` are
+    //    non-escaping local pointer positions.
+    for (_, expr) in func.expressions.iter() {
+        match expr {
+            Expression::LocalVariable(_) | Expression::Load { .. } => {}
+            Expression::Access { base: _, index } => {
+                mark_if_local(*index);
+            }
+            Expression::AccessIndex { base: _, .. } => {}
+            other => {
+                visit_expr_children(other, |c| mark_if_local(c));
+            }
+        }
+    }
+
+    // 2. Statement operands: only `Store.pointer` is a non-escaping local pointer position.
+    fn mark_escaped(
+        h: Handle<Expression>,
+        local_origins: &[Option<Handle<LocalVariable>>],
+        escaped: &mut HashSet<Handle<LocalVariable>>,
+    ) {
+        if let Some(lv) = local_origins[h.index()] {
+            escaped.insert(lv);
+        }
+    }
+
+    fn walk_stmt_escapes(
+        block: &Block,
+        local_origins: &[Option<Handle<LocalVariable>>],
+        escaped: &mut HashSet<Handle<LocalVariable>>,
+    ) {
+        for stmt in block.iter() {
+            match stmt {
+                Statement::Emit(_)
+                | Statement::Break
+                | Statement::Continue
+                | Statement::Kill
+                | Statement::ControlBarrier(_)
+                | Statement::MemoryBarrier(_) => {}
+                Statement::Block(inner) => walk_stmt_escapes(inner, local_origins, escaped),
+                Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } => {
+                    mark_escaped(*condition, local_origins, escaped);
+                    walk_stmt_escapes(accept, local_origins, escaped);
+                    walk_stmt_escapes(reject, local_origins, escaped);
+                }
+                Statement::Switch { selector, cases } => {
+                    mark_escaped(*selector, local_origins, escaped);
+                    for case in cases {
+                        walk_stmt_escapes(&case.body, local_origins, escaped);
+                    }
+                }
+                Statement::Loop {
+                    body,
+                    continuing,
+                    break_if,
+                } => {
+                    walk_stmt_escapes(body, local_origins, escaped);
+                    walk_stmt_escapes(continuing, local_origins, escaped);
+                    if let Some(cond) = break_if {
+                        mark_escaped(*cond, local_origins, escaped);
+                    }
+                }
+                Statement::Return { value } => {
+                    if let Some(v) = value {
+                        mark_escaped(*v, local_origins, escaped);
+                    }
+                }
+                Statement::Store { pointer: _, value } => {
+                    mark_escaped(*value, local_origins, escaped);
+                }
+                Statement::ImageStore {
+                    image,
+                    coordinate,
+                    array_index,
+                    value,
+                } => {
+                    mark_escaped(*image, local_origins, escaped);
+                    mark_escaped(*coordinate, local_origins, escaped);
+                    if let Some(a) = array_index {
+                        mark_escaped(*a, local_origins, escaped);
+                    }
+                    mark_escaped(*value, local_origins, escaped);
+                }
+                Statement::ImageAtomic {
+                    image,
+                    coordinate,
+                    array_index,
+                    value,
+                    ..
+                } => {
+                    mark_escaped(*image, local_origins, escaped);
+                    mark_escaped(*coordinate, local_origins, escaped);
+                    if let Some(a) = array_index {
+                        mark_escaped(*a, local_origins, escaped);
+                    }
+                    mark_escaped(*value, local_origins, escaped);
+                }
+                Statement::Atomic {
+                    pointer,
+                    fun,
+                    value,
+                    ..
+                } => {
+                    mark_escaped(*pointer, local_origins, escaped);
+                    if let AtomicFunction::Exchange {
+                        compare: Some(cmp),
+                    } = fun
+                    {
+                        mark_escaped(*cmp, local_origins, escaped);
+                    }
+                    mark_escaped(*value, local_origins, escaped);
+                }
+                Statement::WorkGroupUniformLoad { pointer, .. } => {
+                    mark_escaped(*pointer, local_origins, escaped);
+                }
+                Statement::Call { arguments, .. } => {
+                    for arg in arguments {
+                        mark_escaped(*arg, local_origins, escaped);
+                    }
+                }
+                Statement::RayQuery { query, fun } => {
+                    mark_escaped(*query, local_origins, escaped);
+                    match fun {
+                        RayQueryFunction::Initialize {
+                            acceleration_structure,
+                            descriptor,
+                        } => {
+                            mark_escaped(*acceleration_structure, local_origins, escaped);
+                            mark_escaped(*descriptor, local_origins, escaped);
+                        }
+                        RayQueryFunction::GenerateIntersection { hit_t } => {
+                            mark_escaped(*hit_t, local_origins, escaped);
+                        }
+                        RayQueryFunction::Proceed { .. }
+                        | RayQueryFunction::ConfirmIntersection
+                        | RayQueryFunction::Terminate => {}
+                    }
+                }
+                Statement::SubgroupBallot { predicate, .. } => {
+                    if let Some(p) = predicate {
+                        mark_escaped(*p, local_origins, escaped);
+                    }
+                }
+                Statement::SubgroupCollectiveOperation { argument, .. } => {
+                    mark_escaped(*argument, local_origins, escaped);
+                }
+                Statement::SubgroupGather { mode, argument, .. } => {
+                    mark_escaped(*argument, local_origins, escaped);
+                    match mode {
+                        GatherMode::Broadcast(idx)
+                        | GatherMode::Shuffle(idx)
+                        | GatherMode::ShuffleDown(idx)
+                        | GatherMode::ShuffleUp(idx)
+                        | GatherMode::ShuffleXor(idx)
+                        | GatherMode::QuadBroadcast(idx) => {
+                            mark_escaped(*idx, local_origins, escaped);
+                        }
+                        GatherMode::BroadcastFirst | GatherMode::QuadSwap(_) => {}
+                    }
+                }
+                Statement::CooperativeStore { target, data } => {
+                    mark_escaped(*target, local_origins, escaped);
+                    mark_escaped(data.pointer, local_origins, escaped);
+                    mark_escaped(data.stride, local_origins, escaped);
+                }
+                Statement::RayPipelineFunction(RayPipelineFunction::TraceRay {
+                    acceleration_structure,
+                    descriptor,
+                    payload,
+                }) => {
+                    mark_escaped(*acceleration_structure, local_origins, escaped);
+                    mark_escaped(*descriptor, local_origins, escaped);
+                    mark_escaped(*payload, local_origins, escaped);
+                }
+            }
+        }
+    }
+
+    walk_stmt_escapes(&func.body, local_origins, &mut escaped);
+
+    for (_, local) in func.local_variables.iter() {
+        if let Some(init_h) = local.init
+            && let Some(lv) = local_origins[init_h.index()]
+        {
+            escaped.insert(lv);
+        }
+    }
+
+    escaped
+}
+
+/// Transitive memory & uniformity dependency summary for a single SSA expression handle.
+#[derive(Debug, Clone, Default)]
+struct ExprDeps {
+    /// Sorted, deduplicated non-escaped locals loaded transitively (when `!reads_any_local`).
+    locals: Vec<Handle<LocalVariable>>,
+    /// Conservative overflow flag when > `MAX_TRACKED_LOCALS` distinct locals are read.
+    reads_any_local: bool,
+    /// Reads mutable non-local memory (storage/workgroup/private/escaped-local `Load`,
+    /// `ImageLoad`, `CooperativeLoad`, `WorkGroupUniformLoadResult`, ray query results).
+    reads_mutable_mem: bool,
+    /// Contains a uniformity- or control-flow-sensitive op (`Derivative`, `ImageSample`,
+    /// `Subgroup*`, `CallResult`, `AtomicResult`, etc.).
+    has_cf_sensitive_op: bool,
+    /// WGSL const-expression (pure tree composed solely of `Literal`/`Constant`/`ZeroValue`).
+    is_const_expr: bool,
+}
+
+impl ExprDeps {
+    fn add_local(&mut self, lv: Handle<LocalVariable>) {
+        if self.reads_any_local {
+            return;
+        }
+        if let Err(pos) = self.locals.binary_search(&lv) {
+            if self.locals.len() >= MAX_TRACKED_LOCALS {
+                self.reads_any_local = true;
+                self.locals.clear();
+            } else {
+                self.locals.insert(pos, lv);
+            }
+        }
+    }
+
+    fn merge_child(&mut self, child: &ExprDeps) {
+        self.reads_mutable_mem |= child.reads_mutable_mem;
+        self.has_cf_sensitive_op |= child.has_cf_sensitive_op;
+        self.is_const_expr &= child.is_const_expr;
+        if child.reads_any_local {
+            self.reads_any_local = true;
+            self.locals.clear();
+        } else if !self.reads_any_local {
+            for &lv in &child.locals {
+                self.add_local(lv);
+            }
+        }
+    }
+
+    #[inline]
+    fn reads_local(&self, lv: Handle<LocalVariable>) -> bool {
+        self.reads_any_local || self.locals.binary_search(&lv).is_ok()
+    }
+
+    #[inline]
+    fn reads_any_in(&self, locals: &HashSet<Handle<LocalVariable>>) -> bool {
+        if locals.is_empty() {
+            return false;
+        }
+        self.reads_any_local || self.locals.iter().any(|lv| locals.contains(lv))
+    }
+}
+
+fn compute_single_expr_deps(
+    expr: &Expression,
+    deps: &[ExprDeps],
+    remap: &[Handle<Expression>],
+    local_origins: &[Option<Handle<LocalVariable>>],
+    escaped_locals: &HashSet<Handle<LocalVariable>>,
+    uniform_ptr_origins: &[bool],
+) -> ExprDeps {
+    match expr {
+        Expression::Literal(_) | Expression::Constant(_) | Expression::ZeroValue(_) => ExprDeps {
+            is_const_expr: true,
+            ..Default::default()
+        },
+        Expression::Override(_)
+        | Expression::FunctionArgument(_)
+        | Expression::GlobalVariable(_)
+        | Expression::LocalVariable(_) => ExprDeps::default(),
+        Expression::Load { pointer } => {
+            let ptr = resolve_remap(remap, *pointer);
+            let mut out = ExprDeps::default();
+            out.merge_child(&deps[ptr.index()]);
+            out.is_const_expr = false;
+            match local_origins[ptr.index()] {
+                Some(lv) if !escaped_locals.contains(&lv) => out.add_local(lv),
+                Some(_) => out.reads_mutable_mem = true,
+                None => {
+                    if !uniform_ptr_origins[ptr.index()] {
+                        out.reads_mutable_mem = true;
+                    }
+                }
+            }
+            out
+        }
+        Expression::ImageLoad { .. }
+        | Expression::CooperativeLoad { .. }
+        | Expression::WorkGroupUniformLoadResult { .. }
+        | Expression::RayQueryGetIntersection { .. }
+        | Expression::RayQueryVertexPositions { .. }
+        | Expression::RayQueryProceedResult => {
+            let mut out = ExprDeps::default();
+            visit_expr_children(expr, |c| {
+                let rc = resolve_remap(remap, c);
+                out.merge_child(&deps[rc.index()]);
+            });
+            out.is_const_expr = false;
+            out.reads_mutable_mem = true;
+            out.has_cf_sensitive_op = true;
+            out
+        }
+        Expression::Derivative { .. }
+        | Expression::ImageSample { .. }
+        | Expression::SubgroupBallotResult
+        | Expression::SubgroupOperationResult { .. }
+        | Expression::CallResult(_)
+        | Expression::AtomicResult { .. } => {
+            let mut out = ExprDeps::default();
+            visit_expr_children(expr, |c| {
+                let rc = resolve_remap(remap, c);
+                out.merge_child(&deps[rc.index()]);
+            });
+            out.is_const_expr = false;
+            out.has_cf_sensitive_op = true;
+            out
+        }
+        Expression::ImageQuery { .. }
+        | Expression::CooperativeMultiplyAdd { .. }
+        | Expression::ArrayLength(_) => {
+            let mut out = ExprDeps::default();
+            visit_expr_children(expr, |c| {
+                let rc = resolve_remap(remap, c);
+                out.merge_child(&deps[rc.index()]);
+            });
+            out.is_const_expr = false;
+            out
+        }
+        // Pure value/pointer constructors and arithmetic expressions.
+        Expression::Access { .. }
+        | Expression::AccessIndex { .. }
+        | Expression::Splat { .. }
+        | Expression::Swizzle { .. }
+        | Expression::Compose { .. }
+        | Expression::Unary { .. }
+        | Expression::Binary { .. }
+        | Expression::Select { .. }
+        | Expression::Relational { .. }
+        | Expression::Math { .. }
+        | Expression::As { .. } => {
+            let mut out = ExprDeps {
+                is_const_expr: true,
+                ..Default::default()
+            };
+            visit_expr_children(expr, |c| {
+                let rc = resolve_remap(remap, c);
+                out.merge_child(&deps[rc.index()]);
+            });
+            out
+        }
+    }
+}
+
+/// Precompute conservative WGSL/Tint const-eval guards for forwarding constant expressions into
+/// `Load` sites:
+/// * `used_by_float_bitcast[h]`: `h` feeds `bitcast<f32>(...)` (must reject NaN/Inf/subnormal/-0.0).
+/// * `unsafe_for_const_target[h]`: `h` feeds an op where substituting a constant expression could
+///   trigger WGSL const-eval rejection (`Divide`/`Modulo`/`Shift*`, float arithmetic, `Math`,
+///   `Relational`, `Access.index`, numeric `As { convert: Some(_) }`, or signed `Unary::Negate`).
+fn compute_const_target_guards(
+    func: &Function,
+    resolved: &[Option<TypeInner>],
+) -> (Vec<bool>, Vec<bool>) {
+    let n = func.expressions.len();
+    let mut used_by_float_bitcast = vec![false; n];
+    let mut unsafe_for_const_target = vec![false; n];
+
+    for (h, expr) in func.expressions.iter() {
+        match expr {
+            Expression::Access { index, .. } => {
+                unsafe_for_const_target[index.index()] = true;
+            }
+            Expression::As {
+                expr: inner,
+                kind,
+                convert,
+            } => {
+                if convert.is_some() {
+                    unsafe_for_const_target[inner.index()] = true;
+                } else if *kind == ScalarKind::Float {
+                    used_by_float_bitcast[inner.index()] = true;
+                }
+            }
+            Expression::Binary { op, left, right } => {
+                let is_dangerous_op = matches!(
+                    op,
+                    BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                        | BinaryOperator::ShiftLeft
+                        | BinaryOperator::ShiftRight
+                );
+                let scalar_kind = resolved[h.index()]
+                    .as_ref()
+                    .and_then(scalar_of_type_inner)
+                    .map(|s| s.kind);
+                let is_float_or_unknown_arith = matches!(
+                    op,
+                    BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply
+                ) && !matches!(
+                    scalar_kind,
+                    Some(ScalarKind::Uint)
+                );
+                if is_dangerous_op || is_float_or_unknown_arith {
+                    unsafe_for_const_target[left.index()] = true;
+                    unsafe_for_const_target[right.index()] = true;
+                }
+            }
+            Expression::Unary {
+                op: UnaryOperator::Negate,
+                expr: inner,
+            } => {
+                unsafe_for_const_target[inner.index()] = true;
+            }
+            Expression::Math { .. } | Expression::Relational { .. } => {
+                visit_expr_children(expr, |c| {
+                    unsafe_for_const_target[c.index()] = true;
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Propagate `unsafe_for_const_target` backward through transparent value wrappers so a
+    // constant forwarded into e.g. `vec2(x, 1.0)` feeding `sqrt(...)` is also protected.
+    let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
+    for h in handles.into_iter().rev() {
+        if !unsafe_for_const_target[h.index()] {
+            continue;
+        }
+        match &func.expressions[h] {
+            Expression::Compose { .. }
+            | Expression::Splat { .. }
+            | Expression::Swizzle { .. }
+            | Expression::AccessIndex { .. }
+            | Expression::Select { .. }
+            | Expression::As { .. } => {
+                visit_expr_children(&func.expressions[h], |c| {
+                    unsafe_for_const_target[c.index()] = true;
+                });
+            }
+            _ => {}
+        }
+    }
+
+    (used_by_float_bitcast, unsafe_for_const_target)
+}
+
+#[inline]
+fn can_forward_to_load(
+    h_load: Handle<Expression>,
+    target: Handle<Expression>,
+    func: &Function,
+    deps: &[ExprDeps],
+    used_by_float_bitcast: &[bool],
+    unsafe_for_const_target: &[bool],
+) -> bool {
+    if !deps[target.index()].is_const_expr {
+        return true;
+    }
+    let idx = h_load.index();
+    if unsafe_for_const_target[idx] {
+        return false;
+    }
+    if used_by_float_bitcast[idx] {
+        match func.expressions[target] {
+            Expression::Literal(Literal::U32(u)) => is_safe_wgsl_f32_literal(f32::from_bits(u)),
+            Expression::Literal(Literal::I32(i)) => {
+                is_safe_wgsl_f32_literal(f32::from_bits(i as u32))
+            }
+            _ => false,
+        }
+    } else {
+        true
+    }
+}
+
+/// Summary of writes and side effects inside a nested control-flow block (`Block`/`If`/`Loop`/`Switch`).
+#[derive(Debug, Default)]
+struct BlockEffects {
+    written_locals: HashSet<Handle<LocalVariable>>,
+    mutates_mem: bool,
+}
+
+fn collect_block_effects(
+    block: &Block,
+    local_origins: &[Option<Handle<LocalVariable>>],
+    escaped_locals: &HashSet<Handle<LocalVariable>>,
+    out: &mut BlockEffects,
+) {
+    for stmt in block.iter() {
+        match stmt {
+            Statement::Emit(_)
+            | Statement::Break
+            | Statement::Continue
+            | Statement::Return { .. }
+            | Statement::Kill
+            | Statement::SubgroupBallot { .. }
+            | Statement::SubgroupCollectiveOperation { .. }
+            | Statement::SubgroupGather { .. } => {}
+            Statement::Block(inner) => {
+                collect_block_effects(inner, local_origins, escaped_locals, out);
+            }
+            Statement::If { accept, reject, .. } => {
+                collect_block_effects(accept, local_origins, escaped_locals, out);
+                collect_block_effects(reject, local_origins, escaped_locals, out);
+            }
+            Statement::Switch { cases, .. } => {
+                for case in cases {
+                    collect_block_effects(&case.body, local_origins, escaped_locals, out);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                collect_block_effects(body, local_origins, escaped_locals, out);
+                collect_block_effects(continuing, local_origins, escaped_locals, out);
+            }
+            Statement::Store { pointer, .. } => match local_origins[pointer.index()] {
+                Some(lv) if !escaped_locals.contains(&lv) => {
+                    out.written_locals.insert(lv);
+                }
+                _ => {
+                    out.mutates_mem = true;
+                }
+            },
+            Statement::ImageStore { .. }
+            | Statement::ImageAtomic { .. }
+            | Statement::Atomic { .. }
+            | Statement::WorkGroupUniformLoad { .. }
+            | Statement::Call { .. }
+            | Statement::RayQuery { .. }
+            | Statement::RayPipelineFunction(_)
+            | Statement::CooperativeStore { .. }
+            | Statement::ControlBarrier(_)
+            | Statement::MemoryBarrier(_) => {
+                out.mutates_mem = true;
+            }
+        }
+    }
+}
+
+fn invalidate_known_for_effects(
+    known_local: &mut HashMap<Handle<LocalVariable>, Handle<Expression>>,
+    effects: &BlockEffects,
+    remap: &[Handle<Expression>],
+    deps: &[ExprDeps],
+) {
+    known_local.retain(|&lv, &mut val| {
+        if effects.written_locals.contains(&lv) {
+            return false;
+        }
+        let d = &deps[resolve_remap(remap, val).index()];
+        if d.has_cf_sensitive_op {
+            return false;
+        }
+        if effects.mutates_mem && d.reads_mutable_mem {
+            return false;
+        }
+        if d.reads_any_in(&effects.written_locals) {
+            return false;
+        }
+        true
+    });
+}
+
+struct ForwardContext<'a> {
+    func: &'a Function,
+    local_origins: &'a [Option<Handle<LocalVariable>>],
+    escaped_locals: &'a HashSet<Handle<LocalVariable>>,
+    uniform_ptr_origins: &'a [bool],
+    used_by_float_bitcast: &'a [bool],
+    unsafe_for_const_target: &'a [bool],
+    deps: Vec<ExprDeps>,
+    remap: Vec<Handle<Expression>>,
+    forwarded_loads: Vec<Handle<Expression>>,
+}
+
+fn walk_forward_block(
+    block: &Block,
+    known_local: &mut HashMap<Handle<LocalVariable>, Handle<Expression>>,
+    fctx: &mut ForwardContext<'_>,
+    stats: &mut IrOptStats,
+) {
+    for stmt in block.iter() {
+        match stmt {
+            Statement::Emit(range) => {
+                for h in range.clone() {
+                    let expr = &fctx.func.expressions[h];
+                    // Dynamically recompute deps using already-forwarded children.
+                    let updated_deps = compute_single_expr_deps(
+                        expr,
+                        &fctx.deps,
+                        &fctx.remap,
+                        fctx.local_origins,
+                        fctx.escaped_locals,
+                        fctx.uniform_ptr_origins,
+                    );
+                    fctx.deps[h.index()] = updated_deps;
+
+                    if let Expression::Load { pointer } = *expr {
+                        let ptr = resolve_remap(&fctx.remap, pointer);
+                        if let Expression::LocalVariable(lv) = fctx.func.expressions[ptr]
+                            && !fctx.escaped_locals.contains(&lv)
+                        {
+                            if let Some(&candidate) = known_local.get(&lv) {
+                                let target = resolve_remap(&fctx.remap, candidate);
+                                if target != h
+                                    && target.index() < h.index()
+                                    && can_forward_to_load(
+                                        h,
+                                        target,
+                                        fctx.func,
+                                        &fctx.deps,
+                                        fctx.used_by_float_bitcast,
+                                        fctx.unsafe_for_const_target,
+                                    )
+                                {
+                                    fctx.remap[h.index()] = target;
+                                    fctx.deps[h.index()] = fctx.deps[target.index()].clone();
+                                    fctx.forwarded_loads.push(h);
+                                    stats.locals_forwarded += 1;
+                                }
+                            } else {
+                                // Record this load for straight-line load-to-load reuse until `lv` is written.
+                                known_local.insert(lv, h);
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::Store { pointer, value } => {
+                let ptr = resolve_remap(&fctx.remap, *pointer);
+                let val = resolve_remap(&fctx.remap, *value);
+                match fctx.local_origins[ptr.index()] {
+                    Some(lv) if !fctx.escaped_locals.contains(&lv) => {
+                        // Invalidate `lv` and any tracked entry whose expression reads `lv`.
+                        known_local.retain(|&k, &mut v| {
+                            k != lv
+                                && !fctx.deps[resolve_remap(&fctx.remap, v).index()].reads_local(lv)
+                        });
+                        // Only record whole-local stores whose value does not self-read `lv`.
+                        if matches!(fctx.func.expressions[ptr], Expression::LocalVariable(_))
+                            && !fctx.deps[val.index()].reads_local(lv)
+                        {
+                            known_local.insert(lv, val);
+                        }
+                    }
+                    _ => {
+                        // Non-local or escaped-local store: invalidate all mutable-memory-dependent entries.
+                        known_local.retain(|_, &mut v| {
+                            !fctx.deps[resolve_remap(&fctx.remap, v).index()].reads_mutable_mem
+                        });
+                    }
+                }
+            }
+            Statement::Call { .. }
+            | Statement::Atomic { .. }
+            | Statement::ImageStore { .. }
+            | Statement::ImageAtomic { .. }
+            | Statement::RayQuery { .. }
+            | Statement::RayPipelineFunction(_)
+            | Statement::CooperativeStore { .. } => {
+                known_local.retain(|_, &mut v| {
+                    !fctx.deps[resolve_remap(&fctx.remap, v).index()].reads_mutable_mem
+                });
+            }
+            Statement::ControlBarrier(_)
+            | Statement::MemoryBarrier(_)
+            | Statement::WorkGroupUniformLoad { .. } => {
+                known_local.retain(|_, &mut v| {
+                    let d = &fctx.deps[resolve_remap(&fctx.remap, v).index()];
+                    !d.reads_mutable_mem && !d.has_cf_sensitive_op
+                });
+            }
+            Statement::Kill => {
+                known_local.retain(|_, &mut v| {
+                    !fctx.deps[resolve_remap(&fctx.remap, v).index()].has_cf_sensitive_op
+                });
+            }
+            Statement::Break | Statement::Continue | Statement::Return { .. } => {
+                known_local.clear();
+            }
+            Statement::Block(inner) => {
+                let mut inner_known = HashMap::new();
+                walk_forward_block(inner, &mut inner_known, fctx, stats);
+                let mut effects = BlockEffects::default();
+                collect_block_effects(inner, fctx.local_origins, fctx.escaped_locals, &mut effects);
+                invalidate_known_for_effects(known_local, &effects, &fctx.remap, &fctx.deps);
+            }
+            Statement::If { accept, reject, .. } => {
+                let mut accept_known = HashMap::new();
+                walk_forward_block(accept, &mut accept_known, fctx, stats);
+                let mut reject_known = HashMap::new();
+                walk_forward_block(reject, &mut reject_known, fctx, stats);
+                let mut effects = BlockEffects::default();
+                collect_block_effects(
+                    accept,
+                    fctx.local_origins,
+                    fctx.escaped_locals,
+                    &mut effects,
+                );
+                collect_block_effects(
+                    reject,
+                    fctx.local_origins,
+                    fctx.escaped_locals,
+                    &mut effects,
+                );
+                invalidate_known_for_effects(known_local, &effects, &fctx.remap, &fctx.deps);
+            }
+            Statement::Switch { cases, .. } => {
+                let mut effects = BlockEffects::default();
+                for case in cases {
+                    let mut case_known = HashMap::new();
+                    walk_forward_block(&case.body, &mut case_known, fctx, stats);
+                    collect_block_effects(
+                        &case.body,
+                        fctx.local_origins,
+                        fctx.escaped_locals,
+                        &mut effects,
+                    );
+                }
+                invalidate_known_for_effects(known_local, &effects, &fctx.remap, &fctx.deps);
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                let mut body_known = HashMap::new();
+                walk_forward_block(body, &mut body_known, fctx, stats);
+                let mut cont_known = HashMap::new();
+                walk_forward_block(continuing, &mut cont_known, fctx, stats);
+                let mut effects = BlockEffects::default();
+                collect_block_effects(body, fctx.local_origins, fctx.escaped_locals, &mut effects);
+                collect_block_effects(
+                    continuing,
+                    fctx.local_origins,
+                    fctx.escaped_locals,
+                    &mut effects,
+                );
+                invalidate_known_for_effects(known_local, &effects, &fctx.remap, &fctx.deps);
+            }
+            Statement::SubgroupBallot { .. }
+            | Statement::SubgroupCollectiveOperation { .. }
+            | Statement::SubgroupGather { .. } => {}
+        }
+    }
+}
+
+fn forward_local_loads(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mut IrOptStats) {
+    let n = func.expressions.len();
+    if n == 0 || func.local_variables.is_empty() {
+        return;
+    }
+
+    let local_origins = compute_local_ptr_origins(func);
+    let escaped_locals = compute_escaped_locals(func, &local_origins);
+    let uniform_ptr_origins = compute_uniform_ptr_origins(ctx, func);
+    let resolved = infer_all_expr_types(ctx, func);
+    let (used_by_float_bitcast, unsafe_for_const_target) =
+        compute_const_target_guards(func, &resolved);
+
+    let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
+    let remap_init = handles.clone();
+    let mut deps: Vec<ExprDeps> = vec![ExprDeps::default(); n];
+    for (h, expr) in func.expressions.iter() {
+        deps[h.index()] = compute_single_expr_deps(
+            expr,
+            &deps,
+            &remap_init,
+            &local_origins,
+            &escaped_locals,
+            &uniform_ptr_origins,
+        );
+    }
+
+    // Seed known values from non-escaped `LocalVariable.init` (strictly pre-emitted handles so
+    // forwarding never references an unemitted expression).
+    let mut known_local: HashMap<Handle<LocalVariable>, Handle<Expression>> = HashMap::new();
+    for (lv, local) in func.local_variables.iter() {
+        if !escaped_locals.contains(&lv)
+            && let Some(init_h) = local.init
+            && !is_emittable_expr(&func.expressions[init_h])
+        {
+            known_local.insert(lv, init_h);
+        }
+    }
+
+    let (remap, forwarded_loads) = {
+        let mut fctx = ForwardContext {
+            func,
+            local_origins: &local_origins,
+            escaped_locals: &escaped_locals,
+            uniform_ptr_origins: &uniform_ptr_origins,
+            used_by_float_bitcast: &used_by_float_bitcast,
+            unsafe_for_const_target: &unsafe_for_const_target,
+            deps,
+            remap: remap_init,
+            forwarded_loads: Vec::new(),
+        };
+        walk_forward_block(&func.body, &mut known_local, &mut fctx, stats);
+        (fctx.remap, fctx.forwarded_loads)
+    };
+
+    if forwarded_loads.is_empty() {
+        return;
+    }
+
+    // Flatten remap chains to their final root handles.
+    let flat_remap: Vec<Handle<Expression>> = handles
+        .iter()
+        .map(|&h| resolve_remap(&remap, h))
+        .collect();
+
+    for (_, expr) in func.expressions.iter_mut() {
+        remap_expr_children(expr, |c| flat_remap[c.index()]);
+    }
+    remap_block_exprs(&mut func.body, false, &|h| flat_remap[h.index()]);
+    for (_, local) in func.local_variables.iter_mut() {
+        if let Some(ref mut init_h) = local.init {
+            *init_h = flat_remap[init_h.index()];
+        }
+    }
+
+    // Neutralize forwarded `Load` handles so `prune_dead_locals` and
+    // `compact_live_expressions_and_emits` no longer see them as live loads.
+    for h in forwarded_loads {
+        func.expressions[h] = Expression::Literal(Literal::Bool(false));
+        func.named_expressions.shift_remove(&h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 3: Intra-block Common Subexpression Elimination (CSE) (#2164)
+// ---------------------------------------------------------------------------
+
+/// Canonical operand identity for CSE keys: merges duplicate pre-emitted handles (`Literal`,
+/// `Constant`, `Override`, `ZeroValue`, `FunctionArgument`, `GlobalVariable`, `LocalVariable`)
+/// while preserving bit-exact IEEE-754 float representations (`-0.0` != `+0.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum CseOperand {
+    Handle(Handle<Expression>),
+    LitF64(u64),
+    LitF32(u32),
+    LitF16(u16),
+    LitU32(u32),
+    LitI32(i32),
+    LitU16(u16),
+    LitI16(i16),
+    LitU64(u64),
+    LitI64(i64),
+    LitBool(bool),
+    LitAbstractInt(i64),
+    LitAbstractFloat(u64),
+    Constant(Handle<Constant>),
+    Override(Handle<Override>),
+    ZeroValue(Handle<Type>),
+    FunctionArgument(u32),
+    GlobalVariable(Handle<GlobalVariable>),
+    LocalVariable(Handle<LocalVariable>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CseKey {
+    Access {
+        base: CseOperand,
+        index: CseOperand,
+    },
+    AccessIndex {
+        base: CseOperand,
+        index: u32,
+    },
+    Splat {
+        size: VectorSize,
+        value: CseOperand,
+    },
+    Swizzle {
+        size: VectorSize,
+        vector: CseOperand,
+        pattern: [u8; 4],
+    },
+    Compose {
+        ty: Handle<Type>,
+        components: Vec<CseOperand>,
+    },
+    Unary {
+        op: UnaryOperator,
+        expr: CseOperand,
+    },
+    Binary {
+        op: BinaryOperator,
+        left: CseOperand,
+        right: CseOperand,
+    },
+    Select {
+        condition: CseOperand,
+        accept: CseOperand,
+        reject: CseOperand,
+    },
+    Relational {
+        fun: RelationalFunction,
+        argument: CseOperand,
+    },
+    Math {
+        fun: MathFunction,
+        arg: CseOperand,
+        arg1: Option<CseOperand>,
+        arg2: Option<CseOperand>,
+        arg3: Option<CseOperand>,
+    },
+    As {
+        expr: CseOperand,
+        kind: ScalarKind,
+        convert: Option<u8>,
+    },
+}
+
+fn canonicalize_cse_operand(func: &Function, h: Handle<Expression>) -> CseOperand {
+    match func.expressions[h] {
+        Expression::Literal(lit) => match lit {
+            Literal::F64(v) => CseOperand::LitF64(v.to_bits()),
+            Literal::F32(v) => CseOperand::LitF32(v.to_bits()),
+            Literal::F16(v) => CseOperand::LitF16(v.to_bits()),
+            Literal::U32(v) => CseOperand::LitU32(v),
+            Literal::I32(v) => CseOperand::LitI32(v),
+            Literal::U16(v) => CseOperand::LitU16(v),
+            Literal::I16(v) => CseOperand::LitI16(v),
+            Literal::U64(v) => CseOperand::LitU64(v),
+            Literal::I64(v) => CseOperand::LitI64(v),
+            Literal::Bool(v) => CseOperand::LitBool(v),
+            Literal::AbstractInt(v) => CseOperand::LitAbstractInt(v),
+            Literal::AbstractFloat(v) => CseOperand::LitAbstractFloat(v.to_bits()),
+        },
+        Expression::Constant(c) => CseOperand::Constant(c),
+        Expression::Override(o) => CseOperand::Override(o),
+        Expression::ZeroValue(ty) => CseOperand::ZeroValue(ty),
+        Expression::FunctionArgument(idx) => CseOperand::FunctionArgument(idx),
+        Expression::GlobalVariable(g) => CseOperand::GlobalVariable(g),
+        Expression::LocalVariable(lv) => CseOperand::LocalVariable(lv),
+        _ => CseOperand::Handle(h),
+    }
+}
+
+/// Returns `true` iff `(left op right) == (right op left)` is provably bit-exact and type-preserving
+/// (strictly matching integer or boolean scalar/vector operands; never floats or matrices).
+fn is_safe_commutative_cse_op(
+    op: BinaryOperator,
+    left: Handle<Expression>,
+    right: Handle<Expression>,
+    resolved: &[Option<TypeInner>],
+) -> bool {
+    let (Some(lt), Some(rt)) = (resolved[left.index()].as_ref(), resolved[right.index()].as_ref())
+    else {
+        return false;
+    };
+    if lt != rt {
+        return false;
+    }
+    let Some((_, scalar)) = value_shape(lt) else {
+        return false;
+    };
+    match op {
+        BinaryOperator::Add
+        | BinaryOperator::Multiply
+        | BinaryOperator::And
+        | BinaryOperator::InclusiveOr
+        | BinaryOperator::ExclusiveOr => matches!(scalar.kind, ScalarKind::Uint | ScalarKind::Sint),
+        BinaryOperator::Equal | BinaryOperator::NotEqual => {
+            matches!(
+                scalar.kind,
+                ScalarKind::Uint | ScalarKind::Sint | ScalarKind::Bool
+            )
+        }
+        _ => false,
+    }
+}
+
+fn build_cse_key(
+    h: Handle<Expression>,
+    func: &Function,
+    resolved: &[Option<TypeInner>],
+    remap: &[Handle<Expression>],
+) -> Option<CseKey> {
+    let op_of = |c: Handle<Expression>| canonicalize_cse_operand(func, resolve_remap(remap, c));
+    match &func.expressions[h] {
+        // Value-typed `Access`/`AccessIndex` only — never CSE pointer / `ValuePointer` accesses,
+        // because baking a `ValuePointer` (e.g. `&vec.x`) into a WGSL `let` is illegal in WGSL.
+        Expression::Access { base, index } => {
+            match resolved[h.index()].as_ref()? {
+                TypeInner::Pointer { .. } | TypeInner::ValuePointer { .. } => return None,
+                _ => {}
+            }
+            Some(CseKey::Access {
+                base: op_of(*base),
+                index: op_of(*index),
+            })
+        }
+        Expression::AccessIndex { base, index } => {
+            match resolved[h.index()].as_ref()? {
+                TypeInner::Pointer { .. } | TypeInner::ValuePointer { .. } => return None,
+                _ => {}
+            }
+            Some(CseKey::AccessIndex {
+                base: op_of(*base),
+                index: *index,
+            })
+        }
+        Expression::Splat { size, value } => Some(CseKey::Splat {
+            size: *size,
+            value: op_of(*value),
+        }),
+        Expression::Swizzle {
+            size,
+            vector,
+            pattern,
+        } => {
+            // Canonicalize unused trailing pattern lanes past `size`.
+            let mut norm_pattern = [0u8; 4];
+            let count = *size as usize;
+            for i in 0..count {
+                norm_pattern[i] = match pattern[i] {
+                    SwizzleComponent::X => 0,
+                    SwizzleComponent::Y => 1,
+                    SwizzleComponent::Z => 2,
+                    SwizzleComponent::W => 3,
+                };
+            }
+            Some(CseKey::Swizzle {
+                size: *size,
+                vector: op_of(*vector),
+                pattern: norm_pattern,
+            })
+        }
+        Expression::Compose { ty, components } => Some(CseKey::Compose {
+            ty: *ty,
+            components: components.iter().map(|&c| op_of(c)).collect(),
+        }),
+        Expression::Unary { op, expr } => Some(CseKey::Unary {
+            op: *op,
+            expr: op_of(*expr),
+        }),
+        Expression::Binary { op, left, right } => {
+            let rl = resolve_remap(remap, *left);
+            let rr = resolve_remap(remap, *right);
+            let lop = canonicalize_cse_operand(func, rl);
+            let rop = canonicalize_cse_operand(func, rr);
+            let (a, b) = if is_safe_commutative_cse_op(*op, rl, rr, resolved) && rop < lop {
+                (rop, lop)
+            } else {
+                (lop, rop)
+            };
+            Some(CseKey::Binary {
+                op: *op,
+                left: a,
+                right: b,
+            })
+        }
+        Expression::Select {
+            condition,
+            accept,
+            reject,
+        } => Some(CseKey::Select {
+            condition: op_of(*condition),
+            accept: op_of(*accept),
+            reject: op_of(*reject),
+        }),
+        Expression::Relational { fun, argument } => Some(CseKey::Relational {
+            fun: *fun,
+            argument: op_of(*argument),
+        }),
+        Expression::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        } => Some(CseKey::Math {
+            fun: *fun,
+            arg: op_of(*arg),
+            arg1: arg1.map(op_of),
+            arg2: arg2.map(op_of),
+            arg3: arg3.map(op_of),
+        }),
+        Expression::As {
+            expr,
+            kind,
+            convert,
+        } => Some(CseKey::As {
+            expr: op_of(*expr),
+            kind: *kind,
+            convert: *convert,
+        }),
+        // Never CSE loads, texture ops, derivatives, statement results, or pre-emitted handles.
+        _ => None,
+    }
+}
+
+struct CseContext<'a> {
+    func: &'a Function,
+    resolved: &'a [Option<TypeInner>],
+    table: HashMap<CseKey, Handle<Expression>>,
+    undo_stack: Vec<CseKey>,
+    remap: Vec<Handle<Expression>>,
+    cse_dropped: Vec<Handle<Expression>>,
+}
+
+impl CseContext<'_> {
+    fn walk_scoped(&mut self, block: &Block, stats: &mut IrOptStats) {
+        let mark = self.undo_stack.len();
+        walk_cse_block(block, self, stats);
+        while self.undo_stack.len() > mark {
+            if let Some(key) = self.undo_stack.pop() {
+                self.table.remove(&key);
+            }
+        }
+    }
+}
+
+fn walk_cse_block(block: &Block, cctx: &mut CseContext<'_>, stats: &mut IrOptStats) {
+    for stmt in block.iter() {
+        match stmt {
+            Statement::Emit(range) => {
+                for h in range.clone() {
+                    if let Some(key) = build_cse_key(h, cctx.func, cctx.resolved, &cctx.remap) {
+                        if let Some(&canon) = cctx.table.get(&key) {
+                            if canon != h && canon.index() < h.index() {
+                                cctx.remap[h.index()] = canon;
+                                cctx.cse_dropped.push(h);
+                                stats.cse_eliminated += 1;
+                            }
+                        } else {
+                            cctx.table.insert(key.clone(), h);
+                            cctx.undo_stack.push(key);
+                        }
+                    }
+                }
+            }
+            Statement::Block(inner) => {
+                cctx.walk_scoped(inner, stats);
+            }
+            Statement::If { accept, reject, .. } => {
+                cctx.walk_scoped(accept, stats);
+                cctx.walk_scoped(reject, stats);
+            }
+            Statement::Switch { cases, .. } => {
+                for case in cases {
+                    cctx.walk_scoped(&case.body, stats);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                cctx.walk_scoped(body, stats);
+                cctx.walk_scoped(continuing, stats);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn eliminate_common_subexpressions(
+    ctx: &ModuleContext<'_>,
+    func: &mut Function,
+    stats: &mut IrOptStats,
+) {
+    let n = func.expressions.len();
+    if n == 0 {
+        return;
+    }
+
+    let resolved = infer_all_expr_types(ctx, func);
+    let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
+
+    let (remap, cse_dropped) = {
+        let mut cctx = CseContext {
+            func,
+            resolved: &resolved,
+            table: HashMap::new(),
+            undo_stack: Vec::new(),
+            remap: handles.clone(),
+            cse_dropped: Vec::new(),
+        };
+        walk_cse_block(&func.body, &mut cctx, stats);
+        (cctx.remap, cctx.cse_dropped)
+    };
+
+    if cse_dropped.is_empty() {
+        return;
+    }
+
+    let flat_remap: Vec<Handle<Expression>> = handles
+        .iter()
+        .map(|&h| resolve_remap(&remap, h))
+        .collect();
+
+    for (_, expr) in func.expressions.iter_mut() {
+        remap_expr_children(expr, |c| flat_remap[c.index()]);
+    }
+    remap_block_exprs(&mut func.body, false, &|h| flat_remap[h.index()]);
+    for (_, local) in func.local_variables.iter_mut() {
+        if let Some(ref mut init_h) = local.init {
+            *init_h = flat_remap[init_h.index()];
+        }
+    }
+    for h in cse_dropped {
+        func.named_expressions.shift_remove(&h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 4: Dead local-variable pruning
 // ---------------------------------------------------------------------------
 
 /// Compute, for every expression handle `h`, whether it is a pointer derived strictly from a
@@ -1688,22 +2989,34 @@ fn compute_local_ptr_origins(func: &Function) -> Vec<Option<Handle<LocalVariable
     origins
 }
 
-/// Compute `transitively_pure[h]`: `true` iff `h` and all its transitive operands are pure.
-fn compute_transitively_pure(func: &Function) -> Vec<bool> {
-    let mut pure = vec![false; func.expressions.len()];
+/// Compute `drop_safe[h]`: `true` iff `h` is composed exclusively of pure expression nodes and
+/// `Load`s of non-escaped `LocalVariable`s (100% side-effect-free, non-trapping, non-aliased
+/// function-scope reads), so a `Store` to an otherwise dead local can be safely dropped.
+fn compute_drop_safe_exprs(
+    func: &Function,
+    local_origins: &[Option<Handle<LocalVariable>>],
+    escaped_locals: &HashSet<Handle<LocalVariable>>,
+) -> Vec<bool> {
+    let mut safe = vec![false; func.expressions.len()];
     for (h, expr) in func.expressions.iter() {
-        if !is_pure_expr_node(expr) {
+        let node_safe = match expr {
+            Expression::Load { pointer } => {
+                local_origins[pointer.index()].is_some_and(|lv| !escaped_locals.contains(&lv))
+            }
+            other => is_pure_expr_node(other),
+        };
+        if !node_safe {
             continue;
         }
-        let mut all_children_pure = true;
+        let mut all_children_safe = true;
         visit_expr_children(expr, |c| {
-            if !pure[c.index()] {
-                all_children_pure = false;
+            if !safe[c.index()] {
+                all_children_safe = false;
             }
         });
-        pure[h.index()] = all_children_pure;
+        safe[h.index()] = all_children_safe;
     }
-    pure
+    safe
 }
 
 /// Mark every `LocalVariable` that MUST be kept alive:
@@ -2116,8 +3429,9 @@ fn prune_dead_locals(func: &mut Function, stats: &mut IrOptStats) {
     }
 
     let local_origins = compute_local_ptr_origins(func);
-    let transitively_pure = compute_transitively_pure(func);
-    let live_locals = collect_live_locals(func, &local_origins, &transitively_pure);
+    let escaped_locals = compute_escaped_locals(func, &local_origins);
+    let drop_safe = compute_drop_safe_exprs(func, &local_origins, &escaped_locals);
+    let live_locals = collect_live_locals(func, &local_origins, &drop_safe);
 
     if live_locals.len() == func.local_variables.len() {
         return;

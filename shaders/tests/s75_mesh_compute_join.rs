@@ -579,8 +579,11 @@ fn s75_mesh_lds_atomics_wave_cross_lane_mbcnt_and_64bit_salu_lowering() {
     w.push(enc_sop1(0x1E, 34, 128 + 37)); // s_bitset1_b64 s[34:35], 37
     w.push(enc_sop1(0x2D, 44, 34)); // s_quadmask_b64 s[44:45], s[34:35]
 
-    // Fold results into exported vertex & primitive words
+    // Fold results into exported vertex & primitive words (including s40/s42 so
+    // `countTrailingZeros`/`countLeadingZeros` remain live after dead-local pruning).
     w.push(enc_sop2(0x00, 46, 30, 39));
+    w.push(enc_sop2(0x00, 46, 46, 40));
+    w.push(enc_sop2(0x00, 46, 46, 42));
     w.push(enc_sop2(0x00, 46, 46, 44));
     w.push(enc_vop2(0x03, 8, 46, 8));
     w.push(enc_vop2(0x03, 9, 256 + 10, 9));

@@ -179,16 +179,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 
     // Count surviving bitcast<...> calls in the emitted WGSL:
-    // Only mismatch_1 (`bitcast<f32>(...)`) and mismatch_2 (`bitcast<i32>(bitcast<f32>(...))`)
-    // should remain (3 bitcasts total instead of 11).
+    // Only mismatch_1 (`bitcast<f32>(u)`) and mismatch_2 (`bitcast<i32>(_e)`), with intra-block
+    // CSE sharing the single `bitcast<f32>(u)` between both consumers (2 bitcasts total instead of 11).
     let bitcast_count = wgsl.matches("bitcast<").count();
     assert_eq!(
-        bitcast_count, 3,
-        "only the mismatched bitcasts should survive (got {bitcast_count}):\n{wgsl}"
+        bitcast_count, 2,
+        "only the deduplicated mismatched bitcasts should survive (got {bitcast_count}):\n{wgsl}"
     );
     assert!(
-        wgsl.contains("bitcast<i32>(bitcast<f32>("),
+        wgsl.contains("bitcast<f32>(u)") && wgsl.contains("bitcast<i32>("),
         "mismatched u32->f32->i32 chain must be preserved:\n{wgsl}"
+    );
+    assert!(
+        stats.cse_eliminated >= 1,
+        "expected CSE to deduplicate shared bitcast<f32>(u), got {stats:?}"
     );
     // All 5 @group/@binding globals must remain intact.
     for b in 0..5 {
@@ -1225,11 +1229,13 @@ fn ir_opt_stats_helpers_merge_and_zero_check() {
         bitcasts_cancelled: 3,
         constants_folded: 2,
         identities_simplified: 5,
+        locals_forwarded: 6,
+        cse_eliminated: 7,
         dead_locals_removed: 1,
         dead_emits_trimmed: 4,
     };
     assert!(!b.is_zero());
-    assert_eq!(b.total_changes(), 15);
+    assert_eq!(b.total_changes(), 28);
     a.merge_from(b);
     assert_eq!(a, b);
 }

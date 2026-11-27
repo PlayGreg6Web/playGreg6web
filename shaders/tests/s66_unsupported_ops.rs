@@ -300,6 +300,10 @@ fn s66_vop1_f16_norm_frexp_ffbh_and_vop3_promoted_ops() {
     words.extend_from_slice(&enc_vop3(0x180 + 0x59, 25, 242, 0, 0, false, 0, 0, 0)); // v_frexp_mant_f16(1.0)
     words.extend_from_slice(&enc_vop3(0x180 + 0x5A, 26, 242, 0, 0, false, 0, 0, 0)); // v_frexp_exp_i16_f16(1.0)
 
+    // Observe v5 (`v_ffbh_u32`) and v6 (`v_ffbl_b32`) via v9 so dead-local pruning keeps their
+    // `countLeadingZeros`/`countTrailingZeros` lowering live in the exported fragment output.
+    words.push(enc_vop2(0x03, 9, 256 + 5, 9));
+    words.push(enc_vop2(0x03, 9, 256 + 6, 9));
     words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [9, 17, 19, 20]));
     words.push(enc_sopp(0x01, 0));
 
@@ -477,9 +481,10 @@ fn s66_constant_fold_semantics_and_determinism() {
         "expected v_frexp_exp_i32_f32(4.0) == 3; WGSL:\n{}",
         out1.wgsl
     );
+    // v_frexp_mant_f32(4.0) == 0.5f (0x3F00_0000 = 1056964608u), forwarded into LDS store.
     assert!(
-        out1.wgsl.contains("v_7_ = 0.5f;"),
-        "expected v_frexp_mant_f32(4.0) == 0.5f; WGSL:\n{}",
+        out1.wgsl.contains("v_7_ = 0.5f;") || out1.wgsl.contains("= 1056964608u;"),
+        "expected v_frexp_mant_f32(4.0) == 0.5f (1056964608u); WGSL:\n{}",
         out1.wgsl
     );
     assert!(
@@ -487,8 +492,9 @@ fn s66_constant_fold_semantics_and_determinism() {
         "expected v_dot4_u32_u8 == 40u; WGSL:\n{}",
         out1.wgsl
     );
+    // s_absdiff_i32(-5, 3) == 8u, forwarded directly into the LDS store.
     assert!(
-        out1.wgsl.contains("s_4_ = 8u;"),
+        out1.wgsl.contains("s_4_ = 8u;") || out1.wgsl.contains("] = 8u;"),
         "expected s_absdiff_i32(-5, 3) == 8u; WGSL:\n{}",
         out1.wgsl
     );
