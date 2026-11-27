@@ -2088,6 +2088,8 @@ export function bootstrapPlayGta6App(options = {}) {
 
   let latestFastBootPlan = null;
   let latestQuotaEviction = null;
+  let latestIoWorkerStats = null;
+  let latestRuntimeDiagnostics = null;
   let lastJsHeapSampleAtMs = -Infinity;
   let jsHeapNotifiedToHud = false;
   let lastFramePresentedForwardAtMs = -Infinity;
@@ -3392,6 +3394,28 @@ export function bootstrapPlayGta6App(options = {}) {
         });
       } catch {
         // Ignore audio telemetry sync errors.
+      }
+    }
+
+    if (
+      latestIoWorkerStats &&
+      typeof crashReporter.setIoWorkerStats === 'function'
+    ) {
+      try {
+        crashReporter.setIoWorkerStats(latestIoWorkerStats);
+      } catch {
+        // Ignore IO worker stats sync errors.
+      }
+    }
+
+    if (
+      latestRuntimeDiagnostics &&
+      typeof crashReporter.setRuntimeDiagnostics === 'function'
+    ) {
+      try {
+        crashReporter.setRuntimeDiagnostics(latestRuntimeDiagnostics);
+      } catch {
+        // Ignore runtime diagnostics sync errors.
       }
     }
   }
@@ -5372,7 +5396,45 @@ export function bootstrapPlayGta6App(options = {}) {
     if (ingestAudioRingTelemetry(data, { allowGenericAttached: false })) {
       updated = true;
     }
+    if (ingestIoWorkerTelemetry(data)) {
+      updated = true;
+    }
 
+    return updated;
+  }
+
+  function ingestIoWorkerTelemetry(data) {
+    if (!data || typeof data !== 'object') {
+      return false;
+    }
+    let updated = false;
+    const rawIo =
+      (data.ioWorkerStats && typeof data.ioWorkerStats === 'object' ? data.ioWorkerStats : null) ||
+      (data.ioStats && typeof data.ioStats === 'object' ? data.ioStats : null) ||
+      (typeof data.type === 'string' &&
+      IO_TELEMETRY_MESSAGE_TYPES.has(data.type) &&
+      data.stats &&
+      typeof data.stats === 'object'
+        ? data.stats
+        : null);
+    if (rawIo || typeof data.mailboxAttached === 'boolean') {
+      const prev = latestIoWorkerStats && typeof latestIoWorkerStats === 'object' ? latestIoWorkerStats : {};
+      const next = Object.assign({}, prev, rawIo || {});
+      if (typeof data.mailboxAttached === 'boolean') {
+        next.mailboxAttached = data.mailboxAttached;
+      } else if (typeof next.mailboxAttached !== 'boolean') {
+        next.mailboxAttached = false;
+      }
+      if (typeof data.mailboxLanes === 'number' && Number.isFinite(data.mailboxLanes) && data.mailboxLanes >= 0) {
+        next.mailboxLanes = Math.floor(data.mailboxLanes);
+      }
+      latestIoWorkerStats = Object.freeze(next);
+      updated = true;
+    }
+    if (data.runtimeDiagnostics && typeof data.runtimeDiagnostics === 'object') {
+      latestRuntimeDiagnostics = Object.freeze(Object.assign({}, data.runtimeDiagnostics));
+      updated = true;
+    }
     return updated;
   }
 
@@ -5478,6 +5540,7 @@ export function bootstrapPlayGta6App(options = {}) {
       return true;
     }
     if (typeof data.type === 'string' && IO_TELEMETRY_MESSAGE_TYPES.has(data.type)) {
+      ingestIoWorkerTelemetry(data);
       ingestPerfAndIoTelemetry(data, {
         notifyHud: true,
         updatePanel: true,
@@ -9320,6 +9383,9 @@ export function bootstrapPlayGta6App(options = {}) {
       vramBudgetUtilization: perf.vramBudgetUtilization,
       bindGroupHitRate: perf.bindGroupHitRate,
       mailboxLanes: perf.mailboxLanes,
+      mailboxAttached: latestIoWorkerStats ? Boolean(latestIoWorkerStats.mailboxAttached) : null,
+      ioWorkerStats: latestIoWorkerStats,
+      runtimeDiagnostics: latestRuntimeDiagnostics,
       fastBootPlan: latestFastBootPlan,
       preloadTelemetry,
       splashTelemetry,
@@ -9465,6 +9531,9 @@ export function bootstrapPlayGta6App(options = {}) {
       vramBudgetUtilization: perf.vramBudgetUtilization,
       bindGroupHitRate: perf.bindGroupHitRate,
       mailboxLanes: perf.mailboxLanes,
+      mailboxAttached: latestIoWorkerStats ? Boolean(latestIoWorkerStats.mailboxAttached) : null,
+      ioWorkerStats: latestIoWorkerStats,
+      runtimeDiagnostics: latestRuntimeDiagnostics,
       fastBootPlan: latestFastBootPlan,
       quotaEviction: latestQuotaEviction,
       preloadTelemetry,

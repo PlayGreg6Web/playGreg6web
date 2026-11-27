@@ -35,11 +35,14 @@ const HttpfsOp = Object.freeze({
   Open: 1,
   Read: 2,
   Close: 3,
+  // 4 is reserved for io_worker.js opt-in /pg6_dump/ write forwarding (HTTPFS_OP_WRITE).
+  Stat: 5,
   // Uppercase convenience aliases
   NONE: 0,
   OPEN: 1,
   READ: 2,
   CLOSE: 3,
+  STAT: 5,
 });
 
 // Exact byte offsets matching static_assert(offsetof(HttpfsMailbox, ...)) in runtime/os/httpfs_mailbox.h.
@@ -1807,6 +1810,12 @@ class HttpfsMailboxHost {
         : backend && typeof backend.close === 'function'
           ? backend.close.bind(backend)
           : null;
+    this._customStat =
+      typeof options.stat === 'function'
+        ? options.stat
+        : backend && typeof backend.stat === 'function'
+          ? backend.stat.bind(backend)
+          : null;
 
     this._shared =
       options._sharedState && typeof options._sharedState === 'object'
@@ -2005,22 +2014,26 @@ class HttpfsMailboxHost {
     return this._manifest;
   }
 
-  _manifestHasFile(cleanPath) {
+  _manifestFindEntry(cleanPath) {
     const manifest = this._resolveManifest();
     if (!manifest || !Array.isArray(manifest.files)) {
-      return null;
+      return { known: null, entry: null };
     }
     for (const entry of manifest.files) {
       if (!entry || typeof entry.path !== 'string') continue;
       try {
         if (normalizeRelPath(entry.path) === cleanPath) {
-          return true;
+          return { known: true, entry };
         }
       } catch {
         // Ignore malformed manifest entries.
       }
     }
-    return false;
+    return { known: false, entry: null };
+  }
+
+  _manifestHasFile(cleanPath) {
+    return this._manifestFindEntry(cleanPath).known;
   }
 
   _finalizeTiming() {
@@ -2073,6 +2086,39 @@ class HttpfsMailboxHost {
       const errCode = typeof handle === 'number' && handle < 0 ? Math.trunc(handle) : -2;
       this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
     }
+  }
+
+  _finishStatResult(res) {
+    if (typeof res === 'bigint') {
+      if (res >= 0n) {
+        this.completeResponse(res, HttpfsStatus.ResponseReady);
+      } else {
+        this.completeResponse(res, HttpfsStatus.Error);
+      }
+      return;
+    }
+    if (typeof res === 'number') {
+      if (Number.isSafeInteger(res) && res >= 0) {
+        this.completeResponse(BigInt(res), HttpfsStatus.ResponseReady);
+      } else if (Number.isFinite(res) && res < 0) {
+        this.completeResponse(BigInt(Math.trunc(res)), HttpfsStatus.Error);
+      } else {
+        this.completeResponse(-2n, HttpfsStatus.Error);
+      }
+      return;
+    }
+    if (res && typeof res === 'object') {
+      const sizeVal = res.size !== undefined ? res.size : res.fileSize;
+      if (typeof sizeVal === 'bigint' && sizeVal >= 0n) {
+        this.completeResponse(sizeVal, HttpfsStatus.ResponseReady);
+        return;
+      }
+      if (typeof sizeVal === 'number' && Number.isSafeInteger(sizeVal) && sizeVal >= 0) {
+        this.completeResponse(BigInt(sizeVal), HttpfsStatus.ResponseReady);
+        return;
+      }
+    }
+    this.completeResponse(-2n, HttpfsStatus.Error);
   }
 
   _finishReadResult(res, reqLen) {
@@ -2658,6 +2704,91 @@ class HttpfsMailboxHost {
     }
   }
 
+  _handleStat(lengthBig, cap) {
+    if (lengthBig === 0n || lengthBig > BigInt(cap)) {
+      this.completeResponse(-22n, HttpfsStatus.Error);
+      return;
+    }
+
+    const pathLen = Number(lengthBig);
+    const rawPath = decodeSabUtf8(this._payloadView, pathLen);
+    let cleanPath;
+    try {
+      cleanPath = normalizeRelPath(rawPath);
+    } catch {
+      this.completeResponse(-22n, HttpfsStatus.Error);
+      return;
+    }
+
+    if (this._customStat) {
+      const res = this._customStat(cleanPath);
+      if (isThenable(res)) {
+        return res.then((resolved) => {
+          this._finishStatResult(resolved);
+        });
+      }
+      this._finishStatResult(res);
+      return;
+    }
+
+    const manifestLookup = this._manifestFindEntry(cleanPath);
+    if (manifestLookup.known === false) {
+      this.completeResponse(-2n, HttpfsStatus.Error);
+      return;
+    }
+    if (
+      manifestLookup.known === true &&
+      manifestLookup.entry &&
+      Number.isSafeInteger(manifestLookup.entry.size) &&
+      manifestLookup.entry.size >= 0
+    ) {
+      this.completeResponse(BigInt(manifestLookup.entry.size), HttpfsStatus.ResponseReady);
+      return;
+    }
+
+    const cache = this._resolveRangeCache();
+    const chunkCache = !cache ? this._shared.chunkCache : null;
+    if (chunkCache) {
+      const url = resolveHttpfsUrl(cleanPath, this._shared.urlConfig);
+      const known = chunkCache.getKnownSize(url);
+      if (Number.isSafeInteger(known) && known >= 0) {
+        this.completeResponse(BigInt(known), HttpfsStatus.ResponseReady);
+        return;
+      }
+      if (typeof chunkCache.probe === 'function') {
+        const probe = chunkCache.probe(url);
+        if (isThenable(probe)) {
+          return probe.then(
+            () => {
+              const probedSize = chunkCache.getKnownSize(url);
+              if (Number.isSafeInteger(probedSize) && probedSize >= 0) {
+                this.completeResponse(BigInt(probedSize), HttpfsStatus.ResponseReady);
+              } else {
+                this.completeResponse(-38n, HttpfsStatus.Error);
+              }
+            },
+            () => {
+              this.completeResponse(-2n, HttpfsStatus.Error);
+            },
+          );
+        }
+      }
+    }
+
+    if (cache && typeof cache.stat === 'function') {
+      const res = cache.stat(cleanPath);
+      if (isThenable(res)) {
+        return res.then((resolved) => {
+          this._finishStatResult(resolved);
+        });
+      }
+      this._finishStatResult(res);
+      return;
+    }
+
+    this.completeResponse(-38n, HttpfsStatus.Error);
+  }
+
   _dispatchOnce() {
     if (this._inFlight) {
       return false;
@@ -2708,11 +2839,13 @@ class HttpfsMailboxHost {
         pending = this._handleRead(handle, offsetBig, lengthBig, cap);
       } else if (op === HttpfsOp.Close) {
         pending = this._handleClose(handle);
+      } else if (op === HttpfsOp.Stat) {
+        pending = this._handleStat(lengthBig, cap);
       } else {
         this.completeResponse(-1n, HttpfsStatus.Error);
       }
     } catch {
-      const errCode = op === HttpfsOp.Open ? -2n : -5n;
+      const errCode = op === HttpfsOp.Open || op === HttpfsOp.Stat ? -2n : -5n;
       this.completeResponse(errCode, HttpfsStatus.Error);
       this._finalizeTiming();
       this._stats.syncFastPathHits += 1;
@@ -2729,7 +2862,7 @@ class HttpfsMailboxHost {
           return true;
         },
         () => {
-          const errCode = op === HttpfsOp.Open ? -2n : -5n;
+          const errCode = op === HttpfsOp.Open || op === HttpfsOp.Stat ? -2n : -5n;
           this.completeResponse(errCode, HttpfsStatus.Error);
           this._finalizeTiming();
           return true;
@@ -3150,6 +3283,15 @@ class HttpfsMailboxClient {
     this._payloadView.set(encoded, 0);
   }
 
+  _writeStatRequest(encoded) {
+    this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Stat, true);
+    this._headerView.setInt32(HttpfsOffsets.HANDLE, -1, true);
+    this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
+    this._headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(encoded.byteLength), true);
+    this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
+    this._payloadView.set(encoded, 0);
+  }
+
   _prepareOpen(relPath) {
     if (typeof relPath !== 'string' || relPath.length === 0) {
       return false;
@@ -3380,6 +3522,60 @@ class HttpfsMailboxClient {
       const { status, result } = await this._executeRoundtripAsync();
       lastStatus = status;
       return status === HttpfsStatus.ResponseReady && result >= 0n;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
+  }
+
+  stat(relPath) {
+    if (typeof relPath !== 'string' || relPath.length === 0) {
+      return -22;
+    }
+    const encoded = textEncoder.encode(relPath);
+    if (encoded.byteLength === 0 || encoded.byteLength > this.payloadCapacity) {
+      return -22;
+    }
+    if (!this._acquireLaneSync()) {
+      return -1;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      this._writeStatRequest(encoded);
+      const { status, result } = this._executeRoundtripSync();
+      lastStatus = status;
+      if (status !== HttpfsStatus.ResponseReady || result < 0n) {
+        return result < 0n ? Number(result) : -1;
+      }
+      return Number(result);
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
+  }
+
+  async statAsync(relPath) {
+    if (typeof relPath !== 'string' || relPath.length === 0) {
+      return -22;
+    }
+    const encoded = textEncoder.encode(relPath);
+    if (encoded.byteLength === 0 || encoded.byteLength > this.payloadCapacity) {
+      return -22;
+    }
+    const fast = this._tryAcquireLaneImmediate();
+    if (fast === HttpfsStatus.Shutdown) {
+      return -1;
+    }
+    if (fast !== HttpfsStatus.Idle && !(await this._acquireLaneAsync())) {
+      return -1;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      this._writeStatRequest(encoded);
+      const { status, result } = await this._executeRoundtripAsync();
+      lastStatus = status;
+      if (status !== HttpfsStatus.ResponseReady || result < 0n) {
+        return result < 0n ? Number(result) : -1;
+      }
+      return Number(result);
     } finally {
       this._resetToIdle(lastStatus);
     }
@@ -3704,6 +3900,10 @@ class HttpfsMailboxPoolClient {
 
   closeAsync(handle) {
     return this._withSlot((client) => client.closeAsync(handle));
+  }
+
+  statAsync(relPath) {
+    return this._withSlot((client) => client.statAsync(relPath));
   }
 
   readBatchAsync(requests) {

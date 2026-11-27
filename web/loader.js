@@ -58,7 +58,15 @@ const HOST_ABI_IMPORT_NAMES = Object.freeze([
   'host_httpfs_close',
   'host_wgpu_submit',
 ]);
+const OPTIONAL_HOST_ABI_IMPORT_NAMES = Object.freeze([
+  'host_httpfs_stat',
+]);
+const ALL_HOST_ABI_IMPORT_NAMES = Object.freeze([
+  ...HOST_ABI_IMPORT_NAMES,
+  ...OPTIONAL_HOST_ABI_IMPORT_NAMES,
+]);
 const HOST_ABI_IMPORT_SET = new Set(HOST_ABI_IMPORT_NAMES);
+const ALL_HOST_ABI_IMPORT_SET = new Set(ALL_HOST_ABI_IMPORT_NAMES);
 const GUEST_SIDE_MODULE_BASENAME_RE = /^guest_part_\d+\.wasm$/i;
 const DEFAULT_RUNTIME_SCRIPT_RELATIVE = './dist/runtime.js';
 const DEFAULT_RUNTIME_SCRIPT_FALLBACK = 'dist/runtime.js';
@@ -268,6 +276,11 @@ let httpfsMailboxSab = null;
 let httpfsMailboxSabs = [];
 let httpfsClient = null;
 let nextHttpfsBroadcastLane = 0;
+let ioWorkerMailboxAttached = false;
+let ioWorkerMailboxLanes = 0;
+let lastIoWorkerStats = null;
+let lastIoStatsPollMs = 0;
+const IO_STATS_POLL_INTERVAL_MS = 1000;
 
 function isFaultRecordLine(line) {
   return typeof line === 'string' && FAULT_RECORD_LINE_RE.test(line);
@@ -2541,12 +2554,33 @@ function createHostImports(options = {}) {
     }
   }
 
+  function host_httpfs_stat(ptr, len) {
+    const fsClient = activeHttpfsClient();
+    if (!fsClient || typeof fsClient.stat !== 'function') {
+      return -38n;
+    }
+    const buf = activeBuffer();
+    if (!buf) return -38n;
+    try {
+      const bytes = copyMemoryBytes(buf, ptr, len);
+      const relPath = utf8Decoder.decode(bytes);
+      const sizeOrErr = fsClient.stat(relPath);
+      if (typeof sizeOrErr === 'bigint') {
+        return sizeOrErr;
+      }
+      return Number.isFinite(sizeOrErr) ? BigInt(Math.trunc(sizeOrErr)) : -2n;
+    } catch {
+      return -2n;
+    }
+  }
+
   const env = {
     host_log,
     host_wgpu_submit,
     host_httpfs_open,
     host_httpfs_read,
     host_httpfs_close,
+    host_httpfs_stat,
   };
 
   const userdata = {
@@ -2726,7 +2760,7 @@ function inspectRequiredHostAbiImports(wasmModule, wasmNs) {
     const needed = new Set();
     for (let i = 0; i < entries.length; i += 1) {
       const imp = entries[i];
-      if (imp && imp.module === 'env' && HOST_ABI_IMPORT_SET.has(imp.name)) {
+      if (imp && imp.module === 'env' && ALL_HOST_ABI_IMPORT_SET.has(imp.name)) {
         needed.add(imp.name);
       }
     }
@@ -2740,7 +2774,9 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
   if (!baseEnv || typeof baseEnv !== 'object' || !hostEnv) {
     return baseEnv;
   }
-  const targetNames = requiredHostNames ? Array.from(requiredHostNames) : HOST_ABI_IMPORT_NAMES;
+  const targetNames = requiredHostNames
+    ? Array.from(requiredHostNames)
+    : ALL_HOST_ABI_IMPORT_NAMES;
   if (targetNames.length === 0) {
     return baseEnv;
   }
@@ -2875,7 +2911,7 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
     get(target, prop, receiver) {
       const isTargetHost =
         typeof prop === 'string' &&
-        HOST_ABI_IMPORT_SET.has(prop) &&
+        ALL_HOST_ABI_IMPORT_SET.has(prop) &&
         (!requiredHostNames || requiredHostNames.has(prop));
       let existing;
       try {
@@ -11720,6 +11756,314 @@ function getPthreadTelemetry() {
   return coordinatorPthreadPool.getTelemetry();
 }
 
+function toSafeIoNonNegInt(val, fallback = 0) {
+  const n = typeof val === 'bigint' ? Number(val) : Number(val);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
+function toSafeIoNonNegNum(val, fallback = 0) {
+  const n = typeof val === 'bigint' ? Number(val) : Number(val);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+function sanitizeIoWorkerStats(rawStats, mailboxState = null) {
+  const src = rawStats && typeof rawStats === 'object' ? rawStats : {};
+  const mailbox = src.mailbox && typeof src.mailbox === 'object' ? src.mailbox : {};
+  const streaming = src.streaming && typeof src.streaming === 'object' ? src.streaming : {};
+  const imm = src.immutableCache && typeof src.immutableCache === 'object' ? src.immutableCache : {};
+  const mState = mailboxState && typeof mailboxState === 'object' ? mailboxState : null;
+
+  const attached =
+    typeof src.mailboxAttached === 'boolean'
+      ? src.mailboxAttached
+      : mState && typeof mState.mailboxAttached === 'boolean'
+        ? mState.mailboxAttached
+        : false;
+  const rawLanes =
+    src.mailboxLanes !== undefined
+      ? src.mailboxLanes
+      : mState && mState.mailboxLanes !== undefined
+        ? mState.mailboxLanes
+        : 0;
+  const inFlightRequests = toSafeIoNonNegInt(
+    src.inFlightRequests !== undefined
+      ? src.inFlightRequests
+      : mailbox.activeLanes !== undefined
+        ? mailbox.activeLanes
+        : imm.inFlightRequests !== undefined
+          ? imm.inFlightRequests
+          : mailbox.activePendingSlots,
+    0,
+  );
+
+  return {
+    mailboxAttached: Boolean(attached),
+    mailboxLanes: toSafeIoNonNegInt(rawLanes, 0),
+    openHandles: toSafeIoNonNegInt(src.openHandles, 0),
+    readsCompleted: toSafeIoNonNegInt(
+      src.readsCompleted !== undefined ? src.readsCompleted : streaming.readsCompleted,
+      0,
+    ),
+    bytesTransferred: toSafeIoNonNegInt(
+      src.bytesTransferred !== undefined ? src.bytesTransferred : streaming.bytesTransferred,
+      0,
+    ),
+    inFlightRequests,
+    activeLanes: toSafeIoNonNegInt(
+      mailbox.activeLanes !== undefined ? mailbox.activeLanes : src.activeLanes,
+      0,
+    ),
+    peakActiveLanes: toSafeIoNonNegInt(
+      mailbox.peakActiveLanes !== undefined ? mailbox.peakActiveLanes : src.peakActiveLanes,
+      0,
+    ),
+    requests: toSafeIoNonNegInt(
+      mailbox.totalRequests !== undefined
+        ? mailbox.totalRequests
+        : mailbox.requests !== undefined
+          ? mailbox.requests
+          : src.requests,
+      0,
+    ),
+    syncFastPathHits: toSafeIoNonNegInt(
+      src.syncFastPathHits !== undefined ? src.syncFastPathHits : mailbox.syncFastPathHits,
+      0,
+    ),
+    asyncPathHits: toSafeIoNonNegInt(
+      mailbox.asyncPathHits !== undefined ? mailbox.asyncPathHits : src.asyncPathHits,
+      0,
+    ),
+    errorCount: toSafeIoNonNegInt(
+      src.errorCount !== undefined ? src.errorCount : streaming.errorCount,
+      0,
+    ),
+    cacheHits: toSafeIoNonNegInt(
+      src.cacheHits !== undefined ? src.cacheHits : streaming.cacheHits,
+      0,
+    ),
+    cacheMisses: toSafeIoNonNegInt(src.cacheMisses, 0),
+    bytesServedFromCache: toSafeIoNonNegInt(src.bytesServedFromCache, 0),
+    bytesFetched: toSafeIoNonNegInt(src.bytesFetched, 0),
+    slabCacheHits: toSafeIoNonNegInt(
+      src.slabCacheHits !== undefined ? src.slabCacheHits : imm.slabCacheHits,
+      0,
+    ),
+    slabCacheMisses: toSafeIoNonNegInt(
+      src.slabCacheMisses !== undefined ? src.slabCacheMisses : imm.slabCacheMisses,
+      0,
+    ),
+    opfsHits: toSafeIoNonNegInt(src.opfsHits, 0),
+    opfsMisses: toSafeIoNonNegInt(src.opfsMisses, 0),
+    avgReadMs: toSafeIoNonNegNum(
+      src.avgReadMs !== undefined ? src.avgReadMs : streaming.avgReadMs,
+      0,
+    ),
+    statHits: toSafeIoNonNegInt(src.statHits, 0),
+    statMisses: toSafeIoNonNegInt(src.statMisses, 0),
+  };
+}
+
+function buildCoordinatorIoWorkerStats() {
+  const lanes =
+    ioWorkerMailboxLanes || httpfsMailboxSabs.length || (httpfsMailboxSab ? 1 : 0);
+  if (lastIoWorkerStats) {
+    return Object.assign({}, lastIoWorkerStats, {
+      mailboxAttached: Boolean(ioWorkerMailboxAttached || lastIoWorkerStats.mailboxAttached),
+      mailboxLanes: ioWorkerMailboxLanes || lastIoWorkerStats.mailboxLanes || lanes,
+    });
+  }
+  return sanitizeIoWorkerStats(null, {
+    mailboxAttached: ioWorkerMailboxAttached,
+    mailboxLanes: lanes,
+  });
+}
+
+function readRuntimeDiagnostics(moduleOrExports) {
+  if (!moduleOrExports || typeof moduleOrExports !== 'object') {
+    return null;
+  }
+  const fn =
+    typeof moduleOrExports._playgta6_runtime_diagnostics_json === 'function'
+      ? moduleOrExports._playgta6_runtime_diagnostics_json
+      : typeof moduleOrExports.playgta6_runtime_diagnostics_json === 'function'
+        ? moduleOrExports.playgta6_runtime_diagnostics_json
+        : moduleOrExports.asm &&
+            typeof moduleOrExports.asm.playgta6_runtime_diagnostics_json === 'function'
+          ? moduleOrExports.asm.playgta6_runtime_diagnostics_json
+          : null;
+  if (!fn) {
+    return null;
+  }
+  try {
+    const rawPtr = fn();
+    const ptr = ptrToNumber(rawPtr, 'runtimeDiagnosticsPtr');
+    if (!Number.isSafeInteger(ptr) || ptr <= 0) {
+      return null;
+    }
+    let heapU8 = null;
+    if (moduleOrExports.HEAPU8 instanceof Uint8Array) {
+      heapU8 = moduleOrExports.HEAPU8;
+    } else if (moduleOrExports.wasmMemory && moduleOrExports.wasmMemory.buffer) {
+      heapU8 = new Uint8Array(moduleOrExports.wasmMemory.buffer);
+    } else if (moduleOrExports.memory && moduleOrExports.memory.buffer) {
+      heapU8 = new Uint8Array(moduleOrExports.memory.buffer);
+    }
+    if (!heapU8 || ptr >= heapU8.byteLength) {
+      return null;
+    }
+    const maxLen = Math.min(heapU8.byteLength - ptr, 256 * 1024);
+    let end = ptr;
+    const limit = ptr + maxLen;
+    while (end < limit && heapU8[end] !== 0) {
+      end += 1;
+    }
+    if (end <= ptr) {
+      return null;
+    }
+    const copy = new Uint8Array(end - ptr);
+    copy.set(heapU8.subarray(ptr, end));
+    const parsed = JSON.parse(utf8Decoder.decode(copy));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function handleIoWorkerMessage(data, hooks = {}) {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  const state =
+    hooks.state && typeof hooks.state === 'object'
+      ? hooks.state
+      : {
+          get mailboxAttached() {
+            return ioWorkerMailboxAttached;
+          },
+          set mailboxAttached(v) {
+            ioWorkerMailboxAttached = Boolean(v);
+          },
+          get mailboxLanes() {
+            return ioWorkerMailboxLanes;
+          },
+          set mailboxLanes(v) {
+            ioWorkerMailboxLanes = toSafeIoNonNegInt(v, 0);
+          },
+          get lastStats() {
+            return lastIoWorkerStats;
+          },
+          set lastStats(v) {
+            lastIoWorkerStats = v;
+          },
+        };
+  const emitToMain =
+    typeof hooks.postToMain === 'function' ? hooks.postToMain : coordinatorPostToMain;
+  const emitProgress = typeof hooks.postProgress === 'function' ? hooks.postProgress : postProgress;
+  const onReady = typeof hooks.onWorkerReady === 'function' ? hooks.onWorkerReady : null;
+  const requestStats = typeof hooks.requestStats === 'function' ? hooks.requestStats : null;
+
+  if (data.ready) {
+    if (onReady) onReady('io_worker', data.summary);
+    return true;
+  }
+  if (data.mailboxAttached === true) {
+    state.mailboxAttached = true;
+    if (data.mailboxLanes !== undefined) {
+      state.mailboxLanes = toSafeIoNonNegInt(data.mailboxLanes, state.mailboxLanes);
+    }
+    const snapshot = sanitizeIoWorkerStats(state.lastStats, {
+      mailboxAttached: true,
+      mailboxLanes: state.mailboxLanes,
+    });
+    state.lastStats = snapshot;
+    if (emitToMain) {
+      try {
+        emitToMain({
+          type: 'io-stats',
+          mailboxAttached: true,
+          mailboxLanes: snapshot.mailboxLanes,
+          ioWorkerStats: snapshot,
+          timestamp: Date.now(),
+        });
+      } catch {
+        // Non-fatal IO telemetry forward error.
+      }
+    }
+    if (requestStats) {
+      try {
+        requestStats();
+      } catch {
+        // Non-fatal stats poll error.
+      }
+    }
+    return true;
+  }
+  if (data.mailboxDetached === true) {
+    state.mailboxAttached = false;
+    state.mailboxLanes = 0;
+    const snapshot = sanitizeIoWorkerStats(state.lastStats, {
+      mailboxAttached: false,
+      mailboxLanes: 0,
+    });
+    state.lastStats = snapshot;
+    if (emitToMain) {
+      try {
+        emitToMain({
+          type: 'io-stats',
+          mailboxAttached: false,
+          mailboxLanes: 0,
+          ioWorkerStats: snapshot,
+          timestamp: Date.now(),
+        });
+      } catch {
+        // Non-fatal IO telemetry forward error.
+      }
+    }
+    return true;
+  }
+  if (data.stats && typeof data.stats === 'object') {
+    const snapshot = sanitizeIoWorkerStats(data.stats, {
+      mailboxAttached:
+        typeof data.stats.mailboxAttached === 'boolean'
+          ? data.stats.mailboxAttached
+          : state.mailboxAttached,
+      mailboxLanes:
+        data.stats.mailboxLanes !== undefined ? data.stats.mailboxLanes : state.mailboxLanes,
+    });
+    state.mailboxAttached = snapshot.mailboxAttached;
+    if (snapshot.mailboxLanes > 0) {
+      state.mailboxLanes = snapshot.mailboxLanes;
+    }
+    state.lastStats = snapshot;
+    if (emitToMain) {
+      const payload = {
+        type: 'io-stats',
+        mailboxAttached: snapshot.mailboxAttached,
+        mailboxLanes: snapshot.mailboxLanes,
+        ioWorkerStats: snapshot,
+        stats: snapshot,
+        timestamp: Date.now(),
+      };
+      if (data.id !== undefined) {
+        payload.id = data.id;
+      }
+      try {
+        emitToMain(payload);
+      } catch {
+        // Non-fatal IO stats forward error.
+      }
+    }
+    return true;
+  }
+  if (data.error) {
+    emitProgress({ error: `io_worker: ${data.error}` });
+    return true;
+  }
+  return false;
+}
+
 function getLoaderStatus() {
   const pthread = coordinatorPthreadPool.getTelemetry();
   const audioBridgeState = coordinatorAudioBridge.getState();
@@ -11758,6 +12102,9 @@ function getLoaderStatus() {
     pthreadPeakConcurrentLoads: pthread.pthreadPeakConcurrentLoads,
     maxConcurrentPthreadLoads: pthread.maxConcurrentPthreadLoads,
     httpfsMailboxLanes: httpfsMailboxSabs.length || (httpfsMailboxSab ? 1 : 0),
+    mailboxAttached: Boolean(ioWorkerMailboxAttached),
+    ioWorkerStats: buildCoordinatorIoWorkerStats(),
+    runtimeDiagnostics: readRuntimeDiagnostics(activeCoordinatorRuntimeModule),
     indirectDispatch: activeGuestManifestSummary
       ? activeGuestManifestSummary.indirectDispatch
       : 'table',
@@ -12207,6 +12554,13 @@ if (typeof self !== 'undefined') {
   self.onmessage = (ev) => {
     const msg = ev.data || {};
     if (msg.type === 'request-loader-status' || msg.type === 'request-pthread-telemetry') {
+      if (ioWorker && typeof ioWorker.postMessage === 'function') {
+        try {
+          ioWorker.postMessage({ stats: true });
+        } catch {
+          // Non-fatal io_worker stats refresh failure.
+        }
+      }
       if (postToMain) {
         const payload = Object.assign({ type: 'loader-status' }, getLoaderStatus(), {
           timestamp: Date.now(),
@@ -12218,6 +12572,38 @@ if (typeof self !== 'undefined') {
           postToMain(payload);
         } catch {
           // Non-fatal status reply failure.
+        }
+      }
+      return;
+    }
+    if (msg.type === 'request-io-stats') {
+      if (ioWorker && typeof ioWorker.postMessage === 'function') {
+        const ioReq = { stats: true };
+        if (msg.id !== undefined) {
+          ioReq.id = msg.id;
+        }
+        try {
+          ioWorker.postMessage(ioReq);
+        } catch {
+          // Non-fatal io_worker stats query failure.
+        }
+      } else if (postToMain) {
+        const snapshot = buildCoordinatorIoWorkerStats();
+        const payload = {
+          type: 'io-stats',
+          mailboxAttached: snapshot.mailboxAttached,
+          mailboxLanes: snapshot.mailboxLanes,
+          ioWorkerStats: snapshot,
+          stats: snapshot,
+          timestamp: Date.now(),
+        };
+        if (msg.id !== undefined) {
+          payload.id = msg.id;
+        }
+        try {
+          postToMain(payload);
+        } catch {
+          // Non-fatal io-stats reply failure.
         }
       }
       return;
@@ -12304,6 +12690,13 @@ if (typeof self !== 'undefined') {
           gpuWorker.postMessage(missingReq);
         }
       }
+      if (ioWorker && typeof ioWorker.postMessage === 'function') {
+        try {
+          ioWorker.postMessage({ stats: true });
+        } catch {
+          // Non-fatal io_worker stats poll failure.
+        }
+      }
       return;
     }
     if (msg.resize && gpuWorker) {
@@ -12370,6 +12763,10 @@ if (typeof self !== 'undefined') {
         }
         activeCoordinatorRuntimeModule = null;
         activeCoordinatorModuleConfig = null;
+        ioWorkerMailboxAttached = false;
+        ioWorkerMailboxLanes = 0;
+        lastIoWorkerStats = null;
+        lastIoStatsPollMs = 0;
         teardownCoordinatorAudioWorker({
           sendStop: true,
           terminate: true,
@@ -12467,6 +12864,10 @@ if (typeof self !== 'undefined') {
     httpfsMailboxSabs = allocatedMailboxPool.sabs;
     httpfsMailboxSab = allocatedMailboxPool.sab;
     nextHttpfsBroadcastLane = 0;
+    ioWorkerMailboxAttached = false;
+    ioWorkerMailboxLanes = 0;
+    lastIoWorkerStats = null;
+    lastIoStatsPollMs = 0;
     if (typeof coordinatorPthreadPool.resetHttpfsLaneCursor === 'function') {
       coordinatorPthreadPool.resetHttpfsLaneCursor();
     }
@@ -12496,8 +12897,16 @@ if (typeof self !== 'undefined') {
     };
 
     ioWorker.onmessage = (e) => {
-      if (e.data.ready) onWorkerReady('io_worker', e.data.summary);
-      else if (e.data.error) postProgress({ error: `io_worker: ${e.data.error}` });
+      handleIoWorkerMessage(e && e.data, {
+        onWorkerReady,
+        postToMain,
+        postProgress,
+        requestStats: () => {
+          if (ioWorker && typeof ioWorker.postMessage === 'function') {
+            ioWorker.postMessage({ stats: true });
+          }
+        },
+      });
     };
     gpuWorker.onerror = () => {
       resetGpuPresentBackpressure();
@@ -12548,6 +12957,33 @@ if (typeof self !== 'undefined') {
           }
         }
         report(`WebGPU frame #${data.frame} presented`);
+        const nowPollMs = Date.now();
+        if (
+          ioWorker &&
+          typeof ioWorker.postMessage === 'function' &&
+          nowPollMs - lastIoStatsPollMs >= IO_STATS_POLL_INTERVAL_MS
+        ) {
+          lastIoStatsPollMs = nowPollMs;
+          try {
+            ioWorker.postMessage({ stats: true });
+          } catch {
+            // Non-fatal periodic io_worker stats poll error.
+          }
+          const rtDiag = readRuntimeDiagnostics(activeCoordinatorRuntimeModule);
+          if (rtDiag && postToMain) {
+            try {
+              postToMain({
+                type: 'loader-status',
+                mailboxAttached: Boolean(ioWorkerMailboxAttached),
+                ioWorkerStats: buildCoordinatorIoWorkerStats(),
+                runtimeDiagnostics: rtDiag,
+                timestamp: nowPollMs,
+              });
+            } catch {
+              // Non-fatal runtime diagnostics forward error.
+            }
+          }
+        }
       } else if (data.error) {
         postProgress({ error: `wgpu_worker: ${formatGpuWorkerError(data.error)}` });
       }
@@ -12713,6 +13149,9 @@ const exportedApi = {
   installPthreadWorkerProxy,
   getPthreadTelemetry,
   getLoaderStatus,
+  sanitizeIoWorkerStats,
+  readRuntimeDiagnostics,
+  handleIoWorkerMessage,
   getWasmMemoryTelemetry,
   resetWasmMemoryTelemetry,
   collectTransferableArrayBuffers,

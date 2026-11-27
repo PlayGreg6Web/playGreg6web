@@ -122,6 +122,14 @@ HttpfsStatus HttpfsMailboxClient::execute_roundtrip_locked(int64_t& out_result) 
 
     if (responder_) {
         responder_(*mailbox_);
+        const int32_t after = status_ref.load(std::memory_order_acquire);
+        if (after == static_cast<int32_t>(HttpfsStatus::RequestReady)) {
+            // A synchronous responder ignored this opcode (e.g. legacy mock without HttpfsOp::Stat).
+            out_result = -38;
+            return HttpfsStatus::Error;
+        }
+        out_result = mailbox_->result;
+        return static_cast<HttpfsStatus>(after);
     }
 
     int32_t cur = status_ref.load(std::memory_order_acquire);
@@ -349,6 +357,53 @@ bool HttpfsMailboxClient::close(int32_t handle) {
     }
 
     return status == HttpfsStatus::ResponseReady && result >= 0;
+}
+
+int64_t HttpfsMailboxClient::stat(std::string_view rel_path) {
+    if (direct_mode_) {
+        if (rel_path.empty()) {
+            return -22;
+        }
+        if (!direct_.stat) {
+            return -38;
+        }
+        if (direct_.concurrent) {
+            return direct_.stat(rel_path);
+        }
+        std::lock_guard<HttpfsFairMutex> lock(mutex_);
+        return direct_.stat(rel_path);
+    }
+
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    if (mailbox_ == nullptr || rel_path.empty()) {
+        return -22;
+    }
+
+    const size_t cap = effective_capacity_locked();
+    if (rel_path.size() > cap) {
+        return -22;
+    }
+
+    mailbox_->op = static_cast<uint32_t>(HttpfsOp::Stat);
+    mailbox_->handle = -1;
+    mailbox_->offset = 0;
+    mailbox_->length = static_cast<uint64_t>(rel_path.size());
+    mailbox_->result = -1;
+    std::memcpy(mailbox_->payload, rel_path.data(), rel_path.size());
+
+    int64_t result = -1;
+    const HttpfsStatus status = execute_roundtrip_locked(result);
+
+    std::atomic_ref<int32_t> status_ref(mailbox_->status);
+    if (status != HttpfsStatus::Shutdown) {
+        status_ref.store(static_cast<int32_t>(HttpfsStatus::Idle), std::memory_order_release);
+        status_ref.notify_one();
+    }
+
+    if (status != HttpfsStatus::ResponseReady || result < 0) {
+        return result < 0 ? result : -1;
+    }
+    return result;
 }
 
 }  // namespace playgta6::os

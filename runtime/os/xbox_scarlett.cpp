@@ -1799,10 +1799,12 @@ public:
                      uint64_t file_size,
                      int32_t httpfs_handle = -1,
                      HttpfsMailboxClient* httpfs_client = nullptr,
-                     uint64_t httpfs_gen = 0)
+                     uint64_t httpfs_gen = 0,
+                     bool file_size_known = true)
         : path_(std::move(normalized_path)),
           backend_(backend),
           file_size_(file_size),
+          file_size_known_(file_size_known),
           httpfs_handle_(httpfs_handle),
           httpfs_client_(httpfs_client),
           httpfs_gen_(httpfs_gen) {}
@@ -1853,9 +1855,74 @@ public:
         if (info == nullptr) {
             return E_POINTER_HR;
         }
-        std::shared_lock<std::shared_mutex> lock(mutex_);
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            if (closed_) {
+                return gdk::E_HANDLE_HR;
+            }
+            if (file_size_known_ || backend_ != DStorageFileBackend::Httpfs) {
+                info->file_size = file_size_;
+                return S_OK_HR;
+            }
+        }
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         if (closed_) {
             return gdk::E_HANDLE_HR;
+        }
+        if (!file_size_known_ && backend_ == DStorageFileBackend::Httpfs &&
+            httpfs_client_ != nullptr && httpfs_handle_ >= 0 &&
+            win32::get_httpfs_client() == httpfs_client_ &&
+            win32::httpfs_client_generation() == httpfs_gen_) {
+            const int64_t st_size = httpfs_client_->stat(path_);
+            if (st_size >= 0) {
+                file_size_ = static_cast<uint64_t>(st_size);
+                file_size_known_ = true;
+            } else {
+                // Fallback when a legacy mock responder does not implement HttpfsOp::Stat.
+                uint8_t probe = 0;
+                const int64_t first = httpfs_client_->read(httpfs_handle_, 0, &probe, 1);
+                if (first == 0) {
+                    file_size_ = 0;
+                    file_size_known_ = true;
+                } else if (first > 0) {
+                    uint64_t lo = 1;
+                    uint64_t hi = 64;
+                    bool ok = true;
+                    while (true) {
+                        const int64_t r = httpfs_client_->read(httpfs_handle_, hi, &probe, 1);
+                        if (r < 0) {
+                            ok = false;
+                            break;
+                        }
+                        if (r == 0) {
+                            break;
+                        }
+                        lo = hi + 1;
+                        if (hi > (std::numeric_limits<uint64_t>::max() / 2)) {
+                            ok = false;
+                            break;
+                        }
+                        hi *= 2;
+                    }
+                    while (ok && lo < hi) {
+                        const uint64_t mid = lo + (hi - lo) / 2;
+                        const int64_t r = httpfs_client_->read(httpfs_handle_, mid, &probe, 1);
+                        if (r < 0) {
+                            ok = false;
+                            break;
+                        }
+                        if (r > 0) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if (ok) {
+                        file_size_ = lo;
+                        file_size_known_ = true;
+                    }
+                }
+            }
         }
         info->file_size = file_size_;
         return S_OK_HR;
@@ -1954,6 +2021,7 @@ private:
     std::string path_;
     DStorageFileBackend backend_;
     uint64_t file_size_ = 0;
+    bool file_size_known_ = true;
     int32_t httpfs_handle_ = -1;
     HttpfsMailboxClient* httpfs_client_ = nullptr;
     uint64_t httpfs_gen_ = 0;
@@ -2391,8 +2459,16 @@ public:
                     if (win32::httpfs_client_generation() != gen_before) {
                         return E_FILE_NOT_FOUND_HR;
                     }
+                    uint64_t file_size = 0;
+                    bool file_size_known = false;
+                    const int64_t st_size = client->stat(normalized);
+                    if (st_size >= 0) {
+                        file_size = static_cast<uint64_t>(st_size);
+                        file_size_known = true;
+                    }
                     auto* file = new (std::nothrow) DStorageFileImpl(
-                        normalized, DStorageFileBackend::Httpfs, 0, handle, client, gen_before);
+                        normalized, DStorageFileBackend::Httpfs, file_size, handle, client, gen_before,
+                        file_size_known);
                     if (file == nullptr) {
                         client->close(handle);
                         return E_OUTOFMEMORY_HR;

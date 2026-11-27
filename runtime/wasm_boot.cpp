@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -16,11 +18,13 @@
 #include "gpu/stage_reflection.h"
 #include "guest/boot.h"
 #include "guest/program_loader.h"
+#include "guest/streaming_drain_probe.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/os_shim.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
+#include "os/win32_sync.h"
 #include "os/xgamesave_local.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
@@ -93,6 +97,17 @@ void close_path(const WasmBootConfig& cfg, int32_t handle) {
         return;
     }
     os::httpfs_close(handle);
+}
+
+int64_t stat_path(const WasmBootConfig& cfg, std::string_view rel_path) {
+    if (cfg.stat_fn) {
+        return cfg.stat_fn(rel_path);
+    }
+    if (cfg.open_fn) {
+        // Custom test callbacks without an explicit stat_fn fall back to legacy probing.
+        return -38;
+    }
+    return os::httpfs_stat(rel_path);
 }
 
 void write_log(const WasmBootConfig& cfg, std::string_view message) {
@@ -363,6 +378,7 @@ public:
             close_path(*cfg_, handle);
             return true;
         };
+        backend.stat = [this](std::string_view rel) { return stat_rel(rel); };
         backend.concurrent = true;
         backend.max_chunk_bytes = 256 * 1024;
         client_ = std::make_unique<os::HttpfsMailboxClient>(std::move(backend));
@@ -405,6 +421,34 @@ private:
             handle = open_path(*cfg_, rel);
         }
         return handle;
+    }
+
+    int64_t stat_rel(std::string_view raw) {
+        std::string rel(raw);
+        std::replace(rel.begin(), rel.end(), '\\', '/');
+        for (;;) {
+            if (rel.size() >= 2 && rel[0] == '.' && rel[1] == '/') {
+                rel.erase(0, 2);
+            } else if (!rel.empty() && rel.front() == '/') {
+                rel.erase(0, 1);
+            } else {
+                break;
+            }
+        }
+        if (rel.empty()) {
+            return -2;
+        }
+        const std::string lower = to_lower_ascii(rel);
+        const bool has_root_prefix = lower.rfind("game/", 0) == 0 || lower.rfind("boot/", 0) == 0;
+        int64_t res = -2;
+        if (!has_root_prefix) {
+            res = stat_path(*cfg_, "game/" + rel);
+            if (res >= 0 || res == -38) {
+                return res;
+            }
+        }
+        const int64_t fallback = stat_path(*cfg_, rel);
+        return fallback >= 0 ? fallback : (fallback == -38 ? -38 : res);
     }
 
     const WasmBootConfig* cfg_ = nullptr;
@@ -1142,4 +1186,82 @@ extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_storage_take_changed(void) 
         joined += '\n';
     }
     return joined.c_str();
+}
+
+namespace {
+std::string escape_json_str(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('"');
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20u) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                    out += buf;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+}  // namespace
+
+// Live post-legal / stall runtime diagnostics snapshot for browser diagnostic exports (additive
+// export, zero ABI break): returns a NUL-terminated sanitized JSON string (valid until next call)
+// containing DirectStorage counters/debug state, Win32 blocked waits (>= 1000 ms), and guest
+// streaming_drain counters when readable from the guest VirtualMemoryArena.
+extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_runtime_diagnostics_json(void) {
+    static std::mutex mutex;
+    static std::string json;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const playgta6::os::scarlett::guest_api::DStorageStats ds =
+        playgta6::os::scarlett::guest_api::dstorage_stats();
+    const std::string ds_debug = playgta6::os::scarlett::guest_api::dstorage_debug_state();
+    const std::string blocked = playgta6::os::win32::blocked_waits_json(1000);
+
+    playgta6::guest::StreamingDrainState drain{};
+    if (playgta6::os::VirtualMemoryArena* arena = playgta6::os::win32::get_vmem_arena();
+        arena != nullptr) {
+        drain = playgta6::guest::read_streaming_drain(
+            [arena](uint64_t va, void* dst, size_t len) { return arena->read(va, dst, len); },
+            playgta6::guest::kDrainSingletonVa);
+    }
+    const std::vector<uint32_t> empty_threads;
+    const std::string drain_json = playgta6::guest::streaming_drain_json(drain, empty_threads);
+
+    json.clear();
+    json.reserve(512 + ds_debug.size() + blocked.size() + drain_json.size());
+    json += "{\"dstorage\":{";
+    json += "\"requests_completed\":" + std::to_string(ds.requests_completed);
+    json += ",\"requests_failed\":" + std::to_string(ds.requests_failed);
+    json += ",\"requests_cancelled\":" + std::to_string(ds.requests_cancelled);
+    json += ",\"bytes_delivered\":" + std::to_string(ds.bytes_delivered);
+    json += ",\"file_reads\":" + std::to_string(ds.file_reads);
+    json += ",\"coalesced_requests\":" + std::to_string(ds.coalesced_requests);
+    json += ",\"decompressed_requests\":" + std::to_string(ds.decompressed_requests);
+    json += ",\"submits\":" + std::to_string(ds.submits);
+    json += ",\"live_queues\":" + std::to_string(ds.live_queues);
+    json += ",\"physical_page_requests\":" + std::to_string(ds.physical_page_requests);
+    json += ",\"bcpack_requests\":" + std::to_string(ds.bcpack_requests);
+    json += ",\"bcpack_decoded\":" + std::to_string(ds.bcpack_decoded);
+    json += ",\"debug_state\":" + escape_json_str(ds_debug);
+    json += "},\"blocked_waits\":";
+    json += blocked;
+    json += ",\"streaming_drain\":";
+    json += drain_json;
+    json += "}";
+    return json.c_str();
 }

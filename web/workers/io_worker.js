@@ -5607,6 +5607,9 @@
           ? Math.min(Math.floor(options.dumpFlushChunkBytes), this._dumpMaxBufferBytes)
           : Math.min(DEFAULT_DUMP_FLUSH_CHUNK_BYTES, this._dumpMaxBufferBytes);
       this.manifest = options.manifest || null;
+      this._manifestIndexRef = null;
+      this._manifestIndexExact = null;
+      this._manifestIndexLower = null;
       this.rangeCache = options.rangeCache || null;
       this._customRangeCacheProvided = Boolean(options.rangeCache);
       this._hasRoutedRangeCache = !options.rangeCache;
@@ -6283,20 +6286,57 @@
       return this.rpfMountTable;
     }
 
-    _findManifestEntry(cleanPath) {
+    _ensureManifestIndex() {
       if (!this.manifest || !Array.isArray(this.manifest.files)) {
-        return { known: null, entry: null };
+        this._manifestIndexRef = null;
+        this._manifestIndexExact = null;
+        this._manifestIndexLower = null;
+        return null;
       }
-      for (let i = 0; i < this.manifest.files.length; i += 1) {
-        const entry = this.manifest.files[i];
+      if (this._manifestIndexRef === this.manifest.files && this._manifestIndexExact) {
+        return {
+          exact: this._manifestIndexExact,
+          lower: this._manifestIndexLower,
+        };
+      }
+      const exact = new Map();
+      const lower = new Map();
+      const files = this.manifest.files;
+      for (let i = 0; i < files.length; i += 1) {
+        const entry = files[i];
         if (!entry || typeof entry.path !== 'string') continue;
         try {
-          if (normalizeRelPath(entry.path) === cleanPath) {
-            return { known: true, entry };
+          const norm = normalizeRelPath(entry.path);
+          if (!exact.has(norm)) {
+            exact.set(norm, entry);
+          }
+          const lowerKey = norm.toLowerCase();
+          if (!lower.has(lowerKey)) {
+            lower.set(lowerKey, entry);
           }
         } catch {
           // Ignore malformed manifest entries.
         }
+      }
+      this._manifestIndexRef = files;
+      this._manifestIndexExact = exact;
+      this._manifestIndexLower = lower;
+      return { exact, lower };
+    }
+
+    _findManifestEntry(cleanPath) {
+      const idx = this._ensureManifestIndex();
+      if (!idx) {
+        return { known: null, entry: null };
+      }
+      const exactHit = idx.exact.get(cleanPath);
+      if (exactHit) {
+        return { known: true, entry: exactHit };
+      }
+      const lowerKey = cleanPath.toLowerCase();
+      const lowerHit = idx.lower.get(lowerKey);
+      if (lowerHit) {
+        return { known: true, entry: lowerHit };
       }
       return { known: false, entry: null };
     }
@@ -6931,10 +6971,14 @@
         throw createErrnoError(-22, route.error);
       }
       const cleanPath = route.relPath;
-      const manifestLookup =
-        route.mount === 'data'
+      let manifestLookup =
+        route.mount === 'data' || route.mount === 'game'
           ? this._findManifestEntry(cleanPath)
           : { known: null, entry: null };
+      if (route.mount === 'game' && manifestLookup.known === false) {
+        const prefixed = this._findManifestEntry(`game/${cleanPath}`);
+        manifestLookup = prefixed.known === true ? prefixed : { known: null, entry: null };
+      }
       if (manifestLookup.known === true) {
         return {
           path: cleanPath,
@@ -6957,6 +7001,172 @@
         }
       }
       return null;
+    }
+
+    /**
+     * Fast 1-roundtrip HTTPFS Stat resolver for `HttpfsOp.Stat` (opcode 5).
+     * Returns an exact non-negative integer byte size synchronously (zero network fetches)
+     * whenever the file size is cached in `manifest.files`, `_activeWholeFiles`,
+     * `immutableCache`, or an open handle; returns `-2` (ENOENT) synchronously when the
+     * manifest proves absence on the `/data/` mount; otherwise falls back to a single
+     * `HEAD` / `Range: bytes=0-0` probe (never 40-60 binary-search probes).
+     */
+    statHandle(rawPath) {
+      if (typeof rawPath !== 'string' || rawPath.length === 0) {
+        return -22; // EINVAL
+      }
+      if (isRpfVirtualPath(rawPath)) {
+        return this.stat(rawPath, { priority: IO_PRIORITY.CRITICAL }).then(
+          (info) => {
+            if (!info) return -2;
+            if (!info.isFile) return -21;
+            return Number.isSafeInteger(info.size) && info.size >= 0 ? info.size : -2;
+          },
+          (err) => mapErrorToErrno(err, -2),
+        );
+      }
+
+      const route = this._resolveRoute(rawPath);
+      if (!route.ok) {
+        return -22; // EINVAL
+      }
+
+      const cleanPath = route.relPath;
+      // 1. In-memory manifest lookup (0 network fetches).
+      if (route.mount === 'data' || route.mount === 'game') {
+        let manifestLookup = this._findManifestEntry(cleanPath);
+        if (route.mount === 'game' && manifestLookup.known === false) {
+          const prefixed = this._findManifestEntry(`game/${cleanPath}`);
+          manifestLookup = prefixed.known === true ? prefixed : { known: null, entry: null };
+        }
+        if (
+          manifestLookup.known === true &&
+          manifestLookup.entry &&
+          Number.isSafeInteger(manifestLookup.entry.size) &&
+          manifestLookup.entry.size >= 0
+        ) {
+          if (this._streamingStats) {
+            this._streamingStats.statHits = (this._streamingStats.statHits || 0) + 1;
+          }
+          return manifestLookup.entry.size;
+        }
+        if (route.mount === 'data' && manifestLookup.known === false) {
+          if (this._streamingStats) {
+            this._streamingStats.statHits = (this._streamingStats.statHits || 0) + 1;
+          }
+          return -2; // ENOENT
+        }
+      }
+
+      // 2. Active whole-file buffer hit (0 network fetches).
+      const existingWhole = this._activeWholeFiles.get(route.url);
+      if (existingWhole) {
+        const size = Number.isSafeInteger(existingWhole.size)
+          ? existingWhole.size
+          : existingWhole.bytes
+            ? existingWhole.bytes.byteLength
+            : null;
+        if (Number.isSafeInteger(size) && size >= 0) {
+          if (this._streamingStats) {
+            this._streamingStats.statHits = (this._streamingStats.statHits || 0) + 1;
+          }
+          return size;
+        }
+      }
+
+      // 3. ImmutableHttpfsCache metadata / negative cache hit (0 network fetches).
+      if (this.immutableCache) {
+        const cachedMeta = this.immutableCache.getFileMetadata(route.url);
+        if (cachedMeta && Number.isSafeInteger(cachedMeta.size) && cachedMeta.size >= 0) {
+          if (this._streamingStats) {
+            this._streamingStats.statHits = (this._streamingStats.statHits || 0) + 1;
+          }
+          return cachedMeta.size;
+        }
+      }
+
+      // 4. Already-open handle size hit (0 network fetches).
+      for (const entry of this._handles.values()) {
+        if (
+          entry &&
+          entry.kind === 'direct' &&
+          entry.url === route.url &&
+          Number.isSafeInteger(entry.size) &&
+          entry.size >= 0
+        ) {
+          if (this._streamingStats) {
+            this._streamingStats.statHits = (this._streamingStats.statHits || 0) + 1;
+          }
+          return entry.size;
+        }
+      }
+
+      // 5. Fallback: 1-request probe (ImmutableHttpfsCache.open or single HEAD/Range probe).
+      if (this._streamingStats) {
+        this._streamingStats.statMisses = (this._streamingStats.statMisses || 0) + 1;
+      }
+      if (this._shouldUseImmutableCache(route)) {
+        const immCache = this.ensureImmutableCache();
+        return immCache.open(route.url).then(
+          (openRes) => {
+            if (!openRes || !openRes.ok) {
+              return openRes && typeof openRes.errno === 'number' && openRes.errno < 0
+                ? openRes.errno
+                : -2;
+            }
+            return Number.isSafeInteger(openRes.size) && openRes.size >= 0 ? openRes.size : -38;
+          },
+          (err) => mapErrorToErrno(err, -2),
+        );
+      }
+
+      const fetchFn = this._getFetchImpl();
+      if (typeof fetchFn !== 'function') {
+        return -38; // ENOSYS
+      }
+      return (async () => {
+        try {
+          const headRes = await fetchFn(route.url, { method: 'HEAD' });
+          if (headRes.status === 404) return -2;
+          if (headRes.status === 403) return -13;
+          if (headRes.ok) {
+            const cl = getResponseHeader(headRes.headers, 'Content-Length');
+            if (cl !== null && /^\d+$/.test(cl.trim())) {
+              const parsed = Number(cl.trim());
+              if (Number.isSafeInteger(parsed) && parsed >= 0) {
+                return parsed;
+              }
+            }
+          }
+          // Fallback to single 1-byte Range probe to read Content-Range total size.
+          const rangeRes = await fetchFn(route.url, {
+            method: 'GET',
+            headers: { Range: 'bytes=0-0' },
+          });
+          if (rangeRes.status === 404) return -2;
+          if (rangeRes.status === 403) return -13;
+          if (rangeRes.status === 416 || rangeRes.status === 206) {
+            const cr = parseContentRangeHeader(getResponseHeader(rangeRes.headers, 'Content-Range'));
+            if (cr && Number.isSafeInteger(cr.total) && cr.total >= 0) {
+              return cr.total;
+            }
+          }
+          if (rangeRes.status === 200) {
+            const cl = getResponseHeader(rangeRes.headers, 'Content-Length');
+            if (cl !== null && /^\d+$/.test(cl.trim())) {
+              const parsed = Number(cl.trim());
+              if (Number.isSafeInteger(parsed) && parsed >= 0) {
+                return parsed;
+              }
+            }
+            const buf = await rangeRes.arrayBuffer();
+            return buf.byteLength;
+          }
+          return -38;
+        } catch (err) {
+          return mapErrorToErrno(err, -5);
+        }
+      })();
     }
 
     async listDir(pathStr, options = {}) {
@@ -7693,6 +7903,25 @@
           this._finishOpenResult(pending);
         }
 
+        _handleStat(lengthBig, cap) {
+          if (lengthBig === 0n || lengthBig > BigInt(cap)) {
+            this.completeResponse(-22n, HttpfsStatus.Error);
+            return;
+          }
+          const pathLen = Number(lengthBig);
+          const copy = new Uint8Array(pathLen);
+          copy.set(this._payloadView.subarray(0, pathLen));
+          const rawPath = utf8Decoder.decode(copy);
+
+          const pending = controller.statHandle(rawPath);
+          if (pending && typeof pending.then === 'function') {
+            return pending.then((sizeOrErrno) => {
+              this._finishStatResult(sizeOrErrno);
+            });
+          }
+          this._finishStatResult(pending);
+        }
+
         _handleRead(handle, offsetBig, lengthBig, cap) {
           // If host-side read-ahead was explicitly opted in, preserve base class path verbatim.
           if (this._shared && this._shared.readAhead && this._shared.readAhead.enabled) {
@@ -7854,6 +8083,7 @@
           }
           return this.closeHandle(handle);
         },
+        stat: (relPath) => this.statHandle(relPath),
       };
       if (options.readAhead !== undefined) {
         hostOptions.readAhead = options.readAhead;
@@ -8132,7 +8362,10 @@
         },
         mountedRpfCount: mountedArchives.length,
         openHandles: this._handles.size,
+        mailboxAttached: Boolean(this._mailboxHost),
         mailboxLanes: this._mailboxLanes,
+        statHits: this._streamingStats.statHits || 0,
+        statMisses: this._streamingStats.statMisses || 0,
       };
     }
 

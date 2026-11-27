@@ -549,6 +549,13 @@ void test_dstorage_virtual_and_httpfs() {
             }
         } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Close)) {
             HttpfsMailboxClient::complete_response(mb, 0);
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Stat)) {
+            std::string path(reinterpret_cast<const char*>(mb.payload), static_cast<size_t>(mb.length));
+            if (path == "stream/chunk0.bin") {
+                HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(httpfs_data.size()));
+            } else {
+                HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
+            }
         }
     });
     win32::set_httpfs_client(&client);
@@ -558,6 +565,9 @@ void test_dstorage_virtual_and_httpfs() {
                              kIidIDStorageFile,
                              reinterpret_cast<void**>(&http_file)) == S_OK_HR);
     CHECK(http_file != nullptr);
+    Pg6DStorageFileInfo http_info{};
+    CHECK(http_file->GetFileInformation(&http_info) == S_OK_HR);
+    CHECK(http_info.file_size == httpfs_data.size());
     char http_out[32]{};
     queue->EnqueueRead(http_file, 7, http_out, 14);  // "STREAMED-ASSET"
     queue->EnqueueStatus(status, 2);

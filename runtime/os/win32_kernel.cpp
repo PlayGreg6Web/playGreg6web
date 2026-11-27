@@ -415,6 +415,20 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
         return true;
     }
 
+    // Fast path: 1-roundtrip HTTPFS Stat (served from io_worker's in-memory manifest with zero
+    // network fetches), avoiding ~40-60 sequential 1-byte ReadAt binary-search probes per archive.
+    if (!file.httpfs_key.empty()) {
+        const int64_t st_size = file.httpfs_client->stat(file.httpfs_key);
+        if (st_size >= 0) {
+            const uint64_t resolved = static_cast<uint64_t>(st_size);
+            file.cached_size = resolved;
+            file.has_cached_size = true;
+            out_size = resolved;
+            remember_httpfs_size(file, resolved);
+            return true;
+        }
+    }
+
     uint8_t probe = 0;
     const int64_t first = file.httpfs_client->read(file.httpfs_handle, 0, &probe, 1);
     if (first < 0) {

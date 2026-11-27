@@ -34,6 +34,7 @@ inline constexpr uint32_t kDefaultDStorageWorkerThreads = 4;
 using HttpfsOpenFn = std::function<int32_t(std::string_view rel_path)>;
 using HttpfsReadFn = std::function<int64_t(int32_t handle, uint64_t offset, void* dst, size_t len)>;
 using HttpfsCloseFn = std::function<void(int32_t handle)>;
+using HttpfsStatFn = std::function<int64_t(std::string_view rel_path)>;
 using LogFn = std::function<void(std::string_view message)>;
 
 // Browser HTTPFS guest program loader. Streams `program-manifest.json` and `.pgim` images
@@ -59,6 +60,8 @@ struct WasmBootConfig {
     uint32_t dstorage_worker_threads = kDefaultDStorageWorkerThreads;
     // Title arguments appended to the guest command line (a relaunch passes the title's new ones).
     std::string title_args;
+    // Optional fast 1-roundtrip stat callback (empty: playgta6::os::httpfs_stat). Kept trailing.
+    HttpfsStatFn stat_fn;
 };
 
 struct WasmBootResult {

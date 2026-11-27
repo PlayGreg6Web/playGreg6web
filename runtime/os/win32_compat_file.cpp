@@ -147,27 +147,50 @@ uint32_t probe_game_file(const std::string& key, uint64_t* size) {
         }
     }
 
-    const Handle h = CreateFileA(key.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, kNullHandle);
+    // Fast path: 1-roundtrip HTTPFS Stat returns both existence and exact byte size from
+    // io_worker's in-memory manifest without CreateFileA / GetFileSizeEx / CloseHandle probes.
+    // Falls back cleanly when a mock responder or direct backend returns unsupported (-38 / -1).
     GameFileStatEntry entry;
-    if (h == INVALID_HANDLE_VALUE) {
-        const uint32_t err = GetLastError();
-        entry.err = err == ERROR_SUCCESS ? ERROR_FILE_NOT_FOUND : err;
-    } else {
-        entry.err = ERROR_SUCCESS;
-        if (size != nullptr) {
-            int64_t file_size = 0;
-            const bool ok = GetFileSizeEx(h, &file_size);
-            CloseHandle(h);
-            if (ok) {
-                entry.has_size = true;
-                entry.size = file_size > 0 ? static_cast<uint64_t>(file_size) : 0;
+    bool stat_resolved = false;
+    if (HttpfsMailboxClient* client = get_httpfs_client();
+        client != nullptr && httpfs_client_generation() == gen) {
+        const int64_t st_size = client->stat(key);
+        if (st_size >= 0) {
+            entry.err = ERROR_SUCCESS;
+            entry.has_size = true;
+            entry.size = static_cast<uint64_t>(st_size);
+            if (size != nullptr) {
                 *size = entry.size;
-            } else {
-                *size = 0;
             }
+            stat_resolved = true;
+        } else if (st_size == -2) {
+            entry.err = ERROR_FILE_NOT_FOUND;
+            stat_resolved = true;
+        }
+    }
+
+    if (!stat_resolved) {
+        const Handle h = CreateFileA(key.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, kNullHandle);
+        if (h == INVALID_HANDLE_VALUE) {
+            const uint32_t err = GetLastError();
+            entry.err = err == ERROR_SUCCESS ? ERROR_FILE_NOT_FOUND : err;
         } else {
-            CloseHandle(h);
+            entry.err = ERROR_SUCCESS;
+            if (size != nullptr) {
+                int64_t file_size = 0;
+                const bool ok = GetFileSizeEx(h, &file_size);
+                CloseHandle(h);
+                if (ok) {
+                    entry.has_size = true;
+                    entry.size = file_size > 0 ? static_cast<uint64_t>(file_size) : 0;
+                    *size = entry.size;
+                } else {
+                    *size = 0;
+                }
+            } else {
+                CloseHandle(h);
+            }
         }
     }
 

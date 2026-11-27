@@ -31,6 +31,8 @@ enum class HttpfsOp : uint32_t {
     Open = 1,
     Read = 2,
     Close = 3,
+    // 4 is reserved for io_worker.js opt-in /pg6_dump/ write forwarding (HTTPFS_OP_WRITE).
+    Stat = 5,
 };
 
 // Fixed-layout shared-memory mailbox protocol struct shared between Wasm64 pthread workers
@@ -42,8 +44,8 @@ enum class HttpfsOp : uint32_t {
 //   8..12  : handle           (int32_t, virtual file handle)
 //   12..16 : payload_capacity (uint32_t, usable payload bytes)
 //   16..24 : offset           (uint64_t, byte offset for Read)
-//   24..32 : length           (uint64_t, path length for Open / byte count for Read)
-//   32..40 : result           (int64_t, handle for Open / bytes read for Read / <0 on error)
+//   24..32 : length           (uint64_t, path length for Open/Stat / byte count for Read)
+//   32..40 : result           (int64_t, handle for Open / bytes read for Read / file size for Stat / <0 on error)
 //   40..   : payload[]        (uint8_t[kHttpfsPayloadBytes])
 struct alignas(8) HttpfsMailbox {
     int32_t status = static_cast<int32_t>(HttpfsStatus::Idle);
@@ -90,8 +92,11 @@ struct HttpfsDirectBackend {
     std::function<int32_t(std::string_view rel_path)> open;
     std::function<int64_t(int32_t handle, uint64_t offset, void* dst, size_t len)> read;
     std::function<bool(int32_t handle)> close;
+    // Optional fast 1-roundtrip file size query: returns exact byte size (>= 0), or < 0 on error
+    // (-2 = ENOENT, -38 = unsupported). When unset, HttpfsMailboxClient::stat() returns -38.
+    std::function<int64_t(std::string_view rel_path)> stat;
     // When true, the backend callbacks are thread-safe / multi-lane and HttpfsMailboxClient does
-    // not hold its global HttpfsFairMutex across direct open/read/close calls.
+    // not hold its global HttpfsFairMutex across direct open/read/close/stat calls.
     bool concurrent = false;
     // Maximum bytes requested per direct read() call (0 falls back to kHttpfsPayloadBytes).
     size_t max_chunk_bytes = kHttpfsPayloadBytes;
@@ -142,6 +147,11 @@ public:
 
     // Closes a virtual file handle. Returns true on success.
     bool close(int32_t handle);
+
+    // Queries the exact byte size of `rel_path` in 1 mailbox roundtrip (e.g. from io_worker's
+    // in-memory manifest without network fetches). Returns byte size (>= 0), or < 0 on error
+    // (-2 = ENOENT, -22 = EINVAL, -38 = ENOSYS when unsupported).
+    int64_t stat(std::string_view rel_path);
 
     // Responder-side helpers (for native worker threads and unit tests).
     static void init_mailbox(HttpfsMailbox& mailbox,

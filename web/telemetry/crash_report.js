@@ -1607,6 +1607,112 @@ function sanitizeBinkTelemetry(raw, depth = 0) {
   return out;
 }
 
+function sanitizeIoWorkerStatsSnapshot(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  let source = raw;
+  if (typeof source === 'object' && typeof source.getStats === 'function') {
+    try {
+      source = source.getStats();
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(source)) {
+    return null;
+  }
+  const mailbox = isPlainObject(source.mailbox) ? source.mailbox : null;
+  const streaming = isPlainObject(source.streaming) ? source.streaming : null;
+  const imm = isPlainObject(source.immutableCache) ? source.immutableCache : null;
+  const out = {};
+
+  if (typeof source.mailboxAttached === 'boolean') {
+    out.mailboxAttached = source.mailboxAttached;
+  }
+  const intSpecs = [
+    ['mailboxLanes', source.mailboxLanes],
+    ['openHandles', source.openHandles],
+    ['readsCompleted', source.readsCompleted ?? (streaming ? streaming.readsCompleted : undefined)],
+    ['bytesTransferred', source.bytesTransferred ?? (streaming ? streaming.bytesTransferred : undefined)],
+    [
+      'inFlightRequests',
+      source.inFlightRequests ??
+        (mailbox ? mailbox.activeLanes ?? mailbox.activePendingSlots : undefined) ??
+        (imm ? imm.inFlightRequests : undefined),
+    ],
+    ['activeLanes', source.activeLanes ?? (mailbox ? mailbox.activeLanes : undefined)],
+    ['peakActiveLanes', source.peakActiveLanes ?? (mailbox ? mailbox.peakActiveLanes : undefined)],
+    [
+      'requests',
+      source.requests ??
+        (mailbox ? mailbox.totalRequests ?? mailbox.requests : undefined),
+    ],
+    ['syncFastPathHits', source.syncFastPathHits ?? (mailbox ? mailbox.syncFastPathHits : undefined)],
+    ['asyncPathHits', source.asyncPathHits ?? (mailbox ? mailbox.asyncPathHits : undefined)],
+    ['errorCount', source.errorCount ?? (streaming ? streaming.errorCount : undefined)],
+    ['cacheHits', source.cacheHits ?? (streaming ? streaming.cacheHits : undefined)],
+    ['cacheMisses', source.cacheMisses],
+    ['bytesServedFromCache', source.bytesServedFromCache],
+    ['bytesFetched', source.bytesFetched],
+    ['slabCacheHits', source.slabCacheHits ?? (imm ? imm.slabCacheHits : undefined)],
+    ['slabCacheMisses', source.slabCacheMisses ?? (imm ? imm.slabCacheMisses : undefined)],
+    ['opfsHits', source.opfsHits],
+    ['opfsMisses', source.opfsMisses],
+    ['statHits', source.statHits],
+    ['statMisses', source.statMisses],
+  ];
+  for (let i = 0; i < intSpecs.length; i += 1) {
+    const [key, val] = intSpecs[i];
+    if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+      out[key] = Math.floor(val);
+    }
+  }
+  const avgReadMs = source.avgReadMs ?? (streaming ? streaming.avgReadMs : undefined);
+  if (typeof avgReadMs === 'number' && Number.isFinite(avgReadMs) && avgReadMs >= 0) {
+    out.avgReadMs = Math.round(avgReadMs * 1000) / 1000;
+  }
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function sanitizeRuntimeDiagnosticsSnapshot(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const out = {};
+  if (isPlainObject(raw.dstorage)) {
+    const ds = {};
+    for (const k of [
+      'requests_completed',
+      'requests_failed',
+      'requests_cancelled',
+      'bytes_delivered',
+      'file_reads',
+      'coalesced_requests',
+      'decompressed_requests',
+      'submits',
+      'live_queues',
+      'physical_page_requests',
+      'bcpack_requests',
+      'bcpack_decoded',
+    ]) {
+      const v = pickNonNegInt(raw.dstorage, k);
+      if (v !== undefined) ds[k] = v;
+    }
+    const dbg = clipSanitizedString(raw.dstorage.debug_state, 512);
+    if (dbg !== undefined) ds.debug_state = dbg;
+    if (Object.keys(ds).length > 0) out.dstorage = ds;
+  }
+  if (raw.blocked_waits !== undefined && raw.blocked_waits !== null) {
+    out.blocked_waits = sanitizeValue(raw.blocked_waits);
+  }
+  if (isPlainObject(raw.streaming_drain)) {
+    out.streaming_drain = sanitizeValue(raw.streaming_drain);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 /**
  * Strictly allowlists and sanitizes a GPU telemetry snapshot.
  * Drops unknown keys, shader sources, and raw binary buffers; redacts host paths/tokens;
@@ -2415,6 +2521,8 @@ export class CrashReporter {
     this._gpuTelemetry = null;
     this._binkTelemetry = null;
     this._audioTelemetry = null;
+    this._ioWorkerStats = null;
+    this._runtimeDiagnostics = null;
     this._gpuAdapter = null;
 
     this._attachedTarget = null;
@@ -2498,6 +2606,8 @@ export class CrashReporter {
     this._gpuTelemetry = null;
     this._binkTelemetry = null;
     this._audioTelemetry = null;
+    this._ioWorkerStats = null;
+    this._runtimeDiagnostics = null;
     this._gpuAdapter = null;
   }
 
@@ -2677,6 +2787,51 @@ export class CrashReporter {
    */
   getAudioTelemetry() {
     return this._audioTelemetry ? sanitizeValue(this._audioTelemetry) : null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized IO / HTTPFS worker telemetry snapshot
+   * (`mailboxAttached`, HTTPFS read counts/bytes/in-flight/errors, cache hits) to include
+   * under `bootDiagnostics.ioWorkerStats` in exported diagnostic bundles.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} snapshot
+   * @returns {object|null}
+   */
+  setIoWorkerStats(snapshot) {
+    this._ioWorkerStats = sanitizeIoWorkerStatsSnapshot(snapshot);
+    return this.getIoWorkerStats();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached IO worker stats snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getIoWorkerStats() {
+    return this._ioWorkerStats ? sanitizeValue(this._ioWorkerStats) : null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized live runtime diagnostics snapshot (`dstorage`,
+   * `blocked_waits`, `streaming_drain`) to include under `bootDiagnostics.runtimeDiagnostics`.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} snapshot
+   * @returns {object|null}
+   */
+  setRuntimeDiagnostics(snapshot) {
+    this._runtimeDiagnostics = sanitizeRuntimeDiagnosticsSnapshot(snapshot);
+    return this.getRuntimeDiagnostics();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached runtime diagnostics snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getRuntimeDiagnostics() {
+    return this._runtimeDiagnostics ? sanitizeValue(this._runtimeDiagnostics) : null;
   }
 
   /**
@@ -2947,6 +3102,8 @@ export class CrashReporter {
     gpuTelemetry,
     binkTelemetry,
     audioTelemetry,
+    ioWorkerStats,
+    runtimeDiagnostics,
     gpuAdapter,
     firstVisibleFrameMs,
     blackLoadingMs,
@@ -2995,6 +3152,12 @@ export class CrashReporter {
       gpuTelemetry !== undefined ? sanitizeGpuTelemetry(gpuTelemetry) : this._gpuTelemetry;
     const resolvedBinkTelemetry =
       binkTelemetry !== undefined ? sanitizeBinkTelemetry(binkTelemetry) : this._binkTelemetry;
+    const resolvedIoWorkerStats =
+      ioWorkerStats !== undefined ? sanitizeIoWorkerStatsSnapshot(ioWorkerStats) : this._ioWorkerStats;
+    const resolvedRuntimeDiagnostics =
+      runtimeDiagnostics !== undefined
+        ? sanitizeRuntimeDiagnosticsSnapshot(runtimeDiagnostics)
+        : this._runtimeDiagnostics;
 
     let resolvedAudioTelemetry =
       audioTelemetry !== undefined ? sanitizeAudioTelemetry(audioTelemetry) : this._audioTelemetry;
@@ -3078,6 +3241,8 @@ export class CrashReporter {
         gpuTelemetry: resolvedGpuTelemetry,
         binkTelemetry: resolvedBinkTelemetry,
         audioTelemetry: resolvedAudioTelemetry,
+        ioWorkerStats: resolvedIoWorkerStats,
+        runtimeDiagnostics: resolvedRuntimeDiagnostics,
       },
     };
 
@@ -3732,6 +3897,42 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
     }
     if (audioParts.length > 0) {
       lines.push(`- **Audio:** ${audioParts.join(', ')}`);
+    }
+  }
+
+  // IO / HTTPFS worker telemetry
+  const ioWorkerStats = sanitizeIoWorkerStatsSnapshot(
+    rawBootDiag && rawBootDiag.ioWorkerStats !== undefined
+      ? rawBootDiag.ioWorkerStats
+      : isPlainObject(rawSource)
+        ? rawSource.ioWorkerStats
+        : null
+  );
+  if (ioWorkerStats && Object.keys(ioWorkerStats).length > 0) {
+    const ioParts = [];
+    if (typeof ioWorkerStats.mailboxAttached === 'boolean') {
+      ioParts.push(`mailboxAttached=${ioWorkerStats.mailboxAttached ? 'yes' : 'no'}`);
+    }
+    if (ioWorkerStats.mailboxLanes !== undefined) {
+      ioParts.push(`lanes=${ioWorkerStats.mailboxLanes}`);
+    }
+    if (ioWorkerStats.readsCompleted !== undefined) {
+      ioParts.push(`reads=${ioWorkerStats.readsCompleted}`);
+    }
+    if (ioWorkerStats.bytesTransferred !== undefined) {
+      ioParts.push(`bytes=${ioWorkerStats.bytesTransferred}`);
+    }
+    if (ioWorkerStats.cacheHits !== undefined) {
+      ioParts.push(`cacheHits=${ioWorkerStats.cacheHits}`);
+    }
+    if (ioWorkerStats.inFlightRequests !== undefined) {
+      ioParts.push(`inFlight=${ioWorkerStats.inFlightRequests}`);
+    }
+    if (ioWorkerStats.errorCount !== undefined) {
+      ioParts.push(`errors=${ioWorkerStats.errorCount}`);
+    }
+    if (ioParts.length > 0) {
+      lines.push(`- **IO / HTTPFS:** ${ioParts.join(', ')}`);
     }
   }
 

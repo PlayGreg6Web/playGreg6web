@@ -14,6 +14,7 @@ EM_IMPORT(host_log) void host_log(const char* ptr, size_t len);
 EM_IMPORT(host_httpfs_open) int32_t host_httpfs_open(const char* ptr, size_t len);
 EM_IMPORT(host_httpfs_read) int64_t host_httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len);
 EM_IMPORT(host_httpfs_close) void host_httpfs_close(int32_t handle);
+EM_IMPORT(host_httpfs_stat) int64_t host_httpfs_stat(const char* ptr, size_t len);
 EM_IMPORT(host_wgpu_submit) void host_wgpu_submit(const uint8_t* ptr, size_t len);
 
 EMSCRIPTEN_KEEPALIVE void playgta6_attach_httpfs_mailbox(playgta6::os::HttpfsMailbox* mailbox) {
@@ -138,6 +139,18 @@ void httpfs_close(int32_t handle) {
     host_httpfs_close(handle);
 #else
     (void)handle;
+#endif
+}
+
+int64_t httpfs_stat(std::string_view rel_path) {
+    if (auto lease = acquire_httpfs_client(); lease.client != nullptr) {
+        return lease.client->stat(rel_path);
+    }
+#ifdef __EMSCRIPTEN__
+    return host_httpfs_stat(rel_path.data(), rel_path.size());
+#else
+    (void)rel_path;
+    return -38;
 #endif
 }
 

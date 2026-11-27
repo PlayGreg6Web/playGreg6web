@@ -604,6 +604,63 @@ void test_concurrent_direct_retries_multithreaded() {
     mutator.join();
 }
 
+// ---------------------------------------------------------------------------
+// 5. HttpfsOp::Stat — 1-roundtrip file size query (mailbox and direct modes)
+// ---------------------------------------------------------------------------
+
+void test_stat_mailbox_and_direct() {
+    using namespace playgta6::os;
+
+    // 5a. Shared-memory mailbox mode.
+    HttpfsMailbox mailbox{};
+    HttpfsMailboxClient::init_mailbox(mailbox);
+    std::atomic<int> stat_calls{0};
+    std::atomic<int> read_calls{0};
+    HttpfsMailboxClient mb_client(&mailbox, [&](HttpfsMailbox& mb) {
+        const auto op = static_cast<HttpfsOp>(mb.op);
+        if (op == HttpfsOp::Stat) {
+            stat_calls.fetch_add(1, std::memory_order_relaxed);
+            std::string path(reinterpret_cast<const char*>(mb.payload), static_cast<size_t>(mb.length));
+            if (path == "game/common.rpf") {
+                HttpfsMailboxClient::complete_response(mb, 5368709120LL, HttpfsStatus::ResponseReady);
+            } else if (path == "empty.bin") {
+                HttpfsMailboxClient::complete_response(mb, 0LL, HttpfsStatus::ResponseReady);
+            } else {
+                HttpfsMailboxClient::complete_response(mb, -2LL, HttpfsStatus::Error);
+            }
+            return;
+        }
+        if (op == HttpfsOp::Read) {
+            read_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        HttpfsMailboxClient::complete_response(mb, -38LL, HttpfsStatus::Error);
+    });
+
+    CHECK(mb_client.stat("game/common.rpf") == 5368709120LL);
+    CHECK(mb_client.stat("empty.bin") == 0LL);
+    CHECK(mb_client.stat("missing.rpf") == -2LL);
+    CHECK(mb_client.stat("") == -22LL);
+    CHECK(stat_calls.load() == 3);
+    CHECK(read_calls.load() == 0);
+
+    // 5b. Direct backend with stat callback.
+    HttpfsDirectBackend direct;
+    direct.stat = [](std::string_view rel) -> int64_t {
+        if (rel == "update/dlc.rpf") return 987654321LL;
+        return -2;
+    };
+    direct.concurrent = true;
+    HttpfsMailboxClient direct_client(std::move(direct));
+    CHECK(direct_client.stat("update/dlc.rpf") == 987654321LL);
+    CHECK(direct_client.stat("absent.rpf") == -2LL);
+    CHECK(direct_client.stat("") == -22LL);
+
+    // 5c. Direct backend without stat callback returns -38 (ENOSYS) cleanly.
+    HttpfsDirectBackend legacy;
+    HttpfsMailboxClient legacy_client(std::move(legacy));
+    CHECK(legacy_client.stat("update/dlc.rpf") == -38LL);
+}
+
 }  // namespace
 
 int main() {
@@ -611,6 +668,7 @@ int main() {
     test_default_direct_serializes_io();
     test_direct_max_chunk_bytes_and_retries();
     test_concurrent_direct_retries_multithreaded();
+    test_stat_mailbox_and_direct();
 
     const int failures = g_failures.load(std::memory_order_relaxed);
     if (failures != 0) {
