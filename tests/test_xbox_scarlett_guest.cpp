@@ -1823,34 +1823,65 @@ void test_xg() {
         CHECK(fx.vcall(t64, 1) == 0);
     }
 
-    // GetResourceTiling for a 4 KiB mode (0x105): a tile is one 4 KiB swizzle block (32x32 RGBA8
-    // texels), not the D3D12 64 KiB standard tile (128x128), and tile numbers are in 4 KiB units.
+    // GetResourceTiling for the 4 KiB and 256 B modes: D3D12 tiled resources always have 64 KiB
+    // tiles and the title sizes and maps them so, so the answer is the standard 64 KiB shape and
+    // the D3D12 packed-mip rule (a mip at least one tile in every dimension is standard, the rest
+    // one packed tail), identical to what a 64 KiB mode gets for the same shape. Tall / narrow
+    // textures must not report 4 KiB-block counts (7+ standard mips).
     {
-        namespace gx = playgta6::gpu::gfx10;
-        const uint64_t tdesc = xg_desc(3, 256, 256, 1, 9, 28);
-        CHECK(com::write_guest(tdesc + 0x2C, uint32_t{0x105}));
-        const uint64_t tout = fx.out_slot();
-        CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
-        const uint64_t t4 = load64(tout);
-        uint32_t tcap = 16;
-        CHECK(com::write_guest(count, tcap));
-        fx.vcall(t4, 10, {I(num_tiles), I(packed), I(shape), I(count), I(0), I(tilings)});
-        const gx::TextureLayoutDesc chain{28u, 256u, 256u, 1u, 9u, 0x105u, 0u};
-        const gx::TileMap tm = gx::tile_map(chain);
-        ga::XgTileShape sh{};
-        CHECK(com::read_guest(shape, sh));
-        CHECK(sh.width_in_texels == 32 && sh.height_in_texels == 32 && sh.depth_in_texels == 1);
-        ga::XgPackedMipInfo tp{};
-        CHECK(com::read_guest(packed, tp));
-        CHECK(tm.ok && tp.num_standard_mips == tm.standard_mips && tp.num_tiles_for_packed_mips == tm.tail_tiles);
-        uint32_t ttiles = 0;
-        CHECK(com::read_guest(num_tiles, ttiles));
-        CHECK(uint64_t{ttiles} * 4096u == gx::surface_bytes(chain));
-        ga::XgSubresourceTiling m0{};
-        CHECK(com::read_guest(tilings, m0));
-        CHECK(m0.width_in_tiles == 8 && m0.height_in_tiles == 8);
-        CHECK(m0.start_tile_index_in_overall_resource == tm.start_tile[0]);
-        CHECK(fx.vcall(t4, 1) == 0);
+        struct Case { uint32_t w, h, mips, fmt, mode; };
+        uint32_t checked = 0;
+        for (const uint32_t mode : {0x101u, 0x105u}) {
+            for (const Case c : {Case{256, 256, 9, 28, mode}, Case{128, 8192, 14, 28, mode}, Case{64, 4096, 13, 28, mode},
+                                 Case{4096, 128, 13, 28, mode}, Case{512, 8192, 14, 71, mode}, Case{1000, 600, 3, 61, mode},
+                                 Case{16, 16, 5, 28, mode}, Case{2048, 2048, 12, 10, mode}}) {
+                const uint64_t tdesc = xg_desc(3, c.w, c.h, 1, static_cast<uint16_t>(c.mips), c.fmt);
+                CHECK(com::write_guest(tdesc + 0x2C, c.mode));
+                const uint64_t tout = fx.out_slot();
+                CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
+                const uint64_t t4 = load64(tout);
+                const uint64_t tl = com::guest_alloc(16 * 12);
+                CHECK(com::write_guest(count, uint32_t{16}));
+                fx.vcall(t4, 10, {I(num_tiles), I(packed), I(shape), I(count), I(0), I(tl)});
+                ga::XgTileShape sh{};
+                ga::XgPackedMipInfo tp{};
+                uint32_t ttiles = 0, n = 0;
+                CHECK(com::read_guest(shape, sh) && com::read_guest(packed, tp));
+                CHECK(com::read_guest(num_tiles, ttiles) && com::read_guest(count, n));
+                // Standard 64 KiB shape (BC1: 512x256 texels, RGBA8 128x128, R8 256x256, RGBA16F 128x64).
+                const uint32_t bytes = c.fmt == 71 ? 8u : c.fmt == 61 ? 1u : c.fmt == 10 ? 8u : 4u;
+                const uint32_t wantw = c.fmt == 71 ? 512u : bytes == 1 ? 256u : bytes == 8 ? 128u : 128u;
+                const uint32_t wanth = c.fmt == 71 ? 256u : bytes == 1 ? 256u : bytes == 8 ? 64u : 128u;
+                CHECK(sh.width_in_texels == wantw && sh.height_in_texels == wanth && sh.depth_in_texels == 1);
+                CHECK(n == c.mips && tp.num_standard_mips + tp.num_packed_mips == c.mips);
+                uint32_t expect_std = 0;
+                while (expect_std < c.mips && (c.w >> expect_std) >= wantw && (c.h >> expect_std) >= wanth) ++expect_std;
+                CHECK(tp.num_standard_mips == expect_std);
+                // Tall / narrow textures: standard mips are bounded by the smaller dimension.
+                CHECK(tp.num_standard_mips <= 6);
+                // Tiles: standard mips back to back from tile 0, then the packed tail; total = sum.
+                uint32_t next = 0;
+                for (uint32_t m = 0; m < tp.num_standard_mips; ++m) {
+                    ga::XgSubresourceTiling st{};
+                    CHECK(com::read_guest(tl + 12ull * m, st));
+                    CHECK(st.start_tile_index_in_overall_resource == next);
+                    CHECK(st.width_in_tiles == (std::max(1u, c.w >> m) + wantw - 1) / wantw);
+                    CHECK(st.height_in_tiles == (std::max(1u, c.h >> m) + wanth - 1) / wanth);
+                    next += st.width_in_tiles * st.height_in_tiles;
+                }
+                if (tp.num_packed_mips != 0) {
+                    CHECK(tp.num_tiles_for_packed_mips >= 1 && tp.start_tile_index_in_overall_resource == next);
+                    next += tp.num_tiles_for_packed_mips;
+                    ga::XgSubresourceTiling pk{};
+                    CHECK(com::read_guest(tl + 12ull * tp.num_standard_mips, pk));
+                    CHECK(pk.start_tile_index_in_overall_resource == ga::kXgPackedTile);
+                }
+                CHECK(ttiles == next);
+                CHECK(fx.vcall(t4, 1) == 0);
+                ++checked;
+            }
+        }
+        CHECK(checked == 16u);
     }
 
     // GetTexelElementOffsetBytes (slot 6): the GFX10 address of an element (the detiler's), plus

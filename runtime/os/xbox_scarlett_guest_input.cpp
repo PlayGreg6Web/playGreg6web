@@ -1125,8 +1125,12 @@ public:
         const uint32_t mips = layout_.mip_levels;
         const uint32_t slices = desc_.dimension == 4 ? 1u : std::max<uint32_t>(layout_.array_size, 1);
         namespace gfx10 = playgta6::gpu::gfx10;
-        // Every verified GFX10 swizzle mode (256 B / 4 KiB / 64 KiB), not only 64 KiB: a tile is
-        // one swizzle block of that mode, not the D3D12 64 KiB standard tile.
+        // Only the 64 KiB GFX10 modes use the memory-order block map. D3D12 tiled resources always
+        // have 64 KiB tiles and the title sizes and maps them that way, so the 4 KiB and 256 B
+        // modes (and console linear) get the plain D3D12 answer: the standard 64 KiB tile shape,
+        // standard mips = the mips at least one tile big in every dimension, the rest one packed
+        // tail (a 4 KiB-block tile count would over-allocate 16x and make tall textures report
+        // 7+ standard mips, which the title rejects).
         const bool gfx10_tiled = tiled_ && tiled_desc_.d3d12_layout != gfx10::kConsoleLinearLayout;
         // GFX10 64KB modes take the standard/packed split and tile numbers from the shared
         // gfx10::tile_map (addrlib mip tail rule, not the D3D12 packed-mip rule: a 2:1 mip such as
@@ -1135,6 +1139,9 @@ public:
         gfx10::TileMap tm{};
         if (gfx10_tiled) {
             tm = gfx10::tile_map(tiled_desc_);
+            if (tm.block_bytes != 65536u) {
+                tm = gfx10::TileMap{};
+            }
         }
         uint32_t standard = 0;
         if (tm.ok) {
@@ -1167,7 +1174,7 @@ public:
             packed_bytes += layout_.mips[m].slice_size_bytes * (desc_.dimension == 4 ? layout_.mips[m].depth : 1u);
         }
         uint32_t packed_tiles =
-            standard < mips ? std::max<uint32_t>(1, ceil_div(packed_bytes, tm.ok ? tm.block_bytes : 65536)) : 0;
+            standard < mips ? std::max<uint32_t>(1, ceil_div(packed_bytes, 65536)) : 0;
         uint32_t packed_start = tiles_per_slice;
         // GFX10 64KB modes (verified placement): a tile is one 64 KiB block, and the tiles are
         // numbered in memory order. addrlib puts the mip tail (one block) first and the larger
