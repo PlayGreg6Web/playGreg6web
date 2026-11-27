@@ -38,6 +38,16 @@ class DecideTests(unittest.TestCase):
                     {"present_samples_total": 50, "fault_record": {"kind": "wall_time_limit"}}):
             self.assertTrue(ps.decide(rep, HS, "r")[0])
 
+    def test_stop_requested_limit_reached_passes(self) -> None:
+        rep = {"present_samples_total": 2831, "status": "limit_reached", "fault_record": {"kind": "stop_requested", "va": "0x140004810"}}
+        self.assertTrue(ps.decide(rep, HS, "r")[0])
+        rep["present_samples_total"] = 0
+        self.assertFalse(ps.decide(rep, HS, "r")[0])
+
+    def test_other_limit_kind_still_fails(self) -> None:
+        rep = {"present_samples_total": 50, "status": "limit_reached", "fault_record": {"kind": "dispatch_limit", "va": "0x10"}}
+        self.assertFalse(ps.decide(rep, HS, "r")[0])
+
     def test_wall_time_limit_without_presents_fails(self) -> None:
         self.assertFalse(ps.decide({"present_samples_total": 0, "fault_record": {"kind": "wall_time_limit"}}, HS, "r")[0])
 

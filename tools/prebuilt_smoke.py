@@ -27,7 +27,10 @@ HARD_STOPS = Path(__file__).resolve().parent.parent / "docs" / "HARD_STOPS.md"
 def _ran_full_duration(report: dict[str, Any]) -> bool:
     fr = report.get("fault_record")
     kinds = [report.get("status"), report.get("stop_reason"), fr.get("kind") if isinstance(fr, dict) else None]
-    return any(k == "wall_time_limit" for k in kinds)
+    if any(k == "wall_time_limit" for k in kinds):
+        return True
+    # the harness's own bound (--max-ms / window close) ends the boot as status limit_reached + fault kind stop_requested
+    return report.get("status") == "limit_reached" and any(k == "stop_requested" for k in kinds)
 
 
 def prune_runs(runs_dir: str | Path, keep: int = 3) -> list[Path]:
