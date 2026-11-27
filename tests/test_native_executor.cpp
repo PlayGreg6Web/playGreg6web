@@ -561,13 +561,16 @@ void test_layout_fit_over_limits(NativeExecutor& ex) {
     setup.create_buffer(140, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 256);
     setup.create_buffer(141, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 256);
     setup.create_buffer(142, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(148, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 16);  // zeros
     const uint32_t seven[4] = {7, 0, 0, 0};
     const uint32_t nine[4] = {9, 0, 0, 0};
     setup.write_buffer(140, 0, nine, 16);
     setup.write_buffer(141, 0, seven, 16);
+    // Binding n+1: a read-only WGSL buffer (`var<storage>`) under the title's read-only entry.
     const std::string wgsl = "@group(0) @binding(2) var<uniform> u: vec4<u32>;\n@group(0) @binding(" + std::to_string(n) +
-                             ") var<storage, read_write> out: array<u32>;\n"
-                             "@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = u.x + i; }\n";
+                             ") var<storage, read_write> out: array<u32>;\n@group(0) @binding(" + std::to_string(n + 1) +
+                             ") var<storage> ro: array<u32>;\n"
+                             "@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = u.x + i + ro[0]; }\n";
     setup.create_shader_module(143, GpuShaderStage::Compute, wgsl.c_str());
     std::vector<GpuBindGroupLayoutEntry> les;
     std::vector<GpuBindGroupEntry2> bes;
@@ -577,6 +580,8 @@ void test_layout_fit_over_limits(NativeExecutor& ex) {
     }
     les.push_back(layout_entry(n, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1));
     bes.push_back(bg_entry(n, GpuBindResourceType::Buffer, 142));
+    les.push_back(layout_entry(n + 1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 2));
+    bes.push_back(bg_entry(n + 1, GpuBindResourceType::Buffer, 148));
     create_layouts(setup, 144, 145, les);
     GpuCreateComputePipeline2Payload cp;
     std::memset(&cp, 0, sizeof cp);

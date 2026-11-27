@@ -734,7 +734,9 @@ void test_layout_remap() {
     need[0].binding = 0; need[0].kind = WgslBindingKind::ReadOnlyStorage;
     need[1].binding = 1; need[1].kind = WgslBindingKind::Sampler;
     std::vector<Group0LayoutEntry> have = {{0, 0, 1}, {1, 1, 0}};
-    CHECK(explicit_layout_compatible(&have, need));  // read-only-storage accepts a storage layout
+    CHECK(!explicit_layout_compatible(&have, need));  // a read-write layout entry does not serve read-only (Dawn)
+    have[0].subtype = 2;
+    CHECK(explicit_layout_compatible(&have, need));
     have[0].subtype = 0;  // uniform
     CHECK(!explicit_layout_compatible(&have, need));
     CHECK(explicit_layout_compatible(nullptr, need));
@@ -1047,6 +1049,12 @@ void test_wgsl_group_bindings() {
         CHECK(groups[3].size() == 1 && groups[3][0].binding == 0 && groups[3][0].kind == WgslBindingKind::Storage);
     }
     CHECK(parse_wgsl_group_bindings("@compute @workgroup_size(1) fn main() {}").empty());
+    // `var<storage>` is read-only in WGSL: a read-write layout entry does not serve it (Dawn rejects it).
+    const auto ro = parse_wgsl_group0_bindings("@group(0) @binding(4) var<storage> s: array<u32>;\nfn f() { _ = s[0]; }");
+    CHECK(ro.size() == 1 && ro[0].kind == WgslBindingKind::ReadOnlyStorage);
+    const std::vector<Group0LayoutEntry> rw = {{4, 0, 1}}, rd = {{4, 0, 2}};
+    CHECK(!explicit_layout_compatible(&rw, ro));
+    CHECK(explicit_layout_compatible(&rd, ro));
     const auto g0 = parse_wgsl_group_bindings("@group(0) @binding(1) var t: texture_2d<f32>;\nfn f() { _ = t; }");
     CHECK(g0.size() == 1 && g0[0].size() == 1 && g0[0][0].kind == WgslBindingKind::Texture);
 }

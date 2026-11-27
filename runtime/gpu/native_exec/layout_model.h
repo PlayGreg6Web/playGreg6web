@@ -254,7 +254,10 @@ inline std::optional<WgslBinding> classify_wgsl_var(const VarMatch& m) {
             b.kind = WgslBindingKind::Uniform;
             entry = b;
         } else if (parts[0] == "storage") {
-            b.kind = parts.size() > 1 && parts[1] == "read" ? WgslBindingKind::ReadOnlyStorage : WgslBindingKind::Storage;
+            // `var<storage>` without an access mode is read-only in WGSL (Dawn rejects a read-write
+            // layout entry for it).
+            b.kind = parts.size() > 1 && (parts[1] == "read_write" || parts[1] == "write") ? WgslBindingKind::Storage
+                                                                                           : WgslBindingKind::ReadOnlyStorage;
             entry = b;
         }
     } else if (type_trim.rfind("sampler_comparison", 0) == 0 &&
@@ -407,8 +410,8 @@ inline bool explicit_layout_compatible(const std::vector<Group0LayoutEntry>* ent
             case WgslBindingKind::Uniform:
                 if (!(e->kind == 0 && e->subtype == 0)) return false;
                 break;
-            case WgslBindingKind::ReadOnlyStorage:
-                if (!(e->kind == 0 && (e->subtype == 2 || e->subtype == 1))) return false;
+            case WgslBindingKind::ReadOnlyStorage:  // Dawn: a read-write layout entry does not serve it
+                if (!(e->kind == 0 && e->subtype == 2)) return false;
                 break;
             case WgslBindingKind::Storage:
                 if (!(e->kind == 0 && e->subtype == 1)) return false;

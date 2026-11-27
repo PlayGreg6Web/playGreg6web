@@ -2770,6 +2770,9 @@ struct NativeExecutor::Impl {
                         LayoutEntry x = le;
                         x.visibility = f.visibility;
                         x.dynamic = false;
+                        // The title's storage entry for a WGSL read-only binding: Dawn wants the WGSL's access.
+                        if (x.kind == 0)
+                            x.subtype = f.b.kind == WgslBindingKind::Uniform ? 0 : f.b.kind == WgslBindingKind::Storage ? 1 : 2;
                         bb.push_back(x);
                     }
             std::vector<wgpu::BindGroupLayoutEntry> wes(bb.size());
