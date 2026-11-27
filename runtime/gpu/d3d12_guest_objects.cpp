@@ -2101,26 +2101,60 @@ uint64_t console_layout_size(const GuestResourceDesc& d) {
 }
 
 // D3D12 small-resource placement (D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, 4 KiB): a texture
-// with D3D12_TEXTURE_LAYOUT_UNKNOWN that asks for it is laid out in 4 KiB swizzle blocks
-// (GFX10 SW_4KB_S, addrlib placement) and may use the 4 KiB alignment only while that whole
-// surface fits in 64 KiB (D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT). Title data for such a
+// (never a buffer) that is not multisampled, a render target or depth-stencil may use the 4 KiB alignment only while its whole
+// surface fits in 64 KiB (D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT), and only in a layout whose
+// swizzle block is at most 4 KiB. With D3D12_TEXTURE_LAYOUT_UNKNOWN a 2D/3D texture that asks for it
+// is laid out in 4 KiB swizzle blocks (GFX10 SW_4KB_S, addrlib placement); title data for such a
 // texture is stored in that layout, so a 128x4 R16G16B16A16 texture takes four 4 KiB blocks
-// (16 KiB), not its 4 KiB of texels. Returns the surface size, or 0 when the description is not
-// such a texture or does not fit (the caller then uses the 64 KiB default).
+// (16 KiB), not its 4 KiB of texels. An explicit console layout keeps its own size. Returns the
+// surface size, or 0 when the description cannot use small placement (the caller then answers
+// with the 64 KiB default, as D3D12 does).
+//
+// The title relies on this: it asks for 4 KiB first for every buffer and every texture it
+// estimates below 512 KiB (Texture3D with layout 0x105), sub-allocates 4 KiB-aligned answers
+// inside shared 64 KiB pages, and later tile-maps resident mips of the larger ones in whole
+// 64 KiB pages from the base rounded down. A 4 KiB answer for a resource over 64 KiB (or in a
+// 64 KiB swizzle) therefore maps a neighbour's page: two owners of one GPU page (#2071).
 constexpr uint64_t kSmallPlacementAlignment = 4u << 10;
 constexpr uint64_t kDefaultPlacementAlignment = 64u << 10;
 constexpr uint32_t kSw4kbSLayout = gfx10::kConsoleLinearLayout | 5u;  // 0x105: SW_4KB_S
 
+// GFX10 swizzle modes whose block is at most 4 KiB: linear, 256B_*, 4KB_* and 4KB_*_X.
+bool small_block_layout(uint32_t layout) {
+    if (layout < gfx10::kConsoleLinearLayout || layout > (gfx10::kConsoleLinearLayout | 0x1Fu)) {
+        return false;
+    }
+    const uint32_t mode = layout & 0x1Fu;
+    return mode <= 7u || (mode >= 20u && mode <= 23u);
+}
+
 uint64_t small_texture_size(const GuestResourceDesc& d) {
-    if (d.Dimension != ResourceDimension::Texture2D || d.Layout != 0 || d.Alignment != kSmallPlacementAlignment ||
-        d.SampleCount > 1) {
+    // Render targets and depth-stencil (ALLOW_RENDER_TARGET / ALLOW_DEPTH_STENCIL) are never small.
+    if (d.Alignment != kSmallPlacementAlignment || d.SampleCount > 1 || (d.Flags & 0x3u) != 0 ||
+        (d.Dimension != ResourceDimension::Texture1D && d.Dimension != ResourceDimension::Texture2D &&
+         d.Dimension != ResourceDimension::Texture3D)) {
         return 0;
     }
-    GuestResourceDesc tiled = d;
-    tiled.Layout = kSw4kbSLayout;
-    const uint64_t size = console_layout_size(tiled);
+    uint64_t size = 0;
+    if (d.Layout == 0) {
+        if (d.Dimension == ResourceDimension::Texture1D) {
+            GuestResourceDesc any = d;
+            any.Alignment = 0;
+            size = resource_size_estimate(any);
+        } else {
+            GuestResourceDesc tiled = d;
+            tiled.Layout = kSw4kbSLayout;
+            size = console_layout_size(tiled);
+        }
+    } else if (small_block_layout(d.Layout)) {
+        GuestResourceDesc any = d;
+        any.Alignment = 0;
+        size = resource_size_estimate(any);
+    }
     return size <= kDefaultPlacementAlignment ? size : 0;
 }
+
+std::atomic<uint64_t> g_small_placement_refused{0};
 
 }  // namespace
 
@@ -2156,15 +2190,20 @@ uint64_t resource_size_estimate(const GuestResourceDesc& d) {
 }
 
 ResourceAllocation resource_allocation(const GuestResourceDesc& d) {
-    if (d.Dimension == ResourceDimension::Texture2D && d.Layout == 0 && d.Alignment == kSmallPlacementAlignment &&
-        d.SampleCount <= 1) {
+    if (d.Alignment == kSmallPlacementAlignment) {
         if (const uint64_t small = small_texture_size(d); small != 0) {
             return {align_up(small, kSmallPlacementAlignment), kSmallPlacementAlignment};
         }
-        // Too large for small placement: D3D12 answers with the default alignment instead.
+        // Not a small resource (a buffer, over 64 KiB, a 64 KiB swizzle, MSAA): D3D12 answers
+        // with the default alignment instead.
         GuestResourceDesc fallback = d;
         fallback.Alignment = 0;
-        return resource_allocation(fallback);
+        const ResourceAllocation a = resource_allocation(fallback);
+        if (g_small_placement_refused.fetch_add(1) < 4) {
+            os::log("d3d12_xs: 4 KiB placement refused (dimension " + std::to_string(d.Dimension) + ", layout " +
+                    std::to_string(d.Layout) + ", " + std::to_string(a.size) + " bytes): 64 KiB alignment");
+        }
+        return a;
     }
     const uint64_t alignment = d.Alignment != 0 ? d.Alignment : (d.SampleCount > 1 ? (4u << 20) : kDefaultPlacementAlignment);
     return {align_up(resource_size_estimate(d), alignment), alignment};

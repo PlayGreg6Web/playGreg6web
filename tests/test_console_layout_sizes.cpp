@@ -128,14 +128,87 @@ void test_small_placement() {
     a = dg::resource_allocation(small(128, 4, 1, 11, 0));
     CHECK(a.alignment == 0x10000u && a.size == 0x10000u);
     CHECK(dg::resource_size_estimate(small(128, 4, 1, 11, 0)) == 4096u);
-    // MSAA and explicit console layouts keep their own answers.
+    // MSAA never uses small placement.
     dg::GuestResourceDesc msaa = small(32, 16, 1, 28, 4096);
     msaa.SampleCount = 4;
-    CHECK(dg::resource_allocation(msaa).alignment == 0x1000u);
+    CHECK(dg::resource_allocation(msaa).alignment != 0x1000u);
+    dg::GuestResourceDesc rt = small(32, 16, 1, 28, 4096);
+    rt.Flags = 0x1;  // ALLOW_RENDER_TARGET
+    CHECK(dg::resource_allocation(rt).alignment == 0x10000u);
+    // Explicit console layouts with a block of at most 4 KiB keep their own size.
     dg::GuestResourceDesc linear = small(128, 4, 1, 11, 4096);
     linear.Layout = 0x100;
     a = dg::resource_allocation(linear);
     CHECK(a.alignment == 0x1000u && a.size == ((dg::resource_size_estimate(linear) + 0xFFFu) & ~0xFFFull));
+}
+
+// #2071: the title asks for 4 KiB first for every buffer and every texture it estimates under
+// 512 KiB, sub-allocates 4 KiB answers inside shared 64 KiB pages, and tile-maps the resident mips
+// of larger resources in whole 64 KiB pages from the base rounded down. Only textures whose whole
+// surface fits in 64 KiB in a layout with blocks of at most 4 KiB may get 4 KiB.
+void test_small_placement_title_requests() {
+    // Buffers: never small, whatever their size.
+    dg::GuestResourceDesc buffer{};
+    buffer.Dimension = 1;
+    buffer.Width = 0x3000;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleCount = 1;
+    buffer.Alignment = 4096;
+    dg::ResourceAllocation a = dg::resource_allocation(buffer);
+    CHECK(a.alignment == 0x10000u && a.size == 0x10000u);
+    buffer.Width = 0x14000;  // the size that used to straddle two 64 KiB pages at a 4 KiB offset
+    a = dg::resource_allocation(buffer);
+    CHECK(a.alignment == 0x10000u && a.size == 0x20000u);
+
+    // Texture3D the way the title asks (layout set to 0x105 = SW_4KB_S): 4 KiB only within 64 KiB.
+    dg::GuestResourceDesc vol = texture(4, 32, 32, 4, 1, 28, 0x105);
+    vol.Alignment = 4096;
+    a = dg::resource_allocation(vol);
+    const gfx10::TextureLayoutDesc vol_small{28u, 32u, 32u, 4u, 1u, 0x105u, 0u};
+    CHECK(a.alignment == 0x1000u && a.size == gfx10::surface_bytes(vol_small) && a.size <= 0x10000u);
+    vol = texture(4, 64, 64, 16, 1, 28, 0x105);  // 256 KiB of texels
+    vol.Alignment = 4096;
+    a = dg::resource_allocation(vol);
+    CHECK(a.alignment == 0x10000u && a.size % 0x10000u == 0 && a.size > 0x10000u);
+    // Texture3D with layout UNKNOWN is sized like the title's SW_4KB_S request.
+    vol = texture(4, 32, 32, 4, 1, 28, 0);
+    vol.Alignment = 4096;
+    CHECK(dg::resource_allocation(vol).alignment == 0x1000u &&
+          dg::resource_allocation(vol).size == gfx10::surface_bytes(vol_small));
+
+    // 2D in a 64 KiB swizzle (0x109 = SW_64KB_S): never 4 KiB, even when small.
+    dg::GuestResourceDesc t64 = small(32, 16, 1, 28, 4096);
+    t64.Layout = 0x109;
+    a = dg::resource_allocation(t64);
+    CHECK(a.alignment == 0x10000u && a.size == 0x10000u);
+    // 2D with an explicit 4 KiB swizzle over 64 KiB: the default.
+    dg::GuestResourceDesc t4 = small(256, 256, 1, 28, 4096);
+    t4.Layout = 0x105;
+    a = dg::resource_allocation(t4);
+    CHECK(a.alignment == 0x10000u && a.size >= 0x40000u && a.size % 0x10000u == 0);
+    // ...and within 64 KiB it keeps 4 KiB.
+    t4 = small(64, 64, 1, 28, 4096);
+    t4.Layout = 0x105;
+    a = dg::resource_allocation(t4);
+    CHECK(a.alignment == 0x1000u && a.size == 0x4000u);
+
+    // Every 4 KiB answer fits in 64 KiB: a 4 KiB-aligned resource never reaches past the next page.
+    for (uint32_t layout : {0u, 0x100u, 0x101u, 0x105u, 0x106u, 0x109u, 0x10Au}) {
+        for (uint32_t dim : {2u, 3u, 4u}) {
+            for (uint32_t w : {16u, 64u, 128u, 256u}) {
+                dg::GuestResourceDesc t = texture(dim, w, dim == 2 ? 1 : w, dim == 4 ? 8 : 1, 1, 28, layout);
+                t.Alignment = 4096;
+                a = dg::resource_allocation(t);
+                CHECK(a.alignment == 0x1000u || a.alignment == 0x10000u);
+                if (a.alignment == 0x1000u) {
+                    CHECK(a.size <= 0x10000u);
+                    CHECK(layout != 0x109u && layout != 0x10Au);
+                }
+            }
+        }
+    }
 }
 
 // G82 (#1747): 3D volume, cubemap, and HDR mip-chain console layout sizes + incremental
@@ -195,6 +268,7 @@ void test_3d_cubemap_hdr_sizes_and_dirty_bands() {
 int main() {
     test_sizes();
     test_small_placement();
+    test_small_placement_title_requests();
     test_3d_cubemap_hdr_sizes_and_dirty_bands();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_console_layout_sizes: %d failure(s)\n", g_failures);

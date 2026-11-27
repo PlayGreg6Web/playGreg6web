@@ -85,6 +85,13 @@ The `bink` block of the report lists Bink export lookups that returned null (`lo
   resources with the title's own math (`sub_140343E80`), and the bad map seen (CPU base 4 KiB into its
   64 KiB page, 0x20000 mapped from the page below) is such a small sub-allocated resource. Still open: whether the mapped resource's lifetime ends early on our side (a completion
   signalled too soon) or the range rounding in the tile-map caller reaches a neighbouring page.
+  The faulting store itself is the drain pushing a physical page onto the title's free list (21-bit
+  links, three per qword, array at `[0x1471BFCD0]`) for a page index past the pool's end, i.e. an
+  unmap of a table entry that no longer holds a valid page. Small-resource placement (4 KiB answers
+  to GetResourceAllocationInfo, which the title asks for first for every buffer and small texture)
+  now follows the D3D12 rule; that was wrong for buffers and 64 KiB swizzles but did not stop this
+  crash. Tile-map ranges for streamed textures come from the title's texture entry: reservation
+  size `+0x2c`, base offset `+0x30`, per-mip offsets `+0x18` and sizes `+0x20` in 4 KiB units.
 - **Unresolved indirect call**: rerun, then use `--seed-targets` (see `tools/run_native_boot.py`), or `triage_fault.py`.
 - **Watchdog / time limit**: the run hit `--max-ms` (not a crash) or `--watchdog-ms` (it did not stop in time:
   read the `[hang-stack]` lines and the watchdog dump).
