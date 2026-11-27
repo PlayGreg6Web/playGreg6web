@@ -1216,6 +1216,20 @@ bool write_minidump(const std::string& path, EXCEPTION_POINTERS* info) {
     return guest::minidump::Writer::init() && guest::minidump::Writer::dump(path.c_str(), info);
 }
 
+// Fault hook (guest::set_fault_hook): runs on the faulting guest thread inside the fault path, so
+// RtlCaptureContext here is that thread's live host context (lifted sub_ frames below it). The
+// dump carries it as a synthetic exception stream plus the fault_record JSON user stream.
+// NOINLINE keeps the captured context a real frame.
+__declspec(noinline) void guest_fault_hook(const std::string& fault_record_json) {
+    if (!g_options.dump_on_fault || !g_minidump_path.empty()) return;
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    const std::string path = guest::minidump::select_path(g_options.report, "guest", "fault",
+                                                          static_cast<uint32_t>(GetCurrentProcessId()));
+    if (guest::minidump::Writer::init() && guest::minidump::Writer::dump_guest_fault(path.c_str(), &ctx, fault_record_json))
+        g_minidump_path = path;
+}
+
 // Start of the host function containing pc, from the image's unwind table (.pdata).
 uint64_t host_function_start(uint64_t pc) {
     DWORD64 image_base = 0;
@@ -1307,6 +1321,7 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
 
 void install_host_fault_handlers() {
     guest::minidump::Writer::init();  // dbghelp + dumper thread before any fault
+    guest::set_fault_hook(&guest_fault_hook);
     AddVectoredExceptionHandler(1, &vectored_handler);
 }
 #else

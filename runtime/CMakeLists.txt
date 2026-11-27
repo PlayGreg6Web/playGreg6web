@@ -456,6 +456,9 @@ else()
         add_test(NAME playgta6_minidump_fault_tests COMMAND test_minidump_fault)
         set_tests_properties(playgta6_minidump_fault_tests PROPERTIES
             ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+        add_test(NAME playgta6_minidump_guest_fault_tests COMMAND test_minidump_fault --guest)
+        set_tests_properties(playgta6_minidump_guest_fault_tests PROPERTIES
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
     endif()
 
     add_executable(test_winsock_ordinals ../tests/test_winsock_ordinals.cpp)

@@ -24,7 +24,23 @@ static LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 static void deliberate_null_deref(volatile int* p) { *p = 1; }
 #pragma optimize("", on)
 
+static const char kFaultJson[] = "{\"kind\": \"unknown_target\", \"thread\": 7, \"rip\": \"0x1400\", \"registers\": {\"rax\": \"0x1\"}, "
+                                  "\"source\": {\"return_address\": \"0x2000\"}, \"recent_entries\": [{\"target\": \"0x3000\", \"name\": null, \"from\": \"0x2000\"}]}";
+
+#pragma optimize("", off)
+static void guest_fault_path(const char* path) {
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    Writer::dump_guest_fault(path, &ctx, kFaultJson);
+}
+#pragma optimize("", on)
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && std::strcmp(argv[1], "--child-guest") == 0) {
+        if (!Writer::init()) return 3;
+        guest_fault_path(argv[2]);
+        return 77;
+    }
     if (argc >= 3 && std::strcmp(argv[1], "--child") == 0) {
         g_dump_path = argv[2];
         if (!Writer::init()) return 3;
@@ -38,7 +54,8 @@ int main(int argc, char** argv) {
     GetTempPathA(MAX_PATH, tmp);
     const std::string dump = std::string(tmp) + "pg6_minidump_fault_test_" + std::to_string(GetCurrentProcessId()) + ".dmp";
     DeleteFileA(dump.c_str());
-    std::string cmd = std::string("\"") + exe + "\" --child \"" + dump + "\"";
+    const bool guest_mode = argc >= 2 && std::strcmp(argv[1], "--guest") == 0;
+    std::string cmd = std::string("\"") + exe + (guest_mode ? "\" --child-guest \"" : "\" --child \"") + dump + "\"";
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -60,8 +77,10 @@ int main(int argc, char** argv) {
         if (std::system(py.c_str()) != 0) { std::fprintf(stderr, "FAIL: minidump_stack.py\n"); return 1; }
         std::ifstream t(dump + ".txt");
         std::string text((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-        if (text.find("exception 0xc0000005") == std::string::npos ||
-            text.find("test_minidump_fault.exe+0x") == std::string::npos) {
+        const char* want = guest_mode ? "exception 0xe0475046" : "exception 0xc0000005";
+        if (text.find(want) == std::string::npos || text.find("test_minidump_fault.exe+0x") == std::string::npos ||
+            (guest_mode && (text.find("guest fault: kind=unknown_target") == std::string::npos ||
+                            text.find("-> 0x3000") == std::string::npos))) {
             std::fprintf(stderr, "FAIL: stack output:\n%s\n", text.c_str());
             return 1;
         }

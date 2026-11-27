@@ -23,6 +23,12 @@
 
 namespace playgta6::guest::minidump {
 
+// User stream carrying the guest fault_record JSON (UTF-8, no terminator). Read by
+// tools/minidump_stack.py.
+constexpr DWORD kFaultRecordStream = 0x50473601;
+// Exception code of the synthetic exception stream written for guest faults.
+constexpr DWORD kGuestFaultExceptionCode = 0xE0475046;
+
 class Writer {
 public:
     // Loads dbghelp and starts the dumper thread. Idempotent; false when unavailable (dumps are
@@ -45,16 +51,30 @@ public:
     // Called from the faulting thread (handler context, or normal code with info == nullptr).
     // Blocks until the dumper finished or timeout_ms elapsed. Returns true when a dump was
     // written. Never throws; one dump per process.
-    static bool dump(const char* path, EXCEPTION_POINTERS* info, DWORD timeout_ms = 20000) {
+    static bool dump(const char* path, EXCEPTION_POINTERS* info, DWORD timeout_ms = 20000,
+                     const void* user = nullptr, size_t user_size = 0) {
         State& s = state();
         if (!s.ready.load() || path == nullptr || s.busy.exchange(true)) return false;
         std::snprintf(s.path, sizeof(s.path), "%s", path);
         s.info = info;
+        s.user = user;
+        s.user_size = user_size;
         s.fault_thread = GetCurrentThreadId();
         s.ok = false;
         SetEvent(s.request);
         if (WaitForSingleObject(s.done, timeout_ms) != WAIT_OBJECT_0) return false;
         return s.ok;
+    }
+
+    // Guest fault: the calling (faulting) thread's host context captured with RtlCaptureContext
+    // becomes a synthetic exception stream (code kGuestFaultExceptionCode), so the host stack,
+    // including lifted sub_ frames, can be walked; `json` is stored as the fault_record user stream.
+    static bool dump_guest_fault(const char* path, CONTEXT* ctx, const std::string& json, DWORD timeout_ms = 20000) {
+        EXCEPTION_RECORD rec{};
+        rec.ExceptionCode = kGuestFaultExceptionCode;
+        rec.ExceptionAddress = reinterpret_cast<PVOID>(ctx->Rip);
+        EXCEPTION_POINTERS ep{&rec, ctx};
+        return dump(path, &ep, timeout_ms, json.data(), json.size());
     }
 
 private:
@@ -66,6 +86,8 @@ private:
         HANDLE request = nullptr, done = nullptr, thread = nullptr;
         char path[MAX_PATH * 2] = {};
         EXCEPTION_POINTERS* info = nullptr;
+        const void* user = nullptr;
+        size_t user_size = 0;
         DWORD fault_thread = 0;
         bool ok = false;
     };
@@ -94,10 +116,19 @@ private:
         ex.ClientPointers = FALSE;
         constexpr DWORD kWithThreadInfo = 0x00001000;
         constexpr DWORD kWithUnloadedModules = 0x00000020;
+        MINIDUMP_USER_STREAM us{};
+        MINIDUMP_USER_STREAM_INFORMATION usi{};
+        if (s.user != nullptr && s.user_size > 0) {
+            us.Type = kFaultRecordStream;
+            us.BufferSize = static_cast<ULONG>(s.user_size);
+            us.Buffer = const_cast<void*>(s.user);
+            usi.UserStreamCount = 1;
+            usi.UserStreamArray = &us;
+        }
         bool ok = false;
         __try {
             ok = s.fn(GetCurrentProcess(), GetCurrentProcessId(), file, kWithThreadInfo | kWithUnloadedModules,
-                      s.info != nullptr ? &ex : nullptr, nullptr, nullptr) != FALSE;
+                      s.info != nullptr ? &ex : nullptr, usi.UserStreamCount != 0 ? &usi : nullptr, nullptr) != FALSE;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             ok = false;
         }

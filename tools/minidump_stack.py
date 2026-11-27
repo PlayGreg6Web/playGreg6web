@@ -15,6 +15,8 @@ Dumps hold no full memory and stay local: do not commit them.
 import argparse, json, ntpath, os, shutil, struct, subprocess, sys
 
 STREAM_THREADS, STREAM_MODULES, STREAM_EXCEPTION, STREAM_MEMORY = 3, 4, 6, 5
+STREAM_FAULT_RECORD = 0x50473601  # user stream: guest fault_record JSON (--dump-on-fault)
+GUEST_FAULT_CODE = 0xE0475046     # synthetic exception code of guest-fault dumps
 HARNESS_IMAGE = "playgta6_boot.exe"
 
 
@@ -155,6 +157,34 @@ def read_modules(data, streams):
     return modules
 
 
+def read_fault_record(data, streams):
+    if STREAM_FAULT_RECORD not in streams:
+        return None
+    size, rva = streams[STREAM_FAULT_RECORD]
+    try:
+        return json.loads(data[rva:rva + size].decode("utf-8"))
+    except ValueError:
+        return None
+
+
+def print_fault_record(fr):
+    """Guest-level info from the fault_record user stream."""
+    def h(v):
+        return "0x%x" % v if isinstance(v, int) else str(v)
+    print("guest fault: kind=%s thread=%s rip=%s target=%s function=%s" % (
+        fr.get("kind"), fr.get("thread"), fr.get("rip"), fr.get("target"), json.dumps(fr.get("function"))))
+    regs = fr.get("registers")
+    if isinstance(regs, dict):
+        print("  guest registers: " + " ".join("%s=%s" % (k, h(v)) for k, v in regs.items()))
+    if fr.get("source") is not None:
+        print("  source site: %s" % json.dumps(fr["source"]))
+    disp = fr.get("recent_entries")
+    if isinstance(disp, list):
+        print("  last %d dispatches (newest last):" % len(disp))
+        for d in disp[-8:]:
+            print("    -> %s %s from %s" % (d.get("target"), d.get("name") or "", d.get("from")))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump")
@@ -166,6 +196,11 @@ def main():
     args = ap.parse_args()
     path = resolve_dump(args.dump)
     cdb = find_cdb(args.cdb)
+    with open(path, "rb") as f0:
+        head = f0.read()
+    fr = read_fault_record(head, parse(head))
+    if fr is not None:
+        print_fault_record(fr)
     if cdb:
         sym = ".sympath+ " + args.pdb_dir + ";" if args.pdb_dir else ""
         cmd = [cdb, "-z", path, "-c", sym + ".ecxr;kn 40;q"]
@@ -203,7 +238,8 @@ def main():
         print("note: " + n)
     loc = sym.describe
 
-    print("exception 0x%08x at 0x%x (%s) thread %d" % (code, addr, loc(addr) or "?", tid))
+    print("exception 0x%08x%s at 0x%x (%s) thread %d" % (
+        code, " (guest fault, captured host context)" if code == GUEST_FAULT_CODE else "", addr, loc(addr) or "?", tid))
     if nparams >= 2:
         print("  access violation info: kind=%d address=0x%x" % (params[0], params[1]))
     print("rip 0x%x  rsp 0x%x" % (rip, rsp))

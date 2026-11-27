@@ -1039,6 +1039,9 @@ bool unwind_backtrace(FaultRecord& record, const GuestState& state, uint64_t va,
 }
 
 // Fills the common parts of a fault record from a guest state. `inside` as for unwind_backtrace.
+FaultHookFn g_fault_hook = nullptr;
+std::string fault_record_json(const FaultRecord& f);
+
 void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t detail, bool inside = false) {
     BootState& b = boot();
     FaultRecord& r = b.fault;
@@ -1069,6 +1072,9 @@ void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t de
     const uint64_t count = b.fault_record ? std::min<uint64_t>(t_dispatch_count, kDispatchRing) : 0;
     for (uint64_t k = t_dispatch_count - count; k < t_dispatch_count; ++k) {
         r.recent_dispatches.push_back(t_dispatch_ring[k % kDispatchRing]);
+    }
+    if (g_fault_hook != nullptr && b.fault_record) {
+        g_fault_hook(fault_record_json(r));
     }
 }
 
@@ -3624,6 +3630,10 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
     log_trap();
     finish_report();
     return true;
+}
+
+void set_fault_hook(FaultHookFn hook) {
+    g_fault_hook = hook;
 }
 
 std::string last_report_json() {

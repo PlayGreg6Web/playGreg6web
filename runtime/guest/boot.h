@@ -602,6 +602,12 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
 // and the harness writes the normal report. Sticky until the process ends.
 void request_boot_stop();
 
+// Called on the faulting thread at the end of capturing a fault record (guest traps, unresolved
+// imports, indirect misses ...) with the fault_record JSON object, so the harness can write a
+// minidump while that thread's stack is still live. Null clears it.
+using FaultHookFn = void (*)(const std::string& fault_record_json);
+void set_fault_hook(FaultHookFn hook);
+
 // Report / summary of the last boot (also after report_host_fault).
 std::string last_report_json();
 
