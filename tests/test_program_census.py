@@ -146,5 +146,26 @@ class CensusTests(unittest.TestCase):
         self.assertIn("Sidecar unresolved bindings by kind", pc.render_markdown(c))
 
 
+class ImpactTest(unittest.TestCase):
+    def test_drop_table_joined_with_sidecar(self):
+        reflect = {"stages": {h(1): {"stage": "fragment", "bindings": [
+            {"group": 0, "binding": 0, "kind": "texture"}]}}}
+        rep = {"gpu_work": {"draws_issued": 100}, "screen_timeline": [{"presents": 10}],
+               "gpu_drop_table": {"entries": [
+                   {"hash": h(1), "draws": 4, "dispatches": 0, "reasons": {"dropped_by_bridge": 4}},
+                   {"hash": h(2), "draws": 0, "dispatches": 3, "reasons": {"no_shader_module": 3}}],
+                   "other": {"draws": 1, "dispatches": 0, "reasons": {}}}}
+        clean = {"gpu_work": {"draws_issued": 100}, "screen_timeline": [{"presents": 10}]}
+        imp = pc.build_impact(dict(reflect=reflect), [rep, clean], top=5)
+        self.assertEqual(imp["reports"], 2)
+        self.assertEqual(imp["reports_with_drops"], 1)
+        self.assertEqual(imp["draws_lost"], 5)
+        self.assertEqual(imp["draws_issued"], 200)
+        self.assertEqual(imp["top_hashes"][0]["hash"], h(1))
+        self.assertEqual({r["reason"]: r["count"] for r in imp["by_reason"]},
+                         {"dropped_by_bridge": 4, "no_shader_module": 3})
+        self.assertEqual(imp["presents_in_runs_with_drops"], 10)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -242,9 +242,79 @@ def read_boot_report(doc: dict[str, Any]) -> dict[str, Any]:
         if isinstance(val, dict) and val and all(_is_hash(k) and isinstance(v, int) for k, v in val.items()):
             for k, v in val.items():
                 per[_canon(k)] = per.get(_canon(k), 0) + v
+    # gpu_drop_table (#1603): per shader hash draws/dispatches lost by reason.
+    dt = doc.get("gpu_drop_table") or {}
+    rows: dict[str, dict[str, Any]] = {}
+    for e in dt.get("entries") or []:
+        if isinstance(e, dict) and _is_hash(e.get("hash")):
+            r = rows.setdefault(_canon(e["hash"]), {"draws": 0, "dispatches": 0, "reasons": {}})
+            r["draws"] += int(e.get("draws") or 0)
+            r["dispatches"] += int(e.get("dispatches") or 0)
+            for k, v in (e.get("reasons") or {}).items():
+                r["reasons"][k] = r["reasons"].get(k, 0) + int(v)
+    if rows:
+        out["drop_table"] = rows
+        for h, r in rows.items():
+            if h not in per and r["draws"]:
+                per[h] = r["draws"]
+    other = dt.get("other") or {}
+    out["drop_table_other"] = {"draws": int(other.get("draws") or 0), "dispatches": int(other.get("dispatches") or 0)}
+    out["draws_issued"] = int(gw.get("draws_issued") or 0)
+    out["presents"] = sum(int(s.get("presents") or 0) for s in doc.get("screen_timeline") or [] if isinstance(s, dict))
     if per:
         out["per_program_drops"] = per
     return out
+
+
+def build_impact(census_args: dict[str, Any], reports: list[dict[str, Any]], top: int = 20) -> dict[str, Any]:
+    """Join the gpu_drop_table of several boot reports with the pack/sidecar census: per hash draws lost by
+    reason, stage, unresolved binding kinds weighted by draws, and how many runs / draws are affected."""
+    stages: dict[str, Any] = {}
+    build_census(**census_args, top=top, stages_out=stages)
+    per: dict[str, dict[str, Any]] = {}
+    issued = lost = presents_hit = presents = runs_hit = 0
+    for doc in reports:
+        rb = read_boot_report(doc)
+        issued += rb["draws_issued"]
+        presents += rb["presents"]
+        dt = rb.get("drop_table") or {}
+        run_lost = 0
+        for h, r in dt.items():
+            p = per.setdefault(h, {"draws": 0, "dispatches": 0, "reasons": {}, "runs": 0})
+            p["draws"] += r["draws"]
+            p["dispatches"] += r["dispatches"]
+            p["runs"] += 1
+            for k, v in r["reasons"].items():
+                p["reasons"][k] = p["reasons"].get(k, 0) + v
+            run_lost += r["draws"]
+        run_lost += rb["drop_table_other"]["draws"]
+        lost += run_lost
+        if run_lost or rb["draws_lost_total"]:
+            runs_hit += 1
+            presents_hit += rb["presents"]
+    by_reason: Counter[str] = Counter()
+    by_kind: Counter[str] = Counter()
+    by_stage: Counter[str] = Counter()
+    for h, p in per.items():
+        st = stages.get(h) or {}
+        for k, v in p["reasons"].items():
+            by_reason[k] += v
+        by_stage[st.get("stage") or "not_in_pack"] += p["draws"] + p["dispatches"]
+        for k in st.get("sc_unresolved", {}):
+            by_kind[k] += p["draws"]
+        p["stage"] = st.get("stage")
+        p["pack_reason"] = st.get("primary", "not_in_pack") if st else "not_in_pack"
+    return {
+        "reports": len(reports), "reports_with_drops": runs_hit,
+        "draws_issued": issued, "draws_lost": lost,
+        "lost_pct_of_draws": round(100.0 * lost / issued, 4) if issued else 0.0,
+        "presents": presents, "presents_in_runs_with_drops": presents_hit,
+        "by_reason": [{"reason": k, "count": v} for k, v in by_reason.most_common()],
+        "by_stage": [{"stage": k, "count": v} for k, v in by_stage.most_common()],
+        "unresolved_kind_weighted_by_draws": [{"kind": k, "draws": v} for k, v in by_kind.most_common()],
+        "top_hashes": [dict(hash=h, **p) for h, p in sorted(per.items(), key=lambda kv: -(kv[1]["draws"] + kv[1]["dispatches"]))[:top]],
+        "per_phase": "unavailable: gpu_drop_table is run-wide, not per screen segment",
+    }
 
 
 def build_census(
@@ -257,6 +327,7 @@ def build_census(
     drop_counts: dict[str, int] | None = None,
     mesh_limit: int = MESH_RECORD_LIMIT_BYTES,
     top: int = 20,
+    stages_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entries = (pack_report or {}).get("entries", [])
     stages = collect_stages(entries, (reflect or {}).get("stages"), pack_toc, mesh_limit)
@@ -301,6 +372,8 @@ def build_census(
         st["primary"] = p
         primary[p] += 1
         primary_by_stage[p][st["stage"]] += 1
+    if stages_out is not None:
+        stages_out.update(stages)
     census["packed_programs"] = {"total": len(stages), "by_stage": by_stage}
     census["packed_reasons"] = [
         {"reason": r, "primary_count": primary[r], "tagged_count": tagged[r], "by_stage": dict(primary_by_stage[r]), "explain": EXPLAIN[r]}
@@ -442,6 +515,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--boot-report", type=Path)
     ap.add_argument("--boot-log", type=Path)
     ap.add_argument("--drop-counts", type=Path)
+    ap.add_argument("--impact", type=Path, nargs="+", metavar="BOOT_REPORT",
+                    help="join the gpu_drop_table of these boot reports with --pack/--reflect: draws lost per hash/reason/stage")
     ap.add_argument("--mesh-limit-bytes", type=int, default=MESH_RECORD_LIMIT_BYTES)
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--json-out", type=Path)
@@ -453,6 +528,19 @@ def main(argv: list[str] | None = None) -> int:
     def load(p: Path) -> Any:
         return json.loads(p.read_text(encoding="utf-8"))
 
+    if a.impact:
+        imp = build_impact(
+            dict(pack_report=load(a.pack_report) if a.pack_report else None,
+                 reflect=load(a.reflect) if a.reflect else None,
+                 pack_toc=read_pack_toc(a.pack) if a.pack else None,
+                 mesh_limit=a.mesh_limit_bytes),
+            [load(p) for p in a.impact], a.top)
+        text = json.dumps(imp, indent=1) + chr(10)
+        if a.json_out:
+            a.json_out.write_text(text, encoding="utf-8")
+        else:
+            sys.stdout.write(text)
+        return 0
     log_lines = None
     if a.boot_log:
         with a.boot_log.open("r", encoding="utf-8", errors="replace") as f:
