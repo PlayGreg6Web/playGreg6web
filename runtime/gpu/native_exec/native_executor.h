@@ -113,6 +113,12 @@ struct ExecutorOptions {
     // (DXGI_ERROR_DEVICE_HUNG at ~90-98 s, then the device is lost for good); with them off the same build
     // runs past 170 s. Off, such a conflict is left to the buffer aliasing pass (resolve_buffer_aliases).
     bool usage_snapshots = false;
+    // With usage_snapshots off, small snapshots are still taken where nothing cheaper exists (a render draw's
+    // read side, a compute read of a buffer range the dispatch does not write): at most `cap` bytes each and
+    // `budget` bytes per command encoder. A conflict left after that skips the draw / dispatch (counted by
+    // reason, skip_usage_*) instead of recording it: Dawn would reject the whole command buffer. 0 cap: none.
+    uint64_t usage_snapshot_cap = 4ull << 20;
+    uint64_t usage_snapshot_budget = 64ull << 20;
     // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
     // that create resources and fill them so a lost device can be rebuilt and the resources re-created
     // with their uploaded contents. Buffer writes are folded into one image per buffer (64 KiB pages, a
@@ -310,6 +316,16 @@ struct ExecutorStats {
     uint64_t usage_snapshots_to_writer_twin = 0;  // big read-only snapshots avoided by twinning the small writable binding
     uint64_t usage_snapshots_off = 0;  // snapshots not taken: ExecutorOptions::usage_snapshots is off
     uint64_t usage_split_discards = 0;
+    uint64_t usage_small_snapshots = 0;        // snapshots taken under usage_snapshot_cap with usage_snapshots off
+    uint64_t usage_snapshot_over_cap = 0;      // ... not taken: bigger than the cap
+    uint64_t usage_snapshot_over_budget = 0;   // ... not taken: the encoder's snapshot budget is spent
+    // Draws / dispatches skipped because what they bind still breaks a usage scope rule (scope_violation in
+    // usage_scope_model.h): read-only + writable use of a buffer / a texture subresource, overlapping writable
+    // buffer ranges, one texture subresource writable twice. Recorded, Dawn rejects the whole command buffer.
+    uint64_t skip_usage_rw_buffer = 0;
+    uint64_t skip_usage_rw_texture = 0;
+    uint64_t skip_usage_alias_buffer = 0;
+    uint64_t skip_usage_alias_texture = 0;
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;
     uint64_t v1_bind_groups = 0;

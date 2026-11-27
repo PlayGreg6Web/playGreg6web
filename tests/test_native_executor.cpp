@@ -969,20 +969,24 @@ void test_usage_scopes(NativeExecutor& ex, bool snapshots) {
     ex.wait_idle();
     ex.poll();
     const ExecutorStats& after = ex.stats();
-    if (!snapshots) {
-        CHECK(after.usage_buffer_snapshots == before.usage_buffer_snapshots);
-        CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots);
-        CHECK(after.usage_snapshot_splits == before.usage_snapshot_splits);
-        CHECK(after.usage_snapshots_off == before.usage_snapshots_off + 2);
-        CHECK(after.usage_scope_splits == before.usage_scope_splits + 1);
-        return;
-    }
     CHECK(after.device_errors == before.device_errors);
     CHECK(after.usage_buffer_snapshots == before.usage_buffer_snapshots + 1);
-    CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots + 1);
-    CHECK(after.usage_snapshot_splits == before.usage_snapshot_splits + 2);
     CHECK(after.usage_scope_splits == before.usage_scope_splits + 1);
     CHECK(after.usage_snapshot_skipped == before.usage_snapshot_skipped);
+    CHECK(after.dispatches_skipped == before.dispatches_skipped);
+    CHECK(after.draws_skipped == before.draws_skipped);
+    if (!snapshots) {
+        // off: the 16-byte uniform range is a small snapshot (under usage_snapshot_cap); the sampled texture is
+        // left to the aliasing pass, which binds a twin of it
+        CHECK(after.usage_small_snapshots == before.usage_small_snapshots + 1);
+        CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots);
+        CHECK(after.usage_snapshot_splits == before.usage_snapshot_splits + 1);
+        CHECK(after.usage_snapshots_off == before.usage_snapshots_off + 1);
+        CHECK(after.storage_tex_alias_copies == before.storage_tex_alias_copies + 1);
+    } else {
+        CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots + 1);
+        CHECK(after.usage_snapshot_splits == before.usage_snapshot_splits + 2);
+    }
     std::vector<uint8_t> out;
     std::string err;
     CHECK(ex.read_buffer(3100, 256, 16, &out, &err));
@@ -993,6 +997,132 @@ void test_usage_scopes(NativeExecutor& ex, bool snapshots) {
     CHECK(ex.read_texture(3130, 1, &px, &w, &h, &err) && w == 2 && h == 2);
     CHECK(px.size() == 16 && px[0] == 200 && px[1] == 100 && px[2] == 50 && px[3] == 255);
     CHECK(frame_is(ex, {0, 255, 0, 255}));  // the second draw read the first one's write
+}
+
+const char* kFragReadWriteBig = R"(
+@group(0) @binding(0) var<storage, read> big: array<u32>;
+@group(0) @binding(1) var<storage, read_write> o: array<u32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4f { o[0] = big[1u]; return vec4f(1.0, 0.0, 0.0, 1.0); }
+)";
+const char* kTwoTexWriters = R"(
+@group(0) @binding(0) var a: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var b: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(1) fn cs_main() {
+  textureStore(a, vec2i(0, 0), vec4f(1.0, 0.0, 0.0, 1.0));
+  textureStore(b, vec2i(1, 0), vec4f(0.0, 1.0, 0.0, 1.0));
+}
+)";
+
+// Conflicts nothing cheap can fix are skipped instead of recorded (Dawn would reject the whole command buffer
+// and the frame would be lost): a render draw reading 5 MiB of a buffer as read-only storage while writing
+// another range of it (a snapshot over usage_snapshot_cap), and a dispatch writing one texture mip through two
+// storage bindings (writable storage texture aliasing). The other draws / dispatches of the frame run, and
+// no device error is raised.
+void test_usage_scope_skips(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    const uint64_t big = 5ull << 20;
+    gpu::CommandEncoder setup;
+    setup.create_buffer(3200, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc, big + 256);
+    setup.create_shader_module(3201, GpuShaderStage::Vertex, kFragReadWriteBig);
+    setup.create_shader_module(3202, GpuShaderStage::Fragment, kFragReadWriteBig);
+    create_layouts(setup, 3203, 3204,
+                   {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Buffer, 2),
+                    layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Buffer, 1)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(3205, 3201, 3202, 3204)));
+    auto rb = bg_entry(0, GpuBindResourceType::Buffer, 3200);
+    rb.size = big;
+    auto wb = bg_entry(1, GpuBindResourceType::Buffer, 3200);
+    wb.offset = big;
+    wb.size = 16;
+    create_bind_group(setup, 3206, 3203, {rb, wb});
+    // the green draw: a uniform holding 7 (kFragReadUniform)
+    setup.create_buffer(3210, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 16);
+    const uint32_t seven[4] = {7, 0, 0, 0};
+    setup.write_buffer(3210, 0, seven, 16);
+    setup.create_shader_module(3211, GpuShaderStage::Vertex, kFragReadUniform);
+    setup.create_shader_module(3212, GpuShaderStage::Fragment, kFragReadUniform);
+    create_layouts(setup, 3213, 3214, {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Buffer, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(3215, 3211, 3212, 3214)));
+    auto ub = bg_entry(0, GpuBindResourceType::Buffer, 3210);
+    ub.size = 16;
+    create_bind_group(setup, 3216, 3213, {ub});
+    // compute: two write-only views of mip 0 of one texture, then a plain dispatch writing a buffer
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(3220, 4, 4, GpuTextureUsage::StorageBinding | GpuTextureUsage::CopySrc, 22)));
+    setup.create_shader_module(3221, GpuShaderStage::Compute, kTwoTexWriters);
+    GpuBindGroupLayoutEntry sa = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                                              static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly), 2);
+    sa.storage_format = 22;
+    GpuBindGroupLayoutEntry sb = sa;
+    sb.binding = 1;
+    create_layouts(setup, 3222, 3223, {sa, sb});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 3224;
+    cp.cs_module_id = 3221;
+    cp.pipeline_layout_id = 3223;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    auto ta = bg_entry(0, GpuBindResourceType::TextureView, 3220);
+    ta.view.dimension = 2;
+    ta.view.mip_level_count = 1;
+    auto tb = ta;
+    tb.binding = 1;
+    create_bind_group(setup, 3225, 3222, {ta, tb});
+    setup.create_buffer(3230, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(3231, GpuShaderStage::Compute, kCompute);
+    create_layouts(setup, 3232, 3233, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    cp.id = 3234;
+    cp.cs_module_id = 3231;
+    cp.pipeline_layout_id = 3233;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 3235, 3232, {bg_entry(0, GpuBindResourceType::Buffer, 3230)});
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats mid = ex.stats();
+    CHECK(mid.device_errors == before.device_errors);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(3224);
+    set_bind_group2(frame, 0, 3225);
+    frame.dispatch_compute(1);  // skipped: writable storage texture aliasing
+    frame.set_compute_pipeline(3234);
+    set_bind_group2(frame, 0, 3235);
+    frame.dispatch_compute(1);
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(3215);
+    set_bind_group2(frame, 0, 3216);
+    frame.draw(3);  // green
+    frame.set_pipeline(3205);
+    set_bind_group2(frame, 0, 3206);
+    frame.draw(3);  // skipped: a 5 MiB read-only range of the buffer it writes (no snapshot over the cap)
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& after = ex.stats();
+    CHECK(after.device_errors == mid.device_errors);  // the command buffer is valid
+    CHECK(after.skip_usage_alias_texture == mid.skip_usage_alias_texture + 1);
+    CHECK(after.skip_usage_rw_buffer == mid.skip_usage_rw_buffer + 1);
+    CHECK(after.usage_snapshot_over_cap == mid.usage_snapshot_over_cap + 1);
+    CHECK(after.dispatches == mid.dispatches + 1);
+    CHECK(after.dispatches_skipped == mid.dispatches_skipped + 1);
+    CHECK(after.draws == mid.draws + 1);
+    CHECK(after.draws_skipped == mid.draws_skipped + 1);
+    CHECK(frame_is(ex, {0, 255, 0, 255}));  // the other draw rendered
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(3230, 0, 16, &out, &err));
+    const uint32_t want[4] = {1, 3, 5, 7};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);  // the other dispatch ran
+    CHECK(ex.stats_json().find("\"skip_usage_rw_buffer\": ") != std::string::npos);
 }
 
 // An explicit layout that does not fit the WGSL (binding 0 in the layout, binding 3 in the shader) gets
@@ -4987,6 +5117,7 @@ int main() {
     test_pipeline_pass_formats(*ex);
     test_split_passes(*ex);
     test_usage_snapshots(*ex);
+    test_usage_scope_skips(*ex);
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

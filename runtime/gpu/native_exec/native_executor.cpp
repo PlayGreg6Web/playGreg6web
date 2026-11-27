@@ -6444,6 +6444,12 @@ struct NativeExecutor::Impl {
             v.push_back(WriteRange{off, end, write_seq});
         }
         UsageScope scope;            // render: the uses encoded in the current pass segment
+        // The uses of each encoded group (by use index) that a substitute binds in place of the original
+        // (snapshot, unreferenced dummy), and the entries the compute aliasing pass rebuilt (with alias_replaced):
+        // what is left is what Dawn sees at the draw / dispatch (scope_violation).
+        std::array<std::vector<uint32_t>, kBindSlots> repl;
+        std::vector<std::pair<uint32_t, size_t>> alias_swapped;  // (group, entry)
+        uint64_t snap_budget_used = 0;  // small snapshot bytes copied in this encoder (usage_snapshot_budget)
         // What a continuation of a split pass replays: the attachments with load ops, and the pass state.
         std::array<wgpu::RenderPassColorAttachment, kGpuMaxColorAttachments> cont_colors{};
         uint32_t cont_color_count = 0;
@@ -6639,6 +6645,8 @@ struct NativeExecutor::Impl {
             for (auto& sg : stream_groups) sg = StreamGroup{};
             for (auto& sg : cbound) sg = StreamGroup{};
             alias_replaced = 0;
+            alias_swapped.clear();
+            for (auto& r : repl) r.clear();
             for (auto& w : want) w = StreamGroup{};
             want_mask = dirty_binds = subst_applied = drop_applied = 0;
             snap_volatile = false;
@@ -6982,8 +6990,7 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = false;
             e.compute_valid = false;
             remap_before_draw(e);
-            if (draw_allowed(e)) {
-                flush_binds(e);
+            if (draw_allowed(e) && flush_binds(e)) {
                 occ_before_draw(e);
                 e.rpass.Draw(d->vertex_count, clamp_draw_instances(d->vertex_count, d->instance_count), d->first_vertex,
                              d->first_instance);
@@ -6993,8 +7000,7 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = false;
             e.compute_valid = false;
             remap_before_draw(e);
-            if (draw_allowed(e)) {
-                flush_binds(e);
+            if (draw_allowed(e) && flush_binds(e)) {
                 occ_before_draw(e);
                 e.rpass.DrawIndexed(di->index_count, clamp_draw_instances(di->index_count, di->instance_count),
                                     di->first_index, di->base_vertex, di->first_instance);
@@ -7024,12 +7030,15 @@ struct NativeExecutor::Impl {
                 bind_compute_fit_dummies(e);
                 flush_binds(e);
                 resolve_buffer_aliases(e);
+                if (compute_scope_blocked(e)) {
+                    alias_post_dispatch(e);
+                    return;
+                }
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
                 ++sub_indirect;
                 alias_post_dispatch(e);
-            } else if (draw_allowed(e)) {
-                flush_binds(e);
+            } else if (draw_allowed(e) && flush_binds(e)) {
                 occ_before_draw(e);
                 if (in->kind == 1) e.rpass.DrawIndexedIndirect(it->second.buffer, in->offset);
                 else e.rpass.DrawIndirect(it->second.buffer, in->offset);
@@ -7100,6 +7109,10 @@ struct NativeExecutor::Impl {
             bind_compute_fit_dummies(e);
             flush_binds(e);
             resolve_buffer_aliases(e);
+            if (compute_scope_blocked(e)) {
+                alias_post_dispatch(e);
+                return;
+            }
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
             sub_max_groups = std::max<uint64_t>(sub_max_groups, uint64_t{x} * y * z);
@@ -7820,6 +7833,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
 
     // The pipeline and groups of a compute pass as the stream set them (swaps applied to the groups they name).
     void alias_restore_state(Encoder& e, const std::vector<AliasSwap>& swaps) {
+        e.alias_swapped.clear();
         if (e.active_compute && e.compute_valid) {
             auto pit = compute_pipelines.find(*e.active_compute);
             if (pit != compute_pipelines.end())
@@ -7858,6 +7872,8 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                     bd.entries = wes.data();
                     use = device.CreateBindGroup(&bd);
                     e.alias_replaced |= static_cast<uint8_t>(1u << g);
+                    for (const AliasSwap& sw : swaps)
+                        if (sw.group == g) e.alias_swapped.emplace_back(g, sw.entry);
                 }
             }
             e.cpass.SetBindGroup(g, use, offs.size(), offs.data());
@@ -8261,15 +8277,77 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         return b;
     }
 
-    void flush_binds(Encoder& e) {
-        flush_binds_impl(e);
+    // False: the draw is skipped (a render draw whose bindings would still break a usage scope rule; nothing
+    // of it is encoded). A dispatch is checked after the aliasing pass (compute_scope_blocked).
+    bool flush_binds(Encoder& e) {
+        if (!flush_binds_impl(e)) return false;
         note_bound_writes(e);
+        return true;
     }
 
-    void flush_binds_impl(Encoder& e) {
+    void count_scope_skip(ScopeViolation v, bool dispatch) {
+        switch (v) {
+            case ScopeViolation::RwBuffer: ++stats.skip_usage_rw_buffer; break;
+            case ScopeViolation::RwTexture: ++stats.skip_usage_rw_texture; break;
+            case ScopeViolation::AliasBuffer: ++stats.skip_usage_alias_buffer; break;
+            case ScopeViolation::AliasTexture: ++stats.skip_usage_alias_texture; break;
+            case ScopeViolation::None: return;
+        }
+        if (dispatch) ++stats.dispatches_skipped;
+        else ++stats.draws_skipped;
+    }
+
+    // A dispatch about to be encoded (after flush_binds and resolve_buffer_aliases): true = skipped, what it
+    // binds would still break a usage scope rule and invalidate the command buffer.
+    bool compute_scope_blocked(Encoder& e) {
+        if (!e.cpass) return false;
+        std::vector<BoundUses> bound;
+        std::vector<std::vector<uint8_t>> replaced;
+        for (uint32_t g = 0; g < Encoder::kBindSlots; ++g) {
+            if (!(e.want_mask >> g & 1u) || !e.want[g].usage) continue;
+            const BgUses& m = e.want[g].usage->m;
+            std::vector<uint8_t> rp(m.uses.size(), 0);
+            for (uint32_t ui : e.repl[g])
+                if (ui < rp.size()) rp[ui] = 1;
+            if (e.alias_replaced >> g & 1u)
+                for (const auto& sw : e.alias_swapped)
+                    if (sw.first == g)
+                        for (size_t ui = 0; ui < m.uses.size(); ++ui)
+                            if (m.uses[ui].entry == sw.second) rp[ui] = 1;
+            bound.push_back(BoundUses{g, &m, &e.want[g].offsets});
+            replaced.push_back(std::move(rp));
+        }
+        const ScopeViolation v = bound.empty() ? ScopeViolation::None : scope_violation(bound, &replaced);
+        if (v == ScopeViolation::None) return false;
+        count_scope_skip(v, true);
+        return true;
+    }
+
+    // Bytes a snapshot of use `sn` copies (textures at 4 per texel); 0 when a cached copy serves it.
+    uint64_t snapshot_cost(const Encoder& e, const std::vector<BoundUses>& bound, const SnapshotUse& sn) const {
+        const uint32_t g = bound[sn.group].group;
+        const BgUsage& u = *e.want[g].usage;
+        const ResUse& r = u.m.uses[sn.use];
+        const BgSnapSrc& src = u.src[sn.use];
+        if (!r.texture) {
+            if (!sn.volatile_ && src.buffer && r.size &&
+                e.snap_lookup(src.buffer.Get(), use_offset(r, &e.want[g].offsets), r.size))
+                return 0;
+            return r.size ? (r.size + 3) & ~uint64_t{3} : UINT64_MAX;
+        }
+        uint64_t total = 0;
+        const uint32_t w = std::max<uint32_t>(1, src.width >> r.mip_base), h = std::max<uint32_t>(1, src.height >> r.mip_base);
+        const uint32_t d = src.tex_3d ? std::max<uint32_t>(1, src.depth >> r.mip_base) : r.layer_count;
+        for (uint32_t m = 0; m < r.mip_count && m < 16; ++m)
+            total += uint64_t{std::max<uint32_t>(1, w >> m)} * std::max<uint32_t>(1, h >> m) *
+                     (src.tex_3d ? std::max<uint32_t>(1, d >> m) : d) * 4;
+        return total;
+    }
+
+    bool flush_binds_impl(Encoder& e) {
         const bool render = static_cast<bool>(e.rpass);
-        if (!render && !e.cpass) return;
-        if (!e.dirty_binds && !e.snap_volatile) return;
+        if (!render && !e.cpass) return true;
+        if (!e.dirty_binds && !e.snap_volatile) return true;
         std::vector<BoundUses> bound;
         std::array<int, Encoder::kBindSlots> bound_of{};
         bound_of.fill(-1);
@@ -8331,10 +8409,34 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         }
         BindPlan plan = bound.empty() ? BindPlan{} : plan_binds(bound, e.scope, render);
         if (!options.usage_snapshots && !plan.snapshots.empty()) {
-            // Snapshots are opt-in (ExecutorOptions::usage_snapshots): the uses stay bound as themselves.
-            stats.usage_snapshots_off += plan.snapshots.size();
-            plan.snapshots.clear();
-            if (!plan.scope_conflict) plan.split = false;
+            // Snapshots are opt-in (ExecutorOptions::usage_snapshots). Off, only small ones are taken where
+            // nothing cheaper fixes the conflict: in a render draw, and in a dispatch for a buffer range the
+            // dispatch does not write (the aliasing pass copies overlapping buffer ranges and texture read sides
+            // itself). The rest stay bound as themselves; scope_violation skips what Dawn would still reject.
+            std::vector<SnapshotUse> kept;
+            for (const SnapshotUse& sn : plan.snapshots) {
+                const ResUse& r = bound[sn.group].uses->uses[sn.use];
+                if (!render && (r.texture || sn.volatile_)) {
+                    ++stats.usage_snapshots_off;
+                    continue;
+                }
+                const uint64_t cost = snapshot_cost(e, bound, sn);
+                if (cost > options.usage_snapshot_cap) {
+                    ++stats.usage_snapshot_over_cap;
+                    ++stats.usage_snapshots_off;
+                    continue;
+                }
+                if (e.snap_budget_used + cost > options.usage_snapshot_budget) {
+                    ++stats.usage_snapshot_over_budget;
+                    ++stats.usage_snapshots_off;
+                    continue;
+                }
+                e.snap_budget_used += cost;
+                ++stats.usage_small_snapshots;
+                kept.push_back(sn);
+            }
+            plan.snapshots = std::move(kept);
+            if (plan.snapshots.empty() && !plan.scope_conflict) plan.split = false;
         }
         if (!render && !plan.snapshots.empty()) {
             // A big read-only range against a small writable one: the writer runs on a scratch copy instead
@@ -8347,12 +8449,14 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                     for (const ResUse& w : wb.uses->uses) {
                         if (!use_writable(w.kind) || !uses_conflict(r, w)) continue;
                         if (w.texture || !prefer_writer_twin(r.size, w.size)) return false;
+                        // the aliasing pass only twins a writer whose range overlaps the read
+                        const uint64_t ro = use_offset(r, rb.dyn), wo = use_offset(w, wb.dyn);
+                        if (!spans_overlap(ro, r.size, wo, w.size ? w.size : UINT64_MAX - wo)) return false;
                         auto bit = bg_infos.find(e.want[wb.group].group.Get());
                         if (bit == bg_infos.end() || bit->second->group.Get() != e.want[wb.group].group.Get()) return false;
                         any = true;
                     }
                 }
-                (void)rb;
                 return any;
             };
             std::vector<SnapshotUse> kept;
@@ -8366,6 +8470,8 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         }
         std::array<wgpu::BindGroup, Encoder::kBindSlots> subst{};
         std::array<std::vector<uint32_t>, Encoder::kBindSlots> subst_dyn{};
+        std::vector<std::vector<uint8_t>> snapped(bound.size());  // per bound group: uses bound from a snapshot
+        for (size_t gi = 0; gi < bound.size(); ++gi) snapped[gi].assign(bound[gi].uses->uses.size(), 0);
         bool volatile_now = false;
         // Every snapshot a reusable, still valid buffer snapshot (and no render scope conflict): no copy, no split.
         bool all_hit = plan.split && !plan.scope_conflict && !plan.snapshots.empty();
@@ -8402,6 +8508,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                         ++stats.usage_snapshot_skipped;
                         continue;
                     }
+                    snapped[gi][sn.use] = 1;
                     any = true;
                     volatile_now = volatile_now || sn.volatile_;
                 }
@@ -8453,6 +8560,15 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                 else e.resume_compute();
             }
         }
+        if (render && !bound.empty()) {
+            // What the draw binds after the snapshots and dummies: anything Dawn would still reject skips the
+            // draw (nothing of it encoded; its groups stay dirty for the next one). Dummies have res == null.
+            const ScopeViolation v = scope_violation(bound, &snapped);
+            if (v != ScopeViolation::None) {
+                count_scope_skip(v, false);
+                return false;
+            }
+        }
         for (uint32_t g = 0; g < Encoder::kBindSlots; ++g) {
             const uint8_t bit = static_cast<uint8_t>(1u << g);
             if (!(e.want_mask & bit)) continue;
@@ -8464,6 +8580,13 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             else cset(e, g, grp, dyn.data(), dyn.size());
             if (use_subst) e.subst_applied |= bit;
             else e.subst_applied &= static_cast<uint8_t>(~bit);
+            e.repl[g].clear();
+            if (use_subst && bound_of[g] >= 0) {
+                const std::vector<uint8_t>& sp = snapped[static_cast<size_t>(bound_of[g])];
+                for (uint32_t ui = 0; ui < sp.size(); ++ui)
+                    if (sp[ui]) e.repl[g].push_back(ui);
+                for (uint32_t d : drops[g]) e.repl[g].push_back(d);
+            }
             // A group with dummies is only right for this pipeline: a pipeline change re-encodes it.
             if (use_subst && !drops[g].empty()) e.drop_applied |= bit;
             else e.drop_applied &= static_cast<uint8_t>(~bit);
@@ -8482,6 +8605,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         }
         e.dirty_binds = 0;
         e.snap_volatile = volatile_now;
+        return true;
     }
 
     void bind_compute_fit_dummies(Encoder& e) {
@@ -9785,6 +9909,13 @@ std::string NativeExecutor::stats_json() const {
     num("usage_snapshot_bytes", st.usage_snapshot_bytes);
     num("usage_snapshot_skipped", st.usage_snapshot_skipped);
     num("usage_snapshots_off", st.usage_snapshots_off);
+    num("usage_small_snapshots", st.usage_small_snapshots);
+    num("usage_snapshot_over_cap", st.usage_snapshot_over_cap);
+    num("usage_snapshot_over_budget", st.usage_snapshot_over_budget);
+    num("skip_usage_rw_buffer", st.skip_usage_rw_buffer);
+    num("skip_usage_rw_texture", st.skip_usage_rw_texture);
+    num("skip_usage_alias_buffer", st.skip_usage_alias_buffer);
+    num("skip_usage_alias_texture", st.skip_usage_alias_texture);
     num("usage_snapshot_reused", st.usage_snapshot_reused);
     num("usage_snapshots_to_writer_twin", st.usage_snapshots_to_writer_twin);
     num("usage_snapshot_bytes_saved", st.usage_snapshot_bytes_saved);

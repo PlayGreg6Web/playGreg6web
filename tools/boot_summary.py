@@ -489,6 +489,12 @@ def _new_field_lines(report: dict[str, Any]) -> list[str]:
         L.append(f"usage scopes: {_i(ne.get('usage_scope_splits'))} splits, {_i(ne.get('usage_buffer_snapshots'))} buffer + "
                  f"{_i(ne.get('usage_texture_snapshots'))} texture copies; storage alias: "
                  f"{_i(ne.get('storage_alias_copies'))} copies, {_i(ne.get('storage_alias_unfixable'))} unfixable")
+    if any(k in ne for k in _SCOPE_SKIP_KEYS):
+        L.append(f"usage scope skips: {_i(ne.get('skip_usage_rw_buffer'))} buffer rw, "
+                 f"{_i(ne.get('skip_usage_rw_texture'))} texture rw, {_i(ne.get('skip_usage_alias_buffer'))} buffer alias, "
+                 f"{_i(ne.get('skip_usage_alias_texture'))} texture alias; small snapshots "
+                 f"{_i(ne.get('usage_small_snapshots'))} ({_i(ne.get('usage_snapshot_over_cap'))} over cap, "
+                 f"{_i(ne.get('usage_snapshot_over_budget'))} over budget)")
     if "command_buffers" in ne:
         L.append(f"command buffers: {_i(ne.get('command_buffers'))}")
     if "bind_group_unfilterable_dummies" in ne:
@@ -520,6 +526,7 @@ def _new_field_lines(report: dict[str, Any]) -> list[str]:
 _QUERY_KEYS = ("query_begins", "query_ends", "query_resolves", "query_results_unwritten")
 _SCOPE_KEYS = ("usage_scope_splits", "usage_buffer_snapshots", "usage_texture_snapshots", "storage_alias_copies",
                "storage_alias_unfixable")
+_SCOPE_SKIP_KEYS = ("skip_usage_rw_buffer", "skip_usage_rw_texture", "skip_usage_alias_buffer", "skip_usage_alias_texture")
 
 
 def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_stops: str | None = None) -> str:

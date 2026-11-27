@@ -1643,6 +1643,32 @@ void test_usage_scope_model() {
     t1.add(img(&tex, UseKind::StorageTexWrite, 0, 4, 1, 1));  // another layer
     bound = {{0, &t1, nullptr}};
     CHECK(!plan_binds(bound, empty, false).split);
+    // scope_violation: what is left after snapshots / copies
+    bound = {{0, &g0, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::RwBuffer);  // disjoint ranges still conflict (whole buffer)
+    std::vector<std::vector<uint8_t>> repl{{1, 0}};             // the uniform bound from a snapshot
+    CHECK(scope_violation(bound, &repl) == ScopeViolation::None);
+    bound = {{0, &g2, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::AliasBuffer);  // two writers of [0, 16)
+    repl = {{0, 1, 0}};                                            // the second one on a scratch twin
+    CHECK(scope_violation(bound, &repl) == ScopeViolation::None);
+    BgUses g5;
+    g5.add(buf(&buf_a, UseKind::StorageWrite, 0, 16));
+    g5.add(buf(&buf_a, UseKind::StorageWrite, 16, 16));
+    bound = {{0, &g5, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::None);  // disjoint writers
+    bound = {{0, &t0, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::RwTexture);
+    bound = {{0, &t1, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::None);  // other mips / layers
+    BgUses t2;
+    t2.add(img(&tex, UseKind::StorageTexWrite, 0, 1));
+    t2.add(img(&tex, UseKind::StorageTexWrite, 0, 1));
+    bound = {{0, &t2, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::AliasTexture);
+    // reads only, across groups: none
+    bound = {{0, &g3, nullptr}, {1, &g4, nullptr}};
+    CHECK(scope_violation(bound) == ScopeViolation::None);
     // view ranges: WebGPU defaults
     ViewRange r = resolve_view_range(1, 5, 6, 4, 0, 0, 0, 0);  // cube of a 6-layer 2d texture
     CHECK(r.mip_count == 5 && r.layer_count == 6 && r.view_dim == 4);

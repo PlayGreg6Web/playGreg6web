@@ -16,7 +16,8 @@
 //  - a render draw whose uses conflict with uses of earlier draws in the pass splits the render pass
 //    (end, restart with load ops): the writes of the earlier draws land and are visible to the later ones,
 //    exactly as across a D3D12 barrier.
-// Two writable uses of one resource (writable storage aliasing) are a different rule and not handled here.
+// Two writable uses of one resource (writable storage aliasing) are a different rule; scope_violation below
+// checks both rules on what a draw / dispatch finally binds, so work Dawn would reject is skipped instead.
 // Pure; no GPU involved.
 #pragma once
 
@@ -213,6 +214,53 @@ inline BindPlan plan_binds(const std::vector<BoundUses>& bound, const UsageScope
         if (p.scope_conflict) p.split = true;
     }
     return p;
+}
+
+// What Dawn would reject in the bindings a draw / dispatch finally binds (after snapshots, dummies and alias
+// copies): a read-only and a writable use of one resource (a buffer as a whole, a texture per subresource),
+// or two writable uses of one texture subresource / of overlapping ranges of one buffer.
+enum class ScopeViolation : uint8_t { None, RwBuffer, RwTexture, AliasBuffer, AliasTexture };
+
+// `replaced[i][j]` != 0: use j of bound[i] is not bound as itself (a snapshot / dummy / copy took its place).
+inline ScopeViolation scope_violation(const std::vector<BoundUses>& bound,
+                                      const std::vector<std::vector<uint8_t>>* replaced = nullptr) {
+    struct Ref {
+        const ResUse* u;
+        const std::vector<uint32_t>* dyn;
+    };
+    std::vector<Ref> v;
+    bool any_writable = false;
+    for (size_t gi = 0; gi < bound.size(); ++gi) {
+        const BoundUses& b = bound[gi];
+        if (!b.uses) continue;
+        for (size_t ui = 0; ui < b.uses->uses.size(); ++ui) {
+            if (replaced && gi < replaced->size() && ui < (*replaced)[gi].size() && (*replaced)[gi][ui]) continue;
+            const ResUse& u = b.uses->uses[ui];
+            if (!u.res) continue;
+            v.push_back(Ref{&u, b.dyn});
+            any_writable = any_writable || use_writable(u.kind);
+        }
+    }
+    if (!any_writable) return ScopeViolation::None;
+    ScopeViolation alias = ScopeViolation::None;
+    for (size_t i = 0; i < v.size(); ++i) {
+        const ResUse& a = *v[i].u;
+        for (size_t j = i + 1; j < v.size(); ++j) {
+            const ResUse& b = *v[j].u;
+            if (!use_writable(a.kind) && !use_writable(b.kind)) continue;
+            if (uses_conflict(a, b)) return a.texture ? ScopeViolation::RwTexture : ScopeViolation::RwBuffer;
+            if (alias != ScopeViolation::None || !use_writable(a.kind) || !use_writable(b.kind) || !uses_touch(a, b))
+                continue;
+            if (a.texture) {
+                alias = ScopeViolation::AliasTexture;
+                continue;
+            }
+            const uint64_t ao = use_offset(a, v[i].dyn), bo = use_offset(b, v[j].dyn);
+            const uint64_t as = a.size ? a.size : UINT64_MAX - ao, bs = b.size ? b.size : UINT64_MAX - bo;
+            if (spans_overlap(ao, as, bo, bs)) alias = ScopeViolation::AliasBuffer;
+        }
+    }
+    return alias;
 }
 
 }  // namespace playgta6::gpu::native_exec
