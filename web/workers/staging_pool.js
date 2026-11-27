@@ -326,12 +326,220 @@
    * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
    * @returns {{ bytes: Uint8Array, originalByteLength: number, alignedByteLength: number, padded: boolean, copiedFromSab: boolean }}
    */
+  const EMPTY_UINT8_ARRAY = new Uint8Array(0);
+
+  /**
+   * O(1) amortized circular ring queue with O(1) arbitrary removal via per-chunk
+   * slot tracking (`chunk._queue` / `chunk._queueSlot`). Preserves strict FIFO
+   * insertion order across `push()`, `shift()`, and iteration without
+   * `Array.prototype.shift()`, `Array.prototype.splice()`, or per-frame array churn.
+   */
+  class ChunkRingQueue {
+    constructor(initialCapacity = 16) {
+      let cap = 16;
+      while (cap < initialCapacity) {
+        cap *= 2;
+      }
+      this._buf = new Array(cap);
+      this._mask = cap - 1;
+      this._head = 0;
+      this._tail = 0;
+      this._span = 0;
+      this._size = 0;
+    }
+
+    get size() {
+      return this._size;
+    }
+
+    push(chunk) {
+      if (this._span >= this._buf.length) {
+        if (this._size * 2 <= this._buf.length) {
+          this._repack(this._buf.length);
+        } else {
+          this._repack(this._buf.length * 2);
+        }
+      }
+      const slot = this._tail;
+      this._buf[slot] = chunk;
+      chunk._queue = this;
+      chunk._queueSlot = slot;
+      this._tail = (slot + 1) & this._mask;
+      this._span += 1;
+      this._size += 1;
+    }
+
+    shift() {
+      const buf = this._buf;
+      const mask = this._mask;
+      while (this._span > 0) {
+        const slot = this._head;
+        const chunk = buf[slot];
+        buf[slot] = undefined;
+        this._head = (slot + 1) & mask;
+        this._span -= 1;
+        if (chunk !== undefined) {
+          chunk._queue = null;
+          chunk._queueSlot = -1;
+          this._size -= 1;
+          if (this._size === 0) {
+            this._head = 0;
+            this._tail = 0;
+            this._span = 0;
+          }
+          return chunk;
+        }
+      }
+      this._head = 0;
+      this._tail = 0;
+      this._span = 0;
+      this._size = 0;
+      return null;
+    }
+
+    pop() {
+      const buf = this._buf;
+      const mask = this._mask;
+      while (this._span > 0) {
+        const slot = (this._tail - 1) & mask;
+        const chunk = buf[slot];
+        buf[slot] = undefined;
+        this._tail = slot;
+        this._span -= 1;
+        if (chunk !== undefined) {
+          chunk._queue = null;
+          chunk._queueSlot = -1;
+          this._size -= 1;
+          if (this._size === 0) {
+            this._head = 0;
+            this._tail = 0;
+            this._span = 0;
+          }
+          return chunk;
+        }
+      }
+      this._head = 0;
+      this._tail = 0;
+      this._span = 0;
+      this._size = 0;
+      return null;
+    }
+
+    contains(chunk) {
+      return chunk !== null && chunk !== undefined && chunk._queue === this;
+    }
+
+    remove(chunk) {
+      if (!chunk || chunk._queue !== this) {
+        return false;
+      }
+      const slot = chunk._queueSlot;
+      const buf = this._buf;
+      buf[slot] = undefined;
+      chunk._queue = null;
+      chunk._queueSlot = -1;
+      this._size -= 1;
+
+      if (this._size === 0) {
+        this._head = 0;
+        this._tail = 0;
+        this._span = 0;
+        return true;
+      }
+
+      const mask = this._mask;
+      while (this._span > 0 && buf[this._head] === undefined) {
+        this._head = (this._head + 1) & mask;
+        this._span -= 1;
+      }
+      while (this._span > 0 && buf[(this._tail - 1) & mask] === undefined) {
+        this._tail = (this._tail - 1) & mask;
+        this._span -= 1;
+      }
+      return true;
+    }
+
+    clear() {
+      const buf = this._buf;
+      const mask = this._mask;
+      let idx = this._head;
+      for (let i = 0; i < this._span; i += 1) {
+        const chunk = buf[idx];
+        if (chunk !== undefined) {
+          chunk._queue = null;
+          chunk._queueSlot = -1;
+          buf[idx] = undefined;
+        }
+        idx = (idx + 1) & mask;
+      }
+      this._head = 0;
+      this._tail = 0;
+      this._span = 0;
+      this._size = 0;
+    }
+
+    _repack(newCapacity) {
+      const oldBuf = this._buf;
+      const oldMask = this._mask;
+      const newBuf = new Array(newCapacity);
+      let idx = this._head;
+      let write = 0;
+      for (let i = 0; i < this._span; i += 1) {
+        const chunk = oldBuf[idx];
+        if (chunk !== undefined) {
+          newBuf[write] = chunk;
+          chunk._queueSlot = write;
+          write += 1;
+        }
+        idx = (idx + 1) & oldMask;
+      }
+      this._buf = newBuf;
+      this._mask = newCapacity - 1;
+      this._head = 0;
+      this._tail = write & this._mask;
+      this._span = write;
+      this._size = write;
+    }
+  }
+
+  function copyTextureRowsPadded(
+    src,
+    dst,
+    rowStart,
+    rowCount,
+    unalignedBytesPerRow,
+    alignedBytesPerRow,
+    zeroPad
+  ) {
+    if (unalignedBytesPerRow <= 64) {
+      for (let r = 0; r < rowCount; r += 1) {
+        const srcRowStart = (rowStart + r) * unalignedBytesPerRow;
+        const dstRowStart = r * alignedBytesPerRow;
+        for (let c = 0; c < unalignedBytesPerRow; c += 1) {
+          dst[dstRowStart + c] = src[srcRowStart + c];
+        }
+        if (zeroPad) {
+          dst.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
+        }
+      }
+      return;
+    }
+    for (let r = 0; r < rowCount; r += 1) {
+      const srcRowStart = (rowStart + r) * unalignedBytesPerRow;
+      const dstRowStart = r * alignedBytesPerRow;
+      dst.set(src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow), dstRowStart);
+      if (zeroPad) {
+        dst.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
+      }
+    }
+  }
+
   function sanitizeWriteBufferPayload(srcBytes) {
     const src = toUint8Array(srcBytes, 'sanitizeWriteBufferPayload');
     const originalByteLength = src.byteLength;
     if (originalByteLength === 0) {
       return {
-        bytes: new Uint8Array(0),
+        bytes: EMPTY_UINT8_ARRAY,
         originalByteLength: 0,
         alignedByteLength: 0,
         padded: false,
@@ -638,14 +846,23 @@
       this._allChunks = new Set();
       this._chunkByBuffer = new Map();
       this._activeChunks = [];
-      this._recycledChunks = [];
+      this._recycledStdQueue = new ChunkRingQueue(16);
+      this._recycledOversizedChunks = [];
       this._largeSlabBuckets = new Map();
       this._idleLargeSlabCount = 0;
-      this._inFlightChunks = [];
+      this._recycledBytes = 0;
+      this._inFlightQueue = new ChunkRingQueue(16);
+      this._gpuDoneInFlightCount = 0;
       this._currentChunk = null;
       this._pendingMapPromises = new Set();
       this._lastAcquireFresh = false;
       this._uploadScratch = null;
+      this._reclaimScratch = {
+        reclaimedChunks: 0,
+        reclaimedBytes: 0,
+        shrunkSlabs: 0,
+        shrunkBytes: 0,
+      };
       this._internalSliceScratch = {
         buffer: null,
         offset: 0,
@@ -754,7 +971,80 @@
     }
 
     _getRecycledCount() {
-      return this._recycledChunks.length + this._idleLargeSlabCount;
+      return (
+        this._recycledStdQueue.size +
+        this._recycledOversizedChunks.length +
+        this._idleLargeSlabCount
+      );
+    }
+
+    _addToActive(chunk) {
+      chunk._activeIdx = this._activeChunks.length;
+      this._activeChunks.push(chunk);
+    }
+
+    _removeFromActive(chunk) {
+      const idx = chunk._activeIdx;
+      if (idx < 0) {
+        return false;
+      }
+      const arr = this._activeChunks;
+      const lastIdx = arr.length - 1;
+      if (idx !== lastIdx) {
+        const moved = arr[lastIdx];
+        arr[idx] = moved;
+        moved._activeIdx = idx;
+      }
+      arr.pop();
+      chunk._activeIdx = -1;
+      return true;
+    }
+
+    _removeFromOversizedRecycled(chunk) {
+      const idx = chunk._oversizedIdx;
+      if (idx < 0) {
+        return false;
+      }
+      const arr = this._recycledOversizedChunks;
+      const lastIdx = arr.length - 1;
+      if (idx !== lastIdx) {
+        const moved = arr[lastIdx];
+        arr[idx] = moved;
+        moved._oversizedIdx = idx;
+      }
+      arr.pop();
+      chunk._oversizedIdx = -1;
+      return true;
+    }
+
+    _removeFromLargeSlabBucket(chunk) {
+      const bucket = this._largeSlabBuckets.get(chunk.slabBucketSize);
+      if (!bucket || !bucket.remove(chunk)) {
+        return false;
+      }
+      this._idleLargeSlabCount = Math.max(0, this._idleLargeSlabCount - 1);
+      if (bucket.size === 0) {
+        this._largeSlabBuckets.delete(chunk.slabBucketSize);
+      }
+      return true;
+    }
+
+    _putIntoInFlight(chunk, frameIndex) {
+      chunk.state = 'inFlight';
+      chunk.retiredAtFrame = frameIndex;
+      chunk.gpuDone = false;
+      chunk.readyToRecycle = false;
+      this._inFlightQueue.push(chunk);
+    }
+
+    _removeFromInFlight(chunk) {
+      if (this._inFlightQueue.remove(chunk)) {
+        if (chunk.gpuDone) {
+          this._gpuDoneInFlightCount = Math.max(0, this._gpuDoneInFlightCount - 1);
+        }
+        return true;
+      }
+      return false;
     }
 
     _resolveLargeSlabBucket(alignedSize) {
@@ -778,30 +1068,44 @@
       if (chunk.isLargeSlab) {
         let bucket = this._largeSlabBuckets.get(chunk.slabBucketSize);
         if (!bucket) {
-          bucket = [];
+          bucket = new ChunkRingQueue(8);
           this._largeSlabBuckets.set(chunk.slabBucketSize, bucket);
         }
         bucket.push(chunk);
         this._idleLargeSlabCount += 1;
+      } else if (chunk.oversized) {
+        chunk._oversizedIdx = this._recycledOversizedChunks.length;
+        this._recycledOversizedChunks.push(chunk);
       } else {
-        this._recycledChunks.push(chunk);
+        this._recycledStdQueue.push(chunk);
       }
+      this._recycledBytes += chunk.size;
     }
 
-    _enforceLargeSlabCap() {
+    _enforceLargeSlabCapInto(out) {
+      out.reclaimedChunks = 0;
+      out.reclaimedBytes = 0;
+      if (this._idleLargeSlabCount === 0) {
+        return;
+      }
+
       let reclaimedChunks = 0;
       let reclaimedBytes = 0;
 
       // 1. Enforce optional per-bucket cap via deterministic LRU eviction within each bucket.
       if (this.maxSlabsPerBucket !== null) {
-        for (const bucket of Array.from(this._largeSlabBuckets.values())) {
-          if (bucket.length <= this.maxSlabsPerBucket) {
+        for (const bucket of this._largeSlabBuckets.values()) {
+          if (bucket.size <= this.maxSlabsPerBucket) {
             continue;
           }
           const bucketSlabs = [];
-          for (let i = 0; i < bucket.length; i += 1) {
-            const slab = bucket[i];
-            if (slab && !slab.destroyed && slab.state === 'recycled') {
+          const bBuf = bucket._buf;
+          const bMask = bucket._mask;
+          let bIdx = bucket._head;
+          for (let i = 0; i < bucket._span; i += 1) {
+            const slab = bBuf[bIdx];
+            bIdx = (bIdx + 1) & bMask;
+            if (slab !== undefined && !slab.destroyed && slab.state === 'recycled') {
               bucketSlabs.push(slab);
             }
           }
@@ -830,9 +1134,13 @@
       if (this._idleLargeSlabCount > this.maxLargeSlabs) {
         const idleSlabs = [];
         for (const bucket of this._largeSlabBuckets.values()) {
-          for (let i = 0; i < bucket.length; i += 1) {
-            const slab = bucket[i];
-            if (slab && !slab.destroyed && slab.state === 'recycled') {
+          const bBuf = bucket._buf;
+          const bMask = bucket._mask;
+          let bIdx = bucket._head;
+          for (let i = 0; i < bucket._span; i += 1) {
+            const slab = bBuf[bIdx];
+            bIdx = (bIdx + 1) & bMask;
+            if (slab !== undefined && !slab.destroyed && slab.state === 'recycled') {
               idleSlabs.push(slab);
             }
           }
@@ -865,7 +1173,16 @@
         this._trimmedStagingBytes += reclaimedBytes;
       }
 
-      return { reclaimedChunks, reclaimedBytes };
+      out.reclaimedChunks = reclaimedChunks;
+      out.reclaimedBytes = reclaimedBytes;
+    }
+
+    _enforceLargeSlabCap() {
+      this._enforceLargeSlabCapInto(this._reclaimScratch);
+      return {
+        reclaimedChunks: this._reclaimScratch.reclaimedChunks,
+        reclaimedBytes: this._reclaimScratch.reclaimedBytes,
+      };
     }
 
     _createChunk(byteSize, oversized, slabBucketSize = 0) {
@@ -924,6 +1241,11 @@
         mapPending: false,
         mappedView,
         destroyed: false,
+        _activeIdx: -1,
+        _oversizedIdx: -1,
+        _bucketIdx: -1,
+        _queue: null,
+        _queueSlot: -1,
       };
 
       this._allChunks.add(chunk);
@@ -945,6 +1267,7 @@
       if (!chunk || chunk.destroyed || chunk.state === 'destroyed') {
         return;
       }
+      const wasRecycled = chunk.state === 'recycled';
       chunk.destroyed = true;
       chunk.state = 'destroyed';
       chunk.isMapped = false;
@@ -957,32 +1280,24 @@
       if (this._currentChunk === chunk) {
         this._currentChunk = null;
       }
-      const activeIdx = this._activeChunks.indexOf(chunk);
-      if (activeIdx !== -1) {
-        this._activeChunks.splice(activeIdx, 1);
+      this._removeFromActive(chunk);
+      let removedFromRecycled = false;
+      if (this._recycledStdQueue.remove(chunk)) {
+        removedFromRecycled = true;
       }
-      const recycledIdx = this._recycledChunks.indexOf(chunk);
-      if (recycledIdx !== -1) {
-        this._recycledChunks.splice(recycledIdx, 1);
+      if (this._removeFromOversizedRecycled(chunk)) {
+        removedFromRecycled = true;
       }
       if (chunk.isLargeSlab) {
-        const bucket = this._largeSlabBuckets.get(chunk.slabBucketSize);
-        if (bucket) {
-          const bucketIdx = bucket.indexOf(chunk);
-          if (bucketIdx !== -1) {
-            bucket.splice(bucketIdx, 1);
-            this._idleLargeSlabCount = Math.max(0, this._idleLargeSlabCount - 1);
-            if (bucket.length === 0) {
-              this._largeSlabBuckets.delete(chunk.slabBucketSize);
-            }
-          }
+        if (this._removeFromLargeSlabBucket(chunk)) {
+          removedFromRecycled = true;
         }
         this._largeSlabBytes = Math.max(0, this._largeSlabBytes - chunk.size);
       }
-      const inFlightIdx = this._inFlightChunks.indexOf(chunk);
-      if (inFlightIdx !== -1) {
-        this._inFlightChunks.splice(inFlightIdx, 1);
+      if (removedFromRecycled || wasRecycled) {
+        this._recycledBytes = Math.max(0, this._recycledBytes - chunk.size);
       }
+      this._removeFromInFlight(chunk);
       this._allocatedBytes = Math.max(0, this._allocatedBytes - chunk.size);
       if (chunk.buffer && typeof chunk.buffer.destroy === 'function') {
         chunk.buffer.destroy();
@@ -994,9 +1309,10 @@
       // 1. Prefer evicting idle non-bucketed oversized burst chunks via deterministic LRU
       //    (oldest frame first, largest first on tie) so steady-state standard chunks stay warm.
       let bestOversized = null;
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        const candidate = this._recycledChunks[i];
-        if (!candidate || candidate.destroyed || candidate.state !== 'recycled' || !candidate.oversized) {
+      const oversizedArr = this._recycledOversizedChunks;
+      for (let i = 0; i < oversizedArr.length; i += 1) {
+        const candidate = oversizedArr[i];
+        if (!candidate || candidate.destroyed || candidate.state !== 'recycled') {
           continue;
         }
         if (!bestOversized || compareEvictionLru(candidate, bestOversized) < 0) {
@@ -1010,9 +1326,13 @@
       // 2. Next evict idle large slabs via deterministic LRU (oldest used first, then largest first).
       let bestSlab = null;
       for (const bucket of this._largeSlabBuckets.values()) {
-        for (let i = 0; i < bucket.length; i += 1) {
-          const slab = bucket[i];
-          if (!slab || slab.destroyed || slab.state !== 'recycled') {
+        const bBuf = bucket._buf;
+        const bMask = bucket._mask;
+        let bIdx = bucket._head;
+        for (let i = 0; i < bucket._span; i += 1) {
+          const slab = bBuf[bIdx];
+          bIdx = (bIdx + 1) & bMask;
+          if (slab === undefined || slab.destroyed || slab.state !== 'recycled') {
             continue;
           }
           if (!bestSlab || compareEvictionLru(slab, bestSlab) < 0) {
@@ -1026,9 +1346,14 @@
 
       // 3. Finally evict the LRU idle standard chunk.
       let bestStd = null;
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        const candidate = this._recycledChunks[i];
-        if (!candidate || candidate.destroyed || candidate.state !== 'recycled') {
+      const stdQ = this._recycledStdQueue;
+      const stdBuf = stdQ._buf;
+      const stdMask = stdQ._mask;
+      let idx = stdQ._head;
+      for (let i = 0; i < stdQ._span; i += 1) {
+        const candidate = stdBuf[idx];
+        idx = (idx + 1) & stdMask;
+        if (candidate === undefined || candidate.destroyed || candidate.state !== 'recycled') {
           continue;
         }
         if (!bestStd || compareEvictionLru(candidate, bestStd) < 0) {
@@ -1039,14 +1364,23 @@
     }
 
     _reclaimCompletedInFlight(enforceCap = true) {
-      if (this._destroyed || this._inFlightChunks.length === 0) {
+      if (this._destroyed || this._gpuDoneInFlightCount === 0 || this._inFlightQueue.size === 0) {
         return 0;
       }
       let reclaimed = 0;
-      const stillInFlight = [];
-      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
-        const chunk = this._inFlightChunks[i];
-        if (!chunk || chunk.destroyed || chunk.state !== 'inFlight') {
+      const q = this._inFlightQueue;
+      const buf = q._buf;
+      const mask = q._mask;
+      let idx = q._head;
+      const span = q._span;
+      for (let i = 0; i < span; i += 1) {
+        const chunk = buf[idx];
+        idx = (idx + 1) & mask;
+        if (chunk === undefined) {
+          continue;
+        }
+        if (chunk.destroyed || chunk.state !== 'inFlight') {
+          this._removeFromInFlight(chunk);
           continue;
         }
         if (chunk.gpuDone) {
@@ -1054,22 +1388,19 @@
             chunk.readyToRecycle = true;
             this._beginRemap(chunk);
             if (chunk.isMapped) {
+              this._removeFromInFlight(chunk);
               this._putIntoRecycled(chunk);
               reclaimed += 1;
-            } else {
-              stillInFlight.push(chunk);
             }
           } else {
+            this._removeFromInFlight(chunk);
             this._putIntoRecycled(chunk);
             reclaimed += 1;
           }
-        } else {
-          stillInFlight.push(chunk);
         }
       }
-      this._inFlightChunks = stillInFlight;
       if (enforceCap && reclaimed > 0) {
-        this._enforceLargeSlabCap();
+        this._enforceLargeSlabCapInto(this._reclaimScratch);
       }
       return reclaimed;
     }
@@ -1084,12 +1415,93 @@
       this._assertNotDestroyed();
       const recycled = this._reclaimCompletedInFlight(true);
       if (this.idleShrinkFrames > 0) {
-        this.shrinkIdleOversizedSlabs(this.idleShrinkFrames);
+        this._shrinkIdleOversizedSlabsInto(this.idleShrinkFrames, this._reclaimScratch);
       }
       if (this.idleEvictFrames > 0) {
-        this.reclaimIdleChunks(this.idleEvictFrames);
+        this._reclaimIdleChunksInto(this.idleEvictFrames, this._reclaimScratch);
       }
       return recycled;
+    }
+
+    _shrinkIdleOversizedSlabsInto(threshold, out) {
+      out.shrunkSlabs = 0;
+      out.shrunkBytes = 0;
+      if (this._recycledOversizedChunks.length === 0 && this._idleLargeSlabCount === 0) {
+        return;
+      }
+
+      const currentFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
+      let candidates = null;
+
+      const oversizedArr = this._recycledOversizedChunks;
+      for (let i = 0; i < oversizedArr.length; i += 1) {
+        const chunk = oversizedArr[i];
+        if (
+          chunk &&
+          !chunk.destroyed &&
+          chunk.state === 'recycled' &&
+          currentFrame - chunk.lastUsedFrame >= threshold
+        ) {
+          if (candidates === null) candidates = [];
+          candidates.push(chunk);
+        }
+      }
+
+      for (const bucket of this._largeSlabBuckets.values()) {
+        const bBuf = bucket._buf;
+        const bMask = bucket._mask;
+        let bIdx = bucket._head;
+        for (let i = 0; i < bucket._span; i += 1) {
+          const slab = bBuf[bIdx];
+          bIdx = (bIdx + 1) & bMask;
+          if (
+            slab !== undefined &&
+            !slab.destroyed &&
+            slab.state === 'recycled' &&
+            currentFrame - slab.lastUsedFrame >= threshold
+          ) {
+            if (candidates === null) candidates = [];
+            candidates.push(slab);
+          }
+        }
+      }
+
+      if (candidates === null) {
+        return;
+      }
+
+      if (candidates.length > 1) {
+        candidates.sort(compareEvictionLru);
+      }
+
+      let shrunkSlabs = 0;
+      let shrunkBytes = 0;
+      for (let i = 0; i < candidates.length; i += 1) {
+        const chunk = candidates[i];
+        if (chunk.destroyed || chunk.state !== 'recycled') {
+          continue;
+        }
+        const byteSize = chunk.size;
+        const wasLargeSlab = chunk.isLargeSlab;
+        this._destroyChunk(chunk);
+        if (wasLargeSlab) {
+          this._largeSlabEvictions += 1;
+        }
+        this._evictedCount += 1;
+        this._evictedBytes += byteSize;
+        this._idleSlabShrinks += 1;
+        shrunkSlabs += 1;
+        shrunkBytes += byteSize;
+      }
+
+      if (shrunkSlabs > 0) {
+        this._reclaimedChunks += shrunkSlabs;
+        this._reclaimedBytes += shrunkBytes;
+        this._trimmedStagingBytes += shrunkBytes;
+      }
+
+      out.shrunkSlabs = shrunkSlabs;
+      out.shrunkBytes = shrunkBytes;
     }
 
     /**
@@ -1118,70 +1530,11 @@
         threshold = maxIdleFrames;
       }
 
-      const currentFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
-      const candidates = [];
-
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        const chunk = this._recycledChunks[i];
-        if (
-          chunk &&
-          !chunk.destroyed &&
-          chunk.state === 'recycled' &&
-          (chunk.oversized || chunk.isLargeSlab) &&
-          currentFrame - chunk.lastUsedFrame >= threshold
-        ) {
-          candidates.push(chunk);
-        }
-      }
-
-      for (const bucket of this._largeSlabBuckets.values()) {
-        for (let i = 0; i < bucket.length; i += 1) {
-          const slab = bucket[i];
-          if (
-            slab &&
-            !slab.destroyed &&
-            slab.state === 'recycled' &&
-            (slab.oversized || slab.isLargeSlab) &&
-            currentFrame - slab.lastUsedFrame >= threshold
-          ) {
-            candidates.push(slab);
-          }
-        }
-      }
-
-      if (candidates.length === 0) {
-        return { shrunkSlabs: 0, shrunkBytes: 0 };
-      }
-
-      candidates.sort(compareEvictionLru);
-
-      let shrunkSlabs = 0;
-      let shrunkBytes = 0;
-      for (let i = 0; i < candidates.length; i += 1) {
-        const chunk = candidates[i];
-        if (chunk.destroyed || chunk.state !== 'recycled') {
-          continue;
-        }
-        const byteSize = chunk.size;
-        const wasLargeSlab = chunk.isLargeSlab;
-        this._destroyChunk(chunk);
-        if (wasLargeSlab) {
-          this._largeSlabEvictions += 1;
-        }
-        this._evictedCount += 1;
-        this._evictedBytes += byteSize;
-        this._idleSlabShrinks += 1;
-        shrunkSlabs += 1;
-        shrunkBytes += byteSize;
-      }
-
-      if (shrunkSlabs > 0) {
-        this._reclaimedChunks += shrunkSlabs;
-        this._reclaimedBytes += shrunkBytes;
-        this._trimmedStagingBytes += shrunkBytes;
-      }
-
-      return { shrunkSlabs, shrunkBytes };
+      this._shrinkIdleOversizedSlabsInto(threshold, this._reclaimScratch);
+      return {
+        shrunkSlabs: this._reclaimScratch.shrunkSlabs,
+        shrunkBytes: this._reclaimScratch.shrunkBytes,
+      };
     }
 
     /**
@@ -1230,8 +1583,28 @@
       const reclaimedInFlight = reclaimCompletedFirst ? this._reclaimCompletedInFlight(false) : 0;
 
       const candidates = [];
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        const chunk = this._recycledChunks[i];
+      if (this.chunkSize > maxRetainedSlabBytes && this._recycledStdQueue.size > 0) {
+        const stdQ = this._recycledStdQueue;
+        const stdBuf = stdQ._buf;
+        const stdMask = stdQ._mask;
+        let idx = stdQ._head;
+        for (let i = 0; i < stdQ._span; i += 1) {
+          const chunk = stdBuf[idx];
+          idx = (idx + 1) & stdMask;
+          if (
+            chunk !== undefined &&
+            !chunk.destroyed &&
+            chunk.state === 'recycled' &&
+            chunk.size > maxRetainedSlabBytes
+          ) {
+            candidates.push(chunk);
+          }
+        }
+      }
+
+      const oversizedArr = this._recycledOversizedChunks;
+      for (let i = 0; i < oversizedArr.length; i += 1) {
+        const chunk = oversizedArr[i];
         if (
           chunk &&
           !chunk.destroyed &&
@@ -1243,10 +1616,14 @@
       }
 
       for (const bucket of this._largeSlabBuckets.values()) {
-        for (let i = 0; i < bucket.length; i += 1) {
-          const slab = bucket[i];
+        const bBuf = bucket._buf;
+        const bMask = bucket._mask;
+        let bIdx = bucket._head;
+        for (let i = 0; i < bucket._span; i += 1) {
+          const slab = bBuf[bIdx];
+          bIdx = (bIdx + 1) & bMask;
           if (
-            slab &&
+            slab !== undefined &&
             !slab.destroyed &&
             slab.state === 'recycled' &&
             (slab.size > maxRetainedSlabBytes || (includeAllLargeSlabs && slab.isLargeSlab))
@@ -1289,89 +1666,97 @@
       this._uploadScratch = null;
 
       if (reclaimedInFlight > 0) {
-        this._enforceLargeSlabCap();
+        this._enforceLargeSlabCapInto(this._reclaimScratch);
       }
 
       return { reclaimedSlabs, reclaimedBytes };
     }
 
-    /**
-     * Destroy and remove idle recycled (not active, not in-flight) staging chunks
-     * whose `currentFrame - chunk.lastUsedFrame >= maxIdleFrames`, while keeping
-     * at least `minWarmChunks` warm chunks in the recycled pool.
-     *
-     * Prefers evicting oversized burst chunks / large slabs (largest first) and
-     * oldest chunks first so steady-state standard chunks stay warm.
-     *
-     * @param {number} [maxIdleFrames]
-     * @returns {{ reclaimedChunks: number, reclaimedBytes: number }}
-     */
-    reclaimIdleChunks(maxIdleFrames) {
-      this._assertNotDestroyed();
-
-      let threshold;
-      if (maxIdleFrames === undefined) {
-        if (this.idleEvictFrames <= 0) {
-          return { reclaimedChunks: 0, reclaimedBytes: 0 };
-        }
-        threshold = this.idleEvictFrames;
-      } else {
-        assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
-        threshold = maxIdleFrames;
-      }
+    _reclaimIdleChunksInto(threshold, out) {
+      out.reclaimedChunks = 0;
+      out.reclaimedBytes = 0;
 
       if (this._getRecycledCount() <= this.minWarmChunks) {
-        return { reclaimedChunks: 0, reclaimedBytes: 0 };
+        return;
       }
 
       const currentFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
-      const candidates = [];
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        const chunk = this._recycledChunks[i];
+      let candidates = null;
+
+      const stdQ = this._recycledStdQueue;
+      const stdBuf = stdQ._buf;
+      const stdMask = stdQ._mask;
+      let idx = stdQ._head;
+      for (let i = 0; i < stdQ._span; i += 1) {
+        const chunk = stdBuf[idx];
+        idx = (idx + 1) & stdMask;
+        if (
+          chunk !== undefined &&
+          !chunk.destroyed &&
+          chunk.state === 'recycled' &&
+          currentFrame - chunk.lastUsedFrame >= threshold
+        ) {
+          if (candidates === null) candidates = [];
+          candidates.push(chunk);
+        }
+      }
+
+      const oversizedArr = this._recycledOversizedChunks;
+      for (let i = 0; i < oversizedArr.length; i += 1) {
+        const chunk = oversizedArr[i];
         if (
           chunk &&
           !chunk.destroyed &&
           chunk.state === 'recycled' &&
           currentFrame - chunk.lastUsedFrame >= threshold
         ) {
+          if (candidates === null) candidates = [];
           candidates.push(chunk);
         }
       }
+
       for (const bucket of this._largeSlabBuckets.values()) {
-        for (let i = 0; i < bucket.length; i += 1) {
-          const chunk = bucket[i];
+        const bBuf = bucket._buf;
+        const bMask = bucket._mask;
+        let bIdx = bucket._head;
+        for (let i = 0; i < bucket._span; i += 1) {
+          const chunk = bBuf[bIdx];
+          bIdx = (bIdx + 1) & bMask;
           if (
-            chunk &&
+            chunk !== undefined &&
             !chunk.destroyed &&
             chunk.state === 'recycled' &&
             currentFrame - chunk.lastUsedFrame >= threshold
           ) {
+            if (candidates === null) candidates = [];
             candidates.push(chunk);
           }
         }
       }
 
-      if (candidates.length === 0) {
-        return { reclaimedChunks: 0, reclaimedBytes: 0 };
+      if (candidates === null) {
+        return;
       }
 
-      candidates.sort((a, b) => {
-        const aLarge = a.oversized || a.isLargeSlab;
-        const bLarge = b.oversized || b.isLargeSlab;
-        if (aLarge !== bLarge) {
-          return aLarge ? -1 : 1;
-        }
-        if (aLarge && a.size !== b.size) {
-          return b.size - a.size;
-        }
-        if (a.lastUsedFrame !== b.lastUsedFrame) {
-          return a.lastUsedFrame - b.lastUsedFrame;
-        }
-        if (a.lastUsedSeq !== b.lastUsedSeq) {
-          return a.lastUsedSeq - b.lastUsedSeq;
-        }
-        return a.id - b.id;
-      });
+      if (candidates.length > 1) {
+        candidates.sort((a, b) => {
+          const aLarge = a.oversized || a.isLargeSlab;
+          const bLarge = b.oversized || b.isLargeSlab;
+          if (aLarge !== bLarge) {
+            return aLarge ? -1 : 1;
+          }
+          if (aLarge && a.size !== b.size) {
+            return b.size - a.size;
+          }
+          if (a.lastUsedFrame !== b.lastUsedFrame) {
+            return a.lastUsedFrame - b.lastUsedFrame;
+          }
+          if (a.lastUsedSeq !== b.lastUsedSeq) {
+            return a.lastUsedSeq - b.lastUsedSeq;
+          }
+          return a.id - b.id;
+        });
+      }
 
       let reclaimedChunks = 0;
       let reclaimedBytes = 0;
@@ -1401,7 +1786,40 @@
         this._trimmedStagingBytes += reclaimedBytes;
       }
 
-      return { reclaimedChunks, reclaimedBytes };
+      out.reclaimedChunks = reclaimedChunks;
+      out.reclaimedBytes = reclaimedBytes;
+    }
+
+    /**
+     * Destroy and remove idle recycled (not active, not in-flight) staging chunks
+     * whose `currentFrame - chunk.lastUsedFrame >= maxIdleFrames`, while keeping
+     * at least `minWarmChunks` warm chunks in the recycled pool.
+     *
+     * Prefers evicting oversized burst chunks / large slabs (largest first) and
+     * oldest chunks first so steady-state standard chunks stay warm.
+     *
+     * @param {number} [maxIdleFrames]
+     * @returns {{ reclaimedChunks: number, reclaimedBytes: number }}
+     */
+    reclaimIdleChunks(maxIdleFrames) {
+      this._assertNotDestroyed();
+
+      let threshold;
+      if (maxIdleFrames === undefined) {
+        if (this.idleEvictFrames <= 0) {
+          return { reclaimedChunks: 0, reclaimedBytes: 0 };
+        }
+        threshold = this.idleEvictFrames;
+      } else {
+        assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
+        threshold = maxIdleFrames;
+      }
+
+      this._reclaimIdleChunksInto(threshold, this._reclaimScratch);
+      return {
+        reclaimedChunks: this._reclaimScratch.reclaimedChunks,
+        reclaimedBytes: this._reclaimScratch.reclaimedBytes,
+      };
     }
 
     _ensureBudget(allocSize, requestedSize) {
@@ -1412,16 +1830,8 @@
       // First reclaim any GPU-completed in-flight chunks so burst eviction can reuse/free them.
       const reclaimedInFlight = this._reclaimCompletedInFlight(false);
 
-      // Check whether evicting idle recycled chunks / idle large slabs can make room.
-      let reclaimable = 0;
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        reclaimable += this._recycledChunks[i].size;
-      }
-      for (const bucket of this._largeSlabBuckets.values()) {
-        for (let i = 0; i < bucket.length; i += 1) {
-          reclaimable += bucket[i].size;
-        }
-      }
+      // O(1) check whether evicting idle recycled chunks / idle large slabs can make room.
+      const reclaimable = this._recycledBytes;
 
       if (this._allocatedBytes - reclaimable + allocSize <= this.maxPoolBytes) {
         while (this._allocatedBytes + allocSize > this.maxPoolBytes) {
@@ -1439,13 +1849,13 @@
           }
         }
         if (reclaimedInFlight > 0) {
-          this._enforceLargeSlabCap();
+          this._enforceLargeSlabCapInto(this._reclaimScratch);
         }
         return;
       }
 
       if (reclaimedInFlight > 0) {
-        this._enforceLargeSlabCap();
+        this._enforceLargeSlabCapInto(this._reclaimScratch);
       }
 
       throw new RangeError(
@@ -1457,16 +1867,17 @@
 
     _takeLargeSlab(bucketSize) {
       const bucket = this._largeSlabBuckets.get(bucketSize);
-      if (!bucket || bucket.length === 0) {
+      if (!bucket || bucket.size === 0) {
         return null;
       }
-      while (bucket.length > 0) {
+      while (bucket.size > 0) {
         const slab = bucket.pop();
         this._idleLargeSlabCount = Math.max(0, this._idleLargeSlabCount - 1);
-        if (bucket.length === 0) {
+        if (bucket.size === 0) {
           this._largeSlabBuckets.delete(bucketSize);
         }
         if (slab && !slab.destroyed && slab.state === 'recycled') {
+          this._recycledBytes = Math.max(0, this._recycledBytes - slab.size);
           slab.cursor = 0;
           slab.subAllocCount = 0;
           slab.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
@@ -1486,16 +1897,16 @@
 
       if (!recycled && this._reclaimCompletedInFlight(false) > 0) {
         recycled = this._takeLargeSlab(bucketSize);
-        this._enforceLargeSlabCap();
+        this._enforceLargeSlabCapInto(this._reclaimScratch);
       }
 
       if (recycled) {
         this._bufferReuseHits += 1;
         this._largeSlabHits += 1;
         this._bytesReused += recycled.size;
-        this._activeChunks.push(recycled);
+        this._addToActive(recycled);
         this._lastAcquireFresh = false;
-        if (this._inFlightChunks.length > 0) {
+        if (this._inFlightQueue.size > 0) {
           this._stallAvoidedCount += 1;
         }
         return recycled;
@@ -1504,51 +1915,51 @@
       const created = this._createChunk(bucketSize, oversized, bucketSize);
       this._bufferReuseMisses += 1;
       this._largeSlabMisses += 1;
-      this._activeChunks.push(created);
+      this._addToActive(created);
       this._lastAcquireFresh = true;
-      if (this._inFlightChunks.length > 0) {
+      if (this._inFlightQueue.size > 0) {
         this._stallAvoidedCount += 1;
       }
       return created;
     }
 
     _takeRecycledChunk(minSize, oversized) {
-      if (this._recycledChunks.length === 0) {
+      // O(1) FIFO fast path for standard steady-state chunks (zero scan, zero shift).
+      if (!oversized && minSize <= this.chunkSize && this._recycledStdQueue.size > 0) {
+        while (this._recycledStdQueue.size > 0) {
+          const chunk = this._recycledStdQueue.shift();
+          if (chunk && !chunk.destroyed && chunk.state === 'recycled' && chunk.size >= minSize) {
+            this._recycledBytes = Math.max(0, this._recycledBytes - chunk.size);
+            chunk.cursor = 0;
+            chunk.subAllocCount = 0;
+            chunk.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
+            chunk.lastUsedSeq = ++this._lruSeq;
+            chunk.retiredAtFrame = -1;
+            chunk.gpuDone = false;
+            chunk.readyToRecycle = false;
+            chunk.state = 'active';
+            return chunk;
+          }
+        }
+      }
+
+      const oversizedArr = this._recycledOversizedChunks;
+      if (oversizedArr.length === 0) {
         return null;
       }
 
       let bestIndex = -1;
       let bestSize = Infinity;
-
-      // Prefer standard chunks for standard allocations; otherwise best-fit >= minSize.
-      if (!oversized) {
-        for (let i = 0; i < this._recycledChunks.length; i += 1) {
-          const candidate = this._recycledChunks[i];
-          if (
-            !candidate.destroyed &&
-            candidate.state === 'recycled' &&
-            !candidate.oversized &&
-            candidate.size >= minSize &&
-            candidate.size < bestSize
-          ) {
-            bestIndex = i;
-            bestSize = candidate.size;
-          }
-        }
-      }
-
-      if (bestIndex === -1) {
-        for (let i = 0; i < this._recycledChunks.length; i += 1) {
-          const candidate = this._recycledChunks[i];
-          if (
-            !candidate.destroyed &&
-            candidate.state === 'recycled' &&
-            candidate.size >= minSize &&
-            candidate.size < bestSize
-          ) {
-            bestIndex = i;
-            bestSize = candidate.size;
-          }
+      for (let i = 0; i < oversizedArr.length; i += 1) {
+        const candidate = oversizedArr[i];
+        if (
+          !candidate.destroyed &&
+          candidate.state === 'recycled' &&
+          candidate.size >= minSize &&
+          candidate.size < bestSize
+        ) {
+          bestIndex = i;
+          bestSize = candidate.size;
         }
       }
 
@@ -1556,11 +1967,9 @@
         return null;
       }
 
-      const chunk = this._recycledChunks[bestIndex];
-      for (let i = bestIndex + 1; i < this._recycledChunks.length; i += 1) {
-        this._recycledChunks[i - 1] = this._recycledChunks[i];
-      }
-      this._recycledChunks.pop();
+      const chunk = oversizedArr[bestIndex];
+      this._removeFromOversizedRecycled(chunk);
+      this._recycledBytes = Math.max(0, this._recycledBytes - chunk.size);
       chunk.cursor = 0;
       chunk.subAllocCount = 0;
       chunk.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
@@ -1581,15 +1990,15 @@
       // before allocating fresh GPUBuffers.
       if (!recycled && this._reclaimCompletedInFlight(false) > 0) {
         recycled = this._takeRecycledChunk(minRequired, oversized);
-        this._enforceLargeSlabCap();
+        this._enforceLargeSlabCapInto(this._reclaimScratch);
       }
 
       if (recycled) {
         this._bufferReuseHits += 1;
         this._bytesReused += recycled.size;
-        this._activeChunks.push(recycled);
+        this._addToActive(recycled);
         this._lastAcquireFresh = false;
-        if (this._inFlightChunks.length > 0) {
+        if (this._inFlightQueue.size > 0) {
           this._stallAvoidedCount += 1;
         }
         return recycled;
@@ -1597,9 +2006,9 @@
 
       const created = this._createChunk(targetSize, oversized, 0);
       this._bufferReuseMisses += 1;
-      this._activeChunks.push(created);
+      this._addToActive(created);
       this._lastAcquireFresh = true;
-      if (this._inFlightChunks.length > 0) {
+      if (this._inFlightQueue.size > 0) {
         this._stallAvoidedCount += 1;
       }
       return created;
@@ -1609,14 +2018,12 @@
       if (this._destroyed || !chunk || chunk.destroyed || chunk.state !== 'inFlight') {
         return false;
       }
-      const idx = this._inFlightChunks.indexOf(chunk);
-      if (idx === -1) {
+      if (!this._removeFromInFlight(chunk)) {
         return false;
       }
-      this._inFlightChunks.splice(idx, 1);
       this._putIntoRecycled(chunk);
       if (chunk.isLargeSlab) {
-        this._enforceLargeSlabCap();
+        this._enforceLargeSlabCapInto(this._reclaimScratch);
       }
       return true;
     }
@@ -1660,18 +2067,50 @@
       }
     }
 
+    _onWorkDoneChunk(chunk) {
+      if (
+        this._destroyed ||
+        !chunk ||
+        chunk.destroyed ||
+        chunk.state !== 'inFlight' ||
+        !this._inFlightQueue.contains(chunk)
+      ) {
+        return;
+      }
+      if (!chunk.gpuDone) {
+        chunk.gpuDone = true;
+        this._gpuDoneInFlightCount += 1;
+      }
+      if (this.mode === STAGING_MODE.MAPPED && !chunk.isMapped) {
+        this._beginRemap(chunk);
+      }
+    }
+
     _onWorkDone(retiredChunks) {
       if (this._destroyed) {
         return;
       }
       for (let i = 0; i < retiredChunks.length; i += 1) {
-        const chunk = retiredChunks[i];
-        if (!chunk || chunk.destroyed || chunk.state !== 'inFlight' || this._inFlightChunks.indexOf(chunk) === -1) {
-          continue;
-        }
-        chunk.gpuDone = true;
-        if (this.mode === STAGING_MODE.MAPPED && !chunk.isMapped) {
-          this._beginRemap(chunk);
+        this._onWorkDoneChunk(retiredChunks[i]);
+      }
+    }
+
+    _attachWorkDoneFenceSingle(chunk) {
+      if (
+        chunk &&
+        this.device.queue &&
+        typeof this.device.queue.onSubmittedWorkDone === 'function'
+      ) {
+        const workDone = this.device.queue.onSubmittedWorkDone();
+        if (workDone && typeof workDone.then === 'function') {
+          workDone.then(
+            () => {
+              this._onWorkDoneChunk(chunk);
+            },
+            () => {
+              // Ignore rejected fence (e.g., lost/destroyed device).
+            }
+          );
         }
       }
     }
@@ -1728,56 +2167,71 @@
       this._frameBytesUploaded = 0;
 
       let recycledCount = 0;
-      const stillInFlight = [];
-
-      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
-        const chunk = this._inFlightChunks[i];
-        if (!chunk || chunk.destroyed || chunk.state !== 'inFlight') {
-          continue;
-        }
-        const epochElapsed = nextFrame - chunk.retiredAtFrame >= this.framesInFlight;
-        if (chunk.gpuDone || epochElapsed) {
-          if (this.mode === STAGING_MODE.MAPPED && !chunk.isMapped) {
-            chunk.readyToRecycle = true;
-            this._beginRemap(chunk);
-            if (chunk.isMapped) {
+      const q = this._inFlightQueue;
+      if (q.size > 0) {
+        const buf = q._buf;
+        const mask = q._mask;
+        let idx = q._head;
+        const span = q._span;
+        const framesInFlight = this.framesInFlight;
+        const isMappedMode = this.mode === STAGING_MODE.MAPPED;
+        for (let i = 0; i < span; i += 1) {
+          const chunk = buf[idx];
+          idx = (idx + 1) & mask;
+          if (chunk === undefined) {
+            continue;
+          }
+          if (chunk.destroyed || chunk.state !== 'inFlight') {
+            this._removeFromInFlight(chunk);
+            continue;
+          }
+          const epochElapsed = nextFrame - chunk.retiredAtFrame >= framesInFlight;
+          if (chunk.gpuDone || epochElapsed) {
+            if (isMappedMode && !chunk.isMapped) {
+              chunk.readyToRecycle = true;
+              this._beginRemap(chunk);
+              if (chunk.isMapped) {
+                this._removeFromInFlight(chunk);
+                this._putIntoRecycled(chunk);
+                recycledCount += 1;
+              }
+            } else {
+              this._removeFromInFlight(chunk);
               this._putIntoRecycled(chunk);
               recycledCount += 1;
-            } else {
-              stillInFlight.push(chunk);
             }
-          } else {
-            this._putIntoRecycled(chunk);
-            recycledCount += 1;
           }
-        } else {
-          stillInFlight.push(chunk);
         }
       }
 
-      this._inFlightChunks = stillInFlight;
-
-      const capReclaim = this._enforceLargeSlabCap();
-      let shrinkReclaim = { shrunkSlabs: 0, shrunkBytes: 0 };
+      const scratch = this._reclaimScratch;
+      this._enforceLargeSlabCapInto(scratch);
+      let reclaimedChunks = scratch.reclaimedChunks;
+      let reclaimedBytes = scratch.reclaimedBytes;
+      let shrunkSlabs = 0;
+      let shrunkBytes = 0;
       if (this.idleShrinkFrames > 0) {
-        shrinkReclaim = this.shrinkIdleOversizedSlabs(this.idleShrinkFrames);
+        this._shrinkIdleOversizedSlabsInto(this.idleShrinkFrames, scratch);
+        shrunkSlabs = scratch.shrunkSlabs;
+        shrunkBytes = scratch.shrunkBytes;
+        reclaimedChunks += shrunkSlabs;
+        reclaimedBytes += shrunkBytes;
       }
-      let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
       if (this.idleEvictFrames > 0) {
-        idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
+        this._reclaimIdleChunksInto(this.idleEvictFrames, scratch);
+        reclaimedChunks += scratch.reclaimedChunks;
+        reclaimedBytes += scratch.reclaimedBytes;
       }
 
       return {
         frameIndex: this._currentFrame,
         recycledCount,
         recycledChunks: this._getRecycledCount(),
-        inFlightChunks: this._inFlightChunks.length,
-        reclaimedChunks:
-          capReclaim.reclaimedChunks + shrinkReclaim.shrunkSlabs + idleReclaim.reclaimedChunks,
-        reclaimedBytes:
-          capReclaim.reclaimedBytes + shrinkReclaim.shrunkBytes + idleReclaim.reclaimedBytes,
-        shrunkSlabs: shrinkReclaim.shrunkSlabs,
-        shrunkBytes: shrinkReclaim.shrunkBytes,
+        inFlightChunks: this._inFlightQueue.size,
+        reclaimedChunks,
+        reclaimedBytes,
+        shrunkSlabs,
+        shrunkBytes,
       };
     }
 
@@ -1837,10 +2291,7 @@
         return false;
       }
 
-      const activeIdx = this._activeChunks.indexOf(chunk);
-      if (activeIdx !== -1) {
-        this._activeChunks.splice(activeIdx, 1);
-      }
+      this._removeFromActive(chunk);
       if (this._currentChunk === chunk) {
         this._currentChunk = null;
       }
@@ -1853,12 +2304,8 @@
         chunk.mappedView = null;
       }
 
-      chunk.state = 'inFlight';
-      chunk.retiredAtFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
-      chunk.gpuDone = false;
-      chunk.readyToRecycle = false;
-      this._inFlightChunks.push(chunk);
-      this._attachWorkDoneFence([chunk]);
+      this._putIntoInFlight(chunk, this._currentFrame < 0 ? 0 : this._currentFrame);
+      this._attachWorkDoneFenceSingle(chunk);
       return true;
     }
 
@@ -1880,26 +2327,44 @@
 
       this.prepareSubmit();
 
-      const rawActive = this._activeChunks;
-      this._activeChunks = [];
+      const active = this._activeChunks;
+      const activeLen = active.length;
       this._currentChunk = null;
 
-      const retiredChunks = [];
-      for (let i = 0; i < rawActive.length; i += 1) {
-        const chunk = rawActive[i];
+      const hasWorkDoneFence = Boolean(
+        activeLen > 0 &&
+          this.device.queue &&
+          typeof this.device.queue.onSubmittedWorkDone === 'function'
+      );
+      let retiredCount = 0;
+      let firstRetired = null;
+      let retiredList = null;
+
+      for (let i = 0; i < activeLen; i += 1) {
+        const chunk = active[i];
+        active[i] = undefined;
+        if (chunk) {
+          chunk._activeIdx = -1;
+        }
         if (!chunk || chunk.destroyed || chunk.state !== 'active') {
           this._doubleReleaseIgnored += 1;
           continue;
         }
-        chunk.state = 'inFlight';
-        chunk.retiredAtFrame = this._currentFrame;
-        chunk.gpuDone = false;
-        chunk.readyToRecycle = false;
-        this._inFlightChunks.push(chunk);
-        retiredChunks.push(chunk);
+        this._putIntoInFlight(chunk, this._currentFrame);
+        retiredCount += 1;
+        if (hasWorkDoneFence) {
+          if (retiredCount === 1) {
+            firstRetired = chunk;
+          } else if (retiredCount === 2) {
+            retiredList = [firstRetired, chunk];
+          } else {
+            retiredList.push(chunk);
+          }
+        }
       }
+      active.length = 0;
 
-      const isDuplicateEnd = wasNotInFrame && retiredChunks.length === 0;
+      const isDuplicateEnd = wasNotInFrame && retiredCount === 0;
       if (isDuplicateEnd) {
         this._doubleReleaseIgnored += 1;
       } else {
@@ -1911,32 +2376,45 @@
         this._recordActivityTime();
       }
 
-      this._attachWorkDoneFence(retiredChunks);
-
-      const capReclaim = this._enforceLargeSlabCap();
-      let shrinkReclaim = { shrunkSlabs: 0, shrunkBytes: 0 };
-      if (this.idleShrinkFrames > 0) {
-        shrinkReclaim = this.shrinkIdleOversizedSlabs(this.idleShrinkFrames);
+      if (hasWorkDoneFence) {
+        if (retiredList !== null) {
+          this._attachWorkDoneFence(retiredList);
+        } else if (firstRetired !== null) {
+          this._attachWorkDoneFenceSingle(firstRetired);
+        }
       }
-      let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
+
+      const scratch = this._reclaimScratch;
+      this._enforceLargeSlabCapInto(scratch);
+      let reclaimedChunks = scratch.reclaimedChunks;
+      let reclaimedBytes = scratch.reclaimedBytes;
+      let shrunkSlabs = 0;
+      let shrunkBytes = 0;
+      if (this.idleShrinkFrames > 0) {
+        this._shrinkIdleOversizedSlabsInto(this.idleShrinkFrames, scratch);
+        shrunkSlabs = scratch.shrunkSlabs;
+        shrunkBytes = scratch.shrunkBytes;
+        reclaimedChunks += shrunkSlabs;
+        reclaimedBytes += shrunkBytes;
+      }
       if (this.idleEvictFrames > 0) {
-        idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
+        this._reclaimIdleChunksInto(this.idleEvictFrames, scratch);
+        reclaimedChunks += scratch.reclaimedChunks;
+        reclaimedBytes += scratch.reclaimedBytes;
       }
 
       const frameStats = {
         frameIndex: this._currentFrame,
-        chunksRetired: retiredChunks.length,
+        chunksRetired: retiredCount,
         allocations: this._frameAllocations,
         bytesAllocated: this._frameBytesAllocated,
         bytesUploaded: this._frameBytesUploaded,
-        inFlightChunks: this._inFlightChunks.length,
+        inFlightChunks: this._inFlightQueue.size,
         recycledChunks: this._getRecycledCount(),
-        reclaimedChunks:
-          capReclaim.reclaimedChunks + shrinkReclaim.shrunkSlabs + idleReclaim.reclaimedChunks,
-        reclaimedBytes:
-          capReclaim.reclaimedBytes + shrinkReclaim.shrunkBytes + idleReclaim.reclaimedBytes,
-        shrunkSlabs: shrinkReclaim.shrunkSlabs,
-        shrunkBytes: shrinkReclaim.shrunkBytes,
+        reclaimedChunks,
+        reclaimedBytes,
+        shrunkSlabs,
+        shrunkBytes,
       };
 
       this._inFrame = false;
@@ -2515,17 +2993,17 @@
 
       if (sliceView) {
         if (alignedBytesPerRow === unalignedBytesPerRow) {
-          sliceView.set(src.subarray(0, stagedBytes), 0);
+          sliceView.set(src.byteLength === stagedBytes ? src : src.subarray(0, stagedBytes), 0);
         } else {
-          for (let row = 0; row < totalRows; row += 1) {
-            const srcRowStart = row * unalignedBytesPerRow;
-            const dstRowStart = row * alignedBytesPerRow;
-            sliceView.set(
-              src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
-              dstRowStart
-            );
-            sliceView.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
-          }
+          copyTextureRowsPadded(
+            src,
+            sliceView,
+            0,
+            totalRows,
+            unalignedBytesPerRow,
+            alignedBytesPerRow,
+            true
+          );
         }
       } else {
         if (!this.device.queue || typeof this.device.queue.writeBuffer !== 'function') {
@@ -2546,7 +3024,7 @@
                 ? scratch
                 : scratch.subarray(0, stagedBytes)
               : new Uint8Array(stagedBytes);
-            payload.set(src.subarray(0, stagedBytes), 0);
+            payload.set(src.byteLength === stagedBytes ? src : src.subarray(0, stagedBytes), 0);
             this.device.queue.writeBuffer(sliceBuffer, sliceOffset, payload);
           } else {
             const scratch = this._acquireUploadScratch(chunkMax);
@@ -2572,17 +3050,15 @@
                 : scratch.subarray(0, stagedBytes)
               : new Uint8Array(stagedBytes);
             const mustZeroPad = scratch !== null;
-            for (let row = 0; row < totalRows; row += 1) {
-              const srcRowStart = row * unalignedBytesPerRow;
-              const dstRowStart = row * alignedBytesPerRow;
-              payload.set(
-                src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
-                dstRowStart
-              );
-              if (mustZeroPad) {
-                payload.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
-              }
-            }
+            copyTextureRowsPadded(
+              src,
+              payload,
+              0,
+              totalRows,
+              unalignedBytesPerRow,
+              alignedBytesPerRow,
+              mustZeroPad
+            );
             this._writeBufferChunked(sliceBuffer, sliceOffset, payload);
           } else {
             const maxStripBytes = rowsPerChunk * alignedBytesPerRow;
@@ -2596,17 +3072,15 @@
                   ? scratch
                   : scratch.subarray(0, stripBytes)
                 : new Uint8Array(stripBytes);
-              for (let r = 0; r < count; r += 1) {
-                const srcRowStart = (rowStart + r) * unalignedBytesPerRow;
-                const dstRowStart = r * alignedBytesPerRow;
-                dst.set(
-                  src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
-                  dstRowStart
-                );
-                if (mustZeroPad) {
-                  dst.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
-                }
-              }
+              copyTextureRowsPadded(
+                src,
+                dst,
+                rowStart,
+                count,
+                unalignedBytesPerRow,
+                alignedBytesPerRow,
+                mustZeroPad
+              );
               this.device.queue.writeBuffer(
                 sliceBuffer,
                 sliceOffset + rowStart * alignedBytesPerRow,
@@ -2719,18 +3193,20 @@
         activeBytes += this._activeChunks[i].size;
       }
       let inFlightBytes = 0;
-      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
-        inFlightBytes += this._inFlightChunks[i].size;
-      }
-      let recycledBytes = 0;
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        recycledBytes += this._recycledChunks[i].size;
-      }
-      for (const bucket of this._largeSlabBuckets.values()) {
-        for (let i = 0; i < bucket.length; i += 1) {
-          recycledBytes += bucket[i].size;
+      const ifQ = this._inFlightQueue;
+      if (ifQ.size > 0) {
+        const buf = ifQ._buf;
+        const mask = ifQ._mask;
+        let idx = ifQ._head;
+        for (let i = 0; i < ifQ._span; i += 1) {
+          const chunk = buf[idx];
+          idx = (idx + 1) & mask;
+          if (chunk !== undefined) {
+            inFlightBytes += chunk.size;
+          }
         }
       }
+      const recycledBytes = sanitizeNonNegativeCounter(this._recycledBytes);
       const scratchBytes =
         this._uploadScratch && typeof this._uploadScratch.byteLength === 'number'
           ? this._uploadScratch.byteLength
@@ -2765,23 +3241,27 @@
       }
       let inFlightLargeSlabs = 0;
       let inFlightBytes = 0;
-      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
-        inFlightBytes += this._inFlightChunks[i].size;
-        if (this._inFlightChunks[i].isLargeSlab) {
-          inFlightLargeSlabs += 1;
+      const ifQ = this._inFlightQueue;
+      if (ifQ.size > 0) {
+        const buf = ifQ._buf;
+        const mask = ifQ._mask;
+        let idx = ifQ._head;
+        for (let i = 0; i < ifQ._span; i += 1) {
+          const chunk = buf[idx];
+          idx = (idx + 1) & mask;
+          if (chunk !== undefined) {
+            inFlightBytes += chunk.size;
+            if (chunk.isLargeSlab) {
+              inFlightLargeSlabs += 1;
+            }
+          }
         }
       }
-      let recycledBytes = 0;
-      for (let i = 0; i < this._recycledChunks.length; i += 1) {
-        recycledBytes += this._recycledChunks[i].size;
-      }
+      const recycledBytes = sanitizeNonNegativeCounter(this._recycledBytes);
       const largeSlabBucketCounts = {};
       for (const [bucketSize, bucket] of this._largeSlabBuckets.entries()) {
-        if (bucket.length > 0) {
-          largeSlabBucketCounts[bucketSize] = bucket.length;
-          for (let i = 0; i < bucket.length; i += 1) {
-            recycledBytes += bucket[i].size;
-          }
+        if (bucket.size > 0) {
+          largeSlabBucketCounts[bucketSize] = bucket.size;
         }
       }
       const scratchBytes =
@@ -2816,7 +3296,7 @@
         totalChunksAllocated: sanitizeNonNegativeCounter(this._totalChunksAllocated),
         activeChunks: activeCount,
         recycledChunks: recycledCount,
-        inFlightChunks: this._inFlightChunks.length,
+        inFlightChunks: this._inFlightQueue.size,
         activeBuffers: activeCount,
         recycledBuffers: recycledCount,
         activeCount,
@@ -2962,11 +3442,14 @@
       this._chunkByBuffer.clear();
       this._largeSlabBuckets.clear();
       this._idleLargeSlabCount = 0;
+      this._recycledBytes = 0;
       this._largeSlabBytes = 0;
       this._pendingMapPromises.clear();
-      this._activeChunks = [];
-      this._recycledChunks = [];
-      this._inFlightChunks = [];
+      this._activeChunks.length = 0;
+      this._recycledStdQueue.clear();
+      this._recycledOversizedChunks.length = 0;
+      this._inFlightQueue.clear();
+      this._gpuDoneInFlightCount = 0;
       this._currentChunk = null;
       this._uploadScratch = null;
       this._internalSliceScratch.buffer = null;

@@ -201,8 +201,11 @@ const MISSING_TEXTURE_REPORT_LIMIT = 4096;
 const MAX_VIEWS_PER_TEXTURE = 64;
 const MAX_FAST_PASS_BG_SLOTS = 8;
 const MAX_FAST_PASS_DYN_OFFSETS = 8;
+const MAX_FRAME_CMD_POOL = 16384;
 const EMPTY_DYNAMIC_OFFSETS = Object.freeze([]);
 const EMPTY_WARNINGS = Object.freeze([]);
+const EMPTY_TEXTURE_VIEW_DESC = Object.freeze({});
+const DEPTH_STENCIL_ATTACHMENT_OPTS = Object.freeze({ isDepthStencil: true });
 const SWAPCHAIN_VIEW_SENTINEL = Symbol('swapchainView');
 
 let _cachedTextureFormatsModule = null;
@@ -564,7 +567,7 @@ function isIntegerTextureFormat(format) {
 
 // Validates a GPU indirect draw/dispatch command against WebGPU/Dawn spec rules:
 // live buffer, GPUBufferUsage.INDIRECT (0x0100), 4-byte offset alignment, and 16/20/12B bounds.
-function validateIndirectCommand(kind, buffer, offset, bufMeta = null) {
+function validateIndirectCommand(kind, buffer, offset, bufMeta = null, out = null) {
   const requiredBytes =
     kind === 'drawIndexedIndirect'
       ? INDIRECT_DRAW_INDEXED_BYTES
@@ -572,6 +575,14 @@ function validateIndirectCommand(kind, buffer, offset, bufMeta = null) {
         ? INDIRECT_DISPATCH_BYTES
         : INDIRECT_DRAW_BYTES;
   if (!buffer || buffer.destroyed === true) {
+    if (out) {
+      out.valid = false;
+      out.reason = 'missing-or-destroyed';
+      out.requiredBytes = requiredBytes;
+      out.usage = null;
+      out.bufferSize = null;
+      return out;
+    }
     return { valid: false, reason: 'missing-or-destroyed', requiredBytes };
   }
   let usage = null;
@@ -583,6 +594,14 @@ function validateIndirectCommand(kind, buffer, offset, bufMeta = null) {
     usage = buffer.desc.usage;
   }
   if (usage !== null && (usage & GPU_BUFFER_USAGE_INDIRECT) === 0) {
+    if (out) {
+      out.valid = false;
+      out.reason = 'missing-indirect-usage';
+      out.requiredBytes = requiredBytes;
+      out.usage = usage;
+      out.bufferSize = null;
+      return out;
+    }
     return { valid: false, reason: 'missing-indirect-usage', requiredBytes, usage };
   }
   if (
@@ -592,6 +611,14 @@ function validateIndirectCommand(kind, buffer, offset, bufMeta = null) {
     offset < 0 ||
     offset % 4 !== 0
   ) {
+    if (out) {
+      out.valid = false;
+      out.reason = 'unaligned-or-invalid-offset';
+      out.requiredBytes = requiredBytes;
+      out.usage = usage;
+      out.bufferSize = null;
+      return out;
+    }
     return { valid: false, reason: 'unaligned-or-invalid-offset', requiredBytes };
   }
   let bufferSize = null;
@@ -603,7 +630,23 @@ function validateIndirectCommand(kind, buffer, offset, bufMeta = null) {
     bufferSize = buffer.desc.size;
   }
   if (bufferSize !== null && offset + requiredBytes > bufferSize) {
+    if (out) {
+      out.valid = false;
+      out.reason = 'offset-out-of-bounds';
+      out.requiredBytes = requiredBytes;
+      out.usage = usage;
+      out.bufferSize = bufferSize;
+      return out;
+    }
     return { valid: false, reason: 'offset-out-of-bounds', requiredBytes, bufferSize };
+  }
+  if (out) {
+    out.valid = true;
+    out.reason = null;
+    out.requiredBytes = requiredBytes;
+    out.usage = usage;
+    out.bufferSize = bufferSize;
+    return out;
   }
   return { valid: true, requiredBytes };
 }
@@ -1751,11 +1794,19 @@ function normalizeDynamicOffsets(raw) {
 // entries with buffer.hasDynamicOffset. Returns Map(binding -> dynamicOffsetIndex).
 function dynamicOffsetIndicesForLayoutEntries(entries) {
   const indices = new Map();
-  if (!Array.isArray(entries)) return indices;
-  const dynBindings = entries
-    .filter((e) => e && e.buffer && e.buffer.hasDynamicOffset)
-    .map((e) => e.binding)
-    .sort((a, b) => a - b);
+  if (!Array.isArray(entries) || entries.length === 0) return indices;
+  let dynBindings = null;
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i];
+    if (e && e.buffer && e.buffer.hasDynamicOffset) {
+      if (dynBindings === null) dynBindings = [];
+      dynBindings.push(e.binding);
+    }
+  }
+  if (dynBindings === null) return indices;
+  if (dynBindings.length > 1) {
+    dynBindings.sort((a, b) => a - b);
+  }
   for (let i = 0; i < dynBindings.length; i += 1) indices.set(dynBindings[i], i);
   return indices;
 }
@@ -2271,8 +2322,21 @@ function resolveAttachmentUsage(view, explicitUsage) {
 // (width, height) and sampleCount, validates resolveTarget invariants, sanitizes color clearValue,
 // and enforces depth/stencil aspect + readOnly vs loadOp/storeOp/clearValue rules before Dawn sees
 // the pass descriptor. Avoids .map()/.slice()/array allocations on the common clean path.
-function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
+function _appendSanitizeWarning(warnings, key, message) {
+  const list = warnings || [];
+  list.push({ key, message });
+  return list;
+}
+
+function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null, out = null) {
   if (!descriptor || typeof descriptor !== 'object') {
+    if (out) {
+      out.descriptor = descriptor;
+      out.referenceSize = null;
+      out.sanitizedCount = 0;
+      out.warnings = EMPTY_WARNINGS;
+      return out;
+    }
     return { descriptor, referenceSize: null, sanitizedCount: 0, warnings: EMPTY_WARNINGS };
   }
   const colorSizesInput =
@@ -2324,10 +2388,6 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
   let sanitizedCount = 0;
   let warnings = null;
   let outColors = null;
-  const pushWarning = (key, message) => {
-    if (!warnings) warnings = [];
-    warnings.push({ key, message });
-  };
 
   for (let i = 0; i < colorCount; i += 1) {
     const att = rawColors[i];
@@ -2337,7 +2397,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       if (!outColors) outColors = rawColors.slice();
       outColors[i] = null;
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-color-size-mismatch:${i}:${sz.width}x${sz.height}:${referenceSize.width}x${referenceSize.height}`,
         `render pass: dropped colorAttachments[${i}] (${sz.width}x${sz.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`
       );
@@ -2355,7 +2416,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       if (!outColors) outColors = rawColors.slice();
       outColors[i] = null;
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-color-sample-mismatch:${i}:${attSampleCount}:${referenceSampleCount}`,
         `render pass: dropped colorAttachments[${i}] (sampleCount=${attSampleCount}) mismatched with pass sampleCount=${referenceSampleCount}`
       );
@@ -2366,7 +2428,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
     if (att.loadOp !== 'load' && att.loadOp !== 'clear') {
       cleanAtt = { ...att, loadOp: 'load' };
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-color-loadop:${i}`,
         `render pass: normalized invalid colorAttachments[${i}].loadOp to 'load'`
       );
@@ -2376,7 +2439,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       if (!cleanAtt) cleanAtt = { ...att };
       cleanAtt.storeOp = 'store';
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-color-storeop:${i}`,
         `render pass: normalized invalid colorAttachments[${i}].storeOp to 'store'`
       );
@@ -2401,7 +2465,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
         if (!cleanAtt) cleanAtt = { ...att };
         cleanAtt.clearValue = { r, g, b, a };
         sanitizedCount += 1;
-        pushWarning(
+        warnings = _appendSanitizeWarning(
+          warnings,
           `rp-color-clearvalue:${i}`,
           `render pass: sanitized non-finite colorAttachments[${i}].clearValue`
         );
@@ -2444,7 +2509,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
         if (!cleanAtt) cleanAtt = { ...att };
         delete cleanAtt.resolveTarget;
         sanitizedCount += 1;
-        pushWarning(
+        warnings = _appendSanitizeWarning(
+          warnings,
           `rp-resolve-invalid:${i}:${dropResolveReason}`,
           `render pass: dropped colorAttachments[${i}].resolveTarget (${dropResolveReason})`
         );
@@ -2466,7 +2532,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       outDs = null;
       dsChanged = true;
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-depth-size-mismatch:${dsSize.width}x${dsSize.height}:${referenceSize.width}x${referenceSize.height}`,
         `render pass: dropped depthStencilAttachment (${dsSize.width}x${dsSize.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`
       );
@@ -2478,7 +2545,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       outDs = null;
       dsChanged = true;
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-depth-sample-mismatch:${dsSampleCount}:${referenceSampleCount}`,
         `render pass: dropped depthStencilAttachment (sampleCount=${dsSampleCount}) mismatched with pass sampleCount=${referenceSampleCount}`
       );
@@ -2486,7 +2554,8 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       outDs = null;
       dsChanged = true;
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         `rp-depth-non-ds-format:${dsFormat}`,
         `render pass: dropped depthStencilAttachment with non-depth-stencil format ${dsFormat}`
       );
@@ -2494,16 +2563,13 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       outDs = null;
       dsChanged = true;
       sanitizedCount += 1;
-      pushWarning(
+      warnings = _appendSanitizeWarning(
+        warnings,
         'rp-depth-missing-ra-usage',
         'render pass: dropped depthStencilAttachment lacking RENDER_ATTACHMENT usage'
       );
     } else {
       let cleanDs = null;
-      const ensureCleanDs = () => {
-        if (!cleanDs) cleanDs = { ...rawDs };
-        return cleanDs;
-      };
       const hasDepth = dsFormat ? hasDepthAspect(dsFormat) : null;
       const hasStencil = dsFormat ? hasStencilAspect(dsFormat) : null;
 
@@ -2518,14 +2584,15 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           rawDs.depthClearValue !== undefined ||
           rawDs.depthReadOnly !== undefined
         ) {
-          const dst = ensureCleanDs();
-          delete dst.depthLoadOp;
-          delete dst.depthStoreOp;
-          delete dst.depthClearValue;
-          delete dst.depthReadOnly;
+          if (!cleanDs) cleanDs = { ...rawDs };
+          delete cleanDs.depthLoadOp;
+          delete cleanDs.depthStoreOp;
+          delete cleanDs.depthClearValue;
+          delete cleanDs.depthReadOnly;
           dsChanged = true;
           sanitizedCount += 1;
-          pushWarning(
+          warnings = _appendSanitizeWarning(
+            warnings,
             `rp-depth-ops-on-stencil-only:${dsFormat}`,
             `render pass: stripped depth fields on stencil-only attachment (${dsFormat})`
           );
@@ -2536,13 +2603,14 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           rawDs.depthStoreOp !== undefined ||
           rawDs.depthClearValue !== undefined
         ) {
-          const dst = ensureCleanDs();
-          delete dst.depthLoadOp;
-          delete dst.depthStoreOp;
-          delete dst.depthClearValue;
+          if (!cleanDs) cleanDs = { ...rawDs };
+          delete cleanDs.depthLoadOp;
+          delete cleanDs.depthStoreOp;
+          delete cleanDs.depthClearValue;
           dsChanged = true;
           sanitizedCount += 1;
-          pushWarning(
+          warnings = _appendSanitizeWarning(
+            warnings,
             'rp-depth-readonly-ops',
             'render pass: stripped depthLoadOp/depthStoreOp/depthClearValue on depthReadOnly attachment'
           );
@@ -2558,12 +2626,13 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           const normLoad = rawLoad === 'clear' || rawLoad === 'load' ? rawLoad : 'load';
           const normStore = rawStore === 'discard' || rawStore === 'store' ? rawStore : 'store';
           if (rawLoad !== normLoad || rawStore !== normStore) {
-            const dst = ensureCleanDs();
-            dst.depthLoadOp = normLoad;
-            dst.depthStoreOp = normStore;
+            if (!cleanDs) cleanDs = { ...rawDs };
+            cleanDs.depthLoadOp = normLoad;
+            cleanDs.depthStoreOp = normStore;
             dsChanged = true;
             sanitizedCount += 1;
-            pushWarning(
+            warnings = _appendSanitizeWarning(
+              warnings,
               `rp-depth-ops-norm:${String(rawLoad)}:${String(rawStore)}`,
               `render pass: normalized depthLoadOp/depthStoreOp to '${normLoad}'/'${normStore}'`
             );
@@ -2572,18 +2641,19 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
             const rawClear = rawDs.depthClearValue;
             const clampedClear = Math.min(1, Math.max(0, finiteOr(rawClear, 1))) || 0;
             if (!Number.isFinite(rawClear) || clampedClear !== rawClear) {
-              const dst = ensureCleanDs();
-              dst.depthClearValue = clampedClear;
+              if (!cleanDs) cleanDs = { ...rawDs };
+              cleanDs.depthClearValue = clampedClear;
               dsChanged = true;
               sanitizedCount += 1;
-              pushWarning(
+              warnings = _appendSanitizeWarning(
+                warnings,
                 `rp-depth-clear-clamp:${rawClear}`,
                 `render pass: clamped depthClearValue ${rawClear} to ${clampedClear}`
               );
             }
           } else if (rawDs.depthClearValue !== undefined) {
-            const dst = ensureCleanDs();
-            delete dst.depthClearValue;
+            if (!cleanDs) cleanDs = { ...rawDs };
+            delete cleanDs.depthClearValue;
             dsChanged = true;
             sanitizedCount += 1;
           }
@@ -2601,14 +2671,15 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           rawDs.stencilClearValue !== undefined ||
           rawDs.stencilReadOnly !== undefined
         ) {
-          const dst = ensureCleanDs();
-          delete dst.stencilLoadOp;
-          delete dst.stencilStoreOp;
-          delete dst.stencilClearValue;
-          delete dst.stencilReadOnly;
+          if (!cleanDs) cleanDs = { ...rawDs };
+          delete cleanDs.stencilLoadOp;
+          delete cleanDs.stencilStoreOp;
+          delete cleanDs.stencilClearValue;
+          delete cleanDs.stencilReadOnly;
           dsChanged = true;
           sanitizedCount += 1;
-          pushWarning(
+          warnings = _appendSanitizeWarning(
+            warnings,
             `rp-stencil-ops-on-depth-only:${dsFormat}`,
             `render pass: stripped stencil fields on depth-only attachment (${dsFormat})`
           );
@@ -2619,13 +2690,14 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           rawDs.stencilStoreOp !== undefined ||
           rawDs.stencilClearValue !== undefined
         ) {
-          const dst = ensureCleanDs();
-          delete dst.stencilLoadOp;
-          delete dst.stencilStoreOp;
-          delete dst.stencilClearValue;
+          if (!cleanDs) cleanDs = { ...rawDs };
+          delete cleanDs.stencilLoadOp;
+          delete cleanDs.stencilStoreOp;
+          delete cleanDs.stencilClearValue;
           dsChanged = true;
           sanitizedCount += 1;
-          pushWarning(
+          warnings = _appendSanitizeWarning(
+            warnings,
             'rp-stencil-readonly-ops',
             'render pass: stripped stencilLoadOp/stencilStoreOp/stencilClearValue on stencilReadOnly attachment'
           );
@@ -2641,12 +2713,13 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           const normSLoad = rawSLoad === 'clear' || rawSLoad === 'load' ? rawSLoad : 'load';
           const normSStore = rawSStore === 'discard' || rawSStore === 'store' ? rawSStore : 'store';
           if (rawSLoad !== normSLoad || rawSStore !== normSStore) {
-            const dst = ensureCleanDs();
-            dst.stencilLoadOp = normSLoad;
-            dst.stencilStoreOp = normSStore;
+            if (!cleanDs) cleanDs = { ...rawDs };
+            cleanDs.stencilLoadOp = normSLoad;
+            cleanDs.stencilStoreOp = normSStore;
             dsChanged = true;
             sanitizedCount += 1;
-            pushWarning(
+            warnings = _appendSanitizeWarning(
+              warnings,
               `rp-stencil-ops-norm:${String(rawSLoad)}:${String(rawSStore)}`,
               `render pass: normalized stencilLoadOp/stencilStoreOp to '${normSLoad}'/'${normSStore}'`
             );
@@ -2655,14 +2728,14 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
             const rawSClear = rawDs.stencilClearValue;
             const normSClear = finiteOr(rawSClear, 0) >>> 0;
             if (rawSClear !== normSClear) {
-              const dst = ensureCleanDs();
-              dst.stencilClearValue = normSClear;
+              if (!cleanDs) cleanDs = { ...rawDs };
+              cleanDs.stencilClearValue = normSClear;
               dsChanged = true;
               sanitizedCount += 1;
             }
           } else if (rawDs.stencilClearValue !== undefined) {
-            const dst = ensureCleanDs();
-            delete dst.stencilClearValue;
+            if (!cleanDs) cleanDs = { ...rawDs };
+            delete cleanDs.stencilClearValue;
             dsChanged = true;
             sanitizedCount += 1;
           }
@@ -2673,6 +2746,13 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
   }
 
   if (outColors === null && !dsChanged) {
+    if (out) {
+      out.descriptor = descriptor;
+      out.referenceSize = referenceSize;
+      out.sanitizedCount = 0;
+      out.warnings = EMPTY_WARNINGS;
+      return out;
+    }
     return { descriptor, referenceSize, sanitizedCount: 0, warnings: EMPTY_WARNINGS };
   }
   const outDescriptor = { ...descriptor, colorAttachments: outColors || rawColors || [] };
@@ -2681,7 +2761,15 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
   } else {
     delete outDescriptor.depthStencilAttachment;
   }
-  return { descriptor: outDescriptor, referenceSize, sanitizedCount, warnings: warnings || EMPTY_WARNINGS };
+  const finalWarnings = warnings || EMPTY_WARNINGS;
+  if (out) {
+    out.descriptor = outDescriptor;
+    out.referenceSize = referenceSize;
+    out.sanitizedCount = sanitizedCount;
+    out.warnings = finalWarnings;
+    return out;
+  }
+  return { descriptor: outDescriptor, referenceSize, sanitizedCount, warnings: finalWarnings };
 }
 
 // ---- Decoders (pure; also used by the tests; W302 zero-alloc scratch reuse) ----
@@ -2848,6 +2936,13 @@ function createRenderStateScratch() {
       z: 0,
       maxWorkgroupsPerDimension: DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
       reason: null,
+    },
+    indirectCheck: {
+      valid: true,
+      reason: null,
+      requiredBytes: 0,
+      usage: null,
+      bufferSize: null,
     },
     targetSize: { width: 0, height: 0 },
     viewportF32: new Float32Array(6),
@@ -3851,8 +3946,17 @@ class BeginRenderPassCommand {
     h._lastPassReferenceSize = null;
     h._activePass = null;
     h._activePassTargetSize = null;
-    const hasColor =
-      Array.isArray(desc.colorAttachments) && desc.colorAttachments.some((c) => Boolean(c && c.view));
+    let hasColor = false;
+    const colorAtts = desc.colorAttachments;
+    if (Array.isArray(colorAtts)) {
+      for (let i = 0; i < colorAtts.length; i += 1) {
+        const c = colorAtts[i];
+        if (c && c.view) {
+          hasColor = true;
+          break;
+        }
+      }
+    }
     const hasDepthStencil = Boolean(desc.depthStencilAttachment && desc.depthStencilAttachment.view);
     if (!hasColor && !hasDepthStencil) {
       if (ctl.passKind === 'render' && typeof ctl.endPass === 'function') {
@@ -4002,6 +4106,61 @@ class RenderStatePackets {
       bgOverflow: null,
     };
     this._scratchSwapchainFormatDesc = { format: '' };
+    this._scratchAttViewDesc = {};
+    this._scratchBoundComputeGroupBglIds = new Int32Array(8);
+    this._scratchFilteredCmds = [];
+    this._scratchTexMeta = {
+      texture: null,
+      meta: null,
+      width: null,
+      height: null,
+      depthOrArrayLayers: 1,
+      mipLevelCount: null,
+      sampleCount: null,
+      format: null,
+      usage: null,
+      dimension: null,
+    };
+    this._scratchTexMetaSize = {
+      texture: null,
+      meta: null,
+      width: null,
+      height: null,
+      depthOrArrayLayers: 1,
+      mipLevelCount: null,
+      sampleCount: null,
+      format: null,
+      usage: null,
+      dimension: null,
+    };
+    this._scratchSanitizeRpResult = {
+      descriptor: null,
+      referenceSize: null,
+      sanitizedCount: 0,
+      warnings: EMPTY_WARNINGS,
+    };
+    this._scratchSeenBindings = new Set();
+    this._scratchRemapUsedIndices = new Set();
+    this._scratchPresentXParams = {
+      planeTextureId: 0,
+      viewDesc: null,
+      viewFormat: null,
+      sampler: null,
+      samplerId: 0,
+      samplerKind: 'filtering',
+      pipeline: null,
+      pipelineId: 0,
+      textureBinding: 0,
+      samplerBinding: 1,
+    };
+    this._scratchPresentXResult = {
+      view: null,
+      bindGroup: null,
+      hit: false,
+      cacheKey: '',
+    };
+    this._lastRemappedBgKey = null;
+    this._lastPresentXCacheKey = null;
     this._scratchLastRenderGroup0 = { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: EMPTY_DYNAMIC_OFFSETS };
     this._scratchLastComputeGroup0 = { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: EMPTY_DYNAMIC_OFFSETS };
     this._scratchRemapResult = { status: 'empty', bindGroup: null };
@@ -4080,8 +4239,15 @@ class RenderStatePackets {
       unknownBindGroupErrors: 0,
       skippedUnboundPassOps: 0,
       skippedInvalidIndirectOps: 0,
-      warnings: [],
     };
+    this._warningRing = new Array(MAX_TELEMETRY_WARNINGS);
+    this._warningHead = 0;
+    this._warningCount = 0;
+    Object.defineProperty(this.telemetry, 'warnings', {
+      enumerable: true,
+      configurable: true,
+      get: () => this._snapshotWarnings(),
+    });
     this._seenWarningKeys = new Set();
     this.lastError = null;
     this._packetError = null;
@@ -4329,16 +4495,38 @@ class RenderStatePackets {
       unknownBindGroupErrors: this.telemetry.unknownBindGroupErrors,
       skippedUnboundPassOps: this.telemetry.skippedUnboundPassOps,
       skippedInvalidIndirectOps: this.telemetry.skippedInvalidIndirectOps,
-      warnings: this.telemetry.warnings.slice(),
+      warnings: this._snapshotWarnings(),
     };
+  }
+
+  _snapshotWarnings() {
+    const count = this._warningCount;
+    if (count === 0) return [];
+    const out = new Array(count);
+    const ring = this._warningRing;
+    const cap = MAX_TELEMETRY_WARNINGS;
+    let idx = this._warningHead;
+    for (let i = 0; i < count; i += 1) {
+      out[i] = ring[idx];
+      idx += 1;
+      if (idx === cap) idx = 0;
+    }
+    return out;
   }
 
   _recordTelemetryWarning(message) {
     if (typeof message !== 'string' || message.length === 0) return;
-    if (this.telemetry.warnings.length >= MAX_TELEMETRY_WARNINGS) {
-      this.telemetry.warnings.shift();
+    const cap = MAX_TELEMETRY_WARNINGS;
+    if (this._warningCount < cap) {
+      let writeIdx = this._warningHead + this._warningCount;
+      if (writeIdx >= cap) writeIdx -= cap;
+      this._warningRing[writeIdx] = message;
+      this._warningCount += 1;
+    } else {
+      this._warningRing[this._warningHead] = message;
+      this._warningHead += 1;
+      if (this._warningHead === cap) this._warningHead = 0;
     }
-    this.telemetry.warnings.push(message);
   }
 
   _recordTelemetryWarningOnce(key, message) {
@@ -4620,16 +4808,28 @@ class RenderStatePackets {
     this._noopGroup0CmdPoolUsed = 0;
     this._brpCmdPoolUsed = 0;
     this._dynOffsetsPoolUsed = 0;
-    const MAX_POOL = 2048;
-    if (this._vpCmdPool.length > MAX_POOL) this._vpCmdPool.length = MAX_POOL;
-    if (this._scCmdPool.length > MAX_POOL) this._scCmdPool.length = MAX_POOL;
-    if (this._bcCmdPool.length > MAX_POOL) this._bcCmdPool.length = MAX_POOL;
-    if (this._srCmdPool.length > MAX_POOL) this._srCmdPool.length = MAX_POOL;
-    if (this._sbg2CmdPool.length > MAX_POOL) this._sbg2CmdPool.length = MAX_POOL;
-    if (this._remappedSbgCmdPool.length > MAX_POOL) this._remappedSbgCmdPool.length = MAX_POOL;
-    if (this._noopGroup0CmdPool.length > MAX_POOL) this._noopGroup0CmdPool.length = MAX_POOL;
-    if (this._brpCmdPool.length > MAX_POOL) this._brpCmdPool.length = MAX_POOL;
-    if (this._dynOffsetsPool.length > MAX_POOL) this._dynOffsetsPool.length = MAX_POOL;
+    this._scratchFilteredCmds.length = 0;
+    this._scratchTexMeta.texture = null;
+    this._scratchTexMeta.meta = null;
+    this._scratchTexMetaSize.texture = null;
+    this._scratchTexMetaSize.meta = null;
+    this._scratchSanitizeRpResult.descriptor = null;
+    this._scratchSanitizeRpResult.referenceSize = null;
+    this._scratchSanitizeRpResult.warnings = EMPTY_WARNINGS;
+    this._scratchPresentXParams.viewDesc = null;
+    this._scratchPresentXParams.sampler = null;
+    this._scratchPresentXParams.pipeline = null;
+    this._scratchPresentXResult.view = null;
+    this._scratchPresentXResult.bindGroup = null;
+    if (this._vpCmdPool.length > MAX_FRAME_CMD_POOL) this._vpCmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._scCmdPool.length > MAX_FRAME_CMD_POOL) this._scCmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._bcCmdPool.length > MAX_FRAME_CMD_POOL) this._bcCmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._srCmdPool.length > MAX_FRAME_CMD_POOL) this._srCmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._sbg2CmdPool.length > MAX_FRAME_CMD_POOL) this._sbg2CmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._remappedSbgCmdPool.length > MAX_FRAME_CMD_POOL) this._remappedSbgCmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._noopGroup0CmdPool.length > MAX_FRAME_CMD_POOL) this._noopGroup0CmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._brpCmdPool.length > MAX_FRAME_CMD_POOL) this._brpCmdPool.length = MAX_FRAME_CMD_POOL;
+    if (this._dynOffsetsPool.length > MAX_FRAME_CMD_POOL) this._dynOffsetsPool.length = MAX_FRAME_CMD_POOL;
   }
 
   _parseRemappedBgKeyPipeline(key) {
@@ -4698,6 +4898,7 @@ class RenderStatePackets {
     if (!keys) return;
     this._remappedBgByPipelineKey.delete(pipelineKey);
     for (const key of keys) {
+      if (this._lastRemappedBgKey === key) this._lastRemappedBgKey = null;
       this.remappedBindGroups.delete(key);
       this._removeRemappedBgFromBindGroupIndex(key);
     }
@@ -4709,6 +4910,7 @@ class RenderStatePackets {
     if (!keys) return;
     this._remappedBgByBindGroupId.delete(bindGroupId);
     for (const key of keys) {
+      if (this._lastRemappedBgKey === key) this._lastRemappedBgKey = null;
       this.remappedBindGroups.delete(key);
       this._removeRemappedBgFromPipelineIndex(key);
     }
@@ -4719,14 +4921,19 @@ class RenderStatePackets {
   _cacheRemappedBindGroup(cacheKey, bindGroup, pipelineKey, bindGroupId) {
     const existed = this.remappedBindGroups.has(cacheKey);
     if (existed) {
+      if (this._lastRemappedBgKey === cacheKey && this.remappedBindGroups.get(cacheKey) === bindGroup) {
+        return;
+      }
       this.remappedBindGroups.delete(cacheKey);
     }
     this.remappedBindGroups.set(cacheKey, bindGroup);
+    this._lastRemappedBgKey = cacheKey;
     if (!existed) {
       this._addRemappedBgIndexes(cacheKey, pipelineKey, bindGroupId);
     }
     while (this.remappedBindGroups.size > this.remappedBindGroupCacheLimit) {
       const oldest = this.remappedBindGroups.keys().next().value;
+      if (this._lastRemappedBgKey === oldest) this._lastRemappedBgKey = null;
       this.remappedBindGroups.delete(oldest);
       this._removeRemappedBgFromBindGroupIndex(oldest);
       this._removeRemappedBgFromPipelineIndex(oldest);
@@ -4750,6 +4957,7 @@ class RenderStatePackets {
       this.dummies.clear();
       this.layoutsByContent.clear();
       this.remappedBindGroups.clear();
+      this._lastRemappedBgKey = null;
       this._remappedBgByBindGroupId.clear();
       this._remappedBgByPipelineKey.clear();
       this._releaseFramePools();
@@ -4830,11 +5038,16 @@ class RenderStatePackets {
 
   _cachePresentXBindGroup(cacheKey, entry) {
     if (this.presentxBindGroupCache.has(cacheKey)) {
+      if (this._lastPresentXCacheKey === cacheKey && this.presentxBindGroupCache.get(cacheKey) === entry) {
+        return;
+      }
       this.presentxBindGroupCache.delete(cacheKey);
     }
     this.presentxBindGroupCache.set(cacheKey, entry);
+    this._lastPresentXCacheKey = cacheKey;
     while (this.presentxBindGroupCache.size > this.presentxBindGroupCacheLimit) {
       const oldest = this.presentxBindGroupCache.keys().next().value;
+      if (this._lastPresentXCacheKey === oldest) this._lastPresentXCacheKey = null;
       this.presentxBindGroupCache.delete(oldest);
     }
   }
@@ -4849,6 +5062,7 @@ class RenderStatePackets {
         entry.layoutId === resourceId ||
         entry.pipelineId === resourceId
       ) {
+        if (this._lastPresentXCacheKey === key) this._lastPresentXCacheKey = null;
         this.presentxBindGroupCache.delete(key);
         removed += 1;
       }
@@ -4860,6 +5074,7 @@ class RenderStatePackets {
     if (!filter || typeof filter !== 'object') {
       const count = this.presentxBindGroupCache.size;
       this.presentxBindGroupCache.clear();
+      this._lastPresentXCacheKey = null;
       return count;
     }
     let removed = 0;
@@ -4873,6 +5088,7 @@ class RenderStatePackets {
         (filter.pipelineId !== undefined && entry.pipelineId === filter.pipelineId) ||
         (filter.pipeline !== undefined && entry.pipeline === filter.pipeline)
       ) {
+        if (this._lastPresentXCacheKey === key) this._lastPresentXCacheKey = null;
         this.presentxBindGroupCache.delete(key);
         removed += 1;
       }
@@ -4883,7 +5099,7 @@ class RenderStatePackets {
   // W186/W354: hot-path PresentX multi-plane bind-group + texture-view cache.
   // Caches per-(planeTextureId, viewFormat, sampler, pipeline/layout) across frames and invalidates
   // automatically on texture handle/generation/destroyed change, device change, reset, or destroy.
-  getOrCreatePresentXPlaneBindGroup(params) {
+  getOrCreatePresentXPlaneBindGroup(params, out = null) {
     if (this._destroyed || !params || typeof params !== 'object') return null;
     this._syncDeviceGeneration();
     if (!this.device || typeof this.device.createBindGroup !== 'function') return null;
@@ -4986,10 +5202,17 @@ class RenderStatePackets {
       if (usedFallbackSampler) {
         this.telemetry.fallbackSamplersBound += 1;
       }
+      if (out) {
+        out.view = cached.view;
+        out.bindGroup = cached.bindGroup;
+        out.hit = true;
+        out.cacheKey = cacheKey;
+        return out;
+      }
       return { view: cached.view, bindGroup: cached.bindGroup, hit: true, cacheKey };
     }
 
-    const view = this._textureView(planeTextureId, baseViewDesc || {});
+    const view = this._textureView(planeTextureId, baseViewDesc || EMPTY_TEXTURE_VIEW_DESC);
     if (!view) return null;
 
     let bindGroup;
@@ -5030,6 +5253,13 @@ class RenderStatePackets {
       deviceGeneration: this._cachedDeviceGeneration,
     };
     this._cachePresentXBindGroup(cacheKey, entry);
+    if (out) {
+      out.view = view;
+      out.bindGroup = bindGroup;
+      out.hit = false;
+      out.cacheKey = cacheKey;
+      return out;
+    }
     return { view, bindGroup, hit: false, cacheKey };
   }
 
@@ -5040,6 +5270,7 @@ class RenderStatePackets {
     this._pipelineBglCache = new WeakMap();
     this._textureViewOwners.clear();
     this.remappedBindGroups.clear();
+    this._lastRemappedBgKey = null;
     this._remappedBgByBindGroupId.clear();
     this._remappedBgByPipelineKey.clear();
     this._releaseFramePools();
@@ -5402,7 +5633,11 @@ class RenderStatePackets {
       return null;
     }
     const expectedAttrs = Math.min(view.getUint32(keyBase + 176, true), 16);
-    const attachedAttrs = key.buffers.reduce((n, b) => n + (b ? b.attributes.length : 0), 0);
+    let attachedAttrs = 0;
+    for (let i = 0; i < key.buffers.length; i += 1) {
+      const b = key.buffers[i];
+      if (b) attachedAttrs += b.attributes.length;
+    }
     if (attachedAttrs !== expectedAttrs) {
       this._packetError = `render pipeline vertex layout dropped attributes (${attachedAttrs}/${expectedAttrs})`;
       return null;
@@ -5429,8 +5664,13 @@ class RenderStatePackets {
       resolvedFsEntryPoint = this._resolveEntryPoint(fs, 'fragment');
       if (Array.isArray(targets) && targets.length > 0) {
         const targetCount = targets.length;
-        targets = targets.map((t, idx) => {
-          if (!t) return null;
+        const sanitizedTargets = new Array(targetCount);
+        for (let idx = 0; idx < targetCount; idx += 1) {
+          const t = targets[idx];
+          if (!t) {
+            sanitizedTargets[idx] = null;
+            continue;
+          }
           const checked = sanitizeColorTargetBlendState(t, this.device, targetCount);
           if (checked.stripped) {
             this.telemetry.strippedNonBlendableBlends += 1;
@@ -5439,14 +5679,20 @@ class RenderStatePackets {
               `render pipeline ${pipeId} target ${idx}: stripped blend state on ${t.format} (${checked.reason})`
             );
           }
-          return checked.target;
-        });
+          sanitizedTargets[idx] = checked.target;
+        }
+        targets = sanitizedTargets;
       }
     } else if (key.colorTargetCount > 0) {
       // No pixel shader but color targets: an empty fragment stage that writes nothing.
       if (!this.emptyFragment) this.emptyFragment = this.device.createShaderModule({ code: EMPTY_FRAGMENT_WGSL });
       fragmentModule = this.emptyFragment;
-      targets = targets.map((t) => (t ? { format: t.format, writeMask: 0 } : null));
+      const noWriteTargets = new Array(targets.length);
+      for (let i = 0; i < targets.length; i += 1) {
+        const t = targets[i];
+        noWriteTargets[i] = t ? { format: t.format, writeMask: 0 } : null;
+      }
+      targets = noWriteTargets;
     }
 
     // Dawn-strict primitive sanitization: gate unclippedDepth on depth-clip-control.
@@ -6144,25 +6390,31 @@ class RenderStatePackets {
           }
         }
         if (texRes) {
-          const cachedPx = this.getOrCreatePresentXPlaneBindGroup({
-            planeTextureId: texRes.planeTextureId,
-            viewDesc: texRes.viewDesc || null,
-            viewFormat: texRes.textureFormat || null,
-            sampler: smpRes ? smpRes.resource : null,
-            samplerId: smpRes && Number.isInteger(smpRes.samplerId) ? smpRes.samplerId : 0,
-            samplerKind: smpBinding.comparison ? 'comparison' : 'filtering',
-            pipeline,
-            pipelineId,
-            textureBinding: texBinding.binding,
-            samplerBinding: smpBinding.binding,
-          });
+          const pxParams = this._scratchPresentXParams;
+          pxParams.planeTextureId = texRes.planeTextureId;
+          pxParams.viewDesc = texRes.viewDesc || null;
+          pxParams.viewFormat = texRes.textureFormat || null;
+          pxParams.sampler = smpRes ? smpRes.resource : null;
+          pxParams.samplerId = smpRes && Number.isInteger(smpRes.samplerId) ? smpRes.samplerId : 0;
+          pxParams.samplerKind = smpBinding.comparison ? 'comparison' : 'filtering';
+          pxParams.pipeline = pipeline;
+          pxParams.pipelineId = pipelineId;
+          pxParams.textureBinding = texBinding.binding;
+          pxParams.samplerBinding = smpBinding.binding;
+          const cachedPx = this.getOrCreatePresentXPlaneBindGroup(pxParams, this._scratchPresentXResult);
+          pxParams.viewDesc = null;
+          pxParams.sampler = null;
+          pxParams.pipeline = null;
           if (cachedPx && cachedPx.bindGroup) {
+            const pxBg = cachedPx.bindGroup;
+            cachedPx.view = null;
+            cachedPx.bindGroup = null;
             if (out) {
               out.status = 'ok';
-              out.bindGroup = cachedPx.bindGroup;
+              out.bindGroup = pxBg;
               return out;
             }
-            return { status: 'ok', bindGroup: cachedPx.bindGroup };
+            return { status: 'ok', bindGroup: pxBg };
           }
         }
       }
@@ -6247,233 +6499,41 @@ class RenderStatePackets {
     }
 
     const dynOffsets = hasAnyNonZeroDyn ? normalizeDynamicOffsets(dynamicOffsets) : EMPTY_DYNAMIC_OFFSETS;
-    const usedIndices = new Set();
+    const usedIndices = this._scratchRemapUsedIndices;
+    usedIndices.clear();
 
-    // Folds r's dynamic offset into a static { buffer, offset, size } binding, clamped so that
-    // offset + size never exceeds the GPUBuffer size; an out-of-bounds offset binds a dummy.
-    const bufferResourceWithDynamicOffset = (r, b) => {
-      const base = r.resource;
-      if (!base || !base.buffer || base.buffer.destroyed === true) {
-        return this._dummyResource(synthLayoutEntryForWgslBinding(b));
-      }
-      const dIdx = r && r.hasDynamicOffset ? r.dynamicOffsetIndex : -1;
-      const dyn =
-        Number.isInteger(dIdx) && dIdx >= 0 && dIdx < dynOffsets.length ? dynOffsets[dIdx] : 0;
-      const isUniform = b.kind === 'uniform';
-      const maxBindingSize = isUniform
-        ? getDeviceLimit(this.device, 'maxUniformBufferBindingSize', DEFAULT_MAX_UNIFORM_BUFFER_BINDING_SIZE)
-        : getDeviceLimit(this.device, 'maxStorageBufferBindingSize', DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE);
-      const effectiveOffset = (Number(base.offset) || 0) + (dyn > 0 ? dyn : 0);
-      const explicitAlignKey = isUniform ? 'minUniformBufferOffsetAlignment' : 'minStorageBufferOffsetAlignment';
-      const explicitAlign =
-        this.device &&
-        this.device.limits &&
-        typeof this.device.limits[explicitAlignKey] === 'number' &&
-        this.device.limits[explicitAlignKey] > 1
-          ? Math.floor(this.device.limits[explicitAlignKey])
-          : 0;
-      if (effectiveOffset > 0 && explicitAlign > 1 && effectiveOffset % explicitAlign !== 0) {
-        this.telemetry.dynamicOffsetClamps += 1;
-        this._recordTelemetryWarningOnce(
-          `remap-dyn-offset-unaligned:${effectiveBgId}:${r.binding}:${explicitAlign}`,
-          `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} offset ${effectiveOffset} not aligned to ${explicitAlign}B; using dummy buffer`
-        );
-        return this._dummyResource(synthLayoutEntryForWgslBinding(b));
-      }
-      const bufferSize =
-        typeof r.bufferSize === 'number' && Number.isFinite(r.bufferSize) && r.bufferSize > 0
-          ? r.bufferSize
-          : base.buffer && typeof base.buffer.size === 'number' && base.buffer.size > 0
-            ? base.buffer.size
-            : null;
-      let size = typeof base.size === 'number' && base.size > 0 ? base.size : null;
-      if (dyn <= 0) {
-        const boundSize = size !== null ? size : bufferSize !== null ? bufferSize - effectiveOffset : null;
-        const needsClamp = boundSize !== null && boundSize > maxBindingSize;
-        const needsStorageAlign = !isUniform && boundSize !== null && (boundSize < 4 || boundSize % 4 !== 0);
-        if (!needsClamp && !needsStorageAlign) return base;
-      }
-      if (bufferSize !== null) {
-        if (effectiveOffset >= bufferSize) {
-          this.telemetry.dynamicOffsetClamps += 1;
-          this._recordTelemetryWarningOnce(
-            `remap-dyn-offset-oob:${effectiveBgId}:${r.binding}`,
-            `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} dynamic offset ${dyn} exceeds buffer size ${bufferSize}; using dummy buffer`
-          );
-          return this._dummyResource(synthLayoutEntryForWgslBinding(b));
-        }
-        const remaining = bufferSize - effectiveOffset;
-        if (size !== null && size > remaining) {
-          size = remaining;
-          this.telemetry.dynamicOffsetClamps += 1;
-          this._recordTelemetryWarningOnce(
-            `remap-dyn-offset-clamp:${effectiveBgId}:${r.binding}`,
-            `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} size clamped to ${remaining} at dynamic offset ${dyn}`
-          );
-        }
-        const effBound = size !== null ? size : remaining;
-        if (effBound > maxBindingSize) {
-          size = isUniform ? maxBindingSize : Math.floor(maxBindingSize / 4) * 4;
-        }
-        if (!isUniform) {
-          const storageBound = size !== null ? size : remaining;
-          if (storageBound < 4) {
-            return this._dummyResource(synthLayoutEntryForWgslBinding(b));
-          }
-          if (storageBound % 4 !== 0) {
-            size = Math.floor(storageBound / 4) * 4;
-          }
-        }
-      } else if (size !== null && size > maxBindingSize) {
-        size = isUniform ? maxBindingSize : Math.floor(maxBindingSize / 4) * 4;
-      }
-      if (dyn > 0) this.telemetry.dynamicOffsetRemaps += 1;
-      const folded = { buffer: base.buffer, offset: effectiveOffset };
-      if (size !== null) folded.size = size;
-      return folded;
-    };
-
-    const pickResourceForBinding = (b) => {
-      for (let pass = 0; pass < 2; pass += 1) {
-        for (let i = 0; i < available.length; i += 1) {
-          if (usedIndices.has(i)) continue;
-          const r = available[i];
-          if (!r || !r.resource || r.isDummy || r.resource.destroyed === true) continue;
-          if (b.kind === 'uniform') {
-            if (!isBufferBindingResource(r.resource) || r.resource.buffer.destroyed === true) continue;
-            const isBuf =
-              r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
-            if (!isBuf) continue;
-            if (pass === 0 && r.kind !== 'uniform') continue;
-            if (r.bufferUsage !== null && r.bufferUsage !== undefined) {
-              if ((r.bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0) continue;
-            } else if (r.kind !== 'uniform') {
-              continue;
-            }
-            usedIndices.add(i);
-            return bufferResourceWithDynamicOffset(r, b);
-          }
-          if (b.kind === 'read-only-storage' || b.kind === 'storage') {
-            if (!isBufferBindingResource(r.resource) || r.resource.buffer.destroyed === true) continue;
-            const isBuf =
-              r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
-            if (!isBuf) continue;
-            if (
-              pass === 0 &&
-              !(r.kind === b.kind || (b.kind === 'read-only-storage' && r.kind === 'storage'))
-            ) {
-              continue;
-            }
-            if (r.bufferUsage !== null && r.bufferUsage !== undefined) {
-              if ((r.bufferUsage & GPU_BUFFER_USAGE_STORAGE) === 0) continue;
-            } else if (
-              !(r.kind === 'storage' || (b.kind === 'read-only-storage' && r.kind === 'read-only-storage'))
-            ) {
-              continue;
-            }
-            usedIndices.add(i);
-            return bufferResourceWithDynamicOffset(r, b);
-          }
-          if (pass > 0) continue;
-          if (b.kind === 'texture') {
-            if (r.kind !== 'texture') continue;
-            if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
-            if (
-              r.textureUsage !== null &&
-              r.textureUsage !== undefined &&
-              (r.textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
-            ) {
-              continue;
-            }
-            const expectedDim = b.viewDimension || '2d';
-            if (r.viewDimension && r.viewDimension !== expectedDim) continue;
-            if (
-              r.multisampled !== undefined &&
-              r.multisampled !== null &&
-              Boolean(r.multisampled) !== Boolean(b.multisampled)
-            ) {
-              continue;
-            }
-            if (r.textureFormat) {
-              const expectedSampleType = b.sampleType || 'float';
-              if (!isTextureSampleTypeCompatible(r.textureFormat, expectedSampleType, this.device)) {
-                continue;
-              }
-            }
-            usedIndices.add(i);
-            return r.resource;
-          }
-          if (b.kind === 'storage-texture') {
-            if (r.kind !== 'storage-texture') continue;
-            if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
-            if (r.multisampled === true) continue;
-            if (
-              r.textureUsage !== null &&
-              r.textureUsage !== undefined &&
-              (r.textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) === 0
-            ) {
-              continue;
-            }
-            const expectedDim = b.viewDimension || '2d';
-            if (r.viewDimension && r.viewDimension !== expectedDim) continue;
-            if (r.textureFormat && b.storageFormat && r.textureFormat !== b.storageFormat) {
-              continue;
-            }
-            usedIndices.add(i);
-            return r.resource;
-          }
-          if (b.kind === 'sampler') {
-            if (r.kind !== 'sampler') continue;
-            if (!isNonBufferBindingResource(r.resource) || isTextureViewResource(r.resource)) {
-              continue;
-            }
-            if (
-              r.comparison !== undefined &&
-              r.comparison !== null &&
-              Boolean(r.comparison) !== Boolean(b.comparison)
-            ) {
-              continue;
-            }
-            usedIndices.add(i);
-            return r.resource;
-          }
-        }
-      }
-      if (b.kind === 'sampler') {
-        const samplerKind = b.comparison ? 'comparison' : 'filtering';
-        const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
-        if (fallbackSampler) {
-          this.telemetry.fallbackSamplersBound += 1;
-          return fallbackSampler;
-        }
-      }
-      return this._dummyResource(synthLayoutEntryForWgslBinding(b));
-    };
-
-    const entries = wgslBindings.map((b) => ({
-      binding: b.binding,
-      resource: pickResourceForBinding(b),
-    }));
+    const entries = new Array(wgslBindings.length);
+    for (let i = 0; i < wgslBindings.length; i += 1) {
+      const b = wgslBindings[i];
+      entries[i] = {
+        binding: b.binding,
+        resource: this._remapPickResourceForBinding(b, available, usedIndices, dynOffsets, effectiveBgId),
+      };
+    }
+    usedIndices.clear();
 
     let remapped = null;
     try {
       remapped = this.device.createBindGroup({ layout: autoBgl, entries });
     } catch (_) {
       try {
-        const fallbackEntries = wgslBindings.map((b) => {
+        const fallbackEntries = new Array(wgslBindings.length);
+        for (let i = 0; i < wgslBindings.length; i += 1) {
+          const b = wgslBindings[i];
           if (b.kind === 'sampler') {
             const samplerKind = b.comparison ? 'comparison' : 'filtering';
             const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
             if (fallbackSampler) {
               this.telemetry.fallbackSamplersBound += 1;
-              return { binding: b.binding, resource: fallbackSampler };
+              fallbackEntries[i] = { binding: b.binding, resource: fallbackSampler };
+              continue;
             }
           }
-          return {
+          fallbackEntries[i] = {
             binding: b.binding,
             resource: this._dummyResource(synthLayoutEntryForWgslBinding(b)),
           };
-        });
+        }
         remapped = this.device.createBindGroup({ layout: autoBgl, entries: fallbackEntries });
       } catch (_err2) {
         remapped = null;
@@ -6489,6 +6549,207 @@ class RenderStatePackets {
       return out;
     }
     return remapped ? { status: 'ok', bindGroup: remapped } : { status: 'empty', bindGroup: null };
+  }
+
+  // Folds r's dynamic offset into a static { buffer, offset, size } binding, clamped so that
+  // offset + size never exceeds the GPUBuffer size; an out-of-bounds offset binds a dummy.
+  _remapBufferResourceWithDynamicOffset(r, b, dynOffsets, effectiveBgId) {
+    const base = r.resource;
+    if (!base || !base.buffer || base.buffer.destroyed === true) {
+      return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+    }
+    const dIdx = r && r.hasDynamicOffset ? r.dynamicOffsetIndex : -1;
+    const dyn =
+      Number.isInteger(dIdx) && dIdx >= 0 && dIdx < dynOffsets.length ? dynOffsets[dIdx] : 0;
+    const isUniform = b.kind === 'uniform';
+    const maxBindingSize = isUniform
+      ? getDeviceLimit(this.device, 'maxUniformBufferBindingSize', DEFAULT_MAX_UNIFORM_BUFFER_BINDING_SIZE)
+      : getDeviceLimit(this.device, 'maxStorageBufferBindingSize', DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE);
+    const effectiveOffset = (Number(base.offset) || 0) + (dyn > 0 ? dyn : 0);
+    const explicitAlignKey = isUniform ? 'minUniformBufferOffsetAlignment' : 'minStorageBufferOffsetAlignment';
+    const explicitAlign =
+      this.device &&
+      this.device.limits &&
+      typeof this.device.limits[explicitAlignKey] === 'number' &&
+      this.device.limits[explicitAlignKey] > 1
+        ? Math.floor(this.device.limits[explicitAlignKey])
+        : 0;
+    if (effectiveOffset > 0 && explicitAlign > 1 && effectiveOffset % explicitAlign !== 0) {
+      this.telemetry.dynamicOffsetClamps += 1;
+      this._recordTelemetryWarningOnce(
+        `remap-dyn-offset-unaligned:${effectiveBgId}:${r.binding}:${explicitAlign}`,
+        `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} offset ${effectiveOffset} not aligned to ${explicitAlign}B; using dummy buffer`
+      );
+      return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+    }
+    const bufferSize =
+      typeof r.bufferSize === 'number' && Number.isFinite(r.bufferSize) && r.bufferSize > 0
+        ? r.bufferSize
+        : base.buffer && typeof base.buffer.size === 'number' && base.buffer.size > 0
+          ? base.buffer.size
+          : null;
+    let size = typeof base.size === 'number' && base.size > 0 ? base.size : null;
+    if (dyn <= 0) {
+      const boundSize = size !== null ? size : bufferSize !== null ? bufferSize - effectiveOffset : null;
+      const needsClamp = boundSize !== null && boundSize > maxBindingSize;
+      const needsStorageAlign = !isUniform && boundSize !== null && (boundSize < 4 || boundSize % 4 !== 0);
+      if (!needsClamp && !needsStorageAlign) return base;
+    }
+    if (bufferSize !== null) {
+      if (effectiveOffset >= bufferSize) {
+        this.telemetry.dynamicOffsetClamps += 1;
+        this._recordTelemetryWarningOnce(
+          `remap-dyn-offset-oob:${effectiveBgId}:${r.binding}`,
+          `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} dynamic offset ${dyn} exceeds buffer size ${bufferSize}; using dummy buffer`
+        );
+        return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+      }
+      const remaining = bufferSize - effectiveOffset;
+      if (size !== null && size > remaining) {
+        size = remaining;
+        this.telemetry.dynamicOffsetClamps += 1;
+        this._recordTelemetryWarningOnce(
+          `remap-dyn-offset-clamp:${effectiveBgId}:${r.binding}`,
+          `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} size clamped to ${remaining} at dynamic offset ${dyn}`
+        );
+      }
+      const effBound = size !== null ? size : remaining;
+      if (effBound > maxBindingSize) {
+        size = isUniform ? maxBindingSize : Math.floor(maxBindingSize / 4) * 4;
+      }
+      if (!isUniform) {
+        const storageBound = size !== null ? size : remaining;
+        if (storageBound < 4) {
+          return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+        }
+        if (storageBound % 4 !== 0) {
+          size = Math.floor(storageBound / 4) * 4;
+        }
+      }
+    } else if (size !== null && size > maxBindingSize) {
+      size = isUniform ? maxBindingSize : Math.floor(maxBindingSize / 4) * 4;
+    }
+    if (dyn > 0) this.telemetry.dynamicOffsetRemaps += 1;
+    const folded = { buffer: base.buffer, offset: effectiveOffset };
+    if (size !== null) folded.size = size;
+    return folded;
+  }
+
+  _remapPickResourceForBinding(b, available, usedIndices, dynOffsets, effectiveBgId) {
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (let i = 0; i < available.length; i += 1) {
+        if (usedIndices.has(i)) continue;
+        const r = available[i];
+        if (!r || !r.resource || r.isDummy || r.resource.destroyed === true) continue;
+        if (b.kind === 'uniform') {
+          if (!isBufferBindingResource(r.resource) || r.resource.buffer.destroyed === true) continue;
+          const isBuf =
+            r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
+          if (!isBuf) continue;
+          if (pass === 0 && r.kind !== 'uniform') continue;
+          if (r.bufferUsage !== null && r.bufferUsage !== undefined) {
+            if ((r.bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0) continue;
+          } else if (r.kind !== 'uniform') {
+            continue;
+          }
+          usedIndices.add(i);
+          return this._remapBufferResourceWithDynamicOffset(r, b, dynOffsets, effectiveBgId);
+        }
+        if (b.kind === 'read-only-storage' || b.kind === 'storage') {
+          if (!isBufferBindingResource(r.resource) || r.resource.buffer.destroyed === true) continue;
+          const isBuf =
+            r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
+          if (!isBuf) continue;
+          if (
+            pass === 0 &&
+            !(r.kind === b.kind || (b.kind === 'read-only-storage' && r.kind === 'storage'))
+          ) {
+            continue;
+          }
+          if (r.bufferUsage !== null && r.bufferUsage !== undefined) {
+            if ((r.bufferUsage & GPU_BUFFER_USAGE_STORAGE) === 0) continue;
+          } else if (
+            !(r.kind === 'storage' || (b.kind === 'read-only-storage' && r.kind === 'read-only-storage'))
+          ) {
+            continue;
+          }
+          usedIndices.add(i);
+          return this._remapBufferResourceWithDynamicOffset(r, b, dynOffsets, effectiveBgId);
+        }
+        if (pass > 0) continue;
+        if (b.kind === 'texture') {
+          if (r.kind !== 'texture') continue;
+          if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
+          if (
+            r.textureUsage !== null &&
+            r.textureUsage !== undefined &&
+            (r.textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
+          ) {
+            continue;
+          }
+          const expectedDim = b.viewDimension || '2d';
+          if (r.viewDimension && r.viewDimension !== expectedDim) continue;
+          if (
+            r.multisampled !== undefined &&
+            r.multisampled !== null &&
+            Boolean(r.multisampled) !== Boolean(b.multisampled)
+          ) {
+            continue;
+          }
+          if (r.textureFormat) {
+            const expectedSampleType = b.sampleType || 'float';
+            if (!isTextureSampleTypeCompatible(r.textureFormat, expectedSampleType, this.device)) {
+              continue;
+            }
+          }
+          usedIndices.add(i);
+          return r.resource;
+        }
+        if (b.kind === 'storage-texture') {
+          if (r.kind !== 'storage-texture') continue;
+          if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
+          if (r.multisampled === true) continue;
+          if (
+            r.textureUsage !== null &&
+            r.textureUsage !== undefined &&
+            (r.textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) === 0
+          ) {
+            continue;
+          }
+          const expectedDim = b.viewDimension || '2d';
+          if (r.viewDimension && r.viewDimension !== expectedDim) continue;
+          if (r.textureFormat && b.storageFormat && r.textureFormat !== b.storageFormat) {
+            continue;
+          }
+          usedIndices.add(i);
+          return r.resource;
+        }
+        if (b.kind === 'sampler') {
+          if (r.kind !== 'sampler') continue;
+          if (!isNonBufferBindingResource(r.resource) || isTextureViewResource(r.resource)) {
+            continue;
+          }
+          if (
+            r.comparison !== undefined &&
+            r.comparison !== null &&
+            Boolean(r.comparison) !== Boolean(b.comparison)
+          ) {
+            continue;
+          }
+          usedIndices.add(i);
+          return r.resource;
+        }
+      }
+    }
+    if (b.kind === 'sampler') {
+      const samplerKind = b.comparison ? 'comparison' : 'filtering';
+      const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+      if (fallbackSampler) {
+        this.telemetry.fallbackSamplersBound += 1;
+        return fallbackSampler;
+      }
+    }
+    return this._dummyResource(synthLayoutEntryForWgslBinding(b));
   }
 
   // Guards queued compute dispatches against zero/oversized workgroup dimensions and missing
@@ -6509,7 +6770,7 @@ class RenderStatePackets {
     let activeComputeRequiredGroupsMask = 0;
     let boundComputeGroupsMask = 0;
     let invalidComputeGroupsMask = 0;
-    const boundComputeGroupBglIds = new Int32Array(8);
+    const boundComputeGroupBglIds = this._scratchBoundComputeGroupBglIds;
     boundComputeGroupBglIds.fill(-1);
     let hadExplicitSetComputePipeline = false;
     let group0BoundForCompute = false;
@@ -6530,23 +6791,18 @@ class RenderStatePackets {
     let activeRenderPending = false;
     let activeComputePending = false;
 
-    // W354: lazily allocate `filtered` ONLY if the command stream actually needs modification
-    // (zero array allocation on steady-state frames!).
-    let filtered = null;
-    const ensureFiltered = (copyUpTo) => {
-      if (filtered === null) {
-        filtered = new Array(copyUpTo);
-        for (let k = 0; k < copyUpTo; k += 1) {
-          filtered[k] = cmds[k];
-        }
-      }
-      return filtered;
-    };
+    // Zero-alloc pass-command filtering:
+    // - Clean frames: writeIdx === i, zero writes, zero allocations.
+    // - Drops & 1-to-1 replacements: compact in-place on `cmds` (zero allocations).
+    // - Insertions (auto-layout draw/dispatch injecting a bind-group cmd): spill into reusable
+    //   `this._scratchFilteredCmds` only if `writeIdx === i`, then copy back into `cmds`.
+    const cmdCount = cmds.length;
+    let writeIdx = 0;
+    let scratchOut = null;
 
-    for (let i = 0; i < cmds.length; i += 1) {
+    for (let i = 0; i < cmdCount; i += 1) {
       const cmd = cmds[i];
       if (!cmd) {
-        ensureFiltered(i);
         continue;
       }
 
@@ -6581,7 +6837,6 @@ class RenderStatePackets {
             }
           }
         }
-        ensureFiltered(i);
         continue;
       }
 
@@ -6611,7 +6866,11 @@ class RenderStatePackets {
         hasLastRenderGroup0 = false;
         activeRenderPending = false;
         activeComputePending = false;
-        if (filtered !== null) filtered.push(cmd);
+        if (scratchOut !== null) scratchOut.push(cmd);
+        else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
@@ -6634,7 +6893,11 @@ class RenderStatePackets {
             idxBuf.destroyed !== true &&
             (idxUsage === null || (idxUsage & GPU_BUFFER_USAGE_INDEX) !== 0)
         );
-        if (filtered !== null) filtered.push(cmd);
+        if (scratchOut !== null) scratchOut.push(cmd);
+        else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
@@ -6662,7 +6925,6 @@ class RenderStatePackets {
           activeRenderHasKnownLayout = false;
           activeRenderRequiredGroupsMask = 0;
           group0BoundForRender = false;
-          ensureFiltered(i);
           continue;
         }
         const rMeta = this.renderPipelineAutoLayoutMeta.get(cmd.pipelineId) || null;
@@ -6681,7 +6943,11 @@ class RenderStatePackets {
           activeRenderRequiredGroupsMask = rLayoutMeta ? rLayoutMeta.requiredGroupsMask || 0 : 0;
         }
         group0BoundForRender = false;
-        if (filtered !== null) filtered.push(cmd);
+        if (scratchOut !== null) scratchOut.push(cmd);
+        else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
@@ -6708,7 +6974,6 @@ class RenderStatePackets {
           activeComputeHasKnownLayout = false;
           activeComputeRequiredGroupsMask = 0;
           group0BoundForCompute = false;
-          ensureFiltered(i);
           continue;
         }
         activeComputePipelineValid = Boolean(
@@ -6723,7 +6988,6 @@ class RenderStatePackets {
             `missing-compute-pipeline:${cmd.pipelineId}`,
             `compute pipeline ${cmd.pipelineId} unavailable; subsequent dispatches will be skipped`
           );
-          ensureFiltered(i);
           continue;
         }
         const cMeta = this.computePipelineMeta.get(cmd.pipelineId) || null;
@@ -6754,7 +7018,11 @@ class RenderStatePackets {
           }
         }
         group0BoundForCompute = false;
-        if (filtered !== null) filtered.push(cmd);
+        if (scratchOut !== null) scratchOut.push(cmd);
+        else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
@@ -6837,7 +7105,6 @@ class RenderStatePackets {
             `skip-rt-group3-auto:${activeComputePipelineId || 0}`,
             `skipped explicit RT arena group 3 bind on layout:'auto' compute pipeline ${activeComputePipelineId || 0}`
           );
-          ensureFiltered(i);
           continue;
         }
 
@@ -6861,11 +7128,15 @@ class RenderStatePackets {
               );
               group0BoundForCompute = true;
               if (res.status === 'ok') {
-                ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, bindGroupId));
+                const repl = this._acquireRemappedSetBindGroupCommand(res.bindGroup, bindGroupId);
+                if (scratchOut !== null) scratchOut.push(repl);
+                else {
+                  cmds[writeIdx] = repl;
+                  writeIdx += 1;
+                }
                 continue;
               }
               if (res.status === 'empty') {
-                ensureFiltered(i);
                 continue;
               }
             }
@@ -6888,11 +7159,21 @@ class RenderStatePackets {
               );
               group0BoundForRender = true;
               if (res.status === 'ok') {
-                ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, bindGroupId));
+                const repl = this._acquireRemappedSetBindGroupCommand(res.bindGroup, bindGroupId);
+                if (scratchOut !== null) scratchOut.push(repl);
+                else {
+                  cmds[writeIdx] = repl;
+                  writeIdx += 1;
+                }
                 continue;
               }
               if (res.status === 'empty') {
-                ensureFiltered(i).push(this._acquireNoopRenderGroup0Command(bindGroupId));
+                const noop = this._acquireNoopRenderGroup0Command(bindGroupId);
+                if (scratchOut !== null) scratchOut.push(noop);
+                else {
+                  cmds[writeIdx] = noop;
+                  writeIdx += 1;
+                }
                 continue;
               }
             }
@@ -6907,7 +7188,11 @@ class RenderStatePackets {
             hasLastComputeGroup0 = true;
           }
         }
-        if (filtered !== null) filtered.push(cmd);
+        if (scratchOut !== null) scratchOut.push(cmd);
+        else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
@@ -6932,7 +7217,6 @@ class RenderStatePackets {
         activeComputePending = false;
         if (activeRenderPending) {
           this.telemetry.pendingAsyncPipelineSkips += 1;
-          ensureFiltered(i);
           continue;
         }
         if (cmd.type === 'drawIndirect' || cmd.type === 'drawIndexedIndirect') {
@@ -6941,14 +7225,19 @@ class RenderStatePackets {
             this.processor._bufferMeta && typeof this.processor._bufferMeta.get === 'function'
               ? this.processor._bufferMeta.get(cmd.bufferId)
               : null;
-          const indirectCheck = validateIndirectCommand(cmd.type, indirectBuf, cmd.offset, indirectMeta);
+          const indirectCheck = validateIndirectCommand(
+            cmd.type,
+            indirectBuf,
+            cmd.offset,
+            indirectMeta,
+            this._scratch.indirectCheck
+          );
           if (!indirectCheck.valid) {
             this.telemetry.skippedInvalidIndirectOps += 1;
             this._recordTelemetryWarningOnce(
               `skip-indirect:${cmd.type}:${indirectCheck.reason}:${cmd.bufferId}`,
               `skipped ${cmd.type} on buffer ${cmd.bufferId} offset ${cmd.offset}: ${indirectCheck.reason}`
             );
-            ensureFiltered(i);
             continue;
           }
           if (cmd.type === 'drawIndexedIndirect' && !hasIndexBufferInPass) {
@@ -6957,10 +7246,10 @@ class RenderStatePackets {
               `skip-indirect:drawIndexedIndirect:no-index-buffer:${activeRenderPipelineId || 0}`,
               `skipped drawIndexedIndirect on pipeline ${activeRenderPipelineId || 0}: no valid index buffer bound in pass`
             );
-            ensureFiltered(i);
             continue;
           }
         }
+        let injectedRenderCmd = null;
         if (activeRenderAutoLayout && !group0BoundForRender) {
           const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
           const srcBgId = hasLastRenderGroup0 ? lastRenderGroup0.bindGroupId : 0;
@@ -6978,9 +7267,9 @@ class RenderStatePackets {
           );
           group0BoundForRender = true;
           if (res.status === 'ok') {
-            ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId));
+            injectedRenderCmd = this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId);
           } else if (res.status === 'empty') {
-            ensureFiltered(i).push(this._acquireNoopRenderGroup0Command(srcBgId));
+            injectedRenderCmd = this._acquireNoopRenderGroup0Command(srcBgId);
           }
         } else if (
           !activeRenderAutoLayout &&
@@ -6996,17 +7285,33 @@ class RenderStatePackets {
             `skip-draw-unbound:${activeRenderPipelineId || 0}:${badMask}`,
             `skipped render draw on pipeline ${activeRenderPipelineId || 0}: required bind group failed to create or is unbound`
           );
-          ensureFiltered(i);
           continue;
         }
-        if (filtered !== null) filtered.push(cmd);
+        if (injectedRenderCmd !== null) {
+          if (scratchOut !== null) {
+            scratchOut.push(injectedRenderCmd, cmd);
+          } else if (writeIdx < i) {
+            cmds[writeIdx] = injectedRenderCmd;
+            cmds[writeIdx + 1] = cmd;
+            writeIdx += 2;
+          } else {
+            scratchOut = this._scratchFilteredCmds;
+            scratchOut.length = writeIdx;
+            for (let k = 0; k < writeIdx; k += 1) scratchOut[k] = cmds[k];
+            scratchOut.push(injectedRenderCmd, cmd);
+          }
+        } else if (scratchOut !== null) {
+          scratchOut.push(cmd);
+        } else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
       if (cmd.type === 'dispatchCompute' || cmd.type === 'dispatchIndirect') {
         if (activeComputePending) {
           this.telemetry.pendingAsyncPipelineSkips += 1;
-          ensureFiltered(i);
           continue;
         }
         if (hadExplicitSetComputePipeline && !activeComputePipelineValid) {
@@ -7015,7 +7320,6 @@ class RenderStatePackets {
             `skip-dispatch-no-pipeline:${activeComputePipelineId}`,
             `skipped compute dispatch: compute pipeline ${activeComputePipelineId} is unavailable`
           );
-          ensureFiltered(i);
           continue;
         }
         if (cmd.type === 'dispatchIndirect') {
@@ -7028,7 +7332,8 @@ class RenderStatePackets {
             'dispatchIndirect',
             indirectBuf,
             cmd.offset,
-            indirectMeta
+            indirectMeta,
+            this._scratch.indirectCheck
           );
           if (!indirectCheck.valid) {
             this.telemetry.skippedInvalidIndirectOps += 1;
@@ -7037,7 +7342,6 @@ class RenderStatePackets {
               `skip-indirect:dispatchIndirect:${indirectCheck.reason}:${cmd.bufferId}`,
               `skipped dispatchIndirect on buffer ${cmd.bufferId} offset ${cmd.offset}: ${indirectCheck.reason}`
             );
-            ensureFiltered(i);
             continue;
           }
         }
@@ -7052,7 +7356,6 @@ class RenderStatePackets {
               `skip-dispatch-zero:${rawX}x${rawY}x${rawZ}`,
               `skipped compute dispatch with zero or invalid workgroups (${rawX}x${rawY}x${rawZ})`
             );
-            ensureFiltered(i);
             continue;
           }
           if (check.clamped) {
@@ -7066,6 +7369,7 @@ class RenderStatePackets {
             );
           }
         }
+        let injectedComputeCmd = null;
         if (activeComputeAutoLayout && !group0BoundForCompute) {
           const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
           const srcBgId = hasLastComputeGroup0 ? lastComputeGroup0.bindGroupId : 0;
@@ -7083,7 +7387,7 @@ class RenderStatePackets {
           );
           group0BoundForCompute = true;
           if (res.status === 'ok') {
-            ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId));
+            injectedComputeCmd = this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId);
           }
         } else if (
           !activeComputeAutoLayout &&
@@ -7100,19 +7404,48 @@ class RenderStatePackets {
             `skip-dispatch-unbound:${activeComputePipelineId || 0}:${missingMask}`,
             `skipped compute dispatch on pipeline ${activeComputePipelineId || 0}: required bind group mask 0x${missingMask.toString(16)} is unbound`
           );
-          ensureFiltered(i);
           continue;
         }
         this.telemetry.computeDispatchCount += 1;
-        if (filtered !== null) filtered.push(cmd);
+        if (injectedComputeCmd !== null) {
+          if (scratchOut !== null) {
+            scratchOut.push(injectedComputeCmd, cmd);
+          } else if (writeIdx < i) {
+            cmds[writeIdx] = injectedComputeCmd;
+            cmds[writeIdx + 1] = cmd;
+            writeIdx += 2;
+          } else {
+            scratchOut = this._scratchFilteredCmds;
+            scratchOut.length = writeIdx;
+            for (let k = 0; k < writeIdx; k += 1) scratchOut[k] = cmds[k];
+            scratchOut.push(injectedComputeCmd, cmd);
+          }
+        } else if (scratchOut !== null) {
+          scratchOut.push(cmd);
+        } else {
+          if (writeIdx !== i) cmds[writeIdx] = cmd;
+          writeIdx += 1;
+        }
         continue;
       }
 
-      if (filtered !== null) filtered.push(cmd);
+      if (scratchOut !== null) scratchOut.push(cmd);
+      else {
+        if (writeIdx !== i) cmds[writeIdx] = cmd;
+        writeIdx += 1;
+      }
     }
 
-    if (filtered !== null) {
-      this.processor._passCommands = filtered;
+    if (scratchOut !== null) {
+      const outLen = scratchOut.length;
+      cmds.length = outLen;
+      for (let k = 0; k < outLen; k += 1) {
+        cmds[k] = scratchOut[k];
+        scratchOut[k] = undefined;
+      }
+      scratchOut.length = 0;
+    } else if (writeIdx !== cmdCount) {
+      cmds.length = writeIdx;
     }
   }
 
@@ -7266,7 +7599,7 @@ class RenderStatePackets {
     return false;
   }
 
-  _resolveTextureMetaFull(textureId) {
+  _resolveTextureMetaFull(textureId, out = null) {
     const meta = this.textureMeta.get(textureId) || null;
     const texture =
       this.processor && this.processor.textures ? this.processor.textures.get(textureId) || null : null;
@@ -7317,6 +7650,19 @@ class RenderStatePackets {
       (texture && typeof texture.dimension === 'string' ? texture.dimension : null) ||
       (meta && typeof meta.dimension === 'string' ? meta.dimension : null) ||
       (desc && typeof desc.dimension === 'string' ? desc.dimension : null);
+    if (out) {
+      out.texture = texture;
+      out.meta = meta;
+      out.width = width;
+      out.height = height;
+      out.depthOrArrayLayers = depthOrArrayLayers;
+      out.mipLevelCount = mipLevelCount;
+      out.sampleCount = sampleCount;
+      out.format = format;
+      out.usage = usage;
+      out.dimension = dimension;
+      return out;
+    }
     return {
       texture,
       meta,
@@ -7666,7 +8012,10 @@ class RenderStatePackets {
     this.telemetry.textureViewCacheMisses += 1;
     let createDesc;
     if (!modified && hasDesc) {
-      createDesc = desc;
+      createDesc =
+        desc === this._scratchAttViewDesc || desc === this._scratchSwapchainFormatDesc
+          ? { ...desc }
+          : desc;
     } else {
       createDesc = hasDesc ? { ...desc } : {};
       if (effFormat) createDesc.format = effFormat;
@@ -7769,7 +8118,7 @@ class RenderStatePackets {
       };
     }
     const isDepthStencil = Boolean(options && options.isDepthStencil);
-    const full = this._resolveTextureMetaFull(textureId);
+    const full = this._resolveTextureMetaFull(textureId, this._scratchTexMeta);
     const hasDesc = Boolean(desc && typeof desc === 'object');
     const actualDim = full.dimension || '2d';
     const is3d = actualDim === '3d';
@@ -7786,7 +8135,21 @@ class RenderStatePackets {
       (is3d ? desc.dimension !== '3d' : desc.dimension !== '2d');
 
     if (isMultiMip || isLayered || is3d || badAspect || badMipCount || badLayerCount || badDim) {
-      const attDesc = hasDesc ? { ...desc } : {};
+      const attDesc = this._scratchAttViewDesc;
+      if (hasDesc && desc.format !== undefined) attDesc.format = desc.format;
+      else if ('format' in attDesc) delete attDesc.format;
+      if (hasDesc && desc.dimension !== undefined) attDesc.dimension = desc.dimension;
+      else if ('dimension' in attDesc) delete attDesc.dimension;
+      if (hasDesc && desc.aspect !== undefined) attDesc.aspect = desc.aspect;
+      else if ('aspect' in attDesc) delete attDesc.aspect;
+      if (hasDesc && desc.baseMipLevel !== undefined) attDesc.baseMipLevel = desc.baseMipLevel;
+      else if ('baseMipLevel' in attDesc) delete attDesc.baseMipLevel;
+      if (hasDesc && desc.mipLevelCount !== undefined) attDesc.mipLevelCount = desc.mipLevelCount;
+      else if ('mipLevelCount' in attDesc) delete attDesc.mipLevelCount;
+      if (hasDesc && desc.baseArrayLayer !== undefined) attDesc.baseArrayLayer = desc.baseArrayLayer;
+      else if ('baseArrayLayer' in attDesc) delete attDesc.baseArrayLayer;
+      if (hasDesc && desc.arrayLayerCount !== undefined) attDesc.arrayLayerCount = desc.arrayLayerCount;
+      else if ('arrayLayerCount' in attDesc) delete attDesc.arrayLayerCount;
       if (badAspect) {
         attDesc.aspect = 'all';
         if (full.format && attDesc.format && attDesc.format !== full.format) {
@@ -7826,7 +8189,7 @@ class RenderStatePackets {
   }
 
   _textureAttachmentSize(textureId, viewDesc, out = null) {
-    const full = this._resolveTextureMetaFull(textureId);
+    const full = this._resolveTextureMetaFull(textureId, this._scratchTexMetaSize);
     const base = validTargetSize(full.width, full.height, out);
     if (!base) return null;
     const rawMip =
@@ -7932,7 +8295,7 @@ class RenderStatePackets {
         continue;
       }
       const isSwap = c.textureId === SWAPCHAIN_TEXTURE_ID;
-      const full = isSwap ? null : this._resolveTextureMetaFull(c.textureId);
+      const full = isSwap ? null : this._resolveTextureMetaFull(c.textureId, this._scratchTexMeta);
       // Drop color attachments lacking RENDER_ATTACHMENT usage or carrying a depth/stencil format.
       if (!isSwap && full) {
         const cFmt = (c.view && c.view.format) || full.format;
@@ -8006,7 +8369,7 @@ class RenderStatePackets {
     let depthFormat = null;
     let depthUsage = null;
     if (d && d.textureId !== SWAPCHAIN_TEXTURE_ID) {
-      const dsFull = this._resolveTextureMetaFull(d.textureId);
+      const dsFull = this._resolveTextureMetaFull(d.textureId, this._scratchTexMeta);
       depthFormat = dsFull.format || (d.view && d.view.format) || null;
       depthUsage = dsFull.usage;
       depthSampleCount = dsFull.sampleCount;
@@ -8060,7 +8423,11 @@ class RenderStatePackets {
     this._scratchAttachmentSizes.depthSampleCount = depthSampleCount;
     this._scratchAttachmentSizes.depthFormat = depthFormat;
     this._scratchAttachmentSizes.depthUsage = depthUsage;
-    const sanitized = sanitizeRenderPassAttachments(descriptor, this._scratchAttachmentSizes);
+    const sanitized = sanitizeRenderPassAttachments(
+      descriptor,
+      this._scratchAttachmentSizes,
+      this._scratchSanitizeRpResult
+    );
     colorSizes.length = 0;
     colorSampleCounts.length = 0;
     colorFormats.length = 0;
@@ -8076,7 +8443,11 @@ class RenderStatePackets {
         this._recordTelemetryWarningOnce(w.key, w.message);
       }
     }
-    return sanitized.descriptor;
+    const resultDesc = sanitized.descriptor;
+    sanitized.descriptor = null;
+    sanitized.referenceSize = null;
+    sanitized.warnings = EMPTY_WARNINGS;
+    return resultDesc;
   }
 
   // W104: report a missing render-pass attachment once per texture id and device generation
@@ -8137,9 +8508,11 @@ class RenderStatePackets {
     let dsResolver = null;
     if (decoded.depthStencil) {
       if (!targetAttachment) targetAttachment = decoded.depthStencil;
-      dsResolver = this._attachmentView(decoded.depthStencil.textureId, decoded.depthStencil.view, {
-        isDepthStencil: true,
-      });
+      dsResolver = this._attachmentView(
+        decoded.depthStencil.textureId,
+        decoded.depthStencil.view,
+        DEPTH_STENCIL_ATTACHMENT_OPTS
+      );
       if (!dsResolver) {
         colorResolvers.length = 0;
         cmd._resolvers.depthStencil = null;
@@ -8321,21 +8694,28 @@ class RenderStatePackets {
       record.dynamicOffsetIndices && record.dynamicOffsetIndices.size > 0
         ? new Array(record.dynamicOffsetIndices.size).fill(null)
         : null;
-    const seenBindings = new Set();
+    const seenBindings = this._scratchSeenBindings;
+    seenBindings.clear();
     const entryByBinding = record.entryByBinding || null;
     for (let i = 0; i < count; i++) {
       const o = offset + 16 + i * 48;
       const binding = view.getUint32(o, true);
       const arrayIndex = isBindingArrayBg ? view.getUint16(o + 12, true) : 0;
       const effectiveBinding = isBindingArrayBg ? binding + arrayIndex : binding;
-      const dummyOwner = `${layoutId}:${effectiveBinding}`;
+      let dummyOwner = null;
       const type = view.getUint32(o + 4, true);
       const resourceId = view.getUint32(o + 8, true);
-      const layoutEntry = entryByBinding
-        ? entryByBinding.get(binding) || null
-        : record.entries
-          ? record.entries.find((e) => e.binding === binding) || null
-          : null;
+      let layoutEntry = null;
+      if (entryByBinding) {
+        layoutEntry = entryByBinding.get(binding) || null;
+      } else if (record.entries) {
+        for (let leIdx = 0; leIdx < record.entries.length; leIdx += 1) {
+          if (record.entries[leIdx].binding === binding) {
+            layoutEntry = record.entries[leIdx];
+            break;
+          }
+        }
+      }
       if (!layoutEntry && Array.isArray(record.entries)) {
         this.telemetry.bindGroupValidationFallbacks += 1;
         this._recordTelemetryWarningOnce(
@@ -8394,11 +8774,11 @@ class RenderStatePackets {
             samplerComparison = samplerKind === 'comparison';
             this.telemetry.fallbackSamplersBound += 1;
           } else if (layoutEntry) {
-            entryResource = this._dummyResource(layoutEntry, dummyOwner);
+            entryResource = this._dummyResource(layoutEntry, dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`));
             if (entryResource) entryUsedDummy = true;
           }
         } else {
-          entryResource = layoutEntry ? this._dummyResource(layoutEntry, dummyOwner) : null;
+          entryResource = layoutEntry ? this._dummyResource(layoutEntry, dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)) : null;
           if (entryResource) entryUsedDummy = true;
         }
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
@@ -8608,11 +8988,21 @@ class RenderStatePackets {
             `bg-missing-buffer:${layoutId}:${effectiveBinding}:${resourceId}`,
             `bind group ${id}: binding ${effectiveBinding} buffer ${resourceId} unavailable; substituting dummy resource`
           );
-          entryResource = this._fallbackResourceForLayoutEntry(layoutEntry, true, dummyOwner);
+          entryResource = this._fallbackResourceForLayoutEntry(
+            layoutEntry,
+            true,
+            dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+          );
           entryUsedDummy = true;
         }
       } else if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
-        const viewDesc = decodeTextureViewDesc(view, o + 32);
+        const viewDesc =
+          (view.getUint32(o + 32, true) |
+            view.getUint32(o + 36, true) |
+            view.getUint32(o + 40, true) |
+            view.getUint32(o + 44, true)) === 0
+            ? EMPTY_TEXTURE_VIEW_DESC
+            : decodeTextureViewDesc(view, o + 32);
         const texFormat = this._resolveTextureFormat(resourceId, viewDesc);
         const texMeta = this.textureMeta.get(resourceId) || null;
         const texObj = this.processor.textures.get(resourceId) || null;
@@ -8626,7 +9016,11 @@ class RenderStatePackets {
               `bg-missing-texture:${layoutId}:${effectiveBinding}:${resourceId}`,
               `bind group ${id}: binding ${effectiveBinding} texture ${resourceId} unavailable; substituting dummy resource`
             );
-            entryResource = this._fallbackResourceForLayoutEntry(layoutEntry, true, dummyOwner);
+            entryResource = this._fallbackResourceForLayoutEntry(
+            layoutEntry,
+            true,
+            dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+          );
             entryUsedDummy = true;
           }
         } else {
@@ -8693,7 +9087,10 @@ class RenderStatePackets {
                   resolvedStorage.reason ? ` (${resolvedStorage.reason})` : ''
                 }; substituting dummy storage texture`
               );
-              entryResource = this._dummyResource(layoutEntry, dummyOwner);
+              entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
               entryUsedDummy = true;
             } else if (textureMultisampled === true) {
               this.telemetry.bindGroupValidationFallbacks += 1;
@@ -8701,7 +9098,10 @@ class RenderStatePackets {
                 `bg-storage-multisampled:${layoutId}:${effectiveBinding}`,
                 `bind group ${id}: binding ${effectiveBinding} multisampled texture cannot bind as storageTexture; substituting dummy storage texture`
               );
-              entryResource = this._dummyResource(layoutEntry, dummyOwner);
+              entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
               entryUsedDummy = true;
             } else if (
               textureUsage !== null &&
@@ -8712,7 +9112,10 @@ class RenderStatePackets {
                 `bg-storage-usage-mismatch:${layoutId}:${effectiveBinding}`,
                 `bind group ${id}: binding ${effectiveBinding} texture usage 0x${textureUsage.toString(16)} lacks STORAGE_BINDING; substituting dummy storage texture`
               );
-              entryResource = this._dummyResource(layoutEntry, dummyOwner);
+              entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
               entryUsedDummy = true;
             } else {
               const effectiveStorageFormat = resolvedStorage ? resolvedStorage.storageFormat : texFormat;
@@ -8726,7 +9129,10 @@ class RenderStatePackets {
                   `bg-storage-format-mismatch:${layoutId}:${effectiveBinding}:${effectiveStorageFormat}:${expectedStorageFormat}`,
                   `bind group ${id}: binding ${effectiveBinding} storageTexture format ${effectiveStorageFormat} mismatches layout ${expectedStorageFormat}; substituting dummy storage texture`
                 );
-                entryResource = this._dummyResource(layoutEntry, dummyOwner);
+                entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
                 entryUsedDummy = true;
               } else if (
                 effectiveStorageFormat &&
@@ -8737,7 +9143,10 @@ class RenderStatePackets {
                   `bg-storage-access-unsupported:${layoutId}:${effectiveBinding}:${effectiveStorageFormat}:${expectedStorageAccess}`,
                   `bind group ${id}: binding ${effectiveBinding} storageTexture format ${effectiveStorageFormat} unsupported for ${expectedStorageAccess}; substituting dummy storage texture`
                 );
-                entryResource = this._dummyResource(layoutEntry, dummyOwner);
+                entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
                 entryUsedDummy = true;
               } else {
                 let storageViewDesc =
@@ -8770,7 +9179,10 @@ class RenderStatePackets {
                     `bg-storage-dim-mismatch:${layoutId}:${effectiveBinding}:${textureViewDimension}:${expectedStorageDim}`,
                     `bind group ${id}: binding ${effectiveBinding} storageTexture dimension ${textureViewDimension} mismatches layout ${expectedStorageDim}; substituting dummy storage texture`
                   );
-                  entryResource = this._dummyResource(layoutEntry, dummyOwner);
+                  entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
                   entryUsedDummy = true;
                 } else {
                   const resolvedView = this._textureView(resourceId, storageViewDesc);
@@ -8792,7 +9204,10 @@ class RenderStatePackets {
                         ? `bind group ${id}: binding ${binding} linear sibling view ${resolvedStorage.storageFormat} unavailable for ${texFormat}; substituting dummy storage texture`
                         : `bind group ${id}: binding ${effectiveBinding} storageTexture view unavailable for texture ${resourceId}; substituting dummy storage texture`
                     );
-                    entryResource = this._dummyResource(layoutEntry, dummyOwner);
+                    entryResource = this._dummyResource(
+                layoutEntry,
+                dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+              );
                     entryUsedDummy = true;
                   }
                 }
@@ -9058,7 +9473,11 @@ class RenderStatePackets {
           `bg-missing-resource:${layoutId}:${effectiveBinding}:${resourceId}`,
           `bind group ${id}: binding ${effectiveBinding} resource ${resourceId} unavailable; substituting dummy resource`
         );
-        entryResource = this._fallbackResourceForLayoutEntry(layoutEntry, true, dummyOwner);
+        entryResource = this._fallbackResourceForLayoutEntry(
+          layoutEntry,
+          true,
+          dummyOwner || (dummyOwner = `${layoutId}:${effectiveBinding}`)
+        );
         entryUsedDummy = true;
       }
       if (!entryResource) {
@@ -9282,28 +9701,42 @@ class RenderStatePackets {
       record.entries.length === 2 &&
       descriptorResources.length === 2
     ) {
-      const texLayout = record.entries.find(
-        (le) =>
-          le &&
+      let texLayout = null;
+      let smpLayout = null;
+      for (let i = 0; i < 2; i += 1) {
+        const le = record.entries[i];
+        if (!le) continue;
+        if (
+          !texLayout &&
           le.texture &&
           !le.texture.multisampled &&
           le.texture.viewDimension === '2d' &&
           le.texture.sampleType === 'float'
-      );
-      const smpLayout = record.entries.find((le) => le && le.sampler);
+        ) {
+          texLayout = le;
+        } else if (!smpLayout && le.sampler) {
+          smpLayout = le;
+        }
+      }
       if (texLayout && smpLayout) {
-        const texDesc = descriptorResources.find(
-          (r) =>
-            r &&
+        let texDesc = null;
+        let smpDesc = null;
+        for (let i = 0; i < 2; i += 1) {
+          const r = descriptorResources[i];
+          if (!r) continue;
+          if (
+            !texDesc &&
             r.binding === texLayout.binding &&
             r.kind === 'texture' &&
             !r.isDummy &&
             Number.isInteger(r.planeTextureId) &&
             r.planeTextureId > 0
-        );
-        const smpDesc = descriptorResources.find(
-          (r) => r && r.binding === smpLayout.binding && r.kind === 'sampler' && r.resource
-        );
+          ) {
+            texDesc = r;
+          } else if (!smpDesc && r.binding === smpLayout.binding && r.kind === 'sampler' && r.resource) {
+            smpDesc = r;
+          }
+        }
         if (texDesc && smpDesc) {
           const liveTexture = this.processor.textures.get(texDesc.planeTextureId) || null;
           if (liveTexture) {
