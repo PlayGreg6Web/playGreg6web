@@ -980,10 +980,12 @@ impl Rdna2WgslOutput {
             let opt = self.ir_opt;
             let _ = writeln!(
                 out,
-                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"constants_folded\": {}, \"identities_simplified\": {}, \"dead_branches_folded\": {}, \"locals_forwarded\": {}, \"cse_eliminated\": {}, \"readonly_loads_cse\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
+                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"constants_folded\": {}, \"identities_simplified\": {}, \"strength_reductions\": {}, \"vector_extracts_folded\": {}, \"dead_branches_folded\": {}, \"locals_forwarded\": {}, \"cse_eliminated\": {}, \"readonly_loads_cse\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
                 opt.bitcasts_cancelled,
                 opt.constants_folded,
                 opt.identities_simplified,
+                opt.strength_reductions,
+                opt.vector_extracts_folded,
                 opt.dead_branches_folded,
                 opt.locals_forwarded,
                 opt.cse_eliminated,
@@ -31519,7 +31521,11 @@ mod tests {
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("if ("), "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("discard;"), "WGSL:\n{}", out.wgsl);
-        assert!(out.wgsl.contains("!("), "NaN-aware negated compare expected:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("!(") || out.wgsl.contains("select(1u, 0u, "),
+            "NaN-aware negated compare expected:\n{}",
+            out.wgsl
+        );
         assert_naga_wgsl_valid(&out.wgsl);
     }
 

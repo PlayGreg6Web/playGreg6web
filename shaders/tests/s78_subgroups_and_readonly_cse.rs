@@ -719,9 +719,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     assert!(wgsl.contains("x >= y"), "!(x < y) should simplify to x >= y:\n{wgsl}");
     // Div-by-zero const-eval trap was prevented!
     assert!(!wgsl.contains("10u / 0u"), "must never create const 10u / 0u:\n{wgsl}");
-    // Float `fx * 0.0` and `!(fx < fy)` / `!(fx == fy)` MUST stay intact for NaN / -0.0!
+    // Float `fx * 0.0` and float `<`/`==` comparisons MUST stay intact for NaN / -0.0
+    // (select(0.0, 1.0, !(fx < fy)) may safely swap to select(1.0, 0.0, fx < fy), which is
+    // bit-exact for NaN, while `fx < fy` / `fx == fy` must NEVER invert to `>=` / `!=`).
     assert!(wgsl.contains("fx * 0.0") || wgsl.contains("fx * 0f"), "float * 0.0 must stay:\n{wgsl}");
-    assert!(wgsl.contains("!((") || wgsl.contains("!(fx"), "float negated cmp must stay:\n{wgsl}");
+    assert!(
+        !wgsl.contains("fx >= fy") && !wgsl.contains("fx != fy") && wgsl.contains("fx < fy") && wgsl.contains("fx == fy"),
+        "float comparisons must NEVER invert to >= / !=:\n{wgsl}"
+    );
 }
 
 #[test]

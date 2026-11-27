@@ -56,8 +56,8 @@
 use std::collections::{HashMap, HashSet};
 
 use naga::{
-    AddressSpace, Arena, AtomicFunction, BinaryOperator, Block, Constant, Expression, Function,
-    GatherMode, GlobalVariable, Handle, ImageClass, ImageQuery, Literal, LocalVariable,
+    AddressSpace, Arena, ArraySize, AtomicFunction, BinaryOperator, Block, Constant, Expression,
+    Function, GatherMode, GlobalVariable, Handle, ImageClass, ImageQuery, Literal, LocalVariable,
     MathFunction, Module, Override, Range, RayPipelineFunction, RayQueryFunction,
     RelationalFunction, SampleLevel, Scalar, ScalarKind, Span, Statement, StorageAccess,
     StorageFormat, SwitchCase, SwizzleComponent, Type, TypeInner, UnaryOperator, UniqueArena,
@@ -72,10 +72,14 @@ const MAX_OPT_PASSES: usize = 8;
 pub struct IrOptStats {
     /// Identity (`bitcast<T>(x) -> x`) and round-trip (`bitcast<T>(bitcast<U>(x)) -> x`) casts cancelled.
     pub bitcasts_cancelled: usize,
-    /// Pure constant expressions folded (`Binary`, `Unary`, `Select`, `Splat`/`Compose` + `AccessIndex`, `As`).
+    /// Pure constant expressions folded (`Binary`, `Unary`, `Select`, `As`).
     pub constants_folded: usize,
-    /// Safe integer/boolean algebraic identities simplified (`x + 0`, `x * 1`, `x * 0`, `x & 0`, `x | 0`, `x ^ 0`, `x & ~0`, `x << 0`, `x >> 0`, `x ^ x`, `x & x`, `x | x`, `select(a, a, c)`, `!!b`, `!(a == b)`).
+    /// Safe integer/boolean algebraic identities simplified (`x + 0`, `x * 1`, `x * 0`, `x / 1`, `x % 1`, `x & 0`, `x | 0`, `x | ~0`, `x ^ 0`, `x & ~0`, `x << 0`, `x >> 0`, `x ^ x`, `x - x`, `x & x`, `x | x`, `select(a, a, c)`, `select(r, a, !c)`, `!!b`, `~~x`, `--x`, `!(a == b)`, nested shifts).
     pub identities_simplified: usize,
+    /// Unsigned integer power-of-two strength reductions (`x / 2^k -> x >> k`, `x % 2^k -> x & (2^k - 1)`, `x * 2^k -> x << k`).
+    pub strength_reductions: usize,
+    /// Constant-index vector/aggregate extractions folded through `Splat`, `Compose`, and `Swizzle`.
+    pub vector_extracts_folded: usize,
     /// Constant-condition `If` branches folded, empty pure `If`s pruned, and unreachable tails trimmed after `Return`/`Break`/`Continue`/`Kill`.
     pub dead_branches_folded: usize,
     /// Local variable `Load` expressions forwarded directly from dominating intra-block stores or initializers.
@@ -96,6 +100,8 @@ impl IrOptStats {
         self.bitcasts_cancelled
             + self.constants_folded
             + self.identities_simplified
+            + self.strength_reductions
+            + self.vector_extracts_folded
             + self.dead_branches_folded
             + self.locals_forwarded
             + self.cse_eliminated
@@ -109,6 +115,8 @@ impl IrOptStats {
         self.bitcasts_cancelled == 0
             && self.constants_folded == 0
             && self.identities_simplified == 0
+            && self.strength_reductions == 0
+            && self.vector_extracts_folded == 0
             && self.dead_branches_folded == 0
             && self.locals_forwarded == 0
             && self.cse_eliminated == 0
@@ -122,6 +130,8 @@ impl IrOptStats {
         self.bitcasts_cancelled += other.bitcasts_cancelled;
         self.constants_folded += other.constants_folded;
         self.identities_simplified += other.identities_simplified;
+        self.strength_reductions += other.strength_reductions;
+        self.vector_extracts_folded += other.vector_extracts_folded;
         self.dead_branches_folded += other.dead_branches_folded;
         self.locals_forwarded += other.locals_forwarded;
         self.cse_eliminated += other.cse_eliminated;
@@ -1216,9 +1226,12 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
     let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
     let mut remap: Vec<Handle<Expression>> = handles.clone();
     let mut resolved: Vec<Option<TypeInner>> = vec![None; n];
+    let mut pure: Vec<bool> = vec![false; n];
+    let mut inserted_before: Vec<Vec<Handle<Expression>>> = vec![Vec::new(); n];
     let mut any_remapped = false;
+    let mut any_inserted = false;
 
-    for h in handles {
+    for &h in &handles {
         let idx = h.index();
 
         // Rewrite all child handles to their already-simplified canonical handles.
@@ -1227,9 +1240,10 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
             remap_expr_children(expr, |c| remap[c.index()]);
         }
 
-        // Infer type of `h` from its canonicalized operands.
+        // Infer type and transitive purity of `h` from its canonicalized operands.
         let cur_ty = infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
         resolved[idx] = cur_ty.clone();
+        pure[idx] = expr_is_transitively_pure(&func.expressions[h], &pure);
 
         // Guard helper: check whether replacing `h` with a bare `Literal` could trigger an unsafe
         // Tint const-eval in a direct consumer.
@@ -1252,7 +1266,7 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
             {
                 return false;
             }
-            if used_as_divisor[idx] && matches!(lit, Literal::U32(0) | Literal::I32(0)) {
+            if used_as_divisor[idx] && matches!(lit, Literal::U32(0) | Literal::I32(0 | -1)) {
                 return false;
             }
             true
@@ -1273,17 +1287,6 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
             }
             true
         };
-
-        enum Rewrite {
-            Redirect(Handle<Expression>, RewriteKind),
-            Literal(Literal, RewriteKind),
-            ReplaceExpr(Expression, RewriteKind),
-        }
-        enum RewriteKind {
-            Bitcast,
-            ConstFold,
-            Identity,
-        }
 
         let rewrite = match &func.expressions[h] {
             // 1. Identity & round-trip `As` / bitcast cancellation + literal bitcast folding.
@@ -1341,7 +1344,8 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 }
             }
 
-            // 2. Unary constant folding & `!!b -> b`.
+            // 2. Unary constant folding, double-negation identities (`!!b`, `~~x`, `--x`),
+            //    and integer/boolean negated comparisons.
             Expression::Unary { op, expr: inner } => {
                 let op = *op;
                 let inner = *inner;
@@ -1364,13 +1368,49 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                         safe_to_become_literal(out)
                             .then_some(Rewrite::Literal(out, RewriteKind::ConstFold))
                     }
+                    // Double logical negation `!!b -> b` (scalar or vector Bool).
                     (
                         UnaryOperator::LogicalNot,
                         Expression::Unary {
                             op: UnaryOperator::LogicalNot,
                             expr: orig,
                         },
-                    ) if safe_to_redirect_to(*orig) => {
+                    ) if resolved[orig.index()]
+                        .as_ref()
+                        .and_then(value_shape)
+                        .is_some_and(|(_, s)| s.kind == ScalarKind::Bool)
+                        && safe_to_redirect_to(*orig) =>
+                    {
+                        Some(Rewrite::Redirect(*orig, RewriteKind::Identity))
+                    }
+                    // Double bitwise negation `~~x -> x` (integer scalar or vector).
+                    (
+                        UnaryOperator::BitwiseNot,
+                        Expression::Unary {
+                            op: UnaryOperator::BitwiseNot,
+                            expr: orig,
+                        },
+                    ) if resolved[orig.index()]
+                        .as_ref()
+                        .and_then(value_shape)
+                        .is_some_and(|(_, s)| matches!(s.kind, ScalarKind::Uint | ScalarKind::Sint))
+                        && safe_to_redirect_to(*orig) =>
+                    {
+                        Some(Rewrite::Redirect(*orig, RewriteKind::Identity))
+                    }
+                    // Double arithmetic negation `--x -> x` (strictly signed integer `Sint`, NEVER float!).
+                    (
+                        UnaryOperator::Negate,
+                        Expression::Unary {
+                            op: UnaryOperator::Negate,
+                            expr: orig,
+                        },
+                    ) if resolved[orig.index()]
+                        .as_ref()
+                        .and_then(value_shape)
+                        .is_some_and(|(_, s)| s.kind == ScalarKind::Sint)
+                        && safe_to_redirect_to(*orig) =>
+                    {
                         Some(Rewrite::Redirect(*orig, RewriteKind::Identity))
                     }
                     // Negated comparison identities strictly on integer/boolean operands (NEVER
@@ -1442,7 +1482,8 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 }
             }
 
-            // 3. Binary constant folding & safe integer/boolean algebraic identities.
+            // 3. Binary constant folding, safe integer/boolean algebraic identities, and
+            //    unsigned power-of-two strength reduction.
             Expression::Binary { op, left, right } => {
                 let op = *op;
                 let left = *left;
@@ -1454,9 +1495,48 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 {
                     safe_to_become_literal(folded)
                         .then_some(Rewrite::Literal(folded, RewriteKind::ConstFold))
+                } else if let Some(id_rew) = simplify_integer_binary_identity(
+                    ctx,
+                    op,
+                    left,
+                    right,
+                    cur_ty.as_ref(),
+                    &resolved,
+                    &pure,
+                    used_as_divisor[idx],
+                    func,
+                )
+                .and_then(|res| match res {
+                    IntIdentity::Redirect(target) if safe_to_redirect_to(target) => {
+                        Some(Rewrite::Redirect(target, RewriteKind::Identity))
+                    }
+                    IntIdentity::Literal(lit) if safe_to_become_literal(lit) => {
+                        Some(Rewrite::Literal(lit, RewriteKind::Identity))
+                    }
+                    IntIdentity::ReplaceExpr(expr) => {
+                        Some(Rewrite::ReplaceExpr(expr, RewriteKind::Identity))
+                    }
+                    IntIdentity::SplatLiteral { size, lit } => Some(Rewrite::SplatLiteral {
+                        size,
+                        lit,
+                        kind: RewriteKind::Identity,
+                    }),
+                    IntIdentity::BinaryWithU32Const { op, left, rhs_u32 } => {
+                        Some(Rewrite::BinaryWithU32Const {
+                            op,
+                            left,
+                            rhs_u32,
+                            vec_size: None,
+                            kind: RewriteKind::Identity,
+                        })
+                    }
+                    _ => None,
+                }) {
+                    Some(id_rew)
                 } else {
-                    // (b) Safe algebraic identities (strictly integer `u32`/`i32` only — NEVER float!).
-                    simplify_integer_binary_identity(
+                    // (c) Unsigned power-of-two strength reduction (`u32` / `vecN<u32>` ONLY!).
+                    try_strength_reduce_unsigned_pow2(
+                        ctx,
                         op,
                         left,
                         right,
@@ -1464,19 +1544,11 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                         &resolved,
                         func,
                     )
-                    .and_then(|res| match res {
-                        IntIdentity::Redirect(target) if safe_to_redirect_to(target) => {
-                            Some(Rewrite::Redirect(target, RewriteKind::Identity))
-                        }
-                        IntIdentity::Literal(lit) if safe_to_become_literal(lit) => {
-                            Some(Rewrite::Literal(lit, RewriteKind::Identity))
-                        }
-                        _ => None,
-                    })
                 }
             }
 
-            // 4. Select constant folding (`select(reject, accept, const_bool)`) & `select(a, a, c) -> a`.
+            // 4. Select constant folding (guarding purity of discarded arm!), `select(a, a, c) -> a`
+            //    (guarding purity of `c`), and `select(reject, accept, !c) -> select(accept, reject, c)`.
             Expression::Select {
                 condition,
                 accept,
@@ -1485,26 +1557,48 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 let condition = *condition;
                 let accept = *accept;
                 let reject = *reject;
-                if let Expression::Literal(Literal::Bool(b)) = func.expressions[condition] {
-                    let target = if b { accept } else { reject };
-                    safe_to_redirect_to(target)
+                if let Some(b) = const_uniform_bool(&func.expressions, condition) {
+                    let (target, discarded) = if b { (accept, reject) } else { (reject, accept) };
+                    (pure[discarded.index()] && safe_to_redirect_to(target))
                         .then_some(Rewrite::Redirect(target, RewriteKind::ConstFold))
-                } else if accept == reject && safe_to_redirect_to(accept) {
+                } else if accept == reject && pure[condition.index()] && safe_to_redirect_to(accept)
+                {
                     Some(Rewrite::Redirect(accept, RewriteKind::Identity))
+                } else if let Expression::Unary {
+                    op: UnaryOperator::LogicalNot,
+                    expr: inner,
+                } = func.expressions[condition]
+                    && resolved[inner.index()]
+                        .as_ref()
+                        .and_then(value_shape)
+                        .is_some_and(|(_, s)| s.kind == ScalarKind::Bool)
+                {
+                    Some(Rewrite::ReplaceExpr(
+                        Expression::Select {
+                            condition: inner,
+                            accept: reject,
+                            reject: accept,
+                        },
+                        RewriteKind::Identity,
+                    ))
                 } else {
                     None
                 }
             }
 
-            // 5. `AccessIndex` folding through `Splat` and 1-to-1 `Compose`.
+            // 5. `AccessIndex` folding through `Splat`, 1-to-1 `Compose`, and `Swizzle`.
             Expression::AccessIndex { base, index } => {
                 let base = *base;
                 let index = *index;
                 match &func.expressions[base] {
                     Expression::Splat { size, value } => {
                         let target = *value;
-                        if (index as usize) < (*size as usize) && safe_to_redirect_to(target) {
-                            Some(Rewrite::Redirect(target, RewriteKind::ConstFold))
+                        if (index as usize) < (*size as usize)
+                            && cur_ty.is_some()
+                            && resolved[target.index()].as_ref() == cur_ty.as_ref()
+                            && safe_to_redirect_to(target)
+                        {
+                            Some(Rewrite::Redirect(target, RewriteKind::VectorExtract))
                         } else {
                             None
                         }
@@ -1517,14 +1611,45 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                                 components.len() == *columns as usize
                             }
                             TypeInner::Struct { members, .. } => components.len() == members.len(),
-                            TypeInner::Array { .. } => true,
+                            TypeInner::Array {
+                                size: ArraySize::Constant(len),
+                                ..
+                            } => components.len() == len.get() as usize,
                             _ => false,
                         };
                         if is_one_to_one
+                            && cur_ty.is_some()
                             && let Some(&target) = components.get(index as usize)
+                            && resolved[target.index()].as_ref() == cur_ty.as_ref()
                             && safe_to_redirect_to(target)
                         {
-                            Some(Rewrite::Redirect(target, RewriteKind::ConstFold))
+                            Some(Rewrite::Redirect(target, RewriteKind::VectorExtract))
+                        } else {
+                            None
+                        }
+                    }
+                    Expression::Swizzle {
+                        size,
+                        vector,
+                        pattern,
+                    } => {
+                        let vector = *vector;
+                        if (index as usize) < (*size as usize)
+                            && let Some(TypeInner::Vector { size: src_size, .. }) =
+                                resolved[vector.index()].as_ref()
+                        {
+                            let lane = swizzle_component_index(pattern[index as usize]);
+                            if lane < (*src_size as u32) {
+                                Some(Rewrite::ReplaceExpr(
+                                    Expression::AccessIndex {
+                                        base: vector,
+                                        index: lane,
+                                    },
+                                    RewriteKind::VectorExtract,
+                                ))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -1533,55 +1658,430 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 }
             }
 
+            // 6. `Swizzle` folding through `Splat` and identity swizzle elimination (`.xy`/`.xyz`/`.xyzw`).
+            Expression::Swizzle {
+                size,
+                vector,
+                pattern,
+            } => {
+                let size = *size;
+                let vector = *vector;
+                let pattern = *pattern;
+                let count = size as usize;
+                match func.expressions[vector] {
+                    Expression::Splat {
+                        size: splat_size,
+                        value,
+                    } if pattern[..count]
+                        .iter()
+                        .all(|&c| swizzle_component_index(c) < splat_size as u32) =>
+                    {
+                        Some(Rewrite::ReplaceExpr(
+                            Expression::Splat { size, value },
+                            RewriteKind::VectorExtract,
+                        ))
+                    }
+                    _ => {
+                        let is_identity = matches!(
+                            resolved[vector.index()].as_ref(),
+                            Some(TypeInner::Vector { size: src_size, .. }) if *src_size == size
+                        ) && (0..count)
+                            .all(|i| swizzle_component_index(pattern[i]) == i as u32);
+                        if is_identity && safe_to_redirect_to(vector) {
+                            Some(Rewrite::Redirect(vector, RewriteKind::VectorExtract))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+
             _ => None,
         };
 
         if let Some(rew) = rewrite {
+            let record_stat = |kind: RewriteKind, stats: &mut IrOptStats| match kind {
+                RewriteKind::Bitcast => stats.bitcasts_cancelled += 1,
+                RewriteKind::ConstFold => stats.constants_folded += 1,
+                RewriteKind::Identity => stats.identities_simplified += 1,
+                RewriteKind::StrengthReduce => stats.strength_reductions += 1,
+                RewriteKind::VectorExtract => stats.vector_extracts_folded += 1,
+            };
+
             match rew {
                 Rewrite::Redirect(target, kind) => {
                     remap[idx] = target;
                     resolved[idx] = resolved[target.index()].clone();
+                    pure[idx] = pure[target.index()];
                     any_remapped = true;
-                    match kind {
-                        RewriteKind::Bitcast => stats.bitcasts_cancelled += 1,
-                        RewriteKind::ConstFold => stats.constants_folded += 1,
-                        RewriteKind::Identity => stats.identities_simplified += 1,
-                    }
+                    record_stat(kind, stats);
                 }
                 Rewrite::Literal(lit, kind) => {
                     func.expressions[h] = Expression::Literal(lit);
                     resolved[idx] =
                         infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
+                    pure[idx] = true;
                     func.named_expressions.shift_remove(&h);
-                    match kind {
-                        RewriteKind::Bitcast => stats.bitcasts_cancelled += 1,
-                        RewriteKind::ConstFold => stats.constants_folded += 1,
-                        RewriteKind::Identity => stats.identities_simplified += 1,
-                    }
+                    record_stat(kind, stats);
                 }
                 Rewrite::ReplaceExpr(new_expr, kind) => {
                     func.expressions[h] = new_expr;
                     resolved[idx] =
                         infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
+                    pure[idx] = expr_is_transitively_pure(&func.expressions[h], &pure);
                     func.named_expressions.shift_remove(&h);
-                    match kind {
-                        RewriteKind::Bitcast => stats.bitcasts_cancelled += 1,
-                        RewriteKind::ConstFold => stats.constants_folded += 1,
-                        RewriteKind::Identity => stats.identities_simplified += 1,
-                    }
+                    record_stat(kind, stats);
+                }
+                Rewrite::BinaryWithU32Const {
+                    op,
+                    left,
+                    rhs_u32,
+                    vec_size,
+                    kind,
+                } => {
+                    let span = func.expressions.get_span(h);
+                    let lit_h = func
+                        .expressions
+                        .append(Expression::Literal(Literal::U32(rhs_u32)), span);
+                    remap.push(lit_h);
+                    resolved.push(Some(TypeInner::Scalar(Scalar::U32)));
+                    pure.push(true);
+                    inserted_before[idx].push(lit_h);
+
+                    let rhs_h = if let Some(size) = vec_size {
+                        let splat_h = func
+                            .expressions
+                            .append(Expression::Splat { size, value: lit_h }, span);
+                        remap.push(splat_h);
+                        resolved.push(Some(TypeInner::Vector {
+                            size,
+                            scalar: Scalar::U32,
+                        }));
+                        pure.push(true);
+                        inserted_before[idx].push(splat_h);
+                        splat_h
+                    } else {
+                        lit_h
+                    };
+
+                    any_inserted = true;
+                    func.expressions[h] = Expression::Binary {
+                        op,
+                        left,
+                        right: rhs_h,
+                    };
+                    resolved[idx] =
+                        infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
+                    pure[idx] = pure[left.index()];
+                    func.named_expressions.shift_remove(&h);
+                    record_stat(kind, stats);
+                }
+                Rewrite::SplatLiteral { size, lit, kind } => {
+                    let span = func.expressions.get_span(h);
+                    let lit_h = func.expressions.append(Expression::Literal(lit), span);
+                    remap.push(lit_h);
+                    let lit_ty =
+                        infer_single_expr_type(ctx, func, &resolved, &func.expressions[lit_h]);
+                    resolved.push(lit_ty);
+                    pure.push(true);
+                    inserted_before[idx].push(lit_h);
+
+                    any_inserted = true;
+                    func.expressions[h] = Expression::Splat { size, value: lit_h };
+                    resolved[idx] =
+                        infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
+                    pure[idx] = true;
+                    func.named_expressions.shift_remove(&h);
+                    record_stat(kind, stats);
                 }
             }
         }
     }
 
-    if any_remapped {
-        remap_block_exprs(&mut func.body, false, &|h| remap[h.index()]);
+    if any_inserted {
+        // Splice synthesized helper expressions immediately before their parent expression in
+        // strictly topological arena order and splice any emittable helpers (e.g. `Splat`) into
+        // the exact `Statement::Emit` point of their parent.
+        let total_len = func.expressions.len();
+        let mut new_exprs: Arena<Expression> = Arena::new();
+        let mut old_to_new: Vec<Option<Handle<Expression>>> = vec![None; total_len];
+        let mut emitted_helpers_before: Vec<Vec<Handle<Expression>>> = vec![Vec::new(); n];
+
+        for old_idx in 0..n {
+            let old_h = handles[old_idx];
+            for &hh in &inserted_before[old_idx] {
+                let mut cloned = func.expressions[hh].clone();
+                remap_expr_children(&mut cloned, |c| {
+                    let rc = resolve_remap(&remap, c);
+                    old_to_new[rc.index()]
+                        .expect("helper operand must already be mapped in topological order")
+                });
+                let span = func.expressions.get_span(hh);
+                let new_hh = new_exprs.append(cloned, span);
+                old_to_new[hh.index()] = Some(new_hh);
+                if is_emittable_expr(&new_exprs[new_hh]) {
+                    emitted_helpers_before[old_idx].push(new_hh);
+                }
+            }
+
+            let mut cloned = func.expressions[old_h].clone();
+            remap_expr_children(&mut cloned, |c| {
+                let rc = resolve_remap(&remap, c);
+                old_to_new[rc.index()]
+                    .expect("expression operand must already be mapped in topological order")
+            });
+            let span = func.expressions.get_span(old_h);
+            let new_h = new_exprs.append(cloned, span);
+            old_to_new[old_idx] = Some(new_h);
+        }
+
+        let final_map = |h: Handle<Expression>| -> Handle<Expression> {
+            let rc = resolve_remap(&remap, h);
+            old_to_new[rc.index()].expect("live handle must exist in rebuilt arena")
+        };
+
+        splice_block_emits_and_remap(
+            &mut func.body,
+            &old_to_new,
+            &emitted_helpers_before,
+            &new_exprs,
+            &final_map,
+            &mut stats.dead_emits_trimmed,
+        );
+
         for (_, local) in func.local_variables.iter_mut() {
             if let Some(ref mut init_h) = local.init {
-                *init_h = remap[init_h.index()];
+                *init_h = final_map(*init_h);
+            }
+        }
+
+        let old_named = std::mem::take(&mut func.named_expressions);
+        for (old_h, name) in old_named {
+            if let Some(new_h) = old_to_new[old_h.index()]
+                && is_emittable_expr(&new_exprs[new_h])
+            {
+                func.named_expressions.insert(new_h, name);
+            }
+        }
+
+        func.expressions = new_exprs;
+    } else if any_remapped {
+        remap_block_exprs(&mut func.body, false, &|h| resolve_remap(&remap, h));
+        for (_, local) in func.local_variables.iter_mut() {
+            if let Some(ref mut init_h) = local.init {
+                *init_h = resolve_remap(&remap, *init_h);
             }
         }
     }
+}
+
+enum RewriteKind {
+    Bitcast,
+    ConstFold,
+    Identity,
+    StrengthReduce,
+    VectorExtract,
+}
+
+enum Rewrite {
+    Redirect(Handle<Expression>, RewriteKind),
+    Literal(Literal, RewriteKind),
+    ReplaceExpr(Expression, RewriteKind),
+    BinaryWithU32Const {
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        rhs_u32: u32,
+        vec_size: Option<VectorSize>,
+        kind: RewriteKind,
+    },
+    SplatLiteral {
+        size: VectorSize,
+        lit: Literal,
+        kind: RewriteKind,
+    },
+}
+
+#[inline]
+fn expr_is_transitively_pure(expr: &Expression, pure: &[bool]) -> bool {
+    if !is_pure_expr_node(expr) {
+        return false;
+    }
+    let mut all_pure = true;
+    visit_expr_children(expr, |c| {
+        if !pure[c.index()] {
+            all_pure = false;
+        }
+    });
+    all_pure
+}
+
+#[inline]
+fn swizzle_component_index(c: SwizzleComponent) -> u32 {
+    match c {
+        SwizzleComponent::X => 0,
+        SwizzleComponent::Y => 1,
+        SwizzleComponent::Z => 2,
+        SwizzleComponent::W => 3,
+    }
+}
+
+#[inline]
+fn const_uniform_bool(exprs: &Arena<Expression>, h: Handle<Expression>) -> Option<bool> {
+    match exprs[h] {
+        Expression::Literal(Literal::Bool(b)) => Some(b),
+        Expression::Splat { value, .. } => match exprs[value] {
+            Expression::Literal(Literal::Bool(b)) => Some(b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn splice_block_emits_and_remap(
+    block: &mut Block,
+    old_to_new: &[Option<Handle<Expression>>],
+    emitted_helpers_before: &[Vec<Handle<Expression>>],
+    new_exprs: &Arena<Expression>,
+    final_map: &impl Fn(Handle<Expression>) -> Handle<Expression>,
+    dead_emits_trimmed: &mut usize,
+) {
+    let old_block = std::mem::replace(block, Block::new());
+    let mut new_block = Block::with_capacity(old_block.len());
+
+    for (stmt, span) in old_block.span_into_iter() {
+        match stmt {
+            Statement::Emit(range) => {
+                let mut surviving: Vec<Handle<Expression>> = Vec::new();
+                for old_h in range {
+                    if let Some(helpers) = emitted_helpers_before.get(old_h.index()) {
+                        surviving.extend(helpers.iter().copied());
+                    }
+                    if let Some(new_h) = old_to_new[old_h.index()] {
+                        if is_emittable_expr(&new_exprs[new_h]) {
+                            surviving.push(new_h);
+                        } else {
+                            *dead_emits_trimmed += 1;
+                        }
+                    }
+                }
+                let mut i = 0;
+                while i < surviving.len() {
+                    let first = surviving[i];
+                    let mut last = first;
+                    i += 1;
+                    while i < surviving.len() && surviving[i].index() == last.index() + 1 {
+                        last = surviving[i];
+                        i += 1;
+                    }
+                    new_block.push(Statement::Emit(Range::new_from_bounds(first, last)), span);
+                }
+            }
+            Statement::Block(mut inner) => {
+                splice_block_emits_and_remap(
+                    &mut inner,
+                    old_to_new,
+                    emitted_helpers_before,
+                    new_exprs,
+                    final_map,
+                    dead_emits_trimmed,
+                );
+                new_block.push(Statement::Block(inner), span);
+            }
+            Statement::If {
+                condition,
+                mut accept,
+                mut reject,
+            } => {
+                splice_block_emits_and_remap(
+                    &mut accept,
+                    old_to_new,
+                    emitted_helpers_before,
+                    new_exprs,
+                    final_map,
+                    dead_emits_trimmed,
+                );
+                splice_block_emits_and_remap(
+                    &mut reject,
+                    old_to_new,
+                    emitted_helpers_before,
+                    new_exprs,
+                    final_map,
+                    dead_emits_trimmed,
+                );
+                new_block.push(
+                    Statement::If {
+                        condition: final_map(condition),
+                        accept,
+                        reject,
+                    },
+                    span,
+                );
+            }
+            Statement::Switch { selector, cases } => {
+                let new_cases: Vec<SwitchCase> = cases
+                    .into_iter()
+                    .map(|mut c| {
+                        splice_block_emits_and_remap(
+                            &mut c.body,
+                            old_to_new,
+                            emitted_helpers_before,
+                            new_exprs,
+                            final_map,
+                            dead_emits_trimmed,
+                        );
+                        c
+                    })
+                    .collect();
+                new_block.push(
+                    Statement::Switch {
+                        selector: final_map(selector),
+                        cases: new_cases,
+                    },
+                    span,
+                );
+            }
+            Statement::Loop {
+                mut body,
+                mut continuing,
+                break_if,
+            } => {
+                splice_block_emits_and_remap(
+                    &mut body,
+                    old_to_new,
+                    emitted_helpers_before,
+                    new_exprs,
+                    final_map,
+                    dead_emits_trimmed,
+                );
+                splice_block_emits_and_remap(
+                    &mut continuing,
+                    old_to_new,
+                    emitted_helpers_before,
+                    new_exprs,
+                    final_map,
+                    dead_emits_trimmed,
+                );
+                new_block.push(
+                    Statement::Loop {
+                        body,
+                        continuing,
+                        break_if: break_if.map(final_map),
+                    },
+                    span,
+                );
+            }
+            other => {
+                let mut tmp = Block::with_capacity(1);
+                tmp.push(other, span);
+                remap_block_exprs(&mut tmp, true, final_map);
+                if let Some((remapped, remapped_span)) = tmp.span_into_iter().next() {
+                    new_block.push(remapped, remapped_span);
+                }
+            }
+        }
+    }
+
+    *block = new_block;
 }
 
 fn fold_literal_bitcast(lit: Literal, target_kind: ScalarKind) -> Option<Literal> {
@@ -1679,35 +2179,241 @@ fn fold_literal_binary(
 enum IntIdentity {
     Redirect(Handle<Expression>),
     Literal(Literal),
+    ReplaceExpr(Expression),
+    SplatLiteral {
+        size: VectorSize,
+        lit: Literal,
+    },
+    BinaryWithU32Const {
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        rhs_u32: u32,
+    },
 }
 
-fn is_int_zero(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Literal(Literal::U32(0) | Literal::I32(0))
-    )
+fn is_int_zero(exprs: &Arena<Expression>, h: Handle<Expression>) -> bool {
+    match exprs[h] {
+        Expression::Literal(Literal::U32(0) | Literal::I32(0)) => true,
+        Expression::Splat { value, .. } => {
+            matches!(
+                exprs[value],
+                Expression::Literal(Literal::U32(0) | Literal::I32(0))
+            )
+        }
+        _ => false,
+    }
 }
 
-fn is_int_one(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Literal(Literal::U32(1) | Literal::I32(1))
-    )
+fn is_int_one(exprs: &Arena<Expression>, h: Handle<Expression>) -> bool {
+    match exprs[h] {
+        Expression::Literal(Literal::U32(1) | Literal::I32(1)) => true,
+        Expression::Splat { value, .. } => {
+            matches!(
+                exprs[value],
+                Expression::Literal(Literal::U32(1) | Literal::I32(1))
+            )
+        }
+        _ => false,
+    }
 }
 
-fn is_int_all_ones(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Literal(Literal::U32(u32::MAX) | Literal::I32(-1))
-    )
+fn is_int_all_ones(exprs: &Arena<Expression>, h: Handle<Expression>) -> bool {
+    match exprs[h] {
+        Expression::Literal(Literal::U32(u32::MAX) | Literal::I32(-1)) => true,
+        Expression::Splat { value, .. } => {
+            matches!(
+                exprs[value],
+                Expression::Literal(Literal::U32(u32::MAX) | Literal::I32(-1))
+            )
+        }
+        _ => false,
+    }
 }
 
-fn simplify_integer_binary_identity(
+fn is_u32_zero(exprs: &Arena<Expression>, h: Handle<Expression>) -> bool {
+    match exprs[h] {
+        Expression::Literal(Literal::U32(0)) => true,
+        Expression::Splat { value, .. } => {
+            matches!(exprs[value], Expression::Literal(Literal::U32(0)))
+        }
+        _ => false,
+    }
+}
+
+fn make_int_zero_identity(
+    ctx: &ModuleContext<'_>,
+    res_ty: &TypeInner,
+    used_as_divisor: bool,
+) -> Option<IntIdentity> {
+    if used_as_divisor {
+        return None;
+    }
+    match *res_ty {
+        TypeInner::Scalar(Scalar::U32) => Some(IntIdentity::Literal(Literal::U32(0))),
+        TypeInner::Scalar(Scalar::I32) => Some(IntIdentity::Literal(Literal::I32(0))),
+        TypeInner::Vector {
+            size,
+            scalar: scalar @ (Scalar::U32 | Scalar::I32),
+        } => {
+            if let Some((ty_h, _)) = ctx.types.iter().find(|(_, t)| t.inner == *res_ty) {
+                Some(IntIdentity::ReplaceExpr(Expression::ZeroValue(ty_h)))
+            } else {
+                let lit = if scalar == Scalar::U32 {
+                    Literal::U32(0)
+                } else {
+                    Literal::I32(0)
+                };
+                Some(IntIdentity::SplatLiteral { size, lit })
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract a uniform `u32` power-of-two constant `k >= 2` from a scalar literal, `Splat`, or
+/// 1-to-1 uniform vector `Compose`. Strictly `u32` (`ScalarKind::Uint`, width 4); never `i32`!
+fn extract_u32_pow2_const(
+    ctx: &ModuleContext<'_>,
+    func: &Function,
+    h: Handle<Expression>,
+    expected_vec_size: Option<VectorSize>,
+) -> Option<u32> {
+    match &func.expressions[h] {
+        Expression::Literal(Literal::U32(k)) if *k >= 2 && k.is_power_of_two() => Some(*k),
+        Expression::Splat { size, value } if expected_vec_size == Some(*size) => {
+            match func.expressions[*value] {
+                Expression::Literal(Literal::U32(k)) if k >= 2 && k.is_power_of_two() => Some(k),
+                _ => None,
+            }
+        }
+        Expression::Compose { ty, components } => {
+            let vec_size = expected_vec_size?;
+            if ctx.types[*ty].inner
+                != (TypeInner::Vector {
+                    size: vec_size,
+                    scalar: Scalar::U32,
+                })
+                || components.len() != vec_size as usize
+            {
+                return None;
+            }
+            let first_k = match func.expressions[components[0]] {
+                Expression::Literal(Literal::U32(k)) if k >= 2 && k.is_power_of_two() => k,
+                _ => return None,
+            };
+            if components[1..].iter().all(|&c| {
+                matches!(
+                    func.expressions[c],
+                    Expression::Literal(Literal::U32(k)) if k == first_k
+                )
+            }) {
+                Some(first_k)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Unsigned power-of-two strength reduction strictly for `Scalar::U32` scalar or `vecN<u32>`:
+/// * `x / 2^s` -> `x >> s`
+/// * `x % 2^s` -> `x & (2^s - 1)`
+/// * `x * 2^s` and `2^s * x` -> `x << s`
+///
+/// Strictly NEVER applied to `ScalarKind::Sint` (signed `/` truncates toward zero while `>>`
+/// rounds toward `-inf`; signed `%` keeps dividend sign while `&` yields non-negative).
+fn try_strength_reduce_unsigned_pow2(
+    ctx: &ModuleContext<'_>,
     op: BinaryOperator,
     left: Handle<Expression>,
     right: Handle<Expression>,
     result_ty: Option<&TypeInner>,
     resolved: &[Option<TypeInner>],
+    func: &Function,
+) -> Option<Rewrite> {
+    let res_ty = result_ty?;
+    let vec_size = match *res_ty {
+        TypeInner::Scalar(Scalar::U32) => None,
+        TypeInner::Vector {
+            size,
+            scalar: Scalar::U32,
+        } => Some(size),
+        _ => return None,
+    };
+
+    let left_matches_ty = resolved[left.index()].as_ref() == Some(res_ty);
+    let right_matches_ty = resolved[right.index()].as_ref() == Some(res_ty);
+
+    match op {
+        BinaryOperator::Divide => {
+            if !left_matches_ty {
+                return None;
+            }
+            let k = extract_u32_pow2_const(ctx, func, right, vec_size)?;
+            let shift = k.trailing_zeros();
+            (shift < 32).then_some(Rewrite::BinaryWithU32Const {
+                op: BinaryOperator::ShiftRight,
+                left,
+                rhs_u32: shift,
+                vec_size,
+                kind: RewriteKind::StrengthReduce,
+            })
+        }
+        BinaryOperator::Modulo => {
+            if !left_matches_ty {
+                return None;
+            }
+            let k = extract_u32_pow2_const(ctx, func, right, vec_size)?;
+            Some(Rewrite::BinaryWithU32Const {
+                op: BinaryOperator::And,
+                left,
+                rhs_u32: k - 1,
+                vec_size,
+                kind: RewriteKind::StrengthReduce,
+            })
+        }
+        BinaryOperator::Multiply => {
+            if left_matches_ty
+                && let Some(k) = extract_u32_pow2_const(ctx, func, right, vec_size)
+            {
+                let shift = k.trailing_zeros();
+                return (shift < 32).then_some(Rewrite::BinaryWithU32Const {
+                    op: BinaryOperator::ShiftLeft,
+                    left,
+                    rhs_u32: shift,
+                    vec_size,
+                    kind: RewriteKind::StrengthReduce,
+                });
+            }
+            if right_matches_ty
+                && let Some(k) = extract_u32_pow2_const(ctx, func, left, vec_size)
+            {
+                let shift = k.trailing_zeros();
+                return (shift < 32).then_some(Rewrite::BinaryWithU32Const {
+                    op: BinaryOperator::ShiftLeft,
+                    left: right,
+                    rhs_u32: shift,
+                    vec_size,
+                    kind: RewriteKind::StrengthReduce,
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simplify_integer_binary_identity(
+    ctx: &ModuleContext<'_>,
+    op: BinaryOperator,
+    left: Handle<Expression>,
+    right: Handle<Expression>,
+    result_ty: Option<&TypeInner>,
+    resolved: &[Option<TypeInner>],
+    pure: &[bool],
+    used_as_divisor: bool,
     func: &Function,
 ) -> Option<IntIdentity> {
     let res_ty = result_ty?;
@@ -1717,103 +2423,130 @@ fn simplify_integer_binary_identity(
         return None;
     }
 
-    let left_expr = &func.expressions[left];
-    let right_expr = &func.expressions[right];
+    let exprs = &func.expressions;
     let left_matches_ty = resolved[left.index()].as_ref() == Some(res_ty);
     let right_matches_ty = resolved[right.index()].as_ref() == Some(res_ty);
 
     match op {
         BinaryOperator::Add => {
-            if is_int_zero(right_expr) && left_matches_ty {
+            if is_int_zero(exprs, right) && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
             }
-            if is_int_zero(left_expr) && right_matches_ty {
+            if is_int_zero(exprs, left) && right_matches_ty {
                 return Some(IntIdentity::Redirect(right));
             }
         }
         BinaryOperator::Subtract => {
-            if is_int_zero(right_expr) && left_matches_ty {
+            if is_int_zero(exprs, right) && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
+            }
+            // Strictly integer `x - x -> 0` (NEVER float, where `Inf - Inf = NaN` and `NaN - NaN = NaN`!).
+            if left == right && left_matches_ty && pure[left.index()] {
+                return make_int_zero_identity(ctx, res_ty, used_as_divisor);
             }
         }
         BinaryOperator::Multiply => {
-            if is_int_one(right_expr) && left_matches_ty {
+            if is_int_one(exprs, right) && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
             }
-            if is_int_one(left_expr) && right_matches_ty {
+            if is_int_one(exprs, left) && right_matches_ty {
                 return Some(IntIdentity::Redirect(right));
             }
-            if (is_int_zero(right_expr) && is_pure_expr_node(left_expr))
-                || (is_int_zero(left_expr) && is_pure_expr_node(right_expr))
+            if (is_int_zero(exprs, right) && pure[left.index()])
+                || (is_int_zero(exprs, left) && pure[right.index()])
             {
-                match *res_ty {
-                    TypeInner::Scalar(Scalar::U32) => {
-                        return Some(IntIdentity::Literal(Literal::U32(0)));
-                    }
-                    TypeInner::Scalar(Scalar::I32) => {
-                        return Some(IntIdentity::Literal(Literal::I32(0)));
-                    }
-                    _ => {}
-                }
+                return make_int_zero_identity(ctx, res_ty, used_as_divisor);
+            }
+        }
+        BinaryOperator::Divide => {
+            if is_int_one(exprs, right) && left_matches_ty {
+                return Some(IntIdentity::Redirect(left));
+            }
+        }
+        BinaryOperator::Modulo => {
+            if is_int_one(exprs, right) && left_matches_ty && pure[left.index()] {
+                return make_int_zero_identity(ctx, res_ty, used_as_divisor);
             }
         }
         BinaryOperator::InclusiveOr => {
-            if is_int_zero(right_expr) && left_matches_ty {
+            if is_int_zero(exprs, right) && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
             }
-            if is_int_zero(left_expr) && right_matches_ty {
+            if is_int_zero(exprs, left) && right_matches_ty {
                 return Some(IntIdentity::Redirect(right));
             }
             if left == right && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
             }
-        }
-        BinaryOperator::ExclusiveOr => {
-            if is_int_zero(right_expr) && left_matches_ty {
-                return Some(IntIdentity::Redirect(left));
-            }
-            if is_int_zero(left_expr) && right_matches_ty {
-                return Some(IntIdentity::Redirect(right));
-            }
-            if left == right && is_pure_expr_node(left_expr) {
-                match *res_ty {
-                    TypeInner::Scalar(Scalar::U32) => {
-                        return Some(IntIdentity::Literal(Literal::U32(0)));
-                    }
-                    TypeInner::Scalar(Scalar::I32) => {
-                        return Some(IntIdentity::Literal(Literal::I32(0)));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        BinaryOperator::And => {
-            if is_int_all_ones(right_expr) && left_matches_ty {
-                return Some(IntIdentity::Redirect(left));
-            }
-            if is_int_all_ones(left_expr) && right_matches_ty {
-                return Some(IntIdentity::Redirect(right));
-            }
-            if left == right && left_matches_ty {
-                return Some(IntIdentity::Redirect(left));
-            }
-            if (is_int_zero(right_expr) && is_pure_expr_node(left_expr))
-                || (is_int_zero(left_expr) && is_pure_expr_node(right_expr))
+            // Absorbing bitwise-OR with all-ones for pure scalar `u32`/`i32`.
+            if (is_int_all_ones(exprs, right) && pure[left.index()])
+                || (is_int_all_ones(exprs, left) && pure[right.index()])
             {
                 match *res_ty {
                     TypeInner::Scalar(Scalar::U32) => {
-                        return Some(IntIdentity::Literal(Literal::U32(0)));
+                        return Some(IntIdentity::Literal(Literal::U32(u32::MAX)));
                     }
                     TypeInner::Scalar(Scalar::I32) => {
-                        return Some(IntIdentity::Literal(Literal::I32(0)));
+                        return Some(IntIdentity::Literal(Literal::I32(-1)));
                     }
                     _ => {}
                 }
             }
         }
-        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
-            if matches!(right_expr, Expression::Literal(Literal::U32(0))) && left_matches_ty {
+        BinaryOperator::ExclusiveOr => {
+            if is_int_zero(exprs, right) && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
+            }
+            if is_int_zero(exprs, left) && right_matches_ty {
+                return Some(IntIdentity::Redirect(right));
+            }
+            if left == right && left_matches_ty && pure[left.index()] {
+                return make_int_zero_identity(ctx, res_ty, used_as_divisor);
+            }
+        }
+        BinaryOperator::And => {
+            if is_int_all_ones(exprs, right) && left_matches_ty {
+                return Some(IntIdentity::Redirect(left));
+            }
+            if is_int_all_ones(exprs, left) && right_matches_ty {
+                return Some(IntIdentity::Redirect(right));
+            }
+            if left == right && left_matches_ty {
+                return Some(IntIdentity::Redirect(left));
+            }
+            if (is_int_zero(exprs, right) && pure[left.index()])
+                || (is_int_zero(exprs, left) && pure[right.index()])
+            {
+                return make_int_zero_identity(ctx, res_ty, used_as_divisor);
+            }
+        }
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
+            if is_u32_zero(exprs, right) && left_matches_ty {
+                return Some(IntIdentity::Redirect(left));
+            }
+            // Nested constant shift merging strictly on scalar `u32`/`i32` when `a < 32`, `b < 32`,
+            // and `a + b < 32`: `(x << a) << b -> x << (a + b)`, `(x >> a) >> b -> x >> (a + b)`.
+            if matches!(*res_ty, TypeInner::Scalar(Scalar::U32 | Scalar::I32))
+                && let Expression::Literal(Literal::U32(b)) = exprs[right]
+                && b < 32
+                && let Expression::Binary {
+                    op: inner_op,
+                    left: orig,
+                    right: inner_right,
+                } = exprs[left]
+                && inner_op == op
+                && let Expression::Literal(Literal::U32(a)) = exprs[inner_right]
+                && a < 32
+                && let Some(sum) = a.checked_add(b)
+                && sum < 32
+                && resolved[orig.index()].as_ref() == Some(res_ty)
+                && !matches!(exprs[orig], Expression::Constant(_))
+            {
+                return Some(IntIdentity::BinaryWithU32Const {
+                    op,
+                    left: orig,
+                    rhs_u32: sum,
+                });
             }
         }
         _ => {}

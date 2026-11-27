@@ -849,7 +849,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wgsl = validate_and_emit_wgsl(&module);
 
     assert!(
-        stats.constants_folded >= 2,
+        stats.vector_extracts_folded >= 2,
         "expected Splat + Compose AccessIndex to fold, got {stats:?}\nWGSL:\n{wgsl}"
     );
     // `splat_v` and `comp_v` should be completely eliminated; only `flat_v` keeps a vec4 compose.
@@ -1229,6 +1229,8 @@ fn ir_opt_stats_helpers_merge_and_zero_check() {
         bitcasts_cancelled: 3,
         constants_folded: 2,
         identities_simplified: 5,
+        strength_reductions: 10,
+        vector_extracts_folded: 11,
         dead_branches_folded: 8,
         locals_forwarded: 6,
         cse_eliminated: 7,
@@ -1237,7 +1239,7 @@ fn ir_opt_stats_helpers_merge_and_zero_check() {
         dead_emits_trimmed: 4,
     };
     assert!(!b.is_zero());
-    assert_eq!(b.total_changes(), 45);
+    assert_eq!(b.total_changes(), 66);
     a.merge_from(b);
     assert_eq!(a, b);
 }
