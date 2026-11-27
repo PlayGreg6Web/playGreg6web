@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -1275,6 +1276,11 @@ struct NativeExecutor::Impl {
                     ++self->stats.device_lost;
                     ++self->stats.device_lost_events;
                     self->stats.last_device_error = to_string(msg);
+                    self->stats.device_lost_message = to_string(msg);
+                    self->stats.device_lost_reason = reason == wgpu::DeviceLostReason::Unknown           ? "unknown"
+                                                     : reason == wgpu::DeviceLostReason::FailedCreation  ? "failed_creation"
+                                                     : reason == wgpu::DeviceLostReason::CallbackCancelled ? "callback_cancelled"
+                                                                                                          : "other";
                     self->lost = true;
                 },
                 this);
@@ -1971,15 +1977,34 @@ struct NativeExecutor::Impl {
         uint16_t opcode = 0;
         uint16_t flags = 0;
         uint32_t id = 0;
-        std::string key;  // write dedup key ("" for creations)
         std::vector<uint8_t> payload;
         bool live = true;
+        bool content = false;  // a texture write (else a creation)
+    };
+    // A buffer's CPU-written contents: 64 KiB pages, each from its page start to the last byte written in
+    // it (the gap before a first write is zero, as in a fresh buffer). Replayed after the creations.
+    static constexpr uint32_t kJournalPageBytes = 64u << 10;
+    struct JournalBuffer {
+        std::map<uint32_t, std::vector<uint8_t>> pages;
+        uint64_t bytes = 0;
+        uint16_t flags = 0;
+    };
+    // Per resource: how its content is written (the eviction heuristic) and its texture writes.
+    struct JournalRes {
+        uint64_t writes = 0;
+        uint64_t frames = 0;           // distinct frames (presents) with a write
+        uint64_t last_frame = ~0ull;
+        uint64_t content_bytes = 0;    // journaled content (buffer pages / texture writes)
+        bool dropped = false;          // content no longer journaled (budget): comes back empty
+        std::vector<size_t> tex_writes;
     };
     std::vector<JournalEntry> journal;
-    std::unordered_map<std::string, size_t> journal_write_keys;
     std::unordered_map<uint32_t, std::vector<size_t>> journal_by_id;
+    std::unordered_map<uint32_t, JournalBuffer> journal_buffers;
+    std::unordered_map<uint32_t, JournalRes> journal_res;
     size_t journal_dead = 0;
-    bool journal_overflowed = false;
+    bool journal_overflowed = false;  // creations alone outgrew the budget: a recovery is impossible
+    uint64_t journal_budget = 0;
     bool fatal = false;
     bool drop_next_present = false;
     bool replaying = false;
@@ -1994,75 +2019,254 @@ struct NativeExecutor::Impl {
         }
     }
 
+    void journal_init_budget() {
+        journal_budget = options.recovery_journal_bytes;
+        if (options.recovery_journal_auto && journal_budget == ExecutorOptions::kDefaultRecoveryJournalBytes) {
+            const uint64_t avail = playgta6::os::available_physical_bytes();
+            journal_budget = std::clamp<uint64_t>(avail / 8, journal_budget, uint64_t{2} << 30);
+        }
+        stats.journal_budget = journal_budget;
+    }
+
+    static bool tex_box_contains(const GpuWriteTexturePayload& o, const GpuWriteTexturePayload& i) {
+        return o.mip_level == i.mip_level && o.origin_x <= i.origin_x && o.origin_y <= i.origin_y &&
+               o.origin_z <= i.origin_z && uint64_t{o.origin_x} + o.width >= uint64_t{i.origin_x} + i.width &&
+               uint64_t{o.origin_y} + o.height >= uint64_t{i.origin_y} + i.height &&
+               uint64_t{o.origin_z} + o.depth_or_layers >= uint64_t{i.origin_z} + i.depth_or_layers;
+    }
+
+    void journal_kill(size_t idx) {
+        JournalEntry& e = journal[idx];
+        if (!e.live) return;
+        stats.journal_bytes -= e.payload.size();
+        if (!e.content) stats.journal_create_bytes -= e.payload.size();
+        std::vector<uint8_t>().swap(e.payload);
+        e.live = false;
+        ++journal_dead;
+    }
+
+    // Drops the journaled content of `id` (its buffer pages / texture writes); the resource is re-created
+    // empty by a recovery. Later writes to it are not journaled until it is destroyed.
+    void journal_drop_content(uint32_t id, JournalRes& r) {
+        if (r.dropped) return;
+        r.dropped = true;
+        ++stats.journal_evicted_resources;
+        stats.journal_evicted_bytes += r.content_bytes;
+        for (size_t idx : r.tex_writes) journal_kill(idx);
+        r.tex_writes.clear();
+        if (auto it = journal_buffers.find(id); it != journal_buffers.end()) {
+            stats.journal_bytes -= it->second.bytes;
+            journal_buffers.erase(it);
+        }
+        r.content_bytes = 0;
+    }
+
+    // Room for `need` more content bytes: first the content of resources rewritten in many frames (the
+    // title uploads them again after a recovery anyway), largest first. False: no room.
+    bool journal_make_room(uint64_t need, uint32_t keep_id) {
+        if (stats.journal_bytes + need <= journal_budget) return true;
+        std::vector<std::pair<uint64_t, uint32_t>> volatile_res;
+        for (auto& [id, r] : journal_res)
+            if (id != keep_id && !r.dropped && r.frames >= 4 && r.content_bytes) volatile_res.push_back({r.content_bytes, id});
+        std::sort(volatile_res.begin(), volatile_res.end(), std::greater<>());
+        for (const auto& v : volatile_res) {
+            if (stats.journal_bytes + need <= journal_budget) break;
+            journal_drop_content(v.second, journal_res[v.second]);
+        }
+        return stats.journal_bytes + need <= journal_budget;
+    }
+
     void journal_record(const Packet& p) {
-        if (!journaled_opcode(p.opcode) || options.recovery_journal_bytes == 0 || p.payload_bytes < 4 || !p.payload) return;
+        if (!journaled_opcode(p.opcode) || journal_budget == 0 || p.payload_bytes < 4 || !p.payload) return;
         uint32_t id;
         std::memcpy(&id, p.payload, 4);
-        std::string key;
-        if (p.opcode == 4 && p.payload_bytes >= 16) key = std::string("b") + std::string(reinterpret_cast<const char*>(p.payload), 12);
-        else if (p.opcode == 13 && p.payload_bytes >= 48) key = std::string("t") + std::string(reinterpret_cast<const char*>(p.payload), 44);
-        if (!key.empty()) {
-            auto it = journal_write_keys.find(key);
-            if (it != journal_write_keys.end() && journal[it->second].live) {
-                JournalEntry& e = journal[it->second];
-                const uint64_t after = stats.journal_bytes - e.payload.size() + p.payload_bytes;
-                if (after > options.recovery_journal_bytes) {
+        const bool buf_write = p.opcode == static_cast<uint16_t>(GpuOpcode::WriteBuffer);
+        const bool tex_write = p.opcode == static_cast<uint16_t>(GpuOpcode::WriteTexture);
+        if (buf_write || tex_write) {
+            if (buf_write ? !buffers.count(id) : !textures.count(id)) return;  // a write the executor ignores too
+            JournalRes& r = journal_res[id];
+            ++r.writes;
+            if (r.last_frame != stats.present_packets) {
+                r.last_frame = stats.present_packets;
+                ++r.frames;
+            }
+            if (r.dropped) return;
+            if (buf_write) {
+                if (p.payload_bytes < sizeof(GpuWriteBufferPayload)) return;
+                GpuWriteBufferPayload w{};
+                std::memcpy(&w, p.payload, sizeof(w));
+                const uint64_t len = std::min<uint64_t>(w.data_len, p.payload_bytes - sizeof(w));
+                auto bit = buffers.find(id);
+                if (len == 0 || bit == buffers.end() || uint64_t{w.dst_offset} + len > bit->second.size) return;
+                const uint8_t* src = p.payload + sizeof(w);
+                JournalBuffer& jb = journal_buffers[id];
+                // Growth first (budget), then the copy.
+                uint64_t grow = 0;
+                for (uint64_t off = w.dst_offset, end = w.dst_offset + len; off < end;) {
+                    const uint32_t pi = static_cast<uint32_t>(off / kJournalPageBytes);
+                    const uint64_t pstart = uint64_t{pi} * kJournalPageBytes;
+                    const uint64_t pend = std::min<uint64_t>(end, pstart + kJournalPageBytes);
+                    auto pit = jb.pages.find(pi);
+                    const uint64_t have = pit == jb.pages.end() ? 0 : pit->second.size();
+                    if (pend - pstart > have) grow += pend - pstart - have;
+                    off = pend;
+                }
+                if (grow && !journal_make_room(grow, id)) {
                     ++stats.journal_overflows;
-                    journal_overflowed = true;
+                    journal_drop_content(id, r);
                     return;
                 }
-                stats.journal_bytes = after;
-                e.payload.assign(p.payload, p.payload + p.payload_bytes);
-                e.flags = p.flags;
+                for (uint64_t off = w.dst_offset, end = w.dst_offset + len; off < end;) {
+                    const uint32_t pi = static_cast<uint32_t>(off / kJournalPageBytes);
+                    const uint64_t pstart = uint64_t{pi} * kJournalPageBytes;
+                    const uint64_t pend = std::min<uint64_t>(end, pstart + kJournalPageBytes);
+                    std::vector<uint8_t>& pg = jb.pages[pi];
+                    if (pg.size() < pend - pstart) pg.resize(static_cast<size_t>(pend - pstart), 0);
+                    std::memcpy(pg.data() + (off - pstart), src + (off - w.dst_offset), static_cast<size_t>(pend - off));
+                    off = pend;
+                }
+                jb.bytes += grow;
+                jb.flags = p.flags;
+                r.content_bytes += grow;
+                stats.journal_bytes += grow;
                 return;
             }
-        }
-        if (stats.journal_bytes + p.payload_bytes > options.recovery_journal_bytes) {
-            ++stats.journal_overflows;
-            journal_overflowed = true;
+            if (p.payload_bytes < sizeof(GpuWriteTexturePayload)) return;
+            GpuWriteTexturePayload box{};
+            std::memcpy(&box, p.payload, sizeof(box));
+            uint64_t freed = 0;
+            for (size_t idx : r.tex_writes) {
+                const JournalEntry& old = journal[idx];
+                if (!old.live) continue;
+                GpuWriteTexturePayload ob{};
+                std::memcpy(&ob, old.payload.data(), sizeof(ob));
+                if (tex_box_contains(box, ob)) freed += old.payload.size();
+            }
+            if (stats.journal_bytes - freed + p.payload_bytes > journal_budget &&
+                !journal_make_room(p.payload_bytes > freed ? p.payload_bytes - freed : 0, id)) {
+                ++stats.journal_overflows;
+                journal_drop_content(id, r);
+                return;
+            }
+            std::vector<size_t> kept;
+            for (size_t idx : r.tex_writes) {
+                JournalEntry& old = journal[idx];
+                if (!old.live) continue;
+                GpuWriteTexturePayload ob{};
+                std::memcpy(&ob, old.payload.data(), sizeof(ob));
+                if (tex_box_contains(box, ob)) {
+                    r.content_bytes -= old.payload.size();
+                    journal_kill(idx);
+                } else {
+                    kept.push_back(idx);
+                }
+            }
+            r.tex_writes = std::move(kept);
+            JournalEntry e;
+            e.opcode = p.opcode;
+            e.flags = p.flags;
+            e.id = id;
+            e.content = true;
+            e.payload.assign(p.payload, p.payload + p.payload_bytes);
+            stats.journal_bytes += p.payload_bytes;
+            r.content_bytes += p.payload_bytes;
+            r.tex_writes.push_back(journal.size());
+            journal_by_id[id].push_back(journal.size());
+            journal.push_back(std::move(e));
+            if (journal_dead > 4096 && journal_dead * 2 > journal.size()) journal_compact();
             return;
+        }
+        // A creation: always kept while it fits (content makes room for it).
+        if (!journal_make_room(p.payload_bytes, 0)) {
+            // Content of the other resources first; creations that alone outgrow the budget end recovery.
+            std::vector<uint32_t> ids;
+            for (auto& [rid, r] : journal_res)
+                if (!r.dropped && r.content_bytes) ids.push_back(rid);
+            for (uint32_t rid : ids) {
+                if (stats.journal_bytes + p.payload_bytes <= journal_budget) break;
+                journal_drop_content(rid, journal_res[rid]);
+            }
+            if (stats.journal_bytes + p.payload_bytes > journal_budget) {
+                ++stats.journal_overflows;
+                journal_overflowed = true;
+                return;
+            }
         }
         JournalEntry e;
         e.opcode = p.opcode;
         e.flags = p.flags;
         e.id = id;
-        e.key = key;
         e.payload.assign(p.payload, p.payload + p.payload_bytes);
         stats.journal_bytes += p.payload_bytes;
-        if (!key.empty()) journal_write_keys[key] = journal.size();
+        stats.journal_create_bytes += p.payload_bytes;
         journal_by_id[id].push_back(journal.size());
         journal.push_back(std::move(e));
     }
 
     void journal_prune(uint32_t id) {
-        auto it = journal_by_id.find(id);
-        if (it == journal_by_id.end()) return;
-        for (size_t idx : it->second) {
-            JournalEntry& e = journal[idx];
-            if (!e.live) continue;
-            stats.journal_bytes -= e.payload.size();
-            if (!e.key.empty()) journal_write_keys.erase(e.key);
-            std::vector<uint8_t>().swap(e.payload);
-            e.live = false;
-            ++journal_dead;
+        if (auto it = journal_by_id.find(id); it != journal_by_id.end()) {
+            for (size_t idx : it->second) journal_kill(idx);
+            journal_by_id.erase(it);
         }
-        journal_by_id.erase(it);
+        if (auto it = journal_buffers.find(id); it != journal_buffers.end()) {
+            stats.journal_bytes -= it->second.bytes;
+            journal_buffers.erase(it);
+        }
+        journal_res.erase(id);
         if (journal_dead > 4096 && journal_dead * 2 > journal.size()) journal_compact();
     }
 
     void journal_compact() {
         std::vector<JournalEntry> kept;
         kept.reserve(journal.size() - journal_dead);
-        journal_write_keys.clear();
         journal_by_id.clear();
+        for (auto& kv : journal_res) kv.second.tex_writes.clear();
         for (JournalEntry& e : journal) {
             if (!e.live) continue;
-            if (!e.key.empty()) journal_write_keys[e.key] = kept.size();
             journal_by_id[e.id].push_back(kept.size());
+            if (e.content) journal_res[e.id].tex_writes.push_back(kept.size());
             kept.push_back(std::move(e));
         }
         journal = std::move(kept);
         journal_dead = 0;
+    }
+
+    // Re-dispatches the journal onto the new device: the creations and texture writes in order, then
+    // every buffer's pages. False: the device was lost again.
+    bool journal_replay() {
+        for (const JournalEntry& e : journal) {
+            if (!e.live) continue;
+            Packet p;
+            p.opcode = e.opcode;
+            p.flags = e.flags;
+            p.payload_bytes = static_cast<uint32_t>(e.payload.size());
+            p.payload = e.payload.data();
+            dispatch_op(p);
+            ++stats.recovery_replayed_packets;
+            if (lost) return false;
+        }
+        std::vector<uint8_t> pkt;
+        for (const auto& [id, jb] : journal_buffers) {
+            for (const auto& [pi, pg] : jb.pages) {
+                if (pg.empty()) continue;
+                GpuWriteBufferPayload w{};
+                w.id = id;
+                w.dst_offset = pi * kJournalPageBytes;
+                w.data_len = static_cast<uint32_t>(pg.size());
+                pkt.resize(sizeof(w) + pg.size());
+                std::memcpy(pkt.data(), &w, sizeof(w));
+                std::memcpy(pkt.data() + sizeof(w), pg.data(), pg.size());
+                Packet p;
+                p.opcode = static_cast<uint16_t>(GpuOpcode::WriteBuffer);
+                p.flags = jb.flags;
+                p.payload_bytes = static_cast<uint32_t>(pkt.size());
+                p.payload = pkt.data();
+                dispatch_op(p);
+                ++stats.recovery_replayed_packets;
+                if (lost) return false;
+            }
+        }
+        return true;
     }
 
     // Drops every object of the lost device (the executor's own state; the journal stays).
@@ -2137,6 +2341,9 @@ struct NativeExecutor::Impl {
         occ_pool = nullptr;
         occ_pool_resolve = nullptr;
         occ_fold_pipeline = nullptr;
+        inflight.clear();
+        ++submit_epoch;  // completions of the old device's submits are ignored
+        submits_done = submit_seq = 0;
         if (surface && surface_configured) surface.Unconfigure();
         surface_configured = false;
         if (device) device.Destroy();
@@ -2161,13 +2368,21 @@ struct NativeExecutor::Impl {
         lost = true;
         ++stats.recovery_failures;
         stats.faulted = true;
+        note_lost_inflight();
         stats.fault_record = "{\"kind\": \"gpu_device_lost\", \"reason\": \"" + json_escape(why) + "\", \"device_error\": \"" +
-                             json_escape(stats.last_device_error) + "\", \"device_lost_events\": " +
+                             json_escape(stats.last_device_error) + "\", \"lost_reason\": \"" +
+                             json_escape(stats.device_lost_reason) + "\", \"lost_message\": \"" +
+                             json_escape(stats.device_lost_message) + "\", \"inflight\": " +
+                             (stats.device_lost_inflight.empty() ? std::string("[]") : stats.device_lost_inflight) +
+                             ", \"journal_bytes\": " + std::to_string(stats.journal_bytes) +
+                             ", \"journal_budget\": " + std::to_string(journal_budget) + ", \"device_lost_events\": " +
                              std::to_string(stats.device_lost_events) + ", \"recoveries\": " + std::to_string(stats.recoveries) +
                              ", \"frames_submitted\": " + std::to_string(stats.frames_submitted) +
                              ", \"packets\": " + std::to_string(stats.packets) + ", \"adapter\": \"" +
                              json_escape(adapter.description) + "\", \"backend\": \"" + json_escape(adapter.backend) + "\"}";
-        std::fprintf(stderr, "[native_exec] fatal: GPU device lost and not recoverable: %s\n", why.c_str());
+        std::fprintf(stderr, "[native_exec] fatal: GPU device lost and not recoverable: %s (lost: %s: %s; in flight: %s)\n",
+                     why.c_str(), stats.device_lost_reason.c_str(), stats.device_lost_message.c_str(),
+                     stats.device_lost_inflight.c_str());
         return false;
     }
 
@@ -2186,11 +2401,14 @@ struct NativeExecutor::Impl {
 
     bool recover() {
         const uint64_t t0 = now_ns();
-        if (options.recovery_journal_bytes == 0) return fail_fatal("the resource journal is disabled (recovery_journal_bytes = 0)");
+        note_lost_inflight();
+        if (journal_budget == 0) return fail_fatal("the resource journal is disabled (recovery_journal_bytes = 0)");
         if (journal_overflowed)
-            return fail_fatal("the resource journal outgrew its budget (" + std::to_string(options.recovery_journal_bytes) +
+            return fail_fatal("the resource creations outgrew the journal budget (" + std::to_string(journal_budget) +
                               " bytes): resources cannot be rebuilt");
-        std::fprintf(stderr, "[native_exec] GPU device lost (%s): recovering\n", stats.last_device_error.c_str());
+        std::fprintf(stderr, "[native_exec] GPU device lost (%s: %s): recovering; in flight: %s\n",
+                     stats.device_lost_reason.c_str(), stats.device_lost_message.c_str(),
+                     stats.device_lost_inflight.c_str());
         // The frame being built is gone; its read-backs complete as failed so no fence stays held.
         const bool partial_frame = !pass_cmds.empty() || early_flushed;
         fail_dropped_readbacks();
@@ -2213,17 +2431,7 @@ struct NativeExecutor::Impl {
             if (!features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
             const uint64_t errors_before = stats.packet_errors;
             replaying = true;
-            for (const JournalEntry& e : journal) {
-                if (!e.live) continue;
-                Packet p;
-                p.opcode = e.opcode;
-                p.flags = e.flags;
-                p.payload_bytes = static_cast<uint32_t>(e.payload.size());
-                p.payload = e.payload.data();
-                dispatch_op(p);
-                ++stats.recovery_replayed_packets;
-                if (lost) break;
-            }
+            journal_replay();
             replaying = false;
             stats.recovery_replay_errors += stats.packet_errors - errors_before;
             if (lost) {
@@ -2238,13 +2446,109 @@ struct NativeExecutor::Impl {
             if (b.second.usage & 0x0080u) ++stats.recovery_gpu_resources_reset;  // Storage
         for (const auto& t : textures)
             if (t.second.usage & 0x0018u) ++stats.recovery_gpu_resources_reset;  // StorageBinding | RenderAttachment
+        uint64_t contents_lost = 0;
+        for (const auto& [id, r] : journal_res)
+            if (r.dropped && (buffers.count(id) || textures.count(id))) ++contents_lost;
+        stats.recovery_contents_lost += contents_lost;
         if (partial_frame) drop_next_present = true;
         ++stats.recoveries;
         stats.recovery_ns_total += now_ns() - t0;
-        std::fprintf(stderr, "[native_exec] device recovered in %llu ms (%llu packet(s) replayed)\n",
+        std::fprintf(stderr, "[native_exec] device recovered in %llu ms (%llu packet(s) replayed, %llu resource(s) without their content)\n",
                      static_cast<unsigned long long>((now_ns() - t0) / 1000000ull),
-                     static_cast<unsigned long long>(stats.recovery_replayed_packets - replayed_before));
+                     static_cast<unsigned long long>(stats.recovery_replayed_packets - replayed_before),
+                     static_cast<unsigned long long>(contents_lost));
         return true;
+    }
+
+    // ---- in-flight submits (device loss diagnostics) ----
+    //
+    // Every frame / read-back submit is summarized (work counts since the previous one) and watched with
+    // OnSubmittedWorkDone; completions arrive in order. A device loss reports the submits still running.
+    struct InflightSubmit {
+        uint64_t seq = 0, t_ns = 0, frame = 0, command_buffers = 0;
+        uint64_t draws = 0, dispatches = 0, indirect = 0, snapshot_bytes = 0, max_draw_work = 0, max_groups = 0;
+    };
+    std::deque<InflightSubmit> inflight;
+    uint64_t submit_seq = 0, submits_done = 0, submit_epoch = 0;
+    uint64_t sub_draws0 = 0, sub_dispatches0 = 0, sub_snap0 = 0;
+    uint64_t sub_indirect = 0, sub_max_draw_work = 0, sub_max_groups = 0;
+
+    // A direct draw's vertex (index) x instance count above kMaxDrawWork: the instances are cut so the draw
+    // stays within it (a garbage count would keep the GPU busy for seconds: a TDR).
+    static constexpr uint64_t kMaxDrawWork = uint64_t{1} << 26;
+    uint32_t clamp_draw_instances(uint32_t per_instance, uint32_t instances) {
+        const uint64_t work = uint64_t{per_instance} * instances;
+        sub_max_draw_work = std::max(sub_max_draw_work, work);
+        if (work <= kMaxDrawWork) return instances;
+        ++stats.draws_clamped;
+        return static_cast<uint32_t>(std::max<uint64_t>(1, kMaxDrawWork / std::max<uint32_t>(per_instance, 1)));
+    }
+
+    void track_submit(size_t command_buffers) {
+        InflightSubmit f;
+        f.seq = submit_seq++;
+        f.t_ns = now_ns();
+        f.frame = stats.frames_submitted;
+        f.command_buffers = command_buffers;
+        f.draws = stats.draws - sub_draws0;
+        f.dispatches = stats.dispatches - sub_dispatches0;
+        f.snapshot_bytes = stats.usage_snapshot_bytes - sub_snap0;
+        f.indirect = sub_indirect;
+        f.max_draw_work = sub_max_draw_work;
+        f.max_groups = sub_max_groups;
+        sub_draws0 = stats.draws;
+        sub_dispatches0 = stats.dispatches;
+        sub_snap0 = stats.usage_snapshot_bytes;
+        sub_indirect = sub_max_draw_work = sub_max_groups = 0;
+        if (inflight.size() >= 64) inflight.pop_front();
+        inflight.push_back(f);
+        ++stats.submits_tracked;
+        struct Done {
+            Impl* self;
+            uint64_t epoch;
+        };
+        queue.OnSubmittedWorkDone(
+            wgpu::CallbackMode::AllowProcessEvents,
+            [](wgpu::QueueWorkDoneStatus st, wgpu::StringView, Done* d) {
+                if (st == wgpu::QueueWorkDoneStatus::Success && d->epoch == d->self->submit_epoch) d->self->submit_done();
+                delete d;
+            },
+            new Done{this, submit_epoch});
+    }
+
+    void submit_done() {
+        const uint64_t seq = submits_done++;
+        const uint64_t t = now_ns();
+        while (!inflight.empty() && inflight.front().seq <= seq) {
+            if (inflight.front().seq == seq) {
+                const uint64_t dt = t - inflight.front().t_ns;
+                if (dt > stats.submit_gpu_max_ns) {
+                    stats.submit_gpu_max_ns = dt;
+                    stats.submit_gpu_max_frame = inflight.front().frame;
+                }
+            }
+            inflight.pop_front();
+        }
+    }
+
+    // The submits the GPU had not finished (JSON, oldest first) into stats.device_lost_inflight; kept when
+    // nothing is in flight any more (a second call for the same loss).
+    void note_lost_inflight() {
+        if (inflight.empty()) return;
+        const uint64_t t = now_ns();
+        std::string o = "[";
+        for (const InflightSubmit& f : inflight) {
+            if (o.size() > 1) o += ", ";
+            o += "{\"age_ms\": " + std::to_string((t - f.t_ns) / 1000000ull) + ", \"frame\": " + std::to_string(f.frame) +
+                 ", \"command_buffers\": " + std::to_string(f.command_buffers) + ", \"draws\": " + std::to_string(f.draws) +
+                 ", \"dispatches\": " + std::to_string(f.dispatches) + ", \"indirect\": " + std::to_string(f.indirect) +
+                 ", \"snapshot_bytes\": " + std::to_string(f.snapshot_bytes) +
+                 ", \"max_draw_work\": " + std::to_string(f.max_draw_work) +
+                 ", \"max_groups\": " + std::to_string(f.max_groups) + "}";
+        }
+        o += "]";
+        stats.device_lost_inflight = o;
+        inflight.clear();
     }
 
     // ---- packets ----
@@ -6127,6 +6431,7 @@ struct NativeExecutor::Impl {
             done.push_back(enc.Finish());
             for (wgpu::CommandBuffer& cb : done) s.queue.Submit(1, &cb);
             s.stats.command_buffers += done.size();
+            s.track_submit(done.size());
             done.clear();
         }
 
@@ -6522,7 +6827,8 @@ struct NativeExecutor::Impl {
             if (draw_allowed(e)) {
                 flush_binds(e);
                 occ_before_draw(e);
-                e.rpass.Draw(d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
+                e.rpass.Draw(d->vertex_count, clamp_draw_instances(d->vertex_count, d->instance_count), d->first_vertex,
+                             d->first_instance);
                 ++stats.draws;
             }
         } else if (const auto* di = std::get_if<DrawIndexedCmd>(&cmd)) {
@@ -6532,8 +6838,8 @@ struct NativeExecutor::Impl {
             if (draw_allowed(e)) {
                 flush_binds(e);
                 occ_before_draw(e);
-                e.rpass.DrawIndexed(di->index_count, di->instance_count, di->first_index, di->base_vertex,
-                                    di->first_instance);
+                e.rpass.DrawIndexed(di->index_count, clamp_draw_instances(di->index_count, di->instance_count),
+                                    di->first_index, di->base_vertex, di->first_instance);
                 ++stats.draws;
             }
         } else if (const auto* in = std::get_if<IndirectCmd>(&cmd)) {
@@ -6561,6 +6867,7 @@ struct NativeExecutor::Impl {
                 resolve_buffer_aliases(e);
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
+                ++sub_indirect;
                 alias_post_dispatch(e);
             } else if (draw_allowed(e)) {
                 flush_binds(e);
@@ -6568,6 +6875,7 @@ struct NativeExecutor::Impl {
                 if (in->kind == 1) e.rpass.DrawIndexedIndirect(it->second.buffer, in->offset);
                 else e.rpass.DrawIndirect(it->second.buffer, in->offset);
                 ++stats.draws;
+                ++sub_indirect;
             }
         } else if (const auto* sc = std::get_if<SetComputePipelineCmd>(&cmd)) {
             if (auto dit = compute_pipelines.find(sc->id); dit != compute_pipelines.end()) settle_budgeted(dit->second);
@@ -6634,6 +6942,7 @@ struct NativeExecutor::Impl {
             resolve_buffer_aliases(e);
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
+            sub_max_groups = std::max<uint64_t>(sub_max_groups, uint64_t{x} * y * z);
             alias_post_dispatch(e);
         } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {
             if (!e.rpass) return;
@@ -8924,6 +9233,7 @@ std::unique_ptr<NativeExecutor> NativeExecutor::create(const ExecutorOptions& op
     if (!error) error = &local_error;
     auto impl = std::make_unique<Impl>();
     impl->options = options;
+    impl->journal_init_budget();
     {
         // Env overrides for diagnosis (PG6_PIPELINE_WAIT_MS / PG6_PIPELINE_WAIT_FULLSCREEN_MS: ms, "inf", "0").
         uint64_t fr = impl->options.pipeline_wait_frame_ns, fs = impl->options.pipeline_wait_fullscreen_ns;
@@ -9159,6 +9469,20 @@ std::string NativeExecutor::stats_json() const {
     num("recovery_gpu_resources_reset", st.recovery_gpu_resources_reset);
     num("journal_bytes", st.journal_bytes);
     num("journal_overflows", st.journal_overflows);
+    num("journal_create_bytes", st.journal_create_bytes);
+    num("journal_budget", st.journal_budget);
+    num("journal_evicted_resources", st.journal_evicted_resources);
+    num("journal_evicted_bytes", st.journal_evicted_bytes);
+    num("recovery_contents_lost", st.recovery_contents_lost);
+    num("submits_tracked", st.submits_tracked);
+    num("submit_gpu_max_ms", st.submit_gpu_max_ns / 1000000ull);
+    num("submit_gpu_max_frame", st.submit_gpu_max_frame);
+    num("draws_clamped", st.draws_clamped);
+    if (!st.device_lost_reason.empty()) {
+        j += "\"device_lost_reason\": \"" + Impl::json_escape(st.device_lost_reason) + "\", ";
+        j += "\"device_lost_message\": \"" + Impl::json_escape(st.device_lost_message) + "\", ";
+        j += "\"device_lost_inflight\": " + (st.device_lost_inflight.empty() ? std::string("[]") : st.device_lost_inflight) + ", ";
+    }
     if (st.faulted) j += "\"fault_record\": " + st.fault_record + ", ";
     num("render_pass_missing_texture", st.render_pass_missing_texture);
     num("render_pass_dropped_colors", st.render_pass_dropped_colors);

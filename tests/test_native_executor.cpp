@@ -3559,20 +3559,196 @@ void test_device_loss() {
     CHECK(js.find("simulated gpu removal") != std::string::npos);
     CHECK(ex2->stats().dropped_while_lost >= 1);
 
-    // A journal over its budget cannot rebuild either.
+    // Content over the budget is dropped, not fatal: the buffer comes back without it (counted).
     ExecutorOptions small = opts;
     small.recovery_journal_bytes = 64;
     auto ex3 = NativeExecutor::create(small, &status, &error);
     CHECK(ex3 != nullptr);
     if (!ex3) return;
+    CHECK(ex3->stats().journal_budget == 64);
     gpu::CommandEncoder big;
-    big.create_buffer(1, GpuBufferUsage::CopyDst, 256);
+    big.create_buffer(1, GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc, 256);
     std::vector<uint8_t> blob(200, 9);
     big.write_buffer(1, 0, blob.data(), 200);
     run(*ex3, big);
     CHECK(ex3->stats().journal_overflows >= 1);
+    CHECK(ex3->stats().journal_evicted_resources == 1);
     ex3->debug_force_device_lost("reset");
-    CHECK(run(*ex3, red) == 0 && ex3->faulted());
+    CHECK(run(*ex3, red) == 1 && !ex3->faulted());
+    CHECK(ex3->stats().recoveries == 1 && ex3->stats().recovery_contents_lost == 1);
+    CHECK(ex3->read_buffer(1, 0, 8, &got, &err) && got == std::vector<uint8_t>(8, 0));
+
+    // Creations that alone outgrow the budget cannot rebuild: the clean end with a fault record.
+    auto ex4 = NativeExecutor::create(small, &status, &error);
+    CHECK(ex4 != nullptr);
+    if (!ex4) return;
+    gpu::CommandEncoder shader;
+    shader.create_shader_module(5, GpuShaderStage::Compute, kCompute);
+    run(*ex4, shader);
+    CHECK(ex4->stats().journal_overflows >= 1);
+    ex4->debug_force_device_lost("reset");
+    CHECK(run(*ex4, red) == 0 && ex4->faulted());
+    CHECK(ex4->stats_json().find("creations outgrew") != std::string::npos);
+}
+
+// The journal folds buffer writes into one image per buffer and drops texture writes a later write covers;
+// over the budget the content of resources rewritten in many frames goes first.
+void test_device_loss_journal() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.recovery_journal_bytes = 4096;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    CHECK(ex != nullptr);
+    if (!ex) return;
+    const auto present = [&] {
+        gpu::CommandEncoder f;
+        f.begin_frame();
+        f.clear_color(0.f, 0.f, 1.f, 1.f);
+        f.present();
+        return run(*ex, f);
+    };
+    gpu::CommandEncoder setup;
+    setup.create_buffer(31, GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc, 64);
+    setup.create_buffer(32, GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc, 2048);
+    setup.create_buffer(33, GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc, 3072);
+    setup.create_texture(34, 4, 4, 1, 1, GpuTextureFormat::Rgba8Unorm,
+                         GpuTextureUsage::CopySrc | GpuTextureUsage::CopyDst | GpuTextureUsage::TextureBinding);
+    run(*ex, setup);
+    const uint64_t creations = ex->stats().journal_bytes;
+    CHECK(creations == ex->stats().journal_create_bytes);
+    // Overlapping rewrites of buffer 31: the journal holds its 48 written bytes once.
+    std::vector<uint8_t> want(64, 0);
+    gpu::CommandEncoder w;
+    for (int round = 0; round < 50; ++round) {
+        std::vector<uint8_t> d(32);
+        for (size_t i = 0; i < d.size(); ++i) d[i] = static_cast<uint8_t>(round * 3 + i);
+        const uint32_t off = (round % 2) ? 16u : 0u;
+        w.write_buffer(31, off, d.data(), 32);
+        std::memcpy(want.data() + off, d.data(), 32);
+    }
+    // Texture 34: a full write, a sub-box, a full write again (the first two are dropped), then a sub-box.
+    std::vector<uint8_t> tex(64);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < tex.size(); ++i) tex[i] = static_cast<uint8_t>(i + pass * 100);
+        w.write_texture(34, 0, 0, 0, 0, 4, 4, 1, 16, 4, tex.data(), 64);
+        const uint8_t sub[16] = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+        w.write_texture(34, 0, 1, 1, 0, 2, 2, 1, 8, 2, sub, 16);
+    }
+    run(*ex, w);
+    CHECK(ex->stats().journal_bytes - creations == 48 + (48 + 64) + (48 + 16));
+    for (uint32_t y = 1; y < 3; ++y)
+        for (uint32_t x = 1; x < 3; ++x)
+            for (uint32_t c = 0; c < 4; ++c) tex[(y * 4 + x) * 4 + c] = 7;
+    // Buffer 32 is rewritten in 5 frames (volatile); buffer 33's one write needs room: 32 goes.
+    std::vector<uint8_t> vol(2048, 5);
+    for (int f = 0; f < 5; ++f) {
+        gpu::CommandEncoder vw;
+        vw.write_buffer(32, 0, vol.data(), 2048);
+        run(*ex, vw);
+        present();
+    }
+    std::vector<uint8_t> stat(3072);
+    for (size_t i = 0; i < stat.size(); ++i) stat[i] = static_cast<uint8_t>(i * 13);
+    gpu::CommandEncoder sw;
+    sw.write_buffer(33, 0, stat.data(), 3072);
+    run(*ex, sw);
+    CHECK(ex->stats().journal_evicted_resources == 1);
+    CHECK(ex->stats().journal_bytes <= 4096);
+
+    ex->debug_force_device_lost("simulated TDR");
+    CHECK(ex->stats().device_lost_reason == "unknown");
+    CHECK(ex->stats().device_lost_message.find("simulated TDR") != std::string::npos);
+    CHECK(present() == 1);
+    CHECK(ex->stats().recoveries == 1 && !ex->faulted());
+    CHECK(ex->stats().recovery_contents_lost == 1);
+    std::vector<uint8_t> got;
+    std::string err;
+    CHECK(ex->read_buffer(31, 0, 64, &got, &err) && got == want);
+    CHECK(ex->read_buffer(33, 0, 3072, &got, &err) && got == stat);
+    CHECK(ex->read_buffer(32, 0, 16, &got, &err) && got == std::vector<uint8_t>(16, 0));
+    uint32_t tw = 0, th = 0;
+    CHECK(ex->read_texture(34, 0, &got, &tw, &th, &err) && got == tex);
+    const std::string js = ex->stats_json();
+    CHECK(js.find("\"device_lost_reason\": \"unknown\"") != std::string::npos);
+    CHECK(js.find("\"recovery_contents_lost\": 1") != std::string::npos);
+    CHECK(ex->stats().submits_tracked > 0);
+}
+
+// The ExecuteIndirect clamp pass (bridge::indirect_clamp_wgsl) on the GPU: garbage draw / dispatch records
+// are cut to the work limits (a TDR guard), sane ones pass unchanged.
+void test_indirect_clamp_work(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    constexpr uint32_t kParams = 420, kSrc = 421, kCnt = 422, kDst = 423, kModule = 424, kBgl = 425, kPl = 426,
+                       kPipe = 427, kGroup = 428;
+    gpu::CommandEncoder setup;
+    setup.create_buffer(kParams, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 32);
+    setup.create_buffer(kSrc, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 64);
+    setup.create_buffer(kCnt, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 16);
+    setup.create_buffer(kDst, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 64);
+    setup.create_shader_module(kModule, GpuShaderStage::Compute, bridge::indirect_clamp_wgsl());
+    create_layouts(setup, kBgl, kPl,
+                   {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                 static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                    layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                 static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                    layout_entry(2, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                 static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                    layout_entry(3, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                 static_cast<uint8_t>(GpuBufferBindingType::Storage))});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = kPipe;
+    cp.cs_module_id = kModule;
+    cp.pipeline_layout_id = kPl;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, kGroup, kBgl,
+                      {bg_entry(0, GpuBindResourceType::Buffer, kParams), bg_entry(1, GpuBindResourceType::Buffer, kSrc),
+                       bg_entry(2, GpuBindResourceType::Buffer, kCnt), bg_entry(3, GpuBindResourceType::Buffer, kDst)});
+    run(ex, setup);
+    const auto clamp = [&](uint32_t kind, uint32_t stride, uint32_t count, uint32_t index_limit,
+                           const std::vector<uint32_t>& records) {
+        const uint32_t params[8] = {0, stride, count, 0, 0, kind, index_limit, 65535};
+        std::vector<uint32_t> src(16, 0);
+        std::copy(records.begin(), records.end(), src.begin());
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        frame.write_buffer(kParams, 0, params, sizeof params);
+        frame.write_buffer(kSrc, 0, src.data(), 64);
+        frame.set_compute_pipeline(kPipe);
+        set_bind_group2(frame, 0, kGroup);
+        frame.dispatch_compute(1, 1, 1);
+        frame.present();
+        run(ex, frame);
+        ex.wait_idle();
+        std::vector<uint8_t> out;
+        std::string err;
+        CHECK(ex.read_buffer(kDst, 0, 64, &out, &err) && out.size() == 64);
+        std::vector<uint32_t> words(16, 0);
+        if (out.size() == 64) std::memcpy(words.data(), out.data(), 64);
+        return words;
+    };
+    constexpr uint32_t kWork = 1u << 26;
+    {  // Draws: an all-ones record, a huge instance count, a sane record.
+        const auto w = clamp(0, 4, 3, 0, {0xFFFFFFFFu, 0xFFFFFFFFu, 0, 0, 3, 0x40000000u, 0, 0, 100, 50, 7, 9});
+        CHECK(w[0] == kWork && w[1] == 1);
+        CHECK(w[4] == 3 && w[5] == kWork / 3);
+        CHECK(w[8] == 100 && w[9] == 50 && w[10] == 7 && w[11] == 9);
+    }
+    {  // Indexed draws (1000 indices): instances cut against the clamped index count.
+        const auto w = clamp(1, 5, 2, 1000, {600, 0xFFFFFFFFu, 0, 0, 0, 10, 20, 995, 1, 2});
+        CHECK(w[0] == 600 && w[1] == kWork / 600);
+        CHECK(w[5] == 5 && w[6] == 20 && w[7] == 995 && w[8] == 1 && w[9] == 2);
+    }
+    {  // Dispatches: at most 2^22 workgroups in all.
+        const auto w = clamp(2, 3, 3, 0, {65535, 65535, 65535, 0xFFFFFFFFu, 2, 3, 8, 8, 8});
+        CHECK(w[0] == 65535 && w[1] == (1u << 22) / 65535 && w[2] == 1);
+        CHECK(w[3] == 65535 && w[4] == 2 && w[5] == 3);
+        CHECK(w[6] == 8 && w[7] == 8 && w[8] == 8);
+    }
+    CHECK(ex.stats().device_errors == before.device_errors);
 }
 
 // ExecuteIndirect root-constant pass (gpu/state_bridge.h indirect_constants_wgsl) on the GPU: per
@@ -4487,6 +4663,7 @@ int main() {
     test_compute_pipeline_survives_copy(*ex);
     test_bindings_survive_copy(*ex);
     test_render_bindings_survive_copy(*ex);
+    test_indirect_clamp_work(*ex);
     test_mesh_pipeline(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
@@ -4511,6 +4688,8 @@ int main() {
     test_show_target_read_only();
     test_overlay_read_only();
     test_show_target_bad_option();
+    test_device_loss();
+    test_device_loss_journal();
     test_async_pipelines_and_blob_cache();
     test_shader_workers("0");
     test_shader_workers("10000");

@@ -2514,8 +2514,18 @@ const char* indirect_clamp_wgsl() noexcept {
     // count, the count buffer word (when has_count), the record kind and the index buffer's element
     // count. Commands at or past the count buffer's value, or whose record does not fit in the
     // source buffer, are written as all zeros (no work). Indexed draws are clamped to the index
-    // buffer, dispatches to the per-dimension workgroup limit.
-    return R"(struct Params {
+    // buffer, dispatches to the per-dimension workgroup limit. Every draw is cut to MAX_DRAW_WORK
+    // vertices (indices) x instances and every dispatch to MAX_GROUPS workgroups in all: a garbage
+    // record (GPU-written arguments) would otherwise keep the GPU busy for seconds (a TDR, device lost).
+    return R"(const MAX_DRAW_WORK: u32 = 67108864u;
+const MAX_GROUPS: u32 = 4194304u;
+fn cut_instances(per_instance: u32, instances: u32) -> u32 {
+    if (per_instance == 0u || instances <= MAX_DRAW_WORK / per_instance) {
+        return instances;
+    }
+    return max(MAX_DRAW_WORK / per_instance, 1u);
+}
+struct Params {
     src_word: u32,
     stride_words: u32,
     count: u32,
@@ -2568,17 +2578,32 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (!live) {
         return;
     }
-    if (p.kind == 1u) {
+    if (p.kind == 0u) {
+        let vertices = min(dst[out], MAX_DRAW_WORK);
+        dst[out] = vertices;
+        dst[out + 1u] = cut_instances(vertices, dst[out + 1u]);
+    } else if (p.kind == 1u) {
         let first = dst[out + 2u];
         var indices = 0u;
         if (first < p.index_limit) {
             indices = min(dst[out], p.index_limit - first);
         }
+        indices = min(indices, MAX_DRAW_WORK);
         dst[out] = indices;
+        dst[out + 1u] = cut_instances(indices, dst[out + 1u]);
     } else if (p.kind == 2u) {
-        dst[out] = min(dst[out], p.group_limit);
-        dst[out + 1u] = min(dst[out + 1u], p.group_limit);
-        dst[out + 2u] = min(dst[out + 2u], p.group_limit);
+        let x = min(dst[out], p.group_limit);
+        var y = min(dst[out + 1u], p.group_limit);
+        var z = min(dst[out + 2u], p.group_limit);
+        if (x != 0u && y > MAX_GROUPS / x) {
+            y = max(MAX_GROUPS / x, 1u);
+        }
+        if (x != 0u && y != 0u && z > MAX_GROUPS / (x * y)) {
+            z = max(MAX_GROUPS / (x * y), 1u);
+        }
+        dst[out] = x;
+        dst[out + 1u] = y;
+        dst[out + 2u] = z;
     } else if (p.kind == 3u) {
         // Mesh dispatch: x-dimension groups only (y = z = 1), at most group_limit; the draw that
         // follows covers index_limit (max primitives * 3) vertices per group.

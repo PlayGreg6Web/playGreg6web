@@ -330,9 +330,15 @@ one step further, it rebuilds.
   so a loss between batches is repaired without waiting for the guest. Nothing is submitted to a lost
   device: the existing `lost` gates stay.
 - **Journal.** Every packet that creates a resource or fills one (buffers, shader modules, textures,
-  samplers, layouts, pipelines v1 / v2, bind groups, `WriteBuffer`, `WriteTexture`) is copied into a
-  journal. `DestroyResource` prunes that id's entries; a write of the same range replaces the older one.
-  Budget: `ExecutorOptions::recovery_journal_bytes` (default 512 MiB).
+  samplers, layouts, pipelines v1 / v2, bind groups, `WriteBuffer`, `WriteTexture`) is kept in a journal.
+  Buffer writes fold into one image per buffer (64 KiB pages: a rewrite of a range costs nothing, so ring
+  and constant buffers stay bounded by their size); a texture write drops the older writes of that texture
+  whose box it covers; `DestroyResource` prunes the id. Budget: `ExecutorOptions::recovery_journal_bytes`
+  (default 512 MiB, raised to 1/8 of the free physical memory, at most 2 GiB, by `recovery_journal_auto`).
+  Over the budget content goes, never the run: first the content of resources rewritten in 4+ frames
+  (largest first; the title uploads them again anyway), else the incoming write's resource. Such a
+  resource is re-created empty by a recovery (`recovery_contents_lost`) and not journaled again until it is
+  destroyed. Only creations that alone outgrow the budget make a recovery impossible.
 - **Recover.** `recover()` fails the read-backs of the frame under construction (their fence counters
   advance as failed), destroys the old device, requests adapter + device again (the same feature / limit
   negotiation, the blob cache stays open, up to 5 attempts 250 ms apart), unconfigures the surface (it is
@@ -343,18 +349,30 @@ one step further, it rebuilds.
   was being built when the device died is dropped (`recovery_frames_dropped`, also `present_failures`);
   the clear colour carries over. Nothing is faked: the output after recovery is what the same packets
   produce on a healthy device, a differing replay is visible as `recovery_replay_errors`.
-- **Cannot rebuild, so end cleanly.** Journal disabled or over budget, no device after the retries, a
+- **Cannot rebuild, so end cleanly.** Journal disabled, creations over the budget, no device after the retries, a
   device with fewer features, or a loss during the replay on every attempt: `faulted()` becomes true,
-  `stats_json()` carries `"fault_record": {"kind": "gpu_device_lost", "reason", "device_error", counters}`,
+  `stats_json()` carries `"fault_record": {"kind": "gpu_device_lost", "reason", "device_error", "lost_reason",
+  "lost_message", "inflight", counters}`,
   later batches are dropped (`dropped_while_lost`) and `poll()` returns false, which ends the live run
   the same way closing the window does. No crash.
 - **Counters** (`stats_json`): `device_lost_events`, `recoveries`, `recovery_failures`, `recovery_ms`,
   `recovery_replayed_packets`, `recovery_replay_errors`, `recovery_frames_dropped`,
-  `recovery_gpu_resources_reset`, `journal_bytes`, `journal_overflows`.
+  `recovery_gpu_resources_reset`, `recovery_contents_lost`, `journal_bytes`, `journal_create_bytes`,
+  `journal_budget`, `journal_overflows`, `journal_evicted_resources`, `journal_evicted_bytes`.
+- **Why it was lost.** Dawn's lost reason and message (`device_lost_reason`, `device_lost_message`; a TDR
+  shows `DXGI_ERROR_DEVICE_HUNG`) and the submits the GPU had not finished (`device_lost_inflight`: age,
+  frame, command buffers, draws, dispatches, indirect calls, usage-snapshot bytes, the largest direct draw
+  (vertices x instances) and dispatch (workgroups)). Every frame / read-back submit is watched with
+  `OnSubmittedWorkDone` (`submits_tracked`, `submit_gpu_max_ms`, `submit_gpu_max_frame`).
+- **TDR guards.** A direct draw is cut to 2^26 vertices (indices) x instances (`draws_clamped`); the
+  ExecuteIndirect clamp pass (`bridge::indirect_clamp_wgsl`) cuts every indirect draw to the same work and
+  every indirect dispatch to 2^22 workgroups, so a garbage (GPU-written) argument record cannot keep the
+  GPU busy for seconds.
 - **Test.** `test_native_executor` loses the device with `NativeExecutor::debug_force_device_lost`
   (Dawn `Device::ForceLoss`): buffer and texture contents compare equal after the rebuild, a pruned
-  resource stays gone, a queued frame is dropped, and the no-journal / over-budget cases end with the
-  fault record.
+  resource stays gone, a queued frame is dropped, content over the budget comes back empty (counted),
+  and the no-journal / creations-over-budget cases end with the fault record; `test_device_loss_journal`
+  pins the buffer folding, texture box pruning and volatile-first eviction.
 
 ## Test strategy
 

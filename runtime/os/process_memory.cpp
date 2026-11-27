@@ -35,6 +35,16 @@ bool process_memory_bytes(uint64_t* private_bytes, uint64_t* working_set_bytes, 
 #endif
 }
 
+uint64_t available_physical_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? ms.ullAvailPhys : 0;
+#else
+    return 0;
+#endif
+}
+
 #ifdef _WIN32
 namespace {
 // Pages of [base, base + size) in the working set.

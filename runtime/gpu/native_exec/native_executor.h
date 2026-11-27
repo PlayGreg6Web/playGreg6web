@@ -114,12 +114,17 @@ struct ExecutorOptions {
     // runs past 170 s. Off, such a conflict is left to the buffer aliasing pass (resolve_buffer_aliases).
     bool usage_snapshots = false;
     // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
-    // that create resources and fill them (creations, buffer / texture writes; destroyed ids are pruned,
-    // a repeated write of the same range replaces the older one) so a lost device can be rebuilt and the
-    // resources re-created with their uploaded contents. Journal budget in bytes; 0 = no journal, so a
-    // device loss ends the run with a fault record instead of a recovery. A journal that outgrew the
-    // budget cannot rebuild the state either: the same clean end.
-    uint64_t recovery_journal_bytes = 512ull << 20;
+    // that create resources and fill them so a lost device can be rebuilt and the resources re-created
+    // with their uploaded contents. Buffer writes are folded into one image per buffer (64 KiB pages, a
+    // rewrite costs nothing), a texture write drops the older writes its box covers, destroyed ids are
+    // pruned. Journal budget in bytes; 0 = no journal, so a device loss ends the run with a fault record.
+    // Over the budget, content goes first (the most often rewritten resources, then the incoming write):
+    // those resources come back empty after a recovery (counted, the next upload fills them); only
+    // creations that outgrow the budget make a recovery impossible.
+    static constexpr uint64_t kDefaultRecoveryJournalBytes = 512ull << 20;
+    uint64_t recovery_journal_bytes = kDefaultRecoveryJournalBytes;
+    // With the default budget: raise it to 1/8 of the free physical memory at start (at most 2 GiB).
+    bool recovery_journal_auto = true;
     // Live-vs-replay check (tools/live_vs_replay.py): when non-empty, every presented frame's stream image
     // (before the blit; 4-byte formats) is read back and a line `digest frame N: <16 hex> WxH <format>` is
     // appended here, N counting presents from 0 - the same digest pg6_native_exec --digest-at prints.
@@ -165,8 +170,22 @@ struct ExecutorStats {
     uint64_t recovery_replay_errors = 0;      // ... that the executor rejected (packet errors during the replay)
     uint64_t recovery_frames_dropped = 0;     // the frame that was being built when the device was lost
     uint64_t recovery_gpu_resources_reset = 0;  // render-target / storage resources re-created empty (GPU-written)
-    uint64_t journal_bytes = 0;               // live journal size
-    uint64_t journal_overflows = 0;           // packets that did not fit the budget (recovery is then impossible)
+    uint64_t journal_bytes = 0;               // live journal size (creations + content)
+    uint64_t journal_create_bytes = 0;        // ... of it creations (shaders, pipelines, layouts, bind groups, ...)
+    uint64_t journal_budget = 0;              // the effective budget (recovery_journal_bytes, raised by _auto)
+    uint64_t journal_overflows = 0;           // writes that did not fit the budget (their resource's content dropped)
+    uint64_t journal_evicted_resources = 0;   // resources whose journaled content was dropped for the budget
+    uint64_t journal_evicted_bytes = 0;
+    uint64_t recovery_contents_lost = 0;      // live resources a recovery re-created without their uploaded content
+    // Device loss diagnostics: Dawn's lost reason / message (also in the fault record), and the submits the
+    // GPU had not finished when the device was lost (JSON array, oldest first: age, frame, work counts).
+    std::string device_lost_reason;
+    std::string device_lost_message;
+    std::string device_lost_inflight;
+    uint64_t submits_tracked = 0;             // frame submits watched for completion
+    uint64_t submit_gpu_max_ns = 0;           // the longest submit -> completion time seen
+    uint64_t submit_gpu_max_frame = 0;        // ... and the frame (frames_submitted) it belonged to
+    uint64_t draws_clamped = 0;               // direct draws whose vertex x instance count was clamped (kMaxDrawWork)
     bool faulted = false;                     // the run cannot continue (see fault_record); poll() returns false
     std::string fault_record;                 // JSON object, empty unless faulted
     uint64_t dropped_while_lost = 0;  // batches ignored after device loss
