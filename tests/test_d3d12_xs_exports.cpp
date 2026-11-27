@@ -9172,10 +9172,13 @@ void test_native_flush_page_index() {
         CHECK(result == 0);
         const uint32_t id_a = object_of<dg::Resource>(a)->id();
         const uint32_t id_b = object_of<dg::Resource>(b)->id();
-        const uint64_t uni = mem + 2 * k64K + 0x40;
-        uint32_t id_u = 0;
-        uint64_t off_u = 0;
+        // A uniform range inside B (primed with it) and one outside every buffer (compared every time).
+        const uint64_t uni = mem + k64K + 0x800;
+        const uint64_t uni2 = mem + 2 * k64K + 0x40;
+        uint32_t id_u = 0, id_u2 = 0;
+        uint64_t off_u = 0, off_u2 = 0;
         CHECK(dev->relocate_uniform(uni, 64, 64, &id_u, &off_u));
+        CHECK(dev->relocate_uniform(uni2, 64, 64, &id_u2, &off_u2));
         struct Write {
             uint32_t id;
             uint32_t offset;
@@ -9195,7 +9198,7 @@ void test_native_flush_page_index() {
                 if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer) {
                     GpuWriteBufferPayload w{};
                     std::memcpy(&w, enc.data() + off, sizeof(w));
-                    if (w.id == id_a || w.id == id_b || w.id == id_u) {
+                    if (w.id == id_a || w.id == id_b || w.id == id_u || w.id == id_u2) {
                         out.push_back({w.id, w.dst_offset, h.payload_bytes - static_cast<uint32_t>(sizeof(w))});
                     }
                 }
@@ -9206,9 +9209,15 @@ void test_native_flush_page_index() {
         auto only = [](const std::vector<Write>& w, uint32_t id, uint32_t offset) {
             return w.size() == 1 && w[0].id == id && w[0].offset == offset;
         };
+        auto has_write = [](const std::vector<Write>& w, uint32_t id, uint64_t offset) {
+            return std::any_of(w.begin(), w.end(), [&](const Write& x) { return x.id == id && x.offset == offset; });
+        };
         const uint32_t one = 1, two = 2;
-        CHECK(com::write_guest(uni, one));  // the uniform range's first bytes
-        CHECK(only(flush(), id_u, static_cast<uint32_t>(off_u)));  // index (A, B: zeros, nothing to upload)
+        CHECK(com::write_guest(uni, one));  // the uniform range's first bytes (in B)
+        {
+            const auto w = flush();  // index (A: zeros, nothing to upload)
+            CHECK(w.size() == 3 && has_write(w, id_b, 0) && has_write(w, id_u, off_u) && has_write(w, id_u2, off_u2));
+        }
         CHECK(flush().empty());                                     // prime
         const uint64_t skipped_b0 = dg::work_total(dg::Work::FlushBuffersSkipped);
         const uint64_t skipped_u0 = dg::work_total(dg::Work::FlushUniformsSkipped);
@@ -9233,7 +9242,12 @@ void test_native_flush_page_index() {
         CHECK(com::write_guest(uni + 8, two));
         {
             const auto w = flush();
-            CHECK(only(w, id_u, static_cast<uint32_t>(off_u)) && w[0].bytes == 64);
+            CHECK(w.size() == 2 && has_write(w, id_b, 0) && has_write(w, id_u, off_u));
+        }
+        CHECK(com::write_guest(uni2 + 8, two));
+        {
+            const auto w = flush();
+            CHECK(only(w, id_u2, static_cast<uint32_t>(off_u2)) && w[0].bytes == 64);
         }
         // A write of the same bytes: reported written, compared, nothing uploaded.
         CHECK(com::write_guest(mem + 2 * kPage + 8, two));
@@ -9252,13 +9266,16 @@ void test_native_flush_page_index() {
         CHECK(com::write_guest(mem, two));
         CHECK(com::write_guest(mem + k64K, two));
         CHECK(com::write_guest(uni, two));
-        CHECK(flush().size() == 3);
+        CHECK(flush().size() == 3);  // A, B, the uniform range in B
         CHECK(flush().empty());
         CHECK(dg::work_total(dg::Work::FlushCrosscheckMisses) == misses0);
-        // A buffer released between flushes leaves the index (no stale key is visited).
+        // A buffer released between flushes leaves the index (no stale key is visited), and the
+        // uniform range inside it, no longer covered by a take, is compared again.
         fx.vcall(b, Slot::Release);
-        CHECK(com::write_guest(mem + k64K + 0x10, two));
-        CHECK(flush().empty());
+        CHECK(com::write_guest(uni + 4, two));
+        CHECK(only(flush(), id_u, static_cast<uint32_t>(off_u)));
+        CHECK(com::write_guest(uni + 4, one));
+        CHECK(only(flush(), id_u, static_cast<uint32_t>(off_u)));
         fx.vcall(a, Slot::Release);
         scene.release_all();
         com::guest_free(mem);

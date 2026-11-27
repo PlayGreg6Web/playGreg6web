@@ -88,7 +88,7 @@ void test_overlapping_and_shared_granules() {
     out.clear();
     idx.collect_range(kBase + 2 * k64K, kBase + 3 * k64K, &out);
     CHECK(sorted(out) == sorted({K(2)}));
-    // One hull for the whole run of granules.
+    // One hull: the ranges overlap.
     const auto& h = idx.hulls();
     CHECK(h.size() == 1 && h[0] == Range(kBase, kBase + 4 * k64K));
 }
@@ -107,15 +107,16 @@ void test_map_unmap_remap_and_resize() {
     CHECK(idx.range_of(K(0), &lo, &hi) && lo == kBase + 20 * k64K + 0x100 && hi == kBase + 20 * k64K + 0x200);
     {
         const auto& h = idx.hulls();
-        CHECK(h.size() == 2 && h[0].first == kBase + 10 * k64K && h[1].first == kBase + 20 * k64K);
+        CHECK(h.size() == 2 && h[0] == Range(kBase + 10 * k64K, kBase + 10 * k64K + kPage) &&
+              h[1] == Range(kBase + 20 * k64K, kBase + 20 * k64K + kPage));
     }
     // Resize in place: grows into the next granule, then shrinks back.
     idx.add(K(0), kBase + 20 * k64K + 0x100, kBase + 21 * k64K + 0x10);
     CHECK(pages_hit(idx, {kBase + 21 * k64K}) == sorted({K(0)}));
-    CHECK(idx.hulls().back() == Range(kBase + 20 * k64K, kBase + 22 * k64K));
+    CHECK(idx.hulls().back() == Range(kBase + 20 * k64K, kBase + 21 * k64K + kPage));
     idx.add(K(0), kBase + 20 * k64K + 0x100, kBase + 20 * k64K + 0x200);
     CHECK(pages_hit(idx, {kBase + 21 * k64K}).empty());
-    CHECK(idx.hulls().back() == Range(kBase + 20 * k64K, kBase + 21 * k64K));
+    CHECK(idx.hulls().back() == Range(kBase + 20 * k64K, kBase + 20 * k64K + kPage));
     // Re-adding the same range changes nothing.
     idx.add(K(0), kBase + 20 * k64K + 0x100, kBase + 20 * k64K + 0x200);
     CHECK(idx.size() == 2);
@@ -133,7 +134,7 @@ void test_map_unmap_remap_and_resize() {
     idx.remove(K(2));
     CHECK(pages_hit(idx, {kBase + 0x1000}).empty());
     CHECK(pages_hit(idx, {kBase + 0x8000}) == sorted({K(3)}));
-    CHECK(idx.hulls().size() == 1);
+    CHECK(idx.hulls().size() == 1 && idx.hulls()[0] == Range(kBase + 0x8000, kBase + 0x9000));
     idx.clear();
     CHECK(idx.size() == 0 && idx.hulls().empty() && pages_hit(idx, {kBase + 0x8000}).empty());
 }
@@ -155,7 +156,11 @@ void test_many_pages_one_query() {
     for (int i = 0; i < 16; ++i) {
         CHECK(has(hit, K(i)) == (i % 2 == 0));
     }
-    CHECK(idx.hulls().size() == 1);  // 48 pages: three adjacent granules
+    // Page-aligned ranges 2 pages apart (within HostPageIndex::kHullGap): merged into one hull.
+    CHECK(idx.hulls().size() == 1 && idx.hulls()[0] == Range(kBase, kBase + 46 * kPage));
+    // A gap wider than kHullGap keeps two hulls.
+    idx.add(K(0), kBase + 100 * kPage, kBase + 100 * kPage + 1);
+    CHECK(idx.hulls().size() == 2 && idx.hulls()[1] == Range(kBase + 100 * kPage, kBase + 101 * kPage));
 }
 
 void test_cover_and_merge() {

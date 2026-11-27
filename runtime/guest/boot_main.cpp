@@ -30,8 +30,9 @@
 //   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
 //   --flush-full         CPU-visible buffer flush compares every buffer / uniform range at every
 //                        submission (the pre-#1963 behaviour; A/B runs)
-//   --flush-crosscheck   compare every one and count any the write-tracking index would have
-//                        skipped although it changed (gpu_work.flush_crosscheck_misses; diagnostic)
+//   --flush-crosscheck [n]  compare every one and count any the write-tracking index would have
+//                        skipped although it changed (gpu_work.flush_crosscheck_misses; diagnostic);
+//                        with n, only every n-th flush (the others run indexed and are timed)
 //   --no-xmem-shared-pages  physical pages mapped at several addresses get per-address copies
 //                        (the pre-O36 behaviour; A/B runs, os/xbox_scarlett.h)
 //   --stack <bytes>      guest stack size (default: the image's SizeOfStackReserve)
@@ -326,7 +327,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--watch-guest-va <addr>[:len]] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages] [--flush-full|--flush-crosscheck]\n"
+                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--watch-guest-va <addr>[:len]] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages] [--flush-full|--flush-crosscheck [n]]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
@@ -391,6 +392,10 @@ bool parse(int argc, char** argv, Options& o) {
             playgta6::gpu::d3d12_guest::set_flush_mode(playgta6::gpu::d3d12_guest::FlushMode::Full);
         } else if (a == "--flush-crosscheck") {
             playgta6::gpu::d3d12_guest::set_flush_mode(playgta6::gpu::d3d12_guest::FlushMode::CrossCheck);
+            if (i + 1 < argc && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9') {
+                playgta6::gpu::d3d12_guest::set_flush_crosscheck_every(
+                    static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10)));
+            }
         } else if (a == "--no-xmem-shared-pages") {
             playgta6::os::win32::set_process_shared_zone(false);
         } else if (a == "--gpu-capture-payloads") {

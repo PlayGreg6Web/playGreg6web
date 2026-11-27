@@ -13,7 +13,6 @@ void HostPageIndex::unlink(const void* key, const Range& r) {
         keys.erase(std::remove(keys.begin(), keys.end(), key), keys.end());
         if (keys.empty()) {
             it = by_granule_.erase(it);
-            hulls_dirty_ = true;
         } else {
             ++it;
         }
@@ -35,12 +34,9 @@ void HostPageIndex::add(const void* key, uintptr_t lo, uintptr_t hi) {
     } else {
         entries_.emplace(key, Range{lo, hi});
     }
+    hulls_dirty_ = true;
     for (uintptr_t g = lo >> kGranuleShift, last = (hi - 1) >> kGranuleShift;; ++g) {
-        auto& keys = by_granule_[g];
-        if (keys.empty()) {
-            hulls_dirty_ = true;
-        }
-        keys.push_back(key);
+        by_granule_[g].push_back(key);
         if (g == last) {
             break;
         }
@@ -54,6 +50,7 @@ void HostPageIndex::remove(const void* key) {
     }
     unlink(key, it->second);
     entries_.erase(it);
+    hulls_dirty_ = true;
 }
 
 bool HostPageIndex::range_of(const void* key, uintptr_t* lo, uintptr_t* hi) const {
@@ -125,14 +122,20 @@ void HostPageIndex::collect_range(uintptr_t lo, uintptr_t hi, std::vector<const 
 const std::vector<HostPageIndex::Range>& HostPageIndex::hulls() const {
     if (hulls_dirty_) {
         hulls_.clear();
-        for (const auto& [g, keys] : by_granule_) {
-            const uintptr_t lo = g << kGranuleShift;
-            if (!hulls_.empty() && hulls_.back().second == lo) {
-                hulls_.back().second = lo + kGranuleBytes;
+        hulls_.reserve(entries_.size());
+        for (const auto& [key, r] : entries_) {
+            hulls_.emplace_back(r.first & ~(kHullPage - 1), (r.second + kHullPage - 1) & ~(kHullPage - 1));
+        }
+        std::sort(hulls_.begin(), hulls_.end());
+        size_t n = 0;
+        for (const auto& r : hulls_) {
+            if (n != 0 && r.first <= hulls_[n - 1].second + kHullGap) {
+                hulls_[n - 1].second = std::max(hulls_[n - 1].second, r.second);
             } else {
-                hulls_.emplace_back(lo, lo + kGranuleBytes);
+                hulls_[n++] = r;
             }
         }
+        hulls_.resize(n);
         hulls_dirty_ = false;
     }
     return hulls_;

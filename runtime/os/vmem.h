@@ -485,6 +485,13 @@ struct WriteCursor {
 };
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);
+// #1963: one take over many ranges (sorted, disjoint, page-aligned starts) from one cursor position:
+// appends the host addresses of the kWrittenPageSize pages written in them since the cursor (the commit
+// log is read once for all), and sets (*ok)[i] false where range i could not tell (the caller treats it
+// as wholly written). The cursor moves to the oldest position any range's take reached, so a write
+// none of them reported is reported by the next call.
+void take_written_pages_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>>& ranges, WriteCursor* cursor,
+                               std::vector<uintptr_t>* pages, std::vector<uint8_t>* ok);
 // Batch of takes (a submission's buffer flush): collects the OS write bits of the (merged) host
 // ranges once, up front, so each take inside them skips its own OS call; a write after the collect
 // is reported by the next batch. Takes outside the ranges, and other threads, are unaffected.

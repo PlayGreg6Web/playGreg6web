@@ -2044,6 +2044,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
 
 namespace {
 std::atomic<uint8_t> g_flush_mode{static_cast<uint8_t>(FlushMode::Index)};
+std::atomic<uint32_t> g_crosscheck_every{1};
 }  // namespace
 
 void set_flush_mode(FlushMode mode) {
@@ -2052,6 +2053,10 @@ void set_flush_mode(FlushMode mode) {
 
 FlushMode flush_mode() {
     return static_cast<FlushMode>(g_flush_mode.load(std::memory_order_relaxed));
+}
+
+void set_flush_crosscheck_every(uint32_t n) {
+    g_crosscheck_every.store(n == 0 ? 1u : n, std::memory_order_relaxed);
 }
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
@@ -2096,8 +2101,22 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     // Buffers the tracking does not cover (no take of their own succeeds) are flushed every time.
     const FlushMode mode = flush_mode();
     const bool indexed = !scanned && !os::guest_window::write_marks_verified() && mode != FlushMode::Full;
-    const bool crosscheck = indexed && mode == FlushMode::CrossCheck;
     const uint64_t seq = ++flush_seq_;
+    const bool crosscheck = indexed && mode == FlushMode::CrossCheck &&
+                            seq % g_crosscheck_every.load(std::memory_order_relaxed) == 0;
+    // The indexed flushes' own cost (crosscheck flushes excluded), for A/B numbers in one run.
+    struct IndexedTimer {
+        bool on;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~IndexedTimer() {
+            if (on) {
+                count_work(Work::FlushIndexedCalls);
+                count_work(Work::FlushIndexedNs, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                         std::chrono::steady_clock::now() - t0)
+                                                                         .count()));
+            }
+        }
+    } indexed_timer{indexed && !crosscheck};
     if (indexed != page_index_live_) {
         // Entering or leaving the indexed mode: start over (every entry unprimed and re-indexed).
         {
@@ -2119,22 +2138,17 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         }
         page_index_live_ = indexed;
     }
-    std::vector<HostPageIndex::Range> take_ranges;  // merged hulls of both indexes
+    // The ranges taken are the indexed buffers' (merged, page-aligned). A uniform range is primed only
+    // where they cover it (most lie in an upload buffer); the others are compared every time, as
+    // before: taking their pages too would arm memory the title rewrites every frame.
+    std::vector<HostPageIndex::Range> take_ranges;
     std::vector<HostPageIndex::Range> taken_ok;     // the ones whose take succeeded
     std::vector<HostPageIndex::Range> taken_failed;
     std::vector<uintptr_t> dirty_pages;  // host page addresses reported written (sorted, unique)
     if (indexed) {
-        {
-            std::lock_guard<std::mutex> lock(tracked_mutex_);
-            const auto& h = buffer_page_index_.hulls();
-            take_ranges.assign(h.begin(), h.end());
-        }
-        {
-            std::lock_guard<std::mutex> lock(relocation_mutex_);
-            const auto& h = uniform_page_index_.hulls();
-            take_ranges.insert(take_ranges.end(), h.begin(), h.end());
-        }
-        merge_ranges(&take_ranges);
+        std::lock_guard<std::mutex> lock(tracked_mutex_);
+        const auto& h = buffer_page_index_.hulls();
+        take_ranges.assign(h.begin(), h.end());
     }
     // The OS write bits of the buffers and of the relocated storage / index ranges, collected in one pass
     // that outlives the loops below (each take inside the ranges then skips its own GetWriteWatch).
@@ -2179,31 +2193,12 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             }
             write_batch.emplace(&host_ranges);
             if (indexed) {
-                // One take per merged range, each from the cursor's position; the new position is the
-                // oldest the takes reached (a later take then reports anything any of them could miss).
-                const os::WriteCursor from = flush_cursor_;
-                os::WriteCursor to{};
-                to.commit_seq = to.view_clock = to.watch_epoch = ~uint64_t{0};
-                std::vector<uint64_t> offsets;
-                for (const auto& h : take_ranges) {
-                    os::WriteCursor c = from;
-                    offsets.clear();
-                    const bool ok = os::take_written_pages(reinterpret_cast<const void*>(h.first),
-                                                           static_cast<uint64_t>(h.second - h.first), &c, &offsets);
-                    to.commit_seq = std::min(to.commit_seq, c.commit_seq);
-                    to.view_clock = std::min(to.view_clock, c.view_clock);
-                    to.watch_epoch = std::min(to.watch_epoch, c.watch_epoch);
-                    if (ok) {
-                        taken_ok.push_back(h);
-                        for (uint64_t off : offsets) {
-                            dirty_pages.push_back(h.first + static_cast<uintptr_t>(off));
-                        }
-                    } else {
-                        taken_failed.push_back(h);
-                    }
-                }
-                if (!take_ranges.empty()) {
-                    flush_cursor_ = to;
+                // One take over all ranges from the flush cursor (os::take_written_pages_ranges).
+                std::vector<uint8_t> ok;
+                os::take_written_pages_ranges(take_ranges, &flush_cursor_, &dirty_pages, &ok);
+                const os::WriteCursor to = flush_cursor_;
+                for (size_t i = 0; i < take_ranges.size(); ++i) {
+                    (ok[i] != 0 ? taken_ok : taken_failed).push_back(take_ranges[i]);
                 }
                 std::sort(dirty_pages.begin(), dirty_pages.end());
                 dirty_pages.erase(std::unique(dirty_pages.begin(), dirty_pages.end()), dirty_pages.end());
@@ -2350,7 +2345,10 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         }
         uint64_t compared = 0, skipped = 0;
         for (auto& [key, r] : relocations_) {
-            const bool skip = indexed && r.primed && r.visit_seq != seq;
+            // (Covered again this time: the buffer around it may have left the index since.)
+            uintptr_t u_lo = 0, u_hi = 0;
+            const bool skip = indexed && r.primed && r.visit_seq != seq && uniform_page_index_.range_of(&r, &u_lo, &u_hi) &&
+                              ranges_cover(taken_ok, u_lo, u_hi);
             if (skip && !crosscheck) {
                 ++skipped;
                 continue;

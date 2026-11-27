@@ -123,6 +123,58 @@ static bool take_written_pages_impl(const void* host, uint64_t len, WriteCursor*
                                                     cursor->peek_watch, offsets);
 }
 
+void take_written_pages_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>>& ranges, WriteCursor* cursor,
+                               std::vector<uintptr_t>* pages, std::vector<uint8_t>* ok) {
+    ok->assign(ranges.size(), 0);
+    if (cursor == nullptr || pages == nullptr || ranges.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_commit_log_mutex);
+        if (cursor->commit_seq > g_commit_seq || g_commit_seq - cursor->commit_seq > kCommitLogSize) {
+            cursor->commit_seq = g_commit_seq;
+            return;  // all unknown
+        }
+        for (uint64_t s = cursor->commit_seq; s < g_commit_seq; ++s) {
+            const CommitRecord& r = g_commit_log[static_cast<size_t>(s % kCommitLogSize)];
+            const uintptr_t r_end = r.start + static_cast<uintptr_t>(r.len);
+            // The first range ending after the record's start.
+            auto it = std::upper_bound(ranges.begin(), ranges.end(), r.start,
+                                       [](uintptr_t v, const std::pair<uintptr_t, uintptr_t>& x) { return v < x.second; });
+            for (; it != ranges.end() && it->first < r_end; ++it) {
+                const uintptr_t lo = std::max<uintptr_t>(r.start, it->first);
+                const uintptr_t hi = std::min<uintptr_t>(r_end, it->second);
+                for (uintptr_t page = lo & ~(uintptr_t{kWrittenPageSize} - 1); page < hi; page += kWrittenPageSize) {
+                    pages->push_back(page);
+                }
+            }
+        }
+        cursor->commit_seq = g_commit_seq;
+    }
+    uint64_t view_clock = ~uint64_t{0};
+    uint64_t watch_epoch = ~uint64_t{0};
+    std::vector<uint64_t> offsets;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        const auto& [lo, hi] = ranges[i];
+        uint64_t vc = cursor->view_clock;
+        uint64_t ep = cursor->watch_epoch;
+        offsets.clear();
+        if (hi > lo && backing::take_written_pages(reinterpret_cast<const uint8_t*>(lo), static_cast<uint64_t>(hi - lo), &vc,
+                                                   cursor->watch_epoch == ~uint64_t{0} ? nullptr : &ep,
+                                                   cursor->peek_watch, &offsets)) {
+            (*ok)[i] = 1;
+            const uintptr_t base = lo & ~(uintptr_t{kWrittenPageSize} - 1);
+            for (uint64_t off : offsets) {
+                pages->push_back(base + static_cast<uintptr_t>(off));
+            }
+        }
+        view_clock = std::min(view_clock, vc);
+        watch_epoch = std::min(watch_epoch, ep);
+    }
+    cursor->view_clock = view_clock;
+    cursor->watch_epoch = watch_epoch;
+}
+
 WriteBatch::WriteBatch(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges) {
     backing::precollect_begin(ranges);
 }

@@ -1773,6 +1773,9 @@ enum class Work : size_t {
     FlushUniformsSkipped,
     FlushCrosscheckLate,
     FlushCrosscheckMisses,
+    // Indexed flushes that were not cross-checked: calls and wall time (ns) in flush_cpu_buffers.
+    FlushIndexedCalls,
+    FlushIndexedNs,
     Count
 };
 // #1963: how flush_cpu_buffers picks what to compare on native builds. Index (default): only the
@@ -1782,6 +1785,8 @@ enum class Work : size_t {
 enum class FlushMode : uint8_t { Index, Full, CrossCheck };
 void set_flush_mode(FlushMode mode);
 FlushMode flush_mode();
+// CrossCheck: only every n-th flush compares everything (default 1: all); the others run as Index.
+void set_flush_crosscheck_every(uint32_t n);
 void count_work(Work w, uint64_t n = 1);
 uint64_t work_total(Work w);
 const char* work_name(Work w);

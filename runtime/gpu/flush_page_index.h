@@ -41,7 +41,10 @@ public:
     void collect_pages(const std::vector<uintptr_t>& pages, uintptr_t page_bytes, std::vector<const void*>* out) const;
     // Appends once each key whose range overlaps [lo, hi).
     void collect_range(uintptr_t lo, uintptr_t hi, std::vector<const void*>* out) const;
-    // Sorted, disjoint, granule-aligned ranges covering every indexed range (adjacent granules merged).
+    // Sorted, disjoint ranges covering every indexed range: each range widened to whole 4 KiB pages,
+    // and ranges at most kHullGap apart merged (fewer takes; only small gaps are taken in addition).
+    static constexpr uintptr_t kHullPage = 4096;
+    static constexpr uintptr_t kHullGap = 4 * kHullPage;
     const std::vector<Range>& hulls() const;
 
 private:
