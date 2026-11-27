@@ -98,6 +98,7 @@ import screen_timeline  # noqa: E402
 import stop_message  # noqa: E402
 import clean_build_dirs  # noqa: E402
 import build_guard  # noqa: E402
+import boot_lock  # noqa: E402
 import prebuilt_guard  # noqa: E402
 from lift_cache import (  # noqa: E402,F401 (re-exported for the tests)
     LIFT_CACHE_ENV, LIFT_CACHE_KEEP, LIFT_CACHE_KEEP_ENV, LIFT_CACHE_VERSION, LIFT_STAMP, PROGRAM_KEEP,
@@ -901,6 +902,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         epilog="Exit code: 0 ok, 1 baseline differences, 2 usage or build error, 3 no report.",
     )
     p.add_argument("--preset", choices=sorted(PRESETS), default="smoke")
+    p.add_argument("--no-boot-lock", action="store_true",
+                   help="do not take the machine-wide boot lock (also PG6_NO_BOOT_LOCK=1); for intentional parallel runs")
+    p.add_argument("--boot-lock-timeout-min", type=float, default=boot_lock.DEFAULT_TIMEOUT_MIN, metavar="MIN",
+                   help="give up waiting for another boot after MIN minutes (default 60)")
     p.add_argument("--name", help="run name (default <preset>-<timestamp>)")
     p.add_argument("--exe", type=Path, help="game executable (default $PLAYGTA6_EXE)")
     p.add_argument("--game-dir", type=Path, help="package directory (default $PLAYGTA6_GAME_DIR)")
@@ -1230,10 +1235,22 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     watch_done = threading.Event()
     if args.play and not args.dry_run:
         threading.Thread(target=watch_for_fault, args=(run_dir, watch_done), daemon=True).start()
+    lock = None
+    lock_info = {"enabled": False, "waited_s": 0.0}
+    if not boot_lock.disabled(env, args.no_boot_lock) and (runner is run_command or env.get("PG6_BOOT_LOCK_DIR")):
+        lock = boot_lock.BootLock(boot_lock.lock_dir(env), run_dir.name, args.boot_lock_timeout_min * 60)
+        try:
+            lock.acquire()
+        except TimeoutError as exc:
+            watch_done.set()
+            raise RunnerError(str(exc)) from exc
+        lock_info = {"enabled": True, "waited_s": round(lock.waited_s, 1), "broke_stale": lock.broke_stale}
     try:
         code, report, relaunches = run_with_relaunch(cmd, repo, run_dir, runner, watchdog_ms / 1000 + 60)
     finally:
         watch_done.set()
+        if lock is not None:
+            lock.release()
     (run_dir / "command.json").write_text(json.dumps({
         "preset": args.preset, "command": cmd, "plan": plan.steps, "harness_exit": code,
         "relaunches": relaunches}, indent=2), encoding="utf-8")
@@ -1244,8 +1261,9 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
         hs_md = HARD_STOPS_MD.read_text(encoding="utf-8") if HARD_STOPS_MD.is_file() else None
     except OSError:
         hs_md = None
-    if annotate_report(report, args.preset, run_dir.name, cmd[len(harness_command(harness)):], harness, hs_md):
-        (run_dir / "boot-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    annotate_report(report, args.preset, run_dir.name, cmd[len(harness_command(harness)):], harness, hs_md)
+    report["boot_lock"] = lock_info
+    (run_dir / "boot-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     presents = timeline_presents(report)
     log_text = ""
     try:

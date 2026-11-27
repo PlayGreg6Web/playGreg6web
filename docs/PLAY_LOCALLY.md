@@ -299,6 +299,15 @@ reverse-Z or tight depth), `@layer=2`, `@mip=1`. Offline: `pg6_native_exec --tra
 --digest-at 30` runs headless and the digest / non-black counts it prints are those of the shown target (the headless swapchain).
 Details: `docs/NATIVE_EXECUTOR_DESIGN.md`, "Present any target".
 
+## One boot at a time: the machine-wide boot lock
+
+`tools/run_native_boot.py` (and so `play_local.ps1` and the `update_prebuilt.ps1` smoke gate) takes a lock file,
+`%LOCALAPPDATA%\playgta6oot.lock` (PID, start time, run name), around the game launch only (not the build), so several agents
+or terminals on one PC do not skew each other's timings or trip watchdogs. A second boot prints who holds the lock and waits
+(`--boot-lock-timeout-min`, default 60, then it errors). A lock whose PID is dead (crash, kill) is detected and broken; it is
+released on exit. The wait is recorded in `boot-report.json` as `boot_lock.waited_s`. For intentional parallel runs pass
+`--no-boot-lock` or set `PG6_NO_BOOT_LOCK=1`. Note that an interactive `--play` session holds the lock while the window is open.
+
 ## Native boot: fast, safe repeat builds
 
 `python tools/run_native_boot.py --build-only ...` runs only the (timed) build stages
