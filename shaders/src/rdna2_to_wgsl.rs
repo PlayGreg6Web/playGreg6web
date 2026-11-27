@@ -35,6 +35,7 @@ use crate::binding_pack::{
     compact_module_bindings,
 };
 use crate::convert::{ShaderStage, format_shader_hash};
+use crate::ir_opt::{IrOptStats, optimize_module};
 use crate::pack::write_json_string;
 use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
@@ -863,6 +864,7 @@ pub struct Rdna2WgslOutput {
     pub atomic64: bool,
     pub binding_summary: Rdna2BindingSummary,
     pub binding_pack: BindingPackStats,
+    pub ir_opt: IrOptStats,
 }
 
 impl Rdna2WgslOutput {
@@ -953,6 +955,18 @@ impl Rdna2WgslOutput {
                 bp.duplicate_bindings_folded,
                 bp.cbv_merged_into_storage,
                 bp.uniform_promoted_to_storage
+            );
+        }
+        if !self.ir_opt.is_zero() {
+            let opt = self.ir_opt;
+            let _ = writeln!(
+                out,
+                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"constants_folded\": {}, \"identities_simplified\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
+                opt.bitcasts_cancelled,
+                opt.constants_folded,
+                opt.identities_simplified,
+                opt.dead_locals_removed,
+                opt.dead_emits_trimmed
             );
         }
 
@@ -26375,6 +26389,11 @@ pub fn translate_rdna2_to_wgsl(
     binding_pack.uniform_promoted_to_storage += uniform_promoted_to_storage;
     validate_emitted_bindings(&bindings, plan.stage)?;
 
+    // Post-lowering Naga IR optimization (#2137): cancel identity/round-trip bitcasts, fold pure
+    // constants and exact integer/boolean identities, and trim dead temps/emits prior to Naga
+    // validation and WGSL emission.
+    let ir_opt = optimize_module(&mut module);
+
     // Unconditional Naga validation against baseline WebGPU capabilities.
     let mut validator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
     let module_info = validator
@@ -26739,6 +26758,7 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
         atomic64: plan.atomic64,
         binding_summary,
         binding_pack,
+        ir_opt,
     })
 }
 
@@ -29223,10 +29243,11 @@ mod tests {
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("fma("), "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("pack2x16float("), "WGSL:\n{}", out.wgsl);
-        // Carry chains flow through the VCC lane bit and the SGPR lane mask s[4:5].
+        // Carry chains flow through the VCC lane bit and the SGPR lane mask s[4:5];
+        // dead upper half `s_5_` (only ever assigned `0u`, never read) is pruned by `ir_opt`.
         assert!(out.wgsl.contains("vcc"), "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("s_4_"), "WGSL:\n{}", out.wgsl);
-        assert!(out.wgsl.contains("s_5_"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("var s_5_"), "WGSL:\n{}", out.wgsl);
         assert_naga_wgsl_valid(&out.wgsl);
     }
 
@@ -29500,8 +29521,28 @@ mod tests {
                 "true".to_string(),
             ), // s_xor_b64 vcc, exec, 2
         ];
+        // Append a live LDS read/store of `reg` so dead-local elimination keeps the tested
+        // architectural register observable in the compute shader without altering its assignment.
+        let keep_compute_reg_live = |words: &mut Vec<u32>, reg: &str| {
+            if let Some(s) = reg
+                .strip_prefix("s_")
+                .and_then(|r| r.strip_suffix('_'))
+                .and_then(|n| n.parse::<u16>().ok())
+            {
+                words.push(enc_vop1(0x01, 250, s)); // v_mov_b32 v250, sN
+                words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0)); // ds_write_b32
+            } else if reg == "vcc" {
+                words.push(enc_vop2(0x01, 250, 128, 0)); // v_cndmask_b32 v250, 0, v0, vcc
+                words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0));
+            } else if reg == "scc" {
+                words.push(enc_sop2(0x0A, 90, 128 + 1, 128)); // s_cselect_b32 s90, 1, 0 (reads scc)
+                words.push(enc_vop1(0x01, 250, 90));
+                words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0));
+            }
+        };
         for (body, reg, expect) in cases {
             let mut words = body.clone();
+            keep_compute_reg_live(&mut words, reg);
             words.push(enc_sopp(0x01, 0));
             let out = translate_as(&words, Rdna2StageOverride::Compute);
             assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
@@ -29525,6 +29566,9 @@ mod tests {
         words.extend_from_slice(&enc_vop3(0x2FF, 6, 6, 0, 0, false, 0, 0, 0)); // v_lshlrev_b64 v[6:7], s6, s[0:1]
         words.extend_from_slice(&enc_vop3(0x301, 8, 7, 256 + 4, 0, false, 0, 0, 0)); // v_ashrrev_i64 v[8:9], s7, v[4:5]
         words.extend_from_slice(&enc_vop3(0x300, 11, 128 + 40, 193, 0, false, 0, 0, 0)); // v_lshrrev_b64 v[11:12], 40, -1
+        // Observe constant-folded v11/v12 in LDS so dead-local pruning retains their stores.
+        words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 11, 0, 0));
+        words.extend_from_slice(&enc_ds(0x0D, 4, 0, 0, 12, 0, 0));
         words.push(enc_sopp(0x01, 0));
 
         let out = translate_as(&words, Rdna2StageOverride::Compute);
@@ -29590,6 +29634,8 @@ mod tests {
                 // v_cmp_class_f32_e64 vcc, lit(bits), mask
                 words.extend_from_slice(&enc_vop3(0x088, 106, 0xFF, src1, 0, false, 0, 0, 0));
                 words.push(bits);
+                words.push(enc_vop2(0x01, 250, 128, 0)); // observe vcc so ir_opt keeps it live
+                words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0));
                 words.push(enc_sopp(0x01, 0));
                 let out = translate_as(&words, Rdna2StageOverride::Compute);
                 assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
@@ -29617,6 +29663,8 @@ mod tests {
             0b01,
         ));
         words.push(0xBF80_0000);
+        words.push(enc_vop2(0x01, 250, 128, 0));
+        words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0));
         words.push(enc_sopp(0x01, 0));
         let out = translate_as(&words, Rdna2StageOverride::Compute);
         assert_eq!(
@@ -31013,6 +31061,7 @@ mod tests {
         words.extend_from_slice(&enc_mimg(0x60, 0x3, 1, 2, 4, 3, 5)); // image_get_lod v[4:5], v[2:3], s[12:19], s[20:23] dmask:0x3
         words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 6, 3, 5)); // image_sample v[6:9], v[2:3], s[12:19], s[20:23]
         words.push(enc_vop2(0x03, 6, 256 + 6, 4)); // v6 = v6 + v4 (uses lod.x)
+        words.push(enc_vop2(0x03, 7, 256 + 7, 5)); // v7 = v7 + v5 (uses lod.y)
         words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [6, 7, 8, 9]));
         words.push(enc_sopp(0x01, 0));
 
@@ -31109,6 +31158,11 @@ mod tests {
         cwords.push(enc_sop1(0x15, 4, 0xFF)); // s_flbit_i32_b32 s4, 0x0000CCCC -> 16
         cwords.push(0x0000_CCCC);
         cwords.push(enc_sop1(0x15, 5, 128 + 1)); // s_flbit_i32_b32 s5, 1 -> 31
+        // Observe s2..s5 via LDS so dead-local pruning keeps their constant-folded assignments live.
+        for sreg in [2u16, 3, 4, 5] {
+            cwords.push(enc_vop1(0x01, 250, sreg));
+            cwords.extend_from_slice(&enc_ds(0x0D, (sreg * 4) as u8, 0, 0, 250, 0, 0));
+        }
         cwords.push(enc_sopp(0x01, 0));
 
         let cout = translate_as(&cwords, Rdna2StageOverride::Compute);
@@ -31306,6 +31360,11 @@ mod tests {
         cwords.push(0x0001_0000);
         cwords.push(enc_sop1(0x13, 14, 0xFF)); // s_ff1_i32_b32 s14, 0x000000F0 -> 4
         cwords.push(0x0000_00F0);
+        // Observe tested SGPRs via LDS so dead-local pruning keeps their folded assignments live.
+        for sreg in [2u16, 3, 6, 7, 10, 11, 12, 13, 14] {
+            cwords.push(enc_vop1(0x01, 250, sreg));
+            cwords.extend_from_slice(&enc_ds(0x0D, (sreg * 4) as u8, 0, 0, 250, 0, 0));
+        }
         cwords.push(enc_sopp(0x01, 0));
 
         let cout = translate_as(&cwords, Rdna2StageOverride::Compute);
@@ -31370,6 +31429,11 @@ mod tests {
                     0,
                 ));
                 words.push(packed_hi);
+                // Observe s2 and s4 via LDS so dead-local pruning keeps them live.
+                words.push(enc_vop1(0x01, 250, 2));
+                words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0));
+                words.push(enc_vop1(0x01, 250, 4));
+                words.extend_from_slice(&enc_ds(0x0D, 4, 0, 0, 250, 0, 0));
                 words.push(enc_sopp(0x01, 0));
                 let out = translate_as(&words, Rdna2StageOverride::Compute);
                 assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
@@ -31408,6 +31472,10 @@ mod tests {
         mod_words.push(1u32 << 8);
         // v_cmp_class_f16 s[4:5], 1.0 (inline 242) with neg=1, mask=0x008 (-Normal) -> 1u
         mod_words.extend_from_slice(&enc_vop3(0x08F, 4, 242, 128 + 8, 0, false, 0, 0, 0b01));
+        mod_words.push(enc_vop1(0x01, 250, 2));
+        mod_words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 250, 0, 0));
+        mod_words.push(enc_vop1(0x01, 250, 4));
+        mod_words.extend_from_slice(&enc_ds(0x0D, 4, 0, 0, 250, 0, 0));
         mod_words.push(enc_sopp(0x01, 0));
         let mod_out = translate_as(&mod_words, Rdna2StageOverride::Compute);
         assert_eq!(mod_out.unsupported_op_count, 0, "WGSL:\n{}", mod_out.wgsl);

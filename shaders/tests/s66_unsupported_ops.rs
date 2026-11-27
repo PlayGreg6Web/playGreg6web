@@ -451,6 +451,10 @@ fn s66_constant_fold_semantics_and_determinism() {
     // 9. Boundary VGPR v255 with v_pk_add_i16 and v_cvt_f16_u16
     words.extend_from_slice(&enc_vop3p(0x02, 255, 256 + 0, 128 + 7, 0, true, 0, 0b11, 0, 0));
     words.push(enc_vop1(0x50, 255, 256 + 255));
+    // Observe v7 and s4 via LDS so dead-local pruning retains their folded assignments.
+    words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 7, 0, 0));
+    words.push(enc_vop1(0x01, 250, 4));
+    words.extend_from_slice(&enc_ds(0x0D, 4, 0, 0, 250, 0, 0));
     words.push(enc_sopp(0x01, 0));
 
     let out1 = translate_and_validate(&words, Rdna2StageOverride::Compute);

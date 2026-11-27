@@ -367,7 +367,8 @@ fn s72_v_interp_f16_high_bit_unpacks_upper_and_paired_lower_halves() {
         false,
         0,
     ));
-    words.extend_from_slice(&enc_exp(0, 0x1, true, true, true, [6, 0, 0, 0]));
+    // Export v6 plus v4/v5 so p1ll results remain live (not pruned by dead-local elimination).
+    words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [6, 4, 5, 0]));
     words.push(enc_sopp(0x01, 0));
 
     let out = translate_and_validate(&words, Rdna2StageOverride::Pixel);
