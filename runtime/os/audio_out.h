@@ -259,9 +259,28 @@ private:
     uint64_t (*present_fn_)() = nullptr;
 };
 
+// Render-thread scheduling class (--audio-mmcss / PLAYGTA6_AUDIO_MMCSS). Default ProAudio.
+enum class MmcssMode { ProAudio, Audio, Off };
+
+inline const char* mmcss_mode_name(MmcssMode m) {
+    return m == MmcssMode::Audio ? "audio" : m == MmcssMode::Off ? "off" : "pro-audio";
+}
+
+// "pro-audio" | "audio" | "off" (case-insensitive). False (and *out untouched) for anything else.
+inline bool parse_mmcss_mode(const std::string& text, MmcssMode* out) {
+    std::string t;
+    for (char c : text) t += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    if (t == "pro-audio") *out = MmcssMode::ProAudio;
+    else if (t == "audio") *out = MmcssMode::Audio;
+    else if (t == "off") *out = MmcssMode::Off;
+    else return false;
+    return true;
+}
+
 inline std::string report_json(bool device_open, uint32_t device_rate, const Stats& s, const std::string& error,
                         uint32_t device_channels = 0, uint32_t device_channel_mask = 0,
-                        uint64_t epoch_us = 0) {
+                        uint64_t epoch_us = 0, MmcssMode mmcss_mode = MmcssMode::ProAudio,
+                        bool mmcss_registered = false) {
     std::string o = "{\"enabled\": true, \"device_open\": ";
     o += device_open ? "true" : "false";
     o += ", \"device_rate\": " + std::to_string(device_rate);
@@ -269,6 +288,8 @@ inline std::string report_json(bool device_open, uint32_t device_rate, const Sta
     o += ", \"device_channels\": " + std::to_string(device_channels);
     o += ", \"device_channel_mask\": " + std::to_string(device_channel_mask);
     o += ", \"render_channels\": 2";
+    o += std::string(", \"mmcss_mode\": \"") + mmcss_mode_name(mmcss_mode) + "\"";
+    o += std::string(", \"mmcss_registered\": ") + (mmcss_registered ? "true" : "false");
     o += ", \"frames_in\": " + std::to_string(s.frames_in);
     o += ", \"frames_played\": " + std::to_string(s.frames_played);
     o += ", \"underruns\": " + std::to_string(s.underruns);

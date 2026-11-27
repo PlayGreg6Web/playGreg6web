@@ -25,6 +25,8 @@ param(
     [int]$MaxMs = 7200000,
     [ValidateSet("auto", "fifo", "mailbox", "immediate")]
     [string]$PresentMode = "auto",
+    [ValidateSet("", "pro-audio", "audio", "off")]
+    [string]$AudioMmcss = "",
     [int]$MaxFps = 0,
     [switch]$ConsoleTiming,
     [switch]$FreshSetup,
@@ -47,6 +49,7 @@ play_native.ps1: build (if stale) and play natively.
   -Update        fast-forward to origin/main first (never discards local changes)
   -FreshSetup    empty save dir so the setup screens appear
   -PresentMode   auto|fifo|mailbox|immediate     -MaxFps N  (0 = off)
+  -AudioMmcss    pro-audio|audio|off  (WASAPI render thread MMCSS class; A/B for audio-on fps drops)
   -ConsoleTiming honor the title's sync interval (menus at the console's 30 fps instead of 60)
   -Record        save real input to %LOCALAPPDATA%\playgta6\recordings   -Keymap <file>  rebind keys
   -Prebuilt      play the ready-made build (no compile; refresh it with tools\update_prebuilt.ps1)
@@ -91,6 +94,7 @@ if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
 if ($Record -or $RecordFile) { $argv += "--record-input"; if ($RecordFile) { $argv += $RecordFile } }
 if ($Keymap) { $argv += @("--keymap", $Keymap) }
 if ($PresentMode -ne "auto") { $argv += @("--present-mode", $PresentMode) }
+if ($AudioMmcss) { $argv += @("--audio-mmcss", $AudioMmcss) }
 if ($ConsoleTiming) { $argv += @("--present-interval", "honor") }
 if ($MaxFps -gt 0) { $argv += @("--max-fps", $MaxFps) }
 if ($FreshSetup) { $argv += "--fresh-setup" }

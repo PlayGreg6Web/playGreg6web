@@ -337,14 +337,17 @@ struct Wasapi::Impl {
     // avrt.lib link dependency), falling back to a raised thread priority.
     void boost_render_thread() {
         typedef HANDLE(WINAPI * AvSetFn)(LPCWSTR, LPDWORD);
+        mmcss_registered_ = false;
+        if (mmcss_mode_ == MmcssMode::Off) return;
         avrt_ = LoadLibraryW(L"avrt.dll");
         if (avrt_) {
             auto set = reinterpret_cast<AvSetFn>(GetProcAddress(avrt_, "AvSetMmThreadCharacteristicsW"));
             if (set) {
                 DWORD task = 0;
-                mmcss_ = set(L"Pro Audio", &task);
+                mmcss_ = set(mmcss_mode_ == MmcssMode::Audio ? L"Audio" : L"Pro Audio", &task);
             }
         }
+        mmcss_registered_ = mmcss_ != nullptr;
         if (!mmcss_) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
 
@@ -470,6 +473,8 @@ struct Wasapi::Impl {
     Feed* feed_ = nullptr;
     std::atomic<bool> running_{false};
     std::thread thread_;
+    MmcssMode mmcss_mode_ = MmcssMode::ProAudio;
+    std::atomic<bool> mmcss_registered_{false};
     uint32_t device_rate_ = 0;
     uint32_t dev_channels_ = 0;
     uint32_t dev_mask_ = 0;
@@ -511,6 +516,9 @@ Wasapi::~Wasapi() {
     impl_->stop();
     delete impl_;
 }
+void Wasapi::set_mmcss_mode(MmcssMode mode) { impl_->mmcss_mode_ = mode; }
+MmcssMode Wasapi::mmcss_mode() const { return impl_->mmcss_mode_; }
+bool Wasapi::mmcss_registered() const { return impl_->mmcss_registered_.load(); }
 bool Wasapi::start(Feed& feed, std::string* error) { return impl_->start(feed, error); }
 void Wasapi::stop() { impl_->stop(); }
 bool Wasapi::open() const { return impl_->device_rate_ != 0; }

@@ -168,6 +168,22 @@ int main() {
         CHECK(k.find("\"device_channel_mask\": 63") != std::string::npos);
     }
 
+    {
+        ao::MmcssMode m = ao::MmcssMode::Off;
+        CHECK(ao::parse_mmcss_mode("pro-audio", &m) && m == ao::MmcssMode::ProAudio);
+        CHECK(ao::parse_mmcss_mode("Audio", &m) && m == ao::MmcssMode::Audio);
+        CHECK(ao::parse_mmcss_mode("OFF", &m) && m == ao::MmcssMode::Off);
+        m = ao::MmcssMode::Audio;
+        CHECK(!ao::parse_mmcss_mode("loud", &m) && m == ao::MmcssMode::Audio);
+        CHECK(!ao::parse_mmcss_mode("", &m));
+        const std::string d = ao::report_json(true, 48000, ao::Stats{}, "");
+        CHECK(d.find("\"mmcss_mode\": \"pro-audio\"") != std::string::npos);
+        CHECK(d.find("\"mmcss_registered\": false") != std::string::npos);
+        const std::string r = ao::report_json(true, 48000, ao::Stats{}, "", 2, 3, 0, ao::MmcssMode::Off, true);
+        CHECK(r.find("\"mmcss_mode\": \"off\"") != std::string::npos);
+        CHECK(r.find("\"mmcss_registered\": true") != std::string::npos);
+    }
+
     if (g_failures == 0) std::printf("test_audio_out: all passed\n");
     return g_failures == 0 ? 0 : 1;
 }

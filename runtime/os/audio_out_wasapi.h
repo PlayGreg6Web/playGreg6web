@@ -18,6 +18,12 @@ public:
     Wasapi(const Wasapi&) = delete;
     Wasapi& operator=(const Wasapi&) = delete;
 
+    // Before start(): the render thread's scheduling class. mmcss_registered() is true once the
+    // MMCSS registration succeeded (false for off, or when avrt.dll refused).
+    void set_mmcss_mode(MmcssMode mode);
+    MmcssMode mmcss_mode() const;
+    bool mmcss_registered() const;
+
     bool start(Feed& feed, std::string* error);
     void stop();
     bool open() const;

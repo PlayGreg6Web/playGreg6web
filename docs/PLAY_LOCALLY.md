@@ -264,6 +264,15 @@ when reached), `-NoBuild`, `-TrustBuild`, `-DryRun`, `-BuildDir`. The report lan
 Same thing from Python: `python tools/run_native_boot.py --play [--fresh-setup] [--save-dir DIR] ...`
 (or `--native-executor` for just the build).
 
+### A/B the audio thread's MMCSS class: `-AudioMmcss`
+
+The WASAPI render thread registers with MMCSS ("Pro Audio") for glitch-free output. If `--audio-out` runs show a lower fps
+or more missed vblanks than without audio, A/B the scheduling class:
+`.\tools\play_native.ps1 -AudioMmcss off` (also `audio`, `pro-audio`; default `pro-audio`). Same switch: `--audio-mmcss
+pro-audio|audio|off` on `playgta6_boot` / `run_native_boot.py --play`, or env `PLAYGTA6_AUDIO_MMCSS` (the flag wins).
+`off` leaves the thread at normal priority (no MMCSS, no priority boost). The `audio_out` block of `boot-report.json` records `mmcss_mode`
+and `mmcss_registered` (false when `off` or when avrt.dll refused), so compare fps p5 / missed vblanks per mode.
+
 ### Debugging a black or garbled screen: `--show-target`
 
 `playgta6_boot --window ... --show-target <selector>` (from `run_native_boot.py --play`: `-- --show-target <selector>`)

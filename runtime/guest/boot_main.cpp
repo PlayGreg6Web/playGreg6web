@@ -49,6 +49,8 @@
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --audio-dump <file.wav>  write the stereo float32 48 kHz mix (os/audio_downmix) to a WAV file, max 10 minutes
+//   --audio-mmcss <pro-audio|audio|off>  render-thread MMCSS class for --audio-out (env PLAYGTA6_AUDIO_MMCSS;
+//                        default pro-audio); the audio_out report block carries mmcss_mode / mmcss_registered
 //   --audio-out          play the stereo mix live (Windows WASAPI shared mode, default render endpoint);
 //                        off by default; no device = warning only; underruns are counted in the report
 //   --gpu-capture-frames <n>  frames to capture (default 10)
@@ -255,6 +257,7 @@ struct Options {
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
     uint64_t profile_start_ms = 0;        // --profile-start-ms: sample only from this time on (a screen's window)
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
+    std::string audio_mmcss;        // --audio-mmcss / PLAYGTA6_AUDIO_MMCSS (empty = default)
     bool audio_out = false;         // --audio-out: live WASAPI playback of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
@@ -321,6 +324,7 @@ void usage() {
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--record-input <file>] [--keymap <file>]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
+                 "                     [--audio-mmcss pro-audio|audio|off]\n"
                  "                     [--bcpack-tables <file>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
@@ -451,7 +455,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--gpu-time-log" || a == "--window-script" || a == "--input-script" || a == "--record-input" || a == "--keymap" || a == "--watch-gpu-va" ||
-                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
+                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" || a == "--audio-mmcss" ||
                    a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
                 return false;
@@ -473,6 +477,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
                                   : a == "--audio-dump" ? o.audio_dump
+                                  : a == "--audio-mmcss" ? o.audio_mmcss
                                   : a == "--bcpack-tables" ? o.bcpack_tables
                                   : a == "--record-indirect-targets" ? o.record_indirect_targets
                                   : a == "--profile" ? o.profile
@@ -1786,7 +1791,9 @@ int main(int argc, char** argv) {
                                                       g_audio_wasapi.device_channels(),
                                                       g_audio_wasapi.device_channel_mask(),
                                                       playgta6::os::audio_out::steady_now_us() -
-                                                          playgta6::guest::boot_elapsed_ms() * 1000ull);
+                                                          playgta6::guest::boot_elapsed_ms() * 1000ull,
+                                                      g_audio_wasapi.mmcss_mode(),
+                                                      g_audio_wasapi.mmcss_registered());
                 }
             }
             if (s_with_presents) {
@@ -1912,6 +1919,19 @@ int main(int argc, char** argv) {
     }
     if (g_options.audio_out) {
         g_audio_feed.set_present_source([]() -> uint64_t { return playgta6::guest::boot_present_count(); });
+        {
+            std::string mm = g_options.audio_mmcss;
+            if (mm.empty()) {
+                const char* env = std::getenv("PLAYGTA6_AUDIO_MMCSS");
+                if (env) mm = env;
+            }
+            playgta6::os::audio_out::MmcssMode mode = playgta6::os::audio_out::MmcssMode::ProAudio;
+            if (!mm.empty() && !playgta6::os::audio_out::parse_mmcss_mode(mm, &mode)) {
+                std::fprintf(stderr, "[harness] --audio-mmcss: unknown mode '%s' (pro-audio|audio|off)\n", mm.c_str());
+                return kExitUsage;
+            }
+            g_audio_wasapi.set_mmcss_mode(mode);
+        }
         g_audio_out_active = g_audio_wasapi.start(g_audio_feed, &g_audio_out_error);
         if (!g_audio_out_active) {
             std::fprintf(stderr, "[harness] --audio-out: no audio device, continuing silent (%s)\n",
