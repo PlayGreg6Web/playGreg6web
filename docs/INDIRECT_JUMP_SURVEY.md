@@ -9,13 +9,16 @@ table/pointer location. "Reachable" walks direct calls and tail calls from the P
 callbacks only; indirect calls are not followed, so it is a lower bound. The report holds addresses,
 section names and counts only.
 
-## Result for the target executable (refined discovery, 435,718 functions)
+## Result for the target executable (refined discovery, 435,719 functions; refreshed after #1781)
 
-- 8,333 unresolved indirect jumps; 753 sit in the 32,178 functions reachable from boot.
+- 8,318 unresolved indirect jumps; 751 sit in the 32,180 functions reachable from boot.
 - By lifter reason: loaded_pointer 5,252, memory_operand 1,795, register_live_in 1,229,
-  table_base_unknown 42, table_unbounded 6, computed 9.
-- About 8,230 of them are tail calls through a pointer, not switches. Only about 100 have a scaled
-  index (role `switch`); 8 or so of those are boot-reachable.
+  table_base_unknown 33 (7 reachable), table_unbounded 5 (0 reachable), computed 4.
+  Before the #1781 table work these were 42 / 6 / 9 (and 8,333 total, 753 reachable).
+- By role: tail_call 8,280 (744 reachable), fn_table 18, ptr_array 11, data_table 5, switch 4 (2 reachable).
+  About 8,280 of them are tail calls through a pointer, not switches; only about 38 have a scaled
+  index into a table the matcher rejects.
+- Pointer-slot tail calls with a statically seeded target: 21 (was 4).
 
 ## Top patterns (total / reachable from boot)
 
@@ -28,9 +31,11 @@ section names and counts only.
 | 5 | `jmp [reg+disp]`, no index, no guard | 647 | 58 | 0x140048387 0x14005aa98 0x14006acf9 |
 | 6 | `jmp reg`, register live-in (pointer passed in) | 1,172 | 10 | 0x14016d002 0x14016d01c 0x140243482 |
 | 7 | as #1 where the pointer slot is in `.data` (writable) | 42 | 7 | 0x14017e042 0x1404b2156 0x1404b215c |
-| 15/21/25/28 | switch-role, byte-scaled (`scale=1`) index into a loaded-pointer table | 13 | 5 | 0x14469f9f9 0x144f6683d 0x140338024 0x1406c90a0 |
-| 16/18/26/27 | switch-role, `jmp [base+idx*8]` with base from `.rdata`/`.data` anchor or loaded pointer (`table_base_unknown`) | 21 | 5 | 0x142847e4d 0x14030a57a 0x14013ef7c 0x141672a85 |
-| 24 | switch-role, 32-bit offset table, base register live-in | 5 | 1 | 0x1411be4ed 0x1411c0ab4 0x14198b644 |
+| 15/21/25/28 (now #16, #23 in the refreshed ranking) | byte-scaled (`scale=1`) index into a loaded-pointer table | 8 | 3 | 0x14469f9f9 0x144f6683d 0x140338024 0x1406c90a0 |
+| 16/18/26/27 (now #17, #19, #26, #30 in the refreshed ranking) | `jmp [base+idx*8]` with base from `.rdata`/`.data` anchor or loaded pointer (`table_base_unknown`, roles fn_table/data_table/ptr_array) | 33 | 7 | 0x142847e4d 0x14030a57a 0x14013ef7c 0x141672a85 |
+| 24 (now #31, #34) | switch-role, `jmp [mem]`/`jmp reg` scale 8, base register live-in (`table_base_unknown`) | 3 | 3 | 0x1411be4ed 0x1411c0ab4 0x14198b644 |
+
+Note: the row ids above are from the earlier survey; the pattern ranking is regenerated on each run, so ids shift. Remaining table shapes (refreshed): `table_base_unknown` fn_table with `.rdata` anchor and no guard, 13 sites, 1 reachable (e.g. 0x14030a57a 0x1405dd3dd 0x14073841a 0x140a95646); `.data` anchor with null check, 2 sites, both reachable (0x142847e4d 0x142847e6d); live-in-base switches (patterns #31, #34), 3 reachable sites.
 
 Equality guards are null/sentinel checks of lazily initialised function pointers, not bounds checks.
 
