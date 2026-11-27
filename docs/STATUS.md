@@ -78,29 +78,25 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 
 How to run it: [quick start](PLAY_LOCALLY.md#quick-start-play-natively-windows).
 
-Setup screens, loading, then the Bink videos decode and play. A headless run reaches about 110 s and
-**stops on `XSystemGetAppSpecificDeviceId`** (a trapping stub on purpose, an owner decision). Nothing past it
-has been seen. Music has not started yet. What the diagnostics (#1947, #1954, #1958) showed: the audio `.rpf` opens
-happen inside the package (`PG6_AUDIO_TRACE` logs each audio-path `CreateFile`), and the music controller never gets
-a start event before the device-ID stop, so the missing music is a consequence of that stop, not a separate bug. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
+Setup screens, loading, then the Bink videos decode and play, then the title streams its world. Boots now end in
+a page-table crash inside `sub_140F2C470` (a page with two owners). The root cause is traced to our
+`GetResourceAllocationInfo` size for some streamed textures; the fix is in progress (see "Since #2045" below). Music has
+not started yet; it is expected after that crash is gone. What the diagnostics (#1947, #1954, #1958) showed: the audio
+`.rpf` opens happen inside the package (`PG6_AUDIO_TRACE` logs each audio-path `CreateFile`). Std shader pack reflection
+covers 31,777 of 31,822 shaders (#1735).
 
-Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). All three are
-still pending; options and consequences in
-[HARD_STOPS.md section 7](HARD_STOPS.md#7-pending-owner-decisions-device-id-and-xuser-sign-in-state):
-
-1. Device ID (`XSystemGetAppSpecificDeviceId`): answer with an error, no id (recommended).
-2. `XUser` sign-in state: "signed in" for the single offline local user, no tokens (recommended).
-3. Store licence (`XStoreAcquireLicenseForDurables` 71/72, slots 20/21/22/65/68): the store brief recommends
-   truthful offline / not-found answers and no ownership claims.
+Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md)) are implemented as recommended (#2029, #2031): the device
+id answers `E_NOTIMPL`, `XUser` reports local sign-in state, `XStore` slots 28/65 answer truthfully offline; the store
+licence slots stay offline / not-found with no ownership claims.
 
 Also open: `XUserGetTokenAndSignatureResult` (slot 25) offline HRESULT. `XNetworking` slots 3/4/5/8/9/10/14 already
 answer offline (network unreachable, #1872); the security/certificate ones are hard stops and never vouch for a server.
 
-Open investigations (no owner decision needed, nothing merged that fixes them yet):
+Open investigations (nothing merged that fixes them yet):
 
 - Title job-graph stall: a run stalls with the title's own `int3` assert in its job graph; the fault record gives
   the address and call stack (see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md)).
-- Music: expected to start only after the device-ID decision (see above); recheck once the stop is answered.
+- Music: has not started; recheck once the page-table crash is fixed.
 - Browser: an `INDIRECT_CALL_MISS` ending is waiting for a crash report from a real browser run
   ([WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) says what to send).
 
@@ -135,11 +131,17 @@ Lazy commit (#2002, Marc) regressed loading: the image loader and host `fread`/`
 Marc, one line each: GPU sRGB+UAV and HDR compute fixes (#1978), colour/gamma frame audit CLI (#1911), `interpolate(flat)` / location patching (#1986), Wasm64 SIMD128 hot loops (#1997), `[fault-record]` delivery and `/pg6_dump` flush (#1996), UCRT path shims (#1998), WGSL discard / EXP fixes (#1999), `pdata_interior` and jump-table recovery (#2001), `render_state_packets` hardening (#2003), pooled FD budget fix (#2004), opaque alpha on the base plane (#2006), Wave-4/5 GPU hang guards, probe timeout and device-lost replay (#2007, #2016, #2018), loader Present backpressure (#2008), RT BVH prelude race and console WebGPU features (#1990), high-throughput Range server and OPFS L2 (#1980), Win32/COM and XMA2/Opus audio hardening (#1976).
 
 Repo rename: the project is now PlayGreg6Web (`PlayGreg6Web/playGreg6web`); main history was rewritten, so old clones and branches must be re-cloned or recreated from `origin/main`. Old GitHub URLs redirect. The local save folder is still `%LOCALAPPDATA%\playgta6\saves`.
-Since #2022 (merged, #2025-#2045): **the owner decisions above are now implemented** (the "stops on device ID" and "all three pending" text above is out of date): the four denied Media Foundation imports are bound as failing shims (#2029); the device id answers `E_NOTIMPL`, `XUser` reports local sign-in state with find/compare, and `XStore` slots 28/65 answer truthfully offline (#2031). `XGTextureAddressComputer` slot 9 `CopyFromSubresource` (GFX10 detile into linear rows, inverse of slot 8) is implemented (#2034). GPU: address-texture LRU counters in the boot report (#2032), pooled textures are cleared GPU-side and pool chains above 64 KiB are pooled (#2036). The vmem flush serves precollected takes in one pass (#2027). Recompiler: #2033 skipped store-backs of registers that still match `%state`, but later evidence on its effect was inconclusive and it was reverted (#2040). Lifter/runtime `%state` boundary contract documented and tested (#2043); the boot report has a `blocked_waits` census (parked waiters, object state, last signaler; #2044); the shard lift-cache key now covers callee `touched_flags` / `written_flags`, fixing stale caller IR (#2045).
-
-Current boot status (after those): with the shader pack, the run hangs at about 93 s on a streaming request that never completes; without the pack it ran 420 s. A nondeterministic page-table crash is under investigation. Neither is resolved.
+Since #2022 (merged, #2025-#2045): **the owner decisions are implemented**: the four denied Media Foundation imports are bound as failing shims (#2029); the device id answers `E_NOTIMPL`, `XUser` reports local sign-in state with find/compare, and `XStore` slots 28/65 answer truthfully offline (#2031). `XGTextureAddressComputer` slot 9 `CopyFromSubresource` (GFX10 detile into linear rows, inverse of slot 8) is implemented (#2034). GPU: address-texture LRU counters in the boot report (#2032), pooled textures are cleared GPU-side and pool chains above 64 KiB are pooled (#2036). The vmem flush serves precollected takes in one pass (#2027). Recompiler: #2033 skipped store-backs of registers that still match `%state`, but later evidence on its effect was inconclusive and it was reverted (#2040). Lifter/runtime `%state` boundary contract documented and tested (#2043); the boot report has a `blocked_waits` census (parked waiters, object state, last signaler; #2044); the shard lift-cache key now covers callee `touched_flags` / `written_flags`, fixing stale caller IR (#2045).
 
 Marc, one line each: web ClearTexture (opcode 63) in worker and `render_state_packets` (#2042), loader `SHARED_WASM_STUB_*` TDZ fix (#2041), RDNA2 divergent-branch descriptor load defs (sampler-heap RootDescriptor leaks, #2038), async replay bind-group loss and dump caps (#2037), precompiled/reused split side modules and bounded caches (#2035).
+
+Since #2045 (merged, #2046-#2099): import thunks and `XMem` hooks honour `unwind_pending` and sync probed arguments (#2046). The live pipeline prewarm builds only while the live pump is idle, which fixed the std-pack menu-to-ingame hang (83 -> 2509 presents, #2054). The fault/stop report never waits on a submitter stuck in a full live pump (#2057); the `prebuilt_smoke` gate passes a run ended by the harness's own bound (#2058). Shader compile moved off the queue thread: pack WGSL is scanned once and modules compile on worker threads with pipelines deferred until ready (#2060, #2074), the WGSL text is dropped after its module exists and the fullscreen pipeline wait budget went from 10 s to 1 s per frame (#2084). Texture copies into plain destinations use a `CopyTexture` packet (#2073). `GetResourceTiling` answers the 4 KiB / 256 B modes with the 64 KiB tile rule and the 64 KB answers tile each slice as the title maps them (#2079, #2082); layout answers and the buddy allocator are ruled out as the cause of the `sub_140F2C470` double-owner page (#2071). Device errors on the current boot went from 18,324 to 389: pipeline layouts fitted to the pack WGSL and async failures classified (#2086), buffer bindings fitted to device limits plus an error-kind histogram (#2095), render pipelines built with the attachment formats and sample count of their pass (#2097). The storage relocation cache keeps a frame's working set (LRU index, 64Ki entries / 1 GiB bound), which fixed a 66 s stall and took execute from 29.7 to 5.0 ms/frame (#2093). Small-resource placement follows the D3D12 rule: textures within 64 KiB, 4 KiB blocks (#2098). `update_prebuilt` runs natives through `Invoke-Native` so stderr never raises NativeCommandError (#2099). A real-Dawn mesh-to-compute test and the mesh pipeline contract are documented (#2055); recomp host-diff tests cover aliased bit/BMI forms (#2059).
+
+GDemay, one line each: GFX10 texture copies of contiguous runs (#2088), 4 KiB sparse buffer shadows (#2089), only selected small XG texture mips are snapshotted (#2096), no redundant snapshots for shared web texture uploads (#2094), GPU clears for pooled Wasm guest textures (#2092), first-fit address reservations skip occupied prefixes (#2065), Dawn blob-cache eviction with a min-heap (#2063), web FNV64 verification (#2061), bootset accounting scans (#2062) and PGIM relocation validation (#2064) made cheaper.
+
+Marc, one line each: deferred ranged preload shader compiles remove a 26-40 s GPU stall and device.lost (#2056), sRGB viewFormats / STORAGE_BINDING view fix (#2072), `v_nop_e64` literal consumption and FSSM `s_swappc_b64` vertex fetch inputs (#2077), 1-roundtrip HTTPFS Stat, real DStorage `file_size_` and live `ioWorkerStats` (#2075).
+
+Current boot status: boots end in the `sub_140F2C470` page-table crash; its root cause is our `GetResourceAllocationInfo` size for some streamed textures (fix in progress).
 
 ## Ray tracing
 
