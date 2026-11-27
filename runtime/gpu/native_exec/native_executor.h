@@ -277,6 +277,11 @@ struct ExecutorStats {
     uint64_t bind_group_sample_type_dummies = 0;  // integer view vs float layout entry (or the reverse): dummy bound
     uint64_t buffer_bindings_clamped = 0;  // buffer ranges cut to the device's binding-size rules (fit_buffer_binding)
     uint64_t buffer_bindings_dummied = 0;  // buffer bindings no range of which fits those rules: dummy bound
+    uint64_t view_dim_coerced = 0;         // texture views re-created with the layout entry's viewDimension (cube-array view meeting a 2d entry, ...)
+    uint64_t view_dim_unfixable = 0;       // view dimension mismatches the texture cannot satisfy (cube entry over < 6 layers)
+    uint64_t storage_alias_copies = 0;     // read-only buffer bindings overlapping a writable one, bound through a copy
+    uint64_t storage_alias_dispatch_restarts = 0;  // compute passes split to take those copies
+    uint64_t storage_alias_unfixable = 0;  // overlapping pairs of two writable bindings (no read-only side to copy)
     uint64_t bind_group_depth_layout_dummies = 0;  // depth view vs float/sint/uint layout entry (or the reverse): dummy bound
     uint64_t depth_float_copies = 0;       // depth aspect re-copied into an r32float twin (float layout entry meets a depth texture)
     uint64_t depth_twins_created = 0;      // ... of which r32uint/r32sint (uint/sint entry on a depth texture): depth_int_twins_created

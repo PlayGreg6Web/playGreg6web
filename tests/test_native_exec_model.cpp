@@ -21,6 +21,7 @@
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/pipe_budget_model.h"
 #include "gpu/native_exec/shader_text_model.h"
+#include "gpu/native_exec/view_alias_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -1273,6 +1274,60 @@ void test_error_scope_model() {
     CHECK(log.total() == 203);
 }
 
+void test_view_alias_model() {
+    // view dimension vs the entry's (6-layer 2d texture)
+    EntryViewFit f = fit_view_to_entry(1, 6, 5, 0, 6, 2);  // cube-array view, 2d entry
+    CHECK(f.fit == ViewFit::Coerced && f.dim == 2 && f.layer_count == 1 && f.base_layer == 0);
+    f = fit_view_to_entry(1, 6, 4, 0, 6, 3);  // cube view, 2d-array entry
+    CHECK(f.fit == ViewFit::Coerced && f.dim == 3 && f.layer_count == 6);
+    f = fit_view_to_entry(1, 6, 3, 0, 0, 4);  // all-layers array view, cube entry
+    CHECK(f.fit == ViewFit::Coerced && f.dim == 4 && f.layer_count == 6);
+    f = fit_view_to_entry(1, 12, 3, 0, 0, 5);  // 12 layers -> cube-array of 12
+    CHECK(f.fit == ViewFit::Coerced && f.dim == 5 && f.layer_count == 12);
+    f = fit_view_to_entry(1, 8, 3, 0, 0, 5);  // 8 layers -> cube-array of 6
+    CHECK(f.fit == ViewFit::Coerced && f.layer_count == 6);
+    f = fit_view_to_entry(1, 2, 3, 0, 0, 4);  // cube entry, 2 layers: no
+    CHECK(f.fit == ViewFit::Unfixable);
+    f = fit_view_to_entry(1, 6, 3, 2, 0, 4);  // 4 layers remain: no
+    CHECK(f.fit == ViewFit::Unfixable);
+    f = fit_view_to_entry(1, 6, 0, 0, 0, 3);  // default view of a layered texture is 2d-array already
+    CHECK(f.fit == ViewFit::Same);
+    f = fit_view_to_entry(1, 1, 0, 0, 0, 2);  // default view of a single layer is 2d
+    CHECK(f.fit == ViewFit::Same);
+    f = fit_view_to_entry(1, 6, 0, 0, 0, 2);  // default 2d-array view, 2d entry: slice 0
+    CHECK(f.fit == ViewFit::Coerced && f.dim == 2 && f.layer_count == 1);
+    f = fit_view_to_entry(2, 1, 6, 0, 0, 2);  // a 3d texture is never touched
+    CHECK(f.fit == ViewFit::Same);
+    f = fit_view_to_entry(1, 6, 5, 0, 6, 6);  // neither is a 3d entry
+    CHECK(f.fit == ViewFit::Same);
+
+    // buffer aliasing
+    auto bind = [](uint64_t buf, uint32_t g, uint32_t b, uint64_t off, uint64_t size, bool w) {
+        AliasBinding a;
+        a.buffer = buf;
+        a.group = g;
+        a.binding = b;
+        a.offset = off;
+        a.size = size;
+        a.writable = w;
+        return a;
+    };
+    AliasPlan p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 0, 1, 0, 64, false)});
+    CHECK(p.copy.size() == 1 && p.copy[0] == 1 && p.unfixable == 0);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, false), bind(1, 1, 0, 32, 64, true)});  // across groups, order swapped
+    CHECK(p.copy.size() == 1 && p.copy[0] == 0 && p.unfixable == 0);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 1, 0, 64, 64, false)});  // adjacent, no overlap
+    CHECK(p.copy.empty() && p.unfixable == 0);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(2, 1, 0, 0, 64, false)});  // other buffer
+    CHECK(p.copy.empty());
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, false), bind(1, 1, 0, 0, 64, false)});  // read-only twice is fine
+    CHECK(p.copy.empty() && p.unfixable == 0);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 1, 0, 0, 64, true)});  // two writers: counted
+    CHECK(p.copy.empty() && p.unfixable == 1);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 0, 1, 0, 16, false), bind(1, 1, 0, 8, 16, false)});
+    CHECK(p.copy.size() == 2 && p.copy[0] == 1 && p.copy[1] == 2);
+}
+
 void test_binding_fit() {
     // whole 128 KiB uniform buffer -> cut to 64 KiB; a 1 KiB range stays as is
     BufferBindingFit f = fit_buffer_binding(false, 131072, 0, 0, 0, 65536);
@@ -1478,6 +1533,7 @@ int main() {
     test_error_scope_model();
     test_device_error_kinds();
     test_binding_fit();
+    test_view_alias_model();
     test_clear_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

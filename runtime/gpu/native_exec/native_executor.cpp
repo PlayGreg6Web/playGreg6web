@@ -36,6 +36,7 @@
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/clear_model.h"
 #include "gpu/native_exec/binding_fit_model.h"
+#include "gpu/native_exec/view_alias_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
@@ -301,6 +302,24 @@ struct BgHandles {
 struct BgDesc {
     std::vector<RemapResource> model;
     std::vector<BgHandles> handles;  // parallel to `model`
+};
+
+// What a created bind group binds, kept to resolve buffer aliasing at dispatch (a writable storage binding
+// may not overlap another binding of the same buffer): the buffer bindings, plus what rebuilds the group
+// with one of them swapped for a copy.
+struct BgBufInfo {
+    uint32_t binding = 0;
+    wgpu::Buffer buffer;
+    uint64_t offset = 0, size = 0;  // size explicit (kWholeSize resolved against the buffer)
+    bool writable = false;
+    int dyn_rank = -1;  // index into the dynamic offsets, -1 = static
+    size_t entry = 0;   // index into BgInfo::entries
+};
+struct BgInfo {
+    wgpu::BindGroup group;  // keeps the handle alive: the registry is keyed by it
+    wgpu::BindGroupLayout layout;
+    std::vector<wgpu::BindGroupEntry> entries;
+    std::vector<BgBufInfo> bufs;
 };
 
 // `renderPipelineAutoLayoutMeta` / `computePipelineMeta`: a pipeline whose explicit layout did not
@@ -651,6 +670,10 @@ struct NativeExecutor::Impl {
     std::unordered_map<std::string, wgpu::Buffer> dummy_buffers;
     std::unordered_map<std::string, wgpu::Sampler> dummy_samplers;
     std::unordered_map<std::string, wgpu::TextureView> dummy_views;
+    // Buffer aliasing (view_alias_model.h): bind group handle -> its buffer bindings; scratch copies by size class.
+    std::unordered_map<const void*, std::shared_ptr<BgInfo>> bg_infos;
+    std::unordered_map<uint64_t, std::vector<wgpu::Buffer>> alias_scratch;
+    std::unordered_map<uint64_t, size_t> alias_scratch_used;  // per dispatch
     std::vector<wgpu::Texture> dummy_textures;
     std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth twin
     std::set<uint32_t> norm_twin_sources;   // texture ids that own a norm16 float twin
@@ -2473,6 +2496,8 @@ struct NativeExecutor::Impl {
         wgpu::BufferDescriptor bd{};
         bd.size = c.byte_size;
         bd.usage = static_cast<wgpu::BufferUsage>(c.usage_flags);
+        // A storage buffer can be copied (an aliasing read-only binding is bound through a copy).
+        if (c.usage_flags & 0x80u) bd.usage |= wgpu::BufferUsage::CopySrc;
         BufferEntry e;
         e.buffer = device.CreateBuffer(&bd);
         e.size = c.byte_size;
@@ -4997,7 +5022,10 @@ struct NativeExecutor::Impl {
         Dummy d;
         if (le.kind == 0) {
             const uint64_t size = std::max<uint64_t>(256, (le.min_binding_size + 3) / 4 * 4);
-            const std::string key = "buffer:" + std::to_string(size);
+            // A read-write storage dummy is its own buffer per (owner, binding): two bindings of one buffer, one
+            // of them writable, are rejected inside a dispatch (Dawn: "Writable storage buffer binding aliasing").
+            std::string key = "buffer:" + std::to_string(size);
+            if (le.subtype == 1) key += ":o" + std::to_string(owner) + "b" + std::to_string(le.binding);
             auto it = dummy_buffers.find(key);
             if (it == dummy_buffers.end()) {
                 wgpu::BufferDescriptor bd{};
@@ -5057,6 +5085,33 @@ struct NativeExecutor::Impl {
         return d;
     }
 
+    // Records the buffer bindings of a created group (pick(i, info) fills the writable / dynamic facts and says
+    // whether entry i is a real buffer binding).
+    template <class Pick>
+    void register_bg_info(const wgpu::BindGroup& g, const wgpu::BindGroupLayout& layout,
+                          const std::vector<wgpu::BindGroupEntry>& wes, Pick pick) {
+        if (!g) return;
+        auto info = std::make_shared<BgInfo>();
+        info->group = g;
+        info->layout = layout;
+        info->entries = wes;
+        for (size_t i = 0; i < wes.size(); ++i) {
+            if (!wes[i].buffer) continue;
+            BgBufInfo bi;
+            bi.binding = wes[i].binding;
+            bi.buffer = wes[i].buffer;
+            bi.offset = wes[i].offset;
+            bi.entry = i;
+            const uint64_t total = wes[i].buffer.GetSize();
+            bi.size = wes[i].size == wgpu::kWholeSize ? (total > bi.offset ? total - bi.offset : 0) : wes[i].size;
+            if (!pick(i, bi)) continue;
+            info->bufs.push_back(std::move(bi));
+        }
+        if (info->bufs.empty()) return;
+        if (bg_infos.size() >= 16384) bg_infos.clear();  // only costs a missed fix for groups still live
+        bg_infos[g.Get()] = std::move(info);
+    }
+
     bool create_bind_group2(const Packet& p) {
         if (p.payload_bytes < 16) return false;
         const auto h = read_payload<GpuCreateBindGroup2Payload>(p);
@@ -5070,6 +5125,8 @@ struct NativeExecutor::Impl {
             uint64_t offset = 0, size = wgpu::kWholeSize;
             wgpu::Sampler sampler;
             wgpu::TextureView view;
+            bool real_buffer = false, writable = false;  // a real (non-dummy) buffer, bound to a read-write storage entry
+            int dyn_rank = -1;
         };
         std::vector<Pending> entries;
         std::vector<uint32_t> seen;
@@ -5177,6 +5234,9 @@ struct NativeExecutor::Impl {
                                     pe.buffer = b.buffer;
                                     pe.offset = buf_offset;
                                     pe.size = fit.size > 0 ? fit.size : wgpu::kWholeSize;
+                                    pe.real_buffer = true;
+                                    pe.writable = le && le->kind == 0 && le->subtype == 1;
+                                    if (rm.has_dynamic_offset) pe.dyn_rank = static_cast<int>(rm.dynamic_offset_index);
                                     have = true;
                                 }
                             }
@@ -5185,19 +5245,37 @@ struct NativeExecutor::Impl {
                 }
             } else if (type == 1) {
                 auto tit = textures.find(e.resource_id);
-                const GpuTextureViewDesc* vd = &e.view;
+                GpuTextureViewDesc ev = e.view;
+                const GpuTextureViewDesc* vd = &ev;
                 if (tit != textures.end()) {
                     TextureEntry& t = tit->second;
-                    uint8_t tex_format = e.view.format ? e.view.format : t.geom.format;
+                    // The view must have the layout entry's viewDimension (Dawn: "Dimension (CubeArray) ... doesn't
+                    // match the expected dimension"): a cube-array view of a BC texture meeting a 2d entry becomes a
+                    // single-slice 2d view, a cube view meeting a 2d-array entry a 2d-array view, ... (cached per
+                    // texture / dimension / range by texture_view).
+                    if (!kind_mismatch && le && (le->kind == 2 || le->kind == 3) && !t.promoted_1d && !t.bc3d_fallback) {
+                        const uint8_t entry_dim = le->kind == 3 && (le->view_dim == 4 || le->view_dim == 5) ? 3 : le->view_dim;
+                        const EntryViewFit vf = fit_view_to_entry(t.geom.dimension, t.geom.depth_or_layers, ev.dimension,
+                                                                  ev.base_array_layer, ev.array_layer_count, entry_dim);
+                        if (vf.fit == ViewFit::Coerced) {
+                            ev.dimension = vf.dim;
+                            ev.base_array_layer = vf.base_layer;
+                            ev.array_layer_count = vf.layer_count;
+                            ++stats.view_dim_coerced;
+                        } else if (vf.fit == ViewFit::Unfixable) {
+                            ++stats.view_dim_unfixable;
+                        }
+                    }
+                    uint8_t tex_format = ev.format ? ev.format : t.geom.format;
                     uint8_t rec_format = 0;  // the descriptor's textureFormat (0 = unknown)
-                    if (e.view.format && t.bc3d_fallback && format_is_bc(e.view.format)) tex_format = t.geom.format;
+                    if (ev.format && t.bc3d_fallback && format_is_bc(ev.format)) tex_format = t.geom.format;
                     rec_format = tex_format;
                     if (!kind_mismatch && le && le->kind == 3 && tex_format) {
                         const StorageResolution sr = resolve_storage_format(tex_format, features);
                         if (!sr.supported || !sr.storage_format) {
                             use_dummy(*le);
                         } else if (sr.linear_sibling) {
-                            GpuTextureViewDesc lv = e.view;
+                            GpuTextureViewDesc lv = ev;
                             lv.format = sr.storage_format;
                             lv.mip_level_count = 1;
                             pe.view = texture_view(t, &lv);
@@ -5205,9 +5283,9 @@ struct NativeExecutor::Impl {
                             if (!have) use_dummy(*le);
                             else { rec_real = true; rec_format = sr.storage_format; rh.view = pe.view; }
                         } else {
-                            GpuTextureViewDesc sv = e.view;
+                            GpuTextureViewDesc sv = ev;
                             sv.mip_level_count = 1;
-                            pe.view = texture_view(t, e.view.mip_level_count == 1 ? vd : &sv);
+                            pe.view = texture_view(t, ev.mip_level_count == 1 ? vd : &sv);
                             have = static_cast<bool>(pe.view);
                             if (have) { rec_real = true; rh.view = pe.view; }
                         }
@@ -5245,19 +5323,19 @@ struct NativeExecutor::Impl {
                             use_dummy(*le);
                         }
                     } else if (!kind_mismatch && le && le->kind == 2 && tex_format && format_is_depth(tex_format) &&
-                               pick_depth_read(le->subtype, le->multisampled, tex_format, e.view.aspect,
+                               pick_depth_read(le->subtype, le->multisampled, tex_format, ev.aspect,
                                                t.sample_count, t.geom.dimension, features.float32_filterable) !=
                                    DepthRead::Direct) {
-                        const DepthRead dr = pick_depth_read(le->subtype, le->multisampled, tex_format, e.view.aspect,
+                        const DepthRead dr = pick_depth_read(le->subtype, le->multisampled, tex_format, ev.aspect,
                                                              t.sample_count, t.geom.dimension, features.float32_filterable);
                         if (dr == DepthRead::StencilDirect) {
-                            GpuTextureViewDesc sv = e.view;
+                            GpuTextureViewDesc sv = ev;
                             sv.aspect = 2;  // the stencil plane (a uint entry); Dawn rejects an all-aspect view
                             pe.view = texture_view(t, &sv);
                             have = static_cast<bool>(pe.view);
                             if (have) ++stats.depth_stencil_direct_binds;
                         } else if (dr != DepthRead::Dummy && depth_twin(e.resource_id, t, dr)) {
-                            pe.view = depth_twin_view(t, dr, e.view);
+                            pe.view = depth_twin_view(t, dr, ev);
                             have = static_cast<bool>(pe.view);
                         }
                         if (!have) {
@@ -5282,7 +5360,7 @@ struct NativeExecutor::Impl {
                         rm.texture_usage = t.usage;
                         if (rec_format) rm.format = rec_format;
                         // textureViewDimension: the view's, with the 1d <-> 2d promotion rules, else the texture's
-                        const uint8_t vdim = e.view.dimension;
+                        const uint8_t vdim = ev.dimension;
                         const bool actual_1d = t.geom.dimension == 0;
                         uint8_t dim;
                         if (vdim != 0) {
@@ -5335,7 +5413,15 @@ struct NativeExecutor::Impl {
         bd.entryCount = wes.size();
         bd.entries = wes.data();
         if (rec.over_limits) bind_groups[h.id] = nullptr;  // recorded (desc) for the remap only
-        else bind_groups[h.id] = device.CreateBindGroup(&bd);
+        else {
+            bind_groups[h.id] = device.CreateBindGroup(&bd);
+            register_bg_info(bind_groups[h.id], rec.layout, wes, [&](size_t i, BgBufInfo& bi) {
+                if (!entries[i].real_buffer) return false;
+                bi.writable = entries[i].writable;
+                bi.dyn_rank = entries[i].dyn_rank;
+                return true;
+            });
+        }
         bg_descs[h.id] = std::move(desc);
         compute_bind_groups.erase(h.id);  // a v2 group of the same id is not a v1 compute group
         ++stats.bind_groups;
@@ -5546,6 +5632,10 @@ struct NativeExecutor::Impl {
         };
         std::array<StreamGroup, kFitMaxGroups> stream_groups;
         uint8_t overridden = 0;
+        // The compute pass's bound groups as the stream set them (bit of alias_replaced: a rebuilt group with a
+        // buffer copy is what the pass has actually bound).
+        std::array<StreamGroup, 8> cbound;
+        uint8_t alias_replaced = 0;
         std::optional<uint32_t> active_pipeline;
         PassFormats pass_fmt;              // the active explicit pass's attachment state (known = false: not tracked)
         bool variant_blocked = false;      // the attachment-state variant of the active pipeline is still compiling
@@ -5629,6 +5719,8 @@ struct NativeExecutor::Impl {
             bound_groups = 0;
             overridden = 0;
             for (auto& sg : stream_groups) sg = StreamGroup{};
+            for (auto& sg : cbound) sg = StreamGroup{};
+            alias_replaced = 0;
             active_pipeline.reset();
             active_compute.reset();
             pass_fmt = PassFormats{};
@@ -5922,6 +6014,7 @@ struct NativeExecutor::Impl {
                 }
                 e.ensure_compute();
                 bind_compute_fit_dummies(e);
+                resolve_buffer_aliases(e);
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
             } else if (draw_allowed(e)) {
@@ -5987,6 +6080,7 @@ struct NativeExecutor::Impl {
             remap_before_dispatch(e);
             e.ensure_compute();
             bind_compute_fit_dummies(e);
+            resolve_buffer_aliases(e);
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
         } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {
@@ -6017,7 +6111,7 @@ struct NativeExecutor::Impl {
                 return;
             }
             if (e.rpass) e.rpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
-            else e.cpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
+            else cset(e, bg->group, bg->bind_group, bg->offsets.data(), bg->offsets.size());
             if (bg->group == 0) e.group0_bound = true;
             if (bg->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << bg->group);
             if (bg->group > 0 && bg->group < kFitMaxGroups) {
@@ -6037,7 +6131,7 @@ struct NativeExecutor::Impl {
                 else e.ensure_render();
             }
             if (e.rpass) e.rpass.SetBindGroup(b1->group, bg, 0, nullptr);
-            else e.cpass.SetBindGroup(b1->group, bg, 0, nullptr);
+            else cset(e, b1->group, bg, nullptr, 0);
             if (b1->group == 0) e.group0_bound = true;
             if (b1->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << b1->group);
             if (b1->group > 0 && b1->group < kFitMaxGroups) {
@@ -6206,6 +6300,10 @@ struct NativeExecutor::Impl {
             bd.entries = wes.data();
             group = device.CreateBindGroup(&bd);
             ++stats.remapped_bind_groups;
+            register_bg_info(group, auto_bgl, wes, [&](size_t i, BgBufInfo& bi) {
+                bi.writable = meta.bindings[i].kind == WgslBindingKind::Storage;
+                return true;
+            });
         }
         if (live) {
             if (remap_cache.size() >= 8192) remap_cache.clear();
@@ -6230,7 +6328,7 @@ struct NativeExecutor::Impl {
             const auto& sg = e.stream_groups[g];
             if (!sg.group) continue;
             if (e.rpass) e.rpass.SetBindGroup(g, sg.group, sg.offsets.size(), sg.offsets.data());
-            else e.cpass.SetBindGroup(g, sg.group, sg.offsets.size(), sg.offsets.data());
+            else cset(e, g, sg.group, sg.offsets.data(), sg.offsets.size());
             ++stats.layout_fit_restores;
         }
         if (!fd.mask) return;
@@ -6241,10 +6339,169 @@ struct NativeExecutor::Impl {
             if (!force && (e.bound_groups & bit)) continue;
             if (force && (e.overridden & bit)) continue;  // still bound from the previous draw
             if (e.rpass) e.rpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
-            else e.cpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
+            else cset(e, g, fd.groups[g], nullptr, 0);
             e.bound_groups |= bit;
             if (force) e.overridden |= bit;
             ++stats.layout_fit_dummy_binds;
+        }
+    }
+
+    // SetBindGroup on the compute pass, remembering what the stream bound.
+    void cset(Encoder& e, uint32_t g, const wgpu::BindGroup& bg, const uint32_t* offs, size_t n) {
+        e.cpass.SetBindGroup(g, bg, n, offs);
+        if (g < e.cbound.size()) {
+            e.cbound[g].group = bg;
+            e.cbound[g].offsets.assign(offs, offs + n);
+            e.alias_replaced &= static_cast<uint8_t>(~(1u << g));
+        }
+    }
+
+    wgpu::Buffer alias_scratch_buffer(uint64_t size) {
+        uint64_t cls = 256;
+        while (cls < size) cls <<= 1;
+        auto& pool = alias_scratch[cls];
+        size_t& used = alias_scratch_used[cls];
+        if (used < pool.size()) return pool[used++];
+        wgpu::BufferDescriptor bd{};
+        bd.size = cls;
+        bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+        pool.push_back(device.CreateBuffer(&bd));
+        return pool[used++];
+    }
+
+    // Dawn rejects a dispatch whose writable storage buffer binding overlaps another binding of the same buffer
+    // (inside one bind group or across groups). The read-only side is bound through a copy of its range (taken
+    // at this point of the pass, so it holds what earlier dispatches wrote); two writable bindings cannot be
+    // helped and are counted. The pass is split around the copy and its state re-established.
+    void resolve_buffer_aliases(Encoder& e) {
+        if (!e.cpass) return;
+        struct Ref {
+            uint32_t group;
+            size_t buf;
+            const BgInfo* info;
+        };
+        std::vector<AliasBinding> bs;
+        std::vector<Ref> refs;
+        bool any_writable = false;
+        for (uint32_t g = 0; g < e.cbound.size(); ++g) {
+            const auto& sg = e.cbound[g];
+            if (!sg.group) continue;
+            auto it = bg_infos.find(sg.group.Get());
+            if (it == bg_infos.end() || it->second->group.Get() != sg.group.Get()) continue;
+            const BgInfo& info = *it->second;
+            for (size_t i = 0; i < info.bufs.size(); ++i) {
+                const BgBufInfo& b = info.bufs[i];
+                AliasBinding ab;
+                ab.buffer = reinterpret_cast<uint64_t>(b.buffer.Get());
+                ab.group = g;
+                ab.binding = b.binding;
+                ab.offset = b.offset + (b.dyn_rank >= 0 && static_cast<size_t>(b.dyn_rank) < sg.offsets.size()
+                                            ? sg.offsets[static_cast<size_t>(b.dyn_rank)]
+                                            : 0);
+                ab.size = b.size;
+                ab.writable = b.writable;
+                any_writable = any_writable || b.writable;
+                bs.push_back(ab);
+                refs.push_back({g, i, &info});
+            }
+        }
+        AliasPlan plan;
+        if (any_writable) plan = plan_alias_copies(bs);
+        stats.storage_alias_unfixable += plan.unfixable;
+        // Groups the pass still has rebuilt from an earlier dispatch but that no longer need it: back to the stream's.
+        uint8_t need = 0;
+        for (size_t c : plan.copy) need |= static_cast<uint8_t>(1u << bs[c].group);
+        for (uint32_t g = 0; g < e.cbound.size(); ++g) {
+            const uint8_t bit = static_cast<uint8_t>(1u << g);
+            if ((e.alias_replaced & bit) && !(need & bit)) {
+                e.cpass.SetBindGroup(g, e.cbound[g].group, e.cbound[g].offsets.size(), e.cbound[g].offsets.data());
+                e.alias_replaced &= static_cast<uint8_t>(~bit);
+            }
+        }
+        if (plan.copy.empty()) return;
+
+        // The copies need the pass closed.
+        const std::optional<uint32_t> pipe = e.active_compute;
+        const bool pipe_valid = e.compute_valid;
+        const uint8_t saved_bound = e.bound_groups;
+        const bool saved_g0 = e.group0_bound;
+        const auto saved_stream = e.stream_groups;
+        const uint8_t saved_overridden = e.overridden;
+        const auto saved_cbound = e.cbound;
+        for (auto& kv : alias_scratch_used) kv.second = 0;
+        struct Swap {
+            uint32_t group;
+            size_t entry;
+            wgpu::Buffer scratch;
+            uint64_t size;
+        };
+        std::vector<Swap> swaps;
+        bool ended = false;
+        for (size_t c : plan.copy) {
+            const AliasBinding& ab = bs[c];
+            const BgBufInfo& b = refs[c].info->bufs[refs[c].buf];
+            const uint64_t copy_size = (ab.size + 3) / 4 * 4;
+            const uint64_t buf_total = b.buffer.GetSize();
+            if (ab.size == 0 || ab.offset + copy_size > buf_total || !(b.buffer.GetUsage() & wgpu::BufferUsage::CopySrc)) {
+                ++stats.storage_alias_unfixable;
+                continue;
+            }
+            if (!ended) {
+                e.end_active();
+                ended = true;
+            }
+            wgpu::Buffer scratch = alias_scratch_buffer(copy_size);
+            e.enc.CopyBufferToBuffer(b.buffer, ab.offset, scratch, 0, copy_size);
+            swaps.push_back({ab.group, b.entry, scratch, ab.size});
+            ++stats.storage_alias_copies;
+        }
+        if (!ended) return;
+        ++stats.storage_alias_dispatch_restarts;
+        e.ensure_compute();
+        e.active_compute = pipe;
+        e.compute_valid = pipe_valid;
+        if (pipe && pipe_valid) {
+            auto pit = compute_pipelines.find(*pipe);
+            if (pit != compute_pipelines.end())
+                if (const wgpu::ComputePipeline* cp = resolve_budgeted(pit->second)) e.cpass.SetPipeline(*cp);
+        }
+        e.cbound = saved_cbound;
+        e.bound_groups = saved_bound;
+        e.group0_bound = saved_g0;
+        e.stream_groups = saved_stream;
+        e.overridden = saved_overridden;
+        for (uint32_t g = 0; g < e.cbound.size(); ++g) {
+            const auto& sg = e.cbound[g];
+            if (!sg.group) continue;
+            wgpu::BindGroup use = sg.group;
+            std::vector<uint32_t> offs = sg.offsets;
+            auto it = bg_infos.find(sg.group.Get());
+            const BgInfo* info =
+                it != bg_infos.end() && it->second->group.Get() == sg.group.Get() ? it->second.get() : nullptr;
+            if (info) {
+                std::vector<wgpu::BindGroupEntry> wes = info->entries;
+                bool changed = false;
+                for (const Swap& sw : swaps) {
+                    if (sw.group != g) continue;
+                    wgpu::BindGroupEntry& w = wes[sw.entry];
+                    w.buffer = sw.scratch;
+                    w.offset = 0;
+                    w.size = sw.size;
+                    for (const BgBufInfo& b : info->bufs)
+                        if (b.entry == sw.entry && b.dyn_rank >= 0 && static_cast<size_t>(b.dyn_rank) < offs.size())
+                            offs[static_cast<size_t>(b.dyn_rank)] = 0;  // the copy already starts at the dynamic offset
+                    changed = true;
+                }
+                if (changed) {
+                    wgpu::BindGroupDescriptor bd{};
+                    bd.layout = info->layout;
+                    bd.entryCount = wes.size();
+                    bd.entries = wes.data();
+                    use = device.CreateBindGroup(&bd);
+                    e.alias_replaced |= static_cast<uint8_t>(1u << g);
+                }
+            }
+            e.cpass.SetBindGroup(g, use, offs.size(), offs.data());
         }
     }
 
@@ -6262,7 +6519,7 @@ struct NativeExecutor::Impl {
             e.rpass.SetBindGroup(0, g, 0, nullptr);
             e.group0_bound = true;  // _recordPassBindGroup
         } else {
-            e.cpass.SetBindGroup(0, g, 0, nullptr);
+            cset(e, 0, g, nullptr, 0);
         }
         e.bound_groups |= 1u;
     }
@@ -7444,6 +7701,11 @@ std::string NativeExecutor::stats_json() const {
     num("reflection_binding_conflicts", st.reflection_binding_conflicts);
     num("reflection_layout_unsupported", st.reflection_layout_unsupported);
     num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
+    num("view_dim_coerced", st.view_dim_coerced);
+    num("view_dim_unfixable", st.view_dim_unfixable);
+    num("storage_alias_copies", st.storage_alias_copies);
+    num("storage_alias_dispatch_restarts", st.storage_alias_dispatch_restarts);
+    num("storage_alias_unfixable", st.storage_alias_unfixable);
     num("bind_group_unfilterable_dummies", st.bind_group_unfilterable_dummies);
     num("bind_group_sample_type_dummies", st.bind_group_sample_type_dummies);
     num("buffer_bindings_clamped", st.buffer_bindings_clamped);

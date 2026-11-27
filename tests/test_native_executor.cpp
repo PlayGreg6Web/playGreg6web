@@ -3552,6 +3552,138 @@ void test_srgb_view_of_storage_texture(NativeExecutor& ex) {
     CHECK(ex.stats().device_errors == before.device_errors);
 }
 
+// A texture view bound to a layout entry takes the entry's viewDimension: a cube-array view of a 6-layer
+// texture meeting a 2d entry is a single-slice 2d view, a cube view meeting a 2d-array entry a 2d-array
+// view, a 2d-array view meeting a cube entry a cube view. No Dawn dimension error, counted as coerced.
+void test_view_dimension_matches_entry(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    GpuCreateTexture2Payload ct = texture2(9600, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22);
+    ct.depth_or_layers = 6;
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(ct));
+    struct Case {
+        uint8_t entry_dim, view_dim;
+    };
+    const Case cases[] = {{2, 5}, {3, 4}, {4, 3}, {5, 3}, {2, 3}, {4, 0}};
+    uint32_t id = 9610;
+    for (const Case& c : cases) {
+        std::vector<uint8_t> bgl;
+        append(bgl, GpuCreateBindGroupLayoutPayload{id, 1, 0, 0, 0});
+        append(bgl, layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture, 0, c.entry_dim));
+        emit(setup, GpuOpcode::CreateBindGroupLayout, bgl);
+        GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::TextureView, 9600);
+        be.view.dimension = c.view_dim;
+        create_bind_group(setup, id + 1, id, {be});
+        id += 2;
+    }
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.device_errors == before.device_errors);
+    CHECK(s.view_dim_coerced == before.view_dim_coerced + 6);
+    CHECK(s.view_dim_unfixable == before.view_dim_unfixable);
+
+    // A cube entry over a 2-layer texture cannot be satisfied: counted, not coerced.
+    gpu::CommandEncoder two;
+    GpuCreateTexture2Payload t2 = texture2(9650, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22);
+    t2.depth_or_layers = 2;
+    emit(two, GpuOpcode::CreateTexture2, bytes_of(t2));
+    std::vector<uint8_t> bgl;
+    append(bgl, GpuCreateBindGroupLayoutPayload{9651, 1, 0, 0, 0});
+    append(bgl, layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture, 0, 4));
+    emit(two, GpuOpcode::CreateBindGroupLayout, bgl);
+    GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::TextureView, 9650);
+    be.view.dimension = 3;
+    create_bind_group(two, 9652, 9651, {be});
+    run(ex, two);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().view_dim_unfixable == before.view_dim_unfixable + 1);
+}
+
+const char* kAliasCompute = R"(
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@group(%G%) @binding(%B%) var<storage, read> inp: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = inp[i] + 10u; }
+)";
+
+// The same buffer bound writable and read-only in one dispatch (WebGPU forbids it; Dawn: "Writable storage
+// buffer binding aliasing"): inside one bind group, and across two bind groups. The read-only side is bound
+// through a copy taken at the dispatch, so the result is out = in + 10 and no device error is raised.
+void test_storage_buffer_aliasing(NativeExecutor& ex, bool across_groups) {
+    const ExecutorStats before = ex.stats();
+    const uint32_t base = across_groups ? 9720 : 9700;
+    const uint32_t buf = base, shader = base + 2, bgl0 = base + 3, bgl1 = base + 4, pl = base + 5, pipe = base + 6,
+                   bg0 = base + 7, bg1 = base + 8;
+    std::string src = kAliasCompute;
+    src.replace(src.find("%G%"), 3, across_groups ? "1" : "0");
+    src.replace(src.find("%B%"), 3, across_groups ? "0" : "1");
+    gpu::CommandEncoder setup;
+    setup.create_buffer(buf, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 16);
+    const uint32_t init[4] = {1, 2, 3, 4};
+    setup.write_buffer(buf, 0, init, 16);
+    setup.create_shader_module(shader, GpuShaderStage::Compute, src.c_str());
+    const GpuBindGroupLayoutEntry rw = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1);
+    const GpuBindGroupLayoutEntry ro =
+        layout_entry(across_groups ? 0 : 1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 2);
+    std::vector<uint8_t> l0;
+    append(l0, GpuCreateBindGroupLayoutPayload{bgl0, across_groups ? 1u : 2u, 0, 0, 0});
+    append(l0, rw);
+    if (!across_groups) append(l0, ro);
+    emit(setup, GpuOpcode::CreateBindGroupLayout, l0);
+    std::vector<uint8_t> plv;
+    if (across_groups) {
+        std::vector<uint8_t> l1;
+        append(l1, GpuCreateBindGroupLayoutPayload{bgl1, 1, 0, 0, 0});
+        append(l1, ro);
+        emit(setup, GpuOpcode::CreateBindGroupLayout, l1);
+        append(plv, GpuCreatePipelineLayoutPayload{pl, 2, 0, 0, 0});
+        append(plv, bgl0);
+        append(plv, bgl1);
+    } else {
+        append(plv, GpuCreatePipelineLayoutPayload{pl, 1, 0, 0, 0});
+        append(plv, bgl0);
+    }
+    emit(setup, GpuOpcode::CreatePipelineLayout, plv);
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = pipe;
+    cp.cs_module_id = shader;
+    cp.pipeline_layout_id = pl;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    if (across_groups) {
+        create_bind_group(setup, bg0, bgl0, {bg_entry(0, GpuBindResourceType::Buffer, buf)});
+        create_bind_group(setup, bg1, bgl1, {bg_entry(0, GpuBindResourceType::Buffer, buf)});
+    } else {
+        create_bind_group(setup, bg0, bgl0,
+                          {bg_entry(0, GpuBindResourceType::Buffer, buf), bg_entry(1, GpuBindResourceType::Buffer, buf)});
+    }
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(pipe);
+    set_bind_group2(frame, 0, bg0);
+    if (across_groups) set_bind_group2(frame, 1, bg1);
+    frame.dispatch_compute(1, 1, 1);
+    frame.dispatch_compute(1, 1, 1);  // again: reads what the first dispatch wrote
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(buf, 0, 16, &out, &err));
+    const uint32_t want[4] = {21, 22, 23, 24};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.device_errors == before.device_errors);
+    CHECK(s.dispatches == before.dispatches + 2);
+    CHECK(s.storage_alias_copies == before.storage_alias_copies + 2);
+    CHECK(s.storage_alias_unfixable == before.storage_alias_unfixable);
+}
+
 void test_error_scope_attribution() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -3730,6 +3862,9 @@ int main() {
     test_dawn_validation_fixes(*ex);
     test_bind_group_binding_fit(*ex);
     test_srgb_view_of_storage_texture(*ex);
+    test_view_dimension_matches_entry(*ex);
+    test_storage_buffer_aliasing(*ex, false);
+    test_storage_buffer_aliasing(*ex, true);
     test_wide_mrt_pipeline(*ex);
     test_screenshot();
     test_error_scope_attribution();
