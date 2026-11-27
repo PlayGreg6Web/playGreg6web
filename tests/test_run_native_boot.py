@@ -1,4 +1,4 @@
-import io
+﻿import io
 import json
 import os
 import sys
@@ -623,9 +623,9 @@ class RunTests(unittest.TestCase):
         self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
         self.assertLess(int(tail[-1][0]), 420_000)
 
-    def test_menu_to_ingame_preset(self):
+    def test_menu_to_ingame_setup_preset(self):
         self.assertEqual(rnb.PRESETS["menu-to-ingame"]["max_ms"], 900_000)
-        script = rnb.input_script_text(900_000, "menu-to-ingame")
+        script = rnb.input_script_text(900_000, "menu-to-ingame-setup")
         lines = [x.strip() for x in script.splitlines() if x.strip() and not x.startswith("#")]
         i = lines.index("repeat every 14s until draws_per_frame==37 for 500ms timeout 240s")
         self.assertEqual(lines[i + 1:i + 3], ["0 A 100", "end"])

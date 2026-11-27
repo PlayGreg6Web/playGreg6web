@@ -266,7 +266,7 @@ Logic: `tools/repo_update.py` (tests: `tests/test_repo_update.py`).
 - **Guest fault.** The window stays open on the last frame with the title `GUEST FAULT ...`; the console prints the
   `tools/fault_report.py` output right away. Close the window to exit (the report is then finalised as usual).
 
-Other options: `-InputScript none|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|menu-to-ingame`
+Other options: `-InputScript none|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|menu-to-ingame|menu-to-ingame-setup`
 (scripted setup input instead of waiting for you; default `none`), `-MaxMs` (default 2 h; closes the window
 when reached), `-NoBuild`, `-TrustBuild`, `-DryRun`, `-BuildDir`. The report lands in `<build-dir>/runs/<name>/`
 (`boot-report.json`: presents, `audio_out` counters). Stop with Ctrl+C or by closing the window.

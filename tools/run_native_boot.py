@@ -93,6 +93,7 @@ import boot_summary  # noqa: E402
 import compare_boot_reports  # noqa: E402
 import find_chrome  # noqa: E402
 import guest_symbols  # noqa: E402
+import screen_flow  # noqa: E402
 import screen_timeline  # noqa: E402
 import stop_message  # noqa: E402
 import clean_build_dirs  # noqa: E402
@@ -119,6 +120,7 @@ PRESETS: dict[str, dict] = {
     "menu-flow-3": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-3"},
     "menu-flow-4": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-4"},
     "menu-to-ingame": {"max_ms": 900_000, "watchdog_ms": 930_000, "input": "menu-to-ingame"},
+    "menu-to-ingame-setup": {"max_ms": 900_000, "watchdog_ms": 930_000, "input": "menu-to-ingame-setup"},
     "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
@@ -493,7 +495,7 @@ def _to_list_screen() -> list[str]:
     rounds; no press goes out once the list screen is on), then the capture step (only acts with
     --gpu-capture-start-at-script). Later press times count from the moment the list screen held."""
     lines = _lines([(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)])
-    lines.append(f"repeat every 14s until {LIST_SCREEN} for 1500ms")
+    lines += ["# step list-screen", f"repeat every 14s until {LIST_SCREEN} for 1500ms"]
     lines += ["  " + line for line in _lines(_menu_cycle())]
     lines += ["end", "capture"]
     return lines
@@ -576,8 +578,33 @@ def _viewer_round() -> list[tuple[int, str, int]]:
             (9_000, "RDown", 1_200), (12_000, "B", 150), (15_000, "DDown", 150)]
 
 
+# The current boot flow (existing save, with or without a shader pack; tools/screen_flow.py): intro video (13-15
+# draws), loading artwork (2 / 4 / 6), UI screens (~9-10), then the 3D scene (38 up to ~520 draws) from ~55-95 s.
+# The gate is a RANGE (scene: draws/frame >= SCENE_DRAWS), never one exact count.
+SCENE_DRAWS = 38
+
+
 def menu_to_ingame_script_text(duration_ms: int) -> str:
-    """The menu-to-ingame preset: A (every 14 s) to LEGAL NOTICES (37 draws/frame), then a plain wait until it
+    """The menu-to-ingame preset (current flow): A at 20 s, then A every 2.5 s only until the 3D scene holds
+    (draws/frame >= SCENE_DRAWS for 2 s; the intro videos, loading artwork and UI screens before it need no exact
+    count), a settle wait, then the movement round every 12 s until the time limit. Every wait / repeat step is
+    named (`# step`), so the digest says which one missed. The fresh-setup flow with its LEGAL NOTICES screens
+    is menu-to-ingame-setup (picked automatically by --fresh-setup)."""
+    lines = ["# menu-to-ingame (tools/run_native_boot.py, current flow): A from 20 s until the scene (draws/frame >= "
+             f"{SCENE_DRAWS}), then the movement round every 12 s",
+             "20000 A 100",
+             "# step intro-to-scene",
+             f"repeat every 2500ms until draws_per_frame>={SCENE_DRAWS} for 2s timeout 180s", "  0 A 100", "end",
+             "# step scene-settle",
+             f"wait draws_per_frame>={SCENE_DRAWS} for 3s timeout 60s",
+             "# step movement-rounds*",
+             "repeat every 12s until presents>=999999999 timeout 800s",
+             "  0 A 100", "  1500 Up 1500", "  3500 RRight 1200", "  5500 LT 1000", "  7000 Up+RT 1000", "end"]
+    return "\n".join(lines) + "\n"
+
+
+def menu_to_ingame_setup_script_text(duration_ms: int) -> str:
+    """The menu-to-ingame-setup preset (fresh setup flow): A (every 14 s) to LEGAL NOTICES (37 draws/frame), then a plain wait until it
     is steady (no A may go out there: a round-start A opened Copyright and the R40 run stayed in the
     viewer to 900 s); B every 3 s only while the screen is not 37 (a document viewer that got opened
     closes); then the menu cycle (Up x6, Down, Down, A on "Next >") every 14 s until the screen after
@@ -591,22 +618,24 @@ def menu_to_ingame_script_text(duration_ms: int) -> str:
              "# wait (no A), B if a viewer is open, then Up x6, Down, Down, A on \"Next >\" every 14 s until "
              + VIEWER_SCREEN + ", then screen-synced rounds"]
     lines += _lines([(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)])
-    lines += [f"repeat every 14s until draws_per_frame=={LEGAL_SCREEN} for 500ms timeout 240s", "  0 A 100", "end",
-              f"wait draws_per_frame=={LEGAL_SCREEN} for 2s timeout 30s",
-              f"repeat every 3s until draws_per_frame=={LEGAL_SCREEN} for 1s timeout 30s", "  0 B 150", "end",
-              f"repeat every 14s until draws_per_frame=={VIEWER_SCREEN} for 1500ms timeout 240s"]
+    lines += ["# step legal-notices", f"repeat every 14s until draws_per_frame=={LEGAL_SCREEN} for 500ms timeout 240s",
+              "  0 A 100", "end",
+              "# step legal-notices-steady", f"wait draws_per_frame=={LEGAL_SCREEN} for 2s timeout 30s",
+              "# step close-viewer", f"repeat every 3s until draws_per_frame=={LEGAL_SCREEN} for 1s timeout 30s",
+              "  0 B 150", "end",
+              "# step legal-terms-screen", f"repeat every 14s until draws_per_frame=={VIEWER_SCREEN} for 1500ms timeout 240s"]
     lines += ["  " + line for line in _lines(_menu_cycle())]
     lines += ["end", "capture"]
     # Terms screen: one round per 16 s until Confirm has taken (the loading screen after it, TERMS_PASSED, held 3 s).
     # Not "until draws/frame leaves VIEWER_SCREEN": the terms screen's draws/frame jump between ~17 and ~86 while
     # its cursor and document panel animate, and a `repeat` sends no press while its condition holds even for
     # one frame, so that gate dropped the round's checkbox A / Down / Confirm presses (#663).
-    lines += [f"repeat every 16s until {TERMS_PASSED} for 3s timeout 200s"]
+    lines += ["# step terms-confirm", f"repeat every 16s until {TERMS_PASSED} for 3s timeout 200s"]
     lines += ["  " + line for line in _lines(_terms_round())]
     lines += ["end"]
-    lines += ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+    lines += ["# step loading-skip", "repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
               "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end",
-              "repeat every 12s until presents>=999999999 timeout 800s",
+              "# step movement-rounds*", "repeat every 12s until presents>=999999999 timeout 800s",
               "  0 A 100", "  1500 Up 1500", "  3500 RRight 1200", "  5500 LT 1000", "  7000 Up+RT 1000", "end"]
     return "\n".join(lines) + "\n"
 
@@ -626,6 +655,8 @@ def _terms_round() -> list[tuple[int, str, int]]:
 
 
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-to-ingame-setup":
+        return menu_to_ingame_setup_script_text(duration_ms)
     if kind == "menu-to-ingame":
         return menu_to_ingame_script_text(duration_ms)
     if kind == "menu-flow-4":
@@ -1188,7 +1219,10 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     if prebuilt_guard.containing_prebuilt(build_dir) is None:
         clean_build_dirs.write_marker(build_dir, "run_native_boot.py", repo)
     if preset["input"] and not args.input_script:
-        script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
+        kind = preset["input"]
+        if kind == "menu-to-ingame" and args.fresh_setup:
+            kind = "menu-to-ingame-setup"  # the setup screens (legal notices) only appear on a fresh save
+        script_path.write_text(input_script_text(max_ms, kind), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)
     if args.play and not args.dry_run:
         # The window banner (runtime/guest/stop_message.h) tells a pending owner decision from a crash with this list.
@@ -1229,6 +1263,17 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     waits = input_wait_line(log_text)
     if waits:
         text += NL + waits
+    ipath = Path(args.input_script) if args.input_script else script_path
+    if ipath.is_file():
+        samples = report.get("present_samples") or []
+        missed = screen_flow.timeout_lines(
+            log_text, ipath.read_text(encoding="utf-8"),
+            last_draws=int(samples[-1].get("draws") or 0) if samples else None,
+            end_ms=report.get("elapsed_ms"))
+        if missed:
+            text += NL + NL.join(missed)
+    if report.get("present_samples"):
+        text += NL + screen_flow.render(screen_flow.detect_from_report(report)).replace("\n", NL)
     (run_dir / "digest.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     try:
