@@ -260,6 +260,9 @@ struct ExecutorStats {
     uint64_t reflection_vertex_fallbacks = 0;  // reflected vertex layout rejected: the single-attribute default
     uint64_t reflection_layout_errors = 0;     // a reflected layout the loader's merge rejected (pipeline not created)
     uint64_t reflection_binding_conflicts = 0; // ... of which two stages disagreed on a binding
+    uint64_t bind_group_sample_type_dummies = 0;  // integer view vs float layout entry (or the reverse): dummy bound
+    uint64_t buffer_bindings_clamped = 0;  // buffer ranges cut to the device's binding-size rules (fit_buffer_binding)
+    uint64_t buffer_bindings_dummied = 0;  // buffer bindings no range of which fits those rules: dummy bound
     uint64_t bind_group_depth_layout_dummies = 0;  // depth view vs float/sint/uint layout entry (or the reverse): dummy bound
     uint64_t depth_float_copies = 0;       // depth aspect re-copied into an r32float twin (float layout entry meets a depth texture)
     uint64_t depth_twins_created = 0;      // ... of which r32uint/r32sint (uint/sint entry on a depth texture): depth_int_twins_created

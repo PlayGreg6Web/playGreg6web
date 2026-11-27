@@ -35,6 +35,7 @@
 #include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/clear_model.h"
+#include "gpu/native_exec/binding_fit_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
@@ -719,6 +720,8 @@ struct NativeExecutor::Impl {
     // ---- diagnostic error scopes (--gpu-error-scopes, error_scope_model.h) ----
     ErrorScopeLog error_scope_log;
     DeviceErrorKinds device_error_kinds;  // every uncaptured error by kind (always on)
+    // The device's buffer binding-size limits (fit_buffer_binding); the WebGPU defaults until the device says.
+    uint64_t max_uniform_binding = 65536, max_storage_binding = 134217728;
     uint16_t cur_opcode = 0;              // the packet in flight, for device_error_kinds
     std::atomic<uint64_t> error_scoped_total{0};  // scoped errors recorded (drives the auto mode's cut-off)
 
@@ -1149,6 +1152,8 @@ struct NativeExecutor::Impl {
         wgpu::Limits limits{};
         if (device.GetLimits(&limits) == wgpu::Status::Success) {
             if (limits.maxComputeWorkgroupsPerDimension >= 1) max_workgroups_per_dim = limits.maxComputeWorkgroupsPerDimension;
+            max_uniform_binding = limits.maxUniformBufferBindingSize;
+            max_storage_binding = limits.maxStorageBufferBindingSize;
             stage_limits.uniform_buffers = limits.maxUniformBuffersPerShaderStage;
             stage_limits.storage_buffers = limits.maxStorageBuffersPerShaderStage;
             stage_limits.sampled_textures = limits.maxSampledTexturesPerShaderStage;
@@ -4936,10 +4941,22 @@ struct NativeExecutor::Impl {
                             if (kind_mismatch || usage_mismatch) {
                                 use_dummy(*le);
                             } else {
-                                pe.buffer = b.buffer;
-                                pe.offset = buf_offset;
-                                pe.size = eff > 0 ? eff : wgpu::kWholeSize;
-                                have = true;
+                                // Into the device's binding-size rules (binding_fit_model.h): a uniform
+                                // range over 64 KiB, an unaligned storage range, ... is cut, not rejected.
+                                const bool storage = le && le->kind == 0 && le->subtype != 0;
+                                const BufferBindingFit fit = fit_buffer_binding(
+                                    storage, buf_size, buf_offset, eff, min_binding,
+                                    !le || le->kind != 0 ? 0 : storage ? max_storage_binding : max_uniform_binding);
+                                if (!fit.ok) {
+                                    ++stats.buffer_bindings_dummied;
+                                    use_dummy(*le);
+                                } else {
+                                    if (fit.clamped) ++stats.buffer_bindings_clamped;
+                                    pe.buffer = b.buffer;
+                                    pe.offset = buf_offset;
+                                    pe.size = fit.size > 0 ? fit.size : wgpu::kWholeSize;
+                                    have = true;
+                                }
                             }
                         }
                     }
@@ -4972,6 +4989,10 @@ struct NativeExecutor::Impl {
                             have = static_cast<bool>(pe.view);
                             if (have) { rec_real = true; rh.view = pe.view; }
                         }
+                    } else if (!kind_mismatch && le && le->kind == 2 && tex_format &&
+                               integer_sample_type_mismatch(le->subtype, tex_format)) {
+                        ++stats.bind_group_sample_type_dummies;
+                        use_dummy(*le);
                     } else if (!kind_mismatch && le && le->kind == 2 && le->subtype == 0 && tex_format &&
                                format_is_float32(tex_format) && !features.float32_filterable) {
                         use_dummy(*le);
@@ -5777,7 +5798,20 @@ struct NativeExecutor::Impl {
                 const WgslBinding& b = meta.bindings[i];
                 wgpu::BindGroupEntry& w = wes[i];
                 w.binding = b.binding;
-                const PickResult r = meta.by_binding ? picker.pick_binding(b) : picker.pick(b);
+                PickResult r = meta.by_binding ? picker.pick_binding(b) : picker.pick(b);
+                BufferBindingFit fit;
+                if (r.kind == PickResult::Kind::Resource && desc->handles[r.index].buffer) {
+                    // The device's binding-size rules (binding_fit_model.h); no range fits: a dummy.
+                    const bool storage = b.kind != WgslBindingKind::Uniform;
+                    fit = fit_buffer_binding(storage, av[r.index].buffer_total, r.offset, r.size, 0,
+                                             storage ? max_storage_binding : max_uniform_binding);
+                    if (!fit.ok) {
+                        ++stats.buffer_bindings_dummied;
+                        r = PickResult{PickResult::Kind::Dummy};
+                    } else if (fit.clamped) {
+                        ++stats.buffer_bindings_clamped;
+                    }
+                }
                 if (r.kind == PickResult::Kind::Resource) {
                     const BgHandles& hnd = desc->handles[r.index];
                     w.buffer = hnd.buffer;
@@ -5785,7 +5819,7 @@ struct NativeExecutor::Impl {
                     w.sampler = hnd.sampler;
                     if (hnd.buffer) {
                         w.offset = r.offset;
-                        w.size = r.size > 0 ? r.size : wgpu::kWholeSize;
+                        w.size = fit.size > 0 ? fit.size : wgpu::kWholeSize;
                         if (r.folded) ++stats.remap_dynamic_offsets;
                         if (r.dyn_clamped) ++stats.remap_dynamic_clamps;
                     }
@@ -7058,6 +7092,9 @@ std::string NativeExecutor::stats_json() const {
     num("reflection_binding_conflicts", st.reflection_binding_conflicts);
     num("reflection_layout_unsupported", st.reflection_layout_unsupported);
     num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
+    num("bind_group_sample_type_dummies", st.bind_group_sample_type_dummies);
+    num("buffer_bindings_clamped", st.buffer_bindings_clamped);
+    num("buffer_bindings_dummied", st.buffer_bindings_dummied);
     num("depth_float_copies", st.depth_float_copies);
     num("depth_twins_created", st.depth_twins_created);
     num("depth_int_twins_created", st.depth_int_twins_created);

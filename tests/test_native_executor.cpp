@@ -169,6 +169,7 @@ void test_buffers(NativeExecutor& ex) {
     ex.wait_idle();
     ex.poll();
     CHECK(ex.stats().device_errors == errors_before + 1);
+    CHECK(ex.stats_json().find("\"device_error_kinds\": {\"total\": ") != std::string::npos);  // the kind is recorded
     CHECK(ex.read_buffer(7, 0, 16, &got, &err) && got == want);
 
     // Re-creating an id replaces the buffer; DestroyResource removes it.
@@ -3283,6 +3284,32 @@ void test_dawn_validation_fixes(NativeExecutor& ex) {
     CHECK(ex.stats().write_masks_cleared == before.write_masks_cleared + 1);
 }
 
+// Bind groups Dawn would reject are fitted (binding_fit_model.h): a whole 128 KiB uniform buffer is cut
+// to the 64 KiB binding maximum, an r32uint view on a float entry gets the entry's dummy. No device error.
+void test_bind_group_binding_fit(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(9500, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 128 * 1024);
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(9501, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 14)));  // r32uint
+    std::vector<uint8_t> bgl;
+    const GpuBindGroupLayoutEntry u = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 0);
+    const GpuBindGroupLayoutEntry t = layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture, 0, 2);
+    append(bgl, GpuCreateBindGroupLayoutPayload{9502, 2, 0, 0, 0});
+    append(bgl, u);
+    append(bgl, t);
+    emit(setup, GpuOpcode::CreateBindGroupLayout, bgl);
+    create_bind_group(setup, 9503, 9502,
+                      {bg_entry(0, GpuBindResourceType::Buffer, 9500), bg_entry(1, GpuBindResourceType::TextureView, 9501)});
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.device_errors == before.device_errors);
+    CHECK(s.buffer_bindings_clamped == before.buffer_bindings_clamped + 1);
+    CHECK(s.bind_group_sample_type_dummies == before.bind_group_sample_type_dummies + 1);
+}
+
 void test_error_scope_attribution() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -3400,6 +3427,7 @@ int main() {
     test_remap_reflected_layout(true);
     test_remap_reflected_layout(false);
     test_dawn_validation_fixes(*ex);
+    test_bind_group_binding_fit(*ex);
     test_wide_mrt_pipeline(*ex);
     test_screenshot();
     test_error_scope_attribution();
