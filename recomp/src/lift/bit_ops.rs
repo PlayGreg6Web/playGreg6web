@@ -184,6 +184,19 @@ impl FunctionLifter<'_> {
                     }
                     let lazy = FlagSource::BitTestBit { val: v, bit, bits };
                     (cf, Some(lazy))
+                } else if m == Mnemonic::Bt {
+                    let o = dyn_offset.expect("dynamic bit offset");
+                    let index = self.val(&format!("and {t} {o}, {}", bits - 1));
+                    let cf = want_cf.then(|| {
+                        let shifted = self.val(&format!("lshr {t} {v}, {index}"));
+                        self.val(&format!("trunc {t} {shifted} to i1"))
+                    });
+                    let lazy = FlagSource::BitTestShift {
+                        val: v,
+                        index,
+                        bits,
+                    };
+                    (cf, Some(lazy))
                 } else {
                     let o = dyn_offset.expect("dynamic bit offset");
                     let index = self.val(&format!("and {t} {o}, {}", bits - 1));
@@ -398,7 +411,7 @@ impl FunctionLifter<'_> {
                 for flag in [Flag::Cf, Flag::Of, Flag::Sf, Flag::Af, Flag::Pf] {
                     self.set_flag(flag, "false");
                 }
-                self.known.flag_source = Some(FlagSource::ZeroOnly { val: src, bits });
+                self.known.flag_source = Some(FlagSource::ZeroClearRest { val: src, bits });
                 r
             }
             m => {
@@ -467,8 +480,12 @@ impl FunctionLifter<'_> {
                 // dst = ~src1 & src2; SF ZF from the result, CF = OF = 0, AF PF undefined.
                 let a = self.read_op(ins, 1, bits)?;
                 let b = self.read_op(ins, 2, bits)?;
-                let na = self.val(&format!("xor {t} {a}, -1"));
-                let r = self.val(&format!("and {t} {na}, {b}"));
+                let r = if a == b {
+                    "0".to_string()
+                } else {
+                    let na = self.val(&format!("xor {t} {a}, -1"));
+                    self.val(&format!("and {t} {na}, {b}"))
+                };
                 self.set_sign_zero(&r, bits);
                 self.set_flag(Flag::Cf, "false");
                 self.set_flag(Flag::Of, "false");
@@ -510,11 +527,21 @@ impl FunctionLifter<'_> {
                     self.set_sign_zero(&r, bits);
                 }
                 self.set_flag(Flag::Of, "false");
-                if m != M::Blsmsk {
-                    self.known.flag_source = Some(FlagSource::ResultZeroSign {
-                        result: r.clone(),
-                        bits,
-                    });
+                match m {
+                    M::Blsi => {
+                        self.known.flag_source = Some(FlagSource::Blsi {
+                            result: r.clone(),
+                            bits,
+                        });
+                    }
+                    M::Blsr => {
+                        self.known.flag_source = Some(FlagSource::Blsr {
+                            src: s,
+                            result: r.clone(),
+                            bits,
+                        });
+                    }
+                    _ => {}
                 }
                 r
             }
@@ -639,6 +666,14 @@ impl FunctionLifter<'_> {
                 let c = c & u64::from(bits - 1);
                 if c == 0 {
                     s
+                } else if let Some(vs) = Self::const_u64(&s, bits) {
+                    let rot = c as u32;
+                    let rotated = if bits == 32 {
+                        u64::from((vs as u32).rotate_right(rot))
+                    } else {
+                        vs.rotate_right(rot)
+                    };
+                    imm(rotated, bits)
                 } else {
                     self.support.insert(Support::Fshr(bits));
                     self.val(&format!(
@@ -1027,10 +1062,20 @@ impl FunctionLifter<'_> {
                 (r, cf)
             }
         } else if left {
-            self.support.insert(Support::Fshl(bits));
-            let r = self.val(&format!(
-                "call {t} @llvm.fshl.{t}({t} {a}, {t} {b}, {t} {count})"
-            ));
+            let r = if let (Some(va), Some(vb), Some(c)) = (
+                Self::const_u64(&a, bits),
+                Self::const_u64(&b, bits),
+                imm_count,
+            ) {
+                let c = c as u32;
+                let res = ((va << c) | (vb >> (bits - c))) & mask(bits);
+                imm(res, bits)
+            } else {
+                self.support.insert(Support::Fshl(bits));
+                self.val(&format!(
+                    "call {t} @llvm.fshl.{t}({t} {a}, {t} {b}, {t} {count})"
+                ))
+            };
             let cf = want_cf.then(|| match imm_count {
                 Some(1) => self.msb(&a, bits),
                 Some(c) => {
@@ -1046,10 +1091,20 @@ impl FunctionLifter<'_> {
             });
             (r, cf)
         } else {
-            self.support.insert(Support::Fshr(bits));
-            let r = self.val(&format!(
-                "call {t} @llvm.fshr.{t}({t} {b}, {t} {a}, {t} {count})"
-            ));
+            let r = if let (Some(va), Some(vb), Some(c)) = (
+                Self::const_u64(&a, bits),
+                Self::const_u64(&b, bits),
+                imm_count,
+            ) {
+                let c = c as u32;
+                let res = ((va >> c) | (vb << (bits - c))) & mask(bits);
+                imm(res, bits)
+            } else {
+                self.support.insert(Support::Fshr(bits));
+                self.val(&format!(
+                    "call {t} @llvm.fshr.{t}({t} {b}, {t} {a}, {t} {count})"
+                ))
+            };
             let cf = want_cf.then(|| match imm_count {
                 Some(1) => self.val(&format!("trunc {t} {a} to i1")),
                 Some(c) => {
@@ -1101,11 +1156,25 @@ impl FunctionLifter<'_> {
                 }
             }
         }
-        if imm_count.is_some() {
-            self.known.flag_source = Some(FlagSource::ResultZeroSign {
-                result: r.clone(),
-                bits,
-            });
+        if let Some(c) = imm_count {
+            if bits >= 32 && c < u64::from(bits) {
+                let cf_bit = if left {
+                    bits - c as u32
+                } else {
+                    c as u32 - 1
+                };
+                self.known.flag_source = Some(FlagSource::ShiftImm {
+                    result: r.clone(),
+                    src: a,
+                    cf_bit,
+                    bits,
+                });
+            } else {
+                self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                    result: r.clone(),
+                    bits,
+                });
+            }
         }
         self.write_op(ins, 0, &r, bits)
     }

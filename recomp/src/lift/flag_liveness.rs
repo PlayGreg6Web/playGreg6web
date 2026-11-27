@@ -56,7 +56,7 @@ use iced_x86::{
 };
 
 use super::memory_access::WindowBurst;
-use super::{FLAGS, ends_in_transfer, is_immediate, mask, simd};
+use super::{FLAGS, ends_in_transfer, is_immediate, simd};
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
 /// Bit `Flag as usize` per arithmetic flag.
@@ -404,25 +404,31 @@ pub(super) fn block_live_out(
 /// 2. Only read flags that the producer unconditionally kills in [`flag_effect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProducerKind {
-    /// `cmp` / `sub` / `neg`: `a - b`. `has_diff_or_zero` is true when `diff` (or `b == 0`) is
-    /// available for `s`/`ns` without extra arithmetic.
-    Compare { has_diff_or_zero: bool },
-    /// `test` / `and` / `or` / `xor` / `andn`: `CF = 0, OF = 0`, `ZF`/`SF` from result.
+    /// Same-register `cmp r, r` / `sub r, r` / `xor r, r`: constant zero flags (`CF=0, OF=0,
+    /// ZF=1, SF=0, PF=1`), so every x86 CC lowers to a boolean constant.
+    ConstZero,
+    /// `cmp` / `sub` / `neg`: `a - b`. All 10 relational CCs plus `s`/`ns` lower directly.
+    Compare,
+    /// `test` / `and` / `or` / `xor` / `andn` / `blsi` / `blsr`: `OF = 0` and all 14 non-parity
+    /// CCs lower directly to a constant or one `icmp`.
     LogicZero,
-    /// `add a, b`: `ZF`/`SF` from `result`, `CF` from `result <u a`.
-    Add,
-    /// `blsi` / `blsr` / `bzhi` / `adc` / `sbb` / non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`:
+    /// `add a, b` or immediate `shl`/`shr`/`sar`/`shld`/`shrd` (`1 <= c < bits`): `e`/`ne`/`s`/`ns`
+    /// and `b`/`ae` lower directly without reading flag allocas.
+    AddOrShiftImm,
+    /// `bzhi` / `adc` / `sbb` / overshifted imm `shl`/`shr`/`sar` / 16-bit `shld`/`shrd`:
     /// `ZF`/`SF` from result.
     ResultZeroSign,
     /// `dec a`: `ZF`/`SF`/`OF` from `a - 1` (`CF` preserved).
     Dec,
     /// `inc a`: `ZF`/`SF`/`OF` from `a + 1` (`CF` preserved).
     Inc,
-    /// `bsf` / `bsr` / `popcnt` / `bextr`: `ZF` from input/result.
+    /// `bsf` / `bsr` / `bextr`: `ZF` from input/result.
     ZeroOnly,
-    /// `tzcnt` / `lzcnt`: `CF = (src == 0)`, `ZF = (result == 0)`.
-    BitCount,
-    /// `bt` / `bts` / `btr` / `btc`: `CF = tested bit`.
+    /// `popcnt`: `ZF = (src == 0)` and `CF = OF = SF = AF = PF = 0`; all 16 CCs lower directly.
+    ZeroClearRest,
+    /// `tzcnt` / `lzcnt`: `CF = (src == 0)`, `ZF = (result == 0)` (`lzcnt` also fuses `be`/`a`).
+    BitCount { is_lzcnt: bool },
+    /// `bt` / `bts` / `btr` / `btc` and non-zero immediate `rol`/`ror`: `CF` only.
     CarryOnly,
     /// `(v)(u)comis{s,d}`: all 16 x86 CCs fuse to a single `fcmp` or constant.
     FloatCompare,
@@ -432,11 +438,11 @@ impl ProducerKind {
     fn supports(self, cc: ConditionCode) -> bool {
         use ConditionCode as C;
         match self {
-            Self::Compare { has_diff_or_zero } => match cc {
-                C::e | C::ne | C::b | C::ae | C::be | C::a | C::l | C::ge | C::le | C::g => true,
-                C::s | C::ns => has_diff_or_zero,
-                _ => false,
-            },
+            Self::ConstZero | Self::ZeroClearRest | Self::FloatCompare => cc != C::None,
+            Self::Compare => matches!(
+                cc,
+                C::e | C::ne | C::b | C::ae | C::be | C::a | C::l | C::ge | C::le | C::g | C::s | C::ns
+            ),
             Self::LogicZero => matches!(
                 cc,
                 C::o | C::no
@@ -453,15 +459,18 @@ impl ProducerKind {
                     | C::le
                     | C::g
             ),
-            Self::Add => matches!(cc, C::e | C::ne | C::s | C::ns | C::b | C::ae),
+            Self::AddOrShiftImm => matches!(cc, C::e | C::ne | C::s | C::ns | C::b | C::ae),
             Self::ResultZeroSign => matches!(cc, C::e | C::ne | C::s | C::ns),
             Self::Dec | Self::Inc => {
                 matches!(cc, C::e | C::ne | C::s | C::ns | C::l | C::ge | C::le | C::g)
             }
             Self::ZeroOnly => matches!(cc, C::e | C::ne),
-            Self::BitCount => matches!(cc, C::e | C::ne | C::b | C::ae),
+            Self::BitCount { is_lzcnt } => match cc {
+                C::e | C::ne | C::b | C::ae => true,
+                C::be | C::a => is_lzcnt,
+                _ => false,
+            },
             Self::CarryOnly => matches!(cc, C::b | C::ae),
-            Self::FloatCompare => cc != C::None,
         }
     }
 }
@@ -523,41 +532,25 @@ fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
     use Mnemonic as M;
     flag_effect(ins)?;
     match ins.mnemonic() {
-        M::Cmp => {
+        M::Cmp | M::Sub => {
             if same_reg_operands(ins) {
-                return None;
+                Some(ProducerKind::ConstZero)
+            } else {
+                Some(ProducerKind::Compare)
             }
-            let bits = operand_bits(ins)?;
-            let is_zero = is_immediate(ins.op_kind(1))
-                && ins
-                    .try_immediate(1)
-                    .ok()
-                    .is_some_and(|v| (v & mask(bits)) == 0);
-            Some(ProducerKind::Compare {
-                has_diff_or_zero: is_zero,
-            })
         }
-        M::Sub => {
-            if same_reg_operands(ins) {
-                return None;
-            }
-            Some(ProducerKind::Compare {
-                has_diff_or_zero: true,
-            })
-        }
-        M::Neg => Some(ProducerKind::Compare {
-            has_diff_or_zero: true,
-        }),
+        M::Neg => Some(ProducerKind::Compare),
         M::Xor => {
             if same_reg_operands(ins) {
-                return None;
+                Some(ProducerKind::ConstZero)
+            } else {
+                Some(ProducerKind::LogicZero)
             }
-            Some(ProducerKind::LogicZero)
         }
-        M::Test | M::And | M::Or | M::Andn => Some(ProducerKind::LogicZero),
-        M::Add => Some(ProducerKind::Add),
-        M::Adc | M::Sbb | M::Blsi | M::Blsr | M::Bzhi => Some(ProducerKind::ResultZeroSign),
-        M::Shl | M::Sal | M::Shr | M::Sar => {
+        M::Test | M::And | M::Or | M::Andn | M::Blsi | M::Blsr => Some(ProducerKind::LogicZero),
+        M::Add => Some(ProducerKind::AddOrShiftImm),
+        M::Adc | M::Sbb | M::Bzhi => Some(ProducerKind::ResultZeroSign),
+        M::Rol | M::Ror => {
             let bits = operand_bits(ins)?;
             let count_mask = if bits == 64 { 63 } else { 31 };
             if is_immediate(ins.op_kind(1))
@@ -566,7 +559,25 @@ fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
                     .ok()
                     .is_some_and(|v| (v & count_mask) != 0)
             {
-                Some(ProducerKind::ResultZeroSign)
+                Some(ProducerKind::CarryOnly)
+            } else {
+                None
+            }
+        }
+        M::Shl | M::Sal | M::Shr | M::Sar => {
+            let bits = operand_bits(ins)?;
+            let count_mask = if bits == 64 { 63 } else { 31 };
+            if is_immediate(ins.op_kind(1))
+                && let Ok(v) = ins.try_immediate(1)
+            {
+                let c = v & count_mask;
+                if c == 0 {
+                    None
+                } else if c < u64::from(bits) {
+                    Some(ProducerKind::AddOrShiftImm)
+                } else {
+                    Some(ProducerKind::ResultZeroSign)
+                }
             } else {
                 None
             }
@@ -575,20 +586,26 @@ fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
             let bits = operand_bits(ins)?;
             let count_mask = if bits == 64 { 63 } else { 31 };
             if is_immediate(ins.op_kind(2))
-                && ins
-                    .try_immediate(2)
-                    .ok()
-                    .is_some_and(|v| (v & count_mask) != 0)
+                && let Ok(v) = ins.try_immediate(2)
             {
-                Some(ProducerKind::ResultZeroSign)
+                let c = v & count_mask;
+                if c == 0 {
+                    None
+                } else if bits >= 32 && c < u64::from(bits) {
+                    Some(ProducerKind::AddOrShiftImm)
+                } else {
+                    Some(ProducerKind::ResultZeroSign)
+                }
             } else {
                 None
             }
         }
         M::Dec => Some(ProducerKind::Dec),
         M::Inc => Some(ProducerKind::Inc),
-        M::Bsf | M::Bsr | M::Popcnt | M::Bextr => Some(ProducerKind::ZeroOnly),
-        M::Tzcnt | M::Lzcnt => Some(ProducerKind::BitCount),
+        M::Bsf | M::Bsr | M::Bextr => Some(ProducerKind::ZeroOnly),
+        M::Popcnt => Some(ProducerKind::ZeroClearRest),
+        M::Tzcnt => Some(ProducerKind::BitCount { is_lzcnt: false }),
+        M::Lzcnt => Some(ProducerKind::BitCount { is_lzcnt: true }),
         M::Bt | M::Bts | M::Btr | M::Btc => Some(ProducerKind::CarryOnly),
         M::Comiss
         | M::Vcomiss

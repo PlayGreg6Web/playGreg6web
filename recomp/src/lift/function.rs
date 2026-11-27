@@ -819,6 +819,10 @@ struct SsaInfo {
     trunc_from: Option<(String, u32, u32)>,
     /// `and i<bits> <src>, mask(low_bits)` (low `low_bits` preserved verbatim from `<src>`).
     mask_from: Option<(String, u32)>,
+    /// `and i<bits> <src>, const_mask` (exact bitwise mask against a constant).
+    and_const: Option<(String, u64, u32)>,
+    /// `shl`/`lshr`/`ashr i<bits> <src>, const_amt` (`const_amt < bits`).
+    shift_const: Option<(&'static str, String, u32, u32)>,
     /// `bitcast <from_ty> <src> to <to_ty>`.
     bitcast_from: Option<(String, String, String)>,
     /// Canonical 64-bit affine address/offset: `base.wrapping_add(offset as u64)`.
@@ -833,6 +837,8 @@ impl SsaInfo {
             sext_from: None,
             trunc_from: None,
             mask_from: None,
+            and_const: None,
+            shift_const: None,
             bitcast_from: None,
             affine: None,
         }
@@ -884,8 +890,10 @@ impl GprFact {
 /// instead of materializing and combining individual flag slots.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum FlagSource {
-    /// `a - b` (`cmp`, `sub`, `neg`): all 10 relational CCs lower directly to `icmp <pred> a, b`;
-    /// `e`/`ne`/`s`/`ns` use `diff` (when available) or `a` vs 0 (when `b == "0"`).
+    /// Constant zero flags (`xor r, r`, `sub r, r`, `cmp r, r`): `CF=0, OF=0, ZF=1, SF=0, PF=1`;
+    /// all 16 x86 CCs lower to a boolean constant.
+    ConstZero,
+    /// `a - b` (`cmp`, `sub`, `neg`): all 10 relational CCs plus `s`/`ns` lower directly.
     Compare {
         a: String,
         b: String,
@@ -902,9 +910,25 @@ pub(super) enum FlagSource {
         result: String,
         bits: u32,
     },
-    /// Result (`blsi`, `blsr`, `bzhi`, `adc`, `sbb`, non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`):
+    /// Immediate shift (`shl`/`shr`/`sar`, 32/64-bit `shld`/`shrd`, `1 <= c < bits`):
+    /// `e`/`ne`/`s`/`ns` test `result` vs 0; `b`/`ae` test bit `cf_bit` of `src`.
+    ShiftImm {
+        result: String,
+        src: String,
+        cf_bit: u32,
+        bits: u32,
+    },
+    /// Result (`bzhi`, `adc`, `sbb`, overshifted imm `shl`/`shr`/`sar`, 16-bit `shld`/`shrd`):
     /// `e`/`ne`/`s`/`ns` lower directly to `icmp eq/ne/slt/sge result, 0`.
     ResultZeroSign { result: String, bits: u32 },
+    /// `blsi` (`r = s & -s`): `OF=0`, `CF=(r!=0)`, `ZF=(r==0)`, `SF=msb(r)`.
+    Blsi { result: String, bits: u32 },
+    /// `blsr` (`r = s & (s - 1)`): `OF=0`, `CF=(src==0)`, `ZF=(r==0)`, `SF=msb(r)`.
+    Blsr {
+        src: String,
+        result: String,
+        bits: u32,
+    },
     /// `dec a` (`result = a - 1`, preserving `CF`): `e`/`ne`/`s`/`ns` test `result` vs 0;
     /// `l`/`ge`/`le`/`g` test `a` vs 1.
     Dec {
@@ -919,11 +943,13 @@ pub(super) enum FlagSource {
         result: String,
         bits: u32,
     },
-    /// `ZF = (val == 0)` (`popcnt`, `bextr`): `e`/`ne` test `val` vs 0.
+    /// `ZF = (val == 0)` (`bextr`): `e`/`ne` test `val` vs 0.
     ZeroOnly { val: String, bits: u32 },
+    /// `popcnt`: `ZF = (val == 0)` and `CF=OF=SF=AF=PF=0`; all 16 x86 CCs fuse directly.
+    ZeroClearRest { val: String, bits: u32 },
     /// Precomputed `ZF = is_zero` (`bsf`, `bsr`, constant-zero `bextr`): `e` uses `is_zero`, `ne` negates it.
     ZeroBit { is_zero: String },
-    /// `tzcnt`/`lzcnt`: `CF = (src == 0)`, `ZF = (lsb/msb(src) == 1)`.
+    /// `tzcnt`/`lzcnt`: `CF = (src == 0)`, `ZF = (lsb/msb(src) == 1)` (`lzcnt` also fuses `be`/`a`).
     BitCount {
         src: String,
         is_tzcnt: bool,
@@ -931,13 +957,19 @@ pub(super) enum FlagSource {
     },
     /// Precomputed `CF = cf` (`bt`/`bts`/`btr`/`btc` when CF is also live): `b` uses `cf`, `ae` negates it.
     CarryBit { cf: String },
-    /// Lazy `CF = ((val & mask) != 0)` (`bt`/`bts`/`btr`/`btc` with dynamic bit mask).
+    /// Lazy `CF = ((val & mask) != 0)` (`bts`/`btr`/`btc` with dynamic bit mask).
     BitTest {
         val: String,
         mask: String,
         bits: u32,
     },
-    /// Lazy `CF = ((val >> bit) & 1) != 0` (`bt`/`bts`/`btr`/`btc` with known bit index `bit < bits`).
+    /// Lazy `CF = ((val >> index) & 1) != 0` (`bt` register with masked dynamic `index < bits`).
+    BitTestShift {
+        val: String,
+        index: String,
+        bits: u32,
+    },
+    /// Lazy `CF = ((val >> bit) & 1) != 0` (`bt*` with known bit index or imm `rol`/`ror`).
     BitTestBit { val: String, bit: u32, bits: u32 },
     /// `(v)(u)comis{s,d}` (`ZF/PF/CF = 111` unordered, `000` >, `001` <, `100` ==; `OF=SF=AF=0`):
     /// every x86 condition code lowers directly to a single `fcmp` or boolean constant.
@@ -1550,7 +1582,16 @@ impl FunctionLifter<'_> {
             "add ", "sub ", "mul ", "and ", "or ", "xor ", "shl ", "lshr ", "ashr ", "icmp ",
             "select ", "trunc ", "zext ", "sext ", "bitcast ",
         ];
-        let cacheable = CSE_OPS.iter().any(|op| rhs.starts_with(op));
+        const CSE_INTRINSICS: &[&str] = &[
+            "@llvm.cttz.",
+            "@llvm.ctlz.",
+            "@llvm.ctpop.",
+            "@llvm.bswap.",
+            "@llvm.fshl.",
+            "@llvm.fshr.",
+        ];
+        let cacheable = CSE_OPS.iter().any(|op| rhs.starts_with(op))
+            || (rhs.starts_with("call ") && CSE_INTRINSICS.iter().any(|f| rhs.contains(f)));
         if cacheable && let Some(prev) = self.cse.get(rhs) {
             return prev.clone();
         }
@@ -1686,6 +1727,17 @@ impl FunctionLifter<'_> {
                         if a == b {
                             return Some(a.to_string());
                         }
+                        if let Some(m2) = cb
+                            && let Some((inner, m1, mb)) =
+                                self.ssa_info(a).and_then(|i| i.and_const.clone())
+                            && mb == bits
+                            && (m1 & m2) != m1
+                        {
+                            return Some(self.val(&format!(
+                                "and i{bits} {inner}, {}",
+                                format_const(m1 & m2, bits)
+                            )));
+                        }
                         None
                     }
                     "or" => {
@@ -1723,6 +1775,9 @@ impl FunctionLifter<'_> {
                         None
                     }
                     "shl" => {
+                        if ca == Some(0) && nz_b < u64::from(bits) {
+                            return Some(format_const(0, bits));
+                        }
                         let amt = cb?;
                         if amt == 0 {
                             return Some(a.to_string());
@@ -1734,10 +1789,24 @@ impl FunctionLifter<'_> {
                             if nz_a == 0 {
                                 return Some(format_const(0, bits));
                             }
+                            if let Some(("shl", inner, k1, sb)) =
+                                self.ssa_info(a).and_then(|i| i.shift_const.clone())
+                                && sb == bits
+                            {
+                                let total = k1 + amt as u32;
+                                return Some(if total >= bits {
+                                    format_const(0, bits)
+                                } else {
+                                    self.val(&format!("shl i{bits} {inner}, {total}"))
+                                });
+                            }
                         }
                         None
                     }
                     "lshr" => {
+                        if ca == Some(0) && nz_b < u64::from(bits) {
+                            return Some(format_const(0, bits));
+                        }
                         let amt = cb?;
                         if amt == 0 {
                             return Some(a.to_string());
@@ -1749,19 +1818,48 @@ impl FunctionLifter<'_> {
                             if (nz_a >> (amt as u32)) == 0 {
                                 return Some(format_const(0, bits));
                             }
+                            if let Some(("lshr", inner, k1, sb)) =
+                                self.ssa_info(a).and_then(|i| i.shift_const.clone())
+                                && sb == bits
+                            {
+                                let total = k1 + amt as u32;
+                                return Some(if total >= bits {
+                                    format_const(0, bits)
+                                } else {
+                                    self.val(&format!("lshr i{bits} {inner}, {total}"))
+                                });
+                            }
                         }
                         None
                     }
                     "ashr" => {
+                        if ca == Some(0) && nz_b < u64::from(bits) {
+                            return Some(format_const(0, bits));
+                        }
+                        if ca == Some(mask(bits)) && nz_b < u64::from(bits) {
+                            return Some(format_const(mask(bits), bits));
+                        }
                         let amt = cb?;
                         if amt == 0 {
                             return Some(a.to_string());
                         }
-                        if amt < u64::from(bits)
-                            && let Some(va) = ca
-                        {
-                            let s = sign_extend_u64(va, bits) as i64;
-                            return Some(format_const((s >> (amt as u32)) as u64, bits));
+                        if amt < u64::from(bits) {
+                            if let Some(va) = ca {
+                                let s = sign_extend_u64(va, bits) as i64;
+                                return Some(format_const((s >> (amt as u32)) as u64, bits));
+                            }
+                            if let Some(("ashr", inner, k1, sb)) =
+                                self.ssa_info(a).and_then(|i| i.shift_const.clone())
+                                && sb == bits
+                            {
+                                let total = (k1 + amt as u32).min(bits - 1);
+                                if total != k1 {
+                                    return Some(
+                                        self.val(&format!("ashr i{bits} {inner}, {total}")),
+                                    );
+                                }
+                                return Some(a.to_string());
+                            }
                         }
                         None
                     }
@@ -1877,20 +1975,71 @@ impl FunctionLifter<'_> {
                     };
                     return Some(if res { "true" } else { "false" }.to_string());
                 }
+                let nz_a = self.nonzero_bits(a, bits);
+                let nz_b = self.nonzero_bits(b, bits);
                 match (pred, ca, cb) {
                     ("ult", _, Some(0)) | ("ugt", Some(0), _) => return Some("false".to_string()),
                     ("uge", _, Some(0)) | ("ule", Some(0), _) => return Some("true".to_string()),
+                    ("ule", None, Some(0)) => {
+                        return Some(self.val(&format!("icmp eq i{bits} {a}, 0")));
+                    }
+                    ("ugt", None, Some(0)) => {
+                        return Some(self.val(&format!("icmp ne i{bits} {a}, 0")));
+                    }
+                    ("ult", Some(0), None) => {
+                        return Some(self.val(&format!("icmp ne i{bits} {b}, 0")));
+                    }
+                    ("uge", Some(0), None) => {
+                        return Some(self.val(&format!("icmp eq i{bits} {b}, 0")));
+                    }
+                    ("eq", None, Some(c)) if (c & !nz_a) != 0 => return Some("false".to_string()),
+                    ("ne", None, Some(c)) if (c & !nz_a) != 0 => return Some("true".to_string()),
+                    ("eq", Some(c), None) if (c & !nz_b) != 0 => return Some("false".to_string()),
+                    ("ne", Some(c), None) if (c & !nz_b) != 0 => return Some("true".to_string()),
                     ("slt", None, Some(0))
-                        if bits > 1 && (self.nonzero_bits(a, bits) & (1u64 << (bits - 1))) == 0 =>
+                        if bits > 1 && (nz_a & (1u64 << (bits - 1))) == 0 =>
                     {
                         return Some("false".to_string());
                     }
                     ("sge", None, Some(0))
-                        if bits > 1 && (self.nonzero_bits(a, bits) & (1u64 << (bits - 1))) == 0 =>
+                        if bits > 1 && (nz_a & (1u64 << (bits - 1))) == 0 =>
                     {
                         return Some("true".to_string());
                     }
+                    ("sle", None, Some(0))
+                        if bits > 1 && (nz_a & (1u64 << (bits - 1))) == 0 =>
+                    {
+                        return Some(self.val(&format!("icmp eq i{bits} {a}, 0")));
+                    }
+                    ("sgt", None, Some(0))
+                        if bits > 1 && (nz_a & (1u64 << (bits - 1))) == 0 =>
+                    {
+                        return Some(self.val(&format!("icmp ne i{bits} {a}, 0")));
+                    }
                     _ => {}
+                }
+                if bits > 1
+                    && cb == Some(0)
+                    && let Some((inner, m, mb)) =
+                        self.ssa_info(a).and_then(|i| i.and_const.clone())
+                    && mb == bits
+                {
+                    let sign_bit = 1u64 << (bits - 1);
+                    if m == sign_bit {
+                        match pred {
+                            "ne" | "slt" => {
+                                return Some(self.val(&format!("icmp slt i{bits} {inner}, 0")));
+                            }
+                            "eq" | "sge" => {
+                                return Some(self.val(&format!("icmp sge i{bits} {inner}, 0")));
+                            }
+                            "sle" => return Some("true".to_string()),
+                            "sgt" => return Some("false".to_string()),
+                            _ => {}
+                        }
+                    } else if m == 1 && pred == "ne" {
+                        return Some(self.val(&format!("trunc i{bits} {inner} to i1")));
+                    }
                 }
                 None
             }
@@ -1964,14 +2113,18 @@ impl FunctionLifter<'_> {
                         info.nonzero_bits = (nz_a & nz_b) & m;
                         if let Some(cb) = parse_const(b, bits)
                             && a.starts_with('%')
-                            && let Some(low) = contiguous_low_mask_bits(cb, bits)
                         {
-                            info.mask_from = Some((a.to_string(), low));
+                            info.and_const = Some((a.to_string(), cb, bits));
+                            if let Some(low) = contiguous_low_mask_bits(cb, bits) {
+                                info.mask_from = Some((a.to_string(), low));
+                            }
                         } else if let Some(ca) = parse_const(a, bits)
                             && b.starts_with('%')
-                            && let Some(low) = contiguous_low_mask_bits(ca, bits)
                         {
-                            info.mask_from = Some((b.to_string(), low));
+                            info.and_const = Some((b.to_string(), ca, bits));
+                            if let Some(low) = contiguous_low_mask_bits(ca, bits) {
+                                info.mask_from = Some((b.to_string(), low));
+                            }
                         }
                     }
                     "or" | "xor" => {
@@ -1982,6 +2135,9 @@ impl FunctionLifter<'_> {
                             && amt < u64::from(bits)
                         {
                             info.nonzero_bits = nz_a.wrapping_shl(amt as u32) & m;
+                            if a.starts_with('%') {
+                                info.shift_const = Some(("shl", a.to_string(), amt as u32, bits));
+                            }
                         } else {
                             info.nonzero_bits = m;
                         }
@@ -1991,6 +2147,9 @@ impl FunctionLifter<'_> {
                             && amt < u64::from(bits)
                         {
                             info.nonzero_bits = (nz_a & m) >> (amt as u32);
+                            if a.starts_with('%') {
+                                info.shift_const = Some(("lshr", a.to_string(), amt as u32, bits));
+                            }
                         } else {
                             info.nonzero_bits = m;
                         }
@@ -1998,10 +2157,15 @@ impl FunctionLifter<'_> {
                     "ashr" => {
                         if let Some(amt) = parse_const(b, bits)
                             && amt < u64::from(bits)
-                            && bits > 1
-                            && (nz_a & (1u64 << (bits - 1))) == 0
                         {
-                            info.nonzero_bits = (nz_a & m) >> (amt as u32);
+                            if bits > 1 && (nz_a & (1u64 << (bits - 1))) == 0 {
+                                info.nonzero_bits = (nz_a & m) >> (amt as u32);
+                            } else {
+                                info.nonzero_bits = m;
+                            }
+                            if a.starts_with('%') {
+                                info.shift_const = Some(("ashr", a.to_string(), amt as u32, bits));
+                            }
                         } else {
                             info.nonzero_bits = m;
                         }
@@ -2085,6 +2249,17 @@ impl FunctionLifter<'_> {
             }
             "icmp" | "fcmp" => {
                 info.nonzero_bits = 1;
+            }
+            "call" => {
+                if let Some((ty_s, callee)) = rest.split_once(' ')
+                    && let Some(bits) = parse_int_ty(ty_s)
+                    && (callee.starts_with("@llvm.cttz.")
+                        || callee.starts_with("@llvm.ctlz.")
+                        || callee.starts_with("@llvm.ctpop."))
+                {
+                    // Result is in `0..=bits` (power-of-two width: 8->0xF, 16->0x1F, 32->0x3F, 64->0x7F).
+                    info.nonzero_bits = ((u64::from(bits) << 1) - 1) & mask(bits);
+                }
             }
             _ => {}
         }
@@ -2583,9 +2758,34 @@ impl FunctionLifter<'_> {
             if let Some(c) = memory_access::const_addr(&scaled) {
                 const_disp = const_disp.wrapping_add(c);
             } else {
-                acc = Some(match acc {
-                    Some(sum) => self.val(&format!("add i64 {sum}, {scaled}")),
-                    None => scaled,
+                // Fold affine offsets into `const_disp` when combining base + scaled + disp so
+                // chains like `lea rcx, [rsp+32]; lea rax, [rcx+rdx*4-32]` cancel cleanly.
+                let mut sum_base = acc.take();
+                let mut sum_idx = scaled;
+                let base_off = sum_base.as_deref().map_or(0, |b| self.affine_root(b).1);
+                let idx_off = if scale == 1 {
+                    self.affine_root(&sum_idx).1
+                } else {
+                    0
+                };
+                if (const_disp != 0 || (base_off != 0 && idx_off != 0))
+                    && (base_off != 0 || idx_off != 0)
+                {
+                    if let Some(b) = sum_base.take() {
+                        let (root, off) = self.affine_root(&b);
+                        const_disp = const_disp.wrapping_add(off as u64);
+                        sum_base = Some(root);
+                    }
+                    if idx_off != 0 {
+                        let (root, off) = self.affine_root(&sum_idx);
+                        const_disp = const_disp.wrapping_add(off as u64);
+                        sum_idx = root;
+                    }
+                }
+                acc = Some(match sum_base {
+                    Some(sum) if sum == sum_idx => self.val(&format!("shl i64 {sum}, 1")),
+                    Some(sum) => self.val(&format!("add i64 {sum}, {sum_idx}")),
+                    None => sum_idx,
                 });
             }
         }
@@ -2681,14 +2881,9 @@ impl FunctionLifter<'_> {
 
     fn read_addr_reg(&mut self, reg: Register) -> R<String> {
         match reg_ref(reg)? {
-            RegRef::Low(idx, 64) => self.load_gpr(idx),
-            RegRef::Low(idx, 32) => {
-                let full = self.load_gpr(idx)?;
-                if let Some(c) = memory_access::const_addr(&full) {
-                    return Ok(imm(c & mask(32), 64));
-                }
-                Ok(self.val(&format!("and i64 {full}, 4294967295")))
-            }
+            // For 32-bit address registers (`addr32 == true`), `address()` applies a single final
+            // `and i64 ..., 4294967295` (modulo 2^32), so pre-masking base/index is redundant.
+            RegRef::Low(idx, 64) | RegRef::Low(idx, 32) => self.load_gpr(idx),
             _ => {
                 let (v, bits) = self.read_reg(reg)?;
                 Ok(self.val(&format!("zext i{bits} {v} to i64")))
@@ -3297,17 +3492,32 @@ impl FunctionLifter<'_> {
         use ConditionCode as C;
         let src = self.known.flag_source.clone()?;
         match src {
+            FlagSource::ConstZero => match cc {
+                C::o | C::b | C::ne | C::a | C::s | C::np | C::l | C::g => {
+                    Some("false".to_string())
+                }
+                C::no | C::ae | C::e | C::be | C::ns | C::p | C::ge | C::le => {
+                    Some("true".to_string())
+                }
+                C::None => None,
+            },
             FlagSource::Compare { a, b, diff, bits } => {
                 let t = ty(bits);
                 match cc {
-                    C::e => Some(match diff {
-                        Some(r) => self.val(&format!("icmp eq {t} {r}, 0")),
-                        None => self.val(&format!("icmp eq {t} {a}, {b}")),
-                    }),
-                    C::ne => Some(match diff {
-                        Some(r) => self.val(&format!("icmp ne {t} {r}, 0")),
-                        None => self.val(&format!("icmp ne {t} {a}, {b}")),
-                    }),
+                    C::e | C::ne => {
+                        let pred = if cc == C::e { "eq" } else { "ne" };
+                        let direct = format!("icmp {pred} {t} {a}, {b}");
+                        if let Some(folded) = self.try_fold_val(&direct) {
+                            Some(folded)
+                        } else if let Some(prev) = self.cse.get(&direct) {
+                            Some(prev.clone())
+                        } else {
+                            Some(match diff {
+                                Some(r) => self.val(&format!("icmp {pred} {t} {r}, 0")),
+                                None => self.val(&direct),
+                            })
+                        }
+                    }
                     C::b => Some(if b == "0" {
                         "false".to_string()
                     } else {
@@ -3324,16 +3534,14 @@ impl FunctionLifter<'_> {
                     C::ge => Some(self.val(&format!("icmp sge {t} {a}, {b}"))),
                     C::le => Some(self.val(&format!("icmp sle {t} {a}, {b}"))),
                     C::g => Some(self.val(&format!("icmp sgt {t} {a}, {b}"))),
-                    C::s => match diff {
-                        Some(r) => Some(self.val(&format!("icmp slt {t} {r}, 0"))),
-                        None if b == "0" => Some(self.val(&format!("icmp slt {t} {a}, 0"))),
-                        None => None,
-                    },
-                    C::ns => match diff {
-                        Some(r) => Some(self.val(&format!("icmp sge {t} {r}, 0"))),
-                        None if b == "0" => Some(self.val(&format!("icmp sge {t} {a}, 0"))),
-                        None => None,
-                    },
+                    C::s => {
+                        let r = diff.unwrap_or_else(|| self.val(&format!("sub {t} {a}, {b}")));
+                        Some(self.val(&format!("icmp slt {t} {r}, 0")))
+                    }
+                    C::ns => {
+                        let r = diff.unwrap_or_else(|| self.val(&format!("sub {t} {a}, {b}")));
+                        Some(self.val(&format!("icmp sge {t} {r}, 0")))
+                    }
                     _ => None,
                 }
             }
@@ -3363,6 +3571,37 @@ impl FunctionLifter<'_> {
                     _ => None,
                 }
             }
+            FlagSource::ShiftImm {
+                result,
+                src,
+                cf_bit,
+                bits,
+            } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::b => Some(if cf_bit == 0 {
+                        self.val(&format!("trunc {t} {src} to i1"))
+                    } else if cf_bit == bits - 1 {
+                        self.msb(&src, bits)
+                    } else {
+                        let m = imm(1u64 << cf_bit, bits);
+                        let hit = self.val(&format!("and {t} {src}, {m}"));
+                        self.val(&format!("icmp ne {t} {hit}, 0"))
+                    }),
+                    C::ae => Some(if cf_bit == bits - 1 {
+                        self.val(&format!("icmp sge {t} {src}, 0"))
+                    } else {
+                        let m = imm(1u64 << cf_bit, bits);
+                        let hit = self.val(&format!("and {t} {src}, {m}"));
+                        self.val(&format!("icmp eq {t} {hit}, 0"))
+                    }),
+                    _ => None,
+                }
+            }
             FlagSource::ResultZeroSign { result, bits } => {
                 let t = ty(bits);
                 match cc {
@@ -3370,6 +3609,36 @@ impl FunctionLifter<'_> {
                     C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
                     C::s => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
                     C::ns => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    _ => None,
+                }
+            }
+            FlagSource::Blsi { result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::o | C::a => Some("false".to_string()),
+                    C::no | C::be => Some("true".to_string()),
+                    C::e | C::ae => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne | C::b => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s | C::l => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns | C::ge => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::le => Some(self.val(&format!("icmp sle {t} {result}, 0"))),
+                    C::g => Some(self.val(&format!("icmp sgt {t} {result}, 0"))),
+                    _ => None,
+                }
+            }
+            FlagSource::Blsr { src, result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::o => Some("false".to_string()),
+                    C::no => Some("true".to_string()),
+                    C::b => Some(self.val(&format!("icmp eq {t} {src}, 0"))),
+                    C::ae => Some(self.val(&format!("icmp ne {t} {src}, 0"))),
+                    C::e | C::be => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne | C::a => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s | C::l => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns | C::ge => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::le => Some(self.val(&format!("icmp sle {t} {result}, 0"))),
+                    C::g => Some(self.val(&format!("icmp sgt {t} {result}, 0"))),
                     _ => None,
                 }
             }
@@ -3409,6 +3678,16 @@ impl FunctionLifter<'_> {
                     _ => None,
                 }
             }
+            FlagSource::ZeroClearRest { val, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::o | C::b | C::s | C::p | C::l => Some("false".to_string()),
+                    C::no | C::ae | C::ns | C::np | C::ge => Some("true".to_string()),
+                    C::e | C::be | C::le => Some(self.val(&format!("icmp eq {t} {val}, 0"))),
+                    C::ne | C::a | C::g => Some(self.val(&format!("icmp ne {t} {val}, 0"))),
+                    C::None => None,
+                }
+            }
             FlagSource::ZeroBit { is_zero } => match cc {
                 C::e => Some(is_zero),
                 C::ne => Some(self.negate_i1(&is_zero)),
@@ -3434,6 +3713,8 @@ impl FunctionLifter<'_> {
                     }),
                     C::b => Some(self.val(&format!("icmp eq {t} {src}, 0"))),
                     C::ae => Some(self.val(&format!("icmp ne {t} {src}, 0"))),
+                    C::be if !is_tzcnt => Some(self.val(&format!("icmp sle {t} {src}, 0"))),
+                    C::a if !is_tzcnt => Some(self.val(&format!("icmp sgt {t} {src}, 0"))),
                     _ => None,
                 }
             }
@@ -3452,6 +3733,21 @@ impl FunctionLifter<'_> {
                     C::ae => {
                         let hit = self.val(&format!("and {t} {val}, {mask}"));
                         Some(self.val(&format!("icmp eq {t} {hit}, 0")))
+                    }
+                    _ => None,
+                }
+            }
+            FlagSource::BitTestShift { val, index, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::b => {
+                        let shifted = self.val(&format!("lshr {t} {val}, {index}"));
+                        Some(self.val(&format!("trunc {t} {shifted} to i1")))
+                    }
+                    C::ae => {
+                        let shifted = self.val(&format!("lshr {t} {val}, {index}"));
+                        let bit = self.val(&format!("trunc {t} {shifted} to i1"));
+                        Some(self.negate_i1(&bit))
                     }
                     _ => None,
                 }
@@ -3649,6 +3945,16 @@ impl FunctionLifter<'_> {
                 let bits = self.op_bits(ins, 0)?;
                 if ins.op_kind(1) != OpKind::Memory {
                     return unsupported("lea without memory operand");
+                }
+                // Identity 64-bit `lea r64, [r64 + 0]` is an architectural no-op (unlike 32-bit
+                // `lea r32, [r32 + 0]`, which still zeroes the upper 32 bits of the 64-bit GPR).
+                if bits == 64
+                    && ins.op_kind(0) == OpKind::Register
+                    && ins.memory_base() == ins.op_register(0)
+                    && ins.memory_index() == Register::None
+                    && ins.memory_displacement64() == 0
+                {
+                    return Ok(());
                 }
                 let addr = self.address(ins, false)?;
                 if bits == 32 && ins.op_kind(0) == OpKind::Register {
@@ -3890,6 +4196,7 @@ impl FunctionLifter<'_> {
                     if !matches!(op, Alu::Cmp) {
                         self.write_op(ins, 0, "0", bits)?;
                     }
+                    self.known.flag_source = Some(FlagSource::ConstZero);
                     return Ok(());
                 }
                 Alu::And | Alu::Or | Alu::Test => {
@@ -4019,15 +4326,17 @@ impl FunctionLifter<'_> {
                 r
             }
             Alu::Cmp => {
-                let diff = if a == b {
+                if a == b {
                     self.set_flag(Flag::Cf, "false");
                     self.set_flag(Flag::Of, "false");
                     self.set_flag(Flag::Af, "false");
                     self.set_flag(Flag::Zf, "true");
                     self.set_flag(Flag::Sf, "false");
                     self.set_flag(Flag::Pf, "true");
-                    Some("0".to_string())
-                } else if b == "0" {
+                    self.known.flag_source = Some(FlagSource::ConstZero);
+                    return String::new();
+                }
+                let diff = if b == "0" {
                     self.set_flag(Flag::Cf, "false");
                     self.set_flag(Flag::Of, "false");
                     self.set_flag(Flag::Af, "false");
@@ -4256,6 +4565,8 @@ impl FunctionLifter<'_> {
         let count_mask: u64 = if bits == 64 { 63 } else { 31 };
         let a = self.read_op(ins, 0, bits)?;
 
+        let want_cf = self.flag_live(Flag::Cf);
+        let want_of = self.flag_live(Flag::Of);
         // Native count width: `i32` for 32-bit shifts/rotates, `i{bits}` for 8/16-bit rotates,
         // `i64` for 64-bit and for 8/16-bit shifts (which widen to i64 so counts 8..31 never poison).
         let cnt_bits = match (kind, bits) {
@@ -4263,6 +4574,7 @@ impl FunctionLifter<'_> {
             (_, 32) => 32,
             _ => 64,
         };
+        let need_count_mask = !matches!(kind, Shift::Rol | Shift::Ror) || want_cf || want_of;
         let (count, imm_count) = match ins.op_kind(1) {
             OpKind::Register if ins.op_register(1) == Register::CL => {
                 let rcx = self.load_gpr(integer::RCX)?;
@@ -4275,10 +4587,17 @@ impl FunctionLifter<'_> {
                     } else {
                         self.val(&format!("trunc i64 {rcx} to i{cnt_bits}"))
                     };
-                    (
-                        self.val(&format!("and i{cnt_bits} {raw}, {count_mask}")),
-                        None,
-                    )
+                    if need_count_mask {
+                        (
+                            self.val(&format!("and i{cnt_bits} {raw}, {count_mask}")),
+                            None,
+                        )
+                    } else {
+                        // LLVM `fshl`/`fshr` reduce the shift amount modulo `bits`, and `bits`
+                        // divides `count_mask + 1` (8|32, 16|32, 32|32, 64|64), so when neither
+                        // CF nor OF is live no explicit count mask is needed.
+                        (raw, None)
+                    }
                 }
             }
             kind if is_immediate(kind) => match ins.try_immediate(1) {
@@ -4296,8 +4615,6 @@ impl FunctionLifter<'_> {
             return self.write_op(ins, 0, &a, bits);
         }
 
-        let want_cf = self.flag_live(Flag::Cf);
-        let want_of = self.flag_live(Flag::Of);
         let (r, cf, of): (String, Option<String>, Option<String>) = match kind {
             Shift::Rol | Shift::Ror => {
                 let r = if let (Some(va), Some(c)) = (parse_const(&a, bits), imm_count) {
@@ -4314,8 +4631,16 @@ impl FunctionLifter<'_> {
                         _ => unreachable!(),
                     };
                     imm(rotated, bits)
+                } else if imm_count.is_some_and(|c| (c as u32) % bits == 0) {
+                    // Full-width rotation (e.g. `rol al, 8`, `ror ax, 16`) leaves the value
+                    // unchanged while still updating CF/OF because the masked count is non-zero.
+                    a.clone()
                 } else {
                     // fshl/fshr take the amount modulo the width, like x86 rotates (after masking).
+                    let rot_arg = match imm_count {
+                        Some(c) => ((c as u32) % bits).to_string(),
+                        None => count.clone(),
+                    };
                     let (name, support) = if kind == Shift::Rol {
                         ("fshl", Support::Fshl(bits))
                     } else {
@@ -4323,7 +4648,7 @@ impl FunctionLifter<'_> {
                     };
                     self.support.insert(support);
                     self.val(&format!(
-                        "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {count})"
+                        "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {rot_arg})"
                     ))
                 };
                 if kind == Shift::Rol {
@@ -4485,11 +4810,31 @@ impl FunctionLifter<'_> {
                 }
             }
         }
-        if !matches!(kind, Shift::Rol | Shift::Ror) && imm_count.is_some() {
-            self.known.flag_source = Some(FlagSource::ResultZeroSign {
-                result: r.clone(),
-                bits,
-            });
+        if let Some(c) = imm_count {
+            if matches!(kind, Shift::Rol | Shift::Ror) {
+                self.known.flag_source = Some(FlagSource::BitTestBit {
+                    val: r.clone(),
+                    bit: if kind == Shift::Rol { 0 } else { bits - 1 },
+                    bits,
+                });
+            } else if c < u64::from(bits) {
+                let cf_bit = if kind == Shift::Shl {
+                    bits - c as u32
+                } else {
+                    c as u32 - 1
+                };
+                self.known.flag_source = Some(FlagSource::ShiftImm {
+                    result: r.clone(),
+                    src: a,
+                    cf_bit,
+                    bits,
+                });
+            } else {
+                self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                    result: r.clone(),
+                    bits,
+                });
+            }
         }
         self.write_op(ins, 0, &r, bits)
     }
