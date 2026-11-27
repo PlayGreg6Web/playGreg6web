@@ -541,6 +541,10 @@ else()
     target_link_libraries(test_guest_window PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_window_tests COMMAND test_guest_window)
 
+    add_executable(test_vmem_window_stress ../tests/test_vmem_window_stress.cpp)
+    target_link_libraries(test_vmem_window_stress PRIVATE playgta6_core)
+    add_test(NAME playgta6_vmem_window_stress_tests COMMAND test_vmem_window_stress)
+
     # O29: the checked-in output of `playgta6-recomp export-thunks --memory-model window --only ...`
     # (tests/fixtures/export_thunks_window, kept in sync with the generator by a Rust test).
     add_executable(test_window_marshal
