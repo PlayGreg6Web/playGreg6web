@@ -537,6 +537,18 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
             fn(read_u32(p));
         }
         break;
+    case kGpuOpcodeClearTexture:
+        if (len >= sizeof(GpuClearTexturePayload)) {
+            fn(read_u32(p + offsetof(GpuClearTexturePayload, texture_id)));
+        }
+        break;
+    case kGpuOpcodeCopyTexture:
+        // Both textures: a deferred create must precede the copy like it does a draw or bind.
+        if (len >= sizeof(GpuCopyTexturePayload)) {
+            fn(read_u32(p + offsetof(GpuCopyTexturePayload, dst_id)));
+            fn(read_u32(p + offsetof(GpuCopyTexturePayload, src_id)));
+        }
+        break;
     case GpuOpcode::ReadbackBuffer:
     case GpuOpcode::ReadbackTexture:
         if (len >= 8) {

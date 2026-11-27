@@ -679,6 +679,21 @@ void test_native_copy_for_plain_destination() {
         }
     }
     CHECK(copies.size() == 2);
+    // Deferred (create-on-use) textures: each one's CreateTexture2 precedes the first copy naming it (#2201).
+    if (!copies.empty()) {
+        bool dst_made = false, src_made = false;
+        for (const Packet& p : ps) {
+            if (p.opcode == kGpuOpcodeCopyTexture) {
+                break;
+            }
+            if (p.opcode == GpuOpcode::CreateTexture2) {
+                const uint32_t id = payload_as<GpuCreateTexture2Payload>(p).id;
+                dst_made = dst_made || id == copies[0].dst_id;
+                src_made = src_made || id == copies[0].src_id;
+            }
+        }
+        CHECK(dst_made && src_made);
+    }
     if (copies.size() == 2) {
         CHECK(copies[0].dst_id != copies[0].src_id);
         CHECK(copies[0].width == 32 && copies[0].height == 32 && copies[0].depth_or_layers == 1);
