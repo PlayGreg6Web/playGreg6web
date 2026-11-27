@@ -9,7 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <dxgi.h>
+#include <dxgi1_4.h>
 #include <psapi.h>
 #endif
 
@@ -70,6 +70,74 @@ uint64_t dedicated_video_memory_bytes() {
     return best;
 #else
     return 0;
+#endif
+}
+
+#ifdef _WIN32
+namespace {
+// The IDXGIAdapter3 of the hardware adapter with the most dedicated memory (the one the executor's Dawn
+// device runs on), found once. Never released: it lives for the process.
+IDXGIAdapter3* video_memory_adapter() {
+    static IDXGIAdapter3* cached = [] {
+        IDXGIAdapter3* best3 = nullptr;
+        HMODULE dxgi = LoadLibraryW(L"dxgi");  // kept loaded: the adapter lives in it
+        if (dxgi == nullptr) return best3;
+        using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+        auto create = reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+        IDXGIFactory1* factory = nullptr;
+        if (create == nullptr || FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return best3;
+        uint64_t best = 0;
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 d{};
+            IDXGIAdapter3* a3 = nullptr;
+            if (SUCCEEDED(adapter->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                (best3 == nullptr || d.DedicatedVideoMemory > best) &&
+                SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&a3)))) {
+                if (best3 != nullptr) best3->Release();
+                best3 = a3;
+                best = d.DedicatedVideoMemory;
+            }
+            adapter->Release();
+        }
+        factory->Release();
+        return best3;
+    }();
+    return cached;
+}
+}  // namespace
+#endif
+
+bool gpu_memory_usage(GpuMemoryUsage* out) {
+#ifdef _WIN32
+    IDXGIAdapter3* a = video_memory_adapter();
+    if (a == nullptr) return false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, nonlocal{};
+    if (FAILED(a->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) return false;
+    if (FAILED(a->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) nonlocal = {};
+    out->local_usage = local.CurrentUsage;
+    out->local_budget = local.Budget;
+    out->nonlocal_usage = nonlocal.CurrentUsage;
+    out->nonlocal_budget = nonlocal.Budget;
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
+bool system_commit_bytes(uint64_t* commit_total, uint64_t* commit_limit) {
+#ifdef _WIN32
+    PERFORMANCE_INFORMATION pi{};
+    pi.cb = sizeof(pi);
+    if (!GetPerformanceInfo(&pi, sizeof(pi))) return false;
+    *commit_total = uint64_t{pi.CommitTotal} * pi.PageSize;
+    *commit_limit = uint64_t{pi.CommitLimit} * pi.PageSize;
+    return true;
+#else
+    (void)commit_total;
+    (void)commit_limit;
+    return false;
 #endif
 }
 

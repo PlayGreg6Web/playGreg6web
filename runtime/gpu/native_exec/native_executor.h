@@ -443,6 +443,20 @@ struct ExecutorStats {
     std::map<std::string, uint64_t> packet_error_kinds;  // packet errors by message (numbers folded), bounded
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
+    // Object lifetime (memory_model.h): ids DestroyResource dropped per kind, and the cache entries
+    // (view_meta / bg_infos) purged because they still referenced a destroyed texture, buffer or group.
+    uint64_t textures_destroyed = 0;
+    uint64_t buffers_destroyed = 0;
+    uint64_t bind_groups_destroyed = 0;
+    uint64_t cache_purges = 0;
+    uint64_t cache_views_purged = 0;
+    uint64_t cache_bg_infos_purged = 0;
+    // Bind group budget (PG6_BIND_GROUP_BUDGET, default 131072 live Dawn groups): groups whose Dawn object
+    // was dropped, rebuilt from the journal when bound again, and rebuilds that failed.
+    uint64_t bind_groups_evicted = 0;
+    uint64_t bind_groups_recreated = 0;
+    uint64_t bind_groups_recreate_failed = 0;
+    uint64_t bind_group_budget_passes = 0;
 };
 
 struct ShowTargetCandidate {

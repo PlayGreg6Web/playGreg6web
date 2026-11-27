@@ -43,6 +43,7 @@
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
+#include "gpu/native_exec/memory_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
 #include "gpu/native_exec/overlay_model.h"
@@ -769,6 +770,14 @@ struct NativeExecutor::Impl {
     std::unordered_map<uint64_t, size_t> alias_scratch_used;  // per dispatch
     std::unordered_map<std::string, std::vector<wgpu::Texture>> alias_tex_pool;  // twin textures by shape
     std::unordered_map<std::string, size_t> alias_tex_used;
+    // Destroyed objects the handle-keyed caches above may still reference (memory_model.h): purged from
+    // view_meta / bg_infos once no recorded pass command can need them (purge_retired).
+    RetiredSet<wgpu::Texture> retired_tex;
+    RetiredSet<wgpu::Buffer> retired_buf;
+    RetiredSet<wgpu::BindGroup> retired_bg;
+    // GPU / process memory and live object counts over the run (sample_memory).
+    MemoryTimeline mem_timeline;
+    uint64_t mem_t0_ns = now_ns();
     std::vector<wgpu::Texture> dummy_textures;
     std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth twin
     std::set<uint32_t> norm_twin_sources;   // texture ids that own a norm16 float twin
@@ -2259,6 +2268,8 @@ struct NativeExecutor::Impl {
     bool journal_replay() {
         for (const JournalEntry& e : journal) {
             if (!e.live) continue;
+            // A group evicted for the bind group budget comes back when the stream binds it.
+            if (e.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup2) && bg_evicted.count(e.id)) continue;
             Packet p;
             p.opcode = e.opcode;
             p.flags = e.flags;
@@ -2367,6 +2378,29 @@ struct NativeExecutor::Impl {
         occ_pool = nullptr;
         occ_pool_resolve = nullptr;
         occ_fold_pipeline = nullptr;
+        // The handle-keyed caches, pools and helper objects: every one holds a reference that keeps the old
+        // device's objects (and through them the old device) alive, and the D3D12 device is one per adapter,
+        // so whatever survived counted against the new device (#2199's confirm run: every new device failed
+        // in CreateDescriptorHeap with E_OUTOFMEMORY).
+        zero_buffer = nullptr;
+        bg_infos.clear();
+        view_meta.clear();
+        alias_scratch.clear();
+        alias_scratch_used.clear();
+        alias_tex_pool.clear();
+        alias_tex_used.clear();
+        alias_kernel_groups.clear();
+        ak = AliasKernels{};
+        snap_free.clear();
+        unref_dummy_w.clear();
+        unref_dummy_r.clear();
+        for (auto& p : show_pipe) p = nullptr;
+        for (auto& b : show_bgl) b = nullptr;
+        show_ub = nullptr;
+        show_pipe_format = wgpu::TextureFormat::Undefined;
+        retired_tex.clear();
+        retired_buf.clear();
+        retired_bg.clear();
         inflight.clear();
         ++submit_epoch;  // completions of the old device's submits are ignored
         submits_done = submit_seq = 0;
@@ -2376,6 +2410,9 @@ struct NativeExecutor::Impl {
         device = nullptr;
         queue = nullptr;
         adapter_handle = nullptr;
+        // Deliver what the destroyed device still has queued (map / work-done callbacks drop their references)
+        // so it is released before a new one is requested.
+        if (instance) instance.ProcessEvents();
     }
 
     static std::string json_escape(const std::string& s) {
@@ -2444,8 +2481,24 @@ struct NativeExecutor::Impl {
         const uint64_t replayed_before = stats.recovery_replayed_packets;
         std::string last_error = "no attempt";
         bool ok = false;
+        {
+            const MemorySample m = memory_sample("device_lost");
+            mem_timeline.push(m);
+            std::fprintf(stderr,
+                         "[native_exec] memory at the loss: gpu local %llu / %llu MB, non-local %llu / %llu MB, private %llu MB, "
+                         "system commit %llu / %llu MB; textures %llu (%llu MB), buffers %llu (%llu MB), bind groups %llu, "
+                         "dead textures pinned %llu (%llu MB)\n",
+                         static_cast<unsigned long long>(m.gpu_local_usage >> 20), static_cast<unsigned long long>(m.gpu_local_budget >> 20),
+                         static_cast<unsigned long long>(m.gpu_nonlocal_usage >> 20), static_cast<unsigned long long>(m.gpu_nonlocal_budget >> 20),
+                         static_cast<unsigned long long>(m.process_private >> 20), static_cast<unsigned long long>(m.system_commit >> 20),
+                         static_cast<unsigned long long>(m.system_commit_limit >> 20), static_cast<unsigned long long>(m.textures),
+                         static_cast<unsigned long long>(m.texture_bytes >> 20), static_cast<unsigned long long>(m.buffers),
+                         static_cast<unsigned long long>(m.buffer_bytes >> 20), static_cast<unsigned long long>(m.bind_groups),
+                         static_cast<unsigned long long>(m.dead_textures_pinned), static_cast<unsigned long long>(m.dead_texture_bytes_pinned >> 20));
+        }
         for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
             release_device_objects();
+            if (attempt == 0) sample_memory("released");  // what the old device left behind
             if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(250));
             lost = false;
             CreateStatus st = CreateStatus::Failed;
@@ -2466,7 +2519,11 @@ struct NativeExecutor::Impl {
             }
             ok = true;
         }
-        if (!ok) return fail_fatal("could not create a new device: " + last_error);
+        if (!ok) {
+            sample_memory("recovery_failed");
+            return fail_fatal("could not create a new device: " + last_error);
+        }
+        sample_memory("recovered");
         clear_color = keep_clear;
         for (const auto& b : buffers)
             if (b.second.usage & 0x0080u) ++stats.recovery_gpu_resources_reset;  // Storage
@@ -2637,6 +2694,204 @@ struct NativeExecutor::Impl {
     static uint64_t now_ns() {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    // ---- memory timeline (memory_model.h) ----
+
+    static uint32_t texel_bits(wgpu::TextureFormat f) {
+        using F = wgpu::TextureFormat;
+        switch (f) {
+            case F::R8Unorm: case F::R8Snorm: case F::R8Uint: case F::R8Sint: case F::Stencil8:
+                return 8;
+            case F::R16Uint: case F::R16Sint: case F::R16Float: case F::R16Unorm: case F::R16Snorm: case F::RG8Unorm:
+            case F::RG8Snorm: case F::RG8Uint: case F::RG8Sint: case F::Depth16Unorm:
+                return 16;
+            case F::RG32Float: case F::RG32Uint: case F::RG32Sint: case F::RGBA16Uint: case F::RGBA16Sint:
+            case F::RGBA16Float: case F::RGBA16Unorm: case F::RGBA16Snorm: case F::Depth32FloatStencil8:
+                return 64;
+            case F::RGBA32Float: case F::RGBA32Uint: case F::RGBA32Sint:
+                return 128;
+            case F::BC1RGBAUnorm: case F::BC1RGBAUnormSrgb: case F::BC4RUnorm: case F::BC4RSnorm:
+                return 4;
+            case F::BC2RGBAUnorm: case F::BC2RGBAUnormSrgb: case F::BC3RGBAUnorm: case F::BC3RGBAUnormSrgb:
+            case F::BC5RGUnorm: case F::BC5RGSnorm: case F::BC6HRGBUfloat: case F::BC6HRGBFloat: case F::BC7RGBAUnorm:
+            case F::BC7RGBAUnormSrgb:
+                return 8;
+            default:
+                return 32;
+        }
+    }
+    static uint64_t tex_bytes(const wgpu::Texture& t) {
+        if (!t) return 0;
+        return texture_storage_bytes(t.GetWidth(), t.GetHeight(), t.GetDepthOrArrayLayers(), t.GetMipLevelCount(),
+                                     t.GetSampleCount(), texel_bits(t.GetFormat()),
+                                     t.GetDimension() == wgpu::TextureDimension::e3D);
+    }
+
+    MemorySample memory_sample(const char* tag) const {
+        MemorySample s;
+        s.tag = tag;
+        s.t_ms = (now_ns() - mem_t0_ns) / 1000000ull;
+        s.presents = stats.present_packets;
+        playgta6::os::GpuMemoryUsage g;
+        if (playgta6::os::gpu_memory_usage(&g)) {
+            s.gpu_local_usage = g.local_usage;
+            s.gpu_local_budget = g.local_budget;
+            s.gpu_nonlocal_usage = g.nonlocal_usage;
+            s.gpu_nonlocal_budget = g.nonlocal_budget;
+        }
+        playgta6::os::process_memory_bytes(&s.process_private, &s.process_working_set, nullptr);
+        playgta6::os::system_commit_bytes(&s.system_commit, &s.system_commit_limit);
+        std::unordered_set<const void*> live;
+        live.reserve(textures.size() * 2);
+        s.buffers = buffers.size();
+        for (const auto& kv : buffers) s.buffer_bytes += kv.second.size;
+        for (const auto& kv : textures) {
+            const TextureEntry& t = kv.second;
+            live.insert(t.texture.Get());
+            s.texture_bytes += tex_bytes(t.texture);
+            s.texture_views += t.views.size() + (t.default_view ? 1 : 0);
+            auto twin = [&](const wgpu::Texture& x) {
+                if (!x) return;
+                live.insert(x.Get());
+                ++s.twin_textures;
+                s.twin_bytes += tex_bytes(x);
+            };
+            for (const TwinSlot& ts : t.twins) twin(ts.tex);
+            twin(t.norm_twin.tex);
+        }
+        s.textures = textures.size();
+        for (const auto& kv : alias_tex_pool)
+            for (const wgpu::Texture& x : kv.second) {
+                live.insert(x.Get());
+                ++s.alias_textures;
+                s.alias_texture_bytes += tex_bytes(x);
+            }
+        for (const auto& kv : alias_scratch) {
+            s.alias_buffers += kv.second.size();
+            s.alias_buffer_bytes += kv.first * kv.second.size();
+        }
+        for (const auto& kv : snap_textures)
+            for (const wgpu::Texture& x : kv.second) {
+                live.insert(x.Get());
+                ++s.snap_textures;
+                s.snap_texture_bytes += tex_bytes(x);
+            }
+        auto snap_buf = [&](const wgpu::Buffer& b) {
+            if (!b) return;
+            ++s.snap_buffers;
+            s.snap_buffer_bytes += b.GetSize();
+        };
+        for (const wgpu::Buffer& b : snap_buffers) snap_buf(b);
+        for (const wgpu::Buffer& b : snap_free) snap_buf(b);
+        for (const wgpu::Texture& x : dummy_textures) live.insert(x.Get());
+        s.dummy_objects = dummy_buffers.size() + dummy_samplers.size() + dummy_views.size() + dummy_textures.size() +
+                          unref_dummy_w.size() + unref_dummy_r.size();
+        s.bind_groups = bind_groups.size();
+        s.bind_groups_evicted = bg_evicted.size();
+        s.bind_group_layouts = bgls.size() + layouts_by_content.size() + manifest_bgls.size();
+        s.pipeline_layouts = pipeline_layouts.size();
+        s.render_pipelines = render_pipelines.size();
+        s.compute_pipelines = compute_pipelines.size();
+        s.shader_modules = shaders.size();
+        s.samplers = samplers.size();
+        s.query_sets = query_sets.size();
+        s.bg_infos = bg_infos.size();
+        s.bg_descs = bg_descs.size();
+        s.view_meta = view_meta.size();
+        s.remap_cache = remap_cache.size();
+        // Textures a cache still references that no table owns any more (the swapchain / intermediate /
+        // overlay textures are never in view_meta).
+        std::unordered_set<const void*> dead;
+        auto note = [&](const wgpu::Texture& x) {
+            if (!x || live.count(x.Get()) || x.Get() == intermediate.Get() || x.Get() == offscreen.Get()) return;
+            if (dead.insert(x.Get()).second) s.dead_texture_bytes_pinned += tex_bytes(x);
+        };
+        for (const auto& kv : view_meta) note(kv.second.tex);
+        for (const auto& kv : bg_infos)
+            for (const BgTexInfo& t : kv.second->texs) note(t.meta.tex);
+        s.dead_textures_pinned = dead.size();
+        s.retired_pending = retired_tex.size() + retired_buf.size() + retired_bg.size();
+        s.journal_bytes = stats.journal_bytes;
+        s.pending_maps = pending_maps;
+        return s;
+    }
+    void sample_memory(const char* tag = "") {
+        if (!*tag && !mem_timeline.due((now_ns() - mem_t0_ns) / 1000000ull)) return;
+        mem_timeline.push(memory_sample(tag));
+    }
+    static void memory_sample_json(std::string& j, const MemorySample& s) {
+        constexpr uint64_t MB = 1ull << 20;
+        j += "{";
+        if (*s.tag) j += std::string("\"tag\": \"") + s.tag + "\", ";
+        auto f = [&](const char* k, uint64_t v, bool last = false) {
+            j += "\"";
+            j += k;
+            j += "\": " + std::to_string(v) + (last ? "" : ", ");
+        };
+        f("t_ms", s.t_ms);
+        f("presents", s.presents);
+        f("gpu_local_mb", s.gpu_local_usage / MB);
+        f("gpu_local_budget_mb", s.gpu_local_budget / MB);
+        f("gpu_nonlocal_mb", s.gpu_nonlocal_usage / MB);
+        f("gpu_nonlocal_budget_mb", s.gpu_nonlocal_budget / MB);
+        f("private_mb", s.process_private / MB);
+        f("working_set_mb", s.process_working_set / MB);
+        f("system_commit_mb", s.system_commit / MB);
+        f("system_commit_limit_mb", s.system_commit_limit / MB);
+        f("buffers", s.buffers);
+        f("buffer_mb", s.buffer_bytes / MB);
+        f("textures", s.textures);
+        f("texture_mb", s.texture_bytes / MB);
+        f("texture_views", s.texture_views);
+        f("twin_textures", s.twin_textures);
+        f("twin_mb", s.twin_bytes / MB);
+        f("alias_textures", s.alias_textures);
+        f("alias_texture_mb", s.alias_texture_bytes / MB);
+        f("alias_buffers", s.alias_buffers);
+        f("alias_buffer_mb", s.alias_buffer_bytes / MB);
+        f("snap_textures", s.snap_textures);
+        f("snap_texture_mb", s.snap_texture_bytes / MB);
+        f("snap_buffers", s.snap_buffers);
+        f("snap_buffer_mb", s.snap_buffer_bytes / MB);
+        f("dummy_objects", s.dummy_objects);
+        f("bind_groups", s.bind_groups);
+        f("bind_groups_evicted", s.bind_groups_evicted);
+        f("bind_group_layouts", s.bind_group_layouts);
+        f("pipeline_layouts", s.pipeline_layouts);
+        f("render_pipelines", s.render_pipelines);
+        f("compute_pipelines", s.compute_pipelines);
+        f("shader_modules", s.shader_modules);
+        f("samplers", s.samplers);
+        f("query_sets", s.query_sets);
+        f("bg_infos", s.bg_infos);
+        f("bg_descs", s.bg_descs);
+        f("view_meta", s.view_meta);
+        f("remap_cache", s.remap_cache);
+        f("dead_textures_pinned", s.dead_textures_pinned);
+        f("dead_texture_mb_pinned", s.dead_texture_bytes_pinned / MB);
+        f("retired_pending", s.retired_pending);
+        f("journal_mb", s.journal_bytes / MB);
+        f("pending_maps", s.pending_maps, true);
+        j += "}";
+    }
+    std::string memory_timeline_json() const {
+        std::string j = "{\"interval_ms\": " + std::to_string(mem_timeline.interval_ms()) + ", \"now\": ";
+        memory_sample_json(j, memory_sample("now"));
+        j += ", \"peak\": ";
+        memory_sample_json(j, mem_timeline.peak());
+        j += ", \"events\": [";
+        for (size_t i = 0; i < mem_timeline.tagged().size(); ++i) {
+            if (i) j += ", ";
+            memory_sample_json(j, mem_timeline.tagged()[i]);
+        }
+        j += "], \"samples\": [";
+        for (size_t i = 0; i < mem_timeline.samples().size(); ++i) {
+            if (i) j += ", ";
+            memory_sample_json(j, mem_timeline.samples()[i]);
+        }
+        j += "]}";
+        return j;
     }
 
     static constexpr uint64_t kSlowPacketNs = 1000ull * 1000000ull;
@@ -3075,13 +3330,30 @@ struct NativeExecutor::Impl {
     // _handleDestroyResource: the id leaves every table; Dawn keeps the object alive until the GPU
     // is done with it (the worker's deferred destroy). Bind groups and pass commands that already
     // hold a handle keep it (the worker resolves SetBindGroup2 / SetPipeline at packet time too).
+    // The handles leave the caches too (retire_* / purge_retired): view_meta and bg_infos used to keep a
+    // destroyed texture alive until they wrapped.
     void destroy_resource(uint32_t id) {
         query_sets.erase(id);  // a pending command keeps its set alive until it is encoded
-        buffers.erase(id);
-        textures.erase(id);
+        if (auto it = buffers.find(id); it != buffers.end()) {
+            retired_buf.add(it->second.buffer);
+            ++stats.buffers_destroyed;
+            buffers.erase(it);
+        }
+        if (auto it = textures.find(id); it != textures.end()) {
+            retire_texture(it->second);
+            ++stats.textures_destroyed;
+            textures.erase(it);
+        }
         pending_clears.erase(id);
         samplers.erase(id);
-        bind_groups.erase(id);
+        if (auto it = bind_groups.find(id); it != bind_groups.end()) {
+            retired_bg.add(it->second);
+            ++stats.bind_groups_destroyed;
+            bind_groups.erase(it);
+        } else if (bg_evicted.erase(id)) {
+            ++stats.bind_groups_destroyed;
+        }
+        bg_track.erase(id);
         shaders.erase(id);
         render_pipelines.erase(id);
         compute_pipelines.erase(id);
@@ -3097,6 +3369,34 @@ struct NativeExecutor::Impl {
         bg_usage.erase(id);
         compute_meta.erase(id);
         comparison_samplers.erase(id);
+    }
+
+    void retire_texture(const TextureEntry& t) {
+        retired_tex.add(t.texture);
+        for (const TwinSlot& s : t.twins) retired_tex.add(s.tex);
+        retired_tex.add(t.norm_twin.tex);
+    }
+
+    // Drops the view_meta / bg_infos entries of destroyed objects. Only between frames (no recorded pass
+    // command left that could look one of them up at encode time).
+    void purge_retired() {
+        if (!pass_cmds.empty() || (retired_tex.empty() && retired_buf.empty() && retired_bg.empty())) return;
+        ++stats.cache_purges;
+        if (!retired_tex.empty())
+            stats.cache_views_purged += purge_cache(view_meta, [&](const auto& kv) {
+                return retired_tex.contains(kv.second.tex.Get());
+            });
+        stats.cache_bg_infos_purged += purge_cache(bg_infos, [&](const auto& kv) {
+            if (retired_bg.contains(kv.first)) return true;
+            for (const BgTexInfo& t : kv.second->texs)
+                if (retired_tex.contains(t.meta.tex.Get())) return true;
+            for (const BgBufInfo& b : kv.second->bufs)
+                if (retired_buf.contains(b.buffer.Get())) return true;
+            return false;
+        });
+        retired_tex.clear();
+        retired_buf.clear();
+        retired_bg.clear();
     }
 
     // ---- shaders (wgpu_worker.js _handleCreateShaderModule / _resolveShaderPayload) ----
@@ -6167,8 +6467,111 @@ struct NativeExecutor::Impl {
             bg_usage.erase(h.id);
         }
         compute_bind_groups.erase(h.id);  // a v2 group of the same id is not a v1 compute group
+        BgTrack& tr = bg_track[h.id];
+        tr.last_use = stats.present_packets;
+        tr.layout = h.layout_id;
+        bg_evicted.erase(h.id);  // created again under the same id
         ++stats.bind_groups;
         return true;
+    }
+
+    // ---- bind group budget ----
+    //
+    // Titles leak bind groups: the stream creates groups it never destroys (one per texture copy, per-list
+    // caches of every command list), and a std-pack boot reached ~530k live Dawn bind groups at ~150 s, where
+    // Dawn's D3D12 backend failed CreateDescriptorHeap with E_OUTOFMEMORY (with VRAM and commit to spare) and
+    // the device was lost. Above the budget, the groups not bound for a few frames lose their Dawn object;
+    // the id stays valid and the group is created again from its journaled CreateBindGroup2 packet when the
+    // stream binds it (the resources are looked up by id again, like the first time).
+    struct BgTrack {
+        uint64_t last_use = 0;  // present count at the last create / bind
+        uint32_t layout = 0;
+    };
+    std::unordered_map<uint32_t, BgTrack> bg_track;  // v2 groups (live or evicted)
+    std::unordered_set<uint32_t> bg_evicted;          // ids whose Dawn group was dropped for the budget
+    size_t bind_group_budget = [] {
+        const char* v = std::getenv("PG6_BIND_GROUP_BUDGET");
+        return v && *v ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t{131072};
+    }();
+
+    // The live journaled CreateBindGroup2 packet of `id` (null: none, the group cannot be rebuilt).
+    const JournalEntry* journaled_bind_group(uint32_t id) const {
+        auto it = journal_by_id.find(id);
+        if (it == journal_by_id.end()) return nullptr;
+        for (auto r = it->second.rbegin(); r != it->second.rend(); ++r) {
+            const JournalEntry& e = journal[*r];
+            if (e.live && e.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup2)) return &e;
+        }
+        return nullptr;
+    }
+
+    // Between frames (pass_cmds empty): drops the Dawn objects of the least recently bound groups until the
+    // live count is 3/4 of the budget. Groups bound in the last 2 frames, or without a journaled packet, stay.
+    void enforce_bind_group_budget() {
+        if (bind_group_budget == 0 || bind_groups.size() <= bind_group_budget || !pass_cmds.empty()) return;
+        std::vector<std::pair<uint64_t, uint32_t>> cand;
+        cand.reserve(bind_groups.size());
+        for (const auto& [id, tr] : bg_track)
+            if (tr.last_use + 2 < stats.present_packets && bind_groups.count(id) && journaled_bind_group(id))
+                cand.push_back({tr.last_use, id});
+        const size_t target = bind_group_budget - bind_group_budget / 4;
+        const size_t want = bind_groups.size() > target ? bind_groups.size() - target : 0;
+        if (cand.size() > want)
+            std::nth_element(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(want), cand.end());
+        const size_t n = std::min(want, cand.size());
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t id = cand[i].second;
+            auto it = bind_groups.find(id);
+            retired_bg.add(it->second);
+            bind_groups.erase(it);
+            bg_descs.erase(id);
+            bg_usage.erase(id);
+            bg_evicted.insert(id);
+        }
+        stats.bind_groups_evicted += n;
+        ++stats.bind_group_budget_passes;
+    }
+
+    // The layouts with the most v2 bind groups (live + evicted), with the entry kinds of each (b buffer,
+    // s sampler, t texture, w storage texture): tells which stream path leaks groups.
+    std::string bind_groups_by_layout_json() const {
+        std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> by;  // layout -> live, evicted
+        for (const auto& [id, tr] : bg_track) {
+            auto& c = by[tr.layout];
+            if (bg_evicted.count(id)) ++c.second;
+            else ++c.first;
+        }
+        std::vector<std::pair<uint64_t, uint32_t>> order;
+        for (const auto& [l, c] : by) order.push_back({c.first + c.second, l});
+        std::sort(order.begin(), order.end(), std::greater<>());
+        std::string j = "[";
+        for (size_t i = 0; i < order.size() && i < 8; ++i) {
+            const uint32_t l = order[i].second;
+            std::string kinds;
+            if (auto it = bgls.find(l); it != bgls.end())
+                for (const LayoutEntry& e : it->second.entries) kinds += "bstw"[e.kind & 3];
+            if (i) j += ", ";
+            j += "{\"layout\": " + std::to_string(l) + ", \"live\": " + std::to_string(by[l].first) +
+                 ", \"evicted\": " + std::to_string(by[l].second) + ", \"entries\": \"" + kinds + "\"}";
+        }
+        return j + "]";
+    }
+
+    // An evicted group the stream binds again: rebuilt from its journaled packet. False: it cannot be.
+    bool recreate_bind_group(uint32_t id) {
+        if (!bg_evicted.erase(id)) return false;
+        const JournalEntry* e = journaled_bind_group(id);
+        if (!e) return false;
+        const std::vector<uint8_t> payload = e->payload;  // create_bind_group2 must not see the journal move
+        Packet p;
+        p.opcode = e->opcode;
+        p.flags = e->flags;
+        p.payload_bytes = static_cast<uint32_t>(payload.size());
+        p.payload = payload.data();
+        const bool ok = create_bind_group2(p);
+        if (ok) ++stats.bind_groups_recreated;
+        else ++stats.bind_groups_recreate_failed;
+        return ok && bind_groups.count(id) != 0;
     }
 
     bool set_bind_group2(const Packet& p) {
@@ -6176,7 +6579,10 @@ struct NativeExecutor::Impl {
         const auto h = read_payload<GpuSetBindGroup2Payload>(p);
         if (uint64_t{16} + uint64_t{h.dynamic_offset_count} * 4 > p.payload_bytes) return false;
         auto it = bind_groups.find(h.bind_group_id);
+        if (it == bind_groups.end() && bg_evicted.count(h.bind_group_id) && recreate_bind_group(h.bind_group_id))
+            it = bind_groups.find(h.bind_group_id);
         if (it == bind_groups.end()) return fail("unknown bind group " + std::to_string(h.bind_group_id));
+        if (auto tit = bg_track.find(h.bind_group_id); tit != bg_track.end()) tit->second.last_use = stats.present_packets;
         SetBindGroup2Cmd c;
         c.group = h.group_index;
         c.bind_group = it->second;
@@ -9506,6 +9912,11 @@ uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
     const uint64_t t2 = Impl::now_ns();
     s.instance.ProcessEvents();
     if (s.lost) s.ensure_device();  // the loss callback arrives here
+    if (s.stats.present_packets != presents_before) {  // once per frame, after its encode
+        s.enforce_bind_group_budget();
+        s.purge_retired();
+    }
+    s.sample_memory();
     const uint64_t t3 = Impl::now_ns();
     s.stats.ns_execute += t1 - t0;
     s.stats.ns_flush_readbacks += t2 - t1;
@@ -9688,6 +10099,19 @@ std::string NativeExecutor::stats_json() const {
     num("submit_gpu_max_ms", st.submit_gpu_max_ns / 1000000ull);
     num("submit_gpu_max_frame", st.submit_gpu_max_frame);
     num("draws_clamped", st.draws_clamped);
+    num("textures_destroyed", st.textures_destroyed);
+    num("buffers_destroyed", st.buffers_destroyed);
+    num("bind_groups_destroyed", st.bind_groups_destroyed);
+    num("cache_purges", st.cache_purges);
+    num("cache_views_purged", st.cache_views_purged);
+    num("cache_bg_infos_purged", st.cache_bg_infos_purged);
+    num("bind_group_budget", impl_->bind_group_budget);
+    num("bind_groups_evicted", st.bind_groups_evicted);
+    num("bind_groups_recreated", st.bind_groups_recreated);
+    num("bind_groups_recreate_failed", st.bind_groups_recreate_failed);
+    num("bind_group_budget_passes", st.bind_group_budget_passes);
+    j += "\"bind_groups_by_layout\": " + impl_->bind_groups_by_layout_json() + ", ";
+    j += "\"memory_timeline\": " + impl_->memory_timeline_json() + ", ";
     if (!st.device_lost_reason.empty()) {
         j += "\"device_lost_reason\": \"" + Impl::json_escape(st.device_lost_reason) + "\", ";
         j += "\"device_lost_message\": \"" + Impl::json_escape(st.device_lost_message) + "\", ";

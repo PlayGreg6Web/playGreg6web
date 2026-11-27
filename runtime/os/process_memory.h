@@ -14,6 +14,18 @@ uint64_t available_physical_bytes();
 // Dedicated video memory of the largest hardware adapter (DXGI) in bytes; 0 when unknown.
 uint64_t dedicated_video_memory_bytes();
 
+// This process's video memory use on the largest hardware adapter (DXGI QueryVideoMemoryInfo): the local
+// (dedicated VRAM) and non-local (shared system memory) segment groups with the OS budgets. False when
+// unavailable (no DXGI 1.4, not Windows); the adapter is looked up once and kept.
+struct GpuMemoryUsage {
+    uint64_t local_usage = 0, local_budget = 0;
+    uint64_t nonlocal_usage = 0, nonlocal_budget = 0;
+};
+bool gpu_memory_usage(GpuMemoryUsage* out);
+
+// The system-wide commit charge and commit limit in bytes. False when unavailable.
+bool system_commit_bytes(uint64_t* commit_total, uint64_t* commit_limit);
+
 // Committed bytes of the process by kind, from a VirtualQuery walk (boot report only; the walk is
 // cheap, a few thousand regions). `arena_lo`..`arena_hi` is the guest arena's host range.
 struct ProcessCommitMap {

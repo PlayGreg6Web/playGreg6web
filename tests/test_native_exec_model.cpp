@@ -9,6 +9,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
@@ -20,6 +21,7 @@
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
+#include "gpu/native_exec/memory_model.h"
 #include "gpu/native_exec/pipe_budget_model.h"
 #include "gpu/native_exec/shader_text_model.h"
 #include "gpu/native_exec/view_alias_model.h"
@@ -1759,7 +1761,57 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     CHECK(!merge_binding_access(vs, &odd).known);
 }
 
+// memory_model.h: texture sizes, the bounded timeline, and the purge of destroyed handles from the caches.
+struct FakeHandle {
+    const void* p = nullptr;
+    const void* Get() const { return p; }
+    explicit operator bool() const { return p != nullptr; }
+};
+void test_memory_model() {
+    // 256x256 rgba8, full mip chain: 4/3 of the top level (rounded down per mip, 1x1 at the end).
+    CHECK(texture_storage_bytes(256, 256, 1, 1, 1, 32, false) == 262144);
+    CHECK(texture_storage_bytes(256, 256, 1, 9, 1, 32, false) == 349524);
+    CHECK(texture_storage_bytes(64, 64, 6, 1, 1, 32, false) == 6 * 64 * 64 * 4);  // array layers do not halve
+    CHECK(texture_storage_bytes(64, 64, 8, 2, 1, 32, true) == 64 * 64 * 8 * 4 + 32 * 32 * 4 * 4);  // 3D depth halves
+    CHECK(texture_storage_bytes(1920, 1080, 1, 1, 4, 32, false) == 1920ull * 1080 * 4 * 4);  // MSAA x4
+    CHECK(texture_storage_bytes(4, 4, 1, 1, 1, 4, false) == 8);  // BC1: 8 bytes per 4x4 block
+    CHECK(texture_storage_bytes(0, 0, 0, 0, 0, 32, false) == 0);
+
+    MemoryTimeline tl(8, 1000);
+    CHECK(tl.due(0));
+    for (uint64_t t = 0; t < 8; ++t) {
+        MemorySample s;
+        s.t_ms = t * 1000;
+        s.gpu_local_usage = t == 3 ? 900 : t;
+        if (tl.due(s.t_ms)) tl.push(s);
+    }
+    // the 8th sample filled it: every second one kept, the interval doubled
+    CHECK(tl.samples().size() == 4);
+    CHECK(tl.interval_ms() == 2000);
+    CHECK(tl.samples()[0].t_ms == 0 && tl.samples()[1].t_ms == 2000 && tl.samples()[3].t_ms == 6000);
+    CHECK(tl.peak().t_ms == 3000);  // the peak survives the thinning
+    CHECK(!tl.due(8000) && tl.due(9000));
+    MemorySample lost;
+    lost.tag = "device_lost";
+    lost.t_ms = 8500;
+    tl.push(lost);
+    CHECK(tl.tagged().size() == 1 && tl.samples().size() == 4);  // tagged samples are kept apart
+
+    int a = 0, b = 0, c = 0;
+    RetiredSet<FakeHandle> rs;
+    rs.add(FakeHandle{&a});
+    rs.add(FakeHandle{&a});  // deduplicated
+    rs.add(FakeHandle{});    // null ignored
+    CHECK(rs.size() == 1 && rs.contains(&a) && !rs.contains(&b) && !rs.contains(nullptr));
+    std::unordered_map<const void*, const void*> cache{{&a, &c}, {&b, &a}, {&c, &c}};  // view -> texture
+    const size_t n = purge_cache(cache, [&](const auto& kv) { return rs.contains(kv.second) || rs.contains(kv.first); });
+    CHECK(n == 2 && cache.size() == 1 && cache.count(&c) == 1);
+    rs.clear();
+    CHECK(rs.empty());
+}
+
 int main() {
+    test_memory_model();
     test_present_model();
     test_shader_payloads();
     test_pack();

@@ -3802,6 +3802,22 @@ void test_device_loss() {
     CHECK(ex->read_buffer(21, 0, 8, &got, &err) && got == std::vector<uint8_t>(bdata, bdata + 8));
     CHECK(ex->stats_json().find("\"recoveries\": 2") != std::string::npos);
     CHECK(ex->stats_json().find("fault_record") == std::string::npos);
+    // Each loss leaves memory samples: at the loss, after the old device's objects were released (none of
+    // the executor's tables or caches holds anything then), and after the rebuild.
+    {
+        const std::string mj = ex->stats_json();
+        CHECK(mj.find("\"memory_timeline\": {") != std::string::npos);
+        CHECK(mj.find("{\"tag\": \"device_lost\"") != std::string::npos);
+        CHECK(mj.find("{\"tag\": \"recovered\"") != std::string::npos);
+        const size_t r = mj.find("{\"tag\": \"released\"");
+        CHECK(r != std::string::npos);
+        if (r != std::string::npos) {
+            const std::string rel = mj.substr(r, mj.find('}', r) - r);
+            for (const char* k : {"\"buffers\": 0,", "\"textures\": 0,", "\"bind_groups\": 0,", "\"view_meta\": 0,",
+                                  "\"bg_infos\": 0,", "\"alias_textures\": 0,", "\"snap_buffers\": 0,", "\"dummy_objects\": 0,"})
+                CHECK(rel.find(k) != std::string::npos);
+        }
+    }
 
     // Without a journal nothing can be rebuilt: a clean end with a fault record, no crash.
     ExecutorOptions nj = opts;
@@ -3863,6 +3879,129 @@ void test_device_loss() {
     ex4->debug_force_device_lost("reset");
     CHECK(run(*ex4, red) == 0 && ex4->faulted());
     CHECK(ex4->stats_json().find("creations outgrew") != std::string::npos);
+}
+
+// A destroyed texture leaves the handle-keyed caches at the next frame (view_meta held every texture with a
+// view until 8192 views had been made, so destroyed textures stayed alive in Dawn), and the memory timeline
+// reports the live objects per kind.
+void test_destroyed_texture_leaves_caches() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    CHECK(ex != nullptr);
+    if (!ex) return;
+    gpu::CommandEncoder setup;
+    for (uint32_t id = 40; id < 44; ++id)
+        setup.create_texture(id, 64, 64, 1, 1, GpuTextureFormat::Rgba8Unorm,
+                             GpuTextureUsage::CopyDst | GpuTextureUsage::TextureBinding);
+    run(*ex, setup);
+    const std::string before = ex->stats_json();
+    CHECK(before.find("\"now\": {\"tag\": \"now\"") != std::string::npos);
+    CHECK(before.find("\"textures\": 4,") != std::string::npos);
+    CHECK(before.find("\"dead_textures_pinned\": 0,") != std::string::npos);
+    gpu::CommandEncoder frame;
+    frame.destroy_resource(40);
+    frame.destroy_resource(41);
+    frame.begin_frame();
+    frame.clear_color(0.f, 0.f, 1.f, 1.f);
+    frame.present();
+    CHECK(run(*ex, frame) == 1);
+    CHECK(ex->stats().textures_destroyed == 2);
+    CHECK(ex->stats().cache_purges >= 1);
+    CHECK(ex->stats().cache_views_purged >= 2);  // the default views of 40 and 41
+    const std::string after = ex->stats_json();
+    CHECK(after.find("\"textures\": 2,") != std::string::npos);
+    CHECK(after.find("\"dead_textures_pinned\": 0,") != std::string::npos);
+    CHECK(after.find("\"retired_pending\": 0,") != std::string::npos);
+    CHECK(after.find("\"textures_destroyed\": 2") != std::string::npos);
+}
+
+// Over the bind group budget (PG6_BIND_GROUP_BUDGET), groups not bound for a few frames lose their Dawn object
+// and are rebuilt from the journal when the stream binds them again: the dispatches still see their buffers.
+void test_bind_group_budget() {
+#ifdef _WIN32
+    _putenv_s("PG6_BIND_GROUP_BUDGET", "4");
+#else
+    setenv("PG6_BIND_GROUP_BUDGET", "4", 1);
+#endif
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+#ifdef _WIN32
+    _putenv_s("PG6_BIND_GROUP_BUDGET", "");
+#else
+    unsetenv("PG6_BIND_GROUP_BUDGET");
+#endif
+    CHECK(ex != nullptr);
+    if (!ex) return;
+    gpu::CommandEncoder setup;
+    setup.create_shader_module(72, GpuShaderStage::Compute, kCompute);
+    create_layouts(setup, 73, 74, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 75;
+    cp.cs_module_id = 72;
+    cp.pipeline_layout_id = 74;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    for (uint32_t i = 0; i < 10; ++i) {
+        setup.create_buffer(100 + i, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+        create_bind_group(setup, 200 + i, 73, {bg_entry(0, GpuBindResourceType::Buffer, 100 + i)});
+    }
+    run(*ex, setup);
+    for (int f = 0; f < 4; ++f) {
+        gpu::CommandEncoder empty;
+        empty.begin_frame();
+        empty.present();
+        run(*ex, empty);
+    }
+    const ExecutorStats mid = ex->stats();
+    CHECK(mid.bind_groups_evicted == 7);  // down to 3/4 of the budget
+    CHECK(ex->stats_json().find("\"bind_groups_evicted\": 7,") != std::string::npos);
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(75);
+    for (uint32_t i = 0; i < 10; ++i) {
+        set_bind_group2(frame, 0, 200 + i);
+        frame.dispatch_compute(1, 1, 1);
+    }
+    frame.present();
+    run(*ex, frame);
+    ex->wait_idle();
+    const ExecutorStats after = ex->stats();
+    CHECK(after.bind_groups_recreated == 7);
+    CHECK(after.bind_groups_recreate_failed == 0);
+    CHECK(after.packet_errors == mid.packet_errors);
+    CHECK(after.device_errors == mid.device_errors);
+    const uint32_t want[4] = {1, 3, 5, 7};
+    for (uint32_t i = 0; i < 10; ++i) {
+        std::vector<uint8_t> out;
+        std::string err;
+        CHECK(ex->read_buffer(100 + i, 0, 16, &out, &err) && out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    }
+    // A destroyed evicted group is gone for good; a recovery does not bring the evicted ones back as Dawn objects.
+    gpu::CommandEncoder later;
+    for (int f = 0; f < 4; ++f) {
+        later.begin_frame();
+        later.present();
+    }
+    run(*ex, later);
+    CHECK(ex->stats().bind_groups_evicted > after.bind_groups_evicted);
+    ex->debug_force_device_lost("reset");
+    gpu::CommandEncoder again;
+    again.begin_frame();
+    again.set_compute_pipeline(75);
+    set_bind_group2(again, 0, 203);
+    again.dispatch_compute(1, 1, 1);
+    again.present();
+    run(*ex, again);
+    CHECK(ex->stats().recoveries == 1 && !ex->faulted());
+    CHECK(ex->stats().packet_errors == after.packet_errors);
 }
 
 // The journal folds buffer writes into one image per buffer and drops texture writes a later write covers;
@@ -4963,6 +5102,8 @@ int main() {
     test_show_target_read_only();
     test_overlay_read_only();
     test_show_target_bad_option();
+    test_destroyed_texture_leaves_caches();
+    test_bind_group_budget();
     test_device_loss();
     test_device_loss_journal();
     test_async_pipelines_and_blob_cache();
