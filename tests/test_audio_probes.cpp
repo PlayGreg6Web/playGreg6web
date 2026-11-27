@@ -6,6 +6,7 @@
 
 #include "guest/audio_probes.h"
 #include "os/audio_file_stats.h"
+#include "os/audio_stream_log.h"
 
 namespace {
 int g_failures = 0;
@@ -18,6 +19,23 @@ int g_failures = 0;
     } while (0)
 
 using namespace playgta6::guest;
+
+void test_stream_log() {
+    namespace asl = playgta6::os::audio_stream_log;
+    asl::Log l;
+    l.set_sources([]() -> uint64_t { return 1500; }, []() -> uint64_t { return 7; });
+    for (int i = 0; i < 100; ++i) {
+        l.record("xapu_voice_start", 1, static_cast<uint64_t>(i), 1);
+    }
+    l.record("probe_entry_stream_decoder_create", 0x10);
+    CHECK(l.count("xapu_voice_start") == 100);
+    CHECK(l.count("missing") == 0);
+    const std::string j = l.to_json();
+    CHECK(j.find("\"count\": 100, \"first_ms\": 1500, \"first_present\": 7") != std::string::npos);
+    CHECK(j.find("probe_entry_stream_decoder_create") != std::string::npos);
+    l.reset();
+    CHECK(l.count("xapu_voice_start") == 0);
+}
 
 void test_probes() {
     AudioProbes p;
@@ -92,6 +110,7 @@ void test_files() {
 
 int main() {
     test_probes();
+    test_stream_log();
     test_files();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_audio_probes FAILED with %d failure(s).\n", g_failures);

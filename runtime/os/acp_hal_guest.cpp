@@ -50,6 +50,7 @@
 #include <utility>
 #include <vector>
 
+#include "os/audio_stream_log.h"
 #include "os/xapu_connect.h"
 #include "os/xapu_opus.h"
 #include "os/xbox_middleware.h"
@@ -384,6 +385,9 @@ public:
             return kEUnexpected;
         }
         handle_xma_command(command, payload);
+        if (command == kAcpEnableXma || command == kAcpEnableXmaMask) {
+            audio_stream_log::log().record("xma_enable", command, payload, arg);
+        }
         if (++commands_[command] == 1) {
             char line[200];
             std::snprintf(line, sizeof(line),
@@ -887,7 +891,16 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
         // Every command type is acknowledged with a result, in command order. The title sends only types
         // 1, 2, 3 and 5 and its drain loop ignores other result types (see the model notes above).
         const bool acknowledged = true;
-        if (++xapu().commands[type] == 1) {
+        const uint64_t seen = ++xapu().commands[type];
+        if (type != 3 || seen <= 8) {
+            // Voice start (1), free (2), XMA-related (5); decodes (3) only the first few.
+            static const char* const kNames[] = {"xapu_cmd_0", "xapu_voice_start", "xapu_voice_free",
+                                                 "xapu_decode", "xapu_cmd_4", "xapu_cmd_5"};
+            audio_stream_log::log().record(type < 6 ? kNames[type] : "xapu_cmd_other", handle, head[1], type);
+        } else if (type == 3) {
+            audio_stream_log::log().record("xapu_decode", handle, head[1], type);  // counted, not kept
+        }
+        if (seen == 1) {
             diag("XApu: first command of type " + std::to_string(type) +
                  (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
         }

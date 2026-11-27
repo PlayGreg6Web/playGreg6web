@@ -19,6 +19,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "guest/audio_probes.h"
+#include "os/audio_stream_log.h"
 #include "guest/export_counters.h"
 #include "os/audio_file_stats.h"
 #include "gpu/d3d12_xs_xbox.h"
@@ -493,6 +494,7 @@ struct BootState {
     // B2: call counters for the exports of the lifted Bink2Scarlett.dll and how its exports bound.
     ExportCounters bink;
     AudioProbes audio_probes;  // A4: title audio-stack call counters (main executable addresses)
+    std::atomic<uint64_t> music_controller{0};  // rcx at the first music_controller_init entry (guest VA)
     GuestWatch watch;          // --watch-guest-va (guest/guest_watch.h)
     std::mutex watch_mutex;
     std::string watch_last_present;            // snapshot logged at the previous changed present
@@ -1326,6 +1328,55 @@ void setup_bink_counters(BootState& b) {
     }
 }
 
+// A4: one stream-log event per probe hit (first kMaxPerKind per probe; the counters keep counting).
+// The metadata lookup is hot, so only its three music-controller hashes are logged.
+void audio_probe_event(BootState& b, long idx, const uint64_t args[AudioProbes::kArgs], bool entry) {
+    if (idx < 0) {
+        return;
+    }
+    const std::string& name = b.audio_probes.name(static_cast<size_t>(idx));
+    if (name == "metadata_hash_lookup") {
+        const uint32_t h = static_cast<uint32_t>(args[0]);
+        if (h != 0x9205c7a1u && h != 0xd3594a47u && h != 0x4aa37aa8u) {
+            return;
+        }
+    } else if (name == "music_controller_init") {
+        uint64_t zero = 0;
+        b.music_controller.compare_exchange_strong(zero, args[0]);
+    }
+    os::audio_stream_log::log().record((std::string(entry ? "probe_entry_" : "probe_call_") + name).c_str(), args[0],
+                                       args[1], args[2]);
+}
+
+// A4: the music controller's looked-up objects, read from guest memory at report time: null means the
+// metadata lookup (by name hash) found nothing. Offsets are fields of the controller object.
+std::string music_controller_json(BootState& b) {
+    const uint64_t obj = b.music_controller.load();
+    if (obj == 0 || b.arena == nullptr) {
+        return "{\"init_seen\": false}";
+    }
+    static const struct { const char* name; uint64_t off; } kSlots[] = {
+        {"lookup_2758", 0x2758}, {"lookup_3058", 0x3058}, {"lookup_3060", 0x3060}, {"lookup_3068", 0x3068},
+        {"lookup_3078", 0x3078}, {"lookup_3080", 0x3080}, {"lookup_3088", 0x3088}, {"lookup_3090", 0x3090},
+    };
+    char head[96];
+    std::snprintf(head, sizeof head, "{\"init_seen\": true, \"object\": \"0x%" PRIx64 "\", \"slots\": {", obj);
+    std::string o = head;
+    bool first = true;
+    for (const auto& sl : kSlots) {
+        uint64_t v = 0;
+        const bool ok = read_u64(*b.arena, obj + sl.off, v);
+        o += std::string(first ? "" : ", ") + "\"" + sl.name + "\": " + (!ok ? "\"unreadable\"" : v == 0 ? "\"null\"" : "\"set\"");
+        first = false;
+    }
+    o += "}, \"flags\": {";
+    uint64_t w = 0;
+    if (read_u64(*b.arena, obj + 0x3180, w)) {
+        o += "\"b3180\": " + std::to_string(w & 0xff) + ", \"b3181\": " + std::to_string((w >> 8) & 0xff);
+    }
+    return o + "}}";
+}
+
 // A4: the title's audio stack as guest addresses (main executable, linked at 0x140000000). The
 // decoder factory is reached by vtable, so the dispatch observer sees it; a direct call between
 // two lifted functions would not show (`calls`, "indirect_calls_only"); a build with
@@ -1345,6 +1396,7 @@ void setup_audio_probes(BootState& b) {
         {"music_controller_init", 0x145b67eb0ull},
         {"stream_decoder_create", 0x140078f00ull},
         {"stream_consumer", 0x140078120ull},
+        {"metadata_hash_lookup", 0x140c8a070ull},      // ecx = name hash; only the music hashes are logged
     };
     std::vector<AudioProbe> probes;
     for (const Def& d : kDefs) {
@@ -1388,6 +1440,7 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                                                    state->gpr[GuestReg::R8], state->gpr[GuestReg::R9]};
         bool first = false;
         const long idx = b.audio_probes.hit(target, args, &first);
+        audio_probe_event(b, idx, args, false);
         if (first && idx >= 0 && b.log_progress) {
             os::log(("[audio-probe] first call of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
         }
@@ -2627,6 +2680,8 @@ std::string build_report() {
 
         o += bink_json() + ",\n";
         o += "  \"audio_probes\": " + b.audio_probes.to_json() + ",\n";
+        o += "  \"audio_stream_log\": " + os::audio_stream_log::log().to_json() + ",\n";
+        o += "  \"music_controller\": " + music_controller_json(b) + ",\n";
         o += "  \"audio_files\": " + os::audio_files::stats().to_json() + ",\n";
         o += "  \"survey\": {\"enabled\": " + std::string(b.survey ? "true" : "false") +
              ", \"unresolved_called\": [";
@@ -4090,6 +4145,9 @@ void reset_boot() {
     b.bink_exports_lifted = 0;
     b.bink_exports_shim = 0;
     b.audio_probes.clear();
+    b.music_controller = 0;
+    os::audio_stream_log::log().reset();
+    os::audio_stream_log::log().set_sources(&boot_elapsed_ms, &boot_present_count);
     os::audio_files::stats().reset();
     b.process_reservation = 0;
     b.peb = 0;
@@ -4580,6 +4638,7 @@ extern "C" void __playgta6_probe_hit(playgta6::GuestState* state, uint64_t va) {
                                                state->gpr[playgta6::GuestReg::R8], state->gpr[playgta6::GuestReg::R9]};
     bool first = false;
     const long idx = b.audio_probes.entry_hit(va, args, &first);
+    audio_probe_event(b, idx, args, true);
     if (first && idx >= 0 && b.log_progress) {
         playgta6::os::log(("[audio-probe] first entry of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
     }
