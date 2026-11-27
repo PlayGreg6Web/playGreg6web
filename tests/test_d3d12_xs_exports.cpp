@@ -6242,6 +6242,52 @@ void test_storage_relocation_reuse_waits_for_presents() {
     scene.release_all();
 }
 
+// A world frame binds more unaligned read-only storage views than the old 2048-entry hard bound:
+// within one frame (no present) every range must stay resident, so binding the same ranges again
+// copies nothing. With the old bound each pass evicted the ranges the next binds needed (every bind
+// a fresh upload of up to 16 MiB: 20 s per frame in the in-game load).
+void test_storage_relocation_keeps_large_frame_working_set() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    constexpr size_t kRanges = 3000;
+    static_assert(kRanges > 4 * dg::Device::kStorageRelocationSoftEntries);
+    std::vector<uint8_t> ring((kRanges + 1) * 256);
+    for (size_t i = 0; i < ring.size(); ++i) {
+        ring[i] = static_cast<uint8_t>(i * 5u + 3u);
+    }
+    const uint64_t base = put_aligned(ring, 256);
+    std::vector<std::pair<uint32_t, uint64_t>> homes(kRanges);
+    for (size_t i = 0; i < kRanges; ++i) {
+        CHECK(dev->relocate_storage_buffer(base + i * 256 + 0x40, 256, &homes[i].first, &homes[i].second, false));
+    }
+    CHECK(dev->relocated_storage_count() == kRanges);
+    CHECK(dev->relocated_storage_bytes() == kRanges * 256);
+    const uint64_t uploads0 = dg::work_total(dg::Work::BufferUploads);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < kRanges; ++i) {
+            uint32_t id = 0;
+            uint64_t offset = 0;
+            CHECK(dev->relocate_storage_buffer(base + i * 256 + 0x40, 256, &id, &offset, false));
+            CHECK(id == homes[i].first && offset == homes[i].second);
+        }
+    }
+    CHECK(dg::work_total(dg::Work::BufferUploads) == uploads0);
+    CHECK(dev->relocated_storage_count() == kRanges);
+    // Unused for three presents, the oldest home is handed to a new range (soft bound) and the
+    // byte total follows.
+    dev->on_frame_presented();
+    dev->on_frame_presented();
+    dev->on_frame_presented();
+    uint32_t id = 0;
+    uint64_t offset = 0;
+    CHECK(dev->relocate_storage_buffer(base + kRanges * 256 + 0x40, 128, &id, &offset, false));
+    CHECK(id == homes[0].first && offset == homes[0].second);
+    CHECK(dev->relocated_storage_count() == kRanges);
+    CHECK(dev->relocated_storage_bytes() == kRanges * 256);
+    scene.release_all();
+}
+
 void test_g58_relocate_ia_vb_ib() {
     Fixture fx;
     Scene scene(fx);
@@ -9897,6 +9943,7 @@ int main() {
     test_g55_root_sig_layout_caps();
     test_g58_relocate_ia_vb_ib();
     test_storage_relocation_reuse_waits_for_presents();
+    test_storage_relocation_keeps_large_frame_working_set();
     test_g84_readback_ring_hardening();
     test_g84_xbox_3d_methods_hardening();
     test_g79_copy_texture_region_3d_array_cube_and_bc_miptail();

@@ -928,6 +928,17 @@ public:
     bool relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset,
                                  bool require_zero_offset = false);
     size_t relocated_storage_count() const;
+    // Bounds of the storage relocation cache. Past kStorageRelocationSoftEntries a home unused for
+    // three presents is handed to the new range; the cache grows otherwise, up to
+    // kStorageRelocationHardEntries entries or kStorageRelocationHardBytes of homes, where the least
+    // recently used home is evicted even if it is recent. A world frame binds thousands of unaligned
+    // read-only storage views: a hard bound below that working set makes every bind a miss (each one
+    // a fresh copy of up to 16 MiB, and each eviction forces every list that binds a home to resolve
+    // its relocations again), which took 20 s per frame in the in-game load (stall after ~66 s).
+    static constexpr size_t kStorageRelocationSoftEntries = 512;
+    static constexpr size_t kStorageRelocationHardEntries = 65536;
+    static constexpr uint64_t kStorageRelocationHardBytes = uint64_t{1} << 30;
+    uint64_t relocated_storage_bytes() const;
     // #663: true for a buffer that holds storage relocation homes (BridgeOptions::relocation_home).
     bool storage_relocation_home(uint32_t buffer_id) const;
     // Index / vertex buffer views at address-only GPU VAs (G58: dynamic guest-RAM ring buffers
@@ -1260,6 +1271,10 @@ private:
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
     uint64_t storage_relocation_seq_ = 0;
+    // Least recently used order of storage_relocations_ (last_used_seq -> key) and the bytes of
+    // their homes (slot capacities).
+    std::map<uint64_t, RelocatedStorageKey> storage_relocation_lru_;
+    uint64_t storage_relocation_bytes_ = 0;
     // G66 (#691): uniform / storage relocation homes handed to another range (BridgeOptions::relocation_epoch).
     std::atomic<uint64_t> relocation_evictions_{0};
     struct RelocatedIa {

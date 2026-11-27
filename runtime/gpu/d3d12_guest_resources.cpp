@@ -2926,14 +2926,18 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     constexpr uint64_t kStorageOffsetAlignment = 256;
     constexpr uint64_t kChunk = uint64_t{4u} << 20;
     constexpr uint64_t kMaxBytes = uint64_t{16u} << 20;
-    constexpr size_t kMaxEntries = 512;
+    constexpr size_t kMaxEntries = kStorageRelocationSoftEntries;
     // A home is only handed to another range once the presents since its last use guarantee that
     // every submission that bound it is behind a Present in the packet stream (#663): the browser
     // worker applies a frame's buffer writes before that frame's draws, and a title recording one
     // frame ahead binds a home one present before the submission that reads it executes.
     constexpr uint64_t kReuseAfterPresents = 3;
-    // Past this many entries the least recently used one is reused even if it is recent.
-    constexpr size_t kHardMaxEntries = 4 * kMaxEntries;
+    // Past this many entries (or bytes of homes) the least recently used one is evicted even if it
+    // is recent.
+    constexpr size_t kHardMaxEntries = kStorageRelocationHardEntries;
+    constexpr uint64_t kHardMaxBytes = kStorageRelocationHardBytes;
+    // Settled homes looked at for reuse, oldest first, before the least recently used one is dropped.
+    constexpr size_t kReuseScan = 1024;
 
     if (va == 0 || size == 0 || size > kMaxBytes || buffer_id == nullptr || offset == nullptr) {
         return false;
@@ -2952,6 +2956,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
     const uint64_t seq = ++storage_relocation_seq_;
     if (auto it = storage_relocations_.find(key); it != storage_relocations_.end()) {
+        storage_relocation_lru_.erase(it->second.last_used_seq);
+        storage_relocation_lru_.emplace(seq, key);
         it->second.last_used_present = present;
         it->second.last_used_seq = seq;
         *buffer_id = it->second.buffer_id;
@@ -2972,33 +2978,55 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     uint64_t target_off = 0;
     uint64_t target_cap = 0;
 
-    if (storage_relocations_.size() >= kMaxEntries) {
-        const bool forced = storage_relocations_.size() >= kHardMaxEntries;
+    const auto erase_entry = [&](std::map<RelocatedStorageKey, RelocatedStorage>::iterator it) {
+        storage_relocation_lru_.erase(it->second.last_used_seq);
+        storage_relocation_bytes_ -= std::min(storage_relocation_bytes_, it->second.slot_capacity);
+        storage_relocations_.erase(it);
+        relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
+    };
+    const auto over_hard_bound = [&] {
+        return storage_relocations_.size() >= kHardMaxEntries || storage_relocation_bytes_ + need > kHardMaxBytes;
+    };
+    if (storage_relocations_.size() >= kMaxEntries || over_hard_bound()) {
+        const bool forced = over_hard_bound();
         const auto settled = [&](const RelocatedStorage& e) {
             return forced || present >= e.last_used_present + kReuseAfterPresents;
         };
+        // Oldest first (last_used_present grows with last_used_seq, so the settled homes lead): the
+        // first settled home large enough is handed to the new range.
         auto reuse_it = storage_relocations_.end();
-        auto lru_it = storage_relocations_.begin();
-        for (auto it = storage_relocations_.begin(); it != storage_relocations_.end(); ++it) {
-            if (it->second.last_used_seq < lru_it->second.last_used_seq) {
-                lru_it = it;
+        size_t scanned = 0;
+        for (auto l = storage_relocation_lru_.begin(); l != storage_relocation_lru_.end() && scanned < kReuseScan;
+             ++l, ++scanned) {
+            const auto it = storage_relocations_.find(l->second);
+            if (it == storage_relocations_.end() || !settled(it->second)) {
+                break;
             }
-            if (it->second.dedicated == dedicated && it->second.slot_capacity >= need && settled(it->second)) {
-                if (reuse_it == storage_relocations_.end() ||
-                    it->second.last_used_seq < reuse_it->second.last_used_seq) {
-                    reuse_it = it;
-                }
+            if (it->second.dedicated == dedicated && it->second.slot_capacity >= need) {
+                reuse_it = it;
+                break;
             }
         }
+        bool dropped = false;
         if (reuse_it != storage_relocations_.end()) {
             target_buf = reuse_it->second.buffer_id;
             target_off = reuse_it->second.offset;
             target_cap = reuse_it->second.slot_capacity;
-            storage_relocations_.erase(reuse_it);
-            relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
-        } else if (!settled(lru_it->second)) {
-            // Every candidate is still bound by a recent submission: grow instead of evicting.
-        } else {
+            erase_entry(reuse_it);
+            dropped = true;
+        }
+        // Past a hard bound the least recently used homes go until the new one fits; past the soft
+        // bound one settled home goes. A home a recent submission may still bind is kept otherwise
+        // (grow instead of evicting).
+        while (!storage_relocation_lru_.empty()) {
+            const auto lru_it = storage_relocations_.find(storage_relocation_lru_.begin()->second);
+            if (lru_it == storage_relocations_.end()) {
+                storage_relocation_lru_.erase(storage_relocation_lru_.begin());
+                continue;
+            }
+            if (!over_hard_bound() && (dropped || !settled(lru_it->second))) {
+                break;
+            }
             if (lru_it->second.dedicated) {
                 const uint32_t old_id = lru_it->second.buffer_id;
                 bridge_->unregister_resource(old_id);
@@ -3008,8 +3036,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
                     std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), old_id),
                     storage_relocation_buffers_.end());
             }
-            storage_relocations_.erase(lru_it);
-            relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
+            erase_entry(lru_it);
+            dropped = true;
         }
     }
 
@@ -3057,6 +3085,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     entry.ever_uploaded = true;
     entry.dedicated = dedicated;
     storage_relocations_.emplace(key, entry);
+    storage_relocation_lru_.emplace(seq, key);
+    storage_relocation_bytes_ += target_cap;
 
     *buffer_id = target_buf;
     *offset = target_off;
@@ -3066,6 +3096,11 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
 size_t Device::relocated_storage_count() const {
     std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
     return storage_relocations_.size();
+}
+
+uint64_t Device::relocated_storage_bytes() const {
+    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+    return storage_relocation_bytes_;
 }
 
 bool Device::storage_relocation_home(uint32_t buffer_id) const {

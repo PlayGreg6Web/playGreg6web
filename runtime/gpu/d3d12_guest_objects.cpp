@@ -410,6 +410,8 @@ Device::~Device() {
             std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
             storage_ids.swap(storage_relocation_buffers_);
             storage_relocations_.clear();
+            storage_relocation_lru_.clear();
+            storage_relocation_bytes_ = 0;
             storage_relocation_buffer_ = 0;
             storage_relocation_used_ = 0;
         }
