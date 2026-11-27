@@ -116,6 +116,11 @@ InputState merge(const InputState& pad, const InputState& kb) {
     return s;
 }
 
+InputState compose_input(bool have_pad, const XPadSample& pad, bool focused, const InputState& keys) {
+    if (!focused) return InputState{};
+    return merge(have_pad ? convert_pad(pad) : InputState{}, keys);
+}
+
 void RumbleForwarder::send(uint16_t low, uint16_t high, uint64_t now_ms) {
     ++stats_.sends;
     if (fn_(static_cast<uint32_t>(pad_), low, high) != 0) {
@@ -418,7 +423,7 @@ void HostInputSource::run() {
             }
         }
         const InputState keys = kb ? keymap::evaluate_look(keymap_, key_down, look_x, look_y) : InputState{};
-        InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, keys);
+        InputState values = compose_input(have_pad, sample, kb, keys);
         values.buttons = tap_latch.apply(values.buttons, now_ms);
         if (recorder_ != nullptr) {
             recorder_->record(values);

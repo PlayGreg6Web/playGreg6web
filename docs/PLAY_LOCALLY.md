@@ -30,7 +30,8 @@ build succeeded, so your playable copy is never broken; it records the source co
 how many commits it is behind `origin/main`. If commits since then touched `runtime/`, `recomp/`, `shaders/` or the boot harness, it also prints one "Prebuilt is N runtime commits behind" line plus the 3 newest subjects (`tools/prebuilt_stale.py`; informational only, never blocks or rebuilds). To use another folder: `$env:PLAYGTA6_PREBUILT_DIR = "D:\pg6-play"`.
 
 **A prebuilt is read-only for the runners.** Runs from a prebuilt (any directory holding `prebuilt.json`, native or web) go to
-`%LOCALAPPDATA%\playgta6uns\<prebuilt-name>\<run>\` (else the sibling `<dir>-runs`); `-DryRun` and the run print that path. Nothing is created inside
+`%LOCALAPPDATA%\playgta6
+uns\<prebuilt-name>\<run>\` (else the sibling `<dir>-runs`); `-DryRun` and the run print that path. Nothing is created inside
 the prebuilt: no `runs/`, no `.build.lock` (it lives next to the runs), no `.playgta6-build-dir` marker. An explicit `--runs-dir` inside a prebuilt is an
 error, and `lift_cache.clear_program`, `clean_build_dirs` and its `remove_tree` refuse any target inside a prebuilt (`tools/prebuilt_guard.py`), so a
 "delete program/" cleanup can never empty it. `tools/run_history.py` finds both the new location and legacy runs inside a prebuilt.
@@ -48,11 +49,13 @@ error, and `lift_cache.clear_program`, `clean_build_dirs` and its `remove_tree` 
 | Q / E | LB / RB |
 | Z / C | LT / RT |
 | Tab / Esc | View / Menu |
-| F11 | Toggle borderless fullscreen |
+| F11 / Alt+Enter | Toggle borderless fullscreen |
 | F12 | Save a screenshot (PNG) to `%LOCALAPPDATA%\playgta6\screenshots` |
 | F8 | Release / re-capture the mouse-look cursor |
 | F3 | Stats overlay on / off (fps, frame-time graph, present mode, draws, GPU ms, audio underruns, fault text); `--overlay` starts with it on |
 | Ctrl+F7 / F8 / F9 / F10 | `--show-target` only: next mip / next layer / previous target / next target |
+
+Window focus loss releases every key, button, stick and the pad too (and stops rumble), so nothing sticks; F-key hotkeys are consumed by the window and never reach the game. Real input is never mixed with `--input-script` (the script wins). The first connected XInput pad is used, and a replug re-scans all four slots.
 
 These window hotkeys live in one table (`runtime/os/window_hotkeys.h`) and are rebindable in `keymap.ini` `[hotkeys]`
 (see "Rebinding keys"); `play_native.ps1 -Help` lists them. Esc stays the pad Menu button.

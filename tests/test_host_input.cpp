@@ -15,6 +15,7 @@
 #include "guest/host_input.h"
 #include "os/game_input.h"
 #include "os/vmem.h"
+#include "os/window_hotkeys.h"
 #include "os/win32_loader.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
@@ -283,6 +284,20 @@ void test_host_input_mapping() {
     const auto c = hi::convert_keyboard(hi::kKeyA | hi::kKeyD);
     CHECK(near(c.left_stick_x, 0.0f));
 
+    {
+        // Focus loss releases everything (pad and keyboard); focused it is the merge.
+        hi::XPadSample pad;
+        pad.buttons = hi::kXA;
+        pad.thumb_lx = 30000;
+        const auto kk = hi::convert_keyboard(hi::kKeyW);
+        const auto off = hi::compose_input(true, pad, false, kk);
+        CHECK(off.buttons == 0 && near(off.left_stick_x, 0.0f) && near(off.left_stick_y, 0.0f));
+        const auto on = hi::compose_input(true, pad, true, kk);
+        CHECK(on.buttons == button::kGamepadA && on.left_stick_x > 0.5f && near(on.left_stick_y, 1.0f));
+        CHECK(hi::compose_input(false, pad, true, InputState{}).buttons == 0);
+        CHECK(playgta6::os::window_hotkeys::is_alt_enter(0x0D, true));
+        CHECK(!playgta6::os::window_hotkeys::is_alt_enter(0x0D, false));
+    }
     const auto m = hi::merge(s, k);
     CHECK(m.buttons == (s.buttons | k.buttons));
     CHECK(near(m.left_stick_x, 1.0f));

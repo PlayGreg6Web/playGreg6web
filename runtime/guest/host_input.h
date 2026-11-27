@@ -61,6 +61,10 @@ InputState convert_keyboard(uint32_t keys);
 // Pad wins per axis when it is deflected more than the keyboard; buttons are ORed.
 InputState merge(const InputState& pad, const InputState& keyboard);
 
+// What the title sees: pad merged with keyboard/mouse, but only while the window has focus (`focused`);
+// unfocused it is all zero so nothing sticks and a pad does not drive the game from another window.
+InputState compose_input(bool have_pad, const XPadSample& pad, bool focused, const InputState& keys);
+
 // Forwards the title's GameInput rumble requests (os::RumbleTelemetry::last_*) to the host pad's
 // motors through XInputSetState. XInput has no trigger motors: non-zero trigger requests are only
 // counted. Rate limited; a stop (both motors 0) is always sent at once. Pure logic over an injectable
@@ -113,7 +117,7 @@ public:
     void stop();
     uint64_t writes() const { return writes_.load(); }
     // The keyboard is read globally (GetAsyncKeyState); with a live window the harness enables it only
-    // while that window has focus, so typing elsewhere does not drive the game. The pad is unaffected.
+    // while that window has focus, so typing elsewhere does not drive the game. The pad is gated the same way (compose_input).
     void set_keyboard_enabled(bool enabled) { keyboard_enabled_.store(enabled); }
     // Every reading (after the keyboard gate and pad merge) is also handed to `recorder` (--record-input).
     void set_recorder(InputRecorder* recorder) { recorder_ = recorder; }

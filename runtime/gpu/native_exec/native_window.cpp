@@ -345,7 +345,8 @@ private:
             namespace wh = playgta6::os::window_hotkeys;
             const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const int vk = static_cast<int>(wp);
-            if (wh::matches(wh::Action::Fullscreen, vk, ctrl)) {
+            if (wh::matches(wh::Action::Fullscreen, vk, ctrl) ||
+                wh::is_alt_enter(vk, (GetKeyState(VK_MENU) & 0x8000) != 0)) {
                 self->toggle_fullscreen();
                 return 0;
             }

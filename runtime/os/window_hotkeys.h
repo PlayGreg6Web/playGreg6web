@@ -118,6 +118,9 @@ inline State& active() {
     return s;
 }
 
+// Alt+Enter is the conventional fullscreen toggle and is always on (in addition to the Fullscreen chord).
+inline bool is_alt_enter(int vk, bool alt_down) { return alt_down && vk == 0x0D; }
+
 // True when the pressed key matches the action's chord (ctrl_down = Ctrl held).
 inline bool matches(Action a, int vk, bool ctrl_down) {
     const Chord c = active().get(a);
