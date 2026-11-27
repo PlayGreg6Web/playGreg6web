@@ -3964,9 +3964,13 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 90..93
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 94..97
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 98..100
-    // Slot 101 is called late in the title's boot (issue 663) and is UNIDENTIFIED: the title's own classes share this
-    // vtable offset, so the call sites alone do not name the method. It stays an unimplemented stub on purpose
-    // (E_NOTIMPL, logged once per run by the com bridge, hits counted: com::stub_hits) rather than a silent no-op.
+    // Slot 101 was hit once late in a browser boot (issue 663) and is UNIDENTIFIED. Public headers cannot name it:
+    // ID3D12GraphicsCommandList..10 end at slot 85, and this table follows the Xbox order (RSSetShadingRate is 126
+    // here, 77 in public; Barrier 146 vs 80). No static call site in the exe applies it to a command list: all 27
+    // `call [vtable+0x328]` sites (22 functions, no register / CFG-indirect forms, none in the bundled DLLs) act on
+    // title objects or the device (device slot 101 = CreateStateObject). So the hit points to a confused or stale
+    // object pointer, not to a missing method. Kept an E_NOTIMPL stub on purpose (logged once with `this` and the
+    // return address, hits counted: com::stub_hits); the call sites' return addresses are in docs/gpu_commands.md.
     CL::stub("Xbox slot 101 (unidentified)"),                                         // 101
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 102..105
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 106..109
