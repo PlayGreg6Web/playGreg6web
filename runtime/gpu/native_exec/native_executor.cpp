@@ -2012,7 +2012,7 @@ struct NativeExecutor::Impl {
     static bool journaled_opcode(uint16_t op) {
         switch (op) {
             case 3: case 4: case 5: case 8: case 12: case 13: case 14: case 15: case 19:
-            case 22: case 23: case 24: case 25: case 32: case 34: case 35:
+            case 22: case 23: case 24: case 25: case 32: case 34: case 35: case 61:  // 61: CreateQuerySet
                 return true;
             default:
                 return false;
