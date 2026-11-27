@@ -24,6 +24,9 @@
 //   --present-interval honor|min1  title-driven present gap: honor = the title's sync interval (30 fps menus like the console), min1 = 1 vblank (default)
 //   --skip-shader <hash>[,<hash>]  native executor: skip every draw / dispatch of these shaders (diagnostic; counted as `quarantined` in the drop table)
 //   --skip-shader-file <path>  same, one `<hash> [reason] [issue]` per line; the repo list runtime/gpu/native_exec/shader_quarantine.txt is loaded too when present (--no-quarantine-list skips it)
+//   --profile-guest[=hz] opt-in sampling profiler (Windows, default 1000 Hz): suspends each guest thread, maps the host RIP and stack to
+//                        lifted functions (sub_<guest VA>) / runtime / OS and writes `guest_profile` (flat + inclusive top-N per thread)
+//                        into the boot report plus <report>.guest-profile.collapsed.txt (flamegraph.pl input)
 //   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
 //   --no-xmem-shared-pages  physical pages mapped at several addresses get per-address copies
 //                        (the pre-O36 behaviour; A/B runs, os/xbox_scarlett.h)
@@ -172,6 +175,8 @@
 // After windows.h.
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #include "guest/minidump_writer.h"
 #else
 #include <execinfo.h>
@@ -255,6 +260,8 @@ struct Options {
     bool eager_gpu_objects = false; // d3d12 DeviceOptions::defer_gpu_objects = false
     std::string profile;            // --profile: per-thread host PC samples (Windows)
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
+    bool profile_guest = false;           // --profile-guest[=hz]: per-function flat + inclusive guest profile (report guest_profile + collapsed stacks)
+    uint64_t profile_guest_hz = 1000;
     uint64_t profile_start_ms = 0;        // --profile-start-ms: sample only from this time on (a screen's window)
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
     std::string audio_mmcss;        // --audio-mmcss / PLAYGTA6_AUDIO_MMCSS (empty = default)
@@ -305,6 +312,7 @@ struct Options {
 
 Options g_options;
 std::string g_minidump_path;  // set once a fault minidump was written (recorded in fault_record)
+std::string g_guest_profile_json;  // --profile-guest: set by finish_profile, injected into the boot report
 std::atomic<bool> g_finishing{false};
 int g_result = 0;
 
@@ -368,6 +376,11 @@ bool parse(int argc, char** argv, Options& o) {
             const std::string v = argv[++i];
             if (v != "honor" && v != "min1") return false;
             o.present_honor_interval = v == "honor";
+        } else if (a == "--profile-guest" || a.rfind("--profile-guest=", 0) == 0) {
+            o.profile_guest = true;
+            if (a.size() > 15) {
+                if (!parse_u64(a.substr(16).c_str(), o.profile_guest_hz) || o.profile_guest_hz == 0) return false;
+            }
         } else if (a == "--no-present-pacing") {
             o.present_pacing = false;
         } else if (a == "--no-xmem-shared-pages") {
@@ -813,8 +826,179 @@ std::string profile_label(const CONTEXT& ctx, uint64_t top, uint32_t thread_id) 
     return where + " (last import " + (last.empty() ? "none" : last) + ")";
 }
 
+// ---- --profile-guest: per-function flat + inclusive counts with collapsed stacks -----------------
+struct GuestProfileThread {
+    uint64_t samples = 0;
+    uint64_t guest = 0, runtime = 0, os = 0;
+    std::map<std::string, uint64_t> flat;
+    std::map<std::string, uint64_t> inclusive;
+    std::map<std::string, uint64_t> os_leaf;
+    std::map<std::string, uint64_t> entry;  // outermost guest function
+};
+std::map<uint32_t, GuestProfileThread> g_gp_threads;
+std::map<std::string, uint64_t> g_gp_collapsed;
+uint64_t g_gp_dropped_stacks = 0;
+uint64_t g_gp_rounds = 0;
+double g_gp_elapsed_ms = 0;
+constexpr size_t kGpMaxFrames = 40;
+constexpr size_t kGpMaxCollapsedKeys = 200000;
+
+// Function-only label of a host PC: sub_<guest VA> for lifted code, else module!symbol or
+// runtime+rva. kind: 0 guest, 1 runtime (our harness), 2 OS.
+std::string gp_frame_label(uint64_t pc, int* kind) {
+    uint64_t offset = 0;
+    char text[96];
+    if (const uint64_t fn = guest::guest_function_for_host_pc(pc, &offset)) {
+        std::snprintf(text, sizeof(text), "sub_%" PRIX64, fn);
+        *kind = 0;
+        return text;
+    }
+    const std::string module = profile_module(pc);
+    *kind = module == "runtime" ? 1 : 2;
+    const std::string symbol = profile_symbol(pc);
+    if (!symbol.empty()) {
+        return (*kind == 2 ? module.substr(3) + "!" : std::string()) + symbol;
+    }
+    HMODULE self = GetModuleHandleW(nullptr);
+    std::snprintf(text, sizeof(text), "%s+0x%" PRIX64, *kind == 2 ? module.c_str() : "runtime",
+                  pc - static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self)));
+    return text;
+}
+
+// Walks up to kGpMaxFrames return addresses from the sampled context (virtual unwind on the live
+// stack after the resume: statistical, faults are swallowed). No allocations.
+size_t gp_unwind(const CONTEXT& start, uint64_t top, uint64_t* pcs) {
+    CONTEXT ctx = start;
+    size_t n = 0;
+    __try {
+        while (n < kGpMaxFrames && ctx.Rip != 0) {
+            pcs[n++] = ctx.Rip;
+            DWORD64 image_base = 0;
+            PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+            if (entry == nullptr) {
+                if (n == 1 && top != 0) {  // leaf function: the return address is on top of the stack
+                    ctx.Rip = top;
+                    ctx.Rsp += 8;
+                    continue;
+                }
+                break;
+            }
+            void* handler_data = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data, &establisher,
+                             nullptr);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+
+void gp_record(uint32_t thread_id, const CONTEXT& ctx, uint64_t top) {
+    uint64_t pcs[kGpMaxFrames];
+    const size_t n = gp_unwind(ctx, top, pcs);
+    if (n == 0) {
+        return;
+    }
+    GuestProfileThread& t = g_gp_threads[thread_id];
+    ++t.samples;
+    std::string stack = "thread_" + std::to_string(thread_id);
+    std::vector<std::string> seen;
+    std::string outer_guest;
+    for (size_t i = n; i-- > 0;) {  // root first
+        int kind = 0;
+        const std::string label = gp_frame_label(pcs[i], &kind);
+        stack += ";" + label;
+        if (kind == 0 && outer_guest.empty()) {
+            outer_guest = label;
+        }
+        if (std::find(seen.begin(), seen.end(), label) == seen.end()) {
+            seen.push_back(label);
+            ++t.inclusive[label];
+        }
+        if (i == 0) {
+            ++t.flat[label];
+            (kind == 0 ? t.guest : kind == 1 ? t.runtime : t.os) += 1;
+            if (kind == 2) {
+                ++t.os_leaf[label];
+            }
+        }
+    }
+    if (!outer_guest.empty()) {
+        ++t.entry[outer_guest];
+    }
+    auto it = g_gp_collapsed.find(stack);
+    if (it != g_gp_collapsed.end()) {
+        ++it->second;
+    } else if (g_gp_collapsed.size() < kGpMaxCollapsedKeys) {
+        g_gp_collapsed.emplace(std::move(stack), 1);
+    } else {
+        ++g_gp_dropped_stacks;
+    }
+}
+
+std::string gp_json_escape(const std::string& in) {
+    std::string out;
+    for (char c : in) {
+        if (c == '"' || c == '\\') out += '\\';
+        out += (static_cast<unsigned char>(c) < 0x20) ? ' ' : c;
+    }
+    return out;
+}
+
+std::string gp_top_json(const std::map<std::string, uint64_t>& m, uint64_t total, size_t limit) {
+    std::vector<std::pair<uint64_t, std::string>> v;
+    for (const auto& [k, n] : m) v.emplace_back(n, k);
+    std::sort(v.rbegin(), v.rend());
+    std::string o = "[";
+    char buf[64];
+    for (size_t i = 0; i < v.size() && i < limit; ++i) {
+        std::snprintf(buf, sizeof(buf), "%.1f", 100.0 * v[i].first / std::max<uint64_t>(1, total));
+        o += std::string(i ? ", " : "") + "{\"fn\": \"" + gp_json_escape(v[i].second) +
+             "\", \"samples\": " + std::to_string(v[i].first) + ", \"pct\": " + buf + "}";
+    }
+    return o + "]";
+}
+
+void gp_finish() {
+    uint64_t total = 0;
+    std::string threads;
+    for (const auto& [id, t] : g_gp_threads) {
+        total += t.samples;
+        std::string entry;
+        uint64_t best = 0;
+        for (const auto& [label, n] : t.entry) {
+            if (n > best) {
+                best = n;
+                entry = label;
+            }
+        }
+        threads += std::string(threads.empty() ? "" : ",\n") + "    {\"thread_id\": " + std::to_string(id) +
+                   ", \"entry\": \"" + gp_json_escape(entry) + "\", \"samples\": " + std::to_string(t.samples) +
+                   ", \"in_guest_code\": " + std::to_string(t.guest) + ", \"in_runtime\": " +
+                   std::to_string(t.runtime) + ", \"in_os\": " + std::to_string(t.os) + ",\n     \"flat\": " +
+                   gp_top_json(t.flat, t.samples, 15) + ",\n     \"inclusive\": " +
+                   gp_top_json(t.inclusive, t.samples, 15) + ",\n     \"os_leaf\": " +
+                   gp_top_json(t.os_leaf, t.samples, 8) + "}";
+    }
+    char head[320];
+    std::snprintf(head, sizeof(head),
+                  "{\"requested_hz\": %" PRIu64 ", \"rounds\": %" PRIu64 ", \"elapsed_ms\": %.0f, \"achieved_hz\": %.0f, "
+                  "\"samples\": %" PRIu64 ", \"dropped_stacks\": %" PRIu64 ",\n",
+                  g_options.profile_guest_hz, g_gp_rounds, g_gp_elapsed_ms,
+                  g_gp_elapsed_ms > 0 ? g_gp_rounds * 1000.0 / g_gp_elapsed_ms : 0.0, total, g_gp_dropped_stacks);
+    g_guest_profile_json = std::string(head) + "   \"threads\": [\n" + threads + "]}";
+    std::string collapsed;
+    for (const auto& [stack, n] : g_gp_collapsed) {
+        collapsed += stack + " " + std::to_string(n) + "\n";
+    }
+    const std::string path = g_options.report + ".guest-profile.collapsed.txt";
+    write_text(path, collapsed);
+    std::fprintf(stderr, "[harness] guest profile: %" PRIu64 " samples, collapsed stacks in %s\n", total, path.c_str());
+}
+
 void profile_loop(uint64_t interval_us, uint64_t start_ms) {
     const auto begin = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point sampling_begin{};
     while (!g_profile_stop.load(std::memory_order_relaxed)) {
         if (std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(start_ms)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -838,25 +1022,46 @@ void profile_loop(uint64_t interval_us, uint64_t start_ms) {
             }
             ResumeThread(t.handle);
             if (ok) {
-                ++g_profile_labels[t.id][profile_label(ctx, top, t.id)];
+                if (g_options.profile_guest) {
+                    gp_record(t.id, ctx, top);
+                }
+                if (!g_options.profile.empty()) {
+                    ++g_profile_labels[t.id][profile_label(ctx, top, t.id)];
+                }
             }
+        }
+        if (g_options.profile_guest) {
+            if (g_gp_rounds++ == 0) sampling_begin = std::chrono::steady_clock::now();
+            g_gp_elapsed_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sampling_begin).count();
         }
         std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
     }
 }
 
 void start_profile() {
-    if (!g_options.profile.empty()) {
+    if (g_options.profile_guest) {
+        timeBeginPeriod(1);  // 1 ms sleeps for a 1 kHz sampler
+        g_profile_thread = std::thread(profile_loop, std::max<uint64_t>(100, 1000000 / g_options.profile_guest_hz),
+                                    g_options.profile_start_ms);
+    } else if (!g_options.profile.empty()) {
         g_profile_thread = std::thread(profile_loop, std::max<uint64_t>(100, g_options.profile_interval_us),
                                     g_options.profile_start_ms);
     }
 }
 
 void finish_profile() {
-    if (g_options.profile.empty() || !g_profile_thread.joinable() || g_profile_stop.exchange(true)) {
+    if ((g_options.profile.empty() && !g_options.profile_guest) || !g_profile_thread.joinable() ||
+        g_profile_stop.exchange(true)) {
         return;
     }
     g_profile_thread.join();
+    if (g_options.profile_guest) {
+        gp_finish();
+    }
+    if (g_options.profile.empty()) {
+        return;
+    }
     std::string out;
     for (const auto& [id, labels] : g_profile_labels) {
         uint64_t total = 0;
@@ -1234,6 +1439,14 @@ void write_outputs(bool print_summary) {
     }
 #endif
     report = guest::minidump::annotate_report(report, g_minidump_path);
+    if (!g_guest_profile_json.empty()) {
+        const size_t close = report.rfind('}');
+        if (close != std::string::npos) {
+            std::string head = report.substr(0, close);
+            while (!head.empty() && (head.back() == '\n' || head.back() == ' ' || head.back() == '\r')) head.pop_back();
+            report = head + ",\n  \"guest_profile\": " + g_guest_profile_json + "\n}\n";
+        }
+    }
     const std::string summary = guest::last_summary();
     write_text(g_options.report, report);
     write_text(g_options.summary, summary);
