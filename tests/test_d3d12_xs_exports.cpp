@@ -9223,7 +9223,10 @@ void test_native_flush_page_index() {
         const uint64_t skipped_u0 = dg::work_total(dg::Work::FlushUniformsSkipped);
         const uint64_t misses0 = dg::work_total(dg::Work::FlushCrosscheckMisses);
         CHECK(flush().empty());  // steady: nothing written
-        if (mode != dg::FlushMode::Full) {
+        // (Hosts without OS write tracking, e.g. POSIX: nothing is indexed, every flush compares all.)
+        uintptr_t lo_a = 0, hi_a = 0;
+        const bool tracking = object_of<dg::Resource>(a)->write_tracked_host_range(&lo_a, &hi_a);
+        if (mode != dg::FlushMode::Full && tracking) {
             CHECK(dg::work_total(dg::Work::FlushBuffersSkipped) - skipped_b0 >= 2);  // (the scene's buffers too)
             CHECK(object_of<dg::Resource>(a)->flush_primed && object_of<dg::Resource>(b)->flush_primed);
             CHECK(dg::work_total(dg::Work::FlushUniformsSkipped) - skipped_u0 == 1);
