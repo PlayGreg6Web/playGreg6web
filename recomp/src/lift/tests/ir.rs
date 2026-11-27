@@ -969,6 +969,46 @@ fn resolved_jump_tables_become_switches() {
     );
 }
 #[test]
+fn function_pointer_table_cases_become_tail_call_arms() {
+    let base = 0x1_4000_0000u64;
+    let text = base + u64::from(SWITCH_TEXT_RVA);
+    let mut function = Program::new()
+        .base(base)
+        .bytes(text, &super::switch_code())
+        .function(text);
+    let (callee_a, callee_b) = (base + 0x5000, base + 0x5010);
+    for block in function.blocks.values_mut() {
+        if block.terminator == cfg::Terminator::IndirectJump {
+            block.successors = vec![cfg::Edge::TailCall(callee_a), cfg::Edge::TailCall(callee_b)];
+        }
+    }
+    let lifted = lift_function(&function).expect("lifts");
+    let switch_line = lifted
+        .ir
+        .lines()
+        .find(|l| l.trim_start().starts_with("switch i64 "))
+        .unwrap_or_else(|| {
+            panic!(
+                "no switch:
+{}",
+                lifted.ir
+            )
+        });
+    for callee in [callee_a, callee_b] {
+        assert!(
+            switch_line.contains(&format!("i64 {callee}, label %")),
+            "{switch_line}"
+        );
+    }
+    // Every other value still goes through the runtime dispatcher.
+    assert!(
+        lifted
+            .ir
+            .contains(&format!("tail call void @{HELPER_INDIRECT_CALL}"))
+    );
+}
+
+#[test]
 fn state_layout_constants_match_the_ir_type_and_the_import_seam() {
     use crate::lift::{
         CALLEE_STACK_ARG_OFFSET, STATE_FLAGS_OFFSET, STATE_FS_BASE_OFFSET, STATE_GPR_OFFSET,

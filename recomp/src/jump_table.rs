@@ -482,7 +482,8 @@ pub(crate) fn resolve_in(
             encoding,
             leaf,
             MAX_INFERRED_ENTRIES,
-        );
+        )
+        .or_else(|| infer_fn_table(image, jmp, load_site, load.table, encoding));
     };
     if bound.min > bound.max {
         return None;
@@ -994,6 +995,90 @@ fn infer_extent(
             break;
         };
         va = next_va;
+    }
+    (targets.len() >= MIN_INFERRED_ENTRIES).then(|| JumpTable {
+        site: jmp.ip(),
+        load_site,
+        table,
+        targets,
+        index: None,
+        inferred: true,
+        alternates: Vec::new(),
+    })
+}
+
+/// Whether `va` is the first byte of a function: a `.pdata` function start, or, in code no
+/// `.pdata` range covers (a leaf function has no unwind data), a 16-byte aligned address that
+/// follows `int3` / `nop` padding. Never true for an address inside a `.pdata` range, so a
+/// mid-function pointer is not taken for a function.
+pub(crate) fn is_function_start(image: &CodeImage<'_>, va: u64) -> bool {
+    if image.code_bytes(va).is_err() {
+        return false;
+    }
+    match image.function_table.range_at(va) {
+        Some(r) => r.start == va && r.function == va,
+        None => {
+            va % 16 == 0
+                && va
+                    .checked_sub(1)
+                    .and_then(|prev| image.bytes_at(prev, 1))
+                    .is_some_and(|b| matches!(b, [0xcc | 0x90]))
+        }
+    }
+}
+
+/// Whether `table` is a function-pointer table found by [`infer_fn_table`]: an inferred
+/// single-level table whose every case is the start of a function other than the jumping one.
+pub(crate) fn is_fn_table(image: &CodeImage<'_>, table: &JumpTable) -> bool {
+    let owner = image.function_table.function_at(table.site);
+    table.inferred
+        && table.index.is_none()
+        && table.alternates.is_empty()
+        && table.targets.len() >= MIN_INFERRED_ENTRIES
+        && table
+            .targets
+            .iter()
+            .all(|&t| is_function_start(image, t) && (owner.is_none() || owner != Some(t)))
+}
+
+/// An unbounded read of a 64-bit pointer table (`jmp [base + index*8]`) whose entries are
+/// function starts rather than case labels of the jumping function: a tail call through a
+/// function-pointer table. The table is read from index 0 while every slot is a base-relocated
+/// pointer (`.rdata` slots the loader rewrites, [`CodeImage::data_relocs`]) whose value is the
+/// start of a function ([`is_function_start`]); the first slot that is not ends it, so the extent stops at the
+/// next unrelocated word, symbol or table. Fewer than [`MIN_INFERRED_ENTRIES`] entries do not
+/// count. The table is never assumed complete: the lifted `switch` sends every other value
+/// through the runtime dispatcher, as for an unresolved jump. Without relocation data nothing
+/// is recognised.
+fn infer_fn_table(
+    image: &CodeImage<'_>,
+    jmp: &Instruction,
+    load_site: u64,
+    table: u64,
+    encoding: EntryEncoding,
+) -> Option<JumpTable> {
+    if encoding != EntryEncoding::Absolute64 {
+        return None;
+    }
+    let mut targets = Vec::new();
+    let mut va = table;
+    while targets.len() < MAX_INFERRED_ENTRIES {
+        if !image.data_relocs.contains(&va) {
+            break;
+        }
+        let Some(target) =
+            read(image, va, 8).and_then(|chunk| EntryEncoding::Absolute64.decode(chunk))
+        else {
+            break;
+        };
+        if !is_function_start(image, target) {
+            break;
+        }
+        targets.push(target);
+        let Some(next) = va.checked_add(8) else {
+            break;
+        };
+        va = next;
     }
     (targets.len() >= MIN_INFERRED_ENTRIES).then(|| JumpTable {
         site: jmp.ip(),
@@ -5242,6 +5327,130 @@ mod tests {
                 assert_not_proven(&analysis, (jmp_va - TEXT) as u32);
             }
         }
+    }
+
+    /// `A: lea rdx, [DATA]; jmp [rdx + rcx*8]` (no guard) and four `ret` functions at
+    /// TEXT+0x20/0x30/0x40/0x50, each its own `.pdata` function. Returns the analysis and `A`'s jmp.
+    fn fn_table_analysis(slots: &[u64], relocated: &[usize]) -> (Analysis, u64) {
+        fn_table_analysis_with(slots, relocated, true)
+    }
+
+    fn fn_table_analysis_with(
+        slots: &[u64],
+        relocated: &[usize],
+        callee_pdata: bool,
+    ) -> (Analysis, u64) {
+        let mut code = vec![0xcc_u8; 0x60];
+        code[..3].copy_from_slice(&[0x48, 0x8d, 0x15]);
+        let disp = (DATA - (TEXT + 7)) as u32;
+        code[3..7].copy_from_slice(&disp.to_le_bytes());
+        code[7..10].copy_from_slice(&[0xff, 0x24, 0xca]);
+        for at in [0x20, 0x30, 0x40, 0x50] {
+            code[at] = 0xc3;
+        }
+        let data: Vec<u8> = slots.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data, false),
+            ],
+            vec![TEXT],
+        );
+        let range = |start: u64, end: u64| FunctionRange {
+            start: TEXT + start,
+            end: TEXT + end,
+            function: TEXT + start,
+        };
+        let mut ranges = vec![range(0, 0x20)];
+        if callee_pdata {
+            ranges.extend([
+                range(0x20, 0x30),
+                range(0x30, 0x40),
+                range(0x40, 0x50),
+                range(0x50, 0x60),
+            ]);
+        }
+        image.function_table = FunctionTable::new(ranges);
+        image.data_relocs = relocated.iter().map(|&i| DATA + 8 * i as u64).collect();
+        (discover(&image), TEXT + 7)
+    }
+
+    #[test]
+    fn function_pointer_table_without_a_guard_becomes_a_bounded_tail_call_switch() {
+        let f = |off: u64| TEXT + off;
+        // Three function starts, then a pointer into the middle of a function: the table ends.
+        let slots = [f(0x20), f(0x30), f(0x40), f(0x51), f(0x50)];
+        let (analysis, jmp) = fn_table_analysis(&slots, &[0, 1, 2, 3, 4]);
+        let jt = analysis.jump_tables.get(&jmp).expect("fn table resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, [f(0x20), f(0x30), f(0x40)]);
+        assert!(
+            jt.inferred,
+            "no guard: the extent is inferred, never proven"
+        );
+        assert!(!analysis.unresolved_jumps.contains_key(&jmp));
+        let a = &analysis.functions[&TEXT];
+        assert_eq!(
+            jump_successors(a, jmp),
+            [
+                Edge::TailCall(f(0x20)),
+                Edge::TailCall(f(0x30)),
+                Edge::TailCall(f(0x40))
+            ]
+        );
+        for off in [0x20, 0x30, 0x40] {
+            assert!(
+                analysis.functions.contains_key(&f(off)),
+                "{off:#x} is a function"
+            );
+        }
+        assert!(!analysis.functions.contains_key(&f(0x50)));
+    }
+
+    #[test]
+    fn function_pointer_table_of_leaf_functions_without_pdata() {
+        let f = |off: u64| TEXT + off;
+        // Leaf functions have no `.pdata`: aligned starts after padding count, a mid-function
+        // address (0x31, not aligned) ends the table.
+        let slots = [f(0x20), f(0x30), f(0x40), f(0x51), f(0x50)];
+        let (analysis, jmp) = fn_table_analysis_with(&slots, &[0, 1, 2, 3, 4], false);
+        let jt = analysis
+            .jump_tables
+            .get(&jmp)
+            .expect("leaf fn table resolved");
+        assert_eq!(jt.targets, [f(0x20), f(0x30), f(0x40)]);
+        for off in [0x20, 0x30, 0x40] {
+            assert!(
+                analysis.functions.contains_key(&f(off)),
+                "{off:#x} is a function"
+            );
+        }
+    }
+
+    #[test]
+    fn function_pointer_table_stops_at_the_first_unrelocated_slot() {
+        let f = |off: u64| TEXT + off;
+        let slots = [f(0x20), f(0x30), f(0x40), f(0x50)];
+        let (analysis, jmp) = fn_table_analysis(&slots, &[0, 1, 3]);
+        let jt = analysis.jump_tables.get(&jmp).expect("resolved");
+        assert_eq!(jt.targets, [f(0x20), f(0x30)]);
+    }
+
+    #[test]
+    fn function_pointer_table_needs_relocations_and_two_entries() {
+        let f = |off: u64| TEXT + off;
+        let slots = [f(0x20), f(0x30), f(0x40)];
+        // No relocation data: nothing is recognised.
+        let (analysis, jmp) = fn_table_analysis(&slots, &[]);
+        assert!(analysis.jump_tables.is_empty());
+        assert!(analysis.unresolved_jumps.contains_key(&jmp));
+        // A single leading function start is not a table.
+        let (analysis, _) = fn_table_analysis(&[f(0x20), 0, f(0x40)], &[0, 1, 2]);
+        assert!(analysis.jump_tables.is_empty());
+        // A value that is not a function start at slot 0 or 1.
+        let (analysis, _) = fn_table_analysis(&[f(0x20), f(0x31), f(0x40)], &[0, 1, 2]);
+        assert!(analysis.jump_tables.is_empty());
     }
 
     #[test]

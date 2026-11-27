@@ -3756,11 +3756,15 @@ impl FunctionLifter<'_> {
             return unsupported("far or non-indirect jump");
         }
         let target = self.indirect_target(ins)?;
-        let mut cases: Vec<u64> = block
+        let mut cases: Vec<(u64, bool)> = block
             .successors
             .iter()
             .filter_map(|edge| match *edge {
-                Edge::JumpTable(case) => Some(case),
+                Edge::JumpTable(case) => Some((case, false)),
+                // A case that is another function's entry (function-pointer table).
+                Edge::TailCall(case) if block.terminator == Terminator::IndirectJump => {
+                    Some((case, true))
+                }
                 _ => None,
             })
             .collect();
@@ -3768,7 +3772,12 @@ impl FunctionLifter<'_> {
         cases.dedup();
         if !cases.is_empty() {
             let mut arms = String::new();
-            for case in cases {
+            for (case, is_exit) in cases {
+                if is_exit {
+                    self.exits.push(case);
+                    let _ = write!(arms, " i64 {}, label %{}", imm(case, 64), exit_label(case));
+                    continue;
+                }
                 if !self.func.blocks.contains_key(&case) {
                     return Err(InsnError::Cfg(LiftError::UnknownSuccessor {
                         block: block.start,

@@ -1361,8 +1361,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 let targets: BTreeSet<u64> = table.all_targets().collect();
                 block.successors = targets.into_iter().map(Edge::JumpTable).collect();
             }
+            let tail_calls = jump_table::is_fn_table(self.image, &table);
             for target in table.unique_targets() {
-                self.add_leader(target);
+                // A function-pointer table's cases are other functions' entries (tail calls).
+                if tail_calls {
+                    self.add_function(target);
+                } else {
+                    self.add_leader(target);
+                }
             }
             self.jump_tables.insert(table.site, table);
         }
@@ -1436,8 +1442,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 let targets: BTreeSet<u64> = table.all_targets().collect();
                 block.successors = targets.into_iter().map(Edge::JumpTable).collect();
             }
+            let tail_calls = jump_table::is_fn_table(self.image, &table);
             for target in table.unique_targets() {
-                self.add_leader(target);
+                // A function-pointer table's cases are other functions' entries (tail calls).
+                if tail_calls {
+                    self.add_function(target);
+                } else {
+                    self.add_leader(target);
+                }
             }
             self.jump_tables.insert(table.site, table);
         }
