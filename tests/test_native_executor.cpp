@@ -3374,6 +3374,63 @@ void test_wide_mrt_pipeline(NativeExecutor& ex) {
     CHECK(ex.stats().write_masks_cleared == before.write_masks_cleared);
 }
 
+// A pipeline is drawn into a pass whose attachments have other formats than the pipeline's key (an sRGB
+// twin of the target, a depth attachment the key does not know): the executor draws with a variant built
+// with the pass's attachment state, so Dawn raises no "attachment state is not compatible" error.
+void test_pipeline_pass_formats(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(texture2(9600, 4, 4, GpuTextureUsage::RenderAttachment, 22)));  // rgba8unorm
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(texture2(9601, 4, 4, GpuTextureUsage::RenderAttachment, 48)));  // depth32float
+    GpuCreateSampler2Payload sp;
+    std::memset(&sp, 0, sizeof sp);
+    sp.id = 9602;
+    sp.max_anisotropy = 1;
+    sp.lod_max_clamp = 32.0f;
+    emit(setup, GpuOpcode::CreateSampler2, bytes_of(sp));
+    setup.create_shader_module(9610, GpuShaderStage::Vertex,
+                               "@group(0) @binding(0) var smp: sampler;\n"
+                               "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {"
+                               " var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));"
+                               " return vec4f(p[i], 0.5, 1.0); }\n");
+    setup.create_shader_module(9611, GpuShaderStage::Fragment,
+                               "@fragment fn fs_main() -> @location(0) vec4f { return vec4f(1.0); }\n");
+    create_layouts(setup, 9620, 9621, {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler, 0)});
+    GpuCreateRenderPipeline2Payload rp = pipeline_to_bgra(9630, 9610, 9611, 9621);
+    rp.key.color_targets[0].format = 23;  // rgba8unorm-srgb: the pass renders into the rgba8unorm texture
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(rp));
+    create_bind_group(setup, 9640, 9620, {bg_entry(0, GpuBindResourceType::Sampler, 9602)});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    for (int with_depth = 0; with_depth < 2; ++with_depth) {
+        GpuBeginRenderPassPayload bp = texture_pass(9600, 0, 0, 0, 1);
+        if (with_depth) {
+            bp.depth_stencil.texture_id = 9601;
+            bp.depth_stencil.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+            bp.depth_stencil.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+            bp.depth_stencil.depth_clear_value = 1.0f;
+        }
+        frame.emit_packet(GpuOpcode::BeginRenderPass, &bp, sizeof bp);
+        frame.set_pipeline(9630);
+        set_bind_group2(frame, 0, 9640);
+        frame.draw(3);
+        frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    }
+    GpuBeginRenderPassPayload pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& after = ex.stats();
+    CHECK(after.device_errors == before.device_errors);
+    CHECK(after.draws == before.draws + 2);
+    CHECK(after.pipeline_variants_created == before.pipeline_variants_created + 2);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -3431,6 +3488,7 @@ int main() {
     test_wide_mrt_pipeline(*ex);
     test_screenshot();
     test_error_scope_attribution();
+    test_pipeline_pass_formats(*ex);
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

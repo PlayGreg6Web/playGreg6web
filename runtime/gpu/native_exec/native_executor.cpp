@@ -387,8 +387,39 @@ struct AsyncSlot {
     bool deferred_compute = false;
 };
 
+// Attachment formats (format codes) and sample count of the render pass a draw goes into. A render
+// pipeline's attachment state has to equal the pass's: a pipeline whose target formats / depth format /
+// sample count differ gets a variant built with the pass's (see Impl::pipeline_variant).
+struct PassFormats {
+    bool known = false;                 // an explicit BeginRenderPass pass (the implicit swapchain pass is not tracked)
+    std::array<uint8_t, kGpuMaxColorAttachments> color{};  // 0 = no attachment in the slot
+    uint32_t color_known = 0;           // bit i: slot i's format is known (a swapchain attachment's is not)
+    bool depth_known = true;
+    uint8_t depth = 0;                  // 0 = no depth/stencil attachment
+    bool samples_known = false;
+    uint32_t samples = 1;
+    uint64_t hash() const {
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
+        for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i) mix((color_known >> i & 1u) ? 0x100u + color[i] : 0u);
+        mix(depth_known ? 0x100u + depth : 0u);
+        mix(samples_known ? samples : 0u);
+        return h;
+    }
+};
+
+// What a render pipeline was built from (the CreateRenderPipeline2 packet, its layout and shaders), kept to
+// build attachment-state variants of it.
+struct PipelineRebuild {
+    GpuCreateRenderPipeline2Payload h;
+    std::optional<PlEntry> layout;
+    std::shared_ptr<ShaderEntry> vs, fs;
+};
+
 struct RenderPipelineEntry : AsyncSlot {
     mutable wgpu::RenderPipeline pipeline;
+    std::shared_ptr<const PipelineRebuild> rebuild;
+    mutable std::unordered_map<uint64_t, std::shared_ptr<RenderPipelineEntry>> variants;  // by PassFormats::hash()
     AutoLayoutMeta auto_meta;
     bool expects_group0 = false;
     uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
@@ -435,6 +466,8 @@ struct ColorAtt {
     uint32_t base_mip = 0, base_layer = 0;  // the attachment view's subresource (--show-target default)
     bool swapchain = false;
     AttachmentSize size;  // texture attachments; a swapchain attachment's size is read at encode time
+    uint8_t fmt = 0;      // the view's format code (texture attachments)
+    uint32_t samples = 1;
     LoadOp load = LoadOp::Load;
     StoreOp store = StoreOp::Store;
     ClearValue clear;
@@ -445,6 +478,8 @@ struct BeginPassCmd {
     bool has_ds = false;
     wgpu::TextureView ds_view;
     AttachmentSize ds_size;
+    uint8_t ds_fmt = 0;
+    uint32_t ds_samples = 1;
     GpuRenderPassDepthStencilAttachment ds{};
 };
 struct EndPassCmd {};
@@ -3865,7 +3900,9 @@ struct NativeExecutor::Impl {
             defer_pipeline(deferred_render, h.id, p, pl, std::move(vs), std::move(fs));
             return true;
         }
-        return build_render_pipeline2(h, pl, *vs, fs.get());
+        if (!build_render_pipeline2(h, pl, *vs, fs.get())) return false;
+        keep_rebuild(h.id, h, pl, vs, fs);
+        return true;
     }
 
     void defer_pipeline(std::unordered_map<uint32_t, DeferredPipe>& m, uint32_t id, const Packet& p, const PlEntry* pl,
@@ -3881,8 +3918,10 @@ struct NativeExecutor::Impl {
         stats.pipelines_deferred_max = std::max<uint64_t>(stats.pipelines_deferred_max, deferred_render.size() + deferred_compute.size());
     }
 
+    // `ov` (variant build): the pass's attachment state overrides the key's target formats, depth format and
+    // sample count; the result goes to *out instead of the pipeline table.
     bool build_render_pipeline2(const GpuCreateRenderPipeline2Payload& h, const PlEntry* pl, const ShaderEntry& vs,
-                                const ShaderEntry* fs) {
+                                const ShaderEntry* fs, const PassFormats* ov = nullptr, RenderPipelineEntry* out = nullptr) {
         const GpuRenderPipelineKey& key = h.key;
         wgpu::PipelineLayout layout;
         bool auto_layout = pl == nullptr;
@@ -3892,13 +3931,22 @@ struct NativeExecutor::Impl {
             layout = pl->layout;
             group0_has_entries = pl->group0_has_entries;
             group0_entries = &pl->group0_entries;
-        } else {
+        } else if (!ov) {
             ++stats.auto_layout_pipelines;
         }
         ensure_shader(vs);
 
         // decodeRenderPipelineKey + validateVertexBufferLayouts
-        const uint32_t target_count = std::min<uint32_t>(key.color_target_count, 8);
+        const uint32_t key_target_count = std::min<uint32_t>(key.color_target_count, 8);
+        uint8_t tcode[kGpuMaxColorAttachments] = {};
+        uint32_t target_count = key_target_count;
+        for (uint32_t i = 0; i < key_target_count; ++i) tcode[i] = key.color_targets[i].format;
+        if (ov) {
+            for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i)
+                if (ov->color_known >> i & 1u) tcode[i] = ov->color[i];
+            for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i)
+                if (tcode[i] != 0) target_count = std::max<uint32_t>(target_count, i + 1);
+        }
         const uint32_t buffer_count = std::min<uint32_t>(key.vertex_buffer_count, 8);
         const uint32_t attr_count = std::min<uint32_t>(key.vertex_attribute_count, 16);
         std::vector<wgpu::VertexAttribute> attrs[8];
@@ -3941,10 +3989,11 @@ struct NativeExecutor::Impl {
         std::vector<wgpu::BlendState> blends(target_count);
         for (uint32_t i = 0; i < target_count; ++i) {
             const GpuColorTargetKey& t = key.color_targets[i];
-            if (t.format == 0) continue;  // null target
-            if (!format_valid(t.format)) return fail("render pipeline target: invalid texture format");
-            targets[i].format = wgpu_format(t.format);
-            targets[i].writeMask = static_cast<wgpu::ColorWriteMask>(t.write_mask & 0x0f);
+            if (tcode[i] == 0) continue;  // null target
+            if (!format_valid(tcode[i])) return fail("render pipeline target: invalid texture format");
+            targets[i].format = wgpu_format(tcode[i]);
+            targets[i].writeMask =
+                static_cast<wgpu::ColorWriteMask>((i < key_target_count && t.format != 0 ? t.write_mask : 0x0f) & 0x0f);
         }
 
         wgpu::RenderPipelineDescriptor rd{};
@@ -3953,8 +4002,8 @@ struct NativeExecutor::Impl {
             ensure_shader(*fs);
             for (uint32_t i = 0; i < target_count; ++i) {
                 const GpuColorTargetKey& t = key.color_targets[i];
-                if (t.format == 0 || !t.blend_enabled) continue;
-                if (!blendable(t.format, features)) continue;  // sanitizeColorTargetBlendState strips the blend
+                if (tcode[i] == 0 || i >= key_target_count || t.format == 0 || !t.blend_enabled) continue;
+                if (!blendable(tcode[i], features)) continue;  // sanitizeColorTargetBlendState strips the blend
                 blends[i].color.operation = wgpu_blend_op(t.color.operation);
                 blends[i].color.srcFactor = wgpu_blend_factor(t.color.src_factor);
                 blends[i].color.dstFactor = wgpu_blend_dst_factor(t.color.dst_factor);
@@ -3992,9 +4041,10 @@ struct NativeExecutor::Impl {
 
         wgpu::DepthStencilState ds{};
         const GpuDepthStencilKey& dk = key.depth_stencil;
-        if (dk.format != 0 && format_valid(dk.format)) {
-            const bool has_depth = format_is_depth(dk.format);
-            ds.format = wgpu_format(dk.format);
+        const uint8_t dcode = ov && ov->depth_known ? ov->depth : dk.format;
+        if (dcode != 0 && format_valid(dcode)) {
+            const bool has_depth = format_is_depth(dcode);
+            ds.format = wgpu_format(dcode);
             ds.depthWriteEnabled = has_depth && dk.depth_write_enabled ? wgpu::OptionalBool::True : wgpu::OptionalBool::False;
             auto face = [](const GpuStencilFaceKey& f) {
                 wgpu::StencilFaceState s{};
@@ -4035,6 +4085,10 @@ struct NativeExecutor::Impl {
         rd.multisample.count = key.multisample.count ? key.multisample.count : 1;
         rd.multisample.mask = key.multisample.mask;
         rd.multisample.alphaToCoverageEnabled = key.multisample.alpha_to_coverage_enabled != 0;
+        if (ov && ov->samples_known && ov->samples != rd.multisample.count) {
+            rd.multisample.count = ov->samples;
+            if (ov->samples == 1) rd.multisample.alphaToCoverageEnabled = false;
+        }
 
         // An explicit layout that does not satisfy the statically referenced @group(0) bindings of the
         // WGSL becomes layout:'auto' with the worker's bind group remap (isExplicitLayoutCompatibleWithWgsl).
@@ -4087,11 +4141,27 @@ struct NativeExecutor::Impl {
         e.fit = std::move(fit);
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs.hash);
+        if (out) {
+            *out = std::move(e);
+            return true;
+        }
         render_pipelines[h.id] = std::move(e);
         ++stats.render_pipelines;
         return true;
     }
     std::string fragment_ep_storage;
+
+    void keep_rebuild(uint32_t id, const GpuCreateRenderPipeline2Payload& h, const PlEntry* pl, const ShaderRef& vs,
+                      const ShaderRef& fs) {
+        auto it = render_pipelines.find(id);
+        if (it == render_pipelines.end()) return;
+        auto rb = std::make_shared<PipelineRebuild>();
+        rb->h = h;
+        if (pl) rb->layout = *pl;
+        rb->vs = vs;
+        rb->fs = fs;
+        it->second.rebuild = std::move(rb);
+    }
 
     // ---- async pipeline creation (live mode) ----
 
@@ -4186,6 +4256,7 @@ struct NativeExecutor::Impl {
             GpuCreateRenderPipeline2Payload h;
             std::memcpy(&h, d.payload.data(), std::min(sizeof h, d.payload.size()));
             ok = build_render_pipeline2(h, pl, *d.a, d.b.get());
+            if (ok) keep_rebuild(id, h, pl, d.a, d.b);
         }
         ++stats.pipelines_deferred_built;
         if (ok) return;
@@ -5148,6 +5219,8 @@ struct NativeExecutor::Impl {
                 return fail("render pass: texture " + std::to_string(c.texture_id) + " createView failed");
             }
             a.size = texture_attachment_size(it->second, c.view);
+            a.fmt = c.view.format != 0 ? c.view.format : it->second.geom.format;
+            a.samples = it->second.sample_count;
         }
         if (plan->has_depth_stencil) {
             const GpuRenderPassDepthStencilAttachment& d = plan->depth_stencil;
@@ -5164,6 +5237,8 @@ struct NativeExecutor::Impl {
                 return fail("render pass: depth texture createView failed");
             }
             cmd.ds_size = texture_attachment_size(it->second, d.view);
+            cmd.ds_fmt = d.view.format != 0 ? d.view.format : it->second.geom.format;
+            cmd.ds_samples = it->second.sample_count;
         }
         pass_cmds.emplace_back(std::move(cmd));
         return true;
@@ -5295,6 +5370,8 @@ struct NativeExecutor::Impl {
         std::array<StreamGroup, kFitMaxGroups> stream_groups;
         uint8_t overridden = 0;
         std::optional<uint32_t> active_pipeline;
+        PassFormats pass_fmt;              // the active explicit pass's attachment state (known = false: not tracked)
+        bool variant_blocked = false;      // the attachment-state variant of the active pipeline is still compiling
         std::optional<uint32_t> active_compute;
         // _preparePassCommandsForFlush compute filter state
         bool had_explicit_compute = false, compute_valid = false;
@@ -5357,6 +5434,8 @@ struct NativeExecutor::Impl {
             for (auto& sg : stream_groups) sg = StreamGroup{};
             active_pipeline.reset();
             active_compute.reset();
+            pass_fmt = PassFormats{};
+            variant_blocked = false;
         }
         void ensure_render() {  // _ensurePresentRenderPass
             if (rpass) return;
@@ -5487,6 +5566,7 @@ struct NativeExecutor::Impl {
         e.rpass = e.enc.BeginRenderPass(&rp);
         e.render_pass_opened = true;
         e.explicit_pass = true;
+        e.pass_fmt = pass_formats_of(b, dropped, b.has_ds && !drop_ds);
         // BeginRenderPassCommand.run: the pass's target size is the sanitized reference size, else the
         // swapchain size (swapchain target) or the static attachment size.
         if (ref.known()) e.explicit_size = ref;
@@ -5494,6 +5574,65 @@ struct NativeExecutor::Impl {
         // A new pass resets the compute filter state (_preparePassCommandsForFlush).
         e.had_explicit_compute = false;
         e.compute_valid = false;
+    }
+
+    // The attachment state of the pass about to be encoded (attachments dropped by the sanitizer are null).
+    static PassFormats pass_formats_of(const BeginPassCmd& b, uint32_t dropped, bool ds_kept) {
+        PassFormats f;
+        f.known = true;
+        f.samples_known = true;
+        bool sampled = false;
+        for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i) {
+            const bool present = i < b.color_count && b.colors[i].texture_id != 0 && !(dropped & (1u << i));
+            if (present && b.colors[i].swapchain) continue;  // the swapchain format is not tracked here
+            f.color_known |= 1u << i;
+            if (!present) continue;
+            f.color[i] = b.colors[i].fmt;
+            if (!sampled) { f.samples = b.colors[i].samples; sampled = true; }
+        }
+        if (ds_kept) {
+            f.depth = b.ds_fmt;
+            if (!sampled) f.samples = b.ds_samples;
+        }
+        return f;
+    }
+
+    // True when a pipeline's attachment state differs from the pass's in a known slot.
+    static bool attachment_state_differs(const GpuRenderPipelineKey& k, const PassFormats& pf) {
+        const uint32_t n = std::min<uint32_t>(k.color_target_count, 8);
+        for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i) {
+            if (!(pf.color_known >> i & 1u)) continue;
+            const uint8_t kf = i < n && format_valid(k.color_targets[i].format) ? k.color_targets[i].format : 0;
+            if (kf != pf.color[i]) return true;
+        }
+        if (pf.depth_known) {
+            const uint8_t kd = k.depth_stencil.format != 0 && format_valid(k.depth_stencil.format) ? k.depth_stencil.format : 0;
+            if (kd != pf.depth) return true;
+        }
+        if (pf.samples_known && std::max<uint32_t>(k.multisample.count, 1) != pf.samples) return true;
+        return false;
+    }
+
+    // The variant of `base` for the pass's attachment state (built on first use), or null when the pipeline
+    // already matches or cannot be rebuilt (auto layout: its bind group layouts belong to that pipeline only).
+    const RenderPipelineEntry* pipeline_variant(const RenderPipelineEntry& base, const PassFormats& pf) {
+        if (!base.rebuild || base.deferred || base.failed || base.pending) return nullptr;
+        if (!attachment_state_differs(base.rebuild->h.key, pf)) return nullptr;
+        if (!base.rebuild->layout || base.auto_meta.remap) {
+            ++stats.pipeline_variants_unsupported;
+            return nullptr;
+        }
+        const uint64_t key = pf.hash();
+        auto it = base.variants.find(key);
+        if (it != base.variants.end()) return it->second.get();
+        auto v = std::make_shared<RenderPipelineEntry>();
+        const PipelineRebuild& rb = *base.rebuild;
+        if (!build_render_pipeline2(rb.h, &*rb.layout, *rb.vs, rb.fs.get(), &pf, v.get())) {
+            ++stats.pipeline_variants_unsupported;
+            return nullptr;
+        }
+        ++stats.pipeline_variants_created;
+        return base.variants.emplace(key, std::move(v)).first->second.get();
     }
 
     void run_cmd(Encoder& e, const PassCmd& cmd) {
@@ -5517,6 +5656,15 @@ struct NativeExecutor::Impl {
             e.compute_valid = false;
             auto it = render_pipelines.find(sp->id);
             const wgpu::RenderPipeline* plp = it != render_pipelines.end() ? resolve_budgeted(it->second) : &sp->at_packet;
+            e.variant_blocked = false;
+            if (plp && *plp && it != render_pipelines.end() && e.pass_fmt.known) {
+                // The pipeline must have the attachment state of the pass it is drawn into.
+                if (const RenderPipelineEntry* v = pipeline_variant(it->second, e.pass_fmt)) {
+                    if (const wgpu::RenderPipeline* vp = resolve_budgeted(*v)) plp = vp;
+                    else if (!v->failed) e.variant_blocked = true;  // still compiling past the budget: draws are dropped
+                }
+            }
+            if (e.variant_blocked) plp = nullptr;
             if (!plp) {
                 // Still compiling past the budget (or failed): draw_allowed() drops the draws.
             } else if (*plp) {
@@ -6352,6 +6500,10 @@ struct NativeExecutor::Impl {
     // unavailable or whose expected @group(0) bind group is not bound.
     bool draw_allowed(Encoder& e) {
         e.ensure_render();
+        if (e.variant_blocked) {
+            ++stats.draws_skipped;
+            return false;
+        }
         if (e.active_pipeline) {
             auto it = render_pipelines.find(*e.active_pipeline);
             if (it == render_pipelines.end()) {
@@ -7099,6 +7251,8 @@ std::string NativeExecutor::stats_json() const {
     num("depth_twins_created", st.depth_twins_created);
     num("depth_int_twins_created", st.depth_int_twins_created);
     num("depth_half_twins_created", st.depth_half_twins_created);
+    num("pipeline_variants_created", st.pipeline_variants_created);
+    num("pipeline_variants_unsupported", st.pipeline_variants_unsupported);
     num("depth_stencil_direct_binds", st.depth_stencil_direct_binds);
     num("show_target_frames", st.show_target_frames);
     num("show_target_unavailable", st.show_target_unavailable);
