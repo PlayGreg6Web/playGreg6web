@@ -525,6 +525,7 @@ private:
         bool retile = false;
         compute_readback::Plan retile_plan{};
         uint64_t retile_cpu_va = 0;
+        uint32_t retile_texture_id = 0;
     };
     std::vector<ReadbackRecord> readbacks_;
     // Backlog 8: textures a dispatch of this recording wrote (bridge take_written_textures); at Close

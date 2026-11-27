@@ -6785,6 +6785,35 @@ void test_window_texture_sync_markpass_and_inplace_hash() {
         }
         gw::set_write_marks_verified(false);
 
+        // Compute read-back ownership: our own re-tile write is not re-uploaded (no ping-pong), a
+        // genuine guest CPU write after it is.
+        {
+            dev->note_texture_readback_pending(tex_id);
+            // First read-back still in flight: no upload.
+            gpu::CommandEncoder e0;
+            dev->begin_submission();
+            CHECK(!dev->sync_bound_texture_memory(tex_id, e0));
+            dev->end_submission();
+            // Host-originated write (what the completion does): write, mark, note the hash.
+            std::memset(raw_tex, 0x66u, size_t{64} * kW);
+            gw::mark_written(tex_cpu, size_t{64} * kW);
+            dev->note_texture_readback_retiled(tex_id, tex_cpu, size_t{kW} * kH);
+            gpu::CommandEncoder e1;
+            dev->begin_submission();
+            CHECK(!dev->sync_bound_texture_memory(tex_id, e1));
+            dev->end_submission();
+            CHECK(write_texture_packets(e1, tex_id).empty());
+            // Genuine guest write afterwards: uploaded again.
+            std::memset(raw_tex, 0x77u, size_t{64} * kW);
+            gw::mark_written(tex_cpu, size_t{64} * kW);
+            gpu::CommandEncoder e2;
+            dev->begin_submission();
+            CHECK(dev->sync_bound_texture_memory(tex_id, e2));
+            dev->end_submission();
+            const auto wts = write_texture_packets(e2, tex_id);
+            CHECK(!wts.empty());
+        }
+
         fx.vcall(tex_obj, Slot::Release);
         fx.vcall(buf_obj, Slot::Release);
         scene.release_all();

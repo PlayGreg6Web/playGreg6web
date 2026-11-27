@@ -794,6 +794,29 @@ void Device::untrack_guest_texture(uint32_t resource_id) {
         tracked_textures_.erase(it);
     }
     copy_destinations_.erase(resource_id);
+    readback_owned_.erase(resource_id);
+}
+
+void Device::note_texture_readback_pending(uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    readback_owned_.try_emplace(resource_id);
+}
+
+void Device::note_texture_readback_retiled(uint32_t resource_id, uint64_t cpu_va, size_t bytes) {
+    const void* host = com::guest_to_host(cpu_va, bytes);
+    if (resource_id == 0 || host == nullptr) {
+        return;
+    }
+    const uint64_t hash = content_hash(host, bytes);
+    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    ReadbackOwned& o = readback_owned_[resource_id];
+    o.valid = true;
+    o.va = cpu_va;
+    o.bytes = bytes;
+    o.hash = hash;
 }
 
 void Device::note_texture_copy_destination(uint32_t resource_id) {
@@ -845,6 +868,34 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     texture_budget().touch_texture(resource_id, present_epoch());
     TrackedTexture tt{};
     {
+        ReadbackOwned owned{};
+        bool is_owned = false;
+        {
+            std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+            const auto ro = readback_owned_.find(resource_id);
+            if (ro != readback_owned_.end()) {
+                is_owned = true;
+                owned = ro->second;
+            }
+        }
+        if (is_owned) {
+            if (!owned.valid) {
+                return false;  // the first read-back is still in flight
+            }
+            const void* host = com::guest_to_host(owned.va, owned.bytes);
+            if (host != nullptr && content_hash(host, owned.bytes) == owned.hash) {
+                return false;  // still the bytes our own re-tile wrote: the GPU copy is current
+            }
+            // A genuine guest write since the re-tile: the guest owns the texels again.
+            std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+            readback_owned_.erase(resource_id);
+            if (const auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
+                it->second.window_dirty = true;
+                it->second.window_checked = false;
+                it->second.view_checked = false;
+                it->second.last_upload_hash = 0;
+            }
+        }
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
         if (copy_destinations_.count(resource_id) != 0) {
             return false;  // a recorded copy defines the texels (note_texture_copy_destination)

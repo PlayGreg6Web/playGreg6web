@@ -2752,14 +2752,18 @@ void CommandList::issue_readbacks() {
         encoder_.patch(r.seq_offset + offsetof(GpuReadbackTexturePayload, dst_addr), &dst, sizeof(dst));
         const compute_readback::Plan plan = r.retile_plan;
         const uint64_t cpu_va = r.retile_cpu_va;
+        Device* const dev = device_.get();
+        const uint32_t tex_id = r.retile_texture_id;
         const uint32_t seq = device_->readbacks().issue_with_completion(
-            0, 0, ReadbackKind::Texture, 0u, [scratch, plan, cpu_va]() {
+            0, 0, ReadbackKind::Texture, 0u, [scratch, plan, cpu_va, dev, tex_id]() {
                 void* host = com::guest_to_host(cpu_va, static_cast<size_t>(plan.surface_bytes));
                 if (host != nullptr &&
                     compute_readback::retile_into_guest(plan, scratch->data(), scratch->size(),
                                                         static_cast<uint8_t*>(host),
                                                         static_cast<size_t>(plan.surface_bytes))) {
                     os::guest_window::mark_written(cpu_va, static_cast<size_t>(plan.surface_bytes));
+                    // Host-originated write: remember its hash so it is not mistaken for a guest write.
+                    dev->note_texture_readback_retiled(tex_id, cpu_va, static_cast<size_t>(plan.surface_bytes));
                     count_work(Work::ComputeTextureRetiled);
                 } else {
                     count_work(Work::ComputeTextureRetileDiscarded);
@@ -2831,8 +2835,9 @@ void CommandList::emit_compute_texture_readbacks() {
         r.retile = true;
         r.retile_plan = plan;
         r.retile_cpu_va = cpu_va;
+        r.retile_texture_id = tt.resource_id;
         readbacks_.push_back(r);
-        device_->note_texture_copy_destination(tt.resource_id);
+        device_->note_texture_readback_pending(tt.resource_id);
         count_work(Work::ComputeTextureReadbacks);
         total += plan.linear_bytes;
         ++emitted;

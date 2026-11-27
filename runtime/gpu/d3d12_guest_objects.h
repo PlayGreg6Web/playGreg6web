@@ -999,6 +999,13 @@ public:
     // texels in API coordinates and defines the contents from then on; the guest memory at the
     // texture's address is no longer uploaded (or de-tiled) over it.
     void note_texture_copy_destination(uint32_t resource_id);
+    // Compute read-back (backlog 8): the texture's guest memory follows the GPU, so uploads stop,
+    // but only while the guest bytes are what our own re-tile wrote. _pending marks the texture
+    // (no upload until the first re-tile lands); _retiled records the surface hash right after the
+    // host write. A later sync that finds different bytes saw a genuine guest CPU write: it drops
+    // the ownership and uploads again.
+    void note_texture_readback_pending(uint32_t resource_id);
+    void note_texture_readback_retiled(uint32_t resource_id, uint64_t cpu_va, size_t bytes);
     // Creates (or returns a cached) WebGPU texture for a GPU VA that has no ID3D12Resource
     // (Xbox Slot-70/71 address views and raw GFX10 T# image descriptors in descriptor memory).
     // Registers TextureInfo in the state bridge and tracks guest memory for detiled WriteTexture
@@ -1283,6 +1290,13 @@ private:
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
     os::guest_window::SlotIndex texture_slot_index_;    // G68: window slot -> resource_id (under tracked_textures_mutex_)
     std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
+    struct ReadbackOwned {
+        bool valid = false;  // a re-tile has landed and `hash` is its surface hash
+        uint64_t va = 0;
+        size_t bytes = 0;
+        uint64_t hash = 0;
+    };
+    std::unordered_map<uint32_t, ReadbackOwned> readback_owned_;  // under tracked_textures_mutex_
     std::unordered_set<uint32_t> conversion_skipped_;  // under tracked_textures_mutex_: reported once
     std::unordered_set<uint32_t> lossy_reported_;      // under tracked_textures_mutex_: DXGI formats
     struct AddressTextureKey {
