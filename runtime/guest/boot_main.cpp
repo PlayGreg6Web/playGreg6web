@@ -619,7 +619,8 @@ public:
                 }
                 std::FILE* f = std::fopen((root_ / path).string().c_str(), "rb");
                 if (f == nullptr) {
-                    if (opened_.size() < 200) {
+                    // Capped on misses (not on successful opens), so late misses still show.
+                    if (missed_++ < 200) {
                         os::log("[harness] file not found in --game-dir: " + rel);
                     }
                     HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
@@ -669,6 +670,7 @@ private:
     std::mutex mutex_;
     std::unordered_map<int32_t, std::FILE*> files_;
     std::vector<std::string> opened_;
+    uint32_t missed_ = 0;
     int32_t next_ = 1;
 };
 

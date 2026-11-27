@@ -571,9 +571,22 @@ Handle create_file_impl_inner(std::string_view raw_path,
     return handle_table().insert(std::move(file));
 }
 
+bool audio_trace_enabled();
+
 Handle create_file_impl(std::string_view raw_path, uint32_t desired_access, uint32_t creation_disposition) {
     const Handle h = create_file_impl_inner(raw_path, desired_access, creation_disposition);
     audio_files::stats().record(raw_path, h != INVALID_HANDLE_VALUE);
+    // PG6_AUDIO_TRACE=1: every open of a path naming audio, with the key it resolved to.
+    if (audio_trace_enabled() && audio_files::path_names_audio(raw_path)) {
+        static std::atomic<uint32_t> lines{0};
+        if (lines.fetch_add(1) < 400) {
+            const uint32_t err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+            std::fprintf(stderr, "audio-trace: CreateFile '%.*s' -> key '%s' access 0x%x disp %u: %s (error %u)\n",
+                         static_cast<int>(raw_path.size()), raw_path.data(), normalize_path(raw_path).c_str(),
+                         desired_access, creation_disposition, h == INVALID_HANDLE_VALUE ? "failed" : "ok", err);
+            if (h == INVALID_HANDLE_VALUE) SetLastError(err);
+        }
+    }
     return h;
 }
 
