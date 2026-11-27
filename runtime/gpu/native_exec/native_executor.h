@@ -263,6 +263,9 @@ struct ExecutorStats {
     uint64_t norm16_twins_created = 0;     // float copies of r16/rg16/rgba16 unorm/snorm textures (float entry meets a norm16 view)
     uint64_t norm16_twin_copies = 0;       // ... refreshes
     uint64_t norm16_twin_binds = 0;        // ... bind-group entries that read a twin (instead of a dummy)
+    uint64_t unfilterable_dummy_not_norm16 = 0;   // ... of the dummies: not a norm16 format (f32 without float32-filterable)
+    uint64_t unfilterable_dummy_view_format = 0;  // ... norm16 view whose format differs from the texture's
+    uint64_t unfilterable_dummy_no_twin = 0;      // ... norm16 but the texture cannot have a twin (msaa, non-2d, promoted 1d, create failed)
     uint64_t bind_group_unfilterable_dummies = 0;  // float layout entry vs an unfilterable-float-only view (norm16, f32 without float32-filterable): dummy bound
     uint64_t bind_group_sample_type_dummies = 0;  // integer view vs float layout entry (or the reverse): dummy bound
     uint64_t buffer_bindings_clamped = 0;  // buffer ranges cut to the device's binding-size rules (fit_buffer_binding)

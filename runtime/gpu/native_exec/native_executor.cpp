@@ -3588,9 +3588,9 @@ struct NativeExecutor::Impl {
     wgpu::Texture norm16_twin(uint32_t id, TextureEntry& t) {
         if (t.norm_twin.tex) return t.norm_twin.tex;
         const uint32_t comps = norm16_components(t.geom.format);
-        if (comps == 0 || t.sample_count != 1 || t.geom.dimension != 1 || t.promoted_1d) return nullptr;
+        if (comps == 0 || t.sample_count != 1 || t.geom.dimension == 0 || t.promoted_1d) return nullptr;
         wgpu::TextureDescriptor td{};
-        td.dimension = wgpu::TextureDimension::e2D;
+        td.dimension = t.geom.dimension == 2 ? wgpu::TextureDimension::e3D : wgpu::TextureDimension::e2D;
         td.size = {t.geom.width, t.geom.height, t.geom.depth_or_layers};
         td.format = norm_twin_format(comps);
         td.mipLevelCount = t.geom.mips;
@@ -3604,11 +3604,20 @@ struct NativeExecutor::Impl {
         return t.norm_twin.tex;
     }
 
-    wgpu::RenderPipeline norm_copy_pipeline_for(uint8_t src_format, uint32_t comps) {
-        const uint32_t key = src_format * 2u + (features.float32_filterable ? 1u : 0u);
+    wgpu::RenderPipeline norm_copy_pipeline_for(uint8_t src_format, uint32_t comps, bool vol) {
+        const uint32_t key = src_format * 4u + (features.float32_filterable ? 1u : 0u) + (vol ? 2u : 0u);
         auto it = norm_copy_pipelines.find(key);
         if (it != norm_copy_pipelines.end()) return it->second;
-        static const char* const kCode =
+        // a volume: the slice rides in the instance index (firstInstance), one pass per depth slice
+        static const char* const kCode3d =
+            "struct VO { @builtin(position) pos: vec4f, @location(0) @interpolate(flat) slice: u32 };\n"
+            "@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) s: u32) -> VO {\n"
+            "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
+            "  var o: VO; o.pos = vec4f(p[i], 0.0, 1.0); o.slice = s; return o;\n}\n"
+            "@group(0) @binding(0) var src: texture_3d<f32>;\n"
+            "@fragment fn fs(v: VO) -> @location(0) vec4f {\n"
+            "  return textureLoad(src, vec3i(vec2i(v.pos.xy), i32(v.slice)), 0);\n}\n";
+        static const char* const kCode2d =
             "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
             "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
             "  return vec4f(p[i], 0.0, 1.0);\n}\n"
@@ -3616,7 +3625,7 @@ struct NativeExecutor::Impl {
             "@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {\n"
             "  return textureLoad(src, vec2i(pos.xy), 0);\n}\n";
         wgpu::ShaderSourceWGSL wgsl{};
-        wgsl.code = kCode;
+        wgsl.code = vol ? kCode3d : kCode2d;
         wgpu::ShaderModuleDescriptor md{};
         md.nextInChain = &wgsl;
         wgpu::ShaderModule mod = device.CreateShaderModule(&md);
@@ -3624,7 +3633,7 @@ struct NativeExecutor::Impl {
         le.binding = 0;
         le.visibility = wgpu::ShaderStage::Fragment;
         le.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
-        le.texture.viewDimension = wgpu::TextureViewDimension::e2D;
+        le.texture.viewDimension = vol ? wgpu::TextureViewDimension::e3D : wgpu::TextureViewDimension::e2D;
         wgpu::BindGroupLayoutDescriptor bgld{};
         bgld.entryCount = 1;
         bgld.entries = &le;
@@ -3658,16 +3667,19 @@ struct NativeExecutor::Impl {
             TextureEntry& t = tit->second;
             if (!t.norm_twin.tex || t.norm_twin.gen == t.depth_gen) continue;
             const uint32_t comps = norm16_components(t.geom.format);
-            wgpu::RenderPipeline pipe = norm_copy_pipeline_for(t.geom.format, comps);
+            wgpu::RenderPipeline pipe = norm_copy_pipeline_for(t.geom.format, comps, t.geom.dimension == 2);
             if (!pipe) continue;
             const wgpu::BindGroupLayout bgl = pipe.GetBindGroupLayout(0);
+            const bool vol = t.geom.dimension == 2;
             for (uint32_t m = 0; m < t.geom.mips; ++m) {
-                for (uint32_t l = 0; l < t.geom.depth_or_layers; ++l) {
+                const uint32_t slices = vol ? std::max(1u, t.geom.depth_or_layers >> m) : t.geom.depth_or_layers;
+                for (uint32_t l = 0; l < slices; ++l) {
                     wgpu::TextureViewDescriptor sv{};
-                    sv.dimension = wgpu::TextureViewDimension::e2D;
+                    sv.dimension = vol ? wgpu::TextureViewDimension::e3D : wgpu::TextureViewDimension::e2D;
                     sv.baseMipLevel = m; sv.mipLevelCount = 1;
-                    sv.baseArrayLayer = l; sv.arrayLayerCount = 1;
+                    if (!vol) { sv.baseArrayLayer = l; sv.arrayLayerCount = 1; }
                     wgpu::TextureViewDescriptor dv = sv;
+                    dv.dimension = vol ? wgpu::TextureViewDimension::e3D : wgpu::TextureViewDimension::e2D;
                     dv.format = norm_twin_format(comps);
                     wgpu::BindGroupEntry be{};
                     be.binding = 0;
@@ -3680,13 +3692,14 @@ struct NativeExecutor::Impl {
                     ca.view = t.norm_twin.tex.CreateView(&dv);
                     ca.loadOp = wgpu::LoadOp::Clear;
                     ca.storeOp = wgpu::StoreOp::Store;
+                    if (vol) ca.depthSlice = l;
                     wgpu::RenderPassDescriptor rp{};
                     rp.colorAttachmentCount = 1;
                     rp.colorAttachments = &ca;
                     wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
                     pass.SetPipeline(pipe);
                     pass.SetBindGroup(0, device.CreateBindGroup(&bd));
-                    pass.Draw(3);
+                    pass.Draw(3, 1, 0, vol ? l : 0);
                     pass.End();
                 }
             }
@@ -5220,6 +5233,15 @@ struct NativeExecutor::Impl {
                         }
                         if (!have) {
                             ++stats.bind_group_unfilterable_dummies;
+                            if (nc == 0) ++stats.unfilterable_dummy_not_norm16;
+                            else if (tex_format != t.geom.format) ++stats.unfilterable_dummy_view_format;
+                            else ++stats.unfilterable_dummy_no_twin;
+                            if (stats.bind_group_unfilterable_dummies <= 40 && std::getenv("PG6_LOG_UNFILTERABLE"))
+                                std::fprintf(stderr, "unfilterable_dummy tex=%u texfmt=%u viewfmt=%u dim=%u vdim=%u mips=%u layers=%u samples=%u promoted1d=%d vmip=%u+%u vlayer=%u+%u\n",
+                                             e.resource_id, (unsigned)t.geom.format, (unsigned)e.view.format, (unsigned)t.geom.dimension,
+                                             (unsigned)e.view.dimension, t.geom.mips, t.geom.depth_or_layers, t.sample_count,
+                                             (int)t.promoted_1d, (unsigned)e.view.base_mip_level, (unsigned)e.view.mip_level_count,
+                                             (unsigned)e.view.base_array_layer, (unsigned)e.view.array_layer_count);
                             use_dummy(*le);
                         }
                     } else if (!kind_mismatch && le && le->kind == 2 && tex_format && format_is_depth(tex_format) &&
@@ -7411,6 +7433,9 @@ std::string NativeExecutor::stats_json() const {
     num("norm16_twins_created", st.norm16_twins_created);
     num("norm16_twin_copies", st.norm16_twin_copies);
     num("norm16_twin_binds", st.norm16_twin_binds);
+    num("unfilterable_dummy_not_norm16", st.unfilterable_dummy_not_norm16);
+    num("unfilterable_dummy_view_format", st.unfilterable_dummy_view_format);
+    num("unfilterable_dummy_no_twin", st.unfilterable_dummy_no_twin);
     num("depth_twins_created", st.depth_twins_created);
     num("depth_int_twins_created", st.depth_int_twins_created);
     num("depth_half_twins_created", st.depth_half_twins_created);

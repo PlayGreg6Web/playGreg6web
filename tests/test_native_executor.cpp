@@ -2233,6 +2233,82 @@ void test_norm16_filtered_read(NativeExecutor& ex) {
     CHECK(ex.read_last_frame(&img, &err) && px_near(img, 1, 1, 191, 128, 64, 255, 2));
 }
 
+// The same for a volume: a 2x2x2 rgba16unorm 3D texture read by texture_3d + linear sampler goes through a
+// 3D float twin (one copy pass per depth slice).
+void test_norm16_volume_filtered_read(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    GpuCreateTexture2Payload ct = texture2(9710, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 36);
+    ct.dimension = 2;
+    ct.depth_or_layers = 2;
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(ct));
+    // slice 0: (0, 0.2, 1, 1)  slice 1: (1, 0.8, 0, 1): the blend at the center is (0.5, 0.5, 0.5, 1)
+    const uint16_t t0[4] = {0, 13107, 65535, 65535}, t1[4] = {65535, 52428, 0, 65535};
+    std::vector<uint8_t> texels(256 * 4, 0);
+    for (int z = 0; z < 2; ++z)
+        for (int y = 0; y < 2; ++y)
+            for (int x = 0; x < 2; ++x) std::memcpy(&texels[(z * 2 + y) * 256 + x * 8], z ? t1 : t0, 8);
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 9710;
+    wt.width = 2;
+    wt.height = 2;
+    wt.depth_or_layers = 2;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 2;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(setup, GpuOpcode::WriteTexture, wtv);
+    GpuCreateSampler2Payload sp;
+    std::memset(&sp, 0, sizeof sp);
+    sp.id = 9711;
+    sp.mag_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+    sp.min_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+    sp.max_anisotropy = 1;
+    sp.lod_max_clamp = 32.0f;
+    emit(setup, GpuOpcode::CreateSampler2, bytes_of(sp));
+    static const char* kVolumeTriangle = R"(
+@group(0) @binding(0) var tex: texture_3d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4f { return textureSample(tex, smp, vec3f(0.5, 0.5, 0.5)); }
+)";
+    setup.create_shader_module(9712, GpuShaderStage::Vertex, kVolumeTriangle);
+    setup.create_shader_module(9713, GpuShaderStage::Fragment, kVolumeTriangle);
+    create_layouts(setup, 9714, 9715,
+                   {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, 0, 6),
+                    layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(9716, 9712, 9713, 9715)));
+    GpuBindGroupEntry2 te = bg_entry(0, GpuBindResourceType::TextureView, 9710);
+    te.view.dimension = 6;
+    create_bind_group(setup, 9717, 9714, {te, bg_entry(1, GpuBindResourceType::Sampler, 9711)});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(9716);
+    set_bind_group2(frame, 0, 9717);
+    frame.draw(3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& after = ex.stats();
+    CHECK(after.device_errors == before.device_errors);
+    CHECK(after.bind_group_unfilterable_dummies == before.bind_group_unfilterable_dummies);
+    CHECK(after.norm16_twin_binds == before.norm16_twin_binds + 1);
+    FrameImage img;
+    std::string err;
+    CHECK(ex.read_last_frame(&img, &err) && px_near(img, 1, 1, 128, 128, 128, 255, 2));
+}
+
 void test_depth_texture_float_layout(NativeExecutor& ex) {
     // A float layout entry with a depth texture bound: the executor binds the entry's dummy instead
     // of letting Dawn reject the bind group; the 'depth' layout entry takes the real view.
@@ -3569,6 +3645,7 @@ int main() {
     test_depth_texture_float_layout(*ex);
     test_depth_read_variants(*ex);
     test_norm16_filtered_read(*ex);
+    test_norm16_volume_filtered_read(*ex);
     test_depth_read_no_float32_filterable();
     test_stencil_twin(*ex);
     test_show_target();
