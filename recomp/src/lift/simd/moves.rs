@@ -150,12 +150,16 @@ impl FunctionLifter<'_> {
             M::Pmovmskb | M::Vpmovmskb => self.move_mask(ins, Elem::I8)?,
             M::Movsldup | M::Vmovsldup | M::Movshdup | M::Vmovshdup => {
                 let v = self.v128(ins, 1, I32)?;
-                let idx = if matches!(ins.mnemonic(), M::Movsldup | M::Vmovsldup) {
-                    [0, 0, 2, 2]
+                let r = if v == "zeroinitializer" {
+                    v
                 } else {
-                    [1, 1, 3, 3]
+                    let idx = if matches!(ins.mnemonic(), M::Movsldup | M::Vmovsldup) {
+                        [0, 0, 2, 2]
+                    } else {
+                        [1, 1, 3, 3]
+                    };
+                    self.shuffle(&v, "poison", I32, &idx)
                 };
-                let r = self.shuffle(&v, "poison", I32, &idx);
                 self.xset(ins.op_register(0), &r, I32)?;
             }
             M::Movddup | M::Vmovddup => {
@@ -166,7 +170,11 @@ impl FunctionLifter<'_> {
                     self.splat_value(&s, I64)
                 } else {
                     let v = self.v128(ins, 1, I64)?;
-                    self.shuffle(&v, "poison", I64, &[0, 0])
+                    if v == "zeroinitializer" {
+                        v
+                    } else {
+                        self.shuffle(&v, "poison", I64, &[0, 0])
+                    }
                 };
                 self.xset(ins.op_register(0), &r, I64)?;
             }
@@ -185,7 +193,7 @@ impl FunctionLifter<'_> {
                         let i = self.lane_imm(i, 2);
                         (0..2).map(|l| (i >> l) & 1).collect()
                     };
-                    if is_identity_mask(&idx) {
+                    if v == "zeroinitializer" || is_identity_mask(&idx) {
                         v
                     } else {
                         self.shuffle(&v, "poison", e, &idx)
@@ -194,7 +202,9 @@ impl FunctionLifter<'_> {
                     // Variable control: bits 1:0 (ps) -> `i8x16.swizzle`; bit 1 (pd) -> vector
                     // select between splatted lanes (zero stack spills).
                     let ctl = self.v128(ins, 2, e)?;
-                    if e == I32 {
+                    if v == "zeroinitializer" {
+                        v
+                    } else if e == I32 {
                         let idx = self.dword_swizzle_indices(&ctl, 3);
                         let vb = self.cast(&v, Ty::v(I32), Ty::v(Elem::I8));
                         let rb = self.intr(Intr::Swizzle, Ty::v(Elem::I8), &[&vb, &idx]);
@@ -308,13 +318,14 @@ impl FunctionLifter<'_> {
 
     /// `dst = shufflevector(a, b, idx)` with the operand layout `f`.
     /// Recognises identical register operands (`poison` unary shuffle), single-source masks
-    /// (such as trivial `blend` masks 0 / all-ones), and identity permutations (direct move).
+    /// (such as trivial `blend` masks 0 / all-ones), identity permutations (direct move), and
+    /// known-zero vector sources.
     pub(super) fn shuffle_op(&mut self, ins: &Instruction, f: Form, e: Elem, idx: &[u32]) -> R<()> {
         let n = e.lanes();
         if same_reg(ins, f.a, f.b) {
             let a = self.v128(ins, f.a, e)?;
             let mapped: Vec<u32> = idx.iter().map(|&k| k % n).collect();
-            let r = if is_identity_mask(&mapped) {
+            let r = if a == "zeroinitializer" || is_identity_mask(&mapped) {
                 a
             } else {
                 self.shuffle(&a, "poison", e, &mapped)
@@ -328,7 +339,7 @@ impl FunctionLifter<'_> {
             if ins.op_kind(f.b) == OpKind::Memory {
                 let _ = self.v128(ins, f.b, e)?;
             }
-            if is_identity_mask(idx) {
+            if a == "zeroinitializer" || is_identity_mask(idx) {
                 a
             } else {
                 self.shuffle(&a, "poison", e, idx)
@@ -339,7 +350,7 @@ impl FunctionLifter<'_> {
             }
             let b = self.v128(ins, f.b, e)?;
             let mapped: Vec<u32> = idx.iter().map(|&k| k - n).collect();
-            if is_identity_mask(&mapped) {
+            if b == "zeroinitializer" || is_identity_mask(&mapped) {
                 b
             } else {
                 self.shuffle(&b, "poison", e, &mapped)
@@ -347,7 +358,11 @@ impl FunctionLifter<'_> {
         } else {
             let a = self.v128(ins, f.a, e)?;
             let b = self.v128(ins, f.b, e)?;
-            self.shuffle(&a, &b, e, idx)
+            if a == "zeroinitializer" && b == "zeroinitializer" {
+                "zeroinitializer".to_string()
+            } else {
+                self.shuffle(&a, &b, e, idx)
+            }
         };
         self.xset(ins.op_register(f.dst), &r, e)
     }
@@ -388,8 +403,15 @@ impl FunctionLifter<'_> {
         if ins.op_count() == 3 {
             // vmovss xmm1, xmm2, xmm3
             let a = self.xget(ins.op_register(1), e)?;
+            if same_reg(ins, 1, 2) {
+                return self.xset(ins.op_register(0), &a, e);
+            }
             let b = self.xget(ins.op_register(2), e)?;
-            let r = self.shuffle(&a, &b, e, merge_idx);
+            let r = if a == "zeroinitializer" && b == "zeroinitializer" {
+                "zeroinitializer".to_string()
+            } else {
+                self.shuffle(&a, &b, e, merge_idx)
+            };
             return self.xset(ins.op_register(0), &r, e);
         }
         match (ins.op_kind(0), ins.op_kind(1)) {
@@ -405,8 +427,15 @@ impl FunctionLifter<'_> {
             }
             (OpKind::Register, OpKind::Register) => {
                 let a = self.xget(ins.op_register(0), e)?;
+                if same_reg(ins, 0, 1) {
+                    return self.xset(ins.op_register(0), &a, e);
+                }
                 let b = self.xget(ins.op_register(1), e)?;
-                let r = self.shuffle(&a, &b, e, merge_idx);
+                let r = if a == "zeroinitializer" && b == "zeroinitializer" {
+                    "zeroinitializer".to_string()
+                } else {
+                    self.shuffle(&a, &b, e, merge_idx)
+                };
                 self.xset(ins.op_register(0), &r, e)
             }
             _ => unsupported("movss/movsd operand form"),
@@ -420,24 +449,33 @@ impl FunctionLifter<'_> {
         if dst_is_xmm {
             if ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_xmm() {
                 let x = self.xget(ins.op_register(1), Elem::I64)?;
-                let r = self.shuffle(&x, "zeroinitializer", Elem::I64, &[0, 2]);
+                let r = if x == "zeroinitializer" {
+                    x
+                } else {
+                    self.shuffle(&x, "zeroinitializer", Elem::I64, &[0, 2])
+                };
                 return self.xset(ins.op_register(0), &r, Elem::I64);
             }
             let v = self.read_op(ins, 1, bits)?;
-            let v = if bits == 32 {
-                self.val(&format!("zext i32 {v} to i64"))
-            } else {
-                v
-            };
-            let r = self.zext_lanes(&v, Elem::I64, 1);
-            return self.xset(ins.op_register(0), &r, Elem::I64);
+            if v == "0" {
+                return self.xset(ins.op_register(0), "zeroinitializer", Elem::I64);
+            }
+            // Insert directly at the operand's lane width (`<4 x i32>` for `movd`, `<2 x i64>` for
+            // `movq`) to skip `zext i32 to i64` and enable native `v128.load32_zero` / `vmovd`.
+            let elem = Elem::of_bits(bits);
+            let r = self.zext_lanes(&v, elem, 1);
+            return self.xset(ins.op_register(0), &r, elem);
         }
         if !(ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_xmm()) {
             return unsupported("movd/movq operand form");
         }
         let e = Elem::of_bits(bits);
         let x = self.xget(ins.op_register(1), e)?;
-        let s = self.extract(&x, e, 0);
+        let s = if x == "zeroinitializer" {
+            "0".to_string()
+        } else {
+            self.extract(&x, e, 0)
+        };
         match ins.op_kind(0) {
             OpKind::Memory => self.mem_store(ins, &s, Ty::s(e)),
             _ => self.write_op(ins, 0, &s, bits),
@@ -464,8 +502,11 @@ impl FunctionLifter<'_> {
     /// Emits native Wasm SIMD128 `i{8x16,32x4,64x2}.bitmask` (1 op, 2 bytes vs 22 bytes).
     fn move_mask(&mut self, ins: &Instruction, e: Elem) -> R<()> {
         let v = self.xget(ins.op_register(1), e)?;
-        let bits = self.intr(Intr::Bitmask, Ty::v(e), &[&v]);
         let dst_bits = self.op_bits(ins, 0)?;
+        if v == "zeroinitializer" {
+            return self.write_op(ins, 0, "0", dst_bits);
+        }
+        let bits = self.intr(Intr::Bitmask, Ty::v(e), &[&v]);
         let r = if dst_bits > 32 {
             self.val(&format!("zext i32 {bits} to i{dst_bits}"))
         } else {
@@ -506,6 +547,12 @@ impl FunctionLifter<'_> {
         let a = self.v128(ins, f.a, e)?;
         let b = self.v128(ins, f.b, e)?;
         let m = self.xget(mask_reg, e)?;
+        if m == "zeroinitializer" {
+            return self.xset(ins.op_register(f.dst), &a, e);
+        }
+        if a == "zeroinitializer" && b == "zeroinitializer" {
+            return self.xset(ins.op_register(f.dst), "zeroinitializer", e);
+        }
         let shift = ty.splat(&(e.bits() - 1).to_string());
         let mask = self.val(&format!("ashr {t} {m}, {shift}"));
         let r = self.intr(Intr::Bitselect, ty, &[&b, &a, &mask]);

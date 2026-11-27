@@ -427,6 +427,15 @@ impl FunctionLifter<'_> {
                 // byte indices in 16..31 zero `dlo` (and `idx ^ 16` in 0..15 hits `dhi`).
                 let dlo = self.v_half(ins, 2, 0, I8)?;
                 let dhi = self.v_half(ins, 2, 1, I8)?;
+                if dlo == "zeroinitializer" && dhi == "zeroinitializer" {
+                    self.set_halves(
+                        ins.op_register(0),
+                        "zeroinitializer",
+                        Some("zeroinitializer"),
+                        I8,
+                    )?;
+                    return Ok(true);
+                }
                 let xor16 = Ty::v(I8).splat("16");
                 let mut out = Vec::with_capacity(2);
                 for half in 0..2 {
@@ -482,6 +491,15 @@ impl FunctionLifter<'_> {
                 let src = if m == M::Vcvtps2pd { F32 } else { I32 };
                 let op = if m == M::Vcvtps2pd { "fpext" } else { "sitofp" };
                 let v = self.v_half(ins, 1, 0, src)?;
+                if v == "zeroinitializer" {
+                    self.set_halves(
+                        ins.op_register(0),
+                        "zeroinitializer",
+                        Some("zeroinitializer"),
+                        F64,
+                    )?;
+                    return Ok(true);
+                }
                 let st = Ty::v(src).ir();
                 let ht = Ty::vn(src, 2).ir();
                 // Split into two native `<2 x src> -> <2 x double>` halves so LLVM emits
@@ -499,6 +517,10 @@ impl FunctionLifter<'_> {
             M::Vcvtpd2ps if wide => {
                 let lo = self.v_half(ins, 1, 0, F64)?;
                 let hi = self.v_half(ins, 1, 1, F64)?;
+                if lo == "zeroinitializer" && hi == "zeroinitializer" {
+                    self.xset_half(ins.op_register(0), 0, "zeroinitializer", I64)?;
+                    return Ok(true);
+                }
                 // Demote each `<2 x double>` half via `zext_lanes` and combine through `<2 x i64>`
                 // so LLVM keeps each half as `f32x4.demote_f64x2_zero` + one `i64x2.shuffle`.
                 let rlo = self.val(&format!("fptrunc <2 x double> {lo} to <2 x float>"));
@@ -630,11 +652,15 @@ impl FunctionLifter<'_> {
         let v = match ins.op_kind(1) {
             OpKind::Register => {
                 let src = self.xget_half(ins.op_register(1), 0, e)?;
-                let t = Ty::v(e).ir();
-                self.val(&format!(
-                    "shufflevector {t} {src}, {t} poison, <{} x i32> zeroinitializer",
-                    e.lanes()
-                ))
+                if src == "zeroinitializer" {
+                    src
+                } else {
+                    let t = Ty::v(e).ir();
+                    self.val(&format!(
+                        "shufflevector {t} {src}, {t} poison, <{} x i32> zeroinitializer",
+                        e.lanes()
+                    ))
+                }
             }
             _ => {
                 let s = self.mem_load_at(ins, Ty::s(e), 0, (e.bits() / 8) as usize)?;
@@ -827,6 +853,9 @@ impl FunctionLifter<'_> {
             let v = match ins.op_kind(1) {
                 OpKind::Register => {
                     let x = self.xget_half(ins.op_register(1), 0, from)?;
+                    if x == "zeroinitializer" {
+                        return self.xset_half(dst, 0, "zeroinitializer", to);
+                    }
                     self.take_low(&x, from, n)
                 }
                 _ => self.mem_load_at(ins, Ty::vn(from, n), 0, (n * from.bits() / 8) as usize)?,
@@ -844,6 +873,9 @@ impl FunctionLifter<'_> {
         let mut cur = match ins.op_kind(1) {
             OpKind::Register => {
                 let x = self.xget_half(ins.op_register(1), 0, from)?;
+                if x == "zeroinitializer" {
+                    return self.set_halves(dst, "zeroinitializer", Some("zeroinitializer"), to);
+                }
                 self.take_low(&x, from, n)
             }
             _ => self.mem_load_at(ins, Ty::vn(from, n), 0, (n * from.bits() / 8) as usize)?,

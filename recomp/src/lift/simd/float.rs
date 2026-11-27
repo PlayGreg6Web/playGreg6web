@@ -289,7 +289,11 @@ impl FunctionLifter<'_> {
             M::Cvttsd2si | M::Vcvttsd2si => self.cvt_scalar_to_int(ins, F64, true)?,
             M::Cvtdq2ps | M::Vcvtdq2ps => {
                 let v = self.v128(ins, 1, I32)?;
-                let r = self.val(&format!("sitofp <4 x i32> {v} to <4 x float>"));
+                let r = if v == "zeroinitializer" {
+                    "zeroinitializer".to_string()
+                } else {
+                    self.val(&format!("sitofp <4 x i32> {v} to <4 x float>"))
+                };
                 self.xset(ins.op_register(0), &r, F32)?;
             }
             M::Cvtps2dq | M::Vcvtps2dq | M::Cvttps2dq | M::Vcvttps2dq => {
@@ -300,7 +304,11 @@ impl FunctionLifter<'_> {
             }
             M::Cvtdq2pd | M::Vcvtdq2pd => {
                 let v = self.low(ins, 1, I32, 2)?;
-                let r = self.val(&format!("sitofp <2 x i32> {v} to <2 x double>"));
+                let r = if v == "zeroinitializer" {
+                    "zeroinitializer".to_string()
+                } else {
+                    self.val(&format!("sitofp <2 x i32> {v} to <2 x double>"))
+                };
                 self.xset(ins.op_register(0), &r, F64)?;
             }
             M::Cvtpd2dq | M::Vcvtpd2dq | M::Cvttpd2dq | M::Vcvttpd2dq => {
@@ -380,6 +388,12 @@ impl FunctionLifter<'_> {
 
     fn arith(&mut self, ins: &Instruction, f: Form, op: FOp, e: Elem, scalar: bool) -> R<()> {
         let unary = matches!(op, FOp::Sqrt | FOp::Rcp | FOp::Rsqrt);
+        // x86 `min(a, a) === a` and `max(a, a) === a` for EVERY bit pattern (normals, +-0.0, inf,
+        // and all NaNs) because `a < a` / `a > a` is always false, selecting the second operand `a`.
+        if matches!(op, FOp::Min | FOp::Max) && same_reg(ins, f.a, f.b) {
+            let a = self.v128(ins, f.a, e)?;
+            return self.xset(ins.op_register(f.dst), &a, e);
+        }
         if scalar {
             // Lane 0 from (a op b) or op(b); lanes 1.. from a.
             let a = self.v128(ins, f.a, e)?;
@@ -472,16 +486,36 @@ impl FunctionLifter<'_> {
 
     /// Bitwise logic on 128 bits (`andn` complements the first source).
     pub(super) fn logic(&mut self, ins: &Instruction, f: Form, op: &str, not_a: bool) -> R<()> {
-        if ((op == "xor" && !not_a) || (op == "and" && not_a))
-            && ins.op_kind(f.a) == OpKind::Register
-            && ins.op_kind(f.b) == OpKind::Register
-            && ins.op_register(f.a) == ins.op_register(f.b)
-        {
-            return self.xset(ins.op_register(f.dst), "zeroinitializer", Elem::I64);
+        if same_reg(ins, f.a, f.b) {
+            if (op == "xor" && !not_a) || (op == "and" && not_a) {
+                return self.xset(ins.op_register(f.dst), "zeroinitializer", Elem::I64);
+            }
+            let a = self.v128(ins, f.a, Elem::I64)?;
+            return self.xset(ins.op_register(f.dst), &a, Elem::I64);
         }
         let t = Ty::v(Elem::I64).ir();
         let mut a = self.v128(ins, f.a, Elem::I64)?;
         let b = self.v128(ins, f.b, Elem::I64)?;
+        if a == "zeroinitializer" || b == "zeroinitializer" {
+            let r = match (op, not_a) {
+                ("and", false) => "zeroinitializer".to_string(),
+                ("and", true) => {
+                    if b == "zeroinitializer" {
+                        "zeroinitializer".to_string()
+                    } else {
+                        b
+                    }
+                }
+                _ => {
+                    if a == "zeroinitializer" {
+                        b
+                    } else {
+                        a
+                    }
+                }
+            };
+            return self.xset(ins.op_register(f.dst), &r, Elem::I64);
+        }
         if not_a {
             a = self.val(&format!("xor {t} {a}, <i64 -1, i64 -1>"));
         }
@@ -495,19 +529,48 @@ impl FunctionLifter<'_> {
         // Legacy SSE encodings use imm8[2:0]; VEX uses imm8[4:0].
         let pred = predicate(if vex { i & 0x1F } else { i & 7 });
         let ie = e.int();
+        let same = same_reg(ins, f.a, f.b);
+        let const_result = match pred {
+            "false" => Some(false),
+            "true" => Some(true),
+            "olt" | "ogt" | "one" if same => Some(false),
+            "ueq" | "uge" | "ule" if same => Some(true),
+            _ => None,
+        };
         if scalar {
             let a = self.v128(ins, f.a, e)?;
             let b = self.low(ins, f.b, e, 1)?;
-            let a0 = self.extract(&a, e, 0);
-            let c = self.val(&format!("fcmp {pred} {} {a0}, {b}", e.scalar()));
-            let m = self.val(&format!("sext i1 {c} to {}", ie.scalar()));
+            let m = match const_result {
+                Some(false) => "0".to_string(),
+                Some(true) => "-1".to_string(),
+                None => {
+                    let a0 = self.extract(&a, e, 0);
+                    let c = self.val(&format!("fcmp {pred} {} {a0}, {b}", e.scalar()));
+                    self.val(&format!("sext i1 {c} to {}", ie.scalar()))
+                }
+            };
             let ai = self.cast(&a, Ty::v(e), Ty::v(ie));
             let r = self.insert(&ai, ie, &m, 0);
             self.xset(ins.op_register(f.dst), &r, ie)
         } else {
             let ty = Ty::v(e);
+            if let Some(res) = const_result {
+                if ins.op_kind(f.b) == OpKind::Memory {
+                    let _ = self.v128(ins, f.b, e)?;
+                }
+                let m = if res {
+                    ty.int().splat("-1")
+                } else {
+                    "zeroinitializer".to_string()
+                };
+                return self.xset(ins.op_register(f.dst), &m, ie);
+            }
             let a = self.v128(ins, f.a, e)?;
-            let b = self.v128(ins, f.b, e)?;
+            let b = if same {
+                a.clone()
+            } else {
+                self.v128(ins, f.b, e)?
+            };
             let c = self.val(&format!("fcmp {pred} {} {a}, {b}", ty.ir()));
             let m = self.val(&format!("sext {} {c} to {}", ty.bool_ir(), ty.int().ir()));
             self.xset(ins.op_register(f.dst), &m, ie)

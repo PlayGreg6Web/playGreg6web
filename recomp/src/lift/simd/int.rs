@@ -275,7 +275,7 @@ impl FunctionLifter<'_> {
                 }
                 let src = if ins.op_count() == 3 { 1 } else { 0 };
                 let v = self.v128(ins, src, I8)?;
-                let r = if i == 0 {
+                let r = if i == 0 || v == "zeroinitializer" {
                     v
                 } else {
                     let left = matches!(m, M::Pslldq | M::Vpslldq);
@@ -299,7 +299,7 @@ impl FunctionLifter<'_> {
                 let i = Self::imm8(ins)?;
                 let v = self.v128(ins, 1, I32)?;
                 let idx: [u32; 4] = std::array::from_fn(|l| (i >> (2 * l)) & 3);
-                let r = if is_identity_mask(&idx) {
+                let r = if v == "zeroinitializer" || is_identity_mask(&idx) {
                     v
                 } else {
                     self.shuffle(&v, "poison", I32, &idx)
@@ -318,7 +318,7 @@ impl FunctionLifter<'_> {
                         _ => l,
                     }
                 });
-                let r = if is_identity_mask(&idx) {
+                let r = if v == "zeroinitializer" || is_identity_mask(&idx) {
                     v
                 } else {
                     self.shuffle(&v, "poison", I16, &idx)
@@ -328,6 +328,10 @@ impl FunctionLifter<'_> {
             M::Pshufb | M::Vpshufb => {
                 let a = self.v128(ins, f.a, I8)?;
                 let b = self.v128(ins, f.b, I8)?;
+                if a == "zeroinitializer" {
+                    self.xset(ins.op_register(f.dst), "zeroinitializer", I8)?;
+                    return Ok(true);
+                }
                 // Bit 7 set selects zero: keep it so the index is >= 16 (swizzle yields 0).
                 let idx = self.val(&format!("and <16 x i8> {b}, {}", Ty::v(I8).splat("-113")));
                 let r = self.intr(Intr::Swizzle, Ty::v(I8), &[&a, &idx]);
@@ -363,7 +367,11 @@ impl FunctionLifter<'_> {
             M::Pmaddwd | M::Vpmaddwd => {
                 let a = self.v128(ins, f.a, I16)?;
                 let b = self.v128(ins, f.b, I16)?;
-                let r = self.intr(Intr::WasmDot, Ty::v(I16), &[&a, &b]);
+                let r = if a == "zeroinitializer" || b == "zeroinitializer" {
+                    "zeroinitializer".to_string()
+                } else {
+                    self.intr(Intr::WasmDot, Ty::v(I16), &[&a, &b])
+                };
                 self.xset(ins.op_register(f.dst), &r, I32)?;
             }
             M::Pmaddubsw | M::Vpmaddubsw => {
@@ -371,17 +379,21 @@ impl FunctionLifter<'_> {
                 // to avoid cross-vector shuffles and wide `<16 x i16>` multiplies.
                 let a = self.v128(ins, f.a, I16)?;
                 let b = self.v128(ins, f.b, I16)?;
-                let ty = Ty::v(I16);
-                let c8 = ty.splat("8");
-                let ae = self.val(&format!("and <8 x i16> {a}, {}", ty.splat("255")));
-                let ao = self.val(&format!("lshr <8 x i16> {a}, {c8}"));
-                let be_s = self.val(&format!("shl <8 x i16> {b}, {c8}"));
-                let be = self.val(&format!("ashr <8 x i16> {be_s}, {c8}"));
-                let bo = self.val(&format!("ashr <8 x i16> {b}, {c8}"));
-                // Each u8 * i8 product fits in signed i16; the pair sum saturates.
-                let pe = self.val(&format!("mul <8 x i16> {ae}, {be}"));
-                let po = self.val(&format!("mul <8 x i16> {ao}, {bo}"));
-                let r = self.intr(Intr::SAddSat, ty, &[&pe, &po]);
+                let r = if a == "zeroinitializer" || b == "zeroinitializer" {
+                    "zeroinitializer".to_string()
+                } else {
+                    let ty = Ty::v(I16);
+                    let c8 = ty.splat("8");
+                    let ae = self.val(&format!("and <8 x i16> {a}, {}", ty.splat("255")));
+                    let ao = self.val(&format!("lshr <8 x i16> {a}, {c8}"));
+                    let be_s = self.val(&format!("shl <8 x i16> {b}, {c8}"));
+                    let be = self.val(&format!("ashr <8 x i16> {be_s}, {c8}"));
+                    let bo = self.val(&format!("ashr <8 x i16> {b}, {c8}"));
+                    // Each u8 * i8 product fits in signed i16; the pair sum saturates.
+                    let pe = self.val(&format!("mul <8 x i16> {ae}, {be}"));
+                    let po = self.val(&format!("mul <8 x i16> {ao}, {bo}"));
+                    self.intr(Intr::SAddSat, ty, &[&pe, &po])
+                };
                 self.xset(ins.op_register(f.dst), &r, I16)?;
             }
             M::Psadbw | M::Vpsadbw => {
@@ -394,6 +406,10 @@ impl FunctionLifter<'_> {
                 // and final 64-bit lane fold (drops 6 vector ops + 2 18-byte constants vs bitmask).
                 let a = self.v128(ins, f.a, I8)?;
                 let b = self.v128(ins, f.b, I8)?;
+                if a == "zeroinitializer" && b == "zeroinitializer" {
+                    self.xset(ins.op_register(f.dst), "zeroinitializer", I64)?;
+                    return Ok(true);
+                }
                 let hi = self.intr(Intr::UMax, Ty::v(I8), &[&a, &b]);
                 let lo = self.intr(Intr::UMin, Ty::v(I8), &[&a, &b]);
                 let d = self.val(&format!("sub <16 x i8> {hi}, {lo}"));
@@ -414,19 +430,23 @@ impl FunctionLifter<'_> {
                 let hi = self.v128(ins, f.a, I8)?;
                 let lo = self.v128(ins, f.b, I8)?;
                 // (hi:lo) >> 8*imm: byte k is lo[k+i] (< 16), hi[k+i-16] (< 32), else 0.
-                let r = match i {
-                    0 => lo,
-                    1..=15 => {
-                        let idx: Vec<u32> = (0..16).map(|k| k + i).collect();
-                        self.shuffle(&lo, &hi, I8, &idx)
+                let r = if hi == "zeroinitializer" && lo == "zeroinitializer" {
+                    "zeroinitializer".to_string()
+                } else {
+                    match i {
+                        0 => lo,
+                        1..=15 => {
+                            let idx: Vec<u32> = (0..16).map(|k| k + i).collect();
+                            self.shuffle(&lo, &hi, I8, &idx)
+                        }
+                        16 => hi,
+                        17..=31 => {
+                            let shift = i - 16;
+                            let idx: Vec<u32> = (0..16).map(|k| (k + shift).min(16)).collect();
+                            self.shuffle(&hi, "zeroinitializer", I8, &idx)
+                        }
+                        _ => "zeroinitializer".to_string(),
                     }
-                    16 => hi,
-                    17..=31 => {
-                        let shift = i - 16;
-                        let idx: Vec<u32> = (0..16).map(|k| (k + shift).min(16)).collect();
-                        self.shuffle(&hi, "zeroinitializer", I8, &idx)
-                    }
-                    _ => "zeroinitializer".to_string(),
                 };
                 self.xset(ins.op_register(f.dst), &r, I8)?;
             }
@@ -479,6 +499,17 @@ impl FunctionLifter<'_> {
                     let a = self.v128(ins, f.a, e)?;
                     return self.xset(ins.op_register(f.dst), &a, e);
                 }
+                IOp::Sign => {
+                    // `psign*(a, a)` negates negative lanes, keeps positive lanes, and preserves 0
+                    // (and `-INT_MIN == INT_MIN`), which is bit-exact with `@llvm.abs(..., false)`.
+                    let a = self.v128(ins, f.a, e)?;
+                    let r = if a == "zeroinitializer" {
+                        a
+                    } else {
+                        self.intr(Intr::Abs, ty, &[&a])
+                    };
+                    return self.xset(ins.op_register(f.dst), &r, e);
+                }
                 _ => {}
             }
         }
@@ -487,6 +518,14 @@ impl FunctionLifter<'_> {
             // emits native `i64x2.extmul_low_i32x4_{u,s}` on `<4 x i32>` chains and memory loads.
             let a32 = self.v128(ins, f.a, Elem::I32)?;
             let same = same_reg(ins, f.a, f.b);
+            let b32 = if same {
+                a32.clone()
+            } else {
+                self.v128(ins, f.b, Elem::I32)?
+            };
+            if a32 == "zeroinitializer" || b32 == "zeroinitializer" {
+                return self.xset(ins.op_register(f.dst), "zeroinitializer", Elem::I64);
+            }
             let even = super::mask(&[0, 2]);
             let ae = self.val(&format!(
                 "shufflevector <4 x i32> {a32}, <4 x i32> poison, {even}"
@@ -500,7 +539,6 @@ impl FunctionLifter<'_> {
             let wb = if same {
                 wa.clone()
             } else {
-                let b32 = self.v128(ins, f.b, Elem::I32)?;
                 let be = self.val(&format!(
                     "shufflevector <4 x i32> {b32}, <4 x i32> poison, {even}"
                 ));
@@ -517,6 +555,30 @@ impl FunctionLifter<'_> {
         } else {
             self.v128(ins, f.b, e)?
         };
+        let a_zero = a == "zeroinitializer";
+        let b_zero = b == "zeroinitializer";
+        if a_zero || b_zero {
+            let folded = match op {
+                IOp::Add | IOp::AddSatS | IOp::AddSatU | IOp::MaxU => {
+                    Some(if a_zero { b.clone() } else { a.clone() })
+                }
+                IOp::Sub | IOp::SubSatS if b_zero => Some(a.clone()),
+                IOp::SubSatU => Some(if a_zero {
+                    "zeroinitializer".to_string()
+                } else {
+                    a.clone()
+                }),
+                IOp::Mul | IOp::MulHiS | IOp::MulHiU | IOp::MulHrs | IOp::MinU | IOp::Sign => {
+                    Some("zeroinitializer".to_string())
+                }
+                IOp::CmpEq if a_zero && b_zero => Some(ty.splat("-1")),
+                IOp::CmpGt if a_zero && b_zero => Some("zeroinitializer".to_string()),
+                _ => None,
+            };
+            if let Some(r) = folded {
+                return self.xset(ins.op_register(f.dst), &r, e);
+            }
+        }
         let r = match op {
             IOp::Add => self.val(&format!("add {t} {a}, {b}")),
             IOp::Sub => self.val(&format!("sub {t} {a}, {b}")),
@@ -550,6 +612,7 @@ impl FunctionLifter<'_> {
                 } else {
                     ("sext", "nsw")
                 };
+                let same = same_reg(ins, f.a, f.b);
                 let lo_mask = super::mask(&[0, 1, 2, 3]);
                 let hi_mask = super::mask(&[4, 5, 6, 7]);
                 let mut halves = Vec::with_capacity(2);
@@ -557,11 +620,15 @@ impl FunctionLifter<'_> {
                     let ah = self.val(&format!(
                         "shufflevector <8 x i16> {a}, <8 x i16> poison, {half_mask}"
                     ));
-                    let bh = self.val(&format!(
-                        "shufflevector <8 x i16> {b}, <8 x i16> poison, {half_mask}"
-                    ));
                     let wa = self.val(&format!("{ext} <4 x i16> {ah} to <4 x i32>"));
-                    let wb = self.val(&format!("{ext} <4 x i16> {bh} to <4 x i32>"));
+                    let wb = if same {
+                        wa.clone()
+                    } else {
+                        let bh = self.val(&format!(
+                            "shufflevector <8 x i16> {b}, <8 x i16> poison, {half_mask}"
+                        ));
+                        self.val(&format!("{ext} <4 x i16> {bh} to <4 x i32>"))
+                    };
                     let p = self.val(&format!("mul {mflag} <4 x i32> {wa}, {wb}"));
                     halves.push(self.cast(&p, Ty::v(Elem::I32), Ty::v(Elem::I16)));
                 }
@@ -625,7 +692,7 @@ impl FunctionLifter<'_> {
                 return self.xset(ins.op_register(0), "zeroinitializer", e);
             }
             let v = self.v128(ins, src, e)?;
-            let r = if c == 0 {
+            let r = if c == 0 || v == "zeroinitializer" {
                 v
             } else if c >= width {
                 self.val(&format!(
@@ -646,12 +713,19 @@ impl FunctionLifter<'_> {
             OpKind::Register => {
                 // The count is always the low quadword of an XMM register, also for YMM data.
                 let v = self.xget_half(ins.op_register(f.b), 0, Elem::I64)?;
-                self.extract(&v, Elem::I64, 0)
+                if v == "zeroinitializer" {
+                    "0".to_string()
+                } else {
+                    self.extract(&v, Elem::I64, 0)
+                }
             }
             OpKind::Memory => self.mem_load_at(ins, Ty::s(Elem::I64), 0, 16)?,
             k => return unsupported(format!("shift count operand {k:?}")),
         };
         let v = self.v128(ins, f.a, e)?;
+        if v == "zeroinitializer" || count == "0" {
+            return self.xset(ins.op_register(0), &v, e);
+        }
         let big = self.val(&format!("icmp ugt i64 {count}, {}", width - 1));
         let r = match kind {
             ShiftKind::Arith => {
@@ -694,6 +768,9 @@ impl FunctionLifter<'_> {
         let bt = ty.bool_ir();
         let v = self.v128(ins, f.a, e)?;
         let c = self.v128(ins, f.b, e)?;
+        if v == "zeroinitializer" || c == "zeroinitializer" {
+            return self.xset(ins.op_register(f.dst), &v, e);
+        }
         let max = ty.splat(&(e.bits() - 1).to_string());
         let big = self.val(&format!("icmp ugt {t} {c}, {max}"));
         let r = match kind {
@@ -702,7 +779,10 @@ impl FunctionLifter<'_> {
                 self.val(&format!("ashr {t} {v}, {n}"))
             }
             _ => {
-                let n = self.val(&format!("select {bt} {big}, {t} zeroinitializer, {t} {c}"));
+                // Masking count with `width - 1` keeps the shift poison-free while reusing `max`
+                // and avoiding a vector `select` before the shift; out-of-range lanes are zeroed
+                // by the final `select`.
+                let n = self.val(&format!("and {t} {c}, {max}"));
                 let op = if kind == ShiftKind::Left {
                     "shl"
                 } else {
@@ -734,19 +814,26 @@ impl FunctionLifter<'_> {
     fn pack(&mut self, ins: &Instruction, f: Form, e: Elem, signed: bool) -> R<()> {
         let a = self.v128(ins, f.a, e)?;
         let b = self.v128(ins, f.b, e)?;
+        let ne = Elem::of_bits(e.bits() / 2);
+        if a == "zeroinitializer" && b == "zeroinitializer" {
+            return self.xset(ins.op_register(f.dst), "zeroinitializer", ne);
+        }
         let intr = if signed {
             Intr::NarrowSigned
         } else {
             Intr::NarrowUnsigned
         };
         let r = self.intr(intr, Ty::v(e), &[&a, &b]);
-        let ne = Elem::of_bits(e.bits() / 2);
         self.xset(ins.op_register(f.dst), &r, ne)
     }
 
     fn abs(&mut self, ins: &Instruction, e: Elem) -> R<()> {
         let v = self.v128(ins, 1, e)?;
-        let r = self.intr(Intr::Abs, Ty::v(e), &[&v]);
+        let r = if v == "zeroinitializer" {
+            v
+        } else {
+            self.intr(Intr::Abs, Ty::v(e), &[&v])
+        };
         self.xset(ins.op_register(0), &r, e)
     }
 
@@ -762,6 +849,9 @@ impl FunctionLifter<'_> {
         let a = self.v128(ins, f.a, e)?;
         let n = e.lanes();
         let (lo, hi) = if same_reg(ins, f.a, f.b) {
+            if a == "zeroinitializer" {
+                return self.xset(ins.op_register(f.dst), "zeroinitializer", e);
+            }
             let even: Vec<u32> = (0..n).map(|l| (2 * l) % n).collect();
             let odd: Vec<u32> = (0..n).map(|l| (2 * l + 1) % n).collect();
             (
@@ -770,6 +860,9 @@ impl FunctionLifter<'_> {
             )
         } else {
             let b = self.v128(ins, f.b, e)?;
+            if a == "zeroinitializer" && b == "zeroinitializer" {
+                return self.xset(ins.op_register(f.dst), "zeroinitializer", e);
+            }
             let even: Vec<u32> = (0..n).map(|l| 2 * l).collect();
             let odd: Vec<u32> = (0..n).map(|l| 2 * l + 1).collect();
             (

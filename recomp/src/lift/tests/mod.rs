@@ -27,6 +27,7 @@ mod host_diff_simd;
 mod host_diff_simd_int;
 #[cfg(target_arch = "x86_64")]
 mod host_diff_strcmp;
+mod hyper_simd_string_opts;
 mod ir;
 mod ir_budget;
 mod ir_integer;
