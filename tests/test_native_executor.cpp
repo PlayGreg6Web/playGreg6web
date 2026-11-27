@@ -12,6 +12,8 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
@@ -2460,6 +2462,120 @@ void test_indirect_constants_pass(NativeExecutor& ex) {
     CHECK(ex.stats().device_errors == before.device_errors);
 }
 
+// ---- mesh pipelines (G66): a synthetic mesh-stage compute shader writes the runtime's output records,
+// the runtime vertex shader pulls them into a draw (the contract of docs/gpu_commands.md "Mesh pipelines") ----
+
+const char* kMeshStageCs = R"(
+@group(3) @binding(0) var<storage, read_write> ms_out: array<u32>;
+fn put4(w: u32, v: vec4<f32>) {
+  ms_out[w] = bitcast<u32>(v.x); ms_out[w + 1u] = bitcast<u32>(v.y);
+  ms_out[w + 2u] = bitcast<u32>(v.z); ms_out[w + 3u] = bitcast<u32>(v.w);
+}
+@compute @workgroup_size(1) fn cs_main(@builtin(workgroup_id) wg: vec3<u32>) {
+  let rec = wg.x * 31u;  // 4 + 3 vertices * 8 words + 1 primitive * 3 indices
+  if (wg.x != 0u) { ms_out[rec] = 0u; ms_out[rec + 1u] = 0u; return; }  // later groups emit nothing
+  ms_out[rec] = 3u; ms_out[rec + 1u] = 1u; ms_out[rec + 2u] = 0u; ms_out[rec + 3u] = 0u;
+  let green = vec4<f32>(0.0, 1.0, 0.0, 1.0);
+  put4(rec + 4u, vec4<f32>(-1.0, -1.0, 0.5, 1.0)); put4(rec + 8u, green);
+  put4(rec + 12u, vec4<f32>(1.0, -1.0, 0.5, 1.0)); put4(rec + 16u, green);
+  put4(rec + 20u, vec4<f32>(-1.0, 1.0, 0.5, 1.0)); put4(rec + 24u, green);
+  ms_out[rec + 28u] = 0u; ms_out[rec + 29u] = 1u; ms_out[rec + 30u] = 2u;
+}
+)";
+
+const char* kMeshPs = R"(
+@fragment fn fs_main(@location(0) c: vec4<f32>) -> @location(0) vec4<f32> { return c; }
+)";
+
+void test_mesh_pipeline(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    const bridge::MeshOutputLayout layout{3, 1, 8};  // 3 vertices, 1 triangle, SV_Position + 1 attribute
+    CHECK(bridge::valid_mesh_output_layout(layout));
+    CHECK(bridge::mesh_group_record_words(layout) == 31);
+    constexpr uint32_t kOut = 900, kCsMod = 901, kVsMod = 902, kFsMod = 903, kPadBgl = 910, kBglC = 911, kBglV = 912,
+                       kPlC = 913, kPlV = 914, kCsPipe = 915, kRenderPipe = 916, kGroupC = 917, kGroupV = 918, kPadGroup = 919;
+    gpu::CommandEncoder setup;
+    setup.create_buffer(kOut, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 256);
+    setup.create_shader_module(kCsMod, GpuShaderStage::Compute, kMeshStageCs);
+    setup.create_shader_module(kVsMod, GpuShaderStage::Vertex, bridge::mesh_draw_vertex_wgsl(layout));
+    setup.create_shader_module(kFsMod, GpuShaderStage::Fragment, kMeshPs);
+    emit(setup, GpuOpcode::CreateBindGroupLayout, bytes_of(GpuCreateBindGroupLayoutPayload{kPadBgl, 0, 0, 0, 0}));
+    const auto stage_entry = [&](uint32_t visibility, GpuBufferBindingType type) {
+        return layout_entry(0, visibility, GpuBindingLayoutType::Buffer, static_cast<uint8_t>(type));
+    };
+    for (const auto& [id, vis, type] :
+         {std::tuple{kBglC, GpuShaderStageBits::Compute, GpuBufferBindingType::Storage},
+          std::tuple{kBglV, GpuShaderStageBits::Vertex, GpuBufferBindingType::ReadOnlyStorage}}) {
+        std::vector<uint8_t> v;
+        append(v, GpuCreateBindGroupLayoutPayload{id, 1, 0, 0, 0});
+        append(v, stage_entry(vis, type));
+        emit(setup, GpuOpcode::CreateBindGroupLayout, v);
+    }
+    // Pipeline layouts: groups 0..2 are empty padding, group kMeshOutputGroup (3) is the output buffer.
+    for (const auto& [pl, out_bgl] : {std::pair{kPlC, kBglC}, std::pair{kPlV, kBglV}}) {
+        std::vector<uint8_t> v;
+        append(v, GpuCreatePipelineLayoutPayload{pl, 4, 0, 0, 0});
+        for (uint32_t i = 0; i < 3; ++i) append(v, kPadBgl);
+        append(v, out_bgl);
+        emit(setup, GpuOpcode::CreatePipelineLayout, v);
+    }
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = kCsPipe;
+    cp.cs_module_id = kCsMod;
+    cp.pipeline_layout_id = kPlC;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(kRenderPipe, kVsMod, kFsMod, kPlV)));
+    create_bind_group(setup, kPadGroup, kPadBgl, {});
+    create_bind_group(setup, kGroupC, kBglC, {bg_entry(0, GpuBindResourceType::Buffer, kOut)});
+    create_bind_group(setup, kGroupV, kBglV, {bg_entry(0, GpuBindResourceType::Buffer, kOut)});
+    run(ex, setup);
+
+    // DispatchMesh(2, 1, 1): two mesh groups, then a draw of groups * max_primitives * 3 vertices.
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(kCsPipe);
+    for (uint32_t g = 0; g < 3; ++g) set_bind_group2(frame, g, kPadGroup);
+    set_bind_group2(frame, bridge::kMeshOutputGroup, kGroupC);
+    frame.dispatch_compute(2, 1, 1);
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(kRenderPipe);
+    for (uint32_t g = 0; g < 3; ++g) set_bind_group2(frame, g, kPadGroup);
+    set_bind_group2(frame, bridge::kMeshOutputGroup, kGroupV);
+    frame.draw(2 * layout.max_primitives * 3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+    CHECK(ex.stats().packet_errors == before.packet_errors);
+    CHECK(ex.stats().dispatches == before.dispatches + 1);
+    CHECK(ex.stats().draws == before.draws + 1);
+
+    // The records: group 0 = 3 vertices / 1 primitive, group 1 = empty; vertex 1 position and the indices.
+    std::vector<uint8_t> raw;
+    std::string err;
+    CHECK(ex.read_buffer(kOut, 0, 248, &raw, &err) && raw.size() == 248);
+    std::vector<uint32_t> w(raw.size() / 4);
+    std::memcpy(w.data(), raw.data(), raw.size());
+    if (w.size() == 62) {
+        CHECK(w[0] == 3 && w[1] == 1 && w[31] == 0 && w[32] == 0);
+        float x1;
+        std::memcpy(&x1, &w[12], 4);
+        CHECK(x1 == 1.0f);
+        CHECK(w[28] == 0 && w[29] == 1 && w[30] == 2);
+    }
+
+    // The triangle (-1,-1) (1,-1) (-1,1) covers the lower-left half of the target in green; the rest stays cleared.
+    FrameImage img;
+    CHECK(ex.read_last_frame(&img, &err) && img.width == kW && img.height == kH);
+    CHECK(px_near(img, 8, 24, 0, 255, 0, 255, 1));    // inside (x + y < 0 in NDC)
+    CHECK(px_near(img, 56, 4, 0, 0, 0, 255, 1));      // outside
+    CHECK(px_near(img, 40, 8, 0, 0, 0, 255, 1));      // outside (x + y > 0 in NDC)
+}
+
 namespace playgta6::gpu::bridge {
 struct StencilTwinDawnTestAccess {
     static StateBridgeDevice::StencilTwinPipelines pipelines(StateBridgeDevice& d, uint8_t df, uint8_t tf,
@@ -2773,6 +2889,7 @@ int main() {
     test_compute(*ex);
     test_auto_layout_remap(*ex);
     test_indirect_constants_pass(*ex);
+    test_mesh_pipeline(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
     test_readbacks(*ex);
