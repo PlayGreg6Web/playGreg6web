@@ -18,7 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::num::NonZeroU32;
 
-use naga::valid::{Capabilities, ValidationFlags, Validator};
+use naga::valid::{
+    Capabilities, ShaderStages as NagaShaderStages, SubgroupOperationSet, ValidationFlags,
+    Validator,
+};
 use naga::{
     AddressSpace, ArraySize, AtomicFunction, BinaryOperator, Binding, BuiltIn, EntryPoint,
     Expression, Function, FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass,
@@ -48,6 +51,11 @@ use crate::rdna2_cfg::{
     BlockId, BranchKind, ControlFlowGraph, DISPATCH_EXIT_PC, ExecMaskOp, ExecMaskWrite,
     STRUCTURED_LOOP_MAX_ITERATIONS, StructuredNode, Terminator, classify_exec_mask_op,
     structure_cfg,
+};
+pub use crate::wave_emul::WaveEmulMode;
+use crate::wave_emul::{
+    WGSL_SUBGROUPS_ENABLE, emit_subgroup_ballot, emit_subgroup_broadcast_first,
+    emit_subgroup_shuffle, emit_subgroup_shuffle_xor,
 };
 
 /// Default minimum number of `vec4<u32>` slots in a statically-sized uniform CBV (`cb0`, `cb1`, ...).
@@ -408,6 +416,11 @@ pub struct Rdna2TranslateOptions {
     /// Optional parsed Xbox Series `FSSM` stage metadata (from a `.meta` sidecar) supplying exact
     /// `s_swappc_b64` vertex fetch VGPR assignments and inter-stage `OSG1`/`ISG1` semantic maps.
     pub fssm_meta: Option<FssmStageMetadata>,
+    /// Wave lowering mode for RDNA2 cross-lane operations (`#2178`).
+    ///
+    /// Defaults to [`WaveEmulMode::WorkgroupLds`] so baseline WebGPU adapters without the
+    /// optional `subgroups` feature remain 100% supported.
+    pub wave_emul_mode: WaveEmulMode,
 }
 
 impl Default for Rdna2TranslateOptions {
@@ -420,6 +433,7 @@ impl Default for Rdna2TranslateOptions {
             workgroup_id_sgpr_base: None,
             preserve_fragment_interpolation: false,
             fssm_meta: None,
+            wave_emul_mode: WaveEmulMode::WorkgroupLds,
         }
     }
 }
@@ -862,6 +876,8 @@ pub struct Rdna2WgslOutput {
     pub bvh_ops: u32,
     pub raw_address: bool,
     pub atomic64: bool,
+    /// `true` when hardware WebGPU `subgroups` (`enable subgroups;`) operations were emitted.
+    pub uses_subgroups: bool,
     pub binding_summary: Rdna2BindingSummary,
     pub binding_pack: BindingPackStats,
     pub ir_opt: IrOptStats,
@@ -946,6 +962,9 @@ impl Rdna2WgslOutput {
         if self.atomic64 {
             out.push_str("  \"atomic64\": true,\n");
         }
+        if self.uses_subgroups {
+            out.push_str("  \"uses_subgroups\": true,\n");
+        }
         if !self.binding_pack.is_zero() {
             let bp = self.binding_pack;
             let _ = writeln!(
@@ -961,12 +980,14 @@ impl Rdna2WgslOutput {
             let opt = self.ir_opt;
             let _ = writeln!(
                 out,
-                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"constants_folded\": {}, \"identities_simplified\": {}, \"locals_forwarded\": {}, \"cse_eliminated\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
+                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"constants_folded\": {}, \"identities_simplified\": {}, \"dead_branches_folded\": {}, \"locals_forwarded\": {}, \"cse_eliminated\": {}, \"readonly_loads_cse\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
                 opt.bitcasts_cancelled,
                 opt.constants_folded,
                 opt.identities_simplified,
+                opt.dead_branches_folded,
                 opt.locals_forwarded,
                 opt.cse_eliminated,
+                opt.readonly_loads_cse,
                 opt.dead_locals_removed,
                 opt.dead_emits_trimmed
             );
@@ -1796,6 +1817,8 @@ struct ProgramPlan {
     uses_lds: bool,
     uses_lds_atomics: bool,
     uses_wave_lds: bool,
+    wave_emul_mode: WaveEmulMode,
+    is_wave32: bool,
     frag_attrs: Vec<u8>,
     frag_attr_interp: BTreeMap<u8, FragAttrInterp>,
     /// Fragment `(clamped_attr, attrchan)` channels read with `high = true` by `v_interp_*_f16`,
@@ -10871,6 +10894,9 @@ fn plan_program(
     let mut uses_lds = false;
     let mut uses_lds_atomics = false;
     let mut uses_wave_lds = false;
+    let is_wave32 = detect_wave32_program(active);
+    let subgroups_active = options.wave_emul_mode == WaveEmulMode::Subgroups
+        && matches!(stage, ShaderStage::Compute | ShaderStage::Fragment);
     let mut has_buffer_fetch = false;
     let mut first_swappc_idx: Option<usize> = None;
     let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
@@ -11462,6 +11488,9 @@ fn plan_program(
                         vgprs.insert(vsrc);
                         written_vgprs.insert(vsrc);
                     }
+                    if matches!(*op, 0x377 | 0x378) && !subgroups_active && stage == ShaderStage::Compute {
+                        uses_wave_lds = true;
+                    }
                     if is_pair_dst && *vdst < 255 {
                         vgprs.insert(*vdst + 1);
                         written_vgprs.insert(*vdst + 1);
@@ -12034,12 +12063,25 @@ fn plan_program(
                             }
                         }
                         DsLdsOp::Swizzle => {
-                            uses_wave_lds = true;
+                            if !subgroups_active {
+                                uses_wave_lds = true;
+                            }
                             vgprs.insert(*vdst);
                             written_vgprs.insert(*vdst);
                         }
-                        DsLdsOp::Permute | DsLdsOp::BPermute => {
+                        DsLdsOp::Permute => {
                             uses_wave_lds = true;
+                            vgprs.insert(*data0);
+                            if !written_vgprs.contains(data0) {
+                                read_before_write_vgprs.insert(*data0);
+                            }
+                            vgprs.insert(*vdst);
+                            written_vgprs.insert(*vdst);
+                        }
+                        DsLdsOp::BPermute => {
+                            if !subgroups_active {
+                                uses_wave_lds = true;
+                            }
                             vgprs.insert(*data0);
                             if !written_vgprs.contains(data0) {
                                 read_before_write_vgprs.insert(*data0);
@@ -12797,6 +12839,8 @@ fn plan_program(
         uses_lds,
         uses_lds_atomics,
         uses_wave_lds,
+        wave_emul_mode: options.wave_emul_mode,
+        is_wave32,
         frag_attrs: frag_attr_set.into_iter().collect(),
         frag_attr_interp: if options.preserve_fragment_interpolation {
             frag_attr_interp
@@ -12880,6 +12924,10 @@ struct IrEmitter {
     storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
     lds_global: Option<Handle<GlobalVariable>>,
     wave_lds_global: Option<Handle<GlobalVariable>>,
+    wave_emul_mode: WaveEmulMode,
+    is_wave32: bool,
+    emitted_subgroup_ops: bool,
+    subgroup_invocation_id_arg: Option<u32>,
     mesh_out_global: Option<Handle<GlobalVariable>>,
     mesh_output: Option<MeshOutputLayout>,
     emitted_bindings: Vec<WgslBindingInfo>,
@@ -14274,6 +14322,10 @@ impl IrEmitter {
             storage_tex_globals,
             lds_global,
             wave_lds_global,
+            wave_emul_mode: plan.wave_emul_mode,
+            is_wave32: plan.is_wave32,
+            emitted_subgroup_ops: false,
+            subgroup_invocation_id_arg: None,
             mesh_out_global,
             mesh_output: plan.mesh_output,
             emitted_bindings,
@@ -16193,12 +16245,28 @@ impl IrEmitter {
             0..=105 => self.load_sgpr_u32(src as u8),
             106 => {
                 let cond = self.load_vcc();
-                let t = self.lit_u32(1);
-                let f = self.lit_u32(0);
-                self.emit_expr(Expression::Select {
-                    condition: cond,
-                    accept: t,
-                    reject: f,
+                if self.subgroups_active() {
+                    let ballot = self.emit_wave_ballot(cond);
+                    self.emit_expr(Expression::AccessIndex {
+                        base: ballot,
+                        index: 0,
+                    })
+                } else {
+                    let t = self.lit_u32(1);
+                    let f = self.lit_u32(0);
+                    self.emit_expr(Expression::Select {
+                        condition: cond,
+                        accept: t,
+                        reject: f,
+                    })
+                }
+            }
+            107 if self.subgroups_active() => {
+                let cond = self.load_vcc();
+                let ballot = self.emit_wave_ballot(cond);
+                self.emit_expr(Expression::AccessIndex {
+                    base: ballot,
+                    index: 1,
                 })
             }
             124 => self.load_m0(),
@@ -16534,29 +16602,122 @@ impl IrEmitter {
         self.emit_select(cond, t, f)
     }
 
+    /// Returns `true` when hardware WebGPU `subgroups` lowering is active for this shader stage.
+    #[inline]
+    fn subgroups_active(&self) -> bool {
+        self.wave_emul_mode == WaveEmulMode::Subgroups
+            && matches!(self.stage, ShaderStage::Compute | ShaderStage::Fragment)
+    }
+
+    /// Lazily add `@builtin(subgroup_invocation_id) sg_lane: u32` to the entry point arguments
+    /// and return its expression handle.
+    fn emit_subgroup_invocation_id(&mut self) -> Handle<Expression> {
+        self.emitted_subgroup_ops = true;
+        let arg_idx = if let Some(idx) = self.subgroup_invocation_id_arg {
+            idx
+        } else {
+            let idx = self.func.arguments.len() as u32;
+            self.func.arguments.push(FunctionArgument {
+                name: Some("sg_lane".to_string()),
+                ty: self.types.u32_ty,
+                binding: Some(Binding::BuiltIn(BuiltIn::SubgroupInvocationId)),
+            });
+            self.subgroup_invocation_id_arg = Some(idx);
+            idx
+        };
+        self.raw_expr(Expression::FunctionArgument(arg_idx))
+    }
+
+    fn emit_wave_broadcast_first(&mut self, value: Handle<Expression>) -> Handle<Expression> {
+        self.emitted_subgroup_ops = true;
+        emit_subgroup_broadcast_first(&mut self.func, value, self.types.u32_ty)
+    }
+
+    fn emit_wave_ballot(&mut self, predicate: Handle<Expression>) -> Handle<Expression> {
+        self.emitted_subgroup_ops = true;
+        emit_subgroup_ballot(&mut self.func, Some(predicate))
+    }
+
+    fn emit_wave_shuffle(
+        &mut self,
+        value: Handle<Expression>,
+        lane: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emitted_subgroup_ops = true;
+        emit_subgroup_shuffle(&mut self.func, value, lane, self.types.u32_ty)
+    }
+
+    fn emit_wave_shuffle_xor(
+        &mut self,
+        value: Handle<Expression>,
+        mask: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emitted_subgroup_ops = true;
+        emit_subgroup_shuffle_xor(&mut self.func, value, mask, self.types.u32_ty)
+    }
+
     /// Store a per-lane boolean into a 64-bit lane-mask destination (`vcc` or `s[n:n+1]`).
     ///
-    /// One WGSL invocation models one wave lane, so SGPR lane masks are canonically
-    /// `(lo = lane bit, hi = 0)`; `exec` / `null` destinations are no-ops.
+    /// In [`WaveEmulMode::WorkgroupLds`], one WGSL invocation models one wave lane so SGPR lane
+    /// masks are canonically `(lo = lane bit, hi = 0)`. In [`WaveEmulMode::Subgroups`], SGPR
+    /// destinations receive the hardware `subgroupBallot(cond)` `.xy` 64-bit lane mask directly.
     fn store_lane_mask(&mut self, sdst: u8, cond: Handle<Expression>) {
         let sd7 = sdst & 0x7F;
         if sd7 == 106 {
             self.store_vcc(cond);
         } else if sd7 <= 105 {
-            let mask_u = self.bool_to_u32(cond);
-            self.store_sgpr_u32(sd7, mask_u);
-            if sd7 <= 104 {
-                let zero = self.lit_u32(0);
-                self.store_sgpr_u32(sd7 + 1, zero);
+            if self.subgroups_active() {
+                let ballot = self.emit_wave_ballot(cond);
+                let lo = self.emit_expr(Expression::AccessIndex {
+                    base: ballot,
+                    index: 0,
+                });
+                self.store_sgpr_u32(sd7, lo);
+                if sd7 <= 104 && !self.is_wave32 {
+                    let hi = self.emit_expr(Expression::AccessIndex {
+                        base: ballot,
+                        index: 1,
+                    });
+                    self.store_sgpr_u32(sd7 + 1, hi);
+                } else if sd7 <= 104 {
+                    let zero = self.lit_u32(0);
+                    self.store_sgpr_u32(sd7 + 1, zero);
+                }
+            } else {
+                let mask_u = self.bool_to_u32(cond);
+                self.store_sgpr_u32(sd7, mask_u);
+                if sd7 <= 104 {
+                    let zero = self.lit_u32(0);
+                    self.store_sgpr_u32(sd7 + 1, zero);
+                }
             }
         }
     }
 
-    /// Read this lane's bit (bit 0 of the low dword) of a 64-bit lane-mask source.
+    /// Read this lane's bit of a 64-bit lane-mask source.
     fn read_lane_mask_bit(&mut self, src: u16, literal: Option<u32>) -> Handle<Expression> {
         match src {
             106 => self.load_vcc(),
             126 if self.exec_local.is_none() => self.lit_bool(true),
+            0..=105 if self.subgroups_active() => {
+                let sg_lane = self.emit_subgroup_invocation_id();
+                let lo = self.load_sgpr_u32(src as u8);
+                let word = if src <= 104 && !self.is_wave32 {
+                    let hi = self.load_sgpr_u32((src + 1) as u8);
+                    let c32 = self.lit_u32(32);
+                    let in_hi = self.emit_bin(BinaryOperator::GreaterEqual, sg_lane, c32);
+                    self.emit_select(in_hi, hi, lo)
+                } else {
+                    lo
+                };
+                let mask31 = self.lit_u32(31);
+                let sh = self.emit_bin(BinaryOperator::And, sg_lane, mask31);
+                let shifted = self.emit_bin(BinaryOperator::ShiftRight, word, sh);
+                let one = self.lit_u32(1);
+                let bit = self.emit_bin(BinaryOperator::And, shifted, one);
+                let zero = self.lit_u32(0);
+                self.emit_bin(BinaryOperator::NotEqual, bit, zero)
+            }
             _ => {
                 let v = self.read_src_u32(src, literal);
                 let one = self.lit_u32(1);
@@ -16569,9 +16730,10 @@ impl IrEmitter {
 
     /// Read a 64-bit scalar source operand as `(lo, hi)` u32 halves.
     ///
-    /// SGPR pairs read both registers, `vcc` yields `(lane bit, 0)`, `exec` is all ones, integer
-    /// inline constants are sign-extended, float inline constants use their `f64` bit pattern,
-    /// and 32-bit literals are zero-extended.
+    /// SGPR pairs read both registers, `vcc` yields `(lane bit, 0)` (or `subgroupBallot(vcc).xy`
+    /// under [`WaveEmulMode::Subgroups`]), `exec` is all ones, integer inline constants are
+    /// sign-extended, float inline constants use their `f64` bit pattern, and 32-bit literals are
+    /// zero-extended.
     fn read_ssrc_pair(
         &mut self,
         src: u8,
@@ -16580,6 +16742,19 @@ impl IrEmitter {
         match src {
             0..=104 => (self.load_sgpr_u32(src), self.load_sgpr_u32(src + 1)),
             105 => (self.load_sgpr_u32(105), self.lit_u32(0)),
+            106 if self.subgroups_active() => {
+                let cond = self.load_vcc();
+                let ballot = self.emit_wave_ballot(cond);
+                let lo = self.emit_expr(Expression::AccessIndex {
+                    base: ballot,
+                    index: 0,
+                });
+                let hi = self.emit_expr(Expression::AccessIndex {
+                    base: ballot,
+                    index: 1,
+                });
+                (lo, hi)
+            }
             106 => (self.read_src_u32(106, None), self.lit_u32(0)),
             126 if self.exec_local.is_some() => (self.load_exec(), self.lit_u32(0)),
             126 => (self.lit_u32(0xFFFF_FFFF), self.lit_u32(0xFFFF_FFFF)),
@@ -18861,7 +19036,12 @@ impl IrEmitter {
             // v_readfirstlane_b32 sdst, vsrc0
             0x02 => {
                 let u = self.read_src_u32(src0, literal);
-                self.store_sgpr_u32(vdst & 0x7F, u);
+                let out = if self.subgroups_active() {
+                    self.emit_wave_broadcast_first(u)
+                } else {
+                    u
+                };
+                self.store_sgpr_u32(vdst & 0x7F, out);
                 true
             }
             // v_cvt_f32_i32
@@ -19867,6 +20047,7 @@ impl IrEmitter {
                 let accept = self.read_src_f32(src1, literal, abs1, neg1);
                 let cond = match cond_src {
                     Some(106) | None => self.load_vcc(),
+                    Some(csrc) if self.subgroups_active() => self.read_lane_mask_bit(csrc, literal),
                     Some(csrc) => {
                         let cu = self.read_src_u32(csrc, literal);
                         let zero = self.lit_u32(0);
@@ -21630,31 +21811,41 @@ impl IrEmitter {
             }
             // v_readlane_b32 sdst, vsrc0, ssrc1: read a lane of vsrc0 into scalar sdst.
             // Constant lanes read per-(vgpr, lane) spill locals when present (falling back to
-            // v[vsrc0]); dynamic lanes select across known constant lane slots before fallback.
+            // hardware `subgroupShuffle` under `WaveEmulMode::Subgroups` or v[vsrc0]); dynamic
+            // lanes select across known constant lane slots before subgroup/fallback read.
             0x360 => {
                 let val = if (256..=511).contains(&src0) {
                     let vsrc = (src0 - 256) as u8;
                     if let Some(lane) = decode_const_lane_index(src1, literal) {
                         if let Some(&slot_local) = self.lane_spill_locals.get(&(vsrc, lane)) {
                             self.load_local(slot_local)
+                        } else if self.subgroups_active() {
+                            let src_val = self.read_src_u32(src0, literal);
+                            let lane_lit = self.lit_u32(u32::from(lane));
+                            self.emit_wave_shuffle(src_val, lane_lit)
                         } else {
                             self.read_src_u32(src0, literal)
                         }
-                    } else {
+                    } else if let Some(slots) = self.vgpr_lane_slots.get(&vsrc).cloned() {
                         let mut acc = self.read_src_u32(src0, literal);
-                        if let Some(slots) = self.vgpr_lane_slots.get(&vsrc).cloned() {
-                            let raw_lane = self.read_src_u32(src1, literal);
-                            let mask63 = self.lit_u32(63);
-                            let lane_idx = self.emit_bin(BinaryOperator::And, raw_lane, mask63);
-                            for (slot_lane, slot_local) in slots {
-                                let target = self.lit_u32(u32::from(slot_lane));
-                                let is_match =
-                                    self.emit_bin(BinaryOperator::Equal, lane_idx, target);
-                                let slot_val = self.load_local(slot_local);
-                                acc = self.emit_select(is_match, slot_val, acc);
-                            }
+                        let raw_lane = self.read_src_u32(src1, literal);
+                        let mask63 = self.lit_u32(63);
+                        let lane_idx = self.emit_bin(BinaryOperator::And, raw_lane, mask63);
+                        for (slot_lane, slot_local) in slots {
+                            let target = self.lit_u32(u32::from(slot_lane));
+                            let is_match = self.emit_bin(BinaryOperator::Equal, lane_idx, target);
+                            let slot_val = self.load_local(slot_local);
+                            acc = self.emit_select(is_match, slot_val, acc);
                         }
                         acc
+                    } else if self.subgroups_active() {
+                        let src_val = self.read_src_u32(src0, literal);
+                        let raw_lane = self.read_src_u32(src1, literal);
+                        let mask63 = self.lit_u32(63);
+                        let lane_idx = self.emit_bin(BinaryOperator::And, raw_lane, mask63);
+                        self.emit_wave_shuffle(src_val, lane_idx)
+                    } else {
+                        self.read_src_u32(src0, literal)
                     }
                 } else {
                     self.read_src_u32(src0, literal)
@@ -21711,14 +21902,19 @@ impl IrEmitter {
             0x365 | 0x366 => {
                 let a = self.read_src_u32(src0, literal);
                 let b = self.read_src_u32(src1, literal);
-                let local_idx = self.emit_compute_local_index();
                 let mask63 = self.lit_u32(63);
                 let mask31 = self.lit_u32(31);
                 let c32 = self.lit_u32(32);
                 let one = self.lit_u32(1);
                 let zero = self.lit_u32(0);
                 let all_ones = self.lit_u32(0xFFFF_FFFF);
-                let lane = self.emit_bin(BinaryOperator::And, local_idx, mask63);
+                let lane = if self.subgroups_active() {
+                    let sg_lane = self.emit_subgroup_invocation_id();
+                    self.emit_bin(BinaryOperator::And, sg_lane, mask63)
+                } else {
+                    let local_idx = self.emit_compute_local_index();
+                    self.emit_bin(BinaryOperator::And, local_idx, mask63)
+                };
                 let in_hi = self.emit_bin(BinaryOperator::GreaterEqual, lane, c32);
                 let bit_mask = if op == 0x365 {
                     let sh = self.emit_bin(BinaryOperator::And, lane, mask31);
@@ -21820,6 +22016,78 @@ impl IrEmitter {
                     right: c,
                 });
                 self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_permlane16_b32 (0x377) / v_permlanex16_b32 (0x378):
+            // 16-lane row nibble-indexed cross-lane permute (`0x377` same 16-lane row, `0x378`
+            // opposite 16-lane row in the same 32-lane half).
+            0x377 | 0x378 => {
+                let val = self.read_src_u32(src0, literal);
+                let s1 = self.read_src_u32(src1, literal);
+                let s2 = self.read_src_u32(src2, literal);
+                let compute_permlane_src = |this: &mut Self, lane: Handle<Expression>| {
+                    let mask15 = this.lit_u32(15);
+                    let mask7 = this.lit_u32(7);
+                    let c8 = this.lit_u32(8);
+                    let sh2 = this.lit_u32(2);
+                    let row_mask = this.lit_u32(0xFFFF_FFF0);
+                    let row_lane = this.emit_bin(BinaryOperator::And, lane, mask15);
+                    let in_hi_half = this.emit_bin(BinaryOperator::GreaterEqual, row_lane, c8);
+                    let sel_word = this.emit_select(in_hi_half, s2, s1);
+                    let idx_in_word = this.emit_bin(BinaryOperator::And, row_lane, mask7);
+                    let bit_shift = this.emit_bin(BinaryOperator::ShiftLeft, idx_in_word, sh2);
+                    let shifted = this.emit_bin(BinaryOperator::ShiftRight, sel_word, bit_shift);
+                    let target_in_row = this.emit_bin(BinaryOperator::And, shifted, mask15);
+                    let row_base_raw = this.emit_bin(BinaryOperator::And, lane, row_mask);
+                    let row_base = if op == 0x378 {
+                        let c16 = this.lit_u32(16);
+                        this.emit_bin(BinaryOperator::ExclusiveOr, row_base_raw, c16)
+                    } else {
+                        row_base_raw
+                    };
+                    let mask63 = this.lit_u32(63);
+                    let src_raw = this.emit_bin(BinaryOperator::InclusiveOr, row_base, target_in_row);
+                    this.emit_bin(BinaryOperator::And, src_raw, mask63)
+                };
+                if self.subgroups_active() {
+                    let sg_lane = self.emit_subgroup_invocation_id();
+                    let src_lane = compute_permlane_src(self, sg_lane);
+                    let res = self.emit_wave_shuffle(val, src_lane);
+                    self.store_vgpr_u32(vdst, res);
+                } else if !self.in_nonuniform_cf()
+                    && let Some(wave_lds) = self.wave_lds_global
+                {
+                    let wave_ptr = self.raw_expr(Expression::GlobalVariable(wave_lds));
+                    let local_idx = self.emit_compute_local_index();
+                    let mask255 = self.lit_u32(255);
+                    let mask63 = self.lit_u32(63);
+                    let wave_base_mask = self.lit_u32(0xFFFF_FFC0);
+                    let slot = self.emit_bin(BinaryOperator::And, local_idx, mask255);
+                    let wave_base = self.emit_bin(BinaryOperator::And, slot, wave_base_mask);
+                    let lane = self.emit_bin(BinaryOperator::And, slot, mask63);
+                    let my_ptr = self.emit_expr(Expression::Access {
+                        base: wave_ptr,
+                        index: slot,
+                    });
+                    self.push_stmt(Statement::Store {
+                        pointer: my_ptr,
+                        value: val,
+                    });
+                    self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+                    let src_lane = compute_permlane_src(self, lane);
+                    let target_slot_raw =
+                        self.emit_bin(BinaryOperator::InclusiveOr, wave_base, src_lane);
+                    let target_slot = self.emit_bin(BinaryOperator::And, target_slot_raw, mask255);
+                    let src_ptr = self.emit_expr(Expression::Access {
+                        base: wave_ptr,
+                        index: target_slot,
+                    });
+                    let res = self.emit_expr(Expression::Load { pointer: src_ptr });
+                    self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+                    self.store_vgpr_u32(vdst, res);
+                } else {
+                    self.store_vgpr_u32(vdst, val);
+                }
                 true
             }
             _ => false,
@@ -23928,6 +24196,109 @@ impl IrEmitter {
             }
             _ => return false,
         };
+
+        // Hardware WebGPU `subgroups` fast path (`#2178`): zero `pg6_wave_lds`, zero barriers!
+        // `DsLdsOp::Permute` (forward scatter with highest-lane-wins collision semantics) falls
+        // through to the `pg6_wave_lds` path below.
+        if self.subgroups_active() {
+            match lds_op {
+                DsLdsOp::Swizzle => {
+                    let imm16 = u16::from(offset0) | (u16::from(offset1) << 8);
+                    let res = match decode_ds_swizzle_offset(imm16) {
+                        Rdna2SwizzleMode::BitMode {
+                            and_mask: 0x1F,
+                            or_mask: 0,
+                            xor_mask,
+                        } => {
+                            if xor_mask == 0 {
+                                fallback_val
+                            } else {
+                                let xor_lit = self.lit_u32(u32::from(xor_mask));
+                                self.emit_wave_shuffle_xor(fallback_val, xor_lit)
+                            }
+                        }
+                        Rdna2SwizzleMode::QuadPerm {
+                            lanes: [0, 1, 2, 3],
+                        } => fallback_val,
+                        Rdna2SwizzleMode::QuadPerm {
+                            lanes: [1, 0, 3, 2],
+                        } => {
+                            let m = self.lit_u32(1);
+                            self.emit_wave_shuffle_xor(fallback_val, m)
+                        }
+                        Rdna2SwizzleMode::QuadPerm {
+                            lanes: [2, 3, 0, 1],
+                        } => {
+                            let m = self.lit_u32(2);
+                            self.emit_wave_shuffle_xor(fallback_val, m)
+                        }
+                        Rdna2SwizzleMode::QuadPerm {
+                            lanes: [3, 2, 1, 0],
+                        } => {
+                            let m = self.lit_u32(3);
+                            self.emit_wave_shuffle_xor(fallback_val, m)
+                        }
+                        Rdna2SwizzleMode::QuadPerm { lanes } => {
+                            let sg_lane = self.emit_subgroup_invocation_id();
+                            let mask63 = self.lit_u32(63);
+                            let lane = self.emit_bin(BinaryOperator::And, sg_lane, mask63);
+                            let mask60 = self.lit_u32(60);
+                            let mask3 = self.lit_u32(3);
+                            let quad_base = self.emit_bin(BinaryOperator::And, lane, mask60);
+                            let quad_id = self.emit_bin(BinaryOperator::And, lane, mask3);
+                            let mut picked = self.lit_u32(u32::from(lanes[0]));
+                            for (q, &target) in lanes.iter().enumerate().skip(1) {
+                                let q_lit = self.lit_u32(q as u32);
+                                let is_q = self.emit_bin(BinaryOperator::Equal, quad_id, q_lit);
+                                let t_lit = self.lit_u32(u32::from(target));
+                                picked = self.emit_select(is_q, t_lit, picked);
+                            }
+                            let src_lane =
+                                self.emit_bin(BinaryOperator::InclusiveOr, quad_base, picked);
+                            self.emit_wave_shuffle(fallback_val, src_lane)
+                        }
+                        Rdna2SwizzleMode::BitMode {
+                            and_mask,
+                            or_mask,
+                            xor_mask,
+                        } => {
+                            let sg_lane = self.emit_subgroup_invocation_id();
+                            let mask63 = self.lit_u32(63);
+                            let lane = self.emit_bin(BinaryOperator::And, sg_lane, mask63);
+                            let c32 = self.lit_u32(32);
+                            let mask31 = self.lit_u32(31);
+                            let hi_bit = self.emit_bin(BinaryOperator::And, lane, c32);
+                            let lo5 = self.emit_bin(BinaryOperator::And, lane, mask31);
+                            let and_l = self.lit_u32(u32::from(and_mask));
+                            let or_l = self.lit_u32(u32::from(or_mask));
+                            let xor_l = self.lit_u32(u32::from(xor_mask));
+                            let t0 = self.emit_bin(BinaryOperator::And, lo5, and_l);
+                            let t1 = self.emit_bin(BinaryOperator::InclusiveOr, t0, or_l);
+                            let t2 = self.emit_bin(BinaryOperator::ExclusiveOr, t1, xor_l);
+                            let t2_clamped = self.emit_bin(BinaryOperator::And, t2, mask31);
+                            let src_lane =
+                                self.emit_bin(BinaryOperator::InclusiveOr, hi_bit, t2_clamped);
+                            self.emit_wave_shuffle(fallback_val, src_lane)
+                        }
+                    };
+                    self.store_vgpr_u32(vdst, res);
+                    return true;
+                }
+                DsLdsOp::BPermute => {
+                    let addr_f = self.load_vgpr_f32(addr);
+                    let addr_u = self.bitcast_f32_to_u32(addr_f);
+                    let two = self.lit_u32(2);
+                    let mask63 = self.lit_u32(63);
+                    let lane_raw = self.emit_bin(BinaryOperator::ShiftRight, addr_u, two);
+                    let src_lane = self.emit_bin(BinaryOperator::And, lane_raw, mask63);
+                    let res = self.emit_wave_shuffle(fallback_val, src_lane);
+                    self.store_vgpr_u32(vdst, res);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         if self.in_nonuniform_cf() {
             self.store_vgpr_u32(vdst, fallback_val);
             return true;
@@ -24082,9 +24453,6 @@ impl IrEmitter {
         data1: u8,
         vdst: u8,
     ) -> bool {
-        if self.stage != ShaderStage::Compute {
-            return false;
-        }
         let Some(lds_op) = ds_lds_op(op) else {
             return false;
         };
@@ -24092,7 +24460,16 @@ impl IrEmitter {
             lds_op,
             DsLdsOp::Swizzle | DsLdsOp::Permute | DsLdsOp::BPermute
         ) {
-            return self.translate_ds_wave_op(lds_op, offset0, offset1, addr, data0, vdst);
+            if self.stage == ShaderStage::Compute
+                || (self.subgroups_active()
+                    && matches!(lds_op, DsLdsOp::Swizzle | DsLdsOp::BPermute))
+            {
+                return self.translate_ds_wave_op(lds_op, offset0, offset1, addr, data0, vdst);
+            }
+            return false;
+        }
+        if self.stage != ShaderStage::Compute {
+            return false;
         }
         let Some(lds_global) = self.lds_global else {
             return false;
@@ -25913,9 +26290,18 @@ fn validate_emitted_bindings(
 /// - No disallowed module-scope `enable` directives (e.g. stray `enable f16;`)
 /// - No non-finite float tokens (`nan`/`inf`/`infinity`) outside comments
 /// - Present, non-empty entry point `fn <entry_point>(...) { ... }`
+#[cfg(test)]
 fn validate_emitted_wgsl_structure(
     wgsl: &str,
     entry_point: &str,
+) -> Result<(), Rdna2TranslateError> {
+    validate_emitted_wgsl_structure_with_options(wgsl, entry_point, false)
+}
+
+fn validate_emitted_wgsl_structure_with_options(
+    wgsl: &str,
+    entry_point: &str,
+    allow_subgroups_enable: bool,
 ) -> Result<(), Rdna2TranslateError> {
     if wgsl.is_empty() {
         return Err(Rdna2TranslateError::WgslParse(
@@ -26175,10 +26561,37 @@ fn validate_emitted_wgsl_structure(
                     ));
                 }
                 if ident == "enable" {
-                    return Err(Rdna2TranslateError::WgslParse(
-                        "disallowed module-scope `enable` directive in baseline WebGPU WGSL"
-                            .to_string(),
-                    ));
+                    if !allow_subgroups_enable {
+                        return Err(Rdna2TranslateError::WgslParse(
+                            "disallowed module-scope `enable` directive in baseline WebGPU WGSL"
+                                .to_string(),
+                        ));
+                    }
+                    skip_wgsl_ws_and_comments(bytes, &mut i)?;
+                    if i >= len || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                        return Err(Rdna2TranslateError::WgslParse(
+                            "malformed `enable` directive in emitted WGSL".to_string(),
+                        ));
+                    }
+                    let ext_start = i;
+                    i += 1;
+                    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                    let ext_ident = &wgsl[ext_start..i];
+                    if ext_ident != "subgroups" {
+                        return Err(Rdna2TranslateError::WgslParse(format!(
+                            "disallowed module-scope `enable {ext_ident}` directive in emitted WGSL"
+                        )));
+                    }
+                    skip_wgsl_ws_and_comments(bytes, &mut i)?;
+                    if i >= len || bytes[i] != b';' {
+                        return Err(Rdna2TranslateError::WgslParse(
+                            "expected ';' after `enable subgroups` in emitted WGSL".to_string(),
+                        ));
+                    }
+                    i += 1;
+                    continue;
                 }
                 match ep_state {
                     0 if ident == "fn" => ep_state = 1,
@@ -26236,6 +26649,47 @@ fn validate_emitted_wgsl_structure(
     }
 
     Ok(())
+}
+
+/// Returns `true` when `module` contains any Naga subgroup statement or subgroup built-in.
+fn module_uses_subgroups(module: &Module) -> bool {
+    fn block_has_subgroup(block: &naga::Block) -> bool {
+        block.iter().any(|stmt| match stmt {
+            Statement::SubgroupBallot { .. }
+            | Statement::SubgroupCollectiveOperation { .. }
+            | Statement::SubgroupGather { .. } => true,
+            Statement::Block(inner) => block_has_subgroup(inner),
+            Statement::If { accept, reject, .. } => {
+                block_has_subgroup(accept) || block_has_subgroup(reject)
+            }
+            Statement::Switch { cases, .. } => cases.iter().any(|c| block_has_subgroup(&c.body)),
+            Statement::Loop {
+                body, continuing, ..
+            } => block_has_subgroup(body) || block_has_subgroup(continuing),
+            _ => false,
+        })
+    }
+
+    let has_builtin = module.entry_points.iter().any(|ep| {
+        ep.function.arguments.iter().any(|arg| {
+            matches!(
+                arg.binding,
+                Some(Binding::BuiltIn(
+                    BuiltIn::SubgroupInvocationId
+                        | BuiltIn::SubgroupSize
+                        | BuiltIn::SubgroupId
+                        | BuiltIn::NumSubgroups
+                ))
+            )
+        })
+    });
+    has_builtin
+        || module
+            .entry_points
+            .iter()
+            .map(|ep| &ep.function)
+            .chain(module.functions.iter().map(|(_, f)| f))
+            .any(|f| block_has_subgroup(&f.body))
 }
 
 /// Baseline WebGPU capabilities permitted during Naga validation.
@@ -26391,13 +26845,27 @@ pub fn translate_rdna2_to_wgsl(
     binding_pack.uniform_promoted_to_storage += uniform_promoted_to_storage;
     validate_emitted_bindings(&bindings, plan.stage)?;
 
-    // Post-lowering Naga IR optimization (#2137): cancel identity/round-trip bitcasts, fold pure
-    // constants and exact integer/boolean identities, and trim dead temps/emits prior to Naga
+    // Post-lowering Naga IR optimization (#2137, #2164, #2178): cancel identity/round-trip
+    // bitcasts, fold pure constants/identities/dead branches, forward intra-block local loads,
+    // CSE pure expressions and read-only global loads, and trim dead temps/emits prior to Naga
     // validation and WGSL emission.
     let ir_opt = optimize_module(&mut module);
 
-    // Unconditional Naga validation against baseline WebGPU capabilities.
-    let mut validator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
+    let uses_subgroups = module_uses_subgroups(&module);
+
+    // Unconditional Naga validation against baseline WebGPU capabilities (plus `SUBGROUP` when
+    // `WaveEmulMode::Subgroups` emitted hardware subgroup operations).
+    let validation_caps = if uses_subgroups {
+        BASELINE_WEBGPU_CAPABILITIES | Capabilities::SUBGROUP
+    } else {
+        BASELINE_WEBGPU_CAPABILITIES
+    };
+    let mut validator = Validator::new(ValidationFlags::all(), validation_caps);
+    if uses_subgroups {
+        validator
+            .subgroup_stages(NagaShaderStages::COMPUTE | NagaShaderStages::FRAGMENT)
+            .subgroup_operations(SubgroupOperationSet::all());
+    }
     let module_info = validator
         .validate(&module)
         .map_err(|err| Rdna2TranslateError::NagaValidation(err.emit_to_string("")))?;
@@ -26432,13 +26900,16 @@ pub fn translate_rdna2_to_wgsl(
         let single_line = comment.replace(['\r', '\n'], " ");
         let _ = writeln!(raw_wgsl, "{single_line}");
     }
+    if uses_subgroups {
+        raw_wgsl.push_str(WGSL_SUBGROUPS_ENABLE);
+    }
     raw_wgsl.push('\n');
     raw_wgsl.push_str(&wgsl_body);
 
     // Compact post-Naga indentation/blank lines, normalize line endings to LF, and enforce
     // unconditional post-emit WGSL structural checks.
     let wgsl = compact_wgsl_whitespace(&raw_wgsl);
-    validate_emitted_wgsl_structure(&wgsl, &entry_point)?;
+    validate_emitted_wgsl_structure_with_options(&wgsl, &entry_point, uses_subgroups)?;
 
     // When `naga/wgsl-in` is active (unit tests), additionally round-trip parse & validate the
     // final WGSL text (including comments) via `naga::front::wgsl::parse_str`. For `rt_arena`
@@ -26644,16 +27115,30 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
     return out;
 }
 "#;
-        let combined: String;
-        let parse_src = if plan.rt_arena {
-            combined = format!("{TEST_RT_PRELUDE_V1}\n{wgsl}");
-            &combined
+        let stripped: String;
+        let wgsl_for_naga = if uses_subgroups {
+            // Naga 30's WGSL frontend parses subgroup builtins directly but rejects the
+            // `enable subgroups;` directive line; strip the directive solely for Naga round-trip.
+            stripped = wgsl.replacen(WGSL_SUBGROUPS_ENABLE, "", 1);
+            &stripped
         } else {
             &wgsl
         };
+        let combined: String;
+        let parse_src = if plan.rt_arena {
+            combined = format!("{TEST_RT_PRELUDE_V1}\n{wgsl_for_naga}");
+            &combined
+        } else {
+            wgsl_for_naga
+        };
         let reparsed = naga::front::wgsl::parse_str(parse_src)
             .map_err(|err| Rdna2TranslateError::WgslParse(err.emit_to_string(parse_src)))?;
-        let mut revalidator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
+        let mut revalidator = Validator::new(ValidationFlags::all(), validation_caps);
+        if uses_subgroups {
+            revalidator
+                .subgroup_stages(NagaShaderStages::COMPUTE | NagaShaderStages::FRAGMENT)
+                .subgroup_operations(SubgroupOperationSet::all());
+        }
         revalidator
             .validate(&reparsed)
             .map_err(|err| Rdna2TranslateError::NagaValidation(err.emit_to_string(parse_src)))?;
@@ -26758,6 +27243,7 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
         bvh_ops: plan.bvh_ops,
         raw_address: plan.raw_address,
         atomic64: plan.atomic64,
+        uses_subgroups,
         binding_summary,
         binding_pack,
         ir_opt,
@@ -29821,37 +30307,36 @@ mod tests {
 
     #[test]
     fn s_cbranch_scc0_if_skip_and_s_branch_diamond_lift_to_structured_wgsl() {
-        // If-skip (compute):
-        //   s_mov_b32 s0, 5 ; s_cmp_eq_u32 s0, 3 ; s_cbranch_scc0 L
-        //   v_mov_b32 v1, 1.0
-        // L: v_mov_b32 v2, 2.0 ; s_endpgm
-        let words = vec![
-            enc_sop1(0x03, 0, 133),
+        // If-skip (compute, runtime-dynamic `s0 == wg_id.x` with live buffer store):
+        //   s_cmp_eq_u32 s0, 3 ; s_cbranch_scc0 L
+        //   v_mov_b32 v1, 1.0 ; buffer_store_dword v1, v0, s[8:11]
+        // L: s_endpgm
+        let mut words = vec![
             enc_sopc(0x06, 0, 131),
-            enc_sopp(0x04, branch_simm(8, 16)),
+            enc_sopp(0x04, branch_simm(4, 20)),
             enc_vop1(0x01, 1, 242),
-            enc_vop1(0x01, 2, 244),
-            enc_sopp(0x01, 0),
         ];
+        words.extend_from_slice(&enc_mubuf(0x1C, 0, 1, 0, 2, false));
+        words.push(enc_sopp(0x01, 0));
         let tree = structured_tree(&words);
         assert!(tree.is_fully_structured(), "{tree:?}");
         let out = translate_as(&words, Rdna2StageOverride::Compute);
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
-        assert_eq!(out.translated_op_count, 6, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 5, "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("if "), "WGSL:\n{}", out.wgsl);
         assert!(!out.wgsl.contains("switch"), "WGSL:\n{}", out.wgsl);
         assert!(!out.wgsl.contains("exec_mask"), "WGSL:\n{}", out.wgsl);
         assert_naga_wgsl_valid(&out.wgsl);
 
-        // If/else diamond with an `s_branch` merge (pixel):
-        //   s_mov_b32 s0, 5 ; s_cmp_eq_u32 s0, 3 ; s_cbranch_scc1 ELSE
+        // If/else diamond with an `s_branch` merge (pixel, runtime-dynamic `v0` attr):
+        //   v_interp_p1_f32 v0, attr0.x ; v_cmp_lt_f32 vcc, 0.5, v0 ; s_cbranch_vccnz ELSE
         //   v_mov_b32 v1, 1.0 ; s_branch MERGE
         // ELSE: v_mov_b32 v1, 2.0
         // MERGE: v_add_f32 v2, v1, v1 ; exp mrt0 v2 x4 ; s_endpgm
         let mut words = vec![
-            enc_sop1(0x03, 0, 133),
-            enc_sopc(0x06, 0, 131),
-            enc_sopp(0x05, branch_simm(8, 20)),
+            enc_vintrp(0, 0, 0, 0, 0),
+            enc_vopc(0x01, 240, 0),
+            enc_sopp(0x07, branch_simm(8, 20)),
             enc_vop1(0x01, 1, 242),
             enc_sopp(0x02, branch_simm(16, 24)),
             enc_vop1(0x01, 1, 244),
@@ -30044,14 +30529,14 @@ mod tests {
         );
         assert_naga_wgsl_valid(&out.wgsl);
 
-        // Fragment: `image_sample` inside a branch must use an explicit LOD.
+        // Fragment: `image_sample` inside a runtime-dynamic branch must use an explicit LOD.
         let mut words = vec![
             enc_vintrp(0, 2, 0, 0, 0),
             enc_vintrp(1, 2, 0, 0, 1),
             enc_vintrp(0, 3, 0, 1, 0),
             enc_vintrp(1, 3, 0, 1, 1),
-            enc_sopc(0x06, 0, 128),
-            enc_sopp(0x05, branch_simm(20, 32)),
+            enc_vopc(0x01, 240, 2),
+            enc_sopp(0x07, branch_simm(20, 32)),
         ];
         words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 4, 2, 1));
         words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
@@ -30069,19 +30554,19 @@ mod tests {
 
     #[test]
     fn s_andn2_wrexec_b32_and_saveexec_b64_with_execz_translate_without_unsupported_ops() {
-        //   v_mov_b32 v0, 1.0 ; v_cmp_lt_f32 vcc, 0.5, v0
+        //   v_cmp_lt_f32 vcc, 0.5, v0
         //   s_andn2_wrexec_b32 s3, vcc_lo ; s_cbranch_execz L
-        //   v_mov_b32 v1, 2.0
+        //   v_mov_b32 v1, 2.0 ; buffer_store_dword v1, v0, s[8:11]
         // L: s_mov_b32 exec_lo, -1 ; s_endpgm
-        let words = vec![
-            enc_vop1(0x01, 0, 242),
+        let mut words = vec![
             enc_vopc(0x01, 240, 0),
             enc_sop1(0x47, 3, 106),
-            enc_sopp(0x08, branch_simm(12, 20)),
+            enc_sopp(0x08, branch_simm(8, 24)),
             enc_vop1(0x01, 1, 244),
-            enc_sop1(0x03, 126, 193),
-            enc_sopp(0x01, 0),
         ];
+        words.extend_from_slice(&enc_mubuf(0x1C, 0, 1, 0, 2, false));
+        words.push(enc_sop1(0x03, 126, 193));
+        words.push(enc_sopp(0x01, 0));
         let out = translate_as(&words, Rdna2StageOverride::Compute);
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         assert_eq!(out.translated_op_count, 7, "WGSL:\n{}", out.wgsl);
@@ -30091,18 +30576,18 @@ mod tests {
         assert_naga_wgsl_valid(&out.wgsl);
 
         // Wave64 form: s_and_saveexec_b64 s[4:5], vcc ; s_cbranch_execnz T ; s_branch E
-        // T: v_mov_b32 v1, 2.0
+        // T: v_mov_b32 v1, 2.0 ; buffer_store_dword v1, v0, s[8:11]
         // E: s_mov_b64 exec, s[4:5] ; s_endpgm
-        let words = vec![
-            enc_vop1(0x01, 0, 242),
+        let mut words = vec![
             enc_vopc(0x01, 240, 0),
             enc_sop1(0x24, 4, 106),
-            enc_sopp(0x09, branch_simm(12, 20)),
-            enc_sopp(0x02, branch_simm(16, 24)),
+            enc_sopp(0x09, branch_simm(8, 16)),
+            enc_sopp(0x02, branch_simm(12, 28)),
             enc_vop1(0x01, 1, 244),
-            enc_sop1(0x04, 126, 4),
-            enc_sopp(0x01, 0),
         ];
+        words.extend_from_slice(&enc_mubuf(0x1C, 0, 1, 0, 2, false));
+        words.push(enc_sop1(0x04, 126, 4));
+        words.push(enc_sopp(0x01, 0));
         let out = translate_as(&words, Rdna2StageOverride::Compute);
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("if ("), "WGSL:\n{}", out.wgsl);
@@ -30118,13 +30603,14 @@ mod tests {
             .collect();
         assert_eq!(ops.len(), 24);
         for op in ops {
-            let words = vec![
+            let mut words = vec![
                 enc_vopc(0x01, 240, 0),
                 enc_sop1(op, 2, 106),
-                enc_sopp(0x08, branch_simm(8, 16)),
+                enc_sopp(0x08, branch_simm(8, 24)),
                 enc_vop1(0x01, 1, 244),
-                enc_sopp(0x01, 0),
             ];
+            words.extend_from_slice(&enc_mubuf(0x1C, 0, 1, 0, 2, false));
+            words.push(enc_sopp(0x01, 0));
             let insts = decode_program(&words_to_bytes(&words));
             assert!(classify_exec_mask_op(&insts[1]).is_some(), "op {op:#x}");
             let out = translate_as(&words, Rdna2StageOverride::Compute);
@@ -30134,7 +30620,9 @@ mod tests {
                 out.wgsl
             );
             assert!(
-                out.wgsl.contains("if (") || out.wgsl.contains("exec_mask"),
+                out.wgsl.contains("if (")
+                    || out.wgsl.contains("exec_mask")
+                    || out.ir_opt.dead_branches_folded > 0,
                 "op {op:#x} WGSL:\n{}",
                 out.wgsl
             );

@@ -458,8 +458,8 @@ fn s75_mesh_culled_zero_prim_early_exit_and_cfg_const_alloc_counts() {
     //   exp pos0, pos1 (clip dist), param0..param2, prim; s_endpgm;
     let mut w = Vec::new();
 
-    // s_cmp_eq_u32 s16, 0 -> branch to active path if scc == 0
-    w.push(enc_sopc(0x06, 16, 128));
+    // s_cmp_eq_u32 s0, 0 (runtime-dynamic `wg_id.x`) -> branch to active path if scc == 0
+    w.push(enc_sopc(0x06, 0, 128));
     let br_to_active = w.len();
     w.push(0); // placeholder for s_cbranch_scc0
 
@@ -479,8 +479,10 @@ fn s75_mesh_culled_zero_prim_early_exit_and_cfg_const_alloc_counts() {
     w.push(128u32);
     w.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_ALLOC_REQ)));
 
-    // Exercise exec_mask tracking (`s_and_saveexec_b32`) to confirm GS_ALLOC_REQ & exp respect exec_mask.
-    w.push(enc_sop1(0x3C, 22, 128 + 1)); // s_and_saveexec_b32 s22, 1
+    // Exercise runtime-dynamic exec_mask tracking (`v_cmp_lt_f32` + `s_and_saveexec_b32`) to
+    // confirm GS_ALLOC_REQ & exp respect exec_mask.
+    w.push((0b0111_110u32 << 25) | (0x01u32 << 17) | (0u32 << 9) | 240u32); // v_cmp_lt_f32 vcc, 0.5, v0
+    w.push(enc_sop1(0x3C, 22, 106)); // s_and_saveexec_b32 s22, vcc_lo
 
     // Export pos0, pos1 (auxiliary clip distance), param0, param1, param2, and prim.
     w.push(enc_vop1(0x01, 4, 0xF2)); // v4 = 1.0

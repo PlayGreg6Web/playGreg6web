@@ -59,8 +59,9 @@ use naga::{
     AddressSpace, Arena, AtomicFunction, BinaryOperator, Block, Constant, Expression, Function,
     GatherMode, GlobalVariable, Handle, ImageClass, ImageQuery, Literal, LocalVariable,
     MathFunction, Module, Override, Range, RayPipelineFunction, RayQueryFunction,
-    RelationalFunction, SampleLevel, Scalar, ScalarKind, Span, Statement, StorageFormat,
-    SwitchCase, SwizzleComponent, Type, TypeInner, UnaryOperator, UniqueArena, VectorSize,
+    RelationalFunction, SampleLevel, Scalar, ScalarKind, Span, Statement, StorageAccess,
+    StorageFormat, SwitchCase, SwizzleComponent, Type, TypeInner, UnaryOperator, UniqueArena,
+    VectorSize,
 };
 
 /// Maximum fixed-point optimization iterations per function.
@@ -73,12 +74,16 @@ pub struct IrOptStats {
     pub bitcasts_cancelled: usize,
     /// Pure constant expressions folded (`Binary`, `Unary`, `Select`, `Splat`/`Compose` + `AccessIndex`, `As`).
     pub constants_folded: usize,
-    /// Safe integer/boolean algebraic identities simplified (`x + 0`, `x * 1`, `x | 0`, `x ^ 0`, `x & ~0`, `x << 0`, `x >> 0`, `x ^ x`, `x & x`, `x | x`, `select(a, a, c)`, `!!b`).
+    /// Safe integer/boolean algebraic identities simplified (`x + 0`, `x * 1`, `x * 0`, `x & 0`, `x | 0`, `x ^ 0`, `x & ~0`, `x << 0`, `x >> 0`, `x ^ x`, `x & x`, `x | x`, `select(a, a, c)`, `!!b`, `!(a == b)`).
     pub identities_simplified: usize,
+    /// Constant-condition `If` branches folded, empty pure `If`s pruned, and unreachable tails trimmed after `Return`/`Break`/`Continue`/`Kill`.
+    pub dead_branches_folded: usize,
     /// Local variable `Load` expressions forwarded directly from dominating intra-block stores or initializers.
     pub locals_forwarded: usize,
     /// Duplicate pure expressions deduplicated by intra-block Common Subexpression Elimination (CSE).
     pub cse_eliminated: usize,
+    /// Duplicate immutable `Load` expressions from read-only `@group/@binding` globals (`Uniform` / `Storage(LOAD)`) deduplicated by intra-block CSE.
+    pub readonly_loads_cse: usize,
     /// Dead `LocalVariable` declarations removed along with their pure stores.
     pub dead_locals_removed: usize,
     /// Unreferenced pure expressions pruned from `Statement::Emit` ranges.
@@ -91,8 +96,10 @@ impl IrOptStats {
         self.bitcasts_cancelled
             + self.constants_folded
             + self.identities_simplified
+            + self.dead_branches_folded
             + self.locals_forwarded
             + self.cse_eliminated
+            + self.readonly_loads_cse
             + self.dead_locals_removed
             + self.dead_emits_trimmed
     }
@@ -102,8 +109,10 @@ impl IrOptStats {
         self.bitcasts_cancelled == 0
             && self.constants_folded == 0
             && self.identities_simplified == 0
+            && self.dead_branches_folded == 0
             && self.locals_forwarded == 0
             && self.cse_eliminated == 0
+            && self.readonly_loads_cse == 0
             && self.dead_locals_removed == 0
             && self.dead_emits_trimmed == 0
     }
@@ -113,8 +122,10 @@ impl IrOptStats {
         self.bitcasts_cancelled += other.bitcasts_cancelled;
         self.constants_folded += other.constants_folded;
         self.identities_simplified += other.identities_simplified;
+        self.dead_branches_folded += other.dead_branches_folded;
         self.locals_forwarded += other.locals_forwarded;
         self.cse_eliminated += other.cse_eliminated;
+        self.readonly_loads_cse += other.readonly_loads_cse;
         self.dead_locals_removed += other.dead_locals_removed;
         self.dead_emits_trimmed += other.dead_emits_trimmed;
     }
@@ -195,17 +206,21 @@ fn optimize_function_with_ctx(ctx: &ModuleContext<'_>, func: &mut Function) -> I
         // 1. Algebraic simplification, bitcast cancellation, and constant folding.
         simplify_expressions(ctx, func, &mut pass);
 
-        // 2. Intra-block Store-to-Load local variable forwarding (#2164).
+        // 2. Constant-condition dead-branch folding & unreachable statement trimming (#2178).
+        fold_dead_branches_and_trim_unreachable(func, &mut pass);
+
+        // 3. Intra-block Store-to-Load local variable forwarding (#2164).
         forward_local_loads(ctx, func, &mut pass);
 
-        // 3. Intra-block Common Subexpression Elimination (CSE) for pure expressions (#2164).
+        // 4. Intra-block Common Subexpression Elimination (CSE) for pure expressions and
+        //    immutable read-only global loads (#2164, #2178).
         eliminate_common_subexpressions(ctx, func, &mut pass);
 
-        // 4. Dead local-variable pruning (locals never loaded or escaped by pointer, whose
+        // 5. Dead local-variable pruning (locals never loaded or escaped by pointer, whose
         //    stores have transitively pure values and indices).
         prune_dead_locals(func, &mut pass);
 
-        // 5. Dead pure-expression Emit trimming and order-preserving expression arena compaction.
+        // 6. Dead pure-expression Emit trimming and order-preserving expression arena compaction.
         compact_live_expressions_and_emits(func, &mut pass);
 
         total.merge_from(pass);
@@ -1162,11 +1177,13 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
         return;
     }
 
-    // Track handles directly consumed by `As { kind: Float, convert: None }` or float `Binary` ops
-    // so folding an expression to a bare `Literal` never creates a Tint-rejected const-eval
-    // expression (e.g., `bitcast<f32>(0x7f800000u)` or `1e38f * 10.0f`).
+    // Track handles directly consumed by `As { kind: Float, convert: None }`, float `Binary` ops,
+    // or integer `Divide`/`Modulo` divisors so folding an expression to a bare `Literal` never
+    // creates a Tint-rejected const-eval expression (e.g., `bitcast<f32>(0x7f800000u)`,
+    // `1e38f * 10.0f`, or `10u / 0u`).
     let mut used_by_float_bitcast = vec![false; n];
     let mut used_by_float_binary = vec![false; n];
+    let mut used_as_divisor = vec![false; n];
     for (_, expr) in func.expressions.iter() {
         match expr {
             Expression::As {
@@ -1178,16 +1195,19 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
             }
             Expression::Binary {
                 op:
-                    BinaryOperator::Add
+                    op @ (BinaryOperator::Add
                     | BinaryOperator::Subtract
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
-                    | BinaryOperator::Modulo,
+                    | BinaryOperator::Modulo),
                 left,
                 right,
             } => {
                 used_by_float_binary[left.index()] = true;
                 used_by_float_binary[right.index()] = true;
+                if matches!(op, BinaryOperator::Divide | BinaryOperator::Modulo) {
+                    used_as_divisor[right.index()] = true;
+                }
             }
             _ => {}
         }
@@ -1232,6 +1252,9 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
             {
                 return false;
             }
+            if used_as_divisor[idx] && matches!(lit, Literal::U32(0) | Literal::I32(0)) {
+                return false;
+            }
             true
         };
 
@@ -1254,6 +1277,7 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
         enum Rewrite {
             Redirect(Handle<Expression>, RewriteKind),
             Literal(Literal, RewriteKind),
+            ReplaceExpr(Expression, RewriteKind),
         }
         enum RewriteKind {
             Bitcast,
@@ -1348,6 +1372,71 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                         },
                     ) if safe_to_redirect_to(*orig) => {
                         Some(Rewrite::Redirect(*orig, RewriteKind::Identity))
+                    }
+                    // Negated comparison identities strictly on integer/boolean operands (NEVER
+                    // floats, where `!(NaN < b)` != `NaN >= b`).
+                    (
+                        UnaryOperator::LogicalNot,
+                        Expression::Binary {
+                            op: cmp_op,
+                            left,
+                            right,
+                        },
+                    ) => {
+                        let cmp_op = *cmp_op;
+                        let left = *left;
+                        let right = *right;
+                        let l_kind = resolved[left.index()]
+                            .as_ref()
+                            .and_then(value_shape)
+                            .map(|(_, s)| s.kind);
+                        let r_kind = resolved[right.index()]
+                            .as_ref()
+                            .and_then(value_shape)
+                            .map(|(_, s)| s.kind);
+                        let inverted = match (cmp_op, l_kind, r_kind) {
+                            (
+                                BinaryOperator::Equal,
+                                Some(ScalarKind::Uint | ScalarKind::Sint | ScalarKind::Bool),
+                                Some(ScalarKind::Uint | ScalarKind::Sint | ScalarKind::Bool),
+                            ) if l_kind == r_kind => Some(BinaryOperator::NotEqual),
+                            (
+                                BinaryOperator::NotEqual,
+                                Some(ScalarKind::Uint | ScalarKind::Sint | ScalarKind::Bool),
+                                Some(ScalarKind::Uint | ScalarKind::Sint | ScalarKind::Bool),
+                            ) if l_kind == r_kind => Some(BinaryOperator::Equal),
+                            (
+                                BinaryOperator::Less,
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                            ) if l_kind == r_kind => Some(BinaryOperator::GreaterEqual),
+                            (
+                                BinaryOperator::LessEqual,
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                            ) if l_kind == r_kind => Some(BinaryOperator::Greater),
+                            (
+                                BinaryOperator::Greater,
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                            ) if l_kind == r_kind => Some(BinaryOperator::LessEqual),
+                            (
+                                BinaryOperator::GreaterEqual,
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                                Some(ScalarKind::Uint | ScalarKind::Sint),
+                            ) if l_kind == r_kind => Some(BinaryOperator::Less),
+                            _ => None,
+                        };
+                        inverted.map(|inv_op| {
+                            Rewrite::ReplaceExpr(
+                                Expression::Binary {
+                                    op: inv_op,
+                                    left,
+                                    right,
+                                },
+                                RewriteKind::Identity,
+                            )
+                        })
                     }
                     _ => None,
                 }
@@ -1461,6 +1550,17 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 }
                 Rewrite::Literal(lit, kind) => {
                     func.expressions[h] = Expression::Literal(lit);
+                    resolved[idx] =
+                        infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
+                    func.named_expressions.shift_remove(&h);
+                    match kind {
+                        RewriteKind::Bitcast => stats.bitcasts_cancelled += 1,
+                        RewriteKind::ConstFold => stats.constants_folded += 1,
+                        RewriteKind::Identity => stats.identities_simplified += 1,
+                    }
+                }
+                Rewrite::ReplaceExpr(new_expr, kind) => {
+                    func.expressions[h] = new_expr;
                     resolved[idx] =
                         infer_single_expr_type(ctx, func, &resolved, &func.expressions[h]);
                     func.named_expressions.shift_remove(&h);
@@ -1643,6 +1743,19 @@ fn simplify_integer_binary_identity(
             if is_int_one(left_expr) && right_matches_ty {
                 return Some(IntIdentity::Redirect(right));
             }
+            if (is_int_zero(right_expr) && is_pure_expr_node(left_expr))
+                || (is_int_zero(left_expr) && is_pure_expr_node(right_expr))
+            {
+                match *res_ty {
+                    TypeInner::Scalar(Scalar::U32) => {
+                        return Some(IntIdentity::Literal(Literal::U32(0)));
+                    }
+                    TypeInner::Scalar(Scalar::I32) => {
+                        return Some(IntIdentity::Literal(Literal::I32(0)));
+                    }
+                    _ => {}
+                }
+            }
         }
         BinaryOperator::InclusiveOr => {
             if is_int_zero(right_expr) && left_matches_ty {
@@ -1684,6 +1797,19 @@ fn simplify_integer_binary_identity(
             if left == right && left_matches_ty {
                 return Some(IntIdentity::Redirect(left));
             }
+            if (is_int_zero(right_expr) && is_pure_expr_node(left_expr))
+                || (is_int_zero(left_expr) && is_pure_expr_node(right_expr))
+            {
+                match *res_ty {
+                    TypeInner::Scalar(Scalar::U32) => {
+                        return Some(IntIdentity::Literal(Literal::U32(0)));
+                    }
+                    TypeInner::Scalar(Scalar::I32) => {
+                        return Some(IntIdentity::Literal(Literal::I32(0)));
+                    }
+                    _ => {}
+                }
+            }
         }
         BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight => {
             if matches!(right_expr, Expression::Literal(Literal::U32(0))) && left_matches_ty {
@@ -1697,7 +1823,180 @@ fn simplify_integer_binary_identity(
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: Intra-block Store-to-Load local variable forwarding (#2164)
+// Pass 2: Constant-condition dead-branch folding & unreachable trimming (#2178)
+// ---------------------------------------------------------------------------
+
+/// Compute `transitively_pure[h]`: `true` iff `h` and all of its transitive expression operands
+/// satisfy [`is_pure_expr_node`].
+fn compute_transitively_pure_exprs(func: &Function) -> Vec<bool> {
+    let mut pure = vec![false; func.expressions.len()];
+    for (h, expr) in func.expressions.iter() {
+        if !is_pure_expr_node(expr) {
+            continue;
+        }
+        let mut all_children_pure = true;
+        visit_expr_children(expr, |c| {
+            if !pure[c.index()] {
+                all_children_pure = false;
+            }
+        });
+        pure[h.index()] = all_children_pure;
+    }
+    pure
+}
+
+fn stmt_contains_return(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Return { .. } => true,
+        Statement::Block(inner) => inner.iter().any(stmt_contains_return),
+        Statement::If { accept, reject, .. } => {
+            accept.iter().any(stmt_contains_return) || reject.iter().any(stmt_contains_return)
+        }
+        Statement::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(stmt_contains_return)),
+        Statement::Loop {
+            body, continuing, ..
+        } => body.iter().any(stmt_contains_return) || continuing.iter().any(stmt_contains_return),
+        _ => false,
+    }
+}
+
+fn fold_and_trim_block(
+    block: &mut Block,
+    exprs: &Arena<Expression>,
+    transitively_pure: &[bool],
+    func_is_void: bool,
+    stats: &mut IrOptStats,
+) {
+    let old_block = std::mem::replace(block, Block::new());
+    let mut folded_stmts: Vec<(Statement, Span)> = Vec::with_capacity(old_block.len());
+
+    for (stmt, span) in old_block.span_into_iter() {
+        match stmt {
+            Statement::Block(mut inner) => {
+                fold_and_trim_block(&mut inner, exprs, transitively_pure, func_is_void, stats);
+                if !inner.is_empty() {
+                    folded_stmts.push((Statement::Block(inner), span));
+                }
+            }
+            Statement::If {
+                condition,
+                mut accept,
+                mut reject,
+            } => {
+                fold_and_trim_block(&mut accept, exprs, transitively_pure, func_is_void, stats);
+                fold_and_trim_block(&mut reject, exprs, transitively_pure, func_is_void, stats);
+                match exprs[condition] {
+                    Expression::Literal(Literal::Bool(true)) => {
+                        stats.dead_branches_folded += 1;
+                        folded_stmts.extend(accept.span_into_iter());
+                    }
+                    Expression::Literal(Literal::Bool(false)) => {
+                        stats.dead_branches_folded += 1;
+                        folded_stmts.extend(reject.span_into_iter());
+                    }
+                    _ if accept.is_empty()
+                        && reject.is_empty()
+                        && transitively_pure[condition.index()] =>
+                    {
+                        stats.dead_branches_folded += 1;
+                    }
+                    _ => {
+                        folded_stmts.push((
+                            Statement::If {
+                                condition,
+                                accept,
+                                reject,
+                            },
+                            span,
+                        ));
+                    }
+                }
+            }
+            Statement::Switch {
+                selector,
+                mut cases,
+            } => {
+                for case in &mut cases {
+                    fold_and_trim_block(
+                        &mut case.body,
+                        exprs,
+                        transitively_pure,
+                        func_is_void,
+                        stats,
+                    );
+                }
+                folded_stmts.push((Statement::Switch { selector, cases }, span));
+            }
+            Statement::Loop {
+                mut body,
+                mut continuing,
+                break_if,
+            } => {
+                fold_and_trim_block(&mut body, exprs, transitively_pure, func_is_void, stats);
+                fold_and_trim_block(
+                    &mut continuing,
+                    exprs,
+                    transitively_pure,
+                    func_is_void,
+                    stats,
+                );
+                folded_stmts.push((
+                    Statement::Loop {
+                        body,
+                        continuing,
+                        break_if,
+                    },
+                    span,
+                ));
+            }
+            other => folded_stmts.push((other, span)),
+        }
+    }
+
+    // Trim unreachable statements following an unconditional terminator (`Return`, `Break`,
+    // `Continue`, or `Kill` when dropping the tail cannot remove a `Return` required by WGSL
+    // control-flow analysis on non-void functions).
+    let mut new_block = Block::with_capacity(folded_stmts.len());
+    let total_len = folded_stmts.len();
+    for (idx, (stmt, span)) in folded_stmts.iter().enumerate() {
+        let is_hard_term = matches!(
+            stmt,
+            Statement::Return { .. } | Statement::Break | Statement::Continue
+        );
+        let is_trim_kill = matches!(stmt, Statement::Kill)
+            && (func_is_void
+                || !folded_stmts[idx + 1..]
+                    .iter()
+                    .any(|(s, _)| stmt_contains_return(s)));
+        new_block.push(stmt.clone(), *span);
+        if (is_hard_term || is_trim_kill) && idx + 1 < total_len {
+            stats.dead_branches_folded += 1;
+            break;
+        }
+    }
+
+    *block = new_block;
+}
+
+fn fold_dead_branches_and_trim_unreachable(func: &mut Function, stats: &mut IrOptStats) {
+    if func.body.is_empty() {
+        return;
+    }
+    let transitively_pure = compute_transitively_pure_exprs(func);
+    let func_is_void = func.result.is_none();
+    fold_and_trim_block(
+        &mut func.body,
+        &func.expressions,
+        &transitively_pure,
+        func_is_void,
+        stats,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pass 3: Intra-block Store-to-Load local variable forwarding (#2164)
 // ---------------------------------------------------------------------------
 
 /// Maximum distinct non-escaped locals tracked precisely per expression before falling back to
@@ -1726,21 +2025,33 @@ fn infer_all_expr_types(ctx: &ModuleContext<'_>, func: &Function) -> Vec<Option<
     resolved
 }
 
-/// Compute whether each expression handle is a pointer rooted in an immutable `Uniform` global.
+/// Returns `true` iff `var` is strictly immutable for the entire shader invocation
+/// (`AddressSpace::Uniform` or read-only `AddressSpace::Storage { access: StorageAccess::LOAD }`).
+#[inline]
+fn is_immutable_readonly_global(var: &GlobalVariable) -> bool {
+    match var.space {
+        AddressSpace::Uniform => true,
+        AddressSpace::Storage { access } => access == StorageAccess::LOAD,
+        _ => false,
+    }
+}
+
+/// Compute whether each expression handle is a pointer rooted in an immutable read-only global
+/// (`AddressSpace::Uniform` or `AddressSpace::Storage { access: StorageAccess::LOAD }`).
 fn compute_uniform_ptr_origins(ctx: &ModuleContext<'_>, func: &Function) -> Vec<bool> {
-    let mut is_uniform = vec![false; func.expressions.len()];
+    let mut is_readonly = vec![false; func.expressions.len()];
     for (h, expr) in func.expressions.iter() {
-        is_uniform[h.index()] = match expr {
+        is_readonly[h.index()] = match expr {
             Expression::GlobalVariable(g) => {
-                ctx.global_variables[*g].space == AddressSpace::Uniform
+                is_immutable_readonly_global(&ctx.global_variables[*g])
             }
             Expression::Access { base, .. } | Expression::AccessIndex { base, .. } => {
-                is_uniform[base.index()]
+                is_readonly[base.index()]
             }
             _ => false,
         };
     }
-    is_uniform
+    is_readonly
 }
 
 /// Identify all `LocalVariable`s whose address escapes into ANY non-`Load`/`Store`/`Access`
@@ -2622,6 +2933,13 @@ enum CseOperand {
     LocalVariable(Handle<LocalVariable>),
 }
 
+/// Canonical step along a read-only global pointer chain (`AccessIndex` / `Access`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PtrStep {
+    Index(u32),
+    Dynamic(CseOperand),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CseKey {
     Access {
@@ -2674,6 +2992,12 @@ enum CseKey {
         expr: CseOperand,
         kind: ScalarKind,
         convert: Option<u8>,
+    },
+    /// Immutable `Load` from a read-only `@group/@binding` global (`Uniform` or `Storage(LOAD)`)
+    /// along a canonical pure pointer chain (`GlobalVariable` + `AccessIndex`/`Access` steps).
+    ReadOnlyLoad {
+        global: Handle<GlobalVariable>,
+        steps: Vec<PtrStep>,
     },
 }
 
@@ -2737,7 +3061,49 @@ fn is_safe_commutative_cse_op(
     }
 }
 
+/// Canonicalize a pointer chain rooted in an immutable read-only global (`AddressSpace::Uniform`
+/// or `AddressSpace::Storage { access: StorageAccess::LOAD }`) with pure `AccessIndex`/`Access`
+/// index steps. Returns `None` for any mutable global (`Storage` with `STORE`, `WorkGroup`,
+/// `Private`), local variable, or non-chain pointer.
+fn canonicalize_readonly_ptr_chain(
+    ctx: &ModuleContext<'_>,
+    func: &Function,
+    ptr: Handle<Expression>,
+    remap: &[Handle<Expression>],
+) -> Option<(Handle<GlobalVariable>, Vec<PtrStep>)> {
+    const MAX_CHAIN_DEPTH: usize = 64;
+    let mut cur = resolve_remap(remap, ptr);
+    let mut steps: Vec<PtrStep> = Vec::new();
+    for _ in 0..MAX_CHAIN_DEPTH {
+        match func.expressions[cur] {
+            Expression::GlobalVariable(g) => {
+                if is_immutable_readonly_global(&ctx.global_variables[g]) {
+                    steps.reverse();
+                    return Some((g, steps));
+                }
+                return None;
+            }
+            Expression::AccessIndex { base, index } => {
+                steps.push(PtrStep::Index(index));
+                cur = resolve_remap(remap, base);
+            }
+            Expression::Access { base, index } => {
+                let r_idx = resolve_remap(remap, index);
+                let step = match func.expressions[r_idx] {
+                    Expression::Literal(Literal::U32(k)) => PtrStep::Index(k),
+                    _ => PtrStep::Dynamic(canonicalize_cse_operand(func, r_idx)),
+                };
+                steps.push(step);
+                cur = resolve_remap(remap, base);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn build_cse_key(
+    ctx: &ModuleContext<'_>,
     h: Handle<Expression>,
     func: &Function,
     resolved: &[Option<TypeInner>],
@@ -2852,18 +3218,25 @@ fn build_cse_key(
             kind: *kind,
             convert: *convert,
         }),
-        // Never CSE loads, texture ops, derivatives, statement results, or pre-emitted handles.
+        // Immutable read-only `@group/@binding` global loads (`Uniform` / `Storage(LOAD)` only!).
+        Expression::Load { pointer } => {
+            let (global, steps) = canonicalize_readonly_ptr_chain(ctx, func, *pointer, remap)?;
+            Some(CseKey::ReadOnlyLoad { global, steps })
+        }
+        // Never CSE mutable loads, texture ops, derivatives, statement results, or pre-emitted handles.
         _ => None,
     }
 }
 
 struct CseContext<'a> {
+    ctx: &'a ModuleContext<'a>,
     func: &'a Function,
     resolved: &'a [Option<TypeInner>],
     table: HashMap<CseKey, Handle<Expression>>,
     undo_stack: Vec<CseKey>,
     remap: Vec<Handle<Expression>>,
     cse_dropped: Vec<Handle<Expression>>,
+    readonly_loads_dropped: Vec<Handle<Expression>>,
 }
 
 impl CseContext<'_> {
@@ -2883,12 +3256,19 @@ fn walk_cse_block(block: &Block, cctx: &mut CseContext<'_>, stats: &mut IrOptSta
         match stmt {
             Statement::Emit(range) => {
                 for h in range.clone() {
-                    if let Some(key) = build_cse_key(h, cctx.func, cctx.resolved, &cctx.remap) {
+                    if let Some(key) =
+                        build_cse_key(cctx.ctx, h, cctx.func, cctx.resolved, &cctx.remap)
+                    {
                         if let Some(&canon) = cctx.table.get(&key) {
                             if canon != h && canon.index() < h.index() {
                                 cctx.remap[h.index()] = canon;
-                                cctx.cse_dropped.push(h);
-                                stats.cse_eliminated += 1;
+                                if matches!(key, CseKey::ReadOnlyLoad { .. }) {
+                                    cctx.readonly_loads_dropped.push(h);
+                                    stats.readonly_loads_cse += 1;
+                                } else {
+                                    cctx.cse_dropped.push(h);
+                                    stats.cse_eliminated += 1;
+                                }
                             }
                         } else {
                             cctx.table.insert(key.clone(), h);
@@ -2933,20 +3313,22 @@ fn eliminate_common_subexpressions(
     let resolved = infer_all_expr_types(ctx, func);
     let handles: Vec<Handle<Expression>> = func.expressions.iter().map(|(h, _)| h).collect();
 
-    let (remap, cse_dropped) = {
+    let (remap, cse_dropped, readonly_loads_dropped) = {
         let mut cctx = CseContext {
+            ctx,
             func,
             resolved: &resolved,
             table: HashMap::new(),
             undo_stack: Vec::new(),
             remap: handles.clone(),
             cse_dropped: Vec::new(),
+            readonly_loads_dropped: Vec::new(),
         };
         walk_cse_block(&func.body, &mut cctx, stats);
-        (cctx.remap, cctx.cse_dropped)
+        (cctx.remap, cctx.cse_dropped, cctx.readonly_loads_dropped)
     };
 
-    if cse_dropped.is_empty() {
+    if cse_dropped.is_empty() && readonly_loads_dropped.is_empty() {
         return;
     }
 
@@ -2965,6 +3347,13 @@ fn eliminate_common_subexpressions(
         }
     }
     for h in cse_dropped {
+        func.named_expressions.shift_remove(&h);
+    }
+    // Neutralize deduplicated read-only `Load` handles so `collect_live_expressions` and
+    // `compact_live_expressions_and_emits` drop both the duplicate `Load` and its dead pointer
+    // chain cleanly from `Statement::Emit` and the expression arena.
+    for h in readonly_loads_dropped {
+        func.expressions[h] = Expression::Literal(Literal::Bool(false));
         func.named_expressions.shift_remove(&h);
     }
 }

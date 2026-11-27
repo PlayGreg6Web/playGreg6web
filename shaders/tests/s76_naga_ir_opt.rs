@@ -1229,13 +1229,15 @@ fn ir_opt_stats_helpers_merge_and_zero_check() {
         bitcasts_cancelled: 3,
         constants_folded: 2,
         identities_simplified: 5,
+        dead_branches_folded: 8,
         locals_forwarded: 6,
         cse_eliminated: 7,
+        readonly_loads_cse: 9,
         dead_locals_removed: 1,
         dead_emits_trimmed: 4,
     };
     assert!(!b.is_zero());
-    assert_eq!(b.total_changes(), 28);
+    assert_eq!(b.total_changes(), 45);
     a.merge_from(b);
     assert_eq!(a, b);
 }

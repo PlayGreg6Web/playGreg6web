@@ -1544,6 +1544,72 @@ pub enum WaveStrategy {
     WorkgroupEmulation,
 }
 
+/// RDNA2 wave lowering mode (`#2178`).
+///
+/// Defaults to [`WaveEmulMode::WorkgroupLds`] so baseline WebGPU adapters without the optional
+/// `subgroups` feature remain 100% supported with zero behavior change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum WaveEmulMode {
+    /// Baseline WebGPU lowering via `var<workgroup> pg6_wave_lds` and `workgroupBarrier()`.
+    #[default]
+    WorkgroupLds,
+    /// Hardware WebGPU `subgroups` (`enable subgroups;`) fast path using 1-cycle subgroup
+    /// builtins (`subgroupBroadcastFirst`, `subgroupBallot`, `subgroupShuffle`,
+    /// `subgroupShuffleXor`, `subgroupAdd`/`Min`/`Max`/`And`/`Or`/`Xor`,
+    /// `subgroupExclusiveAdd`), falling back to `pg6_wave_lds` only for ops that cannot be
+    /// expressed with hardware subgroup intrinsics (such as forward scatter `ds_permute_b32`).
+    Subgroups,
+}
+
+impl WaveEmulMode {
+    /// Canonical lowercase CLI/JSON identifier for this wave lowering mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkgroupLds => "lds",
+            Self::Subgroups => "subgroups",
+        }
+    }
+
+    /// Parse a CLI `--wave-mode` value (`lds` / `workgroup-lds` or `subgroups`).
+    pub fn parse_str(value: &str) -> Result<Self, String> {
+        if value.eq_ignore_ascii_case("lds")
+            || value.eq_ignore_ascii_case("workgroup-lds")
+            || value.eq_ignore_ascii_case("workgroup_lds")
+        {
+            Ok(Self::WorkgroupLds)
+        } else if value.eq_ignore_ascii_case("subgroups") || value.eq_ignore_ascii_case("subgroup")
+        {
+            Ok(Self::Subgroups)
+        } else {
+            Err(format!(
+                "invalid value for --wave-mode: '{value}' (expected 'lds' or 'subgroups')"
+            ))
+        }
+    }
+
+    /// Map this mode to the corresponding SPIR-V/Naga IR [`WaveStrategy`].
+    pub const fn to_wave_strategy(self) -> WaveStrategy {
+        match self {
+            Self::WorkgroupLds => WaveStrategy::WorkgroupEmulation,
+            Self::Subgroups => WaveStrategy::NativeSubgroups,
+        }
+    }
+
+    /// WGSL directive preamble required when hardware subgroup ops are emitted in this mode.
+    pub const fn wgsl_preamble(self) -> &'static str {
+        match self {
+            Self::WorkgroupLds => "",
+            Self::Subgroups => WGSL_SUBGROUPS_ENABLE,
+        }
+    }
+}
+
+impl fmt::Display for WaveEmulMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl WaveStrategy {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1619,6 +1685,116 @@ impl WaveLoweringOptions {
             max_workgroup_storage_bytes: WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
         }
     }
+
+    /// Build [`WaveLoweringOptions`] directly from a [`WaveEmulMode`].
+    pub fn from_emul_mode(mode: WaveEmulMode) -> Self {
+        Self::new(mode.to_wave_strategy())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Naga IR hardware subgroup statement builders (shared with rdna2_to_wgsl)
+// ---------------------------------------------------------------------------
+
+/// Emit `subgroupBroadcastFirst(value)` into `func` and return its result expression handle.
+pub fn emit_subgroup_broadcast_first(
+    func: &mut Function,
+    value: Handle<Expression>,
+    ty: Handle<Type>,
+) -> Handle<Expression> {
+    let result = func
+        .expressions
+        .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
+    func.body.push(
+        Statement::SubgroupGather {
+            mode: GatherMode::BroadcastFirst,
+            argument: value,
+            result,
+        },
+        Span::UNDEFINED,
+    );
+    result
+}
+
+/// Emit `subgroupBallot(predicate)` into `func` and return its `vec4<u32>` result handle.
+pub fn emit_subgroup_ballot(
+    func: &mut Function,
+    predicate: Option<Handle<Expression>>,
+) -> Handle<Expression> {
+    let result = func
+        .expressions
+        .append(Expression::SubgroupBallotResult, Span::UNDEFINED);
+    func.body.push(
+        Statement::SubgroupBallot { result, predicate },
+        Span::UNDEFINED,
+    );
+    result
+}
+
+/// Emit `subgroupShuffle(value, lane)` into `func` and return its result expression handle.
+pub fn emit_subgroup_shuffle(
+    func: &mut Function,
+    value: Handle<Expression>,
+    lane: Handle<Expression>,
+    ty: Handle<Type>,
+) -> Handle<Expression> {
+    let result = func
+        .expressions
+        .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
+    func.body.push(
+        Statement::SubgroupGather {
+            mode: GatherMode::Shuffle(lane),
+            argument: value,
+            result,
+        },
+        Span::UNDEFINED,
+    );
+    result
+}
+
+/// Emit `subgroupShuffleXor(value, mask)` into `func` and return its result expression handle.
+pub fn emit_subgroup_shuffle_xor(
+    func: &mut Function,
+    value: Handle<Expression>,
+    mask: Handle<Expression>,
+    ty: Handle<Type>,
+) -> Handle<Expression> {
+    let result = func
+        .expressions
+        .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
+    func.body.push(
+        Statement::SubgroupGather {
+            mode: GatherMode::ShuffleXor(mask),
+            argument: value,
+            result,
+        },
+        Span::UNDEFINED,
+    );
+    result
+}
+
+/// Emit a subgroup collective reduction or scan (`subgroupAdd`, `subgroupMin`, `subgroupMax`,
+/// `subgroupAnd`, `subgroupOr`, `subgroupXor`, `subgroupExclusiveAdd`, ...) into `func`.
+pub fn emit_subgroup_collective(
+    func: &mut Function,
+    op: SubgroupOperation,
+    collective_op: CollectiveOperation,
+    value: Handle<Expression>,
+    ty: Handle<Type>,
+) -> Handle<Expression> {
+    let result = func
+        .expressions
+        .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
+    func.body.push(
+        Statement::SubgroupCollectiveOperation {
+            op,
+            collective_op,
+            argument: value,
+            result,
+        },
+        Span::UNDEFINED,
+    );
+    result
 }
 
 /// One wave operation lowered by [`lower_wave_ops`].
@@ -4771,6 +4947,96 @@ fn {p}ds_permute_b32(local_idx: u32, byte_addr: u32, value: u32) -> u32 {{
     }}
     workgroupBarrier();
     return result;
+}}
+
+fn {p}wave_reduce_add_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var acc: u32 = 0u;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        acc = acc + {p}wave_scratch[s];
+    }}
+    workgroupBarrier();
+    return acc;
+}}
+
+fn {p}wave_reduce_min_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var acc: u32 = 0xffffffffu;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        acc = min(acc, {p}wave_scratch[s]);
+    }}
+    workgroupBarrier();
+    return acc;
+}}
+
+fn {p}wave_reduce_max_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var acc: u32 = 0u;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        acc = max(acc, {p}wave_scratch[s]);
+    }}
+    workgroupBarrier();
+    return acc;
+}}
+
+fn {p}wave_reduce_and_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var acc: u32 = 0xffffffffu;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        acc = acc & {p}wave_scratch[s];
+    }}
+    workgroupBarrier();
+    return acc;
+}}
+
+fn {p}wave_reduce_or_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var acc: u32 = 0u;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        acc = acc | {p}wave_scratch[s];
+    }}
+    workgroupBarrier();
+    return acc;
+}}
+
+fn {p}wave_reduce_xor_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var acc: u32 = 0u;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        acc = acc ^ {p}wave_scratch[s];
+    }}
+    workgroupBarrier();
+    return acc;
+}}
+
+fn {p}wave_exclusive_add_u32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    var acc: u32 = 0u;
+    for (var s: u32 = base; s < local_idx; s = s + 1u) {{
+        acc = acc + {p}wave_scratch[s];
+    }}
+    workgroupBarrier();
+    return acc;
 }}"
     );
     out
@@ -4848,9 +5114,52 @@ fn {p}ds_swizzle_b32(sg_lane: u32, value: u32, offset16: u32) -> u32 {{
 fn {p}ds_bpermute_b32(byte_addr: u32, value: u32, lane_mask: u32) -> u32 {{
     let src_lane = (byte_addr >> 2u) & (lane_mask & 63u);
     return subgroupShuffle(value, src_lane);
+}}
+
+fn {p}wave_reduce_add_u32(value: u32) -> u32 {{
+    return subgroupAdd(value);
+}}
+
+fn {p}wave_reduce_min_u32(value: u32) -> u32 {{
+    return subgroupMin(value);
+}}
+
+fn {p}wave_reduce_max_u32(value: u32) -> u32 {{
+    return subgroupMax(value);
+}}
+
+fn {p}wave_reduce_and_u32(value: u32) -> u32 {{
+    return subgroupAnd(value);
+}}
+
+fn {p}wave_reduce_or_u32(value: u32) -> u32 {{
+    return subgroupOr(value);
+}}
+
+fn {p}wave_reduce_xor_u32(value: u32) -> u32 {{
+    return subgroupXor(value);
+}}
+
+fn {p}wave_exclusive_add_u32(value: u32) -> u32 {{
+    return subgroupExclusiveAdd(value);
 }}"
     );
     out
+}
+
+/// Emit the standalone RDNA2 wave helper WGSL library for the chosen [`WaveEmulMode`].
+///
+/// * [`WaveEmulMode::WorkgroupLds`]: baseline WebGPU `var<workgroup>` + `workgroupBarrier()`.
+/// * [`WaveEmulMode::Subgroups`]: prepends [`WGSL_SUBGROUPS_ENABLE`] (`enable subgroups;`) and
+///   emits 1-cycle hardware subgroup helpers with zero workgroup barriers.
+pub fn rdna_wave_emul_wgsl(mode: WaveEmulMode, config: &RdnaComputeWaveEmulConfig) -> String {
+    match mode {
+        WaveEmulMode::WorkgroupLds => rdna_compute_wave_emul_wgsl(config),
+        WaveEmulMode::Subgroups => format!(
+            "{WGSL_SUBGROUPS_ENABLE}{}",
+            rdna_native_subgroup_wave_wgsl(&config.prefix)
+        ),
+    }
 }
 
 /// Emit a standalone WGSL prelude for lowering RDNA2 `s_sendmsg(GS_ALLOC_REQ)` (`m0[10:0]` vertex

@@ -32,7 +32,8 @@ use playgta6_shaders::rdna2_pack::{
     pack_rdna2_sources_to_file,
 };
 use playgta6_shaders::rdna2_to_wgsl::{
-    Rdna2StageOverride, Rdna2TranslateOptions, parse_fssm_stage_metadata, translate_rdna2_to_wgsl,
+    Rdna2StageOverride, Rdna2TranslateOptions, WaveEmulMode, parse_fssm_stage_metadata,
+    translate_rdna2_to_wgsl,
 };
 use playgta6_shaders::reflect::{
     LAYOUT_MANIFEST_FILE_NAME, ReflectError, RegisterConvention, build_layout_manifest,
@@ -85,6 +86,7 @@ enum Command {
         file_path: PathBuf,
         out_path: Option<PathBuf>,
         stage: Rdna2StageOverride,
+        wave_mode: WaveEmulMode,
         json: bool,
     },
     PackRdna2 {
@@ -92,6 +94,7 @@ enum Command {
         manifest_path: Option<PathBuf>,
         out_path: PathBuf,
         pack_version: PackVersion,
+        wave_mode: WaveEmulMode,
         best_effort: bool,
         max_wgsl_bytes: Option<usize>,
         max_pack_bytes: Option<u64>,
@@ -119,10 +122,10 @@ fn print_usage() {
     eprintln!("  playgta6-shaders reflect-dxil <file-or-dir> [--out <json>] [--json]");
     eprintln!("  playgta6-shaders disasm-rdna2 <file> [--json] [--max-instructions <N>]");
     eprintln!(
-        "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--json]"
+        "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--wave-mode lds|subgroups] [--json]"
     );
     eprintln!(
-        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--pack-version auto|1|2] [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
+        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--pack-version auto|1|2] [--wave-mode lds|subgroups] [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
     );
     eprintln!();
     eprintln!(
@@ -421,6 +424,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut file_path: Option<PathBuf> = None;
             let mut out_path: Option<PathBuf> = None;
             let mut stage = Rdna2StageOverride::Auto;
+            let mut wave_mode = WaveEmulMode::WorkgroupLds;
             let mut json = false;
 
             let mut i = 1;
@@ -440,6 +444,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                             .ok_or_else(|| "missing value for --stage".to_string())?;
                         stage = Rdna2StageOverride::parse_str(val)?;
                     }
+                    "--wave-mode" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --wave-mode".to_string())?;
+                        wave_mode = WaveEmulMode::parse_str(val)?;
+                    }
                     "--json" => json = true,
                     other if other.starts_with('-') => {
                         return Err(format!("unknown option for translate-rdna2: {other}"));
@@ -457,13 +468,14 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             }
 
             let file_path = file_path.ok_or_else(|| {
-                "translate-rdna2 requires <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--json]".to_string()
+                "translate-rdna2 requires <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--wave-mode lds|subgroups] [--json]".to_string()
             })?;
 
             Ok(Command::TranslateRdna2 {
                 file_path,
                 out_path,
                 stage,
+                wave_mode,
                 json,
             })
         }
@@ -472,6 +484,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut manifest_path: Option<PathBuf> = None;
             let mut out_path: Option<PathBuf> = None;
             let mut pack_version = PackVersion::Auto;
+            let mut wave_mode = WaveEmulMode::WorkgroupLds;
             let mut best_effort = false;
             let mut max_wgsl_bytes: Option<usize> = None;
             let mut max_pack_bytes: Option<u64> = None;
@@ -506,6 +519,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                             .get(i)
                             .ok_or_else(|| "missing value for --pack-version".to_string())?;
                         pack_version = PackVersion::parse_str(val)?;
+                    }
+                    "--wave-mode" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --wave-mode".to_string())?;
+                        wave_mode = WaveEmulMode::parse_str(val)?;
                     }
                     "--best-effort" => best_effort = true,
                     "--max-wgsl-bytes" => {
@@ -591,6 +611,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 manifest_path,
                 out_path,
                 pack_version,
+                wave_mode,
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
@@ -1230,6 +1251,7 @@ fn run_disasm_rdna2(
 fn format_translate_rdna2(
     file_path: &Path,
     stage: Rdna2StageOverride,
+    wave_mode: WaveEmulMode,
     json: bool,
 ) -> Result<(String, playgta6_shaders::rdna2_to_wgsl::Rdna2WgslOutput, String), String> {
     let source = sanitize_source_path(file_path, None);
@@ -1248,6 +1270,7 @@ fn format_translate_rdna2(
     let options = Rdna2TranslateOptions {
         stage,
         fssm_meta,
+        wave_emul_mode: wave_mode,
         ..Rdna2TranslateOptions::default()
     };
     let output = translate_rdna2_to_wgsl(&bytes, &options)
@@ -1264,9 +1287,10 @@ fn run_translate_rdna2(
     file_path: &Path,
     out_path: Option<&Path>,
     stage: Rdna2StageOverride,
+    wave_mode: WaveEmulMode,
     json: bool,
 ) -> Result<(), String> {
-    let (rendered, output, source) = format_translate_rdna2(file_path, stage, json)?;
+    let (rendered, output, source) = format_translate_rdna2(file_path, stage, wave_mode, json)?;
     if let Some(dest) = out_path {
         let dest_label = sanitize_source_path(dest, None);
         if let Some(parent) = dest.parent()
@@ -1477,8 +1501,9 @@ fn main() -> ExitCode {
             file_path,
             out_path,
             stage,
+            wave_mode,
             json,
-        }) => match run_translate_rdna2(&file_path, out_path.as_deref(), stage, json) {
+        }) => match run_translate_rdna2(&file_path, out_path.as_deref(), stage, wave_mode, json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1490,6 +1515,7 @@ fn main() -> ExitCode {
             manifest_path,
             out_path,
             pack_version,
+            wave_mode,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -1505,7 +1531,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let options = Rdna2PackOptions {
+            let mut options = Rdna2PackOptions {
                 pack_version,
                 best_effort,
                 max_wgsl_bytes,
@@ -1515,6 +1541,7 @@ fn main() -> ExitCode {
                 jobs,
                 ..Rdna2PackOptions::default()
             };
+            options.translate.wave_emul_mode = wave_mode;
             match run_pack_rdna2(
                 input_dir.as_deref(),
                 manifest_path.as_deref(),
@@ -2192,6 +2219,7 @@ mod tests {
                 file_path: PathBuf::from("splash_ps.bin"),
                 out_path: Some(PathBuf::from("out/splash.wgsl")),
                 stage: Rdna2StageOverride::Pixel,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 json: true,
             }
         );
@@ -2203,6 +2231,25 @@ mod tests {
                 file_path: PathBuf::from("vs.bin"),
                 out_path: None,
                 stage: Rdna2StageOverride::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
+                json: false,
+            }
+        );
+
+        let cmd_sg = parse_args(&[
+            "translate-rdna2".to_string(),
+            "cs.bin".to_string(),
+            "--wave-mode".to_string(),
+            "subgroups".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd_sg,
+            Command::TranslateRdna2 {
+                file_path: PathBuf::from("cs.bin"),
+                out_path: None,
+                stage: Rdna2StageOverride::Auto,
+                wave_mode: WaveEmulMode::Subgroups,
                 json: false,
             }
         );
@@ -2242,23 +2289,39 @@ mod tests {
         ];
         fs::write(&bin_path, words_to_bytes(&words)).unwrap();
 
-        let (wgsl, output, source) =
-            format_translate_rdna2(&bin_path, Rdna2StageOverride::Auto, false).unwrap();
+        let (wgsl, output, source) = format_translate_rdna2(
+            &bin_path,
+            Rdna2StageOverride::Auto,
+            WaveEmulMode::WorkgroupLds,
+            false,
+        )
+        .unwrap();
         assert_eq!(source, "splash_vs.bin");
         assert!(output.naga_validated);
         assert!(wgsl.contains("@vertex"));
         assert!(wgsl.contains("@builtin(position)"));
 
-        let (json, _, _) =
-            format_translate_rdna2(&bin_path, Rdna2StageOverride::Auto, true).unwrap();
+        let (json, _, _) = format_translate_rdna2(
+            &bin_path,
+            Rdna2StageOverride::Auto,
+            WaveEmulMode::WorkgroupLds,
+            true,
+        )
+        .unwrap();
         assert!(json.contains("\"isa\": \"rdna2_gfx10_3\""));
         assert!(json.contains("\"source\": \"splash_vs.bin\""));
         assert!(json.contains("\"stage\": \"vertex\""));
         assert!(json.contains("\"naga_validated\": true"));
         assert!(json.contains("\"bindings\": []"));
 
-        run_translate_rdna2(&bin_path, Some(&out_wgsl), Rdna2StageOverride::Auto, false)
-            .expect("translate-rdna2 --out should write validated WGSL");
+        run_translate_rdna2(
+            &bin_path,
+            Some(&out_wgsl),
+            Rdna2StageOverride::Auto,
+            WaveEmulMode::WorkgroupLds,
+            false,
+        )
+        .expect("translate-rdna2 --out should write validated WGSL");
         let written_wgsl = fs::read_to_string(&out_wgsl).unwrap();
         assert_eq!(written_wgsl, wgsl);
 
@@ -2297,6 +2360,7 @@ mod tests {
                 manifest_path: None,
                 out_path: PathBuf::from("out/splash.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2321,6 +2385,7 @@ mod tests {
                 manifest_path: None,
                 out_path: PathBuf::from("out/all.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2361,6 +2426,7 @@ mod tests {
                 manifest_path: Some(PathBuf::from("work/dump/manifest.json")),
                 out_path: PathBuf::from("out/splash.wgsl.pack"),
                 pack_version: PackVersion::V2,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: true,
                 max_wgsl_bytes: Some(262_144),
                 max_pack_bytes: Some(536_870_912),
@@ -2389,6 +2455,7 @@ mod tests {
                 manifest_path: Some(PathBuf::from("work/dump/manifest.json")),
                 out_path: PathBuf::from("out/early.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2415,6 +2482,7 @@ mod tests {
                 manifest_path: None,
                 out_path: PathBuf::from("out/hash.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2442,6 +2510,7 @@ mod tests {
                 manifest_path: None,
                 out_path: PathBuf::from("out/single.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2468,6 +2537,7 @@ mod tests {
                 manifest_path: None,
                 out_path: PathBuf::from("out/short.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2495,6 +2565,7 @@ mod tests {
                 manifest_path: Some(PathBuf::from("work/dump/manifest.json")),
                 out_path: PathBuf::from("out/combined.wgsl.pack"),
                 pack_version: PackVersion::Auto,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2919,9 +2990,13 @@ mod tests {
         fs::write(&multi_path, words_to_bytes(&multi_words)).unwrap();
 
         // translate-rdna2 --json for small 48 B CBV
-        let (small_json, small_out, _) =
-            format_translate_rdna2(&small_path, Rdna2StageOverride::Auto, true)
-                .expect("translate-rdna2 --json should succeed");
+        let (small_json, small_out, _) = format_translate_rdna2(
+            &small_path,
+            Rdna2StageOverride::Auto,
+            WaveEmulMode::WorkgroupLds,
+            true,
+        )
+        .expect("translate-rdna2 --json should succeed");
         assert!(small_out.wgsl.contains("array<vec4<u32>, 3>"));
         assert!(
             small_json.contains(
@@ -2931,9 +3006,13 @@ mod tests {
         );
 
         // translate-rdna2 --json for multi-CBV (32 B + 96 B)
-        let (multi_json, multi_out, _) =
-            format_translate_rdna2(&multi_path, Rdna2StageOverride::Auto, true)
-                .expect("translate-rdna2 --json should succeed for multi-CBV");
+        let (multi_json, multi_out, _) = format_translate_rdna2(
+            &multi_path,
+            Rdna2StageOverride::Auto,
+            WaveEmulMode::WorkgroupLds,
+            true,
+        )
+        .expect("translate-rdna2 --json should succeed for multi-CBV");
         assert!(multi_out.wgsl.contains("array<vec4<u32>, 2>"));
         assert!(multi_out.wgsl.contains("array<vec4<u32>, 6>"));
         assert!(
@@ -3076,6 +3155,7 @@ mod tests {
             manifest_path: parsed_manifest,
             out_path,
             pack_version,
+            wave_mode: _,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3268,6 +3348,7 @@ mod tests {
             manifest_path,
             out_path,
             pack_version,
+            wave_mode: _,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3385,6 +3466,7 @@ mod tests {
                 manifest_path,
                 out_path,
                 pack_version,
+                wave_mode: _,
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
@@ -3483,6 +3565,7 @@ mod tests {
             manifest_path,
             out_path,
             pack_version,
+            wave_mode: _,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3608,6 +3691,7 @@ mod tests {
             manifest_path,
             out_path,
             pack_version,
+            wave_mode: _,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3692,6 +3776,7 @@ mod tests {
                 file_path: PathBuf::from("mesh.ms.bin"),
                 out_path: None,
                 stage: Rdna2StageOverride::Mesh,
+                wave_mode: WaveEmulMode::WorkgroupLds,
                 json: true,
             }
         );
@@ -3711,9 +3796,13 @@ mod tests {
         ];
         fs::write(&bin_path, words_to_bytes(&words)).unwrap();
 
-        let (json_out, output, _) =
-            format_translate_rdna2(&bin_path, Rdna2StageOverride::Mesh, true)
-                .expect("CLI mesh translation must succeed");
+        let (json_out, output, _) = format_translate_rdna2(
+            &bin_path,
+            Rdna2StageOverride::Mesh,
+            WaveEmulMode::WorkgroupLds,
+            true,
+        )
+        .expect("CLI mesh translation must succeed");
         assert_eq!(output.stage, ShaderStage::Compute);
         assert!(output.mesh_output.is_some());
         assert!(
@@ -3755,6 +3844,7 @@ mod tests {
             manifest_path,
             out_path,
             pack_version,
+            wave_mode: _,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,

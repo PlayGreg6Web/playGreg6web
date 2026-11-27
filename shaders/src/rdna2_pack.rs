@@ -1887,6 +1887,7 @@ fn translate_blob_task(
             .fssm_meta
             .cloned()
             .or_else(|| options.translate.fssm_meta.clone()),
+        wave_emul_mode: options.translate.wave_emul_mode,
     };
 
     match translate_rdna2_to_wgsl(task.bytes, &translate_opts) {
@@ -2347,6 +2348,7 @@ fn translate_manifest_stage(
         workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
         preserve_fragment_interpolation: options.translate.preserve_fragment_interpolation,
         fssm_meta,
+        wave_emul_mode: options.translate.wave_emul_mode,
     };
 
     match translate_rdna2_to_wgsl(&bytes, &translate_opts) {
