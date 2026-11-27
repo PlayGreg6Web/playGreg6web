@@ -61,6 +61,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping, Sequence
@@ -821,6 +822,7 @@ class SideModuleResult:
     wasm_metrics: WasmModuleMetrics | None = None
     estimated_bytes: int = 0
     side_module_mode: int = 1
+    link_cache_hit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -889,6 +891,7 @@ class BuildReport:
     sample: int = 0
     extrapolated: dict[str, Any] | None = None
     compile_seconds: float = 0.0
+    stage_seconds: dict[str, float] = field(default_factory=dict)
     object_bytes: int = 0
     wasm_bytes: int = 0
     exceeds_v8_1gib_limit: bool = False
@@ -968,6 +971,7 @@ class BuildReport:
             "sample": self.sample,
             "extrapolated": self.extrapolated,
             "compile_seconds": self.compile_seconds,
+            "stage_seconds": dict(self.stage_seconds),
             "object_bytes": self.object_bytes,
             "wasm_bytes": self.wasm_bytes,
             "exceeds_v8_1gib_limit": self.exceeds_v8_1gib_limit,
@@ -1734,15 +1738,15 @@ def _extra_fingerprint_for_unit(
     return digest.digest()
 
 
-def cache_key_for(
-    content: bytes,
+def _cache_key_prefix(
     flags: Sequence[str],
     *,
     kind: str,
     retarget_version: int | str | None = None,
     extra_fingerprint: bytes = b"",
     runtime_headers_fingerprint: str = "",
-) -> str:
+) -> "hashlib._Hash":
+    """Everything in the cache key except the unit content (see `cache_key_for`)."""
     digest = hashlib.sha256()
     digest.update(b"playgta6-guest-wasm-v1\0")
     digest.update(kind.encode("utf-8"))
@@ -1767,9 +1771,89 @@ def cache_key_for(
         digest.update(str(len(extra_fingerprint)).encode("ascii"))
         digest.update(b"\0")
         digest.update(extra_fingerprint)
-        digest.update(b"\0")
+        digest.update(b"@0")
+    return digest
+
+
+def cache_key_for(
+    content: bytes,
+    flags: Sequence[str],
+    *,
+    kind: str,
+    retarget_version: int | str | None = None,
+    extra_fingerprint: bytes = b"",
+    runtime_headers_fingerprint: str = "",
+) -> str:
+    digest = _cache_key_prefix(
+        flags,
+        kind=kind,
+        retarget_version=retarget_version,
+        extra_fingerprint=extra_fingerprint,
+        runtime_headers_fingerprint=runtime_headers_fingerprint,
+    )
     digest.update(content)
     return digest.hexdigest()
+
+
+KEY_STAMP_FILE_NAME = "key-stamps-v1.json"
+
+
+class KeyStampCache:
+    """Remembers `cache_key_for` results for big `.ll` units by (path, size, mtime_ns, key prefix).
+
+    Keys stay byte-identical to `cache_key_for`; the stamp only skips re-reading and re-hashing
+    multi-hundred-MiB shards that did not change since the last build (make-style heuristic).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._entries: dict[str, list[Any]] = {}
+        self._dirty = False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._entries = {k: v for k, v in raw.items() if isinstance(v, list) and len(v) == 3}
+        except (OSError, ValueError):
+            self._entries = {}
+
+    def key_for_file(
+        self,
+        file_path: Path,
+        flags: Sequence[str],
+        *,
+        kind: str,
+        runtime_headers_fingerprint: str = "",
+    ) -> str:
+        prefix = _cache_key_prefix(
+            flags, kind=kind, runtime_headers_fingerprint=runtime_headers_fingerprint
+        )
+        st = file_path.stat()
+        stamp_id = f"{file_path}|{prefix.hexdigest()}"
+        entry = self._entries.get(stamp_id)
+        if entry is not None and entry[0] == st.st_size and entry[1] == st.st_mtime_ns:
+            return str(entry[2])
+        digest = prefix
+        with file_path.open("rb") as fh:
+            while True:
+                chunk = fh.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        key = digest.hexdigest()
+        self._entries[stamp_id] = [st.st_size, st.st_mtime_ns, key]
+        self._dirty = True
+        return key
+
+    def save(self) -> None:
+        if not self._dirty:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._entries), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except OSError:
+            pass
 
 
 def _kind_for_suffix(suffix: str) -> str | None:
@@ -4206,16 +4290,47 @@ def collect_wasm_metrics(
     side_wasms: Sequence[tuple[str, Path]] = (),
     indirect_dispatch: str = DEFAULT_INDIRECT_DISPATCH,
     warnings: list[str] | None = None,
+    stamp_cache_path: Path | None = None,
 ) -> WasmBuildMetrics:
-    """Inspect `runtime.wasm` and every `guest_part_*.wasm` side module after linking."""
+    """Inspect `runtime.wasm` and every `guest_part_*.wasm` side module after linking.
+
+    With `stamp_cache_path`, a module whose (path, size, mtime_ns) is unchanged since the last
+    inspection reuses the stored metrics instead of re-parsing hundreds of MiB.
+    """
+    stamps: dict[str, Any] = {}
+    if stamp_cache_path is not None:
+        try:
+            loaded = json.loads(stamp_cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                stamps = loaded
+        except (OSError, ValueError):
+            stamps = {}
+    stamps_dirty = False
     modules: list[WasmModuleMetrics] = []
     targets: list[tuple[str, str, Path]] = [(RUNTIME_WASM, "main", main_wasm)]
     for side_name, side_path in side_wasms:
         targets.append((side_name, "side", side_path))
 
     for mod_name, role, path in targets:
+        stamp_id = f"{path}|{mod_name}|{role}"
         try:
-            modules.append(inspect_wasm_file(path, name=mod_name, role=role))
+            st = path.stat()
+            stamp = [st.st_size, st.st_mtime_ns]
+        except OSError:
+            stamp = None
+        cached_entry = stamps.get(stamp_id)
+        if stamp is not None and isinstance(cached_entry, dict) and cached_entry.get("stamp") == stamp:
+            try:
+                modules.append(WasmModuleMetrics(**cached_entry["metrics"]))
+                continue
+            except (TypeError, KeyError):
+                pass
+        try:
+            inspected = inspect_wasm_file(path, name=mod_name, role=role)
+            modules.append(inspected)
+            if stamp is not None and stamp_cache_path is not None:
+                stamps[stamp_id] = {"stamp": stamp, "metrics": dataclasses.asdict(inspected)}
+                stamps_dirty = True
         except WasmInspectError as exc:
             if warnings is not None:
                 warnings.append(f"wasm telemetry skipped for {mod_name}: {sanitize_text(str(exc))}")
@@ -4226,6 +4341,14 @@ def collect_wasm_metrics(
                     wasm_bytes=_object_bytes(path),
                 )
             )
+    if stamps_dirty and stamp_cache_path is not None:
+        try:
+            stamp_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = stamp_cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(stamps), encoding="utf-8")
+            os.replace(tmp, stamp_cache_path)
+        except OSError:
+            pass
     return WasmBuildMetrics(indirect_dispatch=indirect_dispatch, modules=tuple(modules))
 
 
@@ -4791,6 +4914,143 @@ def extrapolate_sample(
     }
 
 
+LINK_CACHE_DIR_NAME = "linked"
+LINK_CACHE_KEEP_PER_LABEL = 2
+DEFAULT_LINK_JOBS = 2
+WASM_METRICS_STAMP_FILE_NAME = "wasm-metrics-v1.json"
+
+
+def _file_sha256_hex(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def link_cache_key(
+    label: str,
+    *,
+    linker: Path | None,
+    flags: Sequence[str],
+    objects: Sequence[Path],
+    content_hashed_files: Sequence[Path] = (),
+    extra_text: str = "",
+) -> str:
+    """Content key for one link step.
+
+    Compiled objects are named `<stem>-<key16>.o` after their own content key, so name + size
+    identify them without re-reading hundreds of MiB; archives and loose inputs are hashed.
+    The toolchain is identified by the linker's size/mtime plus its `emscripten-version.txt`.
+    """
+    digest = hashlib.sha256()
+    digest.update(f"playgta6-link-cache-v1:{label}".encode("utf-8"))
+    digest.update(b"\0")
+    if linker is not None:
+        try:
+            st = linker.stat()
+            digest.update(f"{linker.name}:{st.st_size}:{st.st_mtime_ns}".encode("utf-8"))
+        except OSError:
+            digest.update(b"linker-missing")
+        for version_file in (
+            linker.parent / "emscripten-version.txt",
+            linker.parent.parent / "emscripten" / "emscripten-version.txt",
+        ):
+            try:
+                digest.update(version_file.read_bytes())
+                break
+            except OSError:
+                continue
+    digest.update(b"\0")
+    for flag in flags:
+        digest.update(flag.encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(b"objects\0")
+    for obj in objects:
+        try:
+            size = obj.stat().st_size
+        except OSError:
+            size = -1
+        digest.update(f"{obj.name}:{size}".encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(b"files\0")
+    for path in content_hashed_files:
+        try:
+            digest.update(f"{path.name}:{_file_sha256_hex(path)}".encode("utf-8"))
+        except OSError:
+            digest.update(f"{path.name}:missing".encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(extra_text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _link_cache_entry(cache_root: Path, label: str, key: str, suffix: str) -> Path:
+    return cache_root / LINK_CACHE_DIR_NAME / f"{label}-{key[:32]}{suffix}"
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def restore_cached_link_output(cached: Path, dest: Path, *, hardlink: bool) -> bool:
+    """Make `dest` identical to `cached` (hard link when allowed, else copy). False on miss."""
+    if not cached.is_file():
+        return False
+    if dest.is_file() and hardlink and _same_file(cached, dest):
+        return True
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.unlink()
+        if hardlink:
+            try:
+                os.link(cached, dest)
+                return True
+            except OSError:
+                pass
+        shutil.copyfile(cached, dest)
+        return True
+    except OSError:
+        return False
+
+
+def store_link_output(cached: Path, produced: Path, *, hardlink: bool) -> None:
+    """Publish a freshly linked output into the link cache (best effort)."""
+    try:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        if cached.exists():
+            cached.unlink()
+        if hardlink:
+            try:
+                os.link(produced, cached)
+                return
+            except OSError:
+                pass
+        shutil.copyfile(produced, cached)
+    except OSError:
+        pass
+
+
+def prune_link_cache(cache_root: Path, label: str, *, keep: int = LINK_CACHE_KEEP_PER_LABEL) -> None:
+    """Keep only the newest `keep` cached outputs for `label` (parts are hundreds of MiB each)."""
+    directory = cache_root / LINK_CACHE_DIR_NAME
+    try:
+        entries = [
+            p for p in directory.iterdir() if p.is_file() and p.name.startswith(f"{label}-")
+        ]
+        entries.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for old in entries[keep:]:
+            old.unlink()
+    except OSError:
+        pass
+
+
 def run_build(
     *,
     source_dir: Path | None,
@@ -4830,6 +5090,8 @@ def run_build(
     proxy_to_pthread: bool = False,
     max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
     verify_max_table_imports: int | None = None,
+    link_jobs: int = DEFAULT_LINK_JOBS,
+    link_cache: bool = True,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -5019,6 +5281,8 @@ def run_build(
     )
     runtime_headers_fp = compute_runtime_headers_fingerprint(repo_root)
     source_root_hdr_fp = source_root_headers_fingerprint(source_root)
+    key_stamps = KeyStampCache(cache_root / KEY_STAMP_FILE_NAME)
+    plan_started = time.monotonic()
     planned: list[UnitBuildResult] = []
     compile_tasks: list[tuple[SourceUnit, Path, tuple[str, ...]]] = []
     for unit in units:
@@ -5042,20 +5306,28 @@ def run_build(
             wasm_exceptions=wasm_exceptions,
             pic=use_split,
         )
-        content = unit.path.read_bytes()
-        extra_fp = _extra_fingerprint_for_unit(
-            unit,
-            content=content,
-            source_root=source_root,
-            source_root_headers_fp=source_root_hdr_fp,
-        )
-        key = cache_key_for(
-            content,
-            flags,
-            kind=unit.kind,
-            extra_fingerprint=extra_fp,
-            runtime_headers_fingerprint=runtime_headers_fp,
-        )
+        if unit.kind == "ll":
+            key = key_stamps.key_for_file(
+                unit.path,
+                flags,
+                kind=unit.kind,
+                runtime_headers_fingerprint=runtime_headers_fp,
+            )
+        else:
+            content = unit.path.read_bytes()
+            extra_fp = _extra_fingerprint_for_unit(
+                unit,
+                content=content,
+                source_root=source_root,
+                source_root_headers_fp=source_root_hdr_fp,
+            )
+            key = cache_key_for(
+                content,
+                flags,
+                kind=unit.kind,
+                extra_fingerprint=extra_fp,
+                runtime_headers_fingerprint=runtime_headers_fp,
+            )
         object_path = cache_object_path(cache_root, key, unit.unit_id)
         argv = tuple(sanitize_argv(build_compile_argv(compiler, unit.path, object_path, flags)))
         if object_path.is_file():
@@ -5083,6 +5355,9 @@ def run_build(
                 )
             )
 
+    if not dry_run:
+        key_stamps.save()
+    report.stage_seconds["plan_cache_keys"] = round(time.monotonic() - plan_started, 3)
     compiled_by_id: dict[str, UnitBuildResult] = {item.unit.unit_id: item for item in planned}
 
     compile_started = time.monotonic()
@@ -5116,6 +5391,7 @@ def run_build(
     report.cache_hits = sum(1 for item in ordered if item.cache_hit)
     report.cache_misses = sum(1 for item in ordered if not item.cache_hit)
     report.compile_seconds = round(time.monotonic() - compile_started, 3)
+    report.stage_seconds["wasm_shard_compile"] = report.compile_seconds
     report.object_bytes = sum(
         item.object_bytes or _object_bytes(item.object_path) for item in ordered
     )
@@ -5285,6 +5561,7 @@ def run_build(
             return report
 
         cross_exports_by_part: list[list[str]] = []
+        cross_exports_started = time.monotonic()
         if use_pruned_side and side_plans:
             llvm_nm_path = toolchain.nm()
             if llvm_nm_path is None:
@@ -5318,33 +5595,54 @@ def run_build(
                 report.errors.append(sanitize_text(str(exc)))
                 return report
 
+        report.stage_seconds["cross_exports_nm"] = round(time.monotonic() - cross_exports_started, 3)
         output_dir.mkdir(parents=True, exist_ok=True)
-        for idx, (
-            side_result,
-            side_wasm_path,
-            bucket_objects,
-            side_rsp_path,
-            side_exports_rsp_path,
-            raw_side_link,
-        ) in enumerate(side_plans):
-            if side_rsp_path is not None:
-                write_link_response_file(side_rsp_path, bucket_objects)
+        side_link_started = time.monotonic()
+
+        def _link_side_part(idx: int) -> str | None:
+            """Link (or restore from the link cache) one part; returns an error string or None."""
+            (
+                side_result,
+                side_wasm_path,
+                bucket_objects,
+                side_rsp_path,
+                side_exports_rsp_path,
+                raw_side_link,
+            ) = side_plans[idx]
+            part_exports: list[str] = []
             if side_exports_rsp_path is not None:
                 part_exports = cross_exports_by_part[idx] if idx < len(cross_exports_by_part) else []
-                write_side_exports_response_file(side_exports_rsp_path, part_exports)
                 side_result.exported_symbol_count = len(part_exports)
-            side_link_result = runner(raw_side_link)
-            if side_link_result.returncode != 0:
-                report.ok = False
-                err = sanitize_text(
-                    (side_link_result.stderr or side_link_result.stdout or "side module link failed").strip()
-                )
-                report.errors.append(f"{side_result.name}: {err}")
-                return report
-            if not side_wasm_path.is_file():
-                report.ok = False
-                report.errors.append(f"missing side module link output: {side_result.name}")
-                return report
+            label = Path(side_result.name).stem
+            cache_key = link_cache_key(
+                label,
+                linker=linker,
+                flags=side_link_flags,
+                objects=bucket_objects,
+                extra_text="\n".join(part_exports),
+            )
+            cached_wasm = _link_cache_entry(cache_root, label, cache_key, ".wasm")
+            restored = link_cache and restore_cached_link_output(
+                cached_wasm, side_wasm_path, hardlink=True
+            )
+            if restored:
+                side_result.link_cache_hit = True
+            else:
+                if side_rsp_path is not None:
+                    write_link_response_file(side_rsp_path, bucket_objects)
+                if side_exports_rsp_path is not None:
+                    write_side_exports_response_file(side_exports_rsp_path, part_exports)
+                if side_wasm_path.exists():
+                    # Never relink in place: the old file may be hard-linked into the link cache.
+                    side_wasm_path.unlink()
+                side_link_result = runner(raw_side_link)
+                if side_link_result.returncode != 0:
+                    err = sanitize_text(
+                        (side_link_result.stderr or side_link_result.stdout or "side module link failed").strip()
+                    )
+                    return f"{side_result.name}: {err}"
+                if not side_wasm_path.is_file():
+                    return f"missing side module link output: {side_result.name}"
             side_result.wasm_bytes = _object_bytes(side_wasm_path)
             input_obj_bytes = sum(_object_bytes(obj_path) for obj_path in bucket_objects)
             empty_err = check_side_module_not_empty(
@@ -5354,10 +5652,25 @@ def run_build(
                 side_module_mode=side_result.side_module_mode,
             )
             if empty_err is not None:
-                report.ok = False
-                report.errors.append(empty_err)
-                return report
+                return empty_err
+            if link_cache and not restored:
+                store_link_output(cached_wasm, side_wasm_path, hardlink=True)
+                prune_link_cache(cache_root, label)
+            return None
 
+        side_workers = max(1, min(link_jobs, len(side_plans)))
+        if side_workers == 1:
+            side_errors = [_link_side_part(i) for i in range(len(side_plans))]
+        else:
+            with ThreadPoolExecutor(max_workers=side_workers) as link_pool:
+                side_errors = list(link_pool.map(_link_side_part, range(len(side_plans))))
+        first_side_error = next((e for e in side_errors if e), None)
+        if first_side_error is not None:
+            report.ok = False
+            report.errors.append(first_side_error)
+            return report
+
+        report.stage_seconds["side_module_links"] = round(time.monotonic() - side_link_started, 3)
         if archive_filter_plans:
             assert archiver is not None
             for orig_archive, filtered_archive in archive_filter_plans:
@@ -5378,7 +5691,32 @@ def run_build(
 
         if rsp_path is not None:
             write_link_response_file(rsp_path, main_objects)
-        link_result = _invoke_runner(runner, raw_link, env=link_env)
+        runtime_link_started = time.monotonic()
+        rt_key = link_cache_key(
+            "runtime",
+            linker=linker,
+            flags=effective_link_flags,
+            objects=main_objects,
+            content_hashed_files=[p for p in runtime_libs if p.is_file()],
+        )
+        cached_rt_js = _link_cache_entry(cache_root, "runtime", rt_key, ".js")
+        cached_rt_wasm = _link_cache_entry(cache_root, "runtime", rt_key, ".wasm")
+        rt_restored = (
+            link_cache
+            and cached_rt_js.is_file()
+            and cached_rt_wasm.is_file()
+            and restore_cached_link_output(cached_rt_js, output_js, hardlink=False)
+            and restore_cached_link_output(cached_rt_wasm, output_wasm, hardlink=False)
+        )
+        if rt_restored:
+            link_result = CommandResult(returncode=0, stdout="", stderr="")
+        else:
+            link_result = _invoke_runner(runner, raw_link, env=link_env)
+            if link_cache and link_result.returncode == 0:
+                store_link_output(cached_rt_js, output_js, hardlink=False)
+                store_link_output(cached_rt_wasm, output_wasm, hardlink=False)
+                prune_link_cache(cache_root, "runtime", keep=4)
+        report.stage_seconds["runtime_link"] = round(time.monotonic() - runtime_link_started, 3)
         if link_result.returncode != 0:
             report.ok = False
             report.errors.append(
@@ -5490,6 +5828,7 @@ def run_build(
             dry_run=False,
         )
 
+    metrics_started = time.monotonic()
     side_wasm_pairs = [
         (side_result.name, output_dir / side_result.name) for side_result in report.side_modules
     ]
@@ -5498,11 +5837,13 @@ def run_build(
         side_wasms=side_wasm_pairs,
         indirect_dispatch=report.indirect_dispatch,
         warnings=report.warnings,
+        stamp_cache_path=cache_root / WASM_METRICS_STAMP_FILE_NAME if link_cache else None,
     )
     metrics_by_name = {m.name: m for m in report.wasm_metrics.modules}
     for side_result in report.side_modules:
         side_result.wasm_metrics = metrics_by_name.get(side_result.name)
 
+    report.stage_seconds["wasm_inspect"] = round(time.monotonic() - metrics_started, 3)
     report.warnings.extend(
         check_v8_headroom_warnings(report.wasm_metrics, include_module_exceeded=False)
     )
@@ -5677,6 +6018,11 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
     if report.wasm_metrics is not None:
         lines.extend(format_wasm_metrics_lines(report.wasm_metrics))
     if report.guest_manifest:
+        if report.stage_seconds:
+            lines.append(
+                "  Stage seconds: "
+                + ", ".join(f"{k}={v}" for k, v in report.stage_seconds.items())
+            )
         lines.append(f"  Guest manifest: {report.guest_manifest}")
     if report.verify is not None:
         vstat = "PASS" if report.verify.get("ok") else "FAIL"
@@ -5727,6 +6073,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Parallel compile workers (default: CPU count).",
+    )
+    parser.add_argument(
+        "--link-jobs",
+        type=int,
+        default=DEFAULT_LINK_JOBS,
+        help=(
+            "Side-module parts linked in parallel (default: %(default)s; each link can use "
+            "several GiB of node heap, so keep this low on small machines)."
+        ),
+    )
+    parser.add_argument(
+        "--no-link-cache",
+        action="store_true",
+        help="Always relink parts/runtime and re-inspect wasm instead of reusing cached results.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -6093,6 +6453,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             proxy_to_pthread=args.proxy_to_pthread,
             max_concurrent_pthread_loads=args.max_concurrent_pthread_loads,
             verify_max_table_imports=args.verify_max_table_imports,
+            link_jobs=max(1, args.link_jobs),
+            link_cache=not args.no_link_cache,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)

@@ -301,6 +301,8 @@ class TestBuildOrchestrator(unittest.TestCase):
             out = root / "dist"
             runner = RecordingRunner()
             first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -317,6 +319,8 @@ class TestBuildOrchestrator(unittest.TestCase):
 
             runner2 = RecordingRunner()
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -336,6 +340,8 @@ class TestBuildOrchestrator(unittest.TestCase):
             _write(src / "shards" / "a.ll", "; ModuleID = 'a-changed'\n")
             runner3 = RecordingRunner()
             third = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -352,6 +358,8 @@ class TestBuildOrchestrator(unittest.TestCase):
 
             runner4 = RecordingRunner()
             fourth = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -374,6 +382,8 @@ class TestBuildOrchestrator(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner(delay=0.05)
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -394,6 +404,8 @@ class TestBuildOrchestrator(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner(fail_ids=frozenset({"b.ll"}))
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -419,6 +431,8 @@ class TestBuildOrchestrator(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -724,6 +738,8 @@ class TestProgramManifestDiscovery(unittest.TestCase):
             src = _program_layout(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -852,6 +868,8 @@ class TestResponseFileLinking(unittest.TestCase):
             cache = root / "cache"
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -882,6 +900,8 @@ class TestResponseFileLinking(unittest.TestCase):
             cache = root / "cache"
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -907,6 +927,8 @@ class TestResponseFileLinking(unittest.TestCase):
                 _write(src / "lift" / f"shard-{index:05d}.ll", f"; s{index}\n")
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -945,6 +967,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             _write(src / "lift" / "functions.ll", "; registration\n")
             runner = RecordingRunner(delay=0.01)
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1010,6 +1034,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1066,6 +1092,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             cache = root / "cache"
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=prog_src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -1098,6 +1126,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             single_src = _layout_sources(root)
             runner_single = RecordingRunner()
             single_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=single_src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -1123,6 +1153,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
 
             # Dry-run JSON remains sanitized.
             dry = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=prog_src,
                 repo_root=repo,
                 cache_dir=root / "cache-dry",
@@ -1148,6 +1180,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             _write(src / "pg6_program.cpp", "int pg6_program_marker = 1;\n")
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1305,6 +1339,8 @@ class TestWasm64IrRetargetAndFlags(unittest.TestCase):
 
             # Dry-run must not materialize any retargeted IR file in cache_dir.
             dry_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache_dir,
@@ -1332,6 +1368,8 @@ class TestWasm64IrRetargetAndFlags(unittest.TestCase):
                 return base_runner(tokens)
 
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache_dir,
@@ -1382,6 +1420,8 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1434,6 +1474,8 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1482,6 +1524,8 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1559,6 +1603,8 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             for opt_level in ("Os", "Oz"):
                 runner = RecordingRunner()
                 report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     cache_dir=root / f"cache-{opt_level}",
@@ -1626,6 +1672,8 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             # Under-limit real build records exact wasm_bytes and no V8 warning.
             small_runner = RecordingRunner()
             small_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-small",
@@ -1659,6 +1707,8 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             bgw._object_bytes = fake_object_bytes
             try:
                 big_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     cache_dir=root / "cache-big",
@@ -1733,6 +1783,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -1822,6 +1874,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             # Step 1: Warm the cache at -O1 (shrink_largest_shards=0).
             runner_o1 = RecordingRunner()
             first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -1843,6 +1897,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             # the other 4 units reuse their cached -O1 objects!
             runner_shrink = RecordingRunner()
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -1893,6 +1949,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             # Step 3: Repeating --opt O1 --shrink-largest-shards 2 hits the cache for all 6 units.
             runner_warm = RecordingRunner()
             third = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -1924,6 +1982,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             # Tie on 20 instructions breaks deterministically by unit_id ("main/..." < "vcruntime140/...").
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=prog_src,
                 repo_root=repo,
                 cache_dir=root / "cache-prog",
@@ -1948,6 +2008,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             # When opt is already Oz, shrink_largest_shards is a clean no-op (single -Oz flag).
             runner_oz = RecordingRunner()
             report_oz = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=prog_src,
                 repo_root=repo,
                 cache_dir=root / "cache-oz",
@@ -1984,6 +2046,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
 
             with self.assertRaises(bgw.BuildGuestWasmError):
                 bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     shrink_largest_shards=-1,
@@ -1992,6 +2056,8 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
                 )
             with self.assertRaises(bgw.BuildGuestWasmError):
                 bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     shrink_largest_shards=True,  # type: ignore[arg-type]
@@ -2099,6 +2165,8 @@ class TestBrowserBootFlags(unittest.TestCase):
             # Warm cache without wasm_exceptions.
             runner1 = RecordingRunner()
             first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -2118,6 +2186,8 @@ class TestBrowserBootFlags(unittest.TestCase):
             # 2 .ll shards + 1 .c unit must be cache hits; 5 .cpp units (3 layout + 2 boot) recompile.
             runner2 = RecordingRunner()
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -2190,6 +2260,8 @@ class TestBrowserBootFlags(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -2248,6 +2320,8 @@ class TestBrowserBootFlags(unittest.TestCase):
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -2466,6 +2540,8 @@ class TestSplitModules(unittest.TestCase):
             src = _program_layout(root)
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -2506,6 +2582,47 @@ class TestSplitModules(unittest.TestCase):
             self.assertEqual(payload["split_modules"], 1)
             self.assertEqual(payload["side_modules"], [])
 
+    def test_link_cache_skips_unchanged_part_and_runtime_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            _write(src / "helper.c", "int helper(void) { return 7; }\n")
+            common = dict(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                link_guest_boot=True,
+                split_modules=3,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                which_fn=lambda _name: None,
+            )
+            first_runner = RecordingRunner()
+            first = bgw.run_build(run_command=first_runner, **common)
+            self.assertTrue(first.ok, first.errors)
+            self.assertGreater(len(first_runner.side_link_calls), 0)
+            self.assertEqual(len(first_runner.link_calls), 1)
+            parts = sorted((root / "dist").glob("guest_part_*.wasm"))
+            before = {p.name: p.read_bytes() for p in parts}
+
+            second_runner = RecordingRunner()
+            second = bgw.run_build(run_command=second_runner, **common)
+            self.assertTrue(second.ok, second.errors)
+            self.assertEqual(second_runner.side_link_calls, [])
+            self.assertEqual(second_runner.link_calls, [])
+            self.assertTrue(all(m.link_cache_hit for m in second.side_modules))
+            self.assertEqual(
+                before, {p.name: p.read_bytes() for p in sorted((root / "dist").glob("guest_part_*.wasm"))}
+            )
+
+            third_runner = RecordingRunner()
+            third = bgw.run_build(run_command=third_runner, link_cache=False, **common)
+            self.assertTrue(third.ok, third.errors)
+            self.assertEqual(len(third_runner.side_link_calls), len(first_runner.side_link_calls))
+            self.assertEqual(len(third_runner.link_calls), 1)
+
     def test_split_modules_adds_fpic_and_separate_cache_keys(self) -> None:
         for kind in ("ll", "c", "cpp"):
             self.assertNotIn("-fPIC", bgw.compile_flags_for(opt="O2", kind=kind))
@@ -2523,6 +2640,8 @@ class TestSplitModules(unittest.TestCase):
             # Warm non-PIC cache with split_modules=1.
             runner1 = RecordingRunner()
             first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -2539,6 +2658,8 @@ class TestSplitModules(unittest.TestCase):
             # Rebuild with split_modules=3 sharing cache: every unit gets a new -fPIC cache key.
             runner2 = RecordingRunner()
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -2563,6 +2684,8 @@ class TestSplitModules(unittest.TestCase):
             # Repeating split_modules=3 hits cache for every unit.
             runner3 = RecordingRunner()
             third = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -2590,6 +2713,8 @@ class TestSplitModules(unittest.TestCase):
             orig_lib_bytes = orig_lib.read_bytes()
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -2850,6 +2975,8 @@ class TestSplitModules(unittest.TestCase):
             _write(small_src / "lift" / "functions.ll", "; reg\n")
             runner_two = RecordingRunner()
             report_two = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=small_src,
                 repo_root=repo,
                 cache_dir=root / "cache-two",
@@ -2874,6 +3001,8 @@ class TestSplitModules(unittest.TestCase):
             # Failing side module link aborts before main module link.
             runner_fail = RecordingRunner(fail_outputs=frozenset({"guest_part_1.wasm"}))
             report_fail = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=small_src,
                 repo_root=repo,
                 cache_dir=root / "cache-two",
@@ -2914,6 +3043,8 @@ class TestSplitModules(unittest.TestCase):
             bgw._object_bytes = fake_bytes_ok
             try:
                 report_ok = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     cache_dir=root / "cache-ok",
@@ -2950,6 +3081,8 @@ class TestSplitModules(unittest.TestCase):
             bgw._object_bytes = fake_bytes_side_over
             try:
                 report_side_over = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     cache_dir=root / "cache-ok",
@@ -2993,6 +3126,8 @@ class TestSplitModules(unittest.TestCase):
             bgw._object_bytes = fake_bytes_main_over
             try:
                 report_main_over = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     cache_dir=root / "cache-ok",
@@ -3026,6 +3161,8 @@ class TestSplitModules(unittest.TestCase):
             for bad in (0, -1, True, False, "2"):
                 with self.assertRaises(bgw.BuildGuestWasmError, msg=f"run_build split_modules={bad!r}"):
                     bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                         source_dir=src,
                         repo_root=repo,
                         split_modules=bad,  # type: ignore[arg-type]
@@ -3156,6 +3293,8 @@ class TestSplitModules(unittest.TestCase):
 
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3258,6 +3397,8 @@ class TestSplitModules(unittest.TestCase):
             # emar d failure aborts before main link.
             runner_ar_fail = RecordingRunner(fail_outputs=frozenset({"libplaygta6_core_split.a"}))
             fail_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3283,6 +3424,8 @@ class TestSplitModules(unittest.TestCase):
             _write(no_reg_src / "stubs" / "thunks.cpp", "void t() {}\n")
             runner_no_reg = RecordingRunner()
             no_reg_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=no_reg_src,
                 repo_root=repo,
                 cache_dir=root / "cache-no-reg",
@@ -3307,6 +3450,8 @@ class TestSplitModules(unittest.TestCase):
             orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
             runner = RecordingRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-mono",
@@ -3461,6 +3606,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # 1) split_modules=3 with existing unrelated NODE_OPTIONS auto-merges 16384.
             runner_split = EnvCapturingRunner()
             report_split = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3489,6 +3636,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # 2) split_modules=3 respects existing --max-old-space-size in env.
             runner_respect = EnvCapturingRunner()
             report_respect = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3511,6 +3660,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # 3) Explicit node_max_old_space_mb overrides existing NODE_OPTIONS value.
             runner_override = EnvCapturingRunner()
             report_override = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3534,6 +3685,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # 4) split_modules=1 leaves NODE_OPTIONS unset unless explicitly requested.
             runner_single = EnvCapturingRunner()
             report_single = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-single",
@@ -3552,6 +3705,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
 
             runner_single_explicit = EnvCapturingRunner()
             report_single_explicit = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-single",
@@ -3575,6 +3730,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # 5) Legacy 1-arg runner remains 100% compatible.
             legacy_runner = RecordingRunner()
             report_legacy = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3753,6 +3910,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # Step 1: Warm the cache.
             runner1 = RecordingRunner()
             first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3780,6 +3939,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             # Step 2: Unchanged rebuild -> 100% cache hits.
             runner2 = RecordingRunner()
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3798,6 +3959,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             _write(seam_h, "#pragma once\n// v2 updated seam signature\n")
             runner3 = RecordingRunner()
             third = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3823,6 +3986,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             _write(export_hpp, "#pragma once\n// export v2\n")
             runner4 = RecordingRunner()
             fourth = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3841,6 +4006,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             _write(helper_h, "#pragma once\n#define HELPER_VAL 2\n")
             runner5 = RecordingRunner()
             fifth = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -3860,6 +4027,8 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             _write(src / "main" / "lift" / "added.hpp", "#pragma once\n")
             runner6 = RecordingRunner()
             sixth = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -4126,6 +4295,8 @@ var PThread = {
             # run_build default keeps proxy_to_pthread=False.
             runner_default = RecordingRunner()
             rep_default = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache1",
@@ -4143,6 +4314,8 @@ var PThread = {
             # run_build with proxy_to_pthread=True appends -sPROXY_TO_PTHREAD=1.
             runner_proxied = RecordingRunner()
             rep_proxied = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache2",
@@ -4558,6 +4731,8 @@ var PThread = {
             # 1) Split build (split_modules=2) patches runtime.js automatically.
             dist_split = root / "dist-split"
             rep_split = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-split",
@@ -4601,6 +4776,8 @@ var PThread = {
             # 2) Monolithic build (split_modules=1) leaves runtime.js untouched.
             dist_mono = root / "dist-mono"
             rep_mono = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-mono",
@@ -4617,6 +4794,8 @@ var PThread = {
 
             # 3) Dry-run split build skips patching and leaves split_runtime_js_patches=None.
             rep_dry = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-dry",
@@ -4913,6 +5092,8 @@ class TestContiguousSplitBucketing(unittest.TestCase):
             out_dir = root / "dist-contig"
             runner = SizedCompileRunner(shard_sizes)
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -4972,6 +5153,8 @@ class TestContiguousSplitBucketing(unittest.TestCase):
             # Contrast with default balanced strategy on the exact same cached objects:
             # balanced interleaves shard-00000..shard-00005 by descending size.
             bal_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -5242,6 +5425,8 @@ class TestAsymmetricSideModuleSplit(unittest.TestCase):
             # covered by test_asymmetric_partition_targets_994_171_two_part_shape.
             runner = SizedCompileRunner(shard_sizes)
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -5304,6 +5489,8 @@ class TestAsymmetricSideModuleSplit(unittest.TestCase):
 
             # Default balanced callers still get SIDE_MODULE=1.
             bal = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -5825,6 +6012,8 @@ class TestWasmBinaryTelemetryAndShardBuilds(unittest.TestCase):
             orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
             runner = SyntheticWasmRunner()
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -5904,6 +6093,8 @@ class TestWasmBinaryTelemetryAndShardBuilds(unittest.TestCase):
 
             # Enforcing a tight --verify-max-table-imports limit (e.g. 2 < 4) fails cleanly.
             fail_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -5962,6 +6153,8 @@ class TestWasmBinaryTelemetryAndShardBuilds(unittest.TestCase):
             # 1) Legacy table build succeeds normally without [shard-dispatch] banner.
             dist_ok = root / "dist-ok"
             rep_ok = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -5982,6 +6175,8 @@ class TestWasmBinaryTelemetryAndShardBuilds(unittest.TestCase):
 
             # 2) Legacy split build fails --verify-max-table-imports 100.
             rep_fail = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -6005,6 +6200,8 @@ class TestWasmBinaryTelemetryAndShardBuilds(unittest.TestCase):
             bm_data["indirect_dispatch"] = "shard"
             bm_path.write_text(json.dumps(bm_data), encoding="utf-8")
             rep_warn = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-warn",
@@ -6364,6 +6561,8 @@ class TestSideModule2CrossExports(unittest.TestCase):
 
             # 1) Dry-run command lines already include -sSIDE_MODULE=2, ctor flag, and @side_part_<i>_exports.rsp.
             dry = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6426,6 +6625,8 @@ class TestSideModule2CrossExports(unittest.TestCase):
             }
             runner = RecordingRunner(nm_outputs=nm_outputs)
             rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6483,6 +6684,8 @@ class TestSideModule2CrossExports(unittest.TestCase):
             for f in (repo / "work" / "emsdk" / "upstream" / "bin").iterdir():
                 f.unlink()
             missing_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6560,6 +6763,8 @@ class TestSideModule2CrossExports(unittest.TestCase):
 
             bad_runner = StrippedSideRunner(side_wasm_size=676)
             bad_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-bad",
@@ -6582,6 +6787,8 @@ class TestSideModule2CrossExports(unittest.TestCase):
             # Non-stripped (>= 4 KiB) side module succeeds normally.
             good_runner = StrippedSideRunner(side_wasm_size=8192)
             good_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-good",
@@ -6760,6 +6967,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
                 wraps=bgw.compute_runtime_headers_fingerprint,
             ) as spy_fp:
                 first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                     source_dir=src,
                     repo_root=repo,
                     cache_dir=cache,
@@ -6787,6 +6996,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             # Step 2: Unchanged rebuild -> 100% cache hits.
             runner2 = RecordingRunner()
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6809,6 +7020,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             )
             runner3 = RecordingRunner()
             third = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6837,6 +7050,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             _write(repo / "runtime" / ".cache" / "temp.h", "#pragma once\n// v2\n")
             runner4 = RecordingRunner()
             fourth = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6871,6 +7086,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
 
             first = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6888,6 +7105,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             # Mutate top-level generated pg6_program.h -> all C/C++ units recompile, .ll 100% hit.
             _write(prog_h, "#pragma once\n#define PG6_PROG_VER 2\n")
             second = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -6910,6 +7129,8 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             # pg6_program.cpp (which #includes it) recompile; .ll shards stay 100% hit.
             _write(exp_h, "#pragma once\nvoid pg6_export_thunks(); // v2\n")
             third = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -7490,6 +7711,8 @@ class TestMultiModuleBink2AsymmetricSplit(unittest.TestCase):
 
             runner = SizedMultiModuleRunner(nm_outputs=nm_outputs)
             report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -7728,6 +7951,8 @@ class TestT96LibopusAndOptModule(unittest.TestCase):
             # Monolithic link: libopus.a immediately follows libplaygta6_core.a.
             mono_runner = RecordingRunner()
             mono_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-mono",
@@ -7752,6 +7977,8 @@ class TestT96LibopusAndOptModule(unittest.TestCase):
             split_cache = root / "cache-split"
             split_runner = RecordingRunner()
             split_report = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=split_cache,
@@ -7838,6 +8065,8 @@ class TestT96LibopusAndOptModule(unittest.TestCase):
             # Warm build at uniform O2.
             runner1 = RecordingRunner()
             rep1 = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -7858,6 +8087,8 @@ class TestT96LibopusAndOptModule(unittest.TestCase):
             # while main/vcruntime140 remain at -O2 (cache hits where unchanged).
             runner2 = RecordingRunner()
             rep2 = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -8267,6 +8498,8 @@ async function boot() { await loadDylibs(); }
             out_dir = root / "dist"
             runner = RecordingRunner(nm_outputs=nm_outputs)
             rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=cache,
@@ -8610,6 +8843,8 @@ class TestT100Wasm64V8HeadroomAndStaleCleanup(unittest.TestCase):
             out_dir = root / "dist"
 
             rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -8699,6 +8934,8 @@ class TestT100Wasm64V8HeadroomAndStaleCleanup(unittest.TestCase):
 
             # 2a) Dry-run reports stale files without deleting them.
             dry_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -8727,6 +8964,8 @@ class TestT100Wasm64V8HeadroomAndStaleCleanup(unittest.TestCase):
 
             # 2b) Failed side link preserves prior stale files on disk.
             fail_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -8746,6 +8985,8 @@ class TestT100Wasm64V8HeadroomAndStaleCleanup(unittest.TestCase):
 
             # 2c) Successful collapsed build removes stale guest_part_2/3, keeps active & custom.wasm.
             real_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache",
@@ -8773,6 +9014,8 @@ class TestT100Wasm64V8HeadroomAndStaleCleanup(unittest.TestCase):
 
             # 2d) Subsequent monolithic build removes remaining guest_part_0/1, keeps custom.wasm.
             mono_rep = bgw.run_build(
+                link_cache=False,
+                link_jobs=1,
                 source_dir=src,
                 repo_root=repo,
                 cache_dir=root / "cache-mono",
