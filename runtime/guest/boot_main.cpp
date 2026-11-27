@@ -121,6 +121,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
 #include "guest/input_record.h"
+#include "gpu/native_exec/pipe_budget_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/screenshot_model.h"
 #include "gpu/native_exec/show_target_model.h"
@@ -260,6 +261,8 @@ struct Options {
     std::string live_digest;        // --live-digest <file>: per-frame replay digests from the live executor
     std::string dawn_cache;         // --dawn-cache: Dawn blob cache root ("off" disables; default %LOCALAPPDATA%/playgta6/dawn-cache)
     uint64_t dawn_cache_max_mb = 2048;  // --dawn-cache-max-mb: LRU cap of the title's cache directory (0 = unbounded)
+    uint64_t pipeline_wait_ns = playgta6::gpu::native_exec::kDefaultPipeWaitFrameNs;  // --pipeline-wait-ms
+    uint64_t pipeline_wait_fullscreen_ns = playgta6::gpu::native_exec::kDefaultPipeWaitFullscreenNs;
     bool no_async_pipelines = false;    // --no-async-pipelines: live executor creates pipelines synchronously
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
@@ -309,6 +312,7 @@ void usage() {
                  "                     [--dump-pipelines <dir outside the repo, or under work/>]\n"
                  "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--dawn-cache <dir|off>] [--dawn-cache-max-mb N] [--no-async-pipelines]\n"
+                 "                     [--pipeline-wait-ms N|inf] [--pipeline-wait-fullscreen-ms N|inf]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--record-input <file>] [--keymap <file>]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
@@ -376,6 +380,10 @@ bool parse(int argc, char** argv, Options& o) {
             o.gpu_validation = true;
         } else if (a == "--no-async-pipelines") {
             o.no_async_pipelines = true;
+        } else if (a == "--pipeline-wait-ms" && i + 1 < argc) {
+            if (!playgta6::gpu::native_exec::parse_pipe_wait_ms(argv[++i], &o.pipeline_wait_ns)) return false;
+        } else if (a == "--pipeline-wait-fullscreen-ms" && i + 1 < argc) {
+            if (!playgta6::gpu::native_exec::parse_pipe_wait_ms(argv[++i], &o.pipeline_wait_fullscreen_ns)) return false;
         } else if (a == "--dawn-cache-max-mb" && i + 1 < argc) {
             o.dawn_cache_max_mb = std::strtoull(argv[++i], nullptr, 10);
         } else if (a == "--present-mode" && i + 1 < argc) {
@@ -955,6 +963,8 @@ bool start_live_window() {
         options.blob_cache_max_bytes = g_options.dawn_cache_max_mb << 20;
     }
     options.async_pipelines = !g_options.no_async_pipelines;
+    options.pipeline_wait_frame_ns = g_options.pipeline_wait_ns;
+    options.pipeline_wait_fullscreen_ns = g_options.pipeline_wait_fullscreen_ns;
     options.gpu_validation = g_options.gpu_validation;
     options.frame_digest_path = g_options.live_digest;
     options.gpu_time_split = g_options.gpu_time_split;

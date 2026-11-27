@@ -28,6 +28,7 @@
 #include <variant>
 
 #include "abi/playgta6_abi.h"
+#include "gpu/drop_table.h"
 #include "gpu/gpu_time.h"
 #include "gpu/present_pacing.h"
 #include "gpu/native_exec/blit_model.h"
@@ -38,6 +39,7 @@
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
 #include "gpu/native_exec/overlay_model.h"
+#include "gpu/native_exec/pipe_budget_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -312,6 +314,7 @@ struct PendingPipe {
 struct AsyncSlot {
     mutable std::shared_ptr<PendingPipe> pending;  // null: created synchronously / already resolved
     mutable wgpu::Future future;
+    bool fullscreen = false;  // vertex-buffer-less pipeline: the long wait budget (pipe_budget_model.h)
 };
 
 struct RenderPipelineEntry : AsyncSlot {
@@ -1909,6 +1912,7 @@ struct NativeExecutor::Impl {
             case GpuOpcode::Present:
                 ++stats.present_packets;
                 present();
+                pipe_budget.begin_frame();
                 break;
             case GpuOpcode::DestroyResource:
                 if (n >= 4) destroy_resource(read_payload<uint32_t>(p));
@@ -1936,8 +1940,9 @@ struct NativeExecutor::Impl {
                 if (n >= 4) {
                     const uint32_t id = read_payload<uint32_t>(p);
                     auto it = render_pipelines.find(id);
-                    pass_cmds.emplace_back(SetPipelineCmd{id, it != render_pipelines.end() ? resolve(it->second)
-                                                                                           : wgpu::RenderPipeline()});
+                    pass_cmds.emplace_back(SetPipelineCmd{id, it != render_pipelines.end() && !it->second.pending
+                                                                ? it->second.pipeline
+                                                                : wgpu::RenderPipeline()});
                 } else {
                     ++stats.op_errors;
                 }
@@ -3148,6 +3153,7 @@ struct NativeExecutor::Impl {
         rd.vertex.buffers = vbs.data();
 
         RenderPipelineEntry e;
+        e.fullscreen = vbs.empty();
         if (options.async_pipelines) {
             create_render_async(rd, &e);
         } else {
@@ -3194,15 +3200,46 @@ struct NativeExecutor::Impl {
         ++stats.async_pipelines;
     }
 
-    // Blocks until the entry's compile finished (the first use of a pipeline the prewarm did not
-    // finish in time; a pipeline built ahead of use is already done and costs nothing here).
-    void await_pipe(const AsyncSlot& slot) {
-        if (!slot.pending->done) {
-            ++stats.async_pipeline_waits;
-            const uint64_t t0 = now_ns();
-            instance.WaitAny(slot.future, kWaitForever);
-            stats.async_pipeline_wait_ns += now_ns() - t0;
-        }
+    PipeWaitBudget pipe_budget;
+
+    // Waits for the entry's compile within the frame's wait budget (pipe_budget_model.h); true once it
+    // finished. A pipeline built ahead of use is already done and costs nothing here. False: still
+    // compiling past the budget, the caller skips the draw / dispatch (the compile keeps running).
+    bool await_pipe(const AsyncSlot& slot) {
+        if (slot.pending->done) return true;
+        instance.ProcessEvents();
+        if (slot.pending->done) return true;
+        const uint64_t allow = pipe_budget.allowance(slot.fullscreen);
+        if (allow == 0) return false;
+        ++stats.async_pipeline_waits;
+        const uint64_t t0 = now_ns();
+        instance.WaitAny(slot.future, allow);
+        const uint64_t dt = now_ns() - t0;
+        stats.async_pipeline_wait_ns += dt;
+        pipe_budget.charge(slot.fullscreen, dt);
+        return slot.pending->done;
+    }
+
+    // Blocks without a budget (bind group layout / remap paths that need the pipeline's layout now).
+    void await_pipe_forever(const AsyncSlot& slot) {
+        if (slot.pending->done) return;
+        ++stats.async_pipeline_waits;
+        const uint64_t t0 = now_ns();
+        instance.WaitAny(slot.future, kWaitForever);
+        stats.async_pipeline_wait_ns += now_ns() - t0;
+    }
+
+    // Still compiling (no wait): the draw / dispatch using it is dropped.
+    bool pipe_still_pending(const AsyncSlot& slot) {
+        if (!slot.pending) return false;
+        if (slot.pending->done) return false;
+        instance.ProcessEvents();
+        return !slot.pending->done;
+    }
+
+    void note_pipeline_pending(uint64_t hash, bool dispatch) {
+        ++stats.pipeline_pending_skips;
+        d3d12_guest::drop_table().record(hash, d3d12_guest::DropTable::Reason::PipelinePending, dispatch);
     }
 
     void pipe_failed(const PendingPipe& st, const char* what) {
@@ -3234,7 +3271,7 @@ struct NativeExecutor::Impl {
 
     const wgpu::RenderPipeline& resolve(const RenderPipelineEntry& e) {
         if (e.pending) {
-            await_pipe(e);
+            await_pipe_forever(e);
             if (e.pending->render) {
                 e.pipeline = e.pending->render;
             } else {
@@ -3248,9 +3285,19 @@ struct NativeExecutor::Impl {
         return e.pipeline;
     }
 
+    // Budgeted: null while the compile is still running past the frame's wait budget.
+    const wgpu::RenderPipeline* resolve_budgeted(const RenderPipelineEntry& e) {
+        if (e.pending && !await_pipe(e)) return nullptr;
+        return &resolve(e);
+    }
+    const wgpu::ComputePipeline* resolve_budgeted(const ComputePipelineEntry& e) {
+        if (e.pending && !await_pipe(e)) return nullptr;
+        return &resolve(e);
+    }
+
     const wgpu::ComputePipeline& resolve(const ComputePipelineEntry& e) {
         if (e.pending) {
-            await_pipe(e);
+            await_pipe_forever(e);
             if (e.pending->compute) {
                 e.pipeline = e.pending->compute;
             } else {
@@ -4101,6 +4148,8 @@ struct NativeExecutor::Impl {
         std::optional<uint32_t> active_pipeline;
         // _preparePassCommandsForFlush compute filter state
         bool had_explicit_compute = false, compute_valid = false;
+        bool compute_pending = false;  // compute pipeline still compiling past the wait budget
+        uint64_t compute_pending_hash = 0;
         // GPU pass timestamps: the commands being encoded (for the pass's pipeline look-ahead) and
         // the ring slot of this submit (-2: not opened yet, -1: no free slot).
         const std::vector<PassCmd>* cmds = nullptr;
@@ -4308,9 +4357,14 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = false;
             e.compute_valid = false;
             auto it = render_pipelines.find(sp->id);
-            const wgpu::RenderPipeline& pl = it != render_pipelines.end() ? resolve(it->second) : sp->at_packet;
-            if (pl) e.rpass.SetPipeline(pl);
-            else ++stats.op_errors;  // SetPipeline: render pipeline not found
+            const wgpu::RenderPipeline* plp = it != render_pipelines.end() ? resolve_budgeted(it->second) : &sp->at_packet;
+            if (!plp) {
+                // Still compiling past the budget: draw_allowed() drops the draws until a later frame.
+            } else if (*plp) {
+                e.rpass.SetPipeline(*plp);
+            } else {
+                ++stats.op_errors;  // SetPipeline: render pipeline not found
+            }
             if (e.seg_open) e.seg_switch(it != render_pipelines.end() ? it->second.perf_hash : 0, d3d12_guest::GpuPassKind::Render);
         } else if (const auto* vb = std::get_if<SetVertexBufferCmd>(&cmd)) {
             e.ensure_render();
@@ -4361,7 +4415,18 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = true;
             auto it = compute_pipelines.find(sc->id);
             e.compute_valid = it != compute_pipelines.end();
-            if (e.compute_valid) e.cpass.SetPipeline(resolve(it->second));
+            e.compute_pending_hash = 0;
+            e.compute_pending = false;
+            if (e.compute_valid) {
+                if (const wgpu::ComputePipeline* cp = resolve_budgeted(it->second)) {
+                    e.cpass.SetPipeline(*cp);
+                } else {
+                    e.compute_valid = false;
+                    e.compute_pending = true;
+                    auto hit = compute_hash.find(sc->id);
+                    e.compute_pending_hash = hit != compute_hash.end() ? hit->second : 0;
+                }
+            }
             if (e.seg_open) {
                 auto hit = compute_hash.find(sc->id);
                 e.seg_switch(hit != compute_hash.end() ? hit->second : 0, d3d12_guest::GpuPassKind::Compute);
@@ -4369,6 +4434,7 @@ struct NativeExecutor::Impl {
         } else if (const auto* dc = std::get_if<DispatchCmd>(&cmd)) {
             if (e.had_explicit_compute && !e.compute_valid) {
                 ++stats.dispatches_skipped;
+                if (e.compute_pending) note_pipeline_pending(e.compute_pending_hash, true);
                 return;
             }
             // validateComputeDispatch
@@ -4942,6 +5008,11 @@ struct NativeExecutor::Impl {
                 ++stats.op_errors;
                 return false;
             }
+            if (pipe_still_pending(it->second)) {
+                ++stats.draws_skipped;
+                note_pipeline_pending(it->second.perf_hash, false);
+                return false;
+            }
             if (it->second.expects_group0 && !e.group0_bound) {
                 ++stats.draws_skipped;
                 ++stats.op_errors;
@@ -5325,6 +5396,13 @@ std::unique_ptr<NativeExecutor> NativeExecutor::create(const ExecutorOptions& op
     if (!error) error = &local_error;
     auto impl = std::make_unique<Impl>();
     impl->options = options;
+    {
+        // Env overrides for diagnosis (PG6_PIPELINE_WAIT_MS / PG6_PIPELINE_WAIT_FULLSCREEN_MS: ms, "inf", "0").
+        uint64_t fr = impl->options.pipeline_wait_frame_ns, fs = impl->options.pipeline_wait_fullscreen_ns;
+        parse_pipe_wait_ms(std::getenv("PG6_PIPELINE_WAIT_MS"), &fr);
+        parse_pipe_wait_ms(std::getenv("PG6_PIPELINE_WAIT_FULLSCREEN_MS"), &fs);
+        impl->pipe_budget.configure(fr, fs);
+    }
     impl->overlay_on = options.overlay;
     if (!impl->init(status, error)) return nullptr;
     std::unique_ptr<NativeExecutor> ex(new NativeExecutor(std::move(impl)));
@@ -5632,6 +5710,7 @@ std::string NativeExecutor::stats_json() const {
     num("async_pipelines", st.async_pipelines);
     num("async_pipeline_waits", st.async_pipeline_waits);
     num("async_pipeline_wait_ns", st.async_pipeline_wait_ns);
+    num("pipeline_pending_skips", st.pipeline_pending_skips);
     num("async_pipeline_failures", st.async_pipeline_failures);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {

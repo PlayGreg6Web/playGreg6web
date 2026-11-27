@@ -30,6 +30,10 @@ int main() {
     CHECK(has(d, "\"no_shader_module\":3"));
     CHECK(has(d, "\"mesh_refused\":1"));
 
+    DropTable pp;  // a draw skipped while its pipeline is still compiling, keyed by the shader hash
+    pp.record(0xfeed, DropTable::Reason::PipelinePending, false, 2);
+    CHECK(has(pp.detail_json(), "\"pipeline_pending\":2"));
+
     // Bounded: hashes past the cap land in "other", tracked ones keep counting.
     DropTable b;
     for (uint64_t i = 1; i <= DropTable::kMaxHashes + 10; ++i) {

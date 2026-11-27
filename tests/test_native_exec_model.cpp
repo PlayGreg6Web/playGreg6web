@@ -12,6 +12,7 @@
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
+#include "gpu/native_exec/pipe_budget_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -1006,6 +1007,36 @@ void test_show_target_model() {
     CHECK(show_target_title("base", label).find("base | SHOWING tex 7") == 0);
 }
 
+void test_pipe_wait_budget() {
+    using namespace playgta6::gpu::native_exec;
+    uint64_t v = 7;
+    CHECK(parse_pipe_wait_ms("500", &v) && v == 500ull * 1000000ull);
+    CHECK(parse_pipe_wait_ms("0", &v) && v == 0);
+    CHECK(parse_pipe_wait_ms("inf", &v) && v == kPipeWaitUnlimited);
+    CHECK(parse_pipe_wait_ms("-1", &v) && v == kPipeWaitUnlimited);
+    v = 7;
+    CHECK(!parse_pipe_wait_ms("abc", &v) && v == 7);
+    CHECK(!parse_pipe_wait_ms("-5", &v) && !parse_pipe_wait_ms("", &v) && !parse_pipe_wait_ms(nullptr, &v));
+
+    PipeWaitBudget b;  // defaults: 0.5 s per frame, 10 s fullscreen
+    CHECK(b.allowance(false) == 500ull * 1000000ull);
+    CHECK(b.allowance(true) == 10000ull * 1000000ull);
+    b.charge(false, 200ull * 1000000ull);
+    CHECK(b.allowance(false) == 300ull * 1000000ull);
+    CHECK(b.allowance(true) == 10000ull * 1000000ull);  // separate pools
+    b.charge(false, 400ull * 1000000ull);                // overspent: skip, never wrap
+    CHECK(b.allowance(false) == 0);
+    b.charge(true, 10000ull * 1000000ull);
+    CHECK(b.allowance(true) == 0);
+    b.begin_frame();  // a new frame refills both
+    CHECK(b.allowance(false) == 500ull * 1000000ull && b.allowance(true) == 10000ull * 1000000ull);
+
+    b.configure(0, kPipeWaitUnlimited);  // 0 = never wait, unlimited = the old behaviour
+    CHECK(b.allowance(false) == 0);
+    b.charge(true, 1ull << 40);
+    CHECK(b.allowance(true) == kPipeWaitUnlimited);
+}
+
 int main() {
     test_present_model();
     test_shader_payloads();
@@ -1027,6 +1058,7 @@ int main() {
     test_layout_remap();
     test_blit_model();
     test_show_target_model();
+    test_pipe_wait_budget();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

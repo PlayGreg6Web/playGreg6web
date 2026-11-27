@@ -71,6 +71,13 @@ struct ExecutorOptions {
     // keeps consuming packets (the prewarm batches create hundreds ahead of use). The pipeline is
     // awaited, never skipped, when a pass first uses it, so output is identical to sync creation.
     bool async_pipelines = false;
+    // Per-frame wait budget for a still-compiling async pipeline (pipe_budget_model.h): past it the draw
+    // is skipped (drop table reason pipeline_pending) and the pipeline is used once ready. ns;
+    // UINT64_MAX = wait forever (the old behaviour), 0 = never wait. Fullscreen = vertex-buffer-less
+    // pipelines. Overridable: --pipeline-wait-ms / --pipeline-wait-fullscreen-ms, env
+    // PG6_PIPELINE_WAIT_MS / PG6_PIPELINE_WAIT_FULLSCREEN_MS.
+    uint64_t pipeline_wait_frame_ns = 500ull * 1000000ull;
+    uint64_t pipeline_wait_fullscreen_ns = 10000ull * 1000000ull;
     // Strict validation (--gpu-validation): Dawn backend validation (D3D12 debug layer when installed),
     // immediate error handling, and an error scope around every packet. Errors are deduped by text in
     // stats_json()'s "validation" block with the first packet index / opcode. Slower; diagnosis only.
@@ -241,6 +248,7 @@ struct ExecutorStats {
     uint64_t async_pipelines = 0;          // pipelines handed to Dawn's worker threads
     uint64_t async_pipeline_waits = 0;     // first uses that still had to wait for the compile
     uint64_t async_pipeline_wait_ns = 0;
+    uint64_t pipeline_pending_skips = 0;   // draws / dispatches skipped: the pipeline was still compiling past the budget
     uint64_t async_pipeline_failures = 0;  // creation failed: the pipeline became an error object
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
