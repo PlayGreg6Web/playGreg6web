@@ -1268,6 +1268,10 @@ private:
         // flush the range is not hashed again (flush_cpu_buffers). Unprimed = hash and arm.
         os::WriteCursor write_cursor;
         bool write_primed = false;
+        // Page index (storage_page_index_, as RelocatedUniform): compared after a successful flush take
+        // covering its host range, so an indexed flush only looks at it again when a take reports it written.
+        bool index_primed = false;
+        uint64_t visit_seq = 0;
     };
     struct RelocatedStorageKey {
         uint64_t va = 0;
@@ -1281,6 +1285,10 @@ private:
     };
     mutable std::mutex storage_relocation_mutex_;
     std::map<RelocatedStorageKey, RelocatedStorage> storage_relocations_;
+    // Host pages -> relocated storage ranges (under storage_relocation_mutex_), for indexed native
+    // flushes; and the skipped entries that uploaded anyway under --flush-crosscheck.
+    HostPageIndex storage_page_index_;
+    std::unordered_set<const void*> crosscheck_storage_;
     // Live homes by (buffer id << 32 | offset), for storage_homes_unmoved.
     std::unordered_map<uint64_t, std::map<RelocatedStorageKey, RelocatedStorage>::iterator> storage_home_index_;
     static uint64_t storage_home_key(uint32_t buffer_id, uint64_t offset) noexcept {
@@ -1848,6 +1856,8 @@ enum class Work : size_t {
     FlushBuffersUntracked,
     FlushUniformsCompared,
     FlushUniformsSkipped,
+    FlushStorageCompared,  // relocated storage ranges looked at / skipped by an indexed flush
+    FlushStorageSkipped,
     FlushCrosscheckLate,
     FlushCrosscheckMisses,
     // Indexed flushes that were not cross-checked: calls and wall time (ns) in flush_cpu_buffers.

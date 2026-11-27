@@ -9716,6 +9716,8 @@ void test_native_flush_page_index() {
         CHECK(dev->relocate_uniform(uni, 64, 64, &id_u, &off_u));
         CHECK(dev->relocate_uniform(uni2, 64, 64, &id_u2, &off_u2));
         CHECK(dev->relocate_uniform(uni3, 64, 64, &id_u3, &off_u3));
+        uint32_t id_s = 0;  // a relocated storage range, added further down
+        uint64_t off_s = 0;
         struct Write {
             uint32_t id;
             uint32_t offset;
@@ -9735,7 +9737,8 @@ void test_native_flush_page_index() {
                 if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer) {
                     GpuWriteBufferPayload w{};
                     std::memcpy(&w, enc.data() + off, sizeof(w));
-                    if (w.id == id_a || w.id == id_b || w.id == id_u || w.id == id_u2 || w.id == id_u3) {
+                    if (w.id == id_a || w.id == id_b || w.id == id_u || w.id == id_u2 || w.id == id_u3 ||
+                        (id_s != 0 && w.id == id_s)) {
                         out.push_back({w.id, w.dst_offset, h.payload_bytes - static_cast<uint32_t>(sizeof(w))});
                     }
                 }
@@ -9827,6 +9830,31 @@ void test_native_flush_page_index() {
         CHECK(com::write_guest(mem + k64K, two));
         CHECK(com::write_guest(uni, two));
         CHECK(flush().size() == 3);  // A, B, the uniform range in B
+        CHECK(flush().empty());
+        // A relocated storage range outside every buffer: page-indexed like the uniform ranges
+        // (compared while unprimed, then skipped until a take reports one of its pages written).
+        const uint64_t sto = mem + 3 * k64K + 2 * kPage + 0x100;
+        CHECK(dev->relocate_storage_buffer(sto, 256, &id_s, &off_s, false));
+        CHECK(flush().empty());  // index (its bytes were uploaded when it was relocated)
+        CHECK(flush().empty());  // prime
+        {
+            const uint64_t s_skipped0 = dg::work_total(dg::Work::FlushStorageSkipped);
+            CHECK(flush().empty());
+            if (mode != dg::FlushMode::Full && tracking) {
+                CHECK(dg::work_total(dg::Work::FlushStorageSkipped) - s_skipped0 == 1);
+            } else {
+                CHECK(dg::work_total(dg::Work::FlushStorageSkipped) == s_skipped0);
+            }
+        }
+        CHECK(com::write_guest(sto + 8, two));
+        CHECK(only(flush(), id_s, static_cast<uint32_t>(off_s)));
+        CHECK(flush().empty());
+        CHECK(com::write_guest(sto + 8, two));  // same bytes: compared, nothing uploaded
+        CHECK(flush().empty());
+        if (auto* host_s = static_cast<uint8_t*>(com::guest_to_host(sto, 256))) {
+            host_s[200] = 0x77;  // a host write straight into the memory
+            CHECK(only(flush(), id_s, static_cast<uint32_t>(off_s)));
+        }
         CHECK(flush().empty());
         // A uniform range relocated after the others were primed: compared at the next flush (it is
         // unprimed, so the indexed flush visits it without a take naming its page), then skipped.
