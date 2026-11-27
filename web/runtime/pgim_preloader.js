@@ -59,9 +59,11 @@
   const DEFAULT_CHUNK_BYTES = DEFAULT_CHUNK_SIZE;
   const DEFAULT_CONCURRENCY = 4;
   const DEFAULT_MAX_RETRIES = 3;
+  const DEFAULT_MAX_VERSION_RETRIES = 2;
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
   const DEFAULT_MAX_RETRY_DELAY_MS = 30000;
   const PGIM_OPFS_CACHE_VERSION = 1;
+  const PGIM_OPFS_PROVENANCE_SCHEMA = 1;
   const DEFAULT_OPFS_CACHE_DIR = 'playgta6-pgim-cache';
   const DEFAULT_OPFS_CACHE_MODE = 'auto';
   /** Explicit `?streamShaders=1` default threshold (matches web/workers/wgpu_worker.js). */
@@ -1276,6 +1278,54 @@
     return cleaned.length > 0 ? cleaned : null;
   }
 
+  /**
+   * Return true when `rawEtag` is a weak HTTP entity-tag (`W/"..."` or `w/"..."`).
+   *
+   * @param {unknown} rawEtag
+   * @returns {boolean}
+   */
+  function isWeakEtag(rawEtag) {
+    const normalized = normalizeEtag(rawEtag);
+    if (!normalized) return false;
+    return /^(?:W|w)\//.test(normalized);
+  }
+
+  /**
+   * Return true when `rawEtag` is a non-empty quoted strong HTTP entity-tag (`"..."`)
+   * without a weak `W/` prefix (RFC 9110 §8.8.3).
+   *
+   * @param {unknown} rawEtag
+   * @returns {boolean}
+   */
+  function isStrongEtag(rawEtag) {
+    const normalized = normalizeEtag(rawEtag);
+    if (!normalized) return false;
+    if (/^(?:W|w)\//.test(normalized)) return false;
+    return (
+      normalized.length >= 3 &&
+      normalized.startsWith('"') &&
+      normalized.endsWith('"') &&
+      normalized.indexOf('"', 1) === normalized.length - 1
+    );
+  }
+
+  function validatorStrengthForEtag(rawEtag) {
+    if (isStrongEtag(rawEtag)) return 'strong';
+    if (isWeakEtag(rawEtag)) return 'weak';
+    return 'none';
+  }
+
+  function hasVerifiedOpfsProvenance(meta) {
+    return Boolean(
+      meta &&
+        isPlainObject(meta.provenance) &&
+        meta.provenance.schema === PGIM_OPFS_PROVENANCE_SCHEMA &&
+        meta.provenance.verified === true &&
+        typeof meta.provenance.source === 'string' &&
+        meta.provenance.source.length > 0
+    );
+  }
+
   function normalizeLastModified(rawLastModified) {
     if (typeof rawLastModified !== 'string') return null;
     const cleaned = rawLastModified.replace(/[\x00-\x1f\x7f]/g, '').trim();
@@ -2410,6 +2460,7 @@
     chunkBytes,
     concurrency = DEFAULT_CONCURRENCY,
     maxRetries = DEFAULT_MAX_RETRIES,
+    maxVersionRetries = DEFAULT_MAX_VERSION_RETRIES,
     retryDelayMs,
     baseRetryDelayMs,
     maxRetryDelayMs,
@@ -2459,6 +2510,9 @@
     if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
       throw new RangeError(`maxRetries must be a non-negative integer, got: ${maxRetries}`);
     }
+    if (!Number.isSafeInteger(maxVersionRetries) || maxVersionRetries < 0) {
+      throw new RangeError(`maxVersionRetries must be a non-negative integer, got: ${maxVersionRetries}`);
+    }
     const effectiveRetryDelayMs =
       retryDelayMs !== undefined
         ? retryDelayMs
@@ -2503,6 +2557,7 @@
     this.chunkBytes = effectiveChunkSize;
     this.concurrency = concurrency;
     this.maxRetries = maxRetries;
+    this.maxVersionRetries = maxVersionRetries;
     this.retryDelayMs = effectiveRetryDelayMs;
     this.baseRetryDelayMs = effectiveRetryDelayMs;
     this.maxRetryDelayMs = effectiveMaxRetryDelayMs;
@@ -2898,6 +2953,7 @@
     let invalidated = false;
 
     if (meta !== null) {
+      const metaEtag = normalizeEtag(meta.etag);
       const validMetaShape =
         !meta._corrupt &&
         meta.version === this.opfsCacheVersion &&
@@ -2905,27 +2961,31 @@
         typeof meta.dataKey === 'string' &&
         meta.dataKey.length > 0 &&
         Number.isSafeInteger(meta.byteLength) &&
-        meta.byteLength >= PGIM_HEADER_BYTES;
+        meta.byteLength >= PGIM_HEADER_BYTES &&
+        hasVerifiedOpfsProvenance(meta) &&
+        !isWeakEtag(metaEtag);
 
       if (!validMetaShape) {
         invalidated = true;
       } else {
-        const metaEtag = normalizeEtag(meta.etag);
         const metaLastModified = normalizeLastModified(meta.lastModified);
         let mismatch = false;
         if (probeSize !== null && meta.byteLength !== probeSize) {
           mismatch = true;
         }
         if (headValidated) {
-          // Strict ETag equality when HEAD succeeded (detects ETag rotation, addition, or removal).
-          if (metaEtag !== probeEtag) {
+          // Weak validators do not guarantee byte-for-byte identity for binary PGIM caching.
+          if (isWeakEtag(probeEtag)) {
+            mismatch = true;
+          } else if (metaEtag !== probeEtag) {
+            // Strict ETag equality when HEAD succeeded (detects ETag rotation, addition, or removal).
             mismatch = true;
           } else if (probeEtag === null && metaLastModified !== probeLastModified) {
             // Secondary validator when server omits ETag: Last-Modified change/addition/removal invalidates.
             mismatch = true;
           }
         } else {
-          if (probeEtag !== null && metaEtag !== probeEtag) {
+          if (probeEtag !== null && (isWeakEtag(probeEtag) || metaEtag !== probeEtag)) {
             mismatch = true;
           } else if (probeEtag === null && probeLastModified !== null && metaLastModified !== probeLastModified) {
             mismatch = true;
@@ -2956,9 +3016,6 @@
         }
         return null;
       }
-    } else if (probeSize !== null) {
-      // Direct fingerprint lookup when caller pre-populated dataKey without metaKey.
-      candidateDataKey = baseFp.dataKey;
     }
 
     if (!candidateDataKey) {
@@ -3051,18 +3108,30 @@
       parallelMode: false,
       opfsCacheHit: true,
       etag: candidateEtag,
+      hasOwnEtag: true,
       lastModified: candidateLastModified,
       cacheKey: candidateDataKey,
       cacheFingerprint: candidateFingerprint,
+      versionVerified: true,
+      validatorStrength: validatorStrengthForEtag(candidateEtag),
+      versionProvenance: 'opfs-cache',
     };
   }
 
-  _scheduleOpfsWrite(run, { url, etag, lastModified = null, bytes, totalBytes }) {
+  _scheduleOpfsWrite(run, { url, etag, lastModified = null, bytes, totalBytes, provenance = null }) {
     const store = this._opfsStore;
     if (!store || !bytes || !(totalBytes > 0)) return;
     if (bytes.byteLength !== totalBytes || (bytes.buffer && bytes.buffer.detached)) return;
+    if (!provenance || provenance.verified !== true) return;
+    if (isWeakEtag(etag)) return;
     const fp = buildPgimOpfsFingerprint(url, etag, totalBytes, this.opfsCacheVersion);
     const normLastModified = normalizeLastModified(lastModified);
+    const taggedProvenance = {
+      schema: PGIM_OPFS_PROVENANCE_SCHEMA,
+      verified: true,
+      source: typeof provenance.source === 'string' && provenance.source.length > 0 ? provenance.source : 'verified',
+      validatorStrength: validatorStrengthForEtag(fp.etag),
+    };
     // Synchronously clone a detached-safe non-SAB copy so immediate Worker zero-copy transfer
     // (`transferPreloadPayloadToWorker`) or `releaseBootBundleBytes()` cannot detach/corrupt the
     // background OPFS write. Dropped immediately in `finally` to preserve W258 zero-retention.
@@ -3081,6 +3150,7 @@
         byteLength: totalBytes,
         fingerprint: fp.fingerprint,
         dataKey: fp.dataKey,
+        provenance: taggedProvenance,
       })
     );
     const dataMeta = {
@@ -3091,6 +3161,7 @@
       lastModified: normLastModified,
       byteLength: totalBytes,
       fingerprint: fp.fingerprint,
+      provenance: taggedProvenance,
     };
     const metaInfo = {
       kind: 'pgim-meta',
@@ -3100,6 +3171,18 @@
       lastModified: normLastModified,
       byteLength: totalBytes,
       fingerprint: fp.fingerprint,
+      provenance: taggedProvenance,
+    };
+
+    const cleanupKeys = async (keys) => {
+      if (typeof store.delete !== 'function') return;
+      for (let i = 0; i < keys.length; i += 1) {
+        try {
+          await store.delete(keys[i]);
+        } catch {
+          // Ignore cleanup failure.
+        }
+      }
     };
 
     const runWrite = async () => {
@@ -3108,22 +3191,35 @@
       let metaToWrite = metaPayload;
       metaPayload = null;
       try {
-        const writeRes = await store.write(fp.dataKey, dataToWrite, dataMeta);
+        let writeRes;
+        try {
+          writeRes = await store.write(fp.dataKey, dataToWrite, dataMeta);
+        } catch (dataErr) {
+          dataToWrite = null;
+          await cleanupKeys([fp.dataKey]);
+          throw dataErr;
+        }
         dataToWrite = null;
         const stored =
           writeRes !== false &&
           !(writeRes && typeof writeRes === 'object' && writeRes.stored === false);
-        if (!stored) return;
+        if (!stored) {
+          await cleanupKeys([fp.dataKey]);
+          return;
+        }
         try {
-          await store.write(fp.metaKey, metaToWrite, metaInfo);
-        } catch (metaErr) {
-          if (typeof store.delete === 'function') {
-            try {
-              await store.delete(fp.dataKey);
-            } catch {
-              // Ignore cleanup failure.
-            }
+          const metaWriteRes = await store.write(fp.metaKey, metaToWrite, metaInfo);
+          metaToWrite = null;
+          const metaStored =
+            metaWriteRes !== false &&
+            !(metaWriteRes && typeof metaWriteRes === 'object' && metaWriteRes.stored === false);
+          if (!metaStored) {
+            await cleanupKeys([fp.dataKey, fp.metaKey]);
+            return;
           }
+        } catch (metaErr) {
+          metaToWrite = null;
+          await cleanupKeys([fp.dataKey, fp.metaKey]);
           throw metaErr;
         }
         if (run) run.recordOpfsWrite();
@@ -3532,41 +3628,107 @@
     }
 
     if (loaded === null) {
-      if (this.rangeCache) {
-        loaded = await this._loadViaRangeCache(ctx, probe);
-      } else if (probe.acceptRanges === false) {
-        const response = await this._request(ctx, { method: 'GET' });
-        if (!response.ok) throw httpError(url, response.status);
-        loaded = await this._consumeFullBody(ctx, response, probe.totalBytes);
-      } else {
-        loaded = await this._loadRanged(ctx, probe);
+      let versionAttempt = 0;
+      for (;;) {
+        throwIfAborted(signal);
+        if (versionAttempt > 0) {
+          probe = await this._probe(ctx);
+          if (this._opfsStore) {
+            loaded = await this._tryLoadFromOpfsCache(ctx, probe, {
+              verifyChecksums,
+              expectedEtag,
+              expectedBytes,
+              countMiss: false,
+            });
+            if (loaded !== null) break;
+          }
+        }
+        const preAttemptBytesLoaded = ctx.run ? ctx.run.bytesLoaded : 0;
+        const preAttemptChunksFetched = ctx.run ? ctx.run.chunksFetched : 0;
+        try {
+          if (this.rangeCache) {
+            loaded = await this._loadViaRangeCache(ctx, probe);
+          } else if (probe.acceptRanges === false) {
+            loaded = await this._fetchFullCoherent(ctx, probe);
+          } else {
+            loaded = await this._loadRanged(ctx, probe);
+          }
+          break;
+        } catch (err) {
+          if ((signal && signal.aborted) || isAbortError(err)) throw err;
+          const isRetryableVersion =
+            err instanceof PgimPreloadError && err.retryableVersionChange === true;
+          if (!isRetryableVersion) throw err;
+          if (ctx.run) {
+            ctx.run.bytesLoaded = preAttemptBytesLoaded;
+            ctx.run.chunksFetched = preAttemptChunksFetched;
+          }
+          if (versionAttempt < this.maxVersionRetries) {
+            versionAttempt += 1;
+            if (ctx.run) ctx.run.recordRetry();
+            continue;
+          }
+          throw new PgimPreloadError(
+            err.code,
+            `${err.message} (exhausted ${this.maxVersionRetries} version retry attempts)`,
+            {
+              url,
+              cause: err,
+              expectedEtag: err.expectedEtag ?? null,
+              observedEtag: err.observedEtag ?? null,
+              status: err.status,
+              versionRetries: versionAttempt,
+            }
+          );
+        }
       }
     }
     throwIfAborted(signal);
 
     const layout = loaded.layout || parsePgimLayout(loaded.bytes, { verifyChecksums });
     const totalBytes = loaded.bytes.byteLength;
-    const effectiveEtag =
-      loaded.etag !== undefined && loaded.etag !== null
+    const effectiveEtag = loaded.hasOwnEtag
+      ? (loaded.etag ?? null)
+      : loaded.etag !== undefined && loaded.etag !== null
         ? loaded.etag
         : probe && probe.etag !== undefined
           ? probe.etag
           : null;
-    const effectiveLastModified =
-      loaded.lastModified !== undefined && loaded.lastModified !== null
+    const effectiveLastModified = loaded.hasOwnEtag
+      ? (loaded.lastModified ?? null)
+      : loaded.lastModified !== undefined && loaded.lastModified !== null
         ? loaded.lastModified
         : probe && probe.lastModified !== undefined
           ? probe.lastModified
           : null;
     const opfsCacheHit = Boolean(loaded.opfsCacheHit);
+    let versionVerified = Boolean(loaded.versionVerified);
+    let versionProvenance = loaded.versionProvenance || null;
+    if (!versionVerified && loaded.transport === 'range-cache' && verifyChecksums) {
+      versionVerified = true;
+      versionProvenance = 'checksum-verified-range-cache';
+    }
+    const validatorStrength = loaded.validatorStrength || validatorStrengthForEtag(effectiveEtag);
 
-    if (!opfsCacheHit && this._opfsStore && !(signal && signal.aborted)) {
+    if (
+      !opfsCacheHit &&
+      this._opfsStore &&
+      !(signal && signal.aborted) &&
+      versionVerified &&
+      !isWeakEtag(effectiveEtag)
+    ) {
       this._scheduleOpfsWrite(ctx.run, {
         url,
         etag: effectiveEtag,
         lastModified: effectiveLastModified,
         bytes: loaded.bytes,
         totalBytes,
+        provenance: {
+          schema: PGIM_OPFS_PROVENANCE_SCHEMA,
+          verified: true,
+          source: versionProvenance || 'verified',
+          validatorStrength,
+        },
       });
     }
 
@@ -3583,6 +3745,9 @@
       transport: loaded.transport,
       opfsCacheHit,
       etag: effectiveEtag,
+      versionVerified,
+      validatorStrength,
+      versionProvenance,
       cacheKey: loaded.cacheKey || null,
       cacheFingerprint: loaded.cacheFingerprint || null,
       requests: ctx.requests,
@@ -3873,7 +4038,9 @@
             meta.version === this.opfsCacheVersion &&
             meta.urlPath === baseFp.urlPath &&
             Number.isSafeInteger(meta.byteLength) &&
-            meta.byteLength >= PGIM_HEADER_BYTES
+            meta.byteLength >= PGIM_HEADER_BYTES &&
+            hasVerifiedOpfsProvenance(meta) &&
+            !isWeakEtag(meta.etag)
           ) {
             cachedSizes[idx] = meta.byteLength;
             probes[idx] = null;
@@ -4101,6 +4268,9 @@
       transport: result.transport,
       opfsCacheHit: result.opfsCacheHit,
       etag: result.etag,
+      versionVerified: result.versionVerified,
+      validatorStrength: result.validatorStrength,
+      versionProvenance: result.versionProvenance,
       cacheKey: result.cacheKey,
       cacheFingerprint: result.cacheFingerprint,
       requests: result.requests,
@@ -4636,10 +4806,28 @@
         response = await this._request(ctx, { method: 'HEAD' });
       } catch (err) {
         if (ctx.signal && ctx.signal.aborted) throw err;
-        return { totalBytes: null, acceptRanges: null, etag: null, lastModified: null, headOk: false }; // HEAD unsupported: probe with a Range GET.
+        return {
+          totalBytes: null,
+          acceptRanges: null,
+          etag: null,
+          strongEtag: null,
+          weakEtag: false,
+          lastModified: null,
+          headOk: false,
+        }; // HEAD unsupported: probe with a Range GET.
       }
       if (response.status === 404 || response.status === 410) throw httpError(ctx.url, response.status);
-      if (!response.ok) return { totalBytes: null, acceptRanges: null, etag: null, lastModified: null, headOk: false };
+      if (!response.ok) {
+        return {
+          totalBytes: null,
+          acceptRanges: null,
+          etag: null,
+          strongEtag: null,
+          weakEtag: false,
+          lastModified: null,
+          headOk: false,
+        };
+      }
       const totalBytes = contentLength(response);
       if (totalBytes !== null && totalBytes < PGIM_HEADER_BYTES) {
         throw new PgimPreloadError(
@@ -4656,7 +4844,15 @@
       }
       const etag = normalizeEtag(headerValue(response, 'etag'));
       const lastModified = normalizeLastModified(headerValue(response, 'last-modified'));
-      return { totalBytes, acceptRanges, etag, lastModified, headOk: true };
+      return {
+        totalBytes,
+        acceptRanges,
+        etag,
+        strongEtag: isStrongEtag(etag) ? etag : null,
+        weakEtag: isWeakEtag(etag),
+        lastModified,
+        headOk: true,
+      };
     }
 
     async _probeAsset(ctx, what) {
@@ -4787,20 +4983,30 @@
       end,
       dest,
       signal = ctx.signal,
-      { allowFullFallback = false, validateTotal = null } = {}
+      {
+        allowFullFallback = false,
+        validateTotal = null,
+        pinnedEtag = null,
+        requireContentRangeTotal = false,
+      } = {}
     ) {
       const expectedLen = end - start;
       const rangeHeader = `bytes=${start}-${end - 1}`;
+      const strongPinnedEtag = isStrongEtag(pinnedEtag) ? pinnedEtag : null;
       const what = ctx.what || 'PGIM image';
       let attempt = 0;
       for (;;) {
         throwIfAborted(signal);
         ctx.requests += 1;
         if (ctx.run) ctx.run.recordRequest();
+        const reqHeaders = { Range: rangeHeader };
+        if (strongPinnedEtag !== null) {
+          reqHeaders['If-Range'] = strongPinnedEtag;
+        }
         try {
           const res = await raceAbort(
             Promise.resolve().then(() =>
-              this.fetchImpl(ctx.url, { method: 'GET', headers: { Range: rangeHeader }, signal })
+              this.fetchImpl(ctx.url, { method: 'GET', headers: reqHeaders, signal })
             ),
             signal
           );
@@ -4815,24 +5021,127 @@
             await this._sleepWithAbort(delayMs, signal);
             continue;
           }
+          if (res.status === 412) {
+            const observedEtag = normalizeEtag(headerValue(res, 'etag'));
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            throw new PgimPreloadError(
+              'VERSION_MISMATCH',
+              `PGIM chunk ${rangeHeader} precondition failed (HTTP 412; expected ${strongPinnedEtag ?? 'current version'}, got ${observedEtag ?? 'none'})`,
+              {
+                url: ctx.url,
+                status: 412,
+                range: rangeHeader,
+                expectedEtag: strongPinnedEtag,
+                observedEtag,
+                retryableVersionChange: true,
+              }
+            );
+          }
           if (allowFullFallback && res.status === 200) {
             return { fullResponse: res };
           }
           if (res.status === 416 && start === 0) {
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
             throw new PgimPreloadError('TRUNCATED', `truncated PGIM image header: ${ctx.url} is empty (HTTP 416)`, {
               needed: PGIM_HEADER_BYTES,
               available: 0,
             });
           }
+          if (res.status === 416 && start > 0 && strongPinnedEtag !== null) {
+            const observedEtag = normalizeEtag(headerValue(res, 'etag'));
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            throw new PgimPreloadError(
+              'VERSION_MISMATCH',
+              `PGIM chunk ${rangeHeader} became unsatisfiable mid-download (HTTP 416; file likely rotated or shrank)`,
+              {
+                url: ctx.url,
+                status: 416,
+                range: rangeHeader,
+                expectedEtag: strongPinnedEtag,
+                observedEtag,
+                retryableVersionChange: true,
+              }
+            );
+          }
           if (res.status !== 206) {
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
             throw res.status === 200
               ? new PgimPreloadError('RANGE_NOT_HONORED', `server ignored Range ${rangeHeader} for ${ctx.url}`)
               : httpError(ctx.url, res.status, what);
           }
 
           const cr = parseContentRange(headerValue(res, 'content-range'));
+          const chunkEtag = normalizeEtag(headerValue(res, 'etag'));
+          const chunkLastModified = normalizeLastModified(headerValue(res, 'last-modified'));
+
+          if (strongPinnedEtag !== null && (!isStrongEtag(chunkEtag) || chunkEtag !== strongPinnedEtag)) {
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            throw new PgimPreloadError(
+              'VERSION_MISMATCH',
+              `PGIM chunk ${rangeHeader} ETag mismatch (expected ${strongPinnedEtag}, got ${chunkEtag ?? 'none'})`,
+              {
+                url: ctx.url,
+                range: rangeHeader,
+                expectedEtag: strongPinnedEtag,
+                observedEtag: chunkEtag,
+                retryableVersionChange: true,
+              }
+            );
+          }
+
           if (dest !== null) {
-            if (cr && (cr.start !== start || cr.end !== end - 1 || (validateTotal !== null && cr.total !== null && cr.total !== validateTotal))) {
+            if (requireContentRangeTotal) {
+              if (!cr) {
+                if (res.body && typeof res.body.cancel === 'function') {
+                  res.body.cancel().catch(() => {});
+                }
+                throw new PgimPreloadError('RANGE_MISMATCH', `missing Content-Range header for ${rangeHeader}`, {
+                  url: ctx.url,
+                  range: rangeHeader,
+                });
+              }
+              if (cr.start !== start || cr.end !== end - 1) {
+                if (res.body && typeof res.body.cancel === 'function') {
+                  res.body.cancel().catch(() => {});
+                }
+                throw new PgimPreloadError('RANGE_MISMATCH', `unexpected Content-Range for ${rangeHeader}`, {
+                  url: ctx.url,
+                  range: rangeHeader,
+                });
+              }
+              if (cr.total === null || (validateTotal !== null && cr.total !== validateTotal)) {
+                if (res.body && typeof res.body.cancel === 'function') {
+                  res.body.cancel().catch(() => {});
+                }
+                const totalChanged = cr.total !== null && validateTotal !== null && cr.total !== validateTotal;
+                throw new PgimPreloadError(
+                  'RANGE_MISMATCH',
+                  `PGIM chunk ${rangeHeader} Content-Range total mismatch (expected ${validateTotal}, got ${cr.total ?? '*'})`,
+                  {
+                    url: ctx.url,
+                    range: rangeHeader,
+                    expectedTotal: validateTotal,
+                    observedTotal: cr.total,
+                    retryableVersionChange: totalChanged,
+                  }
+                );
+              }
+            } else if (
+              cr &&
+              (cr.start !== start ||
+                cr.end !== end - 1 ||
+                (validateTotal !== null && cr.total !== null && cr.total !== validateTotal))
+            ) {
               if (res.body && typeof res.body.cancel === 'function') {
                 res.body.cancel().catch(() => {});
               }
@@ -4849,16 +5158,64 @@
               );
             }
             const bytesWritten = await this._readRangeBodyInto(res, dest, start, expectedLen, signal);
-            return { bytesWritten, range: cr };
+            return { bytesWritten, range: cr, etag: chunkEtag, lastModified: chunkLastModified };
           }
 
+          if (cr && cr.start !== start) {
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            throw new PgimPreloadError('RANGE_MISMATCH', `unexpected Content-Range start for ${rangeHeader}`);
+          }
+          if (cr && cr.total !== null && validateTotal !== null && cr.total !== validateTotal) {
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            throw new PgimPreloadError(
+              'SIZE_MISMATCH',
+              `PGIM size changed between HEAD (${validateTotal}) and Range response (${cr.total})`,
+              {
+                url: ctx.url,
+                expectedTotal: validateTotal,
+                observedTotal: cr.total,
+                retryableVersionChange: true,
+              }
+            );
+          }
+
+          if (strongPinnedEtag === null && allowFullFallback) {
+            const knownTotal = cr && cr.total !== null ? cr.total : validateTotal;
+            if (knownTotal !== null && knownTotal > end && !isStrongEtag(chunkEtag)) {
+              if (res.body && typeof res.body.cancel === 'function') {
+                res.body.cancel().catch(() => {});
+              }
+              return { needsFullFallback: true, etag: chunkEtag, lastModified: chunkLastModified };
+            }
+          }
+
+          const declaredLen = contentLength(res);
+          if (cr !== null && declaredLen !== null && declaredLen !== cr.end - cr.start + 1) {
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            throw new PgimPreloadError(
+              'RANGE_MISMATCH',
+              `PGIM chunk ${rangeHeader} Content-Length (${declaredLen}) disagrees with Content-Range`
+            );
+          }
           const bytes = new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
           throwIfAborted(signal);
+          if (declaredLen !== null && bytes.byteLength !== declaredLen) {
+            throw new PgimPreloadError(
+              'RANGE_MISMATCH',
+              `PGIM chunk ${rangeHeader} returned ${bytes.byteLength} bytes, declared ${declaredLen}`
+            );
+          }
           return {
             bytes,
             range: cr,
-            etag: normalizeEtag(headerValue(res, 'etag')),
-            lastModified: normalizeLastModified(headerValue(res, 'last-modified')),
+            etag: chunkEtag,
+            lastModified: chunkLastModified,
           };
         } catch (err) {
           if (signal && signal.aborted) throw abortReason(signal);
@@ -4885,26 +5242,75 @@
       }
     }
 
+    async _fetchFullCoherent(ctx, probe) {
+      const response = await this._request(ctx, { method: 'GET' });
+      if (!response.ok) throw httpError(ctx.url, response.status, ctx.what || 'PGIM image');
+      const responseEtag = normalizeEtag(headerValue(response, 'etag'));
+      const responseLastModified = normalizeLastModified(headerValue(response, 'last-modified'));
+      const rotatedSinceHead =
+        probe !== null &&
+        ((probe.etag !== null && responseEtag !== null && responseEtag !== probe.etag) ||
+          (probe.etag === null &&
+            probe.lastModified !== null &&
+            responseLastModified !== null &&
+            responseLastModified !== probe.lastModified));
+      // Full GET is a single coherent representation: if the file rotated since HEAD (or HEAD had no strong
+      // validator), trust the response's own Content-Length and PGIM header file_size.
+      const expectedTotal =
+        rotatedSinceHead || (probe && !isStrongEtag(probe.etag)) ? null : probe ? probe.totalBytes : null;
+      return this._consumeFullBody(ctx, response, expectedTotal);
+    }
+
     async _loadRanged(ctx, probe) {
       const chunkSize = ctx.chunkSize ?? this.chunkSize;
       const concurrency = ctx.concurrency ?? this.concurrency;
+      const headStrongEtag = isStrongEtag(probe.etag) ? probe.etag : null;
+
+      // Weak or non-strong ETag on HEAD cannot safely validate multi-chunk byte ranges (RFC 9110 §13.1.5):
+      // use a single coherent full GET instead of stitching unverified range chunks.
+      if (probe.headOk && probe.etag !== null && headStrongEtag === null) {
+        return this._fetchFullCoherent(ctx, probe);
+      }
+
       const firstLen = probe.totalBytes !== null ? Math.min(chunkSize, probe.totalBytes) : chunkSize;
       const firstRes = await this._fetchRangeChunkWithRetry(ctx, 0, firstLen, null, ctx.signal, {
         allowFullFallback: true,
+        validateTotal: probe.totalBytes,
+        pinnedEtag: headStrongEtag,
       });
       if (firstRes.fullResponse) {
-        // Server ignored the Range header: consume the full body as a single GET.
-        return this._consumeFullBody(ctx, firstRes.fullResponse, probe.totalBytes);
+        // Server either ignored Range or returned 200 OK because If-Range detected version rotation:
+        // consume the coherent full body, trusting its own Content-Length on rotation or unpinned HEAD.
+        const respEtag = normalizeEtag(headerValue(firstRes.fullResponse, 'etag'));
+        const rotated = headStrongEtag !== null && respEtag !== headStrongEtag;
+        const expectedFullBytes = rotated || headStrongEtag === null ? null : probe.totalBytes;
+        return this._consumeFullBody(ctx, firstRes.fullResponse, expectedFullBytes);
       }
+      if (firstRes.needsFullFallback) {
+        // Multi-chunk download has no strong validator: fall back to a coherent single-response full GET.
+        return this._fetchFullCoherent(ctx, probe);
+      }
+
       let { bytes: first, range, etag: chunkEtag, lastModified: chunkLastModified } = firstRes;
       firstRes.bytes = null;
       if (range && (range.start !== 0 || range.end - range.start + 1 !== first.byteLength)) {
-        throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk Content-Range does not match the ${first.byteLength} received bytes`);
+        first = null;
+        throw new PgimPreloadError(
+          'RANGE_MISMATCH',
+          `PGIM first chunk Content-Range does not match the ${first.byteLength} received bytes`
+        );
       }
       if (range && range.total !== null && probe.totalBytes !== null && range.total !== probe.totalBytes) {
+        first = null;
         throw new PgimPreloadError(
           'SIZE_MISMATCH',
-          `PGIM size changed between HEAD (${probe.totalBytes}) and Range response (${range.total})`
+          `PGIM size changed between HEAD (${probe.totalBytes}) and Range response (${range.total})`,
+          {
+            url: ctx.url,
+            expectedTotal: probe.totalBytes,
+            observedTotal: range.total,
+            retryableVersionChange: true,
+          }
         );
       }
       const transportTotal = range && range.total !== null ? range.total : probe.totalBytes;
@@ -4912,9 +5318,64 @@
       const total = header.fileSize;
       const firstByteLen = first.byteLength;
       if (firstByteLen !== Math.min(firstLen, total)) {
-        throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk returned ${firstByteLen} bytes, expected ${Math.min(firstLen, total)}`);
+        first = null;
+        throw new PgimPreloadError(
+          'RANGE_MISMATCH',
+          `PGIM first chunk returned ${firstByteLen} bytes, expected ${Math.min(firstLen, total)}`
+        );
       }
-      const dest = this._allocate(total);
+
+      // Single-chunk download (entire file came from one coherent 206 response): no range stitching needed.
+      if (firstByteLen === total) {
+        const dest = this._allocate(total);
+        dest.bytes.set(first, 0);
+        first = null;
+        if (ctx.run) {
+          if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
+          ctx.run.recordBytes(firstByteLen);
+          ctx.run.recordNetworkBytes(firstByteLen);
+          ctx.run.recordChunk(1);
+        }
+        ctx.emit('header', firstByteLen, total);
+        const resolvedEtag = chunkEtag;
+        return {
+          ...dest,
+          transport: 'range',
+          chunksFetched: 1,
+          parallelMode: false,
+          opfsCacheHit: false,
+          etag: resolvedEtag,
+          hasOwnEtag: true,
+          lastModified: chunkLastModified ?? (resolvedEtag === probe.etag ? probe.lastModified : null),
+          versionVerified: true,
+          validatorStrength: validatorStrengthForEtag(resolvedEtag),
+          versionProvenance: isStrongEtag(resolvedEtag) ? 'strong-etag-single-range' : 'single-response-range',
+        };
+      }
+
+      // Multi-chunk download requires one strong version validator pinned across every range chunk.
+      const pinnedEtag = headStrongEtag ?? (isStrongEtag(chunkEtag) ? chunkEtag : null);
+      if (pinnedEtag === null) {
+        first = null;
+        return this._fetchFullCoherent(ctx, probe);
+      }
+      if (!isStrongEtag(chunkEtag) || chunkEtag !== pinnedEtag) {
+        first = null;
+        throw new PgimPreloadError(
+          'VERSION_MISMATCH',
+          `PGIM first chunk ETag mismatch (expected ${pinnedEtag}, got ${chunkEtag ?? 'none'})`,
+          {
+            url: ctx.url,
+            expectedEtag: pinnedEtag,
+            observedEtag: chunkEtag,
+            retryableVersionChange: true,
+          }
+        );
+      }
+
+      const preChunkBytesLoaded = ctx.run ? ctx.run.bytesLoaded : 0;
+      const preChunkChunksFetched = ctx.run ? ctx.run.chunksFetched : 0;
+      let dest = this._allocate(total);
       dest.bytes.set(first, 0);
       first = null;
       if (ctx.run) {
@@ -4925,19 +5386,73 @@
       }
       ctx.emit('header', firstByteLen, total);
 
-      const parallel = await this._parallelChunks(
-        ctx,
-        dest.bytes,
-        firstByteLen,
-        async (start, end, signal) => {
-          const chunkRes = await this._fetchRangeChunkWithRetry(ctx, start, end, dest.bytes, signal, {
-            allowFullFallback: false,
-            validateTotal: total,
-          });
-          return chunkRes.bytesWritten;
-        },
-        { directWrite: true, countNetworkBytes: true }
-      );
+      let fallbackFullResponse = null;
+      let parallel;
+      try {
+        parallel = await this._parallelChunks(
+          ctx,
+          dest.bytes,
+          firstByteLen,
+          async (start, end, signal) => {
+            const chunkRes = await this._fetchRangeChunkWithRetry(ctx, start, end, dest.bytes, signal, {
+              allowFullFallback: true,
+              validateTotal: total,
+              pinnedEtag,
+              requireContentRangeTotal: true,
+            });
+            if (chunkRes.fullResponse) {
+              const isWinner = fallbackFullResponse === null;
+              if (isWinner) {
+                fallbackFullResponse = chunkRes.fullResponse;
+              } else if (
+                chunkRes.fullResponse.body &&
+                typeof chunkRes.fullResponse.body.cancel === 'function'
+              ) {
+                chunkRes.fullResponse.body.cancel().catch(() => {});
+              }
+              throw new PgimPreloadError(
+                'VERSION_MISMATCH',
+                `PGIM resource rotated mid-download (server returned HTTP 200 to If-Range ${pinnedEtag})`,
+                {
+                  url: ctx.url,
+                  status: 200,
+                  expectedEtag: pinnedEtag,
+                  retryableVersionChange: true,
+                  _preserveWorkerSignal: isWinner,
+                }
+              );
+            }
+            return chunkRes.bytesWritten;
+          },
+          { directWrite: true, countNetworkBytes: true }
+        );
+      } catch (err) {
+        dest = null;
+        const unlinkWinner = err && typeof err._unlinkWinner === 'function' ? err._unlinkWinner : null;
+        if (fallbackFullResponse !== null && !(ctx.signal && ctx.signal.aborted)) {
+          const fullRes = fallbackFullResponse;
+          fallbackFullResponse = null;
+          if (ctx.run) {
+            ctx.run.bytesLoaded = preChunkBytesLoaded;
+            ctx.run.chunksFetched = preChunkChunksFetched;
+          }
+          try {
+            return await this._consumeFullBody(ctx, fullRes, null);
+          } finally {
+            if (unlinkWinner) unlinkWinner();
+          }
+        }
+        if (unlinkWinner) unlinkWinner();
+        if (
+          fallbackFullResponse !== null &&
+          fallbackFullResponse.body &&
+          typeof fallbackFullResponse.body.cancel === 'function'
+        ) {
+          fallbackFullResponse.body.cancel().catch(() => {});
+        }
+        throw err;
+      }
+
       const chunksFetched = 1 + parallel.chunksCompleted;
       const parallelMode = concurrency > 1 && chunksFetched > 1;
       if (parallelMode && ctx.run) ctx.run.setParallelMode(true);
@@ -4947,8 +5462,12 @@
         chunksFetched,
         parallelMode,
         opfsCacheHit: false,
-        etag: probe.etag ?? chunkEtag ?? null,
-        lastModified: probe.lastModified ?? chunkLastModified ?? null,
+        etag: pinnedEtag,
+        hasOwnEtag: true,
+        lastModified: chunkLastModified ?? (pinnedEtag === probe.etag ? probe.lastModified : null),
+        versionVerified: true,
+        validatorStrength: 'strong',
+        versionProvenance: 'strong-etag-range',
       };
     }
 
@@ -4985,7 +5504,15 @@
       const chunksFetched = 1 + parallel.chunksCompleted;
       const parallelMode = concurrency > 1 && chunksFetched > 1;
       if (parallelMode && ctx.run) ctx.run.setParallelMode(true);
-      return { ...dest, transport: 'range-cache', chunksFetched, parallelMode };
+      return {
+        ...dest,
+        transport: 'range-cache',
+        chunksFetched,
+        parallelMode,
+        versionVerified: false,
+        validatorStrength: 'none',
+        versionProvenance: chunksFetched === 1 ? 'range-cache-single' : 'range-cache-unverified',
+      };
     }
 
     async _parallelChunks(ctx, dest, startOffset, fetchChunk, { directWrite = false, countNetworkBytes = false } = {}) {
@@ -4997,12 +5524,20 @@
         chunks.push([start, Math.min(total, start + chunkSize)]);
       }
       if (chunks.length === 0) return { chunksCompleted: 0 };
-      const { controller, unlink } = linkSignal(ctx.signal);
+      const workerCount = Math.min(concurrency, chunks.length);
+      const workerLinks = Array.from({ length: workerCount }, () => linkSignal(ctx.signal));
       let next = 0;
       let loaded = startOffset;
       let chunksCompleted = 0;
       let failure = null;
-      const worker = async () => {
+      let preserveWorkerIdx = -1;
+      const abortWorkers = (err, skipIdx = -1) => {
+        for (let k = 0; k < workerLinks.length; k += 1) {
+          if (k !== skipIdx) workerLinks[k].controller.abort(err);
+        }
+      };
+      const worker = async (workerIdx) => {
+        const workerSignal = workerLinks[workerIdx].controller.signal;
         while (failure === null && next < chunks.length) {
           const [start, end] = chunks[next];
           next += 1;
@@ -5010,7 +5545,7 @@
             const expectedLen = end - start;
             let written;
             if (directWrite) {
-              written = await fetchChunk(start, end, controller.signal);
+              written = await fetchChunk(start, end, workerSignal);
               if (failure !== null) return;
               if (written !== expectedLen) {
                 throw new PgimPreloadError(
@@ -5019,7 +5554,7 @@
                 );
               }
             } else {
-              const data = await fetchChunk(start, end, controller.signal);
+              const data = await fetchChunk(start, end, workerSignal);
               if (failure !== null) return;
               if (data.byteLength !== expectedLen) {
                 throw new PgimPreloadError(
@@ -5041,18 +5576,35 @@
           } catch (err) {
             if (failure === null) {
               failure = err;
-              controller.abort(err);
+              if (err && err._preserveWorkerSignal === true) {
+                preserveWorkerIdx = workerIdx;
+                abortWorkers(err, workerIdx);
+              } else {
+                abortWorkers(err);
+              }
             }
             return;
           }
         }
       };
       try {
-        await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, worker));
+        await Promise.all(Array.from({ length: workerCount }, (_, idx) => worker(idx)));
       } finally {
-        unlink();
+        for (let k = 0; k < workerLinks.length; k += 1) {
+          if (k === preserveWorkerIdx && failure !== null) {
+            failure._unlinkWinner = workerLinks[k].unlink;
+          } else {
+            workerLinks[k].unlink();
+          }
+        }
       }
-      throwIfAborted(ctx.signal);
+      if (ctx.signal && ctx.signal.aborted) {
+        if (failure && typeof failure._unlinkWinner === 'function') {
+          failure._unlinkWinner();
+          failure._unlinkWinner = null;
+        }
+        throw abortReason(ctx.signal);
+      }
       if (failure !== null) throw failure;
       return { chunksCompleted };
     }
@@ -5106,7 +5658,11 @@
           parallelMode: false,
           opfsCacheHit: false,
           etag: responseEtag,
+          hasOwnEtag: true,
           lastModified: responseLastModified,
+          versionVerified: true,
+          validatorStrength: validatorStrengthForEtag(responseEtag),
+          versionProvenance: 'single-response',
         };
       }
 
@@ -5187,7 +5743,11 @@
         parallelMode: false,
         opfsCacheHit: false,
         etag: responseEtag,
+        hasOwnEtag: true,
         lastModified: responseLastModified,
+        versionVerified: true,
+        validatorStrength: validatorStrengthForEtag(responseEtag),
+        versionProvenance: 'single-response',
       };
     }
 
@@ -5388,6 +5948,7 @@
       chunkBytes,
       concurrency,
       maxRetries,
+      maxVersionRetries,
       retryDelayMs,
       baseRetryDelayMs,
       maxRetryDelayMs,
@@ -5413,6 +5974,7 @@
             ...(chunkBytes !== undefined ? { chunkBytes } : {}),
             ...(concurrency !== undefined ? { concurrency } : {}),
             ...(maxRetries !== undefined ? { maxRetries } : {}),
+            ...(maxVersionRetries !== undefined ? { maxVersionRetries } : {}),
             ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
             ...(baseRetryDelayMs !== undefined ? { baseRetryDelayMs } : {}),
             ...(maxRetryDelayMs !== undefined ? { maxRetryDelayMs } : {}),
@@ -5437,7 +5999,9 @@
     PGIM_PROT,
     DEFAULT_CHUNK_BYTES,
     DEFAULT_CONCURRENCY,
+    DEFAULT_MAX_VERSION_RETRIES,
     PGIM_OPFS_CACHE_VERSION,
+    PGIM_OPFS_PROVENANCE_SCHEMA,
     DEFAULT_OPFS_CACHE_DIR,
     DEFAULT_OPFS_CACHE_MODE,
     DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
@@ -5446,6 +6010,8 @@
     PROGRAM_MANIFEST_SCHEMA_VERSION,
     PgimPreloadError,
     pgimFnv1a64,
+    isStrongEtag,
+    isWeakEtag,
     parsePgimHeader,
     parsePgimLayout,
     resolveSafeManifestUrl,

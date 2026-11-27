@@ -209,6 +209,7 @@ function createServer(files, options = {}) {
     delayMs = 0,
     headContentLength = null,
     failStatuses = null,
+    etag: defaultEtag = undefined,
   } = options;
   const log = [];
   let inFlight = 0;
@@ -222,7 +223,8 @@ function createServer(files, options = {}) {
   const fetchImpl = async (url, init = {}) => {
     const method = init.method || 'GET';
     const range = init.headers?.Range ?? init.headers?.range ?? null;
-    log.push({ url, method, range });
+    const ifRange = init.headers?.['If-Range'] ?? init.headers?.['if-range'] ?? null;
+    log.push({ url, method, range, ifRange });
     if (init.signal?.aborted) throw init.signal.reason;
     inFlight += 1;
     maxInFlight = Math.max(maxInFlight, inFlight);
@@ -238,26 +240,38 @@ function createServer(files, options = {}) {
       }
       const body = files[url];
       if (body === undefined) return new Response(null, { status: 404 });
+      const etag =
+        defaultEtag === null
+          ? null
+          : typeof defaultEtag === 'string'
+            ? defaultEtag
+            : `"mock-${body.byteLength.toString(16)}"`;
       if (method === 'HEAD') {
         if (headStatus !== 200) return new Response(null, { status: headStatus });
         const headers = { 'content-length': String(headContentLength ?? body.byteLength) };
         if (acceptRanges !== null) headers['accept-ranges'] = acceptRanges;
+        if (etag !== null) headers.etag = etag;
         return new Response(null, { status: 200, headers });
       }
-      if (range && supportRange) {
+      const rangeAllowed = Boolean(range && supportRange && (!ifRange || (etag !== null && ifRange === etag)));
+      if (rangeAllowed) {
         const m = /^bytes=(\d+)-(\d+)$/.exec(range);
         const start = Number(m[1]);
         if (start >= body.byteLength) return new Response(null, { status: 416 });
         const end = Math.min(Number(m[2]), body.byteLength - 1);
+        const headers = {
+          'content-range': `bytes ${start}-${end}/${body.byteLength}`,
+          'content-length': String(end - start + 1),
+        };
+        if (etag !== null) headers.etag = etag;
         return new Response(body.slice(start, end + 1), {
           status: 206,
-          headers: {
-            'content-range': `bytes ${start}-${end}/${body.byteLength}`,
-            'content-length': String(end - start + 1),
-          },
+          headers,
         });
       }
-      return new Response(body.slice(), { status: 200, headers: { 'content-length': String(body.byteLength) } });
+      const fullHeaders = { 'content-length': String(body.byteLength) };
+      if (etag !== null) fullHeaders.etag = etag;
+      return new Response(body.slice(), { status: 200, headers: fullHeaders });
     } finally {
       inFlight -= 1;
     }
@@ -2070,6 +2084,7 @@ test('W208 parallel Range chunk reassembly preserves exact bytes under out-of-or
         headers: {
           'content-length': String(image.byteLength),
           'accept-ranges': 'bytes',
+          etag: '"w208-ooo-v1"',
         },
       });
     }
@@ -2101,6 +2116,7 @@ test('W208 parallel Range chunk reassembly preserves exact bytes under out-of-or
         headers: {
           'content-range': `bytes ${start}-${end}/${image.byteLength}`,
           'content-length': String(slice.byteLength),
+          etag: '"w208-ooo-v1"',
         },
       });
     } finally {
@@ -2201,7 +2217,7 @@ test('W208 retries mid-stream chunk body errors with backoff without corrupting 
     if (init.method === 'HEAD') {
       return new Response(null, {
         status: 200,
-        headers: { 'content-length': String(image.byteLength), 'accept-ranges': 'bytes' },
+        headers: { 'content-length': String(image.byteLength), 'accept-ranges': 'bytes', etag: '"w208-flaky-v1"' },
       });
     }
     const range = init.headers?.Range;
@@ -2231,6 +2247,7 @@ test('W208 retries mid-stream chunk body errors with backoff without corrupting 
           headers: {
             'content-range': `bytes ${start}-${end}/${image.byteLength}`,
             'content-length': String(slice.byteLength),
+            etag: '"w208-flaky-v1"',
           },
         });
       }
@@ -2241,6 +2258,7 @@ test('W208 retries mid-stream chunk body errors with backoff without corrupting 
       headers: {
         'content-range': `bytes ${start}-${end}/${image.byteLength}`,
         'content-length': String(slice.byteLength),
+        etag: '"w208-flaky-v1"',
       },
     });
   };
@@ -2325,7 +2343,7 @@ test('W208 aborts in-flight parallel Range chunk stream readers cleanly', async 
     if (init.method === 'HEAD') {
       return new Response(null, {
         status: 200,
-        headers: { 'content-length': String(image.byteLength), 'accept-ranges': 'bytes' },
+        headers: { 'content-length': String(image.byteLength), 'accept-ranges': 'bytes', etag: '"w208-abort-v1"' },
       });
     }
     const range = init.headers?.Range;
@@ -2339,6 +2357,7 @@ test('W208 aborts in-flight parallel Range chunk stream readers cleanly', async 
         headers: {
           'content-range': `bytes ${start}-${end}/${image.byteLength}`,
           'content-length': String(slice.byteLength),
+          etag: '"w208-abort-v1"',
         },
       });
     }
@@ -2356,6 +2375,7 @@ test('W208 aborts in-flight parallel Range chunk stream readers cleanly', async 
       headers: {
         'content-range': `bytes ${start}-${end}/${image.byteLength}`,
         'content-length': String(slice.byteLength),
+        etag: '"w208-abort-v1"',
       },
     });
   };
