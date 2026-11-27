@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -179,6 +180,44 @@ class BootSummaryTest(unittest.TestCase):
             (Path(d) / "boot-report.json").write_text(json.dumps(a), encoding="utf-8")
             self.assertEqual(bs.main([d]), 0)
             self.assertEqual(bs.main([str(Path(d) / "missing.json")]), 2)
+
+    def test_compare_marks_regressions_and_improvements(self):
+        a, b = base(), base()
+        a["frame_times"] = {"hitches": [{"at_ms": 1, "ms": 100}]}
+        b["frame_times"] = {"hitches": [{"at_ms": 1, "ms": 100}, {"at_ms": 5, "ms": 90}]}
+        b["audio_out"]["underruns"] = 3  # 7 -> 3 improves
+        a["binding_fallbacks"] = {"phases": [{"name": "menu", "draws": 4, "dispatches": 0}],
+                                  "entries": [{"hash": "0xAA", "draws": 4}]}
+        b["binding_fallbacks"] = {"phases": [{"name": "menu", "draws": 9, "dispatches": 0}],
+                                  "entries": [{"hash": "0xBB", "draws": 9}]}
+        b["fault_record"] = {"kind": "ACCESS_VIOLATION", "rip": "0x1000", "elapsed_ms": 5,
+                             "function": {"entry": "0x1000", "offset": "0x4"}}
+        lines = bs.compare(a, b).splitlines()
+
+        def row(k):
+            return next(ln for ln in lines if ln.startswith(k))
+        self.assertTrue(row("frame_times.hitches").endswith("REGRESSION"))
+        self.assertTrue(row("audio_out.underruns ").endswith("improvement"))
+        self.assertTrue(row("binding_fallbacks.phase.menu").endswith("REGRESSION"))
+        text = "\n".join(lines)
+        self.assertIn("[REGRESSION]", text)
+        self.assertIn("sub_1000+0x4", text)
+        self.assertIn("0xAA x4", text)
+        self.assertIn("0xBB x9", text)
+
+    def test_compare_identical_and_last(self):
+        a = base()
+        self.assertIn("no differences", bs.compare(a, a))
+        with tempfile.TemporaryDirectory() as d:
+            for i, name in enumerate(("r1", "r2")):
+                rd = Path(d) / "pg6x" / "runs" / name
+                rd.mkdir(parents=True)
+                rep = base()
+                rep["elapsed_ms"] = 1000 * (i + 1)
+                (rd / "boot-report.json").write_text(json.dumps(rep), encoding="utf-8")
+                os.utime(rd / "boot-report.json", (1000 + i, 1000 + i))
+            self.assertEqual(bs.main(["--compare-last", "--root", d]), 0)
+            self.assertEqual(bs.main(["--compare-last", "5", "--root", d]), 2)
 
     def test_underruns_next_to_frame_hitches(self):
         rep = {"audio_out": {"device_open": True, "frames_played": 1, "underruns": 2,

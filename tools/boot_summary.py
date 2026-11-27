@@ -3,7 +3,8 @@
 
 Usage:
   tools/boot_summary.py <boot-report.json | run dir> [--pe <game.exe>]
-  tools/boot_summary.py --compare A B        (deltas of the numeric facts)
+  tools/boot_summary.py --compare A B        (side-by-side deltas, regressions marked)
+  tools/boot_summary.py --compare-last [N] [--root H:/]   (newest run vs the one N runs before)
 
 Covers: run length, how it ended (fault_record with symbols via guest_symbols, the docs/HARD_STOPS.md
 status of an unimplemented COM slot, or a run limit), milestones and the draws/frame timeline, fps
@@ -417,21 +418,113 @@ def _fmt(v: float | None) -> str:
     return f"{v:,.2f}" if v != int(v) else f"{int(v):,}"
 
 
+HIGHER_BETTER = ("fps_", "presents", "frames_played", "shader_pack_hits", "xapu_decoded_packets", "hit_before_use",
+                 "audio_open_ok", "frames_submitted", "non_silent_fraction", "low1_fps", "low01_fps", "prewarmed")
+LOWER_BETTER = ("errors", "misses", "underruns", "hitches", "drops", "failed", "wasted", "elapsed_ms",
+                "late_pct", "missed_vblanks", "binding_fallbacks", "draws_skipped", "no_shader_module", "peak",
+                "draws_dropped_by_bridge")
+
+
+def _direction(key: str) -> int:
+    """+1 when a higher value is better, -1 when lower is better, 0 when it is only informational."""
+    if any(t in key for t in LOWER_BETTER):
+        return -1
+    if any(t in key for t in HIGHER_BETTER):
+        return 1
+    return 0
+
+
+def _table_phase_draws(table: dict[str, Any], prefix: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for p in table.get("phases") or []:
+        if isinstance(p, dict) and p.get("name") is not None:
+            out[f"{prefix}.phase.{p['name']}"] = _n(p.get("draws")) + _n(p.get("dispatches"))
+    return out
+
+
+def compare_facts(report: dict[str, Any]) -> dict[str, float]:
+    """numeric_facts plus the extra comparison metrics: hitches, underrun classes, frame-time lows,
+    gpu drops / binding fallbacks per phase."""
+    f = numeric_facts(report)
+    ft = frame_time_summary(report)
+    if ft:
+        f.update({f"frame_times.{k}": v for k, v in ft.items()})
+    if "frame_times" in report:
+        hitches = [h for h in _d(report.get("frame_times")).get("hitches") or [] if isinstance(h, dict)]
+        f["frame_times.hitches"] = float(len(hitches))
+    ao = _d(report.get("audio_out"))
+    for k in ("underruns_guest_stalled", "underruns_host_starved"):
+        if k in ao:
+            f[f"audio_out.{k}"] = _n(ao.get(k))
+    f.update(_table_phase_draws(_d(report.get("gpu_drop_table")), "gpu_drops"))
+    f.update(_table_phase_draws(_d(report.get("binding_fallbacks")), "binding_fallbacks"))
+    return f
+
+
+def _fallback_top(report: dict[str, Any], n: int = 3) -> dict[str, int]:
+    ents = [e for e in _d(report.get("binding_fallbacks")).get("entries") or [] if isinstance(e, dict)]
+    items = {str(e.get("hash")): int(_n(e.get("draws")) + _n(e.get("dispatches"))) for e in ents}
+    return dict(sorted(items.items(), key=lambda kv: -kv[1])[:n])
+
+
+def _fault_site(report: dict[str, Any]) -> str:
+    rec = fault_info(report)
+    if rec is None:
+        return "no fault"
+    fn = rec.get("function")
+    site = f"rip {rec.get('rip')}"
+    if isinstance(fn, dict) and fn.get("entry"):
+        site = f"sub_{str(fn['entry'])[2:].upper()}+{fn.get('offset', '0x0')}"
+    return f"FAULT {rec.get('kind')} at {site}"
+
+
 def compare(a: dict[str, Any], b: dict[str, Any]) -> str:
-    fa, fb = numeric_facts(a), numeric_facts(b)
-    L = [f"A {_ending(a, None, None)[0]}", f"B {_ending(b, None, None)[0]}",
-         f"{'metric':<40}{'A':>16}{'B':>16}{'delta':>16}"]
-    rows = 0
+    """Side-by-side A -> B diff of the key metrics; the last column marks regression / improvement."""
+    fa, fb = compare_facts(a), compare_facts(b)
+    L = [f"A {_ending(a, None, None)[0]}", f"B {_ending(b, None, None)[0]}"]
+    sa, sb = _fault_site(a), _fault_site(b)
+    if sa != sb:
+        faulted_a, faulted_b = fault_info(a) is not None, fault_info(b) is not None
+        mark = "REGRESSION" if faulted_b and not faulted_a else ("improvement" if faulted_a and not faulted_b
+                                                                else "changed")
+        L.append(f"end state: {sa}  ->  {sb}  [{mark}]")
+    else:
+        L.append(f"end state: {sa} (same)")
+    L.append(f"{'metric':<40}{'A':>16}{'B':>16}{'delta':>16}  verdict")
+    rows = regress = improve = 0
     for k in sorted(set(fa) | set(fb)):
         x, y = fa.get(k), fb.get(k)
         if x == y:
             continue
         d = (y or 0) - (x or 0)
-        L.append(f"{k:<40}{_fmt(x):>16}{_fmt(y):>16}{('+' if d > 0 else '') + _fmt(d):>16}")
+        dr = _direction(k)
+        verdict = ""
+        if dr and d:
+            good = (d > 0) == (dr > 0)
+            verdict = "improvement" if good else "REGRESSION"
+            improve += good
+            regress += not good
+        L.append(f"{k:<40}{_fmt(x):>16}{_fmt(y):>16}{('+' if d > 0 else '') + _fmt(d):>16}  {verdict}".rstrip())
         rows += 1
     if not rows:
         L.append("(no differences in the tracked metrics)")
+    ta, tb = _fallback_top(a), _fallback_top(b)
+    if ta or tb:
+        L.append("binding fallbacks top: A " + (", ".join(f"{k} x{v}" for k, v in ta.items()) or "none")
+                 + "  |  B " + (", ".join(f"{k} x{v}" for k, v in tb.items()) or "none"))
+    L.append(f"{regress} regression(s), {improve} improvement(s)")
     return "\n".join(L)
+
+
+def last_runs(root: str | Path, n: int) -> list[Path]:
+    """The newest run's boot-report.json and the one `n` runs before it, found with run_history discovery
+    (<root>/<build dir>/runs/*/boot-report.json, oldest first by mtime)."""
+    import run_history as rh
+    pairs = rh.discover([Path(root)], "*", None)
+    reports = sorted((rd / "boot-report.json" for rd, _ in pairs), key=lambda p: p.stat().st_mtime)
+    if len(reports) < n + 1:
+        raise ValueError(f"need {n + 1} runs under {root}, found {len(reports)}")
+    return [reports[-(n + 1)], reports[-1]]
 
 
 def render_path(path: str | Path, pe: str | None = None) -> str:
@@ -444,10 +537,18 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("report", nargs="?", help="boot-report.json or a run directory")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"), help="show deltas between two reports/run dirs")
+    ap.add_argument("--compare-last", type=int, metavar="N", nargs="?", const=1,
+                    help="compare the newest run with the one N runs before it (default 1), found via run_history "
+                         "discovery under --root (default H:/)")
+    ap.add_argument("--root", default="H:/", help="build-dir root for --compare-last (see tools/run_history.py)")
     ap.add_argument("--pe", help="game PE (read-only) to name fault addresses")
     args = ap.parse_args(argv)
     try:
-        if args.compare:
+        if args.compare_last is not None:
+            runs = last_runs(args.root, args.compare_last)
+            print(f"A {runs[0].parent}\nB {runs[-1].parent}")
+            print(compare(load(runs[0]), load(runs[-1])))
+        elif args.compare:
             print(compare(load(args.compare[0]), load(args.compare[1])))
         elif args.report:
             print(render_path(args.report, args.pe))
