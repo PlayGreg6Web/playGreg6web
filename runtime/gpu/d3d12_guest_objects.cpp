@@ -490,7 +490,7 @@ void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& 
     for (const auto& [data, size] : parts) {
         emit_locked(data, size);
     }
-    ++submissions_;
+    submissions_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Device::write_sink_locked(const uint8_t* bytes, size_t n) {
@@ -1238,8 +1238,8 @@ uint32_t Device::present(std::span<const uint32_t> plane_textures) {
     write_sink_locked(begin.data(), begin.size());
     emit_locked(enc.data(), enc.size());
     frame_open_ = false;
-    ++presents_;
-    va_watch::set_frame(presents_);
+    const uint64_t presented = presents_.fetch_add(1, std::memory_order_relaxed) + 1;
+    va_watch::set_frame(presented);
     return drawn;
 }
 
@@ -1250,13 +1250,26 @@ DeviceStats Device::stats() const {
     s.descriptor_heaps = descriptor_heaps.load();
     s.root_signatures = root_signatures.load();
     s.fences = fences.load();
+    s.presents = presents_.load(std::memory_order_relaxed);
+    s.submissions = submissions_.load(std::memory_order_relaxed);
     {
-        std::lock_guard<std::mutex> lock(submit_mutex_);
-        s.presents = presents_;
-        s.submissions = submissions_;
-        s.gpu_objects_pending = deferred_creates_.size();
-        s.gpu_objects_created_on_use = gpu_objects_created_on_use_;
-        s.gpu_objects_never_created = gpu_objects_never_created_;
+        // Bounded: a thread blocked inside emit_locked (live pump queue full while the executor
+        // compiles) holds the submit lock for as long as that lasts; the fault report must not wait.
+        std::unique_lock<std::mutex> lock(submit_mutex_, std::defer_lock);
+        const auto deadline = std::chrono::steady_clock::now() + kStatsLockWait;
+        while (!lock.try_lock()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (lock.owns_lock()) {
+            s.gpu_objects_pending = deferred_creates_.size();
+            s.gpu_objects_created_on_use = gpu_objects_created_on_use_;
+            s.gpu_objects_never_created = gpu_objects_never_created_;
+        } else {
+            s.submit_lock_busy = true;
+        }
     }
     s.bad_arguments = bad_arguments_.load();
     s.resources = resources.load();

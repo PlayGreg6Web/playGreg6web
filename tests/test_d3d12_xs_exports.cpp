@@ -458,6 +458,41 @@ void test_create_device() {
     CHECK(t_balanced);
 }
 
+// Device::stats() is read by the fault/stop report while a submitter may hold the submit lock for
+// as long as the live pump stays full (std-pack boot: the report hung behind it and was never
+// written). It must return within its bounded wait, flag the skipped fields and still give the
+// lock-free counters.
+void test_device_stats_never_blocks_on_submit_lock() {
+    std::atomic<bool> block{false};  // outlive the Fixture (its teardown may still write packets)
+    std::atomic<bool> in_sink{false};
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&](const uint8_t*, size_t) {
+        if (!block.load()) return;
+        in_sink = true;
+        while (block.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    dx::set_device_options(options);
+    const uint64_t device = fx.create_device();
+    dg::Device* dev = host_device(device);
+    CHECK(!dev->stats().submit_lock_busy);
+    const uint64_t presents_before = dev->stats().presents;
+    block = true;
+    std::thread submitter([&] { dev->present(); });  // holds the submit lock inside the sink
+    for (int i = 0; i < 2000 && !in_sink.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(in_sink.load());
+    const auto t0 = std::chrono::steady_clock::now();
+    const dg::DeviceStats busy = dev->stats();
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    CHECK(busy.submit_lock_busy);
+    CHECK(waited >= dg::Device::kStatsLockWait && waited < std::chrono::seconds(5));
+    CHECK(busy.presents == presents_before);  // lock-free counters are still read
+    block = false;
+    submitter.join();
+    const dg::DeviceStats free = dev->stats();
+    CHECK(!free.submit_lock_busy && free.presents == presents_before + 1);
+}
+
 void test_queue_allocator_fence() {
     Fixture fx;
     // Immediate completion; the lagged publish is covered by test_fence_publish_lag.
@@ -9803,6 +9838,7 @@ int main() {
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();
+    test_device_stats_never_blocks_on_submit_lock();
     test_descriptor_heaps();
     test_root_signatures_and_blobs();
     test_queries_and_footprints();

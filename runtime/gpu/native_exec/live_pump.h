@@ -54,6 +54,12 @@ struct LivePumpStats {
     uint64_t discarded_on_close = 0;   // queued batches dropped when the window closed
     uint64_t max_queue_depth = 0;
     uint64_t polls = 0;
+    // A snapshot of what is in flight right now (a wait or batch that never ends would otherwise
+    // never show in the totals above, which are added when it finishes):
+    uint64_t blocked_now = 0;          // submitters waiting for room at the moment
+    uint64_t blocked_now_ns = 0;       // since when submitters have been waiting without a break
+    uint64_t queued_now = 0;           // batches in the queue
+    uint64_t executing_ns = 0;         // age of the batch inside execute() (0: none)
     bool window_closed = false;
 };
 
@@ -106,7 +112,9 @@ public:
             ++stats_.blocked_submits;
             const os::ThreadSpan frame_span(os::SpanKind::SubmitBlocked);  // the submitting thread's frame_breakdown
             const auto t0 = std::chrono::steady_clock::now();
+            if (blocked_now_++ == 0) blocked_since_ = t0;
             room_cv_.wait(lock, [&] { return !full_locked(len) || closed_ || stopping_; });
+            --blocked_now_;
             stats_.blocked_ns += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
             if (closed_ || stopping_) {
@@ -171,6 +179,14 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         LivePumpStats s = stats_;
         s.window_closed = closed_;
+        const auto now = std::chrono::steady_clock::now();
+        auto ns = [&](std::chrono::steady_clock::time_point t) {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count());
+        };
+        s.blocked_now = blocked_now_;
+        s.blocked_now_ns = blocked_now_ > 0 ? ns(blocked_since_) : 0;
+        s.queued_now = queue_.size();
+        s.executing_ns = executing_ ? ns(executing_since_) : 0;
         return s;
     }
 
@@ -196,6 +212,8 @@ public:
                ", \"dropped_after_close\": " + u(s.dropped_after_close) +
                ", \"discarded_on_close\": " + u(s.discarded_on_close) +
                ", \"max_queue_depth\": " + u(s.max_queue_depth) + ", \"polls\": " + u(s.polls) +
+               ", \"blocked_now\": " + u(s.blocked_now) + ", \"blocked_now_ms\": " + u(s.blocked_now_ns / 1000000) +
+               ", \"queued_now\": " + u(s.queued_now) + ", \"executing_ms\": " + u(s.executing_ns / 1000000) +
                ", \"window_closed\": " + (s.window_closed ? "true" : "false") + "}";
     }
 
@@ -262,6 +280,8 @@ private:
                     queue_.pop_front();
                     queued_bytes_ -= batch.size();
                     busy_ = true;
+                    executing_ = true;
+                    executing_since_ = std::chrono::steady_clock::now();
                     room_cv_.notify_all();
                 }
             }
@@ -272,6 +292,7 @@ private:
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    executing_ = false;
                     ++stats_.executed;
                     stats_.execute_ns += ns;
                     stats_.presents += presents;
@@ -307,6 +328,11 @@ private:
     bool ready_ = false, running_ = false, busy_ = false, closed_ = false, stopping_ = false;
     std::string create_error_;
     LivePumpStats stats_;
+    // In-flight snapshot for stats() (under mutex_).
+    uint64_t blocked_now_ = 0;
+    std::chrono::steady_clock::time_point blocked_since_{};
+    bool executing_ = false;
+    std::chrono::steady_clock::time_point executing_since_{};
     std::function<void()> on_close_;
     std::function<void(bool)> on_focus_;
     std::function<void(Executor&)> finish_hook_;

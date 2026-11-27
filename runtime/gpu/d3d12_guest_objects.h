@@ -706,6 +706,9 @@ struct DeviceStats {
     uint64_t gpu_objects_pending = 0;
     uint64_t gpu_objects_created_on_use = 0;
     uint64_t gpu_objects_never_created = 0;
+    // True when the submit lock stayed held for the whole bounded wait in stats() (a submitter
+    // blocked in a full live pump, ...): the gpu_objects_* fields above are then 0, not read.
+    bool submit_lock_busy = false;
 };
 
 class Resource;
@@ -1106,6 +1109,10 @@ public:
     // True while `id`'s create packet is held.
     bool gpu_object_pending(uint32_t id) const;
 
+    // Never blocks for long: the fields guarded by the submit lock are read only when the lock is
+    // free within kStatsLockWait (fault/stop reports call this while a submitter may sit in a full
+    // live pump holding it); presents/submissions are atomics and always read.
+    static constexpr std::chrono::milliseconds kStatsLockWait{100};
     DeviceStats stats() const;
     void note_bad_argument(const std::string& message);
     // CheckFeatureSupport ids the device does not answer (E_NOTIMPL): id -> times asked; logged once each.
@@ -1138,8 +1145,8 @@ private:
     uint64_t gpu_objects_created_on_use_ = 0;                              // under submit_mutex_
     uint64_t gpu_objects_never_created_ = 0;                               // under submit_mutex_
     bool frame_open_ = false;
-    uint64_t presents_ = 0;
-    uint64_t submissions_ = 0;
+    std::atomic<uint64_t> presents_{0};     // written under submit_mutex_, read lock-free by stats()
+    std::atomic<uint64_t> submissions_{0};  // written under submit_mutex_, read lock-free by stats()
     // Present composition objects (under submit_mutex_), created on first use: shader modules,
     // layouts, sampler, one pipeline per (canvas format, blended), one bind group per texture.
     uint32_t emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc);

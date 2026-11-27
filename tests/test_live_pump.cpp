@@ -107,10 +107,16 @@ void test_backpressure_blocks_and_counts() {
     // One batch is inside the stuck execute(), 4 are queued: the producer must be stopped there.
     CHECK(accepted.load() == 5);
     CHECK(pump.stats().max_queue_depth == 4);
+    // The in-flight snapshot shows the never-ending wait and batch (the totals do not yet).
+    const LivePumpStats stuck = pump.stats();
+    CHECK(stuck.blocked_now == 1 && stuck.blocked_now_ns >= 100'000'000ull);
+    CHECK(stuck.queued_now == 4 && stuck.executing_ns >= 100'000'000ull);
+    CHECK(pump.stats_json().find("\"executing_ms\": ") != std::string::npos);
     sh.gate = true;
     producer.join();
     pump.flush();
     const LivePumpStats s = pump.stats();
+    CHECK(s.blocked_now == 0 && s.blocked_now_ns == 0 && s.queued_now == 0 && s.executing_ns == 0);
     CHECK(s.executed == 20 && s.dropped_after_close == 0);  // nothing is dropped, only delayed
     CHECK(s.blocked_submits >= 1 && s.blocked_ns > 0);
     CHECK(s.max_queue_depth <= 4);
