@@ -60,6 +60,7 @@ add_library(playgta6_core STATIC
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
     gpu/drop_table.cpp
+    gpu/binding_fallbacks.cpp
     gpu/rt_arena.cpp
     gpu/rt_bvh.cpp
     gpu/rt_residency.cpp
