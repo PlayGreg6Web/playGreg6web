@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -34,8 +35,9 @@ MODS = [(0x7E0000000, 0x1000000, r"C:\x\playgta6_boot.exe"), (0x7FFF0000, 0x1000
 class SymbolizerTests(unittest.TestCase):
     def test_resolves_function_and_line(self):
         be = FakeBackend(names={0x7E0000100: "sub_14344FFD0+0x10 (a.cpp:7)"})
-        s = ms.Symbolizer(MODS, be, ["D:\bin"], exists=lambda p: p == "D:\bin\playgta6_boot.exe")
-        self.assertEqual(be.loads, [("D:\bin\playgta6_boot.exe", 0x7E0000000, 0x1000000)])
+        img = os.path.join("D:bin", "playgta6_boot.exe")
+        s = ms.Symbolizer(MODS, be, ["D:bin"], exists=lambda p: p == img)
+        self.assertEqual(be.loads, [(img, 0x7E0000000, 0x1000000)])
         self.assertEqual(s.describe(0x7E0000100), "playgta6_boot.exe+0x100  sub_14344FFD0+0x10 (a.cpp:7)")
 
     def test_system_dll_is_offset_only(self):
