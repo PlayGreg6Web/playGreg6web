@@ -57,10 +57,18 @@ def browser_report():
 
 
 class BootSummaryTest(unittest.TestCase):
+    def test_device_error_kinds(self):
+        b = base()
+        b["native_executor"]["device_error_kinds"] = {"total": 2, "other": 0, "kinds": [
+            {"count": 2, "opcode": 31, "text": "[Invalid BindGroupLayout (unlabeled)] is invalid"}]}
+        out = bs.summarize(b)
+        self.assertIn("gpu error kind: 2 x op 31: [Invalid BindGroupLayout (unlabeled)] is invalid", out)
+
     def test_limit_run(self):
         out = bs.summarize(base())
         self.assertIn("ended: limit", out)
         self.assertIn("device_errors=2", out)
+        self.assertNotIn("gpu error kind:", out)
         self.assertIn("10 hits, 3 misses", out)
         self.assertIn("0x2=50, 0x5=9, 0x3=7, 0x1=5, 0x6=3", out)
         self.assertNotIn("0x7", out)

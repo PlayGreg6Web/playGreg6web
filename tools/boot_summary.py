@@ -532,6 +532,9 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
     L.append("gpu errors: " + (", ".join(f"{k}={_i(v)}" for k, v in errs.items()) if errs else "none")
              + (f"; draws no_shader_module={_i(gw.get('draws_no_shader_module'))}"
                 if _n(gw.get("draws_no_shader_module")) else ""))
+    kinds = [k for k in _d(ne.get("device_error_kinds")).get("kinds") or [] if isinstance(k, dict)]
+    for k in kinds[:3]:
+        L.append(f"  gpu error kind: {_i(k.get('count'))} x op {k.get('opcode')}: {str(k.get('text') or '')[:140]}")
     if ne:
         L.append(f"shader pack: {_i(ne.get('shader_pack_hits'))} hits, {_i(ne.get('shader_pack_misses'))} misses")
         L.append(f"native executor: {_i(ne.get('frames_submitted'))} frames, {_i(ne.get('draws'))} draws "

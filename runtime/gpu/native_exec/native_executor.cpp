@@ -718,6 +718,8 @@ struct NativeExecutor::Impl {
 
     // ---- diagnostic error scopes (--gpu-error-scopes, error_scope_model.h) ----
     ErrorScopeLog error_scope_log;
+    DeviceErrorKinds device_error_kinds;  // every uncaptured error by kind (always on)
+    uint16_t cur_opcode = 0;              // the packet in flight, for device_error_kinds
     std::atomic<uint64_t> error_scoped_total{0};  // scoped errors recorded (drives the auto mode's cut-off)
 
     std::string render_pipeline_ctx(uint32_t id) const {
@@ -1093,6 +1095,7 @@ struct NativeExecutor::Impl {
                     }
                     ++self->stats.device_errors;
                     self->stats.last_device_error = to_string(msg);
+                    self->device_error_kinds.record(self->cur_opcode, self->stats.last_device_error);
                     if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
                     if (self->options.gpu_validation)
                         self->record_validation("uncaptured", to_string(msg), self->validation_cur_packet, self->validation_cur_opcode);
@@ -2107,9 +2110,11 @@ struct NativeExecutor::Impl {
         }
         journal_record(p);
         if (p.opcode == static_cast<uint16_t>(GpuOpcode::DestroyResource) && p.payload_bytes >= 4) journal_prune(read_payload<uint32_t>(p));
+        cur_opcode = kDeviceErrorDeferredOpcode;  // deferred pipelines built ahead of this packet
         pump_deferred();
         const uint64_t t0 = now_ns();
         bool r;
+        cur_opcode = p.opcode;
         const bool diag_scopes = error_scope_active(options.gpu_error_scopes, stats.device_errors, error_scoped_total.load());
         if (options.gpu_validation || diag_scopes) {
             validation_cur_packet = validation_packet_index++;
@@ -3015,6 +3020,8 @@ struct NativeExecutor::Impl {
             errs.swap(worker_errors);
         }
         stats.device_errors += count;
+        for (size_t i = 0; i < errs.size(); ++i)  // the queued messages; any past the cap count with the last one
+            device_error_kinds.record(kDeviceErrorWorkerOpcode, errs[i], i + 1 == errs.size() ? count - (errs.size() - 1) : 1);
         for (std::string& m : errs) {
             if (worker_errors_logged++ < 8) std::fprintf(stderr, "[native_exec] shader worker error: %s\n", m.substr(0, 400).c_str());
             stats.last_device_error = m;
@@ -7163,6 +7170,8 @@ std::string NativeExecutor::stats_json() const {
         bn("max_bytes", st.blob_max_bytes);
         j += "}, ";
     }
+    if (impl_->device_error_kinds.total() > 0) j += "\"device_error_kinds\": " + impl_->device_error_kinds.json() + ", ";
+    if (impl_->device_error_kinds.total() > 0) j += "\"device_error_kinds\": " + impl_->device_error_kinds.json() + ", ";
     if (impl_->options.gpu_error_scopes || impl_->error_scope_log.total() > 0) {
         j += "\"error_scopes\": " + impl_->error_scope_log.json() + ", ";
     }

@@ -166,4 +166,83 @@ private:
     uint64_t total_ = 0, entries_dropped_ = 0, messages_dropped_ = 0;
 };
 
+// Always-on histogram of every uncaptured device error by kind: the message with its numbers folded
+// ("storage buffers (26)" and "(29)" are one kind), keyed with the opcode in flight when Dawn raised it
+// (0xffff = a shader worker thread). Cheap (error path only) and bounded, so a long boot's
+// device_errors total can be split by cause without --gpu-error-scopes, which only sees the first 200.
+inline constexpr size_t kDeviceErrorKindsMax = 48;
+inline constexpr size_t kDeviceErrorKindChars = 320;
+inline constexpr uint16_t kDeviceErrorWorkerOpcode = 0xffff;
+inline constexpr uint16_t kDeviceErrorDeferredOpcode = 0xfffe;  // pump_deferred ahead of a packet
+
+inline std::string normalize_device_error(const std::string& m) {
+    std::string o;
+    o.reserve(std::min(m.size(), kDeviceErrorKindChars));
+    for (size_t i = 0; i < m.size() && o.size() < kDeviceErrorKindChars;) {
+        const char c = m[i];
+        if (c >= '0' && c <= '9') {  // a number (decimal or 0x hex) becomes N
+            const bool hex = c == '0' && i + 1 < m.size() && (m[i + 1] == 'x' || m[i + 1] == 'X');
+            if (hex) i += 2;
+            while (i < m.size() && ((m[i] >= '0' && m[i] <= '9') ||
+                                    (hex && ((m[i] >= 'a' && m[i] <= 'f') || (m[i] >= 'A' && m[i] <= 'F')))))
+                ++i;
+            o += 'N';
+            continue;
+        }
+        if (c == '\n' || c == '\r' || c == '\t') {
+            if (!o.empty() && o.back() != ' ') o += ' ';
+        } else if (c != ' ' || (!o.empty() && o.back() != ' ')) {
+            o += c;
+        }
+        ++i;
+    }
+    while (!o.empty() && o.back() == ' ') o.pop_back();
+    return o;
+}
+
+class DeviceErrorKinds {
+public:
+    void record(uint16_t opcode, const std::string& message, uint64_t n = 1) {
+        std::string key = normalize_device_error(message);
+        std::lock_guard<std::mutex> lock(mu_);
+        total_ += n;
+        auto it = rows_.find({opcode, key});
+        if (it != rows_.end()) {
+            it->second += n;
+        } else if (rows_.size() < kDeviceErrorKindsMax) {
+            rows_.emplace(std::make_pair(opcode, std::move(key)), n);
+        } else {
+            other_ += n;
+        }
+    }
+    uint64_t total() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return total_;
+    }
+    uint64_t count(uint16_t opcode, const std::string& message) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = rows_.find({opcode, normalize_device_error(message)});
+        return it == rows_.end() ? 0 : it->second;
+    }
+    // {"total": N, "other": N, "kinds": [{"count", "opcode", "text"}...]} sorted by count
+    std::string json() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::vector<std::pair<const std::pair<uint16_t, std::string>*, uint64_t>> rows;
+        for (const auto& kv : rows_) rows.emplace_back(&kv.first, kv.second);
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string j = "{\"total\": " + std::to_string(total_) + ", \"other\": " + std::to_string(other_) + ", \"kinds\": [";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i) j += ", ";
+            j += "{\"count\": " + std::to_string(rows[i].second) + ", \"opcode\": " + std::to_string(rows[i].first->first) +
+                 ", \"text\": \"" + ErrorScopeLog::json_escape(rows[i].first->second) + "\"}";
+        }
+        return j + "]}";
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::map<std::pair<uint16_t, std::string>, uint64_t> rows_;
+    uint64_t total_ = 0, other_ = 0;
+};
+
 }  // namespace playgta6::gpu::native_exec
