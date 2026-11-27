@@ -77,6 +77,10 @@ const char* work_name(Work w) {
     case Work::ComputeTextureReadbacks: return "compute_texture_readbacks";
     case Work::ComputeTextureRetiled: return "compute_texture_retiled";
     case Work::ComputeTextureRetileDiscarded: return "compute_texture_retile_discarded";
+    case Work::StencilTwinBindings: return "stencil_twin_bindings";
+    case Work::StencilTwinCopiesIn: return "stencil_twin_copies_in";
+    case Work::StencilTwinCopiesOut: return "stencil_twin_copies_out";
+    case Work::StencilTwinDraws: return "stencil_twin_draws";
     case Work::Count: break;
     }
     return "?";
@@ -93,6 +97,10 @@ void count_object_reuse(const bridge::BridgeStats& a, const bridge::BridgeStats&
     count_work(Work::DepthTwinBindings, b.depth_twin_bindings - a.depth_twin_bindings);
     count_work(Work::DepthTwinCopiesIn, b.depth_twin_copies_in - a.depth_twin_copies_in);
     count_work(Work::DepthTwinCopiesOut, b.depth_twin_copies_out - a.depth_twin_copies_out);
+    count_work(Work::StencilTwinBindings, b.stencil_twin_bindings - a.stencil_twin_bindings);
+    count_work(Work::StencilTwinCopiesIn, b.stencil_twin_copies_in - a.stencil_twin_copies_in);
+    count_work(Work::StencilTwinCopiesOut, b.stencil_twin_copies_out - a.stencil_twin_copies_out);
+    count_work(Work::StencilTwinDraws, b.stencil_twin_draws - a.stencil_twin_draws);
 }
 
 // Counts the outcome of one recorded draw from the state bridge's statistics: emitted if the
@@ -714,7 +722,7 @@ struct CopyParamsKeyHash {
 
 // Per-Device cache of ABI v2 texture-copy shader modules, layouts, pipelines, and uniform buffers.
 // Refcounted by live CommandList instances (which hold com::Ref<Device>), so the entry is always
-// erased before Device destruction — avoiding both leaks and pointer-reuse ABA hazards in tests.
+// erased before Device destruction â€” avoiding both leaks and pointer-reuse ABA hazards in tests.
 struct DeviceTexCopyCache {
     uint64_t live_lists = 0;
     uint32_t blit_vs = 0;

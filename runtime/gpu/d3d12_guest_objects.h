@@ -1732,6 +1732,11 @@ enum class Work : size_t {
     ComputeTextureReadbacks,
     ComputeTextureRetiled,
     ComputeTextureRetileDiscarded,
+    // Backlog 35, stencil plane: bindings bound to an unsigned-integer twin, copies in / out, masked draws.
+    StencilTwinBindings,
+    StencilTwinCopiesIn,
+    StencilTwinCopiesOut,
+    StencilTwinDraws,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

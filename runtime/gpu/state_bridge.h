@@ -645,6 +645,7 @@ private:
     friend class CommandListBridge;
     friend class GraphicsPipelineState;
     friend class ComputePipelineState;
+    friend struct StencilTwinDawnTestAccess;  // tests/test_native_executor.cpp
     friend uint64_t hash_sampler_payload(const GpuCreateSampler2Payload& payload) noexcept;
     friend uint64_t hash_view_record(const ViewRecord& record) noexcept;
 
@@ -744,14 +745,15 @@ private:
     struct IntermediateKey {
         uint32_t resource_id = 0;
         uint8_t format = 0;
-        uint8_t reserved[3] = {};
+        uint8_t plane = 0;  // 0: colour / depth twin, 1: stencil twin (backlog 35)
+        uint8_t reserved[2] = {};
         bool operator==(const IntermediateKey& o) const noexcept {
-            return resource_id == o.resource_id && format == o.format;
+            return resource_id == o.resource_id && format == o.format && plane == o.plane;
         }
     };
     struct IntermediateKeyHash {
         size_t operator()(const IntermediateKey& k) const noexcept {
-            return static_cast<size_t>(splitmix64((uint64_t{k.resource_id} << 8) | k.format));
+            return static_cast<size_t>(splitmix64((uint64_t{k.resource_id} << 16) | (uint64_t{k.plane} << 8) | k.format));
         }
     };
     struct ConversionGroupKey {
@@ -891,7 +893,7 @@ private:
     // #482 storage-format fallback: the intermediate texture of `resource_id` in `format` (same size,
     // dimension and mips), created through `encoder` on first use.
     uint32_t intermediate_storage_texture(uint32_t resource_id, const TextureInfo& info, uint8_t format,
-                                          CommandEncoder& encoder);
+                                          CommandEncoder& encoder, bool stencil_plane = false);
     // The conversion pipeline writing `dst_format` views of `dimension` (GpuTextureViewDimension), and
     // its bind group for (src, dst, subresource); created through `encoder` on first use.
     struct StorageConversionPipeline {
@@ -920,7 +922,19 @@ private:
     DepthTwinPipelines depth_twin_pipelines(uint8_t depth_format, uint8_t twin_format, CommandEncoder& encoder);
     // Bind group of the compute copy (depth texture sampled, twin stored) or of the draw (twin read).
     uint32_t depth_twin_group(uint32_t layout, uint32_t depth_texture, uint32_t twin, bool into_twin,
-                              uint8_t twin_format, uint32_t mip, uint32_t layer, CommandEncoder& encoder);
+                              uint8_t twin_format, uint32_t mip, uint32_t layer, CommandEncoder& encoder,
+                              bool stencil_plane = false);
+    // Backlog 35, stencil plane: an r32uint / r8uint twin holds the 8-bit stencil value. Copy in: a
+    // compute pass sampling the stencil aspect into the twin. Copy out: the stencil plane is cleared
+    // to 0 by the pass's load op, then eight masked draws (one per bit k: stencil op Replace, write
+    // mask 1<<k, reference 1<<k, fragment discards where bit k of the twin is 0) set the bits.
+    struct StencilTwinPipelines {
+        uint32_t in_layout = 0;
+        uint32_t in_pipeline = 0;
+        uint32_t out_layout = 0;
+        uint32_t out_pipeline[8] = {};
+    };
+    StencilTwinPipelines stencil_twin_pipelines(uint8_t depth_format, uint8_t twin_format, CommandEncoder& encoder);
     void flush_retired_locked(CommandEncoder& encoder);
     template <typename Fn>
     void emit_device_object(uint32_t id, CommandEncoder& fallback, Fn&& fn) {
@@ -979,6 +993,7 @@ private:
     uint32_t default_vertex_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;
     std::unordered_map<IntermediateKey, uint32_t, IntermediateKeyHash> intermediates_;  // (texture, format) -> texture
+    std::unordered_map<uint32_t, StencilTwinPipelines, SplitMix32Hash> stencil_twin_pipelines_;  // depth format << 8 | twin format
     std::unordered_map<uint32_t, DepthTwinPipelines, SplitMix32Hash> depth_twin_pipelines_;  // depth format << 8 | twin format
     std::unordered_map<uint32_t, StorageConversionPipeline, SplitMix32Hash> conversion_pipelines_;  // dst format << 8 | dimension
     std::unordered_map<ConversionGroupKey, uint32_t, ConversionGroupKeyHash> conversion_groups_;  // (layout, src, dst, mip, layers)
@@ -1129,8 +1144,8 @@ struct BridgeStats {
     // Storage-texture bindings of a depth/stencil-format texture that could NOT be given a twin
     // (backlog 35): bound null because WebGPU has no storage access on depth formats, so their
     // writes are lost. Counted here, never faked. A twin needs a compute-only 2D binding of the
-    // depth aspect in the storage format r32float or r32uint; the stencil plane has no twin (a
-    // fragment cannot write the stencil value per pixel).
+    // depth aspect in the storage format r32float or r32uint, or of the stencil aspect of a
+    // depth-stencil format in r32uint or r8uint (stencil twin).
     uint64_t storage_views_depth_untwinned = 0;
     // Backlog 35: storage-texture bindings of a depth texture bound to a colour-format twin
     // instead, the depth -> twin copies (compute) and twin -> depth copies (a fullscreen draw
@@ -1138,6 +1153,13 @@ struct BridgeStats {
     uint64_t depth_twin_bindings = 0;
     uint64_t depth_twin_copies_in = 0;
     uint64_t depth_twin_copies_out = 0;
+    // Backlog 35, stencil plane: bindings of the stencil aspect bound to an r32uint / r8uint twin,
+    // the stencil -> twin copies (compute) and twin -> stencil write-backs (a clear plus eight
+    // masked draws each) emitted for them, and the masked draws themselves.
+    uint64_t stencil_twin_bindings = 0;
+    uint64_t stencil_twin_copies_in = 0;
+    uint64_t stencil_twin_copies_out = 0;
+    uint64_t stencil_twin_draws = 0;
     // Dispatches (direct and indirect) dropped because a writable storage binding is null: reads
     // would give zero and atomics no progress, so work-queue / spin-wait loops can hang the device
     // (backlog 39). Their other writes are lost. Counted per dispatch; the distinct pipelines hit
@@ -1398,10 +1420,12 @@ private:
         uint32_t extent[3] = {1, 1, 1};  // texels of the view (z: depth or layers)
         bool depth_twin = false;     // backlog 35: `intermediate` is the colour twin of a depth plane
         uint8_t depth_format = 0;    // depth_twin: the depth texture's WebGPU format
+        bool stencil_twin = false;   // backlog 35: with depth_twin, `intermediate` twins the stencil plane
         bool same_target(const StorageRedirect& o) const noexcept {
             return entry == o.entry && texture == o.texture && intermediate == o.intermediate &&
                    format == o.format && storage_format == o.storage_format && dimension == o.dimension &&
-                   mip == o.mip && base_layer == o.base_layer && layer_count == o.layer_count;
+                   mip == o.mip && base_layer == o.base_layer && layer_count == o.layer_count &&
+                   stencil_twin == o.stencil_twin;
         }
     };
     bool storage_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id, const TextureInfo& info,
@@ -1422,6 +1446,13 @@ private:
     // The last redirect that twinned each depth texture (its twin and formats), for flush_depth_twin.
     std::unordered_map<uint32_t, StorageRedirect> depth_twin_flush_;
     DepthTwinTracker depth_twin_;
+    // Backlog 35: the same bookkeeping for the stencil plane (Stale / Synced / TwinNewer per subresource).
+    bool emit_stencil_twin_in(const StorageRedirect& r);
+    void emit_stencil_twin_out(const StorageRedirect& r);
+    void emit_stencil_twin_out_sub(const StorageRedirect& r, uint32_t mip, uint32_t layer);
+    void flush_stencil_twin(uint32_t texture);
+    std::unordered_map<uint32_t, StorageRedirect> stencil_twin_flush_;
+    DepthTwinTracker stencil_twin_;
     // Fragment-stage redirects of the open render pass: converted out when the pass ends.
     std::vector<StorageRedirect> pass_redirects_;
     std::vector<WrittenTexture> dispatch_written_;  // see take_written_textures

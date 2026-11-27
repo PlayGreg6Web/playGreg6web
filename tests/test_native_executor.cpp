@@ -14,6 +14,9 @@
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
+#include "gpu/d3d12_guest_objects.h"
+#include "gpu/descriptor_heap.h"
+#include "gpu/state_bridge.h"
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/native_executor.h"
 #include "gpu/state_bridge.h"
@@ -2261,6 +2264,174 @@ void test_indirect_constants_pass(NativeExecutor& ex) {
         }
     }
     CHECK(ex.stats().device_errors == before.device_errors);
+
+namespace playgta6::gpu::bridge {
+struct StencilTwinDawnTestAccess {
+    static StateBridgeDevice::StencilTwinPipelines pipelines(StateBridgeDevice& d, uint8_t df, uint8_t tf,
+                                                             CommandEncoder& e) {
+        return d.stencil_twin_pipelines(df, tf, e);
+    }
+    template <class... A>
+    static uint32_t group(StateBridgeDevice& d, A&&... a) {
+        return d.depth_twin_group(std::forward<A>(a)...);
+    }
+};
+}  // namespace playgta6::gpu::bridge
+
+// ---- backlog 35: the stencil plane twin on the real GPU ----
+// A depth24plus-stencil8 texture's stencil plane is cleared to 0xA5, copied into the r32uint twin by the
+// bridge's copy-in pass (read back: every texel 0xA5), the twin is overwritten with a per-texel pattern by
+// a compute pass (standing in for the title's stage), written back by the bridge's write-back pass (clear
+// plus eight masked draws), then the twin is zeroed and the stencil plane copied in again: the pattern
+// can only come from the stencil plane. All pipelines and bind groups are the bridge's own.
+void test_stencil_twin(NativeExecutor& ex) {
+    using playgta6::gpu::bridge::StateBridgeDevice;
+    using Access = playgta6::gpu::bridge::StencilTwinDawnTestAccess;
+    constexpr uint32_t kN = 16;
+    constexpr uint32_t kDepth = 1200, kTwin = 1201, kPatLayout = 1202, kPatPl = 1203, kPatMod = 1204,
+                       kPatPipe = 1205, kPatGroup = 1206, kZeroMod = 1207, kZeroPipe = 1208;
+    const uint8_t ds_fmt = static_cast<uint8_t>(playgta6::gpu::pso::WgpuTextureFormat::Depth24PlusStencil8);
+    const uint8_t twin_fmt = static_cast<uint8_t>(playgta6::gpu::pso::WgpuTextureFormat::R32Uint);
+    std::vector<uint8_t> mem(16384, 0xEE);
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+    std::memset(mem.data(), 0, 16);
+    ex.attach_guest_memory(gm);
+    const ExecutorStats before = ex.stats();
+
+    uint32_t next_id = 1300000;
+    playgta6::gpu::bridge::BridgeOptions options;
+    options.id_allocator = [&next_id] { return next_id++; };
+    playgta6::gpu::d3d12_state::DescriptorHeapRegistry heaps;
+    playgta6::gpu::d3d12_state::ResourceStateRegistry states;
+    StateBridgeDevice dev(heaps, options, &states);
+
+    gpu::CommandEncoder e;
+    emit(e, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(kDepth, kN, kN, GpuTextureUsage::RenderAttachment | GpuTextureUsage::TextureBinding, ds_fmt)));
+    emit(e, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(kTwin, kN, kN,
+                           GpuTextureUsage::StorageBinding | GpuTextureUsage::TextureBinding | GpuTextureUsage::CopySrc,
+                           twin_fmt)));
+    const auto p = Access::pipelines(dev, ds_fmt, twin_fmt, e);
+
+    // The stand-in stage: writes (x * 16 + y * 5) & 255 into the twin (or zero).
+    GpuBindGroupLayoutEntry le = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                                              static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly), 2);
+    le.storage_format = twin_fmt;
+    create_layouts(e, kPatLayout, kPatPl, {le});
+    const auto stage = [](const char* value) {
+        return std::string("@group(0) @binding(0) var dst: texture_storage_2d<r32uint, write>;\n"
+                           "@compute @workgroup_size(8, 8, 1) fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+                           "  textureStore(dst, id.xy, vec4<u32>(") +
+               value + ", 0u, 0u, 0u));\n}\n";
+    };
+    e.create_shader_module(kPatMod, GpuShaderStage::Compute, stage("(id.x * 16u + id.y * 5u) & 255u"));
+    e.create_shader_module(kZeroMod, GpuShaderStage::Compute, stage("0u"));
+    for (const auto& [pipe, mod] : {std::pair<uint32_t, uint32_t>{kPatPipe, kPatMod}, {kZeroPipe, kZeroMod}}) {
+        GpuCreateComputePipeline2Payload cp;
+        std::memset(&cp, 0, sizeof cp);
+        cp.id = pipe;
+        cp.cs_module_id = mod;
+        cp.pipeline_layout_id = kPatPl;
+        emit(e, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    }
+    GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::TextureView, kTwin);
+    be.view.format = twin_fmt;
+    be.view.dimension = 2;
+    be.view.mip_level_count = 1;
+    be.view.array_layer_count = 1;
+    create_bind_group(e, kPatGroup, kPatLayout, {be});
+    const uint32_t in_group = Access::group(dev, p.in_layout, kDepth, kTwin, true, twin_fmt, 0, 0, e, true);
+    const uint32_t out_group = Access::group(dev, p.out_layout, kDepth, kTwin, false, twin_fmt, 0, 0, e, true);
+
+    const auto readback_twin = [&](uint32_t seq, uint64_t dst, uint64_t done) {
+        GpuReadbackTexturePayload rt;
+        std::memset(&rt, 0, sizeof rt);
+        rt.seq = seq;
+        rt.texture_id = kTwin;
+        rt.width = kN;
+        rt.height = kN;
+        rt.depth_or_layers = 1;
+        rt.bytes_per_row = kN * 4;
+        rt.rows_per_image = kN;
+        rt.dst_addr = dst;
+        rt.done_addr = done;
+        rt.dst_size = kN * kN * 4;
+        emit(e, GpuOpcode::ReadbackTexture, bytes_of(rt));
+    };
+    const auto copy_in = [&] {
+        e.set_compute_pipeline(p.in_pipeline);
+        set_bind_group2(e, 0, in_group);
+        e.dispatch_compute(kN / 8, kN / 8, 1);
+    };
+    const auto run_stage = [&](uint32_t pipe) {
+        e.set_compute_pipeline(pipe);
+        set_bind_group2(e, 0, kPatGroup);
+        e.dispatch_compute(kN / 8, kN / 8, 1);
+    };
+    const auto view2d = [](GpuTextureViewDesc& v) {
+        v.dimension = 2;
+        v.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+        v.mip_level_count = 1;
+        v.array_layer_count = 1;
+    };
+
+    // 1. the stencil plane is cleared to 0xA5 (depth to 1)
+    GpuBeginRenderPassPayload clear;
+    std::memset(&clear, 0, sizeof clear);
+    clear.depth_stencil.texture_id = kDepth;
+    clear.depth_stencil.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+    clear.depth_stencil.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    clear.depth_stencil.stencil_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+    clear.depth_stencil.stencil_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    clear.depth_stencil.depth_clear_value = 1.0f;
+    clear.depth_stencil.stencil_clear_value = 0xA5;
+    view2d(clear.depth_stencil.view);
+    e.emit_packet(GpuOpcode::BeginRenderPass, &clear, sizeof clear);
+    e.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    // 2. copy in, read the twin
+    copy_in();
+    readback_twin(1, 4096, 0);
+    // 3. the stage writes the pattern; 4. write it back into the stencil plane (clear + 8 masked draws)
+    run_stage(kPatPipe);
+    GpuBeginRenderPassPayload out;
+    std::memset(&out, 0, sizeof out);
+    out.depth_stencil.texture_id = kDepth;
+    out.depth_stencil.depth_read_only = 1;
+    out.depth_stencil.stencil_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+    out.depth_stencil.stencil_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    out.depth_stencil.stencil_clear_value = 0;
+    view2d(out.depth_stencil.view);
+    e.emit_packet(GpuOpcode::BeginRenderPass, &out, sizeof out);
+    for (uint32_t bit = 0; bit < 8; ++bit) {
+        e.set_pipeline(p.out_pipeline[bit]);
+        set_bind_group2(e, 0, out_group);
+        const GpuSetStencilReferencePayload ref{1u << bit};
+        e.emit_packet(GpuOpcode::SetStencilReference, &ref, sizeof ref);
+        e.draw(3, 1, 0, 0);
+    }
+    e.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    // 5. the twin is zeroed, the stencil plane copied in again: what is read back came from the plane
+    run_stage(kZeroPipe);
+    copy_in();
+    readback_twin(2, 8192, 4);
+    CHECK(run(ex, e) == 0);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(u32_at(mem, 0) == 1 && u32_at(mem, 4) == 1);
+    bool all_a5 = true, pattern = true;
+    for (uint32_t y = 0; y < kN; ++y) {
+        for (uint32_t x = 0; x < kN; ++x) {
+            all_a5 &= u32_at(mem, 4096 + (y * kN + x) * 4) == 0xA5;
+            pattern &= u32_at(mem, 8192 + (y * kN + x) * 4) == ((x * 16u + y * 5u) & 255u);
+        }
+    }
+    CHECK(all_a5);
+    CHECK(pattern);
+    CHECK(ex.stats().device_errors == before.device_errors);
+    ex.attach_guest_memory(GuestMemory{});
 }
 
 int main() {
@@ -2299,6 +2470,7 @@ int main() {
     test_depth_texture_float_layout(*ex);
     test_depth_read_variants(*ex);
     test_depth_read_no_float32_filterable();
+    test_stencil_twin(*ex);
     test_show_target();
     test_show_target_read_only();
     test_overlay_read_only();

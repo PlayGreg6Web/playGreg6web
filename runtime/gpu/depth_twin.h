@@ -16,11 +16,10 @@
 // assume what an earlier one left in the depth plane. An untracked subresource is Stale.
 // Copies: a depth write of any kind (render pass, clear, texture write) stales the covered
 // subresources; a copy out of the depth texture (read-back) first writes pending twin data back.
-// Stencil: not twinned. The stencil plane is still counted as storage_views_depth_untwinned. A
-// write-back is possible in WebGPU only as 8 bit-masked stencil passes (replace op, write mask 1<<k,
-// reference 1<<k for set bits and 0 for clear bits, two shader variants discarding on the other
-// polarity), which needs its own twin texture, a stencil-aspect axis here and 16 extra pipelines; it
-// has no consumer yet (the title's classifier writes depth) and no GPU is available to validate it.
+// Stencil: the stencil plane has its own twin (an r32uint / r8uint texture holding the 8-bit value) and
+// its own instance of this tracker (CommandListBridge::stencil_twin_): the stencil aspect is copied in by
+// a compute pass, and written back after a dispatch by a pass that clears the plane to 0 and runs eight
+// masked Replace draws (write mask and reference 1<<k, fragment discards where bit k of the twin is 0).
 // The single-subresource overloads (mip 0, layer 0) are the plain 2D case.
 #pragma once
 

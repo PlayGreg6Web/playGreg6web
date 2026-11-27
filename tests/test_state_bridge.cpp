@@ -4078,6 +4078,94 @@ void test_depth_storage_twin() {
     }
 }
 
+// Backlog 35, stencil plane: a compute storage view of the stencil aspect (X24_TYPELESS_G8_UINT view of a
+// D24S8 texture) in r32uint binds an integer twin: copied in once (a compute pass), written back after
+// each writing dispatch by one render pass that clears the stencil plane and runs eight masked draws
+// (one per bit, reference 1<<bit) with the depth plane read-only. r32float (no integer twin) stays
+// untwinned; the depth twin counters do not move.
+// variant 0: write-only r32uint, 1: read-only r32uint, 2: write-only r32float.
+void test_stencil_storage_twin() {
+    for (int variant = 0; variant < 3; ++variant) {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions options = counting_options(9700);
+        bridge::StateBridgeDevice device(heaps, options, &states);
+        constexpr uint32_t kTex = 314;
+        constexpr uint64_t kCs = 0xE7;
+        const pso::DxgiFormat fmt = pso::DxgiFormat::D24_UNORM_S8_UINT;
+        bridge::TextureInfo tex{fmt, 32, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        tex.storage = false;
+        device.register_texture(kTex, tex);
+        device.register_shader_module(kCs, 3);
+        d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        d3d::ViewDesc vd;
+        vd.format = static_cast<uint32_t>(pso::DxgiFormat::X24_TYPELESS_G8_UINT);
+        vd.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Uav;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs.parameters.push_back(table);
+        d3d::RootSignature root;
+        CHECK(d3d::RootSignature::build(rs, &root).ok());
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        group.content_id = 0x5EF0;
+        GpuBindGroupLayoutEntry entry = layout_entry(
+            0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+            static_cast<uint8_t>(variant == 1 ? GpuStorageTextureAccess::ReadOnly : GpuStorageTextureAccess::WriteOnly),
+            static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+        entry.storage_format = static_cast<uint8_t>(variant == 2 ? pso::WgpuTextureFormat::R32Float
+                                                                 : pso::WgpuTextureFormat::R32Uint);
+        group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc desc;
+        desc.cs = kCs;
+        auto cpso = device.create_compute_pipeline_state(desc, &root);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {view_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+        list.SetComputePipelineState(cpso.get());
+        CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.Dispatch(2, 2, 1);
+        list.Dispatch(1, 1, 1);
+        list.Close();
+
+        uint32_t render_passes = 0, draws = 0, refs = 0, bad = 0;
+        for (const Packet& pk : decode(enc)) {
+            render_passes += pk.opcode == GpuOpcode::BeginRenderPass ? 1u : 0u;
+            draws += pk.opcode == GpuOpcode::Draw ? 1u : 0u;
+            refs += pk.opcode == GpuOpcode::SetStencilReference ? 1u : 0u;
+            if (pk.opcode == GpuOpcode::BeginRenderPass) {
+                const auto p = pod<GpuBeginRenderPassPayload>(pk);
+                bad += (p.depth_stencil.texture_id != kTex || p.color_count != 0 || p.depth_stencil.depth_read_only != 1 ||
+                        p.depth_stencil.stencil_load_op != static_cast<uint8_t>(GpuLoadOp::Clear) ||
+                        p.depth_stencil.stencil_clear_value != 0)
+                           ? 1u
+                           : 0u;
+            }
+        }
+        const bool twinned = variant != 2;
+        const bool writes = variant != 1;
+        const bridge::BridgeStats& st = list.stats();
+        CHECK(st.stencil_twin_bindings == (twinned ? 1u : 0u));
+        CHECK(st.stencil_twin_copies_in == (twinned ? 1u : 0u));  // once: the twin stays equal afterwards
+        CHECK(st.stencil_twin_copies_out == (twinned && writes ? 2u : 0u));
+        CHECK(st.stencil_twin_draws == st.stencil_twin_copies_out * 8u);
+        CHECK(render_passes == st.stencil_twin_copies_out && draws == st.stencil_twin_draws &&
+              refs == st.stencil_twin_draws && bad == 0);
+        CHECK(st.storage_views_depth_untwinned == (twinned ? 0u : 1u));
+        CHECK(st.depth_twin_bindings == 0u && st.depth_twin_copies_in == 0u && st.depth_twin_copies_out == 0u);
+    }
+}
+
 // Backlog 35 follow-up: a mipped, layered depth texture twins per subresource. A 2D-array storage
 // view of mip 1, layers 1..2 copies exactly those two subresources in (once), writes them back one
 // draw each into the matching mip / layer, and a render pass that writes the depth of one of them
@@ -7343,6 +7431,7 @@ int main() {
     test_null_storage_dispatch_dropped();
     test_depth_storage_twin();
     test_depth_storage_twin_subresources();
+    test_stencil_storage_twin();
     test_fragment_storage_texture_format_conversion();
     test_vertex_mixed_storage_and_attachment_alias();
     test_seam_conversions();
