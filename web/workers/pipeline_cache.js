@@ -15,6 +15,7 @@
   const DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES = DEFAULT_MAX_QUARANTINED_KEYS;
   const DEFAULT_MAX_INTERSTAGE_MODULES = 512;
   const DEFAULT_MAX_INTERSTAGE_INTERFACE_CACHE = 2048;
+  const DEFAULT_MAX_RETAINED_WGSL_SOURCE_BYTES = 8 * 1024 * 1024;
   const MAX_PIPELINE_ERROR_MESSAGE_LENGTH = 512;
   const MAX_PIPELINE_ERROR_KEY_LENGTH = 64;
   const DEFAULT_MAX_VERTEX_BUFFERS = 8;
@@ -499,13 +500,280 @@
   // and user-registered WGPK/numeric shader module IDs without leaking GC references.
   const registeredObjectIds = new WeakMap();
   const registeredShaderModuleSources = new WeakMap();
+  const registeredShaderModuleSummaries = new WeakMap();
   const registeredShaderModuleReflections = new WeakMap();
   const moduleInterstageInterfaceCache = new WeakMap();
   const opaqueObjectIds = new WeakMap();
   const fallbackPipelineLayoutProfiles = new WeakMap();
   const gpuHandleFastCache = new WeakMap();
+  // Bounded global LRU backing standalone `registerShaderModuleSource` calls so raw WGSL strings
+  // cannot grow unboundedly in V8 heap (#2162, #1077).
+  const globalShaderSourceLru = new Map();
+  let globalShaderSourceBytes = 0;
   let nextOpaqueObjectId = 1;
   let shaderModuleRegistryVersion = 0;
+
+  function utf8ByteLength(str) {
+    if (typeof str !== 'string' || str.length === 0) return 0;
+    let bytes = 0;
+    const len = str.length;
+    for (let i = 0; i < len; i += 1) {
+      const c = str.charCodeAt(i);
+      if (c < 0x80) {
+        bytes += 1;
+      } else if (c < 0x800) {
+        bytes += 2;
+      } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
+        const next = str.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          bytes += 4;
+          i += 1;
+        } else {
+          bytes += 3;
+        }
+      } else {
+        bytes += 3;
+      }
+    }
+    return bytes;
+  }
+
+  // Detach short substrings (>= 13 chars) from huge parent WGSL strings so V8 SlicedStrings
+  // cannot keep released 100 KB+ shader sources pinned in memory (#2162).
+  function detachShortString(str) {
+    if (typeof str !== 'string' || str.length < 13) return str;
+    let out = '';
+    for (let i = 0; i < str.length; i += 1) {
+      out += String.fromCharCode(str.charCodeAt(i));
+    }
+    return out;
+  }
+
+  function detachAttrsList(attrs) {
+    if (!Array.isArray(attrs) || attrs.length === 0) return [];
+    const out = new Array(attrs.length);
+    for (let i = 0; i < attrs.length; i += 1) {
+      const a = attrs[i];
+      if (!a || typeof a !== 'object') {
+        out[i] = a;
+        continue;
+      }
+      out[i] = {
+        ...a,
+        name: detachShortString(a.name),
+        raw: detachShortString(a.raw),
+      };
+    }
+    return out;
+  }
+
+  function detachIoEntry(entry) {
+    if (!entry || typeof entry !== 'object') return entry;
+    return {
+      ...entry,
+      name: detachShortString(entry.name),
+      rawType: detachShortString(entry.rawType),
+      builtin: detachShortString(entry.builtin),
+      structName: detachShortString(entry.structName),
+      typeInfo: entry.typeInfo
+        ? {
+            ...entry.typeInfo,
+            scalar: detachShortString(entry.typeInfo.scalar),
+            canonical: detachShortString(entry.typeInfo.canonical),
+          }
+        : null,
+      interpolate: entry.interpolate
+        ? {
+            ...entry.interpolate,
+            type: detachShortString(entry.interpolate.type),
+            sampling: detachShortString(entry.interpolate.sampling),
+            canonical: detachShortString(entry.interpolate.canonical),
+            wgslAttr: detachShortString(entry.interpolate.wgslAttr),
+          }
+        : null,
+      attrs: detachAttrsList(entry.attrs),
+    };
+  }
+
+  function detachStructInfo(sInfo) {
+    if (!sInfo || typeof sInfo !== 'object') return null;
+    const locations = new Map();
+    const members = new Array(sInfo.members.length);
+    const builtins = [];
+    for (let i = 0; i < sInfo.members.length; i += 1) {
+      const m = detachIoEntry(sInfo.members[i]);
+      members[i] = m;
+      if (m.location !== null) {
+        locations.set(m.location, m);
+      }
+      if (m.builtin !== null) {
+        builtins.push(m);
+      }
+    }
+    return {
+      ...sInfo,
+      name: detachShortString(sInfo.name),
+      members,
+      locations,
+      builtins,
+    };
+  }
+
+  function detachInterstageInterface(iface) {
+    if (!iface || typeof iface !== 'object') return null;
+    const ep = iface.ep
+      ? {
+          ...iface.ep,
+          entryPoint: detachShortString(iface.ep.entryPoint),
+          returnTypeText: detachShortString(iface.ep.returnTypeText),
+        }
+      : null;
+    const params = Array.isArray(iface.params) ? iface.params.map(detachIoEntry) : [];
+    const locations = new Map();
+    if (iface.locations instanceof Map) {
+      for (const [loc, item] of iface.locations.entries()) {
+        locations.set(loc, detachIoEntry(item));
+      }
+    }
+    const builtins = Array.isArray(iface.builtins) ? iface.builtins.map(detachIoEntry) : [];
+    if (iface.stage === 'vertex') {
+      return {
+        ...iface,
+        entryPoint: detachShortString(iface.entryPoint),
+        ep,
+        params,
+        structName: detachShortString(iface.structName),
+        structInfo: detachStructInfo(iface.structInfo),
+        directReturn: detachIoEntry(iface.directReturn),
+        locations,
+        builtins,
+      };
+    }
+    return {
+      ...iface,
+      entryPoint: detachShortString(iface.entryPoint),
+      ep,
+      params,
+      inputStructs: Array.isArray(iface.inputStructs) ? iface.inputStructs.map(detachStructInfo) : [],
+      locations,
+      builtins,
+    };
+  }
+
+  function inferShaderStageHint(gpuShaderModule, stageReflection) {
+    if (stageReflection && typeof stageReflection === 'object' && typeof stageReflection.stage === 'string') {
+      const lower = stageReflection.stage.trim().toLowerCase();
+      if (lower === 'vertex' || lower === 'vs') return 'vertex';
+      if (lower === 'fragment' || lower === 'fs' || lower === 'ps' || lower === 'pixel') return 'fragment';
+      if (lower === 'compute' || lower === 'cs') return 'compute';
+    }
+    if (gpuShaderModule && typeof gpuShaderModule === 'object' && typeof gpuShaderModule.label === 'string') {
+      const lower = gpuShaderModule.label.toLowerCase();
+      if (lower.includes(':vertex:') || lower.endsWith(':vs')) return 'vertex';
+      if (lower.includes(':fragment:') || lower.endsWith(':fs') || lower.endsWith(':ps')) return 'fragment';
+      if (lower.includes(':compute:') || lower.endsWith(':cs')) return 'compute';
+    }
+    return null;
+  }
+
+  function extractShaderInterstageSummary(wgslCode, stageHint = null) {
+    if (typeof wgslCode !== 'string' || wgslCode.length === 0) {
+      return null;
+    }
+    const wgslHash = fnv1a64Hex(wgslCode);
+    const wgslByteLength = utf8ByteLength(wgslCode);
+    const shouldParseVs =
+      stageHint === 'vertex' ||
+      (stageHint !== 'fragment' && stageHint !== 'compute' && wgslCode.indexOf('@vertex') !== -1);
+    const shouldParsePs =
+      stageHint === 'fragment' ||
+      (stageHint !== 'vertex' && stageHint !== 'compute' && wgslCode.indexOf('@fragment') !== -1);
+
+    const vsInterface = shouldParseVs
+      ? detachInterstageInterface(parseInterstageInterface(wgslCode, 'vertex', null))
+      : null;
+    const psInterface = shouldParsePs
+      ? detachInterstageInterface(parseInterstageInterface(wgslCode, 'fragment', null))
+      : null;
+
+    const vsOutputLocations =
+      vsInterface && vsInterface.locations instanceof Map
+        ? Array.from(vsInterface.locations.keys()).sort((a, b) => a - b)
+        : [];
+    const psInputLocations =
+      psInterface && psInterface.locations instanceof Map
+        ? Array.from(psInterface.locations.keys()).sort((a, b) => a - b)
+        : [];
+    const psLocationTypes = Object.create(null);
+    let hasFlatNeeded = false;
+
+    if (psInterface && psInterface.locations instanceof Map) {
+      for (let i = 0; i < psInputLocations.length; i += 1) {
+        const loc = psInputLocations[i];
+        const entry = psInterface.locations.get(loc);
+        if (!entry) continue;
+        psLocationTypes[loc] = entry.typeInfo ? entry.typeInfo.canonical : entry.rawType;
+        if (
+          (entry.interpolate && entry.interpolate.type === 'flat') ||
+          (entry.typeInfo && entry.typeInfo.isInteger)
+        ) {
+          hasFlatNeeded = true;
+        }
+      }
+    }
+    if (!hasFlatNeeded && vsInterface && vsInterface.locations instanceof Map) {
+      for (let i = 0; i < vsOutputLocations.length; i += 1) {
+        const entry = vsInterface.locations.get(vsOutputLocations[i]);
+        if (entry && entry.typeInfo && entry.typeInfo.isInteger) {
+          hasFlatNeeded = true;
+          break;
+        }
+      }
+    }
+
+    return {
+      wgslHash,
+      wgslByteLength,
+      vsOutputLocations,
+      psInputLocations,
+      psLocationTypes,
+      hasFlatNeeded,
+      vsInterface,
+      psInterface,
+    };
+  }
+
+  function removeGlobalShaderSource(gpuShaderModule) {
+    const existing = globalShaderSourceLru.get(gpuShaderModule);
+    if (existing !== undefined) {
+      globalShaderSourceLru.delete(gpuShaderModule);
+      globalShaderSourceBytes = Math.max(0, globalShaderSourceBytes - existing.byteLength);
+      return existing.byteLength;
+    }
+    return -1;
+  }
+
+  function storeGlobalShaderSourceBounded(gpuShaderModule, wgslCode, byteLength) {
+    removeGlobalShaderSource(gpuShaderModule);
+    if (byteLength > DEFAULT_MAX_RETAINED_WGSL_SOURCE_BYTES) {
+      registeredShaderModuleSources.delete(gpuShaderModule);
+      return false;
+    }
+    while (
+      globalShaderSourceLru.size > 0 &&
+      globalShaderSourceBytes + byteLength > DEFAULT_MAX_RETAINED_WGSL_SOURCE_BYTES
+    ) {
+      const oldestMod = globalShaderSourceLru.keys().next().value;
+      const oldest = globalShaderSourceLru.get(oldestMod);
+      globalShaderSourceLru.delete(oldestMod);
+      globalShaderSourceBytes = Math.max(0, globalShaderSourceBytes - oldest.byteLength);
+      registeredShaderModuleSources.delete(oldestMod);
+    }
+    globalShaderSourceLru.set(gpuShaderModule, { byteLength });
+    globalShaderSourceBytes += byteLength;
+    registeredShaderModuleSources.set(gpuShaderModule, wgslCode);
+    return true;
+  }
 
   // Reusable 8-byte scratch view for zero-allocation float64 -> 2x uint32 hashing.
   const FAST_HASH_F64 = new Float64Array(1);
@@ -659,12 +927,19 @@
     }
     const token = normalizeShaderId(id);
     setRegisteredObjectId(gpuObject, token);
-    if (typeof wgslCode === 'string' && wgslCode.length > 0) {
-      registeredShaderModuleSources.set(gpuObject, wgslCode);
-      moduleInterstageInterfaceCache.delete(gpuObject);
-    }
     if (stageReflection && typeof stageReflection === 'object') {
       registeredShaderModuleReflections.set(gpuObject, stageReflection);
+    }
+    if (typeof wgslCode === 'string' && wgslCode.length > 0) {
+      const summary = extractShaderInterstageSummary(
+        wgslCode,
+        inferShaderStageHint(gpuObject, stageReflection)
+      );
+      if (summary) {
+        registeredShaderModuleSummaries.set(gpuObject, summary);
+      }
+      storeGlobalShaderSourceBounded(gpuObject, wgslCode, summary ? summary.wgslByteLength : utf8ByteLength(wgslCode));
+      moduleInterstageInterfaceCache.delete(gpuObject);
     }
     return token;
   }
@@ -742,9 +1017,57 @@
     if (typeof wgslCode !== 'string' || wgslCode.length === 0) {
       throw new TypeError('wgslCode must be a non-empty string');
     }
-    registeredShaderModuleSources.set(gpuShaderModule, wgslCode);
+    const refl = registeredShaderModuleReflections.get(gpuShaderModule) || null;
+    const summary = extractShaderInterstageSummary(
+      wgslCode,
+      inferShaderStageHint(gpuShaderModule, refl)
+    );
+    if (summary) {
+      registeredShaderModuleSummaries.set(gpuShaderModule, summary);
+    }
+    storeGlobalShaderSourceBounded(
+      gpuShaderModule,
+      wgslCode,
+      summary ? summary.wgslByteLength : utf8ByteLength(wgslCode)
+    );
     moduleInterstageInterfaceCache.delete(gpuShaderModule);
     return wgslCode;
+  }
+
+  /**
+   * Release any retained raw WGSL source string for `gpuShaderModule` from the global registry
+   * while keeping its compact parsed inter-stage interface summary intact (#2162).
+   *
+   * @param {object | null | undefined} gpuShaderModule
+   * @returns {boolean} True if a retained raw WGSL source string was released
+   */
+  function releaseShaderModuleSource(gpuShaderModule) {
+    if (
+      !gpuShaderModule ||
+      (typeof gpuShaderModule !== 'object' && typeof gpuShaderModule !== 'function')
+    ) {
+      return false;
+    }
+    const hadWeak = registeredShaderModuleSources.delete(gpuShaderModule);
+    const hadGlobal = removeGlobalShaderSource(gpuShaderModule) >= 0;
+    return hadWeak || hadGlobal;
+  }
+
+  /**
+   * Return the compact pre-extracted inter-stage interface summary for `gpuShaderModule`
+   * (`vsOutputLocations`, `psInputLocations`, `psLocationTypes`, `hasFlatNeeded`), or `null`.
+   *
+   * @param {object | null | undefined} gpuShaderModule
+   * @returns {object | null}
+   */
+  function getRegisteredShaderModuleSummary(gpuShaderModule) {
+    if (
+      !gpuShaderModule ||
+      (typeof gpuShaderModule !== 'object' && typeof gpuShaderModule !== 'function')
+    ) {
+      return null;
+    }
+    return registeredShaderModuleSummaries.get(gpuShaderModule) || null;
   }
 
   /**
@@ -6843,6 +7166,49 @@
         'maxInterstageInterfaceCache'
       );
 
+      const rawMaxWgslSourceBytes =
+        options.maxRetainedWgslSourceBytes !== undefined
+          ? options.maxRetainedWgslSourceBytes
+          : options.maxWgslSourceBytes !== undefined
+            ? options.maxWgslSourceBytes
+            : DEFAULT_MAX_RETAINED_WGSL_SOURCE_BYTES;
+      this._maxRetainedWgslSourceBytes =
+        rawMaxWgslSourceBytes === null
+          ? DEFAULT_MAX_RETAINED_WGSL_SOURCE_BYTES
+          : validateNonNegativeInt(rawMaxWgslSourceBytes, 'maxRetainedWgslSourceBytes');
+
+      const rawReleaseAfterLink =
+        options.releaseWgslSourceAfterLink !== undefined
+          ? options.releaseWgslSourceAfterLink
+          : options.releaseSourceAfterLink;
+      if (rawReleaseAfterLink !== undefined && typeof rawReleaseAfterLink !== 'boolean') {
+        throw new TypeError('options.releaseWgslSourceAfterLink must be a boolean when provided');
+      }
+      this._releaseWgslSourceAfterLink = Boolean(rawReleaseAfterLink);
+
+      const rawSourceProvider =
+        options.wgslSourceProvider !== undefined
+          ? options.wgslSourceProvider
+          : options.resolveWgslSource !== undefined
+            ? options.resolveWgslSource
+            : options.getWgslSource !== undefined
+              ? options.getWgslSource
+              : options.wgslPackLoader !== undefined
+                ? options.wgslPackLoader
+                : options.shaderPack;
+      if (
+        rawSourceProvider !== undefined &&
+        rawSourceProvider !== null &&
+        typeof rawSourceProvider !== 'function' &&
+        typeof rawSourceProvider !== 'object'
+      ) {
+        throw new TypeError(
+          'options.wgslSourceProvider must be a function or pack loader object when provided'
+        );
+      }
+      this._wgslSourceProvider =
+        rawSourceProvider !== undefined && rawSourceProvider !== null ? rawSourceProvider : null;
+
       this._reflectionRegistry =
         options.reflectionRegistry && typeof options.reflectionRegistry === 'object'
           ? options.reflectionRegistry
@@ -6857,6 +7223,8 @@
       this._bindGroupLayouts = new Map();
       this._interstagePatchedModules = new Map();
       this._interstageInterfaceCache = new Map();
+      this._wgslSourceLru = new Map();
+      this._wgslSourceBytesRetained = 0;
       this._fastRenderLookup = new Map();
       this._fastComputeLookup = new Map();
       this._fastRenderIntHash = new Map();
@@ -6931,7 +7299,50 @@
         interstageModuleCacheHits: 0,
         interstageModuleCacheMisses: 0,
         interstageModuleEvictions: 0,
+        wgslSourceBytesReleased: 0,
+        wgslSourceEvictions: 0,
+        wgslSourceLazyFetches: 0,
       };
+    }
+
+    _storeRetainedWgslSource(shaderModule, wgslCode, stageHint = null) {
+      const summary = extractShaderInterstageSummary(wgslCode, stageHint);
+      if (summary) {
+        registeredShaderModuleSummaries.set(shaderModule, summary);
+      }
+      moduleInterstageInterfaceCache.delete(shaderModule);
+
+      const byteLength = summary ? summary.wgslByteLength : utf8ByteLength(wgslCode);
+      const existing = this._wgslSourceLru.get(shaderModule);
+      if (existing !== undefined) {
+        this._wgslSourceLru.delete(shaderModule);
+        this._wgslSourceBytesRetained = Math.max(0, this._wgslSourceBytesRetained - existing.byteLength);
+      }
+      removeGlobalShaderSource(shaderModule);
+
+      const cap = this._maxRetainedWgslSourceBytes;
+      if (cap === 0 || byteLength > cap) {
+        registeredShaderModuleSources.delete(shaderModule);
+        this._stats.wgslSourceBytesReleased += byteLength;
+        this._stats.wgslSourceEvictions += 1;
+        return false;
+      }
+
+      while (this._wgslSourceLru.size > 0 && this._wgslSourceBytesRetained + byteLength > cap) {
+        const oldestMod = this._wgslSourceLru.keys().next().value;
+        const oldest = this._wgslSourceLru.get(oldestMod);
+        this._wgslSourceLru.delete(oldestMod);
+        this._wgslSourceBytesRetained = Math.max(0, this._wgslSourceBytesRetained - oldest.byteLength);
+        this._stats.wgslSourceBytesReleased += oldest.byteLength;
+        this._stats.wgslSourceEvictions += 1;
+        registeredShaderModuleSources.delete(oldestMod);
+        removeGlobalShaderSource(oldestMod);
+      }
+
+      this._wgslSourceLru.set(shaderModule, { code: wgslCode, byteLength });
+      this._wgslSourceBytesRetained += byteLength;
+      registeredShaderModuleSources.set(shaderModule, wgslCode);
+      return true;
     }
 
     /**
@@ -6942,10 +7353,26 @@
      * @param {object} shaderModule
      * @param {bigint | number | string} hashOrId
      * @param {string} [wgslCode]
+     * @param {object} [stageReflection]
      * @returns {string}
      */
     registerShaderModule(shaderModule, hashOrId, wgslCode, stageReflection) {
-      return registerShaderModuleId(shaderModule, hashOrId, wgslCode, stageReflection);
+      if (!shaderModule || (typeof shaderModule !== 'object' && typeof shaderModule !== 'function')) {
+        throw new TypeError('gpuObject must be an object');
+      }
+      const token = normalizeShaderId(hashOrId);
+      setRegisteredObjectId(shaderModule, token);
+      if (stageReflection && typeof stageReflection === 'object') {
+        registeredShaderModuleReflections.set(shaderModule, stageReflection);
+      }
+      if (typeof wgslCode === 'string' && wgslCode.length > 0) {
+        this._storeRetainedWgslSource(
+          shaderModule,
+          wgslCode,
+          inferShaderStageHint(shaderModule, stageReflection)
+        );
+      }
+      return token;
     }
 
     /**
@@ -6971,18 +7398,158 @@
     }
 
     /**
+     * Attach or replace a lazy WGSL source provider (callback `(shaderModule, context) => string | null`
+     * or `WgslPackCache`/`WgslPack` instance with `.getWgsl(hash)`) used on demand when an evicted
+     * shader actually requires inter-stage WGSL rewriting (#2162).
+     *
+     * @param {Function | object | null} provider
+     */
+    setWgslSourceProvider(provider) {
+      if (
+        provider !== undefined &&
+        provider !== null &&
+        typeof provider !== 'function' &&
+        typeof provider !== 'object'
+      ) {
+        throw new TypeError('provider must be a function, pack loader object, or null');
+      }
+      this._wgslSourceProvider = provider || null;
+    }
+
+    /**
      * Associate a `GPUShaderModule` with its WGSL source text so render pipelines using it
      * can automatically detect and patch VS<->PS `@interpolate(flat)` / `@location(N)` mismatches.
+     * Extracts compact inter-stage interface metadata immediately and retains raw WGSL source
+     * within `maxRetainedWgslSourceBytes` (#2162).
      *
      * @param {object} shaderModule
      * @param {string} wgslCode
      * @returns {string}
      */
     registerShaderModuleSource(shaderModule, wgslCode) {
-      return registerShaderModuleSource(shaderModule, wgslCode);
+      if (
+        !shaderModule ||
+        (typeof shaderModule !== 'object' && typeof shaderModule !== 'function')
+      ) {
+        throw new TypeError('gpuShaderModule must be an object');
+      }
+      if (typeof wgslCode !== 'string' || wgslCode.length === 0) {
+        throw new TypeError('wgslCode must be a non-empty string');
+      }
+      const refl = registeredShaderModuleReflections.get(shaderModule) || null;
+      this._storeRetainedWgslSource(
+        shaderModule,
+        wgslCode,
+        inferShaderStageHint(shaderModule, refl)
+      );
+      return wgslCode;
     }
 
-    _resolveStageWgslSource(stage, moduleObj, rawDescriptor, opts) {
+    /**
+     * Return the compact pre-extracted inter-stage interface summary for `shaderModule`, or `null`.
+     *
+     * @param {object} shaderModule
+     * @returns {object | null}
+     */
+    getShaderModuleSummary(shaderModule) {
+      return getRegisteredShaderModuleSummary(shaderModule);
+    }
+
+    /**
+     * Release the retained raw WGSL source string for `shaderModule` while preserving its compact
+     * parsed inter-stage interface summary (#2162).
+     *
+     * @param {object} shaderModule
+     * @returns {boolean}
+     */
+    releaseShaderModuleSource(shaderModule) {
+      if (
+        !shaderModule ||
+        (typeof shaderModule !== 'object' && typeof shaderModule !== 'function')
+      ) {
+        return false;
+      }
+      let released = false;
+      const entry = this._wgslSourceLru.get(shaderModule);
+      if (entry !== undefined) {
+        this._wgslSourceLru.delete(shaderModule);
+        this._wgslSourceBytesRetained = Math.max(0, this._wgslSourceBytesRetained - entry.byteLength);
+        this._stats.wgslSourceBytesReleased += entry.byteLength;
+        released = true;
+      }
+      const globalReleased = releaseShaderModuleSource(shaderModule);
+      return released || globalReleased;
+    }
+
+    /**
+     * Release all raw WGSL source strings currently retained by this pipeline cache while
+     * preserving compact inter-stage interface summaries (#2162).
+     *
+     * @returns {{ releasedCount: number, bytesReleased: number }}
+     */
+    releaseAllShaderModuleSources() {
+      let releasedCount = 0;
+      let bytesReleased = 0;
+      for (const [mod, entry] of this._wgslSourceLru.entries()) {
+        releasedCount += 1;
+        bytesReleased += entry.byteLength;
+        registeredShaderModuleSources.delete(mod);
+        removeGlobalShaderSource(mod);
+      }
+      this._wgslSourceLru.clear();
+      this._wgslSourceBytesRetained = 0;
+      if (bytesReleased > 0) {
+        this._stats.wgslSourceBytesReleased += bytesReleased;
+      }
+      return { releasedCount, bytesReleased };
+    }
+
+    _fetchWgslFromLazyProvider(stage, moduleObj, opts) {
+      const provider =
+        opts && opts.wgslSourceProvider !== undefined
+          ? opts.wgslSourceProvider
+          : this._wgslSourceProvider;
+      if (!provider || !moduleObj) {
+        return null;
+      }
+      const hash = this._extractShaderHashForReflectionLookup(moduleObj);
+      const idToken = registeredObjectIds.get(moduleObj) || null;
+      let fetched = null;
+      try {
+        if (typeof provider === 'function') {
+          fetched = provider(moduleObj, {
+            stage,
+            hash,
+            hashHex: typeof hash === 'string' ? hash : null,
+            idToken,
+            module: moduleObj,
+          });
+        } else if (hash !== null) {
+          if (typeof provider.getWgsl === 'function') {
+            fetched = provider.getWgsl(hash, stage);
+            if (!fetched) {
+              fetched = provider.getWgsl(hash);
+            }
+          } else if (typeof provider.getSource === 'function') {
+            fetched = provider.getSource(hash);
+          } else if (typeof provider.getShaderSource === 'function') {
+            fetched = provider.getShaderSource(hash, stage);
+            if (!fetched) {
+              fetched = provider.getShaderSource(hash);
+            }
+          }
+        }
+      } catch (_providerErr) {
+        return null;
+      }
+      if (typeof fetched === 'string' && fetched.length > 0) {
+        this._stats.wgslSourceLazyFetches += 1;
+        return fetched;
+      }
+      return null;
+    }
+
+    _resolveInlineStageWgslSource(stage, rawDescriptor, opts) {
       if (stage === 'vertex') {
         if (opts && typeof opts.vsCode === 'string' && opts.vsCode.length > 0) return opts.vsCode;
         if (opts && typeof opts.vertexCode === 'string' && opts.vertexCode.length > 0) return opts.vertexCode;
@@ -7028,6 +7595,25 @@
           }
         }
       }
+      return null;
+    }
+
+    _resolveStageWgslSource(stage, moduleObj, rawDescriptor, opts, resolveOpts = null) {
+      const inlineCode = this._resolveInlineStageWgslSource(stage, rawDescriptor, opts);
+      if (inlineCode !== null) {
+        return inlineCode;
+      }
+
+      if (moduleObj && (typeof moduleObj === 'object' || typeof moduleObj === 'function')) {
+        const lruEntry = this._wgslSourceLru.get(moduleObj);
+        if (lruEntry !== undefined) {
+          if (this._wgslSourceLru.size > 1) {
+            this._wgslSourceLru.delete(moduleObj);
+            this._wgslSourceLru.set(moduleObj, lruEntry);
+          }
+          return lruEntry.code;
+        }
+      }
 
       const fromModule = getRegisteredShaderModuleSource(moduleObj);
       if (fromModule !== null) {
@@ -7049,7 +7635,60 @@
         }
       }
 
+      if (!resolveOpts || resolveOpts.allowLazyProvider !== false) {
+        const fromProvider = this._fetchWgslFromLazyProvider(stage, moduleObj, opts);
+        if (fromProvider !== null) {
+          return fromProvider;
+        }
+      }
+
       return null;
+    }
+
+    _resolveStageInterstageInterface(stage, moduleObj, inlineCode, entryPoint, rawDescriptor, opts) {
+      const epKey = typeof entryPoint === 'string' && entryPoint.length > 0 ? entryPoint : '';
+      if (inlineCode !== null) {
+        return {
+          iface: this._getCachedInterstageInterface(moduleObj, inlineCode, stage, epKey),
+          code: inlineCode,
+        };
+      }
+
+      // Prefer compact pre-extracted inter-stage summary (zero raw WGSL string required!).
+      const summary = getRegisteredShaderModuleSummary(moduleObj);
+      if (summary) {
+        const summaryIface = stage === 'vertex' ? summary.vsInterface : summary.psInterface;
+        if (
+          summaryIface &&
+          (epKey.length === 0 || summaryIface.entryPoint === epKey)
+        ) {
+          return { iface: summaryIface, code: null };
+        }
+      }
+
+      const code = this._resolveStageWgslSource(stage, moduleObj, rawDescriptor, opts);
+      if (!code) {
+        return { iface: null, code: null };
+      }
+      return {
+        iface: this._getCachedInterstageInterface(moduleObj, code, stage, epKey),
+        code,
+      };
+    }
+
+    _maybeReleaseLinkedPipelineSources(descriptor) {
+      if (!this._releaseWgslSourceAfterLink || !descriptor || typeof descriptor !== 'object') {
+        return;
+      }
+      if (descriptor.vertex && descriptor.vertex.module) {
+        this.releaseShaderModuleSource(descriptor.vertex.module);
+      }
+      if (descriptor.fragment && descriptor.fragment.module) {
+        this.releaseShaderModuleSource(descriptor.fragment.module);
+      }
+      if (descriptor.compute && descriptor.compute.module) {
+        this.releaseShaderModuleSource(descriptor.compute.module);
+      }
     }
 
     _getCachedInterstageInterface(moduleObj, wgslCode, stage, entryPoint) {
@@ -7071,8 +7710,8 @@
 
       // Key by stage + entryPoint + length + 64-bit FNV-1a hash without retaining the raw WGSL string (#1077).
       const wgslHash = fnv1a64Hex(wgslCode);
-      const wgslHead = wgslCode.slice(0, 48);
-      const wgslTail = wgslCode.slice(-48);
+      const wgslHead = detachShortString(wgslCode.slice(0, 48));
+      const wgslTail = detachShortString(wgslCode.slice(-48));
       const cacheKey = `${stage}:${epKey}:${wgslLen}:${wgslHash}`;
       const cached = this._interstageInterfaceCache.get(cacheKey);
       if (
@@ -7097,7 +7736,7 @@
         return cached.parsed;
       }
 
-      const parsed = parseInterstageInterface(wgslCode, stage, epKey || null);
+      const parsed = detachInterstageInterface(parseInterstageInterface(wgslCode, stage, epKey || null));
       this._interstageInterfaceCache.set(cacheKey, {
         wgslLen,
         wgslHead,
@@ -7265,21 +7904,38 @@
 
       const vsModule = effectiveDescriptor.vertex.module;
       const fsModule = effectiveDescriptor.fragment.module;
-      const vsCode = this._resolveStageWgslSource('vertex', vsModule, rawDescriptor, opts);
-      const fsCode = this._resolveStageWgslSource('fragment', fsModule, rawDescriptor, opts);
-      if (!vsCode || !fsCode) {
-        return { descriptor: effectiveDescriptor, patched: false };
-      }
-
       const vsEntryPoint = effectiveDescriptor.vertex.entryPoint;
       const fsEntryPoint = effectiveDescriptor.fragment.entryPoint;
-      const vsIface = this._getCachedInterstageInterface(vsModule, vsCode, 'vertex', vsEntryPoint);
-      const psIface = this._getCachedInterstageInterface(fsModule, fsCode, 'fragment', fsEntryPoint);
+
+      const inlineVsCode = this._resolveInlineStageWgslSource('vertex', rawDescriptor, opts);
+      const inlineFsCode = this._resolveInlineStageWgslSource('fragment', rawDescriptor, opts);
+
+      const vsResolved = this._resolveStageInterstageInterface(
+        'vertex',
+        vsModule,
+        inlineVsCode,
+        vsEntryPoint,
+        rawDescriptor,
+        opts
+      );
+      const psResolved = this._resolveStageInterstageInterface(
+        'fragment',
+        fsModule,
+        inlineFsCode,
+        fsEntryPoint,
+        rawDescriptor,
+        opts
+      );
+      const vsIface = vsResolved.iface;
+      const psIface = psResolved.iface;
       if (!vsIface || !psIface) {
         return { descriptor: effectiveDescriptor, patched: false };
       }
 
-      // 1. Optional FSSM OSG1 <-> ISG1 (SPI_PS_INPUT_CNTL) semantic @location remap (#2085).
+      let vsCode = vsResolved.code;
+      let fsCode = psResolved.code;
+
+      // 1. Optional FSSM OSG1 <-> ISG1 (SPI_PS_INPUT_CNTL) semantic @location remap (#2085, #2113).
       let nextFsModule = fsModule;
       let effectivePsCode = fsCode;
       let effectivePsIface = psIface;
@@ -7302,55 +7958,72 @@
           : computeInterstageLocationRemaps(vsOutputsMeta, psInputsMeta);
 
       if (semanticRemaps.length > 0) {
-        const psRemap = remapPsInputLocationsWgsl(fsCode, semanticRemaps, {
-          psEntryPoint: fsEntryPoint,
-          psInterface: psIface,
-          vsInterface: vsIface,
-          vsOutputs: vsOutputsMeta,
-        });
-        if (psRemap.patched) {
-          const fsToken = resolveGpuHandleToken(fsModule) || `wgsl:${fnv1a64Hex(fsCode)}`;
-          const psPatchKey = `ps:${fsToken}|${psIface.entryPoint || 'fs_main'}|${psRemap.remapSignature}`;
-          let cachedPsMod = this._interstagePatchedModules.get(psPatchKey);
-          if (cachedPsMod !== undefined) {
-            this._interstagePatchedModules.delete(psPatchKey);
-            this._interstagePatchedModules.set(psPatchKey, cachedPsMod);
-            this._stats.interstageModuleCacheHits += 1;
-          } else if (typeof this._device.createShaderModule === 'function') {
-            const baseFsLabel =
-              typeof fsModule.label === 'string' && fsModule.label.length > 0
-                ? fsModule.label
-                : fsToken;
-            let patchedPsModule = null;
-            try {
-              patchedPsModule = this._device.createShaderModule({
-                label: `${baseFsLabel}:interstage-remap`,
-                code: psRemap.psCode,
-              });
-            } catch (_psCompileErr) {
-              patchedPsModule = null;
-            }
-            if (
-              patchedPsModule &&
-              (typeof patchedPsModule === 'object' || typeof patchedPsModule === 'function')
-            ) {
-              registeredObjectIds.set(patchedPsModule, `interstage:${psPatchKey}`);
-              cachedPsMod = {
-                module: patchedPsModule,
-                locationRemapFixes: psRemap.locationRemapFixes,
-                patchSignature: psRemap.remapSignature,
-              };
-              this._cachePatchedInterstageModule(psPatchKey, cachedPsMod);
-            }
+        let hasApplicableRemap = false;
+        for (let i = 0; i < semanticRemaps.length; i += 1) {
+          const r = semanticRemaps[i];
+          if (psIface.locations.has(r.psLocation) && r.psLocation !== r.vsLocation) {
+            hasApplicableRemap = true;
+            break;
           }
-          if (cachedPsMod !== undefined) {
-            nextFsModule = cachedPsMod.module;
-            effectivePsCode = psRemap.psCode;
-            effectivePsIface =
-              this._getCachedInterstageInterface(null, effectivePsCode, 'fragment', fsEntryPoint) ||
-              psIface;
-            psPatched = true;
-            locationRemapFixes = cachedPsMod.locationRemapFixes;
+        }
+        if (hasApplicableRemap) {
+          if (!fsCode) {
+            fsCode = this._resolveStageWgslSource('fragment', fsModule, rawDescriptor, opts, {
+              allowLazyProvider: true,
+            });
+          }
+          if (fsCode) {
+            const psRemap = remapPsInputLocationsWgsl(fsCode, semanticRemaps, {
+              psEntryPoint: fsEntryPoint,
+              psInterface: psIface,
+              vsInterface: vsIface,
+              vsOutputs: vsOutputsMeta,
+            });
+            if (psRemap.patched) {
+              const fsToken = resolveGpuHandleToken(fsModule) || `wgsl:${fnv1a64Hex(fsCode)}`;
+              const psPatchKey = `ps:${fsToken}|${psIface.entryPoint || 'fs_main'}|${psRemap.remapSignature}`;
+              let cachedPsMod = this._interstagePatchedModules.get(psPatchKey);
+              if (cachedPsMod !== undefined) {
+                this._interstagePatchedModules.delete(psPatchKey);
+                this._interstagePatchedModules.set(psPatchKey, cachedPsMod);
+                this._stats.interstageModuleCacheHits += 1;
+              } else if (typeof this._device.createShaderModule === 'function') {
+                const baseFsLabel =
+                  typeof fsModule.label === 'string' && fsModule.label.length > 0
+                    ? fsModule.label
+                    : fsToken;
+                let patchedPsModule = null;
+                try {
+                  patchedPsModule = this._device.createShaderModule({
+                    label: `${baseFsLabel}:interstage-remap`,
+                    code: psRemap.psCode,
+                  });
+                } catch (_psCompileErr) {
+                  patchedPsModule = null;
+                }
+                if (
+                  patchedPsModule &&
+                  (typeof patchedPsModule === 'object' || typeof patchedPsModule === 'function')
+                ) {
+                  registeredObjectIds.set(patchedPsModule, `interstage:${psPatchKey}`);
+                  cachedPsMod = {
+                    module: patchedPsModule,
+                    locationRemapFixes: psRemap.locationRemapFixes,
+                    patchSignature: psRemap.remapSignature,
+                  };
+                  this._cachePatchedInterstageModule(psPatchKey, cachedPsMod);
+                }
+              }
+              if (cachedPsMod !== undefined) {
+                nextFsModule = cachedPsMod.module;
+                effectivePsCode = psRemap.psCode;
+                effectivePsIface =
+                  this._getCachedInterstageInterface(null, effectivePsCode, 'fragment', fsEntryPoint) ||
+                  psIface;
+                psPatched = true;
+                locationRemapFixes = cachedPsMod.locationRemapFixes;
+              }
+            }
           }
         }
       }
@@ -7362,57 +8035,73 @@
       let cachedVsMod = null;
 
       if (analysis.needsPatch) {
-        const vsToken = resolveGpuHandleToken(vsModule) || `wgsl:${fnv1a64Hex(vsCode)}`;
-        const patchKey = `${vsToken}|${vsIface.entryPoint || 'vs_main'}|${analysis.patchSignature}`;
+        const vsSummary = getRegisteredShaderModuleSummary(vsModule);
+        const vsToken =
+          resolveGpuHandleToken(vsModule) ||
+          (vsSummary && vsSummary.wgslHash ? `wgsl:${vsSummary.wgslHash}` : null) ||
+          (vsCode ? `wgsl:${fnv1a64Hex(vsCode)}` : null);
+        const patchKey = vsToken
+          ? `${vsToken}|${vsIface.entryPoint || 'vs_main'}|${analysis.patchSignature}`
+          : null;
 
-        let cachedMod = this._interstagePatchedModules.get(patchKey);
+        let cachedMod = patchKey ? this._interstagePatchedModules.get(patchKey) : undefined;
         if (cachedMod !== undefined) {
-          // Refresh LRU recency
+          // Refresh LRU recency (zero raw WGSL fetch needed on patched-module cache hit!)
           this._interstagePatchedModules.delete(patchKey);
           this._interstagePatchedModules.set(patchKey, cachedMod);
           this._stats.interstageModuleCacheHits += 1;
         } else if (typeof this._device.createShaderModule === 'function') {
-          const patchResult = patchInterstageWgsl(vsCode, effectivePsCode, {
-            vsEntryPoint,
-            psEntryPoint: fsEntryPoint,
-            analysis,
-          });
-          if (patchResult.patched) {
-            const baseLabel =
-              typeof vsModule.label === 'string' && vsModule.label.length > 0
-                ? vsModule.label
-                : vsToken;
-            const patchedLabel = `${baseLabel}:interstage`;
+          if (!vsCode) {
+            vsCode = this._resolveStageWgslSource('vertex', vsModule, rawDescriptor, opts, {
+              allowLazyProvider: true,
+            });
+          }
+          if (vsCode) {
+            const finalVsToken = vsToken || `wgsl:${fnv1a64Hex(vsCode)}`;
+            const finalPatchKey =
+              patchKey || `${finalVsToken}|${vsIface.entryPoint || 'vs_main'}|${analysis.patchSignature}`;
+            const patchResult = patchInterstageWgsl(vsCode, effectivePsCode || '', {
+              vsEntryPoint,
+              psEntryPoint: fsEntryPoint,
+              analysis,
+            });
+            if (patchResult.patched) {
+              const baseLabel =
+                typeof vsModule.label === 'string' && vsModule.label.length > 0
+                  ? vsModule.label
+                  : finalVsToken;
+              const patchedLabel = `${baseLabel}:interstage`;
 
-            let patchedModule = null;
-            try {
-              patchedModule = this._device.createShaderModule({
-                label: patchedLabel,
-                code: patchResult.vsCode,
-              });
-            } catch (_compileErr) {
-              // Never fail pipeline creation solely due to speculative inter-stage patching.
-              patchedModule = null;
-            }
-            if (
-              patchedModule &&
-              (typeof patchedModule === 'object' || typeof patchedModule === 'function')
-            ) {
-              // Register deterministic ID directly on the brand-new patchedModule without bumping
-              // global shaderModuleRegistryVersion (avoids invalidating warm fast-lookup caches for
-              // unrelated pipelines), and avoid pinning patched WGSL strings in WeakMap (#1077).
-              registeredObjectIds.set(patchedModule, `interstage:${patchKey}`);
+              let patchedModule = null;
+              try {
+                patchedModule = this._device.createShaderModule({
+                  label: patchedLabel,
+                  code: patchResult.vsCode,
+                });
+              } catch (_compileErr) {
+                // Never fail pipeline creation solely due to speculative inter-stage patching.
+                patchedModule = null;
+              }
+              if (
+                patchedModule &&
+                (typeof patchedModule === 'object' || typeof patchedModule === 'function')
+              ) {
+                // Register deterministic ID directly on the brand-new patchedModule without bumping
+                // global shaderModuleRegistryVersion (avoids invalidating warm fast-lookup caches for
+                // unrelated pipelines), and avoid pinning patched WGSL strings in WeakMap (#1077).
+                registeredObjectIds.set(patchedModule, `interstage:${finalPatchKey}`);
 
-              cachedMod = {
-                module: patchedModule,
-                flatFixes: patchResult.flatFixes,
-                interpolateFixes: patchResult.interpolateFixes,
-                missingLocationFixes: patchResult.missingLocationFixes,
-                typeFixes: patchResult.typeFixes,
-                integerFlatFixes: patchResult.integerFlatFixes,
-                patchSignature: patchResult.patchSignature,
-              };
-              this._cachePatchedInterstageModule(patchKey, cachedMod);
+                cachedMod = {
+                  module: patchedModule,
+                  flatFixes: patchResult.flatFixes,
+                  interpolateFixes: patchResult.interpolateFixes,
+                  missingLocationFixes: patchResult.missingLocationFixes,
+                  typeFixes: patchResult.typeFixes,
+                  integerFlatFixes: patchResult.integerFlatFixes,
+                  patchSignature: patchResult.patchSignature,
+                };
+                this._cachePatchedInterstageModule(finalPatchKey, cachedMod);
+              }
             }
           }
         }
@@ -7487,6 +8176,12 @@
         moduleCacheEvictions: this._stats.interstageModuleEvictions,
         interfaceCacheSize: this._interstageInterfaceCache.size,
         maxInterfaceCache: this._maxInterstageInterfaceCache,
+        wgslSourceBytesRetained: this._wgslSourceBytesRetained,
+        wgslSourceBytesReleased: this._stats.wgslSourceBytesReleased,
+        wgslSourceEvictions: this._stats.wgslSourceEvictions,
+        wgslSourceLazyFetches: this._stats.wgslSourceLazyFetches,
+        wgslSourceEntriesRetained: this._wgslSourceLru.size,
+        maxRetainedWgslSourceBytes: this._maxRetainedWgslSourceBytes,
       };
     }
 
@@ -9325,6 +10020,7 @@
         priority
       );
       this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
+      this._maybeReleaseLinkedPipelineSources(effectiveDescriptor);
       return pipeline;
     }
 
@@ -9554,6 +10250,7 @@
             priority
           );
           this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
+          this._maybeReleaseLinkedPipelineSources(effectiveDescriptor);
           return Promise.resolve(pipeline);
         } catch (err) {
           return Promise.reject(err);
@@ -9600,6 +10297,7 @@
             effectivePriority
           );
           this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
+          this._maybeReleaseLinkedPipelineSources(effectiveDescriptor);
         }
         return pipeline;
       };
@@ -10428,6 +11126,7 @@
         }
         this._interstagePatchedModules.clear();
         this._interstageInterfaceCache.clear();
+        this.releaseAllShaderModuleSources();
         this._invalidateFastLookups();
         this._hasNonDefaultPriority = false;
         this._stats.evictions += removed;
@@ -10539,6 +11238,9 @@
       this._stats.interstageModuleCacheHits = 0;
       this._stats.interstageModuleCacheMisses = 0;
       this._stats.interstageModuleEvictions = 0;
+      this._stats.wgslSourceBytesReleased = 0;
+      this._stats.wgslSourceEvictions = 0;
+      this._stats.wgslSourceLazyFetches = 0;
       this._compileLatencyHead = 0;
       this._compileLatencyCount = 0;
       this._pipelineErrors.length = 0;
@@ -10570,6 +11272,7 @@
       this._bindGroupLayouts.clear();
       this._interstagePatchedModules.clear();
       this._interstageInterfaceCache.clear();
+      this.releaseAllShaderModuleSources();
       this._fallbackPipelineLayouts.clear();
       this._defaultSamplers.clear();
       this._inFlightRender.clear();
@@ -10794,6 +11497,36 @@
           enumerable: false,
           configurable: true,
         },
+        wgslSourceBytesRetained: {
+          value: this._wgslSourceBytesRetained,
+          enumerable: false,
+          configurable: true,
+        },
+        wgslSourceBytesReleased: {
+          value: this._stats.wgslSourceBytesReleased,
+          enumerable: false,
+          configurable: true,
+        },
+        wgslSourceEvictions: {
+          value: this._stats.wgslSourceEvictions,
+          enumerable: false,
+          configurable: true,
+        },
+        wgslSourceLazyFetches: {
+          value: this._stats.wgslSourceLazyFetches,
+          enumerable: false,
+          configurable: true,
+        },
+        wgslSourceEntriesRetained: {
+          value: this._wgslSourceLru.size,
+          enumerable: false,
+          configurable: true,
+        },
+        maxRetainedWgslSourceBytes: {
+          value: this._maxRetainedWgslSourceBytes,
+          enumerable: false,
+          configurable: true,
+        },
       });
       return stats;
     }
@@ -10815,6 +11548,7 @@
     DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
     DEFAULT_MAX_INTERSTAGE_MODULES,
     DEFAULT_MAX_INTERSTAGE_INTERFACE_CACHE,
+    DEFAULT_MAX_RETAINED_WGSL_SOURCE_BYTES,
     MAX_PIPELINE_ERROR_MESSAGE_LENGTH,
     DEFAULT_MAX_VERTEX_BUFFERS,
     DEFAULT_MAX_VERTEX_ATTRIBUTES,
@@ -10833,6 +11567,8 @@
     registerShaderModuleId,
     registerShaderModuleSource,
     getRegisteredShaderModuleSource,
+    releaseShaderModuleSource,
+    getRegisteredShaderModuleSummary,
     registerShaderModuleReflection,
     getRegisteredShaderModuleReflection,
     parseInterstageInterface,

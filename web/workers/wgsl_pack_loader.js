@@ -57,6 +57,9 @@ export const DEFAULT_MAX_FULL_FALLBACK_BYTES = 256 * 1024 * 1024;
 /** Default bounded in-memory LRU cache budget for on-demand WGSL strings in ranged mode (32 MiB). */
 export const DEFAULT_MAX_CACHED_WGSL_BYTES = 32 * 1024 * 1024;
 
+/** Default bounded LRU cap for compiled GPUShaderModule entries per GPUDevice (`0` / `null` = unlimited). */
+export const DEFAULT_MAX_COMPILED_MODULES = 4096;
+
 /** Default maximum concurrent HTTP 206 Range payload fetches per ranged pack (`0` = unlimited).
  * Kept at 3 so Chrome's 6 HTTP/1.1 connections/origin budget leaves >=3 slots free for io_worker.js .rpf streaming. */
 export const DEFAULT_MAX_CONCURRENT_RANGE_FETCHES = 3;
@@ -454,6 +457,31 @@ function validateMaxCacheEntries(value, defaultValue = null) {
     throw new RangeError(`maxCacheEntries must be a non-negative integer, got: ${value}`);
   }
   return value;
+}
+
+function validateMaxCompiledModules(value, defaultValue = DEFAULT_MAX_COMPILED_MODULES) {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  if (value === null || value === 0) {
+    return null;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`maxCompiledModules must be a non-negative integer or null, got: ${value}`);
+  }
+  return value;
+}
+
+function validateReleaseSourceAfterCompile(value, defaultValue = 'auto') {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (value === true || value === false || value === 'auto') {
+    return value;
+  }
+  throw new TypeError(
+    `releaseSourceAfterCompile must be true, false, or 'auto', got: ${JSON.stringify(value)}`
+  );
 }
 
 function validateInitialRangeBytes(value, defaultValue = DEFAULT_INITIAL_RANGE_BYTES) {
@@ -1606,6 +1634,7 @@ export class WgslPack {
     wgslCache = null,
     pinnedWgslCache = null,
     rangedDecodeCounter = null,
+    bufferTextState = null,
   }) {
     this.version = version;
     this.entryBytes = entryBytes ?? wgpkEntryBytes(version) ?? WGPK_ENTRY_BYTES;
@@ -1696,6 +1725,16 @@ export class WgslPack {
     this._coalescedGapBytes = 0;
     this._inFlightCoalesced = 0;
     this._rangedDecodeCounter = rangedDecodeCounter;
+    // Post-compile WGSL text eviction state & telemetry (#2162, #1077).
+    this._bufferTextState = bufferTextState || null;
+    this._wgslTextBytesReleased = 0;
+    this._wgslTextReleases = 0;
+    this._wgslTextLazyRedecodes = 0;
+    if (this._bufferTextState) {
+      this._bufferTextState.onMutate = () => {
+        this._statsVersion += 1;
+      };
+    }
     // W363: Monotonic mutation version + cached stats snapshot for O(1) steady-state stats().
     this._statsVersion = 0;
     this._cachedStats = null;
@@ -1910,6 +1949,155 @@ export class WgslPack {
     }
     const key = normalizeHash(hash);
     return this.entries.get(key);
+  }
+
+  /**
+   * Alias for `getByHash(hash)`.
+   *
+   * @param {bigint | string | number} hash
+   */
+  getEntry(hash) {
+    return this.getByHash(hash);
+  }
+
+  /**
+   * Check whether a decoded JS WGSL string is currently retained in heap memory for `hash`
+   * without triggering lazy UTF-8 decoding or HTTP Range fetches.
+   *
+   * @param {bigint | string | number} hash
+   * @returns {boolean}
+   */
+  hasCachedWgslText(hash) {
+    const key = this._resolveHashKey(hash);
+    if (this._dynamicEntries.has(key)) {
+      return true;
+    }
+    if (this.mode === 'ranged') {
+      return this._pinnedWgslCache.has(key) || this._wgslCache.has(key);
+    }
+    if (this._bufferTextState) {
+      return this._bufferTextState.isCached(key);
+    }
+    return false;
+  }
+
+  /**
+   * Release the decoded JS WGSL string for `hash` from heap memory while preserving its
+   * compact binary index (`{ hash, stage, offset, length }`) so subsequent `getWgsl(hash)`
+   * or `getWgslAsync(hash)` calls transparently lazily re-decode on demand (#2162).
+   *
+   * In `ranged` mode, pinned hashes stay resident unless `{ includePinned: true }`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {{ includePinned?: boolean }} [options]
+   * @returns {boolean} True if a cached decoded WGSL string was released
+   */
+  releaseWgslText(hash, options = {}) {
+    const key = this._resolveHashKey(hash);
+    if (this.mode !== 'ranged') {
+      if (!this._bufferTextState) {
+        return false;
+      }
+      const releasedBytes = this._bufferTextState.release(key);
+      if (releasedBytes < 0) {
+        return false;
+      }
+      this._statsVersion += 1;
+      return true;
+    }
+
+    const includePinned = Boolean(options && options.includePinned);
+    let releasedBytes = -1;
+    const cached = this._wgslCache.get(key);
+    if (cached !== undefined) {
+      this._wgslCache.delete(key);
+      this._evictableWgslBytes -= cached.byteLength;
+      this._cachedWgslBytes = this._pinnedWgslBytes + this._evictableWgslBytes;
+      if (this._mruKey === key) {
+        this._mruKey = undefined;
+      }
+      releasedBytes = cached.byteLength;
+    } else if (includePinned) {
+      const pinned = this._pinnedWgslCache.get(key);
+      if (pinned !== undefined) {
+        this._pinnedWgslCache.delete(key);
+        this._pinnedWgslBytes -= pinned.byteLength;
+        this._cachedWgslBytes = this._pinnedWgslBytes + this._evictableWgslBytes;
+        releasedBytes = pinned.byteLength;
+      }
+    }
+
+    if (releasedBytes < 0) {
+      return false;
+    }
+
+    const staticEntry = this.entries.get(key);
+    if (staticEntry) {
+      staticEntry._wasTextReleased = true;
+    }
+    this._wgslTextBytesReleased += releasedBytes;
+    this._wgslTextReleases += 1;
+    this._statsVersion += 1;
+    return true;
+  }
+
+  /**
+   * Release all decoded JS WGSL strings currently retained in this pack while keeping
+   * the compact binary index intact for transparent lazy re-decode (#2162).
+   *
+   * @param {{ includePinned?: boolean }} [options]
+   * @returns {{ releasedCount: number, bytesReleased: number }}
+   */
+  releaseAllWgslText(options = {}) {
+    if (this.mode !== 'ranged') {
+      if (!this._bufferTextState) {
+        return { releasedCount: 0, bytesReleased: 0 };
+      }
+      const res = this._bufferTextState.releaseAll();
+      if (res.releasedCount > 0) {
+        this._statsVersion += 1;
+      }
+      return res;
+    }
+
+    const includePinned = Boolean(options && options.includePinned);
+    let releasedCount = 0;
+    let bytesReleased = 0;
+
+    if (this._wgslCache.size > 0) {
+      for (const [key, entry] of this._wgslCache.entries()) {
+        releasedCount += 1;
+        bytesReleased += entry.byteLength;
+        const staticEntry = this.entries.get(key);
+        if (staticEntry) {
+          staticEntry._wasTextReleased = true;
+        }
+      }
+      this._wgslCache.clear();
+      this._evictableWgslBytes = 0;
+      this._mruKey = undefined;
+    }
+
+    if (includePinned && this._pinnedWgslCache.size > 0) {
+      for (const [key, entry] of this._pinnedWgslCache.entries()) {
+        releasedCount += 1;
+        bytesReleased += entry.byteLength;
+        const staticEntry = this.entries.get(key);
+        if (staticEntry) {
+          staticEntry._wasTextReleased = true;
+        }
+      }
+      this._pinnedWgslCache.clear();
+      this._pinnedWgslBytes = 0;
+    }
+
+    this._cachedWgslBytes = this._pinnedWgslBytes + this._evictableWgslBytes;
+    if (releasedCount > 0) {
+      this._wgslTextBytesReleased += bytesReleased;
+      this._wgslTextReleases += releasedCount;
+      this._statsVersion += 1;
+    }
+    return { releasedCount, bytesReleased };
   }
 
   /**
@@ -2725,6 +2913,10 @@ export class WgslPack {
                   if (this._rangedDecodeCounter) {
                     this._rangedDecodeCounter.count += 1;
                   }
+                  if (currentEntry._wasTextReleased) {
+                    currentEntry._wasTextReleased = false;
+                    this._wgslTextLazyRedecodes += 1;
+                  }
                   this._putWgslCache(key, wgsl, currentLength);
                   return wgsl;
                 }
@@ -3099,6 +3291,10 @@ export class WgslPack {
                 if (this._rangedDecodeCounter) {
                   this._rangedDecodeCounter.count += 1;
                 }
+                if (rItem.entry._wasTextReleased) {
+                  rItem.entry._wasTextReleased = false;
+                  this._wgslTextLazyRedecodes += 1;
+                }
                 this._putWgslCache(rItem.key, wgsl, rItem.length);
                 prefetched += 1;
                 this._prefetchShaders += 1;
@@ -3256,6 +3452,10 @@ export class WgslPack {
               const { item } = deferreds[i];
               if (this._rangedDecodeCounter) {
                 this._rangedDecodeCounter.count += 1;
+              }
+              if (item.entry._wasTextReleased) {
+                item.entry._wasTextReleased = false;
+                this._wgslTextLazyRedecodes += 1;
               }
               this._putWgslCache(item.key, res.wgsl, item.length);
               prefetched += 1;
@@ -3448,6 +3648,46 @@ export class WgslPack {
     const coalescedGapBytes = sanitizeNonNegativeInt(this._coalescedGapBytes, 0);
     const inFlightCoalesced = sanitizeNonNegativeInt(this._inFlightCoalesced, 0);
     const inFlightCount = sanitizeNonNegativeInt(this._inFlightFetches.size, 0);
+    const wgslTextBytesRetained = sanitizeNonNegativeInt(
+      this.mode === 'ranged'
+        ? cachedWgslBytes
+        : this._bufferTextState
+          ? this._bufferTextState.retainedBytes
+          : 0,
+      0
+    );
+    const wgslTextEntriesRetained = sanitizeNonNegativeInt(
+      this.mode === 'ranged'
+        ? cachedWgslEntries
+        : this._bufferTextState
+          ? this._bufferTextState.retainedEntries
+          : 0,
+      0
+    );
+    const wgslTextBytesReleased = sanitizeNonNegativeInt(
+      this.mode === 'ranged'
+        ? this._wgslTextBytesReleased
+        : this._bufferTextState
+          ? this._bufferTextState.bytesReleased
+          : 0,
+      0
+    );
+    const wgslTextReleases = sanitizeNonNegativeInt(
+      this.mode === 'ranged'
+        ? this._wgslTextReleases
+        : this._bufferTextState
+          ? this._bufferTextState.releases
+          : 0,
+      0
+    );
+    const wgslTextLazyRedecodes = sanitizeNonNegativeInt(
+      this.mode === 'ranged'
+        ? this._wgslTextLazyRedecodes
+        : this._bufferTextState
+          ? this._bufferTextState.lazyRedecodes
+          : 0,
+      0
+    );
 
     const computed = {
       version: this.version,
@@ -3464,6 +3704,11 @@ export class WgslPack {
       payloadBytes: this.payloadBytes,
       decodedCount,
       lazyDecode: this.lazyDecode,
+      wgslTextBytesRetained,
+      wgslTextEntriesRetained,
+      wgslTextBytesReleased,
+      wgslTextReleases,
+      wgslTextLazyRedecodes,
       stageCounts: { ...this._stageCounts },
       dynamicCount: this._dynamicEntries.size,
       dynamicOverrideCount,
@@ -3553,45 +3798,97 @@ export function parseWgslPack(buffer, options = {}) {
   const byHex = new Map();
   let decodedCount = 0;
 
+  // Compact buffer-mode decoded text tracker: retains zero-copy Uint8Array slices per entry
+  // so decoded JS UTF-16 WGSL strings can be released post-compile and lazily re-decoded on demand (#2162).
+  const releasers = new Map();
+  const cachedCheckers = new Map();
+  const bufferTextState = {
+    retainedBytes: 0,
+    retainedEntries: 0,
+    bytesReleased: 0,
+    releases: 0,
+    lazyRedecodes: 0,
+    onMutate: null,
+    isCached(hashKey) {
+      const check = cachedCheckers.get(hashKey);
+      return check ? check() : false;
+    },
+    release(hashKey) {
+      const fn = releasers.get(hashKey);
+      return fn ? fn() : -1;
+    },
+    releaseAll() {
+      let releasedCount = 0;
+      let bytesReleased = 0;
+      for (const fn of releasers.values()) {
+        const bytesFreed = fn();
+        if (bytesFreed >= 0) {
+          releasedCount += 1;
+          bytesReleased += bytesFreed;
+        }
+      }
+      return { releasedCount, bytesReleased };
+    },
+  };
+
   for (let idx = 0; idx < rawEntries.length; idx += 1) {
     const raw = rawEntries[idx];
     const slice = bytes.subarray(raw.offset, raw.end);
+    const entryByteLength = raw.length;
 
-    let entry;
-    if (lazyDecode) {
-      let cachedWgsl = null;
-      entry = {
-        hash: raw.hash,
-        hashHex: raw.hashHex,
-        stage: raw.stage,
-        stageCode: raw.stageCode,
-        offset: raw.offset,
-        length: raw.length,
-      };
-      Object.defineProperty(entry, 'wgsl', {
-        enumerable: true,
-        configurable: true,
-        get() {
-          if (cachedWgsl === null) {
-            cachedWgsl = decodeUtf8Strict(slice, idx);
-            decodedCount += 1;
-          }
-          return cachedWgsl;
-        },
-      });
-    } else {
-      const wgsl = decodeUtf8Strict(slice, idx);
+    let cachedWgsl = lazyDecode ? null : decodeUtf8Strict(slice, idx);
+    let hasDecoded = !lazyDecode;
+    let wasReleased = false;
+    if (!lazyDecode) {
       decodedCount += 1;
-      entry = {
-        hash: raw.hash,
-        hashHex: raw.hashHex,
-        stage: raw.stage,
-        stageCode: raw.stageCode,
-        offset: raw.offset,
-        length: raw.length,
-        wgsl,
-      };
+      bufferTextState.retainedBytes += entryByteLength;
+      bufferTextState.retainedEntries += 1;
     }
+
+    const entry = {
+      hash: raw.hash,
+      hashHex: raw.hashHex,
+      stage: raw.stage,
+      stageCode: raw.stageCode,
+      offset: raw.offset,
+      length: entryByteLength,
+    };
+    Object.defineProperty(entry, 'wgsl', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        if (cachedWgsl === null) {
+          cachedWgsl = decodeUtf8Strict(slice, idx);
+          bufferTextState.retainedBytes += entryByteLength;
+          bufferTextState.retainedEntries += 1;
+          if (!hasDecoded) {
+            hasDecoded = true;
+            decodedCount += 1;
+          } else if (wasReleased) {
+            wasReleased = false;
+            bufferTextState.lazyRedecodes += 1;
+          }
+          if (typeof bufferTextState.onMutate === 'function') {
+            bufferTextState.onMutate();
+          }
+        }
+        return cachedWgsl;
+      },
+    });
+
+    cachedCheckers.set(raw.hash, () => cachedWgsl !== null);
+    releasers.set(raw.hash, () => {
+      if (cachedWgsl === null) {
+        return -1;
+      }
+      cachedWgsl = null;
+      wasReleased = true;
+      bufferTextState.retainedBytes = Math.max(0, bufferTextState.retainedBytes - entryByteLength);
+      bufferTextState.retainedEntries = Math.max(0, bufferTextState.retainedEntries - 1);
+      bufferTextState.bytesReleased += entryByteLength;
+      bufferTextState.releases += 1;
+      return entryByteLength;
+    });
 
     entryList[idx] = entry;
     byHash.set(raw.hash, entry);
@@ -3612,6 +3909,7 @@ export function parseWgslPack(buffer, options = {}) {
     stageCounts,
     getDecodedCount: () => decodedCount,
     mode: 'buffer',
+    bufferTextState,
   });
 }
 
@@ -4234,6 +4532,16 @@ export class WgslPackCache {
     this._sleepFn = validateSleepFn(options.sleepFn);
     this._prefetchMaxGapBytes = resolvePrefetchMaxGapBytes(options);
     this._prefetchMaxSpanBytes = resolvePrefetchMaxSpanBytes(options);
+    this._releaseSourceAfterCompile = validateReleaseSourceAfterCompile(
+      options.releaseSourceAfterCompile,
+      'auto'
+    );
+    this._maxCompiledModules = validateMaxCompiledModules(
+      options.maxCompiledModules !== undefined
+        ? options.maxCompiledModules
+        : options.maxCachedModules,
+      DEFAULT_MAX_COMPILED_MODULES
+    );
 
     this._packs = new Map();
     this._shaderEntries = new Map();
@@ -4250,6 +4558,7 @@ export class WgslPackCache {
       misses: 0,
       compiles: 0,
       evictions: 0,
+      moduleLruEvictions: 0,
       dynamicHits: 0,
     };
     // W363: Monotonic mutation versions + cached stats / entry-stage counts for O(1) steady-state getStats().
@@ -4740,6 +5049,80 @@ export class WgslPackCache {
   }
 
   /**
+   * Alias for `lookup(hash, stage)`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   */
+  getEntry(hash, stage) {
+    return this.lookup(hash, stage);
+  }
+
+  /**
+   * Check whether a decoded JS WGSL string is currently retained in heap memory for `hash`
+   * without triggering lazy UTF-8 decoding or HTTP Range fetches.
+   *
+   * @param {bigint | string | number} hash
+   * @returns {boolean}
+   */
+  hasCachedWgslText(hash) {
+    const key = normalizeHash(hash);
+    if (this._dynamicEntries.has(key)) {
+      return true;
+    }
+    const record = this._shaderEntries.get(key);
+    if (!record || !record.pack || typeof record.pack.hasCachedWgslText !== 'function') {
+      return false;
+    }
+    return record.pack.hasCachedWgslText(key);
+  }
+
+  /**
+   * Release the cached decoded JS WGSL string for `hash` from its backing pack while preserving
+   * compact binary index metadata so `getWgsl(hash)` / `getWgslAsync(hash)` can lazily re-decode
+   * on demand (#2162).
+   *
+   * @param {bigint | string | number} hash
+   * @param {{ includePinned?: boolean }} [options]
+   * @returns {boolean}
+   */
+  releaseWgslText(hash, options = {}) {
+    const key = normalizeHash(hash);
+    const record = this._shaderEntries.get(key);
+    if (!record || !record.pack || typeof record.pack.releaseWgslText !== 'function') {
+      return false;
+    }
+    const released = record.pack.releaseWgslText(key, options);
+    if (released) {
+      this._statsVersion += 1;
+    }
+    return released;
+  }
+
+  /**
+   * Release all cached decoded JS WGSL strings across all loaded packs while preserving compact
+   * binary index metadata and compiled `GPUShaderModule` caches (#2162).
+   *
+   * @param {{ includePinned?: boolean }} [options]
+   * @returns {{ releasedCount: number, bytesReleased: number }}
+   */
+  releaseAllWgslText(options = {}) {
+    let releasedCount = 0;
+    let bytesReleased = 0;
+    for (const pack of this._packs.values()) {
+      if (typeof pack.releaseAllWgslText === 'function') {
+        const res = pack.releaseAllWgslText(options);
+        releasedCount += res.releasedCount;
+        bytesReleased += res.bytesReleased;
+      }
+    }
+    if (releasedCount > 0) {
+      this._statsVersion += 1;
+    }
+    return { releasedCount, bytesReleased };
+  }
+
+  /**
    * Return whether any dynamic override or loaded static pack contains the given shader hash
    * (optionally matching `stage`).
    *
@@ -5138,6 +5521,35 @@ export class WgslPackCache {
     return map ? map.has(hashBigInt) : false;
   }
 
+  _setCachedDeviceModule(deviceMap, key, shaderModule) {
+    if (deviceMap.has(key)) {
+      deviceMap.delete(key);
+    }
+    deviceMap.set(key, shaderModule);
+    const cap = this._maxCompiledModules;
+    if (cap !== null && cap > 0) {
+      while (deviceMap.size > cap) {
+        const oldestKey = deviceMap.keys().next().value;
+        deviceMap.delete(oldestKey);
+        this._stats.evictions += 1;
+        this._stats.moduleLruEvictions += 1;
+      }
+    }
+  }
+
+  _shouldReleaseSourceAfterCompile(pack) {
+    if (!pack || typeof pack.releaseWgslText !== 'function') {
+      return false;
+    }
+    if (this._releaseSourceAfterCompile === true) {
+      return true;
+    }
+    if (this._releaseSourceAfterCompile === 'auto') {
+      return pack.mode === 'buffer';
+    }
+    return false;
+  }
+
   /**
    * Return a cached `GPUShaderModule` for `(device, hash)` or compile and cache it.
    * Resolves dynamic shader overrides ahead of static pack entries.
@@ -5156,6 +5568,10 @@ export class WgslPackCache {
     const deviceMap = this._getDeviceMap(device, true);
     const cached = deviceMap.get(key);
     if (cached !== undefined) {
+      if (deviceMap.size > 1) {
+        deviceMap.delete(key);
+        deviceMap.set(key, cached);
+      }
       this._stats.hits += 1;
       if (this._dynamicEntries.has(key)) {
         this._stats.dynamicHits += 1;
@@ -5168,6 +5584,7 @@ export class WgslPackCache {
     this._statsVersion += 1;
     const dynamicEntry = this._dynamicEntries.get(key);
     let entry;
+    let staticPack = null;
     if (dynamicEntry) {
       this._stats.dynamicHits += 1;
       entry = dynamicEntry;
@@ -5177,6 +5594,7 @@ export class WgslPackCache {
         throw new Error(`Shader ${formatHashHex(key)} not found in any loaded WGSL pack`);
       }
       entry = record.entry;
+      staticPack = record.pack;
     }
 
     const prefix = labelPrefix !== undefined ? String(labelPrefix) : this._labelPrefix;
@@ -5191,10 +5609,25 @@ export class WgslPackCache {
       code: applyRtBvhPrelude(entry.wgsl),
     });
 
-    deviceMap.set(key, shaderModule);
+    this._setCachedDeviceModule(deviceMap, key, shaderModule);
     this._stats.compiles += 1;
+    if (staticPack && this._shouldReleaseSourceAfterCompile(staticPack)) {
+      staticPack.releaseWgslText(key);
+    }
     this._statsVersion += 1;
     return shaderModule;
+  }
+
+  /**
+   * Alias for `getOrCreateShaderModule(device, hash, labelPrefix)`.
+   *
+   * @param {GPUDevice} device
+   * @param {bigint | string | number} hash
+   * @param {string} [labelPrefix]
+   * @returns {GPUShaderModule}
+   */
+  compileShaderModule(device, hash, labelPrefix) {
+    return this.getOrCreateShaderModule(device, hash, labelPrefix);
   }
 
   /**
@@ -5214,6 +5647,10 @@ export class WgslPackCache {
     const deviceMap = this._getDeviceMap(device, true);
     const cached = deviceMap.get(key);
     if (cached !== undefined) {
+      if (deviceMap.size > 1) {
+        deviceMap.delete(key);
+        deviceMap.set(key, cached);
+      }
       this._stats.hits += 1;
       if (this._dynamicEntries.has(key)) {
         this._stats.dynamicHits += 1;
@@ -5248,6 +5685,10 @@ export class WgslPackCache {
     // Re-check device cache in case a concurrent caller compiled while we awaited.
     const cachedAfterFetch = deviceMap.get(key);
     if (cachedAfterFetch !== undefined) {
+      if (deviceMap.size > 1) {
+        deviceMap.delete(key);
+        deviceMap.set(key, cachedAfterFetch);
+      }
       this._stats.hits += 1;
       this._statsVersion += 1;
       return cachedAfterFetch;
@@ -5266,8 +5707,11 @@ export class WgslPackCache {
       code: applyRtBvhPrelude(code),
     });
 
-    deviceMap.set(key, shaderModule);
+    this._setCachedDeviceModule(deviceMap, key, shaderModule);
     this._stats.compiles += 1;
+    if (latestRecord.pack && this._shouldReleaseSourceAfterCompile(latestRecord.pack)) {
+      latestRecord.pack.releaseWgslText(key);
+    }
     this._statsVersion += 1;
     return shaderModule;
   }
@@ -5432,6 +5876,7 @@ export class WgslPackCache {
       this._stats.misses = 0;
       this._stats.compiles = 0;
       this._stats.evictions = 0;
+      this._stats.moduleLruEvictions = 0;
       this._stats.dynamicHits = 0;
     }
     this._entriesVersion += 1;
@@ -5685,6 +6130,11 @@ export class WgslPackCache {
     let coalescedGapBytes = 0;
     let inFlightDeduplications = 0;
     let inFlightCount = 0;
+    let wgslTextBytesRetained = 0;
+    let wgslTextEntriesRetained = 0;
+    let wgslTextBytesReleased = 0;
+    let wgslTextReleases = 0;
+    let wgslTextLazyRedecodes = 0;
     let hasBufferPack = false;
     let hasRangedPack = false;
     let pinnedUnion = null;
@@ -5730,6 +6180,11 @@ export class WgslPackCache {
       coalescedGapBytes += sanitizeNonNegativeInt(s.coalescedGapBytes, 0);
       inFlightDeduplications += sanitizeNonNegativeInt(s.inFlightCoalesced, 0);
       inFlightCount += sanitizeNonNegativeInt(s.inFlightCount, 0);
+      wgslTextBytesRetained += sanitizeNonNegativeInt(s.wgslTextBytesRetained, 0);
+      wgslTextEntriesRetained += sanitizeNonNegativeInt(s.wgslTextEntriesRetained, 0);
+      wgslTextBytesReleased += sanitizeNonNegativeInt(s.wgslTextBytesReleased, 0);
+      wgslTextReleases += sanitizeNonNegativeInt(s.wgslTextReleases, 0);
+      wgslTextLazyRedecodes += sanitizeNonNegativeInt(s.wgslTextLazyRedecodes, 0);
       if (pack._pinnedHashes && pack._pinnedHashes.size > 0) {
         if (pinnedUnion === null) {
           pinnedUnion = new Set(this._pinnedHashes);
@@ -5814,6 +6269,14 @@ export class WgslPackCache {
       misses: this._stats.misses,
       compiles: this._stats.compiles,
       evictions: this._stats.evictions,
+      moduleLruEvictions: this._stats.moduleLruEvictions,
+      maxCompiledModules: this._maxCompiledModules,
+      releaseSourceAfterCompile: this._releaseSourceAfterCompile,
+      wgslTextBytesRetained,
+      wgslTextEntriesRetained,
+      wgslTextBytesReleased,
+      wgslTextReleases,
+      wgslTextLazyRedecodes,
       dynamicHits: this._stats.dynamicHits,
       hitRate: totalLookups > 0 ? this._stats.hits / totalLookups : 0,
       rangeFetches,
