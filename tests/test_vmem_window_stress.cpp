@@ -343,15 +343,17 @@ void phase_mirrored_2m(uint64_t seed) {
                 ++g_reads_null;
                 return;
             }
-            // A map is not atomic for the guest either: the page is committed (zero) before its
-            // bytes are copied in, so a racing read may see zeros, the old page or the new one,
-            // byte by byte. Never a fault, never anything else.
-            bool known = true;
-            for (size_t i = 0; i < k64K && known; i += 7) {
-                const uint8_t b = view.data()[i];
-                known = b == 0 || b == stamp[0] || b == stamp[1];
+            // A remap commits the slot (zero) and copies the new page's bytes in before it shows
+            // the slot again, and the view re-checks the slot under the arena lock, so a view
+            // shows one whole page: every byte is the stamp of the page mapped there, never zero
+            // and never a mix of the two pages.
+            const uint8_t first = view.data()[0];
+            bool exact = first == stamp[0] || first == stamp[1];
+            for (size_t i = 0; i < k64K && exact; i += 7) {
+                exact = view.data()[i] == first;
             }
-            CHECK(known);
+            exact = exact && view.data()[k64K - 1] == first;
+            CHECK(exact);
             ++g_reads_ok;
         },
         seed);

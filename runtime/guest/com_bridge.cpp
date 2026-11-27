@@ -469,11 +469,20 @@ GuestRangeView::GuestRangeView(uint64_t va, size_t len) {
             // fault the host, so hold the arena lock over the view like the flat path below does
             // (the pages are re-checked under it; a decommitted range reads as not mapped).
             // Runtime-owned window ranges live outside the arena and need no lock.
+            // The window translation is re-checked under the lock too: an XMem remap unmaps the
+            // window slot before it decommits, then commits (zero) and copies the new page's bytes
+            // in before it maps the slot again, so a translation read before the lock may name
+            // memory that is committed again but not filled yet. Under the lock the slot either
+            // still shows these bytes (the decommit waits for the lock) or the view is not mapped.
             os::VirtualMemoryArena& arena = guest_memory();
             const uint64_t arena_va = arena.guest_address(data_);
             if (arena_va >= arena.space_base() && arena_va - arena.space_base() < arena.space_size()) {
-                if (arena.host_ptr_const_held(arena_va, len == 0 ? 1 : len, hold_) != data_) {
+                if (arena.host_ptr_const_held(arena_va, len == 0 ? 1 : len, hold_) != data_ ||
+                    os::guest_window::contiguous(va, len == 0 ? 1 : len) != data_) {
                     data_ = nullptr;
+                    if (hold_.owns_lock()) {
+                        hold_.unlock();
+                    }
                 }
             }
         }
