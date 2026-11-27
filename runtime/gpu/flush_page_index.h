@@ -10,6 +10,9 @@
 // query checks the exact range against the pages, so overlapping and page-straddling ranges and
 // ranges sharing a granule are all handled. add() with a new range for a known key re-keys it (a
 // remap or a resize); remove() drops it. Not thread-safe: the owner locks.
+// A write landing after the flush's take is uploaded at the next submission, as on the old path
+// (writes after a buffer's own take went next time too); nothing is lost. --flush-crosscheck counts
+// these as gpu_work.flush_crosscheck_late (only flush_crosscheck_misses would be a bug).
 #pragma once
 
 #include <cstddef>
