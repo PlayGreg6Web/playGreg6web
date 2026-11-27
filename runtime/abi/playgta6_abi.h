@@ -87,6 +87,13 @@ inline constexpr GpuOpcode kGpuOpcodeClearTexture = static_cast<GpuOpcode>(63);
 // copyTextureToTexture, for the D3D12 CopyTextureRegion / CopyResource cases the render-blit and
 // compute-storage routes cannot serve (a destination that is neither a render target nor a UAV).
 inline constexpr GpuOpcode kGpuOpcodeCopyTexture = static_cast<GpuOpcode>(62);
+//
+// Guest query heaps (D3D12 BeginQuery / EndQuery / ResolveQueryData) on WebGPU query sets: create a
+// heap's query storage (GpuCreateQuerySetPayload), begin / end one query in stream order
+// (GpuQueryPayload), and write resolved results into a buffer (GpuResolveQueryPayload).
+inline constexpr GpuOpcode kGpuOpcodeCreateQuerySet = static_cast<GpuOpcode>(61);
+inline constexpr GpuOpcode kGpuOpcodeQuery = static_cast<GpuOpcode>(60);
+inline constexpr GpuOpcode kGpuOpcodeResolveQuery = static_cast<GpuOpcode>(59);
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
 namespace GpuBufferUsage {
@@ -979,6 +986,45 @@ struct GpuCopyTexturePayload {
     uint32_t reserved;
 };
 static_assert(sizeof(GpuCopyTexturePayload) == 56, "GpuCopyTexturePayload layout must stay 56 bytes");
+
+// CreateQuerySet (kGpuOpcodeCreateQuerySet, 61): `count` queries of `kind` under resource id `id`
+// (DestroyResource releases them). Occlusion results start at zero.
+namespace GpuQuerySetKind {
+inline constexpr uint32_t Occlusion = 0u;  // D3D12_QUERY_HEAP_TYPE_OCCLUSION: OCCLUSION and BINARY_OCCLUSION
+inline constexpr uint32_t Timestamp = 1u;  // D3D12_QUERY_HEAP_TYPE_TIMESTAMP (nanoseconds)
+}  // namespace GpuQuerySetKind
+struct GpuCreateQuerySetPayload {
+    uint32_t id;
+    uint32_t kind;
+    uint32_t count;
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuCreateQuerySetPayload) == 16, "GpuCreateQuerySetPayload layout must stay 16 bytes");
+
+// Query (kGpuOpcodeQuery, 60): `op` 0 begins, 1 ends query `index` of set `set_id`; `type` is the
+// D3D12_QUERY_TYPE (0 OCCLUSION, 1 BINARY_OCCLUSION, 2 TIMESTAMP; a timestamp only ends). An occlusion
+// query counts the samples of the draws between its begin and end (BINARY_OCCLUSION: 0 or 1).
+struct GpuQueryPayload {
+    uint32_t set_id;
+    uint32_t index;
+    uint32_t op;
+    uint32_t type;
+};
+static_assert(sizeof(GpuQueryPayload) == 16, "GpuQueryPayload layout must stay 16 bytes");
+
+// ResolveQuery (kGpuOpcodeResolveQuery, 59): the results of queries `first` .. `first + count - 1` of
+// `set_id` as 64-bit values (D3D12 layout) into buffer `buffer_id` at `dst_offset` (a multiple of 8).
+// Runs in stream order with the frame's passes (any open pass ends first).
+struct GpuResolveQueryPayload {
+    uint32_t set_id;
+    uint32_t type;
+    uint32_t first;
+    uint32_t count;
+    uint32_t buffer_id;
+    uint32_t reserved;
+    uint64_t dst_offset;
+};
+static_assert(sizeof(GpuResolveQueryPayload) == 32, "GpuResolveQueryPayload layout must stay 32 bytes");
 
 }  // namespace playgta6
 

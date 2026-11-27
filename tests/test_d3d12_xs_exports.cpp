@@ -4366,6 +4366,69 @@ void test_xbox_native_pipelines() {
     scene.release_all({list, derived, pso, pso_moved, pso_depth});
 }
 
+// gpu_queries(): an occlusion heap gets a consumer query set (a statistics heap none), BeginQuery /
+// EndQuery / ResolveQueryData become packets in the list's stream, and a resolve into a readback
+// buffer is followed by the read-back of the resolved range into its memory.
+void test_query_packets() {
+    playgta6::gpu::set_gpu_queries(true);
+    {
+        Fixture fx;
+        Scene scene(fx);
+        size_t mark = fx.captured.size();
+        const uint64_t heap = fx.create(scene.device, Slot::CreateQueryHeap, {I(put(dg::GuestQueryHeapDesc{0, 4, 0}))},
+                                        dg::IID_ID3D12QueryHeap);
+        const uint64_t stats_heap = fx.create(scene.device, Slot::CreateQueryHeap,
+                                              {I(put(dg::GuestQueryHeapDesc{2, 4, 0}))}, dg::IID_ID3D12QueryHeap);
+        uint32_t set = 0;
+        size_t creates = 0;
+        for (const Packet& p : packets_since(fx, mark)) {
+            if (p.opcode != kGpuOpcodeCreateQuerySet) continue;
+            const auto c = payload_as<GpuCreateQuerySetPayload>(p);
+            CHECK(c.kind == GpuQuerySetKind::Occlusion && c.count == 4);
+            set = c.id;
+            ++creates;
+        }
+        CHECK(creates == 1 && set != 0);
+        const uint64_t readback = committed(fx, scene.device, 3, buffer_desc(64), 0x400);
+        const uint64_t list = scene.new_list();
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, XSlot::BeginQuery, {I(heap), I(1), I(2)});
+        fx.vcall(list, XSlot::BeginQuery + 1, {I(heap), I(1), I(2)});
+        fx.vcall(list, XSlot::BeginQuery, {I(stats_heap), I(3), I(0)});  // pipeline statistics: no packet
+        fx.vcall(list, XSlot::BeginQuery + 2, {I(heap), I(1), I(2), I(2), I(readback), I(16)});
+        fx.vcall(list, XSlot::BeginQuery + 2, {I(heap), I(1), I(3), I(2), I(readback), I(16)});  // past the heap
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        mark = fx.captured.size();
+        scene.execute({list});
+        std::vector<uint32_t> ops;
+        for (const Packet& p : packets_since(fx, mark)) {
+            if (p.opcode == kGpuOpcodeQuery) {
+                const auto q = payload_as<GpuQueryPayload>(p);
+                CHECK(q.set_id == set && q.index == 2 && q.type == 1);
+                ops.push_back(q.op);
+            } else if (p.opcode == kGpuOpcodeResolveQuery) {
+                const auto r = payload_as<GpuResolveQueryPayload>(p);
+                CHECK(r.set_id == set && r.first == 2 && r.count == 2 && r.dst_offset == 16 &&
+                      r.buffer_id == object_of<dg::Resource>(readback)->id());
+                ops.push_back(2);
+            } else if (p.opcode == GpuOpcode::ReadbackBuffer) {
+                const auto rb = payload_as<GpuReadbackBufferPayload>(p);
+                CHECK(rb.src_offset == 16 && rb.size == 16);
+                ops.push_back(3);
+            }
+        }
+        CHECK((ops == std::vector<uint32_t>{0, 1, 2, 3}));
+        mark = fx.captured.size();
+        fx.vcall(heap, Slot::Release);  // the list still holds it: its query set goes with the list
+        scene.release_all({list, readback, stats_heap});
+        bool destroyed = false;
+        for (const Packet& p : packets_since(fx, mark))
+            destroyed = destroyed || (p.opcode == GpuOpcode::DestroyResource && payload_as<uint32_t>(p) == set);
+        CHECK(destroyed);
+    }
+    playgta6::gpu::set_gpu_queries(false);
+}
+
 void test_xbox_device_queue_and_list_slots() {
     Fixture fx;
     Scene scene(fx);
@@ -10031,6 +10094,7 @@ int main() {
     test_tables_from_descriptor_memory();
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
+    test_query_packets();
     test_xmem_window_alias_wiring();
     test_xbox_compute_pipeline_dump_and_pack_resolve();
     test_slot70_71_address_texture_view_registry();

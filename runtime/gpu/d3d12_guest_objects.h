@@ -1600,11 +1600,18 @@ private:
 class QueryHeap final : public ChildBase<IQueryHeapHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12QueryHeap";
-    QueryHeap(com::Ref<Device> device, const GuestQueryHeapDesc& desc) : ChildBase(std::move(device)), desc_(desc) {}
+    QueryHeap(com::Ref<Device> device, const GuestQueryHeapDesc& desc);
+    ~QueryHeap() override;
     const GuestQueryHeapDesc& desc() const { return desc_; }
+    // The consumer's query set (kGpuOpcodeCreateQuerySet); 0: none (no consumer support or an
+    // unsupported heap type), the heap's queries are then counted and never written.
+    uint32_t query_set_id() const { return query_set_id_; }
+    uint32_t query_set_kind() const { return query_set_kind_; }
 
 private:
     GuestQueryHeapDesc desc_;
+    uint32_t query_set_id_ = 0;
+    uint32_t query_set_kind_ = 0;
 };
 
 class CommandSignature final : public ChildBase<ICommandSignatureHost> {
@@ -1848,9 +1855,9 @@ enum class Work : size_t {
     FlushIndexedNs,
     FlushBufferNs,   // indexed flush time spent on buffers (take included) / on uniform ranges
     FlushUniformNs,
-    // Query heaps (BeginQuery / EndQuery / ResolveQueryData) have no host backend: calls are counted by
-    // D3D12_QUERY_TYPE group and every resolved result is left unwritten (never faked), so a title
-    // reading a resolved buffer sees whatever the buffer held before.
+    // Query heaps (BeginQuery / EndQuery / ResolveQueryData): calls are counted by D3D12_QUERY_TYPE group.
+    // Occlusion and timestamp heaps run on the consumer's query sets (gpu_queries()); every other result
+    // is left unwritten (never faked), so a title reading it sees whatever the buffer held before.
     QueryBegins,
     QueryEnds,
     QueryResolves,
@@ -1858,6 +1865,8 @@ enum class Work : size_t {
     QueryTimestampOps,  // TIMESTAMP (2)
     QueryOtherOps,      // pipeline statistics, stream output, anything else
     QueryResultsUnwritten,  // query results a resolve was asked for and could not write
+    QueryPackets,           // begin / end / resolve packets for the consumer's query sets
+    QueryResultsWritten,    // query results resolved into a buffer by the consumer
     Count
 };
 // #1963: how flush_cpu_buffers picks what to compare on native builds. Index (default): only the

@@ -606,10 +606,47 @@ struct ReadbackCmd {
 struct CopyTextureCmd {
     GpuCopyTexturePayload copy;
 };
+// A guest query heap (kGpuOpcodeCreateQuerySet). Occlusion: one 64-bit result per query, folded from the
+// executor's occlusion pool (an occlusion query set can only count inside one render pass, a D3D12
+// query spans whatever draws come between its begin and end). Timestamp: a timestamp query set.
+struct GuestQuerySet {
+    uint32_t kind = 0;  // GpuQuerySetKind
+    uint32_t count = 0;
+    wgpu::Buffer results;     // occlusion: count x u64 (Storage | CopySrc)
+    wgpu::QuerySet stamps;    // timestamp
+    wgpu::Buffer resolve;     // timestamp: count x u64 (QueryResolve | CopySrc)
+};
+// Query (kGpuOpcodeQuery): begin / end in stream order.
+struct QueryCmd {
+    std::shared_ptr<GuestQuerySet> set;
+    GpuQueryPayload q;
+};
+// ResolveQuery (kGpuOpcodeResolveQuery): runs outside passes, like a read-back.
+struct ResolveQueryCmd {
+    std::shared_ptr<GuestQuerySet> set;
+    wgpu::Buffer dst;  // resolved at packet time
+    uint64_t dst_size = 0;
+    GpuResolveQueryPayload r;
+};
+// A guest occlusion query between its begin and end, or ended and waiting for its fold. D3D12 lets several
+// be active at once; a draw counts for every active one, so they share the pass segment's pool slot.
+struct GuestOcclusionQuery {
+    std::shared_ptr<GuestQuerySet> set;
+    uint32_t index = 0;
+    bool binary = false;  // BINARY_OCCLUSION: the result is 0 or 1
+    bool reset = true;    // the fold starts from zero (begun in this encoder), else it adds to the result
+    bool lost = false;    // a segment found the pool full: the result is left as it was
+    std::vector<uint32_t> slots;  // its pool slots in this encoder
+};
 using PassCmd = std::variant<BeginPassCmd, EndPassCmd, SetPipelineCmd, SetVertexBufferCmd, SetIndexBufferCmd,
                              DrawCmd, DrawIndexedCmd, IndirectCmd, SetComputePipelineCmd, DispatchCmd, ViewportCmd,
                              ScissorCmd, BlendConstantCmd, StencilRefCmd, SetBindGroup2Cmd, SetBindGroup1Cmd,
-                             ReadbackCmd, CopyTextureCmd>;
+                             ReadbackCmd, CopyTextureCmd, QueryCmd, ResolveQueryCmd>;
+
+// The occlusion pool: every render pass the stream opens carries it, and each run of an active guest
+// occlusion query's draws inside one pass segment takes the next slot. Slots restart at 0 with every
+// command encoder; their samples are folded into the guest results before the encoder is submitted.
+constexpr uint32_t kOcclusionPoolSlots = 4096;
 
 // One query set per frame in flight (GpuTimeRing slot): pass begin / end timestamps, resolved into a
 // buffer and copied to a mappable one at the end of the submit.
@@ -795,6 +832,12 @@ struct NativeExecutor::Impl {
     d3d12_guest::GpuTimeTable* time_table = nullptr;
     std::unique_ptr<d3d12_guest::GpuTimeRing> time_ring;
     std::vector<TimerSlot> timer_slots;
+    // Guest query heaps (kGpuOpcodeCreateQuerySet) and the occlusion pool with its fold pipeline.
+    std::unordered_map<uint32_t, std::shared_ptr<GuestQuerySet>> query_sets;
+    wgpu::QuerySet occ_pool;
+    wgpu::Buffer occ_pool_resolve;  // kOcclusionPoolSlots x u64 (QueryResolve | Storage)
+    wgpu::ComputePipeline occ_fold_pipeline;
+    std::vector<GuestOcclusionQuery> occ_carry;  // occlusion queries still active when their encoder was submitted
 
     void snapshot_blob_stats();
 
@@ -1126,7 +1169,8 @@ struct NativeExecutor::Impl {
         static const char* const kValidationToggles[] = {"enable_immediate_error_handling", "use_user_defined_labels_in_backend"};
         std::vector<const char*> enabled_toggles;
         if (options.gpu_validation) enabled_toggles.assign(std::begin(kValidationToggles), std::end(kValidationToggles));
-        const bool want_timing = options.gpu_timing && adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery);
+        const bool want_timing = (options.gpu_timing || options.guest_queries) &&
+                                 adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery);
         if (want_timing) {
             required.push_back(wgpu::FeatureName::TimestampQuery);
             features.timestamp_query = true;
@@ -2078,6 +2122,11 @@ struct NativeExecutor::Impl {
         ov_bg = nullptr;
         timer_slots.clear();
         time_ring.reset();
+        query_sets.clear();
+        occ_carry.clear();
+        occ_pool = nullptr;
+        occ_pool_resolve = nullptr;
+        occ_fold_pipeline = nullptr;
         if (surface && surface_configured) surface.Unconfigure();
         surface_configured = false;
         if (device) device.Destroy();
@@ -2507,6 +2556,31 @@ struct NativeExecutor::Impl {
                     packet_error(op, "CopyTexture: payload too short");
                 }
                 break;
+            case kGpuOpcodeCreateQuerySet:
+                if (n >= sizeof(GpuCreateQuerySetPayload)) create_query_set(read_payload<GpuCreateQuerySetPayload>(p));
+                else packet_error(op, "CreateQuerySet: payload too short");
+                break;
+            case kGpuOpcodeQuery:
+                if (n >= sizeof(GpuQueryPayload)) {
+                    const auto q = read_payload<GpuQueryPayload>(p);
+                    auto it = query_sets.find(q.set_id);
+                    if (it == query_sets.end()) ++stats.query_unsupported;
+                    else pass_cmds.emplace_back(QueryCmd{it->second, q});
+                } else {
+                    packet_error(op, "Query: payload too short");
+                }
+                break;
+            case kGpuOpcodeResolveQuery:
+                if (n >= sizeof(GpuResolveQueryPayload)) {
+                    const auto r = read_payload<GpuResolveQueryPayload>(p);
+                    auto it = query_sets.find(r.set_id);
+                    auto bit = buffers.find(r.buffer_id);
+                    if (it == query_sets.end() || bit == buffers.end()) ++stats.query_unsupported;
+                    else pass_cmds.emplace_back(ResolveQueryCmd{it->second, bit->second.buffer, bit->second.size, r});
+                } else {
+                    packet_error(op, "ResolveQuery: payload too short");
+                }
+                break;
             case GpuOpcode::ReadbackBuffer:
             case GpuOpcode::ReadbackTexture:
                 if (auto r = decode_readback(p)) {
@@ -2594,6 +2668,7 @@ struct NativeExecutor::Impl {
     // is done with it (the worker's deferred destroy). Bind groups and pass commands that already
     // hold a handle keep it (the worker resolves SetBindGroup2 / SetPipeline at packet time too).
     void destroy_resource(uint32_t id) {
+        query_sets.erase(id);  // a pending command keeps its set alive until it is encoded
         buffers.erase(id);
         textures.erase(id);
         pending_clears.erase(id);
@@ -5922,6 +5997,7 @@ struct NativeExecutor::Impl {
         // A split: the active pass ends here (its commands become their own command buffer with split_passes).
         void end_segment() {
             seg_close();
+            occ_seg_close();
             if (rpass) { rpass.End(); rpass = nullptr; }
             if (cpass) { cpass.End(); cpass = nullptr; }
             cut();
@@ -5935,6 +6011,7 @@ struct NativeExecutor::Impl {
             rp.colorAttachmentCount = cont_color_count;
             rp.colorAttachments = cont_colors.data();
             if (cont_has_ds) rp.depthStencilAttachment = &cont_ds;
+            rp.occlusionQuerySet = s.occ_pool;
             rpass = enc.BeginRenderPass(&rp);
             if (cur_rpipe) rpass.SetPipeline(cur_rpipe);
             for (uint32_t i = 0; i < vbs.size(); ++i)
@@ -5981,6 +6058,18 @@ struct NativeExecutor::Impl {
         uint64_t seg_hash = 0;
         // split_passes: the command buffers of the passes already ended, submitted in order by submit().
         std::vector<wgpu::CommandBuffer> done;
+
+        // Guest occlusion queries: the active one (one at a time) and the ended ones whose pool slots
+        // (occ_before_draw) are folded into their results (occ_fold) before this encoder is submitted.
+        std::vector<GuestOcclusionQuery> occ = s.occ_carry;  // the active ones go on from the last encoder
+        bool occ_seg_open = false;  // the active render pass has the active queries' slot begun
+        std::vector<GuestOcclusionQuery> occ_done;
+        uint32_t occ_used = 0;  // pool slots taken in this encoder
+        void occ_seg_close() {
+            if (!occ_seg_open) return;
+            occ_seg_open = false;
+            if (rpass) rpass.EndOcclusionQuery();
+        }
 
         // split_passes: a pass just ended; its commands become a command buffer of their own, so a
         // validation error in it cannot invalidate the passes before or after it.
@@ -6033,6 +6122,7 @@ struct NativeExecutor::Impl {
 
         void end_active() {
             seg_close();
+            occ_seg_close();
             const bool ended = rpass || cpass;
             if (rpass) { rpass.End(); rpass = nullptr; }
             if (cpass) { cpass.End(); cpass = nullptr; }
@@ -6074,6 +6164,7 @@ struct NativeExecutor::Impl {
             if (s.timer_pass(*this, d3d12_guest::GpuPassKind::Render, s.lookahead_hash(*this, idx, false), &tw))
                 rp.timestampWrites = &tw;
             seg_begin(tw, rp.timestampWrites != nullptr, s.lookahead_hash(*this, idx, false));
+            rp.occlusionQuerySet = s.occ_pool;
             rpass = enc.BeginRenderPass(&rp);
             render_pass_opened = true;
             set_continuation(&a, 1, nullptr);
@@ -6192,6 +6283,7 @@ struct NativeExecutor::Impl {
         if (timer_pass(e, d3d12_guest::GpuPassKind::Render, lookahead_hash(e, e.idx + 1, false), &tw))
             rp.timestampWrites = &tw;
         e.seg_begin(tw, rp.timestampWrites != nullptr, lookahead_hash(e, e.idx + 1, false));
+        rp.occlusionQuerySet = occ_pool;  // guest occlusion queries count this pass's draws (occ_before_draw)
         e.rpass = e.enc.BeginRenderPass(&rp);
         e.render_pass_opened = true;
         e.explicit_pass = true;
@@ -6327,6 +6419,7 @@ struct NativeExecutor::Impl {
             remap_before_draw(e);
             if (draw_allowed(e)) {
                 flush_binds(e);
+                occ_before_draw(e);
                 e.rpass.Draw(d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
                 ++stats.draws;
             }
@@ -6336,6 +6429,7 @@ struct NativeExecutor::Impl {
             remap_before_draw(e);
             if (draw_allowed(e)) {
                 flush_binds(e);
+                occ_before_draw(e);
                 e.rpass.DrawIndexed(di->index_count, di->instance_count, di->first_index, di->base_vertex,
                                     di->first_instance);
                 ++stats.draws;
@@ -6367,6 +6461,7 @@ struct NativeExecutor::Impl {
                 alias_post_dispatch(e);
             } else if (draw_allowed(e)) {
                 flush_binds(e);
+                occ_before_draw(e);
                 if (in->kind == 1) e.rpass.DrawIndexedIndirect(it->second.buffer, in->offset);
                 else e.rpass.DrawIndirect(it->second.buffer, in->offset);
                 ++stats.draws;
@@ -6500,7 +6595,273 @@ struct NativeExecutor::Impl {
         } else if (const auto* ct = std::get_if<CopyTextureCmd>(&cmd)) {
             e.end_active();
             record_texture_copy(e.enc, ct->copy);
+        } else if (const auto* qc = std::get_if<QueryCmd>(&cmd)) {
+            run_query(e, *qc);
+        } else if (const auto* rq = std::get_if<ResolveQueryCmd>(&cmd)) {
+            e.end_active();
+            resolve_query(e, *rq);
         }
+    }
+
+    // ---- guest query heaps (kGpuOpcodeCreateQuerySet / Query / ResolveQuery) ----
+
+    // Adds each entry's pool slots (u64 sample counts; `slots[first ..]`) to its result (flags: 1 start from
+    // zero, 2 binary).
+    static constexpr const char* kOcclusionFoldWgsl = R"(
+struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
+@group(0) @binding(0) var<storage, read> pool: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read> entries: array<Entry>;
+@group(0) @binding(2) var<storage, read_write> results: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read> slots: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= arrayLength(&entries)) { return; }
+  let e = entries[id.x];
+  var lo = 0u;
+  var hi = 0u;
+  if ((e.flags & 1u) == 0u) { lo = results[e.dst].x; hi = results[e.dst].y; }
+  for (var i = 0u; i < e.count; i++) {
+    let v = pool[slots[e.first + i]];
+    let s = lo + v.x;
+    hi = hi + v.y + select(0u, 1u, s < lo);
+    lo = s;
+  }
+  if ((e.flags & 2u) != 0u) { lo = select(0u, 1u, lo != 0u || hi != 0u); hi = 0u; }
+  results[e.dst] = vec2<u32>(lo, hi);
+}
+)";
+
+    bool ensure_occlusion_pool() {
+        if (occ_pool && occ_pool_resolve && occ_fold_pipeline) return true;
+        wgpu::QuerySetDescriptor qd{};
+        qd.type = wgpu::QueryType::Occlusion;
+        qd.count = kOcclusionPoolSlots;
+        occ_pool = device.CreateQuerySet(&qd);
+        wgpu::BufferDescriptor bd{};
+        bd.size = uint64_t{kOcclusionPoolSlots} * 8;
+        bd.usage = wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::Storage;
+        occ_pool_resolve = device.CreateBuffer(&bd);
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = {kOcclusionFoldWgsl, WGPU_STRLEN};
+        wgpu::ShaderModuleDescriptor md{};
+        md.nextInChain = &wgsl;
+        md.label = {"playgta6-occlusion-fold", WGPU_STRLEN};
+        wgpu::ComputePipelineDescriptor cd{};
+        cd.compute.module = device.CreateShaderModule(&md);
+        cd.compute.entryPoint = {"main", 4};
+        occ_fold_pipeline = device.CreateComputePipeline(&cd);
+        return occ_pool && occ_pool_resolve && occ_fold_pipeline;
+    }
+
+    // The storage of a guest query heap: occlusion results (zero until a query ends) or a timestamp set.
+    void create_query_set(const GpuCreateQuerySetPayload& c) {
+        if (c.count == 0 || c.count > kOcclusionPoolSlots) {
+            ++stats.query_unsupported;
+            return;
+        }
+        auto qs = std::make_shared<GuestQuerySet>();
+        qs->kind = c.kind;
+        qs->count = c.count;
+        wgpu::BufferDescriptor bd{};
+        bd.size = uint64_t{c.count} * 8;
+        if (c.kind == GpuQuerySetKind::Occlusion && ensure_occlusion_pool()) {
+            bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+            qs->results = device.CreateBuffer(&bd);
+        } else if (c.kind == GpuQuerySetKind::Timestamp && features.timestamp_query) {
+            wgpu::QuerySetDescriptor qd{};
+            qd.type = wgpu::QueryType::Timestamp;
+            qd.count = c.count;
+            qs->stamps = device.CreateQuerySet(&qd);
+            bd.usage = wgpu::BufferUsage::QueryResolve | wgpu::BufferUsage::CopySrc;
+            qs->resolve = device.CreateBuffer(&bd);
+        } else {
+            ++stats.query_unsupported;  // no timestamp-query on this device (or an unknown kind)
+            return;
+        }
+        query_sets[c.id] = std::move(qs);
+        ++stats.query_sets_created;
+    }
+
+    // Before a draw in the active render pass: the active occlusion queries count it, in a pool slot begun
+    // at the first such draw of this pass segment (ended by occ_seg_close when the segment ends or the set
+    // of active queries changes).
+    void occ_before_draw(Encoder& e) {
+        if (e.occ.empty() || e.occ_seg_open || !e.rpass) return;
+        if (e.occ_used >= kOcclusionPoolSlots) {
+            for (GuestOcclusionQuery& q : e.occ) {
+                if (!q.lost) ++stats.query_pool_exhausted;
+                q.lost = true;
+            }
+            return;
+        }
+        for (GuestOcclusionQuery& q : e.occ) q.slots.push_back(e.occ_used);
+        e.rpass.BeginOcclusionQuery(e.occ_used);
+        ++e.occ_used;
+        e.occ_seg_open = true;
+        ++stats.query_occlusion_segments;
+    }
+
+    void run_query(Encoder& e, const QueryCmd& c) {
+        const GuestQuerySet& qs = *c.set;
+        if (c.q.index >= qs.count) {
+            ++stats.query_unsupported;
+            return;
+        }
+        if (qs.kind == GpuQuerySetKind::Timestamp) {
+            if (c.q.op == 1 && c.q.type == 2) write_timestamp(e, qs, c.q.index);
+            else ++stats.query_unsupported;
+            return;
+        }
+        if (c.q.type > 1) {
+            ++stats.query_unsupported;
+            return;
+        }
+        auto it = std::find_if(e.occ.begin(), e.occ.end(),
+                               [&](const GuestOcclusionQuery& q) { return q.set == c.set && q.index == c.q.index; });
+        if ((c.q.op == 0) == (it != e.occ.end())) {
+            ++stats.query_unsupported;  // a begin of an active query, an end of one not begun
+            return;
+        }
+        e.occ_seg_close();  // the next draw counts for the new set of active queries
+        if (c.q.op == 0) {
+            GuestOcclusionQuery q;
+            q.set = c.set;
+            q.index = c.q.index;
+            q.binary = c.q.type == 1;
+            e.occ.push_back(std::move(q));
+            ++stats.query_begins;
+            return;
+        }
+        e.occ_done.push_back(std::move(*it));
+        e.occ.erase(it);
+        ++stats.query_ends;
+    }
+
+    // A timestamp at this point of the stream: inside the pass with timestamps-inside-passes, else in an
+    // empty compute pass between the two halves of the split pass (or between passes).
+    void write_timestamp(Encoder& e, const GuestQuerySet& qs, uint32_t index) {
+        if ((e.rpass || e.cpass) && features.timestamp_inside_passes) {
+            if (e.rpass) e.rpass.WriteTimestamp(qs.stamps, index);
+            else e.cpass.WriteTimestamp(qs.stamps, index);
+            ++stats.query_timestamps;
+            return;
+        }
+        const bool render = static_cast<bool>(e.rpass), compute = static_cast<bool>(e.cpass);
+        if (render || compute) {
+            e.end_segment();
+            ++stats.query_timestamp_splits;
+        }
+        wgpu::PassTimestampWrites tw{};
+        tw.querySet = qs.stamps;
+        tw.beginningOfPassWriteIndex = index;
+        tw.endOfPassWriteIndex = wgpu::kQuerySetIndexUndefined;
+        wgpu::ComputePassDescriptor cd{};
+        cd.timestampWrites = &tw;
+        e.enc.BeginComputePass(&cd).End();
+        if (render) e.resume_render();
+        else if (compute) e.resume_compute();
+        ++stats.query_timestamps;
+    }
+
+    // Folds this encoder's ended occlusion queries (with `active`, also what the active one counted so
+    // far: it goes on adding in the next encoder) into their heaps' results. No pass may be open.
+    void occ_fold(Encoder& e, bool active) {
+        std::vector<GuestOcclusionQuery> todo = std::move(e.occ_done);
+        e.occ_done.clear();
+        if (active) {
+            for (GuestOcclusionQuery& q : e.occ) {
+                todo.push_back(q);
+                q.reset = false;
+                q.slots.clear();
+            }
+            occ_carry = e.occ;
+        }
+        // The encoder is about to be submitted: the next one starts the pool over.
+        const uint32_t used = e.occ_used;
+        if (active) e.occ_used = 0;
+        if (todo.empty()) return;
+        // Per heap, its entries {result index, first of its slots, slot count, flags} and their slot lists; a later
+        // begin of the same query replaces an earlier one (whose result it would overwrite anyway).
+        struct Group {
+            GuestQuerySet* set;
+            std::vector<uint32_t> words, slots;
+        };
+        std::vector<Group> groups;
+        for (size_t i = 0; i < todo.size(); ++i) {
+            const GuestOcclusionQuery& q = todo[i];
+            if (q.lost || !q.set || !q.set->results) continue;
+            bool superseded = false;
+            for (size_t j = i + 1; j < todo.size() && !superseded; ++j)
+                superseded = todo[j].set == q.set && todo[j].index == q.index && todo[j].reset;
+            if (superseded) continue;
+            auto g = std::find_if(groups.begin(), groups.end(), [&](const Group& x) { return x.set == q.set.get(); });
+            if (g == groups.end()) g = groups.insert(groups.end(), Group{q.set.get(), {}, {}});
+            g->words.insert(g->words.end(), {q.index, static_cast<uint32_t>(g->slots.size()),
+                                             static_cast<uint32_t>(q.slots.size()),
+                                             (q.reset ? 1u : 0u) | (q.binary ? 2u : 0u)});
+            g->slots.insert(g->slots.end(), q.slots.begin(), q.slots.end());
+        }
+        if (groups.empty()) return;
+        if (used > 0) e.enc.ResolveQuerySet(occ_pool, 0, used, occ_pool_resolve, 0);
+        wgpu::ComputePassEncoder pass = e.enc.BeginComputePass();
+        pass.SetPipeline(occ_fold_pipeline);
+        for (Group& g : groups) {
+            const std::vector<uint32_t>& words = g.words;
+            if (g.slots.empty()) g.slots.push_back(0);  // a binding cannot be empty
+            wgpu::BufferDescriptor bd{};
+            bd.size = words.size() * sizeof(uint32_t);
+            bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+            wgpu::Buffer entries = device.CreateBuffer(&bd);
+            queue.WriteBuffer(entries, 0, words.data(), bd.size);
+            wgpu::BufferDescriptor sd{};
+            sd.size = (g.slots.size() * sizeof(uint32_t) + 15) & ~uint64_t{15};
+            sd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+            wgpu::Buffer slot_list = device.CreateBuffer(&sd);
+            queue.WriteBuffer(slot_list, 0, g.slots.data(), g.slots.size() * sizeof(uint32_t));
+            GuestQuerySet* set = g.set;
+            wgpu::BindGroupEntry be[4] = {};
+            be[0].binding = 0;
+            be[0].buffer = occ_pool_resolve;
+            be[0].size = uint64_t{kOcclusionPoolSlots} * 8;
+            be[1].binding = 1;
+            be[1].buffer = entries;
+            be[1].size = bd.size;
+            be[2].binding = 2;
+            be[2].buffer = set->results;
+            be[2].size = uint64_t{set->count} * 8;
+            be[3].binding = 3;
+            be[3].buffer = slot_list;
+            be[3].size = sd.size;
+            wgpu::BindGroupDescriptor bgd{};
+            bgd.layout = occ_fold_pipeline.GetBindGroupLayout(0);
+            bgd.entryCount = 4;
+            bgd.entries = be;
+            pass.SetBindGroup(0, device.CreateBindGroup(&bgd));
+            pass.DispatchWorkgroups(static_cast<uint32_t>((words.size() / 4 + 63) / 64));
+        }
+        pass.End();
+    }
+
+    // ResolveQueryData: the queries' 64-bit results into the destination buffer (no pass is open).
+    void resolve_query(Encoder& e, const ResolveQueryCmd& c) {
+        const GuestQuerySet& qs = *c.set;
+        const GpuResolveQueryPayload& r = c.r;
+        const uint64_t bytes = uint64_t{r.count} * 8;
+        const bool type_ok = qs.kind == GpuQuerySetKind::Timestamp ? r.type == 2 : r.type <= 1;
+        if (!c.dst || !type_ok || r.count == 0 || r.first > qs.count || r.count > qs.count - r.first ||
+            (r.dst_offset & 7u) != 0 || r.dst_offset > c.dst_size || bytes > c.dst_size - r.dst_offset ||
+            !(c.dst.GetUsage() & wgpu::BufferUsage::CopyDst)) {
+            ++stats.query_unsupported;
+            return;
+        }
+        if (qs.kind == GpuQuerySetKind::Occlusion) {
+            occ_fold(e, false);
+            e.enc.CopyBufferToBuffer(qs.results, uint64_t{r.first} * 8, c.dst, r.dst_offset, bytes);
+        } else {
+            e.enc.ResolveQuerySet(qs.stamps, r.first, r.count, qs.resolve, 0);
+            e.enc.CopyBufferToBuffer(qs.resolve, 0, c.dst, r.dst_offset, bytes);
+        }
+        ++stats.query_resolves;
+        stats.query_results_written += r.count;
     }
 
 
@@ -7519,7 +7880,7 @@ struct NativeExecutor::Impl {
         for (size_t j = from; j < cmds.size(); ++j) {
             const PassCmd& c = cmds[j];
             if (std::get_if<BeginPassCmd>(&c) || std::get_if<EndPassCmd>(&c) || std::get_if<ReadbackCmd>(&c) ||
-                std::get_if<CopyTextureCmd>(&c))
+                std::get_if<CopyTextureCmd>(&c) || std::get_if<ResolveQueryCmd>(&c))
                 break;
             const auto* ind = std::get_if<IndirectCmd>(&c);
             const bool compute_op = std::get_if<SetComputePipelineCmd>(&c) || std::get_if<DispatchCmd>(&c) ||
@@ -7888,6 +8249,7 @@ struct NativeExecutor::Impl {
             run_cmd(e, head[i]);
         }
         e.end_active();
+        occ_fold(e, true);
         timer_resolve(e);
         e.submit();
         timer_collect(e);
@@ -7962,6 +8324,7 @@ struct NativeExecutor::Impl {
             run_cmd(e, pass_cmds[i]);
         }
         e.end_active();
+        occ_fold(e, true);
         if (!e.render_pass_opened) {
             // The v1 clearing swapchain pass (_ensurePresentRenderPass with renderPassOpened false).
             wgpu::RenderPassColorAttachment a = swapchain_attachment(target, LoadOp::Clear, StoreOp::Store, clear_color);
@@ -8658,6 +9021,16 @@ std::string NativeExecutor::stats_json() const {
     num("view_dim_coerced", st.view_dim_coerced);
     num("view_dim_unfixable", st.view_dim_unfixable);
     num("storage_alias_copies", st.storage_alias_copies);
+    num("query_sets_created", st.query_sets_created);
+    num("query_begins", st.query_begins);
+    num("query_ends", st.query_ends);
+    num("query_occlusion_segments", st.query_occlusion_segments);
+    num("query_timestamps", st.query_timestamps);
+    num("query_timestamp_splits", st.query_timestamp_splits);
+    num("query_resolves", st.query_resolves);
+    num("query_results_written", st.query_results_written);
+    num("query_unsupported", st.query_unsupported);
+    num("query_pool_exhausted", st.query_pool_exhausted);
     num("storage_alias_dispatch_restarts", st.storage_alias_dispatch_restarts);
     num("storage_alias_unfixable", st.storage_alias_unfixable);
     num("storage_alias_twin_writers", st.storage_alias_twin_writers);

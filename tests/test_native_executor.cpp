@@ -1277,6 +1277,125 @@ void test_copy_texture(NativeExecutor& ex) {
     run(ex, done);
 }
 
+// Guest query heaps (opcodes 61 / 60 / 59): occlusion queries count the samples of the draws between
+// their begin and end across render passes, a binary one resolves to 1, one without draws to 0;
+// timestamps are written outside and inside a pass; resolves land in a buffer in the D3D12 layout.
+// Uses the full-screen pipeline 50 / bind group 60 of test_textured_draw.
+void test_queries(NativeExecutor& ex) {
+    std::vector<uint8_t> mem(4096, 0xEE);
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+    std::memset(mem.data(), 0, 16);
+    ex.attach_guest_memory(gm);
+    const ExecutorStats before = ex.stats();
+    auto query = [](gpu::CommandEncoder& enc, uint32_t set, uint32_t index, uint32_t op, uint32_t type) {
+        emit(enc, kGpuOpcodeQuery, bytes_of(GpuQueryPayload{set, index, op, type}));
+    };
+    auto resolve = [](gpu::CommandEncoder& enc, uint32_t set, uint32_t type, uint32_t first, uint32_t count,
+                      uint64_t offset) {
+        emit(enc, kGpuOpcodeResolveQuery, bytes_of(GpuResolveQueryPayload{set, type, first, count, 910, 0, offset}));
+    };
+    auto draw = [](gpu::CommandEncoder& enc) {
+        enc.set_pipeline(50);
+        set_bind_group2(enc, 0, 60);
+        enc.draw(3);
+    };
+    gpu::CommandEncoder setup;
+    emit(setup, kGpuOpcodeCreateQuerySet, bytes_of(GpuCreateQuerySetPayload{900, GpuQuerySetKind::Occlusion, 8, 0}));
+    emit(setup, kGpuOpcodeCreateQuerySet, bytes_of(GpuCreateQuerySetPayload{901, GpuQuerySetKind::Timestamp, 4, 0}));
+    setup.create_buffer(910, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc | GpuBufferUsage::CopyDst, 64);
+    run(ex, setup);
+    const bool stamps = ex.stats().query_sets_created == before.query_sets_created + 2;
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    const auto clear = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    const auto load = swapchain_pass(GpuLoadOp::Load, 0, 0, 0, 1);
+    query(frame, 900, 0, 0, 0);  // begun before the pass its draws fall in (as the producer records it)
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &clear, sizeof clear);
+    draw(frame);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &load, sizeof load);
+    draw(frame);  // a second pass: the query spans both
+    query(frame, 900, 0, 1, 0);
+    query(frame, 900, 1, 0, 1);  // binary
+    draw(frame);
+    query(frame, 900, 1, 1, 1);
+    query(frame, 900, 2, 0, 0);  // no draw: 0
+    query(frame, 900, 2, 1, 0);
+    query(frame, 900, 3, 0, 0);  // two active at once: a draw counts for both
+    draw(frame);
+    query(frame, 900, 4, 0, 0);
+    draw(frame);
+    query(frame, 900, 3, 1, 0);
+    draw(frame);
+    query(frame, 900, 4, 1, 0);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    query(frame, 901, 0, 1, 2);  // a timestamp between passes
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &load, sizeof load);
+    draw(frame);
+    query(frame, 901, 1, 1, 2);  // ... and one inside a pass
+    draw(frame);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    resolve(frame, 900, 0, 0, 5, 0);
+    resolve(frame, 901, 2, 0, 2, 40);
+    emit(frame, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(910, 0, 56, 256, 0)));
+    frame.present();
+    CHECK(run(ex, frame) == 1);
+    ex.wait_idle();
+    ex.poll();
+    auto u64_at = [&](size_t off) {
+        uint64_t v = 0;
+        std::memcpy(&v, mem.data() + off, 8);
+        return v;
+    };
+    const ExecutorStats& a = ex.stats();
+    CHECK(u32_at(mem, 0) == 1);
+    // Dawn's D3D12 backend counts an occlusion query as 0 / 1 per pass segment, others count samples.
+    const uint64_t samples = u64_at(256);
+    std::printf("queries: occlusion %llu, timestamps %llu %llu\n", static_cast<unsigned long long>(samples),
+                static_cast<unsigned long long>(u64_at(256 + 40)), static_cast<unsigned long long>(u64_at(256 + 48)));
+    CHECK(samples == 2 || samples == 2ull * kW * kH);
+    CHECK(u64_at(256 + 8) == 1);
+    CHECK(u64_at(256 + 16) == 0);
+    CHECK(u64_at(256 + 24) == samples && u64_at(256 + 32) == samples);
+    CHECK(a.query_begins == before.query_begins + 5 && a.query_ends == before.query_ends + 5);
+    CHECK(a.query_occlusion_segments == before.query_occlusion_segments + 6);
+    if (stamps) {
+        CHECK(u64_at(256 + 40) != 0 && u64_at(256 + 48) >= u64_at(256 + 40));
+        CHECK(a.query_timestamps == before.query_timestamps + 2);
+        CHECK(a.query_resolves == before.query_resolves + 2);
+        CHECK(a.query_results_written == before.query_results_written + 7);
+    } else {
+        std::printf("queries: no timestamp-query on this adapter\n");
+    }
+    CHECK(a.device_errors == before.device_errors);
+    CHECK(a.packet_errors == before.packet_errors);
+
+    // A query begun again starts over; a mismatched end and an out-of-range resolve are rejected.
+    gpu::CommandEncoder again;
+    again.begin_frame();
+    query(again, 900, 0, 0, 0);
+    query(again, 900, 0, 1, 0);
+    query(again, 900, 5, 1, 0);       // never begun
+    resolve(again, 900, 0, 6, 4, 0);  // past the heap
+    resolve(again, 900, 0, 0, 1, 0);
+    emit(again, GpuOpcode::ReadbackBuffer, bytes_of(rb_buffer(910, 0, 8, 512, 4)));
+    again.present();
+    CHECK(run(ex, again) == 1);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(u32_at(mem, 4) == 1 && u64_at(512) == 0);
+    CHECK(ex.stats().query_unsupported == before.query_unsupported + (stamps ? 2 : 6));
+    CHECK(ex.stats().device_errors == before.device_errors);
+    gpu::CommandEncoder done;
+    done.destroy_resource(900);
+    done.destroy_resource(901);
+    done.destroy_resource(910);
+    run(ex, done);
+}
+
 void test_readbacks(NativeExecutor& ex) {
     std::vector<uint8_t> mem(8192, 0xEE);
     GuestMemory gm;
@@ -4147,6 +4266,7 @@ int main() {
     test_readbacks(*ex);
     test_clear_texture(*ex);
     test_copy_texture(*ex);
+    test_queries(*ex);
     test_readbacks_host_addresses(*ex);
     test_v1(*ex);
     test_reflection();

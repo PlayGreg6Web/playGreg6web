@@ -54,6 +54,9 @@ struct ExecutorOptions {
     // device without it (r16float depth twins, r32float dummies) run on real hardware.
     bool disable_float32_filterable = false;
     bool gpu_timing = true;
+    // Guest query heaps (kGpuOpcodeCreateQuerySet / Query / ResolveQuery): timestamp-query is requested
+    // for them too when the adapter has it (else timestamp heaps are counted as unsupported).
+    bool guest_queries = true;
     // Software adapter (--adapter warp): request Dawn's fallback adapter (D3D12 WARP on Windows) instead of a GPU,
     // so GPU-less hosts (CI runners) can replay for real. Default off (the high-performance GPU).
     bool force_fallback_adapter = false;
@@ -300,6 +303,17 @@ struct ExecutorStats {
     uint64_t view_dim_coerced = 0;         // texture views re-created with the layout entry's viewDimension (cube-array view meeting a 2d entry, ...)
     uint64_t view_dim_unfixable = 0;       // view dimension mismatches the texture cannot satisfy (cube entry over < 6 layers)
     uint64_t storage_alias_copies = 0;     // read-only buffer bindings overlapping a writable one, bound through a copy
+    // Guest query heaps (kGpuOpcodeCreateQuerySet / Query / ResolveQuery).
+    uint64_t query_sets_created = 0;       // guest query heaps with a query set (occlusion results / timestamp set)
+    uint64_t query_begins = 0;             // occlusion queries begun
+    uint64_t query_ends = 0;               // occlusion queries ended (their samples folded into the heap's results)
+    uint64_t query_occlusion_segments = 0;  // pool occlusion queries written (one per render-pass segment a query's draws fell in)
+    uint64_t query_timestamps = 0;         // timestamps written
+    uint64_t query_timestamp_splits = 0;   // passes split to write a timestamp between their commands
+    uint64_t query_resolves = 0;           // ResolveQuery packets that wrote their results
+    uint64_t query_results_written = 0;    // 64-bit results those wrote into the destination buffers
+    uint64_t query_unsupported = 0;        // query packets not run: no timestamp feature, unknown set / buffer, nested or unmatched begin / end, out-of-range destination
+    uint64_t query_pool_exhausted = 0;     // occlusion segments past the per-submit pool: the query's result is not written
     uint64_t storage_alias_dispatch_restarts = 0;  // compute passes split to take those copies
     uint64_t storage_alias_unfixable = 0;  // overlaps no copy could separate (zero-size / out-of-range / depth, MS, BC textures, two texture writers)
     uint64_t storage_alias_twin_writers = 0;  // later writable buffer bindings run on a scratch copy whose changed words are merged back

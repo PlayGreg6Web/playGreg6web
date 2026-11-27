@@ -431,6 +431,7 @@ public:
     void BeginQuery(com::CallContext& ctx) override;
     void EndQuery(com::CallContext& ctx) override;
     void ResolveQueryData(com::CallContext& ctx) override;
+    void emit_query(com::CallContext& ctx, uint32_t op);  // BeginQuery (op 0) / EndQuery (op 1) packet
     void SetPredication(com::CallContext&) override {}
     void DebugMarker(com::CallContext&) override {}
     // Xbox slots (d3d12_xs_xbox.cpp).

@@ -951,6 +951,9 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(static_cast<uint16_t>(GpuOpcode::ReadbackTexture) == 40);
     CHECK(static_cast<uint16_t>(kGpuOpcodeClearTexture) == 63);
     CHECK(static_cast<uint16_t>(kGpuOpcodeCopyTexture) == 62);
+    CHECK(static_cast<uint16_t>(kGpuOpcodeCreateQuerySet) == 61);
+    CHECK(static_cast<uint16_t>(kGpuOpcodeQuery) == 60);
+    CHECK(static_cast<uint16_t>(kGpuOpcodeResolveQuery) == 59);
 
     CHECK(sizeof(GpuTextureViewDesc) == 16);
     CHECK(sizeof(GpuBindGroupLayoutEntry) == 24);

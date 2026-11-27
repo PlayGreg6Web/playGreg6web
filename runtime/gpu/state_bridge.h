@@ -1324,6 +1324,11 @@ public:
     // is not writable.
     size_t Readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes, uint32_t resource_id);
 
+    // Query packets (kGpuOpcodeQuery / kGpuOpcodeResolveQuery). A begin / end goes into the stream where
+    // the recording is (inside an open render pass: the consumer counts the pass's draws); a resolve
+    // (`ends_pass`) ends the pass first like a copy and names its destination buffer `resource_id`.
+    void QueryPacket(GpuOpcode opcode, const void* payload, uint32_t payload_bytes, uint32_t resource_id, bool ends_pass);
+
     // Emits a WriteTexture packet into this command list's encoder stream (G49b).
     void WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
                       uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,

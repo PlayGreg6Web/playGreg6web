@@ -6267,6 +6267,22 @@ size_t CommandListBridge::Readback(GpuOpcode opcode, const void* payload, uint32
     return at;
 }
 
+void CommandListBridge::QueryPacket(GpuOpcode opcode, const void* payload, uint32_t payload_bytes,
+                                    uint32_t resource_id, bool ends_pass) {
+    if (!writable()) {
+        return;
+    }
+    if (ends_pass) {
+        tracker_.flush_pending_clears();
+        tracker_.end_render_pass();
+    }
+    drain_events();
+    if (resource_id != 0) {
+        note_recorded_resource(resource_id);
+    }
+    encoder_.emit_packet(opcode, payload, payload_bytes);
+}
+
 void CommandListBridge::WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
                                      uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,
                                      uint32_t bytes_per_row, uint32_t rows_per_image, const void* data,

@@ -540,6 +540,11 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
             fn(read_u32(p + 4));  // buffer_id / texture_id
         }
         break;
+    case kGpuOpcodeResolveQuery:
+        if (len >= sizeof(GpuResolveQueryPayload)) {
+            fn(read_u32(p + offsetof(GpuResolveQueryPayload, buffer_id)));
+        }
+        break;
     case GpuOpcode::SetVertexBuffer:
         if (len >= sizeof(GpuSetVertexBufferPayload)) {
             fn(read_u32(p + offsetof(GpuSetVertexBufferPayload, buffer_id)));
@@ -2354,6 +2359,36 @@ void Device::GetCopyableFootprints(com::CallContext& ctx) {
     }
     if (total_bytes != 0) {
         com::write_guest(total_bytes, total);
+    }
+}
+
+// D3D12_QUERY_HEAP_TYPE 0 OCCLUSION and 1 TIMESTAMP (5 COPY_QUEUE_TIMESTAMP: the same clock) get a
+// consumer query set; pipeline / stream-output statistics have none.
+QueryHeap::QueryHeap(com::Ref<Device> device, const GuestQueryHeapDesc& desc)
+    : ChildBase(std::move(device)), desc_(desc) {
+    constexpr uint32_t kMaxQueries = 4096;  // WebGPU's query set size limit
+    const bool occlusion = desc.Type == 0;
+    const bool timestamp = desc.Type == 1 || desc.Type == 5;
+    if (!gpu_queries() || (!occlusion && !timestamp) || desc.Count > kMaxQueries ||
+        (timestamp && device_->timestamp_frequency() != 1000000000ull)) {
+        return;  // a timestamp heap needs the nanosecond clock the consumer resolves to
+    }
+    query_set_id_ = device_->allocate_id();
+    query_set_kind_ = occlusion ? GpuQuerySetKind::Occlusion : GpuQuerySetKind::Timestamp;
+    GpuCreateQuerySetPayload p{};
+    p.id = query_set_id_;
+    p.kind = query_set_kind_;
+    p.count = desc.Count;
+    CommandEncoder enc;
+    enc.emit_packet(kGpuOpcodeCreateQuerySet, &p, sizeof(p));
+    device_->submit(enc);
+}
+
+QueryHeap::~QueryHeap() {
+    if (query_set_id_ != 0) {
+        CommandEncoder enc;
+        enc.destroy_resource(query_set_id_);
+        device_->submit(enc);
     }
 }
 

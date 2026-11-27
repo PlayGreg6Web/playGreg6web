@@ -1376,6 +1376,8 @@ bool start_live_window() {
     // Likewise CopyTexture: texture-to-texture copies the blit / storage routes cannot serve.
     playgta6::gpu::set_gpu_texture_copy(g_options.gpu_capture.empty());
     playgta6::gpu::set_gpu_texture_copy_transcode(g_options.gpu_capture.empty());  // native executor only
+    // Likewise query heaps: occlusion / timestamp queries run on the executor's query sets.
+    playgta6::gpu::set_gpu_queries(g_options.gpu_capture.empty());
     // frame_breakdown: the executor's busy time and the packet bytes, sampled at every present.
     guest::set_frame_counter_source([](uint64_t* executor_ns, uint64_t* submitted_bytes) {
         const ne::LivePumpStats st = g_live.stats();

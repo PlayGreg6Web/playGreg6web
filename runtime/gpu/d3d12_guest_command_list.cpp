@@ -92,6 +92,8 @@ const char* work_name(Work w) {
     case Work::QueryTimestampOps: return "query_timestamp_ops";
     case Work::QueryOtherOps: return "query_other_ops";
     case Work::QueryResultsUnwritten: return "query_results_unwritten";
+    case Work::QueryPackets: return "query_packets";
+    case Work::QueryResultsWritten: return "query_results_written";
     case Work::ComputeTextureReadbacks: return "compute_texture_readbacks";
     case Work::ComputeTextureRetiled: return "compute_texture_retiled";
     case Work::ComputeTextureRetileDiscarded: return "compute_texture_retile_discarded";
@@ -3245,26 +3247,109 @@ void count_query_type(uint64_t type) {
 }
 }  // namespace
 
-// Queries have no host backend (no packet): begin / end are counted, a resolve writes nothing. The
-// destination keeps its previous bytes; nothing is invented as a query result.
+// Queries run on the consumer's query sets (gpu_queries(), kGpuOpcodeQuery / kGpuOpcodeResolveQuery):
+// occlusion and timestamp heaps. Without one (no consumer support, pipeline / stream-output statistics)
+// begin / end are only counted and a resolve writes nothing: the destination keeps its previous bytes,
+// nothing is invented as a query result.
+namespace {
+const QueryHeap* query_heap_arg(uint64_t pointer) {
+    auto arg = InterfaceArg<IQueryHeapHost>::resolve(pointer);
+    return arg ? static_cast<const QueryHeap*>(arg.get()) : nullptr;
+}
+
+// The consumer query set a query of D3D12 `type` on `heap` runs on (0: none).
+uint32_t query_set_for(const QueryHeap* heap, uint64_t type, uint64_t index, uint64_t count) {
+    if (heap == nullptr || heap->query_set_id() == 0 || index > heap->desc().Count ||
+        count > heap->desc().Count - index) {
+        return 0;
+    }
+    const bool occlusion = type <= 1u && heap->query_set_kind() == GpuQuerySetKind::Occlusion;
+    const bool timestamp = type == 2u && heap->query_set_kind() == GpuQuerySetKind::Timestamp;
+    return occlusion || timestamp ? heap->query_set_id() : 0u;
+}
+}  // namespace
+
+// The D3D12_QUERY_TYPE and UINT arguments are 32-bit: the upper half of their registers is not theirs.
+static uint32_t u32_arg(com::CallContext& ctx, int i) {
+    return static_cast<uint32_t>(ctx.int_arg(i));
+}
+
+void CommandList::emit_query(com::CallContext& ctx, uint32_t op) {
+    // this, heap, type, index
+    const QueryHeap* heap = query_heap_arg(ctx.int_arg(1));
+    const uint32_t type = u32_arg(ctx, 2);
+    const uint32_t set = query_set_for(heap, type, u32_arg(ctx, 3), 1);
+    if (!usable() || set == 0 || (op == 0 && type == 2u)) {
+        return;  // a timestamp only ends (BeginQuery on one is invalid D3D12)
+    }
+    pinned_.push_back(com::Ref<com::ComObject>::share(const_cast<QueryHeap*>(heap)));
+    GpuQueryPayload p{};
+    p.set_id = set;
+    p.index = u32_arg(ctx, 3);
+    p.op = op;
+    p.type = type;
+    bridge_.QueryPacket(kGpuOpcodeQuery, &p, sizeof(p), 0, false);
+    count_work(Work::QueryPackets);
+}
+
 void CommandList::BeginQuery(com::CallContext& ctx) {
     count_work(Work::QueryBegins);
-    count_query_type(ctx.int_arg(2));
+    count_query_type(u32_arg(ctx, 2));
+    emit_query(ctx, 0);
 }
 
 void CommandList::EndQuery(com::CallContext& ctx) {
     count_work(Work::QueryEnds);
-    count_query_type(ctx.int_arg(2));
+    count_query_type(u32_arg(ctx, 2));
+    emit_query(ctx, 1);
 }
 
 void CommandList::ResolveQueryData(com::CallContext& ctx) {
     // this, heap, type, start index, count, destination buffer, destination offset.
     count_work(Work::QueryResolves);
-    count_query_type(ctx.int_arg(2));
-    count_work(Work::QueryResultsUnwritten, static_cast<uint32_t>(ctx.int_arg(4)));
-    if (usable()) {
-        device_->note_bad_argument("ResolveQueryData: no GPU query backend; type " + std::to_string(ctx.int_arg(2)) +
-                                   " results not written (destination keeps its previous bytes)");
+    const uint32_t type = u32_arg(ctx, 2);
+    const uint64_t first = u32_arg(ctx, 3);
+    const uint64_t count = u32_arg(ctx, 4);
+    const uint64_t offset = ctx.int_arg(6);
+    count_query_type(type);
+    if (!usable()) {
+        return;
+    }
+    const QueryHeap* heap = query_heap_arg(ctx.int_arg(1));
+    Resource* dst = resource(InterfaceArg<IResourceHost>::resolve(ctx.int_arg(5)));
+    const uint32_t set = query_set_for(heap, type, first, count);
+    const bool dst_ok = dst != nullptr && dst->is_buffer() && (offset & 7u) == 0 && count <= (1u << 12) &&
+                        offset <= dst->desc().Width && count * 8 <= dst->desc().Width - offset;
+    if (set == 0 || !dst_ok || count == 0) {
+        count_work(Work::QueryResultsUnwritten, static_cast<uint32_t>(count));
+        device_->note_bad_argument(std::string("ResolveQueryData: ") +
+                                   (set == 0 ? "no GPU query set for type " + std::to_string(type)
+                                             : std::string("invalid destination"))  +
+                                   ", results not written (destination keeps its previous bytes)");
+        return;
+    }
+    pinned_.push_back(com::Ref<com::ComObject>::share(const_cast<QueryHeap*>(heap)));
+    pinned_.push_back(com::Ref<com::ComObject>::share(dst));
+    GpuResolveQueryPayload p{};
+    p.set_id = set;
+    p.type = type;
+    p.first = static_cast<uint32_t>(first);
+    p.count = static_cast<uint32_t>(count);
+    p.buffer_id = dst->id();
+    p.dst_offset = offset;
+    bridge_.QueryPacket(kGpuOpcodeResolveQuery, &p, sizeof(p), dst->id(), true);
+    count_work(Work::QueryPackets);
+    count_work(Work::QueryResultsWritten, static_cast<uint32_t>(count));
+    if (dst->cpu_address() != 0) {
+        // A CPU-visible destination (a readback heap): the resolved bytes also go back to its memory.
+        GpuReadbackBufferPayload rb{};
+        rb.buffer_id = dst->id();
+        rb.src_offset = offset;
+        rb.size = count * 8;
+        if (readback_target(dst->cpu_address() + offset, count * 8, &rb.dst_addr, &rb.done_addr)) {
+            record_readback(GpuOpcode::ReadbackBuffer, &rb, sizeof(rb), dst->id(), dst->cpu_address() + offset,
+                            count * 8);
+        }
     }
 }
 

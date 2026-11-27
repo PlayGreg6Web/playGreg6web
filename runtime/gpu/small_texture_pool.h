@@ -59,6 +59,12 @@ bool gpu_texture_copy() noexcept;
 void set_gpu_texture_copy_transcode(bool on) noexcept;
 bool gpu_texture_copy_transcode() noexcept;
 
+// The GPU consumer runs guest query heaps itself (kGpuOpcodeCreateQuerySet / Query / ResolveQuery):
+// occlusion and timestamp query heaps get query sets, BeginQuery / EndQuery / ResolveQueryData become
+// packets. Enabled by live native boots only (the browser worker does not implement the packets).
+void set_gpu_queries(bool on) noexcept;
+bool gpu_queries() noexcept;
+
 struct SmallTextureShape {
     uint64_t owner = 0;  // the device that owns the host texture ids (ids are per device)
     uint32_t dxgi_format = 0;
