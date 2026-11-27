@@ -1,5 +1,6 @@
 #include "os/guest_window.h"
 #include "os/thread_name.h"
+#include "os/thread_spans.h"
 #include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
 #include "gpu/d3d12_guest_objects.h"
@@ -477,7 +478,8 @@ void Device::submit(const uint8_t* data, size_t size) {
 }
 
 void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts) {
-    std::lock_guard<std::mutex> lock(submit_mutex_);
+    os::lock_with_span(submit_mutex_, os::SpanKind::D3dLock);
+    std::lock_guard<std::mutex> lock(submit_mutex_, std::adopt_lock);
     if (!frame_open_) {
         CommandEncoder begin;
         begin.begin_frame();

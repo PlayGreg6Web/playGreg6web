@@ -1057,6 +1057,12 @@ bool start_live_window() {
     }
     g_live_started = true;
     playgta6::os::set_wgpu_submit_observer(&live_observer);
+    // frame_breakdown: the executor's busy time and the packet bytes, sampled at every present.
+    guest::set_frame_counter_source([](uint64_t* executor_ns, uint64_t* submitted_bytes) {
+        const ne::LivePumpStats st = g_live.stats();
+        *executor_ns = st.execute_ns;
+        *submitted_bytes = st.submitted_bytes;
+    });
     // Every 5 s: where the frame time goes (so a run below 60 fps names its cap): presents/s, the share of
     // wall time the guest's submit() was blocked behind a full executor queue, and the share it slept in
     // the present pacer (title-driven waits). Neither high = the guest's own CPU is the limit.
@@ -1750,6 +1756,7 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> lock(g_live_final_mutex);
                 if (g_live_final_stats != "null") o += ",\n  \"native_executor\": " + g_live_final_stats;
                 else if (g_live_started) o += ",\n  \"native_executor\": " + g_live.stats_json();
+                if (g_live_started) o += ",\n  \"live_pump\": " + g_live.stats_json();
             }
 #endif
             o += ",\n  \"rt\": " + gpu::rt_arena::report_json();

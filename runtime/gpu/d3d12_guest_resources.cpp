@@ -25,6 +25,7 @@
 
 #include "gpu/gfx10_detile.h"
 #include "os/guest_window.h"
+#include "os/thread_spans.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/vmem.h"
@@ -2038,7 +2039,8 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
 }
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
-    std::lock_guard<std::mutex> flush_lock(flush_mutex_);
+    os::lock_with_span(flush_mutex_, os::SpanKind::D3dLock);
+    std::lock_guard<std::mutex> flush_lock(flush_mutex_, std::adopt_lock);
     // G70 (#691): emit deferred DestroyResource packets from the previous frame once Present has
     // advanced (strictly after that frame's Present and before any draw in the new frame).
     bridge_->advance_present_frame(stats().presents, encoder);
@@ -3245,6 +3247,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
             emit(run_start, run_end);
         }
         device_->note_shadow_compared(compared);
+        count_work(Work::ShadowComparedBytes, compared);
         if (uploaded != 0) {
             device_->note_upload(uploaded);
         }
@@ -3260,6 +3263,9 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
                   },
                   &differs);
     device_->note_shadow_compared(size);
+    count_work(Work::ShadowComparedBytes, size);
+    count_work(Work::ShadowFullCompares);
+    count_work(Work::ShadowFullCompareBytes, size);
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
         const bool changed = differs[static_cast<size_t>(page / kShadowPage)] != 0;

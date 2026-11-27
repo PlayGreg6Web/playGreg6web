@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "os/host_sleep.h"
+#include "os/thread_spans.h"
 
 namespace playgta6::gpu {
 
@@ -168,7 +169,10 @@ uint64_t PresentPacer::present(uint32_t interval) {
         auto now_fn = now_;
         auto sleep_until = sleep_until_;
         lock.unlock();
-        sleep_until(until);
+        {
+            const os::ThreadSpan frame_span(os::SpanKind::Pacer);
+            sleep_until(until);
+        }
         const Clock::time_point after = now_fn();
         lock.lock();
         if (generation_ == gen) {
@@ -217,7 +221,10 @@ uint64_t PresentPacer::present(uint32_t interval) {
     auto now_fn = now_;
     auto sleep_until = sleep_until_;
     lock.unlock();
-    sleep_until(until);
+    {
+        const os::ThreadSpan frame_span(os::SpanKind::Pacer);
+        sleep_until(until);
+    }
     const Clock::time_point after = now_fn();
     lock.lock();
     if (generation_ == gen) {

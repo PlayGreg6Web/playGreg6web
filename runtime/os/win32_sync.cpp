@@ -24,6 +24,7 @@
 #include <intrin.h>
 #endif
 
+#include "os/thread_spans.h"
 #include "os/threading.h"
 
 static_assert(sizeof(Pg6CriticalSection) <= 40, "CRITICAL_SECTION is 40 bytes on x64");
@@ -1720,6 +1721,7 @@ int32_t pg6_win32_release_mutex(Pg6Handle mutex) {
 uint32_t pg6_win32_wait_for_single_object_ex(Pg6Handle handle,
                                              uint32_t timeout_ms,
                                              int32_t alertable) {
+    const playgta6::os::ThreadSpan frame_span(timeout_ms != 0 ? playgta6::os::SpanKind::Wait : playgta6::os::SpanKind::Count);
     return playgta6::os::win32::WaitForSingleObjectEx(handle, timeout_ms, alertable != 0);
 }
 
@@ -1727,6 +1729,7 @@ uint32_t pg6_win32_wait_for_multiple_objects(uint32_t count,
                                              const Pg6Handle* handles,
                                              int32_t wait_all,
                                              uint32_t timeout_ms) {
+    const playgta6::os::ThreadSpan frame_span(timeout_ms != 0 ? playgta6::os::SpanKind::Wait : playgta6::os::SpanKind::Count);
     return playgta6::os::win32::WaitForMultipleObjects(count, handles, wait_all != 0, timeout_ms);
 }
 
@@ -1735,6 +1738,7 @@ uint32_t pg6_win32_wait_for_multiple_objects_ex(uint32_t count,
                                                 int32_t wait_all,
                                                 uint32_t timeout_ms,
                                                 int32_t alertable) {
+    const playgta6::os::ThreadSpan frame_span(timeout_ms != 0 ? playgta6::os::SpanKind::Wait : playgta6::os::SpanKind::Count);
     return playgta6::os::win32::WaitForMultipleObjectsEx(
         count, handles, wait_all != 0, timeout_ms, alertable != 0);
 }
@@ -1747,6 +1751,7 @@ int32_t pg6_win32_sleep_condition_variable_srw(Pg6ConditionVariable* condition_v
                                                Pg6SrwLock* srw_lock,
                                                uint32_t timeout_ms,
                                                uint32_t flags) {
+    const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::CondVar);
     return playgta6::os::win32::SleepConditionVariableSRW(
                condition_variable, srw_lock, timeout_ms, flags)
                ? 1
@@ -1756,6 +1761,7 @@ int32_t pg6_win32_sleep_condition_variable_srw(Pg6ConditionVariable* condition_v
 int32_t pg6_win32_sleep_condition_variable_cs(Pg6ConditionVariable* condition_variable,
                                               Pg6CriticalSection* critical_section,
                                               uint32_t timeout_ms) {
+    const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::CondVar);
     return playgta6::os::win32::SleepConditionVariableCS(
                condition_variable, critical_section, timeout_ms)
                ? 1

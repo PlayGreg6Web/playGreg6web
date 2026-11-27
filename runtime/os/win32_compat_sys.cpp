@@ -17,6 +17,7 @@
 #include "os/win32_compat.h"
 #include "os/win32_compat_internal.h"
 #include "os/win32_loader.h"
+#include "os/thread_spans.h"
 #include "os/win32_sync.h"
 
 namespace playgta6::os::win32 {
@@ -646,6 +647,7 @@ void pg6_win32_sleep(uint32_t milliseconds) {
     }
     // Precise (os/host_sleep.h): titles poll with Sleep(1), which the host timer tick stretched to
     // ~16 ms per poll.
+    const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Sleep);
     playgta6::os::host_sleep::sleep_for(std::chrono::milliseconds(milliseconds));
 }
 

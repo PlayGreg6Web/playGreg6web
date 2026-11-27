@@ -15,6 +15,7 @@
 #include "gpu/drop_table.h"
 #include "gpu/gpu_va_watch.h"
 #include "os/guest_window.h"
+#include "os/thread_spans.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -81,6 +82,9 @@ const char* work_name(Work w) {
     case Work::StencilTwinCopiesIn: return "stencil_twin_copies_in";
     case Work::StencilTwinCopiesOut: return "stencil_twin_copies_out";
     case Work::StencilTwinDraws: return "stencil_twin_draws";
+    case Work::ShadowComparedBytes: return "shadow_compared_bytes";
+    case Work::ShadowFullCompares: return "shadow_full_compares";
+    case Work::ShadowFullCompareBytes: return "shadow_full_compare_bytes";
     case Work::Count: break;
     }
     return "?";
@@ -1374,6 +1378,7 @@ HResult Device::CreateCommandListX(const GuestCommandListDescX* desc, InterfaceA
 // ---------------------------------------------------------------------------------------------
 
 void CommandQueue::ExecuteCommandListsX(com::CallContext& ctx) {
+    const os::ThreadSpan frame_span(os::SpanKind::D3dExecute);  // frame_breakdown
     // (NumCommandLists, ppCommandLists, frame token, flags): the token (device slot 80's output, 0
     // outside a frame) is recorded; the flags are not interpreted.
     const uint32_t count = static_cast<uint32_t>(ctx.int_arg(1));
@@ -1417,10 +1422,16 @@ void CommandQueue::execute(const std::vector<uint64_t>& lists) {
     for (CommandList* list : resolved) {
         list->issue_readbacks();  // G66: numbered (and counted) before any signal can follow them
     }
-    device_->flush_cpu_buffers(parts[0]);
+    {
+        const os::ThreadSpan part_span(os::SpanKind::D3dFlush);
+        device_->flush_cpu_buffers(parts[0]);
+    }
     std::vector<d3d::StateDiagnostic> state_diags;
-    for (size_t i = 0; i < resolved.size(); ++i) {
-        resolved[i]->append_submission(parts[i + 1], &state_diags);
+    {
+        const os::ThreadSpan part_span(os::SpanKind::D3dAppend);
+        for (size_t i = 0; i < resolved.size(); ++i) {
+            resolved[i]->append_submission(parts[i + 1], &state_diags);
+        }
     }
     device_->end_submission();
     std::vector<std::pair<const uint8_t*, size_t>> spans;
@@ -1437,7 +1448,10 @@ void CommandQueue::execute(const std::vector<uint64_t>& lists) {
         ordered.push_back(spans[1 + i]);
         ordered.push_back(spans[1 + resolved.size() + i]);
     }
-    device_->submit_parts(ordered);
+    {
+        const os::ThreadSpan part_span(os::SpanKind::D3dSubmit);
+        device_->submit_parts(ordered);
+    }
     for (CommandList* list : resolved) {
         list->apply_immediate_writes();
     }

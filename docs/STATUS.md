@@ -137,6 +137,9 @@ A run stopped or crashed? Start with [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md).
 Also: `tools/surface_survey.py` (static ranked survey of trapping COM slots and unresolved imports reachable from boot, #1870),
 `tools/minidump_stack.py` (host stack of a fault minidump, #1858). Boot reports carry build/run metadata (commit, dirty,
 profile, executor, preset; #1864) and a whole-run per-phase frame-time histogram with 1%/0.1% lows (`frame_times`, #1879)
-that `boot_summary.py` and `run_history.py` print; both also read browser run dirs (#1874).
+that `boot_summary.py` and `run_history.py` print; both also read browser run dirs (#1874). `frame_breakdown` splits each
+phase's (and each 5 s window's) mean frame into the present thread's CPU (guest code vs our D3D12 flush / append / submit),
+its blocked spans (guest waits, condvars, contended locks, sleeps, frame events, pacer, executor backpressure), process CPU,
+executor time and upload / shadow-compare volume; `live_pump` adds the executor queue's totals.
 
 Reports hold hashes, addresses and counts only, never game bytes.

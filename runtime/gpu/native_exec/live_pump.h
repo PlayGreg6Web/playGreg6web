@@ -18,6 +18,7 @@
 #pragma once
 
 #include "os/thread_name.h"
+#include "os/thread_spans.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -48,6 +49,7 @@ struct LivePumpStats {
     uint64_t presents = 0;             // Present packets the executor reported
     uint64_t blocked_submits = 0;      // submits that had to wait for room (backpressure)
     uint64_t blocked_ns = 0;           // total wait of those submits
+    uint64_t execute_ns = 0;           // time the pump thread spent inside the executor's execute()
     uint64_t dropped_after_close = 0;  // batches discarded after close / stop
     uint64_t discarded_on_close = 0;   // queued batches dropped when the window closed
     uint64_t max_queue_depth = 0;
@@ -102,6 +104,7 @@ public:
         }
         if (full_locked(len)) {
             ++stats_.blocked_submits;
+            const os::ThreadSpan frame_span(os::SpanKind::SubmitBlocked);  // the submitting thread's frame_breakdown
             const auto t0 = std::chrono::steady_clock::now();
             room_cv_.wait(lock, [&] { return !full_locked(len) || closed_ || stopping_; });
             stats_.blocked_ns += static_cast<uint64_t>(
@@ -182,6 +185,7 @@ public:
         return "{\"submitted\": " + u(s.submitted) + ", \"submitted_bytes\": " + u(s.submitted_bytes) +
                ", \"executed\": " + u(s.executed) + ", \"presents\": " + u(s.presents) +
                ", \"blocked_submits\": " + u(s.blocked_submits) + ", \"blocked_ms\": " + u(s.blocked_ns / 1000000) +
+               ", \"execute_ms\": " + u(s.execute_ns / 1000000) +
                ", \"dropped_after_close\": " + u(s.dropped_after_close) +
                ", \"discarded_on_close\": " + u(s.discarded_on_close) +
                ", \"max_queue_depth\": " + u(s.max_queue_depth) + ", \"polls\": " + u(s.polls) +
@@ -255,10 +259,14 @@ private:
                 }
             }
             if (!batch.empty()) {
+                const auto t0 = std::chrono::steady_clock::now();
                 const uint32_t presents = exec->execute(batch.data(), batch.size());
+                const auto ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     ++stats_.executed;
+                    stats_.execute_ns += ns;
                     stats_.presents += presents;
                 }
                 batch.clear();

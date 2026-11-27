@@ -25,6 +25,9 @@
 #include "os/audio_file_stats.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
+#include "gpu/frame_breakdown.h"
+#include "os/thread_name.h"
+#include "os/thread_spans.h"
 #include "gpu/frame_time_hist.h"
 #include "gpu/phase_hash_counts.h"
 #include "gpu/present_pacing.h"
@@ -368,6 +371,7 @@ struct Milestone {
 };
 
 std::atomic<ReportExtension> g_report_extension{nullptr};
+std::atomic<FrameCounterSource> g_frame_counter_source{nullptr};
 // Set before boot (set_build_info_json), possibly from a static initializer: function-local so the
 // order of translation-unit initialisation does not matter.
 std::string& build_info_json() {
@@ -450,6 +454,7 @@ struct BootState {
     uint64_t present_elapsed_ms = 0;
     gpu::PresentSampleRing present_samples;  // guarded by `mutex` (R40)
     gpu::FrameTimeStats frame_times;         // guarded by `mutex`: whole-run frame-time histogram
+    gpu::FrameBreakdown frame_breakdown;     // guarded by `mutex`: where each phase's frame time goes
     int64_t last_present_us = -1;            // guarded by `mutex`: steady clock of the previous present
     std::vector<RecentImport> trace;     // optional import trace, guarded by `mutex`
     std::vector<std::string> trace_strings;  // string arguments of each trace entry
@@ -3036,6 +3041,7 @@ std::string build_report() {
     {
         std::lock_guard<std::mutex> lock(b.mutex);
         o += "  \"frame_times\": " + b.frame_times.to_json() + ",\n";
+        o += "  \"frame_breakdown\": " + b.frame_breakdown.to_json() + ",\n";
     }
     // R40: per-present samples without a GPU capture (the last gpu::PresentSampleRing::kDefaultCapacity).
     {
@@ -4028,6 +4034,10 @@ void set_report_extension(ReportExtension extension) {
     g_report_extension.store(extension, std::memory_order_release);
 }
 
+void set_frame_counter_source(FrameCounterSource source) {
+    g_frame_counter_source.store(source, std::memory_order_release);
+}
+
 // The present pacer's observer: every PresentX records a sample (R40); the first marks first_present.
 static void record_present() {
     namespace d3d = gpu::d3d12_guest;
@@ -4040,6 +4050,19 @@ static void record_present() {
                              : gpu::PresentPacer::title_gap_vblanks(ps.last_interval, gpu::present_pacer().honor_interval());
     const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now().time_since_epoch()).count();
+    // frame_breakdown: the present thread's cumulative clocks (sampled before the lock).
+    gpu::FrameSample fs;
+    fs.thread_key = static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    fs.thread_cpu_ns = os::this_thread_cpu_ns();
+    fs.spans = os::this_thread_spans();
+    fs.process_cpu_ns = os::process_cpu_ns();
+    if (const FrameCounterSource src = g_frame_counter_source.load(std::memory_order_acquire)) {
+        src(&fs.executor_ns, &fs.submitted_bytes);
+    }
+    fs.texture_uploads = d3d::work_total(d3d::Work::TextureUploads);
+    fs.resources_created = resources;
+    fs.shadow_compared_bytes = d3d::work_total(d3d::Work::ShadowComparedBytes);
+    fs.shadow_full_bytes = d3d::work_total(d3d::Work::ShadowFullCompareBytes);
     {
         BootState& b = boot();
         std::lock_guard<std::mutex> lock(b.mutex);
@@ -4047,6 +4070,8 @@ static void record_present() {
         if (b.last_present_us >= 0 && now_us >= b.last_present_us) {
             b.frame_times.add(static_cast<uint64_t>(now_us - b.last_present_us), b.present_samples.last().draws, gap,
                               elapsed_ms());
+            b.frame_breakdown.add(static_cast<uint64_t>(now_us - b.last_present_us) * 1000u,
+                                  b.present_samples.last().draws, fs, elapsed_ms());
             gpu::d3d12_guest::set_current_gpu_phase(
                 gpu::d3d12_guest::gpu_phase_for_draws(b.present_samples.last().draws));
         }
@@ -4227,6 +4252,7 @@ void reset_boot() {
     b.present_elapsed_ms = 0;
     b.present_samples.clear();
     b.frame_times.clear();
+    b.frame_breakdown.clear();
     gpu::d3d12_guest::set_current_gpu_phase(0);
     b.last_present_us = -1;
     b.trace.clear();

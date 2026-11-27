@@ -18,6 +18,7 @@
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
+#include "os/thread_spans.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
@@ -2388,6 +2389,10 @@ void pg6_win32_initialize_srw_lock(Pg6SrwLock* srw_lock) {
 }
 
 void pg6_win32_acquire_srw_lock_exclusive(Pg6SrwLock* srw_lock) {
+    if (playgta6::os::win32::TryAcquireSRWLockExclusive(srw_lock)) {
+        return;
+    }
+    const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Lock);  // contended
     playgta6::os::win32::AcquireSRWLockExclusive(srw_lock);
 }
 
@@ -2396,6 +2401,10 @@ void pg6_win32_release_srw_lock_exclusive(Pg6SrwLock* srw_lock) {
 }
 
 void pg6_win32_acquire_srw_lock_shared(Pg6SrwLock* srw_lock) {
+    if (playgta6::os::win32::TryAcquireSRWLockShared(srw_lock)) {
+        return;
+    }
+    const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Lock);  // contended
     playgta6::os::win32::AcquireSRWLockShared(srw_lock);
 }
 
@@ -2420,6 +2429,10 @@ void pg6_win32_delete_critical_section(Pg6CriticalSection* critical_section) {
 }
 
 void pg6_win32_enter_critical_section(Pg6CriticalSection* critical_section) {
+    if (playgta6::os::win32::TryEnterCriticalSection(critical_section)) {
+        return;
+    }
+    const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Lock);  // contended
     playgta6::os::win32::EnterCriticalSection(critical_section);
 }
 
@@ -2456,6 +2469,10 @@ int32_t pg6_win32_reset_event(Pg6Handle event_handle) {
 }
 
 uint32_t pg6_win32_wait_for_single_object(Pg6Handle handle, uint32_t timeout_ms) {
+    if (timeout_ms != 0) {
+        const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Wait);
+        return playgta6::os::win32::WaitForSingleObject(handle, timeout_ms);
+    }
     return playgta6::os::win32::WaitForSingleObject(handle, timeout_ms);
 }
 

@@ -625,6 +625,11 @@ uint64_t boot_present_count();
 // trailing comma; empty for none), called whenever the report is built. nullptr removes it.
 using ReportExtension = std::string (*)();
 void set_report_extension(ReportExtension extension);
+// Whole-process counters the report's `frame_breakdown` samples at every present, from outside the
+// guest library (the live executor): time inside the executor, packet bytes handed to it. nullptr
+// (the default) samples zeros.
+using FrameCounterSource = void (*)(uint64_t* executor_ns, uint64_t* submitted_bytes);
+void set_frame_counter_source(FrameCounterSource source);
 // Build metadata (a JSON object: source commit, dirty flag, recomp hash, profile, executor) the report
 // carries as `build`. Set once before boot by the harness / wasm entry; empty means no block.
 void set_build_info_json(std::string json);

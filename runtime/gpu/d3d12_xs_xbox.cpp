@@ -4,6 +4,7 @@
 
 #include "gpu/d3d12_xs_xbox.h"
 #include "os/thread_name.h"
+#include "os/thread_spans.h"
 
 #include <algorithm>
 #include <array>
@@ -1338,6 +1339,7 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
     uint64_t in = 0;
     token.read(in);
     count(xbox::Counter::FrameWaits);
+    const os::ThreadSpan frame_span(timeout_ms != 0 ? os::SpanKind::FrameEvent : os::SpanKind::Count);
     auto mint_token = [&](uint64_t floor_frame) {
         const uint64_t floor_tok = std::max<uint64_t>(floor_frame, 1);
         uint64_t prev = last_frame_token_.load(std::memory_order_relaxed);
@@ -2484,6 +2486,7 @@ uint32_t emit_color_managed_present_planes(Device* device, std::span<const Prepa
 }  // namespace
 
 HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) {
+    const os::ThreadSpan frame_span(os::SpanKind::D3dPresent);  // frame_breakdown (the pacer wait is its own span)
     device_->frame_pacer().note_present_thread(std::this_thread::get_id());
     if (plane_count == 0) {
         device_->count(xbox::Counter::PresentsWithoutPlanes);

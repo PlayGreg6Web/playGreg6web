@@ -1737,6 +1737,11 @@ enum class Work : size_t {
     StencilTwinCopiesIn,
     StencilTwinCopiesOut,
     StencilTwinDraws,
+    // CPU-visible buffer flush at ExecuteCommandLists (flush_shadow): bytes compared with the shadow,
+    // and the whole-buffer comparisons (no write tracking for the buffer) with their bytes.
+    ShadowComparedBytes,
+    ShadowFullCompares,
+    ShadowFullCompareBytes,
     Count
 };
 void count_work(Work w, uint64_t n = 1);
