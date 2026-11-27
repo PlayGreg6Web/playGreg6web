@@ -61,6 +61,9 @@ use crate::pointer_slot;
 use crate::reach;
 use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
 
+mod pred_index;
+use pred_index::PredIndex;
+
 /// `int 0x29` is the Windows `__fastfail` trap and never returns.
 const FASTFAIL_VECTOR: u8 = 0x29;
 
@@ -80,12 +83,6 @@ const MAX_VTABLE_ENTRIES: usize = 1024;
 /// Incoming intra-function edges of a block: how many, one of them, and every source block
 /// (`others` holds the sources beyond `from`).
 #[derive(Clone)]
-struct Pred {
-    count: u32,
-    from: u64,
-    edge: Edge,
-    others: Vec<u64>,
-}
 
 /// Where an address falls relative to already decoded blocks.
 enum Decoded {
@@ -317,8 +314,13 @@ struct Discovery<'i, 'a> {
     /// Threads for the read-only waves ([`par_map`]).
     threads: usize,
     no_return: BTreeSet<u64>,
-    /// Every block decoded so far, keyed by start VA.
+    /// Every block decoded so far, keyed by start VA. Change it only through
+    /// [`Self::insert_block`], [`Self::set_successors`] and [`Self::split`], which keep
+    /// [`Self::preds`] in step.
     blocks: BTreeMap<u64, BasicBlock>,
+    /// Incoming intra-function edges of every block in [`Self::blocks`], maintained on every edge
+    /// change (always equal to [`PredIndex::from_blocks`]).
+    preds: PredIndex,
     /// Every known block start (decoded or still queued).
     leaders: BTreeSet<u64>,
     /// Pending block starts popped in ascending VA order for input-order independence.
@@ -362,6 +364,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             threads,
             no_return: image.no_return.iter().copied().collect(),
             blocks: BTreeMap::new(),
+            preds: PredIndex::default(),
             leaders: BTreeSet::new(),
             worklist: BTreeSet::new(),
             entries: BTreeSet::new(),
@@ -577,7 +580,39 @@ impl<'i, 'a> Discovery<'i, 'a> {
         };
         head.end = at;
         head.terminator = Terminator::Fallthrough;
-        self.blocks.insert(at, tail);
+        self.preds.remove(start, &tail.successors);
+        self.preds.add(start, &head.successors);
+        self.insert_block(at, tail);
+    }
+
+    /// Store a decoded block (replacing any block at `start`) and index its edges.
+    fn insert_block(&mut self, start: u64, block: BasicBlock) {
+        if let Some(old) = self.blocks.remove(&start) {
+            self.preds.remove(start, &old.successors);
+        }
+        self.preds.add(start, &block.successors);
+        self.blocks.insert(start, block);
+    }
+
+    /// Replace the successors of the block at `start` (no-op when there is none).
+    fn set_successors(&mut self, start: u64, successors: Vec<Edge>) {
+        let Some(block) = self.blocks.get_mut(&start) else {
+            return;
+        };
+        self.preds.remove(start, &block.successors);
+        self.preds.add(start, &successors);
+        block.successors = successors;
+    }
+
+    /// Unit tests check the incremental predecessor index against a full rebuild before every
+    /// phase that reads it.
+    fn check_preds(&self) {
+        #[cfg(test)]
+        assert_eq!(
+            self.preds,
+            PredIndex::from_blocks(&self.blocks),
+            "incremental predecessor index out of step with the block map"
+        );
     }
 
     /// First known leader at or after `va`, if any.
@@ -596,7 +631,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     address: start,
                     kind,
                 });
-                self.blocks.insert(start, block);
+                self.insert_block(start, block);
                 return;
             }
         };
@@ -690,7 +725,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 break;
             }
         }
-        self.blocks.insert(start, block);
+        self.insert_block(start, block);
     }
 
     /// Record control flow of `instr` (already appended to `block`). Returns the terminator if
@@ -821,30 +856,6 @@ impl<'i, 'a> Discovery<'i, 'a> {
         }
     }
 
-    /// Incoming intra-function edges of every block.
-    fn predecessors(&self) -> BTreeMap<u64, Pred> {
-        let mut preds: BTreeMap<u64, Pred> = BTreeMap::new();
-        for (&from, block) in &self.blocks {
-            for &edge in &block.successors {
-                if let Some(target) = edge.intra_target() {
-                    preds
-                        .entry(target)
-                        .and_modify(|p| {
-                            p.count = p.count.saturating_add(1);
-                            p.others.push(from);
-                        })
-                        .or_insert(Pred {
-                            count: 1,
-                            from,
-                            edge,
-                            others: Vec::new(),
-                        });
-                }
-            }
-        }
-        preds
-    }
-
     /// The block whose last instruction is the indirect jump at `site`.
     fn jump_block(&self, site: u64) -> Option<u64> {
         let Decoded::Boundary { start, index } = self.locate(site) else {
@@ -857,7 +868,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// The jump at `site` together with its chain of sole predecessors, and the first block of
     /// that chain.
-    fn jump_trace(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<(Vec<Step<'_>>, u64)> {
+    fn jump_trace(&self, site: u64, preds: &PredIndex) -> Option<(Vec<Step<'_>>, u64)> {
         let start = self.jump_block(site)?;
         let mut chain = vec![(self.blocks.get(&start)?, None)];
         let mut current = start;
@@ -908,19 +919,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
         &self,
         trace: &[Step<'_>],
         first_block: u64,
-        preds: &BTreeMap<u64, Pred>,
+        preds: &PredIndex,
     ) -> Option<(Vec<(Instruction, bool)>, Vec<(Instruction, bool)>)> {
         let live = live_in_registers(trace);
         if live.is_empty() {
             return None;
         }
         let preds_of = |b: u64| -> Vec<u64> {
-            preds.get(&b).map_or_else(Vec::new, |p| {
-                let mut v = Vec::with_capacity(1 + p.others.len());
-                v.push(p.from);
-                v.extend(p.others.iter().copied());
-                v
-            })
+            preds.get(&b).map_or_else(Vec::new, |p| p.sources())
         };
         let is_entry = |b: u64| {
             self.entries.contains(&b)
@@ -985,7 +991,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
     fn match_jump_table(
         &self,
         site: u64,
-        preds: &BTreeMap<u64, Pred>,
+        preds: &PredIndex,
         bases: &BTreeSet<u64>,
     ) -> Option<JumpTable> {
         let table = self.match_jump_table_raw(site, preds)?;
@@ -993,7 +999,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
     }
 
     /// Slice the jump at `site` together with its chain of sole predecessors.
-    fn match_jump_table_raw(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<JumpTable> {
+    fn match_jump_table_raw(&self, site: u64, preds: &PredIndex) -> Option<JumpTable> {
         let (trace, first_block) = self.jump_trace(site, preds)?;
         let leaf = self.leaf_extent(site);
         let direct = jump_table::resolve_in(self.image, &trace, leaf);
@@ -1043,7 +1049,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
         &self,
         trace: &[Step<'_>],
         first_block: u64,
-        preds: &BTreeMap<u64, Pred>,
+        preds: &PredIndex,
         leaf: Option<(u64, u64)>,
         all: &[(Instruction, bool)],
     ) -> Option<JumpTable> {
@@ -1052,12 +1058,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             return None;
         }
         let preds_of = |b: u64| -> Vec<u64> {
-            preds.get(&b).map_or_else(Vec::new, |p| {
-                let mut v = Vec::with_capacity(1 + p.others.len());
-                v.push(p.from);
-                v.extend(p.others.iter().copied());
-                v
-            })
+            preds.get(&b).map_or_else(Vec::new, |p| p.sources())
         };
         let is_entry = |b: u64| {
             self.entries.contains(&b)
@@ -1103,7 +1104,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// Why each indirect jump without an import slot that is left to run-time dispatch did not
     /// resolve ([`jump_table::classify`] on the same slice and reaching facts the match used).
     fn classify_unresolved_jumps(&self) -> BTreeMap<u64, UnresolvedJump> {
-        let preds = self.predecessors();
+        self.check_preds();
+        let preds = &self.preds;
         let jumps: Vec<u64> = self
             .blocks
             .values()
@@ -1116,8 +1118,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .filter_map(|block| block.instructions.last().map(Instruction::ip))
             .collect();
         par_map(self.threads, &jumps, |&site| {
-            let (trace, first_block) = self.jump_trace(site, &preds)?;
-            let kind = match self.reaching_prefix(&trace, first_block, &preds) {
+            let (trace, first_block) = self.jump_trace(site, preds)?;
+            let kind = match self.reaching_prefix(&trace, first_block, preds) {
                 Some((_, all)) if !all.is_empty() => {
                     jump_table::classify(self.image, &prefixed(&all, &trace))
                 }
@@ -1167,7 +1169,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// seed it ahead of time. The jump/call stays on run-time dispatch. Returns whether any new
     /// entry was added.
     fn seed_pointer_slots(&mut self) -> bool {
-        let preds = self.predecessors();
+        self.check_preds();
+        let preds = &self.preds;
         let jumps: Vec<u64> = self
             .blocks
             .values()
@@ -1181,7 +1184,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .filter(|site| !self.slot_checked.contains(site))
             .collect();
         let found: Vec<(u64, Option<(u64, u64)>)> = par_map(self.threads, &jumps, |&site| {
-            let hit = self.jump_trace(site, &preds).and_then(|(trace, _)| {
+            let hit = self.jump_trace(site, preds).and_then(|(trace, _)| {
                 let instrs: Vec<&Instruction> = trace.iter().map(|s| s.instr).collect();
                 pointer_slot::static_target(self.image, &instrs)
             });
@@ -1329,10 +1332,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
             return false;
         }
         // One predecessor snapshot per round keeps the outcome independent of visiting order.
-        let preds = self.predecessors();
+        self.check_preds();
+        let preds = &self.preds;
         let pending: Vec<u64> = pending.into_iter().collect();
         let matched: Vec<JumpTable> = par_map(self.threads, &pending, |&site| {
-            self.match_jump_table_raw(site, &preds)
+            self.match_jump_table_raw(site, preds)
         })
         .into_iter()
         .flatten()
@@ -1349,17 +1353,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
         for &site in &pending {
             if done.contains(&site) {
                 self.failed_jumps.remove(&site);
-            } else if let Some(shape) = self.jump_shape(site, &preds) {
+            } else if let Some(shape) = self.jump_shape(site, preds) {
                 self.failed_jumps.insert(site, shape);
             }
         }
         for table in resolved {
-            if let Some(block) = self
-                .jump_block(table.site)
-                .and_then(|start| self.blocks.get_mut(&start))
-            {
+            if let Some(start) = self.jump_block(table.site) {
                 let targets: BTreeSet<u64> = table.all_targets().collect();
-                block.successors = targets.into_iter().map(Edge::JumpTable).collect();
+                self.set_successors(start, targets.into_iter().map(Edge::JumpTable).collect());
             }
             let tail_calls = jump_table::is_fn_table(self.image, &table);
             for target in table.unique_targets() {
@@ -1377,7 +1378,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// What a jump's match depends on locally: the first block of its slice, the slice length and
     /// the incoming edges of that block.
-    fn jump_shape(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<JumpShape> {
+    fn jump_shape(&self, site: u64, preds: &PredIndex) -> Option<JumpShape> {
         let (trace, first_block) = self.jump_trace(site, preds)?;
         let incoming = preds.get(&first_block).map_or(0, |p| p.count);
         Some((first_block, trace.len(), incoming))
@@ -1389,14 +1390,15 @@ impl<'i, 'a> Discovery<'i, 'a> {
         if self.failed_jumps.is_empty() {
             return false;
         }
-        let preds = self.predecessors();
+        self.check_preds();
+        let preds = &self.preds;
         let changed: Vec<u64> = self
             .failed_jumps
             .iter()
             .filter(|(site, shape)| {
                 !self.jump_tables.contains_key(site)
                     && self.jump_retries.get(site).copied().unwrap_or(0) < MAX_TABLE_REVISIONS
-                    && self.jump_shape(**site, &preds).is_some_and(|now| now != **shape)
+                    && self.jump_shape(**site, preds).is_some_and(|now| now != **shape)
             })
             .map(|(&site, _)| site)
             .collect();
@@ -1415,7 +1417,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// longer match at all are left to [`Self::verify_jump_tables`]. Each table is revised at most
     /// [`MAX_TABLE_REVISIONS`] times, so the rounds terminate.
     fn revise_jump_tables(&mut self) -> bool {
-        let preds = self.predecessors();
+        self.check_preds();
+        let preds = &self.preds;
         let candidates: Vec<(&u64, &JumpTable)> = self
             .jump_tables
             .iter()
@@ -1425,7 +1428,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .collect();
         let bases = self.table_bases();
         let changed: Vec<JumpTable> = par_map(self.threads, &candidates, |&(site, table)| {
-            let now = self.match_jump_table(*site, &preds, &bases)?;
+            let now = self.match_jump_table(*site, preds, &bases)?;
             (now != *table).then_some(now)
         })
         .into_iter()
@@ -1435,12 +1438,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
         for table in changed {
             let revisions = self.table_revisions.entry(table.site).or_insert(0);
             *revisions = revisions.saturating_add(1);
-            if let Some(block) = self
-                .jump_block(table.site)
-                .and_then(|start| self.blocks.get_mut(&start))
-            {
+            if let Some(start) = self.jump_block(table.site) {
                 let targets: BTreeSet<u64> = table.all_targets().collect();
-                block.successors = targets.into_iter().map(Edge::JumpTable).collect();
+                self.set_successors(start, targets.into_iter().map(Edge::JumpTable).collect());
             }
             let tail_calls = jump_table::is_fn_table(self.image, &table);
             for target in table.unique_targets() {
@@ -1460,11 +1460,12 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// second predecessor), until the remaining set is stable.
     fn verify_jump_tables(&mut self) {
         loop {
-            let preds = self.predecessors();
+            self.check_preds();
+            let preds = &self.preds;
             let tables: Vec<(&u64, &JumpTable)> = self.jump_tables.iter().collect();
             let bases = self.table_bases();
             let stale: Vec<u64> = par_map(self.threads, &tables, |&(site, table)| {
-                (self.match_jump_table(*site, &preds, &bases).as_ref() != Some(table))
+                (self.match_jump_table(*site, preds, &bases).as_ref() != Some(table))
                     .then_some(*site)
             })
             .into_iter()
@@ -1475,11 +1476,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
             for site in stale {
                 self.jump_tables.remove(&site);
-                if let Some(block) = self
-                    .jump_block(site)
-                    .and_then(|start| self.blocks.get_mut(&start))
-                {
-                    block.successors = vec![Edge::IndirectJump { slot: None }];
+                if let Some(start) = self.jump_block(site) {
+                    self.set_successors(start, vec![Edge::IndirectJump { slot: None }]);
                 }
             }
         }
@@ -2790,9 +2788,10 @@ mod tests {
         state.add_function(TEXT);
         state.seed_resume_target(TEXT, TEXT + 2);
         state.run();
-        let preds = state.predecessors();
+        state.check_preds();
+        let preds = &state.preds;
         let (trace, first_block) = state
-            .jump_trace(TEXT + 8, &preds)
+            .jump_trace(TEXT + 8, preds)
             .expect("jump trace exists");
         assert_eq!(first_block, TEXT + 2);
         let ips: Vec<u64> = trace.iter().map(|s| s.instr.ip() - TEXT).collect();
