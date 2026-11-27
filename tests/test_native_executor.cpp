@@ -524,6 +524,27 @@ void test_split_passes(NativeExecutor& shared) {
 
 // ---- usage scopes (usage_scope_model.h) ----
 
+void test_usage_scopes(NativeExecutor& ex, bool snapshots);
+
+// Usage-scope snapshots are opt-in (ExecutorOptions::usage_snapshots, --usage-snapshots).
+void test_usage_snapshots(NativeExecutor& shared) {
+    CHECK(!ExecutorOptions{}.usage_snapshots);
+    test_usage_scopes(shared, false);
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.usage_snapshots = true;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: usage-snapshots NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    test_usage_scopes(*ex, true);
+}
+
 const char* kUniformAndStorage = R"(
 @group(0) @binding(0) var<uniform> u: vec4<u32>;
 @group(0) @binding(1) var<storage, read_write> o: array<u32>;
@@ -558,7 +579,9 @@ const char* kMipCopy = R"(
 // bound from a snapshot. Two draws of one render pass, the first writing a buffer as storage, the second
 // reading it as a uniform: the pass splits there and the read sees the write. A texture sampled (all mips)
 // while one of its mips is a storage target: the sampled view comes from a snapshot. No device errors.
-void test_usage_scopes(NativeExecutor& ex) {
+// `snapshots` = ExecutorOptions::usage_snapshots of `ex`; off (the default), no snapshot is taken (the
+// in-world scene's ~950 GB of snapshot copies came with a GPU hang), the render pass split stays.
+void test_usage_scopes(NativeExecutor& ex, bool snapshots) {
     const ExecutorStats before = ex.stats();
     const uint32_t ubo_storage = GpuBufferUsage::Uniform | GpuBufferUsage::Storage | GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc;
     gpu::CommandEncoder setup;
@@ -672,6 +695,14 @@ void test_usage_scopes(NativeExecutor& ex) {
     ex.wait_idle();
     ex.poll();
     const ExecutorStats& after = ex.stats();
+    if (!snapshots) {
+        CHECK(after.usage_buffer_snapshots == before.usage_buffer_snapshots);
+        CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots);
+        CHECK(after.usage_snapshot_splits == before.usage_snapshot_splits);
+        CHECK(after.usage_snapshots_off == before.usage_snapshots_off + 2);
+        CHECK(after.usage_scope_splits == before.usage_scope_splits + 1);
+        return;
+    }
     CHECK(after.device_errors == before.device_errors);
     CHECK(after.usage_buffer_snapshots == before.usage_buffer_snapshots + 1);
     CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots + 1);
@@ -4182,7 +4213,7 @@ int main() {
     test_error_scope_attribution();
     test_pipeline_pass_formats(*ex);
     test_split_passes(*ex);
-    test_usage_scopes(*ex);
+    test_usage_snapshots(*ex);
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

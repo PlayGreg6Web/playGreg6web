@@ -103,6 +103,10 @@ int main(int argc, char** argv) {
             opts.split_passes = true;
         } else if (a == "--no-split-passes") {
             opts.split_passes = false;
+        } else if (a == "--usage-snapshots") {
+            opts.usage_snapshots = true;
+        } else if (a == "--no-usage-snapshots") {
+            opts.usage_snapshots = false;
         } else if (a == "--trace" && (v = next())) {
             trace = v;
         } else if (a == "--pack" && (v = next())) {

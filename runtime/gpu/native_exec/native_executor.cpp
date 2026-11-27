@@ -7259,6 +7259,12 @@ struct NativeExecutor::Impl {
             bound.push_back(BoundUses{g, &e.want[g].usage->m, &e.want[g].offsets});
         }
         BindPlan plan = bound.empty() ? BindPlan{} : plan_binds(bound, e.scope, render);
+        if (!options.usage_snapshots && !plan.snapshots.empty()) {
+            // Snapshots are opt-in (ExecutorOptions::usage_snapshots): the uses stay bound as themselves.
+            stats.usage_snapshots_off += plan.snapshots.size();
+            plan.snapshots.clear();
+            if (!plan.scope_conflict) plan.split = false;
+        }
         if (!render && !plan.snapshots.empty()) {
             // A big read-only range against a small writable one: the writer runs on a scratch copy instead
             // (resolve_buffer_aliases), so the big range is not copied.
@@ -8636,6 +8642,7 @@ std::string NativeExecutor::stats_json() const {
     num("usage_texture_snapshots", st.usage_texture_snapshots);
     num("usage_snapshot_bytes", st.usage_snapshot_bytes);
     num("usage_snapshot_skipped", st.usage_snapshot_skipped);
+    num("usage_snapshots_off", st.usage_snapshots_off);
     num("usage_snapshot_reused", st.usage_snapshot_reused);
     num("usage_snapshots_to_writer_twin", st.usage_snapshots_to_writer_twin);
     num("usage_snapshot_bytes_saved", st.usage_snapshot_bytes_saved);

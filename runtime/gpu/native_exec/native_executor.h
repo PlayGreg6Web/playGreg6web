@@ -103,6 +103,13 @@ struct ExecutorOptions {
     // fires (std-pack --live-executor boot of 3d57fb4a: 0 fps from ~90 s, sub_1423CF620 at 120 s; with
     // the split off the same build runs past 170 s).
     bool split_passes = false;
+    // Usage-scope snapshots (opt-in, --usage-snapshots; usage_scope_model.h): a read-only binding of a
+    // resource the same draw / dispatch writes is bound from a copy of its read range taken right before
+    // it. Off by default: in the in-world scene of the std-pack --live-executor boot they copy ~950 GB in
+    // ~90 s (~34k snapshots of large read-only ranges) and the frames they make valid hang the GPU
+    // (DXGI_ERROR_DEVICE_HUNG at ~90-98 s, then the device is lost for good); with them off the same build
+    // runs past 170 s. Off, such a conflict is left to the buffer aliasing pass (resolve_buffer_aliases).
+    bool usage_snapshots = false;
     // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
     // that create resources and fill them (creations, buffer / texture writes; destroyed ids are pruned,
     // a repeated write of the same range replaces the older one) so a lost device can be rebuilt and the
@@ -270,6 +277,7 @@ struct ExecutorStats {
     uint64_t usage_snapshot_reused = 0;  // buffer snapshots served from the encoder cache (no copy, no split)
     uint64_t usage_snapshot_bytes_saved = 0;
     uint64_t usage_snapshots_to_writer_twin = 0;  // big read-only snapshots avoided by twinning the small writable binding
+    uint64_t usage_snapshots_off = 0;  // snapshots not taken: ExecutorOptions::usage_snapshots is off
     uint64_t usage_split_discards = 0;
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;
