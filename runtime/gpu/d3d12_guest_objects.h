@@ -947,6 +947,11 @@ public:
     size_t relocated_storage_chunk_count() const;
     // #663: true for a buffer that holds storage relocation homes (BridgeOptions::relocation_home).
     bool storage_relocation_home(uint32_t buffer_id) const;
+    // BridgeOptions::storage_homes_unmoved: true when every storage home in `homes` (buffer id,
+    // offset) is still the live home it was when relocation_epoch() read `since_epoch` (not handed
+    // to another range or destroyed since); each one is then marked used, as a relocate_storage_buffer
+    // hit would. False when any of them moved (the caller resolves the bind group again).
+    bool storage_homes_unmoved(const std::pair<uint32_t, uint64_t>* homes, size_t count, uint64_t since_epoch);
     // Index / vertex buffer views at address-only GPU VAs (G58: dynamic guest-RAM ring buffers
     // with no ID3D12Resource): the bytes at [va, va + size) (readable guest/alias memory only, at
     // most 16 MiB) get a dedicated Vertex|Index|CopyDst buffer at offset 0, uploaded immediately
@@ -1254,6 +1259,7 @@ private:
         uint64_t last_hash = 0;
         uint64_t last_used_seq = 0;
         uint64_t last_used_present = 0;  // present_epoch() at the last bind (reuse guard, #663)
+        uint64_t created_epoch = 0;      // relocation_evictions_ when this home took the range
         bool ever_uploaded = false;
         bool dedicated = false;
         // Native write tracking of the guest range: with a primed cursor and no page written since the last
@@ -1273,7 +1279,17 @@ private:
     };
     mutable std::mutex storage_relocation_mutex_;
     std::map<RelocatedStorageKey, RelocatedStorage> storage_relocations_;
+    // Live homes by (buffer id << 32 | offset), for storage_homes_unmoved.
+    std::unordered_map<uint64_t, std::map<RelocatedStorageKey, RelocatedStorage>::iterator> storage_home_index_;
+    static uint64_t storage_home_key(uint32_t buffer_id, uint64_t offset) noexcept {
+        return (uint64_t{buffer_id} << 32) | (offset & 0xffffffffull);
+    }
     std::vector<uint32_t> storage_relocation_buffers_;
+    // The ids in storage_relocation_buffers_, under their own lock: storage_relocation_home is asked
+    // per bound buffer while recording and must not wait behind flushes or relocation misses.
+    mutable std::mutex storage_home_ids_mutex_;
+    std::unordered_set<uint32_t> storage_home_ids_;
+    void note_storage_home_buffer(uint32_t buffer_id, bool live);
     // Slots of evicted small (non-dedicated) homes inside the shared chunks, by capacity: a new small
     // home takes one (capacity in [need, 2 * need]) before the chunk bump pointer advances, so evicting
     // and re-creating relocations does not grow the chunks without bound (#2093).

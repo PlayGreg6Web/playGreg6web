@@ -308,6 +308,12 @@ struct BridgeOptions {
     // memory binds these homes directly (no recorded relocation), so a memory-backed bind group
     // that binds one is rebuilt from its slots when relocation_epoch changed.
     std::function<bool(uint32_t buffer_id)> relocation_home;
+    // Optional: true when each of `count` storage homes (buffer id, offset) a memory-backed bind
+    // group binds is still the home it was at relocation epoch `since_epoch` (marking them used);
+    // the group then skips that rebuild (its slot words are still compared). Unset: every epoch
+    // change rebuilds the group.
+    std::function<bool(const std::pair<uint32_t, uint64_t>* homes, size_t count, uint64_t since_epoch)>
+        storage_homes_unmoved;
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
@@ -1373,7 +1379,9 @@ private:
                      CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
     // G66 (#691): true when a relocation `cached` was emitted with now resolves to another home.
     bool relocations_moved(d3d::CachedBindGroup* cached);
-    bool binds_relocation_home(const d3d::CachedBindGroup& cached) const;
+    // Also lists the (buffer id, offset) of every bound home in `homes` when given.
+    bool binds_relocation_home(const d3d::CachedBindGroup& cached,
+                               std::vector<std::pair<uint32_t, uint64_t>>* homes = nullptr) const;
     // G66 (#691): true when `cached` binds a texture or buffer the device destroyed since it was built.
     bool binds_retired(d3d::CachedBindGroup* cached) const;
     // G66 partly-held mip chains: hash of (texture, clamped base mip) over a group's texture entries,
@@ -1502,6 +1510,7 @@ private:
         // epoch its entries were resolved at.
         bool binds_home = false;
         uint64_t relocation_epoch = 0;
+        std::vector<std::pair<uint32_t, uint64_t>> homes;  // the bound homes (buffer id, offset)
     };
     std::vector<MemoryBindGroup> memory_groups_;
     mutable std::mutex cache_mutex_;

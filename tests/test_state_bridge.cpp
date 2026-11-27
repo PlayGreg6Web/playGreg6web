@@ -2661,6 +2661,15 @@ void test_memory_backed_tables() {
     uint64_t relocation_epoch = 0;
     options.relocation_epoch = [&relocation_epoch] { return relocation_epoch; };
     options.relocation_home = [](uint32_t buffer_id) { return buffer_id == kCb; };
+    // The per-home check: told which homes the group binds and since which epoch.
+    bool homes_moved = true;
+    std::vector<std::pair<uint32_t, uint64_t>> homes_asked;
+    uint64_t homes_since = ~uint64_t{0};
+    options.storage_homes_unmoved = [&](const std::pair<uint32_t, uint64_t>* homes, size_t count, uint64_t since) {
+        homes_asked.assign(homes, homes + count);
+        homes_since = since;
+        return !homes_moved;
+    };
     bridge::StateBridgeDevice device(heaps, options, &states);
     constexpr uint64_t kVs = 0xD1, kPs = 0xD2, kCbVa = 0x10000, kTextureVa = 0x7E00'0001'0000ull;
     device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
@@ -2804,7 +2813,19 @@ void test_memory_backed_tables() {
     // #663: same words, but a relocation home was handed to another range: resolved again once.
     ++relocation_epoch;
     CHECK(list.refresh_memory_bind_groups(prelude) == 1);
+    CHECK(homes_since == relocation_epoch - 1 && homes_asked.size() == 1 && homes_asked[0].first == kCb &&
+          homes_asked[0].second == 0x100);
     CHECK(list.refresh_memory_bind_groups(prelude) == 0);
+    // Another range's home was handed on, the group's own homes were not: nothing to rebuild.
+    homes_moved = false;
+    homes_asked.clear();
+    ++relocation_epoch;
+    CHECK(list.refresh_memory_bind_groups(prelude) == 0);
+    CHECK(homes_asked.size() == 1 && homes_since == relocation_epoch - 1);
+    homes_asked.clear();
+    CHECK(list.refresh_memory_bind_groups(prelude) == 0);
+    CHECK(homes_asked.empty());  // epoch unchanged: not asked
+    homes_moved = true;
 
     // Words the runtime cannot read as a descriptor bind null.
     const uint32_t link[8] = {9, 0, 0, 0, 0, 0, 0, 0};

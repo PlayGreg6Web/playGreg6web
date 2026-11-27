@@ -3016,6 +3016,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             }
             emptied_chunks.push_back(chunk);
         }
+        storage_home_index_.erase(storage_home_key(it->second.buffer_id, it->second.offset));
         storage_relocations_.erase(it);
         relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
     };
@@ -3073,6 +3074,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
                 storage_relocation_buffers_.erase(
                     std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), old_id),
                     storage_relocation_buffers_.end());
+                note_storage_home_buffer(old_id, false);
             }
             erase_entry(lru_it);
             dropped = true;
@@ -3096,12 +3098,14 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             enc.create_buffer(target_buf, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, target_cap);
             bridge_->register_buffer(target_buf, allocate_gpu_va(target_cap), target_cap);
             storage_relocation_buffers_.push_back(target_buf);
+            note_storage_home_buffer(target_buf, true);
         } else {
             if (storage_relocation_buffer_ == 0 || storage_relocation_used_ + need > kChunk) {
                 storage_relocation_buffer_ = allocate_id();
                 enc.create_buffer(storage_relocation_buffer_, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, kChunk);
                 bridge_->register_buffer(storage_relocation_buffer_, allocate_gpu_va(kChunk), kChunk);
                 storage_relocation_buffers_.push_back(storage_relocation_buffer_);
+                note_storage_home_buffer(storage_relocation_buffer_, true);
                 storage_relocation_used_ = 0;
             }
             target_buf = storage_relocation_buffer_;
@@ -3131,7 +3135,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     entry.last_used_present = present;
     entry.ever_uploaded = true;
     entry.dedicated = dedicated;
-    storage_relocations_.emplace(key, entry);
+    entry.created_epoch = relocation_evictions_.load(std::memory_order_relaxed);
+    storage_home_index_[storage_home_key(target_buf, target_off)] = storage_relocations_.emplace(key, entry).first;
     storage_relocation_lru_.emplace(seq, key);
     storage_relocation_bytes_ += target_cap;
     if (!dedicated) {
@@ -3162,6 +3167,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         storage_relocation_buffers_.erase(
             std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), chunk),
             storage_relocation_buffers_.end());
+        note_storage_home_buffer(chunk, false);
     }
 
     *buffer_id = target_buf;
@@ -3189,9 +3195,46 @@ size_t Device::relocated_storage_chunk_count() const {
 }
 
 bool Device::storage_relocation_home(uint32_t buffer_id) const {
+    std::lock_guard<std::mutex> lock(storage_home_ids_mutex_);
+    return storage_home_ids_.count(buffer_id) != 0;
+}
+
+void Device::note_storage_home_buffer(uint32_t buffer_id, bool live) {
+    std::lock_guard<std::mutex> lock(storage_home_ids_mutex_);
+    if (live) {
+        storage_home_ids_.insert(buffer_id);
+    } else {
+        storage_home_ids_.erase(buffer_id);
+    }
+}
+
+bool Device::storage_homes_unmoved(const std::pair<uint32_t, uint64_t>* homes, size_t count, uint64_t since_epoch) {
+    if (count == 0) {
+        return true;
+    }
+    const uint64_t present = present_epoch();
     std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
-    return std::find(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), buffer_id) !=
-           storage_relocation_buffers_.end();
+    for (size_t i = 0; i < count; ++i) {
+        const auto found = storage_home_index_.find(storage_home_key(homes[i].first, homes[i].second));
+        if (found == storage_home_index_.end() || found->second->second.created_epoch > since_epoch) {
+            return false;  // evicted, or handed to another range since: resolve again
+        }
+    }
+    // Same LRU bookkeeping as a hit in relocate_storage_buffer (the #663 reuse guard counts it).
+    for (size_t i = 0; i < count; ++i) {
+        const auto it = storage_home_index_.find(storage_home_key(homes[i].first, homes[i].second))->second;
+        const uint64_t seq = ++storage_relocation_seq_;
+        auto node = storage_relocation_lru_.extract(it->second.last_used_seq);
+        if (node.empty()) {
+            storage_relocation_lru_.emplace(seq, it->first);
+        } else {
+            node.key() = seq;  // reuse the node: no allocation per touch
+            storage_relocation_lru_.insert(std::move(node));
+        }
+        it->second.last_used_present = present;
+        it->second.last_used_seq = seq;
+    }
+    return true;
 }
 
 bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {

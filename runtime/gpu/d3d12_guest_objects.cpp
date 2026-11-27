@@ -262,6 +262,9 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     };
     bo.relocation_epoch = [this] { return relocation_evictions_.load(std::memory_order_relaxed); };
     bo.relocation_home = [this](uint32_t buffer_id) { return storage_relocation_home(buffer_id); };
+    bo.storage_homes_unmoved = [this](const std::pair<uint32_t, uint64_t>* homes, size_t count, uint64_t since_epoch) {
+        return storage_homes_unmoved(homes, count, since_epoch);
+    };
     bo.sync_texture_memory = [this](uint32_t resource_id, CommandEncoder& encoder) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
@@ -410,6 +413,7 @@ Device::~Device() {
             std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
             storage_ids.swap(storage_relocation_buffers_);
             storage_relocations_.clear();
+            storage_home_index_.clear();
             storage_relocation_lru_.clear();
             storage_relocation_bytes_ = 0;
             storage_relocation_buffer_ = 0;

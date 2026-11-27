@@ -4409,29 +4409,42 @@ void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRe
                 m.entries_offset = entries_offset;
                 m.built = cached;
                 note_memory_group_ids(m.built);
+                // Keep the home list in step with the entries (binds_home stays as it was).
+                std::vector<std::pair<uint32_t, uint64_t>> homes;
+                m.binds_home = binds_relocation_home(m.built, &homes) || m.binds_home;
+                m.homes = std::move(homes);
             }
             return;
         }
     }
     note_memory_group_ids(cached);
     MemoryBindGroup m{entries_offset, &group, plan, cached};
-    m.binds_home = binds_relocation_home(cached);
+    m.binds_home = binds_relocation_home(cached, &m.homes);
     m.relocation_epoch = cached.relocation_epoch;
     memory_groups_.push_back(std::move(m));
     ++stats_.memory_bind_groups;
 }
 
-bool CommandListBridge::binds_relocation_home(const d3d::CachedBindGroup& cached) const {
+bool CommandListBridge::binds_relocation_home(const d3d::CachedBindGroup& cached,
+                                              std::vector<std::pair<uint32_t, uint64_t>>* homes) const {
     const BridgeOptions& options = device_.options();
+    if (homes != nullptr) {
+        homes->clear();
+    }
     if (!options.relocation_home) {
         return false;
     }
+    bool any = false;
     for (const d3d::BindGroupEntry& e : cached.entries) {
         if (e.kind == d3d::BindResourceKind::Buffer && e.resource_id != 0 && options.relocation_home(e.resource_id)) {
-            return true;
+            any = true;
+            if (homes == nullptr) {
+                break;
+            }
+            homes->emplace_back(e.resource_id, e.offset);
         }
     }
-    return false;
+    return any;
 }
 
 uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) {
@@ -4449,7 +4462,13 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
     for (MemoryBindGroup& m : memory_groups_) {
         // #663: a home bound straight from descriptor memory may have been handed to another range
         // since these entries were resolved (unchanged slot words do not show it): resolve again.
-        bool force_rebuild = m.invalidated || (m.binds_home && m.relocation_epoch != relocation_epoch);
+        bool force_rebuild = m.invalidated;
+        if (!force_rebuild && m.binds_home && m.relocation_epoch != relocation_epoch) {
+            // Only a home this group binds being handed on (or evicted) since its epoch changes what
+            // its unchanged slot words resolve to; other ranges' evictions leave it as built.
+            force_rebuild = !options.storage_homes_unmoved ||
+                            !options.storage_homes_unmoved(m.homes.data(), m.homes.size(), m.relocation_epoch);
+        }
         if (!force_rebuild) {
             TextureInfo tmp{};
             for (const d3d::BindGroupEntry& e : m.built.entries) {
@@ -4470,7 +4489,7 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
         m.relocation_epoch = relocation_epoch;
         if (changed) {
             m.invalidated = false;
-            m.binds_home = binds_relocation_home(m.built);
+            m.binds_home = binds_relocation_home(m.built, &m.homes);
             std::vector<GpuBindGroupEntry2>& entries = scratch_gpu_entries_;
             gpu_entries(*m.group, m.built, prelude, &entries);
             m.built.view_ids = pending_view_ids_;
