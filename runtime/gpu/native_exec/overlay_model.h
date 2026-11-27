@@ -204,6 +204,12 @@ inline std::vector<std::string> overlay_banner_lines(const std::string& banner) 
     return out;
 }
 
+// Whether a windowed frame must go through the intermediate texture (a full-frame copy). Only when the F3 overlay or
+// the stop banner is active; normal play presents directly.
+inline constexpr bool overlay_needs_intermediate(bool window, bool overlay_on, bool banner_active) {
+    return window && (overlay_on || banner_active);
+}
+
 struct OverlayBitmap {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> rgba;  // premultiplied, row-major, w * h * 4

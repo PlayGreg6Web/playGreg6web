@@ -158,6 +158,10 @@ int main() {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
     }
+    CHECK(!overlay_needs_intermediate(true, false, false));  // normal play: direct present, no extra copy
+    CHECK(overlay_needs_intermediate(true, true, false));
+    CHECK(overlay_needs_intermediate(true, false, true));
+    CHECK(!overlay_needs_intermediate(false, true, true));
     std::printf("test_overlay_model: ok\n");
     return 0;
 }
