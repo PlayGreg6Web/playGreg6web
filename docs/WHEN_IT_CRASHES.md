@@ -67,6 +67,19 @@ The `bink` block of the report lists Bink export lookups that returned null (`lo
   `WaitFor*`, with the object's state, signals since it parked and the last signaler) and `streaming_drain`.
   An object `signaled_for_waiter: true` with the waiter still parked is a lost wakeup in the runtime; an
   object never signaled points at the producer (a job that never finishes, a streaming request never done).
+- **Host access violation in `sub_140F2C470`** (GPU page-table command drain, around 60-105 s into
+  menu-to-ingame, nondeterministic): two owners of one 64 KiB GPU page. Probes on the title's buddy allocator
+  (alloc `sub_145238780`, free-list pop `sub_145238830`, frees `sub_14221B7D0` / `sub_145238960`), shadowing
+  every page's allocated/free state, saw no block handed out twice and none freed twice, and the allocator
+  lock (`0x1471BFAD8`, a recursive lock with semaphore handoff) was held at every entry. Every per-page
+  refcount read-modify-write runs under that lock. The bad pages come one level up: a tile-map call
+  (vtable method `sub_1428C9910` through `sub_1428CB9B0`, from `sub_1443C4850`, op 2) on thread 84
+  covers a page that thread 80 allocated and mapped for another resource, or that thread 80's queue drain
+  unmapped and freed 45 ms earlier (refcount reached zero after the 4 KiB sub-allocator released the page's
+  last slice). The title's CPU view (`[0x149E1DAD0]`) and GPU view (`[0x149E1DAC0]`) are separate
+  reservations here (e.g. 0x180110000 vs 0xA00000000), and its conversions between them were consistent in
+  the paths read. Still open: whether the mapped resource's lifetime ends early on our side (a completion
+  signalled too soon) or the range rounding in the tile-map caller reaches a neighbouring page.
 - **Unresolved indirect call**: rerun, then use `--seed-targets` (see `tools/run_native_boot.py`), or `triage_fault.py`.
 - **Watchdog / time limit**: the run hit `--max-ms` (not a crash) or `--watchdog-ms` (it did not stop in time:
   read the `[hang-stack]` lines and the watchdog dump).
