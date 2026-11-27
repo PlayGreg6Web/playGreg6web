@@ -1501,6 +1501,72 @@ function resolveSubsystemCtor(injectedCtor, globalNamespace, exportName, scriptR
   return null;
 }
 
+function resolvePrewarmBridgeApi(injectedApi) {
+  if (injectedApi && typeof injectedApi === 'object' && typeof injectedApi.attachPrewarmBridge === 'function') {
+    return injectedApi;
+  }
+  if (typeof injectedApi === 'function') {
+    return {
+      attachPrewarmBridge: injectedApi,
+      PREWARM_MSG_REQUEST: 'prewarm-task',
+      PREWARM_MSG_RESULT: 'prewarm-task-result',
+    };
+  }
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6PrewarmBridge &&
+    typeof globalThis.PlayGta6PrewarmBridge.attachPrewarmBridge === 'function'
+  ) {
+    return globalThis.PlayGta6PrewarmBridge;
+  }
+  if (typeof importScripts === 'function') {
+    try {
+      importScripts('./prewarm_bridge.js');
+      if (
+        typeof globalThis !== 'undefined' &&
+        globalThis.PlayGta6PrewarmBridge &&
+        typeof globalThis.PlayGta6PrewarmBridge.attachPrewarmBridge === 'function'
+      ) {
+        return globalThis.PlayGta6PrewarmBridge;
+      }
+    } catch (_) {
+      // Optional prewarm_bridge.js unavailable in this worker environment.
+    }
+  }
+  if (typeof require === 'function') {
+    try {
+      const mod = require('./prewarm_bridge.js');
+      if (mod && typeof mod.attachPrewarmBridge === 'function') {
+        return mod;
+      }
+    } catch (_) {
+      // Optional prewarm_bridge.js unavailable.
+    }
+  }
+  return null;
+}
+
+function resolvePipelineCacheHelper(exportName) {
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6PipelineCache &&
+    typeof globalThis.PlayGta6PipelineCache[exportName] === 'function'
+  ) {
+    return globalThis.PlayGta6PipelineCache[exportName];
+  }
+  if (typeof require === 'function') {
+    try {
+      const mod = require('./pipeline_cache.js');
+      if (mod && typeof mod[exportName] === 'function') {
+        return mod[exportName];
+      }
+    } catch (_) {
+      // Optional pipeline_cache.js unavailable.
+    }
+  }
+  return null;
+}
+
 // Synchronous classic-worker fallback matching web/workers/rt_bvh_prelude.js
 // (and runtime/gpu/rt_bvh.cpp::prelude_wgsl()) byte-for-byte so RT shaders calling
 // pg6_bvh_intersect() / pg6_load32() can NEVER compile un-prefixed if dynamic
@@ -3805,6 +3871,13 @@ class WgpuCommandProcessor {
     // Optional WebGpuPipelineCache for reflection layout deduplication & W167 fallback sampler synthesis
     this._ownsPipelineCache = false;
     this.pipelineCache = null;
+    this._ownsPrewarmBridge = false;
+    this.prewarmBridge =
+      options.prewarmBridge && typeof options.prewarmBridge === 'object'
+        ? options.prewarmBridge
+        : null;
+    this._shaderPackOverride = undefined;
+    this._computePipelineMeta = new Map();
     if (options.pipelineCache && typeof options.pipelineCache === 'object') {
       this.pipelineCache = options.pipelineCache;
     } else if (options.enablePipelineCache === true && device && typeof device === 'object') {
@@ -3990,6 +4063,7 @@ class WgpuCommandProcessor {
         this._ownsReflectionRegistry = true;
       }
     }
+    this._syncPipelineCacheReflectionRegistry();
 
     // 5. GpuResourceRegistry (G21)
     this._ownsResourceRegistry = false;
@@ -4317,6 +4391,205 @@ class WgpuCommandProcessor {
 
   set gpuTimer(timer) {
     this.passTimer = timer;
+  }
+
+  get shaderPack() {
+    return this._shaderPackOverride !== undefined ? this._shaderPackOverride : this.wgslPackCache;
+  }
+
+  set shaderPack(pack) {
+    this._shaderPackOverride = pack;
+  }
+
+  /**
+   * #2085 / #2113: Synchronize the active ReflectionRegistry into WebGpuPipelineCache so
+   * graphics pipeline creation automatically resolves FSSM `vs_outputs`/`ps_inputs` remaps.
+   */
+  _syncPipelineCacheReflectionRegistry() {
+    if (
+      this.pipelineCache &&
+      typeof this.pipelineCache.setReflectionRegistry === 'function'
+    ) {
+      try {
+        this.pipelineCache.setReflectionRegistry(this.reflectionRegistry || null);
+      } catch (_) {
+        // Non-fatal: ignore custom mock pipelineCache registry errors.
+      }
+    }
+  }
+
+  /**
+   * #2085 / #2113: Register a compiled GPUShaderModule's ID, WGSL source, and stage reflection
+   * metadata (including FSSM `vs_outputs` / `ps_inputs`) with WebGpuPipelineCache so
+   * `_applyInterstageCompatibility` can apply SPI_PS_INPUT_CNTL `@location` remaps automatically.
+   */
+  _registerShaderModuleWithPipelineCache(id, entry, wgslCode = null) {
+    if (!entry || !entry.module) {
+      return;
+    }
+    const mod = entry.module;
+    const stageName = stageCodeToName(entry.stage);
+    const refl = this._resolveShaderReflection(id, entry, stageName);
+    const explicitKey = this._shaderReflectionKeys.get(id);
+    const hashOrId =
+      (typeof explicitKey === 'string' && explicitKey.length > 0 ? explicitKey : null) ||
+      (typeof explicitKey === 'bigint' ? formatShaderHashHex(explicitKey) : null) ||
+      (typeof entry.resolvedHash === 'string' && entry.resolvedHash.length > 0
+        ? entry.resolvedHash
+        : null) ||
+      (typeof entry.requestedHash === 'string' && entry.requestedHash.length > 0
+        ? entry.requestedHash
+        : null) ||
+      (typeof entry.hashHex === 'string' && entry.hashHex.length > 0 ? entry.hashHex : null) ||
+      `shader:${id}`;
+    const sourceCode =
+      typeof wgslCode === 'string' && wgslCode.length > 0
+        ? wgslCode
+        : null;
+
+    let handledReflViaCache = false;
+    if (this.pipelineCache && typeof this.pipelineCache === 'object') {
+      if (typeof this.pipelineCache.registerShaderModule === 'function') {
+        try {
+          this.pipelineCache.registerShaderModule(
+            mod,
+            hashOrId,
+            sourceCode || undefined,
+            refl || undefined
+          );
+          handledReflViaCache = Boolean(refl);
+        } catch (_) {
+          // Non-fatal: ignore custom mock registration errors.
+        }
+      } else {
+        if (sourceCode && typeof this.pipelineCache.registerShaderModuleSource === 'function') {
+          try {
+            this.pipelineCache.registerShaderModuleSource(mod, sourceCode);
+          } catch (_) {
+            // Non-fatal: ignore custom mock errors.
+          }
+        }
+        if (refl && typeof this.pipelineCache.registerShaderModuleReflection === 'function') {
+          try {
+            this.pipelineCache.registerShaderModuleReflection(mod, refl);
+            handledReflViaCache = true;
+          } catch (_) {
+            // Non-fatal: ignore custom mock errors.
+          }
+        }
+      }
+    }
+
+    if (refl && !handledReflViaCache) {
+      const registerReflFn = resolvePipelineCacheHelper('registerShaderModuleReflection');
+      if (typeof registerReflFn === 'function') {
+        try {
+          registerReflFn(mod, refl);
+        } catch (_) {
+          // Non-fatal: ignore helper registration errors.
+        }
+      }
+    }
+  }
+
+  /**
+   * #1613 / #2054 / #2116: Return true when the processor has no live frame uploads, pass
+   * commands, or active shader/pipeline compiles so background prewarm work may proceed.
+   */
+  isPrewarmIdle() {
+    if (this._destroyed || this._deviceLost || this._deviceRecovering) {
+      return false;
+    }
+    if (this._hasPendingUploadCommands) {
+      return false;
+    }
+    if (Array.isArray(this._passCommands) && this._passCommands.length > 0) {
+      return false;
+    }
+    if (typeof this._pendingShaderCompiles === 'number' && this._pendingShaderCompiles > 0) {
+      return false;
+    }
+    if (typeof this._inFlightPipelineCompiles === 'number' && this._inFlightPipelineCompiles > 0) {
+      return false;
+    }
+    if (
+      this._compileQueue &&
+      typeof this._compileQueue.length === 'number' &&
+      this._compileQueue.length > 0
+    ) {
+      return false;
+    }
+    if (this._activeRangedShaderCompiles > 0) {
+      return false;
+    }
+    if (
+      Array.isArray(this._rangedShaderCompileQueue) &&
+      this._rangedShaderCompileQueue.length > 0
+    ) {
+      return false;
+    }
+    if (this._inFlightRangedShaders && this._inFlightRangedShaders.size > 0) {
+      return false;
+    }
+    if (this.asyncPipelineCache && typeof this.asyncPipelineCache.getStats === 'function') {
+      try {
+        const st = this.asyncPipelineCache.getStats();
+        if (st && ((st.inFlight || 0) > 0 || (st.queued || 0) > 0)) {
+          return false;
+        }
+      } catch (_) {
+        // Ignore custom mock asyncPipelineCache errors.
+      }
+    }
+    return true;
+  }
+
+  _pumpPrewarmBridge() {
+    if (
+      !this._destroyed &&
+      this.prewarmBridge &&
+      typeof this.prewarmBridge.pump === 'function'
+    ) {
+      try {
+        this.prewarmBridge.pump();
+      } catch (_) {
+        // Non-fatal: prewarm pump errors must never disrupt frame completion.
+      }
+    }
+  }
+
+  /**
+   * #1608 / #2116: Resolve a 64-bit shader hash (`string | bigint`) for an active render or
+   * compute pipeline ID to attribute WebGPU pass timestamps in `GpuTimeTable`.
+   */
+  _resolveShaderHashForPipeline(pipelineId, kind) {
+    if (pipelineId === null || pipelineId === undefined) {
+      return 0n;
+    }
+    if (kind === 'compute') {
+      const cMeta = this._computePipelineMeta ? this._computePipelineMeta.get(pipelineId) : null;
+      const csId = cMeta && cMeta.csShaderId !== undefined ? cMeta.csShaderId : null;
+      const csEntry = csId !== null ? this.shaderModules.get(csId) : null;
+      if (csEntry) {
+        return csEntry.resolvedHash || csEntry.requestedHash || csEntry.hashHex || 0n;
+      }
+      return 0n;
+    }
+    const rMeta = this._pipelineMeta.get(pipelineId);
+    if (!rMeta) {
+      return 0n;
+    }
+    const fsEntry = rMeta.fsShaderId ? this.shaderModules.get(rMeta.fsShaderId) : null;
+    if (fsEntry) {
+      const fsHash = fsEntry.resolvedHash || fsEntry.requestedHash || fsEntry.hashHex;
+      if (fsHash) return fsHash;
+    }
+    const vsEntry = rMeta.vsShaderId ? this.shaderModules.get(rMeta.vsShaderId) : null;
+    if (vsEntry) {
+      const vsHash = vsEntry.resolvedHash || vsEntry.requestedHash || vsEntry.hashHex;
+      if (vsHash) return vsHash;
+    }
+    return 0n;
   }
 
   get requireNonBlackFrame() {
@@ -8919,6 +9192,9 @@ class WgpuCommandProcessor {
     this._pendingCommandStreamScanned = true;
     this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
+    if (this._computePipelineMeta) {
+      this._computePipelineMeta.clear();
+    }
     this._pipelineBindGroupLayouts.clear();
     this._computePipelineBindGroupLayouts.clear();
     this._pipelineReflectionGroups.clear();
@@ -9373,6 +9649,7 @@ class WgpuCommandProcessor {
         // Ignore pipelineCache device swap errors on custom mocks.
       }
     }
+    this._syncPipelineCacheReflectionRegistry();
     // W103: drop in-flight compiles of the dead device; late results are discarded as stale.
     this._resetAsyncPipelineCache(newDevice);
     if (newCtx && typeof newCtx === 'object') {
@@ -9515,13 +9792,20 @@ class WgpuCommandProcessor {
     if (this._pendingTimerReadbacks.size > 0) {
       await Promise.all(Array.from(this._pendingTimerReadbacks));
     }
-    if (
-      !this._destroyed &&
-      typeof this.passTimer.collectCompletedReadback === 'function'
-    ) {
-      const timing = await this.passTimer.collectCompletedReadback();
-      if (timing && !this._destroyed) {
-        this._lastPassTimings = timing;
+    if (!this._destroyed) {
+      if (typeof this.passTimer.flushReadbacks === 'function') {
+        const results = await this.passTimer.flushReadbacks();
+        if (Array.isArray(results) && results.length > 0 && !this._destroyed) {
+          const latest = results[results.length - 1];
+          if (latest) {
+            this._lastPassTimings = latest;
+          }
+        }
+      } else if (typeof this.passTimer.collectCompletedReadback === 'function') {
+        const timing = await this.passTimer.collectCompletedReadback();
+        if (timing && !this._destroyed) {
+          this._lastPassTimings = timing;
+        }
       }
     }
     return this.getLastPassTimings();
@@ -9553,7 +9837,14 @@ class WgpuCommandProcessor {
       this.reflectionRegistry = new ReflectionCtor(this._reflectionRegistryOptions || {});
       this._ownsReflectionRegistry = true;
     }
-    return this.reflectionRegistry.loadManifest(jsonOrObj);
+    const parsed = this.reflectionRegistry.loadManifest(jsonOrObj);
+    this._syncPipelineCacheReflectionRegistry();
+    for (const [shaderId, entry] of this.shaderModules.entries()) {
+      if (entry && entry.module) {
+        this._registerShaderModuleWithPipelineCache(shaderId, entry, null);
+      }
+    }
+    return parsed;
   }
 
   /**
@@ -9564,6 +9855,10 @@ class WgpuCommandProcessor {
    */
   registerShaderReflectionKey(shaderId, hashOrName) {
     this._shaderReflectionKeys.set(shaderId, hashOrName);
+    const entry = this.shaderModules.get(shaderId);
+    if (entry && entry.module) {
+      this._registerShaderModuleWithPipelineCache(shaderId, entry, null);
+    }
   }
 
   /**
@@ -11421,6 +11716,7 @@ class WgpuCommandProcessor {
     entry.module = module;
     entry._compilationInfoPromise = compilationInfoPromise;
     this._materializedShaderCount += 1;
+    this._registerShaderModuleWithPipelineCache(id, entry, code);
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       const byteSize =
         entry.isInlineCode && code === entry.code
@@ -12127,6 +12423,22 @@ class WgpuCommandProcessor {
 
     const vsRefl = this._resolveShaderReflection(vsShaderId, vsEntry, 'vertex');
     const fsRefl = fsEntry ? this._resolveShaderReflection(fsShaderId, fsEntry, 'fragment') : null;
+    if (this.pipelineCache && typeof this.pipelineCache.registerShaderModuleReflection === 'function') {
+      if (vsRefl && vsEntry && vsEntry.module) {
+        try {
+          this.pipelineCache.registerShaderModuleReflection(vsEntry.module, vsRefl);
+        } catch (_) {
+          // Non-fatal: ignore custom mock registration errors.
+        }
+      }
+      if (fsRefl && fsEntry && fsEntry.module) {
+        try {
+          this.pipelineCache.registerShaderModuleReflection(fsEntry.module, fsRefl);
+        } catch (_) {
+          // Non-fatal: ignore custom mock registration errors.
+        }
+      }
+    }
     const matchedRefls = [];
     if (vsRefl) matchedRefls.push(vsRefl);
     if (fsRefl) matchedRefls.push(fsRefl);
@@ -13730,6 +14042,7 @@ class WgpuCommandProcessor {
       // W268 negative-cached (quarantined) or failed compute pipeline compile — skip cleanly.
       return;
     }
+    this._computePipelineMeta.set(built.id, { csShaderId: built.csShaderId });
     this._registerComputePipelineV1(built.id, pipeline);
   }
 
@@ -14386,7 +14699,7 @@ class WgpuCommandProcessor {
     }
   }
 
-  _ensurePresentRenderPass() {
+  _ensurePresentRenderPass(pipelineIdHint = null) {
     const ps = this._presentState;
     if (ps.activePassKind === 'render') return ps.activePass;
     this._endPresentActivePass();
@@ -14402,7 +14715,13 @@ class WgpuCommandProcessor {
       colorAttachments: [attachment],
     };
     if (ps.timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
-      const tsWrites = this.passTimer.getPassTimestampWrites(`render_${ps.renderPassIdx}`);
+      const pid = pipelineIdHint !== null ? pipelineIdHint : ps.activePipelineId;
+      const shaderHash = this._resolveShaderHashForPipeline(pid, 'render');
+      const tsWrites = this.passTimer.getPassTimestampWrites(
+        `render_${ps.renderPassIdx}`,
+        'render',
+        shaderHash
+      );
       if (tsWrites) {
         passDesc.timestampWrites = tsWrites;
       }
@@ -14414,12 +14733,18 @@ class WgpuCommandProcessor {
     return ps.activePass;
   }
 
-  _ensurePresentComputePass() {
+  _ensurePresentComputePass(pipelineIdHint = null) {
     const ps = this._presentState;
     if (ps.activePassKind === 'compute') return ps.activePass;
     this._endPresentActivePass();
     if (ps.timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
-      const tsWrites = this.passTimer.getPassTimestampWrites(`compute_${ps.computePassIdx}`);
+      const pid = pipelineIdHint !== null ? pipelineIdHint : ps.activeComputePipelineId;
+      const shaderHash = this._resolveShaderHashForPipeline(pid, 'compute');
+      const tsWrites = this.passTimer.getPassTimestampWrites(
+        `compute_${ps.computePassIdx}`,
+        'compute',
+        shaderHash
+      );
       ps.computePassIdx += 1;
       ps.activePass = tsWrites
         ? ps.encoder.beginComputePass({ timestampWrites: tsWrites })
@@ -14435,8 +14760,17 @@ class WgpuCommandProcessor {
   _beginExtensionRenderPass(descriptor) {
     const ps = this._presentState;
     this._endPresentActivePass();
-    if (ps.timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
-      const tsWrites = this.passTimer.getPassTimestampWrites(`render_${ps.renderPassIdx}`);
+    if (
+      ps.timerSupported &&
+      typeof this.passTimer.getPassTimestampWrites === 'function' &&
+      (!descriptor || descriptor.timestampWrites === undefined)
+    ) {
+      const passLabel =
+        descriptor && typeof descriptor.label === 'string' && descriptor.label.length > 0
+          ? descriptor.label
+          : `render_${ps.renderPassIdx}`;
+      const shaderHash = this._resolveShaderHashForPipeline(ps.activePipelineId, 'render');
+      const tsWrites = this.passTimer.getPassTimestampWrites(passLabel, 'render', shaderHash);
       if (tsWrites) descriptor = { ...descriptor, timestampWrites: tsWrites };
     }
     ps.renderPassIdx += 1;
@@ -14710,7 +15044,7 @@ class WgpuCommandProcessor {
       const cmd = cmds[i];
       switch (cmd.type) {
         case 'setPipeline': {
-          const pass = this._ensurePresentRenderPass();
+          const pass = this._ensurePresentRenderPass(cmd.pipelineId);
           ps.activePipelineId = cmd.pipelineId;
           ps.activePipeline = null;
           ps.specializedActiveKey = null;
@@ -14789,7 +15123,7 @@ class WgpuCommandProcessor {
           break;
         }
         case 'setComputePipeline': {
-          const pass = this._ensurePresentComputePass();
+          const pass = this._ensurePresentComputePass(cmd.pipelineId);
           ps.activeComputePipelineId = cmd.pipelineId;
           const pipeline = this.computePipelines.get(cmd.pipelineId);
           if (pipeline) {
@@ -15367,17 +15701,33 @@ class WgpuCommandProcessor {
       submitted &&
       timerResolved &&
       this.passTimer &&
-      typeof this.passTimer.collectCompletedReadback === 'function'
+      (typeof this.passTimer.flushReadbacks === 'function' ||
+        typeof this.passTimer.collectCompletedReadback === 'function')
     ) {
-      const readbackPromise = Promise.resolve(this.passTimer.collectCompletedReadback()).then(
-        (timing) => {
-          if (timing && !this._destroyed) {
-            this._lastPassTimings = timing;
-          }
-          return timing;
-        },
-        () => null
-      );
+      const readbackPromise =
+        typeof this.passTimer.flushReadbacks === 'function'
+          ? Promise.resolve(this.passTimer.flushReadbacks()).then(
+              (results) => {
+                if (Array.isArray(results) && results.length > 0 && !this._destroyed) {
+                  const latest = results[results.length - 1];
+                  if (latest) {
+                    this._lastPassTimings = latest;
+                  }
+                  return latest || null;
+                }
+                return null;
+              },
+              () => null
+            )
+          : Promise.resolve(this.passTimer.collectCompletedReadback()).then(
+              (timing) => {
+                if (timing && !this._destroyed) {
+                  this._lastPassTimings = timing;
+                }
+                return timing;
+              },
+              () => null
+            );
       if (this._pendingTimerReadbacks.size >= 64) {
         const oldestPromise = this._pendingTimerReadbacks.values().next().value;
         if (oldestPromise !== undefined) {
@@ -15391,6 +15741,7 @@ class WgpuCommandProcessor {
     }
 
     this._resetFrameState();
+    this._pumpPrewarmBridge();
   }
 
   attachRing(ringOrSab, options = {}) {
@@ -15553,11 +15904,28 @@ class WgpuCommandProcessor {
     if (hasComputeOrCopy && this.device && typeof this.device.createCommandEncoder === 'function') {
       try {
         const encoder = this.device.createCommandEncoder();
+        const timerSupported = Boolean(this.passTimer && this.passTimer.supported);
         let computePass = null;
+        let computePassIdx = 0;
         let activeComputePipelineId = null;
-        const ensureCompute = () => {
+        const ensureCompute = (pipelineIdHint = null) => {
           if (!computePass) {
-            computePass = encoder.beginComputePass();
+            if (timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
+              const pid = pipelineIdHint !== null ? pipelineIdHint : activeComputePipelineId;
+              const shaderHash = this._resolveShaderHashForPipeline(pid, 'compute');
+              const tsWrites = this.passTimer.getPassTimestampWrites(
+                `compute_${computePassIdx}`,
+                'compute',
+                shaderHash
+              );
+              computePassIdx += 1;
+              computePass = tsWrites
+                ? encoder.beginComputePass({ timestampWrites: tsWrites })
+                : encoder.beginComputePass();
+            } else {
+              computePassIdx += 1;
+              computePass = encoder.beginComputePass();
+            }
           }
           return computePass;
         };
@@ -15567,7 +15935,7 @@ class WgpuCommandProcessor {
             activeComputePipelineId = cmd.pipelineId;
             const pipeline = this.computePipelines.get(cmd.pipelineId);
             if (pipeline) {
-              ensureCompute().setPipeline(pipeline);
+              ensureCompute(cmd.pipelineId).setPipeline(pipeline);
             }
           } else if (cmd.type === 'setBindGroup') {
             if (computePass || this._bindGroupKinds.get(cmd.bindGroupId) === 'compute') {
@@ -15602,12 +15970,37 @@ class WgpuCommandProcessor {
         if (computePass && typeof computePass.end === 'function') {
           computePass.end();
         }
+        let timerResolved = false;
+        if (timerSupported && typeof this.passTimer.resolveFrame === 'function') {
+          timerResolved = Boolean(this.passTimer.resolveFrame(encoder));
+        }
         const cb = encoder.finish();
         if (cb && this.device.queue && typeof this.device.queue.submit === 'function') {
           const submitStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
           this.device.queue.submit([cb]);
           if (this._gpuStallWarnMs > 0) {
             this._maybeWarnGpuStall('queue.submit', submitStartMs, null, 0, this._computeDispatchCount);
+          }
+          if (
+            timerResolved &&
+            this.passTimer &&
+            typeof this.passTimer.flushReadbacks === 'function'
+          ) {
+            const rp = Promise.resolve(this.passTimer.flushReadbacks()).then(
+              (results) => {
+                if (Array.isArray(results) && results.length > 0 && !this._destroyed) {
+                  const latest = results[results.length - 1];
+                  if (latest) this._lastPassTimings = latest;
+                  return latest || null;
+                }
+                return null;
+              },
+              () => null
+            );
+            this._pendingTimerReadbacks.add(rp);
+            rp.finally(() => {
+              this._pendingTimerReadbacks.delete(rp);
+            });
           }
         }
       } catch (err) {
@@ -15620,6 +16013,7 @@ class WgpuCommandProcessor {
     }
     this._resetFrameState();
     this._coalescedPresents += 1;
+    this._pumpPrewarmBridge();
   }
 
   _executeCommandView(view, startOffset, endOffset, coalescePresents = false, deferFinalPresent = false) {
@@ -16389,6 +16783,8 @@ class WgpuCommandProcessor {
       ? { ...passTimerBase, lastTimings: lastPassTimings }
       : null;
     const gpuTimer = resolveGpuTimerTelemetry(this, { passTimer });
+    const gpuTime = resolveGpuTimeStats(this, null);
+    const prewarmStats = resolvePrewarmStats(this, null);
     const gpuRecorder = resolveGpuRecorderTelemetry(this, null);
     const resourceRegistry =
       this.resourceRegistry && typeof this.resourceRegistry.getStats === 'function'
@@ -16588,6 +16984,8 @@ class WgpuCommandProcessor {
       uniformRing,
       passTimer,
       gpuTimer,
+      gpuTime,
+      ...(prewarmStats !== null ? { prewarmStats } : {}),
       gpuRecorder,
       lastPassTimings,
       resourceRegistry,
@@ -16806,6 +17204,9 @@ class WgpuCommandProcessor {
     this._pendingCommandStreamScanned = true;
     this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
+    if (this._computePipelineMeta) {
+      this._computePipelineMeta.clear();
+    }
     this._pipelineBindGroupLayouts.clear();
     this._computePipelineBindGroupLayouts.clear();
     this._pipelineReflectionGroups.clear();
@@ -16823,6 +17224,19 @@ class WgpuCommandProcessor {
     if (this.passTimer && typeof this.passTimer.destroy === 'function') {
       this.passTimer.destroy();
     }
+    if (
+      this.prewarmBridge &&
+      this._ownsPrewarmBridge &&
+      typeof this.prewarmBridge.detach === 'function'
+    ) {
+      try {
+        this.prewarmBridge.detach();
+      } catch (_) {
+        // Ignore prewarm bridge teardown errors.
+      }
+    }
+    this.prewarmBridge = null;
+    this._ownsPrewarmBridge = false;
     if (
       this.gpuRecorder &&
       this._ownsGpuRecorder &&
@@ -17355,6 +17769,53 @@ function resolveGpuTimerTelemetry(processor, stats) {
 }
 
 /**
+ * #1608 / #2116: Extract per-pass GPU time table stats from `GpuPassTimer.getGpuTimeStats()`.
+ */
+function resolveGpuTimeStats(processor, stats) {
+  const proc = processor && typeof processor === 'object' ? processor : null;
+  const timerObj = (proc && (proc.passTimer || proc.gpuTimer)) || null;
+  if (timerObj && typeof timerObj.getGpuTimeStats === 'function') {
+    try {
+      const snap = timerObj.getGpuTimeStats();
+      if (snap && typeof snap === 'object') {
+        return snap;
+      }
+    } catch (_) {
+      // Ignore custom mock getGpuTimeStats errors.
+    }
+  }
+  if (stats && stats.gpuTime && typeof stats.gpuTime === 'object') {
+    return stats.gpuTime;
+  }
+  return null;
+}
+
+/**
+ * #1613 / #2116: Extract worker-side prewarm bridge stats when attached.
+ */
+function resolvePrewarmStats(processor, stats, prewarmBridge = null) {
+  const bridge =
+    (prewarmBridge && typeof prewarmBridge === 'object' ? prewarmBridge : null) ||
+    (processor && processor.prewarmBridge && typeof processor.prewarmBridge === 'object'
+      ? processor.prewarmBridge
+      : null);
+  if (bridge && typeof bridge.getStats === 'function') {
+    try {
+      const st = bridge.getStats();
+      if (st && typeof st === 'object') {
+        return st;
+      }
+    } catch (_) {
+      // Ignore custom mock prewarmBridge.getStats errors.
+    }
+  }
+  if (stats && stats.prewarmStats && typeof stats.prewarmStats === 'object') {
+    return stats.prewarmStats;
+  }
+  return null;
+}
+
+/**
  * W332 / W325: Extract and sanitize GpuFrameRecorder 30 FPS spike auto-capture state
  * (zero raw command buffers, zero host paths).
  */
@@ -17777,6 +18238,14 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     const gpuTimer = resolveGpuTimerTelemetry(processor, stats);
     if (gpuTimer !== null) {
       snapshot.gpuTimer = gpuTimer;
+    }
+    const gpuTime = resolveGpuTimeStats(processor, stats);
+    if (gpuTime !== null) {
+      snapshot.gpuTime = gpuTime;
+    }
+    const prewarmStats = resolvePrewarmStats(processor, stats);
+    if (prewarmStats !== null) {
+      snapshot.prewarmStats = prewarmStats;
     }
     const gpuRecorder = resolveGpuRecorderTelemetry(processor, stats);
     if (gpuRecorder !== null) {
@@ -18373,6 +18842,120 @@ function createWgpuWorkerHandler(options = {}) {
   let firstVisibleFrameNotified = false;
   let unbindValidationListener = null;
   let unbindFirstVisibleFrameListener = null;
+  let prewarmBridge = null;
+  let ownsPrewarmBridge = false;
+  let boundPrewarmProcessor = null;
+  let prewarmMsgRequestType = 'prewarm-task';
+  const pendingPrewarmMessages = [];
+
+  function detachWorkerPrewarmBridge() {
+    const prevBridge = prewarmBridge;
+    const prevProc = boundPrewarmProcessor;
+    prewarmBridge = null;
+    boundPrewarmProcessor = null;
+    if (prevProc && prevProc.prewarmBridge === prevBridge) {
+      prevProc.prewarmBridge = null;
+    }
+    if (prevBridge && ownsPrewarmBridge && typeof prevBridge.detach === 'function') {
+      try {
+        prevBridge.detach();
+      } catch (_) {
+        // Ignore prewarm bridge detach errors.
+      }
+    }
+    ownsPrewarmBridge = false;
+  }
+
+  function pumpWorkerPrewarmBridge() {
+    if (prewarmBridge && typeof prewarmBridge.pump === 'function') {
+      try {
+        prewarmBridge.pump();
+      } catch (_) {
+        // Non-fatal: prewarm pump errors must never disrupt worker message handling.
+      }
+    }
+  }
+
+  function bindProcessorPrewarmBridge(targetProcessor, initPayload = null) {
+    if (targetProcessor && targetProcessor === boundPrewarmProcessor && prewarmBridge) {
+      return prewarmBridge;
+    }
+    detachWorkerPrewarmBridge();
+    if (!targetProcessor || options.enablePrewarmBridge === false) {
+      return null;
+    }
+    if (initPayload && initPayload.enablePrewarmBridge === false) {
+      return null;
+    }
+    const injectedBridge =
+      (initPayload && initPayload.prewarmBridge && typeof initPayload.prewarmBridge === 'object'
+        ? initPayload.prewarmBridge
+        : null) ||
+      (options.prewarmBridge && typeof options.prewarmBridge === 'object'
+        ? options.prewarmBridge
+        : null) ||
+      (targetProcessor.prewarmBridge && typeof targetProcessor.prewarmBridge === 'object'
+        ? targetProcessor.prewarmBridge
+        : null);
+    if (injectedBridge) {
+      prewarmBridge = injectedBridge;
+      ownsPrewarmBridge = false;
+      boundPrewarmProcessor = targetProcessor;
+      targetProcessor.prewarmBridge = prewarmBridge;
+    } else {
+      const api = resolvePrewarmBridgeApi(
+        (initPayload && (initPayload.prewarmBridgeApi || initPayload.attachPrewarmBridge)) ||
+          options.prewarmBridgeApi ||
+          options.attachPrewarmBridge
+      );
+      if (!api || typeof api.attachPrewarmBridge !== 'function') {
+        return null;
+      }
+      if (typeof api.PREWARM_MSG_REQUEST === 'string' && api.PREWARM_MSG_REQUEST.length > 0) {
+        prewarmMsgRequestType = api.PREWARM_MSG_REQUEST;
+      }
+      const mergedOpts = {
+        ...(options.prewarmBridgeOptions && typeof options.prewarmBridgeOptions === 'object'
+          ? options.prewarmBridgeOptions
+          : {}),
+        ...(initPayload &&
+        initPayload.prewarmBridgeOptions &&
+        typeof initPayload.prewarmBridgeOptions === 'object'
+          ? initPayload.prewarmBridgeOptions
+          : {}),
+      };
+      if (typeof mergedOpts.postMessage !== 'function') {
+        mergedOpts.postMessage = (m) => postMessage(m);
+      }
+      if (
+        typeof mergedOpts.isIdle !== 'function' &&
+        typeof targetProcessor.isPrewarmIdle === 'function'
+      ) {
+        mergedOpts.isIdle = () => targetProcessor.isPrewarmIdle();
+      }
+      if (typeof mergedOpts.now !== 'function') {
+        mergedOpts.now = telemetryNow;
+      }
+      try {
+        prewarmBridge = api.attachPrewarmBridge(targetProcessor, mergedOpts);
+        ownsPrewarmBridge = true;
+        boundPrewarmProcessor = targetProcessor;
+        targetProcessor.prewarmBridge = prewarmBridge;
+      } catch (_) {
+        prewarmBridge = null;
+        ownsPrewarmBridge = false;
+        boundPrewarmProcessor = null;
+        return null;
+      }
+    }
+    if (prewarmBridge && pendingPrewarmMessages.length > 0 && typeof prewarmBridge.handleMessage === 'function') {
+      const queued = pendingPrewarmMessages.splice(0, pendingPrewarmMessages.length);
+      for (let i = 0; i < queued.length; i += 1) {
+        prewarmBridge.handleMessage(queued[i]);
+      }
+    }
+    return prewarmBridge;
+  }
 
   // W100: bounded device-loss recovery state (per worker session).
   const deviceRecoveryEnabled = options.enableDeviceRecovery !== false;
@@ -18586,6 +19169,7 @@ function createWgpuWorkerHandler(options = {}) {
 
   if (processor) {
     bindProcessorValidationErrors(processor);
+    bindProcessorPrewarmBridge(processor);
   }
 
   function notifyHandlerFirstPresent(info) {
@@ -19482,6 +20066,7 @@ function createWgpuWorkerHandler(options = {}) {
           : options.promote1DTo2D,
     });
     bindProcessorValidationErrors(processor);
+    bindProcessorPrewarmBridge(processor, initPayload);
     installPacketExtensions(processor);
     if (attachedRing) {
       processor.attachRing(attachedRing);
@@ -19640,6 +20225,7 @@ function createWgpuWorkerHandler(options = {}) {
       }
       postMessage({ frame: result.frameCount });
       maybeEmitFrameTelemetry(prevFrames, result.frameCount);
+      pumpWorkerPrewarmBridge();
     }
     return result;
   }
@@ -19662,6 +20248,9 @@ function createWgpuWorkerHandler(options = {}) {
         firstPresentNotified = false;
         firstVisibleFrameNotified = false;
         bindProcessorValidationErrors(processor);
+        bindProcessorPrewarmBridge(processor, payload);
+      } else if (processor) {
+        bindProcessorPrewarmBridge(processor, payload);
       }
       if (
         processor &&
@@ -19849,6 +20438,20 @@ function createWgpuWorkerHandler(options = {}) {
         processor
       ) {
         return handleAsyncLoadShaderPack(payload);
+      } else if (payload.type === prewarmMsgRequestType || payload.type === 'prewarm-task') {
+        if (initInFlight && !prewarmBridge) {
+          pendingPrewarmMessages.push(payload);
+        } else if (prewarmBridge && typeof prewarmBridge.handleMessage === 'function') {
+          prewarmBridge.handleMessage(payload);
+        } else if (payload.task && typeof payload.task === 'object') {
+          postMessage({
+            type: 'prewarm-task-result',
+            id: Number(payload.task.id) >>> 0,
+            ok: false,
+            buildNs: 0,
+            error: 'prewarm bridge unavailable',
+          });
+        }
       } else if (payload.type === 'request-gpu-telemetry') {
         emitTelemetry({
           id: payload.id,
@@ -19973,6 +20576,10 @@ function createWgpuWorkerHandler(options = {}) {
               ? toNonNegativeInt(stats.deferredHighWaterFlushes, 0)
               : 0,
             gpuTimer: resolveGpuTimerTelemetry(processor, stats),
+            gpuTime: resolveGpuTimeStats(processor, stats),
+            ...(resolvePrewarmStats(processor, stats, prewarmBridge) !== null
+              ? { prewarmStats: resolvePrewarmStats(processor, stats, prewarmBridge) }
+              : {}),
             gpuRecorder: resolveGpuRecorderTelemetry(processor, stats),
             ...resolve30FpsTelemetry(processor, stats),
           };
@@ -20194,6 +20801,7 @@ function createWgpuWorkerHandler(options = {}) {
             }
           }
           maybeEmitFrameTelemetry(prevFrames, framesPresented);
+          pumpWorkerPrewarmBridge();
         }
       } else if (payload.type === 'attach-guest-memory') {
         pendingGuestMemory = payload.buffer || null;
@@ -20219,6 +20827,8 @@ function createWgpuWorkerHandler(options = {}) {
         }
         // W100: intentional host destroy must never trigger device-loss recovery.
         bindProcessorDeviceLoss(null);
+        detachWorkerPrewarmBridge();
+        pendingPrewarmMessages.length = 0;
         if (typeof processor.destroy === 'function') {
           processor.destroy();
         }
@@ -20248,6 +20858,7 @@ function createWgpuWorkerHandler(options = {}) {
           }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
+          pumpWorkerPrewarmBridge();
         }
       } else if (
         payload.type === 'execute-batch-queue' &&
@@ -20396,6 +21007,7 @@ function createWgpuWorkerHandler(options = {}) {
           }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
+          pumpWorkerPrewarmBridge();
         }
       }
     } catch (err) {
@@ -20418,6 +21030,9 @@ function createWgpuWorkerHandler(options = {}) {
     },
     get processor() {
       return processor;
+    },
+    get prewarmBridge() {
+      return prewarmBridge;
     },
     get swapchain() {
       return (processor && processor.swapchain) || swapchain;
