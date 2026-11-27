@@ -936,6 +936,12 @@ bool take_written_view_pages(const uint8_t* p, uint64_t len, uint64_t* view_cloc
     return view_clock != nullptr && take_pages_impl(p, len, view_clock, nullptr, false, offsets, true);
 }
 
+void write_positions(uint64_t* view_clock, uint64_t* watch_epoch) {
+    *view_clock = g_track_clock.load();
+    std::lock_guard<std::mutex> lock(g_stamp_mutex);
+    *watch_epoch = g_watch_epoch;
+}
+
 #elif defined(__EMSCRIPTEN__)
 
 // Linear memory [0, kGuestAddressSpaceBase) is the runtime's; [kGuestAddressSpaceBase, max) is the
@@ -1115,6 +1121,8 @@ bool take_written_view_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<ui
     return false;
 }
 
+void write_positions(uint64_t*, uint64_t*) {}
+
 uint64_t tracked_view_faults() {
     return 0;
 }
@@ -1228,6 +1236,8 @@ bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, st
 bool take_written_view_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_t>*) {
     return false;
 }
+
+void write_positions(uint64_t*, uint64_t*) {}
 
 uint64_t tracked_view_faults() {
     return 0;

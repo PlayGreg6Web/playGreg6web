@@ -151,8 +151,14 @@ void take_written_pages_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>
         }
         cursor->commit_seq = g_commit_seq;
     }
-    uint64_t view_clock = ~uint64_t{0};
-    uint64_t watch_epoch = ~uint64_t{0};
+    // The new position: the clocks read before any range is taken (a take's own result stays where
+    // it was for a range without views or watch bits, so it says nothing about the others).
+    uint64_t view_clock = cursor->view_clock;
+    uint64_t watch_epoch = cursor->watch_epoch;
+    backing::write_positions(&view_clock, &watch_epoch);
+    if (cursor->watch_epoch == ~uint64_t{0}) {
+        watch_epoch = ~uint64_t{0};  // the consumed-only form stays so
+    }
     std::vector<uint64_t> offsets;
     for (size_t i = 0; i < ranges.size(); ++i) {
         const auto& [lo, hi] = ranges[i];
@@ -168,8 +174,6 @@ void take_written_pages_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>
                 pages->push_back(base + static_cast<uintptr_t>(off));
             }
         }
-        view_clock = std::min(view_clock, vc);
-        watch_epoch = std::min(watch_epoch, ep);
     }
     cursor->view_clock = view_clock;
     cursor->watch_epoch = watch_epoch;
