@@ -1704,6 +1704,82 @@ def _included_source_root_headers_fingerprint(
     return digest.digest()
 
 
+_ANY_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*[<"]([^>"\r\n]+)[>"]', re.MULTILINE)
+
+
+class IncludeClosure:
+    """Per-unit fingerprint of the project headers a C/C++ unit really includes (transitively).
+
+    Replaces the global `runtime/` header hash in `.o` cache keys: a header edit anywhere under
+    `runtime/` no longer recompiles tiny generated units (`pg6_program.cpp`, import/export thunks)
+    that never include it. Includes are resolved against the including file's directory, then
+    `include_dirs` (conditional includes are over-approximated; unresolved ones are system headers).
+    Header hashes and include lists are memoized for the lifetime of the object (one build).
+    """
+
+    def __init__(self, include_dirs: Sequence[Path]) -> None:
+        self._dirs = [Path(d).resolve() for d in include_dirs]
+        self._memo: dict[Path, tuple[bytes, tuple[str, ...]]] = {}
+
+    @staticmethod
+    def _names(data: bytes) -> tuple[str, ...]:
+        return tuple(
+            m.group(1).decode("utf-8", errors="ignore").replace("\\", "/").strip()
+            for m in _ANY_INCLUDE_RE.finditer(data)
+        )
+
+    def _header(self, path: Path) -> tuple[bytes, tuple[str, ...]]:
+        cached = self._memo.get(path)
+        if cached is None:
+            data = path.read_bytes()
+            cached = (hashlib.sha256(data).digest(), self._names(data))
+            self._memo[path] = cached
+        return cached
+
+    def _resolve(self, base_dir: Path, name: str) -> Path | None:
+        if not name or name.startswith("/"):
+            return None
+        for directory in (base_dir, *self._dirs):
+            candidate = directory / name
+            try:
+                if candidate.suffix.lower() in HEADER_SUFFIXES and candidate.is_file():
+                    return candidate.resolve()
+            except OSError:
+                continue
+        return None
+
+    def _label(self, path: Path) -> str:
+        for directory in self._dirs:
+            try:
+                return path.relative_to(directory).as_posix()
+            except ValueError:
+                continue
+        return path.as_posix()
+
+    def fingerprint(self, source: Path, content: bytes) -> str:
+        seen: dict[str, bytes] = {}
+        queue: list[tuple[Path, tuple[str, ...]]] = [(source.resolve().parent, self._names(content))]
+        while queue:
+            base_dir, pending = queue.pop()
+            for name in pending:
+                resolved = self._resolve(base_dir, name)
+                if resolved is None:
+                    continue
+                label = self._label(resolved)
+                if label in seen:
+                    continue
+                digest, inner = self._header(resolved)
+                seen[label] = digest
+                queue.append((resolved.parent, inner))
+        out = hashlib.sha256()
+        out.update(b"playgta6-include-closure-v1\0")
+        for label in sorted(seen):
+            out.update(label.encode("utf-8"))
+            out.update(b"\0")
+            out.update(seen[label])
+        return out.hexdigest()
+
+
 def _extra_fingerprint_for_unit(
     unit: SourceUnit,
     *,
@@ -1756,8 +1832,13 @@ def _cache_key_prefix(
         digest.update(b"retarget-v")
         digest.update(str(version).encode("utf-8"))
         digest.update(b"\0")
+    after_include = False
     for flag in flags:
-        digest.update(flag.encode("utf-8"))
+        # Include-dir paths are machine/worktree specific; header contents are hashed separately
+        # (include closure), so the path itself must not make keys unstable across checkouts.
+        text = "<include-dir>" if after_include else flag
+        after_include = flag == "-I"
+        digest.update(text.encode("utf-8"))
         digest.update(b"\0")
     if kind in {"c", "cpp"} and runtime_headers_fingerprint:
         rt_fp_bytes = runtime_headers_fingerprint.encode("utf-8")
@@ -4642,9 +4723,12 @@ def compile_unit(
     runtime_headers_fingerprint: str = "",
     source_root: Path | None = None,
     source_root_headers_fp: bytes = b"",
+    include_closure: "IncludeClosure | None" = None,
 ) -> UnitBuildResult:
     started = time.monotonic()
     content = unit.path.read_bytes()
+    if include_closure is not None and unit.kind in {"c", "cpp"}:
+        runtime_headers_fingerprint = include_closure.fingerprint(unit.path, content)
     extra_fp = _extra_fingerprint_for_unit(
         unit,
         content=content,
@@ -5280,6 +5364,7 @@ def run_build(
         else frozenset()
     )
     runtime_headers_fp = compute_runtime_headers_fingerprint(repo_root)
+    include_closure = IncludeClosure(include_dirs)
     source_root_hdr_fp = source_root_headers_fingerprint(source_root)
     key_stamps = KeyStampCache(cache_root / KEY_STAMP_FILE_NAME)
     plan_started = time.monotonic()
@@ -5326,7 +5411,7 @@ def run_build(
                 flags,
                 kind=unit.kind,
                 extra_fingerprint=extra_fp,
-                runtime_headers_fingerprint=runtime_headers_fp,
+                runtime_headers_fingerprint=include_closure.fingerprint(unit.path, content),
             )
         object_path = cache_object_path(cache_root, key, unit.unit_id)
         argv = tuple(sanitize_argv(build_compile_argv(compiler, unit.path, object_path, flags)))
@@ -5376,6 +5461,7 @@ def run_build(
                 runtime_headers_fingerprint=runtime_headers_fp,
                 source_root=source_root,
                 source_root_headers_fp=source_root_hdr_fp,
+                include_closure=include_closure,
             )
 
         workers = min(worker_count, len(compile_tasks))

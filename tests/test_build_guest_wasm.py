@@ -7013,7 +7013,7 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
             self.assertEqual(second.cache_misses, 0)
             self.assertEqual(runner2.compile_calls, [])
 
-            # Step 3: Change runtime/guest/boot.h -> ALL C/C++ units recompile, ALL .ll stay 100% hit!
+            # Step 3: Change runtime/guest/boot.h -> only C/C++ units that include it (transitively) recompile; every other unit stays a hit
             _write(
                 repo / "runtime" / "guest" / "boot.h",
                 "#pragma once\nstruct BootCfg { int a; uint64_t new_field; };\n",
@@ -7033,16 +7033,20 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
                 which_fn=lambda _n: None,
             )
             self.assertTrue(third.ok, third.errors)
-            self.assertEqual(third.cache_misses, len(c_cpp_ids))
-            self.assertEqual(third.cache_hits, len(ll_ids))
-            self.assertEqual(len(runner3.compile_calls), len(c_cpp_ids))
+            dependents = {
+                u.unit.unit_id for u in third.sources if u.status == "compiled"
+            }
+            self.assertTrue(dependents)
+            self.assertTrue(dependents <= c_cpp_ids)
+            self.assertLess(len(dependents), len(c_cpp_ids))
+            self.assertEqual(third.cache_misses, len(dependents))
+            self.assertEqual(len(runner3.compile_calls), len(dependents))
             for item in third.sources:
-                if item.unit.kind == "ll":
+                if item.unit.unit_id in dependents:
+                    self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
+                else:
                     self.assertEqual(item.status, "hit", item.unit.unit_id)
                     self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
-                else:
-                    self.assertEqual(item.status, "compiled", item.unit.unit_id)
-                    self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
 
             # Step 4: Modify excluded dirs under runtime/ (build*, target, .hidden) -> ZERO misses.
             _write(repo / "runtime" / "build-wasm64" / "temp.h", "#pragma once\n// v2\n")
