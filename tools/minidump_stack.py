@@ -12,7 +12,7 @@ A missing or mismatched PDB degrades to module+offset. --guest-exe names the gue
 its image range are described through tools/guest_symbols.py (names only, never code bytes).
 Dumps hold no full memory and stay local: do not commit them.
 """
-import argparse, json, os, shutil, struct, subprocess, sys
+import argparse, json, ntpath, os, shutil, struct, subprocess, sys
 
 STREAM_THREADS, STREAM_MODULES, STREAM_EXCEPTION, STREAM_MEMORY = 3, 4, 6, 5
 HARNESS_IMAGE = "playgta6_boot.exe"
@@ -83,7 +83,7 @@ class Symbolizer:
         self.loaded = {}
         self.notes = []
         for base, size, path in modules if backend is not None else ():
-            name = os.path.basename(path)
+            name = ntpath.basename(path)
             if name.lower() != HARNESS_IMAGE:
                 continue  # system DLLs would need a symbol server; module+offset is enough for them
             image = next((c for c in [os.path.join(d, name) for d in dirs] + [path] if exists(c)), None)
@@ -97,7 +97,7 @@ class Symbolizer:
     def describe(self, a):
         for base, size, path in self.modules:
             if base <= a < base + size:
-                name = os.path.basename(path)
+                name = ntpath.basename(path)
                 text = "%s+0x%x" % (name, a - base)
                 if self.loaded.get(name):
                     r = self.backend.resolve(a)
