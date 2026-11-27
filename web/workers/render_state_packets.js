@@ -1309,41 +1309,77 @@ function sanitizeTextureDescriptor(rawDescriptor, device, options) {
   };
 }
 
+const MAX_PARSED_WGSL_CACHE_ENTRIES = 512;
+const _parsedWgslGroup0Cache = new Map();
+const _parsedWgslStageEntriesCache = new Map();
+
+function _setBoundedCache(map, key, value) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= MAX_PARSED_WGSL_CACHE_ENTRIES) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) {
+      map.delete(oldest);
+    }
+  }
+  map.set(key, value);
+}
+
 // Strips WGSL line (//) and nestable block (/* ... */) comments so commented-out entry points are ignored.
 function stripWgslComments(code) {
   if (typeof code !== 'string' || code.length === 0) return '';
-  let out = '';
+  if (code.indexOf('//') === -1 && code.indexOf('/*') === -1) return code;
+  const chunks = [];
+  let chunkStart = 0;
   let blockDepth = 0;
-  for (let i = 0; i < code.length; i += 1) {
-    const ch = code[i];
-    const next = i + 1 < code.length ? code[i + 1] : '';
+  const len = code.length;
+  for (let i = 0; i < len; i += 1) {
+    const ch = code.charCodeAt(i);
     if (blockDepth > 0) {
-      if (ch === '/' && next === '*') {
+      if (ch === 47 /* '/' */ && i + 1 < len && code.charCodeAt(i + 1) === 42 /* '*' */) {
         blockDepth += 1;
         i += 1;
-      } else if (ch === '*' && next === '/') {
+      } else if (ch === 42 /* '*' */ && i + 1 < len && code.charCodeAt(i + 1) === 47 /* '/' */) {
         blockDepth -= 1;
         i += 1;
-        out += ' ';
-      } else if (ch === '\n') {
-        out += '\n';
+        chunks.push(' ');
+        if (blockDepth === 0) {
+          chunkStart = i + 1;
+        }
+      } else if (ch === 10 /* '\n' */) {
+        chunks.push('\n');
       }
       continue;
     }
-    if (ch === '/' && next === '/') {
-      i += 2;
-      while (i < code.length && code[i] !== '\n') i += 1;
-      if (i < code.length && code[i] === '\n') out += '\n';
-      continue;
+    if (ch === 47 /* '/' */ && i + 1 < len) {
+      const next = code.charCodeAt(i + 1);
+      if (next === 47 /* '/' */) {
+        if (i > chunkStart) {
+          chunks.push(code.slice(chunkStart, i));
+        }
+        i += 2;
+        while (i < len && code.charCodeAt(i) !== 10 /* '\n' */) i += 1;
+        if (i < len && code.charCodeAt(i) === 10 /* '\n' */) {
+          chunks.push('\n');
+        }
+        chunkStart = i + 1;
+        continue;
+      }
+      if (next === 42 /* '*' */) {
+        if (i > chunkStart) {
+          chunks.push(code.slice(chunkStart, i));
+        }
+        blockDepth = 1;
+        i += 1;
+        chunkStart = len;
+        continue;
+      }
     }
-    if (ch === '/' && next === '*') {
-      blockDepth = 1;
-      i += 1;
-      continue;
-    }
-    out += ch;
   }
-  return out;
+  if (blockDepth === 0 && chunkStart < len) {
+    chunks.push(code.slice(chunkStart));
+  }
+  return chunks.join('');
 }
 
 function findWgslStageEntryPoints(code, stage) {
@@ -1351,6 +1387,9 @@ function findWgslStageEntryPoints(code, stage) {
   const stageAttr =
     stage === 'vertex' || stage === 'fragment' || stage === 'compute' ? stage : null;
   if (!stageAttr) return [];
+  const cacheKey = `${stageAttr}\0${code}`;
+  const cached = _parsedWgslStageEntriesCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const cleaned = stripWgslComments(code);
   const re = new RegExp(
     `@${stageAttr}\\b(?:\\s*@[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)*\\s*fn\\s+([A-Za-z_][A-Za-z0-9_]*)`,
@@ -1363,7 +1402,9 @@ function findWgslStageEntryPoints(code, stage) {
       found.push(match[1]);
     }
   }
-  return found;
+  const frozen = Object.freeze(found);
+  _setBoundedCache(_parsedWgslStageEntriesCache, cacheKey, frozen);
+  return frozen;
 }
 
 // #1953 parity: extracts the set of `@location(N)` color output indices written by a WGSL
@@ -1503,6 +1544,8 @@ function extractWgslFunctionBodies(cleaned) {
 // in WGSL source, returning entries sorted and deduplicated by binding index.
 function parseWgslGroup0Bindings(wgslSource) {
   if (typeof wgslSource !== 'string' || wgslSource.length === 0) return [];
+  const cached = _parsedWgslGroup0Cache.get(wgslSource);
+  if (cached !== undefined) return cached;
   const cleaned = stripWgslComments(wgslSource);
   if (cleaned.length === 0) return [];
 
@@ -1587,7 +1630,9 @@ function parseWgslGroup0Bindings(wgslSource) {
     }
   }
 
-  return Array.from(byBinding.values()).sort((a, b) => a.binding - b.binding);
+  const result = Array.from(byBinding.values()).sort((a, b) => a.binding - b.binding);
+  _setBoundedCache(_parsedWgslGroup0Cache, wgslSource, result);
+  return result;
 }
 
 function mergeWgslGroup0Bindings(vsBindings, fsBindings) {

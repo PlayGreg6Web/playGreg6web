@@ -278,7 +278,7 @@ function isDeviceLostError(err) {
   const msg = typeof err === 'string'
     ? err
     : (err && typeof err.message === 'string' ? err.message : '');
-  return /\b(?:gpu\s*)?device\s+(was\s+)?(lost|destroyed)\b|\bgpu\s*device\s*lost\b/i.test(msg);
+  return /\b(?:gpu\s*)?device\s+(was\s+)?(lost|destroyed)\b|\bgpu\s*device\s*lost\b|\bvalid\s+external\s+instance\s+reference\s+no\s+longer\s+exists\b/i.test(msg);
 }
 
 /**
