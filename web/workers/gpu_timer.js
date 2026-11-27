@@ -13,7 +13,15 @@
   const PASS_KIND_UNKNOWN = 0;
   const PASS_KIND_RENDER = 1;
   const PASS_KIND_COMPUTE = 2;
+  const PASS_KIND_COPY = 3;
   const PASS_KINDS = Object.freeze(['unknown', 'render', 'compute']);
+  const GPU_TIME_MAX_KEYS = 1024;
+  const GPU_TIME_SUPPORT = Object.freeze({
+    UNKNOWN: 'unknown',
+    UNAVAILABLE: 'unavailable',
+    AVAILABLE: 'available',
+  });
+  const U64_MASK = 0xffffffffffffffffn;
 
   function normalizePassKindCode(kind) {
     if (kind === 'render' || kind === PASS_KIND_RENDER) {
@@ -22,6 +30,9 @@
     if (kind === 'compute' || kind === PASS_KIND_COMPUTE) {
       return PASS_KIND_COMPUTE;
     }
+    if (kind === 'copy' || kind === PASS_KIND_COPY) {
+      return PASS_KIND_COPY;
+    }
     if (typeof kind === 'string') {
       const lower = kind.trim().toLowerCase();
       if (lower === 'render') {
@@ -29,6 +40,9 @@
       }
       if (lower === 'compute') {
         return PASS_KIND_COMPUTE;
+      }
+      if (lower === 'copy') {
+        return PASS_KIND_COPY;
       }
     }
     return PASS_KIND_UNKNOWN;
@@ -41,7 +55,225 @@
     if (code === PASS_KIND_COMPUTE) {
       return 'compute';
     }
+    if (code === PASS_KIND_COPY) {
+      return 'copy';
+    }
     return 'unknown';
+  }
+
+  function normalizeShaderHash(value) {
+    if (typeof value === 'bigint') {
+      return value >= 0n ? value & U64_MASK : 0n;
+    }
+    if (typeof value === 'number') {
+      if (Number.isSafeInteger(value) && value >= 0) {
+        return BigInt(value);
+      }
+      return 0n;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (/^0x[0-9a-f]{1,16}$/i.test(trimmed)) {
+        try {
+          return BigInt(trimmed) & U64_MASK;
+        } catch (_) {
+          return 0n;
+        }
+      }
+      if (/^[0-9a-f]{16}$/i.test(trimmed)) {
+        try {
+          return BigInt(`0x${trimmed}`) & U64_MASK;
+        } catch (_) {
+          return 0n;
+        }
+      }
+    }
+    return 0n;
+  }
+
+  function formatHashHex16(hash) {
+    const normalized = normalizeShaderHash(hash);
+    return `0x${normalized.toString(16).padStart(16, '0')}`;
+  }
+
+  /**
+   * Bounded per-(shaderHash, passKind) GPU nanosecond accumulator matching
+   * `playgta6::gpu::d3d12_guest::GpuTimeTable` in `runtime/gpu/gpu_time.h` (#1608).
+   * Numbers only ever come from measured GPU timestamps; when unsupported nothing is invented.
+   */
+  class GpuTimeTable {
+    constructor(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      this._maxKeys = normalizePositiveInt(opts.maxKeys, GPU_TIME_MAX_KEYS, 'maxKeys');
+      this._support = GPU_TIME_SUPPORT.UNKNOWN;
+      this._reason = '';
+      this._map = new Map();
+      this._other = { passes: 0, total_ns: 0, max_ns: 0 };
+      this._framesMeasured = 0;
+      this._framesSkipped = 0;
+      this._passesSkipped = 0;
+      this._frameGpuNs = 0;
+    }
+
+    setSupport(support, reason = '') {
+      if (
+        support === GPU_TIME_SUPPORT.AVAILABLE ||
+        support === GPU_TIME_SUPPORT.UNAVAILABLE ||
+        support === GPU_TIME_SUPPORT.UNKNOWN
+      ) {
+        this._support = support;
+      }
+      this._reason = typeof reason === 'string' ? reason : '';
+    }
+
+    get support() {
+      return this._support;
+    }
+
+    get available() {
+      return this._support === GPU_TIME_SUPPORT.AVAILABLE;
+    }
+
+    get tracked() {
+      return this._map.size;
+    }
+
+    record(hash, kind, durationNs) {
+      const ns =
+        typeof durationNs === 'bigint'
+          ? Number(durationNs > 0n ? durationNs : 0n)
+          : typeof durationNs === 'number' && Number.isFinite(durationNs) && durationNs >= 0
+            ? Math.round(durationNs)
+            : 0;
+      this._support = GPU_TIME_SUPPORT.AVAILABLE;
+      const hashBig = normalizeShaderHash(hash);
+      const kindStr = typeof kind === 'number' ? passKindCodeToString(kind) : passKindCodeToString(normalizePassKindCode(kind));
+      const key = `${hashBig.toString(16)}:${kindStr}`;
+
+      let entry = this._map.get(key);
+      if (!entry) {
+        if (this._map.size < this._maxKeys) {
+          entry = {
+            hashBig,
+            hash: formatHashHex16(hashBig),
+            kind: kindStr,
+            passes: 0,
+            total_ns: 0,
+            max_ns: 0,
+          };
+          this._map.set(key, entry);
+        } else {
+          entry = this._other;
+        }
+      }
+      entry.passes += 1;
+      entry.total_ns += ns;
+      if (ns > entry.max_ns) {
+        entry.max_ns = ns;
+      }
+    }
+
+    noteSkippedFrame() {
+      this._framesSkipped += 1;
+    }
+
+    noteSkippedPasses(count = 1) {
+      if (typeof count === 'number' && Number.isFinite(count) && count > 0) {
+        this._passesSkipped += Math.floor(count);
+      }
+    }
+
+    noteMeasuredFrame(gpuNs) {
+      const ns =
+        typeof gpuNs === 'bigint'
+          ? Number(gpuNs > 0n ? gpuNs : 0n)
+          : typeof gpuNs === 'number' && Number.isFinite(gpuNs) && gpuNs >= 0
+            ? Math.round(gpuNs)
+            : 0;
+      this._framesMeasured += 1;
+      this._frameGpuNs += ns;
+    }
+
+    measuredTotals() {
+      return {
+        frames: this._framesMeasured,
+        gpu_ns: this._frameGpuNs,
+      };
+    }
+
+    top(n = 32) {
+      const limit = typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : 32;
+      if (limit === 0 || this._map.size === 0) {
+        return [];
+      }
+      const list = Array.from(this._map.values());
+      list.sort((a, b) => {
+        if (a.total_ns !== b.total_ns) return b.total_ns - a.total_ns;
+        if (a.hashBig !== b.hashBig) return a.hashBig < b.hashBig ? -1 : 1;
+        if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1;
+        return 0;
+      });
+      const out = [];
+      const count = Math.min(limit, list.length);
+      for (let i = 0; i < count; i += 1) {
+        const e = list[i];
+        out.push({
+          hash: e.hash,
+          kind: e.kind,
+          passes: e.passes,
+          total_ns: e.total_ns,
+          max_ns: e.max_ns,
+          avg_ns: e.passes > 0 ? Math.floor(e.total_ns / e.passes) : 0,
+        });
+      }
+      return out;
+    }
+
+    getSnapshot(topN = 32) {
+      let totalNs = this._other.total_ns;
+      for (const e of this._map.values()) {
+        totalNs += e.total_ns;
+      }
+      const available = this._support === GPU_TIME_SUPPORT.AVAILABLE;
+      const snapshot = {
+        available,
+        support: this._support,
+      };
+      if (!available) {
+        snapshot.reason =
+          this._reason ||
+          'no timestamp-query results were fed (no GPU executor attached, or the adapter lacks timestamp-query)';
+      }
+      snapshot.frames_measured = this._framesMeasured;
+      snapshot.frames_skipped = this._framesSkipped;
+      snapshot.passes_skipped = this._passesSkipped;
+      snapshot.frame_gpu_ns = this._frameGpuNs;
+      snapshot.total_ns = totalNs;
+      snapshot.tracked = this._map.size;
+      snapshot.other = {
+        passes: this._other.passes,
+        total_ns: this._other.total_ns,
+      };
+      snapshot.top = this.top(topN);
+      return snapshot;
+    }
+
+    toJson(topN = 32) {
+      return JSON.stringify(this.getSnapshot(topN));
+    }
+
+    reset({ preserveSupport = false } = {}) {
+      if (!preserveSupport) {
+        this._support = GPU_TIME_SUPPORT.UNKNOWN;
+        this._reason = '';
+      }
+      this._map.clear();
+      this._other = { passes: 0, total_ns: 0, max_ns: 0 };
+      this._framesMeasured = 0;
+      this._framesSkipped = 0;
+      this._passesSkipped = 0;
+      this._frameGpuNs = 0;
+    }
   }
 
   // WebGPU GPUBufferUsage & GPUMapMode constants with headless/Node fallbacks.
@@ -293,7 +525,20 @@
       if (opts.now !== undefined && typeof opts.now !== 'function') {
         throw new TypeError('now must be a function');
       }
+      if (opts.onComplete !== undefined && opts.onComplete !== null && typeof opts.onComplete !== 'function') {
+        throw new TypeError('onComplete must be a function');
+      }
+      this._timestampPeriodNs = normalizePositiveNumber(
+        opts.timestampPeriodNs,
+        1.0,
+        'timestampPeriodNs'
+      );
       this._now = opts.now || defaultNowMs;
+      this._completeListeners = new Set();
+      if (typeof opts.onComplete === 'function') {
+        this._completeListeners.add(opts.onComplete);
+      }
+      this._gpuTimeTable = new GpuTimeTable({ maxKeys: opts.maxGpuTimeKeys });
 
       this._device = device;
       this._maxQueries = this._maxPassesPerFrame * 2;
@@ -330,6 +575,7 @@
       this._framePassBeginIdx = new Uint32Array(this._maxPassesPerFrame);
       this._framePassEndIdx = new Uint32Array(this._maxPassesPerFrame);
       this._framePassKinds = new Uint8Array(this._maxPassesPerFrame);
+      this._framePassHashes = new BigUint64Array(this._maxPassesPerFrame);
       this._framePassCount = 0;
       this._queryCursor = 0;
 
@@ -398,6 +644,14 @@
       if (hasTimestampQueryFeature(device)) {
         this._initGpuResources(device);
       }
+      if (this._supported) {
+        this._gpuTimeTable.setSupport(GPU_TIME_SUPPORT.AVAILABLE);
+      } else {
+        this._gpuTimeTable.setSupport(
+          GPU_TIME_SUPPORT.UNAVAILABLE,
+          device ? 'adapter lacks timestamp-query' : 'no GPU device'
+        );
+      }
     }
 
     _initGpuResources(device) {
@@ -441,6 +695,7 @@
             passBeginIdx: new Uint32Array(this._maxPassesPerFrame),
             passEndIdx: new Uint32Array(this._maxPassesPerFrame),
             passKinds: new Uint8Array(this._maxPassesPerFrame),
+            passHashes: new BigUint64Array(this._maxPassesPerFrame),
             passCount: 0,
             queryCount: 0,
             copyBytes: 0,
@@ -565,6 +820,47 @@
 
     get isDeviceLost() {
       return this._deviceLost;
+    }
+
+    get gpuTimeTable() {
+      return this._gpuTimeTable;
+    }
+
+    /**
+     * Register a completion callback invoked asynchronously whenever GPU timestamp readbacks
+     * resolve (or when `complete()` is called directly). Returns an unsubscribe function.
+     *
+     * @param {(result: object) => void} callback
+     * @returns {() => void}
+     */
+    onComplete(callback) {
+      if (typeof callback !== 'function') {
+        throw new TypeError('onComplete callback must be a function');
+      }
+      this._completeListeners.add(callback);
+      return () => {
+        this._completeListeners.delete(callback);
+      };
+    }
+
+    setOnComplete(callback) {
+      this._completeListeners.clear();
+      if (typeof callback === 'function') {
+        this._completeListeners.add(callback);
+      }
+    }
+
+    _emitComplete(payload) {
+      if (this._completeListeners.size === 0) {
+        return;
+      }
+      for (const listener of this._completeListeners) {
+        try {
+          listener(payload);
+        } catch (_) {
+          // Telemetry callbacks must never interrupt rendering or readback cleanup.
+        }
+      }
     }
 
     _fillWindowStats(ring, count, target) {
@@ -726,15 +1022,24 @@
      * @param {'render' | 'compute' | 'unknown'} [kind] Optional pass category/kind.
      * @returns {{ querySet: GPUQuerySet, beginningOfPassWriteIndex: number, endOfPassWriteIndex: number } | undefined}
      */
-    beginPass(label, kind) {
+    beginPass(label, kind, shaderHash) {
       if (this._destroyed) {
         return undefined;
       }
 
-      const kindCode = normalizePassKindCode(kind);
+      let passLabel = label;
+      let passKind = kind;
+      let passHash = shaderHash;
+      if (label && typeof label === 'object') {
+        passLabel = label.label !== undefined ? label.label : label.name;
+        passKind = label.kind !== undefined ? label.kind : kind;
+        passHash = label.hash !== undefined ? label.hash : label.shaderHash;
+      }
+
+      const kindCode = normalizePassKindCode(passKind);
 
       if (this._supported) {
-        const descriptor = this.getPassTimestampWrites(label, kindCode);
+        const descriptor = this.getPassTimestampWrites(passLabel, kindCode, passHash);
         if (descriptor !== undefined && this._activePassDepth < this._maxPassesPerFrame) {
           const depth = this._activePassDepth;
           this._activePassLabels[depth] = this._framePassNames[this._framePassCount - 1];
@@ -757,8 +1062,8 @@
       const depth = this._activePassDepth;
       const passSlotIdx = this._cpuFramePassCount + depth;
       const name =
-        typeof label === 'string' && label.length > 0
-          ? label
+        typeof passLabel === 'string' && passLabel.length > 0
+          ? passLabel
           : this._defaultPassNames[passSlotIdx];
       this._activePassLabels[depth] = name;
       this._activePassStarts[depth] = this._now();
@@ -828,13 +1133,23 @@
      * @param {'render' | 'compute' | 'unknown' | number} [kind] Optional pass category/kind.
      * @returns {{ querySet: GPUQuerySet, beginningOfPassWriteIndex: number, endOfPassWriteIndex: number } | undefined}
      */
-    getPassTimestampWrites(passName, kind) {
+    getPassTimestampWrites(passName, kind, shaderHash) {
       if (!this._supported || this._destroyed || !this._querySet) {
         return undefined;
       }
       if (this._queryCursor + 2 > this._maxQueries) {
         this._droppedPasses += 1;
+        this._gpuTimeTable.noteSkippedPasses(1);
         return undefined;
+      }
+
+      let rawName = passName;
+      let rawKind = kind;
+      let rawHash = shaderHash;
+      if (passName && typeof passName === 'object') {
+        rawName = passName.label !== undefined ? passName.label : passName.name;
+        rawKind = passName.kind !== undefined ? passName.kind : kind;
+        rawHash = passName.hash !== undefined ? passName.hash : passName.shaderHash;
       }
 
       const passIdx = this._framePassCount;
@@ -844,14 +1159,15 @@
       this._framePassCount = passIdx + 1;
 
       const name =
-        typeof passName === 'string' && passName.length > 0
-          ? passName
+        typeof rawName === 'string' && rawName.length > 0
+          ? rawName
           : this._defaultPassNames[passIdx];
 
       this._framePassNames[passIdx] = name;
       this._framePassBeginIdx[passIdx] = beginningOfPassWriteIndex;
       this._framePassEndIdx[passIdx] = endOfPassWriteIndex;
-      this._framePassKinds[passIdx] = normalizePassKindCode(kind);
+      this._framePassKinds[passIdx] = normalizePassKindCode(rawKind);
+      this._framePassHashes[passIdx] = normalizeShaderHash(rawHash);
 
       const descriptorIdx = this._activeQueryRingSlice * this._maxPassesPerFrame + passIdx;
       return this._timestampWriteDescriptors[descriptorIdx];
@@ -896,6 +1212,8 @@
 
       if (this._deviceLost) {
         this._droppedQueryFrames += 1;
+        this._gpuTimeTable.noteSkippedFrame();
+        this._gpuTimeTable.noteSkippedPasses(passCount);
         this._framePassCount = 0;
         this._queryCursor = 0;
         this._activePassDepth = 0;
@@ -913,6 +1231,8 @@
       if (!freeSlot) {
         this._skippedFrames += 1;
         this._droppedQueryFrames += 1;
+        this._gpuTimeTable.noteSkippedFrame();
+        this._gpuTimeTable.noteSkippedPasses(passCount);
         this._framePassCount = 0;
         this._queryCursor = 0;
         this._activePassDepth = 0;
@@ -929,6 +1249,8 @@
         encoder.copyBufferToBuffer(this._resolveBuffer, 0, freeSlot.buffer, 0, copyBytes);
       } catch (_) {
         this._droppedQueryFrames += 1;
+        this._gpuTimeTable.noteSkippedFrame();
+        this._gpuTimeTable.noteSkippedPasses(passCount);
         this._framePassCount = 0;
         this._queryCursor = 0;
         this._activePassDepth = 0;
@@ -941,6 +1263,7 @@
         freeSlot.passBeginIdx[i] = this._framePassBeginIdx[i];
         freeSlot.passEndIdx[i] = this._framePassEndIdx[i];
         freeSlot.passKinds[i] = this._framePassKinds[i];
+        freeSlot.passHashes[i] = this._framePassHashes[i];
       }
       freeSlot.passCount = passCount;
       freeSlot.queryCount = queryCount;
@@ -1109,20 +1432,32 @@
         const timestamps = readTimestampsView(range, queryCount);
 
         let totalGpuMs = 0;
+        let totalGpuNs = 0;
         let renderMs = 0;
         let computeMs = 0;
         let otherMs = 0;
+        let skippedPasses = 0;
         const passes = new Array(passCount);
+        const detailedPasses = new Array(passCount);
+        const periodNs = this._timestampPeriodNs;
 
         for (let i = 0; i < passCount; i += 1) {
           const passName = slot.passNames[i];
           const beginIdx = slot.passBeginIdx[i];
           const endIdx = slot.passEndIdx[i];
           const kindCode = slot.passKinds[i];
+          const shaderHash = slot.passHashes[i];
           const startNs = beginIdx < timestamps.length ? timestamps[beginIdx] : 0n;
           const endNs = endIdx < timestamps.length ? timestamps[endIdx] : 0n;
-          const durationMs = computeDurationMs(startNs, endNs);
+          const validDelta = typeof startNs === 'bigint' && typeof endNs === 'bigint' && endNs > startNs;
+          const rawDeltaNs = validDelta ? Math.round(Number(endNs - startNs) * periodNs) : 0;
+          const durationNs = Number.isFinite(rawDeltaNs) && rawDeltaNs > 0 ? rawDeltaNs : 0;
+          const durationMs =
+            periodNs === 1.0
+              ? computeDurationMs(startNs, endNs)
+              : durationNs / NS_PER_MS;
           totalGpuMs += durationMs;
+          totalGpuNs += durationNs;
           if (kindCode === PASS_KIND_RENDER) {
             renderMs += durationMs;
           } else if (kindCode === PASS_KIND_COMPUTE) {
@@ -1130,7 +1465,19 @@
           } else {
             otherMs += durationMs;
           }
+          if (validDelta && durationNs > 0) {
+            this._gpuTimeTable.record(shaderHash, kindCode, durationNs);
+          } else {
+            skippedPasses += 1;
+          }
           passes[i] = { name: passName, durationMs };
+          detailedPasses[i] = {
+            name: passName,
+            kind: passKindCodeToString(kindCode),
+            hash: formatHashHex16(shaderHash),
+            durationNs,
+            durationMs,
+          };
         }
 
         if (typeof buffer.unmap === 'function') {
@@ -1140,6 +1487,11 @@
         } else {
           mapped = false;
         }
+
+        if (skippedPasses > 0) {
+          this._gpuTimeTable.noteSkippedPasses(skippedPasses);
+        }
+        this._gpuTimeTable.noteMeasuredFrame(totalGpuNs);
 
         const frameSeq = this._frameSeq + 1;
         this._frameSeq = frameSeq;
@@ -1156,11 +1508,23 @@
         this._lastFrameOtherMs = otherMs;
         this._lastFramePassCount = passCount;
 
+        this._emitComplete({
+          mode: 'gpu',
+          supported: true,
+          frameSeq,
+          totalGpuMs,
+          totalGpuNs,
+          skippedPasses,
+          passes: detailedPasses,
+        });
+
         return { totalGpuMs, passes };
       } catch (_) {
         if (!this._destroyed && slotGeneration === this._resetGeneration) {
           this._mapErrors += 1;
           this._droppedQueryFrames += 1;
+          this._gpuTimeTable.noteSkippedPasses(passCount);
+          this._gpuTimeTable.noteSkippedFrame();
         }
         return null;
       } finally {
@@ -1181,11 +1545,170 @@
           slot.passCount = 0;
           slot.passNames.fill(undefined);
           slot.passKinds.fill(PASS_KIND_UNKNOWN);
+          slot.passHashes.fill(0n);
           slot.queryCount = 0;
           slot.copyBytes = 0;
           slot.generation = this._resetGeneration;
         }
       }
+    }
+
+    /**
+     * Direct timestamp completion hook mirroring `GpuTimeRing::complete()` in `runtime/gpu/gpu_time.h` (#1608).
+     * Accepts resolved timestamp ticks (2 per pass: `[begin, end, ...]`), converts valid deltas to
+     * nanoseconds/milliseconds without inventing numbers for zero or non-increasing pairs, updates
+     * `GpuTimeTable` and rolling stats, and fires registered `onComplete` listeners.
+     *
+     * @param {BigUint64Array | Array<bigint | number>} ticks
+     * @param {{
+     *   passes?: Array<{ name?: string, label?: string, kind?: string | number, hash?: bigint | number | string, shaderHash?: bigint | number | string }>,
+     *   periodNs?: number,
+     *   requireNonZeroStart?: boolean
+     * }} [options]
+     */
+    complete(ticks, options = {}) {
+      if (this._destroyed || !ticks || typeof ticks.length !== 'number' || ticks.length < 2) {
+        return null;
+      }
+      const opts = options && typeof options === 'object' ? options : {};
+      const periodNs =
+        opts.periodNs !== undefined
+          ? normalizePositiveNumber(opts.periodNs, this._timestampPeriodNs, 'periodNs')
+          : this._timestampPeriodNs;
+      const requireNonZeroStart = opts.requireNonZeroStart !== false;
+      const passMeta = Array.isArray(opts.passes) ? opts.passes : null;
+      const passCount = passMeta ? passMeta.length : Math.floor(ticks.length / 2);
+      if (passCount <= 0) {
+        return null;
+      }
+
+      let totalGpuNs = 0;
+      let totalGpuMs = 0;
+      let renderMs = 0;
+      let computeMs = 0;
+      let otherMs = 0;
+      let measuredPasses = 0;
+      let skippedPasses = 0;
+      const passes = new Array(passCount);
+
+      const frameSeq = this._frameSeq + 1;
+      this._frameSeq = frameSeq;
+
+      for (let i = 0; i < passCount; i += 1) {
+        const meta = passMeta && passMeta[i] && typeof passMeta[i] === 'object' ? passMeta[i] : null;
+        const name =
+          meta && typeof (meta.name || meta.label) === 'string' && (meta.name || meta.label).length > 0
+            ? meta.name || meta.label
+            : i < this._defaultPassNames.length
+              ? this._defaultPassNames[i]
+              : `pass_${i}`;
+        const kindCode = normalizePassKindCode(meta ? meta.kind : PASS_KIND_UNKNOWN);
+        const hashBig = normalizeShaderHash(meta ? (meta.hash !== undefined ? meta.hash : meta.shaderHash) : 0n);
+
+        const idxBegin = i * 2;
+        const idxEnd = idxBegin + 1;
+        let startTick = 0n;
+        let endTick = 0n;
+        if (idxEnd < ticks.length) {
+          const rawStart = ticks[idxBegin];
+          const rawEnd = ticks[idxEnd];
+          startTick = typeof rawStart === 'bigint' ? rawStart : BigInt(Math.max(0, Math.trunc(Number(rawStart) || 0)));
+          endTick = typeof rawEnd === 'bigint' ? rawEnd : BigInt(Math.max(0, Math.trunc(Number(rawEnd) || 0)));
+        }
+
+        const valid = (requireNonZeroStart ? startTick !== 0n : true) && endTick > startTick;
+        let durationNs = 0;
+        let durationMs = 0;
+        if (valid) {
+          const scaled = Math.floor(Number(endTick - startTick) * periodNs);
+          if (Number.isFinite(scaled) && scaled > 0) {
+            durationNs = scaled;
+            durationMs = durationNs / NS_PER_MS;
+          }
+        }
+
+        if (valid && durationNs > 0) {
+          measuredPasses += 1;
+          totalGpuNs += durationNs;
+          totalGpuMs += durationMs;
+          if (kindCode === PASS_KIND_RENDER) {
+            renderMs += durationMs;
+          } else if (kindCode === PASS_KIND_COMPUTE) {
+            computeMs += durationMs;
+          } else {
+            otherMs += durationMs;
+          }
+          this._gpuTimeTable.record(hashBig, kindCode, durationNs);
+          this._recordPassSample(name, durationMs, frameSeq, kindCode);
+        } else {
+          skippedPasses += 1;
+        }
+
+        passes[i] = {
+          name,
+          kind: passKindCodeToString(kindCode),
+          hash: formatHashHex16(hashBig),
+          durationNs,
+          durationMs,
+        };
+      }
+
+      if (skippedPasses > 0) {
+        this._gpuTimeTable.noteSkippedPasses(skippedPasses);
+      }
+      this._gpuTimeTable.noteMeasuredFrame(totalGpuNs);
+      this._recordFrameTotal(totalGpuMs, frameSeq, renderMs, computeMs, otherMs);
+      this._resolvedFrames += 1;
+      this._lastFrameGpuMs = totalGpuMs;
+      this._lastFrameRenderMs = renderMs;
+      this._lastFrameComputeMs = computeMs;
+      this._lastFrameOtherMs = otherMs;
+      this._lastFramePassCount = passCount;
+
+      const result = {
+        mode: 'gpu',
+        supported: this._supported || this._gpuTimeTable.available,
+        frameSeq,
+        totalGpuNs,
+        totalGpuMs,
+        measuredPasses,
+        skippedPasses,
+        passes,
+      };
+      this._emitComplete(result);
+      return result;
+    }
+
+    /**
+     * Asynchronously drains all currently queued pending readback slots without blocking the render loop.
+     *
+     * @returns {Promise<Array<{ totalGpuMs: number, passes: Array<{ name: string, durationMs: number }> }>>}
+     */
+    async flushReadbacks() {
+      const results = [];
+      if (!this._supported || this._destroyed) {
+        return results;
+      }
+      const maxToDrain = this._pendingCount;
+      for (let i = 0; i < maxToDrain; i += 1) {
+        const res = await this.collectCompletedReadback();
+        if (res) {
+          results.push(res);
+        }
+      }
+      return results;
+    }
+
+    /**
+     * Return a per-pipeline GPU time telemetry snapshot matching `GpuTimeTable::json()`
+     * in `runtime/gpu/gpu_time.h` (#1608).
+     */
+    getGpuTimeStats(topN = 32) {
+      return this._gpuTimeTable.getSnapshot(topN);
+    }
+
+    getGpuTimeJson(topN = 32) {
+      return this._gpuTimeTable.toJson(topN);
     }
 
     /**
@@ -1446,6 +1969,8 @@
       this._framePassCount = 0;
       this._framePassNames.fill(undefined);
       this._framePassKinds.fill(PASS_KIND_UNKNOWN);
+      this._framePassHashes.fill(0n);
+      this._gpuTimeTable.reset({ preserveSupport: true });
       this._queryCursor = 0;
       this._activePassDepth = 0;
       this._activePassLabels.fill(undefined);
@@ -1794,6 +2319,7 @@
         slot.state = 'destroyed';
         slot.passCount = 0;
         slot.passNames.fill(undefined);
+        slot.passHashes.fill(0n);
         slot.queryCount = 0;
         slot.copyBytes = 0;
       }
@@ -1803,6 +2329,7 @@
       this._pendingHead = 0;
       this._pendingTail = 0;
       this._pendingCount = 0;
+      this._completeListeners.clear();
       this.reset();
       this._device = null;
     }
@@ -1818,9 +2345,14 @@
     DEFAULT_30FPS_BUDGET_MS,
     TIMESTAMP_BYTE_SIZE,
     PASS_KINDS,
+    GPU_TIME_MAX_KEYS,
+    GPU_TIME_SUPPORT,
     BUFFER_USAGE,
     MAP_MODE,
+    formatHashHex16,
+    normalizeShaderHash,
     computePercentiles,
+    GpuTimeTable,
     GpuPassTimer,
   };
 

@@ -143,6 +143,11 @@ if (isEmscriptenPthreadWorker(initialWorkerScope) && typeof importScripts === 'f
 if (typeof importScripts === 'function') {
   importScripts('./workers/userdata.js');
   importScripts('./workers/httpfs_mailbox.js');
+  try {
+    importScripts('./workers/prewarm_bridge.js');
+  } catch {
+    // Degrade safely if prewarm_bridge.js cannot be loaded in a custom harness.
+  }
 }
 
 // kRelaunchSelfExitCode (runtime/os/win32_compat.h, ASCII "RELN"): the title called XLaunchNewGame
@@ -181,6 +186,9 @@ const userdataApi =
 const httpfsMailboxApi =
   (typeof globalThis !== 'undefined' && globalThis.PlayGta6HttpfsMailbox) ||
   (typeof require === 'function' ? require('./workers/httpfs_mailbox.js') : null);
+const prewarmBridgeApi =
+  (typeof globalThis !== 'undefined' && globalThis.PlayGta6PrewarmBridge) ||
+  (typeof require === 'function' ? require('./workers/prewarm_bridge.js') : null);
 
 const userdataStore = userdataApi ? new userdataApi.UserdataStore() : null;
 const BOOT_INIT_FORWARD_KEYS = Object.freeze([
@@ -10071,6 +10079,152 @@ function buildRuntimeModuleConfig(options = {}) {
 
   const getAudioRingTelemetry = () => audioRingController.getTelemetry();
 
+  let activePrewarmBridge = null;
+
+  const stopPrewarmBridge = (stopOpts = {}) => {
+    const bridge = activePrewarmBridge;
+    if (!bridge) {
+      return Promise.resolve(null);
+    }
+    const shouldSave = Boolean(stopOpts && stopOpts.save);
+    if (shouldSave && typeof bridge.stop === 'function') {
+      try {
+        const p = bridge.stop({ save: true });
+        activePrewarmBridge = null;
+        return Promise.resolve(p).finally(() => {
+          try {
+            bridge.destroy();
+          } catch {
+            // Ignore secondary destroy errors.
+          }
+        });
+      } catch {
+        activePrewarmBridge = null;
+      }
+    }
+    activePrewarmBridge = null;
+    try {
+      bridge.destroy();
+    } catch {
+      // Ignore prewarm bridge teardown errors.
+    }
+    return Promise.resolve(null);
+  };
+
+  const attachPrewarmBridge = (mod, attachOpts = {}) => {
+    if (options.prewarmEnabled === false || !prewarmBridgeApi || !prewarmBridgeApi.PrewarmBridge) {
+      return null;
+    }
+    const targetMod = mod && typeof mod === 'object' ? mod : boundModule;
+    if (!targetMod) {
+      return null;
+    }
+    if (activePrewarmBridge && activePrewarmBridge.available) {
+      return activePrewarmBridge;
+    }
+    const mergedOpts = Object.assign(
+      {
+        module: targetMod,
+        getMemory: () =>
+          resolveRuntimeMemory(targetMod) || resolveRuntimeMemoryBuffer(targetMod, null) || null,
+        gpuWorker:
+          typeof options.getGpuWorker === 'function'
+            ? options.getGpuWorker()
+            : options.gpuWorker !== undefined
+              ? options.gpuWorker
+              : gpuWorker,
+        buildTask: options.prewarmBuildTask,
+        maxInFlight: options.prewarmMaxInFlight,
+        pollIntervalMs: options.prewarmPollIntervalMs,
+        store: options.prewarmStore,
+        storeOptions: options.prewarmStoreOptions,
+        storeKey: options.prewarmStoreKey,
+        isIdle:
+          typeof options.prewarmIsIdle === 'function'
+            ? options.prewarmIsIdle
+            : () => _inFlightGpuPresents === 0,
+        wasm64: options.prewarmWasm64,
+        pointerSize: options.prewarmPointerSize,
+        scratchOffset: options.prewarmScratchOffset,
+        scratchSize: options.prewarmScratchSize,
+        alloc: options.prewarmAlloc,
+        free: options.prewarmFree,
+        now: options.prewarmNow,
+        onProgress: options.onPrewarmProgress,
+      },
+      attachOpts && typeof attachOpts === 'object' ? attachOpts : {},
+    );
+    const bridge = createRuntimePrewarmBridge(targetMod, mergedOpts);
+    if (!bridge || !bridge.available) {
+      return null;
+    }
+    activePrewarmBridge = bridge;
+    if (options.prewarmAutoLoad !== false) {
+      Promise.resolve(bridge.loadPersistedList())
+        .then(() => {
+          if (activePrewarmBridge === bridge && options.prewarmAutoStart !== false) {
+            bridge.start();
+          }
+        })
+        .catch(() => {
+          if (activePrewarmBridge === bridge && options.prewarmAutoStart !== false) {
+            try {
+              bridge.start();
+            } catch {
+              // Non-fatal prewarm start failure.
+            }
+          }
+        });
+    } else if (options.prewarmAutoStart !== false) {
+      bridge.start();
+    }
+    return bridge;
+  };
+
+  const getPrewarmProgress = () => {
+    if (activePrewarmBridge) {
+      return activePrewarmBridge.readProgress();
+    }
+    return readPrewarmProgress(boundModule, {
+      getMemory: () =>
+        resolveRuntimeMemory(boundModule) || resolveRuntimeMemoryBuffer(boundModule, null) || null,
+      wasm64: options.prewarmWasm64,
+      pointerSize: options.prewarmPointerSize,
+      scratchOffset: options.prewarmScratchOffset,
+      scratchSize: options.prewarmScratchSize,
+      alloc: options.prewarmAlloc,
+      free: options.prewarmFree,
+    });
+  };
+
+  const getPrewarmDiagnostics = () =>
+    activePrewarmBridge ? activePrewarmBridge.getDiagnostics() : null;
+
+  const savePrewarmList = (saveOpts) => {
+    if (activePrewarmBridge) {
+      return activePrewarmBridge.saveWarmList(saveOpts);
+    }
+    const bytes = savePrewarmWarmList(boundModule, {
+      getMemory: () =>
+        resolveRuntimeMemory(boundModule) || resolveRuntimeMemoryBuffer(boundModule, null) || null,
+      wasm64: options.prewarmWasm64,
+      pointerSize: options.prewarmPointerSize,
+      scratchOffset: options.prewarmScratchOffset,
+      scratchSize: options.prewarmScratchSize,
+      alloc: options.prewarmAlloc,
+      free: options.prewarmFree,
+    });
+    return Promise.resolve({
+      ok: bytes !== null,
+      bytes,
+      byteLength: bytes ? bytes.byteLength : 0,
+      persisted: false,
+    });
+  };
+
+  const handlePrewarmMessage = (msg) =>
+    activePrewarmBridge ? activePrewarmBridge.handleWorkerMessage(msg) : false;
+
   let runtimeExportsSummary = null;
   let instantiatedWasmHandler = null;
 
@@ -10079,6 +10233,7 @@ function buildRuntimeModuleConfig(options = {}) {
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
     }
+    stopPrewarmBridge({ save: false });
     stopInputBridge();
     audioRingController.destroy();
     if (
@@ -10095,6 +10250,7 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const resetRuntimeConfig = () => {
+    stopPrewarmBridge({ save: false });
     stopInputBridge();
     audioRingController.reset();
     attachedGuestMemory = null;
@@ -10177,6 +10333,11 @@ function buildRuntimeModuleConfig(options = {}) {
     attachPipelineDumpSyncer(mod);
     attachInputBridge(mod);
     attachAudioRing(mod);
+    try {
+      attachPrewarmBridge(mod);
+    } catch {
+      // Prewarm bridge initialization must never block runtime boot.
+    }
     if (userOnRuntimeInitialized) {
       return userOnRuntimeInitialized.apply(this, arguments);
     }
@@ -10184,10 +10345,14 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const onExit = function onPlayGta6RuntimeExit() {
-    // Snapshot and flush any pending MEMFS /pg6_dump files BEFORE clearing boundModule.
+    // Snapshot and flush any pending MEMFS /pg6_dump files and warm list BEFORE clearing boundModule.
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
+    }
+    const prewarmSavePromise = stopPrewarmBridge({ save: true });
+    if (prewarmSavePromise && typeof prewarmSavePromise.catch === 'function') {
+      prewarmSavePromise.catch(() => {});
     }
     stopInputBridge();
     resetAudioRingAttachment();
@@ -10240,6 +10405,7 @@ function buildRuntimeModuleConfig(options = {}) {
         });
       }
     }
+    stopPrewarmBridge({ save: false });
     stopInputBridge();
     resetAudioRingAttachment();
     if (
@@ -10291,6 +10457,13 @@ function buildRuntimeModuleConfig(options = {}) {
     resetAudioRingAttachment,
     getAudioRingDescriptor: () => audioRingController.getDescriptor(),
     getAudioRingTelemetry,
+    attachPrewarmBridge,
+    stopPrewarmBridge,
+    getPrewarmBridge: () => activePrewarmBridge,
+    getPrewarmProgress,
+    getPrewarmDiagnostics,
+    savePrewarmList,
+    handlePrewarmMessage,
     getRuntimeExportsSummary: () =>
       runtimeExportsSummary
         ? {
@@ -11880,6 +12053,87 @@ function buildCoordinatorIoWorkerStats() {
   });
 }
 
+function createRuntimePrewarmBridge(moduleOrExports, options = {}) {
+  if (!prewarmBridgeApi || typeof prewarmBridgeApi.PrewarmBridge !== 'function') {
+    return null;
+  }
+  const opts = options && typeof options === 'object' ? Object.assign({}, options) : {};
+  if (moduleOrExports && typeof moduleOrExports === 'object') {
+    opts.module = moduleOrExports;
+  }
+  if (typeof opts.getMemory !== 'function') {
+    opts.getMemory = () => resolveRuntimeMemoryBuffer(opts.module, opts.memory || null);
+  }
+  return new prewarmBridgeApi.PrewarmBridge(opts);
+}
+
+function loadPrewarmWarmList(moduleOrExports, bytes, options = {}) {
+  if (!prewarmBridgeApi || typeof prewarmBridgeApi.resolvePrewarmWasmApi !== 'function') {
+    return -1;
+  }
+  const opts = options && typeof options === 'object' ? Object.assign({}, options) : {};
+  if (typeof opts.getMemory !== 'function') {
+    opts.getMemory = () => resolveRuntimeMemoryBuffer(moduleOrExports, opts.memory || null);
+  }
+  const api = prewarmBridgeApi.resolvePrewarmWasmApi(moduleOrExports, opts);
+  if (!api.hasLoadList) {
+    return -1;
+  }
+  const parsed = prewarmBridgeApi.parseWarmList(bytes);
+  if (!parsed.ok) {
+    return -1;
+  }
+  try {
+    return api.loadList(bytes);
+  } catch {
+    return -1;
+  }
+}
+
+function readPrewarmProgress(moduleOrExports, options = {}) {
+  if (!prewarmBridgeApi || typeof prewarmBridgeApi.resolvePrewarmWasmApi !== 'function') {
+    return null;
+  }
+  if (!moduleOrExports || typeof moduleOrExports !== 'object') {
+    return null;
+  }
+  const opts = options && typeof options === 'object' ? Object.assign({}, options) : {};
+  if (typeof opts.getMemory !== 'function') {
+    opts.getMemory = () => resolveRuntimeMemoryBuffer(moduleOrExports, opts.memory || null);
+  }
+  const api = prewarmBridgeApi.resolvePrewarmWasmApi(moduleOrExports, opts);
+  if (!api.hasProgress) {
+    return null;
+  }
+  try {
+    return api.progress();
+  } catch {
+    return null;
+  }
+}
+
+function savePrewarmWarmList(moduleOrExports, options = {}) {
+  if (!prewarmBridgeApi || typeof prewarmBridgeApi.resolvePrewarmWasmApi !== 'function') {
+    return null;
+  }
+  if (!moduleOrExports || typeof moduleOrExports !== 'object') {
+    return null;
+  }
+  const opts = options && typeof options === 'object' ? Object.assign({}, options) : {};
+  if (typeof opts.getMemory !== 'function') {
+    opts.getMemory = () => resolveRuntimeMemoryBuffer(moduleOrExports, opts.memory || null);
+  }
+  const api = prewarmBridgeApi.resolvePrewarmWasmApi(moduleOrExports, opts);
+  if (!api.hasSaveList) {
+    return null;
+  }
+  try {
+    return api.saveList();
+  } catch {
+    return null;
+  }
+}
+
 function readRuntimeDiagnostics(moduleOrExports) {
   if (!moduleOrExports || typeof moduleOrExports !== 'object') {
     return null;
@@ -12163,6 +12417,16 @@ function getLoaderStatus() {
         : activeCoordinatorRuntimeModule
           ? inspectRuntimeExports(activeCoordinatorRuntimeModule)
           : null,
+    prewarmProgress:
+      activeCoordinatorModuleConfig &&
+      typeof activeCoordinatorModuleConfig.getPrewarmProgress === 'function'
+        ? activeCoordinatorModuleConfig.getPrewarmProgress()
+        : readPrewarmProgress(activeCoordinatorRuntimeModule),
+    prewarmDiagnostics:
+      activeCoordinatorModuleConfig &&
+      typeof activeCoordinatorModuleConfig.getPrewarmDiagnostics === 'function'
+        ? activeCoordinatorModuleConfig.getPrewarmDiagnostics()
+        : null,
   };
 }
 
@@ -12918,6 +13182,15 @@ if (typeof self !== 'undefined') {
         handleRecycledCmdBuffer(data.cmdBuffer);
         return;
       }
+      if (
+        prewarmBridgeApi &&
+        data.type === prewarmBridgeApi.PREWARM_MSG_RESULT &&
+        activeCoordinatorModuleConfig &&
+        typeof activeCoordinatorModuleConfig.handlePrewarmMessage === 'function'
+      ) {
+        activeCoordinatorModuleConfig.handlePrewarmMessage(data);
+        return;
+      }
       if (data.ready) {
         resetGpuPresentBackpressure();
         attachActiveCoordinatorGuestMemory();
@@ -13150,6 +13423,10 @@ const exportedApi = {
   getPthreadTelemetry,
   getLoaderStatus,
   sanitizeIoWorkerStats,
+  createRuntimePrewarmBridge,
+  loadPrewarmWarmList,
+  readPrewarmProgress,
+  savePrewarmWarmList,
   readRuntimeDiagnostics,
   handleIoWorkerMessage,
   getWasmMemoryTelemetry,
