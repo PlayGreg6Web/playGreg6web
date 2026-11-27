@@ -4455,13 +4455,12 @@ void test_xbox_device_queue_and_list_slots() {
     fx.vcall(list, XSlot::RSSetShadingRateImage, {I(0)});
     fx.vcall(list, XSlot::RegisterWrite, {I(0xC280), I(0x20000), I(0), I(0xFFFFFFFFFF00ULL)});
     fx.vcall(list, 132, {I(0x700000), I(0), I(0), I(0xFFFFFFFFFF00ULL)});
-    fx.vcall(list, 101, {I(0), I(0), I(0)});  // slot 101: recorded, no effect (no E_NOTIMPL stub, no fault)
     fx.vcall(list, XSlot::BeginQuery, {I(0), I(0), I(0)});
     fx.vcall(list, XSlot::ExecuteIndirect, {I(0), I(1), I(buf), I(0), I(0), I(0)});
     fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
     CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
     const auto calls = object_of<dg::CommandList>(list)->xbox_slot_calls();
-    CHECK(calls.size() == 3 && calls[0].first == 101 && calls[1].first == 131 && calls[2].first == 132);
+    CHECK(calls.size() == 2 && calls[0].first == 131 && calls[1].first == 132);
     CHECK(counter(dev, dg::xbox::Counter::DepthBoundsIgnored) == 1 &&
           counter(dev, dg::xbox::Counter::ShadingRateIgnored) == 2 &&
           counter(dev, dg::xbox::Counter::IndirectSkipped) == 1);
@@ -4469,7 +4468,10 @@ void test_xbox_device_queue_and_list_slots() {
     scene.execute({list});
     CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);  // the indirect draw has no packet
     CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 131) == 0);
+    // Slot 101 (unidentified) stays a counted E_NOTIMPL stub, not a silent no-op.
     CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 101) == 0);
+    CHECK(static_cast<int32_t>(fx.vcall(list, 101, {I(0), I(0), I(0)})) == static_cast<int32_t>(0x80004001));
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 101) == 1);
 
     CHECK(t_balanced);
     scene.release_all({list, buf, heap, aliased});

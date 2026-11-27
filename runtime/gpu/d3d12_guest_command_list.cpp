@@ -3964,10 +3964,10 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 90..93
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 94..97
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 98..100
-    // Slot 101 is called late in the title's boot (issue 663). Its meaning is not established (the title's own
-    // classes share this vtable offset, so the call sites alone do not name the method), so it is recorded and
-    // has no effect, like the other undetermined slots: it was a stub returning E_NOTIMPL and logging every run.
-    CL::method<&H::XboxSlot<101>>("Xbox slot 101"),                                   // 101
+    // Slot 101 is called late in the title's boot (issue 663) and is UNIDENTIFIED: the title's own classes share this
+    // vtable offset, so the call sites alone do not name the method. It stays an unimplemented stub on purpose
+    // (E_NOTIMPL, logged once per run by the com bridge, hits counted: com::stub_hits) rather than a silent no-op.
+    CL::stub("Xbox slot 101 (unidentified)"),                                         // 101
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 102..105
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 106..109
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 110..113
