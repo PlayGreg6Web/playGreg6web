@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "guest/com_bridge.h"
 #include "os/guest_window.h"
 #include "os/os_shim.h"
 #include "os/win32_compat.h"
@@ -632,7 +633,7 @@ uint16_t pg6_win32_register_class_ex_a(const Pg6WndClassExA* window_class) {
     // CPU window): read it through the shared translation, one character at a time.
     std::string raw;
     const uint64_t name_va = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(window_class->class_name));
-    for (char c = 0; raw.size() < 256 && playgta6::os::guest_window::copy_from_guest(&c, name_va + raw.size(), 1) &&
+    for (char c = 0; raw.size() < 256 && playgta6::guest::com::read_guest(name_va + raw.size(), &c, 1) &&
                      c != 0;) {
         raw.push_back(c);
     }

@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -458,34 +459,89 @@ void* guest_to_host(uint64_t va, size_t len) {
     return const_cast<uint8_t*>(guest_memory().host_ptr_const(va, len == 0 ? 1 : len));
 }
 
+namespace {
+
+// The host bytes of window range [va, va + n) (host-contiguous), with the arena lock held in `hold`
+// when they are arena pages; nullptr (and `hold` empty) when the range is not mapped in one piece.
+// The window shows arena pages: another guest thread decommitting them mid-access would fault the
+// host, so the arena lock is held over the access like the flat path does (the pages are re-checked
+// under it; a decommitted range reads as not mapped). Runtime-owned window ranges live outside the
+// arena and need no lock.
+// The window translation is re-checked under the lock too: an XMem remap unmaps the window slot
+// before it decommits, then commits (zero) and copies the new page's bytes in before it maps the
+// slot again, so a translation read before the lock may name memory that is committed again but
+// not filled yet. Under the lock the slot either still shows these bytes (the decommit waits for
+// the lock) or it changed: then the range is translated again (a few times; a slot that keeps
+// moving reads as not mapped).
+// Lock order (#1913): only the arena lock is taken here, and the window translation it re-checks
+// is lock-free; callers must not hold the window or XMem locks.
+uint8_t* window_range_held(uint64_t va, size_t n, std::unique_lock<std::mutex>& hold) {
+    auto* p = static_cast<uint8_t*>(os::guest_window::contiguous(va, n));
+    if (p == nullptr) {
+        return nullptr;
+    }
+    // Fault reporting may hold the arena lock on this thread already: read without it there.
+    if (os::VirtualMemoryArena::DiagnosticReads::active()) {
+        return p;
+    }
+    os::VirtualMemoryArena& arena = guest_memory();
+    for (int attempt = 0; attempt < 4 && p != nullptr; ++attempt) {
+        const uint64_t arena_va = arena.guest_address(p);
+        if (arena_va < arena.space_base() || arena_va - arena.space_base() >= arena.space_size()) {
+            return p;  // runtime-owned window range
+        }
+        if (arena.host_ptr_const_held(arena_va, n, hold) != p) {
+            return nullptr;  // decommitted / released: not mapped
+        }
+        auto* again = static_cast<uint8_t*>(os::guest_window::contiguous(va, n));
+        if (again == p) {
+            return p;
+        }
+        hold.unlock();
+        p = again;
+    }
+    if (hold.owns_lock()) {
+        hold.unlock();
+    }
+    return nullptr;
+}
+
+// Runs access(host, offset, n) over window range [va, va + len): in one piece when it is
+// host-contiguous, else slot by slot, each piece under window_range_held. False when a piece is
+// not mapped (a prefix may have been accessed).
+template <typename Access>
+bool window_access(uint64_t va, size_t len, Access&& access) {
+    size_t done = 0;
+    while (done < len) {
+        const uint64_t at = va + done;
+        size_t n = len - done;
+        std::unique_lock<std::mutex> hold;
+        uint8_t* p = window_range_held(at, n, hold);
+        if (p == nullptr) {
+            const uint64_t left = os::guest_window::kSlotBytes - (at & (os::guest_window::kSlotBytes - 1));
+            if (left >= n) {
+                return false;  // one slot already: not mapped
+            }
+            n = static_cast<size_t>(left);
+            p = window_range_held(at, n, hold);
+            if (p == nullptr) {
+                return false;
+            }
+        }
+        access(p, done, n);
+        done += n;
+    }
+    return true;
+}
+
+}  // namespace
+
 GuestRangeView::GuestRangeView(uint64_t va, size_t len) {
     if (va == 0) {
         return;
     }
     if (os::guest_window::translated(va)) [[unlikely]] {
-        data_ = static_cast<const uint8_t*>(os::guest_window::contiguous(va, len == 0 ? 1 : len));
-        if (data_ != nullptr) {
-            // The window shows arena pages: another guest thread decommitting them mid-read would
-            // fault the host, so hold the arena lock over the view like the flat path below does
-            // (the pages are re-checked under it; a decommitted range reads as not mapped).
-            // Runtime-owned window ranges live outside the arena and need no lock.
-            // The window translation is re-checked under the lock too: an XMem remap unmaps the
-            // window slot before it decommits, then commits (zero) and copies the new page's bytes
-            // in before it maps the slot again, so a translation read before the lock may name
-            // memory that is committed again but not filled yet. Under the lock the slot either
-            // still shows these bytes (the decommit waits for the lock) or the view is not mapped.
-            os::VirtualMemoryArena& arena = guest_memory();
-            const uint64_t arena_va = arena.guest_address(data_);
-            if (arena_va >= arena.space_base() && arena_va - arena.space_base() < arena.space_size()) {
-                if (arena.host_ptr_const_held(arena_va, len == 0 ? 1 : len, hold_) != data_ ||
-                    os::guest_window::contiguous(va, len == 0 ? 1 : len) != data_) {
-                    data_ = nullptr;
-                    if (hold_.owns_lock()) {
-                        hold_.unlock();
-                    }
-                }
-            }
-        }
+        data_ = window_range_held(va, len == 0 ? 1 : len, hold_);
         return;
     }
     data_ = guest_memory().host_ptr_const_held(va, len == 0 ? 1 : len, hold_);
@@ -506,14 +562,22 @@ uint64_t host_to_guest(const void* host) {
 
 bool read_guest(uint64_t va, void* dst, size_t len) {
     if (os::guest_window::translated(va)) [[unlikely]] {
-        return os::guest_window::copy_from_guest(dst, va, len);
+        auto* out = static_cast<uint8_t*>(dst);
+        return window_access(va, len, [out](const uint8_t* host, size_t at, size_t n) {
+            std::memcpy(out + at, host, n);
+        });
     }
     return va != 0 && guest_memory().read(va, dst, len);
 }
 
 bool write_guest(uint64_t va, const void* src, size_t len) {
     if (os::guest_window::translated(va)) [[unlikely]] {
-        return os::guest_window::copy_to_guest(va, src, len);
+        const auto* in = static_cast<const uint8_t*>(src);
+        const bool ok = window_access(va, len, [in](uint8_t* host, size_t at, size_t n) {
+            std::memcpy(host, in + at, n);
+        });
+        os::guest_window::mark_written(va, len);  // after the arena lock is released
+        return ok;
     }
     return va != 0 && guest_memory().write(va, src, len);
 }

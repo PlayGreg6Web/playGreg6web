@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <vector>
 
+#include "guest/com_bridge.h"
 #include "os/guest_window.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -39,17 +40,19 @@ constexpr uint8_t kUwopSaveXmm128Far = 9;
 constexpr uint8_t kUwopPushMachframe = 10;
 
 // Guest memory through the arena, or through the translated CPU window for window VAs (O29:
-// records, contexts and argument arrays the guest passes may live there).
+// records, contexts and argument arrays the guest passes may live there; com::read_guest /
+// write_guest re-check a window slot under the arena lock, so a mirrored remap is never seen
+// half-filled).
 bool read_bytes(VirtualMemoryArena& arena, uint64_t va, void* dst, size_t len) {
     if (os::guest_window::translated(va)) [[unlikely]] {
-        return os::guest_window::copy_from_guest(dst, va, len);
+        return com::read_guest(va, dst, len);
     }
     return arena.read(va, dst, len);
 }
 
 bool write_bytes(VirtualMemoryArena& arena, uint64_t va, const void* src, size_t len) {
     if (os::guest_window::translated(va)) [[unlikely]] {
-        return os::guest_window::copy_to_guest(va, src, len);
+        return com::write_guest(va, src, len);
     }
     return arena.write(va, src, len);
 }

@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "guest/com_bridge.h"
 #include "os/guest_window.h"
 #include "os/vmem.h"
 #include "os/win32_loader.h"
@@ -243,7 +244,7 @@ bool read_guest_u16_string(uint64_t address, std::u16string* out) {
     for (size_t i = 0; i < kMaxChars; ++i) {
         char16_t c = 0;
         const uint64_t va = address + 2 * i;
-        if (guest_window::translated(va) ? !guest_window::copy_from_guest(&c, va, sizeof(c))
+        if (guest_window::translated(va) ? !::playgta6::guest::com::read_guest(va, &c, sizeof(c))
                                          : !arena->read(va, &c, sizeof(c))) {
             return false;
         }

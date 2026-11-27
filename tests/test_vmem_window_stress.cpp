@@ -1,12 +1,13 @@
 // Multi-threaded stress of the real VirtualMemoryArena / guest-window paths the GPU thread reads
 // while guest threads change them (the host-AV family fixed by #1817, #1818, #1855, #1913): guest
 // map_shared / unmap_shared, decommit / MEM_RESET / recommit (incl. the page-reclamation path of
-// #1773), mirrored 2 MiB window slot remaps (#1857), against readers using GuestRangeView and
-// arena reads (what Device::flush_cpu_buffers does). Pass criteria: no host fault, and a reader
+// #1773), mirrored 2 MiB window slot remaps (#1857), against readers using GuestRangeView,
+// com::read_guest and arena reads (what Device::flush_cpu_buffers does). Pass criteria: no host fault, and a reader
 // sees either "not mapped" or one of the page contents that were ever mapped there, uniform per
 // 4 KiB page (every writer fills a page in one locked write). Op schedules are seeded and
 // deterministic; thread interleaving is made tight with start barriers. Synthetic data only.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -295,6 +296,11 @@ void phase_shared_views(uint64_t seed, bool window) {
     release_shared_page(page_b);
 }
 
+std::vector<uint8_t>& read_buf() {
+    thread_local std::vector<uint8_t> buf(k2M);
+    return buf;
+}
+
 // Phase 3: a mirrored 2 MiB MEM_PHYSICAL reservation whose window slots (all 32 per page, #1857)
 // are mapped / unmapped / re-pointed between two physical pages while readers view the window.
 void phase_mirrored_2m(uint64_t seed) {
@@ -325,8 +331,10 @@ void phase_mirrored_2m(uint64_t seed) {
         CHECK(gw::copy_to_guest(wm, chunk.data(), chunk.size()));
         CHECK(pg6_xbox_XMemMapPhysicalPages(mirror, 1, nullptr) == mirror);
     }
+    // More readers than cores: a reader preempted mid-copy is what lets a remap overlap a copy.
+    const int readers = static_cast<int>(std::clamp(2 * std::thread::hardware_concurrency(), 8u, 32u));
     run(
-        1, 4,
+        1, readers,
         [&](int, Rng& rng) {
             for (int i = 0; i < 500; ++i) {
                 switch (rng.below(3)) {
@@ -338,6 +346,31 @@ void phase_mirrored_2m(uint64_t seed) {
         },
         [&](int, Rng& rng) {
             const uint64_t slot = rng.below(32);
+            if (rng.below(2) == 0) {
+                // Host-side copies (read_guest: the GPU thread, audio, IO) re-check the slot under the
+                // arena lock like a view does.
+                // Half of them copy the whole 2 MiB page (one long memcpy that a remap would
+                // otherwise overlap: zeros, or a fault on the decommitted page).
+                const bool whole = rng.below(2) == 0;
+                const size_t n = whole ? k2M : k64K;
+                std::vector<uint8_t>& buf = read_buf();
+                if (!playgta6::guest::com::read_guest(wm + (whole ? 0 : slot * k64K), buf.data(), n)) {
+                    ++g_reads_null;
+                    return;
+                }
+                // A copy is not atomic across slots (a remap between two slots' pieces is fine, as on
+                // the console), but every 64 KiB slot it copied is one whole stamped page.
+                bool exact = true;
+                for (size_t base = 0; base < n && exact; base += k64K) {
+                    exact = buf[base] == stamp[0] || buf[base] == stamp[1];
+                    for (size_t i = base; i < base + k64K && exact; ++i) {
+                        exact = buf[i] == buf[base];
+                    }
+                }
+                CHECK(exact);
+                ++g_reads_ok;
+                return;
+            }
             const GuestRangeView view(wm + slot * k64K, k64K);
             if (view.data() == nullptr) {
                 ++g_reads_null;
