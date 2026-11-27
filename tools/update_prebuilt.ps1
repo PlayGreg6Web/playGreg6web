@@ -7,6 +7,9 @@
   With -Web: the same for the browser build (tools/play_local.ps1 -Prebuilt); dir -Dir, else $env:PLAYGTA6_PREBUILT_WEB_DIR,
   else %LOCALAPPDATA%\playgta6\prebuilt-web. Also needs a shader pack: -ShaderPack, else derived from the std pack (-StdPack / PLAYGTA6_NATIVE_SHADER_PACK, tools/subset_wgsl_pack.py), else PLAYGTA6_SHADER_PACK; and emsdk;
   reuses the lift cache and the previous object cache.
+  Smoke gate (native): after the build, one headless ~75 s menu-flow boot (--live-executor, no window) runs from the new copy; it is
+  swapped in only if it reached presents > 0 and ended on no fault or a known hard stop (tools/prebuilt_smoke.py). Otherwise the old
+  prebuilt stays, the new one is left as <dir>.new, and the stop line and run dir are printed. -SkipSmoke opts out; -DryRun prints the plan.
 .EXAMPLE
   .\tools\update_prebuilt.ps1            # builds the checked-out commit
   .\tools\update_prebuilt.ps1 -Dir H:\pg6-play
@@ -20,7 +23,9 @@ param(
     [string]$GameDir = $env:GTA6_GAME_DIR,
     [switch]$Web,
     [string]$ShaderPack = $env:PLAYGTA6_SHADER_PACK,
-    [string]$StdPack = $env:PLAYGTA6_NATIVE_SHADER_PACK
+    [string]$StdPack = $env:PLAYGTA6_NATIVE_SHADER_PACK,
+    [switch]$SkipSmoke,
+    [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -64,6 +69,10 @@ if ($Web) {
     }
     $target = [System.IO.Path]::GetFullPath($PrebuiltDir)
     $tmp = "$target.new"
+    if ($DryRun) {
+        Write-Host "[dry-run] web prebuilt: $target (build in $tmp, swap on success; no headless smoke boot for the browser build)"
+        return
+    }
     if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
     $seed = @()
     if (Test-Path -LiteralPath $target) { $seed = @("--seed-from", $target) }
@@ -87,6 +96,11 @@ if (-not $Dir) { $Dir = Join-Path $env:LOCALAPPDATA "playgta6\prebuilt" }
 if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
 $Dir = [IO.Path]::GetFullPath($Dir)
 $tmp = "$Dir.new"; $old = "$Dir.old"
+if ($DryRun) {
+    Write-Host "[dry-run] native prebuilt: $Dir (build in $tmp, old copy kept as $old until the swap succeeded)"
+    Write-Host "[dry-run] smoke gate: $(if ($SkipSmoke) { 'skipped (-SkipSmoke)' } else { "python tools/run_native_boot.py --preset menu-flow --name prebuilt-smoke --live-executor --trust-build --build-dir $tmp --max-ms 75000; then python tools/prebuilt_smoke.py <run dir>" })"
+    exit 0
+}
 if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
 if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old }
 $parent = Split-Path -Parent $Dir
@@ -102,10 +116,27 @@ try {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
     throw
 } finally { Pop-Location }
-# drop what is not needed to run (per-run outputs and object/IR intermediates)
-foreach ($n in @("runs", "program\native\harness-build", "program\native\bin\playgta6_boot.pdb")) { $p = Join-Path $tmp $n; if (Test-Path -LiteralPath $p) { Remove-Item -Recurse -Force -LiteralPath $p } }
 @{ commit = $commit; dirty = $dirty; built_utc = (Get-Date).ToUniversalTime().ToString("o") } |
     ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $tmp "prebuilt.json")
+if (-not $SkipSmoke) {
+    $smokeName = "prebuilt-smoke"
+    $smokeRun = Join-Path $tmp "runs\$smokeName"
+    Write-Host "[prebuilt] smoke boot from $tmp (headless, ~75 s)..."
+    $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    Push-Location $repo
+    try {
+        & python tools/run_native_boot.py --preset menu-flow --name $smokeName --live-executor --trust-build `
+            --exe $Exe --game-dir $GameDir --build-dir $tmp --max-ms 75000 --watchdog-ms 105000
+        & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") $smokeRun
+        $smokeOk = ($LASTEXITCODE -eq 0)
+    } finally { Pop-Location; $ErrorActionPreference = $eap }
+    if (-not $smokeOk) {
+        Write-Host "[prebuilt] smoke boot FAILED: the existing prebuilt at $Dir is kept; the new build is left at $tmp (run dir: $smokeRun). Use -SkipSmoke to swap anyway."
+        exit 3
+    }
+}
+# drop what is not needed to run (per-run outputs and object/IR intermediates)
+foreach ($n in @("runs", "program\native\harness-build", "program\native\bin\playgta6_boot.pdb")) { $p = Join-Path $tmp $n; if (Test-Path -LiteralPath $p) { Remove-Item -Recurse -Force -LiteralPath $p } }
 $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$Dir\*" })
 if ($busy) {
     Write-Host "[prebuilt] $Dir is in use (pid $($busy.Id -join ',')); new build kept at $tmp. Close the game, then: Rename-Item '$Dir' '$(Split-Path -Leaf $old)'; Rename-Item '$tmp' '$(Split-Path -Leaf $Dir)'; Remove-Item -Recurse -Force '$old'"

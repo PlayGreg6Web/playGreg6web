@@ -52,5 +52,12 @@ class PlayScriptsDryRunTests(unittest.TestCase):
         self.assertIn("s.pack", out)
 
 
+    def test_update_prebuilt_smoke_plan(self) -> None:
+        out = self.run_script("update_prebuilt.ps1", "-Dir", str(self.tmp / "pb"))
+        self.assertIn("prebuilt_smoke.py", out)
+        self.assertIn("--live-executor", out)
+        out = self.run_script("update_prebuilt.ps1", "-Dir", str(self.tmp / "pb"), "-SkipSmoke")
+        self.assertIn("skipped (-SkipSmoke)", out)
+
 if __name__ == "__main__":
     unittest.main()

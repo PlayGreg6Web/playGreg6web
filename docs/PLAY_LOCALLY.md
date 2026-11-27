@@ -25,7 +25,7 @@ If it stops or crashes, see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) for where t
 
 **Play without compiling (prebuilt).** `tools\update_prebuilt.ps1` builds once into a folder (default
 `%LOCALAPPDATA%\playgta6\prebuilt`, or `-Dir` / `PLAYGTA6_PREBUILT_DIR`) into a temp dir and swaps it in only when the
-build succeeded, so your playable copy is never broken; it records the source commit in `prebuilt.json`. Then
+build succeeded, so your playable copy is never broken; it records the source commit in `prebuilt.json`. Before the swap (native) it runs a ~75 s headless smoke boot from the new copy (`--live-executor`, menu-flow, no window) and swaps only if it reached presents > 0 and ended without a fault or on a known hard stop (`tools/prebuilt_smoke.py`); otherwise the old copy stays, the new build is left as `<dir>.new` and the stop line and run dir are printed (exit 3). `-SkipSmoke` opts out; `-DryRun` prints the plan. The browser build has no headless smoke boot (its build-only check is the gate). Then
 `.\tools\play_native.ps1 -Prebuilt` starts it with `-TrustBuild` semantics (never builds) and prints the build's commit and
 how many commits it is behind `origin/main`. If commits since then touched `runtime/`, `recomp/`, `shaders/` or the boot harness, it also prints one "Prebuilt is N runtime commits behind" line plus the 3 newest subjects (`tools/prebuilt_stale.py`; informational only, never blocks or rebuilds). To use another folder: `$env:PLAYGTA6_PREBUILT_DIR = "D:\pg6-play"`.
 
