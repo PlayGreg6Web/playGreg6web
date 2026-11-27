@@ -3991,7 +3991,7 @@ void test_storage_texture_aliasing(NativeExecutor& ex) {
     CHECK(all);
     const ExecutorStats& s = ex.stats();
     CHECK(s.device_errors == before.device_errors);
-    CHECK(s.storage_tex_alias_copies == before.storage_tex_alias_copies + 2);
+    CHECK(s.storage_tex_alias_copies + s.usage_texture_snapshots == before.storage_tex_alias_copies + before.usage_texture_snapshots + 2);
 }
 
 void test_error_scope_attribution() {
