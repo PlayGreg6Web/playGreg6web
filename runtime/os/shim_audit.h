@@ -328,7 +328,7 @@
     X(pg6_mw_hc_http_call_response_get_status_code, ok, "") \
     X(pg6_mw_hc_http_call_set_tracing, ok, "") \
     X(pg6_mw_hc_settings_get_trace_level, ok, "reports HCTraceLevel::Off") \
-    X(pg6_mw_hc_trace_impl_message, deny, "C-variadic: a fixed-signature thunk cannot marshal it") \
+    X(pg6_mw_hc_trace_impl_message, deny, "C-variadic: a fixed-signature thunk cannot marshal it; gthunk: pg6_gthunk_hc_trace_impl_message (os/host_marshallers.h)") \
     X(pg6_mw_hc_trace_set_etw_enabled, ok, "") \
     /* ---- Bink2Scarlett (no decoder: movies refused at open; per-movie calls tolerate NULL) ---- */ \
     X(pg6_mw_bink_open_with_options, ok, "no decoder: refuses every movie (returns NULL), the title takes its failure path") \
@@ -423,7 +423,7 @@
     X(pg6_ws2_getsockopt, ok, "WSAENOTSOCK") \
     X(pg6_ws2_htons, ok, "") \
     X(pg6_ws2_inet_addr, ok, "") \
-    X(pg6_ws2_inet_ntoa, deny, "takes struct in_addr by value (Win64 passes it in a register); the bridge does not marshal structs by value") \
+    X(pg6_ws2_inet_ntoa, deny, "takes struct in_addr by value (Win64 passes it in a register) and returns a host buffer; gthunk: pg6_gthunk_inet_ntoa (os/host_marshallers.h)") \
     X(pg6_ws2_listen, ok, "WSAENOTSOCK") \
     X(pg6_ws2_recv, ok, "WSAENETUNREACH") \
     X(pg6_ws2_recvfrom, ok, "WSAENETUNREACH") \
