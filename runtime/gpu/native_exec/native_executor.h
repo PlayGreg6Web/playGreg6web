@@ -279,6 +279,15 @@ struct ExecutorStats {
     uint64_t usage_snapshot_skipped = 0;
     uint64_t usage_snapshot_reused = 0;  // buffer snapshots served from the encoder cache (no copy, no split)
     uint64_t usage_snapshot_bytes_saved = 0;
+    // Shader binding access (binding_access_model.h): buffer bindings the bound pipeline never references that
+    // touch another binding of the same buffer are bound to a dummy instead (no snapshot, no alias copy).
+    uint64_t usage_unref_dummies = 0;        // bind-group entries bound to such a dummy
+    uint64_t usage_unref_groups = 0;         // substitute bind groups created for them
+    uint64_t usage_never_written_uses = 0;   // writable buffer uses the pipeline never writes (reads of them stay cacheable)
+    uint64_t usage_writes_not_noted = 0;     // writable buffer uses that did not invalidate cached snapshots (never written)
+    uint64_t shader_access_scans = 0;        // WGSL modules scanned for their binding access
+    uint64_t shader_access_unknown = 0;      // ... the scan could not account for every binding (all assumed written)
+    uint64_t shader_rw_never_written = 0;    // ... read_write storage / storage-texture bindings the module never writes
     uint64_t usage_snapshots_to_writer_twin = 0;  // big read-only snapshots avoided by twinning the small writable binding
     uint64_t usage_snapshots_off = 0;  // snapshots not taken: ExecutorOptions::usage_snapshots is off
     uint64_t usage_split_discards = 0;
@@ -324,6 +333,14 @@ struct ExecutorStats {
     uint64_t query_pool_exhausted = 0;     // occlusion segments past the per-submit pool: the query's result is not written
     uint64_t storage_alias_dispatch_restarts = 0;  // compute passes split to take those copies
     uint64_t storage_alias_unfixable = 0;  // overlaps no copy could separate (zero-size / out-of-range / depth, MS, BC textures, two texture writers)
+    // ... the unfixable ones by reason (they sum to storage_alias_unfixable)
+    uint64_t storage_alias_unfixable_tex_writers = 0;  // two writable storage-texture bindings of one subresource
+    uint64_t storage_alias_unfixable_tex_ms = 0;       // texture twin impossible: multisampled
+    uint64_t storage_alias_unfixable_tex_depth = 0;    // ... depth / stencil format
+    uint64_t storage_alias_unfixable_tex_bc = 0;       // ... block-compressed format
+    uint64_t storage_alias_unfixable_tex_view = 0;     // ... view format or aspect differs from the texture's
+    uint64_t storage_alias_unfixable_tex_copysrc = 0;  // ... texture without CopySrc usage
+    uint64_t storage_alias_unfixable_buf_range = 0;    // buffer copy impossible: zero words / range past the buffer end
     uint64_t storage_alias_twin_writers = 0;  // later writable buffer bindings run on a scratch copy whose changed words are merged back
     uint64_t storage_alias_copy_dispatches = 0;  // copies / merges done by a compute kernel inside the pass (no split)
     uint64_t storage_tex_alias_copies = 0;  // texture bindings overlapping a storage-texture write, bound through a twin texture

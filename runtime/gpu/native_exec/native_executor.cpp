@@ -31,6 +31,7 @@
 #include "gpu/drop_table.h"
 #include "gpu/gpu_time.h"
 #include "gpu/present_pacing.h"
+#include "gpu/native_exec/binding_access_model.h"
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
@@ -401,6 +402,9 @@ struct ShaderEntry {
     mutable std::optional<std::vector<WgslBinding>> group0_cache;
     mutable std::optional<std::vector<std::vector<WgslBinding>>> groups_cache;  // every @group (layout fit)
     mutable std::optional<bool> declares_group0_cache;
+    // Which bindings the module references / can write (binding_access_model.h); null until scanned.
+    mutable std::shared_ptr<const ShaderBindingAccess> access_cache;
+    mutable bool access_accounted = false;
     mutable std::string frag_mask_ep;
     mutable std::optional<std::optional<uint32_t>> frag_mask_cache;
     // Worker hand-off (queue thread: `queued`, `accounted`; worker: the results, then `ready`).
@@ -480,11 +484,13 @@ struct RenderPipelineEntry : AsyncSlot {
     uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
     uint64_t quarantined_hash = 0;  // the stage hash that is on the shader quarantine (draws are skipped), else 0
     FitDummies fit;
+    std::shared_ptr<const ShaderBindingAccess> access;  // its stages' binding access (null: unknown, all written)
 };
 
 struct ComputePipelineEntry : AsyncSlot {
     mutable wgpu::ComputePipeline pipeline;
     FitDummies fit;
+    std::shared_ptr<const ShaderBindingAccess> access;
 };
 
 struct BufferEntry {
@@ -807,6 +813,10 @@ struct NativeExecutor::Impl {
     // copies and the passes reading them in order), indexed by their use within one split.
     std::vector<wgpu::Buffer> snap_buffers;
     std::vector<wgpu::Buffer> snap_free;  // snapshot buffers of finished encoders, reused (queue order keeps it safe)
+    // Dummies for unreferenced buffer bindings (flush_binds): one per slot of a draw / dispatch, writable and
+    // read-only ones apart (a buffer used both ways in one render pass is a usage-scope conflict of its own).
+    std::vector<wgpu::Buffer> unref_dummy_w, unref_dummy_r;
+    bool binding_access_on = std::getenv("PG6_NO_BINDING_ACCESS") == nullptr;
     std::unordered_map<std::string, std::vector<wgpu::Texture>> snap_textures;
     size_t snap_texture_count = 0;
     std::unordered_map<uint32_t, AutoLayoutMeta> compute_meta;
@@ -3128,7 +3138,8 @@ struct NativeExecutor::Impl {
         e.group0_cache = parse_wgsl_group0_bindings(e.code);
         e.groups_cache = parse_wgsl_group_bindings(e.code);
         e.declares_group0_cache = wgsl_declares_group0(e.code);
-        e.worker_scans += 3;
+        e.access_cache = std::make_shared<const ShaderBindingAccess>(scan_binding_access(e.code));
+        e.worker_scans += 4;
         if (e.stage == 1) {
             e.frag_mask_ep = e.ep_cache[1];
             e.frag_mask_cache = wgsl_fragment_output_mask(e.code, e.frag_mask_ep);
@@ -3307,6 +3318,34 @@ struct NativeExecutor::Impl {
             note_scan(now_ns() - t0);
         }
         return *e.groups_cache;
+    }
+
+    const ShaderBindingAccess& access_of(const ShaderEntry& e) {
+        if (!e.access_cache) {
+            const uint64_t t0 = now_ns();
+            e.access_cache = std::make_shared<const ShaderBindingAccess>(scan_binding_access(code_of(e)));
+            note_scan(now_ns() - t0);
+        }
+        return *e.access_cache;
+    }
+
+    // The binding access of a pipeline's stages (accounted once per module in the stats).
+    std::shared_ptr<const ShaderBindingAccess> pipeline_access(const ShaderEntry& a, const ShaderEntry* b) {
+        if (!binding_access_on) return nullptr;
+        auto account = [&](const ShaderEntry& e) {
+            const ShaderBindingAccess& acc = access_of(e);
+            if (!e.access_accounted) {
+                e.access_accounted = true;
+                ++stats.shader_access_scans;
+                if (!acc.known) ++stats.shader_access_unknown;
+                stats.shader_rw_never_written += acc.writable_never_written();
+            }
+            return &acc;
+        };
+        const ShaderBindingAccess* x = account(a);
+        if (!b) return a.access_cache;
+        const ShaderBindingAccess* y = account(*b);
+        return std::make_shared<const ShaderBindingAccess>(merge_binding_access(*x, y));
     }
 
     bool declares_group0_of(const ShaderEntry& e) {
@@ -4472,6 +4511,7 @@ struct NativeExecutor::Impl {
         e.expects_group0 = expects;
         e.auto_meta = std::move(auto_meta);
         e.fit = std::move(fit);
+        e.access = pipeline_access(vs, fs);
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs.hash);
         if (out) {
@@ -4848,6 +4888,7 @@ struct NativeExecutor::Impl {
         cd.compute.entryPoint = {ep.data(), ep.size()};
         ComputePipelineEntry ce;
         ce.fit = std::move(fit);
+        ce.access = pipeline_access(cs, nullptr);
         if (options.async_pipelines) {
             create_compute_async(cd, &ce);
         } else {
@@ -5453,6 +5494,7 @@ struct NativeExecutor::Impl {
                                                                     : UseKind::StorageRead;
                                         u.offset = buf_offset;
                                         u.size = fit.size > 0 ? fit.size : (buf_size > buf_offset ? buf_size - buf_offset : 0);
+                                        u.min_size = le->min_binding_size;
                                         if (le->dynamic) {
                                             const auto rank = std::lower_bound(dyn_bindings.begin(), dyn_bindings.end(), e.binding);
                                             if (rank != dyn_bindings.end() && *rank == e.binding)
@@ -5885,6 +5927,7 @@ struct NativeExecutor::Impl {
         uint8_t want_mask = 0;
         uint8_t dirty_binds = 0;   // groups to (re)encode at the next flush
         uint8_t subst_applied = 0;  // groups whose encoded group is a snapshot substitute
+        uint8_t drop_applied = 0;   // ... of them: with dummies for bindings the pipeline does not reference
         bool snap_volatile = false;  // a snapshot bound now must be retaken before the next draw / dispatch
         // Buffer snapshots kept for reuse (this encoder only): a snapshot of a range stays valid until a draw /
         // dispatch binds a writable range overlapping it.
@@ -6002,7 +6045,7 @@ struct NativeExecutor::Impl {
             if (cpass) { cpass.End(); cpass = nullptr; }
             cut();
             dirty_binds = want_mask;
-            subst_applied = 0;
+            subst_applied = drop_applied = 0;
             scope.clear();
         }
         // ... and continues in a new pass of the same kind with the same state (no timestamps).
@@ -6136,7 +6179,7 @@ struct NativeExecutor::Impl {
             for (auto& sg : cbound) sg = StreamGroup{};
             alias_replaced = 0;
             for (auto& w : want) w = StreamGroup{};
-            want_mask = dirty_binds = subst_applied = 0;
+            want_mask = dirty_binds = subst_applied = drop_applied = 0;
             snap_volatile = false;
             scope.clear();
             cur_rpipe = nullptr;
@@ -6432,6 +6475,7 @@ struct NativeExecutor::Impl {
             remap_set_render_pipeline(sp->id);
             e.ensure_render();
             e.active_pipeline = sp->id;
+            e.dirty_binds |= e.drop_applied;
             e.had_explicit_compute = false;
             e.compute_valid = false;
             auto it = render_pipelines.find(sp->id);
@@ -6530,6 +6574,7 @@ struct NativeExecutor::Impl {
             remap_set_compute_pipeline(sc->id);
             e.ensure_compute();
             e.active_compute = sc->id;
+            e.dirty_binds |= e.drop_applied;
             e.had_explicit_compute = true;
             auto it = compute_pipelines.find(sc->id);
             e.compute_valid = it != compute_pipelines.end();
@@ -7406,6 +7451,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         TexAliasPlan tplan;
         if (any_tex_writable) tplan = plan_texture_alias(ts);
         stats.storage_alias_unfixable += tplan.unfixable;
+        stats.storage_alias_unfixable_tex_writers += tplan.unfixable;
         // Groups the pass still has rebuilt from an earlier dispatch but that no longer need it: back to the stream's.
         uint8_t need = 0;
         for (size_t c : plan.copy) need |= static_cast<uint8_t>(1u << bs[c].group);
@@ -7429,17 +7475,23 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         for (size_t c : tplan.copy) {
             const TexViewMeta& m = trefs[c].first->texs[trefs[c].second].meta;
             const wgpu::Texture& src = m.tex;
-            if (src.GetSampleCount() > 1 || alias_fmt_depth(src.GetFormat()) || alias_fmt_compressed(src.GetFormat()) ||
-                m.fmt != src.GetFormat() ||
-                (m.aspect != wgpu::TextureAspect::All && m.aspect != wgpu::TextureAspect::Undefined) ||
-                !(src.GetUsage() & wgpu::TextureUsage::CopySrc)) {
+            uint64_t* why = nullptr;
+            if (src.GetSampleCount() > 1) why = &stats.storage_alias_unfixable_tex_ms;
+            else if (alias_fmt_depth(src.GetFormat())) why = &stats.storage_alias_unfixable_tex_depth;
+            else if (alias_fmt_compressed(src.GetFormat())) why = &stats.storage_alias_unfixable_tex_bc;
+            else if (m.fmt != src.GetFormat() ||
+                     (m.aspect != wgpu::TextureAspect::All && m.aspect != wgpu::TextureAspect::Undefined))
+                why = &stats.storage_alias_unfixable_tex_view;
+            else if (!(src.GetUsage() & wgpu::TextureUsage::CopySrc)) why = &stats.storage_alias_unfixable_tex_copysrc;
+            if (why) {
+                ++*why;
                 ++stats.storage_alias_unfixable;
                 continue;
             }
             tcopies.push_back({c, alias_texture_twin(src)});
         }
         if (!tcopies.empty()) {
-            const uint8_t saved_subst = e.subst_applied;
+            const uint8_t saved_subst = e.subst_applied, saved_drop = e.drop_applied;
             e.end_segment();
             for (auto& tc : tcopies) {
                 const BgTexInfo& ti = trefs[tc.first].first->texs[trefs[tc.first].second];
@@ -7479,6 +7531,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             e.resume_compute();
             e.dirty_binds = 0;
             e.subst_applied = saved_subst;
+            e.drop_applied = saved_drop;
         }
 
         // Buffer copies and twin writers: kernels inside the pass.
@@ -7489,6 +7542,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             *words = ab.size / 4;
             if (*words == 0 || ab.offset + *words * 4 > total) {
                 ++stats.storage_alias_unfixable;
+                ++stats.storage_alias_unfixable_buf_range;
                 return false;
             }
             return true;
@@ -7667,11 +7721,57 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
     // draw conflicting with an earlier draw of the pass continues in a new pass segment (load ops).
     // The writable buffer ranges the draw / dispatch about to be encoded binds (they invalidate cached snapshots).
     void note_bound_writes(Encoder& e) {
+        const ShaderBindingAccess* acc = nullptr;
+        bool acc_done = false;
         for (uint32_t g = 0; g < Encoder::kBindSlots; ++g) {
             if (!(e.want_mask >> g & 1u) || !e.want[g].usage || !e.want[g].usage->m.any_writable) continue;
-            for (const ResUse& r : e.want[g].usage->m.uses)
-                if (!r.texture && use_writable(r.kind)) e.note_write(r.res, use_offset(r, &e.want[g].offsets), r.size);
+            const BgUsage& u = *e.want[g].usage;
+            for (const ResUse& r : u.m.uses) {
+                if (r.texture || !use_writable(r.kind)) continue;
+                if (!acc_done) {
+                    acc = active_access(e);
+                    acc_done = true;
+                }
+                // A binding the pipeline never writes through does not invalidate cached snapshots.
+                if (acc && r.entry < u.entries.size() && acc->of(g, u.entries[r.entry].binding) != BindingAccess::Written) {
+                    ++stats.usage_writes_not_noted;
+                    continue;
+                }
+                e.note_write(r.res, use_offset(r, &e.want[g].offsets), r.size);
+            }
         }
+    }
+
+    // The binding access of the pipeline the next draw / dispatch runs (null: unknown, everything is written).
+    const ShaderBindingAccess* active_access(const Encoder& e) {
+        if (!binding_access_on) return nullptr;
+        const ShaderBindingAccess* a = nullptr;
+        if (e.rpass) {
+            if (!e.active_pipeline) return nullptr;
+            auto it = render_pipelines.find(*e.active_pipeline);
+            if (it != render_pipelines.end()) a = it->second.access.get();
+        } else if (e.cpass) {
+            if (!e.active_compute) return nullptr;
+            auto it = compute_pipelines.find(*e.active_compute);
+            if (it != compute_pipelines.end()) a = it->second.access.get();
+        }
+        return a && a->known ? a : nullptr;
+    }
+
+    // A dummy for an unreferenced buffer binding: slot `slot` of the writable / read-only pool, at least `need`.
+    wgpu::Buffer unref_dummy(bool writable, uint32_t slot, uint64_t need) {
+        std::vector<wgpu::Buffer>& pool = writable ? unref_dummy_w : unref_dummy_r;
+        if (slot >= pool.size()) pool.resize(slot + 1);
+        wgpu::Buffer& b = pool[slot];
+        if (!b || b.GetSize() < need) {
+            uint64_t cls = 256;
+            while (cls < need) cls <<= 1;
+            wgpu::BufferDescriptor bd{};
+            bd.size = cls;
+            bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+            b = device.CreateBuffer(&bd);
+        }
+        return b;
     }
 
     void flush_binds(Encoder& e) {
@@ -7690,6 +7790,57 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             if (!(e.want_mask >> g & 1u) || !e.want[g].usage) continue;
             bound_of[g] = static_cast<int>(bound.size());
             bound.push_back(BoundUses{g, &e.want[g].usage->m, &e.want[g].offsets});
+        }
+        // Buffer bindings the pipeline never references that touch another binding of the same buffer: bound
+        // to a dummy (no snapshot, no alias copy); writable ones it never writes keep their reads cacheable.
+        std::array<std::vector<uint32_t>, Encoder::kBindSlots> drops;
+        std::array<BgUses, Encoder::kBindSlots> masked;
+        uint8_t drop_mask = 0;
+        if (const ShaderBindingAccess* acc = bound.empty() ? nullptr : active_access(e)) {
+            bool any_w = false;
+            for (const BoundUses& b : bound) any_w = any_w || b.uses->any_writable;
+            if (any_w || (render && !e.scope.empty())) {
+                uint8_t touched = 0;
+                for (BoundUses& b : bound) {
+                    const BgUsage& u = *e.want[b.group].usage;
+                    for (uint32_t ui = 0; ui < u.m.uses.size(); ++ui) {
+                        const ResUse& r = u.m.uses[ui];
+                        if (r.texture || r.entry >= u.entries.size()) continue;
+                        const BindingAccess a = acc->of(b.group, u.entries[r.entry].binding);
+                        if (a == BindingAccess::Written) continue;
+                        if (a == BindingAccess::Read) {
+                            if (!use_writable(r.kind)) continue;
+                            if (!(touched >> b.group & 1u)) masked[b.group] = u.m;
+                            touched |= static_cast<uint8_t>(1u << b.group);
+                            masked[b.group].uses[ui].never_written = true;
+                            ++stats.usage_never_written_uses;
+                            continue;
+                        }
+                        bool hit = render && e.scope.conflicts(r);
+                        for (const BoundUses& o : bound) {
+                            if (hit) break;
+                            const std::vector<ResUse>& ov = e.want[o.group].usage->m.uses;
+                            for (uint32_t oj = 0; oj < ov.size() && !hit; ++oj)
+                                hit = !(o.group == b.group && oj == ui) && !ov[oj].texture && ov[oj].res == r.res &&
+                                      (use_writable(r.kind) || use_writable(ov[oj].kind));
+                        }
+                        if (!hit) continue;
+                        if (!(touched >> b.group & 1u)) masked[b.group] = u.m;
+                        touched |= static_cast<uint8_t>(1u << b.group);
+                        masked[b.group].uses[ui].res = nullptr;  // out of every conflict check
+                        masked[b.group].uses[ui].kind = UseKind::Uniform;
+                        drops[b.group].push_back(ui);
+                        drop_mask |= static_cast<uint8_t>(1u << b.group);
+                    }
+                }
+                for (BoundUses& b : bound) {
+                    if (!(touched >> b.group & 1u)) continue;
+                    BgUses& m = masked[b.group];
+                    m.any_writable = false;
+                    for (const ResUse& r : m.uses) m.any_writable = m.any_writable || (r.res && use_writable(r.kind));
+                    b.uses = &m;
+                }
+            }
         }
         BindPlan plan = bound.empty() ? BindPlan{} : plan_binds(bound, e.scope, render);
         if (!options.usage_snapshots && !plan.snapshots.empty()) {
@@ -7739,14 +7890,17 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             all_hit = !sn.volatile_ && !r.texture && u.src[sn.use].buffer && r.size &&
                       e.snap_lookup(u.src[sn.use].buffer.Get(), off, r.size);
         }
-        if (plan.split) {
-            if (plan.scope_conflict) ++stats.usage_scope_splits;
-            if (!plan.snapshots.empty() && !all_hit) ++stats.usage_snapshot_splits;
-            if (render && e.cont_discards) ++stats.usage_split_discards;
-            if (!all_hit) e.end_segment();
-            // The snapshots, between the two halves: per group, its entries with the snapshot ones replaced.
+        if (plan.split || drop_mask) {
+            if (plan.split) {
+                if (plan.scope_conflict) ++stats.usage_scope_splits;
+                if (!plan.snapshots.empty() && !all_hit) ++stats.usage_snapshot_splits;
+                if (render && e.cont_discards) ++stats.usage_split_discards;
+                if (!all_hit) e.end_segment();
+            }
+            // The snapshots, between the two halves: per group, its entries with the snapshot ones replaced
+            // (and the unreferenced ones by dummies, which need no copy).
             std::unordered_map<std::string, uint32_t> tex_slots;
-            uint32_t buf_slot = 0;
+            uint32_t buf_slot = 0, dummy_w = 0, dummy_r = 0;
             for (uint32_t gi = 0; gi < bound.size(); ++gi) {
                 const uint32_t g = bound[gi].group;
                 const BgUsage& u = *e.want[g].usage;
@@ -7764,7 +7918,21 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                     any = true;
                     volatile_now = volatile_now || sn.volatile_;
                 }
+                for (uint32_t ui : drops[g]) {
+                    const ResUse& r = u.m.uses[ui];
+                    if (entries.empty()) entries = u.entries;
+                    const bool w = use_writable(r.kind);
+                    const uint64_t need = std::max<uint64_t>(256, (r.min_size + 255) & ~uint64_t{255});
+                    wgpu::BindGroupEntry& en = entries[r.entry];
+                    en.buffer = unref_dummy(w, w ? dummy_w++ : dummy_r++, need);
+                    en.offset = 0;
+                    en.size = need;
+                    if (r.dyn_index >= 0 && static_cast<size_t>(r.dyn_index) < dyn.size()) dyn[static_cast<size_t>(r.dyn_index)] = 0;
+                    ++stats.usage_unref_dummies;
+                    any = true;
+                }
                 if (!any) continue;
+                if (!drops[g].empty()) ++stats.usage_unref_groups;
                 wgpu::BindGroupDescriptor bd{};
                 bd.layout = u.layout;
                 bd.entryCount = entries.size();
@@ -7793,7 +7961,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                 }
                 subst_dyn[g] = std::move(dyn);
             }
-            if (!all_hit) {
+            if (plan.split && !all_hit) {
                 if (render) e.resume_render();
                 else e.resume_compute();
             }
@@ -7809,13 +7977,18 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             else cset(e, g, grp, dyn.data(), dyn.size());
             if (use_subst) e.subst_applied |= bit;
             else e.subst_applied &= static_cast<uint8_t>(~bit);
+            // A group with dummies is only right for this pipeline: a pipeline change re-encodes it.
+            if (use_subst && !drops[g].empty()) e.drop_applied |= bit;
+            else e.drop_applied &= static_cast<uint8_t>(~bit);
             if (render && bound_of[g] >= 0) {
                 const BgUses& m = e.want[g].usage->m;
                 for (uint32_t ui = 0; ui < m.uses.size(); ++ui) {
                     bool snapped = false;
-                    if (use_subst)
+                    if (use_subst) {
                         for (const SnapshotUse& sn : plan.snapshots)
                             snapped = snapped || (sn.group == static_cast<uint32_t>(bound_of[g]) && sn.use == ui);
+                        for (uint32_t d : drops[g]) snapped = snapped || d == ui;
+                    }
                     if (!snapped) e.scope.add(m.uses[ui]);
                 }
             }
@@ -9081,6 +9254,13 @@ std::string NativeExecutor::stats_json() const {
     num("usage_snapshot_reused", st.usage_snapshot_reused);
     num("usage_snapshots_to_writer_twin", st.usage_snapshots_to_writer_twin);
     num("usage_snapshot_bytes_saved", st.usage_snapshot_bytes_saved);
+    num("usage_unref_dummies", st.usage_unref_dummies);
+    num("usage_unref_groups", st.usage_unref_groups);
+    num("usage_never_written_uses", st.usage_never_written_uses);
+    num("usage_writes_not_noted", st.usage_writes_not_noted);
+    num("shader_access_scans", st.shader_access_scans);
+    num("shader_access_unknown", st.shader_access_unknown);
+    num("shader_rw_never_written", st.shader_rw_never_written);
     num("usage_split_discards", st.usage_split_discards);
     num("v1_render_pipelines", st.v1_render_pipelines);
     num("v1_compute_pipelines", st.v1_compute_pipelines);
@@ -9112,6 +9292,13 @@ std::string NativeExecutor::stats_json() const {
     num("query_pool_exhausted", st.query_pool_exhausted);
     num("storage_alias_dispatch_restarts", st.storage_alias_dispatch_restarts);
     num("storage_alias_unfixable", st.storage_alias_unfixable);
+    num("storage_alias_unfixable_tex_writers", st.storage_alias_unfixable_tex_writers);
+    num("storage_alias_unfixable_tex_ms", st.storage_alias_unfixable_tex_ms);
+    num("storage_alias_unfixable_tex_depth", st.storage_alias_unfixable_tex_depth);
+    num("storage_alias_unfixable_tex_bc", st.storage_alias_unfixable_tex_bc);
+    num("storage_alias_unfixable_tex_view", st.storage_alias_unfixable_tex_view);
+    num("storage_alias_unfixable_tex_copysrc", st.storage_alias_unfixable_tex_copysrc);
+    num("storage_alias_unfixable_buf_range", st.storage_alias_unfixable_buf_range);
     num("storage_alias_twin_writers", st.storage_alias_twin_writers);
     num("storage_alias_copy_dispatches", st.storage_alias_copy_dispatches);
     num("storage_tex_alias_copies", st.storage_tex_alias_copies);

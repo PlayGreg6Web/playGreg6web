@@ -45,6 +45,11 @@ struct ResUse {
     // Texture: the view's subresources (resolved counts) and aspects (bit 0 colour / depth, bit 1 stencil).
     uint32_t mip_base = 0, mip_count = 1, layer_base = 0, layer_count = 1;
     uint8_t aspects = 1;
+    // Buffer: the layout entry's minBindingSize (a dummy bound in its place must be at least that big).
+    uint64_t min_size = 0;
+    // A writable use the bound pipeline never writes through (binding_access_model.h): Dawn still sees a
+    // writable usage, but a read overlapping it does not need a fresh snapshot every draw.
+    bool never_written = false;
 };
 
 struct BgUses {
@@ -136,7 +141,7 @@ inline std::vector<SnapshotUse> plan_snapshots(const std::vector<BoundUses>& bou
                         const uint64_t ro = use_offset(r, rb.dyn), wo = use_offset(w, wb.dyn);
                         // size 0 = to the end of the buffer
                         const uint64_t rs = r.size ? r.size : UINT64_MAX - ro, ws = w.size ? w.size : UINT64_MAX - wo;
-                        if (spans_overlap(ro, rs, wo, ws)) vol = true;
+                        if (!w.never_written && spans_overlap(ro, rs, wo, ws)) vol = true;
                     }
                 }
             }

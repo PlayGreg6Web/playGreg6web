@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
+#include "gpu/native_exec/binding_access_model.h"
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/clear_model.h"
 #include "gpu/native_exec/binding_fit_model.h"
@@ -1591,6 +1592,11 @@ void test_usage_scope_model() {
     bound = {{0, &g1, &dyn}};
     p = plan_binds(bound, scope, false);
     CHECK(p.snapshots.size() == 1 && p.snapshots[0].volatile_);
+    // ... unless the pipeline never writes through the writable binding: still a snapshot, not volatile
+    g1.uses[1].never_written = true;
+    p = plan_binds(bound, scope, false);
+    CHECK(p.snapshots.size() == 1 && !p.snapshots[0].volatile_);
+    g1.uses[1].never_written = false;
     // two writable uses (aliasing) and reads of another buffer are not usage conflicts
     BgUses g2;
     g2.add(buf(&buf_a, UseKind::StorageWrite, 0, 16));
@@ -1635,6 +1641,111 @@ void test_usage_scope_model() {
     CHECK(r.view_dim == 6 && r.layer_count == 1 && r.mip_count == 3);
 }
 
+void test_binding_access_model() {
+    using A = BindingAccess;
+    // read_write bindings: written by assignment / compound / increment, by an atomic, through a pointer;
+    // read-only when only loaded or measured; unreferenced when no function names them.
+    const char* src = R"(
+struct S { data: array<vec4<u32>, 4>, }
+@group(0) @binding(0) var<uniform> cb0_: S;
+@group(0) @binding(1) var<storage> sbuf0_: array<u32>;
+@group(0) @binding(2) var<storage, read_write> w_assign: array<u32>;
+@group(0) @binding(3) var<storage, read_write> r_only: array<u32>;
+@binding(4) @group(0) var<storage, read_write> unused: array<u32>;
+@group(1) @binding(0) var<storage, read_write> w_compound: array<u32>;
+@group(1) @binding(1) var<storage, read_write> w_atomic: array<atomic<u32>>;
+@group(1) @binding(2) var<storage, read_write> r_atomic_load: array<atomic<u32>>;
+@group(1) @binding(3) var<storage, read_write> w_ptr: array<u32>;
+@group(1) @binding(4) var<storage, read_write> w_inc: array<u32>;
+@group(1) @binding(5) var<storage, read_write> w_member: S;
+@group(1) @binding(6) var<storage, read_write> w_shift: array<u32>;
+@group(1) @binding(7) var<storage, read_write> w_paren: array<u32>;
+@group(2) @binding(0) var tex0_: texture_2d<f32>;
+@group(2) @binding(1) var samp0_: sampler;
+@group(2) @binding(2) var img: texture_storage_2d<rgba8unorm, write>;
+fn helper(p: ptr<storage, array<u32>, read_write>) { (*p)[0] = 1u; }
+@compute @workgroup_size(64, 1, 1)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    // unused[0] = 1u;  (a comment is not a reference)
+    let n = arrayLength((&r_only));
+    let a = r_only[min(id.x, n - 1u)] + sbuf0_[0] + cb0_.data[0].x;
+    if (r_only[0] == 3u && r_only[1] <= 4u && r_only[2] != a) { w_assign[(id.x + 0u)] = a; }
+    w_compound[id.x] += 2u;
+    atomicAdd(&w_atomic[0], 1u);
+    let l = atomicLoad((&r_atomic_load[id.x]));
+    helper(&w_ptr);
+    w_inc[0]++;
+    w_member.data[1].y = l & r_only[3];
+    w_shift[0] <<= 1u;
+    (w_paren)[0] = 5u;
+    textureStore(img, vec2<i32>(0, 0), textureSampleLevel(tex0_, samp0_, vec2<f32>(0.0), 0.0));
+}
+)";
+    const ShaderBindingAccess acc = scan_binding_access(src);
+    CHECK(acc.known);
+    CHECK(acc.of(0, 0) == A::Read);
+    CHECK(acc.of(0, 1) == A::Read);
+    CHECK(acc.of(0, 2) == A::Written);
+    CHECK(acc.of(0, 3) == A::Read);
+    CHECK(acc.of(0, 4) == A::Unreferenced);
+    CHECK(acc.of(0, 9) == A::Unreferenced);  // not declared at all
+    CHECK(acc.of(1, 0) == A::Written);
+    CHECK(acc.of(1, 1) == A::Written);
+    CHECK(acc.of(1, 2) == A::Read);
+    CHECK(acc.of(1, 3) == A::Written);
+    CHECK(acc.of(1, 4) == A::Written);
+    CHECK(acc.of(1, 5) == A::Written);
+    CHECK(acc.of(1, 6) == A::Written);
+    CHECK(acc.of(1, 7) == A::Written);
+    CHECK(acc.of(2, 0) == A::Read);
+    CHECK(acc.of(2, 1) == A::Read);
+    CHECK(acc.of(2, 2) == A::Written);
+    CHECK(acc.of(3, 0) == A::Unreferenced);
+    // declared read_write but never written: r_only, unused, r_atomic_load
+    CHECK(acc.writable_never_written() == 3);
+
+    // Conservative: an @binding the scan cannot match, or no function bodies -> unknown (all written).
+    const ShaderBindingAccess odd = scan_binding_access(
+        "@group(0) @binding(0) @id(3) var<storage, read_write> b: array<u32>;\n"
+        "@compute @workgroup_size(1) fn main() { }\n");
+    CHECK(!odd.known && odd.of(0, 0) == A::Written && odd.of(0, 7) == A::Written);
+    const ShaderBindingAccess nofn = scan_binding_access("@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n");
+    CHECK(!nofn.known);
+    CHECK(scan_binding_access("").of(0, 0) == A::Written);
+    // a local shadowing a binding's name: its stores count as stores to the binding
+    const ShaderBindingAccess shadow = scan_binding_access(
+        "@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n"
+        "@compute @workgroup_size(1) fn main() { var b: u32; b = 1u; }\n");
+    CHECK(shadow.known && shadow.of(0, 0) == A::Written);
+    // a member named like a binding is not a reference to it
+    const ShaderBindingAccess member = scan_binding_access(
+        "struct T { b: u32, }\n"
+        "@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n"
+        "@group(0) @binding(1) var<uniform> t: T;\n"
+        "@compute @workgroup_size(1) fn main() { let x = t.b; }\n");
+    CHECK(member.known && member.of(0, 0) == A::Unreferenced && member.of(0, 1) == A::Read);
+    // a binary & / && before the name is a read
+    const ShaderBindingAccess band = scan_binding_access(
+        "@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n"
+        "@group(0) @binding(1) var<storage, read_write> o: array<u32>;\n"
+        "@compute @workgroup_size(1) fn main() { let x = 3u & b[0]; let y = (x == 1u) && (b[1] == 2u); o[0] = x; }\n");
+    CHECK(band.known && band.of(0, 0) == A::Read && band.of(0, 1) == A::Written);
+
+    // A pipeline: the strongest access over its stages; an unknown stage makes it unknown.
+    const ShaderBindingAccess vs = scan_binding_access(
+        "@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n"
+        "@group(0) @binding(1) var<uniform> u: vec4<f32>;\n"
+        "@vertex fn vs_main() -> @builtin(position) vec4<f32> { return u + vec4<f32>(f32(b[0])); }\n");
+    const ShaderBindingAccess fs = scan_binding_access(
+        "@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n"
+        "@group(0) @binding(2) var<storage, read_write> c: array<u32>;\n"
+        "@fragment fn fs_main() -> @location(0) vec4<f32> { b[1] = 2u; return vec4<f32>(0.0); }\n");
+    const ShaderBindingAccess pl = merge_binding_access(vs, &fs);
+    CHECK(pl.known && pl.of(0, 0) == A::Written && pl.of(0, 1) == A::Read && pl.of(0, 2) == A::Unreferenced);
+    CHECK(merge_binding_access(vs, nullptr).of(0, 0) == A::Read);
+    CHECK(!merge_binding_access(vs, &odd).known);
+}
+
 int main() {
     test_present_model();
     test_shader_payloads();
@@ -1670,6 +1781,7 @@ int main() {
     test_view_alias_model();
     test_clear_model();
     test_usage_scope_model();
+    test_binding_access_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
