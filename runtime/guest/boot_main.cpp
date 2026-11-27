@@ -1333,6 +1333,8 @@ bool start_live_window() {
     // textures over 64 KiB are pooled too. Not with a GPU capture, whose replays may run in a browser
     // worker that does not have the packet.
     playgta6::gpu::set_gpu_texture_clear(g_options.gpu_capture.empty());
+    // Likewise CopyTexture: texture-to-texture copies the blit / storage routes cannot serve.
+    playgta6::gpu::set_gpu_texture_copy(g_options.gpu_capture.empty());
     // frame_breakdown: the executor's busy time and the packet bytes, sampled at every present.
     guest::set_frame_counter_source([](uint64_t* executor_ns, uint64_t* submitted_bytes) {
         const ne::LivePumpStats st = g_live.stats();

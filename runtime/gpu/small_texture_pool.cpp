@@ -261,7 +261,16 @@ SmallTexturePool& large_texture_pool() noexcept {
 
 namespace {
 std::atomic<bool> g_gpu_texture_clear{false};
+std::atomic<bool> g_gpu_texture_copy{false};
 }  // namespace
+
+void set_gpu_texture_copy(bool on) noexcept {
+    g_gpu_texture_copy.store(on, std::memory_order_relaxed);
+}
+
+bool gpu_texture_copy() noexcept {
+    return g_gpu_texture_copy.load(std::memory_order_relaxed);
+}
 
 void set_gpu_texture_clear(bool on) noexcept {
     g_gpu_texture_clear.store(on, std::memory_order_relaxed);

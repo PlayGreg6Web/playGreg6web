@@ -812,7 +812,7 @@ struct SubresourceCopySpec {
 };
 
 struct TextureCopyPlan {
-    enum class Mode : uint8_t { None, RenderBlit, ComputeStorage };
+    enum class Mode : uint8_t { None, RenderBlit, ComputeStorage, NativeCopy };
     Mode mode = Mode::None;
     CopySampleKind src_kind = CopySampleKind::Unsupported;
     CopySampleKind dst_kind = CopySampleKind::Unsupported;
@@ -821,9 +821,60 @@ struct TextureCopyPlan {
     const char* storage_fmt_name = nullptr;
     bool is_3d = false;
     bool dst_swapchain = false;
+    // NativeCopy: block size of the (equal) formats, and whether a copy must cover whole subresources.
+    uint32_t block_w = 1;
+    uint32_t block_h = 1;
+    bool whole_only = false;
 };
 
+// A plain copyTextureToTexture (kGpuOpcodeCopyTexture) for what the shader routes cannot write: the
+// destination is neither a render target nor a UAV (or the source has no shader-resource use).
+TextureCopyPlan plan_native_texture_copy(Device& dev, const Resource* dst, const Resource* src) {
+    TextureCopyPlan plan{};
+    if (!gpu_texture_copy() || dst == nullptr || src == nullptr || dst->is_buffer() || src->is_buffer() ||
+        !dst->has_gpu_texture() || !src->has_gpu_texture() || src->desc().SampleCount > 1u ||
+        dst->desc().SampleCount > 1u) {
+        return plan;
+    }
+    bridge::TextureInfo dst_info{}, src_info{};
+    if (!dev.state_bridge().texture_info(dst->id(), &dst_info) ||
+        !dev.state_bridge().texture_info(src->id(), &src_info) || dst_info.swapchain || src_info.swapchain) {
+        return plan;
+    }
+    const bool both_2d = src_info.dimension == GpuTextureDimension::Dim2D &&
+                         dst_info.dimension == GpuTextureDimension::Dim2D;
+    const bool both_3d = src_info.dimension == GpuTextureDimension::Dim3D &&
+                         dst_info.dimension == GpuTextureDimension::Dim3D;
+    if (!both_2d && !both_3d) {
+        return plan;
+    }
+    const uint32_t features = dev.state_bridge().options().features;
+    const pso::WgpuTextureFormat src_wgpu = resource_wgpu_format(src, features);
+    const pso::WgpuTextureFormat dst_wgpu = resource_wgpu_format(dst, features);
+    if (src_wgpu == pso::WgpuTextureFormat::Undefined || dst_wgpu == pso::WgpuTextureFormat::Undefined ||
+        linear_copy_view_format(src_wgpu) != linear_copy_view_format(dst_wgpu)) {
+        return plan;  // not copy-compatible (equal up to sRGB-ness)
+    }
+    const DxgiFormatLayout l = dxgi_format_layout(dst->desc().Format);
+    plan.mode = TextureCopyPlan::Mode::NativeCopy;
+    plan.is_3d = both_3d;
+    plan.block_w = l.known ? std::max<uint32_t>(1u, l.block_width) : 1u;
+    plan.block_h = l.known ? std::max<uint32_t>(1u, l.block_height) : 1u;
+    plan.whole_only = is_depth_dxgi_format(dst->desc().Format) || is_depth_dxgi_format(src->desc().Format);
+    return plan;
+}
+
+TextureCopyPlan plan_gpu_texture_copy_shader(Device& dev, const Resource* dst, const Resource* src);
+
 TextureCopyPlan plan_gpu_texture_copy(Device& dev, const Resource* dst, const Resource* src) {
+    TextureCopyPlan plan = plan_gpu_texture_copy_shader(dev, dst, src);
+    if (plan.mode != TextureCopyPlan::Mode::None) {
+        return plan;
+    }
+    return plan_native_texture_copy(dev, dst, src);
+}
+
+TextureCopyPlan plan_gpu_texture_copy_shader(Device& dev, const Resource* dst, const Resource* src) {
     TextureCopyPlan plan{};
     if (dst == nullptr || src == nullptr || dst->is_buffer() || src->is_buffer() || !dst->has_gpu_texture() ||
         !src->has_gpu_texture()) {
@@ -910,6 +961,28 @@ bool emit_gpu_texture_subresource_copy(Device& dev, const TextureCopyPlan& plan,
     if (!dev.state_bridge().translate_host_mip(src_id, &host_src_mip) ||
         !dev.state_bridge().translate_host_mip(dst_id, &host_dst_mip)) {
         return true;  // mip trimmed by texture_budget: cleanly skipped
+    }
+
+    if (plan.mode == TextureCopyPlan::Mode::NativeCopy) {
+        if (plan.whole_only && !spec.full_subresource) {
+            return false;  // depth/stencil are copied whole (copyTextureToTexture)
+        }
+        GpuCopyTexturePayload c{};
+        c.dst_id = dst_id;
+        c.src_id = src_id;
+        c.dst_mip = host_dst_mip;
+        c.src_mip = host_src_mip;
+        c.dst_x = spec.dst_x;
+        c.dst_y = spec.dst_y;
+        c.dst_z = spec.dst_z;
+        c.src_x = spec.src_x;
+        c.src_y = spec.src_y;
+        c.src_z = spec.src_z;
+        c.width = align_up_u32(spec.width, plan.block_w);
+        c.height = align_up_u32(spec.height, plan.block_h);
+        c.depth_or_layers = spec.depth;
+        enc.emit_packet(kGpuOpcodeCopyTexture, &c, sizeof(c));
+        return true;
     }
 
     if (plan.mode == TextureCopyPlan::Mode::RenderBlit) {
@@ -3890,7 +3963,11 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 87..89
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 90..93
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 94..97
-    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 98..101
+    CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 98..100
+    // Slot 101 is called late in the title's boot (issue 663). Its meaning is not established (the title's own
+    // classes share this vtable offset, so the call sites alone do not name the method), so it is recorded and
+    // has no effect, like the other undetermined slots: it was a stub returning E_NOTIMPL and logging every run.
+    CL::method<&H::XboxSlot<101>>("Xbox slot 101"),                                   // 101
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 102..105
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 106..109
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 110..113

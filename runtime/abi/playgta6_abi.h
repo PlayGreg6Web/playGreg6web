@@ -82,6 +82,11 @@ enum class GpuOpcode : uint16_t {
 // Zero every texel of every subresource of a texture on the GPU (GpuClearTexturePayload): a
 // recycled texture then reads as a freshly created one (gpu/small_texture_pool.h gpu_texture_clear).
 inline constexpr GpuOpcode kGpuOpcodeClearTexture = static_cast<GpuOpcode>(63);
+//
+// Copy a texture region to another texture on the GPU (GpuCopyTexturePayload): WebGPU's
+// copyTextureToTexture, for the D3D12 CopyTextureRegion / CopyResource cases the render-blit and
+// compute-storage routes cannot serve (a destination that is neither a render target nor a UAV).
+inline constexpr GpuOpcode kGpuOpcodeCopyTexture = static_cast<GpuOpcode>(62);
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
 namespace GpuBufferUsage {
@@ -944,6 +949,30 @@ struct GpuClearTexturePayload {
     uint32_t reserved;
 };
 static_assert(sizeof(GpuClearTexturePayload) == 8, "GpuClearTexturePayload layout must stay 8 bytes");
+
+// CopyTexture (kGpuOpcodeCopyTexture, 62): copy `width` x `height` x `depth_or_layers` texels from
+// (`src_x`, `src_y`, `src_z`) of mip `src_mip` of `src_id` to (`dst_x`, `dst_y`, `dst_z`) of mip `dst_mip` of
+// `dst_id`. `*_z` is the array layer of a 2D texture and the depth slice of a 3D one, and `depth_or_layers` counts
+// the same. Both textures have the same dimension and a copy-compatible format (equal up to sRGB-ness), origins
+// and extents are block aligned for compressed formats, and a depth/stencil or multisampled texture is copied
+// whole. Runs in stream order with the frame's passes (any open pass ends first).
+struct GpuCopyTexturePayload {
+    uint32_t dst_id;
+    uint32_t src_id;
+    uint32_t dst_mip;
+    uint32_t src_mip;
+    uint32_t dst_x;
+    uint32_t dst_y;
+    uint32_t dst_z;
+    uint32_t src_x;
+    uint32_t src_y;
+    uint32_t src_z;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth_or_layers;
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuCopyTexturePayload) == 56, "GpuCopyTexturePayload layout must stay 56 bytes");
 
 }  // namespace playgta6
 

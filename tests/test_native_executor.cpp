@@ -684,6 +684,103 @@ void test_clear_texture(NativeExecutor& ex) {
     run(ex, done);
 }
 
+// CopyTexture (opcode 62): a plain copyTextureToTexture between textures that are neither render
+// targets nor storage; the source was created without CopySrc (the executor adds it). A bad copy is a
+// packet error, not a device error.
+void test_copy_texture(NativeExecutor& ex) {
+    std::vector<uint8_t> mem(8192, 0xEE);
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+    std::memset(mem.data(), 0, 16);
+    ex.attach_guest_memory(gm);
+    const ExecutorStats before = ex.stats();
+
+    auto write = [](gpu::CommandEncoder& enc, uint32_t id, uint32_t w, uint32_t h, uint8_t value) {
+        GpuWriteTexturePayload wt;
+        std::memset(&wt, 0, sizeof wt);
+        wt.texture_id = id;
+        wt.width = w;
+        wt.height = h;
+        wt.depth_or_layers = 1;
+        wt.bytes_per_row = 256;
+        wt.rows_per_image = h;
+        wt.data_len = 256 * h;
+        std::vector<uint8_t> v = bytes_of(wt);
+        v.insert(v.end(), size_t{256} * h, value);
+        emit(enc, GpuOpcode::WriteTexture, v);
+    };
+    auto copy = [](uint32_t dst, uint32_t src, uint32_t dx, uint32_t dy, uint32_t sx, uint32_t sy, uint32_t w,
+                   uint32_t h) {
+        GpuCopyTexturePayload c;
+        std::memset(&c, 0, sizeof c);
+        c.dst_id = dst;
+        c.src_id = src;
+        c.dst_x = dx;
+        c.dst_y = dy;
+        c.src_x = sx;
+        c.src_y = sy;
+        c.width = w;
+        c.height = h;
+        c.depth_or_layers = 1;
+        return c;
+    };
+
+    gpu::CommandEncoder enc;
+    emit(enc, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(130, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    emit(enc, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(131, 4, 4,
+                           GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst | GpuTextureUsage::CopySrc, 22)));
+    write(enc, 130, 4, 4, 0x55);
+    write(enc, 131, 4, 4, 0x11);
+    emit(enc, kGpuOpcodeCopyTexture, bytes_of(copy(131, 130, 2, 0, 1, 1, 2, 2)));
+    GpuReadbackTexturePayload rt;
+    std::memset(&rt, 0, sizeof rt);
+    rt.seq = 1;
+    rt.texture_id = 131;
+    rt.width = 4;
+    rt.height = 4;
+    rt.depth_or_layers = 1;
+    rt.bytes_per_row = 16;
+    rt.rows_per_image = 4;
+    rt.dst_addr = 1024;
+    rt.done_addr = 0;
+    rt.dst_size = 64;
+    emit(enc, GpuOpcode::ReadbackTexture, bytes_of(rt));
+    CHECK(run(ex, enc) == 0);
+    ex.wait_idle();
+    ex.poll();
+    bool ok = u32_at(mem, 0) == 1;
+    for (uint32_t y = 0; y < 4; ++y) {
+        for (uint32_t x = 0; x < 4; ++x) {
+            const bool copied = x >= 2 && y < 2;
+            ok &= mem[1024 + (y * 4 + x) * 4] == (copied ? 0x55 : 0x11);
+        }
+    }
+    CHECK(ok);
+    CHECK(ex.stats().texture_copies == before.texture_copies + 1);
+    CHECK(ex.stats().device_errors == before.device_errors);
+
+    // Out of range, an unknown texture and mismatched formats are rejected without a device error.
+    gpu::CommandEncoder bad;
+    emit(bad, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(132, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 1)));
+    emit(bad, kGpuOpcodeCopyTexture, bytes_of(copy(131, 130, 3, 3, 0, 0, 2, 2)));
+    emit(bad, kGpuOpcodeCopyTexture, bytes_of(copy(131, 9999, 0, 0, 0, 0, 1, 1)));
+    emit(bad, kGpuOpcodeCopyTexture, bytes_of(copy(131, 132, 0, 0, 0, 0, 1, 1)));
+    CHECK(run(ex, bad) == 0);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().texture_copies == before.texture_copies + 1);
+    CHECK(ex.stats().device_errors == before.device_errors);
+    gpu::CommandEncoder done;
+    done.destroy_resource(130);
+    done.destroy_resource(131);
+    done.destroy_resource(132);
+    run(ex, done);
+}
+
 void test_readbacks(NativeExecutor& ex) {
     std::vector<uint8_t> mem(8192, 0xEE);
     GuestMemory gm;
@@ -2910,6 +3007,7 @@ int main() {
     test_stream_accounting(*ex);
     test_readbacks(*ex);
     test_clear_texture(*ex);
+    test_copy_texture(*ex);
     test_readbacks_host_addresses(*ex);
     test_v1(*ex);
     test_reflection();

@@ -448,10 +448,14 @@ struct SetBindGroup1Cmd {
 struct ReadbackCmd {
     ReadbackRequest req;
 };
+// CopyTexture (kGpuOpcodeCopyTexture): a texture-to-texture copy, in stream order like a read-back.
+struct CopyTextureCmd {
+    GpuCopyTexturePayload copy;
+};
 using PassCmd = std::variant<BeginPassCmd, EndPassCmd, SetPipelineCmd, SetVertexBufferCmd, SetIndexBufferCmd,
                              DrawCmd, DrawIndexedCmd, IndirectCmd, SetComputePipelineCmd, DispatchCmd, ViewportCmd,
                              ScissorCmd, BlendConstantCmd, StencilRefCmd, SetBindGroup2Cmd, SetBindGroup1Cmd,
-                             ReadbackCmd>;
+                             ReadbackCmd, CopyTextureCmd>;
 
 // One query set per frame in flight (GpuTimeRing slot): pass begin / end timestamps, resolved into a
 // buffer and copied to a mappable one at the end of the submit.
@@ -2245,6 +2249,13 @@ struct NativeExecutor::Impl {
                     ++stats.op_errors;
                 }
                 break;
+            case kGpuOpcodeCopyTexture:
+                if (n >= sizeof(GpuCopyTexturePayload)) {
+                    pass_cmds.emplace_back(CopyTextureCmd{read_payload<GpuCopyTexturePayload>(p)});
+                } else {
+                    packet_error(op, "CopyTexture: payload too short");
+                }
+                break;
             case GpuOpcode::ReadbackBuffer:
             case GpuOpcode::ReadbackTexture:
                 if (auto r = decode_readback(p)) {
@@ -2715,7 +2726,8 @@ struct NativeExecutor::Impl {
             promoted = true;
         }
         wgpu::TextureDescriptor td{};
-        td.usage = static_cast<wgpu::TextureUsage>(usage);
+        // Every texture can be a CopyTexture source (D3D12 copies between any two textures).
+        td.usage = static_cast<wgpu::TextureUsage>(usage) | wgpu::TextureUsage::CopySrc;
         td.dimension = eff_dim == 0 ? wgpu::TextureDimension::e1D
                        : eff_dim == 2 ? wgpu::TextureDimension::e3D
                                       : wgpu::TextureDimension::e2D;
@@ -4910,6 +4922,9 @@ struct NativeExecutor::Impl {
         } else if (const auto* rb = std::get_if<ReadbackCmd>(&cmd)) {
             e.end_active();  // _recordReadbackCopy: pc.endPass()
             record_readback_copy(e.enc, rb->req);
+        } else if (const auto* ct = std::get_if<CopyTextureCmd>(&cmd)) {
+            e.end_active();
+            record_texture_copy(e.enc, ct->copy);
         }
     }
 
@@ -5189,7 +5204,9 @@ struct NativeExecutor::Impl {
         const std::vector<PassCmd>& cmds = *e.cmds;
         for (size_t j = from; j < cmds.size(); ++j) {
             const PassCmd& c = cmds[j];
-            if (std::get_if<BeginPassCmd>(&c) || std::get_if<EndPassCmd>(&c) || std::get_if<ReadbackCmd>(&c)) break;
+            if (std::get_if<BeginPassCmd>(&c) || std::get_if<EndPassCmd>(&c) || std::get_if<ReadbackCmd>(&c) ||
+                std::get_if<CopyTextureCmd>(&c))
+                break;
             const auto* ind = std::get_if<IndirectCmd>(&c);
             const bool compute_op = std::get_if<SetComputePipelineCmd>(&c) || std::get_if<DispatchCmd>(&c) ||
                                     (ind && ind->kind == 2);
@@ -5278,6 +5295,81 @@ struct NativeExecutor::Impl {
     }
 
     // ---- read-backs (wgpu_worker.js _recordReadbackCopy / _startRecordedReadbacks) ----
+
+    // Same format up to sRGB-ness (copyTextureToTexture's copy-compatibility).
+    static bool copy_compatible_formats(uint8_t a, uint8_t b) {
+        if (a == b) return true;
+        std::string x = format_info(a).name, y = format_info(b).name;
+        for (std::string* f : {&x, &y}) {
+            const size_t k = f->find("-srgb");
+            if (k != std::string::npos) f->erase(k, 5);
+        }
+        return x == y;
+    }
+
+    // CopyTexture (opcode 62): validated against the tracked geometry (a bad copy is a packet error,
+    // never a Dawn validation error), then recorded as copyTextureToTexture.
+    void record_texture_copy(wgpu::CommandEncoder& enc, const GpuCopyTexturePayload& c) {
+        const uint16_t op = static_cast<uint16_t>(kGpuOpcodeCopyTexture);
+        const auto di = textures.find(c.dst_id);
+        const auto si = textures.find(c.src_id);
+        if (di == textures.end() || si == textures.end()) {
+            packet_error(op, "CopyTexture: unknown texture " + std::to_string(di == textures.end() ? c.dst_id : c.src_id));
+            return;
+        }
+        TextureEntry& dt = di->second;
+        const TextureEntry& st = si->second;
+        const TextureGeometry& dg = dt.geom;
+        const TextureGeometry& sg = st.geom;
+        auto bad = [&](const char* why) { packet_error(op, std::string("CopyTexture: ") + why); };
+        if (dg.dimension != sg.dimension || dt.promoted_1d || st.promoted_1d || dt.bc3d_fallback || st.bc3d_fallback) {
+            return bad("textures are not both 2D or both 3D");
+        }
+        if (!copy_compatible_formats(dg.format, sg.format) || dt.sample_count != st.sample_count) {
+            return bad("formats or sample counts are not copy-compatible");
+        }
+        if (c.src_mip >= sg.mips || c.dst_mip >= dg.mips) return bad("mip level out of range");
+        if (c.width == 0 || c.height == 0 || c.depth_or_layers == 0) return;  // empty: nothing to copy
+        const FormatInfo& fi = format_info(dg.format);
+        const bool whole_only = format_is_depth_or_stencil(dg.format) || dt.sample_count > 1;
+        const bool is3d = dg.dimension == 2;
+        const uint32_t bw = fi.compressed ? fi.block_w : 1, bh = fi.compressed ? fi.block_h : 1;
+        auto up = [](uint32_t v, uint32_t b) { return (v + b - 1) / b * b; };
+        auto mip_dim = [](uint32_t v, uint32_t m) { return std::max<uint32_t>(1u, v >> m); };
+        auto aligned = [](uint32_t v, uint32_t b) { return b <= 1 || v % b == 0; };
+        // Compressed textures are addressed in their physical (block rounded) mip size.
+        const uint32_t sw = up(mip_dim(sg.width, c.src_mip), bw), sh = up(mip_dim(sg.height, c.src_mip), bh);
+        const uint32_t dw = up(mip_dim(dg.width, c.dst_mip), bw), dh = up(mip_dim(dg.height, c.dst_mip), bh);
+        const uint32_t sd = is3d ? mip_dim(sg.depth_or_layers, c.src_mip) : sg.depth_or_layers;
+        const uint32_t dd = is3d ? mip_dim(dg.depth_or_layers, c.dst_mip) : dg.depth_or_layers;
+        const uint64_t sx = uint64_t{c.src_x} + c.width, sy = uint64_t{c.src_y} + c.height,
+                       sz = uint64_t{c.src_z} + c.depth_or_layers;
+        const uint64_t dx = uint64_t{c.dst_x} + c.width, dy = uint64_t{c.dst_y} + c.height,
+                       dz = uint64_t{c.dst_z} + c.depth_or_layers;
+        if (sx > sw || sy > sh || sz > sd || dx > dw || dy > dh || dz > dd) return bad("region out of range");
+        if (!aligned(c.src_x, bw) || !aligned(c.dst_x, bw) || !aligned(c.src_y, bh) || !aligned(c.dst_y, bh) ||
+            !aligned(c.width, bw) || !aligned(c.height, bh)) {
+            return bad("compressed region is not block aligned");
+        }
+        if (whole_only && (c.width != sw || c.height != sh || c.depth_or_layers != sd || sw != dw || sh != dh ||
+                           sd != dd || c.src_x || c.src_y || c.src_z || c.dst_x || c.dst_y || c.dst_z)) {
+            return bad("depth/stencil or multisampled textures are copied whole");
+        }
+        wgpu::TexelCopyTextureInfo src{};
+        src.texture = st.texture;
+        src.mipLevel = c.src_mip;
+        src.origin = {c.src_x, c.src_y, c.src_z};
+        src.aspect = wgpu::TextureAspect::All;
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = dt.texture;
+        dst.mipLevel = c.dst_mip;
+        dst.origin = {c.dst_x, c.dst_y, c.dst_z};
+        dst.aspect = wgpu::TextureAspect::All;
+        const wgpu::Extent3D extent{c.width, c.height, c.depth_or_layers};
+        enc.CopyTextureToTexture(&src, &dst, &extent);
+        ++dt.depth_gen;
+        ++stats.texture_copies;
+    }
 
     void record_readback_copy(wgpu::CommandEncoder& enc, const ReadbackRequest& req) {
         Impl_ReadbackEntry entry;
@@ -6107,6 +6199,7 @@ std::string NativeExecutor::stats_json() const {
     num("clear_flushes", st.clear_flushes);
     num("clears_covered", st.clears_covered);
     num("clears_missing", st.clears_missing);
+    num("texture_copies", st.texture_copies);
     num("samplers_created", st.samplers_created);
     num("bind_group_layouts", st.bind_group_layouts);
     num("pipeline_layouts", st.pipeline_layouts);

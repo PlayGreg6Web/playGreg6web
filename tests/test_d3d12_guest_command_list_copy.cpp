@@ -13,6 +13,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "gpu/small_texture_pool.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
 #include "os/vmem.h"
@@ -635,6 +636,60 @@ void test_copy_edge_cases_fallbacks_and_device_lifecycle() {
     }
 }
 
+// With the consumer's CopyTexture packet (gpu_texture_copy), a copy into a destination that is neither a
+// render target nor a UAV becomes a plain texture-to-texture copy instead of being skipped.
+void test_native_copy_for_plain_destination() {
+    gpu::set_gpu_texture_copy(true);
+    Harness h;
+    const uint64_t dev = h.create_device();
+    const uint64_t q = h.create_queue(dev);
+    const uint64_t alloc = h.create_allocator(dev);
+    const uint64_t list = h.create_list(dev, alloc);
+    com::Ref<dg::Device> hdev = dx::current_device();
+
+    const uint64_t src = h.create_committed(dev, tex2d_desc(32, 32, 28, 0));
+    const uint64_t dst = h.create_committed(dev, tex2d_desc(32, 32, 28, 0));
+    const uint64_t other_fmt = h.create_committed(dev, tex2d_desc(32, 32, 10 /* RGBA16F */, 0));
+
+    CHECK(static_cast<int32_t>(h.vcall(list, 10 /* Reset */, {alloc, 0})) == 0);
+    const size_t mark = h.captured.size();
+
+    // CopyResource: whole texture.
+    h.vcall(list, 17 /* CopyResource */, {dst, src});
+    // CopyTextureRegion: a sub box (4..12 x 8..16) to (2, 6).
+    dg::GuestTextureCopyLocation dloc{}, sloc{};
+    dloc.pResource = dst;
+    sloc.pResource = src;
+    dg::GuestBox box{4, 8, 0, 12, 16, 1};
+    h.vcall(list, 16 /* CopyTextureRegion */, {h.put(dloc), 2, 6, 0, h.put(sloc), h.put(box)});
+    // Formats that are not copy-compatible stay skipped (counted).
+    h.vcall(list, 17 /* CopyResource */, {other_fmt, src});
+    CHECK(hdev->stats().unsupported_copies == 1);
+    CHECK(static_cast<int32_t>(h.vcall(list, 9 /* Close */)) == 0);
+    h.execute(q, {list});
+
+    const auto ps = parse_packets(h.captured, mark);
+    CHECK(count_op(ps, GpuOpcode::BeginRenderPass) == 0);
+    CHECK(count_op(ps, GpuOpcode::DispatchCompute) == 0);
+    std::vector<GpuCopyTexturePayload> copies;
+    for (const Packet& p : ps) {
+        if (p.opcode == kGpuOpcodeCopyTexture) {
+            copies.push_back(payload_as<GpuCopyTexturePayload>(p));
+        }
+    }
+    CHECK(copies.size() == 2);
+    if (copies.size() == 2) {
+        CHECK(copies[0].dst_id != copies[0].src_id);
+        CHECK(copies[0].width == 32 && copies[0].height == 32 && copies[0].depth_or_layers == 1);
+        CHECK(copies[0].dst_x == 0 && copies[0].src_x == 0);
+        CHECK(copies[1].src_x == 4 && copies[1].src_y == 8 && copies[1].dst_x == 2 && copies[1].dst_y == 6);
+        CHECK(copies[1].width == 8 && copies[1].height == 8);
+        CHECK(copies[1].dst_id == copies[0].dst_id && copies[1].src_id == copies[0].src_id);
+    }
+    h.release({list, alloc, q, src, dst, other_fmt, dev});
+    gpu::set_gpu_texture_copy(false);
+}
+
 }  // namespace
 
 int main() {
@@ -642,6 +697,7 @@ int main() {
     test_copy_texture_region_subbox_and_xbox_slot85();
     test_compute_storage_2d_and_3d_texture_copies();
     test_copy_edge_cases_fallbacks_and_device_lifecycle();
+    test_native_copy_for_plain_destination();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test failure(s) in test_d3d12_guest_command_list_copy\n", g_failures);
         return 1;

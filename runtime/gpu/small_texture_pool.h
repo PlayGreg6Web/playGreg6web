@@ -46,6 +46,12 @@ inline constexpr uint32_t kLargeTexturePoolBudgetPercent = 60;
 void set_gpu_texture_clear(bool on) noexcept;
 bool gpu_texture_clear() noexcept;
 
+// The GPU consumer copies texture to texture itself (kGpuOpcodeCopyTexture; the native executor): D3D12
+// copies whose destination is neither a render target nor a UAV are emitted as that packet instead of
+// being skipped. Off by default: the browser worker does not have the packet yet.
+void set_gpu_texture_copy(bool on) noexcept;
+bool gpu_texture_copy() noexcept;
+
 struct SmallTextureShape {
     uint64_t owner = 0;  // the device that owns the host texture ids (ids are per device)
     uint32_t dxgi_format = 0;

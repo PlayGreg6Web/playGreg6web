@@ -195,6 +195,7 @@ struct ExecutorStats {
     uint64_t clear_flushes = 0;
     uint64_t clears_covered = 0;
     uint64_t clears_missing = 0;
+    uint64_t texture_copies = 0;  // CopyTexture (opcode 62) copies encoded
     uint64_t samplers_created = 0;
     uint64_t bind_group_layouts = 0;
     uint64_t pipeline_layouts = 0;
