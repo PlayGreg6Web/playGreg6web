@@ -52,6 +52,12 @@ bool gpu_texture_clear() noexcept;
 // implement the packet.
 void set_gpu_texture_copy(bool on) noexcept;
 bool gpu_texture_copy() noexcept;
+// Extension of the CopyTexture packet (reserved = kCopyTextureTranscode): a copy between a block-compressed
+// texture and an uncompressed one of the same bytes per block (D3D12 allows it; copyTextureToTexture does
+// not), which the native executor serves through a scratch buffer. Native live boots only; the browser
+// worker does not implement it.
+void set_gpu_texture_copy_transcode(bool on) noexcept;
+bool gpu_texture_copy_transcode() noexcept;
 
 struct SmallTextureShape {
     uint64_t owner = 0;  // the device that owns the host texture ids (ids are per device)

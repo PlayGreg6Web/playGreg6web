@@ -1758,6 +1758,15 @@ enum class Work : size_t {
     TextureSyncUntracked,    // sync of a range with a host pointer but no view coverage
     BufferUploads,
     CopiesSkipped,
+    // Texture-to-texture copies skipped, by reason (each is also counted in CopiesSkipped).
+    CopySkipGateOff,       // CopyTexture packet disabled (gpu_texture_copy() off, e.g. a GPU capture)
+    CopySkipNoGpuTexture,  // source or destination has no GPU texture object
+    CopySkipMsaa,          // multisampled source or destination
+    CopySkipSwapchain,     // swapchain / canvas texture
+    CopySkipDimension,     // different or unsupported dimensions (1D, 2D vs 3D)
+    CopySkipFormat,        // formats not copy-compatible
+    CopySkipOverlap,       // overlapping same-subresource copy
+    CopySkipEmitFailed,    // planned, but the emit step refused it
     ResourcesCreated,
     ResourcesDestroyed,
     // Reflected descriptor-table bindings joined by table slot because the root signature does not

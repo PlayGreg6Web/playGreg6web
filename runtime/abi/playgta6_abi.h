@@ -956,6 +956,12 @@ static_assert(sizeof(GpuClearTexturePayload) == 8, "GpuClearTexturePayload layou
 // the same. Both textures have the same dimension and a copy-compatible format (equal up to sRGB-ness), origins
 // and extents are block aligned for compressed formats, and a depth/stencil or multisampled texture is copied
 // whole. Runs in stream order with the frame's passes (any open pass ends first).
+// `reserved` = kCopyTextureTranscode (native executor only): one texture is block-compressed and the other is
+// not, with the same bytes per block (D3D12 CopyTextureRegion between e.g. a BC3 and an RGBA32_UINT texture);
+// `width` / `height` count texels of the source, origins are in each texture's own texels, and the destination
+// extent is derived (a compressed source: width / block_w blocks to as many texels; an uncompressed source:
+// width * block_w texels). Only single-sample 2D / array color textures; the executor copies through a buffer.
+inline constexpr uint32_t kCopyTextureTranscode = 1;
 struct GpuCopyTexturePayload {
     uint32_t dst_id;
     uint32_t src_id;

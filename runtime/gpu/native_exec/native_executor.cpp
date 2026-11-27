@@ -7123,6 +7123,71 @@ struct NativeExecutor::Impl {
         return x == y;
     }
 
+    // CopyTexture with reserved = kCopyTextureTranscode: a block-compressed texture and an uncompressed one with
+    // the same bytes per block, through a scratch buffer (texture -> buffer -> texture).
+    template <class Bad>
+    void record_texture_transcode_copy(wgpu::CommandEncoder& enc, const GpuCopyTexturePayload& c, TextureEntry& dt,
+                                       const TextureEntry& st, Bad&& bad) {
+        const TextureGeometry& dg = dt.geom;
+        const TextureGeometry& sg = st.geom;
+        const FormatInfo& sf = format_info(sg.format);
+        const FormatInfo& df = format_info(dg.format);
+        if (dg.dimension != 1 || sg.dimension != 1 || dt.promoted_1d || st.promoted_1d || dt.bc3d_fallback ||
+            st.bc3d_fallback || dt.sample_count != 1 || st.sample_count != 1 ||
+            format_is_depth_or_stencil(dg.format) || format_is_depth_or_stencil(sg.format)) {
+            return bad("block reinterpretation needs single-sample 2D color textures");
+        }
+        if (sf.bytes == 0 || sf.bytes != df.bytes || sf.compressed == df.compressed) {
+            return bad("block reinterpretation formats do not match");
+        }
+        if ((dt.usage & GpuTextureUsage::CopyDst) == 0) return bad("destination is not COPY_DST");
+        if (c.src_mip >= sg.mips || c.dst_mip >= dg.mips) return bad("mip level out of range");
+        if (c.width == 0 || c.height == 0 || c.depth_or_layers == 0) return;
+        const uint32_t sbw = sf.compressed ? sf.block_w : 1, sbh = sf.compressed ? sf.block_h : 1;
+        const uint32_t dbw = df.compressed ? df.block_w : 1, dbh = df.compressed ? df.block_h : 1;
+        if (c.width % sbw || c.height % sbh || c.src_x % sbw || c.src_y % sbh || c.dst_x % dbw || c.dst_y % dbh) {
+            return bad("block reinterpretation region is not block aligned");
+        }
+        const uint32_t cols = c.width / sbw, rows = c.height / sbh;
+        const uint32_t dw = cols * dbw, dh = rows * dbh;
+        auto up = [](uint32_t v, uint32_t b) { return (v + b - 1) / b * b; };
+        auto mip_dim = [](uint32_t v, uint32_t m) { return std::max<uint32_t>(1u, v >> m); };
+        const uint32_t sw = up(mip_dim(sg.width, c.src_mip), sbw), sh = up(mip_dim(sg.height, c.src_mip), sbh);
+        const uint32_t pw = up(mip_dim(dg.width, c.dst_mip), dbw), ph = up(mip_dim(dg.height, c.dst_mip), dbh);
+        if (uint64_t{c.src_x} + c.width > sw || uint64_t{c.src_y} + c.height > sh ||
+            uint64_t{c.dst_x} + dw > pw || uint64_t{c.dst_y} + dh > ph ||
+            uint64_t{c.src_z} + c.depth_or_layers > sg.depth_or_layers ||
+            uint64_t{c.dst_z} + c.depth_or_layers > dg.depth_or_layers) {
+            return bad("block reinterpretation region out of range");
+        }
+        const uint32_t row_bytes = cols * sf.bytes;
+        const uint32_t bpr = (row_bytes + 255u) / 256u * 256u;
+        wgpu::BufferDescriptor bd{};
+        bd.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst;
+        bd.size = uint64_t{bpr} * rows * c.depth_or_layers;
+        wgpu::Buffer scratch = device.CreateBuffer(&bd);
+        wgpu::TexelCopyTextureInfo src{};
+        src.texture = st.texture;
+        src.mipLevel = c.src_mip;
+        src.origin = {c.src_x, c.src_y, c.src_z};
+        src.aspect = wgpu::TextureAspect::All;
+        wgpu::TexelCopyBufferInfo mid{};
+        mid.buffer = scratch;
+        mid.layout.bytesPerRow = bpr;
+        mid.layout.rowsPerImage = rows;
+        const wgpu::Extent3D sext{c.width, c.height, c.depth_or_layers};
+        enc.CopyTextureToBuffer(&src, &mid, &sext);
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = dt.texture;
+        dst.mipLevel = c.dst_mip;
+        dst.origin = {c.dst_x, c.dst_y, c.dst_z};
+        dst.aspect = wgpu::TextureAspect::All;
+        const wgpu::Extent3D dext{dw, dh, c.depth_or_layers};
+        enc.CopyBufferToTexture(&mid, &dst, &dext);
+        ++dt.depth_gen;
+        ++stats.texture_copies;
+    }
+
     // CopyTexture (opcode 62): validated against the tracked geometry (a bad copy is a packet error,
     // never a Dawn validation error), then recorded as copyTextureToTexture.
     void record_texture_copy(wgpu::CommandEncoder& enc, const GpuCopyTexturePayload& c) {
@@ -7138,6 +7203,9 @@ struct NativeExecutor::Impl {
         const TextureGeometry& dg = dt.geom;
         const TextureGeometry& sg = st.geom;
         auto bad = [&](const char* why) { packet_error(op, std::string("CopyTexture: ") + why); };
+        if (c.reserved == kCopyTextureTranscode) {
+            return record_texture_transcode_copy(enc, c, dt, st, bad);
+        }
         if (dg.dimension != sg.dimension || dt.promoted_1d || st.promoted_1d || dt.bc3d_fallback || st.bc3d_fallback) {
             return bad("textures are not both 2D or both 3D");
         }

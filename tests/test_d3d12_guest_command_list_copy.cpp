@@ -665,6 +665,7 @@ void test_native_copy_for_plain_destination() {
     // Formats that are not copy-compatible stay skipped (counted).
     h.vcall(list, 17 /* CopyResource */, {other_fmt, src});
     CHECK(hdev->stats().unsupported_copies == 1);
+    CHECK(dg::work_total(dg::Work::CopySkipFormat) >= 1);  // counted by reason
     CHECK(static_cast<int32_t>(h.vcall(list, 9 /* Close */)) == 0);
     h.execute(q, {list});
 
@@ -690,6 +691,44 @@ void test_native_copy_for_plain_destination() {
     gpu::set_gpu_texture_copy(false);
 }
 
+// A BC1 texture and an RGBA32-UINT-style texture of the same bytes per block (R32G32_UINT, 8 bytes): the
+// copy is emitted as a CopyTexture packet in block-reinterpretation mode instead of being skipped.
+void test_transcode_copy_bc_uint() {
+    gpu::set_gpu_texture_copy(true);
+    gpu::set_gpu_texture_copy_transcode(true);
+    Harness h;
+    const uint64_t dev = h.create_device();
+    const uint64_t q = h.create_queue(dev);
+    const uint64_t alloc = h.create_allocator(dev);
+    const uint64_t list = h.create_list(dev, alloc);
+    const uint64_t bc = h.create_committed(dev, tex2d_desc(32, 32, 71 /* BC1_UNORM */, 0));
+    const uint64_t blocks = h.create_committed(dev, tex2d_desc(8, 8, 17 /* R32G32_UINT */, 0));
+    CHECK(static_cast<int32_t>(h.vcall(list, 10 /* Reset */, {alloc, 0})) == 0);
+    const size_t mark = h.captured.size();
+    dg::GuestTextureCopyLocation dloc{}, sloc{};
+    dloc.pResource = bc;
+    sloc.pResource = blocks;
+    dg::GuestBox box{2, 0, 0, 6, 4, 1};
+    h.vcall(list, 16 /* CopyTextureRegion */, {h.put(dloc), 8, 4, 0, h.put(sloc), h.put(box)});
+    CHECK(static_cast<int32_t>(h.vcall(list, 9 /* Close */)) == 0);
+    h.execute(q, {list});
+    const auto ps = parse_packets(h.captured, mark);
+    size_t n = 0;
+    for (const Packet& p : ps) {
+        if (p.opcode == kGpuOpcodeCopyTexture) {
+            const GpuCopyTexturePayload c = payload_as<GpuCopyTexturePayload>(p);
+            CHECK(c.reserved == kCopyTextureTranscode);
+            CHECK(c.src_x == 2 && c.src_y == 0 && c.dst_x == 8 && c.dst_y == 4);
+            CHECK(c.width == 4 && c.height == 4);  // 4 x 4 source blocks
+            ++n;
+        }
+    }
+    CHECK(n == 1);
+    h.release({list, alloc, q, bc, blocks, dev});
+    gpu::set_gpu_texture_copy_transcode(false);
+    gpu::set_gpu_texture_copy(false);
+}
+
 }  // namespace
 
 int main() {
@@ -698,6 +737,7 @@ int main() {
     test_compute_storage_2d_and_3d_texture_copies();
     test_copy_edge_cases_fallbacks_and_device_lifecycle();
     test_native_copy_for_plain_destination();
+    test_transcode_copy_bc_uint();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test failure(s) in test_d3d12_guest_command_list_copy\n", g_failures);
         return 1;

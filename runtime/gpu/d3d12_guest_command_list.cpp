@@ -53,6 +53,14 @@ const char* work_name(Work w) {
     case Work::TextureSyncUntracked: return "texture_sync_untracked";
     case Work::BufferUploads: return "buffer_uploads";
     case Work::CopiesSkipped: return "copies_skipped";
+    case Work::CopySkipGateOff: return "copy_skip_gate_off";
+    case Work::CopySkipNoGpuTexture: return "copy_skip_no_gpu_texture";
+    case Work::CopySkipMsaa: return "copy_skip_msaa";
+    case Work::CopySkipSwapchain: return "copy_skip_swapchain";
+    case Work::CopySkipDimension: return "copy_skip_dimension";
+    case Work::CopySkipFormat: return "copy_skip_format";
+    case Work::CopySkipOverlap: return "copy_skip_overlap";
+    case Work::CopySkipEmitFailed: return "copy_skip_emit_failed";
     case Work::ResourcesCreated: return "resources_created";
     case Work::ResourcesDestroyed: return "resources_destroyed";
     case Work::ReflectionTableSlotsOutsideRs: return "reflection_table_slots_outside_rs";
@@ -832,20 +840,35 @@ struct TextureCopyPlan {
     uint32_t block_w = 1;
     uint32_t block_h = 1;
     bool whole_only = false;
+    // Mode::None: why no route exists (the Work::CopySkip* counter).
+    Work skip = Work::CopySkipEmitFailed;
 };
 
 // A plain copyTextureToTexture (kGpuOpcodeCopyTexture) for what the shader routes cannot write: the
 // destination is neither a render target nor a UAV (or the source has no shader-resource use).
 TextureCopyPlan plan_native_texture_copy(Device& dev, const Resource* dst, const Resource* src) {
     TextureCopyPlan plan{};
-    if (!gpu_texture_copy() || dst == nullptr || src == nullptr || dst->is_buffer() || src->is_buffer() ||
-        !dst->has_gpu_texture() || !src->has_gpu_texture() || src->desc().SampleCount > 1u ||
-        dst->desc().SampleCount > 1u) {
+    if (!gpu_texture_copy()) {
+        plan.skip = Work::CopySkipGateOff;
+        return plan;
+    }
+    if (dst == nullptr || src == nullptr || dst->is_buffer() || src->is_buffer() || !dst->has_gpu_texture() ||
+        !src->has_gpu_texture()) {
+        plan.skip = Work::CopySkipNoGpuTexture;
+        return plan;
+    }
+    if (src->desc().SampleCount > 1u || dst->desc().SampleCount > 1u) {
+        plan.skip = Work::CopySkipMsaa;
         return plan;
     }
     bridge::TextureInfo dst_info{}, src_info{};
     if (!dev.state_bridge().texture_info(dst->id(), &dst_info) ||
-        !dev.state_bridge().texture_info(src->id(), &src_info) || dst_info.swapchain || src_info.swapchain) {
+        !dev.state_bridge().texture_info(src->id(), &src_info)) {
+        plan.skip = Work::CopySkipNoGpuTexture;
+        return plan;
+    }
+    if (dst_info.swapchain || src_info.swapchain) {
+        plan.skip = Work::CopySkipSwapchain;
         return plan;
     }
     const bool both_2d = src_info.dimension == GpuTextureDimension::Dim2D &&
@@ -853,6 +876,7 @@ TextureCopyPlan plan_native_texture_copy(Device& dev, const Resource* dst, const
     const bool both_3d = src_info.dimension == GpuTextureDimension::Dim3D &&
                          dst_info.dimension == GpuTextureDimension::Dim3D;
     if (!both_2d && !both_3d) {
+        plan.skip = Work::CopySkipDimension;
         return plan;
     }
     const uint32_t features = dev.state_bridge().options().features;
@@ -860,6 +884,7 @@ TextureCopyPlan plan_native_texture_copy(Device& dev, const Resource* dst, const
     const pso::WgpuTextureFormat dst_wgpu = resource_wgpu_format(dst, features);
     if (src_wgpu == pso::WgpuTextureFormat::Undefined || dst_wgpu == pso::WgpuTextureFormat::Undefined ||
         linear_copy_view_format(src_wgpu) != linear_copy_view_format(dst_wgpu)) {
+        plan.skip = Work::CopySkipFormat;
         return plan;  // not copy-compatible (equal up to sRGB-ness)
     }
     const DxgiFormatLayout l = dxgi_format_layout(dst->desc().Format);
@@ -2554,8 +2579,11 @@ void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg
         if (is_depth_dxgi_format(dst->desc().Format)) {
             aux_of(this).depth_twin.note_depth_copied(dst->id(), 0, 0, 0, 0);
         }
+        count_work(plan.mode == TextureCopyPlan::Mode::None ? plan.skip : Work::CopySkipEmitFailed);
         device_->note_unsupported_copy(
-            "CopyResource: GPU texture-to-texture copy requires render-attachment or storage destination (skipped)");
+            "CopyResource: GPU texture-to-texture copy has no route (skipped): " + std::string(work_name(plan.skip)) +
+            ", DXGI " + std::to_string(dst->desc().Format) + " <- " + std::to_string(src->desc().Format) +
+            ", dst flags " + std::to_string(static_cast<uint32_t>(dst->desc().Flags)));
         return;
     }
     device_->note_unsupported_copy("CopyResource: only CPU-visible buffer sources are supported (skipped)");
@@ -2629,6 +2657,57 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
         box.bottom = std::min(box.bottom, src_sub.phys_h);
         box.back = std::min(box.back, src_sub.mip_d);
 
+        // Compressed <-> uncompressed copy of equal bytes per block: the executor copies through a buffer.
+        if (gpu_texture_copy_transcode() && src_l.block_bytes != 0 && src_l.block_bytes == dst_l.block_bytes &&
+            (src_l.block_width != dst_l.block_width || src_l.block_height != dst_l.block_height) &&
+            (src_l.block_width == 1 || dst_l.block_width == 1) && (src_l.block_height == 1 || dst_l.block_height == 1) &&
+            !src_sub.is_3d && !dst_sub.is_3d && !src_sub.is_1d && !dst_sub.is_1d && src_tex != dst_tex &&
+            src_l.planes == 1 && dst_l.planes == 1 && !is_depth_dxgi_format(src_tex->desc().Format) &&
+            !is_depth_dxgi_format(dst_tex->desc().Format) && src_tex->desc().SampleCount <= 1u &&
+            dst_tex->desc().SampleCount <= 1u && src_tex->has_gpu_texture() && dst_tex->has_gpu_texture()) {
+            bridge::TextureInfo ti_dst{}, ti_src{};
+            if (device_->state_bridge().texture_info(dst_tex->id(), &ti_dst) &&
+                device_->state_bridge().texture_info(src_tex->id(), &ti_src) && !ti_dst.swapchain && !ti_src.swapchain &&
+                ti_dst.dimension == GpuTextureDimension::Dim2D && ti_src.dimension == GpuTextureDimension::Dim2D) {
+                // Whole blocks of the source box: a column / row of the box is one block of both textures.
+                const uint32_t cols = std::min((align_up_u32(box.right - box.left, src_l.block_width) / src_l.block_width),
+                                               std::min((src_sub.phys_w - box.left) / src_l.block_width,
+                                                        (dst_sub.phys_w - dst_x) / dst_l.block_width));
+                const uint32_t rows = std::min((align_up_u32(box.bottom - box.top, src_l.block_height) / src_l.block_height),
+                                               std::min((src_sub.phys_h - box.top) / src_l.block_height,
+                                                        (dst_sub.phys_h - dst_y) / dst_l.block_height));
+                uint32_t host_src_mip = src_sub.mip;
+                uint32_t host_dst_mip = dst_sub.mip;
+                if (cols == 0 || rows == 0 ||
+                    !device_->state_bridge().translate_host_mip(src_tex->id(), &host_src_mip) ||
+                    !device_->state_bridge().translate_host_mip(dst_tex->id(), &host_dst_mip)) {
+                    return;  // empty, or a mip trimmed by texture_budget: cleanly skipped
+                }
+                GpuCopyTexturePayload c{};
+                c.dst_id = dst_tex->id();
+                c.src_id = src_tex->id();
+                c.dst_mip = host_dst_mip;
+                c.src_mip = host_src_mip;
+                c.dst_x = dst_x;
+                c.dst_y = dst_y;
+                c.dst_z = dst_sub.layer;
+                c.src_x = box.left;
+                c.src_y = box.top;
+                c.src_z = src_sub.layer;
+                c.width = cols * src_l.block_width;
+                c.height = rows * src_l.block_height;
+                c.depth_or_layers = 1;
+                c.reserved = kCopyTextureTranscode;
+                pinned_.push_back(com::Ref<com::ComObject>::share(src_tex));
+                pinned_.push_back(com::Ref<com::ComObject>::share(dst_tex));
+                device_->sync_bound_texture_memory(src_tex->id(), encoder_);
+                bridge_.ResourceBarrier(0, nullptr);
+                encoder_.emit_packet(kGpuOpcodeCopyTexture, &c, sizeof(c));
+                device_->note_texture_copy_destination(dst_tex->id());
+                return;
+            }
+        }
+
         uint32_t copy_w = align_up_u32(box.right - box.left, src_l.block_width);
         uint32_t copy_h = align_up_u32(box.bottom - box.top, src_l.block_height);
         uint32_t copy_d = box.back - box.front;
@@ -2651,6 +2730,7 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
                 aux_of(this).depth_twin.note_depth_copied(dst_tex->id(), dst_sub.mip, 1u,
                                                           dst_sub.is_3d ? dst_z : dst_sub.layer, copy_d);
             }
+            count_work(Work::CopySkipOverlap);
             device_->note_unsupported_copy(
                 "CopyTextureRegion: same-subresource overlapping texture copy cannot alias in WebGPU (skipped)");
             return;
@@ -2692,8 +2772,11 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
             aux_of(this).depth_twin.note_depth_copied(dst_tex->id(), dst_sub.mip, 1u,
                                                       dst_sub.is_3d ? dst_z : dst_sub.layer, copy_d);
         }
+        count_work(plan.mode == TextureCopyPlan::Mode::None ? plan.skip : Work::CopySkipEmitFailed);
         device_->note_unsupported_copy(
-            "CopyTextureRegion: GPU texture-to-texture copy requires render-attachment or storage destination (skipped)");
+            "CopyTextureRegion: GPU texture-to-texture copy has no route (skipped): " + std::string(work_name(plan.skip)) +
+            ", DXGI " + std::to_string(dst_tex->desc().Format) + " <- " + std::to_string(src_tex->desc().Format) +
+            ", dst flags " + std::to_string(static_cast<uint32_t>(dst_tex->desc().Flags)));
         return;
     }
     if (tex == nullptr || buf == nullptr || dst.Type != 0 || src.Type != 1 || tex->is_buffer() || !buf->is_buffer()) {
