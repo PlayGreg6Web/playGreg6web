@@ -191,16 +191,21 @@ SPLIT_DEFAULT_INITIAL_MEMORY = "64MB"
 SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 48
 SPLIT_RUNTIME_ARCHIVE_EXCLUDES: tuple[str, ...] = ("wasm_boot.cpp.o", "main.cpp.o")
 SIDE_MODULE_CTOR_EXPORT_FLAG = "-Wl,--export-if-defined=__wasm_call_ctors"
+# Lifted shards that happen to contain no atomic ops can carry no `+atomics` target feature; wasm-ld then
+# rejects them under --shared-memory ("not compiled with 'atomics' or 'bulk-memory'"). They are safe to link.
+SIDE_MODULE_NO_CHECK_FEATURES_FLAG = "-Wl,--no-check-features"
 SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
     SIDE_MODULE_FLAG,
+    SIDE_MODULE_NO_CHECK_FEATURES_FLAG,
 )
 SIDE_MODULE_PRUNED_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
     SIDE_MODULE_PRUNED_FLAG,
     SIDE_MODULE_CTOR_EXPORT_FLAG,
+    SIDE_MODULE_NO_CHECK_FEATURES_FLAG,
 )
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 _SIDE_MODULE_FILENAME_RE = re.compile(r"^guest_part_(\d+)\.wasm$")
