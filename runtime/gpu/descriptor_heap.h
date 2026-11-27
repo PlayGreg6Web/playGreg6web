@@ -1145,7 +1145,7 @@ public:
     // filter. Call it after anything that adds ids to a group the cache holds (the cache does it
     // for its own builds; the bridge after it fills in relocations and view ids). Ids are only
     // ever added between rebuilds, so the filter may over-report but never miss a referenced id.
-    void note_group_ids(const CachedBindGroup& group) noexcept;
+    void note_group_ids(const CachedBindGroup& group);
     // Bounds the cache between recordings (O36). Keys carry root-view GPU addresses and table base
     // indices, which ring allocators change per draw, so without a bound the cache (and the WebGPU
     // bind groups behind it) grows for the whole run. When more than `max_entries` are cached, drops
@@ -1206,9 +1206,20 @@ private:
         const size_t b = id_filter_bit(id, view);
         return ((id_filter_[b >> 6] >> (b & 63)) & 1u) != 0;
     }
-    void rebuild_id_filter() noexcept;
+    void rebuild_id_filter();
     std::vector<uint64_t> id_filter_ = std::vector<uint64_t>(kIdFilterBits / 64, 0);
     size_t filter_notes_ = 0;  // note_group_ids calls since the filter was last rebuilt
+    // Exact eviction index next to the filter: (view flag << 32 | id) -> key hashes of the groups
+    // noted with that id. Same invariant as the filter (every id a cached group references was noted
+    // with its hash), so an eviction visits only these candidates instead of scanning the table once
+    // the filter saturates (a large cache sets most of its bits). Entries of dropped or rebuilt groups
+    // go stale and are verified against the group (references_any) before an evict; the index is
+    // rebuilt with the filter. Keys retired by an evict are erased (no cached group references them
+    // afterwards).
+    static uint64_t id_index_key(uint32_t id, bool view) noexcept {
+        return (view ? uint64_t{1} << 32 : 0u) | id;
+    }
+    std::unordered_map<uint64_t, std::vector<uint64_t>> id_index_;
 
     struct ResolvedHeapSlot {
         DescriptorHeap* heap = nullptr;
@@ -1228,6 +1239,7 @@ private:
     std::vector<ResolvedHeapSlot> scratch_heap_slots_;
     std::vector<uint32_t> scratch_evict_res_;
     std::vector<uint32_t> scratch_evict_views_;
+    std::vector<Slot*> scratch_evict_slots_;
     const DescriptorSlotSource* slot_source_ = nullptr;
     uint64_t epoch_ = 1;
     size_t peak_epoch_entries_ = 0;  // largest size_ in the open epoch

@@ -702,6 +702,9 @@ else()
         )
         target_include_directories(playgta6_native_exec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_definitions(playgta6_native_exec PRIVATE PG6_DAWN_COMMIT="${_pg6_dawn_commit}")
+        if(MSVC)
+            target_compile_options(playgta6_native_exec PRIVATE /bigobj)  # native_executor.cpp exceeds the default section limit (C1128)
+        endif()
         target_link_libraries(playgta6_native_exec PUBLIC dawn::webgpu_dawn PRIVATE playgta6_core)  # PRIVATE: gpu/gpu_time.cpp (the GPU-time table the boot report prints)
 
         # `playgta6_boot --window`: the live packet stream goes to the executor (gpu/native_exec/live_pump.h).

@@ -2909,6 +2909,7 @@ void BindGroupCache::clear(std::vector<uint32_t>* retired) {
     last_hash_ = 0;
     last_entry_ = nullptr;
     std::fill(id_filter_.begin(), id_filter_.end(), uint64_t{0});
+    id_index_.clear();
     filter_notes_ = 0;
     track_size();
 }
@@ -2960,11 +2961,15 @@ size_t BindGroupCache::evict_resource(uint32_t resource_id, std::vector<uint32_t
     return evict_resources_and_views(std::span<const uint32_t>(&resource_id, 1), {}, retired);
 }
 
-void BindGroupCache::note_group_ids(const CachedBindGroup& g) noexcept {
-    auto set = [this](uint32_t id, bool view) noexcept {
+void BindGroupCache::note_group_ids(const CachedBindGroup& g) {
+    auto set = [this, &g](uint32_t id, bool view) {
         if (id != 0) {
             const size_t b = id_filter_bit(id, view);
             id_filter_[b >> 6] |= uint64_t{1} << (b & 63);
+            std::vector<uint64_t>& hashes = id_index_[id_index_key(id, view)];
+            if (hashes.empty() || hashes.back() != g.key_hash) {
+                hashes.push_back(g.key_hash);
+            }
         }
     };
     for (const BindGroupEntry& e : g.entries) {
@@ -2981,8 +2986,9 @@ void BindGroupCache::note_group_ids(const CachedBindGroup& g) noexcept {
     ++filter_notes_;
 }
 
-void BindGroupCache::rebuild_id_filter() noexcept {
+void BindGroupCache::rebuild_id_filter() {
     std::fill(id_filter_.begin(), id_filter_.end(), uint64_t{0});
+    id_index_.clear();
     for (const Slot& s : table_) {
         if (s.state == kBindSlotOccupied) {
             note_group_ids(*s.entry);
@@ -3075,8 +3081,36 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
         }
         return false;
     };
+    // Candidates from the exact index instead of a table scan: every group referencing one of the
+    // ids was noted with it. Visited in table order (slot address), as the scan did.
+    std::vector<Slot*>& candidates = scratch_evict_slots_;
+    candidates.clear();
+    auto gather = [&](uint32_t id, bool view) {
+        if (id == 0 || !filter_may_hold(id, view)) {
+            return;
+        }
+        const auto it = id_index_.find(id_index_key(id, view));
+        if (it == id_index_.end()) {
+            return;
+        }
+        for (const uint64_t h : it->second) {
+            if (Slot* s = find_slot(h)) {
+                candidates.push_back(s);
+            }
+        }
+        id_index_.erase(it);  // every group referencing the id is evicted below
+    };
+    for (const uint32_t id : resource_ids) {
+        gather(id, false);
+    }
+    for (const uint32_t id : view_ids) {
+        gather(id, true);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
     size_t dropped = 0;
-    for (Slot& s : table_) {
+    for (Slot* sp : candidates) {
+        Slot& s = *sp;
         if (s.state == kBindSlotOccupied && references_any(*s.entry)) {
             if (retired != nullptr && s.entry->gpu_id != 0) {
                 retired->push_back(s.entry->gpu_id);

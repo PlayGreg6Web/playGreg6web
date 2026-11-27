@@ -2448,6 +2448,7 @@ void test_bind_group_cache_flat_mru_erase_and_scale() {
         CHECK(lk.status == Status::Ok && lk.rebuilt && lk.bind_group != nullptr);
         lk.bind_group->gpu_id = 10000u + i;
         lk.bind_group->view_ids.push_back(50000u + i);
+        cache.note_group_ids(*lk.bind_group);  // ids added after the build are noted (as the bridge does)
         ptrs[i] = lk.bind_group;
 
         // Immediate repeat lookup must hit the 1-entry MRU cache with identical pointer.
@@ -2894,6 +2895,44 @@ void test_copy_descriptors_batched_gen_and_overlap_fastpath() {
     CHECK(dropped == 20);
     CHECK(retired.size() == 20);
     CHECK(cache.size() == 0);
+
+    // Exact eviction index: groups sharing ids, stale index entries (an evicted id evicted again,
+    // groups rebuilt under the same key, an id re-noted after its groups were evicted) evict exactly
+    // the groups that reference the ids, in table order.
+    for (uint32_t i = 0; i < 40; ++i) {
+        CHECK(state.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(dst_cbv, 10 + i)) == Status::Ok);
+        BindGroupLookup lk = cache.get_or_build(state, BindPoint::Graphics, plan, 2, test_resolver, nullptr);
+        CHECK(lk.status == Status::Ok && lk.rebuilt);
+        lk.bind_group->gpu_id = 700 + i;
+        lk.bind_group->view_ids = {7000 + i % 4, 7100 + i};  // view 7000+k shared by every 4th group
+        cache.note_group_ids(*lk.bind_group);
+    }
+    CHECK(cache.size() == 40);
+    retired.clear();
+    const uint32_t shared_view[1] = {7001};
+    CHECK(cache.evict_resources_and_views({}, shared_view, &retired) == 10);
+    std::vector<uint32_t> expect;
+    for (uint32_t i = 1; i < 40; i += 4) expect.push_back(700 + i);
+    std::sort(retired.begin(), retired.end());
+    CHECK(retired == expect);
+    CHECK(cache.evict_resources_and_views({}, shared_view, &retired) == 0);  // nothing references it any more
+    const uint32_t gone_view[1] = {7105};  // its group (i = 5) was evicted above
+    CHECK(cache.evict_resources_and_views({}, gone_view, &retired) == 0);
+    // Rebuild group 5 under the same key: it references 7001 again once noted.
+    CHECK(state.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(dst_cbv, 15)) == Status::Ok);
+    BindGroupLookup again = cache.get_or_build(state, BindPoint::Graphics, plan, 2, test_resolver, nullptr);
+    CHECK(again.status == Status::Ok && again.rebuilt);
+    again.bind_group->gpu_id = 799;
+    again.bind_group->view_ids = {7001};
+    cache.note_group_ids(*again.bind_group);
+    retired.clear();
+    CHECK(cache.evict_resources_and_views({}, shared_view, &retired) == 1 && retired == std::vector<uint32_t>{799});
+    // Resource ids the groups bind (heap slot 10 + i -> resource 1020 + i) plus views.
+    retired.clear();
+    const uint32_t res[2] = {1022, 1023};      // groups 2 and 3
+    const uint32_t views[2] = {7000, 7120};    // groups 0, 4, 8, ... and 20 (already in the 7000 set)
+    CHECK(cache.evict_resources_and_views(res, views, &retired) == 12);
+    CHECK(cache.size() == 40 - 10 - 12);
 }
 
 void test_large_descriptor_range_intersections() {
