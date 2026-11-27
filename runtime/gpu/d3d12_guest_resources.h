@@ -92,10 +92,6 @@ uint64_t shader_identity(const void* data, size_t size);
 // hash taking 32 bytes per step, roughly 10x faster than shader_identity. In-memory only (never
 // persisted or compared with shader identities).
 uint64_t content_hash(const void* data, size_t size);
-// As content_hash / memcpy over a host view of guest memory whose pages another thread may unmap:
-// false (instead of a host crash) when reading raises an access violation. Always true off Windows.
-bool try_content_hash(const void* data, size_t size, uint64_t* out);
-bool try_copy_bytes(void* dst, const void* src, size_t size);
 // True when all `size` bytes are zero (word-wise).
 bool all_zero_bytes(const void* data, size_t size);
 

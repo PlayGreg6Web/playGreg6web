@@ -506,54 +506,6 @@ uint64_t content_hash(const void* data, size_t size) {
     return h;
 }
 
-// A host view of guest memory can lose its pages under the reader (a CPU-window slot remapped or
-// unmapped by the title's memory manager, outside the arena lock). These read the bytes in place and
-// report an access violation as "not readable" so the caller falls back to the checked copy instead
-// of crashing the host (0xC0000005 access violation, 0xC0000006 in-page error; soak: host AV in Device::flush_cpu_buffers -> content_hash).
-#if defined(_WIN32)
-#include <excpt.h>
-namespace {
-bool guarded_hash_raw(const void* data, size_t size, uint64_t* out) {
-    __try {
-        *out = content_hash(data, size);
-        return true;
-    } __except (_exception_code() == 0xC0000005u || _exception_code() == 0xC0000006u
-                    ? EXCEPTION_EXECUTE_HANDLER
-                    : EXCEPTION_CONTINUE_SEARCH) {
-        return false;
-    }
-}
-bool guarded_copy_raw(void* dst, const void* src, size_t size) {
-    __try {
-        std::memcpy(dst, src, size);
-        return true;
-    } __except (_exception_code() == 0xC0000005u || _exception_code() == 0xC0000006u
-                    ? EXCEPTION_EXECUTE_HANDLER
-                    : EXCEPTION_CONTINUE_SEARCH) {
-        return false;
-    }
-}
-}  // namespace
-#endif
-
-bool try_content_hash(const void* data, size_t size, uint64_t* out) {
-#if defined(_WIN32)
-    return guarded_hash_raw(data, size, out);
-#else
-    *out = content_hash(data, size);
-    return true;
-#endif
-}
-
-bool try_copy_bytes(void* dst, const void* src, size_t size) {
-#if defined(_WIN32)
-    return guarded_copy_raw(dst, src, size);
-#else
-    std::memcpy(dst, src, size);
-    return true;
-#endif
-}
-
 bool all_zero_bytes(const void* data, size_t size) {
     const auto* p = static_cast<const uint8_t*>(data);
     size_t i = 0;
@@ -2222,13 +2174,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                     if (native_unwritten(r.write_cursor, r.write_primed, view.data(), r.size) && r.ever_uploaded) {
                         continue;  // no page written since the last hash: same bytes
                     }
-                    bytes.resize(static_cast<size_t>(r.size));
-                    if (!try_content_hash(view.data(), static_cast<size_t>(r.size), &hash)) {
-                        mapped = false;  // the view lost its pages: take the checked copy below
-                    } else if (r.ever_uploaded && hash == r.last_hash) {
+                    hash = content_hash(view.data(), static_cast<size_t>(r.size));
+                    if (r.ever_uploaded && hash == r.last_hash) {
                         unchanged = true;
-                    } else if (!try_copy_bytes(bytes.data(), view.data(), bytes.size())) {
-                        mapped = false;
+                    } else {
+                        bytes.assign(view.data(), view.data() + r.size);
                     }
                 }
             }
@@ -2277,13 +2227,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                     if (native_unwritten(r.write_cursor, r.write_primed, view.data(), key.second)) {
                         continue;  // no page written since the last hash: same bytes
                     }
-                    bytes.resize(static_cast<size_t>(key.second));
-                    if (!try_content_hash(view.data(), static_cast<size_t>(key.second), &hash)) {
-                        mapped = false;  // the view lost its pages: take the checked copy below
-                    } else if (hash == r.last_hash) {
+                    hash = content_hash(view.data(), static_cast<size_t>(key.second));
+                    if (hash == r.last_hash) {
                         unchanged = true;
-                    } else if (!try_copy_bytes(bytes.data(), view.data(), bytes.size())) {
-                        mapped = false;
+                    } else {
+                        bytes.assign(view.data(), view.data() + key.second);
                     }
                 }
             }

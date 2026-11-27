@@ -9115,44 +9115,11 @@ void test_xbox_presentx_color_space_and_planes() {
     scene.release_all({srgb_rt, hdr10_rt, fp16_rt});
 }
 
-#if defined(_WIN32)
-// (<windows.h> collides with d3d12_xs.h's HRESULT: declare the three calls the test needs.)
-extern "C" __declspec(dllimport) void* __stdcall VirtualAlloc(void*, size_t, unsigned long, unsigned long);
-extern "C" __declspec(dllimport) int __stdcall VirtualProtect(void*, size_t, unsigned long, unsigned long*);
-extern "C" __declspec(dllimport) int __stdcall VirtualFree(void*, size_t, unsigned long);
-// try_content_hash / try_copy_bytes report an unmapped host view as "not readable" instead of crashing
-// (the soak's host AV in flush_cpu_buffers).
-void test_guarded_view_reads() {
-    using playgta6::gpu::d3d12_guest::try_content_hash;
-    using playgta6::gpu::d3d12_guest::try_copy_bytes;
-    using playgta6::gpu::d3d12_guest::content_hash;
-    constexpr size_t kBytes = 64 * 1024;
-    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, kBytes, 0x3000ul, 0x04ul));
-    CHECK(mem != nullptr);
-    for (size_t i = 0; i < kBytes; ++i) mem[i] = static_cast<uint8_t>(i * 7u);
-    uint64_t h = 0;
-    std::vector<uint8_t> copy(kBytes);
-    CHECK(try_content_hash(mem, kBytes, &h));
-    CHECK(h == content_hash(mem, kBytes));
-    CHECK(try_copy_bytes(copy.data(), mem, kBytes));
-    CHECK(std::memcmp(copy.data(), mem, kBytes) == 0);
-    unsigned long old = 0;
-    CHECK(VirtualProtect(mem + kBytes / 2, 4096, 0x01ul, &old));  // a page unmapped mid-range
-    h = 0;
-    CHECK(!try_content_hash(mem, kBytes, &h));
-    CHECK(!try_copy_bytes(copy.data(), mem, kBytes));
-    VirtualFree(mem, 0, 0x8000ul);
-}
-#endif
-
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
     playgta6::os::set_write_tracking(true);
     test_same_bytes();
-#if defined(_WIN32)
-    test_guarded_view_reads();
-#endif
     test_compare_shadow_pages();
     test_window_write_marks_flush();
     test_window_texture_sync_markpass_and_inplace_hash();
