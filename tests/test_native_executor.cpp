@@ -558,6 +558,9 @@ void test_usage_scopes(NativeExecutor& ex) {
     sb.offset = 256;
     sb.size = 16;
     create_bind_group(setup, 3105, 3102, {ub, sb});
+    // both bindings null: a uniform dummy and a read-write storage dummy, which must not be one buffer
+    create_bind_group(setup, 3106, 3102,
+                      {bg_entry(0, GpuBindResourceType::Buffer, 0), bg_entry(1, GpuBindResourceType::Buffer, 0)});
     // render: draw 1 writes buffer 3110 [0, 16) as storage, draw 2 reads it as a uniform
     setup.create_buffer(3110, ubo_storage, 256);
     setup.create_shader_module(3111, GpuShaderStage::Vertex, kFragWrite);
@@ -625,6 +628,8 @@ void test_usage_scopes(NativeExecutor& ex) {
     frame.begin_frame();
     frame.set_compute_pipeline(3104);
     set_bind_group2(frame, 0, 3105);
+    frame.dispatch_compute(1);
+    set_bind_group2(frame, 0, 3106);
     frame.dispatch_compute(1);
     frame.set_compute_pipeline(3134);
     set_bind_group2(frame, 0, 3135);
