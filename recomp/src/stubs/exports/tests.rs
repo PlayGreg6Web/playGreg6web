@@ -379,7 +379,7 @@ int g_failures = 0;
         }                                                                             \
     } while (0)
 
-alignas(16) unsigned char g_state[416];
+alignas(16) unsigned char g_state[704];
 uint64_t g_stack[32];
 const char g_text[] = "hi";
 int g_marker = 0;
