@@ -309,6 +309,13 @@ public:
         static bool active();
     };
     bool write(uint64_t addr, const void* src, size_t len);
+    // The runtime's own refill of pages that stay committed (XMem's in-place remap of a mirrored
+    // window slot, docs/XMEM_REMAP.md): under the lock, copies `src` (zeroes when null) into
+    // [addr, addr + len). The pages must be committed and readable (protection is the title's,
+    // not checked for writing, as XMem's other fills); false (nothing written) otherwise. Holding
+    // the lock over the copy keeps it whole for GuestRangeView / read_guest, which re-check the
+    // window under the same lock. No arena event (it is not a guest write).
+    bool fill_committed(uint64_t addr, const void* src, size_t len);
 
     // Host pointer for [addr, addr + len) if every page in it is committed and writable
     // (host_ptr) / readable (host_ptr_const), else nullptr. The range may span pages,

@@ -391,6 +391,55 @@ void phase_mirrored_2m(uint64_t seed) {
         },
         seed);
     CHECK(pg6_xbox_XMemMapPhysicalPages(mirror, 1, nullptr) == mirror);
+
+    // Phase 4: the guest's own loads (what lifted code does: the slot's delta from the window
+    // table, then a plain load at va + delta; no helper, no lock) while the mirrored page is only
+    // ever re-pointed from one physical page to the other, never unmapped. A remap of a mapped
+    // slot keeps the slot's memory committed and shown, and fills it in place, so every load sees
+    // a stamp byte: never the trap delta (a guest fault), never zero (the page committed again but
+    // not filled yet). Before the in-place remap both happened (docs/XMEM_REMAP.md).
+    CHECK(pg6_xbox_XMemMapPhysicalPages(mirror, 1, &pfn[0]) == mirror);
+    std::atomic<uint64_t> raw_traps{0};
+    std::atomic<uint64_t> raw_zeros{0};
+    std::atomic<uint64_t> raw_loads{0};
+    run(
+        1, readers,
+        [&](int, Rng& rng) {
+            for (int i = 0; i < 500; ++i) {
+                CHECK(pg6_xbox_XMemMapPhysicalPages(mirror, 1, &pfn[rng.below(2)]) == mirror);
+            }
+        },
+        [&](int, Rng& rng) {
+            uint64_t traps = 0;
+            uint64_t zeros = 0;
+            for (int i = 0; i < 256; ++i) {
+                const uint64_t va = wm + (rng.next() % k2M);
+                const int64_t delta = std::atomic_ref<int64_t>(
+                    __playgta6_window_table[(va - gw::kWindowBase) >> gw::kSlotShift]).load(std::memory_order_relaxed);
+                if (static_cast<uint64_t>(delta) == gw::kTrapDelta) {
+                    ++traps;  // the guest's load would fault here
+                    continue;
+                }
+                const uint8_t b = *reinterpret_cast<const volatile uint8_t*>(static_cast<uintptr_t>(va + delta));
+                if (b == 0) {
+                    ++zeros;
+                } else {
+                    CHECK(b == stamp[0] || b == stamp[1]);
+                }
+            }
+            raw_traps += traps;
+            raw_zeros += zeros;
+            raw_loads += 256;
+        },
+        seed);
+    std::fprintf(stderr, "  raw guest loads: %llu, trapped %llu, zero %llu\n",
+                 static_cast<unsigned long long>(raw_loads.load()), static_cast<unsigned long long>(raw_traps.load()),
+                 static_cast<unsigned long long>(raw_zeros.load()));
+    CHECK(raw_traps.load() == 0);
+    CHECK(raw_zeros.load() == 0);
+    g_reads_ok += raw_loads.load() - raw_traps.load() - raw_zeros.load();
+
+    CHECK(pg6_xbox_XMemMapPhysicalPages(mirror, 1, nullptr) == mirror);
     CHECK(xmem_virtual_free(mirror));
     CHECK(xmem_virtual_free(pool));
     CHECK(xmem_virtual_free(cpu));

@@ -605,8 +605,11 @@ uint64_t unmirror(uint64_t va) {
     return va;
 }
 
-// Removes the page mapped at slot `va` (guest VA); the caller holds the lock.
-void unmap_slot_locked(XMemState& st, uint64_t va) {
+// Removes the page mapped at slot `va` (guest VA); the caller holds the lock. `keep_committed`
+// (remap_in_place_locked said so): the slot's arena memory stays committed and its mirrored window
+// slots stay shown, because the caller maps another page there right away and fills the memory in
+// place (docs/XMEM_REMAP.md).
+void unmap_slot_locked(XMemState& st, uint64_t va, bool keep_committed = false) {
     auto sit = st.page_slots.find(va);
     if (sit == st.page_slots.end()) {
         return;
@@ -673,14 +676,14 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
     if (const uint64_t w = mirror_window_va_locked(st, va)) {
         if (region != nullptr && region->committed) {
             mark_mirror_locked(st, va, ps);
-        } else {
+        } else if (!keep_committed) {
             // Unmap before decommit so concurrent guest code cannot access decommitted memory and
             // unmapped MEM_PHYSICAL slots do not form split pairs with adjacent alias runs.
             unmap_window_page(w, ps);
         }
     }
     if (region != nullptr && !region->phantom) {
-        if (!region->committed) {
+        if (!region->committed && !keep_committed) {
             xmem_arena().decommit(va, ps);
             st.virtual_committed_bytes -= ps;
         }
@@ -1181,6 +1184,41 @@ KeepResult keep_window_run_locked(XMemState& st,
 
 enum class MapResult { Ok, Failed, NeedWaitPin };
 
+// The mapped slot of a mirrored MEM_PHYSICAL reservation whose window slots show the slot's own
+// arena memory, holding its page's bytes (the page's home): what an in-place remap starts from.
+const PhysicalPage* mirrored_home_locked(XMemState& st, uint64_t va, const VirtualRegion* region) {
+    if (region == nullptr || region->committed || region->phantom || region->translated || region->shared) {
+        return nullptr;
+    }
+    const uint64_t w = mirror_window_va_locked(st, va);
+    const auto sit = w != 0 ? st.page_slots.find(va) : st.page_slots.end();
+    if (sit == st.page_slots.end()) {
+        return nullptr;
+    }
+    const auto pit = st.physical_pages.find(sit->second);
+    if (pit == st.physical_pages.end()) {
+        return nullptr;
+    }
+    const PhysicalPage& old = *pit->second;
+    const bool primary = std::find(old.window_slots.begin(), old.window_slots.end(), w) == old.window_slots.end();  // not an alias slot
+    return old.home_va == va && primary ? &old : nullptr;
+}
+
+// Whether mapping `page` at slot `va` of `region` replaces the page there in place
+// (docs/XMEM_REMAP.md): the slot is the primary mirrored slot of a MEM_PHYSICAL reservation (its
+// window slots show the slot's own arena memory), another page of the same size lives there (its
+// home), and `page` lives nowhere else, so its bytes are copied into that memory. Then the memory
+// stays committed and the window slots stay shown across the remap and the new bytes are copied
+// over the old ones under the arena lock: the title's own loads (window table, no lock) see the
+// old or the new page, never the trap delta or a page committed again but not filled yet.
+bool remap_in_place_locked(XMemState& st, uint64_t va, const PhysicalPage& page, const VirtualRegion* region) {
+    if (page.home_va != 0 || page.view != nullptr) {
+        return false;
+    }
+    const PhysicalPage* old = mirrored_home_locked(st, va, region);
+    return old != nullptr && old != &page && old->page_size == page.page_size;
+}
+
 // Maps `page` at slot `va` (guest VA); the caller validated the page and holds the lock.
 MapResult map_slot_locked(XMemState& st,
                           uint64_t va,
@@ -1196,7 +1234,11 @@ MapResult map_slot_locked(XMemState& st,
     if (region == nullptr && !in_block) {
         return MapResult::Failed;
     }
-    unmap_slot_locked(st, va);
+    if (mirrored_home_locked(st, va, region) == &page) {
+        return MapResult::Ok;  // already shown there: remapping it changes nothing (as on the console)
+    }
+    const bool in_place = remap_in_place_locked(st, va, page, region);
+    unmap_slot_locked(st, va, in_place);
     st.page_slots[va] = page.handle;
     ++page.mapped_slots;
     st.mapped_physical_bytes += ps;
@@ -1285,7 +1327,7 @@ MapResult map_slot_locked(XMemState& st,
     // in the browser untouched linear memory is zero): zeroing it again would make every mapped
     // page resident, e.g. the whole multi-GiB pool view the title maps once at startup.
     bool fresh_zero = false;
-    if (region != nullptr && !region->committed) {
+    if (region != nullptr && !region->committed && !in_place) {  // in place: still committed, counted
         PageProtect pp = PageProtect::ReadWrite;
         xmem_protect(region->protect, pp);
         if (pp == PageProtect::NoAccess) {
@@ -1320,11 +1362,16 @@ MapResult map_slot_locked(XMemState& st,
         std::memcpy(dst, host_of(page.home_va), static_cast<size_t>(ps));
         ++st.alias_conflicts;
     } else if (page.store_va != 0) {
-        std::memcpy(dst, host_of(page.store_va), static_cast<size_t>(ps));
+        // In place: the old bytes are overwritten under the arena lock (whole for locked readers).
+        if (!in_place || !xmem_arena().fill_committed(va, host_of(page.store_va), static_cast<size_t>(ps))) {
+            std::memcpy(dst, host_of(page.store_va), static_cast<size_t>(ps));
+        }
         old_store = page.store_va;
         page.store_va = 0;
     } else if (page.home_va == 0 && !fresh_zero) {
-        std::memset(dst, 0, static_cast<size_t>(ps));
+        if (!in_place || !xmem_arena().fill_committed(va, nullptr, static_cast<size_t>(ps))) {
+            std::memset(dst, 0, static_cast<size_t>(ps));
+        }
         ++st.zero_fills;
     }
     if (page.pool_va == 0) {

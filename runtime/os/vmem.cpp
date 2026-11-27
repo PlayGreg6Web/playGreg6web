@@ -1184,6 +1184,22 @@ bool VirtualMemoryArena::write(uint64_t addr, const void* src, size_t len) {
     return true;
 }
 
+bool VirtualMemoryArena::fill_committed(uint64_t addr, const void* src, size_t len) {
+    if (len == 0) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!pages_allow_locked(addr, len, false)) {
+        return false;
+    }
+    if (src != nullptr) {
+        std::memcpy(translate(addr), src, len);
+    } else {
+        std::memset(translate(addr), 0, len);
+    }
+    return true;
+}
+
 uint8_t* VirtualMemoryArena::host_ptr(uint64_t addr, size_t len) {
     std::lock_guard<std::mutex> lock(mutex_);
     return pages_allow_locked(addr, len, true) ? translate(addr) : nullptr;
