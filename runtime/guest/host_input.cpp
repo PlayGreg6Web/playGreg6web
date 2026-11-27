@@ -330,6 +330,7 @@ void HostInputSource::run() {
     bool have_cursor = false;
     bool prev_kb_enabled = keyboard_enabled_.load();
     ButtonHoldLatch tap_latch;
+    ChordKeyFilter chord_filter;
     bool has_published = false;
     InputState last_published{};
     while (!stop_.load()) {
@@ -422,7 +423,10 @@ void HostInputSource::run() {
                 look_y_ = look_y;
             }
         }
-        const InputState keys = kb ? keymap::evaluate_look(keymap_, key_down, look_x, look_y) : InputState{};
+        if (!kb) chord_filter.reset();
+        const bool alt_now = key_down(0x12);
+        auto chord_down = [&](int vk) { return chord_filter.down(vk, key_down(vk), alt_now); };
+        const InputState keys = kb ? keymap::evaluate_look(keymap_, chord_down, look_x, look_y) : InputState{};
         InputState values = compose_input(have_pad, sample, kb, keys);
         values.buttons = tap_latch.apply(values.buttons, now_ms);
         if (recorder_ != nullptr) {

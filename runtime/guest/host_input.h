@@ -7,6 +7,7 @@
 // unchanged GameInput adapter. Raw values are passed through: the adapter applies the deadzones.
 // Keyboard table: docs/PLAY_LOCALLY.md. Not used together with --input-script.
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <thread>
@@ -53,6 +54,38 @@ enum HostKey : uint32_t {
     kKeyShift = 1u << 21,                          // L3
     kKeyCtrl = 1u << 22,                           // R3
     kKeyZ = 1u << 23, kKeyC = 1u << 24,            // LT, RT
+};
+
+// Window hotkey chords (Alt+Enter, Alt+Tab, ...) must not reach the guest keymap: a key that goes
+// down while Alt is held is hidden until it is released (so Enter-up does not fire A either). Keys
+// already held before Alt went down keep passing, and Alt itself is never hidden, so nothing sticks.
+class ChordKeyFilter {
+public:
+    static bool is_alt(int vk) { return vk == 0x12 || vk == 0xA4 || vk == 0xA5; }
+    // raw_down = physical state of vk now, alt_down = Alt physically held now.
+    bool down(int vk, bool raw_down, bool alt_down) {
+        if (vk < 0 || vk > 255) return raw_down;
+        if (!raw_down) {
+            hidden_[vk] = false;
+            passing_[vk] = false;
+            return false;
+        }
+        if (hidden_[vk]) return false;
+        if (!passing_[vk] && alt_down && !is_alt(vk)) {
+            hidden_[vk] = true;
+            return false;
+        }
+        passing_[vk] = true;
+        return true;
+    }
+    void reset() {
+        hidden_.fill(false);
+        passing_.fill(false);
+    }
+
+private:
+    std::array<bool, 256> hidden_{};
+    std::array<bool, 256> passing_{};
 };
 
 // Keyboard -> InputState (sticks full deflection, opposite keys cancel, triggers 0 or 1).

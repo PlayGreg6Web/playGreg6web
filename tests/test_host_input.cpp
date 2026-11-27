@@ -297,6 +297,17 @@ void test_host_input_mapping() {
         CHECK(hi::compose_input(false, pad, true, InputState{}).buttons == 0);
         CHECK(playgta6::os::window_hotkeys::is_alt_enter(0x0D, true));
         CHECK(!playgta6::os::window_hotkeys::is_alt_enter(0x0D, false));
+        // Alt+Enter: Enter never reaches the keymap, not even on release; Alt alone passes; held keys stay.
+        hi::ChordKeyFilter f;
+        CHECK(f.down(0x57, true, false));            // W held first
+        CHECK(f.down(0x12, true, true));             // Alt itself passes
+        CHECK(f.down(0x57, true, true));             // W stays held through Alt
+        CHECK(!f.down(0x0D, true, true));            // Enter under Alt hidden
+        CHECK(!f.down(0x0D, true, false));           // Alt released first: still hidden
+        CHECK(!f.down(0x0D, false, false));          // Enter up
+        CHECK(f.down(0x0D, true, false));            // next plain Enter works
+        CHECK(!f.down(0x09, true, true));            // Alt+Tab hidden
+        CHECK(!f.down(0x09, false, false) && !f.down(0x12, false, false));
     }
     const auto m = hi::merge(s, k);
     CHECK(m.buttons == (s.buttons | k.buttons));
