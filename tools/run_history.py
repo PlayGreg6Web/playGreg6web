@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boot_summary as bs  # noqa: E402
 import guest_symbols as gs  # noqa: E402
 
-COLUMNS = ["time", "run", "commit", "preset", "duration", "ended", "hard_stop", "max_screen", "fps_p50", "fps_p5",
+COLUMNS = ["time", "run", "commit", "preset", "duration", "ended", "stop", "hard_stop", "max_screen", "fps_p50", "fps_p5",
            "low1_fps", "late_pct", "gpu_errors", "pack_misses", "underruns", "private_peak_mib"]
 GROUP_COLUMNS = ["time", "preset", "commit", "runs", "faults", "max_draws", "fps_p50", "fps_p5", "gpu_errors",
                  "pack_misses", "underruns", "private_peak_mib", "change"]
@@ -101,6 +101,7 @@ def row_from_report(report: dict[str, Any], name: str, when: float, commit: str,
     p50 = f["p50"] if f else (bs._n(report.get("present_fps_avg")) or None)
     ne = bs._d(report.get("native_executor"))
     end, hs = ending(report, hard_stops)
+    si = bs.stop_info(report, hard_stops)
     mb = bs._d(report.get("memory_budget"))
     peak = mb.get("host_private_bytes")
     if peak is None:
@@ -118,6 +119,7 @@ def row_from_report(report: dict[str, Any], name: str, when: float, commit: str,
         "run": name, "commit": commit, "preset": str(bs._d(report.get("run")).get("preset") or report.get("preset") or "-"),
         "duration": bs._dur(report.get("elapsed_ms")) if report.get("elapsed_ms") is not None else "-",
         "ended": end, "hard_stop": hs,
+        "stop": f"{si['key']} @ present #{si['present_index']}" if si else "",
         "max_screen": f"{ms} / {draws:g} draws/frame" if draws else ms,
         "fps_p50": round(p50, 1) if p50 else None, "fps_p5": round(f["p5"], 1) if f else None,
         "low1_fps": round(ft["low1_fps"], 1) if ft else None, "late_pct": round(ft["late_pct"], 1) if ft else None,
@@ -277,12 +279,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--group-by", choices=("commit",))
     ap.add_argument("--fail-on-regression", action="store_true")
     ap.add_argument("--out", help="write the table here instead of stdout (never inside a run dir)")
+    ap.add_argument("--stop", help="only runs whose stop (iface[slot] or kind@target) contains this text")
     ap.add_argument("--tail", type=int, help="only the last N rows")
     args = ap.parse_args(argv)
     roots = [Path(r) for r in (args.root or [])]
     pairs = discover(roots, args.pattern, Path(args.prebuilt_dir) if args.prebuilt_dir else None)
     hs = bs.HARD_STOPS.read_text(encoding="utf-8") if bs.HARD_STOPS.is_file() else None
     rows = collect(pairs, parse_since(args.since), hs)
+    if args.stop:
+        rows = [r for r in rows if args.stop.lower() in str(r.get("stop") or "").lower()]
     groups = group_by_commit(rows) if (args.group_by or args.fail_on_regression) else []
     shown, cols = (groups, GROUP_COLUMNS) if args.group_by else (rows, COLUMNS)
     if args.tail:

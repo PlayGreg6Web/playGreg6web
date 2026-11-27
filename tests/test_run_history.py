@@ -62,6 +62,13 @@ class RunHistoryTests(unittest.TestCase):
         self.assertIn("37 draws/frame", r["max_screen"])
         self.assertTrue(r["ended"].startswith("limit"))
 
+    def test_stop_column_and_filter(self):
+        rep = report()
+        rep["fault_record"] = {"kind": "access_violation", "elapsed_ms": 10, "target": "0xdead"}
+        row = rh.row_from_report(rep, "x", 0.0, "abc")
+        self.assertTrue(row["stop"].startswith("access_violation@0xdead @ present #"))
+        self.assertEqual(self.rows()[0]["stop"], "")
+
     def test_frame_time_columns(self):
         rep = report()
         rep["frame_times"] = {"phases": [{"name": "all", "frames": 200, "low1_fps": 28.5, "low01_fps": 9.0,

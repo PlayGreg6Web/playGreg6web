@@ -7,7 +7,8 @@ Usage:
   tools/boot_summary.py --compare-last [N] [--root H:/]   (newest run vs the one N runs before)
 
 Covers: run length, how it ended (fault_record with symbols via guest_symbols, the docs/HARD_STOPS.md
-status of an unimplemented COM slot, or a run limit), milestones and the draws/frame timeline, fps
+status of an unimplemented COM slot, or a run limit), a `stop:` row (slot/API, hard-stop status, time,
+present index; a not-yet-seen stop is appended to <run root>/stops_seen.json with a survey refresh command), milestones and the draws/frame timeline, fps
 percentiles, GPU errors, shader pack hits/misses, top drop programs, audio, bink, memory budget peak,
 pipeline prewarm and native executor stats. Sections whose data the report lacks are skipped.
 Output holds counts, addresses and symbol names only (no game bytes).
@@ -280,6 +281,64 @@ def _ending(report: dict[str, Any], syms: "gs.PeSymbols | None", hard_stops: str
     return out
 
 
+def stop_info(report: dict[str, Any], hard_stops: str | None = None) -> dict[str, Any] | None:
+    """Where the run ended, None when it did not fault: `key` (stable id: `iface[slot]` of an unimplemented
+    COM slot, else `kind@target`), `name`, `hard_stop` (HARD_STOPS.md status, '' when not a slot, 'unlisted'
+    when the slot is not in the file), `elapsed_ms` and `present_index` (presents completed before the stop)."""
+    rec = fault_info(report)
+    if rec is None:
+        return None
+    slot = gs.find_unimplemented(report)
+    if slot:
+        short = str(slot["iface"]).split(".")[-1]
+        key = f"{short}[{slot['slot']}]"
+        name = slot.get("name") or key
+        st = gs.slot_hard_stop(hard_stops, slot) or "unlisted"
+    else:
+        target = rec.get("target") or rec.get("rip") or "?"
+        key = f"{rec.get('kind')}@{target}"
+        name, st = key, ""
+    return {"key": key, "name": str(name), "hard_stop": st, "elapsed_ms": _n(rec.get("elapsed_ms")
+            if rec.get("elapsed_ms") is not None else report.get("elapsed_ms")),
+            "present_index": int(_total_presents(report)), "kind": str(rec.get("kind"))}
+
+
+def stop_line(info: dict[str, Any] | None) -> str:
+    if info is None:
+        return "stop: none (no fault)"
+    return (f"stop: {info['name']}" + (f" [{info['key']}]" if info["name"] != info["key"] else "")
+            + (f", hard stop: {info['hard_stop']}" if info["hard_stop"] else "")
+            + f", {_dur(info['elapsed_ms'])} into boot, present #{info['present_index']}")
+
+
+STOPS_SEEN = "stops_seen.json"
+
+
+def feed_stop(run_dir: Path, info: dict[str, Any] | None, hard_stops: str | None = None) -> str | None:
+    """Re-survey feed: when the run ended on a stop not yet in `<run root>/stops_seen.json` (the run dir's
+    parent), append it and return the one command that refreshes the stop survey; None otherwise."""
+    if info is None or info["hard_stop"] not in ("", "unlisted"):
+        return None  # no stop, or a listed hard stop (never ranked by the survey)
+    f = run_dir.parent / STOPS_SEEN
+    try:
+        seen = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else []
+    except (OSError, ValueError):
+        seen = []
+    if not isinstance(seen, list):
+        seen = []
+    if any(isinstance(e, dict) and e.get("key") == info["key"] for e in seen):
+        return None
+    seen.append({"key": info["key"], "run": run_dir.name, "elapsed_ms": info["elapsed_ms"],
+                 "present_index": info["present_index"], "hard_stop": info["hard_stop"]})
+    try:
+        f.write_text(json.dumps(seen, indent=1) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return (f"new stop {info['key']}: refresh the survey with `python tools/surface_survey.py --pe <exe> "
+            f"--recomp target/release/playgta6-recomp --targets <indirect-targets.txt> --stop {info['key']} "
+            f"--json-out survey.json` (see {f})")
+
+
 def _identity(report: dict[str, Any]) -> list[str]:
     """`build:` and `launch:` lines from the report's build / run blocks (absent in older reports)."""
     out: list[str] = []
@@ -303,6 +362,7 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
              + (f"browser {report.get('preset')}, {_i(c.get('presents'))} presents"
                 if report.get("runner") == "browser" else f"{_i(c.get('dispatches'))} dispatches"))
     L += _ending(report, syms, hard_stops)
+    L.append(stop_line(stop_info(report, hard_stops)))
     ms = report.get("milestones") or []
     if ms:
         seen: dict[str, Any] = {}
@@ -527,10 +587,16 @@ def last_runs(root: str | Path, n: int) -> list[Path]:
     return [reports[-(n + 1)], reports[-1]]
 
 
-def render_path(path: str | Path, pe: str | None = None) -> str:
+def render_path(path: str | Path, pe: str | None = None, feed: bool = True) -> str:
     syms = gs.PeSymbols.from_path(pe) if pe else None
     md = HARD_STOPS.read_text(encoding="utf-8") if HARD_STOPS.is_file() else None
-    return summarize(load(path), syms, md)
+    out = summarize(load(path), syms, md)
+    p = Path(path)
+    if feed and p.is_dir():
+        cmd = feed_stop(p, stop_info(load(p), md), md)
+        if cmd:
+            out += "\n" + cmd
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -541,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="compare the newest run with the one N runs before it (default 1), found via run_history "
                          "discovery under --root (default H:/)")
     ap.add_argument("--root", default="H:/", help="build-dir root for --compare-last (see tools/run_history.py)")
+    ap.add_argument("--no-feed", action="store_true", help="do not record the stop in <run root>/stops_seen.json")
     ap.add_argument("--pe", help="game PE (read-only) to name fault addresses")
     args = ap.parse_args(argv)
     try:
@@ -551,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.compare:
             print(compare(load(args.compare[0]), load(args.compare[1])))
         elif args.report:
-            print(render_path(args.report, args.pe))
+            print(render_path(args.report, args.pe, not args.no_feed))
         else:
             ap.error("give a report or --compare A B")
     except (OSError, ValueError) as exc:

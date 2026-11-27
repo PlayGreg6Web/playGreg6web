@@ -237,3 +237,58 @@ class BootSummaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopRowTests(unittest.TestCase):
+    HS = ("## 1. Stores\n\n| Slot | Function | Today |\n|---|---|---|\n"
+          "| XStore 3 | QueryLicense | Stub: owner decision |\n")
+
+    @staticmethod
+    def slot_fault(iface, slot, name):
+        r = base()
+        r["status"] = "fault"
+        r["fault_record"] = {"kind": "unimplemented_slot", "elapsed_ms": 5000, "rip": "0x1", "target": "0x2",
+                             "unimplemented_slot": {"interface": iface, "guid": "g", "slot": slot, "name": name}}
+        return r
+
+    def test_no_fault_has_no_stop(self):
+        self.assertIsNone(bs.stop_info(base()))
+        self.assertIn("stop: none", bs.summarize(base()))
+
+    def test_slot_stop_row(self):
+        r = self.slot_fault("xgameruntime.XStore", 3, "QueryLicense")
+        info = bs.stop_info(r, self.HS)
+        self.assertEqual((info["key"], info["present_index"]), ("XStore[3]", 5))
+        line = bs.stop_line(info)
+        self.assertIn("QueryLicense", line)
+        self.assertIn("hard stop:", line)
+        self.assertIn("5.0s into boot, present #5", line)
+        self.assertIn("stop: QueryLicense", bs.summarize(r, None, self.HS))
+
+    def test_unlisted_slot_and_plain_fault(self):
+        self.assertEqual(bs.stop_info(self.slot_fault("xgameruntime.XNew", 9, None), self.HS)["hard_stop"], "unlisted")
+        r = base()
+        r["fault_record"] = {"kind": "access_violation", "elapsed_ms": 10, "target": "0xdead"}
+        self.assertEqual(bs.stop_info(r)["key"], "access_violation@0xdead")
+
+    def test_feed_records_new_stop_once(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            run = root / "run1"
+            run.mkdir()
+            info = bs.stop_info(self.slot_fault("xgameruntime.XNew", 9, "Foo"), self.HS)
+            cmd = bs.feed_stop(run, info, self.HS)
+            self.assertIn("surface_survey.py", cmd)
+            seen = json.loads((root / "stops_seen.json").read_text(encoding="utf-8"))
+            self.assertEqual([e["key"] for e in seen], ["XNew[9]"])
+            self.assertIsNone(bs.feed_stop(run, info, self.HS))
+            self.assertEqual(len(json.loads((root / "stops_seen.json").read_text(encoding="utf-8"))), 1)
+
+    def test_feed_skips_listed_hard_stop_and_no_fault(self):
+        with tempfile.TemporaryDirectory() as t:
+            run = Path(t) / "run1"
+            run.mkdir()
+            info = bs.stop_info(self.slot_fault("xgameruntime.XStore", 3, "QueryLicense"), self.HS)
+            self.assertIsNone(bs.feed_stop(run, info, self.HS))
+            self.assertIsNone(bs.feed_stop(run, None))
+            self.assertFalse((Path(t) / "stops_seen.json").exists())
