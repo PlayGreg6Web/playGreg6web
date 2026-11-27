@@ -1,16 +1,111 @@
 #!/usr/bin/env python3
 """Print the faulting host stack from a playgta6_boot fault minidump.
 
-Usage: minidump_stack.py <dump.dmp | boot-report.json> [--pdb-dir DIR] [--cdb PATH]
+Usage: minidump_stack.py <dump.dmp | boot-report.json> [--pdb-dir DIR] [--exe-dir DIR] [--cdb PATH]
+                         [--guest-exe PATH] [--no-symbols]
 
 A report argument uses fault_record.minidump. Uses cdb.exe when installed (best: full symbols),
-otherwise parses the dump's exception stream and stack memory with the stdlib and prints
-module+offset frames (resolve with the harness PDB via cdb/WinDbg when available).
+otherwise parses the dump's exception stream and stack memory with the stdlib. Host frames are then
+symbolized through Windows' own dbghelp.dll (ctypes) to function+file:line, using the harness
+playgta6_boot.exe/.pdb from --exe-dir/--pdb-dir (default: the module path recorded in the dump).
+A missing or mismatched PDB degrades to module+offset. --guest-exe names the guest PE: frames inside
+its image range are described through tools/guest_symbols.py (names only, never code bytes).
 Dumps hold no full memory and stay local: do not commit them.
 """
 import argparse, json, os, shutil, struct, subprocess, sys
 
 STREAM_THREADS, STREAM_MODULES, STREAM_EXCEPTION, STREAM_MEMORY = 3, 4, 6, 5
+HARNESS_IMAGE = "playgta6_boot.exe"
+
+
+class DbgHelp:
+    """Thin ctypes wrapper over dbghelp.dll (Windows only)."""
+
+    def __init__(self, search_path=None):
+        import ctypes
+        from ctypes import wintypes
+        self.ct, self.wt = ctypes, wintypes
+        self.dll = ctypes.WinDLL("dbghelp.dll")
+        self.proc = ctypes.c_void_p(-1)  # pseudo handle: no real process behind it
+        self.dll.SymSetOptions(0x2 | 0x4 | 0x10)  # UNDNAME | DEFERRED_LOADS | LOAD_LINES
+        self.dll.SymInitializeW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.BOOL]
+        if not self.dll.SymInitializeW(self.proc, search_path, False):
+            raise OSError("SymInitializeW failed")
+        self.dll.SymLoadModuleExW.restype = ctypes.c_uint64
+        self.dll.SymLoadModuleExW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                              ctypes.c_uint64, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        self.dll.SymFromAddrW.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+                                          ctypes.c_void_p]
+        self.dll.SymGetLineFromAddrW64.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(wintypes.DWORD),
+                                                   ctypes.c_void_p]
+
+        class SYMBOL_INFOW(ctypes.Structure):
+            _fields_ = [("SizeOfStruct", ctypes.c_uint32), ("TypeIndex", ctypes.c_uint32),
+                        ("Reserved", ctypes.c_uint64 * 2), ("Index", ctypes.c_uint32), ("Size", ctypes.c_uint32),
+                        ("ModBase", ctypes.c_uint64), ("Flags", ctypes.c_uint32), ("Value", ctypes.c_uint64),
+                        ("Address", ctypes.c_uint64), ("Register", ctypes.c_uint32), ("Scope", ctypes.c_uint32),
+                        ("Tag", ctypes.c_uint32), ("NameLen", ctypes.c_uint32), ("MaxNameLen", ctypes.c_uint32),
+                        ("Name", ctypes.c_wchar * 1024)]
+
+        class IMAGEHLP_LINEW64(ctypes.Structure):
+            _fields_ = [("SizeOfStruct", ctypes.c_uint32), ("Key", ctypes.c_void_p), ("LineNumber", ctypes.c_uint32),
+                        ("FileName", ctypes.c_wchar_p), ("Address", ctypes.c_uint64)]
+
+        self.SYM, self.LINE = SYMBOL_INFOW, IMAGEHLP_LINEW64
+
+    def load(self, image, base, size):
+        return bool(self.dll.SymLoadModuleExW(self.proc, None, image, None, base, size, None, 0))
+
+    def resolve(self, addr):
+        """'func+0xoff (file:line)' or None (no symbol)."""
+        ct = self.ct
+        si = self.SYM()
+        si.SizeOfStruct = 88  # sizeof(SYMBOL_INFOW) without the name buffer
+        si.MaxNameLen = 1024
+        disp = ct.c_uint64(0)
+        if not self.dll.SymFromAddrW(self.proc, addr, ct.byref(disp), ct.byref(si)):
+            return None
+        out = "%s+0x%x" % (si.Name, disp.value)
+        ln = self.LINE()
+        ln.SizeOfStruct = ct.sizeof(self.LINE)
+        d32 = self.wt.DWORD(0)
+        if self.dll.SymGetLineFromAddrW64(self.proc, addr, ct.byref(d32), ct.byref(ln)):
+            out += " (%s:%d)" % (ln.FileName, ln.LineNumber)
+        return out
+
+
+class Symbolizer:
+    """Address -> text. `backend` provides load(image, base, size)->bool and resolve(addr)->str|None
+    (DbgHelp, or a mock in tests). `modules` is [(base, size, full_path)]."""
+
+    def __init__(self, modules, backend=None, dirs=(), guest=None, exists=os.path.exists):
+        self.modules, self.backend, self.guest = modules, backend, guest
+        self.loaded = {}
+        self.notes = []
+        for base, size, path in modules if backend is not None else ():
+            name = os.path.basename(path)
+            if name.lower() != HARNESS_IMAGE:
+                continue  # system DLLs would need a symbol server; module+offset is enough for them
+            image = next((c for c in [os.path.join(d, name) for d in dirs] + [path] if exists(c)), None)
+            if image is None:
+                self.notes.append("no %s found (pass --exe-dir): module+offset only" % name)
+                continue
+            self.loaded[name] = backend.load(image, base, size)
+            if not self.loaded[name]:
+                self.notes.append("dbghelp could not load %s" % image)
+
+    def describe(self, a):
+        for base, size, path in self.modules:
+            if base <= a < base + size:
+                name = os.path.basename(path)
+                text = "%s+0x%x" % (name, a - base)
+                if self.loaded.get(name):
+                    r = self.backend.resolve(a)
+                    text += "  " + r if r else "  (no symbol: PDB missing or from another build)"
+                return text
+        if self.guest is not None and self.guest.contains(a):
+            return "guest " + self.guest.describe(a)
+        return None
 
 
 def resolve_dump(arg):
@@ -48,11 +143,26 @@ def parse(data):
     return streams
 
 
+def read_modules(data, streams):
+    modules = []
+    if STREAM_MODULES in streams:
+        _s, rva = streams[STREAM_MODULES]
+        (n,) = struct.unpack_from("<I", data, rva)
+        for i in range(n):
+            base, size, _cs, _ts, name_rva = struct.unpack_from("<QIIII", data, rva + 4 + 108 * i)
+            (nlen,) = struct.unpack_from("<I", data, name_rva)
+            modules.append((base, size, data[name_rva + 4:name_rva + 4 + nlen].decode("utf-16-le")))
+    return modules
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump")
     ap.add_argument("--pdb-dir")
     ap.add_argument("--cdb")
+    ap.add_argument("--exe-dir", help="dir with playgta6_boot.exe + .pdb (default: path recorded in the dump)")
+    ap.add_argument("--guest-exe", help="guest PE for naming guest-address frames (guest_symbols.py)")
+    ap.add_argument("--no-symbols", action="store_true", help="skip dbghelp symbolization")
     args = ap.parse_args()
     path = resolve_dump(args.dump)
     cdb = find_cdb(args.cdb)
@@ -62,15 +172,7 @@ def main():
         sys.exit(subprocess.call(cmd))
     data = open(path, "rb").read()
     streams = parse(data)
-    modules = []
-    if STREAM_MODULES in streams:
-        _s, rva = streams[STREAM_MODULES]
-        (n,) = struct.unpack_from("<I", data, rva)
-        for i in range(n):
-            base, size, _cs, _ts, name_rva = struct.unpack_from("<QIIII", data, rva + 4 + 108 * i)
-            (nlen,) = struct.unpack_from("<I", data, name_rva)
-            name = data[name_rva + 4:name_rva + 4 + nlen].decode("utf-16-le")
-            modules.append((base, size, os.path.basename(name)))
+    modules = read_modules(data, streams)
     if STREAM_EXCEPTION not in streams:
         sys.exit("dump has no exception stream (guest-fault dump): install cdb for thread stacks")
     _s, rva = streams[STREAM_EXCEPTION]
@@ -81,11 +183,25 @@ def main():
     rsp = struct.unpack_from("<Q", data, ctx_rva + 0x98)[0]
     rip = struct.unpack_from("<Q", data, ctx_rva + 0xF8)[0]
 
-    def loc(a):
-        for base, size, name in modules:
-            if base <= a < base + size:
-                return "%s+0x%x" % (name, a - base)
-        return None
+    guest = None
+    if args.guest_exe:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import guest_symbols
+        try:
+            guest = guest_symbols.PeSymbols.from_path(args.guest_exe)
+        except (OSError, ValueError) as e:
+            print("guest exe unusable: %s" % e)
+    dirs = [d for d in (args.exe_dir, args.pdb_dir) if d]
+    backend = None
+    if not args.no_symbols and os.name == "nt":
+        try:
+            backend = DbgHelp(";".join(dirs) or None)
+        except OSError as e:
+            print("dbghelp unavailable: %s" % e)
+    sym = Symbolizer(modules, backend, dirs, guest)
+    for n in sym.notes:
+        print("note: " + n)
+    loc = sym.describe
 
     print("exception 0x%08x at 0x%x (%s) thread %d" % (code, addr, loc(addr) or "?", tid))
     if nparams >= 2:
@@ -106,7 +222,7 @@ def main():
         print("stack memory not in dump")
         return
     start, size, mrva = mem
-    print("candidate return addresses (module+offset):")
+    print("candidate return addresses (module+offset  function (file:line)):")
     shown = 0
     for a in range(rsp - start, size - 7, 8):
         (w,) = struct.unpack_from("<Q", data, mrva + a)
@@ -116,7 +232,8 @@ def main():
             shown += 1
             if shown >= 40:
                 break
-    print("Resolve offsets with the harness PDB: cdb -z <dump> -c '.sympath+ <pdb dir>;.ecxr;kn;q'")
+    if not any(sym.loaded.values()):
+        print("(no symbols loaded: pass --exe-dir <dir with playgta6_boot.exe/.pdb> or use cdb)")
 
 
 if __name__ == "__main__":
