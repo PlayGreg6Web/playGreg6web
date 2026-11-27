@@ -1,3 +1,4 @@
+pub mod binding_pack;
 pub mod compat;
 pub mod convert;
 pub mod dxbc;

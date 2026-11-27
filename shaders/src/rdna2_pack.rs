@@ -24,6 +24,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use crate::binding_pack::{
+    BindingPackStats, PackBindingLimitSummary, StageBindingLimits,
+};
 use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
 use crate::pack::{
@@ -253,6 +256,7 @@ pub struct Rdna2PackEntrySummary {
     pub bvh_ops: u32,
     pub raw_address: bool,
     pub atomic64: bool,
+    pub binding_pack: BindingPackStats,
 }
 
 /// Strictly sanitized record of an individual shader that failed packing (zero host paths,
@@ -291,6 +295,7 @@ pub struct Rdna2PackSummary {
     pub fragment_packed: usize,
     pub compute_packed: usize,
     pub pack_bytes: usize,
+    pub binding_limits: PackBindingLimitSummary,
     pub entries: Vec<Rdna2PackEntrySummary>,
     pub failures: Vec<Rdna2PackFailureSummary>,
 }
@@ -353,6 +358,9 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  \"fragment_packed\": {},", self.fragment_packed);
         let _ = writeln!(out, "  \"compute_packed\": {},", self.compute_packed);
         let _ = writeln!(out, "  \"pack_bytes\": {},", self.pack_bytes);
+        out.push_str("  \"binding_limits\": ");
+        self.binding_limits.write_json(&mut out, "  ");
+        out.push_str(",\n");
         if self.entries.is_empty() {
             out.push_str("  \"entries\": [],\n");
         } else {
@@ -497,6 +505,7 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  largest_wgsl_bytes: {}", self.largest_wgsl_bytes);
         let _ = writeln!(out, "  total_wgsl_bytes:  {}", self.total_wgsl_bytes);
         let _ = writeln!(out, "  pack_bytes:        {}", self.pack_bytes);
+        self.binding_limits.write_text(&mut out);
         if !self.failures.is_empty() {
             let _ = writeln!(out, "  failures ({}):", self.failures.len());
             for failure in &self.failures {
@@ -1584,6 +1593,18 @@ fn build_pack_result(
         })?;
     debug_assert_eq!(expected_pack_bytes, written.bytes.len() as u64);
 
+    let mut binding_limits = PackBindingLimitSummary::default();
+    let d3d12_limits = StageBindingLimits::webgpu_d3d12();
+    for es in &entry_summaries {
+        binding_limits.record_wgsl_stage(
+            &es.bindings,
+            es.rt_arena,
+            es.mesh_output.is_some(),
+            es.binding_pack,
+            d3d12_limits,
+        );
+    }
+
     let summary = Rdna2PackSummary {
         pack_version: written.version,
         total_blobs: state.total_blobs,
@@ -1606,6 +1627,7 @@ fn build_pack_result(
         fragment_packed: pixel_count,
         compute_packed: compute_count,
         pack_bytes: written.bytes.len(),
+        binding_limits,
         entries: entry_summaries,
         failures: state.failures,
     };
@@ -1667,6 +1689,7 @@ struct TranslatedStageData {
     bvh_ops: u32,
     raw_address: bool,
     atomic64: bool,
+    binding_pack: BindingPackStats,
 }
 
 impl TranslatedStageData {
@@ -1689,6 +1712,7 @@ impl TranslatedStageData {
             bvh_ops: output.bvh_ops,
             raw_address: output.raw_address,
             atomic64: output.atomic64,
+            binding_pack: output.binding_pack,
         }
     }
 
@@ -1718,6 +1742,7 @@ impl TranslatedStageData {
             bvh_ops: self.bvh_ops,
             raw_address: self.raw_address,
             atomic64: self.atomic64,
+            binding_pack: self.binding_pack,
         };
         (entry, summary)
     }
@@ -3310,6 +3335,18 @@ fn finalize_streaming_pack(
 
     let write_summary = stream.finish()?;
 
+    let mut binding_limits = PackBindingLimitSummary::default();
+    let d3d12_limits = StageBindingLimits::webgpu_d3d12();
+    for es in &entry_summaries {
+        binding_limits.record_wgsl_stage(
+            &es.bindings,
+            es.rt_arena,
+            es.mesh_output.is_some(),
+            es.binding_pack,
+            d3d12_limits,
+        );
+    }
+
     let summary = Rdna2PackSummary {
         pack_version: write_summary.version,
         total_blobs: state.total_blobs,
@@ -3332,6 +3369,7 @@ fn finalize_streaming_pack(
         fragment_packed: pixel_count,
         compute_packed: compute_count,
         pack_bytes: usize::try_from(write_summary.total_bytes).unwrap_or(usize::MAX),
+        binding_limits,
         entries: entry_summaries,
         failures: state.failures,
     };

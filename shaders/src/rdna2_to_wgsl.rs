@@ -28,6 +28,12 @@ use naga::{
     SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
 };
 
+use crate::binding_pack::{
+    BindingPackStats, MESH_OUTPUT_STORAGE_BUFFER_COUNT, RT_ARENA_STORAGE_BUFFER_COUNT,
+    StageBindingLimits, WEBGPU_D3D12_MAX_STORAGE_BUFFERS_PER_STAGE,
+    WEBGPU_D3D12_MAX_UNIFORM_BUFFERS_PER_STAGE, canonicalize_binding_source,
+    compact_module_bindings,
+};
 use crate::convert::{ShaderStage, format_shader_hash};
 use crate::pack::write_json_string;
 use crate::rdna2::{
@@ -478,7 +484,7 @@ pub struct LaneIndexedHeapSource {
 
 /// Origin of a reflected binding in console user-data SGPRs or static samplers
 /// (`runtime/gpu/stage_reflection.h` / `tools/stage_reflection_sidecar.py`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WgslBindingSource {
     /// Descriptor loaded from a descriptor table whose 32-bit pointer lives in `user_sgpr`
     /// (s8+ for graphics, s4+ for compute) at `table_byte_offset` bytes into the table.
@@ -855,6 +861,7 @@ pub struct Rdna2WgslOutput {
     pub raw_address: bool,
     pub atomic64: bool,
     pub binding_summary: Rdna2BindingSummary,
+    pub binding_pack: BindingPackStats,
 }
 
 impl Rdna2WgslOutput {
@@ -935,6 +942,17 @@ impl Rdna2WgslOutput {
         }
         if self.atomic64 {
             out.push_str("  \"atomic64\": true,\n");
+        }
+        if !self.binding_pack.is_zero() {
+            let bp = self.binding_pack;
+            let _ = writeln!(
+                out,
+                "  \"binding_pack\": {{\"dead_bindings_pruned\": {}, \"duplicate_bindings_folded\": {}, \"cbv_merged_into_storage\": {}, \"uniform_promoted_to_storage\": {}}},",
+                bp.dead_bindings_pruned,
+                bp.duplicate_bindings_folded,
+                bp.cbv_merged_into_storage,
+                bp.uniform_promoted_to_storage
+            );
         }
 
         // binding_summary
@@ -1754,7 +1772,6 @@ struct ProgramPlan {
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
     cbv_slots: Vec<CbvSlotPlan>,
-    cbv_vec4_count: u32,
     tex_slots: Vec<ResourceKey>,
     samp_slots: Vec<ResourceKey>,
     storage_buf_slots: Vec<StorageBufSlotPlan>,
@@ -1790,6 +1807,11 @@ struct ProgramPlan {
     raw_address: bool,
     /// `true` when the active program contains 64-bit FLAT/GLOBAL atomic instructions (`0x50..=0x5F`).
     atomic64: bool,
+    /// Storage-buffer keys whose only references in `plan_program` came from unlowered
+    /// `buffer_atomic_*` instructions (kept when within D3D12 limits; pruned if over-limit).
+    atomic_only_storage_keys: BTreeSet<ResourceKey>,
+    /// Number of duplicate/aliased bindings folded during `plan_program` canonicalization.
+    duplicate_bindings_folded: usize,
 }
 
 fn resolve_stage(inferred: Rdna2InferredStage, override_stage: Rdna2StageOverride) -> ShaderStage {
@@ -10554,6 +10576,8 @@ fn plan_program(
     let mut samp_has_non_compare: BTreeSet<ResourceKey> = BTreeSet::new();
     let mut compare_tex_samp_pairs: BTreeSet<(ResourceKey, ResourceKey)> = BTreeSet::new();
     let mut storage_buf_usage: BTreeMap<ResourceKey, bool> = BTreeMap::new();
+    let mut non_atomic_storage_buf_keys: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut atomic_storage_buf_keys: BTreeSet<ResourceKey> = BTreeSet::new();
     let mut storage_tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
     let mut uses_lds = false;
     let mut has_buffer_fetch = false;
@@ -11430,11 +11454,13 @@ fn plan_program(
                             StorageDispatch::TwoWayChoice { keys, .. } => {
                                 for &k in keys {
                                     storage_buf_usage.insert(k, true);
+                                    non_atomic_storage_buf_keys.insert(k);
                                 }
                             }
                             StorageDispatch::BoundedIndexed { keys, .. } => {
                                 for &k in keys {
                                     storage_buf_usage.insert(k, true);
+                                    non_atomic_storage_buf_keys.insert(k);
                                 }
                             }
                         }
@@ -11448,6 +11474,7 @@ fn plan_program(
                             .entry(key)
                             .and_modify(|w| *w |= writable)
                             .or_insert(writable);
+                        non_atomic_storage_buf_keys.insert(key);
                     }
                     if *offen || *idxen {
                         vgprs.insert(*vaddr);
@@ -11496,11 +11523,13 @@ fn plan_program(
                             StorageDispatch::TwoWayChoice { keys, .. } => {
                                 for &k in keys {
                                     storage_buf_usage.insert(k, true);
+                                    atomic_storage_buf_keys.insert(k);
                                 }
                             }
                             StorageDispatch::BoundedIndexed { keys, .. } => {
                                 for &k in keys {
                                     storage_buf_usage.insert(k, true);
+                                    atomic_storage_buf_keys.insert(k);
                                 }
                             }
                         }
@@ -11511,6 +11540,7 @@ fn plan_program(
                             .copied()
                             .unwrap_or(ResourceKey::RawSlot(*srsrc));
                         storage_buf_usage.insert(key, true);
+                        atomic_storage_buf_keys.insert(key);
                     }
                 }
             }
@@ -11564,11 +11594,13 @@ fn plan_program(
                             StorageDispatch::TwoWayChoice { keys, .. } => {
                                 for &k in keys {
                                     storage_buf_usage.insert(k, true);
+                                    non_atomic_storage_buf_keys.insert(k);
                                 }
                             }
                             StorageDispatch::BoundedIndexed { keys, .. } => {
                                 for &k in keys {
                                     storage_buf_usage.insert(k, true);
+                                    non_atomic_storage_buf_keys.insert(k);
                                 }
                             }
                         }
@@ -11582,6 +11614,7 @@ fn plan_program(
                             .entry(key)
                             .and_modify(|w| *w |= writable)
                             .or_insert(writable);
+                        non_atomic_storage_buf_keys.insert(key);
                     }
                     if *offen || *idxen {
                         vgprs.insert(*vaddr);
@@ -12052,6 +12085,236 @@ fn plan_program(
         ps_mrts.push(0);
     }
 
+    // Canonicalize duplicate/aliased descriptor keys before finalizing resource slot plans:
+    // - Power-of-two `stride == 1 << shift` vs `stride == 0` in CBV/lane-indexed heaps
+    // - `RootDescriptor { user_sgpr, table_byte_offset }` vs `Table { user_sgpr, table_byte_offset }`
+    //   when `user_sgpr` is proven to be a descriptor table in the same stage.
+    // Preserves the first-seen key representation so canonical `stride` fields stay unchanged.
+    let mut known_table_sgprs: BTreeSet<u32> = BTreeSet::new();
+    for src in desc_analysis.cbv_sources.values() {
+        if let WgslBindingSource::Table { user_sgpr, .. } = *src {
+            known_table_sgprs.insert(user_sgpr);
+        }
+    }
+    for k in tex_dims
+        .keys()
+        .chain(samp_rsrc_set.iter())
+        .chain(storage_buf_usage.keys())
+        .chain(storage_tex_dims.keys())
+    {
+        if let ResourceKey::Table { user_sgpr, .. } = *k {
+            known_table_sgprs.insert(user_sgpr);
+        }
+    }
+
+    let mut indirect_smem_cbv_keys = indirect_smem_cbv_keys;
+    let mut cbv_sources = desc_analysis.cbv_sources;
+    let mut inst_tex_keys = desc_analysis.inst_tex_keys;
+    let mut inst_samp_keys = desc_analysis.inst_samp_keys;
+    let mut inst_storage_buf_keys = desc_analysis.inst_storage_buf_keys;
+    let mut inst_storage_tex_keys = desc_analysis.inst_storage_tex_keys;
+    let mut inst_storage_buf_dispatches = desc_analysis.inst_storage_buf_dispatches;
+    let mut inst_storage_tex_dispatches = desc_analysis.inst_storage_tex_dispatches;
+    let mut duplicate_bindings_folded = 0usize;
+
+    // 1. Canonicalize CBV keys sharing an identical canonical `WgslBindingSource`.
+    {
+        let mut primary_by_src: BTreeMap<WgslBindingSource, CbvKey> = BTreeMap::new();
+        let mut cbv_remap: BTreeMap<CbvKey, CbvKey> = BTreeMap::new();
+        let mut merged_cbv_usage: BTreeMap<CbvKey, CbvUsage> = BTreeMap::new();
+        for (key, usage) in cbv_usage {
+            let target = if let Some(&raw_src) = cbv_sources.get(&key) {
+                let canon = canonicalize_binding_source(raw_src, &known_table_sgprs);
+                if let Some(&primary) = primary_by_src.get(&canon) {
+                    if primary != key {
+                        cbv_remap.insert(key, primary);
+                        duplicate_bindings_folded += 1;
+                    }
+                    primary
+                } else {
+                    primary_by_src.insert(canon, key);
+                    key
+                }
+            } else {
+                key
+            };
+            merged_cbv_usage
+                .entry(target)
+                .and_modify(|u| {
+                    u.max_vec4_index = u.max_vec4_index.max(usage.max_vec4_index);
+                    u.has_dynamic_offset |= usage.has_dynamic_offset;
+                })
+                .or_insert(usage);
+        }
+        cbv_usage = merged_cbv_usage;
+        if !cbv_remap.is_empty() {
+            for k in indirect_smem_cbv_keys.values_mut() {
+                if let Some(&primary) = cbv_remap.get(k) {
+                    *k = primary;
+                }
+            }
+            for dup in cbv_remap.keys() {
+                cbv_sources.remove(dup);
+            }
+        }
+    }
+
+    // Helper to build a `ResourceKey -> primary ResourceKey` canonicalization map for one class.
+    let canonicalize_rsrc_keys = |keys: &[ResourceKey], folded: &mut usize| -> BTreeMap<ResourceKey, ResourceKey> {
+        let mut primary_by_src: BTreeMap<WgslBindingSource, ResourceKey> = BTreeMap::new();
+        let mut remap: BTreeMap<ResourceKey, ResourceKey> = BTreeMap::new();
+        for &k in keys {
+            if let Some(raw_src) = k.to_source() {
+                let canon = canonicalize_binding_source(raw_src, &known_table_sgprs);
+                if let Some(&primary) = primary_by_src.get(&canon) {
+                    if primary != k {
+                        remap.insert(k, primary);
+                        *folded += 1;
+                    }
+                } else {
+                    primary_by_src.insert(canon, k);
+                }
+            }
+        }
+        remap
+    };
+
+    // 2. Canonicalize sampled textures & samplers.
+    let tex_key_list: Vec<ResourceKey> = tex_dims.keys().copied().collect();
+    let tex_remap = canonicalize_rsrc_keys(&tex_key_list, &mut duplicate_bindings_folded);
+    if !tex_remap.is_empty() {
+        let map_t = |k: ResourceKey| tex_remap.get(&k).copied().unwrap_or(k);
+        let mut new_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
+        for (k, d) in tex_dims {
+            let pk = map_t(k);
+            new_dims
+                .entry(pk)
+                .and_modify(|cur| *cur = cur.merge(d))
+                .or_insert(d);
+        }
+        tex_dims = new_dims;
+        tex_has_compare = tex_has_compare.into_iter().map(map_t).collect();
+        tex_has_non_compare = tex_has_non_compare.into_iter().map(map_t).collect();
+        tex_has_load = tex_has_load.into_iter().map(map_t).collect();
+        compare_tex_samp_pairs = compare_tex_samp_pairs
+            .into_iter()
+            .map(|(tk, sk)| (map_t(tk), sk))
+            .collect();
+        for tk in inst_tex_keys.values_mut() {
+            *tk = map_t(*tk);
+        }
+    }
+
+    let samp_key_list: Vec<ResourceKey> = samp_rsrc_set.iter().copied().collect();
+    let samp_remap = canonicalize_rsrc_keys(&samp_key_list, &mut duplicate_bindings_folded);
+    if !samp_remap.is_empty() {
+        let map_s = |k: ResourceKey| samp_remap.get(&k).copied().unwrap_or(k);
+        samp_rsrc_set = samp_rsrc_set.into_iter().map(map_s).collect();
+        samp_has_compare = samp_has_compare.into_iter().map(map_s).collect();
+        samp_has_non_compare = samp_has_non_compare.into_iter().map(map_s).collect();
+        compare_tex_samp_pairs = compare_tex_samp_pairs
+            .into_iter()
+            .map(|(tk, sk)| (tk, map_s(sk)))
+            .collect();
+        for sk in inst_samp_keys.values_mut() {
+            *sk = map_s(*sk);
+        }
+    }
+
+    // 3. Canonicalize storage buffers and collapse trivial identical dispatches.
+    let sbuf_key_list: Vec<ResourceKey> = storage_buf_usage.keys().copied().collect();
+    let sbuf_remap = canonicalize_rsrc_keys(&sbuf_key_list, &mut duplicate_bindings_folded);
+    if !sbuf_remap.is_empty() {
+        let map_sb = |k: ResourceKey| sbuf_remap.get(&k).copied().unwrap_or(k);
+        let mut new_usage: BTreeMap<ResourceKey, bool> = BTreeMap::new();
+        for (k, w) in storage_buf_usage {
+            let pk = map_sb(k);
+            new_usage.entry(pk).and_modify(|cur| *cur |= w).or_insert(w);
+        }
+        storage_buf_usage = new_usage;
+        non_atomic_storage_buf_keys = non_atomic_storage_buf_keys.into_iter().map(map_sb).collect();
+        atomic_storage_buf_keys = atomic_storage_buf_keys.into_iter().map(map_sb).collect();
+        for k in inst_storage_buf_keys.values_mut() {
+            *k = map_sb(*k);
+        }
+        let mut collapsed_buf_dispatches = Vec::new();
+        for (&inst_idx, disp) in &mut inst_storage_buf_dispatches {
+            match disp {
+                StorageDispatch::TwoWayChoice { keys, .. } => {
+                    keys[0] = map_sb(keys[0]);
+                    keys[1] = map_sb(keys[1]);
+                    if keys[0] == keys[1] {
+                        collapsed_buf_dispatches.push((inst_idx, keys[0]));
+                    }
+                }
+                StorageDispatch::BoundedIndexed { keys, .. } => {
+                    for k in keys.iter_mut() {
+                        *k = map_sb(*k);
+                    }
+                    if let Some(&first) = keys.first()
+                        && keys.iter().all(|&k| k == first)
+                    {
+                        collapsed_buf_dispatches.push((inst_idx, first));
+                    }
+                }
+            }
+        }
+        for (inst_idx, single_key) in collapsed_buf_dispatches {
+            inst_storage_buf_dispatches.remove(&inst_idx);
+            inst_storage_buf_keys.insert(inst_idx, single_key);
+        }
+    }
+
+    // 4. Canonicalize storage textures and collapse trivial identical dispatches.
+    let stex_key_list: Vec<ResourceKey> = storage_tex_dims.keys().copied().collect();
+    let stex_remap = canonicalize_rsrc_keys(&stex_key_list, &mut duplicate_bindings_folded);
+    if !stex_remap.is_empty() {
+        let map_st = |k: ResourceKey| stex_remap.get(&k).copied().unwrap_or(k);
+        let mut new_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
+        for (k, d) in storage_tex_dims {
+            let pk = map_st(k);
+            new_dims
+                .entry(pk)
+                .and_modify(|cur| *cur = cur.merge(d))
+                .or_insert(d);
+        }
+        storage_tex_dims = new_dims;
+        for k in inst_storage_tex_keys.values_mut() {
+            *k = map_st(*k);
+        }
+        let mut collapsed_tex_dispatches = Vec::new();
+        for (&inst_idx, disp) in &mut inst_storage_tex_dispatches {
+            match disp {
+                StorageDispatch::TwoWayChoice { keys, .. } => {
+                    keys[0] = map_st(keys[0]);
+                    keys[1] = map_st(keys[1]);
+                    if keys[0] == keys[1] {
+                        collapsed_tex_dispatches.push((inst_idx, keys[0]));
+                    }
+                }
+                StorageDispatch::BoundedIndexed { keys, .. } => {
+                    for k in keys.iter_mut() {
+                        *k = map_st(*k);
+                    }
+                    if let Some(&first) = keys.first()
+                        && keys.iter().all(|&k| k == first)
+                    {
+                        collapsed_tex_dispatches.push((inst_idx, first));
+                    }
+                }
+            }
+        }
+        for (inst_idx, single_key) in collapsed_tex_dispatches {
+            inst_storage_tex_dispatches.remove(&inst_idx);
+            inst_storage_tex_keys.insert(inst_idx, single_key);
+        }
+    }
+
+    let atomic_only_storage_keys: BTreeSet<ResourceKey> = atomic_storage_buf_keys
+        .difference(&non_atomic_storage_buf_keys)
+        .copied()
+        .collect();
+
     // WGSL forbids `textureLoad` on cube/cube-array textures; downgrade any texture that
     // also executes `image_load` from Cube/CubeArray to D2Array.
     for key in &tex_has_load {
@@ -12122,12 +12385,6 @@ fn plan_program(
         .collect();
     let storage_tex_slots: Vec<ResourceKey> = storage_tex_dims.keys().copied().collect();
 
-    let cbv_vec4_count = cbv_slots
-        .iter()
-        .map(|slot| slot.vec4_count)
-        .max()
-        .unwrap_or(0);
-
     let mut bvh_ops: u32 = 0;
     let mut raw_address = false;
     let mut atomic64 = false;
@@ -12178,13 +12435,13 @@ fn plan_program(
         legacy_uv_attr_index,
         vsharp_fetch_insts,
         indirect_smem_cbv_keys,
-        cbv_sources: desc_analysis.cbv_sources,
-        inst_tex_keys: desc_analysis.inst_tex_keys,
-        inst_samp_keys: desc_analysis.inst_samp_keys,
-        inst_storage_buf_keys: desc_analysis.inst_storage_buf_keys,
-        inst_storage_tex_keys: desc_analysis.inst_storage_tex_keys,
-        inst_storage_buf_dispatches: desc_analysis.inst_storage_buf_dispatches,
-        inst_storage_tex_dispatches: desc_analysis.inst_storage_tex_dispatches,
+        cbv_sources,
+        inst_tex_keys,
+        inst_samp_keys,
+        inst_storage_buf_keys,
+        inst_storage_tex_keys,
+        inst_storage_buf_dispatches,
+        inst_storage_tex_dispatches,
         choice_def_writes: desc_analysis.choice_def_writes,
         choice_count: desc_analysis.choice_count,
         tex_dims,
@@ -12194,7 +12451,6 @@ fn plan_program(
         vertex_storage_buf_insts,
         vertex_fetch_vb_slots,
         cbv_slots,
-        cbv_vec4_count,
         tex_slots,
         samp_slots,
         storage_buf_slots,
@@ -12222,6 +12478,8 @@ fn plan_program(
         bvh_ops,
         raw_address,
         atomic64,
+        atomic_only_storage_keys,
+        duplicate_bindings_folded,
     }
 }
 
@@ -12248,6 +12506,17 @@ enum ConstExprType {
     Vec2F32,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CbvGlobalTarget {
+    Uniform {
+        global: Handle<GlobalVariable>,
+        vec4_count: u32,
+    },
+    Storage {
+        global: Handle<GlobalVariable>,
+    },
+}
+
 struct IrEmitter {
     module: Module,
     types: CommonTypes,
@@ -12263,7 +12532,7 @@ struct IrEmitter {
     choice_sel_locals: Vec<Handle<LocalVariable>>,
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
-    cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)>,
+    cb_globals: BTreeMap<CbvKey, CbvGlobalTarget>,
     tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim, bool)>,
     samp_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
     storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
@@ -12272,6 +12541,9 @@ struct IrEmitter {
     mesh_out_global: Option<Handle<GlobalVariable>>,
     mesh_output: Option<MeshOutputLayout>,
     emitted_bindings: Vec<WgslBindingInfo>,
+    atomic_only_slots: BTreeSet<(u32, u32)>,
+    cbv_merged_into_storage: usize,
+    uniform_promoted_to_storage: usize,
     stage: ShaderStage,
     workgroup_size: [u32; 3],
     compute_seed_wg_sgprs: Vec<(u8, u32)>,
@@ -12452,7 +12724,7 @@ impl IrEmitter {
         //   tex0 -> @group(0) @binding(1)
         //   samp0 -> @group(0) @binding(2)
         //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
-        let mut cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
+        let mut cb_globals: BTreeMap<CbvKey, CbvGlobalTarget> = BTreeMap::new();
         let mut tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim, bool)> =
             BTreeMap::new();
         let mut samp_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)> =
@@ -12463,6 +12735,10 @@ impl IrEmitter {
             BTreeMap::new();
         let mut used_group0_bindings: BTreeSet<(u32, u32)> = BTreeSet::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
+        let mut atomic_only_slots: BTreeSet<(u32, u32)> = BTreeSet::new();
+        let mut cbv_merged_into_storage: usize = 0;
+        let mut uniform_promoted_to_storage: usize = 0;
+        let mut u32_runtime_arr_ty_opt: Option<Handle<Type>> = None;
         let has_any_reflected_binding = plan
             .cbv_slots
             .iter()
@@ -12508,14 +12784,147 @@ impl IrEmitter {
                 3
             };
 
-        if !plan.cbv_slots.is_empty() {
+        // Cross-kind CBV <-> storage-buffer deduplication (#2110):
+        // When a stage exceeds D3D12's 12-uniform-buffer-per-stage ceiling, first merge any
+        // non-RootConstants CBV that shares the exact same canonical descriptor source as an
+        // existing storage buffer directly into that storage buffer (zero extra storage buffer
+        // slots consumed, keeping all under-limit stages' legacy cb+sbuf layout untouched).
+        let mut known_table_sgprs: BTreeSet<u32> = BTreeSet::new();
+        for src in plan.cbv_sources.values() {
+            if let WgslBindingSource::Table { user_sgpr, .. } = *src {
+                known_table_sgprs.insert(user_sgpr);
+            }
+        }
+        for s in &plan.storage_buf_slots {
+            if let Some(WgslBindingSource::Table { user_sgpr, .. }) = s.key.to_source() {
+                known_table_sgprs.insert(user_sgpr);
+            }
+        }
+        let mut storage_key_by_canon_src: BTreeMap<WgslBindingSource, ResourceKey> =
+            BTreeMap::new();
+        for s in &plan.storage_buf_slots {
+            if let Some(raw_src) = s.key.to_source() {
+                let canon = canonicalize_binding_source(raw_src, &known_table_sgprs);
+                storage_key_by_canon_src.entry(canon).or_insert(s.key);
+            }
+        }
+        let mut cbv_merged_to_sbuf: Vec<(CbvKey, ResourceKey)> = Vec::new();
+        let mut standalone_cbv_slots: Vec<&CbvSlotPlan> = Vec::with_capacity(plan.cbv_slots.len());
+        let needs_uniform_reduction =
+            plan.cbv_slots.len() > WEBGPU_D3D12_MAX_UNIFORM_BUFFERS_PER_STAGE;
+        for slot in &plan.cbv_slots {
+            if needs_uniform_reduction
+                && let Some(&raw_src) = plan.cbv_sources.get(&slot.key)
+                && !matches!(raw_src, WgslBindingSource::RootConstants { .. })
+            {
+                let canon = canonicalize_binding_source(raw_src, &known_table_sgprs);
+                if let Some(&sbuf_key) = storage_key_by_canon_src.get(&canon) {
+                    cbv_merged_to_sbuf.push((slot.key, sbuf_key));
+                    continue;
+                }
+            }
+            standalone_cbv_slots.push(slot);
+        }
+
+        // Excess uniform buffer spillover (#2110):
+        // If standalone CBVs still exceed D3D12's 12-uniform-buffer-per-stage hardware ceiling
+        // and the stage has storage-buffer headroom (< 16 including runtime-owned `rt_arena` and
+        // `ms_out`), promote highest-index non-RootConstants CBVs to `var<storage, read>`
+        // (`stage_reflection.cpp` accepts CBV/SRV/UAV for `read_only_storage`, and all guest
+        // D3D12 buffers carry `GpuBufferUsage::Storage`).
+        let mut promoted_cbv_keys: BTreeSet<CbvKey> = BTreeSet::new();
+        let mut remaining_uniforms = standalone_cbv_slots.len();
+        let mut effective_storage_buffers = plan.storage_buf_slots.len()
+            + if plan.rt_arena {
+                RT_ARENA_STORAGE_BUFFER_COUNT
+            } else {
+                0
+            }
+            + if plan.mesh_output.is_some() && plan.stage == ShaderStage::Compute {
+                MESH_OUTPUT_STORAGE_BUFFER_COUNT
+            } else {
+                0
+            };
+        if remaining_uniforms > WEBGPU_D3D12_MAX_UNIFORM_BUFFERS_PER_STAGE
+            && effective_storage_buffers < WEBGPU_D3D12_MAX_STORAGE_BUFFERS_PER_STAGE
+        {
+            for slot in standalone_cbv_slots.iter().rev() {
+                if remaining_uniforms <= WEBGPU_D3D12_MAX_UNIFORM_BUFFERS_PER_STAGE
+                    || effective_storage_buffers >= WEBGPU_D3D12_MAX_STORAGE_BUFFERS_PER_STAGE
+                {
+                    break;
+                }
+                if matches!(
+                    plan.cbv_sources.get(&slot.key),
+                    Some(WgslBindingSource::RootConstants { .. })
+                ) {
+                    continue;
+                }
+                promoted_cbv_keys.insert(slot.key);
+                remaining_uniforms -= 1;
+                effective_storage_buffers += 1;
+            }
+        }
+
+        if !standalone_cbv_slots.is_empty() {
             let mut cbv_struct_by_count: BTreeMap<u32, Handle<Type>> = BTreeMap::new();
-            for (idx, slot) in plan.cbv_slots.iter().enumerate() {
+            let mut uniform_idx = 0usize;
+            for (idx, slot) in standalone_cbv_slots.iter().enumerate() {
+                if promoted_cbv_keys.contains(&slot.key) {
+                    let arr_ty = *u32_runtime_arr_ty_opt.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Array {
+                                base: u32_ty,
+                                size: ArraySize::Dynamic,
+                                stride: 4,
+                            },
+                        )
+                    });
+                    let preferred_binding = binding_base.saturating_add(next_extra_binding);
+                    next_extra_binding = next_extra_binding.saturating_add(1);
+                    let binding_num =
+                        alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
+                    let name = format!("cb{idx}");
+                    let g = module.global_variables.append(
+                        GlobalVariable {
+                            name: Some(name.clone()),
+                            space: AddressSpace::Storage {
+                                access: StorageAccess::LOAD,
+                            },
+                            binding: Some(ResourceBinding {
+                                group: 0,
+                                binding: binding_num,
+                            }),
+                            ty: arr_ty,
+                            init: None,
+                            memory_decorations: MemoryDecorations::empty(),
+                        },
+                        Span::UNDEFINED,
+                    );
+                    cb_globals.insert(slot.key, CbvGlobalTarget::Storage { global: g });
+                    emitted_bindings.push(WgslBindingInfo {
+                        group: 0,
+                        binding: binding_num,
+                        kind: "read-only-storage",
+                        name,
+                        view_dimension: None,
+                        storage_format: None,
+                        min_binding_size_bytes: None,
+                        highest_vec4_offset: None,
+                        source: plan.cbv_sources.get(&slot.key).copied(),
+                    });
+                    uniform_promoted_to_storage += 1;
+                    continue;
+                }
                 let count = slot.vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
                 let byte_size = count
                     .checked_mul(16)
                     .unwrap_or(MAX_CBV_VEC4_COUNT * 16);
                 let highest_vec4_offset = slot.highest_vec4_offset.min(count - 1);
+                let this_uniform_idx = uniform_idx;
+                uniform_idx += 1;
                 let cbv_struct_ty = *cbv_struct_by_count.entry(count).or_insert_with(|| {
                     let arr_ty = insert_type(
                         &mut module,
@@ -12528,10 +12937,10 @@ impl IrEmitter {
                             stride: 16,
                         },
                     );
-                    let struct_name = if idx == 0 {
+                    let struct_name = if this_uniform_idx == 0 {
                         "Rdna2Cbv".to_string()
                     } else {
-                        format!("Rdna2Cbv{idx}")
+                        format!("Rdna2Cbv{this_uniform_idx}")
                     };
                     insert_type(
                         &mut module,
@@ -12547,7 +12956,7 @@ impl IrEmitter {
                         },
                     )
                 });
-                let preferred_binding = binding_base.saturating_add(if idx == 0 {
+                let preferred_binding = binding_base.saturating_add(if this_uniform_idx == 0 {
                     0
                 } else {
                     let b = next_extra_binding;
@@ -12555,7 +12964,7 @@ impl IrEmitter {
                     b
                 });
                 let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
-                let name = format!("cb{idx}");
+                let name = format!("cb{this_uniform_idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
                         name: Some(name.clone()),
@@ -12570,7 +12979,13 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                cb_globals.insert(slot.key, (g, count));
+                cb_globals.insert(
+                    slot.key,
+                    CbvGlobalTarget::Uniform {
+                        global: g,
+                        vec4_count: count,
+                    },
+                );
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -12819,15 +13234,17 @@ impl IrEmitter {
         }
 
         if !plan.storage_buf_slots.is_empty() {
-            let u32_runtime_arr_ty = insert_type(
-                &mut module,
-                None,
-                TypeInner::Array {
-                    base: u32_ty,
-                    size: ArraySize::Dynamic,
-                    stride: 4,
-                },
-            );
+            let u32_runtime_arr_ty = *u32_runtime_arr_ty_opt.get_or_insert_with(|| {
+                insert_type(
+                    &mut module,
+                    None,
+                    TypeInner::Array {
+                        base: u32_ty,
+                        size: ArraySize::Dynamic,
+                        stride: 4,
+                    },
+                )
+            });
             let mut srv_idx = 0u32;
             let mut uav_idx = 0u32;
             for slot in &plan.storage_buf_slots {
@@ -12865,6 +13282,9 @@ impl IrEmitter {
                     Span::UNDEFINED,
                 );
                 storage_buf_globals.insert(slot.key, (g, writable));
+                if plan.atomic_only_storage_keys.contains(&slot.key) {
+                    atomic_only_slots.insert((0, binding_num));
+                }
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -12876,6 +13296,15 @@ impl IrEmitter {
                     highest_vec4_offset: None,
                     source: slot.key.to_source(),
                 });
+            }
+        }
+
+        // Wire cross-kind CBVs that share the exact same canonical descriptor source as an
+        // existing storage buffer directly to that storage buffer's `GlobalVariable`.
+        for (cbv_key, sbuf_key) in cbv_merged_to_sbuf {
+            if let Some(&(g, _)) = storage_buf_globals.get(&sbuf_key) {
+                cb_globals.insert(cbv_key, CbvGlobalTarget::Storage { global: g });
+                cbv_merged_into_storage += 1;
             }
         }
 
@@ -13473,6 +13902,9 @@ impl IrEmitter {
             mesh_out_global,
             mesh_output: plan.mesh_output,
             emitted_bindings,
+            atomic_only_slots,
+            cbv_merged_into_storage,
+            uniform_promoted_to_storage,
             stage: plan.stage,
             workgroup_size: plan.workgroup_size,
             compute_seed_wg_sgprs: plan.compute_seed_wg_sgprs.clone(),
@@ -17645,16 +18077,9 @@ impl IrEmitter {
                 cbv_indexed_heap: None,
                 lane_indexed_heap: None,
             });
-        let Some(&(cb_global, cb_vec4_count)) = self.cb_globals.get(&cbv_key) else {
+        let Some(&cb_target) = self.cb_globals.get(&cbv_key) else {
             return false;
         };
-        let total_dwords = cb_vec4_count.max(1).saturating_mul(4);
-
-        let cb_ptr = self.raw_expr(Expression::GlobalVariable(cb_global));
-        let data_ptr = self.emit_expr(Expression::AccessIndex {
-            base: cb_ptr,
-            index: 0,
-        });
 
         let has_dynamic_offset = soffset != 0x7D && soffset <= 105;
         let base_word_dyn = if has_dynamic_offset {
@@ -17680,69 +18105,134 @@ impl IrEmitter {
         } else {
             0
         };
-        let mut cached_static_vec: Option<(u32, Handle<Expression>)> = None;
 
-        for k in 0..count {
-            let Some(dst_reg) = checked_sgpr_reg(sdata, k) else {
-                break;
-            };
-            let elem_val = if let Some(base_w) = base_word_dyn {
-                let k_lit = self.lit_u32(u32::from(k));
-                let raw_word = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::Add,
-                    left: base_w,
-                    right: k_lit,
+        match cb_target {
+            CbvGlobalTarget::Uniform {
+                global: cb_global,
+                vec4_count: cb_vec4_count,
+            } => {
+                let total_dwords = cb_vec4_count.max(1).saturating_mul(4);
+                let cb_ptr = self.raw_expr(Expression::GlobalVariable(cb_global));
+                let data_ptr = self.emit_expr(Expression::AccessIndex {
+                    base: cb_ptr,
+                    index: 0,
                 });
-                let total_lit = self.lit_u32(total_dwords);
-                let bounded_word = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::Modulo,
-                    left: raw_word,
-                    right: total_lit,
-                });
-                let two = self.lit_u32(2);
-                let vec_idx = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::ShiftRight,
-                    left: bounded_word,
-                    right: two,
-                });
-                let three = self.lit_u32(3);
-                let comp_idx = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::And,
-                    left: bounded_word,
-                    right: three,
-                });
-                let vec_ptr = self.emit_expr(Expression::Access {
-                    base: data_ptr,
-                    index: vec_idx,
-                });
-                let vec_val = self.emit_expr(Expression::Load { pointer: vec_ptr });
-                self.emit_expr(Expression::Access {
-                    base: vec_val,
-                    index: comp_idx,
-                })
-            } else {
-                let word_idx = (static_base_word.saturating_add(u32::from(k))) % total_dwords;
-                let vec_idx = word_idx / 4;
-                let comp_idx = word_idx % 4;
-                let vec_val = match cached_static_vec {
-                    Some((cached_idx, handle)) if cached_idx == vec_idx => handle,
-                    _ => {
-                        let vec_ptr = self.emit_expr(Expression::AccessIndex {
+                let mut cached_static_vec: Option<(u32, Handle<Expression>)> = None;
+
+                for k in 0..count {
+                    let Some(dst_reg) = checked_sgpr_reg(sdata, k) else {
+                        break;
+                    };
+                    let elem_val = if let Some(base_w) = base_word_dyn {
+                        let k_lit = self.lit_u32(u32::from(k));
+                        let raw_word = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: base_w,
+                            right: k_lit,
+                        });
+                        let total_lit = self.lit_u32(total_dwords);
+                        let bounded_word = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Modulo,
+                            left: raw_word,
+                            right: total_lit,
+                        });
+                        let two = self.lit_u32(2);
+                        let vec_idx = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::ShiftRight,
+                            left: bounded_word,
+                            right: two,
+                        });
+                        let three = self.lit_u32(3);
+                        let comp_idx = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::And,
+                            left: bounded_word,
+                            right: three,
+                        });
+                        let vec_ptr = self.emit_expr(Expression::Access {
                             base: data_ptr,
                             index: vec_idx,
                         });
-                        let loaded = self.emit_expr(Expression::Load { pointer: vec_ptr });
-                        cached_static_vec = Some((vec_idx, loaded));
-                        loaded
-                    }
-                };
-                self.emit_expr(Expression::AccessIndex {
-                    base: vec_val,
-                    index: comp_idx,
-                })
-            };
+                        let vec_val = self.emit_expr(Expression::Load { pointer: vec_ptr });
+                        self.emit_expr(Expression::Access {
+                            base: vec_val,
+                            index: comp_idx,
+                        })
+                    } else {
+                        let word_idx =
+                            (static_base_word.saturating_add(u32::from(k))) % total_dwords;
+                        let vec_idx = word_idx / 4;
+                        let comp_idx = word_idx % 4;
+                        let vec_val = match cached_static_vec {
+                            Some((cached_idx, handle)) if cached_idx == vec_idx => handle,
+                            _ => {
+                                let vec_ptr = self.emit_expr(Expression::AccessIndex {
+                                    base: data_ptr,
+                                    index: vec_idx,
+                                });
+                                let loaded = self.emit_expr(Expression::Load { pointer: vec_ptr });
+                                cached_static_vec = Some((vec_idx, loaded));
+                                loaded
+                            }
+                        };
+                        self.emit_expr(Expression::AccessIndex {
+                            base: vec_val,
+                            index: comp_idx,
+                        })
+                    };
 
-            self.store_sgpr_u32(dst_reg, elem_val);
+                    self.store_sgpr_u32(dst_reg, elem_val);
+                }
+            }
+            CbvGlobalTarget::Storage { global: buf_global } => {
+                let buf_ptr = self.raw_expr(Expression::GlobalVariable(buf_global));
+                let buf_len = self.emit_expr(Expression::ArrayLength(buf_ptr));
+                let one = self.lit_u32(1);
+                let clamped_len = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Max,
+                    arg: buf_len,
+                    arg1: Some(one),
+                    arg2: None,
+                    arg3: None,
+                });
+                let max_idx = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Subtract,
+                    left: clamped_len,
+                    right: one,
+                });
+
+                for k in 0..count {
+                    let Some(dst_reg) = checked_sgpr_reg(sdata, k) else {
+                        break;
+                    };
+                    let word_idx = if let Some(base_w) = base_word_dyn {
+                        if k == 0 {
+                            base_w
+                        } else {
+                            let k_lit = self.lit_u32(u32::from(k));
+                            self.emit_expr(Expression::Binary {
+                                op: BinaryOperator::Add,
+                                left: base_w,
+                                right: k_lit,
+                            })
+                        }
+                    } else {
+                        self.lit_u32(static_base_word.saturating_add(u32::from(k)))
+                    };
+                    let safe_idx = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: word_idx,
+                        arg1: Some(max_idx),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    let elem_ptr = self.emit_expr(Expression::Access {
+                        base: buf_ptr,
+                        index: safe_idx,
+                    });
+                    let elem_val = self.emit_expr(Expression::Load { pointer: elem_ptr });
+                    self.store_sgpr_u32(dst_reg, elem_val);
+                }
+            }
         }
 
         true
@@ -24275,6 +24765,9 @@ impl IrEmitter {
         Vec<String>,
         Vec<String>,
         Vec<WgslBindingInfo>,
+        BTreeSet<(u32, u32)>,
+        usize,
+        usize,
     ) {
         // Emit stage return statement (unless structured lowering already ended the body
         // with one).
@@ -24307,6 +24800,9 @@ impl IrEmitter {
             self.unsupported_comments,
             self.note_comments,
             self.emitted_bindings,
+            self.atomic_only_slots,
+            self.cbv_merged_into_storage,
+            self.uniform_promoted_to_storage,
         )
     }
 }
@@ -24993,13 +25489,32 @@ pub fn translate_rdna2_to_wgsl(
 
     let entry_point = plan.entry_point.clone();
     let (
-        module,
+        mut module,
         translated_op_count,
         unsupported_op_count,
         unsupported_comments,
         note_comments,
-        bindings,
+        mut bindings,
+        atomic_only_slots,
+        cbv_merged_into_storage,
+        uniform_promoted_to_storage,
     ) = emitter.finish(entry_point.clone());
+
+    // Post-lowering binding compaction (#2110): prune unreferenced globals (e.g. unreachable CFG
+    // branches or unused dispatch arms), fold any remaining duplicate canonical bindings, and keep
+    // reflection metadata 100% synchronized with the emitted WGSL.
+    let mut binding_pack = compact_module_bindings(
+        &mut module,
+        &mut bindings,
+        plan.rt_arena,
+        plan.mesh_output.is_some(),
+        &atomic_only_slots,
+        StageBindingLimits::webgpu_d3d12(),
+    );
+    binding_pack.duplicate_bindings_folded += plan.duplicate_bindings_folded;
+    binding_pack.cbv_merged_into_storage += cbv_merged_into_storage;
+    binding_pack.uniform_promoted_to_storage += uniform_promoted_to_storage;
+    validate_emitted_bindings(&bindings, plan.stage)?;
 
     // Unconditional Naga validation against baseline WebGPU capabilities.
     let mut validator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
@@ -25276,13 +25791,23 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
         }
     };
 
+    let surviving_cbv_vec4_count = bindings
+        .iter()
+        .filter(|b| b.kind == "uniform")
+        .filter_map(|b| b.min_binding_size_bytes.map(|bytes| bytes / 16))
+        .max()
+        .unwrap_or(0);
     let binding_summary = Rdna2BindingSummary {
-        has_cbv: !plan.cbv_slots.is_empty(),
-        cbv_vec4_count: plan.cbv_vec4_count,
-        has_texture_2d: !plan.tex_slots.is_empty(),
-        has_sampler: !plan.samp_slots.is_empty(),
-        has_storage_buffer: !plan.storage_buf_slots.is_empty(),
-        has_storage_texture: !plan.storage_tex_slots.is_empty(),
+        has_cbv: bindings.iter().any(|b| b.kind == "uniform"),
+        cbv_vec4_count: surviving_cbv_vec4_count,
+        has_texture_2d: bindings.iter().any(|b| b.kind == "texture_2d"),
+        has_sampler: bindings
+            .iter()
+            .any(|b| matches!(b.kind, "sampler" | "sampler_comparison")),
+        has_storage_buffer: bindings
+            .iter()
+            .any(|b| matches!(b.kind, "storage" | "read-only-storage")),
+        has_storage_texture: bindings.iter().any(|b| b.kind == "storage-texture"),
         has_lds: plan.uses_lds,
         vertex_input_mode: plan.vertex_input_mode.as_str().to_string(),
         fragment_input_locations: plan.frag_attrs.iter().map(|&a| u32::from(a)).collect(),
@@ -25354,6 +25879,7 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
         raw_address: plan.raw_address,
         atomic64: plan.atomic64,
         binding_summary,
+        binding_pack,
     })
 }
 

@@ -4264,6 +4264,50 @@ impl StageReflectionSidecar {
         out.push_str("\n}\n");
         out
     }
+
+    /// Audit every reflected stage in this sidecar against per-stage WebGPU/D3D12 binding limits,
+    /// returning per-stage overflow findings and an aggregate sanitized summary.
+    pub fn audit_stage_binding_limits(
+        &self,
+        limits: crate::binding_pack::StageBindingLimits,
+    ) -> SidecarBindingLimitAudit {
+        let mut per_stage_overflows: BTreeMap<u64, crate::binding_pack::StageBindingLimitAudit> =
+            BTreeMap::new();
+        let mut summary = crate::binding_pack::PackBindingLimitSummary::default();
+        for (&hash, entry) in &self.stages {
+            let audit = crate::binding_pack::StageBindingLimitAudit::audit_sidecar_bindings(
+                &entry.bindings,
+                entry.rt_arena,
+                entry.mesh_output.is_some(),
+                limits,
+            );
+            summary.record_audit(&audit, crate::binding_pack::BindingPackStats::default());
+            if !audit.within_limits() {
+                per_stage_overflows.insert(hash, audit);
+            }
+        }
+        SidecarBindingLimitAudit {
+            limits,
+            summary,
+            per_stage_overflows,
+        }
+    }
+}
+
+/// Per-stage WebGPU/D3D12 binding-limit audit across all stages in a [`StageReflectionSidecar`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarBindingLimitAudit {
+    pub limits: crate::binding_pack::StageBindingLimits,
+    pub summary: crate::binding_pack::PackBindingLimitSummary,
+    /// Stages that exceed at least one per-stage limit, keyed by 64-bit stage hash.
+    pub per_stage_overflows: BTreeMap<u64, crate::binding_pack::StageBindingLimitAudit>,
+}
+
+impl SidecarBindingLimitAudit {
+    /// `true` when every stage in the sidecar fits within `self.limits`.
+    pub fn all_within_limits(&self) -> bool {
+        self.per_stage_overflows.is_empty()
+    }
 }
 
 #[cfg(test)]

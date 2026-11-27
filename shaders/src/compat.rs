@@ -2627,6 +2627,23 @@ impl WebGpuLimits {
             max_compute_workgroup_storage_size: WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
         }
     }
+
+    /// WebGPU / Dawn D3D12 hardware per-stage binding ceilings (12 uniform buffers, 16 storage
+    /// buffers, 8 storage textures, 16 sampled textures, 16 samplers per shader stage).
+    pub const fn webgpu_d3d12() -> Self {
+        let mut limits = Self::webgpu_baseline();
+        limits.max_uniform_buffers_per_shader_stage =
+            crate::binding_pack::WEBGPU_D3D12_MAX_UNIFORM_BUFFERS_PER_STAGE;
+        limits.max_storage_buffers_per_shader_stage =
+            crate::binding_pack::WEBGPU_D3D12_MAX_STORAGE_BUFFERS_PER_STAGE;
+        limits.max_storage_textures_per_shader_stage =
+            crate::binding_pack::WEBGPU_D3D12_MAX_STORAGE_TEXTURES_PER_STAGE;
+        limits.max_sampled_textures_per_shader_stage =
+            crate::binding_pack::WEBGPU_D3D12_MAX_SAMPLED_TEXTURES_PER_STAGE;
+        limits.max_samplers_per_shader_stage =
+            crate::binding_pack::WEBGPU_D3D12_MAX_SAMPLERS_PER_STAGE;
+        limits
+    }
 }
 
 impl Default for WebGpuLimits {
