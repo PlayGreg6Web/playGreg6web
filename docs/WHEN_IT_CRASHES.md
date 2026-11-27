@@ -78,7 +78,12 @@ The `bink` block of the report lists Bink export lookups that returned null (`lo
   unmapped and freed 45 ms earlier (refcount reached zero after the 4 KiB sub-allocator released the page's
   last slice). The title's CPU view (`[0x149E1DAD0]`) and GPU view (`[0x149E1DAC0]`) are separate
   reservations here (e.g. 0x180110000 vs 0xA00000000), and its conversions between them were consistent in
-  the paths read. Still open: whether the mapped resource's lifetime ends early on our side (a completion
+  the paths read. Our layout answers are ruled out as the source of the range: the only API answer that
+  feeds the tile-map ranges is XG GetResourceTiling (texture computer slot 10, via `sub_1403441F0`, tiled
+  path only), and its 64KB-mode answers tile each slice exactly the way the title consumes them (tail at
+  tile 0, no gaps, nothing past the slice; `test_tile_map_title_model_sweep`). The other path sizes
+  resources with the title's own math (`sub_140343E80`), and the bad map seen (CPU base 4 KiB into its
+  64 KiB page, 0x20000 mapped from the page below) is such a small sub-allocated resource. Still open: whether the mapped resource's lifetime ends early on our side (a completion
   signalled too soon) or the range rounding in the tile-map caller reaches a neighbouring page.
 - **Unresolved indirect call**: rerun, then use `--seed-targets` (see `tools/run_native_boot.py`), or `triage_fault.py`.
 - **Watchdog / time limit**: the run hit `--max-ms` (not a crash) or `--watchdog-ms` (it did not stop in time:

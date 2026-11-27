@@ -970,6 +970,55 @@ void test_tile_map() {
     CHECK(!tile_map({0u, 64u, 64u, 1u, 1u, 0x109u, 0u, 1u}).ok);
 }
 
+// How the title consumes a GetResourceTiling answer (sub_1403441F0 -> descriptor -> page mapping in
+// sub_1443C4850): per array slice it maps each standard mip as [start, start + width x height
+// tiles) and the tail as [0, slice tiles - sum of the standard mips' tiles), and it allocates
+// slice tiles x array size. In the 64KB modes these ranges must tile the slice exactly: no gaps
+// (the tail would grow over a neighbour) and nothing past the slice (the next slice or resource).
+void test_tile_map_title_model_sweep() {
+    uint32_t tested = 0;
+    for (const uint32_t layout : {0x109u, 0x10Au}) {
+        for (const uint32_t fmt : {98u, 77u, 71u, 80u, 28u, 61u, 10u, 2u, 41u, 49u, 24u}) {
+            const FormatGeometry g = format_geometry(fmt);
+            for (const uint32_t w : {1u, 3u, 60u, 100u, 256u, 300u, 720u, 1000u, 1280u, 1920u, 4096u}) {
+                for (const uint32_t h : {1u, 4u, 36u, 90u, 256u, 360u, 1080u, 2048u}) {
+                    for (const uint32_t arr : {1u, 6u}) {
+                        uint32_t full = 1;
+                        while ((std::max(w, h) >> full) != 0u) ++full;
+                        for (const uint32_t mips : {1u, 2u, full}) {
+                            const TextureLayoutDesc d{fmt, w, h, 1u, mips, layout, 0u, arr};
+                            const TileMap t = tile_map(d);
+                            if (!t.ok) continue;
+                            ++tested;
+                            const uint32_t tw = t.block_width * g.block_width;
+                            const uint32_t th = t.block_height * g.block_height;
+                            std::vector<std::pair<uint64_t, uint64_t>> r;
+                            uint64_t sum = 0;
+                            for (uint32_t m = 0; m < t.standard_mips; ++m) {
+                                const uint32_t mw = std::max(1u, w >> m), mh = std::max(1u, h >> m);
+                                const uint64_t n = uint64_t{(mw + tw - 1) / tw} * ((mh + th - 1) / th);
+                                r.push_back({t.start_tile[m], t.start_tile[m] + n});
+                                sum += n;
+                            }
+                            if (t.packed_mips != 0u) {
+                                CHECK(t.tail_start_tile == 0u);
+                                r.push_back({0u, t.slice_tiles - sum});
+                            }
+                            CHECK(sum + t.tail_tiles == t.slice_tiles);
+                            for (size_t i = 0; i < r.size(); ++i) {
+                                CHECK(r[i].first < r[i].second && r[i].second <= t.slice_tiles);
+                                for (size_t j = i + 1; j < r.size(); ++j) {
+                                    CHECK(!(r[i].first < r[j].second && r[j].first < r[i].second));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CHECK(tested > 1000u);
+}
 void test_planes_and_suggest() {
     const PlanarSplit d32 = depth_stencil_planes(20);
     CHECK(d32.planes == 2 && d32.format[0] == 41 && d32.format[1] == 62);
@@ -1218,6 +1267,7 @@ int main() {
     test_addrlib_equations_3d();
     test_mip_chain_placement();
     test_tile_map();
+    test_tile_map_title_model_sweep();
     test_mip_chain_round_trips();
     test_console_linear_chain();
     test_console_linear_fast_path();
