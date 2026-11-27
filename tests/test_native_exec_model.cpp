@@ -1028,6 +1028,117 @@ void test_remap_bindings_match() {
     CHECK(remap_bindings_match({}, {}));
 }
 
+// Layout fitting: every @group of a WGSL is parsed (group 0 exactly as the remap parses it).
+void test_wgsl_group_bindings() {
+    using namespace playgta6::gpu::native_exec;
+    const char* src = R"(
+@group(0) @binding(0) var<uniform> cb0: vec4<u32>;
+@group(0) @binding(9) var<storage> sbuf0: array<u32>;
+@group(0) @binding(12) var<storage> unused: array<u32>;
+@group(3) @binding(0) var<storage, read_write> ms_out: array<u32>;
+@compute @workgroup_size(64) fn cs_main() { ms_out[0] = cb0.x + sbuf0[0]; }
+)";
+    const auto groups = parse_wgsl_group_bindings(src);
+    CHECK(groups.size() == 4);  // trimmed after the last used group
+    if (groups.size() == 4) {
+        CHECK(groups[0] == parse_wgsl_group0_bindings(src));
+        CHECK(groups[0].size() == 2);  // binding 12 is not referenced
+        CHECK(groups[1].empty() && groups[2].empty());
+        CHECK(groups[3].size() == 1 && groups[3][0].binding == 0 && groups[3][0].kind == WgslBindingKind::Storage);
+    }
+    CHECK(parse_wgsl_group_bindings("@compute @workgroup_size(1) fn main() {}").empty());
+    const auto g0 = parse_wgsl_group_bindings("@group(0) @binding(1) var t: texture_2d<f32>;\nfn f() { _ = t; }");
+    CHECK(g0.size() == 1 && g0[0].size() == 1 && g0[0][0].kind == WgslBindingKind::Texture);
+}
+
+// Missing groups: the title's group serves the WGSL where it is compatible, a group the layout lacks
+// (or binds differently) is built from the WGSL, a gap below it is padding.
+void test_fit_missing_groups() {
+    using namespace playgta6::gpu::native_exec;
+    WgslBinding u;  // uniform at 0
+    WgslBinding out;
+    out.kind = WgslBindingKind::Storage;
+    const std::vector<std::vector<WgslBinding>> cs = {{u}, {}, {}, {out}};
+    const std::vector<FitStage> stages = {{kFitCompute, &cs}};
+    std::vector<std::vector<FitBinding>> wg;
+    for (size_t g = 0; g < cs.size(); ++g) wg.push_back(merge_fit_group(stages, g));
+    CHECK(wg[3].size() == 1 && wg[3][0].visibility == kFitCompute);
+
+    FitExplicitGroup g0;
+    g0.entries = std::vector<Group0LayoutEntry>{{0, 0, 0}};
+    auto src = fit_layout_groups({g0}, wg, false);
+    CHECK(src.size() == 4);
+    if (src.size() == 4) {
+        CHECK(src[0] == FitSource::Explicit);
+        CHECK(src[1] == FitSource::Empty && src[2] == FitSource::Empty);
+        CHECK(src[3] == FitSource::Wgsl);
+    }
+    CHECK(layout_needs_fit(src, 1, false));
+
+    // The title's layout has all four groups and its group 3 matches: nothing to fit.
+    FitExplicitGroup empty;
+    empty.entries = std::vector<Group0LayoutEntry>{};
+    FitExplicitGroup g3;
+    g3.entries = std::vector<Group0LayoutEntry>{{0, 0, 1}};
+    src = fit_layout_groups({g0, empty, empty, g3}, wg, false);
+    CHECK(!layout_needs_fit(src, 4, false));
+    // Its group 3 binds a uniform where the WGSL writes storage: rebuilt from the WGSL.
+    g3.entries = std::vector<Group0LayoutEntry>{{0, 0, 0}};
+    src = fit_layout_groups({g0, empty, empty, g3}, wg, false);
+    CHECK(src.size() == 4 && src[3] == FitSource::Wgsl);
+    CHECK(layout_needs_fit(src, 4, false));
+    // Group 0 the remap binds is always the WGSL's.
+    src = fit_layout_groups({g0}, wg, true);
+    CHECK(!src.empty() && src[0] == FitSource::Wgsl);
+    // Only group 0 used and compatible: nothing to fit.
+    const std::vector<std::vector<FitBinding>> only0 = {wg[0]};
+    CHECK(!layout_needs_fit(fit_layout_groups({g0}, only0, false), 1, false));
+}
+
+// Per-stage limits: a root-signature layout visible to every stage counts its buffers in each stage;
+// the WGSL-fitted group counts only what each stage binds.
+void test_fit_stage_limits() {
+    using namespace playgta6::gpu::native_exec;
+    StageLimits lim;  // Dawn D3D12: 12 uniform, 16 storage buffers per stage
+    lim.uniform_buffers = 12;
+    lim.storage_buffers = 16;
+    std::vector<LimitEntry> title;
+    for (int i = 0; i < 15; ++i) title.push_back({kFitVertex | kFitFragment, 0, 0});
+    CHECK(stage_limit_excess(title, lim) == "uniform buffers 15 > 12 (vertex)");
+    std::vector<LimitEntry> storage;
+    for (int i = 0; i < 22; ++i) storage.push_back({kFitCompute, 0, 2});  // read-only storage counts as storage
+    CHECK(stage_limit_excess(storage, lim) == "storage buffers 22 > 16 (compute)");
+    CHECK(stage_limit_excess({{kFitCompute, 3, 0}}, lim).empty());
+    std::vector<LimitEntry> tex;
+    for (int i = 0; i < 5; ++i) tex.push_back({kFitCompute, 3, 0});
+    CHECK(stage_limit_excess(tex, lim) == "storage textures 5 > 4 (compute)");
+
+    // Vertex binds 4 uniforms, fragment 6 (2 shared): fitted, the vertex stage counts 4, fragment 6.
+    std::vector<WgslBinding> vs, fs;
+    for (uint32_t b = 0; b < 4; ++b) { WgslBinding w; w.binding = b; vs.push_back(w); }
+    for (uint32_t b = 2; b < 8; ++b) { WgslBinding w; w.binding = b; fs.push_back(w); }
+    const std::vector<std::vector<WgslBinding>> vg = {vs}, fg = {fs};
+    const auto merged = merge_fit_group({{kFitVertex, &vg}, {kFitFragment, &fg}}, 0);
+    CHECK(merged.size() == 8);
+    if (merged.size() == 8) {
+        CHECK(merged[0].visibility == kFitVertex);
+        CHECK(merged[2].visibility == (kFitVertex | kFitFragment));
+        CHECK(merged[7].visibility == kFitFragment);
+    }
+    std::vector<LimitEntry> fitted;
+    for (const FitBinding& f : merged) fitted.push_back(limit_entry_of(f));
+    CHECK(stage_limit_excess(fitted, lim).empty());
+    // Over the limits: a fit is needed even when every group is the title's.
+    CHECK(layout_needs_fit({FitSource::Explicit}, 1, true));
+
+    // A writable storage binding loses the vertex bit when the fragment stage binds it too.
+    WgslBinding rw;
+    rw.kind = WgslBindingKind::Storage;
+    const std::vector<std::vector<WgslBinding>> rwg = {{rw}};
+    const auto m2 = merge_fit_group({{kFitVertex, &rwg}, {kFitFragment, &rwg}}, 0);
+    CHECK(m2.size() == 1 && m2[0].visibility == kFitFragment);
+}
+
 void test_pipe_wait_budget() {
     using namespace playgta6::gpu::native_exec;
     uint64_t v = 7;
@@ -1262,6 +1373,9 @@ int main() {
     test_pipe_wait_budget();
     test_shader_workers();
     test_remap_bindings_match();
+    test_wgsl_group_bindings();
+    test_fit_missing_groups();
+    test_fit_stage_limits();
     test_fragment_outputs();
     test_error_scope_model();
     test_clear_model();

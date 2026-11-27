@@ -301,6 +301,19 @@ struct ExecutorStats {
     uint64_t async_pipeline_waits = 0;     // first uses that still had to wait for the compile
     uint64_t async_pipeline_wait_ns = 0;
     uint64_t pipeline_pending_skips = 0;   // draws / dispatches skipped: the pipeline was still compiling past the budget
+    // Pipeline layouts fitted to the WGSL (fit_pipeline_layout): the title's layout lacked a group the
+    // WGSL binds, or was over the device's per-stage limits.
+    uint64_t layout_fit_pipelines = 0;      // pipelines built with a fitted layout
+    uint64_t layout_fit_wgsl_groups = 0;    // groups (above 0) built from the WGSL
+    uint64_t layout_fit_over_limits = 0;    // of the fitted: the title's layout was over a per-stage limit
+    uint64_t layout_fit_still_over = 0;     // over the limits even fitted: built with the title's layout
+    uint64_t layout_fit_dummy_binds = 0;    // fitted groups bound with dummies (the pass bound nothing there)
+    // The device's per-stage limits the layouts are checked against.
+    uint32_t limit_uniform_buffers_per_stage = 0;
+    uint32_t limit_storage_buffers_per_stage = 0;
+    uint32_t limit_sampled_textures_per_stage = 0;
+    uint32_t limit_samplers_per_stage = 0;
+    uint32_t limit_storage_textures_per_stage = 0;
     uint64_t remap_reflected_layouts = 0;  // v2 remap pipelines built with an explicit reflection layout (no wait for the compiled pipeline)
     uint64_t pipeline_failed_skips = 0;  // draws / dispatches dropped because their async pipeline failed to compile
     uint64_t write_masks_cleared = 0;  // color targets the fragment stage does not write: writeMask forced to 0

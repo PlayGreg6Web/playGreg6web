@@ -73,20 +73,22 @@ inline bool match_attr_args(std::string_view s, size_t& i, bool want_zero, uint3
 }
 
 struct VarMatch {
+    uint32_t group = 0;
     uint32_t binding = 0;
     std::string addr_raw, var_name, type_raw;
     size_t end = 0;
 };
 
 // WGSL_GROUP0_VAR_RE at position `i` (which holds '@'): either attribute order, then
-// `var(<addr>)? name : type ;`.
-inline bool match_group0_var(std::string_view s, size_t i, VarMatch* m) {
+// `var(<addr>)? name : type ;`. `any_group` accepts every @group(N) (N in m->group).
+inline bool match_group0_var(std::string_view s, size_t i, VarMatch* m, bool any_group = false) {
     size_t p = i;
     uint32_t binding = 0;
+    uint32_t group = 0;
     auto group_attr = [&](size_t& q) {
         if (!lw_starts_with(s, q, "@group")) return false;
         q += 6;
-        return match_attr_args(s, q, true, nullptr);
+        return match_attr_args(s, q, !any_group, &group);
     };
     auto binding_attr = [&](size_t& q) {
         if (!lw_starts_with(s, q, "@binding")) return false;
@@ -140,6 +142,7 @@ inline bool match_group0_var(std::string_view s, size_t i, VarMatch* m) {
     const size_t t0 = p;
     while (p < s.size() && s[p] != ';') ++p;
     if (p >= s.size() || p == t0) return false;
+    m->group = group;
     m->binding = binding;
     m->addr_raw = addr;
     m->var_name = name;
@@ -229,6 +232,95 @@ inline bool references_name(std::string_view text, std::string_view name) {
     }
 }
 
+// The binding a matched `var` declares (its kind from the address space / type), or nullopt for a
+// type the remap does not bind.
+inline std::optional<WgslBinding> classify_wgsl_var(const VarMatch& m) {
+    std::optional<WgslBinding> entry;
+    const std::string type = m.type_raw;  // already trimmed at the start; ends may carry whitespace
+    const std::string type_trim = lw_trim(type);
+    if (!m.addr_raw.empty()) {
+        // split(',') + lw_trim + lowercase
+        std::vector<std::string> parts;
+        size_t a = 0;
+        while (true) {
+            const size_t c = m.addr_raw.find(',', a);
+            parts.push_back(lw_lower(lw_trim(m.addr_raw.substr(a, c == std::string::npos ? std::string::npos : c - a))));
+            if (c == std::string::npos) break;
+            a = c + 1;
+        }
+        WgslBinding b;
+        b.binding = m.binding;
+        if (parts[0] == "uniform") {
+            b.kind = WgslBindingKind::Uniform;
+            entry = b;
+        } else if (parts[0] == "storage") {
+            b.kind = parts.size() > 1 && parts[1] == "read" ? WgslBindingKind::ReadOnlyStorage : WgslBindingKind::Storage;
+            entry = b;
+        }
+    } else if (type_trim.rfind("sampler_comparison", 0) == 0 &&
+               (type_trim.size() == 18 || !lw_is_ident_char(type_trim[18]))) {
+        WgslBinding b;
+        b.binding = m.binding;
+        b.kind = WgslBindingKind::Sampler;
+        b.comparison = true;
+        entry = b;
+    } else if (type_trim.rfind("sampler", 0) == 0 && (type_trim.size() == 7 || !lw_is_ident_char(type_trim[7]))) {
+        WgslBinding b;
+        b.binding = m.binding;
+        b.kind = WgslBindingKind::Sampler;
+        entry = b;
+    } else if (type_trim.rfind("texture_storage_", 0) == 0) {
+        size_t e = 0;
+        while (e < type_trim.size() && lw_is_ident_char(type_trim[e])) ++e;
+        const std::string prefix = type_trim.substr(0, e);
+        WgslBinding b;
+        b.binding = m.binding;
+        b.kind = WgslBindingKind::StorageTexture;
+        b.view_dim = classify_texture_dim(prefix);
+        // /^texture_storage_[A-Za-z0-9_]+\s*<\s*([A-Za-z0-9_-]+)/
+        size_t q = lw_skip_ws(type_trim, e);
+        if (q < type_trim.size() && type_trim[q] == '<') {
+            q = lw_skip_ws(type_trim, q + 1);
+            size_t f = q;
+            while (f < type_trim.size() && (lw_is_ident_char(type_trim[f]) || type_trim[f] == '-')) ++f;
+            if (f > q) b.storage_format = type_trim.substr(q, f - q);
+        }
+        entry = b;
+    } else if (type_trim.rfind("texture_", 0) == 0) {
+        size_t e = 0;
+        while (e < type_trim.size() && lw_is_ident_char(type_trim[e])) ++e;
+        const std::string prefix = type_trim.substr(0, e);
+        WgslBinding b;
+        b.binding = m.binding;
+        b.kind = WgslBindingKind::Texture;
+        b.view_dim = classify_texture_dim(prefix);
+        if (prefix.find("_multisampled_") != std::string::npos) b.multisampled = true;
+        if (prefix.rfind("texture_depth_", 0) == 0) {
+            b.sample_type = WgslSampleType::Depth;
+        } else {
+            // /<\s*(u32|i32|f32)\s*>/ anywhere in the type
+            for (size_t k = 0; k < type_trim.size(); ++k) {
+                if (type_trim[k] != '<') continue;
+                size_t q = lw_skip_ws(type_trim, k + 1);
+                const std::string_view rest = std::string_view(type_trim).substr(q);
+                for (const char* t : {"u32", "i32", "f32"}) {
+                    if (rest.substr(0, 3) == t) {
+                        const size_t r = lw_skip_ws(type_trim, q + 3);
+                        if (r < type_trim.size() && type_trim[r] == '>') {
+                            if (t[0] == 'u') b.sample_type = WgslSampleType::Uint;
+                            else if (t[0] == 'i') b.sample_type = WgslSampleType::Sint;
+                            k = type_trim.size();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        entry = b;
+    }
+    return entry;
+}
+
 }  // namespace layout_detail
 
 // parseWgslGroup0Bindings: the statically referenced @group(0) bindings of a WGSL source, sorted by
@@ -265,89 +357,7 @@ inline std::vector<WgslBinding> parse_wgsl_group0_bindings(std::string_view wgsl
         if (seen(m.binding)) continue;
         if (has_function && !references_name(usage, m.var_name)) continue;
 
-        std::optional<WgslBinding> entry;
-        const std::string type = m.type_raw;  // already trimmed at the start; ends may carry whitespace
-        const std::string type_trim = lw_trim(type);
-        if (!m.addr_raw.empty()) {
-            // split(',') + lw_trim + lowercase
-            std::vector<std::string> parts;
-            size_t a = 0;
-            while (true) {
-                const size_t c = m.addr_raw.find(',', a);
-                parts.push_back(lw_lower(lw_trim(m.addr_raw.substr(a, c == std::string::npos ? std::string::npos : c - a))));
-                if (c == std::string::npos) break;
-                a = c + 1;
-            }
-            WgslBinding b;
-            b.binding = m.binding;
-            if (parts[0] == "uniform") {
-                b.kind = WgslBindingKind::Uniform;
-                entry = b;
-            } else if (parts[0] == "storage") {
-                b.kind = parts.size() > 1 && parts[1] == "read" ? WgslBindingKind::ReadOnlyStorage : WgslBindingKind::Storage;
-                entry = b;
-            }
-        } else if (type_trim.rfind("sampler_comparison", 0) == 0 &&
-                   (type_trim.size() == 18 || !lw_is_ident_char(type_trim[18]))) {
-            WgslBinding b;
-            b.binding = m.binding;
-            b.kind = WgslBindingKind::Sampler;
-            b.comparison = true;
-            entry = b;
-        } else if (type_trim.rfind("sampler", 0) == 0 && (type_trim.size() == 7 || !lw_is_ident_char(type_trim[7]))) {
-            WgslBinding b;
-            b.binding = m.binding;
-            b.kind = WgslBindingKind::Sampler;
-            entry = b;
-        } else if (type_trim.rfind("texture_storage_", 0) == 0) {
-            size_t e = 0;
-            while (e < type_trim.size() && lw_is_ident_char(type_trim[e])) ++e;
-            const std::string prefix = type_trim.substr(0, e);
-            WgslBinding b;
-            b.binding = m.binding;
-            b.kind = WgslBindingKind::StorageTexture;
-            b.view_dim = classify_texture_dim(prefix);
-            // /^texture_storage_[A-Za-z0-9_]+\s*<\s*([A-Za-z0-9_-]+)/
-            size_t q = lw_skip_ws(type_trim, e);
-            if (q < type_trim.size() && type_trim[q] == '<') {
-                q = lw_skip_ws(type_trim, q + 1);
-                size_t f = q;
-                while (f < type_trim.size() && (lw_is_ident_char(type_trim[f]) || type_trim[f] == '-')) ++f;
-                if (f > q) b.storage_format = type_trim.substr(q, f - q);
-            }
-            entry = b;
-        } else if (type_trim.rfind("texture_", 0) == 0) {
-            size_t e = 0;
-            while (e < type_trim.size() && lw_is_ident_char(type_trim[e])) ++e;
-            const std::string prefix = type_trim.substr(0, e);
-            WgslBinding b;
-            b.binding = m.binding;
-            b.kind = WgslBindingKind::Texture;
-            b.view_dim = classify_texture_dim(prefix);
-            if (prefix.find("_multisampled_") != std::string::npos) b.multisampled = true;
-            if (prefix.rfind("texture_depth_", 0) == 0) {
-                b.sample_type = WgslSampleType::Depth;
-            } else {
-                // /<\s*(u32|i32|f32)\s*>/ anywhere in the type
-                for (size_t k = 0; k < type_trim.size(); ++k) {
-                    if (type_trim[k] != '<') continue;
-                    size_t q = lw_skip_ws(type_trim, k + 1);
-                    const std::string_view rest = std::string_view(type_trim).substr(q);
-                    for (const char* t : {"u32", "i32", "f32"}) {
-                        if (rest.substr(0, 3) == t) {
-                            const size_t r = lw_skip_ws(type_trim, q + 3);
-                            if (r < type_trim.size() && type_trim[r] == '>') {
-                                if (t[0] == 'u') b.sample_type = WgslSampleType::Uint;
-                                else if (t[0] == 'i') b.sample_type = WgslSampleType::Sint;
-                                k = type_trim.size();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            entry = b;
-        }
+        const std::optional<WgslBinding> entry = classify_wgsl_var(m);
         if (entry) by_binding.push_back(*entry);
     }
     result = std::move(by_binding);
@@ -621,6 +631,22 @@ public:
         return PickResult{PickResult::Kind::Dummy};
     }
 
+    // The resource bound at the WGSL's own binding number, else a dummy (a fallback sampler): the remap
+    // of a layout whose group 0 already matches the WGSL binding for binding, rebuilt only to drop the
+    // bindings the WGSL does not reference (fit_pipeline_layout, a layout over the per-stage limits).
+    PickResult pick_binding(const WgslBinding& b) {
+        for (size_t i = 0; i < av_.size(); ++i) {
+            const RemapResource& r = av_[i];
+            if (used_[i] || r.is_dummy || r.binding != b.binding) continue;
+            used_[i] = true;
+            const bool r_buf = r.kind == WgslBindingKind::Uniform || r.kind == WgslBindingKind::Storage ||
+                               r.kind == WgslBindingKind::ReadOnlyStorage;
+            return r_buf ? buffer_result(i, r) : PickResult{PickResult::Kind::Resource, i};
+        }
+        if (b.kind == WgslBindingKind::Sampler) return PickResult{PickResult::Kind::FallbackSampler};
+        return PickResult{PickResult::Kind::Dummy};
+    }
+
 private:
     PickResult buffer_result(size_t i, const RemapResource& r) {
         PickResult out{PickResult::Kind::Resource, i};
@@ -712,6 +738,197 @@ inline SynthLayoutEntry synth_layout_entry(const WgslBinding& b) {
             break;
     }
     return e;
+}
+
+// ---- pipeline layout fitting ----
+//
+// The title's explicit pipeline layout comes from its root signature; the pack WGSL of a stage can
+// bind more than that layout has (the mesh-to-compute translations write their output through
+// @group(3) @binding(0)), and a root signature whose resources are visible to every stage can put
+// more bindings into one stage than the device allows (Dawn D3D12: 12 uniform and 16 storage buffers
+// per stage), which makes the bind group layout, the pipeline layout and every pipeline built with it
+// invalid. A fitted layout keeps the title's groups where they serve the WGSL and builds the others
+// from the WGSL's own bindings.
+
+constexpr uint32_t kFitMaxGroups = 4;  // WebGPU maxBindGroups default
+
+// The statically referenced bindings of every @group(N), N < kFitMaxGroups (index = group), each
+// sorted by binding and deduplicated like parse_wgsl_group0_bindings. Trailing unused groups are
+// trimmed (an empty result: the WGSL binds nothing).
+inline std::vector<std::vector<WgslBinding>> parse_wgsl_group_bindings(std::string_view wgsl) {
+    using namespace layout_detail;
+    std::vector<std::vector<WgslBinding>> groups;
+    if (wgsl.empty()) return groups;
+    const std::string cleaned = strip_wgsl_comments(wgsl);
+    if (cleaned.empty()) return groups;
+    std::vector<VarMatch> matches;
+    for (size_t i = 0; i < cleaned.size();) {
+        VarMatch m;
+        if (cleaned[i] == '@' && match_group0_var(cleaned, i, &m, true)) {
+            if (m.group < kFitMaxGroups) matches.push_back(m);
+            i = m.end;
+        } else {
+            ++i;
+        }
+    }
+    if (matches.empty()) return groups;
+    std::string usage;
+    const bool has_function = extract_function_bodies(cleaned, &usage);
+    groups.resize(kFitMaxGroups);
+    for (const VarMatch& m : matches) {
+        std::vector<WgslBinding>& g = groups[m.group];
+        bool seen = false;
+        for (const WgslBinding& x : g) seen = seen || x.binding == m.binding;
+        if (seen) continue;
+        if (has_function && !references_name(usage, m.var_name)) continue;
+        if (const std::optional<WgslBinding> entry = classify_wgsl_var(m)) g.push_back(*entry);
+    }
+    for (auto& g : groups)
+        std::sort(g.begin(), g.end(), [](const WgslBinding& a, const WgslBinding& b) { return a.binding < b.binding; });
+    while (!groups.empty() && groups.back().empty()) groups.pop_back();
+    return groups;
+}
+
+// Stage visibility bits (GPUShaderStage): 1 vertex, 2 fragment, 4 compute.
+constexpr uint32_t kFitVertex = 1, kFitFragment = 2, kFitCompute = 4;
+
+// A WGSL binding of a fitted group with the stages that reference it.
+struct FitBinding {
+    WgslBinding b;
+    uint32_t visibility = 0;
+};
+
+// One stage's WGSL bindings (by group) and its visibility bit.
+struct FitStage {
+    uint32_t stage_bit = 0;
+    const std::vector<std::vector<WgslBinding>>* groups = nullptr;
+};
+
+// Every stage's bindings of `group` merged (merge_wgsl_group0_bindings' rule: a later `storage`
+// upgrades a `read-only-storage`), with the visibility of every stage that binds it. A writable
+// storage binding is not allowed in the vertex stage: the vertex bit is dropped when another stage
+// binds it too.
+inline std::vector<FitBinding> merge_fit_group(const std::vector<FitStage>& stages, size_t group) {
+    std::vector<FitBinding> out;
+    for (const FitStage& st : stages) {
+        if (!st.groups || group >= st.groups->size()) continue;
+        for (const WgslBinding& b : (*st.groups)[group]) {
+            FitBinding* e = nullptr;
+            for (FitBinding& x : out)
+                if (x.b.binding == b.binding) e = &x;
+            if (!e) {
+                out.push_back(FitBinding{b, st.stage_bit});
+                continue;
+            }
+            e->visibility |= st.stage_bit;
+            if (e->b.kind == WgslBindingKind::ReadOnlyStorage && b.kind == WgslBindingKind::Storage) e->b = b;
+        }
+    }
+    for (FitBinding& f : out) {
+        const bool writable = f.b.kind == WgslBindingKind::Storage || f.b.kind == WgslBindingKind::StorageTexture;
+        if (writable && (f.visibility & kFitVertex) && f.visibility != kFitVertex) f.visibility &= ~kFitVertex;
+    }
+    std::sort(out.begin(), out.end(), [](const FitBinding& a, const FitBinding& b) { return a.b.binding < b.b.binding; });
+    return out;
+}
+
+// The per-stage binding limits a layout is checked against (GPUSupportedLimits *PerShaderStage).
+struct StageLimits {
+    uint32_t uniform_buffers = 12;
+    uint32_t storage_buffers = 8;
+    uint32_t sampled_textures = 16;
+    uint32_t samplers = 16;
+    uint32_t storage_textures = 4;
+};
+
+// One layout entry as the per-stage counts see it (kind / subtype as LayoutEntry: 0 buffer (0 uniform,
+// 1 storage, 2 read-only storage), 1 sampler, 2 texture, 3 storage texture).
+struct LimitEntry {
+    uint32_t visibility = 0;
+    uint8_t kind = 0, subtype = 0;
+};
+
+inline LimitEntry limit_entry_of(const FitBinding& f) {
+    const SynthLayoutEntry se = synth_layout_entry(f.b);
+    return LimitEntry{f.visibility, se.kind, se.subtype};
+}
+
+// "" when every stage stays within `lim` over all `entries` (all groups of one pipeline layout), else
+// the first excess, e.g. "uniform buffers 15 > 12 (vertex)".
+inline std::string stage_limit_excess(const std::vector<LimitEntry>& entries, const StageLimits& lim) {
+    static const char* const kStage[3] = {"vertex", "fragment", "compute"};
+    static const char* const kWhat[5] = {"uniform buffers", "storage buffers", "sampled textures", "samplers",
+                                         "storage textures"};
+    const uint32_t cap[5] = {lim.uniform_buffers, lim.storage_buffers, lim.sampled_textures, lim.samplers,
+                             lim.storage_textures};
+    for (uint32_t s = 0; s < 3; ++s) {
+        const uint32_t bit = 1u << s;
+        uint32_t n[5] = {};
+        for (const LimitEntry& e : entries) {
+            if (!(e.visibility & bit)) continue;
+            if (e.kind == 0) ++n[e.subtype == 0 ? 0 : 1];
+            else if (e.kind == 1) ++n[3];
+            else if (e.kind == 2) ++n[2];
+            else ++n[4];
+        }
+        for (int k = 0; k < 5; ++k)
+            if (n[k] > cap[k])
+                return std::string(kWhat[k]) + " " + std::to_string(n[k]) + " > " + std::to_string(cap[k]) + " (" +
+                       kStage[s] + ")";
+    }
+    return {};
+}
+
+// Where each group of a fitted layout comes from.
+enum class FitSource : uint8_t {
+    Explicit,  // the title's bind group layout (its bind groups bind as they are)
+    Wgsl,      // built from the WGSL bindings (group 0: the remap binds it; others: dummies unless bound)
+    Empty,     // padding below a used group
+};
+
+// One explicit group as the fit sees it: its entries (nullopt: not known, a manifest layout).
+struct FitExplicitGroup {
+    std::optional<std::vector<Group0LayoutEntry>> entries;
+};
+
+// The source of every group of the fitted layout: group 0 is Wgsl when `remap_group0` (the remap binds
+// it), else the title's; a higher group is the title's when it serves the WGSL's bindings there (or the
+// WGSL binds nothing in it), else built from the WGSL; a gap below a used group is Empty.
+inline std::vector<FitSource> fit_layout_groups(const std::vector<FitExplicitGroup>& explicit_groups,
+                                                const std::vector<std::vector<FitBinding>>& wgsl, bool remap_group0) {
+    const size_t n = std::max(explicit_groups.size(), wgsl.size());
+    std::vector<FitSource> out(n, FitSource::Empty);
+    for (size_t g = 0; g < n; ++g) {
+        const bool used = g < wgsl.size() && !wgsl[g].empty();
+        const bool have = g < explicit_groups.size();
+        if (g == 0 && remap_group0) {
+            out[g] = FitSource::Wgsl;
+            continue;
+        }
+        if (have) {
+            bool serves = !used || !explicit_groups[g].entries;
+            if (!serves) {
+                std::vector<WgslBinding> wb;
+                for (const FitBinding& f : wgsl[g]) wb.push_back(f.b);
+                serves = explicit_layout_compatible(&*explicit_groups[g].entries, wb);
+            }
+            if (serves) {
+                out[g] = FitSource::Explicit;
+                continue;
+            }
+        }
+        out[g] = used ? FitSource::Wgsl : FitSource::Empty;
+    }
+    return out;
+}
+
+// True when the title's layout cannot serve the WGSL as it is: a group the WGSL binds above group 0 is
+// missing or does not match (group 0 has the remap), or the layout is over the per-stage limits.
+inline bool layout_needs_fit(const std::vector<FitSource>& sources, size_t explicit_count, bool over_limits) {
+    if (over_limits) return true;
+    for (size_t g = 1; g < sources.size(); ++g)
+        if (g >= explicit_count || sources[g] != FitSource::Explicit) return true;
+    return false;
 }
 
 }  // namespace playgta6::gpu::native_exec
