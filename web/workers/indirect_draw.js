@@ -22,6 +22,33 @@
   const DISPATCH_MESH_CLAMP_OUTPUT_BYTES = 28; // 12B dispatch + 16B drawIndirect pair (G66 #1537)
   const DEFAULT_CLAMP_PARAMS_SLOTS = 64;
   const DEFAULT_CLAMP_OUTPUT_BYTES = 65536; // 64 KiB managed clamped indirect ring
+  const MAX_DIRTY_RANGE_POOL_SIZE = 64;
+  const IS_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+
+  function compareDirtyRangeStart(a, b) {
+    return a.start - b.start;
+  }
+
+  const _tmpBatchCount = {
+    count: 0,
+    requestedCount: 0,
+    clamped: false,
+    maxIndirectBatchCount: DEFAULT_MAX_INDIRECT_BATCH_COUNT,
+  };
+  const _tmpStepPlan = {
+    valid: false,
+    reason: null,
+    requestedCount: 0,
+    effectiveCount: 0,
+    clamped: false,
+    clampedReason: null,
+    recordSize: 0,
+    stride: 0,
+    firstOffset: 0,
+    lastOffset: 0,
+    requiredBytes: 0,
+    bufferSize: null,
+  };
 
   function createEmptyStats() {
     return {
@@ -408,40 +435,108 @@
   }
 
   function checkField(kind, name, value, signed) {
-    if (!Number.isInteger(value)) {
+    if (typeof value !== 'number') {
       throw new TypeError(`${kind}.${name} must be an integer, got ${value}`);
     }
-    const min = signed ? I32_MIN : 0;
-    const max = signed ? I32_MAX : U32_MAX;
-    if (value < min || value > max) {
-      throw new RangeError(`${kind}.${name} must be in [${min}, ${max}], got ${value}`);
+    if (signed) {
+      if ((value | 0) !== value) {
+        if (!Number.isInteger(value)) {
+          throw new TypeError(`${kind}.${name} must be an integer, got ${value}`);
+        }
+        throw new RangeError(`${kind}.${name} must be in [${I32_MIN}, ${I32_MAX}], got ${value}`);
+      }
+      return value;
     }
+    if ((value >>> 0) !== value) {
+      if (!Number.isInteger(value)) {
+        throw new TypeError(`${kind}.${name} must be an integer, got ${value}`);
+      }
+      throw new RangeError(`${kind}.${name} must be in [0, ${U32_MAX}], got ${value}`);
+    }
+    return value;
   }
 
   /**
    * Validate field types and ranges of a record and apply defaults. Only `firstVertex`,
    * `firstIndex`, `baseVertex` and `firstInstance` default to 0; counts are required.
+   * Pass an optional preallocated `out` object to avoid per-call allocations.
    *
    * @param {string} kind One of INDIRECT_KIND.
    * @param {object} record
-   * @returns {object} A new object with every field present.
+   * @param {object} [out]
+   * @returns {object}
    */
-  function normalizeRecord(kind, record) {
-    const layout = layoutFor(kind);
+  function normalizeRecord(kind, record, out) {
+    layoutFor(kind);
     if (record === null || typeof record !== 'object') {
       throw new TypeError(`${kind} record must be an object`);
     }
-    const defaults = { firstVertex: 0, firstIndex: 0, baseVertex: 0, firstInstance: 0 };
-    const out = {};
-    for (const [name, spec] of Object.entries(layout.fields)) {
-      let value = record[name];
-      if (value === undefined && name in defaults) {
-        value = defaults[name];
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : null;
+    if (kind === INDIRECT_KIND.DRAW) {
+      const vertexCount = checkField(kind, 'vertexCount', record.vertexCount, false);
+      const instanceCount = checkField(kind, 'instanceCount', record.instanceCount, false);
+      const firstVertex = checkField(
+        kind,
+        'firstVertex',
+        record.firstVertex === undefined ? 0 : record.firstVertex,
+        false
+      );
+      const firstInstance = checkField(
+        kind,
+        'firstInstance',
+        record.firstInstance === undefined ? 0 : record.firstInstance,
+        false
+      );
+      if (target !== null) {
+        target.vertexCount = vertexCount;
+        target.instanceCount = instanceCount;
+        target.firstVertex = firstVertex;
+        target.firstInstance = firstInstance;
+        return target;
       }
-      checkField(kind, name, value, spec.signed);
-      out[name] = value;
+      return { vertexCount, instanceCount, firstVertex, firstInstance };
     }
-    return out;
+    if (kind === INDIRECT_KIND.DRAW_INDEXED) {
+      const indexCount = checkField(kind, 'indexCount', record.indexCount, false);
+      const instanceCount = checkField(kind, 'instanceCount', record.instanceCount, false);
+      const firstIndex = checkField(
+        kind,
+        'firstIndex',
+        record.firstIndex === undefined ? 0 : record.firstIndex,
+        false
+      );
+      const baseVertex = checkField(
+        kind,
+        'baseVertex',
+        record.baseVertex === undefined ? 0 : record.baseVertex,
+        true
+      );
+      const firstInstance = checkField(
+        kind,
+        'firstInstance',
+        record.firstInstance === undefined ? 0 : record.firstInstance,
+        false
+      );
+      if (target !== null) {
+        target.indexCount = indexCount;
+        target.instanceCount = instanceCount;
+        target.firstIndex = firstIndex;
+        target.baseVertex = baseVertex;
+        target.firstInstance = firstInstance;
+        return target;
+      }
+      return { indexCount, instanceCount, firstIndex, baseVertex, firstInstance };
+    }
+    const x = checkField(kind, 'x', record.x, false);
+    const y = checkField(kind, 'y', record.y, false);
+    const z = checkField(kind, 'z', record.z, false);
+    if (target !== null) {
+      target.x = x;
+      target.y = y;
+      target.z = z;
+      return target;
+    }
+    return { x, y, z };
   }
 
   function toDataView(target, byteOffset, byteLength, label) {
@@ -464,8 +559,119 @@
     return view;
   }
 
+  function writeU32BytesLE(bytes, offset, value) {
+    bytes[offset] = value & 0xff;
+    bytes[offset + 1] = (value >>> 8) & 0xff;
+    bytes[offset + 2] = (value >>> 16) & 0xff;
+    bytes[offset + 3] = (value >>> 24) & 0xff;
+  }
+
+  function readU32BytesLE(bytes, offset) {
+    return (
+      (bytes[offset] |
+        (bytes[offset + 1] << 8) |
+        (bytes[offset + 2] << 16) |
+        (bytes[offset + 3] << 24)) >>>
+      0
+    );
+  }
+
+  function readI32BytesLE(bytes, offset) {
+    return (
+      bytes[offset] |
+      (bytes[offset + 1] << 8) |
+      (bytes[offset + 2] << 16) |
+      (bytes[offset + 3] << 24)
+    );
+  }
+
+  function assertTargetBounds(byteLength, byteOffset, neededBytes, label) {
+    assertNonNegativeInteger(byteOffset, 'byteOffset');
+    if (byteOffset + neededBytes > byteLength) {
+      throw new RangeError(
+        `${label}: ${neededBytes} bytes at offset ${byteOffset} exceed target of ${byteLength} bytes`
+      );
+    }
+  }
+
+  function writeDrawFieldsToTarget(target, byteOffset, f0, f1, f2, f3) {
+    if (target instanceof Uint8Array) {
+      assertTargetBounds(target.byteLength, byteOffset, DRAW_INDIRECT_BYTES, 'encode draw');
+      writeU32BytesLE(target, byteOffset, f0);
+      writeU32BytesLE(target, byteOffset + 4, f1);
+      writeU32BytesLE(target, byteOffset + 8, f2);
+      writeU32BytesLE(target, byteOffset + 12, f3);
+      return;
+    }
+    if (IS_LITTLE_ENDIAN && target instanceof Uint32Array && isAligned4Fast(byteOffset)) {
+      assertTargetBounds(target.byteLength, byteOffset, DRAW_INDIRECT_BYTES, 'encode draw');
+      const idx = byteOffset <= 0x7fffffff ? byteOffset >>> 2 : byteOffset / 4;
+      target[idx] = f0;
+      target[idx + 1] = f1;
+      target[idx + 2] = f2;
+      target[idx + 3] = f3;
+      return;
+    }
+    const view = toDataView(target, byteOffset, DRAW_INDIRECT_BYTES, 'encode draw');
+    view.setUint32(byteOffset, f0, true);
+    view.setUint32(byteOffset + 4, f1, true);
+    view.setUint32(byteOffset + 8, f2, true);
+    view.setUint32(byteOffset + 12, f3, true);
+  }
+
+  function writeDrawIndexedFieldsToTarget(target, byteOffset, f0, f1, f2, f3i, f4) {
+    if (target instanceof Uint8Array) {
+      assertTargetBounds(target.byteLength, byteOffset, DRAW_INDEXED_INDIRECT_BYTES, 'encode drawIndexed');
+      writeU32BytesLE(target, byteOffset, f0);
+      writeU32BytesLE(target, byteOffset + 4, f1);
+      writeU32BytesLE(target, byteOffset + 8, f2);
+      writeU32BytesLE(target, byteOffset + 12, f3i);
+      writeU32BytesLE(target, byteOffset + 16, f4);
+      return;
+    }
+    if (IS_LITTLE_ENDIAN && target instanceof Uint32Array && isAligned4Fast(byteOffset)) {
+      assertTargetBounds(target.byteLength, byteOffset, DRAW_INDEXED_INDIRECT_BYTES, 'encode drawIndexed');
+      const idx = byteOffset <= 0x7fffffff ? byteOffset >>> 2 : byteOffset / 4;
+      target[idx] = f0;
+      target[idx + 1] = f1;
+      target[idx + 2] = f2;
+      target[idx + 3] = f3i >>> 0;
+      target[idx + 4] = f4;
+      return;
+    }
+    const view = toDataView(target, byteOffset, DRAW_INDEXED_INDIRECT_BYTES, 'encode drawIndexed');
+    view.setUint32(byteOffset, f0, true);
+    view.setUint32(byteOffset + 4, f1, true);
+    view.setUint32(byteOffset + 8, f2, true);
+    view.setInt32(byteOffset + 12, f3i, true);
+    view.setUint32(byteOffset + 16, f4, true);
+  }
+
+  function writeDispatchFieldsToTarget(target, byteOffset, f0, f1, f2) {
+    if (target instanceof Uint8Array) {
+      assertTargetBounds(target.byteLength, byteOffset, DISPATCH_INDIRECT_BYTES, 'encode dispatch');
+      writeU32BytesLE(target, byteOffset, f0);
+      writeU32BytesLE(target, byteOffset + 4, f1);
+      writeU32BytesLE(target, byteOffset + 8, f2);
+      return;
+    }
+    if (IS_LITTLE_ENDIAN && target instanceof Uint32Array && isAligned4Fast(byteOffset)) {
+      assertTargetBounds(target.byteLength, byteOffset, DISPATCH_INDIRECT_BYTES, 'encode dispatch');
+      const idx = byteOffset <= 0x7fffffff ? byteOffset >>> 2 : byteOffset / 4;
+      target[idx] = f0;
+      target[idx + 1] = f1;
+      target[idx + 2] = f2;
+      return;
+    }
+    const view = toDataView(target, byteOffset, DISPATCH_INDIRECT_BYTES, 'encode dispatch');
+    view.setUint32(byteOffset, f0, true);
+    view.setUint32(byteOffset + 4, f1, true);
+    view.setUint32(byteOffset + 8, f2, true);
+  }
+
   /**
    * Encode one record of `kind` into `target` at `byteOffset` (little-endian).
+   * Zero-allocation fast path for `Uint8Array`, 4-byte-aligned `Uint32Array`, and `DataView`.
    *
    * @param {string} kind One of INDIRECT_KIND.
    * @param {object} record
@@ -474,37 +680,235 @@
    * @returns {number} Bytes written.
    */
   function encodeRecord(kind, record, target, byteOffset = 0) {
-    const layout = layoutFor(kind);
-    const values = normalizeRecord(kind, record);
-    const view = toDataView(target, byteOffset, layout.byteSize, `encode ${kind}`);
-    for (const [name, spec] of Object.entries(layout.fields)) {
-      if (spec.signed) {
-        view.setInt32(byteOffset + spec.offset, values[name], true);
-      } else {
-        view.setUint32(byteOffset + spec.offset, values[name], true);
-      }
+    layoutFor(kind);
+    if (record === null || typeof record !== 'object') {
+      throw new TypeError(`${kind} record must be an object`);
     }
-    return layout.byteSize;
+    if (kind === INDIRECT_KIND.DRAW) {
+      const vertexCount = checkField(kind, 'vertexCount', record.vertexCount, false);
+      const instanceCount = checkField(kind, 'instanceCount', record.instanceCount, false);
+      const firstVertex = checkField(
+        kind,
+        'firstVertex',
+        record.firstVertex === undefined ? 0 : record.firstVertex,
+        false
+      );
+      const firstInstance = checkField(
+        kind,
+        'firstInstance',
+        record.firstInstance === undefined ? 0 : record.firstInstance,
+        false
+      );
+      writeDrawFieldsToTarget(target, byteOffset, vertexCount, instanceCount, firstVertex, firstInstance);
+      return DRAW_INDIRECT_BYTES;
+    }
+    if (kind === INDIRECT_KIND.DRAW_INDEXED) {
+      const indexCount = checkField(kind, 'indexCount', record.indexCount, false);
+      const instanceCount = checkField(kind, 'instanceCount', record.instanceCount, false);
+      const firstIndex = checkField(
+        kind,
+        'firstIndex',
+        record.firstIndex === undefined ? 0 : record.firstIndex,
+        false
+      );
+      const baseVertex = checkField(
+        kind,
+        'baseVertex',
+        record.baseVertex === undefined ? 0 : record.baseVertex,
+        true
+      );
+      const firstInstance = checkField(
+        kind,
+        'firstInstance',
+        record.firstInstance === undefined ? 0 : record.firstInstance,
+        false
+      );
+      writeDrawIndexedFieldsToTarget(
+        target,
+        byteOffset,
+        indexCount,
+        instanceCount,
+        firstIndex,
+        baseVertex,
+        firstInstance
+      );
+      return DRAW_INDEXED_INDIRECT_BYTES;
+    }
+    const x = checkField(kind, 'x', record.x, false);
+    const y = checkField(kind, 'y', record.y, false);
+    const z = checkField(kind, 'z', record.z, false);
+    writeDispatchFieldsToTarget(target, byteOffset, x, y, z);
+    return DISPATCH_INDIRECT_BYTES;
   }
 
   /**
    * Decode one record of `kind` from `source` at `byteOffset`.
+   * Pass an optional preallocated `out` object to avoid per-call allocations.
    *
    * @param {string} kind One of INDIRECT_KIND.
    * @param {ArrayBuffer|DataView|ArrayBufferView} source
    * @param {number} [byteOffset=0]
+   * @param {object} [out]
    * @returns {object}
    */
-  function decodeRecord(kind, source, byteOffset = 0) {
+  function decodeRecord(kind, source, byteOffset = 0, out) {
     const layout = layoutFor(kind);
-    const view = toDataView(source, byteOffset, layout.byteSize, `decode ${kind}`);
-    const out = {};
-    for (const [name, spec] of Object.entries(layout.fields)) {
-      out[name] = spec.signed
-        ? view.getInt32(byteOffset + spec.offset, true)
-        : view.getUint32(byteOffset + spec.offset, true);
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : null;
+    const isU8 = source instanceof Uint8Array;
+    const isAlignedU32 =
+      !isU8 && IS_LITTLE_ENDIAN && source instanceof Uint32Array && isAligned4Fast(byteOffset);
+
+    if (isU8) {
+      assertTargetBounds(source.byteLength, byteOffset, layout.byteSize, `decode ${kind}`);
+      if (kind === INDIRECT_KIND.DRAW) {
+        const vertexCount = readU32BytesLE(source, byteOffset);
+        const instanceCount = readU32BytesLE(source, byteOffset + 4);
+        const firstVertex = readU32BytesLE(source, byteOffset + 8);
+        const firstInstance = readU32BytesLE(source, byteOffset + 12);
+        if (target !== null) {
+          target.vertexCount = vertexCount;
+          target.instanceCount = instanceCount;
+          target.firstVertex = firstVertex;
+          target.firstInstance = firstInstance;
+          return target;
+        }
+        return { vertexCount, instanceCount, firstVertex, firstInstance };
+      }
+      if (kind === INDIRECT_KIND.DRAW_INDEXED) {
+        const indexCount = readU32BytesLE(source, byteOffset);
+        const instanceCount = readU32BytesLE(source, byteOffset + 4);
+        const firstIndex = readU32BytesLE(source, byteOffset + 8);
+        const baseVertex = readI32BytesLE(source, byteOffset + 12);
+        const firstInstance = readU32BytesLE(source, byteOffset + 16);
+        if (target !== null) {
+          target.indexCount = indexCount;
+          target.instanceCount = instanceCount;
+          target.firstIndex = firstIndex;
+          target.baseVertex = baseVertex;
+          target.firstInstance = firstInstance;
+          return target;
+        }
+        return { indexCount, instanceCount, firstIndex, baseVertex, firstInstance };
+      }
+      const x = readU32BytesLE(source, byteOffset);
+      const y = readU32BytesLE(source, byteOffset + 4);
+      const z = readU32BytesLE(source, byteOffset + 8);
+      if (target !== null) {
+        target.x = x;
+        target.y = y;
+        target.z = z;
+        return target;
+      }
+      return { x, y, z };
     }
-    return out;
+
+    if (isAlignedU32) {
+      assertTargetBounds(source.byteLength, byteOffset, layout.byteSize, `decode ${kind}`);
+      const idx = byteOffset <= 0x7fffffff ? byteOffset >>> 2 : byteOffset / 4;
+      if (kind === INDIRECT_KIND.DRAW) {
+        const vertexCount = source[idx];
+        const instanceCount = source[idx + 1];
+        const firstVertex = source[idx + 2];
+        const firstInstance = source[idx + 3];
+        if (target !== null) {
+          target.vertexCount = vertexCount;
+          target.instanceCount = instanceCount;
+          target.firstVertex = firstVertex;
+          target.firstInstance = firstInstance;
+          return target;
+        }
+        return { vertexCount, instanceCount, firstVertex, firstInstance };
+      }
+      if (kind === INDIRECT_KIND.DRAW_INDEXED) {
+        const indexCount = source[idx];
+        const instanceCount = source[idx + 1];
+        const firstIndex = source[idx + 2];
+        const baseVertex = source[idx + 3] | 0;
+        const firstInstance = source[idx + 4];
+        if (target !== null) {
+          target.indexCount = indexCount;
+          target.instanceCount = instanceCount;
+          target.firstIndex = firstIndex;
+          target.baseVertex = baseVertex;
+          target.firstInstance = firstInstance;
+          return target;
+        }
+        return { indexCount, instanceCount, firstIndex, baseVertex, firstInstance };
+      }
+      const x = source[idx];
+      const y = source[idx + 1];
+      const z = source[idx + 2];
+      if (target !== null) {
+        target.x = x;
+        target.y = y;
+        target.z = z;
+        return target;
+      }
+      return { x, y, z };
+    }
+
+    const view = toDataView(source, byteOffset, layout.byteSize, `decode ${kind}`);
+    if (kind === INDIRECT_KIND.DRAW) {
+      const vertexCount = view.getUint32(byteOffset, true);
+      const instanceCount = view.getUint32(byteOffset + 4, true);
+      const firstVertex = view.getUint32(byteOffset + 8, true);
+      const firstInstance = view.getUint32(byteOffset + 12, true);
+      if (target !== null) {
+        target.vertexCount = vertexCount;
+        target.instanceCount = instanceCount;
+        target.firstVertex = firstVertex;
+        target.firstInstance = firstInstance;
+        return target;
+      }
+      return { vertexCount, instanceCount, firstVertex, firstInstance };
+    }
+    if (kind === INDIRECT_KIND.DRAW_INDEXED) {
+      const indexCount = view.getUint32(byteOffset, true);
+      const instanceCount = view.getUint32(byteOffset + 4, true);
+      const firstIndex = view.getUint32(byteOffset + 8, true);
+      const baseVertex = view.getInt32(byteOffset + 12, true);
+      const firstInstance = view.getUint32(byteOffset + 16, true);
+      if (target !== null) {
+        target.indexCount = indexCount;
+        target.instanceCount = instanceCount;
+        target.firstIndex = firstIndex;
+        target.baseVertex = baseVertex;
+        target.firstInstance = firstInstance;
+        return target;
+      }
+      return { indexCount, instanceCount, firstIndex, baseVertex, firstInstance };
+    }
+    const x = view.getUint32(byteOffset, true);
+    const y = view.getUint32(byteOffset + 4, true);
+    const z = view.getUint32(byteOffset + 8, true);
+    if (target !== null) {
+      target.x = x;
+      target.y = y;
+      target.z = z;
+      return target;
+    }
+    return { x, y, z };
+  }
+
+  /**
+   * Zero-allocation `drawIndirect` record encoder (16 bytes) writing directly into `target` at `byteOffset`.
+   */
+  function encodeDrawIndirectInto(record, target, byteOffset = 0) {
+    return encodeRecord(INDIRECT_KIND.DRAW, record, target, byteOffset);
+  }
+
+  /**
+   * Zero-allocation `drawIndexedIndirect` record encoder (20 bytes) writing directly into `target` at `byteOffset`.
+   */
+  function encodeDrawIndexedIndirectInto(record, target, byteOffset = 0) {
+    return encodeRecord(INDIRECT_KIND.DRAW_INDEXED, record, target, byteOffset);
+  }
+
+  /**
+   * Zero-allocation `dispatchWorkgroupsIndirect` record encoder (12 bytes) writing directly into `target` at `byteOffset`.
+   */
+  function encodeDispatchIndirectInto(record, target, byteOffset = 0) {
+    return encodeRecord(INDIRECT_KIND.DISPATCH, record, target, byteOffset);
   }
 
   /**
@@ -515,7 +919,7 @@
    */
   function encodeDrawIndirect(record) {
     const bytes = new Uint8Array(DRAW_INDIRECT_BYTES);
-    encodeRecord(INDIRECT_KIND.DRAW, record, bytes);
+    encodeRecord(INDIRECT_KIND.DRAW, record, bytes, 0);
     return bytes;
   }
 
@@ -527,7 +931,7 @@
    */
   function encodeDrawIndexedIndirect(record) {
     const bytes = new Uint8Array(DRAW_INDEXED_INDIRECT_BYTES);
-    encodeRecord(INDIRECT_KIND.DRAW_INDEXED, record, bytes);
+    encodeRecord(INDIRECT_KIND.DRAW_INDEXED, record, bytes, 0);
     return bytes;
   }
 
@@ -539,7 +943,7 @@
    */
   function encodeDispatchIndirect(record) {
     const bytes = new Uint8Array(DISPATCH_INDIRECT_BYTES);
-    encodeRecord(INDIRECT_KIND.DISPATCH, record, bytes);
+    encodeRecord(INDIRECT_KIND.DISPATCH, record, bytes, 0);
     return bytes;
   }
 
@@ -547,30 +951,33 @@
    * Decode a 16-byte drawIndirect record.
    * @param {ArrayBuffer|DataView|ArrayBufferView} source
    * @param {number} [byteOffset=0]
+   * @param {object} [out]
    * @returns {object}
    */
-  function decodeDrawIndirect(source, byteOffset = 0) {
-    return decodeRecord(INDIRECT_KIND.DRAW, source, byteOffset);
+  function decodeDrawIndirect(source, byteOffset = 0, out) {
+    return decodeRecord(INDIRECT_KIND.DRAW, source, byteOffset, out);
   }
 
   /**
    * Decode a 20-byte drawIndexedIndirect record.
    * @param {ArrayBuffer|DataView|ArrayBufferView} source
    * @param {number} [byteOffset=0]
+   * @param {object} [out]
    * @returns {object}
    */
-  function decodeDrawIndexedIndirect(source, byteOffset = 0) {
-    return decodeRecord(INDIRECT_KIND.DRAW_INDEXED, source, byteOffset);
+  function decodeDrawIndexedIndirect(source, byteOffset = 0, out) {
+    return decodeRecord(INDIRECT_KIND.DRAW_INDEXED, source, byteOffset, out);
   }
 
   /**
    * Decode a 12-byte dispatchWorkgroupsIndirect record.
    * @param {ArrayBuffer|DataView|ArrayBufferView} source
    * @param {number} [byteOffset=0]
+   * @param {object} [out]
    * @returns {object}
    */
-  function decodeDispatchIndirect(source, byteOffset = 0) {
-    return decodeRecord(INDIRECT_KIND.DISPATCH, source, byteOffset);
+  function decodeDispatchIndirect(source, byteOffset = 0, out) {
+    return decodeRecord(INDIRECT_KIND.DISPATCH, source, byteOffset, out);
   }
 
   /**
@@ -580,6 +987,9 @@
    * throws IndirectDrawError('FIRST_INSTANCE_UNSUPPORTED') naming the record index; with
    * `patchFirstInstance: true` the field is written as 0 and the index is reported instead.
    *
+   * Zero-allocation fast path when `options.out` (destination `Uint8Array`), `options.patchedOut`
+   * (reusable `number[]`), and `options.resultOut` (or 4th arg `resultOut`) are provided.
+   *
    * @param {string} kind One of INDIRECT_KIND.
    * @param {object[]} records
    * @param {object} [options]
@@ -588,38 +998,57 @@
    * @param {boolean} [options.patchFirstInstance=false] Patch firstInstance to 0 instead of throwing.
    * @param {Uint8Array} [options.out] Destination; allocated when omitted.
    * @param {number} [options.outOffset=0] Byte offset into `out`.
+   * @param {number[]} [options.patchedOut] Optional reusable array populated with patched indices.
+   * @param {object} [options.resultOut] Optional reusable result object `{ bytes, stride, patched }`.
    * @param {number} [options.maxIndirectBatchCount=4096] Maximum records allowed per batch.
    * @param {boolean} [options.clampBatch=false] Clamp oversized batches instead of throwing.
+   * @param {object} [resultOut]
    * @returns {{bytes: Uint8Array, stride: number, patched: number[]}} `patched` lists record indices.
    */
-  function encodeBatch(kind, records, options = {}) {
+  function encodeBatch(kind, records, options, resultOut) {
     const layout = layoutFor(kind);
     if (!Array.isArray(records)) {
       throw new TypeError('records must be an array');
     }
-    const stride = options.stride === undefined ? layout.byteSize : options.stride;
-    if (!Number.isInteger(stride) || stride < layout.byteSize || stride % INDIRECT_OFFSET_ALIGNMENT !== 0) {
+    const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+    const stride = hasOpts && options.stride !== undefined ? options.stride : layout.byteSize;
+    if (!isPosSafeIntFast(stride) || stride < layout.byteSize || !isAligned4Fast(stride)) {
       recordBoundsRejection(null);
       throw new RangeError(
         `stride must be a multiple of 4 and >= ${layout.byteSize} for ${kind}, got ${stride}`
       );
     }
-    const outOffset = options.outOffset || 0;
-    if (!Number.isInteger(outOffset) || outOffset < 0) {
+    const outOffset = hasOpts && options.outOffset !== undefined ? options.outOffset : 0;
+    if (!isNonNegSafeIntFast(outOffset)) {
       recordBoundsRejection(null);
       throw new RangeError(`outOffset must be a non-negative integer, got ${outOffset}`);
     }
-    const batch = resolveBatchCount(records.length, options, null);
+    const resTarget =
+      resultOut !== undefined && resultOut !== null && typeof resultOut === 'object'
+        ? resultOut
+        : hasOpts && options.resultOut !== undefined && options.resultOut !== null && typeof options.resultOut === 'object'
+          ? options.resultOut
+          : null;
+    const patched =
+      hasOpts && Array.isArray(options.patchedOut) ? ((options.patchedOut.length = 0), options.patchedOut) : [];
+
+    const batch = resolveBatchCountInto(_tmpBatchCount, records.length, hasOpts ? options : null, null);
     if (batch.count === 0) {
       recordStat('zeroBatchSkips');
-      const bytes = options.out || new Uint8Array(0);
+      const bytes = hasOpts && options.out !== undefined ? options.out : new Uint8Array(0);
       if (!(bytes instanceof Uint8Array)) {
         throw new TypeError('out must be a Uint8Array');
       }
-      return { bytes, stride, patched: [] };
+      if (resTarget !== null) {
+        resTarget.bytes = bytes;
+        resTarget.stride = stride;
+        resTarget.patched = patched;
+        return resTarget;
+      }
+      return { bytes, stride, patched };
     }
     const total = stride * (batch.count - 1) + layout.byteSize;
-    const bytes = options.out || new Uint8Array(total);
+    const bytes = hasOpts && options.out !== undefined ? options.out : new Uint8Array(total);
     if (!(bytes instanceof Uint8Array)) {
       throw new TypeError('out must be a Uint8Array');
     }
@@ -629,24 +1058,109 @@
         `encodeBatch ${kind}: ${total} bytes at offset ${outOffset} exceed target of ${bytes.byteLength} bytes`
       );
     }
-    const patched = [];
-    for (let i = 0; i < batch.count; i += 1) {
-      let rec = records[i];
-      if ('firstInstance' in layout.fields) {
-        const normalized = normalizeRecord(kind, rec);
-        if (normalized.firstInstance !== 0 && !options.indirectFirstInstance) {
-          if (!options.patchFirstInstance) {
+
+    const allowFirstInstance = hasOpts && Boolean(options.indirectFirstInstance);
+    const patchFirstInstance = hasOpts && Boolean(options.patchFirstInstance);
+
+    if (kind === INDIRECT_KIND.DRAW) {
+      for (let i = 0, off = outOffset; i < batch.count; i += 1, off += stride) {
+        const rec = records[i];
+        if (rec === null || typeof rec !== 'object') {
+          throw new TypeError(`${kind} record must be an object`);
+        }
+        const vertexCount = checkField(kind, 'vertexCount', rec.vertexCount, false);
+        const instanceCount = checkField(kind, 'instanceCount', rec.instanceCount, false);
+        const firstVertex = checkField(
+          kind,
+          'firstVertex',
+          rec.firstVertex === undefined ? 0 : rec.firstVertex,
+          false
+        );
+        let firstInstance = checkField(
+          kind,
+          'firstInstance',
+          rec.firstInstance === undefined ? 0 : rec.firstInstance,
+          false
+        );
+        if (firstInstance !== 0 && !allowFirstInstance) {
+          if (!patchFirstInstance) {
             throw new IndirectDrawError(
               'FIRST_INSTANCE_UNSUPPORTED',
-              `record ${i}: firstInstance=${normalized.firstInstance} requires the ` +
+              `record ${i}: firstInstance=${firstInstance} requires the ` +
                 `'indirect-first-instance' feature`
             );
           }
-          rec = { ...normalized, firstInstance: 0 };
+          firstInstance = 0;
           patched.push(i);
         }
+        writeU32BytesLE(bytes, off, vertexCount);
+        writeU32BytesLE(bytes, off + 4, instanceCount);
+        writeU32BytesLE(bytes, off + 8, firstVertex);
+        writeU32BytesLE(bytes, off + 12, firstInstance);
       }
-      encodeRecord(kind, rec, bytes, outOffset + i * stride);
+    } else if (kind === INDIRECT_KIND.DRAW_INDEXED) {
+      for (let i = 0, off = outOffset; i < batch.count; i += 1, off += stride) {
+        const rec = records[i];
+        if (rec === null || typeof rec !== 'object') {
+          throw new TypeError(`${kind} record must be an object`);
+        }
+        const indexCount = checkField(kind, 'indexCount', rec.indexCount, false);
+        const instanceCount = checkField(kind, 'instanceCount', rec.instanceCount, false);
+        const firstIndex = checkField(
+          kind,
+          'firstIndex',
+          rec.firstIndex === undefined ? 0 : rec.firstIndex,
+          false
+        );
+        const baseVertex = checkField(
+          kind,
+          'baseVertex',
+          rec.baseVertex === undefined ? 0 : rec.baseVertex,
+          true
+        );
+        let firstInstance = checkField(
+          kind,
+          'firstInstance',
+          rec.firstInstance === undefined ? 0 : rec.firstInstance,
+          false
+        );
+        if (firstInstance !== 0 && !allowFirstInstance) {
+          if (!patchFirstInstance) {
+            throw new IndirectDrawError(
+              'FIRST_INSTANCE_UNSUPPORTED',
+              `record ${i}: firstInstance=${firstInstance} requires the ` +
+                `'indirect-first-instance' feature`
+            );
+          }
+          firstInstance = 0;
+          patched.push(i);
+        }
+        writeU32BytesLE(bytes, off, indexCount);
+        writeU32BytesLE(bytes, off + 4, instanceCount);
+        writeU32BytesLE(bytes, off + 8, firstIndex);
+        writeU32BytesLE(bytes, off + 12, baseVertex);
+        writeU32BytesLE(bytes, off + 16, firstInstance);
+      }
+    } else {
+      for (let i = 0, off = outOffset; i < batch.count; i += 1, off += stride) {
+        const rec = records[i];
+        if (rec === null || typeof rec !== 'object') {
+          throw new TypeError(`${kind} record must be an object`);
+        }
+        const x = checkField(kind, 'x', rec.x, false);
+        const y = checkField(kind, 'y', rec.y, false);
+        const z = checkField(kind, 'z', rec.z, false);
+        writeU32BytesLE(bytes, off, x);
+        writeU32BytesLE(bytes, off + 4, y);
+        writeU32BytesLE(bytes, off + 8, z);
+      }
+    }
+
+    if (resTarget !== null) {
+      resTarget.bytes = bytes;
+      resTarget.stride = stride;
+      resTarget.patched = patched;
+      return resTarget;
     }
     return { bytes, stride, patched };
   }
@@ -1251,7 +1765,7 @@
     return 1 + Math.floor((remaining - recordSize) / stride);
   }
 
-  function resolveBatchCount(requestedCount, options, statsTarget) {
+  function resolveBatchCountInto(out, requestedCount, options, statsTarget) {
     if (!isNonNegSafeIntFast(requestedCount)) {
       recordBoundsRejection(statsTarget);
       throw new RangeError(`count must be a non-negative integer, got ${requestedCount}`);
@@ -1262,17 +1776,20 @@
         : DEFAULT_MAX_INDIRECT_BATCH_COUNT;
     assertPositiveInteger(maxIndirectBatchCount, 'maxIndirectBatchCount');
     if (requestedCount === 0) {
-      return { count: 0, requestedCount: 0, clamped: false, maxIndirectBatchCount };
+      out.count = 0;
+      out.requestedCount = 0;
+      out.clamped = false;
+      out.maxIndirectBatchCount = maxIndirectBatchCount;
+      return out;
     }
     if (requestedCount > maxIndirectBatchCount) {
       if (options && options.clampBatch) {
         recordBatchClamped(statsTarget);
-        return {
-          count: maxIndirectBatchCount,
-          requestedCount,
-          clamped: true,
-          maxIndirectBatchCount,
-        };
+        out.count = maxIndirectBatchCount;
+        out.requestedCount = requestedCount;
+        out.clamped = true;
+        out.maxIndirectBatchCount = maxIndirectBatchCount;
+        return out;
       }
       recordBatchLimitRejected(statsTarget);
       throw new IndirectDrawError(
@@ -1280,7 +1797,20 @@
         `indirect batch count ${requestedCount} exceeds maxIndirectBatchCount ${maxIndirectBatchCount}`
       );
     }
-    return { count: requestedCount, requestedCount, clamped: false, maxIndirectBatchCount };
+    out.count = requestedCount;
+    out.requestedCount = requestedCount;
+    out.clamped = false;
+    out.maxIndirectBatchCount = maxIndirectBatchCount;
+    return out;
+  }
+
+  function resolveBatchCount(requestedCount, options, statsTarget) {
+    return resolveBatchCountInto(
+      { count: 0, requestedCount: 0, clamped: false, maxIndirectBatchCount: DEFAULT_MAX_INDIRECT_BATCH_COUNT },
+      requestedCount,
+      options,
+      statsTarget
+    );
   }
 
   /**
@@ -1339,101 +1869,127 @@
    *   bufferSize: number | null
    * }}
    */
-  function computeIndirectBatchStepPlan(buffer, options) {
-    const opts = options && typeof options === 'object' ? options : {};
-    let recordSize;
-    if (opts.recordSize !== undefined) {
-      recordSize = opts.recordSize;
-    } else if (opts.kind !== undefined) {
-      const layout = LAYOUTS[opts.kind];
-      recordSize = layout ? layout.byteSize : -1;
-    } else {
-      recordSize = opts.indexed ? DRAW_INDEXED_INDIRECT_BYTES : DRAW_INDIRECT_BYTES;
+  function writeStepPlanResult(
+    target,
+    valid,
+    reason,
+    requestedCount,
+    effectiveCount,
+    clamped,
+    clampedReason,
+    recordSize,
+    stride,
+    firstOffset,
+    lastOffset,
+    requiredBytes,
+    bufferSize
+  ) {
+    if (target !== null) {
+      target.valid = valid;
+      target.reason = reason;
+      target.requestedCount = requestedCount;
+      target.effectiveCount = effectiveCount;
+      target.clamped = clamped;
+      target.clampedReason = clampedReason;
+      target.recordSize = recordSize;
+      target.stride = stride;
+      target.firstOffset = firstOffset;
+      target.lastOffset = lastOffset;
+      target.requiredBytes = requiredBytes;
+      target.bufferSize = bufferSize;
+      return target;
     }
+    return {
+      valid,
+      reason,
+      requestedCount,
+      effectiveCount,
+      clamped,
+      clampedReason,
+      recordSize,
+      stride,
+      firstOffset,
+      lastOffset,
+      requiredBytes,
+      bufferSize,
+    };
+  }
 
-    const requestedCount = opts.count !== undefined ? opts.count : opts.maxCommandCount !== undefined ? opts.maxCommandCount : 1;
-    const firstSlot = opts.firstSlot === undefined ? 0 : opts.firstSlot;
-    const baseOffset = opts.baseOffset === undefined ? 0 : opts.baseOffset;
-    const stride = opts.stride === undefined ? recordSize : opts.stride;
-    const clampBatch = opts.clampBatch !== false;
-    const clampToBuffer = opts.clampToBuffer !== false;
-    const maxBatch =
-      opts.maxIndirectBatchCount === undefined
-        ? DEFAULT_MAX_INDIRECT_BATCH_COUNT
-        : opts.maxIndirectBatchCount;
-    const explicitSize = opts.bufferSize;
+  function computeIndirectBatchStepPlanInto(
+    target,
+    buffer,
+    recordSize,
+    requestedCount,
+    firstSlot,
+    baseOffset,
+    stride,
+    explicitSize,
+    maxBatch,
+    clampBatch,
+    clampToBuffer
+  ) {
     const effectiveSize = resolveEffectiveBufferSizeFast(buffer, explicitSize);
     const knownBufferSize = effectiveSize >= 0 ? effectiveSize : null;
-
-    const fail = (reason) => ({
-      valid: false,
-      reason,
-      requestedCount: isNonNegSafeIntFast(requestedCount) ? requestedCount : 0,
-      effectiveCount: 0,
-      clamped: false,
-      clampedReason: null,
-      recordSize: isPosSafeIntFast(recordSize) ? recordSize : 0,
-      stride: isPosSafeIntFast(stride) ? stride : 0,
-      firstOffset: isNonNegSafeIntFast(baseOffset) ? baseOffset : 0,
-      lastOffset: 0,
-      requiredBytes: 0,
-      bufferSize: knownBufferSize,
-    });
+    const safeReq = isNonNegSafeIntFast(requestedCount) ? requestedCount : 0;
+    const safeRec = isPosSafeIntFast(recordSize) ? recordSize : 0;
+    const safeStride = isPosSafeIntFast(stride) ? stride : 0;
+    const safeBase = isNonNegSafeIntFast(baseOffset) ? baseOffset : 0;
 
     if (!isPosSafeIntFast(recordSize)) {
-      return fail('INVALID_RECORD_SIZE');
+      return writeStepPlanResult(target, false, 'INVALID_RECORD_SIZE', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!isNonNegSafeIntFast(firstSlot)) {
-      return fail('INVALID_OFFSET');
+      return writeStepPlanResult(target, false, 'INVALID_OFFSET', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!isNonNegSafeIntFast(baseOffset)) {
-      return fail('INVALID_OFFSET');
+      return writeStepPlanResult(target, false, 'INVALID_OFFSET', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!isPosSafeIntFast(stride) || stride < recordSize || !isAligned4Fast(stride)) {
-      return fail('INVALID_STRIDE');
+      return writeStepPlanResult(target, false, 'INVALID_STRIDE', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!isPosSafeIntFast(maxBatch)) {
-      return fail('INVALID_BATCH_LIMIT');
+      return writeStepPlanResult(target, false, 'INVALID_BATCH_LIMIT', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!isNonNegSafeIntFast(requestedCount)) {
-      return fail('INVALID_COUNT');
+      return writeStepPlanResult(target, false, 'INVALID_COUNT', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!buffer || typeof buffer !== 'object') {
-      return fail('NOT_INDIRECT');
+      return writeStepPlanResult(target, false, 'NOT_INDIRECT', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (buffer.destroyed === true) {
-      return fail('DESTROYED_BUFFER');
+      return writeStepPlanResult(target, false, 'DESTROYED_BUFFER', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if ((buffer.usage & BUFFER_USAGE.INDIRECT) === 0) {
-      return fail('NOT_INDIRECT');
+      return writeStepPlanResult(target, false, 'NOT_INDIRECT', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (effectiveSize === -2 || effectiveSize === -3) {
-      return fail('OUT_OF_BOUNDS');
+      return writeStepPlanResult(target, false, 'OUT_OF_BOUNDS', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
 
     const firstOffset = baseOffset + firstSlot * stride;
     if (!isNonNegSafeIntFast(firstOffset)) {
-      return fail('OUT_OF_BOUNDS');
+      return writeStepPlanResult(target, false, 'OUT_OF_BOUNDS', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
     if (!isAligned4Fast(firstOffset)) {
-      return fail('MISALIGNED_OFFSET');
+      return writeStepPlanResult(target, false, 'MISALIGNED_OFFSET', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
 
     if (requestedCount === 0) {
-      return {
-        valid: true,
-        reason: null,
-        requestedCount: 0,
-        effectiveCount: 0,
-        clamped: false,
-        clampedReason: null,
+      return writeStepPlanResult(
+        target,
+        true,
+        null,
+        0,
+        0,
+        false,
+        null,
         recordSize,
         stride,
         firstOffset,
-        lastOffset: firstOffset,
-        requiredBytes: 0,
-        bufferSize: knownBufferSize,
-      };
+        firstOffset,
+        0,
+        knownBufferSize
+      );
     }
 
     let effectiveCount = requestedCount;
@@ -1442,7 +1998,7 @@
 
     if (effectiveCount > maxBatch) {
       if (!clampBatch) {
-        return fail('BATCH_LIMIT_EXCEEDED');
+        return writeStepPlanResult(target, false, 'BATCH_LIMIT_EXCEEDED', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
       }
       effectiveCount = maxBatch;
       clampedByBatch = true;
@@ -1452,7 +2008,7 @@
       const maxFit = maxRecordsFittingBuffer(effectiveSize, firstOffset, stride, recordSize);
       if (effectiveCount > maxFit) {
         if (!clampToBuffer || maxFit === 0) {
-          return fail('OUT_OF_BOUNDS');
+          return writeStepPlanResult(target, false, 'OUT_OF_BOUNDS', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
         }
         effectiveCount = maxFit;
         clampedByBuffer = true;
@@ -1462,7 +2018,7 @@
     const requiredBytes = stride * (effectiveCount - 1) + recordSize;
     const endByte = firstOffset + requiredBytes;
     if (!Number.isSafeInteger(endByte) || (effectiveSize >= 0 && endByte > effectiveSize)) {
-      return fail('OUT_OF_BOUNDS');
+      return writeStepPlanResult(target, false, 'OUT_OF_BOUNDS', safeReq, 0, false, null, safeRec, safeStride, safeBase, 0, 0, knownBufferSize);
     }
 
     const clamped = clampedByBatch || clampedByBuffer;
@@ -1475,9 +2031,10 @@
             ? 'CLAMPED_TO_BUFFER'
             : null;
 
-    return {
-      valid: true,
-      reason: clampedReason,
+    return writeStepPlanResult(
+      target,
+      true,
+      clampedReason,
       requestedCount,
       effectiveCount,
       clamped,
@@ -1485,34 +2042,63 @@
       recordSize,
       stride,
       firstOffset,
-      lastOffset: firstOffset + (effectiveCount - 1) * stride,
+      firstOffset + (effectiveCount - 1) * stride,
       requiredBytes,
-      bufferSize: knownBufferSize,
-    };
+      knownBufferSize
+    );
   }
 
-  /**
-   * Validate an indirect batch's stride, offset alignment, buffer bounds, and
-   * `maxIndirectBatchCount` guardrail without issuing pass commands.
-   *
-   * @param {{usage:number, size?:number, destroyed?:boolean}} buffer Indirect buffer.
-   * @param {object} options
-   * @param {string} [options.kind] INDIRECT_KIND.
-   * @param {boolean} [options.indexed=false] Used when neither `kind` nor `recordSize` is set.
-   * @param {number} [options.recordSize] Explicit record byte size (16 / 20 / 12).
-   * @param {number} options.count Number of indirect records in the batch.
-   * @param {number} [options.firstSlot=0]
-   * @param {number} [options.baseOffset=0]
-   * @param {number} [options.stride] Bytes between slots (>= recordSize, multiple of 4).
-   * @param {number} [options.bufferSize] Optional explicit buffer byte length.
-   * @param {number} [options.maxIndirectBatchCount=4096]
-   * @param {boolean} [options.clampBatch=false] Clamp oversized batches instead of throwing.
-   * @returns {{count:number, requestedCount:number, clamped:boolean, recordSize:number, stride:number, firstOffset:number, requiredBytes:number}}
-   */
-  function validateIndirectBatch(buffer, options) {
+  function computeIndirectBatchStepPlan(buffer, options, out) {
+    const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+    const outTarget = resolveOutTarget(options, out);
+    let recordSize;
+    if (hasOpts && options.recordSize !== undefined) {
+      recordSize = options.recordSize;
+    } else if (hasOpts && options.kind !== undefined) {
+      const layout = LAYOUTS[options.kind];
+      recordSize = layout ? layout.byteSize : -1;
+    } else {
+      recordSize = hasOpts && options.indexed ? DRAW_INDEXED_INDIRECT_BYTES : DRAW_INDIRECT_BYTES;
+    }
+
+    const requestedCount = hasOpts
+      ? options.count !== undefined
+        ? options.count
+        : options.maxCommandCount !== undefined
+          ? options.maxCommandCount
+          : 1
+      : 1;
+    const firstSlot = hasOpts && options.firstSlot !== undefined ? options.firstSlot : 0;
+    const baseOffset = hasOpts && options.baseOffset !== undefined ? options.baseOffset : 0;
+    const stride = hasOpts && options.stride !== undefined ? options.stride : recordSize;
+    const clampBatch = !hasOpts || options.clampBatch !== false;
+    const clampToBuffer = !hasOpts || options.clampToBuffer !== false;
+    const maxBatch =
+      hasOpts && options.maxIndirectBatchCount !== undefined
+        ? options.maxIndirectBatchCount
+        : DEFAULT_MAX_INDIRECT_BATCH_COUNT;
+    const explicitSize = hasOpts ? options.bufferSize : undefined;
+
+    return computeIndirectBatchStepPlanInto(
+      outTarget,
+      buffer,
+      recordSize,
+      requestedCount,
+      firstSlot,
+      baseOffset,
+      stride,
+      explicitSize,
+      maxBatch,
+      clampBatch,
+      clampToBuffer
+    );
+  }
+
+  function validateIndirectBatch(buffer, options, out) {
     if (!options || typeof options !== 'object') {
       throw new TypeError('options must be an object');
     }
+    const outTarget = resolveOutTarget(options, out);
     const statsTarget = options._statsTarget || null;
     const recordSize =
       options.recordSize !== undefined
@@ -1541,9 +2127,19 @@
       recordBoundsRejection(statsTarget);
       throw new RangeError(`stride must be a multiple of 4 and >= ${recordSize}, got ${stride}`);
     }
-    const batch = resolveBatchCount(options.count, options, statsTarget);
+    const batch = resolveBatchCountInto(_tmpBatchCount, options.count, options, statsTarget);
     const firstOffset = baseOffset + firstSlot * stride;
     if (batch.count === 0) {
+      if (outTarget !== null) {
+        outTarget.count = 0;
+        outTarget.requestedCount = batch.requestedCount;
+        outTarget.clamped = false;
+        outTarget.recordSize = recordSize;
+        outTarget.stride = stride;
+        outTarget.firstOffset = firstOffset;
+        outTarget.requiredBytes = 0;
+        return outTarget;
+      }
       return {
         count: 0,
         requestedCount: batch.requestedCount,
@@ -1555,10 +2151,21 @@
       };
     }
     const requiredBytes = stride * (batch.count - 1) + recordSize;
-    validateIndirectRange(buffer, firstOffset, requiredBytes, {
-      bufferSize: options.bufferSize,
-      _statsTarget: statsTarget,
-    });
+    const status = fastCheckIndirectRange(buffer, firstOffset, requiredBytes, options.bufferSize);
+    if (status !== RANGE_OK) {
+      recordRangeRejection(status, statsTarget, 1);
+      throwForRangeCode(status, buffer, firstOffset, requiredBytes, options.bufferSize);
+    }
+    if (outTarget !== null) {
+      outTarget.count = batch.count;
+      outTarget.requestedCount = batch.requestedCount;
+      outTarget.clamped = batch.clamped;
+      outTarget.recordSize = recordSize;
+      outTarget.stride = stride;
+      outTarget.firstOffset = firstOffset;
+      outTarget.requiredBytes = requiredBytes;
+      return outTarget;
+    }
     return {
       count: batch.count,
       requestedCount: batch.requestedCount,
@@ -1575,26 +2182,40 @@
    *
    * @param {{x:number, y?:number, z?:number}} counts
    * @param {number} [limit=65535] device.limits.maxComputeWorkgroupsPerDimension
+   * @param {object} [out] Optional preallocated scratch target `{ x, y, z }`.
    * @returns {{x:number, y:number, z:number}}
    * @throws {IndirectDrawError} With code DISPATCH_LIMIT.
    */
-  function validateDispatchCounts(counts, limit = DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION) {
+  function validateDispatchCounts(counts, limit = DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION, out) {
     assertPositiveInteger(limit, 'maxComputeWorkgroupsPerDimension');
-    const out = {
-      x: counts.x,
-      y: counts.y === undefined ? 1 : counts.y,
-      z: counts.z === undefined ? 1 : counts.z,
-    };
-    for (const axis of ['x', 'y', 'z']) {
-      checkField('dispatch', axis, out[axis], false);
-      if (out[axis] > limit) {
-        throw new IndirectDrawError(
-          'DISPATCH_LIMIT',
-          `dispatch ${axis}=${out[axis]} exceeds maxComputeWorkgroupsPerDimension ${limit}`
-        );
-      }
+    const x = checkField('dispatch', 'x', counts.x, false);
+    if (x > limit) {
+      throw new IndirectDrawError(
+        'DISPATCH_LIMIT',
+        `dispatch x=${x} exceeds maxComputeWorkgroupsPerDimension ${limit}`
+      );
     }
-    return out;
+    const y = checkField('dispatch', 'y', counts.y === undefined ? 1 : counts.y, false);
+    if (y > limit) {
+      throw new IndirectDrawError(
+        'DISPATCH_LIMIT',
+        `dispatch y=${y} exceeds maxComputeWorkgroupsPerDimension ${limit}`
+      );
+    }
+    const z = checkField('dispatch', 'z', counts.z === undefined ? 1 : counts.z, false);
+    if (z > limit) {
+      throw new IndirectDrawError(
+        'DISPATCH_LIMIT',
+        `dispatch z=${z} exceeds maxComputeWorkgroupsPerDimension ${limit}`
+      );
+    }
+    if (out !== undefined && out !== null && typeof out === 'object') {
+      out.x = x;
+      out.y = y;
+      out.z = z;
+      return out;
+    }
+    return { x, y, z };
   }
 
   /**
@@ -1636,13 +2257,15 @@
    * @returns {number} Number of dispatches issued.
    */
   function encodeDispatches(pass, plan, beforeEach) {
-    plan.forEach((dispatch, index) => {
+    const len = plan.length;
+    for (let i = 0; i < len; i += 1) {
+      const dispatch = plan[i];
       if (beforeEach) {
-        beforeEach(dispatch, index);
+        beforeEach(dispatch, i);
       }
       pass.dispatchWorkgroups(dispatch.x, dispatch.y, dispatch.z);
-    });
-    return plan.length;
+    }
+    return len;
   }
 
   /**
@@ -1652,14 +2275,31 @@
    * @param {number} itemCount
    * @param {number} workgroupSize
    * @param {number} [limit=65535]
-   * @returns {Uint8Array}
+   * @param {Uint8Array|Uint32Array|DataView} [out] Optional preallocated destination (>= 12 bytes).
+   * @param {number} [outOffset=0]
+   * @returns {Uint8Array|Uint32Array|DataView}
    * @throws {IndirectDrawError} DISPATCH_LIMIT when the count does not fit one dimension.
    */
-  function encodeDispatchForItems(itemCount, workgroupSize, limit = DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION) {
+  function encodeDispatchForItems(
+    itemCount,
+    workgroupSize,
+    limit = DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
+    out,
+    outOffset = 0
+  ) {
     assertNonNegativeInteger(itemCount, 'itemCount');
     assertPositiveInteger(workgroupSize, 'workgroupSize');
-    const counts = validateDispatchCounts({ x: Math.ceil(itemCount / workgroupSize), y: 1, z: 1 }, limit);
-    return encodeDispatchIndirect(counts);
+    assertPositiveInteger(limit, 'maxComputeWorkgroupsPerDimension');
+    const x = checkField('dispatch', 'x', Math.ceil(itemCount / workgroupSize), false);
+    if (x > limit) {
+      throw new IndirectDrawError(
+        'DISPATCH_LIMIT',
+        `dispatch x=${x} exceeds maxComputeWorkgroupsPerDimension ${limit}`
+      );
+    }
+    const target = out !== undefined && out !== null ? out : new Uint8Array(DISPATCH_INDIRECT_BYTES);
+    writeDispatchFieldsToTarget(target, outOffset, x, 1, 1);
+    return target;
   }
 
   function visibleAt(mask, i) {
@@ -1990,10 +2630,22 @@
    * @param {boolean} [options.skipInvalid=false] Skip invalid ranges/args instead of throwing.
    * @returns {{calls:number, draws:number, skipped:number, native:boolean}}
    */
-  function encodeMultiDraw(pass, buffer, options) {
+  function writeMultiDrawResult(target, calls, draws, skipped, native) {
+    if (target !== null) {
+      target.calls = calls;
+      target.draws = draws;
+      target.skipped = skipped;
+      target.native = native;
+      return target;
+    }
+    return { calls, draws, skipped, native };
+  }
+
+  function encodeMultiDraw(pass, buffer, options, out) {
     if (!options || typeof options !== 'object') {
       throw new TypeError('options must be an object');
     }
+    const outTarget = resolveOutTarget(options, out);
     const statsTarget = options._statsTarget || null;
     const indexed = Boolean(options.indexed);
     const kind = indexed ? INDIRECT_KIND.DRAW_INDEXED : INDIRECT_KIND.DRAW;
@@ -2015,14 +2667,14 @@
     if (!isNonNegSafeIntFast(firstSlot)) {
       recordRangeRejection(RANGE_INVALID_OFFSET, statsTarget, reqCountFallback);
       if (skipInvalid) {
-        return { calls: 0, draws: 0, skipped: isNonNegSafeIntFast(options.count) ? options.count : 0, native };
+        return writeMultiDrawResult(outTarget, 0, 0, isNonNegSafeIntFast(options.count) ? options.count : 0, native);
       }
       throw new RangeError(`firstSlot must be a non-negative integer, got ${firstSlot}`);
     }
     if (!isNonNegSafeIntFast(baseOffset)) {
       recordRangeRejection(RANGE_INVALID_OFFSET, statsTarget, reqCountFallback);
       if (skipInvalid) {
-        return { calls: 0, draws: 0, skipped: isNonNegSafeIntFast(options.count) ? options.count : 0, native };
+        return writeMultiDrawResult(outTarget, 0, 0, isNonNegSafeIntFast(options.count) ? options.count : 0, native);
       }
       throw new RangeError(`baseOffset must be a non-negative integer, got ${baseOffset}`);
     }
@@ -2033,12 +2685,13 @@
         recordBoundsRejection(statsTarget);
       }
       if (skipInvalid) {
-        return { calls: 0, draws: 0, skipped: isNonNegSafeIntFast(options.count) ? options.count : 0, native };
+        return writeMultiDrawResult(outTarget, 0, 0, isNonNegSafeIntFast(options.count) ? options.count : 0, native);
       }
       throw new RangeError(`stride must be a multiple of 4 and >= ${recordSize}, got ${stride}`);
     }
 
-    let batch;
+    let batchCount;
+    let batchClamped = false;
     if (skipInvalid) {
       const requested = options.count;
       const maxBatch =
@@ -2047,32 +2700,35 @@
           : DEFAULT_MAX_INDIRECT_BATCH_COUNT;
       if (!isNonNegSafeIntFast(requested) || !isPosSafeIntFast(maxBatch)) {
         recordBoundsRejection(statsTarget);
-        return { calls: 0, draws: 0, skipped: 0, native };
+        return writeMultiDrawResult(outTarget, 0, 0, 0, native);
       }
       if (requested > maxBatch) {
         if (options.clampBatch) {
           recordBatchClamped(statsTarget);
-          batch = { count: maxBatch, requestedCount: requested, clamped: true };
+          batchCount = maxBatch;
+          batchClamped = true;
         } else {
           recordBatchLimitRejected(statsTarget);
-          return { calls: 0, draws: 0, skipped: requested, native };
+          return writeMultiDrawResult(outTarget, 0, 0, requested, native);
         }
       } else {
-        batch = { count: requested, requestedCount: requested, clamped: false };
+        batchCount = requested;
       }
     } else {
-      batch = resolveBatchCount(options.count, options, statsTarget);
+      const batch = resolveBatchCountInto(_tmpBatchCount, options.count, options, statsTarget);
+      batchCount = batch.count;
+      batchClamped = batch.clamped;
     }
 
-    if (batch.count === 0) {
+    if (batchCount === 0) {
       recordStat('zeroBatchSkips', 1, statsTarget);
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return { calls: 0, draws: 0, skipped: 0, native };
+      return writeMultiDrawResult(outTarget, 0, 0, 0, native);
     }
 
     const firstOffset = baseOffset + firstSlot * stride;
     const explicitSize = options.bufferSize;
-    let effectiveCount = batch.count;
+    let effectiveCount = batchCount;
     let clampedSkipped = 0;
 
     if (clampToBuffer) {
@@ -2080,7 +2736,7 @@
       if (baseStatus !== RANGE_OK && baseStatus !== RANGE_OUT_OF_BOUNDS) {
         recordRangeRejection(baseStatus, statsTarget, effectiveCount, skipInvalid);
         if (skipInvalid) {
-          return { calls: 0, draws: 0, skipped: effectiveCount, native };
+          return writeMultiDrawResult(outTarget, 0, 0, effectiveCount, native);
         }
         throwForRangeCode(baseStatus, buffer, firstOffset, recordSize, explicitSize);
       }
@@ -2092,7 +2748,7 @@
           effectiveCount = maxFit;
           recordStat('skippedOutOfBoundsDraws', clampedSkipped, statsTarget);
           recordStat('outOfBoundsElided', clampedSkipped, statsTarget);
-          if (!batch.clamped) {
+          if (!batchClamped) {
             if (maxFit === 0) {
               recordBoundsRejection(statsTarget);
             } else {
@@ -2101,7 +2757,7 @@
           }
           if (effectiveCount === 0) {
             recordStat('commandsValidated', clampedSkipped, statsTarget);
-            return { calls: 0, draws: 0, skipped: clampedSkipped, native };
+            return writeMultiDrawResult(outTarget, 0, 0, clampedSkipped, native);
           }
         }
       }
@@ -2118,7 +2774,7 @@
         recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
         recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         if (skipInvalid) {
-          return { calls: 0, draws: 0, skipped: effectiveCount + clampedSkipped, native };
+          return writeMultiDrawResult(outTarget, 0, 0, effectiveCount + clampedSkipped, native);
         }
         throwForRangeCode(status, buffer, firstOffset, spanBytes, explicitSize);
       }
@@ -2128,7 +2784,7 @@
         recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         recordStat('batchesDispatched', 1, statsTarget);
         recordMaxStat('maxMultiDrawCount', effectiveCount, statsTarget);
-        return { calls: 1, draws: effectiveCount, skipped: clampedSkipped, native: true };
+        return writeMultiDrawResult(outTarget, 1, effectiveCount, clampedSkipped, true);
       }
       for (let i = 0, offset = firstOffset; i < effectiveCount; i += 1, offset += stride) {
         pass[method](buffer, offset);
@@ -2137,7 +2793,7 @@
       recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
       recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', effectiveCount, statsTarget);
-      return { calls: effectiveCount, draws: effectiveCount, skipped: clampedSkipped, native: false };
+      return writeMultiDrawResult(outTarget, effectiveCount, effectiveCount, clampedSkipped, false);
     }
 
     // Visibility-masked and/or CPU shadow zero-count elision path: validate bounds atomically
@@ -2154,7 +2810,7 @@
       }
       if (maxVisIdx === -1) {
         recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
-        return { calls: 0, draws: 0, skipped: effectiveCount + clampedSkipped, native };
+        return writeMultiDrawResult(outTarget, 0, 0, effectiveCount + clampedSkipped, native);
       }
     }
 
@@ -2164,7 +2820,7 @@
       recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
       recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
       if (skipInvalid) {
-        return { calls: 0, draws: 0, skipped: effectiveCount + clampedSkipped, native };
+        return writeMultiDrawResult(outTarget, 0, 0, effectiveCount + clampedSkipped, native);
       }
       throwForRangeCode(status, buffer, maxVisOffset, recordSize, explicitSize);
     }
@@ -2230,37 +2886,29 @@
       recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', draws, statsTarget);
     }
-    return { calls, draws, skipped, native };
+    return writeMultiDrawResult(outTarget, calls, draws, skipped, native);
   }
 
-  /**
-   * Issue `dispatchWorkgroupsIndirect` for `count` consecutive slots on a compute pass encoder,
-   * validating offset alignment, stride, buffer bounds, and `maxIndirectBatchCount` before
-   * invoking WebGPU pass commands.
-   *
-   * @param {{dispatchWorkgroupsIndirect: Function}} pass GPUComputePassEncoder.
-   * @param {{usage:number, size?:number, destroyed?:boolean}} buffer Indirect buffer.
-   * @param {object} options
-   * @param {number} options.count
-   * @param {number} [options.firstSlot=0]
-   * @param {number} [options.baseOffset=0]
-   * @param {number} [options.stride=12] Bytes between slots (>= 12, multiple of 4).
-   * @param {number} [options.bufferSize] Optional explicit buffer byte length.
-   * @param {ArrayLike<boolean|number>} [options.visibility] CPU mask indexed from `firstSlot`; falsy skips.
-   * @param {number} [options.maxIndirectBatchCount=4096] Maximum dispatches allowed per batch.
-   * @param {boolean} [options.clampBatch=false] Clamp oversized batches instead of throwing.
-   * @param {boolean} [options.clampToBuffer=false] Clamp count to records fitting within known buffer size.
-   * @param {boolean} [options.skipInvalid=false] Skip invalid ranges/args instead of throwing.
-   * @returns {{calls:number, dispatches:number, skipped:number, clamped:boolean}}
-   */
-  function encodeMultiDispatchIndirect(pass, buffer, options) {
+  function writeMultiDispatchResult(target, calls, dispatches, skipped, clamped) {
+    if (target !== null) {
+      target.calls = calls;
+      target.dispatches = dispatches;
+      target.skipped = skipped;
+      target.clamped = clamped;
+      return target;
+    }
+    return { calls, dispatches, skipped, clamped };
+  }
+
+  function encodeMultiDispatchIndirect(pass, buffer, options, out) {
     const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+    const outTarget = resolveOutTarget(options, out);
     const skipInvalid = hasOpts && Boolean(options.skipInvalid);
     const statsTarget = hasOpts ? options._statsTarget || null : null;
     if (!pass || typeof pass.dispatchWorkgroupsIndirect !== 'function') {
       if (skipInvalid) {
         recordBoundsRejection(statsTarget);
-        return { calls: 0, dispatches: 0, skipped: 0, clamped: false };
+        return writeMultiDispatchResult(outTarget, 0, 0, 0, false);
       }
       throw new TypeError('pass must implement dispatchWorkgroupsIndirect');
     }
@@ -2277,24 +2925,26 @@
     if (!isNonNegSafeIntFast(firstSlot)) {
       recordRangeRejection(RANGE_INVALID_OFFSET, statsTarget, reqCountFallback);
       if (skipInvalid) {
-        return {
-          calls: 0,
-          dispatches: 0,
-          skipped: isNonNegSafeIntFast(options.count) ? options.count : 0,
-          clamped: false,
-        };
+        return writeMultiDispatchResult(
+          outTarget,
+          0,
+          0,
+          isNonNegSafeIntFast(options.count) ? options.count : 0,
+          false
+        );
       }
       throw new RangeError(`firstSlot must be a non-negative integer, got ${firstSlot}`);
     }
     if (!isNonNegSafeIntFast(baseOffset)) {
       recordRangeRejection(RANGE_INVALID_OFFSET, statsTarget, reqCountFallback);
       if (skipInvalid) {
-        return {
-          calls: 0,
-          dispatches: 0,
-          skipped: isNonNegSafeIntFast(options.count) ? options.count : 0,
-          clamped: false,
-        };
+        return writeMultiDispatchResult(
+          outTarget,
+          0,
+          0,
+          isNonNegSafeIntFast(options.count) ? options.count : 0,
+          false
+        );
       }
       throw new RangeError(`baseOffset must be a non-negative integer, got ${baseOffset}`);
     }
@@ -2305,17 +2955,19 @@
         recordBoundsRejection(statsTarget);
       }
       if (skipInvalid) {
-        return {
-          calls: 0,
-          dispatches: 0,
-          skipped: isNonNegSafeIntFast(options.count) ? options.count : 0,
-          clamped: false,
-        };
+        return writeMultiDispatchResult(
+          outTarget,
+          0,
+          0,
+          isNonNegSafeIntFast(options.count) ? options.count : 0,
+          false
+        );
       }
       throw new RangeError(`stride must be a multiple of 4 and >= ${recordSize}, got ${stride}`);
     }
 
-    let batch;
+    let batchCount;
+    let clamped = false;
     if (skipInvalid) {
       const requested = options.count;
       const maxBatch =
@@ -2324,33 +2976,35 @@
           : DEFAULT_MAX_INDIRECT_BATCH_COUNT;
       if (!isNonNegSafeIntFast(requested) || !isPosSafeIntFast(maxBatch)) {
         recordBoundsRejection(statsTarget);
-        return { calls: 0, dispatches: 0, skipped: 0, clamped: false };
+        return writeMultiDispatchResult(outTarget, 0, 0, 0, false);
       }
       if (requested > maxBatch) {
         if (options.clampBatch) {
           recordBatchClamped(statsTarget);
-          batch = { count: maxBatch, requestedCount: requested, clamped: true };
+          batchCount = maxBatch;
+          clamped = true;
         } else {
           recordBatchLimitRejected(statsTarget);
-          return { calls: 0, dispatches: 0, skipped: requested, clamped: false };
+          return writeMultiDispatchResult(outTarget, 0, 0, requested, false);
         }
       } else {
-        batch = { count: requested, requestedCount: requested, clamped: false };
+        batchCount = requested;
       }
     } else {
-      batch = resolveBatchCount(options.count, options, statsTarget);
+      const batch = resolveBatchCountInto(_tmpBatchCount, options.count, options, statsTarget);
+      batchCount = batch.count;
+      clamped = batch.clamped;
     }
 
-    if (batch.count === 0) {
+    if (batchCount === 0) {
       recordStat('zeroBatchSkips', 1, statsTarget);
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return { calls: 0, dispatches: 0, skipped: 0, clamped: false };
+      return writeMultiDispatchResult(outTarget, 0, 0, 0, false);
     }
 
     const firstOffset = baseOffset + firstSlot * stride;
     const explicitSize = options.bufferSize;
-    let effectiveCount = batch.count;
-    let clamped = batch.clamped;
+    let effectiveCount = batchCount;
     let clampedSkipped = 0;
 
     if (clampToBuffer) {
@@ -2358,7 +3012,7 @@
       if (baseStatus !== RANGE_OK && baseStatus !== RANGE_OUT_OF_BOUNDS) {
         recordRangeRejection(baseStatus, statsTarget, effectiveCount, skipInvalid);
         if (skipInvalid) {
-          return { calls: 0, dispatches: 0, skipped: effectiveCount, clamped };
+          return writeMultiDispatchResult(outTarget, 0, 0, effectiveCount, clamped);
         }
         throwForRangeCode(baseStatus, buffer, firstOffset, recordSize, explicitSize);
       }
@@ -2380,7 +3034,7 @@
           clamped = true;
           if (effectiveCount === 0) {
             recordStat('commandsValidated', clampedSkipped, statsTarget);
-            return { calls: 0, dispatches: 0, skipped: clampedSkipped, clamped: true };
+            return writeMultiDispatchResult(outTarget, 0, 0, clampedSkipped, true);
           }
         }
       }
@@ -2397,12 +3051,7 @@
         recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
         recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         if (skipInvalid) {
-          return {
-            calls: 0,
-            dispatches: 0,
-            skipped: effectiveCount + clampedSkipped,
-            clamped,
-          };
+          return writeMultiDispatchResult(outTarget, 0, 0, effectiveCount + clampedSkipped, clamped);
         }
         throwForRangeCode(status, buffer, firstOffset, spanBytes, explicitSize);
       }
@@ -2413,12 +3062,7 @@
       recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
       recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', effectiveCount, statsTarget);
-      return {
-        calls: effectiveCount,
-        dispatches: effectiveCount,
-        skipped: clampedSkipped,
-        clamped,
-      };
+      return writeMultiDispatchResult(outTarget, effectiveCount, effectiveCount, clampedSkipped, clamped);
     }
 
     const visibility = hasVisibility ? options.visibility : null;
@@ -2433,7 +3077,7 @@
       }
       if (maxVisIdx === -1) {
         recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
-        return { calls: 0, dispatches: 0, skipped: effectiveCount + clampedSkipped, clamped };
+        return writeMultiDispatchResult(outTarget, 0, 0, effectiveCount + clampedSkipped, clamped);
       }
     }
 
@@ -2443,12 +3087,7 @@
       recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
       recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
       if (skipInvalid) {
-        return {
-          calls: 0,
-          dispatches: 0,
-          skipped: effectiveCount + clampedSkipped,
-          clamped,
-        };
+        return writeMultiDispatchResult(outTarget, 0, 0, effectiveCount + clampedSkipped, clamped);
       }
       throwForRangeCode(status, buffer, maxVisOffset, recordSize, explicitSize);
     }
@@ -2479,7 +3118,7 @@
       recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', dispatches, statsTarget);
     }
-    return { calls: dispatches, dispatches, skipped, clamped };
+    return writeMultiDispatchResult(outTarget, dispatches, dispatches, skipped, clamped);
   }
 
   /**
@@ -2711,17 +3350,19 @@
       );
     }
 
-    const plan = computeIndirectBatchStepPlan(buffer, {
-      kind,
-      count: requestedCount,
+    const plan = computeIndirectBatchStepPlanInto(
+      _tmpStepPlan,
+      buffer,
+      recordSize,
+      requestedCount,
       firstSlot,
-      baseOffset: argOffset,
+      argOffset,
       stride,
-      bufferSize: explicitSize,
-      maxIndirectBatchCount: maxBatch,
+      explicitSize,
+      maxBatch,
       clampBatch,
-      clampToBuffer,
-    });
+      clampToBuffer
+    );
 
     if (!plan.valid) {
       const skippedCount = plan.requestedCount > 0 ? plan.requestedCount : 1;
@@ -3808,8 +4449,46 @@
       this.nextSlot = 0;
       this.live = new Set();
       this.dirty = [];
+      this._dirtyRangePool = [];
+      this._dirtyUnsorted = false;
+      this._encodeDrawsOpts = {
+        indexed: kind === INDIRECT_KIND.DRAW_INDEXED,
+        firstSlot: 0,
+        count: 0,
+        baseOffset: 0,
+        stride: this.stride,
+        bufferSize: undefined,
+        visibility: undefined,
+        shadowData: undefined,
+        elideZeroCount: undefined,
+        useNative: false,
+        maxIndirectBatchCount: maxIndirectBatchCount,
+        clampBatch: this.clampBatch,
+        clampToBuffer: false,
+        skipInvalid: false,
+        out: undefined,
+        _statsTarget: null,
+      };
+      this._executeDrawsOpts = {
+        firstSlot: 0,
+        count: 0,
+        stride: this.stride,
+        bufferSize: undefined,
+        visibility: undefined,
+        shadowData: undefined,
+        elideZeroCount: undefined,
+        useNative: false,
+        maxIndirectBatchCount: maxIndirectBatchCount,
+        clampBatch: true,
+        clampToBuffer: true,
+        strict: false,
+        out: undefined,
+        _statsTarget: null,
+      };
       this.destroyed = false;
       this._stats = createEmptyStats();
+      this._encodeDrawsOpts._statsTarget = this._stats;
+      this._executeDrawsOpts._statsTarget = this._stats;
     }
 
     _createBuffer(capacity) {
@@ -3895,7 +4574,7 @@
 
     /**
      * Write CPU args for a slot (staged; call flush() to upload). Applies the
-     * `indirect-first-instance` policy configured on the buffer.
+     * `indirect-first-instance` policy configured on the buffer with zero heap allocations.
      *
      * @param {number} slot
      * @param {object} record
@@ -3903,58 +4582,167 @@
     setArgs(slot, record) {
       this._assertAlive();
       this._assertLive(slot);
-      const { bytes } = encodeBatch(this.kind, [record], {
-        indirectFirstInstance: this.indirectFirstInstance,
-        patchFirstInstance: this.patchFirstInstance,
-      });
-      this.shadow.set(bytes, slot * this.stride);
-      this._markDirty(slot * this.stride, this.stride);
+      if (record === null || typeof record !== 'object') {
+        throw new TypeError(`${this.kind} record must be an object`);
+      }
+      const off = slot * this.stride;
+      if (this.kind === INDIRECT_KIND.DRAW) {
+        const vertexCount = checkField(this.kind, 'vertexCount', record.vertexCount, false);
+        const instanceCount = checkField(this.kind, 'instanceCount', record.instanceCount, false);
+        const firstVertex = checkField(
+          this.kind,
+          'firstVertex',
+          record.firstVertex === undefined ? 0 : record.firstVertex,
+          false
+        );
+        let firstInstance = checkField(
+          this.kind,
+          'firstInstance',
+          record.firstInstance === undefined ? 0 : record.firstInstance,
+          false
+        );
+        if (firstInstance !== 0 && !this.indirectFirstInstance) {
+          if (!this.patchFirstInstance) {
+            throw new IndirectDrawError(
+              'FIRST_INSTANCE_UNSUPPORTED',
+              `record 0: firstInstance=${firstInstance} requires the 'indirect-first-instance' feature`
+            );
+          }
+          firstInstance = 0;
+        }
+        writeU32BytesLE(this.shadow, off, vertexCount);
+        writeU32BytesLE(this.shadow, off + 4, instanceCount);
+        writeU32BytesLE(this.shadow, off + 8, firstVertex);
+        writeU32BytesLE(this.shadow, off + 12, firstInstance);
+      } else {
+        const indexCount = checkField(this.kind, 'indexCount', record.indexCount, false);
+        const instanceCount = checkField(this.kind, 'instanceCount', record.instanceCount, false);
+        const firstIndex = checkField(
+          this.kind,
+          'firstIndex',
+          record.firstIndex === undefined ? 0 : record.firstIndex,
+          false
+        );
+        const baseVertex = checkField(
+          this.kind,
+          'baseVertex',
+          record.baseVertex === undefined ? 0 : record.baseVertex,
+          true
+        );
+        let firstInstance = checkField(
+          this.kind,
+          'firstInstance',
+          record.firstInstance === undefined ? 0 : record.firstInstance,
+          false
+        );
+        if (firstInstance !== 0 && !this.indirectFirstInstance) {
+          if (!this.patchFirstInstance) {
+            throw new IndirectDrawError(
+              'FIRST_INSTANCE_UNSUPPORTED',
+              `record 0: firstInstance=${firstInstance} requires the 'indirect-first-instance' feature`
+            );
+          }
+          firstInstance = 0;
+        }
+        writeU32BytesLE(this.shadow, off, indexCount);
+        writeU32BytesLE(this.shadow, off + 4, instanceCount);
+        writeU32BytesLE(this.shadow, off + 8, firstIndex);
+        writeU32BytesLE(this.shadow, off + 12, baseVertex);
+        writeU32BytesLE(this.shadow, off + 16, firstInstance);
+      }
+      this._markDirty(off, this.stride);
     }
 
     /**
      * Last CPU-written args of a slot (GPU-side culling edits are not reflected).
      * @param {number} slot
+     * @param {object} [out] Optional preallocated scratch target.
      * @returns {object}
      */
-    getArgs(slot) {
+    getArgs(slot, out) {
       this._assertLive(slot);
-      return decodeRecord(this.kind, this.shadow, slot * this.stride);
+      return decodeRecord(this.kind, this.shadow, slot * this.stride, out);
     }
 
     _markDirty(start, length) {
-      this.dirty.push({ start, end: start + length });
+      const end = start + length;
+      const dirty = this.dirty;
+      const len = dirty.length;
+      if (len > 0) {
+        const last = dirty[len - 1];
+        if (start >= last.start) {
+          if (start <= last.end + this.mergeGap) {
+            if (end > last.end) {
+              last.end = end;
+            }
+            return;
+          }
+        } else {
+          this._dirtyUnsorted = true;
+        }
+      }
+      let entry;
+      if (this._dirtyRangePool.length > 0) {
+        entry = this._dirtyRangePool.pop();
+        entry.start = start;
+        entry.end = end;
+      } else {
+        entry = { start, end };
+      }
+      dirty.push(entry);
     }
 
     /**
      * Upload dirty ranges with `queue.writeBuffer`, coalescing overlapping, adjacent (and,
-     * with `mergeGap`, nearby) ranges into one write each.
+     * with `mergeGap`, nearby) ranges into one write each with zero per-flush array allocations.
      *
      * @returns {number} Number of writeBuffer calls issued.
      */
     flush() {
       this._assertAlive();
-      if (this.dirty.length === 0) {
+      const dirty = this.dirty;
+      const len = dirty.length;
+      if (len === 0) {
         return 0;
       }
-      const sorted = this.dirty.sort((a, b) => a.start - b.start);
-      const merged = [];
-      for (const range of sorted) {
-        const last = merged[merged.length - 1];
-        if (last && range.start <= last.end + this.mergeGap) {
-          last.end = Math.max(last.end, range.end);
+      if (len > 1 && this._dirtyUnsorted) {
+        dirty.sort(compareDirtyRangeStart);
+      }
+      this._dirtyUnsorted = false;
+
+      // Coalesce sorted ranges in-place.
+      let writeIdx = 0;
+      let cur = dirty[0];
+      const gap = this.mergeGap;
+      for (let i = 1; i < len; i += 1) {
+        const range = dirty[i];
+        if (range.start <= cur.end + gap) {
+          if (range.end > cur.end) {
+            cur.end = range.end;
+          }
+          if (this._dirtyRangePool.length < MAX_DIRTY_RANGE_POOL_SIZE) {
+            this._dirtyRangePool.push(range);
+          }
         } else {
-          merged.push({ start: range.start, end: range.end });
+          writeIdx += 1;
+          dirty[writeIdx] = range;
+          cur = range;
         }
       }
-      this.dirty = [];
-      for (const range of merged) {
+      const mergedCount = writeIdx + 1;
+      for (let i = 0; i < mergedCount; i += 1) {
+        const range = dirty[i];
         this.device.queue.writeBuffer(
           this.buffer,
           range.start,
           this.shadow.subarray(range.start, range.end)
         );
+        if (this._dirtyRangePool.length < MAX_DIRTY_RANGE_POOL_SIZE) {
+          this._dirtyRangePool.push(range);
+        }
       }
-      return merged.length;
+      dirty.length = 0;
+      return mergedCount;
     }
 
     /**
@@ -4019,30 +4807,45 @@
      * @param {object} [options] firstSlot, count (default: all slots handed out), visibility, useNative, maxIndirectBatchCount, clampBatch.
      * @returns {{calls:number, draws:number, skipped:number, native:boolean}}
      */
-    encodeDraws(pass, options = {}) {
+    encodeDraws(pass, options, out) {
       this._assertAlive();
-      const firstSlot = options.firstSlot || 0;
+      const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+      const firstSlot = hasOpts && options.firstSlot !== undefined ? options.firstSlot : 0;
       assertNonNegativeInteger(firstSlot, 'firstSlot');
-      const count = options.count === undefined ? Math.max(0, this.nextSlot - firstSlot) : options.count;
-      return encodeMultiDraw(pass, this.buffer, {
-        ...options,
-        indexed: this.kind === INDIRECT_KIND.DRAW_INDEXED,
-        firstSlot,
-        count,
-        stride: this.stride,
-        shadowData:
-          options.shadowData !== undefined
-            ? options.shadowData
-            : options.elideZeroCount === true
-              ? this.shadow
-              : undefined,
-        maxIndirectBatchCount:
-          options.maxIndirectBatchCount === undefined
-            ? this.maxIndirectBatchCount
-            : options.maxIndirectBatchCount,
-        clampBatch: options.clampBatch === undefined ? this.clampBatch : options.clampBatch,
-        _statsTarget: this._stats,
-      });
+      const count =
+        hasOpts && options.count !== undefined
+          ? options.count
+          : Math.max(0, this.nextSlot - firstSlot);
+      const o = this._encodeDrawsOpts;
+      o.indexed = this.kind === INDIRECT_KIND.DRAW_INDEXED;
+      o.firstSlot = firstSlot;
+      o.count = count;
+      o.baseOffset = hasOpts && options.baseOffset !== undefined ? options.baseOffset : 0;
+      o.stride = this.stride;
+      o.bufferSize = hasOpts ? options.bufferSize : undefined;
+      o.visibility = hasOpts ? options.visibility : undefined;
+      o.shadowData =
+        hasOpts && options.shadowData !== undefined
+          ? options.shadowData
+          : hasOpts && options.elideZeroCount === true
+            ? this.shadow
+            : undefined;
+      o.elideZeroCount = hasOpts ? options.elideZeroCount : undefined;
+      o.useNative = hasOpts && Boolean(options.useNative);
+      o.maxIndirectBatchCount =
+        hasOpts && options.maxIndirectBatchCount !== undefined
+          ? options.maxIndirectBatchCount
+          : this.maxIndirectBatchCount;
+      o.clampBatch = hasOpts && options.clampBatch !== undefined ? options.clampBatch : this.clampBatch;
+      o.clampToBuffer = hasOpts && Boolean(options.clampToBuffer);
+      o.skipInvalid = hasOpts && Boolean(options.skipInvalid);
+      o.out = out !== undefined ? out : hasOpts ? options.out : undefined;
+      o._statsTarget = this._stats;
+      const result = encodeMultiDraw(pass, this.buffer, o, o.out);
+      o.visibility = undefined;
+      o.shadowData = undefined;
+      o.out = undefined;
+      return result;
     }
 
     /**
@@ -4051,31 +4854,44 @@
      *
      * @param {object} pass GPURenderPassEncoder.
      * @param {object} [options] firstSlot, count (default: handed-out slots), visibility, useNative, maxIndirectBatchCount, clampBatch, clampToBuffer, strict, elideZeroCount.
+     * @param {object} [out] Optional preallocated scratch result object.
      */
-    executeDraws(pass, options = {}) {
+    executeDraws(pass, options, out) {
       this._assertAlive();
-      const firstSlot = options.firstSlot || 0;
+      const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+      const firstSlot = hasOpts && options.firstSlot !== undefined ? options.firstSlot : 0;
       const count =
-        options.count === undefined ? Math.max(0, this.nextSlot - firstSlot) : options.count;
-      return executeIndirect(pass, this.kind, this.buffer, 0, {
-        ...options,
-        firstSlot,
-        count,
-        stride: this.stride,
-        shadowData:
-          options.shadowData !== undefined
-            ? options.shadowData
-            : options.elideZeroCount === true
-              ? this.shadow
-              : undefined,
-        maxIndirectBatchCount:
-          options.maxIndirectBatchCount === undefined
-            ? this.maxIndirectBatchCount
-            : options.maxIndirectBatchCount,
-        clampBatch: options.clampBatch === undefined ? true : options.clampBatch,
-        clampToBuffer: options.clampToBuffer === undefined ? true : options.clampToBuffer,
-        _statsTarget: this._stats,
-      });
+        hasOpts && options.count !== undefined
+          ? options.count
+          : Math.max(0, this.nextSlot - firstSlot);
+      const o = this._executeDrawsOpts;
+      o.firstSlot = firstSlot;
+      o.count = count;
+      o.stride = this.stride;
+      o.bufferSize = hasOpts ? options.bufferSize : undefined;
+      o.visibility = hasOpts ? options.visibility : undefined;
+      o.shadowData =
+        hasOpts && options.shadowData !== undefined
+          ? options.shadowData
+          : hasOpts && options.elideZeroCount === true
+            ? this.shadow
+            : undefined;
+      o.elideZeroCount = hasOpts ? options.elideZeroCount : undefined;
+      o.useNative = hasOpts && Boolean(options.useNative);
+      o.maxIndirectBatchCount =
+        hasOpts && options.maxIndirectBatchCount !== undefined
+          ? options.maxIndirectBatchCount
+          : this.maxIndirectBatchCount;
+      o.clampBatch = hasOpts && options.clampBatch !== undefined ? options.clampBatch : true;
+      o.clampToBuffer = hasOpts && options.clampToBuffer !== undefined ? options.clampToBuffer : true;
+      o.strict = hasOpts && Boolean(options.strict);
+      o.out = out !== undefined ? out : hasOpts ? options.out : undefined;
+      o._statsTarget = this._stats;
+      const result = executeIndirect(pass, this.kind, this.buffer, 0, o, o.out);
+      o.visibility = undefined;
+      o.shadowData = undefined;
+      o.out = undefined;
+      return result;
     }
 
     /**
@@ -4153,6 +4969,8 @@
      */
     resetStats() {
       this._stats = createEmptyStats();
+      this._encodeDrawsOpts._statsTarget = this._stats;
+      this._executeDrawsOpts._statsTarget = this._stats;
     }
 
     /** Destroy the GPU buffer; further use throws. Idempotent. */
@@ -4162,9 +4980,11 @@
       }
       this.destroyed = true;
       this.buffer.destroy();
-      this.dirty = [];
+      this.dirty.length = 0;
+      this._dirtyRangePool.length = 0;
+      this._dirtyUnsorted = false;
       this.live.clear();
-      this.freeSlots = [];
+      this.freeSlots.length = 0;
     }
   }
 
@@ -4400,27 +5220,7 @@
    *   cacheHit: boolean
    * }}
    */
-  function getOrCreateIndirectClampPipeline(device, kind, options) {
-    if (
-      !device ||
-      typeof device !== 'object' ||
-      typeof device.createShaderModule !== 'function' ||
-      typeof device.createComputePipeline !== 'function'
-    ) {
-      throw new TypeError(
-        'getOrCreateIndirectClampPipeline requires a GPUDevice with createShaderModule() and createComputePipeline()'
-      );
-    }
-    clampInputWordCount(kind);
-    const wgSize =
-      options && options.workgroupSize !== undefined
-        ? options.workgroupSize
-        : DEFAULT_CLAMP_WORKGROUP_SIZE;
-    if (!Number.isInteger(wgSize) || wgSize < 1 || wgSize > 256) {
-      throw new RangeError(`workgroupSize must be an integer in [1, 256], got ${wgSize}`);
-    }
-    const statsTarget = options && options._statsTarget ? options._statsTarget : null;
-
+  function _getOrCreateIndirectClampPipelineInternal(device, kind, wgSize, statsTarget, out) {
     let perDevice = _deviceClampPipelineCache.get(device);
     if (!perDevice) {
       perDevice = new Map();
@@ -4430,6 +5230,18 @@
     const cached = perDevice.get(key);
     if (cached && cached.pipeline && cached.pipeline.destroyed !== true) {
       recordStat('gpuClampPipelineCacheHits', 1, statsTarget);
+      if (out !== null) {
+        out.kind = cached.kind;
+        out.workgroupSize = cached.workgroupSize;
+        out.wgsl = cached.wgsl;
+        out.module = cached.module;
+        out.bindGroupLayout = cached.bindGroupLayout;
+        out.pipelineLayout = cached.pipelineLayout;
+        out.pipeline = cached.pipeline;
+        out.hasDynamicParamsOffset = cached.hasDynamicParamsOffset;
+        out.cacheHit = true;
+        return out;
+      }
       return {
         kind: cached.kind,
         workgroupSize: cached.workgroupSize,
@@ -4516,6 +5328,18 @@
     };
     perDevice.set(key, entry);
     recordStat('gpuClampPipelinesCreated', 1, statsTarget);
+    if (out !== null) {
+      out.kind = entry.kind;
+      out.workgroupSize = entry.workgroupSize;
+      out.wgsl = entry.wgsl;
+      out.module = entry.module;
+      out.bindGroupLayout = entry.bindGroupLayout;
+      out.pipelineLayout = entry.pipelineLayout;
+      out.pipeline = entry.pipeline;
+      out.hasDynamicParamsOffset = entry.hasDynamicParamsOffset;
+      out.cacheHit = false;
+      return out;
+    }
     return {
       kind: entry.kind,
       workgroupSize: entry.workgroupSize,
@@ -4527,6 +5351,30 @@
       hasDynamicParamsOffset: entry.hasDynamicParamsOffset,
       cacheHit: false,
     };
+  }
+
+  function getOrCreateIndirectClampPipeline(device, kind, options) {
+    if (
+      !device ||
+      typeof device !== 'object' ||
+      typeof device.createShaderModule !== 'function' ||
+      typeof device.createComputePipeline !== 'function'
+    ) {
+      throw new TypeError(
+        'getOrCreateIndirectClampPipeline requires a GPUDevice with createShaderModule() and createComputePipeline()'
+      );
+    }
+    clampInputWordCount(kind);
+    const wgSize =
+      options && options.workgroupSize !== undefined
+        ? options.workgroupSize
+        : DEFAULT_CLAMP_WORKGROUP_SIZE;
+    if (!Number.isInteger(wgSize) || wgSize < 1 || wgSize > 256) {
+      throw new RangeError(`workgroupSize must be an integer in [1, 256], got ${wgSize}`);
+    }
+    const statsTarget = options && options._statsTarget ? options._statsTarget : null;
+    const out = options && options.out && typeof options.out === 'object' ? options.out : null;
+    return _getOrCreateIndirectClampPipelineInternal(device, kind, wgSize, statsTarget, out);
   }
 
   function writeClampPassResult(
@@ -4676,9 +5524,75 @@
       this._nextResourceId = 0;
       this._bgCache = new Map();
       this._maxBgCacheEntries = 256;
+      this._lastBgPipe = null;
+      this._lastBgParams = null;
+      this._lastBgKeyOffset = -1;
+      this._lastBgSrc = null;
+      this._lastBgCount = null;
+      this._lastBgDst = null;
+      this._lastBg = null;
+      this._pipeCache = [null, null, null, null];
+      this._pipeInfoScratch = {
+        kind: INDIRECT_CLAMP_KIND.DRAW,
+        workgroupSize: this.workgroupSize,
+        wgsl: '',
+        module: null,
+        bindGroupLayout: null,
+        pipelineLayout: null,
+        pipeline: null,
+        hasDynamicParamsOffset: false,
+        cacheHit: false,
+      };
       this._stats = createEmptyStats();
       this._bgCacheHits = 0;
       this._bgCacheMisses = 0;
+    }
+
+    _clearLastBgFastPath() {
+      this._lastBgPipe = null;
+      this._lastBgParams = null;
+      this._lastBgKeyOffset = -1;
+      this._lastBgSrc = null;
+      this._lastBgCount = null;
+      this._lastBgDst = null;
+      this._lastBg = null;
+    }
+
+    _resolveClampPipeline(kind) {
+      const idx = clampKindNumericId(kind);
+      const cached = this._pipeCache[idx];
+      if (cached !== null && cached.pipeline && cached.pipeline.destroyed !== true) {
+        recordStat('gpuClampPipelineCacheHits', 1, this._stats);
+        const out = this._pipeInfoScratch;
+        out.kind = cached.kind;
+        out.workgroupSize = cached.workgroupSize;
+        out.wgsl = cached.wgsl;
+        out.module = cached.module;
+        out.bindGroupLayout = cached.bindGroupLayout;
+        out.pipelineLayout = cached.pipelineLayout;
+        out.pipeline = cached.pipeline;
+        out.hasDynamicParamsOffset = cached.hasDynamicParamsOffset;
+        out.cacheHit = true;
+        return out;
+      }
+      const info = _getOrCreateIndirectClampPipelineInternal(
+        this.device,
+        kind,
+        this.workgroupSize,
+        this._stats,
+        this._pipeInfoScratch
+      );
+      this._pipeCache[idx] = {
+        kind: info.kind,
+        workgroupSize: info.workgroupSize,
+        wgsl: info.wgsl,
+        module: info.module,
+        bindGroupLayout: info.bindGroupLayout,
+        pipelineLayout: info.pipelineLayout,
+        pipeline: info.pipeline,
+        hasDynamicParamsOffset: info.hasDynamicParamsOffset,
+      };
+      return info;
     }
 
     _getResId(obj) {
@@ -4718,6 +5632,7 @@
       });
       this._paramsSlotCursor = 0;
       this._bgCache.clear();
+      this._clearLastBgFastPath();
       return this._paramsBuffer;
     }
 
@@ -4749,6 +5664,7 @@
       this.outputRingBytes = nextSize;
       this._outputRingCursor = 0;
       this._bgCache.clear();
+      this._clearLastBgFastPath();
       return this._outputRingBuffer;
     }
 
@@ -4767,6 +5683,26 @@
     _getOrCreateClampBindGroup(pipeInfo, paramsBuffer, srcBuffer, countBuffer, dstBuffer, paramsOffset) {
       const dynamic = pipeInfo.hasDynamicParamsOffset;
       const keyOffset = dynamic ? 0 : paramsOffset;
+
+      // Zero-allocation direct-reference fast path (avoids string key concat & Map lookup).
+      if (
+        this._lastBg !== null &&
+        this._lastBg.destroyed !== true &&
+        this._lastBgPipe === pipeInfo.pipeline &&
+        this._lastBgParams === paramsBuffer &&
+        this._lastBgKeyOffset === keyOffset &&
+        this._lastBgSrc === srcBuffer &&
+        this._lastBgCount === countBuffer &&
+        this._lastBgDst === dstBuffer &&
+        paramsBuffer.destroyed !== true &&
+        srcBuffer.destroyed !== true &&
+        countBuffer.destroyed !== true &&
+        dstBuffer.destroyed !== true
+      ) {
+        this._bgCacheHits += 1;
+        return this._lastBg;
+      }
+
       const key =
         `${this._getResId(pipeInfo.pipeline)}:` +
         `${this._getResId(paramsBuffer)}:${keyOffset}:` +
@@ -4789,6 +5725,13 @@
         dstBuffer.destroyed !== true
       ) {
         this._bgCacheHits += 1;
+        this._lastBgPipe = pipeInfo.pipeline;
+        this._lastBgParams = paramsBuffer;
+        this._lastBgKeyOffset = keyOffset;
+        this._lastBgSrc = srcBuffer;
+        this._lastBgCount = countBuffer;
+        this._lastBgDst = dstBuffer;
+        this._lastBg = cached.bg;
         return cached.bg;
       }
 
@@ -4813,6 +5756,13 @@
         countBuffer,
         dstBuffer,
       });
+      this._lastBgPipe = pipeInfo.pipeline;
+      this._lastBgParams = paramsBuffer;
+      this._lastBgKeyOffset = keyOffset;
+      this._lastBgSrc = srcBuffer;
+      this._lastBgCount = countBuffer;
+      this._lastBgDst = dstBuffer;
+      this._lastBg = bg;
       return bg;
     }
 
@@ -5223,10 +6173,7 @@
         dstBuffer = this._outputRingBuffer;
       }
 
-      const pipeInfo = getOrCreateIndirectClampPipeline(this.device, kind, {
-        workgroupSize: this.workgroupSize,
-        _statsTarget: this._stats,
-      });
+      const pipeInfo = this._resolveClampPipeline(kind);
 
       const paramsBuffer = this._ensureParamsBuffer(pipeInfo.hasDynamicParamsOffset);
       let paramsOffset = 0;
@@ -5421,6 +6368,15 @@
       this._paramsBuffer = null;
       this._outputRingBuffer = null;
       this._bgCache.clear();
+      this._clearLastBgFastPath();
+      this._pipeCache[0] = null;
+      this._pipeCache[1] = null;
+      this._pipeCache[2] = null;
+      this._pipeCache[3] = null;
+      this._pipeInfoScratch.module = null;
+      this._pipeInfoScratch.bindGroupLayout = null;
+      this._pipeInfoScratch.pipelineLayout = null;
+      this._pipeInfoScratch.pipeline = null;
     }
   }
 
@@ -5538,6 +6494,13 @@
     indirectFirstInstance: undefined,
   };
   const _meshDrawBatchScratch = {};
+  const _meshDrawBatchOptsScratch = {
+    indexed: false,
+    count: 1,
+    baseOffset: 0,
+    stride: DRAW_INDIRECT_BYTES,
+    useNative: false,
+  };
 
   /**
    * Orchestrate a lowered mesh-shader compute-then-draw pipeline (#1537 / #1552):
@@ -5961,16 +6924,16 @@
       drawsIssued = dr.executed;
       drawReason = dr.reason;
     } else {
+      const bo = _meshDrawBatchOptsScratch;
+      bo.indexed = indexed;
+      bo.count = drawCount;
+      bo.baseOffset = finalDrawOff;
+      bo.stride = finalDrawStride;
+      bo.useNative = Boolean(spec.useNativeMultiDraw);
       const br = dispatchIndirectBatch(
         renderPass,
         finalDrawBuf,
-        {
-          indexed,
-          count: drawCount,
-          baseOffset: finalDrawOff,
-          stride: finalDrawStride,
-          useNative: Boolean(spec.useNativeMultiDraw),
-        },
+        bo,
         _meshDrawBatchScratch
       );
       drawOk = br.ok;
@@ -6038,6 +7001,9 @@
     encodeDrawIndirect,
     encodeDrawIndexedIndirect,
     encodeDispatchIndirect,
+    encodeDrawIndirectInto,
+    encodeDrawIndexedIndirectInto,
+    encodeDispatchIndirectInto,
     decodeDrawIndirect,
     decodeDrawIndexedIndirect,
     decodeDispatchIndirect,

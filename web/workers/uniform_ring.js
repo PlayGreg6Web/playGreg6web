@@ -19,6 +19,7 @@
   const WEBGPU_BUFFER_COPY_ALIGNMENT = 4;
   const MAX_DIRTY_RANGE_POOL_SIZE = 32;
   const EMPTY_UINT8 = new Uint8Array(0);
+  const IS_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 
   // WebGPU GPUBufferUsage bitmask values with headless/Node fallbacks.
   const BUFFER_USAGE = Object.freeze({
@@ -92,6 +93,12 @@
   }
 
   function isSharedArrayBuffer(value) {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+    if (value instanceof ArrayBuffer) {
+      return false;
+    }
     if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
       return true;
     }
@@ -286,7 +293,7 @@
     if (size === 0) {
       return;
     }
-    if (data instanceof Uint8Array) {
+    if (data instanceof Uint8Array || data instanceof Uint8ClampedArray) {
       shadow.set(data, offset);
       return;
     }
@@ -300,6 +307,23 @@
     }
     if (shadowI32 && data instanceof Int32Array && (offset & 3) === 0) {
       shadowI32.set(data, offset >>> 2);
+      return;
+    }
+    if (data instanceof DataView) {
+      if (IS_LITTLE_ENDIAN && shadowU32 && (offset & 3) === 0) {
+        const words = size >>> 2;
+        const dstWord = offset >>> 2;
+        for (let i = 0; i < words; i += 1) {
+          shadowU32[dstWord + i] = data.getUint32(i << 2, true);
+        }
+        for (let i = words << 2; i < size; i += 1) {
+          shadow[offset + i] = data.getUint8(i);
+        }
+      } else {
+        for (let i = 0; i < size; i += 1) {
+          shadow[offset + i] = data.getUint8(i);
+        }
+      }
       return;
     }
     if (ArrayBuffer.isView(data)) {
@@ -372,7 +396,12 @@
     }
 
     if (mergeEndIdx === insertIdx) {
-      ranges.splice(insertIdx, 0, acquireDirtyRange(pool, mergedStart, mergedEnd, mergedWrites));
+      const entry = acquireDirtyRange(pool, mergedStart, mergedEnd, mergedWrites);
+      ranges.push(entry);
+      for (let i = len; i > insertIdx; i -= 1) {
+        ranges[i] = ranges[i - 1];
+      }
+      ranges[insertIdx] = entry;
     } else {
       const keeper = ranges[insertIdx];
       keeper.start = mergedStart;
@@ -387,7 +416,11 @@
             }
           }
         }
-        ranges.splice(insertIdx + 1, removeCount);
+        const newLen = len - removeCount;
+        for (let i = insertIdx + 1; i < newLen; i += 1) {
+          ranges[i] = ranges[i + removeCount];
+        }
+        ranges.length = newLen;
       }
     }
   }
@@ -420,12 +453,17 @@
       assertPositiveInteger(writes, 'range.writeCount');
       insertDirtyRange(merged, r.start, r.end, writes, maxGapBytes);
     }
-    return merged.map((r) => ({
-      start: r.start,
-      end: r.end,
-      byteLength: r.end - r.start,
-      writeCount: r.writeCount,
-    }));
+    const result = new Array(merged.length);
+    for (let i = 0; i < merged.length; i += 1) {
+      const r = merged[i];
+      result[i] = {
+        start: r.start,
+        end: r.end,
+        byteLength: r.end - r.start,
+        writeCount: r.writeCount,
+      };
+    }
+    return result;
   }
 
   /**
@@ -687,6 +725,8 @@
       this.shrinkAfterIdleFrames = resolvedShrinkAfterIdleFrames;
       this.shrinkThresholdRatio = shrinkThresholdRatio;
 
+      this._alignmentMask =
+        resolvedAlignment <= 0x40000000 ? resolvedAlignment - 1 : -1;
       this._capacity = resolvedByteSize;
       this._shadow = null;
       this._shadowU32 = null;
@@ -703,6 +743,20 @@
         dynamicOffset: 0,
         createdNewPage: false,
       };
+      this._tmpFlushResult = {
+        uploadedBytes: 0,
+        bytesUploaded: 0,
+        drawCount: 0,
+        stagedWrites: 0,
+        writeBufferCalls: 0,
+        coalescedWrites: 0,
+        dirtyRangesFlushed: 0,
+      };
+      this._tmpReclaimResult = {
+        reclaimedPages: 0,
+        reclaimedBytes: 0,
+      };
+      this._singleDynamicOffset = new Uint32Array(1);
       this._slots = [];
       this._destroyed = false;
 
@@ -767,6 +821,9 @@
           shadowU32: null,
           shadowI32: null,
           shadowF32: null,
+          cachedFlushView: null,
+          cachedFlushStart: -1,
+          cachedFlushEnd: -1,
           generation: 1,
           used: false,
           inFlight: false,
@@ -840,6 +897,9 @@
 
     _setSlotShadowBuffer(slot, buffer) {
       slot.shadow = buffer;
+      slot.cachedFlushView = null;
+      slot.cachedFlushStart = -1;
+      slot.cachedFlushEnd = -1;
       if (buffer && (buffer.byteLength & 3) === 0) {
         slot.shadowU32 = new Uint32Array(
           buffer.buffer,
@@ -861,6 +921,34 @@
         slot.shadowI32 = null;
         slot.shadowF32 = null;
       }
+    }
+
+    _alignToRingFast(value) {
+      const mask = this._alignmentMask;
+      if (mask >= 0 && value <= 0x7fffffff - mask) {
+        return (value + mask) & ~mask;
+      }
+      return alignUp(value, this.alignment);
+    }
+
+    _getSlotShadowSlice(slot, start, end) {
+      const shadow = this._shadow;
+      if (start === 0 && end === shadow.byteLength) {
+        return shadow;
+      }
+      if (
+        slot.cachedFlushView !== null &&
+        slot.cachedFlushStart === start &&
+        slot.cachedFlushEnd === end &&
+        slot.cachedFlushView.buffer === shadow.buffer
+      ) {
+        return slot.cachedFlushView;
+      }
+      const view = shadow.subarray(start, end);
+      slot.cachedFlushView = view;
+      slot.cachedFlushStart = start;
+      slot.cachedFlushEnd = end;
+      return view;
     }
 
     _bindSlotShadow(slot) {
@@ -1557,11 +1645,16 @@
      * and CPU shadow slab if the ring grew or shrank on an earlier frame, and reset the write
      * cursor to 0.
      *
+     * Pass an optional preallocated `out` object as the 2nd argument to avoid per-frame
+     * heap allocations.
+     *
      * @param {number} [frameIndex]
+     * @param {object} [out]
      * @returns {{ frameIndex: number, slotIndex: number, partitionIndex: number, buffer: GPUBuffer, byteSize: number, generation: number, framesInFlight: number }}
      */
-    beginFrame(frameIndex) {
+    beginFrame(frameIndex, out) {
       this._assertNotDestroyed();
+      const target = validateOutTarget(out, 'beginFrame');
 
       this._recordFramePeak();
 
@@ -1630,6 +1723,17 @@
       }
       this._bindSlotShadow(slot);
 
+      if (target) {
+        target.frameIndex = this._frameIndex;
+        target.slotIndex = this._slotIndex;
+        target.partitionIndex = this._slotIndex;
+        target.buffer = slot.buffer;
+        target.byteSize = slot.byteSize;
+        target.generation = slot.generation;
+        target.framesInFlight = this.framesInFlight;
+        return target;
+      }
+
       return {
         frameIndex: this._frameIndex,
         slotIndex: this._slotIndex,
@@ -1650,12 +1754,21 @@
      * Supports nesting: nested `beginBatch()` / `endBatch()` pairs defer auto-flushing
      * until the outermost batch completes.
      *
+     * @param {object} [out]
      * @returns {{ batchDepth: number, frameIndex: number, slotIndex: number, cursor: number }}
      */
-    beginBatch() {
+    beginBatch(out) {
       this._assertNotDestroyed();
+      const target = validateOutTarget(out, 'beginBatch');
       this._ensureActiveFrame();
       this._batchDepth += 1;
+      if (target) {
+        target.batchDepth = this._batchDepth;
+        target.frameIndex = this._frameIndex;
+        target.slotIndex = this._slotIndex;
+        target.cursor = this._cursor;
+        return target;
+      }
       return {
         batchDepth: this._batchDepth,
         frameIndex: this._frameIndex,
@@ -1669,12 +1782,28 @@
      * to 0), flushes all coalesced dirty ranges in the CPU shadow staging slab unless
      * `{ autoFlush: false }` is passed.
      *
-     * @param {{ autoFlush?: boolean }} [options]
+     * @param {{ autoFlush?: boolean, out?: object }} [options]
+     * @param {object} [out]
      * @returns {{ uploadedBytes: number, bytesUploaded: number, drawCount: number, stagedWrites: number, writeBufferCalls: number, coalescedWrites: number, dirtyRangesFlushed: number, batchDepth: number }}
      */
-    endBatch(options = {}) {
+    endBatch(options, out) {
       this._assertNotDestroyed();
+      const target = validateOutTarget(
+        out !== undefined ? out : options && options.out,
+        'endBatch'
+      );
       if (this._batchDepth === 0) {
+        if (target) {
+          target.uploadedBytes = 0;
+          target.bytesUploaded = 0;
+          target.drawCount = 0;
+          target.stagedWrites = 0;
+          target.writeBufferCalls = 0;
+          target.coalescedWrites = 0;
+          target.dirtyRangesFlushed = 0;
+          target.batchDepth = 0;
+          return target;
+        }
         return {
           uploadedBytes: 0,
           bytesUploaded: 0,
@@ -1689,7 +1818,11 @@
       this._batchDepth -= 1;
       const shouldFlush = !(options && options.autoFlush === false);
       if (this._batchDepth === 0 && shouldFlush) {
-        const res = this._flushDirtyInternal();
+        const res = this._flushDirtyInternal(target || this._tmpFlushResult);
+        if (target) {
+          target.batchDepth = 0;
+          return target;
+        }
         return {
           uploadedBytes: res.uploadedBytes,
           bytesUploaded: res.bytesUploaded,
@@ -1700,6 +1833,17 @@
           dirtyRangesFlushed: res.dirtyRangesFlushed,
           batchDepth: 0,
         };
+      }
+      if (target) {
+        target.uploadedBytes = 0;
+        target.bytesUploaded = 0;
+        target.drawCount = 0;
+        target.stagedWrites = 0;
+        target.writeBufferCalls = 0;
+        target.coalescedWrites = 0;
+        target.dirtyRangesFlushed = 0;
+        target.batchDepth = this._batchDepth;
+        return target;
       }
       return {
         uploadedBytes: 0,
@@ -1721,12 +1865,18 @@
      */
     getDirtyRanges() {
       this._assertNotDestroyed();
-      return this._dirtyRanges.map((r) => ({
-        start: r.start,
-        end: r.end,
-        byteLength: r.end - r.start,
-        writeCount: r.writeCount,
-      }));
+      const len = this._dirtyRanges.length;
+      const out = new Array(len);
+      for (let i = 0; i < len; i += 1) {
+        const r = this._dirtyRanges[i];
+        out[i] = {
+          start: r.start,
+          end: r.end,
+          byteLength: r.end - r.start,
+          writeCount: r.writeCount,
+        };
+      }
+      return out;
     }
 
     _pushInternal(
@@ -1740,22 +1890,21 @@
       includeShadow,
       hasData
     ) {
-      const paddedSize = Math.max(
-        this.minUniformBindingSize,
-        alignUp(size, WEBGPU_BUFFER_COPY_ALIGNMENT)
-      );
+      const sizeAligned4 = size <= 0x7ffffffc ? (size + 3) & ~3 : alignUp(size, WEBGPU_BUFFER_COPY_ALIGNMENT);
+      const paddedSize =
+        sizeAligned4 > this.minUniformBindingSize ? sizeAligned4 : this.minUniformBindingSize;
       if (paddedSize > this.maxBindingSize) {
         throw new RangeError(
           `pushConstants padded size (${paddedSize} bytes) exceeds maxBindingSize (${this.maxBindingSize} bytes)`
         );
       }
 
-      const alignedSize = alignUp(paddedSize, this.alignment);
+      const alignedSize = this._alignToRingFast(paddedSize);
 
       this._ensureActiveFrame();
 
       const slot = this._slots[this._slotIndex];
-      const primaryDynamicOffset = alignUp(this._cursor, this.alignment);
+      const primaryDynamicOffset = this._alignToRingFast(this._cursor);
       const primaryEndOffset = primaryDynamicOffset + alignedSize;
 
       let targetBuffer;
@@ -2144,6 +2293,47 @@
 
     /**
      * Zero-allocation hot-path aligned uniform/CBV allocation (`alignment`-aligned, default 256B).
+     * Writes directly into the caller-supplied `out` object without inspecting option-bag keys.
+     *
+     * @param {number} byteLength
+     * @param {object} out Pre-allocated scratch result object.
+     * @param {{ allowEmpty?: boolean, wrap?: boolean }} [options]
+     */
+    allocateInto(byteLength, out, options) {
+      this._assertNotDestroyed();
+      assertNonNegativeInteger(byteLength, 'byteLength');
+      if (!out || typeof out !== 'object') {
+        throw new TypeError('allocateInto requires a preallocated out object');
+      }
+      const allowEmpty =
+        (options && options.allowEmpty === true) || this.allowEmptyPayloads;
+      const allowWrap = (options && options.wrap === true) || this.allowWrap;
+      const deferImmediateFlush = !(options && options._deferImmediateFlush === false);
+
+      if (byteLength === 0 && !allowEmpty) {
+        throw new RangeError('allocate byteLength must not be empty (got 0 bytes)');
+      }
+      if (byteLength > this.maxBindingSize) {
+        throw new RangeError(
+          `allocate size (${byteLength} bytes) exceeds maxBindingSize (${this.maxBindingSize} bytes)`
+        );
+      }
+
+      return this._pushInternal(
+        EMPTY_UINT8,
+        byteLength,
+        false,
+        false,
+        allowWrap,
+        deferImmediateFlush,
+        out,
+        true,
+        false
+      );
+    }
+
+    /**
+     * Zero-allocation hot-path aligned uniform/CBV allocation (`alignment`-aligned, default 256B).
      * Accepts a reusable `out` scratch object directly (`allocAligned(byteLength, out)`) or via
      * options (`allocAligned(byteLength, { out, allowEmpty, wrap })`) to eliminate per-draw GC
      * churn while preserving the exact default return shape when `out` is omitted.
@@ -2153,6 +2343,70 @@
      */
     allocAligned(byteLength, outOrOptions) {
       return this.allocate(byteLength, outOrOptions);
+    }
+
+    /**
+     * Zero-allocation hot-path `pushConstants` writing directly into `out` without
+     * allocating an options wrapper object.
+     *
+     * @param {ArrayBufferView | ArrayBuffer | SharedArrayBuffer | null | undefined} data
+     * @param {object} out Pre-allocated scratch result object.
+     * @param {{ allowEmpty?: boolean, wrap?: boolean }} [options]
+     */
+    pushConstantsInto(data, out, options) {
+      this._assertNotDestroyed();
+      if (!out || typeof out !== 'object') {
+        throw new TypeError('pushConstantsInto requires a preallocated out object');
+      }
+      const allowEmpty =
+        (options && options.allowEmpty === true) || this.allowEmptyPayloads;
+      const allowWrap = (options && options.wrap === true) || this.allowWrap;
+      const deferImmediateFlush = Boolean(options && options._deferImmediateFlush === true);
+      return this._pushConstantsWithFlags(data, allowEmpty, allowWrap, deferImmediateFlush, out);
+    }
+
+    /**
+     * Zero-allocation hot-path `pushCbv` writing directly into `out` without
+     * allocating an options wrapper object.
+     *
+     * @param {ArrayBufferView | ArrayBuffer | SharedArrayBuffer | null | undefined} data
+     * @param {object} out Pre-allocated scratch result object.
+     * @param {{ wrap?: boolean }} [options]
+     */
+    pushCbvInto(data, out, options) {
+      this._assertNotDestroyed();
+      if (!out || typeof out !== 'object') {
+        throw new TypeError('pushCbvInto requires a preallocated out object');
+      }
+      const allowWrap = (options && options.wrap === true) || this.allowWrap;
+      return this._pushConstantsWithFlags(data, true, allowWrap, false, out);
+    }
+
+    /**
+     * Zero-allocation helper returning the ring's reusable 1-element `Uint32Array` populated
+     * with `dynamicOffset` for synchronous `pass.setBindGroup(group, bg, dynamicOffsets)`.
+     *
+     * @param {number} dynamicOffset
+     * @returns {Uint32Array}
+     */
+    getDynamicOffsetArray(dynamicOffset) {
+      this._singleDynamicOffset[0] = dynamicOffset >>> 0;
+      return this._singleDynamicOffset;
+    }
+
+    /**
+     * Write `dynamicOffset` into a caller-provided array/TypedArray (or the ring's reusable
+     * 1-element `Uint32Array` when `out` is omitted) at index `index` (default 0).
+     *
+     * @param {number} dynamicOffset
+     * @param {Uint32Array | number[]} [out]
+     * @param {number} [index=0]
+     * @returns {Uint32Array | number[]}
+     */
+    fillDynamicOffsets(dynamicOffset, out, index = 0) {
+      const target = out || this._singleDynamicOffset;
+      target[index] = dynamicOffset >>> 0;
+      return target;
     }
 
     /**
@@ -2570,10 +2824,7 @@
         for (let rIdx = 0; rIdx < this._dirtyRanges.length; rIdx += 1) {
           const range = this._dirtyRanges[rIdx];
           const rangeBytes = range.end - range.start;
-          const shadowSlice =
-            range.start === 0 && range.end === this._shadow.byteLength
-              ? this._shadow
-              : this._shadow.subarray(range.start, range.end);
+          const shadowSlice = this._getSlotShadowSlice(slot, range.start, range.end);
 
           this._safeWriteBuffer(slot.buffer, range.start, shadowSlice);
 
@@ -2676,32 +2927,14 @@
         const res = this._flushDirtyInternal(target);
         return res;
       }
-      const res = this._flushDirtyInternal(null);
+      const res = this._flushDirtyInternal(this._tmpFlushResult);
       return {
         uploadedBytes: res.uploadedBytes,
         drawCount: res.drawCount,
       };
     }
 
-    /**
-     * Reclaim and destroy auxiliary spill-page GPUBuffers across all slots (or a single
-     * specified `slotIndex`). Safe and idempotent to call on quiet frames or after GPU work
-     * completes.
-     *
-     * @param {number} [slotIndex]
-     * @returns {{ reclaimedPages: number, reclaimedBytes: number }}
-     */
-    reclaimSpillPages(slotIndex) {
-      this._assertNotDestroyed();
-      if (slotIndex !== undefined) {
-        assertNonNegativeInteger(slotIndex, 'slotIndex');
-        if (slotIndex >= this.framesInFlight) {
-          throw new RangeError(
-            `slotIndex (${slotIndex}) out of range [0, ${this.framesInFlight - 1}]`
-          );
-        }
-      }
-
+    _reclaimSpillPagesInternal(slotIndex, out) {
       let reclaimedPages = 0;
       let reclaimedBytes = 0;
       const start = slotIndex !== undefined ? slotIndex : 0;
@@ -2717,42 +2950,78 @@
           reclaimedPages += 1;
           reclaimedBytes += chunk.byteSize;
           this._destroyRawBuffer(chunk.buffer, chunk.byteSize);
+          if (chunk.dirtyRanges && chunk.dirtyRanges.length > 0) {
+            releaseDirtyRanges(chunk.dirtyRanges, this._dirtyRangePool);
+          }
           chunk.buffer = null;
           chunk.shadow = null;
+          chunk.shadowU32 = null;
+          chunk.shadowI32 = null;
+          chunk.shadowF32 = null;
         }
         slot.overflowChunks.length = 0;
       }
 
-      const activeSlot = this._slots[this._slotIndex];
-      let activeHasDirtySpill = false;
-      if (activeSlot && activeSlot.overflowChunks) {
-        for (let i = 0; i < activeSlot.overflowChunks.length; i += 1) {
-          const chunk = activeSlot.overflowChunks[i];
-          if (chunk.dirty && chunk.dirtyRanges && chunk.dirtyRanges.length > 0) {
-            activeHasDirtySpill = true;
-            break;
+      if (reclaimedPages > 0) {
+        const activeSlot = this._slots[this._slotIndex];
+        let activeHasDirtySpill = false;
+        if (activeSlot && activeSlot.overflowChunks) {
+          for (let i = 0; i < activeSlot.overflowChunks.length; i += 1) {
+            const chunk = activeSlot.overflowChunks[i];
+            if (chunk.dirty && chunk.dirtyRanges && chunk.dirtyRanges.length > 0) {
+              activeHasDirtySpill = true;
+              break;
+            }
           }
         }
-      }
-      let activeHasDirtyRetiredSlice = false;
-      if (activeSlot && activeSlot.retiredSlices) {
-        for (let i = 0; i < activeSlot.retiredSlices.length; i += 1) {
-          const slice = activeSlot.retiredSlices[i];
-          if (slice.dirty && slice.dirtyRanges && slice.dirtyRanges.length > 0) {
-            activeHasDirtyRetiredSlice = true;
-            break;
+        let activeHasDirtyRetiredSlice = false;
+        if (activeSlot && activeSlot.retiredSlices) {
+          for (let i = 0; i < activeSlot.retiredSlices.length; i += 1) {
+            const slice = activeSlot.retiredSlices[i];
+            if (slice.dirty && slice.dirtyRanges && slice.dirtyRanges.length > 0) {
+              activeHasDirtyRetiredSlice = true;
+              break;
+            }
           }
         }
-      }
-      if (
-        this._dirtyRanges.length === 0 &&
-        !activeHasDirtySpill &&
-        !activeHasDirtyRetiredSlice
-      ) {
-        this._dirty = false;
+        if (
+          this._dirtyRanges.length === 0 &&
+          !activeHasDirtySpill &&
+          !activeHasDirtyRetiredSlice
+        ) {
+          this._dirty = false;
+        }
       }
 
+      if (out) {
+        out.reclaimedPages = reclaimedPages;
+        out.reclaimedBytes = reclaimedBytes;
+        return out;
+      }
       return { reclaimedPages, reclaimedBytes };
+    }
+
+    /**
+     * Reclaim and destroy auxiliary spill-page GPUBuffers across all slots (or a single
+     * specified `slotIndex`). Safe and idempotent to call on quiet frames or after GPU work
+     * completes.
+     *
+     * @param {number} [slotIndex]
+     * @param {object} [out]
+     * @returns {{ reclaimedPages: number, reclaimedBytes: number }}
+     */
+    reclaimSpillPages(slotIndex, out) {
+      this._assertNotDestroyed();
+      const target = validateOutTarget(out, 'reclaimSpillPages');
+      if (slotIndex !== undefined) {
+        assertNonNegativeInteger(slotIndex, 'slotIndex');
+        if (slotIndex >= this.framesInFlight) {
+          throw new RangeError(
+            `slotIndex (${slotIndex}) out of range [0, ${this.framesInFlight - 1}]`
+          );
+        }
+      }
+      return this._reclaimSpillPagesInternal(slotIndex, target);
     }
 
     /**
@@ -2766,8 +3035,8 @@
      * - `endFrame(options)`
      * - `endFrame(frameIndex, options?)`
      *
-     * @param {number | { deferReclaim?: boolean, reclaimSpillPages?: boolean, fence?: Promise<any>, fencePromise?: Promise<any> }} [frameIndexOrOptions]
-     * @param {{ deferReclaim?: boolean, reclaimSpillPages?: boolean, fence?: Promise<any>, fencePromise?: Promise<any> }} [maybeOptions]
+     * @param {number | { deferReclaim?: boolean, reclaimSpillPages?: boolean, fence?: Promise<any>, fencePromise?: Promise<any>, out?: object }} [frameIndexOrOptions]
+     * @param {{ deferReclaim?: boolean, reclaimSpillPages?: boolean, fence?: Promise<any>, fencePromise?: Promise<any>, out?: object }} [maybeOptions]
      * @returns {{ frameIndex: number, slotIndex: number, partitionIndex: number, frameBytes: number, reclaimedPages: number, reclaimedBytes: number, inFlight: boolean }}
      */
     endFrame(frameIndexOrOptions, maybeOptions) {
@@ -2775,7 +3044,7 @@
       this._recordFramePeak();
 
       let resolvedFrameIndex;
-      let options;
+      let options = null;
       if (typeof frameIndexOrOptions === 'number') {
         assertNonNegativeInteger(frameIndexOrOptions, 'frameIndex');
         resolvedFrameIndex = frameIndexOrOptions;
@@ -2784,12 +3053,9 @@
             throw new TypeError('endFrame options argument must be an object');
           }
           options = maybeOptions;
-        } else {
-          options = {};
         }
       } else if (frameIndexOrOptions === undefined || frameIndexOrOptions === null) {
         resolvedFrameIndex = this._frameIndex;
-        options = {};
       } else if (typeof frameIndexOrOptions === 'object') {
         resolvedFrameIndex = this._frameIndex;
         options = frameIndexOrOptions;
@@ -2797,11 +3063,15 @@
         throw new TypeError('endFrame expects an optional frameIndex integer or options object');
       }
 
-      const fence =
-        options.fence !== undefined ? options.fence : options.fencePromise;
+      const fence = options
+        ? options.fence !== undefined
+          ? options.fence
+          : options.fencePromise
+        : undefined;
       if (fence !== undefined && fence !== null && typeof fence.then !== 'function') {
         throw new TypeError('endFrame fence option must be a Promise/thenable, null, or undefined');
       }
+      const target = options ? validateOutTarget(options.out, 'endFrame') : null;
 
       const targetSlotIndex =
         resolvedFrameIndex >= 0
@@ -2859,10 +3129,21 @@
 
       let reclaimedPages = 0;
       let reclaimedBytes = 0;
-      if (shouldReclaim) {
-        const res = this.reclaimSpillPages(targetSlotIndex);
+      if (shouldReclaim && slot.overflowChunks && slot.overflowChunks.length > 0) {
+        const res = this._reclaimSpillPagesInternal(targetSlotIndex, this._tmpReclaimResult);
         reclaimedPages = res.reclaimedPages;
         reclaimedBytes = res.reclaimedBytes;
+      }
+
+      if (target) {
+        target.frameIndex = resolvedFrameIndex;
+        target.slotIndex = targetSlotIndex;
+        target.partitionIndex = targetSlotIndex;
+        target.frameBytes = frameBytes;
+        target.reclaimedPages = reclaimedPages;
+        target.reclaimedBytes = reclaimedBytes;
+        target.inFlight = slot.inFlight;
+        return target;
       }
 
       return {
@@ -2880,13 +3161,17 @@
      * Reset per-frame write state and destroy all live spill pages and retired buffers across
      * all slots while preserving primary slot GPUBuffers and lifetime telemetry counters.
      *
+     * @param {object} [out]
      * @returns {{ reclaimedPages: number, reclaimedBytes: number }}
      */
-    reset() {
+    reset(out) {
       this._assertNotDestroyed();
+      const target = validateOutTarget(out, 'reset');
       this._recordFramePeak();
 
-      const { reclaimedPages, reclaimedBytes } = this.reclaimSpillPages();
+      const res = this._reclaimSpillPagesInternal(undefined, this._tmpReclaimResult);
+      const reclaimedPages = res.reclaimedPages;
+      const reclaimedBytes = res.reclaimedBytes;
       for (let i = 0; i < this._slots.length; i += 1) {
         const slot = this._slots[i];
         this._releaseSlotTransientBuffers(slot);
@@ -2913,6 +3198,11 @@
       this._consecutiveIdleFrames = 0;
       this._idleWindowHighWaterBytes = 0;
 
+      if (target) {
+        target.reclaimedPages = reclaimedPages;
+        target.reclaimedBytes = reclaimedBytes;
+        return target;
+      }
       return { reclaimedPages, reclaimedBytes };
     }
 
@@ -2959,7 +3249,7 @@
      * @param {number} [sliceSize]
      * @param {number} [slotIndex]
      */
-    createBindGroupEntry(binding, sliceSize, slotIndex = this._slotIndex) {
+    createBindGroupEntry(binding, sliceSize, slotIndex = this._slotIndex, out) {
       this._assertNotDestroyed();
       assertNonNegativeInteger(binding, 'binding');
       assertNonNegativeInteger(slotIndex, 'slotIndex');
@@ -2999,6 +3289,23 @@
             `Padded sliceSize (${resolvedSize}) exceeds slot buffer size (${slot.byteSize})`
           );
         }
+      }
+
+      const target = validateOutTarget(out, 'createBindGroupEntry');
+      if (target) {
+        target.binding = binding;
+        if (!target.resource || typeof target.resource !== 'object') {
+          target.resource = {
+            buffer: slot.buffer,
+            offset: 0,
+            size: resolvedSize,
+          };
+        } else {
+          target.resource.buffer = slot.buffer;
+          target.resource.offset = 0;
+          target.resource.size = resolvedSize;
+        }
+        return target;
       }
 
       return {
@@ -3268,6 +3575,9 @@
         slot.shadowU32 = null;
         slot.shadowI32 = null;
         slot.shadowF32 = null;
+        slot.cachedFlushView = null;
+        slot.cachedFlushStart = -1;
+        slot.cachedFlushEnd = -1;
         slot.inFlight = false;
         slot.fencePromise = null;
       }
