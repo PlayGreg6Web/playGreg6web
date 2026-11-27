@@ -272,6 +272,7 @@ struct Options {
     bool no_async_pipelines = false;    // --no-async-pipelines: live executor creates pipelines synchronously
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
+    bool gpu_error_scopes = false;  // --gpu-error-scopes: attribute device errors (phase, present, shader hashes) in the report
     bool live_executor = false;     // --live-executor: --window's live path into the offscreen swapchain (no window)
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     std::string show_target;        // --show-target <selector>
@@ -387,6 +388,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.live_executor = true;
         } else if (a == "--gpu-validation") {
             o.gpu_validation = true;
+        } else if (a == "--gpu-error-scopes") {
+            o.gpu_error_scopes = true;
         } else if (a == "--no-async-pipelines") {
             o.no_async_pipelines = true;
         } else if (a == "--pipeline-wait-ms" && i + 1 < argc) {
@@ -1008,6 +1011,7 @@ bool start_live_window() {
     options.pipeline_wait_frame_ns = g_options.pipeline_wait_ns;
     options.pipeline_wait_fullscreen_ns = g_options.pipeline_wait_fullscreen_ns;
     options.gpu_validation = g_options.gpu_validation;
+    options.gpu_error_scopes = g_options.gpu_error_scopes;
     options.frame_digest_path = g_options.live_digest;
     options.gpu_time_split = g_options.gpu_time_split;
     options.window_script = g_options.window_script;

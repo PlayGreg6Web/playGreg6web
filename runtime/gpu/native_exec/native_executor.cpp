@@ -34,6 +34,7 @@
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
+#include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
@@ -621,6 +622,100 @@ struct NativeExecutor::Impl {
             e.kind = kind;
         }
         ++e.by_opcode[opcode];
+    }
+
+    // ---- diagnostic error scopes (--gpu-error-scopes, error_scope_model.h) ----
+    ErrorScopeLog error_scope_log;
+    std::atomic<uint64_t> error_scoped_total{0};  // scoped errors recorded (drives the auto mode's cut-off)
+
+    std::string render_pipeline_ctx(uint32_t id) const {
+        auto it = render_pipelines.find(id);
+        if (it == render_pipelines.end()) return "rp" + std::to_string(id) + "(unknown)";
+        return "rp" + std::to_string(id) + "(vs=" + hash_hex(it->second.vs_hash) + " fs=" + hash_hex(it->second.fs_hash) + ")";
+    }
+    std::string compute_pipeline_ctx(uint32_t id) const {
+        auto it = compute_hash.find(id);
+        return "cp" + std::to_string(id) + "(cs=" + (it == compute_hash.end() ? std::string("?") : hash_hex(it->second)) + ")";
+    }
+    // The pipelines and bind groups the frame's recorded passes use (encoded and submitted by the Present).
+    std::string frame_scope_context() const {
+        std::vector<std::string> items;
+        std::set<std::string> seen;
+        auto add = [&](std::string v) {
+            if (items.size() < 24 && seen.insert(v).second) items.push_back(std::move(v));
+        };
+        for (const PassCmd& c : pass_cmds) {
+            if (const auto* sp = std::get_if<SetPipelineCmd>(&c)) add(render_pipeline_ctx(sp->id));
+            else if (const auto* cp = std::get_if<SetComputePipelineCmd>(&c)) add(compute_pipeline_ctx(cp->id));
+            else if (const auto* b1 = std::get_if<SetBindGroup1Cmd>(&c)) add("bg" + std::to_string(b1->id));
+            else if (const auto* b2 = std::get_if<SetBindGroup2Cmd>(&c)) add("bg" + std::to_string(b2->bind_group_id));
+        }
+        std::string out;
+        for (const std::string& i : items) out += (out.empty() ? "" : " ") + i;
+        return out;
+    }
+    // The resource ids a packet names, read after the packet ran (pipelines then hold their shader hashes).
+    std::string packet_scope_context(const Packet& p) const {
+        const uint32_t n = p.payload_bytes;
+        switch (static_cast<GpuOpcode>(p.opcode)) {
+            case GpuOpcode::CreateRenderPipeline2:
+                if (n >= sizeof(GpuCreateRenderPipeline2Payload)) {
+                    const auto h = read_payload<GpuCreateRenderPipeline2Payload>(p);
+                    return render_pipeline_ctx(h.id) + " vs_module=" + std::to_string(h.vs_module_id) +
+                           " fs_module=" + std::to_string(h.fs_module_id) + " layout=" + std::to_string(h.pipeline_layout_id);
+                }
+                break;
+            case GpuOpcode::CreateComputePipeline2:
+                if (n >= sizeof(GpuCreateComputePipeline2Payload)) {
+                    const auto h = read_payload<GpuCreateComputePipeline2Payload>(p);
+                    return compute_pipeline_ctx(h.id) + " cs_module=" + std::to_string(h.cs_module_id);
+                }
+                break;
+            case GpuOpcode::CreateRenderPipeline:
+                if (n >= sizeof(GpuCreateRenderPipelinePayload)) {
+                    const auto h = read_payload<GpuCreateRenderPipelinePayload>(p);
+                    return "rp" + std::to_string(h.id) + " vs_module=" + std::to_string(h.vs_shader_id) +
+                           " fs_module=" + std::to_string(h.fs_shader_id);
+                }
+                break;
+            case GpuOpcode::CreateComputePipeline:
+                if (n >= sizeof(GpuCreateComputePipelinePayload)) {
+                    const auto h = read_payload<GpuCreateComputePipelinePayload>(p);
+                    return "cp" + std::to_string(h.id) + " cs_module=" + std::to_string(h.cs_shader_id);
+                }
+                break;
+            case GpuOpcode::CreateBindGroup2:
+                if (n >= sizeof(GpuCreateBindGroup2Payload)) {
+                    const auto h = read_payload<GpuCreateBindGroup2Payload>(p);
+                    std::string c = "bg" + std::to_string(h.id) + " layout=" + std::to_string(h.layout_id) + " resources=";
+                    const uint64_t cnt = std::min<uint64_t>(h.entry_count, (n - 16) / sizeof(GpuBindGroupEntry2));
+                    for (uint64_t i = 0; i < cnt && i < 16; ++i) {
+                        GpuBindGroupEntry2 e;
+                        std::memcpy(&e, p.payload + 16 + i * sizeof(GpuBindGroupEntry2), sizeof e);
+                        c += (i ? "," : "") + std::to_string(e.resource_type) + ":" + std::to_string(e.resource_id);
+                    }
+                    return c;
+                }
+                break;
+            case GpuOpcode::CreateBindGroup:
+                if (n >= sizeof(GpuCreateBindGroupPayload)) {
+                    const auto h = read_payload<GpuCreateBindGroupPayload>(p);
+                    return "bg" + std::to_string(h.id) + " pipeline=" + std::to_string(h.pipeline_id);
+                }
+                break;
+            case GpuOpcode::CreateShaderModule:
+                if (n >= 4) return "shader_module=" + std::to_string(read_payload<uint32_t>(p));
+                break;
+            case GpuOpcode::SetPipeline:
+                if (n >= 4) return render_pipeline_ctx(read_payload<uint32_t>(p));
+                break;
+            case GpuOpcode::SetComputePipeline:
+                if (n >= 4) return compute_pipeline_ctx(read_payload<uint32_t>(p));
+                break;
+            default:
+                break;
+        }
+        return "";
     }
 
     // ---- setup ----
@@ -1865,29 +1960,53 @@ struct NativeExecutor::Impl {
         if (p.opcode == static_cast<uint16_t>(GpuOpcode::DestroyResource) && p.payload_bytes >= 4) journal_prune(read_payload<uint32_t>(p));
         const uint64_t t0 = now_ns();
         bool r;
-        if (options.gpu_validation) {
+        const bool diag_scopes = error_scope_active(options.gpu_error_scopes, stats.device_errors, error_scoped_total.load());
+        if (options.gpu_validation || diag_scopes) {
             validation_cur_packet = validation_packet_index++;
             validation_cur_opcode = p.opcode;
             ++validation_scoped_packets;
+            const bool is_present = p.opcode == static_cast<uint16_t>(GpuOpcode::Present);
+            const uint64_t present_index = stats.present_packets;
+            // A present encodes, finishes and submits the recorded passes: take their context before it is consumed.
+            std::string ctx = diag_scopes && is_present ? frame_scope_context() : std::string();
             device.PushErrorScope(wgpu::ErrorFilter::Internal);
+            device.PushErrorScope(wgpu::ErrorFilter::OutOfMemory);
             device.PushErrorScope(wgpu::ErrorFilter::Validation);
             r = dispatch_op(p);
-            for (const char* kind : {"scope-validation", "scope-internal"}) {
+            if (diag_scopes) {
+                const std::string pc = packet_scope_context(p);
+                if (!pc.empty()) ctx += (ctx.empty() ? "" : " ") + pc;
+            }
+            struct Kind {
+                const char* scope_kind;
+                const char* diag_kind;
+            };
+            for (const Kind k : {Kind{"scope-validation", "validation"}, Kind{"scope-oom", "out-of-memory"},
+                                 Kind{"scope-internal", "internal"}}) {
                 struct Ctx {
                     Impl* self;
                     uint64_t packet;
                     uint16_t opcode;
-                    const char* kind;
+                    uint64_t present_index;
+                    Kind kind;
+                    bool validation, diag;
+                    std::string context;
                 };
-                auto* ctx = new Ctx{this, validation_cur_packet, p.opcode, kind};
+                auto* c = new Ctx{this, validation_cur_packet, p.opcode, present_index, k, options.gpu_validation, diag_scopes, ctx};
                 device.PopErrorScope(
                     wgpu::CallbackMode::AllowSpontaneous,
                     [](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg, Ctx* c) {
-                        if (type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown)
-                            c->self->record_validation(c->kind, to_string(msg), c->packet, c->opcode);
+                        if (type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown) {
+                            if (c->validation) c->self->record_validation(c->kind.scope_kind, to_string(msg), c->packet, c->opcode);
+                            if (c->diag) {
+                                c->self->error_scope_log.record(c->kind.diag_kind, to_string(msg), error_scope_phase(c->opcode),
+                                                                c->context, c->present_index, c->packet, c->opcode);
+                                ++c->self->error_scoped_total;
+                            }
+                        }
                         delete c;
                     },
-                    ctx);
+                    c);
             }
         } else {
             r = dispatch_op(p);
@@ -5925,6 +6044,9 @@ std::string NativeExecutor::stats_json() const {
         bn("total_bytes", st.blob_total_bytes);
         bn("max_bytes", st.blob_max_bytes);
         j += "}, ";
+    }
+    if (impl_->options.gpu_error_scopes || impl_->error_scope_log.total() > 0) {
+        j += "\"error_scopes\": " + impl_->error_scope_log.json() + ", ";
     }
     if (impl_->options.gpu_validation) {
         auto esc = [](const std::string& in) {

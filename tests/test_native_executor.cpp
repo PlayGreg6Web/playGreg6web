@@ -2492,6 +2492,43 @@ void test_dawn_validation_fixes(NativeExecutor& ex) {
     CHECK(ex.stats().write_masks_cleared == before.write_masks_cleared + 1);
 }
 
+void test_error_scope_attribution() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.gpu_error_scopes = true;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto exu = NativeExecutor::create(opts, &status, &error);
+    if (!exu) {
+        CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+        return;
+    }
+    NativeExecutor& ex = *exu;
+    const uint8_t data[4] = {1, 2, 3, 4};
+    gpu::CommandEncoder setup;
+    setup.create_buffer(7, GpuBufferUsage::CopySrc | GpuBufferUsage::CopyDst, 16);
+    run(ex, setup);
+    // A good packet inside a scope records nothing.
+    gpu::CommandEncoder good;
+    good.write_buffer(7, 4, data, 4);
+    run(ex, good);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats_json().find("\"error_scopes\": {\"total\": 0") != std::string::npos);
+    // An unaligned write is a validation error raised inside the packet's scope: attributed to that packet.
+    gpu::CommandEncoder bad;
+    bad.write_buffer(7, 2, data, 4);
+    run(ex, bad);
+    ex.wait_idle();
+    ex.poll();
+    const std::string j = ex.stats_json();
+    CHECK(j.find("\"error_scopes\": {\"total\": 1") != std::string::npos);
+    CHECK(j.find("\"kind\": \"validation\", \"phase\": \"other\"") != std::string::npos);
+    CHECK(j.find("\"opcode\": 4,") != std::string::npos);  // WriteBuffer
+    CHECK(j.find("\"present_index\": 0") != std::string::npos);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -2538,6 +2575,7 @@ int main() {
     test_remap_reflected_layout(false);
     test_dawn_validation_fixes(*ex);
     test_screenshot();
+    test_error_scope_attribution();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

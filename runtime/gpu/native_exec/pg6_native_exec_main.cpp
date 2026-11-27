@@ -97,6 +97,8 @@ int main(int argc, char** argv) {
             opts.force_fallback_adapter = (w == "warp");
         } else if (a == "--gpu-validation") {
             opts.gpu_validation = true;
+        } else if (a == "--gpu-error-scopes") {
+            opts.gpu_error_scopes = true;
         } else if (a == "--trace" && (v = next())) {
             trace = v;
         } else if (a == "--pack" && (v = next())) {

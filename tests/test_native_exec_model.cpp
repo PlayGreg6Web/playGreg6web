@@ -10,6 +10,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/native_exec/blit_model.h"
+#include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
@@ -1061,6 +1062,34 @@ void test_fragment_outputs() {
                                     "@fragment fn b() -> @location(3) vec4f { return vec4f(); }", "b") == 8u);
 }
 
+void test_error_scope_model() {
+    CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::CreateRenderPipeline2))) == "pipeline_create");
+    CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::CreateBindGroup2))) == "bind_group_create");
+    CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::Draw))) == "pass");
+    CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::Present))) == "present_submit");
+    CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::WriteBuffer))) == "other");
+    // off until a device error arms it; explicit stays on; auto disarms after the error budget
+    CHECK(!error_scope_active(false, 0, 0));
+    CHECK(error_scope_active(false, 1, 0));
+    CHECK(!error_scope_active(false, 5, kErrorScopeAutoErrors));
+    CHECK(error_scope_active(true, 0, kErrorScopeAutoErrors + 10));
+    // dedupe by (message, phase, context); bounded entries, counts by message
+    ErrorScopeLog log;
+    log.record("validation", "bad \"thing\"", "pipeline_create", "rp1(vs=a fs=b)", 3, 10, 24);
+    log.record("validation", "bad \"thing\"", "pipeline_create", "rp1(vs=a fs=b)", 4, 11, 24);
+    log.record("validation", "bad \"thing\"", "present_submit", "rp1(vs=a fs=b)", 4, 12, 7);
+    CHECK(log.total() == 3);
+    CHECK(log.entries().size() == 2);
+    CHECK(log.entries()[0].count == 2 && log.entries()[0].present_index == 3);
+    CHECK(log.by_message().at("bad \"thing\"") == 3);
+    CHECK(log.json().find("\\\"thing\\\"") != std::string::npos);
+    for (int i = 0; i < 200; ++i) log.record("validation", "m" + std::to_string(i), "pass", "", 0, i, 6);
+    CHECK(log.entries().size() == kErrorScopeMaxEntries);
+    CHECK(log.entries_dropped() > 0);
+    CHECK(log.by_message().size() <= kErrorScopeMaxMessages);
+    CHECK(log.total() == 203);
+}
+
 int main() {
     test_present_model();
     test_shader_payloads();
@@ -1085,6 +1114,7 @@ int main() {
     test_pipe_wait_budget();
     test_remap_bindings_match();
     test_fragment_outputs();
+    test_error_scope_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

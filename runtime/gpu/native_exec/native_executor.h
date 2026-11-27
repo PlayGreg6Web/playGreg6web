@@ -85,6 +85,12 @@ struct ExecutorOptions {
     // immediate error handling, and an error scope around every packet. Errors are deduped by text in
     // stats_json()'s "validation" block with the first packet index / opcode. Slower; diagnosis only.
     bool gpu_validation = false;
+    // Error-scope attribution (--gpu-error-scopes, error_scope_model.h): an error scope around every packet
+    // (pipeline / bind group creation, pass commands, the present's encode + submit) records each device
+    // error with its phase, present index and the shader hashes / resource ids in scope into stats_json()'s
+    // "error_scopes" block (bounded). Off = no scopes until the first uncaptured device error arms it
+    // (then for up to 200 scoped errors), so a healthy run pays nothing.
+    bool gpu_error_scopes = false;
     // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
     // that create resources and fill them (creations, buffer / texture writes; destroyed ids are pruned,
     // a repeated write of the same range replaces the older one) so a lost device can be rebuilt and the
