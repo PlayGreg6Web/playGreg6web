@@ -392,7 +392,7 @@ test('createTexture strips -srgb viewFormats on linear STORAGE_BINDING textures 
     sampleCount: 1,
     dimension: '2d',
     format: 'rgba8unorm',
-    usage: USAGE_TEXTURE_BINDING | USAGE_RENDER_ATTACHMENT,
+    usage: USAGE_COPY_SRC | USAGE_TEXTURE_BINDING | USAGE_RENDER_ATTACHMENT,
     viewFormats: ['rgba8unorm-srgb'],
   };
   assert.equal(

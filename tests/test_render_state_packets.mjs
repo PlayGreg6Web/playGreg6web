@@ -1856,7 +1856,7 @@ test('W89 R32G32B32A32_FLOAT (rgba32float) texture creation & unfilterable-float
 
   const createdTex = strictNoF32.gpu.results('createTexture')[0];
   assert.equal(createdTex.desc.format, 'rgba32float');
-  assert.equal(createdTex.desc.usage, 0x04 | 0x08 | 0x10 | 0x02);
+  assert.equal(createdTex.desc.usage, 0x01 | 0x04 | 0x08 | 0x10 | 0x02);
 
   const [bgUnfilt, bgFilt] = strictNoF32.gpu.results('createBindGroup');
   // Unfilterable layout binds the real rgba32float texture view directly!
@@ -2030,9 +2030,9 @@ test('W89 G48/R32 texture format & usage compatibility strips invalid STORAGE_BI
   assert.equal(handlerWithBc.stats.errors, 0, handlerWithBc.lastError);
   const [bcNative, bgraStorage] = gpuWithBc.results('createTexture');
   assert.equal(bcNative.desc.format, 'bc7-rgba-unorm');
-  assert.equal(bcNative.desc.usage, 0x04); // STORAGE_BINDING & RENDER_ATTACHMENT stripped even with BC feature
+  assert.equal(bcNative.desc.usage, 0x01 | 0x04); // COPY_SRC added for CopyTexture; STORAGE_BINDING & RENDER_ATTACHMENT stripped even with BC feature
   assert.equal(bgraStorage.desc.format, 'bgra8unorm');
-  assert.equal(bgraStorage.desc.usage, 0x04 | 0x08 | 0x10);
+  assert.equal(bgraStorage.desc.usage, 0x01 | 0x04 | 0x08 | 0x10);
   assert.equal(handlerWithBc.getStats().bcFormatFallbacks, 0);
 });
 

@@ -817,7 +817,7 @@ test('G5 opcodes drive textures, samplers, bind groups, indexed draw, and comput
     size: { width: 2, height: 2, depthOrArrayLayers: 1 },
     mipLevelCount: 1,
     format: 'rgba8unorm',
-    usage: TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+    usage: TEXTURE_USAGE.COPY_SRC | TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
     dimension: '2d',
   });
   const writeTexCall = calls.find((c) => c.op === 'writeTexture');

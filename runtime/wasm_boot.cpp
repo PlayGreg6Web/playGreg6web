@@ -466,6 +466,14 @@ struct ScopedGpuTextureClear {
     ~ScopedGpuTextureClear() { gpu::set_gpu_texture_clear(previous); }
 };
 
+// The bundled browser worker implements CopyTexture (opcode 62). Enable its
+// producer path only for this boot, preserving the embedding host's prior mode.
+struct ScopedGpuTextureCopy {
+    bool previous = gpu::gpu_texture_copy();
+    ScopedGpuTextureCopy() { gpu::set_gpu_texture_copy(true); }
+    ~ScopedGpuTextureCopy() { gpu::set_gpu_texture_copy(previous); }
+};
+
 struct ScopedDeviceOptions {
     bool installed = false;
 
@@ -978,6 +986,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     });
     os::win32::reset_relaunch_request();
     ScopedGpuTextureClear gpu_texture_clear_guard;
+    ScopedGpuTextureCopy gpu_texture_copy_guard;
     const guest::BootResult boot = guest::run_boot(program_boot.config);
     if (auto dev = gpu::d3d12_xs_exports::current_device()) {
         if (!dump_dir.empty()) {
@@ -1090,6 +1099,7 @@ WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg) {
     boot_cfg.command_line = with_title_args("game.exe", cfg.title_args);
     os::win32::reset_relaunch_request();
     ScopedGpuTextureClear gpu_texture_clear_guard;
+    ScopedGpuTextureCopy gpu_texture_copy_guard;
     const guest::BootResult boot = guest::run_boot(boot_cfg);
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;

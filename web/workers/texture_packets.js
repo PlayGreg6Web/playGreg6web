@@ -37,6 +37,8 @@
   const WRITE_TEXTURE_HEADER_BYTES = 48;
   const CREATE_TEXTURE2 = 35;
   const CREATE_TEXTURE2_BYTES = 40;
+  const OPCODE_COPY_TEXTURE = 62;
+  const COPY_TEXTURE_PAYLOAD_BYTES = 56;
   const MAX_VIEW_FORMATS = 8;
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
   const DEFAULT_MAX_SCRATCH_BYTES = 16 * 1024 * 1024; // 16 MiB cap for persistent row-repack / SAB scratch
@@ -89,6 +91,7 @@
   const BC_SLICED_3D_FEATURE = 'texture-compression-bc-sliced-3d';
   const BGRA8_STORAGE_FEATURE = 'bgra8unorm-storage';
   const RG11B10_RENDERABLE_FEATURE = 'rg11b10ufloat-renderable';
+  const GPU_TEXTURE_USAGE_COPY_SRC = 0x01;
   const GPU_TEXTURE_USAGE_STORAGE_BINDING = 0x08;
   const GPU_TEXTURE_USAGE_RENDER_ATTACHMENT = 0x10;
 
@@ -4411,13 +4414,14 @@
       }
 
       // Sanitize usage before resolving viewFormats so STORAGE_BINDING compatibility is exact
-      // (WebGPU forbids `-srgb` entries in `viewFormats` when STORAGE_BINDING is present).
+      // (WebGPU forbids `-srgb` entries in `viewFormats` when STORAGE_BINDING is present), and
+      // include COPY_SRC on every created texture so CopyTexture (opcode 62) can copy from any texture.
       if (
         effectiveDescriptor &&
         typeof effectiveDescriptor.format === 'string' &&
         typeof effectiveDescriptor.usage === 'number'
       ) {
-        let sanitizedUsage = effectiveDescriptor.usage;
+        let sanitizedUsage = (effectiveDescriptor.usage >>> 0) | GPU_TEXTURE_USAGE_COPY_SRC;
         const fmt = effectiveDescriptor.format;
         const dev = p && p.device ? p.device : null;
         if (
@@ -4747,6 +4751,8 @@
     WRITE_TEXTURE_HEADER_BYTES,
     CREATE_TEXTURE2,
     CREATE_TEXTURE2_BYTES,
+    OPCODE_COPY_TEXTURE,
+    COPY_TEXTURE_PAYLOAD_BYTES,
     MAX_VIEW_FORMATS,
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     TEXTURE_FORMAT_NAMES,

@@ -410,7 +410,7 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
     sampleCount: 4,
     dimension: '2d',
     format: 'rgba16float',
-    usage: 0x10,
+    usage: 0x10 | 0x01,
   });
   assert.equal(tex.format, 'bgra8unorm');
   assert.deepEqual(tex.viewFormats, ['bgra8unorm-srgb']);

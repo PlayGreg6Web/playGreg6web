@@ -46,8 +46,11 @@ const OPCODES = Object.freeze({
   READBACK_TEXTURE: 40,
 });
 
-// Native-executor extension opcode outside GpuOpcode (runtime/abi/playgta6_abi.h kGpuOpcodeClearTexture).
-// Kept separate from OPCODES so tools/repo_health.py GpuOpcode enum parity stays exact.
+// Native-executor extension opcodes outside GpuOpcode (runtime/abi/playgta6_abi.h
+// kGpuOpcodeCopyTexture = 62, kGpuOpcodeClearTexture = 63). Kept separate from OPCODES so
+// tools/repo_health.py GpuOpcode enum parity stays exact.
+const OPCODE_COPY_TEXTURE = 62;
+const COPY_TEXTURE_PAYLOAD_BYTES = 56;
 const OPCODE_CLEAR_TEXTURE = 63;
 const CLEAR_TEXTURE_PAYLOAD_BYTES = 8;
 const CLEAR_TEXTURE_ROW_ALIGN = 256;
@@ -479,6 +482,7 @@ const OPCODE_NAMES = Object.freeze({
   [OPCODES.DISPATCH_INDIRECT]: 'DispatchIndirect',
   [OPCODES.READBACK_BUFFER]: 'ReadbackBuffer',
   [OPCODES.READBACK_TEXTURE]: 'ReadbackTexture',
+  [OPCODE_COPY_TEXTURE]: 'CopyTexture',
   [OPCODE_CLEAR_TEXTURE]: 'ClearTexture',
 });
 
@@ -3788,6 +3792,12 @@ class WgpuCommandProcessor {
       copyClears: 0,
       writeTextureClears: 0,
       copies: 0,
+    };
+    this._copyTextureStats = {
+      copied: 0,
+      noop: 0,
+      missing: 0,
+      invalid: 0,
     };
     this._promote1DTo2D = options.promote1DTo2D !== false;
     this._promoted1DTo2DCount = 0;
@@ -12283,6 +12293,7 @@ class WgpuCommandProcessor {
     const rawDimension = descriptor.dimension || '2d';
     const is1D = rawDimension === '1d';
     const rawUsage = typeof descriptor.usage === 'number' ? descriptor.usage >>> 0 : 0;
+    const ensureCopySrc = (rawUsage & TEXTURE_USAGE.COPY_SRC) === 0;
     const hasStorageBinding = (rawUsage & TEXTURE_USAGE.STORAGE_BINDING) !== 0;
     const rawFormat = typeof descriptor.format === 'string' ? descriptor.format : '';
     const stripStorageForSrgbFormat = hasStorageBinding && rawFormat.endsWith('-srgb');
@@ -12297,7 +12308,7 @@ class WgpuCommandProcessor {
         }
       }
     }
-    if (!is1D && !stripStorageForSrgbFormat && !hasIncompatibleSrgbViewFormat) {
+    if (!is1D && !ensureCopySrc && !stripStorageForSrgbFormat && !hasIncompatibleSrgbViewFormat) {
       return descriptor;
     }
     const out = { ...descriptor };
@@ -12327,19 +12338,24 @@ class WgpuCommandProcessor {
       if (sanitizedUsage === 0) {
         sanitizedUsage = TEXTURE_USAGE.TEXTURE_BINDING;
       }
-      out.usage = sanitizedUsage;
-    } else if (hasIncompatibleSrgbViewFormat) {
-      const filtered = [];
-      for (let i = 0; i < rawViewFormats.length; i += 1) {
-        const vf = rawViewFormats[i];
-        if (typeof vf !== 'string' || !vf.endsWith('-srgb')) {
-          filtered.push(vf);
-        }
+      out.usage = sanitizedUsage | TEXTURE_USAGE.COPY_SRC;
+    } else {
+      if (ensureCopySrc) {
+        out.usage = rawUsage | TEXTURE_USAGE.COPY_SRC;
       }
-      if (filtered.length > 0) {
-        out.viewFormats = filtered;
-      } else {
-        delete out.viewFormats;
+      if (hasIncompatibleSrgbViewFormat) {
+        const filtered = [];
+        for (let i = 0; i < rawViewFormats.length; i += 1) {
+          const vf = rawViewFormats[i];
+          if (typeof vf !== 'string' || !vf.endsWith('-srgb')) {
+            filtered.push(vf);
+          }
+        }
+        if (filtered.length > 0) {
+          out.viewFormats = filtered;
+        } else {
+          delete out.viewFormats;
+        }
       }
     }
     return out;
@@ -12472,6 +12488,7 @@ class WgpuCommandProcessor {
       sampleCount,
       format: effectiveDescriptor.format || 'rgba8unorm',
       dimension: effectiveDescriptor.dimension || '2d',
+      promoted1DTo2D: promotedFrom1D,
       usage: typeof effectiveDescriptor.usage === 'number' ? effectiveDescriptor.usage : 0,
       viewFormats: Array.isArray(effectiveDescriptor.viewFormats)
         ? effectiveDescriptor.viewFormats
@@ -12513,6 +12530,7 @@ class WgpuCommandProcessor {
       sampleCount: meta.sampleCount || 1,
       format: meta.format || 'rgba8unorm',
       dimension: meta.dimension || '2d',
+      promoted1DTo2D: Boolean(meta.promoted1DTo2D),
       usage: typeof meta.usage === 'number' ? meta.usage : 0,
     };
     if (meta && 'viewFormats' in meta) {
@@ -13359,6 +13377,301 @@ class WgpuCommandProcessor {
     const result = this._clearTextureById(textureId);
     if (result.status === 'invalid' && result.error) {
       this._recordOpValidationError('ClearTexture', result.error);
+    }
+  }
+
+  _resolveCopyTextureInfo(textureId, extTextureMetaMap = null) {
+    const extMeta =
+      extTextureMetaMap && typeof extTextureMetaMap.get === 'function'
+        ? extTextureMetaMap.get(textureId) || null
+        : null;
+    const base = this._resolveClearTextureInfo(textureId, extMeta);
+    if (!base) {
+      return null;
+    }
+    let tpMeta = null;
+    let bc3dFallback = Boolean(extMeta && extMeta.bcFallback && base.dimension === '3d');
+    let promoted1D = Boolean(extMeta && extMeta.promoted1DTo2D);
+    let ext = this.extension;
+    while (ext) {
+      if (!tpMeta && ext._textureMeta && typeof ext._textureMeta.get === 'function') {
+        tpMeta = ext._textureMeta.get(textureId) || null;
+      }
+      if (
+        !bc3dFallback &&
+        ext._bc3dFallbackTextures &&
+        typeof ext._bc3dFallbackTextures.has === 'function' &&
+        ext._bc3dFallbackTextures.has(textureId)
+      ) {
+        bc3dFallback = true;
+      }
+      if (
+        !bc3dFallback &&
+        ext.textureMeta &&
+        typeof ext.textureMeta.get === 'function'
+      ) {
+        const rm = ext.textureMeta.get(textureId);
+        if (rm) {
+          if (rm.bcFallback && base.dimension === '3d') bc3dFallback = true;
+          if (rm.promoted1DTo2D) promoted1D = true;
+        }
+      }
+      ext = ext.next || null;
+    }
+    const localMeta = this._textureMeta.get(textureId) || null;
+    if (tpMeta && tpMeta.promoted1DTo2D) promoted1D = true;
+    if (localMeta && localMeta.promoted1DTo2D) promoted1D = true;
+    return {
+      ...base,
+      promoted1D,
+      bc3dFallback,
+    };
+  }
+
+  _encodeCopyTextureOnEncoder(encoder, copyParams) {
+    if (!encoder || typeof encoder.copyTextureToTexture !== 'function') {
+      throw new Error('encoder lacks copyTextureToTexture');
+    }
+    encoder.copyTextureToTexture(
+      {
+        texture: copyParams.srcTexture,
+        mipLevel: copyParams.srcMip,
+        origin: { x: copyParams.srcX, y: copyParams.srcY, z: copyParams.srcZ },
+        aspect: 'all',
+      },
+      {
+        texture: copyParams.dstTexture,
+        mipLevel: copyParams.dstMip,
+        origin: { x: copyParams.dstX, y: copyParams.dstY, z: copyParams.dstZ },
+        aspect: 'all',
+      },
+      {
+        width: copyParams.width,
+        height: copyParams.height,
+        depthOrArrayLayers: copyParams.depthOrArrayLayers,
+      }
+    );
+  }
+
+  /**
+   * CopyTexture (opcode 62, kGpuOpcodeCopyTexture): validate against tracked texture geometry
+   * (mirroring native_executor.cpp record_texture_copy) and encode WebGPU copyTextureToTexture
+   * in stream order, ending any active render/compute pass and flushing pending staged uploads.
+   */
+  _copyTextureFromView(view, payloadOffset, extTextureMetaMap = null) {
+    const dstId = view.getUint32(payloadOffset, true);
+    const srcId = view.getUint32(payloadOffset + 4, true);
+    const dstMip = view.getUint32(payloadOffset + 8, true);
+    const srcMip = view.getUint32(payloadOffset + 12, true);
+    const dstX = view.getUint32(payloadOffset + 16, true);
+    const dstY = view.getUint32(payloadOffset + 20, true);
+    const dstZ = view.getUint32(payloadOffset + 24, true);
+    const srcX = view.getUint32(payloadOffset + 28, true);
+    const srcY = view.getUint32(payloadOffset + 32, true);
+    const srcZ = view.getUint32(payloadOffset + 36, true);
+    const width = view.getUint32(payloadOffset + 40, true);
+    const height = view.getUint32(payloadOffset + 44, true);
+    const depthOrArrayLayers = view.getUint32(payloadOffset + 48, true);
+    // payloadOffset + 52 is u32 reserved.
+
+    const dstInfo = this._resolveCopyTextureInfo(dstId, extTextureMetaMap);
+    const srcInfo = this._resolveCopyTextureInfo(srcId, extTextureMetaMap);
+    if (!dstInfo || !srcInfo) {
+      this._copyTextureStats.missing += 1;
+      return {
+        status: 'missing',
+        error: `CopyTexture: unknown texture ${!dstInfo ? dstId : srcId}`,
+      };
+    }
+
+    if (
+      dstInfo.dimension !== srcInfo.dimension ||
+      (dstInfo.dimension !== '2d' && dstInfo.dimension !== '3d') ||
+      dstInfo.promoted1D ||
+      srcInfo.promoted1D ||
+      dstInfo.bc3dFallback ||
+      srcInfo.bc3dFallback
+    ) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: textures are not both 2D or both 3D',
+      };
+    }
+
+    const dstBaseFmt = TEXTURE_SRGB_TO_LINEAR[dstInfo.format] || dstInfo.format;
+    const srcBaseFmt = TEXTURE_SRGB_TO_LINEAR[srcInfo.format] || srcInfo.format;
+    if (!dstBaseFmt || dstBaseFmt !== srcBaseFmt || dstInfo.sampleCount !== srcInfo.sampleCount) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: formats or sample counts are not copy-compatible',
+      };
+    }
+
+    if (typeof srcInfo.usage === 'number' && srcInfo.usage !== 0 && (srcInfo.usage & TEXTURE_USAGE.COPY_SRC) === 0) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `CopyTexture: source texture ${srcId} lacks COPY_SRC usage`,
+      };
+    }
+    if (typeof dstInfo.usage === 'number' && dstInfo.usage !== 0 && (dstInfo.usage & TEXTURE_USAGE.COPY_DST) === 0) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `CopyTexture: destination texture ${dstId} lacks COPY_DST usage`,
+      };
+    }
+
+    if (srcMip >= srcInfo.mipLevelCount || dstMip >= dstInfo.mipLevelCount) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: mip level out of range',
+      };
+    }
+
+    if (width === 0 || height === 0 || depthOrArrayLayers === 0) {
+      this._copyTextureStats.noop += 1;
+      return { status: 'noop' };
+    }
+
+    const isCompressed = (TEXTURE_BLOCK_FORMAT_BYTES[dstInfo.format] || 0) > 0;
+    const bw = isCompressed ? 4 : 1;
+    const bh = isCompressed ? 4 : 1;
+    const is3D = dstInfo.dimension === '3d';
+    const mipDim = (v, m) => Math.max(1, v >>> m);
+    const roundUpBlock = (v, b) => (b <= 1 ? v : Math.ceil(v / b) * b);
+
+    const sw = roundUpBlock(mipDim(srcInfo.width, srcMip), bw);
+    const sh = roundUpBlock(mipDim(srcInfo.height, srcMip), bh);
+    const dw = roundUpBlock(mipDim(dstInfo.width, dstMip), bw);
+    const dh = roundUpBlock(mipDim(dstInfo.height, dstMip), bh);
+    const sd = is3D ? mipDim(srcInfo.depthOrArrayLayers, srcMip) : srcInfo.depthOrArrayLayers;
+    const dd = is3D ? mipDim(dstInfo.depthOrArrayLayers, dstMip) : dstInfo.depthOrArrayLayers;
+
+    if (
+      srcX + width > sw ||
+      srcY + height > sh ||
+      srcZ + depthOrArrayLayers > sd ||
+      dstX + width > dw ||
+      dstY + height > dh ||
+      dstZ + depthOrArrayLayers > dd
+    ) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: region out of range',
+      };
+    }
+
+    if (
+      (bw > 1 && (srcX % bw !== 0 || dstX % bw !== 0 || width % bw !== 0)) ||
+      (bh > 1 && (srcY % bh !== 0 || dstY % bh !== 0 || height % bh !== 0))
+    ) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: compressed region is not block aligned',
+      };
+    }
+
+    const wholeOnly = CLEAR_TEXTURE_DEPTH_STENCIL_FORMATS.has(dstInfo.format) || dstInfo.sampleCount > 1;
+    if (
+      wholeOnly &&
+      (width !== sw ||
+        height !== sh ||
+        depthOrArrayLayers !== sd ||
+        sw !== dw ||
+        sh !== dh ||
+        sd !== dd ||
+        srcX !== 0 ||
+        srcY !== 0 ||
+        srcZ !== 0 ||
+        dstX !== 0 ||
+        dstY !== 0 ||
+        dstZ !== 0)
+    ) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: depth/stencil or multisampled textures are copied whole',
+      };
+    }
+
+    // Flush any earlier staged texture/buffer uploads so they land before this texture copy.
+    if (this._pendingEncoder && this._hasPendingUploadCommands) {
+      this._flushPendingUploads(false);
+    }
+
+    const copyParams = {
+      srcTexture: srcInfo.texture,
+      dstTexture: dstInfo.texture,
+      srcMip,
+      dstMip,
+      srcX,
+      srcY,
+      srcZ,
+      dstX,
+      dstY,
+      dstZ,
+      width,
+      height,
+      depthOrArrayLayers,
+    };
+
+    // If pass commands are already queued in this frame, enqueue the copy in stream order so any
+    // open render/compute pass finishes before copyTextureToTexture runs on the frame's encoder.
+    if (this._passCommands.length > 0) {
+      this._passCommands.push({
+        type: 'copyTexture',
+        copyParams,
+        _wgpuMeta: { kind: 'CopyTexture' },
+        run: (pc) => {
+          if (pc && typeof pc.endPass === 'function') {
+            pc.endPass();
+          }
+          this._encodeCopyTextureOnEncoder(pc ? pc.encoder : null, copyParams);
+        },
+      });
+      this._copyTextureStats.copied += 1;
+      return { status: 'copied', queued: true };
+    }
+
+    // No prior pass commands in this frame: encode and submit immediately so copy-only streams
+    // and upload -> copy -> overwrite-src sequences execute in strict stream order without Present.
+    if (
+      !this.device ||
+      typeof this.device.createCommandEncoder !== 'function' ||
+      !this.device.queue ||
+      typeof this.device.queue.submit !== 'function'
+    ) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: 'CopyTexture: device lacks createCommandEncoder or queue.submit',
+      };
+    }
+    try {
+      const encoder = this.device.createCommandEncoder();
+      this._encodeCopyTextureOnEncoder(encoder, copyParams);
+      this.device.queue.submit([encoder.finish()]);
+      this._copyTextureStats.copied += 1;
+      return { status: 'copied', queued: false };
+    } catch (err) {
+      this._copyTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `CopyTexture: ${String(err && err.message ? err.message : err)}`,
+      };
+    }
+  }
+
+  _handleCopyTexture(view, payloadOffset) {
+    const result = this._copyTextureFromView(view, payloadOffset);
+    if ((result.status === 'invalid' || result.status === 'missing') && result.error) {
+      this._recordOpValidationError('CopyTexture', result.error);
     }
   }
 
@@ -15228,16 +15541,16 @@ class WgpuCommandProcessor {
     }
 
     const cmds = this._passCommands;
-    let hasComputeDispatch = false;
+    let hasComputeOrCopy = false;
     for (let i = 0, n = cmds.length; i < n; i += 1) {
       const t = cmds[i].type;
-      if (t === 'dispatchCompute' || t === 'dispatchIndirect') {
-        hasComputeDispatch = true;
+      if (t === 'dispatchCompute' || t === 'dispatchIndirect' || t === 'copyTexture') {
+        hasComputeOrCopy = true;
         break;
       }
     }
 
-    if (hasComputeDispatch && this.device && typeof this.device.createCommandEncoder === 'function') {
+    if (hasComputeOrCopy && this.device && typeof this.device.createCommandEncoder === 'function') {
       try {
         const encoder = this.device.createCommandEncoder();
         let computePass = null;
@@ -15278,6 +15591,12 @@ class WgpuCommandProcessor {
               ensureCompute().dispatchWorkgroupsIndirect(buf, cmd.offset);
               this._computeDispatchCount += 1;
             }
+          } else if (cmd.type === 'copyTexture' && cmd.copyParams) {
+            if (computePass && typeof computePass.end === 'function') {
+              computePass.end();
+              computePass = null;
+            }
+            this._encodeCopyTextureOnEncoder(encoder, cmd.copyParams);
           }
         }
         if (computePass && typeof computePass.end === 'function') {
@@ -15798,6 +16117,23 @@ class WgpuCommandProcessor {
           this._handleWriteTexture(view, payloadOffset, payloadBytes);
         } else {
           this._recordOpValidationError('WriteTexture', `truncated payload (${payloadBytes}B < 48B)`);
+        }
+        break;
+      case OPCODE_COPY_TEXTURE:
+        if (payloadBytes >= COPY_TEXTURE_PAYLOAD_BYTES) {
+          if (this.extension) {
+            const handled = this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+            if (!handled) {
+              this._handleCopyTexture(view, payloadOffset);
+            }
+          } else {
+            this._handleCopyTexture(view, payloadOffset);
+          }
+        } else {
+          this._recordOpValidationError(
+            'CopyTexture',
+            `truncated payload (${payloadBytes}B < ${COPY_TEXTURE_PAYLOAD_BYTES}B)`
+          );
         }
         break;
       case OPCODE_CLEAR_TEXTURE:
@@ -16336,6 +16672,7 @@ class WgpuCommandProcessor {
       replayBindGroupEvictions: this._replayBindGroupEvictions,
       replayLogOverflowCount: this._replayLogOverflowCount,
       clearTextureStats: { ...this._clearTextureStats },
+      copyTextureStats: { ...this._copyTextureStats },
     };
   }
 
@@ -20152,6 +20489,8 @@ const exportedApi = {
   deliverReadback,
   fnv1a64Hex,
   OPCODES,
+  OPCODE_COPY_TEXTURE,
+  COPY_TEXTURE_PAYLOAD_BYTES,
   OPCODE_CLEAR_TEXTURE,
   CLEAR_TEXTURE_PAYLOAD_BYTES,
   SHADER_STAGE,

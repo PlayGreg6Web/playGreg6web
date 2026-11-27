@@ -88,8 +88,11 @@ const V2_OPCODES = Object.freeze({
   CREATE_TEXTURE2: 35,
 });
 
-// Native-executor extension opcode outside GpuOpcode (runtime/abi/playgta6_abi.h kGpuOpcodeClearTexture).
+// Native-executor extension opcodes outside GpuOpcode (runtime/abi/playgta6_abi.h
+// kGpuOpcodeCopyTexture = 62, kGpuOpcodeClearTexture = 63).
 // Kept separate from V2_OPCODES so enum parity tests against GpuOpcode stay exact.
+const OPCODE_COPY_TEXTURE = 62;
+const COPY_TEXTURE_PAYLOAD_BYTES = 56;
 const OPCODE_CLEAR_TEXTURE = 63;
 const CLEAR_TEXTURE_PAYLOAD_BYTES = 8;
 
@@ -1269,22 +1272,13 @@ function sanitizeTextureDescriptor(rawDescriptor, device, options) {
     }
   }
 
-  // #1937/#1944: address-backed compute UAV float textures (ensure_address_texture: STORAGE_BINDING
-  // without RENDER_ATTACHMENT) may be read back via ReadbackTexture; ensure COPY_SRC is present so
-  // copyTextureToBuffer never fails Dawn validation.
-  if (
-    (usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
-    (usage & GPU_TEXTURE_USAGE_RENDER_ATTACHMENT) === 0 &&
-    effectiveDimension === '2d' &&
-    sampleCount === 1 &&
-    FLOAT_READBACK_STORAGE_FORMATS.has(effectiveFormat)
-  ) {
-    usage |= GPU_TEXTURE_USAGE_COPY_SRC;
-  }
-
   if (usage === 0) {
     usage = GPU_TEXTURE_USAGE_TEXTURE_BINDING;
   }
+
+  // #2109 (CopyTexture opcode 62) & #1937/#1944 (ReadbackTexture): include COPY_SRC on every
+  // created texture so any texture can serve as a copyTextureToTexture / readback source.
+  usage |= GPU_TEXTURE_USAGE_COPY_SRC;
 
   const descriptor = {
     size: { ...rawDescriptor.size },
@@ -4050,6 +4044,8 @@ class RenderStatePackets {
       skippedComputeDispatchCount: 0,
       clampedComputeDispatchCount: 0,
       texture2Count: 0,
+      textureCopies: 0,
+      textureCopiesMissing: 0,
       textureClears: 0,
       textureClearsMissing: 0,
       bcFormatFallbacks: 0,
@@ -4432,6 +4428,8 @@ class RenderStatePackets {
         return this._count(payloadBytes >= 24 && this._createSampler(view, offset));
       case V2_OPCODES.CREATE_TEXTURE2:
         return this._count(this._createTexture2(view, offset, payloadBytes));
+      case OPCODE_COPY_TEXTURE:
+        return this._count(this._copyTexture(view, offset, payloadBytes));
       case OPCODE_CLEAR_TEXTURE:
         return this._count(this._clearTexture(view, offset, payloadBytes));
       default:
@@ -7239,6 +7237,35 @@ class RenderStatePackets {
     return true;
   }
 
+  _copyTexture(view, offset, payloadBytes) {
+    if (
+      !view ||
+      payloadBytes < COPY_TEXTURE_PAYLOAD_BYTES ||
+      offset + COPY_TEXTURE_PAYLOAD_BYTES > view.byteLength
+    ) {
+      this._packetError = `CopyTexture: payload ${payloadBytes} < ${COPY_TEXTURE_PAYLOAD_BYTES} bytes`;
+      return false;
+    }
+    if (this.processor && typeof this.processor._copyTextureFromView === 'function') {
+      const result = this.processor._copyTextureFromView(view, offset, this.textureMeta);
+      if (result.status === 'copied') {
+        this.telemetry.textureCopies += 1;
+        return true;
+      }
+      if (result.status === 'noop') {
+        return true;
+      }
+      if (result.status === 'missing') {
+        this.telemetry.textureCopiesMissing += 1;
+      }
+      this._packetError = result.error || 'CopyTexture: invalid copy parameters';
+      return false;
+    }
+    this.telemetry.textureCopiesMissing += 1;
+    this._packetError = 'CopyTexture: processor does not support CopyTexture';
+    return false;
+  }
+
   _resolveTextureMetaFull(textureId) {
     const meta = this.textureMeta.get(textureId) || null;
     const texture =
@@ -9649,6 +9676,8 @@ const exportedApi = {
   BLENDABLE_CORE_FORMATS,
   VERTEX_FORMAT_BYTE_SIZES,
   V2_OPCODES,
+  OPCODE_COPY_TEXTURE,
+  COPY_TEXTURE_PAYLOAD_BYTES,
   OPCODE_CLEAR_TEXTURE,
   CLEAR_TEXTURE_PAYLOAD_BYTES,
   SWAPCHAIN_TEXTURE_ID,

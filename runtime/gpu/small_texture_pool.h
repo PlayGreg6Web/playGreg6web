@@ -46,9 +46,10 @@ inline constexpr uint32_t kLargeTexturePoolBudgetPercent = 60;
 void set_gpu_texture_clear(bool on) noexcept;
 bool gpu_texture_clear() noexcept;
 
-// The GPU consumer copies texture to texture itself (kGpuOpcodeCopyTexture; the native executor): D3D12
+// The GPU consumer copies texture to texture itself (kGpuOpcodeCopyTexture): D3D12
 // copies whose destination is neither a render target nor a UAV are emitted as that packet instead of
-// being skipped. Off by default: the browser worker does not have the packet yet.
+// being skipped. Enabled by live native and browser boots, otherwise off for consumers that do not
+// implement the packet.
 void set_gpu_texture_copy(bool on) noexcept;
 bool gpu_texture_copy() noexcept;
 

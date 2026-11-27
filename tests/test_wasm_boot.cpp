@@ -615,17 +615,26 @@ void test_program_boot_full_synthetic_execution() {
     g_test_dllmain_ran = false;
     g_test_entry_ran = false;
     const bool previous_gpu_clear = playgta6::gpu::gpu_texture_clear();
+    const bool previous_gpu_copy = playgta6::gpu::gpu_texture_copy();
     playgta6::gpu::set_gpu_texture_clear(false);
+    playgta6::gpu::set_gpu_texture_copy(false);
     bool gpu_clear_enabled_in_guest = false;
-    g_test_entry_hook = [&]() { gpu_clear_enabled_in_guest = playgta6::gpu::gpu_texture_clear(); };
+    bool gpu_copy_enabled_in_guest = false;
+    g_test_entry_hook = [&]() {
+        gpu_clear_enabled_in_guest = playgta6::gpu::gpu_texture_clear();
+        gpu_copy_enabled_in_guest = playgta6::gpu::gpu_texture_copy();
+    };
 
     playgta6::os::VirtualMemoryArena arena;
     playgta6::os::win32::set_vmem_arena(&arena);
     const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
     g_test_entry_hook = nullptr;
     CHECK(gpu_clear_enabled_in_guest);
+    CHECK(gpu_copy_enabled_in_guest);
     CHECK(!playgta6::gpu::gpu_texture_clear());
+    CHECK(!playgta6::gpu::gpu_texture_copy());
     playgta6::gpu::set_gpu_texture_clear(previous_gpu_clear);
+    playgta6::gpu::set_gpu_texture_copy(previous_gpu_copy);
     const bool dll_registered = playgta6::os::win32::GetModuleHandleA("helper.dll") == kTestDllBase;
     playgta6::guest::reset_boot();
     playgta6::os::win32::set_vmem_arena(nullptr);
