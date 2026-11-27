@@ -7,8 +7,8 @@ docs. No game files are in this repo; the executable and package stay outside (s
 
 ```
 $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
-.	ools\play_native.ps1 -FreshSetup  # new empty save dir so the setup screens appear
-.	ools\play_native.ps1              # later runs: builds what is stale, live window with audio and input
+.\tools\play_native.ps1 -FreshSetup  # new empty save dir so the setup screens appear
+.\tools\play_native.ps1              # later runs: builds what is stale, live window with audio and input
 .\tools\update_prebuilt.ps1          # build once into a folder (atomic swap, prebuilt.json), incremental after
 .\tools\play_native.ps1 -Prebuilt   # start that build in seconds: never compiles, prints its commit and how far behind main it is
 ```
@@ -17,9 +17,13 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
   under `work/` is picked and printed; the std pack is picked automatically), `PLAYGTA6_PREBUILT_DIR` (native
   prebuilt, default `%LOCALAPPDATA%\playgta6\prebuilt`), `PLAYGTA6_PREBUILT_WEB_DIR` (browser prebuilt, default
   `...\prebuilt-web`). Flags: `-Prebuilt` (#1854, #1866), `-ConsoleTiming`, `-MaxMs`, `-SaveDir`, `-InputScript`, `-NoBuild`, `-DryRun`.
+- `-DryRun` (#1930) prints the resolved command and exits without building or launching. `-Prebuilt` prints a
+  one-line staleness hint (commits to runtime, recomp, harness or shaders since that build; never blocks; #1926).
+- `update_prebuilt.ps1` boots the fresh build headless first and swaps it in only if that smoke boot passes;
+  on failure the old prebuilt and the `.new` folder stay. `-SkipSmoke` opts out, `-DryRun` prints the plan (#1948).
 - `-ConsoleTiming` (#1861) honors the title's present sync interval: menus run at the console's 30 fps instead of
   about 60 (default `--present-interval min1`); gameplay at interval 1 is the same.
-- `python tools	rim_caches.py [--apply]` reports and LRU-trims all build caches to budgets (dry run by default); builders
+- `python tools\trim_caches.py [--apply]` reports and LRU-trims all build caches to budgets (dry run by default); builders
   auto-trim when free disk < `PLAYGTA6_MIN_FREE_GB` (default 20). See [BUILD_CACHING.md](BUILD_CACHING.md).
 - One cache root (`PLAYGTA6_CACHE_ROOT`, default `%LOCALAPPDATA%\playgta6\cache`, or `auto` = drive with most free space) holds the
   object, lift, shard-lift, recomp, targets and wasm caches for every tool; legacy dirs get a one-time hint, nothing is moved.
@@ -69,8 +73,8 @@ How to run it: [quick start](PLAY_LOCALLY.md#quick-start-play-natively-windows).
 
 Setup screens, loading, then the Bink videos decode and play. A headless run reaches about 110 s and
 **stops on `XSystemGetAppSpecificDeviceId`** (a trapping stub on purpose, an owner decision). Nothing past it
-has been seen. Music has not started yet; the audio probe counters in the boot report (#1737) are the way to
-diagnose that. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
+has been seen. Music has not started yet; the boot report's music-start diagnostics (stream events with time and
+present index, music controller lookup nulls, metadata hash lookups; #1947) are the way to diagnose that. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
 
 Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). All three are
 still pending; options and consequences in
@@ -83,6 +87,23 @@ still pending; options and consequences in
 
 Also open: `XUserGetTokenAndSignatureResult` (slot 25) offline HRESULT. `XNetworking` slots 3/4/5/8/9/10/14 already
 answer offline (network unreachable, #1872); the security/certificate ones are hard stops and never vouch for a server.
+
+Open investigations (no owner decision needed, nothing merged that fixes them yet):
+
+- Title job-graph stall: a run stalls with the title's own `int3` assert in its job graph; the fault record gives
+  the address and call stack (see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md)).
+- Music: the music controller lookup returns null metadata (#1947 logs it); no music until that is understood.
+- Browser: an `INDIRECT_CALL_MISS` ending is waiting for a crash report from a real browser run
+  ([WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) says what to send).
+
+Since 2026-11-26 (merged): a stopped or crashed run now shows an always-visible banner ("Stopped: <slot> - needs an
+owner decision" vs "Crashed: <kind> at <site> - report: <dir>"), printed again at the end of `play_native` and
+browser runs (#1929, #1933); `--dump-on-fault` minidumps carry the thread context and fault record (#1925); the
+host-fault races in GPU hashing and shared-page views are closed (#1903, #1913, #1916); GPU: compute-written float
+and stencil textures are read back into guest memory (#1937, #1940, #1944), `ExecuteIndirect` with root constants
+(#1941), a per-frame budget for async pipeline creation so a slow pipeline skips the draw instead of freezing
+the frame (#1936, #1943); audio output is event-driven and underruns are split into `host_starved` and
+`guest_stalled` (#1907, #1924); `inet_ntoa` and `HCTraceImplMessage` are handled (#1945).
 
 ## Ray tracing
 
