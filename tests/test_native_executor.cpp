@@ -2264,6 +2264,7 @@ void test_indirect_constants_pass(NativeExecutor& ex) {
         }
     }
     CHECK(ex.stats().device_errors == before.device_errors);
+}
 
 namespace playgta6::gpu::bridge {
 struct StencilTwinDawnTestAccess {
