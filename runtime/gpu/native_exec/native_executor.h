@@ -528,6 +528,8 @@ public:
     // Test hook: loses the device now (wgpu Device::ForceLoss, reason Unknown) so the recovery runs on
     // the next packet / poll exactly as for a driver reset.
     void debug_force_device_lost(const std::string& message);
+    // Test hook: the next `count` device creations fail, so a recovery ends fatal without a device.
+    void debug_fail_device_creations(int count);
     bool faulted() const;
 
     uint64_t frame_count() const;

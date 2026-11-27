@@ -3715,6 +3715,19 @@ void test_device_loss() {
     CHECK(js.find("simulated gpu removal") != std::string::npos);
     CHECK(ex2->stats().dropped_while_lost >= 1);
 
+    // A recovery whose new device cannot be created (the driver's E_OUTOFMEMORY) ends without a device:
+    // the fault record, and wait_idle() (the live pump's last call) must not touch the null queue.
+    auto ex5 = NativeExecutor::create(opts, &status, &error);
+    CHECK(ex5 != nullptr);
+    if (!ex5) return;
+    CHECK(run(*ex5, red) == 1);
+    ex5->debug_fail_device_creations(5);
+    ex5->debug_force_device_lost("simulated out of memory");
+    CHECK(run(*ex5, red) == 0);
+    CHECK(ex5->faulted() && !ex5->poll());
+    CHECK(ex5->stats_json().find("could not create a new device: simulated device creation failure") != std::string::npos);
+    ex5->wait_idle();
+
     // Content over the budget is dropped, not fatal: the buffer comes back without it (counted).
     ExecutorOptions small = opts;
     small.recovery_journal_bytes = 64;

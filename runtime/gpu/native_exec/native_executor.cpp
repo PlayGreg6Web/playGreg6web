@@ -1055,6 +1055,12 @@ struct NativeExecutor::Impl {
 
     // Adapter + device (+ offscreen canvas, timers): the first creation and every device-loss recovery.
     bool acquire_device(CreateStatus* status, std::string* error) {
+        if (debug_failed_acquires > 0) {  // tests: a device the driver will not create (e.g. out of memory)
+            --debug_failed_acquires;
+            if (status) *status = CreateStatus::Failed;
+            if (error) *error = "simulated device creation failure";
+            return false;
+        }
         features = DeviceFeatures{};
         timer_slots.clear();
         time_ring.reset();
@@ -2008,6 +2014,7 @@ struct NativeExecutor::Impl {
     bool fatal = false;
     bool drop_next_present = false;
     bool replaying = false;
+    int debug_failed_acquires = 0;  // debug_fail_device_creations: the next N acquire_device calls fail
 
     static bool journaled_opcode(uint16_t op) {
         switch (op) {
@@ -9394,6 +9401,8 @@ std::vector<ShowTargetCandidate> NativeExecutor::shown_target_candidates() const
 
 std::string NativeExecutor::present_mode_name() const { return impl_->present_mode_name; }
 
+void NativeExecutor::debug_fail_device_creations(int count) { impl_->debug_failed_acquires = count; }
+
 void NativeExecutor::debug_force_device_lost(const std::string& message) {
     if (impl_->device) impl_->device.ForceLoss(wgpu::DeviceLostReason::Unknown, {message.data(), message.size()});
     impl_->instance.ProcessEvents();  // delivers the lost callback
@@ -9405,9 +9414,12 @@ bool NativeExecutor::window_focused() const { return impl_->window && impl_->win
 
 void NativeExecutor::wait_idle() {
     Impl& s = *impl_;
-    s.instance.WaitAny(s.queue.OnSubmittedWorkDone(wgpu::CallbackMode::WaitAnyOnly,
-                                                   [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}),
-                       kWaitForever);
+    // A failed recovery leaves no device (release_device_objects): nothing is in flight to wait for, and
+    // OnSubmittedWorkDone on the null queue was a host access violation that hid the gpu_device_lost record.
+    if (s.queue)
+        s.instance.WaitAny(s.queue.OnSubmittedWorkDone(wgpu::CallbackMode::WaitAnyOnly,
+                                                       [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}),
+                           kWaitForever);
     // Read-back and timer maps complete in ProcessEvents once the GPU is done.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (s.pending_maps > 0 && std::chrono::steady_clock::now() < deadline) {
