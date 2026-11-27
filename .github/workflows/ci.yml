@@ -83,7 +83,7 @@ jobs:
       - name: Configure (PLAYGTA6_NATIVE_EXECUTOR=ON)
         run: cmake -S runtime -B build-native-exec -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_NATIVE_EXECUTOR=ON "-DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.fc-cache"
       - name: Build boot harness, executor and model tests
-        run: cmake --build build-native-exec --config Release --parallel --target playgta6_boot pg6_native_exec gen_native_exec_trace test_native_executor test_native_exec_model test_native_exec_reflection
+        run: cmake --build build-native-exec --config Release --parallel --target playgta6_boot pg6_native_exec gen_native_exec_trace test_native_executor test_native_exec_model test_native_exec_reflection test_native_exec_quarantine
       - name: Run GPU-free tests (GPU tests skip without an adapter)
         run: ctest --test-dir build-native-exec -C Release --output-on-failure -R "test_native_exec"
       - name: E2E smoke on the WARP software adapter (replay, digests, PNG dump, native_replay_compare --self-check)
