@@ -6288,6 +6288,72 @@ void test_storage_relocation_keeps_large_frame_working_set() {
     scene.release_all();
 }
 
+// #2093: evicting small storage relocations returns their space. Growing size classes (each phase
+// needs bigger homes than the last, in one frame so the cache grows past the reuse scan window) evict
+// the old small homes without being able to reuse their slots; the shared 4 MiB chunks that end up
+// empty are destroyed, so the chunk set stays bounded and every live home keeps its bytes.
+void test_storage_relocation_evicted_chunks_are_released() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    constexpr size_t kPerPhase = 1500;  // > the 1024-entry reuse scan window
+    constexpr size_t kPhases = 16;
+    constexpr uint64_t kUnit = 256;
+    std::vector<uint8_t> ring(kPerPhase * kUnit * (kPhases * (kPhases + 1) / 2) + 4096);
+    for (size_t i = 0; i < ring.size(); ++i) {
+        ring[i] = static_cast<uint8_t>(i * 13u + 5u);
+    }
+    const uint64_t base = put_aligned(ring, 256);
+    uint64_t cursor = 0;
+    struct Live {
+        uint64_t va, size;
+        uint32_t id;
+        uint64_t off;
+    };
+    std::vector<Live> last_phase;
+    size_t max_chunks = 0;
+    for (size_t p = 1; p <= kPhases; ++p) {
+        dev->on_frame_presented();
+        dev->on_frame_presented();
+        dev->on_frame_presented();
+        last_phase.clear();
+        for (size_t i = 0; i < kPerPhase; ++i) {
+            const uint64_t size = kUnit * p;
+            const uint64_t va = base + cursor;
+            cursor += size;
+            uint32_t id = 0;
+            uint64_t offset = 0;
+            CHECK(dev->relocate_storage_buffer(va, size, &id, &offset, false));
+            CHECK(offset + size <= (uint64_t{4} << 20));
+            CHECK(dev->storage_relocation_home(id));
+            last_phase.push_back({va, size, id, offset});
+        }
+        max_chunks = std::max(max_chunks, dev->relocated_storage_chunk_count());
+    }
+    // Leaking every evicted slot would need ~ sum(1500 * 256 * p) = 52 MiB = 13 chunks.
+    CHECK(max_chunks <= 8);
+    // The newest homes are distinct, non-overlapping slots and bind again unchanged.
+    std::map<std::pair<uint32_t, uint64_t>, uint64_t> slots;
+    for (const Live& l : last_phase) {
+        uint32_t id = 0;
+        uint64_t offset = 0;
+        CHECK(dev->relocate_storage_buffer(l.va, l.size, &id, &offset, false));
+        CHECK(id == l.id && offset == l.off);
+        slots[{id, offset}] = l.size;
+    }
+    CHECK(slots.size() == last_phase.size());
+    uint32_t prev_id = 0;
+    uint64_t prev_end = 0;
+    for (const auto& [home, size] : slots) {
+        if (home.first == prev_id) {
+            CHECK(home.second >= prev_end);
+        }
+        prev_id = home.first;
+        prev_end = home.second + size;
+    }
+    scene.release_all();
+}
+
 void test_g58_relocate_ia_vb_ib() {
     Fixture fx;
     Scene scene(fx);
@@ -9946,6 +10012,7 @@ int main() {
     test_g58_relocate_ia_vb_ib();
     test_storage_relocation_reuse_waits_for_presents();
     test_storage_relocation_keeps_large_frame_working_set();
+    test_storage_relocation_evicted_chunks_are_released();
     test_g84_readback_ring_hardening();
     test_g84_xbox_3d_methods_hardening();
     test_g79_copy_texture_region_3d_array_cube_and_bc_miptail();

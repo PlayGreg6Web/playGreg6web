@@ -2978,9 +2978,18 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     uint64_t target_off = 0;
     uint64_t target_cap = 0;
 
+    std::vector<uint32_t> emptied_chunks;  // shared chunks that lost a home in this call (#2093)
     const auto erase_entry = [&](std::map<RelocatedStorageKey, RelocatedStorage>::iterator it) {
         storage_relocation_lru_.erase(it->second.last_used_seq);
         storage_relocation_bytes_ -= std::min(storage_relocation_bytes_, it->second.slot_capacity);
+        if (!it->second.dedicated) {
+            const uint32_t chunk = it->second.buffer_id;
+            auto live_it = storage_relocation_chunk_live_.find(chunk);
+            if (live_it != storage_relocation_chunk_live_.end() && live_it->second > 0) {
+                --live_it->second;
+            }
+            emptied_chunks.push_back(chunk);
+        }
         storage_relocations_.erase(it);
         relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
     };
@@ -3027,7 +3036,10 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             if (!over_hard_bound() && (dropped || !settled(lru_it->second))) {
                 break;
             }
-            if (lru_it->second.dedicated) {
+            if (!lru_it->second.dedicated) {
+                storage_relocation_free_.emplace(lru_it->second.slot_capacity,
+                                                 std::make_pair(lru_it->second.buffer_id, lru_it->second.offset));
+            } else {
                 const uint32_t old_id = lru_it->second.buffer_id;
                 bridge_->unregister_resource(old_id);
                 bridge_->advance_present_frame(stats().presents, enc);
@@ -3041,6 +3053,15 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         }
     }
 
+    if (target_buf == 0 && !dedicated) {
+        const auto fit = storage_relocation_free_.lower_bound(need);
+        if (fit != storage_relocation_free_.end() && fit->first <= need * 2) {
+            target_cap = fit->first;
+            target_buf = fit->second.first;
+            target_off = fit->second.second;
+            storage_relocation_free_.erase(fit);
+        }
+    }
     if (target_buf == 0) {
         if (dedicated) {
             target_buf = allocate_id();
@@ -3087,6 +3108,35 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     storage_relocations_.emplace(key, entry);
     storage_relocation_lru_.emplace(seq, key);
     storage_relocation_bytes_ += target_cap;
+    if (!dedicated) {
+        ++storage_relocation_chunk_live_[target_buf];
+    }
+    // A shared chunk whose homes were all evicted is destroyed (its free slots go with it), so evicted
+    // small relocations return their space instead of growing the chunk set over a long session.
+    std::sort(emptied_chunks.begin(), emptied_chunks.end());
+    emptied_chunks.erase(std::unique(emptied_chunks.begin(), emptied_chunks.end()), emptied_chunks.end());
+    for (const uint32_t chunk : emptied_chunks) {
+        const auto live_it = storage_relocation_chunk_live_.find(chunk);
+        if (live_it == storage_relocation_chunk_live_.end() || live_it->second != 0) {
+            continue;
+        }
+        storage_relocation_chunk_live_.erase(live_it);
+        for (auto f = storage_relocation_free_.begin(); f != storage_relocation_free_.end();) {
+            f = f->second.first == chunk ? storage_relocation_free_.erase(f) : std::next(f);
+        }
+        if (chunk == storage_relocation_buffer_) {
+            storage_relocation_buffer_ = 0;
+            storage_relocation_used_ = 0;
+        }
+        bridge_->unregister_resource(chunk);
+        CommandEncoder rel;
+        bridge_->advance_present_frame(stats().presents, rel);
+        bridge_->destroy_or_defer_resource(chunk, rel);
+        submit(rel);
+        storage_relocation_buffers_.erase(
+            std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), chunk),
+            storage_relocation_buffers_.end());
+    }
 
     *buffer_id = target_buf;
     *offset = target_off;
@@ -3101,6 +3151,15 @@ size_t Device::relocated_storage_count() const {
 uint64_t Device::relocated_storage_bytes() const {
     std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
     return storage_relocation_bytes_;
+}
+
+size_t Device::relocated_storage_chunk_count() const {
+    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+    size_t dedicated = 0;
+    for (const auto& [key, r] : storage_relocations_) {
+        dedicated += r.dedicated ? 1 : 0;
+    }
+    return storage_relocation_buffers_.size() >= dedicated ? storage_relocation_buffers_.size() - dedicated : 0;
 }
 
 bool Device::storage_relocation_home(uint32_t buffer_id) const {

@@ -939,6 +939,8 @@ public:
     static constexpr size_t kStorageRelocationHardEntries = 65536;
     static constexpr uint64_t kStorageRelocationHardBytes = uint64_t{1} << 30;
     uint64_t relocated_storage_bytes() const;
+    // Shared (non-dedicated) 4 MiB chunks allocated for small storage relocations (test hook, #2093).
+    size_t relocated_storage_chunk_count() const;
     // #663: true for a buffer that holds storage relocation homes (BridgeOptions::relocation_home).
     bool storage_relocation_home(uint32_t buffer_id) const;
     // Index / vertex buffer views at address-only GPU VAs (G58: dynamic guest-RAM ring buffers
@@ -1268,6 +1270,11 @@ private:
     mutable std::mutex storage_relocation_mutex_;
     std::map<RelocatedStorageKey, RelocatedStorage> storage_relocations_;
     std::vector<uint32_t> storage_relocation_buffers_;
+    // Slots of evicted small (non-dedicated) homes inside the shared chunks, by capacity: a new small
+    // home takes one (capacity in [need, 2 * need]) before the chunk bump pointer advances, so evicting
+    // and re-creating relocations does not grow the chunks without bound (#2093).
+    std::multimap<uint64_t, std::pair<uint32_t, uint64_t>> storage_relocation_free_;
+    std::map<uint32_t, uint32_t> storage_relocation_chunk_live_;  // shared chunk -> live homes; 0 = destroyed
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
     uint64_t storage_relocation_seq_ = 0;
