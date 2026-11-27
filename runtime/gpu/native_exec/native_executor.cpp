@@ -303,6 +303,10 @@ struct ShaderEntry {
     uint64_t hash = 0;  // the pack hash of a hash-only payload (0 = inline WGSL): the GPU-time key
     uint64_t reflect_hash = 0;  // the worker's `hashHex`: the pack hash, else FNV-1a 64 of the WGSL text
     mutable bool pending = false;  // pack-backed and not yet materialized
+    // Text scans of `code` memoized per shader (a compute WGSL can be 16 MB; every pipeline built
+    // from the module rescanned it): resolved entry point per stage, statically referenced @group(0).
+    mutable std::string ep_cache[3];
+    mutable std::optional<std::vector<WgslBinding>> group0_cache;
 };
 
 // Result of an asynchronous pipeline creation (ExecutorOptions::async_pipelines), shared with the
@@ -1954,6 +1958,18 @@ struct NativeExecutor::Impl {
                                          std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
+    static constexpr uint64_t kSlowPacketNs = 1000ull * 1000000ull;
+    std::string slow_note;  // what the current packet materialized (ensure_shader), for the slow log
+
+    void note_slow_packet(uint16_t opcode, uint64_t ns) {
+        ++stats.slow_packets;
+        stats.slow_packet_max_ns = std::max(stats.slow_packet_max_ns, ns);
+        if (stats.slow_packets <= 32) {
+            std::fprintf(stderr, "[native_exec] slow packet: opcode %u took %llu ms%s%s\n", static_cast<unsigned>(opcode),
+                         static_cast<unsigned long long>(ns / 1000000), slow_note.empty() ? "" : "; ", slow_note.c_str());
+        }
+    }
+
     bool dispatch(const Packet& p) {
         if (lost || fatal) {
             if (!ensure_device()) {
@@ -2016,7 +2032,10 @@ struct NativeExecutor::Impl {
         } else {
             r = dispatch_op(p);
         }
-        if (p.opcode < kOpcodeSlots) stats.opcode_ns[p.opcode] += now_ns() - t0;
+        const uint64_t dt = now_ns() - t0;
+        if (p.opcode < kOpcodeSlots) stats.opcode_ns[p.opcode] += dt;
+        if (dt >= kSlowPacketNs) note_slow_packet(p.opcode, dt);
+        slow_note.clear();
         return r;
     }
 
@@ -2566,7 +2585,47 @@ struct NativeExecutor::Impl {
         }
         const char* stage_name = e.stage == 0 ? "vertex" : e.stage == 1 ? "fragment" : e.stage == 2 ? "compute" : "";
         e.explicit_ep = extract_wgsl_entry_point(e.code, stage_name);
-        e.module = make_module(e.code);
+        const uint64_t t0 = now_ns();
+        e.module = make_module(e.code);  // WGSL parse + resolve in Dawn/tint, on this thread
+        const uint64_t dt = now_ns() - t0;
+        ++stats.shader_materialized;
+        stats.shader_materialize_ns += dt;
+        if (dt > stats.shader_materialize_max_ns) {
+            stats.shader_materialize_max_ns = dt;
+            stats.shader_materialize_max_hash = e.hash;
+            stats.shader_materialize_max_bytes = e.code.size();
+        }
+        char note[96];
+        std::snprintf(note, sizeof note, "shader 0x%016llx, %zu WGSL bytes, module %llu ms",
+                      static_cast<unsigned long long>(e.hash), e.code.size(),
+                      static_cast<unsigned long long>(dt / 1000000));
+        slow_note = note;
+    }
+
+    static int stage_slot(std::string_view stage) { return stage == "vertex" ? 0 : stage == "fragment" ? 1 : 2; }
+
+    const std::string& entry_point_of(const ShaderEntry& e, std::string_view stage) {
+        std::string& c = e.ep_cache[stage_slot(stage)];
+        if (c.empty()) {
+            const uint64_t t0 = now_ns();
+            c = resolve_shader_entry_point(e.code, e.explicit_ep, stage);
+            note_scan(now_ns() - t0);
+        }
+        return c;
+    }
+
+    const std::vector<WgslBinding>& group0_of(const ShaderEntry& e) {
+        if (!e.group0_cache) {
+            const uint64_t t0 = now_ns();
+            e.group0_cache = parse_wgsl_group0_bindings(e.code);
+            note_scan(now_ns() - t0);
+        }
+        return *e.group0_cache;
+    }
+
+    void note_scan(uint64_t ns) {
+        ++stats.shader_scans;
+        stats.shader_scan_ns += ns;
     }
 
     wgpu::ShaderModule make_module(const std::string& code) {
@@ -3327,7 +3386,7 @@ struct NativeExecutor::Impl {
                 targets[i].blend = &blends[i];
             }
             fragment.module = fs->module;
-            const std::string ep = resolve_shader_entry_point(fs->code, fs->explicit_ep, "fragment");
+            const std::string& ep = entry_point_of(*fs, "fragment");
             // A target the fragment stage never writes must have writeMask 0 (Dawn validation).
             if (const auto outs = wgsl_fragment_output_mask(fs->code, ep)) {
                 for (uint32_t i = 0; i < target_count && i < 32; ++i) {
@@ -3403,8 +3462,8 @@ struct NativeExecutor::Impl {
         // WGSL becomes layout:'auto' with the worker's bind group remap (isExplicitLayoutCompatibleWithWgsl).
         AutoLayoutMeta auto_meta;
         if (!auto_layout && group0_entries) {
-            std::vector<WgslBinding> wb = merge_wgsl_group0_bindings(
-                parse_wgsl_group0_bindings(vs.code), fs ? parse_wgsl_group0_bindings(fs->code) : std::vector<WgslBinding>{});
+            std::vector<WgslBinding> wb =
+                merge_wgsl_group0_bindings(group0_of(vs), fs ? group0_of(*fs) : std::vector<WgslBinding>{});
             if (!explicit_layout_compatible(group0_entries->has_value() ? &**group0_entries : nullptr, wb)) {
                 auto_meta.remap = true;
                 auto_meta.bindings = std::move(wb);
@@ -3421,7 +3480,7 @@ struct NativeExecutor::Impl {
         }
         rd.layout = reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         rd.vertex.module = vs.module;
-        const std::string vep = resolve_shader_entry_point(vs.code, vs.explicit_ep, "vertex");
+        const std::string& vep = entry_point_of(vs, "vertex");
         rd.vertex.entryPoint = {vep.data(), vep.size()};
         rd.vertex.bufferCount = vbs.size();
         rd.vertex.buffers = vbs.data();
@@ -3637,10 +3696,10 @@ struct NativeExecutor::Impl {
         if (cit == shaders.end()) return fail("unknown compute shader module " + std::to_string(h.cs_module_id));
         const ShaderEntry& cs = cit->second;
         ensure_shader(cs);
-        const std::string ep = resolve_shader_entry_point(cs.code, cs.explicit_ep, "compute");
+        const std::string& ep = entry_point_of(cs, "compute");
         AutoLayoutMeta auto_meta;
         if (!auto_layout && group0_entries) {
-            std::vector<WgslBinding> wb = parse_wgsl_group0_bindings(cs.code);
+            std::vector<WgslBinding> wb = group0_of(cs);
             if (!explicit_layout_compatible(group0_entries->has_value() ? &**group0_entries : nullptr, wb)) {
                 auto_meta.remap = true;
                 auto_meta.bindings = std::move(wb);
@@ -6026,6 +6085,19 @@ std::string NativeExecutor::stats_json() const {
     num("shader_modules", st.shader_modules);
     num("shader_pack_hits", st.shader_pack_hits);
     num("shader_pack_misses", st.shader_pack_misses);
+    num("shader_materialized", st.shader_materialized);
+    num("shader_materialize_ms", st.shader_materialize_ns / 1000000ull);
+    num("shader_materialize_max_ms", st.shader_materialize_max_ns / 1000000ull);
+    {
+        char h[24];
+        std::snprintf(h, sizeof h, "0x%016llx", static_cast<unsigned long long>(st.shader_materialize_max_hash));
+        j += std::string("\"shader_materialize_max_hash\": \"") + h + "\", ";
+    }
+    num("shader_materialize_max_bytes", st.shader_materialize_max_bytes);
+    num("shader_scans", st.shader_scans);
+    num("shader_scan_ms", st.shader_scan_ns / 1000000ull);
+    num("slow_packets", st.slow_packets);
+    num("slow_packet_max_ms", st.slow_packet_max_ns / 1000000ull);
     num("textures_created", st.textures_created);
     num("texture_uploads", st.texture_uploads);
     num("texture_upload_bytes", st.texture_upload_bytes);

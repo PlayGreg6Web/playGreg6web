@@ -508,6 +508,22 @@ void test_pack_and_formats(NativeExecutor& ex) {
     CHECK(ex.stats().shader_pack_hits == before.shader_pack_hits + 1);
     CHECK(ex.stats().shader_pack_misses == before.shader_pack_misses + 1);
 
+    // The pack shader is materialized once (timed) and its WGSL scanned once, however many
+    // pipelines use it (a compute WGSL can be 16 MB).
+    gpu::CommandEncoder pipes;
+    for (uint32_t id : {82u, 83u, 84u}) {
+        GpuCreateComputePipeline2Payload cp;
+        std::memset(&cp, 0, sizeof cp);
+        cp.id = id;
+        cp.cs_module_id = 80;
+        emit(pipes, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    }
+    run(ex, pipes);
+    CHECK(ex.stats().shader_materialized == before.shader_materialized + 1);
+    CHECK(ex.stats().shader_scans == before.shader_scans + 1);  // the entry point, resolved once
+    CHECK(ex.stats().slow_packets == before.slow_packets);
+    CHECK(ex.stats_json().find("\"shader_materialize_max_hash\": \"0x") != std::string::npos);
+
     // A BC7 texture takes a 4x4 block upload (16 bytes) without a device error.
     ex.wait_idle();
     ex.poll();

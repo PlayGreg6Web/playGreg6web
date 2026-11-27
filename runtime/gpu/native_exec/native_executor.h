@@ -171,6 +171,18 @@ struct ExecutorStats {
     uint64_t shader_modules = 0;
     uint64_t shader_pack_hits = 0;
     uint64_t shader_pack_misses = 0;  // a hash-only shader the pack does not hold (compiled as text: invalid)
+    // Pack shaders materialized on first pipeline use: the module compile (WGSL parse + resolve, on
+    // the executor thread) and the memoized text scans (entry point, @group(0) bindings).
+    uint64_t shader_materialized = 0;
+    uint64_t shader_materialize_ns = 0;
+    uint64_t shader_materialize_max_ns = 0;
+    uint64_t shader_materialize_max_hash = 0;
+    uint64_t shader_materialize_max_bytes = 0;
+    uint64_t shader_scans = 0;
+    uint64_t shader_scan_ns = 0;
+    // Packets that took >= 1 s in the executor (each also logged, the first 32, with its shader).
+    uint64_t slow_packets = 0;
+    uint64_t slow_packet_max_ns = 0;
     uint64_t textures_created = 0;
     uint64_t texture_uploads = 0;
     uint64_t texture_upload_bytes = 0;
