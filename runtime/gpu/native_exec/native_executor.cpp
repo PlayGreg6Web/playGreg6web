@@ -6127,6 +6127,7 @@ struct NativeExecutor::Impl {
             if (rpass) { rpass.End(); rpass = nullptr; }
             if (cpass) { cpass.End(); cpass = nullptr; }
             if (ended) cut();
+            keep_kind = 0;
             explicit_pass = false;
             group0_bound = false;
             bound_groups = 0;
@@ -6152,8 +6153,60 @@ struct NativeExecutor::Impl {
             pass_fmt = PassFormats{};
             variant_blocked = false;
         }
+        // A copy / readback the executor records itself ends the open pass, but the title's state (bind groups,
+        // vertex / index buffers, pipeline, dynamic state) is still current: it is kept, and the next pass of the
+        // same kind re-sets it lazily (resume_render / the dirty binds). keep_kind: 0 none, 1 render, 2 compute.
+        uint8_t keep_kind = 0;
+        void end_for_copy() {
+            const uint8_t kind = rpass ? 1 : cpass ? 2 : keep_kind;
+            auto w = want;
+            const uint8_t wm = want_mask, bg = bound_groups;
+            auto cb = vbs;
+            auto sgs = stream_groups;
+            auto ibuf = ib;
+            const auto ibf = ib_format;
+            const auto ibo = ib_offset;
+            auto vp = viewport;
+            auto sc = scissor;
+            auto bl = blend;
+            auto sr = stencil_ref;
+            auto rp = cur_rpipe;
+            auto ap = active_pipeline;
+            auto pf = pass_fmt;
+            const bool ep = explicit_pass, g0 = group0_bound;
+            const bool vb = variant_blocked;
+            end_active();
+            if (!kind) return;
+            keep_kind = kind;
+            want = std::move(w);
+            want_mask = wm;
+            dirty_binds = wm;
+            bound_groups = bg;
+            stream_groups = std::move(sgs);
+            group0_bound = g0;
+            if (kind == 1) {
+                vbs = cb;
+                ib = ibuf;
+                ib_format = ibf;
+                ib_offset = ibo;
+                viewport = vp;
+                scissor = sc;
+                blend = bl;
+                stencil_ref = sr;
+                cur_rpipe = rp;
+                active_pipeline = ap;
+                pass_fmt = pf;
+                explicit_pass = ep;
+                variant_blocked = vb;
+            }
+        }
         void ensure_render() {  // _ensurePresentRenderPass
             if (rpass) return;
+            if (keep_kind == 1) {
+                keep_kind = 0;
+                resume_render();
+                return;
+            }
             end_active();
             s.refresh_depth_twins(enc);
             wgpu::RenderPassColorAttachment a = s.swapchain_attachment(
@@ -6172,7 +6225,11 @@ struct NativeExecutor::Impl {
         }
         void ensure_compute() {
             if (cpass) return;
-            end_active();
+            if (keep_kind == 2) {
+                keep_kind = 0;  // the state kept across a copy stays; the pass restarts with no pipeline
+            } else {
+                end_active();
+            }
             s.refresh_depth_twins(enc);
             wgpu::ComputePassDescriptor cd{};
             wgpu::PassTimestampWrites tw{};
@@ -6364,7 +6421,7 @@ struct NativeExecutor::Impl {
             begin_explicit_pass(e, *b);
         } else if (std::get_if<EndPassCmd>(&cmd)) {
             remap_pass_boundary(false);
-            if (e.rpass) e.end_active();  // EndRenderPass: `if (ctl.passKind === 'render') ctl.endPass()`
+            if (e.rpass || e.keep_kind == 1) e.end_active();  // EndRenderPass: `if (ctl.passKind === 'render') ctl.endPass()`
             e.explicit_pass = false;
             e.had_explicit_compute = false;
             e.compute_valid = false;
@@ -6593,10 +6650,10 @@ struct NativeExecutor::Impl {
                 e.overridden &= static_cast<uint8_t>(~(1u << b1->group));
             }
         } else if (const auto* rb = std::get_if<ReadbackCmd>(&cmd)) {
-            e.end_active();  // _recordReadbackCopy: pc.endPass()
+            e.end_for_copy();  // _recordReadbackCopy: pc.endPass(); the title's state survives
             record_readback_copy(e.enc, rb->req);
         } else if (const auto* ct = std::get_if<CopyTextureCmd>(&cmd)) {
-            e.end_active();
+            e.end_for_copy();
             record_texture_copy(e.enc, ct->copy);
         } else if (const auto* qc = std::get_if<QueryCmd>(&cmd)) {
             run_query(e, *qc);

@@ -482,6 +482,145 @@ void test_compute_pipeline_survives_copy(NativeExecutor& ex) {
     run(ex, done);
 }
 
+// Bind groups survive a copy that ended the pass: out[i] += 1 runs before and after the copy with the group bound
+// once, so the buffer reads back +2 per element (real values; a missing binding would error or leave +1).
+const char* kComputeInc = R"(
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = out[i] + 1u; }
+)";
+
+void test_bindings_survive_copy(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(190, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc | GpuBufferUsage::CopyDst, 16);
+    const uint32_t init[4] = {10, 20, 30, 40};
+    setup.write_buffer(190, 0, init, 16);
+    setup.create_buffer(191, GpuBufferUsage::Indirect | GpuBufferUsage::CopyDst, 12);
+    const uint32_t args[3] = {1, 1, 1};
+    setup.write_buffer(191, 0, args, 12);
+    setup.create_shader_module(192, GpuShaderStage::Compute, kComputeInc);
+    create_layouts(setup, 193, 194, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 195;
+    cp.cs_module_id = 192;
+    cp.pipeline_layout_id = 194;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 196, 193, {bg_entry(0, GpuBindResourceType::Buffer, 190)});
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(197, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst | GpuTextureUsage::CopySrc, 22)));
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(198, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    run(ex, setup);
+    auto copy = [] {
+        GpuCopyTexturePayload c;
+        std::memset(&c, 0, sizeof c);
+        c.dst_id = 198;
+        c.src_id = 197;
+        c.width = 2;
+        c.height = 2;
+        c.depth_or_layers = 1;
+        return c;
+    };
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(195);
+    set_bind_group2(frame, 0, 196);
+    frame.dispatch_compute(1, 1, 1);
+    emit(frame, kGpuOpcodeCopyTexture, bytes_of(copy()));
+    frame.dispatch_compute(1, 1, 1);
+    emit(frame, kGpuOpcodeCopyTexture, bytes_of(copy()));
+    frame.indirect(GpuOpcode::DispatchIndirect, 191, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(190, 0, 16, &out, &err));
+    const uint32_t want[4] = {13, 23, 33, 43};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    CHECK(ex.stats().dispatches == before.dispatches + 3);
+    CHECK(ex.stats().device_errors == before.device_errors);
+    gpu::CommandEncoder done;
+    done.destroy_resource(197);
+    done.destroy_resource(198);
+    run(ex, done);
+}
+
+// A draw after a copy inside the render pass: the pipeline and bind group were set once before the copy.
+void test_render_bindings_survive_copy(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(200, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst | GpuTextureUsage::CopySrc, 22)));
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(201, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    std::vector<uint8_t> texels(256 + 8, 0);
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x) {
+            texels[y * 256 + x * 4 + 0] = 255;
+            texels[y * 256 + x * 4 + 1] = 128;
+            texels[y * 256 + x * 4 + 3] = 255;
+        }
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 200;
+    wt.width = 2;
+    wt.height = 2;
+    wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 2;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(setup, GpuOpcode::WriteTexture, wtv);
+    GpuCreateSampler2Payload sp;
+    std::memset(&sp, 0, sizeof sp);
+    sp.id = 202;
+    sp.max_anisotropy = 1;
+    sp.lod_max_clamp = 32.0f;
+    emit(setup, GpuOpcode::CreateSampler2, bytes_of(sp));
+    setup.create_shader_module(203, GpuShaderStage::Vertex, kTexturedTriangle);
+    setup.create_shader_module(204, GpuShaderStage::Fragment, kTexturedTriangle);
+    create_layouts(setup, 205, 206,
+                   {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, 0, 2),
+                    layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(207, 203, 204, 206)));
+    create_bind_group(setup, 208, 205, {bg_entry(0, GpuBindResourceType::TextureView, 200), bg_entry(1, GpuBindResourceType::Sampler, 202)});
+    run(ex, setup);
+
+    GpuCopyTexturePayload c;
+    std::memset(&c, 0, sizeof c);
+    c.dst_id = 201;
+    c.src_id = 200;
+    c.width = 2;
+    c.height = 2;
+    c.depth_or_layers = 1;
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(207);
+    set_bind_group2(frame, 0, 208);
+    emit(frame, kGpuOpcodeCopyTexture, bytes_of(c));
+    frame.draw(3);
+    emit(frame, kGpuOpcodeCopyTexture, bytes_of(c));
+    frame.draw(3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+    CHECK(ex.stats().draws == before.draws + 2);
+    CHECK(ex.stats().draws_skipped == before.draws_skipped);
+    CHECK(frame_is(ex, {0, 128, 255, 255}));
+    gpu::CommandEncoder done;
+    done.destroy_resource(200);
+    done.destroy_resource(201);
+    run(ex, done);
+}
+
 // Two writable storage bindings in two groups: bound to the same buffer they alias, which WebGPU rejects
 // when the command buffer is finished.
 const char* kComputeAlias = R"(
@@ -4315,6 +4454,8 @@ int main() {
     test_layout_fit_unused_group_over_limits(*ex);
     test_indirect_constants_pass(*ex);
     test_compute_pipeline_survives_copy(*ex);
+    test_bindings_survive_copy(*ex);
+    test_render_bindings_survive_copy(*ex);
     test_mesh_pipeline(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
