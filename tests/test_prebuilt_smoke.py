@@ -45,6 +45,33 @@ class DecideTests(unittest.TestCase):
         rep = {"fault_record": {"kind": "access_violation", "va": "0x10"}}
         self.assertFalse(ps.decide(rep, HS, "rd")[0])
 
+    def test_expect_name_mismatch_fails(self) -> None:
+        rep = {"present_samples_total": 50, "run": {"name": "prebuilt-smoke-old"}}
+        ok, line = ps.decide(rep, HS, "r", expect_name="prebuilt-smoke-new")
+        self.assertFalse(ok)
+        self.assertIn("stale", line)
+
+    def test_expect_name_match_passes(self) -> None:
+        rep = {"present_samples_total": 50, "run": {"name": "n1"}}
+        self.assertTrue(ps.decide(rep, HS, "r", expect_name="n1")[0])
+
+    def test_expect_name_missing_run_fails(self) -> None:
+        self.assertFalse(ps.decide({"present_samples_total": 50}, HS, "r", expect_name="n1")[0])
+
+
+class PruneTests(unittest.TestCase):
+    def test_keeps_newest_three(self) -> None:
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            for i in range(5):
+                d = root / f"run{i}"
+                d.mkdir()
+                os.utime(d, (1000 + i, 1000 + i))
+            ps.prune_runs(root, 3)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["run2", "run3", "run4"])
+
 
 if __name__ == "__main__":
     unittest.main()

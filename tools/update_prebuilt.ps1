@@ -98,7 +98,7 @@ $Dir = [IO.Path]::GetFullPath($Dir)
 $tmp = "$Dir.new"; $old = "$Dir.old"
 if ($DryRun) {
     Write-Host "[dry-run] native prebuilt: $Dir (build in $tmp, old copy kept as $old until the swap succeeded)"
-    Write-Host "[dry-run] smoke gate: $(if ($SkipSmoke) { 'skipped (-SkipSmoke)' } else { "python tools/run_native_boot.py --preset menu-flow --name prebuilt-smoke --live-executor --trust-build --build-dir $tmp --runs-dir $tmp-smoke-runs$(if ($StdPack) { " --shader-pack $StdPack" }) --max-ms 75000; then python tools/prebuilt_smoke.py <run dir>" })"
+    Write-Host "[dry-run] smoke gate: $(if ($SkipSmoke) { 'skipped (-SkipSmoke)' } else { "python tools/run_native_boot.py --preset menu-flow --name prebuilt-smoke-<yyyyMMdd-HHmmss>-<commit> --live-executor --trust-build --build-dir $tmp --runs-dir $tmp-smoke-runs$(if ($StdPack) { " --shader-pack $StdPack" }) --max-ms 75000; then python tools/prebuilt_smoke.py <run dir> --expect-name <that name> (only that runs report is read); keeps the last 3 smoke runs" })"
     exit 0
 }
 if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
@@ -119,7 +119,7 @@ try {
 @{ commit = $commit; dirty = $dirty; built_utc = (Get-Date).ToUniversalTime().ToString("o") } |
     ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $tmp "prebuilt.json")
 if (-not $SkipSmoke) {
-    $smokeName = "prebuilt-smoke"
+    $smokeName = "prebuilt-smoke-$((Get-Date).ToString('yyyyMMdd-HHmmss'))-$($commit.Substring(0, 9))"  # unique per gate run: never reuse (or read) an older run's dir
     $smokeRuns = "$tmp-smoke-runs"  # outside the prebuilt (it is read-only for the runners)
     $smokeRun = Join-Path $smokeRuns $smokeName
     Write-Host "[prebuilt] smoke boot from $tmp (headless, ~75 s)..."
@@ -129,9 +129,10 @@ if (-not $SkipSmoke) {
     try {
         & python tools/run_native_boot.py --preset menu-flow --name $smokeName --live-executor --trust-build `
             --exe $Exe --game-dir $GameDir --build-dir $tmp --runs-dir $smokeRuns @smokePack --max-ms 75000 --watchdog-ms 105000
-        & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") $smokeRun
+        & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") $smokeRun --expect-name $smokeName
         $smokeOk = ($LASTEXITCODE -eq 0)
     } finally { Pop-Location; $ErrorActionPreference = $eap }
+    & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") --prune $smokeRuns --keep 3  # only inside the smoke-runs dir, never a prebuilt
     if (-not $smokeOk) {
         Write-Host "[prebuilt] smoke boot FAILED: the existing prebuilt at $Dir is kept; the new build is left at $tmp (run dir: $smokeRun). Use -SkipSmoke to swap anyway."
         exit 3

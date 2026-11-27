@@ -56,6 +56,8 @@ class PlayScriptsDryRunTests(unittest.TestCase):
         out = self.run_script("update_prebuilt.ps1", "-Dir", str(self.tmp / "pb"))
         self.assertIn("prebuilt_smoke.py", out)
         self.assertIn("--live-executor", out)
+        self.assertIn("--name prebuilt-smoke-<yyyyMMdd-HHmmss>-<commit>", out)
+        self.assertIn("--expect-name", out)
         out = self.run_script("update_prebuilt.ps1", "-Dir", str(self.tmp / "pb"), "-SkipSmoke")
         self.assertIn("skipped (-SkipSmoke)", out)
 
