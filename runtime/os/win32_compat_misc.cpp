@@ -630,11 +630,15 @@ uint16_t pg6_win32_register_class_ex_a(const Pg6WndClassExA* window_class) {
         return 0;
     }
     // class_name is a guest address held in guest memory (O31: it may lie in the translated
-    // CPU window): read it through the shared translation, one character at a time.
+    // CPU window): read it through the shared translation, one character at a time (window bytes
+    // through com::read_guest, which re-checks the slot under the arena lock).
     std::string raw;
     const uint64_t name_va = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(window_class->class_name));
-    for (char c = 0; raw.size() < 256 && playgta6::guest::com::read_guest(name_va + raw.size(), &c, 1) &&
-                     c != 0;) {
+    const auto read_char = [](uint64_t va, char* c) {
+        return playgta6::os::guest_window::translated(va) ? playgta6::guest::com::read_guest(va, c, 1)
+                                                          : playgta6::os::guest_window::copy_from_guest(c, va, 1);
+    };
+    for (char c = 0; raw.size() < 256 && read_char(name_va + raw.size(), &c) && c != 0;) {
         raw.push_back(c);
     }
     const std::string name = lower_ascii(raw);
