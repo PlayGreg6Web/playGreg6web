@@ -80,7 +80,7 @@ struct ExecutorOptions {
     // pipelines. Overridable: --pipeline-wait-ms / --pipeline-wait-fullscreen-ms, env
     // PG6_PIPELINE_WAIT_MS / PG6_PIPELINE_WAIT_FULLSCREEN_MS.
     uint64_t pipeline_wait_frame_ns = 500ull * 1000000ull;
-    uint64_t pipeline_wait_fullscreen_ns = 10000ull * 1000000ull;
+    uint64_t pipeline_wait_fullscreen_ns = 1000ull * 1000000ull;
     // Strict validation (--gpu-validation): Dawn backend validation (D3D12 debug layer when installed),
     // immediate error handling, and an error scope around every packet. Errors are deduped by text in
     // stats_json()'s "validation" block with the first packet index / opcode. Slower; diagnosis only.
@@ -170,6 +170,7 @@ struct ExecutorStats {
     std::string last_packet_error;
     uint64_t shader_modules = 0;
     uint64_t shader_pack_hits = 0;
+    uint64_t shader_code_rereads = 0;  // WGSL texts re-read from the pack after being dropped (rescan of a dropped shader)
     uint64_t shader_pack_misses = 0;  // a hash-only shader the pack does not hold (compiled as text: invalid)
     // Pack shaders materialized on first pipeline use (on the executor thread or a shader worker): the
     // module compile (WGSL parse + resolve) and the memoized text scans (entry point, @group(0) bindings).

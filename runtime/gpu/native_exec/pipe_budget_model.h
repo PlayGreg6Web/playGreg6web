@@ -1,7 +1,7 @@
 // Native executor: per-frame wait budget for asynchronous pipeline creation (backlog 14). A pipeline
 // the prewarm did not finish in time used to be awaited forever, so one slow compile froze the frame
 // (and tripped the title's watchdog). Now a frame may wait ~0.5 s in total for normal pipelines and
-// ~10 s for fullscreen passes (vertex-buffer-less pipelines: post-process / blit, which would leave a
+// ~1 s for fullscreen passes (was 10 s: one frame blocked that long tripped the title's watchdog, #2074) (vertex-buffer-less pipelines: post-process / blit, which would leave a
 // visibly broken frame if skipped); past the budget the draw is skipped (the compile keeps running and
 // the pipeline is used once ready on a later frame) and counted as `pipeline_pending`. Pure logic, no GPU.
 #pragma once
@@ -14,7 +14,7 @@ namespace playgta6::gpu::native_exec {
 
 constexpr uint64_t kPipeWaitUnlimited = UINT64_MAX;
 constexpr uint64_t kDefaultPipeWaitFrameNs = 500ull * 1000000ull;
-constexpr uint64_t kDefaultPipeWaitFullscreenNs = 10000ull * 1000000ull;
+constexpr uint64_t kDefaultPipeWaitFullscreenNs = 1000ull * 1000000ull;
 
 // Milliseconds text -> ns. "inf" / "unlimited" / "-1" = unlimited (the old always-wait behaviour),
 // "0" = never wait. Returns false (out untouched) on anything else.

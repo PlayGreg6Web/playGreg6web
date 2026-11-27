@@ -19,6 +19,7 @@
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/pipe_budget_model.h"
+#include "gpu/native_exec/shader_text_model.h"
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -1038,18 +1039,22 @@ void test_pipe_wait_budget() {
     CHECK(!parse_pipe_wait_ms("abc", &v) && v == 7);
     CHECK(!parse_pipe_wait_ms("-5", &v) && !parse_pipe_wait_ms("", &v) && !parse_pipe_wait_ms(nullptr, &v));
 
-    PipeWaitBudget b;  // defaults: 0.5 s per frame, 10 s fullscreen
+    CHECK(shader_text_droppable(0x1234, false));  // pack-backed: re-readable from the pack
+    CHECK(!shader_text_droppable(0, false));      // inline WGSL: the only copy
+    CHECK(!shader_text_droppable(0x1234, true));  // pack miss: the hash text is what compiled
+
+    PipeWaitBudget b;  // defaults: 0.5 s per frame, 1 s fullscreen
     CHECK(b.allowance(false) == 500ull * 1000000ull);
-    CHECK(b.allowance(true) == 10000ull * 1000000ull);
+    CHECK(b.allowance(true) == 1000ull * 1000000ull);
     b.charge(false, 200ull * 1000000ull);
     CHECK(b.allowance(false) == 300ull * 1000000ull);
-    CHECK(b.allowance(true) == 10000ull * 1000000ull);  // separate pools
+    CHECK(b.allowance(true) == 1000ull * 1000000ull);  // separate pools
     b.charge(false, 400ull * 1000000ull);                // overspent: skip, never wrap
     CHECK(b.allowance(false) == 0);
-    b.charge(true, 10000ull * 1000000ull);
+    b.charge(true, 1000ull * 1000000ull);
     CHECK(b.allowance(true) == 0);
     b.begin_frame();  // a new frame refills both
-    CHECK(b.allowance(false) == 500ull * 1000000ull && b.allowance(true) == 10000ull * 1000000ull);
+    CHECK(b.allowance(false) == 500ull * 1000000ull && b.allowance(true) == 1000ull * 1000000ull);
 
     b.configure(0, kPipeWaitUnlimited);  // 0 = never wait, unlimited = the old behaviour
     CHECK(b.allowance(false) == 0);

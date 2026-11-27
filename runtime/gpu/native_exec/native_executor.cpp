@@ -43,6 +43,7 @@
 #include "gpu/native_exec/native_window.h"
 #include "gpu/native_exec/overlay_model.h"
 #include "gpu/native_exec/pipe_budget_model.h"
+#include "gpu/native_exec/shader_text_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
@@ -332,6 +333,8 @@ struct ShaderEntry {
     mutable uint64_t worker_scan_ns = 0;  // text scans on the worker
     mutable uint32_t worker_scans = 0;
     mutable bool worker_miss = false;     // the pack no longer delivered it (compiled as the hash text)
+    mutable uint64_t worker_code_bytes = 0;  // size of the WGSL the worker compiled (`code` is dropped afterwards)
+    mutable bool code_dropped = false;       // pack-backed text released after its scans + module (code_of() re-reads it)
     mutable uint64_t worker_private_mb = 0;  // host process private bytes right after the compile, MB
 };
 using ShaderRef = std::shared_ptr<ShaderEntry>;
@@ -2701,6 +2704,14 @@ struct NativeExecutor::Impl {
             ++e.worker_scans;
         }
         e.worker_scan_ns = now_ns() - t1;
+        e.worker_code_bytes = e.code.size();
+        // The module and every scan the builders memoize are done: a pack-backed text (~3 MB each, ~2 GB over
+        // a std-pack boot) is not kept; code_of() re-reads it from the pack on the rare rescan.
+        static const bool keep_text = std::getenv("PG6_KEEP_WGSL") != nullptr;  // diagnosis: the old behaviour
+        if (!keep_text && shader_text_droppable(e.hash, e.worker_miss)) {
+            std::string().swap(e.code);
+            e.code_dropped = true;
+        }
         tl_shader_worker = false;
         e.ready.store(true, std::memory_order_release);
     }
@@ -2750,7 +2761,7 @@ struct NativeExecutor::Impl {
         if (e.worker_ns > stats.shader_async_max_ns) {
             stats.shader_async_max_ns = e.worker_ns;
             stats.shader_async_max_hash = e.hash;
-            stats.shader_async_max_bytes = e.code.size();
+            stats.shader_async_max_bytes = e.worker_code_bytes;
         }
         stats.shader_async_private_mb_max = std::max(stats.shader_async_private_mb_max, e.worker_private_mb);
         stats.shader_scans += e.worker_scans;
@@ -2758,8 +2769,8 @@ struct NativeExecutor::Impl {
         if (e.worker_miss) ++stats.shader_pack_misses;
         if (e.worker_ns >= kSlowShaderLogNs && slow_shader_logs < 32) {
             ++slow_shader_logs;
-            std::fprintf(stderr, "[native_exec] shader worker: 0x%016llx, %zu WGSL bytes, module %llu ms, host private %llu MB\n",
-                         static_cast<unsigned long long>(e.hash), e.code.size(),
+            std::fprintf(stderr, "[native_exec] shader worker: 0x%016llx, %llu WGSL bytes, module %llu ms, host private %llu MB\n",
+                         static_cast<unsigned long long>(e.hash), static_cast<unsigned long long>(e.worker_code_bytes),
                          static_cast<unsigned long long>(e.worker_ns / 1000000),
                          static_cast<unsigned long long>(e.worker_private_mb));
         }
@@ -2818,13 +2829,30 @@ struct NativeExecutor::Impl {
         slow_note = note;
     }
 
+    // The shader's WGSL text. A pack-backed shader's text is dropped once its module and scans exist
+    // (materialize_on_worker); a later rescan re-reads it from the pack into one reusable scratch string.
+    std::string code_scratch;
+    const std::string& code_of(const ShaderEntry& e) {
+        if (!e.code_dropped) return e.code;
+        std::optional<std::string> hit = pack ? pack->get(e.hash) : std::nullopt;
+        if (hit && !hit->empty()) {
+            code_scratch = std::move(*hit);
+        } else {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "hash:%llx", static_cast<unsigned long long>(e.hash));
+            code_scratch = buf;
+        }
+        ++stats.shader_code_rereads;
+        return code_scratch;
+    }
+
     static int stage_slot(std::string_view stage) { return stage == "vertex" ? 0 : stage == "fragment" ? 1 : 2; }
 
     const std::string& entry_point_of(const ShaderEntry& e, std::string_view stage) {
         std::string& c = e.ep_cache[stage_slot(stage)];
         if (c.empty()) {
             const uint64_t t0 = now_ns();
-            c = resolve_shader_entry_point(e.code, e.explicit_ep, stage);
+            c = resolve_shader_entry_point(code_of(e), e.explicit_ep, stage);
             note_scan(now_ns() - t0);
         }
         return c;
@@ -2833,7 +2861,7 @@ struct NativeExecutor::Impl {
     const std::vector<WgslBinding>& group0_of(const ShaderEntry& e) {
         if (!e.group0_cache) {
             const uint64_t t0 = now_ns();
-            e.group0_cache = parse_wgsl_group0_bindings(e.code);
+            e.group0_cache = parse_wgsl_group0_bindings(code_of(e));
             note_scan(now_ns() - t0);
         }
         return *e.group0_cache;
@@ -2842,7 +2870,7 @@ struct NativeExecutor::Impl {
     bool declares_group0_of(const ShaderEntry& e) {
         if (!e.declares_group0_cache) {
             const uint64_t t0 = now_ns();
-            e.declares_group0_cache = wgsl_declares_group0(e.code);
+            e.declares_group0_cache = wgsl_declares_group0(code_of(e));
             note_scan(now_ns() - t0);
         }
         return *e.declares_group0_cache;
@@ -2852,7 +2880,7 @@ struct NativeExecutor::Impl {
         if (!e.frag_mask_cache || e.frag_mask_ep != ep) {
             const uint64_t t0 = now_ns();
             e.frag_mask_ep = ep;
-            e.frag_mask_cache = wgsl_fragment_output_mask(e.code, ep);
+            e.frag_mask_cache = wgsl_fragment_output_mask(code_of(e), ep);
             note_scan(now_ns() - t0);
         }
         return *e.frag_mask_cache;
@@ -4247,7 +4275,7 @@ struct NativeExecutor::Impl {
         }
         RenderPipelineEntry e;
         e.pipeline = device.CreateRenderPipeline(&rd);
-        e.expects_group0 = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
+        e.expects_group0 = declares_group0_of(vs) || (fs && declares_group0_of(*fs));
         e.auto_meta.gen = ++pipeline_gen_counter;
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs.hash);
@@ -6592,6 +6620,7 @@ std::string NativeExecutor::stats_json() const {
     num("shader_modules", st.shader_modules);
     num("shader_pack_hits", st.shader_pack_hits);
     num("shader_pack_misses", st.shader_pack_misses);
+    num("shader_code_rereads", st.shader_code_rereads);
     num("shader_materialized", st.shader_materialized);
     num("shader_materialize_ms", st.shader_materialize_ns / 1000000ull);
     num("shader_materialize_max_ms", st.shader_materialize_max_ns / 1000000ull);
