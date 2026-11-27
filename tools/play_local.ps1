@@ -6,6 +6,7 @@
   .\tools\play_local.ps1 -Exe D:\game\game.exe -GameDir D:\game\package
 .NOTES
   Stop: close the Chrome window or press Ctrl+C here; the server stops with this script.
+  At the end it prints the one-line Stopped/Crashed verdict (tools/stop_message.py) from the run's boot-report.json; on a crash send that run dir (docs/WHEN_IT_CRASHES.md).
   -Prebuilt: play the build made by tools/update_prebuilt.ps1 -Web (dir: -PrebuiltDir, else $env:PLAYGTA6_PREBUILT_WEB_DIR, else %LOCALAPPDATA%\playgta6\prebuilt-web; -BuildDir is ignored). Never builds (-TrustBuild semantics); prints its source commit and how far behind origin/main it is.
   -StreamShaders [-StreamPack file]: serve the FULL std pack (WGPK v2 + .reflect.json; -StreamPack, else $env:PLAYGTA6_NATIVE_SHADER_PACK) with HTTP Range and open the page with ?streamShaders=1 (staged by hard link into a separate dir). With -Prebuilt this is the default when that pack exists; -NoStreamShaders forces the staged v1 subset.
   -Update: if the checkout has no uncommitted tracked changes, switch to main when detached and fast-forward to origin/main (never resets; otherwise prints why and continues). Every start warns when behind origin/main.

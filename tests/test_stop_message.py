@@ -71,6 +71,26 @@ class StopMessageTests(unittest.TestCase):
         md = (REPO_ROOT / "docs" / "HARD_STOPS.md").read_text(encoding="utf-8")
         self.assertIn("xsystem/5/7", sm.pending_arg(md).split(";"))
 
+    def test_browser_report_fault_block_without_fault_record(self):
+        r = {"status": "fault", "fault": {"kind": "INDIRECT_CALL_MISS", "trap_kind": "INDIRECT_CALL_MISS", "va": "0x1400abcd0"},
+             "fault_record": None}
+        self.assertEqual(sm.select(r, MD, "work/browser-boot/runs/x"),
+                         "Crashed: INDIRECT_CALL_MISS at 0x1400abcd0 — report: work/browser-boot/runs/x "
+                         "(see docs/WHEN_IT_CRASHES.md)")
+
+    def test_browser_report_with_unimplemented_slot_record_is_a_stop(self):
+        r = rep()
+        r["fault"] = {"kind": "unimplemented_slot", "va": "0x1"}
+        self.assertTrue(sm.select(r, MD, "R").startswith("Stopped:"))
+
+    def test_browser_report_without_fault_is_silent(self):
+        self.assertIsNone(sm.select({"status": "ok", "fault": None, "fault_record": None}, MD, "R"))
+
+    def test_cli_reads_browser_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "boot-report.json").write_text(json.dumps({"fault": {"kind": "INDIRECT_CALL_MISS", "va": "0x1"}}))
+            self.assertEqual(sm.main([tmp]), 0)
+
     def test_cli_prints_line_and_exits_1_without_fault(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "boot-report.json").write_text(json.dumps({"status": "ok"}))

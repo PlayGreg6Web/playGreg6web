@@ -91,6 +91,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
 import guest_symbols  # noqa: E402
+import stop_message  # noqa: E402
 import clean_build_dirs  # noqa: E402
 import lift_cache  # noqa: E402
 
@@ -5216,6 +5217,13 @@ FAULT_RECORD_PREFIX = "[fault-record] "
 HARD_STOPS_MD = Path(__file__).resolve().parent.parent / "docs" / "HARD_STOPS.md"
 
 
+def HARD_STOPS_TEXT() -> str | None:
+    try:
+        return HARD_STOPS_MD.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def extract_fault_record(lines: Sequence[str] | None, hard_stops: str | None = None) -> dict[str, Any] | None:
     """The newest `[fault-record] {json}` line the wasm runtime logs after the chunked boot report (the HUD
     keeps only the log tail, so the report's own fault block is usually gone). Adds the docs/HARD_STOPS.md
@@ -6896,6 +6904,9 @@ def _run(
     digest_text = digest(loaded_report, session.exit_code)
     (run_dir / "digest.txt").write_text(digest_text + "\n", encoding="utf-8")
     print(digest_text)
+    stop_line = stop_message.select(loaded_report, HARD_STOPS_TEXT(), run_dir)
+    if stop_line:
+        stop_message.emit(stop_line)
 
     if args.baseline:
         return compare_with_baseline(args, run_dir, runs_dir)

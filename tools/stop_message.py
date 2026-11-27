@@ -94,7 +94,13 @@ def select(report: dict[str, Any] | None, md: str | None, run_dir: str | Path | 
     """The stop line for a report, None when the run did not fault."""
     rec = report.get("fault_record") if isinstance(report, dict) else None
     if not isinstance(rec, dict):
-        return None
+        # Browser run (tools/run_browser_boot.py): the wasm `[fault-record]` line may be gone from the HUD tail,
+        # but the tracer's fatal trap is still in the report's `fault` block (kind e.g. INDIRECT_CALL_MISS, va).
+        rec = report.get("fault") if isinstance(report, dict) else None
+        if not isinstance(rec, dict) or not (rec.get("kind") or rec.get("trap_kind")):
+            return None
+        rec = {**rec, "kind": rec.get("kind") or rec.get("trap_kind")}
+        report = {**report, "fault_record": rec}
     slot = gs.find_unimplemented(report) if rec.get("kind") == "unimplemented_slot" or rec.get("unimplemented_slot") else None
     if slot:
         short = _short(slot["iface"])
