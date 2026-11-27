@@ -1392,8 +1392,10 @@ void test_httpfs_size_cache() {
             const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
             std::memset(mb.payload, 0x5A, static_cast<size_t>(n));
             HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
-        } else {
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Close)) {
             HttpfsMailboxClient::complete_response(mb, 0);
+        } else {
+            HttpfsMailboxClient::complete_response(mb, -38, HttpfsStatus::Error);
         }
     });
     set_httpfs_client(&client);
@@ -1476,8 +1478,10 @@ static void test_httpfs_sparse_64bit_and_retry() {
                 mb.payload[i] = sparse_byte(mb.offset + i);
             }
             HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
-        } else {
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Close)) {
             HttpfsMailboxClient::complete_response(mb, 0);
+        } else {
+            HttpfsMailboxClient::complete_response(mb, -38, HttpfsStatus::Error);
         }
     });
     std::vector<uint32_t> sleeps;
@@ -1600,8 +1604,10 @@ static void test_httpfs_stat_cache_and_invalidation() {
             const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
             std::memset(mb.payload, 0x33, static_cast<size_t>(n));
             HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
-        } else {
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Close)) {
             HttpfsMailboxClient::complete_response(mb, 0);
+        } else {
+            HttpfsMailboxClient::complete_response(mb, -38, HttpfsStatus::Error);
         }
     });
 
@@ -1663,6 +1669,52 @@ static void test_httpfs_stat_cache_and_invalidation() {
     CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\cached.rpf") == kInvalidAttrs);
     CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
     CHECK(opens.load() == 5);
+
+    // 6. Fast 1-roundtrip HttpfsOp::Stat path resolves existence & exact size with 0 opens / 0 reads.
+    std::atomic<int> stat_ops{0};
+    std::atomic<int> stat_opens{0};
+    std::atomic<int> stat_reads{0};
+    constexpr uint64_t kFastSize = 5368709120ull;  // 5 GiB
+    HttpfsMailbox fast_mb{};
+    HttpfsMailboxClient::init_mailbox(fast_mb);
+    HttpfsMailboxClient fast_client(&fast_mb, [&](HttpfsMailbox& mb) {
+        if (mb.op == static_cast<uint32_t>(HttpfsOp::Stat)) {
+            const std::string path(reinterpret_cast<const char*>(mb.payload),
+                                   static_cast<size_t>(mb.length));
+            stat_ops.fetch_add(1, std::memory_order_relaxed);
+            if (path == "data/fast.rpf") {
+                HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(kFastSize));
+            } else {
+                HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
+            }
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Open)) {
+            stat_opens.fetch_add(1, std::memory_order_relaxed);
+            HttpfsMailboxClient::complete_response(mb, 9);
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Read)) {
+            stat_reads.fetch_add(1, std::memory_order_relaxed);
+            HttpfsMailboxClient::complete_response(mb, 0);
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Close)) {
+            HttpfsMailboxClient::complete_response(mb, 0);
+        } else {
+            HttpfsMailboxClient::complete_response(mb, -38, HttpfsStatus::Error);
+        }
+    });
+    set_httpfs_client(&fast_client);
+    std::memset(&attr_data, 0, sizeof(attr_data));
+    CHECK(pg6_win32_get_file_attributes_ex_w(u"G:\\data\\fast.rpf", 0, &attr_data) == 1);
+    CHECK(((static_cast<uint64_t>(attr_data.file_size_high) << 32) | attr_data.file_size_low) == kFastSize);
+    CHECK(stat_ops.load() == 1 && stat_opens.load() == 0 && stat_reads.load() == 0);
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\nope.rpf") == kInvalidAttrs);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+    CHECK(stat_ops.load() == 2 && stat_opens.load() == 0 && stat_reads.load() == 0);
+    const Handle fh_fast = CreateFileW(u"G:\\data\\fast.rpf", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    CHECK(fh_fast != INVALID_HANDLE_VALUE);
+    int64_t fast_sz = 0;
+    CHECK(GetFileSizeEx(fh_fast, &fast_sz) && static_cast<uint64_t>(fast_sz) == kFastSize);
+    CHECK(stat_opens.load() == 1 && stat_reads.load() == 0);
+    CloseHandle(fh_fast);
+    set_httpfs_client(nullptr);
 }
 
 static void test_concurrent_handles_and_spin_cs() {
