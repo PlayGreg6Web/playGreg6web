@@ -2138,9 +2138,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         }
         page_index_live_ = indexed;
     }
-    // The ranges taken are the indexed buffers' (merged, page-aligned). A uniform range is primed only
-    // where they cover it (most lie in an upload buffer); the others are compared every time, as
-    // before: taking their pages too would arm memory the title rewrites every frame.
+    // The ranges taken are the indexed buffers' and relocated uniform ranges' (merged, page-aligned).
     std::vector<HostPageIndex::Range> take_ranges;
     std::vector<HostPageIndex::Range> taken_ok;     // the ones whose take succeeded
     std::vector<HostPageIndex::Range> taken_failed;
@@ -2150,6 +2148,15 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         const auto& h = buffer_page_index_.hulls();
         take_ranges.assign(h.begin(), h.end());
     }
+    if (indexed) {
+        // The relocated uniform ranges are taken too (also where no buffer covers them), so only the
+        // ones overlapping a written page are compared.
+        std::lock_guard<std::mutex> lock(relocation_mutex_);
+        const auto& h = uniform_page_index_.hulls();
+        take_ranges.insert(take_ranges.end(), h.begin(), h.end());
+        merge_ranges(&take_ranges);
+    }
+    const auto buffers_t0 = std::chrono::steady_clock::now();
     // The OS write bits of the buffers and of the relocated storage / index ranges, collected in one pass
     // that outlives the loops below (each take inside the ranges then skips its own GetWriteWatch).
     std::vector<std::pair<uintptr_t, uintptr_t>> host_ranges;
@@ -2293,6 +2300,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             }
         }
     }
+    if (indexed && !crosscheck) {
+        count_work(Work::FlushBufferNs, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                std::chrono::steady_clock::now() - buffers_t0)
+                                                                .count()));
+    }
     // G68 (#663): propagate the same submission MarkPass's dirty slots to tracked window textures
     // so textures sharing a 64 KiB slot with buffers (or written during a submission that did not
     // bind them) never lose write marks.
@@ -2319,6 +2331,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         }
     }
     // Relocated uniform ranges: refresh the aligned copies whose guest bytes changed.
+    const auto uniforms_t0 = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(relocation_mutex_);
         std::vector<uint8_t> bytes;
@@ -2412,6 +2425,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             count_work(Work::FlushUniformsCompared, compared);
             count_work(Work::FlushUniformsSkipped, skipped);
         }
+    }
+    if (indexed && !crosscheck) {
+        count_work(Work::FlushUniformNs, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 std::chrono::steady_clock::now() - uniforms_t0)
+                                                                 .count()));
     }
     // Relocated storage buffers (G51): refresh any relocated range whose guest bytes changed.
     {

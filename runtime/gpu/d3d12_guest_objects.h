@@ -1776,6 +1776,8 @@ enum class Work : size_t {
     // Indexed flushes that were not cross-checked: calls and wall time (ns) in flush_cpu_buffers.
     FlushIndexedCalls,
     FlushIndexedNs,
+    FlushBufferNs,   // indexed flush time spent on buffers (take included) / on uniform ranges
+    FlushUniformNs,
     Count
 };
 // #1963: how flush_cpu_buffers picks what to compare on native builds. Index (default): only the

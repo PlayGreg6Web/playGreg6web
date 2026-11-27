@@ -9175,10 +9175,12 @@ void test_native_flush_page_index() {
         // A uniform range inside B (primed with it) and one outside every buffer (compared every time).
         const uint64_t uni = mem + k64K + 0x800;
         const uint64_t uni2 = mem + 2 * k64K + 0x40;
-        uint32_t id_u = 0, id_u2 = 0;
-        uint64_t off_u = 0, off_u2 = 0;
+        const uint64_t uni3 = mem + 3 * k64K + kPage - 32;  // straddles two pages
+        uint32_t id_u = 0, id_u2 = 0, id_u3 = 0;
+        uint64_t off_u = 0, off_u2 = 0, off_u3 = 0;
         CHECK(dev->relocate_uniform(uni, 64, 64, &id_u, &off_u));
         CHECK(dev->relocate_uniform(uni2, 64, 64, &id_u2, &off_u2));
+        CHECK(dev->relocate_uniform(uni3, 64, 64, &id_u3, &off_u3));
         struct Write {
             uint32_t id;
             uint32_t offset;
@@ -9198,7 +9200,7 @@ void test_native_flush_page_index() {
                 if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer) {
                     GpuWriteBufferPayload w{};
                     std::memcpy(&w, enc.data() + off, sizeof(w));
-                    if (w.id == id_a || w.id == id_b || w.id == id_u || w.id == id_u2) {
+                    if (w.id == id_a || w.id == id_b || w.id == id_u || w.id == id_u2 || w.id == id_u3) {
                         out.push_back({w.id, w.dst_offset, h.payload_bytes - static_cast<uint32_t>(sizeof(w))});
                     }
                 }
@@ -9216,7 +9218,8 @@ void test_native_flush_page_index() {
         CHECK(com::write_guest(uni, one));  // the uniform range's first bytes (in B)
         {
             const auto w = flush();  // index (A: zeros, nothing to upload)
-            CHECK(w.size() == 3 && has_write(w, id_b, 0) && has_write(w, id_u, off_u) && has_write(w, id_u2, off_u2));
+            CHECK(w.size() == 4 && has_write(w, id_b, 0) && has_write(w, id_u, off_u) && has_write(w, id_u2, off_u2) &&
+                  has_write(w, id_u3, off_u3));
         }
         CHECK(flush().empty());                                     // prime
         const uint64_t skipped_b0 = dg::work_total(dg::Work::FlushBuffersSkipped);
@@ -9229,7 +9232,7 @@ void test_native_flush_page_index() {
         if (mode != dg::FlushMode::Full && tracking) {
             CHECK(dg::work_total(dg::Work::FlushBuffersSkipped) - skipped_b0 >= 2);  // (the scene's buffers too)
             CHECK(object_of<dg::Resource>(a)->flush_primed && object_of<dg::Resource>(b)->flush_primed);
-            CHECK(dg::work_total(dg::Work::FlushUniformsSkipped) - skipped_u0 == 1);
+            CHECK(dg::work_total(dg::Work::FlushUniformsSkipped) - skipped_u0 == 3);  // (uniform ranges outside every buffer are page-indexed too)
         } else {
             CHECK(dg::work_total(dg::Work::FlushBuffersSkipped) == skipped_b0);
         }
@@ -9252,6 +9255,25 @@ void test_native_flush_page_index() {
             const auto w = flush();
             CHECK(only(w, id_u2, static_cast<uint32_t>(off_u2)) && w[0].bytes == 64);
         }
+        // A range straddling two pages: a write to either page compares (and uploads) it.
+        CHECK(com::write_guest(uni3 + 40, two));  // second page
+        CHECK(only(flush(), id_u3, static_cast<uint32_t>(off_u3)));
+        CHECK(com::write_guest(uni3 + 4, two));  // first page
+        CHECK(only(flush(), id_u3, static_cast<uint32_t>(off_u3)));
+        // A buffer placed over the uniform range later: its writes still reach the range.
+        const uint64_t c = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                     {I(mem + 2 * k64K), I(put(buffer_desc(kPage))), I(0), I(0)},
+                                     dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        flush();
+        flush();
+        CHECK(com::write_guest(uni2 + 12, one));
+        {
+            const auto w = flush();
+            CHECK(has_write(w, id_u2, off_u2));
+        }
+        CHECK(flush().empty());
+        fx.vcall(c, Slot::Release);
         // A write of the same bytes: reported written, compared, nothing uploaded.
         CHECK(com::write_guest(mem + 2 * kPage + 8, two));
         CHECK(flush().empty());

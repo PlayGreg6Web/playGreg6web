@@ -97,6 +97,8 @@ const char* work_name(Work w) {
     case Work::FlushCrosscheckMisses: return "flush_crosscheck_misses";
     case Work::FlushIndexedCalls: return "flush_indexed_calls";
     case Work::FlushIndexedNs: return "flush_indexed_ns";
+    case Work::FlushBufferNs: return "flush_buffer_ns";
+    case Work::FlushUniformNs: return "flush_uniform_ns";
     case Work::Count: break;
     }
     return "?";
