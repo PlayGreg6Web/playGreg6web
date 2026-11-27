@@ -55,6 +55,7 @@
     importWorkerScript('./httpfs_mailbox.js', 'PlayGta6HttpfsMailbox', true);
     importWorkerScript('./io_scheduler.js', 'PlayGta6IoScheduler', false);
     importWorkerScript('./rpf9_vfs.js', 'PlayGta6Rpf9Vfs', false);
+    importWorkerScript('./perf_profile.js', 'PlayGta6PerfProfile', false);
   }
 
   function tryRequire(modPath) {
@@ -98,6 +99,80 @@
       (typeof globalThis !== 'undefined' && globalThis.PlayGta6Rpf9Vfs) ||
       tryRequire('./rpf9_vfs.js')
     );
+  }
+
+  const FALLBACK_IO_PERF_PROFILES = Object.freeze({
+    low: Object.freeze({
+      name: 'low',
+      ioSlabCacheBytes: 64 * 1024 * 1024,
+      ioMaxConcurrentLanes: 4,
+    }),
+    balanced: Object.freeze({
+      name: 'balanced',
+      ioSlabCacheBytes: 128 * 1024 * 1024,
+      ioMaxConcurrentLanes: 6,
+    }),
+    high: Object.freeze({
+      name: 'high',
+      ioSlabCacheBytes: 192 * 1024 * 1024,
+      ioMaxConcurrentLanes: 8,
+    }),
+  });
+
+  function resolvePerfProfileModule(override) {
+    return (
+      override ||
+      (typeof globalThis !== 'undefined' && globalThis.PlayGta6PerfProfile) ||
+      tryRequire('./perf_profile.js')
+    );
+  }
+
+  function coerceIoPerfProfile(profileOrName, overrideMod) {
+    const mod = resolvePerfProfileModule(overrideMod);
+    if (mod && typeof mod.coercePerfProfile === 'function') {
+      return mod.coercePerfProfile(profileOrName);
+    }
+    if (typeof profileOrName === 'string') {
+      const key = profileOrName.trim().toLowerCase();
+      if (key === 'auto') {
+        return FALLBACK_IO_PERF_PROFILES.balanced;
+      }
+      if (Object.prototype.hasOwnProperty.call(FALLBACK_IO_PERF_PROFILES, key)) {
+        return FALLBACK_IO_PERF_PROFILES[key];
+      }
+      throw new RangeError(`Unknown performance profile "${profileOrName}"`);
+    }
+    if (profileOrName && typeof profileOrName === 'object') {
+      const name =
+        typeof profileOrName.name === 'string'
+          ? profileOrName.name.trim().toLowerCase()
+          : typeof profileOrName.preset === 'string'
+            ? profileOrName.preset.trim().toLowerCase()
+            : 'balanced';
+      const base = Object.prototype.hasOwnProperty.call(FALLBACK_IO_PERF_PROFILES, name)
+        ? FALLBACK_IO_PERF_PROFILES[name]
+        : FALLBACK_IO_PERF_PROFILES.balanced;
+      return Object.freeze({
+        name: base.name,
+        ioSlabCacheBytes:
+          profileOrName.ioSlabCacheBytes !== undefined
+            ? profileOrName.ioSlabCacheBytes
+            : profileOrName.slabCacheBytes !== undefined
+              ? profileOrName.slabCacheBytes
+              : profileOrName.slabMaxBytes !== undefined
+                ? profileOrName.slabMaxBytes
+                : base.ioSlabCacheBytes,
+        ioMaxConcurrentLanes:
+          profileOrName.ioMaxConcurrentLanes !== undefined
+            ? profileOrName.ioMaxConcurrentLanes
+            : profileOrName.maxConcurrentLanes !== undefined
+              ? profileOrName.maxConcurrentLanes
+              : profileOrName.maxConcurrentSlabFetches !== undefined
+                ? profileOrName.maxConcurrentSlabFetches
+                : base.ioMaxConcurrentLanes,
+      });
+    }
+    throw new TypeError('perfProfile must be a preset name or profile object');
   }
 
   const defaultIoSchedulerMod = resolveIoSchedulerModule();
@@ -1437,6 +1512,13 @@
    */
   class ImmutableHttpfsCache {
     constructor(options = {}) {
+      const resolvedPerfProfile =
+        options.perfProfile !== undefined && options.perfProfile !== null
+          ? coerceIoPerfProfile(options.perfProfile)
+          : null;
+      this._perfProfile = resolvedPerfProfile;
+      this._perfProfileName = resolvedPerfProfile ? resolvedPerfProfile.name || null : null;
+
       this.chunkSize =
         Number.isInteger(options.chunkSize) && options.chunkSize > 0
           ? options.chunkSize
@@ -1445,7 +1527,21 @@
         Number.isFinite(options.maxBytes) && options.maxBytes >= 0
           ? Math.floor(options.maxBytes)
           : DEFAULT_IMMUTABLE_MAX_BYTES;
-      const slabCfg = resolveSlabConfig(options);
+      const slabResolveOptions = resolvedPerfProfile
+        ? Object.assign({}, options, {
+            slabMaxBytes:
+              options.slabMaxBytes !== undefined
+                ? options.slabMaxBytes
+                : options.maxRamCacheBytes !== undefined
+                  ? options.maxRamCacheBytes
+                  : resolvedPerfProfile.ioSlabCacheBytes,
+            maxConcurrentSlabFetches:
+              options.maxConcurrentSlabFetches !== undefined
+                ? options.maxConcurrentSlabFetches
+                : resolvedPerfProfile.ioMaxConcurrentLanes,
+          })
+        : options;
+      const slabCfg = resolveSlabConfig(slabResolveOptions);
       this.slabSize = slabCfg.slabSize;
       this.slabMaxBytes = slabCfg.slabMaxBytes;
       this.prefetchAheadSlabs = slabCfg.prefetchAheadSlabs;
@@ -4458,6 +4554,17 @@
       };
     }
 
+    applyPerfProfile(profileOrName) {
+      const profile = coerceIoPerfProfile(profileOrName);
+      this._perfProfile = profile;
+      this._perfProfileName = profile.name || null;
+      const tuned = this.tuneSlabCache({
+        slabMaxBytes: profile.ioSlabCacheBytes,
+        maxConcurrentSlabFetches: profile.ioMaxConcurrentLanes,
+      });
+      return Object.assign({ profile: this._perfProfileName }, tuned);
+    }
+
     _getSlabRange(url, firstSlab, lastSlab, cacheFlagsOut = null) {
       const resolveSingleSlab = (slabIndex, slotIdx) => {
         const key = this._slabKey(url, slabIndex);
@@ -5160,6 +5267,7 @@
         chunkSize: this.chunkSize,
         entries: this._chunks.size,
         filesIndexed: this._fileMeta.size,
+        perfProfile: this._perfProfileName,
       };
     }
   }
@@ -5584,6 +5692,20 @@
       this._httpfsMailboxModule = options.httpfsMailboxModule || null;
       this._ioSchedulerModule = options.ioSchedulerModule || null;
       this._rpf9VfsModule = options.rpf9VfsModule || null;
+      this._perfProfileModule = options.perfProfileModule || null;
+
+      const resolvedPerfProfile =
+        options.perfProfile !== undefined && options.perfProfile !== null
+          ? coerceIoPerfProfile(options.perfProfile, this._perfProfileModule)
+          : null;
+      this._perfProfile = resolvedPerfProfile;
+      this._perfProfileName = resolvedPerfProfile ? resolvedPerfProfile.name || null : null;
+      this._maxMailboxLanes =
+        resolvedPerfProfile &&
+        Number.isInteger(resolvedPerfProfile.ioMaxConcurrentLanes) &&
+        resolvedPerfProfile.ioMaxConcurrentLanes > 0
+          ? resolvedPerfProfile.ioMaxConcurrentLanes
+          : null;
 
       this.dataBase = normalizeDataBase(options.dataBase);
       this.bootBase = normalizeOptionalBase(options.bootBase);
@@ -5626,7 +5748,12 @@
       this._cacheOptions = {
         chunkSize: options.chunkSize,
         maxBytes: options.maxBytes,
-        maxPrefetchConcurrency: options.maxPrefetchConcurrency,
+        maxPrefetchConcurrency:
+          options.maxPrefetchConcurrency !== undefined
+            ? options.maxPrefetchConcurrency
+            : resolvedPerfProfile
+              ? resolvedPerfProfile.ioMaxConcurrentLanes
+              : undefined,
         opfsDir: options.opfsDir !== undefined ? options.opfsDir : undefined,
         coalesceAdjacent: options.coalesceAdjacent,
         coalesceMaxGapBytes: options.coalesceMaxGapBytes,
@@ -5665,11 +5792,18 @@
                 : Number.isFinite(options.recommendedSlabMaxBytes) &&
                     options.recommendedSlabMaxBytes > 0
                   ? options.recommendedSlabMaxBytes
-                  : undefined,
+                  : resolvedPerfProfile
+                    ? resolvedPerfProfile.ioSlabCacheBytes
+                    : undefined,
         slabCacheEnabled: options.slabCacheEnabled,
         slabProfile: options.slabProfile,
         prefetchAheadSlabs: options.prefetchAheadSlabs,
-        maxConcurrentSlabFetches: options.maxConcurrentSlabFetches,
+        maxConcurrentSlabFetches:
+          options.maxConcurrentSlabFetches !== undefined
+            ? options.maxConcurrentSlabFetches
+            : resolvedPerfProfile
+              ? resolvedPerfProfile.ioMaxConcurrentLanes
+              : undefined,
         sequentialThresholdReads: options.sequentialThresholdReads,
         negativeCacheTtlMs: options.negativeCacheTtlMs,
         negativeCacheMaxEntries: options.negativeCacheMaxEntries,
@@ -5707,7 +5841,12 @@
           ? Math.floor(rawWholeFileTotalMax)
           : Math.max(this._wholeFileMaxBytes, DEFAULT_WHOLE_FILE_TOTAL_MAX_BYTES);
       this._schedulerOptions = {
-        maxConcurrency: options.maxConcurrency,
+        maxConcurrency:
+          options.maxConcurrency !== undefined
+            ? options.maxConcurrency
+            : resolvedPerfProfile
+              ? resolvedPerfProfile.ioMaxConcurrentLanes
+              : undefined,
         maxRetries: options.maxRetries,
         baseRetryDelayMs: options.baseRetryDelayMs,
         sleep: options.sleep,
@@ -5755,6 +5894,30 @@
 
     get mailboxLanes() {
       return this._mailboxLanes;
+    }
+
+    get perfProfile() {
+      return this._perfProfile;
+    }
+
+    get maxConcurrentLanes() {
+      if (this._maxMailboxLanes !== null) {
+        return this._maxMailboxLanes;
+      }
+      if (
+        this.immutableCache &&
+        Number.isInteger(this.immutableCache.maxConcurrentSlabFetches) &&
+        this.immutableCache.maxConcurrentSlabFetches > 0
+      ) {
+        return this.immutableCache.maxConcurrentSlabFetches;
+      }
+      if (
+        Number.isInteger(this._immutableCacheOptions.maxConcurrentSlabFetches) &&
+        this._immutableCacheOptions.maxConcurrentSlabFetches > 0
+      ) {
+        return this._immutableCacheOptions.maxConcurrentSlabFetches;
+      }
+      return DEFAULT_MAX_CONCURRENT_SLAB_FETCHES;
     }
 
     _getRangeCacheModule() {
@@ -5886,6 +6049,7 @@
           maxPendingOpfsL2WriteBytes: this._immutableCacheOptions.maxPendingOpfsL2WriteBytes,
           maxOpfsL2WriteConcurrency: this._immutableCacheOptions.maxOpfsL2WriteConcurrency,
           opfsL2MaxBytes: this._immutableCacheOptions.opfsL2MaxBytes,
+          perfProfile: this._perfProfile,
           now: this._immutableCacheOptions.now,
           fetchImpl: this._getFetchImpl(),
         });
@@ -5940,6 +6104,60 @@
       this._immutableCacheOptions.maxConcurrentSlabFetches = tuned.maxConcurrentSlabFetches;
       this._immutableCacheOptions.sequentialThresholdReads = tuned.sequentialThresholdReads;
       return tuned;
+    }
+
+    applyPerfProfile(profileOrName) {
+      const profile = coerceIoPerfProfile(profileOrName, this._perfProfileModule);
+      this._perfProfile = profile;
+      this._perfProfileName = profile.name || null;
+
+      const slabMaxBytes = profile.ioSlabCacheBytes;
+      const maxLanes = profile.ioMaxConcurrentLanes;
+
+      this._maxMailboxLanes =
+        Number.isInteger(maxLanes) && maxLanes > 0 ? maxLanes : this._maxMailboxLanes;
+      this._immutableCacheOptions.slabMaxBytes = slabMaxBytes;
+      this._immutableCacheOptions.maxConcurrentSlabFetches = maxLanes;
+      this._cacheOptions.maxPrefetchConcurrency = maxLanes;
+      this._schedulerOptions.maxConcurrency = maxLanes;
+
+      let slabConfig = {
+        slabSize: this._immutableCacheOptions.slabSize || DEFAULT_SLAB_SIZE,
+        slabMaxBytes,
+        prefetchAheadSlabs:
+          this._immutableCacheOptions.prefetchAheadSlabs !== undefined
+            ? this._immutableCacheOptions.prefetchAheadSlabs
+            : DEFAULT_SLAB_PREFETCH_AHEAD,
+        maxConcurrentSlabFetches: maxLanes,
+        sequentialThresholdReads:
+          this._immutableCacheOptions.sequentialThresholdReads !== undefined
+            ? this._immutableCacheOptions.sequentialThresholdReads
+            : DEFAULT_SEQUENTIAL_THRESHOLD_READS,
+      };
+      if (this.immutableCache && typeof this.immutableCache.applyPerfProfile === 'function') {
+        slabConfig = this.immutableCache.applyPerfProfile(profile);
+        this._immutableCacheOptions.slabSize = slabConfig.slabSize;
+        this._immutableCacheOptions.slabMaxBytes = slabConfig.slabMaxBytes;
+        this._immutableCacheOptions.prefetchAheadSlabs = slabConfig.prefetchAheadSlabs;
+        this._immutableCacheOptions.maxConcurrentSlabFetches = slabConfig.maxConcurrentSlabFetches;
+        this._immutableCacheOptions.sequentialThresholdReads = slabConfig.sequentialThresholdReads;
+      }
+      if (this.rangeCache && typeof this.rangeCache === 'object') {
+        this.rangeCache.maxPrefetchConcurrency = maxLanes;
+      }
+      if (this.scheduler && typeof this.scheduler === 'object') {
+        this.scheduler.maxConcurrency = maxLanes;
+      }
+
+      return {
+        profile: this._perfProfileName,
+        slabMaxBytes: slabConfig.slabMaxBytes,
+        slabSize: slabConfig.slabSize,
+        prefetchAheadSlabs: slabConfig.prefetchAheadSlabs,
+        maxConcurrentSlabFetches: slabConfig.maxConcurrentSlabFetches,
+        maxConcurrentLanes: this._maxMailboxLanes,
+        maxPrefetchConcurrency: maxLanes,
+      };
     }
 
     async prefetchVideoSlabs(rawPath, startOffset = 0, count) {
@@ -8364,6 +8582,8 @@
         openHandles: this._handles.size,
         mailboxAttached: Boolean(this._mailboxHost),
         mailboxLanes: this._mailboxLanes,
+        maxConcurrentLanes: this.maxConcurrentLanes,
+        perfProfile: this._perfProfileName,
         statHits: this._streamingStats.statHits || 0,
         statMisses: this._streamingStats.statMisses || 0,
       };
@@ -8513,6 +8733,21 @@
       }
       this._customRangeCacheProvided = Boolean(opts.rangeCache);
       this._hasRoutedRangeCache = !opts.rangeCache;
+      const initPerfProfile =
+        opts.perfProfile !== undefined && opts.perfProfile !== null
+          ? coerceIoPerfProfile(opts.perfProfile, this._perfProfileModule)
+          : null;
+      if (initPerfProfile) {
+        this._perfProfile = initPerfProfile;
+        this._perfProfileName = initPerfProfile.name || null;
+        if (
+          Number.isInteger(initPerfProfile.ioMaxConcurrentLanes) &&
+          initPerfProfile.ioMaxConcurrentLanes > 0
+        ) {
+          this._maxMailboxLanes = initPerfProfile.ioMaxConcurrentLanes;
+        }
+      }
+
       const resolvedSlabSize =
         opts.slabSize !== undefined
           ? opts.slabSize
@@ -8531,7 +8766,9 @@
               : Number.isFinite(opts.recommendedSlabMaxBytes) &&
                   opts.recommendedSlabMaxBytes > 0
                 ? opts.recommendedSlabMaxBytes
-                : this._immutableCacheOptions.slabMaxBytes;
+                : initPerfProfile
+                  ? initPerfProfile.ioSlabCacheBytes
+                  : this._immutableCacheOptions.slabMaxBytes;
       const resolvedSlabEnabled =
         opts.slabCacheEnabled !== undefined
           ? opts.slabCacheEnabled
@@ -8547,11 +8784,24 @@
       const resolvedMaxConcurrentSlabFetches =
         opts.maxConcurrentSlabFetches !== undefined
           ? opts.maxConcurrentSlabFetches
-          : this._immutableCacheOptions.maxConcurrentSlabFetches;
+          : initPerfProfile
+            ? initPerfProfile.ioMaxConcurrentLanes
+            : this._immutableCacheOptions.maxConcurrentSlabFetches;
       const resolvedSequentialThreshold =
         opts.sequentialThresholdReads !== undefined
           ? opts.sequentialThresholdReads
           : this._immutableCacheOptions.sequentialThresholdReads;
+
+      if (initPerfProfile) {
+        this._immutableCacheOptions.slabMaxBytes = resolvedSlabMaxBytes;
+        this._immutableCacheOptions.maxConcurrentSlabFetches = resolvedMaxConcurrentSlabFetches;
+        if (opts.maxPrefetchConcurrency === undefined) {
+          this._cacheOptions.maxPrefetchConcurrency = initPerfProfile.ioMaxConcurrentLanes;
+        }
+        if (opts.maxConcurrency === undefined) {
+          this._schedulerOptions.maxConcurrency = initPerfProfile.ioMaxConcurrentLanes;
+        }
+      }
 
       const resolvedOpfsL2 =
         opts.opfsL2 !== undefined ? opts.opfsL2 : this._immutableCacheOptions.opfsL2;
@@ -8644,6 +8894,7 @@
           maxPendingOpfsL2WriteBytes: resolvedMaxPendingOpfsL2WriteBytes,
           maxOpfsL2WriteConcurrency: resolvedMaxOpfsL2WriteConcurrency,
           opfsL2MaxBytes: resolvedOpfsL2MaxBytes,
+          perfProfile: this._perfProfile,
           now:
             typeof opts.now === 'function' ? opts.now : this._immutableCacheOptions.now,
           fetchImpl: fetchFn,
@@ -8794,6 +9045,8 @@
         shadersBase: this.shadersBase,
         allowDumpWrites: this.allowDumpWrites,
         dumpEndpoint: this.dumpEndpoint,
+        perfProfile: this._perfProfileName,
+        maxConcurrentLanes: this.maxConcurrentLanes,
       };
 
       if (this.postMessage && !opts._deferReady) {
@@ -8975,6 +9228,16 @@
           const slabConfig = this.tuneSlabCache(target);
           if (this.postMessage) {
             this.postMessage({ id: m.id, ok: true, slabConfig });
+          }
+        } else if (m.applyPerfProfile || m.type === 'apply-perf-profile') {
+          const target =
+            typeof m.applyPerfProfile === 'string' ||
+            (m.applyPerfProfile && typeof m.applyPerfProfile === 'object')
+              ? m.applyPerfProfile
+              : m.perfProfile || m.profile || m.preset || m;
+          const perfProfile = this.applyPerfProfile(target);
+          if (this.postMessage) {
+            this.postMessage({ id: m.id, ok: true, perfProfile });
           }
         } else if (m.prefetchSlabs) {
           const prefetch = await this.prefetchVideoSlabs(m.path, m.offset || 0, m.count);

@@ -13,6 +13,80 @@
   const DEFAULT_MAX_TEXTURE_DIMENSION_2D = 8192;
   const DEFAULT_MAX_TEXTURE_ARRAY_LAYERS = 256;
 
+  const FALLBACK_RT_PERF_PROFILES = Object.freeze({
+    low: Object.freeze({ name: 'low', rtPoolMaxBytes: 128 * 1024 * 1024, rtPoolMaxIdleFrames: 8 }),
+    balanced: Object.freeze({
+      name: 'balanced',
+      rtPoolMaxBytes: 256 * 1024 * 1024,
+      rtPoolMaxIdleFrames: 16,
+    }),
+    high: Object.freeze({
+      name: 'high',
+      rtPoolMaxBytes: 512 * 1024 * 1024,
+      rtPoolMaxIdleFrames: 30,
+    }),
+  });
+
+  function _resolvePerfProfileModule() {
+    if (typeof globalThis !== 'undefined' && globalThis.PlayGta6PerfProfile) {
+      return globalThis.PlayGta6PerfProfile;
+    }
+    if (typeof require === 'function') {
+      try {
+        return require('./perf_profile.js');
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  function _coercePerfProfile(profileOrName) {
+    const mod = _resolvePerfProfileModule();
+    if (mod && typeof mod.coercePerfProfile === 'function') {
+      return mod.coercePerfProfile(profileOrName);
+    }
+    if (typeof profileOrName === 'string') {
+      const key = profileOrName.trim().toLowerCase();
+      if (key === 'auto') {
+        return FALLBACK_RT_PERF_PROFILES.balanced;
+      }
+      if (Object.prototype.hasOwnProperty.call(FALLBACK_RT_PERF_PROFILES, key)) {
+        return FALLBACK_RT_PERF_PROFILES[key];
+      }
+      throw new RangeError(`Unknown performance profile "${profileOrName}"`);
+    }
+    if (profileOrName && typeof profileOrName === 'object') {
+      const name =
+        typeof profileOrName.name === 'string'
+          ? profileOrName.name.trim().toLowerCase()
+          : typeof profileOrName.preset === 'string'
+            ? profileOrName.preset.trim().toLowerCase()
+            : 'custom';
+      const base = Object.prototype.hasOwnProperty.call(FALLBACK_RT_PERF_PROFILES, name)
+        ? FALLBACK_RT_PERF_PROFILES[name]
+        : FALLBACK_RT_PERF_PROFILES.balanced;
+      return Object.freeze({
+        name: base.name,
+        rtPoolMaxBytes:
+          profileOrName.rtPoolMaxBytes !== undefined
+            ? profileOrName.rtPoolMaxBytes
+            : profileOrName.maxPoolBytes !== undefined
+              ? profileOrName.maxPoolBytes
+              : base.rtPoolMaxBytes,
+        rtPoolMaxIdleFrames:
+          profileOrName.rtPoolMaxIdleFrames !== undefined
+            ? profileOrName.rtPoolMaxIdleFrames
+            : profileOrName.idleFrameTtl !== undefined
+              ? profileOrName.idleFrameTtl
+              : profileOrName.maxIdleFrames !== undefined
+                ? profileOrName.maxIdleFrames
+                : base.rtPoolMaxIdleFrames,
+      });
+    }
+    throw new TypeError('perfProfile must be a preset name or profile object');
+  }
+
   const VALID_VIEW_DIMENSIONS = Object.freeze([
     '1d',
     '2d',
@@ -1291,6 +1365,7 @@
 
       const {
         device,
+        perfProfile: rawPerfProfile,
         maxPoolBytes: rawMaxPoolBytes,
         maxVramBytes,
         idleFrameTtl: rawIdleFrameTtl,
@@ -1305,18 +1380,27 @@
         warn = null,
       } = options;
 
+      const resolvedPerfProfile =
+        rawPerfProfile !== undefined && rawPerfProfile !== null
+          ? _coercePerfProfile(rawPerfProfile)
+          : null;
+
       const maxPoolBytes =
         rawMaxPoolBytes !== undefined
           ? rawMaxPoolBytes
           : maxVramBytes !== undefined
             ? maxVramBytes
-            : DEFAULT_MAX_POOL_BYTES;
+            : resolvedPerfProfile && resolvedPerfProfile.rtPoolMaxBytes !== undefined
+              ? resolvedPerfProfile.rtPoolMaxBytes
+              : DEFAULT_MAX_POOL_BYTES;
       const idleFrameTtl =
         rawIdleFrameTtl !== undefined
           ? rawIdleFrameTtl
           : maxIdleFrames !== undefined
             ? maxIdleFrames
-            : DEFAULT_IDLE_FRAME_TTL;
+            : resolvedPerfProfile && resolvedPerfProfile.rtPoolMaxIdleFrames !== undefined
+              ? resolvedPerfProfile.rtPoolMaxIdleFrames
+              : DEFAULT_IDLE_FRAME_TTL;
 
       if (!device || typeof device.createTexture !== 'function') {
         throw new TypeError('RenderTargetPool requires a WebGPU device with createTexture()');
@@ -1349,6 +1433,8 @@
       }
 
       this._device = device;
+      this._perfProfile = resolvedPerfProfile;
+      this._perfProfileName = resolvedPerfProfile ? resolvedPerfProfile.name || null : null;
       this._maxPoolBytes = maxPoolBytes;
       this._idleFrameTtl = idleFrameTtl;
       this._oversizedTargetBytes = oversizedTargetBytes;
@@ -1436,6 +1522,10 @@
 
     get maxTextureDimension2D() {
       return this._effectiveMaxTextureDimension2D();
+    }
+
+    get perfProfile() {
+      return this._perfProfile;
     }
 
     _effectiveMaxTextureDimension2D() {
@@ -1679,6 +1769,50 @@
         }
       }
       return { evictedCount, evictedBytes };
+    }
+
+    /**
+     * Apply a hardware-adaptive performance profile (`'low' | 'balanced' | 'high' | 'auto'`
+     * or a resolved profile object from `PlayGta6PerfProfile.resolvePerfProfile`), updating
+     * `maxPoolBytes` and `idleFrameTtl` and immediately evicting excess idle targets.
+     * Never destroys currently checked-out/active targets.
+     *
+     * @param {string | object} profileOrName
+     * @returns {{
+     *   profile: string | null,
+     *   maxPoolBytes: number,
+     *   idleFrameTtl: number,
+     *   evictedCount: number,
+     *   evictedBytes: number,
+     *   budgetEvictedCount: number,
+     *   idleEvictedCount: number,
+     * }}
+     */
+    applyPerfProfile(profileOrName) {
+      this._assertNotDestroyed();
+      const profile = _coercePerfProfile(profileOrName);
+      this._perfProfile = profile;
+      this._perfProfileName = profile.name || null;
+
+      let budgetEvict = { evictedCount: 0, evictedBytes: 0 };
+      if (profile.rtPoolMaxBytes !== undefined) {
+        budgetEvict = this.setMaxPoolBytes(profile.rtPoolMaxBytes);
+      }
+
+      let idleEvict = { evictedCount: 0, evictedBytes: 0 };
+      if (profile.rtPoolMaxIdleFrames !== undefined) {
+        idleEvict = this.setIdleFrameTtl(profile.rtPoolMaxIdleFrames);
+      }
+
+      return {
+        profile: this._perfProfileName,
+        maxPoolBytes: this._maxPoolBytes,
+        idleFrameTtl: this._idleFrameTtl,
+        evictedCount: budgetEvict.evictedCount + idleEvict.evictedCount,
+        evictedBytes: budgetEvict.evictedBytes + idleEvict.evictedBytes,
+        budgetEvictedCount: budgetEvict.evictedCount,
+        idleEvictedCount: idleEvict.evictedCount,
+      };
     }
 
     /**
@@ -2525,6 +2659,7 @@
         srgbAcquires: sanitizeNonNegativeCounter(this._srgbAcquires),
         maxTextureDimension2D: this._effectiveMaxTextureDimension2D(),
         currentFrame: sanitizeNonNegativeCounter(this._currentFrame),
+        perfProfile: this._perfProfileName,
       };
     }
 

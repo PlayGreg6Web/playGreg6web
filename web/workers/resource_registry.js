@@ -13,10 +13,114 @@
 (function (root) {
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
   const DEFAULT_SOFT_BUDGET_BYTES = 512 * 1024 * 1024; // 512 MiB
+  const DEFAULT_VRAM_RECLAIM_TRIGGER_RATIO = 0.85;
+  const DEFAULT_VRAM_RECLAIM_TARGET_RATIO = 0.72;
   const DEFAULT_OLDEST_LIVE_LIMIT = 16;
   const DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE = 16;
   const FAST_HANDLE_LIMIT = 65536;
   const DEFAULT_MAX_STALE_HANDLE_HISTORY = 16384;
+
+  const VRAM_PRESSURE_TIER = Object.freeze({
+    NORMAL: 'normal',
+    SOFT: 'soft',
+    HARD: 'hard',
+  });
+
+  const FALLBACK_REGISTRY_PERF_PROFILES = Object.freeze({
+    low: Object.freeze({
+      name: 'low',
+      vramBudgetBytes: 1536 * 1024 * 1024,
+      vramReclaimTriggerRatio: 0.72,
+      vramReclaimTargetRatio: 0.58,
+      gcDeferFrames: 2,
+    }),
+    balanced: Object.freeze({
+      name: 'balanced',
+      vramBudgetBytes: 3072 * 1024 * 1024,
+      vramReclaimTriggerRatio: 0.78,
+      vramReclaimTargetRatio: 0.65,
+      gcDeferFrames: 2,
+    }),
+    high: Object.freeze({
+      name: 'high',
+      vramBudgetBytes: 6144 * 1024 * 1024,
+      vramReclaimTriggerRatio: 0.85,
+      vramReclaimTargetRatio: 0.72,
+      gcDeferFrames: 3,
+    }),
+  });
+
+  function _resolvePerfProfileModule() {
+    if (typeof globalThis !== 'undefined' && globalThis.PlayGta6PerfProfile) {
+      return globalThis.PlayGta6PerfProfile;
+    }
+    if (typeof require === 'function') {
+      try {
+        return require('./perf_profile.js');
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  function _coercePerfProfile(profileOrName) {
+    const mod = _resolvePerfProfileModule();
+    if (mod && typeof mod.coercePerfProfile === 'function') {
+      return mod.coercePerfProfile(profileOrName);
+    }
+    if (typeof profileOrName === 'string') {
+      const key = profileOrName.trim().toLowerCase();
+      if (key === 'auto') {
+        return FALLBACK_REGISTRY_PERF_PROFILES.balanced;
+      }
+      if (Object.prototype.hasOwnProperty.call(FALLBACK_REGISTRY_PERF_PROFILES, key)) {
+        return FALLBACK_REGISTRY_PERF_PROFILES[key];
+      }
+      throw new RangeError(`Unknown performance profile "${profileOrName}"`);
+    }
+    if (profileOrName && typeof profileOrName === 'object') {
+      const name =
+        typeof profileOrName.name === 'string'
+          ? profileOrName.name.trim().toLowerCase()
+          : typeof profileOrName.preset === 'string'
+            ? profileOrName.preset.trim().toLowerCase()
+            : 'balanced';
+      const base = Object.prototype.hasOwnProperty.call(FALLBACK_REGISTRY_PERF_PROFILES, name)
+        ? FALLBACK_REGISTRY_PERF_PROFILES[name]
+        : FALLBACK_REGISTRY_PERF_PROFILES.balanced;
+      return Object.freeze({
+        name: base.name,
+        vramBudgetBytes:
+          profileOrName.vramBudgetBytes !== undefined
+            ? profileOrName.vramBudgetBytes
+            : profileOrName.softBudgetBytes !== undefined
+              ? profileOrName.softBudgetBytes
+              : base.vramBudgetBytes,
+        vramReclaimTriggerRatio:
+          profileOrName.vramReclaimTriggerRatio !== undefined
+            ? profileOrName.vramReclaimTriggerRatio
+            : base.vramReclaimTriggerRatio,
+        vramReclaimTargetRatio:
+          profileOrName.vramReclaimTargetRatio !== undefined
+            ? profileOrName.vramReclaimTargetRatio
+            : base.vramReclaimTargetRatio,
+        gcDeferFrames:
+          profileOrName.gcDeferFrames !== undefined
+            ? profileOrName.gcDeferFrames
+            : profileOrName.framesInFlight !== undefined
+              ? profileOrName.framesInFlight
+              : base.gcDeferFrames,
+      });
+    }
+    throw new TypeError('perfProfile must be a preset name or profile object');
+  }
+
+  function assertUnitRatio(value, name) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 1) {
+      throw new RangeError(`${name} must be a finite number in (0, 1], got ${String(value)}`);
+    }
+  }
 
   const CREATE_TEXTURE2_OPCODE = 35;
   const CREATE_TEXTURE2_PAYLOAD_BYTES = 40;
@@ -1460,20 +1564,59 @@
       }
 
       const {
-        framesInFlight = DEFAULT_FRAMES_IN_FLIGHT,
-        softBudgetBytes = DEFAULT_SOFT_BUDGET_BYTES,
+        perfProfile: rawPerfProfile,
+        framesInFlight: rawFramesInFlight,
+        softBudgetBytes: rawSoftBudgetBytes,
+        vramReclaimTriggerRatio: rawTriggerRatio,
+        vramReclaimTargetRatio: rawTargetRatio,
         device = null,
         includeSrgbSiblingViewFormat = false,
         maxCachedViewsPerTexture = DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
         maxStaleHandleHistory = DEFAULT_MAX_STALE_HANDLE_HISTORY,
         onBudgetWarning = null,
+        onPressureChange = null,
         onDestroyError = null,
         onSanitizeWarning = null,
       } = options;
 
+      const resolvedPerfProfile =
+        rawPerfProfile !== undefined && rawPerfProfile !== null
+          ? _coercePerfProfile(rawPerfProfile)
+          : null;
+
+      const framesInFlight =
+        rawFramesInFlight !== undefined
+          ? rawFramesInFlight
+          : resolvedPerfProfile && resolvedPerfProfile.gcDeferFrames !== undefined
+            ? resolvedPerfProfile.gcDeferFrames
+            : DEFAULT_FRAMES_IN_FLIGHT;
+
+      const softBudgetBytes =
+        rawSoftBudgetBytes !== undefined
+          ? rawSoftBudgetBytes
+          : resolvedPerfProfile && resolvedPerfProfile.vramBudgetBytes !== undefined
+            ? resolvedPerfProfile.vramBudgetBytes
+            : DEFAULT_SOFT_BUDGET_BYTES;
+
+      const vramReclaimTriggerRatio =
+        rawTriggerRatio !== undefined
+          ? rawTriggerRatio
+          : resolvedPerfProfile && resolvedPerfProfile.vramReclaimTriggerRatio !== undefined
+            ? resolvedPerfProfile.vramReclaimTriggerRatio
+            : DEFAULT_VRAM_RECLAIM_TRIGGER_RATIO;
+
+      const vramReclaimTargetRatio =
+        rawTargetRatio !== undefined
+          ? rawTargetRatio
+          : resolvedPerfProfile && resolvedPerfProfile.vramReclaimTargetRatio !== undefined
+            ? resolvedPerfProfile.vramReclaimTargetRatio
+            : DEFAULT_VRAM_RECLAIM_TARGET_RATIO;
+
       assertPositiveInteger(framesInFlight, 'framesInFlight');
       assertPositiveInteger(maxCachedViewsPerTexture, 'maxCachedViewsPerTexture');
       assertPositiveInteger(maxStaleHandleHistory, 'maxStaleHandleHistory');
+      assertUnitRatio(vramReclaimTriggerRatio, 'vramReclaimTriggerRatio');
+      assertUnitRatio(vramReclaimTargetRatio, 'vramReclaimTargetRatio');
 
       let resolvedBudget = null;
       if (softBudgetBytes !== null && softBudgetBytes !== Infinity) {
@@ -1487,6 +1630,9 @@
       if (onBudgetWarning !== null && typeof onBudgetWarning !== 'function') {
         throw new TypeError('onBudgetWarning must be a function when provided');
       }
+      if (onPressureChange !== null && typeof onPressureChange !== 'function') {
+        throw new TypeError('onPressureChange must be a function when provided');
+      }
       if (onDestroyError !== null && typeof onDestroyError !== 'function') {
         throw new TypeError('onDestroyError must be a function when provided');
       }
@@ -1494,15 +1640,21 @@
         throw new TypeError('onSanitizeWarning must be a function when provided');
       }
 
+      this._perfProfile = resolvedPerfProfile;
+      this._perfProfileName = resolvedPerfProfile ? resolvedPerfProfile.name || null : null;
       this.framesInFlight = framesInFlight;
       this.softBudgetBytes = resolvedBudget;
+      this.vramReclaimTriggerRatio = vramReclaimTriggerRatio;
+      this.vramReclaimTargetRatio = Math.min(vramReclaimTargetRatio, vramReclaimTriggerRatio);
       this.device = device;
       this.includeSrgbSiblingViewFormat = Boolean(includeSrgbSiblingViewFormat);
       this.maxCachedViewsPerTexture = maxCachedViewsPerTexture;
       this._maxStaleHandleHistory = maxStaleHandleHistory;
       this._onBudgetWarning = onBudgetWarning;
+      this._onPressureChange = onPressureChange;
       this._onDestroyError = onDestroyError;
       this._onSanitizeWarning = onSanitizeWarning;
+      this._lastPressureTier = VRAM_PRESSURE_TIER.NORMAL;
 
       /** @type {Map<string, Map<number, object>>} */
       this._tables = new Map();
@@ -1643,6 +1795,131 @@
         throw new TypeError('setDevice expects a WebGPU device object or null');
       }
       this.device = device;
+    }
+
+    get perfProfile() {
+      return this._perfProfile;
+    }
+
+    /**
+     * Compute current VRAM budget utilization and pressure tier (`normal` | `soft` | `hard`)
+     * against `softBudgetBytes`, `vramReclaimTriggerRatio`, and `vramReclaimTargetRatio`.
+     */
+    getVramPressure() {
+      const activeBytes = sanitizeNonNegativeCounter(this._activeBytes);
+      const pendingRetireBytes = sanitizeNonNegativeCounter(this._pendingRetireBytes);
+      const totalBytes = activeBytes + pendingRetireBytes;
+      const budget = this.softBudgetBytes;
+
+      if (budget === null || budget <= 0) {
+        return {
+          tier: VRAM_PRESSURE_TIER.NORMAL,
+          utilization: 0,
+          budgetUtilization: 0,
+          totalBytes,
+          softBudgetBytes: null,
+          triggerRatio: this.vramReclaimTriggerRatio,
+          targetRatio: this.vramReclaimTargetRatio,
+          triggerBytes: null,
+          targetBytes: null,
+          shouldReclaim: false,
+          bytesOverTarget: 0,
+          budgetExceeded: false,
+        };
+      }
+
+      const utilization = totalBytes > 0 ? totalBytes / budget : 0;
+      const budgetUtilization = clampUnitRate(totalBytes, budget);
+      const triggerBytes = Math.floor(budget * this.vramReclaimTriggerRatio);
+      const targetBytes = Math.floor(budget * this.vramReclaimTargetRatio);
+
+      let tier = VRAM_PRESSURE_TIER.NORMAL;
+      if (totalBytes >= budget) {
+        tier = VRAM_PRESSURE_TIER.HARD;
+      } else if (utilization >= this.vramReclaimTriggerRatio) {
+        tier = VRAM_PRESSURE_TIER.SOFT;
+      }
+
+      const shouldReclaim = tier !== VRAM_PRESSURE_TIER.NORMAL;
+      const bytesOverTarget = shouldReclaim ? Math.max(0, totalBytes - targetBytes) : 0;
+
+      return {
+        tier,
+        utilization,
+        budgetUtilization,
+        totalBytes,
+        softBudgetBytes: budget,
+        triggerRatio: this.vramReclaimTriggerRatio,
+        targetRatio: this.vramReclaimTargetRatio,
+        triggerBytes,
+        targetBytes,
+        shouldReclaim,
+        bytesOverTarget,
+        budgetExceeded: this._budgetExceeded,
+      };
+    }
+
+    /**
+     * Apply a hardware-adaptive performance profile (`'low' | 'balanced' | 'high' | 'auto'`
+     * or a resolved profile object from `PlayGta6PerfProfile.resolvePerfProfile`), updating
+     * VRAM soft budget, reclaim trigger/target ratios, and deferred-GC frame retention.
+     * Immediately collects any retired non-fence resources now eligible under the updated
+     * deferred-GC delay.
+     *
+     * @param {string | object} profileOrName
+     */
+    applyPerfProfile(profileOrName) {
+      const profile = _coercePerfProfile(profileOrName);
+      this._perfProfile = profile;
+      this._perfProfileName = profile.name || null;
+
+      if (profile.vramBudgetBytes !== undefined && profile.vramBudgetBytes !== null) {
+        assertPositiveInteger(profile.vramBudgetBytes, 'vramBudgetBytes');
+        this.softBudgetBytes = profile.vramBudgetBytes;
+      }
+      if (profile.vramReclaimTriggerRatio !== undefined) {
+        assertUnitRatio(profile.vramReclaimTriggerRatio, 'vramReclaimTriggerRatio');
+        this.vramReclaimTriggerRatio = profile.vramReclaimTriggerRatio;
+      }
+      if (profile.vramReclaimTargetRatio !== undefined) {
+        assertUnitRatio(profile.vramReclaimTargetRatio, 'vramReclaimTargetRatio');
+        this.vramReclaimTargetRatio = Math.min(
+          profile.vramReclaimTargetRatio,
+          this.vramReclaimTriggerRatio
+        );
+      } else if (this.vramReclaimTargetRatio > this.vramReclaimTriggerRatio) {
+        this.vramReclaimTargetRatio = this.vramReclaimTriggerRatio;
+      }
+
+      const prevFramesInFlight = this.framesInFlight;
+      if (profile.gcDeferFrames !== undefined) {
+        assertPositiveInteger(profile.gcDeferFrames, 'gcDeferFrames');
+        this.framesInFlight = profile.gcDeferFrames;
+      }
+
+      let collected = {
+        destroyedCount: 0,
+        freedBytes: 0,
+        remainingCount: this._pendingRetire.length,
+        pendingRetireBytes: this._pendingRetireBytes,
+      };
+      if (this.framesInFlight < prevFramesInFlight && this._pendingRetire.length > 0) {
+        collected = this.collect(false);
+      } else {
+        this._checkBudget(null);
+      }
+
+      return {
+        profile: this._perfProfileName,
+        softBudgetBytes: this.softBudgetBytes,
+        vramBudgetBytes: this.softBudgetBytes,
+        vramReclaimTriggerRatio: this.vramReclaimTriggerRatio,
+        vramReclaimTargetRatio: this.vramReclaimTargetRatio,
+        framesInFlight: this.framesInFlight,
+        gcDeferFrames: this.framesInFlight,
+        pressure: this.getVramPressure(),
+        collected,
+      };
     }
 
     _resolveDevice(overrideDevice, methodName) {
@@ -1875,6 +2152,19 @@
         }
       } else {
         this._budgetExceeded = false;
+      }
+
+      if (this._onPressureChange) {
+        const pressure = this.getVramPressure();
+        if (pressure.tier !== this._lastPressureTier) {
+          const previousTier = this._lastPressureTier;
+          this._lastPressureTier = pressure.tier;
+          this._onPressureChange({
+            ...pressure,
+            previousTier,
+            currentFrame: this._currentFrame,
+          });
+        }
       }
     }
 
@@ -3811,6 +4101,8 @@
         sanitizeNonNegativeCounter(this._peakBytes)
       );
 
+      const pressure = this.getVramPressure();
+
       return {
         buffer: byKind[VRAM_KIND.BUFFER],
         texture: byKind[VRAM_KIND.TEXTURE],
@@ -3826,6 +4118,12 @@
         evictedBytes: sanitizeNonNegativeCounter(this._evictedBytes),
         softBudgetBytes: this.softBudgetBytes,
         budgetExceeded: this._budgetExceeded,
+        perfProfile: this._perfProfileName,
+        vramReclaimTriggerRatio: this.vramReclaimTriggerRatio,
+        vramReclaimTargetRatio: this.vramReclaimTargetRatio,
+        vramPressureTier: pressure.tier,
+        vramUtilization: pressure.utilization,
+        vramShouldReclaim: pressure.shouldReclaim,
       };
     }
 
@@ -3884,6 +4182,7 @@
       const viewCacheMisses = sanitizeNonNegativeCounter(this._viewCacheMisses);
       const viewCacheHitRate = clampUnitRate(viewCacheHits, viewCacheHits + viewCacheMisses);
       const viewCacheInvalidations = sanitizeNonNegativeCounter(this._viewCacheInvalidations);
+      const pressure = this.getVramPressure();
 
       return {
         countsByKind,
@@ -3903,6 +4202,12 @@
         softBudgetBytes: this.softBudgetBytes,
         budgetExceeded: this._budgetExceeded,
         budgetWarningCount: sanitizeNonNegativeCounter(this._budgetWarningCount),
+        perfProfile: this._perfProfileName,
+        vramReclaimTriggerRatio: this.vramReclaimTriggerRatio,
+        vramReclaimTargetRatio: this.vramReclaimTargetRatio,
+        vramPressureTier: pressure.tier,
+        vramUtilization: pressure.utilization,
+        vramShouldReclaim: pressure.shouldReclaim,
         totalRegistered: sanitizeNonNegativeCounter(this._totalRegistered),
         totalRetired: sanitizeNonNegativeCounter(this._totalRetired),
         totalDestroyed: sanitizeNonNegativeCounter(this._totalDestroyed),
@@ -4107,6 +4412,8 @@
   const exportsObj = Object.freeze({
     DEFAULT_FRAMES_IN_FLIGHT,
     DEFAULT_SOFT_BUDGET_BYTES,
+    DEFAULT_VRAM_RECLAIM_TRIGGER_RATIO,
+    DEFAULT_VRAM_RECLAIM_TARGET_RATIO,
     DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
     FAST_HANDLE_LIMIT,
     DEFAULT_MAX_STALE_HANDLE_HISTORY,
@@ -4131,6 +4438,7 @@
     RESOURCE_KINDS,
     VRAM_KIND,
     VRAM_KINDS,
+    VRAM_PRESSURE_TIER,
     resolveVramKind,
     isBcFormat,
     isSrgbFormat,
@@ -4162,6 +4470,8 @@
     module.exports = {
       DEFAULT_FRAMES_IN_FLIGHT,
       DEFAULT_SOFT_BUDGET_BYTES,
+      DEFAULT_VRAM_RECLAIM_TRIGGER_RATIO,
+      DEFAULT_VRAM_RECLAIM_TARGET_RATIO,
       DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
       FAST_HANDLE_LIMIT,
       DEFAULT_MAX_STALE_HANDLE_HISTORY,
@@ -4186,6 +4496,7 @@
       RESOURCE_KINDS,
       VRAM_KIND,
       VRAM_KINDS,
+      VRAM_PRESSURE_TIER,
       resolveVramKind,
       isBcFormat,
       isSrgbFormat,
