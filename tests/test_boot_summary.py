@@ -311,7 +311,57 @@ class BootSummaryTest(unittest.TestCase):
         self.assertRegex(reg_diff, r"first_visible_frame_s.*REGRESSION")
 
 
+class LaterFieldsTests(unittest.TestCase):
+    @staticmethod
+    def rep(root=4, cascade=10, unwritten=0, evict=3, waited=1.5, unpaired=0, scene_start=0):
+        r = base()
+        r["native_executor"].update({
+            "device_error_kinds": {"total": root + cascade, "root_total": root, "cascade_total": cascade, "other": 0,
+                                   "kinds": [{"count": cascade, "opcode": 7, "cascade": True, "text": "invalid cmd"},
+                                             {"count": root, "opcode": 9, "cascade": False, "text": "bad bind group"}]},
+            "command_buffers": 50, "usage_scope_splits": 6, "usage_buffer_snapshots": 2, "usage_texture_snapshots": 1,
+            "storage_alias_copies": 4, "storage_alias_unfixable": 1, "bind_group_unfilterable_dummies": 0})
+        r["gpu_work"].update({"query_begins": 5, "query_ends": 5, "query_resolves": 2, "query_occlusion_ops": 4,
+                              "query_timestamp_ops": 3, "query_other_ops": 0, "query_results_unwritten": unwritten})
+        r["small_texture_pool"] = {"address_misses": 9, "address_evictions": evict, "address_recreates": 1}
+        r["boot_lock"] = {"enabled": True, "waited_s": waited}
+        r["guest_probes"] = {"enabled": True, "lines": 7, "probes": [
+            {"name": "f", "addr": "0x1000", "calls": 12, "entry_calls": 6, "exit_calls": 6, "exit_unpaired": unpaired}]}
+        r["present_samples"] = [{"wall_ms": scene_start + i * 100, "draws": 60} for i in range(40)]
+        return r
+
+    def test_summary_lines(self):
+        out = bs.summarize(self.rep())
+        for frag in ("device errors: 4 root, 10 cascade, 0 other (14 total)", "root kind: 4 x op 9: bad bind group",
+                     "queries: 5 begins, 5 ends, 2 resolves (occlusion 4, timestamp 3, other 0), 0 results unwritten",
+                     "usage scopes: 6 splits, 2 buffer + 1 texture copies; storage alias: 4 copies, 1 unfixable",
+                     "command buffers: 50", "bind group unfilterable dummies: 0",
+                     "address textures: 3 evictions, 1 recreates, 9 misses", "boot lock: on, waited 1.5 s",
+                     "guest probes: 1 probes, 12 calls", "probe f 0x1000: 12 calls", "screen flow flow: scene"):
+            self.assertIn(frag, out)
+        self.assertNotIn("invalid cmd", out.split("root kind")[1])
+
+    def test_absent_fields_skipped(self):
+        out = bs.summarize(base())
+        for frag in ("queries:", "usage scopes:", "command buffers:", "address textures:", "boot lock:",
+                     "guest probes:", "device errors:"):
+            self.assertNotIn(frag, out)
+
+    def test_compare_directions(self):
+        a = self.rep()
+        b = self.rep(root=9, cascade=20, unwritten=3, evict=8, waited=30.0, unpaired=2, scene_start=5000)
+        out = bs.compare(a, b)
+        rows = {ln.split()[0]: ln for ln in out.splitlines() if "." in ln.split()[0]}
+        for k in ("device_error_kinds.root_total", "device_error_kinds.cascade_total", "gpu_work.query_results_unwritten",
+                  "small_texture_pool.address_evictions", "boot_lock.waited_s", "guest_probes.exit_unpaired",
+                  "screen_flow.scene_ms"):
+            self.assertIn("REGRESSION", rows[k], k)
+        better = bs.compare(b, a)
+        self.assertIn("improvement", [ln for ln in better.splitlines() if ln.startswith("boot_lock.waited_s")][0])
+
+
 if __name__ == "__main__":
+
     unittest.main()
 
 

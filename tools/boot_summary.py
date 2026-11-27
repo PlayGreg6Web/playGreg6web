@@ -24,6 +24,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import guest_symbols as gs  # noqa: E402
+import screen_flow as sf  # noqa: E402
 
 HARD_STOPS = Path(__file__).resolve().parent.parent / "docs" / "HARD_STOPS.md"
 
@@ -473,6 +474,54 @@ def timing_lines(report: dict[str, Any]) -> list[str]:
     return out
 
 
+def _new_field_lines(report: dict[str, Any]) -> list[str]:
+    """Lines for the later boot-report fields (queries, usage scopes, alias copies, command buffers, address
+    textures, unfilterable dummies, boot lock, guest probes, screen flow); each is skipped when absent."""
+    L: list[str] = []
+    ne = _d(report.get("native_executor"))
+    gw = _d(report.get("gpu_work"))
+    if any(k in gw for k in _QUERY_KEYS):
+        L.append(f"queries: {_i(gw.get('query_begins'))} begins, {_i(gw.get('query_ends'))} ends, "
+                 f"{_i(gw.get('query_resolves'))} resolves (occlusion {_i(gw.get('query_occlusion_ops'))}, timestamp "
+                 f"{_i(gw.get('query_timestamp_ops'))}, other {_i(gw.get('query_other_ops'))}), "
+                 f"{_i(gw.get('query_results_unwritten'))} results unwritten")
+    if any(k in ne for k in _SCOPE_KEYS):
+        L.append(f"usage scopes: {_i(ne.get('usage_scope_splits'))} splits, {_i(ne.get('usage_buffer_snapshots'))} buffer + "
+                 f"{_i(ne.get('usage_texture_snapshots'))} texture copies; storage alias: "
+                 f"{_i(ne.get('storage_alias_copies'))} copies, {_i(ne.get('storage_alias_unfixable'))} unfixable")
+    if "command_buffers" in ne:
+        L.append(f"command buffers: {_i(ne.get('command_buffers'))}")
+    if "bind_group_unfilterable_dummies" in ne:
+        L.append(f"bind group unfilterable dummies: {_i(ne.get('bind_group_unfilterable_dummies'))}")
+    stp = _d(report.get("small_texture_pool"))
+    if "address_evictions" in stp or "address_recreates" in stp:
+        L.append(f"address textures: {_i(stp.get('address_evictions'))} evictions, {_i(stp.get('address_recreates'))} "
+                 f"recreates, {_i(stp.get('address_misses'))} misses")
+    bl = _d(report.get("boot_lock"))
+    if bl:
+        L.append(f"boot lock: {'on' if bl.get('enabled') else 'off'}, waited {_n(bl.get('waited_s')):.1f} s")
+    gp = _d(report.get("guest_probes"))
+    if gp.get("enabled"):
+        probes = [p for p in gp.get("probes") or [] if isinstance(p, dict)]
+        L.append(f"guest probes: {len(probes)} probes, {_i(sum(_n(p.get('calls')) for p in probes))} calls, "
+                 f"{_i(gp.get('lines'))} lines logged, {_i(sum(_n(p.get('exit_unpaired')) for p in probes))} exit unpaired")
+        for p in sorted(probes, key=lambda p: -_n(p.get("calls")))[:5]:
+            L.append(f"  probe {p.get('name')} {p.get('addr')}: {_i(p.get('calls'))} calls "
+                     f"(entry {_i(p.get('entry_calls'))}, exit {_i(p.get('exit_calls'))}, unpaired {_i(p.get('exit_unpaired'))})")
+    if report.get("present_samples"):
+        try:
+            L += ["screen flow " + ln if i == 0 else ln for i, ln in
+                  enumerate(sf.render(sf.detect_from_report(report)).splitlines())]
+        except (TypeError, ValueError, KeyError):
+            pass
+    return L
+
+
+_QUERY_KEYS = ("query_begins", "query_ends", "query_resolves", "query_results_unwritten")
+_SCOPE_KEYS = ("usage_scope_splits", "usage_buffer_snapshots", "usage_texture_snapshots", "storage_alias_copies",
+               "storage_alias_unfixable")
+
+
 def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_stops: str | None = None) -> str:
     L: list[str] = []
     L += _identity(report)
@@ -540,6 +589,14 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
     kinds = [k for k in _d(ne.get("device_error_kinds")).get("kinds") or [] if isinstance(k, dict)]
     for k in kinds[:3]:
         L.append(f"  gpu error kind: {_i(k.get('count'))} x op {k.get('opcode')}: {str(k.get('text') or '')[:140]}")
+    dek = _d(ne.get("device_error_kinds"))
+    if dek:
+        L.append(f"device errors: {_i(dek.get('root_total'))} root, {_i(dek.get('cascade_total'))} cascade, "
+                 f"{_i(dek.get('other'))} other ({_i(dek.get('total'))} total)")
+        roots = [k for k in dek.get("kinds") or [] if isinstance(k, dict) and not k.get("cascade")]
+        for k in roots[:5]:
+            L.append(f"  root kind: {_i(k.get('count'))} x op {k.get('opcode')}: {str(k.get('text') or '')[:140]}")
+    L += _new_field_lines(report)
     if ne:
         L.append(f"shader pack: {_i(ne.get('shader_pack_hits'))} hits, {_i(ne.get('shader_pack_misses'))} misses")
         L.append(f"native executor: {_i(ne.get('frames_submitted'))} frames, {_i(ne.get('draws'))} draws "
@@ -647,17 +704,38 @@ def numeric_facts(report: dict[str, Any]) -> dict[str, float]:
     if f:
         facts.update({f"fps_{k}": v for k, v in f.items() if k != "n"})
     for sec, keys in (("native_executor", ("device_errors", "op_errors", "packet_errors", "shader_pack_hits",
-                                            "shader_pack_misses", "draws", "draws_skipped", "frames_submitted")),
+                                            "shader_pack_misses", "draws", "draws_skipped", "frames_submitted", "command_buffers", "usage_scope_splits",
+                                            "usage_buffer_snapshots", "usage_texture_snapshots",
+                                            "storage_alias_copies", "storage_alias_unfixable",
+                                            "bind_group_unfilterable_dummies")),
+                      ("small_texture_pool", ("address_evictions", "address_recreates")),
+                      ("boot_lock", ("waited_s",)),
                       ("audio", ("xapu_decoded_packets", "xapu_failed_packets", "non_silent_fraction")),
                       ("audio_files", ("audio_open_ok", "audio_open_failed")),
                       ("audio_out", ("frames_played", "underruns")),
                       ("bink", ("total_calls",)),
                       ("pipeline_prewarm", ("prewarmed", "hit_before_use", "wasted", "failed")),
-                      ("gpu_work", ("draws_emitted", "draws_no_shader_module", "draws_dropped_by_bridge"))):
+                      ("gpu_work", ("draws_emitted", "draws_no_shader_module", "draws_dropped_by_bridge") + _QUERY_KEYS
+                       + ("query_occlusion_ops", "query_timestamp_ops", "query_other_ops"))):
         for k in keys:
             v = _d(report.get(sec)).get(k)
             if _is_num(v):
                 facts[f"{sec}.{k}"] = float(v)
+    dek = _d(_d(report.get("native_executor")).get("device_error_kinds"))
+    for k in ("root_total", "cascade_total"):
+        if _is_num(dek.get(k)):
+            facts[f"device_error_kinds.{k}"] = float(dek[k])
+    probes = [p for p in _d(report.get("guest_probes")).get("probes") or [] if isinstance(p, dict)]
+    if probes:
+        facts["guest_probes.calls"] = float(sum(_n(p.get("calls")) for p in probes))
+        facts["guest_probes.exit_unpaired"] = float(sum(_n(p.get("exit_unpaired")) for p in probes))
+    if report.get("present_samples"):
+        try:
+            scene = sf.detect_from_report(report).get("scene_ms")
+        except (TypeError, ValueError, KeyError):
+            scene = None
+        if _is_num(scene):
+            facts["screen_flow.scene_ms"] = float(scene)
     summary_sec = _d(report.get("summary"))
     for k in ("present_fps_avg", "fps_steady_avg", "fps_p50_window", "fps_max_window",
               "windows_ge_30fps_pct", "first_visible_frame_s", "black_loading_s",
@@ -728,7 +806,9 @@ HIGHER_BETTER = ("fps_", "presents", "frames_played", "shader_pack_hits", "xapu_
 LOWER_BETTER = ("errors", "failures", "misses", "underruns", "hitches", "drops", "failed", "wasted", "elapsed_ms",
                 "late_pct", "missed_vblanks", "binding_fallbacks", "draws_skipped", "no_shader_module", "peak",
                 "draws_dropped_by_bridge", "black_loading", "first_visible_frame", "overshoot", "lookup_null",
-                "_ms_per_frame")
+                "_ms_per_frame", "root_total", "cascade_total", "unwritten", "evictions", "recreates", "waited",
+                "alias_copies", "unfixable", "unfilterable_dummies", "scope_splits", "snapshots", "exit_unpaired",
+                "scene_ms")
 
 
 def _direction(key: str) -> int:
