@@ -138,6 +138,8 @@ def _link_tree(src: Path, dst: Path) -> None:
 def clear_program(program: Path, keep: Iterable[str] = PROGRAM_KEEP) -> None:
     """Removes the lift output from `program` (keeps the names in `keep`). Its files may be hard
     links into the lift cache, so they are unlinked before a lift, never rewritten in place."""
+    import prebuilt_guard  # noqa: PLC0415
+    prebuilt_guard.refuse_inside_prebuilt(program, "clear the program in")
     if not program.is_dir():
         return
     keep = set(keep) - {LIFT_STAMP}

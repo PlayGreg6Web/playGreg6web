@@ -29,6 +29,12 @@ build succeeded, so your playable copy is never broken; it records the source co
 `.\tools\play_native.ps1 -Prebuilt` starts it with `-TrustBuild` semantics (never builds) and prints the build's commit and
 how many commits it is behind `origin/main`. If commits since then touched `runtime/`, `recomp/`, `shaders/` or the boot harness, it also prints one "Prebuilt is N runtime commits behind" line plus the 3 newest subjects (`tools/prebuilt_stale.py`; informational only, never blocks or rebuilds). To use another folder: `$env:PLAYGTA6_PREBUILT_DIR = "D:\pg6-play"`.
 
+**A prebuilt is read-only for the runners.** Runs from a prebuilt (any directory holding `prebuilt.json`, native or web) go to
+`%LOCALAPPDATA%\playgta6uns\<prebuilt-name>\<run>\` (else the sibling `<dir>-runs`); `-DryRun` and the run print that path. Nothing is created inside
+the prebuilt: no `runs/`, no `.build.lock` (it lives next to the runs), no `.playgta6-build-dir` marker. An explicit `--runs-dir` inside a prebuilt is an
+error, and `lift_cache.clear_program`, `clean_build_dirs` and its `remove_tree` refuse any target inside a prebuilt (`tools/prebuilt_guard.py`), so a
+"delete program/" cleanup can never empty it. `tools/run_history.py` finds both the new location and legacy runs inside a prebuilt.
+
 **Controls** (full table and `keymap.ini` details further down):
 
 | Key | Action |

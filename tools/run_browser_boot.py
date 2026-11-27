@@ -93,6 +93,7 @@ import compare_boot_reports  # noqa: E402
 import guest_symbols  # noqa: E402
 import stop_message  # noqa: E402
 import clean_build_dirs  # noqa: E402
+import prebuilt_guard  # noqa: E402
 import lift_cache  # noqa: E402
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
@@ -6460,7 +6461,12 @@ def _run(
     input_mode = "input-script" if input_script is not None else ("cdp-enter" if cdp_send_input else "none")
 
     build_dir = resolve_against_repo(args.build_dir or DEFAULT_BUILD_DIR_REL, repo)
-    runs_dir = resolve_against_repo(args.runs_dir or (build_dir / "runs"), repo)
+    runs_dir = resolve_against_repo(args.runs_dir or prebuilt_guard.default_runs_dir(build_dir) or (build_dir / "runs"), repo)
+    if prebuilt_guard.containing_prebuilt(build_dir) is not None:
+        if prebuilt_guard.containing_prebuilt(runs_dir) is not None:
+            raise RunnerError(f"--runs-dir {runs_dir} is inside the prebuilt build "
+                              f"{prebuilt_guard.containing_prebuilt(build_dir)}; a prebuilt stays read-only")
+        print(f"[prebuilt] runs go to {runs_dir} (the prebuilt build is never written)", file=sys.stderr, flush=True)
     boot_dir = resolve_against_repo(args.boot_dir or DEFAULT_BOOT_DIR_REL, repo)
     out_dir = resolve_against_repo(args.out_dir or DEFAULT_OUT_DIR_REL, repo)
     web_dir = resolve_against_repo(args.web_dir, repo) if args.web_dir else repo / "web"
@@ -6678,12 +6684,14 @@ def _run(
         )
 
     if args.build_only:
-        clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
+        if prebuilt_guard.containing_prebuilt(build_dir) is None:
+            clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
         print("[build-only] build stages and shader staging complete", file=sys.stderr, flush=True)
         return 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
+    if prebuilt_guard.containing_prebuilt(build_dir) is None:
+        clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
     print(f"[run] {repo_relative_label(run_dir, repo)}", file=sys.stderr, flush=True)
 
     shared_profile_dir: Path | None = None

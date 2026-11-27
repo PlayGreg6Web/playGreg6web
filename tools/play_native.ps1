@@ -74,6 +74,9 @@ if ($Prebuilt) {
         if ($LASTEXITCODE -eq 0 -and "$n" -match '^\d+$') { $behind = $n }
     } catch { }
     Write-Host "[prebuilt] $pdir built from $pc ($behind commits behind origin/main). Refresh: .\tools\update_prebuilt.ps1"
+    $RunsDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "playgta6
+uns\$(Split-Path -Leaf ([IO.Path]::GetFullPath($pdir)))" } else { "$([IO.Path]::GetFullPath($pdir).TrimEnd(''))-runs" }
+    Write-Host "[prebuilt] runs go to $RunsDir (the prebuilt itself is never written)"
     if ($DryRun) { Write-Host "[dry-run] python tools/prebuilt_stale.py --prebuilt $pdir --repo $repo" }
     try { & python (Join-Path $PSScriptRoot "prebuilt_stale.py") --prebuilt $pdir --repo $repo } catch { }
 }
@@ -98,6 +101,7 @@ if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
 if ($SaveDir) { $argv += @("--save-dir", $SaveDir) }
 if ($DryRun) {
+    if ($Prebuilt) { Write-Host "[dry-run] run dir: $(Join-Path $RunsDir $Name)" }
     Write-Host "[dry-run] build dir: $BuildDir; run name: $Name; input script: $InputScript (preset $preset); shader pack: $(if ($ShaderPack) { $ShaderPack } else { '(auto-picked by run_native_boot.py)' })"
     Write-Host "[dry-run] python $($argv -join ' ')"
     exit 0

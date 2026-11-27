@@ -142,7 +142,18 @@ def discover(roots: list[Path], pattern: str, prebuilt_dir: Path | None) -> list
         except OSError:
             pass
     if prebuilt_dir and prebuilt_dir.is_dir():
-        builds += [c for c in sorted(prebuilt_dir.iterdir()) if (c / "runs").is_dir()]
+        builds += [c for c in sorted(prebuilt_dir.iterdir()) if c.name != "runs" and (c / "runs").is_dir()]  # legacy: runs inside the prebuilt
+    # current layout (tools/prebuilt_guard.py): <prebuilt_dir>/runs/<prebuilt-name>/<run>; the build dir is <prebuilt_dir>/<prebuilt-name>
+    outside = (prebuilt_dir / "runs") if prebuilt_dir else None
+    out_pairs: list[tuple[Path, Path]] = []
+    if outside is not None and outside.is_dir():
+        for rr in sorted(outside.iterdir()):
+            try:
+                for rd in sorted(rr.iterdir()):
+                    if (rd / "boot-report.json").is_file():
+                        out_pairs.append((rd, prebuilt_dir / rr.name))
+            except OSError:
+                pass
     out: list[tuple[Path, Path]] = []
     for b in builds:
         try:
@@ -151,7 +162,7 @@ def discover(roots: list[Path], pattern: str, prebuilt_dir: Path | None) -> list
                     out.append((rd, b))
         except OSError:
             pass
-    return out
+    return out + out_pairs
 
 
 def parse_since(s: str | None, now: float | None = None) -> float | None:

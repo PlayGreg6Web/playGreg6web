@@ -44,6 +44,9 @@ if ($Prebuilt) {
         throw "No prebuilt build in $PrebuiltDir. Create it with: .\tools\update_prebuilt.ps1 -Web"
     }
     $TrustBuild = $true
+    $RunsDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "playgta6
+uns\$(Split-Path -Leaf $PrebuiltDir)" } else { "$($PrebuiltDir.TrimEnd(''))-runs" }
+    Write-Host "[prebuilt] runs go to $RunsDir (the prebuilt itself is never written)"
     & python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $PrebuiltDir --repo $repo
     if ($DryRun) { Write-Host "[dry-run] python tools/prebuilt_stale.py --prebuilt $PrebuiltDir --repo $repo --web" }
     try { & python (Join-Path $PSScriptRoot "prebuilt_stale.py") --prebuilt $PrebuiltDir --repo $repo --web } catch { }
@@ -100,6 +103,7 @@ if ($Prebuilt) {
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
 if ($DryRun) {
+    if ($Prebuilt) { Write-Host "[dry-run] run dir: $(Join-Path $RunsDir $Name)" }
     Write-Host "[dry-run] build dir: $BuildDir; run name: $Name; input script: $InputScript; shader pack: $(if ($ShaderPack) { $ShaderPack } else { '(none)' })"
     Write-Host "[dry-run] python $($argv -join ' ')"
     exit 0

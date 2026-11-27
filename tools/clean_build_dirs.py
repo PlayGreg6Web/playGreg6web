@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+import prebuilt_guard
+
 MARKER = ".playgta6-build-dir"
 REPO = Path(__file__).resolve().parent.parent
 
@@ -128,6 +130,8 @@ def check_candidate(path: Path, repo: Path, min_age_min: float, now: float | Non
     repo = repo.resolve()
     if _is_link(path):
         return False, "is a symlink/junction"
+    if prebuilt_guard.containing_prebuilt(path) is not None:
+        return False, "is (inside) a prebuilt build (prebuilt.json)"
     if not path.is_dir():
         return False, "not a directory"
     real = path.resolve()
@@ -163,7 +167,8 @@ def _remove_link(p: Path) -> None:
 
 
 def remove_tree(root: Path) -> None:
-    """Delete root without ever following links out of it."""
+    """Delete root without ever following links out of it (never inside a prebuilt)."""
+    prebuilt_guard.refuse_inside_prebuilt(root)
     stack: list[tuple[Path, bool]] = [(root, False)]
     while stack:
         d, visited = stack.pop()

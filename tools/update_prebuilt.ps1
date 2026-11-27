@@ -98,7 +98,7 @@ $Dir = [IO.Path]::GetFullPath($Dir)
 $tmp = "$Dir.new"; $old = "$Dir.old"
 if ($DryRun) {
     Write-Host "[dry-run] native prebuilt: $Dir (build in $tmp, old copy kept as $old until the swap succeeded)"
-    Write-Host "[dry-run] smoke gate: $(if ($SkipSmoke) { 'skipped (-SkipSmoke)' } else { "python tools/run_native_boot.py --preset menu-flow --name prebuilt-smoke --live-executor --trust-build --build-dir $tmp --max-ms 75000; then python tools/prebuilt_smoke.py <run dir>" })"
+    Write-Host "[dry-run] smoke gate: $(if ($SkipSmoke) { 'skipped (-SkipSmoke)' } else { "python tools/run_native_boot.py --preset menu-flow --name prebuilt-smoke --live-executor --trust-build --build-dir $tmp --runs-dir $tmp-smoke-runs --max-ms 75000; then python tools/prebuilt_smoke.py <run dir>" })"
     exit 0
 }
 if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
@@ -120,13 +120,14 @@ try {
     ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $tmp "prebuilt.json")
 if (-not $SkipSmoke) {
     $smokeName = "prebuilt-smoke"
-    $smokeRun = Join-Path $tmp "runs\$smokeName"
+    $smokeRuns = "$tmp-smoke-runs"  # outside the prebuilt (it is read-only for the runners)
+    $smokeRun = Join-Path $smokeRuns $smokeName
     Write-Host "[prebuilt] smoke boot from $tmp (headless, ~75 s)..."
     $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     Push-Location $repo
     try {
         & python tools/run_native_boot.py --preset menu-flow --name $smokeName --live-executor --trust-build `
-            --exe $Exe --game-dir $GameDir --build-dir $tmp --max-ms 75000 --watchdog-ms 105000
+            --exe $Exe --game-dir $GameDir --build-dir $tmp --runs-dir $smokeRuns --max-ms 75000 --watchdog-ms 105000
         & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") $smokeRun
         $smokeOk = ($LASTEXITCODE -eq 0)
     } finally { Pop-Location; $ErrorActionPreference = $eap }

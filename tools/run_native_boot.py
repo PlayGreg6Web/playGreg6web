@@ -97,6 +97,7 @@ import screen_timeline  # noqa: E402
 import stop_message  # noqa: E402
 import clean_build_dirs  # noqa: E402
 import build_guard  # noqa: E402
+import prebuilt_guard  # noqa: E402
 from lift_cache import (  # noqa: E402,F401 (re-exported for the tests)
     LIFT_CACHE_ENV, LIFT_CACHE_KEEP, LIFT_CACHE_KEEP_ENV, LIFT_CACHE_VERSION, LIFT_STAMP, PROGRAM_KEEP,
     clear_program, file_digest, lift_cache_dir, lift_cache_keep, lift_cache_restore, lift_cache_store,
@@ -1022,7 +1023,12 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     build_dir, note = choose_build_dir(repo, args.build_dir, env)
     if note:
         print(note, file=sys.stderr)
-    runs_dir = (args.runs_dir or build_dir / "runs").resolve()
+    runs_dir = (args.runs_dir or prebuilt_guard.default_runs_dir(build_dir, env) or build_dir / "runs").resolve()
+    if prebuilt_guard.containing_prebuilt(build_dir) is not None:
+        if prebuilt_guard.containing_prebuilt(runs_dir) is not None:
+            raise RunnerError(f"--runs-dir {runs_dir} is inside the prebuilt build "
+                              f"{prebuilt_guard.containing_prebuilt(build_dir)}; a prebuilt stays read-only")
+        print(f"[prebuilt] runs go to {runs_dir} (the prebuilt build is never written)", file=sys.stderr)
     preset = PRESETS[args.preset]
     name = args.name or f"{args.preset}-{time.strftime('%Y%m%d-%H%M%S')}"
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
@@ -1037,7 +1043,7 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         return _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset, run_dir,
                            lift_cache, recomp_cache)
     try:
-        with build_guard.build_dir_lock(build_dir):
+        with build_guard.build_dir_lock(build_dir, lock_dir=prebuilt_guard.lock_dir(build_dir, env)):
             return _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset,
                                run_dir, lift_cache, recomp_cache)
     except build_guard.BuildDirBusy as exc:
@@ -1175,7 +1181,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
         print(f"[build] done; harness {harness}", file=sys.stderr, flush=True)
         return 0
     run_dir.mkdir(parents=True, exist_ok=True)
-    clean_build_dirs.write_marker(build_dir, "run_native_boot.py", repo)
+    if prebuilt_guard.containing_prebuilt(build_dir) is None:
+        clean_build_dirs.write_marker(build_dir, "run_native_boot.py", repo)
     if preset["input"] and not args.input_script:
         script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)

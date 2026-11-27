@@ -112,11 +112,12 @@ def lock_holder(lock: Path) -> str:
 
 
 @contextmanager
-def build_dir_lock(build_dir: Path, stale_s: float | None = None) -> Iterator[Path]:
+def build_dir_lock(build_dir: Path, stale_s: float | None = None, lock_dir: Path | None = None) -> Iterator[Path]:
     """Holds `<build_dir>/.build.lock` for the duration; raises BuildDirBusy when another live run has it."""
     import build_native_boot  # noqa: PLC0415
-    build_dir.mkdir(parents=True, exist_ok=True)
-    lock = build_dir / BUILD_LOCK_NAME
+    lock_dir = build_dir if lock_dir is None else lock_dir  # outside a prebuilt (see prebuilt_guard.lock_dir)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = lock_dir / BUILD_LOCK_NAME
     for _ in range(2):  # the second try follows the removal of a stale lock
         if build_native_boot.try_lock(lock, stale_s):
             break
