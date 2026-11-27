@@ -19,6 +19,13 @@ Browser runs also hold `telemetry.json` and `console.log`. A guest fault in eith
 `fault_record` in `boot-report.json`; the native window stays open on the last frame titled `GUEST FAULT ...`
 and the console prints the fault report right away. Close the window to finish the report.
 
+The window also shows a box on the last frame, even with the F3 overlay off, and the launcher prints the same
+line at the end (`python tools\stop_message.py <run dir>` prints it again):
+
+- `Stopped: <slot> - this needs an owner decision (see docs/HARD_STOPS.md section 7). Not a crash.` An
+  unimplemented slot that [HARD_STOPS.md](HARD_STOPS.md) lists; nothing to report.
+- `Crashed: <kind> at <site> - report: <run dir>`: anything else. Follow this guide and send that report.
+
 ## Read it
 
 ```

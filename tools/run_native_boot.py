@@ -94,6 +94,7 @@ import compare_boot_reports  # noqa: E402
 import find_chrome  # noqa: E402
 import guest_symbols  # noqa: E402
 import screen_timeline  # noqa: E402
+import stop_message  # noqa: E402
 import clean_build_dirs  # noqa: E402
 import build_guard  # noqa: E402
 from lift_cache import (  # noqa: E402,F401 (re-exported for the tests)
@@ -210,6 +211,13 @@ def play_save_dir(fresh: bool, explicit: Path | None, env: Mapping[str, str], no
     return root.parent / f"fresh-{now}" if fresh else root
 
 
+def hard_stops_text() -> str | None:
+    try:
+        return HARD_STOPS_MD.read_text(encoding="utf-8") if HARD_STOPS_MD.is_file() else None
+    except OSError:
+        return None
+
+
 def watch_for_fault(run_dir: Path, done, out=None, poll_s: float = 0.5) -> None:
     """While the window is held open on a guest fault the harness has already written the report:
     print tools/fault_report.py's output to the console once it shows up."""
@@ -220,6 +228,7 @@ def watch_for_fault(run_dir: Path, done, out=None, poll_s: float = 0.5) -> None:
         if data and isinstance(data.get("fault_record"), dict):
             print("[play] the guest faulted; the window stays open on the last frame (close it to exit)",
                   file=out, flush=True)
+            stop_message.emit(stop_message.select(data, hard_stops_text(), run_dir) or "", out)
             try:
                 proc = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "fault_report.py"), str(report)],
                                       capture_output=True, text=True, timeout=60)
@@ -1170,6 +1179,9 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     if preset["input"] and not args.input_script:
         script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)
+    if args.play and not args.dry_run:
+        # The window banner (runtime/guest/stop_message.h) tells a pending owner decision from a crash with this list.
+        os.environ["PLAYGTA6_HARD_STOP_SLOTS"] = stop_message.pending_arg(hard_stops_text())
     watch_done = threading.Event()
     if args.play and not args.dry_run:
         threading.Thread(target=watch_for_fault, args=(run_dir, watch_done), daemon=True).start()
@@ -1212,6 +1224,9 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
         print(NL + "summary (tools/boot_summary.py):" + NL + boot_summary.render_path(run_dir))
     except (OSError, ValueError) as exc:
         print(f"[run] boot_summary failed: {exc}", file=sys.stderr)
+    stop_line = stop_message.select(report, hs_md, run_dir)
+    if stop_line:
+        stop_message.emit(NL + stop_line)
     hint = shader_pack_hint(report, args.shader_pack)
     if hint:
         print(hint)

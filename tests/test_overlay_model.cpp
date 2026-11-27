@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "gpu/native_exec/overlay_model.h"
+#include "guest/stop_message.h"
 #include "os/window_hotkeys.h"
 
 using namespace playgta6::gpu::native_exec;
@@ -105,6 +106,46 @@ int main() {
     // A box larger than the canvas is clipped, not overrun.
     std::vector<uint8_t> tiny(size_t{16} * 16 * 4, 7);
     overlay_composite(tiny, 16, 16, bm, 3, true);
+
+    // Stop message: a listed hard stop says "Stopped" and not a crash; anything else says "Crashed" with the report dir.
+    {
+        namespace sm = playgta6::guest::stop_message;
+        const auto pending = sm::parse_pending("xsystem/5/7;xuser/14/7;xstore/20/-;bogus");
+        CHECK(pending.size() == 3 && pending[0].iface == "xsystem" && pending[0].slot == 5 && pending[0].section == "7");
+        CHECK(pending[2].section.empty());
+        const std::string report =
+            "{\"status\": \"fault\", \"fault_record\": {\"kind\": \"\\u0075nimplemented_slot\", \"va\": \"0x140001000\", "
+            "\"unimplemented_slot\": {\"interface\": \"xgameruntime.XSystem\", \"guid\": \"{g}\", \"slot\": 5, "
+            "\"name\": \"XSystemGetAppSpecificDeviceId\"}, \"callers\": []}}";
+        const sm::Facts f = sm::facts_from_report(report, "H:/runs/x");
+        CHECK(f.kind == "unimplemented_slot" && f.site == "0x140001000" && f.slot == 5 && f.run_dir == "H:/runs/x");
+        const std::string stop = sm::select(f, pending);
+        CHECK(stop == "Stopped: XSystemGetAppSpecificDeviceId \xE2\x80\x94 this needs an owner decision (see docs/HARD_STOPS.md "
+                      "\xC2\xA7" "7). Not a crash.");
+        CHECK(sm::select(f, {}).rfind("Crashed: unimplemented_slot at 0x140001000", 0) == 0);  // not listed: a crash
+        CHECK(sm::select(f, sm::parse_pending("xsystem/6/-")).rfind("Crashed:", 0) == 0);
+        const std::string trap = "{\"fault_record\": {\"kind\": \"unknown_target\", \"va\": \"0x1400\", \"unimplemented_slot\": null}}";
+        const std::string crash = sm::select(sm::facts_from_report(trap, "H:/runs/y"), pending);
+        CHECK(crash == "Crashed: unknown_target at 0x1400 \xE2\x80\x94 report: H:/runs/y (see docs/WHEN_IT_CRASHES.md)");
+        CHECK(sm::select(sm::facts_from_report("{}", ""), pending).rfind("Crashed: fault at unknown site", 0) == 0);
+        // The banner box: ASCII only, wrapped to the banner width, amber for a stop, always sized by itself (F3 off).
+        const std::vector<std::string> rows = overlay_banner_lines(stop);
+        CHECK(!rows.empty() && rows.size() <= kBannerMaxLines);
+        for (const std::string& r : rows) {
+            CHECK(r.size() <= static_cast<size_t>(kBannerCols));
+            for (char c : r) CHECK(static_cast<unsigned char>(c) < 0x80);
+        }
+        CHECK(rows[0].rfind("Stopped: XSystemGetAppSpecificDeviceId -", 0) == 0);
+        OverlayStatus st;
+        st.banner = stop;
+        st.show_stats = false;
+        const OverlayBitmap box = render_overlay(st, OverlayHistory{});
+        CHECK(box.w == static_cast<uint32_t>(overlay_width(st)) && box.h == static_cast<uint32_t>(overlay_height(st)));
+        CHECK(box.h == kOverlayPad * 2 + rows.size() * kOverlayLineH);
+        st.show_stats = true;  // with F3 on the stats box grows by the banner rows and drops its own fault rows
+        st.fault = "something";
+        CHECK(overlay_height(st) > overlay_height(OverlayStatus{}) + static_cast<int>(rows.size()) * kOverlayLineH);
+    }
 
     // The hotkey: F3 by default, in the table with a help line.
     namespace wh = playgta6::os::window_hotkeys;

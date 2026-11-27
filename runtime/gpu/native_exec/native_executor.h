@@ -311,6 +311,8 @@ public:
     void set_overlay(bool on);
     bool overlay_enabled() const;
     void set_overlay_extra(int64_t audio_underruns, const std::string& fault);
+    // The stop message (guest/stop_message.h): a box that is drawn on the last frame even with the F3 overlay off.
+    void set_overlay_banner(const std::string& text);
     // --show-target at run time: selector grammar in show_target_model.h; "" switches it off. False + *error
     // for a selector that does not parse.
     bool set_show_target(const std::string& selector, std::string* error);

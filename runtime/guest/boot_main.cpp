@@ -131,6 +131,7 @@
 #endif
 #include "guest/input_script.h"
 #include "guest/keymap.h"
+#include "guest/stop_message.h"
 #include "gpu/gpu_va_watch.h"
 #include "gpu/present_pacing.h"
 #include "os/guest_heap.h"
@@ -868,6 +869,7 @@ std::atomic<bool> g_live_deadline_active{false};
 std::atomic<bool> g_live_stats_active{false};  // the 5 s [live] fps line thread  // the --max-ms watcher thread of a live run
 std::atomic<bool> g_guest_faulted{false};  // set before the window is held open on a fault
 std::string g_fault_text;                  // one-line fault summary for the overlay, written before g_guest_faulted
+std::string g_stop_message;                // the "Stopped: ..." / "Crashed: ..." banner (guest/stop_message.h), same timing
 
 // Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
 // of the newest interval, and the fault state.
@@ -915,6 +917,7 @@ void live_title_tick(ne::NativeExecutor& exec) {
     // Overlay extras (F3): live-audio underruns and why the guest stopped.
     exec.set_overlay_extra(g_audio_out_active ? static_cast<int64_t>(g_audio_feed.buffer().stats().underruns) : -1,
                            g_guest_faulted.load() ? g_fault_text : std::string());
+    exec.set_overlay_banner(g_guest_faulted.load() ? g_stop_message : std::string());
 }
 
 void live_observer(const uint8_t* data, size_t len) {
@@ -1067,6 +1070,16 @@ bool start_live_window() {
 void hold_window_on_fault(bool faulted, const std::string& summary) {
     if (!faulted || !g_live_started || !g_options.window || g_live.window_closed()) return;
     g_fault_text = summary.substr(0, summary.find('\n'));
+    {
+        namespace sm = playgta6::guest::stop_message;
+        const char* slots = std::getenv("PLAYGTA6_HARD_STOP_SLOTS");
+        std::string dir = g_options.report;
+        const size_t cut = dir.find_last_of("/\\");
+        dir = cut == std::string::npos ? std::string() : dir.substr(0, cut);
+        g_stop_message = sm::select(sm::facts_from_report(guest::last_report_json(), dir),
+                                    sm::parse_pending(slots != nullptr ? slots : ""));
+        std::fprintf(stderr, "[harness] %s\n", g_stop_message.c_str());
+    }
     write_text(g_options.report, guest::last_report_json());
     std::fprintf(stderr, "[harness] guest fault: window kept open on the last frame; close it to exit\n");
     std::fflush(stderr);

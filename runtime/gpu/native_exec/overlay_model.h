@@ -41,6 +41,8 @@ inline constexpr uint8_t kOverlayGlyphs[64][5] = {
 };
 
 inline constexpr int kOverlayCols = 34;  // characters per line
+inline constexpr int kBannerCols = 56;   // characters per line of the stop banner (always visible, wider than the stats box)
+inline constexpr size_t kBannerMaxLines = 9;
 inline constexpr int kOverlayPad = 4;
 inline constexpr int kOverlayGlyphW = 6, kOverlayLineH = 9;
 inline constexpr int kOverlayWidth = kOverlayPad * 2 + kOverlayCols * kOverlayGlyphW;  // 212
@@ -96,6 +98,8 @@ struct OverlayStatus {
     int64_t audio_underruns = -1;  // < 0: no live audio
     std::string present_mode;
     std::string fault;  // non-empty once the guest stopped: why (shown in red)
+    std::string banner;  // non-empty once the guest stopped: the full message (guest/stop_message.h), shown even with the stats off
+    bool show_stats = true;  // false: the banner box alone (F3 off)
 };
 
 // One row of text per entry, each no longer than kOverlayCols.
@@ -138,22 +142,92 @@ inline std::vector<std::string> overlay_fault_lines(const std::string& fault, si
     return out;
 }
 
+// The glyph font is ASCII only: the typographic dash and the section sign become "-" and "SECTION ".
+inline std::string overlay_ascii(const std::string& t) {
+    std::string o;
+    for (size_t i = 0; i < t.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(t[i]);
+        if (c == 0xE2 && i + 2 < t.size() && static_cast<unsigned char>(t[i + 1]) == 0x80 &&
+            (static_cast<unsigned char>(t[i + 2]) == 0x94 || static_cast<unsigned char>(t[i + 2]) == 0x93)) {
+            o += '-';
+            i += 2;
+        } else if (c == 0xC2 && i + 1 < t.size() && static_cast<unsigned char>(t[i + 1]) == 0xA7) {
+            o += "section ";
+            i += 1;
+        } else if (c < 0x80) {
+            o += static_cast<char>(c);
+        } else if ((c & 0xC0) != 0x80) {
+            o += '?';
+        }
+    }
+    return o;
+}
+
+// Word-wraps the banner to kBannerCols (a word longer than a row is split), at most kBannerMaxLines rows.
+inline std::vector<std::string> overlay_banner_lines(const std::string& banner) {
+    std::vector<std::string> out;
+    if (banner.empty()) return out;
+    const std::string text = overlay_ascii(banner);
+    std::string cur;
+    size_t pos = 0;
+    auto flush = [&] {
+        if (!cur.empty()) out.push_back(cur);
+        cur.clear();
+    };
+    while (pos < text.size()) {
+        while (pos < text.size() && text[pos] == ' ') ++pos;
+        size_t end = text.find(' ', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string word = text.substr(pos, end - pos);
+        pos = end;
+        while (!word.empty()) {
+            const size_t cols = static_cast<size_t>(kBannerCols);
+            const size_t room = cur.empty() ? cols : (cur.size() + 1 < cols ? cols - cur.size() - 1 : 0);
+            if (word.size() <= room) {
+                cur += (cur.empty() ? "" : " ") + word;
+                word.clear();
+            } else if (!cur.empty()) {
+                flush();
+            } else {
+                out.push_back(word.substr(0, kBannerCols));
+                word.erase(0, kBannerCols);
+            }
+        }
+    }
+    flush();
+    if (out.size() > kBannerMaxLines) {
+        out.resize(kBannerMaxLines);
+        std::string& last = out.back();
+        if (last.size() > kBannerCols - 3) last.resize(kBannerCols - 3);
+        last += "...";
+    }
+    return out;
+}
+
 struct OverlayBitmap {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> rgba;  // premultiplied, row-major, w * h * 4
 };
 
+inline int overlay_width(const OverlayStatus& s) {
+    return s.banner.empty() ? kOverlayWidth : kOverlayPad * 2 + kBannerCols * kOverlayGlyphW;
+}
+
 inline int overlay_height(const OverlayStatus& s) {
-    const int fault_rows = static_cast<int>(overlay_fault_lines(s.fault).size());
+    const int banner_rows = static_cast<int>(overlay_banner_lines(s.banner).size());
+    const int banner_h = banner_rows ? 2 + banner_rows * kOverlayLineH : 0;
+    if (!s.show_stats) return kOverlayPad * 2 + banner_h - (banner_rows ? 2 : 0);
+    // With a banner the F3 box drops its own (shorter) fault rows: the banner says it all.
+    const int fault_rows = banner_rows ? 0 : static_cast<int>(overlay_fault_lines(s.fault).size());
     return kOverlayPad * 2 + static_cast<int>(overlay_lines(s).size()) * kOverlayLineH + 2 + kOverlayGraphH + 2 +
-           (fault_rows ? 2 + fault_rows * kOverlayLineH : 0);
+           (fault_rows ? 2 + fault_rows * kOverlayLineH : 0) + banner_h;
 }
 
 // Rasterizes the box: translucent dark background, text, the frame-time graph (green; orange above 20 ms, red above
 // 33 ms; 50 ms at the top) and the fault text in red.
 inline OverlayBitmap render_overlay(const OverlayStatus& s, const OverlayHistory& hist) {
     OverlayBitmap bm;
-    bm.w = kOverlayWidth;
+    bm.w = static_cast<uint32_t>(overlay_width(s));
     bm.h = static_cast<uint32_t>(overlay_height(s));
     bm.rgba.assign(size_t{bm.w} * bm.h * 4, 0);
     auto put = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {  // straight colour, stored premultiplied
@@ -167,7 +241,7 @@ inline OverlayBitmap render_overlay(const OverlayStatus& s, const OverlayHistory
     for (uint32_t y = 0; y < bm.h; ++y)
         for (uint32_t x = 0; x < bm.w; ++x) put(static_cast<int>(x), static_cast<int>(y), 0, 0, 0, 166);  // ~65 % black
     auto text = [&](int x, int y, const std::string& t, uint8_t r, uint8_t g, uint8_t b) {
-        for (size_t i = 0; i < t.size() && static_cast<int>(i) < kOverlayCols; ++i) {
+        for (size_t i = 0; i < t.size() && static_cast<int>(i) < kBannerCols; ++i) {
             const uint8_t* gl = overlay_glyph(t[i]);
             for (int c = 0; c < 5; ++c)
                 for (int row = 0; row < 7; ++row)
@@ -175,6 +249,19 @@ inline OverlayBitmap render_overlay(const OverlayStatus& s, const OverlayHistory
         }
     };
     int y = kOverlayPad;
+    const std::vector<std::string> banner = overlay_banner_lines(s.banner);
+    // "Stopped: ..." (a decision is pending, not a crash) is amber, "Crashed: ..." red.
+    const bool is_stop = s.banner.compare(0, 8, "Stopped:") == 0;
+    auto draw_banner = [&] {
+        for (const std::string& t : banner) {
+            text(kOverlayPad, y, t, 255, is_stop ? 200 : 90, is_stop ? 60 : 90);
+            y += kOverlayLineH;
+        }
+    };
+    if (!s.show_stats) {
+        draw_banner();
+        return bm;
+    }
     const std::vector<std::string> lines = overlay_lines(s);
     for (size_t i = 0; i < lines.size(); ++i) {
         text(kOverlayPad, y, lines[i], 255, 255, 255);
@@ -198,7 +285,11 @@ inline OverlayBitmap render_overlay(const OverlayStatus& s, const OverlayHistory
             y += kOverlayGraphH + 2;
         }
     }
-    const std::vector<std::string> fl = overlay_fault_lines(s.fault);
+    const std::vector<std::string> fl = banner.empty() ? overlay_fault_lines(s.fault) : std::vector<std::string>();
+    if (!banner.empty()) {
+        y += 2;
+        draw_banner();
+    }
     if (!fl.empty()) {
         y += 2;
         for (const std::string& t : fl) {

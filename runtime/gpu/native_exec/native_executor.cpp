@@ -1029,10 +1029,10 @@ struct NativeExecutor::Impl {
         ++stats.surface_configures;
     }
 
-    // With the overlay on in a window the frame always goes through the intermediate texture, so the last frame
-    // survives the present and can be redrawn with the overlay (fault text after the guest stopped).
+    // In a window the frame always goes through the intermediate texture (one cheap copy), so the last frame
+    // survives the present and can be redrawn with the overlay / the stop banner after the guest stopped.
     bool blit_active() const {
-        return stream_format != swap_format || stream_w != swap_width || stream_h != swap_height || (window && overlay_on);
+        return stream_format != swap_format || stream_w != swap_width || stream_h != swap_height || window;
     }
 
     // ---- stats overlay (overlay_model.h): drawn after every copy of the guest's frame, never read back ----
@@ -1045,6 +1045,7 @@ struct NativeExecutor::Impl {
     double ov_gpu_ms = -1;
     int64_t ov_underruns = -1;
     std::string ov_fault;
+    std::string ov_banner;  // the stop message, drawn even with the stats overlay off
     wgpu::Texture ov_tex;
     wgpu::TextureView ov_view;
     uint32_t ov_tex_w = 0, ov_tex_h = 0;
@@ -1074,6 +1075,8 @@ struct NativeExecutor::Impl {
         s.present_mode = present_mode_name;
         if (gpu::present_pacer().honor_interval()) s.present_mode += " HONOR";
         s.fault = ov_fault;
+        s.banner = ov_banner;
+        s.show_stats = overlay_on;
         return s;
     }
 
@@ -1176,7 +1179,7 @@ struct NativeExecutor::Impl {
     void overlay_idle_redraw() {
         if (!window || !surface || lost || fatal || show_spec || !have_last_frame || !intermediate || frame_target) return;
         const uint64_t now = now_ns();
-        const bool due = overlay_dirty || (overlay_on && now - ov_last_present_ns > 250000000ull &&
+        const bool due = overlay_dirty || ((overlay_on || !ov_banner.empty()) && now - ov_last_present_ns > 250000000ull &&
                                            now - ov_redraw_ns > 250000000ull);
         if (!due) return;
         overlay_dirty = false;
@@ -1185,7 +1188,7 @@ struct NativeExecutor::Impl {
         if (!acquire_canvas(&t)) return;
         wgpu::CommandEncoder enc = device.CreateCommandEncoder();
         encode_blit(enc, t.canvas_view);
-        if (overlay_on) encode_overlay(enc, t.canvas_view);
+        if (overlay_on || !ov_banner.empty()) encode_overlay(enc, t.canvas_view);
         wgpu::CommandBuffer cb = enc.Finish();
         queue.Submit(1, &cb);
         surface.Present();
@@ -5038,7 +5041,7 @@ struct NativeExecutor::Impl {
                 e.enc.CopyTextureToBuffer(&src, &dst, &extent);
             }
         }
-        if (overlay_on) encode_overlay(e.enc, target.canvas_view);  // after every copy of the guest's frame
+        if (overlay_on || !ov_banner.empty()) encode_overlay(e.enc, target.canvas_view);  // after every copy of the guest's frame
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
         const uint64_t tp1 = now_ns();
@@ -5385,6 +5388,14 @@ void NativeExecutor::set_overlay_extra(int64_t audio_underruns, const std::strin
     s.ov_underruns = audio_underruns;
     if (fault != s.ov_fault) {
         s.ov_fault = fault;
+        s.overlay_dirty = true;
+    }
+}
+
+void NativeExecutor::set_overlay_banner(const std::string& text) {
+    Impl& s = *impl_;
+    if (text != s.ov_banner) {
+        s.ov_banner = text;
         s.overlay_dirty = true;
     }
 }
