@@ -526,6 +526,29 @@ void test_timer_resolution_raised() {
     CHECK(us[us.size() / 2] < 10000);
 }
 
+// Guest Sleep latency stats: overshoot histogram buckets, counts and the --timer-resolution switch.
+void test_guest_sleep_stats() {
+    namespace hs = playgta6::os::host_sleep;
+    using ms = std::chrono::microseconds;
+    hs::reset_guest_sleep_stats();
+    hs::record_guest_sleep(ms(1000), ms(1200));    // +0.2 ms -> lt0.5
+    hs::record_guest_sleep(ms(1000), ms(15600));   // +14.6 ms -> lt16
+    hs::record_guest_sleep(ms(1000), ms(900));     // early -> lt0.5
+    const std::string j = hs::guest_sleep_stats_json();
+    CHECK(j.find("\"count\": 3") != std::string::npos);
+    CHECK(j.find("\"lt0.5\": 2") != std::string::npos);
+    CHECK(j.find("\"lt16\": 1") != std::string::npos);
+    CHECK(j.find("\"max_overshoot_ms\": 14.600") != std::string::npos);
+    hs::set_mode(hs::Mode::Default);
+    CHECK(hs::mode() == hs::Mode::Default);
+    const auto t0 = Clock::now();
+    hs::sleep_for(std::chrono::milliseconds(2));  // plain sleep path still waits
+    CHECK(Clock::now() - t0 >= std::chrono::milliseconds(1));
+    CHECK(hs::guest_sleep_stats_json().find("\"default\"") != std::string::npos);
+    hs::set_mode(hs::Mode::OneMs);
+    hs::reset_guest_sleep_stats();
+}
+
 int main() {
     std::printf("test_present_pacing\n");
     test_vblank_clock();
@@ -545,6 +568,7 @@ int main() {
     test_frame_time_hist();
     test_host_sleep_is_precise();
     test_timer_resolution_raised();
+    test_guest_sleep_stats();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_present_pacing: %d failure(s)\n", g_failures);
         return 1;

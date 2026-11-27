@@ -648,7 +648,10 @@ void pg6_win32_sleep(uint32_t milliseconds) {
     // Precise (os/host_sleep.h): titles poll with Sleep(1), which the host timer tick stretched to
     // ~16 ms per poll.
     const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Sleep);
-    playgta6::os::host_sleep::sleep_for(std::chrono::milliseconds(milliseconds));
+    const auto requested = std::chrono::milliseconds(milliseconds);
+    const auto t0 = std::chrono::steady_clock::now();
+    playgta6::os::host_sleep::sleep_for(requested);
+    playgta6::os::host_sleep::record_guest_sleep(requested, std::chrono::steady_clock::now() - t0);
 }
 
 int32_t pg6_win32_initialize_critical_section_and_spin_count(Pg6CriticalSection* critical_section,

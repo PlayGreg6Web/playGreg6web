@@ -22,6 +22,7 @@
 //   --max-ms <n>         stop after n ms, checked at dispatches (0 = unbounded)
 //   --watchdog-ms <n>    hard limit: report and terminate even without dispatches (default 0)
 //   --present-interval honor|min1  title-driven present gap: honor = the title's sync interval (30 fps menus like the console), min1 = 1 vblank (default)
+//   --timer-resolution 1ms|default  host timer: 1ms (default) raises the OS tick + high-resolution sleeps; default = OS tick (A/B baseline)
 //   --skip-shader <hash>[,<hash>]  native executor: skip every draw / dispatch of these shaders (diagnostic; counted as `quarantined` in the drop table)
 //   --skip-shader-file <path>  same, one `<hash> [reason] [issue]` per line; the repo list runtime/gpu/native_exec/shader_quarantine.txt is loaded too when present (--no-quarantine-list skips it)
 //   --profile-guest[=hz] opt-in sampling profiler (Windows, default 1000 Hz): suspends each guest thread, maps the host RIP and stack to
@@ -381,6 +382,11 @@ bool parse(int argc, char** argv, Options& o) {
             const std::string v = argv[++i];
             if (v != "honor" && v != "min1") return false;
             o.present_honor_interval = v == "honor";
+        } else if (a == "--timer-resolution" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "1ms" && v != "default") return false;
+            playgta6::os::host_sleep::set_mode(v == "1ms" ? playgta6::os::host_sleep::Mode::OneMs
+                                                          : playgta6::os::host_sleep::Mode::Default);
         } else if (a == "--profile-guest" || a.rfind("--profile-guest=", 0) == 0) {
             o.profile_guest = true;
             if (a.size() > 15) {

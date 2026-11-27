@@ -27,6 +27,7 @@
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/frame_breakdown.h"
+#include "os/host_sleep.h"
 #include "os/thread_name.h"
 #include "os/thread_spans.h"
 #include "gpu/frame_time_hist.h"
@@ -3064,6 +3065,7 @@ std::string build_report() {
         o += "  \"frame_times\": " + b.frame_times.to_json() + ",\n";
         o += "  \"frame_breakdown\": " + b.frame_breakdown.to_json() + ",\n";
     }
+    o += "  \"guest_sleep\": " + os::host_sleep::guest_sleep_stats_json() + ",\n";
     // R40: per-present samples without a GPU capture (the last gpu::PresentSampleRing::kDefaultCapacity).
     {
         std::lock_guard<std::mutex> lock(b.mutex);

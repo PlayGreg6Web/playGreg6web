@@ -7,6 +7,7 @@
 // which ignores the timer tick; elsewhere (and if that timer cannot be created) the standard sleep.
 
 #include <chrono>
+#include <string>
 
 namespace playgta6::os::host_sleep {
 
@@ -23,5 +24,18 @@ inline void sleep_for(std::chrono::steady_clock::duration duration) {
 // limit becomes 16-31 ms frames and the title settles near 40 fps. Idempotent; the OS restores the
 // resolution at process exit.
 void raise_timer_resolution();
+
+// --timer-resolution 1ms|default. `default` keeps the OS tick: raise_timer_resolution() does nothing
+// and sleep_until uses the plain standard sleep (the A/B baseline). Set before the first use.
+enum class Mode { OneMs, Default };
+void set_mode(Mode mode);
+Mode mode();
+
+// Guest Sleep(ms) latency: requested vs actual wall time, as a histogram of the overshoot
+// (actual - requested). Recorded by the guest Sleep thunk; thread-safe, lock-free.
+void record_guest_sleep(std::chrono::steady_clock::duration requested, std::chrono::steady_clock::duration actual);
+void reset_guest_sleep_stats();
+// JSON object for the boot report: mode, count, mean/max requested and actual ms, overshoot buckets.
+std::string guest_sleep_stats_json();
 
 }  // namespace playgta6::os::host_sleep
