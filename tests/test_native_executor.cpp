@@ -1240,7 +1240,7 @@ void test_pack_and_formats(NativeExecutor& ex) {
     }
     run(ex, pipes);
     CHECK(ex.stats().shader_materialized == before.shader_materialized + 1);
-    CHECK(ex.stats().shader_scans == before.shader_scans + 1);  // the entry point, resolved once
+    CHECK(ex.stats().shader_scans == before.shader_scans + 2);  // the entry point and the binding access, once each
     CHECK(ex.stats().slow_packets == before.slow_packets);
     CHECK(ex.stats_json().find("\"shader_materialize_max_hash\": \"0x") != std::string::npos);
 
