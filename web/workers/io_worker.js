@@ -3831,7 +3831,14 @@
 
                 if (coversCompleteChunk) {
                   const takeLen = Math.min(this.chunkSize, neededLen, availFromChunkStart);
-                  const chunkBytes = fetched.bytes.slice(relStart, relStart + takeLen);
+                  const chunkBytes =
+                    runItems.length === 1 &&
+                    relStart === 0 &&
+                    takeLen === fetched.bytes.byteLength &&
+                    fetched.bytes.byteOffset === 0 &&
+                    fetched.bytes.byteLength === fetched.bytes.buffer.byteLength
+                      ? fetched.bytes
+                      : fetched.bytes.slice(relStart, relStart + takeLen);
                   if (chunkBytes.byteLength > 0) {
                     this._putChunk(item.key, chunkBytes);
                     this._maybeWriteThroughOpfsL2(url, cStart, this.chunkSize, chunkBytes);
@@ -3873,7 +3880,13 @@
                 } else {
                   const relStart = cStart - single.actualStart;
                   const takeLen = Math.min(this.chunkSize, single.bytes.byteLength - relStart);
-                  const chunkBytes = single.bytes.slice(relStart, relStart + takeLen);
+                  const chunkBytes =
+                    relStart === 0 &&
+                    takeLen === single.bytes.byteLength &&
+                    single.bytes.byteOffset === 0 &&
+                    single.bytes.byteLength === single.bytes.buffer.byteLength
+                      ? single.bytes
+                      : single.bytes.slice(relStart, relStart + takeLen);
                   if (chunkBytes.byteLength > 0) {
                     this._putChunk(item.key, chunkBytes);
                     this._maybeWriteThroughOpfsL2(url, cStart, this.chunkSize, chunkBytes);
@@ -4222,7 +4235,7 @@
             }
 
             // Server returned a truncated 206 prefix of the slab; continue fetching remaining tail.
-            const parts = [first.bytes.slice(relStart, relStart + avail)];
+            const parts = [first.bytes.subarray(relStart, relStart + avail)];
             let filled = avail;
             let cursor = slabStart + avail;
             const maxContinuations = 64;
@@ -4247,7 +4260,7 @@
               if (nAvail <= 0) {
                 break;
               }
-              parts.push(next.bytes.slice(nRel, nRel + nAvail));
+              parts.push(next.bytes.subarray(nRel, nRel + nAvail));
               filled += nAvail;
               cursor += nAvail;
               if (next.reachedEof) {
@@ -5380,6 +5393,8 @@
       avgReadMs: 0,
       totalReadMs: 0,
       maxReadMs: 0,
+      rangeCacheSyncZeroCopyHits: 0,
+      rangeCacheReadIntoHits: 0,
     };
   }
 
@@ -5409,6 +5424,8 @@
       opfsL2WriteErrors: immStats.opfsL2WriteErrors,
       opfsL2Invalidations: immStats.opfsL2Invalidations,
       syncFastPathHits: mailboxStats.syncFastPathHits,
+      rangeCacheSyncZeroCopyHits: streamingStats.rangeCacheSyncZeroCopyHits,
+      rangeCacheReadIntoHits: streamingStats.rangeCacheReadIntoHits,
       dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
       dumpBytesWritten: dumpWriteStats.dumpBytesWritten,
       dumpWriteErrors: dumpWriteStats.dumpWriteErrors,
@@ -7617,6 +7634,107 @@
       return handle;
     }
 
+    _getRangeCacheFileSize(cache, cacheKey) {
+      if (!cache) {
+        return null;
+      }
+      if (typeof cache.getFileSize === 'function') {
+        const size = cache.getFileSize(cacheKey);
+        if (Number.isSafeInteger(size) && size >= 0) {
+          return size;
+        }
+      }
+      if (cache._fileSizes && typeof cache._fileSizes.get === 'function') {
+        let key = cacheKey;
+        if (typeof cache._normalizePathOrUrl === 'function') {
+          try {
+            key = cache._normalizePathOrUrl(cacheKey);
+          } catch {
+            key = cacheKey;
+          }
+        }
+        const size = cache._fileSizes.get(key);
+        if (Number.isSafeInteger(size) && size >= 0) {
+          return size;
+        }
+      }
+      return null;
+    }
+
+    _isSchedulerContended() {
+      const sched = this.scheduler;
+      if (!sched) {
+        return false;
+      }
+      if (typeof sched._inFlight !== 'number') {
+        // Custom scheduler mock without internal queue inspection: preserve scheduled dispatch.
+        return true;
+      }
+      if (sched._inFlight > 0) {
+        return true;
+      }
+      if (Array.isArray(sched._queues)) {
+        for (let i = 0; i < sched._queues.length; i += 1) {
+          if (sched._queues[i] && sched._queues[i].length > 0) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    _tryRangeCacheReadIntoSync(rangeCache, cacheKey, offset, reqLen, dst, dstOffset = 0) {
+      if (!rangeCache) {
+        return -1;
+      }
+      const hasSlice = typeof rangeCache.getCachedSlice === 'function';
+      const hasRangeInto = typeof rangeCache.readCachedRangeInto === 'function';
+      if (!hasSlice && !hasRangeInto) {
+        return -1;
+      }
+      const chunkSize = rangeCache.chunkSize;
+      const isSingleChunk =
+        Number.isInteger(chunkSize) &&
+        chunkSize > 0 &&
+        Math.floor(offset / chunkSize) === Math.floor((offset + reqLen - 1) / chunkSize);
+
+      if (hasSlice && (isSingleChunk || !hasRangeInto)) {
+        const slice = rangeCache.getCachedSlice(cacheKey, offset, reqLen);
+        if (slice instanceof Uint8Array) {
+          const avail = dst.byteLength - dstOffset;
+          const copyLen = Math.min(slice.byteLength, reqLen, avail);
+          if (copyLen > 0) {
+            if (copyLen <= 64) {
+              for (let j = 0; j < copyLen; j += 1) {
+                dst[dstOffset + j] = slice[j];
+              }
+            } else if (copyLen === slice.byteLength) {
+              dst.set(slice, dstOffset);
+            } else {
+              dst.set(slice.subarray(0, copyLen), dstOffset);
+            }
+          }
+          return copyLen;
+        }
+        // Single-chunk miss on real RangeCache: avoid redundant readCachedRangeInto Map lookup.
+        if (isSingleChunk) {
+          return -1;
+        }
+      }
+
+      if (hasRangeInto) {
+        const written =
+          dstOffset === 0
+            ? rangeCache.readCachedRangeInto(cacheKey, offset, reqLen, dst)
+            : rangeCache.readCachedRangeInto(cacheKey, offset, reqLen, dst, {
+                targetOffset: dstOffset,
+              });
+        return typeof written === 'number' && written >= 0 ? written : -1;
+      }
+
+      return -1;
+    }
+
     _readHandleFast(handle, offset, reqLen) {
       const entry = this._handles.get(handle);
       if (!entry) {
@@ -7661,6 +7779,27 @@
           }
           this._recordReadSuccess(syncBytes.byteLength, Math.max(0, this._now() - startMs));
           return syncBytes;
+        }
+      }
+      if (
+        entry.kind === 'direct' &&
+        !entry.useImmutableCache &&
+        !entry.wholeFilePending &&
+        this.rangeCache &&
+        typeof this.rangeCache.getCachedSlice === 'function'
+      ) {
+        const cacheKey = entry.cachePath || entry.path;
+        const slice = this.rangeCache.getCachedSlice(cacheKey, offset, reqLen);
+        if (slice instanceof Uint8Array) {
+          if (entry.size === null) {
+            const learnedSize = this._getRangeCacheFileSize(this.rangeCache, cacheKey);
+            if (Number.isSafeInteger(learnedSize)) {
+              entry.size = learnedSize;
+            }
+          }
+          this._streamingStats.rangeCacheSyncZeroCopyHits += 1;
+          this._recordReadSuccess(slice.byteLength, Math.max(0, this._now() - startMs));
+          return slice;
         }
       }
       return this.readHandle(handle, offset, reqLen);
@@ -8094,6 +8233,22 @@
       const controller = this;
 
       class IoWorkerMailboxHost extends BaseHost {
+        _decodeSabPath(pathLen) {
+          let scratch = this._pathDecodeScratch;
+          if (!scratch || scratch.byteLength < pathLen) {
+            scratch = new Uint8Array(Math.max(256, pathLen));
+            this._pathDecodeScratch = scratch;
+          }
+          if (pathLen <= 64) {
+            for (let i = 0; i < pathLen; i += 1) {
+              scratch[i] = this._payloadView[i];
+            }
+          } else {
+            scratch.set(this._payloadView.subarray(0, pathLen), 0);
+          }
+          return utf8Decoder.decode(scratch.subarray(0, pathLen));
+        }
+
         _handleOpen(lengthBig, cap) {
           if (lengthBig === 0n || lengthBig > BigInt(cap)) {
             this.completeResponse(-22n, HttpfsStatus.Error);
@@ -8101,9 +8256,7 @@
           }
 
           const pathLen = Number(lengthBig);
-          const copy = new Uint8Array(pathLen);
-          copy.set(this._payloadView.subarray(0, pathLen));
-          const rawPath = utf8Decoder.decode(copy);
+          const rawPath = this._decodeSabPath(pathLen);
           const openFlags = this._headerView.getBigUint64(mailboxMod.HttpfsOffsets.OFFSET, true);
           const writeFlag = (openFlags & HTTPFS_OPEN_FLAG_WRITE) !== 0n;
           const appendFlag = (openFlags & HTTPFS_OPEN_FLAG_APPEND) !== 0n;
@@ -8127,9 +8280,7 @@
             return;
           }
           const pathLen = Number(lengthBig);
-          const copy = new Uint8Array(pathLen);
-          copy.set(this._payloadView.subarray(0, pathLen));
-          const rawPath = utf8Decoder.decode(copy);
+          const rawPath = this._decodeSabPath(pathLen);
 
           const pending = controller.statHandle(rawPath);
           if (pending && typeof pending.then === 'function') {
@@ -8231,6 +8382,89 @@
                 this.completeResponse(BigInt(mapErrorToErrno(err, -5)), HttpfsStatus.Error);
               },
             );
+          }
+
+          // Direct zero-copy write into SAB payload view for RangeCache-backed handles
+          // (sync L1 getCachedSlice / readCachedRangeInto, and direct async readInto on miss).
+          if (entry.kind === 'direct' && !entry.useImmutableCache && !entry.wholeFilePending) {
+            const cacheKey = entry.cachePath || entry.path;
+            const rangeCache = controller.rangeCache;
+            if (rangeCache) {
+              let syncWritten;
+              try {
+                syncWritten = controller._tryRangeCacheReadIntoSync(
+                  rangeCache,
+                  cacheKey,
+                  offset,
+                  reqLen,
+                  this._payloadView,
+                  0,
+                );
+              } catch (err) {
+                controller._recordReadError(err);
+                this.completeResponse(BigInt(mapErrorToErrno(err, -5)), HttpfsStatus.Error);
+                return;
+              }
+              if (syncWritten >= 0) {
+                if (entry.size === null) {
+                  const learnedSize = controller._getRangeCacheFileSize(rangeCache, cacheKey);
+                  if (Number.isSafeInteger(learnedSize)) {
+                    entry.size = learnedSize;
+                  }
+                }
+                controller._streamingStats.rangeCacheSyncZeroCopyHits += 1;
+                controller._recordReadSuccess(syncWritten, Math.max(0, controller._now() - startMs));
+                this.completeResponse(BigInt(syncWritten), HttpfsStatus.ResponseReady);
+                return;
+              }
+            }
+
+            if (!controller._isSchedulerContended()) {
+              let ensuredCache = rangeCache;
+              if (!ensuredCache) {
+                try {
+                  ensuredCache = controller.ensureRangeCache();
+                } catch (err) {
+                  controller._recordReadError(err);
+                  this.completeResponse(BigInt(mapErrorToErrno(err, -19)), HttpfsStatus.Error);
+                  return;
+                }
+              }
+              if (ensuredCache && typeof ensuredCache.readInto === 'function') {
+                let readIntoPromise;
+                try {
+                  readIntoPromise = ensuredCache.readInto(
+                    cacheKey,
+                    offset,
+                    reqLen,
+                    this._payloadView,
+                    0,
+                  );
+                } catch (err) {
+                  controller._recordReadError(err);
+                  this.completeResponse(BigInt(mapErrorToErrno(err, -5)), HttpfsStatus.Error);
+                  return;
+                }
+                return Promise.resolve(readIntoPromise).then(
+                  (written) => {
+                    const n = Number.isInteger(written) && written >= 0 ? written : 0;
+                    if (entry.size === null) {
+                      const learnedSize = controller._getRangeCacheFileSize(ensuredCache, cacheKey);
+                      if (Number.isSafeInteger(learnedSize)) {
+                        entry.size = learnedSize;
+                      }
+                    }
+                    controller._streamingStats.rangeCacheReadIntoHits += 1;
+                    controller._recordReadSuccess(n, Math.max(0, controller._now() - startMs));
+                    this.completeResponse(BigInt(n), HttpfsStatus.ResponseReady);
+                  },
+                  (err) => {
+                    controller._recordReadError(err);
+                    this.completeResponse(BigInt(mapErrorToErrno(err, -5)), HttpfsStatus.Error);
+                  },
+                );
+              }
+            }
           }
 
           return super._handleRead(handle, offsetBig, lengthBig, cap);
@@ -8510,6 +8744,8 @@
         avgReadMs,
         totalReadMs: this._streamingStats.totalReadMs,
         maxReadMs: this._streamingStats.maxReadMs,
+        rangeCacheSyncZeroCopyHits: this._streamingStats.rangeCacheSyncZeroCopyHits,
+        rangeCacheReadIntoHits: this._streamingStats.rangeCacheReadIntoHits,
       };
 
       const totalOpfsHits =
@@ -8548,6 +8784,8 @@
         opfsL2WriteErrors: immutableCacheStats.opfsL2WriteErrors,
         opfsL2Invalidations: immutableCacheStats.opfsL2Invalidations,
         syncFastPathHits: mailboxStats.syncFastPathHits,
+        rangeCacheSyncZeroCopyHits: streamingStats.rangeCacheSyncZeroCopyHits,
+        rangeCacheReadIntoHits: streamingStats.rangeCacheReadIntoHits,
         // Top-level opt-in /pg6_dump/* write forwarding telemetry
         dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
         dumpBytesWritten: dumpWriteStats.dumpBytesWritten,
