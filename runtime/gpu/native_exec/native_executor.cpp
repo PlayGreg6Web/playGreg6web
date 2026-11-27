@@ -273,10 +273,15 @@ struct BglEntry {
     // Over a per-stage limit on its own (an invalid layout): its bind groups are recorded for the remap
     // but not created, and never bound (an invalid bind group in a pass invalidates the command buffer).
     bool over_limits = false;
+    bool invalid = false;  // Dawn rejected it (or it is over a limit): a pipeline layout using it is never created
 };
 
 struct PlEntry {
     wgpu::PipelineLayout layout;
+    // A group's layout is invalid: `layout` is null (never created, it would be an error object) and a
+    // pipeline that needs it as it is fails without being created. invalid_groups: bit g = group g.
+    bool invalid = false;
+    uint32_t invalid_groups = 0;
     bool group0_has_entries = false;
     // The worker's `pipelineLayoutMeta.group0Entries`: nullopt for a manifest layout or an empty slot.
     std::optional<std::vector<Group0LayoutEntry>> group0_entries;
@@ -377,7 +382,8 @@ struct AutoLayoutMeta {
 };
 
 struct RemapCacheEntry {
-    wgpu::BindGroup group;  // null: the remap came out empty
+    wgpu::BindGroup group;  // null: the remap came out empty (or invalid)
+    bool invalid = false;   // Dawn rejected the remapped group: never encoded
     const BgDesc* desc = nullptr;
     uint64_t gen = 0;
 };
@@ -596,6 +602,7 @@ struct SetBindGroup2Cmd {
     wgpu::BindGroup bind_group;  // resolved at packet time
     std::vector<uint32_t> offsets;
     uint32_t bind_group_id = 0;
+    bool invalid = false;  // Dawn rejected the group at creation: never encoded, its draws / dispatches are skipped
     std::shared_ptr<BgDesc> desc;  // the recorded descriptor at packet time (the layout:'auto' remap reads it)
     std::shared_ptr<const BgUsage> usage;  // its storage-capable resources (null: none)
 };
@@ -612,6 +619,10 @@ struct ReadbackCmd {
 // CopyTexture (kGpuOpcodeCopyTexture): a texture-to-texture copy, in stream order like a read-back.
 struct CopyTextureCmd {
     GpuCopyTexturePayload copy;
+    // The two textures as they were at packet time: the title may release a copy's source (or
+    // destination) right after recording it, and DestroyResource runs at packet time, before the frame
+    // is encoded. Views / twins are not carried (a copy needs the texture and its geometry only).
+    std::shared_ptr<TextureEntry> dst, src;
 };
 // A guest query heap (kGpuOpcodeCreateQuerySet). Occlusion: one 64-bit result per query, folded from the
 // executor's occlusion pool (an occlusion query set can only count inside one render pass, a D3D12
@@ -767,6 +778,11 @@ struct NativeExecutor::Impl {
     wgpu::ShaderModule empty_fragment;
     wgpu::ShaderModule error_vertex_module;
     wgpu::ShaderModule error_compute_module;
+    wgpu::RenderPipeline error_render_pipe;    // error_render_placeholder
+    wgpu::ComputePipeline error_compute_pipe;  // error_compute_placeholder
+    // Bind groups (by id) Dawn rejected at creation: never encoded; the draws / dispatches they were set
+    // for are skipped (Encoder::invalid_binds).
+    std::unordered_set<uint32_t> invalid_bind_group_ids;
     std::shared_ptr<WgslPack> pack;  // shared with the shader workers
     // Shader workers (live mode, shader_workers.h) and the pipelines waiting for their shaders: the
     // packet (with the pipeline layout as it was at packet time and the shader entries) is replayed
@@ -2308,6 +2324,9 @@ struct NativeExecutor::Impl {
         empty_fragment = nullptr;
         error_vertex_module = nullptr;
         error_compute_module = nullptr;
+        error_render_pipe = nullptr;
+        error_compute_pipe = nullptr;
+        invalid_bind_group_ids.clear();
         reflected_render.clear();
         reflected_compute.clear();
         manifest_bgls.clear();
@@ -2573,6 +2592,46 @@ struct NativeExecutor::Impl {
         ++stats.packet_errors;
         if (op < kOpcodeSlots) ++stats.packet_errors_by_opcode[op];
         stats.last_packet_error = message;
+        std::string kind = std::to_string(op) + ": " + normalize_device_error(message);
+        if (stats.packet_error_kinds.size() < 48 || stats.packet_error_kinds.count(kind)) ++stats.packet_error_kinds[kind];
+        else ++stats.packet_error_kinds["(other)"];
+    }
+
+    void note_bind_group_validity(uint32_t id, bool valid) {
+        if (valid) {
+            invalid_bind_group_ids.erase(id);
+            return;
+        }
+        invalid_bind_group_ids.insert(id);
+        ++stats.invalid_bind_groups;
+    }
+
+    // Runs `create` (a Dawn object creation) inside a validation error scope: false when Dawn rejected it.
+    // The error is still counted as the uncaptured callback would (device_errors, its kind), so a tracked
+    // invalid object is never hidden from the report; the caller marks the object invalid.
+    template <class F>
+    bool created_valid(F&& create) {
+        device.PushErrorScope(wgpu::ErrorFilter::Validation);
+        create();
+        struct ScopeResult {
+            bool error = false;
+            std::string message;
+        } sr;
+        instance.WaitAny(device.PopErrorScope(
+                             wgpu::CallbackMode::WaitAnyOnly,
+                             [](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg, ScopeResult* out) {
+                                 out->error = type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown;
+                                 if (out->error) out->message = to_string(msg);
+                             },
+                             &sr),
+                         kWaitForever);
+        if (!sr.error) return true;
+        ++stats.device_errors;
+        stats.last_device_error = sr.message;
+        device_error_kinds.record(cur_opcode, sr.message);
+        if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(sr.message);
+        if (options.gpu_validation) record_validation("scope-object", sr.message, validation_cur_packet, validation_cur_opcode);
+        return false;
     }
 
     static uint64_t now_ns() {
@@ -2841,9 +2900,15 @@ struct NativeExecutor::Impl {
                 if (n >= 4) pass_cmds.emplace_back(StencilRefCmd{read_payload<uint32_t>(p)});
                 else packet_error(op, "malformed or truncated v2 packet");
                 break;
-            case GpuOpcode::CreateBindGroup2:
-                if (!create_bind_group2(p)) packet_error(op, pending_error("malformed or truncated v2 packet"));
+            case GpuOpcode::CreateBindGroup2: {
+                // In a validation scope: a group Dawn rejects (an invalid view, a usage mismatch) is tracked
+                // as invalid and never encoded (one invalid group in a pass invalidates the command buffer).
+                bool ok = true;
+                const bool valid = created_valid([&] { ok = create_bind_group2(p); });
+                if (!ok) packet_error(op, pending_error("malformed or truncated v2 packet"));
+                if (n >= sizeof(GpuCreateBindGroup2Payload)) note_bind_group_validity(read_payload<GpuCreateBindGroup2Payload>(p).id, valid);
                 break;
+            }
             case GpuOpcode::SetBindGroup2:
                 if (!set_bind_group2(p)) packet_error(op, pending_error("malformed or truncated v2 packet"));
                 break;
@@ -2857,8 +2922,12 @@ struct NativeExecutor::Impl {
                 else ++stats.op_errors;
                 break;
             case GpuOpcode::CreateBindGroup:
-                if (n >= sizeof(GpuCreateBindGroupPayload)) create_bind_group1(p);
-                else ++stats.op_errors;
+                if (n >= sizeof(GpuCreateBindGroupPayload)) {
+                    const bool valid = created_valid([&] { create_bind_group1(p); });
+                    note_bind_group_validity(read_payload<GpuCreateBindGroupPayload>(p).id, valid);
+                } else {
+                    ++stats.op_errors;
+                }
                 break;
             case GpuOpcode::SetBindGroup:
                 if (n >= sizeof(GpuSetBindGroupPayload)) {
@@ -2872,7 +2941,25 @@ struct NativeExecutor::Impl {
                 break;
             case kGpuOpcodeCopyTexture:
                 if (n >= sizeof(GpuCopyTexturePayload)) {
-                    pass_cmds.emplace_back(CopyTextureCmd{read_payload<GpuCopyTexturePayload>(p)});
+                    CopyTextureCmd ct{read_payload<GpuCopyTexturePayload>(p), nullptr, nullptr};
+                    auto snap = [&](uint32_t id) -> std::shared_ptr<TextureEntry> {
+                        auto it = textures.find(id);
+                        if (it == textures.end()) return nullptr;
+                        auto e = std::make_shared<TextureEntry>();
+                        e->texture = it->second.texture;
+                        e->geom = it->second.geom;
+                        e->usage = it->second.usage;
+                        e->sample_count = it->second.sample_count;
+                        e->promoted_1d = it->second.promoted_1d;
+                        e->bc3d_fallback = it->second.bc3d_fallback;
+                        return e;
+                    };
+                    ct.dst = snap(ct.copy.dst_id);
+                    ct.src = snap(ct.copy.src_id);
+                    if (!ct.dst || !ct.src)
+                        packet_error(op, std::string("CopyTexture: unknown ") + (ct.dst ? "source" : "destination") +
+                                             " texture at packet time");
+                    else pass_cmds.emplace_back(std::move(ct));
                 } else {
                     packet_error(op, "CopyTexture: payload too short");
                 }
@@ -3281,6 +3368,9 @@ struct NativeExecutor::Impl {
             for (uint32_t g = 0; g < kFitMaxGroups; ++g)
                 if (force & (1u << g)) ++stats.layout_fit_unused_groups;
         }
+        // A title group kept as it is must be a valid layout, else the fitted layout is an error object too.
+        for (size_t g = 0; g < src.size() && g < 32; ++g)
+            if (src[g] == FitSource::Explicit && (pl.invalid_groups >> g & 1u)) return {};
         std::vector<wgpu::BindGroupLayout> bgls(src.size());
         FitDummies fd;
         // Over the limits with a group 0 that matches the WGSL: the title's own entries for the bindings
@@ -4259,6 +4349,9 @@ struct NativeExecutor::Impl {
                 mip_count = 1;
             }
         }
+        // A mip range past the host texture's mips (its mip chain was created shorter than the title's view
+        // asks for): the mips that exist, not an invalid view (which invalidates every bind group using it).
+        if (mip_count && base_mip < t.geom.mips && uint64_t{base_mip} + mip_count > t.geom.mips) mip_count = t.geom.mips - base_mip;
         if (!fmt && !dim && !aspect && !base_mip && !mip_count && !base_layer && !layer_count) return t.default_view;
         const uint64_t key = uint64_t{fmt} | (uint64_t{dim} << 8) | (uint64_t{aspect} << 16) |
                              (uint64_t{base_mip & 0xffff} << 24) | (uint64_t{mip_count & 0xffff} << 40) |
@@ -4450,6 +4543,7 @@ struct NativeExecutor::Impl {
             entries.push_back(le);
         }
         wgpu::BindGroupLayout layout;
+        bool layout_valid = true;
         const uint64_t content = h.content_id;
         auto cit = content ? layouts_by_content.find(content) : layouts_by_content.end();
         if (cit != layouts_by_content.end()) {
@@ -4460,8 +4554,8 @@ struct NativeExecutor::Impl {
             wgpu::BindGroupLayoutDescriptor d{};
             d.entryCount = wes.size();
             d.entries = wes.data();
-            layout = device.CreateBindGroupLayout(&d);
-            if (content) layouts_by_content[content] = layout;
+            layout_valid = created_valid([&] { layout = device.CreateBindGroupLayout(&d); });
+            if (content && layout_valid) layouts_by_content[content] = layout;  // an invalid one is never reused
         }
         BglEntry b;
         b.layout = layout;
@@ -4471,6 +4565,8 @@ struct NativeExecutor::Impl {
             b.over_limits = !stage_limit_excess(le, stage_limits).empty();
             if (b.over_limits) ++stats.over_limit_bind_group_layouts;
         }
+        b.invalid = !layout_valid || b.over_limits;
+        if (b.invalid) ++stats.invalid_bind_group_layouts;
         b.entries = std::move(entries);
         bgls[h.id] = std::move(b);
         ++stats.bind_group_layouts;
@@ -4510,6 +4606,7 @@ struct NativeExecutor::Impl {
         std::vector<FitExplicitGroup> fit_groups;
         std::vector<std::vector<LayoutEntry>> entry_groups;
         const BglEntry* group0 = nullptr;
+        uint32_t invalid_groups = 0;
         for (uint32_t g = 0; g < h.bind_group_layout_count; ++g) {
             const uint32_t bgl_id = read_payload<uint32_t>(p, 24 + size_t{g} * 4);
             const BglEntry* rec = nullptr;
@@ -4518,6 +4615,7 @@ struct NativeExecutor::Impl {
                 if (it == bgls.end()) return fail("pipeline layout: unknown bind group layout " + std::to_string(bgl_id));
                 rec = &it->second;
             }
+            if (rec && rec->invalid && g < 32) invalid_groups |= 1u << g;
             if (g == 0) group0 = rec;
             layouts.push_back(rec ? rec->layout : empty_bgl());
             FitExplicitGroup fg;
@@ -4536,7 +4634,14 @@ struct NativeExecutor::Impl {
         d.bindGroupLayoutCount = layouts.size();
         d.bindGroupLayouts = layouts.data();
         PlEntry e;
-        e.layout = device.CreatePipelineLayout(&d);
+        // An invalid group layout makes the pipeline layout invalid: it is not created (the fit may still
+        // build a valid layout from the WGSL for a pipeline, fit_pipeline_layout).
+        e.invalid_groups = invalid_groups;
+        if (invalid_groups || !created_valid([&] { e.layout = device.CreatePipelineLayout(&d); })) {
+            e.invalid = true;
+            e.layout = nullptr;
+            ++stats.invalid_pipeline_layouts;
+        }
         e.bgls = layouts;
         e.fit_groups = std::move(fit_groups);
         e.entry_groups = std::move(entry_groups);
@@ -4807,6 +4912,8 @@ struct NativeExecutor::Impl {
             reflected_pl = reflected_remap_layout(auto_meta, rf, fs ? 2 : 1);
         }
         rd.layout = fitted_pl ? fitted_pl : reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
+        // The title's own layout is invalid and nothing replaced it: the pipeline would be an error object.
+        const bool layout_invalid = !fitted_pl && !reflected_pl && !auto_layout && !auto_meta.remap && pl->invalid;
         rd.vertex.module = vs.module;
         const std::string& vep = entry_point_of(vs, "vertex");
         rd.vertex.entryPoint = {vep.data(), vep.size()};
@@ -4817,10 +4924,16 @@ struct NativeExecutor::Impl {
         e.fullscreen = vbs.empty();
         e.vs_hash = vs.hash;
         e.fs_hash = fs ? fs->hash : 0;
-        if (options.async_pipelines) {
+        if (layout_invalid) {
+            e.failed = true;  // never created; draws using it are skipped (pipeline_failed_skips)
+            e.pipeline = error_render_placeholder();
+            ++stats.invalid_pipelines;
+        } else if (options.async_pipelines) {
             create_render_async(rd, &e);
-        } else {
-            e.pipeline = device.CreateRenderPipeline(&rd);
+        } else if (!created_valid([&] { e.pipeline = device.CreateRenderPipeline(&rd); })) {
+            e.failed = true;
+            e.pipeline = error_render_placeholder();
+            ++stats.invalid_pipelines;
         }
         bool expects = declares_group0_of(vs) || (fs && declares_group0_of(*fs));
         if (!expects && !auto_layout && group0_has_entries) expects = true;
@@ -5075,25 +5188,44 @@ struct NativeExecutor::Impl {
         if (stats.async_pipeline_failures <= 16) std::fprintf(stderr, "[native_exec] %s\n", msg.substr(0, 600).c_str());
     }
 
-    // An invalid-by-validation pipeline (the entry point does not exist in a valid module). The
-    // descriptors must carry a real module: Dawn dereferences a null module while validating it
+    // The stand-in handle of a failed pipeline (entry.failed is set, so no draw / dispatch ever uses it):
+    // one small VALID pipeline shared by all of them. An error object here (the old placeholder) cost a
+    // device error per failure and invalidated any command buffer a path forgot to guard. The
+    // descriptors carry a real module: Dawn dereferences a null module while validating
     // (ObjectBase::GetDevice on null: a host access violation that killed live runs).
-    wgpu::RenderPipeline make_error_render_pipeline() {
+    wgpu::RenderPipeline error_render_placeholder() {
+        if (error_render_pipe) return error_render_pipe;
         if (!error_vertex_module)
-            error_vertex_module = make_module("@vertex fn vs_main() -> @builtin(position) vec4f { return vec4f(); }\n");
-        wgpu::RenderPipelineDescriptor bad{};
-        bad.vertex.module = error_vertex_module;
-        bad.vertex.entryPoint = {"pg6_missing_entry", WGPU_STRLEN};
-        return device.CreateRenderPipeline(&bad);
+            error_vertex_module = make_module(
+                "@vertex fn vs_main() -> @builtin(position) vec4f { return vec4f(); }\n"
+                "@fragment fn fs_main() -> @location(0) vec4f { return vec4f(); }\n");
+        wgpu::ColorTargetState ct{};
+        ct.format = wgpu::TextureFormat::RGBA8Unorm;
+        ct.writeMask = wgpu::ColorWriteMask::None;
+        wgpu::FragmentState fsd{};
+        fsd.module = error_vertex_module;
+        fsd.entryPoint = {"fs_main", WGPU_STRLEN};
+        fsd.targetCount = 1;
+        fsd.targets = &ct;
+        wgpu::RenderPipelineDescriptor d{};
+        d.vertex.module = error_vertex_module;
+        d.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
+        d.fragment = &fsd;
+        error_render_pipe = device.CreateRenderPipeline(&d);
+        return error_render_pipe;
     }
+    wgpu::RenderPipeline make_error_render_pipeline() { return error_render_placeholder(); }
 
-    wgpu::ComputePipeline make_error_compute_pipeline() {
+    wgpu::ComputePipeline error_compute_placeholder() {
+        if (error_compute_pipe) return error_compute_pipe;
         if (!error_compute_module) error_compute_module = make_module("@compute @workgroup_size(1) fn cs_main() {}\n");
-        wgpu::ComputePipelineDescriptor bad{};
-        bad.compute.module = error_compute_module;
-        bad.compute.entryPoint = {"pg6_missing_entry", WGPU_STRLEN};
-        return device.CreateComputePipeline(&bad);
+        wgpu::ComputePipelineDescriptor d{};
+        d.compute.module = error_compute_module;
+        d.compute.entryPoint = {"cs_main", WGPU_STRLEN};
+        error_compute_pipe = device.CreateComputePipeline(&d);
+        return error_compute_pipe;
     }
+    wgpu::ComputePipeline make_error_compute_pipeline() { return error_compute_placeholder(); }
 
     const wgpu::RenderPipeline& resolve(const RenderPipelineEntry& e) {
         if (e.pending) {
@@ -5200,15 +5332,22 @@ struct NativeExecutor::Impl {
             reflected_pl = reflected_remap_layout(auto_meta, rf, 1);
         }
         cd.layout = fitted_pl ? fitted_pl : reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
+        const bool layout_invalid = !fitted_pl && !reflected_pl && !auto_layout && !auto_meta.remap && pl->invalid;
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {ep.data(), ep.size()};
         ComputePipelineEntry ce;
         ce.fit = std::move(fit);
         ce.access = pipeline_access(cs, nullptr);
-        if (options.async_pipelines) {
+        if (layout_invalid) {
+            ce.failed = true;  // never created; dispatches using it are skipped
+            ce.pipeline = error_compute_placeholder();
+            ++stats.invalid_pipelines;
+        } else if (options.async_pipelines) {
             create_compute_async(cd, &ce);
-        } else {
-            ce.pipeline = device.CreateComputePipeline(&cd);
+        } else if (!created_valid([&] { ce.pipeline = device.CreateComputePipeline(&cd); })) {
+            ce.failed = true;
+            ce.pipeline = error_compute_placeholder();
+            ++stats.invalid_pipelines;
         }
         compute_pipelines[h.id] = std::move(ce);
         compute_meta[h.id] = std::move(auto_meta);
@@ -6042,6 +6181,7 @@ struct NativeExecutor::Impl {
         c.group = h.group_index;
         c.bind_group = it->second;
         c.bind_group_id = h.bind_group_id;
+        c.invalid = invalid_bind_group_ids.count(h.bind_group_id) != 0;
         if (auto dit = bg_descs.find(h.bind_group_id); dit != bg_descs.end()) c.desc = dit->second;
         if (auto uit = bg_usage.find(h.bind_group_id); uit != bg_usage.end()) c.usage = uit->second;
         for (uint32_t i = 0; i < h.dynamic_offset_count; ++i) c.offsets.push_back(read_payload<uint32_t>(p, 16 + size_t{i} * 4));
@@ -6229,6 +6369,9 @@ struct NativeExecutor::Impl {
         std::optional<AttachmentSize> explicit_size;
         bool group0_bound = false;
         uint8_t bound_groups = 0;  // groups the active pass bound (bit = group): fitted dummies skip them
+        // Groups whose last SetBindGroup named an invalid bind group (bit = group): not encoded, and every
+        // draw / dispatch is skipped until the slot is set to a valid group or the pass ends.
+        uint32_t invalid_binds = 0;
         // The stream's own bind groups 1..3 of the active pass, to restore after a padded pipeline's
         // draw bound its padding over them (`overridden`).
         struct StreamGroup {
@@ -6491,6 +6634,7 @@ struct NativeExecutor::Impl {
             explicit_pass = false;
             group0_bound = false;
             bound_groups = 0;
+            invalid_binds = 0;
             overridden = 0;
             for (auto& sg : stream_groups) sg = StreamGroup{};
             for (auto& sg : cbound) sg = StreamGroup{};
@@ -6521,6 +6665,7 @@ struct NativeExecutor::Impl {
             const uint8_t kind = rpass ? 1 : cpass ? 2 : keep_kind;
             auto w = want;
             const uint8_t wm = want_mask, bg = bound_groups;
+            const uint32_t ib_mask = invalid_binds;
             auto cb = vbs;
             auto sgs = stream_groups;
             auto ibuf = ib;
@@ -6542,6 +6687,7 @@ struct NativeExecutor::Impl {
             want_mask = wm;
             dirty_binds = wm;
             bound_groups = bg;
+            invalid_binds = ib_mask;
             stream_groups = std::move(sgs);
             group0_bound = g0;
             if (kind == 1) {
@@ -6872,6 +7018,7 @@ struct NativeExecutor::Impl {
                     else note_pipeline_pending(e.compute_pending_hash, true);
                     return;
                 }
+                if (invalid_binds_block(e, true)) return;
                 e.ensure_compute();
                 restore_compute_pipeline(e);
                 bind_compute_fit_dummies(e);
@@ -6947,6 +7094,7 @@ struct NativeExecutor::Impl {
                 z = std::min(z, max_workgroups_per_dim);
             }
             remap_before_dispatch(e);
+            if (invalid_binds_block(e, true)) return;
             e.ensure_compute();
             restore_compute_pipeline(e);
             bind_compute_fit_dummies(e);
@@ -6983,6 +7131,12 @@ struct NativeExecutor::Impl {
             e.rpass.SetStencilReference(st->ref);
             e.stencil_ref = st->ref;
         } else if (const auto* bg = std::get_if<SetBindGroup2Cmd>(&cmd)) {
+            if (bg->invalid) {  // Dawn rejected the group: never encoded (not even through the remap)
+                ++stats.skip_invalid_bind_group_sets;
+                if ((e.rpass || e.cpass || e.keep_kind) && bg->group < 32) e.invalid_binds |= 1u << bg->group;
+                return;
+            }
+            if (bg->group < 32) e.invalid_binds &= ~(1u << bg->group);
             if (bg->group == 0 && remap_set_group0(e, *bg)) return;  // layout:'auto' remap
             if (!e.rpass && !e.cpass) return;  // `if (!ctl.pass) return`
             if (!bg->bind_group) {  // a group of an over-limit layout: only a fitted pipeline can use it (remap)
@@ -7008,6 +7162,12 @@ struct NativeExecutor::Impl {
                 if (compute_bind_groups.count(b1->id)) e.ensure_compute();
                 else e.ensure_render();
             }
+            if (invalid_bind_group_ids.count(b1->id)) {  // Dawn rejected the group: never encoded
+                ++stats.skip_invalid_bind_group_sets;
+                if (b1->group < 32) e.invalid_binds |= 1u << b1->group;
+                return;
+            }
+            if (b1->group < 32) e.invalid_binds &= ~(1u << b1->group);
             e.bind(b1->group, bg, {}, nullptr);
             if (b1->group == 0) e.group0_bound = true;
             if (b1->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << b1->group);
@@ -7020,7 +7180,7 @@ struct NativeExecutor::Impl {
             record_readback_copy(e.enc, rb->req);
         } else if (const auto* ct = std::get_if<CopyTextureCmd>(&cmd)) {
             e.end_for_copy();
-            record_texture_copy(e.enc, ct->copy);
+            record_texture_copy(e.enc, *ct);
         } else if (const auto* qc = std::get_if<QueryCmd>(&cmd)) {
             run_query(e, *qc);
         } else if (const auto* rq = std::get_if<ResolveQueryCmd>(&cmd)) {
@@ -7311,7 +7471,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
     }
 
     struct RemapResult {
-        enum class Status { Ok, Empty, Unsupported } status = Status::Unsupported;
+        enum class Status { Ok, Empty, Unsupported, Invalid } status = Status::Unsupported;
         wgpu::BindGroup group;
     };
 
@@ -7353,7 +7513,9 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             auto cit = remap_cache.find(key);
             if (cit != remap_cache.end() && cit->second.desc == desc.get() && cit->second.gen == meta.gen) {
                 ++stats.remap_cache_hits;
-                if (cit->second.group) {
+                if (cit->second.invalid) {
+                    out.status = RemapResult::Status::Invalid;
+                } else if (cit->second.group) {
                     out.status = RemapResult::Status::Ok;
                     out.group = cit->second.group;
                 }
@@ -7377,6 +7539,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             }
         }
         wgpu::BindGroup group;
+        bool remap_invalid = false;
         if (auto_bgl) {
             RemapPicker picker(av, dyn, features.float32_filterable);
             std::vector<wgpu::BindGroupEntry> wes(meta.bindings.size());
@@ -7441,7 +7604,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             bd.layout = auto_bgl;
             bd.entryCount = wes.size();
             bd.entries = wes.data();
-            group = device.CreateBindGroup(&bd);
+            remap_invalid = !created_valid([&] { group = device.CreateBindGroup(&bd); });
             ++stats.remapped_bind_groups;
             std::vector<uint8_t> tex_w(wes.size(), 0);
             for (size_t i = 0; i < wes.size(); ++i) tex_w[i] = meta.bindings[i].kind == WgslBindingKind::StorageTexture ? 1 : 0;
@@ -7452,9 +7615,12 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         }
         if (live) {
             if (remap_cache.size() >= 8192) remap_cache.clear();
-            remap_cache[key] = RemapCacheEntry{group, desc.get(), meta.gen};
+            remap_cache[key] = RemapCacheEntry{remap_invalid ? nullptr : group, remap_invalid, desc.get(), meta.gen};
         }
-        if (group) {
+        if (remap_invalid) {
+            ++stats.invalid_bind_groups;
+            out.status = RemapResult::Status::Invalid;
+        } else if (group) {
             out.status = RemapResult::Status::Ok;
             out.group = group;
         }
@@ -8329,6 +8495,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
     void apply_remapped(Encoder& e, const wgpu::BindGroup& g) {
         if (!e.rpass && !e.cpass) return;
         e.bind(0, g, {}, nullptr);
+        e.invalid_binds &= ~1u;  // a valid group 0 replaces an invalid one
         if (e.rpass) e.group0_bound = true;  // _recordPassBindGroup
         e.bound_groups |= 1u;
     }
@@ -8386,6 +8553,10 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                     return true;
                 }
                 if (r.status == RemapResult::Status::Empty) return true;
+                if (r.status == RemapResult::Status::Invalid) {  // never encoded: the draws / dispatches are skipped
+                    e.invalid_binds |= 1u;
+                    return true;
+                }
             }
         } else if (remap.mode == 1) {
             remap.last_render = src;
@@ -8401,6 +8572,10 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                         return true;
                     }
                     if (r.status == RemapResult::Status::Empty) return true;  // NoopRenderGroup0Command
+                    if (r.status == RemapResult::Status::Invalid) {
+                        e.invalid_binds |= 1u;
+                        return true;
+                    }
                 } else {
                     remap.group0_render = true;
                 }
@@ -8427,6 +8602,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         if (pit == render_pipelines.end()) return;
         const RemapResult r = get_remapped(false, remap.render_pipe, pit->second.auto_meta, src.id, src.desc, src.dyn);
         if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
+        else if (r.status == RemapResult::Status::Invalid) e.invalid_binds |= 1u;
     }
     void remap_before_dispatch(Encoder& e) {
         if (!remap.compute_auto || remap.group0_compute) return;
@@ -8437,6 +8613,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         if (mit == compute_meta.end()) return;
         const RemapResult r = get_remapped(true, remap.compute_pipe, mit->second, src.id, src.desc, src.dyn);
         if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
+        else if (r.status == RemapResult::Status::Invalid) e.invalid_binds |= 1u;
     }
 
     // ---- GPU pass timestamps (gpu_timer.js, #1608) ----
@@ -8621,16 +8798,21 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
 
     // CopyTexture (opcode 62): validated against the tracked geometry (a bad copy is a packet error,
     // never a Dawn validation error), then recorded as copyTextureToTexture.
-    void record_texture_copy(wgpu::CommandEncoder& enc, const GpuCopyTexturePayload& c) {
+    void record_texture_copy(wgpu::CommandEncoder& enc, const CopyTextureCmd& cmd) {
+        const GpuCopyTexturePayload& c = cmd.copy;
         const uint16_t op = static_cast<uint16_t>(kGpuOpcodeCopyTexture);
-        const auto di = textures.find(c.dst_id);
-        const auto si = textures.find(c.src_id);
-        if (di == textures.end() || si == textures.end()) {
-            packet_error(op, "CopyTexture: unknown texture " + std::to_string(di == textures.end() ? c.dst_id : c.src_id));
+        if (!cmd.dst || !cmd.src) {
+            packet_error(op, "CopyTexture: unknown texture " + std::to_string(!cmd.dst ? c.dst_id : c.src_id));
             return;
         }
-        TextureEntry& dt = di->second;
-        const TextureEntry& st = si->second;
+        // The live entry while it is still the texture of packet time (its depth_gen moves), else the
+        // packet-time snapshot (the title released it after recording the copy).
+        const auto di = textures.find(c.dst_id);
+        const auto si = textures.find(c.src_id);
+        const bool dst_live = di != textures.end() && di->second.texture.Get() == cmd.dst->texture.Get();
+        const bool src_live = si != textures.end() && si->second.texture.Get() == cmd.src->texture.Get();
+        TextureEntry& dt = dst_live ? di->second : *cmd.dst;
+        const TextureEntry& st = src_live ? si->second : *cmd.src;
         const TextureGeometry& dg = dt.geom;
         const TextureGeometry& sg = st.geom;
         auto bad = [&](const char* why) { packet_error(op, std::string("CopyTexture: ") + why); };
@@ -8833,8 +9015,19 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
 
     // _executePresentRenderDraw: opens the lazy render pass, then skips a draw whose pipeline is
     // unavailable or whose expected @group(0) bind group is not bound.
+    // A draw / dispatch with an invalid bind group set: skipped (encoded, it would invalidate the whole
+    // command buffer and black out the frame).
+    bool invalid_binds_block(Encoder& e, bool dispatch) {
+        if (!e.invalid_binds) return false;
+        ++stats.skip_invalid_bind_group;
+        if (dispatch) ++stats.dispatches_skipped;
+        else ++stats.draws_skipped;
+        return true;
+    }
+
     bool draw_allowed(Encoder& e) {
         e.ensure_render();
+        if (invalid_binds_block(e, false)) return false;
         if (e.variant_blocked) {
             ++stats.draws_skipped;
             return false;
@@ -9686,6 +9879,21 @@ std::string NativeExecutor::stats_json() const {
     num("layout_fit_restores", st.layout_fit_restores);
     num("over_limit_bind_group_layouts", st.over_limit_bind_group_layouts);
     num("over_limit_binds_skipped", st.over_limit_binds_skipped);
+    num("invalid_bind_group_layouts", st.invalid_bind_group_layouts);
+    num("invalid_pipeline_layouts", st.invalid_pipeline_layouts);
+    num("invalid_bind_groups", st.invalid_bind_groups);
+    num("invalid_pipelines", st.invalid_pipelines);
+    num("skip_invalid_bind_group", st.skip_invalid_bind_group);
+    num("skip_invalid_bind_group_sets", st.skip_invalid_bind_group_sets);
+    j += "\"packet_error_kinds\": {";
+    {
+        bool first = true;
+        for (const auto& [k, v] : st.packet_error_kinds) {
+            j += (first ? "\"" : ", \"") + ErrorScopeLog::json_escape(k) + "\": " + std::to_string(v);
+            first = false;
+        }
+    }
+    j += "}, ";
     j += "\"async_failure_kinds\": {";
     {
         bool first = true;

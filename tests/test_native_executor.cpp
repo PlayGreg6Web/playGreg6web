@@ -388,6 +388,85 @@ void test_textured_draw(NativeExecutor& ex) {
     CHECK(frame_is(ex, {0, 0, 0, 255}));
 }
 
+// A bind group Dawn rejects at creation (its view's base mip is past the texture's mips) is tracked as
+// invalid: the draw it is set for is skipped and counted, the other draws of the frame render, and the
+// frame's command buffer stays valid (no cascade error, the frame is not black). A view whose mip count
+// runs past the texture's mips is clamped to the mips that exist (a valid group).
+void test_invalid_bind_group_skipped(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(900, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst | GpuTextureUsage::CopySrc, 22)));
+    std::vector<uint8_t> texels(256 + 8, 0);
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x) {
+            texels[y * 256 + x * 4 + 1] = 255;  // (0, 255, 0, 255)
+            texels[y * 256 + x * 4 + 3] = 255;
+        }
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 900;
+    wt.width = 2;
+    wt.height = 2;
+    wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 2;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(setup, GpuOpcode::WriteTexture, wtv);
+    GpuCreateSampler2Payload sp;
+    std::memset(&sp, 0, sizeof sp);
+    sp.id = 901;
+    sp.max_anisotropy = 1;
+    sp.lod_max_clamp = 32.0f;
+    emit(setup, GpuOpcode::CreateSampler2, bytes_of(sp));
+    setup.create_shader_module(902, GpuShaderStage::Vertex, kTexturedTriangle);
+    setup.create_shader_module(903, GpuShaderStage::Fragment, kTexturedTriangle);
+    create_layouts(setup, 904, 905,
+                   {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, 0, 2),
+                    layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(906, 902, 903, 905)));
+    create_bind_group(setup, 907, 904, {bg_entry(0, GpuBindResourceType::TextureView, 900), bg_entry(1, GpuBindResourceType::Sampler, 901)});
+    auto bad_view = bg_entry(0, GpuBindResourceType::TextureView, 900);
+    bad_view.view.base_mip_level = 5;  // the texture has one mip: an invalid view, an invalid group
+    bad_view.view.mip_level_count = 1;
+    create_bind_group(setup, 908, 904, {bad_view, bg_entry(1, GpuBindResourceType::Sampler, 901)});
+    auto long_view = bg_entry(0, GpuBindResourceType::TextureView, 900);
+    long_view.view.mip_level_count = 4;  // past the one mip: clamped, a valid group
+    create_bind_group(setup, 909, 904, {long_view, bg_entry(1, GpuBindResourceType::Sampler, 901)});
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats mid = ex.stats();
+    CHECK(mid.invalid_bind_groups == before.invalid_bind_groups + 1);  // 908 only
+    CHECK(mid.device_errors == before.device_errors + 1);               // its creation error, counted once
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(906);
+    set_bind_group2(frame, 0, 908);  // invalid: never encoded, the draw is skipped
+    frame.draw(3);
+    set_bind_group2(frame, 0, 909);  // the clamped view: draws
+    frame.draw(3);
+    set_bind_group2(frame, 0, 907);
+    frame.draw(3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& after = ex.stats();
+    CHECK(after.skip_invalid_bind_group == mid.skip_invalid_bind_group + 1);
+    CHECK(after.skip_invalid_bind_group_sets == mid.skip_invalid_bind_group_sets + 1);
+    CHECK(after.draws == mid.draws + 2);
+    CHECK(after.device_errors == mid.device_errors);  // the command buffer is valid: no cascade
+    CHECK(frame_is(ex, {0, 255, 0, 255}));             // the other draws rendered
+    CHECK(ex.stats_json().find("\"skip_invalid_bind_group\": ") != std::string::npos);
+}
+
 const char* kCompute = R"(
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 @compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = i * 2u + 1u; }
@@ -1167,6 +1246,9 @@ void test_layout_fit_unused_group_over_limits(NativeExecutor& ex) {
     create_bind_group(setup, 166, 156, {bg_entry(0, GpuBindResourceType::Buffer, 152)});
     run(ex, setup);
     const uint64_t setup_errors = ex.stats().device_errors;  // the over-limit layout itself
+    // ... and nothing else: the pipeline layout over it is never created (no cascade error).
+    CHECK(setup_errors == before.device_errors + 1);
+    CHECK(ex.stats().invalid_pipeline_layouts == before.invalid_pipeline_layouts + 1);
 
     gpu::CommandEncoder frame;
     frame.begin_frame();
@@ -1497,6 +1579,29 @@ void test_copy_texture(NativeExecutor& ex) {
     ex.poll();
     CHECK(ex.stats().texture_copies == before.texture_copies + 1);
     CHECK(ex.stats().device_errors == before.device_errors);
+
+    // The source is released right after the copy is recorded (DestroyResource runs at packet time,
+    // before the copy is encoded): the copy still runs, from the texture as it was at packet time.
+    const uint64_t packet_errors_before = ex.stats().packet_errors;
+    gpu::CommandEncoder released;
+    emit(released, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(133, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    write(released, 133, 4, 4, 0x77);
+    emit(released, kGpuOpcodeCopyTexture, bytes_of(copy(131, 133, 0, 0, 0, 0, 4, 4)));
+    released.destroy_resource(133);
+    rt.seq = 2;
+    emit(released, GpuOpcode::ReadbackTexture, bytes_of(rt));
+    CHECK(run(ex, released) == 0);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(u32_at(mem, 0) == 2);
+    CHECK(mem[1024] == 0x77 && mem[1024 + 63] == 0x77);
+    CHECK(ex.stats().texture_copies == before.texture_copies + 2);
+    // (The rejected copies above are encoded with this batch: only "unknown texture" must not show up.)
+    CHECK(ex.stats().packet_errors == packet_errors_before + 2);
+    CHECK(ex.stats().last_packet_error.find("unknown") == std::string::npos);
+    CHECK(ex.stats().device_errors == before.device_errors);
+
     gpu::CommandEncoder done;
     done.destroy_resource(130);
     done.destroy_resource(131);
@@ -4823,6 +4928,7 @@ int main() {
     test_clear_present(*ex);
     test_buffers(*ex);
     test_textured_draw(*ex);
+    test_invalid_bind_group_skipped(*ex);
     test_compute(*ex);
     test_auto_layout_remap(*ex);
     test_layout_fit_missing_group(*ex);

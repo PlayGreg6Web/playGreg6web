@@ -431,6 +431,16 @@ struct ExecutorStats {
     uint64_t write_masks_cleared = 0;  // color targets the fragment stage does not write: writeMask forced to 0
     uint64_t async_pipeline_failures = 0;  // creation failed: the pipeline became an error object
     std::vector<uint64_t> failed_pipeline_hashes;  // unique perf hashes whose pipeline creation failed (auto-quarantine input)
+    // Object validity (the executor never records work Dawn will reject: one invalid object in a pass
+    // invalidates the whole command buffer, a black frame). Objects created with a validation error are
+    // tracked as invalid; the work that would use one is skipped and counted by reason.
+    uint64_t invalid_bind_group_layouts = 0;   // created with an error (or over a per-stage limit)
+    uint64_t invalid_pipeline_layouts = 0;     // a group's layout is invalid: never created
+    uint64_t invalid_bind_groups = 0;          // created with an error (an invalid view, a usage mismatch, ...)
+    uint64_t invalid_pipelines = 0;            // sync creation error, or an invalid explicit layout: never handed to a pass
+    uint64_t skip_invalid_bind_group = 0;      // draws / dispatches skipped: a bound group is invalid
+    uint64_t skip_invalid_bind_group_sets = 0; // SetBindGroup of an invalid group: not encoded
+    std::map<std::string, uint64_t> packet_error_kinds;  // packet errors by message (numbers folded), bounded
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
 };
