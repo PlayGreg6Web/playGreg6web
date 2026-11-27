@@ -70,4 +70,19 @@ inline bool integer_sample_type_mismatch(uint8_t layout_sample_type, uint8_t for
     return actual_int;
 }
 
+// A float (filterable) layout entry bound to a view WebGPU samples only as unfilterable-float: the
+// 16-bit normalized formats (r16unorm & co., "texture-formats-tier1") and, without "float32-filterable",
+// the 32-bit float ones. The entry is paired with a filtering sampler, so Dawn rejects the bind group
+// ("None of the supported sample types (UnfilterableFloat) ... match the expected sample types (Float)").
+// layout_sample_type: 0 float, 1 unfilterable-float, 2 depth, 3 sint, 4 uint.
+inline bool format_is_norm16(uint8_t format) {
+    if (!format_valid(format) || format_is_depth(format)) return false;
+    const std::string_view n = format_info(format).name;
+    return n.find("16unorm") != std::string_view::npos || n.find("16snorm") != std::string_view::npos;
+}
+inline bool unfilterable_float_mismatch(uint8_t layout_sample_type, uint8_t format, bool float32_filterable) {
+    if (layout_sample_type != 0 || !format_valid(format) || format_is_depth(format)) return false;
+    return format_is_norm16(format) || (format_is_float32(format) && !float32_filterable);
+}
+
 }  // namespace playgta6::gpu::native_exec

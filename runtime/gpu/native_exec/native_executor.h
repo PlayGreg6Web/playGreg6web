@@ -260,6 +260,7 @@ struct ExecutorStats {
     uint64_t reflection_vertex_fallbacks = 0;  // reflected vertex layout rejected: the single-attribute default
     uint64_t reflection_layout_errors = 0;     // a reflected layout the loader's merge rejected (pipeline not created)
     uint64_t reflection_binding_conflicts = 0; // ... of which two stages disagreed on a binding
+    uint64_t bind_group_unfilterable_dummies = 0;  // float layout entry vs an unfilterable-float-only view (norm16, f32 without float32-filterable): dummy bound
     uint64_t bind_group_sample_type_dummies = 0;  // integer view vs float layout entry (or the reverse): dummy bound
     uint64_t buffer_bindings_clamped = 0;  // buffer ranges cut to the device's binding-size rules (fit_buffer_binding)
     uint64_t buffer_bindings_dummied = 0;  // buffer bindings no range of which fits those rules: dummy bound

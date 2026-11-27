@@ -1302,6 +1302,14 @@ void test_binding_fit() {
     CHECK(integer_sample_type_mismatch(4, 22));   // rgba8unorm on uint
     CHECK(!integer_sample_type_mismatch(0, 22));  // rgba8unorm on float
     CHECK(!integer_sample_type_mismatch(1, 16));  // r32float on unfilterable-float
+    // unfilterable-float-only views on a float entry: norm16 always, float32 without float32-filterable
+    CHECK(unfilterable_float_mismatch(0, format_code_by_name("rg16unorm"), true));
+    CHECK(unfilterable_float_mismatch(0, format_code_by_name("r16snorm"), true));
+    CHECK(unfilterable_float_mismatch(0, format_code_by_name("rgba16unorm"), false));
+    CHECK(!unfilterable_float_mismatch(1, format_code_by_name("rg16unorm"), true));  // unfilterable entry takes it
+    CHECK(!unfilterable_float_mismatch(0, 22, true));                                   // rgba8unorm
+    CHECK(!unfilterable_float_mismatch(0, format_code_by_name("depth16unorm"), true));  // depth: pick_depth_read
+    CHECK(unfilterable_float_mismatch(0, 16, false) && !unfilterable_float_mismatch(0, 16, true));  // r32float
 }
 
 void test_device_error_kinds() {

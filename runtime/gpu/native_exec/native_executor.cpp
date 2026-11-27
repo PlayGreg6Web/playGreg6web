@@ -3604,6 +3604,11 @@ struct NativeExecutor::Impl {
             if (vd.format == wgpu::TextureFormat::Depth32FloatStencil8 || vd.format == wgpu::TextureFormat::Depth24PlusStencil8)
                 vd.format = wgpu::TextureFormat::Stencil8;
         }
+        // An sRGB view of a storage-capable texture: the view inherits StorageBinding, which no sRGB format
+        // allows ("usage ... includes StorageBinding, which is incompatible with the format"). Such a view is
+        // only ever sampled / rendered, so it drops the storage usage.
+        if ((t.usage & 0x8u) && vd.format != wgpu::TextureFormat::Undefined && fmt && format_is_srgb(fmt))
+            vd.usage = static_cast<wgpu::TextureUsage>(t.usage & ~0x8u) | wgpu::TextureUsage::CopySrc;
         wgpu::TextureView v = t.texture.CreateView(&vd);
         if (t.views.size() >= 64) t.views.erase(t.views.begin());
         t.views[key2] = v;
@@ -5064,8 +5069,9 @@ struct NativeExecutor::Impl {
                                integer_sample_type_mismatch(le->subtype, tex_format)) {
                         ++stats.bind_group_sample_type_dummies;
                         use_dummy(*le);
-                    } else if (!kind_mismatch && le && le->kind == 2 && le->subtype == 0 && tex_format &&
-                               format_is_float32(tex_format) && !features.float32_filterable) {
+                    } else if (!kind_mismatch && le && le->kind == 2 && tex_format &&
+                               unfilterable_float_mismatch(le->subtype, tex_format, features.float32_filterable)) {
+                        ++stats.bind_group_unfilterable_dummies;
                         use_dummy(*le);
                     } else if (!kind_mismatch && le && le->kind == 2 && tex_format && format_is_depth(tex_format) &&
                                pick_depth_read(le->subtype, le->multisampled, tex_format, e.view.aspect,
@@ -7244,6 +7250,7 @@ std::string NativeExecutor::stats_json() const {
     num("reflection_binding_conflicts", st.reflection_binding_conflicts);
     num("reflection_layout_unsupported", st.reflection_layout_unsupported);
     num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
+    num("bind_group_unfilterable_dummies", st.bind_group_unfilterable_dummies);
     num("bind_group_sample_type_dummies", st.bind_group_sample_type_dummies);
     num("buffer_bindings_clamped", st.buffer_bindings_clamped);
     num("buffer_bindings_dummied", st.buffer_bindings_dummied);

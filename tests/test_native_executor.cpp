@@ -3310,6 +3310,32 @@ void test_bind_group_binding_fit(NativeExecutor& ex) {
     CHECK(s.bind_group_sample_type_dummies == before.bind_group_sample_type_dummies + 1);
 }
 
+// An sRGB view of a storage-capable rgba8unorm texture (a sampled bind group entry): the view drops the
+// texture's StorageBinding usage, which no sRGB format allows. No device error.
+void test_srgb_view_of_storage_texture(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    GpuCreateTexture2Payload ct = texture2(9510, 2, 2,
+                                           GpuTextureUsage::TextureBinding | GpuTextureUsage::StorageBinding |
+                                               GpuTextureUsage::RenderAttachment | GpuTextureUsage::CopyDst,
+                                           22);
+    ct.view_format_count = 1;
+    ct.view_formats[0] = 23;  // rgba8unorm-srgb
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(ct));
+    std::vector<uint8_t> bgl;
+    const GpuBindGroupLayoutEntry t = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture, 0, 2);
+    append(bgl, GpuCreateBindGroupLayoutPayload{9511, 1, 0, 0, 0});
+    append(bgl, t);
+    emit(setup, GpuOpcode::CreateBindGroupLayout, bgl);
+    GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::TextureView, 9510);
+    be.view.format = 23;
+    create_bind_group(setup, 9512, 9511, {be});
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+}
+
 void test_error_scope_attribution() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -3485,6 +3511,7 @@ int main() {
     test_remap_reflected_layout(false);
     test_dawn_validation_fixes(*ex);
     test_bind_group_binding_fit(*ex);
+    test_srgb_view_of_storage_texture(*ex);
     test_wide_mrt_pipeline(*ex);
     test_screenshot();
     test_error_scope_attribution();
