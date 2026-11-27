@@ -362,12 +362,7 @@ pub(super) fn lift(
         block_entry_facts: [GprFact::Bottom; 16],
         edge_known: Vec::new(),
         cse: BTreeMap::new(),
-        state_derived: BTreeSet::new(),
-        ret_synced: Vec::new(),
-        exit_synced: Vec::new(),
-        entry_synced: (0, 0),
     };
-    lifter.entry_synced = lifter.entry_loaded();
     lifter.lift_blocks()?;
     Ok(lifter.finish())
 }
@@ -450,39 +445,6 @@ fn value_tokens(code: &str) -> impl Iterator<Item = &str> {
             .unwrap_or(rest.len());
         &rest[..end]
     })
-}
-
-/// `(state, flags)` bits of the register whose alloca or `%state` slot `name` (without `%`) is:
-/// `rax..r15` / `state.gprN`, the flag slots / `state.flagN`, `xmmN` / `state.xmmN` and
-/// `ymmhN` / `state.ymmhN`. `None` for every other name.
-fn slot_state_bits(name: &str) -> Option<(StateMask, FlagMask)> {
-    if let Some(idx) = GPR_NAMES.iter().position(|&g| g == name) {
-        return Some((1u64 << idx, 0));
-    }
-    if let Some(i) = FLAGS.iter().position(|f| &f.slot()[1..] == name) {
-        return Some((0, 1 << i));
-    }
-    let field = name.strip_prefix("state.").unwrap_or(name);
-    let index = |prefix: &str, n: usize| {
-        field
-            .strip_prefix(prefix)
-            .and_then(|i| i.parse::<usize>().ok())
-            .filter(|&i| i < n)
-    };
-    let in_state = field.len() != name.len();
-    if in_state && let Some(i) = index("gpr", 16) {
-        return Some((1u64 << i, 0));
-    }
-    if in_state && let Some(i) = index("flag", FLAGS.len()) {
-        return Some((0, 1 << i));
-    }
-    if let Some(i) = index("xmm", 16) {
-        return Some((flag_liveness::xmm_state_bit(i), 0));
-    }
-    if let Some(i) = index("ymmh", 16) {
-        return Some((flag_liveness::ymmh_state_bit(i), 0));
-    }
-    None
 }
 
 /// Whether the right-hand side of a value definition has no effect besides its result, so the
@@ -743,17 +705,6 @@ struct FunctionLifter<'a> {
     /// Local value numbering: pure definitions already emitted in the current dominating region,
     /// by right-hand side. Cleared whenever a block starts or lifting rolls back.
     cse: BTreeMap<String, String>,
-    /// Values derived from `%state` other than the named slot pointers (`getelementptr`s into a
-    /// field and the like): a store through one may write any slot.
-    state_derived: BTreeSet<String>,
-    /// `(synced_state, synced_flags)` of [`Known`] at each branch to the shared `ret_epilog`.
-    ret_synced: Vec<(StateMask, FlagMask)>,
-    /// `(target, synced_state, synced_flags)` at each branch to a tail-call exit block.
-    exit_synced: Vec<(u64, StateMask, FlagMask)>,
-    /// The registers and flags `entry:` loads from `%state` (a lower bound computed before
-    /// lifting, see [`FunctionLifter::entry_loaded`]): their allocas hold the state's values on
-    /// the edge into the first guest block.
-    entry_synced: (StateMask, FlagMask),
 }
 
 /// R71: intra-procedural forward dataflow lattice fact for one 64-bit GPR.
@@ -874,14 +825,6 @@ struct Known {
     /// Tracks `(rdx64_ssa, rax64_ssa, bits)` immediately after `cdq` (32) or `cqo` (64) so a
     /// subsequent `idiv` lowers to native `sdiv`/`srem i32`/`i64` instead of widening/`sdiv128`.
     sign_ext_rdx: Option<(String, String, u32)>,
-    /// Registers (GPR bit `n`, `xmm`/`ymmh` bits as in [`StateMask`]) whose alloca provably
-    /// holds the same value as their `%state` slot at this point: set by a sync in either
-    /// direction, cleared by any store to the alloca or the slot and by every call that may
-    /// write the state (see [`FunctionLifter::note_sync_effects`]). [`FunctionLifter::sync_out_parts`]
-    /// skips their store-backs, which LLVM cannot drop itself once a call lies in between.
-    synced_state: StateMask,
-    /// [`Self::synced_state`] for the arithmetic flags.
-    synced_flags: FlagMask,
 }
 
 struct Checkpoint {
@@ -897,8 +840,6 @@ struct Checkpoint {
     edge_known: usize,
     window_load_cache: Vec<memory_access::CachedWindowAddr>,
     ymmh_zeroed: u16,
-    ret_synced: usize,
-    exit_synced: usize,
 }
 
 impl FunctionLifter<'_> {
@@ -937,8 +878,6 @@ impl FunctionLifter<'_> {
                 && let Some(at) = self.edge_known.iter().position(|(t, _)| *t == start)
             {
                 self.known = self.edge_known.swap_remove(at).1;
-            } else if let Some(&incoming) = preds.get(&start) {
-                self.join_synced(start, incoming);
             }
             if let Some(&raw_facts) = entry_gpr_facts.get(&start) {
                 let mut facts = [GprFact::Bottom; 16];
@@ -1118,7 +1057,6 @@ impl FunctionLifter<'_> {
         };
         if let Edge::TailCall(target) = *edge {
             self.exits.push(target);
-            self.note_exit_synced(target);
             return Ok(exit_label(target));
         }
         match edge.intra_target() {
@@ -1154,19 +1092,6 @@ impl FunctionLifter<'_> {
         for &target in &exits {
             let exit = exit_label(target);
             self.start_block(&exit);
-            // Every branch to `exit` was recorded by `note_exit_synced`: what all of them agree
-            // on holds on entry to the exit block.
-            let mut synced: Option<(StateMask, FlagMask)> = None;
-            for &(t, st, fl) in &self.exit_synced {
-                if t == target {
-                    let (s, f) = synced.unwrap_or((ALL_STATE, ALL_FLAGS));
-                    synced = Some((s & st, f & fl));
-                }
-            }
-            if let Some((state, flags)) = synced {
-                self.known.synced_state = state;
-                self.known.synced_flags = flags;
-            }
             let flags = self.flags_needed_by(target);
             self.sync_out_parts(ALL_STATE, flags);
             self.emit(&format!(
@@ -1179,14 +1104,6 @@ impl FunctionLifter<'_> {
 
         if self.has_shared_ret {
             self.start_block("ret_epilog");
-            if !self.ret_synced.is_empty() {
-                let (state, flags) = self
-                    .ret_synced
-                    .iter()
-                    .fold((ALL_STATE, ALL_FLAGS), |(s, f), &(st, fl)| (s & st, f & fl));
-                self.known.synced_state = state;
-                self.known.synced_flags = flags;
-            }
             self.sync_out();
             self.emit("ret void");
         }
@@ -1364,8 +1281,6 @@ impl FunctionLifter<'_> {
             edge_known: self.edge_known.len(),
             window_load_cache: self.window_load_cache.clone(),
             ymmh_zeroed: self.ymmh_zeroed,
-            ret_synced: self.ret_synced.len(),
-            exit_synced: self.exit_synced.len(),
         }
     }
 
@@ -1383,8 +1298,6 @@ impl FunctionLifter<'_> {
         self.edge_known.truncate(checkpoint.edge_known);
         self.window_load_cache = checkpoint.window_load_cache;
         self.ymmh_zeroed = checkpoint.ymmh_zeroed;
-        self.ret_synced.truncate(checkpoint.ret_synced);
-        self.exit_synced.truncate(checkpoint.exit_synced);
         self.simd.clear_mem32();
     }
 
@@ -1434,7 +1347,6 @@ impl FunctionLifter<'_> {
     // ----- IR emission primitives ---------------------------------------------------------------
 
     fn emit(&mut self, line: &str) {
-        self.note_sync_effects(line);
         self.body.push_str("  ");
         self.body.push_str(line);
         self.body.push('\n');
@@ -1549,10 +1461,6 @@ impl FunctionLifter<'_> {
                 self.known.flags[i] = entry.flags[i].clone();
             }
         }
-        // Facts about memory (not SSA values): whatever holds at the end of both arms holds at
-        // the join.
-        self.known.synced_state = a.synced_state & b.synced_state;
-        self.known.synced_flags = a.synced_flags & b.synced_flags;
         if entry.flag_source.is_some()
             && a.flag_source == entry.flag_source
             && b.flag_source == entry.flag_source
@@ -1642,134 +1550,6 @@ impl FunctionLifter<'_> {
         (state_mask, flag_written_first)
     }
 
-    /// Whether every register of `bits` ([`StateMask`]) is known to match its `%state` slot.
-    pub(super) fn is_synced(&self, bits: StateMask) -> bool {
-        self.known.synced_state & bits == bits
-    }
-
-    /// Records that the registers of `bits` now match their `%state` slots.
-    pub(super) fn note_synced(&mut self, bits: StateMask) {
-        self.known.synced_state |= bits;
-    }
-
-    /// The registers and flags the `entry:` sync loads into their allocas ([`Self::finish`]),
-    /// computed before lifting. [`Self::entry_overwritten_state`] only skips the loads it can
-    /// prove dead and stops at the first unsupported instruction, so with no instruction known
-    /// to be unsupported yet it skips at least as much as it will at the end: this is a subset of
-    /// what `entry:` really loads.
-    fn entry_loaded(&self) -> (StateMask, FlagMask) {
-        let (dead_state, dead_flags) = self.entry_overwritten_state();
-        let state = ALL_STATE & !dead_state;
-        let mut gprs: StateMask = 0;
-        for idx in 0..16 {
-            if self.regs[idx] && state & (1u64 << idx) != 0 {
-                gprs |= 1u64 << idx;
-            }
-        }
-        let mut flags: FlagMask = 0;
-        for flag in FLAGS {
-            if self.flags[flag as usize] && dead_flags & (1 << flag as usize) == 0 {
-                flags |= 1 << flag as usize;
-            }
-        }
-        (gprs | self.vec_loaded(state), flags)
-    }
-
-    /// Records the synced registers on a branch to the tail-call exit block of `target`.
-    fn note_exit_synced(&mut self, target: u64) {
-        self.exit_synced
-            .push((target, self.known.synced_state, self.known.synced_flags));
-    }
-
-    /// Starts the synced registers of the guest block `start` (with `incoming` edges) as the
-    /// intersection over its incoming edges, when every one of them was lifted already (the
-    /// function entry counts as an edge carrying [`Self::entry_synced`]). A loop head (whose back
-    /// edge is lifted later) or resume target (re-entered from the unwinder) starts with none.
-    fn join_synced(&mut self, start: u64, incoming: usize) {
-        let mut seen = 0usize;
-        let (mut state, mut flags) = (ALL_STATE, ALL_FLAGS);
-        if start == self.func.entry {
-            seen += 1;
-            state &= self.entry_synced.0;
-            flags &= self.entry_synced.1;
-        }
-        for (target, known) in &self.edge_known {
-            if *target == start {
-                seen += 1;
-                state &= known.synced_state;
-                flags &= known.synced_flags;
-            }
-        }
-        if seen == incoming {
-            self.known.synced_state = state;
-            self.known.synced_flags = flags;
-        }
-    }
-
-    /// Keeps [`Known::synced_state`] / [`Known::synced_flags`] true for an emitted line: a store
-    /// to a register alloca or to its `%state` slot clears that register, and anything else that
-    /// may write the state (a call other than a pure intrinsic, a store through a pointer derived
-    /// from `%state`, any other instruction naming the state) clears them all. Syncs set their
-    /// bits after emitting.
-    fn note_sync_effects(&mut self, code: &str) {
-        let (def, rhs) = match code.split_once(" = ") {
-            Some((lhs, rhs)) if lhs.starts_with('%') && !lhs.contains(' ') => {
-                (Some(&lhs[1..]), rhs)
-            }
-            _ => (None, code),
-        };
-        let names_state = |text: &str, derived: &BTreeSet<String>| {
-            value_tokens(text)
-                .any(|t| t == "state" || t.starts_with("state.") || derived.contains(t))
-        };
-        if let Some(store) = rhs.strip_prefix("store ") {
-            let Some((value, ptr)) = store.rsplit_once(", ptr %") else {
-                self.clear_synced();
-                return;
-            };
-            if names_state(value, &self.state_derived) {
-                self.clear_synced();
-                return;
-            }
-            let ptr = &ptr[..ptr.find([',', ' ']).unwrap_or(ptr.len())];
-            if let Some(bits) = slot_state_bits(ptr) {
-                self.known.synced_state &= !bits.0;
-                self.known.synced_flags &= !bits.1;
-            } else if ptr == "state" || self.state_derived.contains(ptr) {
-                self.clear_synced();
-            }
-            return;
-        }
-        if rhs.starts_with("load ") {
-            return;
-        }
-        let call = rhs.strip_prefix("tail call ").or_else(|| rhs.strip_prefix("call "));
-        if let Some(call) = call {
-            let pure_intrinsic = call.split_once("@llvm.").is_some_and(|(_, name)| {
-                !name.starts_with("mem") && !name.starts_with("masked.")
-            }) && !names_state(call, &self.state_derived);
-            if !pure_intrinsic {
-                self.clear_synced();
-            }
-            return;
-        }
-        if names_state(rhs, &self.state_derived) {
-            if let Some(def) = def {
-                self.state_derived.insert(def.to_string());
-            }
-            if !rhs.starts_with("getelementptr ") {
-                self.clear_synced();
-            }
-        } else if rhs.starts_with("invoke ") || rhs.starts_with("callbr ") {
-            self.clear_synced();
-        }
-    }
-
-    fn clear_synced(&mut self) {
-        self.known.synced_state = 0;
-        self.known.synced_flags = 0;
-    }
-
     /// Loads all tracked registers and flags from `%state` into their allocas.
     fn sync_in(&mut self) {
         self.sync_in_parts(ALL_STATE, ALL_FLAGS);
@@ -1784,7 +1564,6 @@ impl FunctionLifter<'_> {
                 let v = self.val(&format!("load i64, ptr {ptr}"));
                 self.emit(&format!("store i64 {v}, ptr %{name}"));
                 self.known.gprs[idx] = Some(v);
-                self.known.synced_state |= 1u64 << idx;
                 self.block_entry_facts[idx] = GprFact::Bottom;
             }
         }
@@ -1796,7 +1575,6 @@ impl FunctionLifter<'_> {
                 let bit = self.val(&format!("trunc i8 {byte} to i1"));
                 self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
                 self.known.flags[flag as usize] = Some(bit);
-                self.known.synced_flags |= 1 << flag as usize;
             } else {
                 self.known.flags[flag as usize] = None;
             }
@@ -1848,23 +1626,16 @@ impl FunctionLifter<'_> {
         let state = state & self.written_state;
         let flags = flags & self.written_flags;
         for idx in 0..16 {
-            if self.regs[idx]
-                && state & (1u64 << idx) != 0
-                && self.known.synced_state & (1u64 << idx) == 0
-            {
+            if self.regs[idx] && state & (1u64 << idx) != 0 {
                 let Ok(v) = self.load_gpr(idx) else {
                     unreachable!("register {idx} is tracked")
                 };
                 let ptr = self.state_gpr_ptr(idx);
                 self.emit(&format!("store i64 {v}, ptr {ptr}"));
-                self.known.synced_state |= 1u64 << idx;
             }
         }
         for flag in FLAGS {
-            if self.flags[flag as usize]
-                && flags & (1 << flag as usize) != 0
-                && self.known.synced_flags & (1 << flag as usize) == 0
-            {
+            if self.flags[flag as usize] && flags & (1 << flag as usize) != 0 {
                 let bit = self.load_flag(flag);
                 let byte = match bit.as_str() {
                     "true" => "1".to_string(),
@@ -1873,7 +1644,6 @@ impl FunctionLifter<'_> {
                 };
                 let ptr = self.state_flag_ptr(flag);
                 self.emit(&format!("store i8 {byte}, ptr {ptr}"));
-                self.known.synced_flags |= 1 << flag as usize;
             }
         }
         if state & (ALL_XMM_STATE | ALL_YMMH_STATE) != 0 {
@@ -4224,8 +3994,6 @@ impl FunctionLifter<'_> {
             let out_state = self.state_sync_out_by(target);
             let in_state = self.state_written_by(target);
             self.sync_out_parts(out_state, flags);
-            let pre_synced_state = self.known.synced_state;
-            let pre_synced_flags = self.known.synced_flags;
             let pre_known_gprs = self.known.gprs.clone();
             let pre_known_flags = self.known.flags.clone();
             let pre_entry_facts = self.block_entry_facts;
@@ -4243,11 +4011,6 @@ impl FunctionLifter<'_> {
                     self.block_entry_facts[idx] = pre_entry_facts[idx];
                 }
             }
-            // The callee leaves every slot outside `in_state` / `written_flags` as it was, so an
-            // alloca that matched its slot before the call (and was not reloaded) still does.
-            let kept = (0xFFFF | ALL_XMM_STATE | ALL_YMMH_STATE) & !(1u64 << RSP) & !in_state;
-            self.known.synced_state |= pre_synced_state & kept;
-            self.known.synced_flags |= pre_synced_flags & !written_flags;
             for flag in FLAGS {
                 let f = flag as usize;
                 if self.flags[f] && written_flags & (1 << f) == 0 {
@@ -4279,8 +4042,6 @@ impl FunctionLifter<'_> {
         self.store_gpr(RSP, &new_rsp)?;
         if self.share_ret {
             self.has_shared_ret = true;
-            self.ret_synced
-                .push((self.known.synced_state, self.known.synced_flags));
             self.emit("br label %ret_epilog");
         } else {
             self.sync_out();
@@ -4317,7 +4078,6 @@ impl FunctionLifter<'_> {
             for (case, is_exit) in cases {
                 if is_exit {
                     self.exits.push(case);
-                    self.note_exit_synced(case);
                     let _ = write!(arms, " i64 {}, label %{}", imm(case, 64), exit_label(case));
                     continue;
                 }

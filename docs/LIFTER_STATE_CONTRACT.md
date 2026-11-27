@@ -4,8 +4,7 @@ Lifted functions are `void sub_<VA>(GuestState* state)` (`runtime/abi/playgta6_a
 function, registers and flags live in allocas. They are synced with `*state` around calls, at
 returns and at tail jumps. This document lists every place outside lifted code that reads or
 writes `GuestState`. It also states what a lifter that skips store-backs would have to guarantee.
-#2033 was such a lifter. #2040 reverted it; it is relanded now that the crash blamed on it was traced
-to `GetResourceAllocationInfo` under-sizing some streamed textures (reproduces without #2033).
+#2033 was such a lifter, and #2040 reverted it.
 
 **Status of the #2033 evidence: inconclusive.** With #2033, the menu-to-ingame boot crashed at
 116 s, and reverting it made one run reach the 900 s limit. Since then, the same crash
