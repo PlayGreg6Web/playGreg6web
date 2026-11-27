@@ -2656,6 +2656,84 @@ class V3SchemaAndGapBreakdownTests(unittest.TestCase):
         self.assertNotIn("WGPK v1 .wgsl.pack", help_text)
         self.assertNotIn("existing v1 sidecar", help_text)
 
+    def test_vs_outputs_and_ps_inputs_propagated_and_validated(self):
+        # Issue #2085: Brightness Calibration VS_Blit (COLOR0@0, TEXCOORD0@1) +
+        # PS_BlitCalibration (unused COLOR0 mask=0, TEXCOORD0@0 mask=3).
+        vs_entry = {
+            "hash_fnv1a64": "0x5fe7a88d9cb680b3",
+            "stage": "vertex",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "uniform",
+                 "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+            ],
+            "vs_outputs": [
+                {"semantic_reg": 1, "location": 0},
+                {"semantic_reg": 2, "location": 1},
+            ],
+        }
+        ps_entry = {
+            "hash_fnv1a64": "0x56214b8d3b10a108",
+            "stage": "fragment",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "texture",
+                 "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+            ],
+            "ps_inputs": [
+                {"semantic_reg": 1, "location": 0, "mask": 0},
+                {"semantic_reg": 2, "location": 0, "mask": 3},
+            ],
+        }
+        # Empty arrays are omitted for compact backward-compatible sidecars
+        vs_empty = {
+            "hash_fnv1a64": "0x000000000000aa01",
+            "stage": "vertex",
+            "bindings": [],
+            "vs_outputs": [],
+        }
+
+        doc, skipped = sidecar.build([{"entries": [vs_entry, ps_entry, vs_empty]}])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(
+            doc["stages"]["0x5fe7a88d9cb680b3"]["vs_outputs"],
+            [{"semantic_reg": 1, "location": 0}, {"semantic_reg": 2, "location": 1}],
+        )
+        self.assertNotIn("ps_inputs", doc["stages"]["0x5fe7a88d9cb680b3"])
+        self.assertEqual(
+            doc["stages"]["0x56214b8d3b10a108"]["ps_inputs"],
+            [{"semantic_reg": 1, "location": 0, "mask": 0}, {"semantic_reg": 2, "location": 0, "mask": 3}],
+        )
+        self.assertNotIn("vs_outputs", doc["stages"]["0x56214b8d3b10a108"])
+        self.assertNotIn("vs_outputs", doc["stages"]["0x000000000000aa01"])
+
+        # Round-trip through CLI + --merge-existing preserves vs_outputs & ps_inputs
+        with tempfile.TemporaryDirectory() as tmp:
+            src1 = Path(tmp) / "in1.json"
+            src2 = Path(tmp) / "in2.json"
+            out = Path(tmp) / "pack.reflect.json"
+            src1.write_text(json.dumps({"entries": [vs_entry]}), encoding="utf-8")
+            src2.write_text(json.dumps({"entries": [ps_entry]}), encoding="utf-8")
+            self.assertEqual(sidecar.main([str(src1), "--out", str(out)]), 0)
+            self.assertEqual(sidecar.main([str(src2), "--out", str(out), "--merge-existing", str(out)]), 0)
+            merged = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(merged["stages"]["0x5fe7a88d9cb680b3"]["vs_outputs"], vs_entry["vs_outputs"])
+        self.assertEqual(merged["stages"]["0x56214b8d3b10a108"]["ps_inputs"], ps_entry["ps_inputs"])
+
+        # Malformed vs_outputs / ps_inputs are rejected cleanly
+        bad_cases = [
+            ({"hash_fnv1a64": "0x1", "stage": "vertex", "bindings": [], "vs_outputs": "nope"}, "malformed vs_outputs"),
+            ({"hash_fnv1a64": "0x2", "stage": "vertex", "bindings": [], "vs_outputs": [{"semantic_reg": 256, "location": 0}]}, "malformed vs_outputs"),
+            ({"hash_fnv1a64": "0x3", "stage": "vertex", "bindings": [], "vs_outputs": [{"semantic_reg": True, "location": 0}]}, "malformed vs_outputs"),
+            ({"hash_fnv1a64": "0x4", "stage": "fragment", "bindings": [], "vs_outputs": [{"semantic_reg": 1, "location": 0}]}, "malformed vs_outputs"),
+            ({"hash_fnv1a64": "0x5", "stage": "fragment", "bindings": [], "ps_inputs": [{"semantic_reg": 2, "location": -1}]}, "malformed ps_inputs"),
+            ({"hash_fnv1a64": "0x6", "stage": "fragment", "bindings": [], "ps_inputs": [{"semantic_reg": 2, "location": 0, "mask": 16}]}, "malformed ps_inputs"),
+            ({"hash_fnv1a64": "0x7", "stage": "vertex", "bindings": [], "ps_inputs": [{"semantic_reg": 2, "location": 0, "mask": 3}]}, "malformed ps_inputs"),
+        ]
+        for bad_entry, expected_reason in bad_cases:
+            bad_doc, bad_skipped = sidecar.build([bad_entry])
+            self.assertEqual(bad_doc["stages"], {}, bad_entry)
+            self.assertEqual(bad_skipped, {expected_reason: 1}, bad_entry)
+
 
 if __name__ == "__main__":
     unittest.main()

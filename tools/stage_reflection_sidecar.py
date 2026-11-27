@@ -23,8 +23,10 @@ sidecar only when its reflection carries the join keys the runtime needs:
     {unresolved: true | "<reason>"} (G62 / #482, sidecar version 3; added with --unresolved-sources:
     the translator reflected the binding but could not trace its descriptor; the runtime binds the
     worker's default for it and joins the rest of the stage; writable kinds stay skipped));
-  - optional stage-level `rt_arena: true` (RT arena prelude flag) and compute-only `mesh_output`
-    ({max_vertices: 1..256, max_primitives: 1..256, vertex_words: 4 + 4*n, 0 <= n <= 15});
+  - optional stage-level `rt_arena: true` (RT arena prelude flag), compute-only `mesh_output`
+    ({max_vertices: 1..256, max_primitives: 1..256, vertex_words: 4 + 4*n, 0 <= n <= 15}),
+    vertex-only `vs_outputs` ([{semantic_reg, location}]), and fragment-only `ps_inputs`
+    ([{semantic_reg, location, mask?}]) for FSSM OSG1<->ISG1 @location remapping (#2085);
   - a vertex stage that fetches attributes lists `vertex_inputs` ({location, vb_slot, byte_offset,
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
@@ -151,6 +153,35 @@ def mesh_output_ok(mesh_output: Any) -> bool:
         and 4 <= vw <= MAX_MESH_VERTEX_WORDS
         and vw % 4 == 0
     )
+
+
+def _normalize_stage_params(raw_params: Any) -> list[dict[str, int]] | None:
+    """Validate and normalize optional FSSM `vs_outputs` / `ps_inputs` arrays (#2085).
+
+    Each entry is `{"semantic_reg": 0..255, "location": u32, "mask"?: 0..15}`.
+    Returns None when malformed.
+    """
+    if not isinstance(raw_params, list):
+        return None
+    normalized: list[dict[str, int]] = []
+    for item in raw_params:
+        if not isinstance(item, dict):
+            return None
+        semantic_reg = item.get("semantic_reg")
+        location = item.get("location")
+        if not (_u32(semantic_reg) and semantic_reg <= 0xFF and _u32(location)):
+            return None
+        rec: dict[str, int] = {
+            "semantic_reg": semantic_reg,
+            "location": location,
+        }
+        if "mask" in item and item["mask"] is not None:
+            mask = item["mask"]
+            if not (_u32(mask) and mask <= 0x0F):
+                return None
+            rec["mask"] = mask
+        normalized.append(rec)
+    return normalized
 
 
 def _cb_dword_ok(heap: dict[str, Any]) -> bool:
@@ -395,6 +426,18 @@ def convert(entry: dict[str, Any], *, unresolved: bool = False) -> tuple[str | N
             "max_primitives": mesh_output["max_primitives"],
             "vertex_words": mesh_output["vertex_words"],
         }
+    if "vs_outputs" in entry and entry["vs_outputs"] is not None:
+        vs_outputs = _normalize_stage_params(entry["vs_outputs"])
+        if vs_outputs is None or (vs_outputs and stage != "vertex"):
+            return key, None, "malformed vs_outputs"
+        if vs_outputs:
+            out["vs_outputs"] = vs_outputs
+    if "ps_inputs" in entry and entry["ps_inputs"] is not None:
+        ps_inputs = _normalize_stage_params(entry["ps_inputs"])
+        if ps_inputs is None or (ps_inputs and stage != "fragment"):
+            return key, None, "malformed ps_inputs"
+        if ps_inputs:
+            out["ps_inputs"] = ps_inputs
     return key, out, ""
 
 
@@ -902,6 +945,14 @@ def _load_sidecar_doc(path: Path, *, label: str, allow_missing: bool) -> tuple[i
         if "mesh_output" in v:
             if v.get("stage") != "compute" or not mesh_output_ok(v["mesh_output"]):
                 raise ValueError(f"{label} stage {safe_k!r} has malformed mesh_output")
+        if "vs_outputs" in v and v["vs_outputs"] is not None:
+            vs_outputs = _normalize_stage_params(v["vs_outputs"])
+            if vs_outputs is None or (vs_outputs and v.get("stage") != "vertex"):
+                raise ValueError(f"{label} stage {safe_k!r} has malformed vs_outputs")
+        if "ps_inputs" in v and v["ps_inputs"] is not None:
+            ps_inputs = _normalize_stage_params(v["ps_inputs"])
+            if ps_inputs is None or (ps_inputs and v.get("stage") != "fragment"):
+                raise ValueError(f"{label} stage {safe_k!r} has malformed ps_inputs")
         validated[k] = v
     return version, validated
 

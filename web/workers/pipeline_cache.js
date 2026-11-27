@@ -499,6 +499,7 @@
   // and user-registered WGPK/numeric shader module IDs without leaking GC references.
   const registeredObjectIds = new WeakMap();
   const registeredShaderModuleSources = new WeakMap();
+  const registeredShaderModuleReflections = new WeakMap();
   const moduleInterstageInterfaceCache = new WeakMap();
   const opaqueObjectIds = new WeakMap();
   const fallbackPipelineLayoutProfiles = new WeakMap();
@@ -652,7 +653,7 @@
     shaderModuleRegistryVersion += 1;
   }
 
-  function registerShaderModuleId(gpuObject, id, wgslCode) {
+  function registerShaderModuleId(gpuObject, id, wgslCode, stageReflection) {
     if (!gpuObject || (typeof gpuObject !== 'object' && typeof gpuObject !== 'function')) {
       throw new TypeError('gpuObject must be an object');
     }
@@ -662,7 +663,64 @@
       registeredShaderModuleSources.set(gpuObject, wgslCode);
       moduleInterstageInterfaceCache.delete(gpuObject);
     }
+    if (stageReflection && typeof stageReflection === 'object') {
+      registeredShaderModuleReflections.set(gpuObject, stageReflection);
+    }
     return token;
+  }
+
+  /**
+   * Associate a `GPUShaderModule` with its stage reflection metadata (carrying optional FSSM
+   * `vs_outputs` / `ps_inputs` semantic maps for SPI_PS_INPUT_CNTL `@location` remapping, #2085).
+   *
+   * @param {object} gpuShaderModule
+   * @param {object} stageReflection
+   * @returns {object}
+   */
+  function registerShaderModuleReflection(gpuShaderModule, stageReflection) {
+    if (
+      !gpuShaderModule ||
+      (typeof gpuShaderModule !== 'object' && typeof gpuShaderModule !== 'function')
+    ) {
+      throw new TypeError('gpuShaderModule must be an object');
+    }
+    if (!stageReflection || typeof stageReflection !== 'object') {
+      throw new TypeError('stageReflection must be a non-null object');
+    }
+    registeredShaderModuleReflections.set(gpuShaderModule, stageReflection);
+    return stageReflection;
+  }
+
+  /**
+   * Retrieve stage reflection metadata registered for `gpuShaderModule` (or attached directly via
+   * `.reflection` / `.vs_outputs` / `.vsOutputs` / `.ps_inputs` / `.psInputs`), or `null`.
+   *
+   * @param {object | null | undefined} gpuShaderModule
+   * @returns {object | null}
+   */
+  function getRegisteredShaderModuleReflection(gpuShaderModule) {
+    if (
+      !gpuShaderModule ||
+      (typeof gpuShaderModule !== 'object' && typeof gpuShaderModule !== 'function')
+    ) {
+      return null;
+    }
+    const registered = registeredShaderModuleReflections.get(gpuShaderModule);
+    if (registered && typeof registered === 'object') {
+      return registered;
+    }
+    if (gpuShaderModule.reflection && typeof gpuShaderModule.reflection === 'object') {
+      return gpuShaderModule.reflection;
+    }
+    if (
+      Array.isArray(gpuShaderModule.vs_outputs) ||
+      Array.isArray(gpuShaderModule.vsOutputs) ||
+      Array.isArray(gpuShaderModule.ps_inputs) ||
+      Array.isArray(gpuShaderModule.psInputs)
+    ) {
+      return gpuShaderModule;
+    }
+    return null;
   }
 
   /**
@@ -4329,7 +4387,13 @@
       Object.prototype.hasOwnProperty.call(descriptor, 'fsCode') ||
       Object.prototype.hasOwnProperty.call(descriptor, 'psCode') ||
       Object.prototype.hasOwnProperty.call(descriptor, 'vertexCode') ||
-      Object.prototype.hasOwnProperty.call(descriptor, 'fragmentCode');
+      Object.prototype.hasOwnProperty.call(descriptor, 'fragmentCode') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'vsReflection') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'psReflection') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'vsOutputs') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'vs_outputs') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'psInputs') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'ps_inputs');
 
     // 1. Pipeline layout normalization
     const rawLayout = descriptor.layout;
@@ -4412,7 +4476,10 @@
 
       const hasVertexCodeMeta =
         Object.prototype.hasOwnProperty.call(descriptor.vertex, 'code') ||
-        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'wgsl');
+        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'wgsl') ||
+        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'reflection') ||
+        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'vsOutputs') ||
+        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'vs_outputs');
 
       if (vertexLayoutNormalized || nextVsEntryPoint !== descriptor.vertex.entryPoint || hasVertexCodeMeta) {
         nextVertex = {
@@ -4422,6 +4489,9 @@
         if (hasVertexCodeMeta) {
           delete nextVertex.code;
           delete nextVertex.wgsl;
+          delete nextVertex.reflection;
+          delete nextVertex.vsOutputs;
+          delete nextVertex.vs_outputs;
         }
         if (shouldInspectBuffers && vertexLayoutNormalized) {
           nextVertex.buffers = nextBuffers;
@@ -4435,7 +4505,10 @@
       let fragChanged = false;
       const hasFragmentCodeMeta =
         Object.prototype.hasOwnProperty.call(descriptor.fragment, 'code') ||
-        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'wgsl');
+        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'wgsl') ||
+        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'reflection') ||
+        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'psInputs') ||
+        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'ps_inputs');
       let nextFsEntryPoint = descriptor.fragment.entryPoint;
       if (
         fallbackProfile !== null &&
@@ -4474,6 +4547,9 @@
         if (hasFragmentCodeMeta) {
           delete nextFragment.code;
           delete nextFragment.wgsl;
+          delete nextFragment.reflection;
+          delete nextFragment.psInputs;
+          delete nextFragment.ps_inputs;
         }
       }
     }
@@ -4580,6 +4656,12 @@
       delete nextDescriptor.psCode;
       delete nextDescriptor.vertexCode;
       delete nextDescriptor.fragmentCode;
+      delete nextDescriptor.vsReflection;
+      delete nextDescriptor.psReflection;
+      delete nextDescriptor.vsOutputs;
+      delete nextDescriptor.vs_outputs;
+      delete nextDescriptor.psInputs;
+      delete nextDescriptor.ps_inputs;
     }
     if (stripDepthStencil) {
       delete nextDescriptor.depthStencil;
@@ -5735,19 +5817,391 @@
     };
   }
 
+  function extractStageParamArray(source, snakeKey, camelKey) {
+    if (Array.isArray(source)) {
+      return source;
+    }
+    if (source && typeof source === 'object') {
+      if (Array.isArray(source[snakeKey])) return source[snakeKey];
+      if (Array.isArray(source[camelKey])) return source[camelKey];
+    }
+    return null;
+  }
+
+  /**
+   * Compute non-identity SPI_PS_INPUT_CNTL inter-stage `@location` remaps by matching
+   * `ps_inputs[i].semantic_reg` against `vs_outputs[j].semantic_reg` (#2085).
+   *
+   * Skips unused PS inputs (`mask === 0`) and identity mappings (`psLocation === vsLocation`).
+   * Accepts either raw param arrays or stage reflection records containing `vs_outputs`/`ps_inputs`.
+   *
+   * @param {Array<object> | object | null | undefined} vsOutputsOrReflection
+   * @param {Array<object> | object | null | undefined} psInputsOrReflection
+   * @returns {Array<{
+   *   semanticReg: number,
+   *   semantic_reg: number,
+   *   psLocation: number,
+   *   ps_location: number,
+   *   vsLocation: number,
+   *   vs_location: number,
+   * }>}
+   */
+  function computeInterstageLocationRemaps(vsOutputsOrReflection, psInputsOrReflection) {
+    const vsOutputs = extractStageParamArray(vsOutputsOrReflection, 'vs_outputs', 'vsOutputs');
+    const psInputs = extractStageParamArray(psInputsOrReflection, 'ps_inputs', 'psInputs');
+    if (!vsOutputs || vsOutputs.length === 0 || !psInputs || psInputs.length === 0) {
+      return [];
+    }
+
+    const vsLocBySemantic = new Map();
+    for (let i = 0; i < vsOutputs.length; i += 1) {
+      const o = vsOutputs[i];
+      if (!o || typeof o !== 'object') continue;
+      const sem = o.semantic_reg !== undefined ? o.semantic_reg : o.semanticReg;
+      const loc = o.location;
+      if (
+        !Number.isInteger(sem) ||
+        sem < 0 ||
+        sem > 0xff ||
+        !Number.isInteger(loc) ||
+        loc < 0 ||
+        loc > 0xffffffff
+      ) {
+        continue;
+      }
+      if (!vsLocBySemantic.has(sem)) {
+        vsLocBySemantic.set(sem, loc);
+      }
+    }
+    if (vsLocBySemantic.size === 0) {
+      return [];
+    }
+
+    const remaps = [];
+    const seenPsLoc = new Set();
+    for (let i = 0; i < psInputs.length; i += 1) {
+      const inp = psInputs[i];
+      if (!inp || typeof inp !== 'object') continue;
+      if (inp.mask !== undefined && inp.mask !== null && inp.mask === 0) {
+        continue;
+      }
+      const sem = inp.semantic_reg !== undefined ? inp.semantic_reg : inp.semanticReg;
+      const psLoc = inp.location;
+      if (
+        !Number.isInteger(sem) ||
+        sem < 0 ||
+        sem > 0xff ||
+        !Number.isInteger(psLoc) ||
+        psLoc < 0 ||
+        psLoc > 0xffffffff
+      ) {
+        continue;
+      }
+      if (seenPsLoc.has(psLoc)) {
+        continue;
+      }
+      seenPsLoc.add(psLoc);
+      const vsLoc = vsLocBySemantic.get(sem);
+      if (vsLoc !== undefined && vsLoc !== psLoc) {
+        remaps.push({
+          semanticReg: sem,
+          semantic_reg: sem,
+          psLocation: psLoc,
+          ps_location: psLoc,
+          vsLocation: vsLoc,
+          vs_location: vsLoc,
+        });
+      }
+    }
+
+    remaps.sort((a, b) => a.psLocation - b.psLocation);
+    return remaps;
+  }
+
+  function resolveSemanticRemapsFromOptions(opts) {
+    if (!opts || typeof opts !== 'object') {
+      return [];
+    }
+    if (opts.locationRemaps instanceof Map) {
+      const list = [];
+      for (const [psLoc, vsLoc] of opts.locationRemaps.entries()) {
+        if (
+          Number.isInteger(psLoc) &&
+          psLoc >= 0 &&
+          Number.isInteger(vsLoc) &&
+          vsLoc >= 0 &&
+          psLoc !== vsLoc
+        ) {
+          list.push({
+            semanticReg: null,
+            semantic_reg: null,
+            psLocation: psLoc,
+            ps_location: psLoc,
+            vsLocation: vsLoc,
+            vs_location: vsLoc,
+          });
+        }
+      }
+      list.sort((a, b) => a.psLocation - b.psLocation);
+      return list;
+    }
+    if (Array.isArray(opts.locationRemaps)) {
+      const list = [];
+      const seen = new Set();
+      for (let i = 0; i < opts.locationRemaps.length; i += 1) {
+        const r = opts.locationRemaps[i];
+        if (!r || typeof r !== 'object') continue;
+        const psLoc = r.psLocation !== undefined ? r.psLocation : r.ps_location;
+        const vsLoc = r.vsLocation !== undefined ? r.vsLocation : r.vs_location;
+        const sem = r.semanticReg !== undefined ? r.semanticReg : r.semantic_reg;
+        if (
+          Number.isInteger(psLoc) &&
+          psLoc >= 0 &&
+          Number.isInteger(vsLoc) &&
+          vsLoc >= 0 &&
+          psLoc !== vsLoc &&
+          !seen.has(psLoc)
+        ) {
+          seen.add(psLoc);
+          list.push({
+            semanticReg: Number.isInteger(sem) ? sem : null,
+            semantic_reg: Number.isInteger(sem) ? sem : null,
+            psLocation: psLoc,
+            ps_location: psLoc,
+            vsLocation: vsLoc,
+            vs_location: vsLoc,
+          });
+        }
+      }
+      list.sort((a, b) => a.psLocation - b.psLocation);
+      return list;
+    }
+    const vsSrc =
+      opts.vsOutputs !== undefined
+        ? opts.vsOutputs
+        : opts.vs_outputs !== undefined
+          ? opts.vs_outputs
+          : opts.vsReflection;
+    const psSrc =
+      opts.psInputs !== undefined
+        ? opts.psInputs
+        : opts.ps_inputs !== undefined
+          ? opts.ps_inputs
+          : opts.psReflection;
+    return computeInterstageLocationRemaps(vsSrc, psSrc);
+  }
+
+  /**
+   * Rewrite fragment shader input `@location(psLoc)` attributes to `@location(vsLoc)` according
+   * to a semantic remap table (`SPI_PS_INPUT_CNTL`, #2085).
+   *
+   * Applies all edits in a single descending-offset pass so swaps/cycles (`0->1, 1->0`) never
+   * clobber each other, never touches fragment outputs (`PsOut`) or comments, and leaves identity
+   * mappings untouched. If a remapped input would collide with an unmapped PS input, the unmapped
+   * input is relocated to the lowest unused location so the resulting WGSL stays valid.
+   *
+   * @param {string} psWgsl
+   * @param {Array<object> | Map<number, number>} remaps
+   * @param {{ psEntryPoint?: string, psInterface?: object, vsInterface?: object, vsOutputs?: Array<object> }} [options]
+   * @returns {{
+   *   patched: boolean,
+   *   psCode: string,
+   *   locationRemapFixes: number,
+   *   remapsApplied: Array<{ semanticReg: number | null, psLocation: number, vsLocation: number }>,
+   *   remapSignature: string | null,
+   * }}
+   */
+  function remapPsInputLocationsWgsl(psWgsl, remaps, options = {}) {
+    const noop = {
+      patched: false,
+      psCode: psWgsl,
+      locationRemapFixes: 0,
+      remapsApplied: [],
+      remapSignature: null,
+    };
+    if (typeof psWgsl !== 'string' || psWgsl.length === 0 || !remaps) {
+      return noop;
+    }
+    const opts = options && typeof options === 'object' ? options : {};
+    const remapList = resolveSemanticRemapsFromOptions({ locationRemaps: remaps });
+    if (remapList.length === 0) {
+      return noop;
+    }
+
+    const psInterface =
+      opts.psInterface && opts.psInterface.locations instanceof Map
+        ? opts.psInterface
+        : parseInterstageInterface(psWgsl, 'fragment', opts.psEntryPoint);
+    if (!psInterface || psInterface.locations.size === 0) {
+      return noop;
+    }
+
+    const rawRemapByPsLoc = new Map();
+    for (let i = 0; i < remapList.length; i += 1) {
+      const r = remapList[i];
+      if (psInterface.locations.has(r.psLocation) && r.psLocation !== r.vsLocation) {
+        rawRemapByPsLoc.set(r.psLocation, r);
+      }
+    }
+    if (rawRemapByPsLoc.size === 0) {
+      return noop;
+    }
+
+    const psLocKeys = Array.from(psInterface.locations.keys()).sort((a, b) => a - b);
+    const assignedTargets = new Map();
+    const usedTargets = new Set();
+    const displacedLocs = [];
+
+    // 1. Assign non-identity semantic remaps first (ascending psLocation, guarding duplicate targets).
+    for (let i = 0; i < psLocKeys.length; i += 1) {
+      const psLoc = psLocKeys[i];
+      const r = rawRemapByPsLoc.get(psLoc);
+      if (!r) continue;
+      if (!usedTargets.has(r.vsLocation)) {
+        assignedTargets.set(psLoc, { targetLoc: r.vsLocation, semanticReg: r.semanticReg });
+        usedTargets.add(r.vsLocation);
+      } else {
+        displacedLocs.push(psLoc);
+      }
+    }
+
+    // 2. Keep unmapped PS inputs at their original location unless another remapped input took it.
+    for (let i = 0; i < psLocKeys.length; i += 1) {
+      const psLoc = psLocKeys[i];
+      if (assignedTargets.has(psLoc) || rawRemapByPsLoc.has(psLoc)) continue;
+      if (!usedTargets.has(psLoc)) {
+        assignedTargets.set(psLoc, { targetLoc: psLoc, semanticReg: null });
+        usedTargets.add(psLoc);
+      } else {
+        displacedLocs.push(psLoc);
+      }
+    }
+
+    // 3. Relocate any displaced PS input to the lowest free location unused by VS or PS targets.
+    if (displacedLocs.length > 0) {
+      const reservedLocs = new Set(usedTargets);
+      if (opts.vsInterface && opts.vsInterface.locations instanceof Map) {
+        for (const loc of opts.vsInterface.locations.keys()) {
+          reservedLocs.add(loc);
+        }
+      }
+      const vsOutputs = extractStageParamArray(opts.vsOutputs, 'vs_outputs', 'vsOutputs');
+      if (vsOutputs) {
+        for (let i = 0; i < vsOutputs.length; i += 1) {
+          const o = vsOutputs[i];
+          if (o && Number.isInteger(o.location) && o.location >= 0) {
+            reservedLocs.add(o.location);
+          }
+        }
+      }
+      let nextFree = 0;
+      for (let i = 0; i < displacedLocs.length; i += 1) {
+        while (reservedLocs.has(nextFree)) {
+          nextFree += 1;
+        }
+        assignedTargets.set(displacedLocs[i], { targetLoc: nextFree, semanticReg: null });
+        usedTargets.add(nextFree);
+        reservedLocs.add(nextFree);
+        nextFree += 1;
+      }
+    }
+
+    const edits = [];
+    const remapsApplied = [];
+    for (let i = 0; i < psLocKeys.length; i += 1) {
+      const psLoc = psLocKeys[i];
+      const assignment = assignedTargets.get(psLoc);
+      if (!assignment || assignment.targetLoc === psLoc) {
+        continue;
+      }
+      const entry = psInterface.locations.get(psLoc);
+      if (!entry || !entry.locationAttrSpan) {
+        continue;
+      }
+      edits.push({
+        start: entry.locationAttrSpan.start,
+        end: entry.locationAttrSpan.end,
+        text: `@location(${assignment.targetLoc})`,
+      });
+      remapsApplied.push({
+        semanticReg: assignment.semanticReg,
+        psLocation: psLoc,
+        vsLocation: assignment.targetLoc,
+      });
+    }
+
+    if (edits.length === 0) {
+      return noop;
+    }
+
+    const patchedPsCode = applyTextEditsDescending(psWgsl, edits);
+    if (patchedPsCode === psWgsl) {
+      return noop;
+    }
+
+    const remapSignature = `r:${remapsApplied.map((r) => `${r.psLocation}->${r.vsLocation}`).join(';')}`;
+    return {
+      patched: true,
+      psCode: patchedPsCode,
+      locationRemapFixes: remapsApplied.length,
+      remapsApplied,
+      remapSignature,
+    };
+  }
+
   /**
    * Analyze inter-stage `@location(N)`, `@interpolate(...)`, and type compatibility between
-   * vertex and fragment WGSL sources.
+   * vertex and fragment WGSL sources, optionally checking FSSM `vs_outputs` <-> `ps_inputs`
+   * semantic location remaps (`SPI_PS_INPUT_CNTL`, #2085).
    *
    * @param {string} vsWgsl
    * @param {string} psWgsl
-   * @param {{ vsEntryPoint?: string, psEntryPoint?: string }} [options]
+   * @param {{
+   *   vsEntryPoint?: string,
+   *   psEntryPoint?: string,
+   *   vsOutputs?: Array<object>,
+   *   psInputs?: Array<object>,
+   *   vsReflection?: object,
+   *   psReflection?: object,
+   *   locationRemaps?: Array<object> | Map<number, number>,
+   * }} [options]
    * @returns {object}
    */
   function analyzeInterstageCompatibility(vsWgsl, psWgsl, options = {}) {
     const opts = options && typeof options === 'object' ? options : {};
     const vsInterface = parseInterstageInterface(vsWgsl, 'vertex', opts.vsEntryPoint);
     const psInterface = parseInterstageInterface(psWgsl, 'fragment', opts.psEntryPoint);
+    const semanticRemaps = resolveSemanticRemapsFromOptions(opts);
+    const psRemap =
+      semanticRemaps.length > 0 && psInterface
+        ? remapPsInputLocationsWgsl(psWgsl, semanticRemaps, {
+            psEntryPoint: opts.psEntryPoint,
+            psInterface,
+            vsInterface,
+            vsOutputs: opts.vsOutputs || opts.vs_outputs || opts.vsReflection,
+          })
+        : null;
+
+    if (psRemap && psRemap.patched) {
+      const remappedPsInterface = parseInterstageInterface(
+        psRemap.psCode,
+        'fragment',
+        opts.psEntryPoint
+      );
+      const base = analyzeInterstageCompatibilityFromInterfaces(vsInterface, remappedPsInterface);
+      const combinedSig = base.patchSignature
+        ? `${psRemap.remapSignature}|${base.patchSignature}`
+        : psRemap.remapSignature;
+      return {
+        ...base,
+        compatible: false,
+        needsPatch: true,
+        patchSignature: combinedSig,
+        locationRemaps: psRemap.remapsApplied,
+        remapSignature: psRemap.remapSignature,
+      };
+    }
+
     return analyzeInterstageCompatibilityFromInterfaces(vsInterface, psInterface);
   }
 
@@ -6103,92 +6557,125 @@
    */
   function patchInterstageWgsl(vsWgsl, psWgsl, options = {}) {
     const opts = options && typeof options === 'object' ? options : {};
+    const semanticRemaps = resolveSemanticRemapsFromOptions(opts);
+    const parsedVsInterfaceForRemap =
+      semanticRemaps.length > 0
+        ? opts.vsInterface || parseInterstageInterface(vsWgsl, 'vertex', opts.vsEntryPoint)
+        : null;
+    const psRemap =
+      semanticRemaps.length > 0
+        ? remapPsInputLocationsWgsl(psWgsl, semanticRemaps, {
+            psEntryPoint: opts.psEntryPoint,
+            psInterface: opts.psInterface,
+            vsInterface: parsedVsInterfaceForRemap,
+            vsOutputs: opts.vsOutputs || opts.vs_outputs || opts.vsReflection,
+          })
+        : {
+            patched: false,
+            psCode: psWgsl,
+            locationRemapFixes: 0,
+            remapsApplied: [],
+            remapSignature: null,
+          };
+
+    const effectivePsCode = psRemap.patched ? psRemap.psCode : psWgsl;
     const analysis =
-      opts.analysis && typeof opts.analysis === 'object'
+      !psRemap.patched && opts.analysis && typeof opts.analysis === 'object'
         ? opts.analysis
-        : analyzeInterstageCompatibility(vsWgsl, psWgsl, opts);
+        : analyzeInterstageCompatibility(vsWgsl, effectivePsCode, {
+            vsEntryPoint: opts.vsEntryPoint,
+            psEntryPoint: opts.psEntryPoint,
+          });
 
-    if (!analysis || !analysis.needsPatch) {
-      return {
-        patched: false,
-        vsCode: vsWgsl,
-        psCode: psWgsl,
-        patchedStage: null,
-        flatFixes: 0,
-        interpolateFixes: 0,
-        missingLocationFixes: 0,
-        typeFixes: 0,
-        integerFlatFixes: 0,
-        patchSignature: null,
-        analysis,
-      };
-    }
+    let vsPatched = false;
+    let patchedVsCode = vsWgsl;
+    let flatFixes = 0;
+    let interpolateFixes = 0;
+    let missingLocationFixes = 0;
+    let typeFixes = 0;
+    let integerFlatFixes = 0;
+    let vsPatchSignature = null;
 
-    const vsInterface = analysis.vsInterface;
-    if (!vsInterface || vsInterface.returnKind === 'void' || vsInterface.returnKind === 'unknown') {
-      return {
-        patched: false,
-        vsCode: vsWgsl,
-        psCode: psWgsl,
-        patchedStage: null,
-        flatFixes: 0,
-        interpolateFixes: 0,
-        missingLocationFixes: 0,
-        typeFixes: 0,
-        integerFlatFixes: 0,
-        patchSignature: null,
-        analysis,
-      };
-    }
+    if (
+      analysis &&
+      analysis.needsPatch &&
+      analysis.vsInterface &&
+      analysis.vsInterface.returnKind !== 'void' &&
+      analysis.vsInterface.returnKind !== 'unknown'
+    ) {
+      const vsInterface = analysis.vsInterface;
+      const canEditStructInPlace =
+        vsInterface.returnKind === 'struct' &&
+        vsInterface.structInfo !== null &&
+        analysis.typeMismatches.length === 0 &&
+        !(analysis.missingLocations.length > 0 && vsInterface.hasPositionalConstructor);
 
-    const canEditStructInPlace =
-      vsInterface.returnKind === 'struct' &&
-      vsInterface.structInfo !== null &&
-      analysis.typeMismatches.length === 0 &&
-      !(analysis.missingLocations.length > 0 && vsInterface.hasPositionalConstructor);
+      let candidateVsCode = canEditStructInPlace
+        ? patchVsStructInPlace(vsWgsl, vsInterface, analysis)
+        : patchVsWithWrapperEntryPoint(vsWgsl, vsInterface, analysis);
 
-    let patchedVsCode = canEditStructInPlace
-      ? patchVsStructInPlace(vsWgsl, vsInterface, analysis)
-      : patchVsWithWrapperEntryPoint(vsWgsl, vsInterface, analysis);
-
-    if (patchedVsCode === vsWgsl) {
-      return {
-        patched: false,
-        vsCode: vsWgsl,
-        psCode: psWgsl,
-        patchedStage: null,
-        flatFixes: 0,
-        interpolateFixes: 0,
-        missingLocationFixes: 0,
-        typeFixes: 0,
-        integerFlatFixes: 0,
-        patchSignature: null,
-        analysis,
-      };
-    }
-
-    // If patching introduced f16 inter-stage types into a VS without `enable f16;`, prepend it.
-    const introducesF16 =
-      analysis.missingLocations.some((m) => m.psTypeInfo && m.psTypeInfo.scalar === 'f16') ||
-      analysis.typeMismatches.some((t) => t.psTypeInfo && t.psTypeInfo.scalar === 'f16');
-    if (introducesF16) {
-      const strippedPatched = stripWgslCommentsPreservingLength(patchedVsCode);
-      if (!/\benable\s+[^;]*\bf16\b/.test(strippedPatched)) {
-        patchedVsCode = `enable f16;\n${patchedVsCode}`;
+      if (candidateVsCode !== vsWgsl) {
+        // If patching introduced f16 inter-stage types into a VS without `enable f16;`, prepend it.
+        const introducesF16 =
+          analysis.missingLocations.some((m) => m.psTypeInfo && m.psTypeInfo.scalar === 'f16') ||
+          analysis.typeMismatches.some((t) => t.psTypeInfo && t.psTypeInfo.scalar === 'f16');
+        if (introducesF16) {
+          const strippedPatched = stripWgslCommentsPreservingLength(candidateVsCode);
+          if (!/\benable\s+[^;]*\bf16\b/.test(strippedPatched)) {
+            candidateVsCode = `enable f16;\n${candidateVsCode}`;
+          }
+        }
+        vsPatched = true;
+        patchedVsCode = candidateVsCode;
+        flatFixes = analysis.flatMismatches.length;
+        interpolateFixes = analysis.interpolateMismatches.length;
+        missingLocationFixes = analysis.missingLocations.length;
+        typeFixes = analysis.typeMismatches.length;
+        integerFlatFixes = analysis.integerFlatFixes.length;
+        vsPatchSignature = analysis.patchSignature;
       }
     }
+
+    const psPatched = psRemap.patched;
+    const patched = vsPatched || psPatched;
+    if (!patched) {
+      return {
+        patched: false,
+        vsCode: vsWgsl,
+        psCode: psWgsl,
+        patchedStage: null,
+        flatFixes: 0,
+        interpolateFixes: 0,
+        missingLocationFixes: 0,
+        typeFixes: 0,
+        integerFlatFixes: 0,
+        locationRemapFixes: 0,
+        locationRemaps: [],
+        patchSignature: null,
+        analysis,
+      };
+    }
+
+    const combinedSignature =
+      psPatched && vsPatchSignature
+        ? `${psRemap.remapSignature}|${vsPatchSignature}`
+        : psPatched
+          ? psRemap.remapSignature
+          : vsPatchSignature;
 
     return {
       patched: true,
       vsCode: patchedVsCode,
-      psCode: psWgsl,
-      patchedStage: 'vertex',
-      flatFixes: analysis.flatMismatches.length,
-      interpolateFixes: analysis.interpolateMismatches.length,
-      missingLocationFixes: analysis.missingLocations.length,
-      typeFixes: analysis.typeMismatches.length,
-      integerFlatFixes: analysis.integerFlatFixes.length,
-      patchSignature: analysis.patchSignature,
+      psCode: effectivePsCode,
+      patchedStage: vsPatched && psPatched ? 'both' : vsPatched ? 'vertex' : 'fragment',
+      flatFixes,
+      interpolateFixes,
+      missingLocationFixes,
+      typeFixes,
+      integerFlatFixes,
+      locationRemapFixes: psRemap.locationRemapFixes,
+      locationRemaps: psRemap.remapsApplied,
+      patchSignature: combinedSignature,
       analysis,
     };
   }
@@ -6356,6 +6843,15 @@
         'maxInterstageInterfaceCache'
       );
 
+      this._reflectionRegistry =
+        options.reflectionRegistry && typeof options.reflectionRegistry === 'object'
+          ? options.reflectionRegistry
+          : options.reflectionSidecar && typeof options.reflectionSidecar === 'object'
+            ? options.reflectionSidecar
+            : options.reflection && typeof options.reflection === 'object'
+              ? options.reflection
+              : null;
+
       this._renderPipelines = new Map();
       this._computePipelines = new Map();
       this._bindGroupLayouts = new Map();
@@ -6431,6 +6927,7 @@
         interstageInterpolateFixes: 0,
         interstageTypeFixes: 0,
         interstageIntegerFlatFixes: 0,
+        interstageLocationRemapFixes: 0,
         interstageModuleCacheHits: 0,
         interstageModuleCacheMisses: 0,
         interstageModuleEvictions: 0,
@@ -6447,8 +6944,30 @@
      * @param {string} [wgslCode]
      * @returns {string}
      */
-    registerShaderModule(shaderModule, hashOrId, wgslCode) {
-      return registerShaderModuleId(shaderModule, hashOrId, wgslCode);
+    registerShaderModule(shaderModule, hashOrId, wgslCode, stageReflection) {
+      return registerShaderModuleId(shaderModule, hashOrId, wgslCode, stageReflection);
+    }
+
+    /**
+     * Associate a `GPUShaderModule` with its stage reflection metadata (carrying optional FSSM
+     * `vs_outputs` / `ps_inputs` semantic maps for SPI_PS_INPUT_CNTL `@location` remapping, #2085).
+     *
+     * @param {object} shaderModule
+     * @param {object} stageReflection
+     * @returns {object}
+     */
+    registerShaderModuleReflection(shaderModule, stageReflection) {
+      return registerShaderModuleReflection(shaderModule, stageReflection);
+    }
+
+    /**
+     * Attach or replace a `ReflectionRegistry` / parsed stage reflection sidecar so render
+     * pipelines can automatically resolve `vs_outputs` / `ps_inputs` by WGPK shader hash (#2085).
+     *
+     * @param {object | null} registry
+     */
+    setReflectionRegistry(registry) {
+      this._reflectionRegistry = registry && typeof registry === 'object' ? registry : null;
     }
 
     /**
@@ -6602,6 +7121,135 @@
       return parsed;
     }
 
+    _extractShaderHashForReflectionLookup(moduleObj) {
+      if (!moduleObj || (typeof moduleObj !== 'object' && typeof moduleObj !== 'function')) {
+        return null;
+      }
+      const direct =
+        moduleObj.wgpkHash !== undefined
+          ? moduleObj.wgpkHash
+          : moduleObj.shaderHash !== undefined
+            ? moduleObj.shaderHash
+            : moduleObj.hashHex !== undefined
+              ? moduleObj.hashHex
+              : moduleObj.hash;
+      if (typeof direct === 'bigint' || typeof direct === 'number') {
+        return direct;
+      }
+      if (typeof direct === 'string' && direct.length > 0) {
+        return direct;
+      }
+      const regToken = registeredObjectIds.get(moduleObj);
+      if (typeof regToken === 'string') {
+        const m = /^(?:str:|wgpk:|sh:|hex:|h:)?(0x[0-9a-fA-F]{1,16}|[0-9a-fA-F]{16})$/.exec(
+          regToken
+        );
+        if (m) {
+          return m[1];
+        }
+      }
+      if (typeof moduleObj.label === 'string') {
+        const m = WGPK_LABEL_RE.exec(moduleObj.label);
+        if (m) {
+          return m[1];
+        }
+      }
+      return null;
+    }
+
+    _lookupReflectionStage(registry, hashKey) {
+      if (!registry || typeof registry !== 'object' || hashKey === null || hashKey === undefined) {
+        return null;
+      }
+      try {
+        if (typeof registry.getStageReflection === 'function') {
+          return registry.getStageReflection(hashKey) || null;
+        }
+        if (typeof registry.getStage === 'function') {
+          return registry.getStage(hashKey) || null;
+        }
+        if (typeof registry.getShaderReflection === 'function') {
+          return registry.getShaderReflection(hashKey) || null;
+        }
+        if (registry.stages instanceof Map && typeof hashKey === 'string') {
+          return registry.stages.get(hashKey) || null;
+        }
+      } catch (_lookupErr) {
+        return null;
+      }
+      return null;
+    }
+
+    _resolveStageParamMetadata(stage, moduleObj, rawDescriptor, opts) {
+      const snakeKey = stage === 'vertex' ? 'vs_outputs' : 'ps_inputs';
+      const camelKey = stage === 'vertex' ? 'vsOutputs' : 'psInputs';
+      const reflKey = stage === 'vertex' ? 'vsReflection' : 'psReflection';
+      const stageDescKey = stage === 'vertex' ? 'vertex' : 'fragment';
+
+      if (opts && typeof opts === 'object') {
+        const fromOpts =
+          extractStageParamArray(opts[camelKey], snakeKey, camelKey) ||
+          extractStageParamArray(opts[snakeKey], snakeKey, camelKey) ||
+          extractStageParamArray(opts[reflKey], snakeKey, camelKey);
+        if (fromOpts && fromOpts.length > 0) {
+          return fromOpts;
+        }
+      }
+
+      if (rawDescriptor && typeof rawDescriptor === 'object') {
+        const fromDesc =
+          extractStageParamArray(rawDescriptor[camelKey], snakeKey, camelKey) ||
+          extractStageParamArray(rawDescriptor[snakeKey], snakeKey, camelKey) ||
+          extractStageParamArray(rawDescriptor[reflKey], snakeKey, camelKey);
+        if (fromDesc && fromDesc.length > 0) {
+          return fromDesc;
+        }
+        const stageDesc = rawDescriptor[stageDescKey];
+        if (stageDesc && typeof stageDesc === 'object') {
+          const fromStageDesc =
+            extractStageParamArray(stageDesc[camelKey], snakeKey, camelKey) ||
+            extractStageParamArray(stageDesc[snakeKey], snakeKey, camelKey) ||
+            extractStageParamArray(stageDesc.reflection, snakeKey, camelKey);
+          if (fromStageDesc && fromStageDesc.length > 0) {
+            return fromStageDesc;
+          }
+        }
+      }
+
+      const modRefl = getRegisteredShaderModuleReflection(moduleObj);
+      const fromMod = extractStageParamArray(modRefl, snakeKey, camelKey);
+      if (fromMod && fromMod.length > 0) {
+        return fromMod;
+      }
+
+      const registry =
+        opts && opts.reflectionRegistry && typeof opts.reflectionRegistry === 'object'
+          ? opts.reflectionRegistry
+          : this._reflectionRegistry;
+      if (registry) {
+        const hashKey = this._extractShaderHashForReflectionLookup(moduleObj);
+        if (hashKey !== null) {
+          const rec = this._lookupReflectionStage(registry, hashKey);
+          const fromReg = extractStageParamArray(rec, snakeKey, camelKey);
+          if (fromReg && fromReg.length > 0) {
+            return fromReg;
+          }
+        }
+      }
+
+      return null;
+    }
+
+    _cachePatchedInterstageModule(patchKey, entry) {
+      this._interstagePatchedModules.set(patchKey, entry);
+      this._stats.interstageModuleCacheMisses += 1;
+      while (this._interstagePatchedModules.size > this._maxInterstageModules) {
+        const oldestKey = this._interstagePatchedModules.keys().next().value;
+        this._interstagePatchedModules.delete(oldestKey);
+        this._stats.interstageModuleEvictions += 1;
+      }
+    }
+
     _applyInterstageCompatibility(effectiveDescriptor, rawDescriptor, opts) {
       if (
         !this._enableInterstagePatching ||
@@ -6631,99 +7279,190 @@
         return { descriptor: effectiveDescriptor, patched: false };
       }
 
-      const analysis = analyzeInterstageCompatibilityFromInterfaces(vsIface, psIface);
-      if (!analysis.needsPatch) {
+      // 1. Optional FSSM OSG1 <-> ISG1 (SPI_PS_INPUT_CNTL) semantic @location remap (#2085).
+      let nextFsModule = fsModule;
+      let effectivePsCode = fsCode;
+      let effectivePsIface = psIface;
+      let psPatched = false;
+      let locationRemapFixes = 0;
+
+      const explicitRemaps =
+        opts && opts.locationRemaps ? resolveSemanticRemapsFromOptions(opts) : null;
+      const vsOutputsMeta =
+        explicitRemaps && explicitRemaps.length > 0
+          ? null
+          : this._resolveStageParamMetadata('vertex', vsModule, rawDescriptor, opts);
+      const psInputsMeta =
+        explicitRemaps && explicitRemaps.length > 0
+          ? null
+          : this._resolveStageParamMetadata('fragment', fsModule, rawDescriptor, opts);
+      const semanticRemaps =
+        explicitRemaps && explicitRemaps.length > 0
+          ? explicitRemaps
+          : computeInterstageLocationRemaps(vsOutputsMeta, psInputsMeta);
+
+      if (semanticRemaps.length > 0) {
+        const psRemap = remapPsInputLocationsWgsl(fsCode, semanticRemaps, {
+          psEntryPoint: fsEntryPoint,
+          psInterface: psIface,
+          vsInterface: vsIface,
+          vsOutputs: vsOutputsMeta,
+        });
+        if (psRemap.patched) {
+          const fsToken = resolveGpuHandleToken(fsModule) || `wgsl:${fnv1a64Hex(fsCode)}`;
+          const psPatchKey = `ps:${fsToken}|${psIface.entryPoint || 'fs_main'}|${psRemap.remapSignature}`;
+          let cachedPsMod = this._interstagePatchedModules.get(psPatchKey);
+          if (cachedPsMod !== undefined) {
+            this._interstagePatchedModules.delete(psPatchKey);
+            this._interstagePatchedModules.set(psPatchKey, cachedPsMod);
+            this._stats.interstageModuleCacheHits += 1;
+          } else if (typeof this._device.createShaderModule === 'function') {
+            const baseFsLabel =
+              typeof fsModule.label === 'string' && fsModule.label.length > 0
+                ? fsModule.label
+                : fsToken;
+            let patchedPsModule = null;
+            try {
+              patchedPsModule = this._device.createShaderModule({
+                label: `${baseFsLabel}:interstage-remap`,
+                code: psRemap.psCode,
+              });
+            } catch (_psCompileErr) {
+              patchedPsModule = null;
+            }
+            if (
+              patchedPsModule &&
+              (typeof patchedPsModule === 'object' || typeof patchedPsModule === 'function')
+            ) {
+              registeredObjectIds.set(patchedPsModule, `interstage:${psPatchKey}`);
+              cachedPsMod = {
+                module: patchedPsModule,
+                locationRemapFixes: psRemap.locationRemapFixes,
+                patchSignature: psRemap.remapSignature,
+              };
+              this._cachePatchedInterstageModule(psPatchKey, cachedPsMod);
+            }
+          }
+          if (cachedPsMod !== undefined) {
+            nextFsModule = cachedPsMod.module;
+            effectivePsCode = psRemap.psCode;
+            effectivePsIface =
+              this._getCachedInterstageInterface(null, effectivePsCode, 'fragment', fsEntryPoint) ||
+              psIface;
+            psPatched = true;
+            locationRemapFixes = cachedPsMod.locationRemapFixes;
+          }
+        }
+      }
+
+      // 2. Standard VS <-> PS @interpolate(flat) / missing-location / type compatibility patching.
+      const analysis = analyzeInterstageCompatibilityFromInterfaces(vsIface, effectivePsIface);
+      let nextVsModule = vsModule;
+      let vsPatched = false;
+      let cachedVsMod = null;
+
+      if (analysis.needsPatch) {
+        const vsToken = resolveGpuHandleToken(vsModule) || `wgsl:${fnv1a64Hex(vsCode)}`;
+        const patchKey = `${vsToken}|${vsIface.entryPoint || 'vs_main'}|${analysis.patchSignature}`;
+
+        let cachedMod = this._interstagePatchedModules.get(patchKey);
+        if (cachedMod !== undefined) {
+          // Refresh LRU recency
+          this._interstagePatchedModules.delete(patchKey);
+          this._interstagePatchedModules.set(patchKey, cachedMod);
+          this._stats.interstageModuleCacheHits += 1;
+        } else if (typeof this._device.createShaderModule === 'function') {
+          const patchResult = patchInterstageWgsl(vsCode, effectivePsCode, {
+            vsEntryPoint,
+            psEntryPoint: fsEntryPoint,
+            analysis,
+          });
+          if (patchResult.patched) {
+            const baseLabel =
+              typeof vsModule.label === 'string' && vsModule.label.length > 0
+                ? vsModule.label
+                : vsToken;
+            const patchedLabel = `${baseLabel}:interstage`;
+
+            let patchedModule = null;
+            try {
+              patchedModule = this._device.createShaderModule({
+                label: patchedLabel,
+                code: patchResult.vsCode,
+              });
+            } catch (_compileErr) {
+              // Never fail pipeline creation solely due to speculative inter-stage patching.
+              patchedModule = null;
+            }
+            if (
+              patchedModule &&
+              (typeof patchedModule === 'object' || typeof patchedModule === 'function')
+            ) {
+              // Register deterministic ID directly on the brand-new patchedModule without bumping
+              // global shaderModuleRegistryVersion (avoids invalidating warm fast-lookup caches for
+              // unrelated pipelines), and avoid pinning patched WGSL strings in WeakMap (#1077).
+              registeredObjectIds.set(patchedModule, `interstage:${patchKey}`);
+
+              cachedMod = {
+                module: patchedModule,
+                flatFixes: patchResult.flatFixes,
+                interpolateFixes: patchResult.interpolateFixes,
+                missingLocationFixes: patchResult.missingLocationFixes,
+                typeFixes: patchResult.typeFixes,
+                integerFlatFixes: patchResult.integerFlatFixes,
+                patchSignature: patchResult.patchSignature,
+              };
+              this._cachePatchedInterstageModule(patchKey, cachedMod);
+            }
+          }
+        }
+        if (cachedMod !== undefined) {
+          nextVsModule = cachedMod.module;
+          vsPatched = true;
+          cachedVsMod = cachedMod;
+        }
+      }
+
+      if (!vsPatched && !psPatched) {
         return { descriptor: effectiveDescriptor, patched: false };
       }
 
-      const vsToken = resolveGpuHandleToken(vsModule) || `wgsl:${fnv1a64Hex(vsCode)}`;
-      const patchKey = `${vsToken}|${vsIface.entryPoint || 'vs_main'}|${analysis.patchSignature}`;
-
-      let cachedMod = this._interstagePatchedModules.get(patchKey);
-      if (cachedMod !== undefined) {
-        // Refresh LRU recency
-        this._interstagePatchedModules.delete(patchKey);
-        this._interstagePatchedModules.set(patchKey, cachedMod);
-        this._stats.interstageModuleCacheHits += 1;
-      } else {
-        if (typeof this._device.createShaderModule !== 'function') {
-          return { descriptor: effectiveDescriptor, patched: false };
-        }
-        const patchResult = patchInterstageWgsl(vsCode, fsCode, {
-          vsEntryPoint,
-          psEntryPoint: fsEntryPoint,
-          analysis,
-        });
-        if (!patchResult.patched) {
-          return { descriptor: effectiveDescriptor, patched: false };
-        }
-
-        const baseLabel =
-          typeof vsModule.label === 'string' && vsModule.label.length > 0
-            ? vsModule.label
-            : vsToken;
-        const patchedLabel = `${baseLabel}:interstage`;
-
-        let patchedModule;
-        try {
-          patchedModule = this._device.createShaderModule({
-            label: patchedLabel,
-            code: patchResult.vsCode,
-          });
-        } catch (_compileErr) {
-          // Never fail pipeline creation solely due to speculative inter-stage patching.
-          return { descriptor: effectiveDescriptor, patched: false };
-        }
-        if (
-          !patchedModule ||
-          (typeof patchedModule !== 'object' && typeof patchedModule !== 'function')
-        ) {
-          return { descriptor: effectiveDescriptor, patched: false };
-        }
-
-        // Register deterministic ID directly on the brand-new patchedModule without bumping
-        // global shaderModuleRegistryVersion (avoids invalidating warm fast-lookup caches for
-        // unrelated pipelines), and avoid pinning patched WGSL strings in WeakMap (#1077).
-        registeredObjectIds.set(patchedModule, `interstage:${patchKey}`);
-
-        cachedMod = {
-          module: patchedModule,
-          flatFixes: patchResult.flatFixes,
-          interpolateFixes: patchResult.interpolateFixes,
-          missingLocationFixes: patchResult.missingLocationFixes,
-          typeFixes: patchResult.typeFixes,
-          integerFlatFixes: patchResult.integerFlatFixes,
-          patchSignature: patchResult.patchSignature,
-        };
-        this._interstagePatchedModules.set(patchKey, cachedMod);
-        this._stats.interstageModuleCacheMisses += 1;
-
-        while (this._interstagePatchedModules.size > this._maxInterstageModules) {
-          const oldestKey = this._interstagePatchedModules.keys().next().value;
-          this._interstagePatchedModules.delete(oldestKey);
-          this._stats.interstageModuleEvictions += 1;
-        }
-      }
-
       this._stats.interstagePatchedPipelines += 1;
-      this._stats.interstageFlatFixes += cachedMod.flatFixes;
-      this._stats.interstageMissingLocationFixes += cachedMod.missingLocationFixes;
-      this._stats.interstageInterpolateFixes += cachedMod.interpolateFixes;
-      this._stats.interstageTypeFixes += cachedMod.typeFixes;
-      this._stats.interstageIntegerFlatFixes += cachedMod.integerFlatFixes;
+      if (psPatched) {
+        this._stats.interstageLocationRemapFixes += locationRemapFixes;
+      }
+      if (vsPatched && cachedVsMod) {
+        this._stats.interstageFlatFixes += cachedVsMod.flatFixes;
+        this._stats.interstageMissingLocationFixes += cachedVsMod.missingLocationFixes;
+        this._stats.interstageInterpolateFixes += cachedVsMod.interpolateFixes;
+        this._stats.interstageTypeFixes += cachedVsMod.typeFixes;
+        this._stats.interstageIntegerFlatFixes += cachedVsMod.integerFlatFixes;
+      }
 
       const patchedDescriptor = {
         ...effectiveDescriptor,
-        vertex: {
-          ...effectiveDescriptor.vertex,
-          module: cachedMod.module,
-        },
+        ...(vsPatched
+          ? {
+              vertex: {
+                ...effectiveDescriptor.vertex,
+                module: nextVsModule,
+              },
+            }
+          : {}),
+        ...(psPatched
+          ? {
+              fragment: {
+                ...effectiveDescriptor.fragment,
+                module: nextFsModule,
+              },
+            }
+          : {}),
       };
 
       return {
         descriptor: patchedDescriptor,
         patched: true,
-        patchSummary: cachedMod,
+        patchSummary: cachedVsMod || { locationRemapFixes },
       };
     }
 
@@ -6740,6 +7479,7 @@
         missingLocationFixes: this._stats.interstageMissingLocationFixes,
         typeFixes: this._stats.interstageTypeFixes,
         integerFlatFixes: this._stats.interstageIntegerFlatFixes,
+        locationRemapFixes: this._stats.interstageLocationRemapFixes,
         patchedModuleCacheSize: this._interstagePatchedModules.size,
         maxPatchedModules: this._maxInterstageModules,
         moduleCacheHits: this._stats.interstageModuleCacheHits,
@@ -9795,6 +10535,7 @@
       this._stats.interstageInterpolateFixes = 0;
       this._stats.interstageTypeFixes = 0;
       this._stats.interstageIntegerFlatFixes = 0;
+      this._stats.interstageLocationRemapFixes = 0;
       this._stats.interstageModuleCacheHits = 0;
       this._stats.interstageModuleCacheMisses = 0;
       this._stats.interstageModuleEvictions = 0;
@@ -10048,6 +10789,11 @@
           enumerable: false,
           configurable: true,
         },
+        interstageLocationRemapFixes: {
+          value: this._stats.interstageLocationRemapFixes,
+          enumerable: false,
+          configurable: true,
+        },
       });
       return stats;
     }
@@ -10087,7 +10833,11 @@
     registerShaderModuleId,
     registerShaderModuleSource,
     getRegisteredShaderModuleSource,
+    registerShaderModuleReflection,
+    getRegisteredShaderModuleReflection,
     parseInterstageInterface,
+    computeInterstageLocationRemaps,
+    remapPsInputLocationsWgsl,
     analyzeInterstageCompatibility,
     patchInterstageWgsl,
     normalizeVisibility,

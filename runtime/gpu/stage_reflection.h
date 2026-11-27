@@ -188,10 +188,31 @@ struct ReflectedBinding {
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };
 
+// Inter-stage parameter semantic mapping entry from Xbox Series FSSM stage metadata (#2085):
+//   - vs_outputs (OSG1): semantic_reg -> exp param<location>
+//   - ps_inputs  (ISG1): semantic_reg -> v_interp attr<location>, with optional component mask (0..15)
+struct ReflectedStageParam {
+    uint8_t semantic_reg = 0;
+    uint32_t location = 0;
+    uint8_t mask = 0x0fu;
+    bool has_mask = false;
+};
+
+// Non-identity SPI_PS_INPUT_CNTL inter-stage @location remap: rewrite PS input @location(ps_location)
+// to read VS output @location(vs_location) for matching FSSM semantic_reg (#2085).
+struct InterstageLocationRemap {
+    uint8_t semantic_reg = 0;
+    uint32_t ps_location = 0;
+    uint32_t vs_location = 0;
+};
+
 struct StageReflection {
     ReflectedStage stage = ReflectedStage::Vertex;
     std::vector<ReflectedVertexInput> vertex_inputs;
     std::vector<ReflectedBinding> bindings;
+    // Optional FSSM inter-stage parameter semantic maps (#2085).
+    std::vector<ReflectedStageParam> vs_outputs;
+    std::vector<ReflectedStageParam> ps_inputs;
     // G66: a mesh stage translated to compute (pack key bridge::mesh_compute_pack_key): its output
     // record layout, from the optional "mesh_output": {"max_vertices", "max_primitives",
     // "vertex_words"} (see bridge::MeshOutputLayout; validated by bridge::valid_mesh_output_layout).
@@ -288,5 +309,11 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
 // `constant_default` fetch. False (one line per failed location in *report) when the classes differ.
 bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementDesc* elements, uint32_t count,
                         std::vector<pso::VertexInputFetch>* out, std::string* report, JoinStats* stats = nullptr);
+
+// Compute non-identity PS->VS @location remaps by matching `ps.ps_inputs[i].semantic_reg` against
+// `vs.vs_outputs[j].semantic_reg` (SPI_PS_INPUT_CNTL, #2085). Skips unused PS inputs (`has_mask && mask == 0`)
+// and identity mappings (`ps_location == vs_location`). Results are sorted by ascending `ps_location`.
+std::vector<InterstageLocationRemap> compute_interstage_location_remaps(const StageReflection& vs,
+                                                                        const StageReflection& ps);
 
 }  // namespace playgta6::gpu

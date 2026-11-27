@@ -305,6 +305,41 @@ bool parse_cb_dword(const Json& body, uint32_t version, ReflectedBinding* r) {
     return ok && r->cb_bit_offset < 32 && r->cb_mask != 0 && r->cb_byte_offset % 4 == 0;
 }
 
+bool parse_stage_params(const Json& arr, const char* field_name, std::vector<ReflectedStageParam>* out,
+                        std::string* error) {
+    if (arr.type != Json::Type::Array) {
+        *error = std::string(field_name) + " must be an array";
+        return false;
+    }
+    for (const Json& item : arr.array) {
+        if (item.type != Json::Type::Object) {
+            *error = std::string(field_name) + " entries must be objects";
+            return false;
+        }
+        uint32_t semantic_reg = 0;
+        uint32_t location = 0;
+        if (!get_u32(item, "semantic_reg", &semantic_reg) || semantic_reg > 255u ||
+            !get_u32(item, "location", &location)) {
+            *error = std::string(field_name) + " entries need semantic_reg (0..255) and location";
+            return false;
+        }
+        ReflectedStageParam p;
+        p.semantic_reg = static_cast<uint8_t>(semantic_reg);
+        p.location = location;
+        if (const Json* mask_v = item.get("mask"); mask_v != nullptr && mask_v->type != Json::Type::Null) {
+            uint32_t mask = 0;
+            if (!get_u32(item, "mask", &mask) || mask > 15u) {
+                *error = std::string(field_name) + " mask must be in 0..15";
+                return false;
+            }
+            p.mask = static_cast<uint8_t>(mask);
+            p.has_mask = true;
+        }
+        out->push_back(p);
+    }
+    return true;
+}
+
 bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::string* error) {
     const std::string stage = get_string(s, "stage");
     if (stage == "vertex") {
@@ -376,6 +411,24 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
                 return false;
             }
             out->vertex_inputs.push_back(v);
+        }
+    }
+    if (const Json* vs_outputs = s.get("vs_outputs"); vs_outputs != nullptr && vs_outputs->type != Json::Type::Null) {
+        if (!parse_stage_params(*vs_outputs, "vs_outputs", &out->vs_outputs, error)) {
+            return false;
+        }
+        if (!out->vs_outputs.empty() && out->stage != ReflectedStage::Vertex) {
+            *error = "vs_outputs is only valid on vertex stages";
+            return false;
+        }
+    }
+    if (const Json* ps_inputs = s.get("ps_inputs"); ps_inputs != nullptr && ps_inputs->type != Json::Type::Null) {
+        if (!parse_stage_params(*ps_inputs, "ps_inputs", &out->ps_inputs, error)) {
+            return false;
+        }
+        if (!out->ps_inputs.empty() && out->stage != ReflectedStage::Fragment) {
+            *error = "ps_inputs is only valid on fragment stages";
+            return false;
         }
     }
     if (const Json* bindings = s.get("bindings"); bindings != nullptr && bindings->type == Json::Type::Array) {
@@ -2051,6 +2104,47 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         stats->vertex_inputs_defaulted += defaulted;
     }
     return true;
+}
+
+std::vector<InterstageLocationRemap> compute_interstage_location_remaps(const StageReflection& vs,
+                                                                        const StageReflection& ps) {
+    std::vector<InterstageLocationRemap> remaps;
+    if (vs.vs_outputs.empty() || ps.ps_inputs.empty()) {
+        return remaps;
+    }
+    int64_t vs_loc_by_semantic[256];
+    std::fill_n(vs_loc_by_semantic, 256, int64_t{-1});
+    for (const ReflectedStageParam& o : vs.vs_outputs) {
+        if (vs_loc_by_semantic[o.semantic_reg] < 0) {
+            vs_loc_by_semantic[o.semantic_reg] = static_cast<int64_t>(o.location);
+        }
+    }
+    std::unordered_map<uint32_t, bool> seen_ps_loc;
+    seen_ps_loc.reserve(ps.ps_inputs.size());
+    for (const ReflectedStageParam& in : ps.ps_inputs) {
+        if (in.has_mask && in.mask == 0) {
+            continue;
+        }
+        if (!seen_ps_loc.emplace(in.location, true).second) {
+            continue;
+        }
+        const int64_t vs_loc = vs_loc_by_semantic[in.semantic_reg];
+        if (vs_loc < 0) {
+            continue;
+        }
+        const uint32_t target = static_cast<uint32_t>(vs_loc);
+        if (target != in.location) {
+            InterstageLocationRemap r;
+            r.semantic_reg = in.semantic_reg;
+            r.ps_location = in.location;
+            r.vs_location = target;
+            remaps.push_back(r);
+        }
+    }
+    std::sort(remaps.begin(), remaps.end(), [](const InterstageLocationRemap& a, const InterstageLocationRemap& b) {
+        return a.ps_location < b.ps_location;
+    });
+    return remaps;
 }
 
 }  // namespace playgta6::gpu

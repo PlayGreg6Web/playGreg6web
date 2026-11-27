@@ -4242,3 +4242,100 @@ test('W379 diagnoseStageBindings supports MESH_USER_DATA_BASE=16, root_descripto
   assert.equal(diagOk.resolvedBindings[2].bindingArraySize, 32);
   assert.equal(diagOk.resolvedBindings[3].unresolved, true);
 });
+
+test('#2085 parseStageReflectionSidecar and parseReflectionManifest preserve optional FSSM vs_outputs and ps_inputs', () => {
+  const sidecar = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x5fe7a88d9cb680b3': {
+        stage: 'vertex',
+        bindings: [],
+        vs_outputs: [
+          { semantic_reg: 1, location: 0 },
+          { semantic_reg: 2, location: 1 },
+        ],
+      },
+      '0x56214b8d3b10a108': {
+        stage: 'fragment',
+        bindings: [],
+        ps_inputs: [
+          { semantic_reg: 1, location: 0, mask: 0 },
+          { semantic_reg: 2, location: 0, mask: 3 },
+        ],
+      },
+      '0x000000000000aa01': {
+        stage: 'vertex',
+        bindings: [],
+      },
+    },
+  });
+
+  const vs = sidecar.getStage('0x5fe7a88d9cb680b3');
+  const ps = sidecar.getStage('0x56214b8d3b10a108');
+  const plainVs = sidecar.getStage('0x000000000000aa01');
+
+  assert.equal(vs.vsOutputs.length, 2);
+  assert.strictEqual(vs.vs_outputs, vs.vsOutputs);
+  assert.deepEqual(vs.vsOutputs[0], { semantic_reg: 1, semanticReg: 1, location: 0 });
+  assert.deepEqual(vs.vsOutputs[1], { semantic_reg: 2, semanticReg: 2, location: 1 });
+  assert.equal(vs.psInputs.length, 0);
+
+  assert.equal(ps.psInputs.length, 2);
+  assert.strictEqual(ps.ps_inputs, ps.psInputs);
+  assert.deepEqual(ps.psInputs[0], { semantic_reg: 1, semanticReg: 1, location: 0, mask: 0 });
+  assert.deepEqual(ps.psInputs[1], { semantic_reg: 2, semanticReg: 2, location: 0, mask: 3 });
+  assert.equal(ps.vsOutputs.length, 0);
+
+  // Omitted arrays share frozen empty array with zero per-stage allocation
+  assert.strictEqual(plainVs.vsOutputs, ps.vsOutputs);
+  assert.strictEqual(plainVs.psInputs, vs.psInputs);
+
+  // Also preserved in S6 layout-manifest.json parsing
+  const manifest = parseReflectionManifest({
+    schema_version: 1,
+    bind_group_layouts: {},
+    pipeline_layouts: {},
+    shaders: {
+      '0x5fe7a88d9cb680b3': {
+        stage: 'vertex',
+        entry_point: 'vs_main',
+        bind_group_layouts: [],
+        bindings: [],
+        vs_outputs: [
+          { semantic_reg: 1, location: 0 },
+          { semantic_reg: 2, location: 1 },
+        ],
+      },
+      '0x56214b8d3b10a108': {
+        stage: 'fragment',
+        entry_point: 'fs_main',
+        bind_group_layouts: [],
+        bindings: [],
+        ps_inputs: [{ semantic_reg: 2, location: 0, mask: 3 }],
+      },
+    },
+  });
+  assert.equal(manifest.shaders.get('0x5fe7a88d9cb680b3').vsOutputs.length, 2);
+  assert.equal(manifest.shaders.get('0x56214b8d3b10a108').psInputs[0].semantic_reg, 2);
+
+  // Malformed vs_outputs / ps_inputs rejected cleanly
+  const badStages = [
+    { stage: 'vertex', bindings: [], vs_outputs: 'nope' },
+    { stage: 'vertex', bindings: [], vs_outputs: [{ semantic_reg: 256, location: 0 }] },
+    { stage: 'fragment', bindings: [], vs_outputs: [{ semantic_reg: 1, location: 0 }] },
+    { stage: 'fragment', bindings: [], ps_inputs: [{ semantic_reg: 2, location: 0, mask: 16 }] },
+    { stage: 'vertex', bindings: [], ps_inputs: [{ semantic_reg: 2, location: 0, mask: 3 }] },
+  ];
+  for (const st of badStages) {
+    assert.throws(
+      () =>
+        parseStageReflectionSidecar({
+          schema: 'playgta6-stage-reflection',
+          version: 1,
+          stages: { '0x0000000000009999': st },
+        }),
+      (err) => err instanceof ManifestValidationError
+    );
+  }
+});

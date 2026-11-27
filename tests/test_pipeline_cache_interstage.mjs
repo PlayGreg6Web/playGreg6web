@@ -5,17 +5,22 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 const routerMod = require('../web/workers/shader_fallback_router.js');
+const reflectionLoaderMod = require('../web/workers/reflection_loader.js');
 
 const {
   DEFAULT_MAX_INTERSTAGE_MODULES,
   DEFAULT_MAX_INTERSTAGE_INTERFACE_CACHE,
   registerShaderModuleSource,
   getRegisteredShaderModuleSource,
+  registerShaderModuleReflection,
   parseInterstageInterface,
+  computeInterstageLocationRemaps,
+  remapPsInputLocationsWgsl,
   analyzeInterstageCompatibility,
   patchInterstageWgsl,
   WebGpuPipelineCache,
 } = pipelineCacheMod;
+const { ReflectionRegistry } = reflectionLoaderMod;
 
 function assertBalancedWgsl(code, label = 'wgsl') {
   const stack = [];
@@ -651,4 +656,228 @@ test('P1 #9 review hardening: fn-containing entry point names, @invariant, enabl
   cache.trimTo(0);
   assert.equal(cache.getInterstageStats().patchedModuleCacheSize, 0);
   assert.equal(cache.getInterstageStats().interfaceCacheSize, 0);
+});
+
+test('#2085 SPI_PS_INPUT_CNTL remap: Brightness Calibration VS_Blit (COLOR0@0, TEXCOORD0@1) -> PS_BlitCalibration (TEXCOORD0@0 -> @1)', async () => {
+  // Exact PIPE 55065 VS_Blit / PS_BlitCalibration inter-stage structure from issue #2085:
+  // VS exports COLOR0 (semantic_reg=1) at @location(0) and TEXCOORD0 (semantic_reg=2) at @location(1).
+  // PS leaves COLOR0 unused (ISG1 rw=0x0) and reads TEXCOORD0 (semantic_reg=2, mask=3) at @location(0),
+  // while also outputting fragment MRT at @location(0) (PsOut must NEVER be rewritten!).
+  const vsBlitWgsl = [
+    'struct VsOut {',
+    '    @builtin(position) position: vec4<f32>,',
+    '    @location(0) param_0_: vec4<f32>,',
+    '    @location(1) param_1_: vec4<f32>,',
+    '}',
+    '@vertex fn vs_main(@location(0) pos: vec3<f32>, @location(1) col: vec4<f32>, @location(2) uv: vec2<f32>) -> VsOut {',
+    '    var out: VsOut;',
+    '    out.position = vec4<f32>(pos, 1.0);',
+    '    out.param_0_ = col;',
+    '    out.param_1_ = vec4<f32>(uv, 0.0, 1.0);',
+    '    return out;',
+    '}',
+  ].join('\n');
+
+  const psBlitCalibrationWgsl = [
+    'struct FragIn {',
+    '    // @location(0) comment_ignored: vec4<f32>,',
+    '    @location(0) attr_0_: vec4<f32>,',
+    '}',
+    'struct PsOut {',
+    '    @location(0) mrt_0_: vec4<f32>,',
+    '}',
+    '@fragment fn fs_main(frag_in: FragIn) -> PsOut {',
+    '    var ps_out: PsOut;',
+    '    ps_out.mrt_0_ = frag_in.attr_0_;',
+    '    return ps_out;',
+    '}',
+  ].join('\n');
+
+  const vsOutputs = [
+    { semantic_reg: 1, location: 0 },
+    { semantic_reg: 2, location: 1 },
+  ];
+  const psInputsWithUnusedColor = [
+    { semantic_reg: 1, location: 0, mask: 0 },
+    { semantic_reg: 2, location: 0, mask: 3 },
+  ];
+
+  // 1. Pure remap computation skips unused mask=0 entry and maps PS @location(0) -> VS @location(1)
+  const remaps = computeInterstageLocationRemaps(vsOutputs, psInputsWithUnusedColor);
+  assert.deepEqual(remaps, [
+    {
+      semanticReg: 2,
+      semantic_reg: 2,
+      psLocation: 0,
+      ps_location: 0,
+      vsLocation: 1,
+      vs_location: 1,
+    },
+  ]);
+
+  // 2. Direct patchInterstageWgsl rewrites FragIn @location(0) -> @location(1), leaves PsOut & VS untouched
+  const patched = patchInterstageWgsl(vsBlitWgsl, psBlitCalibrationWgsl, {
+    vsOutputs,
+    psInputs: psInputsWithUnusedColor,
+  });
+  assert.equal(patched.patched, true);
+  assert.equal(patched.patchedStage, 'fragment');
+  assert.equal(patched.locationRemapFixes, 1);
+  assert.equal(patched.vsCode, vsBlitWgsl);
+  assertBalancedWgsl(patched.psCode, 'remapped PS_BlitCalibration');
+  assert.match(patched.psCode, /struct FragIn \{[\s\S]*@location\(1\) attr_0_: vec4<f32>,[\s\S]*\}/);
+  assert.match(patched.psCode, /struct PsOut \{\s*@location\(0\) mrt_0_: vec4<f32>,\s*\}/);
+  assert.match(patched.psCode, /\/\/ @location\(0\) comment_ignored/);
+  assert.equal(analyzeInterstageCompatibility(patched.vsCode, patched.psCode).compatible, true);
+
+  // 3. Identity mapping is left completely untouched
+  const identityPsInputs = [
+    { semantic_reg: 1, location: 0, mask: 15 },
+    { semantic_reg: 2, location: 1, mask: 3 },
+  ];
+  assert.deepEqual(computeInterstageLocationRemaps(vsOutputs, identityPsInputs), []);
+  const identityRes = patchInterstageWgsl(vsBlitWgsl, psBlitCalibrationWgsl, {
+    vsOutputs,
+    psInputs: identityPsInputs,
+  });
+  assert.equal(identityRes.patched, false);
+  assert.equal(identityRes.locationRemapFixes, 0);
+  assert.equal(identityRes.psCode, psBlitCalibrationWgsl);
+
+  // 4. WebGpuPipelineCache end-to-end auto-lookup via ReflectionRegistry + caching + async path
+  const registry = new ReflectionRegistry();
+  registry.loadStageReflection({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x5fe7a88d9cb680b3': {
+        stage: 'vertex',
+        bindings: [],
+        vs_outputs: vsOutputs,
+      },
+      '0x56214b8d3b10a108': {
+        stage: 'fragment',
+        bindings: [],
+        ps_inputs: [{ semantic_reg: 2, location: 0, mask: 3 }],
+      },
+    },
+  });
+
+  const { device, calls } = createMockWebGpuDevice({ withAsync: true });
+  const cache = new WebGpuPipelineCache({ device, reflectionRegistry: registry });
+  const vsMod = makeOpaqueShaderModule('wgpk:vertex:0x5fe7a88d9cb680b3', '0x5fe7a88d9cb680b3');
+  const psMod = makeOpaqueShaderModule('wgpk:fragment:0x56214b8d3b10a108', '0x56214b8d3b10a108');
+  cache.registerShaderModule(vsMod, '0x5fe7a88d9cb680b3', vsBlitWgsl);
+  cache.registerShaderModule(psMod, '0x56214b8d3b10a108', psBlitCalibrationWgsl);
+
+  const pipe1 = cache.getOrCreateRenderPipeline({
+    layout: 'auto',
+    vertex: { module: vsMod, entryPoint: 'vs_main' },
+    fragment: { module: psMod, entryPoint: 'fs_main', targets: [{ format: 'rgba8unorm' }] },
+  });
+  assert.equal(calls.createShaderModule.length, 1);
+  assert.equal(pipe1.descriptor.vertex.module, vsMod);
+  assert.notEqual(pipe1.descriptor.fragment.module, psMod);
+  assert.match(calls.createShaderModule[0].desc.code, /@location\(1\) attr_0_: vec4<f32>/);
+  assert.equal(cache.getInterstageStats().locationRemapFixes, 1);
+  assert.equal(cache.getStats().interstageLocationRemapFixes, 1);
+  assert.equal(cache.getStats().interstagePatchedPipelines, 1);
+
+  // Second pipeline with different RT format reuses cached remapped PS module (zero extra createShaderModule!)
+  const pipe2 = await cache.getOrCreateRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: vsMod, entryPoint: 'vs_main' },
+    fragment: { module: psMod, entryPoint: 'fs_main', targets: [{ format: 'bgra8unorm' }] },
+  });
+  assert.equal(calls.createShaderModule.length, 1);
+  assert.equal(pipe2.descriptor.fragment.module, pipe1.descriptor.fragment.module);
+  assert.equal(cache.getInterstageStats().moduleCacheHits, 1);
+  assert.equal(cache.getInterstageStats().locationRemapFixes, 2);
+
+  // Descriptor helper vsOutputs/psInputs are stripped before reaching device.createRenderPipeline
+  const vsMod2 = makeOpaqueShaderModule('vs-helper', '0x0000000000009001');
+  const psMod2 = makeOpaqueShaderModule('ps-helper', '0x0000000000009002');
+  registerShaderModuleReflection(vsMod2, { vs_outputs: vsOutputs });
+  const pipe3 = cache.getOrCreateRenderPipeline({
+    layout: 'auto',
+    vsCode: vsBlitWgsl,
+    fsCode: psBlitCalibrationWgsl,
+    psInputs: [{ semantic_reg: 2, location: 0, mask: 3 }],
+    vertex: { module: vsMod2, entryPoint: 'vs_main' },
+    fragment: { module: psMod2, entryPoint: 'fs_main', targets: [{ format: 'rgba8unorm' }] },
+  });
+  assert.equal('psInputs' in pipe3.descriptor, false);
+  assert.equal('vsOutputs' in pipe3.descriptor, false);
+  assert.notEqual(pipe3.descriptor.fragment.module, psMod2);
+});
+
+test('#2085 SPI_PS_INPUT_CNTL remap handles swaps/cycles, direct PS params, combined VS flat fix, and unmapped collision avoidance', () => {
+  // 1. 2-way swap (0->1, 1->0) and 3-way cycle (0->1, 1->2, 2->0) in one pass without clobbering
+  const psCycleDirect =
+    '@fragment fn fs_main(@location(0) a: vec4<f32>, @location(1) b: vec4<f32>, @location(2) c: vec4<f32>) -> @location(0) vec4<f32> { return a + b + c; }';
+  const cycleRemap = remapPsInputLocationsWgsl(psCycleDirect, [
+    { semanticReg: 2, psLocation: 0, vsLocation: 1 },
+    { semanticReg: 3, psLocation: 1, vsLocation: 2 },
+    { semanticReg: 1, psLocation: 2, vsLocation: 0 },
+  ]);
+  assert.equal(cycleRemap.patched, true);
+  assert.equal(cycleRemap.locationRemapFixes, 3);
+  assert.equal(cycleRemap.remapSignature, 'r:0->1;1->2;2->0');
+  assertBalancedWgsl(cycleRemap.psCode, '3-cycle direct PS params');
+  assert.match(
+    cycleRemap.psCode,
+    /@location\(1\) a: vec4<f32>, @location\(2\) b: vec4<f32>, @location\(0\) c: vec4<f32>/
+  );
+  assert.match(cycleRemap.psCode, /-> @location\(0\) vec4<f32>/);
+
+  // 2. Combined PS remap + VS @interpolate(flat) fix targets the REMAPPED VS location (loc 1, NOT loc 0!)
+  const psFlatRemapped = [
+    'struct FragIn {',
+    '    @location(0) @interpolate(flat) uv: vec4<f32>,',
+    '}',
+    '@fragment fn fs_main(i: FragIn) -> @location(0) vec4<f32> { return i.uv; }',
+  ].join('\n');
+  const combined = patchInterstageWgsl(NAGA_VS_3_LOCS, psFlatRemapped, {
+    vsOutputs: [
+      { semantic_reg: 1, location: 0 },
+      { semantic_reg: 2, location: 1 },
+    ],
+    psInputs: [{ semantic_reg: 2, location: 0, mask: 3 }],
+  });
+  assert.equal(combined.patched, true);
+  assert.equal(combined.patchedStage, 'both');
+  assert.equal(combined.locationRemapFixes, 1);
+  assert.equal(combined.flatFixes, 1);
+  assert.match(combined.psCode, /@location\(1\) @interpolate\(flat\) uv: vec4<f32>/);
+  // VS @location(1) gets @interpolate(flat), while VS @location(0) stays perspective!
+  assert.match(combined.vsCode, /@location\(0\) param_0_: vec4<f32>/);
+  assert.match(combined.vsCode, /@location\(1\) @interpolate\(flat\) param_1_: vec4<f32>/);
+  assert.equal(analyzeInterstageCompatibility(combined.vsCode, combined.psCode).compatible, true);
+
+  // 3. Unmapped PS input sitting at remapped target location is cleanly relocated (no duplicate @location(1))
+  const psCollision = [
+    'struct FragIn {',
+    '    @location(0) mapped_uv: vec4<f32>,',
+    '    @location(1) unmapped_extra: vec4<f32>,',
+    '}',
+    '@fragment fn fs_main(i: FragIn) -> @location(0) vec4<f32> { return i.mapped_uv + i.unmapped_extra; }',
+  ].join('\n');
+  const colRes = patchInterstageWgsl(NAGA_VS_3_LOCS, psCollision, {
+    vsOutputs: [
+      { semantic_reg: 1, location: 0 },
+      { semantic_reg: 2, location: 1 },
+    ],
+    psInputs: [
+      { semantic_reg: 2, location: 0, mask: 3 },
+      { semantic_reg: 99, location: 1, mask: 15 },
+    ],
+  });
+  assert.equal(colRes.patched, true);
+  assertBalancedWgsl(colRes.psCode, 'collision-free PS');
+  assertBalancedWgsl(colRes.vsCode, 'collision-free VS');
+  assert.match(colRes.psCode, /@location\(1\) mapped_uv: vec4<f32>/);
+  // NAGA_VS_3_LOCS already exports @location(0, 1, 2), so displaced unmapped input moves to @location(3)
+  assert.match(colRes.psCode, /@location\(3\) unmapped_extra: vec4<f32>/);
+  assert.match(colRes.vsCode, /@location\(3\) _pg6_link_loc_3: vec4<f32>/);
+  assert.equal(analyzeInterstageCompatibility(colRes.vsCode, colRes.psCode).compatible, true);
 });

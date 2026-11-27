@@ -3034,6 +3034,104 @@ void test_sm66_implicit_heap_sgprs() {
     }
 }
 
+// #2085: Parse optional FSSM vs_outputs / ps_inputs semantic maps and compute non-identity
+// SPI_PS_INPUT_CNTL @location remaps (Brightness Calibration PIPE 55065, swaps, identity, unused mask=0).
+void test_interstage_location_remaps() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 1,
+  "stages": {
+    "0x5fe7a88d9cb680b3": {
+      "stage": "vertex",
+      "vs_outputs": [
+        {"semantic_reg": 1, "location": 0},
+        {"semantic_reg": 2, "location": 1}
+      ],
+      "bindings": []
+    },
+    "0x56214b8d3b10a108": {
+      "stage": "fragment",
+      "ps_inputs": [
+        {"semantic_reg": 1, "location": 0, "mask": 0},
+        {"semantic_reg": 2, "location": 0, "mask": 3}
+      ],
+      "bindings": []
+    },
+    "0x0000000000007701": {
+      "stage": "fragment",
+      "ps_inputs": [
+        {"semantic_reg": 1, "location": 0, "mask": 15},
+        {"semantic_reg": 2, "location": 1, "mask": 3}
+      ],
+      "bindings": []
+    },
+    "0x0000000000007702": {
+      "stage": "fragment",
+      "ps_inputs": [
+        {"semantic_reg": 2, "location": 0, "mask": 3},
+        {"semantic_reg": 1, "location": 1, "mask": 15}
+      ],
+      "bindings": []
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    CHECK(error.empty());
+
+    const StageReflection& vs = index.at(0x5fe7a88d9cb680b3ull);
+    const StageReflection& ps_calib = index.at(0x56214b8d3b10a108ull);
+    const StageReflection& ps_ident = index.at(0x7701ull);
+    const StageReflection& ps_swap = index.at(0x7702ull);
+
+    CHECK(vs.vs_outputs.size() == 2);
+    CHECK(vs.vs_outputs[0].semantic_reg == 1 && vs.vs_outputs[0].location == 0 && !vs.vs_outputs[0].has_mask);
+    CHECK(vs.vs_outputs[1].semantic_reg == 2 && vs.vs_outputs[1].location == 1 && !vs.vs_outputs[1].has_mask);
+    CHECK(ps_calib.ps_inputs.size() == 2);
+    CHECK(ps_calib.ps_inputs[0].has_mask && ps_calib.ps_inputs[0].mask == 0);
+    CHECK(ps_calib.ps_inputs[1].semantic_reg == 2 && ps_calib.ps_inputs[1].location == 0 &&
+          ps_calib.ps_inputs[1].has_mask && ps_calib.ps_inputs[1].mask == 3);
+
+    // 1. Brightness Calibration: unused mask=0 entry skipped; TEXCOORD0 remaps @location(0) -> @location(1).
+    const std::vector<InterstageLocationRemap> calib_remaps = compute_interstage_location_remaps(vs, ps_calib);
+    CHECK(calib_remaps.size() == 1);
+    if (calib_remaps.size() == 1) {
+        CHECK(calib_remaps[0].semantic_reg == 2 && calib_remaps[0].ps_location == 0 &&
+              calib_remaps[0].vs_location == 1);
+    }
+
+    // 2. Identity mapping produces zero remaps.
+    CHECK(compute_interstage_location_remaps(vs, ps_ident).empty());
+
+    // 3. Swap/cycle (0->1, 1->0) produces both remaps sorted by ascending ps_location.
+    const std::vector<InterstageLocationRemap> swap_remaps = compute_interstage_location_remaps(vs, ps_swap);
+    CHECK(swap_remaps.size() == 2);
+    if (swap_remaps.size() == 2) {
+        CHECK(swap_remaps[0].semantic_reg == 2 && swap_remaps[0].ps_location == 0 && swap_remaps[0].vs_location == 1);
+        CHECK(swap_remaps[1].semantic_reg == 1 && swap_remaps[1].ps_location == 1 && swap_remaps[1].vs_location == 0);
+    }
+
+    // 4. Missing metadata on either stage produces zero remaps.
+    StageReflection empty_stage;
+    CHECK(compute_interstage_location_remaps(empty_stage, ps_calib).empty());
+    CHECK(compute_interstage_location_remaps(vs, empty_stage).empty());
+
+    // 5. Malformed vs_outputs / ps_inputs rejected cleanly.
+    const char* bad_docs[] = {
+        R"({"schema":"playgta6-stage-reflection","version":1,"stages":{"0x1":{"stage":"vertex","vs_outputs":"bad","bindings":[]}}})",
+        R"({"schema":"playgta6-stage-reflection","version":1,"stages":{"0x1":{"stage":"vertex","vs_outputs":[{"semantic_reg":256,"location":0}],"bindings":[]}}})",
+        R"({"schema":"playgta6-stage-reflection","version":1,"stages":{"0x1":{"stage":"fragment","vs_outputs":[{"semantic_reg":1,"location":0}],"bindings":[]}}})",
+        R"({"schema":"playgta6-stage-reflection","version":1,"stages":{"0x1":{"stage":"fragment","ps_inputs":[{"semantic_reg":2,"location":0,"mask":16}],"bindings":[]}}})",
+        R"({"schema":"playgta6-stage-reflection","version":1,"stages":{"0x1":{"stage":"vertex","ps_inputs":[{"semantic_reg":2,"location":0,"mask":3}],"bindings":[]}}})",
+    };
+    for (const char* bad_doc : bad_docs) {
+        StageReflectionIndex rejected;
+        error.clear();
+        CHECK(!parse_stage_reflection_json(bad_doc, &rejected, &error));
+        CHECK(!error.empty());
+    }
+}
+
 int main() {
     test_rt_arena_bindings();
     test_mesh_output();
@@ -3063,6 +3161,7 @@ int main() {
     test_cbv_indexed_root_constants_and_table_coercion();
     test_vertex_join_and_pso_completeness();
     test_sm66_implicit_heap_sgprs();
+    test_interstage_location_remaps();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;

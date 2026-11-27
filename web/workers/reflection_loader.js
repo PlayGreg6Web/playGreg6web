@@ -2403,6 +2403,22 @@
         fragmentOutputs.sort((a, b) => a.location - b.location);
       }
 
+      // Parse optional FSSM vs_outputs / ps_inputs semantic maps (#2085)
+      const vsOutputs = parseStageParamList(
+        rawShader.vs_outputs !== undefined ? rawShader.vs_outputs : rawShader.vsOutputs,
+        'vs_outputs',
+        stage,
+        'vertex',
+        `${shPath}.vs_outputs`
+      );
+      const psInputs = parseStageParamList(
+        rawShader.ps_inputs !== undefined ? rawShader.ps_inputs : rawShader.psInputs,
+        'ps_inputs',
+        stage,
+        'fragment',
+        `${shPath}.ps_inputs`
+      );
+
       // Parse requires_lowering
       const requiresLowering = [];
       if (rawShader.requires_lowering !== undefined) {
@@ -2467,6 +2483,10 @@
         isVertexIndexStage,
         fragmentOutputs,
         fragment_outputs: fragmentOutputs,
+        vsOutputs,
+        vs_outputs: vsOutputs,
+        psInputs,
+        ps_inputs: psInputs,
         requiresLowering,
         requires_lowering: requiresLowering,
         limitViolations,
@@ -2770,6 +2790,68 @@
       type: typeStr,
       format,
     };
+  }
+
+  function parseStageParamInfo(raw, path) {
+    if (!isPlainObject(raw)) {
+      throw new ManifestValidationError('stage param entry must be an object', path);
+    }
+    const rawSemanticReg =
+      raw.semantic_reg !== undefined ? raw.semantic_reg : raw.semanticReg;
+    if (!isNonNegativeInt(rawSemanticReg) || rawSemanticReg > 0xff) {
+      throw new ManifestValidationError(
+        `semantic_reg must be an integer in 0..255, got ${JSON.stringify(rawSemanticReg)}`,
+        `${path}.semantic_reg`
+      );
+    }
+    if (!isNonNegativeInt(raw.location)) {
+      throw new ManifestValidationError(
+        `location must be a non-negative uint32 integer, got ${JSON.stringify(raw.location)}`,
+        `${path}.location`
+      );
+    }
+    let mask = null;
+    if (raw.mask !== undefined && raw.mask !== null) {
+      if (!isNonNegativeInt(raw.mask) || raw.mask > 0x0f) {
+        throw new ManifestValidationError(
+          `mask must be an integer in 0..15, got ${JSON.stringify(raw.mask)}`,
+          `${path}.mask`
+        );
+      }
+      mask = raw.mask;
+    }
+    const entry = {
+      semantic_reg: rawSemanticReg,
+      semanticReg: rawSemanticReg,
+      location: raw.location,
+    };
+    if (mask !== null) {
+      entry.mask = mask;
+    }
+    return Object.freeze(entry);
+  }
+
+  function parseStageParamList(rawList, fieldName, stage, expectedStage, path) {
+    if (rawList === undefined || rawList === null) {
+      return EMPTY_ARRAY;
+    }
+    if (!Array.isArray(rawList)) {
+      throw new ManifestValidationError(`${fieldName} must be an array`, path);
+    }
+    if (rawList.length === 0) {
+      return EMPTY_ARRAY;
+    }
+    if (stage !== expectedStage) {
+      throw new ManifestValidationError(
+        `${fieldName} is only valid on ${expectedStage} stages`,
+        path
+      );
+    }
+    const out = new Array(rawList.length);
+    for (let i = 0; i < rawList.length; i += 1) {
+      out[i] = parseStageParamInfo(rawList[i], `${path}[${i}]`);
+    }
+    return Object.freeze(out);
   }
 
   function buildSidecarLayoutEntry(rec, visibility) {
@@ -3515,6 +3597,21 @@
         }
       }
 
+      const vsOutputs = parseStageParamList(
+        rawStage.vs_outputs !== undefined ? rawStage.vs_outputs : rawStage.vsOutputs,
+        'vs_outputs',
+        stage,
+        'vertex',
+        `${stPath}.vs_outputs`
+      );
+      const psInputs = parseStageParamList(
+        rawStage.ps_inputs !== undefined ? rawStage.ps_inputs : rawStage.psInputs,
+        'ps_inputs',
+        stage,
+        'fragment',
+        `${stPath}.ps_inputs`
+      );
+
       const resolvedVim = resolveVertexInputMode(rawStage, stage, vertexInputs, stPath);
       const vertexInputMode = resolvedVim !== null ? internStr(resolvedVim) : null;
       const isVertexIndexStage = stage === 'vertex' && vertexInputMode === 'vertex_index';
@@ -3587,6 +3684,10 @@
         isVertexIndexStage,
         fragmentOutputs: EMPTY_ARRAY,
         fragment_outputs: EMPTY_ARRAY,
+        vsOutputs,
+        vs_outputs: vsOutputs,
+        psInputs,
+        ps_inputs: psInputs,
         requiresLowering: EMPTY_ARRAY,
         requires_lowering: EMPTY_ARRAY,
         limitViolations: EMPTY_ARRAY,
