@@ -49,7 +49,7 @@ uint64_t available_physical_bytes() {
 uint64_t dedicated_video_memory_bytes() {
 #ifdef _WIN32
     // Loaded at run time: no link dependency on dxgi.lib.
-    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    HMODULE dxgi = LoadLibraryW(L"dxgi");  // the loader appends .dll
     if (dxgi == nullptr) return 0;
     using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
     auto create = reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
