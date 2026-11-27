@@ -428,6 +428,60 @@ void test_compute(NativeExecutor& ex) {
     CHECK(ex.stats().device_errors == before.device_errors);
 }
 
+// A texture copy ends the open compute pass; the title's compute pipeline is still current, so the dispatches after
+// the copy (direct and indirect) run on it instead of hitting Dawn's "No pipeline set".
+void test_compute_pipeline_survives_copy(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(170, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(171, GpuBufferUsage::Indirect | GpuBufferUsage::CopyDst, 12);
+    const uint32_t args[3] = {1, 1, 1};
+    setup.write_buffer(171, 0, args, 12);
+    setup.create_shader_module(172, GpuShaderStage::Compute, kCompute);
+    create_layouts(setup, 173, 174, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 175;
+    cp.cs_module_id = 172;
+    cp.pipeline_layout_id = 174;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 176, 173, {bg_entry(0, GpuBindResourceType::Buffer, 170)});
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(177, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst | GpuTextureUsage::CopySrc, 22)));
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(178, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    run(ex, setup);
+
+    auto copy = [] {
+        GpuCopyTexturePayload c;
+        std::memset(&c, 0, sizeof c);
+        c.dst_id = 178;
+        c.src_id = 177;
+        c.width = 2;
+        c.height = 2;
+        c.depth_or_layers = 1;
+        return c;
+    };
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(175);
+    set_bind_group2(frame, 0, 176);
+    frame.dispatch_compute(1, 1, 1);
+    emit(frame, kGpuOpcodeCopyTexture, bytes_of(copy()));
+    frame.dispatch_compute(1, 1, 1);
+    emit(frame, kGpuOpcodeCopyTexture, bytes_of(copy()));
+    frame.indirect(GpuOpcode::DispatchIndirect, 171, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    CHECK(ex.stats().dispatches == before.dispatches + 3);
+    CHECK(ex.stats().device_errors == before.device_errors);
+    gpu::CommandEncoder done;
+    done.destroy_resource(177);
+    done.destroy_resource(178);
+    run(ex, done);
+}
+
 // Two writable storage bindings in two groups: bound to the same buffer they alias, which WebGPU rejects
 // when the command buffer is finished.
 const char* kComputeAlias = R"(
@@ -4141,6 +4195,7 @@ int main() {
     test_layout_fit_over_limits(*ex);
     test_layout_fit_unused_group_over_limits(*ex);
     test_indirect_constants_pass(*ex);
+    test_compute_pipeline_survives_copy(*ex);
     test_mesh_pipeline(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);

@@ -6057,7 +6057,8 @@ struct NativeExecutor::Impl {
             blend.reset();
             stencil_ref.reset();
             active_pipeline.reset();
-            active_compute.reset();
+            // active_compute survives: the title's compute pipeline stays set across a copy that ended the pass
+            // (restore_compute_pipeline re-sets it on the next pass); had_explicit_compute / compute_valid gate it.
             pass_fmt = PassFormats{};
             variant_blocked = false;
         }
@@ -6359,6 +6360,7 @@ struct NativeExecutor::Impl {
                     return;
                 }
                 e.ensure_compute();
+                restore_compute_pipeline(e);
                 bind_compute_fit_dummies(e);
                 flush_binds(e);
                 resolve_buffer_aliases(e);
@@ -6429,6 +6431,7 @@ struct NativeExecutor::Impl {
             }
             remap_before_dispatch(e);
             e.ensure_compute();
+            restore_compute_pipeline(e);
             bind_compute_fit_dummies(e);
             flush_binds(e);
             resolve_buffer_aliases(e);
@@ -6852,6 +6855,18 @@ struct NativeExecutor::Impl {
         wgpu::Buffer cur, base;
     };
     std::vector<AliasMerge> alias_merges;  // after the dispatch: fold the changed words of each twin writer back
+
+    // A new compute pass (after a copy ended the previous one) starts without a pipeline; the title's compute
+    // pipeline is still the current one, so set it before the dispatch.
+    void restore_compute_pipeline(Encoder& e) {
+        if (e.cur_cpipe || !e.cpass || !e.had_explicit_compute || !e.compute_valid || !e.active_compute) return;
+        auto pit = compute_pipelines.find(*e.active_compute);
+        if (pit == compute_pipelines.end()) return;
+        if (const wgpu::ComputePipeline* cp = resolve_budgeted(pit->second)) {
+            e.cpass.SetPipeline(*cp);
+            e.cur_cpipe = *cp;
+        }
+    }
 
     // The pipeline and groups of a compute pass as the stream set them (swaps applied to the groups they name).
     void alias_restore_state(Encoder& e, const std::vector<AliasSwap>& swaps) {
