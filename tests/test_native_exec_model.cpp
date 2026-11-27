@@ -1587,7 +1587,6 @@ void test_usage_scope_model() {
 }
 
 int main() {
-    test_usage_scope_model();
     test_present_model();
     test_shader_payloads();
     test_pack();
@@ -1621,6 +1620,7 @@ int main() {
     test_binding_fit();
     test_view_alias_model();
     test_clear_model();
+    test_usage_scope_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
