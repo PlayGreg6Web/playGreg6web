@@ -312,6 +312,15 @@ const SWAPCHAIN_SRGB_TO_BASE = Object.freeze({
   'rgba8unorm-srgb': 'rgba8unorm',
 });
 
+const TEXTURE_SRGB_TO_LINEAR = Object.freeze({
+  'rgba8unorm-srgb': 'rgba8unorm',
+  'bgra8unorm-srgb': 'bgra8unorm',
+  'bc1-rgba-unorm-srgb': 'bc1-rgba-unorm',
+  'bc2-rgba-unorm-srgb': 'bc2-rgba-unorm',
+  'bc3-rgba-unorm-srgb': 'bc3-rgba-unorm',
+  'bc7-rgba-unorm-srgb': 'bc7-rgba-unorm',
+});
+
 const SWAPCHAIN_BASE_TO_SRGB = Object.freeze({
   bgra8unorm: 'bgra8unorm-srgb',
   rgba8unorm: 'rgba8unorm-srgb',
@@ -3766,6 +3775,7 @@ class WgpuCommandProcessor {
     this._liveTextureBytes = 0;
     this._peakTextureBytes = 0;
     this._textureMeta = new Map();
+    this._textureObjMeta = new WeakMap();
     this._directWriteScratch = null;
     this._clearZeroBuffer = null;
     this._clearZeroBufferBytes = 0;
@@ -10675,6 +10685,9 @@ class WgpuCommandProcessor {
       }
       this.textures.delete(id);
       this._textureMeta.delete(id);
+      if (this._textureObjMeta) {
+        this._textureObjMeta.delete(existing);
+      }
     }
     this.textureViews.delete(id);
   }
@@ -12268,44 +12281,76 @@ class WgpuCommandProcessor {
       return descriptor;
     }
     const rawDimension = descriptor.dimension || '2d';
-    if (rawDimension !== '1d') {
+    const is1D = rawDimension === '1d';
+    const rawUsage = typeof descriptor.usage === 'number' ? descriptor.usage >>> 0 : 0;
+    const hasStorageBinding = (rawUsage & TEXTURE_USAGE.STORAGE_BINDING) !== 0;
+    const rawFormat = typeof descriptor.format === 'string' ? descriptor.format : '';
+    const stripStorageForSrgbFormat = hasStorageBinding && rawFormat.endsWith('-srgb');
+    const rawViewFormats = Array.isArray(descriptor.viewFormats) ? descriptor.viewFormats : null;
+    let hasIncompatibleSrgbViewFormat = false;
+    if (hasStorageBinding && !stripStorageForSrgbFormat && rawViewFormats !== null) {
+      for (let i = 0; i < rawViewFormats.length; i += 1) {
+        const vf = rawViewFormats[i];
+        if (typeof vf === 'string' && vf.endsWith('-srgb')) {
+          hasIncompatibleSrgbViewFormat = true;
+          break;
+        }
+      }
+    }
+    if (!is1D && !stripStorageForSrgbFormat && !hasIncompatibleSrgbViewFormat) {
       return descriptor;
     }
-    const size = descriptor.size;
-    let width = 1;
-    if (Array.isArray(size)) {
-      width = Math.max(1, Math.floor(Number(size[0]) || 1));
-    } else if (size && typeof size === 'object') {
-      width = Math.max(1, Math.floor(Number(size.width) || 1));
-    }
-    if (this._promote1DTo2D !== false) {
-      this._promoted1DTo2DCount += 1;
-      return {
-        ...descriptor,
-        dimension: '2d',
-        size: {
-          width,
-          height: 1,
-          depthOrArrayLayers: 1,
-        },
-        mipLevelCount: 1,
-      };
-    }
-    return {
-      ...descriptor,
-      dimension: '1d',
-      size: {
+    const out = { ...descriptor };
+    if (is1D) {
+      const size = descriptor.size;
+      let width = 1;
+      if (Array.isArray(size)) {
+        width = Math.max(1, Math.floor(Number(size[0]) || 1));
+      } else if (size && typeof size === 'object') {
+        width = Math.max(1, Math.floor(Number(size.width) || 1));
+      }
+      if (this._promote1DTo2D !== false) {
+        this._promoted1DTo2DCount += 1;
+        out.dimension = '2d';
+      } else {
+        out.dimension = '1d';
+      }
+      out.size = {
         width,
         height: 1,
         depthOrArrayLayers: 1,
-      },
-      mipLevelCount: 1,
-    };
+      };
+      out.mipLevelCount = 1;
+    }
+    if (stripStorageForSrgbFormat) {
+      let sanitizedUsage = rawUsage & ~TEXTURE_USAGE.STORAGE_BINDING;
+      if (sanitizedUsage === 0) {
+        sanitizedUsage = TEXTURE_USAGE.TEXTURE_BINDING;
+      }
+      out.usage = sanitizedUsage;
+    } else if (hasIncompatibleSrgbViewFormat) {
+      const filtered = [];
+      for (let i = 0; i < rawViewFormats.length; i += 1) {
+        const vf = rawViewFormats[i];
+        if (typeof vf !== 'string' || !vf.endsWith('-srgb')) {
+          filtered.push(vf);
+        }
+      }
+      if (filtered.length > 0) {
+        out.viewFormats = filtered;
+      } else {
+        delete out.viewFormats;
+      }
+    }
+    return out;
   }
 
-  _createSafeTextureView(texture, viewDescriptor = null) {
+  _createSafeTextureView(texture, viewDescriptor = null, textureId = null) {
     if (!texture || typeof texture.createView !== 'function') {
       return null;
+    }
+    if (!viewDescriptor || typeof viewDescriptor !== 'object') {
+      return texture.createView();
     }
     const texDim =
       typeof texture.dimension === 'string' && texture.dimension
@@ -12313,13 +12358,84 @@ class WgpuCommandProcessor {
         : texture.desc && typeof texture.desc.dimension === 'string' && texture.desc.dimension
           ? texture.desc.dimension
           : null;
-    if (!viewDescriptor || typeof viewDescriptor !== 'object') {
-      return texture.createView();
+    const coerce1D = Boolean(
+      texDim === '1d' && viewDescriptor.dimension && viewDescriptor.dimension !== '1d'
+    );
+
+    let rewrittenFormat = null;
+    const reqFormat = viewDescriptor.format;
+    if (typeof reqFormat === 'string' && reqFormat.endsWith('-srgb')) {
+      const linearSibling = Object.prototype.hasOwnProperty.call(TEXTURE_SRGB_TO_LINEAR, reqFormat)
+        ? TEXTURE_SRGB_TO_LINEAR[reqFormat]
+        : null;
+      if (linearSibling) {
+        const meta =
+          (textureId !== null && textureId !== undefined ? this._textureMeta.get(textureId) || null : null) ||
+          (this._textureObjMeta ? this._textureObjMeta.get(texture) || null : null);
+        let rsMeta = null;
+        if (textureId !== null && textureId !== undefined) {
+          const renderStateExt = this._getRenderStateExtension();
+          if (
+            renderStateExt &&
+            renderStateExt.textureMeta &&
+            typeof renderStateExt.textureMeta.get === 'function'
+          ) {
+            rsMeta = renderStateExt.textureMeta.get(textureId) || null;
+          }
+        }
+        const texDesc = texture.desc && typeof texture.desc === 'object' ? texture.desc : null;
+        const hasStorageBinding =
+          (typeof texture.usage === 'number' &&
+            (texture.usage & TEXTURE_USAGE.STORAGE_BINDING) !== 0) ||
+          (meta !== null &&
+            typeof meta.usage === 'number' &&
+            (meta.usage & TEXTURE_USAGE.STORAGE_BINDING) !== 0) ||
+          (rsMeta !== null &&
+            typeof rsMeta.usage === 'number' &&
+            (rsMeta.usage & TEXTURE_USAGE.STORAGE_BINDING) !== 0) ||
+          (texDesc !== null &&
+            typeof texDesc.usage === 'number' &&
+            (texDesc.usage & TEXTURE_USAGE.STORAGE_BINDING) !== 0);
+
+        let missingSrgbViewFormat = false;
+        if (!hasStorageBinding) {
+          const texFormat =
+            (typeof texture.format === 'string' && texture.format) ||
+            (rsMeta && typeof rsMeta.format === 'string' && rsMeta.format) ||
+            (meta && typeof meta.format === 'string' && meta.format) ||
+            (texDesc && typeof texDesc.format === 'string' && texDesc.format) ||
+            null;
+          if (texFormat && !texFormat.endsWith('-srgb')) {
+            if (Array.isArray(texture.viewFormats)) {
+              missingSrgbViewFormat = !texture.viewFormats.includes(reqFormat);
+            } else if (texDesc && Array.isArray(texDesc.viewFormats)) {
+              missingSrgbViewFormat = !texDesc.viewFormats.includes(reqFormat);
+            } else if (rsMeta && 'viewFormats' in rsMeta) {
+              missingSrgbViewFormat = !(
+                Array.isArray(rsMeta.viewFormats) && rsMeta.viewFormats.includes(reqFormat)
+              );
+            } else if (meta && 'viewFormats' in meta) {
+              missingSrgbViewFormat = !(
+                Array.isArray(meta.viewFormats) && meta.viewFormats.includes(reqFormat)
+              );
+            } else if (texDesc && typeof texDesc.format === 'string' && !Array.isArray(texDesc.viewFormats)) {
+              missingSrgbViewFormat = true;
+            }
+          }
+        }
+        if (hasStorageBinding || missingSrgbViewFormat) {
+          rewrittenFormat = linearSibling;
+        }
+      }
     }
-    if (texDim === '1d' && viewDescriptor.dimension && viewDescriptor.dimension !== '1d') {
-      return texture.createView({ ...viewDescriptor, dimension: '1d' });
+
+    if (!coerce1D && rewrittenFormat === null) {
+      return texture.createView(viewDescriptor);
     }
-    return texture.createView(viewDescriptor);
+    const safeDesc = { ...viewDescriptor };
+    if (coerce1D) safeDesc.dimension = '1d';
+    if (rewrittenFormat !== null) safeDesc.format = rewrittenFormat;
+    return texture.createView(safeDesc);
   }
 
   _createTrackedTexture(id, descriptor, was1D = false) {
@@ -12332,8 +12448,8 @@ class WgpuCommandProcessor {
     let textureView = null;
     if (texture && typeof texture.createView === 'function') {
       textureView = promotedFrom1D
-        ? this._createSafeTextureView(texture, { dimension: '2d' })
-        : this._createSafeTextureView(texture);
+        ? this._createSafeTextureView(texture, { dimension: '2d' }, id)
+        : this._createSafeTextureView(texture, null, id);
       this.textureViews.set(id, textureView);
     }
     const size = effectiveDescriptor.size || {};
@@ -12357,6 +12473,9 @@ class WgpuCommandProcessor {
       format: effectiveDescriptor.format || 'rgba8unorm',
       dimension: effectiveDescriptor.dimension || '2d',
       usage: typeof effectiveDescriptor.usage === 'number' ? effectiveDescriptor.usage : 0,
+      viewFormats: Array.isArray(effectiveDescriptor.viewFormats)
+        ? effectiveDescriptor.viewFormats
+        : null,
     });
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('texture', id, texture, {
@@ -12384,7 +12503,7 @@ class WgpuCommandProcessor {
     if (prev && typeof prev.byteSize === 'number' && prev.byteSize > 0) {
       this._liveTextureBytes = Math.max(0, this._liveTextureBytes - prev.byteSize);
     }
-    this._textureMeta.set(id, {
+    const entry = {
       texture,
       byteSize: safeBytes,
       width: meta.width || 1,
@@ -12395,7 +12514,14 @@ class WgpuCommandProcessor {
       format: meta.format || 'rgba8unorm',
       dimension: meta.dimension || '2d',
       usage: typeof meta.usage === 'number' ? meta.usage : 0,
-    });
+    };
+    if (meta && 'viewFormats' in meta) {
+      entry.viewFormats = Array.isArray(meta.viewFormats) ? meta.viewFormats : null;
+    }
+    this._textureMeta.set(id, entry);
+    if (this._textureObjMeta && texture && typeof texture === 'object') {
+      this._textureObjMeta.set(texture, entry);
+    }
     this._liveTextureBytes += safeBytes;
     if (this._liveTextureBytes > this._peakTextureBytes) {
       this._peakTextureBytes = this._liveTextureBytes;
@@ -12534,7 +12660,7 @@ class WgpuCommandProcessor {
       dimension,
       sampleCount
     );
-    this._recordTextureByteAccounting(id, texture, {
+    const accountedMeta = {
       byteSize,
       width,
       height,
@@ -12544,7 +12670,15 @@ class WgpuCommandProcessor {
       format,
       dimension,
       usage,
-    });
+    };
+    if (rsMeta && 'viewFormats' in rsMeta) {
+      accountedMeta.viewFormats = Array.isArray(rsMeta.viewFormats) ? rsMeta.viewFormats : null;
+    } else if (Array.isArray(texture.viewFormats)) {
+      accountedMeta.viewFormats = texture.viewFormats;
+    } else if (texDesc && Array.isArray(texDesc.viewFormats)) {
+      accountedMeta.viewFormats = texDesc.viewFormats;
+    }
+    this._recordTextureByteAccounting(id, texture, accountedMeta);
   }
 
   _handleCreateTexture(view, payloadOffset) {

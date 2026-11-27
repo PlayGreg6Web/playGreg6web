@@ -492,12 +492,19 @@ function isViewFormatCompatible(textureFormat, viewFormat) {
 }
 
 // Resolves Dawn-valid `viewFormats` for `effectiveFormat`, mapping any fallback formats, stripping
-// incompatible formats that Dawn would reject, and ensuring linear/sRGB siblings (#1896/#1904) are
-// always registered at texture creation time.
+// incompatible formats that Dawn would reject (including `-srgb` entries on STORAGE_BINDING
+// textures), and ensuring linear/sRGB siblings (#1896/#1904) are registered at texture creation time
+// when compatible with the texture's usage.
 function resolveCompatibleViewFormats(effectiveFormat, rawViewFormats, options = null) {
   const bcFallback = Boolean(options && options.bcFallback);
   const depthFallback = Boolean(options && options.depthFallback);
   const norm16Fallback = Boolean(options && options.norm16Fallback);
+  const hasStorageBinding = Boolean(
+    options &&
+      (options.hasStorageBinding === true ||
+        (typeof options.usage === 'number' &&
+          (options.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0))
+  );
   const sibling = getSrgbSiblingFormat(effectiveFormat);
   const clean = [];
   const dropped = [];
@@ -512,7 +519,10 @@ function resolveCompatibleViewFormats(effectiveFormat, rawViewFormats, options =
       } else if (norm16Fallback && Object.prototype.hasOwnProperty.call(NORM16_TO_FLOAT16_FALLBACK, vf)) {
         vf = NORM16_TO_FLOAT16_FALLBACK[vf];
       }
-      if (!isViewFormatCompatible(effectiveFormat, vf)) {
+      if (
+        !isViewFormatCompatible(effectiveFormat, vf) ||
+        (hasStorageBinding && isSrgbTextureFormat(vf))
+      ) {
         dropped.push(vf);
         continue;
       }
@@ -521,7 +531,11 @@ function resolveCompatibleViewFormats(effectiveFormat, rawViewFormats, options =
       }
     }
   }
-  if (sibling !== null && !clean.includes(sibling)) {
+  if (
+    sibling !== null &&
+    !(hasStorageBinding && isSrgbTextureFormat(sibling)) &&
+    !clean.includes(sibling)
+  ) {
     clean.push(sibling);
   }
   return { viewFormats: clean, dropped };
@@ -1281,12 +1295,14 @@ function sanitizeTextureDescriptor(rawDescriptor, device, options) {
     usage,
   };
 
-  // #1896/#1904: strip Dawn-incompatible viewFormats and auto-register sRGB/linear siblings so
-  // PresentX linear sibling views and GPU-to-GPU bit-exact copies never fail createView validation.
+  // #1896/#1904: strip Dawn-incompatible viewFormats (including -srgb on STORAGE_BINDING textures)
+  // and auto-register compatible sRGB/linear siblings so PresentX linear sibling views and
+  // GPU-to-GPU bit-exact copies never fail createView validation.
   const vfResolved = resolveCompatibleViewFormats(effectiveFormat, rawDescriptor.viewFormats, {
     bcFallback,
     depthFallback,
     norm16Fallback,
+    usage,
   });
   if (vfResolved.dropped.length > 0) {
     warnings.push({
@@ -7368,6 +7384,71 @@ class RenderStatePackets {
       }
     }
 
+    // WebGPU forbids `-srgb` views on textures created with STORAGE_BINDING usage or linear
+    // textures whose viewFormats omit the requested `-srgb` format; rewrite to linear sibling.
+    if (effFormat && isSrgbTextureFormat(effFormat)) {
+      const linearSibling = getSrgbSiblingFormat(effFormat);
+      if (linearSibling) {
+        let procMeta = null;
+        if (this.processor) {
+          if (
+            textureIdForError &&
+            this.processor._textureMeta &&
+            typeof this.processor._textureMeta.get === 'function'
+          ) {
+            procMeta = this.processor._textureMeta.get(textureIdForError) || null;
+          }
+          if (
+            !procMeta &&
+            this.processor._textureObjMeta &&
+            typeof this.processor._textureObjMeta.get === 'function'
+          ) {
+            procMeta = this.processor._textureObjMeta.get(texture) || null;
+          }
+        }
+        const texDesc = texture.desc && typeof texture.desc === 'object' ? texture.desc : null;
+        const hasStorageBinding =
+          (typeof texture.usage === 'number' &&
+            (texture.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0) ||
+          (meta !== null &&
+            typeof meta.usage === 'number' &&
+            (meta.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0) ||
+          (procMeta !== null &&
+            typeof procMeta.usage === 'number' &&
+            (procMeta.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0) ||
+          (texDesc !== null &&
+            typeof texDesc.usage === 'number' &&
+            (texDesc.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0);
+
+        let missingSrgbViewFormat = false;
+        if (!hasStorageBinding) {
+          const baseTexFormat =
+            actualTexFormat || (procMeta && typeof procMeta.format === 'string' ? procMeta.format : null);
+          if (baseTexFormat && !isSrgbTextureFormat(baseTexFormat)) {
+            if (Array.isArray(texture.viewFormats)) {
+              missingSrgbViewFormat = !texture.viewFormats.includes(effFormat);
+            } else if (texDesc && Array.isArray(texDesc.viewFormats)) {
+              missingSrgbViewFormat = !texDesc.viewFormats.includes(effFormat);
+            } else if (meta && 'viewFormats' in meta) {
+              missingSrgbViewFormat = !(
+                Array.isArray(meta.viewFormats) && meta.viewFormats.includes(effFormat)
+              );
+            } else if (procMeta && 'viewFormats' in procMeta) {
+              missingSrgbViewFormat = !(
+                Array.isArray(procMeta.viewFormats) && procMeta.viewFormats.includes(effFormat)
+              );
+            } else if (texDesc && typeof texDesc.format === 'string' && !Array.isArray(texDesc.viewFormats)) {
+              missingSrgbViewFormat = true;
+            }
+          }
+        }
+        if (hasStorageBinding || missingSrgbViewFormat) {
+          effFormat = linearSibling;
+          modified = true;
+        }
+      }
+    }
+
     // Sanitize aspect against actual texture format (e.g. stencil-only on depth-only or depth/stencil aspect on color).
     if (effAspect && actualTexFormat) {
       if (effAspect === 'depth-only' && !hasDepthAspect(actualTexFormat)) {
@@ -7614,7 +7695,13 @@ class RenderStatePackets {
       return null;
     }
     this._getTextureGeneration(textureId, texture);
-    const meta = this.textureMeta.get(textureId) || null;
+    const meta =
+      this.textureMeta.get(textureId) ||
+      (this.processor &&
+      this.processor._textureMeta &&
+      typeof this.processor._textureMeta.get === 'function'
+        ? this.processor._textureMeta.get(textureId) || null
+        : null);
     return this.getOrCreateTextureView(texture, desc, meta, textureId);
   }
 

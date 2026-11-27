@@ -323,14 +323,21 @@
    * @param {string[] | null | undefined} [requestedViewFormats]
    * @returns {{ viewFormats: string[] | undefined, siblingAdded: boolean }}
    */
-  function resolveCompatibleViewFormats(format, requestedViewFormats) {
+  function resolveCompatibleViewFormats(format, requestedViewFormats, options = null) {
     if (typeof format !== 'string' || !format) {
       return { viewFormats: undefined, siblingAdded: false };
     }
     const baseFormat = format.trim().toLowerCase();
+    const hasStorageBinding = Boolean(
+      options &&
+        (options.hasStorageBinding === true ||
+          (typeof options.usage === 'number' &&
+            (options.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0))
+    );
     const sibling = getSrgbSiblingFormat(baseFormat);
+    const allowSibling = sibling !== null && !(hasStorageBinding && sibling.endsWith('-srgb'));
     if (!Array.isArray(requestedViewFormats) || requestedViewFormats.length === 0) {
-      return sibling !== null
+      return allowSibling
         ? { viewFormats: [sibling], siblingAdded: true }
         : { viewFormats: undefined, siblingAdded: false };
     }
@@ -346,6 +353,9 @@
       if (!vf || seen.has(vf)) {
         continue;
       }
+      if (hasStorageBinding && vf.endsWith('-srgb')) {
+        continue;
+      }
       if (vf === baseFormat || (sibling !== null && vf === sibling)) {
         seen.add(vf);
         out.push(vf);
@@ -353,7 +363,7 @@
     }
 
     let siblingAdded = false;
-    if (sibling !== null && !seen.has(sibling)) {
+    if (allowSibling && !seen.has(sibling)) {
       seen.add(sibling);
       out.push(sibling);
       siblingAdded = true;
@@ -1396,7 +1406,9 @@
       depthOrArrayLayers,
       dimension
     );
+    const hasStorageBinding = (usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0;
     const sibling = getSrgbSiblingFormat(format);
+    const attachSibling = sibling !== null && !(hasStorageBinding && sibling.endsWith('-srgb'));
 
     if (targetOut) {
       let pool = targetOut._pool;
@@ -1428,7 +1440,7 @@
       descriptor.dimension = dimension;
       if ('sampleCount' in descriptor) delete descriptor.sampleCount;
       const viewFormats = pool.viewFormats;
-      if (sibling !== null) {
+      if (attachSibling) {
         viewFormats.length = 1;
         viewFormats[0] = sibling;
         descriptor.viewFormats = viewFormats;
@@ -1449,7 +1461,7 @@
       usage,
       dimension,
     };
-    if (sibling !== null) {
+    if (attachSibling) {
       descriptor.viewFormats = [sibling];
     }
 
@@ -4366,9 +4378,65 @@
             delete effectiveDescriptor.viewFormats;
           }
         }
-      } else if (descriptor && typeof descriptor.format === 'string') {
-        const resolved = resolveCompatibleViewFormats(descriptor.format, descriptor.viewFormats);
-        const origViewFormats = Array.isArray(descriptor.viewFormats) ? descriptor.viewFormats : null;
+      }
+
+      // Sanitize usage before resolving viewFormats so STORAGE_BINDING compatibility is exact
+      // (WebGPU forbids `-srgb` entries in `viewFormats` when STORAGE_BINDING is present).
+      if (
+        effectiveDescriptor &&
+        typeof effectiveDescriptor.format === 'string' &&
+        typeof effectiveDescriptor.usage === 'number'
+      ) {
+        let sanitizedUsage = effectiveDescriptor.usage;
+        const fmt = effectiveDescriptor.format;
+        const dev = p && p.device ? p.device : null;
+        if (
+          (sanitizedUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
+          !formatSupportsStorageBinding(fmt, dev)
+        ) {
+          sanitizedUsage &= ~GPU_TEXTURE_USAGE_STORAGE_BINDING;
+        }
+        if (
+          (sanitizedUsage & GPU_TEXTURE_USAGE_RENDER_ATTACHMENT) !== 0 &&
+          !formatSupportsRenderAttachment(fmt, dev)
+        ) {
+          sanitizedUsage &= ~GPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+        }
+        if (sanitizedUsage !== effectiveDescriptor.usage) {
+          effectiveDescriptor = {
+            ...effectiveDescriptor,
+            size: effectiveDescriptor.size ? { ...effectiveDescriptor.size } : effectiveDescriptor.size,
+            usage: sanitizedUsage,
+          };
+        }
+      }
+
+      const hasStorageBinding = Boolean(
+        effectiveDescriptor &&
+          typeof effectiveDescriptor.usage === 'number' &&
+          (effectiveDescriptor.usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0
+      );
+
+      if (bc3dFallback) {
+        if (hasStorageBinding && Array.isArray(effectiveDescriptor.viewFormats)) {
+          const filteredViewFormats = effectiveDescriptor.viewFormats.filter(
+            (vf) => typeof vf !== 'string' || !vf.endsWith('-srgb')
+          );
+          if (filteredViewFormats.length > 0) {
+            effectiveDescriptor.viewFormats = filteredViewFormats;
+          } else {
+            delete effectiveDescriptor.viewFormats;
+          }
+        }
+      } else if (effectiveDescriptor && typeof effectiveDescriptor.format === 'string') {
+        const resolved = resolveCompatibleViewFormats(
+          effectiveDescriptor.format,
+          effectiveDescriptor.viewFormats,
+          hasStorageBinding ? { hasStorageBinding: true } : null
+        );
+        const origViewFormats = Array.isArray(effectiveDescriptor.viewFormats)
+          ? effectiveDescriptor.viewFormats
+          : null;
         const resolvedViewFormats = resolved.viewFormats || null;
         const changed =
           resolved.siblingAdded ||
@@ -4378,8 +4446,8 @@
               origViewFormats.some((vf, idx) => vf !== resolvedViewFormats[idx])));
         if (changed) {
           effectiveDescriptor = {
-            ...descriptor,
-            size: descriptor.size ? { ...descriptor.size } : descriptor.size,
+            ...effectiveDescriptor,
+            size: effectiveDescriptor.size ? { ...effectiveDescriptor.size } : effectiveDescriptor.size,
           };
           if (resolvedViewFormats && resolvedViewFormats.length > 0) {
             effectiveDescriptor.viewFormats = resolvedViewFormats;
@@ -4413,35 +4481,6 @@
           effectiveDescriptor.sampleCount = 1;
         }
         promoted1DTo2D = true;
-      }
-
-      if (
-        effectiveDescriptor &&
-        typeof effectiveDescriptor.format === 'string' &&
-        typeof effectiveDescriptor.usage === 'number'
-      ) {
-        let sanitizedUsage = effectiveDescriptor.usage;
-        const fmt = effectiveDescriptor.format;
-        const dev = p && p.device ? p.device : null;
-        if (
-          (sanitizedUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
-          !formatSupportsStorageBinding(fmt, dev)
-        ) {
-          sanitizedUsage &= ~GPU_TEXTURE_USAGE_STORAGE_BINDING;
-        }
-        if (
-          (sanitizedUsage & GPU_TEXTURE_USAGE_RENDER_ATTACHMENT) !== 0 &&
-          !formatSupportsRenderAttachment(fmt, dev)
-        ) {
-          sanitizedUsage &= ~GPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
-        }
-        if (sanitizedUsage !== effectiveDescriptor.usage) {
-          effectiveDescriptor = {
-            ...effectiveDescriptor,
-            size: effectiveDescriptor.size ? { ...effectiveDescriptor.size } : effectiveDescriptor.size,
-            usage: sanitizedUsage,
-          };
-        }
       }
 
       if (
@@ -4503,6 +4542,10 @@
           requestedDimension,
           promoted1DTo2D,
           format: effectiveDescriptor.format || null,
+          usage: typeof effectiveDescriptor.usage === 'number' ? effectiveDescriptor.usage : 0,
+          viewFormats: Array.isArray(effectiveDescriptor.viewFormats)
+            ? effectiveDescriptor.viewFormats
+            : null,
         };
         this._textureMeta.set(id, meta);
         if (texture && typeof texture === 'object') {
@@ -4546,6 +4589,9 @@
           depthOrArrayLayers: effectiveDescriptor.size
             ? effectiveDescriptor.size.depthOrArrayLayers
             : 1,
+          viewFormats: Array.isArray(effectiveDescriptor.viewFormats)
+            ? effectiveDescriptor.viewFormats
+            : null,
         });
       }
       let textureView = null;

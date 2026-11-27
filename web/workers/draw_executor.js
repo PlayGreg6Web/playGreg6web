@@ -1890,7 +1890,7 @@
       }
 
       const hasDesc = Boolean(viewDescriptor && typeof viewDescriptor === 'object');
-      const rawFormat =
+      let effFormat =
         hasDesc && viewDescriptor.format !== undefined && viewDescriptor.format !== null
           ? viewDescriptor.format
           : '';
@@ -1930,6 +1930,34 @@
           : '';
 
       let coerced = false;
+      let formatCoerced = false;
+      if (hasDesc && typeof effFormat === 'string' && effFormat.endsWith('-srgb')) {
+        const texDesc = texture.desc && typeof texture.desc === 'object' ? texture.desc : null;
+        const hasStorageBinding =
+          (typeof texture.usage === 'number' && (texture.usage & 0x0008) !== 0) ||
+          (texDesc !== null && typeof texDesc.usage === 'number' && (texDesc.usage & 0x0008) !== 0);
+        let missingSrgbViewFormat = false;
+        if (!hasStorageBinding) {
+          const baseTexFmt =
+            (typeof texture.format === 'string' && texture.format) ||
+            (texDesc && typeof texDesc.format === 'string' && texDesc.format) ||
+            null;
+          if (baseTexFmt && !baseTexFmt.endsWith('-srgb')) {
+            if (Array.isArray(texture.viewFormats)) {
+              missingSrgbViewFormat = !texture.viewFormats.includes(effFormat);
+            } else if (texDesc && Array.isArray(texDesc.viewFormats)) {
+              missingSrgbViewFormat = !texDesc.viewFormats.includes(effFormat);
+            } else if (texDesc && typeof texDesc.format === 'string' && !Array.isArray(texDesc.viewFormats)) {
+              missingSrgbViewFormat = true;
+            }
+          }
+        }
+        if (hasStorageBinding || missingSrgbViewFormat) {
+          effFormat = effFormat.slice(0, -5);
+          formatCoerced = true;
+          coerced = true;
+        }
+      }
       if (hasDesc && typeof effDim === 'string' && effDim.length > 0 && effDim !== 'undefined') {
         const actualTexDim =
           typeof texture.dimension === 'string'
@@ -1973,7 +2001,7 @@
       }
 
       const isDefaultKey =
-        rawFormat === '' &&
+        effFormat === '' &&
         effDim === '' &&
         rawAspect === '' &&
         effBaseMip === '' &&
@@ -2010,7 +2038,7 @@
         }
       }
 
-      const key = `${rawFormat}|${effDim}|${rawAspect}|${effBaseMip}|${effMipCount}|${effBaseLayer}|${effLayerCount}|${rawUsage}`;
+      const key = `${effFormat}|${effDim}|${rawAspect}|${effBaseMip}|${effMipCount}|${effBaseLayer}|${effLayerCount}|${rawUsage}`;
       if (record && record.byKey !== null) {
         const cached = record.byKey.get(key);
         if (cached) {
@@ -2026,7 +2054,9 @@
       this._stats.textureViewCacheMisses += 1;
       let createDesc = viewDescriptor;
       if (coerced) {
-        createDesc = { ...viewDescriptor, dimension: effDim };
+        createDesc = { ...viewDescriptor };
+        if (formatCoerced) createDesc.format = effFormat;
+        if (effDim !== '') createDesc.dimension = effDim;
         if (effBaseLayer !== '') createDesc.baseArrayLayer = effBaseLayer;
         if (effLayerCount !== '') createDesc.arrayLayerCount = effLayerCount;
         if (effBaseMip !== '') createDesc.baseMipLevel = effBaseMip;
