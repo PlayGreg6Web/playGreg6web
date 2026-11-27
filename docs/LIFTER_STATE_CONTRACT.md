@@ -13,6 +13,10 @@ Runs from one binary are nondeterministic, and a runtime synchronisation race is
 This audit also found no runtime writer that breaks the contract below. Treat #2033 as
 "not proven unsafe", not as the cause. The contract is what any store-back-skipping lifter needs.
 
+**#2104 (the #2033 reland), reverted by #2115: still no static violation.** See
+[The #2104 trap](#the-2104-trap-sub_1406395d00x9f) below. A differential IR check over every lifted
+function found no store-back that #2033 skips while the slot differs from the alloca.
+
 ## What lifted code assumes today (before any skipping)
 
 - **Direct call to `sub_T`.**
@@ -122,6 +126,66 @@ register. This applies to:
 - the entry of every resume target.
 
 Before #2033, rules 1-4 already held. Nothing found here shows #2033 broke one of them.
+
+## The #2104 trap (`sub_1406395D0+0x9f`)
+
+One std-pack boot with #2104 trapped at `sub_1406395D0+0x9f` on four worker threads at about
+658 s (callers `sub_143E54A70` <- `sub_142570310` <- `sub_14221C1F0` <- `sub_142215EA0`).
+
+**What the trap is.** `+0x9f` is a guest `int3`. The function pops an entry from a shared
+lock-free free list (`lock cmpxchg` on a tagged head) and executes the `int3` when the head holds
+the "list empty" sentinel. All four threads had that sentinel in `eax`, so the pool was empty.
+The trap does not consume a stale register. It shows that the pool ran dry: either entries
+leaked or the free list was cut short somewhere else, earlier. The trap site cannot say where.
+
+**#2033 does not change the trapping function.** With and without #2033, `sub_1406395D0` lifts
+to the same IR. Its callers and the pool's free path differ only in skipped `store ... ptr
+%state.*` lines.
+
+**Differential check over every function.** This used a local checker that is not in the repo.
+It lifted every function of the executable (435,719) and of `vcruntime140`, `vcruntime140_1`,
+`msvcp140` and `Bink2Scarlett`, once with and once without #2033, using whole-program summaries
+and the default (flat) memory model of that boot. The checker ran a forward dataflow over each
+function's emitted IR. It tracked, per register and flag, the value in the alloca and the value
+in the `%state` slot. The two count as equal only when they hold the same SSA value. At joins it
+intersected over the predecessors. At a direct call it overwrote the slots of `written(T)` /
+`written_flags(T)`. At a call to a runtime helper that receives `%state` it overwrote every slot.
+It then checked alloca == slot at every observation:
+- a direct call (`touched & live_in_state`, `touched_flags & live_in`);
+- a tail call;
+- a returning or trapping helper that receives `%state`;
+- a normal `ret`.
+- **Result:** no failure that appears only with #2033 (19,387 failures with it, 19,834 without;
+  these are where the checker cannot prove two SSA values equal). The checker does catch real
+  mistakes: deliberately changing #2033's join to a union makes it report failures at once.
+- **Rule 2 checked against the emitted IR:** for every function, the slots its IR stores itself,
+  plus the transitive closure over its `call` / `tail call` targets, are a subset of
+  `written` / `written_flags`. There are no exceptions.
+
+So, under rules 1-6, #2033 leaves `%state` identical at every point where lifted code or a
+runtime helper reads it. **No missing static invariant was found, and no recomp test can
+reproduce one.** A unit test that "fails with #2033's logic" would need a real counterexample,
+and the check above found none.
+
+**What #2033 does change at run time.** It removes a side effect that rules 1-6 do not account
+for:
+
+7. **Unconditional store-backs repair foreign writes; skipped store-backs do not.** Suppose
+   something other than the lifted callee writes slot `r` during a direct call, where
+   `r ∉ written(T)`. That can be a runtime path missed by rule 1, or another host thread sharing
+   the state against rule 5. Without #2033, the caller's next store-back puts the alloca value
+   back into `%state`, so the foreign write survives only until then. With #2033, the store-back
+   is skipped and the foreign write stays. A store-back-skipping lifter therefore needs rules 1
+   and 5 to hold **dynamically**, not just in the static audit. A cheap way to test this at run
+   time: a debug build of the skipping lifter that turns each skipped store into
+   `load slot; icmp ne alloca; br -> __playgta6_trap`. That asserts the invariant at exactly the
+   points #2033 relies on it, so it names the first foreign write or race.
+
+Until such a debug build has run past the trap point with no assertion, treat the 658 s pool
+exhaustion like the earlier 116 s crash. It is one run against twelve. It may come from the
+nondeterministic runtime race described above, and #2033's lower store traffic may only change
+its timing. It may also be a real violation of rule 1 or 5 that unconditional store-backs used
+to hide.
 
 ## Incidental findings (pre-existing, independent of #2033)
 
