@@ -114,7 +114,7 @@ Build and watch the game in a headed Chrome on your own machine. Game files stay
 ```
 This calls `tools/run_browser_boot.py --preset long --headed`: it rebuilds stale stages (recomp lift, PIC runtime lib,
 guest Wasm, shader pack, staging), starts the local COOP/COEP server and launches Chrome with its own profile.
-Useful switches: `-NoBuild` (fail on stale), `-TrustBuild` (reuse artifacts), `-DryRun` (print plan),
+Useful switches: `-NoBuild` (fail on stale), `-TrustBuild` (reuse artifacts), `-DryRun` (resolve everything and print the exact `python tools/run_*_boot.py ...` command, plus the prebuilt staleness line, then exit 0 without building or launching; same in `play_native.ps1`),
 `-Chrome <path>`, `-DurationS`. Input presets: start-screen, menu-flow, calibration-skip, intro-watch,
 legal-notices, chrome-menu-flow, chrome-menu-flow-2, chrome-menu-flow-4, chrome-menu-flow-5, chrome-full-boot,
 menu-to-ingame, chrome-to-ingame (every preset `tools/run_browser_boot.py` accepts; `chrome-to-ingame` goes through

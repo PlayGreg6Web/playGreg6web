@@ -44,6 +44,7 @@ if ($Prebuilt) {
     }
     $TrustBuild = $true
     & python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $PrebuiltDir --repo $repo
+    if ($DryRun) { Write-Host "[dry-run] python tools/prebuilt_stale.py --prebuilt $PrebuiltDir --repo $repo --web" }
     try { & python (Join-Path $PSScriptRoot "prebuilt_stale.py") --prebuilt $PrebuiltDir --repo $repo --web } catch { }
     # Full std pack (WGPK v2) streamed with HTTP Range (?streamShaders=1); the staged v1 subset is the fallback.
     if (-not $NoStreamShaders -and -not $ShaderPack -and -not $StreamShaders) {
@@ -97,7 +98,11 @@ if ($Prebuilt) {
 }
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
-if ($DryRun) { $argv += "--dry-run" }
+if ($DryRun) {
+    Write-Host "[dry-run] build dir: $BuildDir; run name: $Name; input script: $InputScript; shader pack: $(if ($ShaderPack) { $ShaderPack } else { '(none)' })"
+    Write-Host "[dry-run] python $($argv -join ' ')"
+    exit 0
+}
 Write-Host "Serving on http://127.0.0.1:$Port/ ; stop with Ctrl+C or by closing Chrome (run lasts up to $DurationS s)."
 Push-Location $repo
 try { & python @argv; exit $LASTEXITCODE } finally { Pop-Location }

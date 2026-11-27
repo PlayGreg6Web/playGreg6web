@@ -74,6 +74,7 @@ if ($Prebuilt) {
         if ($LASTEXITCODE -eq 0 -and "$n" -match '^\d+$') { $behind = $n }
     } catch { }
     Write-Host "[prebuilt] $pdir built from $pc ($behind commits behind origin/main). Refresh: .\tools\update_prebuilt.ps1"
+    if ($DryRun) { Write-Host "[dry-run] python tools/prebuilt_stale.py --prebuilt $pdir --repo $repo" }
     try { & python (Join-Path $PSScriptRoot "prebuilt_stale.py") --prebuilt $pdir --repo $repo } catch { }
 }
 if ($Update) { & python (Join-Path $PSScriptRoot "repo_update.py") update --repo $repo }
@@ -95,7 +96,11 @@ if ($MaxFps -gt 0) { $argv += @("--max-fps", $MaxFps) }
 if ($FreshSetup) { $argv += "--fresh-setup" }
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
-if ($DryRun) { $argv += "--dry-run" }
 if ($SaveDir) { $argv += @("--save-dir", $SaveDir) }
+if ($DryRun) {
+    Write-Host "[dry-run] build dir: $BuildDir; run name: $Name; input script: $InputScript (preset $preset); shader pack: $(if ($ShaderPack) { $ShaderPack } else { '(auto-picked by run_native_boot.py)' })"
+    Write-Host "[dry-run] python $($argv -join ' ')"
+    exit 0
+}
 Push-Location $repo
 try { & python @argv; exit $LASTEXITCODE } finally { Pop-Location }
