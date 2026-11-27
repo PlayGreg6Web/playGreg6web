@@ -1207,6 +1207,19 @@ public:
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
 
+    // Textures a recorded compute dispatch writes through a writable storage view (backlog 8): the
+    // resource id and the first mip of the view. take_written_textures moves them out (deduplicated,
+    // in first-written order) and clears the list.
+    struct WrittenTexture {
+        uint32_t resource_id = 0;
+        uint32_t mip = 0;
+        bool operator==(const WrittenTexture& o) const { return resource_id == o.resource_id && mip == o.mip; }
+    };
+    void take_written_textures(std::vector<WrittenTexture>* out) {
+        out->insert(out->end(), dispatch_written_.begin(), dispatch_written_.end());
+        dispatch_written_.clear();
+    }
+
     // G66 read-back: ends the open render pass (pending clears first, as for a copy) and emits a
     // ReadbackBuffer / ReadbackTexture packet naming `resource_id`. Returns the encoder offset of
     // the payload (the caller patches its sequence number at execution), or SIZE_MAX when the list
@@ -1242,6 +1255,7 @@ private:
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> dynamic_offsets;
         uint32_t null_write_entries = 0;  // writable storage bindings of the group bound null
+        std::vector<WrittenTexture> written;  // textures a writable storage view of the group names
     };
     struct VertexBinding {
         uint32_t buffer_id = 0;
@@ -1352,6 +1366,7 @@ private:
     DepthTwinTracker depth_twin_;
     // Fragment-stage redirects of the open render pass: converted out when the pass ends.
     std::vector<StorageRedirect> pass_redirects_;
+    std::vector<WrittenTexture> dispatch_written_;  // see take_written_textures
 
     StateBridgeDevice& device_;
     CommandEncoder& encoder_;

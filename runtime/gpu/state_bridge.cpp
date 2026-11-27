@@ -3206,6 +3206,7 @@ void CommandListBridge::note_bind_group_used_locked(const d3d::CachedBindGroup& 
 }
 
 void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
+    dispatch_written_.clear();
     rt_ranges_.clear();
     clamp_batch_.close();
     // O36: bound the per-list bind group cache. Its keys change per draw (ring-allocated root CBVs,
@@ -4744,6 +4745,21 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
         }
         BoundGroup& b = (*bound)[g];
         b.null_write_entries = cached != nullptr ? cached->null_write_entries : 0u;
+        b.written.clear();
+        if (bind_point == d3d::BindPoint::Compute && cached != nullptr) {
+            for (size_t i = 0; i < group.entries.size() && i < cached->entries.size(); ++i) {
+                const GpuBindGroupLayoutEntry& le = group.entries[i];
+                const d3d::BindGroupEntry& ce = cached->entries[i];
+                if (le.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) &&
+                    le.binding_type != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly) &&
+                    ce.kind == d3d::BindResourceKind::TextureView && ce.resource_id != 0) {
+                    const WrittenTexture w{ce.resource_id, d3d::view_subresource_range(ce.view).first_mip};
+                    if (std::find(b.written.begin(), b.written.end(), w) == b.written.end()) {
+                        b.written.push_back(w);
+                    }
+                }
+            }
+        }
         const uint32_t* offsets_ptr = heap_offsets.empty() ? stack_offsets.data() : heap_offsets.data();
         const bool same_offsets = b.dynamic_offsets.size() == offset_count &&
                                   (offset_count == 0 ||
@@ -5189,6 +5205,14 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
     encoder_.dispatch_compute(thread_group_count_x, thread_group_count_y, thread_group_count_z);
     ++stats_.dispatches;
+    for (const BoundGroup& b : compute_groups_) {
+        for (const WrittenTexture& w : b.written) {
+            if (dispatch_written_.size() < 64 &&
+                std::find(dispatch_written_.begin(), dispatch_written_.end(), w) == dispatch_written_.end()) {
+                dispatch_written_.push_back(w);
+            }
+        }
+    }
     if (state->layout_ != nullptr && state->layout_->rt_arena && !state->layout_->rt_address_sources.empty()) {
         GpuReadbackBufferPayload rb{};
         uint32_t stats_buffer = 0;

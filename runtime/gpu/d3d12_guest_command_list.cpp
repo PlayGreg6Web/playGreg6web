@@ -8,11 +8,13 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/binding_fallbacks.h"
 #include "gpu/drop_table.h"
 #include "gpu/gpu_va_watch.h"
+#include "os/guest_window.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -72,6 +74,9 @@ const char* work_name(Work w) {
     case Work::DepthTwinBindings: return "depth_twin_bindings";
     case Work::DepthTwinCopiesIn: return "depth_twin_copies_in";
     case Work::DepthTwinCopiesOut: return "depth_twin_copies_out";
+    case Work::ComputeTextureReadbacks: return "compute_texture_readbacks";
+    case Work::ComputeTextureRetiled: return "compute_texture_retiled";
+    case Work::ComputeTextureRetileDiscarded: return "compute_texture_retile_discarded";
     case Work::Count: break;
     }
     return "?";
@@ -1473,6 +1478,7 @@ void CommandList::reset(PipelineState* initial_state) {
     deferred_.clear();
     immediate_writes_.clear();
     readbacks_.clear();
+    compute_written_.clear();
     graphics_root_args_ = {};
     graphics_root_signature_ = nullptr;
     vertex_buffers_ = {};
@@ -1499,6 +1505,7 @@ HResult CommandList::Close() {
         note("ID3D12GraphicsCommandList::Close on a closed list");
         return kEFail;
     }
+    emit_compute_texture_readbacks();
     bridge_.Close();
     open_ = false;
     return kSOk;
@@ -2222,6 +2229,7 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
     const uint64_t emitted = bridge_.stats().dispatches;
     const bridge::BridgeStats before = bridge_.stats();
     bridge_.Dispatch(x, y, z);
+    bridge_.take_written_textures(&compute_written_);
     count_object_reuse(before, bridge_.stats());
     note_binding_fallbacks(compute_pso_ != nullptr ? &compute_pso_->shader_identities() : nullptr, before,
                            bridge_.stats(), true);
@@ -2730,8 +2738,104 @@ void CommandList::record_readback(GpuOpcode opcode, const void* payload, uint32_
 
 void CommandList::issue_readbacks() {
     for (const ReadbackRecord& r : readbacks_) {
-        const uint32_t seq = device_->readbacks().issue(r.guest_va, r.bytes);
+        if (!r.retile) {
+            const uint32_t seq = device_->readbacks().issue(r.guest_va, r.bytes);
+            encoder_.patch(r.seq_offset, &seq, sizeof(seq));
+            continue;
+        }
+        // Backlog 8: the bytes land in a scratch buffer of this execution (pre-filled with a sentinel
+        // so a read-back that never wrote is told apart); the completion re-tiles them into the guest
+        // surface and marks it written. Nothing is written unless the GPU result arrived.
+        auto scratch = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(r.retile_plan.linear_bytes));
+        compute_readback::fill_sentinel(scratch->data(), scratch->size());
+        const uint64_t dst = reinterpret_cast<uintptr_t>(scratch->data());
+        encoder_.patch(r.seq_offset + offsetof(GpuReadbackTexturePayload, dst_addr), &dst, sizeof(dst));
+        const compute_readback::Plan plan = r.retile_plan;
+        const uint64_t cpu_va = r.retile_cpu_va;
+        const uint32_t seq = device_->readbacks().issue_with_completion(
+            0, 0, ReadbackKind::Texture, 0u, [scratch, plan, cpu_va]() {
+                void* host = com::guest_to_host(cpu_va, static_cast<size_t>(plan.surface_bytes));
+                if (host != nullptr &&
+                    compute_readback::retile_into_guest(plan, scratch->data(), scratch->size(),
+                                                        static_cast<uint8_t*>(host),
+                                                        static_cast<size_t>(plan.surface_bytes))) {
+                    os::guest_window::mark_written(cpu_va, static_cast<size_t>(plan.surface_bytes));
+                    count_work(Work::ComputeTextureRetiled);
+                } else {
+                    count_work(Work::ComputeTextureRetileDiscarded);
+                }
+            });
         encoder_.patch(r.seq_offset, &seq, sizeof(seq));
+    }
+}
+
+// Backlog 8: a compute pass wrote a float texture the title reads on the CPU (ocean height /
+// displacement maps). The host GPU wrote its own texture, so read it back (async: the packet joins
+// the list's read-back ring, the title is never blocked on a map) and re-tile the rows into the
+// texture's console-layout guest memory when the read-back completes. Only small, tracked,
+// guest-backed float 2D textures qualify (compute_texture_readback.h). The texture's guest memory
+// then follows the GPU (the CPU->GPU upload sync stops, as for a copy destination), so the
+// read-back result is not uploaded back over the next dispatch's output.
+void CommandList::emit_compute_texture_readbacks() {
+    if (compute_written_.empty()) {
+        return;
+    }
+    constexpr size_t kMaxPerList = 4;
+    constexpr uint64_t kMaxBytesPerList = 2ull << 20;
+    std::vector<bridge::CommandListBridge::WrittenTexture> written;
+    written.swap(compute_written_);
+    size_t emitted = 0;
+    uint64_t total = 0;
+    for (const auto& w : written) {
+        if (emitted >= kMaxPerList) {
+            break;
+        }
+        TrackedTexture tt{};
+        if (!device_->tracked_texture_info(w.resource_id, &tt) || tt.gpu_va == 0 ||
+            tt.dimension != ResourceDimension::Texture2D || tt.sample_count > 1 || tt.host_floor != 0 ||
+            tt.cap_floor_applied != 0 || device_->upload_needs_conversion(tt.dxgi_format)) {
+            continue;
+        }
+        compute_readback::Target target;
+        target.dxgi_format = tt.dxgi_format;
+        target.width = tt.width;
+        target.height = tt.height;
+        target.array_size = std::max<uint32_t>(1u, tt.depth);
+        target.mip_levels = tt.mip_levels;
+        target.d3d12_layout = tt.layout;
+        target.is_2d = true;
+        const compute_readback::Plan plan = compute_readback::plan_readback(target, w.mip);
+        if (!plan.ok || total + plan.linear_bytes > kMaxBytesPerList) {
+            continue;
+        }
+        const uint64_t cpu_va = device_->cpu_address_for_gpu(tt.gpu_va);
+        if (cpu_va == 0 || com::guest_to_host(cpu_va, static_cast<size_t>(plan.surface_bytes)) == nullptr) {
+            continue;
+        }
+        GpuReadbackTexturePayload p{};
+        p.texture_id = tt.resource_id;
+        p.mip_level = plan.mip;
+        p.width = plan.mip_width;
+        p.height = plan.mip_height;
+        p.depth_or_layers = 1;
+        p.bytes_per_row = plan.row_bytes;
+        p.rows_per_image = plan.mip_height;
+        p.dst_size = plan.linear_bytes;
+        p.done_addr = device_->readbacks().done_address();
+        const size_t at = bridge_.Readback(GpuOpcode::ReadbackTexture, &p, sizeof(p), tt.resource_id);
+        if (at == SIZE_MAX) {
+            continue;
+        }
+        ReadbackRecord r;
+        r.seq_offset = at;
+        r.retile = true;
+        r.retile_plan = plan;
+        r.retile_cpu_va = cpu_va;
+        readbacks_.push_back(r);
+        device_->note_texture_copy_destination(tt.resource_id);
+        count_work(Work::ComputeTextureReadbacks);
+        total += plan.linear_bytes;
+        ++emitted;
     }
 }
 

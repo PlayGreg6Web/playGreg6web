@@ -1678,6 +1678,12 @@ enum class Work : size_t {
     DepthTwinBindings,
     DepthTwinCopiesIn,
     DepthTwinCopiesOut,
+    // Backlog 8: compute-written float textures read back and re-tiled into guest memory: read-backs
+    // recorded, re-tiled into guest memory (real GPU bytes only), and discarded because the consumer
+    // completed them without writing (or the guest surface could not be addressed).
+    ComputeTextureReadbacks,
+    ComputeTextureRetiled,
+    ComputeTextureRetileDiscarded,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

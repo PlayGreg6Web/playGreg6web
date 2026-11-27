@@ -68,6 +68,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_readback.cpp
     gpu/gfx10_descriptors.cpp
     gpu/gfx10_detile.cpp
+    gpu/compute_texture_readback.cpp
     gpu/descriptor_words.cpp
     gpu/frame_capture.cpp
     os/xmem_windows.cpp
@@ -293,6 +294,10 @@ else()
     add_executable(test_gfx10_detile ../tests/test_gfx10_detile.cpp)
     target_link_libraries(test_gfx10_detile PRIVATE playgta6_core)
     add_test(NAME test_gfx10_detile COMMAND test_gfx10_detile)
+
+    add_executable(test_compute_texture_readback ../tests/test_compute_texture_readback.cpp)
+    target_link_libraries(test_compute_texture_readback PRIVATE playgta6_core)
+    add_test(NAME test_compute_texture_readback COMMAND test_compute_texture_readback)
 
     add_executable(test_console_layout_sizes ../tests/test_console_layout_sizes.cpp)
     target_link_libraries(test_console_layout_sizes PRIVATE playgta6_core)

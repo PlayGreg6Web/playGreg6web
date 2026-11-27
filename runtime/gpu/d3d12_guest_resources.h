@@ -70,6 +70,7 @@
 #include <string>
 #include <vector>
 
+#include "gpu/compute_texture_readback.h"
 #include "gpu/d3d12_guest_objects.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -518,8 +519,18 @@ private:
         size_t seq_offset = 0;
         uint64_t guest_va = 0;
         uint64_t bytes = 0;
+        // Backlog 8: a compute-written texture read back into a scratch buffer (allocated per
+        // execution, its address patched into the payload) and re-tiled into the guest surface at
+        // `retile_cpu_va` when the read-back completes.
+        bool retile = false;
+        compute_readback::Plan retile_plan{};
+        uint64_t retile_cpu_va = 0;
     };
     std::vector<ReadbackRecord> readbacks_;
+    // Backlog 8: textures a dispatch of this recording wrote (bridge take_written_textures); at Close
+    // the eligible ones get a read-back + re-tile record.
+    std::vector<bridge::CommandListBridge::WrittenTexture> compute_written_;
+    void emit_compute_texture_readbacks();
     // Emits a read-back packet (dst_addr / done_addr already set) whose bytes land at guest
     // [va, va + bytes).
     bool readback_target(uint64_t va, uint64_t bytes, uint64_t* dst_addr, uint64_t* done_addr);

@@ -54,7 +54,8 @@ ReadbackGate::~ReadbackGate() {
     dropped.clear();
 }
 
-ReadbackSlot ReadbackGate::issue_slot_impl(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag) {
+ReadbackSlot ReadbackGate::issue_slot_impl(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag,
+                                           std::function<void()> on_complete) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Advance completion tracking first so already-completed ring slots are not miscounted as
     // overflows when reusing the ring.
@@ -83,7 +84,7 @@ ReadbackSlot ReadbackGate::issue_slot_impl(uint64_t guest_va, uint64_t bytes, Re
     slot.ring_index = ridx;
     slot.completed = (done >= seq);
 
-    ranges_.push_back(PendingRange{seq, guest_va, bytes, kind, tag});
+    ranges_.push_back(PendingRange{seq, guest_va, bytes, kind, tag, std::move(on_complete)});
     count_work(Work::ReadbacksIssued);
     if (bytes != 0) {
         count_work(Work::ReadbackBytes, bytes);
@@ -97,6 +98,11 @@ ReadbackSlot ReadbackGate::issue_slot_impl(uint64_t guest_va, uint64_t bytes, Re
 
 uint32_t ReadbackGate::issue(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag) {
     return static_cast<uint32_t>(issue_slot_impl(guest_va, bytes, kind, tag).seq);
+}
+
+uint32_t ReadbackGate::issue_with_completion(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag,
+                                             std::function<void()> on_complete) {
+    return static_cast<uint32_t>(issue_slot_impl(guest_va, bytes, kind, tag, std::move(on_complete)).seq);
 }
 
 uint64_t ReadbackGate::issue64(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag) {
@@ -136,8 +142,11 @@ uint64_t ReadbackGate::completed_locked() {
     const uint64_t done = reported;
     // The consumer wrote these ranges: lifted code tracking window writes must see them (O37).
     while (!ranges_.empty() && ranges_.front().seq <= done) {
-        const PendingRange r = ranges_.front();
+        PendingRange r = std::move(ranges_.front());
         ranges_.pop_front();
+        if (r.on_complete) {
+            r.on_complete();
+        }
         if (r.va != 0 && r.bytes != 0) {
             const size_t clamped = static_cast<size_t>(
                 std::min<uint64_t>(r.bytes, static_cast<uint64_t>(std::numeric_limits<size_t>::max())));

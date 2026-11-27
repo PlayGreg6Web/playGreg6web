@@ -100,6 +100,14 @@ public:
     // Issues one typed read-back and returns its full 64-bit monotonic sequence number (wrap-safe).
     uint64_t issue64(uint64_t guest_va, uint64_t bytes, ReadbackKind kind = ReadbackKind::Buffer, uint32_t tag = 0);
 
+    // Like issue(), plus `on_complete`, run once when the consumer has reported this read-back done
+    // (delivered or failed: the callback must check what it was given), in sequence order, on
+    // whichever thread observed the completion. It runs under the gate's lock: keep it short and
+    // never call back into the gate. `guest_va` / `bytes` may be 0 when the bytes land in a scratch
+    // buffer the callback owns (no guest range is then marked written).
+    uint32_t issue_with_completion(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag,
+                                   std::function<void()> on_complete);
+
     // Convenience typed issuers for non-blocking occlusion queries, GPU pass timestamps, and
     // compute readbacks (auto-exposure / GPU culling).
     ReadbackSlot issue_occlusion_query(uint64_t guest_va, uint64_t bytes = 8, uint32_t query_index = 0);
@@ -156,11 +164,13 @@ private:
         uint64_t bytes = 0;
         ReadbackKind kind = ReadbackKind::Buffer;
         uint32_t tag = 0;
+        std::function<void()> on_complete;
     };
     uint64_t peek_completed_locked() const;
     uint64_t completed_locked();
     void start_poller_locked();
-    ReadbackSlot issue_slot_impl(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag);
+    ReadbackSlot issue_slot_impl(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag,
+                                 std::function<void()> on_complete = {});
 
     const std::chrono::milliseconds timeout_;
     const size_t ring_capacity_;
