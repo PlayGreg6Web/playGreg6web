@@ -4783,6 +4783,16 @@ void test_unregister_texture_invalidates_cached_bind_groups() {
         CHECK(last_bind_group_entry(enc, &bg1).resource_id == kTex1);
         CHECK(list.cached_bind_group_count() == 1);
 
+        // A retire of ids no group references (the invalidation id filters skip the scans) changes nothing.
+        for (uint32_t unrelated = kTex2 + 1000; unrelated < kTex2 + 1064; ++unrelated) {
+            device.unregister_resource(unrelated);
+        }
+        CHECK(list.cached_bind_group_count() == 1);
+        {
+            gpu::CommandEncoder unchanged;
+            CHECK(list.refresh_memory_bind_groups(unchanged) == 0);
+        }
+
         // Evict kTex1 and re-create a replacement kTex2 at the same GPU VA (descriptor words unchanged).
         device.unregister_resource(kTex1);
         CHECK(list.cached_bind_group_count() == 0);

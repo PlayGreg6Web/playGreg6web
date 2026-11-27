@@ -1516,6 +1516,46 @@ private:
     bool drop_null_storage_dispatch(uint32_t pipeline_id);
     std::array<uint32_t, pso::kMaxColorTargets + 1> om_attachments_{};  // texture ids of the bound RTVs + DSV
     std::unordered_map<uint32_t, std::vector<StorageRedirect>> redirects_;
+    // Superset filters of the ids memory_groups_ (entry resources, view resources, counters, view ids)
+    // and redirects_ (textures, intermediates) reference, kept next to the containers they shadow.
+    // invalidate_resources_locked runs for every bridge on every resource retire (an address-texture
+    // LRU churns thousands per second in game); a retire whose ids are all unset cannot match, so the
+    // scans are skipped. Bits are only added between scans; a full scan rebuilds them.
+    struct InvalidationIdFilter {
+        static constexpr size_t kBits = size_t{1} << 14;
+        std::array<uint64_t, kBits / 64> bits{};
+        static size_t bit(uint32_t id, bool view) noexcept {
+            return static_cast<size_t>(((id + (view ? 0x5bd1e995u : 0u)) * 0x9E3779B1u) >> 12) & (kBits - 1);
+        }
+        void clear() noexcept { bits.fill(0); }
+        void set(uint32_t id, bool view) noexcept {
+            if (id != 0) {
+                const size_t b = bit(id, view);
+                bits[b >> 6] |= uint64_t{1} << (b & 63);
+            }
+        }
+        bool may_hold(uint32_t id, bool view) const noexcept {
+            const size_t b = bit(id, view);
+            return id != 0 && ((bits[b >> 6] >> (b & 63)) & 1u) != 0;
+        }
+        bool may_hold_any(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids) const noexcept {
+            for (const uint32_t id : resource_ids) {
+                if (may_hold(id, false)) {
+                    return true;
+                }
+            }
+            for (const uint32_t id : view_ids) {
+                if (may_hold(id, true)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+    InvalidationIdFilter memory_filter_;
+    InvalidationIdFilter redirect_filter_;
+    void note_memory_group_ids(const d3d::CachedBindGroup& built) noexcept;
+    void note_redirect_ids(const std::vector<StorageRedirect>& redirects) noexcept;
     static constexpr size_t kNoPacket = ~size_t{0};  // created by an earlier recording
     void note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::BindGroupPlan& plan,
                            const d3d::CachedBindGroup& cached, size_t entries_offset);

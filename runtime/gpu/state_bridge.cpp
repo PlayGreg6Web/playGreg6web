@@ -3435,17 +3435,24 @@ void CommandListBridge::invalidate_resources_locked(std::span<const uint32_t> re
         }
         return false;
     };
-    for (auto it = redirects_.begin(); it != redirects_.end();) {
-        const bool match = std::any_of(it->second.begin(), it->second.end(), [&](const StorageRedirect& r) {
-            return contains(resource_ids, r.texture) || contains(resource_ids, r.intermediate);
-        });
-        if (match) {
-            if (it->first != 0 && std::find(local_retired.begin(), local_retired.end(), it->first) == local_retired.end()) {
-                local_retired.push_back(it->first);
+    // The filters skip the scans when no id can match (see InvalidationIdFilter); a full scan rebuilds
+    // its filter from what remains.
+    if (!redirects_.empty() && redirect_filter_.may_hold_any(resource_ids, {})) {
+        redirect_filter_.clear();
+        for (auto it = redirects_.begin(); it != redirects_.end();) {
+            const bool match = std::any_of(it->second.begin(), it->second.end(), [&](const StorageRedirect& r) {
+                return contains(resource_ids, r.texture) || contains(resource_ids, r.intermediate);
+            });
+            if (match) {
+                if (it->first != 0 &&
+                    std::find(local_retired.begin(), local_retired.end(), it->first) == local_retired.end()) {
+                    local_retired.push_back(it->first);
+                }
+                it = redirects_.erase(it);
+            } else {
+                note_redirect_ids(it->second);
+                ++it;
             }
-            it = redirects_.erase(it);
-        } else {
-            ++it;
         }
     }
     for (const uint32_t bg_id : local_retired) {
@@ -3474,7 +3481,12 @@ void CommandListBridge::invalidate_resources_locked(std::span<const uint32_t> re
             retired_bgs->push_back(bg_id);
         }
     }
+    if (memory_groups_.empty() || !memory_filter_.may_hold_any(resource_ids, view_ids)) {
+        return;
+    }
+    memory_filter_.clear();
     for (MemoryBindGroup& m : memory_groups_) {
+        note_memory_group_ids(m.built);  // an invalidated group is still refreshed (and kept) later
         if (m.invalidated) {
             continue;
         }
@@ -3497,6 +3509,24 @@ void CommandListBridge::invalidate_resources_locked(std::span<const uint32_t> re
         if (stale) {
             m.invalidated = true;
         }
+    }
+}
+
+void CommandListBridge::note_memory_group_ids(const d3d::CachedBindGroup& built) noexcept {
+    for (const d3d::BindGroupEntry& e : built.entries) {
+        memory_filter_.set(e.resource_id, false);
+        memory_filter_.set(e.view.resource_id, false);
+        memory_filter_.set(e.view.counter_resource_id, false);
+    }
+    for (const uint32_t vid : built.view_ids) {
+        memory_filter_.set(vid, true);
+    }
+}
+
+void CommandListBridge::note_redirect_ids(const std::vector<StorageRedirect>& redirects) noexcept {
+    for (const StorageRedirect& r : redirects) {
+        redirect_filter_.set(r.texture, false);
+        redirect_filter_.set(r.intermediate, false);
     }
 }
 
@@ -3652,6 +3682,7 @@ void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
         compute_groups_.clear();
         scoped_bind_groups_.clear();
         memory_groups_.clear();
+        memory_filter_.clear();
     }
     tracker_.reset();
     root_args_.reset();
@@ -4272,6 +4303,7 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     ++stats_.bind_groups_created;
     if (!pending_redirects_.empty()) {
         stats_.storage_views_converted += pending_redirects_.size();
+        note_redirect_ids(pending_redirects_);
         redirects_[header.id] = std::move(pending_redirects_);
         pending_redirects_.clear();
     }
@@ -4363,10 +4395,12 @@ void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRe
             if (entries_offset != kNoPacket) {
                 m.entries_offset = entries_offset;
                 m.built = cached;
+                note_memory_group_ids(m.built);
             }
             return;
         }
     }
+    note_memory_group_ids(cached);
     MemoryBindGroup m{entries_offset, &group, plan, cached};
     m.binds_home = binds_relocation_home(cached);
     m.relocation_epoch = cached.relocation_epoch;
@@ -4428,6 +4462,7 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
             gpu_entries(*m.group, m.built, prelude, &entries);
             m.built.view_ids = pending_view_ids_;
             m.built.null_write_entries = pending_null_writes_;
+            note_memory_group_ids(m.built);
             // The conversions were recorded with the dispatches: a redirect the recording did not
             // make has none, so that binding is bound null as before (#482).
             const auto recorded = redirects_.find(m.built.gpu_id);
