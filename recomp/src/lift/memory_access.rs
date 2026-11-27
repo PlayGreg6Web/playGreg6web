@@ -253,7 +253,9 @@ impl FunctionLifter<'_> {
     fn flat_host(&mut self, addr: &str, base: GuestBase) -> String {
         match base {
             GuestBase::Constant(0) => addr.to_string(),
-            GuestBase::Constant(base) => self.val(&format!("add i64 {addr}, {}", imm(base, 64))),
+            GuestBase::Constant(base) => {
+                self.val_raw(&format!("add i64 {addr}, {}", imm(base, 64)))
+            }
             GuestBase::Symbol => {
                 let base_val = self.flat_base_val(GuestBase::Symbol);
                 if addr == "0" {
@@ -514,26 +516,94 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// `(inside, va - W)` for the window check.
+    /// `(inside, va - W)` for the window check, cached per address within the current basic block
+    /// so same-address RMW / repeated accesses reuse the range check without recomputing `sub` +
+    /// `icmp ult` with 64-bit immediates.
     fn window_test(&mut self, addr: &str, w: Window) -> (String, String) {
         self.support.insert(Support::Memory(Decl::WindowTable));
+        if let Some((_, inside, rel)) = self.window_test_cache.iter().find(|(a, _, _)| a == addr) {
+            return (inside.clone(), rel.clone());
+        }
         let rel = self.val(&format!("sub i64 {addr}, {}", imm(w.base, 64)));
         let inside = self.val(&format!("icmp ult i64 {rel}, {}", imm(w.size, 64)));
+        if self.window_test_cache.len() >= 8 {
+            self.window_test_cache.remove(0);
+        }
+        self.window_test_cache
+            .push((addr.to_string(), inside.clone(), rel.clone()));
         (inside, rel)
+    }
+
+    /// True if `[a1, a1 + s1)` and `[a2, a2 + s2)` are provably disjoint in 64-bit modular guest
+    /// address space (including wrap-around): either both are constant VAs, or both share the
+    /// same canonical affine base SSA value with non-overlapping displacements.
+    fn are_addrs_disjoint(&self, a1: &str, s1: u64, a2: &str, s2: u64) -> bool {
+        if s1 == 0 || s2 == 0 {
+            return false;
+        }
+        let (off1, off2) = match (const_addr(a1), const_addr(a2)) {
+            (Some(c1), Some(c2)) => (c1, c2),
+            (None, None) => {
+                let (b1, o1) = self.affine_root(a1);
+                let (b2, o2) = self.affine_root(a2);
+                if b1 != b2 {
+                    return false;
+                }
+                (o1 as u64, o2 as u64)
+            }
+            _ => return false,
+        };
+        let d = off2.wrapping_sub(off1);
+        d >= s1 && d.wrapping_neg() >= s2
+    }
+
+    /// Scalar integer width of an LLVM type (`i8`, `i16`, `i32`, `i64`), or `None` for vectors/FP.
+    fn scalar_int_bits(ty: &str) -> Option<u32> {
+        match ty {
+            "i8" => Some(8),
+            "i16" => Some(16),
+            "i32" => Some(32),
+            "i64" => Some(64),
+            _ => None,
+        }
+    }
+
+    /// Drops `mem_cache` entries invalidated by any non-memory-preserving IR line emitted since
+    /// their `at` position.
+    fn prune_mem_cache(&mut self) {
+        let body = &self.body;
+        self.mem_cache.retain(|e| {
+            body.get(e.at..)
+                .is_some_and(|since| since.lines().all(keeps_memory))
+        });
     }
 
     /// Loads `ty` (`bytes` wide, `align 1`) from guest address `addr`.
     pub(super) fn guest_load(&mut self, addr: &str, ty: &str, bytes: u64) -> String {
-        if let Some(last) = &self.last_access
-            && last.addr == addr
-            && last.ty == ty
-            && last.bytes == bytes
-            && self
-                .body
-                .get(last.at..)
-                .is_some_and(|since| since.lines().all(keeps_memory))
+        self.prune_mem_cache();
+        // Exact match (newest first).
+        if let Some(entry) = self
+            .mem_cache
+            .iter()
+            .rev()
+            .find(|e| e.addr == addr && e.ty == ty && e.bytes == bytes)
         {
-            return last.value.clone();
+            return entry.value.clone();
+        }
+        // Little-endian narrow scalar integer prefix match from a wider cached access at `addr`.
+        if let Some(dst_bits) = Self::scalar_int_bits(ty)
+            && let Some((src_ty, src_val)) = self
+                .mem_cache
+                .iter()
+                .rev()
+                .find_map(|e| {
+                    (e.addr == addr
+                        && e.bytes > bytes
+                        && Self::scalar_int_bits(&e.ty).is_some_and(|sb| sb > dst_bits))
+                    .then(|| (e.ty.clone(), e.value.clone()))
+                })
+        {
+            return self.val(&format!("trunc {src_ty} {src_val} to {ty}"));
         }
         let value = self
             .guest_access(addr, bytes, Access::Load { ty })
@@ -544,13 +614,56 @@ impl FunctionLifter<'_> {
 
     /// Stores `value` of `ty` (`bytes` wide, `align 1`) to guest address `addr`.
     pub(super) fn guest_store(&mut self, addr: &str, ty: &str, value: &str, bytes: u64) {
+        self.prune_mem_cache();
+        // Keep only entries provably disjoint from `[addr, addr + bytes)`.
+        let mut surviving: Vec<LastAccess> = Vec::with_capacity(self.mem_cache.len());
+        for entry in std::mem::take(&mut self.mem_cache) {
+            if self.are_addrs_disjoint(&entry.addr, entry.bytes, addr, bytes) {
+                surviving.push(entry);
+            }
+        }
+        let before = self.body.len();
         self.guest_access(addr, bytes, Access::Store { ty, value });
+        let after = self.body.len();
+        // Advance surviving disjoint entries ONLY if the store stayed inside the same LLVM block
+        // without calls, atomics, fences, or branches (i.e. flat / stack-flat stores).
+        let simple_store = self
+            .body
+            .get(before..after)
+            .is_some_and(|emitted| {
+                emitted.lines().all(|line| {
+                    keeps_memory(line)
+                        || line
+                            .strip_prefix("  ")
+                            .is_some_and(|code| {
+                                code.starts_with("store ")
+                                    && !code.starts_with("store atomic")
+                                    && !code.starts_with("store volatile")
+                            })
+                })
+            });
+        if simple_store {
+            for entry in &mut surviving {
+                entry.at = after;
+            }
+            self.mem_cache = surviving;
+        }
         self.note_access(addr, ty, value, bytes);
     }
 
-    /// Remembers the access just emitted as the candidate for [`Self::guest_load`] forwarding.
+    /// Remembers the access just emitted as a candidate for [`Self::guest_load`] forwarding.
     fn note_access(&mut self, addr: &str, ty: &str, value: &str, bytes: u64) {
-        self.last_access = (!value.is_empty()).then(|| LastAccess {
+        const MAX_MEM_CACHE: usize = 8;
+        if value.is_empty() {
+            return;
+        }
+        // Replace any existing entry for the exact same `(addr, bytes)` to keep the cache compact.
+        self.mem_cache
+            .retain(|e| !(e.addr == addr && e.bytes == bytes));
+        if self.mem_cache.len() >= MAX_MEM_CACHE {
+            self.mem_cache.remove(0);
+        }
+        self.mem_cache.push(LastAccess {
             addr: addr.to_string(),
             ty: ty.to_string(),
             value: value.to_string(),

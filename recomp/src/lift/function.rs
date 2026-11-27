@@ -195,6 +195,48 @@ fn imm(value: u64, bits: u32) -> String {
     signed.to_string()
 }
 
+fn parse_int_ty(ty_s: &str) -> Option<u32> {
+    ty_s.strip_prefix('i')?
+        .parse::<u32>()
+        .ok()
+        .filter(|&b| (1..=64).contains(&b))
+}
+
+fn parse_const(s: &str, bits: u32) -> Option<u64> {
+    if bits == 1 {
+        return match s {
+            "true" | "1" | "-1" => Some(1),
+            "false" | "0" => Some(0),
+            _ => None,
+        };
+    }
+    let raw = if let Ok(v) = s.parse::<i64>() {
+        v as u64
+    } else if let Ok(v) = s.parse::<u64>() {
+        v
+    } else {
+        return None;
+    };
+    Some(raw & mask(bits))
+}
+
+fn format_const(value: u64, bits: u32) -> String {
+    if bits == 1 {
+        if value & 1 != 0 { "true" } else { "false" }.to_string()
+    } else {
+        imm(value, bits)
+    }
+}
+
+fn contiguous_low_mask_bits(m: u64, bits: u32) -> Option<u32> {
+    if m != 0 && (m & m.wrapping_add(1)) == 0 {
+        let k = m.trailing_ones();
+        (k < bits).then_some(k)
+    } else {
+        None
+    }
+}
+
 fn block_label(va: u64) -> String {
     format!("bb_{va:X}")
 }
@@ -345,8 +387,9 @@ pub(super) fn lift(
         memory,
         stack_values: BTreeMap::new(),
         window_load_cache: Vec::new(),
+        window_test_cache: Vec::new(),
         burst_override: None,
-        last_access: None,
+        mem_cache: Vec::new(),
         guest_base: None,
         cold_traps: Vec::new(),
         share_ret: return_blocks > 1,
@@ -362,17 +405,20 @@ pub(super) fn lift(
         block_entry_facts: [GprFact::Bottom; 16],
         edge_known: Vec::new(),
         cse: BTreeMap::new(),
+        affine_cse: BTreeMap::new(),
+        ssa_info: Vec::new(),
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
 }
 
-/// Removes stores to a GPR or flag alloca that a later store to the same alloca overwrites in the
-/// same LLVM block with no use of the alloca in between. The allocas never escape (only `load`
-/// and `store` name them), so nothing else can read the overwritten value; a terminator or label
-/// ends the block and counts as a use of every alloca, as a successor may load it. With the load
-/// forwarding of [`FunctionLifter::known`], a register written twice in a block (`push`/`pop`
-/// pairs, `rsp` updates, flags of consecutive ALU instructions) keeps only its last store.
+/// Removes stores to a GPR, flag, or vector (`%xmmN`/`%ymmhN`) alloca that a later store to the
+/// same alloca overwrites in the same LLVM block with no use of the alloca in between. The allocas
+/// never escape (only `load` and `store` name them), so nothing else can read the overwritten
+/// value; a terminator or label ends the block and counts as a use of every alloca, as a successor
+/// may load it. With the load forwarding of [`FunctionLifter::known`], a register written twice in
+/// a block (`push`/`pop` pairs, `rsp` updates, flags of consecutive ALU instructions, vector math
+/// chains) keeps only its last store.
 fn drop_overwritten_slot_stores(ir: &str) -> String {
     const TERMINATORS: [&str; 8] = [
         "br ",
@@ -384,21 +430,35 @@ fn drop_overwritten_slot_stores(ir: &str) -> String {
         "resume ",
         "callbr ",
     ];
+    const NUM_SLOTS: usize = 16 + 6 + 16 + 16;
     let slot_of = |name: &str| -> Option<usize> {
-        GPR_NAMES.iter().position(|&g| g == name).or_else(|| {
-            FLAGS
-                .iter()
-                .position(|f| &f.slot()[1..] == name)
-                .map(|i| GPR_NAMES.len() + i)
-        })
+        if let Some(i) = GPR_NAMES.iter().position(|&g| g == name) {
+            return Some(i);
+        }
+        if let Some(i) = FLAGS.iter().position(|f| &f.slot()[1..] == name) {
+            return Some(16 + i);
+        }
+        if let Some(rest) = name.strip_prefix("xmm")
+            && let Ok(i) = rest.parse::<usize>()
+            && i < 16
+        {
+            return Some(22 + i);
+        }
+        if let Some(rest) = name.strip_prefix("ymmh")
+            && let Ok(i) = rest.parse::<usize>()
+            && i < 16
+        {
+            return Some(38 + i);
+        }
+        None
     };
     let lines: Vec<&str> = ir.lines().collect();
     let mut keep = vec![true; lines.len()];
-    let mut pending: [Option<usize>; 22] = [None; 22];
+    let mut pending: [Option<usize>; NUM_SLOTS] = [None; NUM_SLOTS];
     for (i, line) in lines.iter().enumerate() {
         let code = line.trim();
         if !line.starts_with(' ') || TERMINATORS.iter().any(|t| code.starts_with(t)) {
-            pending = [None; 22];
+            pending = [None; NUM_SLOTS];
             continue;
         }
         let stored = code
@@ -449,11 +509,11 @@ fn value_tokens(code: &str) -> impl Iterator<Item = &str> {
 
 /// Whether the right-hand side of a value definition has no effect besides its result, so the
 /// definition can go once nothing uses it. Loads count only when they read guest state or a
-/// register/flag alloca, never guest memory (a guest load may fault) and never atomic or volatile
-/// ones (the memory-model barriers of #719/#722 order those); calls, divisions and every other
-/// instruction stay.
+/// register/flag/vector alloca, never guest memory (a guest load may fault) and never atomic or
+/// volatile ones (the memory-model barriers of #719/#722 order those); calls (except pure bit
+/// intrinsics), divisions and every other instruction stay.
 fn is_pure_definition(rhs: &str) -> bool {
-    const PURE: [&str; 21] = [
+    const PURE: &[&str] = &[
         "add ",
         "sub ",
         "mul ",
@@ -464,19 +524,45 @@ fn is_pure_definition(rhs: &str) -> bool {
         "lshr ",
         "ashr ",
         "icmp ",
+        "fcmp ",
+        "fadd ",
+        "fsub ",
+        "fmul ",
+        "fdiv ",
+        "fneg ",
         "select ",
         "trunc ",
         "zext ",
         "sext ",
+        "sitofp ",
+        "uitofp ",
+        "fptosi ",
+        "fptoui ",
+        "fpext ",
+        "fptrunc ",
         "getelementptr ",
         "inttoptr ",
         "ptrtoint ",
         "bitcast ",
         "phi ",
         "extractvalue ",
+        "insertvalue ",
         "extractelement ",
+        "insertelement ",
+        "shufflevector ",
+    ];
+    const PURE_INTRINSICS: &[&str] = &[
+        "@llvm.ctpop.",
+        "@llvm.ctlz.",
+        "@llvm.cttz.",
+        "@llvm.bswap.",
+        "@llvm.fshl.",
+        "@llvm.fshr.",
     ];
     if PURE.iter().any(|op| rhs.starts_with(op)) {
+        return true;
+    }
+    if rhs.starts_with("call ") && PURE_INTRINSICS.iter().any(|f| rhs.contains(f)) {
         return true;
     }
     let Some(load) = rhs.strip_prefix("load ") else {
@@ -492,6 +578,10 @@ fn is_pure_definition(rhs: &str) -> bool {
     ptr.starts_with("state.")
         || GPR_NAMES.contains(&ptr)
         || FLAGS.iter().any(|f| &f.slot()[1..] == ptr)
+        || ptr
+            .strip_prefix("xmm")
+            .or_else(|| ptr.strip_prefix("ymmh"))
+            .is_some_and(|n| n.parse::<usize>().is_ok_and(|i| i < 16))
 }
 
 /// Removes pure value definitions ([`is_pure_definition`]) that nothing uses, transitively. The
@@ -655,11 +745,14 @@ struct FunctionLifter<'a> {
     /// repeated accesses within the same basic block (cleared at block boundaries and
     /// calls/atomics/fences).
     window_load_cache: Vec<memory_access::CachedWindowAddr>,
+    /// Cached `(addr, inside, rel)` from pre-branch `window_test` calls within the same basic
+    /// block, avoiding duplicate `sub` + `icmp ult` range checks on RMW / repeated accesses.
+    window_test_cache: Vec<(String, String, String)>,
     /// R58: active fast-path translation override for a coalesced same-base window burst.
     burst_override: Option<memory_access::BurstOverride>,
-    /// The last plain guest load or store, for forwarding its value to a load of the same address
-    /// later in the same LLVM block (`memory_access::LastAccess`).
-    last_access: Option<memory_access::LastAccess>,
+    /// Recent plain guest loads/stores in the current LLVM block, for forwarding to later loads of
+    /// the same address (and narrow little-endian integer prefixes) across provably disjoint stores.
+    mem_cache: Vec<memory_access::LastAccess>,
     /// SSA value holding `@__playgta6_guest_base`, loaded once in `entry:` when needed.
     pub(super) guest_base: Option<String>,
     /// Incoming edges `(kind, va, pred_block)` into this function's shared `cold_trap` sink.
@@ -690,10 +783,10 @@ struct FunctionLifter<'a> {
     /// slot is already known to hold `zeroinitializer` in the current straight-line region.
     /// Cleared on every `start_block`, call, and non-zero 256-bit write to an unread `ymmh`.
     pub(super) ymmh_zeroed: u16,
-    /// Load forwarding: the value each GPR / flag alloca holds, as far as it is known in the
-    /// current LLVM basic block (the last value stored or loaded there). The allocas are private
-    /// to the function and never escape, so a later load in the same block reads exactly that
-    /// value; every store is still emitted. Cleared at each new block (see [`Self::start_block`]).
+    /// Load forwarding: the value each GPR, flag, and vector alloca holds, as far as it is known
+    /// in the current LLVM basic block (the last value stored or loaded there). The allocas are
+    /// private to the function and never escape, so a later load in the same block reads exactly
+    /// that value; every store is still emitted. Cleared at each new block (see [`Self::start_block`]).
     known: Known,
     /// R71: per-GPR cross-block proven entry facts (`StackOffset`/`StackFrame`/`Const`) for the
     /// current block, cleared individually on writes/reloads so `load_gpr` and `lift_window_burst`
@@ -705,6 +798,45 @@ struct FunctionLifter<'a> {
     /// Local value numbering: pure definitions already emitted in the current dominating region,
     /// by right-hand side. Cleared whenever a block starts or lifting rolls back.
     cse: BTreeMap<String, String>,
+    /// Local affine value numbering: `(canonical_base, offset) -> %tN` for 64-bit `add`/`sub`
+    /// by constant in the current dominating region. Cleared alongside [`Self::cse`].
+    affine_cse: BTreeMap<(String, i64), String>,
+    /// Immutable SSA metadata indexed by `%tN` number (`ssa_info.len() == tmp as usize`).
+    ssa_info: Vec<SsaInfo>,
+}
+
+/// Immutable per-SSA-value facts tracked for `%tN` definitions, used for locally sound constant,
+/// identity, affine-offset, known-zero-bits, and redundant cast/bitcast folding.
+#[derive(Clone)]
+struct SsaInfo {
+    /// Bitmask of bits that may be 1 (any 0 bit is provably 0).
+    nonzero_bits: u64,
+    /// `zext i<src_bits> <src> to i<dst_bits>`.
+    zext_from: Option<(String, u32, u32)>,
+    /// `sext i<src_bits> <src> to i<dst_bits>`.
+    sext_from: Option<(String, u32, u32)>,
+    /// `trunc i<src_bits> <src> to i<dst_bits>`.
+    trunc_from: Option<(String, u32, u32)>,
+    /// `and i<bits> <src>, mask(low_bits)` (low `low_bits` preserved verbatim from `<src>`).
+    mask_from: Option<(String, u32)>,
+    /// `bitcast <from_ty> <src> to <to_ty>`.
+    bitcast_from: Option<(String, String, String)>,
+    /// Canonical 64-bit affine address/offset: `base.wrapping_add(offset as u64)`.
+    affine: Option<(String, i64)>,
+}
+
+impl SsaInfo {
+    fn unknown() -> Self {
+        Self {
+            nonzero_bits: u64::MAX,
+            zext_from: None,
+            sext_from: None,
+            trunc_from: None,
+            mask_from: None,
+            bitcast_from: None,
+            affine: None,
+        }
+    }
 }
 
 /// R71: intra-procedural forward dataflow lattice fact for one 64-bit GPR.
@@ -821,6 +953,10 @@ pub(super) enum FlagSource {
 struct Known {
     gprs: [Option<String>; 16],
     flags: [Option<String>; 6],
+    xmms: [Option<String>; 16],
+    ymmhs: [Option<String>; 16],
+    fs_base: Option<String>,
+    gs_base: Option<String>,
     flag_source: Option<FlagSource>,
     /// Tracks `(rdx64_ssa, rax64_ssa, bits)` immediately after `cdq` (32) or `cqo` (64) so a
     /// subsequent `idiv` lowers to native `sdiv`/`srem i32`/`i64` instead of widening/`sdiv128`.
@@ -839,6 +975,7 @@ struct Checkpoint {
     block_entry_facts: [GprFact; 16],
     edge_known: usize,
     window_load_cache: Vec<memory_access::CachedWindowAddr>,
+    window_test_cache: Vec<(String, String, String)>,
     ymmh_zeroed: u16,
 }
 
@@ -1280,6 +1417,7 @@ impl FunctionLifter<'_> {
             block_entry_facts: self.block_entry_facts,
             edge_known: self.edge_known.len(),
             window_load_cache: self.window_load_cache.clone(),
+            window_test_cache: self.window_test_cache.clone(),
             ymmh_zeroed: self.ymmh_zeroed,
         }
     }
@@ -1295,8 +1433,11 @@ impl FunctionLifter<'_> {
         self.known = checkpoint.known;
         self.block_entry_facts = checkpoint.block_entry_facts;
         self.cse.clear();
+        self.affine_cse.clear();
+        self.mem_cache.clear();
         self.edge_known.truncate(checkpoint.edge_known);
         self.window_load_cache = checkpoint.window_load_cache;
+        self.window_test_cache = checkpoint.window_test_cache;
         self.ymmh_zeroed = checkpoint.ymmh_zeroed;
         self.simd.clear_mem32();
     }
@@ -1338,10 +1479,12 @@ impl FunctionLifter<'_> {
         let known = std::mem::take(&mut self.known);
         let facts = self.block_entry_facts;
         let cse = std::mem::take(&mut self.cse);
+        let affine_cse = std::mem::take(&mut self.affine_cse);
         self.start_block(&ok);
         self.known = known;
         self.block_entry_facts = facts;
         self.cse = cse;
+        self.affine_cse = affine_cse;
     }
 
     // ----- IR emission primitives ---------------------------------------------------------------
@@ -1356,24 +1499,596 @@ impl FunctionLifter<'_> {
     pub(super) fn fresh_name(&mut self) -> String {
         let name = format!("%t{}", self.tmp);
         self.tmp += 1;
+        self.ssa_info.push(SsaInfo::unknown());
         name
     }
 
-    /// Emits `%tN = <rhs>` and returns `%tN`.
+    fn ssa_index(v: &str) -> Option<usize> {
+        v.strip_prefix("%t")?.parse::<usize>().ok()
+    }
+
+    fn ssa_info(&self, v: &str) -> Option<&SsaInfo> {
+        self.ssa_info.get(Self::ssa_index(v)?)
+    }
+
+    /// Bitmask of bits in `v` (of integer width `bits`) that may be 1.
+    fn nonzero_bits(&self, v: &str, bits: u32) -> u64 {
+        let m = mask(bits);
+        if let Some(c) = parse_const(v, bits) {
+            return c & m;
+        }
+        self.ssa_info(v).map_or(m, |info| info.nonzero_bits & m)
+    }
+
+    /// Canonical `(root_base, offset)` for a 64-bit SSA address/offset value.
+    pub(super) fn affine_root(&self, v: &str) -> (String, i64) {
+        if let Some(info) = self.ssa_info(v)
+            && let Some((base, off)) = &info.affine
+        {
+            return (base.clone(), *off);
+        }
+        (v.to_string(), 0)
+    }
+
+    /// Emits `%tN = <rhs>` without constant/identity folding (used where the exact IR shape is
+    /// required, e.g. constant non-zero `GuestBase` translation).
+    pub(super) fn val_raw(&mut self, rhs: &str) -> String {
+        self.val_emit(rhs)
+    }
+
+    /// Emits `%tN = <rhs>` (or returns an already-equivalent constant / SSA value when locally
+    /// provable by constant, identity, affine-offset, known-zero-bits, or cast-round-trip folding).
     fn val(&mut self, rhs: &str) -> String {
-        const CSE_OPS: [&str; 10] = [
-            "add ", "sub ", "and ", "or ", "xor ", "shl ", "lshr ", "trunc ", "zext ", "sext ",
+        if let Some(folded) = self.try_fold_val(rhs) {
+            return folded;
+        }
+        self.val_emit(rhs)
+    }
+
+    fn val_emit(&mut self, rhs: &str) -> String {
+        const CSE_OPS: &[&str] = &[
+            "add ", "sub ", "mul ", "and ", "or ", "xor ", "shl ", "lshr ", "ashr ", "icmp ",
+            "select ", "trunc ", "zext ", "sext ", "bitcast ",
         ];
         let cacheable = CSE_OPS.iter().any(|op| rhs.starts_with(op));
         if cacheable && let Some(prev) = self.cse.get(rhs) {
             return prev.clone();
         }
+        let info = self.compute_ssa_info(rhs);
+        let affine = info.affine.clone();
         let name = self.fresh_name();
+        let id = (self.tmp - 1) as usize;
+        self.ssa_info[id] = info;
         self.emit(&format!("{name} = {rhs}"));
         if cacheable {
             self.cse.insert(rhs.to_string(), name.clone());
         }
+        if let Some(key) = affine {
+            self.affine_cse.entry(key).or_insert_with(|| name.clone());
+        }
         name
+    }
+
+    fn try_fold_val(&mut self, rhs: &str) -> Option<String> {
+        let (op, rest) = rhs.split_once(' ')?;
+        match op {
+            "add" | "sub" | "mul" | "and" | "or" | "xor" | "shl" | "lshr" | "ashr" => {
+                let (ty_s, ops) = rest.split_once(' ')?;
+                let bits = parse_int_ty(ty_s)?;
+                let (a, b) = ops.split_once(", ")?;
+                if a.contains(' ') || b.contains(' ') {
+                    return None;
+                }
+                let ca = parse_const(a, bits);
+                let cb = parse_const(b, bits);
+                let nz_a = self.nonzero_bits(a, bits);
+                let nz_b = self.nonzero_bits(b, bits);
+                match op {
+                    "add" => {
+                        if let (Some(va), Some(vb)) = (ca, cb) {
+                            return Some(format_const(va.wrapping_add(vb), bits));
+                        }
+                        if cb == Some(0) {
+                            return Some(a.to_string());
+                        }
+                        if ca == Some(0) {
+                            return Some(b.to_string());
+                        }
+                        if bits == 64 {
+                            let (dyn_op, delta) = match (ca, cb) {
+                                (None, Some(d)) => (a, d as i64),
+                                (Some(d), None) => (b, d as i64),
+                                _ => return None,
+                            };
+                            let (root, base_off) = self.affine_root(dyn_op);
+                            let total = base_off.wrapping_add(delta);
+                            if total == 0 {
+                                return Some(root);
+                            }
+                            if let Some(prev) = self.affine_cse.get(&(root.clone(), total)) {
+                                return Some(prev.clone());
+                            }
+                            if base_off != 0 {
+                                return Some(
+                                    self.val_emit(&format!(
+                                        "add i64 {root}, {}",
+                                        imm(total as u64, 64)
+                                    )),
+                                );
+                            }
+                        }
+                        None
+                    }
+                    "sub" => {
+                        if let (Some(va), Some(vb)) = (ca, cb) {
+                            return Some(format_const(va.wrapping_sub(vb), bits));
+                        }
+                        if cb == Some(0) {
+                            return Some(a.to_string());
+                        }
+                        if a == b {
+                            return Some(format_const(0, bits));
+                        }
+                        if bits == 64
+                            && let (None, Some(d)) = (ca, cb)
+                        {
+                            let (root, base_off) = self.affine_root(a);
+                            let total = base_off.wrapping_sub(d as i64);
+                            if total == 0 {
+                                return Some(root);
+                            }
+                            if let Some(prev) = self.affine_cse.get(&(root.clone(), total)) {
+                                return Some(prev.clone());
+                            }
+                            if base_off != 0 {
+                                return Some(
+                                    self.val_emit(&format!(
+                                        "add i64 {root}, {}",
+                                        imm(total as u64, 64)
+                                    )),
+                                );
+                            }
+                        }
+                        None
+                    }
+                    "mul" => {
+                        if let (Some(va), Some(vb)) = (ca, cb) {
+                            return Some(format_const(va.wrapping_mul(vb), bits));
+                        }
+                        if ca == Some(0) || cb == Some(0) {
+                            return Some(format_const(0, bits));
+                        }
+                        if cb == Some(1) {
+                            return Some(a.to_string());
+                        }
+                        if ca == Some(1) {
+                            return Some(b.to_string());
+                        }
+                        None
+                    }
+                    "and" => {
+                        if let (Some(va), Some(vb)) = (ca, cb) {
+                            return Some(format_const(va & vb, bits));
+                        }
+                        if ca == Some(0) || cb == Some(0) || (nz_a & nz_b) == 0 {
+                            return Some(format_const(0, bits));
+                        }
+                        if let Some(m) = cb
+                            && (nz_a & !m) == 0
+                        {
+                            return Some(a.to_string());
+                        }
+                        if let Some(m) = ca
+                            && (nz_b & !m) == 0
+                        {
+                            return Some(b.to_string());
+                        }
+                        if a == b {
+                            return Some(a.to_string());
+                        }
+                        None
+                    }
+                    "or" => {
+                        if let (Some(va), Some(vb)) = (ca, cb) {
+                            return Some(format_const(va | vb, bits));
+                        }
+                        if cb == Some(0) {
+                            return Some(a.to_string());
+                        }
+                        if ca == Some(0) {
+                            return Some(b.to_string());
+                        }
+                        let all = mask(bits);
+                        if cb == Some(all) || ca == Some(all) {
+                            return Some(format_const(all, bits));
+                        }
+                        if a == b {
+                            return Some(a.to_string());
+                        }
+                        None
+                    }
+                    "xor" => {
+                        if let (Some(va), Some(vb)) = (ca, cb) {
+                            return Some(format_const(va ^ vb, bits));
+                        }
+                        if cb == Some(0) {
+                            return Some(a.to_string());
+                        }
+                        if ca == Some(0) {
+                            return Some(b.to_string());
+                        }
+                        if a == b {
+                            return Some(format_const(0, bits));
+                        }
+                        None
+                    }
+                    "shl" => {
+                        let amt = cb?;
+                        if amt == 0 {
+                            return Some(a.to_string());
+                        }
+                        if amt < u64::from(bits) {
+                            if let Some(va) = ca {
+                                return Some(format_const(va.wrapping_shl(amt as u32), bits));
+                            }
+                            if nz_a == 0 {
+                                return Some(format_const(0, bits));
+                            }
+                        }
+                        None
+                    }
+                    "lshr" => {
+                        let amt = cb?;
+                        if amt == 0 {
+                            return Some(a.to_string());
+                        }
+                        if amt < u64::from(bits) {
+                            if let Some(va) = ca {
+                                return Some(format_const(va >> (amt as u32), bits));
+                            }
+                            if (nz_a >> (amt as u32)) == 0 {
+                                return Some(format_const(0, bits));
+                            }
+                        }
+                        None
+                    }
+                    "ashr" => {
+                        let amt = cb?;
+                        if amt == 0 {
+                            return Some(a.to_string());
+                        }
+                        if amt < u64::from(bits)
+                            && let Some(va) = ca
+                        {
+                            let s = sign_extend_u64(va, bits) as i64;
+                            return Some(format_const((s >> (amt as u32)) as u64, bits));
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            "trunc" | "zext" | "sext" => {
+                let (lhs, dst_ty_s) = rest.split_once(" to ")?;
+                let (src_ty_s, src) = lhs.split_once(' ')?;
+                let src_bits = parse_int_ty(src_ty_s)?;
+                let dst_bits = parse_int_ty(dst_ty_s)?;
+                if src.contains(' ') {
+                    return None;
+                }
+                if src_bits == dst_bits {
+                    return Some(src.to_string());
+                }
+                if let Some(c) = parse_const(src, src_bits) {
+                    let out = if op == "sext" {
+                        sign_extend_u64(c, src_bits)
+                    } else {
+                        c
+                    };
+                    return Some(format_const(out, dst_bits));
+                }
+                match op {
+                    "trunc" => {
+                        let info = self.ssa_info(src)?.clone();
+                        if let Some((inner, inner_bits, ext_dst)) =
+                            info.zext_from.or(info.sext_from)
+                            && ext_dst == src_bits
+                        {
+                            if inner_bits == dst_bits {
+                                return Some(inner);
+                            }
+                            if dst_bits < inner_bits {
+                                return Some(self.val(&format!(
+                                    "trunc i{inner_bits} {inner} to i{dst_bits}"
+                                )));
+                            }
+                        }
+                        if let Some((inner, low_bits)) = info.mask_from
+                            && low_bits >= dst_bits
+                        {
+                            return Some(self.val(&format!(
+                                "trunc i{src_bits} {inner} to i{dst_bits}"
+                            )));
+                        }
+                        None
+                    }
+                    "zext" => {
+                        let info = self.ssa_info(src)?.clone();
+                        if let Some((inner, inner_bits, trunc_dst)) = info.trunc_from
+                            && inner_bits == dst_bits
+                            && trunc_dst == src_bits
+                            && (self.nonzero_bits(&inner, inner_bits) & !mask(src_bits)) == 0
+                        {
+                            return Some(inner);
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            "bitcast" => {
+                let (lhs, to_ty) = rest.split_once(" to ")?;
+                let (from_ty, src) = lhs.rsplit_once(' ')?;
+                if from_ty == to_ty {
+                    return Some(src.to_string());
+                }
+                if let Some(info) = self.ssa_info(src)
+                    && let Some((inner, orig_ty, cur_ty)) = &info.bitcast_from
+                    && cur_ty == from_ty
+                    && orig_ty == to_ty
+                {
+                    return Some(inner.clone());
+                }
+                None
+            }
+            "icmp" => {
+                let (pred, after_pred) = rest.split_once(' ')?;
+                let (ty_s, ops) = after_pred.split_once(' ')?;
+                let bits = parse_int_ty(ty_s)?;
+                let (a, b) = ops.split_once(", ")?;
+                if a.contains(' ') || b.contains(' ') {
+                    return None;
+                }
+                let ca = parse_const(a, bits);
+                let cb = parse_const(b, bits);
+                if let (Some(va), Some(vb)) = (ca, cb) {
+                    let sa = sign_extend_u64(va, bits) as i64;
+                    let sb = sign_extend_u64(vb, bits) as i64;
+                    let res = match pred {
+                        "eq" => va == vb,
+                        "ne" => va != vb,
+                        "ult" => va < vb,
+                        "ule" => va <= vb,
+                        "ugt" => va > vb,
+                        "uge" => va >= vb,
+                        "slt" => sa < sb,
+                        "sle" => sa <= sb,
+                        "sgt" => sa > sb,
+                        "sge" => sa >= sb,
+                        _ => return None,
+                    };
+                    return Some(if res { "true" } else { "false" }.to_string());
+                }
+                if a == b {
+                    let res = match pred {
+                        "eq" | "ule" | "uge" | "sle" | "sge" => true,
+                        "ne" | "ult" | "ugt" | "slt" | "sgt" => false,
+                        _ => return None,
+                    };
+                    return Some(if res { "true" } else { "false" }.to_string());
+                }
+                match (pred, ca, cb) {
+                    ("ult", _, Some(0)) | ("ugt", Some(0), _) => return Some("false".to_string()),
+                    ("uge", _, Some(0)) | ("ule", Some(0), _) => return Some("true".to_string()),
+                    ("slt", None, Some(0))
+                        if bits > 1 && (self.nonzero_bits(a, bits) & (1u64 << (bits - 1))) == 0 =>
+                    {
+                        return Some("false".to_string());
+                    }
+                    ("sge", None, Some(0))
+                        if bits > 1 && (self.nonzero_bits(a, bits) & (1u64 << (bits - 1))) == 0 =>
+                    {
+                        return Some("true".to_string());
+                    }
+                    _ => {}
+                }
+                None
+            }
+            "select" => {
+                let rest = rest.strip_prefix("i1 ")?;
+                let (cond, branches) = rest.split_once(", ")?;
+                let (left, right) = branches.split_once(", ")?;
+                let (ty_l, a) = left.rsplit_once(' ')?;
+                let (ty_r, b) = right.rsplit_once(' ')?;
+                if ty_l != ty_r {
+                    return None;
+                }
+                match cond {
+                    "true" => Some(a.to_string()),
+                    "false" => Some(b.to_string()),
+                    _ if a == b => Some(a.to_string()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn compute_ssa_info(&self, rhs: &str) -> SsaInfo {
+        let mut info = SsaInfo::unknown();
+        let Some((op, rest)) = rhs.split_once(' ') else {
+            return info;
+        };
+        match op {
+            "add" | "sub" | "and" | "or" | "xor" | "shl" | "lshr" | "ashr" => {
+                let Some((ty_s, ops)) = rest.split_once(' ') else {
+                    return info;
+                };
+                let Some(bits) = parse_int_ty(ty_s) else {
+                    return info;
+                };
+                let Some((a, b)) = ops.split_once(", ") else {
+                    return info;
+                };
+                let m = mask(bits);
+                let nz_a = self.nonzero_bits(a, bits);
+                let nz_b = self.nonzero_bits(b, bits);
+                match op {
+                    "add" => {
+                        info.nonzero_bits = m;
+                        if bits == 64 {
+                            if let (None, Some(d)) = (parse_const(a, 64), parse_const(b, 64))
+                                && a.starts_with('%')
+                            {
+                                let (root, off) = self.affine_root(a);
+                                info.affine = Some((root, off.wrapping_add(d as i64)));
+                            } else if let (Some(d), None) = (parse_const(a, 64), parse_const(b, 64))
+                                && b.starts_with('%')
+                            {
+                                let (root, off) = self.affine_root(b);
+                                info.affine = Some((root, off.wrapping_add(d as i64)));
+                            }
+                        }
+                    }
+                    "sub" => {
+                        info.nonzero_bits = m;
+                        if bits == 64
+                            && let (None, Some(d)) = (parse_const(a, 64), parse_const(b, 64))
+                            && a.starts_with('%')
+                        {
+                            let (root, off) = self.affine_root(a);
+                            info.affine = Some((root, off.wrapping_sub(d as i64)));
+                        }
+                    }
+                    "and" => {
+                        info.nonzero_bits = (nz_a & nz_b) & m;
+                        if let Some(cb) = parse_const(b, bits)
+                            && a.starts_with('%')
+                            && let Some(low) = contiguous_low_mask_bits(cb, bits)
+                        {
+                            info.mask_from = Some((a.to_string(), low));
+                        } else if let Some(ca) = parse_const(a, bits)
+                            && b.starts_with('%')
+                            && let Some(low) = contiguous_low_mask_bits(ca, bits)
+                        {
+                            info.mask_from = Some((b.to_string(), low));
+                        }
+                    }
+                    "or" | "xor" => {
+                        info.nonzero_bits = (nz_a | nz_b) & m;
+                    }
+                    "shl" => {
+                        if let Some(amt) = parse_const(b, bits)
+                            && amt < u64::from(bits)
+                        {
+                            info.nonzero_bits = nz_a.wrapping_shl(amt as u32) & m;
+                        } else {
+                            info.nonzero_bits = m;
+                        }
+                    }
+                    "lshr" => {
+                        if let Some(amt) = parse_const(b, bits)
+                            && amt < u64::from(bits)
+                        {
+                            info.nonzero_bits = (nz_a & m) >> (amt as u32);
+                        } else {
+                            info.nonzero_bits = m;
+                        }
+                    }
+                    "ashr" => {
+                        if let Some(amt) = parse_const(b, bits)
+                            && amt < u64::from(bits)
+                            && bits > 1
+                            && (nz_a & (1u64 << (bits - 1))) == 0
+                        {
+                            info.nonzero_bits = (nz_a & m) >> (amt as u32);
+                        } else {
+                            info.nonzero_bits = m;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "zext" => {
+                if let Some((lhs, dst_ty_s)) = rest.split_once(" to ")
+                    && let Some((src_ty_s, src)) = lhs.split_once(' ')
+                    && let (Some(src_bits), Some(dst_bits)) =
+                        (parse_int_ty(src_ty_s), parse_int_ty(dst_ty_s))
+                {
+                    info.nonzero_bits = self.nonzero_bits(src, src_bits) & mask(src_bits);
+                    if src.starts_with('%') {
+                        info.zext_from = Some((src.to_string(), src_bits, dst_bits));
+                    }
+                }
+            }
+            "sext" => {
+                if let Some((lhs, dst_ty_s)) = rest.split_once(" to ")
+                    && let Some((src_ty_s, src)) = lhs.split_once(' ')
+                    && let (Some(src_bits), Some(dst_bits)) =
+                        (parse_int_ty(src_ty_s), parse_int_ty(dst_ty_s))
+                {
+                    let src_nz = self.nonzero_bits(src, src_bits);
+                    info.nonzero_bits = if src_bits > 1 && (src_nz & (1u64 << (src_bits - 1))) == 0
+                    {
+                        src_nz
+                    } else {
+                        mask(dst_bits)
+                    };
+                    if src.starts_with('%') {
+                        info.sext_from = Some((src.to_string(), src_bits, dst_bits));
+                    }
+                }
+            }
+            "trunc" => {
+                if let Some((lhs, dst_ty_s)) = rest.split_once(" to ")
+                    && let Some((src_ty_s, src)) = lhs.split_once(' ')
+                    && let (Some(src_bits), Some(dst_bits)) =
+                        (parse_int_ty(src_ty_s), parse_int_ty(dst_ty_s))
+                {
+                    info.nonzero_bits = self.nonzero_bits(src, src_bits) & mask(dst_bits);
+                    if src.starts_with('%') {
+                        info.trunc_from = Some((src.to_string(), src_bits, dst_bits));
+                    }
+                }
+            }
+            "bitcast" => {
+                if let Some((lhs, to_ty)) = rest.split_once(" to ")
+                    && let Some((from_ty, src)) = lhs.rsplit_once(' ')
+                    && src.starts_with('%')
+                {
+                    info.bitcast_from =
+                        Some((src.to_string(), from_ty.to_string(), to_ty.to_string()));
+                }
+            }
+            "select" => {
+                if let Some(rest) = rest.strip_prefix("i1 ")
+                    && let Some((_, branches)) = rest.split_once(", ")
+                    && let Some((left, right)) = branches.split_once(", ")
+                    && let Some((ty_l, a)) = left.rsplit_once(' ')
+                    && let Some((ty_r, b)) = right.rsplit_once(' ')
+                    && ty_l == ty_r
+                    && let Some(bits) = parse_int_ty(ty_l)
+                {
+                    info.nonzero_bits =
+                        (self.nonzero_bits(a, bits) | self.nonzero_bits(b, bits)) & mask(bits);
+                }
+            }
+            "load" => {
+                let ty_s = rest.split([',', ' ']).next().unwrap_or_default();
+                if let Some(bits) = parse_int_ty(ty_s) {
+                    info.nonzero_bits = if rhs.contains("!range !{i8 0, i8 2}") {
+                        1
+                    } else {
+                        mask(bits)
+                    };
+                }
+            }
+            "icmp" | "fcmp" => {
+                info.nonzero_bits = 1;
+            }
+            _ => {}
+        }
+        info
     }
 
     fn new_label(&mut self, prefix: &str) -> String {
@@ -1384,10 +2099,12 @@ impl FunctionLifter<'_> {
 
     fn start_block(&mut self, label: &str) {
         self.cse.clear();
+        self.affine_cse.clear();
         self.known = Known::default();
         self.block_entry_facts = [GprFact::Bottom; 16];
         self.window_load_cache.clear();
-        self.last_access = None;
+        self.window_test_cache.clear();
+        self.mem_cache.clear();
         self.ymmh_zeroed = 0;
         self.current_block.clear();
         self.current_block.push_str(label);
@@ -1399,6 +2116,7 @@ impl FunctionLifter<'_> {
     /// never write GPR/flag allocas or invoke runtime remapping helpers.
     pub(super) fn start_internal_block(&mut self, label: &str) {
         self.cse.clear();
+        self.affine_cse.clear();
         self.current_block.clear();
         self.current_block.push_str(label);
         let _ = writeln!(self.body, "{label}:");
@@ -1406,6 +2124,7 @@ impl FunctionLifter<'_> {
 
     pub(super) fn clear_window_cache(&mut self) {
         self.window_load_cache.clear();
+        self.window_test_cache.clear();
     }
 
     pub(super) fn known_gpr(&self, idx: usize) -> Option<&str> {
@@ -1452,6 +2171,18 @@ impl FunctionLifter<'_> {
             {
                 self.known.gprs[i] = entry.gprs[i].clone();
             }
+            if entry.xmms[i].is_some()
+                && a.xmms[i] == entry.xmms[i]
+                && b.xmms[i] == entry.xmms[i]
+            {
+                self.known.xmms[i] = entry.xmms[i].clone();
+            }
+            if entry.ymmhs[i].is_some()
+                && a.ymmhs[i] == entry.ymmhs[i]
+                && b.ymmhs[i] == entry.ymmhs[i]
+            {
+                self.known.ymmhs[i] = entry.ymmhs[i].clone();
+            }
         }
         for i in 0..6 {
             if entry.flags[i].is_some()
@@ -1460,6 +2191,12 @@ impl FunctionLifter<'_> {
             {
                 self.known.flags[i] = entry.flags[i].clone();
             }
+        }
+        if entry.fs_base.is_some() && a.fs_base == entry.fs_base && b.fs_base == entry.fs_base {
+            self.known.fs_base = entry.fs_base.clone();
+        }
+        if entry.gs_base.is_some() && a.gs_base == entry.gs_base && b.gs_base == entry.gs_base {
+            self.known.gs_base = entry.gs_base.clone();
         }
         if entry.flag_source.is_some()
             && a.flag_source == entry.flag_source
@@ -1568,6 +2305,8 @@ impl FunctionLifter<'_> {
             }
         }
         self.known.flag_source = None;
+        self.known.fs_base = None;
+        self.known.gs_base = None;
         for flag in FLAGS {
             if self.flags[flag as usize] && flags & (1 << flag as usize) != 0 {
                 let ptr = self.state_flag_ptr(flag);
@@ -1652,8 +2391,22 @@ impl FunctionLifter<'_> {
     }
 
     fn segment_base(&mut self, field: u32) -> String {
+        let cached = match field {
+            3 => self.known.fs_base.as_ref(),
+            4 => self.known.gs_base.as_ref(),
+            _ => None,
+        };
+        if let Some(v) = cached {
+            return v.clone();
+        }
         let ptr = self.state_ptr(field, None);
-        self.val(&format!("load i64, ptr {ptr}"))
+        let v = self.val(&format!("load i64, ptr {ptr}"));
+        match field {
+            3 => self.known.fs_base = Some(v.clone()),
+            4 => self.known.gs_base = Some(v.clone()),
+            _ => {}
+        }
+        v
     }
 
     // ----- registers -----------------------------------------------------------------------------
@@ -1794,6 +2547,7 @@ impl FunctionLifter<'_> {
         let index = ins.memory_index();
         // For RIP-relative operands iced already returns the absolute target here.
         let disp = ins.memory_displacement64();
+        let mut const_disp = disp;
         let mut addr32 = false;
         let mut acc: Option<String> = None;
 
@@ -1805,7 +2559,12 @@ impl FunctionLifter<'_> {
                 return unsupported(format!("memory base register {base:?}"));
             }
             addr32 |= base.is_gpr32();
-            acc = Some(self.read_addr_reg(base)?);
+            let base_val = self.read_addr_reg(base)?;
+            if let Some(c) = memory_access::const_addr(&base_val) {
+                const_disp = const_disp.wrapping_add(c);
+            } else {
+                acc = Some(base_val);
+            }
         }
         if index != Register::None {
             if !(index.is_gpr64() || index.is_gpr32()) {
@@ -1821,19 +2580,14 @@ impl FunctionLifter<'_> {
                     scaled = self.val(&format!("shl i64 {scaled}, {}", scale.trailing_zeros()));
                 }
             }
-            acc = Some(match acc {
-                Some(sum) => {
-                    if let (Some(a), Some(b)) = (
-                        memory_access::const_addr(&sum),
-                        memory_access::const_addr(&scaled),
-                    ) {
-                        imm(a.wrapping_add(b), 64)
-                    } else {
-                        self.val(&format!("add i64 {sum}, {scaled}"))
-                    }
-                }
-                None => scaled,
-            });
+            if let Some(c) = memory_access::const_addr(&scaled) {
+                const_disp = const_disp.wrapping_add(c);
+            } else {
+                acc = Some(match acc {
+                    Some(sum) => self.val(&format!("add i64 {sum}, {scaled}")),
+                    None => scaled,
+                });
+            }
         }
         let acc_base = if index == Register::None {
             acc.clone()
@@ -1841,15 +2595,18 @@ impl FunctionLifter<'_> {
             None
         };
         let mut addr = match acc {
-            Some(sum) if disp != 0 => {
-                if let Some(base_va) = memory_access::const_addr(&sum) {
-                    imm(base_va.wrapping_add(disp), 64)
-                } else {
-                    self.val(&format!("add i64 {sum}, {}", imm(disp, 64)))
-                }
+            Some(sum) if const_disp != 0 => {
+                self.val(&format!("add i64 {sum}, {}", imm(const_disp, 64)))
             }
             Some(sum) => sum,
-            None => imm(if addr32 { disp & mask(32) } else { disp }, 64),
+            None => imm(
+                if addr32 {
+                    const_disp & mask(32)
+                } else {
+                    const_disp
+                },
+                64,
+            ),
         };
         let has_fs_gs = with_segment
             && matches!(ins.memory_segment(), Register::FS | Register::GS);
@@ -1860,11 +2617,15 @@ impl FunctionLifter<'_> {
                 addr = self.val(&format!("and i64 {addr}, 4294967295"));
             }
         } else if base == Register::RSP && index == Register::None {
-            self.note_stack_value(&addr, disp as i64);
+            if !self.stack_values.contains_key(&addr) {
+                self.note_stack_value(&addr, disp as i64);
+            }
         } else if index == Register::None
             && let Some(base_val) = &acc_base
         {
-            self.propagate_stack_offset(base_val, &addr, disp as i64);
+            if !self.stack_values.contains_key(&addr) {
+                self.propagate_stack_offset(base_val, &addr, disp as i64);
+            }
         }
         if !addr32
             && !has_fs_gs
@@ -1959,8 +2720,14 @@ impl FunctionLifter<'_> {
 
     fn push(&mut self, value: &str, bits: u32) -> R<()> {
         let rsp = self.load_gpr(RSP)?;
-        let new_rsp = self.val(&format!("sub i64 {rsp}, {}", bits / 8));
-        self.note_stack_value(&new_rsp, -i64::from(bits / 8));
+        let delta = i64::from(bits / 8);
+        let new_rsp = self.val(&format!("sub i64 {rsp}, {delta}"));
+        if !self.stack_values.contains_key(&new_rsp) {
+            self.propagate_stack_offset(&rsp, &new_rsp, -delta);
+            if !self.stack_values.contains_key(&new_rsp) {
+                self.note_stack_value(&new_rsp, -delta);
+            }
+        }
         self.store_mem(&new_rsp, value, bits);
         self.store_gpr(RSP, &new_rsp)
     }
@@ -2416,11 +3183,27 @@ impl FunctionLifter<'_> {
     }
 
     fn msb(&mut self, v: &str, bits: u32) -> String {
+        if let Some(c) = parse_const(v, bits) {
+            return if (c >> (bits - 1)) & 1 != 0 {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string();
+        }
         self.val(&format!("icmp slt i{bits} {v}, 0"))
     }
 
     /// PF: set when the low byte of the result has an even number of 1 bits.
     fn parity(&mut self, r: &str, bits: u32) -> String {
+        if let Some(c) = parse_const(r, bits) {
+            return if ((c as u8).count_ones() & 1) == 0 {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string();
+        }
         let low = if bits == 8 {
             r.to_string()
         } else {
@@ -3162,11 +3945,15 @@ impl FunctionLifter<'_> {
         let t = ty(bits);
         match op {
             Alu::Add => {
-                let r = if b == "0" {
+                let r = if b == "0" || a == "0" {
                     self.set_flag(Flag::Cf, "false");
                     self.set_flag(Flag::Of, "false");
                     self.set_flag(Flag::Af, "false");
-                    a.to_string()
+                    if b == "0" {
+                        a.to_string()
+                    } else {
+                        b.to_string()
+                    }
                 } else {
                     let r = self.val(&format!("add {t} {a}, {b}"));
                     if self.flag_live(Flag::Cf) {
@@ -3232,7 +4019,15 @@ impl FunctionLifter<'_> {
                 r
             }
             Alu::Cmp => {
-                let diff = if b == "0" {
+                let diff = if a == b {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    self.set_flag(Flag::Af, "false");
+                    self.set_flag(Flag::Zf, "true");
+                    self.set_flag(Flag::Sf, "false");
+                    self.set_flag(Flag::Pf, "true");
+                    Some("0".to_string())
+                } else if b == "0" {
                     self.set_flag(Flag::Cf, "false");
                     self.set_flag(Flag::Of, "false");
                     self.set_flag(Flag::Af, "false");
@@ -3276,7 +4071,12 @@ impl FunctionLifter<'_> {
                 String::new()
             }
             Alu::Sub => {
-                let r = if b == "0" {
+                let r = if a == b {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    self.set_flag(Flag::Af, "false");
+                    "0".to_string()
+                } else if b == "0" {
                     self.set_flag(Flag::Cf, "false");
                     self.set_flag(Flag::Of, "false");
                     self.set_flag(Flag::Af, "false");
@@ -3500,16 +4300,32 @@ impl FunctionLifter<'_> {
         let want_of = self.flag_live(Flag::Of);
         let (r, cf, of): (String, Option<String>, Option<String>) = match kind {
             Shift::Rol | Shift::Ror => {
-                // fshl/fshr take the amount modulo the width, like x86 rotates (after masking).
-                let (name, support) = if kind == Shift::Rol {
-                    ("fshl", Support::Fshl(bits))
+                let r = if let (Some(va), Some(c)) = (parse_const(&a, bits), imm_count) {
+                    let rot = (c as u32) % bits;
+                    let rotated = match (kind, bits) {
+                        (Shift::Rol, 8) => u64::from((va as u8).rotate_left(rot)),
+                        (Shift::Rol, 16) => u64::from((va as u16).rotate_left(rot)),
+                        (Shift::Rol, 32) => u64::from((va as u32).rotate_left(rot)),
+                        (Shift::Rol, _) => va.rotate_left(rot),
+                        (Shift::Ror, 8) => u64::from((va as u8).rotate_right(rot)),
+                        (Shift::Ror, 16) => u64::from((va as u16).rotate_right(rot)),
+                        (Shift::Ror, 32) => u64::from((va as u32).rotate_right(rot)),
+                        (Shift::Ror, _) => va.rotate_right(rot),
+                        _ => unreachable!(),
+                    };
+                    imm(rotated, bits)
                 } else {
-                    ("fshr", Support::Fshr(bits))
+                    // fshl/fshr take the amount modulo the width, like x86 rotates (after masking).
+                    let (name, support) = if kind == Shift::Rol {
+                        ("fshl", Support::Fshl(bits))
+                    } else {
+                        ("fshr", Support::Fshr(bits))
+                    };
+                    self.support.insert(support);
+                    self.val(&format!(
+                        "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {count})"
+                    ))
                 };
-                self.support.insert(support);
-                let r = self.val(&format!(
-                    "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {count})"
-                ));
                 if kind == Shift::Rol {
                     let cf =
                         (want_cf || want_of).then(|| self.val(&format!("trunc {t} {r} to i1")));
@@ -3539,8 +4355,8 @@ impl FunctionLifter<'_> {
                     Shift::Shr => "lshr",
                     _ => "ashr",
                 };
-                if bits == 64 || bits == 32 {
-                    // Masked counts are in 0..bits, so native `i32`/`i64` shifts never poison.
+                if bits == 64 || bits == 32 || imm_count.is_some_and(|c| c < u64::from(bits)) {
+                    // Native-width shift when count is provably in `0..bits` (never poisons).
                     let w = u64::from(bits);
                     let m = w - 1;
                     let r = self.val(&format!("{op} {t} {a}, {count}"));
@@ -3724,6 +4540,34 @@ impl FunctionLifter<'_> {
         } else {
             (self.read_op(ins, 0, bits)?, self.read_op(ins, 1, bits)?)
         };
+        let ca = parse_const(&a, bits);
+        let cb = parse_const(&b, bits);
+        if let (Some(va), Some(vb)) = (ca, cb) {
+            let sa = i128::from(sign_extend_u64(va, bits) as i64);
+            let sb = i128::from(sign_extend_u64(vb, bits) as i64);
+            let prod = sa * sb;
+            let trunc = (prod as u64) & mask(bits);
+            let ov = i128::from(sign_extend_u64(trunc, bits) as i64) != prod;
+            let ov_s = if ov { "true" } else { "false" };
+            self.set_flag(Flag::Cf, ov_s);
+            self.set_flag(Flag::Of, ov_s);
+            return self.write_op(ins, 0, &imm(trunc, bits), bits);
+        }
+        if ca == Some(0) || cb == Some(0) {
+            self.set_flag(Flag::Cf, "false");
+            self.set_flag(Flag::Of, "false");
+            return self.write_op(ins, 0, "0", bits);
+        }
+        if cb == Some(1) {
+            self.set_flag(Flag::Cf, "false");
+            self.set_flag(Flag::Of, "false");
+            return self.write_op(ins, 0, &a, bits);
+        }
+        if ca == Some(1) {
+            self.set_flag(Flag::Cf, "false");
+            self.set_flag(Flag::Of, "false");
+            return self.write_op(ins, 0, &b, bits);
+        }
         if !self.flag_live(Flag::Cf) && !self.flag_live(Flag::Of) {
             let r = if bits == 64 {
                 self.val(&format!("mul i64 {a}, {b}"))
@@ -3996,6 +4840,8 @@ impl FunctionLifter<'_> {
             self.sync_out_parts(out_state, flags);
             let pre_known_gprs = self.known.gprs.clone();
             let pre_known_flags = self.known.flags.clone();
+            let pre_known_xmms = self.known.xmms.clone();
+            let pre_known_ymmhs = self.known.ymmhs.clone();
             let pre_entry_facts = self.block_entry_facts;
             self.guest_call(&format!(
                 "call void @{}(ptr %state)",
@@ -4003,12 +4849,22 @@ impl FunctionLifter<'_> {
             ));
             self.callees.push(target);
             self.sync_in_parts(in_state, written_flags & live_flags_after);
-            // `after_call` is dominated solely by the pre-call block: GPRs and flags the callee
-            // never writes (other than `rsp`) still hold their pre-call SSA values and facts.
+            // `after_call` is dominated solely by the pre-call block: registers and flags the
+            // callee never writes (other than `rsp`) still hold their pre-call SSA values and facts.
             for idx in 0..16 {
                 if idx != RSP && self.regs[idx] && in_state & (1u64 << idx) == 0 {
                     self.known.gprs[idx] = pre_known_gprs[idx].clone();
                     self.block_entry_facts[idx] = pre_entry_facts[idx];
+                }
+                if self.simd.has_xmm(idx)
+                    && in_state & flag_liveness::xmm_state_bit(idx) == 0
+                {
+                    self.known.xmms[idx] = pre_known_xmms[idx].clone();
+                }
+                if self.simd.has_ymmh(idx)
+                    && in_state & flag_liveness::ymmh_state_bit(idx) == 0
+                {
+                    self.known.ymmhs[idx] = pre_known_ymmhs[idx].clone();
                 }
             }
             for flag in FLAGS {

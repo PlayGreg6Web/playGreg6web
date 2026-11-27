@@ -92,6 +92,15 @@ impl FunctionLifter<'_> {
         if bits == 8 {
             return v.to_string();
         }
+        if let Some(c) = Self::const_u64(v, bits) {
+            let swapped = match bits {
+                16 => u64::from((c as u16).swap_bytes()),
+                32 => u64::from((c as u32).swap_bytes()),
+                64 => c.swap_bytes(),
+                _ => c,
+            };
+            return imm(swapped, bits);
+        }
         self.bit_intrinsic(BitIntrinsic::Bswap, v, bits)
     }
 
@@ -215,17 +224,27 @@ impl FunctionLifter<'_> {
                     }
                     None => {
                         let o = self.read_op(ins, 1, bits)?;
-                        let wide = if bits == 64 {
-                            o
+                        if let Some(c) = Self::const_u64(&o, bits) {
+                            let shift = 64 - bits;
+                            let signed = (((c << shift) as i64) >> shift) as i64;
+                            let byte_off = (signed >> 3) as u64;
+                            let addr = self.offset_addr(&ea, byte_off);
+                            let bit_pos = (signed & 7) as u32;
+                            let bit = 1u64 << bit_pos;
+                            (addr, imm(bit, 8), Some(imm(!bit, 8)), Some(bit_pos))
                         } else {
-                            self.val(&format!("sext {t} {o} to i64"))
-                        };
-                        let byte_offset = self.val(&format!("ashr i64 {wide}, 3"));
-                        let addr = self.val(&format!("add i64 {ea}, {byte_offset}"));
-                        let low = self.val(&format!("and i64 {wide}, 7"));
-                        let pos = self.val(&format!("trunc i64 {low} to i8"));
-                        let one = self.val(&format!("shl i8 1, {pos}"));
-                        (addr, one, None, None)
+                            let wide = if bits == 64 {
+                                o
+                            } else {
+                                self.val(&format!("sext {t} {o} to i64"))
+                            };
+                            let byte_offset = self.val(&format!("ashr i64 {wide}, 3"));
+                            let addr = self.val(&format!("add i64 {ea}, {byte_offset}"));
+                            let low = self.val(&format!("and i64 {wide}, 7"));
+                            let pos = self.val(&format!("trunc i64 {low} to i8"));
+                            let one = self.val(&format!("shl i8 1, {pos}"));
+                            (addr, one, None, None)
+                        }
                     }
                 };
                 let old = if locked {
@@ -307,6 +326,29 @@ impl FunctionLifter<'_> {
         let bits = self.op_bits(ins, 0)?;
         let t = ty(bits);
         let src = self.read_op(ins, 1, bits)?;
+        if ins.op_kind(0) != OpKind::Register {
+            return unsupported("bit scan destination");
+        }
+        if let Some(c) = Self::const_u64(&src, bits) {
+            if c == 0 {
+                self.set_flag(Flag::Zf, "true");
+                self.known.flag_source = Some(FlagSource::ZeroBit {
+                    is_zero: "true".to_string(),
+                });
+                return Ok(());
+            }
+            let idx_val = if ins.mnemonic() == Mnemonic::Bsf {
+                u64::from(c.trailing_zeros())
+            } else {
+                u64::from(bits - 1 - (c << (64 - bits)).leading_zeros())
+            };
+            self.set_flag(Flag::Zf, "false");
+            let res = self.write_op(ins, 0, &imm(idx_val, bits), bits);
+            self.known.flag_source = Some(FlagSource::ZeroBit {
+                is_zero: "false".to_string(),
+            });
+            return res;
+        }
         let zero = self.val(&format!("icmp eq {t} {src}, 0"));
         let index = if ins.mnemonic() == Mnemonic::Bsf {
             self.bit_intrinsic(BitIntrinsic::Cttz, &src, bits)
@@ -315,9 +357,6 @@ impl FunctionLifter<'_> {
             self.val(&format!("sub {t} {}, {lz}", bits - 1))
         };
         self.set_flag(Flag::Zf, &zero);
-        if ins.op_kind(0) != OpKind::Register {
-            return unsupported("bit scan destination");
-        }
         let res = match reg_ref(ins.op_register(0))? {
             RegRef::Low(idx, 64) | RegRef::Low(idx, 32) => {
                 let old = self.load_gpr(idx)?;
@@ -347,7 +386,11 @@ impl FunctionLifter<'_> {
         let src = self.read_op(ins, 1, bits)?;
         let r = match ins.mnemonic() {
             Mnemonic::Popcnt => {
-                let r = self.bit_intrinsic(BitIntrinsic::Ctpop, &src, bits);
+                let r = if let Some(c) = Self::const_u64(&src, bits) {
+                    imm(u64::from(c.count_ones()), bits)
+                } else {
+                    self.bit_intrinsic(BitIntrinsic::Ctpop, &src, bits)
+                };
                 if self.flag_live(Flag::Zf) {
                     let src_zero = self.val(&format!("icmp eq {t} {src}, 0"));
                     self.set_flag(Flag::Zf, &src_zero);
@@ -360,12 +403,23 @@ impl FunctionLifter<'_> {
             }
             m => {
                 let is_tzcnt = m == Mnemonic::Tzcnt;
-                let kind = if is_tzcnt {
-                    BitIntrinsic::Cttz
+                let r = if let Some(c) = Self::const_u64(&src, bits) {
+                    let cnt = if c == 0 {
+                        bits
+                    } else if is_tzcnt {
+                        c.trailing_zeros()
+                    } else {
+                        (c << (64 - bits)).leading_zeros()
+                    };
+                    imm(u64::from(cnt), bits)
                 } else {
-                    BitIntrinsic::Ctlz
+                    let kind = if is_tzcnt {
+                        BitIntrinsic::Cttz
+                    } else {
+                        BitIntrinsic::Ctlz
+                    };
+                    self.bit_intrinsic(kind, &src, bits)
                 };
-                let r = self.bit_intrinsic(kind, &src, bits);
                 if self.flag_live(Flag::Cf) {
                     let src_zero = self.val(&format!("icmp eq {t} {src}, 0"));
                     self.set_flag(Flag::Cf, &src_zero);
@@ -560,13 +614,22 @@ impl FunctionLifter<'_> {
             M::Shlx | M::Shrx | M::Sarx => {
                 let s = self.read_op(ins, 1, bits)?;
                 let c = self.read_op(ins, 2, bits)?;
-                let c = self.val(&format!("and {t} {c}, {}", bits - 1));
                 let op = match m {
                     M::Shlx => "shl",
                     M::Shrx => "lshr",
                     _ => "ashr",
                 };
-                self.val(&format!("{op} {t} {s}, {c}"))
+                if let Some(cv) = Self::const_u64(&c, bits) {
+                    let amt = cv & u64::from(bits - 1);
+                    if amt == 0 {
+                        s
+                    } else {
+                        self.val(&format!("{op} {t} {s}, {amt}"))
+                    }
+                } else {
+                    let c = self.val(&format!("and {t} {c}, {}", bits - 1));
+                    self.val(&format!("{op} {t} {s}, {c}"))
+                }
             }
             M::Rorx => {
                 let s = self.read_op(ins, 1, bits)?;

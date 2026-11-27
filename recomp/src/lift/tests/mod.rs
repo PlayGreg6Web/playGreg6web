@@ -31,6 +31,7 @@ mod ir;
 mod ir_budget;
 mod ir_integer;
 mod ir_simd;
+mod low_overhead_opts;
 mod memory_bench;
 mod memory_models;
 #[cfg(target_arch = "x86_64")]

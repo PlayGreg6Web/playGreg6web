@@ -680,6 +680,7 @@ fn r60_same_block_predicate_fusion_and_scalar_lowering_compactness() {
         a.movzx(eax, cl)?;
         a.movzx(edx, byte_ptr(rsi))?;
         a.lea(r8d, dword_ptr(rcx + rdx * 4 + 16))?;
+        a.lea(r10d, dword_ptr(rcx + rdx * 4 + 16))?;
         a.shl(eax, 3)?;
         a.shr(edx, cl)?;
         a.sar(r8d, 5)?;
@@ -812,15 +813,16 @@ fn r71_bit_ops_const_fast_paths_lzcnt_tzcnt_mulx_and_adcx_adox() {
     );
 
     // 5. `mulx` with identical 32-bit destinations skips computing/storing the unused low half
-    //    (only 3 `trunc i64`: `ecx`, `edx`, and `hi` after `lshr 32`; no 4th `trunc` for `lo`).
+    //    (only 2 `trunc i64` for `ecx` and `edx`; `lshr i64 %p, 32` already has zero upper 32
+    //    bits so its `trunc`+`zext` round-trip folds away too).
     let mulx_ir = module_ir(|a| {
         a.mulx(r8d, r8d, ecx)?;
         a.ret()
     });
     assert_eq!(
         mulx_ir.matches("trunc i64 ").count(),
-        3,
-        "equal-dst 32-bit mulx should skip low-half trunc:\n{mulx_ir}"
+        2,
+        "equal-dst 32-bit mulx should skip low-half and redundant high-half trunc:\n{mulx_ir}"
     );
     assert_eq!(
         mulx_ir.matches(", ptr %r8\n").count(),

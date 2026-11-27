@@ -530,6 +530,14 @@ impl Regs {
     pub(super) fn clear_mem32(&mut self) {
         self.mem32 = None;
     }
+
+    pub(super) fn has_xmm(&self, idx: usize) -> bool {
+        idx < 16 && self.xmm[idx]
+    }
+
+    pub(super) fn has_ymmh(&self, idx: usize) -> bool {
+        idx < 16 && self.ymmh[idx]
+    }
 }
 
 fn is_read_access(access: OpAccess) -> bool {
@@ -959,13 +967,39 @@ impl FunctionLifter<'_> {
             let ptr = self.state_vec_ptr(field, idx);
             let v = self.val(&format!("load {XMM_TYPE}, ptr {ptr}, align 8"));
             self.emit(&format!("store {XMM_TYPE} {v}, ptr {slot}"));
+            if field == 5 {
+                self.known.xmms[idx] = Some(v);
+            } else {
+                self.known.ymmhs[idx] = Some(v);
+            }
         }
+    }
+
+    /// Loads `<2 x i64>` from local vector alloca `slot` (`half == 0` for `xmm`, `1` for `ymmh`),
+    /// forwarding from [`FunctionLifter::known`] when the block already has it.
+    fn load_vec_slot(&mut self, idx: usize, half: u32, slot: &str) -> String {
+        let cached = if half == 0 {
+            &self.known.xmms[idx]
+        } else {
+            &self.known.ymmhs[idx]
+        };
+        if let Some(v) = cached {
+            return v.clone();
+        }
+        let v = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
+        if half == 0 {
+            self.known.xmms[idx] = Some(v.clone());
+        } else {
+            self.known.ymmhs[idx] = Some(v.clone());
+        }
+        v
     }
 
     /// Stores the tracked vector registers present in `state` back into `%state`.
     pub(super) fn sync_xmm_out(&mut self, state: StateMask) {
         for (field, idx, slot) in self.vec_slots(state) {
-            let v = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
+            let half = u32::from(field != 5);
+            let v = self.load_vec_slot(idx, half, &slot);
             let ptr = self.state_vec_ptr(field, idx);
             self.emit(&format!("store {XMM_TYPE} {v}, ptr {ptr}, align 8"));
         }
@@ -998,6 +1032,8 @@ impl FunctionLifter<'_> {
     fn cast(&mut self, v: &str, from: Ty, to: Ty) -> String {
         if from == to {
             v.to_string()
+        } else if v == "zeroinitializer" && to.n > 1 {
+            "zeroinitializer".to_string()
         } else {
             self.val(&format!("bitcast {} {v} to {}", from.ir(), to.ir()))
         }
@@ -1006,7 +1042,7 @@ impl FunctionLifter<'_> {
     /// Lane `half` of a vector register as a 128-bit vector of `e`.
     fn xget_half(&mut self, reg: Register, half: u32, e: Elem) -> R<String> {
         let slot = self.slot(reg, half)?;
-        let raw = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
+        let raw = self.load_vec_slot(reg.number(), half, &slot);
         Ok(self.cast(&raw, Ty::v(Elem::I64), Ty::v(e)))
     }
 
@@ -1046,6 +1082,11 @@ impl FunctionLifter<'_> {
         let raw = self.cast(v, Ty::v(e), Ty::v(Elem::I64));
         let slot = self.slot(reg, half)?;
         self.emit(&format!("store {XMM_TYPE} {raw}, ptr {slot}"));
+        if half == 0 {
+            self.known.xmms[idx] = Some(raw);
+        } else {
+            self.known.ymmhs[idx] = Some(raw);
+        }
         Ok(())
     }
 

@@ -31,9 +31,11 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
         "only used registers get a slot"
     );
     let state_slot = |idx: u32| format!("ptr %state.xmm{idx}, align 8");
-    // entry + after the call + before the call + before the return
+    // xmm0: entry + pre-call store + post-call reload + exit store = 4.
+    // xmm5: entry + pre-call store + exit store = 3 (dead post-call reload overwritten by movaps
+    //       is eliminated by intra-block XMM forwarding + overwritten-store dropping).
     assert_eq!(ir.matches(&state_slot(0)).count(), 4, "{ir}");
-    assert_eq!(ir.matches(&state_slot(5)).count(), 4, "{ir}");
+    assert_eq!(ir.matches(&state_slot(5)).count(), 3, "{ir}");
     let call = ir.find("call void @sub_2000").expect("call");
     let before = &ir[..call];
     let after = &ir[call..];
@@ -1013,10 +1015,10 @@ fn r66_wasm_simd128_native_lowering_ir() {
             "palignr_variants",
             asm_function(0x1B00, |a| {
                 a.palignr(xmm0, xmm1, 0)?;
-                a.palignr(xmm0, xmm1, 5)?;
-                a.palignr(xmm0, xmm1, 16)?;
-                a.palignr(xmm0, xmm1, 20)?;
-                a.palignr(xmm0, xmm1, 32)?;
+                a.palignr(xmm2, xmm1, 5)?;
+                a.palignr(xmm3, xmm1, 16)?;
+                a.palignr(xmm4, xmm1, 20)?;
+                a.palignr(xmm5, xmm1, 32)?;
                 a.ret()
             }),
         ),
@@ -1278,10 +1280,10 @@ fn r70_3d_fp_fma_f16c_and_shuffle_lowering_ir() {
                 assert!(!ir.contains("fneg "), "vfmaddsub/vfmsubadd should use sign-bit xor:\n{ir}");
             }
             "fma3_scalar_ss" => {
-                // Only 1 load of %xmm0 inside the body (1 in body + 1 in sync_out = 2 total).
+                // Only 1 load of %xmm0 in the entire function (sync_out forwards the stored value).
                 assert_eq!(
                     ir.matches("load <2 x i64>, ptr %xmm0").count(),
-                    2,
+                    1,
                     "scalar FMA should not reload %xmm0:\n{ir}"
                 );
             }
@@ -1588,8 +1590,8 @@ fn wasm64_simd128_bitmask_extadd_fp_fusion_and_idioms_ir() {
                 );
                 assert_eq!(
                     ir.matches("load <2 x i64>, ptr %xmm6").count(),
-                    1,
-                    "insertps zeroing all other lanes must not load %xmm6 in body (only sync_out):\n{ir}"
+                    0,
+                    "insertps zeroing all other lanes must not load %xmm6 at all (sync_out forwards):\n{ir}"
                 );
             }
             "vmaskmov_per_half" => {
@@ -1683,6 +1685,7 @@ fn wasm64_batch2_bitselect_q15mulr_strcmp_and_noinline_ir() {
             "pcmpstrm_vec_mask",
             asm_function(0x3400, |a| {
                 a.pcmpistrm(xmm0, xmm1, 0x40)?; // 8-bit unit mask
+                a.movdqa(xmm4, xmm0)?; // keep 8-bit mask live across the next pcmpestrm
                 a.pcmpestrm(xmm2, xmm3, 0x41)?; // 16-bit unit mask
                 a.ret()
             }),
