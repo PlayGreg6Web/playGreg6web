@@ -31,9 +31,10 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
         "only used registers get a slot"
     );
     let state_slot = |idx: u32| format!("ptr %state.xmm{idx}, align 8");
-    // entry + after the call + before the call + before the return
-    assert_eq!(ir.matches(&state_slot(0)).count(), 4, "{ir}");
-    assert_eq!(ir.matches(&state_slot(5)).count(), 4, "{ir}");
+    // xmm0: entry load, store before the call, reload after it (still in sync at the return).
+    // xmm5: entry load (still in sync before the call), reload, store before the return.
+    assert_eq!(ir.matches(&state_slot(0)).count(), 3, "{ir}");
+    assert_eq!(ir.matches(&state_slot(5)).count(), 3, "{ir}");
     let call = ir.find("call void @sub_2000").expect("call");
     let before = &ir[..call];
     let after = &ir[call..];

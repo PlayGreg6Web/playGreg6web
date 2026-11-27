@@ -1299,6 +1299,8 @@ fn r19_measure_real_code() {
         .ok()
         .map(|v| v.split(',').map(str::to_string).collect());
     let emit_obj = env::var_os("PLAYGTA6_R19_NO_OBJ").is_none();
+    // Lift with the summaries of the whole program (as `build-program` does) instead of none.
+    let with_summaries = env::var_os("PLAYGTA6_R19_SUMMARIES").is_some();
     let tool = if emit_obj { find_llvm_tool() } else { None };
 
     let bytes = fs::read(&exe).expect("read executable");
@@ -1306,6 +1308,8 @@ fn r19_measure_real_code() {
     let Seeded { image, .. } = seed(&pe, &bytes);
     let analysis = discover(&image);
     let sample: Vec<&cfg::Function> = analysis.functions.values().step_by(stride).collect();
+    let summaries =
+        with_summaries.then(|| crate::lift::FlagSummaries::compute(analysis.functions.values()));
     let instructions: usize = sample
         .iter()
         .flat_map(|f| f.blocks.values())
@@ -1332,7 +1336,11 @@ fn r19_measure_real_code() {
         for (i, chunk) in sample.chunks(shard).enumerate() {
             let mut functions = Vec::new();
             for f in chunk {
-                if let Ok(l) = lift_function_with(f, model) {
+                let lifted = match &summaries {
+                    Some(s) => crate::lift::lift_function_in(f, model, s),
+                    None => lift_function_with(f, model),
+                };
+                if let Ok(l) = lifted {
                     functions.push(l);
                 }
             }

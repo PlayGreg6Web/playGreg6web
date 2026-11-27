@@ -228,25 +228,26 @@ fn around_call(ir: &str, caller: u64, callee: u64) -> (String, String) {
 fn calls_keep_untouched_registers_out_of_the_state() {
     let functions = program().discover();
     let ir = lift_module(functions.values()).expect("lifts").ir;
-    // LEAF touches rax, rbx, rsp: rcx, rdx, rsi, r9 stay in the caller.
+    // LEAF touches rax, rbx, rsp: rcx, rdx, rsi, r9 stay in the caller. `rax` still holds the
+    // value `entry:` loaded, so only `rsp` (the pushed return address) is stored.
     let (before, after) = around_call(&ir, CALLER, LEAF);
-    assert_eq!(gprs(&before), vec![RAX, RSP], "stores before the call");
+    assert_eq!(gprs(&before), vec![RSP], "stores before the call");
     assert_eq!(gprs(&after), vec![RAX, RSP], "reloads after the call");
     // MID reads r8 without writing it, and MID_CALLER also only reads r8: r8 needs neither a
     // pre-call store (already live in `%state`) nor a post-call reload.
     let (before, after) = around_call(&ir, MID_CALLER, MID);
-    assert_eq!(gprs(&before), vec![RAX, RSP]);
+    assert_eq!(gprs(&before), vec![RSP]);
     assert_eq!(gprs(&after), vec![RAX, RSP]);
     // TAIL also touches rdx; rsi stays.
     let (before, _) = around_call(&ir, TAIL_CALLER, TAIL);
-    assert_eq!(gprs(&before), vec![RAX, RSP]);
+    assert_eq!(gprs(&before), vec![RSP]);
     // VECTOR touches rax, rsp, xmm0: rsi stays out of `%state`.
     let (before, after) = around_call(&ir, VECTOR_CALLER, VECTOR);
-    assert_eq!(gprs(&before), vec![RAX, RSP]);
+    assert_eq!(gprs(&before), vec![RSP]);
     assert_eq!(gprs(&after), vec![RAX, RSP]);
     // UNMODELLED_CALLEE may touch anything: every written tracked register goes through the state.
     let (before, after) = around_call(&ir, UNMODELLED_CALLER, UNMODELLED_CALLEE);
-    assert_eq!(gprs(&before), vec![RAX, RSP, RSI]);
+    assert_eq!(gprs(&before), vec![RSP, RSI]);
     assert_eq!(gprs(&after), vec![RAX, RSP, RSI]);
     // The caller's own return writes back every register CALLER itself modifies (skipping
     // read-only `rdx`, whose value in `%state` is already up to date).
@@ -262,9 +263,10 @@ fn calls_without_summaries_sync_every_register() {
     let functions = program().discover();
     let lifted = crate::lift::lift_function(&functions[&CALLER]).expect("lifts");
     let (before, after) = around_call(&lifted.ir, CALLER, LEAF);
-    // `rdx` is strictly read-only in CALLER so pre-call sync_out skips it, while post-call
-    // sync_in reloads every tracked register without summaries.
-    assert_eq!(gprs(&before), vec![RAX, RCX, RSP, RSI, R9]);
+    // `rdx` is strictly read-only in CALLER so pre-call sync_out skips it, and so are `rax` and
+    // `rcx`, which still hold their entry values; post-call sync_in reloads every tracked
+    // register without summaries.
+    assert_eq!(gprs(&before), vec![RSP, RSI, R9]);
     assert_eq!(gprs(&after), vec![RAX, RCX, RDX, RSP, RSI, R9]);
 }
 

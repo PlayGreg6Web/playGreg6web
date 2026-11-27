@@ -116,6 +116,15 @@ use super::super::Support;
 use super::flag_liveness::{StateMask, xmm_state_bit, ymmh_state_bit};
 use super::{ColdTrapKind, FunctionLifter, R, imm, unsupported};
 
+/// The [`StateMask`] bit of `%state` vector field `field` (5: `xmm`, 6: `ymmh`) element `idx`.
+fn vec_state_bit(field: u32, idx: usize) -> StateMask {
+    if field == 5 {
+        xmm_state_bit(idx)
+    } else {
+        ymmh_state_bit(idx)
+    }
+}
+
 /// Canonical type of an XMM register value (allocas and guest state slots).
 pub(super) const XMM_TYPE: &str = "<2 x i64>";
 
@@ -940,6 +949,14 @@ impl FunctionLifter<'_> {
         self.state_ptr(field, Some(idx))
     }
 
+    /// The registers `entry:` loads from `%state` for `state` (see [`Self::sync_xmm_in`]).
+    pub(super) fn vec_loaded(&self, state: StateMask) -> StateMask {
+        self.vec_slots(state)
+            .iter()
+            .map(|&(field, idx, _)| vec_state_bit(field, idx))
+            .fold(0, |a, b| a | b)
+    }
+
     fn vec_slots(&self, state: StateMask) -> Vec<(u32, usize, String)> {
         let mut slots = Vec::new();
         for idx in 0..16 {
@@ -959,15 +976,21 @@ impl FunctionLifter<'_> {
             let ptr = self.state_vec_ptr(field, idx);
             let v = self.val(&format!("load {XMM_TYPE}, ptr {ptr}, align 8"));
             self.emit(&format!("store {XMM_TYPE} {v}, ptr {slot}"));
+            self.note_synced(vec_state_bit(field, idx));
         }
     }
 
     /// Stores the tracked vector registers present in `state` back into `%state`.
     pub(super) fn sync_xmm_out(&mut self, state: StateMask) {
         for (field, idx, slot) in self.vec_slots(state) {
+            let bit = vec_state_bit(field, idx);
+            if self.is_synced(bit) {
+                continue;
+            }
             let v = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
             let ptr = self.state_vec_ptr(field, idx);
             self.emit(&format!("store {XMM_TYPE} {v}, ptr {ptr}, align 8"));
+            self.note_synced(bit);
         }
     }
 
