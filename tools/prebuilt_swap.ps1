@@ -1,5 +1,16 @@
 # Dot-sourced by update_prebuilt.ps1 (and tests/test_prebuilt_swap.ps1): swap a freshly built dir into place with bounded retries.
 
+# Run a native command with its stderr lines forwarded to the host (information stream) instead of the error stream, so a progress
+# line on stderr can never become a terminating error or NativeCommandError noise, whatever $ErrorActionPreference the caller or a
+# redirection (*>, 2>&1, Start-Job, a parent that merges our stderr) has. The exit code stays in $LASTEXITCODE: callers must check it.
+function Invoke-Native {
+    $exe, $rest = $args
+    $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    try {
+        & $exe @rest 2>&1 | ForEach-Object { Write-Host ($(if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" })) }
+    } finally { $ErrorActionPreference = $eap }
+}
+
 function Invoke-WithRetry {
     param([scriptblock]$Action, [int]$Tries = 5, [int]$DelayMs = 500)
     for ($i = 1; $i -le $Tries; $i++) {

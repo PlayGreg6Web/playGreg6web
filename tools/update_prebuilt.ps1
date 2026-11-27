@@ -29,6 +29,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "prebuilt_swap.ps1")  # Invoke-Native (stderr-safe native calls) and Invoke-PrebuiltSwap
 if ($Web) {
     # Windows PowerShell 5.1 turns any native stderr line (python progress such as "[plan] ...") into a terminating error under "Stop";
     # every native call below is checked via $LASTEXITCODE, so do not stop on stderr.
@@ -49,7 +50,7 @@ if ($Web) {
         if (-not (Test-Path -LiteralPath $derived) -or -not (Test-Path -LiteralPath $stamp) -or (Get-Content -LiteralPath $stamp -Raw).Trim() -ne $srcKey) {
             $subsetArgs = @((Join-Path $PSScriptRoot "subset_wgsl_pack.py"), $StdPack, "--out", $derived)
             if ($ShaderPack -and (Test-Path -LiteralPath $ShaderPack)) { $subsetArgs += @("--priority-pack", $ShaderPack) }
-            & python @subsetArgs
+            Invoke-Native python @subsetArgs
             if ($LASTEXITCODE -ne 0) { throw "subset_wgsl_pack failed" }
             Set-Content -LiteralPath $stamp -Value $srcKey
         }
@@ -61,7 +62,7 @@ if ($Web) {
     }
     if (-not $ShaderPack -or -not (Test-Path -LiteralPath $ShaderPack)) { throw "No shader pack: pass -ShaderPack, or set PLAYGTA6_NATIVE_SHADER_PACK (std pack; a browser pack is derived) / PLAYGTA6_SHADER_PACK." }
     if (-not (Get-Command emcc -ErrorAction SilentlyContinue) -and -not $env:EMSDK) {
-        & python (Join-Path $PSScriptRoot "emsdk_locator.py")
+        Invoke-Native python (Join-Path $PSScriptRoot "emsdk_locator.py")
         if ($LASTEXITCODE -ne 0) { throw "No Emscripten found (emcc not on PATH, EMSDK unset, no work/**/emsdk)." }
     }
     if (-not (Get-Command emcmake -ErrorAction SilentlyContinue) -and $env:EMSDK) {
@@ -76,20 +77,20 @@ if ($Web) {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction Stop }
     $seed = @()
     if (Test-Path -LiteralPath $target) { $seed = @("--seed-from", $target) }
-    & python (Join-Path $PSScriptRoot "prebuilt_web.py") prepare --repo $repo --dest $tmp @seed
+    Invoke-Native python (Join-Path $PSScriptRoot "prebuilt_web.py") prepare --repo $repo --dest $tmp @seed
     if ($LASTEXITCODE -ne 0) { throw "prepare failed" }
     Push-Location $repo
     try {
-        & python tools/run_browser_boot.py --build-only --exe $Exe --game-dir $GameDir --shader-pack $ShaderPack `
+        Invoke-Native python tools/run_browser_boot.py --build-only --exe $Exe --game-dir $GameDir --shader-pack $ShaderPack `
             --build-dir (Join-Path $tmp "build") --boot-dir (Join-Path $tmp "boot") `
             --out-dir (Join-Path $tmp "web\dist") --web-dir (Join-Path $tmp "web")
         if ($LASTEXITCODE -ne 0) { throw "build failed (existing prebuilt left untouched; partial build in $tmp)" }
     } finally { Pop-Location }
-    & python (Join-Path $PSScriptRoot "prebuilt_web.py") stamp --repo $repo --dest $tmp --shader-pack (Join-Path $tmp "build\staged-shaders\$(Split-Path -Leaf $ShaderPack)")
+    Invoke-Native python (Join-Path $PSScriptRoot "prebuilt_web.py") stamp --repo $repo --dest $tmp --shader-pack (Join-Path $tmp "build\staged-shaders\$(Split-Path -Leaf $ShaderPack)")
     if ($LASTEXITCODE -ne 0) { throw "stamp failed" }
-    & python (Join-Path $PSScriptRoot "prebuilt_web.py") swap --new $tmp --target $target
+    Invoke-Native python (Join-Path $PSScriptRoot "prebuilt_web.py") swap --new $tmp --target $target
     if ($LASTEXITCODE -ne 0) { throw "swap failed" }
-    & python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $target --repo $repo
+    Invoke-Native python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $target --repo $repo
     return
 }
 if (-not $Dir) { $Dir = Join-Path $env:LOCALAPPDATA "playgta6\prebuilt" }
@@ -113,7 +114,7 @@ $commit = (& git -C $repo rev-parse HEAD).Trim()
 $dirty = [bool](& git -C $repo status --porcelain --untracked-files=no)
 Push-Location $repo
 try {
-    & python tools/run_native_boot.py --preset long --name prebuilt-build --play --build-only `
+    Invoke-Native python tools/run_native_boot.py --preset long --name prebuilt-build --play --build-only `
         --exe $Exe --game-dir $GameDir --build-dir $tmp
     if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE); the existing prebuilt copy is untouched." }
 } catch {
@@ -131,12 +132,12 @@ if (-not $SkipSmoke) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     Push-Location $repo
     try {
-        & python tools/run_native_boot.py --preset menu-flow --name $smokeName --live-executor --trust-build `
+        Invoke-Native python tools/run_native_boot.py --preset menu-flow --name $smokeName --live-executor --trust-build `
             --exe $Exe --game-dir $GameDir --build-dir $tmp --runs-dir $smokeRuns @smokePack --max-ms 75000 --watchdog-ms 105000
-        & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") $smokeRun --expect-name $smokeName
+        Invoke-Native python (Join-Path $PSScriptRoot "prebuilt_smoke.py") $smokeRun --expect-name $smokeName
         $smokeOk = ($LASTEXITCODE -eq 0)
     } finally { Pop-Location; $ErrorActionPreference = $eap }
-    & python (Join-Path $PSScriptRoot "prebuilt_smoke.py") --prune $smokeRuns --keep 3  # only inside the smoke-runs dir, never a prebuilt
+    Invoke-Native python (Join-Path $PSScriptRoot "prebuilt_smoke.py") --prune $smokeRuns --keep 3  # only inside the smoke-runs dir, never a prebuilt
     if (-not $smokeOk) {
         Write-Host "[prebuilt] smoke boot FAILED: the existing prebuilt at $Dir is kept; the new build is left at $tmp (run dir: $smokeRun). Use -SkipSmoke to swap anyway."
         exit 3
@@ -149,6 +150,5 @@ if ($busy) {
     Write-Host "[prebuilt] $Dir is in use (pid $($busy.Id -join ',')); new build kept at $tmp. Close the game, then: Rename-Item '$Dir' '$(Split-Path -Leaf $old)'; Rename-Item '$tmp' '$(Split-Path -Leaf $Dir)'; Remove-Item -Recurse -Force '$old'"
     exit 2
 }
-. (Join-Path $PSScriptRoot "prebuilt_swap.ps1")
 Invoke-PrebuiltSwap -Dir $Dir -Tmp $tmp -Old $old
 Write-Host "[prebuilt] updated $Dir from $commit. Play: `$env:PLAYGTA6_PREBUILT_DIR='$Dir'; .\tools\play_native.ps1 -Prebuilt"
