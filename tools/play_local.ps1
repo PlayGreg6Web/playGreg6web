@@ -44,6 +44,7 @@ if ($Prebuilt) {
     }
     $TrustBuild = $true
     & python (Join-Path $PSScriptRoot "prebuilt_web.py") info --prebuilt $PrebuiltDir --repo $repo
+    try { & python (Join-Path $PSScriptRoot "prebuilt_stale.py") --prebuilt $PrebuiltDir --repo $repo --web } catch { }
     # Full std pack (WGPK v2) streamed with HTTP Range (?streamShaders=1); the staged v1 subset is the fallback.
     if (-not $NoStreamShaders -and -not $ShaderPack -and -not $StreamShaders) {
         $found = (& python (Join-Path $PSScriptRoot "prebuilt_web.py") stream-pack --env "$StreamPack") | Select-Object -Last 1

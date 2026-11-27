@@ -74,6 +74,7 @@ if ($Prebuilt) {
         if ($LASTEXITCODE -eq 0 -and "$n" -match '^\d+$') { $behind = $n }
     } catch { }
     Write-Host "[prebuilt] $pdir built from $pc ($behind commits behind origin/main). Refresh: .\tools\update_prebuilt.ps1"
+    try { & python (Join-Path $PSScriptRoot "prebuilt_stale.py") --prebuilt $pdir --repo $repo } catch { }
 }
 if ($Update) { & python (Join-Path $PSScriptRoot "repo_update.py") update --repo $repo }
 if (-not $Prebuilt) { & python (Join-Path $PSScriptRoot "repo_update.py") check --repo $repo }

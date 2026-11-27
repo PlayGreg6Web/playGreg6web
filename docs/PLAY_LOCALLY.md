@@ -27,7 +27,7 @@ If it stops or crashes, see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) for where t
 `%LOCALAPPDATA%\playgta6\prebuilt`, or `-Dir` / `PLAYGTA6_PREBUILT_DIR`) into a temp dir and swaps it in only when the
 build succeeded, so your playable copy is never broken; it records the source commit in `prebuilt.json`. Then
 `.\tools\play_native.ps1 -Prebuilt` starts it with `-TrustBuild` semantics (never builds) and prints the build's commit and
-how many commits it is behind `origin/main`. To use another folder: `$env:PLAYGTA6_PREBUILT_DIR = "D:\pg6-play"`.
+how many commits it is behind `origin/main`. If commits since then touched `runtime/`, `recomp/`, `shaders/` or the boot harness, it also prints one "Prebuilt is N runtime commits behind" line plus the 3 newest subjects (`tools/prebuilt_stale.py`; informational only, never blocks or rebuilds). To use another folder: `$env:PLAYGTA6_PREBUILT_DIR = "D:\pg6-play"`.
 
 **Controls** (full table and `keymap.ini` details further down):
 
