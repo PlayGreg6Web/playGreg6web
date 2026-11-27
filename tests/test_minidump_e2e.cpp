@@ -6,16 +6,23 @@
 //   --fault     host access violation: dump from the vectored handler, report carrying
 //               fault_record.minidump, exit 9
 //   --watchdog  hang caught by the watchdog: all-thread stacks + dump, report, exit 10
+//   --multi     8 threads fault at once (null deref, abort(), terminate()): the first owns the
+//               report + all-thread dump, the others park; exit 9, never 0xC0000409 / no report
 //   --stuck     the report path after the watchdog stop hangs: the exit backstop (30 s in the
 //               harness, 2 s here) prints stacks, writes its own dump and ends the process with
 //               exit 10; no report exists
 #ifdef _WIN32
 #include "guest/exit_backstop.h"
+#include "guest/fault_gate.h"
 #include "guest/minidump.h"
 #include "guest/minidump_writer.h"
+#include "guest/terminate_hook.h"
 
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -60,12 +67,53 @@ static DWORD WINAPI watchdog_thread(void* stuck) {
     return 0;
 }
 
+// --multi: the harness's claim-or-park (guest/fault_gate.h) in front of one report writer.
+static playgta6::guest::FaultGate g_gate;
+static std::atomic<bool> g_go{false};
+[[noreturn]] static void multi_fault() {
+    backstop::arm(kExitHostFault);
+    g_gate.claim_or_park();  // a loser never returns: the owner ends the process
+    const std::string path = dump_path("host_multi_fault", GetCurrentProcessId());
+    if (Writer::dump_threads(path.c_str(), "multi fault", 20000)) write_report("host_multi_fault", path);
+    TerminateProcess(GetCurrentProcess(), kExitHostFault);
+    for (;;) Sleep(1000);
+}
+static LONG CALLBACK multi_handler(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    multi_fault();
+}
+static void multi_abort(int) {
+    std::signal(SIGABRT, &multi_abort);  // the CRT resets it before the call
+    multi_fault();
+}
+[[noreturn]] static void multi_terminate() { multi_fault(); }
+static void throw_in_noexcept() noexcept { std::terminate(); }
+static DWORD WINAPI multi_thread(void* arg) {
+    const int i = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    while (!g_go.load()) {}
+    if (i % 3 == 0) deliberate_null_deref(nullptr);
+    if (i % 3 == 1) playgta6::guest::abort_once();
+    throw_in_noexcept();
+    return 0;
+}
+
 static int run_child(const std::string& mode) {
     if (!Writer::init()) return 3;
     backstop::start(dump_path("report_stuck", GetCurrentProcessId()).c_str(), kExitWatchdog, kBackstopMs);
     if (mode == "--fault") {
         AddVectoredExceptionHandler(1, &handler);
         deliberate_null_deref(nullptr);
+        return 4;
+    }
+    if (mode == "--multi") {
+        AddVectoredExceptionHandler(1, &multi_handler);
+        playgta6::guest::terminate_hook::install(&multi_terminate);
+        std::signal(SIGABRT, &multi_abort);
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        for (int i = 0; i < 8; ++i) CreateThread(nullptr, 0, &multi_thread, reinterpret_cast<void*>(static_cast<intptr_t>(i)), 0, nullptr);
+        Sleep(200);
+        g_go = true;
+        Sleep(INFINITE);
         return 4;
     }
     CreateThread(nullptr, 0, &watchdog_thread, mode == "--stuck" ? &g_report : nullptr, 0, nullptr);
@@ -178,6 +226,7 @@ int main(int argc, char** argv) {
         {"--fault", "host_access_violation", kExitHostFault, true, 0, 30000, "exception 0xc0000005", nullptr, nullptr},
         {"--watchdog", "host_watchdog_timeout", kExitWatchdog, true, 1000, 30000, "thread ", "[harness] watchdog:",
          "[hang-stack] thread "},
+        {"--multi", "host_multi_fault", kExitHostFault, true, 0, 30000, "thread ", nullptr, nullptr},
         {"--stuck", "report_stuck", kExitWatchdog, false, 1000 + kBackstopMs, 30000, "thread ", "[harness] exit backstop:",
          "[hang-stack] thread "},
     };

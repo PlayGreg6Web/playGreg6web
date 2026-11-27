@@ -478,7 +478,7 @@ else()
     add_test(NAME playgta6_guest_boot_tests COMMAND test_guest_boot)
 
     if(WIN32)
-        add_executable(test_minidump_fault ../tests/test_minidump_fault.cpp)
+        add_executable(test_minidump_fault ../tests/test_minidump_fault.cpp os/host_sleep.cpp)
         target_include_directories(test_minidump_fault PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME playgta6_minidump_fault_tests COMMAND test_minidump_fault)
         set_tests_properties(playgta6_minidump_fault_tests PROPERTIES
@@ -495,7 +495,7 @@ else()
 
         # End to end: host fault, watchdog hang and stuck report path (backstop) each leave a
         # parseable non-empty minidump within a time bound.
-        add_executable(test_minidump_e2e ../tests/test_minidump_e2e.cpp)
+        add_executable(test_minidump_e2e ../tests/test_minidump_e2e.cpp os/host_sleep.cpp)
         target_include_directories(test_minidump_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME playgta6_minidump_e2e_tests COMMAND test_minidump_e2e)
         set_tests_properties(playgta6_minidump_e2e_tests PROPERTIES

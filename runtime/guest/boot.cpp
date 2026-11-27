@@ -20,6 +20,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "guest/audio_probes.h"
+#include "guest/fault_gate.h"
 #include "guest/guest_probe.h"
 #include "guest/hash_registry_scan.h"
 #include "guest/streaming_drain_probe.h"
@@ -405,7 +406,7 @@ struct BootState {
     OffThreadFaultFn off_thread_fault = nullptr;
     std::function<void(std::string_view)> report_sink;  // O36
     GuestThreadStartedFn guest_thread_started = nullptr;
-    std::atomic<bool> off_thread_fault_taken{false};
+    FaultGate fault_gate;  // first faulting thread owns capture_fault + the report; others park
     bool log_progress = true;
     std::chrono::steady_clock::time_point start;
 
@@ -1105,7 +1106,7 @@ void finish_report();
     log_trap();
     os::log("guest boot: stopping without exception support; aborting the process");
     std::fflush(stderr);
-    std::abort();
+    abort_once();
 #endif
 }
 
@@ -1190,9 +1191,10 @@ void boot_fault_handler(const FaultInfo* info) {
                                         : info->va);
     }
     const bool other_thread = !t_running_boot;
-    if (other_thread && (b.off_thread_fault == nullptr || b.off_thread_fault_taken.exchange(true))) {
+    if (other_thread && b.off_thread_fault == nullptr) {
         return;
     }
+    b.fault_gate.claim_or_park();  // concurrent faults on other threads park behind the first
     const auto kind = static_cast<FaultKind>(info->kind);
     const bool inside = kind == FaultKind::Trap || kind == FaultKind::Unimplemented ||
                         kind == FaultKind::DivideError;
@@ -1215,6 +1217,7 @@ void boot_fault_handler(const FaultInfo* info) {
 
 void stop_on_limit(GuestState* state, const char* kind, uint64_t target) {
     BootState& b = boot();
+    b.fault_gate.claim_or_park();
     t_observer.flush_dispatches();
     capture_fault(kind, state, target, 0);
     char message[160];
@@ -1930,6 +1933,7 @@ void boot_unresolved_thunk(void* raw_state) {
         return;
     }
     if (running && t_running_boot) {
+        b.fault_gate.claim_or_park();
         t_observer.flush_dispatches();
         capture_fault("unresolved_import", state, return_address, state->rip);
         b.fault.import_index = index;
@@ -1941,7 +1945,8 @@ void boot_unresolved_thunk(void* raw_state) {
     }
     // Another guest thread during a boot: reported like any other off-thread fault (the hook
     // writes the report and parks the thread), once.
-    if (running && b.off_thread_fault != nullptr && !b.off_thread_fault_taken.exchange(true)) {
+    if (running && b.off_thread_fault != nullptr) {
+        b.fault_gate.claim_or_park();
         t_observer.flush_dispatches();
         capture_fault("unresolved_import", state, return_address, state->rip);
         b.fault.import_index = index;
@@ -1959,7 +1964,7 @@ void boot_unresolved_thunk(void* raw_state) {
     std::snprintf(message, sizeof(message), "[trap] UNRESOLVED_IMPORT %s called outside the boot thread",
                   index >= 0 ? import_label(b.imports[static_cast<size_t>(index)].import).c_str() : "?");
     os::log(message);
-    std::abort();
+    abort_once();
 }
 
 const char* crt_exit_kind_id(int32_t kind) {
@@ -4564,7 +4569,7 @@ BootResult run_boot(const BootConfig& config) {
         std::lock_guard<std::mutex> lock(b.arena_mutex);
         b.arena_log_limit = config.arena_log_limit;
     }
-    b.off_thread_fault_taken = false;
+    b.fault_gate.reset();
     b.arena = config.arena != nullptr ? config.arena : os::win32::get_vmem_arena();
     // One arena everywhere: O16 bridge objects and lazily created guest threads live in it too.
     com::set_guest_memory(config.arena);

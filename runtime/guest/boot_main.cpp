@@ -104,6 +104,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <csignal>
+#include "guest/fault_gate.h"
 #include <exception>
 #include <cstdint>
 #include <cstdio>
@@ -189,6 +190,7 @@
 #include "guest/minidump_writer.h"
 #ifdef _WIN32
 #include "guest/exit_backstop.h"
+#include "guest/terminate_hook.h"
 #endif
 #else
 #include <execinfo.h>
@@ -333,6 +335,15 @@ Options g_options;
 std::string g_minidump_path;  // set once a fault minidump was written (recorded in fault_record)
 std::string g_guest_profile_json;  // --profile-guest: set by finish_profile, injected into the boot report
 std::atomic<bool> g_finishing{false};
+guest::FaultGate g_report_gate;  // who owns the final report (fault, stop or normal end)
+// Claims the report: true for the first caller. Another thread parks (the owner writes the report
+// and ends the process; the exit backstop covers an owner that hangs); the owner itself (a fault
+// inside its own report path) gets false and must end the process without reporting again.
+bool claim_report() {
+    if (g_finishing.exchange(true)) return false;
+    g_report_gate.try_claim();
+    return true;
+}
 int g_result = 0;
 
 void usage() {
@@ -1616,13 +1627,15 @@ void arm_exit_backstop(int code) { g_backstop_code.store(code); }
 // Reports a host fault once and terminates; later/concurrent faults just terminate.
 [[noreturn]] void host_fault(const char* kind, uint64_t address, uint64_t pc, int code) {
     arm_exit_backstop(code);
-    if (!g_finishing.exchange(true)) {
+    if (claim_report()) {
         if (guest::report_host_fault(kind, address, pc)) {
             write_outputs(true);
         } else {
             std::fprintf(stderr, "[harness] host fault %s at 0x%" PRIx64 " (pc 0x%" PRIx64 ") outside a boot\n",
                          kind, address, pc);
         }
+    } else if (!g_report_gate.owned_by_me()) {
+        guest::FaultGate::park_forever();  // the owner is writing the report and ends the process
     }
     terminate_now(code);
 }
@@ -1635,13 +1648,19 @@ void arm_exit_backstop(int code) { g_backstop_code.store(code); }
 }
 
 void abort_signal_report(int) {
+    // The CRT resets the handler to default before calling it: put it back so a second aborting
+    // thread is reported (parks behind the owner) instead of fast-failing with 0xC0000409.
+    std::signal(SIGABRT, &abort_signal_report);
     host_fault("host_abort", 0, 0, kExitHostFault);
 }
 
 // BootConfig::off_thread_fault: the boot already recorded the fault of a non-boot guest thread.
 void off_thread_fault() {
-    if (!g_finishing.exchange(true)) {
+    arm_exit_backstop(static_cast<int>(guest::BootStatus::Fault));
+    if (claim_report()) {
         write_outputs(true);
+    } else if (!g_report_gate.owned_by_me()) {
+        guest::FaultGate::park_forever();  // the owner is reporting and ends the process
     }
     terminate_now(static_cast<int>(guest::BootStatus::Fault));
 }
@@ -2015,8 +2034,19 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
+#ifdef _WIN32
+    guest::terminate_hook::install(&terminate_handler_report);  // every thread, not just this one
+#else
     std::set_terminate(&terminate_handler_report);
+#endif
     std::signal(SIGABRT, &abort_signal_report);
+#ifdef _WIN32
+    // abort() without a handler fast-fails (0xC0000409, no report, WER): exit with 3 instead.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {
+        host_fault("host_invalid_parameter", 0, 0, kExitHostFault);
+    });
+#endif
     {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.refuse_native_pipelines = !g_options.native_pipelines;

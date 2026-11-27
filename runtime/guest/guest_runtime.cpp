@@ -1,4 +1,5 @@
 #include "guest/guest_runtime.h"
+#include "guest/fault_gate.h"
 
 #include <algorithm>
 #include <atomic>
@@ -431,7 +432,7 @@ struct Formatter {
     char message[1024];
     format_fault(info, message, sizeof(message));
     os::log(message);
-    std::abort();
+    abort_once();
 }
 
 }  // namespace
