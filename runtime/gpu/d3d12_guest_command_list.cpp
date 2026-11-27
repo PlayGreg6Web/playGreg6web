@@ -722,7 +722,7 @@ struct CopyParamsKeyHash {
 
 // Per-Device cache of ABI v2 texture-copy shader modules, layouts, pipelines, and uniform buffers.
 // Refcounted by live CommandList instances (which hold com::Ref<Device>), so the entry is always
-// erased before Device destruction â€” avoiding both leaks and pointer-reuse ABA hazards in tests.
+// erased before Device destruction — avoiding both leaks and pointer-reuse ABA hazards in tests.
 struct DeviceTexCopyCache {
     uint64_t live_lists = 0;
     uint32_t blit_vs = 0;
