@@ -1287,8 +1287,35 @@
     }
   }
 
+  function defaultIsProcessorIdle(processor) {
+    if (!processor || typeof processor !== 'object') {
+      return true;
+    }
+    if (processor._hasPendingUploadCommands) {
+      return false;
+    }
+    if (Array.isArray(processor._passCommands) && processor._passCommands.length > 0) {
+      return false;
+    }
+    if (typeof processor._pendingShaderCompiles === 'number' && processor._pendingShaderCompiles > 0) {
+      return false;
+    }
+    if (typeof processor._inFlightPipelineCompiles === 'number' && processor._inFlightPipelineCompiles > 0) {
+      return false;
+    }
+    if (
+      processor._compileQueue &&
+      typeof processor._compileQueue.length === 'number' &&
+      processor._compileQueue.length > 0
+    ) {
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Clean worker-side message handler that can be attached to `wgpu_worker.js` without invasive edits.
+   * Yields behind live title submits/compiles (#2054) and reports `yieldCount` / `yieldMs`.
    */
   function attachPrewarmBridge(processor, options = {}) {
     const opts = options && typeof options === 'object' ? options : {};
@@ -1301,16 +1328,89 @@
     );
     const defaultPost =
       typeof opts.postMessage === 'function' ? opts.postMessage : null;
+    const isIdle =
+      typeof opts.isIdle === 'function' ? opts.isIdle : () => defaultIsProcessorIdle(processor);
+    const nowMs = typeof opts.now === 'function' ? opts.now : defaultNowMs;
+    const retryDelayMs =
+      typeof opts.yieldRetryMs === 'number' && Number.isFinite(opts.yieldRetryMs) && opts.yieldRetryMs >= 1
+        ? Math.floor(opts.yieldRetryMs)
+        : 16;
+    const scheduleTimeout =
+      typeof opts.setTimeout === 'function'
+        ? opts.setTimeout
+        : typeof setTimeout === 'function'
+          ? setTimeout
+          : null;
+    const cancelTimeout =
+      typeof opts.clearTimeout === 'function'
+        ? opts.clearTimeout
+        : typeof clearTimeout === 'function'
+          ? clearTimeout
+          : null;
 
     let detached = false;
     let inFlight = 0;
     let peakInFlight = 0;
     let completed = 0;
     let failed = 0;
+    let yieldCount = 0;
+    let yieldMs = 0;
+    let yieldStartedAtMs = null;
+    let retryTimer = null;
     const queue = [];
+
+    function closeYieldWindow() {
+      if (yieldStartedAtMs !== null) {
+        const delta = nowMs() - yieldStartedAtMs;
+        if (delta > 0) {
+          yieldMs += delta;
+        }
+        yieldStartedAtMs = null;
+      }
+    }
+
+    function clearRetryTimer() {
+      if (retryTimer !== null && cancelTimeout) {
+        try {
+          cancelTimeout(retryTimer);
+        } catch {
+          // Ignore clearTimeout errors.
+        }
+        retryTimer = null;
+      }
+    }
+
+    function scheduleRetry() {
+      if (detached || retryTimer !== null || !scheduleTimeout) {
+        return;
+      }
+      retryTimer = scheduleTimeout(() => {
+        retryTimer = null;
+        drain();
+      }, retryDelayMs);
+      if (retryTimer && typeof retryTimer.unref === 'function') {
+        retryTimer.unref();
+      }
+    }
 
     function drain() {
       while (!detached && inFlight < maxInFlight && queue.length > 0) {
+        let idleNow = true;
+        try {
+          idleNow = Boolean(isIdle());
+        } catch {
+          idleNow = false;
+        }
+        if (!idleNow) {
+          yieldCount += 1;
+          if (yieldStartedAtMs === null) {
+            yieldStartedAtMs = nowMs();
+          }
+          scheduleRetry();
+          return;
+        }
+        closeYieldWindow();
+        clearRetryTimer();
         const item = queue.shift();
         inFlight += 1;
         if (inFlight > peakInFlight) {
@@ -1397,7 +1497,10 @@
     return {
       handleMessage,
       executeTask,
+      pump: drain,
       getStats() {
+        const liveYieldMs =
+          yieldStartedAtMs !== null ? yieldMs + Math.max(0, nowMs() - yieldStartedAtMs) : yieldMs;
         return {
           detached,
           maxInFlight,
@@ -1406,10 +1509,14 @@
           peakInFlight,
           completed,
           failed,
+          yieldCount,
+          yieldMs: liveYieldMs,
         };
       },
       detach() {
         detached = true;
+        closeYieldWindow();
+        clearRetryTimer();
         queue.length = 0;
       },
     };
@@ -1471,6 +1578,9 @@
       this._tasksCompleted = 0;
       this._tasksSucceeded = 0;
       this._tasksFailed = 0;
+      this._yieldCount = 0;
+      this._yieldMs = 0;
+      this._yieldStartedAtMs = null;
       this._listLoadedCount = 0;
       this._listLoadErrors = 0;
       this._listSaveCount = 0;
@@ -1668,12 +1778,25 @@
         return 0;
       }
       if (this._isIdle) {
+        let idleNow = false;
         try {
-          if (!this._isIdle()) {
-            return 0;
-          }
+          idleNow = Boolean(this._isIdle());
         } catch {
+          idleNow = false;
+        }
+        if (!idleNow) {
+          this._yieldCount += 1;
+          if (this._yieldStartedAtMs === null) {
+            this._yieldStartedAtMs = this._now();
+          }
           return 0;
+        }
+        if (this._yieldStartedAtMs !== null) {
+          const delta = this._now() - this._yieldStartedAtMs;
+          if (delta > 0) {
+            this._yieldMs += delta;
+          }
+          this._yieldStartedAtMs = null;
         }
       }
 
@@ -1906,6 +2029,13 @@
     destroy() {
       this._active = false;
       this._destroyed = true;
+      if (this._yieldStartedAtMs !== null) {
+        const delta = this._now() - this._yieldStartedAtMs;
+        if (delta > 0) {
+          this._yieldMs += delta;
+        }
+        this._yieldStartedAtMs = null;
+      }
       if (this._pollTimer !== null && this._clearInterval) {
         try {
           this._clearInterval(this._pollTimer);
@@ -1923,6 +2053,10 @@
           ? Object.assign({}, this._lastProgress)
           : null
         : this.readProgress();
+      const liveYieldMs =
+        this._yieldStartedAtMs !== null
+          ? this._yieldMs + Math.max(0, this._now() - this._yieldStartedAtMs)
+          : this._yieldMs;
       return {
         available: this._api.available,
         active: this.active,
@@ -1933,6 +2067,8 @@
         tasksCompleted: this._tasksCompleted,
         tasksSucceeded: this._tasksSucceeded,
         tasksFailed: this._tasksFailed,
+        yieldCount: this._yieldCount,
+        yieldMs: liveYieldMs,
         listLoadedCount: this._listLoadedCount,
         listLoadErrors: this._listLoadErrors,
         listSaveCount: this._listSaveCount,

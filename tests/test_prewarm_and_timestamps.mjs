@@ -1018,3 +1018,86 @@ test('GpuPassTimer and GpuTimeTable degrade gracefully when timestamp-query is u
 
   timer.destroy();
 });
+
+test('PrewarmBridge and attachPrewarmBridge yield behind live title submits/compiles and report yieldMs (#2054)', async () => {
+  const rt = createMockPrewarmWasmRuntime({ wasm64: true });
+  let fakeNow = 100;
+  let idle = false;
+  const built = [];
+
+  const bridge = new PrewarmBridge({
+    module: rt.mod,
+    isIdle: () => idle,
+    now: () => fakeNow,
+    buildTask: async (task) => {
+      built.push(task.id);
+      return { ok: true, buildNs: 250_000 };
+    },
+  });
+
+  const warmBytes = serializeWarmList([
+    { kind: PREWARM_KIND_COMPUTE, key0: 0xfeedface00000001n, key1: 0n },
+  ]);
+  assert.equal(bridge.loadWarmList(warmBytes).queued, 1);
+
+  assert.equal(bridge.pump(), 0);
+  fakeNow = 145;
+  assert.equal(bridge.pump(), 0);
+  assert.equal(built.length, 0);
+  assert.equal(bridge.getDiagnostics().yieldCount, 2);
+  assert.equal(bridge.getDiagnostics().yieldMs, 45);
+
+  idle = true;
+  fakeNow = 160;
+  assert.equal(bridge.pump(), 1);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(built, [1]);
+  assert.equal(bridge.getDiagnostics().yieldCount, 2);
+  assert.equal(bridge.getDiagnostics().yieldMs, 60);
+  bridge.destroy();
+
+  // Worker-side attachPrewarmBridge defaults to yielding while processor has live submits/compiles.
+  let workerNow = 500;
+  const fakeProcessor = {
+    _hasPendingUploadCommands: true,
+    _passCommands: [{ type: 'draw' }],
+    _inFlightPipelineCompiles: 1,
+    device: {
+      createShaderModule: ({ code }) => ({ code }),
+    },
+    shaderPack: {
+      getShader: (key) => ({ code: `// ${key.toString(16)}`, entryPoint: 'main' }),
+    },
+  };
+  const workerBridge = attachPrewarmBridge(fakeProcessor, {
+    now: () => workerNow,
+    setTimeout: () => null,
+  });
+
+  const replies = [];
+  const taskPromise = workerBridge.executeTask(
+    { id: 7, kind: PREWARM_KIND_COMPUTE, key0: 0x42n, key1: 0n },
+    (m) => replies.push(m),
+  );
+  assert.equal(workerBridge.getStats().queued, 1);
+  assert.equal(workerBridge.getStats().inFlight, 0);
+  assert.equal(workerBridge.getStats().yieldCount, 1);
+
+  workerNow = 535;
+  assert.equal(workerBridge.getStats().yieldMs, 35);
+
+  // Clear live title work and resume draining.
+  fakeProcessor._hasPendingUploadCommands = false;
+  fakeProcessor._passCommands = [];
+  fakeProcessor._inFlightPipelineCompiles = 0;
+  workerNow = 550;
+  workerBridge.pump();
+
+  const res = await taskPromise;
+  assert.equal(res.ok, true);
+  assert.equal(replies.length, 1);
+  assert.equal(workerBridge.getStats().completed, 1);
+  assert.equal(workerBridge.getStats().yieldCount, 1);
+  assert.equal(workerBridge.getStats().yieldMs, 50);
+  workerBridge.detach();
+});

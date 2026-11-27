@@ -10142,7 +10142,10 @@ function buildRuntimeModuleConfig(options = {}) {
         isIdle:
           typeof options.prewarmIsIdle === 'function'
             ? options.prewarmIsIdle
-            : () => _inFlightGpuPresents === 0,
+            : () =>
+                _inFlightGpuPresents === 0 &&
+                _pendingCoalescedPresent === null &&
+                pendingRecycleTxPorts.length === 0,
         wasm64: options.prewarmWasm64,
         pointerSize: options.prewarmPointerSize,
         scratchOffset: options.prewarmScratchOffset,
