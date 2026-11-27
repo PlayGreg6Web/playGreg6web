@@ -210,6 +210,13 @@ inline constexpr bool overlay_needs_intermediate(bool window, bool overlay_on, b
     return window && (overlay_on || banner_active);
 }
 
+// Direct presents leave no frame behind, so a snapshot of the presented image is copied into the intermediate
+// texture about once a second (not every frame); a guest fault then redraws the banner over that frame.
+inline constexpr uint64_t kOverlaySnapshotIntervalNs = 1000000000ull;
+inline constexpr bool overlay_snapshot_due(uint64_t now_ns, uint64_t last_ns) {
+    return last_ns == 0 || now_ns - last_ns >= kOverlaySnapshotIntervalNs;
+}
+
 struct OverlayBitmap {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> rgba;  // premultiplied, row-major, w * h * 4

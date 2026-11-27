@@ -1042,7 +1042,7 @@ struct NativeExecutor::Impl {
     bool overlay_dirty = false;
     bool have_last_frame = false;  // the intermediate texture holds the last presented stream image
     OverlayHistory ov_hist;
-    uint64_t ov_last_present_ns = 0, ov_last_draws = 0, ov_redraw_ns = 0, ov_gpu_sample_ns = 0;
+    uint64_t ov_last_present_ns = 0, ov_last_draws = 0, ov_redraw_ns = 0, ov_gpu_sample_ns = 0, ov_snapshot_ns = 0;
     uint64_t ov_gpu_frames = 0, ov_gpu_total_ns = 0;
     double ov_gpu_ms = -1;
     int64_t ov_underruns = -1;
@@ -1222,7 +1222,7 @@ struct NativeExecutor::Impl {
         wgpu::TextureDescriptor td{};
         td.label = {"playgta6-swapchain-intermediate", WGPU_STRLEN};
         td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding |
-                   wgpu::TextureUsage::CopySrc;
+                   wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
         td.dimension = wgpu::TextureDimension::e2D;
         td.size = {stream_w, stream_h, 1};
         td.format = stream_format;
@@ -5008,6 +5008,19 @@ struct NativeExecutor::Impl {
         }
         const bool shown = show_spec.has_value() && encode_show_target(e.enc, target.canvas_view);
         if (target.blit && !shown) encode_blit(e.enc, target.canvas_view);
+        // Direct present: the swapchain image is gone after Present, so keep a snapshot (about once a second, not
+        // per frame) that the stop banner can be redrawn over if the guest stops (overlay_snapshot_due).
+        bool snapped = false;
+        if (!target.blit && surface && target.canvas_texture && overlay_snapshot_due(now_ns(), ov_snapshot_ns)) {
+            ensure_intermediate();
+            wgpu::TexelCopyTextureInfo cs{}, cd{};
+            cs.texture = target.canvas_texture;
+            cd.texture = intermediate;
+            const wgpu::Extent3D ce{stream_w, stream_h, 1};
+            e.enc.CopyTextureToTexture(&cs, &cd, &ce);
+            ov_snapshot_ns = now_ns();
+            snapped = true;
+        }
         wgpu::Buffer probe_buf;
         uint32_t probe_row = 0, probe_w = 0, probe_h = 0;
         PresentRect probe_rect;
@@ -5077,7 +5090,7 @@ struct NativeExecutor::Impl {
             if (ov_last_present_ns) ov_hist.push(static_cast<double>(pn - ov_last_present_ns) / 1e6, static_cast<uint32_t>(stats.draws - ov_last_draws));
             ov_last_present_ns = pn;
             ov_last_draws = stats.draws;
-            have_last_frame = target.blit;
+            if (target.blit || snapped) have_last_frame = true;
         }
         const uint64_t tp2 = now_ns();
         stats.ns_present_submit += tp2 - tp1;
