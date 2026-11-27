@@ -3,7 +3,7 @@
 
     prebuilt_smoke.py <run dir | boot-report.json>   # prints one line; exit 0 = swap, 1 = keep the old prebuilt
 
-Pass: the report exists, at least one present happened, and the run either did not fault or ended on a known
+Pass: the report exists (a run that ended on wall_time_limit, i.e. ran the full duration, counts as no fault), at least one present happened, and the run either did not fault or ended on a known
 hard stop ("Stopped: ..." from tools/stop_message.py, docs/HARD_STOPS.md). A crash ("Crashed: ...") or a run
 that never presented fails; the line printed is then the stop line (or the reason) and the run dir.
 """
@@ -21,11 +21,21 @@ import stop_message  # noqa: E402
 HARD_STOPS = Path(__file__).resolve().parent.parent / "docs" / "HARD_STOPS.md"
 
 
+def _ran_full_duration(report: dict[str, Any]) -> bool:
+    fr = report.get("fault_record")
+    kinds = [report.get("status"), report.get("stop_reason"), fr.get("kind") if isinstance(fr, dict) else None]
+    return any(k == "wall_time_limit" for k in kinds)
+
+
 def decide(report: dict[str, Any] | None, hard_stops_md: str | None, run_dir: str | Path = "") -> tuple[bool, str]:
     """(swap?, one-line reason)."""
     if not isinstance(report, dict):
         return False, f"smoke boot left no boot-report.json - report: {run_dir}"
     presents = int(boot_summary._total_presents(report))
+    if _ran_full_duration(report):  # the boot ran until its --max-ms: that is a pass when it presented
+        if presents <= 0:
+            return False, f"smoke boot reached 0 presents - report: {run_dir}"
+        return True, f"smoke boot ok: {presents} presents, ran the full duration (wall_time_limit)"
     stop = stop_message.select(report, hard_stops_md, run_dir)
     if stop is not None and not stop.startswith("Stopped:"):
         return False, stop

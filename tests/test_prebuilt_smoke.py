@@ -33,6 +33,14 @@ class DecideTests(unittest.TestCase):
         self.assertTrue(line.startswith("Crashed:"))
         self.assertIn("rd", line)
 
+    def test_wall_time_limit_passes(self) -> None:
+        for rep in ({"present_samples_total": 50, "status": "wall_time_limit"},
+                    {"present_samples_total": 50, "fault_record": {"kind": "wall_time_limit"}}):
+            self.assertTrue(ps.decide(rep, HS, "r")[0])
+
+    def test_wall_time_limit_without_presents_fails(self) -> None:
+        self.assertFalse(ps.decide({"present_samples_total": 0, "fault_record": {"kind": "wall_time_limit"}}, HS, "r")[0])
+
     def test_crash_without_presents_fails(self) -> None:
         rep = {"fault_record": {"kind": "access_violation", "va": "0x10"}}
         self.assertFalse(ps.decide(rep, HS, "rd")[0])
