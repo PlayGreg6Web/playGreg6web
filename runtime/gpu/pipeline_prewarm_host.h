@@ -49,6 +49,12 @@ struct PrewarmBuilder {
     std::function<PrewarmBuild(uint32_t task_id, uint32_t kind, uint64_t key0, uint64_t key1,
                                const std::vector<uint8_t>& detail)>
         build_pipeline;
+    // Optional gate checked before each task: false = the GPU consumer is busy with the title's work, so
+    // the builder waits (polling every 2 ms) instead of queueing a pipeline build in front of it. A build
+    // is a packet the live executor compiles synchronously (up to seconds for a big compute program);
+    // pushed while the title loads, 64 of them filled the live pump queue and the title's own submits
+    // waited behind them for the whole load (the title's hang watchdog fired). Null = always build.
+    std::function<bool()> may_build;
 };
 void prewarm_host_start(PrewarmBuilder builder);
 void prewarm_host_wait();  // blocks until the queue is drained (then the thread has ended)
@@ -57,7 +63,8 @@ void prewarm_host_stop();  // asks the thread to end and joins it
 // Saves this run's list to the configured path. No-op when not configured. True when a file was written.
 bool prewarm_host_save();
 
-// JSON object for the boot report (queued_total, prewarmed, hit_before_use, wasted, failed, ...).
+// JSON object for the boot report (queued_total, prewarmed, hit_before_use, wasted, failed, ...,
+// yield_ms: time the builder waited on PrewarmBuilder::may_build).
 std::string prewarm_host_report_json();
 
 }  // namespace playgta6::gpu

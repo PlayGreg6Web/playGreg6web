@@ -160,6 +160,13 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return closed_;
     }
+
+    // True when nothing is queued and the executor is between batches: background work (pipeline
+    // prewarm) submitted now does not land in front of a batch the guest already handed over.
+    bool idle() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty() && !busy_;
+    }
     LivePumpStats stats() const {
         std::lock_guard<std::mutex> lock(mutex_);
         LivePumpStats s = stats_;

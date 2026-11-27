@@ -619,6 +619,50 @@ void test_host_stop_mid_queue_leaves_queued() {
     pipeline_prewarm().reset();
 }
 
+// may_build gate: while it says no (the live pump has title work), nothing is taken or built; once it
+// opens the queue drains, and the wait shows up as yield_ms. Stop while gated ends the thread.
+void test_host_may_build_gate() {
+    auto bytes = make_list({{1, 1, 0}, {1, 2, 0}, {1, 3, 0}});
+    pipeline_prewarm().reset();
+    CHECK(pipeline_prewarm().load_warm_list(bytes.data(), bytes.size(), nullptr));
+    std::atomic<bool> open{false};
+    std::atomic<int> asked{0};
+    std::atomic<int> built{0};
+    PrewarmBuilder b;
+    b.ready = [] { return true; };
+    b.build = [&](uint32_t, uint64_t, uint64_t) {
+        ++built;
+        return true;
+    };
+    b.may_build = [&] {
+        ++asked;
+        return open.load();
+    };
+    prewarm_host_start(b);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    CHECK(asked.load() > 1);
+    CHECK(built.load() == 0);
+    PrewarmProgress p = pipeline_prewarm().progress();
+    CHECK(p.queued == 3 && p.in_flight == 0);
+    open = true;
+    prewarm_host_wait();
+    CHECK(built.load() == 3);
+    CHECK(pipeline_prewarm().progress().done == 3);
+    CHECK(prewarm_host_report_json().find("\"yield_ms\": 0}") == std::string::npos);
+
+    // Gated forever: stop still returns and leaves the queue intact.
+    pipeline_prewarm().reset();
+    CHECK(pipeline_prewarm().load_warm_list(bytes.data(), bytes.size(), nullptr));
+    built = 0;
+    open = false;
+    prewarm_host_start(b);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    prewarm_host_stop();
+    CHECK(built.load() == 0);
+    CHECK(pipeline_prewarm().progress().queued == 3);
+    pipeline_prewarm().reset();
+}
+
 void test_v2_save_load_stress_256() {
     namespace fs = std::filesystem;
     PipelinePrewarm src;
@@ -720,6 +764,7 @@ int main() {
     test_diagnostics_histogram_and_counters();
     test_duplicate_note_title_pipeline_full();
     test_host_stop_mid_queue_leaves_queued();
+    test_host_may_build_gate();
     test_v2_save_load_stress_256();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_pipeline_prewarm: %d failure(s)\n", g_failures);

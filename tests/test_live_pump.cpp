@@ -118,6 +118,31 @@ void test_backpressure_blocks_and_counts() {
     for (size_t i = 0; i < sh.first_bytes.size(); ++i) CHECK(sh.first_bytes[i] == i);
 }
 
+// idle(): false while a batch executes or waits in the queue, true again once the executor is between
+// batches (the pipeline prewarm builds only then, so it never queues ahead of the guest).
+void test_idle_tracks_queue_and_execution() {
+    Shared sh;
+    Pump pump;
+    CHECK(start(pump, sh));
+    CHECK(pump.idle());
+    sh.gate = false;
+    submit_byte(pump, 1);
+    submit_byte(pump, 2);
+    CHECK(!pump.idle());  // one queued or executing, the other queued
+    std::this_thread::sleep_for(50ms);
+    CHECK(!pump.idle());  // stuck inside execute()
+    sh.gate = true;
+    pump.flush();
+    bool idle = false;
+    for (int i = 0; i < 200 && !idle; ++i) {
+        idle = pump.idle();
+        if (!idle) std::this_thread::sleep_for(5ms);
+    }
+    CHECK(idle);
+    pump.stop();
+    CHECK(pump.idle());
+}
+
 void test_byte_bound_and_oversized_batch() {
     Shared sh;
     sh.gate = false;
@@ -322,6 +347,7 @@ void test_headless_live_executor() {
 int main() {
     test_order_and_threads();
     test_backpressure_blocks_and_counts();
+    test_idle_tracks_queue_and_execution();
     test_byte_bound_and_oversized_batch();
     test_close_unblocks_and_requests_shutdown();
     test_focus_forwarding();

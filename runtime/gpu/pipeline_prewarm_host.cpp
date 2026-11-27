@@ -19,6 +19,7 @@ std::mutex g_mutex;
 std::string g_path;
 std::thread g_thread;
 std::atomic<bool> g_stop{false};
+std::atomic<uint64_t> g_yield_ns{0};  // builder time spent waiting on may_build
 }  // namespace
 
 std::string default_warm_list_path(const std::string& title) {
@@ -112,6 +113,7 @@ uint32_t prewarm_host_configure(const std::string& path, std::string* message) {
 void prewarm_host_start(PrewarmBuilder builder) {
     prewarm_host_stop();
     g_stop = false;
+    g_yield_ns = 0;
     g_thread = std::thread([b = std::move(builder)]() {
         playgta6::os::name_this_thread(L"pg6-prewarm");
         while (!g_stop && !b.ready()) {
@@ -119,6 +121,15 @@ void prewarm_host_start(PrewarmBuilder builder) {
         }
         PrewarmTask task{};
         while (!g_stop) {
+            if (b.may_build && !b.may_build()) {
+                const auto y0 = std::chrono::steady_clock::now();
+                while (!g_stop && !b.may_build()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                g_yield_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - y0).count());
+                if (g_stop) break;
+            }
             if (pipeline_prewarm().take(&task, 1) == 0) break;  // queue drained
             const auto t0 = std::chrono::steady_clock::now();
             PrewarmBuild result;
@@ -169,12 +180,13 @@ std::string prewarm_host_report_json() {
                   "\"skipped\": %u, \"observed\": %u, \"pipelines_prewarmed\": %u, "
                   "\"pipelines_hit_before_use\": %u, \"pipelines_wasted\": %u, \"build_ms\": %llu, "
                   "\"longest_build_ms\": %llu, \"races_lost\": %u, \"retired_queued\": %u, \"pack_skipped\": %u, "
-                  "\"priority_queued\": %u}",
+                  "\"priority_queued\": %u, \"yield_ms\": %llu}",
                   p.total, u.prewarmed, u.hit, u.wasted, p.failed, p.skipped, p.observed, u.pipelines_prewarmed,
                   u.pipelines_hit, u.pipelines_wasted,
                   static_cast<unsigned long long>(p.total_ns / 1000000),
                   static_cast<unsigned long long>(p.longest_ns / 1000000),
-                  d.races_lost, d.retired_queued, d.pack_skipped, d.priority_queued);
+                  d.races_lost, d.retired_queued, d.pack_skipped, d.priority_queued,
+                  static_cast<unsigned long long>(g_yield_ns.load() / 1000000));
     return buf;
 }
 

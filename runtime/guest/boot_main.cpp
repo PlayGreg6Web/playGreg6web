@@ -1156,7 +1156,7 @@ std::string g_audio_out_error;
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 namespace ne = playgta6::gpu::native_exec;
 ne::LivePump<ne::NativeExecutor> g_live;
-bool g_live_started = false;
+std::atomic<bool> g_live_started{false};  // also read by the prewarm thread
 std::atomic<bool> g_window_focused{true};
 std::atomic<playgta6::guest::host_input::HostInputSource*> g_host_source{nullptr};
 std::mutex g_live_final_mutex;
@@ -2067,7 +2067,10 @@ int main(int argc, char** argv) {
                              case gpu::bridge::PrewarmPipelineResult::Lost: return gpu::PrewarmBuild::Lost;
                              default: return gpu::PrewarmBuild::Failed;
                          }
-                     }});
+                     },
+                     // --live-executor: build only while the pump is idle, so a prewarm compile never
+                     // queues ahead of the title's own batches (it starved the menu-to-ingame load).
+                     []() { return !g_live_started || g_live.idle(); }});
             }
         }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
