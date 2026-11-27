@@ -21,6 +21,7 @@ const {
   PERF_PROFILE_NAMES,
   parsePerfProfileFromQuery,
   classifyAdapterInfo,
+  computeDisplayNativeBounds,
   resolvePerfProfile,
   coercePerfProfile,
 } = perfProfileMod;
@@ -173,7 +174,7 @@ test('UMD export attaches PlayGta6PerfProfile and loads cleanly under classic-wo
   assert.equal(ctx.PlayGta6PerfProfile.PERF_PROFILES.low.rtPoolMaxBytes, 128 * MiB);
 });
 
-test('PERF_PROFILES defines exact bounded parameters for low, balanced, and high', () => {
+test('PERF_PROFILES preserves 100% full visual quality across low, balanced, and high while tuning memory/concurrency budgets', () => {
   assert.deepEqual(PERF_PROFILES.low, {
     name: 'low',
     rtPoolMaxBytes: 128 * MiB,
@@ -184,8 +185,11 @@ test('PERF_PROFILES defines exact bounded parameters for low, balanced, and high
     gcDeferFrames: 2,
     ioSlabCacheBytes: 64 * MiB,
     ioMaxConcurrentLanes: 4,
-    textureMipCap: 512,
-    dprCap: 1.0,
+    textureMipCap: 0,
+    dprCap: null,
+    preserveFullQuality: true,
+    clampToDisplayResolution: true,
+    clampToDisplayNative: true,
     prewarmMaxInFlight: 1,
     shaderCompileConcurrency: 1,
   });
@@ -200,8 +204,11 @@ test('PERF_PROFILES defines exact bounded parameters for low, balanced, and high
     gcDeferFrames: 2,
     ioSlabCacheBytes: 128 * MiB,
     ioMaxConcurrentLanes: 6,
-    textureMipCap: 1024,
-    dprCap: 1.0,
+    textureMipCap: 0,
+    dprCap: null,
+    preserveFullQuality: true,
+    clampToDisplayResolution: true,
+    clampToDisplayNative: true,
     prewarmMaxInFlight: 2,
     shaderCompileConcurrency: 2,
   });
@@ -217,10 +224,126 @@ test('PERF_PROFILES defines exact bounded parameters for low, balanced, and high
     ioSlabCacheBytes: 192 * MiB,
     ioMaxConcurrentLanes: 8,
     textureMipCap: 0,
-    dprCap: 2.0,
+    dprCap: null,
+    preserveFullQuality: true,
+    clampToDisplayResolution: true,
+    clampToDisplayNative: true,
     prewarmMaxInFlight: 4,
     shaderCompileConcurrency: 4,
   });
+});
+
+test('computeDisplayNativeBounds computes exact physical monitor pixels and respects WebGPU maxTextureDimension2D', () => {
+  // Standard 1080p @ 1.0 DPR -> 1920x1080
+  assert.deepEqual(
+    computeDisplayNativeBounds({
+      screenWidth: 1920,
+      screenHeight: 1080,
+      devicePixelRatio: 1.0,
+      maxTextureDimension2D: 8192,
+    }),
+    {
+      width: 1920,
+      height: 1080,
+      maxDisplayWidth: 1920,
+      maxDisplayHeight: 1080,
+      screenWidth: 1920,
+      screenHeight: 1080,
+      devicePixelRatio: 1,
+      maxTextureDimension2D: 8192,
+      clampedToMaxTextureDimension: false,
+    }
+  );
+
+  // HiDPI 1080p laptop (1280x720 CSS @ 1.5 DPR) -> exact 1920x1080 physical pixels
+  assert.deepEqual(
+    computeDisplayNativeBounds({
+      screenWidth: 1280,
+      screenHeight: 720,
+      devicePixelRatio: 1.5,
+      maxTextureDimension2D: 8192,
+    }),
+    {
+      width: 1920,
+      height: 1080,
+      maxDisplayWidth: 1920,
+      maxDisplayHeight: 1080,
+      screenWidth: 1280,
+      screenHeight: 720,
+      devicePixelRatio: 1.5,
+      maxTextureDimension2D: 8192,
+      clampedToMaxTextureDimension: false,
+    }
+  );
+
+  // 1680x1050 16:10 monitor @ 1.0 DPR -> exact 1680x1050 physical pixels
+  const wsxga = computeDisplayNativeBounds({
+    screenWidth: 1680,
+    screenHeight: 1050,
+    devicePixelRatio: 1,
+  });
+  assert.equal(wsxga.width, 1680);
+  assert.equal(wsxga.height, 1050);
+  assert.equal(wsxga.maxDisplayWidth, 1680);
+  assert.equal(wsxga.maxDisplayHeight, 1050);
+  assert.equal(wsxga.maxTextureDimension2D, null);
+  assert.equal(wsxga.clampedToMaxTextureDimension, false);
+
+  // Real 4K monitor (1920x1080 @ 2.0 DPR or 3840x2160 @ 1.0 DPR) -> full 3840x2160
+  const fourK = computeDisplayNativeBounds({
+    screenWidth: 1920,
+    screenHeight: 1080,
+    devicePixelRatio: 2.0,
+    maxTextureDimension2D: 16384,
+  });
+  assert.equal(fourK.width, 3840);
+  assert.equal(fourK.height, 2160);
+  assert.equal(fourK.clampedToMaxTextureDimension, false);
+
+  // Exceeding WebGPU maxTextureDimension2D clamps cleanly to device limit
+  const capped = computeDisplayNativeBounds({
+    screenWidth: 5120,
+    screenHeight: 2880,
+    devicePixelRatio: 1.0,
+    maxTextureDimension2D: 4096,
+  });
+  assert.equal(capped.width, 4096);
+  assert.equal(capped.height, 2880);
+  assert.equal(capped.maxDisplayWidth, 4096);
+  assert.equal(capped.maxDisplayHeight, 2880);
+  assert.equal(capped.clampedToMaxTextureDimension, true);
+  assert.ok(Object.isFrozen(capped));
+
+  // Accepts screen object and defaults invalid/missing DPR to 1
+  const fromScreen = computeDisplayNativeBounds({
+    screen: { width: 1920, height: 1080 },
+    devicePixelRatio: -2,
+  });
+  assert.equal(fromScreen.width, 1920);
+  assert.equal(fromScreen.height, 1080);
+  assert.equal(fromScreen.devicePixelRatio, 1);
+
+  // Missing or non-positive screen dimensions safely return null
+  assert.equal(computeDisplayNativeBounds({}), null);
+  assert.equal(computeDisplayNativeBounds({ screenWidth: 0, screenHeight: 1080 }), null);
+  assert.equal(computeDisplayNativeBounds({ screenWidth: 1920, screenHeight: -10 }), null);
+  assert.equal(computeDisplayNativeBounds(null), null);
+
+  // resolvePerfProfile integrates displayNativeBounds when display dimensions are provided
+  const resolvedWithDisplay = resolvePerfProfile({
+    preset: 'low',
+    screenWidth: 1280,
+    screenHeight: 720,
+    devicePixelRatio: 1.5,
+    adapterLimits: { maxTextureDimension2D: 8192 },
+  });
+  assert.equal(resolvedWithDisplay.textureMipCap, 0);
+  assert.equal(resolvedWithDisplay.dprCap, null);
+  assert.equal(resolvedWithDisplay.preserveFullQuality, true);
+  assert.equal(resolvedWithDisplay.clampToDisplayResolution, true);
+  assert.equal(resolvedWithDisplay.clampToDisplayNative, true);
+  assert.equal(resolvedWithDisplay.displayNativeBounds.width, 1920);
+  assert.equal(resolvedWithDisplay.displayNativeBounds.height, 1080);
 });
 
 // ---------------------------------------------------------------------------
@@ -291,8 +414,11 @@ test('auto detection classifies low-end laptop, mid-range PC, and high-end works
   assert.equal(midRangePc.vramBudgetBytes, 3072 * MiB);
   assert.equal(midRangePc.ioSlabCacheBytes, 128 * MiB);
   assert.equal(midRangePc.ioMaxConcurrentLanes, 6);
-  assert.equal(midRangePc.textureMipCap, 1024);
-  assert.equal(midRangePc.dprCap, 1.0);
+  assert.equal(midRangePc.textureMipCap, 0);
+  assert.equal(midRangePc.dprCap, null);
+  assert.equal(midRangePc.preserveFullQuality, true);
+  assert.equal(midRangePc.clampToDisplayResolution, true);
+  assert.equal(midRangePc.clampToDisplayNative, true);
 
   // Integrated / low-power adapter on a 32 GB laptop caps auto to balanced (not high)
   const integratedLaptop = resolvePerfProfile({
@@ -325,7 +451,10 @@ test('auto detection classifies low-end laptop, mid-range PC, and high-end works
   assert.equal(workstation.ioSlabCacheBytes, 192 * MiB);
   assert.equal(workstation.ioMaxConcurrentLanes, 8);
   assert.equal(workstation.textureMipCap, 0);
-  assert.equal(workstation.dprCap, 2.0);
+  assert.equal(workstation.dprCap, null);
+  assert.equal(workstation.preserveFullQuality, true);
+  assert.equal(workstation.clampToDisplayResolution, true);
+  assert.equal(workstation.clampToDisplayNative, true);
 
   // Navigator fallback when explicit signals are omitted
   const fromNavigator = resolvePerfProfile({
@@ -420,6 +549,15 @@ test('query-string parsing and explicit/numeric overrides take proper precedence
   assert.ok(overridden.overridesApplied.includes('ioSlabCacheBytes'));
   assert.ok(overridden.overridesApplied.includes('rtPoolMaxBytes'));
   assert.ok(overridden.overridesApplied.includes('vramBudgetBytes'));
+
+  // Explicit caller opt-in for textureMipCap still works while default stays 0 (full quality)
+  const explicitMipCap = resolvePerfProfile({
+    preset: 'low',
+    textureMipCap: 512,
+  });
+  assert.equal(explicitMipCap.textureMipCap, 512);
+  assert.ok(explicitMipCap.overridesApplied.includes('textureMipCap'));
+  assert.equal(resolvePerfProfile({ preset: 'low' }).textureMipCap, 0);
 
   // coercePerfProfile validation
   assert.equal(coercePerfProfile('low').name, 'low');

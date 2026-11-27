@@ -33,6 +33,8 @@ const {
   isHdrStreamFormat,
   isSrgbFormat,
   isValidCanvasFormat,
+  normalizeDisplayBounds,
+  clampToDisplayBounds,
   normalizeExposure,
   normalizeToneMapMode,
 } = swapchainMod;
@@ -3535,4 +3537,331 @@ test('pre-encoded SDR passthrough (bgra8unorm, rgba8unorm) and HDR rgba16float c
     assert.equal(device.createdShaderModules[0].desc.code, BLIT_FULLSCREEN_WGSL);
     swapchain.destroy();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #2161: Display-native physical pixel clamping (full native sharpness,
+//              zero wasted unseen 4K backing buffers on 1080p / 1680x1050)
+// ---------------------------------------------------------------------------
+
+test('display-native clamping caps 4K requests cleanly to 1080p and aspect-preserving 1680x945 on 1680x1050 monitors', () => {
+  // 1) 4K (3840x2160) request on a 1080p (1920x1080 @ 1.0 DPR) monitor -> 1920x1080
+  {
+    const { canvas, context, device } = createMockWebGpuEnv();
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      maxDisplayWidth: 1920,
+      maxDisplayHeight: 1080,
+    });
+
+    const cfg = swapchain.configure({ width: 3840, height: 2160, devicePixelRatio: 1 });
+    assert.deepEqual(cfg, {
+      width: 1920,
+      height: 1080,
+      format: 'bgra8unorm',
+      depthFormat: 'depth24plus',
+      devicePixelRatio: 1,
+    });
+    assert.equal(canvas.width, 1920);
+    assert.equal(canvas.height, 1080);
+    assert.deepEqual(device.createdTextures[0].desc.size, {
+      width: 1920,
+      height: 1080,
+      depthOrArrayLayers: 1,
+    });
+
+    const stats = swapchain.getStats();
+    assert.equal(stats.clampedToDisplayCount, 1);
+    assert.equal(stats.requestedWidth, 3840);
+    assert.equal(stats.requestedHeight, 2160);
+    assert.equal(stats.backingWidth, 1920);
+    assert.equal(stats.backingHeight, 1080);
+    assert.deepEqual(stats.displayBounds, {
+      maxDisplayWidth: 1920,
+      maxDisplayHeight: 1080,
+      screenWidth: 1920,
+      screenHeight: 1080,
+      devicePixelRatio: 1,
+    });
+
+    // Repeated resize with same 4K request clamps to identical 1920x1080 -> strict no-op!
+    assert.equal(swapchain.resize(3840, 2160, 1), false);
+    assert.equal(context.configurations.length, 1);
+    assert.equal(device.createdTextures.length, 1);
+    assert.equal(swapchain.clampedToDisplayCount, 1);
+    assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 1);
+
+    swapchain.destroy();
+  }
+
+  // 2) 4K 16:9 (3840x2160) request on a 1680x1050 (16:10) monitor -> aspect-preserving 1680x945
+  {
+    const { canvas, context, device } = createMockWebGpuEnv();
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      screenWidth: 1680,
+      screenHeight: 1050,
+      dpr: 1,
+    });
+
+    swapchain.configure({ width: 3840, height: 2160, devicePixelRatio: 1 });
+    assert.equal(canvas.width, 1680);
+    assert.equal(canvas.height, 945);
+    assert.equal(swapchain.backingWidth, 1680);
+    assert.equal(swapchain.backingHeight, 945);
+    assert.equal(swapchain.requestedWidth, 3840);
+    assert.equal(swapchain.requestedHeight, 2160);
+    assert.deepEqual(device.createdTextures[0].desc.size, {
+      width: 1680,
+      height: 945,
+      depthOrArrayLayers: 1,
+    });
+    assert.equal(swapchain.getStats().clampedToDisplayCount, 1);
+    swapchain.destroy();
+  }
+});
+
+test('display-native clamping never upscales small canvases and never downscales below native display pixels', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    displayBounds: { maxDisplayWidth: 3840, maxDisplayHeight: 2160 },
+  });
+
+  // 1080p request on a 4K monitor -> untouched 1920x1080 (never upscaled, never clamped)
+  swapchain.configure({ width: 1920, height: 1080, devicePixelRatio: 1 });
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  let stats = swapchain.getStats();
+  assert.equal(stats.requestedWidth, 1920);
+  assert.equal(stats.requestedHeight, 1080);
+  assert.equal(stats.backingWidth, 1920);
+  assert.equal(stats.backingHeight, 1080);
+  assert.equal(stats.clampedToDisplayCount, 0);
+
+  // Small 800x600 canvas -> untouched 800x600
+  assert.equal(swapchain.resize(800, 600, 1), true);
+  assert.equal(canvas.width, 800);
+  assert.equal(canvas.height, 600);
+  assert.equal(swapchain.clampedToDisplayCount, 0);
+
+  // Exact native 4K request on 4K monitor -> untouched full 3840x2160
+  assert.equal(swapchain.resize(3840, 2160, 1), true);
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+  stats = swapchain.getStats();
+  assert.equal(stats.requestedWidth, 3840);
+  assert.equal(stats.requestedHeight, 2160);
+  assert.equal(stats.backingWidth, 3840);
+  assert.equal(stats.backingHeight, 2160);
+  assert.equal(stats.clampedToDisplayCount, 0);
+
+  swapchain.destroy();
+});
+
+test('display-native clamping handles HiDPI (1280x720 @ 1.5 DPR = 1920x1080) and PerfProfile computeDisplayNativeBounds integration', () => {
+  const { computeDisplayNativeBounds } = require('../web/workers/perf_profile.js');
+  const nativeBounds = computeDisplayNativeBounds({
+    screenWidth: 1280,
+    screenHeight: 720,
+    devicePixelRatio: 1.5,
+    maxTextureDimension2D: 8192,
+  });
+  assert.equal(nativeBounds.maxDisplayWidth, 1920);
+  assert.equal(nativeBounds.maxDisplayHeight, 1080);
+
+  // Passing computeDisplayNativeBounds directly must NOT double-multiply by DPR!
+  const { canvas, context, device } = createMockWebGpuEnv();
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    displayBounds: nativeBounds,
+  });
+
+  // Native 1280x720 @ 1.5 DPR request -> exact 1920x1080, unclamped
+  swapchain.configure({ width: 1280, height: 720, devicePixelRatio: 1.5 });
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.equal(swapchain.getStats().clampedToDisplayCount, 0);
+
+  // Oversized 4K request (2560x1440 @ 1.5 DPR = 3840x2160) -> clamped to exact 1920x1080
+  // Since backing size stays 1920x1080, resize() elides redundant GPU reconfigure!
+  assert.equal(swapchain.resize(2560, 1440, 1.5), false);
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.equal(swapchain.requestedWidth, 3840);
+  assert.equal(swapchain.requestedHeight, 2160);
+
+  // Starting fresh with screenWidth/screenHeight/dpr constructor shorthand on 1280x720 @ 1.5 DPR
+  const env2 = createMockWebGpuEnv();
+  const sc2 = new WgpuSwapchain({
+    canvas: env2.canvas,
+    device: env2.device,
+    context: env2.context,
+    format: 'bgra8unorm',
+    screenWidth: 1280,
+    screenHeight: 720,
+    dpr: 1.5,
+  });
+  sc2.configure({ width: 3840, height: 2160, devicePixelRatio: 1 });
+  assert.equal(env2.canvas.width, 1920);
+  assert.equal(env2.canvas.height, 1080);
+  assert.equal(sc2.getStats().clampedToDisplayCount, 1);
+  assert.deepEqual(sc2.displayBounds, {
+    maxDisplayWidth: 1920,
+    maxDisplayHeight: 1080,
+    screenWidth: 1280,
+    screenHeight: 720,
+    devicePixelRatio: 1.5,
+  });
+
+  swapchain.destroy();
+  sc2.destroy();
+});
+
+test('setDisplayBounds dynamically updates backing resolution across monitor changes and supports clearing/recovery', async () => {
+  const { canvas, context, device, makeDevice } = createMockWebGpuEnv();
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+  });
+
+  // Start on 4K monitor requesting 3840x2160 -> full 3840x2160
+  assert.equal(swapchain.setDisplayBounds(3840, 2160, 1), false); // unconfigured yet
+  swapchain.configure({ width: 3840, height: 2160, devicePixelRatio: 1 });
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+  assert.equal(swapchain.clampedToDisplayCount, 0);
+
+  const depthTex4k = device.createdTextures[0];
+
+  // Drag window to 1680x1050 @ 1.0 DPR monitor -> clamps immediately to 1680x945
+  assert.equal(swapchain.setDisplayBounds(1680, 1050, 1), true);
+  assert.equal(canvas.width, 1680);
+  assert.equal(canvas.height, 945);
+  assert.equal(depthTex4k.destroyed, true);
+  assert.deepEqual(device.createdTextures[1].desc.size, {
+    width: 1680,
+    height: 945,
+    depthOrArrayLayers: 1,
+  });
+  assert.equal(swapchain.requestedWidth, 3840);
+  assert.equal(swapchain.requestedHeight, 2160);
+  assert.equal(swapchain.clampedToDisplayCount, 1);
+  assert.equal(swapchain.getTelemetry().resizeCount, 1);
+
+  // Calling setDisplayBounds with equivalent HiDPI bounds yielding same backing size -> no-op
+  const configCountBefore = context.configurations.length;
+  assert.equal(swapchain.setDisplayBounds(840, 525, 2), false);
+  assert.equal(context.configurations.length, configCountBefore);
+
+  // Drag window onto a 1080p HiDPI laptop (1280x720 @ 1.5 DPR -> 1920x1080) -> re-clamps to 1920x1080
+  assert.equal(swapchain.setDisplayBounds(1280, 720, 1.5), true);
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.equal(swapchain.clampedToDisplayCount, 2);
+  assert.equal(swapchain.getTelemetry().resizeCount, 2);
+
+  // Drag window back to 4K monitor -> restores full 3840x2160 automatically from remembered requested dims!
+  assert.equal(swapchain.setDisplayBounds(3840, 2160, 1), true);
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+  assert.equal(swapchain.clampedToDisplayCount, 2); // unclamped restore
+
+  // Re-clamp to 1080p, verify resetStats() resets clampedToDisplayCount while keeping displayBounds,
+  // and verify recover() preserves display-native clamping on new GPUDevice.
+  assert.equal(swapchain.setDisplayBounds(1920, 1080, 1), true);
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.equal(swapchain.clampedToDisplayCount, 3);
+
+  swapchain.resetStats();
+  assert.equal(swapchain.getStats().clampedToDisplayCount, 0);
+  assert.equal(swapchain.displayBounds.maxDisplayWidth, 1920);
+  assert.equal(swapchain.backingWidth, 1920);
+  assert.equal(swapchain.requestedWidth, 3840);
+
+  device.triggerLost({ reason: 'unknown', message: 'reset' });
+  await device.lost;
+  await Promise.resolve();
+
+  const newDevice = makeDevice('device-1');
+  swapchain.recover(newDevice);
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.deepEqual(newDevice.createdTextures[0].desc.size, {
+    width: 1920,
+    height: 1080,
+    depthOrArrayLayers: 1,
+  });
+
+  // Clearing displayBounds with null restores full requested 3840x2160
+  assert.equal(swapchain.setDisplayBounds(null), true);
+  assert.equal(swapchain.displayBounds, null);
+  assert.equal(swapchain.getStats().displayBounds, null);
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+
+  swapchain.destroy();
+});
+
+test('display-native clamping preserves full backward compatibility when unset and validates invalid inputs', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+  });
+
+  assert.equal(swapchain.displayBounds, null);
+  swapchain.configure({ width: 3840, height: 2160, devicePixelRatio: 1 });
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+
+  const stats = swapchain.getStats();
+  assert.equal(stats.displayBounds, null);
+  assert.equal(stats.clampedToDisplayCount, 0);
+  assert.equal(stats.requestedWidth, 3840);
+  assert.equal(stats.requestedHeight, 2160);
+  assert.equal(stats.backingWidth, 3840);
+  assert.equal(stats.backingHeight, 2160);
+
+  // Pure helper edge checks
+  assert.deepEqual(clampToDisplayBounds(3840, 2160, null), {
+    width: 3840,
+    height: 2160,
+    clamped: false,
+  });
+  assert.deepEqual(
+    clampToDisplayBounds(3840, 2160, { maxDisplayWidth: 1680, maxDisplayHeight: 1050 }),
+    { width: 1680, height: 945, clamped: true }
+  );
+  assert.deepEqual(
+    clampToDisplayBounds(2560, 2560, { maxDisplayWidth: 1920, maxDisplayHeight: 1080 }),
+    { width: 1080, height: 1080, clamped: true }
+  );
+
+  // Validation errors on malformed bounds
+  assert.throws(() => normalizeDisplayBounds('1920x1080'), TypeError);
+  assert.throws(() => normalizeDisplayBounds({}), RangeError);
+  assert.throws(() => normalizeDisplayBounds({ maxDisplayWidth: -1, maxDisplayHeight: 1080 }), RangeError);
+  assert.throws(() => swapchain.setDisplayBounds(0, 1080, 1), RangeError);
+  assert.throws(() => swapchain.setDisplayBounds(1920, 1080, -1), RangeError);
+
+  swapchain.destroy();
+  assert.throws(() => swapchain.setDisplayBounds(1920, 1080, 1), /destroyed/i);
 });

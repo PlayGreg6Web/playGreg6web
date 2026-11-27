@@ -505,6 +505,191 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     return scaled;
   }
 
+  function validatePositiveDisplayNumber(value, label) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`${label} must be a positive finite number, got ${value}`);
+    }
+    return value;
+  }
+
+  function normalizeDisplayBounds(input, fallbackDpr = 1) {
+    if (input === null || input === undefined) {
+      return null;
+    }
+    if (typeof input !== 'object') {
+      throw new TypeError('displayBounds must be an object or null');
+    }
+
+    if (input.maxDisplayWidth !== undefined || input.maxDisplayHeight !== undefined) {
+      const maxW = Math.max(
+        1,
+        Math.round(validatePositiveDisplayNumber(input.maxDisplayWidth, 'maxDisplayWidth'))
+      );
+      const maxH = Math.max(
+        1,
+        Math.round(validatePositiveDisplayNumber(input.maxDisplayHeight, 'maxDisplayHeight'))
+      );
+      const rawDpr =
+        input.devicePixelRatio !== undefined
+          ? input.devicePixelRatio
+          : input.dpr !== undefined
+            ? input.dpr
+            : null;
+      const dpr =
+        typeof rawDpr === 'number' && Number.isFinite(rawDpr) && rawDpr > 0 ? rawDpr : 1;
+      const screenWidth =
+        typeof input.screenWidth === 'number' &&
+        Number.isFinite(input.screenWidth) &&
+        input.screenWidth > 0
+          ? input.screenWidth
+          : maxW;
+      const screenHeight =
+        typeof input.screenHeight === 'number' &&
+        Number.isFinite(input.screenHeight) &&
+        input.screenHeight > 0
+          ? input.screenHeight
+          : maxH;
+      return {
+        maxDisplayWidth: maxW,
+        maxDisplayHeight: maxH,
+        screenWidth,
+        screenHeight,
+        devicePixelRatio: dpr,
+      };
+    }
+
+    if (input.screenWidth !== undefined || input.screenHeight !== undefined) {
+      const screenWidth = validatePositiveDisplayNumber(input.screenWidth, 'screenWidth');
+      const screenHeight = validatePositiveDisplayNumber(input.screenHeight, 'screenHeight');
+      const rawDpr =
+        input.devicePixelRatio !== undefined
+          ? input.devicePixelRatio
+          : input.dpr !== undefined
+            ? input.dpr
+            : fallbackDpr;
+      const dpr =
+        rawDpr === undefined || rawDpr === null
+          ? 1
+          : validatePositiveDisplayNumber(rawDpr, 'devicePixelRatio');
+      return {
+        maxDisplayWidth: Math.max(1, Math.round(screenWidth * dpr)),
+        maxDisplayHeight: Math.max(1, Math.round(screenHeight * dpr)),
+        screenWidth,
+        screenHeight,
+        devicePixelRatio: dpr,
+      };
+    }
+
+    if (input.width !== undefined || input.height !== undefined) {
+      const maxW = Math.max(
+        1,
+        Math.round(validatePositiveDisplayNumber(input.width, 'displayBounds.width'))
+      );
+      const maxH = Math.max(
+        1,
+        Math.round(validatePositiveDisplayNumber(input.height, 'displayBounds.height'))
+      );
+      return {
+        maxDisplayWidth: maxW,
+        maxDisplayHeight: maxH,
+        screenWidth: maxW,
+        screenHeight: maxH,
+        devicePixelRatio: 1,
+      };
+    }
+
+    throw new RangeError(
+      'displayBounds must provide positive maxDisplayWidth/maxDisplayHeight, screenWidth/screenHeight, or width/height'
+    );
+  }
+
+  function extractDisplayBoundsOption(options, allowDevicePixelRatioFallback = false) {
+    if (!options || typeof options !== 'object') {
+      return { provided: false, bounds: null };
+    }
+    if (options.displayBounds !== undefined) {
+      return { provided: true, bounds: normalizeDisplayBounds(options.displayBounds) };
+    }
+    if (options.maxDisplayWidth !== undefined || options.maxDisplayHeight !== undefined) {
+      return {
+        provided: true,
+        bounds: normalizeDisplayBounds({
+          maxDisplayWidth: options.maxDisplayWidth,
+          maxDisplayHeight: options.maxDisplayHeight,
+        }),
+      };
+    }
+    if (options.screenWidth !== undefined || options.screenHeight !== undefined) {
+      const rawDpr =
+        options.displayDevicePixelRatio !== undefined
+          ? options.displayDevicePixelRatio
+          : options.screenDpr !== undefined
+            ? options.screenDpr
+            : options.dpr !== undefined
+              ? options.dpr
+              : allowDevicePixelRatioFallback && options.devicePixelRatio !== undefined
+                ? options.devicePixelRatio
+                : 1;
+      return {
+        provided: true,
+        bounds: normalizeDisplayBounds({
+          screenWidth: options.screenWidth,
+          screenHeight: options.screenHeight,
+          devicePixelRatio: rawDpr,
+        }),
+      };
+    }
+    return { provided: false, bounds: null };
+  }
+
+  /**
+   * Proportionally clamp requested backing dimensions to fit within the physical
+   * display pixel ceiling (`maxDisplayWidth x maxDisplayHeight`), preserving aspect
+   * ratio. Never upscales small canvases and never downscales requests that already
+   * fit within the native display resolution.
+   *
+   * @param {number} requestedWidth
+   * @param {number} requestedHeight
+   * @param {{ maxDisplayWidth: number, maxDisplayHeight: number } | null | undefined} displayBounds
+   * @param {number} [maxDimension]
+   * @returns {{ width: number, height: number, clamped: boolean }}
+   */
+  function clampToDisplayBounds(requestedWidth, requestedHeight, displayBounds, maxDimension) {
+    const reqW = Math.max(1, Math.round(requestedWidth));
+    const reqH = Math.max(1, Math.round(requestedHeight));
+    if (
+      !displayBounds ||
+      typeof displayBounds !== 'object' ||
+      !Number.isFinite(displayBounds.maxDisplayWidth) ||
+      !Number.isFinite(displayBounds.maxDisplayHeight) ||
+      displayBounds.maxDisplayWidth < 1 ||
+      displayBounds.maxDisplayHeight < 1
+    ) {
+      return { width: reqW, height: reqH, clamped: false };
+    }
+
+    let limitW = Math.floor(displayBounds.maxDisplayWidth);
+    let limitH = Math.floor(displayBounds.maxDisplayHeight);
+    if (typeof maxDimension === 'number' && Number.isFinite(maxDimension) && maxDimension >= 1) {
+      const cap = Math.floor(maxDimension);
+      limitW = Math.min(limitW, cap);
+      limitH = Math.min(limitH, cap);
+    }
+
+    if (reqW <= limitW && reqH <= limitH) {
+      return { width: reqW, height: reqH, clamped: false };
+    }
+
+    const scale = Math.min(limitW / reqW, limitH / reqH);
+    const width = Math.max(1, Math.min(limitW, Math.round(reqW * scale)));
+    const height = Math.max(1, Math.min(limitH, Math.round(reqH * scale)));
+    return {
+      width,
+      height,
+      clamped: width < reqW || height < reqH,
+    };
+  }
+
   function normalizeClearColor(clearColor) {
     if (!clearColor) {
       return { ...DEFAULT_CLEAR_COLOR };
@@ -732,6 +917,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       const resolvedToneMapMode = normalizeToneMapMode(toneMapMode);
       const resolvedExposure = normalizeExposure(exposure);
       const resolvedApplySrgbEncode = normalizeApplySrgbEncode(applySrgbEncode);
+      const initialDisplayBounds = extractDisplayBoundsOption(options, true);
 
       const preferredCanvasFormat = resolvePreferredCanvasFormat();
       let resolvedCanvasFormat = preferredCanvasFormat;
@@ -808,6 +994,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       this._width = 0;
       this._height = 0;
+      this._requestedWidth = 0;
+      this._requestedHeight = 0;
+      this._displayBounds = initialDisplayBounds.provided ? initialDisplayBounds.bounds : null;
+      this._clampedToDisplayCount = 0;
       this._devicePixelRatio = 1;
       this._configured = false;
       this._destroyed = false;
@@ -958,6 +1148,30 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     get height() {
       return this._height;
+    }
+
+    get backingWidth() {
+      return this._width;
+    }
+
+    get backingHeight() {
+      return this._height;
+    }
+
+    get requestedWidth() {
+      return this._requestedWidth;
+    }
+
+    get requestedHeight() {
+      return this._requestedHeight;
+    }
+
+    get displayBounds() {
+      return this._displayBounds ? { ...this._displayBounds } : null;
+    }
+
+    get clampedToDisplayCount() {
+      return this._clampedToDisplayCount;
     }
 
     get format() {
@@ -1968,8 +2182,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       if (this._configured && this._width > 0 && this._height > 0) {
         const maxDim = this._effectiveMaxDimension();
-        this._width = Math.min(this._width, maxDim);
-        this._height = Math.min(this._height, maxDim);
+        const reqW = Math.min(this._requestedWidth > 0 ? this._requestedWidth : this._width, maxDim);
+        const reqH = Math.min(this._requestedHeight > 0 ? this._requestedHeight : this._height, maxDim);
+        const clamped = clampToDisplayBounds(reqW, reqH, this._displayBounds, maxDim);
+        this._requestedWidth = reqW;
+        this._requestedHeight = reqH;
+        this._width = clamped.width;
+        this._height = clamped.height;
         this._applyContextConfiguration();
       }
       return true;
@@ -2417,10 +2636,14 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         config.droppedFrameThresholdMs !== undefined
           ? normalizeDroppedFrameThresholdMs(config.droppedFrameThresholdMs)
           : undefined;
+      const displayBoundsUpdate = extractDisplayBoundsOption(config, true);
 
       const wasConfigured = this._configured;
       const prevWidth = this._width;
       const prevHeight = this._height;
+      const prevRequestedWidth = this._requestedWidth;
+      const prevRequestedHeight = this._requestedHeight;
+      const prevDisplayBounds = this._displayBounds;
       const prevFormat = this._format;
       const prevStreamFormat = this._streamFormat;
       const prevUsesBlit = this._usesBlitFallback;
@@ -2525,21 +2748,38 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       if (nextDroppedFrameThresholdMs !== undefined) {
         this._droppedFrameThresholdMs = nextDroppedFrameThresholdMs;
       }
+      if (displayBoundsUpdate.provided) {
+        this._displayBounds = displayBoundsUpdate.bounds;
+      }
 
       const dpr = config.devicePixelRatio !== undefined ? config.devicePixelRatio : 1;
       const maxDim = this._effectiveMaxDimension();
-      const nextWidth =
-        config.width === undefined && wasConfigured && prevWidth > 0
-          ? Math.min(prevWidth, maxDim)
-          : clampDimension(config.width, dpr, maxDim);
-      const nextHeight =
-        config.height === undefined && wasConfigured && prevHeight > 0
-          ? Math.min(prevHeight, maxDim)
-          : clampDimension(config.height, dpr, maxDim);
+      const nextRequestedWidth =
+        config.width === undefined && wasConfigured && prevRequestedWidth > 0
+          ? Math.min(prevRequestedWidth, maxDim)
+          : config.width === undefined && wasConfigured && prevWidth > 0
+            ? Math.min(prevWidth, maxDim)
+            : clampDimension(config.width, dpr, maxDim);
+      const nextRequestedHeight =
+        config.height === undefined && wasConfigured && prevRequestedHeight > 0
+          ? Math.min(prevRequestedHeight, maxDim)
+          : config.height === undefined && wasConfigured && prevHeight > 0
+            ? Math.min(prevHeight, maxDim)
+            : clampDimension(config.height, dpr, maxDim);
+      const clampedDims = clampToDisplayBounds(
+        nextRequestedWidth,
+        nextRequestedHeight,
+        this._displayBounds,
+        maxDim
+      );
+      const nextWidth = clampedDims.width;
+      const nextHeight = clampedDims.height;
 
       const dimensionsChanged =
         wasConfigured && (nextWidth !== prevWidth || nextHeight !== prevHeight);
 
+      this._requestedWidth = nextRequestedWidth;
+      this._requestedHeight = nextRequestedHeight;
       this._width = nextWidth;
       this._height = nextHeight;
       this._devicePixelRatio =
@@ -2585,7 +2825,15 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           this._explicitUsage = prevExplicitUsage;
           this._usage = prevUsage;
           this._copySrcSupported = prevCopySrcSupported;
+          this._displayBounds = prevDisplayBounds;
+          this._requestedWidth = prevRequestedWidth;
+          this._requestedHeight = prevRequestedHeight;
+          this._width = prevWidth;
+          this._height = prevHeight;
           throw err;
+        }
+        if (clampedDims.clamped) {
+          this._clampedToDisplayCount += 1;
         }
         if (dimensionsChanged) {
           this._resizeCount += 1;
@@ -2609,9 +2857,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
      * @param {number} cssWidth
      * @param {number} cssHeight
      * @param {number} [devicePixelRatio=1]
+     * @param {object} [displayOptions]
      * @returns {boolean} True if swapchain was reconfigured, false on no-op or invalid input.
      */
-    resize(cssWidth, cssHeight, devicePixelRatio = 1) {
+    resize(cssWidth, cssHeight, devicePixelRatio = 1, displayOptions) {
       if (this._destroyed) {
         throw new Error('Cannot resize a destroyed WgpuSwapchain');
       }
@@ -2630,6 +2879,14 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         return false;
       }
 
+      const displayBoundsUpdate =
+        displayOptions !== undefined
+          ? extractDisplayBoundsOption(displayOptions, true)
+          : { provided: false, bounds: null };
+      const effectiveDisplayBounds = displayBoundsUpdate.provided
+        ? displayBoundsUpdate.bounds
+        : this._displayBounds;
+
       const effectiveDpr =
         typeof devicePixelRatio === 'number' &&
         !Number.isNaN(devicePixelRatio) &&
@@ -2637,8 +2894,16 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           ? devicePixelRatio
           : 1;
       const maxDim = this._effectiveMaxDimension();
-      const nextWidth = clampDimension(cssWidth, effectiveDpr, maxDim);
-      const nextHeight = clampDimension(cssHeight, effectiveDpr, maxDim);
+      const requestedWidth = clampDimension(cssWidth, effectiveDpr, maxDim);
+      const requestedHeight = clampDimension(cssHeight, effectiveDpr, maxDim);
+      const clamped = clampToDisplayBounds(
+        requestedWidth,
+        requestedHeight,
+        effectiveDisplayBounds,
+        maxDim
+      );
+      const nextWidth = clamped.width;
+      const nextHeight = clamped.height;
 
       if (
         this._configured &&
@@ -2648,15 +2913,91 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         nextWidth === this._width &&
         nextHeight === this._height
       ) {
+        if (displayBoundsUpdate.provided) {
+          this._displayBounds = effectiveDisplayBounds;
+        }
+        this._requestedWidth = requestedWidth;
+        this._requestedHeight = requestedHeight;
         this._skippedRedundantReconfigures += 1;
         return false;
       }
 
-      this.configure({
+      const nextConfig = {
         width: cssWidth,
         height: cssHeight,
         devicePixelRatio: effectiveDpr,
-      });
+      };
+      if (displayBoundsUpdate.provided) {
+        nextConfig.displayBounds = effectiveDisplayBounds;
+      }
+      this.configure(nextConfig);
+      return true;
+    }
+
+    /**
+     * Update (or clear with `null`) the physical display pixel ceiling used to clamp
+     * oversized swapchain requests proportionally to native monitor resolution.
+     *
+     * Supports:
+     * - `setDisplayBounds(screenWidth, screenHeight, dpr = 1)`
+     * - `setDisplayBounds({ screenWidth, screenHeight, devicePixelRatio })`
+     * - `setDisplayBounds({ maxDisplayWidth, maxDisplayHeight })`
+     * - `setDisplayBounds(null)` to disable display-native clamping
+     *
+     * When already configured, re-clamps the last requested backing dimensions against the
+     * new display bounds and reconfigures only if the effective backing dimensions change.
+     *
+     * @param {number | object | null | undefined} screenWidthOrBounds
+     * @param {number} [screenHeight]
+     * @param {number} [dpr=1]
+     * @returns {boolean} True if active swapchain backing dimensions changed and reconfigured.
+     */
+    setDisplayBounds(screenWidthOrBounds, screenHeight, dpr = 1) {
+      if (this._destroyed) {
+        throw new Error('Cannot set display bounds on a destroyed WgpuSwapchain');
+      }
+
+      let nextBounds;
+      if (screenWidthOrBounds === null || screenWidthOrBounds === undefined) {
+        nextBounds = null;
+      } else if (typeof screenWidthOrBounds === 'object') {
+        nextBounds = normalizeDisplayBounds(screenWidthOrBounds);
+      } else {
+        nextBounds = normalizeDisplayBounds({
+          screenWidth: screenWidthOrBounds,
+          screenHeight,
+          devicePixelRatio: dpr,
+        });
+      }
+
+      this._displayBounds = nextBounds;
+
+      if (
+        !this._configured ||
+        this._isDeviceLost ||
+        this._requestedWidth < 1 ||
+        this._requestedHeight < 1
+      ) {
+        return false;
+      }
+
+      const maxDim = this._effectiveMaxDimension();
+      const reqW = Math.min(this._requestedWidth, maxDim);
+      const reqH = Math.min(this._requestedHeight, maxDim);
+      const clamped = clampToDisplayBounds(reqW, reqH, this._displayBounds, maxDim);
+
+      if (clamped.width === this._width && clamped.height === this._height) {
+        this._skippedRedundantReconfigures += 1;
+        return false;
+      }
+
+      this._width = clamped.width;
+      this._height = clamped.height;
+      this._applyContextConfiguration();
+      this._resizeCount += 1;
+      if (clamped.clamped) {
+        this._clampedToDisplayCount += 1;
+      }
       return true;
     }
 
@@ -3435,6 +3776,12 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         fps30ComplianceRate: this._fps30ComplianceRate,
         frameJitterMs: this._frameJitterMs,
         longestStallMs: this._longestStallMs,
+        clampedToDisplayCount: this._clampedToDisplayCount,
+        displayBounds: this._displayBounds ? { ...this._displayBounds } : null,
+        requestedWidth: this._requestedWidth,
+        requestedHeight: this._requestedHeight,
+        backingWidth: this._width,
+        backingHeight: this._height,
       };
     }
 
@@ -3484,6 +3831,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._toneMapBlitCount = 0;
       this._toneMapUniformUploads = 0;
       this._viewFormatsFallbackCount = 0;
+      this._clampedToDisplayCount = 0;
 
       this._validationErrors.length = 0;
       this._validationErrorCount = 0;
@@ -3579,8 +3927,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       if (this._configured && this._width > 0 && this._height > 0) {
         const maxDim = this._effectiveMaxDimension();
-        this._width = Math.min(this._width, maxDim);
-        this._height = Math.min(this._height, maxDim);
+        const reqW = Math.min(this._requestedWidth > 0 ? this._requestedWidth : this._width, maxDim);
+        const reqH = Math.min(this._requestedHeight > 0 ? this._requestedHeight : this._height, maxDim);
+        const clamped = clampToDisplayBounds(reqW, reqH, this._displayBounds, maxDim);
+        this._requestedWidth = reqW;
+        this._requestedHeight = reqH;
+        this._width = clamped.width;
+        this._height = clamped.height;
         this._applyContextConfiguration();
       }
 
@@ -3666,6 +4019,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     isHdrStreamFormat,
     normalizeToneMapMode,
     normalizeExposure,
+    normalizeDisplayBounds,
+    clampToDisplayBounds,
     getCompatibleViewFormats,
     WgpuSwapchain,
   };

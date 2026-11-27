@@ -34,8 +34,11 @@
       gcDeferFrames: 2,
       ioSlabCacheBytes: 64 * MiB,
       ioMaxConcurrentLanes: 4,
-      textureMipCap: 512,
-      dprCap: 1.0,
+      textureMipCap: 0,
+      dprCap: null,
+      preserveFullQuality: true,
+      clampToDisplayResolution: true,
+      clampToDisplayNative: true,
       prewarmMaxInFlight: 1,
       shaderCompileConcurrency: 1,
     }),
@@ -49,8 +52,11 @@
       gcDeferFrames: 2,
       ioSlabCacheBytes: 128 * MiB,
       ioMaxConcurrentLanes: 6,
-      textureMipCap: 1024,
-      dprCap: 1.0,
+      textureMipCap: 0,
+      dprCap: null,
+      preserveFullQuality: true,
+      clampToDisplayResolution: true,
+      clampToDisplayNative: true,
       prewarmMaxInFlight: 2,
       shaderCompileConcurrency: 2,
     }),
@@ -65,7 +71,10 @@
       ioSlabCacheBytes: 192 * MiB,
       ioMaxConcurrentLanes: 8,
       textureMipCap: 0,
-      dprCap: 2.0,
+      dprCap: null,
+      preserveFullQuality: true,
+      clampToDisplayResolution: true,
+      clampToDisplayNative: true,
       prewarmMaxInFlight: 4,
       shaderCompileConcurrency: 4,
     }),
@@ -112,6 +121,13 @@
     },
     { field: 'textureMipCap', keys: ['textureMipCap'], type: 'nonNegativeInt' },
     { field: 'dprCap', keys: ['dprCap'], type: 'positiveFloat' },
+    { field: 'preserveFullQuality', keys: ['preserveFullQuality'], type: 'boolean' },
+    {
+      field: 'clampToDisplayResolution',
+      keys: ['clampToDisplayResolution'],
+      type: 'boolean',
+    },
+    { field: 'clampToDisplayNative', keys: ['clampToDisplayNative'], type: 'boolean' },
     { field: 'prewarmMaxInFlight', keys: ['prewarmMaxInFlight'], type: 'positiveInt' },
     {
       field: 'shaderCompileConcurrency',
@@ -261,9 +277,120 @@
     return value;
   }
 
+  /**
+   * Compute the exact physical pixel dimensions of the user's display
+   * (`screenWidth * devicePixelRatio` by `screenHeight * devicePixelRatio`),
+   * optionally clamped to WebGPU `maxTextureDimension2D`.
+   *
+   * Returns `null` when valid positive display dimensions are not provided.
+   *
+   * @param {{
+   *   screenWidth?: number,
+   *   screenHeight?: number,
+   *   devicePixelRatio?: number,
+   *   dpr?: number,
+   *   maxTextureDimension2D?: number | null,
+   *   screen?: { width?: number, height?: number } | null,
+   * }} [options]
+   * @returns {Readonly<{
+   *   width: number,
+   *   height: number,
+   *   maxDisplayWidth: number,
+   *   maxDisplayHeight: number,
+   *   screenWidth: number,
+   *   screenHeight: number,
+   *   devicePixelRatio: number,
+   *   maxTextureDimension2D: number | null,
+   *   clampedToMaxTextureDimension: boolean,
+   * }> | null}
+   */
+  function computeDisplayNativeBounds(options = {}) {
+    if (!options || typeof options !== 'object') {
+      return null;
+    }
+
+    const screenObj = options.screen && typeof options.screen === 'object' ? options.screen : null;
+    const rawWidth =
+      options.screenWidth !== undefined
+        ? options.screenWidth
+        : screenObj && screenObj.width !== undefined
+          ? screenObj.width
+          : null;
+    const rawHeight =
+      options.screenHeight !== undefined
+        ? options.screenHeight
+        : screenObj && screenObj.height !== undefined
+          ? screenObj.height
+          : null;
+
+    const screenWidth = sanitizePositiveNumber(
+      rawWidth !== null && rawWidth !== undefined ? Number(rawWidth) : null
+    );
+    const screenHeight = sanitizePositiveNumber(
+      rawHeight !== null && rawHeight !== undefined ? Number(rawHeight) : null
+    );
+    if (screenWidth === null || screenHeight === null) {
+      return null;
+    }
+
+    const rawDpr =
+      options.devicePixelRatio !== undefined
+        ? options.devicePixelRatio
+        : options.dpr !== undefined
+          ? options.dpr
+          : 1;
+    const parsedDpr = sanitizePositiveNumber(
+      rawDpr !== null && rawDpr !== undefined ? Number(rawDpr) : null
+    );
+    const devicePixelRatio = parsedDpr !== null ? parsedDpr : 1;
+
+    const rawMaxDim =
+      options.maxTextureDimension2D !== undefined
+        ? options.maxTextureDimension2D
+        : options.maxDimension;
+    const parsedMaxDim = sanitizePositiveNumber(
+      rawMaxDim !== null && rawMaxDim !== undefined ? Number(rawMaxDim) : null
+    );
+    const maxTextureDimension2D =
+      parsedMaxDim !== null && Math.floor(parsedMaxDim) >= 1 ? Math.floor(parsedMaxDim) : null;
+
+    const physicalWidth = Math.max(1, Math.round(screenWidth * devicePixelRatio));
+    const physicalHeight = Math.max(1, Math.round(screenHeight * devicePixelRatio));
+
+    let width = physicalWidth;
+    let height = physicalHeight;
+    let clampedToMaxTextureDimension = false;
+
+    if (maxTextureDimension2D !== null) {
+      if (width > maxTextureDimension2D) {
+        width = maxTextureDimension2D;
+        clampedToMaxTextureDimension = true;
+      }
+      if (height > maxTextureDimension2D) {
+        height = maxTextureDimension2D;
+        clampedToMaxTextureDimension = true;
+      }
+    }
+
+    return Object.freeze({
+      width,
+      height,
+      maxDisplayWidth: width,
+      maxDisplayHeight: height,
+      screenWidth,
+      screenHeight,
+      devicePixelRatio,
+      maxTextureDimension2D,
+      clampedToMaxTextureDimension,
+    });
+  }
+
   function sanitizeOverrideValue(raw, type) {
     if (raw === undefined || raw === null) {
       return null;
+    }
+    if (type === 'boolean') {
+      return typeof raw === 'boolean' ? raw : null;
     }
     const num = Number(raw);
     if (!Number.isFinite(num)) {
@@ -515,6 +642,9 @@
       ioMaxConcurrentLanes: base.ioMaxConcurrentLanes,
       textureMipCap: base.textureMipCap,
       dprCap: base.dprCap,
+      preserveFullQuality: base.preserveFullQuality,
+      clampToDisplayResolution: base.clampToDisplayResolution,
+      clampToDisplayNative: base.clampToDisplayNative,
       prewarmMaxInFlight: base.prewarmMaxInFlight,
       shaderCompileConcurrency: base.shaderCompileConcurrency,
     };
@@ -551,6 +681,19 @@
       resolved.vramReclaimTargetRatio = resolved.vramReclaimTriggerRatio;
     }
 
+    const displayNativeBounds = computeDisplayNativeBounds({
+      screenWidth: opts.screenWidth,
+      screenHeight: opts.screenHeight,
+      devicePixelRatio:
+        opts.devicePixelRatio !== undefined ? opts.devicePixelRatio : opts.dpr,
+      screen: opts.screen,
+      maxTextureDimension2D:
+        opts.maxTextureDimension2D !== undefined
+          ? opts.maxTextureDimension2D
+          : hardware.maxTextureDimension2D,
+    });
+
+    resolved.displayNativeBounds = displayNativeBounds;
     resolved.reasons = Object.freeze(reasons.slice());
     resolved.hardware = hardware;
     resolved.overridesApplied = Object.freeze(overridesApplied);
@@ -598,6 +741,7 @@
     normalizePresetName,
     parsePerfProfileFromQuery,
     classifyAdapterInfo,
+    computeDisplayNativeBounds,
     resolvePerfProfile,
     coercePerfProfile,
   });
