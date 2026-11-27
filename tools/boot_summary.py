@@ -132,6 +132,28 @@ def frame_time_lines(report: dict[str, Any]) -> list[str]:
     return out
 
 
+def _gpu_table_phase_lines(title: str, table: dict[str, Any]) -> list[str]:
+    phases = [p for p in (table.get("phases") or []) if isinstance(p, dict)]
+    whole = sum(int(_n(e.get("draws")) + _n(e.get("dispatches"))) for e in (table.get("entries") or []) if isinstance(e, dict))
+    whole += int(_n(_d(table.get("other")).get("draws")) + _n(_d(table.get("other")).get("dispatches")))
+    if not phases or whole == 0:
+        return []
+    out = [f"{title} (whole run {whole}; per draws/frame phase, attributed to the previous frame's regime):"]
+    for p in phases:
+        ents = [e for e in (p.get("entries") or []) if isinstance(e, dict)][:3]
+        top = ", ".join(f"{e.get('hash')} x{int(_n(e.get('draws')) + _n(e.get('dispatches')))}" for e in ents)
+        out.append(f"  {str(p.get('name')):<16} {_i(p.get('draws')):>8} draws {_i(p.get('dispatches')):>6} dispatches"
+                   f"  {top}")
+    return out
+
+
+def gpu_phase_lines(report: dict[str, Any]) -> list[str]:
+    """Per-phase gpu_drop_table (draws lost) and binding_fallbacks (draws that bound a null/dummy resource:
+    unresolved sidecar entry or empty slot; not dropped, the picture may be wrong)."""
+    return (_gpu_table_phase_lines("gpu drops", _d(report.get("gpu_drop_table"))) +
+            _gpu_table_phase_lines("binding fallbacks", _d(report.get("binding_fallbacks"))))
+
+
 def frame_time_summary(report: dict[str, Any]) -> dict[str, float] | None:
     """The `all` phase of `frame_times`: {low1_fps, low01_fps, missed_vblanks, late_pct}, None if absent."""
     for p in _d(report.get("frame_times")).get("phases") or []:
@@ -271,6 +293,7 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
         L.append(f"fps: p1 {f['p1']:.1f}  p5 {f['p5']:.1f}  p50 {f['p50']:.1f}  p95 {f['p95']:.1f} "
                  f"({int(f['n'])} samples)")
     L += frame_time_lines(report)
+    L += gpu_phase_lines(report)
     if report.get("present_fps_avg") is not None:
         L.append(f"browser fps: avg {_n(report.get('present_fps_avg')):.1f}, steady {_n(report.get('fps_steady_avg')):.1f}, "
                  f"p50 window {_n(report.get('fps_p50_window')):.1f}, max window {_n(report.get('fps_max_window')):.1f}, "

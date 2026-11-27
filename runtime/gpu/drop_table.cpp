@@ -24,6 +24,7 @@ uint64_t sum(const uint64_t* a) {
     }
     return t;
 }
+const char* reason_name_idx(size_t i) { return DropTable::reason_name(static_cast<DropTable::Reason>(i)); }
 std::string reasons_json(const DropTable::Counts& c) {
     std::string o = "{";
     bool first = true;
@@ -65,9 +66,11 @@ std::string DropTable::by_program_json() const {
 
 std::string DropTable::detail_json() const {
     Counts other;
+    std::string phases;
     {
         std::lock_guard<std::mutex> lock(mu_);
         other = other_;
+        phases = phases_.json(&reason_name_idx);
     }
     std::string o = "{\"tracked\": " + std::to_string(tracked()) + ", \"max_hashes\": " + std::to_string(kMaxHashes) +
                     ", \"other\": {\"draws\": " + std::to_string(sum(other.draws)) +
@@ -80,7 +83,7 @@ std::string DropTable::detail_json() const {
              ", \"reasons\": " + reasons_json(e.second) + "}";
         first = false;
     }
-    return o + "]}";
+    return o + "], \"phases\": " + phases + "}";
 }
 
 }  // namespace playgta6::gpu::d3d12_guest

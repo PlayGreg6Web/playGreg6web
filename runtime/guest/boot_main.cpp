@@ -109,6 +109,7 @@
 
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/rt_arena.h"
+#include "gpu/binding_fallbacks.h"
 #include "gpu/drop_table.h"
 #include "gpu/pipeline_prewarm_host.h"
 #include "gpu/gpu_time.h"
@@ -1668,6 +1669,7 @@ int main(int argc, char** argv) {
             // (--window); "available": false with the reason when nothing was measured.
             o += ",\n  \"gpu_time\": " + dg::gpu_time_table().json();
             o += ",\n  \"gpu_drop_table\": " + dg::drop_table().detail_json();
+            o += ",\n  \"binding_fallbacks\": " + dg::binding_fallback_table().detail_json();
             {
                 namespace ar = os::audio_report;
                 const os::scarlett::guest_api::AudioEndpointStats a = os::scarlett::guest_api::audio_endpoint_stats();

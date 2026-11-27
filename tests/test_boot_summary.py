@@ -86,6 +86,20 @@ class BootSummaryTest(unittest.TestCase):
         self.assertAlmostEqual(s["late_pct"], 3.0)
         self.assertNotIn("frame times", bs.summarize(base() | {"frame_times": {"phases": []}}))
 
+    def test_gpu_phase_tables_printed(self):
+        r = base()
+        r["gpu_drop_table"] = {"entries": [{"hash": "0x1", "draws": 5, "dispatches": 0}], "other": {},
+                               "phases": [{"name": "draws_0", "draws": 5, "dispatches": 0,
+                                           "entries": [{"hash": "0x0000000000000001", "draws": 5, "dispatches": 0}]}]}
+        r["binding_fallbacks"] = {"entries": [{"hash": "0x2", "draws": 9, "dispatches": 1}], "other": {},
+                                  "phases": [{"name": "draws_100_999", "draws": 9, "dispatches": 1,
+                                              "entries": [{"hash": "0x0000000000000002", "draws": 9, "dispatches": 1}]}]}
+        out = bs.summarize(r)
+        self.assertIn("gpu drops (whole run 5", out)
+        self.assertIn("binding fallbacks (whole run 10", out)
+        self.assertRegex(out, r"draws_100_999\s+9 draws\s+1 dispatches\s+0x0000000000000002 x10")
+        self.assertNotIn("binding fallbacks", bs.summarize(base()))
+
     def test_missing_sections_skipped(self):
         out = bs.summarize({"status": "limit_reached", "elapsed_ms": 1000})
         self.assertIn("gpu errors: none", out)

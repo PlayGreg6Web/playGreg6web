@@ -1038,6 +1038,8 @@ private:
 struct BridgeStats {
     uint64_t draws = 0;
     uint64_t draws_skipped = 0;
+    uint64_t null_bound_unresolved = 0;  // draws/dispatches with a plan-unresolved binding bound null
+    uint64_t null_bound_empty = 0;       // draws/dispatches with an empty-slot (null descriptor) binding bound null
     uint64_t dispatches = 0;
     uint64_t render_passes = 0;
     uint64_t pipelines_created = 0;

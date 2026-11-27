@@ -166,6 +166,32 @@ class ImpactTest(unittest.TestCase):
                          {"dropped_by_bridge": 4, "no_shader_module": 3})
         self.assertEqual(imp["presents_in_runs_with_drops"], 10)
 
+    def test_per_phase_drops_and_binding_fallbacks(self):
+        ph = lambda name, d, dis, hh: {"name": name, "draws": d, "dispatches": dis,
+                                       "entries": [{"hash": hh, "draws": d, "dispatches": dis}]}
+        a = {"gpu_work": {"draws_issued": 100}, "screen_timeline": [{"presents": 1}],
+             "gpu_drop_table": {"entries": [{"hash": h(1), "draws": 2, "dispatches": 0, "reasons": {"rect_list": 2}}],
+                                "phases": [ph("draws_0", 2, 0, h(1))]},
+             "binding_fallbacks": {"entries": [{"hash": h(3), "draws": 7, "dispatches": 1,
+                                                "reasons": {"unresolved_entry": 8}}],
+                                   "other": {"draws": 1, "dispatches": 0},
+                                   "phases": [ph("draws_100_999", 7, 1, h(3))]}}
+        b = {"gpu_work": {"draws_issued": 100}, "screen_timeline": [{"presents": 1}],
+             "binding_fallbacks": {"entries": [{"hash": h(3), "draws": 3, "dispatches": 0,
+                                                "reasons": {"empty_slot": 3}}],
+                                   "phases": [ph("draws_100_999", 3, 0, h(3)), ph("draws_1_9", 1, 0, h(4))]}}
+        imp = pc.build_impact(dict(reflect={"stages": {}}), [a, b], top=5)
+        self.assertEqual([r["phase"] for r in imp["per_phase"]], ["draws_0"])
+        bf = imp["binding_fallbacks"]
+        self.assertEqual(bf["draws"], 11)  # 7 + 1 other + 3
+        self.assertEqual([r["phase"] for r in bf["per_phase"]], ["draws_1_9", "draws_100_999"])
+        heavy = bf["per_phase"][1]
+        self.assertEqual((heavy["draws"], heavy["dispatches"]), (10, 1))
+        self.assertEqual(heavy["top_hashes"][0], {"hash": h(3), "count": 11})
+        top = bf["top_hashes"][0]
+        self.assertEqual((top["hash"], top["draws"], top["runs"]), (h(3), 10, 2))
+        self.assertEqual(top["reasons"], {"unresolved_entry": 8, "empty_slot": 3})
+
 
 if __name__ == "__main__":
     unittest.main()

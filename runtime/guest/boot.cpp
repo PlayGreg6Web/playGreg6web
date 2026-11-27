@@ -24,6 +24,7 @@
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/frame_time_hist.h"
+#include "gpu/phase_hash_counts.h"
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
 #include "gpu/small_texture_pool.h"
@@ -3934,6 +3935,8 @@ static void record_present() {
         if (b.last_present_us >= 0 && now_us >= b.last_present_us) {
             b.frame_times.add(static_cast<uint64_t>(now_us - b.last_present_us), b.present_samples.last().draws, gap,
                               elapsed_ms());
+            gpu::d3d12_guest::set_current_gpu_phase(
+                gpu::d3d12_guest::gpu_phase_for_draws(b.present_samples.last().draws));
         }
         b.last_present_us = now_us;
     }
@@ -4101,6 +4104,7 @@ void reset_boot() {
     b.present_elapsed_ms = 0;
     b.present_samples.clear();
     b.frame_times.clear();
+    gpu::d3d12_guest::set_current_gpu_phase(0);
     b.last_present_us = -1;
     b.trace.clear();
     b.trace_strings.clear();

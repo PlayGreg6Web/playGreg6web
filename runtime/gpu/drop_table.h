@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "gpu/phase_hash_counts.h"
+
 namespace playgta6::gpu::d3d12_guest {
 
 class DropTable {
@@ -20,17 +22,7 @@ public:
     enum class Reason : uint8_t { NoModule, MeshRefused, Bridge, RectList, Count };
     static constexpr size_t kReasons = static_cast<size_t>(Reason::Count);
 
-    struct Counts {
-        uint64_t draws[kReasons] = {};
-        uint64_t dispatches[kReasons] = {};
-        uint64_t total() const {
-            uint64_t t = 0;
-            for (size_t i = 0; i < kReasons; ++i) {
-                t += draws[i] + dispatches[i];
-            }
-            return t;
-        }
-    };
+    using Counts = HashCounts<kReasons>;
 
     static const char* reason_name(Reason r) {
         switch (r) {
@@ -54,12 +46,14 @@ public:
             c = &map_[hash];
         }
         (dispatch ? c->dispatches : c->draws)[static_cast<size_t>(reason)] += n;
+        phases_.add(current_gpu_phase(), hash, static_cast<size_t>(reason), dispatch, n);
     }
 
     void reset() {
         std::lock_guard<std::mutex> lock(mu_);
         map_.clear();
         other_ = Counts{};
+        phases_.clear();
     }
 
     size_t tracked() const {
@@ -70,7 +64,8 @@ public:
     // {"0x<16 hex>": total, ...} (hashes only, the shape program_census --drop-counts reads), sorted
     // by total descending.
     std::string by_program_json() const;
-    // {"tracked","max_hashes","other":{draws,dispatches,reasons},"entries":[{hash,draws,dispatches,reasons}]}
+    // {"tracked","max_hashes","other":{draws,dispatches,reasons},"entries":[{hash,draws,dispatches,reasons}],
+    //  "phases":[{name,tracked,draws,dispatches,other,entries(top 32)}]}
     std::string detail_json() const;
 
 private:
@@ -78,6 +73,7 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<uint64_t, Counts> map_;
     Counts other_;
+    PhaseHashMaps<kReasons> phases_;
 };
 
 DropTable& drop_table();

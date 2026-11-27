@@ -10,6 +10,7 @@
 #include <map>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/binding_fallbacks.h"
 #include "gpu/drop_table.h"
 #include "gpu/gpu_va_watch.h"
 
@@ -92,6 +93,24 @@ void count_object_reuse(const bridge::BridgeStats& a, const bridge::BridgeStats&
 // Counts the outcome of one recorded draw from the state bridge's statistics: emitted if the
 // bridge drew, dropped by the bridge if it skipped, otherwise `fallback` (set by the caller's own
 // skip paths).
+// Draws / dispatches that bound a null/dummy resource (BridgeStats::null_bound_*), per shader identity.
+// Runs only when the counters moved, so a clean draw pays two compares.
+void note_binding_fallbacks(const std::vector<uint64_t>* identities, const bridge::BridgeStats& a,
+                            const bridge::BridgeStats& b, bool dispatch) {
+    if (identities == nullptr || (a.null_bound_unresolved == b.null_bound_unresolved &&
+                                  a.null_bound_empty == b.null_bound_empty)) {
+        return;
+    }
+    const bool unresolved = b.null_bound_unresolved != a.null_bound_unresolved;
+    for (uint64_t id : *identities) {
+        if (id != 0) {
+            binding_fallback_table().record(id, unresolved ? BindingFallbackTable::Reason::Unresolved
+                                                           : BindingFallbackTable::Reason::EmptySlot,
+                                            dispatch);
+        }
+    }
+}
+
 class DrawOutcome {
 public:
     explicit DrawOutcome(const bridge::CommandListBridge& b)
@@ -100,6 +119,7 @@ public:
     }
     ~DrawOutcome() {
         count_object_reuse(before_, bridge_.stats());
+        note_binding_fallbacks(identities, before_, bridge_.stats(), false);
         if (bridge_.stats().draws != drawn_) {
             count_work(Work::DrawsEmitted);
         } else if (bridge_.stats().draws_skipped != dropped_) {
@@ -2203,6 +2223,8 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
     const bridge::BridgeStats before = bridge_.stats();
     bridge_.Dispatch(x, y, z);
     count_object_reuse(before, bridge_.stats());
+    note_binding_fallbacks(compute_pso_ != nullptr ? &compute_pso_->shader_identities() : nullptr, before,
+                           bridge_.stats(), true);
     if (bridge_.stats().dispatches != emitted) {
         count_work(Work::DispatchesEmitted);
     } else {

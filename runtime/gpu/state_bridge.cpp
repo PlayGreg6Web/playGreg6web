@@ -4614,6 +4614,7 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
     std::lock_guard cache_lock(cache_mutex_);
     drain_invalidations_locked();
     bound->resize(layout->groups.size());
+    bool null_unresolved = false, null_empty = false;  // fallback path accounting, see BridgeStats
     for (size_t g = 0; g < layout->groups.size(); ++g) {
         const StateBridgeDevice::GroupLayoutRecord& group = *layout->groups[g];
         if (group.runtime_owned) {
@@ -4738,6 +4739,9 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                 }
             }
         }
+        if (cached != nullptr && cached->null_entries != 0) {
+            (plans[g].unresolved_count() != 0 ? null_unresolved : null_empty) = true;
+        }
         BoundGroup& b = (*bound)[g];
         b.null_write_entries = cached != nullptr ? cached->null_write_entries : 0u;
         const uint32_t* offsets_ptr = heap_offsets.empty() ? stack_offsets.data() : heap_offsets.data();
@@ -4760,6 +4764,8 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
         // Drain any re-entrant invalidation that arrived while building this group.
         drain_invalidations_locked();
     }
+    stats_.null_bound_unresolved += null_unresolved ? 1u : 0u;
+    stats_.null_bound_empty += null_empty ? 1u : 0u;
     return true;
 }
 

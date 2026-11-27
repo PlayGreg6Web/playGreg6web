@@ -228,6 +228,33 @@ DROP_COUNTER_KEYS = (
 )
 
 
+def _read_phases(table: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """{phase: {draws, dispatches, entries: {hash: draws+dispatches}}} from a gpu_drop_table / binding_fallbacks block."""
+    out: dict[str, dict[str, Any]] = {}
+    for p in table.get("phases") or []:
+        if isinstance(p, dict) and p.get("name"):
+            out[str(p["name"])] = {
+                "draws": int(p.get("draws") or 0), "dispatches": int(p.get("dispatches") or 0),
+                "entries": {_canon(e["hash"]): int(e.get("draws") or 0) + int(e.get("dispatches") or 0)
+                            for e in p.get("entries") or [] if isinstance(e, dict) and _is_hash(e.get("hash"))}}
+    return out
+
+
+def _merge_phases(into: dict[str, dict[str, Any]], add: dict[str, dict[str, Any]]) -> None:
+    for name, p in add.items():
+        d = into.setdefault(name, {"draws": 0, "dispatches": 0, "hashes": Counter()})
+        d["draws"] += p["draws"]
+        d["dispatches"] += p["dispatches"]
+        d["hashes"].update(p["entries"])
+
+
+def _phase_rows(merged: dict[str, dict[str, Any]], top: int) -> list[dict[str, Any]]:
+    order = ["draws_0", "draws_1_9", "draws_10_99", "draws_100_999", "draws_1000_plus"]
+    return [{"phase": n, "draws": merged[n]["draws"], "dispatches": merged[n]["dispatches"],
+             "top_hashes": [{"hash": h, "count": c} for h, c in merged[n]["hashes"].most_common(top)]}
+            for n in sorted(merged, key=lambda k: order.index(k) if k in order else len(order))]
+
+
 def read_boot_report(doc: dict[str, Any]) -> dict[str, Any]:
     gw = doc.get("gpu_work") or {}
     counters = {k: gw[k] for k in DROP_COUNTER_KEYS if isinstance(gw.get(k), int)}
@@ -259,6 +286,20 @@ def read_boot_report(doc: dict[str, Any]) -> dict[str, Any]:
                 per[h] = r["draws"]
     other = dt.get("other") or {}
     out["drop_table_other"] = {"draws": int(other.get("draws") or 0), "dispatches": int(other.get("dispatches") or 0)}
+    out["drop_table_phases"] = _read_phases(dt)
+    bf = doc.get("binding_fallbacks") or {}
+    brows: dict[str, dict[str, Any]] = {}
+    for e in bf.get("entries") or []:
+        if isinstance(e, dict) and _is_hash(e.get("hash")):
+            r = brows.setdefault(_canon(e["hash"]), {"draws": 0, "dispatches": 0, "reasons": {}})
+            r["draws"] += int(e.get("draws") or 0)
+            r["dispatches"] += int(e.get("dispatches") or 0)
+            for k, v in (e.get("reasons") or {}).items():
+                r["reasons"][k] = r["reasons"].get(k, 0) + int(v)
+    out["binding_fallbacks"] = brows
+    bo = bf.get("other") or {}
+    out["binding_fallbacks_other"] = {"draws": int(bo.get("draws") or 0), "dispatches": int(bo.get("dispatches") or 0)}
+    out["binding_fallbacks_phases"] = _read_phases(bf)
     out["draws_issued"] = int(gw.get("draws_issued") or 0)
     out["presents"] = sum(int(s.get("presents") or 0) for s in doc.get("screen_timeline") or [] if isinstance(s, dict))
     if per:
@@ -292,6 +333,27 @@ def build_impact(census_args: dict[str, Any], reports: list[dict[str, Any]], top
         if run_lost or rb["draws_lost_total"]:
             runs_hit += 1
             presents_hit += rb["presents"]
+    drop_phases: dict[str, dict[str, Any]] = {}
+    fb_phases: dict[str, dict[str, Any]] = {}
+    fb_per: dict[str, dict[str, Any]] = {}
+    fb_total = 0
+    for doc in reports:
+        rb = read_boot_report(doc)
+        _merge_phases(drop_phases, rb["drop_table_phases"])
+        _merge_phases(fb_phases, rb["binding_fallbacks_phases"])
+        for h, r in rb["binding_fallbacks"].items():
+            p = fb_per.setdefault(h, {"draws": 0, "dispatches": 0, "reasons": {}, "runs": 0})
+            p["draws"] += r["draws"]
+            p["dispatches"] += r["dispatches"]
+            p["runs"] += 1
+            for k, v in r["reasons"].items():
+                p["reasons"][k] = p["reasons"].get(k, 0) + v
+            fb_total += r["draws"]
+        fb_total += rb["binding_fallbacks_other"]["draws"]
+    for h, p in fb_per.items():
+        st = stages.get(h) or {}
+        p["stage"] = st.get("stage")
+        p["pack_reason"] = st.get("primary", "not_in_pack") if st else "not_in_pack"
     by_reason: Counter[str] = Counter()
     by_kind: Counter[str] = Counter()
     by_stage: Counter[str] = Counter()
@@ -313,7 +375,14 @@ def build_impact(census_args: dict[str, Any], reports: list[dict[str, Any]], top
         "by_stage": [{"stage": k, "count": v} for k, v in by_stage.most_common()],
         "unresolved_kind_weighted_by_draws": [{"kind": k, "draws": v} for k, v in by_kind.most_common()],
         "top_hashes": [dict(hash=h, **p) for h, p in sorted(per.items(), key=lambda kv: -(kv[1]["draws"] + kv[1]["dispatches"]))[:top]],
-        "per_phase": "unavailable: gpu_drop_table is run-wide, not per screen segment",
+        "per_phase": _phase_rows(drop_phases, top),
+        "binding_fallbacks": {
+            "draws": fb_total,
+            "pct_of_draws": round(100.0 * fb_total / issued, 4) if issued else 0.0,
+            "per_phase": _phase_rows(fb_phases, top),
+            "top_hashes": [dict(hash=h, **p) for h, p in
+                           sorted(fb_per.items(), key=lambda kv: -(kv[1]["draws"] + kv[1]["dispatches"]))[:top]],
+        },
     }
 
 
