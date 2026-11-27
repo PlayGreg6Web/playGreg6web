@@ -78,10 +78,11 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
 
 How to run it: [quick start](PLAY_LOCALLY.md#quick-start-play-natively-windows).
 
-Setup screens, loading, then the Bink videos decode and play, then the title streams its world. Boots now end in
-a page-table crash inside `sub_140F2C470` (a page with two owners). The root cause is traced to our
-`GetResourceAllocationInfo` size for some streamed textures; the fix is in progress (see "Since #2045" below). Music has
-not started yet; it is expected after that crash is gone. What the diagnostics (#1947, #1954, #1958) showed: the audio
+Setup screens, loading, then the Bink videos decode and play, then the title streams its world. Boots no longer end in
+a page-table crash inside `sub_140F2C470` (a page with two owners): the root cause (our
+`GetResourceAllocationInfo` size for some streamed textures) is fixed (#2101), and the boot now reaches the in-world 3D
+scene (about 55-100 s). Remaining issues: low fps in the scene, black frames (under investigation), and the #2033
+store-back optimisation is still out (reverted again, #2115). Music has not started yet; recheck it. What the diagnostics (#1947, #1954, #1958) showed: the audio
 `.rpf` opens happen inside the package (`PG6_AUDIO_TRACE` logs each audio-path `CreateFile`). Std shader pack reflection
 covers 31,777 of 31,822 shaders (#1735).
 
@@ -96,7 +97,8 @@ Open investigations (nothing merged that fixes them yet):
 
 - Title job-graph stall: a run stalls with the title's own `int3` assert in its job graph; the fault record gives
   the address and call stack (see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md)).
-- Music: has not started; recheck once the page-table crash is fixed.
+- Music: has not started; recheck now that the page-table crash is fixed.
+- In-scene fps is low and some frames are black; both are under investigation.
 - Browser: an `INDIRECT_CALL_MISS` ending is waiting for a crash report from a real browser run
   ([WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) says what to send).
 
@@ -141,7 +143,11 @@ GDemay, one line each: GFX10 texture copies of contiguous runs (#2088), 4 KiB sp
 
 Marc, one line each: deferred ranged preload shader compiles remove a 26-40 s GPU stall and device.lost (#2056), sRGB viewFormats / STORAGE_BINDING view fix (#2072), `v_nop_e64` literal consumption and FSSM `s_swappc_b64` vertex fetch inputs (#2077), 1-roundtrip HTTPFS Stat, real DStorage `file_size_` and live `ioWorkerStats` (#2075).
 
-Current boot status: boots end in the `sub_140F2C470` page-table crash; its root cause is our `GetResourceAllocationInfo` size for some streamed textures (fix in progress).
+Since #2099 (merged, #2100-#2132): **the page-table crash root cause is fixed**: textures with an UNKNOWN layout are sized at least as their `SW_4KB_S` placement (#2101). Norm16 textures (and 3D/volume ones) are read through a float twin instead of a dummy, and float layout entries bound to unfilterable-only views get the entry's dummy: `bind_group_unfilterable_dummies` went from about 3200 to 0 in a std-pack boot (#2100, #2107, #2123). Evicted small storage relocations return their space through a free list (#2103). #2033 (skipped store-backs of synced registers) was relanded (#2104) and reverted again (#2115); it is still out. Command-list slot 101 has no call site, so the `E_NOTIMPL` stub stays (#2105). The screen timeline marks the segment that folds presents past the 500-segment cap and `boot_summary` prints it as folded (#2106). A reusable safe `--probe` facility (spec or file, JSONL hits, safe guest reads, report counters) with a function-exit hook that logs the real `rax`/`xmm0` (#2108, #2112). The menu-to-ingame input script follows the current boot flow and `tools/screen_flow.py` detects screens (#2117). 3D-scene frame cost: resource-retire scans skip bind groups and redirects that cannot match (#2121), address textures are dropped in batches at the cap (#2128), a memory bind group is rebuilt only when one of its own storage homes moved (#2132). One command buffer per pass (`--no-split-passes` to turn off), so a pass that fails Dawn validation no longer invalidates the whole frame (#2122). The boot report counts XMA frames decoded and bad frames (#2126). Texture views take the bind-group entry's `viewDimension`, and read-only buffer aliases of a writable binding are bound through a copy (#2129). Lifter contract rule 7 and the #2104 trap analysis with a differential IR check of skipped store-backs (#2131).
+
+Marc, one line each: FSSM `@location` remap in the web path (#2113), `CopyTexture` (opcode 62) in the WebGPU worker (#2114), async pipeline prewarm queue and GPU pass timestamp bridge (#2116), per-stage WGSL binding compaction and audit for WebGPU/D3D12 limits (#2118), `wgpu_worker.js` wiring of FSSM remap, prewarm bridge and `gpu_timer` (#2124), mixed-version PGIM range downloads rejected before caching (#2125).
+
+Current boot status: the boot reaches the in-world 3D scene (about 55-100 s). Open: low fps in the scene, black frames (under investigation), #2033 still out.
 
 ## Ray tracing
 
