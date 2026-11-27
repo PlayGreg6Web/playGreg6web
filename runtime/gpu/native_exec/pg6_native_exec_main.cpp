@@ -99,6 +99,8 @@ int main(int argc, char** argv) {
             opts.gpu_validation = true;
         } else if (a == "--gpu-error-scopes") {
             opts.gpu_error_scopes = true;
+        } else if (a == "--no-split-passes") {
+            opts.split_passes = false;
         } else if (a == "--trace" && (v = next())) {
             trace = v;
         } else if (a == "--pack" && (v = next())) {

@@ -5544,6 +5544,24 @@ struct NativeExecutor::Impl {
         bool seg_open = false;
         uint32_t seg_end = 0;
         uint64_t seg_hash = 0;
+        // split_passes: the command buffers of the passes already ended, submitted in order by submit().
+        std::vector<wgpu::CommandBuffer> done;
+
+        // split_passes: a pass just ended; its commands become a command buffer of their own, so a
+        // validation error in it cannot invalidate the passes before or after it.
+        void cut() {
+            if (!s.options.split_passes) return;
+            done.push_back(enc.Finish());
+            enc = s.device.CreateCommandEncoder();
+        }
+        // Finishes the last command buffer and submits every one in encode order (one Submit each: Dawn
+        // rejects a whole Submit when any buffer in it is invalid).
+        void submit() {
+            done.push_back(enc.Finish());
+            for (wgpu::CommandBuffer& cb : done) s.queue.Submit(1, &cb);
+            s.stats.command_buffers += done.size();
+            done.clear();
+        }
 
         // gpu_time_split: the pass-level write keeps only the begin query; the end is written inside the
         // pass (seg_close) so later segments can follow.
@@ -5580,8 +5598,10 @@ struct NativeExecutor::Impl {
 
         void end_active() {
             seg_close();
+            const bool ended = rpass || cpass;
             if (rpass) { rpass.End(); rpass = nullptr; }
             if (cpass) { cpass.End(); cpass = nullptr; }
+            if (ended) cut();
             explicit_pass = false;
             group0_bound = false;
             bound_groups = 0;
@@ -6646,8 +6666,7 @@ struct NativeExecutor::Impl {
         }
         e.end_active();
         timer_resolve(e);
-        wgpu::CommandBuffer cb = e.enc.Finish();
-        queue.Submit(1, &cb);
+        e.submit();
         timer_collect(e);
         start_recorded_readbacks(true);
         ++stats.early_readback_flushes;
@@ -6818,10 +6837,9 @@ struct NativeExecutor::Impl {
         }
         if (overlay_on || !ov_banner.empty()) encode_overlay(e.enc, target.canvas_view);  // after every copy of the guest's frame
         timer_resolve(e);
-        wgpu::CommandBuffer cb = e.enc.Finish();
         const uint64_t tp1 = now_ns();
         stats.ns_present_encode += tp1 - tp0;
-        queue.Submit(1, &cb);
+        e.submit();
         timer_collect(e);
         start_recorded_readbacks(true);
         if (shot_buf) shot_collect(shot_buf, shot_row, shot_w, shot_h, shot_fmt);
@@ -7388,6 +7406,7 @@ std::string NativeExecutor::stats_json() const {
     num("readbacks_failed", st.readbacks_failed);
     num("readback_bytes", st.readback_bytes);
     num("early_readback_flushes", st.early_readback_flushes);
+    num("command_buffers", st.command_buffers);
     num("v1_render_pipelines", st.v1_render_pipelines);
     num("v1_compute_pipelines", st.v1_compute_pipelines);
     num("v1_bind_groups", st.v1_bind_groups);

@@ -92,6 +92,12 @@ struct ExecutorOptions {
     // "error_scopes" block (bounded). Off = no scopes until the first uncaptured device error arms it
     // (then for up to 200 scoped errors), so a healthy run pays nothing.
     bool gpu_error_scopes = false;
+    // One command buffer per pass (--no-split-passes turns it off): each render / compute pass of a frame
+    // or read-back flush is finished and submitted on its own, in order. Dawn invalidates a whole command
+    // buffer on its first validation error (an invalid bind group, writable storage aliasing, ...), so
+    // with one buffer per frame a single bad pass dropped every pass of that frame, the present copy and
+    // the read-backs with it (black frames); split, only the bad pass is lost.
+    bool split_passes = true;
     // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
     // that create resources and fill them (creations, buffer / texture writes; destroyed ids are pruned,
     // a repeated write of the same range replaces the older one) so a lost device can be rebuilt and the
@@ -244,6 +250,7 @@ struct ExecutorStats {
     uint64_t readbacks_failed = 0;     // counter advanced without data (copy / map failed, no memory, out of range)
     uint64_t readback_bytes = 0;
     uint64_t early_readback_flushes = 0;  // submits that ran the recorded work up to a read-back (no present)
+    uint64_t command_buffers = 0;         // command buffers submitted by presents and read-back flushes (split_passes: one per pass)
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;
     uint64_t v1_bind_groups = 0;

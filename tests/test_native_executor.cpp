@@ -428,6 +428,76 @@ void test_compute(NativeExecutor& ex) {
     CHECK(ex.stats().device_errors == before.device_errors);
 }
 
+// Two writable storage bindings in two groups: bound to the same buffer they alias, which WebGPU rejects
+// when the command buffer is finished.
+const char* kComputeAlias = R"(
+@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+@group(1) @binding(0) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { a[i] = i; b[i] = i + 9u; }
+)";
+
+// split_passes: a compute pass that fails validation (writable storage aliasing) loses only itself; the
+// render pass and the compute pass after it in the same frame still run and the frame is presented.
+void test_split_passes(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(3000, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(3001, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(3002, GpuShaderStage::Compute, kComputeAlias);
+    create_layouts(setup, 3003, 3012, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    std::vector<uint8_t> pl;
+    append(pl, GpuCreatePipelineLayoutPayload{3004, 2, 0, 0, 0});
+    append(pl, uint32_t{3003});
+    append(pl, uint32_t{3003});
+    emit(setup, GpuOpcode::CreatePipelineLayout, pl);
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 3005;
+    cp.cs_module_id = 3002;
+    cp.pipeline_layout_id = 3004;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 3006, 3003, {bg_entry(0, GpuBindResourceType::Buffer, 3000)});
+    create_bind_group(setup, 3013, 3003, {bg_entry(0, GpuBindResourceType::Buffer, 3000)});
+    setup.create_shader_module(3007, GpuShaderStage::Compute, kCompute);
+    create_layouts(setup, 3008, 3009, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    cp.id = 3010;
+    cp.cs_module_id = 3007;
+    cp.pipeline_layout_id = 3009;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 3011, 3008, {bg_entry(0, GpuBindResourceType::Buffer, 3001)});
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    const uint64_t setup_errors = ex.stats().device_errors;
+    CHECK(setup_errors == before.device_errors);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(3005);  // the aliasing pass: invalid
+    set_bind_group2(frame, 0, 3006);
+    set_bind_group2(frame, 1, 3013);
+    frame.dispatch_compute(1);
+    auto green = swapchain_pass(GpuLoadOp::Clear, 0.0f, 1.0f, 0.0f, 1.0f);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &green, sizeof green);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.set_compute_pipeline(3010);  // a valid pass after it
+    set_bind_group2(frame, 0, 3011);
+    frame.dispatch_compute(1);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(3000, 0, 16, &out, &err));  // the aliasing pass was rejected (its writes never land) ...
+    CHECK(out == std::vector<uint8_t>(16, 0));
+    CHECK(frame_is(ex, {0, 255, 0, 255}));             // ... and the rest of the frame was not
+    CHECK(ex.read_buffer(3001, 0, 16, &out, &err));
+    const uint32_t want[4] = {1, 3, 5, 7};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    CHECK(ex.stats().command_buffers >= before.command_buffers + 3);
+}
+
 // An explicit layout that does not fit the WGSL (binding 0 in the layout, binding 3 in the shader) gets
 // layout:'auto' and the worker's group 0 remap: the buffer bound at 0 serves binding 3, with the
 // dynamic offset folded into the static offset.
@@ -3587,6 +3657,7 @@ int main() {
     test_screenshot();
     test_error_scope_attribution();
     test_pipeline_pass_formats(*ex);
+    test_split_passes(*ex);
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
