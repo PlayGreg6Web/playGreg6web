@@ -7258,7 +7258,35 @@ struct NativeExecutor::Impl {
             bound_of[g] = static_cast<int>(bound.size());
             bound.push_back(BoundUses{g, &e.want[g].usage->m, &e.want[g].offsets});
         }
-        const BindPlan plan = bound.empty() ? BindPlan{} : plan_binds(bound, e.scope, render);
+        BindPlan plan = bound.empty() ? BindPlan{} : plan_binds(bound, e.scope, render);
+        if (!render && !plan.snapshots.empty()) {
+            // A big read-only range against a small writable one: the writer runs on a scratch copy instead
+            // (resolve_buffer_aliases), so the big range is not copied.
+            auto writer_twinnable = [&](const BoundUses& rb, const ResUse& r) {
+                if (r.texture || !r.size) return false;
+                bool any = false;
+                for (const BoundUses& wb : bound) {
+                    if (!wb.uses || !wb.uses->any_writable) continue;
+                    for (const ResUse& w : wb.uses->uses) {
+                        if (!use_writable(w.kind) || !uses_conflict(r, w)) continue;
+                        if (w.texture || !prefer_writer_twin(r.size, w.size)) return false;
+                        auto bit = bg_infos.find(e.want[wb.group].group.Get());
+                        if (bit == bg_infos.end() || bit->second->group.Get() != e.want[wb.group].group.Get()) return false;
+                        any = true;
+                    }
+                }
+                (void)rb;
+                return any;
+            };
+            std::vector<SnapshotUse> kept;
+            for (const SnapshotUse& sn : plan.snapshots)
+                if (!writer_twinnable(bound[sn.group], bound[sn.group].uses->uses[sn.use])) kept.push_back(sn);
+            if (kept.size() != plan.snapshots.size()) {
+                stats.usage_snapshots_to_writer_twin += plan.snapshots.size() - kept.size();
+                plan.snapshots = std::move(kept);
+                if (plan.snapshots.empty() && !plan.scope_conflict) plan.split = false;
+            }
+        }
         std::array<wgpu::BindGroup, Encoder::kBindSlots> subst{};
         std::array<std::vector<uint32_t>, Encoder::kBindSlots> subst_dyn{};
         bool volatile_now = false;
@@ -7303,6 +7331,27 @@ struct NativeExecutor::Impl {
                 bd.entryCount = entries.size();
                 bd.entries = entries.data();
                 subst[g] = device.CreateBindGroup(&bd);
+                // The substitute stays visible to the buffer / texture aliasing pass (resolve_buffer_aliases).
+                auto oit = bg_infos.find(e.want[g].group.Get());
+                if (oit != bg_infos.end() && oit->second->group.Get() == e.want[g].group.Get() && subst[g]) {
+                    auto ni = std::make_shared<BgInfo>(*oit->second);
+                    ni->group = subst[g];
+                    ni->entries = entries;
+                    for (BgBufInfo& b : ni->bufs) {
+                        const wgpu::BindGroupEntry& en = entries[b.entry];
+                        if (en.buffer.Get() == b.buffer.Get()) continue;
+                        b.buffer = en.buffer;
+                        b.offset = en.offset;
+                        b.size = en.size == wgpu::kWholeSize ? en.buffer.GetSize() - en.offset : en.size;
+                    }
+                    ni->texs.erase(std::remove_if(ni->texs.begin(), ni->texs.end(),
+                                                  [&](const BgTexInfo& t) {
+                                                      return entries[t.entry].textureView.Get() != t.meta.view.Get();
+                                                  }),
+                                   ni->texs.end());
+                    if (bg_infos.size() >= 16384) bg_infos.clear();
+                    bg_infos[subst[g].Get()] = std::move(ni);
+                }
                 subst_dyn[g] = std::move(dyn);
             }
             if (!all_hit) {
@@ -8520,6 +8569,7 @@ std::string NativeExecutor::stats_json() const {
     num("usage_snapshot_bytes", st.usage_snapshot_bytes);
     num("usage_snapshot_skipped", st.usage_snapshot_skipped);
     num("usage_snapshot_reused", st.usage_snapshot_reused);
+    num("usage_snapshots_to_writer_twin", st.usage_snapshots_to_writer_twin);
     num("usage_snapshot_bytes_saved", st.usage_snapshot_bytes_saved);
     num("usage_split_discards", st.usage_split_discards);
     num("v1_render_pipelines", st.v1_render_pipelines);

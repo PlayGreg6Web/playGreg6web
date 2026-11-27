@@ -269,6 +269,7 @@ struct ExecutorStats {
     uint64_t usage_snapshot_skipped = 0;
     uint64_t usage_snapshot_reused = 0;  // buffer snapshots served from the encoder cache (no copy, no split)
     uint64_t usage_snapshot_bytes_saved = 0;
+    uint64_t usage_snapshots_to_writer_twin = 0;  // big read-only snapshots avoided by twinning the small writable binding
     uint64_t usage_split_discards = 0;
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;

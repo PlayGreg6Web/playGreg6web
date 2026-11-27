@@ -1332,6 +1332,11 @@ void test_view_alias_model() {
     p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 0, 1, 0, 16, false), bind(1, 1, 0, 8, 16, false)});
     CHECK(p.copy.size() == 2 && p.copy[0] == 1 && p.copy[1] == 2);
 
+    p = plan_alias_copies({bind(1, 0, 0, 0, 1 << 20, false), bind(1, 0, 1, 512, 32, true)});  // big reader, tiny writer
+    CHECK(p.copy.empty() && p.twin.size() == 1 && p.twin[0] == 1);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 1 << 20, false), bind(1, 0, 1, 0, 1 << 19, true)});  // comparable: copy the reader
+    CHECK(p.copy.size() == 1 && p.twin.empty());
+
     // texture aliasing
     auto tb = [](uint64_t tex, uint32_t mip, uint32_t mips, uint32_t layer, uint32_t layers, bool w) {
         AliasTexBinding t;

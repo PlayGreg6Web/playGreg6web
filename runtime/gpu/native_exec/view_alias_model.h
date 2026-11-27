@@ -85,21 +85,32 @@ inline bool ranges_overlap(const AliasBinding& a, const AliasBinding& b) {
 //  - of several overlapping writable bindings the first stays on the buffer and every later one that overlaps
 //    a binding staying on the buffer is bound through a scratch copy whose changed words are merged back
 //    after the dispatch (`twin`).
+// A small writable range overlapping (or sharing a buffer with) a much larger read-only one: the writer is the
+// cheap side to run on a scratch copy (a few bytes in, the changed words back) instead of copying the reader.
+inline bool prefer_writer_twin(uint64_t ro_size, uint64_t w_size) {
+    return ro_size >= 65536 && w_size != 0 && w_size * 8 <= ro_size;
+}
+
 inline AliasPlan plan_alias_copies(const std::vector<AliasBinding>& v) {
     AliasPlan p;
+    std::vector<bool> forced(v.size(), false);
     for (size_t i = 0; i < v.size(); ++i) {
         for (size_t j = i + 1; j < v.size(); ++j) {
             const AliasBinding &a = v[i], &b = v[j];
             if (a.buffer != b.buffer || (!a.writable && !b.writable) || !ranges_overlap(a, b)) continue;
             if (a.writable && b.writable) continue;
-            const size_t ro = a.writable ? j : i;
+            const size_t ro = a.writable ? j : i, w = a.writable ? i : j;
+            if (prefer_writer_twin(v[ro].size, v[w].size)) {
+                forced[w] = true;
+                continue;
+            }
             if (std::find(p.copy.begin(), p.copy.end(), ro) == p.copy.end()) p.copy.push_back(ro);
         }
     }
     std::vector<size_t> direct;
     for (size_t j = 0; j < v.size(); ++j) {
         if (!v[j].writable) continue;
-        bool hit = false;
+        bool hit = forced[j];
         for (size_t d : direct)
             if (v[d].buffer == v[j].buffer && ranges_overlap(v[d], v[j])) hit = true;
         if (hit) p.twin.push_back(j);
