@@ -2068,9 +2068,14 @@ int main(int argc, char** argv) {
                              default: return gpu::PrewarmBuild::Failed;
                          }
                      },
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
                      // --live-executor: build only while the pump is idle, so a prewarm compile never
                      // queues ahead of the title's own batches (it starved the menu-to-ingame load).
-                     []() { return !g_live_started || g_live.idle(); }});
+                     []() { return !g_live_started || g_live.idle(); }
+#else
+                     {}
+#endif
+                    });
             }
         }
         gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
