@@ -1219,7 +1219,10 @@ class TestWasm64IrRetargetAndFlags(unittest.TestCase):
         self.assertNotIn('target triple = "wasm64-unknown-unknown"', retargeted)
         self.assertIn('target triple = "wasm64-unknown-emscripten"\n', retargeted)
         self.assertIn("define void @sub_140001000(ptr %state) #0 {\n", retargeted)
-        self.assertIn('attributes #0 = { "target-features"="+simd128" }\n', retargeted)
+        self.assertIn(
+            'attributes #0 = { "target-features"="+simd128,+atomics,+bulk-memory,+mutable-globals" }\n',
+            retargeted,
+        )
 
         # CRLF line endings are preserved on surviving lines.
         crlf_in = self.SAMPLE_SHARD_IR.replace("\n", "\r\n")
@@ -1253,6 +1256,19 @@ class TestWasm64IrRetargetAndFlags(unittest.TestCase):
         self.assertNotIn("-msimd128", c_flags)
 
         self.assertEqual(bgw.COMPILE_WASM_FLAGS, ("-sMEMORY64=1", "-pthread"))
+
+    def test_shared_memory_features_passed_and_no_check_features_gone(self) -> None:
+        for kind in ("ll", "cpp", "c"):
+            flags = bgw.compile_flags_for(opt="O2", kind=kind)
+            for flag in ("-matomics", "-mbulk-memory", "-mmutable-globals"):
+                self.assertIn(flag, flags)
+        # Features already present are not duplicated.
+        ir = 'attributes #0 = { "target-features"="+atomics,+simd128" }\n'
+        out = bgw.retarget_wasm64_ir(ir)
+        self.assertEqual(out.count("+atomics"), 1)
+        self.assertIn("+bulk-memory", out)
+        for argv in (bgw.SIDE_MODULE_LINK_FLAGS, bgw.SIDE_MODULE_PRUNED_LINK_FLAGS):
+            self.assertNotIn("-Wl,--no-check-features", argv)
 
     def test_cache_key_salts_ll_with_retarget_version(self) -> None:
         ll_flags = bgw.compile_flags_for(opt="O2", kind="ll")

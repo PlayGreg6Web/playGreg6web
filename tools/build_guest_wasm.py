@@ -107,12 +107,19 @@ SKIP_DIR_NAMES: frozenset[str] = frozenset(
 )
 
 # Bump whenever retarget_wasm64_ir changes its output (salted into .ll cache keys).
-WASM64_IR_RETARGET_VERSION = 1
+WASM64_IR_RETARGET_VERSION = 2
 WASM64_SOURCE_TRIPLE = "wasm64-unknown-unknown"
 WASM64_EMSCRIPTEN_TRIPLE = "wasm64-unknown-emscripten"
 
 # Compile flags applied to every translation unit (plus `-O*` from --opt).
 COMPILE_WASM_FLAGS: tuple[str, ...] = ("-sMEMORY64=1", "-pthread")
+
+# Target features every object of the shared-memory pthread build must carry (what `emcc -pthread` implies).
+# Passed explicitly to every compile, and merged into the `"target-features"` attribute of lifted IR (function
+# attributes REPLACE the command-line features), so wasm-ld's feature check passes without --no-check-features.
+SHARED_MEMORY_TARGET_FEATURES: tuple[str, ...] = ("+atomics", "+bulk-memory", "+mutable-globals")
+SHARED_MEMORY_COMPILE_FLAGS: tuple[str, ...] = ("-matomics", "-mbulk-memory", "-mmutable-globals")
+_IR_TARGET_FEATURES_RE = re.compile(r'"target-features"="([^"]*)"')
 
 # Link flags matching runtime/CMakeLists.txt EMSCRIPTEN target_link_options.
 LINK_FLAGS: tuple[str, ...] = (
@@ -191,21 +198,16 @@ SPLIT_DEFAULT_INITIAL_MEMORY = "64MB"
 SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 48
 SPLIT_RUNTIME_ARCHIVE_EXCLUDES: tuple[str, ...] = ("wasm_boot.cpp.o", "main.cpp.o")
 SIDE_MODULE_CTOR_EXPORT_FLAG = "-Wl,--export-if-defined=__wasm_call_ctors"
-# Lifted shards that happen to contain no atomic ops can carry no `+atomics` target feature; wasm-ld then
-# rejects them under --shared-memory ("not compiled with 'atomics' or 'bulk-memory'"). They are safe to link.
-SIDE_MODULE_NO_CHECK_FEATURES_FLAG = "-Wl,--no-check-features"
 SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
     SIDE_MODULE_FLAG,
-    SIDE_MODULE_NO_CHECK_FEATURES_FLAG,
 )
 SIDE_MODULE_PRUNED_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
     SIDE_MODULE_PRUNED_FLAG,
     SIDE_MODULE_CTOR_EXPORT_FLAG,
-    SIDE_MODULE_NO_CHECK_FEATURES_FLAG,
 )
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 _SIDE_MODULE_FILENAME_RE = re.compile(r"^guest_part_(\d+)\.wasm$")
@@ -1486,13 +1488,24 @@ def build_link_env(
     return env_out
 
 
+def _merge_ir_target_features(match: "re.Match[str]") -> str:
+    present = [f for f in match.group(1).split(",") if f]
+    for feature in SHARED_MEMORY_TARGET_FEATURES:
+        if feature not in present:
+            present.append(feature)
+    return '"target-features"="' + ",".join(present) + '"'
+
+
 def retarget_wasm64_ir(text: str) -> str:
     """Normalize lifted wasm64 LLVM IR for Emscripten 7 / LLVM 24 `emcc`.
 
     Drops any hardcoded `target datalayout = ...` line so `emcc` supplies the
     active LLVM backend's DataLayout, and rewrites
     `target triple = "wasm64-unknown-unknown"` to `"wasm64-unknown-emscripten"`.
+    Every `"target-features"` attribute also gains the shared-memory pthread features
+    (`+atomics,+bulk-memory,+mutable-globals`) so shards without atomic ops still link.
     """
+    text = _IR_TARGET_FEATURES_RE.sub(_merge_ir_target_features, text)
     out: list[str] = []
     for line in text.splitlines(keepends=True):
         if line.endswith("\r\n"):
@@ -1520,7 +1533,7 @@ def compile_flags_for(
     wasm_exceptions: bool = False,
     pic: bool = False,
 ) -> tuple[str, ...]:
-    flags: list[str] = [*COMPILE_WASM_FLAGS, f"-{opt}"]
+    flags: list[str] = [*COMPILE_WASM_FLAGS, *SHARED_MEMORY_COMPILE_FLAGS, f"-{opt}"]
     if pic and PIC_FLAG not in flags:
         flags.append(PIC_FLAG)
     flags.extend(extra_flags)
@@ -4886,9 +4899,9 @@ def run_build(
     else:
         mode = "build"
     base_compile_flags = (
-        (*COMPILE_WASM_FLAGS, f"-{opt_level}", PIC_FLAG)
+        (*COMPILE_WASM_FLAGS, *SHARED_MEMORY_COMPILE_FLAGS, f"-{opt_level}", PIC_FLAG)
         if use_split
-        else (*COMPILE_WASM_FLAGS, f"-{opt_level}")
+        else (*COMPILE_WASM_FLAGS, *SHARED_MEMORY_COMPILE_FLAGS, f"-{opt_level}")
     )
     report = BuildReport(
         ok=toolchain.ok,
