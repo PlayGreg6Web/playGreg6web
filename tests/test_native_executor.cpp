@@ -498,6 +498,169 @@ void test_split_passes(NativeExecutor& ex) {
     CHECK(ex.stats().command_buffers >= before.command_buffers + 3);
 }
 
+// ---- usage scopes (usage_scope_model.h) ----
+
+const char* kUniformAndStorage = R"(
+@group(0) @binding(0) var<uniform> u: vec4<u32>;
+@group(0) @binding(1) var<storage, read_write> o: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { o[i] = u[i] + 1u; }
+)";
+const char* kFragWrite = R"(
+@group(0) @binding(0) var<storage, read_write> o: array<u32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4f { o[0] = 7u; return vec4f(1.0, 0.0, 0.0, 1.0); }
+)";
+const char* kFragReadUniform = R"(
+@group(0) @binding(0) var<uniform> u: vec4<u32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4f {
+  if (u.x == 7u) { return vec4f(0.0, 1.0, 0.0, 1.0); }
+  return vec4f(0.0, 0.0, 1.0, 1.0);
+}
+)";
+const char* kMipCopy = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var dst: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(1) fn cs_main() { textureStore(dst, vec2i(0, 0), textureLoad(src, vec2i(0, 0), 0)); }
+)";
+
+// One buffer bound as a uniform and as read-write storage (disjoint ranges) in one dispatch: the uniform is
+// bound from a snapshot. Two draws of one render pass, the first writing a buffer as storage, the second
+// reading it as a uniform: the pass splits there and the read sees the write. A texture sampled (all mips)
+// while one of its mips is a storage target: the sampled view comes from a snapshot. No device errors.
+void test_usage_scopes(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    const uint32_t ubo_storage = GpuBufferUsage::Uniform | GpuBufferUsage::Storage | GpuBufferUsage::CopyDst | GpuBufferUsage::CopySrc;
+    gpu::CommandEncoder setup;
+    // compute: uniform [0, 16) and storage [256, 272) of buffer 3100
+    setup.create_buffer(3100, ubo_storage, 512);
+    const uint32_t init[4] = {10, 20, 30, 40};
+    setup.write_buffer(3100, 0, init, 16);
+    setup.create_shader_module(3101, GpuShaderStage::Compute, kUniformAndStorage);
+    create_layouts(setup, 3102, 3103,
+                   {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 0),
+                    layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 3104;
+    cp.cs_module_id = 3101;
+    cp.pipeline_layout_id = 3103;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    auto ub = bg_entry(0, GpuBindResourceType::Buffer, 3100);
+    ub.size = 16;
+    auto sb = bg_entry(1, GpuBindResourceType::Buffer, 3100);
+    sb.offset = 256;
+    sb.size = 16;
+    create_bind_group(setup, 3105, 3102, {ub, sb});
+    // render: draw 1 writes buffer 3110 [0, 16) as storage, draw 2 reads it as a uniform
+    setup.create_buffer(3110, ubo_storage, 256);
+    setup.create_shader_module(3111, GpuShaderStage::Vertex, kFragWrite);
+    setup.create_shader_module(3112, GpuShaderStage::Fragment, kFragWrite);
+    setup.create_shader_module(3113, GpuShaderStage::Vertex, kFragReadUniform);
+    setup.create_shader_module(3114, GpuShaderStage::Fragment, kFragReadUniform);
+    create_layouts(setup, 3115, 3116, {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Buffer, 1)});
+    create_layouts(setup, 3117, 3118, {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Buffer, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(3119, 3111, 3112, 3116)));
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(3120, 3113, 3114, 3118)));
+    auto wb = bg_entry(0, GpuBindResourceType::Buffer, 3110);
+    wb.size = 16;
+    create_bind_group(setup, 3121, 3115, {wb});
+    create_bind_group(setup, 3122, 3117, {wb});
+    // texture: 4x4 rgba8unorm with 2 mips; mip 0 uploaded, mip 1 written from it
+    auto tex = texture2(3130, 4, 4,
+                        GpuTextureUsage::TextureBinding | GpuTextureUsage::StorageBinding | GpuTextureUsage::CopyDst |
+                            GpuTextureUsage::CopySrc,
+                        22);
+    tex.mip_levels = 2;
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(tex));
+    std::vector<uint8_t> texels(256 * 3 + 16, 0);
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) {
+            uint8_t* t = &texels[size_t(y) * 256 + size_t(x) * 4];
+            t[0] = 200;
+            t[1] = 100;
+            t[2] = 50;
+            t[3] = 255;
+        }
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 3130;
+    wt.width = 4;
+    wt.height = 4;
+    wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 4;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(setup, GpuOpcode::WriteTexture, wtv);
+    setup.create_shader_module(3131, GpuShaderStage::Compute, kMipCopy);
+    GpuBindGroupLayoutEntry st = layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                                              static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly), 2);
+    st.storage_format = 22;
+    create_layouts(setup, 3132, 3133, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture, 0, 2), st});
+    cp.id = 3134;
+    cp.cs_module_id = 3131;
+    cp.pipeline_layout_id = 3133;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    auto sv = bg_entry(0, GpuBindResourceType::TextureView, 3130);
+    sv.view.dimension = 2;
+    auto wv = bg_entry(1, GpuBindResourceType::TextureView, 3130);
+    wv.view.dimension = 2;
+    wv.view.base_mip_level = 1;
+    wv.view.mip_level_count = 1;
+    create_bind_group(setup, 3135, 3132, {sv, wv});
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(3104);
+    set_bind_group2(frame, 0, 3105);
+    frame.dispatch_compute(1);
+    frame.set_compute_pipeline(3134);
+    set_bind_group2(frame, 0, 3135);
+    frame.dispatch_compute(1);
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(3119);
+    set_bind_group2(frame, 0, 3121);
+    frame.draw(3);
+    frame.set_pipeline(3120);
+    set_bind_group2(frame, 0, 3122);
+    frame.draw(3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& after = ex.stats();
+    CHECK(after.device_errors == before.device_errors);
+    CHECK(after.usage_buffer_snapshots == before.usage_buffer_snapshots + 1);
+    CHECK(after.usage_texture_snapshots == before.usage_texture_snapshots + 1);
+    CHECK(after.usage_snapshot_splits == before.usage_snapshot_splits + 2);
+    CHECK(after.usage_scope_splits == before.usage_scope_splits + 1);
+    CHECK(after.usage_snapshot_skipped == before.usage_snapshot_skipped);
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(3100, 256, 16, &out, &err));
+    const uint32_t want[4] = {11, 21, 31, 41};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    std::vector<uint8_t> px;
+    uint32_t w = 0, h = 0;
+    CHECK(ex.read_texture(3130, 1, &px, &w, &h, &err) && w == 2 && h == 2);
+    CHECK(px.size() == 16 && px[0] == 200 && px[1] == 100 && px[2] == 50 && px[3] == 255);
+    CHECK(frame_is(ex, {0, 255, 0, 255}));  // the second draw read the first one's write
+}
+
 // An explicit layout that does not fit the WGSL (binding 0 in the layout, binding 3 in the shader) gets
 // layout:'auto' and the worker's group 0 remap: the buffer bound at 0 serves binding 3, with the
 // dynamic offset folded into the static offset.
@@ -3870,6 +4033,7 @@ int main() {
     test_error_scope_attribution();
     test_pipeline_pass_formats(*ex);
     test_split_passes(*ex);
+    test_usage_scopes(*ex);
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

@@ -251,6 +251,18 @@ struct ExecutorStats {
     uint64_t readback_bytes = 0;
     uint64_t early_readback_flushes = 0;  // submits that ran the recorded work up to a read-back (no present)
     uint64_t command_buffers = 0;         // command buffers submitted by presents and read-back flushes (split_passes: one per pass)
+    // Usage scopes (usage_scope_model.h): a resource written and read through bindings of one render pass /
+    // one dispatch. Render passes split at a draw that conflicts with an earlier draw of the pass; passes
+    // split to bind snapshots (copies of the read range) for a conflict inside one draw / dispatch; those
+    // snapshots (buffer / texture) and their bytes (texture bytes estimated at 4 per texel); snapshots
+    // that could not be made (the conflict stays); splits of a pass whose attachments store Discard.
+    uint64_t usage_scope_splits = 0;
+    uint64_t usage_snapshot_splits = 0;
+    uint64_t usage_buffer_snapshots = 0;
+    uint64_t usage_texture_snapshots = 0;
+    uint64_t usage_snapshot_bytes = 0;
+    uint64_t usage_snapshot_skipped = 0;
+    uint64_t usage_split_discards = 0;
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;
     uint64_t v1_bind_groups = 0;

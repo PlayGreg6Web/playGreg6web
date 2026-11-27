@@ -28,6 +28,7 @@
 #include "gpu/native_exec/shader_workers.h"
 #include "gpu/native_exec/show_target_model.h"
 #include "gpu/native_exec/stream_model.h"
+#include "gpu/native_exec/usage_scope_model.h"
 
 namespace {
 int g_failures = 0;
@@ -1501,7 +1502,92 @@ void test_clear_model() {
     CHECK(copied_bytes(copies) == 5ull * 64 * 4 + 4ull * 16 * 4);
 }
 
+void test_usage_scope_model() {
+    int buf_a = 0, buf_b = 0, tex = 0;
+    auto buf = [](const void* r, UseKind k, uint64_t off, uint64_t size, int32_t dyn = -1) {
+        ResUse u;
+        u.res = r;
+        u.kind = k;
+        u.offset = off;
+        u.size = size;
+        u.dyn_index = dyn;
+        return u;
+    };
+    auto img = [](const void* r, UseKind k, uint32_t mip, uint32_t mips, uint32_t layer = 0, uint32_t layers = 1) {
+        ResUse u;
+        u.res = r;
+        u.texture = true;
+        u.kind = k;
+        u.mip_base = mip;
+        u.mip_count = mips;
+        u.layer_base = layer;
+        u.layer_count = layers;
+        return u;
+    };
+    // one group: uniform [0, 16) + storage [256, 272) of one buffer -> a snapshot, not volatile
+    BgUses g0;
+    g0.add(buf(&buf_a, UseKind::Uniform, 0, 16));
+    g0.add(buf(&buf_a, UseKind::StorageWrite, 256, 16));
+    CHECK(g0.any_writable);
+    std::vector<BoundUses> bound{{0, &g0, nullptr}};
+    UsageScope scope;
+    BindPlan p = plan_binds(bound, scope, false);
+    CHECK(p.split && !p.scope_conflict && p.snapshots.size() == 1);
+    CHECK(p.snapshots[0].group == 0 && p.snapshots[0].use == 0 && !p.snapshots[0].volatile_);
+    // a dynamic offset moves the uniform onto the written range: volatile
+    BgUses g1;
+    g1.add(buf(&buf_a, UseKind::StorageRead, 0, 16, 0));
+    g1.add(buf(&buf_a, UseKind::StorageWrite, 256, 16));
+    const std::vector<uint32_t> dyn{256};
+    bound = {{0, &g1, &dyn}};
+    p = plan_binds(bound, scope, false);
+    CHECK(p.snapshots.size() == 1 && p.snapshots[0].volatile_);
+    // two writable uses (aliasing) and reads of another buffer are not usage conflicts
+    BgUses g2;
+    g2.add(buf(&buf_a, UseKind::StorageWrite, 0, 16));
+    g2.add(buf(&buf_a, UseKind::StorageWrite, 0, 16));
+    g2.add(buf(&buf_b, UseKind::Uniform, 0, 16));
+    bound = {{0, &g2, nullptr}};
+    CHECK(!plan_binds(bound, scope, true).split);
+    // render: a write in one draw, a read of the same buffer in a later one -> scope split
+    for (const ResUse& u : g2.uses) scope.add(u);
+    BgUses g3;
+    g3.add(buf(&buf_a, UseKind::Uniform, 512, 16));
+    bound = {{1, &g3, nullptr}};
+    p = plan_binds(bound, scope, true);
+    CHECK(p.split && p.scope_conflict && p.snapshots.empty());
+    CHECK(!plan_binds(bound, scope, false).split);  // compute: per-dispatch scopes
+    BgUses g4;
+    g4.add(buf(&buf_b, UseKind::Uniform, 0, 16));
+    bound = {{1, &g4, nullptr}};
+    CHECK(!plan_binds(bound, scope, true).split);
+    // textures: sampled mips 0..3 against a storage write of mip 1 conflict; of mip 4 they do not
+    BgUses t0;
+    t0.add(img(&tex, UseKind::Sampled, 0, 4));
+    t0.add(img(&tex, UseKind::StorageTexWrite, 1, 1));
+    bound = {{0, &t0, nullptr}};
+    UsageScope empty;
+    p = plan_binds(bound, empty, false);
+    CHECK(p.snapshots.size() == 1 && p.snapshots[0].use == 0 && p.snapshots[0].volatile_);
+    BgUses t1;
+    t1.add(img(&tex, UseKind::Sampled, 0, 4));
+    t1.add(img(&tex, UseKind::StorageTexWrite, 4, 1));
+    t1.add(img(&tex, UseKind::StorageTexWrite, 0, 4, 1, 1));  // another layer
+    bound = {{0, &t1, nullptr}};
+    CHECK(!plan_binds(bound, empty, false).split);
+    // view ranges: WebGPU defaults
+    ViewRange r = resolve_view_range(1, 5, 6, 4, 0, 0, 0, 0);  // cube of a 6-layer 2d texture
+    CHECK(r.mip_count == 5 && r.layer_count == 6 && r.view_dim == 4);
+    r = resolve_view_range(1, 5, 6, 0, 2, 0, 1, 0);  // undefined dim: 2d-array, layers 1..5
+    CHECK(r.view_dim == 3 && r.mip_base == 2 && r.mip_count == 3 && r.layer_base == 1 && r.layer_count == 5);
+    r = resolve_view_range(1, 1, 6, 2, 0, 0, 3, 0);  // a 2d view: one layer
+    CHECK(r.layer_base == 3 && r.layer_count == 1);
+    r = resolve_view_range(2, 3, 8, 0, 0, 0, 0, 0);  // 3d
+    CHECK(r.view_dim == 6 && r.layer_count == 1 && r.mip_count == 3);
+}
+
 int main() {
+    test_usage_scope_model();
     test_present_model();
     test_shader_payloads();
     test_pack();
