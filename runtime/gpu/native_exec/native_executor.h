@@ -171,8 +171,9 @@ struct ExecutorStats {
     uint64_t shader_modules = 0;
     uint64_t shader_pack_hits = 0;
     uint64_t shader_pack_misses = 0;  // a hash-only shader the pack does not hold (compiled as text: invalid)
-    // Pack shaders materialized on first pipeline use: the module compile (WGSL parse + resolve, on
-    // the executor thread) and the memoized text scans (entry point, @group(0) bindings).
+    // Pack shaders materialized on first pipeline use (on the executor thread or a shader worker): the
+    // module compile (WGSL parse + resolve) and the memoized text scans (entry point, @group(0) bindings).
+    // shader_materialize_* is the time spent on the executor (queue) thread only.
     uint64_t shader_materialized = 0;
     uint64_t shader_materialize_ns = 0;
     uint64_t shader_materialize_max_ns = 0;
@@ -180,6 +181,24 @@ struct ExecutorStats {
     uint64_t shader_materialize_max_bytes = 0;
     uint64_t shader_scans = 0;
     uint64_t shader_scan_ns = 0;
+    // Live mode (async_pipelines): shader workers (shader_workers.h) compile them instead. Handed over,
+    // finished (and their compile time / slowest one, host private MB after a compile), times the
+    // executor thread had to wait for one (a draw / dispatch needed its pipeline) and how long.
+    uint64_t shader_workers = 0;
+    uint64_t shader_async_queued = 0;
+    uint64_t shader_async = 0;
+    uint64_t shader_async_ns = 0;
+    uint64_t shader_async_max_ns = 0;
+    uint64_t shader_async_max_hash = 0;
+    uint64_t shader_async_max_bytes = 0;
+    uint64_t shader_async_private_mb_max = 0;
+    uint64_t shader_async_waits = 0;
+    uint64_t shader_async_wait_ns = 0;
+    // Pipelines created after their packet because a shader was still on a worker: deferred, built
+    // so far, the most deferred at once.
+    uint64_t pipelines_deferred = 0;
+    uint64_t pipelines_deferred_built = 0;
+    uint64_t pipelines_deferred_max = 0;
     // Packets that took >= 1 s in the executor (each also logged, the first 32, with its shader).
     uint64_t slow_packets = 0;
     uint64_t slow_packet_max_ns = 0;

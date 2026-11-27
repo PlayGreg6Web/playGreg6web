@@ -47,12 +47,23 @@
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/screenshot_model.h"
+#include "gpu/native_exec/shader_workers.h"
 #include "gpu/native_exec/show_target_model.h"
 #include "gpu/native_exec/stream_model.h"
+#include "os/process_memory.h"
 
 namespace playgta6::gpu::native_exec {
 
 namespace {
+
+// Set on the shader worker threads: a device error raised there is queued for the executor thread
+// instead of touching the stats from a second thread.
+thread_local bool tl_shader_worker = false;
+
+uint64_t host_private_mb() {
+    uint64_t priv = 0, ws = 0;
+    return playgta6::os::process_memory_bytes(&priv, &ws, nullptr) ? priv >> 20 : 0;
+}
 
 std::string to_string(wgpu::StringView sv) {
     const std::string_view v = sv;
@@ -295,6 +306,8 @@ struct RemapCacheEntry {
 // module compiled) on first use by a pipeline: a title creates ~1400 modules of which only a few
 // are ever used, and compiling each synchronously (about 50 ms for multi-MB WGSL) stalled the
 // executor for over a minute. Fields are mutable: ensure_shader() fills them through const refs.
+// Live mode hands the materialization to a shader worker (shader_workers.h): while `queued` and not
+// `ready`, the worker owns every mutable field below; the queue thread reads them after `ready`.
 struct ShaderEntry {
     mutable wgpu::ShaderModule module;
     mutable std::string code;
@@ -302,12 +315,26 @@ struct ShaderEntry {
     uint32_t stage = 0;
     uint64_t hash = 0;  // the pack hash of a hash-only payload (0 = inline WGSL): the GPU-time key
     uint64_t reflect_hash = 0;  // the worker's `hashHex`: the pack hash, else FNV-1a 64 of the WGSL text
-    mutable bool pending = false;  // pack-backed and not yet materialized
+    mutable bool pending = false;  // pack-backed and not yet materialized (nor handed to a worker)
     // Text scans of `code` memoized per shader (a compute WGSL can be 16 MB; every pipeline built
-    // from the module rescanned it): resolved entry point per stage, statically referenced @group(0).
+    // from the module rescanned it): resolved entry point per stage, statically referenced @group(0),
+    // whether it declares @group(0) at all, the fragment outputs of an entry point.
     mutable std::string ep_cache[3];
     mutable std::optional<std::vector<WgslBinding>> group0_cache;
+    mutable std::optional<bool> declares_group0_cache;
+    mutable std::string frag_mask_ep;
+    mutable std::optional<std::optional<uint32_t>> frag_mask_cache;
+    // Worker hand-off (queue thread: `queued`, `accounted`; worker: the results, then `ready`).
+    mutable bool queued = false;
+    mutable bool accounted = false;  // the worker's timings were folded into the executor stats
+    mutable std::atomic<bool> ready{false};
+    mutable uint64_t worker_ns = 0;       // module compile on the worker
+    mutable uint64_t worker_scan_ns = 0;  // text scans on the worker
+    mutable uint32_t worker_scans = 0;
+    mutable bool worker_miss = false;     // the pack no longer delivered it (compiled as the hash text)
+    mutable uint64_t worker_private_mb = 0;  // host process private bytes right after the compile, MB
 };
+using ShaderRef = std::shared_ptr<ShaderEntry>;
 
 // Result of an asynchronous pipeline creation (ExecutorOptions::async_pipelines), shared with the
 // completion callback. The callback runs on the executor thread (ProcessEvents / WaitAny).
@@ -327,6 +354,11 @@ struct AsyncSlot {
     bool fullscreen = false;  // vertex-buffer-less pipeline: the long wait budget (pipe_budget_model.h)
     mutable bool failed = false;  // the async compile failed: draws / dispatches using it are dropped, never submitted
     uint64_t vs_hash = 0, fs_hash = 0;  // stage shader hashes, for the failure log
+    // Deferred: a shader of it is still being materialized on a shader worker, so the pipeline is not
+    // created yet (Impl::deferred_render / deferred_compute hold its packet). `pending` is set and never done.
+    mutable bool deferred = false;
+    uint32_t deferred_id = 0;
+    bool deferred_compute = false;
 };
 
 struct RenderPipelineEntry : AsyncSlot {
@@ -537,7 +569,7 @@ struct NativeExecutor::Impl {
     std::unordered_map<uint32_t, PendingClear> pending_clears;
     wgpu::Buffer zero_buffer;  // CopySrc, never written: Dawn zero-initializes it
     std::unordered_map<uint32_t, wgpu::Sampler> samplers;
-    std::unordered_map<uint32_t, ShaderEntry> shaders;
+    std::unordered_map<uint32_t, ShaderRef> shaders;
     std::unordered_map<uint32_t, BglEntry> bgls;
     std::unordered_map<uint32_t, PlEntry> pipeline_layouts;
     std::unordered_map<uint64_t, wgpu::BindGroupLayout> layouts_by_content;
@@ -554,7 +586,24 @@ struct NativeExecutor::Impl {
     wgpu::ShaderModule empty_fragment;
     wgpu::ShaderModule error_vertex_module;
     wgpu::ShaderModule error_compute_module;
-    std::unique_ptr<WgslPack> pack;
+    std::shared_ptr<WgslPack> pack;  // shared with the shader workers
+    // Shader workers (live mode, shader_workers.h) and the pipelines waiting for their shaders: the
+    // packet (with the pipeline layout as it was at packet time and the shader entries) is replayed
+    // once the shaders are ready, by pump_deferred() between packets or by a draw that needs it.
+    ShaderWorkers shader_workers;
+    bool use_shader_workers = false;
+    struct DeferredPipe {
+        uint16_t opcode = 0;
+        std::vector<uint8_t> payload;
+        std::optional<PlEntry> layout;
+        ShaderRef a, b;  // vertex + fragment, or compute
+    };
+    std::unordered_map<uint32_t, DeferredPipe> deferred_render, deferred_compute;
+    uint64_t deferred_seen_completed = 0;
+    // Uncaptured device errors raised on a shader worker thread: drained into the stats by the queue thread.
+    std::mutex worker_error_mu;
+    std::vector<std::string> worker_errors;  // the first few messages
+    uint64_t worker_error_count = 0;
     // Reflection loader (web/workers/reflection_loader.js ReflectionRegistry) and the layouts a v1
     // pipeline was built with (`_pipelineBindGroupLayouts` / `_pipelineReflectionGroups` and the compute twins).
     reflect::ReflectionRegistry reflection;
@@ -877,6 +926,14 @@ struct NativeExecutor::Impl {
                 features.*(w.flag) = true;
             }
         }
+        // Live mode: pack shader modules are compiled on shader workers (shader_workers.h), which needs
+        // a device whose API calls may come from several threads.
+        bool want_worker_sync = false;
+        if (options.async_pipelines && !options.gpu_validation &&
+            adapter_handle.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization)) {
+            required.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
+            want_worker_sync = true;
+        }
         // GPU pass timestamps (gpu_timer.js requests 'timestamp-query' when the adapter has it).
         // Chrome quantizes timestamp queries to 100 us; native Dawn gets exact values (the toggle
         // is turned off), which is what per-pass GPU time needs.
@@ -994,6 +1051,12 @@ struct NativeExecutor::Impl {
             if (attempt == kFeaturesAndLimits) ddesc.requiredLimits = &required_limits;
             ddesc.SetUncapturedErrorCallback(
                 [](const wgpu::Device&, wgpu::ErrorType, wgpu::StringView msg, Impl* self) {
+                    if (tl_shader_worker) {  // drained by the executor thread (drain_worker_errors)
+                        std::lock_guard<std::mutex> lock(self->worker_error_mu);
+                        ++self->worker_error_count;
+                        if (self->worker_errors.size() < 64) self->worker_errors.push_back(to_string(msg));
+                        return;
+                    }
                     ++self->stats.device_errors;
                     self->stats.last_device_error = to_string(msg);
                     if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
@@ -1027,6 +1090,7 @@ struct NativeExecutor::Impl {
                 if (attempt == kBare) {  // the features were dropped with the request
                     features = DeviceFeatures{};
                     required.clear();
+                    want_worker_sync = false;
                 }
                 break;
             }
@@ -1038,6 +1102,13 @@ struct NativeExecutor::Impl {
         }
         device = dr.device;
         queue = device.GetQueue();
+        if (want_worker_sync && !shader_workers.running()) {
+            const unsigned n = shader_worker_count(std::thread::hardware_concurrency(), std::getenv("PG6_SHADER_WORKERS"));
+            if (n) shader_workers.start(n);
+        }
+        // A rebuilt device without the feature keeps the (idle) threads but compiles on this thread again.
+        use_shader_workers = want_worker_sync && shader_workers.running();
+        stats.shader_workers = use_shader_workers ? shader_workers.size() : 0;
         wgpu::Limits limits{};
         if (device.GetLimits(&limits) == wgpu::Status::Success && limits.maxComputeWorkgroupsPerDimension >= 1)
             max_workgroups_per_dim = limits.maxComputeWorkgroupsPerDimension;
@@ -1784,6 +1855,8 @@ struct NativeExecutor::Impl {
         layouts_by_content.clear();
         render_pipelines.clear();
         compute_pipelines.clear();
+        deferred_render.clear();
+        deferred_compute.clear();
         bind_groups.clear();
         dummy_buffers.clear();
         dummy_samplers.clear();
@@ -1979,6 +2052,7 @@ struct NativeExecutor::Impl {
         }
         journal_record(p);
         if (p.opcode == static_cast<uint16_t>(GpuOpcode::DestroyResource) && p.payload_bytes >= 4) journal_prune(read_payload<uint32_t>(p));
+        pump_deferred();
         const uint64_t t0 = now_ns();
         bool r;
         const bool diag_scopes = error_scope_active(options.gpu_error_scopes, stats.device_errors, error_scoped_total.load());
@@ -2338,6 +2412,8 @@ struct NativeExecutor::Impl {
         shaders.erase(id);
         render_pipelines.erase(id);
         compute_pipelines.erase(id);
+        deferred_render.erase(id);
+        deferred_compute.erase(id);
         reflected_render.erase(id);
         reflected_compute.erase(id);
         compute_hash.erase(id);
@@ -2545,11 +2621,11 @@ struct NativeExecutor::Impl {
             shader_hash = *hash;
             if (pack && pack->has(*hash)) {
                 ++stats.shader_pack_hits;
-                ShaderEntry e;
-                e.stage = h.stage;
-                e.hash = shader_hash;
-                e.reflect_hash = shader_hash;
-                e.pending = true;
+                auto e = std::make_shared<ShaderEntry>();
+                e->stage = h.stage;
+                e->hash = shader_hash;
+                e->reflect_hash = shader_hash;
+                e->pending = true;
                 shaders[h.id] = std::move(e);
                 ++stats.shader_modules;
                 return;
@@ -2558,15 +2634,141 @@ struct NativeExecutor::Impl {
             }
         }
         const char* stage_name = h.stage == 0 ? "vertex" : h.stage == 1 ? "fragment" : h.stage == 2 ? "compute" : "";
-        ShaderEntry e;
-        e.stage = h.stage;
-        e.hash = shader_hash;
-        e.reflect_hash = text_hash;
-        e.explicit_ep = extract_wgsl_entry_point(code, stage_name);
-        e.module = make_module(code);
-        e.code = std::move(code);
+        auto e = std::make_shared<ShaderEntry>();
+        e->stage = h.stage;
+        e->hash = shader_hash;
+        e->reflect_hash = text_hash;
+        e->explicit_ep = extract_wgsl_entry_point(code, stage_name);
+        e->module = make_module(code);
+        e->code = std::move(code);
         shaders[h.id] = std::move(e);
         ++stats.shader_modules;
+    }
+
+    static const char* stage_name_of(uint32_t stage) {
+        return stage == 0 ? "vertex" : stage == 1 ? "fragment" : stage == 2 ? "compute" : "";
+    }
+
+    // Shader worker job (any thread but the executor's): everything ensure_shader() and the pipeline
+    // builders would do with the WGSL text, so the executor only picks up the results. Touches only
+    // the entry (owned by the worker until `ready`), the pack (locked reads) and the device (thread-safe
+    // with ImplicitDeviceSynchronization).
+    static void materialize_on_worker(const wgpu::Device& device, const std::shared_ptr<WgslPack>& pk, ShaderEntry& e) {
+        tl_shader_worker = true;
+        std::optional<std::string> hit = pk ? pk->get(e.hash) : std::nullopt;
+        if (hit && !hit->empty()) {
+            e.code = std::move(*hit);
+        } else {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "hash:%llx", static_cast<unsigned long long>(e.hash));
+            e.code = buf;
+            e.worker_miss = true;
+        }
+        const char* stage_name = stage_name_of(e.stage);
+        e.explicit_ep = extract_wgsl_entry_point(e.code, stage_name);
+        const uint64_t t0 = now_ns();
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = {e.code.data(), e.code.size()};
+        wgpu::ShaderModuleDescriptor desc{};
+        desc.nextInChain = &wgsl;
+        e.module = device.CreateShaderModule(&desc);
+        const uint64_t t1 = now_ns();
+        e.worker_ns = t1 - t0;
+        e.worker_private_mb = host_private_mb();
+        // The scans the pipeline builders need (memoized: entry_point_of / group0_of / ... find them).
+        if (*stage_name) {
+            e.ep_cache[stage_slot(stage_name)] = resolve_shader_entry_point(e.code, e.explicit_ep, stage_name);
+            ++e.worker_scans;
+        }
+        e.group0_cache = parse_wgsl_group0_bindings(e.code);
+        e.declares_group0_cache = wgsl_declares_group0(e.code);
+        e.worker_scans += 2;
+        if (e.stage == 1) {
+            e.frag_mask_ep = e.ep_cache[1];
+            e.frag_mask_cache = wgsl_fragment_output_mask(e.code, e.frag_mask_ep);
+            ++e.worker_scans;
+        }
+        e.worker_scan_ns = now_ns() - t1;
+        tl_shader_worker = false;
+        e.ready.store(true, std::memory_order_release);
+    }
+
+    // Live mode: true while `e` is (or has just been handed over to be) materialized on a shader
+    // worker, i.e. a pipeline built from it has to wait. False: usable on this thread now (inline
+    // WGSL, already materialized, or no workers: ensure_shader() compiles it here as before).
+    bool shader_on_worker(const ShaderRef& e) {
+        if (!e || !use_shader_workers) return false;
+        if (e->pending) {
+            e->pending = false;
+            e->queued = true;
+            ++stats.shader_async_queued;
+            shader_workers.submit([dev = device, pk = pack, e] { materialize_on_worker(dev, pk, *e); });
+            return true;
+        }
+        if (!e->queued) return false;
+        if (!e->ready.load(std::memory_order_acquire)) return true;
+        account_worker_shader(*e);
+        return false;
+    }
+
+    // v1 pipelines are created synchronously: a shader a v2 pipeline already handed to a worker is
+    // waited for (unbudgeted, like the sync compile it replaces).
+    void shader_here_now(const ShaderRef& e) {
+        if (!e || !e->queued) return;
+        if (!shader_ready(e)) {
+            const uint64_t t0 = now_ns();
+            ++stats.shader_async_waits;
+            shader_workers.wait([&] { return shader_ready(e); }, kPipeWaitUnlimited);
+            stats.shader_async_wait_ns += now_ns() - t0;
+        }
+        account_worker_shader(*e);
+    }
+
+    static bool shader_ready(const ShaderRef& e) { return !e || !e->queued || e->ready.load(std::memory_order_acquire); }
+
+    // Folds a worker's results into the stats (once, on this thread).
+    static constexpr uint64_t kSlowShaderLogNs = 1000ull * 1000000ull;
+    uint64_t slow_shader_logs = 0;
+    void account_worker_shader(const ShaderEntry& e) {
+        if (e.accounted || !e.queued) return;
+        e.accounted = true;
+        ++stats.shader_materialized;
+        ++stats.shader_async;
+        stats.shader_async_ns += e.worker_ns;
+        if (e.worker_ns > stats.shader_async_max_ns) {
+            stats.shader_async_max_ns = e.worker_ns;
+            stats.shader_async_max_hash = e.hash;
+            stats.shader_async_max_bytes = e.code.size();
+        }
+        stats.shader_async_private_mb_max = std::max(stats.shader_async_private_mb_max, e.worker_private_mb);
+        stats.shader_scans += e.worker_scans;
+        stats.shader_scan_ns += e.worker_scan_ns;
+        if (e.worker_miss) ++stats.shader_pack_misses;
+        if (e.worker_ns >= kSlowShaderLogNs && slow_shader_logs < 32) {
+            ++slow_shader_logs;
+            std::fprintf(stderr, "[native_exec] shader worker: 0x%016llx, %zu WGSL bytes, module %llu ms, host private %llu MB\n",
+                         static_cast<unsigned long long>(e.hash), e.code.size(),
+                         static_cast<unsigned long long>(e.worker_ns / 1000000),
+                         static_cast<unsigned long long>(e.worker_private_mb));
+        }
+    }
+
+    // Device errors raised on a worker thread (the uncaptured-error callback queued them).
+    void drain_worker_errors() {
+        std::vector<std::string> errs;
+        uint64_t count = 0;
+        {
+            std::lock_guard<std::mutex> lock(worker_error_mu);
+            if (!worker_error_count) return;
+            count = worker_error_count;
+            worker_error_count = 0;
+            errs.swap(worker_errors);
+        }
+        stats.device_errors += count;
+        for (std::string& m : errs) {
+            stats.last_device_error = m;
+            if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(m);
+        }
     }
 
     // Materializes a pack-backed shader (see ShaderEntry). An entry the pack cannot deliver any more
@@ -2595,10 +2797,11 @@ struct NativeExecutor::Impl {
             stats.shader_materialize_max_hash = e.hash;
             stats.shader_materialize_max_bytes = e.code.size();
         }
-        char note[96];
-        std::snprintf(note, sizeof note, "shader 0x%016llx, %zu WGSL bytes, module %llu ms",
+        char note[128];
+        std::snprintf(note, sizeof note, "shader 0x%016llx, %zu WGSL bytes, module %llu ms, host private %llu MB",
                       static_cast<unsigned long long>(e.hash), e.code.size(),
-                      static_cast<unsigned long long>(dt / 1000000));
+                      static_cast<unsigned long long>(dt / 1000000),
+                      static_cast<unsigned long long>(dt >= kSlowPacketNs ? host_private_mb() : 0));
         slow_note = note;
     }
 
@@ -2621,6 +2824,25 @@ struct NativeExecutor::Impl {
             note_scan(now_ns() - t0);
         }
         return *e.group0_cache;
+    }
+
+    bool declares_group0_of(const ShaderEntry& e) {
+        if (!e.declares_group0_cache) {
+            const uint64_t t0 = now_ns();
+            e.declares_group0_cache = wgsl_declares_group0(e.code);
+            note_scan(now_ns() - t0);
+        }
+        return *e.declares_group0_cache;
+    }
+
+    std::optional<uint32_t> fragment_outputs_of(const ShaderEntry& e, const std::string& ep) {
+        if (!e.frag_mask_cache || e.frag_mask_ep != ep) {
+            const uint64_t t0 = now_ns();
+            e.frag_mask_ep = ep;
+            e.frag_mask_cache = wgsl_fragment_output_mask(e.code, ep);
+            note_scan(now_ns() - t0);
+        }
+        return *e.frag_mask_cache;
     }
 
     void note_scan(uint64_t ns) {
@@ -3296,23 +3518,69 @@ struct NativeExecutor::Impl {
 
     bool create_render_pipeline2(const Packet& p) {
         const auto h = read_payload<GpuCreateRenderPipeline2Payload>(p);
-        const GpuRenderPipelineKey& key = h.key;
-        wgpu::PipelineLayout layout;
-        bool auto_layout = h.pipeline_layout_id == 0;
-        bool group0_has_entries = false;
-        const std::optional<std::vector<Group0LayoutEntry>>* group0_entries = nullptr;
-        if (!auto_layout) {
+        const PlEntry* pl = nullptr;
+        if (h.pipeline_layout_id != 0) {
             auto lit = pipeline_layouts.find(h.pipeline_layout_id);
             if (lit == pipeline_layouts.end()) return fail("unknown pipeline layout " + std::to_string(h.pipeline_layout_id));
-            layout = lit->second.layout;
-            group0_has_entries = lit->second.group0_has_entries;
-            group0_entries = &lit->second.group0_entries;
-        } else {
-            ++stats.auto_layout_pipelines;
+            pl = &lit->second;
         }
         auto vit = shaders.find(h.vs_module_id);
         if (vit == shaders.end()) return fail("unknown vertex shader module " + std::to_string(h.vs_module_id));
-        const ShaderEntry& vs = vit->second;
+        ShaderRef vs = vit->second, fs;
+        if (h.fs_module_id != 0) {
+            auto fit = shaders.find(h.fs_module_id);
+            if (fit == shaders.end()) return fail("unknown fragment shader module " + std::to_string(h.fs_module_id));
+            fs = fit->second;
+        }
+        deferred_render.erase(h.id);
+        const bool vs_away = shader_on_worker(vs);
+        const bool fs_away = shader_on_worker(fs);
+        if (vs_away || fs_away) {
+            // Built once both shaders are ready (pump_deferred / a draw that needs it within budget).
+            RenderPipelineEntry e;
+            e.pending = std::make_shared<PendingPipe>();
+            e.deferred = true;
+            e.deferred_id = h.id;
+            e.fullscreen = std::min<uint32_t>(h.key.vertex_buffer_count, 8) == 0;
+            e.vs_hash = vs->hash;
+            e.fs_hash = fs ? fs->hash : 0;
+            e.auto_meta.gen = ++pipeline_gen_counter;
+            e.perf_hash = fs && fs->hash ? fs->hash : vs->hash;
+            e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs->hash);
+            render_pipelines[h.id] = std::move(e);
+            defer_pipeline(deferred_render, h.id, p, pl, std::move(vs), std::move(fs));
+            return true;
+        }
+        return build_render_pipeline2(h, pl, *vs, fs.get());
+    }
+
+    void defer_pipeline(std::unordered_map<uint32_t, DeferredPipe>& m, uint32_t id, const Packet& p, const PlEntry* pl,
+                        ShaderRef a, ShaderRef b) {
+        DeferredPipe d;
+        d.opcode = p.opcode;
+        d.payload.assign(p.payload, p.payload + p.payload_bytes);
+        if (pl) d.layout = *pl;
+        d.a = std::move(a);
+        d.b = std::move(b);
+        m[id] = std::move(d);
+        ++stats.pipelines_deferred;
+        stats.pipelines_deferred_max = std::max<uint64_t>(stats.pipelines_deferred_max, deferred_render.size() + deferred_compute.size());
+    }
+
+    bool build_render_pipeline2(const GpuCreateRenderPipeline2Payload& h, const PlEntry* pl, const ShaderEntry& vs,
+                                const ShaderEntry* fs) {
+        const GpuRenderPipelineKey& key = h.key;
+        wgpu::PipelineLayout layout;
+        bool auto_layout = pl == nullptr;
+        bool group0_has_entries = false;
+        const std::optional<std::vector<Group0LayoutEntry>>* group0_entries = nullptr;
+        if (!auto_layout) {
+            layout = pl->layout;
+            group0_has_entries = pl->group0_has_entries;
+            group0_entries = &pl->group0_entries;
+        } else {
+            ++stats.auto_layout_pipelines;
+        }
         ensure_shader(vs);
 
         // decodeRenderPipelineKey + validateVertexBufferLayouts
@@ -3367,11 +3635,7 @@ struct NativeExecutor::Impl {
 
         wgpu::RenderPipelineDescriptor rd{};
         wgpu::FragmentState fragment{};
-        const ShaderEntry* fs = nullptr;
-        if (h.fs_module_id != 0) {
-            auto fit = shaders.find(h.fs_module_id);
-            if (fit == shaders.end()) return fail("unknown fragment shader module " + std::to_string(h.fs_module_id));
-            fs = &fit->second;
+        if (fs) {
             ensure_shader(*fs);
             for (uint32_t i = 0; i < target_count; ++i) {
                 const GpuColorTargetKey& t = key.color_targets[i];
@@ -3388,7 +3652,7 @@ struct NativeExecutor::Impl {
             fragment.module = fs->module;
             const std::string& ep = entry_point_of(*fs, "fragment");
             // A target the fragment stage never writes must have writeMask 0 (Dawn validation).
-            if (const auto outs = wgsl_fragment_output_mask(fs->code, ep)) {
+            if (const auto outs = fragment_outputs_of(*fs, ep)) {
                 for (uint32_t i = 0; i < target_count && i < 32; ++i) {
                     if (targets[i].format == wgpu::TextureFormat::Undefined || (*outs >> i & 1u)) continue;
                     if (targets[i].writeMask != wgpu::ColorWriteMask::None) ++stats.write_masks_cleared;
@@ -3494,7 +3758,7 @@ struct NativeExecutor::Impl {
         } else {
             e.pipeline = device.CreateRenderPipeline(&rd);
         }
-        bool expects = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
+        bool expects = declares_group0_of(vs) || (fs && declares_group0_of(*fs));
         if (!expects && !auto_layout && group0_has_entries) expects = true;
         e.expects_group0 = expects;
         e.auto_meta = std::move(auto_meta);
@@ -3538,10 +3802,114 @@ struct NativeExecutor::Impl {
 
     PipeWaitBudget pipe_budget;
 
+    // ---- pipelines deferred on their shaders (shader workers, live mode) ----
+
+    // Waits up to `timeout_ns` (kPipeWaitUnlimited = no limit) for the shaders of a deferred pipeline,
+    // then builds it (Create*PipelineAsync: the compile itself is then Dawn's). True once it is no
+    // longer deferred. `slot` is the map entry itself and is rewritten in place by the build.
+    bool settle(const AsyncSlot& slot, uint64_t timeout_ns) {
+        if (!slot.deferred) return true;
+        const bool compute = slot.deferred_compute;
+        auto& m = compute ? deferred_compute : deferred_render;
+        auto it = m.find(slot.deferred_id);
+        if (it == m.end()) {  // cannot happen (erased together with the entry); never leave it hanging
+            slot.deferred = false;
+            slot.pending.reset();
+            slot.failed = true;
+            return true;
+        }
+        const ShaderRef a = it->second.a, b = it->second.b;
+        auto ready = [&] { return shader_ready(a) && shader_ready(b); };
+        if (!ready()) {
+            if (timeout_ns == 0) return false;
+            const uint64_t t0 = now_ns();
+            ++stats.shader_async_waits;
+            const bool ok = shader_workers.wait(ready, timeout_ns);
+            stats.shader_async_wait_ns += now_ns() - t0;
+            if (!ok) return false;
+        }
+        build_deferred(compute, slot.deferred_id);
+        return true;
+    }
+
+    // Budgeted (the frame's pipeline wait budget, as for a still-compiling pipeline): false = the
+    // shaders are not ready in time; the caller drops the draw / dispatch and counts it.
+    bool settle_budgeted(const AsyncSlot& slot) {
+        if (!slot.deferred) return true;
+        const uint64_t allow = pipe_budget.allowance(slot.fullscreen);
+        const uint64_t t0 = now_ns();
+        const bool built = settle(slot, allow);
+        pipe_budget.charge(slot.fullscreen, now_ns() - t0);
+        return built;
+    }
+
+    // Replays a deferred pipeline packet with its captured layout and shaders. A failure (the
+    // packet's own validation) leaves a failed entry: draws / dispatches with it are dropped and counted.
+    void build_deferred(bool compute, uint32_t id) {
+        auto& m = compute ? deferred_compute : deferred_render;
+        auto it = m.find(id);
+        if (it == m.end()) return;
+        DeferredPipe d = std::move(it->second);
+        m.erase(it);
+        account_worker_shader(*d.a);
+        if (d.b) account_worker_shader(*d.b);
+        const PlEntry* pl = d.layout ? &*d.layout : nullptr;
+        bool ok;
+        if (compute) {
+            GpuCreateComputePipeline2Payload h;
+            std::memcpy(&h, d.payload.data(), std::min(sizeof h, d.payload.size()));
+            ok = build_compute_pipeline2(h, pl, *d.a);
+        } else {
+            GpuCreateRenderPipeline2Payload h;
+            std::memcpy(&h, d.payload.data(), std::min(sizeof h, d.payload.size()));
+            ok = build_render_pipeline2(h, pl, *d.a, d.b.get());
+        }
+        ++stats.pipelines_deferred_built;
+        if (ok) return;
+        packet_error(d.opcode, pending_error("deferred pipeline build failed"));
+        if (compute) {
+            auto e = compute_pipelines.find(id);
+            if (e == compute_pipelines.end()) return;
+            e->second.deferred = false;
+            e->second.pending.reset();
+            e->second.failed = true;
+            e->second.pipeline = make_error_compute_pipeline();
+        } else {
+            auto e = render_pipelines.find(id);
+            if (e == render_pipelines.end()) return;
+            e->second.deferred = false;
+            e->second.pending.reset();
+            e->second.failed = true;
+            e->second.pipeline = make_error_render_pipeline();
+        }
+    }
+
+    // Between packets: builds every deferred pipeline whose shaders finished, so Dawn starts
+    // compiling it ahead of its first use. Cheap when no worker finished anything since the last call.
+    void pump_deferred() {
+        drain_worker_errors();
+        if (deferred_render.empty() && deferred_compute.empty()) return;
+        const uint64_t done = shader_workers.completed();
+        if (done == deferred_seen_completed) return;
+        deferred_seen_completed = done;
+        std::vector<uint32_t> ids;
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool compute = pass == 1;
+            ids.clear();
+            for (const auto& [id, d] : compute ? deferred_compute : deferred_render)
+                if (shader_ready(d.a) && shader_ready(d.b)) ids.push_back(id);
+            for (uint32_t id : ids) build_deferred(compute, id);
+        }
+    }
+
     // Waits for the entry's compile within the frame's wait budget (pipe_budget_model.h); true once it
     // finished. A pipeline built ahead of use is already done and costs nothing here. False: still
     // compiling past the budget, the caller skips the draw / dispatch (the compile keeps running).
     bool await_pipe(const AsyncSlot& slot) {
+        if (slot.deferred) {
+            if (!settle_budgeted(slot)) return false;
+            if (!slot.pending) return true;  // its build failed: resolve() hands out nothing
+        }
         if (slot.pending->done) return true;
         instance.ProcessEvents();
         if (slot.pending->done) return true;
@@ -3558,6 +3926,10 @@ struct NativeExecutor::Impl {
 
     // Blocks without a budget (bind group layout / remap paths that need the pipeline's layout now).
     void await_pipe_forever(const AsyncSlot& slot) {
+        if (slot.deferred) {
+            settle(slot, kPipeWaitUnlimited);
+            if (!slot.pending) return;
+        }
         if (slot.pending->done) return;
         ++stats.async_pipeline_waits;
         const uint64_t t0 = now_ns();
@@ -3568,6 +3940,7 @@ struct NativeExecutor::Impl {
     // Still compiling (no wait): the draw / dispatch using it is dropped.
     bool pipe_still_pending(const AsyncSlot& slot) {
         if (!slot.pending) return false;
+        if (slot.deferred) return true;  // not even created: only SetPipeline / a binding settles it (budgeted)
         if (slot.pending->done) return false;
         instance.ProcessEvents();
         return !slot.pending->done;
@@ -3640,6 +4013,7 @@ struct NativeExecutor::Impl {
     const wgpu::RenderPipeline& resolve(const RenderPipelineEntry& e) {
         if (e.pending) {
             await_pipe_forever(e);
+            if (!e.pending) return e.pipeline;  // a deferred build that failed
             if (e.pending->render) {
                 e.pipeline = e.pending->render;
             } else {
@@ -3668,6 +4042,7 @@ struct NativeExecutor::Impl {
     const wgpu::ComputePipeline& resolve(const ComputePipelineEntry& e) {
         if (e.pending) {
             await_pipe_forever(e);
+            if (!e.pending) return e.pipeline;
             if (e.pending->compute) {
                 e.pipeline = e.pending->compute;
             } else {
@@ -3681,20 +4056,42 @@ struct NativeExecutor::Impl {
 
     bool create_compute_pipeline2(const Packet& p) {
         const auto h = read_payload<GpuCreateComputePipeline2Payload>(p);
-        wgpu::PipelineLayout layout;
-        const bool auto_layout = h.pipeline_layout_id == 0;
-        const std::optional<std::vector<Group0LayoutEntry>>* group0_entries = nullptr;
-        if (!auto_layout) {
+        const PlEntry* pl = nullptr;
+        if (h.pipeline_layout_id != 0) {
             auto lit = pipeline_layouts.find(h.pipeline_layout_id);
             if (lit == pipeline_layouts.end()) return fail("unknown pipeline layout " + std::to_string(h.pipeline_layout_id));
-            layout = lit->second.layout;
-            group0_entries = &lit->second.group0_entries;
-        } else {
-            ++stats.auto_layout_pipelines;
+            pl = &lit->second;
         }
         auto cit = shaders.find(h.cs_module_id);
         if (cit == shaders.end()) return fail("unknown compute shader module " + std::to_string(h.cs_module_id));
-        const ShaderEntry& cs = cit->second;
+        ShaderRef cs = cit->second;
+        deferred_compute.erase(h.id);
+        if (shader_on_worker(cs)) {
+            ComputePipelineEntry ce;
+            ce.pending = std::make_shared<PendingPipe>();
+            ce.deferred = true;
+            ce.deferred_id = h.id;
+            ce.deferred_compute = true;
+            ce.vs_hash = cs->hash;
+            compute_pipelines[h.id] = std::move(ce);
+            compute_meta.erase(h.id);  // known once built (the remap needs the WGSL's group 0 bindings)
+            compute_hash[h.id] = cs->hash;
+            defer_pipeline(deferred_compute, h.id, p, pl, std::move(cs), nullptr);
+            return true;
+        }
+        return build_compute_pipeline2(h, pl, *cs);
+    }
+
+    bool build_compute_pipeline2(const GpuCreateComputePipeline2Payload& h, const PlEntry* pl, const ShaderEntry& cs) {
+        wgpu::PipelineLayout layout;
+        const bool auto_layout = pl == nullptr;
+        const std::optional<std::vector<Group0LayoutEntry>>* group0_entries = nullptr;
+        if (!auto_layout) {
+            layout = pl->layout;
+            group0_entries = &pl->group0_entries;
+        } else {
+            ++stats.auto_layout_pipelines;
+        }
         ensure_shader(cs);
         const std::string& ep = entry_point_of(cs, "compute");
         AutoLayoutMeta auto_meta;
@@ -3747,7 +4144,8 @@ struct NativeExecutor::Impl {
             ++stats.op_errors;  // unknown vertex shader module
             return;
         }
-        const ShaderEntry& vs = vit->second;
+        const ShaderEntry& vs = *vit->second;
+        shader_here_now(vit->second);
         ensure_shader(vs);
         const ShaderEntry* fs = nullptr;
         if (h.fs_shader_id != 0) {
@@ -3756,7 +4154,8 @@ struct NativeExecutor::Impl {
                 ++stats.op_errors;  // unknown fragment shader module
                 return;
             }
-            fs = &fit->second;
+            fs = fit->second.get();
+            shader_here_now(fit->second);
             ensure_shader(*fs);
         }
         const reflect::StageRecord* vs_refl = resolve_shader_reflection(vs, "vertex");
@@ -3848,7 +4247,8 @@ struct NativeExecutor::Impl {
         const auto h = read_payload<GpuCreateComputePipelinePayload>(p);
         auto cit = shaders.find(h.cs_shader_id);
         if (cit == shaders.end()) return;  // `_buildComputePipelineDescriptorV1` returns null silently
-        const ShaderEntry& cs = cit->second;
+        const ShaderEntry& cs = *cit->second;
+        shader_here_now(cit->second);
         ensure_shader(cs);
         const reflect::StageRecord* cs_refl = resolve_shader_reflection(cs, "compute");
         ReflectedLayout reflected;
@@ -4747,6 +5147,9 @@ struct NativeExecutor::Impl {
             e.had_explicit_compute = false;
             e.compute_valid = false;
         } else if (const auto* sp = std::get_if<SetPipelineCmd>(&cmd)) {
+            // A pipeline still waiting for its shaders is built first (within the budget): the remap
+            // state below reads what the build decides.
+            if (auto dit = render_pipelines.find(sp->id); dit != render_pipelines.end()) settle_budgeted(dit->second);
             remap_set_render_pipeline(sp->id);
             e.ensure_render();
             e.active_pipeline = sp->id;
@@ -4801,6 +5204,13 @@ struct NativeExecutor::Impl {
                     note_quarantined(e.compute_quarantined_hash, true);
                     return;
                 }
+                if (e.had_explicit_compute && !e.compute_valid && (e.compute_pending || e.compute_failed)) {
+                    // As a direct dispatch: no pipeline was set (still compiling past the budget / failed).
+                    ++stats.dispatches_skipped;
+                    if (e.compute_failed) note_pipeline_failed(e.compute_pending_hash, true);
+                    else note_pipeline_pending(e.compute_pending_hash, true);
+                    return;
+                }
                 e.ensure_compute();
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
@@ -4810,6 +5220,7 @@ struct NativeExecutor::Impl {
                 ++stats.draws;
             }
         } else if (const auto* sc = std::get_if<SetComputePipelineCmd>(&cmd)) {
+            if (auto dit = compute_pipelines.find(sc->id); dit != compute_pipelines.end()) settle_budgeted(dit->second);
             remap_set_compute_pipeline(sc->id);
             e.ensure_compute();
             e.had_explicit_compute = true;
@@ -5854,6 +6265,7 @@ NativeExecutor::NativeExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(imp
 
 NativeExecutor::~NativeExecutor() {
     if (impl_) impl_->shot_join();
+    if (impl_) impl_->shader_workers.stop();  // before the device goes: a running compile finishes first
     if (impl_ && impl_->device) {
         impl_->pass_cmds.clear();
         impl_->buffers.clear();
@@ -6096,6 +6508,23 @@ std::string NativeExecutor::stats_json() const {
     num("shader_materialize_max_bytes", st.shader_materialize_max_bytes);
     num("shader_scans", st.shader_scans);
     num("shader_scan_ms", st.shader_scan_ns / 1000000ull);
+    num("shader_workers", st.shader_workers);
+    num("shader_async_queued", st.shader_async_queued);
+    num("shader_async", st.shader_async);
+    num("shader_async_ms", st.shader_async_ns / 1000000ull);
+    num("shader_async_max_ms", st.shader_async_max_ns / 1000000ull);
+    {
+        char h[24];
+        std::snprintf(h, sizeof h, "0x%016llx", static_cast<unsigned long long>(st.shader_async_max_hash));
+        j += std::string("\"shader_async_max_hash\": \"") + h + "\", ";
+    }
+    num("shader_async_max_bytes", st.shader_async_max_bytes);
+    num("shader_async_private_mb_max", st.shader_async_private_mb_max);
+    num("shader_async_waits", st.shader_async_waits);
+    num("shader_async_wait_ms", st.shader_async_wait_ns / 1000000ull);
+    num("pipelines_deferred", st.pipelines_deferred);
+    num("pipelines_deferred_built", st.pipelines_deferred_built);
+    num("pipelines_deferred_max", st.pipelines_deferred_max);
     num("slow_packets", st.slow_packets);
     num("slow_packet_max_ms", st.slow_packet_max_ns / 1000000ull);
     num("textures_created", st.textures_created);

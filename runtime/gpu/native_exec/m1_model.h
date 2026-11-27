@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -103,9 +104,11 @@ public:
     size_t size() const { return entries_.size(); }
     bool has(uint64_t hash) const { return entries_.count(hash) != 0; }
 
+    // Thread-safe (the shader workers read concurrently): one seek + read at a time.
     std::optional<std::string> get(uint64_t hash) {
         auto it = entries_.find(hash);
         if (it == entries_.end() || !file_) return std::nullopt;
+        std::lock_guard<std::mutex> lock(read_mu_);
 #ifdef _WIN32
         _fseeki64(file_, static_cast<long long>(it->second.offset), SEEK_SET);
 #else
@@ -119,6 +122,7 @@ public:
 private:
     std::string path_;
     FILE* file_ = nullptr;
+    std::mutex read_mu_;
     std::unordered_map<uint64_t, Entry> entries_;
 };
 

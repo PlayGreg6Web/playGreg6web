@@ -1,11 +1,14 @@
 // Native executor stream model (gpu/native_exec/stream_model.h, replay_frames.h): packet walking,
 // payload decoding and the replay frame split / digest, checked against the browser worker's rules.
 // No GPU involved.
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
@@ -19,6 +22,7 @@
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/replay_frames.h"
+#include "gpu/native_exec/shader_workers.h"
 #include "gpu/native_exec/show_target_model.h"
 #include "gpu/native_exec/stream_model.h"
 
@@ -1053,6 +1057,35 @@ void test_pipe_wait_budget() {
     CHECK(b.allowance(true) == kPipeWaitUnlimited);
 }
 
+void test_shader_workers() {
+    CHECK(shader_worker_count(24, nullptr) == 4);  // a quarter, at most 4
+    CHECK(shader_worker_count(8, "") == 2);
+    CHECK(shader_worker_count(2, nullptr) == 1);  // at least one
+    CHECK(shader_worker_count(24, "0") == 0);     // PG6_SHADER_WORKERS=0: off
+    CHECK(shader_worker_count(24, "7") == 7);
+    CHECK(shader_worker_count(24, "x") == 4);     // not a number: the default
+
+    ShaderWorkers w;
+    CHECK(!w.running());
+    w.start(2);
+    CHECK(w.running() && w.size() == 2);
+    std::atomic<bool> release{false};
+    std::atomic<int> done{0};
+    w.submit([&] {
+        while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ++done;
+    });
+    w.submit([&] { ++done; });
+    // A bounded wait for an unfinished job times out instead of blocking.
+    CHECK(!w.wait([&] { return done.load() == 2; }, 20ull * 1000000ull));
+    release = true;
+    CHECK(w.wait([&] { return done.load() == 2; }, kPipeWaitUnlimited));
+    CHECK(w.wait([&] { return w.completed() == 2; }, 1000ull * 1000000ull));
+    CHECK(w.outstanding() == 0);
+    w.stop();
+    CHECK(!w.running());
+}
+
 void test_fragment_outputs() {
     CHECK(wgsl_fragment_output_mask("@fragment fn fs_main() -> @location(0) vec4f { return vec4f(); }", "fs_main") == 1u);
     CHECK(wgsl_fragment_output_mask("struct O { @location(0) a: vec4f, @location(2) b: vec4f }\n"
@@ -1222,6 +1255,7 @@ int main() {
     test_blit_model();
     test_show_target_model();
     test_pipe_wait_budget();
+    test_shader_workers();
     test_remap_bindings_match();
     test_fragment_outputs();
     test_error_scope_model();

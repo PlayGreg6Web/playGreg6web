@@ -1697,6 +1697,141 @@ void test_async_pipelines_and_blob_cache() {
     fs::remove_all(root, ec);
 }
 
+// Live mode with a WGSL pack: the pack shader's module is compiled on a shader worker, not on the
+// executor (queue) thread. The pipeline packet returns at once; the pipeline is created once the
+// shader is ready. A dispatch that needs it earlier waits within the frame's pipeline budget; past the
+// budget it is dropped and counted (pipeline_pending), never run with a stand-in.
+std::string big_compute_wgsl(int pad_functions) {
+    std::string s = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n";
+    for (int i = 0; i < pad_functions; ++i) {
+        const std::string n = std::to_string(i);
+        s += "fn pad" + n + "(x: u32) -> u32 { var a = x * " + n + "u; a = a ^ (a >> 3u); if (a > " + n +
+             "u) { a = a - 1u; } return a + " + n + "u; }\n";
+    }
+    s += "@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = i * 3u + 2u; }\n";
+    return s;
+}
+
+bool write_one_shader_pack(const std::string& path, uint64_t hash, uint8_t wgpk_stage, const std::string& wgsl) {
+    std::vector<uint8_t> pack = {'W', 'G', 'P', 'K', 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+    append(pack, hash);
+    pack.push_back(wgpk_stage);
+    pack.insert(pack.end(), 3, 0);
+    append(pack, static_cast<uint32_t>(16 + 20));
+    append(pack, static_cast<uint32_t>(wgsl.size()));
+    pack.insert(pack.end(), wgsl.begin(), wgsl.end());
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(pack.data(), 1, pack.size(), f) == pack.size();
+    std::fclose(f);
+    return ok;
+}
+
+void set_env(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    if (*v) setenv(k, v, 1);
+    else unsetenv(k);
+#endif
+}
+
+void test_shader_workers(const char* wait_ms) {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.async_pipelines = true;
+    set_env("PG6_PIPELINE_WAIT_MS", wait_ms);
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto exu = NativeExecutor::create(opts, &status, &error);
+    set_env("PG6_PIPELINE_WAIT_MS", "");
+    if (!exu) {
+        CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+        return;
+    }
+    NativeExecutor& ex = *exu;
+    if (ex.stats().shader_workers == 0) {
+        std::printf("shader workers: skipped (no implicit device synchronization)\n");
+        return;
+    }
+    const std::string path = "test_native_executor_workers.wgsl.pack";
+    const std::string wgsl = big_compute_wgsl(1500);  // ~180 KB: a module compile that takes a while
+    CHECK(write_one_shader_pack(path, 0x00b16b00b5c0ffeeull, 3, wgsl));
+    std::string err;
+    CHECK(ex.load_wgsl_pack(path, &err));
+    const ExecutorStats before = ex.stats();
+
+    gpu::CommandEncoder setup;
+    setup.create_buffer(110, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(111, GpuShaderStage::Compute, "0x00b16b00b5c0ffee");
+    create_layouts(setup, 112, 113, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 114;
+    cp.cs_module_id = 111;
+    cp.pipeline_layout_id = 113;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 115, 112, {bg_entry(0, GpuBindResourceType::Buffer, 110)});
+    // The layout is destroyed right away: the deferred pipeline keeps the one it was created with.
+    emit(setup, GpuOpcode::DestroyResource, bytes_of(uint32_t{113}));
+    const auto t0 = std::chrono::steady_clock::now();
+    run(ex, setup);
+    const uint64_t setup_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    {
+        const ExecutorStats& s = ex.stats();
+        CHECK(s.shader_async_queued == before.shader_async_queued + 1);
+        CHECK(s.pipelines_deferred == before.pipelines_deferred + 1);
+        CHECK(s.shader_materialize_ns == before.shader_materialize_ns);  // nothing compiled on this thread
+    }
+
+    const uint32_t want[4] = {2, 5, 8, 11};
+    bool ok = false, first_ok = false;
+    int frames = 0;
+    const auto tf = std::chrono::steady_clock::now();
+    for (int frame = 0; frame < 2000 && !ok; ++frame, ++frames) {
+        gpu::CommandEncoder f;
+        f.begin_frame();
+        f.set_compute_pipeline(114);
+        set_bind_group2(f, 0, 115);
+        f.dispatch_compute(1, 1, 1);
+        f.present();
+        run(ex, f);
+        ex.wait_idle();
+        std::vector<uint8_t> out;
+        ok = ex.read_buffer(110, 0, 16, &out, &err) && out.size() == 16 && std::memcmp(out.data(), want, 16) == 0;
+        if (frame == 0) first_ok = ok;
+        if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(ok);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.shader_async == before.shader_async + 1);
+    CHECK(s.pipelines_deferred_built == before.pipelines_deferred_built + 1);
+    CHECK(s.shader_materialize_ns == before.shader_materialize_ns);
+    CHECK(s.async_pipeline_failures == before.async_pipeline_failures);
+    CHECK(s.device_errors == before.device_errors);
+    // The executor thread never compiled: the setup batch returned before the worker finished.
+    CHECK(setup_ns < s.shader_async_ns - before.shader_async_ns);
+    if (std::string(wait_ms) == "0") {
+        // Never waits: every dispatch before the pipeline existed was dropped and counted.
+        if (!first_ok) CHECK(s.pipeline_pending_skips > before.pipeline_pending_skips);
+        CHECK(s.shader_async_wait_ns == before.shader_async_wait_ns);
+    } else {
+        // A long budget: the first dispatch waited for the worker and ran.
+        CHECK(first_ok);
+        CHECK(s.pipeline_pending_skips == before.pipeline_pending_skips);
+    }
+    std::printf("shader workers (wait %s ms): %llu workers, setup %llu us, worker compile %llu ms, waited %llu ms, first frame %s, frames %d, %lld ms\n",
+                wait_ms, static_cast<unsigned long long>(s.shader_workers), static_cast<unsigned long long>(setup_ns / 1000),
+                static_cast<unsigned long long>((s.shader_async_ns - before.shader_async_ns) / 1000000),
+                static_cast<unsigned long long>((s.shader_async_wait_ns - before.shader_async_wait_ns) / 1000000),
+                first_ok ? "ran" : "dropped", frames,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tf).count()));
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 void test_depth_texture_float_layout(NativeExecutor& ex) {
     // A float layout entry with a depth texture bound: the executor binds the entry's dummy instead
     // of letting Dawn reject the bind group; the 'depth' layout entry takes the real view.
@@ -2926,6 +3061,8 @@ int main() {
     test_overlay_read_only();
     test_show_target_bad_option();
     test_async_pipelines_and_blob_cache();
+    test_shader_workers("0");
+    test_shader_workers("10000");
     test_remap_reflected_layout(true);
     test_remap_reflected_layout(false);
     test_dawn_validation_fixes(*ex);
