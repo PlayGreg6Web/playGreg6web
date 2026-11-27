@@ -62,9 +62,13 @@ int main() {
     t.xapu_type1 = 2;
     t.xapu_type2 = 2;
     t.xapu_type3 = 7;
+    t.xma_frames = 9;
+    t.xma_frames_decoded = 8;
+    t.xma_bad_frames = 1;
     const std::string json2 = ar::to_json(t, {}, 0);
     CHECK(json2.find("\"xapu_commands\": 12, \"xapu_unhandled_commands\": 1") != std::string::npos);
     CHECK(json2.find("\"xapu_commands_by_type\": {\"1\": 2, \"2\": 2, \"3\": 7, \"5\": 0}") != std::string::npos);
+    CHECK(json2.find("\"xma_frames\": 9, \"xma_frames_decoded\": 8, \"xma_bad_frames\": 1") != std::string::npos);
     CHECK(ar::to_json(ar::Totals{}, {}, 0).find("\"non_silent_fraction\": 0.000000") != std::string::npos);
 
     {  // XApuConnect params as the title sends them (raw dump, menu run)

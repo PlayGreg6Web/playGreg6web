@@ -85,13 +85,15 @@ struct Totals {
     uint64_t xapu_type1 = 0, xapu_type2 = 0, xapu_type3 = 0, xapu_type5 = 0;
     // XMA decoder contexts (AcpHal shape contexts of kind 4) at report time: allocated, set up by
     // the title, with an input buffer marked valid, and with decoded output not yet consumed.
-    // There is no XMA decoder, so input_valid > 0 means XMA voices (music, ambience) wait forever.
+    // input_valid > 0 with the decode worker idle means XMA voices (music, ambience) are not being consumed.
     uint64_t xma_contexts = 0, xma_contexts_touched = 0, xma_contexts_input_valid = 0, xma_contexts_output_pending = 0;
     // AcpHal XMA commands: contexts enabled now, enable (5 and 6) / read-advance (18) commands.
     uint64_t xma_contexts_enabled = 0, xma_enable_commands = 0, xma_read_advances = 0;
-    // The XMA decode worker: frames walked and 256-byte output blocks written (silence until a
-    // WMA Pro frame decoder exists), times a voice ran out of input.
-    uint64_t xma_frames = 0, xma_blocks_written = 0, xma_input_exhausted = 0;
+    // The XMA decode worker: frames walked, frames the WMA Pro decoder turned into PCM (the rest
+    // are silence), frames or buffers it could not walk, 256-byte output blocks written, times a
+    // voice ran out of input.
+    uint64_t xma_frames = 0, xma_frames_decoded = 0, xma_bad_frames = 0, xma_blocks_written = 0,
+             xma_input_exhausted = 0;
 };
 
 // Non-silent share of everything the title released: render-client frames plus spatial passes
@@ -134,6 +136,8 @@ inline std::string to_json(const Totals& t, const std::vector<uint64_t>& windows
     add("xma_enable_commands", t.xma_enable_commands);
     add("xma_read_advances", t.xma_read_advances);
     add("xma_frames", t.xma_frames);
+    add("xma_frames_decoded", t.xma_frames_decoded);
+    add("xma_bad_frames", t.xma_bad_frames);
     add("xma_blocks_written", t.xma_blocks_written);
     add("xma_input_exhausted", t.xma_input_exhausted);
     add("window_ms", kWindowMs);

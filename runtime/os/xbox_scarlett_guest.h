@@ -489,7 +489,7 @@ struct XmaCommandStats {
     uint32_t enabled_now = 0;  // contexts enabled at the moment
     // The decode worker: XMA frames walked, 256-byte output blocks written, loops taken, times a
     // voice ran out of input, frames or buffers it could not walk.
-    uint64_t frames = 0, blocks_written = 0, loops = 0, input_exhausted = 0, bad_frames = 0;
+    uint64_t frames = 0, frames_decoded = 0, blocks_written = 0, loops = 0, input_exhausted = 0, bad_frames = 0;
 };
 XmaCommandStats xma_command_stats();
 bool xma_context_enabled(uint32_t index);

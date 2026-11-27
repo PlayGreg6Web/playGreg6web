@@ -510,8 +510,7 @@ void trace_window(uint32_t objects_this_pass, float pass_peak) {
     com::detail::diagnostic(line);
     const Pg6XmaContextCensus xma = pg6_mw_xma_context_census();
     std::snprintf(line, sizeof(line),
-                  "audio-trace: XMA contexts %u: %u set up, %u with input valid, %u with output pending (no XMA "
-                  "decoder: input stays queued)",
+                  "audio-trace: XMA contexts %u: %u set up, %u with input valid, %u with output pending",
                   xma.contexts, xma.touched, xma.input_valid, xma.output_pending);
     com::detail::diagnostic(line);
     objects = 0;

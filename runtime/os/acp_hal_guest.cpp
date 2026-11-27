@@ -102,7 +102,7 @@ struct XmaState {
     std::atomic<uint32_t> dumped{0};
     std::atomic<uint32_t> trace_lines{0};
     // Filled by the worker (atomics: read by xma_command_stats without the voice locks).
-    std::atomic<uint64_t> frames{0}, blocks_written{0}, loops{0}, exhausted{0}, bad_frames{0};
+    std::atomic<uint64_t> frames{0}, frames_decoded{0}, blocks_written{0}, loops{0}, exhausted{0}, bad_frames{0};
 };
 void quiesce_xma_contexts();
 XmaState& xma() {
@@ -188,6 +188,7 @@ void dump_enabled_context(uint32_t index, xd::Context ctx, const xd::ApuMap& map
 void account(const xd::VoiceStats& before, const xd::VoiceStats& after) {
     auto& x = xma();
     x.frames += after.frames - before.frames;
+    x.frames_decoded += after.frames_decoded - before.frames_decoded;
     x.blocks_written += after.blocks_written - before.blocks_written;
     x.loops += after.loops - before.loops;
     x.exhausted += after.exhausted - before.exhausted;
@@ -1184,6 +1185,7 @@ XmaCommandStats xma_command_stats() {
     std::lock_guard<std::mutex> lock(x.mutex);
     XmaCommandStats s = x.stats;
     s.frames = x.frames;
+    s.frames_decoded = x.frames_decoded;
     s.blocks_written = x.blocks_written;
     s.loops = x.loops;
     s.input_exhausted = x.exhausted;
@@ -1206,6 +1208,7 @@ void reset_xma_commands() {
     x.stats = {};
     x.pump_done.wait(lock, [&x] { return x.active_pumps == 0; });
     x.frames = 0;
+    x.frames_decoded = 0;
     x.blocks_written = 0;
     x.loops = 0;
     x.exhausted = 0;

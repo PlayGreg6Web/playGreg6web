@@ -319,8 +319,8 @@ Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void);
 // bytes in the public XMA context layout; the executable's stream consumer (0x140078120) reads
 // dword 0 bits 22-26 (output buffer block count) and 27-31 (output write offset, in 256-byte
 // blocks) and dword 9 bits 0-4 (output read offset), and only copies decoded PCM out and sends
-// AcpHal command 0x12 (tag 0xF1F1F1F1) when the write offset has moved. No XMA decoder exists
-// here, so the write offset never moves and every XMA voice (music, ambience) stays silent.
+// AcpHal command 0x12 (tag 0xF1F1F1F1) when the write offset has moved. The XMA decode worker
+// (os/xma_decoder.h) moves it for enabled contexts.
 struct Pg6XmaContextCensus {
     uint32_t contexts = 0;        // kind-4 contexts allocated
     uint32_t touched = 0;         // contexts with any non-zero byte (set up by the title)
