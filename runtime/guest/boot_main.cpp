@@ -22,6 +22,8 @@
 //   --max-ms <n>         stop after n ms, checked at dispatches (0 = unbounded)
 //   --watchdog-ms <n>    hard limit: report and terminate even without dispatches (default 0)
 //   --present-interval honor|min1  title-driven present gap: honor = the title's sync interval (30 fps menus like the console), min1 = 1 vblank (default)
+//   --skip-shader <hash>[,<hash>]  native executor: skip every draw / dispatch of these shaders (diagnostic; counted as `quarantined` in the drop table)
+//   --skip-shader-file <path>  same, one `<hash> [reason] [issue]` per line; the repo list runtime/gpu/native_exec/shader_quarantine.txt is loaded too when present (--no-quarantine-list skips it)
 //   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
 //   --no-xmem-shared-pages  physical pages mapped at several addresses get per-address copies
 //                        (the pre-O36 behaviour; A/B runs, os/xbox_scarlett.h)
@@ -125,6 +127,7 @@
 #include "gpu/native_exec/present_model.h"
 #include "gpu/native_exec/screenshot_model.h"
 #include "gpu/native_exec/show_target_model.h"
+#include "gpu/native_exec/shader_quarantine.h"
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
 #include "gpu/native_exec/blob_cache.h"
 #include "gpu/native_exec/live_pump.h"
@@ -269,6 +272,8 @@ struct Options {
     bool live_executor = false;     // --live-executor: --window's live path into the offscreen swapchain (no window)
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     std::string show_target;        // --show-target <selector>
+    playgta6::gpu::native_exec::ShaderQuarantine quarantine;  // --skip-shader / --skip-shader-file / repo list
+    bool no_quarantine_list = false;  // --no-quarantine-list
     bool overlay = false;           // --overlay: start with the stats overlay on (F3 toggles)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
     playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
@@ -396,6 +401,23 @@ bool parse(int argc, char** argv, Options& o) {
             }
         } else if (a == "--overlay") {
             o.overlay = true;
+        } else if (a == "--skip-shader" && i + 1 < argc) {
+            std::string err;
+            if (!o.quarantine.add_list(argv[++i], &err)) {
+                std::fprintf(stderr, "--skip-shader: %s\n", err.c_str());
+                return false;
+            }
+        } else if (a == "--skip-shader-file" && i + 1 < argc) {
+            const std::string path = argv[++i];
+            std::ifstream f(path, std::ios::binary);
+            std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::string err;
+            if (!f || !o.quarantine.add_text(text, false, path, &err)) {
+                std::fprintf(stderr, "--skip-shader-file: %s\n", f ? err.c_str() : ("cannot read " + path).c_str());
+                return false;
+            }
+        } else if (a == "--no-quarantine-list") {
+            o.no_quarantine_list = true;
         } else if (a == "--show-target" && i + 1 < argc) {
             o.show_target = argv[++i];
             playgta6::gpu::native_exec::ShowTargetSpec spec;
@@ -952,6 +974,21 @@ bool start_live_window() {
     options.present_height = g_options.window_height;
     options.present_mode = g_options.present_mode;
     options.show_target = g_options.show_target;
+    options.quarantine = g_options.quarantine;
+    if (!g_options.no_quarantine_list) {
+        // The repo list (empty by default): found relative to the working directory (the repo root).
+        const char* kList = "runtime/gpu/native_exec/shader_quarantine.txt";
+        std::ifstream lf(kList, std::ios::binary);
+        if (lf) {
+            std::string text((std::istreambuf_iterator<char>(lf)), std::istreambuf_iterator<char>());
+            std::string err;
+            if (!options.quarantine.add_text(text, true, kList, &err))
+                std::fprintf(stderr, "shader quarantine list ignored: %s\n", err.c_str());
+        }
+    }
+    if (!options.quarantine.empty())
+        std::fprintf(stderr, "shader quarantine: %zu shader(s) skipped (drop table reason \"quarantined\")\n",
+                     options.quarantine.size());
     options.overlay = g_options.overlay;
     options.max_fps = g_options.max_fps;
     options.screenshot_at = g_options.screenshot_at;

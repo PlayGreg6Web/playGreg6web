@@ -16,6 +16,7 @@
 #include <string>
 
 #include "gpu/native_exec/present_model.h"
+#include "gpu/native_exec/shader_quarantine.h"
 #include <vector>
 
 #include "gpu/native_exec/m2_model.h"
@@ -27,6 +28,8 @@ class GpuTimeTable;
 namespace playgta6::gpu::native_exec {
 
 struct ExecutorOptions {
+    // Shader hashes whose draws / dispatches are skipped (shader_quarantine.h; --skip-shader, --skip-shader-file, repo list).
+    ShaderQuarantine quarantine;
     bool window = false;  // present to a native window instead of the offscreen swapchain
     uint32_t width = 1280;  // swapchain (and initial client area) size
     uint32_t height = 720;
@@ -151,6 +154,7 @@ struct ExecutorStats {
     uint64_t probes = 0;                     // letterbox probes run
     uint64_t screenshots_saved = 0, screenshots_failed = 0;  // F12 / --screenshot-at PNGs written / failed
     uint64_t probes_failed = 0;              // ... whose bars were not black or whose picture was blank
+    uint64_t quarantine_skips = 0;           // draws / dispatches skipped by the shader quarantine (also in the drop table)
     uint64_t show_target_frames = 0;         // presents that drew the --show-target texture instead of the swapchain image
     uint64_t show_target_unavailable = 0;    // presents where the chosen target could not be shown (the swapchain image stays)
     // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`

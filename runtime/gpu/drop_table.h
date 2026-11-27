@@ -19,7 +19,7 @@ namespace playgta6::gpu::d3d12_guest {
 class DropTable {
 public:
     static constexpr size_t kMaxHashes = 512;
-    enum class Reason : uint8_t { NoModule, MeshRefused, Bridge, RectList, PipelinePending, Count };
+    enum class Reason : uint8_t { NoModule, MeshRefused, Bridge, RectList, PipelinePending, Quarantined, Count };
     static constexpr size_t kReasons = static_cast<size_t>(Reason::Count);
 
     using Counts = HashCounts<kReasons>;
@@ -31,6 +31,7 @@ public:
         case Reason::Bridge: return "dropped_by_bridge";
         case Reason::RectList: return "rect_list";
         case Reason::PipelinePending: return "pipeline_pending";
+        case Reason::Quarantined: return "quarantined";
         case Reason::Count: break;
         }
         return "?";

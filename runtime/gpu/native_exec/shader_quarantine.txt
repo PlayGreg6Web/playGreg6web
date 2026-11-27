@@ -1,0 +1,6 @@
+# Native executor shader quarantine (gpu/native_exec/shader_quarantine.h). Empty by default.
+# A listed shader's draws and dispatches are skipped (counted as "quarantined" in the boot report's
+# drop table, never replaced by fake output). One entry per line:
+#     <hash> <reason> <issue link>
+#     0x00000000deadbeef  hangs the GPU in the hair pass  https://github.com/PlayGta6Web/playgta6web/issues/123
+# The same list can be given per run with --skip-shader <hash>[,<hash>] or --skip-shader-file <path>.

@@ -411,3 +411,12 @@ one step further, it rebuilds.
    `--max-ms` below that.
 
 5. **Window test hook (`--window-script`):** `playgta6_boot --window --window-script "4000:resize=1000x700,5000:probe,7000:minimize,10000:restore,13000:fullscreen,15000:probe,17000:windowed"` drives the live window from the executor's poll (times in ms from the first presented frame; `resize=WxH` client pixels, `minimize`, `restore`, `maximize`, `fullscreen`, `windowed`, `probe`). `probe` reads the presented canvas back after the blit and logs `window probe OK|FAIL`: the letterbox bars must be black. The live window keeps the stream at its fixed size (`fixed_stream_size`), so a resize letterboxes instead of stretching. Surface reconfiguration is the pure `SurfaceState` machine (`window_script.h`, unit tested): a zero-size client area (minimized) skips the present and keeps the configuration, a size change reconfigures, Outdated / Lost retry once. Stats: `surface_configures`, `surface_minimized_skips`, `surface_acquire_retries`, `window_actions`, `probes`, `probes_failed`. NVIDIA / D3D12 run: resize to 1000x700 and 700x900, minimize 3 s, restore, fullscreen, windowed and maximize, no device error, bars black on every probe.
+
+## Shader quarantine (diagnostic)
+
+`--skip-shader <hash>[,<hash>]`, `--skip-shader-file <path>` and the repo list `runtime/gpu/native_exec/shader_quarantine.txt`
+(empty by default; format `<hash> <reason> <issue link>`, `--no-quarantine-list` ignores it) make the executor skip every
+draw and dispatch (indirect ones too) of the listed shaders, so a program that hangs or crashes the GPU can be bisected
+without a rebuild. Each skip is counted per phase in the boot report's drop table as `quarantined` with the hash; no
+output is substituted. Hair-strand skip-by-name is not possible on the native side: the executor only sees shader
+hashes, not program names (use `tools/program_census.py` to map names to hashes, then list the hash).

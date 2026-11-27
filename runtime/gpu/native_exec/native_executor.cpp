@@ -325,6 +325,7 @@ struct RenderPipelineEntry : AsyncSlot {
     AutoLayoutMeta auto_meta;
     bool expects_group0 = false;
     uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
+    uint64_t quarantined_hash = 0;  // the stage hash that is on the shader quarantine (draws are skipped), else 0
 };
 
 struct ComputePipelineEntry : AsyncSlot {
@@ -3201,6 +3202,7 @@ struct NativeExecutor::Impl {
         e.expects_group0 = expects;
         e.auto_meta = std::move(auto_meta);
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
+        e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs.hash);
         render_pipelines[h.id] = std::move(e);
         ++stats.render_pipelines;
         return true;
@@ -3272,6 +3274,20 @@ struct NativeExecutor::Impl {
         if (slot.pending->done) return false;
         instance.ProcessEvents();
         return !slot.pending->done;
+    }
+
+    // The quarantined hash among a render pipeline's stages (fragment first, as perf_hash), else 0.
+    uint64_t quarantined_stage(uint64_t fs_hash, uint64_t vs_hash) const {
+        if (options.quarantine.empty()) return 0;
+        if (options.quarantine.contains(fs_hash)) return fs_hash;
+        if (options.quarantine.contains(vs_hash)) return vs_hash;
+        return 0;
+    }
+
+    // A draw / dispatch skipped by the shader quarantine: counted per phase in the drop table, never silent.
+    void note_quarantined(uint64_t hash, bool dispatch) {
+        ++stats.quarantine_skips;
+        d3d12_guest::drop_table().record(hash, d3d12_guest::DropTable::Reason::Quarantined, dispatch);
     }
 
     void note_pipeline_pending(uint64_t hash, bool dispatch) {
@@ -3503,6 +3519,7 @@ struct NativeExecutor::Impl {
         e.expects_group0 = wgsl_declares_group0(vs.code) || (fs && wgsl_declares_group0(fs->code));
         e.auto_meta.gen = ++pipeline_gen_counter;
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
+        e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs.hash);
         render_pipelines[h.id] = std::move(e);
         if (has_reflected) reflected_render[h.id] = std::move(reflected);
         else reflected_render.erase(h.id);
@@ -4207,6 +4224,7 @@ struct NativeExecutor::Impl {
         bool had_explicit_compute = false, compute_valid = false;
         bool compute_pending = false;  // compute pipeline still compiling past the wait budget
         uint64_t compute_pending_hash = 0;
+        uint64_t compute_quarantined_hash = 0;  // the bound compute shader's hash when it is quarantined
         // GPU pass timestamps: the commands being encoded (for the pass's pipeline look-ahead) and
         // the ring slot of this submit (-2: not opened yet, -1: no free slot).
         const std::vector<PassCmd>* cmds = nullptr;
@@ -4458,6 +4476,10 @@ struct NativeExecutor::Impl {
                 return;
             }
             if (in->kind == 2) {
+                if (e.compute_quarantined_hash) {
+                    note_quarantined(e.compute_quarantined_hash, true);
+                    return;
+                }
                 e.ensure_compute();
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
@@ -4474,6 +4496,12 @@ struct NativeExecutor::Impl {
             e.compute_valid = it != compute_pipelines.end();
             e.compute_pending_hash = 0;
             e.compute_pending = false;
+            e.compute_quarantined_hash = 0;
+            if (!options.quarantine.empty()) {
+                auto qh = compute_hash.find(sc->id);
+                if (qh != compute_hash.end() && options.quarantine.contains(qh->second))
+                    e.compute_quarantined_hash = qh->second;
+            }
             if (e.compute_valid) {
                 if (const wgpu::ComputePipeline* cp = resolve_budgeted(it->second)) {
                     e.cpass.SetPipeline(*cp);
@@ -4489,6 +4517,10 @@ struct NativeExecutor::Impl {
                 e.seg_switch(hit != compute_hash.end() ? hit->second : 0, d3d12_guest::GpuPassKind::Compute);
             }
         } else if (const auto* dc = std::get_if<DispatchCmd>(&cmd)) {
+            if (e.had_explicit_compute && e.compute_quarantined_hash) {
+                note_quarantined(e.compute_quarantined_hash, true);
+                return;
+            }
             if (e.had_explicit_compute && !e.compute_valid) {
                 ++stats.dispatches_skipped;
                 if (e.compute_pending) note_pipeline_pending(e.compute_pending_hash, true);
@@ -5076,6 +5108,10 @@ struct NativeExecutor::Impl {
             if (it == render_pipelines.end()) {
                 ++stats.draws_skipped;
                 ++stats.op_errors;
+                return false;
+            }
+            if (it->second.quarantined_hash) {
+                note_quarantined(it->second.quarantined_hash, false);
                 return false;
             }
             if (pipe_still_pending(it->second)) {
@@ -5782,6 +5818,7 @@ std::string NativeExecutor::stats_json() const {
     num("async_pipeline_wait_ns", st.async_pipeline_wait_ns);
     num("pipeline_pending_skips", st.pipeline_pending_skips);
     num("remap_reflected_layouts", st.remap_reflected_layouts);
+    num("quarantine_skips", st.quarantine_skips);
     num("async_pipeline_failures", st.async_pipeline_failures);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
