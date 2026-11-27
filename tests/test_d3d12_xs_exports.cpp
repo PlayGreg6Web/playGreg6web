@@ -4478,7 +4478,20 @@ void test_xbox_device_queue_and_list_slots() {
     fx.vcall(list, XSlot::RSSetShadingRateImage, {I(0)});
     fx.vcall(list, XSlot::RegisterWrite, {I(0xC280), I(0x20000), I(0), I(0xFFFFFFFFFF00ULL)});
     fx.vcall(list, 132, {I(0x700000), I(0), I(0), I(0xFFFFFFFFFF00ULL)});
-    fx.vcall(list, XSlot::BeginQuery, {I(0), I(0), I(0)});
+    const uint64_t q_begins = dg::work_total(dg::Work::QueryBegins), q_ends = dg::work_total(dg::Work::QueryEnds),
+                   q_resolves = dg::work_total(dg::Work::QueryResolves),
+                   q_occ = dg::work_total(dg::Work::QueryOcclusionOps),
+                   q_ts = dg::work_total(dg::Work::QueryTimestampOps),
+                   q_unwritten = dg::work_total(dg::Work::QueryResultsUnwritten);
+    fx.vcall(list, XSlot::BeginQuery, {I(0), I(1), I(0)});    // binary occlusion
+    fx.vcall(list, XSlot::BeginQuery + 1, {I(0), I(1), I(0)});  // EndQuery
+    fx.vcall(list, XSlot::BeginQuery + 1, {I(0), I(2), I(3)});  // EndQuery, timestamp
+    fx.vcall(list, XSlot::BeginQuery + 2, {I(0), I(2), I(0), I(4), I(0), I(0)});  // ResolveQueryData, 4 results
+    CHECK(dg::work_total(dg::Work::QueryBegins) == q_begins + 1 && dg::work_total(dg::Work::QueryEnds) == q_ends + 2 &&
+          dg::work_total(dg::Work::QueryResolves) == q_resolves + 1 &&
+          dg::work_total(dg::Work::QueryOcclusionOps) == q_occ + 2 &&
+          dg::work_total(dg::Work::QueryTimestampOps) == q_ts + 2 &&
+          dg::work_total(dg::Work::QueryResultsUnwritten) == q_unwritten + 4);
     fx.vcall(list, XSlot::ExecuteIndirect, {I(0), I(1), I(buf), I(0), I(0), I(0)});
     fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
     CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);

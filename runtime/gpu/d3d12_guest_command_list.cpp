@@ -77,6 +77,13 @@ const char* work_name(Work w) {
     case Work::DepthTwinBindings: return "depth_twin_bindings";
     case Work::DepthTwinCopiesIn: return "depth_twin_copies_in";
     case Work::DepthTwinCopiesOut: return "depth_twin_copies_out";
+    case Work::QueryBegins: return "query_begins";
+    case Work::QueryEnds: return "query_ends";
+    case Work::QueryResolves: return "query_resolves";
+    case Work::QueryOcclusionOps: return "query_occlusion_ops";
+    case Work::QueryTimestampOps: return "query_timestamp_ops";
+    case Work::QueryOtherOps: return "query_other_ops";
+    case Work::QueryResultsUnwritten: return "query_results_unwritten";
     case Work::ComputeTextureReadbacks: return "compute_texture_readbacks";
     case Work::ComputeTextureRetiled: return "compute_texture_retiled";
     case Work::ComputeTextureRetileDiscarded: return "compute_texture_retile_discarded";
@@ -3148,8 +3155,34 @@ void CommandList::ClearUnorderedAccessView(com::CallContext&) {
     }
 }
 
-void CommandList::QueryOperation(com::CallContext&) {
-    // Queries (BeginQuery / EndQuery / ResolveQueryData) have no packet; results stay zero.
+namespace {
+// D3D12_QUERY_TYPE: 0 OCCLUSION, 1 BINARY_OCCLUSION, 2 TIMESTAMP, 3.. pipeline statistics / stream output.
+void count_query_type(uint64_t type) {
+    count_work(type <= 1u ? Work::QueryOcclusionOps : type == 2u ? Work::QueryTimestampOps : Work::QueryOtherOps);
+}
+}  // namespace
+
+// Queries have no host backend (no packet): begin / end are counted, a resolve writes nothing. The
+// destination keeps its previous bytes; nothing is invented as a query result.
+void CommandList::BeginQuery(com::CallContext& ctx) {
+    count_work(Work::QueryBegins);
+    count_query_type(ctx.int_arg(2));
+}
+
+void CommandList::EndQuery(com::CallContext& ctx) {
+    count_work(Work::QueryEnds);
+    count_query_type(ctx.int_arg(2));
+}
+
+void CommandList::ResolveQueryData(com::CallContext& ctx) {
+    // this, heap, type, start index, count, destination buffer, destination offset.
+    count_work(Work::QueryResolves);
+    count_query_type(ctx.int_arg(2));
+    count_work(Work::QueryResultsUnwritten, static_cast<uint32_t>(ctx.int_arg(4)));
+    if (usable()) {
+        device_->note_bad_argument("ResolveQueryData: no GPU query backend; type " + std::to_string(ctx.int_arg(2)) +
+                                   " results not written (destination keeps its previous bytes)");
+    }
 }
 
 void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateDiagnostic>* state_diagnostics) {
@@ -3912,9 +3945,9 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::method<&H::ResourceBarrier>("ResourceBarrier"),                               // 26
     CL::stub("ExecuteBundle"),                                                        // 27
     // Xbox order from here on (d3d12_xs_xbox.h): queries and predication moved up, public 28..51 +4.
-    CL::method<&H::QueryOperation>("BeginQuery"),                                     // 28
-    CL::method<&H::QueryOperation>("EndQuery"),                                       // 29
-    CL::method<&H::QueryOperation>("ResolveQueryData"),                               // 30
+    CL::method<&H::BeginQuery>("BeginQuery"),                                     // 28
+    CL::method<&H::EndQuery>("EndQuery"),                                       // 29
+    CL::method<&H::ResolveQueryData>("ResolveQueryData"),                               // 30
     CL::method<&H::SetPredication>("SetPredication (inferred)"),                      // 31
     CL::method<&H::SetDescriptorHeaps>("SetDescriptorHeaps"),                         // 32
     CL::method<&H::SetComputeRootSignature>("SetComputeRootSignature"),               // 33

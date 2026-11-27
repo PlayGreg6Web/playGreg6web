@@ -413,7 +413,9 @@ struct IGraphicsCommandListHost : IDeviceChildHost {
                                        uint64_t rects) = 0;                                          // 48
     virtual void ClearUnorderedAccessView(com::CallContext& ctx) = 0;                                // 49, 50
     virtual void DiscardResource(InterfaceArg<IResourceHost> resource, uint64_t region) = 0;         // 51
-    virtual void QueryOperation(com::CallContext& ctx) = 0;                                          // 52..54
+    virtual void BeginQuery(com::CallContext& ctx) = 0;                                              // 52
+    virtual void EndQuery(com::CallContext& ctx) = 0;                                                // 53
+    virtual void ResolveQueryData(com::CallContext& ctx) = 0;                                        // 54
     virtual void SetPredication(com::CallContext& ctx) = 0;                                          // 55
     virtual void DebugMarker(com::CallContext& ctx) = 0;                                             // 56..58
     // Xbox slots (see d3d12_xs_xbox.h).
@@ -1837,6 +1839,16 @@ enum class Work : size_t {
     FlushIndexedNs,
     FlushBufferNs,   // indexed flush time spent on buffers (take included) / on uniform ranges
     FlushUniformNs,
+    // Query heaps (BeginQuery / EndQuery / ResolveQueryData) have no host backend: calls are counted by
+    // D3D12_QUERY_TYPE group and every resolved result is left unwritten (never faked), so a title
+    // reading a resolved buffer sees whatever the buffer held before.
+    QueryBegins,
+    QueryEnds,
+    QueryResolves,
+    QueryOcclusionOps,  // OCCLUSION (0) and BINARY_OCCLUSION (1)
+    QueryTimestampOps,  // TIMESTAMP (2)
+    QueryOtherOps,      // pipeline statistics, stream output, anything else
+    QueryResultsUnwritten,  // query results a resolve was asked for and could not write
     Count
 };
 // #1963: how flush_cpu_buffers picks what to compare on native builds. Index (default): only the

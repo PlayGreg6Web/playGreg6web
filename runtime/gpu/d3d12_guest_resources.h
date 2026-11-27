@@ -428,7 +428,9 @@ public:
     void ClearRenderTargetView(uint64_t rtv, uint64_t color, uint32_t rect_count, uint64_t rects) override;
     void ClearUnorderedAccessView(com::CallContext& ctx) override;
     void DiscardResource(InterfaceArg<IResourceHost>, uint64_t) override {}
-    void QueryOperation(com::CallContext& ctx) override;
+    void BeginQuery(com::CallContext& ctx) override;
+    void EndQuery(com::CallContext& ctx) override;
+    void ResolveQueryData(com::CallContext& ctx) override;
     void SetPredication(com::CallContext&) override {}
     void DebugMarker(com::CallContext&) override {}
     // Xbox slots (d3d12_xs_xbox.cpp).
