@@ -11,6 +11,9 @@ bool process_memory_bytes(uint64_t* private_bytes, uint64_t* working_set_bytes, 
 // Free physical memory of the machine in bytes; 0 when the platform call is unavailable.
 uint64_t available_physical_bytes();
 
+// Dedicated video memory of the largest hardware adapter (DXGI) in bytes; 0 when unknown.
+uint64_t dedicated_video_memory_bytes();
+
 // Committed bytes of the process by kind, from a VirtualQuery walk (boot report only; the walk is
 // cheap, a few thousand regions). `arena_lo`..`arena_hi` is the guest arena's host range.
 struct ProcessCommitMap {

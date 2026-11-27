@@ -4504,7 +4504,21 @@ BootResult run_boot(const BootConfig& config) {
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
     gpu::present_pacer().set_honor_interval(config.present_honor_interval);
-    gpu::texture_budget().set_budget_bytes(uint64_t{config.gpu_memory_budget_mb} << 20);
+    {
+        // No budget configured: 60% of the GPU's dedicated memory (textures share it with buffers, render
+        // targets, Dawn's descriptor heaps and the desktop; without a budget the in-world scene grew to
+        // 7.2 GB of textures on a 12 GB card and the device was lost in CreateDescriptorHeap, E_OUTOFMEMORY).
+        uint64_t budget = uint64_t{config.gpu_memory_budget_mb} << 20;
+        if (budget == 0) {
+            const uint64_t vram = os::dedicated_video_memory_bytes();
+            budget = vram / 10 * 6;
+            if (budget != 0) {
+                std::fprintf(stderr, "[gpu] texture budget: %llu MiB (60%% of %llu MiB dedicated video memory)\n",
+                             static_cast<unsigned long long>(budget >> 20), static_cast<unsigned long long>(vram >> 20));
+            }
+        }
+        gpu::texture_budget().set_budget_bytes(budget);
+    }
     gpu::texture_budget().set_base_cap(config.texture_size_cap);
     gpu::d3d12_state::set_bind_group_slot_budget(config.bind_group_slot_budget);
     gpu::d3d12_guest::xbox::set_present_max_interval(config.present_max_interval);
