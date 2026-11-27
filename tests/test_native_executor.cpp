@@ -438,7 +438,8 @@ const char* kComputeAlias = R"(
 
 // split_passes: a compute pass that fails validation (writable storage aliasing) loses only itself; the
 // render pass and the compute pass after it in the same frame still run and the frame is presented.
-void test_split_passes(NativeExecutor& ex) {
+// Without it (the default) the frame is one command buffer.
+void split_passes_frame(NativeExecutor& ex, bool split) {
     const ExecutorStats before = ex.stats();
     gpu::CommandEncoder setup;
     setup.create_buffer(3000, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
@@ -487,6 +488,10 @@ void test_split_passes(NativeExecutor& ex) {
     run(ex, frame);
     ex.wait_idle();
     ex.poll();
+    if (!split) {
+        CHECK(ex.stats().command_buffers == before.command_buffers + 1);  // the whole frame in one buffer
+        return;
+    }
     std::vector<uint8_t> out;
     std::string err;
     CHECK(ex.read_buffer(3000, 0, 16, &out, &err));  // the aliasing pass was rejected (its writes never land) ...
@@ -496,6 +501,26 @@ void test_split_passes(NativeExecutor& ex) {
     const uint32_t want[4] = {1, 3, 5, 7};
     CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
     CHECK(ex.stats().command_buffers >= before.command_buffers + 3);
+}
+
+// split_passes is opt-in (ExecutorOptions::split_passes): split, the passes a bad pass used to take down
+// with it run, and in the in-world scene some of them stall the GPU long enough to stop the live executor.
+void test_split_passes(NativeExecutor& shared) {
+    CHECK(!ExecutorOptions{}.split_passes);
+    split_passes_frame(shared, false);
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.split_passes = true;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: split-passes NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    split_passes_frame(*ex, true);
 }
 
 // ---- usage scopes (usage_scope_model.h) ----

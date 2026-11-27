@@ -92,12 +92,17 @@ struct ExecutorOptions {
     // "error_scopes" block (bounded). Off = no scopes until the first uncaptured device error arms it
     // (then for up to 200 scoped errors), so a healthy run pays nothing.
     bool gpu_error_scopes = false;
-    // One command buffer per pass (--no-split-passes turns it off): each render / compute pass of a frame
-    // or read-back flush is finished and submitted on its own, in order. Dawn invalidates a whole command
+    // One command buffer per pass (opt-in, --split-passes): each render / compute pass of a frame or
+    // read-back flush is finished and submitted on its own, in order. Dawn invalidates a whole command
     // buffer on its first validation error (an invalid bind group, writable storage aliasing, ...), so
     // with one buffer per frame a single bad pass dropped every pass of that frame, the present copy and
     // the read-backs with it (black frames); split, only the bad pass is lost.
-    bool split_passes = true;
+    // Off by default: in the in-world scene the passes that a bad pass used to take down with it then run,
+    // and some of them keep the GPU busy for tens of seconds; Dawn's Submit blocks in WaitForSerial (the
+    // command allocators are all in flight), the live executor stops, the title's 30 s main-loop watchdog
+    // fires (std-pack --live-executor boot of 3d57fb4a: 0 fps from ~90 s, sub_1423CF620 at 120 s; with
+    // the split off the same build runs past 170 s).
+    bool split_passes = false;
     // Device-loss recovery (docs/NATIVE_EXECUTOR_DESIGN.md "Device loss"): the executor journals the packets
     // that create resources and fill them (creations, buffer / texture writes; destroyed ids are pruned,
     // a repeated write of the same range replaces the older one) so a lost device can be rebuilt and the
