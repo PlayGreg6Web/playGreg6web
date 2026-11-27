@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -179,8 +180,9 @@ void test_begin_render_pass() {
 
 void test_write_buffer() {
     const uint8_t data[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    std::vector<std::unique_ptr<gpu::CommandEncoder>> encs;  // the plans point into the encoders' bytes
     auto plan_for = [&](uint32_t offset, uint32_t len, uint64_t size) {
-        gpu::CommandEncoder enc;
+        gpu::CommandEncoder& enc = *encs.emplace_back(std::make_unique<gpu::CommandEncoder>());
         enc.write_buffer(5, offset, data, len);
         return plan_write_buffer(single(enc), size);
     };
