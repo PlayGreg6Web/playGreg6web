@@ -19,6 +19,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "guest/audio_probes.h"
+#include "guest/hash_registry_scan.h"
 #include "os/audio_stream_log.h"
 #include "guest/export_counters.h"
 #include "os/audio_file_stats.h"
@@ -1343,6 +1344,15 @@ void audio_probe_event(BootState& b, long idx, const uint64_t args[AudioProbes::
     } else if (name == "music_controller_init") {
         uint64_t zero = 0;
         b.music_controller.compare_exchange_strong(zero, args[0]);
+    } else if (name == "metadata_registry_insert") {
+        // rdx points at the key; only the three music hashes are logged (the counters count all).
+        uint32_t h = 0;
+        if (b.arena == nullptr || !read_u32(*b.arena, args[1], h) ||
+            (h != 0x9205c7a1u && h != 0xd3594a47u && h != 0x4aa37aa8u)) {
+            return;
+        }
+        os::audio_stream_log::log().record("probe_entry_metadata_registry_insert_music", h);
+        return;
     }
     os::audio_stream_log::log().record((std::string(entry ? "probe_entry_" : "probe_call_") + name).c_str(), args[0],
                                        args[1], args[2]);
@@ -1377,6 +1387,37 @@ std::string music_controller_json(BootState& b) {
     return o + "}}";
 }
 
+// A4: the name-hash registry the music controller's metadata lookups search (globals of the main
+// executable: group count, entry count, table pointer), read at report time: entries in total and
+// whether each music hash is registered. "absent" in a populated registry means nothing registered
+// that name, so the lookup's null is not a lookup bug.
+std::string metadata_registry_json(BootState& b) {
+    if (b.arena == nullptr || b.modules.empty() || !b.modules[0].loaded || b.modules[0].image.base == 0) {
+        return "{\"available\": false}";
+    }
+    const uint64_t g = b.modules[0].image.base + (0x149ab7d18ull - 0x140000000ull);
+    uint32_t groups = 0, entries = 0;
+    uint64_t table = 0;
+    if (!read_u32(*b.arena, g, groups) || !read_u32(*b.arena, g + 4, entries) || !read_u64(*b.arena, g + 8, table)) {
+        return "{\"available\": false}";
+    }
+    static const std::vector<uint32_t> kMusic = {0x9205c7a1u, 0xd3594a47u, 0x4aa37aa8u};
+    VirtualMemoryArena* arena = b.arena;
+    const HashRegistryScan scan = scan_hash_registry(
+        [arena](uint64_t va, void* dst, size_t len) { return arena->read(va, dst, len); }, table, groups, kMusic);
+    std::string o = "{\"available\": true, \"groups\": " + std::to_string(groups) +
+                    ", \"entries\": " + std::to_string(entries) + ", \"readable\": " +
+                    (scan.readable ? "true" : "false") + ", \"full_slots\": " + std::to_string(scan.full_slots) +
+                    ", \"music_hashes\": {";
+    for (size_t i = 0; i < kMusic.size(); ++i) {
+        char key[32];
+        std::snprintf(key, sizeof key, "\"0x%08x\": ", kMusic[i]);
+        o += std::string(i == 0 ? "" : ", ") + key +
+             (!scan.present[i] ? "\"absent\"" : scan.value_null[i] ? "\"null_value\"" : "\"present\"");
+    }
+    return o + "}}";
+}
+
 // A4: the title's audio stack as guest addresses (main executable, linked at 0x140000000). The
 // decoder factory is reached by vtable, so the dispatch observer sees it; a direct call between
 // two lifted functions would not show (`calls`, "indirect_calls_only"); a build with
@@ -1397,6 +1438,8 @@ void setup_audio_probes(BootState& b) {
         {"stream_decoder_create", 0x140078f00ull},
         {"stream_consumer", 0x140078120ull},
         {"metadata_hash_lookup", 0x140c8a070ull},      // ecx = name hash; only the music hashes are logged
+        {"metadata_registry_build", 0x141e74390ull},   // startup pass that fills that name-hash registry
+        {"metadata_registry_insert", 0x141d73cc0ull},  // its insert; rdx = &key, only the music hashes are logged
     };
     std::vector<AudioProbe> probes;
     for (const Def& d : kDefs) {
@@ -2682,6 +2725,7 @@ std::string build_report() {
         o += "  \"audio_probes\": " + b.audio_probes.to_json() + ",\n";
         o += "  \"audio_stream_log\": " + os::audio_stream_log::log().to_json() + ",\n";
         o += "  \"music_controller\": " + music_controller_json(b) + ",\n";
+        o += "  \"metadata_registry\": " + metadata_registry_json(b) + ",\n";
         o += "  \"audio_files\": " + os::audio_files::stats().to_json() + ",\n";
         o += "  \"survey\": {\"enabled\": " + std::string(b.survey ? "true" : "false") +
              ", \"unresolved_called\": [";

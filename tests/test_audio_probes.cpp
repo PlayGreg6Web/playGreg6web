@@ -1,10 +1,12 @@
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "guest/audio_probes.h"
+#include "guest/hash_registry_scan.h"
 #include "os/audio_file_stats.h"
 #include "os/audio_stream_log.h"
 
@@ -108,9 +110,44 @@ void test_files() {
 }
 }  // namespace
 
+// The registry scan reads groups of 16 control bytes + 16 {key, value} slots; a high control bit
+// marks an empty slot (its key is ignored even if it matches).
+void test_hash_registry_scan() {
+    std::vector<uint8_t> mem(2 * kHashRegistryGroupBytes, 0);
+    for (int s = 0; s < 16; ++s) {
+        mem[s] = 0x80;
+        mem[kHashRegistryGroupBytes + s] = 0x80;
+    }
+    auto put = [&](size_t group, int slot, uint8_t ctrl, uint32_t key, uint64_t value) {
+        uint8_t* g = mem.data() + group * kHashRegistryGroupBytes;
+        g[slot] = ctrl;
+        uint8_t* e = g + 0x10 + slot * 0x10;
+        for (int i = 0; i < 4; ++i) e[i] = static_cast<uint8_t>(key >> (8 * i));
+        for (int i = 0; i < 8; ++i) e[8 + i] = static_cast<uint8_t>(value >> (8 * i));
+    };
+    put(0, 3, 0x21, 0x11111111u, 0x7ff000001000ull);
+    put(1, 15, 0x05, 0x22222222u, 0);
+    put(1, 0, 0x80, 0x33333333u, 0x1234);  // empty: not counted
+    const uint64_t base = 0x10000;
+    auto read = [&](uint64_t va, void* dst, size_t len) {
+        if (va < base || va + len > base + mem.size()) return false;
+        std::memcpy(dst, mem.data() + (va - base), len);
+        return true;
+    };
+    const auto r = scan_hash_registry(read, base, 2, {0x11111111u, 0x22222222u, 0x33333333u});
+    CHECK(r.readable && r.full_slots == 2);
+    CHECK(r.present[0] && !r.value_null[0]);
+    CHECK(r.present[1] && r.value_null[1]);
+    CHECK(!r.present[2]);
+    CHECK(!scan_hash_registry(read, base, 3, {1}).readable);  // third group unreadable
+    const auto empty = scan_hash_registry(read, 0, 0, {1});
+    CHECK(empty.readable && empty.full_slots == 0 && !empty.present[0]);
+}
+
 int main() {
     test_probes();
     test_stream_log();
+    test_hash_registry_scan();
     test_files();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_audio_probes FAILED with %d failure(s).\n", g_failures);
