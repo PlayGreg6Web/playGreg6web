@@ -63,6 +63,19 @@ struct State {
     std::chrono::steady_clock::time_point since{};
     uint64_t cpu_since = 0;  // thread CPU at `since` (CPU kinds)
 };
+// Test hook: replaces the wall / thread-CPU clocks (null = the real ones) so tests feed synthetic time.
+struct ClockHooks {
+    std::chrono::steady_clock::time_point (*now)() = nullptr;
+    uint64_t (*cpu)() = nullptr;
+};
+inline ClockHooks& hooks() {
+    static ClockHooks h;
+    return h;
+}
+inline std::chrono::steady_clock::time_point now_tp() {
+    return hooks().now ? hooks().now() : std::chrono::steady_clock::now();
+}
+inline uint64_t cpu_now() { return hooks().cpu ? hooks().cpu() : this_thread_cpu_ns(); }
 inline State& state() {
     thread_local State s;
     return s;
@@ -83,7 +96,7 @@ inline void charge(State& s, std::chrono::steady_clock::time_point now, uint64_t
 inline ThreadSpanTotals this_thread_spans() {
     namespace d = thread_spans_detail;
     d::State s = d::state();
-    d::charge(s, std::chrono::steady_clock::now(), d::active_is_cpu(s) ? this_thread_cpu_ns() : 0);
+    d::charge(s, d::now_tp(), d::active_is_cpu(s) ? d::cpu_now() : 0);
     return s.totals;
 }
 
@@ -97,8 +110,8 @@ public:
         }
         namespace d = thread_spans_detail;
         d::State& s = d::state();
-        const auto now = std::chrono::steady_clock::now();
-        const uint64_t cpu = d::active_is_cpu(s) || span_kind_is_cpu(kind) ? this_thread_cpu_ns() : 0;
+        const auto now = d::now_tp();
+        const uint64_t cpu = d::active_is_cpu(s) || span_kind_is_cpu(kind) ? d::cpu_now() : 0;
         d::charge(s, now, cpu);
         outer_ = s.active;
         s.active = static_cast<int>(kind);
@@ -111,9 +124,9 @@ public:
         }
         namespace d = thread_spans_detail;
         d::State& s = d::state();
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = d::now_tp();
         const bool outer_cpu = outer_ >= 0 && span_kind_is_cpu(static_cast<SpanKind>(outer_));
-        const uint64_t cpu = d::active_is_cpu(s) || outer_cpu ? this_thread_cpu_ns() : 0;
+        const uint64_t cpu = d::active_is_cpu(s) || outer_cpu ? d::cpu_now() : 0;
         d::charge(s, now, cpu);
         s.active = outer_;
         s.since = now;

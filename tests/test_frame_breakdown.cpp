@@ -27,65 +27,69 @@ using playgta6::os::ThreadSpan;
 
 uint64_t span_ns(SpanKind k) { return playgta6::os::this_thread_spans().ns[static_cast<size_t>(k)]; }
 
-void busy(std::chrono::milliseconds d) {
-    const auto end = std::chrono::steady_clock::now() + d;
-    while (std::chrono::steady_clock::now() < end) {
-    }
+// Synthetic clocks: wall and thread CPU only move when a test advances them.
+uint64_t g_wall_ns = 0;
+uint64_t g_cpu_ns = 0;
+std::chrono::steady_clock::time_point fake_now() {
+    return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(g_wall_ns));
 }
+uint64_t fake_cpu() { return g_cpu_ns; }
+void install_fake_clock() {
+    g_wall_ns = 1000000000u;
+    g_cpu_ns = 0;
+    playgta6::os::thread_spans_detail::hooks().now = &fake_now;
+    playgta6::os::thread_spans_detail::hooks().cpu = &fake_cpu;
+}
+void busy_ms(uint64_t ms) {  // CPU work: both clocks advance
+    g_wall_ns += ms * 1000000u;
+    g_cpu_ns += ms * 1000000u;
+}
+void sleep_ms(uint64_t ms) { g_wall_ns += ms * 1000000u; }  // blocked: only wall advances
 
 // An inner scope pauses the outer one: each kind gets only its own (self) time.
 void test_nested_spans_charge_self_time() {
-    const uint64_t wait0 = span_ns(SpanKind::Wait);
-    const uint64_t d3d0 = span_ns(SpanKind::D3dExecute);
     {
         const ThreadSpan outer(SpanKind::D3dExecute);
-        busy(std::chrono::milliseconds(5));
+        busy_ms(5);
         {
             const ThreadSpan inner(SpanKind::Wait);
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            sleep_ms(20);
         }
-        busy(std::chrono::milliseconds(5));
+        busy_ms(5);
     }
-    const uint64_t wait = span_ns(SpanKind::Wait) - wait0;
-    const uint64_t d3d = span_ns(SpanKind::D3dExecute) - d3d0;
-    CHECK(wait >= 20000000u);
-    CHECK(d3d >= 10000000u);
-    CHECK(d3d < 20000000u);  // the 20 ms wait is not also charged to the outer scope
+    CHECK(span_ns(SpanKind::Wait) == 20000000u);
+    CHECK(span_ns(SpanKind::D3dExecute) == 10000000u);  // the 20 ms wait is not also charged to the outer scope
 }
 
 void test_inactive_span_and_open_scope() {
     const uint64_t before = span_ns(SpanKind::Wait);
-    { const ThreadSpan none(SpanKind::Count); }
+    { const ThreadSpan none(SpanKind::Count); sleep_ms(3); }
     CHECK(span_ns(SpanKind::Wait) == before);
     const ThreadSpan open(SpanKind::Sleep);
     const uint64_t s0 = span_ns(SpanKind::Sleep);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    CHECK(span_ns(SpanKind::Sleep) > s0);  // a still-open scope's elapsed time is visible
+    sleep_ms(2);
+    CHECK(span_ns(SpanKind::Sleep) - s0 == 2000000u);  // a still-open scope's elapsed time is visible
 }
 
 // A CPU kind records the thread's CPU time inside it: busy work is CPU, a sleep inside it is not.
 void test_cpu_kind_records_thread_cpu() {
-    if (playgta6::os::this_thread_cpu_ns() == 0) return;  // host without a thread CPU clock
     const auto before = playgta6::os::this_thread_spans();
     {
         const ThreadSpan s(SpanKind::D3dAppend);
-        busy(std::chrono::milliseconds(10));
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        busy_ms(10);
+        sleep_ms(20);
     }
     const auto after = playgta6::os::this_thread_spans();
     const size_t k = static_cast<size_t>(SpanKind::D3dAppend);
-    const uint64_t wall = after.ns[k] - before.ns[k];
-    const uint64_t cpu = after.cpu_ns[k] - before.cpu_ns[k];
-    CHECK(wall >= 30000000u);
-    CHECK(cpu >= 7000000u);
-    CHECK(cpu < 25000000u);
+    CHECK(after.ns[k] - before.ns[k] == 30000000u);
+    CHECK(after.cpu_ns[k] - before.cpu_ns[k] == 10000000u);
 }
 
 void test_spans_are_per_thread() {
     const uint64_t here = span_ns(SpanKind::Lock);
     std::thread([] {
         const ThreadSpan s(SpanKind::Lock);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        sleep_ms(2);
     }).join();
     CHECK(span_ns(SpanKind::Lock) == here);
 }
@@ -150,6 +154,7 @@ void test_windows() {
 }  // namespace
 
 int main() {
+    install_fake_clock();
     test_windows();
     test_nested_spans_charge_self_time();
     test_inactive_span_and_open_scope();
