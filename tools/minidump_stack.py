@@ -185,39 +185,7 @@ def print_fault_record(fr):
             print("    -> %s %s from %s" % (d.get("target"), d.get("name") or "", d.get("from")))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("dump")
-    ap.add_argument("--pdb-dir")
-    ap.add_argument("--cdb")
-    ap.add_argument("--exe-dir", help="dir with playgta6_boot.exe + .pdb (default: path recorded in the dump)")
-    ap.add_argument("--guest-exe", help="guest PE for naming guest-address frames (guest_symbols.py)")
-    ap.add_argument("--no-symbols", action="store_true", help="skip dbghelp symbolization")
-    args = ap.parse_args()
-    path = resolve_dump(args.dump)
-    cdb = find_cdb(args.cdb)
-    with open(path, "rb") as f0:
-        head = f0.read()
-    fr = read_fault_record(head, parse(head))
-    if fr is not None:
-        print_fault_record(fr)
-    if cdb:
-        sym = ".sympath+ " + args.pdb_dir + ";" if args.pdb_dir else ""
-        cmd = [cdb, "-z", path, "-c", sym + ".ecxr;kn 40;q"]
-        sys.exit(subprocess.call(cmd))
-    data = open(path, "rb").read()
-    streams = parse(data)
-    modules = read_modules(data, streams)
-    if STREAM_EXCEPTION not in streams:
-        sys.exit("dump has no exception stream (guest-fault dump): install cdb for thread stacks")
-    _s, rva = streams[STREAM_EXCEPTION]
-    tid, _pad = struct.unpack_from("<II", data, rva)
-    code, _fl, _rec, addr, nparams = struct.unpack_from("<IIQQI", data, rva + 8)
-    params = struct.unpack_from("<15Q", data, rva + 8 + 32)
-    ctx_size, ctx_rva = struct.unpack_from("<II", data, rva + 8 + 32 + 120)
-    rsp = struct.unpack_from("<Q", data, ctx_rva + 0x98)[0]
-    rip = struct.unpack_from("<Q", data, ctx_rva + 0xF8)[0]
-
+def make_symbolizer(args, modules):
     guest = None
     if args.guest_exe:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -236,6 +204,88 @@ def main():
     sym = Symbolizer(modules, backend, dirs, guest)
     for n in sym.notes:
         print("note: " + n)
+    return sym
+
+
+def read_threads(data, streams):
+    """(thread id, rip, rsp, stack start, stack size, stack rva) per MINIDUMP_THREAD."""
+    out = []
+    if STREAM_THREADS not in streams:
+        return out
+    _s, trva = streams[STREAM_THREADS]
+    (n,) = struct.unpack_from("<I", data, trva)
+    for i in range(n):
+        off = trva + 4 + 48 * i
+        (t,) = struct.unpack_from("<I", data, off)
+        start, size, mrva = struct.unpack_from("<QII", data, off + 24)
+        csize, crva = struct.unpack_from("<II", data, off + 40)
+        rip = rsp = 0
+        if csize >= 0x100:
+            rsp = struct.unpack_from("<Q", data, crva + 0x98)[0]
+            rip = struct.unpack_from("<Q", data, crva + 0xF8)[0]
+        out.append((t, rip, rsp, start, size, mrva))
+    return out
+
+
+def print_all_threads(data, streams, loc, per_thread=16):
+    threads = read_threads(data, streams)
+    print("%d thread(s)" % len(threads))
+    for t, rip, rsp, start, size, mrva in threads:
+        print("thread %d rip 0x%x (%s) rsp 0x%x" % (t, rip, loc(rip) or "?", rsp))
+        if not (start <= rsp < start + size):
+            print("  stack memory not in dump")
+            continue
+        shown = 0
+        for a in range(rsp - start, size - 7, 8):
+            (w,) = struct.unpack_from("<Q", data, mrva + a)
+            l = loc(w)
+            if l:
+                print("  [rsp+0x%x] %s" % (a - (rsp - start), l))
+                shown += 1
+                if shown >= per_thread:
+                    break
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dump")
+    ap.add_argument("--pdb-dir")
+    ap.add_argument("--cdb")
+    ap.add_argument("--exe-dir", help="dir with playgta6_boot.exe + .pdb (default: path recorded in the dump)")
+    ap.add_argument("--guest-exe", help="guest PE for naming guest-address frames (guest_symbols.py)")
+    ap.add_argument("--no-symbols", action="store_true", help="skip dbghelp symbolization")
+    ap.add_argument("--all-threads", action="store_true",
+                    help="every thread's candidate return addresses (watchdog / hang dumps have no exception)")
+    args = ap.parse_args()
+    path = resolve_dump(args.dump)
+    cdb = find_cdb(args.cdb)
+    with open(path, "rb") as f0:
+        head = f0.read()
+    fr = read_fault_record(head, parse(head))
+    if fr is not None:
+        print_fault_record(fr)
+    if cdb:
+        sym = ".sympath+ " + args.pdb_dir + ";" if args.pdb_dir else ""
+        cmd = [cdb, "-z", path, "-c", sym + ("~*kn 40;q" if args.all_threads else ".ecxr;kn 40;q")]
+        sys.exit(subprocess.call(cmd))
+    data = open(path, "rb").read()
+    streams = parse(data)
+    modules = read_modules(data, streams)
+    if args.all_threads:
+        sym = make_symbolizer(args, modules)
+        print_all_threads(data, streams, sym.describe)
+        return
+    if STREAM_EXCEPTION not in streams:
+        sys.exit("dump has no exception stream (guest-fault dump): install cdb for thread stacks")
+    _s, rva = streams[STREAM_EXCEPTION]
+    tid, _pad = struct.unpack_from("<II", data, rva)
+    code, _fl, _rec, addr, nparams = struct.unpack_from("<IIQQI", data, rva + 8)
+    params = struct.unpack_from("<15Q", data, rva + 8 + 32)
+    ctx_size, ctx_rva = struct.unpack_from("<II", data, rva + 8 + 32 + 120)
+    rsp = struct.unpack_from("<Q", data, ctx_rva + 0x98)[0]
+    rip = struct.unpack_from("<Q", data, ctx_rva + 0xF8)[0]
+
+    sym = make_symbolizer(args, modules)
     loc = sym.describe
 
     print("exception 0x%08x%s at 0x%x (%s) thread %d" % (

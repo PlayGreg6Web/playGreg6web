@@ -42,6 +42,13 @@ add `--dump-on-fault` to the boot options (pass it to `run_native_boot.py` after
 recorded in `fault_record.minidump`; `minidump_stack.py` takes the dump or the report. Dumps stay local, do
 not commit or upload them.
 
+Dumps are written by a helper process (the harness executable started with `--pg6-minidump-helper`), never
+inside the faulting process, so a dump cannot freeze the run (#663). A run that hangs is never silent: at
+`--watchdog-ms` the harness prints every thread's stack (`[hang-stack]` lines) and writes
+`host-fault-host_watchdog_timeout-<pid>.dmp` before it builds the report, and if the fault or stop report
+path itself does not finish within 30 s, it prints the stacks again and terminates with the fault/watchdog
+exit code. `python tools\minidump_stack.py <dump> --all-threads --exe-dir <bin dir>` names every thread's frames.
+
 ## Common endings today
 
 - **Unimplemented slot, e.g. `XSystemGetAppSpecificDeviceId`**: the title called a platform interface slot
@@ -52,7 +59,8 @@ not commit or upload them.
 - **Host access violation**: a bug in the harness or runtime, not the game. Gives a minidump; use
   `minidump_stack.py`.
 - **Unresolved indirect call**: rerun, then use `--seed-targets` (see `tools/run_native_boot.py`), or `triage_fault.py`.
-- **Watchdog / time limit**: not a crash; the run hit `--max-ms` or `--watchdog-ms`.
+- **Watchdog / time limit**: the run hit `--max-ms` (not a crash) or `--watchdog-ms` (it did not stop in time:
+  read the `[hang-stack]` lines and the watchdog dump).
 
 ## What to send to developers
 

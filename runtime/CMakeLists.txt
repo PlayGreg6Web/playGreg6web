@@ -468,6 +468,12 @@ else()
         add_test(NAME playgta6_minidump_guest_fault_tests COMMAND test_minidump_fault --guest)
         set_tests_properties(playgta6_minidump_guest_fault_tests PROPERTIES
             ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+        # A thread holding the process heap lock must not freeze the dump (#663).
+        add_test(NAME playgta6_minidump_locked_heap_tests COMMAND test_minidump_fault --locked)
+        # Watchdog path: every thread's stack printed and an all-thread dump.
+        add_test(NAME playgta6_minidump_hang_tests COMMAND test_minidump_fault --hang)
+        set_tests_properties(playgta6_minidump_hang_tests PROPERTIES
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
     endif()
 
     add_executable(test_host_marshallers ../tests/test_host_marshallers.cpp)

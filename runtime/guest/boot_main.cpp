@@ -1460,6 +1460,50 @@ void write_outputs(bool print_summary) {
     std::fflush(stderr);
 }
 
+// Exit backstop (#663): the report path of a fault or watchdog stop runs arbitrary runtime code
+// (report building, audio/device shutdown, flushes) while other threads may hold any lock, and a
+// hang there used to keep the process alive until the runner's timeout with no report at all. A
+// thread created at startup (no thread creation, heap or CRT lock needed when it fires) waits
+// kExitBackstopMs after arming, prints every thread's stack through the minidump helper and
+// terminates with the armed exit code.
+std::atomic<int> g_backstop_code{-1};
+#ifdef _WIN32
+constexpr DWORD kExitBackstopMs = 30000;
+HANDLE g_backstop_event = nullptr;
+
+// stderr without the CRT stream lock (a stuck thread may hold it).
+void raw_stderr(const char* text) {
+    DWORD written = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(std::strlen(text)), &written, nullptr);
+}
+
+DWORD WINAPI exit_backstop_main(void*) {
+    WaitForSingleObject(g_backstop_event, INFINITE);
+    Sleep(kExitBackstopMs);
+    raw_stderr("[harness] exit backstop: the fault/stop report path did not finish within 30 s; thread stacks follow\n");
+    guest::minidump::Writer::dump_threads(nullptr, "report path stuck", 20000);
+    raw_stderr("[harness] exit backstop: terminating\n");
+    const int code = g_backstop_code.load();
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code >= 0 ? code : kExitWatchdog));
+    return 0;
+}
+
+void start_exit_backstop() {
+    g_backstop_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (g_backstop_event == nullptr) return;
+    HANDLE t = CreateThread(nullptr, 64 * 1024, &exit_backstop_main, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (t != nullptr) CloseHandle(t);
+}
+
+void arm_exit_backstop(int code) {
+    int expected = -1;
+    if (g_backstop_code.compare_exchange_strong(expected, code) && g_backstop_event != nullptr) SetEvent(g_backstop_event);
+}
+#else
+void start_exit_backstop() {}
+void arm_exit_backstop(int code) { g_backstop_code.store(code); }
+#endif
+
 [[noreturn]] void terminate_now(int code) {
     playgta6::guest::host_input::silence_host_rumble();
     std::fflush(nullptr);
@@ -1471,6 +1515,7 @@ void write_outputs(bool print_summary) {
 
 // Reports a host fault once and terminates; later/concurrent faults just terminate.
 [[noreturn]] void host_fault(const char* kind, uint64_t address, uint64_t pc, int code) {
+    arm_exit_backstop(code);
     if (!g_finishing.exchange(true)) {
         if (guest::report_host_fault(kind, address, pc)) {
             write_outputs(true);
@@ -1502,7 +1547,7 @@ void off_thread_fault() {
 }
 
 #ifdef _WIN32
-// Writes the dump via the dedicated dumper thread (guest/minidump_writer.h); `info` may be null
+// Writes the dump via the minidump helper process (guest/minidump_writer.h); `info` may be null
 // (guest faults). Returns true on success. Never throws; safe to call from the vectored handler.
 bool write_minidump(const std::string& path, EXCEPTION_POINTERS* info) {
     return guest::minidump::Writer::init() && guest::minidump::Writer::dump(path.c_str(), info);
@@ -1769,6 +1814,21 @@ void start_watchdog() {
     }
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::milliseconds(g_options.watchdog_ms));
+        arm_exit_backstop(kExitWatchdog);
+#ifdef _WIN32
+        // First, before touching any runtime state (a hang may hold any lock): every thread's
+        // stack on stderr and a dump of all threads, both written by the helper process.
+        char line[160];
+        std::snprintf(line, sizeof(line), "[harness] watchdog: %llu ms elapsed, the run did not end; thread stacks follow\n",
+                      static_cast<unsigned long long>(g_options.watchdog_ms));
+        raw_stderr(line);
+        const std::string path = guest::minidump::select_path(g_options.report, "host", "host_watchdog_timeout",
+                                                              static_cast<uint32_t>(GetCurrentProcessId()));
+        if (guest::minidump::Writer::dump_threads(path.c_str(), "watchdog", 20000)) {
+            if (g_minidump_path.empty()) g_minidump_path = path;
+            raw_stderr(("[harness] watchdog: all-thread dump written to " + path + "\n").c_str());
+        }
+#endif
         // Reads the boot's state while the guest may still run: diagnostic, racy by nature.
         host_fault("host_watchdog_timeout", 0, 0, kExitWatchdog);
     }).detach();
@@ -1777,6 +1837,10 @@ void start_watchdog() {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // The out-of-process minidump writer is this executable (guest/minidump_writer.h).
+    if (const int helper = guest::minidump::Writer::run_helper_if_requested(argc, argv); helper >= 0) return helper;
+#endif
     if (!parse(argc, argv, g_options)) {
         usage();
         return kExitUsage;
@@ -2242,6 +2306,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[harness] --record-input needs --host-input\n");
         return kExitUsage;
     }
+    start_exit_backstop();
     start_watchdog();
     start_profile();
 
