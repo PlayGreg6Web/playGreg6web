@@ -3848,7 +3848,10 @@ void test_storage_buffer_aliasing(NativeExecutor& ex, bool across_groups) {
     const ExecutorStats& s = ex.stats();
     CHECK(s.device_errors == before.device_errors);
     CHECK(s.dispatches == before.dispatches + 2);
-    CHECK(s.storage_alias_copies == before.storage_alias_copies + 2);
+    // the read-only side is copied once per dispatch (a usage-scope snapshot: read-only + writable storage of one
+    // buffer is a usage conflict before it is an aliasing one)
+    CHECK(s.storage_alias_copies + s.usage_buffer_snapshots ==
+          before.storage_alias_copies + before.usage_buffer_snapshots + 2);
     CHECK(s.storage_alias_unfixable == before.storage_alias_unfixable);
 }
 

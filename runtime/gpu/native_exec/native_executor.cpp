@@ -321,6 +321,8 @@ struct BgInfo {
     wgpu::BindGroupLayout layout;
     std::vector<wgpu::BindGroupEntry> entries;
     std::vector<BgBufInfo> bufs;
+};
+
 // A bind group's storage-capable resources (usage_scope_model.h) and what a snapshot of one needs: the
 // group's layout and entries (to build the group again with the snapshot in that entry) and the source.
 struct BgSnapSrc {  // parallel to BgUses::uses
