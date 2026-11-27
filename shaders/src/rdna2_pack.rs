@@ -766,7 +766,10 @@ fn parse_manifest_stage(value: &str) -> Option<(ShaderStage, bool)> {
         Some((ShaderStage::Fragment, false))
     } else if value.eq_ignore_ascii_case("compute") {
         Some((ShaderStage::Compute, false))
-    } else if value.eq_ignore_ascii_case("mesh") || value.eq_ignore_ascii_case("ms") {
+    } else if value.eq_ignore_ascii_case("mesh")
+        || value.eq_ignore_ascii_case("ms")
+        || value.eq_ignore_ascii_case("mesh_shader")
+    {
         Some((ShaderStage::Compute, true))
     } else {
         None
@@ -1750,7 +1753,9 @@ impl TranslatedStageData {
 
 enum TranslatedStageOutcome {
     Translated(TranslatedStageData),
-    Oversize,
+    Oversize {
+        is_mesh: bool,
+    },
     Failed {
         error: Option<Rdna2PackError>,
         reason: String,
@@ -1847,8 +1852,18 @@ struct BlobCandidate<'a> {
     source_order: usize,
     stage: Rdna2StageOverride,
     explicit_hash: Option<u64>,
-    final_hash: u64,
+    base_hash: u64,
     work_idx: Option<usize>,
+}
+
+impl BlobCandidate<'_> {
+    fn pack_key(&self, translated_is_mesh: bool) -> u64 {
+        if self.stage == Rdna2StageOverride::Mesh || translated_is_mesh {
+            mesh_compute_pack_key(self.base_hash)
+        } else {
+            self.base_hash
+        }
+    }
 }
 
 struct BlobTranslateTask<'a> {
@@ -1879,7 +1894,9 @@ fn translate_blob_task(
             if let Some(max_wgsl) = options.max_wgsl_bytes
                 && out.wgsl.len() > max_wgsl
             {
-                TranslatedStageOutcome::Oversize
+                TranslatedStageOutcome::Oversize {
+                    is_mesh: out.mesh_output.is_some(),
+                }
             } else {
                 TranslatedStageOutcome::Translated(TranslatedStageData::from_output(out))
             }
@@ -1934,11 +1951,6 @@ fn pack_blobs_into_map(
         let explicit_hash = blob.hash_override.or(hint.hash);
         let content_hash = fnv1a_64(&blob.bytes);
         let base_hash = explicit_hash.unwrap_or(content_hash);
-        let final_hash = if stage == Rdna2StageOverride::Mesh {
-            mesh_compute_pack_key(base_hash)
-        } else {
-            base_hash
-        };
 
         let work_idx = if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
             None
@@ -1972,7 +1984,7 @@ fn pack_blobs_into_map(
             source_order: source_order_base.saturating_add(idx),
             stage,
             explicit_hash,
-            final_hash,
+            base_hash,
             work_idx,
         });
     }
@@ -2007,21 +2019,23 @@ fn pack_blobs_into_map(
                 state.skipped_or_failed += 1;
                 state.failed += 1;
                 state.failures.push(Rdna2PackFailureSummary {
-                    code_identity: Some(candidate.final_hash),
+                    code_identity: Some(candidate.pack_key(false)),
                     stage: override_to_stage(candidate.stage),
                     reason: reason.clone(),
                 });
             }
-            Some(TranslatedStageOutcome::Oversize) => {
-                if state.candidates_by_hash.contains_key(&candidate.final_hash) {
+            Some(TranslatedStageOutcome::Oversize { is_mesh }) => {
+                let final_hash = candidate.pack_key(*is_mesh);
+                if state.candidates_by_hash.contains_key(&final_hash) {
                     state.skipped_or_failed += 1;
                 } else {
                     state.skipped_oversize += 1;
                     state.skipped_or_failed += 1;
                 }
             }
-            Some(TranslatedStageOutcome::Translated(_)) => {
-                if let Some(existing) = state.candidates_by_hash.get_mut(&candidate.final_hash) {
+            Some(TranslatedStageOutcome::Translated(peek)) => {
+                let final_hash = candidate.pack_key(peek.mesh_output.is_some());
+                if let Some(existing) = state.candidates_by_hash.get_mut(&final_hash) {
                     existing.0 = existing.0.min(candidate.source_order);
                     state.skipped_or_failed += 1;
                     continue;
@@ -2037,9 +2051,9 @@ fn pack_blobs_into_map(
                         _ => unreachable!(),
                     }
                 };
-                let (entry, entry_summary) = data.into_pack_parts(candidate.final_hash);
+                let (entry, entry_summary) = data.into_pack_parts(final_hash);
                 state.insert_translated(
-                    candidate.final_hash,
+                    final_hash,
                     candidate.source_order,
                     entry,
                     entry_summary,
@@ -2340,7 +2354,9 @@ fn translate_manifest_stage(
             if let Some(max_wgsl) = options.max_wgsl_bytes
                 && out.wgsl.len() > max_wgsl
             {
-                TranslatedStageOutcome::Oversize
+                TranslatedStageOutcome::Oversize {
+                    is_mesh: out.mesh_output.is_some(),
+                }
             } else {
                 TranslatedStageOutcome::Translated(TranslatedStageData::from_output(out))
             }
@@ -2444,7 +2460,7 @@ fn pack_manifest_into_map(
                     );
                 }
             }
-            TranslatedStageOutcome::Oversize => {
+            TranslatedStageOutcome::Oversize { .. } => {
                 state.skipped_oversize += 1;
                 state.skipped_or_failed += 1;
             }
@@ -3458,11 +3474,6 @@ fn stream_blobs_into_spill(
             let explicit_hash = blob.hash_override.or(hint.hash);
             let content_hash = fnv1a_64(&blob.bytes);
             let base_hash = explicit_hash.unwrap_or(content_hash);
-            let final_hash = if stage == Rdna2StageOverride::Mesh {
-                mesh_compute_pack_key(base_hash)
-            } else {
-                base_hash
-            };
 
             let work_idx = if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
                 None
@@ -3496,7 +3507,7 @@ fn stream_blobs_into_spill(
                 source_order: source_order_base.saturating_add(idx),
                 stage,
                 explicit_hash,
-                final_hash,
+                base_hash,
                 work_idx,
             });
         }
@@ -3540,21 +3551,23 @@ fn stream_blobs_into_spill(
                     state.skipped_or_failed += 1;
                     state.failed += 1;
                     state.failures.push(Rdna2PackFailureSummary {
-                        code_identity: Some(candidate.final_hash),
+                        code_identity: Some(candidate.pack_key(false)),
                         stage: override_to_stage(candidate.stage),
                         reason: reason.clone(),
                     });
                 }
-                Some(TranslatedStageOutcome::Oversize) => {
-                    if state.candidates_by_hash.contains_key(&candidate.final_hash) {
+                Some(TranslatedStageOutcome::Oversize { is_mesh }) => {
+                    let final_hash = candidate.pack_key(*is_mesh);
+                    if state.candidates_by_hash.contains_key(&final_hash) {
                         state.skipped_or_failed += 1;
                     } else {
                         state.skipped_oversize += 1;
                         state.skipped_or_failed += 1;
                     }
                 }
-                Some(TranslatedStageOutcome::Translated(_)) => {
-                    if let Some(existing) = state.candidates_by_hash.get_mut(&candidate.final_hash) {
+                Some(TranslatedStageOutcome::Translated(peek)) => {
+                    let final_hash = candidate.pack_key(peek.mesh_output.is_some());
+                    if let Some(existing) = state.candidates_by_hash.get_mut(&final_hash) {
                         existing.source_order = existing.source_order.min(candidate.source_order);
                         state.skipped_or_failed += 1;
                         continue;
@@ -3570,7 +3583,7 @@ fn stream_blobs_into_spill(
                             _ => unreachable!(),
                         }
                     };
-                    state.record_spilled(candidate.final_hash, candidate.source_order, data, options)?;
+                    state.record_spilled(final_hash, candidate.source_order, data, options)?;
                 }
                 None => unreachable!("all blob translation tasks must produce an outcome"),
             }
@@ -3675,7 +3688,7 @@ fn stream_manifest_into_spill(
                         );
                     }
                 }
-                TranslatedStageOutcome::Oversize => {
+                TranslatedStageOutcome::Oversize { .. } => {
                     state.skipped_oversize += 1;
                     state.skipped_or_failed += 1;
                 }

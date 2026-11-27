@@ -85,6 +85,7 @@ pub enum Rdna2InferredStage {
     Vertex,
     Pixel,
     Compute,
+    Mesh,
     Unknown,
 }
 
@@ -94,6 +95,7 @@ impl Rdna2InferredStage {
             Self::Vertex => "vertex",
             Self::Pixel => "pixel",
             Self::Compute => "compute",
+            Self::Mesh => "mesh",
             Self::Unknown => "unknown",
         }
     }
@@ -4077,6 +4079,7 @@ pub fn analyze_instructions(
     let mut has_lds = false;
     let mut has_pixel_export = false;
     let mut has_vertex_export = false;
+    let mut has_mesh_signal = false;
     let mut has_any_export = false;
     let mut has_compute_mem = false;
 
@@ -4091,7 +4094,10 @@ pub fn analyze_instructions(
 
         match &inst.detail {
             Rdna2Detail::Sopp {
-                op, branch_target, ..
+                op,
+                simm16,
+                branch_target,
+                ..
             } => {
                 if matches!(op, 0x01 | 0x1B | 0x1E) {
                     endpgm_count += 1;
@@ -4101,6 +4107,9 @@ pub fn analyze_instructions(
                 }
                 if *op == 0x0A {
                     has_barriers = true;
+                }
+                if matches!(op, 0x10 | 0x11) && sendmsg_id(*simm16) == SENDMSG_ID_GS_ALLOC_REQ {
+                    has_mesh_signal = true;
                 }
                 if let Some(target_offset) = branch_target {
                     let (_, _, conditional) = sopp_mnemonic(*op);
@@ -4289,6 +4298,9 @@ pub fn analyze_instructions(
                 has_any_export = true;
                 if target.is_pixel_output() {
                     has_pixel_export = true;
+                }
+                if matches!(target, Rdna2ExportTarget::Prim) {
+                    has_mesh_signal = true;
                 }
                 if target.is_vertex_output() {
                     has_vertex_export = true;
@@ -4545,6 +4557,8 @@ pub fn analyze_instructions(
 
     let inferred_stage = if has_pixel_export || has_vintrp {
         Rdna2InferredStage::Pixel
+    } else if has_mesh_signal {
+        Rdna2InferredStage::Mesh
     } else if has_vertex_export {
         Rdna2InferredStage::Vertex
     } else if !has_any_export && has_compute_mem {

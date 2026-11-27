@@ -20,12 +20,12 @@ use std::num::NonZeroU32;
 
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{
-    AddressSpace, ArraySize, BinaryOperator, Binding, BuiltIn, EntryPoint, Expression, Function,
-    FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass, ImageDimension,
-    ImageQuery, Interpolation, Literal, LocalVariable, MathFunction, MemoryDecorations, Module,
-    Range, ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind, ShaderStage as NagaStage,
-    Span, Statement, StorageAccess, StorageFormat, StructMember, SwitchCase, SwitchValue,
-    SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
+    AddressSpace, ArraySize, AtomicFunction, BinaryOperator, Binding, BuiltIn, EntryPoint,
+    Expression, Function, FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass,
+    ImageDimension, ImageQuery, Interpolation, Literal, LocalVariable, MathFunction,
+    MemoryDecorations, Module, Range, ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind,
+    ShaderStage as NagaStage, Span, Statement, StorageAccess, StorageFormat, StructMember,
+    SwitchCase, SwitchValue, SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
 };
 
 use crate::binding_pack::{
@@ -38,9 +38,10 @@ use crate::convert::{ShaderStage, format_shader_hash};
 use crate::pack::write_json_string;
 use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
-    SENDMSG_ID_GS, SENDMSG_ID_GS_ALLOC_REQ, SENDMSG_ID_GS_DONE, analyze_instructions,
-    decode_program, decode_vop3_interp_attr, mimg_addr_vgpr, mimg_bvh_addr_vgpr_count, sendmsg_id,
-    sop2_src_pair_widths, sopc_src_pair_widths, vop2_is_co_ci, vop2_is_madk, vop3_is_interp_f16,
+    Rdna2SwizzleMode, SENDMSG_ID_GS, SENDMSG_ID_GS_ALLOC_REQ, SENDMSG_ID_GS_DONE,
+    analyze_instructions, decode_ds_swizzle_offset, decode_program, decode_vop3_interp_attr,
+    mimg_addr_vgpr, mimg_bvh_addr_vgpr_count, sendmsg_id, sop2_src_pair_widths,
+    sopc_src_pair_widths, vop2_is_co_ci, vop2_is_madk, vop3_is_interp_f16,
 };
 use crate::rdna2_cfg::{
     BlockId, BranchKind, ControlFlowGraph, DISPATCH_EXIT_PC, ExecMaskOp, ExecMaskWrite,
@@ -1777,6 +1778,8 @@ struct ProgramPlan {
     storage_buf_slots: Vec<StorageBufSlotPlan>,
     storage_tex_slots: Vec<ResourceKey>,
     uses_lds: bool,
+    uses_lds_atomics: bool,
+    uses_wave_lds: bool,
     frag_attrs: Vec<u8>,
     frag_attr_interp: BTreeMap<u8, FragAttrInterp>,
     /// Fragment `(clamped_attr, attrchan)` channels read with `high = true` by `v_interp_*_f16`,
@@ -1822,7 +1825,9 @@ fn resolve_stage(inferred: Rdna2InferredStage, override_stage: Rdna2StageOverrid
         Rdna2StageOverride::Auto => match inferred {
             Rdna2InferredStage::Vertex => ShaderStage::Vertex,
             Rdna2InferredStage::Pixel => ShaderStage::Fragment,
-            Rdna2InferredStage::Compute | Rdna2InferredStage::Unknown => ShaderStage::Compute,
+            Rdna2InferredStage::Compute
+            | Rdna2InferredStage::Mesh
+            | Rdna2InferredStage::Unknown => ShaderStage::Compute,
         },
     }
 }
@@ -2313,19 +2318,64 @@ fn mtbuf_storage_op(op: u8) -> Option<StorageBufOpKind> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DsAtomicOp {
+    Add,
+    Sub,
+    UMin,
+    UMax,
+    And,
+    Or,
+    Xor,
+    Swap,
+    Inc,
+    Dec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DsLdsOp {
     ReadContiguous(u8),
     WriteContiguous(u8),
     Read2 { stride_bytes: u32 },
     Write2 { stride_bytes: u32 },
+    Atomic { op: DsAtomicOp, returns_value: bool },
+    Swizzle,
+    Permute,
+    BPermute,
 }
 
 fn ds_lds_op(op: u8) -> Option<DsLdsOp> {
     match op {
+        // Non-returning 32-bit LDS atomics
+        0x00 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Add, returns_value: false }),
+        0x01 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Sub, returns_value: false }),
+        0x03 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Inc, returns_value: false }),
+        0x04 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Dec, returns_value: false }),
+        0x05 | 0x07 => Some(DsLdsOp::Atomic { op: DsAtomicOp::UMin, returns_value: false }),
+        0x06 | 0x08 => Some(DsLdsOp::Atomic { op: DsAtomicOp::UMax, returns_value: false }),
+        0x09 => Some(DsLdsOp::Atomic { op: DsAtomicOp::And, returns_value: false }),
+        0x0A => Some(DsLdsOp::Atomic { op: DsAtomicOp::Or, returns_value: false }),
+        0x0B => Some(DsLdsOp::Atomic { op: DsAtomicOp::Xor, returns_value: false }),
+        // Standard LDS reads & writes
         0x0D => Some(DsLdsOp::WriteContiguous(1)),
         0x0E => Some(DsLdsOp::Write2 { stride_bytes: 4 }),
         0x0F => Some(DsLdsOp::Write2 { stride_bytes: 256 }),
         0x1E | 0x1F => Some(DsLdsOp::WriteContiguous(1)),
+        // Returning 32-bit LDS atomics
+        0x20 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Add, returns_value: true }),
+        0x21 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Sub, returns_value: true }),
+        0x23 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Inc, returns_value: true }),
+        0x24 => Some(DsLdsOp::Atomic { op: DsAtomicOp::Dec, returns_value: true }),
+        0x25 | 0x27 => Some(DsLdsOp::Atomic { op: DsAtomicOp::UMin, returns_value: true }),
+        0x26 | 0x28 => Some(DsLdsOp::Atomic { op: DsAtomicOp::UMax, returns_value: true }),
+        0x29 => Some(DsLdsOp::Atomic { op: DsAtomicOp::And, returns_value: true }),
+        0x2A => Some(DsLdsOp::Atomic { op: DsAtomicOp::Or, returns_value: true }),
+        0x2B => Some(DsLdsOp::Atomic { op: DsAtomicOp::Xor, returns_value: true }),
+        0x2D => Some(DsLdsOp::Atomic { op: DsAtomicOp::Swap, returns_value: true }),
+        // Cross-lane wave DS ops
+        0x35 => Some(DsLdsOp::Swizzle),
+        0xB2 => Some(DsLdsOp::Permute),
+        0xB3 => Some(DsLdsOp::BPermute),
+        // Standard LDS reads & wide transfers
         0x36 => Some(DsLdsOp::ReadContiguous(1)),
         0x37 => Some(DsLdsOp::Read2 { stride_bytes: 4 }),
         0x38 => Some(DsLdsOp::Read2 { stride_bytes: 256 }),
@@ -2679,27 +2729,33 @@ impl OriginState {
         }
     }
 
-    fn initial(stage: ShaderStage, is_mesh: bool, unreferenced_user_sgprs: &[bool; 32]) -> Self {
+    fn initial(
+        stage: ShaderStage,
+        is_mesh: bool,
+        unreferenced_user_sgprs: &[bool; MAX_USER_DATA_SGPR_LIMIT],
+    ) -> Self {
         let mut origins = [SgprOrigin::Unwritten; TRACKED_SGPR_COUNT];
         // Seed console ABI initial SGPR origins:
         //   Mesh (lowered to compute):
-        //             NGG/mesh system SGPRs in s0..s15, user data starts at s16..s31
-        //             (matching `runtime/gpu/stage_reflection.h` `kMeshUserDataBase = 16`).
+        //             NGG/mesh system SGPRs in s0..s15, user data starts at s16..s47 (up to 32
+        //             GFX10.3 SPI_SHADER_USER_DATA_GS_0..31 dwords, matching
+        //             `runtime/gpu/stage_reflection.h` `kMeshUserDataBase = 16`).
         //   Graphics (vertex / fragment):
         //             system SGPRs in s0..s7 (vertex hardware VB table ptr in s[0:1]),
         //             user data starts at s8..s31; scratch SGPRs s32..s105 & vcc start Unwritten.
         //   Compute:  system SGPRs in s0..s3, user data starts at s4..s31; s32..s105 & vcc Unwritten.
-        // Any register in user_base..32 that is not live-on-entry (never read, or unconditionally
-        // written before any read along every path from entry) stays Unwritten so CFG merges
-        // across guarded descriptor loads do not lose provenance.
+        // Any register in user_base..user_limit that is not live-on-entry (never read, or
+        // unconditionally written before any read along every path from entry) stays Unwritten so
+        // CFG merges across guarded descriptor loads do not lose provenance.
         let user_base = initial_user_sgpr_base(stage, is_mesh);
+        let user_limit = initial_user_sgpr_limit(is_mesh);
         for slot in origins.iter_mut().take(user_base) {
             *slot = SgprOrigin::Unknown;
         }
         if stage == ShaderStage::Vertex {
             origins[0] = SgprOrigin::VbTablePtr { byte_offset: 0 };
         }
-        for (sgpr, slot) in origins.iter_mut().enumerate().take(32).skip(user_base) {
+        for (sgpr, slot) in origins.iter_mut().enumerate().take(user_limit).skip(user_base) {
             if !unreferenced_user_sgprs[sgpr] {
                 *slot = SgprOrigin::UserTable {
                     user_sgpr: sgpr as u32,
@@ -9449,13 +9505,28 @@ fn step_origin_state(
             clear_vgpr_origins(state, *vdst);
         }
         Rdna2Detail::Ds { op, vdst, .. } => {
-            if let Some(DsLdsOp::ReadContiguous(n)) = ds_lds_op(*op) {
-                for k in 0..n {
-                    clear_vgpr_origins(state, vdst.saturating_add(k));
+            if let Some(lds_op) = ds_lds_op(*op) {
+                match lds_op {
+                    DsLdsOp::ReadContiguous(n) => {
+                        for k in 0..n {
+                            clear_vgpr_origins(state, vdst.saturating_add(k));
+                        }
+                    }
+                    DsLdsOp::Read2 { .. } => {
+                        clear_vgpr_origins(state, *vdst);
+                        clear_vgpr_origins(state, vdst.saturating_add(1));
+                    }
+                    DsLdsOp::Atomic {
+                        returns_value: true,
+                        ..
+                    }
+                    | DsLdsOp::Swizzle
+                    | DsLdsOp::Permute
+                    | DsLdsOp::BPermute => {
+                        clear_vgpr_origins(state, *vdst);
+                    }
+                    _ => {}
                 }
-            } else if let Some(DsLdsOp::Read2 { .. }) = ds_lds_op(*op) {
-                clear_vgpr_origins(state, *vdst);
-                clear_vgpr_origins(state, vdst.saturating_add(1));
             }
         }
         Rdna2Detail::Sopp { .. } | Rdna2Detail::Exp { .. } | Rdna2Detail::Unknown { .. } => {}
@@ -9504,6 +9575,22 @@ fn mark_untainted_def_and_parents(
     }
 }
 
+/// Upper SGPR bound (exclusive) tracked for console initial user-data SGPRs.
+/// Mesh stages begin at `s16` (`kMeshUserDataBase = 16`) and can carry up to 32 user-data dwords
+/// (`s16..s47`, including SM 6.6 trailing implicit heap SGPRs when root signatures exceed 16 dwords).
+const MAX_USER_DATA_SGPR_LIMIT: usize = 48;
+
+/// Exclusive upper SGPR index for initial user-data seeding (`s48` for mesh `s16..s47`,
+/// `s32` for graphics `s8..s31` and compute `s4..s31`).
+#[inline]
+const fn initial_user_sgpr_limit(is_mesh: bool) -> usize {
+    if is_mesh {
+        MAX_USER_DATA_SGPR_LIMIT
+    } else {
+        32
+    }
+}
+
 /// First SGPR holding console root-argument user data for the given stage.
 ///
 /// Matches `runtime/gpu/stage_reflection.h`:
@@ -9521,52 +9608,54 @@ const fn initial_user_sgpr_base(stage: ShaderStage, is_mesh: bool) -> usize {
     }
 }
 
-/// Identify SGPRs in `user_base..32` that are NOT live-on-entry (either never read as scalar/pointer
-/// user-data inputs, or unconditionally written before any read along every CFG path from entry).
-/// Seeding those registers as `Unwritten` instead of `UserTable` prevents scratch SGPRs (e.g.
-/// `s12`/`s14`/`s16`/`s19`) and guarded CFG joins from clobbering proven descriptor origins.
+/// Identify SGPRs in `user_base..user_limit` that are NOT live-on-entry (either never read as
+/// scalar/pointer user-data inputs, or unconditionally written before any read along every CFG
+/// path from entry). Seeding those registers as `Unwritten` instead of `UserTable` prevents
+/// scratch SGPRs (e.g. `s12`/`s14`/`s16`/`s19`/`s32+`) and guarded CFG joins from clobbering
+/// proven descriptor origins.
 fn compute_unreferenced_initial_user_sgprs(
     active: &[Rdna2Instruction],
     cfg: &ControlFlowGraph,
     stage: ShaderStage,
     is_mesh: bool,
     is_wave32: bool,
-) -> [bool; 32] {
+) -> [bool; MAX_USER_DATA_SGPR_LIMIT] {
     let user_base = initial_user_sgpr_base(stage, is_mesh);
+    let user_limit = initial_user_sgpr_limit(is_mesh);
     let Some(entry) = cfg.entry() else {
-        return [false; 32];
+        return [false; MAX_USER_DATA_SGPR_LIMIT];
     };
 
     #[inline]
-    fn bit_u16(reg: u16) -> u32 {
-        if reg < 32 {
-            1u32 << reg
+    fn bit_u16(reg: u16, limit: usize) -> u64 {
+        if usize::from(reg) < limit {
+            1u64 << reg
         } else {
             0
         }
     }
     #[inline]
-    fn pair_bits_u16(reg: u16) -> u32 {
-        let mut mask = bit_u16(reg);
+    fn pair_bits_u16(reg: u16, limit: usize) -> u64 {
+        let mut mask = bit_u16(reg, limit);
         if let Some(hi) = reg.checked_add(1) {
-            mask |= bit_u16(hi);
+            mask |= bit_u16(hi, limit);
         }
         mask
     }
     #[inline]
-    fn bit_u8(reg: u8) -> u32 {
-        if reg < 32 {
-            1u32 << reg
+    fn bit_u8(reg: u8, limit: usize) -> u64 {
+        if usize::from(reg) < limit {
+            1u64 << reg
         } else {
             0
         }
     }
     #[inline]
-    fn range_bits_u8(base: u8, count: u8) -> u32 {
-        let mut mask = 0u32;
+    fn range_bits_u8(base: u8, count: u8, limit: usize) -> u64 {
+        let mut mask = 0u64;
         for k in 0..count {
             if let Some(r) = base.checked_add(k) {
-                mask |= bit_u8(r);
+                mask |= bit_u8(r, limit);
             }
         }
         mask
@@ -9574,7 +9663,7 @@ fn compute_unreferenced_initial_user_sgprs(
 
     // Track non-SMEM scalar writes across the program to recognize in-place synthesized root V#s
     // at `s[r..r+3]` where words 2/3 are filled via SALU while words 0/1 come from initial user SGPRs.
-    let mut non_smem_written_mask = 0u32;
+    let mut non_smem_written_mask = 0u64;
     for inst in active {
         if inst.truncated {
             continue;
@@ -9582,83 +9671,83 @@ fn compute_unreferenced_initial_user_sgprs(
         match &inst.detail {
             Rdna2Detail::Sop1 { op, sdst, .. } if !matches!(*op, 0x20 | 0x22) => {
                 non_smem_written_mask |= if sop1_writes_pair(*op) {
-                    range_bits_u8(*sdst, 2)
+                    range_bits_u8(*sdst, 2, user_limit)
                 } else {
-                    bit_u8(*sdst)
+                    bit_u8(*sdst, user_limit)
                 };
             }
             Rdna2Detail::Sopk { op, sdst, .. }
                 if !matches!(*op, 0x03..=0x0E | 0x12 | 0x13 | 0x17..=0x1A) =>
             {
-                non_smem_written_mask |= bit_u8(*sdst);
+                non_smem_written_mask |= bit_u8(*sdst, user_limit);
             }
             Rdna2Detail::Sop2 { op, sdst, .. } => {
                 let (p0, _) = sop2_src_pair_widths(*op);
                 non_smem_written_mask |= if p0 || *op == 0x25 {
-                    range_bits_u8(*sdst, 2)
+                    range_bits_u8(*sdst, 2, user_limit)
                 } else {
-                    bit_u8(*sdst)
+                    bit_u8(*sdst, user_limit)
                 };
             }
             Rdna2Detail::Vop1 { op, vdst, .. } if *op == 0x02 => {
-                non_smem_written_mask |= bit_u8(*vdst & 0x7F);
+                non_smem_written_mask |= bit_u8(*vdst & 0x7F, user_limit);
             }
             Rdna2Detail::Vop3 { op, vdst, .. } if matches!(*op, 0x182 | 0x360) => {
-                non_smem_written_mask |= bit_u8(*vdst & 0x7F);
+                non_smem_written_mask |= bit_u8(*vdst & 0x7F, user_limit);
             }
             _ => {}
         }
     }
 
-    let inst_reads_writes = |inst: &Rdna2Instruction| -> (u32, u32) {
+    let inst_reads_writes = |inst: &Rdna2Instruction| -> (u64, u64) {
         if inst.truncated {
             return (0, 0);
         }
-        let mut reads = 0u32;
-        let mut writes = 0u32;
+        let mut reads = 0u64;
+        let mut writes = 0u64;
         match &inst.detail {
             Rdna2Detail::Sopc {
                 op, ssrc0, ssrc1, ..
             } => {
                 let (p0, p1) = sopc_src_pair_widths(*op);
                 reads |= if p0 {
-                    pair_bits_u16(u16::from(*ssrc0))
+                    pair_bits_u16(u16::from(*ssrc0), user_limit)
                 } else {
-                    bit_u16(u16::from(*ssrc0))
+                    bit_u16(u16::from(*ssrc0), user_limit)
                 };
                 reads |= if p1 {
-                    pair_bits_u16(u16::from(*ssrc1))
+                    pair_bits_u16(u16::from(*ssrc1), user_limit)
                 } else {
-                    bit_u16(u16::from(*ssrc1))
+                    bit_u16(u16::from(*ssrc1), user_limit)
                 };
             }
             Rdna2Detail::Sop1 {
                 op, sdst, ssrc0, ..
             } => {
                 reads |= if sop1_reads_pair(*op) {
-                    pair_bits_u16(u16::from(*ssrc0))
+                    pair_bits_u16(u16::from(*ssrc0), user_limit)
                 } else {
-                    bit_u16(u16::from(*ssrc0))
+                    bit_u16(u16::from(*ssrc0), user_limit)
                 };
                 if matches!(*op, 0x05 | 0x1B | 0x1D) {
-                    reads |= bit_u16(u16::from(*sdst));
+                    reads |= bit_u16(u16::from(*sdst), user_limit);
                 } else if matches!(*op, 0x06 | 0x1C | 0x1E) {
-                    reads |= pair_bits_u16(u16::from(*sdst));
+                    reads |= pair_bits_u16(u16::from(*sdst), user_limit);
                 }
                 if !matches!(*op, 0x20 | 0x22) {
                     writes |= if sop1_writes_pair(*op) {
-                        range_bits_u8(*sdst, 2)
+                        range_bits_u8(*sdst, 2, user_limit)
                     } else {
-                        bit_u8(*sdst)
+                        bit_u8(*sdst, user_limit)
                     };
                 }
             }
             Rdna2Detail::Sopk { op, sdst, .. } => {
                 if matches!(*op, 0x02..=0x10 | 0x12) {
-                    reads |= bit_u16(u16::from(*sdst));
+                    reads |= bit_u16(u16::from(*sdst), user_limit);
                 }
                 if !matches!(*op, 0x03..=0x0E | 0x12 | 0x13 | 0x17..=0x1A) {
-                    writes |= bit_u8(*sdst);
+                    writes |= bit_u8(*sdst, user_limit);
                 }
             }
             Rdna2Detail::Sop2 {
@@ -9670,19 +9759,19 @@ fn compute_unreferenced_initial_user_sgprs(
             } => {
                 let (p0, p1) = sop2_src_pair_widths(*op);
                 reads |= if p0 {
-                    pair_bits_u16(u16::from(*ssrc0))
+                    pair_bits_u16(u16::from(*ssrc0), user_limit)
                 } else {
-                    bit_u16(u16::from(*ssrc0))
+                    bit_u16(u16::from(*ssrc0), user_limit)
                 };
                 reads |= if p1 {
-                    pair_bits_u16(u16::from(*ssrc1))
+                    pair_bits_u16(u16::from(*ssrc1), user_limit)
                 } else {
-                    bit_u16(u16::from(*ssrc1))
+                    bit_u16(u16::from(*ssrc1), user_limit)
                 };
                 writes |= if p0 || *op == 0x25 {
-                    range_bits_u8(*sdst, 2)
+                    range_bits_u8(*sdst, 2, user_limit)
                 } else {
-                    bit_u8(*sdst)
+                    bit_u8(*sdst, user_limit)
                 };
             }
             Rdna2Detail::Smem {
@@ -9698,13 +9787,13 @@ fn compute_unreferenced_initial_user_sgprs(
                     2
                 };
                 if let Some(sgpr) = checked_descriptor_sgpr(*sbase, 2) {
-                    reads |= range_bits_u8(sgpr, base_count);
+                    reads |= range_bits_u8(sgpr, base_count, user_limit);
                 }
                 if *soffset != 0x7D {
-                    reads |= bit_u16(u16::from(*soffset));
+                    reads |= bit_u16(u16::from(*soffset), user_limit);
                 }
                 if let Some(count) = smem_load_dword_count(*op) {
-                    writes |= range_bits_u8(*sdata, count);
+                    writes |= range_bits_u8(*sdata, count, user_limit);
                 } else {
                     let store_count: u8 = match *op {
                         0x10 | 0x18 => 1,
@@ -9714,30 +9803,30 @@ fn compute_unreferenced_initial_user_sgprs(
                         _ => 0,
                     };
                     if store_count > 0 {
-                        reads |= range_bits_u8(*sdata, store_count);
+                        reads |= range_bits_u8(*sdata, store_count, user_limit);
                     }
                 }
             }
             Rdna2Detail::Vop1 { op, vdst, src0, .. } => {
-                reads |= bit_u16(*src0);
+                reads |= bit_u16(*src0, user_limit);
                 if *op == 0x02 {
-                    writes |= bit_u8(*vdst & 0x7F);
+                    writes |= bit_u8(*vdst & 0x7F, user_limit);
                 }
             }
             Rdna2Detail::Vopc {
                 op, src0, literal, ..
             } => {
-                reads |= bit_u16(*src0);
+                reads |= bit_u16(*src0, user_limit);
                 if let Some(sd) = vopc_sdwab_sdst(*op, *src0, *literal) {
                     if !is_wave32 && sd % 2 == 0 {
-                        writes |= pair_bits_u16(u16::from(sd));
+                        writes |= pair_bits_u16(u16::from(sd), user_limit);
                     } else {
-                        writes |= bit_u8(sd);
+                        writes |= bit_u8(sd, user_limit);
                     }
                 }
             }
             Rdna2Detail::Vop2 { src0, .. } => {
-                reads |= bit_u16(*src0);
+                reads |= bit_u16(*src0, user_limit);
             }
             Rdna2Detail::Vop3 {
                 op,
@@ -9749,17 +9838,17 @@ fn compute_unreferenced_initial_user_sgprs(
                 ..
             } => {
                 if !vop3_is_interp_f16(*op) {
-                    reads |= bit_u16(*src0);
+                    reads |= bit_u16(*src0, user_limit);
                 }
                 if !(0x180..=0x1FF).contains(op) {
                     if matches!(*op, 0x2FF..=0x301) || *op == 0x364 {
-                        reads |= pair_bits_u16(*src1);
+                        reads |= pair_bits_u16(*src1, user_limit);
                     } else {
-                        reads |= bit_u16(*src1);
+                        reads |= bit_u16(*src1, user_limit);
                     }
                 }
                 if *op == 0x364 {
-                    reads |= pair_bits_u16(*src0);
+                    reads |= pair_bits_u16(*src0, user_limit);
                 }
                 if *op != 0x342
                     && matches!(
@@ -9776,25 +9865,25 @@ fn compute_unreferenced_initial_user_sgprs(
                             | 0x378
                     )
                 {
-                    reads |= bit_u16(*src2);
+                    reads |= bit_u16(*src2, user_limit);
                 }
                 if let Some(sd) = sdst {
                     let sd7 = *sd & 0x7F;
                     writes |= if !is_wave32 && sd7 % 2 == 0 {
-                        range_bits_u8(sd7, 2)
+                        range_bits_u8(sd7, 2, user_limit)
                     } else {
-                        bit_u8(sd7)
+                        bit_u8(sd7, user_limit)
                     };
                 }
                 if *op <= 0xFF && (*op & 0x10) == 0 {
                     let sd = *vdst & 0x7F;
                     writes |= if !is_wave32 && sd % 2 == 0 {
-                        range_bits_u8(sd, 2)
+                        range_bits_u8(sd, 2, user_limit)
                     } else {
-                        bit_u8(sd)
+                        bit_u8(sd, user_limit)
                     };
                 } else if matches!(*op, 0x182 | 0x360) {
-                    writes |= bit_u8(*vdst & 0x7F);
+                    writes |= bit_u8(*vdst & 0x7F, user_limit);
                 }
             }
             Rdna2Detail::Vop3P {
@@ -9804,25 +9893,25 @@ fn compute_unreferenced_initial_user_sgprs(
                 src2,
                 ..
             } => {
-                reads |= bit_u16(*src0) | bit_u16(*src1);
+                reads |= bit_u16(*src0, user_limit) | bit_u16(*src1, user_limit);
                 if vop3p_is_ternary(*op) {
-                    reads |= bit_u16(*src2);
+                    reads |= bit_u16(*src2, user_limit);
                 }
             }
             Rdna2Detail::Flat { saddr, .. } => {
-                reads |= pair_bits_u16(u16::from(*saddr));
+                reads |= pair_bits_u16(u16::from(*saddr), user_limit);
             }
             Rdna2Detail::Mubuf { srsrc, soffset, .. }
             | Rdna2Detail::Mtbuf { srsrc, soffset, .. } => {
-                reads |= bit_u16(u16::from(*soffset));
+                reads |= bit_u16(u16::from(*soffset), user_limit);
                 // If a MUBUF/MTBUF consumes an in-place synthesized root V# at s[r..r+3] whose
                 // words 2/3 were written by non-SMEM scalar ops, treat `s[r..r+1]` as read here
                 // so they stay live-on-entry unless overwritten beforehand.
                 if let Some(r) = checked_descriptor_sgpr(*srsrc, 4)
-                    && (r as usize) + 3 < 32
-                    && (non_smem_written_mask & range_bits_u8(r + 2, 2)) != 0
+                    && (r as usize) + 3 < user_limit
+                    && (non_smem_written_mask & range_bits_u8(r + 2, 2, user_limit)) != 0
                 {
-                    reads |= range_bits_u8(r, 2);
+                    reads |= range_bits_u8(r, 2, user_limit);
                 }
             }
             Rdna2Detail::Mimg { .. }
@@ -9836,14 +9925,14 @@ fn compute_unreferenced_initial_user_sgprs(
     };
 
     let num_blocks = cfg.blocks.len();
-    let mut block_gen = vec![0u32; num_blocks];
-    let mut block_kill = vec![0u32; num_blocks];
+    let mut block_gen = vec![0u64; num_blocks];
+    let mut block_kill = vec![0u64; num_blocks];
     for (bid, block) in cfg.blocks.iter().enumerate() {
         if block.synthetic_exit {
             continue;
         }
-        let mut use_mask = 0u32;
-        let mut kill = 0u32;
+        let mut use_mask = 0u64;
+        let mut kill = 0u64;
         for inst_idx in block.instr_range.clone() {
             if let Some(inst) = active.get(inst_idx) {
                 let (reads, writes) = inst_reads_writes(inst);
@@ -9856,7 +9945,7 @@ fn compute_unreferenced_initial_user_sgprs(
     }
 
     // Standard backward dataflow fixpoint: `live_in[b] = gen[b] | (union(live_in[succ]) & !kill[b])`.
-    // Monotonic on a 32-bit lattice, so guaranteed to converge in at most 32 * num_blocks steps.
+    // Monotonic on a 48-bit lattice, so guaranteed to converge in at most 48 * num_blocks steps.
     let mut live_in = block_gen.clone();
     loop {
         let mut changed = false;
@@ -9865,7 +9954,7 @@ fn compute_unreferenced_initial_user_sgprs(
             if block.synthetic_exit {
                 continue;
             }
-            let mut live_out = 0u32;
+            let mut live_out = 0u64;
             for succ in block.terminator.successors() {
                 if let Some(&succ_in) = live_in.get(succ) {
                     live_out |= succ_in;
@@ -9883,9 +9972,14 @@ fn compute_unreferenced_initial_user_sgprs(
     }
 
     let live_at_entry = live_in[entry];
-    let mut unreferenced = [false; 32];
-    for (sgpr, slot) in unreferenced.iter_mut().enumerate().skip(user_base) {
-        *slot = (live_at_entry & (1u32 << sgpr)) == 0;
+    let mut unreferenced = [false; MAX_USER_DATA_SGPR_LIMIT];
+    for (sgpr, slot) in unreferenced
+        .iter_mut()
+        .enumerate()
+        .take(user_limit)
+        .skip(user_base)
+    {
+        *slot = (live_at_entry & (1u64 << sgpr)) == 0;
     }
     unreferenced
 }
@@ -10392,10 +10486,39 @@ fn inst_uses_m0(inst: &Rdna2Instruction) -> bool {
 }
 
 /// Evaluate a scalar operand if it is a compile-time constant or tracked constant SGPR/`m0`.
-fn eval_const_ssrc(src: u8, literal: Option<u32>, sgpr_consts: &[Option<u32>; 106], m0: Option<u32>) -> Option<u32> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstLat {
+    Const(u32),
+    Bottom,
+}
+
+impl ConstLat {
+    #[inline]
+    const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Const(a), Self::Const(b)) if a == b => Self::Const(a),
+            _ => Self::Bottom,
+        }
+    }
+
+    #[inline]
+    const fn as_const(self) -> Option<u32> {
+        match self {
+            Self::Const(v) => Some(v),
+            Self::Bottom => None,
+        }
+    }
+}
+
+fn eval_const_ssrc(
+    src: u8,
+    literal: Option<u32>,
+    sgpr_consts: &[ConstLat; 106],
+    m0: ConstLat,
+) -> Option<u32> {
     match src {
-        0..=105 => sgpr_consts[usize::from(src)],
-        124 => m0,
+        0..=105 => sgpr_consts[usize::from(src)].as_const(),
+        124 => m0.as_const(),
         128..=192 => Some(u32::from(src - 128)),
         193..=208 => Some((-(i32::from(src) - 192)) as u32),
         255 => literal,
@@ -10403,77 +10526,86 @@ fn eval_const_ssrc(src: u8, literal: Option<u32>, sgpr_consts: &[Option<u32>; 10
     }
 }
 
-/// Best-effort static inference of `(max_vertices, max_primitives)` when every
-/// `s_sendmsg(MSG_GS_ALLOC_REQ)` site in `active` has a statically known constant `m0`
-/// (`verts = m0 & 0x7FF`, `prims = (m0 >> 12) & 0x7FF`) within `1..=256`.
-fn infer_static_mesh_counts(active: &[Rdna2Instruction]) -> Option<(u32, u32)> {
-    let mut branch_targets: BTreeSet<usize> = BTreeSet::new();
-    for inst in active {
-        if let Rdna2Detail::Sopp {
-            branch_target: Some(t),
-            ..
-        } = inst.detail
-            && t >= 0
-        {
-            branch_targets.insert(t as usize);
+#[derive(Clone, PartialEq, Eq)]
+struct MeshConstState {
+    sgprs: [ConstLat; 106],
+    m0: ConstLat,
+}
+
+impl MeshConstState {
+    fn entry() -> Self {
+        Self {
+            sgprs: [ConstLat::Bottom; 106],
+            m0: ConstLat::Bottom,
         }
     }
 
-    let mut sgpr_consts: [Option<u32>; 106] = [None; 106];
-    let mut m0_const: Option<u32> = None;
-    let mut saw_alloc = false;
-    let mut max_verts: u32 = 0;
-    let mut max_prims: u32 = 0;
-
-    for inst in active {
-        if inst.truncated {
-            continue;
+    fn join_from(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        for (dst, &src) in self.sgprs.iter_mut().zip(other.sgprs.iter()) {
+            let next = dst.join(src);
+            if next != *dst {
+                *dst = next;
+                changed = true;
+            }
         }
-        if branch_targets.contains(&inst.offset) {
-            sgpr_consts.fill(None);
-            m0_const = None;
+        let next_m0 = self.m0.join(other.m0);
+        if next_m0 != self.m0 {
+            self.m0 = next_m0;
+            changed = true;
+        }
+        changed
+    }
+
+    fn set_reg(&mut self, reg: u8, val: ConstLat) {
+        if reg <= 105 {
+            self.sgprs[usize::from(reg)] = val;
+        } else if reg == 124 {
+            self.m0 = val;
+        }
+    }
+
+    fn step(&mut self, inst: &Rdna2Instruction) {
+        if inst.truncated {
+            return;
         }
         match &inst.detail {
-            Rdna2Detail::Sopp { op, simm16, .. }
-                if matches!(*op, 0x10 | 0x11)
-                    && sendmsg_id(*simm16) == SENDMSG_ID_GS_ALLOC_REQ =>
-            {
-                let m0 = m0_const?;
-                let verts = m0 & 0x7FF;
-                let prims = (m0 >> 12) & 0x7FF;
-                if !(1..=MAX_MESH_VERTICES).contains(&verts)
-                    || !(1..=MAX_MESH_PRIMITIVES).contains(&prims)
-                {
-                    return None;
-                }
-                saw_alloc = true;
-                max_verts = max_verts.max(verts);
-                max_prims = max_prims.max(prims);
-            }
             Rdna2Detail::Sop1 {
                 op,
                 sdst,
                 ssrc0,
                 literal,
             } => {
-                let val = if *op == 0x03 {
-                    eval_const_ssrc(*ssrc0, *literal, &sgpr_consts, m0_const)
-                } else {
-                    None
+                let c0 = eval_const_ssrc(*ssrc0, *literal, &self.sgprs, self.m0);
+                let val = match (*op, c0) {
+                    (0x03, Some(v)) => ConstLat::Const(v),
+                    (0x07, Some(v)) => ConstLat::Const(!v),
+                    (0x0B, Some(v)) => ConstLat::Const(v.reverse_bits()),
+                    (0x19, Some(v)) => ConstLat::Const(i32::from(v as i8) as u32),
+                    (0x1A, Some(v)) => ConstLat::Const(i32::from(v as i16) as u32),
+                    (0x34, Some(v)) => ConstLat::Const((v as i32).wrapping_abs() as u32),
+                    _ => ConstLat::Bottom,
                 };
-                if *sdst <= 105 {
-                    sgpr_consts[usize::from(*sdst)] = val;
-                } else if *sdst == 124 {
-                    m0_const = val;
+                if !matches!(*op, 0x20 | 0x22) {
+                    self.set_reg(*sdst, val);
+                    if sop1_writes_pair(*op)
+                        && let Some(hi) = checked_sgpr_reg(*sdst, 1)
+                    {
+                        self.set_reg(hi, ConstLat::Bottom);
+                    }
                 }
             }
             Rdna2Detail::Sopk { op, sdst, simm16, .. } => {
                 let imm = (*simm16 as i16 as i32) as u32;
-                let val = if *op == 0x00 { Some(imm) } else { None };
-                if *sdst <= 105 {
-                    sgpr_consts[usize::from(*sdst)] = val;
-                } else if *sdst == 124 {
-                    m0_const = val;
+                let prev = eval_const_ssrc(*sdst, None, &self.sgprs, self.m0);
+                let val = match (*op, prev) {
+                    (0x00, _) => ConstLat::Const(imm),
+                    (0x0F, Some(p)) => ConstLat::Const(p.wrapping_add(imm)),
+                    (0x10, Some(p)) => ConstLat::Const(p.wrapping_mul(imm)),
+                    _ => ConstLat::Bottom,
+                };
+                if !matches!(*op, 0x03..=0x0E | 0x12 | 0x13 | 0x17..=0x1A) {
+                    self.set_reg(*sdst, val);
                 }
             }
             Rdna2Detail::Sop2 {
@@ -10483,46 +10615,185 @@ fn infer_static_mesh_counts(active: &[Rdna2Instruction]) -> Option<(u32, u32)> {
                 ssrc1,
                 literal,
             } => {
-                let a = eval_const_ssrc(*ssrc0, *literal, &sgpr_consts, m0_const);
-                let b = eval_const_ssrc(*ssrc1, *literal, &sgpr_consts, m0_const);
+                let a = eval_const_ssrc(*ssrc0, *literal, &self.sgprs, self.m0);
+                let b = eval_const_ssrc(*ssrc1, *literal, &self.sgprs, self.m0);
                 let val = match (*op, a, b) {
-                    (0x00 | 0x02, Some(x), Some(y)) => Some(x.wrapping_add(y)),
-                    (0x0E, Some(x), Some(y)) => Some(x & y),
-                    (0x10, Some(x), Some(y)) => Some(x | y),
-                    (0x1E, Some(x), Some(y)) => Some(x.wrapping_shl(y & 31)),
-                    _ => None,
+                    (0x00 | 0x02, Some(x), Some(y)) => ConstLat::Const(x.wrapping_add(y)),
+                    (0x01 | 0x03, Some(x), Some(y)) => ConstLat::Const(x.wrapping_sub(y)),
+                    (0x06, Some(x), Some(y)) => ConstLat::Const((x as i32).min(y as i32) as u32),
+                    (0x07, Some(x), Some(y)) => ConstLat::Const(x.min(y)),
+                    (0x08, Some(x), Some(y)) => ConstLat::Const((x as i32).max(y as i32) as u32),
+                    (0x09, Some(x), Some(y)) => ConstLat::Const(x.max(y)),
+                    (0x0E, Some(x), Some(y)) => ConstLat::Const(x & y),
+                    (0x10, Some(x), Some(y)) => ConstLat::Const(x | y),
+                    (0x12, Some(x), Some(y)) => ConstLat::Const(x ^ y),
+                    (0x14, Some(x), Some(y)) => ConstLat::Const(x & !y),
+                    (0x1E, Some(x), Some(y)) => ConstLat::Const(x.wrapping_shl(y & 31)),
+                    (0x20, Some(x), Some(y)) => ConstLat::Const(x.wrapping_shr(y & 31)),
+                    (0x22, Some(x), Some(y)) => {
+                        ConstLat::Const(((x as i32).wrapping_shr(y & 31)) as u32)
+                    }
+                    (0x24, Some(w), Some(o)) => {
+                        let width = w & 31;
+                        let off = o & 31;
+                        let mask = if width == 0 {
+                            0u32
+                        } else {
+                            (1u32 << width).wrapping_sub(1)
+                        };
+                        ConstLat::Const(mask.wrapping_shl(off))
+                    }
+                    (0x26, Some(x), Some(y)) => ConstLat::Const(x.wrapping_mul(y)),
+                    (0x27, Some(x), Some(p)) => {
+                        let off = p & 31;
+                        let width = (p >> 16) & 0x7F;
+                        let r = if width == 0 {
+                            0
+                        } else if width >= 32 {
+                            x.wrapping_shr(off)
+                        } else {
+                            x.wrapping_shr(off) & ((1u32 << width) - 1)
+                        };
+                        ConstLat::Const(r)
+                    }
+                    (0x2E..=0x31, Some(x), Some(y)) => {
+                        let sh = u32::from(*op - 0x2D);
+                        ConstLat::Const(x.wrapping_shl(sh).wrapping_add(y))
+                    }
+                    (0x32, Some(x), Some(y)) => {
+                        ConstLat::Const((x & 0xFFFF) | ((y & 0xFFFF) << 16))
+                    }
+                    (0x33, Some(x), Some(y)) => ConstLat::Const((x & 0xFFFF) | (y & 0xFFFF_0000)),
+                    (0x34, Some(x), Some(y)) => ConstLat::Const((x >> 16) | (y & 0xFFFF_0000)),
+                    _ => ConstLat::Bottom,
                 };
-                if *sdst <= 105 {
-                    sgpr_consts[usize::from(*sdst)] = val;
-                } else if *sdst == 124 {
-                    m0_const = val;
+                self.set_reg(*sdst, val);
+                let (p0, _) = sop2_src_pair_widths(*op);
+                if (p0 || *op == 0x25)
+                    && let Some(hi) = checked_sgpr_reg(*sdst, 1)
+                {
+                    self.set_reg(hi, ConstLat::Bottom);
                 }
             }
-            Rdna2Detail::Smem { sdata, .. } => {
-                if *sdata <= 105 {
-                    for k in 0..4u8 {
+            Rdna2Detail::Smem { op, sdata, .. } => {
+                if let Some(count) = smem_load_dword_count(*op) {
+                    for k in 0..count {
                         if let Some(r) = checked_sgpr_reg(*sdata, k) {
-                            sgpr_consts[usize::from(r)] = None;
+                            self.set_reg(r, ConstLat::Bottom);
                         }
                     }
-                } else if *sdata == 124 {
-                    m0_const = None;
+                    if *sdata == 124 {
+                        self.m0 = ConstLat::Bottom;
+                    }
                 }
             }
             Rdna2Detail::Vop1 { op: 0x02, vdst, .. }
-            | Rdna2Detail::Vop3 { op: 0x360, vdst, .. } => {
-                let sd = *vdst & 0x7F;
-                if sd <= 105 {
-                    sgpr_consts[usize::from(sd)] = None;
-                } else if sd == 124 {
-                    m0_const = None;
-                }
+            | Rdna2Detail::Vop3 {
+                op: 0x182 | 0x360,
+                vdst,
+                ..
+            } => {
+                self.set_reg(*vdst & 0x7F, ConstLat::Bottom);
             }
             _ => {}
         }
     }
+}
 
-    if saw_alloc {
+/// CFG-aware static inference of `(max_vertices, max_primitives)` when every reachable
+/// `s_sendmsg(MSG_GS_ALLOC_REQ)` site in `active` has a statically known constant `m0`
+/// (`verts = m0 & 0x7FF`, `prims = (m0 >> 12) & 0x7FF`) that is either a culled zero-primitive
+/// early exit (`m0 == 0`) or within `1..=256`, with at least one non-zero allocation site.
+fn infer_static_mesh_counts(active: &[Rdna2Instruction]) -> Option<(u32, u32)> {
+    let cfg = ControlFlowGraph::from_instructions(active);
+    let entry = cfg.entry()?;
+    let num_blocks = cfg.blocks.len();
+    let mut block_in: Vec<Option<MeshConstState>> = vec![None; num_blocks];
+    let mut visits: Vec<u8> = vec![0; num_blocks];
+    let mut worklist: BTreeSet<BlockId> = BTreeSet::new();
+
+    block_in[entry] = Some(MeshConstState::entry());
+    worklist.insert(entry);
+
+    while let Some(bid) = worklist.pop_first() {
+        if visits[bid] >= 16 {
+            continue;
+        }
+        visits[bid] += 1;
+        let block = &cfg.blocks[bid];
+        if block.synthetic_exit {
+            continue;
+        }
+        let Some(mut state) = block_in[bid].clone() else {
+            continue;
+        };
+        for inst_idx in block.instr_range.clone() {
+            if let Some(inst) = active.get(inst_idx) {
+                state.step(inst);
+            }
+        }
+        for succ in block.terminator.successors() {
+            if cfg.blocks.get(succ).is_none_or(|b| b.synthetic_exit) {
+                continue;
+            }
+            match &mut block_in[succ] {
+                None => {
+                    block_in[succ] = Some(state.clone());
+                    worklist.insert(succ);
+                }
+                Some(existing) => {
+                    if existing.join_from(&state) {
+                        worklist.insert(succ);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut saw_nonzero = false;
+    let mut max_verts: u32 = 0;
+    let mut max_prims: u32 = 0;
+
+    for (bid, block) in cfg.blocks.iter().enumerate() {
+        if block.synthetic_exit {
+            continue;
+        }
+        let Some(mut state) = block_in[bid].clone() else {
+            continue;
+        };
+        for inst_idx in block.instr_range.clone() {
+            let Some(inst) = active.get(inst_idx) else {
+                continue;
+            };
+            if inst.truncated {
+                continue;
+            }
+            if let Rdna2Detail::Sopp { op, simm16, .. } = inst.detail
+                && matches!(op, 0x10 | 0x11)
+                && sendmsg_id(simm16) == SENDMSG_ID_GS_ALLOC_REQ
+            {
+                let m0 = state.m0.as_const()?;
+                let verts = m0 & 0x7FF;
+                let prims = (m0 >> 12) & 0x7FF;
+                if verts == 0 && prims == 0 {
+                    // Culled zero-primitive early-exit SetMeshOutputCounts(0, 0).
+                    continue;
+                }
+                if !(1..=MAX_MESH_VERTICES).contains(&verts)
+                    || !(1..=MAX_MESH_PRIMITIVES).contains(&prims)
+                {
+                    return None;
+                }
+                saw_nonzero = true;
+                max_verts = max_verts.max(verts);
+                max_prims = max_prims.max(prims);
+            } else {
+                state.step(inst);
+            }
+        }
+    }
+
+    if saw_nonzero {
         Some((max_verts, max_prims))
     } else {
         None
@@ -10534,7 +10805,9 @@ fn plan_program(
     instructions: &[Rdna2Instruction],
     options: &Rdna2TranslateOptions,
 ) -> ProgramPlan {
-    let is_mesh = options.stage == Rdna2StageOverride::Mesh;
+    let is_mesh = options.stage == Rdna2StageOverride::Mesh
+        || (options.stage == Rdna2StageOverride::Auto
+            && summary.inferred_stage == Rdna2InferredStage::Mesh);
     let stage = resolve_stage(summary.inferred_stage, options.stage);
     let entry_point = match &options.entry_point {
         Some(custom) => sanitize_wgsl_ident(custom, default_entry_point(stage)),
@@ -10580,6 +10853,8 @@ fn plan_program(
     let mut atomic_storage_buf_keys: BTreeSet<ResourceKey> = BTreeSet::new();
     let mut storage_tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
     let mut uses_lds = false;
+    let mut uses_lds_atomics = false;
+    let mut uses_wave_lds = false;
     let mut has_buffer_fetch = false;
     let mut first_swappc_idx: Option<usize> = None;
     let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
@@ -10709,28 +10984,47 @@ fn plan_program(
                     } else if *sdst == 106 {
                         needs_vcc = true;
                     }
-                } else if matches!(*op, 0x04 | 0x08 | 0x0A) {
-                    // s_mov_b64 / s_not_b64 / s_wqm_b64: 64-bit SGPR pair source and destination
-                    if *op == 0x08 {
+                } else if sop1_reads_pair(*op) || sop1_writes_pair(*op) {
+                    if matches!(*op, 0x06 | 0x08 | 0x0E | 0x10 | 0x2D) {
                         needs_scc = true;
                     }
-                    if *ssrc0 <= 104 {
+                    if sop1_reads_pair(*op) && *ssrc0 <= 104 {
                         let hi = *ssrc0 + 1;
                         sgprs.insert(hi);
                         if !written_sgprs.contains(&hi) {
                             read_before_write_sgprs.insert(hi);
                         }
                     }
-                    if *sdst <= 104 {
+                    if matches!(*op, 0x06 | 0x1C | 0x1E) {
+                        if *sdst <= 105 {
+                            sgprs.insert(*sdst);
+                            if !written_sgprs.contains(sdst) {
+                                read_before_write_sgprs.insert(*sdst);
+                            }
+                        }
+                        if *sdst <= 104 {
+                            let hi = *sdst + 1;
+                            sgprs.insert(hi);
+                            if !written_sgprs.contains(&hi) {
+                                read_before_write_sgprs.insert(hi);
+                            }
+                        }
+                    }
+                    if sop1_writes_pair(*op) {
+                        if *sdst <= 104 {
+                            sgprs.insert(*sdst);
+                            sgprs.insert(*sdst + 1);
+                            written_sgprs.insert(*sdst);
+                            written_sgprs.insert(*sdst + 1);
+                        } else if *sdst == 105 {
+                            sgprs.insert(105);
+                            written_sgprs.insert(105);
+                        } else if *sdst == 106 {
+                            needs_vcc = true;
+                        }
+                    } else if *sdst <= 105 {
                         sgprs.insert(*sdst);
-                        sgprs.insert(*sdst + 1);
                         written_sgprs.insert(*sdst);
-                        written_sgprs.insert(*sdst + 1);
-                    } else if *sdst == 105 {
-                        sgprs.insert(105);
-                        written_sgprs.insert(105);
-                    } else if *sdst == 106 {
-                        needs_vcc = true;
                     }
                 } else {
                     if matches!(*op, 0x05 | 0x1B | 0x1D) {
@@ -11126,8 +11420,8 @@ fn plan_program(
                         needs_exec = true;
                     }
                     record_lane_mask_dst(*vdst & 0x7F);
-                } else if *op == 0x360 {
-                    // v_readlane_b32 sdst, vsrc0, ssrc1: writes 32-bit scalar destination sdst
+                } else if matches!(*op, 0x182 | 0x360) {
+                    // v_readfirstlane_b32_e64 / v_readlane_b32: writes 32-bit scalar destination sdst
                     let sd = *vdst & 0x7F;
                     if sd <= 105 {
                         sgprs.insert(sd);
@@ -11668,13 +11962,13 @@ fn plan_program(
                 if stage == ShaderStage::Compute
                     && let Some(lds_op) = ds_lds_op(*op)
                 {
-                    uses_lds = true;
                     vgprs.insert(*addr);
                     if !written_vgprs.contains(addr) {
                         read_before_write_vgprs.insert(*addr);
                     }
                     match lds_op {
                         DsLdsOp::ReadContiguous(n) => {
+                            uses_lds = true;
                             for k in 0..n {
                                 if let Some(reg) = checked_vgpr_reg(*vdst, k) {
                                     vgprs.insert(reg);
@@ -11683,6 +11977,7 @@ fn plan_program(
                             }
                         }
                         DsLdsOp::Read2 { .. } => {
+                            uses_lds = true;
                             for k in 0..2u8 {
                                 if let Some(reg) = checked_vgpr_reg(*vdst, k) {
                                     vgprs.insert(reg);
@@ -11691,6 +11986,7 @@ fn plan_program(
                             }
                         }
                         DsLdsOp::WriteContiguous(n) => {
+                            uses_lds = true;
                             for k in 0..n {
                                 if let Some(reg) = checked_vgpr_reg(*data0, k) {
                                     vgprs.insert(reg);
@@ -11701,12 +11997,39 @@ fn plan_program(
                             }
                         }
                         DsLdsOp::Write2 { .. } => {
+                            uses_lds = true;
                             for &reg in &[data0, data1] {
                                 vgprs.insert(*reg);
                                 if !written_vgprs.contains(reg) {
                                     read_before_write_vgprs.insert(*reg);
                                 }
                             }
+                        }
+                        DsLdsOp::Atomic { returns_value, .. } => {
+                            uses_lds = true;
+                            uses_lds_atomics = true;
+                            vgprs.insert(*data0);
+                            if !written_vgprs.contains(data0) {
+                                read_before_write_vgprs.insert(*data0);
+                            }
+                            if returns_value {
+                                vgprs.insert(*vdst);
+                                written_vgprs.insert(*vdst);
+                            }
+                        }
+                        DsLdsOp::Swizzle => {
+                            uses_wave_lds = true;
+                            vgprs.insert(*vdst);
+                            written_vgprs.insert(*vdst);
+                        }
+                        DsLdsOp::Permute | DsLdsOp::BPermute => {
+                            uses_wave_lds = true;
+                            vgprs.insert(*data0);
+                            if !written_vgprs.contains(data0) {
+                                read_before_write_vgprs.insert(*data0);
+                            }
+                            vgprs.insert(*vdst);
+                            written_vgprs.insert(*vdst);
                         }
                     }
                 }
@@ -12456,6 +12779,8 @@ fn plan_program(
         storage_buf_slots,
         storage_tex_slots,
         uses_lds,
+        uses_lds_atomics,
+        uses_wave_lds,
         frag_attrs: frag_attr_set.into_iter().collect(),
         frag_attr_interp: if options.preserve_fragment_interpolation {
             frag_attr_interp
@@ -12538,6 +12863,7 @@ struct IrEmitter {
     storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
     storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
     lds_global: Option<Handle<GlobalVariable>>,
+    wave_lds_global: Option<Handle<GlobalVariable>>,
     mesh_out_global: Option<Handle<GlobalVariable>>,
     mesh_output: Option<MeshOutputLayout>,
     emitted_bindings: Vec<WgslBindingInfo>,
@@ -13394,12 +13720,19 @@ impl IrEmitter {
             }
         }
 
+        let lds_is_atomic =
+            plan.uses_lds && plan.uses_lds_atomics && plan.stage == ShaderStage::Compute;
         let lds_global = if plan.uses_lds && plan.stage == ShaderStage::Compute {
+            let lds_elem_ty = if lds_is_atomic {
+                insert_type(&mut module, None, TypeInner::Atomic(Scalar::U32))
+            } else {
+                u32_ty
+            };
             let lds_arr_ty = insert_type(
                 &mut module,
                 None,
                 TypeInner::Array {
-                    base: u32_ty,
+                    base: lds_elem_ty,
                     size: ArraySize::Constant(
                         NonZeroU32::new(LDS_WORKGROUP_DWORDS).unwrap_or(NonZeroU32::MIN),
                     ),
@@ -13412,6 +13745,31 @@ impl IrEmitter {
                     space: AddressSpace::WorkGroup,
                     binding: None,
                     ty: lds_arr_ty,
+                    init: None,
+                    memory_decorations: MemoryDecorations::empty(),
+                },
+                Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
+
+        let wave_lds_global = if plan.uses_wave_lds && plan.stage == ShaderStage::Compute {
+            let wave_arr_ty = insert_type(
+                &mut module,
+                None,
+                TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Constant(NonZeroU32::new(256).unwrap_or(NonZeroU32::MIN)),
+                    stride: 4,
+                },
+            );
+            Some(module.global_variables.append(
+                GlobalVariable {
+                    name: Some("pg6_wave_lds".to_string()),
+                    space: AddressSpace::WorkGroup,
+                    binding: None,
+                    ty: wave_arr_ty,
                     init: None,
                     memory_decorations: MemoryDecorations::empty(),
                 },
@@ -13899,6 +14257,7 @@ impl IrEmitter {
             storage_buf_globals,
             storage_tex_globals,
             lds_global,
+            wave_lds_global,
             mesh_out_global,
             mesh_output: plan.mesh_output,
             emitted_bindings,
@@ -16827,7 +17186,12 @@ impl IrEmitter {
                         let local_idx = self.raw_expr(Expression::FunctionArgument(3));
                         let zero = self.lit_u32(0);
                         let is_lane0 = self.emit_bin(BinaryOperator::Equal, local_idx, zero);
-                        let cond = self.emit_bin(BinaryOperator::LogicalAnd, is_lane0, rec_ok);
+                        let mut cond = self.emit_bin(BinaryOperator::LogicalAnd, is_lane0, rec_ok);
+                        if self.exec_local.is_some() {
+                            let exec = self.load_exec();
+                            let active = self.emit_bin(BinaryOperator::NotEqual, exec, zero);
+                            cond = self.emit_bin(BinaryOperator::LogicalAnd, cond, active);
+                        }
                         let accept = self.lower_nested(|s| {
                             let m0 = s.load_m0();
                             let mask11 = s.lit_u32(0x7FF);
@@ -17028,6 +17392,16 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_cmov_b64: scc ? src0[0:1] : sdst[0:1]
+            0x06 => {
+                let cond = self.load_scc();
+                let (a_lo, a_hi) = self.read_ssrc_pair(ssrc0, literal);
+                let (r_lo, r_hi) = self.read_ssrc_pair(sdst, None);
+                let lo = self.emit_select(cond, a_lo, r_lo);
+                let hi = self.emit_select(cond, a_hi, r_hi);
+                self.store_sdst_pair(sdst, lo, hi);
+                true
+            }
             // s_not_b32
             0x07 => {
                 let v = self.read_src_u32(u16::from(ssrc0), literal);
@@ -17061,6 +17435,26 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_brev_b64: 64-bit bit-reversal across SGPR pair
+            0x0C => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let rev_lo = self.emit_expr(Expression::Math {
+                    fun: MathFunction::ReverseBits,
+                    arg: hi,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let rev_hi = self.emit_expr(Expression::Math {
+                    fun: MathFunction::ReverseBits,
+                    arg: lo,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                self.store_sdst_pair(sdst, rev_lo, rev_hi);
+                true
+            }
             // s_bcnt0_i32_b32: count zero bits in 32-bit src0; scc = (res != 0)
             0x0D => {
                 let v = self.read_src_u32(u16::from(ssrc0), literal);
@@ -17072,6 +17466,33 @@ impl IrEmitter {
                     arg2: None,
                     arg3: None,
                 });
+                self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
+            // s_bcnt0_i32_b64 (0x0E) / s_bcnt1_i32_b64 (0x10): count 0/1 bits in 64-bit src0; scc = (res != 0)
+            0x0E | 0x10 => {
+                let (lo_raw, hi_raw) = self.read_ssrc_pair(ssrc0, literal);
+                let (lo, hi) = if op == 0x0E {
+                    (self.emit_bit_not(lo_raw), self.emit_bit_not(hi_raw))
+                } else {
+                    (lo_raw, hi_raw)
+                };
+                let c_lo = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountOneBits,
+                    arg: lo,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let c_hi = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountOneBits,
+                    arg: hi,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let res = self.emit_bin(BinaryOperator::Add, c_lo, c_hi);
                 self.store_sgpr_u32(sdst, res);
                 self.update_scc_nonzero(res);
                 true
@@ -17105,6 +17526,39 @@ impl IrEmitter {
                 let is_zero = self.emit_bin(BinaryOperator::Equal, inv, zero);
                 let neg_one = self.lit_u32(0xFFFF_FFFF);
                 let res = self.emit_select(is_zero, neg_one, ctz);
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_ff0_i32_b64 (0x12) / s_ff1_i32_b64 (0x14): find first 0/1 bit from LSB in 64-bit src0
+            0x12 | 0x14 => {
+                let (lo_raw, hi_raw) = self.read_ssrc_pair(ssrc0, literal);
+                let (lo, hi) = if op == 0x12 {
+                    (self.emit_bit_not(lo_raw), self.emit_bit_not(hi_raw))
+                } else {
+                    (lo_raw, hi_raw)
+                };
+                let ctz_lo = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountTrailingZeros,
+                    arg: lo,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let ctz_hi = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountTrailingZeros,
+                    arg: hi,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let c32 = self.lit_u32(32);
+                let hi_pos = self.emit_bin(BinaryOperator::Add, ctz_hi, c32);
+                let zero = self.lit_u32(0);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let hi_nz = self.emit_bin(BinaryOperator::NotEqual, hi, zero);
+                let from_hi = self.emit_select(hi_nz, hi_pos, neg_one);
+                let lo_nz = self.emit_bin(BinaryOperator::NotEqual, lo, zero);
+                let res = self.emit_select(lo_nz, ctz_lo, from_hi);
                 self.store_sgpr_u32(sdst, res);
                 true
             }
@@ -17142,10 +17596,72 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_flbit_i32_b64: count leading zeros from MSB in 64-bit src0; -1 when 0
+            0x16 => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let clz_hi = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountLeadingZeros,
+                    arg: hi,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let clz_lo = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountLeadingZeros,
+                    arg: lo,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let c32 = self.lit_u32(32);
+                let lo_pos = self.emit_bin(BinaryOperator::Add, clz_lo, c32);
+                let zero = self.lit_u32(0);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let lo_nz = self.emit_bin(BinaryOperator::NotEqual, lo, zero);
+                let from_lo = self.emit_select(lo_nz, lo_pos, neg_one);
+                let hi_nz = self.emit_bin(BinaryOperator::NotEqual, hi, zero);
+                let res = self.emit_select(hi_nz, clz_hi, from_lo);
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
             // s_flbit_i32: count leading bits matching MSB sign bit; -1 when 0 or -1
             0x17 => {
                 let v = self.read_src_u32(u16::from(ssrc0), literal);
                 let res = self.emit_ffbh_i32(v);
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_flbit_i32_i64: count leading bits matching MSB sign bit of 64-bit src0; -1 when 0 or -1
+            0x18 => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let hi_i = self.bitcast_u32_to_i32(hi);
+                let sh31 = self.lit_u32(31);
+                let sign_i = self.emit_bin(BinaryOperator::ShiftRight, hi_i, sh31);
+                let sign_mask = self.bitcast_i32_to_u32(sign_i);
+                let x_lo = self.emit_bin(BinaryOperator::ExclusiveOr, lo, sign_mask);
+                let x_hi = self.emit_bin(BinaryOperator::ExclusiveOr, hi, sign_mask);
+                let clz_hi = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountLeadingZeros,
+                    arg: x_hi,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let clz_lo = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountLeadingZeros,
+                    arg: x_lo,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let c32 = self.lit_u32(32);
+                let lo_pos = self.emit_bin(BinaryOperator::Add, clz_lo, c32);
+                let zero = self.lit_u32(0);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let lo_nz = self.emit_bin(BinaryOperator::NotEqual, x_lo, zero);
+                let from_lo = self.emit_select(lo_nz, lo_pos, neg_one);
+                let hi_nz = self.emit_bin(BinaryOperator::NotEqual, x_hi, zero);
+                let res = self.emit_select(hi_nz, clz_hi, from_lo);
                 self.store_sgpr_u32(sdst, res);
                 true
             }
@@ -17183,6 +17699,35 @@ impl IrEmitter {
                     self.emit_bin(BinaryOperator::And, cur, nbit)
                 };
                 self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_bitset0_b64 (0x1C) / s_bitset1_b64 (0x1E): clear/set bit (src0 & 63) in 64-bit sdst
+            0x1C | 0x1E => {
+                let idx_raw = self.read_src_u32(u16::from(ssrc0), literal);
+                let mask63 = self.lit_u32(63);
+                let mask31 = self.lit_u32(31);
+                let c32 = self.lit_u32(32);
+                let one = self.lit_u32(1);
+                let idx = self.emit_bin(BinaryOperator::And, idx_raw, mask63);
+                let in_hi = self.emit_bin(BinaryOperator::GreaterEqual, idx, c32);
+                let sh = self.emit_bin(BinaryOperator::And, idx, mask31);
+                let bit = self.emit_bin(BinaryOperator::ShiftLeft, one, sh);
+                let (cur_lo, cur_hi) = self.read_ssrc_pair(sdst, None);
+                let (mod_lo, mod_hi) = if op == 0x1E {
+                    (
+                        self.emit_bin(BinaryOperator::InclusiveOr, cur_lo, bit),
+                        self.emit_bin(BinaryOperator::InclusiveOr, cur_hi, bit),
+                    )
+                } else {
+                    let nbit = self.emit_bit_not(bit);
+                    (
+                        self.emit_bin(BinaryOperator::And, cur_lo, nbit),
+                        self.emit_bin(BinaryOperator::And, cur_hi, nbit),
+                    )
+                };
+                let out_lo = self.emit_select(in_hi, cur_lo, mod_lo);
+                let out_hi = self.emit_select(in_hi, mod_hi, cur_hi);
+                self.store_sdst_pair(sdst, out_lo, out_hi);
                 true
             }
             // s_swappc_b64: Xbox FSSM driver-generated vertex fetch shader call.
@@ -17250,6 +17795,37 @@ impl IrEmitter {
                 }
                 self.store_sgpr_u32(sdst, res);
                 self.update_scc_nonzero(res);
+                true
+            }
+            // s_quadmask_b64: bit q (0..15) = (any bit in src0[4q+3:4q] != 0); scc = (res != 0)
+            0x2D => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let one = self.lit_u32(1);
+                let two = self.lit_u32(2);
+                let collapse = |this: &mut Self, word: Handle<Expression>| {
+                    let r1 = this.emit_bin(BinaryOperator::ShiftRight, word, one);
+                    let t1 = this.emit_bin(BinaryOperator::InclusiveOr, word, r1);
+                    let r2 = this.emit_bin(BinaryOperator::ShiftRight, t1, two);
+                    let t2 = this.emit_bin(BinaryOperator::InclusiveOr, t1, r2);
+                    let mut out = this.emit_bin(BinaryOperator::And, t2, one);
+                    for q in 1..8u32 {
+                        let sh = this.lit_u32(q * 4);
+                        let shifted = this.emit_bin(BinaryOperator::ShiftRight, t2, sh);
+                        let bit = this.emit_bin(BinaryOperator::And, shifted, one);
+                        let q_lit = this.lit_u32(q);
+                        let placed = this.emit_bin(BinaryOperator::ShiftLeft, bit, q_lit);
+                        out = this.emit_bin(BinaryOperator::InclusiveOr, out, placed);
+                    }
+                    out
+                };
+                let q_lo = collapse(self, lo);
+                let q_hi = collapse(self, hi);
+                let c8 = self.lit_u32(8);
+                let q_hi_sh = self.emit_bin(BinaryOperator::ShiftLeft, q_hi, c8);
+                let res_lo = self.emit_bin(BinaryOperator::InclusiveOr, q_lo, q_hi_sh);
+                let res_hi = self.lit_u32(0);
+                self.store_sdst_pair(sdst, res_lo, res_hi);
+                self.update_scc_nonzero_pair(res_lo, res_hi);
                 true
             }
             // s_abs_i32
@@ -21113,6 +21689,45 @@ impl IrEmitter {
                 }
                 true
             }
+            // v_mbcnt_lo_u32_b32 (0x365) / v_mbcnt_hi_u32_b32 (0x366):
+            // Count set bits in `src0` for wave lanes strictly below this invocation's lane (`0..63`),
+            // plus `src1` accumulator. Core RDNA2 mesh/compute wave-prefix-sum primitive.
+            0x365 | 0x366 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let local_idx = self.emit_compute_local_index();
+                let mask63 = self.lit_u32(63);
+                let mask31 = self.lit_u32(31);
+                let c32 = self.lit_u32(32);
+                let one = self.lit_u32(1);
+                let zero = self.lit_u32(0);
+                let all_ones = self.lit_u32(0xFFFF_FFFF);
+                let lane = self.emit_bin(BinaryOperator::And, local_idx, mask63);
+                let in_hi = self.emit_bin(BinaryOperator::GreaterEqual, lane, c32);
+                let bit_mask = if op == 0x365 {
+                    let sh = self.emit_bin(BinaryOperator::And, lane, mask31);
+                    let sh_bit = self.emit_bin(BinaryOperator::ShiftLeft, one, sh);
+                    let lo_mask = self.emit_bin(BinaryOperator::Subtract, sh_bit, one);
+                    self.emit_select(in_hi, all_ones, lo_mask)
+                } else {
+                    let hi_lane = self.emit_bin(BinaryOperator::Subtract, lane, c32);
+                    let sh = self.emit_bin(BinaryOperator::And, hi_lane, mask31);
+                    let sh_bit = self.emit_bin(BinaryOperator::ShiftLeft, one, sh);
+                    let hi_mask = self.emit_bin(BinaryOperator::Subtract, sh_bit, one);
+                    self.emit_select(in_hi, hi_mask, zero)
+                };
+                let masked = self.emit_bin(BinaryOperator::And, a, bit_mask);
+                let cnt = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountOneBits,
+                    arg: masked,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let res = self.emit_bin(BinaryOperator::Add, cnt, b);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_add3_u32
             0x36D => {
                 let a = self.read_src_u32(src0, literal);
@@ -23216,6 +23831,38 @@ impl IrEmitter {
 
     // -- DS (LDS Workgroup Shared Memory) --
 
+    fn emit_compute_local_index(&mut self) -> Handle<Expression> {
+        if self.stage != ShaderStage::Compute {
+            return self.lit_u32(0);
+        }
+        if self.mesh_output.is_some() {
+            return self.raw_expr(Expression::FunctionArgument(3));
+        }
+        let local_id = self.raw_expr(Expression::FunctionArgument(0));
+        let lx = self.emit_expr(Expression::AccessIndex {
+            base: local_id,
+            index: 0,
+        });
+        let [wg_x, wg_y, _] = self.workgroup_size;
+        if wg_y <= 1 && self.workgroup_size[2] <= 1 {
+            return lx;
+        }
+        let ly = self.emit_expr(Expression::AccessIndex {
+            base: local_id,
+            index: 1,
+        });
+        let lz = self.emit_expr(Expression::AccessIndex {
+            base: local_id,
+            index: 2,
+        });
+        let wg_x_lit = self.lit_u32(wg_x.max(1));
+        let wg_xy_lit = self.lit_u32(wg_x.max(1).saturating_mul(wg_y.max(1)));
+        let y_part = self.emit_bin(BinaryOperator::Multiply, ly, wg_x_lit);
+        let z_part = self.emit_bin(BinaryOperator::Multiply, lz, wg_xy_lit);
+        let xy = self.emit_bin(BinaryOperator::Add, lx, y_part);
+        self.emit_bin(BinaryOperator::Add, xy, z_part)
+    }
+
     fn lds_masked_dword_index(
         &mut self,
         base_addr_u32: Handle<Expression>,
@@ -23245,6 +23892,169 @@ impl IrEmitter {
         })
     }
 
+    fn translate_ds_wave_op(
+        &mut self,
+        lds_op: DsLdsOp,
+        offset0: u8,
+        offset1: u8,
+        addr: u8,
+        data0: u8,
+        vdst: u8,
+    ) -> bool {
+        let fallback_val = match lds_op {
+            DsLdsOp::Swizzle => {
+                let f = self.load_vgpr_f32(addr);
+                self.bitcast_f32_to_u32(f)
+            }
+            DsLdsOp::Permute | DsLdsOp::BPermute => {
+                let f = self.load_vgpr_f32(data0);
+                self.bitcast_f32_to_u32(f)
+            }
+            _ => return false,
+        };
+        if self.in_nonuniform_cf() {
+            self.store_vgpr_u32(vdst, fallback_val);
+            return true;
+        }
+        let Some(wave_lds) = self.wave_lds_global else {
+            self.store_vgpr_u32(vdst, fallback_val);
+            return true;
+        };
+
+        let wave_ptr = self.raw_expr(Expression::GlobalVariable(wave_lds));
+        let local_idx = self.emit_compute_local_index();
+        let mask255 = self.lit_u32(255);
+        let mask63 = self.lit_u32(63);
+        let wave_base_mask = self.lit_u32(0xFFFF_FFC0);
+        let slot = self.emit_bin(BinaryOperator::And, local_idx, mask255);
+        let wave_base = self.emit_bin(BinaryOperator::And, slot, wave_base_mask);
+        let lane = self.emit_bin(BinaryOperator::And, slot, mask63);
+
+        match lds_op {
+            DsLdsOp::Swizzle => {
+                let my_ptr = self.emit_expr(Expression::Access {
+                    base: wave_ptr,
+                    index: slot,
+                });
+                self.push_stmt(Statement::Store {
+                    pointer: my_ptr,
+                    value: fallback_val,
+                });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+
+                let imm16 = u16::from(offset0) | (u16::from(offset1) << 8);
+                let src_lane = match decode_ds_swizzle_offset(imm16) {
+                    Rdna2SwizzleMode::QuadPerm { lanes } => {
+                        let mask60 = self.lit_u32(60);
+                        let mask3 = self.lit_u32(3);
+                        let quad_base = self.emit_bin(BinaryOperator::And, lane, mask60);
+                        let quad_id = self.emit_bin(BinaryOperator::And, lane, mask3);
+                        let mut picked = self.lit_u32(u32::from(lanes[0]));
+                        for (q, &target) in lanes.iter().enumerate().skip(1) {
+                            let q_lit = self.lit_u32(q as u32);
+                            let is_q = self.emit_bin(BinaryOperator::Equal, quad_id, q_lit);
+                            let t_lit = self.lit_u32(u32::from(target));
+                            picked = self.emit_select(is_q, t_lit, picked);
+                        }
+                        self.emit_bin(BinaryOperator::InclusiveOr, quad_base, picked)
+                    }
+                    Rdna2SwizzleMode::BitMode {
+                        and_mask,
+                        or_mask,
+                        xor_mask,
+                    } => {
+                        let c32 = self.lit_u32(32);
+                        let mask31 = self.lit_u32(31);
+                        let hi_bit = self.emit_bin(BinaryOperator::And, lane, c32);
+                        let lo5 = self.emit_bin(BinaryOperator::And, lane, mask31);
+                        let and_l = self.lit_u32(u32::from(and_mask));
+                        let or_l = self.lit_u32(u32::from(or_mask));
+                        let xor_l = self.lit_u32(u32::from(xor_mask));
+                        let t0 = self.emit_bin(BinaryOperator::And, lo5, and_l);
+                        let t1 = self.emit_bin(BinaryOperator::InclusiveOr, t0, or_l);
+                        let t2 = self.emit_bin(BinaryOperator::ExclusiveOr, t1, xor_l);
+                        let t2_clamped = self.emit_bin(BinaryOperator::And, t2, mask31);
+                        self.emit_bin(BinaryOperator::InclusiveOr, hi_bit, t2_clamped)
+                    }
+                };
+                let clamped_lane = self.emit_bin(BinaryOperator::And, src_lane, mask63);
+                let target_slot_raw =
+                    self.emit_bin(BinaryOperator::InclusiveOr, wave_base, clamped_lane);
+                let target_slot = self.emit_bin(BinaryOperator::And, target_slot_raw, mask255);
+                let src_ptr = self.emit_expr(Expression::Access {
+                    base: wave_ptr,
+                    index: target_slot,
+                });
+                let res = self.emit_expr(Expression::Load { pointer: src_ptr });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            DsLdsOp::BPermute => {
+                let my_ptr = self.emit_expr(Expression::Access {
+                    base: wave_ptr,
+                    index: slot,
+                });
+                self.push_stmt(Statement::Store {
+                    pointer: my_ptr,
+                    value: fallback_val,
+                });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+
+                let addr_f = self.load_vgpr_f32(addr);
+                let addr_u = self.bitcast_f32_to_u32(addr_f);
+                let two = self.lit_u32(2);
+                let lane_raw = self.emit_bin(BinaryOperator::ShiftRight, addr_u, two);
+                let src_lane = self.emit_bin(BinaryOperator::And, lane_raw, mask63);
+                let target_slot_raw = self.emit_bin(BinaryOperator::InclusiveOr, wave_base, src_lane);
+                let target_slot = self.emit_bin(BinaryOperator::And, target_slot_raw, mask255);
+                let src_ptr = self.emit_expr(Expression::Access {
+                    base: wave_ptr,
+                    index: target_slot,
+                });
+                let res = self.emit_expr(Expression::Load { pointer: src_ptr });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            DsLdsOp::Permute => {
+                let my_ptr = self.emit_expr(Expression::Access {
+                    base: wave_ptr,
+                    index: slot,
+                });
+                let zero = self.lit_u32(0);
+                self.push_stmt(Statement::Store {
+                    pointer: my_ptr,
+                    value: zero,
+                });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+
+                let addr_f = self.load_vgpr_f32(addr);
+                let addr_u = self.bitcast_f32_to_u32(addr_f);
+                let two = self.lit_u32(2);
+                let lane_raw = self.emit_bin(BinaryOperator::ShiftRight, addr_u, two);
+                let dst_lane = self.emit_bin(BinaryOperator::And, lane_raw, mask63);
+                let target_slot_raw = self.emit_bin(BinaryOperator::InclusiveOr, wave_base, dst_lane);
+                let target_slot = self.emit_bin(BinaryOperator::And, target_slot_raw, mask255);
+                let dst_ptr = self.emit_expr(Expression::Access {
+                    base: wave_ptr,
+                    index: target_slot,
+                });
+                self.push_stmt(Statement::Store {
+                    pointer: dst_ptr,
+                    value: fallback_val,
+                });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+
+                let res = self.emit_expr(Expression::Load { pointer: my_ptr });
+                self.push_stmt(Statement::ControlBarrier(naga::Barrier::WORK_GROUP));
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn translate_ds(
         &mut self,
@@ -23259,10 +24069,16 @@ impl IrEmitter {
         if self.stage != ShaderStage::Compute {
             return false;
         }
-        let Some(lds_global) = self.lds_global else {
+        let Some(lds_op) = ds_lds_op(op) else {
             return false;
         };
-        let Some(lds_op) = ds_lds_op(op) else {
+        if matches!(
+            lds_op,
+            DsLdsOp::Swizzle | DsLdsOp::Permute | DsLdsOp::BPermute
+        ) {
+            return self.translate_ds_wave_op(lds_op, offset0, offset1, addr, data0, vdst);
+        }
+        let Some(lds_global) = self.lds_global else {
             return false;
         };
 
@@ -23433,6 +24249,49 @@ impl IrEmitter {
                 );
                 true
             }
+            DsLdsOp::Atomic {
+                op: atomic_op,
+                returns_value,
+            } => {
+                let imm16 = u32::from(offset0) | (u32::from(offset1) << 8);
+                let idx = self.lds_masked_dword_index(addr_u, imm16);
+                let elem_ptr = self.emit_expr(Expression::Access {
+                    base: lds_ptr,
+                    index: idx,
+                });
+                let val = match atomic_op {
+                    DsAtomicOp::Inc | DsAtomicOp::Dec => self.lit_u32(1),
+                    _ => {
+                        let vf = self.load_vgpr_f32(data0);
+                        self.bitcast_f32_to_u32(vf)
+                    }
+                };
+                let fun = match atomic_op {
+                    DsAtomicOp::Add | DsAtomicOp::Inc => AtomicFunction::Add,
+                    DsAtomicOp::Sub | DsAtomicOp::Dec => AtomicFunction::Subtract,
+                    DsAtomicOp::UMin => AtomicFunction::Min,
+                    DsAtomicOp::UMax => AtomicFunction::Max,
+                    DsAtomicOp::And => AtomicFunction::And,
+                    DsAtomicOp::Or => AtomicFunction::InclusiveOr,
+                    DsAtomicOp::Xor => AtomicFunction::ExclusiveOr,
+                    DsAtomicOp::Swap => AtomicFunction::Exchange { compare: None },
+                };
+                let res = self.raw_expr(Expression::AtomicResult {
+                    ty: self.types.u32_ty,
+                    comparison: false,
+                });
+                self.push_stmt(Statement::Atomic {
+                    pointer: elem_ptr,
+                    fun,
+                    value: val,
+                    result: Some(res),
+                });
+                if returns_value {
+                    self.store_vgpr_u32(vdst, res);
+                }
+                true
+            }
+            DsLdsOp::Swizzle | DsLdsOp::Permute | DsLdsOp::BPermute => unreachable!(),
         }
     }
 
