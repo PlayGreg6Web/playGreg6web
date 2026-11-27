@@ -1386,10 +1386,24 @@ void test_device_error_kinds() {
     CHECK(k.count(31, "limit (1) exceeded") == 2);
     CHECK(k.count(7, "limit (1) exceeded") == 1);
     const std::string j = k.json();
-    CHECK(j.find("{\"count\": 5, \"opcode\": 65535, \"text\": \"worker thing\"}") < j.find("\"opcode\": 31"));
+    CHECK(j.find("{\"count\": 5, \"opcode\": 65535, \"cascade\": false, \"text\": \"worker thing\"}") < j.find("\"opcode\": 31"));
     for (int i = 0; i < 100; ++i) k.record(9, "kind " + std::string(1, static_cast<char>('A' + i % 26)) + std::string(1, static_cast<char>('a' + i / 26)));
     CHECK(k.total() == 108);
     CHECK(j.size() < k.json().size());
+    {
+        DeviceErrorKinds c;
+        c.record(1, "root failure", 2);
+        c.record(1, "Entry point pg6_missing_entry doesn't exist", 3);
+        c.record(2, "[Invalid CommandBuffer \"x\"] is invalid due to a previous error.");
+        c.record(2, "[Invalid BindGroup] is invalid.");
+        c.record(2, "[Invalid BindGroupLayout] is invalid.");
+        c.record(2, "[Invalid PipelineLayout] is invalid.");
+        CHECK(c.root_total() == 2 && c.cascade_total() == 7 && c.total() == 9);
+        const std::string cj = c.json();
+        CHECK(cj.find("\"cascade_total\": 7") != std::string::npos);
+        CHECK(cj.find("\"cascade\": true, \"text\": \"Entry point pgN_missing_entry") != std::string::npos);
+        CHECK(cj.find("\"cascade\": false, \"text\": \"root failure\"") != std::string::npos);
+    }
     CHECK(k.json().find("\"other\": 0") == std::string::npos);  // past the row cap the rest is "other"
 }
 

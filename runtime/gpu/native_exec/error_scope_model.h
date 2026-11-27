@@ -200,12 +200,27 @@ inline std::string normalize_device_error(const std::string& m) {
     return o;
 }
 
+// A cascade error is a consequence of an earlier root error rather than a cause: the deliberate invalid
+// placeholder pipeline (entry pg6_missing_entry) made after a real pipeline build failed, and Dawn's
+// "[Invalid CommandBuffer/BindGroup/BindGroupLayout/PipelineLayout/...] is invalid" follow-ups.
+inline bool is_cascade_device_error(const std::string& m) {
+    if (m.find("pg6_missing_entry") != std::string::npos || m.find("pgN_missing_entry") != std::string::npos) return true;
+    static const char* const kObjs[] = {"CommandBuffer", "BindGroup", "BindGroupLayout", "PipelineLayout", "RenderPipeline", "ComputePipeline"};
+    for (const char* o : kObjs) {
+        const std::string a = std::string("Invalid ") + o, b = std::string("invalid ") + o;
+        if (m.find(a) != std::string::npos || m.find(b) != std::string::npos) return true;
+    }
+    return false;
+}
+
 class DeviceErrorKinds {
 public:
     void record(uint16_t opcode, const std::string& message, uint64_t n = 1) {
         std::string key = normalize_device_error(message);
+        const bool cascade = is_cascade_device_error(message);
         std::lock_guard<std::mutex> lock(mu_);
         total_ += n;
+        (cascade ? cascade_ : root_) += n;
         auto it = rows_.find({opcode, key});
         if (it != rows_.end()) {
             it->second += n;
@@ -224,17 +239,27 @@ public:
         auto it = rows_.find({opcode, normalize_device_error(message)});
         return it == rows_.end() ? 0 : it->second;
     }
-    // {"total": N, "other": N, "kinds": [{"count", "opcode", "text"}...]} sorted by count
+    uint64_t cascade_total() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return cascade_;
+    }
+    uint64_t root_total() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return root_;
+    }
+    // {"total": N, "root_total": N, "cascade_total": N, "other": N, "kinds": [{"count", "opcode", "cascade", "text"}...]}
+    // sorted by count; cascade rows are consequences of an earlier root error (see is_cascade_device_error)
     std::string json() const {
         std::lock_guard<std::mutex> lock(mu_);
         std::vector<std::pair<const std::pair<uint16_t, std::string>*, uint64_t>> rows;
         for (const auto& kv : rows_) rows.emplace_back(&kv.first, kv.second);
         std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-        std::string j = "{\"total\": " + std::to_string(total_) + ", \"other\": " + std::to_string(other_) + ", \"kinds\": [";
+        std::string j = "{\"total\": " + std::to_string(total_) + ", \"root_total\": " + std::to_string(root_) +
+                        ", \"cascade_total\": " + std::to_string(cascade_) + ", \"other\": " + std::to_string(other_) + ", \"kinds\": [";
         for (size_t i = 0; i < rows.size(); ++i) {
             if (i) j += ", ";
             j += "{\"count\": " + std::to_string(rows[i].second) + ", \"opcode\": " + std::to_string(rows[i].first->first) +
-                 ", \"text\": \"" + ErrorScopeLog::json_escape(rows[i].first->second) + "\"}";
+                 ", \"cascade\": " + (is_cascade_device_error(rows[i].first->second) ? "true" : "false") + ", \"text\": \"" + ErrorScopeLog::json_escape(rows[i].first->second) + "\"}";
         }
         return j + "]}";
     }
@@ -242,7 +267,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::map<std::pair<uint16_t, std::string>, uint64_t> rows_;
-    uint64_t total_ = 0, other_ = 0;
+    uint64_t total_ = 0, other_ = 0, root_ = 0, cascade_ = 0;
 };
 
 }  // namespace playgta6::gpu::native_exec
