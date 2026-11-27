@@ -604,6 +604,7 @@ struct NativeExecutor::Impl {
     std::mutex worker_error_mu;
     std::vector<std::string> worker_errors;  // the first few messages
     uint64_t worker_error_count = 0;
+    uint64_t worker_errors_logged = 0;
     // Reflection loader (web/workers/reflection_loader.js ReflectionRegistry) and the layouts a v1
     // pipeline was built with (`_pipelineBindGroupLayouts` / `_pipelineReflectionGroups` and the compute twins).
     reflect::ReflectionRegistry reflection;
@@ -2766,6 +2767,7 @@ struct NativeExecutor::Impl {
         }
         stats.device_errors += count;
         for (std::string& m : errs) {
+            if (worker_errors_logged++ < 8) std::fprintf(stderr, "[native_exec] shader worker error: %s\n", m.substr(0, 400).c_str());
             stats.last_device_error = m;
             if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(m);
         }
@@ -3988,6 +3990,7 @@ struct NativeExecutor::Impl {
                                 " fs=" + hash_hex(slot.fs_hash) + "]: " + st.message;
         stats.last_device_error = msg;
         if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(msg);
+        if (stats.async_pipeline_failures <= 16) std::fprintf(stderr, "[native_exec] %s\n", msg.substr(0, 600).c_str());
     }
 
     // An invalid-by-validation pipeline (the entry point does not exist in a valid module). The
