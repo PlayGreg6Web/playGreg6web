@@ -415,6 +415,7 @@ Device::~Device() {
             storage_relocations_.clear();
             storage_page_index_.clear();
             crosscheck_storage_.clear();
+            storage_unprimed_.clear();
             storage_home_index_.clear();
             storage_relocation_lru_.clear();
             storage_relocation_bytes_ = 0;

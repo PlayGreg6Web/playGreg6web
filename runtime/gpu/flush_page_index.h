@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -52,6 +53,7 @@ public:
 
 private:
     std::unordered_map<const void*, Range> entries_;
+    std::multiset<Range> sorted_;  // the ranges of entries_ in order, so hulls() needs no sort
     std::map<uintptr_t, std::vector<const void*>> by_granule_;  // granule number -> keys touching it
     mutable std::vector<Range> hulls_;
     mutable bool hulls_dirty_ = false;

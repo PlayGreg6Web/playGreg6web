@@ -6,6 +6,9 @@
 namespace playgta6::gpu::d3d12_guest {
 
 void HostPageIndex::unlink(const void* key, const Range& r) {
+    if (const auto s = sorted_.find(r); s != sorted_.end()) {
+        sorted_.erase(s);  // one of the equal ranges
+    }
     const uintptr_t g_lo = r.first >> kGranuleShift;
     const uintptr_t g_hi = (r.second - 1) >> kGranuleShift;
     for (auto it = by_granule_.lower_bound(g_lo); it != by_granule_.end() && it->first <= g_hi;) {
@@ -34,6 +37,7 @@ void HostPageIndex::add(const void* key, uintptr_t lo, uintptr_t hi) {
     } else {
         entries_.emplace(key, Range{lo, hi});
     }
+    sorted_.emplace(lo, hi);
     hulls_dirty_ = true;
     for (uintptr_t g = lo >> kGranuleShift, last = (hi - 1) >> kGranuleShift;; ++g) {
         by_granule_[g].push_back(key);
@@ -65,6 +69,7 @@ bool HostPageIndex::range_of(const void* key, uintptr_t* lo, uintptr_t* hi) cons
 
 void HostPageIndex::clear() {
     entries_.clear();
+    sorted_.clear();
     by_granule_.clear();
     hulls_.clear();
     hulls_dirty_ = false;
@@ -122,20 +127,16 @@ void HostPageIndex::collect_range(uintptr_t lo, uintptr_t hi, std::vector<const 
 const std::vector<HostPageIndex::Range>& HostPageIndex::hulls() const {
     if (hulls_dirty_) {
         hulls_.clear();
-        hulls_.reserve(entries_.size());
-        for (const auto& [key, r] : entries_) {
-            hulls_.emplace_back(r.first & ~(kHullPage - 1), (r.second + kHullPage - 1) & ~(kHullPage - 1));
-        }
-        std::sort(hulls_.begin(), hulls_.end());
-        size_t n = 0;
-        for (const auto& r : hulls_) {
-            if (n != 0 && r.first <= hulls_[n - 1].second + kHullGap) {
-                hulls_[n - 1].second = std::max(hulls_[n - 1].second, r.second);
+        // sorted_ is in (lo, hi) order and widening lo down to its page keeps that order, so one
+        // merging pass gives the hulls.
+        for (const auto& e : sorted_) {
+            const Range r{e.first & ~(kHullPage - 1), (e.second + kHullPage - 1) & ~(kHullPage - 1)};
+            if (!hulls_.empty() && r.first <= hulls_.back().second + kHullGap) {
+                hulls_.back().second = std::max(hulls_.back().second, r.second);
             } else {
-                hulls_[n++] = r;
+                hulls_.push_back(r);
             }
         }
-        hulls_.resize(n);
         hulls_dirty_ = false;
     }
     return hulls_;
