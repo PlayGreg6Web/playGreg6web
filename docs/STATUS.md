@@ -21,6 +21,13 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
   one-line staleness hint (commits to runtime, recomp, harness or shaders since that build; never blocks; #1926).
 - `update_prebuilt.ps1` boots the fresh build headless first and swaps it in only if that smoke boot passes;
   on failure the old prebuilt and the `.new` folder stay. `-SkipSmoke` opts out, `-DryRun` prints the plan (#1948).
+  A prebuilt is read-only for runners: run dirs, lock and marker go outside it, deletions inside it refuse (#1950);
+  each gate run uses its own smoke run name, reads only its own report, and keeps the last 3 smoke runs (#1972).
+- `--audio-mmcss pro-audio|audio|off` (env `PLAYGTA6_AUDIO_MMCSS`, `play_native -AudioMmcss`) sets the WASAPI render
+  thread's MMCSS class; the mode and registration result show in the `audio_out` report (#1951).
+- Input: the most recently active XInput pad drives the local user (switch on activity, reconnect in another slot
+  works; rumble follows it, #1965); keys held with Alt never reach the guest, so Alt+Enter no longer taps A (#1964);
+  focus loss releases the pad too (#1961).
 - `-ConsoleTiming` (#1861) honors the title's present sync interval: menus run at the console's 30 fps instead of
   about 60 (default `--present-interval min1`); gameplay at interval 1 is the same.
 - `python tools\trim_caches.py [--apply]` reports and LRU-trims all build caches to budgets (dry run by default); builders
@@ -73,8 +80,9 @@ How to run it: [quick start](PLAY_LOCALLY.md#quick-start-play-natively-windows).
 
 Setup screens, loading, then the Bink videos decode and play. A headless run reaches about 110 s and
 **stops on `XSystemGetAppSpecificDeviceId`** (a trapping stub on purpose, an owner decision). Nothing past it
-has been seen. Music has not started yet; the boot report's music-start diagnostics (stream events with time and
-present index, music controller lookup nulls, metadata hash lookups; #1947) are the way to diagnose that. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
+has been seen. Music has not started yet. What the diagnostics (#1947, #1954, #1958) showed: the audio `.rpf` opens
+happen inside the package (`PG6_AUDIO_TRACE` logs each audio-path `CreateFile`), and the music controller never gets
+a start event before the device-ID stop, so the missing music is a consequence of that stop, not a separate bug. Std shader pack reflection covers 31,777 of 31,822 shaders (#1735).
 
 Owner decisions (full table in [HARD_STOPS.md](HARD_STOPS.md); agents implement none of them). All three are
 still pending; options and consequences in
@@ -92,7 +100,7 @@ Open investigations (no owner decision needed, nothing merged that fixes them ye
 
 - Title job-graph stall: a run stalls with the title's own `int3` assert in its job graph; the fault record gives
   the address and call stack (see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md)).
-- Music: the music controller lookup returns null metadata (#1947 logs it); no music until that is understood.
+- Music: expected to start only after the device-ID decision (see above); recheck once the stop is answered.
 - Browser: an `INDIRECT_CALL_MISS` ending is waiting for a crash report from a real browser run
   ([WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) says what to send).
 
@@ -105,6 +113,19 @@ and stencil textures are read back into guest memory (#1937, #1940, #1944), `Exe
 the frame (#1936, #1943); audio output is event-driven and underruns are split into `host_starved` and
 `guest_stalled` (#1907, #1924); `inet_ntoa` and `HCTraceImplMessage` are handled (#1945).
 
+Since 2026-11-27 (merged, #1950-#1972): a prebuilt is read-only for runners and its smoke gate is race-free (#1950,
+#1972); `--audio-mmcss` (#1951); `xmem` remaps a mirrored window slot in place, so guest loads never see a trap delta
+or zero page mid-remap (#1952); Dawn: distinct dummy storage textures, fragment-output writeMask, failed async
+pipelines dropped and logged (#1953), `--gpu-error-scopes` attributes device errors to phase, present index and shader
+hashes (#1956), validation tests (#1959); the recompiler recognises unguarded `jmp [base+idx*8]` function-pointer
+tables as bounded tail-call switches (#1955); discovery is faster (incremental predecessor index #1962, per-phase
+`--timings` and state kept across refinement rounds #1971); harness: `frame_breakdown` (#1963, #1968),
+`--profile-guest[=hz]` sampling profiler (#1967), minidumps written from a helper process plus a watchdog backstop
+for a stuck report path (#1969), dstorage stall line (#1960) and `streaming_drain` report block (#1966); a dirty-page
+driven GPU buffer flush cut it from about 9.0 to about 4.5 ms/frame (#1970, `--flush-crosscheck` verifies it).
+Latest soak: 12/12 boots end at the `XSystemGetAppSpecificDeviceId` owner-decision stop, 0 host AVs, 0 title traps,
+0 hangs, fps p50 58.8.
+
 ## Ray tracing
 
 Runtime pieces are merged (residency of BVH/address sources, fault readback, WGSL helper with CPU twin;
@@ -114,7 +135,8 @@ Runtime pieces are merged (residency of BVH/address sources, fault readback, WGS
 ## Speed today
 
 - Native live window: about 55 to 60 fps in the menus.
-- Native headless: about 58 fps.
+- Native headless: about 58 fps (soak p50 58.8).
+- The GPU buffer flush costs about 4.5 ms/frame (was 9.0, #1970); `frame_breakdown` shows where the rest goes.
 - Rough, scene-dependent figures; refresh them from a boot report (`gpu_time_top.py`, `[live]` lines, window title).
 
 ## Diagnostic tools
@@ -141,5 +163,8 @@ that `boot_summary.py` and `run_history.py` print; both also read browser run di
 phase's (and each 5 s window's) mean frame into the present thread's CPU (guest code vs our D3D12 flush / append / submit),
 its blocked spans (guest waits, condvars, contended locks, sleeps, frame events, pacer, executor backpressure), process CPU,
 executor time and upload / shadow-compare volume; `live_pump` adds the executor queue's totals.
+`--profile-guest[=hz]` adds a sampling profiler (per-thread flat and inclusive counts in `guest_profile`, collapsed
+stacks for flamegraph tools; #1967); `--gpu-error-scopes` attributes Dawn errors (#1956); `streaming_drain` shows
+what the title's drain-all-streaming loop waits on (#1966); recomp `--timings` gives per-phase discovery times (#1971).
 
 Reports hold hashes, addresses and counts only, never game bytes.
