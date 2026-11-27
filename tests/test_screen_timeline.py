@@ -64,6 +64,24 @@ class ScreenTimeline(unittest.TestCase):
         segs = st.build_timeline(ps, max_segments=5)
         self.assertEqual(len(segs), 5)
         self.assertEqual(sum(s["presents"] for s in segs), 49)
+        self.assertTrue(segs[-1]["folded"])
+        self.assertFalse(any(s.get("folded") for s in segs[:-1]))
+
+    def test_cap_fold_keeps_draw_range(self):
+        # A 2-draw screen hits the cap, then a heavy scene follows: the folded tail must not read as
+        # "2 draws/frame until the end".
+        ps, total = [], 0
+        for i, d in enumerate([5, 9, 2, 200, 150, 260, 219]):
+            total += d
+            ps.append(present(i * 1000, total, 0))
+        segs = st.build_timeline(ps, max_segments=3)
+        tail = segs[-1]
+        self.assertEqual((tail["first_present"], tail["presents"]), (2, 5))
+        self.assertTrue(tail["folded"])
+        self.assertEqual((tail["draws_min"], tail["draws_max"], tail["draws_per_frame"]), (2, 260, 219))
+        self.assertIn("folded past the cap: 2-260", st.format_table(segs)[-1])
+        # Under the cap nothing is folded.
+        self.assertFalse(any(s.get("folded") for s in st.build_timeline(ps)))
 
     def test_empty_and_parse(self):
         self.assertEqual(st.build_timeline([]), [])

@@ -493,6 +493,11 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
     segs = screen_segments(report)
     L.append(f"screens: {int(pres)} presents, {len(segs)} timeline segments")
     for s in segs[-6:]:
+        if s.get("folded"):  # past the segment cap: many screens, not one
+            L.append(f"  {_dur(s.get('start_time'))}-{_dur(s.get('end_time'))}: {_i(s.get('presents'))} presents "
+                     f"folded past the segment cap, {s.get('draws_min')}-{s.get('draws_max')} draws/frame "
+                     f"(last {s.get('draws_per_frame')})")
+            continue
         L.append(f"  {_dur(s.get('start_time'))}-{_dur(s.get('end_time'))}: {_i(s.get('presents'))} presents, "
                  f"{s.get('draws_per_frame')} draws/frame")
     f = fps_percentiles(report)

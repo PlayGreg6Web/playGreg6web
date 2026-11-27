@@ -7,7 +7,9 @@ turns them into per-present deltas and collapses consecutive presents with the s
 (+-1) and no new resources into one segment:
   {start_time, end_time, first_present, presents, draws_per_frame, new_resources_at_start,
    input_events_in_segment}
-Capped at MAX_SEGMENTS (later presents are folded into the last segment). Times are wall_ms.
+Capped at MAX_SEGMENTS: later presents are folded into the last segment, which then gets
+`folded: true`, `draws_min` / `draws_max` over the folded presents, and `draws_per_frame` of the latest
+present (not one screen). Times are wall_ms.
 
 T64 + T81 (Chrome capture frame directory CLI):
 Analyzes a directory of captured frames (e.g. `frame_0001.png` / `frame_0001.jpg`), groups
@@ -145,10 +147,22 @@ def build_timeline(presents: Sequence[dict[str, Any]], input_times: Sequence[flo
         prev_draws, prev_res = draws_total, res_total
         t = float(p.get("wall_ms") or 0)
         cur = segs[-1] if segs else None
-        if cur is not None and (len(segs) >= max_segments or
-                                (new_res == 0 and abs(draws - cur["draws_per_frame"]) <= 1)):
+        if cur is not None and not cur.get("folded") and new_res == 0 and abs(draws - cur["draws_per_frame"]) <= 1:
             cur["end_time"] = t
             cur["presents"] += 1
+            continue
+        if cur is not None and len(segs) >= max_segments:
+            # Past the cap the last segment holds every later present. Mark it so readers do not take its
+            # first draw count for a screen that lasted to the end: it carries the folded draws range and the
+            # most recent draw count.
+            if not cur.get("folded"):
+                cur["folded"] = True
+                cur["draws_min"] = cur["draws_max"] = cur["draws_per_frame"]
+            cur["end_time"] = t
+            cur["presents"] += 1
+            cur["draws_min"] = min(cur["draws_min"], draws)
+            cur["draws_max"] = max(cur["draws_max"], draws)
+            cur["draws_per_frame"] = draws
             continue
         segs.append({"start_time": t, "end_time": t, "first_present": i, "presents": 1,
                      "draws_per_frame": draws, "new_resources_at_start": new_res,
@@ -165,7 +179,8 @@ def format_table(segs: Sequence[dict[str, Any]], limit: int = 20) -> list[str]:
              "  start_ms  end_ms  present  n  draws/frame  new_res  inputs"]
     for s in segs[:limit]:
         lines.append(f"  {s['start_time']:8.0f}  {s['end_time']:6.0f}  {s['first_present']:7d}  {s['presents']:d}  "
-                     f"{s['draws_per_frame']:11d}  {s['new_resources_at_start']:7d}  {s['input_events_in_segment']:6d}")
+                     f"{s['draws_per_frame']:11d}  {s['new_resources_at_start']:7d}  {s['input_events_in_segment']:6d}"
+                     + (f"  folded past the cap: {s['draws_min']}-{s['draws_max']} draws/frame" if s.get("folded") else ""))
     if len(segs) > limit:
         lines.append(f"  ... {len(segs) - limit} more")
     return lines

@@ -64,6 +64,14 @@ class BootSummaryTest(unittest.TestCase):
         out = bs.summarize(b)
         self.assertIn("gpu error kind: 2 x op 31: [Invalid BindGroupLayout (unlabeled)] is invalid", out)
 
+    def test_folded_screen_segment(self):
+        b = base()
+        b["screen_timeline"].append({"start_time": 27904, "end_time": 888918, "presents": 1169,
+                                     "draws_per_frame": 219, "folded": True, "draws_min": 0, "draws_max": 486})
+        out = bs.summarize(b)
+        self.assertIn("1,169 presents folded past the segment cap, 0-486 draws/frame (last 219)", out)
+        self.assertNotIn("1,169 presents, 219 draws/frame", out)
+
     def test_limit_run(self):
         out = bs.summarize(base())
         self.assertIn("ended: limit", out)
