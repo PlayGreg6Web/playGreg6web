@@ -249,6 +249,7 @@ struct ExecutorStats {
     uint64_t async_pipeline_waits = 0;     // first uses that still had to wait for the compile
     uint64_t async_pipeline_wait_ns = 0;
     uint64_t pipeline_pending_skips = 0;   // draws / dispatches skipped: the pipeline was still compiling past the budget
+    uint64_t remap_reflected_layouts = 0;  // v2 remap pipelines built with an explicit reflection layout (no wait for the compiled pipeline)
     uint64_t async_pipeline_failures = 0;  // creation failed: the pipeline became an error object
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors

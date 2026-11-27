@@ -659,6 +659,17 @@ private:
     std::vector<bool> used_;
 };
 
+// An explicit layout built from the shader reflection may replace layout:'auto' for a remap pipeline
+// only when its group 0 binds exactly the WGSL's @group(0) bindings (else the remapped bind group
+// would carry entries the layout lacks, or miss ones it has).
+inline bool remap_bindings_match(std::vector<uint32_t> layout_bindings, const std::vector<WgslBinding>& wgsl) {
+    std::vector<uint32_t> w;
+    for (const WgslBinding& b : wgsl) w.push_back(b.binding);
+    std::sort(layout_bindings.begin(), layout_bindings.end());
+    std::sort(w.begin(), w.end());
+    return layout_bindings == w;
+}
+
 // synthLayoutEntryForWgslBinding -> the executor's LayoutEntry fields (kind / subtype / format / dim)
 // so the existing dummy resource builder can serve it. Buffers use minBindingSize 4096.
 struct SynthLayoutEntry {

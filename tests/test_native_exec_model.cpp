@@ -1007,6 +1007,19 @@ void test_show_target_model() {
     CHECK(show_target_title("base", label).find("base | SHOWING tex 7") == 0);
 }
 
+void test_remap_bindings_match() {
+    using namespace playgta6::gpu::native_exec;
+    WgslBinding a, b;
+    a.binding = 3;
+    b.binding = 1;
+    CHECK(remap_bindings_match({3}, {a}));
+    CHECK(remap_bindings_match({3, 1}, {a, b}));  // order-insensitive
+    CHECK(!remap_bindings_match({3, 1}, {a}));     // layout has an entry the remap would not fill
+    CHECK(!remap_bindings_match({3}, {a, b}));     // the WGSL binds one the layout lacks
+    CHECK(!remap_bindings_match({}, {a}));
+    CHECK(remap_bindings_match({}, {}));
+}
+
 void test_pipe_wait_budget() {
     using namespace playgta6::gpu::native_exec;
     uint64_t v = 7;
@@ -1059,6 +1072,7 @@ int main() {
     test_blit_model();
     test_show_target_model();
     test_pipe_wait_budget();
+    test_remap_bindings_match();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

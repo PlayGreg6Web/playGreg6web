@@ -277,6 +277,9 @@ struct AutoLayoutMeta {
     bool remap = false;
     std::vector<WgslBinding> bindings;
     uint64_t gen = 0;  // bumps when the pipeline id is (re)created: invalidates cached remapped groups
+    // Group 0 layout built up front from the shader reflection (the pipeline was created with it as an
+    // explicit layout): the remap binds against it without the pipeline having finished compiling.
+    wgpu::BindGroupLayout reflected_bgl0;
 };
 
 struct RemapCacheEntry {
@@ -2339,6 +2342,33 @@ struct NativeExecutor::Impl {
         return true;
     }
 
+    // v2 remap pipelines: an explicit layout from the stages' reflection instead of layout:'auto', so
+    // nothing has to wait for the compiled pipeline to get its group 0 layout. Null (stay on 'auto',
+    // budgeted wait later) unless every stage has a record and its group 0 binds exactly the WGSL's
+    // bindings.
+    wgpu::PipelineLayout reflected_remap_layout(AutoLayoutMeta& meta, const std::vector<const reflect::StageRecord*>& refls,
+                                                size_t stage_count) {
+        if (refls.size() != stage_count) return {};
+        reflect::LayoutBuildResult r = reflect::build_bind_group_layout_descriptors(refls);
+        if (!r.ok || r.groups.empty()) return {};
+        std::vector<uint32_t> nums;
+        for (const auto& e : r.groups[0]) nums.push_back(e.binding);
+        if (!remap_bindings_match(nums, meta.bindings)) return {};
+        std::vector<wgpu::BindGroupLayout> bgls;
+        for (auto& g : r.groups) {
+            wgpu::BindGroupLayout bgl;
+            if (!make_bgl_from_entries(g, &bgl)) return {};
+            bgls.push_back(std::move(bgl));
+        }
+        wgpu::PipelineLayoutDescriptor pd{};
+        pd.bindGroupLayoutCount = bgls.size();
+        pd.bindGroupLayouts = bgls.data();
+        wgpu::PipelineLayout pl = device.CreatePipelineLayout(&pd);
+        meta.reflected_bgl0 = bgls[0];
+        ++stats.remap_reflected_layouts;
+        return pl;
+    }
+
     void create_shader_module(const Packet& p) {
         const auto h = read_payload<GpuCreateShaderModulePayload>(p);
         if (uint64_t{16} + h.code_len > p.payload_bytes) {
@@ -3145,7 +3175,14 @@ struct NativeExecutor::Impl {
             }
         }
         auto_meta.gen = ++pipeline_gen_counter;
-        rd.layout = auto_layout || auto_meta.remap ? nullptr : layout;
+        wgpu::PipelineLayout reflected_pl;
+        if (auto_meta.remap && reflection.shader_count() != 0) {
+            std::vector<const reflect::StageRecord*> rf;
+            if (const auto* r = resolve_shader_reflection(vs, "vertex")) rf.push_back(r);
+            if (fs) if (const auto* r = resolve_shader_reflection(*fs, "fragment")) rf.push_back(r);
+            reflected_pl = reflected_remap_layout(auto_meta, rf, fs ? 2 : 1);
+        }
+        rd.layout = reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         rd.vertex.module = vs.module;
         const std::string vep = resolve_shader_entry_point(vs.code, vs.explicit_ep, "vertex");
         rd.vertex.entryPoint = {vep.data(), vep.size()};
@@ -3338,7 +3375,13 @@ struct NativeExecutor::Impl {
         }
         auto_meta.gen = ++pipeline_gen_counter;
         wgpu::ComputePipelineDescriptor cd{};
-        cd.layout = auto_layout || auto_meta.remap ? nullptr : layout;
+        wgpu::PipelineLayout reflected_pl;
+        if (auto_meta.remap && reflection.shader_count() != 0) {
+            std::vector<const reflect::StageRecord*> rf;
+            if (const auto* r = resolve_shader_reflection(cs, "compute")) rf.push_back(r);
+            reflected_pl = reflected_remap_layout(auto_meta, rf, 1);
+        }
+        cd.layout = reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {ep.data(), ep.size()};
         ComputePipelineEntry ce;
@@ -3517,9 +3560,23 @@ struct NativeExecutor::Impl {
         auto rit = render_pipelines.find(h.pipeline_id);
         auto cit = compute_pipelines.find(h.pipeline_id);
         if (rit != render_pipelines.end()) {
-            layout = rl ? rl->bgls[h.group_index] : cl ? cl->bgls[h.group_index] : resolve(rit->second).GetBindGroupLayout(h.group_index);
+            if (rl) layout = rl->bgls[h.group_index];
+            else if (cl) layout = cl->bgls[h.group_index];
+            else {
+                // No reflection: the only source of the layout is the compiled pipeline. Budgeted; past it
+                // the bind group is skipped and counted as pipeline_pending.
+                const wgpu::RenderPipeline* rp = resolve_budgeted(rit->second);
+                if (!rp) { note_pipeline_pending(rit->second.perf_hash, false); return; }
+                layout = rp->GetBindGroupLayout(h.group_index);
+            }
         } else if (cit != compute_pipelines.end()) {
-            layout = rl ? rl->bgls[h.group_index] : cl ? cl->bgls[h.group_index] : resolve(cit->second).GetBindGroupLayout(h.group_index);
+            if (rl) layout = rl->bgls[h.group_index];
+            else if (cl) layout = cl->bgls[h.group_index];
+            else {
+                const wgpu::ComputePipeline* cp = resolve_budgeted(cit->second);
+                if (!cp) { note_pipeline_pending(0, true); return; }
+                layout = cp->GetBindGroupLayout(h.group_index);
+            }
             compute = true;
         } else {
             auto bit = bgls.find(h.pipeline_id);  // a v2 bind group layout id works here too
@@ -4571,8 +4628,21 @@ struct NativeExecutor::Impl {
             }
         }
 
-        wgpu::BindGroupLayout auto_bgl = compute ? resolve(compute_pipelines.find(pipeline_id)->second).GetBindGroupLayout(0)
-                                                 : resolve(render_pipelines.find(pipeline_id)->second).GetBindGroupLayout(0);
+        wgpu::BindGroupLayout auto_bgl = meta.reflected_bgl0;
+        if (!auto_bgl) {
+            // layout:'auto' pipeline without reflection: its layout needs the compiled pipeline. Budgeted; past
+            // it nothing is bound (the draw / dispatch is skipped as pipeline_pending) and nothing is cached.
+            if (compute) {
+                const wgpu::ComputePipeline* cp = resolve_budgeted(compute_pipelines.find(pipeline_id)->second);
+                if (!cp) { note_pipeline_pending(0, true); return out; }
+                auto_bgl = cp->GetBindGroupLayout(0);
+            } else {
+                const RenderPipelineEntry& re = render_pipelines.find(pipeline_id)->second;
+                const wgpu::RenderPipeline* rp = resolve_budgeted(re);
+                if (!rp) { note_pipeline_pending(re.perf_hash, false); return out; }
+                auto_bgl = rp->GetBindGroupLayout(0);
+            }
+        }
         wgpu::BindGroup group;
         if (auto_bgl) {
             RemapPicker picker(av, dyn, features.float32_filterable);
@@ -5711,6 +5781,7 @@ std::string NativeExecutor::stats_json() const {
     num("async_pipeline_waits", st.async_pipeline_waits);
     num("async_pipeline_wait_ns", st.async_pipeline_wait_ns);
     num("pipeline_pending_skips", st.pipeline_pending_skips);
+    num("remap_reflected_layouts", st.remap_reflected_layouts);
     num("async_pipeline_failures", st.async_pipeline_failures);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
