@@ -19,7 +19,7 @@ use crate::lift::compile::{compile_to_object, find_llvm_tool, find_on_path, rust
 use crate::lift::target::LiftTarget;
 use crate::lift::{
     STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_SIZE, STATE_XMM_OFFSET, STATE_YMM_HI_OFFSET,
-    lift_module,
+    emit_module, lift_module,
 };
 
 const F: u64 = 0x1_4000_1000;
@@ -696,4 +696,131 @@ entry:
     };
     let status = Command::new(&exe).status().expect("run native R62");
     assert_eq!(status.code(), Some(0), "native R62 run failed");
+}
+
+#[test]
+fn exit_probe_reports_return_values_including_a_tail_call_natively() {
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipping native exit probe test: host is not x86-64");
+        return;
+    }
+    let Some(tool) = find_llvm_tool() else {
+        eprintln!("skipping native exit probe test: no LLVM tool (llc/clang) found");
+        return;
+    };
+    let target = LiftTarget::native_host();
+    let triple = target.triple().to_string();
+    let dir = TempDir::new();
+
+    const OUTER: u64 = F;
+    const TAILER: u64 = F + 0x100;
+    const LEAF: u64 = F + 0x200;
+    // OUTER(x) calls TAILER(x); TAILER sets rax = x + 5 and tail-jumps to LEAF, which doubles it.
+    // OUTER and TAILER are listed, LEAF is not: expected exits are TAILER -> 24, OUTER -> 24.
+    let prog = Program::new()
+        .asm(OUTER, |a| {
+            a.sub(rsp, 0x28)?;
+            a.call(TAILER)?;
+            a.add(rsp, 0x28)?;
+            a.ret()
+        })
+        .asm(TAILER, |a| {
+            a.lea(rax, qword_ptr(rcx + 5))?;
+            a.jmp(LEAF)
+        })
+        .asm(LEAF, |a| {
+            a.add(rax, rax)?;
+            a.ret()
+        });
+    let functions = prog.discover();
+    let mut module = lift_module(functions.values()).expect("lift");
+    for f in &mut module.functions {
+        if f.entry == OUTER || f.entry == TAILER {
+            f.insert_exit_probe();
+        }
+    }
+    let ir = emit_module(&module.functions).expect("emit");
+    let leaf = &ir[ir.find(&format!("define void @sub_{LEAF:X}")).expect("leaf")..];
+    assert!(!leaf.contains("__playgta6_probe_exit"), "unlisted function stays hook-free");
+    let native_ir = target.retarget(ir);
+
+    let o_rsp = STATE_GPR_OFFSET + 8 * 4;
+    let o_rcx = STATE_GPR_OFFSET + 8;
+    let o_rax = STATE_GPR_OFFSET;
+    let driver = format!(
+        r#"target triple = "{triple}"
+@__playgta6_guest_base = global i64 0
+@state = global [{STATE_SIZE} x i8] zeroinitializer, align 16
+@stack = global [4096 x i64] zeroinitializer, align 16
+@n = global i64 0
+@vas = global [8 x i64] zeroinitializer
+@vals = global [8 x i64] zeroinitializer
+declare void @sub_{OUTER:X}(ptr)
+declare void @llvm.trap() noreturn
+define void @__playgta6_indirect_call(ptr %s, i64 %t) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_trap(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_unimplemented(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_divide_error(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_probe_exit(ptr %s, i64 %va) {{
+  %i = load i64, ptr @n
+  %pv = getelementptr i64, ptr @vas, i64 %i
+  store i64 %va, ptr %pv
+  %pa = getelementptr i8, ptr %s, i64 {o_rax}
+  %rax = load i64, ptr %pa
+  %pr = getelementptr i64, ptr @vals, i64 %i
+  store i64 %rax, ptr %pr
+  %i2 = add i64 %i, 1
+  store i64 %i2, ptr @n
+  ret void
+}}
+define i32 @main() {{
+entry:
+  %stack = ptrtoint ptr @stack to i64
+  %top = add i64 %stack, 32768
+  %entry_rsp = sub i64 %top, 8
+  store i64 %entry_rsp, ptr getelementptr (i8, ptr @state, i64 {o_rsp})
+  store i64 7, ptr getelementptr (i8, ptr @state, i64 {o_rcx})
+  call void @sub_{OUTER:X}(ptr @state)
+  %n = load i64, ptr @n
+  %v0 = load i64, ptr @vas
+  %v1 = load i64, ptr getelementptr (i64, ptr @vas, i64 1)
+  %r0 = load i64, ptr @vals
+  %r1 = load i64, ptr getelementptr (i64, ptr @vals, i64 1)
+  %c0 = icmp eq i64 %n, 2
+  %c1 = icmp eq i64 %v0, {TAILER}
+  %c2 = icmp eq i64 %v1, {OUTER}
+  %c3 = icmp eq i64 %r0, 24
+  %c4 = icmp eq i64 %r1, 24
+  %a0 = and i1 %c0, %c1
+  %a1 = and i1 %a0, %c2
+  %a2 = and i1 %a1, %c3
+  %a3 = and i1 %a2, %c4
+  %code = select i1 %a3, i32 0, i32 1
+  ret i32 %code
+}}
+"#
+    );
+    let lifted_ll = dir.0.join("exit_lifted.ll");
+    let driver_ll_path = dir.0.join("exit_driver.ll");
+    fs::write(&lifted_ll, &native_ir).expect("write lifted.ll");
+    fs::write(&driver_ll_path, &driver).expect("write driver.ll");
+    let obj_ext = if triple.contains("windows") { "obj" } else { "o" };
+    let mut objects = Vec::new();
+    for ll in [&lifted_ll, &driver_ll_path] {
+        let obj = ll.with_extension(obj_ext);
+        if let Err(err) = compile_to_object(&tool, &target, ll, &obj) {
+            eprintln!("skipping native exit probe test: {err}");
+            return;
+        }
+        objects.push(obj);
+    }
+    let exe = match link(&dir.0, &objects, &triple) {
+        Ok(exe) => exe,
+        Err(reason) => {
+            eprintln!("skipping native exit probe test: {reason}");
+            return;
+        }
+    };
+    let status = Command::new(&exe).status().expect("run native exit probe");
+    assert_eq!(status.code(), Some(0), "exit hooks saw the wrong sequence or values");
 }

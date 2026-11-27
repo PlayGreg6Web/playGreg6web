@@ -440,6 +440,7 @@ fn lift_and_write(
             })?;
         if context.probes.contains(&function.entry) {
             one.insert_entry_probe();
+            one.insert_exit_probe();
         }
         lifted.push(one);
     }

@@ -12,7 +12,7 @@ use super::{
 use crate::cfg::{self, Edge, Terminator};
 use crate::lift::{
     GUEST_BASE_SYMBOL, GuestBase, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP,
-    HELPER_PROBE_HIT, HELPER_UNIMPLEMENTED, LiftError, TBAA_GUEST_TAG, TBAA_METADATA,
+    HELPER_PROBE_EXIT, HELPER_PROBE_HIT, HELPER_UNIMPLEMENTED, LiftError, TBAA_GUEST_TAG, TBAA_METADATA,
     TBAA_STATE_TAG, WASM64_TRIPLE, emit_module, lift_function, lift_module, lift_module_with,
 };
 
@@ -198,6 +198,51 @@ fn entry_probe_is_emitted_only_for_a_listed_function() {
     assert!(callee.contains(&format!("entry:\n  {call}\n")));
     let caller = &ir[ir.find("define void @sub_2000").expect("sub_2000")..ir.find("define void @sub_3000").unwrap()];
     assert!(!caller.contains(HELPER_PROBE_HIT));
+}
+
+#[test]
+fn exit_probe_is_emitted_only_for_a_listed_function() {
+    let functions = Program::new()
+        .asm(0x2000, |a| {
+            a.mov(rax, rcx)?;
+            a.test(rcx, rcx)?;
+            let mut out = a.create_label();
+            a.je(out)?;
+            a.add(rax, 1)?;
+            a.ret()?;
+            a.set_label(&mut out)?;
+            a.jmp(0x3000u64)
+        })
+        .asm(0x3000, |a| {
+            a.add(rax, rdx)?;
+            a.ret()
+        })
+        .discover();
+    let (a, b) = (&functions[&0x2000], &functions[&0x3000]);
+    let plain = lift_module([a, b]).expect("lifts");
+    assert!(!plain.ir.contains(HELPER_PROBE_EXIT));
+
+    let mut lifted = plain.functions.clone();
+    lifted[0].insert_exit_probe();
+    lifted[0].insert_exit_probe(); // idempotent
+    let ir = emit_module(&lifted).expect("emits");
+    let hook = format!("call void @{HELPER_PROBE_EXIT}(ptr %state, i64 {})", 0x2000);
+    let caller = &ir[ir.find("define void @sub_2000").expect("sub_2000")..ir.find("define void @sub_3000").unwrap()];
+    // One hook per normal return: the plain `ret` and the tail call out, which is now a call
+    // followed by the hook (the hook must see the callee's result).
+    assert_eq!(caller.matches(&hook).count(), 2, "{caller}");
+    assert!(caller.contains(&format!("  call void @sub_3000(ptr %state)
+  {hook}
+  ret void")), "{caller}");
+    assert!(!caller.contains("tail call void @sub_3000"), "{caller}");
+    assert_eq!(
+        ir.matches(&format!("declare void @{HELPER_PROBE_EXIT}(ptr noundef, i64 noundef)"))
+            .count(),
+        1
+    );
+    // The unlisted function has no hook.
+    let callee = &ir[ir.find("define void @sub_3000").unwrap()..];
+    assert!(!callee.contains(HELPER_PROBE_EXIT));
 }
 
 #[test]

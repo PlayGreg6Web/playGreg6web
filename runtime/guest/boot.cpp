@@ -537,6 +537,8 @@ thread_local uint64_t t_last_import_seq = 0;
 constexpr size_t kDispatchRing = 64;
 thread_local DispatchRecord t_dispatch_ring[kDispatchRing];
 thread_local uint64_t t_dispatch_count = 0;
+thread_local ProbeFrames t_probe_frames;  // entries of `ret` probes waiting for their exit hook
+thread_local uint64_t t_probe_dispatch_seq = 0;  // seq of the line behind t_probe_dispatch_va
 thread_local uint64_t t_probe_dispatch_va = 0;  // a --probe hit the dispatch observer logged; its entry hook skips it
 
 // Per-thread observer state: batches dispatch counter increments and owns a lock-free
@@ -1513,15 +1515,24 @@ void guest_probe_hit(BootState& b, GuestState* state, long idx, uint64_t va, boo
     if (idx < 0) {
         return;
     }
+    const bool wants_ret = b.guest_probes.spec(static_cast<size_t>(idx)).ret;
     if (entry) {
         if (t_probe_dispatch_va == va) {
             t_probe_dispatch_va = 0;  // the dispatch observer already logged this execution
+            if (wants_ret) {
+                t_probe_frames.push(idx, va, state->gpr[GuestReg::Rsp], t_probe_dispatch_seq);
+            }
+            t_probe_dispatch_seq = 0;
             return;
         }
     } else {
         t_probe_dispatch_va = va;
+        t_probe_dispatch_seq = 0;
     }
     if (!b.guest_probes.count_hit(static_cast<size_t>(idx), entry)) {
+        if (entry && wants_ret) {
+            t_probe_frames.push(idx, va, state->gpr[GuestReg::Rsp], 0);  // exit still counted, unlogged entry
+        }
         return;
     }
     ProbeHit hit;
@@ -1532,13 +1543,35 @@ void guest_probe_hit(BootState& b, GuestState* state, long idx, uint64_t va, boo
         hit.regs[i] = state->gpr[i];
     }
     VirtualMemoryArena* arena = b.arena;
-    b.guest_probes.log_hit(static_cast<size_t>(idx), hit, [arena](uint64_t a, void* dst, size_t n) {
+    const uint64_t seq = b.guest_probes.log_hit(static_cast<size_t>(idx), hit, [arena](uint64_t a, void* dst, size_t n) {
         if (arena == nullptr) {
             return false;
         }
         VirtualMemoryArena::DiagnosticReads scope;
         return arena->read(a, dst, n);
     });
+    if (entry && wants_ret) {
+        t_probe_frames.push(idx, va, state->gpr[GuestReg::Rsp], seq);
+    } else if (!entry) {
+        t_probe_dispatch_seq = seq;
+    }
+}
+
+// Exit of a function listed in `--probe-functions` (the lifter calls `__playgta6_probe_exit` on each
+// return path): pairs it with the entry frame of this thread and logs the return value.
+void guest_probe_exit(BootState& b, GuestState* state, uint64_t va) {
+    const long idx = b.guest_probes.find(va);
+    if (idx < 0 || !b.guest_probes.spec(static_cast<size_t>(idx)).ret || state->unwind_pending != 0) {
+        return;  // a context restore passing through returns no value (its frame is dropped later)
+    }
+    ProbeFrames::Frame frame;
+    const bool paired = t_probe_frames.pop(va, state->gpr[GuestReg::Rsp], &frame);
+    if (paired && frame.entry_seq == 0) {
+        b.guest_probes.count_exit_only(static_cast<size_t>(idx));  // its entry line was rate limited
+        return;
+    }
+    b.guest_probes.log_exit(static_cast<size_t>(idx), t_active != nullptr ? t_active->thread_id : 0u, elapsed_ms(),
+                            paired ? frame.entry_seq : 0, paired, state->gpr[GuestReg::Rax], state->xmm[0]);
 }
 
 // First call of a counted Bink2Scarlett.dll export: BinkOpenWithOptions is the BINK_OPEN milestone
@@ -4865,6 +4898,14 @@ extern "C" void __playgta6_probe_hit(playgta6::GuestState* state, uint64_t va) {
     audio_probe_event(b, idx, args, true);
     if (first && idx >= 0 && b.log_progress) {
         playgta6::os::log(("[audio-probe] first entry of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
+    }
+}
+
+extern "C" void __playgta6_probe_exit(playgta6::GuestState* state, uint64_t va) {
+    using namespace playgta6::guest;
+    BootState& b = boot();
+    if (b.guest_probes.active()) {
+        guest_probe_exit(b, state, va);
     }
 }
 

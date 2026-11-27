@@ -275,7 +275,7 @@ std::string format_probe_line(const ProbeSpec& spec, uint64_t addr, const ProbeH
         o += "]";
     }
     if (spec.ret) {
-        o += ",\"ret\":\"unsupported\"";
+        o += ",\"ret\":\"pending\"";
     }
     if (!spec.mem.empty()) {
         static const char* const kRegNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
@@ -304,6 +304,20 @@ std::string format_probe_line(const ProbeSpec& spec, uint64_t addr, const ProbeH
     return o;
 }
 
+std::string format_probe_exit_line(const ProbeSpec& spec, uint64_t addr, uint64_t seq, uint64_t t_ms, uint32_t thread,
+                                   uint64_t entry_seq, bool paired, uint64_t rax, const uint64_t xmm0[2]) {
+    char head[192];
+    std::snprintf(head, sizeof(head), "{\"seq\":%" PRIu64 ",\"t_ms\":%" PRIu64 ",\"thread\":%u,\"src\":\"exit\",\"name\":\"",
+                  seq, t_ms, thread);
+    std::string o = head;
+    o += spec.name.empty() ? "probe" : spec.name;
+    o += "\",\"addr\":" + hex_u64(addr);
+    o += ",\"entry_seq\":" + (paired && entry_seq != 0 ? std::to_string(entry_seq) : std::string("null"));
+    o += std::string(",\"paired\":") + (paired ? "true" : "false");
+    o += ",\"rax\":" + hex_u64(rax) + ",\"xmm0\":[" + hex_u64(xmm0[0]) + "," + hex_u64(xmm0[1]) + "]}";
+    return o;
+}
+
 void ProbeSet::clear() {
     std::lock_guard<std::mutex> lock(file_mutex_);
     if (file_ != nullptr) {
@@ -315,6 +329,8 @@ void ProbeSet::clear() {
     calls_.reset();
     entry_calls_.reset();
     logged_.reset();
+    exit_calls_.reset();
+    exit_unpaired_.reset();
     count_ = 0;
     min_ = max_ = 0;
     lines_.store(0, std::memory_order_relaxed);
@@ -341,10 +357,14 @@ void ProbeSet::configure(std::vector<ProbeSpec> specs, const std::string& out_pa
     calls_ = std::make_unique<std::atomic<uint64_t>[]>(count_);
     entry_calls_ = std::make_unique<std::atomic<uint64_t>[]>(count_);
     logged_ = std::make_unique<std::atomic<uint64_t>[]>(count_);
+    exit_calls_ = std::make_unique<std::atomic<uint64_t>[]>(count_);
+    exit_unpaired_ = std::make_unique<std::atomic<uint64_t>[]>(count_);
     for (size_t i = 0; i < count_; ++i) {
         calls_[i].store(0, std::memory_order_relaxed);
         entry_calls_[i].store(0, std::memory_order_relaxed);
         logged_[i].store(0, std::memory_order_relaxed);
+        exit_calls_[i].store(0, std::memory_order_relaxed);
+        exit_unpaired_[i].store(0, std::memory_order_relaxed);
     }
     if (!out_path_.empty()) {
         file_ = std::fopen(out_path_.c_str(), "wb");
@@ -382,9 +402,9 @@ bool ProbeSet::count_hit(size_t i, bool entry) noexcept {
     return lines_.fetch_add(1, std::memory_order_relaxed) < budget_;
 }
 
-void ProbeSet::log_hit(size_t i, ProbeHit hit, const ProbeReadFn& read) {
+uint64_t ProbeSet::log_hit(size_t i, ProbeHit hit, const ProbeReadFn& read) {
     if (i >= count_) {
-        return;
+        return 0;
     }
     hit.seq = next_seq();
     const std::string line = format_probe_line(specs_[i], specs_[i].addr, hit, read);
@@ -394,6 +414,31 @@ void ProbeSet::log_hit(size_t i, ProbeHit hit, const ProbeReadFn& read) {
         std::fwrite(line.data(), 1, line.size(), file_);
         std::fputc('\n', file_);
         std::fflush(file_);  // a fault right after must not lose the last hits
+    }
+    return hit.seq;
+}
+
+void ProbeSet::log_exit(size_t i, uint32_t thread, uint64_t t_ms, uint64_t entry_seq, bool paired, uint64_t rax,
+                        const uint64_t xmm0[2]) noexcept {
+    if (i >= count_) {
+        return;
+    }
+    exit_calls_[i].fetch_add(1, std::memory_order_relaxed);
+    if (paired) {
+        lines_.fetch_add(1, std::memory_order_relaxed);  // bounded by the logged entries
+    } else {
+        const uint64_t n = exit_unpaired_[i].fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > specs_[i].max_lines || lines_.fetch_add(1, std::memory_order_relaxed) >= budget_) {
+            return;
+        }
+    }
+    const std::string line = format_probe_exit_line(specs_[i], specs_[i].addr, next_seq(), t_ms, thread, entry_seq, paired,
+                                                    rax, xmm0);
+    std::lock_guard<std::mutex> lock(file_mutex_);
+    if (file_ != nullptr) {
+        std::fwrite(line.data(), 1, line.size(), file_);
+        std::fputc('\n', file_);
+        std::fflush(file_);
     }
 }
 
@@ -413,9 +458,9 @@ std::string ProbeSet::to_json() const {
         char buf[320];
         std::snprintf(buf, sizeof(buf),
                       "%s{\"name\": \"%s\", \"addr\": \"0x%" PRIx64 "\", \"calls\": %" PRIu64 ", \"entry_calls\": %" PRIu64
-                      ", \"logged\": %" PRIu64 ", \"rate_limited\": %" PRIu64 ", \"max_lines\": %" PRIu64 "}",
+                      ", \"exit_calls\": %" PRIu64 ", \"exit_unpaired\": %" PRIu64 ", \"logged\": %" PRIu64 ", \"rate_limited\": %" PRIu64 ", \"max_lines\": %" PRIu64 "}",
                       i == 0 ? "" : ", ", specs_[i].name.empty() ? "probe" : specs_[i].name.c_str(), specs_[i].addr,
-                      calls(i), entry_calls(i), logged(i), calls(i) > logged(i) ? calls(i) - logged(i) : 0,
+                      calls(i), entry_calls(i), exit_calls(i), exit_unpaired(i), logged(i), calls(i) > logged(i) ? calls(i) - logged(i) : 0,
                       specs_[i].max_lines);
         o += buf;
     }

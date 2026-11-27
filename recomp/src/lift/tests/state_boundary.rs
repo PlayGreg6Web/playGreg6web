@@ -17,7 +17,7 @@ use iced_x86::code_asm::*;
 use super::Program;
 use super::exec::CODE_BASE;
 use crate::lift::{
-    FlagSummaries, HELPER_CPUID, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_PROBE_HIT,
+    FlagSummaries, HELPER_CPUID, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_PROBE_EXIT, HELPER_PROBE_HIT,
     HELPER_RDTSC, HELPER_RDTSCP, HELPER_TRAP, HELPER_UNIMPLEMENTED, HELPER_XGETBV, function_symbol,
     lift_module,
 };
@@ -46,6 +46,7 @@ const RUNTIME_STATE_CALLS: &[(&str, Effect)] = &[
     (HELPER_UNIMPLEMENTED, Effect::NoReturn),
     (HELPER_DIVIDE_ERROR, Effect::NoReturn),
     (HELPER_PROBE_HIT, Effect::ReadOnly),
+    (HELPER_PROBE_EXIT, Effect::ReadOnly),
 ];
 
 const PURE: u64 = CODE_BASE;
@@ -164,6 +165,7 @@ fn only_functions_summarised_as_writing_everything_let_the_runtime_write_state()
     for f in &mut module.functions {
         if f.entry == PURE {
             f.insert_entry_probe();
+            f.insert_exit_probe();
         }
     }
     let ir: String = module
@@ -224,6 +226,7 @@ fn only_functions_summarised_as_writing_everything_let_the_runtime_write_state()
         HELPER_CPUID,
         HELPER_RDTSC,
         HELPER_PROBE_HIT,
+        HELPER_PROBE_EXIT,
     ] {
         assert!(seen.iter().any(|s| s == name), "no call of @{name}");
     }

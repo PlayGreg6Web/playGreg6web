@@ -89,8 +89,9 @@ pub(super) const OTHER_STATE: StateMask = 1u64 << 48;
 
 /// Everything a call may touch (bits `0..=48`).
 pub(super) const ALL_STATE: StateMask = (OTHER_STATE << 1) - 1;
-/// The Win64 integer argument registers `rcx rdx r8 r9`, which the entry probe reads.
-pub(super) const PROBE_ARG_STATE: StateMask = (1 << 1) | (1 << 2) | (1 << 8) | (1 << 9);
+/// The Win64 integer argument registers `rcx rdx r8 r9` and `rsp`, which the entry probe reads
+/// (`rsp` pairs the exit hook with its entry).
+pub(super) const PROBE_ARG_STATE: StateMask = (1 << 1) | (1 << 2) | (1 << 4) | (1 << 8) | (1 << 9);
 
 /// Bit in [`StateMask`] for `xmm{idx}` (`idx < 16`).
 pub(super) const fn xmm_state_bit(idx: usize) -> StateMask {

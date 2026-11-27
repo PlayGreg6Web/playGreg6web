@@ -106,7 +106,7 @@ void test_format_line() {
     CHECK(line.find("\"src\":\"entry\"") != std::string::npos && line.find("\"name\":\"fn\"") != std::string::npos);
     CHECK(line.find("\"caller\":\"0x") != std::string::npos);
     CHECK(line.find("\"args\":[\"0x100100\",\"0x21\"") != std::string::npos);
-    CHECK(line.find("\"ret\":\"unsupported\"") != std::string::npos);
+    CHECK(line.find("\"ret\":\"pending\"") != std::string::npos);
     CHECK(line.find("\"reg\":\"rcx\",\"off\":4,\"addr\":\"0x100104\",\"len\":4,\"status\":\"ok\",\"hex\":\"04050607\"") !=
           std::string::npos);
     CHECK(line.find("\"reg\":\"rdx\",\"off\":0,\"addr\":\"0x21\",\"len\":8,\"status\":\"null_page\"") != std::string::npos);
@@ -155,6 +155,74 @@ void test_probe_set() {
     CHECK(approved == 3 && set.calls(0) == 10);
 }
 
+void test_frames_and_exit_lines() {
+    ProbeFrames f;
+    ProbeFrames::Frame out;
+    // A nested call chain: A (rsp 0x1000) calls B (0xff0) which calls A again (0xfe0, recursion).
+    f.push(0, 0xA, 0x1000, 1);
+    f.push(1, 0xB, 0xff0, 2);
+    f.push(0, 0xA, 0xfe0, 3);
+    CHECK(f.depth() == 3);
+    CHECK(f.pop(0xA, 0xfe8, &out) && out.entry_seq == 3 && f.depth() == 2);  // the inner A, not the outer
+    CHECK(f.pop(0xB, 0xff8, &out) && out.entry_seq == 2 && out.idx == 1);
+    CHECK(f.pop(0xA, 0x1008, &out) && out.entry_seq == 1 && f.depth() == 0);
+    // An exit nobody pushed (the entry ran before the probe was armed) stays unpaired.
+    CHECK(!f.pop(0xA, 0x1008, &out));
+    // An unwind past C and D: they never exit. The caller's exit drops them.
+    f.push(0, 0xA, 0x2000, 10);
+    f.push(2, 0xC, 0x1ff0, 11);
+    f.push(3, 0xD, 0x1fe0, 12);
+    CHECK(f.pop(0xA, 0x2008, &out) && out.entry_seq == 10 && f.depth() == 0 && f.dropped() == 2);
+    // A stale frame (its owner was unwound) is dropped when a new activation starts above it, so a
+    // later exit of the same function at the same depth pairs with the new entry.
+    f.push(1, 0xB, 0x3000, 20);
+    f.push(1, 0xB, 0x3000, 21);  // same slot again: the first one was unwound
+    CHECK(f.depth() == 1 && f.pop(0xB, 0x3008, &out) && out.entry_seq == 21);
+    // Wrong rsp: no frame matches, the stack is untouched.
+    f.push(0, 0xA, 0x4000, 30);
+    CHECK(!f.pop(0xA, 0x4010, &out) && f.depth() == 1);
+    // The depth is bounded.
+    ProbeFrames deep;
+    for (uint64_t i = 0; i < ProbeFrames::kMaxDepth + 10; ++i) deep.push(0, 0xA, 0x100000 - i * 16, i + 1);
+    CHECK(deep.depth() == ProbeFrames::kMaxDepth);
+
+    ProbeSpec s;
+    std::string e;
+    CHECK(parse_probe_spec("0x1000:fn:ret", &s, &e));
+    const uint64_t xmm0[2] = {0x3ff0000000000000ull, 0};
+    const std::string line = format_probe_exit_line(s, 0x1000, 9, 55, 2, 4, true, 0xdead, xmm0);
+    CHECK(line == "{\"seq\":9,\"t_ms\":55,\"thread\":2,\"src\":\"exit\",\"name\":\"fn\",\"addr\":\"0x1000\","
+                  "\"entry_seq\":4,\"paired\":true,\"rax\":\"0xdead\",\"xmm0\":[\"0x3ff0000000000000\",\"0x0\"]}");
+    const std::string loose = format_probe_exit_line(s, 0x1000, 10, 56, 2, 0, false, 1, xmm0);
+    CHECK(loose.find("\"entry_seq\":null,\"paired\":false") != std::string::npos);
+
+    // Through the probe set: the exit line names the entry line's seq.
+    ProbeSet set;
+    std::vector<ProbeSpec> specs(1);
+    CHECK(parse_probe_spec("0x1000:fn:ret", &specs[0], &e));
+    const std::string path = "test_guest_probe_exit.jsonl";
+    set.configure(specs, path, 100);
+    FakeMem m;
+    ProbeHit h;
+    h.regs[4] = 0x100100;
+    CHECK(set.count_hit(0, true));
+    const uint64_t entry_seq = set.log_hit(0, h, m.fn());
+    CHECK(entry_seq == 1);
+    set.log_exit(0, 1, 5, entry_seq, true, 0x2a, xmm0);
+    set.log_exit(0, 1, 6, 0, false, 0x2b, xmm0);
+    CHECK(set.exit_calls(0) == 2 && set.exit_unpaired(0) == 1);
+    CHECK(set.to_json().find("\"exit_calls\": 2, \"exit_unpaired\": 1") != std::string::npos);
+    set.clear();
+    std::ifstream in(path);
+    std::string l1, l2, l3, l4;
+    CHECK(std::getline(in, l1) && std::getline(in, l2) && std::getline(in, l3) && !std::getline(in, l4));
+    CHECK(l2.find("\"src\":\"exit\"") != std::string::npos && l2.find("\"entry_seq\":1") != std::string::npos &&
+          l2.find("\"rax\":\"0x2a\"") != std::string::npos);
+    CHECK(l3.find("\"paired\":false") != std::string::npos);
+    in.close();
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -162,6 +230,7 @@ int main() {
     test_safe_read();
     test_format_line();
     test_probe_set();
+    test_frames_and_exit_lines();
     if (g_failures == 0) {
         std::puts("test_guest_probe: ok");
     }

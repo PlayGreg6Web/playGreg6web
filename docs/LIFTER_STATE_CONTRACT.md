@@ -79,6 +79,7 @@ state and end the run on a fault.
 | `capture_caller_context` (RtlCaptureContext / RaiseException / setjmp) | all GPRs, `flags`, `mxcsr`, `xmm0-15`, `[rsp]` | inside an indirect call |
 | `boot_dispatch_observer` (`guest/boot.cpp`) | `rcx rdx r8 r9 rsp` | inside an indirect call |
 | `__playgta6_probe_hit` (`--probe-functions`, inserted at function entry **after** lifting) | `rcx rdx r8 r9` | at callee entry, **during a direct call**. A probed build's summaries (`FlagSummaries::compute_with_probes`) count the probed function as reading all four, so callers sync them first. Logging only |
+| `__playgta6_probe_exit` (`--probe-functions`, inserted before every normal `ret void` **after** lifting; a tail call out becomes a call plus the hook) | `rax`, `xmm0`, `rsp` | at function exit, state already stored. `rsp` is in the probe's entry reads so the runtime pairs exit with entry. Logging only; the `unwind` returns get no hook |
 | Fault capture / backtrace / thread dump (`guest/boot.cpp`, `guest_runtime.cpp format_fault`) | everything (on copies). The thread dump reads another running thread's state without synchronisation | on fatal faults or a dump. Values can be stale or torn, but nothing is written |
 | `__playgta6_trap` / `unimplemented` / `divide_error` | `unwind_pending`, `resume_rip`, `rsp` | after a full sync, then the run ends |
 

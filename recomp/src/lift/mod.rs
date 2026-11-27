@@ -292,6 +292,10 @@ pub const HELPER_TRAP: &str = "__playgta6_trap";
 /// Entry counter of a function in a build's `--probe-functions` list (called with the state and the
 /// function's entry VA; the runtime tallies it). Emitted only for listed functions.
 pub const HELPER_PROBE_HIT: &str = "__playgta6_probe_hit";
+/// Exit hook of a function in a build's `--probe-functions` list (called with the state and the
+/// function's entry VA on every return path, after a tail call has returned; the runtime pairs it
+/// with the entry and reads `rax`/`xmm0`). Emitted only for listed functions.
+pub const HELPER_PROBE_EXIT: &str = "__playgta6_probe_exit";
 /// Runtime `cpuid`: `void (ptr state)` (see the module docs for the contract).
 pub const HELPER_CPUID: &str = "__playgta6_cpuid";
 /// Runtime `rdtsc`: `void (ptr state)` (see the module docs for the contract).
@@ -428,6 +432,44 @@ impl LiftedFunction {
         }
     }
 
+    /// Calls [`HELPER_PROBE_EXIT`] before every `ret void` that is a normal return (a `ret`, the
+    /// shared `ret_epilog`, a tail call out), so the runtime sees the return value in `rax`/`xmm0`.
+    /// A tail call out (`tail call @callee; ret void`) becomes a plain call followed by the hook:
+    /// the hook has to run after the callee returned. The `unwind` returns of a pending context
+    /// restore get no hook (no value is returned; the runtime drops the unpaired entry). Idempotent.
+    pub fn insert_exit_probe(&mut self) {
+        if !self.support.insert(Support::ProbeExit) {
+            return;
+        }
+        let hook = format!("  call void @{HELPER_PROBE_EXIT}(ptr %state, i64 {})\n", self.entry);
+        let mut out = String::with_capacity(self.ir.len() + 256);
+        let mut label = "entry";
+        let mut prev_tail: Option<usize> = None;
+        for line in self.ir.split_inclusive('\n') {
+            let t = line.trim_end();
+            if !line.starts_with(' ') && t.ends_with(':') {
+                label = &t[..t.len() - 1];
+                prev_tail = None;
+            }
+            if t == "  ret void" && !matches!(label, "unwind" | "unwind_leave") {
+                if let Some(at) = prev_tail.take() {
+                    out.replace_range(at..at + "tail ".len(), "");
+                }
+                out.push_str(&hook);
+            }
+            prev_tail = if t.starts_with("  tail call void @sub_")
+                || t.starts_with(&format!("  tail call void @{HELPER_INDIRECT_CALL}("))
+            {
+                Some(out.len() + 2)
+            } else {
+                None
+            };
+            out.push_str(line);
+        }
+        self.ir = out;
+        self.tiny_leaf = false;
+    }
+
     /// Whether the function contains atomic instructions (its module needs a shared memory).
     pub fn uses_atomics(&self) -> bool {
         self.support.contains(&Support::Atomics)
@@ -463,6 +505,8 @@ enum Support {
     GuestBase,
     /// The [`HELPER_PROBE_HIT`] declaration.
     Probe,
+    /// The [`HELPER_PROBE_EXIT`] declaration.
+    ProbeExit,
     /// R19 memory models ([`memory`]): a delta table or a guest-memory runtime helper.
     Memory(memory::Decl),
 }
@@ -691,6 +735,12 @@ pub fn emit_module_with_dispatch(
                 let _ = writeln!(
                     out,
                     "declare void @{HELPER_PROBE_HIT}(ptr noundef, i64 noundef)"
+                );
+            }
+            Support::ProbeExit => {
+                let _ = writeln!(
+                    out,
+                    "declare void @{HELPER_PROBE_EXIT}(ptr noundef, i64 noundef)"
                 );
             }
             Support::GuestBase => {

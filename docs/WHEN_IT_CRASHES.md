@@ -115,14 +115,22 @@ playgta6_boot ... --probe ADDR[:name][:args=N][:ret][:mem=REG+OFF,LEN][:max=N]  
   `mem=rcx+10,32` or `mem=rdx-8,16`.
 - `max=N`: log lines for this probe (default 200); a global budget of 20000 lines also applies. Counters keep
   counting past the limits.
-- `ret`: accepted and logged as `"ret":"unsupported"`. The lifter has no function-exit hook, so a return value
-  cannot be observed yet; log the callee's output buffer with `mem=` at its caller instead.
+- `ret`: log the return value. The entry line carries `"ret":"pending"`; when the function returns, a second line
+  follows (`"src":"exit"`, `entry_seq` = the `seq` of the entry line, `paired`, `rax`, `xmm0` as two qwords).
+  This needs the function in the build's `--probe-functions` file: only those get the lifter's exit hook (zero
+  cost for every other function), on every return path. A tail call out of the function is reported after the
+  callee returned, so the value is the real one. Entry and exit are paired per thread by the stack slot of the
+  return address, so recursion pairs correctly; an activation skipped by an exception unwind or `longjmp` never
+  logs an exit line (its entry stays unmatched). An exit with no matching entry is logged with
+  `"paired":false,"entry_seq":null`. A `ret` probe on a function that is not in `--probe-functions` only ever
+  gets the entry line; log the output buffer with `mem=` at its caller instead.
 
 Each hit is one JSON line: `seq`, `t_ms`, `thread`, `src`, `name`, `addr`, `caller` (return address), `args`,
 `mem`. Every memory read is range-checked (null page, non-canonical, wrapping) and then goes through the
 arena's checked copy page by page, so a bad address is logged as `status` `null_page`, `out_of_range`,
 `overflow`, `unmapped` (not mapped or not committed) or `partial` (`ok_bytes` readable), never a fault. The
-boot report's `guest_probes` lists per probe `calls`, `entry_calls`, `logged` and `rate_limited`.
+boot report's `guest_probes` lists per probe `calls`, `entry_calls`, `exit_calls`, `exit_unpaired`, `logged` and
+`rate_limited`.
 
 Hits are seen at dispatch (indirect calls, vtable calls). Direct calls between lifted functions only show for
 functions listed in the build's `--probe-functions` file (the entry counter), which needs a rebuild of the
