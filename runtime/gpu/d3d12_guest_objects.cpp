@@ -2206,7 +2206,22 @@ ResourceAllocation resource_allocation(const GuestResourceDesc& d) {
         return a;
     }
     const uint64_t alignment = d.Alignment != 0 ? d.Alignment : (d.SampleCount > 1 ? (4u << 20) : kDefaultPlacementAlignment);
-    return {align_up(resource_size_estimate(d), alignment), alignment};
+    uint64_t size = resource_size_estimate(d);
+    // A texture with D3D12_TEXTURE_LAYOUT_UNKNOWN is tiled on the console, never stored tight: its
+    // allocation must hold at least the 4 KiB swizzle placement (SW_4KB_S: the mip tail block first,
+    // then the larger mips smallest-first, each padded to whole 4 KiB blocks). The title's texture
+    // streaming reserves exactly this answer and maps the asset's baked mip ranges (tail block, then
+    // mips in 4 KiB pages) inside it; the tight estimate of a 64x1024 BC1 chain (0x10000) is short
+    // of the 0x11000 those ranges cover, so the map spilled into a neighbour's page (#2071).
+    // Depth-stencil and planar formats keep their per-plane sizes.
+    if (d.Layout == 0 && (d.Dimension == ResourceDimension::Texture2D || d.Dimension == ResourceDimension::Texture3D) &&
+        d.SampleCount <= 1 && (d.Flags & 0x2u) == 0 && dxgi_format_layout(d.Format).planes < 2) {
+        GuestResourceDesc tiled = d;
+        tiled.Layout = kSw4kbSLayout;
+        tiled.Alignment = 0;
+        size = std::max(size, console_layout_size(tiled));
+    }
+    return {align_up(size, alignment), alignment};
 }
 
 GuestResourceAllocationInfo Device::GetResourceAllocationInfo(uint32_t, uint32_t count, uint64_t descs) {

@@ -1,6 +1,7 @@
 // Synthetic tests: D3D12 resource sizes for textures with a console layout value (#551).
 // Verified GFX10 modes are sized by the whole-surface placement in gpu/gfx10_detile.h; other
 // layouts keep the linear estimate.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -211,6 +212,48 @@ void test_small_placement_title_requests() {
     }
 }
 
+// #2071: the title's texture streaming reserves exactly GetResourceAllocationInfo's size and maps
+// the asset's baked ranges inside it: the 4 KiB mip-tail block first, then the mips in 4 KiB
+// pages. For a layout-UNKNOWN texture the answer must therefore cover the SW_4KB_S placement,
+// whatever alignment the title asked for. The tight estimate of a 64x1024 BC1 chain (0x10000) was
+// short of the 0x11000 the asset maps, so the map reached a neighbour's 64 KiB page.
+void test_unknown_layout_covers_4kb_placement() {
+    dg::GuestResourceDesc bc1 = texture(3, 64, 1024, 1, 5, 71, 0);
+    dg::ResourceAllocation a = dg::resource_allocation(bc1);
+    CHECK(a.size >= 0x11000u && a.alignment == 0x10000u && a.size % a.alignment == 0);
+    bc1.Alignment = 4096;
+    CHECK(dg::resource_allocation(bc1).size >= 0x11000u);
+
+    for (uint32_t format : {71u, 72u, 77u, 98u, 99u, 28u, 10u, 61u, 26u}) {
+        for (uint32_t w = 4; w <= 2048; w *= 2) {
+            for (uint32_t h = 4; h <= 2048; h *= 2) {
+                uint32_t full = 1;
+                while ((std::max(w, h) >> full) != 0) ++full;
+                for (uint32_t mips : {1u, 5u, full}) {
+                    if (mips > full) continue;
+                    for (uint64_t alignment : {uint64_t{0}, uint64_t{4096}}) {
+                        dg::GuestResourceDesc t = texture(3, w, h, 1, uint16_t(mips), format, 0);
+                        t.Alignment = alignment;
+                        const gfx10::TextureLayoutDesc g{format, w, h, 1u, mips, 0x105u, 0u};
+                        const uint64_t placement = gfx10::surface_bytes(g);
+                        a = dg::resource_allocation(t);
+                        CHECK(placement != 0);
+                        CHECK(a.size >= placement);
+                        CHECK(a.size >= dg::resource_size_estimate(t));
+                        CHECK(a.alignment != 0 && a.size % a.alignment == 0);
+                        // Every mip of the placement ends inside the answer (tail block included).
+                        for (uint32_t m = 0; m < mips; ++m) {
+                            const gfx10::MipPlacement mp = gfx10::mip_placement(g, m);
+                            CHECK(mp.ok && mp.macro_block_offset + mp.size_bytes <= a.size);
+                        }
+                        if (g_failures > 20) return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // G82 (#1747): 3D volume, cubemap, and HDR mip-chain console layout sizes + incremental
 // dirty-band / dirty-slice hashing & run coalescing.
 void test_3d_cubemap_hdr_sizes_and_dirty_bands() {
@@ -269,6 +312,7 @@ int main() {
     test_sizes();
     test_small_placement();
     test_small_placement_title_requests();
+    test_unknown_layout_covers_4kb_placement();
     test_3d_cubemap_hdr_sizes_and_dirty_bands();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_console_layout_sizes: %d failure(s)\n", g_failures);
