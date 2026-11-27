@@ -265,6 +265,9 @@ struct BglEntry {
     wgpu::BindGroupLayout layout;
     std::vector<LayoutEntry> entries;
     bool entries_known = true;
+    // Over a per-stage limit on its own (an invalid layout): its bind groups are recorded for the remap
+    // but not created, and never bound (an invalid bind group in a pass invalidates the command buffer).
+    bool over_limits = false;
 };
 
 struct PlEntry {
@@ -283,6 +286,7 @@ struct PlEntry {
 // bound with dummy resources before a draw / dispatch unless the pass bound that group itself.
 struct FitDummies {
     uint8_t mask = 0;
+    uint8_t force = 0;  // of `mask`: the title's groups replaced by padding (bound over whatever the pass bound)
     std::array<wgpu::BindGroup, kFitMaxGroups> groups;
 };
 
@@ -2723,7 +2727,7 @@ struct NativeExecutor::Impl {
         bool upper = false;
         for (size_t g = 1; g < ng; ++g) upper = upper || !wg[g].empty();
         const bool remap0 = meta.remap || over;
-        const std::vector<FitSource> src = fit_layout_groups(pl.fit_groups, wg, remap0);
+        std::vector<FitSource> src = fit_layout_groups(pl.fit_groups, wg, remap0);
         if (!layout_needs_fit(src, pl.fit_groups.size(), over) && !(meta.remap && upper)) return {};
         std::vector<LimitEntry> fitted;
         for (size_t g = 0; g < src.size(); ++g) {
@@ -2731,9 +2735,26 @@ struct NativeExecutor::Impl {
             else if (src[g] == FitSource::Wgsl)
                 for (const FitBinding& f : wg[g]) fitted.push_back(limit_entry_of(f));
         }
+        uint8_t force = 0;
         if (!stage_limit_excess(fitted, stage_limits).empty()) {
-            ++stats.layout_fit_still_over;
-            return {};
+            std::vector<FitSource> padded = src;
+            force = replace_unused_groups(&padded, wg);
+            fitted.clear();
+            for (size_t g = 0; g < padded.size(); ++g) {
+                if (padded[g] == FitSource::Explicit) limits_of(pl.entry_groups[g], &fitted);
+                else if (padded[g] == FitSource::Wgsl)
+                    for (const FitBinding& f : wg[g]) fitted.push_back(limit_entry_of(f));
+            }
+            const std::string excess = stage_limit_excess(fitted, stage_limits);
+            if (!force || !excess.empty()) {
+                if (++stats.layout_fit_still_over <= 8)
+                    std::fprintf(stderr, "[native_exec] layout fit: the WGSL alone is over a per-stage limit: %s\n",
+                                 excess.c_str());
+                return {};
+            }
+            src = std::move(padded);
+            for (uint32_t g = 0; g < kFitMaxGroups; ++g)
+                if (force & (1u << g)) ++stats.layout_fit_unused_groups;
         }
         std::vector<wgpu::BindGroupLayout> bgls(src.size());
         FitDummies fd;
@@ -2788,6 +2809,7 @@ struct NativeExecutor::Impl {
         }
         if (over) ++stats.layout_fit_over_limits;
         ++stats.layout_fit_pipelines;
+        fd.force = force;
         *dummies = std::move(fd);
         return fitted_pl;
     }
@@ -3705,6 +3727,12 @@ struct NativeExecutor::Impl {
         }
         BglEntry b;
         b.layout = layout;
+        {
+            std::vector<LimitEntry> le;
+            for (const LayoutEntry& x : entries) le.push_back({x.visibility, x.kind, x.subtype});
+            b.over_limits = !stage_limit_excess(le, stage_limits).empty();
+            if (b.over_limits) ++stats.over_limit_bind_group_layouts;
+        }
         b.entries = std::move(entries);
         bgls[h.id] = std::move(b);
         ++stats.bind_group_layouts;
@@ -4267,6 +4295,7 @@ struct NativeExecutor::Impl {
         const std::string msg = std::string("async ") + what + " pipeline [vs=" + hash_hex(slot.vs_hash) +
                                 " fs=" + hash_hex(slot.fs_hash) + "]: " + st.message;
         stats.last_device_error = msg;
+        ++stats.async_failure_kinds[classify_pipeline_failure(st.message)];
         if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(msg);
         if (stats.async_pipeline_failures <= 16) std::fprintf(stderr, "[native_exec] %s\n", msg.substr(0, 600).c_str());
     }
@@ -5026,7 +5055,8 @@ struct NativeExecutor::Impl {
         bd.layout = rec.layout;
         bd.entryCount = wes.size();
         bd.entries = wes.data();
-        bind_groups[h.id] = device.CreateBindGroup(&bd);
+        if (rec.over_limits) bind_groups[h.id] = nullptr;  // recorded (desc) for the remap only
+        else bind_groups[h.id] = device.CreateBindGroup(&bd);
         bg_descs[h.id] = std::move(desc);
         compute_bind_groups.erase(h.id);  // a v2 group of the same id is not a v1 compute group
         ++stats.bind_groups;
@@ -5225,6 +5255,14 @@ struct NativeExecutor::Impl {
         std::optional<AttachmentSize> explicit_size;
         bool group0_bound = false;
         uint8_t bound_groups = 0;  // groups the active pass bound (bit = group): fitted dummies skip them
+        // The stream's own bind groups 1..3 of the active pass, to restore after a padded pipeline's
+        // draw bound its padding over them (`overridden`).
+        struct StreamGroup {
+            wgpu::BindGroup group;
+            std::vector<uint32_t> offsets;
+        };
+        std::array<StreamGroup, kFitMaxGroups> stream_groups;
+        uint8_t overridden = 0;
         std::optional<uint32_t> active_pipeline;
         std::optional<uint32_t> active_compute;
         // _preparePassCommandsForFlush compute filter state
@@ -5284,6 +5322,8 @@ struct NativeExecutor::Impl {
             explicit_pass = false;
             group0_bound = false;
             bound_groups = 0;
+            overridden = 0;
+            for (auto& sg : stream_groups) sg = StreamGroup{};
             active_pipeline.reset();
             active_compute.reset();
         }
@@ -5592,10 +5632,18 @@ struct NativeExecutor::Impl {
         } else if (const auto* bg = std::get_if<SetBindGroup2Cmd>(&cmd)) {
             if (bg->group == 0 && remap_set_group0(e, *bg)) return;  // layout:'auto' remap
             if (!e.rpass && !e.cpass) return;  // `if (!ctl.pass) return`
+            if (!bg->bind_group) {  // a group of an over-limit layout: only a fitted pipeline can use it (remap)
+                ++stats.over_limit_binds_skipped;
+                return;
+            }
             if (e.rpass) e.rpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             else e.cpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             if (bg->group == 0) e.group0_bound = true;
             if (bg->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << bg->group);
+            if (bg->group > 0 && bg->group < kFitMaxGroups) {
+                e.stream_groups[bg->group] = {bg->bind_group, bg->offsets};
+                e.overridden &= static_cast<uint8_t>(~(1u << bg->group));
+            }
         } else if (const auto* b1 = std::get_if<SetBindGroup1Cmd>(&cmd)) {
             // `this.bindGroups.get(id) || cmd.bindGroup`; a missing group is a validation error.
             auto it = bind_groups.find(b1->id);
@@ -5612,6 +5660,10 @@ struct NativeExecutor::Impl {
             else e.cpass.SetBindGroup(b1->group, bg, 0, nullptr);
             if (b1->group == 0) e.group0_bound = true;
             if (b1->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << b1->group);
+            if (b1->group > 0 && b1->group < kFitMaxGroups) {
+                e.stream_groups[b1->group] = {bg, {}};
+                e.overridden &= static_cast<uint8_t>(~(1u << b1->group));
+            }
         } else if (const auto* rb = std::get_if<ReadbackCmd>(&cmd)) {
             e.end_active();  // _recordReadbackCopy: pc.endPass()
             record_readback_copy(e.enc, rb->req);
@@ -5774,23 +5826,40 @@ struct NativeExecutor::Impl {
     }
 
     // Before a draw / dispatch: the fitted groups the pass has not bound get their dummies.
+    // Every draw / dispatch: a group a padded pipeline bound over the stream's own is restored first
+    // (unless this pipeline pads it too).
     void bind_fit_dummies(Encoder& e, const FitDummies& fd) {
+        if (!e.rpass && !e.cpass) return;
+        for (uint32_t g = 1; g < kFitMaxGroups && e.overridden; ++g) {
+            const uint8_t bit = static_cast<uint8_t>(1u << g);
+            if (!(e.overridden & bit) || (fd.force & bit)) continue;
+            e.overridden &= static_cast<uint8_t>(~bit);
+            const auto& sg = e.stream_groups[g];
+            if (!sg.group) continue;
+            if (e.rpass) e.rpass.SetBindGroup(g, sg.group, sg.offsets.size(), sg.offsets.data());
+            else e.cpass.SetBindGroup(g, sg.group, sg.offsets.size(), sg.offsets.data());
+            ++stats.layout_fit_restores;
+        }
         if (!fd.mask) return;
         for (uint32_t g = 0; g < kFitMaxGroups; ++g) {
             const uint8_t bit = static_cast<uint8_t>(1u << g);
-            if (!(fd.mask & bit) || (e.bound_groups & bit) || !fd.groups[g]) continue;
+            const bool force = (fd.force & bit) != 0;
+            if (!(fd.mask & bit) || !fd.groups[g]) continue;
+            if (!force && (e.bound_groups & bit)) continue;
+            if (force && (e.overridden & bit)) continue;  // still bound from the previous draw
             if (e.rpass) e.rpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
-            else if (e.cpass) e.cpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
-            else continue;
+            else e.cpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
             e.bound_groups |= bit;
+            if (force) e.overridden |= bit;
             ++stats.layout_fit_dummy_binds;
         }
     }
 
     void bind_compute_fit_dummies(Encoder& e) {
-        if (!e.active_compute || !e.compute_valid) return;
+        static const FitDummies kNone;
+        if (!e.active_compute || !e.compute_valid) return bind_fit_dummies(e, kNone);
         auto it = compute_pipelines.find(*e.active_compute);
-        if (it != compute_pipelines.end()) bind_fit_dummies(e, it->second.fit);
+        bind_fit_dummies(e, it != compute_pipelines.end() ? it->second.fit : kNone);
     }
 
     // RemappedSetBindGroupCommand.run: `if (!ctl.pass) return`.
@@ -7005,6 +7074,19 @@ std::string NativeExecutor::stats_json() const {
     num("layout_fit_over_limits", st.layout_fit_over_limits);
     num("layout_fit_still_over", st.layout_fit_still_over);
     num("layout_fit_dummy_binds", st.layout_fit_dummy_binds);
+    num("layout_fit_unused_groups", st.layout_fit_unused_groups);
+    num("layout_fit_restores", st.layout_fit_restores);
+    num("over_limit_bind_group_layouts", st.over_limit_bind_group_layouts);
+    num("over_limit_binds_skipped", st.over_limit_binds_skipped);
+    j += "\"async_failure_kinds\": {";
+    {
+        bool first = true;
+        for (const auto& [k, v] : st.async_failure_kinds) {
+            j += (first ? "\"" : ", \"") + k + "\": " + std::to_string(v);
+            first = false;
+        }
+    }
+    j += "}, ";
     num("limit_uniform_buffers_per_stage", st.limit_uniform_buffers_per_stage);
     num("limit_storage_buffers_per_stage", st.limit_storage_buffers_per_stage);
     num("limit_sampled_textures_per_stage", st.limit_sampled_textures_per_stage);

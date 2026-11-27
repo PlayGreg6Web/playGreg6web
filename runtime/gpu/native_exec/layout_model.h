@@ -931,4 +931,48 @@ inline bool layout_needs_fit(const std::vector<FitSource>& sources, size_t expli
     return false;
 }
 
+// The class of an async pipeline creation failure (Dawn's message), for the boot report:
+// "missing_group" (the WGSL binds a group the layout lacks), "stage_limit_<what>" (a layout or the
+// shader itself over a per-stage limit), "invalid_layout" (built with a layout that failed earlier,
+// usually over a limit), "binding_mismatch" (a layout entry of another type than the WGSL's), "other".
+inline std::string classify_pipeline_failure(std::string_view msg) {
+    if (msg.find("doesn't have a BindGroupLayout for this index") != std::string_view::npos) return "missing_group";
+    const size_t lim = msg.find("exceeds the maximum per-stage limit");
+    if (lim != std::string_view::npos) {
+        static const char* const kWhat[] = {"uniform buffers", "storage buffers", "sampled textures", "samplers",
+                                            "storage textures"};
+        for (const char* w : kWhat) {
+            if (msg.find(std::string("number of ") + w) != std::string_view::npos) {
+                std::string k = std::string("stage_limit_") + w;
+                for (char& c : k)
+                    if (c == ' ') c = '_';
+                return k;
+            }
+        }
+        return "stage_limit";
+    }
+    if (msg.find("PipelineLayout") != std::string_view::npos && msg.find("is invalid due to a previous error") != std::string_view::npos)
+        return "invalid_layout";
+    if (msg.find("is not compatible with the type in the layout") != std::string_view::npos ||
+        msg.find("doesn't match the type in the layout") != std::string_view::npos)
+        return "binding_mismatch";
+    return "other";
+}
+
+// A layout still over the limits after the fit: the title's groups the WGSL does not bind at all
+// (descriptor tables of other root parameters, visible to every stage) still count against the
+// stage limits. Replace them with padding, which the executor binds itself for this pipeline
+// (`force` groups); returns the groups replaced (bit = group).
+inline uint8_t replace_unused_groups(std::vector<FitSource>* sources, const std::vector<std::vector<FitBinding>>& wgsl) {
+    uint8_t mask = 0;
+    for (size_t g = 0; g < sources->size() && g < kFitMaxGroups; ++g) {
+        const bool used = g < wgsl.size() && !wgsl[g].empty();
+        if ((*sources)[g] == FitSource::Explicit && !used) {
+            (*sources)[g] = FitSource::Empty;
+            mask |= static_cast<uint8_t>(1u << g);
+        }
+    }
+    return mask;
+}
+
 }  // namespace playgta6::gpu::native_exec

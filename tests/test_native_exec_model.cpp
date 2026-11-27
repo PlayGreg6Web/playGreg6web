@@ -1139,6 +1139,30 @@ void test_fit_stage_limits() {
     CHECK(m2.size() == 1 && m2[0].visibility == kFitFragment);
 }
 
+void test_fit_failure_classes() {
+    using namespace playgta6::gpu::native_exec;
+    CHECK(classify_pipeline_failure("The entry-point uses bindings in group 3 but [PipelineLayout (unlabeled)] doesn't "
+                                    "have a BindGroupLayout for this index.") == "missing_group");
+    CHECK(classify_pipeline_failure("The number of storage textures (9) in the Compute stage exceeds the maximum "
+                                    "per-stage limit (8).") == "stage_limit_storage_textures");
+    CHECK(classify_pipeline_failure("The number of uniform buffers (15) in the Vertex stage exceeds the maximum "
+                                    "per-stage limit (12).") == "stage_limit_uniform_buffers");
+    CHECK(classify_pipeline_failure("[Invalid PipelineLayout (unlabeled)] is invalid due to a previous error.") ==
+          "invalid_layout");
+    CHECK(classify_pipeline_failure("The buffer type in the shader (BufferBindingType::ReadOnlyStorage) is not "
+                                    "compatible with the type in the layout (BufferBindingType::Storage).") ==
+          "binding_mismatch");
+    CHECK(classify_pipeline_failure("something else") == "other");
+
+    // Unused title groups become padding; used and WGSL-built ones stay.
+    WgslBinding u;
+    std::vector<FitSource> src = {FitSource::Wgsl, FitSource::Explicit, FitSource::Explicit, FitSource::Wgsl};
+    const std::vector<std::vector<FitBinding>> wg = {{FitBinding{u, kFitCompute}}, {}, {FitBinding{u, kFitCompute}},
+                                                     {FitBinding{u, kFitCompute}}};
+    CHECK(replace_unused_groups(&src, wg) == 0x2);
+    CHECK(src[1] == FitSource::Empty && src[2] == FitSource::Explicit && src[0] == FitSource::Wgsl);
+}
+
 void test_pipe_wait_budget() {
     using namespace playgta6::gpu::native_exec;
     uint64_t v = 7;
@@ -1376,6 +1400,7 @@ int main() {
     test_wgsl_group_bindings();
     test_fit_missing_groups();
     test_fit_stage_limits();
+    test_fit_failure_classes();
     test_fragment_outputs();
     test_error_scope_model();
     test_clear_model();

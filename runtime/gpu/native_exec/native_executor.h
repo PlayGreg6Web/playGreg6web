@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 
 #include "gpu/native_exec/present_model.h"
@@ -308,6 +309,11 @@ struct ExecutorStats {
     uint64_t layout_fit_over_limits = 0;    // of the fitted: the title's layout was over a per-stage limit
     uint64_t layout_fit_still_over = 0;     // over the limits even fitted: built with the title's layout
     uint64_t layout_fit_dummy_binds = 0;    // fitted groups bound with dummies (the pass bound nothing there)
+    uint64_t layout_fit_unused_groups = 0;  // the title's groups the WGSL does not bind, padded to get under the limits
+    uint64_t layout_fit_restores = 0;
+    uint64_t over_limit_bind_group_layouts = 0;  // title bind group layouts over a per-stage limit on their own
+    uint64_t over_limit_binds_skipped = 0;       // their bind groups set outside a fitted pipeline's remap: not encoded       // the stream's own group re-bound after a padded pipeline's draw
+    std::map<std::string, uint64_t> async_failure_kinds;  // classify_pipeline_failure -> count
     // The device's per-stage limits the layouts are checked against.
     uint32_t limit_uniform_buffers_per_stage = 0;
     uint32_t limit_storage_buffers_per_stage = 0;
