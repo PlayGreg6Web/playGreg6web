@@ -1436,6 +1436,32 @@ void test_failed_async_pipeline_resolves(NativeExecutor& ex) {
     ex.wait_idle();
     ex.poll();
     CHECK(ex.stats().async_pipeline_failures > before.async_pipeline_failures);
+    // The draw is dropped and counted (pipeline_failed), never encoded: an invalid pipeline in the pass
+    // would invalidate the whole command buffer.
+    CHECK(ex.stats().draws_skipped > before.draws_skipped);
+    CHECK(ex.stats().pipeline_failed_skips > before.pipeline_failed_skips);
+
+    // Same for a compute pipeline whose async compile failed.
+    const ExecutorStats mid = ex.stats();
+    gpu::CommandEncoder csetup;
+    csetup.create_shader_module(85, GpuShaderStage::Compute, "this is not wgsl");
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 86;
+    cp.cs_module_id = 85;
+    cp.pipeline_layout_id = 83;
+    emit(csetup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    run(ex, csetup);
+    gpu::CommandEncoder cframe;
+    cframe.begin_frame();
+    cframe.set_compute_pipeline(86);
+    cframe.dispatch_compute(1, 1, 1);
+    cframe.present();
+    run(ex, cframe);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().dispatches_skipped > mid.dispatches_skipped);
+    CHECK(ex.stats().pipeline_failed_skips > mid.pipeline_failed_skips);
 }
 
 // Live-mode options: pipelines are created asynchronously (awaited at first use, same output) and
@@ -2529,6 +2555,33 @@ void test_error_scope_attribution() {
     CHECK(j.find("\"present_index\": 0") != std::string::npos);
 }
 
+// Five RGBA16F targets = 40 bytes per sample, over the 32 B WebGPU default: the device must have been
+// created with the adapter's own maxColorAttachmentBytesPerSample or Dawn rejects the pipeline.
+void test_wide_mrt_pipeline(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder pl;
+    pl.create_shader_module(920, GpuShaderStage::Vertex,
+                            "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {"
+                            " var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));"
+                            " return vec4f(p[i], 0.0, 1.0); }\n");
+    pl.create_shader_module(921, GpuShaderStage::Fragment,
+                            "struct Out { @location(0) a: vec4f, @location(1) b: vec4f, @location(2) c: vec4f,"
+                            " @location(3) d: vec4f, @location(4) e: vec4f }\n"
+                            "@fragment fn fs_main() -> Out { var o: Out; return o; }\n");
+    GpuCreateRenderPipeline2Payload rp = pipeline_to_bgra(922, 920, 921, 0);
+    rp.key.color_target_count = 5;
+    for (int i = 0; i < 5; ++i) {
+        rp.key.color_targets[i].format = 40;  // rgba16float
+        rp.key.color_targets[i].write_mask = 15;
+    }
+    emit(pl, GpuOpcode::CreateRenderPipeline2, bytes_of(rp));
+    run(ex, pl);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+    CHECK(ex.stats().write_masks_cleared == before.write_masks_cleared);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -2574,6 +2627,7 @@ int main() {
     test_remap_reflected_layout(true);
     test_remap_reflected_layout(false);
     test_dawn_validation_fixes(*ex);
+    test_wide_mrt_pipeline(*ex);
     test_screenshot();
     test_error_scope_attribution();
     if (g_failures) {
