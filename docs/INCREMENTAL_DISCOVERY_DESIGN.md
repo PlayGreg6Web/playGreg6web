@@ -1,6 +1,6 @@
 # Incremental discovery: design
 
-Status: proposal, nothing implemented. Owner of the files involved (`recomp/src/discover.rs`,
+Status: Phase 0 implemented (0a #1962, 0b and 0c below); Phases 1-3 are proposals. Owner of the files involved (`recomp/src/discover.rs`,
 `reach.rs`, `jump_table.rs`, `cfg.rs`, `eh.rs`): Marc. This page only describes the scheme and the
 numbers behind it; see "Rollout" for which step touches which file.
 
@@ -53,6 +53,48 @@ Two things follow:
    changes to the executable.
 2. The part a jump-table rule actually decides is small (next section). That makes rule-level
    incrementality worth doing after Phase 0.
+
+## After Phase 0 (measured)
+
+Game executable, cold refined discovery (no cache, 4 rounds), per-phase timers (what
+`build-program --timings` prints; same machine, one run each, absolute times move by 5-10 s
+with load):
+
+| Phase | after 0a | after 0b |
+|---|---:|---:|
+| decode (`run`) | 24.7 s | 11.2 s |
+| jump tables (resolve, revise, requeue, verify, classify) | 2.1 s | 1.4 s |
+| late resume targets + pointer slots + vtables | 17.1 s | 11.0 s |
+| relocations | 3.5 s | 3.8 s |
+| functions (membership walks) | 11.1 s | 10.1 s |
+| refinement (code-pointer classification) | 2.4 s | 2.4 s |
+| rounds (s) | 13.2, 14.9, 15.3, 15.3 | 12.8, 15.1, 4.9, 4.7 |
+| **total** | **67.3 s** | **46.2 s** |
+
+(Before 0a: 312 s, measured on a more loaded run in #1962; 0a gave 99.5 s on that run.)
+
+The whole encoded result (`discovery_cache::encode`, 126 MB) is byte-identical to `main` after
+each step.
+
+Phase 0b keeps the `Discovery` state between refinement rounds (`discover::Session`): a round
+moves its blocks into the analysis, the refinement classifies the code pointers on it, and
+`Session::reclaim` takes the blocks back (undoing the membership walk's tail-call rewrites and
+restoring the tables verification demoted, so the state is the pre-verification fixpoint again)
+before the accepted entries are added. A round starts over instead when the previous round found a
+no-return thunk that decoded code calls directly (`no_return` decides where a block ends at a
+direct call, so those blocks would have to be decoded again), or when the continued round hit an
+event a fresh run may order differently (`Session::diverged`: a resolved table revised to one
+that drops targets or no longer matching, a retry or revision cap, a pointer-slot seed on a jump
+that later resolved as a table). On the game executable round 1 finds called no-return thunks, so
+round 2 starts over and rounds 3-4 continue (none diverged). Unit tests check every `discover()`
+call against a continued session (the entries split in two, and all added to an empty session)
+and `discover_refined_rounds` continued against fresh rounds.
+
+What is left is per-round full scans: decoding is serial, and the late resume targets, vtable /
+pointer-slot seeds, relocations and membership walks each visit all ~4M blocks once or more per
+round. Making those visit only blocks changed since their last pass, and continuing round 2
+through a no-return addition (retracting the decoded tails of the affected calls), are the
+remaining Phase 0-style wins; neither needs the match records of Phase 1.
 
 ## What a discovery rule can reach (measured)
 
@@ -287,7 +329,9 @@ the real executable with `--verify-discovery-cache` (identical result) before it
   b. keep the `Discovery` state between refinement rounds and add the accepted entries to it
      instead of re-running `discover()` from scratch (needs the pre-verify state kept, and the
      equality to a fresh run checked on the exe, because R8 demotion is not monotone);
-  c. per-phase timers in the build manifest (`discovery.timing`).
+  c. per-phase timers: `build-program --timings` prints them per module, and the discovery cache
+     stores them next to each entry (`<module>-<key>.disc-meta.json`; a hit prints the stored
+     ones). Not in `build-manifest.json`, which stays deterministic.
   Benefits every discovery miss including cold runs. Expected ~150 s -> ~35-50 s.
 - **Phase 1 - records only** (`discover.rs`, `reach.rs` return the subgraph it walked; cache
   format 2): record provenance, match records and read-sets; a `build-program

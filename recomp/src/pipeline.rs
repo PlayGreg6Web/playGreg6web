@@ -131,7 +131,7 @@ use std::thread;
 
 use crate::cfg::{CallTarget, DiagnosticKind, Function, Terminator};
 use crate::code_image::CodeImage;
-use crate::discover::Analysis;
+use crate::discover::{Analysis, DiscoveryTimings};
 use crate::eh::EhMetadata;
 use crate::image::{self, ImageBuild, ImageDiagnostic, ImageError, ImageOptions};
 use crate::lift::compile::{LlvmTool, compile_to_object, find_llvm_tool};
@@ -320,6 +320,10 @@ pub struct PipelineOptions {
     /// With [`Self::discovery_cache`]: run discovery anyway and fail when the stored entry (or
     /// the encode/decode round trip) differs from it (`--verify-discovery-cache`).
     pub verify_discovery_cache: bool,
+    /// Report the wall time of every discovery phase through the progress callback
+    /// (`--timings`, one `discovery timings: ...` message per discovery run; for a cache hit the
+    /// times stored with the entry). Never affects the outputs.
+    pub discovery_timings: bool,
 }
 
 /// Parses a `--probe-functions` file: one hexadecimal VA per line (optional `0x`), anything after
@@ -366,6 +370,7 @@ impl PipelineOptions {
             lift_cache: None,
             discovery_cache: None,
             verify_discovery_cache: false,
+            discovery_timings: false,
         }
     }
 
@@ -1540,15 +1545,33 @@ pub fn run_module(
         )
     });
     let mut cache_outcomes = Vec::new();
-    let mut refined = |image: &mut CodeImage<'_>, key: Option<u128>| match (&cache, key) {
-        (Some(cache), Some(key)) => {
-            let (analysis, code_pointers, outcome) = cache
-                .discover_refined(key, image, &guest.image)
-                .map_err(PipelineError::Options)?;
-            cache_outcomes.push(outcome.as_str());
-            Ok::<_, PipelineError>((analysis, code_pointers))
-        }
-        _ => Ok(refine::discover_refined(image, &guest.image)),
+    let mut timing_lines = Vec::new();
+    let mut refined = |image: &mut CodeImage<'_>, key: Option<u128>| {
+        let mut timings = DiscoveryTimings::default();
+        let result = match (&cache, key) {
+            (Some(cache), Some(key)) => {
+                let (analysis, code_pointers, outcome) = cache
+                    .discover_refined(key, image, &guest.image, &mut timings)
+                    .map_err(PipelineError::Options)?;
+                cache_outcomes.push(outcome.as_str());
+                if outcome == discovery_cache::Outcome::Hit {
+                    timing_lines.push(match cache.stored_timings(key) {
+                        Some(json) => format!("cache hit, stored with the entry: {json}"),
+                        None => "cache hit, no stored timings".to_string(),
+                    });
+                    return Ok((analysis, code_pointers));
+                }
+                (analysis, code_pointers)
+            }
+            _ => refine::discover_refined_timed(
+                image,
+                &guest.image,
+                refine::MAX_ROUNDS,
+                &mut timings,
+            ),
+        };
+        timing_lines.push(timings.render().trim_end().to_string());
+        Ok::<_, PipelineError>(result)
     };
     let (mut analysis, mut code_pointers) = refined(&mut seeded.image, cache_key)?;
     if let Some(seeds) = &options.trace_seeds {
@@ -1580,6 +1603,11 @@ pub fn run_module(
     drop(refined);
     if !cache_outcomes.is_empty() {
         progress(&format!("discovery cache: {};", cache_outcomes.join(", ")));
+    }
+    if options.discovery_timings {
+        for line in &timing_lines {
+            progress(&format!("discovery timings: {line}"));
+        }
     }
     let discovery = DiscoveryStats::new(&seeded.image, &analysis, code_pointers.rounds);
     let pdata = PdataStats::new(&seeded.pdata, &seeded.image);

@@ -63,6 +63,8 @@ use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations
 
 mod pred_index;
 use pred_index::PredIndex;
+mod timing;
+pub use timing::{DiscoveryTimings, Phase, PhaseTime};
 
 /// `int 0x29` is the Windows `__fastfail` trap and never returns.
 const FASTFAIL_VECTOR: u8 = 0x29;
@@ -79,6 +81,9 @@ const MAX_TABLE_REVISIONS: u32 = 8;
 
 /// Maximum consecutive 8-byte relocated pointer entries walked per `.rdata` vtable/callback table.
 const MAX_VTABLE_ENTRIES: usize = 1024;
+
+/// A table demoted by verification: `(site, table, (jump block, its successors before))`.
+type Demoted = (u64, JumpTable, Option<(u64, Vec<Edge>)>);
 
 /// Incoming intra-function edges of a block: how many, one of them, and every source block
 /// (`others` holds the sources beyond `from`).
@@ -143,56 +148,241 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
 /// [`discover`] with an explicit thread count (`0` and `1` run serially). The result does not
 /// depend on `threads`.
 pub fn discover_with_threads(image: &CodeImage<'_>, threads: usize) -> Analysis {
-    let mut state = Discovery::new(image, threads);
-    for &entry in &image.entry_points {
-        state.add_function(entry);
-    }
-    for &(owner, target) in &image.eh.resume_targets {
-        state.seed_resume_target(owner, target);
-    }
-    state.run();
-    loop {
-        while state.resolve_jump_tables()
-            || state.revise_jump_tables()
-            || state.requeue_changed_jumps()
-        {
-            state.run();
-        }
-        let late = state.add_late_resume_targets();
-        let seeded = state.seed_pointer_slots();
-        let vtables = state.seed_vtable_callbacks();
-        if !late && !seeded && !vtables {
-            break;
-        }
-        state.run();
-    }
-    state.verify_jump_tables();
-    let unresolved_jumps = state.classify_unresolved_jumps();
-    let pointer_slots = std::mem::take(&mut state.pointer_slots);
+    discover_timed(image, threads, &mut DiscoveryTimings::default())
+}
 
-    let blocks: Vec<&BasicBlock> = state.blocks.values().collect();
-    let mut relocations: Vec<Relocation> = par_map(threads, &blocks, |block| {
-        let mut out = Vec::new();
-        for instr in &block.instructions {
-            instruction_relocations(image, instr, &mut out);
-        }
-        out
-    })
-    .into_iter()
-    .flatten()
-    .collect();
-    let jump_tables = std::mem::take(&mut state.jump_tables);
-    for table in jump_tables.values() {
-        jump_table_relocations(image, table, &mut relocations);
+/// [`discover_with_threads`] that adds the wall time of each phase to `timings` (and this call's
+/// wall time to `timings.rounds`). The result does not depend on the timings.
+pub fn discover_timed(
+    image: &CodeImage<'_>,
+    threads: usize,
+    timings: &mut DiscoveryTimings,
+) -> Analysis {
+    let no_return = image.no_return.iter().copied().collect();
+    let mut session = Session::new(image, threads, &image.entry_points, no_return, timings);
+    let analysis = session.round(timings);
+    #[cfg(test)]
+    check_continued_rounds(image, threads, &analysis);
+    analysis
+}
+
+/// Unit tests check every discovery against continued sessions ([`Session::add_entries`]): the
+/// entries split in two (and all added to an empty session) must give the fresh result unless
+/// the continued round reports [`Session::diverged`].
+#[cfg(test)]
+fn check_continued_rounds(image: &CodeImage<'_>, threads: usize, fresh: &Analysis) {
+    let entries = &image.entry_points;
+    let mut splits = vec![0];
+    if entries.len() >= 2 {
+        splits.push(entries.len() / 2);
     }
-    let relocations = RelocationMap::from_entries(relocations);
-    let functions = state.into_functions();
-    Analysis {
-        functions,
-        relocations,
-        jump_tables,
-        unresolved_jumps,
-        pointer_slots,
+    for split in splits {
+        let mut t = DiscoveryTimings::default();
+        let no_return = image.no_return.iter().copied().collect();
+        let mut session = Session::new(image, threads, &entries[..split], no_return, &mut t);
+        let first = session.round(&mut t);
+        session.reclaim(first.clone());
+        let again = session.round(&mut t);
+        assert_eq!(first, again, "a reclaimed session's round is not repeatable");
+        session.reclaim(again);
+        session.add_entries(entries[split..].iter().copied());
+        let continued = session.round(&mut t);
+        if !session.diverged() {
+            assert_eq!(
+                &continued, fresh,
+                "continued discovery ({split} of {} entries first) differs from a fresh run",
+                entries.len()
+            );
+        }
+    }
+}
+
+/// Discovery state kept between the code-pointer refinement rounds of
+/// [`crate::pipeline::refine::discover_refined`]: a round adds a few hundred entries to a
+/// fixpoint over ~4M blocks, so instead of rediscovering everything the next round continues the
+/// previous round's fixpoint with the new entries ([`Self::add_entries`]).
+///
+/// [`Self::round`] moves the blocks into the analysis it returns; [`Self::reclaim`] takes them back
+/// (with the tail-call rewrites of the membership walk undone and the tables verification demoted
+/// restored), so the next round continues from the pre-verification fixpoint, the state a single
+/// run over the larger seed set passes through once it has decoded the old seeds.
+///
+/// The continued fixpoint equals a fresh run over all seeds when the rounds only add leaders,
+/// entries and tables (the fixpoint is then the least one over the seeds). A continued round
+/// records every event that is not of that kind ([`Self::diverged`]): a resolved table revised to
+/// one that drops targets or no longer matching, a retry or revision cap reached, a
+/// pointer-slot seed on a jump that later resolved as a table. The caller then starts a fresh
+/// session. New no-return functions also need a fresh session (they end blocks that are already
+/// decoded); the caller handles that.
+pub struct Session<'i, 'a> {
+    state: Discovery<'i, 'a>,
+}
+
+impl<'i, 'a> Session<'i, 'a> {
+    /// A session seeded with `entries` (instead of `image.entry_points`), `no_return` (instead of
+    /// `image.no_return`) and the EH resume targets of `image`.
+    pub fn new(
+        image: &'i CodeImage<'a>,
+        threads: usize,
+        entries: &[u64],
+        no_return: BTreeSet<u64>,
+        timings: &mut DiscoveryTimings,
+    ) -> Self {
+        let mut state = Discovery::new(image, threads);
+        state.no_return = no_return;
+        timings.time(Phase::Seed, || {
+            for &entry in entries {
+                state.add_function(entry);
+            }
+            for &(owner, target) in &image.eh.resume_targets {
+                state.seed_resume_target(owner, target);
+            }
+        });
+        Self { state }
+    }
+
+    /// Adds function entries for the next [`Self::round`] (after [`Self::reclaim`]).
+    ///
+    /// A fresh run knows these entries when it first matches a jump. An unresolved jump whose
+    /// leaf extent ([`Discovery::leaf_extent`], the neighbouring entries) they change is
+    /// therefore matched again (its slice shape alone would not show the change).
+    pub fn add_entries(&mut self, entries: impl IntoIterator<Item = u64>) {
+        assert!(self.state.reclaimed.is_none(), "add_entries before reclaim");
+        let state = &mut self.state;
+        state.warm = true;
+        let failed: Vec<(u64, Option<(u64, u64)>)> = state
+            .failed_jumps
+            .keys()
+            .filter(|site| !state.jump_tables.contains_key(site))
+            .map(|&site| (site, state.leaf_extent(site)))
+            .collect();
+        for entry in entries {
+            state.add_function(entry);
+        }
+        for (site, leaf) in failed {
+            if state.leaf_extent(site) != leaf {
+                state.pending_jumps.insert(site);
+            }
+        }
+    }
+
+    /// Adds no-return functions for the next [`Self::round`] when that cannot change anything
+    /// decoded so far: `no_return` is only read at direct calls, so this holds when no decoded
+    /// block calls one of `thunks` directly. Returns `false` (and changes nothing) otherwise; the
+    /// session must then not be continued.
+    pub fn add_no_return(&mut self, thunks: &BTreeSet<u64>) -> bool {
+        assert!(self.state.reclaimed.is_none(), "add_no_return before reclaim");
+        let called = self.state.blocks.values().any(|block| {
+            block
+                .calls
+                .iter()
+                .any(|call| matches!(call.target, CallTarget::Direct(t) if thunks.contains(&t)))
+        });
+        if called {
+            return false;
+        }
+        self.state.no_return.extend(thunks.iter().copied());
+        true
+    }
+
+    /// Whether a continued round hit an event after which its result may differ from a fresh
+    /// run (see the type docs). The session must not be continued then.
+    pub fn diverged(&self) -> bool {
+        self.state.diverged
+    }
+
+    /// Runs the fixpoint to completion and returns its analysis. The blocks move into the
+    /// analysis: hand it back with [`Self::reclaim`] to continue the session.
+    pub fn round(&mut self, timings: &mut DiscoveryTimings) -> Analysis {
+        assert!(self.state.reclaimed.is_none(), "round before reclaim");
+        let round_start = std::time::Instant::now();
+        let t = timings;
+        let state = &mut self.state;
+        let threads = state.threads;
+        let image = state.image;
+        t.time(Phase::Decode, || state.run());
+        loop {
+            while t.time(Phase::ResolveJumpTables, || state.resolve_jump_tables())
+                || t.time(Phase::ReviseJumpTables, || state.revise_jump_tables())
+                || t.time(Phase::RequeueChangedJumps, || state.requeue_changed_jumps())
+            {
+                t.time(Phase::Decode, || state.run());
+            }
+            let late = t.time(Phase::LateResumeTargets, || state.add_late_resume_targets());
+            let seeded = t.time(Phase::PointerSlots, || state.seed_pointer_slots());
+            let vtables = t.time(Phase::VtableCallbacks, || state.seed_vtable_callbacks());
+            if !late && !seeded && !vtables {
+                break;
+            }
+            t.time(Phase::Decode, || state.run());
+        }
+        if state.warm
+            && state
+                .jump_tables
+                .keys()
+                .any(|site| state.pointer_slots.contains_key(site))
+        {
+            state.diverged = true;
+        }
+        let demoted = t.time(Phase::VerifyJumpTables, || state.verify_jump_tables());
+        let unresolved_jumps =
+            t.time(Phase::ClassifyUnresolved, || state.classify_unresolved_jumps());
+        let pointer_slots = std::mem::take(&mut state.pointer_slots);
+
+        let relocations = t.time(Phase::Relocations, || {
+            let blocks: Vec<&BasicBlock> = state.blocks.values().collect();
+            let mut relocations: Vec<Relocation> = par_map(threads, &blocks, |block| {
+                let mut out = Vec::new();
+                for instr in &block.instructions {
+                    instruction_relocations(image, instr, &mut out);
+                }
+                out
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+            for table in state.jump_tables.values() {
+                jump_table_relocations(image, table, &mut relocations);
+            }
+            RelocationMap::from_entries(relocations)
+        });
+        let jump_tables = std::mem::take(&mut state.jump_tables);
+        let functions = t.time(Phase::Functions, || state.functions());
+        state.reclaimed = Some(demoted);
+        t.rounds.push(round_start.elapsed());
+        Analysis {
+            functions,
+            relocations,
+            jump_tables,
+            unresolved_jumps,
+            pointer_slots,
+        }
+    }
+}
+
+impl Session<'_, '_> {
+    /// Takes back the analysis of the last [`Self::round`] so the session can continue: its
+    /// blocks, jump tables and pointer slots return to the state, the membership walk's tail-call
+    /// rewrites are undone and the tables verification demoted are restored.
+    pub fn reclaim(&mut self, analysis: Analysis) {
+        let state = &mut self.state;
+        let demoted = state.reclaimed.take().expect("reclaim after round");
+        let rewritten = std::mem::take(&mut state.rewritten);
+        for function in analysis.functions.into_values() {
+            for (start, mut block) in function.blocks {
+                if state.blocks.contains_key(&start) {
+                    continue;
+                }
+                if let Some(successors) = rewritten.get(&start) {
+                    block.successors.clone_from(successors);
+                }
+                state.blocks.insert(start, block);
+            }
+        }
+        state.jump_tables = analysis.jump_tables;
+        state.pointer_slots = analysis.pointer_slots;
+        state.check_preds();
+        state.restore_demoted(demoted);
     }
 }
 
@@ -355,6 +545,17 @@ struct Discovery<'i, 'a> {
     scanned_data_refs: BTreeSet<u64>,
     /// `(block.start, block.end)` snapshots already scanned for RIP-relative vtable/callback refs.
     vtable_scanned_blocks: BTreeSet<(u64, u64)>,
+    /// The state is continued from an earlier round ([`Session::add_entries`]).
+    warm: bool,
+    /// A continued round hit an event that a fresh run may order differently
+    /// ([`Session::diverged`]).
+    diverged: bool,
+    /// Successors of the blocks whose intra-function edges [`Self::functions`] rewrote to tail
+    /// calls, before the rewrite ([`Session::reclaim`]).
+    rewritten: BTreeMap<u64, Vec<Edge>>,
+    /// Set by [`Session::round`] (the blocks are in the analysis) until [`Session::reclaim`]:
+    /// the tables verification demoted.
+    reclaimed: Option<Vec<Demoted>>,
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
@@ -382,6 +583,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
             slot_checked: BTreeSet::new(),
             scanned_data_refs: BTreeSet::new(),
             vtable_scanned_blocks: BTreeSet::new(),
+            warm: false,
+            diverged: false,
+            rewritten: BTreeMap::new(),
+            reclaimed: None,
         }
     }
 
@@ -518,8 +723,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
             match self.locate(va) {
                 Decoded::Boundary { start, index } => self.split(start, index),
-                // `va` is inside an instruction: decode a second, overlapping stream.
-                Decoded::InsideInstruction => self.decode_block(va, true),
+                // `va` is inside an instruction: decode a second, overlapping stream. A fresh run
+                // may have known the leader when it decoded the containing block (which then
+                // carries an overlap diagnostic): a continued round cannot tell.
+                Decoded::InsideInstruction => {
+                    self.diverged |= self.warm;
+                    self.decode_block(va, true)
+                }
                 Decoded::No => self.decode_block(va, false),
             }
         }
@@ -708,7 +918,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 && leader > ip
                 && leader < next
             {
-                // This instruction straddles a known leader: keep decoding this stream.
+                // This instruction straddles a known leader: keep decoding this stream. Which of
+                // two overlapping streams is decoded first decides where the diagnostics go, and a
+                // continued round decodes in a different order than a fresh run.
+                self.diverged |= self.warm;
                 block.diagnostics.push(Diagnostic {
                     site: ip,
                     address: leader,
@@ -1405,6 +1618,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
         for &site in &changed {
             let retries = self.jump_retries.entry(site).or_insert(0);
             *retries = retries.saturating_add(1);
+            if self.warm && *retries >= MAX_TABLE_REVISIONS {
+                self.diverged = true;
+            }
             self.pending_jumps.insert(site);
         }
         !changed.is_empty()
@@ -1427,17 +1643,34 @@ impl<'i, 'a> Discovery<'i, 'a> {
             })
             .collect();
         let bases = self.table_bases();
-        let changed: Vec<JumpTable> = par_map(self.threads, &candidates, |&(site, table)| {
-            let now = self.match_jump_table(*site, preds, &bases)?;
-            (now != *table).then_some(now)
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+        let warm = self.warm;
+        let revised: Vec<(Option<JumpTable>, bool)> =
+            par_map(self.threads, &candidates, |&(site, table)| {
+                let Some(now) = self.match_jump_table(*site, preds, &bases) else {
+                    // A continued round may have voided a table a fresh run never resolves.
+                    return (None, warm);
+                };
+                if now == *table {
+                    return (None, false);
+                }
+                let drops = warm && {
+                    let targets: BTreeSet<u64> = now.all_targets().collect();
+                    table.all_targets().any(|t| !targets.contains(&t))
+                };
+                (Some(now), drops)
+            });
+        let mut changed = Vec::new();
+        for (table, drops) in revised {
+            self.diverged |= drops;
+            changed.extend(table);
+        }
         let progress = !changed.is_empty();
         for table in changed {
             let revisions = self.table_revisions.entry(table.site).or_insert(0);
             *revisions = revisions.saturating_add(1);
+            if self.warm && *revisions >= MAX_TABLE_REVISIONS {
+                self.diverged = true;
+            }
             if let Some(start) = self.jump_block(table.site) {
                 let targets: BTreeSet<u64> = table.all_targets().collect();
                 self.set_successors(start, targets.into_iter().map(Edge::JumpTable).collect());
@@ -1458,7 +1691,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// Demote resolutions that no longer hold in the final CFG (e.g. the dispatch block gained a
     /// second predecessor), until the remaining set is stable.
-    fn verify_jump_tables(&mut self) {
+    ///
+    /// Returns what was demoted, in order (`(site, table, jump block and its successors)`), for
+    /// [`Self::restore_demoted`].
+    fn verify_jump_tables(&mut self) -> Vec<Demoted> {
+        let mut demoted = Vec::new();
         loop {
             self.check_preds();
             let preds = &self.preds;
@@ -1472,19 +1709,36 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .flatten()
             .collect();
             if stale.is_empty() {
-                return;
+                return demoted;
             }
             for site in stale {
-                self.jump_tables.remove(&site);
-                if let Some(start) = self.jump_block(site) {
+                let table = self.jump_tables.remove(&site);
+                let block = self.jump_block(site).and_then(|start| {
+                    let before = self.blocks.get(&start)?.successors.clone();
                     self.set_successors(start, vec![Edge::IndirectJump { slot: None }]);
+                    Some((start, before))
+                });
+                if let Some(table) = table {
+                    demoted.push((site, table, block));
                 }
             }
         }
     }
 
+    /// Undoes [`Self::verify_jump_tables`]: the state is the pre-verification fixpoint again.
+    fn restore_demoted(&mut self, demoted: Vec<Demoted>) {
+        for (site, table, block) in demoted.into_iter().rev() {
+            if let Some((start, successors)) = block {
+                self.set_successors(start, successors);
+            }
+            self.jump_tables.insert(site, table);
+        }
+    }
+
     /// Phase 2: assign blocks to functions and classify tail calls.
-    fn into_functions(mut self) -> BTreeMap<u64, Function> {
+    /// Each block moves into its last owner (the others get copies). Blocks no function reaches
+    /// stay in the block map, and [`Self::preds`] is left as it was, for [`Session::reclaim`].
+    fn functions(&mut self) -> BTreeMap<u64, Function> {
         let entries: Vec<u64> = self.entries.iter().copied().collect();
         let mut roots: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         // A target that became another function's entry after it was recorded is that
@@ -1548,12 +1802,20 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 let Some(mut block) = block else {
                     continue;
                 };
-                for edge in &mut block.successors {
-                    if let Some(target) = edge.intra_target()
-                        && target != entry
-                        && self.entries.contains(&target)
-                    {
-                        *edge = Edge::TailCall(target);
+                let tail_call = |edge: &Edge| {
+                    edge.intra_target()
+                        .is_some_and(|target| target != entry && self.entries.contains(&target))
+                };
+                if block.successors.iter().any(tail_call) {
+                    self.rewritten
+                        .entry(va)
+                        .or_insert_with(|| block.successors.clone());
+                    for edge in &mut block.successors {
+                        if tail_call(edge)
+                            && let Some(target) = edge.intra_target()
+                        {
+                            *edge = Edge::TailCall(target);
+                        }
                     }
                 }
                 for call in &block.calls {

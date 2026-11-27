@@ -54,7 +54,7 @@ use crate::cfg::{
     JumpTableIndex, Terminator, UnresolvedJump,
 };
 use crate::code_image::{CodeImage, Region};
-use crate::discover::Analysis;
+use crate::discover::{Analysis, DiscoveryTimings};
 use crate::image::GuestImage;
 use crate::reloc::{RelocKind, Relocation, RelocationMap};
 
@@ -66,6 +66,8 @@ const FORMAT: u32 = 1;
 const MAGIC: &[u8; 8] = b"PG6DISC\0";
 const HEADER_LEN: usize = 8 + 4 + 16 + 8 + 8;
 const EXT: &str = "disc";
+/// Extension of an entry's metadata file ([`DiscoveryCache::stored_timings`]).
+const META_EXT: &str = "disc-meta.json";
 
 /// Entries kept per module after a store (newest first by modification time).
 pub const KEEP_PER_MODULE: usize = 3;
@@ -167,15 +169,30 @@ impl DiscoveryCache {
         self.dir.join(format!("{}-{key:032x}.{EXT}", self.module))
     }
 
+    /// Path of the metadata next to the entry under `key`: the [`DiscoveryTimings::to_json`] of
+    /// the run that computed it (diagnostic only, never part of the entry or its check).
+    fn meta_path(&self, key: u128) -> PathBuf {
+        self.dir.join(format!("{}-{key:032x}.{META_EXT}", self.module))
+    }
+
+    /// The stored timings of the run that computed the entry under `key`, if recorded.
+    pub fn stored_timings(&self, key: u128) -> Option<String> {
+        let text = fs::read_to_string(self.meta_path(key)).ok()?;
+        let text = text.trim();
+        (text.starts_with('{') && text.ends_with('}')).then(|| text.to_string())
+    }
+
     /// [`refine::discover_refined`] on `image` through the cache under `key`: on a hit the
     /// stored result is applied to `image` (entry points, no-return slots) and returned without
     /// running discovery. Store failures are ignored (the cache never changes the outputs); a
-    /// verification difference is an error.
+    /// verification difference is an error. A computed run adds its phase times to `timings`
+    /// and stores them as the entry's metadata ([`Self::stored_timings`]).
     pub fn discover_refined(
         &self,
         key: u128,
         image: &mut CodeImage<'_>,
         guest: &GuestImage<'_>,
+        timings: &mut DiscoveryTimings,
     ) -> Result<(Analysis, CodePointerOutcome, Outcome), String> {
         let path = self.path(key);
         if !self.verify
@@ -191,7 +208,10 @@ impl DiscoveryCache {
         } else {
             None
         };
-        let (analysis, code_pointers) = refine::discover_refined(image, guest);
+        let mut run = DiscoveryTimings::default();
+        let (analysis, code_pointers) =
+            refine::discover_refined_timed(image, guest, refine::MAX_ROUNDS, &mut run);
+        timings.merge(&run);
         let fresh = Discovered {
             analysis,
             code_pointers,
@@ -217,7 +237,9 @@ impl DiscoveryCache {
             }
         }
         if stored.is_none() {
-            let _ = self.store(key, &payload);
+            if self.store(key, &payload).is_ok() {
+                let _ = fs::write(self.meta_path(key), run.to_json());
+            }
         } else {
             touch(&path);
         }
@@ -273,6 +295,7 @@ impl DiscoveryCache {
             .filter(|(_, p)| p != current)
             .skip(KEEP_PER_MODULE.saturating_sub(1))
         {
+            let _ = fs::remove_file(path.with_extension(META_EXT));
             let _ = fs::remove_file(path);
         }
     }

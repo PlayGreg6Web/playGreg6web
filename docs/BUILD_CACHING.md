@@ -154,7 +154,11 @@ Instructions are stored as lengths and decoded again from the image bytes on loa
 threads (a decode that does not reproduce a stored length is a miss). The header carries the key,
 the payload length and an FNV-1a 64 of the payload; a truncated or damaged entry is a miss.
 Writes go through a temporary and a rename; the newest 3 entries per module are kept (a hit
-touches its entry). The game executable's entry is 126 MB.
+touches its entry). The game executable's entry is 126 MB. Next to each entry,
+`<module>-<key>.disc-meta.json` records the wall time of every discovery phase of the run that
+computed it (diagnostic only, not part of the key or the check; trimmed with its entry).
+`build-program --timings` prints those phase times per module: measured on a miss or without a
+cache, the stored ones on a hit.
 
 `--verify-discovery-cache` runs discovery anyway, compares it with the stored entry (every field,
 every instruction with `eq_all_bits`, since `Instruction`'s `PartialEq` ignores IP and length) and

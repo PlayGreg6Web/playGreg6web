@@ -16,12 +16,13 @@
 //!    the IAT slots of the import bridge plan.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic};
 
 use crate::cfg::{BasicBlock, Edge, Terminator};
 use crate::code_image::{CodeImage, Region};
-use crate::discover::{Analysis, discover};
+use crate::discover::{Analysis, DiscoveryTimings, Phase, Session, default_threads};
 use crate::image::{BaseRelocKind, GuestImage};
 use crate::pe::{ImportedSymbol, Pe64};
 use crate::reloc::{RelocKind, RelocationMap};
@@ -671,12 +672,49 @@ pub fn discover_refined_with_max_rounds(
     guest: &GuestImage<'_>,
     max_rounds: usize,
 ) -> (Analysis, CodePointerOutcome) {
+    discover_refined_timed(image, guest, max_rounds, &mut DiscoveryTimings::default())
+}
+
+/// [`discover_refined_with_max_rounds`] that adds the wall time of every discovery round and
+/// refinement step to `timings` (diagnostic only; the result does not depend on it).
+pub fn discover_refined_timed(
+    image: &mut CodeImage<'_>,
+    guest: &GuestImage<'_>,
+    max_rounds: usize,
+    timings: &mut DiscoveryTimings,
+) -> (Analysis, CodePointerOutcome) {
+    discover_refined_rounds(image, guest, max_rounds, true, timings)
+}
+
+/// [`discover_refined_timed`], choosing whether a round continues the previous round's
+/// discovery state ([`Session`], `continue_rounds`) or rediscovers everything from the grown seed
+/// set (the reference behaviour; both give the same result).
+pub fn discover_refined_rounds(
+    image: &mut CodeImage<'_>,
+    guest: &GuestImage<'_>,
+    max_rounds: usize,
+    continue_rounds: bool,
+    timings: &mut DiscoveryTimings,
+) -> (Analysis, CodePointerOutcome) {
+    let stage_start = Instant::now();
+    let result = refined_rounds(image, guest, max_rounds, continue_rounds, timings);
+    timings.total += stage_start.elapsed();
+    result
+}
+
+fn refined_rounds(
+    image: &mut CodeImage<'_>,
+    guest: &GuestImage<'_>,
+    max_rounds: usize,
+    continue_rounds: bool,
+    timings: &mut DiscoveryTimings,
+) -> (Analysis, CodePointerOutcome) {
     let mut known_entries: BTreeSet<u64> = image.entry_points.iter().copied().collect();
     let mut known_no_return: BTreeSet<u64> = image.no_return.iter().copied().collect();
     image.entry_points = known_entries.iter().copied().collect();
     image.no_return = known_no_return.iter().copied().collect();
 
-    let relocated = base_reloc_pointers(image, guest);
+    let relocated = timings.time(Phase::RefineBaseRelocs, || base_reloc_pointers(image, guest));
     let empty_graph =
         known_entries.is_empty() && image.eh.resume_targets.is_empty() && relocated.is_empty();
     if empty_graph || max_rounds == 0 {
@@ -698,8 +736,31 @@ pub fn discover_refined_with_max_rounds(
 
     let mut added = BTreeSet::new();
     let mut thunks = BTreeSet::new();
+    let img: &CodeImage<'_> = image;
+    let threads = default_threads();
+    let mut session: Option<Session<'_, '_>> = None;
+    let mut result = None;
     for rounds in 1..=max_rounds {
-        let analysis = discover(image);
+        let last = rounds == max_rounds;
+        let state = match session.as_mut() {
+            Some(state) => {
+                timings.continued_rounds += 1;
+                state
+            }
+            None => {
+                let entries: Vec<u64> = known_entries.iter().copied().collect();
+                session.insert(Session::new(
+                    img,
+                    threads,
+                    &entries,
+                    known_no_return.clone(),
+                    timings,
+                ))
+            }
+        };
+        let analysis = state.round(timings);
+        let diverged = state.diverged();
+        let classify_start = Instant::now();
         let mut candidates: BTreeMap<u64, BTreeSet<PointerSource>> = BTreeMap::new();
         for va in lea_pointers(&analysis) {
             candidates.entry(va).or_default().insert(PointerSource::Lea);
@@ -710,7 +771,7 @@ pub fn discover_refined_with_max_rounds(
                 .or_default()
                 .insert(PointerSource::BaseReloc);
         }
-        let pointers = classify(image, &analysis, &candidates, &added);
+        let pointers = classify(img, &analysis, &candidates, &added);
         let new_entries: BTreeSet<u64> = pointers
             .iter()
             .filter(|p| {
@@ -722,24 +783,42 @@ pub fn discover_refined_with_max_rounds(
             .map(|p| p.va)
             .collect();
         let new_thunks = no_return_thunks(&analysis, &known_no_return);
+        timings.add(Phase::RefineClassify, classify_start.elapsed());
         let converged = new_entries.is_empty() && new_thunks.is_empty();
-        if converged || rounds == max_rounds {
+        if converged || last {
             let outcome = CodePointerOutcome {
                 rounds,
                 round_limit_hit: !converged,
-                no_return_thunks: thunks.into_iter().collect(),
+                no_return_thunks: thunks.iter().copied().collect(),
                 pointers,
             };
-            return (analysis, outcome);
+            result = Some((analysis, outcome));
+            break;
+        }
+        // A new no-return function that decoded code calls ends blocks that are already decoded:
+        // start over then.
+        let keep = continue_rounds
+            && !diverged
+            && session.as_mut().is_some_and(|state| {
+                state.reclaim(analysis);
+                new_thunks.is_empty() || state.add_no_return(&new_thunks)
+            });
+        if diverged {
+            timings.diverged_rounds += 1;
+        }
+        match session.as_mut() {
+            Some(state) if keep => state.add_entries(new_entries.iter().copied()),
+            _ => session = None,
         }
         added.extend(new_entries.iter().copied());
         known_entries.extend(new_entries.iter().copied());
-        image.entry_points = known_entries.iter().copied().collect();
         thunks.extend(new_thunks.iter().copied());
         known_no_return.extend(new_thunks.iter().copied());
-        image.no_return = known_no_return.iter().copied().collect();
     }
-    unreachable!("max_rounds >= 1 returns on the final iteration");
+    drop(session);
+    image.entry_points = known_entries.into_iter().collect();
+    image.no_return = known_no_return.into_iter().collect();
+    result.expect("max_rounds >= 1 returns on the final iteration")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1063,6 +1142,51 @@ mod probe_tests {
         assert_eq!(final_entries, vec![f0, f1, f2, vt0, vt1, thunk1, thunk2]);
         assert_eq!(final_no_return, vec![thunk1, thunk2, exit_slot]);
         assert_eq!(analysis.functions.len(), 7);
+    }
+
+    #[test]
+    fn continued_rounds_match_fresh_rounds() {
+        // A lea chain f_0 -> f_1 -> ... -> f_9 where each link also calls into the middle of the
+        // previous function (the next round splits an already decoded block) and the last one
+        // jumps into the first (a tail call into an existing entry): one link per round.
+        let n = 10usize;
+        let mut code = Vec::new();
+        for i in 0..n {
+            let at = TEXT + (i * 16) as u64;
+            let next = TEXT + (((i + 1) % n) * 16) as u64;
+            // lea rax, [rip+next]
+            let disp = i32::try_from(next as i64 - (at as i64 + 7)).unwrap();
+            code.extend_from_slice(&[0x48, 0x8d, 0x05]);
+            code.extend_from_slice(&disp.to_le_bytes());
+            if i + 1 < n {
+                // call into the previous link's middle (or own middle for f_0): at + 7 of it
+                let callee = TEXT + (i.saturating_sub(1) * 16) as u64 + 7;
+                let disp = i32::try_from(callee as i64 - (at as i64 + 12)).unwrap();
+                code.push(0xe8);
+                code.extend_from_slice(&disp.to_le_bytes());
+            } else {
+                emit_jmp_rel(&mut code, TEXT, TEXT);
+            }
+            code.push(0xc3);
+            code.resize((i + 1) * 16, 0xcc);
+        }
+        let guest = empty_guest(BASE);
+        let run = |continued: bool| {
+            let mut image =
+                CodeImage::new(BASE, vec![CodeSection::new(TEXT, &code, true)], vec![TEXT]);
+            let mut timings = DiscoveryTimings::default();
+            let (analysis, outcome) =
+                discover_refined_rounds(&mut image, &guest, MAX_ROUNDS, continued, &mut timings);
+            (analysis, outcome, image.entry_points, image.no_return, timings)
+        };
+        let (a, ao, ae, an, at) = run(true);
+        let (b, bo, be, bn, bt) = run(false);
+        assert_eq!((&a, &ao, &ae, &an), (&b, &bo, &be, &bn));
+        assert!(ao.rounds >= 3, "{}", ao.rounds);
+        assert_eq!(at.continued_rounds, ao.rounds - 1);
+        assert_eq!(at.diverged_rounds, 0);
+        assert_eq!(at.rounds.len(), ao.rounds);
+        assert_eq!(bt.continued_rounds, 0);
     }
 
     #[test]

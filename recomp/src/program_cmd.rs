@@ -44,6 +44,8 @@ pub struct ProgramArgs {
     pub discovery_cache: Option<Option<PathBuf>>,
     /// `--verify-discovery-cache`.
     pub verify_discovery_cache: bool,
+    /// `--timings`: print the wall time of every discovery phase.
+    pub timings: bool,
 }
 
 impl ProgramArgs {
@@ -56,7 +58,7 @@ impl ProgramArgs {
     }
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>] [--lift-cache <dir>] [--discovery-cache <dir>|off] [--verify-discovery-cache]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>] [--lift-cache <dir>] [--discovery-cache <dir>|off] [--verify-discovery-cache] [--timings]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
@@ -75,6 +77,7 @@ pub const OPTIONS: &[&str] = &[
     "  --lift-cache <dir>     build-program: reuse lifted shards whose functions, flag summaries and lifter version are unchanged (content-keyed, outside git; see docs/BUILD_CACHING.md)",
     "  --discovery-cache <dir>|off build-program: skip discovery for a module whose input bytes, seeds and discovery sources are unchanged (default <lift cache>/discovery with --lift-cache; see docs/BUILD_CACHING.md)",
     "  --verify-discovery-cache build-program: run discovery anyway and fail if the discovery cache entry differs from it",
+    "  --timings              build-program: print the wall time of every discovery phase per module (for a discovery cache hit, the times stored with the entry)",
     "  --address-pool <lo>-<hi> build-program: hex range every module image must lie in (default 0x100000000-0x400000000)",
 ];
 
@@ -105,6 +108,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         lift_cache: None,
         discovery_cache: None,
         verify_discovery_cache: false,
+        timings: false,
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -190,6 +194,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
                 });
             }
             "--verify-discovery-cache" => parsed.verify_discovery_cache = true,
+            "--timings" => parsed.timings = true,
             "--seed-report" => {
                 i += 1;
                 parsed.seed_report = Some(PathBuf::from(value(i, flag, "<file>")?));
@@ -326,12 +331,20 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
     build.lift_cache = args.lift_cache.clone();
     build.discovery_cache = args.discovery_cache_dir();
     build.verify_discovery_cache = args.verify_discovery_cache;
+    build.discovery_timings = args.timings;
     if build.verify_discovery_cache && build.discovery_cache.is_none() {
         return Err("--verify-discovery-cache needs a discovery cache (--discovery-cache or --lift-cache)".into());
     }
     let start = Instant::now();
     let report = program::build_program(&options, &mut |module, stage| {
         let module = if module.is_empty() { "program" } else { module };
+        if let Some(timings) = stage.strip_prefix("discovery timings: ") {
+            eprintln!(
+                "[{:>9.2}s] {module}: discovery timings: {timings}",
+                start.elapsed().as_secs_f64()
+            );
+            return;
+        }
         eprintln!(
             "[{:>9.2}s] {module}: {stage} done",
             start.elapsed().as_secs_f64()

@@ -2270,6 +2270,65 @@ fn discovery_cache_keeps_the_newest_entries_per_module() {
         discovery_entries(&cache).len(),
         discovery_cache::KEEP_PER_MODULE
     );
+    // Each kept entry keeps its metadata; trimmed entries take theirs along.
+    let meta: Vec<PathBuf> = fs::read_dir(&cache)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    let meta: Vec<&PathBuf> = meta
+        .iter()
+        .filter(|p| p.to_string_lossy().ends_with(".disc-meta.json"))
+        .collect();
+    assert_eq!(meta.len(), discovery_cache::KEEP_PER_MODULE);
+}
+
+/// `discovery_timings` reports each discovery run's phase times through the progress callback,
+/// stores them with a discovery cache entry and reports the stored ones on a hit; it never
+/// changes the outputs.
+#[test]
+fn discovery_timings_are_reported_and_stored_with_the_cache_entry() {
+    let tmp = TempDir::new("discovery_timings");
+    let cache = tmp.path().join("discovery");
+    let (pe, _) = basic_fixture(true);
+    let lines = |options: &PipelineOptions| {
+        let mut lines = Vec::new();
+        run_with_progress(options, &mut |stage| {
+            if let Some(line) = stage.strip_prefix("discovery timings: ") {
+                lines.push(line.to_string());
+            }
+        })
+        .expect("build succeeds");
+        lines
+    };
+
+    let mut plain = options_for(tmp.path(), &pe);
+    plain.out_dir = tmp.path().join("plain");
+    assert!(lines(&plain).is_empty());
+    let expected = read_tree(&plain.module_dir());
+
+    let mut timed = options_for(tmp.path(), &pe);
+    timed.out_dir = tmp.path().join("timed");
+    timed.discovery_timings = true;
+    let uncached = lines(&timed);
+    assert_eq!(uncached.len(), 1);
+    assert!(uncached[0].contains(" s total"), "{}", uncached[0]);
+    assert!(uncached[0].contains("decode"), "{}", uncached[0]);
+    assert_eq!(read_tree(&timed.module_dir()), expected);
+
+    timed.discovery_cache = Some(cache.clone());
+    let miss = lines(&timed);
+    assert_eq!(miss.len(), 1);
+    assert!(miss[0].contains("rounds (s)"), "{}", miss[0]);
+    let entry = discovery_entries(&cache);
+    assert_eq!(entry.len(), 1);
+    let meta = fs::read_to_string(entry[0].with_extension("disc-meta.json")).expect("metadata");
+    assert!(meta.starts_with("{\"total_s\":"), "{meta}");
+    assert!(meta.contains("\"decode\":{\"calls\":"), "{meta}");
+
+    let hit = lines(&timed);
+    assert_eq!(hit, [format!("cache hit, stored with the entry: {meta}")]);
+    assert_eq!(read_tree(&timed.module_dir()), expected);
+    fs::remove_file(entry[0].with_extension("disc-meta.json")).expect("remove metadata");
+    assert_eq!(lines(&timed), ["cache hit, no stored timings"]);
 }
 
 #[test]
