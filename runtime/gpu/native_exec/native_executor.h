@@ -254,6 +254,8 @@ struct ExecutorStats {
     uint64_t async_pipeline_wait_ns = 0;
     uint64_t pipeline_pending_skips = 0;   // draws / dispatches skipped: the pipeline was still compiling past the budget
     uint64_t remap_reflected_layouts = 0;  // v2 remap pipelines built with an explicit reflection layout (no wait for the compiled pipeline)
+    uint64_t pipeline_failed_skips = 0;  // draws / dispatches dropped because their async pipeline failed to compile
+    uint64_t write_masks_cleared = 0;  // color targets the fragment stage does not write: writeMask forced to 0
     uint64_t async_pipeline_failures = 0;  // creation failed: the pipeline became an error object
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors

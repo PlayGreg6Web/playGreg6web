@@ -2435,6 +2435,63 @@ void test_stencil_twin(NativeExecutor& ex) {
     ex.attach_guest_memory(GuestMemory{});
 }
 
+// Two writable storage bindings that fall back to dummies must not alias one texture (Dawn:
+// "writable storage texture used twice"), and a color target the fragment stage never writes gets
+// writeMask 0 instead of failing the pipeline.
+void test_dawn_validation_fixes(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    GpuBindGroupLayoutEntry a = layout_entry(2, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                                             static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly), 2);
+    a.storage_format = 22;  // rgba8unorm
+    GpuBindGroupLayoutEntry b = a;
+    b.binding = 3;
+    create_layouts(setup, 900, 901, {a, b});
+    setup.create_shader_module(902, GpuShaderStage::Compute,
+                               "@group(0) @binding(2) var d0: texture_storage_2d<rgba8unorm, write>;\n"
+                               "@group(0) @binding(3) var d1: texture_storage_2d<rgba8unorm, write>;\n"
+                               "@compute @workgroup_size(1) fn cs_main() {\n"
+                               "  textureStore(d0, vec2<u32>(0u, 0u), vec4f(1.0));\n"
+                               "  textureStore(d1, vec2<u32>(0u, 0u), vec4f(1.0));\n}\n");
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 903;
+    cp.cs_module_id = 902;
+    cp.pipeline_layout_id = 901;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 904, 900,
+                      {bg_entry(2, GpuBindResourceType::TextureView, 0), bg_entry(3, GpuBindResourceType::TextureView, 0)});
+    run(ex, setup);
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(903);
+    set_bind_group2(frame, 0, 904);
+    frame.dispatch_compute(1, 1, 1);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    CHECK(ex.stats().device_errors == before.device_errors);
+
+    // Two color targets, the fragment writes only @location(0): target 1 keeps writeMask 15 in the key.
+    gpu::CommandEncoder pl;
+    pl.create_shader_module(910, GpuShaderStage::Vertex,
+                            "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {"
+                            " var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));"
+                            " return vec4f(p[i], 0.0, 1.0); }\n");
+    pl.create_shader_module(911, GpuShaderStage::Fragment,
+                            "struct Out { @location(0) c: vec4f }\n"
+                            "@fragment fn fs_main() -> Out { var o: Out; o.c = vec4f(1.0); return o; }\n");
+    GpuCreateRenderPipeline2Payload rp = pipeline_to_bgra(912, 910, 911, 0);
+    rp.key.color_target_count = 2;
+    rp.key.color_targets[1].format = 22;
+    rp.key.color_targets[1].write_mask = 15;
+    emit(pl, GpuOpcode::CreateRenderPipeline2, bytes_of(rp));
+    run(ex, pl);
+    ex.wait_idle();
+    CHECK(ex.stats().device_errors == before.device_errors);
+    CHECK(ex.stats().write_masks_cleared == before.write_masks_cleared + 1);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -2479,6 +2536,7 @@ int main() {
     test_async_pipelines_and_blob_cache();
     test_remap_reflected_layout(true);
     test_remap_reflected_layout(false);
+    test_dawn_validation_fixes(*ex);
     test_screenshot();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

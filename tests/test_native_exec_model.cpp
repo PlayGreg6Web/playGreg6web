@@ -10,6 +10,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/native_exec/blit_model.h"
+#include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/pipe_budget_model.h"
@@ -1050,6 +1051,16 @@ void test_pipe_wait_budget() {
     CHECK(b.allowance(true) == kPipeWaitUnlimited);
 }
 
+void test_fragment_outputs() {
+    CHECK(wgsl_fragment_output_mask("@fragment fn fs_main() -> @location(0) vec4f { return vec4f(); }", "fs_main") == 1u);
+    CHECK(wgsl_fragment_output_mask("struct O { @location(0) a: vec4f, @location(2) b: vec4f }\n"
+                                    "@fragment fn fs_main() -> O { var o: O; return o; }", "fs_main") == 5u);
+    CHECK(wgsl_fragment_output_mask("@fragment fn fs_main() {}", "fs_main") == 0u);
+    CHECK(!wgsl_fragment_output_mask("@fragment fn fs_main() -> Unknown { }", "fs_main").has_value());
+    CHECK(wgsl_fragment_output_mask("@fragment fn a() -> @location(1) vec4f { return vec4f(); }\n"
+                                    "@fragment fn b() -> @location(3) vec4f { return vec4f(); }", "b") == 8u);
+}
+
 int main() {
     test_present_model();
     test_shader_payloads();
@@ -1073,6 +1084,7 @@ int main() {
     test_show_target_model();
     test_pipe_wait_budget();
     test_remap_bindings_match();
+    test_fragment_outputs();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

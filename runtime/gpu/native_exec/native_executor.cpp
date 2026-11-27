@@ -34,6 +34,7 @@
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
+#include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/m2_model.h"
@@ -318,6 +319,8 @@ struct AsyncSlot {
     mutable std::shared_ptr<PendingPipe> pending;  // null: created synchronously / already resolved
     mutable wgpu::Future future;
     bool fullscreen = false;  // vertex-buffer-less pipeline: the long wait budget (pipe_budget_model.h)
+    mutable bool failed = false;  // the async compile failed: draws / dispatches using it are dropped, never submitted
+    uint64_t vs_hash = 0, fs_hash = 0;  // stage shader hashes, for the failure log
 };
 
 struct RenderPipelineEntry : AsyncSlot {
@@ -857,6 +860,12 @@ struct NativeExecutor::Impl {
             required_limits.maxBufferSize = want[6] ? want[6] : WGPU_LIMIT_U64_UNDEFINED;
             required_limits.maxStorageBufferBindingSize = want[7] ? want[7] : WGPU_LIMIT_U64_UNDEFINED;
             required_limits.maxComputeWorkgroupStorageSize = want[8] ? static_cast<uint32_t>(want[8]) : WGPU_LIMIT_U32_UNDEFINED;
+            // Wide MRT sets (e.g. 5+ RGBA16F targets = 40 B/sample) exceed the 32 B WebGPU default; the
+            // adapter's own cap is a faithful superset, so ask for it (the D3D12 backend allows 64).
+            if (adapter_limits.maxColorAttachmentBytesPerSample > 32) {
+                required_limits.maxColorAttachmentBytesPerSample = adapter_limits.maxColorAttachmentBytesPerSample;
+                have_limits = true;
+            }
         }
         // Features + limits, then features only, then a bare device (the worker's order; the
         // timestamp feature rides along with the features and is dropped with them).
@@ -3100,6 +3109,14 @@ struct NativeExecutor::Impl {
             }
             fragment.module = fs->module;
             const std::string ep = resolve_shader_entry_point(fs->code, fs->explicit_ep, "fragment");
+            // A target the fragment stage never writes must have writeMask 0 (Dawn validation).
+            if (const auto outs = wgsl_fragment_output_mask(fs->code, ep)) {
+                for (uint32_t i = 0; i < target_count && i < 32; ++i) {
+                    if (targets[i].format == wgpu::TextureFormat::Undefined || (*outs >> i & 1u)) continue;
+                    if (targets[i].writeMask != wgpu::ColorWriteMask::None) ++stats.write_masks_cleared;
+                    targets[i].writeMask = wgpu::ColorWriteMask::None;
+                }
+            }
             fragment.entryPoint = {ep.data(), ep.size()};
             fragment.targetCount = targets.size();
             fragment.targets = targets.data();
@@ -3192,6 +3209,8 @@ struct NativeExecutor::Impl {
 
         RenderPipelineEntry e;
         e.fullscreen = vbs.empty();
+        e.vs_hash = vs.hash;
+        e.fs_hash = fs ? fs->hash : 0;
         if (options.async_pipelines) {
             create_render_async(rd, &e);
         } else {
@@ -3295,9 +3314,24 @@ struct NativeExecutor::Impl {
         d3d12_guest::drop_table().record(hash, d3d12_guest::DropTable::Reason::PipelinePending, dispatch);
     }
 
-    void pipe_failed(const PendingPipe& st, const char* what) {
+    static std::string hash_hex(uint64_t h) {
+        char b[24];
+        std::snprintf(b, sizeof b, "0x%016llx", static_cast<unsigned long long>(h));
+        return b;
+    }
+
+    // A draw / dispatch skipped because its async pipeline failed to compile: counted per hash, never submitted
+    // (an invalid pipeline in the pass would invalidate the whole command buffer).
+    void note_pipeline_failed(uint64_t hash, bool dispatch) {
+        ++stats.pipeline_failed_skips;
+        d3d12_guest::drop_table().record(hash, d3d12_guest::DropTable::Reason::PipelineFailed, dispatch);
+    }
+
+    void pipe_failed(const PendingPipe& st, const char* what, const AsyncSlot& slot) {
         ++stats.async_pipeline_failures;
-        const std::string msg = std::string("async ") + what + " pipeline: " + st.message;
+        slot.failed = true;
+        const std::string msg = std::string("async ") + what + " pipeline [vs=" + hash_hex(slot.vs_hash) +
+                                " fs=" + hash_hex(slot.fs_hash) + "]: " + st.message;
         stats.last_device_error = msg;
         if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(msg);
     }
@@ -3328,7 +3362,7 @@ struct NativeExecutor::Impl {
             if (e.pending->render) {
                 e.pipeline = e.pending->render;
             } else {
-                pipe_failed(*e.pending, "render");
+                pipe_failed(*e.pending, "render", e);
                 // What sync creation yields for an invalid descriptor: an error pipeline (the draw
                 // that uses it is then dropped by validation), not a null handle.
                 e.pipeline = make_error_render_pipeline();
@@ -3341,11 +3375,13 @@ struct NativeExecutor::Impl {
     // Budgeted: null while the compile is still running past the frame's wait budget.
     const wgpu::RenderPipeline* resolve_budgeted(const RenderPipelineEntry& e) {
         if (e.pending && !await_pipe(e)) return nullptr;
-        return &resolve(e);
+        const wgpu::RenderPipeline& p = resolve(e);
+        return e.failed ? nullptr : &p;  // a failed compile is never handed to an encoder
     }
     const wgpu::ComputePipeline* resolve_budgeted(const ComputePipelineEntry& e) {
         if (e.pending && !await_pipe(e)) return nullptr;
-        return &resolve(e);
+        const wgpu::ComputePipeline& p = resolve(e);
+        return e.failed ? nullptr : &p;
     }
 
     const wgpu::ComputePipeline& resolve(const ComputePipelineEntry& e) {
@@ -3354,7 +3390,7 @@ struct NativeExecutor::Impl {
             if (e.pending->compute) {
                 e.pipeline = e.pending->compute;
             } else {
-                pipe_failed(*e.pending, "compute");
+                pipe_failed(*e.pending, "compute", e);
                 e.pipeline = make_error_compute_pipeline();
             }
             e.pending.reset();
@@ -3583,7 +3619,7 @@ struct NativeExecutor::Impl {
                 // No reflection: the only source of the layout is the compiled pipeline. Budgeted; past it
                 // the bind group is skipped and counted as pipeline_pending.
                 const wgpu::RenderPipeline* rp = resolve_budgeted(rit->second);
-                if (!rp) { note_pipeline_pending(rit->second.perf_hash, false); return; }
+                if (!rp) { if (rit->second.failed) note_pipeline_failed(rit->second.perf_hash, false); else note_pipeline_pending(rit->second.perf_hash, false); return; }
                 layout = rp->GetBindGroupLayout(h.group_index);
             }
         } else if (cit != compute_pipelines.end()) {
@@ -3725,7 +3761,7 @@ struct NativeExecutor::Impl {
         wgpu::TextureView view;
     };
 
-    Dummy dummy_resource(const LayoutEntry& le) {
+    Dummy dummy_resource(const LayoutEntry& le, uint64_t owner = 0) {
         Dummy d;
         if (le.kind == 0) {
             const uint64_t size = std::max<uint64_t>(256, (le.min_binding_size + 3) / 4 * 4);
@@ -3763,8 +3799,11 @@ struct NativeExecutor::Impl {
         const bool ms = !storage && le.multisampled;
         if (ms && (!render_attachment_supported(format, features) || format_is_float32(format) || format_is_integer(format)))
             format = 22;
-        const std::string key = "tex:" + std::to_string(format) + ":" + std::to_string(le.view_dim) + ":" +
+        std::string key = "tex:" + std::to_string(format) + ":" + std::to_string(le.view_dim) + ":" +
                                 std::to_string(ms) + ":" + std::to_string(storage);
+        // Writable storage textures must not alias inside one pass (Dawn: "writable storage texture
+        // used twice"): each (owner, binding) gets its own dummy.
+        if (storage) key += ":o" + std::to_string(owner) + "b" + std::to_string(le.binding);
         auto it = dummy_views.find(key);
         if (it == dummy_views.end()) {
             const uint32_t layers = le.view_dim == 4 || le.view_dim == 5 ? 6 : 1;
@@ -3832,7 +3871,7 @@ struct NativeExecutor::Impl {
             BgHandles rh;
             rm.binding = e.binding;
             auto use_dummy = [&](const LayoutEntry& l) {
-                const Dummy d = dummy_resource(l);
+                const Dummy d = dummy_resource(l, h.layout_id);
                 pe.buffer = d.buffer;
                 pe.offset = 0;
                 pe.size = wgpu::kWholeSize;
@@ -4222,6 +4261,7 @@ struct NativeExecutor::Impl {
         std::optional<uint32_t> active_pipeline;
         // _preparePassCommandsForFlush compute filter state
         bool had_explicit_compute = false, compute_valid = false;
+        bool compute_failed = false;  // the compute pipeline's async compile failed
         bool compute_pending = false;  // compute pipeline still compiling past the wait budget
         uint64_t compute_pending_hash = 0;
         uint64_t compute_quarantined_hash = 0;  // the bound compute shader's hash when it is quarantined
@@ -4434,7 +4474,7 @@ struct NativeExecutor::Impl {
             auto it = render_pipelines.find(sp->id);
             const wgpu::RenderPipeline* plp = it != render_pipelines.end() ? resolve_budgeted(it->second) : &sp->at_packet;
             if (!plp) {
-                // Still compiling past the budget: draw_allowed() drops the draws until a later frame.
+                // Still compiling past the budget (or failed): draw_allowed() drops the draws.
             } else if (*plp) {
                 e.rpass.SetPipeline(*plp);
             } else {
@@ -4496,6 +4536,7 @@ struct NativeExecutor::Impl {
             e.compute_valid = it != compute_pipelines.end();
             e.compute_pending_hash = 0;
             e.compute_pending = false;
+            e.compute_failed = false;
             e.compute_quarantined_hash = 0;
             if (!options.quarantine.empty()) {
                 auto qh = compute_hash.find(sc->id);
@@ -4507,7 +4548,8 @@ struct NativeExecutor::Impl {
                     e.cpass.SetPipeline(*cp);
                 } else {
                     e.compute_valid = false;
-                    e.compute_pending = true;
+                    e.compute_failed = it->second.failed;
+                    e.compute_pending = !e.compute_failed;
                     auto hit = compute_hash.find(sc->id);
                     e.compute_pending_hash = hit != compute_hash.end() ? hit->second : 0;
                 }
@@ -4523,7 +4565,8 @@ struct NativeExecutor::Impl {
             }
             if (e.had_explicit_compute && !e.compute_valid) {
                 ++stats.dispatches_skipped;
-                if (e.compute_pending) note_pipeline_pending(e.compute_pending_hash, true);
+                if (e.compute_failed) note_pipeline_failed(e.compute_pending_hash, true);
+                else if (e.compute_pending) note_pipeline_pending(e.compute_pending_hash, true);
                 return;
             }
             // validateComputeDispatch
@@ -4671,7 +4714,7 @@ struct NativeExecutor::Impl {
             } else {
                 const RenderPipelineEntry& re = render_pipelines.find(pipeline_id)->second;
                 const wgpu::RenderPipeline* rp = resolve_budgeted(re);
-                if (!rp) { note_pipeline_pending(re.perf_hash, false); return out; }
+                if (!rp) { if (re.failed) note_pipeline_failed(re.perf_hash, false); else note_pipeline_pending(re.perf_hash, false); return out; }
                 auto_bgl = rp->GetBindGroupLayout(0);
             }
         }
@@ -5112,6 +5155,11 @@ struct NativeExecutor::Impl {
             }
             if (it->second.quarantined_hash) {
                 note_quarantined(it->second.quarantined_hash, false);
+                return false;
+            }
+            if (it->second.failed) {
+                ++stats.draws_skipped;
+                note_pipeline_failed(it->second.perf_hash, false);
                 return false;
             }
             if (pipe_still_pending(it->second)) {
@@ -5820,6 +5868,8 @@ std::string NativeExecutor::stats_json() const {
     num("remap_reflected_layouts", st.remap_reflected_layouts);
     num("quarantine_skips", st.quarantine_skips);
     num("async_pipeline_failures", st.async_pipeline_failures);
+    num("pipeline_failed_skips", st.pipeline_failed_skips);
+    num("write_masks_cleared", st.write_masks_cleared);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {
         j += "\"";
