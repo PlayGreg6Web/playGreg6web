@@ -31,6 +31,23 @@
   const MAX_DECLICK_FRAMES = 4096;
   const DEFAULT_FADE_CURVE = 'linear';
   const EMPTY_FLOAT32 = new Float32Array(0);
+  const COS_RECURRENCE_RESYNC_MASK = 4095; // Re-sync cosine recurrence every 4096 frames
+  const MAX_SCRATCH_VIEW_CACHE = 16;
+
+  // Reusable internal extract options/result for downmixToStereo/resampleLinear when
+  // callers pass a scratch pool (always cleared before returning to avoid retaining buffers).
+  const _INTERNAL_EXTRACT_RESULT = {
+    ok: false,
+    pcm: null,
+    copiedFromSab: false,
+    sanitizedSamples: 0,
+    error: '',
+  };
+  const _INTERNAL_EXTRACT_OPTS = {
+    maxPcmBytes: 64 * 1024 * 1024,
+    scratch: null,
+    outResult: _INTERNAL_EXTRACT_RESULT,
+  };
 
   // Multi-channel ITU-R BS.775 downmix, soft-clip limiter, and resampling safeguards.
   const DEFAULT_SOFT_CLIP_KNEE = 0.95;
@@ -491,6 +508,8 @@
 
       this._planarBacking = [];
       this._planarViews = [];
+      this._planarViewCache = Object.create(null);
+      this._planarViewCacheSize = 0;
       this._planarChannels = 0;
       this._planarCapacityFrames = 0;
       this._planarViewFrames = 0;
@@ -498,6 +517,16 @@
       this._lastRawSab = null;
       this._lastRawSabSamples = 0;
       this._lastRawSabView = null;
+
+      this._lastRawByteBuf = null;
+      this._lastRawByteOffset = 0;
+      this._lastRawByteLen = 0;
+      this._lastRawByteView = null;
+
+      this._lastRawF32Buf = null;
+      this._lastRawF32Offset = 0;
+      this._lastRawF32Len = 0;
+      this._lastRawF32View = null;
 
       this._allocations = 0;
       this._reuses = 0;
@@ -532,18 +561,33 @@
         const cap = count > 0 ? count : 1;
         const backing = new Float32Array(cap);
         const byteBacking = needBytes ? new Uint8Array(backing.buffer) : null;
+        const view = count === cap ? backing : backing.subarray(0, count);
+        const byteLen = count * Float32Array.BYTES_PER_ELEMENT;
+        const byteView = needBytes
+          ? count === cap
+            ? byteBacking
+            : byteBacking.subarray(0, byteLen)
+          : null;
+        const viewCache = Object.create(null);
+        viewCache[count] = view;
+        const byteViewCache = Object.create(null);
+        let byteViewCacheSize = 0;
+        if (needBytes) {
+          byteViewCache[byteLen] = byteView;
+          byteViewCacheSize = 1;
+        }
         slot = {
           backing,
           capacity: cap,
-          view: count === cap ? backing : backing.subarray(0, count),
+          view,
           viewLen: count,
+          viewCache,
+          viewCacheSize: 1,
           byteBacking,
-          byteView: needBytes
-            ? count === cap
-              ? byteBacking
-              : byteBacking.subarray(0, count * Float32Array.BYTES_PER_ELEMENT)
-            : null,
-          byteViewLen: needBytes ? count * Float32Array.BYTES_PER_ELEMENT : -1,
+          byteView,
+          byteViewLen: needBytes ? byteLen : -1,
+          byteViewCache,
+          byteViewCacheSize,
           pair: { floats: null, bytes: null },
         };
         slot.pair.floats = slot.view;
@@ -560,10 +604,17 @@
         slot.capacity = count;
         slot.view = backing;
         slot.viewLen = count;
+        slot.viewCache = Object.create(null);
+        slot.viewCache[count] = backing;
+        slot.viewCacheSize = 1;
         if (needBytes || slot.byteBacking !== null) {
+          const byteLen = count * Float32Array.BYTES_PER_ELEMENT;
           slot.byteBacking = new Uint8Array(backing.buffer);
           slot.byteView = slot.byteBacking;
-          slot.byteViewLen = count * Float32Array.BYTES_PER_ELEMENT;
+          slot.byteViewLen = byteLen;
+          slot.byteViewCache = Object.create(null);
+          slot.byteViewCache[byteLen] = slot.byteBacking;
+          slot.byteViewCacheSize = 1;
         }
         slot.pair.floats = slot.view;
         slot.pair.bytes = slot.byteView;
@@ -572,9 +623,17 @@
       }
 
       if (slot.viewLen !== count) {
-        slot.view = count === slot.capacity ? slot.backing : slot.backing.subarray(0, count);
+        let cachedView = slot.viewCache[count];
+        if (!cachedView) {
+          cachedView = count === slot.capacity ? slot.backing : slot.backing.subarray(0, count);
+          if (slot.viewCacheSize < MAX_SCRATCH_VIEW_CACHE) {
+            slot.viewCache[count] = cachedView;
+            slot.viewCacheSize += 1;
+          }
+        }
+        slot.view = cachedView;
         slot.viewLen = count;
-        slot.pair.floats = slot.view;
+        slot.pair.floats = cachedView;
       }
 
       if (needBytes) {
@@ -582,14 +641,24 @@
         if (!slot.byteBacking) {
           slot.byteBacking = new Uint8Array(slot.backing.buffer);
           slot.byteViewLen = -1;
+          slot.byteViewCache = Object.create(null);
+          slot.byteViewCacheSize = 0;
         }
         if (slot.byteViewLen !== byteLen) {
-          slot.byteView =
-            byteLen === slot.byteBacking.byteLength
-              ? slot.byteBacking
-              : slot.byteBacking.subarray(0, byteLen);
+          let cachedByteView = slot.byteViewCache[byteLen];
+          if (!cachedByteView) {
+            cachedByteView =
+              byteLen === slot.byteBacking.byteLength
+                ? slot.byteBacking
+                : slot.byteBacking.subarray(0, byteLen);
+            if (slot.byteViewCacheSize < MAX_SCRATCH_VIEW_CACHE) {
+              slot.byteViewCache[byteLen] = cachedByteView;
+              slot.byteViewCacheSize += 1;
+            }
+          }
+          slot.byteView = cachedByteView;
           slot.byteViewLen = byteLen;
-          slot.pair.bytes = slot.byteView;
+          slot.pair.bytes = cachedByteView;
         }
       }
 
@@ -623,14 +692,21 @@
       if (!slot) {
         const cap = count > 0 ? count : 1;
         const backing = new Float32Array(cap);
+        const view = count === cap ? backing : backing.subarray(0, count);
+        const viewCache = Object.create(null);
+        viewCache[count] = view;
         slot = {
           backing,
           capacity: cap,
-          view: count === cap ? backing : backing.subarray(0, count),
+          view,
           viewLen: count,
+          viewCache,
+          viewCacheSize: 1,
           byteBacking: null,
           byteView: null,
           byteViewLen: -1,
+          byteViewCache: Object.create(null),
+          byteViewCacheSize: 0,
           pair: { floats: null, bytes: null },
         };
         slot.pair.floats = slot.view;
@@ -647,10 +723,17 @@
         slot.capacity = count;
         slot.view = backing;
         slot.viewLen = count;
+        slot.viewCache = Object.create(null);
+        slot.viewCache[count] = backing;
+        slot.viewCacheSize = 1;
         if (slot.byteBacking !== null) {
+          const byteLen = count * Float32Array.BYTES_PER_ELEMENT;
           slot.byteBacking = new Uint8Array(backing.buffer);
           slot.byteView = slot.byteBacking;
-          slot.byteViewLen = count * Float32Array.BYTES_PER_ELEMENT;
+          slot.byteViewLen = byteLen;
+          slot.byteViewCache = Object.create(null);
+          slot.byteViewCache[byteLen] = slot.byteBacking;
+          slot.byteViewCacheSize = 1;
         }
         slot.pair.floats = slot.view;
         slot.pair.bytes = slot.byteView;
@@ -674,6 +757,40 @@
       this._lastRawSab = sab;
       this._lastRawSabSamples = sampleCount;
       this._lastRawSabView = view;
+      return view;
+    }
+
+    acquireRawByteView(buf, byteOffset, byteLength) {
+      if (
+        this._lastRawByteBuf === buf &&
+        this._lastRawByteOffset === byteOffset &&
+        this._lastRawByteLen === byteLength &&
+        this._lastRawByteView
+      ) {
+        return this._lastRawByteView;
+      }
+      const view = new Uint8Array(buf, byteOffset, byteLength);
+      this._lastRawByteBuf = buf;
+      this._lastRawByteOffset = byteOffset;
+      this._lastRawByteLen = byteLength;
+      this._lastRawByteView = view;
+      return view;
+    }
+
+    acquireRawFloat32View(buf, byteOffset, sampleCount) {
+      if (
+        this._lastRawF32Buf === buf &&
+        this._lastRawF32Offset === byteOffset &&
+        this._lastRawF32Len === sampleCount &&
+        this._lastRawF32View
+      ) {
+        return this._lastRawF32View;
+      }
+      const view = new Float32Array(buf, byteOffset, sampleCount);
+      this._lastRawF32Buf = buf;
+      this._lastRawF32Offset = byteOffset;
+      this._lastRawF32Len = sampleCount;
+      this._lastRawF32View = view;
       return view;
     }
 
@@ -711,6 +828,8 @@
             this._planarBacking[c] = new Float32Array(nextCap);
           }
           this._allocations += targetChannelCount;
+          this._planarViewCache = Object.create(null);
+          this._planarViewCacheSize = 0;
         } else {
           for (let c = this._planarBacking.length; c < targetChannelCount; c++) {
             this._planarBacking.push(new Float32Array(nextCap));
@@ -718,26 +837,39 @@
           }
         }
         this._planarCapacityFrames = nextCap;
-        this._planarViews = new Array(channels);
+        const views = new Array(channels);
         for (let c = 0; c < channels; c++) {
-          this._planarViews[c] =
+          views[c] =
             frames === nextCap ? this._planarBacking[c] : this._planarBacking[c].subarray(0, frames);
         }
+        const cacheKey = channels * 0x10000000 + frames;
+        if (this._planarViewCacheSize < MAX_SCRATCH_VIEW_CACHE * 2) {
+          this._planarViewCache[cacheKey] = views;
+          this._planarViewCacheSize += 1;
+        }
+        this._planarViews = views;
         this._planarChannels = channels;
         this._planarViewFrames = frames;
         return this._planarViews;
       }
 
       if (channels !== this._planarChannels || frames !== this._planarViewFrames) {
-        if (this._planarViews.length !== channels) {
-          this._planarViews = new Array(channels);
+        const cacheKey = channels * 0x10000000 + frames;
+        let cached = this._planarViewCache[cacheKey];
+        if (!cached) {
+          cached = new Array(channels);
+          for (let c = 0; c < channels; c++) {
+            cached[c] =
+              frames === this._planarCapacityFrames
+                ? this._planarBacking[c]
+                : this._planarBacking[c].subarray(0, frames);
+          }
+          if (this._planarViewCacheSize < MAX_SCRATCH_VIEW_CACHE * 2) {
+            this._planarViewCache[cacheKey] = cached;
+            this._planarViewCacheSize += 1;
+          }
         }
-        for (let c = 0; c < channels; c++) {
-          this._planarViews[c] =
-            frames === this._planarCapacityFrames
-              ? this._planarBacking[c]
-              : this._planarBacking[c].subarray(0, frames);
-        }
+        this._planarViews = cached;
         this._planarChannels = channels;
         this._planarViewFrames = frames;
       }
@@ -799,12 +931,22 @@
       this._slotCount = 0;
       this._planarBacking = [];
       this._planarViews = [];
+      this._planarViewCache = Object.create(null);
+      this._planarViewCacheSize = 0;
       this._planarChannels = 0;
       this._planarCapacityFrames = 0;
       this._planarViewFrames = 0;
       this._lastRawSab = null;
       this._lastRawSabSamples = 0;
       this._lastRawSabView = null;
+      this._lastRawByteBuf = null;
+      this._lastRawByteOffset = 0;
+      this._lastRawByteLen = 0;
+      this._lastRawByteView = null;
+      this._lastRawF32Buf = null;
+      this._lastRawF32Offset = 0;
+      this._lastRawF32Len = 0;
+      this._lastRawF32View = null;
       this._allocations = 0;
       this._reuses = 0;
     }
@@ -846,19 +988,45 @@
       typeof options.scratch.acquireFloat32 === 'function'
         ? options.scratch
         : null;
+    const outRes =
+      options && options.outResult && typeof options.outResult === 'object'
+        ? options.outResult
+        : null;
+
+    const finishOk = (pcm, copiedFromSab, sanitizedSamples) => {
+      if (outRes) {
+        outRes.ok = true;
+        outRes.pcm = pcm;
+        outRes.copiedFromSab = copiedFromSab;
+        outRes.sanitizedSamples = sanitizedSamples;
+        outRes.error = '';
+        return outRes;
+      }
+      return { ok: true, pcm, copiedFromSab, sanitizedSamples };
+    };
+    const finishErr = (error) => {
+      if (outRes) {
+        outRes.ok = false;
+        outRes.pcm = null;
+        outRes.copiedFromSab = false;
+        outRes.sanitizedSamples = 0;
+        outRes.error = error;
+        return outRes;
+      }
+      return { ok: false, error };
+    };
 
     if (samples === null || samples === undefined) {
-      return { ok: false, error: 'PCM samples missing or null' };
+      return finishErr('PCM samples missing or null');
     }
 
     // 1. Raw SharedArrayBuffer
     if (isSharedArrayBuffer(samples)) {
       const byteLen = samples.byteLength;
       if (byteLen > maxPcmBytes) {
-        return {
-          ok: false,
-          error: `PCM payload (${byteLen} bytes) exceeds max allowed (${maxPcmBytes} bytes)`,
-        };
+        return finishErr(
+          `PCM payload (${byteLen} bytes) exceeds max allowed (${maxPcmBytes} bytes)`
+        );
       }
       const sampleCount = Math.floor(byteLen / Float32Array.BYTES_PER_ELEMENT);
       const view =
@@ -878,23 +1046,25 @@
           sanitizedSamples += 1;
         }
       }
-      return { ok: true, pcm: copy, copiedFromSab: true, sanitizedSamples };
+      return finishOk(copy, true, sanitizedSamples);
     }
 
     // 2. Raw ArrayBuffer
     if (samples instanceof ArrayBuffer) {
       if (isDetachedArrayBuffer(samples)) {
-        return { ok: false, error: 'PCM ArrayBuffer is detached' };
+        return finishErr('PCM ArrayBuffer is detached');
       }
       const byteLen = samples.byteLength;
       if (byteLen > maxPcmBytes) {
-        return {
-          ok: false,
-          error: `PCM payload (${byteLen} bytes) exceeds max allowed (${maxPcmBytes} bytes)`,
-        };
+        return finishErr(
+          `PCM payload (${byteLen} bytes) exceeds max allowed (${maxPcmBytes} bytes)`
+        );
       }
       const sampleCount = Math.floor(byteLen / Float32Array.BYTES_PER_ELEMENT);
-      const view = new Float32Array(samples, 0, sampleCount);
+      const view =
+        scratch && typeof scratch.acquireRawFloat32View === 'function'
+          ? scratch.acquireRawFloat32View(samples, 0, sampleCount)
+          : new Float32Array(samples, 0, sampleCount);
       let sanitizedSamples = 0;
       let copy = null;
       for (let i = 0; i < sampleCount; i++) {
@@ -909,7 +1079,7 @@
           sanitizedSamples += 1;
         }
       }
-      return { ok: true, pcm: copy || view, copiedFromSab: false, sanitizedSamples };
+      return finishOk(copy || view, false, sanitizedSamples);
     }
 
     // 3. TypedArray or DataView (Float32Array, Uint8Array, etc.)
@@ -922,21 +1092,20 @@
         byteOffset = samples.byteOffset;
         byteLength = samples.byteLength;
       } catch (_err) {
-        return { ok: false, error: 'PCM TypedArray view is unreadable or detached' };
+        return finishErr('PCM TypedArray view is unreadable or detached');
       }
 
       if (!backing) {
-        return { ok: false, error: 'PCM view has no backing buffer' };
+        return finishErr('PCM view has no backing buffer');
       }
       const fromSab = isSharedArrayBuffer(backing);
       if (!fromSab && isDetachedArrayBuffer(backing)) {
-        return { ok: false, error: 'PCM TypedArray backing ArrayBuffer is detached' };
+        return finishErr('PCM TypedArray backing ArrayBuffer is detached');
       }
       if (byteLength > maxPcmBytes) {
-        return {
-          ok: false,
-          error: `PCM payload (${byteLength} bytes) exceeds max allowed (${maxPcmBytes} bytes)`,
-        };
+        return finishErr(
+          `PCM payload (${byteLength} bytes) exceeds max allowed (${maxPcmBytes} bytes)`
+        );
       }
 
       const alignedByteLength =
@@ -960,7 +1129,7 @@
               sanitizedSamples += 1;
             }
           }
-          return { ok: true, pcm: copy, copiedFromSab: fromSab, sanitizedSamples };
+          return finishOk(copy, fromSab, sanitizedSamples);
         }
 
         if (scratch && typeof scratch.acquireFloat32WithBytes === 'function') {
@@ -970,7 +1139,11 @@
               pair.bytes[i] = samples[i];
             }
           } else {
-            pair.bytes.set(new Uint8Array(backing, byteOffset, alignedByteLength));
+            const srcBytes =
+              typeof scratch.acquireRawByteView === 'function'
+                ? scratch.acquireRawByteView(backing, byteOffset, alignedByteLength)
+                : new Uint8Array(backing, byteOffset, alignedByteLength);
+            pair.bytes.set(srcBytes);
           }
           copy = pair.floats;
         } else {
@@ -985,13 +1158,15 @@
             sanitizedSamples += 1;
           }
         }
-        return { ok: true, pcm: copy, copiedFromSab: fromSab, sanitizedSamples };
+        return finishOk(copy, fromSab, sanitizedSamples);
       }
 
       const view =
         samples instanceof Float32Array
           ? samples
-          : new Float32Array(backing, byteOffset, sampleCount);
+          : scratch && typeof scratch.acquireRawFloat32View === 'function'
+            ? scratch.acquireRawFloat32View(backing, byteOffset, sampleCount)
+            : new Float32Array(backing, byteOffset, sampleCount);
       let sanitizedSamples = 0;
       let copy = null;
       for (let i = 0; i < view.length; i++) {
@@ -1006,16 +1181,15 @@
           sanitizedSamples += 1;
         }
       }
-      return { ok: true, pcm: copy || view, copiedFromSab: false, sanitizedSamples };
+      return finishOk(copy || view, false, sanitizedSamples);
     }
 
     // 4. Plain JS number[]
     if (Array.isArray(samples)) {
       if (samples.length > maxSamples) {
-        return {
-          ok: false,
-          error: `PCM array (${samples.length} samples) exceeds max allowed (${maxSamples} samples)`,
-        };
+        return finishErr(
+          `PCM array (${samples.length} samples) exceeds max allowed (${maxSamples} samples)`
+        );
       }
       const out = scratch
         ? scratch.acquireFloat32('extract', samples.length)
@@ -1024,7 +1198,7 @@
       for (let i = 0; i < samples.length; i++) {
         const v = samples[i];
         if (typeof v !== 'number') {
-          return { ok: false, error: `PCM array contains non-numeric element at index ${i}` };
+          return finishErr(`PCM array contains non-numeric element at index ${i}`);
         }
         if (Number.isFinite(v)) {
           out[i] = v;
@@ -1033,13 +1207,12 @@
           sanitizedSamples += 1;
         }
       }
-      return { ok: true, pcm: out, copiedFromSab: false, sanitizedSamples };
+      return finishOk(out, false, sanitizedSamples);
     }
 
-    return {
-      ok: false,
-      error: 'PCM samples must be a Float32Array, ArrayBuffer, SharedArrayBuffer, TypedArray, or number[]',
-    };
+    return finishErr(
+      'PCM samples must be a Float32Array, ArrayBuffer, SharedArrayBuffer, TypedArray, or number[]'
+    );
   }
 
   /**
@@ -1164,57 +1337,131 @@
     }
 
     const gDiff = g1 - g0;
+    const halfGDiff = 0.5 * gDiff;
     const lastIdx = n - 1;
-    const invDenom = Math.PI / lastIdx;
+    const step = Math.PI / lastIdx;
+    const halfStep = 0.5 * step;
+    const s = Math.sin(halfStep);
+    const k = 4.0 * s * s;
 
     if (channels === 2) {
-      for (let f = 0; f < n; f++) {
-        const gain =
-          f === 0
-            ? g0
-            : f === lastIdx
-              ? g1
-              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
-        const base = f * 2;
-        if (gain === 0.0) {
-          samples[base] = 0.0;
-          samples[base + 1] = 0.0;
-        } else {
-          const s0 = samples[base];
-          const s1 = samples[base + 1];
-          samples[base] = s0 - s0 !== 0 ? 0.0 : s0 * gain;
-          samples[base + 1] = s1 - s1 !== 0 ? 0.0 : s1 * gain;
+      // Exact start endpoint (f === 0 -> g0)
+      if (g0 === 0.0) {
+        samples[0] = 0.0;
+        samples[1] = 0.0;
+      } else {
+        const s0 = samples[0];
+        const s1 = samples[1];
+        samples[0] = s0 - s0 !== 0 ? 0.0 : s0 * g0;
+        samples[1] = s1 - s1 !== 0 ? 0.0 : s1 * g0;
+      }
+      // Interior frames (1 .. lastIdx - 1) using second-order cosine recurrence
+      // c_{f+1} - 2*cos(step)*c_f + c_{f-1} = 0  <=>  c += delta; delta -= k * c
+      // with periodic resync every 4096 frames for arbitrarily long ramps (< 1e-6 error).
+      if (lastIdx > 1) {
+        let c = 1.0 - 0.5 * k;
+        let delta = -0.5 * k - k * c;
+        for (let f = 1; f < lastIdx; f++) {
+          const gain = g0 + halfGDiff * (1.0 - c);
+          const base = f * 2;
+          if (gain === 0.0) {
+            samples[base] = 0.0;
+            samples[base + 1] = 0.0;
+          } else {
+            const s0 = samples[base];
+            const s1 = samples[base + 1];
+            samples[base] = s0 - s0 !== 0 ? 0.0 : s0 * gain;
+            samples[base + 1] = s1 - s1 !== 0 ? 0.0 : s1 * gain;
+          }
+          if ((f & COS_RECURRENCE_RESYNC_MASK) === 0 && f + 1 < lastIdx) {
+            const nextTheta = (f + 1) * step;
+            c = Math.cos(nextTheta);
+            delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+          } else {
+            c += delta;
+            delta -= k * c;
+          }
         }
       }
-    } else if (channels === 1) {
-      for (let f = 0; f < n; f++) {
-        const gain =
-          f === 0
-            ? g0
-            : f === lastIdx
-              ? g1
-              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
-        const s = samples[f];
-        samples[f] = gain === 0.0 || s - s !== 0 ? 0.0 : s * gain;
+      // Exact end endpoint (f === lastIdx -> g1)
+      const endBase = lastIdx * 2;
+      if (g1 === 0.0) {
+        samples[endBase] = 0.0;
+        samples[endBase + 1] = 0.0;
+      } else {
+        const s0 = samples[endBase];
+        const s1 = samples[endBase + 1];
+        samples[endBase] = s0 - s0 !== 0 ? 0.0 : s0 * g1;
+        samples[endBase + 1] = s1 - s1 !== 0 ? 0.0 : s1 * g1;
       }
+    } else if (channels === 1) {
+      const startSample = samples[0];
+      samples[0] = g0 === 0.0 || startSample - startSample !== 0 ? 0.0 : startSample * g0;
+      if (lastIdx > 1) {
+        let c = 1.0 - 0.5 * k;
+        let delta = -0.5 * k - k * c;
+        for (let f = 1; f < lastIdx; f++) {
+          const gain = g0 + halfGDiff * (1.0 - c);
+          const sv = samples[f];
+          samples[f] = gain === 0.0 || sv - sv !== 0 ? 0.0 : sv * gain;
+          if ((f & COS_RECURRENCE_RESYNC_MASK) === 0 && f + 1 < lastIdx) {
+            const nextTheta = (f + 1) * step;
+            c = Math.cos(nextTheta);
+            delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+          } else {
+            c += delta;
+            delta -= k * c;
+          }
+        }
+      }
+      const endSample = samples[lastIdx];
+      samples[lastIdx] = g1 === 0.0 || endSample - endSample !== 0 ? 0.0 : endSample * g1;
     } else {
-      for (let f = 0; f < n; f++) {
-        const gain =
-          f === 0
-            ? g0
-            : f === lastIdx
-              ? g1
-              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
-        const base = f * channels;
-        if (gain === 0.0) {
-          for (let c = 0; c < channels; c++) {
-            samples[base + c] = 0.0;
+      if (g0 === 0.0) {
+        for (let ch = 0; ch < channels; ch++) {
+          samples[ch] = 0.0;
+        }
+      } else {
+        for (let ch = 0; ch < channels; ch++) {
+          const sv = samples[ch];
+          samples[ch] = sv - sv !== 0 ? 0.0 : sv * g0;
+        }
+      }
+      if (lastIdx > 1) {
+        let c = 1.0 - 0.5 * k;
+        let delta = -0.5 * k - k * c;
+        for (let f = 1; f < lastIdx; f++) {
+          const gain = g0 + halfGDiff * (1.0 - c);
+          const base = f * channels;
+          if (gain === 0.0) {
+            for (let ch = 0; ch < channels; ch++) {
+              samples[base + ch] = 0.0;
+            }
+          } else {
+            for (let ch = 0; ch < channels; ch++) {
+              const sv = samples[base + ch];
+              samples[base + ch] = sv - sv !== 0 ? 0.0 : sv * gain;
+            }
           }
-        } else {
-          for (let c = 0; c < channels; c++) {
-            const s = samples[base + c];
-            samples[base + c] = s - s !== 0 ? 0.0 : s * gain;
+          if ((f & COS_RECURRENCE_RESYNC_MASK) === 0 && f + 1 < lastIdx) {
+            const nextTheta = (f + 1) * step;
+            c = Math.cos(nextTheta);
+            delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+          } else {
+            c += delta;
+            delta -= k * c;
           }
+        }
+      }
+      const endBase = lastIdx * channels;
+      if (g1 === 0.0) {
+        for (let ch = 0; ch < channels; ch++) {
+          samples[endBase + ch] = 0.0;
+        }
+      } else {
+        for (let ch = 0; ch < channels; ch++) {
+          const sv = samples[endBase + ch];
+          samples[endBase + ch] = sv - sv !== 0 ? 0.0 : sv * g1;
         }
       }
     }
@@ -1372,12 +1619,17 @@
       }
       src = samples;
     } else {
-      const extracted = extractSafePcmSamples(samples, { maxPcmBytes: 64 * 1024 * 1024 });
+      _INTERNAL_EXTRACT_OPTS.scratch = opts.scratch || null;
+      const extracted = extractSafePcmSamples(samples, _INTERNAL_EXTRACT_OPTS);
+      _INTERNAL_EXTRACT_OPTS.scratch = null;
       if (!extracted.ok) {
-        throw new TypeError(extracted.error);
+        const errMsg = extracted.error;
+        _INTERNAL_EXTRACT_RESULT.pcm = null;
+        throw new TypeError(errMsg);
       }
       src = extracted.pcm;
       nanSanitized += extracted.sanitizedSamples;
+      _INTERNAL_EXTRACT_RESULT.pcm = null;
     }
 
     const frameCount = Math.floor(src.length / channels);
@@ -1583,12 +1835,17 @@
       }
       src = samples;
     } else {
-      const extracted = extractSafePcmSamples(samples, { maxPcmBytes: 64 * 1024 * 1024 });
+      _INTERNAL_EXTRACT_OPTS.scratch = opts.scratch || null;
+      const extracted = extractSafePcmSamples(samples, _INTERNAL_EXTRACT_OPTS);
+      _INTERNAL_EXTRACT_OPTS.scratch = null;
       if (!extracted.ok) {
-        throw new TypeError(extracted.error);
+        const errMsg = extracted.error;
+        _INTERNAL_EXTRACT_RESULT.pcm = null;
+        throw new TypeError(errMsg);
       }
       src = extracted.pcm;
       nanSanitized += extracted.sanitizedSamples;
+      _INTERNAL_EXTRACT_RESULT.pcm = null;
     }
 
     const maxSrcFrames = Math.floor(src.length / channels);
@@ -1869,6 +2126,11 @@
       rawBufferFillPct < 0 ? 0.0 : rawBufferFillPct > 100 ? 100.0 : rawBufferFillPct;
     const scratchAllocations = sanitizeNonNegInt(s.scratchAllocations, 0);
     const scratchReuses = sanitizeNonNegInt(s.scratchReuses, 0);
+    const scratchBufferReuses = sanitizeNonNegInt(
+      s.scratchBufferReuses !== undefined ? s.scratchBufferReuses : scratchReuses,
+      scratchReuses
+    );
+    const fastCosineRamps = sanitizeNonNegInt(s.fastCosineRamps, 0);
     const overflowPolicy = normalizeOverflowPolicy(s.overflowPolicy, DEFAULT_OVERFLOW_POLICY);
     const maxFillRatio = sanitizeFillRatio(s.maxFillRatio, DEFAULT_MAX_FILL_RATIO);
     const outputState = normalizeOutputState(s.outputState, OUTPUT_STATES.HEADLESS_DRAIN);
@@ -1934,6 +2196,8 @@
         activeVoicePeak,
         scratchAllocations,
         scratchReuses,
+        scratchBufferReuses,
+        fastCosineRamps,
         zeroAllocDrains,
         guestRingAttached,
         guestFramesDrained,
@@ -2134,6 +2398,7 @@
       this._fadeInTotal = 0;
       this._underrunFadeCount = 0;
       this._recoveryFadeCount = 0;
+      this._fastCosineRamps = 0;
       this._reusableResult = {
         framesRead: 0,
         underrun: false,
@@ -2157,6 +2422,10 @@
       return this._recoveryFadeCount;
     }
 
+    get fastCosineRamps() {
+      return this._fastCosineRamps;
+    }
+
     resetFadeState() {
       this._lastStereoFrame[0] = 0.0;
       this._lastStereoFrame[1] = 0.0;
@@ -2168,6 +2437,7 @@
       this._fadeInTotal = 0;
       this._underrunFadeCount = 0;
       this._recoveryFadeCount = 0;
+      this._fastCosineRamps = 0;
     }
 
     get sab() {
@@ -2459,9 +2729,14 @@
             : framesToRead;
         const oldBuf = this._trimXfadeSamples;
         const denom = xfFrames + 1;
+        const step = Math.PI / denom;
+        const halfStep = 0.5 * step;
+        const s = Math.sin(halfStep);
+        const k = 4.0 * s * s;
+        let c = 1.0 - 0.5 * k;
+        let delta = -0.5 * k - k * c;
         for (let f = 0; f < xfFrames; f++) {
-          const t = (f + 1) / denom;
-          const wNew = 0.5 * (1.0 - Math.cos(Math.PI * t));
+          const wNew = 0.5 * (1.0 - c);
           const wOld = 1.0 - wNew;
           const base = f * GUEST_PCM_RING_CHANNELS;
           const l = oldBuf[base] * wOld + output[base] * wNew;
@@ -2472,7 +2747,16 @@
           const absR = r < 0 ? -r : r;
           if (absL > peakLevel) peakLevel = absL;
           if (absR > peakLevel) peakLevel = absR;
+          if ((f & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK && f + 1 < xfFrames) {
+            const nextTheta = (f + 2) * step;
+            c = Math.cos(nextTheta);
+            delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+          } else {
+            c += delta;
+            delta -= k * c;
+          }
         }
+        this._fastCosineRamps += 1;
         this._pendingTrimXfadeFrames = 0;
       }
 
@@ -2489,12 +2773,42 @@
           const remaining = this._fadeInTotal - this._fadeInPos;
           const rampCount = framesToRead < remaining ? framesToRead : remaining;
           const total = this._fadeInTotal;
-          for (let f = 0; f < rampCount; f++) {
-            const t = (this._fadeInPos + f) / total;
-            const rampGain = useCosine ? 0.5 * (1.0 - Math.cos(Math.PI * t)) : t;
-            const base = f * GUEST_PCM_RING_CHANNELS;
-            output[base] *= rampGain;
-            output[base + 1] *= rampGain;
+          const startPos = this._fadeInPos;
+          if (useCosine) {
+            const step = Math.PI / total;
+            const halfStep = 0.5 * step;
+            const s = Math.sin(halfStep);
+            const k = 4.0 * s * s;
+            const theta0 = startPos * step;
+            let c = startPos === 0 ? 1.0 : Math.cos(theta0);
+            let delta =
+              startPos === 0 ? -0.5 * k : -2.0 * Math.sin(theta0 + halfStep) * s;
+            for (let f = 0; f < rampCount; f++) {
+              const rampGain = 0.5 * (1.0 - c);
+              const base = f * GUEST_PCM_RING_CHANNELS;
+              output[base] *= rampGain;
+              output[base + 1] *= rampGain;
+              if (
+                (f & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                f + 1 < rampCount
+              ) {
+                const nextTheta = (startPos + f + 1) * step;
+                c = Math.cos(nextTheta);
+                delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+              } else {
+                c += delta;
+                delta -= k * c;
+              }
+            }
+            this._fastCosineRamps += 1;
+          } else {
+            const invTotal = 1.0 / total;
+            for (let f = 0; f < rampCount; f++) {
+              const rampGain = (startPos + f) * invTotal;
+              const base = f * GUEST_PCM_RING_CHANNELS;
+              output[base] *= rampGain;
+              output[base + 1] *= rampGain;
+            }
           }
           this._fadeInPos += rampCount;
           if (this._fadeInPos >= this._fadeInTotal) {
@@ -2517,16 +2831,45 @@
             ) {
               const fadeFrames = declickFrames < framesToRead ? declickFrames : framesToRead;
               const fadeStart = framesToRead - fadeFrames;
-              for (let i = 0; i < fadeFrames; i++) {
-                const rampGain =
-                  i === fadeFrames - 1
-                    ? 0.0
-                    : useCosine
-                      ? 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
-                      : (fadeFrames - 1 - i) / fadeFrames;
-                const base = (fadeStart + i) * GUEST_PCM_RING_CHANNELS;
-                output[base] *= rampGain;
-                output[base + 1] *= rampGain;
+              const lastFade = fadeFrames - 1;
+              if (useCosine) {
+                if (lastFade > 0) {
+                  const step = Math.PI / fadeFrames;
+                  const halfStep = 0.5 * step;
+                  const s = Math.sin(halfStep);
+                  const k = 4.0 * s * s;
+                  let c = 1.0 - 0.5 * k;
+                  let delta = -0.5 * k - k * c;
+                  for (let i = 0; i < lastFade; i++) {
+                    const rampGain = 0.5 * (1.0 + c);
+                    const base = (fadeStart + i) * GUEST_PCM_RING_CHANNELS;
+                    output[base] *= rampGain;
+                    output[base + 1] *= rampGain;
+                    if (
+                      (i & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                      i + 1 < lastFade
+                    ) {
+                      const nextTheta = (i + 2) * step;
+                      c = Math.cos(nextTheta);
+                      delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+                    } else {
+                      c += delta;
+                      delta -= k * c;
+                    }
+                  }
+                }
+                const endBase = (fadeStart + lastFade) * GUEST_PCM_RING_CHANNELS;
+                output[endBase] = 0.0;
+                output[endBase + 1] = 0.0;
+                this._fastCosineRamps += 1;
+              } else {
+                const invFade = 1.0 / fadeFrames;
+                for (let i = 0; i < fadeFrames; i++) {
+                  const rampGain = i === lastFade ? 0.0 : (lastFade - i) * invFade;
+                  const base = (fadeStart + i) * GUEST_PCM_RING_CHANNELS;
+                  output[base] *= rampGain;
+                  output[base + 1] *= rampGain;
+                }
               }
               output.fill(0, samplesToRead, reqFrames * GUEST_PCM_RING_CHANNELS);
             } else {
@@ -2538,16 +2881,45 @@
               const fadeFrames = declickFrames < missingFrames ? declickFrames : missingFrames;
               const lastL = this._lastStereoFrame[0];
               const lastR = this._lastStereoFrame[1];
-              for (let i = 0; i < fadeFrames; i++) {
-                const rampGain =
-                  i === fadeFrames - 1
-                    ? 0.0
-                    : useCosine
-                      ? 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
-                      : (fadeFrames - 1 - i) / fadeFrames;
-                const base = (framesToRead + i) * GUEST_PCM_RING_CHANNELS;
-                output[base] = lastL * rampGain;
-                output[base + 1] = lastR * rampGain;
+              const lastFade = fadeFrames - 1;
+              if (useCosine) {
+                if (lastFade > 0) {
+                  const step = Math.PI / fadeFrames;
+                  const halfStep = 0.5 * step;
+                  const s = Math.sin(halfStep);
+                  const k = 4.0 * s * s;
+                  let c = 1.0 - 0.5 * k;
+                  let delta = -0.5 * k - k * c;
+                  for (let i = 0; i < lastFade; i++) {
+                    const rampGain = 0.5 * (1.0 + c);
+                    const base = (framesToRead + i) * GUEST_PCM_RING_CHANNELS;
+                    output[base] = lastL * rampGain;
+                    output[base + 1] = lastR * rampGain;
+                    if (
+                      (i & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                      i + 1 < lastFade
+                    ) {
+                      const nextTheta = (i + 2) * step;
+                      c = Math.cos(nextTheta);
+                      delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+                    } else {
+                      c += delta;
+                      delta -= k * c;
+                    }
+                  }
+                }
+                const endBase = (framesToRead + lastFade) * GUEST_PCM_RING_CHANNELS;
+                output[endBase] = 0.0;
+                output[endBase + 1] = 0.0;
+                this._fastCosineRamps += 1;
+              } else {
+                const invFade = 1.0 / fadeFrames;
+                for (let i = 0; i < fadeFrames; i++) {
+                  const rampGain = i === lastFade ? 0.0 : (lastFade - i) * invFade;
+                  const base = (framesToRead + i) * GUEST_PCM_RING_CHANNELS;
+                  output[base] = lastL * rampGain;
+                  output[base + 1] = lastR * rampGain;
+                }
               }
               if (framesToRead + fadeFrames < reqFrames) {
                 output.fill(
@@ -2734,10 +3106,15 @@
       this._droppedPackets = 0;
       this._lastPushDroppedFrames = 0;
       this._lastPushOverflowed = false;
+      this._fastCosineRamps = 0;
       this._pushScratch = null;
+      this._pushExtractResult = null;
+      this._pushExtractOpts = null;
       this._pullScratch = null;
       this._pullScratchView = null;
       this._pullScratchViewLen = 0;
+      this._pullScratchAllocations = 0;
+      this._pullScratchReuses = 0;
     }
 
     get sab() {
@@ -2810,6 +3187,10 @@
 
     get fadeInCount() {
       return this._fadeInCount;
+    }
+
+    get fastCosineRamps() {
+      return this._fastCosineRamps;
     }
 
     get peakFillFrames() {
@@ -2988,15 +3369,27 @@
       } else {
         if (!this._pushScratch) {
           this._pushScratch = new PcmScratchPool({ maxSamples: 16 * 1024 * 1024 });
+          this._pushExtractResult = {
+            ok: false,
+            pcm: null,
+            copiedFromSab: false,
+            sanitizedSamples: 0,
+            error: '',
+          };
+          this._pushExtractOpts = {
+            maxPcmBytes: 64 * 1024 * 1024,
+            scratch: this._pushScratch,
+            outResult: this._pushExtractResult,
+          };
         }
-        const extracted = extractSafePcmSamples(samples, {
-          maxPcmBytes: 64 * 1024 * 1024,
-          scratch: this._pushScratch,
-        });
+        const extracted = extractSafePcmSamples(samples, this._pushExtractOpts);
         if (!extracted.ok) {
-          throw new TypeError(extracted.error);
+          const errMsg = extracted.error;
+          this._pushExtractResult.pcm = null;
+          throw new TypeError(errMsg);
         }
         pcm = extracted.pcm;
+        this._pushExtractResult.pcm = null;
       }
 
       const channels = this._channels;
@@ -3149,7 +3542,7 @@
      * @param {number} [gainOverride] Optional explicit gain override in [0, 1].
      * @returns {number} Number of real frames pulled before any underrun fill.
      */
-    pullSamples(output, gainOverride) {
+    pullSamples(output, gainOverride, frameCount) {
       if (!(output instanceof Float32Array)) {
         throw new TypeError('pullSamples target must be a Float32Array');
       }
@@ -3158,7 +3551,11 @@
       }
 
       const channels = this._channels;
-      const requestedFrames = Math.floor(output.length / channels);
+      const maxOutputFrames = Math.floor(output.length / channels);
+      const requestedFrames =
+        frameCount !== undefined
+          ? Math.min(sanitizeNonNegInt(frameCount, 0), maxOutputFrames)
+          : maxOutputFrames;
       if (requestedFrames <= 0) {
         return 0;
       }
@@ -3252,12 +3649,43 @@
           const remaining = this._fadeInTotal - this._fadeInPos;
           const rampCount = framesToRead < remaining ? framesToRead : remaining;
           const total = this._fadeInTotal;
-          for (let f = 0; f < rampCount; f++) {
-            const t = (this._fadeInPos + f) / total;
-            const rampGain = useCosine ? 0.5 * (1.0 - Math.cos(Math.PI * t)) : t;
-            const base = f * channels;
-            for (let c = 0; c < channels; c++) {
-              output[base + c] *= rampGain;
+          const startPos = this._fadeInPos;
+          if (useCosine) {
+            const step = Math.PI / total;
+            const halfStep = 0.5 * step;
+            const s = Math.sin(halfStep);
+            const k = 4.0 * s * s;
+            const theta0 = startPos * step;
+            let c = startPos === 0 ? 1.0 : Math.cos(theta0);
+            let delta =
+              startPos === 0 ? -0.5 * k : -2.0 * Math.sin(theta0 + halfStep) * s;
+            for (let f = 0; f < rampCount; f++) {
+              const rampGain = 0.5 * (1.0 - c);
+              const base = f * channels;
+              for (let ch = 0; ch < channels; ch++) {
+                output[base + ch] *= rampGain;
+              }
+              if (
+                (f & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                f + 1 < rampCount
+              ) {
+                const nextTheta = (startPos + f + 1) * step;
+                c = Math.cos(nextTheta);
+                delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+              } else {
+                c += delta;
+                delta -= k * c;
+              }
+            }
+            this._fastCosineRamps += 1;
+          } else {
+            const invTotal = 1.0 / total;
+            for (let f = 0; f < rampCount; f++) {
+              const rampGain = (startPos + f) * invTotal;
+              const base = f * channels;
+              for (let ch = 0; ch < channels; ch++) {
+                output[base + ch] *= rampGain;
+              }
             }
           }
           this._fadeInPos += rampCount;
@@ -3286,15 +3714,47 @@
               const fadeFrames =
                 declickFrames < framesToRead ? declickFrames : framesToRead;
               const fadeStart = framesToRead - fadeFrames;
-              for (let i = 0; i < fadeFrames; i++) {
-                const rampGain = useCosine
-                  ? i === fadeFrames - 1
-                    ? 0.0
-                    : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
-                  : (fadeFrames - 1 - i) / fadeFrames;
-                const base = (fadeStart + i) * channels;
-                for (let c = 0; c < channels; c++) {
-                  output[base + c] *= rampGain;
+              const lastFade = fadeFrames - 1;
+              if (useCosine) {
+                if (lastFade > 0) {
+                  const step = Math.PI / fadeFrames;
+                  const halfStep = 0.5 * step;
+                  const s = Math.sin(halfStep);
+                  const k = 4.0 * s * s;
+                  let c = 1.0 - 0.5 * k;
+                  let delta = -0.5 * k - k * c;
+                  for (let i = 0; i < lastFade; i++) {
+                    const rampGain = 0.5 * (1.0 + c);
+                    const base = (fadeStart + i) * channels;
+                    for (let ch = 0; ch < channels; ch++) {
+                      output[base + ch] *= rampGain;
+                    }
+                    if (
+                      (i & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                      i + 1 < lastFade
+                    ) {
+                      const nextTheta = (i + 2) * step;
+                      c = Math.cos(nextTheta);
+                      delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+                    } else {
+                      c += delta;
+                      delta -= k * c;
+                    }
+                  }
+                }
+                const endBase = (fadeStart + lastFade) * channels;
+                for (let ch = 0; ch < channels; ch++) {
+                  output[endBase + ch] = 0.0;
+                }
+                this._fastCosineRamps += 1;
+              } else {
+                const invFade = 1.0 / fadeFrames;
+                for (let i = 0; i < fadeFrames; i++) {
+                  const rampGain = (lastFade - i) * invFade;
+                  const base = (fadeStart + i) * channels;
+                  for (let ch = 0; ch < channels; ch++) {
+                    output[base + ch] *= rampGain;
+                  }
                 }
               }
               output.fill(0, framesToRead * channels, requestedFrames * channels);
@@ -3308,18 +3768,50 @@
               }
               const fadeFrames =
                 declickFrames < missingFrames ? declickFrames : missingFrames;
-              for (let i = 0; i < fadeFrames; i++) {
-                const rampGain =
-                  fadeFrames === 1
-                    ? 0.5
-                    : useCosine
-                      ? i === fadeFrames - 1
-                        ? 0.0
-                        : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
-                      : (fadeFrames - 1 - i) / fadeFrames;
-                const base = (framesToRead + i) * channels;
-                for (let c = 0; c < channels; c++) {
-                  output[base + c] = this._lastOutputFrame[c] * rampGain;
+              const lastFade = fadeFrames - 1;
+              if (fadeFrames === 1) {
+                const base = framesToRead * channels;
+                for (let ch = 0; ch < channels; ch++) {
+                  output[base + ch] = this._lastOutputFrame[ch] * 0.5;
+                }
+              } else if (useCosine) {
+                const step = Math.PI / fadeFrames;
+                const halfStep = 0.5 * step;
+                const s = Math.sin(halfStep);
+                const k = 4.0 * s * s;
+                let c = 1.0 - 0.5 * k;
+                let delta = -0.5 * k - k * c;
+                for (let i = 0; i < lastFade; i++) {
+                  const rampGain = 0.5 * (1.0 + c);
+                  const base = (framesToRead + i) * channels;
+                  for (let ch = 0; ch < channels; ch++) {
+                    output[base + ch] = this._lastOutputFrame[ch] * rampGain;
+                  }
+                  if (
+                    (i & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                    i + 1 < lastFade
+                  ) {
+                    const nextTheta = (i + 2) * step;
+                    c = Math.cos(nextTheta);
+                    delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+                  } else {
+                    c += delta;
+                    delta -= k * c;
+                  }
+                }
+                const endBase = (framesToRead + lastFade) * channels;
+                for (let ch = 0; ch < channels; ch++) {
+                  output[endBase + ch] = 0.0;
+                }
+                this._fastCosineRamps += 1;
+              } else {
+                const invFade = 1.0 / fadeFrames;
+                for (let i = 0; i < fadeFrames; i++) {
+                  const rampGain = (lastFade - i) * invFade;
+                  const base = (framesToRead + i) * channels;
+                  for (let ch = 0; ch < channels; ch++) {
+                    output[base + ch] = this._lastOutputFrame[ch] * rampGain;
+                  }
                 }
               }
               if (framesToRead + fadeFrames < requestedFrames) {
@@ -3401,16 +3893,13 @@
         this._pullScratch = new Float32Array(neededSamples);
         this._pullScratchView = this._pullScratch;
         this._pullScratchViewLen = neededSamples;
-      } else if (this._pullScratchViewLen !== neededSamples) {
-        this._pullScratchView =
-          neededSamples === this._pullScratch.length
-            ? this._pullScratch
-            : this._pullScratch.subarray(0, neededSamples);
-        this._pullScratchViewLen = neededSamples;
+        this._pullScratchAllocations += 1;
+      } else {
+        this._pullScratchReuses += 1;
       }
 
-      const framesRead = this.pullSamples(this._pullScratchView, gainOverride);
-      deinterleavePcm(this._pullScratchView, channels, requestedFrames, planarOutputs);
+      const framesRead = this.pullSamples(this._pullScratch, gainOverride, requestedFrames);
+      deinterleavePcm(this._pullScratch, channels, requestedFrames, planarOutputs);
       return framesRead;
     }
 
@@ -3489,6 +3978,11 @@
       this._droppedPackets = 0;
       this._lastPushDroppedFrames = 0;
       this._lastPushOverflowed = false;
+      this._fastCosineRamps = 0;
+      this._pullScratchReuses = 0;
+      if (this._pushScratch) {
+        this._pushScratch.resetStats();
+      }
     }
 
     getStats() {
@@ -3524,6 +4018,9 @@
         maxConsecutiveUnderruns: this._maxConsecutiveUnderruns,
         fadeOutCount: this._fadeOutCount,
         fadeInCount: this._fadeInCount,
+        fastCosineRamps: this._fastCosineRamps,
+        scratchBufferReuses:
+          this._pullScratchReuses + (this._pushScratch ? this._pushScratch.reuses : 0),
         peakFillFrames: this.peakFillFrames,
         minFillFrames: this.minFillFrames,
         avgFillRatio: this.avgFillRatio,
@@ -3641,11 +4138,32 @@
       this._scratchPool = new PcmScratchPool({
         maxSamples: Math.max(1, Math.floor(this._maxPcmBytes / Float32Array.BYTES_PER_ELEMENT)),
       });
+      this._extractResult = {
+        ok: false,
+        pcm: null,
+        copiedFromSab: false,
+        sanitizedSamples: 0,
+        error: '',
+      };
+      this._extractOpts = {
+        maxPcmBytes: this._maxPcmBytes,
+        scratch: this._scratchPool,
+        outResult: this._extractResult,
+      };
       this._dmStats = {
         downmixedFrames: 0,
         clippedSamples: 0,
         nanSanitizedSamples: 0,
         peakLevel: 0.0,
+      };
+      this._downmixOpts = {
+        centerGain: undefined,
+        surroundGain: undefined,
+        lfeGain: undefined,
+        softClip: true,
+        limiterKnee: this._limiterKnee,
+        scratch: this._scratchPool,
+        stats: this._dmStats,
       };
       this._rsStats = {
         resampledFrames: 0,
@@ -3689,6 +4207,7 @@
       this._clippedSamples = 0;
       this._softClippedSamples = 0;
       this._zeroAllocDrains = 0;
+      this._fastCosineRamps = 0;
       this._activeVoicePeak = 0;
       this._resamplerState = { phase: 0.0 };
       this._lastResampleSrcRate = null;
@@ -4075,8 +4594,8 @@
       }
       if (nextRate !== this.sampleRate) {
         this.sampleRate = nextRate;
-        this._guestResamplerState = { phase: 0.0 };
-        this._resamplerState = { phase: 0.0 };
+        this._guestResamplerState.phase = 0.0;
+        this._resamplerState.phase = 0.0;
         this._lastResampleSrcRate = null;
       }
       return this.sampleRate;
@@ -4733,8 +5252,8 @@
         this._pullPlanarResult.frameCount = frames;
         return this._pullPlanarResult;
       }
-      const scratchInterleaved = this._scratchPool.acquireFloat32('pull', frames * channels);
-      const framesRead = this.ring.pullSamples(scratchInterleaved, gainOverride);
+      const scratchInterleaved = this._scratchPool.acquireFloat32Backing('pull', frames * channels);
+      const framesRead = this.ring.pullSamples(scratchInterleaved, gainOverride, frames);
       this.totalPulledFrames += framesRead;
       deinterleavePcm(scratchInterleaved, channels, frames, planar);
       this._pullPlanarResult.framesRead = framesRead;
@@ -4812,7 +5331,7 @@
       if (descriptor.fadeCurve !== undefined) {
         this._guestFadeCurve = sanitizeFadeCurve(descriptor.fadeCurve, this._guestFadeCurve);
       }
-      this._guestResamplerState = { phase: 0.0 };
+      this._guestResamplerState.phase = 0.0;
 
       if (descriptor.resetStats === true) {
         this._guestFramesDrained = 0;
@@ -4837,6 +5356,19 @@
         'guestDrain',
         prewarmFrames * GUEST_PCM_RING_CHANNELS
       );
+      if (reader.sampleRate !== this.sampleRate) {
+        const resampledPrewarmFrames = Math.min(
+          Math.max(
+            prewarmFrames,
+            Math.ceil((prewarmFrames * this.sampleRate) / reader.sampleRate) + 4
+          ),
+          quantumCap
+        );
+        this._scratchPool.acquireFloat32Backing(
+          'resample',
+          resampledPrewarmFrames * GUEST_PCM_RING_CHANNELS
+        );
+      }
 
       if (this.initialized && this.ring && this._autoDrain && this._shouldRunTimer()) {
         const desiredInterval = this._effectiveTimerIntervalMs();
@@ -4866,7 +5398,7 @@
       this._guestRing = null;
       this._guestRingExplicitQuantum = false;
       this._guestRingAutoPump = false;
-      this._guestResamplerState = { phase: 0.0 };
+      this._guestResamplerState.phase = 0.0;
       if (!this._shouldRunTimer()) {
         this._stopDrainTimer();
       }
@@ -5182,12 +5714,42 @@
             const rem = this._directResampleFadeInTotal - this._directResampleFadeInPos;
             const rampCount = outFramesWritten < rem ? outFramesWritten : rem;
             const total = this._directResampleFadeInTotal;
-            for (let f = 0; f < rampCount; f++) {
-              const t = (this._directResampleFadeInPos + f) / total;
-              const rampGain = useCosine ? 0.5 * (1.0 - Math.cos(Math.PI * t)) : t;
-              const base = f * GUEST_PCM_RING_CHANNELS;
-              output[base] *= rampGain;
-              output[base + 1] *= rampGain;
+            const startPos = this._directResampleFadeInPos;
+            if (useCosine) {
+              const step = Math.PI / total;
+              const halfStep = 0.5 * step;
+              const s = Math.sin(halfStep);
+              const k = 4.0 * s * s;
+              const theta0 = startPos * step;
+              let c = startPos === 0 ? 1.0 : Math.cos(theta0);
+              let delta =
+                startPos === 0 ? -0.5 * k : -2.0 * Math.sin(theta0 + halfStep) * s;
+              for (let f = 0; f < rampCount; f++) {
+                const rampGain = 0.5 * (1.0 - c);
+                const base = f * GUEST_PCM_RING_CHANNELS;
+                output[base] *= rampGain;
+                output[base + 1] *= rampGain;
+                if (
+                  (f & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                  f + 1 < rampCount
+                ) {
+                  const nextTheta = (startPos + f + 1) * step;
+                  c = Math.cos(nextTheta);
+                  delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+                } else {
+                  c += delta;
+                  delta -= k * c;
+                }
+              }
+              this._fastCosineRamps += 1;
+            } else {
+              const invTotal = 1.0 / total;
+              for (let f = 0; f < rampCount; f++) {
+                const rampGain = (startPos + f) * invTotal;
+                const base = f * GUEST_PCM_RING_CHANNELS;
+                output[base] *= rampGain;
+                output[base + 1] *= rampGain;
+              }
             }
             this._directResampleFadeInPos += rampCount;
             if (this._directResampleFadeInPos >= this._directResampleFadeInTotal) {
@@ -5215,18 +5777,47 @@
                 drainDeclickFrames < underrunFrames ? drainDeclickFrames : underrunFrames;
               const lastL = this._directResampleLastFrame[0];
               const lastR = this._directResampleLastFrame[1];
-              for (let i = 0; i < fadeFrames; i++) {
-                const rampGain =
-                  fadeFrames === 1
-                    ? 0.5
-                    : useCosine
-                      ? i === fadeFrames - 1
-                        ? 0.0
-                        : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
-                      : (fadeFrames - 1 - i) / fadeFrames;
-                const base = (outFramesWritten + i) * GUEST_PCM_RING_CHANNELS;
-                output[base] = lastL * rampGain;
-                output[base + 1] = lastR * rampGain;
+              const lastFade = fadeFrames - 1;
+              if (fadeFrames === 1) {
+                const base = outFramesWritten * GUEST_PCM_RING_CHANNELS;
+                output[base] = lastL * 0.5;
+                output[base + 1] = lastR * 0.5;
+              } else if (useCosine) {
+                const step = Math.PI / fadeFrames;
+                const halfStep = 0.5 * step;
+                const s = Math.sin(halfStep);
+                const k = 4.0 * s * s;
+                let c = 1.0 - 0.5 * k;
+                let delta = -0.5 * k - k * c;
+                for (let i = 0; i < lastFade; i++) {
+                  const rampGain = 0.5 * (1.0 + c);
+                  const base = (outFramesWritten + i) * GUEST_PCM_RING_CHANNELS;
+                  output[base] = lastL * rampGain;
+                  output[base + 1] = lastR * rampGain;
+                  if (
+                    (i & COS_RECURRENCE_RESYNC_MASK) === COS_RECURRENCE_RESYNC_MASK &&
+                    i + 1 < lastFade
+                  ) {
+                    const nextTheta = (i + 2) * step;
+                    c = Math.cos(nextTheta);
+                    delta = -2.0 * Math.sin(nextTheta + halfStep) * s;
+                  } else {
+                    c += delta;
+                    delta -= k * c;
+                  }
+                }
+                const endBase = (outFramesWritten + lastFade) * GUEST_PCM_RING_CHANNELS;
+                output[endBase] = 0.0;
+                output[endBase + 1] = 0.0;
+                this._fastCosineRamps += 1;
+              } else {
+                const invFade = 1.0 / fadeFrames;
+                for (let i = 0; i < fadeFrames; i++) {
+                  const rampGain = (lastFade - i) * invFade;
+                  const base = (outFramesWritten + i) * GUEST_PCM_RING_CHANNELS;
+                  output[base] = lastL * rampGain;
+                  output[base + 1] = lastR * rampGain;
+                }
               }
               if (outFramesWritten + fadeFrames < requestedFrames) {
                 output.fill(
@@ -5266,6 +5857,23 @@
         const zeroAlloc = this._scratchPool.allocations === allocsBefore;
         if (zeroAlloc) {
           this._zeroAllocDrains += 1;
+        }
+
+        if (outResult) {
+          outResult.framesDrained = readRes.framesRead;
+          outResult.requestedFrames = requestedFrames;
+          outResult.outputFrames = outFramesWritten;
+          outResult.pushedFrames = 0;
+          outResult.droppedFrames = 0;
+          outResult.underrun = underrun;
+          outResult.underrunFrames = underrunFrames;
+          outResult.overrun = readRes.overrun;
+          outResult.overrunDroppedFrames = readRes.overrunDroppedFrames;
+          outResult.peakLevel = peakLevel;
+          outResult.zeroAlloc = zeroAlloc;
+          outResult.sanitizedNonFiniteSamples = totalSanitized;
+          outResult.softClippedSamples = totalSoftClipped;
+          return outResult;
         }
 
         return {
@@ -5461,14 +6069,15 @@
       this._clippedSamples = 0;
       this._softClippedSamples = 0;
       this._zeroAllocDrains = 0;
+      this._fastCosineRamps = 0;
       this._activeVoicePeak = 0;
-      this._resamplerState = { phase: 0.0 };
+      this._resamplerState.phase = 0.0;
       this._lastResampleSrcRate = null;
       this._lastDrainMs = null;
       this._stalledFullTicks = 0;
       this._stalledFullSinceMs = null;
       this._lastObservedReadCursor = null;
-      this._guestResamplerState = { phase: 0.0 };
+      this._guestResamplerState.phase = 0.0;
       this._guestFramesDrained = 0;
       this._guestUnderruns = 0;
       this._guestUnderrunFrames = 0;
@@ -5569,6 +6178,8 @@
             underrunRecoveries: 0,
             fadeOutCount: 0,
             fadeInCount: 0,
+            fastCosineRamps: 0,
+            scratchBufferReuses: 0,
             peakFillFrames: 0,
             minFillFrames: 0,
             avgFillRatio: 0.0,
@@ -5630,6 +6241,11 @@
         activeVoicePeak: this._activeVoicePeak,
         scratchAllocations: this._scratchPool.allocations,
         scratchReuses: this._scratchPool.reuses,
+        scratchBufferReuses: this._scratchPool.reuses + (ringStats.scratchBufferReuses || 0),
+        fastCosineRamps:
+          (ringStats.fastCosineRamps || 0) +
+          (this._guestRing ? this._guestRing.fastCosineRamps : 0) +
+          this._fastCosineRamps,
         zeroAllocDrains: this._zeroAllocDrains,
         guestRingAttached: this._guestRing !== null,
         guestFramesDrained: this._guestFramesDrained,
@@ -6002,29 +6618,34 @@
               }
             }
             inferredChannels = chCount;
-            extracted = {
-              ok: true,
-              pcm: interleaved,
-              copiedFromSab,
-              sanitizedSamples,
-            };
+            extracted = this._extractResult;
+            extracted.ok = true;
+            extracted.pcm = interleaved;
+            extracted.copiedFromSab = copiedFromSab;
+            extracted.sanitizedSamples = sanitizedSamples;
+            extracted.error = '';
           } else {
-            extracted = extractSafePcmSamples(msg.samples, {
-              maxPcmBytes: this._maxPcmBytes,
-              scratch: this._scratchPool,
-            });
+            this._extractOpts.maxPcmBytes = this._maxPcmBytes;
+            extracted = extractSafePcmSamples(msg.samples, this._extractOpts);
           }
 
           if (!extracted.ok) {
+            const extractErr = extracted.error;
+            this._extractResult.pcm = null;
             this._rejectedPackets += 1;
             if (safeId !== undefined) {
               this._safePostMessage({
                 id: safeId,
-                error: extracted.error,
+                error: extractErr,
               });
             }
             return;
           }
+
+          const extractedPcm = extracted.pcm;
+          const extractedCopiedFromSab = extracted.copiedFromSab;
+          const extractedSanitizedSamples = extracted.sanitizedSamples;
+          this._extractResult.pcm = null;
 
           const srcChannels = msg.channels !== undefined ? msg.channels : inferredChannels;
           if (!Number.isInteger(srcChannels) || srcChannels < 1 || srcChannels > MAX_CHANNELS) {
@@ -6081,14 +6702,14 @@
 
           this._packetsReceived += 1;
 
-          if (extracted.copiedFromSab) {
+          if (extractedCopiedFromSab) {
             this._sabCopiedPackets += 1;
           }
-          if (extracted.sanitizedSamples > 0) {
-            this._sanitizedSamples += extracted.sanitizedSamples;
+          if (extractedSanitizedSamples > 0) {
+            this._sanitizedSamples += extractedSanitizedSamples;
           }
 
-          let pcm = extracted.pcm;
+          let pcm = extractedPcm;
 
           // Step 1: ITU-R BS.775 multi-channel (5.1 / 7.1 / 4ch) or mono -> stereo downmix/adapt.
           if (srcChannels !== this.channels) {
@@ -6104,15 +6725,13 @@
                 : msg.softClipKnee !== undefined
                   ? msg.softClipKnee
                   : this._limiterKnee;
-            pcm = downmixToStereo(pcm, srcChannels, {
-              centerGain: msg.centerGain,
-              surroundGain: msg.surroundGain,
-              lfeGain: msg.lfeGain,
-              softClip: dmSoftClip,
-              limiterKnee: dmKnee,
-              scratch: this._scratchPool,
-              stats: dmStats,
-            });
+            const dmOpts = this._downmixOpts;
+            dmOpts.centerGain = msg.centerGain;
+            dmOpts.surroundGain = msg.surroundGain;
+            dmOpts.lfeGain = msg.lfeGain;
+            dmOpts.softClip = dmSoftClip;
+            dmOpts.limiterKnee = dmKnee;
+            pcm = downmixToStereo(pcm, srcChannels, dmOpts);
             this._downmixedFrames += dmStats.downmixedFrames;
             this._clippedSamples += dmStats.clippedSamples;
             if (dmSoftClip) {
@@ -6143,7 +6762,7 @@
           // Step 2: Smooth 44.1 kHz <-> 48 kHz (and general) linear resampling with phase continuity.
           if (srcSampleRate !== this.sampleRate) {
             if (this._lastResampleSrcRate !== srcSampleRate) {
-              this._resamplerState = { phase: 0.0 };
+              this._resamplerState.phase = 0.0;
               this._lastResampleSrcRate = srcSampleRate;
             }
             const maxOutputFrames = Math.max(
@@ -6154,17 +6773,20 @@
             rsStats.resampledFrames = 0;
             rsStats.nanSanitizedSamples = 0;
             rsStats.clippedSamples = 0;
-            pcm = resampleLinear(pcm, this.channels, srcSampleRate, this.sampleRate, {
-              state: this._resamplerState,
-              maxOutputFrames,
-              scratch: this._scratchPool,
-              stats: rsStats,
-            });
+            const rsOpts = this._resampleOpts;
+            rsOpts.srcFrames = undefined;
+            rsOpts.state = this._resamplerState;
+            rsOpts.maxOutputFrames = maxOutputFrames;
+            rsOpts.scratch = this._scratchPool;
+            rsOpts.stats = rsStats;
+            rsOpts.softClip = false;
+            rsOpts.limiterKnee = this._limiterKnee;
+            pcm = resampleLinear(pcm, this.channels, srcSampleRate, this.sampleRate, rsOpts);
             this._resampledFrames += rsStats.resampledFrames;
             this._sanitizedSamples += rsStats.nanSanitizedSamples;
             this._clippedSamples += rsStats.clippedSamples;
           } else if (this._lastResampleSrcRate !== null) {
-            this._resamplerState = { phase: 0.0 };
+            this._resamplerState.phase = 0.0;
             this._lastResampleSrcRate = null;
           }
 
