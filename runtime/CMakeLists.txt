@@ -89,6 +89,7 @@ add_library(playgta6_core STATIC
     guest/export_counters.cpp
     guest/audio_probes.cpp
     guest/guest_watch.cpp
+    guest/guest_probe.cpp
     guest/input_script.cpp
     guest/host_input.cpp
     guest/keymap.cpp
@@ -460,6 +461,9 @@ else()
     add_executable(test_guest_watch ../tests/test_guest_watch.cpp)
     target_link_libraries(test_guest_watch PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_watch_tests COMMAND test_guest_watch)
+    add_executable(test_guest_probe ../tests/test_guest_probe.cpp)
+    target_link_libraries(test_guest_probe PRIVATE playgta6_core)
+    add_test(NAME playgta6_guest_probe_tests COMMAND test_guest_probe)
 
     add_executable(test_audio_probes ../tests/test_audio_probes.cpp)
     target_link_libraries(test_audio_probes PRIVATE playgta6_core)

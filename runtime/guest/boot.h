@@ -10,6 +10,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "guest/export_thunks.h"
+#include "guest/guest_probe.h"
 #include "guest/guest_watch.h"
 #include "guest/guest_runtime.h"
 #include "guest/memory_model.h"
@@ -464,6 +465,10 @@ struct BootConfig {
     // checked writes are logged, with a snapshot of their contents at each `--probe-functions`
     // entry and at the fault (guest/guest_watch.h). Empty: off.
     std::vector<WatchRange> watch_guest_va;
+    // `--probe` specs (guest/guest_probe.h) and the JSONL file their hits are written to (empty: the
+    // report's "guest_probes" counters only). Empty specs: off.
+    std::vector<std::string> probe_specs;
+    std::string probe_out;
     // Non-empty: append every distinct (call site, target) pair of guest code the run dispatched
     // through the indirect-call path to this file (guest/indirect_targets.h), at the end of the
     // run and at a fault. Feed it back with `playgta6-recomp build-program --seed-targets`.

@@ -96,6 +96,38 @@ The `bink` block of the report lists Bink export lookups that returned null (`lo
 - **Watchdog / time limit**: the run hit `--max-ms` (not a crash) or `--watchdog-ms` (it did not stop in time:
   read the `[hang-stack]` lines and the watchdog dump).
 
+## Probing guest functions without code changes
+
+Do not patch probes into `boot.cpp`: a raw guest value (`0x21`) dereferenced as a pointer, or a scan past the
+end of a stack, crashes the host and hides the bug under investigation. `playgta6_boot --probe` logs hits of any
+guest function through a reader that cannot fault.
+
+```
+playgta6_boot ... --probe ADDR[:name][:args=N][:ret][:mem=REG+OFF,LEN][:max=N]   (repeatable)
+                  --probe-file FILE    one spec per line, `#` comments
+                  --probe-out FILE     default <report>.probe.jsonl
+```
+
+- `ADDR`: hex VA. A main-executable link VA (`0x14...`) is rebased onto the loaded image; `module.dll+0xOFF` is an
+  offset into a loaded module.
+- `args=N` (0..8): the first N integer arguments (rcx rdx r8 r9, then stack slots).
+- `mem=REG+OFF,LEN`: LEN (1..256) bytes at register plus signed hex offset, up to 4 per probe, e.g.
+  `mem=rcx+10,32` or `mem=rdx-8,16`.
+- `max=N`: log lines for this probe (default 200); a global budget of 20000 lines also applies. Counters keep
+  counting past the limits.
+- `ret`: accepted and logged as `"ret":"unsupported"`. The lifter has no function-exit hook, so a return value
+  cannot be observed yet; log the callee's output buffer with `mem=` at its caller instead.
+
+Each hit is one JSON line: `seq`, `t_ms`, `thread`, `src`, `name`, `addr`, `caller` (return address), `args`,
+`mem`. Every memory read is range-checked (null page, non-canonical, wrapping) and then goes through the
+arena's checked copy page by page, so a bad address is logged as `status` `null_page`, `out_of_range`,
+`overflow`, `unmapped` (not mapped or not committed) or `partial` (`ok_bytes` readable), never a fault. The
+boot report's `guest_probes` lists per probe `calls`, `entry_calls`, `logged` and `rate_limited`.
+
+Hits are seen at dispatch (indirect calls, vtable calls). Direct calls between lifted functions only show for
+functions listed in the build's `--probe-functions` file (the entry counter), which needs a rebuild of the
+lifted program; a function reached both ways is logged once per execution.
+
 ## What to send to developers
 
 - The run directory **name** (for example `play-local-20261127-101500`) and the build commit (`prebuilt.json`

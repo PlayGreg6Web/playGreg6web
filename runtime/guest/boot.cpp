@@ -1,6 +1,7 @@
 #include "guest/boot.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -19,6 +20,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "guest/audio_probes.h"
+#include "guest/guest_probe.h"
 #include "guest/hash_registry_scan.h"
 #include "guest/streaming_drain_probe.h"
 #include "os/audio_stream_log.h"
@@ -501,6 +503,7 @@ struct BootState {
 
     // B2: call counters for the exports of the lifted Bink2Scarlett.dll and how its exports bound.
     ExportCounters bink;
+    ProbeSet guest_probes;     // --probe / --probe-file (guest/guest_probe.h)
     AudioProbes audio_probes;  // A4: title audio-stack call counters (main executable addresses)
     std::atomic<uint64_t> music_controller{0};  // rcx at the first music_controller_init entry (guest VA)
     GuestWatch watch;          // --watch-guest-va (guest/guest_watch.h)
@@ -534,6 +537,7 @@ thread_local uint64_t t_last_import_seq = 0;
 constexpr size_t kDispatchRing = 64;
 thread_local DispatchRecord t_dispatch_ring[kDispatchRing];
 thread_local uint64_t t_dispatch_count = 0;
+thread_local uint64_t t_probe_dispatch_va = 0;  // a --probe hit the dispatch observer logged; its entry hook skips it
 
 // Per-thread observer state: batches dispatch counter increments and owns a lock-free
 // post-present recent-import ring. Its destructor flushes pending dispatches on thread exit.
@@ -1456,6 +1460,87 @@ void setup_audio_probes(BootState& b) {
     b.audio_probes.configure(std::move(probes));
 }
 
+// `--probe` / `--probe-file`: resolve the specs against the loaded modules (a main-executable link VA
+// is rebased onto the image, `module+off` onto that module) and open the JSONL file. A spec that
+// does not resolve is reported and skipped.
+void setup_guest_probes(BootState& b, const BootConfig& config) {
+    b.guest_probes.clear();
+    if (config.probe_specs.empty()) {
+        return;
+    }
+    constexpr uint64_t kLinkBase = 0x140000000ull;
+    std::vector<ProbeSpec> specs;
+    for (const std::string& text : config.probe_specs) {
+        ProbeSpec s;
+        std::string err;
+        if (!parse_probe_spec(text, &s, &err)) {
+            logf("[probe] ignoring '%s': %s", text.c_str(), err.c_str());
+            continue;
+        }
+        if (!s.module.empty()) {
+            const ModuleState* found = nullptr;
+            for (const ModuleState& m : b.modules) {
+                std::string a = m.name, z = s.module;
+                std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                std::transform(z.begin(), z.end(), z.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (m.loaded && m.image.base != 0 && a == z) {
+                    found = &m;
+                    break;
+                }
+            }
+            if (found == nullptr) {
+                logf("[probe] ignoring '%s': module %s is not loaded", text.c_str(), s.module.c_str());
+                continue;
+            }
+            s.addr += found->image.base;
+        } else if (s.addr >= kLinkBase && !b.modules.empty() && b.modules[0].loaded && b.modules[0].image.base != 0) {
+            s.addr = b.modules[0].image.base + (s.addr - kLinkBase);
+        }
+        specs.push_back(std::move(s));
+    }
+    b.guest_probes.configure(std::move(specs), config.probe_out);
+    for (size_t i = 0; i < b.guest_probes.size(); ++i) {
+        logf("[probe] %s at 0x%" PRIx64 " -> %s",
+             b.guest_probes.spec(i).name.empty() ? "probe" : b.guest_probes.spec(i).name.c_str(),
+             b.guest_probes.address(i), config.probe_out.empty() ? "(counters only)" : config.probe_out.c_str());
+    }
+}
+
+// One `--probe` hit: counted always, logged (as a JSONL line) under the rate limits. `entry` is the
+// `__playgta6_probe_hit` entry counter, otherwise the dispatch observer. Reads go through the
+// arena's checked copy with the diagnostic-read scope (never blocks on the arena lock).
+void guest_probe_hit(BootState& b, GuestState* state, long idx, uint64_t va, bool entry) {
+    if (idx < 0) {
+        return;
+    }
+    if (entry) {
+        if (t_probe_dispatch_va == va) {
+            t_probe_dispatch_va = 0;  // the dispatch observer already logged this execution
+            return;
+        }
+    } else {
+        t_probe_dispatch_va = va;
+    }
+    if (!b.guest_probes.count_hit(static_cast<size_t>(idx), entry)) {
+        return;
+    }
+    ProbeHit hit;
+    hit.t_ms = elapsed_ms();
+    hit.thread = t_active != nullptr ? t_active->thread_id : 0u;
+    hit.source = entry ? "entry" : "dispatch";
+    for (int i = 0; i < 16; ++i) {
+        hit.regs[i] = state->gpr[i];
+    }
+    VirtualMemoryArena* arena = b.arena;
+    b.guest_probes.log_hit(static_cast<size_t>(idx), hit, [arena](uint64_t a, void* dst, size_t n) {
+        if (arena == nullptr) {
+            return false;
+        }
+        VirtualMemoryArena::DiagnosticReads scope;
+        return arena->read(a, dst, n);
+    });
+}
+
 // First call of a counted Bink2Scarlett.dll export: BinkOpenWithOptions is the BINK_OPEN milestone
 // (the import-name milestone cannot see a guest-to-guest call), the others are logged.
 void bink_first_call(BootState& b, size_t index) {
@@ -1485,6 +1570,9 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
         if (first && bink_index >= 0) {
             bink_first_call(b, static_cast<size_t>(bink_index));
         }
+    }
+    if (b.guest_probes.active()) {
+        guest_probe_hit(b, state, b.guest_probes.find(target), target, false);
     }
     if (b.audio_probes.active()) {
         const uint64_t args[AudioProbes::kArgs] = {state->gpr[GuestReg::Rcx], state->gpr[GuestReg::Rdx],
@@ -2750,6 +2838,7 @@ std::string build_report() {
         o += ordered.empty() ? "]},\n" : "\n  ]},\n";
 
         o += bink_json() + ",\n";
+        o += "  \"guest_probes\": " + b.guest_probes.to_json() + ",\n";
         o += "  \"audio_probes\": " + b.audio_probes.to_json() + ",\n";
         o += "  \"audio_stream_log\": " + os::audio_stream_log::log().to_json() + ",\n";
         o += "  \"music_controller\": " + music_controller_json(b) + ",\n";
@@ -4274,6 +4363,7 @@ void reset_boot() {
     b.bink_exports_lifted = 0;
     b.bink_exports_shim = 0;
     b.audio_probes.clear();
+    b.guest_probes.clear();
     b.music_controller = 0;
     os::audio_stream_log::log().reset();
     os::audio_stream_log::log().set_sources(&boot_elapsed_ms, &boot_present_count);
@@ -4648,6 +4738,7 @@ BootResult run_boot(const BootConfig& config) {
     // lifted/shim classification of Bink2Scarlett.dll's exports is only meaningful from here on.
     setup_bink_counters(b);
     setup_audio_probes(b);
+    setup_guest_probes(b, config);
     // R11 unwinder: every image's .pdata (RtlLookupFunctionEntry, exception dispatch, backtraces),
     // unless after_load (R12's register_program_modules) registered it already.
     for (ModuleState& m : b.modules) {
@@ -4760,6 +4851,9 @@ extern "C" void __playgta6_probe_hit(playgta6::GuestState* state, uint64_t va) {
                       " rdx=0x%" PRIx64, elapsed_ms(), t_active != nullptr ? t_active->thread_id : 0u, va,
                       state->gpr[playgta6::GuestReg::Rcx], state->gpr[playgta6::GuestReg::Rdx]);
         playgta6::os::log(std::string(head) + watch_snapshot(b));  // longer than logf's buffer
+    }
+    if (b.guest_probes.active()) {
+        guest_probe_hit(b, state, b.guest_probes.find(va), va, true);
     }
     if (!b.audio_probes.active()) {
         return;

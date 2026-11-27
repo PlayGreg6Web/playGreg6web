@@ -318,6 +318,8 @@ struct Options {
     std::string record_indirect_targets;  // --record-indirect-targets <file>
     bool dump_on_fault = false;  // --dump-on-fault: also write a minidump on a guest fault
     bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
+    std::vector<std::string> probe_specs;  // --probe SPEC (repeatable), --probe-file FILE (one spec per line)
+    std::string probe_out;                 // --probe-out FILE (default <report>.probe.jsonl)
     std::vector<playgta6::guest::WatchRange> watch;  // --watch-guest-va <addr>[:len] (repeatable)
     bool present_honor_interval = false;  // --present-interval honor|min1 (default min1)
     bool test_stall = false;  // --test-stall: test seam, the boot thread hangs once the boot is active
@@ -337,7 +339,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--watch-guest-va <addr>[:len]] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages] [--flush-full|--flush-crosscheck [n]]\n"
+                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--watch-guest-va <addr>[:len]] [--probe ADDR[:name][:args=N][:ret][:mem=REG+OFF,LEN]] [--probe-file FILE] [--probe-out FILE] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages] [--flush-full|--flush-crosscheck [n]]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
@@ -387,6 +389,38 @@ bool parse(int argc, char** argv, Options& o) {
             playgta6::guest::WatchRange r;
             if (!playgta6::guest::parse_watch_spec(argv[++i], &r)) return false;
             o.watch.push_back(r);
+        } else if (a == "--probe" && i + 1 < argc) {
+            playgta6::guest::ProbeSpec ps;
+            std::string perr;
+            if (!playgta6::guest::parse_probe_spec(argv[++i], &ps, &perr)) {
+                std::fprintf(stderr, "--probe %s: %s\n", argv[i], perr.c_str());
+                return false;
+            }
+            o.probe_specs.push_back(argv[i]);
+        } else if (a == "--probe-file" && i + 1 < argc) {
+            std::ifstream pf(argv[++i]);
+            if (!pf) {
+                std::fprintf(stderr, "--probe-file: cannot open %s\n", argv[i]);
+                return false;
+            }
+            std::string line;
+            while (std::getline(pf, line)) {
+                const size_t hash = line.find('#');
+                if (hash != std::string::npos) line.resize(hash);
+                while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) line.pop_back();
+                const size_t b0 = line.find_first_not_of(" \t");
+                if (b0 == std::string::npos) continue;
+                line = line.substr(b0);
+                playgta6::guest::ProbeSpec ps;
+                std::string perr;
+                if (!playgta6::guest::parse_probe_spec(line, &ps, &perr)) {
+                    std::fprintf(stderr, "--probe-file %s: '%s': %s\n", argv[i], line.c_str(), perr.c_str());
+                    return false;
+                }
+                o.probe_specs.push_back(line);
+            }
+        } else if (a == "--probe-out" && i + 1 < argc) {
+            o.probe_out = argv[++i];
         } else if (a == "--present-interval" && i + 1 < argc) {
             const std::string v = argv[++i];
             if (v != "honor" && v != "min1") return false;
@@ -1833,6 +1867,10 @@ void run_boot_thread() {
     cfg.log_progress = !g_options.quiet;
     cfg.fault_record = g_options.fault_record;
     cfg.watch_guest_va = g_options.watch;
+    cfg.probe_specs = g_options.probe_specs;
+    cfg.probe_out = g_options.probe_specs.empty() ? std::string()
+                    : !g_options.probe_out.empty() ? g_options.probe_out
+                                                   : (g_options.report.empty() ? std::string("probe") : g_options.report) + ".probe.jsonl";
     cfg.record_indirect_targets = g_options.record_indirect_targets;
     cfg.capture_host_stack = &capture_host_stack;
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
