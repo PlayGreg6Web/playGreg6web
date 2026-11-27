@@ -1380,6 +1380,12 @@ export function extractBootAssetUrls(source) {
     source.shaderPack,
     source.wgslPack
   );
+  const wgslSubgroupsPackUrl = pickBootUrl(
+    source.wgslSubgroupsPackUrl,
+    source.subgroupsShaderPackUrl,
+    source.subgroupsPackUrl,
+    source.wgslSubgroupsPack
+  );
   const reflectionManifestUrl = pickBootUrl(
     source.reflectionManifestUrl,
     source.reflectionUrl,
@@ -1390,6 +1396,7 @@ export function extractBootAssetUrls(source) {
   if (bootBase) out.bootBase = bootBase;
   if (gameBase) out.gameBase = gameBase;
   if (shaderPackUrl) out.shaderPackUrl = shaderPackUrl;
+  if (wgslSubgroupsPackUrl) out.wgslSubgroupsPackUrl = wgslSubgroupsPackUrl;
   if (reflectionManifestUrl) out.reflectionManifestUrl = reflectionManifestUrl;
   if (pgimUrl) out.pgimUrl = pgimUrl;
   if (programManifestUrl) out.programManifestUrl = programManifestUrl;
@@ -1875,7 +1882,11 @@ export function resolveBootstrapPerfProfile(params = {}) {
  * Builds structured-clone-safe worker init fields for `ioWorker` and `gpuWorker` from a
  * resolved `perfProfile` and optional `displayBounds`.
  */
-export function buildWorkerPerfInitPayloads(perfProfile, displayBounds = null) {
+export function buildWorkerPerfInitPayloads(
+  perfProfile,
+  displayBounds = null,
+  extraOptions = null
+) {
   const cleanBounds = cloneDisplayBounds(
     displayBounds !== undefined && displayBounds !== null
       ? displayBounds
@@ -1884,6 +1895,15 @@ export function buildWorkerPerfInitPayloads(perfProfile, displayBounds = null) {
         : null
   );
   const cleanProfile = toCloneablePerfProfile(perfProfile, cleanBounds);
+  const opts = extraOptions && typeof extraOptions === 'object' ? extraOptions : null;
+  const wgslSubgroupsPackUrl = pickBootUrl(
+    opts && opts.wgslSubgroupsPackUrl,
+    opts && opts.subgroupsShaderPackUrl,
+    opts && opts.subgroupsPackUrl,
+    opts && opts.wgslSubgroupsPack,
+    perfProfile && perfProfile.wgslSubgroupsPackUrl
+  );
+  const hasPreferSubgroups = Boolean(opts && typeof opts.preferSubgroups === 'boolean');
   return Object.freeze({
     ioWorker: Object.freeze({
       ...(cleanProfile ? { perfProfile: cleanProfile } : {}),
@@ -1891,6 +1911,8 @@ export function buildWorkerPerfInitPayloads(perfProfile, displayBounds = null) {
     gpuWorker: Object.freeze({
       ...(cleanProfile ? { perfProfile: cleanProfile } : {}),
       ...(cleanBounds ? { displayBounds: cleanBounds } : {}),
+      ...(wgslSubgroupsPackUrl ? { wgslSubgroupsPackUrl } : {}),
+      ...(hasPreferSubgroups ? { preferSubgroups: opts.preferSubgroups } : {}),
     }),
   });
 }
@@ -2395,7 +2417,14 @@ export function bootstrapPlayGta6App(options = {}) {
     options.shaderPack,
     options.wgslPack
   );
+  const explicitWgslSubgroupsPackUrl = pickBootUrl(
+    options.wgslSubgroupsPackUrl,
+    options.subgroupsShaderPackUrl,
+    options.subgroupsPackUrl,
+    options.wgslSubgroupsPack
+  );
   let startOverrideShaderPackUrl = null;
+  let startOverrideWgslSubgroupsPackUrl = null;
   const initialBootAssets = extractBootAssetUrls(options);
   let latestDiscoveredBootAssets = { ...initialBootAssets };
   let lastNotifiedSideModuleKey = null;
@@ -2525,6 +2554,9 @@ export function bootstrapPlayGta6App(options = {}) {
     rangedShaderFetches: 0,
     rangedShaderErrors: 0,
     asyncShaderPendingCount: 0,
+    hasSubgroups: null,
+    subgroupMinSize: null,
+    subgroupMaxSize: null,
     gpuMemory: null,
   };
 
@@ -2873,6 +2905,17 @@ export function bootstrapPlayGta6App(options = {}) {
         merged.shaderPackUrl ||
         DEFAULT_SHADER_PACK_URL,
     };
+    const wgslSubgroupsPackUrl =
+      startOverrideWgslSubgroupsPackUrl ||
+      explicitWgslSubgroupsPackUrl ||
+      merged.wgslSubgroupsPackUrl ||
+      null;
+    if (wgslSubgroupsPackUrl) {
+      fields.wgslSubgroupsPackUrl = wgslSubgroupsPackUrl;
+    }
+    if (typeof options.preferSubgroups === 'boolean') {
+      fields.preferSubgroups = options.preferSubgroups;
+    }
     if (merged.reflectionManifestUrl) {
       fields.reflectionManifestUrl = merged.reflectionManifestUrl;
     }
@@ -4553,6 +4596,9 @@ export function bootstrapPlayGta6App(options = {}) {
       rangedShaderFetches: gpuTelemetry.rangedShaderFetches,
       rangedShaderErrors: gpuTelemetry.rangedShaderErrors,
       asyncShaderPendingCount: gpuTelemetry.asyncShaderPendingCount,
+      hasSubgroups: gpuTelemetry.hasSubgroups,
+      subgroupMinSize: gpuTelemetry.subgroupMinSize,
+      subgroupMaxSize: gpuTelemetry.subgroupMaxSize,
     };
     if (gpuTelemetry.gpuAdapter !== null) {
       payload.gpuAdapter = gpuTelemetry.gpuAdapter;
@@ -5419,6 +5465,52 @@ export function bootstrapPlayGta6App(options = {}) {
     if (asyncShaderPendingField.found && asyncShaderPendingField.value !== null) {
       gpuTelemetry.asyncShaderPendingCount = toSafeNonNegativeInt(asyncShaderPendingField.value, 0);
       matchedW83Field = true;
+    }
+
+    const hasSubgroupsField = pickFirstDefinedField(sources, [
+      'hasSubgroups',
+      'has_subgroups',
+    ]);
+    if (hasSubgroupsField.found && typeof hasSubgroupsField.value === 'boolean') {
+      gpuTelemetry.hasSubgroups = hasSubgroupsField.value;
+      matchedW83Field = true;
+    } else {
+      for (let i = 0; i < sources.length; i += 1) {
+        const feats = sources[i] && sources[i].features;
+        if (Array.isArray(feats)) {
+          gpuTelemetry.hasSubgroups = feats.includes('subgroups');
+          matchedW83Field = true;
+          break;
+        }
+      }
+    }
+
+    const subgroupMinSizeField = pickFirstDefinedField(sources, [
+      'subgroupMinSize',
+      'subgroup_min_size',
+    ]);
+    if (subgroupMinSizeField.found) {
+      const parsedMin = sanitizePositiveInt(subgroupMinSizeField.value);
+      if (parsedMin !== null) {
+        gpuTelemetry.subgroupMinSize = parsedMin;
+        matchedW83Field = true;
+      } else if (subgroupMinSizeField.value === null && gpuTelemetry.subgroupMinSize === null) {
+        matchedW83Field = true;
+      }
+    }
+
+    const subgroupMaxSizeField = pickFirstDefinedField(sources, [
+      'subgroupMaxSize',
+      'subgroup_max_size',
+    ]);
+    if (subgroupMaxSizeField.found) {
+      const parsedMax = sanitizePositiveInt(subgroupMaxSizeField.value);
+      if (parsedMax !== null) {
+        gpuTelemetry.subgroupMaxSize = parsedMax;
+        matchedW83Field = true;
+      } else if (subgroupMaxSizeField.value === null && gpuTelemetry.subgroupMaxSize === null) {
+        matchedW83Field = true;
+      }
     }
 
     // #1077: ingest structured WebGPU VRAM counters (`gpuMemory`) from wgpu_worker / loader.
@@ -7602,7 +7694,15 @@ export function bootstrapPlayGta6App(options = {}) {
     const bootForwardFields = resolveBootForwardFields(launchContext);
     const workerPerfInitPayloads = buildWorkerPerfInitPayloads(
       activePerfProfile,
-      activeDisplayBounds
+      activeDisplayBounds,
+      {
+        ...(bootForwardFields.wgslSubgroupsPackUrl
+          ? { wgslSubgroupsPackUrl: bootForwardFields.wgslSubgroupsPackUrl }
+          : {}),
+        ...(typeof bootForwardFields.preferSubgroups === 'boolean'
+          ? { preferSubgroups: bootForwardFields.preferSubgroups }
+          : {}),
+      }
     );
 
     let worker;
@@ -10045,6 +10145,10 @@ export function bootstrapPlayGta6App(options = {}) {
       gpuStallWarnCount: toSafeNonNegativeInt(gpuTelemetry.gpuStallWarnCount, 0),
       rangedPackActive:
         typeof gpuTelemetry.rangedPackActive === 'boolean' ? gpuTelemetry.rangedPackActive : null,
+      hasSubgroups:
+        typeof gpuTelemetry.hasSubgroups === 'boolean' ? gpuTelemetry.hasSubgroups : null,
+      subgroupMinSize: gpuTelemetry.subgroupMinSize,
+      subgroupMaxSize: gpuTelemetry.subgroupMaxSize,
       gpuMemory: gpuTelemetry.gpuMemory ? Object.freeze({ ...gpuTelemetry.gpuMemory }) : null,
       bootToStartScreenMs,
       bootToIntroVideoMs,
@@ -10128,6 +10232,10 @@ export function bootstrapPlayGta6App(options = {}) {
       gpuStallWarnCount: toSafeNonNegativeInt(gpuTelemetry.gpuStallWarnCount, 0),
       rangedPackActive:
         typeof gpuTelemetry.rangedPackActive === 'boolean' ? gpuTelemetry.rangedPackActive : null,
+      hasSubgroups:
+        typeof gpuTelemetry.hasSubgroups === 'boolean' ? gpuTelemetry.hasSubgroups : null,
+      subgroupMinSize: gpuTelemetry.subgroupMinSize,
+      subgroupMaxSize: gpuTelemetry.subgroupMaxSize,
       gpuMemory: gpuTelemetry.gpuMemory ? Object.freeze({ ...gpuTelemetry.gpuMemory }) : null,
     });
 
@@ -10191,6 +10299,9 @@ export function bootstrapPlayGta6App(options = {}) {
       deviceRecoveredCount: gpu.deviceRecoveredCount,
       gpuStallWarnCount: gpu.gpuStallWarnCount,
       rangedPackActive: gpu.rangedPackActive,
+      hasSubgroups: gpu.hasSubgroups,
+      subgroupMinSize: gpu.subgroupMinSize,
+      subgroupMaxSize: gpu.subgroupMaxSize,
       gpuMemory: gpu.gpuMemory,
       bootToStartScreenMs,
       bootToIntroVideoMs,
@@ -10481,6 +10592,15 @@ export function bootstrapPlayGta6App(options = {}) {
             startOpts.preferredShaderPackUrl,
             startOpts.shaderPack,
             startOpts.wgslPack
+          )
+        : null;
+    startOverrideWgslSubgroupsPackUrl =
+      startOpts && typeof startOpts === 'object'
+        ? pickBootUrl(
+            startOpts.wgslSubgroupsPackUrl,
+            startOpts.subgroupsShaderPackUrl,
+            startOpts.subgroupsPackUrl,
+            startOpts.wgslSubgroupsPack
           )
         : null;
     await initializeFastBootStoragePlan();

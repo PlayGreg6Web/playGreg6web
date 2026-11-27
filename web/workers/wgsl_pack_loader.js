@@ -85,6 +85,115 @@ export const DEFAULT_MAX_COALESCE_SPAN_BYTES = 2 * 1024 * 1024;
 /** Shader index ABI version matching shaders/src/pack.rs and docs/gpu_commands.md. */
 export const SHADER_INDEX_ABI_VERSION = 1;
 
+/** Dual-mode WGSL shader pack variants (`WorkgroupLds` default vs hardware `subgroups`). */
+export const WGSL_PACK_VARIANT = Object.freeze({
+  WORKGROUP_LDS: 'workgroup-lds',
+  SUBGROUPS: 'subgroups',
+});
+
+function pickNonEmptyPackUrl(...candidates) {
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve dual-mode WGSL shader pack selection between the default `WorkgroupLds` pack
+ * and an optional hardware-`subgroups`-compiled pack.
+ *
+ * Accepts either an options object `{ defaultPackUrl, subgroupsPackUrl, hasSubgroups, preferSubgroups }`
+ * or positional `(defaultPackUrl, subgroupsPackUrl, hasSubgroups)`.
+ *
+ * @param {object | string | null | undefined} optionsOrDefaultUrl
+ * @param {string | null} [maybeSubgroupsUrl]
+ * @param {boolean} [maybeHasSubgroups]
+ * @returns {Readonly<{
+ *   url: string | null,
+ *   fallbackUrl: string | null,
+ *   mode: 'subgroups' | 'workgroup-lds',
+ *   usesSubgroupsPack: boolean,
+ *   hasSubgroups: boolean,
+ * }>}
+ */
+export function resolveWgslPackSelection(
+  optionsOrDefaultUrl,
+  maybeSubgroupsUrl = null,
+  maybeHasSubgroups = false
+) {
+  let defaultPackUrl = null;
+  let subgroupsPackUrl = null;
+  let hasSubgroups = false;
+  let preferSubgroups = true;
+
+  if (
+    optionsOrDefaultUrl &&
+    typeof optionsOrDefaultUrl === 'object' &&
+    !Array.isArray(optionsOrDefaultUrl)
+  ) {
+    defaultPackUrl = pickNonEmptyPackUrl(
+      optionsOrDefaultUrl.defaultPackUrl,
+      optionsOrDefaultUrl.packUrl,
+      optionsOrDefaultUrl.fallbackPackUrl,
+      optionsOrDefaultUrl.shaderPackUrl
+    );
+    subgroupsPackUrl = pickNonEmptyPackUrl(
+      optionsOrDefaultUrl.subgroupsPackUrl,
+      optionsOrDefaultUrl.wgslSubgroupsPackUrl,
+      optionsOrDefaultUrl.subgroupsShaderPackUrl
+    );
+    hasSubgroups = optionsOrDefaultUrl.hasSubgroups === true;
+    preferSubgroups = optionsOrDefaultUrl.preferSubgroups !== false;
+  } else {
+    defaultPackUrl = pickNonEmptyPackUrl(optionsOrDefaultUrl);
+    subgroupsPackUrl = pickNonEmptyPackUrl(maybeSubgroupsUrl);
+    hasSubgroups = maybeHasSubgroups === true;
+  }
+
+  if (hasSubgroups && preferSubgroups && subgroupsPackUrl) {
+    return Object.freeze({
+      url: subgroupsPackUrl,
+      fallbackUrl:
+        defaultPackUrl && defaultPackUrl !== subgroupsPackUrl ? defaultPackUrl : null,
+      mode: WGSL_PACK_VARIANT.SUBGROUPS,
+      usesSubgroupsPack: true,
+      hasSubgroups: true,
+    });
+  }
+
+  return Object.freeze({
+    url: defaultPackUrl,
+    fallbackUrl: null,
+    mode: WGSL_PACK_VARIANT.WORKGROUP_LDS,
+    usesSubgroupsPack: false,
+    hasSubgroups,
+  });
+}
+
+/**
+ * Select the preferred `.wgsl.pack` URL given adapter `subgroups` support.
+ * Returns `subgroupsPackUrl` when `hasSubgroups === true` and `preferSubgroups !== false`
+ * and a valid subgroups pack URL is provided; otherwise falls back cleanly to `defaultPackUrl`.
+ *
+ * @param {object | string | null | undefined} optionsOrDefaultUrl
+ * @param {string | null} [maybeSubgroupsUrl]
+ * @param {boolean} [maybeHasSubgroups]
+ * @returns {string | null}
+ */
+export function selectWgslPackUrl(
+  optionsOrDefaultUrl,
+  maybeSubgroupsUrl = null,
+  maybeHasSubgroups = false
+) {
+  return resolveWgslPackSelection(optionsOrDefaultUrl, maybeSubgroupsUrl, maybeHasSubgroups).url;
+}
+
 /**
  * WebGPU shader stage enum matching `ShaderStage` in `shaders/src/convert.rs`.
  * Note: `.wgsl.pack` encodes Vertex=1, Fragment=2, Compute=3.
@@ -4542,6 +4651,15 @@ export class WgslPackCache {
         : options.maxCachedModules,
       DEFAULT_MAX_COMPILED_MODULES
     );
+    this._hasSubgroups = options.hasSubgroups === true;
+    this._preferSubgroups = options.preferSubgroups !== false;
+    this._subgroupsPackUrl = pickNonEmptyPackUrl(
+      options.subgroupsPackUrl,
+      options.wgslSubgroupsPackUrl,
+      options.subgroupsShaderPackUrl
+    );
+    this._activePackMode = WGSL_PACK_VARIANT.WORKGROUP_LDS;
+    this._subgroupsPackFallbackCount = 0;
 
     this._packs = new Map();
     this._shaderEntries = new Map();
@@ -4674,34 +4792,62 @@ export class WgslPackCache {
   }
 
   /**
-   * Fetch only the WGPK header + entry table from a URL via HTTP `206 Range` and register
-   * the resulting ranged pack (or buffer fallback on `200 OK`).
+   * Update hardware `subgroups` capability and optional subgroups pack preference on the cache.
    *
-   * @param {string} url
-   * @param {typeof fetch | {
-   *   packName?: string,
-   *   fetch?: typeof fetch,
-   *   fetchInit?: RequestInit,
-   *   initialRangeBytes?: number,
-   *   maxCachedWgslBytes?: number,
-   *   lazyDecode?: boolean,
-   * }} [fetchImplOrOptions]
-   * @param {object} [maybeOptions]
-   * @returns {Promise<WgslPack>}
+   * @param {boolean} hasSubgroups
+   * @param {{ preferSubgroups?: boolean, subgroupsPackUrl?: string | null, wgslSubgroupsPackUrl?: string | null }} [opts]
    */
-  async loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
-    if (typeof url !== 'string' || url.length === 0) {
-      throw new TypeError('url must be a non-empty string');
+  setSubgroupsSupport(hasSubgroups, opts = {}) {
+    this._hasSubgroups = hasSubgroups === true;
+    if (opts && typeof opts === 'object') {
+      if (opts.preferSubgroups !== undefined) {
+        this._preferSubgroups = opts.preferSubgroups !== false;
+      }
+      if (
+        opts.subgroupsPackUrl !== undefined ||
+        opts.wgslSubgroupsPackUrl !== undefined ||
+        opts.subgroupsShaderPackUrl !== undefined
+      ) {
+        this._subgroupsPackUrl = pickNonEmptyPackUrl(
+          opts.subgroupsPackUrl,
+          opts.wgslSubgroupsPackUrl,
+          opts.subgroupsShaderPackUrl
+        );
+      }
     }
-    const { fetcher, options } = resolveFetchAndOptions(
-      fetchImplOrOptions,
-      maybeOptions,
-      this._fetch
-    );
-    if (typeof fetcher !== 'function') {
-      throw new Error('No fetch implementation available for loadIndexFromUrl');
-    }
+    this._statsVersion += 1;
+  }
 
+  get hasSubgroups() {
+    return this._hasSubgroups;
+  }
+
+  get activePackVariant() {
+    return this._activePackMode;
+  }
+
+  /**
+   * Select a pack URL using this cache's `hasSubgroups` / `preferSubgroups` / `subgroupsPackUrl`
+   * defaults combined with any per-call overrides.
+   */
+  selectPackUrl(defaultPackUrl, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    return selectWgslPackUrl({
+      defaultPackUrl,
+      subgroupsPackUrl: pickNonEmptyPackUrl(
+        opts.subgroupsPackUrl,
+        opts.wgslSubgroupsPackUrl,
+        opts.subgroupsShaderPackUrl,
+        this._subgroupsPackUrl
+      ),
+      hasSubgroups:
+        opts.hasSubgroups !== undefined ? opts.hasSubgroups === true : this._hasSubgroups,
+      preferSubgroups:
+        opts.preferSubgroups !== undefined ? opts.preferSubgroups !== false : this._preferSubgroups,
+    });
+  }
+
+  async _loadIndexSingleUrl(url, fetcher, options) {
     const pack = await loadIndexFromUrl(url, fetcher, {
       fetchInit: options.fetchInit,
       initialRangeBytes: options.initialRangeBytes ?? this._initialRangeBytes,
@@ -4724,31 +4870,26 @@ export class WgslPackCache {
   }
 
   /**
-   * Alias for `loadIndexFromUrl`.
-   */
-  loadPackIndexUrl(url, fetchImplOrOptions, maybeOptions) {
-    return this.loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions);
-  }
-
-  /**
-   * Fetch a `.wgsl.pack` bundle from a URL and register it in the cache.
-   * If `options.streamThresholdBytes > 0` (or configured on the cache), automatically uses
-   * HTTP `206 Range` index-only mode when the remote pack exceeds the threshold.
+   * Fetch only the WGPK header + entry table from a URL via HTTP `206 Range` and register
+   * the resulting ranged pack (or buffer fallback on `200 OK`).
    *
    * @param {string} url
    * @param {typeof fetch | {
    *   packName?: string,
-   *   lazyDecode?: boolean,
    *   fetch?: typeof fetch,
    *   fetchInit?: RequestInit,
-   *   streamThresholdBytes?: number,
    *   initialRangeBytes?: number,
    *   maxCachedWgslBytes?: number,
+   *   lazyDecode?: boolean,
+   *   subgroupsPackUrl?: string | null,
+   *   wgslSubgroupsPackUrl?: string | null,
+   *   hasSubgroups?: boolean,
+   *   preferSubgroups?: boolean,
    * }} [fetchImplOrOptions]
    * @param {object} [maybeOptions]
    * @returns {Promise<WgslPack>}
    */
-  async loadPackUrl(url, fetchImplOrOptions, maybeOptions) {
+  async loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
     if (typeof url !== 'string' || url.length === 0) {
       throw new TypeError('url must be a non-empty string');
     }
@@ -4758,9 +4899,50 @@ export class WgslPackCache {
       this._fetch
     );
     if (typeof fetcher !== 'function') {
-      throw new Error('No fetch implementation available for loadPackUrl');
+      throw new Error('No fetch implementation available for loadIndexFromUrl');
     }
 
+    const selection = resolveWgslPackSelection({
+      defaultPackUrl: url,
+      subgroupsPackUrl: pickNonEmptyPackUrl(
+        options.subgroupsPackUrl,
+        options.wgslSubgroupsPackUrl,
+        options.subgroupsShaderPackUrl,
+        this._subgroupsPackUrl
+      ),
+      hasSubgroups:
+        options.hasSubgroups !== undefined ? options.hasSubgroups === true : this._hasSubgroups,
+      preferSubgroups:
+        options.preferSubgroups !== undefined
+          ? options.preferSubgroups !== false
+          : this._preferSubgroups,
+    });
+
+    if (selection.usesSubgroupsPack && selection.url && selection.url !== url) {
+      try {
+        const pack = await this._loadIndexSingleUrl(selection.url, fetcher, options);
+        this._activePackMode = WGSL_PACK_VARIANT.SUBGROUPS;
+        this._statsVersion += 1;
+        return pack;
+      } catch (_subgroupsErr) {
+        this._subgroupsPackFallbackCount += 1;
+      }
+    }
+
+    const pack = await this._loadIndexSingleUrl(url, fetcher, options);
+    this._activePackMode = WGSL_PACK_VARIANT.WORKGROUP_LDS;
+    this._statsVersion += 1;
+    return pack;
+  }
+
+  /**
+   * Alias for `loadIndexFromUrl`.
+   */
+  loadPackIndexUrl(url, fetchImplOrOptions, maybeOptions) {
+    return this.loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions);
+  }
+
+  async _loadPackSingleUrl(url, fetcher, options) {
     const streamThresholdBytes = validateStreamThresholdBytes(
       options.streamThresholdBytes !== undefined
         ? options.streamThresholdBytes
@@ -4801,6 +4983,76 @@ export class WgslPackCache {
 
     const buffer = await response.arrayBuffer();
     return this.loadPackBuffer(buffer, name, { lazyDecode });
+  }
+
+  /**
+   * Fetch a `.wgsl.pack` bundle from a URL and register it in the cache.
+   * If `options.streamThresholdBytes > 0` (or configured on the cache), automatically uses
+   * HTTP `206 Range` index-only mode when the remote pack exceeds the threshold.
+   * When hardware `subgroups` support is enabled and a `subgroupsPackUrl` is provided,
+   * selects the subgroups-compiled pack first and falls back cleanly to `url` on failure.
+   *
+   * @param {string} url
+   * @param {typeof fetch | {
+   *   packName?: string,
+   *   lazyDecode?: boolean,
+   *   fetch?: typeof fetch,
+   *   fetchInit?: RequestInit,
+   *   streamThresholdBytes?: number,
+   *   initialRangeBytes?: number,
+   *   maxCachedWgslBytes?: number,
+   *   subgroupsPackUrl?: string | null,
+   *   wgslSubgroupsPackUrl?: string | null,
+   *   hasSubgroups?: boolean,
+   *   preferSubgroups?: boolean,
+   * }} [fetchImplOrOptions]
+   * @param {object} [maybeOptions]
+   * @returns {Promise<WgslPack>}
+   */
+  async loadPackUrl(url, fetchImplOrOptions, maybeOptions) {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError('url must be a non-empty string');
+    }
+    const { fetcher, options } = resolveFetchAndOptions(
+      fetchImplOrOptions,
+      maybeOptions,
+      this._fetch
+    );
+    if (typeof fetcher !== 'function') {
+      throw new Error('No fetch implementation available for loadPackUrl');
+    }
+
+    const selection = resolveWgslPackSelection({
+      defaultPackUrl: url,
+      subgroupsPackUrl: pickNonEmptyPackUrl(
+        options.subgroupsPackUrl,
+        options.wgslSubgroupsPackUrl,
+        options.subgroupsShaderPackUrl,
+        this._subgroupsPackUrl
+      ),
+      hasSubgroups:
+        options.hasSubgroups !== undefined ? options.hasSubgroups === true : this._hasSubgroups,
+      preferSubgroups:
+        options.preferSubgroups !== undefined
+          ? options.preferSubgroups !== false
+          : this._preferSubgroups,
+    });
+
+    if (selection.usesSubgroupsPack && selection.url && selection.url !== url) {
+      try {
+        const pack = await this._loadPackSingleUrl(selection.url, fetcher, options);
+        this._activePackMode = WGSL_PACK_VARIANT.SUBGROUPS;
+        this._statsVersion += 1;
+        return pack;
+      } catch (_subgroupsErr) {
+        this._subgroupsPackFallbackCount += 1;
+      }
+    }
+
+    const pack = await this._loadPackSingleUrl(url, fetcher, options);
+    this._activePackMode = WGSL_PACK_VARIANT.WORKGROUP_LDS;
+    this._statsVersion += 1;
+    return pack;
   }
 
   /**
@@ -6315,6 +6567,11 @@ export class WgslPackCache {
       inFlightCount,
       stageCounts: entryCounts.stageCounts,
       dynamicStageCounts: entryCounts.dynamicStageCounts,
+      hasSubgroups: this._hasSubgroups,
+      preferSubgroups: this._preferSubgroups,
+      subgroupsPackActive: this._activePackMode === WGSL_PACK_VARIANT.SUBGROUPS,
+      packVariant: this._activePackMode,
+      subgroupsPackFallbackCount: this._subgroupsPackFallbackCount,
       packs,
     };
 
