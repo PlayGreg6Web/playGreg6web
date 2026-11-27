@@ -1310,6 +1310,8 @@ void test_binding_fit() {
     CHECK(!unfilterable_float_mismatch(0, 22, true));                                   // rgba8unorm
     CHECK(!unfilterable_float_mismatch(0, format_code_by_name("depth16unorm"), true));  // depth: pick_depth_read
     CHECK(unfilterable_float_mismatch(0, 16, false) && !unfilterable_float_mismatch(0, 16, true));  // r32float
+    CHECK(norm16_components(format_code_by_name("r16snorm")) == 1 && norm16_components(format_code_by_name("rg16unorm")) == 2 &&
+          norm16_components(format_code_by_name("rgba16unorm")) == 4 && norm16_components(22) == 0 && norm16_components(16) == 0);
 }
 
 void test_device_error_kinds() {

@@ -455,7 +455,10 @@ struct TextureEntry {
     // Depth twins (color copies of the depth plane bound where a layout entry cannot take a depth
     // view, see depth_twin below): each refreshed when depth_gen moved past its slot's gen.
     std::array<TwinSlot, kDepthReadCount> twins;  // indexed by DepthRead (Twin* kinds only)
-    uint64_t depth_gen = 1;  // bumps on every write to the depth texture
+    uint64_t depth_gen = 1;  // bumps on every write to the texture (depth plane, or a norm16 texture's contents)
+    // A 16-bit normalized texture (r16unorm & co.) is unfilterable-float to Dawn: a float (filterable) layout
+    // entry reads this float copy instead (norm16_twin below), refreshed when depth_gen moved past its gen.
+    TwinSlot norm_twin;
 };
 
 // ---- pass commands (wgpu_worker.js `_passCommands`) ----
@@ -650,6 +653,8 @@ struct NativeExecutor::Impl {
     std::unordered_map<std::string, wgpu::TextureView> dummy_views;
     std::vector<wgpu::Texture> dummy_textures;
     std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth twin
+    std::set<uint32_t> norm_twin_sources;   // texture ids that own a norm16 float twin
+    std::unordered_map<uint32_t, wgpu::RenderPipeline> norm_copy_pipelines;  // source format * 2 + (f32 target)
     std::unordered_map<uint32_t, wgpu::RenderPipeline> depth_copy_pipelines;  // DepthRead * 256 + source format
     wgpu::BindGroupLayout empty_layout;
     wgpu::ShaderModule empty_fragment;
@@ -1962,6 +1967,8 @@ struct NativeExecutor::Impl {
         dummy_textures.clear();
         depth_twin_sources.clear();
         depth_copy_pipelines.clear();
+        norm_twin_sources.clear();
+        norm_copy_pipelines.clear();
         empty_layout = nullptr;
         empty_fragment = nullptr;
         error_vertex_module = nullptr;
@@ -3560,6 +3567,132 @@ struct NativeExecutor::Impl {
                 ++stats.depth_float_copies;
             }
         }
+        refresh_norm_twins(enc);
+    }
+
+    // ---- norm16 twins ----
+    //
+    // r16/rg16/rgba16 unorm/snorm textures are unfilterable-float to Dawn (no device feature changes that:
+    // texture-formats-tier1 only makes them usable), but the title pairs them with filtering samplers
+    // (float entries). The twin is a same-extent r32float/rg32float/rgba32float copy (exact; the r16float
+    // family without float32-filterable: half precision) refreshed by a fullscreen textureLoad pass
+    // before each pass that follows a write; the float entry then reads real data.
+
+    wgpu::TextureFormat norm_twin_format(uint32_t comps) const {
+        using F = wgpu::TextureFormat;
+        if (features.float32_filterable) return comps == 4 ? F::RGBA32Float : comps == 2 ? F::RG32Float : F::R32Float;
+        return comps == 4 ? F::RGBA16Float : comps == 2 ? F::RG16Float : F::R16Float;
+    }
+
+    // The twin of norm16 texture `id` (created on first need); null when the texture cannot have one.
+    wgpu::Texture norm16_twin(uint32_t id, TextureEntry& t) {
+        if (t.norm_twin.tex) return t.norm_twin.tex;
+        const uint32_t comps = norm16_components(t.geom.format);
+        if (comps == 0 || t.sample_count != 1 || t.geom.dimension != 1 || t.promoted_1d) return nullptr;
+        wgpu::TextureDescriptor td{};
+        td.dimension = wgpu::TextureDimension::e2D;
+        td.size = {t.geom.width, t.geom.height, t.geom.depth_or_layers};
+        td.format = norm_twin_format(comps);
+        td.mipLevelCount = t.geom.mips;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment;
+        t.norm_twin.tex = device.CreateTexture(&td);
+        if (t.norm_twin.tex) {
+            norm_twin_sources.insert(id);
+            t.norm_twin.gen = 0;
+            ++stats.norm16_twins_created;
+        }
+        return t.norm_twin.tex;
+    }
+
+    wgpu::RenderPipeline norm_copy_pipeline_for(uint8_t src_format, uint32_t comps) {
+        const uint32_t key = src_format * 2u + (features.float32_filterable ? 1u : 0u);
+        auto it = norm_copy_pipelines.find(key);
+        if (it != norm_copy_pipelines.end()) return it->second;
+        static const char* const kCode =
+            "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+            "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
+            "  return vec4f(p[i], 0.0, 1.0);\n}\n"
+            "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+            "@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {\n"
+            "  return textureLoad(src, vec2i(pos.xy), 0);\n}\n";
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = kCode;
+        wgpu::ShaderModuleDescriptor md{};
+        md.nextInChain = &wgsl;
+        wgpu::ShaderModule mod = device.CreateShaderModule(&md);
+        wgpu::BindGroupLayoutEntry le{};
+        le.binding = 0;
+        le.visibility = wgpu::ShaderStage::Fragment;
+        le.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+        le.texture.viewDimension = wgpu::TextureViewDimension::e2D;
+        wgpu::BindGroupLayoutDescriptor bgld{};
+        bgld.entryCount = 1;
+        bgld.entries = &le;
+        wgpu::BindGroupLayout bgl = device.CreateBindGroupLayout(&bgld);
+        wgpu::PipelineLayoutDescriptor pld{};
+        pld.bindGroupLayoutCount = 1;
+        pld.bindGroupLayouts = &bgl;
+        wgpu::ColorTargetState ct{};
+        ct.format = norm_twin_format(comps);
+        wgpu::FragmentState fs{};
+        fs.module = mod;
+        fs.entryPoint = "fs";
+        fs.targetCount = 1;
+        fs.targets = &ct;
+        wgpu::RenderPipelineDescriptor pd{};
+        pd.layout = device.CreatePipelineLayout(&pld);
+        pd.vertex.module = mod;
+        pd.vertex.entryPoint = "vs";
+        pd.fragment = &fs;
+        wgpu::RenderPipeline p = device.CreateRenderPipeline(&pd);
+        norm_copy_pipelines[key] = p;
+        return p;
+    }
+
+    // Before every pass begins (no pass open): re-copy each stale norm16 twin, one pass per mip/layer.
+    void refresh_norm_twins(wgpu::CommandEncoder& enc) {
+        for (auto sit = norm_twin_sources.begin(); sit != norm_twin_sources.end();) {
+            auto tit = textures.find(*sit);
+            if (tit == textures.end()) { sit = norm_twin_sources.erase(sit); continue; }
+            ++sit;
+            TextureEntry& t = tit->second;
+            if (!t.norm_twin.tex || t.norm_twin.gen == t.depth_gen) continue;
+            const uint32_t comps = norm16_components(t.geom.format);
+            wgpu::RenderPipeline pipe = norm_copy_pipeline_for(t.geom.format, comps);
+            if (!pipe) continue;
+            const wgpu::BindGroupLayout bgl = pipe.GetBindGroupLayout(0);
+            for (uint32_t m = 0; m < t.geom.mips; ++m) {
+                for (uint32_t l = 0; l < t.geom.depth_or_layers; ++l) {
+                    wgpu::TextureViewDescriptor sv{};
+                    sv.dimension = wgpu::TextureViewDimension::e2D;
+                    sv.baseMipLevel = m; sv.mipLevelCount = 1;
+                    sv.baseArrayLayer = l; sv.arrayLayerCount = 1;
+                    wgpu::TextureViewDescriptor dv = sv;
+                    dv.format = norm_twin_format(comps);
+                    wgpu::BindGroupEntry be{};
+                    be.binding = 0;
+                    be.textureView = t.texture.CreateView(&sv);
+                    wgpu::BindGroupDescriptor bd{};
+                    bd.layout = bgl;
+                    bd.entryCount = 1;
+                    bd.entries = &be;
+                    wgpu::RenderPassColorAttachment ca{};
+                    ca.view = t.norm_twin.tex.CreateView(&dv);
+                    ca.loadOp = wgpu::LoadOp::Clear;
+                    ca.storeOp = wgpu::StoreOp::Store;
+                    wgpu::RenderPassDescriptor rp{};
+                    rp.colorAttachmentCount = 1;
+                    rp.colorAttachments = &ca;
+                    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+                    pass.SetPipeline(pipe);
+                    pass.SetBindGroup(0, device.CreateBindGroup(&bd));
+                    pass.Draw(3);
+                    pass.End();
+                }
+            }
+            t.norm_twin.gen = t.depth_gen;
+            ++stats.norm16_twin_copies;
+        }
     }
 
     // TexturePackets / RenderStatePackets.getOrCreateTextureView (W347 1D promotion, 3D-BC fallback).
@@ -5071,8 +5204,24 @@ struct NativeExecutor::Impl {
                         use_dummy(*le);
                     } else if (!kind_mismatch && le && le->kind == 2 && tex_format &&
                                unfilterable_float_mismatch(le->subtype, tex_format, features.float32_filterable)) {
-                        ++stats.bind_group_unfilterable_dummies;
-                        use_dummy(*le);
+                        // norm16: a float copy (norm16_twin); the dummy only when no twin can exist
+                        const uint32_t nc = norm16_components(tex_format);
+                        if (nc != 0 && tex_format == t.geom.format && norm16_twin(e.resource_id, t)) {
+                            wgpu::TextureViewDescriptor vd2{};
+                            vd2.format = norm_twin_format(nc);
+                            if (e.view.dimension) vd2.dimension = wgpu_view_dim(e.view.dimension);
+                            vd2.baseMipLevel = e.view.base_mip_level;
+                            if (e.view.mip_level_count) vd2.mipLevelCount = e.view.mip_level_count;
+                            vd2.baseArrayLayer = e.view.base_array_layer;
+                            if (e.view.array_layer_count) vd2.arrayLayerCount = e.view.array_layer_count;
+                            pe.view = t.norm_twin.tex.CreateView(&vd2);
+                            have = static_cast<bool>(pe.view);
+                            if (have) ++stats.norm16_twin_binds;
+                        }
+                        if (!have) {
+                            ++stats.bind_group_unfilterable_dummies;
+                            use_dummy(*le);
+                        }
                     } else if (!kind_mismatch && le && le->kind == 2 && tex_format && format_is_depth(tex_format) &&
                                pick_depth_read(le->subtype, le->multisampled, tex_format, e.view.aspect,
                                                t.sample_count, t.geom.dimension, features.float32_filterable) !=
@@ -5497,6 +5646,10 @@ struct NativeExecutor::Impl {
         }
         e.end_active();
         refresh_depth_twins(e.enc);
+        for (uint32_t i = 0; i < b.color_count; ++i) {  // a norm16 color target: its float twin goes stale
+            auto cit = b.colors[i].swapchain ? textures.end() : textures.find(b.colors[i].texture_id);
+            if (cit != textures.end() && cit->second.norm_twin.tex) ++cit->second.depth_gen;
+        }
         if (b.has_ds && !b.ds.depth_read_only && b.ds.depth_load_op != 0) {
             auto wit = textures.find(b.ds.texture_id);
             if (wit != textures.end()) ++wit->second.depth_gen;
@@ -7255,6 +7408,9 @@ std::string NativeExecutor::stats_json() const {
     num("buffer_bindings_clamped", st.buffer_bindings_clamped);
     num("buffer_bindings_dummied", st.buffer_bindings_dummied);
     num("depth_float_copies", st.depth_float_copies);
+    num("norm16_twins_created", st.norm16_twins_created);
+    num("norm16_twin_copies", st.norm16_twin_copies);
+    num("norm16_twin_binds", st.norm16_twin_binds);
     num("depth_twins_created", st.depth_twins_created);
     num("depth_int_twins_created", st.depth_int_twins_created);
     num("depth_half_twins_created", st.depth_half_twins_created);

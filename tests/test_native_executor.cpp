@@ -2163,6 +2163,76 @@ void test_shader_workers(const char* wait_ms) {
     std::filesystem::remove(path, ec);
 }
 
+// A rgba16unorm texture (unfilterable-float to Dawn) read through a float layout entry with a linear
+// sampler: the executor binds its float twin, so the bilinear blend of the real texels is what shows.
+void test_norm16_filtered_read(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(9700, 2, 2, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 36)));  // rgba16unorm
+    // x=0: (0, 0.2, 1, 1)  x=1: (0.5, 0.8, 0.5, 1): the blend at the center is (0.25, 0.5, 0.75, 1)
+    const uint16_t t0[4] = {0, 13107, 65535, 65535}, t1[4] = {32768, 52428, 32768, 65535};
+    std::vector<uint8_t> texels(256 + 16, 0);
+    for (int y = 0; y < 2; ++y) {
+        std::memcpy(&texels[y * 256], t0, 8);
+        std::memcpy(&texels[y * 256 + 8], t1, 8);
+    }
+    GpuWriteTexturePayload wt;
+    std::memset(&wt, 0, sizeof wt);
+    wt.texture_id = 9700;
+    wt.width = 2;
+    wt.height = 2;
+    wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256;
+    wt.rows_per_image = 2;
+    wt.data_len = static_cast<uint32_t>(texels.size());
+    std::vector<uint8_t> wtv = bytes_of(wt);
+    wtv.insert(wtv.end(), texels.begin(), texels.end());
+    emit(setup, GpuOpcode::WriteTexture, wtv);
+    GpuCreateSampler2Payload sp;
+    std::memset(&sp, 0, sizeof sp);
+    sp.id = 9701;
+    sp.mag_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+    sp.min_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+    sp.max_anisotropy = 1;
+    sp.lod_max_clamp = 32.0f;
+    emit(setup, GpuOpcode::CreateSampler2, bytes_of(sp));
+    setup.create_shader_module(9702, GpuShaderStage::Vertex, kTexturedTriangle);
+    setup.create_shader_module(9703, GpuShaderStage::Fragment, kTexturedTriangle);
+    create_layouts(setup, 9704, 9705,
+                   {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, 0, 2),
+                    layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(9706, 9702, 9703, 9705)));
+    create_bind_group(setup, 9707, 9704,
+                      {bg_entry(0, GpuBindResourceType::TextureView, 9700), bg_entry(1, GpuBindResourceType::Sampler, 9701)});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+    frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+    frame.set_pipeline(9706);
+    set_bind_group2(frame, 0, 9707);
+    frame.draw(3);
+    frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& after = ex.stats();
+    std::printf("norm16 filtered read: twins=%llu copies=%llu binds=%llu dummies=%llu\n",
+                (unsigned long long)(after.norm16_twins_created - before.norm16_twins_created),
+                (unsigned long long)(after.norm16_twin_copies - before.norm16_twin_copies),
+                (unsigned long long)(after.norm16_twin_binds - before.norm16_twin_binds),
+                (unsigned long long)(after.bind_group_unfilterable_dummies - before.bind_group_unfilterable_dummies));
+    CHECK(after.device_errors == before.device_errors);
+    CHECK(after.bind_group_unfilterable_dummies == before.bind_group_unfilterable_dummies);
+    CHECK(after.norm16_twin_binds == before.norm16_twin_binds + 1);
+    FrameImage img;
+    std::string err;
+    CHECK(ex.read_last_frame(&img, &err) && px_near(img, 1, 1, 191, 128, 64, 255, 2));
+}
+
 void test_depth_texture_float_layout(NativeExecutor& ex) {
     // A float layout entry with a depth texture bound: the executor binds the entry's dummy instead
     // of letting Dawn reject the bind group; the 'depth' layout entry takes the real view.
@@ -3498,6 +3568,7 @@ int main() {
     test_blit();
     test_depth_texture_float_layout(*ex);
     test_depth_read_variants(*ex);
+    test_norm16_filtered_read(*ex);
     test_depth_read_no_float32_filterable();
     test_stencil_twin(*ex);
     test_show_target();

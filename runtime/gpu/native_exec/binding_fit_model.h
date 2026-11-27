@@ -80,6 +80,12 @@ inline bool format_is_norm16(uint8_t format) {
     const std::string_view n = format_info(format).name;
     return n.find("16unorm") != std::string_view::npos || n.find("16snorm") != std::string_view::npos;
 }
+// Component count of a 16-bit normalized format code (r16 -> 1, rg16 -> 2, rgba16 -> 4), 0 for any other.
+inline uint32_t norm16_components(uint8_t format) {
+    if (!format_is_norm16(format)) return 0;
+    const std::string_view n = format_info(format).name;
+    return n.rfind("rgba16", 0) == 0 ? 4u : n.rfind("rg16", 0) == 0 ? 2u : 1u;
+}
 inline bool unfilterable_float_mismatch(uint8_t layout_sample_type, uint8_t format, bool float32_filterable) {
     if (layout_sample_type != 0 || !format_valid(format) || format_is_depth(format)) return false;
     return format_is_norm16(format) || (format_is_float32(format) && !float32_filterable);
