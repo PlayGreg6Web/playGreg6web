@@ -9144,6 +9144,128 @@ void test_xbox_presentx_color_space_and_planes() {
     scene.release_all({srgb_rt, hdr10_rt, fp16_rt});
 }
 
+// #1963: native CPU-visible buffers and relocated uniform ranges are flushed from the OS write
+// tracking through the flush's page index. The first flush indexes them, the second (whose take
+// covers them) primes them; from then on an unwritten one is skipped and a written page is
+// uploaded exactly as before. --flush-crosscheck compares everything and finds no skip that missed
+// a change; --flush-full never skips.
+void test_native_flush_page_index() {
+    constexpr uint64_t kPage = 4096, k64K = 64ull << 10;
+    playgta6::os::set_write_tracking(true);
+    const dg::FlushMode modes[] = {dg::FlushMode::Index, dg::FlushMode::CrossCheck, dg::FlushMode::Full};
+    for (const dg::FlushMode mode : modes) {
+        dg::set_flush_mode(mode);
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        const uint64_t mem = com::guest_alloc(4 * k64K);  // its own (write-watched) reservation
+        CHECK(mem != 0);
+        int32_t result = -1;
+        // A: 3 pages + 100 bytes (its end straddles into a fourth page); B: one page, another granule.
+        const uint64_t a = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                     {I(mem), I(put(buffer_desc(3 * kPage + 100))), I(0), I(0)},
+                                     dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(a)->cpu_address() == mem);
+        const uint64_t b = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                     {I(mem + k64K), I(put(buffer_desc(kPage))), I(0), I(0)},
+                                     dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t id_a = object_of<dg::Resource>(a)->id();
+        const uint32_t id_b = object_of<dg::Resource>(b)->id();
+        const uint64_t uni = mem + 2 * k64K + 0x40;
+        uint32_t id_u = 0;
+        uint64_t off_u = 0;
+        CHECK(dev->relocate_uniform(uni, 64, 64, &id_u, &off_u));
+        struct Write {
+            uint32_t id;
+            uint32_t offset;
+            uint32_t bytes;
+        };
+        auto flush = [&] {
+            gpu::CommandEncoder enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(enc);
+            dev->end_submission();
+            std::vector<Write> out;
+            size_t off = 0;
+            while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+                GpuPacketHeader h{};
+                std::memcpy(&h, enc.data() + off, sizeof(h));
+                off += sizeof(h);
+                if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer) {
+                    GpuWriteBufferPayload w{};
+                    std::memcpy(&w, enc.data() + off, sizeof(w));
+                    if (w.id == id_a || w.id == id_b || w.id == id_u) {
+                        out.push_back({w.id, w.dst_offset, h.payload_bytes - static_cast<uint32_t>(sizeof(w))});
+                    }
+                }
+                off += h.payload_bytes;
+            }
+            return out;
+        };
+        auto only = [](const std::vector<Write>& w, uint32_t id, uint32_t offset) {
+            return w.size() == 1 && w[0].id == id && w[0].offset == offset;
+        };
+        const uint32_t one = 1, two = 2;
+        CHECK(com::write_guest(uni, one));  // the uniform range's first bytes
+        CHECK(only(flush(), id_u, static_cast<uint32_t>(off_u)));  // index (A, B: zeros, nothing to upload)
+        CHECK(flush().empty());                                     // prime
+        const uint64_t skipped_b0 = dg::work_total(dg::Work::FlushBuffersSkipped);
+        const uint64_t skipped_u0 = dg::work_total(dg::Work::FlushUniformsSkipped);
+        const uint64_t misses0 = dg::work_total(dg::Work::FlushCrosscheckMisses);
+        CHECK(flush().empty());  // steady: nothing written
+        if (mode != dg::FlushMode::Full) {
+            CHECK(dg::work_total(dg::Work::FlushBuffersSkipped) - skipped_b0 >= 2);  // (the scene's buffers too)
+            CHECK(object_of<dg::Resource>(a)->flush_primed && object_of<dg::Resource>(b)->flush_primed);
+            CHECK(dg::work_total(dg::Work::FlushUniformsSkipped) - skipped_u0 == 1);
+        } else {
+            CHECK(dg::work_total(dg::Work::FlushBuffersSkipped) == skipped_b0);
+        }
+        // One page of A: only that page is uploaded, B and the uniform range stay skipped.
+        CHECK(com::write_guest(mem + 2 * kPage + 8, two));
+        CHECK(only(flush(), id_a, static_cast<uint32_t>(2 * kPage)));
+        // The straddling tail of A (its fourth page).
+        CHECK(com::write_guest(mem + 3 * kPage + 96, one));
+        CHECK(only(flush(), id_a, static_cast<uint32_t>(3 * kPage)));
+        // B, then the uniform range.
+        CHECK(com::write_guest(mem + k64K + 0x10, one));
+        CHECK(only(flush(), id_b, 0));
+        CHECK(com::write_guest(uni + 8, two));
+        {
+            const auto w = flush();
+            CHECK(only(w, id_u, static_cast<uint32_t>(off_u)) && w[0].bytes == 64);
+        }
+        // A write of the same bytes: reported written, compared, nothing uploaded.
+        CHECK(com::write_guest(mem + 2 * kPage + 8, two));
+        CHECK(flush().empty());
+        // A page next to B (same granule, outside its range): reported, but no range overlaps it.
+        CHECK(com::write_guest(mem + k64K + kPage + 4, two));
+        CHECK(flush().empty());
+        // Host writes straight into the memory (no checked write): the OS write tracking sees them.
+        auto* host_a = static_cast<uint8_t*>(com::guest_to_host(mem, 4 * kPage));
+        CHECK(host_a != nullptr);
+        if (host_a != nullptr) {
+            host_a[kPage + 1] = 0x5a;
+            CHECK(only(flush(), id_a, static_cast<uint32_t>(kPage)));
+        }
+        // Several in one flush.
+        CHECK(com::write_guest(mem, two));
+        CHECK(com::write_guest(mem + k64K, two));
+        CHECK(com::write_guest(uni, two));
+        CHECK(flush().size() == 3);
+        CHECK(flush().empty());
+        CHECK(dg::work_total(dg::Work::FlushCrosscheckMisses) == misses0);
+        // A buffer released between flushes leaves the index (no stale key is visited).
+        fx.vcall(b, Slot::Release);
+        CHECK(com::write_guest(mem + k64K + 0x10, two));
+        CHECK(flush().empty());
+        fx.vcall(a, Slot::Release);
+        scene.release_all();
+        com::guest_free(mem);
+    }
+    dg::set_flush_mode(dg::FlushMode::Index);
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -9156,6 +9278,7 @@ int main() {
     test_g73_console_linear_direct_zero_copy_upload();
     test_streaming_texture_hash_skip();
     test_shared_view_write_tracking_flush();
+    test_native_flush_page_index();
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();

@@ -81,6 +81,7 @@
 #include "gpu/d3d12_xs_dump.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
+#include "gpu/flush_page_index.h"
 #include "gpu/log_rate_limiter.h"
 #include "gpu/pso_cache.h"
 #include "gpu/shader_pack_index.h"
@@ -1208,6 +1209,10 @@ private:
         uint64_t offset = 0;
         std::vector<uint8_t> shadow;  // bytes last written (empty: never written)
         uint64_t last_used_seq = 0;
+        // #1963 page index (under relocation_mutex_): primed = compared after a successful flush
+        // take covering its host range, so only compared again when a take reports it written.
+        bool primed = false;
+        uint64_t visit_seq = 0;
     };
     mutable std::mutex relocation_mutex_;
     // O36: homes of evicted entries, reused by the next entry of the same (size, home bytes) so the
@@ -1282,6 +1287,17 @@ private:
     std::mutex tracked_mutex_;
     std::vector<Resource*> tracked_;
     os::guest_window::SlotIndex slot_index_;  // O36: window slot -> tracked buffers (under tracked_mutex_)
+    // #1963: host pages -> tracked buffers (under tracked_mutex_) and relocated uniform ranges (under
+    // relocation_mutex_), for native flushes driven by the OS write tracking (flush_cpu_buffers).
+    HostPageIndex buffer_page_index_;
+    HostPageIndex uniform_page_index_;
+    // --flush-crosscheck: skipped entries that uploaded anyway (each must be reported at the next flush).
+    std::unordered_set<const void*> crosscheck_buffers_;   // under tracked_mutex_
+    std::unordered_set<const void*> crosscheck_uniforms_;  // under relocation_mutex_
+    // Under flush_mutex_: the flush take's position, the flush sequence and whether the index is in use.
+    os::WriteCursor flush_cursor_{};
+    uint64_t flush_seq_ = 0;
+    bool page_index_live_ = false;
     // O36: one pass over the translated window's write marks per flush_cpu_buffers, shared by the
     // tracked buffers and the relocated ranges (under flush_mutex_).
     std::mutex flush_mutex_;
@@ -1742,8 +1758,30 @@ enum class Work : size_t {
     ShadowComparedBytes,
     ShadowFullCompares,
     ShadowFullCompareBytes,
+    // #1963 page-indexed native flush (flush_cpu_buffers): host ranges taken at each flush (and the
+    // takes that could not tell, whose entries were all flushed), pages reported written, buffers
+    // flushed / skipped / flushed for want of write tracking, uniform ranges compared / skipped, and
+    // the --flush-crosscheck results: an entry skipped although it changed that the next flush's take
+    // reported (a write racing with the flush, flushed one submission later as before) or did not (a miss).
+    FlushIndexTakes,
+    FlushIndexTakeFailures,
+    FlushIndexDirtyPages,
+    FlushBuffersVisited,
+    FlushBuffersSkipped,
+    FlushBuffersUntracked,
+    FlushUniformsCompared,
+    FlushUniformsSkipped,
+    FlushCrosscheckLate,
+    FlushCrosscheckMisses,
     Count
 };
+// #1963: how flush_cpu_buffers picks what to compare on native builds. Index (default): only the
+// buffers / uniform ranges whose host pages the OS write tracking reports written. Full: every one
+// (the earlier behaviour; --flush-full). CrossCheck: every one, and a skip the index would have made
+// for an entry that changed is counted (--flush-crosscheck; Work::FlushCrosscheck*).
+enum class FlushMode : uint8_t { Index, Full, CrossCheck };
+void set_flush_mode(FlushMode mode);
+FlushMode flush_mode();
 void count_work(Work w, uint64_t n = 1);
 uint64_t work_total(Work w);
 const char* work_name(Work w);

@@ -737,6 +737,10 @@ void Device::untrack_cpu_buffer(Resource* resource) {
     std::lock_guard<std::mutex> lock(tracked_mutex_);
     tracked_.erase(std::remove(tracked_.begin(), tracked_.end(), resource), tracked_.end());
     slot_index_.remove(resource);
+    buffer_page_index_.remove(resource);
+    crosscheck_buffers_.erase(resource);
+    resource->flush_indexed = false;
+    resource->flush_primed = false;
 }
 
 namespace {
@@ -2038,6 +2042,18 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     return id;
 }
 
+namespace {
+std::atomic<uint8_t> g_flush_mode{static_cast<uint8_t>(FlushMode::Index)};
+}  // namespace
+
+void set_flush_mode(FlushMode mode) {
+    g_flush_mode.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+}
+
+FlushMode flush_mode() {
+    return static_cast<FlushMode>(g_flush_mode.load(std::memory_order_relaxed));
+}
+
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     os::lock_with_span(flush_mutex_, os::SpanKind::D3dLock);
     std::lock_guard<std::mutex> flush_lock(flush_mutex_, std::adopt_lock);
@@ -2070,6 +2086,56 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     // overlapping one (sharing this submission's MarkPass so a shared 64 KiB slot notifies both).
     std::vector<uint64_t> dirty;
     const bool scanned = mark_pass_.take_dirty(&dirty);
+    // #1963: native flushes (no translated window) are driven by the OS write tracking. The host
+    // ranges of the indexed buffers and uniform ranges (buffer_page_index_, uniform_page_index_) are
+    // taken once here, with the flush's own cursor; only the entries overlapping a written page are
+    // flushed / compared, plus every entry not primed yet (new, re-keyed, or not covered by a
+    // successful take at its last visit) and every entry of a range whose take could not tell.
+    // Why that is enough: a primed entry was compared after the take of a flush covering it, so every
+    // write since lands after that take and is reported by a later one, which flushes the entry.
+    // Buffers the tracking does not cover (no take of their own succeeds) are flushed every time.
+    const FlushMode mode = flush_mode();
+    const bool indexed = !scanned && !os::guest_window::write_marks_verified() && mode != FlushMode::Full;
+    const bool crosscheck = indexed && mode == FlushMode::CrossCheck;
+    const uint64_t seq = ++flush_seq_;
+    if (indexed != page_index_live_) {
+        // Entering or leaving the indexed mode: start over (every entry unprimed and re-indexed).
+        {
+            std::lock_guard<std::mutex> lock(tracked_mutex_);
+            buffer_page_index_.clear();
+            crosscheck_buffers_.clear();
+            for (Resource* r : tracked_) {
+                r->flush_indexed = false;
+                r->flush_primed = false;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(relocation_mutex_);
+            uniform_page_index_.clear();
+            crosscheck_uniforms_.clear();
+            for (auto& [key, r] : relocations_) {
+                r.primed = false;
+            }
+        }
+        page_index_live_ = indexed;
+    }
+    std::vector<HostPageIndex::Range> take_ranges;  // merged hulls of both indexes
+    std::vector<HostPageIndex::Range> taken_ok;     // the ones whose take succeeded
+    std::vector<HostPageIndex::Range> taken_failed;
+    std::vector<uintptr_t> dirty_pages;  // host page addresses reported written (sorted, unique)
+    if (indexed) {
+        {
+            std::lock_guard<std::mutex> lock(tracked_mutex_);
+            const auto& h = buffer_page_index_.hulls();
+            take_ranges.assign(h.begin(), h.end());
+        }
+        {
+            std::lock_guard<std::mutex> lock(relocation_mutex_);
+            const auto& h = uniform_page_index_.hulls();
+            take_ranges.insert(take_ranges.end(), h.begin(), h.end());
+        }
+        merge_ranges(&take_ranges);
+    }
     // The OS write bits of the buffers and of the relocated storage / index ranges, collected in one pass
     // that outlives the loops below (each take inside the ranges then skips its own GetWriteWatch).
     std::vector<std::pair<uintptr_t, uintptr_t>> host_ranges;
@@ -2081,9 +2147,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             slot_index_.clear();
             // Native: every tracked buffer takes its written pages below. Collect the OS write bits
             // of all of them in one pass first, so each buffer does not pay a GetWriteWatch call.
-            host_ranges.reserve(tracked_.size());
+            // (Indexed buffers lie inside take_ranges.)
+            host_ranges.reserve(take_ranges.size() + (indexed ? 64u : tracked_.size()));
+            host_ranges.insert(host_ranges.end(), take_ranges.begin(), take_ranges.end());
             for (Resource* r : tracked_) {
-                if (r->cpu_address() == 0 || r->shadow_bytes() == 0) {
+                if (r->cpu_address() == 0 || r->shadow_bytes() == 0 || (indexed && r->flush_indexed)) {
                     continue;
                 }
                 if (const auto* live = static_cast<const uint8_t*>(
@@ -2110,9 +2178,102 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 }
             }
             write_batch.emplace(&host_ranges);
-            for (Resource* r : tracked_) {
-                r->set_slot_indexed(false);
-                r->flush_shadow(encoder, &mark_pass_);
+            if (indexed) {
+                // One take per merged range, each from the cursor's position; the new position is the
+                // oldest the takes reached (a later take then reports anything any of them could miss).
+                const os::WriteCursor from = flush_cursor_;
+                os::WriteCursor to{};
+                to.commit_seq = to.view_clock = to.watch_epoch = ~uint64_t{0};
+                std::vector<uint64_t> offsets;
+                for (const auto& h : take_ranges) {
+                    os::WriteCursor c = from;
+                    offsets.clear();
+                    const bool ok = os::take_written_pages(reinterpret_cast<const void*>(h.first),
+                                                           static_cast<uint64_t>(h.second - h.first), &c, &offsets);
+                    to.commit_seq = std::min(to.commit_seq, c.commit_seq);
+                    to.view_clock = std::min(to.view_clock, c.view_clock);
+                    to.watch_epoch = std::min(to.watch_epoch, c.watch_epoch);
+                    if (ok) {
+                        taken_ok.push_back(h);
+                        for (uint64_t off : offsets) {
+                            dirty_pages.push_back(h.first + static_cast<uintptr_t>(off));
+                        }
+                    } else {
+                        taken_failed.push_back(h);
+                    }
+                }
+                if (!take_ranges.empty()) {
+                    flush_cursor_ = to;
+                }
+                std::sort(dirty_pages.begin(), dirty_pages.end());
+                dirty_pages.erase(std::unique(dirty_pages.begin(), dirty_pages.end()), dirty_pages.end());
+                count_work(Work::FlushIndexTakes, take_ranges.size());
+                count_work(Work::FlushIndexTakeFailures, taken_failed.size());
+                count_work(Work::FlushIndexDirtyPages, dirty_pages.size());
+
+                // The buffers the takes name (primed ones; the others are flushed below anyway).
+                std::vector<const void*> visit;
+                buffer_page_index_.collect_pages(dirty_pages, os::kWrittenPageSize, &visit);
+                for (const auto& h : taken_failed) {
+                    buffer_page_index_.collect_range(h.first, h.second, &visit);
+                }
+                for (const void* key : visit) {
+                    const_cast<Resource*>(static_cast<const Resource*>(key))->flush_visit_seq = seq;
+                }
+                // --flush-crosscheck: an entry skipped last time although it changed must be named now.
+                for (const void* key : crosscheck_buffers_) {
+                    const Resource* r = static_cast<const Resource*>(key);
+                    if (r->flush_visit_seq == seq || !r->flush_primed) {
+                        count_work(Work::FlushCrosscheckLate);
+                    } else {
+                        count_work(Work::FlushCrosscheckMisses);
+                        std::fprintf(stderr, "[flush-crosscheck] buffer %u (guest 0x%llx, %llu bytes) changed unreported\n",
+                                     r->id(), static_cast<unsigned long long>(r->cpu_address()),
+                                     static_cast<unsigned long long>(r->shadow_bytes()));
+                    }
+                }
+                crosscheck_buffers_.clear();
+                uint64_t visited = 0, skipped = 0, untracked = 0;
+                for (Resource* r : tracked_) {
+                    if (r->cpu_address() == 0 || r->shadow_bytes() == 0) {
+                        continue;
+                    }
+                    const bool skip = r->flush_primed && r->flush_visit_seq != seq;
+                    if (skip && !crosscheck) {
+                        // No page of it written since `from`: its own next take may start at `to`.
+                        r->advance_write_cursor(to);
+                        ++skipped;
+                        continue;
+                    }
+                    r->set_slot_indexed(false);
+                    const uint64_t uploaded = r->flush_shadow(encoder, &mark_pass_);
+                    ++visited;
+                    if (skip) {
+                        ++skipped;
+                        if (uploaded != 0) {
+                            crosscheck_buffers_.insert(r);
+                        }
+                    }
+                    uintptr_t lo = 0, hi = 0;
+                    if (r->write_tracked_host_range(&lo, &hi)) {
+                        buffer_page_index_.add(r, lo, hi);
+                        r->flush_indexed = true;
+                        r->flush_primed = ranges_cover(taken_ok, lo, hi);
+                    } else {
+                        buffer_page_index_.remove(r);
+                        r->flush_indexed = false;
+                        r->flush_primed = false;
+                        ++untracked;
+                    }
+                }
+                count_work(Work::FlushBuffersVisited, visited);
+                count_work(Work::FlushBuffersSkipped, skipped);
+                count_work(Work::FlushBuffersUntracked, untracked);
+            } else {
+                for (Resource* r : tracked_) {
+                    r->set_slot_indexed(false);
+                    r->flush_shadow(encoder, &mark_pass_);
+                }
             }
         } else {
             std::vector<const void*> visit;
@@ -2166,43 +2327,92 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     {
         std::lock_guard<std::mutex> lock(relocation_mutex_);
         std::vector<uint8_t> bytes;
+        if (indexed) {
+            std::vector<const void*> visit;
+            uniform_page_index_.collect_pages(dirty_pages, os::kWrittenPageSize, &visit);
+            for (const auto& h : taken_failed) {
+                uniform_page_index_.collect_range(h.first, h.second, &visit);
+            }
+            for (const void* key : visit) {
+                const_cast<RelocatedUniform*>(static_cast<const RelocatedUniform*>(key))->visit_seq = seq;
+            }
+            for (const void* key : crosscheck_uniforms_) {
+                const RelocatedUniform* r = static_cast<const RelocatedUniform*>(key);
+                if (r->visit_seq == seq || !r->primed) {
+                    count_work(Work::FlushCrosscheckLate);
+                } else {
+                    count_work(Work::FlushCrosscheckMisses);
+                    std::fprintf(stderr, "[flush-crosscheck] uniform range 0x%llx (%llu bytes) changed unreported\n",
+                                 static_cast<unsigned long long>(r->va), static_cast<unsigned long long>(r->size));
+                }
+            }
+            crosscheck_uniforms_.clear();
+        }
+        uint64_t compared = 0, skipped = 0;
         for (auto& [key, r] : relocations_) {
-            const uint64_t cpu = cpu_address_for_gpu(r.va);
-            if (unwritten(cpu, r.size) && !r.shadow.empty()) {
+            const bool skip = indexed && r.primed && r.visit_seq != seq;
+            if (skip && !crosscheck) {
+                ++skipped;
                 continue;
+            }
+            const uint64_t cpu = cpu_address_for_gpu(r.va);
+            if (!indexed && unwritten(cpu, r.size) && !r.shadow.empty()) {
+                continue;
+            }
+            ++compared;
+            if (skip) {
+                ++skipped;
             }
             // R40: compare the live bytes in place where they are mapped in one piece (no copy
             // through the arena's checked read for an unchanged range, the usual case).
             // (The view holds the arena lock: another guest thread must not decommit the pages mid-read.)
             bool unchanged = false;
-            bool copied = false;
+            bool have_bytes = false;
+            uintptr_t host = 0;
             {
                 const com::GuestRangeView view(cpu, static_cast<size_t>(r.size));
                 if (view.data() != nullptr) {
+                    host = reinterpret_cast<uintptr_t>(view.data());
                     if (r.shadow.size() == r.size && std::memcmp(view.data(), r.shadow.data(), r.shadow.size()) == 0) {
                         unchanged = true;
                     } else {
                         bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
                         std::memcpy(bytes.data(), view.data(), bytes.size());
-                        copied = true;
+                        have_bytes = true;
                     }
                 }
             }
-            if (unchanged) {
-                continue;
-            }
-            if (!copied) {
+            if (!unchanged && !have_bytes) {
                 bytes.resize(static_cast<size_t>(r.size));
-                if (!com::read_guest(cpu, bytes.data(), bytes.size())) {
-                    continue;
-                }
+                have_bytes = com::read_guest(cpu, bytes.data(), bytes.size());
             }
-            if (bytes == r.shadow) {
+            bool changed = false;
+            if (!unchanged && have_bytes && bytes != r.shadow) {
+                encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
+                r.shadow = bytes;
+                note_upload(r.size);
+                changed = true;
+            }
+            if (!indexed) {
                 continue;
             }
-            encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
-            r.shadow = bytes;
-            note_upload(r.size);
+            if (skip && changed) {
+                crosscheck_uniforms_.insert(&r);
+            }
+            // Indexed by its host range once it has been compared in place (a range read only through
+            // the checked copy, or never written, is compared every time).
+            if (host != 0 && !r.shadow.empty()) {
+                const uintptr_t hi = host + static_cast<uintptr_t>(r.size);
+                uniform_page_index_.add(&r, host, hi);
+                r.primed = ranges_cover(taken_ok, host, hi);
+            } else {
+                uniform_page_index_.remove(&r);
+                r.primed = false;
+            }
+        }
+        if (indexed) {
+            count_work(Work::FlushUniformsCompared, compared);
+            count_work(Work::FlushUniformsSkipped, skipped);
         }
     }
     // Relocated storage buffers (G51): refresh any relocated range whose guest bytes changed.
@@ -2336,6 +2546,8 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
             }
             relocation_free_[{lru->second.size, std::get<2>(lru->first)}].emplace_back(lru->second.buffer_id,
                                                                                          lru->second.offset);
+            uniform_page_index_.remove(&lru->second);
+            crosscheck_uniforms_.erase(&lru->second);
             relocations_.erase(lru);
             relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -3135,9 +3347,9 @@ void Resource::shadow_store(uint64_t off, const uint8_t* src, uint64_t n) {
     }
 }
 
-void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks) {
+uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks) {
     if (cpu_va_ == 0 || shadow_size_ == 0) {
-        return;
+        return 0;
     }
     const uint64_t size = shadow_size_;
     // Held for the whole compare / upload-copy below so a concurrent decommit cannot fault it.
@@ -3181,6 +3393,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
         }
     }
     write_tracked_ = tracked;
+    tracked_host_ = tracked ? reinterpret_cast<uintptr_t>(live) : 0;
     // O37: the translated window keeps write marks per 64 KiB slot instead (the browser has no OS
     // write watch): the same protocol, with the slot marks taken (cleared) before the comparison
     // and the first flush after the marks became usable comparing everything.
@@ -3251,7 +3464,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
         if (uploaded != 0) {
             device_->note_upload(uploaded);
         }
-        return;
+        return uploaded;
     }
     // Every page is compared here (no candidates, or verification): the bulk of the work when the
     // buffer has no write tracking (R40: split across helper threads, compare_pages).
@@ -3288,6 +3501,7 @@ void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass*
     if (uploaded != 0) {
         device_->note_upload(uploaded);
     }
+    return uploaded;
 }
 
 HResult Resource::Map(uint32_t subresource, uint64_t, OutPtr data) {

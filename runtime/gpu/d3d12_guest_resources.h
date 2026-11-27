@@ -207,7 +207,27 @@ public:
     bool has_gpu_texture() const { return gpu_texture_; }
     // Shadow comparison (CPU-visible buffers): appends WriteBuffer packets for changed pages.
     // `marks`: the flush's pass over the translated window's write marks (null: a pass of its own).
-    void flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks = nullptr);
+    // Returns the bytes uploaded.
+    uint64_t flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks = nullptr);
+    // #1963: the host range the last flush_shadow compared through the OS write tracking (its take
+    // succeeded on the live bytes), else false: the flush's page index keys the buffer by it.
+    bool write_tracked_host_range(uintptr_t* lo, uintptr_t* hi) const {
+        if (!write_tracked_ || tracked_host_ == 0) {
+            return false;
+        }
+        *lo = tracked_host_;
+        *hi = tracked_host_ + static_cast<uintptr_t>(shadow_size_);
+        return true;
+    }
+    // #1963: a flush that found no page of this buffer written since the cursor's position moves the
+    // buffer's own cursor there (a later take of its own then reports only newer writes).
+    void advance_write_cursor(const os::WriteCursor& c) { write_cursor_ = c; }
+    // #1963 page-index state (under Device::tracked_mutex_): indexed by host range, and primed (its
+    // bytes were compared after a successful flush take covering them, so it is only flushed when a
+    // take reports one of its pages written).
+    bool flush_indexed = false;
+    bool flush_primed = false;
+    uint64_t flush_visit_seq = 0;
     // O36: the flush indexes a buffer by window slot once its write marks are in use; it is then
     // only flushed when one of its slots is marked.
     bool window_marks_in_use() const { return window_marked_ && cpu_va_ != 0 && shadow_size_ != 0; }
@@ -252,6 +272,7 @@ private:
     // flushes compare only the pages reported written since (os::take_written_pages).
     bool write_tracked_ = false;
     os::WriteCursor write_cursor_;  // os::take_written_pages' position (commit log, view stamps)
+    uintptr_t tracked_host_ = 0;    // the live bytes' host address when write_tracked_
     // O37: the translated window's write marks cover this buffer and were taken at a full
     // comparison: later flushes compare only the pages of slots marked since.
     bool window_marked_ = false;

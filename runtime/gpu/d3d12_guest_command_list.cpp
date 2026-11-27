@@ -85,6 +85,16 @@ const char* work_name(Work w) {
     case Work::ShadowComparedBytes: return "shadow_compared_bytes";
     case Work::ShadowFullCompares: return "shadow_full_compares";
     case Work::ShadowFullCompareBytes: return "shadow_full_compare_bytes";
+    case Work::FlushIndexTakes: return "flush_index_takes";
+    case Work::FlushIndexTakeFailures: return "flush_index_take_failures";
+    case Work::FlushIndexDirtyPages: return "flush_index_dirty_pages";
+    case Work::FlushBuffersVisited: return "flush_buffers_visited";
+    case Work::FlushBuffersSkipped: return "flush_buffers_skipped";
+    case Work::FlushBuffersUntracked: return "flush_buffers_untracked";
+    case Work::FlushUniformsCompared: return "flush_uniforms_compared";
+    case Work::FlushUniformsSkipped: return "flush_uniforms_skipped";
+    case Work::FlushCrosscheckLate: return "flush_crosscheck_late";
+    case Work::FlushCrosscheckMisses: return "flush_crosscheck_misses";
     case Work::Count: break;
     }
     return "?";

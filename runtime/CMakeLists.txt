@@ -47,6 +47,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_objects.cpp
     gpu/d3d12_xs_exports.cpp
     gpu/d3d12_guest_resources.cpp
+    gpu/flush_page_index.cpp
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
     gpu/xbox_embedded_native.cpp
@@ -424,6 +425,9 @@ else()
     add_executable(test_present_pacing ../tests/test_present_pacing.cpp)
     target_link_libraries(test_present_pacing PRIVATE playgta6_core)
     add_test(NAME playgta6_present_pacing_tests COMMAND test_present_pacing)
+    add_executable(test_flush_page_index ../tests/test_flush_page_index.cpp)
+    target_link_libraries(test_flush_page_index PRIVATE playgta6_core)
+    add_test(NAME playgta6_flush_page_index_tests COMMAND test_flush_page_index)
     add_executable(test_frame_breakdown ../tests/test_frame_breakdown.cpp)
     target_link_libraries(test_frame_breakdown PRIVATE playgta6_core)
     add_test(NAME playgta6_frame_breakdown_tests COMMAND test_frame_breakdown)
