@@ -384,7 +384,7 @@ test('state bridge fixture stream produces the exact WebGPU calls', () => {
   });
 
   const ring = gpu.results('createBuffer').find((c) => c.desc.size === 1 << 20);
-  assert.deepEqual(ring.desc, { size: 1 << 20, usage: 0x0048 });
+  assert.deepEqual(ring.desc, { size: 1 << 20, usage: 0x00C8 });
   // Views created from packet view descriptors (v1 CreateTexture also makes a default view).
   const views = gpu.results('texture.createView').filter((v) => v.desc !== undefined);
   const viewOf = (textureHandle) => views.find((v) => v.texture.handle === textureHandle);

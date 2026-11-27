@@ -364,6 +364,20 @@ enum class IndirectKind : uint8_t {
     // mesh stage run as compute, then a draw record (x * max_primitives * 3, 1, 0, 0).
     DispatchMesh = 3,
 };
+// One command-signature argument that sets root constants per command (D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT):
+// `num_words` 32-bit values at `record_word` of every record go to words `dest_word`.. of root
+// parameter `root_parameter`. The values are read by the GPU (a compute pass writes them into the
+// root-constant ring); the CPU never reads the argument buffer.
+struct IndirectRootConstant {
+    uint32_t root_parameter = 0;
+    uint32_t dest_word = 0;
+    uint32_t num_words = 0;
+    uint32_t record_word = 0;
+};
+// Constant arguments one signature may carry (more are skipped and counted).
+inline constexpr uint32_t kMaxIndirectRootConstants = 4;
+// Largest root-constant chunk one execution writes (params + base values + per-command values).
+inline constexpr uint32_t kIndirectConstantsMaxBytes = 256u << 10;
 struct IndirectExecution {
     IndirectKind kind = IndirectKind::Draw;
     uint32_t max_count = 0;
@@ -372,6 +386,11 @@ struct IndirectExecution {
     uint64_t args_offset = 0;
     uint32_t count_buffer = 0;  // 0 = no count buffer (max_count commands)
     uint64_t count_offset = 0;
+    // Signatures with root-constant arguments before the work argument: the work argument starts
+    // `work_word` words into the record; `constants[0..constant_count)` change per command.
+    uint32_t work_word = 0;
+    uint32_t constant_count = 0;
+    IndirectRootConstant constants[kMaxIndirectRootConstants] = {};
 };
 // Commands one ExecuteIndirect emits at most (more are dropped and counted).
 inline constexpr uint32_t kMaxIndirectCommands = 256;
@@ -386,6 +405,26 @@ inline constexpr uint32_t kIndirectClampSlotBytes = 120;
 uint32_t indirect_output_bytes(IndirectKind kind) noexcept;
 // The clamp compute shader (entry point cs_main, workgroup size 64).
 const char* indirect_clamp_wgsl() noexcept;
+// The root-constant pass of an ExecuteIndirect with constant arguments (entry point cs_main,
+// workgroup size 64): per command, fills one 256-byte root-constant slot per argument from the
+// record (live commands) over a copy of the parameter's current values. Chunk layout (words, all
+// inside one dynamic-offset window of the root-constant ring):
+//   [0] source word of the first record   [1] stride in words   [2] command count
+//   [3] count buffer word  [4] has count buffer  [5] argument count  [6] first per-command slot word
+//   [7] record words (every argument incl. the work argument)
+//   [8 + 4j .. 11 + 4j] argument j: record word, dest word, value count, 0
+//   [64 + 64j ..] argument j's base values (its parameter's current values)
+//   [first slot + (command * argument count + j) * 64 ..] the values command `command` binds
+const char* indirect_constants_wgsl() noexcept;
+// Bytes of the chunk for `count` commands of `args` constant arguments, and the slot geometry.
+inline constexpr uint32_t indirect_constants_first_slot_word(uint32_t args) noexcept { return 64u + 64u * args; }
+inline constexpr uint32_t indirect_constants_chunk_bytes(uint32_t args, uint32_t count) noexcept {
+    return 4u * (indirect_constants_first_slot_word(args) + count * args * 64u);
+}
+// The most commands a chunk of `args` constant arguments holds within kIndirectConstantsMaxBytes.
+inline constexpr uint32_t indirect_constants_max_commands(uint32_t args) noexcept {
+    return args == 0 ? 0 : (kIndirectConstantsMaxBytes - 4u * indirect_constants_first_slot_word(args)) / (256u * args);
+}
 class CommandListBridge;
 
 // ---- G66: mesh pipelines (triangle output, x-dimension groups) emulated with compute + draw ----
@@ -815,6 +854,16 @@ private:
     // True when the (args, count) clamp bind group already exists (a batched clamp may use it).
     bool indirect_clamp_group_known(uint32_t args, uint32_t count);
     uint32_t allocate_indirect_window();
+    // The root-constant pass (see indirect_constants_wgsl): pipeline and group layout created through
+    // `encoder` on first use, and its bind group over (args, count) and a ring window size class.
+    struct IndirectConstants {
+        uint32_t group_layout = 0;
+        uint32_t pipeline = 0;
+    };
+    IndirectConstants indirect_constants(CommandEncoder& encoder);
+    // `window_bytes`: the (power of two) size of the ring window the dynamic offset selects.
+    uint32_t indirect_constants_group(const IndirectConstants& pass, uint32_t ring, uint32_t args, uint32_t count,
+                                      uint32_t window_bytes, CommandEncoder& encoder);
 
     // RT-class dispatch preparation (design sections 3 and 5): applies the gate, makes `ranges` (guest
     // address, size) resident, and emits through `encoder`, in this order: the arena / directory /
@@ -935,6 +984,8 @@ private:
     std::unordered_map<ConversionGroupKey, uint32_t, ConversionGroupKeyHash> conversion_groups_;  // (layout, src, dst, mip, layers)
     std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
     IndirectClamp indirect_clamp_{};
+    IndirectConstants indirect_constants_{};
+    std::unordered_map<uint64_t, uint32_t> indirect_constants_groups_;  // (args, count, window) -> bind group
     std::unordered_map<ResourcePairKey, uint32_t, ResourcePairKeyHash> indirect_groups_;  // (args, count) -> bind group
     uint32_t indirect_cursor_ = 0;
     std::unordered_map<MeshLayoutKey, PipelineLayoutRecord*, MeshLayoutKeyHash> mesh_layouts_;
@@ -1106,6 +1157,10 @@ struct BridgeStats {
     uint64_t indirect_skipped = 0;
     uint64_t indirect_truncated = 0;
     uint64_t indirect_clamps_batched = 0;  // clamps recorded ahead of their draws (backlog 41)
+    // ExecuteIndirect with root-constant arguments: executions and commands emitted through the
+    // GPU-side constants pass (their values are never read back), commands cut by the chunk size.
+    uint64_t indirect_constant_executions = 0;
+    uint64_t indirect_constant_commands = 0;
     // G66 mesh pipelines: mesh dispatches emitted (direct, and indirect commands), and mesh work
     // skipped (no mesh pipeline state bound, invalid group counts, bindings that cannot be built).
     uint64_t mesh_dispatches = 0;
@@ -1308,6 +1363,9 @@ private:
     bool prepare_mesh_draw();
     // G66: emits the clamp pass for `e` (count commands) and returns the ring offset of its output.
     bool emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring, uint32_t* out_offset);
+    // The root-constant pass of an execution with constant arguments; returns the chunk's ring offset.
+    bool emit_indirect_constants(const IndirectExecution& e, uint32_t count, uint32_t* chunk_offset,
+                                 uint32_t* window_bytes);
     void apply_input_assembler(bool indexed);
 
     // #482: a compute storage-texture binding redirected to an intermediate texture in the stage's
@@ -1418,6 +1476,14 @@ private:
     bool compute_pass_valid_ = false;
     uint32_t compute_pipeline_bound_ = 0;
     IndirectClampBatch clamp_batch_;  // backlog 41: the open run of batched ExecuteIndirect clamps
+    // While an ExecuteIndirect with constant arguments emits its commands: the ring offset of the
+    // current command's slot per (bind point, root parameter), used instead of the CPU values.
+    struct RootConstantOverride {
+        uint32_t offset = 0;
+        bool valid = false;
+    };
+    std::array<std::array<RootConstantOverride, d3d::kMaxRootParameters>, d3d::kBindPointCount>
+        root_override_{};
     // Root constants last uploaded per (bind point, parameter): values + ring offset.
     struct RootConstantUpload {
         std::vector<uint32_t> values;

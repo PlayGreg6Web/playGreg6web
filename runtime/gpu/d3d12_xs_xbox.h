@@ -796,6 +796,10 @@ enum class Counter : size_t {
     IndirectExecuted,            // ... emitted (draw / indexed draw / dispatch through the clamp pass)
     IndirectMeshSkipped,         // ... mesh dispatch signatures without an emulated mesh pipeline bound, skipped
     IndirectType105Skipped,      // ... Xbox type 105 signatures: skipped
+    IndirectConstantExecuted,    // ... emitted with root-constant arguments (values written by a GPU pass)
+    IndirectVertexIndexArgsSkipped,  // ... signatures changing vertex / index buffer views per command: skipped
+                                     // (WebGPU cannot bind a buffer from a GPU address read on the GPU)
+    IndirectRootViewArgsSkipped,     // ... signatures setting root CBV / SRV / UAV addresses per command: skipped
     RectListPipelineStates,      // topology type kTopologyTypeRect accepted
     RectListDrawsSkipped,        // draws with topology kTopologyRectList that were not expanded
     RectListDrawsExpanded,       // ... expanded into triangle lists

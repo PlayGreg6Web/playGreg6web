@@ -2296,14 +2296,27 @@ HResult Device::CreateCommandSignature(const GuestCommandSignatureDesc* desc, ui
         note_bad_argument("CreateCommandSignature: invalid descriptor");
         return kEInvalidArg;
     }
-    // D3D12_INDIRECT_ARGUMENT_DESC is 16 bytes, Type first; the work argument is the last one.
+    // D3D12_INDIRECT_ARGUMENT_DESC is 16 bytes, Type first, then the union (Constant: root
+    // parameter, dest offset, value count); the work argument is the last one.
     uint32_t work_type = CommandSignature::kIndirectArgUnknown;
     if (!com::read_guest(desc->pArgumentDescs + uint64_t{desc->NumArgumentDescs - 1} * 16u, &work_type,
                          sizeof(work_type))) {
         work_type = CommandSignature::kIndirectArgUnknown;
     }
+    std::vector<CommandSignature::Arg> args;
+    if (desc->NumArgumentDescs <= 32) {
+        for (uint32_t i = 0; i < desc->NumArgumentDescs; ++i) {
+            uint32_t raw[4] = {};
+            if (!com::read_guest(desc->pArgumentDescs + uint64_t{i} * 16u, raw, sizeof(raw))) {
+                args.clear();
+                break;
+            }
+            args.push_back({raw[0], raw[1], raw[2], raw[3]});
+        }
+    }
     auto signature = com::create_object<CommandSignature>(com::implements(kID3D12CommandSignature), device_ref(this),
-                                                          desc->ByteStride, desc->NumArgumentDescs, work_type);
+                                                          desc->ByteStride, desc->NumArgumentDescs, work_type,
+                                                          std::move(args));
     return hand_out(std::move(signature), riid, out);
 }
 

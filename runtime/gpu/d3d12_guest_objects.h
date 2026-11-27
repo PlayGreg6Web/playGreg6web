@@ -1529,18 +1529,52 @@ public:
     static constexpr uint32_t kIndirectArgDispatchMesh = 10;
     static constexpr uint32_t kIndirectArgXbox105 = 105;
     static constexpr uint32_t kIndirectArgUnknown = 0xFFFFFFFFu;
+    // D3D12_INDIRECT_ARGUMENT_TYPE of the arguments that change state before the work argument.
+    static constexpr uint32_t kIndirectArgVertexBufferView = 3;
+    static constexpr uint32_t kIndirectArgIndexBufferView = 4;
+    static constexpr uint32_t kIndirectArgConstant = 5;
+    static constexpr uint32_t kIndirectArgCbv = 6;
+    static constexpr uint32_t kIndirectArgSrv = 7;
+    static constexpr uint32_t kIndirectArgUav = 8;
+    // One argument of the signature: Constant carries (root_parameter, dest_word, num_words).
+    struct Arg {
+        uint32_t type = kIndirectArgUnknown;
+        uint32_t root_parameter = 0;
+        uint32_t dest_word = 0;
+        uint32_t num_words = 0;
+    };
     CommandSignature(com::Ref<Device> device, uint32_t byte_stride, uint32_t argument_count,
-                     uint32_t work_type = kIndirectArgUnknown)
+                     uint32_t work_type = kIndirectArgUnknown, std::vector<Arg> args = {})
         : ChildBase(std::move(device)), byte_stride_(byte_stride), argument_count_(argument_count),
-          work_type_(work_type) {}
+          work_type_(work_type), args_(std::move(args)) {}
     uint32_t byte_stride() const { return byte_stride_; }
     uint32_t argument_count() const { return argument_count_; }
     uint32_t work_type() const { return work_type_; }
+    // The arguments in record order (the last is the work argument); empty when unparsed.
+    const std::vector<Arg>& args() const { return args_; }
+    // Bytes one argument occupies in a record (arguments are tightly packed, in order).
+    static uint32_t arg_bytes(const Arg& a) {
+        switch (a.type) {
+        case kIndirectArgDraw: return 16;
+        case kIndirectArgDrawIndexed: return 20;
+        case kIndirectArgDispatch:
+        case kIndirectArgDispatchMesh:
+        case kIndirectArgXbox105: return 12;
+        case kIndirectArgVertexBufferView:
+        case kIndirectArgIndexBufferView: return 16;
+        case kIndirectArgConstant: return 4u * a.num_words;
+        case kIndirectArgCbv:
+        case kIndirectArgSrv:
+        case kIndirectArgUav: return 8;
+        default: return 0;
+        }
+    }
 
 private:
     uint32_t byte_stride_;
     uint32_t argument_count_;
     uint32_t work_type_;
+    std::vector<Arg> args_;
 };
 
 class CommandQueue final : public ChildBase<ICommandQueueHost> {

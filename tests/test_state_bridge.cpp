@@ -458,7 +458,7 @@ void test_representative_command_list() {
     CHECK(ring.id == 1003 && ring.byte_size == (1u << 20));
     const auto smp = pod<GpuCreateSampler2Payload>(p[9]);
     CHECK(smp.id == 1004 && smp.address_u == static_cast<uint8_t>(GpuAddressMode::Repeat) && smp.min_filter == 1);
-    CHECK(ring.usage_flags == (GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst));
+    CHECK(ring.usage_flags == (GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst | GpuBufferUsage::Storage));
     const auto bg = pod<GpuCreateBindGroup2Payload>(p[10]);
     CHECK(bg.id == 1005 && bg.layout_id == 1000 && bg.entry_count == 3);
     const auto b0 = pod<GpuBindGroupEntry2>(p[10], sizeof(bg));
@@ -1091,6 +1091,88 @@ void test_execute_indirect_clamp_batching() {
         CHECK(find_op(p, GpuOpcode::DispatchCompute) < find_op(p, GpuOpcode::DrawIndirect));
         CHECK(count_op(p, GpuOpcode::DispatchCompute) == 1);
     }
+    list.Close();
+}
+
+
+// ExecuteIndirect with a root-constant argument before the draw: one GPU pass fills a per-command
+// root-constant slot from the record (nothing is read back), the clamp reads the draw record behind
+// the constants, and each command's draw is bound to its own slot (a dynamic offset 256 bytes apart).
+void test_execute_indirect_root_constants() {
+    Scene scene(7300);
+    constexpr uint32_t kArgs = 440;
+    scene.device.register_buffer(kArgs, 0x500000, 4096);
+    const std::string wgsl = bridge::indirect_constants_wgsl();
+    CHECK(wgsl.find("@compute @workgroup_size(64)") != std::string::npos && wgsl.find("fn cs_main") != std::string::npos);
+    const d3d::CpuDescriptorHandle rtv1 = scene.rtv(1);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);  // binds the CPU values (slot 0 of the ring)
+
+    bridge::IndirectExecution e;
+    e.kind = bridge::IndirectKind::Draw;
+    e.max_count = 3;
+    e.stride = 24;  // 2 constant words + 16 bytes of draw record
+    e.args_buffer = kArgs;
+    e.work_word = 2;
+    e.constant_count = 1;
+    e.constants[0] = {1, 1, 2, 0};  // root parameter 1, words 1..2, from record word 0
+    const size_t mark = enc.size();
+    CHECK(list.ExecuteIndirect(e));
+    {
+        const std::vector<Packet> p = decode(enc, mark);
+        // The constants pass: its chunk header (first source word, stride, count, ..., arg 0) and the base values.
+        size_t head = p.size();
+        for (size_t i = 0; i < p.size(); ++i) {
+            if (p[i].opcode == GpuOpcode::WriteBuffer && pod<GpuWriteBufferPayload>(p[i]).data_len == 4u * 128u) {
+                head = i;
+            }
+        }
+        CHECK(head < p.size());
+        if (head < p.size()) {
+            uint32_t w[128] = {};
+            std::memcpy(w, p[head].payload.data() + sizeof(GpuWriteBufferPayload), sizeof(w));
+            CHECK(w[0] == 0 && w[1] == 6 && w[2] == 3 && w[4] == 0 && w[5] == 1 && w[6] == 128 && w[7] == 6);
+            CHECK(w[8] == 0 && w[9] == 1 && w[10] == 2);
+            CHECK(w[64] == 0x3f800000u && w[65] == 0x3f000000u && w[66] == 0x3e800000u && w[67] == 0x3f800000u);
+        }
+        CHECK(count_op(p, GpuOpcode::DispatchCompute) == 2);  // the constants pass and the clamp
+        const size_t first_dispatch = find_op(p, GpuOpcode::DispatchCompute);
+        const size_t first_draw = find_op(p, GpuOpcode::DrawIndirect);
+        CHECK(first_dispatch < first_draw && count_op(p, GpuOpcode::DrawIndirect) == 3);
+        const std::array<uint32_t, 8> params = indirect_params(p, find_op(p, GpuOpcode::DispatchCompute, first_dispatch + 1));
+        CHECK(params[0] == 2 && params[1] == 6 && params[2] == 3);  // the draw record starts behind the constants
+        // Each draw is bound to its own slot: the root-constant group's dynamic offset steps by 256.
+        std::vector<uint32_t> offsets;
+        const size_t after_passes = find_op(p, GpuOpcode::DispatchCompute, first_dispatch + 1) + 1;
+        for (size_t i = after_passes; i < p.size(); ++i) {
+            if (p[i].opcode == GpuOpcode::SetBindGroup2) {
+                const auto set = pod<GpuSetBindGroup2Payload>(p[i]);
+                if (set.dynamic_offset_count == 1) {
+                    offsets.push_back(pod<uint32_t>(p[i], sizeof(set)));
+                }
+            }
+        }
+        CHECK(offsets.size() == 3);
+        for (size_t i = 1; i < offsets.size(); ++i) {
+            CHECK(offsets[i] - offsets[i - 1] == 256);
+        }
+    }
+    CHECK(list.stats().indirect_constant_executions == 1 && list.stats().indirect_constant_commands == 3);
+    // The next plain draw goes back to the parameter's own values.
+    const size_t mark2 = enc.size();
+    list.DrawInstanced(3, 1, 0, 0);
+    {
+        const std::vector<Packet> p = decode(enc, mark2);
+        CHECK(count_op(p, GpuOpcode::SetBindGroup2) == 1 && count_op(p, GpuOpcode::Draw) == 1);
+    }
+    // A constant range that does not fit the record is skipped.
+    bridge::IndirectExecution bad = e;
+    bad.constants[0].num_words = 3;
+    const size_t mark3 = enc.size();
+    CHECK(!list.ExecuteIndirect(bad) && enc.size() == mark3);
     list.Close();
 }
 
@@ -7281,6 +7363,7 @@ int main() {
     test_execute_indirect_packets();
     test_indirect_clamp_batch_planner();
     test_execute_indirect_clamp_batching();
+    test_execute_indirect_root_constants();
     test_mesh_pipeline_packets();
     test_binding_array_layouts();
     test_diagnostics_and_closed_list();

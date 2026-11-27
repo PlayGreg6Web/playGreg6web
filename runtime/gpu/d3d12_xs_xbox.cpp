@@ -2739,7 +2739,35 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
             : (e.kind == bridge::IndirectKind::Draw ? 16u : 12u);
     const uint64_t args_offset = ctx.int_arg(4);
     const uint64_t count_offset = count != nullptr ? ctx.int_arg(6) : 0u;
-    if (signature->argument_count() != 1 || signature->byte_stride() < min_stride || args == nullptr ||
+    // Arguments before the work argument: root constants are expressed (a GPU pass writes each
+    // command's values into the root-constant ring); view / address arguments are not.
+    uint32_t work_word = 0;
+    const auto& sig_args = signature->args();
+    if (sig_args.size() > 1 && sig_args.size() == signature->argument_count()) {
+        for (size_t a = 0; a + 1 < sig_args.size(); ++a) {
+            const CommandSignature::Arg& arg = sig_args[a];
+            if (arg.type != CommandSignature::kIndirectArgConstant) {
+                skip(arg.type == CommandSignature::kIndirectArgVertexBufferView ||
+                             arg.type == CommandSignature::kIndirectArgIndexBufferView
+                         ? xbox::Counter::IndirectVertexIndexArgsSkipped
+                         : arg.type == CommandSignature::kIndirectArgCbv ||
+                                   arg.type == CommandSignature::kIndirectArgSrv ||
+                                   arg.type == CommandSignature::kIndirectArgUav
+                               ? xbox::Counter::IndirectRootViewArgsSkipped
+                               : xbox::Counter::IndirectSkipped);
+                return;
+            }
+            if (e.constant_count >= bridge::kMaxIndirectRootConstants || e.kind == bridge::IndirectKind::DispatchMesh) {
+                skip(xbox::Counter::IndirectSkipped);
+                return;
+            }
+            e.constants[e.constant_count++] = {arg.root_parameter, arg.dest_word, arg.num_words, work_word};
+            work_word += CommandSignature::arg_bytes(arg) / 4u;
+        }
+        e.work_word = work_word;
+    }
+    if ((signature->argument_count() != 1 && e.constant_count == 0) ||
+        signature->byte_stride() < min_stride + work_word * 4u || args == nullptr ||
         !args->is_buffer() || (args_offset & 3u) != 0 ||
         (count_pointer != 0 && (count == nullptr || !count->is_buffer() || (count_offset & 3u) != 0)) ||
         (pso != nullptr && !pso->resolved()) || (graphics && rect_list_)) {
@@ -2767,6 +2795,9 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
         return;
     }
     device_->count(xbox::Counter::IndirectExecuted);
+    if (e.constant_count != 0) {
+        device_->count(xbox::Counter::IndirectConstantExecuted);
+    }
     count_work(Work::IndirectExecutionsEmitted);
 }
 

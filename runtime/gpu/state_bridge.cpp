@@ -1380,7 +1380,9 @@ uint32_t StateBridgeDevice::ensure_root_constant_ring(CommandEncoder& encoder) {
     if (ring_buffer_id_ == 0) {
         ring_buffer_id_ = allocate_id();
         emit_device_object(ring_buffer_id_, encoder, [&](CommandEncoder& dst) {
-            dst.create_buffer(ring_buffer_id_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst,
+            // Storage: the ExecuteIndirect root-constant pass writes per-command slots (indirect_constants_wgsl).
+            dst.create_buffer(ring_buffer_id_,
+                              GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst | GpuBufferUsage::Storage,
                               options_.root_constant_ring_bytes);
         });
     }
@@ -2285,6 +2287,50 @@ uint32_t indirect_output_bytes(IndirectKind kind) noexcept {
     return 16u;
 }
 
+const char* indirect_constants_wgsl() noexcept {
+    // One invocation per command. Slots of dead commands (past the count buffer's value, or whose
+    // record does not fit in the source buffer) keep the parameter's current values.
+    return R"(@group(0) @binding(0) var<storage, read_write> chunk: array<u32>;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read> cnt: array<u32>;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    let count = chunk[2];
+    if (i >= count) {
+        return;
+    }
+    let nargs = chunk[5];
+    var n = count;
+    if (chunk[4] != 0u) {
+        n = 0u;
+        if (chunk[3] < arrayLength(&cnt)) {
+            n = min(cnt[chunk[3]], count);
+        }
+    }
+    let base = chunk[0] + i * chunk[1];
+    let live = i < n && base < arrayLength(&src) && chunk[7] <= arrayLength(&src) - base;
+    for (var j = 0u; j < nargs; j = j + 1u) {
+        let a = 8u + 4u * j;
+        let slot = chunk[6] + (i * nargs + j) * 64u;
+        let basew = 64u + 64u * j;
+        for (var k = 0u; k < 64u; k = k + 1u) {
+            chunk[slot + k] = chunk[basew + k];
+        }
+        if (live) {
+            for (var k = 0u; k < chunk[a + 2u]; k = k + 1u) {
+                let d = chunk[a + 1u] + k;
+                if (d < 64u) {
+                    chunk[slot + d] = src[base + chunk[a] + k];
+                }
+            }
+        }
+    }
+}
+)";
+}
+
 // ---- G66: mesh pipelines ----
 
 bool valid_mesh_output_layout(const MeshOutputLayout& l) noexcept {
@@ -2561,6 +2607,73 @@ uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uin
         g.id = id;
         g.layout_id = clamp.group_layout;
         g.entry_count = 4;
+        emit_device_object(id, encoder, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        });
+    }
+    return id;
+}
+
+StateBridgeDevice::IndirectConstants StateBridgeDevice::indirect_constants(CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    IndirectConstants& c = indirect_constants_;
+    if (c.pipeline == 0) {
+        GpuBindGroupLayoutEntry entries[3] = {};
+        const uint8_t types[3] = {static_cast<uint8_t>(GpuBufferBindingType::Storage),
+                                  static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage),
+                                  static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)};
+        for (uint32_t i = 0; i < 3; ++i) {
+            entries[i].binding = i;
+            entries[i].visibility = GpuShaderStageBits::Compute;
+            entries[i].type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+            entries[i].binding_type = types[i];
+        }
+        entries[0].flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;  // the chunk in the root-constant ring
+        c.group_layout = allocate_id();
+        emit_device_object(c.group_layout, encoder, [&](CommandEncoder& dst) {
+            GpuCreateBindGroupLayoutPayload layout{};
+            layout.id = c.group_layout;
+            layout.entry_count = 3;
+            dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        });
+        c.pipeline = allocate_id();
+        emit_device_object(c.pipeline, encoder, [&](CommandEncoder& dst) {
+            const uint32_t module = allocate_id();
+            dst.create_shader_module(module, GpuShaderStage::Compute, indirect_constants_wgsl());
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = allocate_id();
+            pl.bind_group_layout_count = 1;
+            dst.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+            GpuCreateComputePipeline2Payload cp{};
+            cp.id = c.pipeline;
+            cp.cs_module_id = module;
+            cp.pipeline_layout_id = pl.id;
+            dst.emit_packet(GpuOpcode::CreateComputePipeline2, &cp, sizeof(cp));
+        });
+    }
+    return c;
+}
+
+uint32_t StateBridgeDevice::indirect_constants_group(const IndirectConstants& pass, uint32_t ring, uint32_t args,
+                                                     uint32_t count, uint32_t window_bytes, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    const uint64_t key = (uint64_t{args} << 40) ^ (uint64_t{count} << 16) ^ uint64_t{window_bytes >> 10};
+    uint32_t& id = indirect_constants_groups_[key];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e[3] = {};
+        const uint32_t ids[3] = {ring, args, count != 0 ? count : args};
+        const uint64_t sizes[3] = {window_bytes, 0, 0};
+        for (uint32_t i = 0; i < 3; ++i) {
+            e[i].binding = i;
+            e[i].resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+            e[i].resource_id = ids[i];
+            e[i].size = sizes[i];
+        }
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = pass.group_layout;
+        g.entry_count = 3;
         emit_device_object(id, encoder, [&](CommandEncoder& dst) {
             dst.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
         });
@@ -3770,6 +3883,10 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
 uint32_t CommandListBridge::upload_root_constants(d3d::BindPoint bind_point, uint32_t parameter_index) {
     if (parameter_index >= d3d::kMaxRootParameters) {
         return 0;
+    }
+    if (const RootConstantOverride& o = root_override_[static_cast<uint32_t>(bind_point) & 1u][parameter_index];
+        o.valid) {
+        return o.offset;  // the current command's slot of an ExecuteIndirect with constant arguments
     }
     const std::span<const uint32_t> values = root_args_.root_constants(bind_point, parameter_index);
     RootConstantUpload& upload = root_uploads_[static_cast<uint32_t>(bind_point) & 1u][parameter_index];
@@ -5263,7 +5380,7 @@ bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t
         index_limit = mesh_pso_->output_.max_primitives * 3u;  // draw vertices per group
         group_limit = mesh_max_groups(mesh_pso_->output_);
     }
-    const uint32_t params[8] = {static_cast<uint32_t>(e.args_offset / 4u),
+    const uint32_t params[8] = {static_cast<uint32_t>(e.args_offset / 4u) + e.work_word,
                                 e.stride / 4u,
                                 count,
                                 static_cast<uint32_t>(e.count_offset / 4u),
@@ -5328,7 +5445,18 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
         diagnostics_ |= BridgeDiag::DrawSkipped;
         return false;
     };
-    if (e.args_buffer == 0 || e.stride < record || e.stride % 4u != 0 || e.args_offset % 4u != 0 ||
+    const bool constants = e.constant_count != 0;
+    if (constants && (e.constant_count > kMaxIndirectRootConstants || e.kind == IndirectKind::DispatchMesh)) {
+        return skip();  // mesh dispatches keep their single-argument form
+    }
+    for (uint32_t j = 0; j < e.constant_count && j < kMaxIndirectRootConstants; ++j) {
+        const IndirectRootConstant& c = e.constants[j];
+        if (c.root_parameter >= d3d::kMaxRootParameters || c.num_words == 0 || c.dest_word >= 64u ||
+            c.num_words > 64u - c.dest_word || c.record_word + c.num_words > e.work_word) {
+            return skip();
+        }
+    }
+    if (e.args_buffer == 0 || e.stride < e.work_word * 4u + record || e.stride % 4u != 0 || e.args_offset % 4u != 0 ||
         e.count_offset % 4u != 0 || e.args_offset / 4u > 0xFFFFFFFFull || e.count_offset / 4u > 0xFFFFFFFFull) {
         return skip();
     }
@@ -5336,7 +5464,13 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
         ++stats_.indirect_executions;
         return true;  // no commands
     }
-    const uint32_t count = std::min(e.max_count, kMaxIndirectCommands);
+    uint32_t count = std::min(e.max_count, kMaxIndirectCommands);
+    if (constants) {
+        count = std::min(count, indirect_constants_max_commands(e.constant_count));
+        if (indirect_constants_chunk_bytes(e.constant_count, count) > device_.options().root_constant_ring_bytes) {
+            return skip();
+        }
+    }
     if (e.kind == IndirectKind::DispatchMesh) {
         if (mesh_pso_ == nullptr || mesh_pso_->stage_->pipeline_id_ == 0 || mesh_max_groups(mesh_pso_->output_) == 0) {
             ++stats_.mesh_skipped;
@@ -5353,6 +5487,11 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
     stats_.indirect_truncated += e.max_count - count;
     uint32_t ring = 0;
     uint32_t base = 0;
+    uint32_t constants_chunk = 0;
+    uint32_t constants_window = 0;
+    if (constants && !emit_indirect_constants(e, count, &constants_chunk, &constants_window)) {
+        return skip();
+    }
     emit_indirect_clamp(e, count, &ring, &base);
     if (e.kind == IndirectKind::DispatchMesh) {
         // Per command: the mesh stage as compute (dispatch record), then the draw over its output.
@@ -5375,33 +5514,127 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
         return true;
     }
     GpuOpcode opcode = GpuOpcode::DispatchIndirect;
-    if (e.kind == IndirectKind::Dispatch) {
-        ComputePipelineState* indirect_state = prepare_compute_dispatch();
-        if (indirect_state == nullptr) {
-            return skip();
-        }
-        if (drop_null_storage_dispatch(indirect_state->pipeline_id_)) {
-            return skip();
-        }
-        // Storage bindings redirected to an intermediate texture (#482) need conversions around the
-        // stage, which only direct dispatches run: such an execution is skipped.
-        for (const BoundGroup& b : compute_groups_) {
-            if (redirects_.count(b.bind_group_id) != 0) {
-                return skip();
+    const d3d::BindPoint bind_point = e.kind == IndirectKind::Dispatch ? d3d::BindPoint::Compute
+                                                                       : d3d::BindPoint::Graphics;
+    // Readies the pipeline and bindings for the next command (once for the whole execution unless
+    // the commands bind different root constants).
+    const auto prepare = [&]() -> bool {
+        if (e.kind == IndirectKind::Dispatch) {
+            ComputePipelineState* indirect_state = prepare_compute_dispatch();
+            if (indirect_state == nullptr) {
+                return false;
             }
+            if (drop_null_storage_dispatch(indirect_state->pipeline_id_)) {
+                return false;
+            }
+            // Storage bindings redirected to an intermediate texture (#482) need conversions around the
+            // stage, which only direct dispatches run: such an execution is skipped.
+            for (const BoundGroup& b : compute_groups_) {
+                if (redirects_.count(b.bind_group_id) != 0) {
+                    return false;
+                }
+            }
+            return true;
         }
-    } else {
         if (!prepare_render_draw()) {
-            return skip();
+            return false;
         }
         apply_input_assembler(e.kind == IndirectKind::DrawIndexed);
+        return true;
+    };
+    if (e.kind != IndirectKind::Dispatch) {
         opcode = e.kind == IndirectKind::DrawIndexed ? GpuOpcode::DrawIndexedIndirect : GpuOpcode::DrawIndirect;
     }
-    for (uint32_t i = 0; i < count; ++i) {
-        encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * out_record);
+    if (!constants) {
+        if (!prepare()) {
+            return skip();
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * out_record);
+        }
+    } else {
+        auto& overrides = root_override_[static_cast<uint32_t>(bind_point) & 1u];
+        const uint32_t first_slot = 4u * indirect_constants_first_slot_word(e.constant_count);
+        bool ok = true;
+        for (uint32_t i = 0; i < count && ok; ++i) {
+            for (uint32_t j = 0; j < e.constant_count; ++j) {
+                overrides[e.constants[j].root_parameter] = {
+                    constants_chunk + first_slot + (i * e.constant_count + j) * 256u, true};
+            }
+            ok = prepare();
+            if (ok) {
+                encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * out_record);
+            }
+        }
+        for (uint32_t j = 0; j < e.constant_count; ++j) {
+            overrides[e.constants[j].root_parameter] = {};
+        }
+        if (!ok) {
+            return skip();
+        }
+        ++stats_.indirect_constant_executions;
+        stats_.indirect_constant_commands += count;
     }
     stats_.indirect_commands += count;
     ++stats_.indirect_executions;
+    return true;
+}
+
+bool CommandListBridge::emit_indirect_constants(const IndirectExecution& e, uint32_t count, uint32_t* chunk_offset,
+                                                uint32_t* window_bytes) {
+    // The compute pass must not share a render pass.
+    clamp_batch_.close();
+    tracker_.flush_pending_clears();
+    tracker_.end_render_pass();
+    drain_events();
+    const d3d::BindPoint bind_point = e.kind == IndirectKind::Dispatch ? d3d::BindPoint::Compute
+                                                                       : d3d::BindPoint::Graphics;
+    const uint32_t nargs = e.constant_count;
+    const uint32_t bytes = indirect_constants_chunk_bytes(nargs, count);
+    uint32_t window = 4096;
+    while (window < bytes) {
+        window <<= 1;
+    }
+    window = std::min(window, kIndirectConstantsMaxBytes);
+    const uint32_t ring = device_.ensure_root_constant_ring(encoder_);
+    bool wrapped = false;
+    const uint32_t offset = device_.allocate_root_constants(window, &wrapped);
+    if (wrapped) {
+        diagnostics_ |= BridgeDiag::RootConstantRingWrapped;
+    }
+    // Header and base values (the parameters' current values), uploaded with the chunk start.
+    std::vector<uint32_t> head(indirect_constants_first_slot_word(nargs), 0u);
+    head[0] = static_cast<uint32_t>(e.args_offset / 4u);
+    head[1] = e.stride / 4u;
+    head[2] = count;
+    head[3] = static_cast<uint32_t>(e.count_offset / 4u);
+    head[4] = e.count_buffer != 0 ? 1u : 0u;
+    head[5] = nargs;
+    head[6] = indirect_constants_first_slot_word(nargs);
+    head[7] = e.work_word + (e.kind == IndirectKind::DrawIndexed ? 5u : e.kind == IndirectKind::Draw ? 4u : 3u);
+    for (uint32_t j = 0; j < nargs; ++j) {
+        const IndirectRootConstant& c = e.constants[j];
+        head[8 + 4 * j] = c.record_word;
+        head[9 + 4 * j] = c.dest_word;
+        head[10 + 4 * j] = c.num_words;
+        const std::span<const uint32_t> values = root_args_.root_constants(bind_point, c.root_parameter);
+        std::copy_n(values.begin(), std::min<size_t>(values.size(), 64u), head.begin() + 64 + 64 * j);
+    }
+    encoder_.write_buffer(ring, offset, head.data(), static_cast<uint32_t>(head.size() * 4u));
+    const StateBridgeDevice::IndirectConstants pass = device_.indirect_constants(encoder_);
+    const uint32_t group =
+        device_.indirect_constants_group(pass, ring, e.args_buffer, e.count_buffer, window, encoder_);
+    note_recorded_resource(e.args_buffer);
+    note_recorded_resource(e.count_buffer);
+    encoder_.set_compute_pipeline(pass.pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 1u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set), &offset, sizeof(offset));
+    encoder_.dispatch_compute((count + 63u) / 64u, 1, 1);
+    // The stage's pipeline and bind groups are set again by the next dispatch.
+    compute_pipeline_bound_ = 0;
+    compute_groups_.clear();
+    *chunk_offset = offset;
+    *window_bytes = window;
     return true;
 }
 

@@ -14,6 +14,7 @@
 #include "gpu/cmd_encoder.h"
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/native_executor.h"
+#include "gpu/state_bridge.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "png_stored_decode.h"
 #include "gpu/native_exec/show_target_model.h"
@@ -30,6 +31,7 @@ void check_impl(bool cond, const char* expr, int line) {
 
 using namespace playgta6;
 using namespace playgta6::gpu::native_exec;
+namespace bridge = playgta6::gpu::bridge;
 
 constexpr uint32_t kW = 64, kH = 32;
 
@@ -2023,6 +2025,126 @@ void test_device_loss() {
     CHECK(run(*ex3, red) == 0 && ex3->faulted());
 }
 
+// ExecuteIndirect root-constant pass (gpu/state_bridge.h indirect_constants_wgsl) on the GPU: per
+// command and constant argument, a 256-byte slot holds the parameter's base values with the record's
+// words written over its range; commands past the count buffer's value or past the end of the
+// argument buffer keep the base values. Nothing is read back by the pass itself.
+void test_indirect_constants_pass(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    constexpr uint32_t kRing = 400, kArgs = 401, kCount = 402, kModule = 403, kBgl = 404, kPl = 405, kPipe = 406,
+                       kGroup = 407;
+    constexpr uint32_t kWindow = 4096, kStrideWords = 6, kNargs = 2, kCommands = 4;
+    const uint32_t first_slot = bridge::indirect_constants_first_slot_word(kNargs);
+    gpu::CommandEncoder setup;
+    setup.create_buffer(kRing, GpuBufferUsage::Uniform | GpuBufferUsage::Storage | GpuBufferUsage::CopyDst |
+                                    GpuBufferUsage::CopySrc, 3 * kWindow);
+    setup.create_buffer(kArgs, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 80);  // 20 words: 3 full records + 2
+    setup.create_buffer(kCount, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 16);
+    uint32_t args[20];
+    for (uint32_t i = 0; i < 20; ++i) args[i] = 0xDEAD0000u + i * 7u;  // garbage: every word is just data
+    setup.write_buffer(kArgs, 0, args, sizeof args);
+    const uint32_t count_values[4] = {2, 0, 0, 0};
+    setup.write_buffer(kCount, 0, count_values, sizeof count_values);
+    setup.create_shader_module(kModule, GpuShaderStage::Compute, bridge::indirect_constants_wgsl());
+    GpuBindGroupLayoutEntry l0 = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                              static_cast<uint8_t>(GpuBufferBindingType::Storage));
+    l0.flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;
+    create_layouts(setup, kBgl, kPl,
+                   {l0, layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                     static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                    layout_entry(2, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                 static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage))});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = kPipe;
+    cp.cs_module_id = kModule;
+    cp.pipeline_layout_id = kPl;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    GpuBindGroupEntry2 e0 = bg_entry(0, GpuBindResourceType::Buffer, kRing);
+    e0.size = kWindow;
+    create_bind_group(setup, kGroup, kBgl,
+                      {e0, bg_entry(1, GpuBindResourceType::Buffer, kArgs), bg_entry(2, GpuBindResourceType::Buffer, kCount)});
+
+    const auto chunk = [&](uint32_t has_count) {
+        std::vector<uint32_t> w(first_slot, 0u);
+        w[0] = 0;  // first record word
+        w[1] = kStrideWords;
+        w[2] = kCommands;
+        w[3] = 0;  // count word
+        w[4] = has_count;
+        w[5] = kNargs;
+        w[6] = first_slot;
+        w[7] = kStrideWords;
+        w[8] = 0, w[9] = 1, w[10] = 2;  // argument 0: record words 0..1 -> words 1..2
+        w[12] = 2, w[13] = 0, w[14] = 1;  // argument 1: record word 2 -> word 0
+        for (uint32_t k = 0; k < 64; ++k) {
+            w[64 + k] = 0xB000u + k;
+            w[128 + k] = 0xC000u + k;
+        }
+        return w;
+    };
+    const auto run_pass = [&](uint32_t offset, uint32_t has_count) {
+        const std::vector<uint32_t> w = chunk(has_count);
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        frame.write_buffer(kRing, offset, w.data(), static_cast<uint32_t>(w.size() * 4));
+        frame.set_compute_pipeline(kPipe);
+        std::vector<uint8_t> sb;
+        append(sb, GpuSetBindGroup2Payload{0, kGroup, 1, 0});
+        append(sb, offset);
+        emit(frame, GpuOpcode::SetBindGroup2, sb);
+        frame.dispatch_compute(1, 1, 1);
+        frame.present();
+        run(ex, frame);
+        ex.wait_idle();
+        std::vector<uint8_t> out;
+        std::string err;
+        CHECK(ex.read_buffer(kRing, offset, kWindow, &out, &err) && out.size() == kWindow);
+        std::vector<uint32_t> words(out.size() / 4);
+        std::memcpy(words.data(), out.data(), out.size());
+        return words;
+    };
+    run(ex, setup);
+
+    // Slot of (command, argument), as the words the draw would bind.
+    const auto slot = [&](const std::vector<uint32_t>& words, uint32_t command, uint32_t arg) {
+        const size_t at = first_slot + (command * kNargs + arg) * 64u;
+        return std::vector<uint32_t>(words.begin() + at, words.begin() + at + 64);
+    };
+    const auto base_of = [&](uint32_t arg) {
+        std::vector<uint32_t> v(64);
+        for (uint32_t k = 0; k < 64; ++k) v[k] = (arg == 0 ? 0xB000u : 0xC000u) + k;
+        return v;
+    };
+    {  // With a count buffer (value 2): commands 0 and 1 take their records, 2 and 3 keep the base values.
+        const std::vector<uint32_t> w = run_pass(256, 1);
+        for (uint32_t c = 0; c < kCommands; ++c) {
+            std::vector<uint32_t> a = base_of(0), b = base_of(1);
+            if (c < 2) {
+                a[1] = args[c * kStrideWords];
+                a[2] = args[c * kStrideWords + 1];
+                b[0] = args[c * kStrideWords + 2];
+            }
+            CHECK(slot(w, c, 0) == a);
+            CHECK(slot(w, c, 1) == b);
+        }
+    }
+    {  // No count buffer: commands 0 to 2 are live; command 3's record does not fit the buffer.
+        const std::vector<uint32_t> w = run_pass(4096 + 256, 0);
+        for (uint32_t c = 0; c < kCommands; ++c) {
+            std::vector<uint32_t> a = base_of(0), b = base_of(1);
+            if (c < 3) {
+                a[1] = args[c * kStrideWords];
+                a[2] = args[c * kStrideWords + 1];
+                b[0] = args[c * kStrideWords + 2];
+            }
+            CHECK(slot(w, c, 0) == a);
+            CHECK(slot(w, c, 1) == b);
+        }
+    }
+    CHECK(ex.stats().device_errors == before.device_errors);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -2045,6 +2167,7 @@ int main() {
     test_textured_draw(*ex);
     test_compute(*ex);
     test_auto_layout_remap(*ex);
+    test_indirect_constants_pass(*ex);
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
     test_readbacks(*ex);
