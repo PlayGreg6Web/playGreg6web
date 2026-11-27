@@ -474,9 +474,8 @@ void split_passes_frame(NativeExecutor& ex, bool split) {
 
     gpu::CommandEncoder frame;
     frame.begin_frame();
-    frame.set_compute_pipeline(3005);  // the aliasing pass: invalid
+    frame.set_compute_pipeline(3005);  // group 1 never bound: the pass is invalid
     set_bind_group2(frame, 0, 3006);
-    set_bind_group2(frame, 1, 3013);
     frame.dispatch_compute(1);
     auto green = swapchain_pass(GpuLoadOp::Clear, 0.0f, 1.0f, 0.0f, 1.0f);
     frame.emit_packet(GpuOpcode::BeginRenderPass, &green, sizeof green);
@@ -494,7 +493,7 @@ void split_passes_frame(NativeExecutor& ex, bool split) {
     }
     std::vector<uint8_t> out;
     std::string err;
-    CHECK(ex.read_buffer(3000, 0, 16, &out, &err));  // the aliasing pass was rejected (its writes never land) ...
+    CHECK(ex.read_buffer(3000, 0, 16, &out, &err));  // the invalid pass was rejected (its writes never land) ...
     CHECK(out == std::vector<uint8_t>(16, 0));
     CHECK(frame_is(ex, {0, 255, 0, 255}));             // ... and the rest of the frame was not
     CHECK(ex.read_buffer(3001, 0, 16, &out, &err));
@@ -3880,6 +3879,121 @@ void test_storage_buffer_aliasing(NativeExecutor& ex, bool across_groups) {
     CHECK(s.storage_alias_unfixable == before.storage_alias_unfixable);
 }
 
+// The same buffer bound twice as writable storage in one dispatch (Dawn: "Writable storage buffer binding
+// aliasing"): the shader writes disjoint words through each binding; the second runs on a scratch copy and its
+// changed words are merged back, so both writes land and no device error is raised.
+void test_storage_buffer_two_writers(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    const uint32_t buf = 9740, shader = 9742, bgl0 = 9743, pl = 9745, pipe = 9746, bg0 = 9747;
+    gpu::CommandEncoder setup;
+    setup.create_buffer(buf, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 16);
+    const uint32_t init[4] = {1, 2, 3, 4};
+    setup.write_buffer(buf, 0, init, 16);
+    setup.create_shader_module(shader, GpuShaderStage::Compute,
+                               "@group(0) @binding(0) var<storage, read_write> a: array<u32>;\n"
+                               "@group(0) @binding(1) var<storage, read_write> b: array<u32>;\n"
+                               "@compute @workgroup_size(2) fn cs_main(@builtin(local_invocation_index) i: u32) {\n"
+                               "  a[i] = a[i] + 10u;\n  b[i + 2u] = b[i + 2u] + 20u;\n}\n");
+    create_layouts(setup, bgl0, pl,
+                   {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1),
+                    layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = pipe;
+    cp.cs_module_id = shader;
+    cp.pipeline_layout_id = pl;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, bg0, bgl0,
+                      {bg_entry(0, GpuBindResourceType::Buffer, buf), bg_entry(1, GpuBindResourceType::Buffer, buf)});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(pipe);
+    set_bind_group2(frame, 0, bg0);
+    frame.dispatch_compute(1, 1, 1);
+    frame.dispatch_compute(1, 1, 1);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(buf, 0, 16, &out, &err));
+    const uint32_t want[4] = {21, 22, 43, 44};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.device_errors == before.device_errors);
+    CHECK(s.dispatches == before.dispatches + 2);
+    CHECK(s.storage_alias_twin_writers == before.storage_alias_twin_writers + 2);
+    CHECK(s.storage_alias_unfixable == before.storage_alias_unfixable);
+}
+
+// A texture bound as a writable storage texture and as a sampled texture in one dispatch (Dawn: usage conflict
+// in the dispatch): the sampled side reads a twin copy, so dst = src + 7 per dispatch and no device error.
+void test_storage_texture_aliasing(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    const uint32_t tex = 9760, shader = 9761, bgl0 = 9762, pl = 9763, pipe = 9764, bg0 = 9765;
+    const uint8_t fmt = static_cast<uint8_t>(playgta6::gpu::pso::WgpuTextureFormat::R32Uint);
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(tex, 4, 4,
+                           GpuTextureUsage::StorageBinding | GpuTextureUsage::TextureBinding | GpuTextureUsage::CopySrc,
+                           fmt)));
+    GpuBindGroupLayoutEntry src = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture, 4, 2);
+    GpuBindGroupLayoutEntry dst = layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                                               static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly), 2);
+    dst.storage_format = fmt;
+    create_layouts(setup, bgl0, pl, {src, dst});
+    setup.create_shader_module(
+        shader, GpuShaderStage::Compute,
+        "@group(0) @binding(0) var src: texture_2d<u32>;\n"
+        "@group(0) @binding(1) var dst: texture_storage_2d<r32uint, write>;\n"
+        "@compute @workgroup_size(4, 4, 1) fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+        "  textureStore(dst, id.xy, vec4<u32>(textureLoad(src, id.xy, 0).x + 7u, 0u, 0u, 0u));\n}\n");
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = pipe;
+    cp.cs_module_id = shader;
+    cp.pipeline_layout_id = pl;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    GpuBindGroupEntry2 b0 = bg_entry(0, GpuBindResourceType::TextureView, tex);
+    GpuBindGroupEntry2 b1 = bg_entry(1, GpuBindResourceType::TextureView, tex);
+    for (GpuBindGroupEntry2* b : {&b0, &b1}) {
+        b->view.format = fmt;
+        b->view.dimension = 2;
+        b->view.mip_level_count = 1;
+        b->view.array_layer_count = 1;
+    }
+    create_bind_group(setup, bg0, bgl0, {b0, b1});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(pipe);
+    set_bind_group2(frame, 0, bg0);
+    frame.dispatch_compute(1, 1, 1);
+    frame.dispatch_compute(1, 1, 1);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    ex.poll();
+    std::vector<uint8_t> px;
+    uint32_t w = 0, h = 0;
+    std::string err;
+    CHECK(ex.read_texture(tex, 0, &px, &w, &h, &err) && w == 4 && h == 4 && px.size() == 64);
+    bool all = px.size() == 64;
+    for (size_t i = 0; all && i < 16; ++i) {
+        uint32_t v;
+        std::memcpy(&v, px.data() + i * 4, 4);
+        all = v == 14;
+    }
+    CHECK(all);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.device_errors == before.device_errors);
+    CHECK(s.storage_tex_alias_copies == before.storage_tex_alias_copies + 2);
+}
+
 void test_error_scope_attribution() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -4061,6 +4175,8 @@ int main() {
     test_view_dimension_matches_entry(*ex);
     test_storage_buffer_aliasing(*ex, false);
     test_storage_buffer_aliasing(*ex, true);
+    test_storage_buffer_two_writers(*ex);
+    test_storage_texture_aliasing(*ex);
     test_wide_mrt_pipeline(*ex);
     test_screenshot();
     test_error_scope_attribution();

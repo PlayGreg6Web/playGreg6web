@@ -72,19 +72,68 @@ struct AliasBinding {
 
 struct AliasPlan {
     std::vector<size_t> copy;  // indexes of the read-only bindings to bind through a copy
-    uint32_t unfixable = 0;    // overlapping pairs of two writable bindings (no read-only side to copy)
+    std::vector<size_t> twin;  // indexes of writable bindings bound through a scratch copy that is merged back
+    uint32_t unfixable = 0;    // overlapping pairs the plan cannot separate
 };
 
 inline bool ranges_overlap(const AliasBinding& a, const AliasBinding& b) {
     return a.offset < b.offset + b.size && b.offset < a.offset + a.size;
 }
 
+// Dawn rejects a dispatch whose writable storage binding overlaps any other binding of the same buffer.
+//  - a read-only binding overlapping a writable one is bound through a copy of its range;
+//  - of several overlapping writable bindings the first stays on the buffer and every later one that overlaps
+//    a binding staying on the buffer is bound through a scratch copy whose changed words are merged back
+//    after the dispatch (`twin`).
 inline AliasPlan plan_alias_copies(const std::vector<AliasBinding>& v) {
     AliasPlan p;
     for (size_t i = 0; i < v.size(); ++i) {
         for (size_t j = i + 1; j < v.size(); ++j) {
             const AliasBinding &a = v[i], &b = v[j];
             if (a.buffer != b.buffer || (!a.writable && !b.writable) || !ranges_overlap(a, b)) continue;
+            if (a.writable && b.writable) continue;
+            const size_t ro = a.writable ? j : i;
+            if (std::find(p.copy.begin(), p.copy.end(), ro) == p.copy.end()) p.copy.push_back(ro);
+        }
+    }
+    std::vector<size_t> direct;
+    for (size_t j = 0; j < v.size(); ++j) {
+        if (!v[j].writable) continue;
+        bool hit = false;
+        for (size_t d : direct)
+            if (v[d].buffer == v[j].buffer && ranges_overlap(v[d], v[j])) hit = true;
+        if (hit) p.twin.push_back(j);
+        else direct.push_back(j);
+    }
+    std::sort(p.copy.begin(), p.copy.end());
+    return p;
+}
+
+// One texture binding of a dispatch (a subresource range of a texture, used as sampled / read-only storage
+// or as a writable storage texture).
+struct AliasTexBinding {
+    uint64_t texture = 0;
+    uint32_t group = 0, binding = 0;
+    uint32_t base_mip = 0, mip_count = 1, base_layer = 0, layer_count = 1;
+    bool writable = false;
+};
+
+struct TexAliasPlan {
+    std::vector<size_t> copy;  // indexes of the non-writable bindings to bind through a twin texture
+    uint32_t unfixable = 0;    // overlapping writable pairs
+};
+
+inline bool tex_ranges_overlap(const AliasTexBinding& a, const AliasTexBinding& b) {
+    return a.texture == b.texture && a.base_mip < b.base_mip + b.mip_count && b.base_mip < a.base_mip + a.mip_count &&
+           a.base_layer < b.base_layer + b.layer_count && b.base_layer < a.base_layer + a.layer_count;
+}
+
+inline TexAliasPlan plan_texture_alias(const std::vector<AliasTexBinding>& v) {
+    TexAliasPlan p;
+    for (size_t i = 0; i < v.size(); ++i) {
+        for (size_t j = i + 1; j < v.size(); ++j) {
+            const AliasTexBinding &a = v[i], &b = v[j];
+            if ((!a.writable && !b.writable) || !tex_ranges_overlap(a, b)) continue;
             if (a.writable && b.writable) {
                 ++p.unfixable;
                 continue;

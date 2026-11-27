@@ -1323,10 +1323,40 @@ void test_view_alias_model() {
     CHECK(p.copy.empty());
     p = plan_alias_copies({bind(1, 0, 0, 0, 64, false), bind(1, 1, 0, 0, 64, false)});  // read-only twice is fine
     CHECK(p.copy.empty() && p.unfixable == 0);
-    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 1, 0, 0, 64, true)});  // two writers: counted
-    CHECK(p.copy.empty() && p.unfixable == 1);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 1, 0, 0, 64, true)});  // two writers: the later one twins
+    CHECK(p.copy.empty() && p.twin.size() == 1 && p.twin[0] == 1 && p.unfixable == 0);
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 0, 1, 64, 64, true), bind(1, 1, 0, 32, 64, true)});
+    CHECK(p.twin.size() == 1 && p.twin[0] == 2);  // 0 and 1 are disjoint: both stay on the buffer
+    p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(2, 0, 1, 0, 64, true)});  // other buffer
+    CHECK(p.twin.empty());
     p = plan_alias_copies({bind(1, 0, 0, 0, 64, true), bind(1, 0, 1, 0, 16, false), bind(1, 1, 0, 8, 16, false)});
     CHECK(p.copy.size() == 2 && p.copy[0] == 1 && p.copy[1] == 2);
+
+    // texture aliasing
+    auto tb = [](uint64_t tex, uint32_t mip, uint32_t mips, uint32_t layer, uint32_t layers, bool w) {
+        AliasTexBinding t;
+        t.texture = tex;
+        t.base_mip = mip;
+        t.mip_count = mips;
+        t.base_layer = layer;
+        t.layer_count = layers;
+        t.writable = w;
+        return t;
+    };
+    TexAliasPlan tp = plan_texture_alias({tb(1, 0, 1, 0, 1, true), tb(1, 0, 1, 0, 1, false)});
+    CHECK(tp.copy.size() == 1 && tp.copy[0] == 1 && tp.unfixable == 0);
+    tp = plan_texture_alias({tb(1, 0, 1, 0, 1, false), tb(1, 0, 4, 0, 1, true)});  // writer's mips cover the reader's
+    CHECK(tp.copy.size() == 1 && tp.copy[0] == 0);
+    tp = plan_texture_alias({tb(1, 0, 1, 0, 1, true), tb(1, 1, 1, 0, 1, false)});  // other mip
+    CHECK(tp.copy.empty() && tp.unfixable == 0);
+    tp = plan_texture_alias({tb(1, 0, 1, 0, 2, true), tb(1, 0, 1, 2, 2, false)});  // other layers
+    CHECK(tp.copy.empty());
+    tp = plan_texture_alias({tb(1, 0, 1, 0, 1, true), tb(2, 0, 1, 0, 1, false)});  // other texture
+    CHECK(tp.copy.empty());
+    tp = plan_texture_alias({tb(1, 0, 1, 0, 1, false), tb(1, 0, 1, 0, 1, false)});  // two readers
+    CHECK(tp.copy.empty() && tp.unfixable == 0);
+    tp = plan_texture_alias({tb(1, 0, 1, 0, 1, true), tb(1, 0, 1, 0, 1, true)});  // two writers: counted
+    CHECK(tp.copy.empty() && tp.unfixable == 1);
 }
 
 void test_binding_fit() {

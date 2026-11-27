@@ -267,6 +267,8 @@ struct ExecutorStats {
     uint64_t usage_texture_snapshots = 0;
     uint64_t usage_snapshot_bytes = 0;
     uint64_t usage_snapshot_skipped = 0;
+    uint64_t usage_snapshot_reused = 0;  // buffer snapshots served from the encoder cache (no copy, no split)
+    uint64_t usage_snapshot_bytes_saved = 0;
     uint64_t usage_split_discards = 0;
     uint64_t v1_render_pipelines = 0;
     uint64_t v1_compute_pipelines = 0;
@@ -298,7 +300,11 @@ struct ExecutorStats {
     uint64_t view_dim_unfixable = 0;       // view dimension mismatches the texture cannot satisfy (cube entry over < 6 layers)
     uint64_t storage_alias_copies = 0;     // read-only buffer bindings overlapping a writable one, bound through a copy
     uint64_t storage_alias_dispatch_restarts = 0;  // compute passes split to take those copies
-    uint64_t storage_alias_unfixable = 0;  // overlapping pairs of two writable bindings (no read-only side to copy)
+    uint64_t storage_alias_unfixable = 0;  // overlaps no copy could separate (zero-size / out-of-range / depth, MS, BC textures, two texture writers)
+    uint64_t storage_alias_twin_writers = 0;  // later writable buffer bindings run on a scratch copy whose changed words are merged back
+    uint64_t storage_alias_copy_dispatches = 0;  // copies / merges done by a compute kernel inside the pass (no split)
+    uint64_t storage_tex_alias_copies = 0;  // texture bindings overlapping a storage-texture write, bound through a twin texture
+    uint64_t storage_tex_alias_restarts = 0;  // compute passes split to take texture twins
     uint64_t bind_group_depth_layout_dummies = 0;  // depth view vs float/sint/uint layout entry (or the reverse): dummy bound
     uint64_t depth_float_copies = 0;       // depth aspect re-copied into an r32float twin (float layout entry meets a depth texture)
     uint64_t depth_twins_created = 0;      // ... of which r32uint/r32sint (uint/sint entry on a depth texture): depth_int_twins_created

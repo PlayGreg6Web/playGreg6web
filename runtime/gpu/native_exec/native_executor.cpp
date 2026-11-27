@@ -316,11 +316,27 @@ struct BgBufInfo {
     int dyn_rank = -1;  // index into the dynamic offsets, -1 = static
     size_t entry = 0;   // index into BgInfo::entries
 };
+// A texture view of a bind group: the subresource range it covers, and whether it is a writable storage
+// texture (tex_flag 1) or a read-only one / a sampled view (0 / 2).
+struct TexViewMeta {
+    wgpu::TextureView view;  // keeps the handle alive: the registry is keyed by it
+    wgpu::Texture tex;
+    uint32_t base_mip = 0, mip_count = 1, base_layer = 0, layer_count = 1;
+    wgpu::TextureViewDimension dim = wgpu::TextureViewDimension::Undefined;
+    wgpu::TextureFormat fmt = wgpu::TextureFormat::Undefined;
+    wgpu::TextureAspect aspect = wgpu::TextureAspect::All;
+};
+struct BgTexInfo {
+    size_t entry = 0;  // index into BgInfo::entries
+    TexViewMeta meta;
+    bool writable = false;  // a write-only / read-write storage texture
+};
 struct BgInfo {
     wgpu::BindGroup group;  // keeps the handle alive: the registry is keyed by it
     wgpu::BindGroupLayout layout;
     std::vector<wgpu::BindGroupEntry> entries;
     std::vector<BgBufInfo> bufs;
+    std::vector<BgTexInfo> texs;
 };
 
 // A bind group's storage-capable resources (usage_scope_model.h) and what a snapshot of one needs: the
@@ -693,8 +709,11 @@ struct NativeExecutor::Impl {
     std::unordered_map<std::string, wgpu::TextureView> dummy_views;
     // Buffer aliasing (view_alias_model.h): bind group handle -> its buffer bindings; scratch copies by size class.
     std::unordered_map<const void*, std::shared_ptr<BgInfo>> bg_infos;
+    std::unordered_map<const void*, TexViewMeta> view_meta;  // every created texture view -> its subresource range
     std::unordered_map<uint64_t, std::vector<wgpu::Buffer>> alias_scratch;
     std::unordered_map<uint64_t, size_t> alias_scratch_used;  // per dispatch
+    std::unordered_map<std::string, std::vector<wgpu::Texture>> alias_tex_pool;  // twin textures by shape
+    std::unordered_map<std::string, size_t> alias_tex_used;
     std::vector<wgpu::Texture> dummy_textures;
     std::set<uint32_t> depth_twin_sources;  // texture ids that own a depth twin
     std::set<uint32_t> norm_twin_sources;   // texture ids that own a norm16 float twin
@@ -750,6 +769,7 @@ struct NativeExecutor::Impl {
     // Snapshot copies (flush_binds): scratch buffers / textures reused by every split (the queue runs the
     // copies and the passes reading them in order), indexed by their use within one split.
     std::vector<wgpu::Buffer> snap_buffers;
+    std::vector<wgpu::Buffer> snap_free;  // snapshot buffers of finished encoders, reused (queue order keeps it safe)
     std::unordered_map<std::string, std::vector<wgpu::Texture>> snap_textures;
     size_t snap_texture_count = 0;
     std::unordered_map<uint32_t, AutoLayoutMeta> compute_meta;
@@ -3345,6 +3365,7 @@ struct NativeExecutor::Impl {
             return;
         }
         e.default_view = e.texture.CreateView();
+        record_view_meta(e.default_view, e.texture, nullptr);
         e.geom.width = w;
         e.geom.height = eff_h;
         e.geom.depth_or_layers = eff_d;
@@ -3766,6 +3787,34 @@ struct NativeExecutor::Impl {
     }
 
     // TexturePackets / RenderStatePackets.getOrCreateTextureView (W347 1D promotion, 3D-BC fallback).
+    // Remembers the subresource range a view covers (storage-texture aliasing needs it at dispatch time).
+    void record_view_meta(const wgpu::TextureView& v, const wgpu::Texture& t, const wgpu::TextureViewDescriptor* vd) {
+        if (!v || !t) return;
+        if (view_meta.size() >= 8192) view_meta.clear();  // only costs a missed fix for views still live
+        TexViewMeta m;
+        m.view = v;
+        m.tex = t;
+        const uint32_t mips = t.GetMipLevelCount();
+        const bool tex3d = t.GetDimension() == wgpu::TextureDimension::e3D;
+        const uint32_t layers = tex3d ? 1 : t.GetDepthOrArrayLayers();
+        wgpu::TextureViewDimension dim = vd ? vd->dimension : wgpu::TextureViewDimension::Undefined;
+        m.dim = dim;
+        m.fmt = vd && vd->format != wgpu::TextureFormat::Undefined ? vd->format : t.GetFormat();
+        m.aspect = vd ? vd->aspect : wgpu::TextureAspect::All;
+        m.base_mip = vd ? vd->baseMipLevel : 0;
+        m.mip_count = vd && vd->mipLevelCount != WGPU_MIP_LEVEL_COUNT_UNDEFINED
+                          ? vd->mipLevelCount
+                          : (mips > m.base_mip ? mips - m.base_mip : 1);
+        m.base_layer = tex3d ? 0 : (vd ? vd->baseArrayLayer : 0);
+        if (vd && vd->arrayLayerCount != WGPU_ARRAY_LAYER_COUNT_UNDEFINED) m.layer_count = vd->arrayLayerCount;
+        else if (dim == wgpu::TextureViewDimension::Cube) m.layer_count = 6;
+        else if (dim == wgpu::TextureViewDimension::e1D || dim == wgpu::TextureViewDimension::e2D ||
+                 dim == wgpu::TextureViewDimension::e3D)
+            m.layer_count = 1;
+        else m.layer_count = layers > m.base_layer ? layers - m.base_layer : 1;
+        view_meta[v.Get()] = std::move(m);
+    }
+
     wgpu::TextureView texture_view(TextureEntry& t, const GpuTextureViewDesc* d) {
         uint8_t fmt = d ? d->format : 0, dim = d ? d->dimension : 0, aspect = d ? d->aspect : 0;
         uint32_t base_mip = d ? d->base_mip_level : 0, mip_count = d ? d->mip_level_count : 0;
@@ -3813,6 +3862,7 @@ struct NativeExecutor::Impl {
         if ((t.usage & 0x8u) && vd.format != wgpu::TextureFormat::Undefined && fmt && format_is_srgb(fmt))
             vd.usage = static_cast<wgpu::TextureUsage>(t.usage & ~0x8u) | wgpu::TextureUsage::CopySrc;
         wgpu::TextureView v = t.texture.CreateView(&vd);
+        record_view_meta(v, t.texture, &vd);
         if (t.views.size() >= 64) t.views.erase(t.views.begin());
         t.views[key2] = v;
         return v;
@@ -5119,15 +5169,27 @@ struct NativeExecutor::Impl {
 
     // Records the buffer bindings of a created group (pick(i, info) fills the writable / dynamic facts and says
     // whether entry i is a real buffer binding).
+    // tex_writable[i] != 0: entry i is a writable storage texture (empty: none known).
     template <class Pick>
     void register_bg_info(const wgpu::BindGroup& g, const wgpu::BindGroupLayout& layout,
-                          const std::vector<wgpu::BindGroupEntry>& wes, Pick pick) {
+                          const std::vector<wgpu::BindGroupEntry>& wes, Pick pick,
+                          const std::vector<uint8_t>& tex_writable = {}) {
         if (!g) return;
         auto info = std::make_shared<BgInfo>();
         info->group = g;
         info->layout = layout;
         info->entries = wes;
         for (size_t i = 0; i < wes.size(); ++i) {
+            if (wes[i].textureView) {
+                auto mit = view_meta.find(wes[i].textureView.Get());
+                if (mit != view_meta.end() && mit->second.view.Get() == wes[i].textureView.Get()) {
+                    BgTexInfo ti;
+                    ti.entry = i;
+                    ti.meta = mit->second;
+                    ti.writable = i < tex_writable.size() && tex_writable[i] != 0;
+                    info->texs.push_back(std::move(ti));
+                }
+            }
             if (!wes[i].buffer) continue;
             BgBufInfo bi;
             bi.binding = wes[i].binding;
@@ -5139,7 +5201,7 @@ struct NativeExecutor::Impl {
             if (!pick(i, bi)) continue;
             info->bufs.push_back(std::move(bi));
         }
-        if (info->bufs.empty()) return;
+        if (info->bufs.empty() && info->texs.empty()) return;
         if (bg_infos.size() >= 16384) bg_infos.clear();  // only costs a missed fix for groups still live
         bg_infos[g.Get()] = std::move(info);
     }
@@ -5158,6 +5220,7 @@ struct NativeExecutor::Impl {
             wgpu::Sampler sampler;
             wgpu::TextureView view;
             bool real_buffer = false, writable = false;  // a real (non-dummy) buffer, bound to a read-write storage entry
+            bool tex_writable = false;                   // a real texture view bound to a writable storage-texture entry
             int dyn_rank = -1;
         };
         std::vector<Pending> entries;
@@ -5441,6 +5504,7 @@ struct NativeExecutor::Impl {
                                 tex_use(t, e.view, false, UseKind::Sampled, tex_format);
                         }
                     }
+                    pe.tex_writable = !kind_mismatch && le && le->kind == 3 && le->subtype != 1;
                     if (rec_real) {
                         if (!kind_mismatch && le && le->kind == 3) rm.kind = WgslBindingKind::StorageTexture;
                         else if (!kind_mismatch && le && le->kind == 2) rm.kind = WgslBindingKind::Texture;
@@ -5510,12 +5574,14 @@ struct NativeExecutor::Impl {
         if (rec.over_limits) bind_groups[h.id] = nullptr;  // recorded (desc) for the remap only
         else {
             bind_groups[h.id] = device.CreateBindGroup(&bd);
+            std::vector<uint8_t> tex_w(entries.size(), 0);
+            for (size_t i = 0; i < entries.size(); ++i) tex_w[i] = entries[i].tex_writable ? 1 : 0;
             register_bg_info(bind_groups[h.id], rec.layout, wes, [&](size_t i, BgBufInfo& bi) {
                 if (!entries[i].real_buffer) return false;
                 bi.writable = entries[i].writable;
                 bi.dyn_rank = entries[i].dyn_rank;
                 return true;
-            });
+            }, tex_w);
         }
         bg_descs[h.id] = std::move(desc);
         if (!uses.uses.empty() && !rec.over_limits) {
@@ -5745,6 +5811,61 @@ struct NativeExecutor::Impl {
         uint8_t dirty_binds = 0;   // groups to (re)encode at the next flush
         uint8_t subst_applied = 0;  // groups whose encoded group is a snapshot substitute
         bool snap_volatile = false;  // a snapshot bound now must be retaken before the next draw / dispatch
+        // Buffer snapshots kept for reuse (this encoder only): a snapshot of a range stays valid until a draw /
+        // dispatch binds a writable range overlapping it.
+        struct WriteRange {
+            uint64_t off, end, seq;
+        };
+        struct SnapEntry {
+            const void* buf;
+            uint64_t off, size, seq;
+            wgpu::Buffer snap;
+        };
+        std::unordered_map<const void*, std::vector<WriteRange>> buf_writes;
+        uint64_t write_seq = 0;
+        std::vector<SnapEntry> snap_cache;
+        uint64_t snap_cache_bytes = 0;
+        Encoder(Impl& impl, FrameTarget& t, wgpu::CommandEncoder ce) : s(impl), target(t), enc(std::move(ce)) {}
+        Encoder(const Encoder&) = delete;
+        Encoder& operator=(const Encoder&) = delete;
+        ~Encoder() { release_snaps(); }
+        void release_snaps() {
+            for (SnapEntry& se : snap_cache) s.snap_free.push_back(std::move(se.snap));
+            snap_cache.clear();
+            snap_cache_bytes = 0;
+        }
+        // The cached snapshot of [off, off + size) of buf, when nothing wrote it since.
+        wgpu::Buffer snap_lookup(const void* buf, uint64_t off, uint64_t size) const {
+            for (const SnapEntry& se : snap_cache) {
+                if (se.buf != buf || se.off != off || se.size != size) continue;
+                auto it = buf_writes.find(buf);
+                if (it != buf_writes.end())
+                    for (const WriteRange& w : it->second)
+                        if (w.seq > se.seq && w.off < off + size && off < w.end) return nullptr;
+                return se.snap;
+            }
+            return nullptr;
+        }
+        void note_write(const void* buf, uint64_t off, uint64_t size) {
+            std::vector<WriteRange>& v = buf_writes[buf];
+            const uint64_t end = size ? off + size : UINT64_MAX;
+            ++write_seq;
+            for (WriteRange& w : v)  // the same range again: refresh it
+                if (w.off == off && w.end == end) {
+                    w.seq = write_seq;
+                    return;
+                }
+            if (v.size() >= 32) {  // collapse: one range covering all, newest seq
+                uint64_t lo = off, hi = end;
+                for (const WriteRange& w : v) {
+                    lo = std::min(lo, w.off);
+                    hi = std::max(hi, w.end);
+                }
+                v.assign(1, WriteRange{lo, hi, write_seq});
+                return;
+            }
+            v.push_back(WriteRange{off, end, write_seq});
+        }
         UsageScope scope;            // render: the uses encoded in the current pass segment
         // What a continuation of a split pass replays: the attachments with load ops, and the pass state.
         std::array<wgpu::RenderPassColorAttachment, kGpuMaxColorAttachments> cont_colors{};
@@ -6243,6 +6364,7 @@ struct NativeExecutor::Impl {
                 resolve_buffer_aliases(e);
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
+                alias_post_dispatch(e);
             } else if (draw_allowed(e)) {
                 flush_binds(e);
                 if (in->kind == 1) e.rpass.DrawIndexedIndirect(it->second.buffer, in->offset);
@@ -6312,6 +6434,7 @@ struct NativeExecutor::Impl {
             resolve_buffer_aliases(e);
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
+            alias_post_dispatch(e);
         } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {
             if (!e.rpass) return;
             const auto ts = e.target_size();
@@ -6533,10 +6656,12 @@ struct NativeExecutor::Impl {
             bd.entries = wes.data();
             group = device.CreateBindGroup(&bd);
             ++stats.remapped_bind_groups;
+            std::vector<uint8_t> tex_w(wes.size(), 0);
+            for (size_t i = 0; i < wes.size(); ++i) tex_w[i] = meta.bindings[i].kind == WgslBindingKind::StorageTexture ? 1 : 0;
             register_bg_info(group, auto_bgl, wes, [&](size_t i, BgBufInfo& bi) {
                 bi.writable = meta.bindings[i].kind == WgslBindingKind::Storage;
                 return true;
-            });
+            }, tex_w);
         }
         if (live) {
             if (remap_cache.size() >= 8192) remap_cache.clear();
@@ -6600,11 +6725,201 @@ struct NativeExecutor::Impl {
         return pool[used++];
     }
 
+    static bool alias_fmt_depth(wgpu::TextureFormat f) {
+        return f == wgpu::TextureFormat::Stencil8 || f == wgpu::TextureFormat::Depth16Unorm ||
+               f == wgpu::TextureFormat::Depth24Plus || f == wgpu::TextureFormat::Depth24PlusStencil8 ||
+               f == wgpu::TextureFormat::Depth32Float || f == wgpu::TextureFormat::Depth32FloatStencil8;
+    }
+    static bool alias_fmt_compressed(wgpu::TextureFormat f) {
+        return f >= wgpu::TextureFormat::BC1RGBAUnorm && f <= wgpu::TextureFormat::BC7RGBAUnormSrgb;
+    }
+
+    // A twin texture to copy a binding's subresource range into (pooled by shape, reused every dispatch).
+    wgpu::Texture alias_texture_twin(const wgpu::Texture& src) {
+        std::string key;
+        const uint32_t k[7] = {static_cast<uint32_t>(src.GetFormat()), static_cast<uint32_t>(src.GetDimension()),
+                               src.GetWidth(), src.GetHeight(), src.GetDepthOrArrayLayers(), src.GetMipLevelCount(),
+                               static_cast<uint32_t>(src.GetUsage() & wgpu::TextureUsage::StorageBinding)};
+        key.assign(reinterpret_cast<const char*>(k), sizeof k);
+        auto& pool = alias_tex_pool[key];
+        size_t& used = alias_tex_used[key];
+        if (used < pool.size()) return pool[used++];
+        wgpu::TextureDescriptor td{};
+        td.dimension = src.GetDimension();
+        td.size = {src.GetWidth(), src.GetHeight(), src.GetDepthOrArrayLayers()};
+        td.format = src.GetFormat();
+        td.mipLevelCount = src.GetMipLevelCount();
+        td.sampleCount = 1;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst |
+                   (src.GetUsage() & wgpu::TextureUsage::StorageBinding);
+        pool.push_back(device.CreateTexture(&td));
+        return pool[used++];
+    }
+
+    // The compute kernels that copy / merge buffer ranges inside the pass (no pass split).
+    struct AliasKernels {
+        wgpu::ComputePipeline copy1, copy2, merge;
+        bool ready = false;
+    } ak;
+    std::unordered_map<std::string, wgpu::BindGroup> alias_kernel_groups;
+
+    void ensure_alias_kernels() {
+        if (ak.ready) return;
+        auto build = [&](const std::string& body) {
+            wgpu::ComputePipelineDescriptor cd{};
+            cd.compute.module = make_module(body);
+            cd.compute.entryPoint = {"main", WGPU_STRLEN};
+            return device.CreateComputePipeline(&cd);
+        };
+        const std::string head =
+            "fn gi(w: vec3<u32>, n: vec3<u32>, l: u32) -> u32 { return (w.y * n.x + w.x) * 64u + l; }\n";
+        const std::string sig =
+            "@compute @workgroup_size(64) fn main(@builtin(workgroup_id) w: vec3<u32>, "
+            "@builtin(num_workgroups) n: vec3<u32>, @builtin(local_invocation_index) l: u32) {\n"
+            "  let i = gi(w, n, l);\n";
+        ak.copy1 = build(head +
+                         "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+                         "@group(0) @binding(1) var<storage, read_write> d0: array<u32>;\n" +
+                         sig + "  if (i < arrayLength(&src) && i < arrayLength(&d0)) { d0[i] = src[i]; }\n}\n");
+        ak.copy2 = build(head +
+                         "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+                         "@group(0) @binding(1) var<storage, read_write> d0: array<u32>;\n"
+                         "@group(0) @binding(2) var<storage, read_write> d1: array<u32>;\n" +
+                         sig +
+                         "  if (i < arrayLength(&src) && i < arrayLength(&d0) && i < arrayLength(&d1)) {\n"
+                         "    let v = src[i]; d0[i] = v; d1[i] = v; }\n}\n");
+        // dst takes every word the writer changed (scratch != the copy the dispatch started from)
+        ak.merge = build(head +
+                         "@group(0) @binding(0) var<storage, read_write> dst: array<u32>;\n"
+                         "@group(0) @binding(1) var<storage, read> cur: array<u32>;\n"
+                         "@group(0) @binding(2) var<storage, read> base: array<u32>;\n" +
+                         sig +
+                         "  if (i < arrayLength(&dst) && i < arrayLength(&cur) && i < arrayLength(&base)) {\n"
+                         "    let c = cur[i]; if (c != base[i]) { dst[i] = c; } }\n}\n");
+        ak.ready = true;
+    }
+
+    struct KBuf {
+        wgpu::Buffer buf;
+        uint64_t offset, size;
+    };
+    // Runs a kernel on `words` words with the given buffers (binding i = bufs[i]) as bindings 0..n-1.
+    void alias_run_kernel(Encoder& e, const wgpu::ComputePipeline& pl, const std::vector<KBuf>& bufs, uint64_t words) {
+        std::string key(1, static_cast<char>(bufs.size()));
+        const void* plp = pl.Get();
+        key.append(reinterpret_cast<const char*>(&plp), sizeof plp);
+        for (const KBuf& b : bufs) {
+            const void* p = b.buf.Get();
+            key.append(reinterpret_cast<const char*>(&p), sizeof p);
+            key.append(reinterpret_cast<const char*>(&b.offset), sizeof b.offset);
+            key.append(reinterpret_cast<const char*>(&b.size), sizeof b.size);
+        }
+        auto it = alias_kernel_groups.find(key);
+        if (it == alias_kernel_groups.end()) {
+            if (alias_kernel_groups.size() >= 512) alias_kernel_groups.clear();
+            std::vector<wgpu::BindGroupEntry> es(bufs.size());
+            for (size_t i = 0; i < bufs.size(); ++i) {
+                es[i].binding = static_cast<uint32_t>(i);
+                es[i].buffer = bufs[i].buf;
+                es[i].offset = bufs[i].offset;
+                es[i].size = bufs[i].size;
+            }
+            wgpu::BindGroupDescriptor bd{};
+            bd.layout = pl.GetBindGroupLayout(0);
+            bd.entryCount = es.size();
+            bd.entries = es.data();
+            it = alias_kernel_groups.emplace(std::move(key), device.CreateBindGroup(&bd)).first;
+        }
+        e.cpass.SetPipeline(pl);
+        e.cpass.SetBindGroup(0, it->second, 0, nullptr);
+        const uint64_t groups = (words + 63) / 64;
+        const uint32_t gx = static_cast<uint32_t>(std::min<uint64_t>(groups, max_workgroups_per_dim));
+        const uint32_t gy = static_cast<uint32_t>((groups + gx - 1) / gx);
+        e.cpass.DispatchWorkgroups(gx, std::max<uint32_t>(gy, 1), 1);
+        ++stats.storage_alias_copy_dispatches;
+    }
+
+    struct AliasSwap {
+        uint32_t group = 0;
+        size_t entry = 0;
+        wgpu::Buffer scratch;  // buffer swap (size bytes), or
+        uint64_t size = 0;
+        wgpu::TextureView view;  // texture swap
+    };
+    struct AliasMerge {
+        wgpu::Buffer dst;
+        uint64_t offset, size;
+        wgpu::Buffer cur, base;
+    };
+    std::vector<AliasMerge> alias_merges;  // after the dispatch: fold the changed words of each twin writer back
+
+    // The pipeline and groups of a compute pass as the stream set them (swaps applied to the groups they name).
+    void alias_restore_state(Encoder& e, const std::vector<AliasSwap>& swaps) {
+        if (e.active_compute && e.compute_valid) {
+            auto pit = compute_pipelines.find(*e.active_compute);
+            if (pit != compute_pipelines.end())
+                if (const wgpu::ComputePipeline* cp = resolve_budgeted(pit->second)) e.cpass.SetPipeline(*cp);
+        }
+        for (uint32_t g = 0; g < e.cbound.size(); ++g) {
+            const auto& sg = e.cbound[g];
+            if (!sg.group) continue;
+            wgpu::BindGroup use = sg.group;
+            std::vector<uint32_t> offs = sg.offsets;
+            auto it = bg_infos.find(sg.group.Get());
+            const BgInfo* info =
+                it != bg_infos.end() && it->second->group.Get() == sg.group.Get() ? it->second.get() : nullptr;
+            if (info && !swaps.empty()) {
+                std::vector<wgpu::BindGroupEntry> wes = info->entries;
+                bool changed = false;
+                for (const AliasSwap& sw : swaps) {
+                    if (sw.group != g) continue;
+                    wgpu::BindGroupEntry& w = wes[sw.entry];
+                    if (sw.view) {
+                        w.textureView = sw.view;
+                    } else {
+                        w.buffer = sw.scratch;
+                        w.offset = 0;
+                        w.size = sw.size;
+                        for (const BgBufInfo& b : info->bufs)
+                            if (b.entry == sw.entry && b.dyn_rank >= 0 && static_cast<size_t>(b.dyn_rank) < offs.size())
+                                offs[static_cast<size_t>(b.dyn_rank)] = 0;  // the copy already starts at the dynamic offset
+                    }
+                    changed = true;
+                }
+                if (changed) {
+                    wgpu::BindGroupDescriptor bd{};
+                    bd.layout = info->layout;
+                    bd.entryCount = wes.size();
+                    bd.entries = wes.data();
+                    use = device.CreateBindGroup(&bd);
+                    e.alias_replaced |= static_cast<uint8_t>(1u << g);
+                }
+            }
+            e.cpass.SetBindGroup(g, use, offs.size(), offs.data());
+        }
+    }
+
+    // After a dispatch that ran on twin scratch buffers: fold the words the shader changed back into the buffer.
+    void alias_post_dispatch(Encoder& e) {
+        if (alias_merges.empty()) return;
+        if (!e.cpass) {
+            alias_merges.clear();
+            return;
+        }
+        for (const AliasMerge& m : alias_merges)
+            alias_run_kernel(e, ak.merge, {{m.dst, m.offset, m.size}, {m.cur, 0, m.size}, {m.base, 0, m.size}}, m.size / 4);
+        alias_merges.clear();
+        e.alias_replaced = 0;
+        alias_restore_state(e, {});
+    }
+
     // Dawn rejects a dispatch whose writable storage buffer binding overlaps another binding of the same buffer
-    // (inside one bind group or across groups). The read-only side is bound through a copy of its range (taken
-    // at this point of the pass, so it holds what earlier dispatches wrote); two writable bindings cannot be
-    // helped and are counted. The pass is split around the copy and its state re-established.
+    // (inside one bind group or across groups), and one that uses a storage-write texture subresource as anything
+    // else. Read-only buffer sides are bound through a copy of their range (a kernel inside the pass: no split);
+    // a later writable buffer overlapping an earlier one runs on a scratch copy whose changed words are merged back
+    // after the dispatch; a texture read side is bound through a twin texture (that needs the pass split).
     void resolve_buffer_aliases(Encoder& e) {
+        alias_merges.clear();
         if (!e.cpass) return;
         struct Ref {
             uint32_t group;
@@ -6613,7 +6928,9 @@ struct NativeExecutor::Impl {
         };
         std::vector<AliasBinding> bs;
         std::vector<Ref> refs;
-        bool any_writable = false;
+        std::vector<AliasTexBinding> ts;
+        std::vector<std::pair<const BgInfo*, size_t>> trefs;
+        bool any_writable = false, any_tex_writable = false;
         for (uint32_t g = 0; g < e.cbound.size(); ++g) {
             const auto& sg = e.cbound[g];
             if (!sg.group) continue;
@@ -6635,13 +6952,32 @@ struct NativeExecutor::Impl {
                 bs.push_back(ab);
                 refs.push_back({g, i, &info});
             }
+            for (size_t i = 0; i < info.texs.size(); ++i) {
+                const BgTexInfo& t = info.texs[i];
+                AliasTexBinding tb;
+                tb.texture = reinterpret_cast<uint64_t>(t.meta.tex.Get());
+                tb.group = g;
+                tb.binding = info.entries[t.entry].binding;
+                tb.base_mip = t.meta.base_mip;
+                tb.mip_count = t.meta.mip_count;
+                tb.base_layer = t.meta.base_layer;
+                tb.layer_count = t.meta.layer_count;
+                tb.writable = t.writable;
+                any_tex_writable = any_tex_writable || t.writable;
+                ts.push_back(tb);
+                trefs.push_back({&info, i});
+            }
         }
         AliasPlan plan;
         if (any_writable) plan = plan_alias_copies(bs);
-        stats.storage_alias_unfixable += plan.unfixable;
+        TexAliasPlan tplan;
+        if (any_tex_writable) tplan = plan_texture_alias(ts);
+        stats.storage_alias_unfixable += tplan.unfixable;
         // Groups the pass still has rebuilt from an earlier dispatch but that no longer need it: back to the stream's.
         uint8_t need = 0;
         for (size_t c : plan.copy) need |= static_cast<uint8_t>(1u << bs[c].group);
+        for (size_t c : plan.twin) need |= static_cast<uint8_t>(1u << bs[c].group);
+        for (size_t c : tplan.copy) need |= static_cast<uint8_t>(1u << ts[c].group);
         for (uint32_t g = 0; g < e.cbound.size(); ++g) {
             const uint8_t bit = static_cast<uint8_t>(1u << g);
             if ((e.alias_replaced & bit) && !(need & bit)) {
@@ -6649,84 +6985,131 @@ struct NativeExecutor::Impl {
                 e.alias_replaced &= static_cast<uint8_t>(~bit);
             }
         }
-        if (plan.copy.empty()) return;
+        if (plan.copy.empty() && plan.twin.empty() && tplan.copy.empty()) return;
 
-        // The copies need the pass closed.
-        const uint8_t saved_subst = e.subst_applied;
         for (auto& kv : alias_scratch_used) kv.second = 0;
-        struct Swap {
-            uint32_t group;
-            size_t entry;
-            wgpu::Buffer scratch;
-            uint64_t size;
-        };
-        std::vector<Swap> swaps;
-        bool ended = false;
-        for (size_t c : plan.copy) {
-            const AliasBinding& ab = bs[c];
-            const BgBufInfo& b = refs[c].info->bufs[refs[c].buf];
-            const uint64_t copy_size = (ab.size + 3) / 4 * 4;
-            const uint64_t buf_total = b.buffer.GetSize();
-            if (ab.size == 0 || ab.offset + copy_size > buf_total || !(b.buffer.GetUsage() & wgpu::BufferUsage::CopySrc)) {
+        for (auto& kv : alias_tex_used) kv.second = 0;
+        std::vector<AliasSwap> swaps;
+
+        // Texture twins: CopyTextureToTexture needs the pass closed, then the pass is re-opened.
+        std::vector<std::pair<size_t, wgpu::Texture>> tcopies;
+        for (size_t c : tplan.copy) {
+            const TexViewMeta& m = trefs[c].first->texs[trefs[c].second].meta;
+            const wgpu::Texture& src = m.tex;
+            if (src.GetSampleCount() > 1 || alias_fmt_depth(src.GetFormat()) || alias_fmt_compressed(src.GetFormat()) ||
+                m.fmt != src.GetFormat() ||
+                (m.aspect != wgpu::TextureAspect::All && m.aspect != wgpu::TextureAspect::Undefined) ||
+                !(src.GetUsage() & wgpu::TextureUsage::CopySrc)) {
                 ++stats.storage_alias_unfixable;
                 continue;
             }
-            if (!ended) {
-                e.end_segment();
-                ended = true;
+            tcopies.push_back({c, alias_texture_twin(src)});
+        }
+        if (!tcopies.empty()) {
+            const uint8_t saved_subst = e.subst_applied;
+            e.end_segment();
+            for (auto& tc : tcopies) {
+                const BgTexInfo& ti = trefs[tc.first].first->texs[trefs[tc.first].second];
+                const TexViewMeta& m = ti.meta;
+                const wgpu::Texture& src = m.tex;
+                const bool tex3d = src.GetDimension() == wgpu::TextureDimension::e3D;
+                for (uint32_t mip = m.base_mip; mip < m.base_mip + m.mip_count && mip < src.GetMipLevelCount(); ++mip) {
+                    wgpu::TexelCopyTextureInfo s{}, d{};
+                    s.texture = src;
+                    s.mipLevel = mip;
+                    s.origin = {0, 0, tex3d ? 0 : m.base_layer};
+                    d.texture = tc.second;
+                    d.mipLevel = mip;
+                    d.origin = s.origin;
+                    const wgpu::Extent3D ext{std::max<uint32_t>(1, src.GetWidth() >> mip),
+                                             std::max<uint32_t>(1, src.GetHeight() >> mip),
+                                             tex3d ? std::max<uint32_t>(1, src.GetDepthOrArrayLayers() >> mip)
+                                                   : m.layer_count};
+                    e.enc.CopyTextureToTexture(&s, &d, &ext);
+                }
+                wgpu::TextureViewDescriptor vd{};
+                vd.format = m.fmt;
+                vd.dimension = m.dim;
+                vd.baseMipLevel = m.base_mip;
+                vd.mipLevelCount = m.mip_count;
+                vd.baseArrayLayer = m.base_layer;
+                vd.arrayLayerCount = m.layer_count;
+                AliasSwap sw{};
+                sw.group = ts[tc.first].group;
+                sw.entry = ti.entry;
+                sw.view = tc.second.CreateView(&vd);
+                swaps.push_back(std::move(sw));
+                ++stats.storage_tex_alias_copies;
             }
-            wgpu::Buffer scratch = alias_scratch_buffer(copy_size);
-            e.enc.CopyBufferToBuffer(b.buffer, ab.offset, scratch, 0, copy_size);
-            swaps.push_back({ab.group, b.entry, scratch, ab.size});
+            ++stats.storage_tex_alias_restarts;
+            // The pass state survives the split (Encoder::end_segment / resume_compute); the groups are set below.
+            e.resume_compute();
+            e.dirty_binds = 0;
+            e.subst_applied = saved_subst;
+        }
+
+        // Buffer copies and twin writers: kernels inside the pass.
+        auto fit_words = [&](size_t c, uint64_t* words) {
+            const AliasBinding& ab = bs[c];
+            const BgBufInfo& b = refs[c].info->bufs[refs[c].buf];
+            const uint64_t total = b.buffer.GetSize();
+            *words = ab.size / 4;
+            if (*words == 0 || ab.offset + *words * 4 > total) {
+                ++stats.storage_alias_unfixable;
+                return false;
+            }
+            return true;
+        };
+        bool kernels = false;
+        for (size_t c : plan.copy) {
+            uint64_t words;
+            if (!fit_words(c, &words)) continue;
+            if (!kernels) ensure_alias_kernels();
+            kernels = true;
+            const AliasBinding& ab = bs[c];
+            const BgBufInfo& b = refs[c].info->bufs[refs[c].buf];
+            wgpu::Buffer scratch = alias_scratch_buffer((ab.size + 3) / 4 * 4);
+            alias_run_kernel(e, ak.copy1, {{b.buffer, ab.offset, words * 4}, {scratch, 0, words * 4}}, words);
+            AliasSwap sw{};
+            sw.group = ab.group;
+            sw.entry = b.entry;
+            sw.scratch = scratch;
+            sw.size = ab.size;
+            swaps.push_back(std::move(sw));
             ++stats.storage_alias_copies;
         }
-        if (!ended) return;
-        ++stats.storage_alias_dispatch_restarts;
-        // The pass state survives the split (Encoder::end_segment / resume_compute); the groups are set below.
-        e.resume_compute();
-        e.dirty_binds = 0;
-        e.subst_applied = saved_subst;
-        for (uint32_t g = 0; g < e.cbound.size(); ++g) {
-            const auto& sg = e.cbound[g];
-            if (!sg.group) continue;
-            wgpu::BindGroup use = sg.group;
-            std::vector<uint32_t> offs = sg.offsets;
-            auto it = bg_infos.find(sg.group.Get());
-            const BgInfo* info =
-                it != bg_infos.end() && it->second->group.Get() == sg.group.Get() ? it->second.get() : nullptr;
-            if (info) {
-                std::vector<wgpu::BindGroupEntry> wes = info->entries;
-                bool changed = false;
-                for (const Swap& sw : swaps) {
-                    if (sw.group != g) continue;
-                    wgpu::BindGroupEntry& w = wes[sw.entry];
-                    w.buffer = sw.scratch;
-                    w.offset = 0;
-                    w.size = sw.size;
-                    for (const BgBufInfo& b : info->bufs)
-                        if (b.entry == sw.entry && b.dyn_rank >= 0 && static_cast<size_t>(b.dyn_rank) < offs.size())
-                            offs[static_cast<size_t>(b.dyn_rank)] = 0;  // the copy already starts at the dynamic offset
-                    changed = true;
-                }
-                if (changed) {
-                    wgpu::BindGroupDescriptor bd{};
-                    bd.layout = info->layout;
-                    bd.entryCount = wes.size();
-                    bd.entries = wes.data();
-                    use = device.CreateBindGroup(&bd);
-                    e.alias_replaced |= static_cast<uint8_t>(1u << g);
-                }
-            }
-            e.cpass.SetBindGroup(g, use, offs.size(), offs.data());
+        for (size_t c : plan.twin) {
+            uint64_t words;
+            if (!fit_words(c, &words)) continue;
+            if (!kernels) ensure_alias_kernels();
+            kernels = true;
+            const AliasBinding& ab = bs[c];
+            const BgBufInfo& b = refs[c].info->bufs[refs[c].buf];
+            wgpu::Buffer cur = alias_scratch_buffer((ab.size + 3) / 4 * 4);
+            wgpu::Buffer base = alias_scratch_buffer((ab.size + 3) / 4 * 4);
+            alias_run_kernel(e, ak.copy2, {{b.buffer, ab.offset, words * 4}, {cur, 0, words * 4}, {base, 0, words * 4}},
+                             words);
+            AliasSwap sw{};
+            sw.group = ab.group;
+            sw.entry = b.entry;
+            sw.scratch = cur;
+            sw.size = ab.size;
+            swaps.push_back(std::move(sw));
+            alias_merges.push_back({b.buffer, ab.offset, words * 4, cur, base});
+            ++stats.storage_alias_twin_writers;
         }
+        if (swaps.empty() && !kernels) return;
+        alias_restore_state(e, swaps);
     }
 
     // ---- usage scopes (usage_scope_model.h) ----
 
     // Copies the read range of use `ui` of `u` into a scratch resource (slot `slot` of this split) and points
     // `entry` at it; a dynamic offset of the entry becomes 0 in `dyn`. False: no snapshot could be made.
-    bool snapshot_use(wgpu::CommandEncoder& enc, const BgUsage& u, uint32_t ui, std::vector<uint32_t>& dyn,
-                      wgpu::BindGroupEntry& entry, std::unordered_map<std::string, uint32_t>& tex_slots, uint32_t& buf_slot) {
+    bool snapshot_use(Encoder& e, const BgUsage& u, uint32_t ui, std::vector<uint32_t>& dyn,
+                      wgpu::BindGroupEntry& entry, std::unordered_map<std::string, uint32_t>& tex_slots, uint32_t& buf_slot,
+                      bool vol) {
+        wgpu::CommandEncoder& enc = e.enc;
         const ResUse& r = u.m.uses[ui];
         const BgSnapSrc& s = u.src[ui];
         if (!r.texture) {
@@ -6735,6 +7118,46 @@ struct NativeExecutor::Impl {
             const uint64_t size = r.size;
             const uint64_t copy = (size + 3) & ~uint64_t{3};
             if (!s.buffer || size == 0 || off % 4 || off + copy > total) return false;
+            if (!vol) {  // a range nothing wrote since its snapshot: reuse it (no copy)
+                if (wgpu::Buffer hit = e.snap_lookup(s.buffer.Get(), off, size)) {
+                    entry.buffer = hit;
+                    entry.offset = 0;
+                    entry.size = size;
+                    if (r.dyn_index >= 0 && static_cast<size_t>(r.dyn_index) < dyn.size()) dyn[static_cast<size_t>(r.dyn_index)] = 0;
+                    ++stats.usage_snapshot_reused;
+                    stats.usage_snapshot_bytes_saved += copy;
+                    return true;
+                }
+                if (e.snap_cache.size() >= 256 || e.snap_cache_bytes + copy > (uint64_t{512} << 20)) {
+                    e.release_snaps();
+                    // the released buffers may still be bound by recorded commands; queue order keeps reuse safe
+                }
+                uint64_t cls = 256;
+                while (cls < copy) cls <<= 1;
+                wgpu::Buffer nb;
+                for (size_t i = 0; i < snap_free.size(); ++i)
+                    if (snap_free[i].GetSize() == cls) {
+                        nb = std::move(snap_free[i]);
+                        snap_free.erase(snap_free.begin() + static_cast<std::ptrdiff_t>(i));
+                        break;
+                    }
+                if (!nb) {
+                    wgpu::BufferDescriptor bd{};
+                    bd.size = cls;
+                    bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+                    nb = device.CreateBuffer(&bd);
+                }
+                enc.CopyBufferToBuffer(s.buffer, off, nb, 0, copy);
+                e.snap_cache.push_back({s.buffer.Get(), off, size, e.write_seq, nb});
+                e.snap_cache_bytes += cls;
+                entry.buffer = nb;
+                entry.offset = 0;
+                entry.size = size;
+                if (r.dyn_index >= 0 && static_cast<size_t>(r.dyn_index) < dyn.size()) dyn[static_cast<size_t>(r.dyn_index)] = 0;
+                ++stats.usage_buffer_snapshots;
+                stats.usage_snapshot_bytes += copy;
+                return true;
+            }
             if (buf_slot >= snap_buffers.size()) snap_buffers.resize(buf_slot + 1);
             wgpu::Buffer& sb = snap_buffers[buf_slot++];
             if (!sb || sb.GetSize() < copy) {
@@ -6766,7 +7189,7 @@ struct NativeExecutor::Impl {
                 snap_textures.clear();
                 snap_texture_count = 0;
                 tex_slots.clear();
-                return snapshot_use(enc, u, ui, dyn, entry, tex_slots, buf_slot);
+                return snapshot_use(e, u, ui, dyn, entry, tex_slots, buf_slot, vol);
             }
             wgpu::TextureDescriptor td{};
             td.dimension = s.tex_3d ? wgpu::TextureDimension::e3D : wgpu::TextureDimension::e2D;
@@ -6809,7 +7232,21 @@ struct NativeExecutor::Impl {
     // Before a draw / dispatch: encodes the bind groups recorded since the last one (Encoder::bind), after the
     // usage-scope check. A conflict inside the draw / dispatch binds snapshots of the read-only uses; a render
     // draw conflicting with an earlier draw of the pass continues in a new pass segment (load ops).
+    // The writable buffer ranges the draw / dispatch about to be encoded binds (they invalidate cached snapshots).
+    void note_bound_writes(Encoder& e) {
+        for (uint32_t g = 0; g < Encoder::kBindSlots; ++g) {
+            if (!(e.want_mask >> g & 1u) || !e.want[g].usage || !e.want[g].usage->m.any_writable) continue;
+            for (const ResUse& r : e.want[g].usage->m.uses)
+                if (!r.texture && use_writable(r.kind)) e.note_write(r.res, use_offset(r, &e.want[g].offsets), r.size);
+        }
+    }
+
     void flush_binds(Encoder& e) {
+        flush_binds_impl(e);
+        note_bound_writes(e);
+    }
+
+    void flush_binds_impl(Encoder& e) {
         const bool render = static_cast<bool>(e.rpass);
         if (!render && !e.cpass) return;
         if (!e.dirty_binds && !e.snap_volatile) return;
@@ -6825,11 +7262,21 @@ struct NativeExecutor::Impl {
         std::array<wgpu::BindGroup, Encoder::kBindSlots> subst{};
         std::array<std::vector<uint32_t>, Encoder::kBindSlots> subst_dyn{};
         bool volatile_now = false;
+        // Every snapshot a reusable, still valid buffer snapshot (and no render scope conflict): no copy, no split.
+        bool all_hit = plan.split && !plan.scope_conflict && !plan.snapshots.empty();
+        for (const SnapshotUse& sn : plan.snapshots) {
+            if (!all_hit) break;
+            const BgUsage& u = *e.want[bound[sn.group].group].usage;
+            const ResUse& r = u.m.uses[sn.use];
+            const uint64_t off = use_offset(r, &e.want[bound[sn.group].group].offsets);
+            all_hit = !sn.volatile_ && !r.texture && u.src[sn.use].buffer && r.size &&
+                      e.snap_lookup(u.src[sn.use].buffer.Get(), off, r.size);
+        }
         if (plan.split) {
             if (plan.scope_conflict) ++stats.usage_scope_splits;
-            if (!plan.snapshots.empty()) ++stats.usage_snapshot_splits;
+            if (!plan.snapshots.empty() && !all_hit) ++stats.usage_snapshot_splits;
             if (render && e.cont_discards) ++stats.usage_split_discards;
-            e.end_segment();
+            if (!all_hit) e.end_segment();
             // The snapshots, between the two halves: per group, its entries with the snapshot ones replaced.
             std::unordered_map<std::string, uint32_t> tex_slots;
             uint32_t buf_slot = 0;
@@ -6843,7 +7290,7 @@ struct NativeExecutor::Impl {
                     if (sn.group != gi) continue;
                     if (entries.empty()) entries = u.entries;
                     const uint32_t ei = u.m.uses[sn.use].entry;
-                    if (ei >= entries.size() || !snapshot_use(e.enc, u, sn.use, dyn, entries[ei], tex_slots, buf_slot)) {
+                    if (ei >= entries.size() || !snapshot_use(e, u, sn.use, dyn, entries[ei], tex_slots, buf_slot, sn.volatile_)) {
                         ++stats.usage_snapshot_skipped;
                         continue;
                     }
@@ -6858,8 +7305,10 @@ struct NativeExecutor::Impl {
                 subst[g] = device.CreateBindGroup(&bd);
                 subst_dyn[g] = std::move(dyn);
             }
-            if (render) e.resume_render();
-            else e.resume_compute();
+            if (!all_hit) {
+                if (render) e.resume_render();
+                else e.resume_compute();
+            }
         }
         for (uint32_t g = 0; g < Encoder::kBindSlots; ++g) {
             const uint8_t bit = static_cast<uint8_t>(1u << g);
@@ -8070,6 +8519,8 @@ std::string NativeExecutor::stats_json() const {
     num("usage_texture_snapshots", st.usage_texture_snapshots);
     num("usage_snapshot_bytes", st.usage_snapshot_bytes);
     num("usage_snapshot_skipped", st.usage_snapshot_skipped);
+    num("usage_snapshot_reused", st.usage_snapshot_reused);
+    num("usage_snapshot_bytes_saved", st.usage_snapshot_bytes_saved);
     num("usage_split_discards", st.usage_split_discards);
     num("v1_render_pipelines", st.v1_render_pipelines);
     num("v1_compute_pipelines", st.v1_compute_pipelines);
@@ -8091,6 +8542,10 @@ std::string NativeExecutor::stats_json() const {
     num("storage_alias_copies", st.storage_alias_copies);
     num("storage_alias_dispatch_restarts", st.storage_alias_dispatch_restarts);
     num("storage_alias_unfixable", st.storage_alias_unfixable);
+    num("storage_alias_twin_writers", st.storage_alias_twin_writers);
+    num("storage_alias_copy_dispatches", st.storage_alias_copy_dispatches);
+    num("storage_tex_alias_copies", st.storage_tex_alias_copies);
+    num("storage_tex_alias_restarts", st.storage_tex_alias_restarts);
     num("bind_group_unfilterable_dummies", st.bind_group_unfilterable_dummies);
     num("bind_group_sample_type_dummies", st.bind_group_sample_type_dummies);
     num("buffer_bindings_clamped", st.buffer_bindings_clamped);
