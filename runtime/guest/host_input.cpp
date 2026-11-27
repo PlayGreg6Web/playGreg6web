@@ -145,6 +145,11 @@ void RumbleForwarder::update(const playgta6::os::RumbleTelemetry& t, int pad, bo
         return;
     }
     if (pad != pad_) {
+        if (pad_ >= 0 && running_) {
+            fn_(static_cast<uint32_t>(pad_), 0, 0);  // the pad we leave must not keep buzzing
+            ++stats_.sends;
+            ++stats_.stops;
+        }
         pad_ = pad;
         low_ = high_ = 0;
         running_ = false;
@@ -196,6 +201,59 @@ void HostInputSource::start() {
     stop_.store(false);
     thread_ = std::thread([this] { run(); });
 #endif
+}
+
+bool PadSelector::is_active(const XPadSample& p) {
+    constexpr int kLeftDead = 7849, kRightDead = 8689, kTrigDead = 30;
+    auto mag2 = [](int x, int y) { return static_cast<int64_t>(x) * x + static_cast<int64_t>(y) * y; };
+    return p.buttons != 0 || p.left_trigger > kTrigDead || p.right_trigger > kTrigDead ||
+           mag2(p.thumb_lx, p.thumb_ly) > static_cast<int64_t>(kLeftDead) * kLeftDead ||
+           mag2(p.thumb_rx, p.thumb_ry) > static_cast<int64_t>(kRightDead) * kRightDead;
+}
+
+bool PadSelector::poll(uint64_t now_ms, int* slot, XPadSample* sample) {
+    XPadSample cur[4];
+    bool any = false;
+    for (int i = 0; i < 4; ++i) {
+        const bool due = connected_[i] || !scanned_[i] || !(active_ >= 0 || any) ||
+                         (now_ms >= last_scan_ms_[i] && now_ms - last_scan_ms_[i] >= rescan_ms_);
+        if (!due) {
+            continue;
+        }
+        scanned_[i] = true;
+        last_scan_ms_[i] = now_ms;
+        cur[i] = XPadSample{};
+        connected_[i] = read_(i, &cur[i]);
+        any = any || connected_[i];
+    }
+    if (active_ >= 0 && !connected_[active_]) {
+        active_ = -1;
+    }
+    // Activity on another pad takes over; the current pad keeps the seat while it is also active.
+    if (active_ < 0 || !is_active(cur[active_])) {
+        int pick = active_;
+        for (int i = 0; i < 4; ++i) {
+            if (connected_[i] && i != active_ && is_active(cur[i])) {
+                pick = i;
+                break;
+            }
+        }
+        if (pick < 0) {
+            for (int i = 0; i < 4; ++i) {
+                if (connected_[i]) {
+                    pick = i;
+                    break;
+                }
+            }
+        }
+        active_ = pick;
+    }
+    if (active_ < 0) {
+        return false;
+    }
+    *slot = active_;
+    *sample = cur[active_];
+    return true;
 }
 
 void HostInputSource::stop() {
@@ -326,6 +384,20 @@ void HostInputSource::run() {
         g_silence_fn.store(&xinput_set_state);
     }
     int pad_index = -1;
+    PadSelector selector([&](int slot, XPadSample* out) {
+        RawState raw{};
+        if (get_state == nullptr || get_state(static_cast<DWORD>(slot), &raw) != ERROR_SUCCESS) {
+            return false;
+        }
+        out->buttons = raw.pad.buttons;
+        out->left_trigger = raw.pad.lt;
+        out->right_trigger = raw.pad.rt;
+        out->thumb_lx = raw.pad.lx;
+        out->thumb_ly = raw.pad.ly;
+        out->thumb_rx = raw.pad.rx;
+        out->thumb_ry = raw.pad.ry;
+        return true;
+    });
     POINT last_cursor{};
     bool have_cursor = false;
     bool prev_kb_enabled = keyboard_enabled_.load();
@@ -340,37 +412,9 @@ void HostInputSource::run() {
         XPadSample sample;
         bool have_pad = false;
         if (get_state != nullptr) {
-            auto try_slot = [&](int slot) -> bool {
-                RawState raw{};
-                if (get_state(static_cast<DWORD>(slot), &raw) == ERROR_SUCCESS) {
-                    pad_index = slot;
-                    have_pad = true;
-                    sample.buttons = raw.pad.buttons;
-                    sample.left_trigger = raw.pad.lt;
-                    sample.right_trigger = raw.pad.rt;
-                    sample.thumb_lx = raw.pad.lx;
-                    sample.thumb_ly = raw.pad.ly;
-                    sample.thumb_rx = raw.pad.rx;
-                    sample.thumb_ry = raw.pad.ry;
-                    return true;
-                }
-                return false;
-            };
-            // Stick to the connected pad; on disconnect, rescan all other slots (including slot 0) immediately.
-            int failed_slot = -1;
-            if (pad_index >= 0) {
-                if (!try_slot(pad_index)) {
-                    failed_slot = pad_index;
-                    pad_index = -1;
-                }
-            }
-            if (!have_pad) {
-                for (int i = 0; i < 4 && !have_pad; ++i) {
-                    if (i != failed_slot) {
-                        try_slot(i);
-                    }
-                }
-            }
+            int slot = -1;
+            have_pad = selector.poll(now_ms, &slot, &sample);
+            pad_index = have_pad ? slot : -1;
         }
         const bool kb = keyboard_enabled_.load();
         if (g_set_state.load(std::memory_order_acquire) != nullptr) {

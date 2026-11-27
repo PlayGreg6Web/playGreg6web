@@ -55,7 +55,7 @@ error, and `lift_cache.clear_program`, `clean_build_dirs` and its `remove_tree` 
 | F3 | Stats overlay on / off (fps, frame-time graph, present mode, draws, GPU ms, audio underruns, fault text); `--overlay` starts with it on |
 | Ctrl+F7 / F8 / F9 / F10 | `--show-target` only: next mip / next layer / previous target / next target |
 
-Window focus loss releases every key, button, stick and the pad too (and stops rumble), so nothing sticks; F-key hotkeys are consumed by the window and never reach the game. Real input is never mixed with `--input-script` (the script wins). The first connected XInput pad is used, and a replug re-scans all four slots.
+Window focus loss releases every key, button, stick and the pad too (and stops rumble), so nothing sticks; F-key hotkeys are consumed by the window and never reach the game. Real input is never mixed with `--input-script` (the script wins). The most recently active XInput pad (any button, trigger or stick past the deadzone) drives the single local user and switches on activity, so a second controller or a pad that reconnects in another slot just works; empty slots are re-scanned about once a second. No extra users or sign-in.
 
 These window hotkeys live in one table (`runtime/os/window_hotkeys.h`) and are rebindable in `keymap.ini` `[hotkeys]`
 (see "Rebinding keys"); `play_native.ps1 -Help` lists them. Esc stays the pad Menu button.
@@ -66,7 +66,7 @@ another file with `-Keymap <file>`.
 **Mouse look** (off by default): set `look = on` under `[mouse]` in `keymap.ini`. The window then captures the cursor
 (Raw Input, hidden and clipped) and the mouse drives the right stick. **F8** (`release_key`) releases or re-captures it
 by hand; a click in the window re-captures. Focus loss releases it automatically. Details in "Rebinding keys" below.
-A connected XInput pad also gets the game's rumble.
+The active XInput pad also gets the game's rumble.
 
 **Overlay:** F3 draws a small box top-left (fps and frame time, a graph of the last 120 frames, present mode, draws per frame, GPU ms when the adapter has timestamps, live-audio underruns). When the guest stops on a fault the box also shows the reason, so it is readable in fullscreen where the title bar is not. It is drawn after the game's frame is copied for `--live-digest` and screenshots, so those never contain it.
 

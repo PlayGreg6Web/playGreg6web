@@ -870,6 +870,12 @@ void test_rumble_forwarder() {
     g.update(t, 1, true, 0);
     CHECK(g_fake.calls.size() == 1 && g_fake.calls[0].pad == 1 && g_fake.calls[0].low == 65535 && g_fake.calls[0].high == 0);
 
+    // Switching to another pad silences the old one first, then drives the new one.
+    g_fake.calls.clear();
+    g.update(t, 2, true, 100);
+    CHECK(g_fake.calls.size() == 2 && g_fake.calls[0].pad == 1 && g_fake.calls[0].low == 0 && g_fake.calls[0].high == 0);
+    CHECK(g_fake.calls[1].pad == 2 && g_fake.calls[1].low == 65535);
+
     // Non-monotonic timestamp regression must not underflow rate limiter.
     g_fake.calls.clear();
     hi::RumbleForwarder mono(&fake_set_state, 16);
@@ -932,9 +938,46 @@ void test_host_input_hardening() {
     }
 }
 
+void test_pad_selector() {
+    using namespace playgta6::guest::host_input;
+    XPadSample pads[4];
+    bool conn[4] = {true, false, false, false};
+    PadSelector sel([&](int slot, XPadSample* out) {
+        if (!conn[slot]) return false;
+        *out = pads[slot];
+        return true;
+    }, 1000);
+    int slot = -1;
+    XPadSample s;
+    CHECK(sel.poll(0, &slot, &s) && slot == 0);
+    conn[1] = true;  // second pad appears, idle: slot 0 keeps the seat
+    CHECK(sel.poll(1000, &slot, &s) && slot == 0);
+    pads[1].buttons = kXA;  // activity on pad 1 takes over
+    CHECK(sel.poll(1008, &slot, &s) && slot == 1 && s.buttons == kXA);
+    pads[1].buttons = 0;
+    pads[1].thumb_lx = 1000;  // inside the deadzone: still pad 1, no switch
+    pads[0].thumb_lx = 1000;
+    CHECK(sel.poll(1016, &slot, &s) && slot == 1);
+    pads[0].buttons = kXB;
+    pads[1].buttons = kXA;  // both active: current stays
+    CHECK(sel.poll(1024, &slot, &s) && slot == 1);
+    pads[1].buttons = 0;
+    CHECK(sel.poll(1032, &slot, &s) && slot == 0 && s.buttons == kXB);
+    conn[0] = false;  // active pad unplugged: fall back to pad 1
+    pads[0].buttons = 0;
+    CHECK(sel.poll(1040, &slot, &s) && slot == 1);
+    conn[1] = false;
+    CHECK(!sel.poll(1048, &slot, &s));
+    conn[3] = true;  // reconnect in another slot, found immediately when none is connected
+    pads[3].thumb_ry = 30000;
+    CHECK(sel.poll(1056, &slot, &s) && slot == 3);
+    CHECK(PadSelector::is_active(s) && !PadSelector::is_active(XPadSample{}));
+}
+
 }  // namespace
 
 int main() {
+    test_pad_selector();
     test_rumble_forwarder();
     test_host_input_mapping();
     test_host_input_hardening();

@@ -10,7 +10,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <thread>
+#include <utility>
 
 #include "abi/playgta6_abi.h"
 #include "guest/keymap.h"
@@ -38,6 +40,30 @@ struct XPadSample {
 
 // Pad -> InputState fields (buttons, sticks in [-1,1] with up = +y, triggers in [0,1]). No deadzone.
 InputState convert_pad(const XPadSample& pad);
+
+// Picks which of the four XInput slots drives guest user 0: the most recently active pad (any
+// button, trigger or stick beyond the deadzone). A connected pad is polled every tick; slots that
+// are empty are rescanned every `rescan_ms` (every tick while no pad is connected at all).
+class PadSelector {
+public:
+    // Reads one slot; returns false when nothing is connected there.
+    using ReadFn = std::function<bool(int slot, XPadSample* out)>;
+    explicit PadSelector(ReadFn fn, uint64_t rescan_ms = 1000) : read_(std::move(fn)), rescan_ms_(rescan_ms) {}
+
+    static bool is_active(const XPadSample& p);
+
+    // Polls the slots; returns true with the active slot and its sample, false when no pad is connected.
+    bool poll(uint64_t now_ms, int* slot, XPadSample* sample);
+    int active_slot() const { return active_; }
+
+private:
+    ReadFn read_;
+    uint64_t rescan_ms_;
+    int active_ = -1;
+    bool connected_[4] = {};
+    uint64_t last_scan_ms_[4] = {};
+    bool scanned_[4] = {};
+};
 
 // Keyboard keys of the table, as bits of a mask.
 enum HostKey : uint32_t {
@@ -137,7 +163,7 @@ private:
 // Best-effort motors-off from any thread (fault/terminate path). No-op when nothing was driven.
 void silence_host_rumble();
 
-// Polls the host (Windows: first connected XInput pad plus GetAsyncKeyState) on its own
+// Polls the host (Windows: the most recently active XInput pad plus GetAsyncKeyState) on its own
 // thread and publishes into `state`. A no-op on other hosts.
 class HostInputSource {
 public:
