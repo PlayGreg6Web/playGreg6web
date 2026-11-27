@@ -20,6 +20,7 @@
 #include "gpu/d3d12_xs_exports.h"
 #include "guest/audio_probes.h"
 #include "guest/hash_registry_scan.h"
+#include "guest/streaming_drain_probe.h"
 #include "os/audio_stream_log.h"
 #include "guest/export_counters.h"
 #include "os/audio_file_stats.h"
@@ -2778,6 +2779,9 @@ std::string build_report() {
                 }
             }
         }
+        std::vector<uint32_t> drain_threads;  // threads inside the title's streaming-drain loop
+        const bool drain_base_ok = !b.modules.empty() && b.modules[0].loaded && b.modules[0].image.base != 0;
+        const uint64_t drain_base = drain_base_ok ? b.modules[0].image.base : 0;
         for (size_t k = 0; k < b.threads.size(); ++k) {
             const GuestThreadContext* t = b.threads[k].get();
             GuestState snapshot = t->thread.state;
@@ -2806,6 +2810,13 @@ std::string build_report() {
             }
             FaultRecord scan;
             scan_backtrace(scan, s.gpr[GuestReg::Rsp], t);
+            if (drain_base_ok) {
+                std::vector<uint64_t> fns;
+                for (const auto& f : scan.frames) fns.push_back(f.function);
+                if (thread_in_drain(s.rip, fns, drain_base + (kDrainFunctionVa - kDrainLinkBase))) {
+                    drain_threads.push_back(t->thread_id);
+                }
+            }
             o += ", \"stack_scan\": [";
             for (size_t i = 0; i < scan.frames.size() && i < 8; ++i) {
                 o += (i == 0 ? "" : ", ") + hex(scan.frames[i].return_address);
@@ -2813,6 +2824,16 @@ std::string build_report() {
             o += "]}";
         }
         o += b.threads.empty() ? "],\n" : "\n  ],\n";
+        // The title's "drain all streaming" loop: the counters it waits on and who is inside it.
+        if (drain_base_ok && b.arena != nullptr) {
+            VirtualMemoryArena* arena = b.arena;
+            const StreamingDrainState st = read_streaming_drain(
+                [arena](uint64_t va, void* dst, size_t len) { return arena->read(va, dst, len); },
+                drain_base + (kDrainSingletonVa - kDrainLinkBase));
+            o += "  \"streaming_drain\": " + streaming_drain_json(st, drain_threads) + ",\n";
+        } else {
+            o += "  \"streaming_drain\": {\"available\": false},\n";
+        }
     }
     {
         // Arena totals first: the arena observer takes arena_mutex under the arena's lock.

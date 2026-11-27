@@ -7,6 +7,7 @@
 
 #include "guest/audio_probes.h"
 #include "guest/hash_registry_scan.h"
+#include "guest/streaming_drain_probe.h"
 #include "os/audio_file_stats.h"
 #include "os/audio_stream_log.h"
 
@@ -144,7 +145,42 @@ void test_hash_registry_scan() {
     CHECK(empty.readable && empty.full_slots == 0 && !empty.present[0]);
 }
 
+// Streaming-drain probe: counters read through the owner pointer, only non-zero categories listed,
+// bad pointers and unreadable blocks report unavailable, thread detection by rip or frame function.
+void test_streaming_drain() {
+    const uint64_t singleton = 0x5000, owner = 0x20000;
+    std::vector<uint8_t> glob(8, 0), blk(kDrainBlockOffset + kDrainBlockBytes, 0);
+    auto put64 = [](uint8_t* p, uint64_t v) { for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); };
+    put64(glob.data(), owner);
+    uint8_t* block = blk.data() + kDrainBlockOffset;
+    put64(block + kDrainEntriesOffset + 3 * kDrainEntryStride + 0x18, 7);   // category 3, counter 1
+    put64(block + kDrainEntriesOffset + 48 * kDrainEntryStride + 0x60, 2);  // category 48, counter 4
+    put64(block + kDrainAllOffset + 0x30, 5);                               // aggregate counter 2
+    auto read = [&](uint64_t va, void* dst, size_t len) {
+        if (va >= singleton && va + len <= singleton + glob.size()) { std::memcpy(dst, glob.data() + (va - singleton), len); return true; }
+        if (va >= owner && va + len <= owner + blk.size()) { std::memcpy(dst, blk.data() + (va - owner), len); return true; }
+        return false;
+    };
+    const auto st = read_streaming_drain(read, singleton);
+    CHECK(st.available && st.owner == owner && st.pending.size() == 2);
+    CHECK(st.pending[0].index == 3 && st.pending[0].counters[1] == 7);
+    CHECK(st.pending[1].index == 48 && st.pending[1].counters[4] == 2);
+    CHECK(st.all[2] == 5 && st.all_sum == 5);
+    const std::string j = streaming_drain_json(st, {4, 9});
+    CHECK(j.find("\"all_sum\": 5") != std::string::npos && j.find("\"threads_in_drain\": [4, 9]") != std::string::npos);
+    put64(glob.data(), 0xdead0000);  // bad pointer: no fault, just unavailable
+    const auto bad = read_streaming_drain(read, singleton);
+    CHECK(!bad.available && bad.owner == 0xdead0000);
+    put64(glob.data(), 0);
+    CHECK(!read_streaming_drain(read, singleton).available);
+    CHECK(!read_streaming_drain(read, 0x9000).available);
+    const uint64_t fn = 0x7000;
+    CHECK(thread_in_drain(fn + 0x120, {}, fn) && thread_in_drain(1, {5, fn}, fn));
+    CHECK(!thread_in_drain(fn + kDrainFunctionBytes, {fn - 1}, fn));
+}
+
 int main() {
+    test_streaming_drain();
     test_probes();
     test_stream_log();
     test_hash_registry_scan();
