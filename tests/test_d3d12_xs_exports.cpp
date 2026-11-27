@@ -1309,6 +1309,29 @@ void test_resources() {
                                           GpuTextureDimension::Dim2D, false) != 0);
         CHECK(dev->address_texture_count() <= dg::Device::kMaxAddressTextures);
     }
+    // At the cap one miss drops a whole batch of the least recently used (one victim scan and one
+    // bind-group invalidation pass for the batch), new texture included the table holds
+    // kMaxAddressTextures - kAddressTextureEvictBatch, so the next misses evict nothing.
+    {
+        uint64_t n = 0;
+        const auto add = [&] {
+            const uint64_t va = view_memory + 0x1000000 + n++ * 0x1000;
+            return dev->ensure_address_texture(va, 77, 4, 4, 1, 1, 0x105, GpuTextureDimension::Dim2D, false);
+        };
+        while (dev->address_texture_count() < dg::Device::kMaxAddressTextures) {
+            CHECK(add() != 0);
+        }
+        const uint64_t newest_va = view_memory + 0x1000000 + (n - 1) * 0x1000;
+        const uint32_t newest =
+            dev->ensure_address_texture(newest_va, 77, 4, 4, 1, 1, 0x105, GpuTextureDimension::Dim2D, false);
+        CHECK(add() != 0);
+        const size_t after = dg::Device::kMaxAddressTextures - dg::Device::kAddressTextureEvictBatch;
+        CHECK(dev->address_texture_count() == after);
+        // The most recently used survives the batch (a hit: same id, no new entry).
+        CHECK(dev->ensure_address_texture(newest_va, 77, 4, 4, 1, 1, 0x105, GpuTextureDimension::Dim2D, false) ==
+              newest);
+        CHECK(dev->address_texture_count() == after);
+    }
     // An Xbox D16_UNORM_S8_UINT (118) depth-stencil texture at title memory is accepted.
     dg::GuestResourceDesc d16s8 = texture_desc(256, 256, 118, 0x2);
     const uint64_t ds16 = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(d16s8)), I(0), I(0)},

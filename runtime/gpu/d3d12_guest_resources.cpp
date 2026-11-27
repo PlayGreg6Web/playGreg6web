@@ -2129,58 +2129,84 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
             bridge_->destroy_or_defer_resource(victim, drop);
         }
     }
-    while (address_textures_.size() >= kMaxAddressTextures) {
-        auto oldest = address_textures_.end();
-        bool oldest_in_frame = true;
-        uint64_t oldest_use = UINT64_MAX;
+    if (address_textures_.size() >= kMaxAddressTextures) {
+        // Drop the least recently used down to kMaxAddressTextures - kAddressTextureEvictBatch in one
+        // pass, preferring textures the frame being recorded does not reference.
+        struct Candidate {
+            decltype(address_textures_)::iterator it;
+            bool in_frame;
+            uint64_t use;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(address_textures_.size());
         {
             const bridge::StateBridgeDevice::ResourceUseScan use_scan(*bridge_);
             for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
-                const bool in_frame = use_scan.in_frame(i->second.id);
-                const uint64_t use = std::max(i->second.last_use, use_scan.last_use_tick(i->second.id));
-                if (oldest == address_textures_.end() ||
-                    (oldest_in_frame && !in_frame) ||
-                    (in_frame == oldest_in_frame && use < oldest_use)) {
-                    oldest = i;
-                    oldest_in_frame = in_frame;
-                    oldest_use = use;
-                }
+                candidates.push_back(Candidate{i, use_scan.in_frame(i->second.id),
+                                               std::max(i->second.last_use, use_scan.last_use_tick(i->second.id))});
             }
         }
-        const uint32_t victim = oldest->second.id;
-        const AddressTextureEntry victim_entry = oldest->second;
-        const bool victim_in_frame = oldest_in_frame;
-        bool victim_shrunk = false;  // host texture re-created at a capped size: not the shape it is keyed by
-        {
-            std::lock_guard<std::mutex> tracked_lock(tracked_textures_mutex_);
-            const auto t = tracked_textures_.find(victim);
-            victim_shrunk = t != tracked_textures_.end() && (t->second.host_floor != 0 || t->second.host_saved_bytes != 0);
+        const size_t keep = kMaxAddressTextures - std::min(kAddressTextureEvictBatch, kMaxAddressTextures);
+        const size_t n_evict = std::min(candidates.size(), candidates.size() - std::min(candidates.size(), keep) + 1u);
+        const auto older = [](const Candidate& a, const Candidate& b) {
+            return a.in_frame != b.in_frame ? !a.in_frame : a.use < b.use;
+        };
+        std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(n_evict),
+                          candidates.end(), older);
+        struct Victim {
+            uint32_t id;
+            AddressTextureEntry entry;
+            bool in_frame;
+            bool shrunk;  // host texture re-created at a capped size: not the shape it is keyed by
+        };
+        std::vector<Victim> victims;
+        std::vector<uint32_t> victim_ids;
+        victims.reserve(n_evict);
+        victim_ids.reserve(n_evict);
+        for (size_t v = 0; v < n_evict; ++v) {
+            const auto oldest = candidates[v].it;
+            Victim victim{oldest->second.id, oldest->second, candidates[v].in_frame, false};
+            {
+                std::lock_guard<std::mutex> tracked_lock(tracked_textures_mutex_);
+                const auto t = tracked_textures_.find(victim.id);
+                victim.shrunk =
+                    t != tracked_textures_.end() && (t->second.host_floor != 0 || t->second.host_saved_bytes != 0);
+            }
+            note_address_texture_evicted(oldest->first);
+            address_textures_.erase(oldest);
+            untrack_guest_texture(victim.id);
+            victims.push_back(victim);
+            victim_ids.push_back(victim.id);
         }
-        note_address_texture_evicted(oldest->first);
-        address_textures_.erase(oldest);
-        untrack_guest_texture(victim);
-        bridge_->unregister_resource(victim);
-        // Backlog 38: a texture not referenced by the frame being recorded is parked for reuse instead
-        // of destroyed (it stays counted in the texture budget while parked). Chains over 64 KiB go to
-        // the large pool, only when the consumer zeroes reused textures on the GPU.
+        bridge_->unregister_resources(victim_ids);
         std::vector<uint32_t> pool_evicted;
         std::vector<uint64_t> pool_evicted_bytes;
-        if (!victim_in_frame && victim_entry.budget_bytes != 0 && !victim_shrunk &&
-            texture_pool_for(victim_entry.budget_bytes)
-                .release(victim_entry.shape, victim, victim_entry.budget_bytes, &pool_evicted, &pool_evicted_bytes)) {
+        for (const Victim& victim : victims) {
+            // Backlog 38: a texture not referenced by the frame being recorded is parked for reuse
+            // instead of destroyed (it stays counted in the texture budget while parked). Chains over
+            // 64 KiB go to the large pool, only when the consumer zeroes reused textures on the GPU.
+            if (!victim.in_frame && victim.entry.budget_bytes != 0 && !victim.shrunk &&
+                texture_pool_for(victim.entry.budget_bytes)
+                    .release(victim.entry.shape, victim.id, victim.entry.budget_bytes, &pool_evicted,
+                             &pool_evicted_bytes)) {
+                continue;
+            }
+            if (victim.entry.budget_bytes != 0) {
+                texture_budget().note_destroyed(victim.entry.budget_bytes);
+                texture_budget().note_lru_evicted(victim.id, victim.entry.budget_bytes);
+            }
+            bridge_->destroy_or_defer_resource(victim.id, drop);
+        }
+        if (!pool_evicted.empty()) {
             for (size_t i = 0; i < pool_evicted.size(); ++i) {
                 texture_budget().note_destroyed(pool_evicted_bytes[i]);
                 untrack_guest_texture(pool_evicted[i]);
-                bridge_->unregister_resource(pool_evicted[i]);
-                bridge_->destroy_or_defer_resource(pool_evicted[i], drop);
             }
-            continue;
+            bridge_->unregister_resources(pool_evicted);
+            for (const uint32_t id : pool_evicted) {
+                bridge_->destroy_or_defer_resource(id, drop);
+            }
         }
-        if (victim_entry.budget_bytes != 0) {
-            texture_budget().note_destroyed(victim_entry.budget_bytes);
-            texture_budget().note_lru_evicted(victim, victim_entry.budget_bytes);
-        }
-        bridge_->destroy_or_defer_resource(victim, drop);
     }
     if (drop.size() != 0) {
         submit(drop);

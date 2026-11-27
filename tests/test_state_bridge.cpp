@@ -569,6 +569,33 @@ void test_bind_group_rebuild_and_retire() {
     list.Close();
 }
 
+// unregister_resources: a batch (an LRU dropping many textures at once) retires every id and drops
+// the cached groups over any of them, like one unregister_resource per id.
+void test_unregister_resources_batch() {
+    Scene scene;
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    const uint32_t ids[] = {Scene::kAlbedo2, 0u, Scene::kAlbedo};
+    scene.device.unregister_resources(ids);
+    CHECK(scene.device.retired(Scene::kAlbedo2));
+    CHECK(scene.device.retired(Scene::kAlbedo));
+    const size_t mark = enc.size();
+    list.Reset(nullptr);
+    scene.bind_root(list);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+    const std::vector<Packet> p = decode(enc, mark);
+    CHECK(std::any_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; }));
+    CHECK(list.stats().bind_groups_resource_retired == 1);
+}
+
 // G66 (#691): the title releases a texture and leaves its descriptor in the heap. The descriptor
 // words do not change, so the cached bind group stayed a hit and kept binding the destroyed texture:
 // WebGPU then rejects the whole submit (show1 capture: black frame 2216). The hit is rebuilt with
@@ -4952,7 +4979,8 @@ void test_evicted_texture_destroy_deferred_until_after_present() {
             // lut_id must NOT be evicted while cold non-in-frame candidates exist.
             std::vector<uint32_t> others;
             others.reserve(dg::Device::kMaxAddressTextures);
-            for (size_t i = 1; i <= dg::Device::kMaxAddressTextures; ++i) {
+            // (to exactly the cap: reaching it would drop a batch of the cold ones)
+            for (size_t i = 1; device->address_texture_count() < dg::Device::kMaxAddressTextures; ++i) {
                 const uint32_t id = device->ensure_address_texture(kBaseVa + i * 0x10000ull, 2u, 256u, 1u, 1u, 1u,
                                                                    0x100u, GpuTextureDimension::Dim2D, false);
                 CHECK(id != 0);
@@ -8013,6 +8041,7 @@ int main() {
     test_reflected_uniform_min_size();
     test_bind_group_rebuild_and_retire();
     test_cached_bind_group_drops_destroyed_texture();
+    test_unregister_resources_batch();
     test_usage_conflict_is_diagnosed();
     test_barrier_flushes_pending_clears();
     test_partial_clear_is_reported();

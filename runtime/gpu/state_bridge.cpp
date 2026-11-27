@@ -704,6 +704,21 @@ uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
 }
 
 void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
+    unregister_resources(std::span<const uint32_t>(&resource_id, 1));
+}
+
+void StateBridgeDevice::unregister_resources(std::span<const uint32_t> resource_ids) {
+    std::vector<uint32_t> invalidated_resources;
+    std::vector<uint32_t> invalidated_views;
+    invalidated_resources.reserve(resource_ids.size());
+    for (const uint32_t id : resource_ids) {
+        unregister_resource_quiet(id, &invalidated_resources, &invalidated_views);
+    }
+    notify_bridges_invalidated(invalidated_resources, invalidated_views);
+}
+
+void StateBridgeDevice::unregister_resource_quiet(uint32_t resource_id, std::vector<uint32_t>* invalidated_resources,
+                                                  std::vector<uint32_t>* invalidated_views) {
     if (resource_id == 0) {
         return;
     }
@@ -753,12 +768,10 @@ void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
             defer_destroy_resource(id);
         }
     }
-    std::vector<uint32_t> invalidated_resources;
-    invalidated_resources.reserve(1 + retired_intermediates.size());
-    invalidated_resources.push_back(resource_id);
-    invalidated_resources.insert(invalidated_resources.end(), retired_intermediates.begin(),
-                                 retired_intermediates.end());
-    notify_bridges_invalidated(invalidated_resources, retired_views);
+    invalidated_resources->push_back(resource_id);
+    invalidated_resources->insert(invalidated_resources->end(), retired_intermediates.begin(),
+                                  retired_intermediates.end());
+    invalidated_views->insert(invalidated_views->end(), retired_views.begin(), retired_views.end());
 }
 
 void StateBridgeDevice::attach_bridge(CommandListBridge* bridge) {

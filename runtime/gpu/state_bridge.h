@@ -506,6 +506,10 @@ public:
     // Bytes the WebGPU buffer has (>= the guest size; 0 for an unknown buffer).
     uint64_t buffer_allocated_size(uint32_t resource_id) const;
     void unregister_resource(uint32_t resource_id);
+    // unregister_resource for many ids with ONE bind-group invalidation pass over every command list
+    // (each pass scans a list's whole bind-group cache; an LRU dropping textures one by one paid it
+    // per texture).
+    void unregister_resources(std::span<const uint32_t> resource_ids);
     // Shader identity (D3D12GraphicsPsoDesc::vs/ps/cs) -> CreateShaderModule id.
     void register_shader_module(uint64_t shader_identity, uint32_t module_id);
     // Layout for a shader combination: (vs, ps) for graphics, (cs, 0) for compute.
@@ -803,6 +807,9 @@ private:
     void attach_bridge(CommandListBridge* bridge);
     void detach_bridge(CommandListBridge* bridge);
     void notify_bridges_invalidated(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids);
+    // unregister_resource without the invalidation pass: appends what the pass must drop.
+    void unregister_resource_quiet(uint32_t resource_id, std::vector<uint32_t>* invalidated_resources,
+                                   std::vector<uint32_t>* invalidated_views);
     size_t flush_deferred_destroys_impl(CommandEncoder& encoder, bool respect_unexecuted);
 
 public:

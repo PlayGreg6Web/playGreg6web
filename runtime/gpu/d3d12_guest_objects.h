@@ -919,6 +919,10 @@ public:
     size_t relocated_uniform_count() const;
     // O36: textures known only by a view at an address (bounded; least recently used dropped).
     static constexpr size_t kMaxAddressTextures = 2048;
+    // At the cap, this many least recently used are dropped in one pass (one victim scan, one
+    // bind-group invalidation pass): a title whose working set exceeds the cap otherwise paid both
+    // per new texture, seconds per frame in the 3D scene.
+    static constexpr size_t kAddressTextureEvictBatch = 64;
     size_t address_texture_count() const;
     // Storage buffer views at unaligned offsets or address-only GPU VAs (G51): the bytes at
     // [va, va + size) (readable guest/alias memory only) get a 256-byte aligned home (or a
