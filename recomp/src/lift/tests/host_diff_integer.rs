@@ -1196,6 +1196,574 @@ fn bit_instructions_match_the_host_cpu() {
     report(test, &differential("hostdiff_bits", &ops));
 }
 
+// ----- bit/BMI forms with aliased operands, memory sources and in-block flag consumers ----------
+
+/// Bit offsets for `bt* [rsi + rdx*8 - 8], rdx` (the offset doubles as the index register).
+const ALIAS_OFFSETS: [i64; 15] = [0, 1, 7, 8, 31, 32, 63, 64, 100, -1, -8, -9, -64, -65, -100];
+
+/// Operand-aliasing and memory-source forms of the BMI/bit-count/bit-test instructions (the
+/// destination doubling as a source, count or control register), as compilers emit them.
+fn alias_ops(rng: &mut Lcg) -> Vec<Op> {
+    let mut ops = Vec::new();
+    for bits in [32u32, 64] {
+        let w = bits == 64;
+        let mut add = |name: &str, feature, code: Vec<u8>, cases, undefined| {
+            ops.push(op(
+                format!("{name}{bits}"),
+                code,
+                Some(feature),
+                cases,
+                undefined,
+            ));
+        };
+        for name in ["shlx", "shrx", "sarx"] {
+            let pick = |a: &mut CodeAssembler, d: usize, s: usize, c: usize| {
+                let r64 = [rdx, r8, r9];
+                let r32 = [edx, r8d, r9d];
+                match (name, w) {
+                    ("shlx", true) => a.shlx(r64[d], r64[s], r64[c]),
+                    ("shlx", false) => a.shlx(r32[d], r32[s], r32[c]),
+                    ("shrx", true) => a.shrx(r64[d], r64[s], r64[c]),
+                    ("shrx", false) => a.shrx(r32[d], r32[s], r32[c]),
+                    (_, true) => a.sarx(r64[d], r64[s], r64[c]),
+                    _ => a.sarx(r32[d], r32[s], r32[c]),
+                }
+            };
+            add(
+                &format!("{name} d=s "),
+                "bmi2",
+                asm(|a| pick(a, 1, 1, 2)),
+                reg_cases(rng, &[(X8, Src::Value), (X9, Src::Count)], 0, |_, _| {}),
+                no_undef(),
+            );
+            add(
+                &format!("{name} d=c "),
+                "bmi2",
+                asm(|a| pick(a, 2, 1, 2)),
+                reg_cases(rng, &[(X8, Src::Value), (X9, Src::Count)], 0, |_, _| {}),
+                no_undef(),
+            );
+            add(
+                &format!("{name} d=s=c "),
+                "bmi2",
+                asm(|a| pick(a, 1, 1, 1)),
+                reg_cases(rng, &[(X8, Src::Value)], 0, |_, _| {})
+                    .into_iter()
+                    .chain(reg_cases(rng, &[(X8, Src::Count)], 0, |_, _| {}))
+                    .collect(),
+                no_undef(),
+            );
+            add(
+                &format!("{name} [m] "),
+                "bmi2",
+                asm(|a| match (name, w) {
+                    ("shlx", true) => a.shlx(rdx, qword_ptr(rsi), r9),
+                    ("shlx", false) => a.shlx(edx, dword_ptr(rsi), r9d),
+                    ("shrx", true) => a.shrx(rdx, qword_ptr(rsi), r9),
+                    ("shrx", false) => a.shrx(edx, dword_ptr(rsi), r9d),
+                    (_, true) => a.sarx(rdx, qword_ptr(rsi), r9),
+                    _ => a.sarx(edx, dword_ptr(rsi), r9d),
+                }),
+                mem_cases(rng, SI, 8, &[(X9, Src::Count)], 32, |_, _| {}),
+                no_undef(),
+            );
+        }
+        // bextr with the destination as control (`bextr r9d, esi, r9d`) or as source.
+        for (label, d, s) in [("d=ctl ", 2usize, 1usize), ("d=s ", 1, 1)] {
+            add(
+                &format!("bextr {label}"),
+                "bmi1",
+                asm(|a| {
+                    if w {
+                        let r = [rdx, r8, r9];
+                        a.bextr(r[d], r[s], r9)
+                    } else {
+                        let r = [edx, r8d, r9d];
+                        a.bextr(r[d], r[s], r9d)
+                    }
+                }),
+                reg_cases(rng, &[(X8, Src::Value), (X9, Src::Control)], 0, |_, _| {}),
+                undef(&[AF, SF, PF]),
+            );
+        }
+        add(
+            "bextr [m] d=ctl ",
+            "bmi1",
+            asm(|a| {
+                if w {
+                    a.bextr(r9, qword_ptr(rsi), r9)
+                } else {
+                    a.bextr(r9d, dword_ptr(rsi), r9d)
+                }
+            }),
+            mem_cases(rng, SI, 8, &[(X9, Src::Control)], 32, |_, _| {}),
+            undef(&[AF, SF, PF]),
+        );
+        add(
+            "bzhi d=idx ",
+            "bmi2",
+            asm(|a| {
+                if w {
+                    a.bzhi(r9, r8, r9)
+                } else {
+                    a.bzhi(r9d, r8d, r9d)
+                }
+            }),
+            reg_cases(rng, &[(X8, Src::Value), (X9, Src::Count)], 0, |_, _| {}),
+            undef(&[AF, PF]),
+        );
+        add(
+            "bzhi [m] ",
+            "bmi2",
+            asm(|a| {
+                if w {
+                    a.bzhi(rdx, qword_ptr(rsi), r9)
+                } else {
+                    a.bzhi(edx, dword_ptr(rsi), r9d)
+                }
+            }),
+            mem_cases(rng, SI, 8, &[(X9, Src::Count)], 32, |_, _| {}),
+            undef(&[AF, PF]),
+        );
+        for (label, d) in [("d=s1 ", 1usize), ("d=s2 ", 2)] {
+            add(
+                &format!("andn {label}"),
+                "bmi1",
+                asm(|a| {
+                    if w {
+                        let r = [rdx, r8, r9];
+                        a.andn(r[d], r8, r9)
+                    } else {
+                        let r = [edx, r8d, r9d];
+                        a.andn(r[d], r8d, r9d)
+                    }
+                }),
+                reg_cases(rng, &[(X8, Src::Value), (X9, Src::Value)], 0, |_, _| {}),
+                undef(&[AF, PF]),
+            );
+        }
+        for name in ["blsi", "blsr", "blsmsk"] {
+            add(
+                &format!("{name} d=s "),
+                "bmi1",
+                asm(|a| match (name, w) {
+                    ("blsi", true) => a.blsi(r8, r8),
+                    ("blsi", false) => a.blsi(r8d, r8d),
+                    ("blsr", true) => a.blsr(r8, r8),
+                    ("blsr", false) => a.blsr(r8d, r8d),
+                    (_, true) => a.blsmsk(r8, r8),
+                    _ => a.blsmsk(r8d, r8d),
+                }),
+                reg_cases(rng, &[(X8, Src::Value)], 0, |_, _| {}),
+                undef(&[AF, PF]),
+            );
+            add(
+                &format!("{name} [m] "),
+                "bmi1",
+                asm(|a| match (name, w) {
+                    ("blsi", true) => a.blsi(rdx, qword_ptr(rsi)),
+                    ("blsi", false) => a.blsi(edx, dword_ptr(rsi)),
+                    ("blsr", true) => a.blsr(rdx, qword_ptr(rsi)),
+                    ("blsr", false) => a.blsr(edx, dword_ptr(rsi)),
+                    (_, true) => a.blsmsk(rdx, qword_ptr(rsi)),
+                    _ => a.blsmsk(edx, dword_ptr(rsi)),
+                }),
+                mem_cases(rng, SI, 8, &[], 32, |input, rng| {
+                    if rng.next() % 4 == 0 {
+                        put(&mut input.mem, 8, 8, 0);
+                    }
+                }),
+                undef(&[AF, PF]),
+            );
+        }
+    }
+    // lzcnt/tzcnt/popcnt in place, at every width.
+    for (name, feature, list) in [
+        ("lzcnt", "lzcnt", &[PF, AF, SF, OF][..]),
+        ("tzcnt", "bmi1", &[PF, AF, SF, OF][..]),
+        ("popcnt", "popcnt", &[][..]),
+    ] {
+        for bits in [16u32, 32, 64] {
+            let code = asm(|a| match (name, bits) {
+                ("lzcnt", 16) => a.lzcnt(r8w, r8w),
+                ("lzcnt", 32) => a.lzcnt(r8d, r8d),
+                ("lzcnt", _) => a.lzcnt(r8, r8),
+                ("tzcnt", 16) => a.tzcnt(r8w, r8w),
+                ("tzcnt", 32) => a.tzcnt(r8d, r8d),
+                ("tzcnt", _) => a.tzcnt(r8, r8),
+                (_, 16) => a.popcnt(r8w, r8w),
+                (_, 32) => a.popcnt(r8d, r8d),
+                _ => a.popcnt(r8, r8),
+            });
+            let list: &'static [usize] = list;
+            ops.push(op(
+                format!("{name}{bits} d=s"),
+                code,
+                Some(feature),
+                reg_cases(rng, &[(X8, Src::Value)], 0, |_, _| {}),
+                undef(list),
+            ));
+        }
+    }
+    // bt* with the offset register aliasing the destination register.
+    let bt_undef = || undef(&[PF, AF, SF, OF]);
+    for (m, name) in [(0, "bt"), (1, "bts"), (2, "btr"), (3, "btc")] {
+        for bits in [16u32, 32, 64] {
+            let code = asm(|a| match (m, bits) {
+                (0, 16) => a.bt(dx, dx),
+                (0, 32) => a.bt(edx, edx),
+                (0, _) => a.bt(rdx, rdx),
+                (1, 16) => a.bts(dx, dx),
+                (1, 32) => a.bts(edx, edx),
+                (1, _) => a.bts(rdx, rdx),
+                (2, 16) => a.btr(dx, dx),
+                (2, 32) => a.btr(edx, edx),
+                (2, _) => a.btr(rdx, rdx),
+                (_, 16) => a.btc(dx, dx),
+                (_, 32) => a.btc(edx, edx),
+                _ => a.btc(rdx, rdx),
+            });
+            let cases = reg_cases(rng, &[(DX, Src::Value)], 0, |_, _| {})
+                .into_iter()
+                .chain(reg_cases(rng, &[(DX, Src::Count)], 0, |_, _| {}))
+                .collect();
+            ops.push(op(
+                format!("{name}{bits} r,r d=o"),
+                code,
+                None,
+                cases,
+                bt_undef(),
+            ));
+            // [rsi + rdx*8 - 8], rdx: the offset is also the scaled index, so the bit lands in a
+            // different element than the one the address names (or before it, when negative).
+            let code = asm(|a| match (m, bits) {
+                (0, 16) => a.bt(word_ptr(rsi + rdx * 8 - 8), dx),
+                (0, 32) => a.bt(dword_ptr(rsi + rdx * 8 - 8), edx),
+                (0, _) => a.bt(qword_ptr(rsi + rdx * 8 - 8), rdx),
+                (1, 16) => a.bts(word_ptr(rsi + rdx * 8 - 8), dx),
+                (1, 32) => a.bts(dword_ptr(rsi + rdx * 8 - 8), edx),
+                (1, _) => a.bts(qword_ptr(rsi + rdx * 8 - 8), rdx),
+                (2, 16) => a.btr(word_ptr(rsi + rdx * 8 - 8), dx),
+                (2, 32) => a.btr(dword_ptr(rsi + rdx * 8 - 8), edx),
+                (2, _) => a.btr(qword_ptr(rsi + rdx * 8 - 8), rdx),
+                (_, 16) => a.btc(word_ptr(rsi + rdx * 8 - 8), dx),
+                (_, 32) => a.btc(dword_ptr(rsi + rdx * 8 - 8), edx),
+                _ => a.btc(qword_ptr(rsi + rdx * 8 - 8), rdx),
+            });
+            let mut cases = Vec::new();
+            for &e in &ALIAS_OFFSETS {
+                for cf in [false, true] {
+                    let mut input = random_input(rng, 2048);
+                    input.ptrs = 1 << SI;
+                    input.regs[SI] = 1024;
+                    // The index uses all 64 bits, so the offset must be a clean sign extension.
+                    input.regs[DX] = e as u64;
+                    input.flags[CF] = cf;
+                    cases.push(input);
+                }
+            }
+            ops.push(op(
+                format!("{name}{bits} [b+o*8-8],o"),
+                code,
+                None,
+                cases,
+                bt_undef(),
+            ));
+        }
+    }
+    ops
+}
+
+/// Short sequences that consume the flags of a bit/BMI instruction inside the same block
+/// (setcc / cmovcc / adc / sbb / jcc), which exercises the lifter's lazy flag sources rather
+/// than the flags materialised at the function exit, plus the shapes of a real buddy allocator.
+fn flag_consumer_ops(rng: &mut Lcg) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let two = [(X8, Src::Value), (X9, Src::Value)];
+    let one = [(X8, Src::Value)];
+    let bt_undef = || undef(&[PF, AF, SF, OF]);
+    let cnt_undef = || undef(&[PF, AF, SF, OF]);
+    for bits in [16u32, 32, 64] {
+        for (name, feature) in [("lzcnt", "lzcnt"), ("tzcnt", "bmi1")] {
+            let code = asm(|a| {
+                match (name, bits) {
+                    ("lzcnt", 16) => a.lzcnt(dx, r8w)?,
+                    ("lzcnt", 32) => a.lzcnt(edx, r8d)?,
+                    ("lzcnt", _) => a.lzcnt(rdx, r8)?,
+                    (_, 16) => a.tzcnt(dx, r8w)?,
+                    (_, 32) => a.tzcnt(edx, r8d)?,
+                    _ => a.tzcnt(rdx, r8)?,
+                }
+                a.setb(al)?;
+                a.sete(cl)?;
+                a.setbe(bl)?;
+                a.cmova(rdi, r9)
+            });
+            ops.push(op(
+                format!("{name}{bits}; setb sete setbe cmova"),
+                code,
+                Some(feature),
+                reg_cases(rng, &two, 0, |_, _| {}),
+                cnt_undef(),
+            ));
+        }
+        let code = asm(|a| {
+            match bits {
+                16 => a.popcnt(dx, r8w)?,
+                32 => a.popcnt(edx, r8d)?,
+                _ => a.popcnt(rdx, r8)?,
+            }
+            a.sete(al)?;
+            a.setb(cl)?;
+            a.sets(bl)?;
+            a.setp(dil)
+        });
+        ops.push(op(
+            format!("popcnt{bits}; sete setb sets setp"),
+            code,
+            Some("popcnt"),
+            reg_cases(rng, &one, 0, |_, _| {}),
+            no_undef(),
+        ));
+        for (m, name) in [(0, "bt"), (1, "bts"), (2, "btr"), (3, "btc")] {
+            let code = asm(|a| {
+                match (m, bits) {
+                    (0, 16) => a.bt(dx, r8w)?,
+                    (0, 32) => a.bt(edx, r8d)?,
+                    (0, _) => a.bt(rdx, r8)?,
+                    (1, 16) => a.bts(dx, r8w)?,
+                    (1, 32) => a.bts(edx, r8d)?,
+                    (1, _) => a.bts(rdx, r8)?,
+                    (2, 16) => a.btr(dx, r8w)?,
+                    (2, 32) => a.btr(edx, r8d)?,
+                    (2, _) => a.btr(rdx, r8)?,
+                    (_, 16) => a.btc(dx, r8w)?,
+                    (_, 32) => a.btc(edx, r8d)?,
+                    _ => a.btc(rdx, r8)?,
+                }
+                a.setb(al)?;
+                a.cmovb(rdi, r9)?;
+                a.adc(rcx, 0)
+            });
+            ops.push(op(
+                format!("{name}{bits} r,r; setb cmovb adc"),
+                code,
+                None,
+                reg_cases(rng, &[(DX, Src::Value), (X8, Src::Count)], 0, |_, _| {}),
+                no_undef(),
+            ));
+            let code = asm(|a| {
+                match (m, bits) {
+                    (0, 16) => a.bt(dx, 13)?,
+                    (0, 32) => a.bt(edx, 45)?,
+                    (0, _) => a.bt(rdx, 63)?,
+                    (1, 16) => a.bts(dx, 13)?,
+                    (1, 32) => a.bts(edx, 45)?,
+                    (1, _) => a.bts(rdx, 63)?,
+                    (2, 16) => a.btr(dx, 13)?,
+                    (2, 32) => a.btr(edx, 45)?,
+                    (2, _) => a.btr(rdx, 63)?,
+                    (_, 16) => a.btc(dx, 13)?,
+                    (_, 32) => a.btc(edx, 45)?,
+                    _ => a.btc(rdx, 63)?,
+                }
+                a.setae(al)?;
+                a.cmovae(rdi, r9)?;
+                a.sbb(rcx, rcx)
+            });
+            ops.push(op(
+                format!("{name}{bits} r,imm; setae cmovae sbb"),
+                code,
+                None,
+                reg_cases(rng, &[(DX, Src::Value)], 0, |_, _| {}),
+                no_undef(),
+            ));
+            let code = asm(|a| {
+                match (m, bits) {
+                    (0, 16) => a.bt(word_ptr(rsi), r8w)?,
+                    (0, 32) => a.bt(dword_ptr(rsi), r8d)?,
+                    (0, _) => a.bt(qword_ptr(rsi), r8)?,
+                    (1, 16) => a.bts(word_ptr(rsi), r8w)?,
+                    (1, 32) => a.bts(dword_ptr(rsi), r8d)?,
+                    (1, _) => a.bts(qword_ptr(rsi), r8)?,
+                    (2, 16) => a.btr(word_ptr(rsi), r8w)?,
+                    (2, 32) => a.btr(dword_ptr(rsi), r8d)?,
+                    (2, _) => a.btr(qword_ptr(rsi), r8)?,
+                    (_, 16) => a.btc(word_ptr(rsi), r8w)?,
+                    (_, 32) => a.btc(dword_ptr(rsi), r8d)?,
+                    _ => a.btc(qword_ptr(rsi), r8)?,
+                }
+                a.setb(al)?;
+                a.cmovb(rdi, r9)
+            });
+            let offsets: [i64; 12] = [0, 5, 31, 32, 63, 64, 200, -1, -8, -64, -65, -300];
+            let mut cases = Vec::new();
+            for &e in &offsets {
+                for cf in [false, true] {
+                    let mut input = random_input(rng, 512);
+                    input.ptrs = 1 << SI;
+                    input.regs[SI] = 256;
+                    input.regs[X8] = bit_offset_value(e, bits, rng);
+                    input.flags[CF] = cf;
+                    cases.push(input);
+                }
+            }
+            ops.push(op(
+                format!("{name}{bits} [m],r; setb cmovb"),
+                code,
+                None,
+                cases,
+                bt_undef(),
+            ));
+        }
+    }
+    for bits in [32u32, 64] {
+        let w = bits == 64;
+        for name in ["blsi", "blsr", "blsmsk"] {
+            let code = asm(|a| {
+                match (name, w) {
+                    ("blsi", true) => a.blsi(rdx, r8)?,
+                    ("blsi", false) => a.blsi(edx, r8d)?,
+                    ("blsr", true) => a.blsr(rdx, r8)?,
+                    ("blsr", false) => a.blsr(edx, r8d)?,
+                    (_, true) => a.blsmsk(rdx, r8)?,
+                    _ => a.blsmsk(edx, r8d)?,
+                }
+                a.setb(al)?;
+                a.sete(cl)?;
+                a.sets(bl)?;
+                a.seto(dil)?;
+                a.cmovle(r9, r8)
+            });
+            ops.push(op(
+                format!("{name}{bits}; setb sete sets seto cmovle"),
+                code,
+                Some("bmi1"),
+                reg_cases(rng, &two, 0, |_, _| {}),
+                undef(&[AF, PF]),
+            ));
+        }
+        let code = asm(|a| {
+            if w {
+                a.andn(rdx, r8, r9)?;
+            } else {
+                a.andn(edx, r8d, r9d)?;
+            }
+            a.sete(al)?;
+            a.sets(cl)?;
+            a.setb(bl)?;
+            a.setg(dil)
+        });
+        ops.push(op(
+            format!("andn{bits}; sete sets setb setg"),
+            code,
+            Some("bmi1"),
+            reg_cases(rng, &two, 0, |_, _| {}),
+            undef(&[AF, PF]),
+        ));
+        let code = asm(|a| {
+            if w {
+                a.bextr(rdx, r8, r9)?;
+            } else {
+                a.bextr(edx, r8d, r9d)?;
+            }
+            a.sete(al)?;
+            a.setb(cl)?;
+            a.seto(bl)?;
+            a.cmova(rdi, rdx)
+        });
+        ops.push(op(
+            format!("bextr{bits}; sete setb seto cmova"),
+            code,
+            Some("bmi1"),
+            reg_cases(rng, &[(X8, Src::Value), (X9, Src::Control)], 0, |_, _| {}),
+            undef(&[AF, SF, PF]),
+        ));
+        let code = asm(|a| {
+            if w {
+                a.bzhi(rdx, r8, r9)?;
+            } else {
+                a.bzhi(edx, r8d, r9d)?;
+            }
+            a.setb(al)?;
+            a.sete(cl)?;
+            a.sets(bl)?;
+            a.setl(dil)
+        });
+        ops.push(op(
+            format!("bzhi{bits}; setb sete sets setl"),
+            code,
+            Some("bmi2"),
+            reg_cases(rng, &[(X8, Src::Value), (X9, Src::Count)], 0, |_, _| {}),
+            undef(&[AF, PF]),
+        ));
+    }
+    // lzcnt feeding branches (CF, then CF|ZF).
+    let code = asm(|a| {
+        let mut zero = a.create_label();
+        let mut done = a.create_label();
+        a.lzcnt(eax, ecx)?;
+        a.jb(zero)?;
+        a.jbe(done)?;
+        a.mov(edx, 1)?;
+        a.jmp(done)?;
+        a.set_label(&mut zero)?;
+        a.mov(edx, 2)?;
+        a.set_label(&mut done)?;
+        a.nop()
+    });
+    ops.push(op(
+        "lzcnt32; jb jbe",
+        code,
+        Some("lzcnt"),
+        reg_cases(rng, &[(CX, Src::Value)], 0, |_, _| {}),
+        cnt_undef(),
+    ));
+    // Buddy-allocator shapes: order = 31 - lzcnt(size); a shrx loop bound; a shlx order
+    // weight; a bextr of a packed order field with the control in the destination register.
+    let code = asm(|a| {
+        a.lzcnt(eax, ecx)?;
+        a.mov(esi, 0x1f)?;
+        a.sub(esi, eax)?;
+        a.shrx(r9d, edx, esi)?;
+        a.mov(eax, 1)?;
+        a.shlx(eax, eax, esi)?;
+        a.mov(r10d, 0x50f)?;
+        a.bextr(r10d, r8d, r10d)?;
+        a.cmp(r10d, 0x17)?;
+        a.seta(bl)?;
+        a.test(r9d, r9d)?;
+        a.sete(dil)
+    });
+    ops.push(op(
+        "buddy order/shrx/shlx/bextr",
+        code,
+        Some("bmi2"),
+        reg_cases(
+            rng,
+            &[(CX, Src::Value), (DX, Src::Value), (X8, Src::Value)],
+            0,
+            |_, _| {},
+        ),
+        // `test` leaves AF undefined.
+        undef(&[AF]),
+    ));
+    ops
+}
+
+#[test]
+fn aliased_bit_forms_and_flag_consumers_match_the_host_cpu() {
+    let test = "aliased_bit_forms_and_flag_consumers_match_the_host_cpu";
+    if !exec_or_skip(test) {
+        return;
+    }
+    let mut rng = Lcg(0xA11A5);
+    let mut ops = alias_ops(&mut rng);
+    ops.extend(flag_consumer_ops(&mut rng));
+    let ops = supported(test, ops);
+    report(test, &differential("hostdiff_bit_alias", &ops));
+}
+
 // ----- rotates through carry, double shifts ----------------------------------------------------
 
 fn masked(count: u64, bits: u32) -> u64 {
