@@ -1645,6 +1645,37 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
 
 }  // namespace
 
+size_t shift_legacy_fragment_bindings(StageReflectionIndex* index, uint32_t shift) {
+    if (index == nullptr || shift == 0 || shift >= kMaxGroup0Binding) {
+        return 0;
+    }
+    size_t shifted = 0;
+    for (auto& [key, r] : *index) {
+        if (r.stage != ReflectedStage::Fragment || r.group0_binding_shift != 0) {
+            continue;
+        }
+        uint32_t lo = UINT32_MAX;
+        uint32_t hi = 0;
+        for (const ReflectedBinding& b : r.bindings) {
+            if (b.group == 0) {
+                lo = std::min(lo, b.binding);
+                hi = std::max(hi, b.binding);
+            }
+        }
+        if (lo == UINT32_MAX || hi >= shift || hi + shift >= kMaxGroup0Binding) {
+            continue;  // no group 0, already numbered from `shift`, or no room
+        }
+        for (ReflectedBinding& b : r.bindings) {
+            if (b.group == 0) {
+                b.binding += shift;
+            }
+        }
+        r.group0_binding_shift = shift;
+        ++shifted;
+    }
+    return shifted;
+}
+
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
                           bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats,
                           const JoinOptions& options) {

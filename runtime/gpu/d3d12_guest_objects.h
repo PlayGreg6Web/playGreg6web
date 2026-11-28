@@ -1029,6 +1029,9 @@ public:
     bridge::PrewarmPipelineResult prewarm_pipeline(uint32_t task_id, uint32_t kind, uint64_t key0, uint64_t key1,
                                                    const std::vector<uint8_t>& detail);
     uint32_t pack_module_locked(uint64_t key, GpuShaderStage stage);  // pack_mutex_ held
+    // The @group(0) renumbering of a pack stage (StageReflection::group0_binding_shift; 0 = none): its
+    // modules are created as pack_key_code(key, shift) so they match the joined layouts.
+    uint32_t pack_binding_shift(uint64_t key) const;
     // Module for a pack key (deterministic id, built once) or, for a non-pack key, a sequential id. pack_mutex_ held.
     uint32_t module_locked(uint64_t key, GpuShaderStage stage, const std::string& code);
     // Reflection join failures reported so far (once per pipeline: stage keys + root signature).

@@ -62,6 +62,10 @@ bool parse_shader_pack_index(const uint8_t* data, size_t size, ShaderPackIndex* 
 
 // The hash-only CreateShaderModule code for a pack key ("0x" + 16 lowercase hex digits).
 std::string pack_key_code(uint64_t key);
+// The same with a @group(0) binding renumbering (StageReflection::group0_binding_shift): with a
+// nonzero shift, `wgpk:0x<16 hex>;group0_binding_shift=<n>`, which the native executor resolves
+// from its pack and renumbers (shift_wgsl_group0_bindings); shift 0 is pack_key_code(key).
+std::string pack_key_code(uint64_t key, uint32_t group0_binding_shift);
 
 // Deterministic CreateShaderModule ids for pack modules. A pack key's id is kPackModuleIdBase + its rank
 // among the pack's keys in ascending order, so it does not depend on which thread (the pipeline prewarm

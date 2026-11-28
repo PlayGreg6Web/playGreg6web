@@ -1039,6 +1039,37 @@ void test_show_target_model() {
     CHECK(show_target_title("base", label).find("base | SHOWING tex 7") == 0);
 }
 
+// Legacy fragment stages renumbered on request (gpu::pack_key_code(key, shift)).
+void test_shifted_pack_shader() {
+    using namespace playgta6::gpu::native_exec;
+    const auto s = parse_shifted_pack_shader_payload("wgpk:0x00a5459e8d5891ed;group0_binding_shift=128");
+    CHECK(s && s->hash == 0x00a5459e8d5891edull && s->group0_binding_shift == 128);
+    CHECK(!parse_hash_only_shader_payload("wgpk:0x00a5459e8d5891ed;group0_binding_shift=128"));
+    CHECK(!parse_shifted_pack_shader_payload("0x00a5459e8d5891ed"));
+    CHECK(!parse_shifted_pack_shader_payload("wgpk:0x00a5459e8d5891ed;group0_binding_shift=0"));
+    CHECK(!parse_shifted_pack_shader_payload("wgpk:0x00a5459e8d5891ed;group0_binding_shift=12x"));
+    CHECK(!parse_shifted_pack_shader_payload("wgpk:0xzz;group0_binding_shift=128"));
+
+    const std::string wgsl =
+        "@group(0) @binding(0) var<uniform> cb0: CB;\n"
+        "@group(0) @binding(1)\nvar tex1: texture_2d<f32>;\n"
+        "@binding( 2 ) @group( 0 ) var samp2: sampler;\n"
+        "@group(3) @binding(16) var<storage, read> rt: array<u32>;\n"
+        "@group(1) @binding(0) var other: sampler;\n"
+        "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n";
+    const std::string out = shift_wgsl_group0_bindings(wgsl, 128);
+    CHECK(out ==
+          "@group(0) @binding(128) var<uniform> cb0: CB;\n"
+          "@group(0) @binding(129)\nvar tex1: texture_2d<f32>;\n"
+          "@binding( 130 ) @group( 0 ) var samp2: sampler;\n"
+          "@group(3) @binding(16) var<storage, read> rt: array<u32>;\n"
+          "@group(1) @binding(0) var other: sampler;\n"
+          "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }\n");
+    const auto g0 = parse_wgsl_group0_bindings(out);
+    CHECK(g0.size() == 0 || g0.front().binding >= 128);  // unreferenced bindings are not listed
+    CHECK(shift_wgsl_group0_bindings("", 128).empty());
+}
+
 void test_remap_bindings_match() {
     using namespace playgta6::gpu::native_exec;
     WgslBinding a, b;
@@ -1911,6 +1942,7 @@ int main() {
     test_pipe_wait_budget();
     test_shader_workers();
     test_remap_bindings_match();
+    test_shifted_pack_shader();
     test_wgsl_group_bindings();
     test_fit_missing_groups();
     test_fit_stage_limits();

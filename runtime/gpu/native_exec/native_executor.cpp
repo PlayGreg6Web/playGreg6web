@@ -403,6 +403,9 @@ struct ShaderEntry {
     uint32_t stage = 0;
     uint64_t hash = 0;  // the pack hash of a hash-only payload (0 = inline WGSL): the GPU-time key
     uint64_t reflect_hash = 0;  // the worker's `hashHex`: the pack hash, else FNV-1a 64 of the WGSL text
+    // A pack shader requested renumbered (parse_shifted_pack_shader_payload): every read of its pack
+    // text raises its @group(0) bindings by this much (shift_wgsl_group0_bindings). 0 = as packed.
+    uint32_t group0_binding_shift = 0;
     mutable bool pending = false;  // pack-backed and not yet materialized (nor handed to a worker)
     // Text scans of `code` memoized per shader (a compute WGSL can be 16 MB; every pipeline built
     // from the module rescanned it): resolved entry point per stage, statically referenced @group(0),
@@ -4268,6 +4271,23 @@ struct NativeExecutor::Impl {
             } else {
                 ++stats.shader_pack_misses;  // the hash text itself is compiled (and rejected)
             }
+        } else if (auto shifted = parse_shifted_pack_shader_payload(trimmed)) {
+            shader_hash = shifted->hash;
+            if (pack && pack->has(shifted->hash)) {
+                ++stats.shader_pack_hits;
+                ++stats.shader_binding_shifted;
+                auto e = std::make_shared<ShaderEntry>();
+                e->stage = h.stage;
+                e->hash = shader_hash;
+                // Not the pack hash: a reflection document for the pack shader numbers its bindings as packed.
+                e->reflect_hash = text_hash;
+                e->group0_binding_shift = shifted->group0_binding_shift;
+                e->pending = true;
+                shaders[h.id] = std::move(e);
+                ++stats.shader_modules;
+                return;
+            }
+            ++stats.shader_pack_misses;
         }
         const char* stage_name = h.stage == 0 ? "vertex" : h.stage == 1 ? "fragment" : h.stage == 2 ? "compute" : "";
         auto e = std::make_shared<ShaderEntry>();
@@ -4289,9 +4309,18 @@ struct NativeExecutor::Impl {
     // builders would do with the WGSL text, so the executor only picks up the results. Touches only
     // the entry (owned by the worker until `ready`), the pack (locked reads) and the device (thread-safe
     // with ImplicitDeviceSynchronization).
+    // A pack shader's WGSL text (renumbered when the entry asks for it), nullopt when the pack has none.
+    static std::optional<std::string> pack_text(const std::shared_ptr<WgslPack>& pk, const ShaderEntry& e) {
+        std::optional<std::string> hit = pk ? pk->get(e.hash) : std::nullopt;
+        if (hit && !hit->empty() && e.group0_binding_shift != 0) {
+            *hit = shift_wgsl_group0_bindings(*hit, e.group0_binding_shift);
+        }
+        return hit;
+    }
+
     static void materialize_on_worker(const wgpu::Device& device, const std::shared_ptr<WgslPack>& pk, ShaderEntry& e) {
         tl_shader_worker = true;
-        std::optional<std::string> hit = pk ? pk->get(e.hash) : std::nullopt;
+        std::optional<std::string> hit = pack_text(pk, e);
         if (hit && !hit->empty()) {
             e.code = std::move(*hit);
         } else {
@@ -4430,7 +4459,7 @@ struct NativeExecutor::Impl {
     void ensure_shader(const ShaderEntry& e) {
         if (!e.pending) return;
         e.pending = false;
-        std::optional<std::string> hit = pack ? pack->get(e.hash) : std::nullopt;
+        std::optional<std::string> hit = pack_text(pack, e);
         if (hit && !hit->empty()) {
             e.code = std::move(*hit);
         } else {
@@ -4464,7 +4493,7 @@ struct NativeExecutor::Impl {
     std::string code_scratch;
     const std::string& code_of(const ShaderEntry& e) {
         if (!e.code_dropped) return e.code;
-        std::optional<std::string> hit = pack ? pack->get(e.hash) : std::nullopt;
+        std::optional<std::string> hit = pack_text(pack, e);
         if (hit && !hit->empty()) {
             code_scratch = std::move(*hit);
         } else {
@@ -10763,6 +10792,7 @@ std::string NativeExecutor::stats_json() const {
     num("shader_modules", st.shader_modules);
     num("shader_pack_hits", st.shader_pack_hits);
     num("shader_pack_misses", st.shader_pack_misses);
+    num("shader_binding_shifted", st.shader_binding_shifted);
     num("shader_code_rereads", st.shader_code_rereads);
     num("shader_materialized", st.shader_materialized);
     num("shader_materialize_ms", st.shader_materialize_ns / 1000000ull);

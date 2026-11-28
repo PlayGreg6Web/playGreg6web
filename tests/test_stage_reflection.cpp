@@ -598,6 +598,102 @@ void test_plan_direct_slot() {
     CHECK(plan.table_windows().size() == 1 && plan.table_windows()[0].first_offset == 5);
 }
 
+// A pack translated before #1868 numbers the pixel stage's @group(0) from 0, like the vertex stage:
+// the pair below (bindings trimmed from a real std-pack pipeline) reads a different descriptor of the
+// same s8 table at @binding(0) in each stage, which no single layout can bind. Renumbering the legacy
+// fragment stage from @binding(128) makes the pair join; current-numbered stages are left alone.
+void test_legacy_fragment_binding_shift() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x9e9ed8a186a9c572": {
+      "stage": "vertex",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 8, "table_byte_offset": 5696},
+         "min_binding_size_bytes": 64},
+        {"group": 0, "binding": 1, "kind": "texture", "source": {"user_sgpr": 9, "table_byte_offset": 192},
+         "view_dimension": "2d"}
+      ]
+    },
+    "0xa5459e8d5891ed3b": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 8, "table_byte_offset": 320},
+         "min_binding_size_bytes": 256},
+        {"group": 0, "binding": 1, "kind": "texture", "source": {"user_sgpr": 8, "table_byte_offset": 1600},
+         "view_dimension": "2d"},
+        {"group": 0, "binding": 2, "kind": "sampler",
+         "source": {"inline_sampler": {"sdwords": [0, 12582912, 407896064, 0]}}}
+      ]
+    },
+    "0x00000000000000f1": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 128, "kind": "uniform", "source": {"user_sgpr": 8, "table_byte_offset": 320},
+         "min_binding_size_bytes": 16}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    // Two resource tables (s8, s9) with one unbounded SRV range each.
+    d3d::RootSignatureDesc rs;
+    for (uint32_t space = 0; space < 2; ++space) {
+        d3d::DescriptorRangeDesc r;
+        r.range_type = d3d::DescriptorRangeType::Srv;
+        r.num_descriptors = d3d::kUnboundedDescriptorCount;
+        r.register_space = space;
+        d3d::RootParameterDesc t;
+        t.parameter_type = d3d::RootParameterType::DescriptorTable;
+        t.ranges = {r};
+        rs.parameters.push_back(t);
+    }
+    const uint64_t vs = 0x9e9ed8a186a9c572ull, ps = 0xa5459e8d5891ed3bull;
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &index.at(vs)},
+                                            {GpuShaderStageBits::Fragment, &index.at(ps)}},
+                                &layout, &report));
+    CHECK(report.find("@group(0) @binding(0) <- table at s8 + 320: the stages disagree") != std::string::npos);
+
+    CHECK(shift_legacy_fragment_bindings(&index) == 1);  // the legacy pixel stage only
+    CHECK(index.at(ps).group0_binding_shift == kLegacyFragmentBindingShift);
+    CHECK(index.at(ps).bindings[0].binding == 128 && index.at(ps).bindings[2].binding == 130);
+    CHECK(index.at(vs).group0_binding_shift == 0 && index.at(vs).bindings[1].binding == 1);
+    CHECK(index.at(0xf1).group0_binding_shift == 0 && index.at(0xf1).bindings[0].binding == 128);
+    CHECK(shift_legacy_fragment_bindings(&index) == 0);  // idempotent
+
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &index.at(vs)},
+                                           {GpuShaderStageBits::Fragment, &index.at(ps)}},
+                               &layout, &report));
+    CHECK(report.empty());
+    CHECK(layout.groups.size() == 1 && layout.groups[0].bindings.size() == 5);
+    const bridge::LayoutBinding* v0 = find(layout, 0, 0);
+    const bridge::LayoutBinding* p0 = find(layout, 0, 128);
+    const bridge::LayoutBinding* p1 = find(layout, 0, 129);
+    const bridge::LayoutBinding* p2 = find(layout, 0, 130);
+    CHECK(v0 != nullptr && v0->entry.visibility == GpuShaderStageBits::Vertex && v0->entry.min_binding_size == 64);
+    CHECK(p0 != nullptr && p0->entry.visibility == GpuShaderStageBits::Fragment && p0->entry.min_binding_size == 256);
+    CHECK(p1 != nullptr && p1->entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Texture));
+    CHECK(p2 != nullptr && p2->join.inline_sampler);
+
+    // No room under maxBindingsPerBindGroup: left as it is.
+    StageReflectionIndex wide;
+    StageReflection big;
+    big.stage = ReflectedStage::Fragment;
+    ReflectedBinding hb;
+    hb.binding = 0;
+    big.bindings.push_back(hb);
+    hb.binding = 127;
+    big.bindings.push_back(hb);
+    wide.emplace(1, big);
+    CHECK(shift_legacy_fragment_bindings(&wide, 900) == 0 && wide.at(1).bindings[1].binding == 127);
+    CHECK(shift_legacy_fragment_bindings(&wide) == 1 && wide.at(1).bindings[1].binding == 255);
+}
+
 // #482 contract: a sampler the stage builds from constants in its code comes as its four S# dwords
 // ("inline_sampler": {"sdwords": [...]}) and is bound as the decoded sampler, whatever the root
 // signature declares. Hand-made GFX10 S# words: clamp-to-edge bilinear with linear mips (filter 0x15),
@@ -3182,6 +3278,7 @@ int main() {
     test_lane_indexed_heap_sources();
     test_s63_lane_indexed_sidecar();
     test_inline_sampler();
+    test_legacy_fragment_binding_shift();
     test_root_descriptor_over_table();
     test_unresolved_source();
     test_g83_unresolved_and_multistage();

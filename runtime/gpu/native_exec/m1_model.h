@@ -179,6 +179,84 @@ inline std::optional<uint64_t> parse_hash_only_shader_payload(std::string_view t
     return std::nullopt;
 }
 
+// A pack shader whose @group(0) bindings are renumbered (gpu::pack_key_code(key, shift), for
+// fragment stages of packs translated before the disjoint fragment numbering):
+// `wgpk:0x<1..16 hex>;group0_binding_shift=<decimal 1..999>`, exactly. Not a hash-only payload.
+struct ShiftedPackShader {
+    uint64_t hash = 0;
+    uint32_t group0_binding_shift = 0;
+};
+inline std::optional<ShiftedPackShader> parse_shifted_pack_shader_payload(std::string_view t) {
+    static constexpr std::string_view kSep = ";group0_binding_shift=";
+    const size_t sep = t.find(kSep);
+    if (sep == std::string_view::npos || t.substr(0, 7) != "wgpk:0x") return std::nullopt;
+    const std::optional<uint64_t> hash = parse_hex_u64(t.substr(7, sep - 7));
+    const std::string_view digits = t.substr(sep + kSep.size());
+    if (!hash || digits.empty() || digits.size() > 3) return std::nullopt;
+    uint32_t shift = 0;
+    for (char c : digits) {
+        if (c < '0' || c > '9') return std::nullopt;
+        shift = shift * 10 + static_cast<uint32_t>(c - '0');
+    }
+    if (shift == 0) return std::nullopt;
+    return ShiftedPackShader{*hash, shift};
+}
+
+// Raises N of every `@group(0) @binding(N)` (either attribute order, whitespace between them
+// allowed) by `shift`; other groups and all other text are kept byte for byte.
+inline std::string shift_wgsl_group0_bindings(std::string_view wgsl, uint32_t shift) {
+    auto ws = [&](size_t p) {
+        while (p < wgsl.size() && is_space(wgsl[p])) ++p;
+        return p;
+    };
+    // `@name ( digits )` at p: the digits' [begin, end) and the position after `)`.
+    auto attr = [&](size_t p, std::string_view name, size_t* d0, size_t* d1, size_t* after) {
+        if (wgsl.substr(p, name.size()) != name) return false;
+        p = ws(p + name.size());
+        if (p >= wgsl.size() || wgsl[p] != '(') return false;
+        p = ws(p + 1);
+        const size_t b = p;
+        while (p < wgsl.size() && wgsl[p] >= '0' && wgsl[p] <= '9') ++p;
+        if (p == b || p - b > 9) return false;
+        const size_t e = p;
+        p = ws(p);
+        if (p >= wgsl.size() || wgsl[p] != ')') return false;
+        *d0 = b;
+        *d1 = e;
+        *after = p + 1;
+        return true;
+    };
+    auto is_zero = [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i)
+            if (wgsl[i] != '0') return false;
+        return true;
+    };
+    std::string out;
+    out.reserve(wgsl.size() + 64);
+    size_t copied = 0;
+    for (size_t i = wgsl.find('@'); i != std::string_view::npos; i = wgsl.find('@', i)) {
+        size_t g0, g1, b0, b1, a1, a2;
+        bool hit = false;
+        if (attr(i, "@group", &g0, &g1, &a1) && attr(ws(a1), "@binding", &b0, &b1, &a2)) {
+            hit = is_zero(g0, g1);
+        } else if (attr(i, "@binding", &b0, &b1, &a1) && attr(ws(a1), "@group", &g0, &g1, &a2)) {
+            hit = is_zero(g0, g1);
+        }
+        if (!hit) {
+            ++i;
+            continue;
+        }
+        uint64_t n = 0;
+        for (size_t k = b0; k < b1; ++k) n = n * 10 + static_cast<uint64_t>(wgsl[k] - '0');
+        out.append(wgsl.substr(copied, b0 - copied));
+        out += std::to_string(n + shift);
+        copied = b1;
+        i = a2;
+    }
+    out.append(wgsl.substr(copied));
+    return out;
+}
+
 // ---- WGSL scanning (render_state_packets.js) ----
 
 // stripWgslComments: `//` line and nestable `/* */` block comments are removed (newlines kept).

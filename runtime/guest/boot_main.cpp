@@ -79,6 +79,8 @@
 //   --overlay            (with --window) start with the on-screen stats overlay on (F3 toggles it, rebindable [hotkeys] overlay; gpu/native_exec/overlay_model.h)
 //   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; Ctrl+F7 mip, Ctrl+F8 layer, Ctrl+F9/F10 target, rebindable in keymap.ini [hotkeys]; gpu/native_exec/show_target_model.h)
 //   --window-script <script>  (with --window) timed resize / minimize / restore / fullscreen / probe actions (gpu/native_exec/window_script.h)
+//   --no-fragment-binding-shift  (with --window / --live-executor) keep the fragment @group(0) numbering of a
+//                        pack translated before #1868 instead of renumbering those stages from @binding(128)
 //   --live-executor [--window-size WxH]  the same live path as --window (LivePump + native executor, the guest's GPU stream,
 //                        --live-digest / --screenshot-at / --gpu-validation / gpu_time / --gpu-capture / --host-input), but
 //                        presenting into the executor's offscreen swapchain texture (same format, size and blit): no window.
@@ -300,6 +302,9 @@ struct Options {
     bool usage_snapshots = false;   // --usage-snapshots / --no-usage-snapshots: usage-scope snapshots (ExecutorOptions::usage_snapshots, off by default)
     bool gpu_error_scopes = false;  // --gpu-error-scopes: attribute device errors (phase, present, shader hashes) in the report
     bool live_executor = false;     // --live-executor: --window's live path into the offscreen swapchain (no window)
+    // --no-fragment-binding-shift: keep a pre-#1868 pack's fragment @group(0) numbering (see
+    // gpu::shift_legacy_fragment_bindings); by default the live executor renumbers those stages.
+    bool fragment_binding_shift = true;
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     std::string show_target;        // --show-target <selector>
     playgta6::gpu::native_exec::ShaderQuarantine quarantine;  // --skip-shader / --skip-shader-file / repo list
@@ -479,6 +484,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.window = true;
         } else if (a == "--live-executor") {
             o.live_executor = true;
+        } else if (a == "--no-fragment-binding-shift") {
+            o.fragment_binding_shift = false;
         } else if (a == "--gpu-validation") {
             o.gpu_validation = true;
         } else if (a == "--gpu-error-scopes") {
@@ -2148,7 +2155,17 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "[harness] %s: %s\n", sidecar.c_str(), error.c_str());
                     return kExitUsage;
                 }
-                std::fprintf(stderr, "[harness] stage reflection %s: %zu stage(s)\n", sidecar.c_str(), reflection->size());
+                // The native executor renumbers pack shaders on request (pack_key_code(key, shift)):
+                // fragment stages of a pack numbered before #1868 move to @binding(128+) so their
+                // bindings never collide with the vertex stage's in the joined layout.
+                // Only with that executor attached (--window / --live-executor); a capture replayed in
+                // the browser worker keeps the pack's numbering (as does --no-fragment-binding-shift).
+                const size_t shifted =
+                    (g_options.window || g_options.live_executor) && g_options.fragment_binding_shift
+                        ? gpu::shift_legacy_fragment_bindings(reflection.get())
+                        : 0;
+                std::fprintf(stderr, "[harness] stage reflection %s: %zu stage(s), %zu legacy fragment stage(s) renumbered\n",
+                             sidecar.c_str(), reflection->size(), shifted);
                 uint64_t reflection_bytes = uint64_t{reflection->bucket_count()} * 8;
                 for (const auto& kv : *reflection) {
                     reflection_bytes += 24 + sizeof(gpu::StageReflection) +

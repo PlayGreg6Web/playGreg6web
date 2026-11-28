@@ -5232,8 +5232,17 @@ uint32_t Device::module_locked(uint64_t key, GpuShaderStage stage, const std::st
     return id;
 }
 
+uint32_t Device::pack_binding_shift(uint64_t key) const {
+    const StageReflectionIndex* refl = options_.stage_reflection.get();
+    if (refl == nullptr) {
+        return 0;
+    }
+    const auto it = refl->find(key);
+    return it != refl->end() ? it->second.group0_binding_shift : 0;
+}
+
 uint32_t Device::pack_module_locked(uint64_t key, GpuShaderStage stage) {
-    return module_locked(key, stage, pack_key_code(key));
+    return module_locked(key, stage, pack_key_code(key, pack_binding_shift(key)));
 }
 
 bool Device::prewarm_pack_modules(uint32_t kind, uint64_t key0, uint64_t key1) {
@@ -5263,6 +5272,23 @@ bridge::PrewarmPipelineResult Device::prewarm_pipeline(uint32_t task_id, uint32_
     if (!options_.shader_pack || !decode_prewarm_pipeline_desc(detail.data(), detail.size(), &desc) ||
         desc.kind != kind || desc.pack_key0 != key0 || desc.pack_key1 != key1) {
         return Result::Failed;
+    }
+    if (kind != kPrewarmKindCompute && key1 != 0 && pack_binding_shift(key1) != 0 && desc.has_layout) {
+        // A warm list recorded before the fragment stage was renumbered holds a layout for the old
+        // numbers: leave that pipeline to the title's own (reflected) request.
+        const StageReflection& ps = options_.stage_reflection->at(key1);
+        for (const ReflectedBinding& b : ps.bindings) {
+            if (b.group != 0) {
+                continue;
+            }
+            const bool listed =
+                !desc.layout.groups.empty() &&
+                std::any_of(desc.layout.groups[0].bindings.begin(), desc.layout.groups[0].bindings.end(),
+                            [&](const bridge::LayoutBinding& lb) { return lb.entry.binding == b.binding; });
+            if (!listed) {
+                return Result::Failed;
+            }
+        }
     }
     if (!prewarm_pack_modules(kind, key0, key1)) {
         return Result::Failed;
@@ -5532,7 +5558,8 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
         register_shader_module(stage_identity, module_for(ms_key, GpuShaderStage::Compute, pack_key_code(ms_key)));
         register_shader_module(draw_vs, module_for(draw_vs, GpuShaderStage::Vertex, bridge::mesh_draw_vertex_wgsl(output)));
         if (ps_id != 0) {
-            register_shader_module(ps_id, module_for(ps_key, GpuShaderStage::Fragment, pack_key_code(ps_key)));
+            register_shader_module(ps_id, module_for(ps_key, GpuShaderStage::Fragment,
+                                                     pack_key_code(ps_key, pack_binding_shift(ps_key))));
         }
         if (pack_layouts_.insert({stage_identity, 0}).second) {
             bridge_->register_pipeline_layout(stage_identity, 0, std::move(stage_layout));

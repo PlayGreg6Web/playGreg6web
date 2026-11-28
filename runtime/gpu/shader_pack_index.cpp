@@ -136,6 +136,15 @@ std::string pack_key_code(uint64_t key) {
     return b;
 }
 
+std::string pack_key_code(uint64_t key, uint32_t group0_binding_shift) {
+    if (group0_binding_shift == 0) {
+        return pack_key_code(key);
+    }
+    char b[80];
+    std::snprintf(b, sizeof(b), "wgpk:0x%016" PRIx64 ";group0_binding_shift=%u", key, group0_binding_shift);
+    return b;
+}
+
 PackModuleTable::PackModuleTable(const ShaderPackIndex& pack) {
     std::vector<uint64_t> keys;
     keys.reserve(pack.size());

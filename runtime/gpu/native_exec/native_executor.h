@@ -229,6 +229,7 @@ struct ExecutorStats {
     uint64_t shader_pack_hits = 0;
     uint64_t shader_code_rereads = 0;  // WGSL texts re-read from the pack after being dropped (rescan of a dropped shader)
     uint64_t shader_pack_misses = 0;  // a hash-only shader the pack does not hold (compiled as text: invalid)
+    uint64_t shader_binding_shifted = 0;  // pack shaders requested with renumbered @group(0) bindings (legacy fragments)
     // Pack shaders materialized on first pipeline use (on the executor thread or a shader worker): the
     // module compile (WGSL parse + resolve) and the memoized text scans (entry point, @group(0) bindings).
     // shader_materialize_* is the time spent on the executor (queue) thread only.
