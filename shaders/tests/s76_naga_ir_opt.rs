@@ -1227,7 +1227,9 @@ fn ir_opt_stats_helpers_merge_and_zero_check() {
 
     let b = IrOptStats {
         bitcasts_cancelled: 3,
+        casts_folded: 12,
         constants_folded: 2,
+        math_ops_folded: 13,
         identities_simplified: 5,
         strength_reductions: 10,
         vector_extracts_folded: 11,
@@ -1239,7 +1241,7 @@ fn ir_opt_stats_helpers_merge_and_zero_check() {
         dead_emits_trimmed: 4,
     };
     assert!(!b.is_zero());
-    assert_eq!(b.total_changes(), 66);
+    assert_eq!(b.total_changes(), 91);
     a.merge_from(b);
     assert_eq!(a, b);
 }

@@ -72,8 +72,12 @@ const MAX_OPT_PASSES: usize = 8;
 pub struct IrOptStats {
     /// Identity (`bitcast<T>(x) -> x`) and round-trip (`bitcast<T>(bitcast<U>(x)) -> x`) casts cancelled.
     pub bitcasts_cancelled: usize,
-    /// Pure constant expressions folded (`Binary`, `Unary`, `Select`, `As`).
+    /// Redundant identity numeric casts (`T(x) -> x`) and bit-exact literal/splat `As` conversions folded.
+    pub casts_folded: usize,
+    /// Pure constant expressions folded (`Binary`, `Unary`, `Select`, bitcast `As`).
     pub constants_folded: usize,
+    /// Bit-exact `Expression::Math` literal constant folds and algebraic/idempotent identities folded.
+    pub math_ops_folded: usize,
     /// Safe integer/boolean algebraic identities simplified (`x + 0`, `x * 1`, `x * 0`, `x / 1`, `x % 1`, `x & 0`, `x | 0`, `x | ~0`, `x ^ 0`, `x & ~0`, `x << 0`, `x >> 0`, `x ^ x`, `x - x`, `x & x`, `x | x`, `select(a, a, c)`, `select(r, a, !c)`, `!!b`, `~~x`, `--x`, `!(a == b)`, nested shifts).
     pub identities_simplified: usize,
     /// Unsigned integer power-of-two strength reductions (`x / 2^k -> x >> k`, `x % 2^k -> x & (2^k - 1)`, `x * 2^k -> x << k`).
@@ -98,7 +102,9 @@ impl IrOptStats {
     /// Total optimization actions applied across all categories.
     pub const fn total_changes(&self) -> usize {
         self.bitcasts_cancelled
+            + self.casts_folded
             + self.constants_folded
+            + self.math_ops_folded
             + self.identities_simplified
             + self.strength_reductions
             + self.vector_extracts_folded
@@ -113,7 +119,9 @@ impl IrOptStats {
     /// `true` when no optimization fired.
     pub const fn is_zero(&self) -> bool {
         self.bitcasts_cancelled == 0
+            && self.casts_folded == 0
             && self.constants_folded == 0
+            && self.math_ops_folded == 0
             && self.identities_simplified == 0
             && self.strength_reductions == 0
             && self.vector_extracts_folded == 0
@@ -128,7 +136,9 @@ impl IrOptStats {
     /// Accumulate counters from `other` into `self`.
     pub fn merge_from(&mut self, other: Self) {
         self.bitcasts_cancelled += other.bitcasts_cancelled;
+        self.casts_folded += other.casts_folded;
         self.constants_folded += other.constants_folded;
+        self.math_ops_folded += other.math_ops_folded;
         self.identities_simplified += other.identities_simplified;
         self.strength_reductions += other.strength_reductions;
         self.vector_extracts_folded += other.vector_extracts_folded;
@@ -1187,22 +1197,34 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
         return;
     }
 
-    // Track handles directly consumed by `As { kind: Float, convert: None }`, float `Binary` ops,
-    // or integer `Divide`/`Modulo` divisors so folding an expression to a bare `Literal` never
-    // creates a Tint-rejected const-eval expression (e.g., `bitcast<f32>(0x7f800000u)`,
-    // `1e38f * 10.0f`, or `10u / 0u`).
+    // Track handles directly consumed by `As { kind: Float, convert: None }`, numeric int casts,
+    // float `Binary` ops, `Divide`/`Modulo` divisors, or domain-restricted `Math` ops so folding
+    // an expression to a bare `Literal` never creates a Tint-rejected const-eval expression
+    // (e.g., `bitcast<f32>(0x7f800000u)`, `1e38f * 10.0f`, `10u / 0u`, `u32(-1.0)`, `sqrt(-1.0)`).
     let mut used_by_float_bitcast = vec![false; n];
     let mut used_by_float_binary = vec![false; n];
     let mut used_as_divisor = vec![false; n];
+    let mut used_by_uint_convert = vec![false; n];
+    let mut used_by_sint_convert = vec![false; n];
+    let mut used_by_unsafe_math = vec![false; n];
     for (_, expr) in func.expressions.iter() {
         match expr {
             Expression::As {
                 expr: inner,
-                kind: ScalarKind::Float,
-                convert: None,
-            } => {
-                used_by_float_bitcast[inner.index()] = true;
-            }
+                kind,
+                convert,
+            } => match (kind, convert) {
+                (ScalarKind::Float, None) => {
+                    used_by_float_bitcast[inner.index()] = true;
+                }
+                (ScalarKind::Uint, Some(4)) => {
+                    used_by_uint_convert[inner.index()] = true;
+                }
+                (ScalarKind::Sint, Some(4)) => {
+                    used_by_sint_convert[inner.index()] = true;
+                }
+                _ => {}
+            },
             Expression::Binary {
                 op:
                     op @ (BinaryOperator::Add
@@ -1218,6 +1240,30 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 if matches!(op, BinaryOperator::Divide | BinaryOperator::Modulo) {
                     used_as_divisor[right.index()] = true;
                 }
+            }
+            Expression::Math { fun, .. }
+                if !matches!(
+                    fun,
+                    MathFunction::Abs
+                        | MathFunction::Floor
+                        | MathFunction::Ceil
+                        | MathFunction::Trunc
+                        | MathFunction::Saturate
+                        | MathFunction::Min
+                        | MathFunction::Max
+                        | MathFunction::Clamp
+                        | MathFunction::Fma
+                        | MathFunction::CountOneBits
+                        | MathFunction::CountLeadingZeros
+                        | MathFunction::CountTrailingZeros
+                        | MathFunction::FirstLeadingBit
+                        | MathFunction::FirstTrailingBit
+                        | MathFunction::ReverseBits
+                ) =>
+            {
+                visit_expr_children(expr, |c| {
+                    used_by_unsafe_math[c.index()] = true;
+                });
             }
             _ => {}
         }
@@ -1266,7 +1312,25 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
             {
                 return false;
             }
-            if used_as_divisor[idx] && matches!(lit, Literal::U32(0) | Literal::I32(0 | -1)) {
+            if used_as_divisor[idx]
+                && (matches!(lit, Literal::U32(0) | Literal::I32(0 | -1))
+                    || matches!(lit, Literal::F32(f) if f == 0.0))
+            {
+                return false;
+            }
+            if used_by_uint_convert[idx]
+                && let Literal::F32(f) = lit
+                && !(f.is_finite() && (0.0_f32..=4294967040.0_f32).contains(&f))
+            {
+                return false;
+            }
+            if used_by_sint_convert[idx]
+                && let Literal::F32(f) = lit
+                && !(f.is_finite() && (-2147483648.0_f32..=2147483520.0_f32).contains(&f))
+            {
+                return false;
+            }
+            if used_by_unsafe_math[idx] && matches!(lit, Literal::F32(_)) {
                 return false;
             }
             true
@@ -1289,7 +1353,7 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
         };
 
         let rewrite = match &func.expressions[h] {
-            // 1. Identity & round-trip `As` / bitcast cancellation + literal bitcast folding.
+            // 1. Identity & round-trip `As` / bitcast cancellation + bit-exact literal/splat `As` folding.
             Expression::As {
                 expr: inner,
                 kind,
@@ -1300,47 +1364,69 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 let convert = *convert;
                 let inner_shape = resolved[inner.index()].as_ref().and_then(value_shape);
 
-                // (a) Identity bitcast (`bitcast<T>(x)` where `x: T`) or identity numeric cast
-                //     (`T(x)` where `x: T` with matching scalar kind and width).
-                let is_identity = match (inner_shape, convert) {
-                    (Some((_, s)), None) => s.kind == kind,
-                    (Some((_, s)), Some(w)) => s.kind == kind && s.width == w,
-                    _ => false,
-                };
-
-                if is_identity && safe_to_redirect_to(inner) {
-                    Some(Rewrite::Redirect(inner, RewriteKind::Bitcast))
-                } else if convert.is_none() {
-                    // (b) Round-trip bitcast: `bitcast<T>(bitcast<U>(orig))` where
-                    //     `type(orig) == T` and bitwidths match.
-                    if let Expression::As {
-                        expr: orig,
-                        kind: _mid_kind,
-                        convert: None,
-                    } = func.expressions[inner]
+                match (inner_shape, convert) {
+                    // (a) Identity bitcast (`bitcast<T>(x)` where `x: T`).
+                    (Some((_, s)), None) if s.kind == kind => safe_to_redirect_to(inner)
+                        .then_some(Rewrite::Redirect(inner, RewriteKind::Bitcast)),
+                    // (b) Redundant identity numeric conversion (`T(x)` where `x` already has
+                    //     exact matching scalar or vector `(kind, width)`).
+                    (Some((_, s)), Some(w))
+                        if s.kind == kind
+                            && s.width == w
+                            && cur_ty.is_some()
+                            && cur_ty.as_ref() == resolved[inner.index()].as_ref() =>
                     {
-                        let orig_shape = resolved[orig.index()].as_ref().and_then(value_shape);
-                        match (orig_shape, inner_shape) {
-                            (Some((orig_vec, orig_s)), Some((mid_vec, mid_s)))
-                                if orig_vec == mid_vec
-                                    && orig_s.kind == kind
-                                    && orig_s.width == mid_s.width
-                                    && safe_to_redirect_to(orig) =>
-                            {
-                                Some(Rewrite::Redirect(orig, RewriteKind::Bitcast))
-                            }
-                            _ => None,
-                        }
-                    } else if let Expression::Literal(lit) = func.expressions[inner] {
-                        // (c) Constant scalar bitcast folding (keeping Tint float literal safety).
-                        fold_literal_bitcast(lit, kind)
-                            .filter(|&out_lit| safe_to_become_literal(out_lit))
-                            .map(|out_lit| Rewrite::Literal(out_lit, RewriteKind::ConstFold))
-                    } else {
-                        None
+                        safe_to_redirect_to(inner)
+                            .then_some(Rewrite::Redirect(inner, RewriteKind::CastFold))
                     }
-                } else {
-                    None
+                    // (c) Bitcast round-trip cancellation & literal bitcast folding (`convert: None`).
+                    (_, None) => {
+                        if let Expression::As {
+                            expr: orig,
+                            kind: _mid_kind,
+                            convert: None,
+                        } = func.expressions[inner]
+                        {
+                            let orig_shape = resolved[orig.index()].as_ref().and_then(value_shape);
+                            match (orig_shape, inner_shape) {
+                                (Some((orig_vec, orig_s)), Some((mid_vec, mid_s)))
+                                    if orig_vec == mid_vec
+                                        && orig_s.kind == kind
+                                        && orig_s.width == mid_s.width
+                                        && safe_to_redirect_to(orig) =>
+                                {
+                                    Some(Rewrite::Redirect(orig, RewriteKind::Bitcast))
+                                }
+                                _ => None,
+                            }
+                        } else if let Expression::Literal(lit) = func.expressions[inner] {
+                            fold_literal_bitcast(lit, kind)
+                                .filter(|&out_lit| safe_to_become_literal(out_lit))
+                                .map(|out_lit| Rewrite::Literal(out_lit, RewriteKind::ConstFold))
+                        } else {
+                            None
+                        }
+                    }
+                    // (d) Bit-exact literal & constant `Splat(Literal)` numeric conversion folding.
+                    (_, Some(width)) => match func.expressions[inner] {
+                        Expression::Literal(lit) => fold_literal_as_convert(lit, kind, width)
+                            .filter(|&out_lit| safe_to_become_literal(out_lit))
+                            .map(|out_lit| Rewrite::Literal(out_lit, RewriteKind::CastFold)),
+                        Expression::Splat { size, value } => {
+                            if let Expression::Literal(lit) = func.expressions[value] {
+                                fold_literal_as_convert(lit, kind, width)
+                                    .filter(|&out_lit| safe_to_become_literal(out_lit))
+                                    .map(|out_lit| Rewrite::SplatLiteral {
+                                        size,
+                                        lit: out_lit,
+                                        kind: RewriteKind::CastFold,
+                                    })
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    },
                 }
             }
 
@@ -1696,13 +1782,36 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
                 }
             }
 
+            // 7. Bit-exact `Expression::Math` constant folding and algebraic/idempotent identities.
+            Expression::Math {
+                fun,
+                arg,
+                arg1,
+                arg2,
+                arg3,
+            } => simplify_math_expr(
+                *fun,
+                *arg,
+                *arg1,
+                *arg2,
+                *arg3,
+                cur_ty.as_ref(),
+                &resolved,
+                &pure,
+                func,
+                &safe_to_become_literal,
+                &safe_to_redirect_to,
+            ),
+
             _ => None,
         };
 
         if let Some(rew) = rewrite {
             let record_stat = |kind: RewriteKind, stats: &mut IrOptStats| match kind {
                 RewriteKind::Bitcast => stats.bitcasts_cancelled += 1,
+                RewriteKind::CastFold => stats.casts_folded += 1,
                 RewriteKind::ConstFold => stats.constants_folded += 1,
+                RewriteKind::MathFold => stats.math_ops_folded += 1,
                 RewriteKind::Identity => stats.identities_simplified += 1,
                 RewriteKind::StrengthReduce => stats.strength_reductions += 1,
                 RewriteKind::VectorExtract => stats.vector_extracts_folded += 1,
@@ -1877,7 +1986,9 @@ fn simplify_expressions(ctx: &ModuleContext<'_>, func: &mut Function, stats: &mu
 
 enum RewriteKind {
     Bitcast,
+    CastFold,
     ConstFold,
+    MathFold,
     Identity,
     StrengthReduce,
     VectorExtract,
@@ -2098,6 +2209,548 @@ fn fold_literal_bitcast(lit: Literal, target_kind: ScalarKind) -> Option<Literal
             let f = f32::from_bits(i as u32);
             is_safe_wgsl_f32_literal(f).then_some(Literal::F32(f))
         }
+        _ => None,
+    }
+}
+
+/// Bit-exact WGSL numeric `Expression::As { convert: Some(target_width) }` conversion folding
+/// on scalar literals:
+/// * `i32 <-> u32`: exact two's-complement bit-preserving wrap (`v as u32` / `v as i32`).
+/// * `bool -> u32/i32/f32`: `false -> 0`, `true -> 1`.
+/// * `u32/i32 -> bool`: `!= 0`.
+/// * `u32/i32 -> f32`: IEEE-754 round-to-nearest-ties-to-even (`val as f32`).
+/// * Finite `f32 -> u32/i32`: strictly when finite and within exact representable integer range
+///   (`0.0..=4294967040.0` for `u32`, `-2147483648.0..=2147483520.0` for `i32`); NEVER folds
+///   `NaN`, `±Inf`, negative-to-`u32`, or out-of-range floats.
+fn fold_literal_as_convert(
+    lit: Literal,
+    target_kind: ScalarKind,
+    target_width: u8,
+) -> Option<Literal> {
+    const MAX_EXACT_U32_F32: f32 = 4294967040.0_f32; // 0xFFFF_FF00u32 as f32 (largest f32 < 2^32)
+    const MIN_EXACT_I32_F32: f32 = -2147483648.0_f32; // i32::MIN as f32 (-2^31)
+    const MAX_EXACT_I32_F32: f32 = 2147483520.0_f32; // 0x7FFF_FF80i32 as f32 (largest f32 < 2^31)
+
+    match (lit, target_kind, target_width) {
+        (Literal::I32(v), ScalarKind::Uint, 4) => Some(Literal::U32(v as u32)),
+        (Literal::U32(v), ScalarKind::Sint, 4) => Some(Literal::I32(v as i32)),
+        (Literal::Bool(b), ScalarKind::Uint, 4) => Some(Literal::U32(u32::from(b))),
+        (Literal::Bool(b), ScalarKind::Sint, 4) => Some(Literal::I32(i32::from(b))),
+        (Literal::Bool(b), ScalarKind::Float, 4) => Some(Literal::F32(if b { 1.0 } else { 0.0 })),
+        (Literal::U32(v), ScalarKind::Bool, w) if w == Scalar::BOOL.width => {
+            Some(Literal::Bool(v != 0))
+        }
+        (Literal::I32(v), ScalarKind::Bool, w) if w == Scalar::BOOL.width => {
+            Some(Literal::Bool(v != 0))
+        }
+        (Literal::U32(v), ScalarKind::Float, 4) => {
+            let f = v as f32;
+            is_safe_wgsl_f32_literal(f).then_some(Literal::F32(f))
+        }
+        (Literal::I32(v), ScalarKind::Float, 4) => {
+            let f = v as f32;
+            is_safe_wgsl_f32_literal(f).then_some(Literal::F32(f))
+        }
+        (Literal::F32(v), ScalarKind::Uint, 4) => {
+            if v.is_finite() && (0.0_f32..=MAX_EXACT_U32_F32).contains(&v) {
+                Some(Literal::U32(v as u32))
+            } else {
+                None
+            }
+        }
+        (Literal::F32(v), ScalarKind::Sint, 4) => {
+            if v.is_finite() && (MIN_EXACT_I32_F32..=MAX_EXACT_I32_F32).contains(&v) {
+                Some(Literal::I32(v as i32))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn is_finite_non_neg_zero(f: f32) -> bool {
+    f.is_finite() && f.to_bits() != 0x8000_0000
+}
+
+#[inline]
+fn extract_uniform_splat_literal(
+    exprs: &Arena<Expression>,
+    h: Handle<Expression>,
+) -> Option<(VectorSize, Literal)> {
+    if let Expression::Splat { size, value } = exprs[h]
+        && let Expression::Literal(lit) = exprs[value]
+    {
+        Some((size, lit))
+    } else {
+        None
+    }
+}
+
+/// Bit-exact WGSL constant folding for scalar `Expression::Math` literals (`u32`, `i32`, and
+/// strictly finite non-NaN `f32`).
+fn fold_literal_math(
+    fun: MathFunction,
+    a0: Literal,
+    a1: Option<Literal>,
+    a2: Option<Literal>,
+    a3: Option<Literal>,
+) -> Option<Literal> {
+    match (fun, a0, a1, a2, a3) {
+        // ---- Unsigned integer (`u32`) ----
+        (MathFunction::Abs, Literal::U32(x), None, None, None) => Some(Literal::U32(x)),
+        (MathFunction::Min, Literal::U32(a), Some(Literal::U32(b)), None, None) => {
+            Some(Literal::U32(a.min(b)))
+        }
+        (MathFunction::Max, Literal::U32(a), Some(Literal::U32(b)), None, None) => {
+            Some(Literal::U32(a.max(b)))
+        }
+        (
+            MathFunction::Clamp,
+            Literal::U32(x),
+            Some(Literal::U32(lo)),
+            Some(Literal::U32(hi)),
+            None,
+        ) if lo <= hi => Some(Literal::U32(x.clamp(lo, hi))),
+        (MathFunction::CountOneBits, Literal::U32(x), None, None, None) => {
+            Some(Literal::U32(x.count_ones()))
+        }
+        (MathFunction::CountLeadingZeros, Literal::U32(x), None, None, None) => {
+            Some(Literal::U32(x.leading_zeros()))
+        }
+        (MathFunction::CountTrailingZeros, Literal::U32(x), None, None, None) => {
+            Some(Literal::U32(x.trailing_zeros()))
+        }
+        (MathFunction::ReverseBits, Literal::U32(x), None, None, None) => {
+            Some(Literal::U32(x.reverse_bits()))
+        }
+        (MathFunction::FirstLeadingBit, Literal::U32(x), None, None, None) => {
+            let out = if x == 0 {
+                u32::MAX
+            } else {
+                31 - x.leading_zeros()
+            };
+            Some(Literal::U32(out))
+        }
+        (MathFunction::FirstTrailingBit, Literal::U32(x), None, None, None) => {
+            let out = if x == 0 {
+                u32::MAX
+            } else {
+                x.trailing_zeros()
+            };
+            Some(Literal::U32(out))
+        }
+        (
+            MathFunction::ExtractBits,
+            Literal::U32(e),
+            Some(Literal::U32(offset)),
+            Some(Literal::U32(count)),
+            None,
+        ) if offset <= 32 && count <= 32 && offset.checked_add(count).is_some_and(|s| s <= 32) => {
+            let out = if count == 0 {
+                0u32
+            } else if count == 32 {
+                e
+            } else {
+                (e >> offset) & ((1u32 << count) - 1)
+            };
+            Some(Literal::U32(out))
+        }
+        (
+            MathFunction::InsertBits,
+            Literal::U32(e),
+            Some(Literal::U32(newbits)),
+            Some(Literal::U32(offset)),
+            Some(Literal::U32(count)),
+        ) if offset <= 32 && count <= 32 && offset.checked_add(count).is_some_and(|s| s <= 32) => {
+            let out = if count == 0 {
+                e
+            } else if count == 32 {
+                newbits
+            } else {
+                let mask = ((1u32 << count) - 1) << offset;
+                (e & !mask) | ((newbits << offset) & mask)
+            };
+            Some(Literal::U32(out))
+        }
+
+        // ---- Signed integer (`i32`) ----
+        // WGSL spec: `abs(i32::MIN)` wraps to `i32::MIN`.
+        (MathFunction::Abs, Literal::I32(x), None, None, None) => {
+            Some(Literal::I32(x.wrapping_abs()))
+        }
+        (MathFunction::Min, Literal::I32(a), Some(Literal::I32(b)), None, None) => {
+            Some(Literal::I32(a.min(b)))
+        }
+        (MathFunction::Max, Literal::I32(a), Some(Literal::I32(b)), None, None) => {
+            Some(Literal::I32(a.max(b)))
+        }
+        (
+            MathFunction::Clamp,
+            Literal::I32(x),
+            Some(Literal::I32(lo)),
+            Some(Literal::I32(hi)),
+            None,
+        ) if lo <= hi => Some(Literal::I32(x.clamp(lo, hi))),
+        (MathFunction::CountOneBits, Literal::I32(x), None, None, None) => {
+            Some(Literal::I32(x.count_ones() as i32))
+        }
+        (MathFunction::CountLeadingZeros, Literal::I32(x), None, None, None) => {
+            Some(Literal::I32(x.leading_zeros() as i32))
+        }
+        (MathFunction::CountTrailingZeros, Literal::I32(x), None, None, None) => {
+            Some(Literal::I32(x.trailing_zeros() as i32))
+        }
+        (MathFunction::ReverseBits, Literal::I32(x), None, None, None) => {
+            Some(Literal::I32(x.reverse_bits()))
+        }
+        (MathFunction::FirstLeadingBit, Literal::I32(x), None, None, None) => {
+            let out = if x == 0 || x == -1 {
+                -1i32
+            } else {
+                let v = if x < 0 { !x } else { x };
+                (31 - v.leading_zeros()) as i32
+            };
+            Some(Literal::I32(out))
+        }
+        (MathFunction::FirstTrailingBit, Literal::I32(x), None, None, None) => {
+            let out = if x == 0 {
+                -1i32
+            } else {
+                x.trailing_zeros() as i32
+            };
+            Some(Literal::I32(out))
+        }
+        (
+            MathFunction::ExtractBits,
+            Literal::I32(e),
+            Some(Literal::U32(offset)),
+            Some(Literal::U32(count)),
+            None,
+        ) if offset <= 32 && count <= 32 && offset.checked_add(count).is_some_and(|s| s <= 32) => {
+            let out = if count == 0 {
+                0i32
+            } else if count == 32 {
+                e
+            } else {
+                let shl = 32 - offset - count;
+                let shr = 32 - count;
+                e.wrapping_shl(shl) >> shr
+            };
+            Some(Literal::I32(out))
+        }
+        (
+            MathFunction::InsertBits,
+            Literal::I32(e),
+            Some(Literal::I32(newbits)),
+            Some(Literal::U32(offset)),
+            Some(Literal::U32(count)),
+        ) if offset <= 32 && count <= 32 && offset.checked_add(count).is_some_and(|s| s <= 32) => {
+            let out = if count == 0 {
+                e
+            } else if count == 32 {
+                newbits
+            } else {
+                let mask = ((1u32 << count) - 1) << offset;
+                (((e as u32) & !mask) | (((newbits as u32) << offset) & mask)) as i32
+            };
+            Some(Literal::I32(out))
+        }
+
+        // ---- Finite non-NaN `f32` ----
+        // `abs(-0.0)` is unambiguously `+0.0`; all other float folds reject `-0.0` inputs and
+        // require a safe finite WGSL literal result (`is_safe_wgsl_f32_literal`).
+        (MathFunction::Abs, Literal::F32(a), None, None, None) if a.is_finite() => {
+            let out = a.abs();
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (MathFunction::Floor, Literal::F32(a), None, None, None) if is_finite_non_neg_zero(a) => {
+            let out = a.floor();
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (MathFunction::Ceil, Literal::F32(a), None, None, None) if is_finite_non_neg_zero(a) => {
+            let out = a.ceil();
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (MathFunction::Trunc, Literal::F32(a), None, None, None) if is_finite_non_neg_zero(a) => {
+            let out = a.trunc();
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (MathFunction::Saturate, Literal::F32(a), None, None, None)
+            if is_finite_non_neg_zero(a) =>
+        {
+            let out = a.clamp(0.0_f32, 1.0_f32);
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (MathFunction::Min, Literal::F32(a), Some(Literal::F32(b)), None, None)
+            if is_finite_non_neg_zero(a) && is_finite_non_neg_zero(b) =>
+        {
+            let out = a.min(b);
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (MathFunction::Max, Literal::F32(a), Some(Literal::F32(b)), None, None)
+            if is_finite_non_neg_zero(a) && is_finite_non_neg_zero(b) =>
+        {
+            let out = a.max(b);
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (
+            MathFunction::Clamp,
+            Literal::F32(x),
+            Some(Literal::F32(lo)),
+            Some(Literal::F32(hi)),
+            None,
+        ) if is_finite_non_neg_zero(x)
+            && is_finite_non_neg_zero(lo)
+            && is_finite_non_neg_zero(hi)
+            && lo <= hi =>
+        {
+            let out = x.clamp(lo, hi);
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        (
+            MathFunction::Fma,
+            Literal::F32(a),
+            Some(Literal::F32(b)),
+            Some(Literal::F32(c)),
+            None,
+        ) if is_finite_non_neg_zero(a)
+            && is_finite_non_neg_zero(b)
+            && is_finite_non_neg_zero(c) =>
+        {
+            let out = a.mul_add(b, c);
+            is_safe_wgsl_f32_literal(out).then_some(Literal::F32(out))
+        }
+        _ => None,
+    }
+}
+
+/// Bit-exact `Expression::Math` constant folding and algebraic/idempotent simplification.
+///
+/// Negative safety guards (strictly NEVER folded):
+/// * `fma(a, 0.0, c)` (breaks on `a = Inf/NaN` or `c = -0.0`)
+/// * `mix(x, x, t)` (breaks on `t = NaN`)
+/// * non-constant float `min(f, f)` / `max(f, f)` / `clamp(f, c, c)`
+/// * `clamp` with `low > high`, `extractBits`/`insertBits` with `offset + count > 32`
+/// * any discarding identity (`min(x, 0u)`, `max(x, u32::MAX)`, `clamp(x, c, c)`) when `x` is impure
+#[allow(clippy::too_many_arguments)]
+fn simplify_math_expr(
+    fun: MathFunction,
+    arg: Handle<Expression>,
+    arg1: Option<Handle<Expression>>,
+    arg2: Option<Handle<Expression>>,
+    arg3: Option<Handle<Expression>>,
+    result_ty: Option<&TypeInner>,
+    resolved: &[Option<TypeInner>],
+    pure: &[bool],
+    func: &Function,
+    safe_to_become_literal: &impl Fn(Literal) -> bool,
+    safe_to_redirect_to: &impl Fn(Handle<Expression>) -> bool,
+) -> Option<Rewrite> {
+    let exprs = &func.expressions;
+
+    // 1. Scalar literal constant folding (all present args are bare `Expression::Literal`).
+    if let Expression::Literal(l0) = exprs[arg] {
+        let l1 = match arg1 {
+            None => Some(None),
+            Some(h1) => match exprs[h1] {
+                Expression::Literal(l) => Some(Some(l)),
+                _ => None,
+            },
+        };
+        let l2 = match arg2 {
+            None => Some(None),
+            Some(h2) => match exprs[h2] {
+                Expression::Literal(l) => Some(Some(l)),
+                _ => None,
+            },
+        };
+        let l3 = match arg3 {
+            None => Some(None),
+            Some(h3) => match exprs[h3] {
+                Expression::Literal(l) => Some(Some(l)),
+                _ => None,
+            },
+        };
+        if let (Some(l1), Some(l2), Some(l3)) = (l1, l2, l3)
+            && let Some(out_lit) = fold_literal_math(fun, l0, l1, l2, l3)
+            && safe_to_become_literal(out_lit)
+        {
+            return Some(Rewrite::Literal(out_lit, RewriteKind::MathFold));
+        }
+    }
+
+    // 2. Uniform `Splat(Literal)` constant folding for uniform-shape 1/2/3-arg math ops.
+    if !matches!(fun, MathFunction::ExtractBits | MathFunction::InsertBits)
+        && arg3.is_none()
+        && let Some((size, l0)) = extract_uniform_splat_literal(exprs, arg)
+    {
+        let l1 = match arg1 {
+            None => Some(None),
+            Some(h1) => extract_uniform_splat_literal(exprs, h1)
+                .filter(|(s, _)| *s == size)
+                .map(|(_, l)| Some(l)),
+        };
+        let l2 = match arg2 {
+            None => Some(None),
+            Some(h2) => extract_uniform_splat_literal(exprs, h2)
+                .filter(|(s, _)| *s == size)
+                .map(|(_, l)| Some(l)),
+        };
+        if let (Some(l1), Some(l2)) = (l1, l2)
+            && let Some(out_lit) = fold_literal_math(fun, l0, l1, l2, None)
+            && safe_to_become_literal(out_lit)
+        {
+            return Some(Rewrite::SplatLiteral {
+                size,
+                lit: out_lit,
+                kind: RewriteKind::MathFold,
+            });
+        }
+    }
+
+    let res_ty = result_ty?;
+    let (res_vec, res_scalar) = value_shape(res_ty)?;
+
+    // 3. Exact algebraic & idempotent identities.
+    match (fun, arg1, arg2, arg3) {
+        // `abs(u32_x) -> u32_x` (scalar or vector `u32`).
+        (MathFunction::Abs, None, None, None)
+            if res_scalar == Scalar::U32
+                && resolved[arg.index()].as_ref() == Some(res_ty)
+                && safe_to_redirect_to(arg) =>
+        {
+            Some(Rewrite::Redirect(arg, RewriteKind::MathFold))
+        }
+
+        // Idempotent unary math identities (100% bit-exact for ALL IEEE-754 floats including
+        // `NaN`, `±0.0`, `±Inf`, and for signed `i32` including `i32::MIN`):
+        // `abs(abs(x)) -> abs(x)`, `saturate(saturate(x)) -> saturate(x)`,
+        // `floor(floor(x)) -> floor(x)`, `ceil(ceil(x)) -> ceil(x)`, `trunc(trunc(x)) -> trunc(x)`.
+        (
+            MathFunction::Abs
+            | MathFunction::Saturate
+            | MathFunction::Floor
+            | MathFunction::Ceil
+            | MathFunction::Trunc,
+            None,
+            None,
+            None,
+        ) if matches!(exprs[arg], Expression::Math { fun: inner_fun, .. } if inner_fun == fun)
+            && resolved[arg.index()].as_ref() == Some(res_ty)
+            && safe_to_redirect_to(arg) =>
+        {
+            Some(Rewrite::Redirect(arg, RewriteKind::MathFold))
+        }
+
+        // Strictly integer (`u32` / `i32`) `min` identities (NEVER float!).
+        (MathFunction::Min, Some(rhs), None, None)
+            if matches!(res_scalar, Scalar::U32 | Scalar::I32) =>
+        {
+            // `min(x, x) -> x` (scalar or vector integer).
+            if arg == rhs
+                && resolved[arg.index()].as_ref() == Some(res_ty)
+                && safe_to_redirect_to(arg)
+            {
+                return Some(Rewrite::Redirect(arg, RewriteKind::MathFold));
+            }
+            // Scalar `u32` bounds identities.
+            if res_vec.is_none() && res_scalar == Scalar::U32 {
+                // `min(x, 0u) -> 0u` / `min(0u, x) -> 0u` (requires pure `x`!).
+                if (matches!(exprs[rhs], Expression::Literal(Literal::U32(0)))
+                    && pure[arg.index()])
+                    || (matches!(exprs[arg], Expression::Literal(Literal::U32(0)))
+                        && pure[rhs.index()])
+                {
+                    let out = Literal::U32(0);
+                    if safe_to_become_literal(out) {
+                        return Some(Rewrite::Literal(out, RewriteKind::MathFold));
+                    }
+                }
+                // `min(x, u32::MAX) -> x` / `min(u32::MAX, x) -> x`.
+                if matches!(exprs[rhs], Expression::Literal(Literal::U32(u32::MAX)))
+                    && resolved[arg.index()].as_ref() == Some(res_ty)
+                    && safe_to_redirect_to(arg)
+                {
+                    return Some(Rewrite::Redirect(arg, RewriteKind::MathFold));
+                }
+                if matches!(exprs[arg], Expression::Literal(Literal::U32(u32::MAX)))
+                    && resolved[rhs.index()].as_ref() == Some(res_ty)
+                    && safe_to_redirect_to(rhs)
+                {
+                    return Some(Rewrite::Redirect(rhs, RewriteKind::MathFold));
+                }
+            }
+            None
+        }
+
+        // Strictly integer (`u32` / `i32`) `max` identities (NEVER float!).
+        (MathFunction::Max, Some(rhs), None, None)
+            if matches!(res_scalar, Scalar::U32 | Scalar::I32) =>
+        {
+            // `max(x, x) -> x` (scalar or vector integer).
+            if arg == rhs
+                && resolved[arg.index()].as_ref() == Some(res_ty)
+                && safe_to_redirect_to(arg)
+            {
+                return Some(Rewrite::Redirect(arg, RewriteKind::MathFold));
+            }
+            // Scalar `u32` bounds identities.
+            if res_vec.is_none() && res_scalar == Scalar::U32 {
+                // `max(x, 0u) -> x` / `max(0u, x) -> x`.
+                if matches!(exprs[rhs], Expression::Literal(Literal::U32(0)))
+                    && resolved[arg.index()].as_ref() == Some(res_ty)
+                    && safe_to_redirect_to(arg)
+                {
+                    return Some(Rewrite::Redirect(arg, RewriteKind::MathFold));
+                }
+                if matches!(exprs[arg], Expression::Literal(Literal::U32(0)))
+                    && resolved[rhs.index()].as_ref() == Some(res_ty)
+                    && safe_to_redirect_to(rhs)
+                {
+                    return Some(Rewrite::Redirect(rhs, RewriteKind::MathFold));
+                }
+                // `max(x, u32::MAX) -> u32::MAX` / `max(u32::MAX, x) -> u32::MAX` (requires pure `x`!).
+                if (matches!(exprs[rhs], Expression::Literal(Literal::U32(u32::MAX)))
+                    && pure[arg.index()])
+                    || (matches!(exprs[arg], Expression::Literal(Literal::U32(u32::MAX)))
+                        && pure[rhs.index()])
+                {
+                    let out = Literal::U32(u32::MAX);
+                    if safe_to_become_literal(out) {
+                        return Some(Rewrite::Literal(out, RewriteKind::MathFold));
+                    }
+                }
+            }
+            None
+        }
+
+        // `clamp(x, c, c) -> c` strictly for pure scalar `u32` / `i32` with equal constant bounds.
+        (MathFunction::Clamp, Some(lo), Some(hi), None)
+            if res_vec.is_none()
+                && matches!(res_scalar, Scalar::U32 | Scalar::I32)
+                && pure[arg.index()] =>
+        {
+            match (&exprs[lo], &exprs[hi]) {
+                (&Expression::Literal(Literal::U32(a)), &Expression::Literal(Literal::U32(b)))
+                    if a == b && res_scalar == Scalar::U32 =>
+                {
+                    let out = Literal::U32(a);
+                    safe_to_become_literal(out)
+                        .then_some(Rewrite::Literal(out, RewriteKind::MathFold))
+                }
+                (&Expression::Literal(Literal::I32(a)), &Expression::Literal(Literal::I32(b)))
+                    if a == b && res_scalar == Scalar::I32 =>
+                {
+                    let out = Literal::I32(a);
+                    safe_to_become_literal(out)
+                        .then_some(Rewrite::Literal(out, RewriteKind::MathFold))
+                }
+                _ => None,
+            }
+        }
+
         _ => None,
     }
 }

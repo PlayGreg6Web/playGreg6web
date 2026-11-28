@@ -980,9 +980,11 @@ impl Rdna2WgslOutput {
             let opt = self.ir_opt;
             let _ = writeln!(
                 out,
-                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"constants_folded\": {}, \"identities_simplified\": {}, \"strength_reductions\": {}, \"vector_extracts_folded\": {}, \"dead_branches_folded\": {}, \"locals_forwarded\": {}, \"cse_eliminated\": {}, \"readonly_loads_cse\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
+                "  \"ir_opt\": {{\"bitcasts_cancelled\": {}, \"casts_folded\": {}, \"constants_folded\": {}, \"math_ops_folded\": {}, \"identities_simplified\": {}, \"strength_reductions\": {}, \"vector_extracts_folded\": {}, \"dead_branches_folded\": {}, \"locals_forwarded\": {}, \"cse_eliminated\": {}, \"readonly_loads_cse\": {}, \"dead_locals_removed\": {}, \"dead_emits_trimmed\": {}}},",
                 opt.bitcasts_cancelled,
+                opt.casts_folded,
                 opt.constants_folded,
+                opt.math_ops_folded,
                 opt.identities_simplified,
                 opt.strength_reductions,
                 opt.vector_extracts_folded,
