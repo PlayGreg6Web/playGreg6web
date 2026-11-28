@@ -17,8 +17,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
-#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,11 +32,11 @@ public:
     // Indexes [lo, hi) under `key`; an earlier range of the key is replaced. An empty range removes it.
     void add(const void* key, uintptr_t lo, uintptr_t hi);
     void remove(const void* key);
-    bool contains(const void* key) const { return entries_.count(key) != 0; }
+    bool contains(const void* key) const { return key_to_id_.count(key) != 0; }
     // The indexed range of `key` (false when it is not indexed).
     bool range_of(const void* key, uintptr_t* lo, uintptr_t* hi) const;
     void clear();
-    size_t size() const { return entries_.size(); }
+    size_t size() const { return key_to_id_.size(); }
 
     // Appends once each key whose range overlaps any page [p, p + page_bytes) of `pages` (sorted,
     // unique, page-aligned host addresses).
@@ -52,12 +50,29 @@ public:
     const std::vector<Range>& hulls() const;
 
 private:
-    std::unordered_map<const void*, Range> entries_;
-    std::multiset<Range> sorted_;  // the ranges of entries_ in order, so hulls() needs no sort
-    std::map<uintptr_t, std::vector<const void*>> by_granule_;  // granule number -> keys touching it
+    struct Entry {
+        const void* key = nullptr;
+        uintptr_t lo = 0;
+        uintptr_t hi = 0;  // live iff lo < hi
+        mutable uint64_t last_seen_gen = 0;
+    };
+    struct BucketItem {
+        uintptr_t lo = 0;
+        uintptr_t hi = 0;
+        uint32_t id = 0;
+    };
+    static constexpr uintptr_t kDirectProbeGranules = 64;
+
+    std::unordered_map<const void*, uint32_t> key_to_id_;
+    std::vector<Entry> pool_;
+    std::vector<uint32_t> free_ids_;
+    std::unordered_map<uintptr_t, std::vector<BucketItem>> by_granule_;  // granule number -> items touching it
     mutable std::vector<Range> hulls_;
     mutable bool hulls_dirty_ = false;
-    void unlink(const void* key, const Range& r);
+    mutable uint64_t visit_gen_ = 0;
+
+    uint64_t next_visit_gen() const;
+    void unlink(uint32_t id, uintptr_t lo, uintptr_t hi);
 };
 
 // Sorted disjoint ranges (HostPageIndex::hulls, merge_ranges) cover [lo, hi) as a whole.
