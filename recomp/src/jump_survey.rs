@@ -186,6 +186,9 @@ pub struct JumpSurvey {
     pub functions_reachable: usize,
     /// Unresolved jumps whose pointer slot is statically initialised (target seeded as an entry).
     pub pointer_slot_jumps: usize,
+    /// Indirect jumps given direct tail-call arms from their slot's visible stores: `(closed,
+    /// open)`; closed ones left the unresolved set (see `pointer_slot::resolve_slot_stores`).
+    pub slot_store_jumps: (usize, usize),
     pub by_reason: BTreeMap<&'static str, usize>,
     pub by_reason_reachable: BTreeMap<&'static str, usize>,
     /// Role (`"switch"`, `"tail_call"`, `"computed"`) -> `(total, reachable)`.
@@ -308,6 +311,7 @@ impl JumpSurvey {
             functions_total: self.functions_total,
             functions_reachable: self.functions_reachable,
             pointer_slot_jumps: self.pointer_slot_jumps,
+            slot_store_jumps: self.slot_store_jumps,
             by_reason,
             by_reason_reachable,
             by_role,
@@ -872,6 +876,7 @@ pub fn survey_jumps_probed(
         functions_total: analysis.functions.len(),
         functions_reachable: depth.len(),
         pointer_slot_jumps: analysis.pointer_slots.len(),
+        slot_store_jumps: crate::pointer_slot::slot_store_counts(analysis),
         ..Default::default()
     };
     let mut groups: BTreeMap<Pattern, Group> = BTreeMap::new();
@@ -986,6 +991,11 @@ pub fn render(s: &JumpSurvey, examples: usize) -> String {
         "pointer-slot tail calls with a statically seeded target: {}",
         s.pointer_slot_jumps
     );
+    let _ = writeln!(
+        o,
+        "slot-store tail calls with direct arms: {} closed (resolved), {} open (dispatch fallback kept)",
+        s.slot_store_jumps.0, s.slot_store_jumps.1
+    );
     let _ = writeln!(o, "by lifter reason:");
     for (k, v) in &s.by_reason {
         let reachable = s.by_reason_reachable.get(k).copied().unwrap_or(0);
@@ -1086,6 +1096,11 @@ fn render_json_with_trace(
         s.functions_reachable
     );
     let _ = writeln!(out, "  \"pointer_slot_jumps\": {},", s.pointer_slot_jumps);
+    let _ = writeln!(
+        out,
+        "  \"slot_store_jumps\": {{\"closed\": {}, \"open\": {}}},",
+        s.slot_store_jumps.0, s.slot_store_jumps.1
+    );
 
     out.push_str("  \"by_reason\": {");
     for (i, (k, v)) in s.by_reason.iter().enumerate() {

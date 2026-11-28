@@ -55,3 +55,13 @@ On the target executable 4 jumps have such a slot, and their targets were alread
 the refined relocated-pointer seeding (function count unchanged at 435,718); the survey prints the
 count as `pointer-slot tail calls with a statically seeded target`. The other ~8,200 go through
 pointers loaded via another loaded pointer or a register, which no static slot describes.
+
+After discovery, `pointer_slot::resolve_slot_stores` also reads every store to such a slot in the
+lifted code: `mov [rip+slot], reg` with `reg` from `lea reg, [rip+code]` (or `xor reg, reg`), a vector
+copy from an initialised constant, plus the relocated initial value. Each known target that is an
+entry becomes a direct tail-call arm of the jump, with the run-time dispatcher as the fallback.
+When nothing else can write the slot (no other store, no address-taking `lea` at or up to 0x40 below
+it) the jump leaves the unresolved set. Survey line `slot-store tail calls with direct arms`; on the
+target executable (main 00b8b6e0): 5 closed, 12 open; unresolved jumps 8,300 -> 8,295 (pattern #7,
+`.data` slots, 42 -> 38). The rest of the `.data` slots are written by copy-assignment from another
+object or a call result, or their object's address is passed on, so they stay on dispatch.
