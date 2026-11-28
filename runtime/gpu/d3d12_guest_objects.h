@@ -679,6 +679,53 @@ struct DeviceOptions {
     uint32_t gpu_readback_timeout_ms = 250;
 };
 
+// One PresentX plane of the plain canvas composition (Device::present): its texture and the host
+// texture's format and size as registered when the plane is drawn.
+struct PresentPlaneSource {
+    uint32_t texture_id = 0;
+    pso::WgpuTextureFormat format = pso::WgpuTextureFormat::Undefined;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+// The composition's objects, created on first use: shader modules, layouts, sampler, one pipeline
+// per (canvas format, blended) and one bind group per (texture, view format). A cached bind group
+// is only reused for the same texture size and format; otherwise it is re-created and the old id
+// is listed in `retired` for the caller to destroy.
+struct PresentBlitCache {
+    uint32_t vs = 0, fs = 0, group_layout = 0, pipeline_layout = 0, sampler = 0;
+    std::unordered_map<uint32_t, uint32_t> pipelines;  // canvas format code << 1 | blended -> pipeline
+    struct Group {
+        uint32_t id = 0;
+        uint32_t texture_id = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        pso::WgpuTextureFormat format = pso::WgpuTextureFormat::Undefined;
+    };
+    std::unordered_map<uint64_t, Group> groups;  // (texture id << 8) | view format -> bind group
+    std::vector<uint32_t> retired;               // replaced bind groups, to destroy
+    std::unordered_set<std::string> logged_layouts;  // compositions logged so far (each once, capped)
+};
+
+// One drawn plane of a composition (for the log and tests).
+struct PresentPlaneDraw {
+    uint32_t texture_id = 0;
+    uint32_t width = 0, height = 0;
+    pso::WgpuTextureFormat format = pso::WgpuTextureFormat::Undefined;
+    uint8_t view_format = 0;  // 0: the texture's own format
+    uint32_t bind_group = 0;
+    bool blended = false;  // premultiplied alpha over the planes below (all but the bottom plane)
+};
+
+// Emits the canvas pass compositing `planes` given top first (PresentX order: plane 0 on top, the
+// last plane at the bottom); planes that are not drawable (id 0, not a filterable colour format)
+// are skipped. The bottom drawable plane is drawn opaque and picks the canvas format, the others
+// are blended over it with premultiplied alpha. Returns the number of planes drawn; `draws`, when
+// given, receives them bottom first.
+uint32_t emit_present_plane_blit(PresentBlitCache& cache, std::span<const PresentPlaneSource> planes,
+                                 const std::function<uint32_t()>& allocate_id, CommandEncoder& enc,
+                                 std::vector<PresentPlaneDraw>* draws = nullptr);
+
 struct DeviceStats {
     uint64_t resources = 0;
     uint64_t heaps = 0;
@@ -1171,14 +1218,9 @@ private:
     bool frame_open_ = false;
     std::atomic<uint64_t> presents_{0};     // written under submit_mutex_, read lock-free by stats()
     std::atomic<uint64_t> submissions_{0};  // written under submit_mutex_, read lock-free by stats()
-    // Present composition objects (under submit_mutex_), created on first use: shader modules,
-    // layouts, sampler, one pipeline per (canvas format, blended), one bind group per texture.
+    // Present composition objects (under submit_mutex_), created on first use (PresentBlitCache).
     uint32_t emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc);
-    struct PresentBlit {
-        uint32_t vs = 0, fs = 0, group_layout = 0, pipeline_layout = 0, sampler = 0;
-        std::unordered_map<uint32_t, uint32_t> pipelines;  // canvas format code << 1 | blended -> pipeline
-        std::unordered_map<uint64_t, uint32_t> groups;     // (texture id << 8) | view format -> bind group
-    } present_blit_;
+    PresentBlitCache present_blit_;
     // G79: MSAA resolve pipelines (color float/unorm/srgb & depth), created lazily once per device.
     mutable std::mutex resolve_mutex_;
     struct MsaaResolve {

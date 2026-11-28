@@ -7,6 +7,7 @@
 #include <chrono>
 #include <thread>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -5248,6 +5249,104 @@ void test_dump_targets() {
     std::filesystem::remove_all(dir, ec);
 }
 
+// PresentX plane composition (gpu::d3d12_guest::emit_present_plane_blit, the canvas pass of Device::present):
+// a 4x-canvas-sized base plane under a smaller transparent overlay shows the base; a half-covering
+// premultiplied overlay blends over it; an opaque overlay (plane 0) is on top; a base texture re-created
+// under the same id at another size gets a fresh bind group, and the canvas shows the new contents.
+// Every pixel of the last frame is (r, g, b, a) within tol, whichever 8-bit canvas format it has.
+bool canvas_near(NativeExecutor& ex, uint8_t r, uint8_t g, uint8_t b, uint8_t a, int tol = 1) {
+    FrameImage img;
+    std::string err;
+    if (!ex.read_last_frame(&img, &err) || img.width != kW || img.height != kH) return false;
+    const bool rgba = img.format == "rgba8unorm";
+    if (!rgba && img.format != "bgra8unorm") return false;
+    const uint8_t want[4] = {rgba ? r : b, g, rgba ? b : r, a};
+    for (size_t i = 0; i + 3 < img.pixels.size(); i += 4) {
+        for (int c = 0; c < 4; ++c) {
+            if (std::abs(int{img.pixels[i + c]} - int{want[c]}) > tol) {
+                std::fprintf(stderr, "pixel %zu = %u,%u,%u,%u (%s), want rgba %u,%u,%u,%u\n", i / 4, img.pixels[i],
+                             img.pixels[i + 1], img.pixels[i + 2], img.pixels[i + 3], img.format.c_str(), r, g, b, a);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void test_present_plane_composition() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string create_error;
+    auto owned = NativeExecutor::create(opts, &status, &create_error);
+    if (!owned) {
+        CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+        return;
+    }
+    NativeExecutor& ex = *owned;
+    using gpu::d3d12_guest::PresentPlaneDraw;
+    using gpu::d3d12_guest::PresentPlaneSource;
+    using Fmt = gpu::pso::WgpuTextureFormat;
+    const ExecutorStats before = ex.stats();
+    constexpr uint32_t kBase = 9700, kOverlay = 9701;
+    constexpr uint32_t kUsage = GpuTextureUsage::RenderAttachment | GpuTextureUsage::TextureBinding;
+    gpu::d3d12_guest::PresentBlitCache cache;
+    uint32_t next_id = 9710;
+    const std::function<uint32_t()> alloc = [&] { return next_id++; };
+    PresentPlaneSource planes[2];  // PresentX order: plane 0 (the overlay) on top of plane 1 (the base)
+    planes[0] = {kOverlay, Fmt::Rgba8Unorm, kW / 2, kH / 2};
+    planes[1] = {kBase, Fmt::Rgba8Unorm, kW * 4, kH * 4};
+    auto frame = [&](float br, float bg, float bb, float ov_r, float ov_a, std::vector<PresentPlaneDraw>* draws) {
+        gpu::CommandEncoder e;
+        e.begin_frame();
+        end_pass(e, texture_pass(kBase, br, bg, bb, 1.0f));
+        end_pass(e, texture_pass(kOverlay, ov_r, 0.0f, 0.0f, ov_a));
+        const uint32_t n = gpu::d3d12_guest::emit_present_plane_blit(cache, planes, alloc, e, draws);
+        e.present();
+        run(ex, e);
+        ex.wait_idle();
+        return n;
+    };
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(texture2(kBase, kW * 4, kH * 4, kUsage, 22)));      // rgba8unorm
+    emit(setup, GpuOpcode::CreateTexture2, bytes_of(texture2(kOverlay, kW / 2, kH / 2, kUsage, 22)));  // rgba8unorm
+    run(ex, setup);
+
+    // Transparent overlay: the base plane's colour (51, 102, 204), drawn opaque, then the overlay blended.
+    std::vector<PresentPlaneDraw> draws;
+    CHECK(frame(0.2f, 0.4f, 0.8f, 0.0f, 0.0f, &draws) == 2);
+    CHECK(draws.size() == 2 && draws[0].texture_id == kBase && !draws[0].blended && draws[1].texture_id == kOverlay &&
+          draws[1].blended && draws[0].width == kW * 4 && draws[0].format == Fmt::Rgba8Unorm);
+    CHECK(canvas_near(ex, 51, 102, 204, 255));
+    // A premultiplied 40% red overlay: 0.4 + 0.2 * 0.6 = 0.52 red, the rest scaled by 0.6.
+    CHECK(frame(0.2f, 0.4f, 0.8f, 0.4f, 0.4f, nullptr) == 2);
+    CHECK(canvas_near(ex, 133, 61, 122, 255, 2));
+    // An opaque overlay covers the base.
+    CHECK(frame(0.2f, 0.4f, 0.8f, 1.0f, 1.0f, nullptr) == 2);
+    CHECK(canvas_near(ex, 255, 0, 0, 255));
+    const size_t groups = cache.groups.size();
+
+    // The base texture re-created under its id at another size: a new bind group, the new contents shown.
+    gpu::CommandEncoder recreate;
+    emit(recreate, GpuOpcode::CreateTexture2, bytes_of(texture2(kBase, kW * 2, kH * 2, kUsage, 22)));
+    run(ex, recreate);
+    planes[1].width = kW * 2;
+    planes[1].height = kH * 2;
+    const uint32_t old_group = draws[0].bind_group;
+    draws.clear();
+    CHECK(frame(0.0f, 1.0f, 0.0f, 0.0f, 0.0f, &draws) == 2);
+    CHECK(draws.size() == 2 && draws[0].bind_group != old_group && draws[0].width == kW * 2);
+    CHECK(cache.retired.size() == 1 && cache.retired[0] == old_group && cache.groups.size() == groups);
+    CHECK(canvas_near(ex, 0, 255, 0, 255));
+    // Not drawable (no texture, an unfilterable format): nothing composited, no packets.
+    const PresentPlaneSource none[2] = {{0, Fmt::Rgba8Unorm, 1, 1}, {kBase, Fmt::R32Float, kW, kH}};
+    gpu::CommandEncoder empty;
+    CHECK(gpu::d3d12_guest::emit_present_plane_blit(cache, none, alloc, empty) == 0 && empty.size() == 0);
+    ex.poll();
+    CHECK(ex.stats().device_errors == before.device_errors);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -5306,6 +5405,7 @@ int main() {
     test_destroyed_texture_leaves_caches();
     test_bind_group_budget();
     test_dump_targets();
+    test_present_plane_composition();
     test_device_loss();
     test_device_loss_journal();
     test_async_pipelines_and_blob_cache();

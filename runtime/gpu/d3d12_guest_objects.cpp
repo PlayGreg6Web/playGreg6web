@@ -835,36 +835,27 @@ uint8_t present_canvas_format(pso::WgpuTextureFormat f) {
 
 }  // namespace
 
-uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc) {
+uint32_t emit_present_plane_blit(PresentBlitCache& b, std::span<const PresentPlaneSource> planes,
+                                 const std::function<uint32_t()>& allocate_id, CommandEncoder& enc,
+                                 std::vector<PresentPlaneDraw>* draws_out) {
     // Drawable planes, bottom (last plane) first; the bottom one picks the canvas format.
-    std::vector<std::pair<uint32_t, pso::WgpuTextureFormat>> order;
+    std::vector<const PresentPlaneSource*> order;
     uint8_t canvas_format = 0;
-    for (size_t i = plane_textures.size(); i-- > 0;) {
-        const uint32_t id = plane_textures[i];
-        bridge::TextureInfo info;
-        if (id == 0 || !bridge_->texture_info(id, &info) || info.swapchain ||
-            info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
-            continue;  // none, gone, already the canvas (set_back_buffer), or not a plain 2D texture
-        }
-        const pso::WgpuTextureFormat plane_fmt =
-            info.created_format != pso::WgpuTextureFormat::Undefined
-                ? info.created_format
-                : pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features)
-                      .format;
-        const uint8_t format = present_canvas_format(plane_fmt);
+    for (size_t i = planes.size(); i-- > 0;) {
+        const PresentPlaneSource& p = planes[i];
+        const uint8_t format = p.texture_id != 0 ? present_canvas_format(p.format) : 0;
         if (format == 0) {
             continue;
         }
         if (order.empty()) {
             canvas_format = format;
         }
-        order.emplace_back(id, plane_fmt);
+        order.push_back(&p);
     }
     if (order.empty()) {
         return 0;
     }
     const bool canvas_is_srgb = bridge::is_srgb_format(static_cast<pso::WgpuTextureFormat>(canvas_format));
-    PresentBlit& b = present_blit_;
     if (b.vs == 0) {
         b.vs = allocate_id();
         b.fs = allocate_id();
@@ -927,41 +918,59 @@ uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, C
         }
         return pipeline;
     };
-    auto group_for = [&](uint32_t texture_id, pso::WgpuTextureFormat plane_fmt) {
+    auto view_format_for = [&](pso::WgpuTextureFormat plane_fmt) -> uint8_t {
         // Match each plane's sampled view sRGB-ness to the canvas format so mixing UNORM and sRGB
         // planes never double-encodes (washed out) or decodes without re-encoding (darkened).
-        uint8_t view_format = 0;
         if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(plane_fmt);
             sibling != pso::WgpuTextureFormat::Undefined && bridge::is_srgb_format(plane_fmt) != canvas_is_srgb) {
-            view_format = static_cast<uint8_t>(sibling);
+            return static_cast<uint8_t>(sibling);
         }
-        const uint64_t group_key = (uint64_t{texture_id} << 8) | view_format;
-        uint32_t& group = b.groups[group_key];
-        if (group == 0) {
-            group = allocate_id();
-            GpuBindGroupEntry2 e[2] = {};
-            e[0].binding = 0;
-            e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
-            e[0].resource_id = texture_id;
-            e[0].view.format = view_format;
-            e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
-            e[0].view.mip_level_count = 1;
-            e[0].view.array_layer_count = 1;
-            e[1].binding = 1;
-            e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
-            e[1].resource_id = b.sampler;
-            GpuCreateBindGroup2Payload g{};
-            g.id = group;
-            g.layout_id = b.group_layout;
-            g.entry_count = 2;
-            enc.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        return 0;
+    };
+    auto group_for = [&](const PresentPlaneSource& plane, uint8_t view_format) {
+        // Keyed by texture and view format, but only reused while the texture keeps the size and
+        // format it had when the group was made: a host texture re-created under the same id at
+        // another size / format gets a fresh view.
+        PresentBlitCache::Group& g = b.groups[(uint64_t{plane.texture_id} << 8) | view_format];
+        if (g.id != 0 && g.width == plane.width && g.height == plane.height && g.format == plane.format) {
+            return g.id;
         }
-        return group;
+        if (g.id != 0) {
+            b.retired.push_back(g.id);
+        }
+        g.id = allocate_id();
+        g.texture_id = plane.texture_id;
+        g.width = plane.width;
+        g.height = plane.height;
+        g.format = plane.format;
+        GpuBindGroupEntry2 e[2] = {};
+        e[0].binding = 0;
+        e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+        e[0].resource_id = plane.texture_id;
+        e[0].view.format = view_format;
+        e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        e[0].view.mip_level_count = 1;
+        e[0].view.array_layer_count = 1;
+        e[1].binding = 1;
+        e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
+        e[1].resource_id = b.sampler;
+        GpuCreateBindGroup2Payload cg{};
+        cg.id = g.id;
+        cg.layout_id = b.group_layout;
+        cg.entry_count = 2;
+        enc.emit_packet(GpuOpcode::CreateBindGroup2, &cg, sizeof(cg), e, sizeof(e));
+        return g.id;
     };
     std::vector<std::pair<uint32_t, uint32_t>> draws;  // (pipeline, bind group), bottom first
     for (size_t k = 0; k < order.size(); ++k) {
+        const PresentPlaneSource& plane = *order[k];
+        const uint8_t view_format = view_format_for(plane.format);
         const uint32_t pipeline = pipeline_for(k > 0);
-        draws.emplace_back(pipeline, group_for(order[k].first, order[k].second));
+        const uint32_t group = group_for(plane, view_format);
+        draws.emplace_back(pipeline, group);
+        if (draws_out != nullptr) {
+            draws_out->push_back({plane.texture_id, plane.width, plane.height, plane.format, view_format, group, k > 0});
+        }
     }
     GpuBeginRenderPassPayload pass{};
     pass.color_count = 1;
@@ -984,6 +993,65 @@ uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, C
     }
     enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
     return static_cast<uint32_t>(order.size());
+}
+
+uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc) {
+    std::vector<PresentPlaneSource> sources(plane_textures.size());
+    for (size_t i = 0; i < plane_textures.size(); ++i) {
+        const uint32_t id = plane_textures[i];
+        bridge::TextureInfo info;
+        if (id == 0 || !bridge_->texture_info(id, &info) || info.swapchain ||
+            info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
+            continue;  // none, gone, already the canvas (set_back_buffer), or not a plain 2D texture
+        }
+        PresentPlaneSource& s = sources[i];
+        s.texture_id = id;
+        s.format = info.created_format != pso::WgpuTextureFormat::Undefined
+                       ? info.created_format
+                       : pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features)
+                             .format;
+        // Host size (a capped texture lacks its top levels: level 0 is guest level host_mip_offset).
+        s.width = std::max(1u, info.width >> info.host_mip_offset);
+        s.height = std::max(1u, info.height >> info.host_mip_offset);
+    }
+    PresentBlitCache& b = present_blit_;
+    std::vector<PresentPlaneDraw> drawn;
+    const uint32_t count =
+        emit_present_plane_blit(b, sources, [this] { return allocate_id(); }, enc, &drawn);
+    // Bind groups of textures that are gone (and groups replaced above) are destroyed once the
+    // frames that used them are retired; checked only when the cache grows past the usual planes.
+    if (b.groups.size() > 16) {
+        for (auto it = b.groups.begin(); it != b.groups.end();) {
+            bridge::TextureInfo info;
+            if (!bridge_->texture_info(it->second.texture_id, &info)) {
+                b.retired.push_back(it->second.id);
+                it = b.groups.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const uint32_t id : b.retired) {
+        bridge_->defer_destroy_resource(id);
+    }
+    b.retired.clear();
+    // Each distinct composition (plane textures, sizes, formats, views, blend, bind groups) is logged
+    // once (alternating back buffers repeat theirs), so a black canvas can be traced to what the blit
+    // draws sampled.
+    std::string layout;
+    for (const PresentPlaneDraw& d : drawn) {
+        layout += " [tex " + std::to_string(d.texture_id) + " " + std::to_string(d.width) + "x" +
+                  std::to_string(d.height) + " " + pso::texture_format_name(d.format) + " view " +
+                  (d.view_format != 0 ? pso::texture_format_name(static_cast<pso::WgpuTextureFormat>(d.view_format))
+                                      : "own") +
+                  (d.blended ? " blended" : " opaque") + " group " + std::to_string(d.bind_group) + "]";
+    }
+    if (b.logged_layouts.size() < 256 && b.logged_layouts.insert(layout).second) {
+        os::log("d3d12_xs: present " + std::to_string(presents_.load(std::memory_order_relaxed) + 1) + ": " +
+                std::to_string(count) + " of " + std::to_string(plane_textures.size()) +
+                " plane(s) composited, bottom first:" + (layout.empty() ? std::string(" none") : layout));
+    }
+    return count;
 }
 
 namespace {
