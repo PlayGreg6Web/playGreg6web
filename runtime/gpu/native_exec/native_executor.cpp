@@ -382,6 +382,10 @@ struct AutoLayoutMeta {
     // one gets a dummy of the title's entry.
     bool by_binding = false;
     std::vector<LayoutEntry> by_binding_entries;
+    // Per entry of `bindings`: the WGSL binding's minimum size from the stages' reflection (0 = none
+    // known). The remap binds a buffer range at least this big: extended within the buffer, else a
+    // zero-padded copy of the range (a compacted stage can declare a block past the title's view).
+    std::vector<uint64_t> min_sizes;
 };
 
 struct RemapCacheEntry {
@@ -845,6 +849,10 @@ struct NativeExecutor::Impl {
     // copies and the passes reading them in order), indexed by their use within one split.
     std::vector<wgpu::Buffer> snap_buffers;
     std::vector<wgpu::Buffer> snap_free;  // snapshot buffers of finished encoders, reused (queue order keeps it safe)
+    // Zero-padded twins of remapped buffer ranges shorter than the WGSL's minimum (min_size_twins), by
+    // slot within one remapped group; refilled in encoder order where each group is bound.
+    std::vector<wgpu::Buffer> min_twins_render, min_twins_compute;
+    uint64_t remap_min_size_logged = 0, remap_invalid_logged = 0;
     // Dummies for unreferenced buffer bindings (flush_binds): one per slot of a draw / dispatch, writable and
     // read-only ones apart (a buffer used both ways in one render pass is a usage-scope conflict of its own).
     std::vector<wgpu::Buffer> unref_dummy_w, unref_dummy_r;
@@ -4492,6 +4500,21 @@ struct NativeExecutor::Impl {
         return pl;
     }
 
+    // meta.min_sizes: each remapped WGSL binding's minimum size, the largest any stage's reflection gives
+    // that group 0 binding (what Dawn derives from the WGSL for layout:'auto').
+    static void fill_remap_min_sizes(AutoLayoutMeta& meta, const std::vector<const reflect::StageRecord*>& refls) {
+        meta.min_sizes.assign(meta.bindings.size(), 0);
+        for (const reflect::StageRecord* r : refls) {
+            if (!r || r->group_layouts.empty()) continue;
+            for (const reflect::LayoutEntryDesc& le : r->group_layouts[0]) {
+                if (le.kind != reflect::LayoutEntryDesc::Kind::Buffer || !le.min_binding_size) continue;
+                for (size_t i = 0; i < meta.bindings.size(); ++i)
+                    if (meta.bindings[i].binding == le.binding)
+                        meta.min_sizes[i] = std::max(meta.min_sizes[i], le.min_binding_size);
+            }
+        }
+    }
+
     void create_shader_module(const Packet& p) {
         const auto h = read_payload<GpuCreateShaderModulePayload>(p);
         if (uint64_t{16} + h.code_len > p.payload_bytes) {
@@ -5982,6 +6005,12 @@ struct NativeExecutor::Impl {
             if (fs) if (const auto* r = resolve_shader_reflection(*fs, "fragment")) rf.push_back(r);
             reflected_pl = reflected_remap_layout(auto_meta, rf, fs ? 2 : 1);
         }
+        if (auto_meta.remap && reflection.shader_count() != 0) {
+            std::vector<const reflect::StageRecord*> rf;
+            if (const auto* r = resolve_shader_reflection(vs, "vertex")) rf.push_back(r);
+            if (fs) if (const auto* r = resolve_shader_reflection(*fs, "fragment")) rf.push_back(r);
+            fill_remap_min_sizes(auto_meta, rf);
+        }
         rd.layout = fitted_pl ? fitted_pl : reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         // The title's own layout is invalid and nothing replaced it: the pipeline would be an error object.
         const bool layout_invalid = !fitted_pl && !reflected_pl && !auto_layout && !auto_meta.remap && pl->invalid;
@@ -6401,6 +6430,11 @@ struct NativeExecutor::Impl {
             std::vector<const reflect::StageRecord*> rf;
             if (const auto* r = resolve_shader_reflection(cs, "compute")) rf.push_back(r);
             reflected_pl = reflected_remap_layout(auto_meta, rf, 1);
+        }
+        if (auto_meta.remap && reflection.shader_count() != 0) {
+            std::vector<const reflect::StageRecord*> rf;
+            if (const auto* r = resolve_shader_reflection(cs, "compute")) rf.push_back(r);
+            fill_remap_min_sizes(auto_meta, rf);
         }
         cd.layout = fitted_pl ? fitted_pl : reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         const bool layout_invalid = !fitted_pl && !reflected_pl && !auto_layout && !auto_meta.remap && pl->invalid;
@@ -8692,10 +8726,25 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         wgpu::BindGroup group;
     };
 
+    // Slot `slot` of the padded twins for one remapped group (a fresh buffer starts zero; the copy into
+    // it clears what follows the range).
+    wgpu::Buffer min_size_twin(bool compute, uint32_t slot, uint64_t size) {
+        std::vector<wgpu::Buffer>& pool = compute ? min_twins_compute : min_twins_render;
+        if (slot >= pool.size()) pool.resize(slot + 1);
+        wgpu::Buffer& tb = pool[slot];
+        if (!tb || tb.GetSize() < size) {
+            wgpu::BufferDescriptor bd{};
+            bd.size = std::max<uint64_t>(256, (size + 255) & ~uint64_t{255});
+            bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+            tb = device.CreateBuffer(&bd);  // a replaced twin stays alive while recorded commands use it
+        }
+        return tb;
+    }
+
     // Builds (or reuses) the bind group for the auto layout's group 0 from the recorded descriptor of
     // the group the stream bound: each WGSL binding takes the first matching real resource, else a
     // default sampler / a dummy. Dynamic offsets are folded into the static buffer offsets.
-    RemapResult get_remapped(bool compute, uint32_t pipeline_id, const AutoLayoutMeta& meta, uint32_t bg_id,
+    RemapResult get_remapped(Encoder& e, bool compute, uint32_t pipeline_id, const AutoLayoutMeta& meta, uint32_t bg_id,
                              const std::shared_ptr<BgDesc>& desc, const std::vector<uint32_t>& dyn) {
         RemapResult out;
         const bool has_pipeline = compute ? compute_pipelines.count(pipeline_id) != 0 : render_pipelines.count(pipeline_id) != 0;
@@ -8757,34 +8806,67 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         }
         wgpu::BindGroup group;
         bool remap_invalid = false;
+        bool twinned = false;  // a padded twin is bound: the group is not cached (the twin is refilled per bind)
         if (auto_bgl) {
             RemapPicker picker(av, dyn, features.float32_filterable);
             std::vector<wgpu::BindGroupEntry> wes(meta.bindings.size());
+            // The padded twins of this group (copied once, after every binding is picked).
+            struct TwinCopy {
+                wgpu::Buffer src, dst;
+                uint64_t offset = 0, data = 0;
+            };
+            std::vector<TwinCopy> twins;
             for (size_t i = 0; i < meta.bindings.size(); ++i) {
                 const WgslBinding& b = meta.bindings[i];
                 wgpu::BindGroupEntry& w = wes[i];
                 w.binding = b.binding;
                 PickResult r = meta.by_binding ? picker.pick_binding(b) : picker.pick(b);
                 BufferBindingFit fit;
+                wgpu::Buffer twin;
                 if (r.kind == PickResult::Kind::Resource && desc->handles[r.index].buffer) {
-                    // The device's binding-size rules (binding_fit_model.h); no range fits: a dummy.
+                    // The device's binding-size rules (binding_fit_model.h), at least the WGSL's minimum size:
+                    // extended within the buffer, else a zero-padded twin; no range fits: a dummy.
                     const bool storage = b.kind != WgslBindingKind::Uniform;
-                    fit = fit_buffer_binding(storage, av[r.index].buffer_total, r.offset, r.size, 0,
-                                             storage ? max_storage_binding : max_uniform_binding);
+                    const uint64_t min_size = i < meta.min_sizes.size() ? meta.min_sizes[i] : 0;
+                    fit = fit_buffer_binding(storage, av[r.index].buffer_total, r.offset, r.size, min_size,
+                                             storage ? max_storage_binding : max_uniform_binding, true);
+                    if (fit.ok && fit.padded) {
+                        const wgpu::Buffer& src = desc->handles[r.index].buffer;
+                        if ((src.GetUsage() & wgpu::BufferUsage::CopySrc) && r.offset % 4 == 0 &&
+                            r.offset + fit.data_size <= src.GetSize()) {
+                            twin = min_size_twin(compute, static_cast<uint32_t>(twins.size()), fit.size);
+                            twins.push_back({src, twin, r.offset, fit.data_size});
+                        } else {
+                            fit.ok = false;
+                        }
+                    }
                     if (!fit.ok) {
                         ++stats.buffer_bindings_dummied;
+                        if (min_size) ++stats.remap_min_size_dummies;
                         r = PickResult{PickResult::Kind::Dummy};
-                    } else if (fit.clamped) {
-                        ++stats.buffer_bindings_clamped;
+                    } else {
+                        if (fit.clamped) ++stats.buffer_bindings_clamped;
+                        if (fit.extended) ++stats.remap_min_size_extended;
+                        if (fit.padded) ++stats.remap_min_size_twins;
+                        if ((fit.extended || fit.padded) && ++remap_min_size_logged <= 12)
+                            std::fprintf(stderr,
+                                         "[native_exec] remap %s pipeline %u binding %u (%s): range %llu at %llu of a "
+                                         "%llu-byte buffer < WGSL minimum %llu -> %s\n",
+                                         compute ? "compute" : "render", pipeline_id, b.binding,
+                                         storage ? "storage" : "uniform", static_cast<unsigned long long>(r.size),
+                                         static_cast<unsigned long long>(r.offset),
+                                         static_cast<unsigned long long>(av[r.index].buffer_total),
+                                         static_cast<unsigned long long>(min_size),
+                                         fit.padded ? "zero-padded twin" : "extended in place");
                     }
                 }
                 if (r.kind == PickResult::Kind::Resource) {
                     const BgHandles& hnd = desc->handles[r.index];
-                    w.buffer = hnd.buffer;
+                    w.buffer = twin ? twin : hnd.buffer;
                     w.textureView = hnd.view;
                     w.sampler = hnd.sampler;
                     if (hnd.buffer) {
-                        w.offset = r.offset;
+                        w.offset = twin ? 0 : r.offset;
                         w.size = fit.size > 0 ? fit.size : wgpu::kWholeSize;
                         if (r.folded) ++stats.remap_dynamic_offsets;
                         if (r.dyn_clamped) ++stats.remap_dynamic_clamps;
@@ -8817,11 +8899,40 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                     ++stats.remap_dummies;
                 }
             }
+            if (!twins.empty()) {
+                // Encoded where the group is bound: the open pass ends around the copies and continues.
+                twinned = true;
+                const bool split = e.rpass || e.cpass;
+                const bool render = static_cast<bool>(e.rpass);
+                if (split) {
+                    if (render && e.cont_discards) ++stats.usage_split_discards;
+                    ++stats.remap_min_size_splits;
+                    e.end_segment();
+                }
+                for (const TwinCopy& t : twins) {
+                    if (t.data) e.enc.CopyBufferToBuffer(t.src, t.offset, t.dst, 0, t.data);
+                    if (t.dst.GetSize() > t.data) e.enc.ClearBuffer(t.dst, t.data, t.dst.GetSize() - t.data);
+                }
+                if (split) {
+                    if (render) e.resume_render();
+                    else e.resume_compute();
+                }
+            }
             wgpu::BindGroupDescriptor bd{};
             bd.layout = auto_bgl;
             bd.entryCount = wes.size();
             bd.entries = wes.data();
             remap_invalid = !created_valid([&] { group = device.CreateBindGroup(&bd); });
+            if (remap_invalid && ++remap_invalid_logged <= 8) {
+                std::string ents;
+                for (size_t i = 0; i < wes.size(); ++i)
+                    if (wes[i].buffer)
+                        ents += " b" + std::to_string(wes[i].binding) + "=" + std::to_string(wes[i].size) + "@" +
+                                std::to_string(wes[i].offset) + "/" + std::to_string(wes[i].buffer.GetSize()) + "(min " +
+                                std::to_string(i < meta.min_sizes.size() ? meta.min_sizes[i] : 0) + ")";
+                std::fprintf(stderr, "[native_exec] remap %s pipeline %u: bind group rejected; buffers:%s\n",
+                             compute ? "compute" : "render", pipeline_id, ents.c_str());
+            }
             ++stats.remapped_bind_groups;
             std::vector<uint8_t> tex_w(wes.size(), 0);
             for (size_t i = 0; i < wes.size(); ++i) tex_w[i] = meta.bindings[i].kind == WgslBindingKind::StorageTexture ? 1 : 0;
@@ -8830,7 +8941,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                 return true;
             }, tex_w);
         }
-        if (live) {
+        if (live && !twinned) {
             if (remap_cache.size() >= 8192) remap_cache.clear();
             remap_cache[key] = RemapCacheEntry{remap_invalid ? nullptr : group, remap_invalid, desc.get(), meta.gen};
         }
@@ -9874,7 +9985,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             remap.has_last_compute = true;
             if (remap.compute_valid && remap.compute_auto) {
                 auto mit = compute_meta.find(remap.compute_pipe);
-                const RemapResult r = get_remapped(true, remap.compute_pipe, mit->second, c.bind_group_id, c.desc, c.offsets);
+                const RemapResult r = get_remapped(e, true, remap.compute_pipe, mit->second, c.bind_group_id, c.desc, c.offsets);
                 remap.group0_compute = true;
                 if (r.status == RemapResult::Status::Ok) {
                     apply_remapped(e, r.group);
@@ -9893,7 +10004,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                 auto pit = render_pipelines.find(remap.render_pipe);
                 if (pit != render_pipelines.end()) {
                     const RemapResult r =
-                        get_remapped(false, remap.render_pipe, pit->second.auto_meta, c.bind_group_id, c.desc, c.offsets);
+                        get_remapped(e, false, remap.render_pipe, pit->second.auto_meta, c.bind_group_id, c.desc, c.offsets);
                     remap.group0_render = true;
                     if (r.status == RemapResult::Status::Ok) {
                         apply_remapped(e, r.group);
@@ -9928,7 +10039,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         const Group0Src& src = remap.has_last_render ? remap.last_render : none;
         remap.group0_render = true;
         if (pit == render_pipelines.end()) return;
-        const RemapResult r = get_remapped(false, remap.render_pipe, pit->second.auto_meta, src.id, src.desc, src.dyn);
+        const RemapResult r = get_remapped(e, false, remap.render_pipe, pit->second.auto_meta, src.id, src.desc, src.dyn);
         if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
         else if (r.status == RemapResult::Status::Invalid) e.invalid_binds |= 1u;
     }
@@ -9939,7 +10050,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         const Group0Src& src = remap.has_last_compute ? remap.last_compute : none;
         remap.group0_compute = true;
         if (mit == compute_meta.end()) return;
-        const RemapResult r = get_remapped(true, remap.compute_pipe, mit->second, src.id, src.desc, src.dyn);
+        const RemapResult r = get_remapped(e, true, remap.compute_pipe, mit->second, src.id, src.desc, src.dyn);
         if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
         else if (r.status == RemapResult::Status::Invalid) e.invalid_binds |= 1u;
     }
@@ -11229,6 +11340,10 @@ std::string NativeExecutor::stats_json() const {
     num("bind_group_sample_type_dummies", st.bind_group_sample_type_dummies);
     num("buffer_bindings_clamped", st.buffer_bindings_clamped);
     num("buffer_bindings_dummied", st.buffer_bindings_dummied);
+    num("remap_min_size_extended", st.remap_min_size_extended);
+    num("remap_min_size_twins", st.remap_min_size_twins);
+    num("remap_min_size_splits", st.remap_min_size_splits);
+    num("remap_min_size_dummies", st.remap_min_size_dummies);
     num("depth_float_copies", st.depth_float_copies);
     num("norm16_twins_created", st.norm16_twins_created);
     num("norm16_twin_copies", st.norm16_twin_copies);

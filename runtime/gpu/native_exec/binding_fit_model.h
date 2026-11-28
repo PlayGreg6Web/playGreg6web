@@ -16,12 +16,18 @@ struct BufferBindingFit {
     bool ok = true;         // false: no range of the buffer fits; bind a dummy
     uint64_t size = 0;      // the explicit size to bind (never "whole")
     bool clamped = false;   // the requested / whole range was cut to the device maximum or to 4 bytes
+    bool extended = false;  // the range was grown within the buffer to the minimum size
+    // allow_pad only: the buffer ends before offset + min_binding. Bind a copy of `size` (= min_binding)
+    // bytes holding the `data_size` bytes of the range and zero past them (a padded twin of the range).
+    bool padded = false;
+    uint64_t data_size = 0;
 };
 
 // buffer_size: the buffer's size (0 = unknown: nothing is fitted, size 0 = whole). requested: 0 = whole.
 // min_binding: the layout entry's minBindingSize (0 = none). max_binding: the device limit for the kind.
+// allow_pad: a range the buffer cannot extend to min_binding comes back padded instead of !ok.
 inline BufferBindingFit fit_buffer_binding(bool storage, uint64_t buffer_size, uint64_t offset, uint64_t requested,
-                                           uint64_t min_binding, uint64_t max_binding) {
+                                           uint64_t min_binding, uint64_t max_binding, bool allow_pad = false) {
     BufferBindingFit f;
     if (buffer_size == 0) {
         f.size = requested;
@@ -42,11 +48,24 @@ inline BufferBindingFit fit_buffer_binding(bool storage, uint64_t buffer_size, u
         f.clamped = true;
     }
     if (min_binding && size < min_binding) {
-        if (remaining < min_binding || (max_binding && min_binding > max_binding)) {
+        if (max_binding && min_binding > max_binding) {
             f.ok = false;
             return f;
         }
+        if (remaining < min_binding) {
+            // As far as the buffer goes (what an extension in place would bind), in whole 4-byte words.
+            const uint64_t data = remaining & ~uint64_t{3};
+            if (!allow_pad || data == 0) {
+                f.ok = false;
+                return f;
+            }
+            f.padded = true;
+            f.data_size = data;
+            f.size = (min_binding + 3) & ~uint64_t{3};
+            return f;
+        }
         size = min_binding;
+        f.extended = true;
     }
     if (size == 0) {
         f.ok = false;

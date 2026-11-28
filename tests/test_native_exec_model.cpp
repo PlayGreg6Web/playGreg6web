@@ -1430,8 +1430,20 @@ void test_binding_fit() {
     CHECK(!fit_buffer_binding(true, 2, 0, 0, 0, 1u << 27).ok);
     // under minBindingSize: grown when the buffer has room, else no fit
     f = fit_buffer_binding(false, 4096, 0, 64, 256, 65536);
-    CHECK(f.ok && f.size == 256);
+    CHECK(f.ok && f.size == 256 && f.extended && !f.padded);
     CHECK(!fit_buffer_binding(false, 128, 0, 0, 256, 65536).ok);
+    // ... with allow_pad (the remap of a compacted stage's block): a zero-padded twin of min bytes holding
+    // the rest of the buffer, the copy in whole words
+    f = fit_buffer_binding(false, 128, 0, 0, 256, 65536, true);
+    CHECK(f.ok && f.padded && f.size == 256 && f.data_size == 128);
+    f = fit_buffer_binding(false, 4096, 3968, 64, 912, 65536, true);  // a 64-byte view near the end, a 912-byte block
+    CHECK(f.ok && f.padded && f.size == 912 && f.data_size == 128);
+    f = fit_buffer_binding(true, 1030, 1024, 0, 64, 1u << 27, true);  // storage: 6 bytes left -> 4 copied
+    CHECK(f.ok && f.padded && f.size == 64 && f.data_size == 4);
+    CHECK(!fit_buffer_binding(false, 4096, 4094, 0, 256, 65536, true).ok);  // nothing whole to copy
+    CHECK(!fit_buffer_binding(false, 4096, 0, 0, 131072, 65536, true).ok);  // minimum over the device limit
+    f = fit_buffer_binding(false, 4096, 0, 64, 256, 65536, true);  // room in the buffer: extended, no twin
+    CHECK(f.ok && f.extended && !f.padded && f.size == 256);
     // size unknown: unchanged
     f = fit_buffer_binding(false, 0, 0, 0, 0, 65536);
     CHECK(f.ok && f.size == 0);

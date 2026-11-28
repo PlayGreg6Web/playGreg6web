@@ -409,6 +409,11 @@ struct ExecutorStats {
     uint64_t bind_group_sample_type_dummies = 0;  // integer view vs float layout entry (or the reverse): dummy bound
     uint64_t buffer_bindings_clamped = 0;  // buffer ranges cut to the device's binding-size rules (fit_buffer_binding)
     uint64_t buffer_bindings_dummied = 0;  // buffer bindings no range of which fits those rules: dummy bound
+    // Remapped group 0 buffer ranges shorter than the WGSL binding's minimum size (its reflection):
+    uint64_t remap_min_size_extended = 0;  // grown within the buffer
+    uint64_t remap_min_size_twins = 0;     // bound as a zero-padded copy (the buffer ends first)
+    uint64_t remap_min_size_splits = 0;    // passes split to encode those copies
+    uint64_t remap_min_size_dummies = 0;   // no copy possible: a dummy
     uint64_t view_dim_coerced = 0;         // texture views re-created with the layout entry's viewDimension (cube-array view meeting a 2d entry, ...)
     uint64_t view_dim_unfixable = 0;       // view dimension mismatches the texture cannot satisfy (cube entry over < 6 layers)
     uint64_t storage_alias_copies = 0;     // read-only buffer bindings overlapping a writable one, bound through a copy
