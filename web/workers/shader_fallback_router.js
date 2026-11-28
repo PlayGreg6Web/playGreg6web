@@ -1079,7 +1079,7 @@
    * @param {bigint} hashBigInt
    * @returns {boolean}
    */
-  function isPendingRangedPackShader(packLoader, hashBigInt) {
+  function isPendingRangedPackShader(packLoader, hashBigInt, hashHex) {
     if (!packLoader || typeof packLoader !== 'object') {
       return false;
     }
@@ -1089,6 +1089,53 @@
     }
     if (packLoader.mode === 'ranged' && packLoader.entries instanceof Map) {
       return packLoader.entries.has(hashBigInt);
+    }
+    if (typeof packLoader.getWgslAsync === 'function') {
+      let isRangedMode = packLoader.mode === 'ranged' || packLoader.mode === 'mixed';
+      if (!isRangedMode && typeof packLoader.getStats === 'function') {
+        try {
+          const st = packLoader.getStats();
+          const stMode = st && typeof st.mode === 'string' ? st.mode.trim().toLowerCase() : '';
+          isRangedMode = stMode === 'ranged' || stMode === 'mixed';
+        } catch (_err) {
+          isRangedMode = false;
+        }
+      }
+      if (
+        !isRangedMode &&
+        typeof packLoader.getWgsl !== 'function' &&
+        typeof packLoader.getSource !== 'function' &&
+        typeof packLoader.getShaderSource !== 'function' &&
+        typeof packLoader.lookup !== 'function' &&
+        typeof packLoader.get !== 'function'
+      ) {
+        isRangedMode = true;
+      }
+      if (isRangedMode) {
+        const hasFn =
+          typeof packLoader.hasShader === 'function'
+            ? packLoader.hasShader
+            : typeof packLoader.has === 'function'
+              ? packLoader.has
+              : null;
+        if (hasFn) {
+          try {
+            if (hasFn.call(packLoader, hashBigInt)) {
+              return true;
+            }
+          } catch (_err) {
+            // Fall through to canonical hex lookup.
+          }
+          const resolvedHex = hashHex !== undefined ? hashHex : formatShaderHash(hashBigInt);
+          try {
+            if (hasFn.call(packLoader, resolvedHex)) {
+              return true;
+            }
+          } catch (_err) {
+            return false;
+          }
+        }
+      }
     }
     return false;
   }
@@ -1286,6 +1333,7 @@
         fallbackHits: 0,
         builtinHits: 0,
       };
+      this._rangedPendingHits = 0;
 
       // W179: Categorized missing-shader telemetry (bounded unique hash+stage entries).
       this._categorizedMissing = new Map();
@@ -2087,8 +2135,8 @@
       }
 
       if (!this._isConfiguredFallbackHash(hashBigInt)) {
-        const packHit = lookupPackSource(this._packLoader, hashBigInt);
-        if (packHit) {
+        const packHit = lookupPackSource(this._packLoader, hashBigInt, hashHex);
+        if (packHit || isPendingRangedPackShader(this._packLoader, hashBigInt, hashHex)) {
           return true;
         }
       }
@@ -2213,6 +2261,25 @@
     }
 
     /**
+     * Record a completed asynchronous ranged-pack shader hit so `packHits`, `totalLookups`,
+     * and `hitRatePct` accurately reflect ranged HTTP 206 shader resolutions.
+     *
+     * @param {bigint | string | number | null | undefined} [hash]
+     * @param {number | string | null | undefined} [_stage]
+     */
+    recordPackHit(hash, _stage) {
+      if (hash !== undefined && hash !== null && hash !== '') {
+        try {
+          normalizeShaderHash(hash);
+        } catch (_err) {
+          // Non-fatal: still count the pack hit even if caller passed an opaque label.
+        }
+      }
+      this._stats.totalLookups += 1;
+      this._stats.packHits += 1;
+    }
+
+    /**
      * Resolve a requested shader hash for a stage:
      * 1) exact pack hit (never silently overwritten by fallbacks),
      * 2) registered / caller-supplied real shader guard (never silently overwritten by fallbacks),
@@ -2275,6 +2342,7 @@
         opts !== null &&
         (opts.forceFallback === true ||
           opts.isRealShader === true ||
+          opts.rangedPending === true ||
           opts.existingSource !== undefined ||
           opts.existingShader !== undefined ||
           opts.reason !== undefined ||
@@ -2554,31 +2622,52 @@
         }
       }
 
-      // Exact miss — record Frame-1, categorized, and W304 priority-hash telemetry in O(1).
-      const missingRow = this._trackMissing(requested, requestedHex, stageCode, stageName, nowMs, frame);
-      const priorityRow = this._trackMissingPriorityHash(requested, requestedHex, stageCode, stageName, nowMs);
-      const missReason =
-        opts !== null && (opts.reason !== undefined || opts.missingReason !== undefined)
-          ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
-          : MISSING_SHADER_REASONS.NOT_IN_PACK;
-      const categorizedRow = this._recordCategorizedMissingRow(requestedHex, stageName, missReason, nowMs);
+      const pendingRanged =
+        (opts !== null && opts.rangedPending === true) ||
+        isPendingRangedPackShader(this._packLoader, requested, requestedHex);
 
-      const canCacheMiss = !hasSpecialOpts && !isPendingRangedPackShader(this._packLoader, requested);
+      let missingRow = null;
+      let priorityRow = null;
+      let categorizedRow = null;
+      if (pendingRanged) {
+        // Shader exists in the ranged pack's TOC and is awaiting HTTP 206 fetch/compile.
+        // Do not record it as missing (`not_in_pack`) or inflate `builtinHits`/`totalLookups`;
+        // the real outcome will be recorded once ranged fetch/compile settles.
+        this._stats.totalLookups = Math.max(0, this._stats.totalLookups - 1);
+        this._rangedPendingHits += 1;
+      } else {
+        // Exact miss — record Frame-1, categorized, and W304 priority-hash telemetry in O(1).
+        missingRow = this._trackMissing(requested, requestedHex, stageCode, stageName, nowMs, frame);
+        priorityRow = this._trackMissingPriorityHash(requested, requestedHex, stageCode, stageName, nowMs);
+        const missReason =
+          opts !== null && (opts.reason !== undefined || opts.missingReason !== undefined)
+            ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
+            : MISSING_SHADER_REASONS.NOT_IN_PACK;
+        categorizedRow = this._recordCategorizedMissingRow(requestedHex, stageName, missReason, nowMs);
+      }
+
+      const canCacheMiss = !hasSpecialOpts && !pendingRanged;
 
       const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
       if (fallbackHash !== null && !this._compileFailures.has(fallbackHash)) {
         const resolvedHex = formatShaderHash(fallbackHash);
         const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
         if (fallbackHit) {
-          this._stats.fallbackHits += 1;
-          const result = Object.freeze({
+          if (!pendingRanged) {
+            this._stats.fallbackHits += 1;
+          }
+          const resultObj = {
             wgsl: fallbackHit.wgsl,
             source: 'fallback',
             requestedHash: requestedHex,
             resolvedHash: resolvedHex,
             stage: stageName,
             entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
-          });
+          };
+          if (pendingRanged) {
+            resultObj.rangedPending = true;
+          }
+          const result = Object.freeze(resultObj);
           if (canCacheMiss) {
             this._storeResolveCache(
               stageCode,
@@ -2606,8 +2695,10 @@
             locationCount: opts.interstageLocationCount,
           })
         : profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
-      this._stats.builtinHits += 1;
-      const result = Object.freeze({
+      if (!pendingRanged) {
+        this._stats.builtinHits += 1;
+      }
+      const resultObj = {
         wgsl: builtin,
         source: 'builtin',
         requestedHash: requestedHex,
@@ -2615,7 +2706,11 @@
         stage: stageName,
         entryPoint: extractEntryPoint(builtin, stageName),
         profile: profileName,
-      });
+      };
+      if (pendingRanged) {
+        resultObj.rangedPending = true;
+      }
+      const result = Object.freeze(resultObj);
       if (canCacheMiss) {
         this._storeResolveCache(
           stageCode,
@@ -3322,7 +3417,7 @@
       const hitRatio = total > 0 ? this._stats.packHits / total : 0;
       const hitRatePct =
         total > 0 ? Math.round(hitRatio * 10000) / 100 : 0;
-      return {
+      const stats = {
         totalLookups: this._stats.totalLookups,
         packHits: this._stats.packHits,
         fallbackHits: this._stats.fallbackHits,
@@ -3338,6 +3433,12 @@
         compileFailureCacheHits: this._compileFailureCacheHits,
         compileFailureRecorded: this._compileFailureRecorded,
       };
+      Object.defineProperty(stats, 'rangedPendingHits', {
+        value: this._rangedPendingHits,
+        enumerable: false,
+        configurable: true,
+      });
+      return stats;
     }
 
     /**
@@ -3377,6 +3478,7 @@
       this._stats.packHits = 0;
       this._stats.fallbackHits = 0;
       this._stats.builtinHits = 0;
+      this._rangedPendingHits = 0;
 
       this._resolveCacheHits = 0;
       this._fastPathHits = 0;

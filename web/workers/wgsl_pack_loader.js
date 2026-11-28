@@ -70,6 +70,9 @@ export const DEFAULT_MAX_RANGE_FETCH_RETRIES = 2;
 /** Default base backoff delay in milliseconds before retrying a transient Range fetch failure. */
 export const DEFAULT_RANGE_RETRY_DELAY_MS = 25;
 
+/** Default per-request timeout in milliseconds for ranged HTTP 206 fetches (`0` = no timeout). */
+export const DEFAULT_RANGE_FETCH_TIMEOUT_MS = 30000;
+
 /** Default maximum byte gap between nearby shaders to coalesce into a single prefetch HTTP 206 Range request (16 KiB, legacy alias). */
 export const DEFAULT_PREFETCH_MAX_GAP_BYTES = 16 * 1024;
 
@@ -665,6 +668,18 @@ function validateRangeRetryDelayMs(value, defaultValue = DEFAULT_RANGE_RETRY_DEL
   return value;
 }
 
+function validateRangeFetchTimeoutMs(value, defaultValue = DEFAULT_RANGE_FETCH_TIMEOUT_MS) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(
+      `rangeFetchTimeoutMs must be a non-negative finite number, got: ${value}`
+    );
+  }
+  return value;
+}
+
 function validateSleepFn(value, defaultValue = null) {
   if (value === undefined || value === null) {
     return defaultValue;
@@ -944,6 +959,9 @@ function isRetryableRangeFetchError(err, fetchInit) {
   if (!err) {
     return false;
   }
+  if (err.code === 'WGPK_RANGE_FETCH_TIMEOUT') {
+    return true;
+  }
   if (err.name === 'AbortError' || err.code === 'ABORT_ERR') {
     return false;
   }
@@ -1155,85 +1173,163 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit, rangeOptions
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
     throw new RangeError(`Invalid HTTP byte range: bytes=${start}-${end}`);
   }
-  if (fetchInit && fetchInit.signal && fetchInit.signal.aborted) {
-    throw createAbortError(fetchInit.signal);
+  const callerSignal = fetchInit && fetchInit.signal ? fetchInit.signal : null;
+  if (callerSignal && callerSignal.aborted) {
+    throw createAbortError(callerSignal);
   }
   const rangeHeader = `bytes=${start}-${end}`;
-  const response = await fetcher(
-    url,
-    mergeRequestInit(fetchInit, { cache: 'no-store', headers: { Range: rangeHeader } })
-  );
-  if (!response || (!response.ok && response.status !== 206)) {
-    const status = response ? response.status : 'unknown';
-    const statusText = response && response.statusText ? ` ${response.statusText}` : '';
-    const err = new Error(
-      `Failed to fetch WGSL pack range (${rangeHeader}) from "${url}": HTTP ${status}${statusText}`
-    );
-    err.httpStatus = response && typeof response.status === 'number' ? response.status : 0;
-    err.etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
-    err.lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
-    err.contentRangeTotal = parseContentRangeTotal(getResponseHeader(response, 'content-range'));
-    throw err;
-  }
+  const timeoutMs =
+    rangeOptions &&
+    typeof rangeOptions.timeoutMs === 'number' &&
+    Number.isFinite(rangeOptions.timeoutMs) &&
+    rangeOptions.timeoutMs > 0
+      ? rangeOptions.timeoutMs
+      : 0;
 
-  const contentRange = parseContentRange(getResponseHeader(response, 'content-range'));
-  const contentLength = parseNonNegativeInt(getResponseHeader(response, 'content-length'));
-  const etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
-  const lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
+  let timeoutId = null;
+  let timeoutController = null;
+  let onCallerAbort = null;
+  let requestInit = mergeRequestInit(fetchInit, { cache: 'no-store', headers: { Range: rangeHeader } });
 
-  if (response.status !== 206) {
-    const requirePartial = Boolean(rangeOptions && rangeOptions.requirePartialContent === true);
-    const maxFullFallbackBytes =
-      rangeOptions && typeof rangeOptions.maxFullFallbackBytes === 'number'
-        ? rangeOptions.maxFullFallbackBytes
-        : DEFAULT_MAX_FULL_FALLBACK_BYTES;
-    const exceedsCap =
-      maxFullFallbackBytes > 0 && contentLength !== null && contentLength > maxFullFallbackBytes;
-    if (requirePartial || exceedsCap) {
-      if (response.body && typeof response.body.cancel === 'function') {
-        try {
-          const cancelResult = response.body.cancel();
-          if (cancelResult && typeof cancelResult.catch === 'function') {
-            cancelResult.catch(() => {});
-          }
-        } catch (_) {
-          // Best-effort cancellation of oversized 200 OK body.
-        }
-      }
-      const sizeDetail =
-        contentLength !== null ? `${contentLength} bytes` : 'unknown size';
+  const runFetch = async () => {
+    const response = await fetcher(url, requestInit);
+    if (!response || (!response.ok && response.status !== 206)) {
+      const status = response ? response.status : 'unknown';
+      const statusText = response && response.statusText ? ` ${response.statusText}` : '';
       const err = new Error(
-        `WGSL pack range request (${rangeHeader}) from "${url}" received HTTP ${response.status} (${sizeDetail}) instead of 206 Partial Content; refusing full-pack buffer fallback`
+        `Failed to fetch WGSL pack range (${rangeHeader}) from "${url}": HTTP ${status}${statusText}`
       );
-      err.httpStatus = response.status;
-      err.code = 'WGPK_FULL_FALLBACK_REJECTED';
-      err.contentLength = contentLength;
-      err.etag = etag;
-      err.lastModified = lastModified;
+      err.httpStatus = response && typeof response.status === 'number' ? response.status : 0;
+      err.etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
+      err.lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
+      err.contentRangeTotal = parseContentRangeTotal(getResponseHeader(response, 'content-range'));
       throw err;
     }
+
+    const contentRange = parseContentRange(getResponseHeader(response, 'content-range'));
+    const contentLength = parseNonNegativeInt(getResponseHeader(response, 'content-length'));
+    const etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
+    const lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
+
+    if (response.status !== 206) {
+      const requirePartial = Boolean(rangeOptions && rangeOptions.requirePartialContent === true);
+      const maxFullFallbackBytes =
+        rangeOptions && typeof rangeOptions.maxFullFallbackBytes === 'number'
+          ? rangeOptions.maxFullFallbackBytes
+          : DEFAULT_MAX_FULL_FALLBACK_BYTES;
+      const exceedsCap =
+        maxFullFallbackBytes > 0 && contentLength !== null && contentLength > maxFullFallbackBytes;
+      if (requirePartial || exceedsCap) {
+        if (response.body && typeof response.body.cancel === 'function') {
+          try {
+            const cancelResult = response.body.cancel();
+            if (cancelResult && typeof cancelResult.catch === 'function') {
+              cancelResult.catch(() => {});
+            }
+          } catch (_) {
+            // Best-effort cancellation of oversized 200 OK body.
+          }
+        }
+        const sizeDetail =
+          contentLength !== null ? `${contentLength} bytes` : 'unknown size';
+        const err = new Error(
+          `WGSL pack range request (${rangeHeader}) from "${url}" received HTTP ${response.status} (${sizeDetail}) instead of 206 Partial Content; refusing full-pack buffer fallback`
+        );
+        err.httpStatus = response.status;
+        err.code = 'WGPK_FULL_FALLBACK_REJECTED';
+        err.contentLength = contentLength;
+        err.etag = etag;
+        err.lastModified = lastModified;
+        throw err;
+      }
+    }
+
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const totalSize =
+      contentRange && contentRange.total !== null
+        ? contentRange.total
+        : response.status === 200
+          ? contentLength !== null
+            ? contentLength
+            : bytes.byteLength
+          : null;
+
+    return {
+      status: response.status,
+      bytes,
+      contentRange,
+      contentLength,
+      etag,
+      lastModified,
+      totalSize,
+    };
+  };
+
+  if (timeoutMs <= 0) {
+    return runFetch();
   }
 
-  const buffer = await response.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const totalSize =
-    contentRange && contentRange.total !== null
-      ? contentRange.total
-      : response.status === 200
-        ? contentLength !== null
-          ? contentLength
-          : bytes.byteLength
-        : null;
+  if (typeof AbortController === 'function') {
+    timeoutController = new AbortController();
+    if (callerSignal && typeof callerSignal.addEventListener === 'function') {
+      onCallerAbort = () => {
+        try {
+          timeoutController.abort(callerSignal.reason);
+        } catch (_) {
+          timeoutController.abort();
+        }
+      };
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+    requestInit = { ...requestInit, signal: timeoutController.signal };
+  }
 
-  return {
-    status: response.status,
-    bytes,
-    contentRange,
-    contentLength,
-    etag,
-    lastModified,
-    totalSize,
-  };
+  let timedOut = false;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      const err = new Error(
+        `WGSL pack range request (${rangeHeader}) from "${url}" timed out after ${timeoutMs}ms`
+      );
+      err.name = 'TimeoutError';
+      err.code = 'WGPK_RANGE_FETCH_TIMEOUT';
+      if (timeoutController) {
+        try {
+          timeoutController.abort(err);
+        } catch (_) {
+          // Ignore AbortController abort errors.
+        }
+      }
+      reject(err);
+    }, timeoutMs);
+  });
+
+  const fetchExecution = runFetch();
+  // Suppress unhandled rejection if timeout fires before fetchExecution settles.
+  fetchExecution.catch(() => {});
+
+  try {
+    return await Promise.race([fetchExecution, timeoutPromise]);
+  } catch (err) {
+    if (timedOut && (!callerSignal || !callerSignal.aborted)) {
+      const timeoutErr = new Error(
+        `WGSL pack range request (${rangeHeader}) from "${url}" timed out after ${timeoutMs}ms`
+      );
+      timeoutErr.name = 'TimeoutError';
+      timeoutErr.code = 'WGPK_RANGE_FETCH_TIMEOUT';
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    if (callerSignal && onCallerAbort && typeof callerSignal.removeEventListener === 'function') {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
+  }
 }
 
 async function fetchRangeChunkWithRetry(fetcher, url, start, end, fetchInit, retryOptions = {}) {
@@ -1245,6 +1341,7 @@ async function fetchRangeChunkWithRetry(fetcher, url, start, end, fetchInit, ret
   const rangeOptions = {
     maxFullFallbackBytes: validateMaxFullFallbackBytes(retryOptions.maxFullFallbackBytes),
     requirePartialContent: Boolean(retryOptions.requirePartialContent === true),
+    timeoutMs: validateRangeFetchTimeoutMs(retryOptions.rangeFetchTimeoutMs),
   };
   const signal = fetchInit && fetchInit.signal ? fetchInit.signal : null;
 
@@ -1727,6 +1824,7 @@ export class WgslPack {
     maxConcurrentRangeFetches = DEFAULT_MAX_CONCURRENT_RANGE_FETCHES,
     maxRangeFetchRetries = DEFAULT_MAX_RANGE_FETCH_RETRIES,
     rangeRetryDelayMs = DEFAULT_RANGE_RETRY_DELAY_MS,
+    rangeFetchTimeoutMs = DEFAULT_RANGE_FETCH_TIMEOUT_MS,
     sleepFn = null,
     maxCoalesceGapBytes = undefined,
     prefetchMaxGapBytes = undefined,
@@ -1794,6 +1892,8 @@ export class WgslPack {
       mode === 'ranged' ? validateMaxRangeFetchRetries(maxRangeFetchRetries) : null;
     this._rangeRetryDelayMs =
       mode === 'ranged' ? validateRangeRetryDelayMs(rangeRetryDelayMs) : null;
+    this._rangeFetchTimeoutMs =
+      mode === 'ranged' ? validateRangeFetchTimeoutMs(rangeFetchTimeoutMs) : null;
     this._sleepFn = mode === 'ranged' ? validateSleepFn(sleepFn) : null;
     this._prefetchMaxGapBytes =
       mode === 'ranged'
@@ -2563,7 +2663,14 @@ export class WgslPack {
         maxFullFallbackBytes > 0 &&
         this.totalSize > maxFullFallbackBytes
     );
-    const rangeOptions = { maxFullFallbackBytes, requirePartialContent };
+    const rangeOptions = {
+      maxFullFallbackBytes,
+      requirePartialContent,
+      timeoutMs:
+        typeof this._rangeFetchTimeoutMs === 'number'
+          ? this._rangeFetchTimeoutMs
+          : DEFAULT_RANGE_FETCH_TIMEOUT_MS,
+    };
 
     let attempt = 0;
     for (;;) {
@@ -4133,6 +4240,9 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
   const rangeRetryDelayMs = validateRangeRetryDelayMs(
     options ? options.rangeRetryDelayMs : undefined
   );
+  const rangeFetchTimeoutMs = validateRangeFetchTimeoutMs(
+    options ? options.rangeFetchTimeoutMs : undefined
+  );
   const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
   const prefetchMaxGapBytes = resolvePrefetchMaxGapBytes(options);
   const prefetchMaxSpanBytes = resolvePrefetchMaxSpanBytes(options);
@@ -4179,6 +4289,7 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     maxConcurrentRangeFetches,
     maxRangeFetchRetries,
     rangeRetryDelayMs,
+    rangeFetchTimeoutMs,
     sleepFn,
     prefetchMaxGapBytes,
     prefetchMaxSpanBytes,
@@ -4211,6 +4322,9 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
   );
   const rangeRetryDelayMs = validateRangeRetryDelayMs(
     options ? options.rangeRetryDelayMs : undefined
+  );
+  const rangeFetchTimeoutMs = validateRangeFetchTimeoutMs(
+    options ? options.rangeFetchTimeoutMs : undefined
   );
   const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
   const prefetchMaxGapBytes = resolvePrefetchMaxGapBytes(options);
@@ -4368,6 +4482,7 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     maxConcurrentRangeFetches,
     maxRangeFetchRetries,
     rangeRetryDelayMs,
+    rangeFetchTimeoutMs,
     sleepFn,
     prefetchMaxGapBytes,
     prefetchMaxSpanBytes,
@@ -4418,6 +4533,7 @@ export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
   validateMaxConcurrentRangeFetches(options.maxConcurrentRangeFetches);
   const maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
   const rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
+  const rangeFetchTimeoutMs = validateRangeFetchTimeoutMs(options.rangeFetchTimeoutMs);
   const sleepFn = validateSleepFn(options.sleepFn);
   resolvePrefetchMaxGapBytes(options);
   resolvePrefetchMaxSpanBytes(options);
@@ -4433,6 +4549,7 @@ export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
     {
       maxRangeFetchRetries,
       rangeRetryDelayMs,
+      rangeFetchTimeoutMs,
       sleepFn,
       maxFullFallbackBytes,
       requirePartialContent: Boolean(options.requirePartialContent === true),
@@ -4638,6 +4755,7 @@ export class WgslPackCache {
     );
     this._maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
     this._rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
+    this._rangeFetchTimeoutMs = validateRangeFetchTimeoutMs(options.rangeFetchTimeoutMs);
     this._sleepFn = validateSleepFn(options.sleepFn);
     this._prefetchMaxGapBytes = resolvePrefetchMaxGapBytes(options);
     this._prefetchMaxSpanBytes = resolvePrefetchMaxSpanBytes(options);
@@ -4860,6 +4978,7 @@ export class WgslPackCache {
         options.maxConcurrentRangeFetches ?? this._maxConcurrentRangeFetches,
       maxRangeFetchRetries: options.maxRangeFetchRetries ?? this._maxRangeFetchRetries,
       rangeRetryDelayMs: options.rangeRetryDelayMs ?? this._rangeRetryDelayMs,
+      rangeFetchTimeoutMs: options.rangeFetchTimeoutMs ?? this._rangeFetchTimeoutMs,
       sleepFn: options.sleepFn ?? this._sleepFn,
       prefetchMaxGapBytes: resolvePrefetchMaxGapBytes(options, this._prefetchMaxGapBytes),
       prefetchMaxSpanBytes: resolvePrefetchMaxSpanBytes(options, this._prefetchMaxSpanBytes),
@@ -4967,6 +5086,7 @@ export class WgslPackCache {
           options.maxConcurrentRangeFetches ?? this._maxConcurrentRangeFetches,
         maxRangeFetchRetries: options.maxRangeFetchRetries ?? this._maxRangeFetchRetries,
         rangeRetryDelayMs: options.rangeRetryDelayMs ?? this._rangeRetryDelayMs,
+        rangeFetchTimeoutMs: options.rangeFetchTimeoutMs ?? this._rangeFetchTimeoutMs,
         sleepFn: options.sleepFn ?? this._sleepFn,
         prefetchMaxGapBytes: resolvePrefetchMaxGapBytes(options, this._prefetchMaxGapBytes),
         prefetchMaxSpanBytes: resolvePrefetchMaxSpanBytes(options, this._prefetchMaxSpanBytes),
