@@ -1799,8 +1799,9 @@ struct NativeExecutor::Impl {
     }
 
     // The display pipeline (show_target_wgsl) for a colour target of format fmt.
-    void build_show_pipeline(bool ms, wgpu::TextureFormat fmt, wgpu::RenderPipeline* pipe, wgpu::BindGroupLayout* bgl) {
-        const std::string code = show_target_wgsl(ms);
+    void build_show_pipeline(bool ms, wgpu::TextureFormat fmt, wgpu::RenderPipeline* pipe, wgpu::BindGroupLayout* bgl,
+                             bool volume = false) {
+        const std::string code = show_target_wgsl(ms, volume);
         wgpu::ShaderSourceWGSL wgsl{};
         wgsl.code = {code.data(), code.size()};
         wgpu::ShaderModuleDescriptor md{};
@@ -1811,7 +1812,7 @@ struct NativeExecutor::Impl {
         le[0].binding = 0;
         le[0].visibility = wgpu::ShaderStage::Fragment;
         le[0].texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
-        le[0].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+        le[0].texture.viewDimension = volume ? wgpu::TextureViewDimension::e3D : wgpu::TextureViewDimension::e2D;
         le[0].texture.multisampled = ms;
         le[1].binding = 1;
         le[1].visibility = wgpu::ShaderStage::Fragment;
@@ -2011,8 +2012,8 @@ struct NativeExecutor::Impl {
     };
     std::vector<DumpStorage> dump_storage;  // storage textures written by the frame's dispatches
     DumpCounters frame_start_counters;      // the counters when the frame being built began
-    wgpu::RenderPipeline dump_pipe[2];
-    wgpu::BindGroupLayout dump_bgl[2];
+    wgpu::RenderPipeline dump_pipe[3];  // 2d, multisampled, 3d
+    wgpu::BindGroupLayout dump_bgl[3];
     std::atomic<uint64_t> dump_saved{0}, dump_failed{0};
 
     bool dump_wanted_now() const {
@@ -2050,6 +2051,90 @@ struct NativeExecutor::Impl {
                                                        static_cast<uint32_t>(dump_passes.size())});
             }
         }
+    }
+
+    // What each executed draw / dispatch of a dumped frame bound: pipeline hash and the textures of its groups
+    // (stream ids, "w" = written as storage). Keyed by the number of render passes begun before it.
+    struct DumpWork {
+        uint32_t after = 0;
+        std::string text;
+        uint32_t repeat = 1;
+    };
+    std::vector<DumpWork> dump_work;
+    std::vector<std::pair<TargetRef, uint32_t>> dump_sampled;  // textures the frame's work bound (first use: passes begun)
+    std::unordered_map<const void*, uint32_t> dump_tex_ids;  // texture handle -> stream id (rebuilt on a miss)
+
+    uint32_t dump_tex_id(const void* h) {
+        auto it = dump_tex_ids.find(h);
+        if (it != dump_tex_ids.end()) return it->second;
+        dump_tex_ids.clear();
+        for (const auto& [id, t] : textures)
+            if (t.texture) dump_tex_ids.emplace(t.texture.Get(), id);
+        it = dump_tex_ids.find(h);
+        return it != dump_tex_ids.end() ? it->second : 0;
+    }
+
+    template <class Enc>
+    void dump_note_work(const Enc& e, bool dispatch) {
+        if (!dump_wanted_now() || dump_work.size() >= 4000) return;
+        uint64_t hash = 0;
+        if (dispatch) {
+            auto h = e.active_compute ? compute_hash.find(*e.active_compute) : compute_hash.end();
+            if (h != compute_hash.end()) hash = h->second;
+        } else if (e.active_pipeline) {
+            auto it = render_pipelines.find(*e.active_pipeline);
+            if (it != render_pipelines.end()) hash = it->second.perf_hash;
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%s 0x%016llx", dispatch ? "dispatch" : "draw", static_cast<unsigned long long>(hash));
+        std::string s = buf;
+        for (uint32_t g = 0; g < Enc::kBindSlots; ++g) {
+            if (!(e.want_mask & (1u << g))) continue;
+            const auto& u = e.want[g].usage;
+            s += " g" + std::to_string(g) + "[";
+            auto bit = bg_infos.find(e.want[g].group.Get());
+            const std::vector<wgpu::BindGroupEntry>* ents =
+                bit != bg_infos.end() && bit->second ? &bit->second->entries : u ? &u->entries : nullptr;
+            if (!ents) {
+                s += "?]";
+                continue;
+            }
+            bool first = true;
+            for (const wgpu::BindGroupEntry& be : *ents) {
+                std::string item;
+                if (be.textureView) {
+                    auto mit = view_meta.find(be.textureView.Get());
+                    const void* th = mit != view_meta.end() ? mit->second.tex.Get() : nullptr;
+                    const uint32_t id = th ? dump_tex_id(th) : 0;
+                    item = "b" + std::to_string(be.binding) + "=tex" + (id ? std::to_string(id) : std::string("?"));
+                    if (id && mit != view_meta.end()) {
+                        const TargetRef r{id, false, mit->second.base_mip, mit->second.base_layer};
+                        bool seen = false;
+                        for (const auto& [sr, sa] : dump_sampled) seen = seen || (sr.id == r.id && sr.mip == r.mip && sr.layer == r.layer);
+                        if (!seen && dump_sampled.size() < 64) dump_sampled.emplace_back(r, static_cast<uint32_t>(dump_passes.size()));
+                    }
+                    if (u)
+                        for (const ResUse& ru : u->m.uses)
+                            if (ru.texture && ru.res == th && ru.kind == UseKind::StorageTexWrite) {
+                                item += "w";
+                                break;
+                            }
+                } else if (be.buffer) {
+                    item = "b" + std::to_string(be.binding) + "=buf";
+                } else {
+                    continue;
+                }
+                s += (first ? "" : " ") + item;
+                first = false;
+            }
+            s += "]";
+        }
+        const uint32_t after = static_cast<uint32_t>(dump_passes.size());
+        if (!dump_work.empty() && dump_work.back().after == after && dump_work.back().text == s) {
+            ++dump_work.back().repeat;
+            return;
+        }
+        dump_work.push_back(DumpWork{after, std::move(s), 1});
     }
 
     struct DumpJob {
@@ -2115,6 +2200,12 @@ struct NativeExecutor::Impl {
                            " storage textures written by dispatches; stream " + std::to_string(stream_w) + "x" +
                            std::to_string(stream_h));
         if (!dump_passes.empty()) df->head.push_back("before pass 0: " + delta(frame_start_counters, dump_passes[0].at));
+        auto work = [&](uint32_t after) {
+            for (const DumpWork& w : dump_work)
+                if (w.after == after)
+                    df->head.push_back("    " + w.text + (w.repeat > 1 ? " x" + std::to_string(w.repeat) : std::string()));
+        };
+        work(0);
         for (size_t p = 0; p < dump_passes.size(); ++p) {
             const DumpPass& d = dump_passes[p];
             const DumpCounters& next = p + 1 < dump_passes.size() ? dump_passes[p + 1].at : end;
@@ -2125,6 +2216,7 @@ struct NativeExecutor::Impl {
                                    job_for(d.colors[c], target_dump_stem(static_cast<uint32_t>(p), d.colors[c].id, "", d.slots[c]), ""));
             if (d.depth)
                 df->head.push_back("  depth " + job_for(*d.depth, target_dump_stem(static_cast<uint32_t>(p), d.depth->id, "depth", 0), "depth"));
+            work(static_cast<uint32_t>(p + 1));
         }
         for (const DumpStorage& s : dump_storage) {
             auto it = by_handle.find(s.res);
@@ -2135,6 +2227,15 @@ struct NativeExecutor::Impl {
             df->head.push_back("storage (first written after pass " + std::to_string(s.after_pass) + ") " +
                                job_for(TargetRef{it->second, false, s.mip, s.layer},
                                        target_dump_stem(s.after_pass, it->second, "storage", 0), "storage"));
+        }
+        for (const auto& [r, after] : dump_sampled) {
+            auto tit = textures.find(r.id);
+            const bool depth = tit != textures.end() && format_is_depth(tit->second.geom.format);
+            TargetRef rr = r;
+            rr.depth = depth;
+            df->head.push_back("bound (first after pass " + std::to_string(after) + ") " +
+                               job_for(rr, target_dump_stem(after, r.id, depth ? "bound-depth" : "bound", 0),
+                                       depth ? "bound depth" : "bound"));
         }
         df->results.resize(df->jobs.size());
         return df;
@@ -2166,16 +2267,22 @@ struct NativeExecutor::Impl {
                       format_info(st.format).name, st.sample_count > 1 ? " msaa" : "", mw, mh, sub.mip, st.mips,
                       sub.layer, st.layers);
         j->desc = desc;
-        const std::string why = show_target_unsupported(st, ref.depth);
+        // A 3d texture (a colour LUT): its middle z slice through the texture_3d variant of the display shader.
+        const bool volume = st.dimension == 2 && !t.bc3d_fallback && !ref.depth;
+        ShowTexture chk = st;
+        if (volume) chk.dimension = 1;
+        const std::string why = show_target_unsupported(chk, ref.depth);
         if (!why.empty()) {
             j->error = "cannot be dumped: " + why;
             return;
         }
+        const uint32_t slice = volume ? show_target_mip_extent(st.layers, sub.mip) / 2 : 0;
+        if (volume) j->desc += " (3d, slice z=" + std::to_string(slice) + ")";
         wgpu::TextureViewDescriptor vd{};
-        vd.dimension = wgpu::TextureViewDimension::e2D;
+        vd.dimension = volume ? wgpu::TextureViewDimension::e3D : wgpu::TextureViewDimension::e2D;
         vd.baseMipLevel = sub.mip;
         vd.mipLevelCount = 1;
-        vd.baseArrayLayer = sub.layer;
+        vd.baseArrayLayer = volume ? 0 : sub.layer;
         vd.arrayLayerCount = 1;
         wgpu::TextureView view;
         if (ref.depth) {
@@ -2190,8 +2297,10 @@ struct NativeExecutor::Impl {
             view = t.texture.CreateView(&vd);
         }
         const bool ms = t.sample_count > 1 && !ref.depth;
-        if (!dump_pipe[ms]) build_show_pipeline(ms, wgpu::TextureFormat::RGBA16Float, &dump_pipe[ms], &dump_bgl[ms]);
-        if (!view || !dump_pipe[ms]) {
+        const size_t pk = volume ? 2 : ms ? 1 : 0;
+        if (!dump_pipe[pk])
+            build_show_pipeline(ms && !volume, wgpu::TextureFormat::RGBA16Float, &dump_pipe[pk], &dump_bgl[pk], volume);
+        if (!view || !dump_pipe[pk]) {
             j->error = "display pipeline unavailable";
             return;
         }
@@ -2207,6 +2316,7 @@ struct NativeExecutor::Impl {
         std::memcpy(ubits, u, sizeof u);
         ubits[8] = ref.depth ? 1u : 0u;
         ubits[9] = 1u;  // raw
+        ubits[10] = slice;
         wgpu::BufferDescriptor ubd{};
         ubd.size = 48;
         ubd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
@@ -2219,7 +2329,7 @@ struct NativeExecutor::Impl {
         be[1].buffer = ub;
         be[1].size = 48;
         wgpu::BindGroupDescriptor bd{};
-        bd.layout = dump_bgl[ms];
+        bd.layout = dump_bgl[pk];
         bd.entryCount = 2;
         bd.entries = be;
         wgpu::BindGroup group = device.CreateBindGroup(&bd);
@@ -2233,7 +2343,7 @@ struct NativeExecutor::Impl {
         rp.colorAttachmentCount = 1;
         rp.colorAttachments = &a;
         wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
-        pass.SetPipeline(dump_pipe[ms]);
+        pass.SetPipeline(dump_pipe[pk]);
         pass.SetBindGroup(0, group);
         pass.Draw(3);
         pass.End();
@@ -3006,6 +3116,8 @@ struct NativeExecutor::Impl {
         frame_pass_count = 0;
         dump_passes.clear();
         dump_storage.clear();
+        dump_work.clear();
+        dump_sampled.clear();
         if (!options.dump_targets_at.empty()) frame_start_counters = dump_counters_now();
         clear_color = kDefaultClearColor;
         pass_cmds.clear();
@@ -7770,6 +7882,7 @@ struct NativeExecutor::Impl {
                 e.rpass.Draw(d->vertex_count, clamp_draw_instances(d->vertex_count, d->instance_count), d->first_vertex,
                              d->first_instance);
                 ++stats.draws;
+                if (!options.dump_targets_at.empty()) dump_note_work(e, false);
             }
         } else if (const auto* di = std::get_if<DrawIndexedCmd>(&cmd)) {
             e.had_explicit_compute = false;
@@ -7780,6 +7893,7 @@ struct NativeExecutor::Impl {
                 e.rpass.DrawIndexed(di->index_count, clamp_draw_instances(di->index_count, di->instance_count),
                                     di->first_index, di->base_vertex, di->first_instance);
                 ++stats.draws;
+                if (!options.dump_targets_at.empty()) dump_note_work(e, false);
             }
         } else if (const auto* in = std::get_if<IndirectCmd>(&cmd)) {
             auto it = buffers.find(in->id);
@@ -7813,12 +7927,14 @@ struct NativeExecutor::Impl {
                 ++stats.dispatches;
                 ++sub_indirect;
                 if (!options.dump_targets_at.empty()) dump_note_dispatch(e);
+                if (!options.dump_targets_at.empty()) dump_note_work(e, true);
                 alias_post_dispatch(e);
             } else if (draw_allowed(e) && flush_binds(e)) {
                 occ_before_draw(e);
                 if (in->kind == 1) e.rpass.DrawIndexedIndirect(it->second.buffer, in->offset);
                 else e.rpass.DrawIndirect(it->second.buffer, in->offset);
                 ++stats.draws;
+                if (!options.dump_targets_at.empty()) dump_note_work(e, false);
                 ++sub_indirect;
             }
         } else if (const auto* sc = std::get_if<SetComputePipelineCmd>(&cmd)) {
@@ -7892,6 +8008,7 @@ struct NativeExecutor::Impl {
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
             if (!options.dump_targets_at.empty()) dump_note_dispatch(e);
+            if (!options.dump_targets_at.empty()) dump_note_work(e, true);
             sub_max_groups = std::max<uint64_t>(sub_max_groups, uint64_t{x} * y * z);
             alias_post_dispatch(e);
         } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {

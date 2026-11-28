@@ -282,7 +282,7 @@ inline float show_target_map(float v, float lo, float hi) { return std::min(1.0f
 
 // The display shader. The fragment reads the texel under its own framebuffer position
 // (textureLoad, no filtering: exact values, any float format, multisampled sample 0).
-inline std::string show_target_wgsl(bool multisampled) {
+inline std::string show_target_wgsl(bool multisampled, bool volume = false) {
     std::string s =
         "struct U {\n"
         "  rect: vec4<f32>,  // x, y, w, h of the destination rect in framebuffer pixels\n"
@@ -290,7 +290,7 @@ inline std::string show_target_wgsl(bool multisampled) {
         "  mode: vec4<u32>,  // x: 1 = single channel (depth), 0 = rgb; y: 1 = raw texel (no range, alpha kept)\n"
         "};\n"
         "@group(0) @binding(0) var tex: ";
-    s += multisampled ? "texture_multisampled_2d<f32>;\n" : "texture_2d<f32>;\n";
+    s += volume ? "texture_3d<f32>;\n" : multisampled ? "texture_multisampled_2d<f32>;\n" : "texture_2d<f32>;\n";
     s +=
         "@group(0) @binding(1) var<uniform> u: U;\n"
         "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
@@ -299,8 +299,10 @@ inline std::string show_target_wgsl(bool multisampled) {
         "}\n"
         "@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {\n"
         "  let uv = (pos.xy - u.rect.xy) / u.rect.zw;\n"
-        "  let xy = vec2<i32>(clamp(floor(uv * u.src.xy), vec2<f32>(0.0), u.src.xy - vec2<f32>(1.0)));\n"
-        "  let c = textureLoad(tex, xy, 0);\n"
+        "  let xy = vec2<i32>(clamp(floor(uv * u.src.xy), vec2<f32>(0.0), u.src.xy - vec2<f32>(1.0)));\n";
+    s += volume ? "  let c = textureLoad(tex, vec3<i32>(xy, i32(u.mode.z)), 0);  // mode.z: the z slice\n"
+                : "  let c = textureLoad(tex, xy, 0);\n";
+    s +=
         "  var v = c.rgb;\n"
         "  if (u.mode.x == 1u) { v = vec3<f32>(c.r); }\n"
         "  if (u.mode.y == 1u) { return vec4<f32>(v, select(c.a, 1.0, u.mode.x == 1u)); }  // raw (--dump-targets-at)\n"

@@ -307,7 +307,10 @@ and screenshot copies, each distinct target is drawn with the display shader in 
 is, depth through its r32float twin) into an rgba16float copy at most 640 px on its larger side, read back
 asynchronously and written as `present-N/pass-PPP-tex-ID[-depth|-storage][-cK].png` (scaled by its own max) plus
 `index.txt`: per pass the work that ran / was skipped up to the next pass, per target format, size, `BLACK` / `FLAT` /
-`ok`, max, mean, alpha range, NaN / inf counts. Contents are those at the present (a target rewritten later in the frame
+`ok`, max, mean, alpha range, NaN / inf counts. Each executed draw / dispatch is listed under its pass with its
+pipeline hash (0 = a guest-internal pipeline such as the PresentX plane blit) and the textures of its groups (`tex?`:
+a view the registry no longer knows), and the textures they bind are dumped too (`-bound`); a 3d texture shows its
+middle z slice. Contents are those at the present (a target rewritten later in the frame
 shows its last state). Same read-only rule and the same unsupported cases as `--show-target`. Stats: `targets_dumped`,
 `targets_dump_failed`. Tests: `test_target_dump_model` (model), `test_dump_targets` (GPU).
 
