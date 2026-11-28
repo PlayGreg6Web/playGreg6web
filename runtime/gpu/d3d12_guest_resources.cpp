@@ -2362,6 +2362,12 @@ void set_flush_crosscheck_every(uint32_t n) {
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     os::lock_with_span(flush_mutex_, os::SpanKind::D3dLock);
     std::lock_guard<std::mutex> flush_lock(flush_mutex_, std::adopt_lock);
+    // Odd while a flush runs: bumped before any write mark is taken and again when it ends.
+    flush_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    struct FlushEpochEnd {
+        std::atomic<uint64_t>& epoch;
+        ~FlushEpochEnd() { epoch.fetch_add(1, std::memory_order_acq_rel); }
+    } flush_epoch_end{flush_epoch_};
     // G70 (#691): emit deferred DestroyResource packets from the previous frame once Present has
     // advanced (strictly after that frame's Present and before any draw in the new frame).
     bridge_->advance_present_frame(presents(), encoder);
@@ -2954,7 +2960,9 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             };
             const uint64_t write_len = align_up(r.size, 4u);
             const uint64_t cpu = cpu_address_for_gpu(r.va);
-            if (unwritten(cpu, r.size) && r.ever_uploaded) {
+            const bool marks_vouch = r.ever_uploaded && !r.hash_next_flush;  // hashed below otherwise
+            r.hash_next_flush = false;
+            if (unwritten(cpu, r.size) && marks_vouch) {
                 reindex();
                 return;
             }
@@ -2968,7 +2976,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 if (view.data() != nullptr) {
                     mapped = true;
                     seen_host = reinterpret_cast<uintptr_t>(view.data());
-                    if (native_unwritten(r.write_cursor, r.write_primed, view.data(), r.size) && r.ever_uploaded) {
+                    if (native_unwritten(r.write_cursor, r.write_primed, view.data(), r.size) && marks_vouch) {
                         unchanged = true;  // no page written since the last hash: same bytes
                     } else {
                         hash = content_hash(view.data(), static_cast<size_t>(r.size));
@@ -3295,18 +3303,34 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     const RelocatedStorageKey key{va, size, dedicated};
 
     const uint64_t present = present_epoch();
-    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
-    const uint64_t seq = ++storage_relocation_seq_;
-    if (auto it = storage_relocations_.find(key); it != storage_relocations_.end()) {
+    // A hit only touches the LRU; false on a miss. Called with storage_relocation_mutex_ held.
+    const auto take_hit = [&]() {
+        const auto it = storage_relocations_.find(key);
+        if (it == storage_relocations_.end()) {
+            return false;
+        }
+        const uint64_t hit_seq = ++storage_relocation_seq_;
         storage_relocation_lru_.erase(it->second.last_used_seq);
-        storage_relocation_lru_.emplace(seq, key);
+        storage_relocation_lru_.emplace(hit_seq, key);
         it->second.last_used_present = present;
-        it->second.last_used_seq = seq;
+        it->second.last_used_seq = hit_seq;
         *buffer_id = it->second.buffer_id;
         *offset = it->second.offset;
         return true;
+    };
+    {
+        std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+        if (take_hit()) {
+            return true;
+        }
     }
 
+    // Miss: read and hash the guest bytes (up to 16 MiB) without the lock, so recording threads that
+    // hit (and refresh_memory_bind_groups) are not held behind the copy. A guest write racing the read
+    // is caught like any other: the new entry is unprimed and compared at the next flush. If a flush ran
+    // during the read it may have taken the write marks of a write that landed after it, so the entry is
+    // then marked hash_next_flush.
+    const uint64_t flush_epoch_before = flush_epoch_.load(std::memory_order_acquire);
     std::vector<uint8_t> bytes(static_cast<size_t>(size), 0);
     if (!read_guest_best_effort(cpu_va, bytes.data(), bytes.size())) {
         return false;
@@ -3314,6 +3338,12 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     const uint64_t hash = content_hash(bytes.data(), bytes.size());
     const uint64_t write_len = align_up(size, 4u);
     bytes.resize(static_cast<size_t>(write_len), 0);
+
+    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+    if (take_hit()) {
+        return true;  // another thread placed the same range meanwhile
+    }
+    const uint64_t seq = ++storage_relocation_seq_;
 
     CommandEncoder enc;
     uint32_t target_buf = 0;
@@ -3457,6 +3487,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     entry.last_used_seq = seq;
     entry.last_used_present = present;
     entry.ever_uploaded = true;
+    entry.hash_next_flush = (flush_epoch_before & 1u) != 0 ||
+                            flush_epoch_.load(std::memory_order_acquire) != flush_epoch_before;
     entry.dedicated = dedicated;
     entry.created_epoch = relocation_evictions_.load(std::memory_order_relaxed);
     const auto placed = storage_relocations_.emplace(key, entry).first;

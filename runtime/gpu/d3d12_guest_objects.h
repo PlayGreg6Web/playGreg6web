@@ -1321,6 +1321,9 @@ private:
         uint64_t created_epoch = 0;      // relocation_evictions_ when this home took the range
         bool ever_uploaded = false;
         bool dedicated = false;
+        // Placed from bytes read while a flush ran (relocate_storage_buffer reads outside the lock): the
+        // write marks cannot vouch for it, so the next flush hashes it whatever the marks say.
+        bool hash_next_flush = false;
         // Native write tracking of the guest range: with a primed cursor and no page written since the last
         // flush the range is not hashed again (flush_cpu_buffers). Unprimed = hash and arm.
         os::WriteCursor write_cursor;
@@ -1436,6 +1439,10 @@ private:
     os::WriteCursor flush_cursor_{};
     uint64_t flush_seq_ = 0;
     bool page_index_live_ = false;
+    // Bumped when a flush begins and when it ends (odd while one runs; read without flush_mutex_):
+    // relocate_storage_buffer reads a new range's bytes outside its lock and needs to know whether a
+    // flush could have taken the write marks meanwhile.
+    std::atomic<uint64_t> flush_epoch_{0};
     // O36: one pass over the translated window's write marks per flush_cpu_buffers, shared by the
     // tracked buffers and the relocated ranges (under flush_mutex_).
     std::mutex flush_mutex_;
