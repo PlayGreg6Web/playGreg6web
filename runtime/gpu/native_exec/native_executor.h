@@ -171,7 +171,7 @@ struct ExecutorOptions {
 inline constexpr size_t kOpcodeSlots = 64;
 
 // A direct dispatch's workgroups in all are cut to kMaxDispatchGroups (z first, then y, then x), as the
-// ExecuteIndirect clamp pass cuts indirect ones (state_bridge indirect_clamp_wgsl MAX_GROUPS): a garbage
+// ExecuteIndirect clamp pass cuts indirect ones (state_bridge indirect_clamp_wgsl MAX_GROUPS, 2^18): a garbage
 // count would keep the GPU busy past the TDR limit. True: the counts were cut.
 inline constexpr uint64_t kMaxDispatchGroups = uint64_t{1} << 22;
 inline bool clamp_dispatch_groups(uint32_t* x, uint32_t* y, uint32_t* z) {
@@ -235,6 +235,9 @@ struct ExecutorStats {
     std::string device_removed_reason;        // GetDeviceRemovedReason of the last loss (e.g. DXGI_ERROR_DEVICE_HUNG)
     uint64_t recovery_attempts = 0;           // device creations tried by recoveries
     uint64_t recovery_instance_resets = 0;    // ... after dropping the instance (the removed adapter's D3D12 device)
+    uint64_t recovery_bind_groups_deferred = 0;  // bind groups a recovery left to their next bind (not replayed)
+    std::string recovery_timeline;            // JSON: the last recovery's phases and attempts (ms)
+    uint64_t debug_gpu_hangs = 0;             // GPU hangs injected on purpose (debug_hang_gpu / PG6_DEBUG_GPU_HANG_AT_FRAME)
     uint64_t submit_budget_splits = 0;        // early submits at a pass boundary (submit_budget_ns)
     uint64_t submit_est_max_ns = 0;           // the largest estimated GPU time of one submit
     uint64_t submits_tracked = 0;             // frame submits watched for completion
@@ -621,6 +624,10 @@ public:
     void debug_force_device_lost(const std::string& message);
     // Test hook: the next `count` device creations fail, so a recovery ends fatal without a device.
     void debug_fail_device_creations(int count);
+    // Test hook: submits a compute dispatch that never ends (a real GPU hang: on Windows the driver resets the
+    // adapter after ~2 s, DXGI_ERROR_DEVICE_HUNG), so a recovery from a real TDR can be timed. Counted in
+    // stats().debug_gpu_hangs. PG6_DEBUG_GPU_HANG_AT_FRAME=<n> does the same right after frame n is submitted.
+    void debug_hang_gpu();
     bool faulted() const;
 
     uint64_t frame_count() const;

@@ -2517,8 +2517,12 @@ const char* indirect_clamp_wgsl() noexcept {
     // buffer, dispatches to the per-dimension workgroup limit. Every draw is cut to MAX_DRAW_WORK
     // vertices (indices) x instances and every dispatch to MAX_GROUPS workgroups in all: a garbage
     // record (GPU-written arguments) would otherwise keep the GPU busy for seconds (a TDR, device lost).
+    // MAX_GROUPS is 2^18 (16.7M invocations of a 64-wide group), below the 2^22 of a direct dispatch (a
+    // CPU-chosen count): the std-pack boot's hung submit held one compute pass with 91 indirect dispatches
+    // behind a counter-clear kernel whose translated count is never loaded (0x56d744a4394aeb41), and 91 of
+    // them cut at 2^22 is ~24G invocations, far past the ~2 s Windows' TDR allows.
     return R"(const MAX_DRAW_WORK: u32 = 67108864u;
-const MAX_GROUPS: u32 = 4194304u;
+const MAX_GROUPS: u32 = 262144u;
 fn cut_instances(per_instance: u32, instances: u32) -> u32 {
     if (per_instance == 0u || instances <= MAX_DRAW_WORK / per_instance) {
         return instances;

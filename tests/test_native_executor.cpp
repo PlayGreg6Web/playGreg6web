@@ -2577,7 +2577,11 @@ void test_timers() {
         if (!inflight.empty() && inflight != "[]") {
             CHECK(inflight.find("\"est_gpu_ms\": ") != std::string::npos);
             CHECK(inflight.find("\"top_pass\": {\"hash\": \"0x00c0ffee0badf00d\"") != std::string::npos);
+            // Every compute shader of the submit, with its dispatch counts (the timing key is only the first).
+            CHECK(inflight.find("\"compute_shaders\": [{\"cs\": \"0x00c0ffee0badf00d\", \"dispatches\": 1, \"indirect\": 0, "
+                                "\"direct_groups\": 64, \"max_groups\": 64}]") != std::string::npos);
         }
+        CHECK(ex->stats_json().find("\"recovery_timeline\": {\"prepare_ms\": ") != std::string::npos);
     }
     ex.reset();  // closes the pack
     std::remove(path.c_str());
@@ -4235,6 +4239,97 @@ void test_bind_group_budget() {
 
 // The journal folds buffer writes into one image per buffer and drops texture writes a later write covers;
 // over the budget the content of resources rewritten in many frames goes first.
+// A recovery leaves the bind groups to their next bind (no ~35k creations while the title's watchdog runs):
+// the compute dispatch after the loss rebuilds its group from the journal and writes the same output.
+void test_device_loss_lazy_bind_groups() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    CHECK(ex != nullptr);
+    if (!ex) return;
+    gpu::CommandEncoder setup;
+    setup.create_buffer(70, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(72, GpuShaderStage::Compute, kCompute);
+    create_layouts(setup, 73, 74, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 75;
+    cp.cs_module_id = 72;
+    cp.pipeline_layout_id = 74;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 76, 73, {bg_entry(0, GpuBindResourceType::Buffer, 70)});
+    create_bind_group(setup, 77, 73, {bg_entry(0, GpuBindResourceType::Buffer, 70)});  // never bound again
+    run(*ex, setup);
+    ex->debug_force_device_lost("simulated hang: Device removed reason: DXGI_ERROR_DEVICE_HUNG (0x887A0006)");
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(75);
+    set_bind_group2(frame, 0, 76);
+    frame.dispatch_compute(1, 1, 1);
+    frame.present();
+    run(*ex, frame);
+    ex->wait_idle();
+    CHECK(ex->stats().recoveries == 1 && !ex->faulted());
+    CHECK(ex->stats().recovery_bind_groups_deferred == 2);
+    CHECK(ex->stats().bind_groups_recreated == 1);
+    CHECK(ex->stats().bind_groups_recreate_failed == 0);
+    CHECK(ex->stats().recovery_instance_resets >= 1);
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex->read_buffer(70, 0, 16, &out, &err));
+    const uint32_t want[4] = {1, 3, 5, 7};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    const std::string& tl = ex->stats().recovery_timeline;
+    CHECK(tl.find("\"attempts\": [{\"release_ms\": ") != std::string::npos);
+    CHECK(tl.find("\"ok\": true") != std::string::npos);
+    CHECK(tl.find("\"bind_groups_deferred\": 2") != std::string::npos);
+}
+
+// PG6_TEST_REAL_TDR=1 only (it resets the GPU for every process on the machine): a dispatch that never ends,
+// the driver's TDR (DXGI_ERROR_DEVICE_HUNG) and the recovery, timed; it has to finish well within the
+// title's ~30 s watchdog. Prints the recovery timeline.
+int test_real_tdr() {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    CHECK(ex != nullptr);
+    if (!ex) return 1;
+    gpu::CommandEncoder red;
+    red.begin_frame();
+    red.clear_color(1.f, 0.f, 0.f, 1.f);
+    red.present();
+    CHECK(run(*ex, red) == 1);
+    const auto t0 = std::chrono::steady_clock::now();
+    ex->debug_hang_gpu();
+    // Frames until the loss is noticed and recovered (the hang itself lasts the driver's ~2 s TDR delay).
+    for (int i = 0; i < 600 && ex->stats().recoveries == 0 && !ex->faulted(); ++i) {
+        run(*ex, red);
+        ex->poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("real TDR: %.1f s from the hang to recovered=%d faulted=%d; removed reason %s; timeline %s\n", secs,
+                static_cast<int>(ex->stats().recoveries), ex->faulted() ? 1 : 0, ex->stats().device_removed_reason.c_str(),
+                ex->stats().recovery_timeline.c_str());
+    CHECK(ex->stats().debug_gpu_hangs == 1);
+    CHECK(ex->stats().recoveries == 1 && !ex->faulted());
+    CHECK(secs < 20.0);
+    gpu::CommandEncoder green;
+    green.begin_frame();
+    green.clear_color(0.f, 1.f, 0.f, 1.f);
+    green.present();
+    CHECK(run(*ex, green) == 1);
+    CHECK(frame_is(*ex, {0, 255, 0, 255}));
+    std::printf("test_real_tdr: %s\n", g_failures ? "FAILED" : "ok");
+    return g_failures ? 1 : 0;
+}
+
 void test_device_loss_journal() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -4384,10 +4479,10 @@ void test_indirect_clamp_work(NativeExecutor& ex) {
         CHECK(w[0] == 600 && w[1] == kWork / 600);
         CHECK(w[5] == 5 && w[6] == 20 && w[7] == 995 && w[8] == 1 && w[9] == 2);
     }
-    {  // Dispatches: at most 2^22 workgroups in all.
+    {  // Dispatches: at most 2^18 workgroups in all.
         const auto w = clamp(2, 3, 3, 0, {65535, 65535, 65535, 0xFFFFFFFFu, 2, 3, 8, 8, 8});
-        CHECK(w[0] == 65535 && w[1] == (1u << 22) / 65535 && w[2] == 1);
-        CHECK(w[3] == 65535 && w[4] == 2 && w[5] == 3);
+        CHECK(w[0] == 65535 && w[1] == (1u << 18) / 65535 && w[2] == 1);
+        CHECK(w[3] == 65535 && w[4] == 2 && w[5] == 2);  // 65535 x 2 x 3 > 2^18: z cut to 2
         CHECK(w[6] == 8 && w[7] == 8 && w[8] == 8);
     }
     CHECK(ex.stats().device_errors == before.device_errors);
@@ -5446,6 +5541,7 @@ void test_present_plane_composition() {
 }
 
 int main() {
+    if (const char* v = std::getenv("PG6_TEST_REAL_TDR"); v && *v == '1') return test_real_tdr();
     ExecutorOptions opts;
     opts.width = kW;
     opts.height = kH;
@@ -5506,6 +5602,7 @@ int main() {
     test_present_plane_composition();
     test_dispatch_clamp_and_removed_reason();
     test_device_loss();
+    test_device_loss_lazy_bind_groups();
     test_device_loss_journal();
     test_async_pipelines_and_blob_cache();
     test_shader_workers("0");

@@ -2541,6 +2541,68 @@ struct NativeExecutor::Impl {
     bool drop_next_present = false;
     bool replaying = false;
     int debug_failed_acquires = 0;  // debug_fail_device_creations: the next N acquire_device calls fail
+    // PG6_DEBUG_GPU_HANG_AT_FRAME: the frame after whose submit debug_hang_gpu runs (0 = never).
+    uint64_t debug_hang_frame = [] {
+        const char* v = std::getenv("PG6_DEBUG_GPU_HANG_AT_FRAME");
+        return v && *v ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : uint64_t{0};
+    }();
+
+    // A dispatch that never ends: two nested loops bounded by 0xffffffff read from a storage buffer (so no
+    // compiler can drop or bound them), each invocation's result written out. Its own command buffer.
+    void debug_hang_gpu() {
+        if (!device || lost) return;
+        static const char* const kHangWgsl = R"(
+@group(0) @binding(0) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    var acc = g.x;
+    let n = b[0];
+    let m = b[1];
+    for (var i = 0u; i < n; i = i + 1u) {
+        for (var j = 0u; j < m; j = j + 1u) {
+            acc = acc * 1664525u + 1013904223u + j;
+        }
+        if (acc == 0x9e3779b9u) {
+            b[2] = i;
+        }
+    }
+    b[4u + (g.x & 1023u)] = acc;
+}
+)";
+        wgpu::ShaderSourceWGSL wgsl{};
+        wgsl.code = {kHangWgsl, WGPU_STRLEN};
+        wgpu::ShaderModuleDescriptor md{};
+        md.nextInChain = &wgsl;
+        md.label = {"playgta6-debug-hang", WGPU_STRLEN};
+        wgpu::ComputePipelineDescriptor cd{};
+        cd.compute.module = device.CreateShaderModule(&md);
+        cd.compute.entryPoint = {"main", 4};
+        wgpu::ComputePipeline pipe = device.CreateComputePipeline(&cd);
+        wgpu::BufferDescriptor bd{};
+        bd.size = 4096 + 16;
+        bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+        wgpu::Buffer buf = device.CreateBuffer(&bd);
+        const uint32_t bounds[2] = {0xffffffffu, 0xffffffffu};
+        queue.WriteBuffer(buf, 0, bounds, sizeof bounds);
+        wgpu::BindGroupEntry be{};
+        be.binding = 0;
+        be.buffer = buf;
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = pipe.GetBindGroupLayout(0);
+        bgd.entryCount = 1;
+        bgd.entries = &be;
+        wgpu::BindGroup bg = device.CreateBindGroup(&bgd);
+        wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+        wgpu::ComputePassEncoder cp = enc.BeginComputePass();
+        cp.SetPipeline(pipe);
+        cp.SetBindGroup(0, bg);
+        cp.DispatchWorkgroups(1024);
+        cp.End();
+        wgpu::CommandBuffer cb = enc.Finish();
+        queue.Submit(1, &cb);
+        ++stats.debug_gpu_hangs;
+        std::fprintf(stderr, "[native_exec] debug: submitted a GPU hang (frame %llu)\n",
+                     static_cast<unsigned long long>(stats.frames_submitted));
+    }
 
     static bool journaled_opcode(uint16_t op) {
         switch (op) {
@@ -2769,8 +2831,13 @@ struct NativeExecutor::Impl {
     bool journal_replay() {
         for (const JournalEntry& e : journal) {
             if (!e.live) continue;
-            // A group evicted for the bind group budget comes back when the stream binds it.
-            if (e.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup2) && bg_evicted.count(e.id)) continue;
+            // Bind groups come back when the stream binds them (recreate_bind_group, like a group evicted for
+            // the bind group budget): a std-pack boot holds ~35k, each a Dawn creation in a validation scope,
+            // and the title's watchdog allows ~30 s without a frame.
+            if (e.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup2)) {
+                if (bg_evicted.insert(e.id).second) ++stats.recovery_bind_groups_deferred;
+                continue;
+            }
             Packet p;
             p.opcode = e.opcode;
             p.flags = e.flags;
@@ -2806,6 +2873,7 @@ struct NativeExecutor::Impl {
 
     // Drops every object of the lost device (the executor's own state; the journal stays).
     void release_device_objects() {
+        const uint64_t t0 = now_ns();
         pass_cmds.clear();
         recorded_readbacks.clear();
         readback_flush_wanted = false;
@@ -2903,18 +2971,28 @@ struct NativeExecutor::Impl {
         retired_buf.clear();
         retired_bg.clear();
         inflight.clear();
+        sub_pipes.clear();
         ++submit_epoch;  // completions of the old device's submits are ignored
         submits_done = submit_seq = 0;
+        const uint64_t t1 = now_ns();
         if (surface && surface_configured) surface.Unconfigure();
         surface_configured = false;
+        const uint64_t t2 = now_ns();
         if (device) device.Destroy();
+        const uint64_t t3a = now_ns();
         device = nullptr;
         queue = nullptr;
         adapter_handle = nullptr;
+        const uint64_t t3 = now_ns();
         // Deliver what the destroyed device still has queued (map / work-done callbacks drop their references)
         // so it is released before a new one is requested.
         if (instance) instance.ProcessEvents();
+        const uint64_t t4 = now_ns();
+        release_ns = {t1 - t0, t2 - t1, t3a - t2, t3 - t3a, t4 - t3};
     }
+    // The last release_device_objects: objects dropped, surface unconfigured, Device::Destroy, the last
+    // device / queue / adapter references dropped, events delivered.
+    std::array<uint64_t, 5> release_ns{};
 
     static std::string json_escape(const std::string& s) {
         std::string o;
@@ -3022,46 +3100,72 @@ struct NativeExecutor::Impl {
         // A removed adapter (DXGI_ERROR_DEVICE_HUNG / _REMOVED / _RESET): the first attempt makes the new
         // instance as well; a creation on the old one only returns DXGI_ERROR_DEVICE_REMOVED again.
         const bool adapter_removed = !stats.device_removed_reason.empty();
-        auto ms_since = [](uint64_t t) { return static_cast<unsigned long long>((now_ns() - t) / 1000000ull); };
+        auto ms_of = [](uint64_t ns) { return static_cast<unsigned long long>(ns / 1000000ull); };
+        auto ms_since = [&](uint64_t t) { return ms_of(now_ns() - t); };
+        // The recovery's timeline (stats.recovery_timeline, in the boot report): where its time goes.
+        std::string timeline = "{\"prepare_ms\": " + std::to_string(ms_since(t0)) + ", \"attempts\": [";
         for (int attempt = 0; attempt < kAttempts && !ok; ++attempt) {
             const uint64_t ta = now_ns();
             release_device_objects();
             if (attempt == 0) sample_memory("released");  // what the old device left behind
             const unsigned long long release_ms = ms_since(ta);
+            const uint64_t tb = now_ns();
             if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(250ll << (attempt - 1)));
+            const unsigned long long backoff_ms = ms_since(tb);
             const uint64_t ti = now_ns();
-            if (attempt || adapter_removed) {
-                std::string ierr;
-                if (!reset_instance(&ierr)) {
-                    last_error = ierr;
-                    continue;
-                }
-            }
-            const unsigned long long instance_ms = ms_since(ti);
-            ++stats.recovery_attempts;
-            lost = false;
-            CreateStatus st = CreateStatus::Failed;
             std::string err;
-            const uint64_t td = now_ns();
-            const bool acquired = acquire_device(&st, &err);
-            std::fprintf(stderr, "[native_exec] recovery attempt %d: release %llu ms, instance %llu ms, device %llu ms: %s\n",
-                         attempt + 1, release_ms, instance_ms, ms_since(td), acquired ? "ok" : err.c_str());
-            if (!acquired) {
+            bool acquired = false;
+            unsigned long long instance_ms = 0, device_ms = 0, replay_ms = 0;
+            uint64_t replayed = 0;
+            if ((attempt || adapter_removed) && !reset_instance(&err)) {
+                if (err.empty()) err = "instance reset failed";
                 last_error = err;
-                continue;
             }
-            if (!features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
-            const uint64_t errors_before = stats.packet_errors;
-            replaying = true;
-            journal_replay();
-            replaying = false;
-            stats.recovery_replay_errors += stats.packet_errors - errors_before;
-            if (lost) {
-                last_error = "the device was lost again while the resources were rebuilt";
-                continue;
+            instance_ms = ms_since(ti);
+            if (err.empty()) {
+                ++stats.recovery_attempts;
+                lost = false;
+                CreateStatus st = CreateStatus::Failed;
+                const uint64_t td = now_ns();
+                acquired = acquire_device(&st, &err);
+                device_ms = ms_since(td);
+                if (!acquired) last_error = err;
             }
-            ok = true;
+            std::fprintf(stderr,
+                         "[native_exec] recovery attempt %d: release %llu ms (objects %llu, unconfigure %llu, destroy %llu, "
+                         "drop %llu, events %llu), backoff %llu ms, instance %llu ms, device %llu ms: %s\n",
+                         attempt + 1, release_ms, ms_of(release_ns[0]), ms_of(release_ns[1]), ms_of(release_ns[2]),
+                         ms_of(release_ns[3]), ms_of(release_ns[4]), backoff_ms, instance_ms, device_ms,
+                         acquired ? "ok" : last_error.c_str());
+            if (acquired && !features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
+            if (acquired) {
+                const uint64_t errors_before = stats.packet_errors;
+                const uint64_t replayed0 = stats.recovery_replayed_packets;
+                const uint64_t tr = now_ns();
+                replaying = true;
+                journal_replay();
+                replaying = false;
+                replay_ms = ms_since(tr);
+                replayed = stats.recovery_replayed_packets - replayed0;
+                stats.recovery_replay_errors += stats.packet_errors - errors_before;
+                if (lost) last_error = "the device was lost again while the resources were rebuilt";
+                else ok = true;
+            }
+            if (attempt) timeline += ", ";
+            timeline += "{\"release_ms\": " + std::to_string(release_ms) + ", \"objects_ms\": " + std::to_string(ms_of(release_ns[0])) +
+                        ", \"unconfigure_ms\": " + std::to_string(ms_of(release_ns[1])) +
+                        ", \"destroy_ms\": " + std::to_string(ms_of(release_ns[2])) +
+                        ", \"drop_ms\": " + std::to_string(ms_of(release_ns[3])) +
+                        ", \"events_ms\": " + std::to_string(ms_of(release_ns[4])) + ", \"backoff_ms\": " + std::to_string(backoff_ms) +
+                        ", \"instance_ms\": " + std::to_string(instance_ms) + ", \"device_ms\": " + std::to_string(device_ms) +
+                        ", \"replay_ms\": " + std::to_string(replay_ms) + ", \"replayed_packets\": " + std::to_string(replayed) +
+                        ", \"ok\": " + (ok ? "true" : "false") +
+                        (ok ? std::string() : ", \"error\": \"" + json_escape(last_error) + "\"") + "}";
         }
+        timeline += "], \"bind_groups_deferred\": " + std::to_string(stats.recovery_bind_groups_deferred) +
+                    ", \"total_ms\": " + std::to_string(ms_since(t0)) + "}";
+        stats.recovery_timeline = timeline;
+        std::fprintf(stderr, "[native_exec] recovery timeline: %s\n", timeline.c_str());
         if (!ok) {
             sample_memory("recovery_failed");
             return fail_fatal("could not create a new device: " + last_error);
@@ -3113,7 +3217,42 @@ struct NativeExecutor::Impl {
         // Passes, their estimated GPU time and the heaviest one (timing key, average / max measured ns).
         uint64_t passes = 0, est_ns = 0, top_hash = 0, top_ns = 0, top_max_ns = 0, max_groups_hash = 0;
         bool top_compute = false;
+        std::string pipes;  // JSON: the compute shaders it dispatched (sub_pipes_json)
     };
+    // Per compute shader of the submit being built: its dispatches (direct / indirect) and largest direct
+    // dispatch. A pass's timing key is only its first pipeline; a hang record names every shader instead.
+    struct SubPipe {
+        uint64_t dispatches = 0, indirect = 0, max_groups = 0, groups = 0;
+    };
+    std::unordered_map<uint64_t, SubPipe> sub_pipes;
+    void note_sub_dispatch(const std::optional<uint32_t>& active, uint64_t groups, bool indirect) {
+        uint64_t h = 0;
+        if (active)
+            if (auto hit = compute_hash.find(*active); hit != compute_hash.end()) h = hit->second;
+        SubPipe& sp = sub_pipes[h];
+        ++sp.dispatches;
+        if (indirect) ++sp.indirect;
+        sp.max_groups = std::max(sp.max_groups, groups);
+        sp.groups += groups;
+    }
+    // The shaders with indirect dispatches first, then by dispatch count; at most 12 (and how many more).
+    std::string sub_pipes_json() const {
+        std::vector<std::pair<uint64_t, SubPipe>> v(sub_pipes.begin(), sub_pipes.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+            if ((a.second.indirect != 0) != (b.second.indirect != 0)) return a.second.indirect != 0;
+            if (a.second.dispatches != b.second.dispatches) return a.second.dispatches > b.second.dispatches;
+            return a.first < b.first;
+        });
+        std::string o = "[";
+        for (size_t i = 0; i < v.size() && i < 12; ++i) {
+            if (i) o += ", ";
+            o += "{\"cs\": \"" + hash_hex(v[i].first) + "\", \"dispatches\": " + std::to_string(v[i].second.dispatches) +
+                 ", \"indirect\": " + std::to_string(v[i].second.indirect) + ", \"direct_groups\": " +
+                 std::to_string(v[i].second.groups) + ", \"max_groups\": " + std::to_string(v[i].second.max_groups) + "}";
+        }
+        if (v.size() > 12) o += ", {\"more\": " + std::to_string(v.size() - 12) + "}";
+        return o + "]";
+    }
     std::deque<InflightSubmit> inflight;
     uint64_t submit_seq = 0, submits_done = 0, submit_epoch = 0;
     uint64_t sub_draws0 = 0, sub_dispatches0 = 0, sub_snap0 = 0;
@@ -3156,6 +3295,8 @@ struct NativeExecutor::Impl {
         f.top_ns = sub_top_ns;
         f.top_max_ns = sub_top_max_ns;
         f.top_compute = sub_top_compute;
+        f.pipes = sub_pipes_json();
+        sub_pipes.clear();
         stats.submit_est_max_ns = std::max(stats.submit_est_max_ns, sub_est_ns);
         sub_indirect = sub_max_draw_work = sub_max_groups = 0;
         sub_passes = sub_est_ns = sub_top_hash = sub_top_ns = sub_top_max_ns = 0;
@@ -3212,7 +3353,7 @@ struct NativeExecutor::Impl {
                  ", \"est_gpu_ms\": " + std::to_string(f.est_ns / 1000000ull) + ", \"top_pass\": {\"hash\": \"" +
                  hash_hex(f.top_hash) + "\", \"kind\": \"" + (f.top_compute ? "compute" : "render") +
                  "\", \"avg_ms\": " + std::to_string(f.top_ns / 1000000ull) + ", \"max_ms\": " +
-                 std::to_string(f.top_max_ns / 1000000ull) + "}}";
+                 std::to_string(f.top_max_ns / 1000000ull) + "}, \"compute_shaders\": " + f.pipes + "}";
         }
         o += "]";
         stats.device_lost_inflight = o;
@@ -7184,7 +7325,10 @@ struct NativeExecutor::Impl {
         p.flags = e->flags;
         p.payload_bytes = static_cast<uint32_t>(payload.size());
         p.payload = payload.data();
-        const bool ok = create_bind_group2(p);
+        bool ok = true;
+        // In a validation scope, like its first creation: a group Dawn rejects is tracked and never encoded.
+        const bool valid = created_valid([&] { ok = create_bind_group2(p); });
+        note_bind_group_validity(id, valid);
         if (ok) ++stats.bind_groups_recreated;
         else ++stats.bind_groups_recreate_failed;
         return ok && bind_groups.count(id) != 0;
@@ -8071,6 +8215,7 @@ struct NativeExecutor::Impl {
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
                 ++sub_indirect;
+                note_sub_dispatch(e.active_compute, 0, true);
                 if (!options.dump_targets_at.empty()) dump_note_dispatch(e);
                 if (!options.dump_targets_at.empty()) dump_note_work(e, true);
                 alias_post_dispatch(e);
@@ -8155,6 +8300,7 @@ struct NativeExecutor::Impl {
             ++stats.dispatches;
             if (!options.dump_targets_at.empty()) dump_note_dispatch(e);
             if (!options.dump_targets_at.empty()) dump_note_work(e, true);
+            note_sub_dispatch(e.active_compute, uint64_t{x} * y * z, false);
             if (uint64_t{x} * y * z > sub_max_groups) {
                 sub_max_groups = uint64_t{x} * y * z;
                 auto hit = e.active_compute ? compute_hash.find(*e.active_compute) : compute_hash.end();
@@ -10389,6 +10535,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         const uint64_t tp2 = now_ns();
         stats.ns_present_submit += tp2 - tp1;
         if (surface) surface.Present();
+        if (debug_hang_frame && stats.frames_submitted == debug_hang_frame) debug_hang_gpu();
         if (options.window) apply_frame_cap();
         stats.ns_present_swap += now_ns() - tp2;
         frame_target.reset();
@@ -10782,6 +10929,8 @@ std::string NativeExecutor::present_mode_name() const { return impl_->present_mo
 
 void NativeExecutor::debug_fail_device_creations(int count) { impl_->debug_failed_acquires = count; }
 
+void NativeExecutor::debug_hang_gpu() { impl_->debug_hang_gpu(); }
+
 void NativeExecutor::debug_force_device_lost(const std::string& message) {
     if (impl_->device) impl_->device.ForceLoss(wgpu::DeviceLostReason::Unknown, {message.data(), message.size()});
     impl_->instance.ProcessEvents();  // delivers the lost callback
@@ -10879,6 +11028,9 @@ std::string NativeExecutor::stats_json() const {
     num("submit_budget_splits", st.submit_budget_splits);
     num("recovery_attempts", st.recovery_attempts);
     num("recovery_instance_resets", st.recovery_instance_resets);
+    num("recovery_bind_groups_deferred", st.recovery_bind_groups_deferred);
+    num("debug_gpu_hangs", st.debug_gpu_hangs);
+    if (!st.recovery_timeline.empty()) j += "\"recovery_timeline\": " + st.recovery_timeline + ", ";
     num("submit_gpu_max_frame", st.submit_gpu_max_frame);
     num("draws_clamped", st.draws_clamped);
     num("textures_destroyed", st.textures_destroyed);
