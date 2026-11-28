@@ -2162,7 +2162,8 @@ int main(int argc, char** argv) {
                 // the browser worker keeps the pack's numbering (as does --no-fragment-binding-shift).
                 const size_t shifted =
                     (g_options.window || g_options.live_executor) && g_options.fragment_binding_shift
-                        ? gpu::shift_legacy_fragment_bindings(reflection.get())
+                        ? gpu::shift_legacy_fragment_bindings(reflection.get(), gpu::kLegacyFragmentBindingShift,
+                                                              device_options.shader_pack.get())
                         : 0;
                 std::fprintf(stderr, "[harness] stage reflection %s: %zu stage(s), %zu legacy fragment stage(s) renumbered\n",
                              sidecar.c_str(), reflection->size(), shifted);

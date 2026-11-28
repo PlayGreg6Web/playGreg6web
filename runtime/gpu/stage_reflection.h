@@ -98,6 +98,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/pso_cache.h"
+#include "gpu/shader_pack_index.h"
 #include "gpu/state_bridge.h"
 
 namespace playgta6::gpu {
@@ -252,11 +253,14 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
 // binding of each such fragment stage (one with a group-0 binding below `shift`, none at or above
 // it, and the highest one plus `shift` still under kMaxGroup0Binding) by `shift` and records it in
 // StageReflection::group0_binding_shift; the stage's module must then be renumbered alike. A
-// fragment stage already numbered from `shift` (current packs) is left as it is. Returns the
-// number of stages shifted.
+// fragment stage already numbered from `shift` (current packs) is left as it is. With `pack`, a
+// stage is a fragment stage when the pack holds its key as one (the pipeline binds it as the pixel
+// stage whatever its reflection says: std-pack sidecars carry "compute" reflections for some
+// fragment keys); without, when its reflection says so. Returns the number of stages shifted.
 inline constexpr uint32_t kLegacyFragmentBindingShift = 128;
 inline constexpr uint32_t kMaxGroup0Binding = 1000;  // WebGPU maxBindingsPerBindGroup (binding < 1000)
-size_t shift_legacy_fragment_bindings(StageReflectionIndex* index, uint32_t shift = kLegacyFragmentBindingShift);
+size_t shift_legacy_fragment_bindings(StageReflectionIndex* index, uint32_t shift = kLegacyFragmentBindingShift,
+                                      const ShaderPackIndex* pack = nullptr);
 
 // The root parameter whose user data starts at `user_sgpr` (-1 when none does).
 inline constexpr uint32_t kGraphicsUserDataBase = 8;

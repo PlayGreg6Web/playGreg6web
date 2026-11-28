@@ -692,6 +692,20 @@ void test_legacy_fragment_binding_shift() {
     wide.emplace(1, big);
     CHECK(shift_legacy_fragment_bindings(&wide, 900) == 0 && wide.at(1).bindings[1].binding == 127);
     CHECK(shift_legacy_fragment_bindings(&wide) == 1 && wide.at(1).bindings[1].binding == 255);
+
+    // With the pack: its stage decides (a fragment key whose sidecar reflection says "compute" is
+    // still the pixel stage; a reflected fragment the pack holds as compute is not).
+    StageReflectionIndex mixed;
+    StageReflection as_compute;
+    as_compute.stage = ReflectedStage::Compute;
+    as_compute.bindings.push_back(ReflectedBinding{});
+    mixed.emplace(2, as_compute);
+    StageReflection as_fragment = as_compute;
+    as_fragment.stage = ReflectedStage::Fragment;
+    mixed.emplace(3, as_fragment);
+    const ShaderPackIndex pack{{2, PackStage::Fragment}, {3, PackStage::Compute}};
+    CHECK(shift_legacy_fragment_bindings(&mixed, kLegacyFragmentBindingShift, &pack) == 1);
+    CHECK(mixed.at(2).bindings[0].binding == 128 && mixed.at(3).bindings[0].binding == 0);
 }
 
 // #482 contract: a sampler the stage builds from constants in its code comes as its four S# dwords

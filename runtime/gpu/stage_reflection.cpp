@@ -1645,13 +1645,18 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
 
 }  // namespace
 
-size_t shift_legacy_fragment_bindings(StageReflectionIndex* index, uint32_t shift) {
+size_t shift_legacy_fragment_bindings(StageReflectionIndex* index, uint32_t shift, const ShaderPackIndex* pack) {
     if (index == nullptr || shift == 0 || shift >= kMaxGroup0Binding) {
         return 0;
     }
     size_t shifted = 0;
     for (auto& [key, r] : *index) {
-        if (r.stage != ReflectedStage::Fragment || r.group0_binding_shift != 0) {
+        bool fragment = r.stage == ReflectedStage::Fragment;
+        if (pack != nullptr) {
+            const auto it = pack->find(key);
+            fragment = it != pack->end() && it->second == PackStage::Fragment;
+        }
+        if (!fragment || r.group0_binding_shift != 0) {
             continue;
         }
         uint32_t lo = UINT32_MAX;
