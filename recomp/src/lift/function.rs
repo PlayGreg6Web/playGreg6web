@@ -388,6 +388,9 @@ pub(super) fn lift(
         stack_values: BTreeMap::new(),
         window_load_cache: Vec::new(),
         window_test_cache: Vec::new(),
+        slot_delta_cache: Vec::new(),
+        window_select_cache: Vec::new(),
+        page_addr_cache: Vec::new(),
         burst_override: None,
         mem_cache: Vec::new(),
         guest_base: None,
@@ -748,6 +751,13 @@ struct FunctionLifter<'a> {
     /// Cached `(addr, inside, rel)` from pre-branch `window_test` calls within the same basic
     /// block, avoiding duplicate `sub` + `icmp ult` range checks on RMW / repeated accesses.
     window_test_cache: Vec<(String, String, String)>,
+    /// Intra-block cache of dominating `@__playgta6_window_table` / `@__playgta6_page_table`
+    /// slot deltas (cleared on block boundaries, calls, atomics, fences, and helpers).
+    slot_delta_cache: Vec<memory_access::CachedSlotDelta>,
+    /// Intra-block cache of `WindowCheck::Select` slot translations and dirty-mark coverage.
+    window_select_cache: Vec<memory_access::CachedSelectDelta>,
+    /// Intra-block cache of dynamic `PageTable` translations (survives internal straddle joins).
+    page_addr_cache: Vec<memory_access::CachedPageAddr>,
     /// R58: active fast-path translation override for a coalesced same-base window burst.
     burst_override: Option<memory_access::BurstOverride>,
     /// Recent plain guest loads/stores in the current LLVM block, for forwarding to later loads of
@@ -1008,6 +1018,9 @@ struct Checkpoint {
     edge_known: usize,
     window_load_cache: Vec<memory_access::CachedWindowAddr>,
     window_test_cache: Vec<(String, String, String)>,
+    slot_delta_cache: Vec<memory_access::CachedSlotDelta>,
+    window_select_cache: Vec<memory_access::CachedSelectDelta>,
+    page_addr_cache: Vec<memory_access::CachedPageAddr>,
     ymmh_zeroed: u16,
 }
 
@@ -1450,6 +1463,9 @@ impl FunctionLifter<'_> {
             edge_known: self.edge_known.len(),
             window_load_cache: self.window_load_cache.clone(),
             window_test_cache: self.window_test_cache.clone(),
+            slot_delta_cache: self.slot_delta_cache.clone(),
+            window_select_cache: self.window_select_cache.clone(),
+            page_addr_cache: self.page_addr_cache.clone(),
             ymmh_zeroed: self.ymmh_zeroed,
         }
     }
@@ -1470,6 +1486,9 @@ impl FunctionLifter<'_> {
         self.edge_known.truncate(checkpoint.edge_known);
         self.window_load_cache = checkpoint.window_load_cache;
         self.window_test_cache = checkpoint.window_test_cache;
+        self.slot_delta_cache = checkpoint.slot_delta_cache;
+        self.window_select_cache = checkpoint.window_select_cache;
+        self.page_addr_cache = checkpoint.page_addr_cache;
         self.ymmh_zeroed = checkpoint.ymmh_zeroed;
         self.simd.clear_mem32();
     }
@@ -2277,8 +2296,7 @@ impl FunctionLifter<'_> {
         self.affine_cse.clear();
         self.known = Known::default();
         self.block_entry_facts = [GprFact::Bottom; 16];
-        self.window_load_cache.clear();
-        self.window_test_cache.clear();
+        self.clear_window_cache();
         self.mem_cache.clear();
         self.ymmh_zeroed = 0;
         self.current_block.clear();
@@ -2300,6 +2318,9 @@ impl FunctionLifter<'_> {
     pub(super) fn clear_window_cache(&mut self) {
         self.window_load_cache.clear();
         self.window_test_cache.clear();
+        self.slot_delta_cache.clear();
+        self.window_select_cache.clear();
+        self.page_addr_cache.clear();
     }
 
     pub(super) fn known_gpr(&self, idx: usize) -> Option<&str> {
