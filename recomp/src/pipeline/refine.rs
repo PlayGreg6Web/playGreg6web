@@ -9,7 +9,9 @@
 //!    (vtables, callbacks, function-pointer tables) are never reached by recursive descent. Two
 //!    sources propose candidates: RIP-relative `lea` of a code address ([`lea_pointers`]) and
 //!    `DIR64` base relocations in non-executable sections whose stored value points into code
-//!    ([`base_reloc_pointers`]). See [`PointerStatus`] for the acceptance rule.
+//!    ([`base_reloc_pointers`]). See [`PointerStatus`] for the acceptance rule. With `.pdata`, a
+//!    third source proposes the undecoded padding-aligned starts between functions
+//!    ([`gap_pointers`]): leaf functions without unwind data that nothing references statically.
 //! 3. **Dispatcher-reachable set**: every discovered function entry is lifted and registered;
 //!    candidates that did not become entries are reported (see [`CodePointer::lifted`]).
 //! 4. **Import slot consistency** ([`check_import_slots`]): slot reads found by discovery versus
@@ -252,15 +254,20 @@ pub enum PointerSource {
     Lea,
     /// `DIR64` base relocation in a non-executable section whose value points into code.
     BaseReloc,
+    /// Undecoded, 16-byte aligned code right after `int3` padding outside every `.pdata`
+    /// function ([`gap_pointers`]): a leaf function without unwind data whose address is only
+    /// computed at run time (e.g. a handler registered from an obfuscated or arithmetic table).
+    Gap,
 }
 
 impl PointerSource {
-    pub const ALL: [Self; 2] = [Self::Lea, Self::BaseReloc];
+    pub const ALL: [Self; 3] = [Self::Lea, Self::BaseReloc, Self::Gap];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Lea => "lea",
             Self::BaseReloc => "base_reloc",
+            Self::Gap => "padding_gap",
         }
     }
 }
@@ -446,6 +453,53 @@ fn base_reloc_code_info(
         }
     }
     (out, ro_runs)
+}
+
+/// Alignment of the function starts [`gap_pointers`] proposes (MSVC x64 pads functions to 16).
+const GAP_ALIGN: u64 = 16;
+
+/// Code starts between functions that recursive descent and the pointer sources never reached:
+/// every 16-byte aligned address of an executable section that directly follows an `int3`
+/// padding byte, is not itself `int3`, lies outside every `.pdata` function and is not part of a
+/// discovered block. Only proposed when the image has `.pdata`: every function that touches the
+/// stack is described there, so such an address is the start of a leaf function without unwind
+/// data (the run-time-registered callback / handler thunks that were never address-taken by a
+/// `lea` or a relocated pointer). The candidates still pass [`classify`]'s probe.
+fn gap_pointers(image: &CodeImage<'_>, blocks: &BlockIndex<'_>) -> BTreeSet<u64> {
+    let table = &image.function_table;
+    let mut out = BTreeSet::new();
+    if table.is_empty() {
+        return out;
+    }
+    for section in image.sections().iter().filter(|s| s.executable) {
+        let data = section.initialized_data();
+        // Offset >= 1: the byte before the candidate is in the section.
+        let Some(mut va) = section
+            .va
+            .checked_add(1)
+            .and_then(|v| v.checked_next_multiple_of(GAP_ALIGN))
+        else {
+            continue;
+        };
+        while let Some(offset) = va
+            .checked_sub(section.va)
+            .and_then(|o| usize::try_from(o).ok())
+            .filter(|&o| o < data.len())
+        {
+            if data[offset - 1] == 0xcc
+                && data[offset] != 0xcc
+                && table.range_at(va).is_none()
+                && blocks.locate(va).is_none()
+            {
+                out.insert(va);
+            }
+            let Some(next) = va.checked_add(GAP_ALIGN) else {
+                break;
+            };
+            va = next;
+        }
+    }
+    out
 }
 
 /// Blocks of all functions keyed by start (shared blocks once).
@@ -731,7 +785,8 @@ fn classify(
     candidates: &BTreeMap<u64, BTreeSet<PointerSource>>,
     added: &BTreeSet<u64>,
 ) -> Vec<CodePointer> {
-    classify_with_reloc_runs(image, analysis, candidates, added, &BTreeSet::new())
+    let blocks = BlockIndex::new(analysis);
+    classify_with_reloc_runs(image, analysis, &blocks, candidates, added, &BTreeSet::new())
 }
 
 /// [`classify`] with read-only contiguous `DIR64` pointer-table run metadata (`ro_reloc_runs`)
@@ -742,6 +797,7 @@ fn classify(
 fn classify_with_reloc_runs(
     image: &CodeImage<'_>,
     analysis: &Analysis,
+    blocks: &BlockIndex<'_>,
     candidates: &BTreeMap<u64, BTreeSet<PointerSource>>,
     added: &BTreeSet<u64>,
     ro_reloc_runs: &BTreeSet<u64>,
@@ -749,8 +805,7 @@ fn classify_with_reloc_runs(
     if candidates.is_empty() {
         return Vec::new();
     }
-    let blocks = BlockIndex::new(analysis);
-    let tables = jump_table_ranges_with_blocks(analysis, &blocks);
+    let tables = jump_table_ranges_with_blocks(analysis, blocks);
 
     // Collect EH/longjmp resume targets and resolved intra-function jump-table targets so neither
     // is ever split out into a standalone function entry.
@@ -952,6 +1007,7 @@ fn refined_rounds(
     }
 
     let mut added = BTreeSet::new();
+    let mut gap_added: BTreeSet<u64> = BTreeSet::new();
     let mut thunks = BTreeSet::new();
     let img: &CodeImage<'_> = image;
     let threads = default_threads();
@@ -988,8 +1044,22 @@ fn refined_rounds(
                 .or_default()
                 .insert(PointerSource::BaseReloc);
         }
-        let pointers =
-            classify_with_reloc_runs(img, &analysis, &candidates, &added, &ro_reloc_runs);
+        let blocks = BlockIndex::new(&analysis);
+        // Gap starts accepted in earlier rounds are decoded now (no longer proposed); they stay
+        // candidates so the outcome keeps reporting them.
+        let gaps = gap_pointers(img, &blocks);
+        for &va in gaps.iter().chain(&gap_added) {
+            candidates.entry(va).or_default().insert(PointerSource::Gap);
+        }
+        let mut pointers =
+            classify_with_reloc_runs(img, &analysis, &blocks, &candidates, &added, &ro_reloc_runs);
+        drop(blocks);
+        // A gap start no other source proposed that does not probe as code is just padding or
+        // data between functions: not reported.
+        pointers.retain(|p| {
+            p.status == PointerStatus::Accepted
+                || p.sources.iter().any(|&s| s != PointerSource::Gap)
+        });
         let new_entries: BTreeSet<u64> = pointers
             .iter()
             .filter(|p| {
@@ -1038,6 +1108,7 @@ fn refined_rounds(
                 drop_in_background(analysis);
             }
         }
+        gap_added.extend(new_entries.iter().copied().filter(|va| gaps.contains(va)));
         added.extend(new_entries.iter().copied());
         known_entries.extend(new_entries.iter().copied());
         thunks.extend(new_thunks.iter().copied());
@@ -1260,6 +1331,57 @@ mod probe_tests {
         code.push(0xc3);
         let starts = probe_code(&code).expect("plausible");
         assert_eq!(starts.len(), 6001);
+    }
+
+    #[test]
+    fn unreferenced_leaf_after_padding_is_a_gap_entry_with_pdata_only() {
+        // 0x00: .pdata function (entry): push rsi; pop rsi; ret
+        // 0x20: leaf without .pdata, never referenced: cmp dword [rcx+0x10], 0; ret
+        // 0x40: zero bytes after padding (not code): never reported
+        // 0x60: .pdata function (entry): ret
+        // 0x70: in a decoded block, after the last (0xcc) byte of an immediate: not proposed
+        let mut code = vec![0x56, 0x5e, 0xc3];
+        code.resize(0x20, 0xcc);
+        code.extend_from_slice(&[0x83, 0x79, 0x10, 0x00, 0xc3]);
+        code.resize(0x40, 0xcc);
+        code.resize(0x50, 0x00);
+        code.resize(0x60, 0xcc);
+        code.push(0xc3);
+        code.resize(0x68, 0xcc);
+        // 0x68: entry without .pdata: nops ; mov eax, 0xcccccccc ; nop ; ret (0x70 is the nop)
+        code.extend_from_slice(&[0x90, 0x90, 0x90, 0xb8, 0xcc, 0xcc, 0xcc, 0xcc, 0x90, 0xc3]);
+        code.resize(0x80, 0xcc);
+        let range = |start: u64, end: u64| crate::pdata::FunctionRange {
+            start: TEXT + start,
+            end: TEXT + end,
+            function: TEXT + start,
+        };
+        let guest = empty_guest(BASE);
+        let run = |pdata: bool| {
+            let entries = vec![TEXT, TEXT + 0x60, TEXT + 0x68];
+            let mut image =
+                CodeImage::new(BASE, vec![CodeSection::new(TEXT, &code, true)], entries);
+            if pdata {
+                image.function_table =
+                    crate::pdata::FunctionTable::new(vec![range(0, 3), range(0x60, 0x61)]);
+            }
+            discover_refined(&mut image, &guest)
+        };
+
+        let (analysis, outcome) = run(true);
+        let leaf = TEXT + 0x20;
+        assert!(analysis.functions.contains_key(&leaf));
+        assert!(!analysis.functions.contains_key(&(TEXT + 0x40)));
+        assert!(!analysis.functions.contains_key(&(TEXT + 0x70)));
+        assert_eq!(outcome.added_entries().collect::<Vec<_>>(), vec![leaf]);
+        assert_eq!(outcome.count(PointerSource::Gap, PointerStatus::Accepted), 1);
+        assert_eq!(outcome.pointers.len(), 1, "{:?}", outcome.pointers);
+        assert!(outcome.pointers[0].lifted);
+
+        // Without .pdata nothing tells a leaf from the tail of an undescribed function.
+        let (analysis, outcome) = run(false);
+        assert!(!analysis.functions.contains_key(&leaf));
+        assert!(outcome.pointers.is_empty());
     }
 
     #[test]

@@ -62,7 +62,7 @@ use crate::reloc::{RelocKind, Relocation, RelocationMap};
 pub const DISCOVERY_CODE: &str = env!("PLAYGTA6_DISCOVERY_CODE");
 
 /// Entry file format; part of the key and checked in the header.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAGIC: &[u8; 8] = b"PG6DISC\0";
 const HEADER_LEN: usize = 8 + 4 + 16 + 8 + 8;
 const EXT: &str = "disc";
@@ -674,6 +674,7 @@ fn source_bit(s: PointerSource) -> u8 {
     match s {
         PointerSource::Lea => 1,
         PointerSource::BaseReloc => 2,
+        PointerSource::Gap => 4,
     }
 }
 
@@ -1041,7 +1042,7 @@ pub fn decode(payload: &[u8], image: &CodeImage<'_>) -> Option<Discovered> {
         let va = i.rel(prev)?;
         prev = va;
         let bits = i.byte()?;
-        if bits & !3 != 0 {
+        if bits & !7 != 0 {
             return None;
         }
         let sources: BTreeSet<PointerSource> = PointerSource::ALL
