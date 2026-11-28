@@ -221,6 +221,25 @@
     'viewParams',
   ]);
 
+  const KNOWN_SLOT_DESCRIPTOR_LOOKUP = Object.create(null);
+  for (const _k of KNOWN_SLOT_DESCRIPTOR_KEYS) {
+    KNOWN_SLOT_DESCRIPTOR_LOOKUP[_k] = 1;
+  }
+
+  const KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP = Object.create(null);
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.format = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.dimension = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.aspect = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.baseMipLevel = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.mipLevelCount = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.baseArrayLayer = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.arrayLayerCount = 1;
+  KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP.usage = 1;
+
+  const EMPTY_EXTRA_VIEW_RESULT = Object.freeze({ extraViewParams: null, extraViewKey: '' });
+  const EMPTY_VIEW_FORMATS = Object.freeze([]);
+  const CANONICAL_SCRATCH_KEYS = [];
+
   function isValidSlotIndex(slotIndex) {
     return typeof slotIndex === 'number' && Number.isInteger(slotIndex) && slotIndex >= 0;
   }
@@ -266,72 +285,449 @@
     return 'generic';
   }
 
-  function canonicalizeExtraValue(value, depth) {
-    if (value === null) return 'null';
-    if (value === undefined) return 'undefined';
-    const t = typeof value;
-    if (t === 'number' || t === 'boolean' || t === 'bigint') {
-      return `${t}:${String(value)}`;
+  function sortStringKeysInPlace(keys, count) {
+    if (count <= 16) {
+      for (let i = 1; i < count; i += 1) {
+        const cur = keys[i];
+        let j = i - 1;
+        while (j >= 0 && keys[j] > cur) {
+          keys[j + 1] = keys[j];
+          j -= 1;
+        }
+        keys[j + 1] = cur;
+      }
+      return;
     }
+    keys.length = count;
+    keys.sort();
+  }
+
+  // Deterministic, collision-free, zero-JSON canonicalizer using type tags and
+  // length-prefixed strings/keys so arbitrary characters (delimiters, quotes,
+  // colons, control chars) can never collide.
+  function canonicalizeExtraValue(value, depth) {
+    if (value === null) return 'n';
+    if (value === undefined) return 'u';
+    const t = typeof value;
     if (t === 'string') {
-      return `s:${JSON.stringify(value)}`;
+      return `s${value.length}:${value}`;
+    }
+    if (t === 'number') {
+      return value === 0 && 1 / value < 0 ? 'd-0' : `d${value}`;
+    }
+    if (t === 'boolean') {
+      return value ? 'b1' : 'b0';
+    }
+    if (t === 'bigint') {
+      return `i${value}`;
     }
     if (depth > 4) {
       return '[depth]';
     }
     if (Array.isArray(value)) {
-      let out = '[';
-      for (let i = 0; i < value.length; i += 1) {
+      const len = value.length;
+      if (len === 0) return 'a0[]';
+      let out = `a${len}[`;
+      for (let i = 0; i < len; i += 1) {
         if (i > 0) out += ',';
         out += canonicalizeExtraValue(value[i], depth + 1);
       }
-      return out + ']';
+      return `${out}]`;
     }
     if (ArrayBuffer.isView(value)) {
-      return `view:${value.constructor ? value.constructor.name : 'view'}:${value.byteLength}`;
+      const ctorName = value.constructor ? value.constructor.name : 'view';
+      return `v${ctorName.length}:${ctorName}:${value.byteLength}`;
     }
     if (t === 'object') {
-      const keys = Object.keys(value).sort();
-      let out = '{';
-      for (let i = 0; i < keys.length; i += 1) {
+      let count = 0;
+      let k0 = '';
+      let k1 = '';
+      let keys = null;
+      for (const k in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, k)) continue;
+        if (count === 0) {
+          k0 = k;
+        } else if (count === 1) {
+          k1 = k;
+        } else {
+          if (keys === null) {
+            if (depth === 0) {
+              keys = CANONICAL_SCRATCH_KEYS;
+              keys.length = 0;
+            } else {
+              keys = [];
+            }
+            keys[0] = k0;
+            keys[1] = k1;
+          }
+          keys[count] = k;
+        }
+        count += 1;
+      }
+      if (count === 0) {
+        return 'o0{}';
+      }
+      if (count === 1) {
+        return `o1{k${k0.length}:${k0}=${canonicalizeExtraValue(value[k0], depth + 1)}}`;
+      }
+      if (count === 2) {
+        if (k0 > k1) {
+          const tmp = k0;
+          k0 = k1;
+          k1 = tmp;
+        }
+        return `o2{k${k0.length}:${k0}=${canonicalizeExtraValue(value[k0], depth + 1)},k${k1.length}:${k1}=${canonicalizeExtraValue(value[k1], depth + 1)}}`;
+      }
+      sortStringKeysInPlace(keys, count);
+      let out = `o${count}{`;
+      for (let i = 0; i < count; i += 1) {
         const k = keys[i];
         if (i > 0) out += ',';
-        out += `${JSON.stringify(k)}:${canonicalizeExtraValue(value[k], depth + 1)}`;
+        out += `k${k.length}:${k}=${canonicalizeExtraValue(value[k], depth + 1)}`;
       }
-      return out + '}';
+      if (keys === CANONICAL_SCRATCH_KEYS) {
+        keys.length = 0;
+      }
+      return `${out}}`;
     }
-    return `${t}:${String(value)}`;
+    const str = String(value);
+    return `x${t.length}:${t}:${str.length}:${str}`;
   }
 
   function extractExtraViewParams(primaryObj, nestedViewObj) {
     let extra = null;
+    let extraCount = 0;
+    let k0 = '';
+    let k1 = '';
+
     if (primaryObj && typeof primaryObj === 'object') {
-      const keys = Object.keys(primaryObj);
-      for (let i = 0; i < keys.length; i += 1) {
-        const k = keys[i];
-        if (!KNOWN_SLOT_DESCRIPTOR_KEYS.has(k) && primaryObj[k] !== undefined) {
-          if (!extra) extra = Object.create(null);
-          extra[k] = primaryObj[k];
+      for (const k in primaryObj) {
+        if (!Object.prototype.hasOwnProperty.call(primaryObj, k)) continue;
+        if (KNOWN_SLOT_DESCRIPTOR_LOOKUP[k] === 1) continue;
+        const v = primaryObj[k];
+        if (v === undefined) continue;
+        if (extra === null) {
+          extra = Object.create(null);
         }
+        if (extra[k] === undefined) {
+          if (extraCount === 0) k0 = k;
+          else if (extraCount === 1) k1 = k;
+          extraCount += 1;
+        }
+        extra[k] = v;
       }
     }
     if (nestedViewObj && typeof nestedViewObj === 'object') {
-      const keys = Object.keys(nestedViewObj);
-      for (let i = 0; i < keys.length; i += 1) {
-        const k = keys[i];
-        if (!KNOWN_SLOT_DESCRIPTOR_KEYS.has(k) && nestedViewObj[k] !== undefined) {
-          if (!extra) extra = Object.create(null);
-          extra[k] = nestedViewObj[k];
+      for (const k in nestedViewObj) {
+        if (!Object.prototype.hasOwnProperty.call(nestedViewObj, k)) continue;
+        if (KNOWN_SLOT_DESCRIPTOR_LOOKUP[k] === 1) continue;
+        const v = nestedViewObj[k];
+        if (v === undefined) continue;
+        if (extra === null) {
+          extra = Object.create(null);
         }
+        if (extra[k] === undefined) {
+          if (extraCount === 0) k0 = k;
+          else if (extraCount === 1) k1 = k;
+          extraCount += 1;
+        }
+        extra[k] = v;
       }
     }
-    if (!extra) {
-      return { extraViewParams: null, extraViewKey: '' };
+    if (extra === null) {
+      return EMPTY_EXTRA_VIEW_RESULT;
+    }
+    let extraViewKey;
+    if (extraCount === 1) {
+      extraViewKey = `o1{k${k0.length}:${k0}=${canonicalizeExtraValue(extra[k0], 1)}}`;
+    } else if (extraCount === 2) {
+      if (k0 > k1) {
+        const tmp = k0;
+        k0 = k1;
+        k1 = tmp;
+      }
+      extraViewKey = `o2{k${k0.length}:${k0}=${canonicalizeExtraValue(extra[k0], 1)},k${k1.length}:${k1}=${canonicalizeExtraValue(extra[k1], 1)}}`;
+    } else {
+      extraViewKey = canonicalizeExtraValue(extra, 0);
     }
     return {
       extraViewParams: extra,
-      extraViewKey: canonicalizeExtraValue(extra, 0),
+      extraViewKey,
     };
+  }
+
+  function encodeCanonicalOptionalString(raw, lowercase) {
+    if (raw === undefined || raw === null) {
+      return 'u';
+    }
+    if (typeof raw === 'string') {
+      if (raw.length === 0) return 'u';
+      const s = lowercase ? raw.toLowerCase() : raw;
+      return `s${s.length}:${s}`;
+    }
+    return canonicalizeExtraValue(raw, 0);
+  }
+
+  function encodeCanonicalOptionalUint(raw, defaultZero) {
+    if (raw === undefined || raw === null) {
+      return defaultZero ? 'd0' : 'u';
+    }
+    const num = Number(raw);
+    if (Number.isFinite(num)) {
+      return `d${Math.max(0, Math.floor(num))}`;
+    }
+    return defaultZero ? 'd0' : 'u';
+  }
+
+  /**
+   * Compute a fast, deterministic, collision-free canonical key for a WebGPU
+   * `GPUTextureViewDescriptor` without using `JSON.stringify` or
+   * `Object.keys().sort()` on standard descriptors.
+   *
+   * Known fields (`format`, `dimension`, `aspect`, `baseMipLevel`,
+   * `mipLevelCount`, `baseArrayLayer`, `arrayLayerCount`, `usage`) are encoded
+   * directly as length-prefixed/tagged scalars; any unknown/extra own keys are
+   * deterministically canonicalized only when present.
+   *
+   * @param {object | null | undefined} viewDesc
+   * @returns {string}
+   */
+  function canonicalizeTextureViewDescriptorKey(viewDesc) {
+    if (viewDesc === null || viewDesc === undefined || typeof viewDesc !== 'object') {
+      return 'tv:default';
+    }
+    let hasKnown = false;
+    const f = viewDesc.format;
+    const d = viewDesc.dimension;
+    const a = viewDesc.aspect;
+    const bm = viewDesc.baseMipLevel;
+    const mc = viewDesc.mipLevelCount;
+    const bl = viewDesc.baseArrayLayer;
+    const lc = viewDesc.arrayLayerCount;
+    const u = viewDesc.usage;
+    if (
+      (f !== undefined && f !== null && f !== '') ||
+      (d !== undefined && d !== null && d !== '') ||
+      (a !== undefined && a !== null && a !== '') ||
+      (bm !== undefined && bm !== null && Number(bm) > 0) ||
+      (mc !== undefined && mc !== null) ||
+      (bl !== undefined && bl !== null && Number(bl) > 0) ||
+      (lc !== undefined && lc !== null) ||
+      (u !== undefined && u !== null)
+    ) {
+      hasKnown = true;
+    }
+
+    // Scan for any unknown own keys without allocating Object.keys().
+    let extra = null;
+    let extraCount = 0;
+    let ek0 = '';
+    let ek1 = '';
+    for (const k in viewDesc) {
+      if (!Object.prototype.hasOwnProperty.call(viewDesc, k)) continue;
+      if (KNOWN_TEXTURE_VIEW_DESCRIPTOR_LOOKUP[k] === 1) continue;
+      const v = viewDesc[k];
+      if (v === undefined) continue;
+      if (extra === null) extra = Object.create(null);
+      if (extraCount === 0) ek0 = k;
+      else if (extraCount === 1) ek1 = k;
+      extra[k] = v;
+      extraCount += 1;
+    }
+
+    if (!hasKnown && extra === null) {
+      return 'tv:default';
+    }
+
+    const fTok = encodeCanonicalOptionalString(f, true);
+    const dTok = encodeCanonicalOptionalString(d, true);
+    const aTok = encodeCanonicalOptionalString(a, true);
+    const bmTok = encodeCanonicalOptionalUint(bm, true);
+    const mcTok = encodeCanonicalOptionalUint(mc, false);
+    const blTok = encodeCanonicalOptionalUint(bl, true);
+    const lcTok = encodeCanonicalOptionalUint(lc, false);
+    const uTok =
+      u !== undefined && u !== null && Number.isFinite(Number(u))
+        ? `d${Number(u) >>> 0}`
+        : 'u';
+
+    const base = `tv|f=${fTok}|d=${dTok}|a=${aTok}|bm=${bmTok}|mc=${mcTok}|bl=${blTok}|lc=${lcTok}|u=${uTok}`;
+    if (extra === null) {
+      return base;
+    }
+    let extraKey;
+    if (extraCount === 1) {
+      extraKey = `o1{k${ek0.length}:${ek0}=${canonicalizeExtraValue(extra[ek0], 1)}}`;
+    } else if (extraCount === 2) {
+      if (ek0 > ek1) {
+        const tmp = ek0;
+        ek0 = ek1;
+        ek1 = tmp;
+      }
+      extraKey = `o2{k${ek0.length}:${ek0}=${canonicalizeExtraValue(extra[ek0], 1)},k${ek1.length}:${ek1}=${canonicalizeExtraValue(extra[ek1], 1)}}`;
+    } else {
+      extraKey = canonicalizeExtraValue(extra, 0);
+    }
+    return `${base}|x=${extraKey}`;
+  }
+
+  /**
+   * Compute a fast, deterministic, collision-free canonical key for a
+   * `ResourceTable.setSlot` descriptor (supporting flat and nested `view` /
+   * `viewParams`, case-insensitive enum strings, and arbitrary property order)
+   * without calling `JSON.stringify` or `Object.keys().sort()` on standard
+   * descriptors.
+   *
+   * @param {object | number | null | undefined} descriptorOrHandle
+   * @param {object} [viewParamsArg]
+   * @returns {string}
+   */
+  function canonicalizeSlotDescriptorKey(descriptorOrHandle, viewParamsArg) {
+    if (descriptorOrHandle === null || descriptorOrHandle === undefined) {
+      return 'slot:empty';
+    }
+    let rawKind;
+    let rawHandle = null;
+    let directResource = null;
+    let srcA = null;
+    let srcB = null;
+
+    if (typeof descriptorOrHandle === 'number') {
+      rawHandle = descriptorOrHandle;
+      if (viewParamsArg && typeof viewParamsArg === 'object') {
+        srcA = viewParamsArg;
+        rawKind = viewParamsArg.kind;
+        srcB = viewParamsArg.view || viewParamsArg.viewParams || null;
+      }
+    } else if (typeof descriptorOrHandle === 'object') {
+      if (isDirectGpuResource(descriptorOrHandle)) {
+        directResource = descriptorOrHandle;
+        if (viewParamsArg && typeof viewParamsArg === 'object') {
+          srcA = viewParamsArg;
+          rawKind = viewParamsArg.kind;
+          srcB = viewParamsArg.view || viewParamsArg.viewParams || null;
+        }
+      } else {
+        srcA = descriptorOrHandle;
+        rawKind = descriptorOrHandle.kind;
+        if (descriptorOrHandle.resource && typeof descriptorOrHandle.resource === 'object') {
+          directResource = descriptorOrHandle.resource;
+        }
+        const candidateHandle =
+          descriptorOrHandle.handle !== undefined
+            ? descriptorOrHandle.handle
+            : descriptorOrHandle.id !== undefined
+              ? descriptorOrHandle.id
+              : descriptorOrHandle.resourceId;
+        if (typeof candidateHandle === 'number') {
+          rawHandle = candidateHandle;
+        } else if (candidateHandle && typeof candidateHandle === 'object') {
+          directResource = candidateHandle;
+        }
+        srcB =
+          (viewParamsArg && typeof viewParamsArg === 'object' ? viewParamsArg : null) ||
+          descriptorOrHandle.view ||
+          descriptorOrHandle.viewParams ||
+          null;
+      }
+    } else {
+      return `slot:raw:${canonicalizeExtraValue(descriptorOrHandle, 0)}`;
+    }
+
+    const kind = normalizeSlotKind(rawKind, directResource);
+    const handle =
+      rawHandle !== null && Number.isFinite(rawHandle) ? Math.floor(rawHandle) : null;
+
+    const rawOffset =
+      srcB && srcB.offset !== undefined
+        ? srcB.offset
+        : srcA && srcA.offset !== undefined
+          ? srcA.offset
+          : undefined;
+    const rawSize =
+      srcB && srcB.size !== undefined
+        ? srcB.size
+        : srcA && srcA.size !== undefined
+          ? srcA.size
+          : undefined;
+    const rawFormat =
+      srcB && srcB.format !== undefined
+        ? srcB.format
+        : srcA && srcA.format !== undefined
+          ? srcA.format
+          : undefined;
+    const rawDimension =
+      srcB && srcB.dimension !== undefined
+        ? srcB.dimension
+        : srcA && srcA.dimension !== undefined
+          ? srcA.dimension
+          : undefined;
+    const rawAspect =
+      srcB && srcB.aspect !== undefined
+        ? srcB.aspect
+        : srcA && srcA.aspect !== undefined
+          ? srcA.aspect
+          : undefined;
+    const rawBaseMip =
+      srcB && srcB.baseMipLevel !== undefined
+        ? srcB.baseMipLevel
+        : srcA && srcA.baseMipLevel !== undefined
+          ? srcA.baseMipLevel
+          : undefined;
+    const rawMipCnt =
+      srcB && srcB.mipLevelCount !== undefined
+        ? srcB.mipLevelCount
+        : srcA && srcA.mipLevelCount !== undefined
+          ? srcA.mipLevelCount
+          : undefined;
+    const rawBaseLayer =
+      srcB && srcB.baseArrayLayer !== undefined
+        ? srcB.baseArrayLayer
+        : srcA && srcA.baseArrayLayer !== undefined
+          ? srcA.baseArrayLayer
+          : undefined;
+    const rawLayerCnt =
+      srcB && srcB.arrayLayerCount !== undefined
+        ? srcB.arrayLayerCount
+        : srcA && srcA.arrayLayerCount !== undefined
+          ? srcA.arrayLayerCount
+          : undefined;
+    const rawUsage =
+      srcB && srcB.usage !== undefined
+        ? srcB.usage
+        : srcA && srcA.usage !== undefined
+          ? srcA.usage
+          : undefined;
+
+    const offTok = encodeCanonicalOptionalUint(rawOffset, true);
+    const szTok = encodeCanonicalOptionalUint(rawSize, false);
+    const fmtTok = encodeCanonicalOptionalString(rawFormat, true);
+    const dimTok = encodeCanonicalOptionalString(rawDimension, true);
+    const aspTok = encodeCanonicalOptionalString(rawAspect, true);
+    const bmTok = encodeCanonicalOptionalUint(rawBaseMip, true);
+    const mcTok = encodeCanonicalOptionalUint(rawMipCnt, false);
+    const blTok = encodeCanonicalOptionalUint(rawBaseLayer, true);
+    const lcTok = encodeCanonicalOptionalUint(rawLayerCnt, false);
+    const usageTok =
+      rawUsage !== undefined && rawUsage !== null && Number.isFinite(Number(rawUsage))
+        ? `d${Number(rawUsage) >>> 0}`
+        : 'u';
+
+    const extraRes = extractExtraViewParams(srcA, srcB);
+    const handleTok = handle !== null ? `d${handle}` : directResource !== null ? 'r1' : 'n';
+    const base = `slot|k=s${kind.length}:${kind}|h=${handleTok}|o=${offTok}|z=${szTok}|f=${fmtTok}|d=${dimTok}|a=${aspTok}|bm=${bmTok}|mc=${mcTok}|bl=${blTok}|lc=${lcTok}|u=${usageTok}`;
+    return extraRes.extraViewKey.length > 0 ? `${base}|x=${extraRes.extraViewKey}` : base;
+  }
+
+  function cloneViewDescWithDimension(viewDesc, textureDimension) {
+    const safeDesc = {};
+    for (const k in viewDesc) {
+      if (Object.prototype.hasOwnProperty.call(viewDesc, k)) {
+        safeDesc[k] = viewDesc[k];
+      }
+    }
+    safeDesc.dimension = textureDimension;
+    return safeDesc;
   }
 
   // WebGPU-compatible GPUBufferUsage bitmask values (runtime/abi/playgta6_abi.h).
@@ -1153,6 +1549,11 @@
       this._promote1DTo2D = Boolean(options.promote1DTo2D);
       this._promoted1DTo2DCount = 0;
       this._viewDimensionGuardCount = 0;
+      this._scratchSanitizedViewResult = {
+        viewDesc: undefined,
+        adjusted: false,
+        textureDimension: '2d',
+      };
 
       /** @type {Map<number, object>} */
       this.buffers = new Map();
@@ -2079,17 +2480,25 @@
 
     _sanitizeViewDescriptorForTexture(texture, viewDesc, textureId) {
       const textureDimension = this._resolveActualTextureDimension(texture, textureId);
+      const out = this._scratchSanitizedViewResult;
+      out.textureDimension = textureDimension;
       if (viewDesc === undefined || viewDesc === null || typeof viewDesc !== 'object') {
-        return { viewDesc, adjusted: false, textureDimension };
+        out.viewDesc = viewDesc;
+        out.adjusted = false;
+        return out;
       }
       const requestedDim = viewDesc.dimension;
       if (requestedDim === undefined || requestedDim === null) {
-        return { viewDesc, adjusted: false, textureDimension };
+        out.viewDesc = viewDesc;
+        out.adjusted = false;
+        return out;
       }
       if (isViewDimensionCompatible(textureDimension, requestedDim)) {
-        return { viewDesc, adjusted: false, textureDimension };
+        out.viewDesc = viewDesc;
+        out.adjusted = false;
+        return out;
       }
-      const safeDesc = { ...viewDesc, dimension: textureDimension };
+      const safeDesc = cloneViewDescWithDimension(viewDesc, textureDimension);
       if (textureDimension === '1d') {
         if (safeDesc.baseArrayLayer !== undefined && safeDesc.baseArrayLayer > 0) {
           safeDesc.baseArrayLayer = 0;
@@ -2104,7 +2513,9 @@
         typeof textureId === 'number' ? textureId : -1,
         `adjusted incompatible view dimension ${String(requestedDim)} -> ${textureDimension} for ${textureDimension} texture`
       );
-      return { viewDesc: safeDesc, adjusted: true, textureDimension };
+      out.viewDesc = safeDesc;
+      out.adjusted = true;
+      return out;
     }
 
     /**
@@ -2234,9 +2645,10 @@
         originalFormat: sanitized.originalFormat,
         usage: sanitized.descriptor.usage,
         byteSize: estimatedBytes,
-        viewFormats: sanitized.descriptor.viewFormats
-          ? sanitized.descriptor.viewFormats.slice()
-          : [],
+        viewFormats:
+          sanitized.descriptor.viewFormats && sanitized.descriptor.viewFormats.length > 0
+            ? sanitized.descriptor.viewFormats.slice()
+            : EMPTY_VIEW_FORMATS,
         bcFormatFallback: sanitized.bcFormatFallback,
         bcDimensionAligned: sanitized.bcDimensionAligned,
         mipClamped: sanitized.mipClamped,
@@ -2473,7 +2885,7 @@
         originalFormat: format,
         usage,
         byteSize: estimatedBytes,
-        viewFormats: [],
+        viewFormats: EMPTY_VIEW_FORMATS,
         bcFormatFallback: false,
         bcDimensionAligned: false,
         mipClamped: false,
@@ -2707,7 +3119,15 @@
         this._missingLookups += 1;
         return undefined;
       }
-      return { ...meta };
+      return {
+        id: meta.id,
+        requestedSize: meta.requestedSize,
+        alignedSize: meta.alignedSize,
+        usage: meta.usage,
+        isUniform: meta.isUniform,
+        padded: meta.padded,
+        label: meta.label,
+      };
     }
 
     hasBuffer(id) {
@@ -2736,7 +3156,25 @@
         this._missingLookups += 1;
         return undefined;
       }
-      return { ...meta, viewFormats: meta.viewFormats.slice() };
+      return {
+        id: meta.id,
+        width: meta.width,
+        height: meta.height,
+        depthOrArrayLayers: meta.depthOrArrayLayers,
+        mipLevelCount: meta.mipLevelCount,
+        sampleCount: meta.sampleCount,
+        dimension: meta.dimension,
+        format: meta.format,
+        originalFormat: meta.originalFormat,
+        usage: meta.usage,
+        byteSize: meta.byteSize,
+        viewFormats: meta.viewFormats.length > 0 ? meta.viewFormats.slice() : [],
+        bcFormatFallback: meta.bcFormatFallback,
+        bcDimensionAligned: meta.bcDimensionAligned,
+        mipClamped: meta.mipClamped,
+        sampleClamped: meta.sampleClamped,
+        promoted1DTo2D: meta.promoted1DTo2D,
+      };
     }
 
     hasTexture(id) {
@@ -2955,7 +3393,12 @@
     _buildSlotSnapshot(entry) {
       let frozenExtra = null;
       if (entry.extraViewParams !== null) {
-        frozenExtra = Object.freeze({ ...entry.extraViewParams });
+        const copy = {};
+        const src = entry.extraViewParams;
+        for (const k in src) {
+          copy[k] = src[k];
+        }
+        frozenExtra = Object.freeze(copy);
       }
       return Object.freeze({
         slot: entry.slot,
@@ -4225,7 +4668,7 @@
      */
     evictStaleBindGroups() {
       let evicted = 0;
-      for (const [cacheKey, entry] of Array.from(this._bindGroupCache.entries())) {
+      for (const [cacheKey, entry] of this._bindGroupCache) {
         if (!this._isBindGroupEntryValid(entry)) {
           if (this._evictBindGroupEntry(cacheKey, entry, 'stale')) {
             evicted += 1;
@@ -4236,18 +4679,33 @@
     }
 
     _resolveBindGroupEntries(rawEntries, rawSlots) {
-      const normalizedItems = [];
+      let sorted;
       if (Array.isArray(rawEntries)) {
+        let needsSort = false;
+        let prevBinding = -Infinity;
         for (let i = 0; i < rawEntries.length; i += 1) {
-          normalizedItems.push(rawEntries[i]);
+          const item = rawEntries[i];
+          const b = item && typeof item === 'object' ? Number(item.binding) || 0 : 0;
+          if (b < prevBinding) {
+            needsSort = true;
+            break;
+          }
+          prevBinding = b;
+        }
+        if (needsSort) {
+          sorted = rawEntries.slice().sort((a, b) => ((a && a.binding) || 0) - ((b && b.binding) || 0));
+        } else {
+          sorted = rawEntries;
         }
       } else if (Array.isArray(rawSlots)) {
-        for (let i = 0; i < rawSlots.length; i += 1) {
-          normalizedItems.push({ binding: i, slot: rawSlots[i] });
+        const len = rawSlots.length;
+        sorted = new Array(len);
+        for (let i = 0; i < len; i += 1) {
+          sorted[i] = { binding: i, slot: rawSlots[i] };
         }
+      } else {
+        sorted = EMPTY_VIEW_FORMATS;
       }
-
-      const sorted = normalizedItems.slice().sort((a, b) => (a.binding || 0) - (b.binding || 0));
       const gpuEntries = [];
       const stamps = [];
       const seenKeys = new Set();
@@ -5459,6 +5917,8 @@
   }
 
   ResourceTable.isViewDimensionCompatible = isViewDimensionCompatible;
+  ResourceTable.canonicalizeTextureViewDescriptorKey = canonicalizeTextureViewDescriptorKey;
+  ResourceTable.canonicalizeSlotDescriptorKey = canonicalizeSlotDescriptorKey;
 
   const exportsObj = Object.freeze({
     CREATE_TEXTURE2_OPCODE,
@@ -5491,6 +5951,8 @@
     decodeCreateTexture2,
     sanitizeTextureDescriptor,
     computeBindGroupHashFast,
+    canonicalizeTextureViewDescriptorKey,
+    canonicalizeSlotDescriptorKey,
     ResourceTable,
     GpuResourceTable: ResourceTable,
   });
@@ -5533,6 +5995,8 @@
       decodeCreateTexture2,
       sanitizeTextureDescriptor,
       computeBindGroupHashFast,
+      canonicalizeTextureViewDescriptorKey,
+      canonicalizeSlotDescriptorKey,
       ResourceTable,
       GpuResourceTable: ResourceTable,
     };

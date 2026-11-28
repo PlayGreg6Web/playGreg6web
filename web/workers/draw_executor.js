@@ -89,6 +89,53 @@
   const MAX_FAST_VB_SLOTS = 8;
   const MAX_FAST_BG_SLOTS = 4;
   const MAX_FAST_DYN_OFFSETS = 8;
+  const EMPTY_UINT32_ARRAY = new Uint32Array(0);
+  const ROUTER_PROFILE_OPTS = Object.freeze({
+    [FALLBACK_PROFILE.DEFAULT]: Object.freeze({ profile: FALLBACK_PROFILE.DEFAULT }),
+    [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]: Object.freeze({
+      profile: FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV,
+    }),
+    [FALLBACK_PROFILE.TEXTURED_QUAD_24B]: Object.freeze({
+      profile: FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+    }),
+    [FALLBACK_PROFILE.SPLASH_RECT_24B]: Object.freeze({
+      profile: FALLBACK_PROFILE.SPLASH_RECT_24B,
+    }),
+  });
+
+  function isNativeWebGpuPass(pass) {
+    return (
+      (typeof GPURenderPassEncoder !== 'undefined' && pass instanceof GPURenderPassEncoder) ||
+      (typeof GPUComputePassEncoder !== 'undefined' && pass instanceof GPUComputePassEncoder)
+    );
+  }
+
+  function buildCoercedViewDescriptor(
+    viewDescriptor,
+    formatCoerced,
+    effFormat,
+    effDim,
+    effBaseLayer,
+    effLayerCount,
+    effBaseMip,
+    effMipCount
+  ) {
+    const createDesc = {};
+    if (viewDescriptor && typeof viewDescriptor === 'object') {
+      for (const k in viewDescriptor) {
+        if (Object.prototype.hasOwnProperty.call(viewDescriptor, k)) {
+          createDesc[k] = viewDescriptor[k];
+        }
+      }
+    }
+    if (formatCoerced) createDesc.format = effFormat;
+    if (effDim !== '') createDesc.dimension = effDim;
+    if (effBaseLayer !== '') createDesc.baseArrayLayer = effBaseLayer;
+    if (effLayerCount !== '') createDesc.arrayLayerCount = effLayerCount;
+    if (effBaseMip !== '') createDesc.baseMipLevel = effBaseMip;
+    if (effMipCount !== '') createDesc.mipLevelCount = effMipCount;
+    return createDesc;
+  }
 
   // W354: O(1) zero-string-alloc hash-bucketed bind-group cache constants for 1..8 entries.
   const MAX_FAST_BG_CACHE_ENTRIES = 8;
@@ -269,136 +316,186 @@
     return fallback ? fallback[1] : defaultName;
   }
 
-  function iterateCollectionValues(collection) {
-    if (!collection) {
-      return [];
+  function isTruthyResourceItem(item) {
+    if (item === null || item === undefined || item === false) {
+      return false;
     }
-    if (collection instanceof Map) {
-      return Array.from(collection.values());
+    if (typeof item === 'object') {
+      if (item.destroyed === true) return false;
+      if ('buffer' in item && item.buffer === null && item.present !== true) return false;
+      if ('texture' in item && item.texture === null && !item.textureView && item.present !== true) return false;
+      if ('sampler' in item && item.sampler === null && item.present !== true) return false;
     }
-    if (Array.isArray(collection)) {
-      return collection;
-    }
-    if (typeof collection === 'object') {
-      return Object.values(collection);
-    }
-    return [];
+    return true;
   }
 
   function hasAnyTruthyValue(collection) {
-    const values = iterateCollectionValues(collection);
-    for (let i = 0; i < values.length; i += 1) {
-      const item = values[i];
-      if (item !== null && item !== undefined && item !== false) {
-        if (typeof item === 'object') {
-          if (item.destroyed === true) continue;
-          if ('buffer' in item && item.buffer === null && item.present !== true) continue;
-          if ('texture' in item && item.texture === null && !item.textureView && item.present !== true) continue;
-          if ('sampler' in item && item.sampler === null && item.present !== true) continue;
+    if (!collection) {
+      return false;
+    }
+    if (Array.isArray(collection)) {
+      for (let i = 0; i < collection.length; i += 1) {
+        if (isTruthyResourceItem(collection[i])) return true;
+      }
+      return false;
+    }
+    if (collection instanceof Map) {
+      for (const item of collection.values()) {
+        if (isTruthyResourceItem(item)) return true;
+      }
+      return false;
+    }
+    if (typeof collection === 'object') {
+      for (const k in collection) {
+        if (Object.prototype.hasOwnProperty.call(collection, k) && isTruthyResourceItem(collection[k])) {
+          return true;
         }
-        return true;
       }
     }
     return false;
   }
 
-  function inspectBindGroupMeta(bindGroups) {
-    let hasCbv = false;
-    let hasTexture = false;
-    let hasSampler = false;
+  function inspectSingleBindGroupMeta(group, out) {
+    if (!group || typeof group !== 'object') {
+      return;
+    }
+    if (group.hasCbv === true || group.hasBoundCbv === true || group.cbv || group.cbvBuffer || group.uniformBuffer) {
+      out.hasCbv = true;
+    }
+    if (
+      group.hasTexture === true ||
+      group.hasBoundTexture === true ||
+      group.hasSampledTexture === true ||
+      group.hasSrv === true ||
+      group.texture ||
+      group.textureView ||
+      group.srv
+    ) {
+      out.hasTexture = true;
+    }
+    if (group.hasSampler === true || group.hasBoundSampler === true || group.sampler) {
+      out.hasSampler = true;
+    }
 
-    const groups = iterateCollectionValues(bindGroups);
-    for (let i = 0; i < groups.length; i += 1) {
-      const group = groups[i];
-      if (!group || typeof group !== 'object') {
+    const entries = Array.isArray(group.entries)
+      ? group.entries
+      : group.desc && Array.isArray(group.desc.entries)
+        ? group.desc.entries
+        : null;
+    if (!entries) {
+      return;
+    }
+    for (let j = 0; j < entries.length; j += 1) {
+      const entry = entries[j];
+      if (!entry || typeof entry !== 'object') {
         continue;
       }
-      if (group.hasCbv === true || group.hasBoundCbv === true || group.cbv || group.cbvBuffer || group.uniformBuffer) {
-        hasCbv = true;
+      const type = typeof entry.type === 'string' ? entry.type.toLowerCase() : '';
+      const kind = typeof entry.kind === 'string' ? entry.kind.toLowerCase() : '';
+      const resourceType = entry.resourceType;
+      const resource = entry.resource;
+      const resKind =
+        resource && typeof resource === 'object' && typeof resource.kind === 'string'
+          ? resource.kind.toLowerCase()
+          : '';
+
+      if (
+        type === 'uniform' ||
+        type === 'cbv' ||
+        kind === 'cbv' ||
+        kind === 'uniform' ||
+        entry.isCbv === true ||
+        resourceType === 0 ||
+        resourceType === 'buffer' ||
+        (resource && typeof resource === 'object' && resource.buffer)
+      ) {
+        out.hasCbv = true;
       }
       if (
-        group.hasTexture === true ||
-        group.hasBoundTexture === true ||
-        group.hasSampledTexture === true ||
-        group.hasSrv === true ||
-        group.texture ||
-        group.textureView ||
-        group.srv
+        type === 'texture' ||
+        type === 'srv' ||
+        type === 'sampled-texture' ||
+        kind === 'srv' ||
+        kind === 'texture' ||
+        kind === 'gputextureview' ||
+        resKind === 'gputextureview' ||
+        resKind === 'gputexture' ||
+        entry.isTexture === true ||
+        resourceType === 1 ||
+        resourceType === 'textureView' ||
+        resourceType === 'texture' ||
+        entry.textureView ||
+        entry.texture
       ) {
-        hasTexture = true;
+        out.hasTexture = true;
       }
-      if (group.hasSampler === true || group.hasBoundSampler === true || group.sampler) {
-        hasSampler = true;
+      if (
+        type === 'sampler' ||
+        kind === 'sampler' ||
+        kind === 'gpusampler' ||
+        resKind === 'gpusampler' ||
+        entry.isSampler === true ||
+        resourceType === 2 ||
+        resourceType === 'sampler' ||
+        entry.sampler
+      ) {
+        out.hasSampler = true;
       }
+    }
+  }
 
-      const entries = Array.isArray(group.entries)
-        ? group.entries
-        : group.desc && Array.isArray(group.desc.entries)
-          ? group.desc.entries
-          : null;
-      if (!entries) {
-        continue;
+  function inspectBindGroupMeta(bindGroups) {
+    const out = { hasCbv: false, hasTexture: false, hasSampler: false };
+    if (!bindGroups) {
+      return out;
+    }
+    if (Array.isArray(bindGroups)) {
+      for (let i = 0; i < bindGroups.length; i += 1) {
+        inspectSingleBindGroupMeta(bindGroups[i], out);
       }
-      for (let j = 0; j < entries.length; j += 1) {
-        const entry = entries[j];
-        if (!entry || typeof entry !== 'object') {
-          continue;
-        }
-        const type = typeof entry.type === 'string' ? entry.type.toLowerCase() : '';
-        const kind = typeof entry.kind === 'string' ? entry.kind.toLowerCase() : '';
-        const resourceType = entry.resourceType;
-        const resource = entry.resource;
-        const resKind =
-          resource && typeof resource === 'object' && typeof resource.kind === 'string'
-            ? resource.kind.toLowerCase()
-            : '';
-
-        if (
-          type === 'uniform' ||
-          type === 'cbv' ||
-          kind === 'cbv' ||
-          kind === 'uniform' ||
-          entry.isCbv === true ||
-          resourceType === 0 ||
-          resourceType === 'buffer' ||
-          (resource && typeof resource === 'object' && resource.buffer)
-        ) {
-          hasCbv = true;
-        }
-        if (
-          type === 'texture' ||
-          type === 'srv' ||
-          type === 'sampled-texture' ||
-          kind === 'srv' ||
-          kind === 'texture' ||
-          kind === 'gputextureview' ||
-          resKind === 'gputextureview' ||
-          resKind === 'gputexture' ||
-          entry.isTexture === true ||
-          resourceType === 1 ||
-          resourceType === 'textureView' ||
-          resourceType === 'texture' ||
-          entry.textureView ||
-          entry.texture
-        ) {
-          hasTexture = true;
-        }
-        if (
-          type === 'sampler' ||
-          kind === 'sampler' ||
-          kind === 'gpusampler' ||
-          resKind === 'gpusampler' ||
-          entry.isSampler === true ||
-          resourceType === 2 ||
-          resourceType === 'sampler' ||
-          entry.sampler
-        ) {
-          hasSampler = true;
+    } else if (bindGroups instanceof Map) {
+      for (const group of bindGroups.values()) {
+        inspectSingleBindGroupMeta(group, out);
+      }
+    } else if (typeof bindGroups === 'object') {
+      for (const k in bindGroups) {
+        if (Object.prototype.hasOwnProperty.call(bindGroups, k)) {
+          inspectSingleBindGroupMeta(bindGroups[k], out);
         }
       }
     }
+    return out;
+  }
 
-    return { hasCbv, hasTexture, hasSampler };
+  function collectionHasStride(collection, targetStride) {
+    if (!collection) return false;
+    if (Array.isArray(collection)) {
+      for (let i = 0; i < collection.length; i += 1) {
+        const item = collection[i];
+        if (item && typeof item === 'object' && (item.stride === targetStride || item.arrayStride === targetStride)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (collection instanceof Map) {
+      for (const item of collection.values()) {
+        if (item && typeof item === 'object' && (item.stride === targetStride || item.arrayStride === targetStride)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (typeof collection === 'object') {
+      for (const k in collection) {
+        if (!Object.prototype.hasOwnProperty.call(collection, k)) continue;
+        const item = collection[k];
+        if (item && typeof item === 'object' && (item.stride === targetStride || item.arrayStride === targetStride)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   function hasVertexStride(drawState, targetStride) {
@@ -409,32 +506,13 @@
     ) {
       return true;
     }
-
-    const vbValues = iterateCollectionValues(drawState.vertexBuffers);
-    for (let i = 0; i < vbValues.length; i += 1) {
-      const vb = vbValues[i];
-      if (!vb || typeof vb !== 'object') {
-        continue;
-      }
-      if (vb.stride === targetStride || vb.arrayStride === targetStride) {
-        return true;
-      }
+    if (collectionHasStride(drawState.vertexBuffers, targetStride)) {
+      return true;
     }
-
-    const layoutValues = iterateCollectionValues(
-      drawState.vertexBufferLayouts || drawState.vertexLayouts
+    return collectionHasStride(
+      drawState.vertexBufferLayouts || drawState.vertexLayouts,
+      targetStride
     );
-    for (let i = 0; i < layoutValues.length; i += 1) {
-      const layout = layoutValues[i];
-      if (!layout || typeof layout !== 'object') {
-        continue;
-      }
-      if (layout.arrayStride === targetStride || layout.stride === targetStride) {
-        return true;
-      }
-    }
-
-    return false;
   }
 
   function isRectListTopology(topology) {
@@ -986,7 +1064,7 @@
     return resource.sampler && typeof resource.sampler === 'object' ? resource.sampler : resource;
   }
 
-  function dynamicOffsetsEqual(boundRecord, nextOffsets) {
+  function dynamicOffsetsRangeEqual(boundRecord, nextOffsets, start, explicitLen) {
     const nextHas = nextOffsets !== null && nextOffsets !== undefined;
     if (boundRecord.hasDynamicOffsets !== nextHas) {
       return false;
@@ -994,38 +1072,38 @@
     if (!nextHas) {
       return true;
     }
-    const nextLen = nextOffsets.length;
+    const nextLen = explicitLen >= 0 ? explicitLen : nextOffsets.length;
     if (boundRecord.dynamicOffsetsLength !== nextLen) {
       return false;
     }
     const prev = boundRecord.dynamicOffsetsSnapshot;
     for (let i = 0; i < nextLen; i += 1) {
-      if (prev[i] !== nextOffsets[i]) {
+      if (prev[i] !== nextOffsets[start + i]) {
         return false;
       }
     }
     return true;
   }
 
-  function copyDynamicOffsetsInto(boundRecord, nextOffsets) {
+  function copyDynamicOffsetsRangeInto(boundRecord, nextOffsets, start, explicitLen) {
     const nextHas = nextOffsets !== null && nextOffsets !== undefined;
     boundRecord.hasDynamicOffsets = nextHas;
     if (!nextHas) {
       boundRecord.dynamicOffsetsLength = 0;
       return;
     }
-    const len = nextOffsets.length;
+    const len = explicitLen >= 0 ? explicitLen : nextOffsets.length;
     boundRecord.dynamicOffsetsLength = len;
     if (len === 0) {
       return;
     }
     let snap = boundRecord.dynamicOffsetsSnapshot;
-    if (!snap) {
-      snap = new Array(len);
+    if (!snap || snap.length < len) {
+      snap = new Float64Array(len);
       boundRecord.dynamicOffsetsSnapshot = snap;
     }
     for (let i = 0; i < len; i += 1) {
-      snap[i] = nextOffsets[i];
+      snap[i] = nextOffsets[start + i];
     }
   }
 
@@ -1418,6 +1496,7 @@
       elidedBlendConstantSets: 0,
       elidedStencilReferenceSets: 0,
       totalElidedStateCalls: 0,
+      redundantStateCallsSkipped: 0,
       bindGroupCacheHits: 0,
       bindGroupCacheMisses: 0,
       bindGroupCacheEvictions: 0,
@@ -1776,6 +1855,43 @@
         reuseResult: true,
       };
       this._scratchReuseDrawOpts = { reuseResult: true };
+      this._scratchCbvCandidate = { buffer: null, offset: 0, size: null };
+      this._scratchResolvedFallback = {
+        selectedProfile: null,
+        effectiveProfile: null,
+        vertex: null,
+        fragment: null,
+      };
+      this._scratchDrawVbs = [];
+      this._scratchDrawVbPool = [];
+      this._scratchDrawBgs = [];
+      this._scratchDrawBgPool = [];
+      this._scratchDrawCbvs = [];
+      this._scratchDrawTextures = [];
+      this._scratchDrawSamplers = [];
+      this._scratchDrawState = {
+        vertexCount: 0,
+        indexCount: 0,
+        instanceCount: 1,
+        firstVertex: 0,
+        firstIndex: 0,
+        baseVertex: 0,
+        firstInstance: 0,
+        indexed: false,
+        indirect: false,
+        pipeline: null,
+        vertexStride: null,
+        vertexBuffers: this._scratchDrawVbs,
+        vertexBufferLayouts: null,
+        bindGroups: this._scratchDrawBgs,
+        cbvs: this._scratchDrawCbvs,
+        textures: this._scratchDrawTextures,
+        samplers: this._scratchDrawSamplers,
+        viewport: null,
+        scissorRect: null,
+        blendConstant: null,
+        stencilReference: null,
+      };
 
       // Device-scoped resource caches & object identity maps (WeakMap avoids retention leaks).
       this._fallbackPipelineCache = new Map();
@@ -2026,7 +2142,19 @@
           const view = texture.createView();
           if (view && typeof view === 'object') {
             if (!record) {
-              record = { defaultView: view, byKey: null };
+              record = {
+                defaultView: view,
+                byKey: null,
+                lastView: null,
+                lastFormat: '',
+                lastDim: '',
+                lastAspect: '',
+                lastBaseMip: '',
+                lastMipCount: '',
+                lastBaseLayer: '',
+                lastLayerCount: '',
+                lastUsage: '',
+              };
               this._textureViewCache.set(texture, record);
             } else {
               record.defaultView = view;
@@ -2038,11 +2166,40 @@
         }
       }
 
+      // Zero-string-allocation inline MRU scalar cache hit check for non-default view descriptors.
+      if (
+        record &&
+        record.lastView !== null &&
+        record.lastFormat === effFormat &&
+        record.lastDim === effDim &&
+        record.lastAspect === rawAspect &&
+        record.lastBaseMip === effBaseMip &&
+        record.lastMipCount === effMipCount &&
+        record.lastBaseLayer === effBaseLayer &&
+        record.lastLayerCount === effLayerCount &&
+        record.lastUsage === rawUsage
+      ) {
+        if (record.lastView.destroyed !== true) {
+          this._stats.textureViewCacheHits += 1;
+          return record.lastView;
+        }
+        record.lastView = null;
+      }
+
       const key = `${effFormat}|${effDim}|${rawAspect}|${effBaseMip}|${effMipCount}|${effBaseLayer}|${effLayerCount}|${rawUsage}`;
       if (record && record.byKey !== null) {
         const cached = record.byKey.get(key);
         if (cached) {
           if (cached.destroyed !== true) {
+            record.lastView = cached;
+            record.lastFormat = effFormat;
+            record.lastDim = effDim;
+            record.lastAspect = rawAspect;
+            record.lastBaseMip = effBaseMip;
+            record.lastMipCount = effMipCount;
+            record.lastBaseLayer = effBaseLayer;
+            record.lastLayerCount = effLayerCount;
+            record.lastUsage = rawUsage;
             this._stats.textureViewCacheHits += 1;
             return cached;
           }
@@ -2052,16 +2209,18 @@
       }
 
       this._stats.textureViewCacheMisses += 1;
-      let createDesc = viewDescriptor;
-      if (coerced) {
-        createDesc = { ...viewDescriptor };
-        if (formatCoerced) createDesc.format = effFormat;
-        if (effDim !== '') createDesc.dimension = effDim;
-        if (effBaseLayer !== '') createDesc.baseArrayLayer = effBaseLayer;
-        if (effLayerCount !== '') createDesc.arrayLayerCount = effLayerCount;
-        if (effBaseMip !== '') createDesc.baseMipLevel = effBaseMip;
-        if (effMipCount !== '') createDesc.mipLevelCount = effMipCount;
-      }
+      const createDesc = coerced
+        ? buildCoercedViewDescriptor(
+            viewDescriptor,
+            formatCoerced,
+            effFormat,
+            effDim,
+            effBaseLayer,
+            effLayerCount,
+            effBaseMip,
+            effMipCount
+          )
+        : viewDescriptor;
 
       try {
         const view = texture.createView(createDesc);
@@ -2069,16 +2228,41 @@
           if (!record) {
             const byKey = new Map();
             byKey.set(key, view);
-            this._textureViewCache.set(texture, { defaultView: null, byKey });
+            this._textureViewCache.set(texture, {
+              defaultView: null,
+              byKey,
+              lastView: view,
+              lastFormat: effFormat,
+              lastDim: effDim,
+              lastAspect: rawAspect,
+              lastBaseMip: effBaseMip,
+              lastMipCount: effMipCount,
+              lastBaseLayer: effBaseLayer,
+              lastLayerCount: effLayerCount,
+              lastUsage: rawUsage,
+            });
           } else {
             if (record.byKey === null) {
               record.byKey = new Map();
             } else if (record.byKey.size >= MAX_VIEWS_PER_TEXTURE) {
               const oldestKey = record.byKey.keys().next().value;
+              const evictedView = record.byKey.get(oldestKey);
               record.byKey.delete(oldestKey);
+              if (record.lastView === evictedView) {
+                record.lastView = null;
+              }
               this._stats.textureViewCacheEvictions += 1;
             }
             record.byKey.set(key, view);
+            record.lastView = view;
+            record.lastFormat = effFormat;
+            record.lastDim = effDim;
+            record.lastAspect = rawAspect;
+            record.lastBaseMip = effBaseMip;
+            record.lastMipCount = effMipCount;
+            record.lastBaseLayer = effBaseLayer;
+            record.lastLayerCount = effLayerCount;
+            record.lastUsage = rawUsage;
           }
         }
         return view;
@@ -3451,8 +3635,15 @@
       }
       if (hasDyn === 1) {
         const len = explicitLen >= 0 ? explicitLen : src.length;
-        if (start === 0 && len === src.length) {
+        if (len === 0) {
+          pass.setBindGroup(slot, bindGroup, EMPTY_UINT32_ARRAY);
+        } else if (start === 0 && len === src.length) {
           pass.setBindGroup(slot, bindGroup, src);
+        } else if (
+          src instanceof Uint32Array &&
+          (isNativeWebGpuPass(pass) || pass.setBindGroup.length >= 5)
+        ) {
+          pass.setBindGroup(slot, bindGroup, src, start, len);
         } else {
           const slice =
             typeof src.subarray === 'function'
@@ -3479,7 +3670,7 @@
       return true;
     }
 
-    _bindBindGroupOnPass(pass, groupIndex, bindGroup, dynamicOffsets) {
+    _bindBindGroupOnPass(pass, groupIndex, bindGroup, dynamicOffsets, dynStart = 0, dynLen = -1) {
       this._syncPassTracking(pass);
       const hasDyn = dynamicOffsets !== null && dynamicOffsets !== undefined ? 1 : 0;
       if (groupIndex >= 0 && groupIndex < MAX_FAST_BG_SLOTS) {
@@ -3491,8 +3682,8 @@
           bindGroup,
           hasDyn,
           hasDyn === 1 ? dynamicOffsets : null,
-          0,
-          -1
+          dynStart,
+          dynLen
         );
         if (!bound) {
           this._stats.redundantBindGroupSkips += 1;
@@ -3512,7 +3703,11 @@
         bindGroup.destroyed !== true
       ) {
         const bound = this._boundBgOverflow.get(groupIndex);
-        if (bound && bound.bindGroup === bindGroup && dynamicOffsetsEqual(bound, offsets)) {
+        if (
+          bound &&
+          bound.bindGroup === bindGroup &&
+          dynamicOffsetsRangeEqual(bound, offsets, dynStart, dynLen)
+        ) {
           this._stats.redundantBindGroupSkips += 1;
           this._stats.elidedBindGroupSets += 1;
           this._stats.totalElidedStateCalls += 1;
@@ -3521,7 +3716,23 @@
         }
       }
       if (offsets !== null) {
-        pass.setBindGroup(groupIndex, bindGroup, offsets);
+        const len = dynLen >= 0 ? dynLen : offsets.length;
+        if (len === 0) {
+          pass.setBindGroup(groupIndex, bindGroup, EMPTY_UINT32_ARRAY);
+        } else if (dynStart === 0 && len === offsets.length) {
+          pass.setBindGroup(groupIndex, bindGroup, offsets);
+        } else if (
+          offsets instanceof Uint32Array &&
+          (isNativeWebGpuPass(pass) || pass.setBindGroup.length >= 5)
+        ) {
+          pass.setBindGroup(groupIndex, bindGroup, offsets, dynStart, len);
+        } else {
+          const slice =
+            typeof offsets.subarray === 'function'
+              ? offsets.subarray(dynStart, dynStart + len)
+              : Array.prototype.slice.call(offsets, dynStart, dynStart + len);
+          pass.setBindGroup(groupIndex, bindGroup, slice);
+        }
       } else {
         pass.setBindGroup(groupIndex, bindGroup);
       }
@@ -3541,7 +3752,7 @@
       } else {
         record.bindGroup = bindGroup;
       }
-      copyDynamicOffsetsInto(record, offsets);
+      copyDynamicOffsetsRangeInto(record, offsets, dynStart, dynLen);
       return true;
     }
 
@@ -3998,13 +4209,23 @@
       if (this._stagedVbOverflow === null) {
         this._stagedVbOverflow = new Map();
       }
-      this._stagedVbOverflow.set(slot, {
-        slot,
-        buffer,
-        offset,
-        size: explicitSize,
-        stride,
-      });
+      let vbRec = this._stagedVbOverflow.get(slot);
+      if (!vbRec) {
+        vbRec = {
+          slot,
+          buffer,
+          offset,
+          size: explicitSize,
+          stride,
+        };
+        this._stagedVbOverflow.set(slot, vbRec);
+      } else {
+        vbRec.slot = slot;
+        vbRec.buffer = buffer;
+        vbRec.offset = offset;
+        vbRec.size = explicitSize;
+        vbRec.stride = stride;
+      }
       return true;
     }
 
@@ -4144,26 +4365,29 @@
         return true;
       }
       let dynamicOffsets = null;
+      let dynStart = 0;
+      let dynLen = -1;
       let meta = null;
       if (Array.isArray(dynamicOffsetsOrMeta) || ArrayBuffer.isView(dynamicOffsetsOrMeta)) {
+        dynamicOffsets = dynamicOffsetsOrMeta;
         if (
           ArrayBuffer.isView(dynamicOffsetsOrMeta) &&
           typeof dynamicOffsetsDataStart === 'number' &&
           Number.isInteger(dynamicOffsetsDataStart) &&
           dynamicOffsetsDataStart >= 0
         ) {
-          const end =
+          const srcLen = dynamicOffsetsOrMeta.length;
+          const clampedStart =
+            dynamicOffsetsDataStart > srcLen ? srcLen : dynamicOffsetsDataStart;
+          const rawEnd =
             typeof dynamicOffsetsDataLength === 'number' &&
             Number.isInteger(dynamicOffsetsDataLength) &&
             dynamicOffsetsDataLength >= 0
-              ? dynamicOffsetsDataStart + dynamicOffsetsDataLength
-              : dynamicOffsetsOrMeta.length;
-          dynamicOffsets =
-            typeof dynamicOffsetsOrMeta.subarray === 'function'
-              ? dynamicOffsetsOrMeta.subarray(dynamicOffsetsDataStart, end)
-              : Array.prototype.slice.call(dynamicOffsetsOrMeta, dynamicOffsetsDataStart, end);
-        } else {
-          dynamicOffsets = dynamicOffsetsOrMeta;
+              ? clampedStart + dynamicOffsetsDataLength
+              : srcLen;
+          const clampedEnd = rawEnd > srcLen ? srcLen : rawEnd;
+          dynStart = clampedStart;
+          dynLen = clampedEnd - clampedStart;
         }
       } else if (dynamicOffsetsOrMeta && typeof dynamicOffsetsOrMeta === 'object') {
         meta = dynamicOffsetsOrMeta;
@@ -4178,22 +4402,49 @@
       if (this._stagedBgOverflow === null) {
         this._stagedBgOverflow = new Map();
       }
-      this._stagedBgOverflow.set(groupIndex, {
-        groupIndex,
-        bindGroup: bindGroup.bindGroup !== undefined ? bindGroup.bindGroup : bindGroup,
-        dynamicOffsets,
-        entries:
-          (meta && meta.entries) ||
-          (bindGroup && bindGroup.entries) ||
-          (bindGroup && bindGroup.desc && bindGroup.desc.entries) ||
-          null,
-        hasCbv: Boolean((meta && meta.hasCbv) || (bindGroup && bindGroup.hasCbv)),
-        hasTexture: Boolean((meta && meta.hasTexture) || (bindGroup && bindGroup.hasTexture)),
-        hasSampler: Boolean((meta && meta.hasSampler) || (bindGroup && bindGroup.hasSampler)),
-        cbvBuffer: (meta && meta.cbvBuffer) || (bindGroup && bindGroup.cbvBuffer) || null,
-        textureView: (meta && meta.textureView) || (bindGroup && bindGroup.textureView) || null,
-        sampler: (meta && meta.sampler) || (bindGroup && bindGroup.sampler) || null,
-      });
+      const actualBg = bindGroup.bindGroup !== undefined ? bindGroup.bindGroup : bindGroup;
+      const bgEntries =
+        (meta && meta.entries) ||
+        (bindGroup && bindGroup.entries) ||
+        (bindGroup && bindGroup.desc && bindGroup.desc.entries) ||
+        null;
+      const bgHasCbv = Boolean((meta && meta.hasCbv) || (bindGroup && bindGroup.hasCbv));
+      const bgHasTexture = Boolean((meta && meta.hasTexture) || (bindGroup && bindGroup.hasTexture));
+      const bgHasSampler = Boolean((meta && meta.hasSampler) || (bindGroup && bindGroup.hasSampler));
+      const bgCbvBuffer = (meta && meta.cbvBuffer) || (bindGroup && bindGroup.cbvBuffer) || null;
+      const bgTextureView = (meta && meta.textureView) || (bindGroup && bindGroup.textureView) || null;
+      const bgSampler = (meta && meta.sampler) || (bindGroup && bindGroup.sampler) || null;
+      let bgRec = this._stagedBgOverflow.get(groupIndex);
+      if (!bgRec) {
+        bgRec = {
+          groupIndex,
+          bindGroup: actualBg,
+          dynamicOffsets,
+          dynStart,
+          dynLen,
+          entries: bgEntries,
+          hasCbv: bgHasCbv,
+          hasTexture: bgHasTexture,
+          hasSampler: bgHasSampler,
+          cbvBuffer: bgCbvBuffer,
+          textureView: bgTextureView,
+          sampler: bgSampler,
+        };
+        this._stagedBgOverflow.set(groupIndex, bgRec);
+      } else {
+        bgRec.groupIndex = groupIndex;
+        bgRec.bindGroup = actualBg;
+        bgRec.dynamicOffsets = dynamicOffsets;
+        bgRec.dynStart = dynStart;
+        bgRec.dynLen = dynLen;
+        bgRec.entries = bgEntries;
+        bgRec.hasCbv = bgHasCbv;
+        bgRec.hasTexture = bgHasTexture;
+        bgRec.hasSampler = bgHasSampler;
+        bgRec.cbvBuffer = bgCbvBuffer;
+        bgRec.textureView = bgTextureView;
+        bgRec.sampler = bgSampler;
+      }
       return true;
     }
 
@@ -4206,13 +4457,19 @@
         this._cbvs.delete(slot);
         return true;
       }
-      const opts = options && typeof options === 'object' ? options : {};
-      this._cbvs.set(slot, {
-        slot,
-        buffer,
-        offset: opts.offset !== undefined ? opts.offset : 0,
-        size: opts.size !== undefined ? opts.size : null,
-      });
+      const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+      const offset = hasOpts && options.offset !== undefined ? options.offset : 0;
+      const size = hasOpts && options.size !== undefined ? options.size : null;
+      let rec = this._cbvs.get(slot);
+      if (!rec) {
+        rec = { slot, buffer, offset, size };
+        this._cbvs.set(slot, rec);
+      } else {
+        rec.slot = slot;
+        rec.buffer = buffer;
+        rec.offset = offset;
+        rec.size = size;
+      }
       return true;
     }
 
@@ -4288,6 +4545,7 @@
         try {
           return this._bindViewportOnPass(xOrPass, this._tmpViewport) !== BIND_STATUS_UNSUPPORTED;
         } catch (err) {
+          this._clearBoundPassState();
           this._stats.passErrors += 1;
           this._warn('setViewport failed on pass', {
             error: String(err && err.message ? err.message : err),
@@ -4340,6 +4598,7 @@
         try {
           return this._bindScissorRectOnPass(xOrPass, this._tmpScissor) !== BIND_STATUS_UNSUPPORTED;
         } catch (err) {
+          this._clearBoundPassState();
           this._stats.passErrors += 1;
           this._warn('setScissorRect failed on pass', {
             error: String(err && err.message ? err.message : err),
@@ -4384,6 +4643,7 @@
             BIND_STATUS_UNSUPPORTED
           );
         } catch (err) {
+          this._clearBoundPassState();
           this._stats.passErrors += 1;
           this._warn('setBlendConstant failed on pass', {
             error: String(err && err.message ? err.message : err),
@@ -4426,6 +4686,7 @@
         try {
           return this._bindStencilReferenceOnPass(refOrPass, sr) !== BIND_STATUS_UNSUPPORTED;
         } catch (err) {
+          this._clearBoundPassState();
           this._stats.passErrors += 1;
           this._warn('setStencilReference failed on pass', {
             error: String(err && err.message ? err.message : err),
@@ -4514,13 +4775,20 @@
       }
       if (this._boundBgOverflow !== null && this._boundBgOverflow.size > 0) {
         for (const [groupIndex, rec] of this._boundBgOverflow.entries()) {
+          let dynCopy = null;
+          if (rec.hasDynamicOffsets) {
+            const len = rec.dynamicOffsetsLength;
+            dynCopy = new Array(len);
+            const snap = rec.dynamicOffsetsSnapshot;
+            if (snap) {
+              for (let i = 0; i < len; i += 1) {
+                dynCopy[i] = snap[i];
+              }
+            }
+          }
           bindGroups[groupIndex] = {
             bindGroup: rec.bindGroup,
-            dynamicOffsets: rec.hasDynamicOffsets
-              ? rec.dynamicOffsetsSnapshot
-                ? rec.dynamicOffsetsSnapshot.slice(0, rec.dynamicOffsetsLength)
-                : []
-              : null,
+            dynamicOffsets: dynCopy,
           };
         }
       }
@@ -4547,6 +4815,9 @@
         }
       }
 
+      const bvp = this._boundViewportData;
+      const bsc = this._boundScissorData;
+      const bbc = this._boundBlendConstantData;
       return {
         hasActivePass: this._boundPass !== null,
         pipeline: this._boundPipeline,
@@ -4560,9 +4831,22 @@
               size: this._boundIbSize,
             }
           : null,
-        viewport: this._hasBoundViewport ? { ...this._boundViewportData } : null,
-        scissorRect: this._hasBoundScissor ? { ...this._boundScissorData } : null,
-        blendConstant: this._hasBoundBlendConstant ? { ...this._boundBlendConstantData } : null,
+        viewport: this._hasBoundViewport
+          ? {
+              x: bvp.x,
+              y: bvp.y,
+              width: bvp.width,
+              height: bvp.height,
+              minDepth: bvp.minDepth,
+              maxDepth: bvp.maxDepth,
+            }
+          : null,
+        scissorRect: this._hasBoundScissor
+          ? { x: bsc.x, y: bsc.y, width: bsc.width, height: bsc.height }
+          : null,
+        blendConstant: this._hasBoundBlendConstant
+          ? { r: bbc.r, g: bbc.g, b: bbc.b, a: bbc.a }
+          : null,
         stencilReference: this._boundStencilReference,
       };
     }
@@ -4571,8 +4855,8 @@
      * Snapshot active draw state merged with optional per-draw overrides.
      */
     getDrawState(overrides) {
-      const ov = overrides && typeof overrides === 'object' ? overrides : {};
-      const pipe = ov.pipeline !== undefined ? ov.pipeline : this._activePipeline;
+      const ov = overrides && typeof overrides === 'object' ? overrides : null;
+      const pipe = ov !== null && ov.pipeline !== undefined ? ov.pipeline : this._activePipeline;
 
       const vertexBuffers = [];
       let vbMask = this._stagedVbMask;
@@ -4590,10 +4874,16 @@
       }
       if (this._stagedVbOverflow !== null && this._stagedVbOverflow.size > 0) {
         for (const vb of this._stagedVbOverflow.values()) {
-          vertexBuffers.push({ ...vb });
+          vertexBuffers.push({
+            slot: vb.slot,
+            buffer: vb.buffer,
+            offset: vb.offset,
+            size: vb.size,
+            stride: vb.stride,
+          });
         }
       }
-      if (Array.isArray(ov.vertexBuffers)) {
+      if (ov !== null && Array.isArray(ov.vertexBuffers)) {
         for (let i = 0; i < ov.vertexBuffers.length; i += 1) {
           if (ov.vertexBuffers[i]) {
             vertexBuffers.push(ov.vertexBuffers[i]);
@@ -4614,7 +4904,7 @@
           bindGroups.push(bg);
         }
       }
-      if (Array.isArray(ov.bindGroups)) {
+      if (ov !== null && Array.isArray(ov.bindGroups)) {
         for (let i = 0; i < ov.bindGroups.length; i += 1) {
           if (ov.bindGroups[i]) {
             bindGroups.push(ov.bindGroups[i]);
@@ -4622,12 +4912,15 @@
         }
       }
 
-      const cbvs = Array.from(this._cbvs.values());
-      const textures = Array.from(this._textures.values());
-      const samplers = Array.from(this._samplers.values());
+      const cbvs = [];
+      for (const c of this._cbvs.values()) cbvs.push(c);
+      const textures = [];
+      for (const t of this._textures.values()) textures.push(t);
+      const samplers = [];
+      for (const s of this._samplers.values()) samplers.push(s);
 
       let vertexStride =
-        ov.vertexStride !== undefined
+        ov !== null && ov.vertexStride !== undefined
           ? ov.vertexStride
           : pipe && typeof pipe === 'object' && typeof pipe.vertexStride === 'number'
             ? pipe.vertexStride
@@ -4638,20 +4931,23 @@
         }
       }
 
+      const svp = this._stagedViewport;
+      const ssc = this._stagedScissor;
+      const sbc = this._stagedBlendConstant;
       const state = {
-        vertexCount: ov.vertexCount !== undefined ? ov.vertexCount : 0,
-        indexCount: ov.indexCount !== undefined ? ov.indexCount : 0,
-        instanceCount: ov.instanceCount !== undefined ? ov.instanceCount : 1,
-        firstVertex: ov.firstVertex !== undefined ? ov.firstVertex : 0,
-        firstIndex: ov.firstIndex !== undefined ? ov.firstIndex : 0,
-        baseVertex: ov.baseVertex !== undefined ? ov.baseVertex : 0,
-        firstInstance: ov.firstInstance !== undefined ? ov.firstInstance : 0,
-        indexed: Boolean(ov.indexed),
+        vertexCount: ov !== null && ov.vertexCount !== undefined ? ov.vertexCount : 0,
+        indexCount: ov !== null && ov.indexCount !== undefined ? ov.indexCount : 0,
+        instanceCount: ov !== null && ov.instanceCount !== undefined ? ov.instanceCount : 1,
+        firstVertex: ov !== null && ov.firstVertex !== undefined ? ov.firstVertex : 0,
+        firstIndex: ov !== null && ov.firstIndex !== undefined ? ov.firstIndex : 0,
+        baseVertex: ov !== null && ov.baseVertex !== undefined ? ov.baseVertex : 0,
+        firstInstance: ov !== null && ov.firstInstance !== undefined ? ov.firstInstance : 0,
+        indexed: Boolean(ov !== null && ov.indexed),
         pipeline: pipe,
         vertexStride,
         vertexBuffers,
         vertexBufferLayouts:
-          ov.vertexBufferLayouts ||
+          (ov !== null && ov.vertexBufferLayouts) ||
           (pipe && typeof pipe === 'object' ? pipe.vertexBufferLayouts || pipe.vertexBuffers : null) ||
           null,
         bindGroups,
@@ -4659,37 +4955,226 @@
         textures,
         samplers,
         viewport:
-          ov.viewport !== undefined
+          ov !== null && ov.viewport !== undefined
             ? ov.viewport
             : this._hasStagedViewport
-              ? { ...this._stagedViewport }
+              ? {
+                  x: svp.x,
+                  y: svp.y,
+                  width: svp.width,
+                  height: svp.height,
+                  minDepth: svp.minDepth,
+                  maxDepth: svp.maxDepth,
+                }
               : null,
         scissorRect:
-          ov.scissorRect !== undefined
+          ov !== null && ov.scissorRect !== undefined
             ? ov.scissorRect
-            : ov.scissor !== undefined
+            : ov !== null && ov.scissor !== undefined
               ? ov.scissor
               : this._hasStagedScissor
-                ? { ...this._stagedScissor }
+                ? { x: ssc.x, y: ssc.y, width: ssc.width, height: ssc.height }
                 : null,
         blendConstant:
-          ov.blendConstant !== undefined
+          ov !== null && ov.blendConstant !== undefined
             ? ov.blendConstant
             : this._hasStagedBlendConstant
-              ? { ...this._stagedBlendConstant }
+              ? { r: sbc.r, g: sbc.g, b: sbc.b, a: sbc.a }
               : null,
         stencilReference:
-          ov.stencilReference !== undefined ? ov.stencilReference : this._stencilReference,
+          ov !== null && ov.stencilReference !== undefined ? ov.stencilReference : this._stencilReference,
       };
 
       // Propagate explicit override hints when passed directly to executeDraw / resolve.
-      for (let i = 0; i < PASSTHROUGH_DRAW_STATE_KEYS.length; i += 1) {
-        const key = PASSTHROUGH_DRAW_STATE_KEYS[i];
-        if (ov[key] !== undefined) {
-          state[key] = ov[key];
+      if (ov !== null) {
+        for (let i = 0; i < PASSTHROUGH_DRAW_STATE_KEYS.length; i += 1) {
+          const key = PASSTHROUGH_DRAW_STATE_KEYS[i];
+          if (ov[key] !== undefined) {
+            state[key] = ov[key];
+          }
         }
       }
 
+      return state;
+    }
+
+    _populateScratchDrawState(
+      ov,
+      indexed,
+      indirect,
+      vertexCount,
+      indexCount,
+      instanceCount,
+      firstVertex,
+      firstIndex,
+      baseVertex,
+      firstInstance
+    ) {
+      const pipe = ov !== null && ov.pipeline !== undefined ? ov.pipeline : this._activePipeline;
+
+      const vertexBuffers = this._scratchDrawVbs;
+      vertexBuffers.length = 0;
+      const vbPool = this._scratchDrawVbPool;
+      let vbPoolIdx = 0;
+      let vbMask = this._stagedVbMask;
+      while (vbMask !== 0) {
+        const bit = vbMask & -vbMask;
+        const slot = 31 - Math.clz32(bit);
+        vbMask ^= bit;
+        let rec = vbPool[vbPoolIdx];
+        if (!rec) {
+          rec = { slot: 0, buffer: null, offset: 0, size: null, stride: null };
+          vbPool[vbPoolIdx] = rec;
+        }
+        vbPoolIdx += 1;
+        rec.slot = slot;
+        rec.buffer = this._stagedVbBuffers[slot];
+        rec.offset = this._stagedVbOffsets[slot];
+        rec.size = this._stagedVbSizes[slot];
+        rec.stride = this._stagedVbStrides[slot];
+        vertexBuffers.push(rec);
+      }
+      if (this._stagedVbOverflow !== null && this._stagedVbOverflow.size > 0) {
+        for (const vb of this._stagedVbOverflow.values()) {
+          vertexBuffers.push(vb);
+        }
+      }
+      if (ov !== null && Array.isArray(ov.vertexBuffers)) {
+        for (let i = 0; i < ov.vertexBuffers.length; i += 1) {
+          if (ov.vertexBuffers[i]) {
+            vertexBuffers.push(ov.vertexBuffers[i]);
+          }
+        }
+      }
+
+      const bindGroups = this._scratchDrawBgs;
+      bindGroups.length = 0;
+      const bgPool = this._scratchDrawBgPool;
+      let bgPoolIdx = 0;
+      let bgMask = this._stagedBgMask;
+      while (bgMask !== 0) {
+        const bit = bgMask & -bgMask;
+        const slot = 31 - Math.clz32(bit);
+        bgMask ^= bit;
+        let rec = bgPool[bgPoolIdx];
+        if (!rec) {
+          rec = {
+            groupIndex: 0,
+            bindGroup: null,
+            dynamicOffsets: null,
+            entries: null,
+            hasCbv: false,
+            hasTexture: false,
+            hasSampler: false,
+            cbvBuffer: null,
+            textureView: null,
+            sampler: null,
+          };
+          bgPool[bgPoolIdx] = rec;
+        }
+        bgPoolIdx += 1;
+        const raw = this._stagedBgRaw[slot];
+        const meta = this._stagedBgMeta[slot];
+        rec.groupIndex = slot;
+        rec.bindGroup = this._stagedBgGroups[slot];
+        rec.dynamicOffsets = this._stagedBgHasDyn[slot] === 1 ? this._stagedBgDynSource[slot] : null;
+        rec.entries =
+          (meta && meta.entries) ||
+          (raw && raw.entries) ||
+          (raw && raw.desc && raw.desc.entries) ||
+          null;
+        rec.hasCbv = Boolean((meta && meta.hasCbv) || (raw && raw.hasCbv));
+        rec.hasTexture = Boolean((meta && meta.hasTexture) || (raw && raw.hasTexture));
+        rec.hasSampler = Boolean((meta && meta.hasSampler) || (raw && raw.hasSampler));
+        rec.cbvBuffer = (meta && meta.cbvBuffer) || (raw && raw.cbvBuffer) || null;
+        rec.textureView = (meta && meta.textureView) || (raw && raw.textureView) || null;
+        rec.sampler = (meta && meta.sampler) || (raw && raw.sampler) || null;
+        bindGroups.push(rec);
+      }
+      if (this._stagedBgOverflow !== null && this._stagedBgOverflow.size > 0) {
+        for (const bg of this._stagedBgOverflow.values()) {
+          bindGroups.push(bg);
+        }
+      }
+      if (ov !== null && Array.isArray(ov.bindGroups)) {
+        for (let i = 0; i < ov.bindGroups.length; i += 1) {
+          if (ov.bindGroups[i]) {
+            bindGroups.push(ov.bindGroups[i]);
+          }
+        }
+      }
+
+      const cbvs = this._scratchDrawCbvs;
+      cbvs.length = 0;
+      if (this._cbvs.size > 0) {
+        for (const c of this._cbvs.values()) cbvs.push(c);
+      }
+      const textures = this._scratchDrawTextures;
+      textures.length = 0;
+      if (this._textures.size > 0) {
+        for (const t of this._textures.values()) textures.push(t);
+      }
+      const samplers = this._scratchDrawSamplers;
+      samplers.length = 0;
+      if (this._samplers.size > 0) {
+        for (const s of this._samplers.values()) samplers.push(s);
+      }
+
+      let vertexStride =
+        ov !== null && ov.vertexStride !== undefined
+          ? ov.vertexStride
+          : pipe && typeof pipe === 'object' && typeof pipe.vertexStride === 'number'
+            ? pipe.vertexStride
+            : null;
+      if (vertexStride === null && (this._stagedVbMask & 1) !== 0) {
+        if (typeof this._stagedVbStrides[0] === 'number') {
+          vertexStride = this._stagedVbStrides[0];
+        }
+      }
+
+      const state = this._scratchDrawState;
+      state.vertexCount = vertexCount;
+      state.indexCount = indexCount;
+      state.instanceCount = instanceCount;
+      state.firstVertex = firstVertex;
+      state.firstIndex = firstIndex;
+      state.baseVertex = baseVertex;
+      state.firstInstance = firstInstance;
+      state.indexed = indexed;
+      state.indirect = indirect;
+      state.pipeline = pipe;
+      state.vertexStride = vertexStride;
+      state.vertexBufferLayouts =
+        (ov !== null && ov.vertexBufferLayouts) ||
+        (pipe && typeof pipe === 'object' ? pipe.vertexBufferLayouts || pipe.vertexBuffers : null) ||
+        null;
+      state.viewport =
+        ov !== null && ov.viewport !== undefined
+          ? ov.viewport
+          : this._hasStagedViewport
+            ? this._stagedViewport
+            : null;
+      state.scissorRect =
+        ov !== null && ov.scissorRect !== undefined
+          ? ov.scissorRect
+          : ov !== null && ov.scissor !== undefined
+            ? ov.scissor
+            : this._hasStagedScissor
+              ? this._stagedScissor
+              : null;
+      state.blendConstant =
+        ov !== null && ov.blendConstant !== undefined
+          ? ov.blendConstant
+          : this._hasStagedBlendConstant
+            ? this._stagedBlendConstant
+            : null;
+      state.stencilReference =
+        ov !== null && ov.stencilReference !== undefined ? ov.stencilReference : this._stencilReference;
+
+      for (let i = 0; i < PASSTHROUGH_DRAW_STATE_KEYS.length; i += 1) {
+        const key = PASSTHROUGH_DRAW_STATE_KEYS[i];
+        state[key] = ov !== null && ov[key] !== undefined ? ov[key] : undefined;
+      }
       return state;
     }
 
@@ -4789,8 +5274,9 @@
       }
 
       let raw = null;
+      const profileOpts = ROUTER_PROFILE_OPTS[profile] || { profile };
       try {
-        raw = router.resolve(hash, stageName, { profile });
+        raw = router.resolve(hash, stageName, profileOpts);
       } catch (_err3) {
         // Backwards compatibility with strict legacy 2-arg mock routers that reject a 3rd options arg.
         this._stats.legacyRouterFallbacks += 1;
@@ -4809,14 +5295,7 @@
       return unwrapRouterResult(raw, stageName);
     }
 
-    /**
-     * Select and resolve fallback vertex + fragment WGSL for a draw state.
-     *
-     * @param {object} drawState
-     * @param {string} [overrideProfile]
-     */
-    resolveFallbackShaders(drawState, overrideProfile) {
-      const state = drawState && typeof drawState === 'object' ? drawState : this.getDrawState();
+    _resolveFallbackShadersInto(out, state, overrideProfile) {
       const selectedProfile =
         overrideProfile !== undefined && overrideProfile !== null
           ? normalizeProfileName(overrideProfile)
@@ -4832,13 +5311,28 @@
         return null;
       }
 
-      const effectiveProfile = inferEffectiveProfileFromWgsl(vertex, fragment);
-      return {
-        selectedProfile,
-        effectiveProfile,
-        vertex,
-        fragment,
+      out.selectedProfile = selectedProfile;
+      out.effectiveProfile = inferEffectiveProfileFromWgsl(vertex, fragment);
+      out.vertex = vertex;
+      out.fragment = fragment;
+      return out;
+    }
+
+    /**
+     * Select and resolve fallback vertex + fragment WGSL for a draw state.
+     *
+     * @param {object} drawState
+     * @param {string} [overrideProfile]
+     */
+    resolveFallbackShaders(drawState, overrideProfile) {
+      const state = drawState && typeof drawState === 'object' ? drawState : this.getDrawState();
+      const out = {
+        selectedProfile: null,
+        effectiveProfile: null,
+        vertex: null,
+        fragment: null,
       };
+      return this._resolveFallbackShadersInto(out, state, overrideProfile);
     }
 
     _getOrCreateShaderModule(wgsl, label) {
@@ -4914,7 +5408,11 @@
                 {
                   arrayStride: FRAME1_SPLASH_VERTEX_LAYOUT_24B.arrayStride,
                   stepMode: FRAME1_SPLASH_VERTEX_LAYOUT_24B.stepMode,
-                  attributes: FRAME1_SPLASH_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
+                  attributes: [
+                    { shaderLocation: 0, offset: 0, format: 'float32x3' },
+                    { shaderLocation: 1, offset: 12, format: 'unorm8x4' },
+                    { shaderLocation: 2, offset: 16, format: 'float32x2' },
+                  ],
                 },
               ]
             : resolved.effectiveProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B
@@ -4922,7 +5420,10 @@
                   {
                     arrayStride: FALLBACK_VERTEX_LAYOUT_24B.arrayStride,
                     stepMode: FALLBACK_VERTEX_LAYOUT_24B.stepMode,
-                    attributes: FALLBACK_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
+                    attributes: [
+                      { shaderLocation: 0, offset: 0, format: 'float32x4' },
+                      { shaderLocation: 1, offset: 16, format: 'float32x2' },
+                    ],
                   },
                 ]
               : [];
@@ -5191,16 +5692,27 @@
     }
 
     _findBoundCbvCandidate(drawState) {
+      const out = this._scratchCbvCandidate;
       if (drawState.cbvBuffer) {
-        return { buffer: drawState.cbvBuffer, offset: 0, size: null };
+        out.buffer = drawState.cbvBuffer;
+        out.offset = 0;
+        out.size = null;
+        return out;
       }
       if (drawState.uniformBuffer) {
-        return { buffer: drawState.uniformBuffer, offset: 0, size: null };
+        out.buffer = drawState.uniformBuffer;
+        out.offset = 0;
+        out.size = null;
+        return out;
       }
       if (drawState.cbv && typeof drawState.cbv === 'object') {
-        return drawState.cbv.buffer !== undefined
-          ? drawState.cbv
-          : { buffer: drawState.cbv, offset: 0, size: null };
+        if (drawState.cbv.buffer !== undefined) {
+          return drawState.cbv;
+        }
+        out.buffer = drawState.cbv;
+        out.offset = 0;
+        out.size = null;
+        return out;
       }
       if (this._cbvs.has(0)) {
         return this._cbvs.get(0);
@@ -5213,18 +5725,20 @@
         const raw = this._stagedBgRaw[0];
         const cbvBuffer = (meta && meta.cbvBuffer) || (raw && raw.cbvBuffer) || null;
         if (cbvBuffer) {
-          return { buffer: cbvBuffer, offset: 0, size: null };
+          out.buffer = cbvBuffer;
+          out.offset = 0;
+          out.size = null;
+          return out;
         }
         const entries = this._getStagedBg0Entries();
         if (entries) {
           for (let i = 0; i < entries.length; i += 1) {
             const e = entries[i];
             if (e && e.resource && typeof e.resource === 'object' && e.resource.buffer) {
-              return {
-                buffer: e.resource.buffer,
-                offset: e.resource.offset || 0,
-                size: e.resource.size !== undefined ? e.resource.size : null,
-              };
+              out.buffer = e.resource.buffer;
+              out.offset = e.resource.offset || 0;
+              out.size = e.resource.size !== undefined ? e.resource.size : null;
+              return out;
             }
           }
         }
@@ -6031,6 +6545,11 @@
               vertexBuffersElided += 1;
             }
           } catch (err) {
+            this._boundVbMask &= ~bit;
+            this._boundVbBuffers[slot] = null;
+            this._boundVbOffsets[slot] = 0;
+            this._boundVbSizes[slot] = null;
+            this._dirtyVbMask |= bit;
             this._stats.passErrors += 1;
             this._stats.invalidVertexBufferGuards += 1;
             this._stats.skippedVertexBufferBindings += 1;
@@ -6071,6 +6590,9 @@
               vertexBuffersElided += 1;
             }
           } catch (err) {
+            if (this._boundVbOverflow !== null) {
+              this._boundVbOverflow.delete(slot);
+            }
             this._stats.passErrors += 1;
             this._stats.invalidVertexBufferGuards += 1;
             this._stats.skippedVertexBufferBindings += 1;
@@ -6143,6 +6665,11 @@
               bindGroupsElided += 1;
             }
           } catch (err) {
+            this._boundBgMask &= ~bit;
+            this._boundBgGroups[slot] = null;
+            this._boundBgHasDyn[slot] = 0;
+            this._boundBgDynLen[slot] = 0;
+            this._dirtyBgMask |= bit;
             this._stats.passErrors += 1;
             this._stats.bindGroupGuards += 1;
             this._stats.skippedBindGroupBindings += 1;
@@ -6176,12 +6703,17 @@
               pass,
               groupIndex,
               entry.bindGroup,
-              entry.dynamicOffsets || null
+              entry.dynamicOffsets || null,
+              entry.dynStart || 0,
+              entry.dynLen !== undefined ? entry.dynLen : -1
             );
             if (!bound) {
               bindGroupsElided += 1;
             }
           } catch (err) {
+            if (this._boundBgOverflow !== null) {
+              this._boundBgOverflow.delete(groupIndex);
+            }
             this._stats.passErrors += 1;
             this._stats.bindGroupGuards += 1;
             this._stats.skippedBindGroupBindings += 1;
@@ -6198,6 +6730,7 @@
     }
 
     _validateAndBindIndexBuffer(pass, indexCount, firstIndex) {
+      this._syncPassTracking(pass);
       if (!this._hasStagedIb) {
         this._hasBoundIb = false;
         this._boundIbBuffer = null;
@@ -6232,7 +6765,13 @@
           return IB_STATUS_INVALID_RANGE;
         }
       }
-      if (this._elideRedundantIndexBuffers && !this._dirtyIb && this._hasBoundIb) {
+      if (
+        this._elideRedundantIndexBuffers &&
+        !this._dirtyIb &&
+        this._hasBoundIb &&
+        this._boundIbBuffer === buf &&
+        this._boundIbBuffer.destroyed !== true
+      ) {
         this._stats.redundantIndexBufferSkips += 1;
         this._stats.elidedIndexBufferSets += 1;
         this._stats.totalElidedStateCalls += 1;
@@ -6243,6 +6782,7 @@
         const bound = this._bindIndexBufferOnPass(pass, buf, format, offset, this._stagedIbSize);
         return bound ? IB_STATUS_EMITTED : IB_STATUS_ELIDED;
       } catch (err) {
+        this._clearBoundPassState();
         this._stats.passErrors += 1;
         this._warn('setIndexBuffer failed', {
           error: String(err && err.message ? err.message : err),
@@ -6514,7 +7054,9 @@
                 pass,
                 groupIndex,
                 entry.bindGroup,
-                entry.dynamicOffsets || null
+                entry.dynamicOffsets || null,
+                entry.dynStart || 0,
+                entry.dynLen !== undefined ? entry.dynLen : -1
               );
               if (!bound) {
                 bindGroupsElided += 1;
@@ -6533,6 +7075,7 @@
         result.executed = true;
         return result;
       } catch (err) {
+        this._clearBoundPassState();
         this._stats.passErrors += 1;
         this._stats.skippedComputeDispatches += 1;
         this._warn('Compute dispatch execution failed', {
@@ -7156,6 +7699,7 @@
       const compRes = this.executeCompute(computePass, cArgs);
       if (ownedComputePass && typeof computePass.end === 'function') {
         computePass.end();
+        this._clearBoundPassState();
       }
       if (!compRes.executed) {
         this._recordSkip(compRes.reason || 'mesh-compute-failed', false);
@@ -7290,6 +7834,7 @@
 
       if (ownedRenderPass && typeof renderPass.end === 'function') {
         renderPass.end();
+        this._clearBoundPassState();
       }
 
       if (drawsIssued > 0) {
@@ -7783,6 +8328,7 @@
           result.executed = true;
           return result;
         } catch (err) {
+          this._clearBoundPassState();
           this._stats.passErrors += 1;
           this._recordSkip('pass-error', false);
           this._warn('Normal indirect draw execution failed', {
@@ -7801,16 +8347,20 @@
         return result;
       }
 
-      const drawState = this.getDrawState({
-        ...(args !== null ? args : {}),
+      const drawState = this._populateScratchDrawState(
+        args,
         indexed,
-        indirect: true,
-        vertexCount: args !== null && args.vertexCount !== undefined ? args.vertexCount : 0,
-        indexCount: 0,
-        instanceCount: 1,
-      });
+        true,
+        args !== null && args.vertexCount !== undefined ? args.vertexCount : 0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0
+      );
 
-      const resolved = this.resolveFallbackShaders(drawState);
+      const resolved = this._resolveFallbackShadersInto(this._scratchResolvedFallback, drawState);
       if (!resolved) {
         this._recordSkip('shader-resolve-failed', false);
         result.skipped = true;
@@ -7833,6 +8383,7 @@
         const bound = this._bindPipelineOnPass(pass, fallbackPipeline);
         result.pipelineElided = !bound;
       } catch (err) {
+        this._clearBoundPassState();
         this._stats.passErrors += 1;
         this._recordSkip('pass-error', false);
         this._warn('pass.setPipeline failed on fallback indirect draw', {
@@ -7918,6 +8469,7 @@
           pass.drawIndirect(indirectBuffer, indirectOffset);
         }
       } catch (err) {
+        this._clearBoundPassState();
         this._stats.passErrors += 1;
         this._recordSkip('pass-error', false);
         this._warn('Fallback indirect draw submission failed', {
@@ -8061,6 +8613,7 @@
           result.executed = true;
           return result;
         } catch (err) {
+          this._clearBoundPassState();
           this._stats.passErrors += 1;
           this._recordSkip('pass-error', false);
           this._warn('Normal draw execution failed', {
@@ -8079,21 +8632,22 @@
         return result;
       }
 
-      const drawState = this.getDrawState({
-        ...(args !== null ? args : {}),
+      const drawState = this._populateScratchDrawState(
+        args,
         indexed,
-        vertexCount: indexed ? (args !== null && args.vertexCount ? args.vertexCount : 0) : count,
-        indexCount: indexed ? count : 0,
+        false,
+        indexed ? (args !== null && args.vertexCount ? args.vertexCount : 0) : count,
+        indexed ? count : 0,
         instanceCount,
         firstVertex,
         firstIndex,
         baseVertex,
-        firstInstance,
-      });
+        firstInstance
+      );
 
       // Fallback draw path: select G34 profile, resolve shaders, create/cache pipeline,
       // and harden bind-group & vertex-buffer bindings.
-      const resolved = this.resolveFallbackShaders(drawState);
+      const resolved = this._resolveFallbackShadersInto(this._scratchResolvedFallback, drawState);
       if (!resolved) {
         this._recordSkip('shader-resolve-failed', false);
         result.skipped = true;
@@ -8116,6 +8670,7 @@
         const bound = this._bindPipelineOnPass(pass, fallbackPipeline);
         result.pipelineElided = !bound;
       } catch (err) {
+        this._clearBoundPassState();
         this._stats.passErrors += 1;
         this._recordSkip('pass-error', false);
         this._warn('pass.setPipeline failed on fallback draw', {
@@ -8215,6 +8770,7 @@
           this._stats.nonIndexedDraws += 1;
         }
       } catch (err) {
+        this._clearBoundPassState();
         this._stats.passErrors += 1;
         this._recordSkip('pass-error', false);
         this._warn('Fallback draw submission failed', {
@@ -8291,6 +8847,7 @@
         elidedBlendConstantSets: this._stats.elidedBlendConstantSets,
         elidedStencilReferenceSets: this._stats.elidedStencilReferenceSets,
         totalElidedStateCalls: this._stats.totalElidedStateCalls,
+        redundantStateCallsSkipped: this._stats.totalElidedStateCalls,
         stateElisionHitRate: this._computeStateElisionHitRate(),
         bindGroupCacheHits: this._stats.bindGroupCacheHits,
         bindGroupCacheMisses: this._stats.bindGroupCacheMisses,
