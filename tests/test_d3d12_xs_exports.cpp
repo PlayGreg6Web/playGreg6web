@@ -10229,8 +10229,10 @@ void test_flush_shadow_dirty_indices_and_ia_index() {
         const uint32_t id_large = r_large->id();
         const uint32_t id_tail = r_tail->id();
 
-        // Initial flush primes write_tracked_ on platforms with OS write tracking.
-        {
+        // Initial flushes prime write_tracked_ on platforms with OS write tracking. Two of them: the first read
+        // of a lazily committed range commits it after that flush's take, so the next flush still reports
+        // every page as written (conservative, harmless); only the one after sees a quiet buffer.
+        for (int prime = 0; prime < 2; ++prime) {
             gpu::CommandEncoder enc;
             CHECK(r_large->flush_shadow(enc) == 0);
             CHECK(r_tail->flush_shadow(enc) == 0);
