@@ -721,11 +721,16 @@ struct NativeExecutor::Impl {
     std::atomic<bool> lost{false};  // set by Dawn's device-lost callback (any thread)
     bool blob_cache_opened = false;
 
-    // ---- GPU stall breaker (gpu_stall_model.h) ----
+    // ---- GPU stall watch (gpu_stall_model.h) ----
     // A fence of our own is signaled on Dawn's D3D12 queue after every tracked submit; a watcher thread
-    // removes the device once the GPU has completed nothing for the threshold, so Dawn's Submit stops
-    // waiting for a command allocator and the device-loss recovery runs instead of the title's watchdog.
+    // reports a stall once the GPU has completed nothing for the threshold and, with PG6_GPU_STALL_REMOVE=1,
+    // removes the device so Dawn's Submit stops waiting for a command allocator.
+    std::atomic<uint64_t> gpu_stall_events{0};
     std::atomic<uint64_t> gpu_stall_removals{0};
+    const bool gpu_stall_remove = [] {
+        const char* v = std::getenv("PG6_GPU_STALL_REMOVE");
+        return v && v[0] == '1';
+    }();
     std::atomic<uint64_t> gpu_stall_max_ns{0};
     uint64_t gpu_stall_threshold = gpu_stall_threshold_ns(std::getenv("PG6_GPU_STALL_MS"));
 #ifdef _WIN32
@@ -801,13 +806,14 @@ struct NativeExecutor::Impl {
             const uint64_t stalled = stall_watch.stalled_ns(t);
             if (stalled > gpu_stall_max_ns.load()) gpu_stall_max_ns.store(stalled);
             if (!fire) continue;
+            ++gpu_stall_events;
+            std::fprintf(stderr, "[native_exec] GPU stall: nothing completed for %llu ms (fence %llu of %llu)%s\n",
+                         static_cast<unsigned long long>(stalled / 1000000ull),
+                         static_cast<unsigned long long>(completed), static_cast<unsigned long long>(stall_signaled),
+                         gpu_stall_remove ? ": removing the device so the recovery runs" : "");
+            if (!gpu_stall_remove) continue;
             Microsoft::WRL::ComPtr<ID3D12Device5> d5;
             if (FAILED(stall_device.As(&d5))) continue;
-            std::fprintf(stderr,
-                         "[native_exec] GPU stall: nothing completed for %llu ms (fence %llu of %llu): removing the "
-                         "device so the recovery runs\n",
-                         static_cast<unsigned long long>(stalled / 1000000ull),
-                         static_cast<unsigned long long>(completed), static_cast<unsigned long long>(stall_signaled));
             ++gpu_stall_removals;
             d5->RemoveDevice();
         }
@@ -11262,6 +11268,7 @@ std::string NativeExecutor::stats_json() const {
     num("recovery_instance_resets", st.recovery_instance_resets);
     num("recovery_bind_groups_deferred", st.recovery_bind_groups_deferred);
     num("debug_gpu_hangs", st.debug_gpu_hangs);
+    num("gpu_stall_events", impl_->gpu_stall_events.load());
     num("gpu_stall_removals", impl_->gpu_stall_removals.load());
     num("gpu_stall_max_ms", impl_->gpu_stall_max_ns.load() / 1000000ull);
     num("gpu_stall_threshold_ms", impl_->gpu_stall_threshold / 1000000ull);
