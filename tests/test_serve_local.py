@@ -1900,6 +1900,205 @@ class TestServeLocalRangeFastpath(unittest.TestCase):
             serve_local._is_client_disconnect_error(OSError(errno.EACCES, "permission denied"))
         )
 
+    def test_shaders_interstage_static_and_dynamic_fallback_with_cache(self) -> None:
+        shaders_dir = self.data_root / "shaders"
+        shaders_dir.mkdir(exist_ok=True)
+        outside_reflect = Path(self.tmp.name) / "escape.wgsl.pack.reflect.json"
+        outside_reflect.write_text(
+            json.dumps({
+                "schema": "playgta6-stage-reflection",
+                "version": 1,
+                "stages": {
+                    "0x0000000000000001": {
+                        "stage": "vertex",
+                        "bindings": [],
+                        "vs_outputs": [{"semantic_reg": 1, "location": 0}],
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        # 1. Missing both .interstage.json and .reflect.json -> 404 + COOP/COEP
+        st_miss, hdr_miss, body_miss = self._request(
+            "GET", "/shaders/splash.wgsl.pack.interstage.json"
+        )
+        self.assertEqual(st_miss, 404)
+        self._assert_coop_coep(hdr_miss)
+        self.assertEqual(body_miss, b"")
+
+        # Traversal must never resolve outside shaders_root
+        st_esc, hdr_esc, _ = self._request(
+            "GET", "/shaders/../escape.wgsl.pack.interstage.json"
+        )
+        self.assertEqual(st_esc, 404)
+        self._assert_coop_coep(hdr_esc)
+
+        # 2. Only splash.wgsl.pack.reflect.json exists -> dynamically extract compact v3 JSON & cache
+        reflect_path = shaders_dir / "splash.wgsl.pack.reflect.json"
+        reflect_doc = {
+            "schema": "playgta6-stage-reflection",
+            "version": 3,
+            "stages": {
+                "0x5fe7a88d9cb680b3": {
+                    "stage": "vertex",
+                    "bindings": [
+                        {"group": 0, "binding": 0, "kind": "uniform",
+                         "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+                    ],
+                    "vertex_inputs": [
+                        {"location": 0, "vb_slot": 0, "byte_offset": 0, "components": 3, "component_type": "f32"},
+                    ],
+                    "vs_outputs": [
+                        {"semantic_reg": 1, "location": 0},
+                        {"semantic_reg": 2, "location": 1},
+                    ],
+                },
+                "0x56214b8d3b10a108": {
+                    "stage": "fragment",
+                    "bindings": [
+                        {"group": 0, "binding": 0, "kind": "texture",
+                         "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+                    ],
+                    "ps_inputs": [
+                        {"semantic_reg": 1, "location": 0, "mask": 0},
+                        {"semantic_reg": 2, "location": 0, "mask": 3},
+                    ],
+                },
+                "0x0000000000009999": {
+                    "stage": "compute",
+                    "bindings": [
+                        {"group": 0, "binding": 0, "kind": "storage",
+                         "source": {"user_sgpr": 4, "table_byte_offset": 0}},
+                    ],
+                },
+                "0x0000000000008888": {
+                    "stage": "vertex",
+                    "bindings": [
+                        {"group": 0, "binding": 0, "kind": "uniform",
+                         "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+                    ],
+                },
+            },
+        }
+        reflect_raw = json.dumps(reflect_doc, indent=2)
+        reflect_path.write_text(reflect_raw, encoding="utf-8")
+
+        st1, hdr1, body1 = self._request("GET", "/shaders/splash.wgsl.pack.interstage.json")
+        self.assertEqual(st1, 200)
+        self._assert_coop_coep(hdr1)
+        self.assertEqual(hdr1.get("Content-Type"), "application/json")
+        self.assertEqual(hdr1.get("Content-Length"), str(len(body1)))
+        self.assertLess(len(body1), len(reflect_raw.encode("utf-8")))
+        parsed1 = json.loads(body1.decode("utf-8"))
+        self.assertEqual(
+            parsed1,
+            {
+                "schema": "playgta6-stage-reflection",
+                "version": 3,
+                "stages": {
+                    "0x5fe7a88d9cb680b3": {
+                        "stage": "vertex",
+                        "bindings": [],
+                        "vs_outputs": [
+                            {"semantic_reg": 1, "location": 0},
+                            {"semantic_reg": 2, "location": 1},
+                        ],
+                    },
+                    "0x56214b8d3b10a108": {
+                        "stage": "fragment",
+                        "bindings": [],
+                        "ps_inputs": [
+                            {"semantic_reg": 1, "location": 0, "mask": 0},
+                            {"semantic_reg": 2, "location": 0, "mask": 3},
+                        ],
+                    },
+                },
+            },
+        )
+        etag1 = hdr1.get("ETag")
+        self.assertTrue(etag1)
+        self.assertEqual(self.httpd.interstage_sidecar_cache.stats()["misses"], 1)
+        self.assertEqual(self.httpd.interstage_sidecar_cache.stats()["hits"], 0)
+
+        # Second GET hits in-memory cache without re-parsing .reflect.json; HEAD and If-None-Match 304 work
+        with mock.patch.object(
+            serve_local,
+            "extract_interstage_sidecar_bytes",
+            side_effect=AssertionError("expected interstage cache hit"),
+        ):
+            st2, hdr2, body2 = self._request("GET", "/shaders/splash.wgsl.pack.interstage.json")
+            self.assertEqual(st2, 200)
+            self.assertEqual(body2, body1)
+            self.assertEqual(hdr2.get("ETag"), etag1)
+
+            st_head, hdr_head, body_head = self._request(
+                "HEAD", "/shaders/splash.wgsl.pack.interstage.json"
+            )
+            self.assertEqual(st_head, 200)
+            self._assert_coop_coep(hdr_head)
+            self.assertEqual(hdr_head.get("Content-Length"), str(len(body1)))
+            self.assertEqual(body_head, b"")
+
+            st_304, hdr_304, body_304 = self._request(
+                "GET",
+                "/shaders/splash.wgsl.pack.interstage.json",
+                {"If-None-Match": etag1},
+            )
+            self.assertEqual(st_304, 304)
+            self._assert_coop_coep(hdr_304)
+            self.assertEqual(body_304, b"")
+        self.assertGreaterEqual(self.httpd.interstage_sidecar_cache.stats()["hits"], 3)
+
+        # Mutating .reflect.json (size/mtime_ns) invalidates cache and recomputes
+        prev_st = reflect_path.stat()
+        reflect_doc["stages"]["0x000000000000aaaa"] = {
+            "stage": "fragment",
+            "bindings": [],
+            "ps_inputs": [{"semantic_reg": 4, "location": 0, "mask": 15}],
+        }
+        reflect_path.write_text(json.dumps(reflect_doc), encoding="utf-8")
+        os.utime(reflect_path, ns=(prev_st.st_atime_ns, prev_st.st_mtime_ns + 2_000_000_000))
+        st_upd, hdr_upd, body_upd = self._request(
+            "GET", "/shaders/splash.wgsl.pack.interstage.json"
+        )
+        self.assertEqual(st_upd, 200)
+        self.assertNotEqual(hdr_upd.get("ETag"), etag1)
+        parsed_upd = json.loads(body_upd.decode("utf-8"))
+        self.assertIn("0x000000000000aaaa", parsed_upd["stages"])
+        self.assertEqual(self.httpd.interstage_sidecar_cache.stats()["misses"], 2)
+
+        # 3. Malformed .reflect.json degrades cleanly to 404
+        bad_reflect = shaders_dir / "broken.wgsl.pack.reflect.json"
+        bad_reflect.write_text("{not valid json", encoding="utf-8")
+        st_bad, hdr_bad, _ = self._request("GET", "/shaders/broken.wgsl.pack.interstage.json")
+        self.assertEqual(st_bad, 404)
+        self._assert_coop_coep(hdr_bad)
+
+        # 4. Static .interstage.json on disk takes precedence over dynamic .reflect.json fallback
+        static_path = shaders_dir / "splash.wgsl.pack.interstage.json"
+        static_doc = {
+            "schema": "playgta6-stage-reflection",
+            "version": 3,
+            "stages": {
+                "0x000000000000feed": {
+                    "stage": "vertex",
+                    "bindings": [],
+                    "vs_outputs": [{"semantic_reg": 7, "location": 2}],
+                }
+            },
+        }
+        static_bytes = json.dumps(static_doc, separators=(",", ":")).encode("utf-8")
+        static_path.write_bytes(static_bytes)
+
+        st_static, hdr_static, body_static = self._request(
+            "GET", "/shaders/splash.wgsl.pack.interstage.json"
+        )
+        self.assertEqual(st_static, 200)
+        self._assert_coop_coep(hdr_static)
+        self.assertEqual(hdr_static.get("Content-Type"), "application/json")
+        self.assertEqual(body_static, static_bytes)
+
 
 if __name__ == "__main__":
     unittest.main()

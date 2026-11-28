@@ -10487,16 +10487,11 @@ class WgpuCommandProcessor {
   }
 
   /**
-   * Load and index an S6 shader reflection manifest (JSON string or parsed object).
-   * Lazily initializes ReflectionRegistry if one was not injected in the constructor.
+   * Ensure `this.reflectionRegistry` is initialized (lazy construction when not injected).
    *
-   * @param {string | object} jsonOrObj
-   * @returns {object} Parsed reflection manifest
+   * @returns {object}
    */
-  loadReflectionManifest(jsonOrObj) {
-    if (this._destroyed) {
-      throw new Error('WgpuCommandProcessor has been destroyed');
-    }
+  _ensureReflectionRegistry() {
     if (!this.reflectionRegistry) {
       const ReflectionCtor = resolveSubsystemCtor(
         this._ReflectionRegistryCtor,
@@ -10512,7 +10507,49 @@ class WgpuCommandProcessor {
       this.reflectionRegistry = new ReflectionCtor(this._reflectionRegistryOptions || {});
       this._ownsReflectionRegistry = true;
     }
-    const parsed = this.reflectionRegistry.loadManifest(jsonOrObj);
+    return this.reflectionRegistry;
+  }
+
+  /**
+   * Load and index an S6 shader reflection manifest (JSON string or parsed object).
+   * Lazily initializes ReflectionRegistry if one was not injected in the constructor.
+   * Multiple manifests/sidecars merge cleanly into the same registry without clearing prior entries.
+   *
+   * @param {string | object} jsonOrObj
+   * @returns {object} Parsed reflection manifest
+   */
+  loadReflectionManifest(jsonOrObj) {
+    if (this._destroyed) {
+      throw new Error('WgpuCommandProcessor has been destroyed');
+    }
+    const registry = this._ensureReflectionRegistry();
+    const parsed = registry.loadManifest(jsonOrObj);
+    this._syncPipelineCacheReflectionRegistry();
+    for (const [shaderId, entry] of this.shaderModules.entries()) {
+      if (entry && entry.module) {
+        this._registerShaderModuleWithPipelineCache(shaderId, entry, null);
+      }
+    }
+    return parsed;
+  }
+
+  /**
+   * Load and merge a `playgta6-stage-reflection` v1/v2/v3 sidecar (including compact
+   * `<pack>.interstage.json` FSSM `vs_outputs`/`ps_inputs` sidecars, #2085) into the
+   * active ReflectionRegistry without clobbering existing manifest entries.
+   *
+   * @param {string | object} jsonOrObj
+   * @returns {object} Parsed stage reflection sidecar
+   */
+  loadStageReflection(jsonOrObj) {
+    if (this._destroyed) {
+      throw new Error('WgpuCommandProcessor has been destroyed');
+    }
+    const registry = this._ensureReflectionRegistry();
+    const parsed =
+      typeof registry.loadStageReflection === 'function'
+        ? registry.loadStageReflection(jsonOrObj)
+        : registry.loadManifest(jsonOrObj);
     this._syncPipelineCacheReflectionRegistry();
     for (const [shaderId, entry] of this.shaderModules.entries()) {
       if (entry && entry.module) {
@@ -20807,12 +20844,37 @@ function createWgpuWorkerHandler(options = {}) {
     return false;
   }
 
+  function deriveInterstageReflectionUrl(packUrl) {
+    if (typeof packUrl !== 'string') {
+      return null;
+    }
+    const trimmed = packUrl.trim();
+    if (trimmed.length === 0) {
+      return null;
+    }
+    const hashIdx = trimmed.indexOf('#');
+    const beforeHash = hashIdx >= 0 ? trimmed.slice(0, hashIdx) : trimmed;
+    const hashSuffix = hashIdx >= 0 ? trimmed.slice(hashIdx) : '';
+    const queryIdx = beforeHash.indexOf('?');
+    const basePath = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
+    const querySuffix = queryIdx >= 0 ? beforeHash.slice(queryIdx) : '';
+    if (basePath.length === 0) {
+      return null;
+    }
+    if (basePath.toLowerCase().endsWith('.interstage.json')) {
+      return `${basePath}${querySuffix}${hashSuffix}`;
+    }
+    return `${basePath}.interstage.json${querySuffix}${hashSuffix}`;
+  }
+
   async function preloadBootShaderAssets(targetProcessor, initPayload = {}) {
     const summary = {
       shaderPackLoaded: false,
       shaderPackShaders: 0,
       reflectionLoaded: false,
       reflectionShaders: 0,
+      interstageReflectionLoaded: false,
+      interstageReflectionStages: 0,
     };
     if (!targetProcessor || !initPayload || typeof initPayload !== 'object') {
       return summary;
@@ -20879,6 +20941,19 @@ function createWgpuWorkerHandler(options = {}) {
       initPayload.reflectionManifestUrl.trim().length > 0
         ? initPayload.reflectionManifestUrl.trim()
         : null;
+    const explicitInterstageUrl =
+      typeof initPayload.interstageReflectionUrl === 'string' &&
+      initPayload.interstageReflectionUrl.trim().length > 0
+        ? initPayload.interstageReflectionUrl.trim()
+        : typeof options.interstageReflectionUrl === 'string' &&
+            options.interstageReflectionUrl.trim().length > 0
+          ? options.interstageReflectionUrl.trim()
+          : null;
+    const interstageReflectionUrl =
+      initPayload.interstageReflectionUrl === false
+        ? null
+        : explicitInterstageUrl ||
+          (effectivePackUrl ? deriveInterstageReflectionUrl(effectivePackUrl) : null);
 
     const tasks = [];
 
@@ -21021,6 +21096,63 @@ function createWgpuWorkerHandler(options = {}) {
             }
           } catch (_) {
             // Non-fatal: worker init must never abort if reflection manifest fetch/parse fails.
+          }
+        })()
+      );
+    }
+
+    if (
+      interstageReflectionUrl &&
+      interstageReflectionUrl !== reflectionManifestUrl &&
+      activeFetch
+    ) {
+      tasks.push(
+        (async () => {
+          try {
+            const resp =
+              fetchInit !== undefined
+                ? await activeFetch(interstageReflectionUrl, fetchInit)
+                : await activeFetch(interstageReflectionUrl);
+            if (!resp || !resp.ok) {
+              return;
+            }
+            const sidecarData =
+              typeof resp.text === 'function'
+                ? await resp.text()
+                : typeof resp.json === 'function'
+                  ? await resp.json()
+                  : null;
+            if (sidecarData === null) {
+              return;
+            }
+            let parsedSidecar = null;
+            if (typeof targetProcessor.loadStageReflection === 'function') {
+              parsedSidecar = targetProcessor.loadStageReflection(sidecarData);
+            } else if (typeof targetProcessor.loadReflectionManifest === 'function') {
+              parsedSidecar = targetProcessor.loadReflectionManifest(sidecarData);
+            } else if (
+              targetProcessor.reflectionRegistry &&
+              typeof targetProcessor.reflectionRegistry.loadStageReflection === 'function'
+            ) {
+              parsedSidecar = targetProcessor.reflectionRegistry.loadStageReflection(sidecarData);
+              if (typeof targetProcessor._syncPipelineCacheReflectionRegistry === 'function') {
+                targetProcessor._syncPipelineCacheReflectionRegistry();
+              }
+            }
+            if (parsedSidecar !== null) {
+              summary.interstageReflectionLoaded = true;
+              summary.reflectionLoaded = true;
+              summary.interstageReflectionStages =
+                parsedSidecar && parsedSidecar.stages instanceof Map
+                  ? parsedSidecar.stages.size
+                  : 0;
+              if (typeof targetProcessor.getStats === 'function') {
+                const pStats = targetProcessor.getStats();
+                summary.reflectionShaders = pStats ? pStats.reflectionShaderCount || 0 : 0;
+              }
+            }
+          } catch (_) {
+            // Non-fatal: interstage sidecar is best-effort (404 / network / parse errors never abort init).
           }
         })()
       );

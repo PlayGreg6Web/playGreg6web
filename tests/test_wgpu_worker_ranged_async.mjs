@@ -601,8 +601,14 @@ test('W159 auto-enables HTTP 206 Range streaming by default for >128 MiB packs o
     initialRangeBytes: dataStart,
   });
 
-  assert.equal(netWorker.requests.filter((r) => r.method === 'GET' && r.rangeHeader === null).length, 0);
-  assert.ok(netWorker.requests.some((r) => r.rangeHeader !== null));
+  const packWorkerRequests = netWorker.requests.filter(
+    (r) => r.url === '/shaders/full-18504.wgsl.pack'
+  );
+  assert.equal(
+    packWorkerRequests.filter((r) => r.method === 'GET' && r.rangeHeader === null).length,
+    0
+  );
+  assert.ok(packWorkerRequests.some((r) => r.rangeHeader !== null));
   assert.equal(procWorker.rangedPackActive, true);
 
   await handler.handleMessage({ id: 'stats-1', type: 'request-gpu-stats' });
@@ -673,9 +679,12 @@ test('W159 explicit streamThresholdBytes: 0 and streamShaders: false disable aut
     shaderPackUrl: '/shaders/full-optout-false.wgsl.pack',
   });
 
-  assert.equal(netFalse.requests.length, 1);
-  assert.equal(netFalse.requests[0].method, 'GET');
-  assert.equal(netFalse.requests[0].rangeHeader, null);
+  const packFalseRequests = netFalse.requests.filter(
+    (r) => r.url === '/shaders/full-optout-false.wgsl.pack'
+  );
+  assert.equal(packFalseRequests.length, 1);
+  assert.equal(packFalseRequests[0].method, 'GET');
+  assert.equal(packFalseRequests[0].rangeHeader, null);
   assert.equal(procFalse.rangedPackActive, false);
   assert.equal(procFalse.rangedPackThresholdBytes, 0);
   assert.equal(procFalse.wgslPackCache.getStats().mode, 'buffer');
