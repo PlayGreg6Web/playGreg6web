@@ -1363,15 +1363,28 @@ private:
     // G66 (#691): uniform / storage relocation homes handed to another range (BridgeOptions::relocation_epoch).
     std::atomic<uint64_t> relocation_evictions_{0};
     struct RelocatedIa {
+        uint64_t va = 0;
+        uint64_t size = 0;
         uint64_t buffer_bytes = 0;   // WebGPU buffer size (guest size rounded up to 4)
         uint32_t buffer_id = 0;
         uint64_t last_hash = 0;
         uint64_t last_used_seq = 0;
         os::WriteCursor write_cursor;  // as RelocatedStorage
         bool write_primed = false;
+        // Page index (ia_page_index_, as RelocatedStorage): compared after a successful flush take
+        // covering its host range, so an indexed flush only looks at it again when a take reports it written.
+        bool index_primed = false;
+        uint64_t visit_seq = 0;
     };
     mutable std::mutex ia_relocation_mutex_;
     std::map<std::pair<uint64_t, uint64_t>, RelocatedIa> ia_relocations_;  // (base GPU VA, size)
+    // Host pages -> relocated IA ranges (under ia_relocation_mutex_), for indexed native flushes;
+    // and the skipped entries that uploaded anyway under --flush-crosscheck.
+    HostPageIndex ia_page_index_;
+    std::unordered_set<const void*> crosscheck_ia_;
+    // The ia_relocations_ entries with index_primed == false: with the ones a take reported, the
+    // only IA ranges an indexed flush visits (as uniform_unprimed_ / storage_unprimed_).
+    std::unordered_set<RelocatedIa*> ia_unprimed_;
     uint64_t ia_relocation_bytes_ = 0;
     uint64_t ia_relocation_seq_ = 0;
     mutable std::mutex pack_mutex_;
@@ -1400,6 +1413,9 @@ private:
     HostPageIndex uniform_page_index_;
     // --flush-crosscheck: skipped entries that uploaded anyway (each must be reported at the next flush).
     std::unordered_set<const void*> crosscheck_buffers_;   // under tracked_mutex_
+    // The tracked_ entries with flush_primed == false (under tracked_mutex_): with the ones a take
+    // reported, the only buffers an indexed flush visits (as uniform_unprimed_ / storage_unprimed_).
+    std::unordered_set<Resource*> tracked_unprimed_;
     std::unordered_set<const void*> crosscheck_uniforms_;  // under relocation_mutex_
     // The relocations_ entries with primed == false (under relocation_mutex_): with the ones a take
     // reported, the only uniform ranges an indexed flush visits.
@@ -1412,6 +1428,23 @@ private:
     // tracked buffers and the relocated ranges (under flush_mutex_).
     std::mutex flush_mutex_;
     os::guest_window::MarkPass mark_pass_;
+    // Reusable scratch buffers for flush_cpu_buffers (under flush_mutex_) to avoid per-submission
+    // heap allocations in steady state.
+    std::vector<uint64_t> flush_marked_;
+    std::vector<uint64_t> flush_native_written_;
+    std::vector<uint64_t> flush_dirty_slots_;
+    std::vector<HostPageIndex::Range> flush_take_ranges_;
+    std::vector<HostPageIndex::Range> flush_taken_ok_;
+    std::vector<HostPageIndex::Range> flush_taken_failed_;
+    std::vector<uintptr_t> flush_dirty_pages_;
+    std::vector<std::pair<uintptr_t, uintptr_t>> flush_host_ranges_;
+    std::vector<uint8_t> flush_take_ok_flags_;
+    std::vector<const void*> flush_visit_keys_;
+    std::vector<Resource*> flush_buffer_candidates_;
+    std::vector<RelocatedUniform*> flush_uniform_candidates_;
+    std::vector<RelocatedStorage*> flush_storage_candidates_;
+    std::vector<RelocatedIa*> flush_ia_candidates_;
+    std::vector<uint8_t> flush_bytes_scratch_;
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
     os::guest_window::SlotIndex texture_slot_index_;    // G68: window slot -> resource_id (under tracked_textures_mutex_)
@@ -1906,6 +1939,8 @@ enum class Work : size_t {
     FlushUniformsSkipped,
     FlushStorageCompared,  // relocated storage ranges looked at / skipped by an indexed flush
     FlushStorageSkipped,
+    FlushIaCompared,       // relocated IA (vertex / index) ranges looked at / skipped by an indexed flush
+    FlushIaSkipped,
     FlushCrosscheckLate,
     FlushCrosscheckMisses,
     // Indexed flushes that were not cross-checked: calls and wall time (ns) in flush_cpu_buffers.

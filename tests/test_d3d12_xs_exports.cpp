@@ -9718,6 +9718,8 @@ void test_native_flush_page_index() {
         CHECK(dev->relocate_uniform(uni3, 64, 64, &id_u3, &off_u3));
         uint32_t id_s = 0;  // a relocated storage range, added further down
         uint64_t off_s = 0;
+        uint32_t id_ia = 0;  // a relocated IA range, added further down
+        uint64_t off_ia = 0;
         struct Write {
             uint32_t id;
             uint32_t offset;
@@ -9738,7 +9740,7 @@ void test_native_flush_page_index() {
                     GpuWriteBufferPayload w{};
                     std::memcpy(&w, enc.data() + off, sizeof(w));
                     if (w.id == id_a || w.id == id_b || w.id == id_u || w.id == id_u2 || w.id == id_u3 ||
-                        (id_s != 0 && w.id == id_s)) {
+                        (id_s != 0 && w.id == id_s) || (id_ia != 0 && w.id == id_ia)) {
                         out.push_back({w.id, w.dst_offset, h.payload_bytes - static_cast<uint32_t>(sizeof(w))});
                     }
                 }
@@ -9855,6 +9857,39 @@ void test_native_flush_page_index() {
             host_s[200] = 0x77;  // a host write straight into the memory
             CHECK(only(flush(), id_s, static_cast<uint32_t>(off_s)));
         }
+        CHECK(flush().empty());
+        // A relocated IA (vertex / index) range outside every buffer: page-indexed like uniform
+        // and storage ranges (compared while unprimed, then skipped until a take reports a page).
+        const uint64_t ia = mem + 3 * k64K + 3 * kPage + 0x100;
+        CHECK(dev->relocate_ia_buffer(ia, 256, &id_ia, &off_ia) && off_ia == 0);
+        CHECK(flush().empty());  // index (its bytes were uploaded when it was relocated)
+        CHECK(flush().empty());  // prime
+        {
+            const uint64_t ia_skipped0 = dg::work_total(dg::Work::FlushIaSkipped);
+            CHECK(flush().empty());
+            if (mode != dg::FlushMode::Full && tracking) {
+                CHECK(dg::work_total(dg::Work::FlushIaSkipped) - ia_skipped0 == 1);
+            } else {
+                CHECK(dg::work_total(dg::Work::FlushIaSkipped) == ia_skipped0);
+            }
+        }
+        CHECK(com::write_guest(ia + 8, two));
+        CHECK(only(flush(), id_ia, 0));
+        CHECK(flush().empty());
+        CHECK(com::write_guest(ia + 8, two));  // same bytes: compared, nothing uploaded
+        CHECK(flush().empty());
+        if (auto* host_ia = static_cast<uint8_t*>(com::guest_to_host(ia, 256))) {
+            host_ia[200] = 0x77;  // a host write straight into the memory
+            CHECK(only(flush(), id_ia, 0));
+        }
+        CHECK(flush().empty());
+        // Multi-flush skip: primed buffers stay skipped across several submissions without losing
+        // write-cursor accuracy when one page is modified later.
+        for (int i = 0; i < 5; ++i) {
+            CHECK(flush().empty());
+        }
+        CHECK(com::write_guest(mem + 2 * kPage + 12, one));
+        CHECK(only(flush(), id_a, static_cast<uint32_t>(2 * kPage)));
         CHECK(flush().empty());
         // A uniform range relocated after the others were primed: compared at the next flush (it is
         // unprimed, so the indexed flush visits it without a take naming its page), then skipped.
@@ -10066,6 +10101,336 @@ void test_native_flush_edge_cases() {
     dg::set_flush_mode(dg::FlushMode::Index);
 }
 
+// #2233: Resource::flush_shadow O(dirty_pages) path (0 dirty pages must not fall through to full
+// compare, 1 dirty page in a large buffer, coalesced adjacent dirty pages, unaligned tail page,
+// and verify mode catching unmarked writes), plus IA page-index straddling / mode-switch / crosscheck.
+void test_flush_shadow_dirty_indices_and_ia_index() {
+    constexpr uint64_t kPage = 4096, k64K = 64ull << 10;
+    struct Write {
+        uint32_t offset;
+        uint32_t bytes;
+    };
+    auto decode_writes = [](const gpu::CommandEncoder& enc, uint32_t target_id) {
+        std::vector<Write> out;
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer) {
+                GpuWriteBufferPayload w{};
+                std::memcpy(&w, enc.data() + off, sizeof(w));
+                if (w.id == target_id) {
+                    out.push_back({w.dst_offset, h.payload_bytes - static_cast<uint32_t>(sizeof(w))});
+                }
+            }
+            off += h.payload_bytes;
+        }
+        return out;
+    };
+
+    // Part A: Direct Resource::flush_shadow on native write-tracked buffers (and full-compare fallback on POSIX).
+    playgta6::os::set_write_tracking(true);
+    {
+        Fixture fx;
+        Scene scene(fx);
+        const uint64_t mem = com::guest_alloc(8 * k64K);
+        CHECK(mem != 0);
+        int32_t result = -1;
+        constexpr uint64_t kLargeSize = 64 * kPage;  // 256 KiB
+        constexpr uint64_t kTailSize = 3 * kPage + 100;
+        const uint64_t large_va = mem;
+        const uint64_t tail_va = mem + 5 * k64K;
+        const uint64_t large_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                             {I(large_va), I(put(buffer_desc(kLargeSize))), I(0), I(0)},
+                                             dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint64_t tail_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                            {I(tail_va), I(put(buffer_desc(kTailSize))), I(0), I(0)},
+                                            dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        dg::Resource* r_large = object_of<dg::Resource>(large_obj);
+        dg::Resource* r_tail = object_of<dg::Resource>(tail_obj);
+        const uint32_t id_large = r_large->id();
+        const uint32_t id_tail = r_tail->id();
+
+        // Initial flush primes write_tracked_ on platforms with OS write tracking.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(r_large->flush_shadow(enc) == 0);
+            CHECK(r_tail->flush_shadow(enc) == 0);
+        }
+        uintptr_t lo = 0, hi = 0;
+        const bool tracking = r_large->write_tracked_host_range(&lo, &hi);
+
+        // 1. 0 dirty pages: must return 0 without falling through to full compare_pages.
+        {
+            const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+            const uint64_t cmp0 = dg::work_total(dg::Work::ShadowComparedBytes);
+            gpu::CommandEncoder enc;
+            CHECK(r_large->flush_shadow(enc) == 0);
+            CHECK(decode_writes(enc, id_large).empty());
+            if (tracking) {
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+                CHECK(dg::work_total(dg::Work::ShadowComparedBytes) == cmp0);
+            }
+        }
+
+        // 2. 1 dirty page in a large buffer (page 37 of 64).
+        const uint32_t v1 = 0x12345678u, v2 = 0x87654321u;
+        CHECK(com::write_guest(large_va + 37 * kPage + 16, v1));
+        {
+            const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+            const uint64_t cmp0 = dg::work_total(dg::Work::ShadowComparedBytes);
+            gpu::CommandEncoder enc;
+            CHECK(r_large->flush_shadow(enc) == kPage);
+            const auto ws = decode_writes(enc, id_large);
+            CHECK(ws.size() == 1 && ws[0].offset == static_cast<uint32_t>(37 * kPage) &&
+                  ws[0].bytes == static_cast<uint32_t>(kPage));
+            if (tracking) {
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+                CHECK(dg::work_total(dg::Work::ShadowComparedBytes) - cmp0 == kPage);
+            }
+        }
+
+        // 3. Coalesced adjacent dirty pages (10, 11, 12) + separate page (20).
+        CHECK(com::write_guest(large_va + 10 * kPage + 4, v1));
+        CHECK(com::write_guest(large_va + 11 * kPage + 8, v1));
+        CHECK(com::write_guest(large_va + 12 * kPage + 12, v1));
+        CHECK(com::write_guest(large_va + 20 * kPage + 16, v2));
+        {
+            const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+            const uint64_t cmp0 = dg::work_total(dg::Work::ShadowComparedBytes);
+            gpu::CommandEncoder enc;
+            CHECK(r_large->flush_shadow(enc) == 4 * kPage);
+            const auto ws = decode_writes(enc, id_large);
+            CHECK(ws.size() == 2 && ws[0].offset == static_cast<uint32_t>(10 * kPage) &&
+                  ws[0].bytes == static_cast<uint32_t>(3 * kPage) &&
+                  ws[1].offset == static_cast<uint32_t>(20 * kPage) && ws[1].bytes == static_cast<uint32_t>(kPage));
+            if (tracking) {
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+                CHECK(dg::work_total(dg::Work::ShadowComparedBytes) - cmp0 == 4 * kPage);
+            }
+        }
+
+        // 4. Unaligned tail page (100 bytes), and coalescing page 2 + tail page 3.
+        CHECK(com::write_guest(tail_va + 3 * kPage + 96, v1));
+        {
+            const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+            gpu::CommandEncoder enc;
+            CHECK(r_tail->flush_shadow(enc) == 100);
+            const auto ws = decode_writes(enc, id_tail);
+            CHECK(ws.size() == 1 && ws[0].offset == static_cast<uint32_t>(3 * kPage) && ws[0].bytes == 100);
+            if (tracking) {
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+            }
+        }
+        CHECK(com::write_guest(tail_va + 2 * kPage + 4, v2));
+        CHECK(com::write_guest(tail_va + 3 * kPage + 92, v2));
+        {
+            const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+            gpu::CommandEncoder enc;
+            CHECK(r_tail->flush_shadow(enc) == kPage + 100);
+            const auto ws = decode_writes(enc, id_tail);
+            CHECK(ws.size() == 1 && ws[0].offset == static_cast<uint32_t>(2 * kPage) &&
+                  ws[0].bytes == static_cast<uint32_t>(kPage + 100));
+            if (tracking) {
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+            }
+        }
+
+        fx.vcall(tail_obj, Slot::Release);
+        fx.vcall(large_obj, Slot::Release);
+        scene.release_all();
+        com::guest_free(mem);
+    }
+
+    // Part B: Translated-window dirty-page-index path + verify mode (exercises sparse candidate path
+    // on every platform, including POSIX hosts without MEM_WRITE_WATCH).
+    {
+        namespace gw = playgta6::os::guest_window;
+        namespace xw = playgta6::os::xmem_windows;
+        namespace sc = playgta6::os::scarlett;
+        constexpr uint64_t k16G = 16ull << 30;
+        constexpr uint32_t kType = 0x20402000u;
+        playgta6::os::set_write_tracking(false);
+        sc::xmem_reset_for_testing();
+        gw::reset_for_testing();
+        gw::set_enabled(true);
+        xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+        void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x21u, 0x4u);
+        void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x3u, 0x801u);
+        const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu);
+        const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu);
+        CHECK(C == gw::kWindowBase && xw::is_phantom(G, k16G));
+        size_t count = 4;
+        uint64_t pfn[4] = {};
+        CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 4);
+        const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K, C + 6 * k64K, C + 7 * k64K};
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 4, pfn) == 1);
+        {
+            Fixture fx;
+            Scene scene(fx);
+            dg::Device* dev = host_device(scene.device);
+            int32_t result = -1;
+            constexpr uint64_t kWinBufSize = 3 * k64K + 100;  // 4 slots, 100-byte unaligned tail
+            const uint64_t wbuf = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                            {I(G + 4 * k64K), I(put(buffer_desc(kWinBufSize))), I(0), I(0)},
+                                            dg::IID_ID3D12Resource, &result);
+            CHECK(result == 0);
+            dg::Resource* r_win = object_of<dg::Resource>(wbuf);
+            const uint32_t id_win = r_win->id();
+            auto flush_dev = [&] {
+                gpu::CommandEncoder enc;
+                dev->begin_submission();
+                dev->flush_cpu_buffers(enc);
+                dev->end_submission();
+                return decode_writes(enc, id_win);
+            };
+
+            // Initial flush primes window_marked_.
+            CHECK(flush_dev().empty());
+
+            // 0 dirty slots via direct flush_shadow: must NOT fall through to full compare_pages.
+            {
+                const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+                const uint64_t cmp0 = dg::work_total(dg::Work::ShadowComparedBytes);
+                gpu::CommandEncoder enc;
+                CHECK(r_win->flush_shadow(enc) == 0);
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+                CHECK(dg::work_total(dg::Work::ShadowComparedBytes) == cmp0);
+            }
+
+            // 1 dirty slot via direct flush_shadow: compares only that 64 KiB slot (not 3*64 KiB + 100),
+            // uploads only the changed 4 KiB page, and never falls through to full compare_pages.
+            const uint32_t val = 0xAABBCCDDu;
+            CHECK(com::write_guest(C + 5 * k64K + kPage + 8, val));
+            {
+                const uint64_t full0 = dg::work_total(dg::Work::ShadowFullCompares);
+                const uint64_t cmp0 = dg::work_total(dg::Work::ShadowComparedBytes);
+                gpu::CommandEncoder enc;
+                CHECK(r_win->flush_shadow(enc) == kPage);
+                const auto ws = decode_writes(enc, id_win);
+                CHECK(ws.size() == 1 && ws[0].offset == static_cast<uint32_t>(k64K + kPage) &&
+                      ws[0].bytes == static_cast<uint32_t>(kPage));
+                CHECK(dg::work_total(dg::Work::ShadowFullCompares) == full0);
+                CHECK(dg::work_total(dg::Work::ShadowComparedBytes) - cmp0 == k64K);
+            }
+
+            // Coalesce across slot boundary into the unaligned 100-byte tail page.
+            CHECK(com::write_guest(C + 7 * k64K - kPage + 8, val));
+            CHECK(com::write_guest(C + 7 * k64K + 96, val));
+            {
+                const auto ws = flush_dev();
+                CHECK(ws.size() == 1 && ws[0].offset == static_cast<uint32_t>(3 * k64K - kPage) &&
+                      ws[0].bytes == static_cast<uint32_t>(kPage + 100));
+            }
+
+            // Verify mode with 1 marked slot + 1 unmarked direct write: uploads both, flags only the unmarked one.
+            CHECK(com::write_guest(C + 4 * k64K + 8, val));
+            auto* raw_slot2 = static_cast<uint32_t*>(gw::translate(C + 6 * k64K + 16));
+            CHECK(raw_slot2 != nullptr);
+            *raw_slot2 = 0x55AA1122u;
+            gw::set_write_marks_verified(true);
+            {
+                const uint64_t misses0 = gw::verify_misses();
+                const auto ws = flush_dev();
+                CHECK(ws.size() == 2 && ws[0].offset == 0 && ws[0].bytes == static_cast<uint32_t>(kPage) &&
+                      ws[1].offset == static_cast<uint32_t>(2 * k64K) && ws[1].bytes == static_cast<uint32_t>(kPage));
+                CHECK(gw::verify_misses() == misses0 + 1);
+            }
+
+            // Verify mode with 0 marked slots + 1 unmarked direct write: still catches and uploads it.
+            auto* raw_slot1 = static_cast<uint32_t*>(gw::translate(C + 5 * k64K + 32));
+            CHECK(raw_slot1 != nullptr);
+            *raw_slot1 = 0x99887766u;
+            {
+                const uint64_t misses1 = gw::verify_misses();
+                const auto ws = flush_dev();
+                CHECK(ws.size() == 1 && ws[0].offset == static_cast<uint32_t>(k64K) &&
+                      ws[0].bytes == static_cast<uint32_t>(kPage));
+                CHECK(gw::verify_misses() == misses1 + 1);
+            }
+            gw::set_write_marks_verified(false);
+
+            fx.vcall(wbuf, Slot::Release);
+            scene.release_all();
+        }
+        sc::xmem_reset_for_testing();
+        gw::reset_for_testing();
+        xw::set_policy(xw::PlacementPolicy::Arena);
+        playgta6::os::set_write_tracking(true);
+    }
+
+    // Part C: CrossCheck every=2, mode switches (Index -> Full -> Index) after multi-flush skips,
+    // and page-straddling IA relocation.
+    {
+        dg::set_flush_mode(dg::FlushMode::CrossCheck);
+        dg::set_flush_crosscheck_every(2);
+        const uint64_t misses0 = dg::work_total(dg::Work::FlushCrosscheckMisses);
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        const uint64_t mem = com::guest_alloc(4 * k64K);
+        CHECK(mem != 0);
+        int32_t result = -1;
+        const uint64_t buf = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                       {I(mem), I(put(buffer_desc(4 * kPage))), I(0), I(0)},
+                                       dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t id_buf = object_of<dg::Resource>(buf)->id();
+        const uint64_t ia_straddle = mem + 2 * k64K + kPage - 32;  // straddles two 4 KiB pages
+        uint32_t id_ia = 0;
+        uint64_t off_ia = 0;
+        CHECK(dev->relocate_ia_buffer(ia_straddle, 64, &id_ia, &off_ia) && off_ia == 0);
+
+        auto flush_both = [&](std::vector<Write>* buf_out, std::vector<Write>* ia_out) {
+            gpu::CommandEncoder enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(enc);
+            dev->end_submission();
+            *buf_out = decode_writes(enc, id_buf);
+            *ia_out = decode_writes(enc, id_ia);
+        };
+        std::vector<Write> wb, wia;
+        // Index + prime + 4 alternating indexed / crosscheck clean flushes.
+        for (int i = 0; i < 6; ++i) {
+            flush_both(&wb, &wia);
+            CHECK(wb.empty() && wia.empty());
+        }
+        // Switch Index/CrossCheck -> Full after skipped flushes: writes must still be uploaded.
+        const uint32_t one = 1, two = 2;
+        dg::set_flush_mode(dg::FlushMode::Full);
+        CHECK(com::write_guest(mem + 3 * kPage + 8, one));
+        CHECK(com::write_guest(ia_straddle + 40, one));  // second page of straddling IA range
+        flush_both(&wb, &wia);
+        CHECK(wb.size() == 1 && wb[0].offset == static_cast<uint32_t>(3 * kPage));
+        CHECK(wia.size() == 1 && wia[0].offset == 0 && wia[0].bytes == 64);
+
+        // Switch Full -> CrossCheck (every=2), re-prime, skip 3 flushes, then write to first page of straddling IA.
+        dg::set_flush_mode(dg::FlushMode::CrossCheck);
+        for (int i = 0; i < 5; ++i) {
+            flush_both(&wb, &wia);
+            CHECK(wb.empty() && wia.empty());
+        }
+        CHECK(com::write_guest(ia_straddle + 4, two));  // first page of straddling IA range
+        flush_both(&wb, &wia);
+        CHECK(wb.empty() && wia.size() == 1 && wia[0].offset == 0 && wia[0].bytes == 64);
+        CHECK(com::write_guest(mem + kPage + 16, two));
+        flush_both(&wb, &wia);
+        CHECK(wb.size() == 1 && wb[0].offset == static_cast<uint32_t>(kPage) && wia.empty());
+        flush_both(&wb, &wia);
+        CHECK(wb.empty() && wia.empty());
+        CHECK(dg::work_total(dg::Work::FlushCrosscheckMisses) == misses0);
+
+        fx.vcall(buf, Slot::Release);
+        scene.release_all();
+        com::guest_free(mem);
+        dg::set_flush_mode(dg::FlushMode::Index);
+        dg::set_flush_crosscheck_every(1);
+    }
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -10080,6 +10445,7 @@ int main() {
     test_shared_view_write_tracking_flush();
     test_native_flush_page_index();
     test_native_flush_edge_cases();
+    test_flush_shadow_dirty_indices_and_ia_index();
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();
