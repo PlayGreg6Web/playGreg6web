@@ -9455,17 +9455,44 @@ export function bootstrapPlayGta6App(options = {}) {
       });
   }
 
+  function postFlushUserdataToLoader(reason) {
+    const loaderWorker =
+      activeWasmHandle &&
+      activeWasmHandle.worker &&
+      typeof activeWasmHandle.worker.postMessage === 'function'
+        ? activeWasmHandle.worker
+        : null;
+    if (!loaderWorker) {
+      return false;
+    }
+    try {
+      loaderWorker.postMessage({ type: 'flush-userdata', reason });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function handleVisibilityChange() {
     if (destroyed) {
       return;
     }
     if (isPageHidden()) {
+      postFlushUserdataToLoader('visibilitychange');
       if (isPointerLocked()) {
         exitPointerLock();
       }
       return;
     }
     recoverAudioOnVisibility('visibilitychange');
+  }
+
+  function handlePageHideOrUnload(ev) {
+    if (destroyed) {
+      return;
+    }
+    const reason = ev && typeof ev.type === 'string' ? ev.type : 'pagehide';
+    postFlushUserdataToLoader(reason);
   }
 
   function handleWindowFocusOrShow(ev) {
@@ -9519,6 +9546,22 @@ export function bootstrapPlayGta6App(options = {}) {
         windowObj.addEventListener('pageshow', handleWindowFocusOrShow);
         cleanups.push(() => {
           windowObj.removeEventListener('pageshow', handleWindowFocusOrShow);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+      try {
+        windowObj.addEventListener('pagehide', handlePageHideOrUnload);
+        cleanups.push(() => {
+          windowObj.removeEventListener('pagehide', handlePageHideOrUnload);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+      try {
+        windowObj.addEventListener('beforeunload', handlePageHideOrUnload);
+        cleanups.push(() => {
+          windowObj.removeEventListener('beforeunload', handlePageHideOrUnload);
         });
       } catch {
         // Ignore listener registration errors.

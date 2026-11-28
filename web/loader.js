@@ -24,6 +24,13 @@ const FAULT_RECORD_NUMERIC_KEYS = new Set([
 const FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE = 'flush-pipeline-dumps';
 const FLUSH_PIPELINE_DUMP_MESSAGE_TYPE = 'flush-pipeline-dump';
 const PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE = 'pipeline-dumps-flushed';
+const FLUSH_USERDATA_MESSAGE_TYPE = 'flush-userdata';
+const USERDATA_FLUSHED_MESSAGE_TYPE = 'userdata-flushed';
+const DEFAULT_SAVE_SYNC_INTERVAL_MS = 2000;
+const DEFAULT_SAVE_ROOT = '/userdata/saves';
+const USERDATA_ROOT_PREFIX = '/userdata/';
+const MAX_SAVE_SYNC_WALK_DEPTH = 16;
+const MAX_WASM_CSTRING_BYTES = 1024 * 1024;
 const WGPU_CMD_POOL_MIN_BYTES = 256 * 1024;
 const WGPU_CMD_POOL_MAX_BYTES = 32 * 1024 * 1024;
 const WGPU_CMD_POOL_MAX_BUFFERS = 3;
@@ -9521,6 +9528,696 @@ function createMemfsPipelineDumpSyncer(options = {}) {
 }
 
 /**
+ * Safely reads a NUL-terminated UTF-8 C string from Wasm linear memory.
+ * Handles both Wasm64 (`BigInt`) and Wasm32 (`Number`) pointers as well as
+ * `SharedArrayBuffer`-backed pthread heaps (copies out before `TextDecoder.decode`).
+ */
+function readWasmCString(mod, rawPtr, maxBytes = MAX_WASM_CSTRING_BYTES) {
+  if (!mod || typeof mod !== 'object' || rawPtr === null || rawPtr === undefined) {
+    return '';
+  }
+  let ptr;
+  try {
+    ptr = ptrToNumber(rawPtr, 'wasmCStringPtr');
+  } catch {
+    return '';
+  }
+  if (!Number.isSafeInteger(ptr) || ptr <= 0) {
+    return '';
+  }
+  let heapU8 = null;
+  if (mod.HEAPU8 instanceof Uint8Array) {
+    heapU8 = mod.HEAPU8;
+  } else {
+    const buf = resolveBuffer(mod.wasmMemory || mod.memory);
+    if (buf) {
+      heapU8 = new Uint8Array(buf);
+    }
+  }
+  if (heapU8 && ptr < heapU8.byteLength) {
+    const cap =
+      typeof maxBytes === 'number' && Number.isFinite(maxBytes) && maxBytes > 0
+        ? Math.floor(maxBytes)
+        : MAX_WASM_CSTRING_BYTES;
+    const limit = Math.min(heapU8.byteLength, ptr + cap);
+    let end = ptr;
+    while (end < limit && heapU8[end] !== 0) {
+      end += 1;
+    }
+    if (end <= ptr) {
+      return '';
+    }
+    const copy = new Uint8Array(end - ptr);
+    copy.set(heapU8.subarray(ptr, end));
+    return utf8Decoder.decode(copy);
+  }
+  if (typeof mod.UTF8ToString === 'function') {
+    try {
+      const str = mod.UTF8ToString(ptr);
+      return typeof str === 'string' ? str : '';
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function parseStorageGeneration(raw) {
+  if (typeof raw === 'bigint') {
+    return raw >= 0n ? raw : null;
+  }
+  if (typeof raw === 'number' && Number.isFinite(raw) && Number.isInteger(raw) && raw >= 0) {
+    return BigInt(raw);
+  }
+  return null;
+}
+
+function resolveStorageExports(mod) {
+  if (!mod || typeof mod !== 'object') {
+    return null;
+  }
+  const getGeneration =
+    typeof mod._playgta6_storage_generation === 'function'
+      ? mod._playgta6_storage_generation
+      : typeof mod.playgta6_storage_generation === 'function'
+        ? mod.playgta6_storage_generation
+        : mod.asm && typeof mod.asm.playgta6_storage_generation === 'function'
+          ? mod.asm.playgta6_storage_generation
+          : mod.asm && typeof mod.asm._playgta6_storage_generation === 'function'
+            ? mod.asm._playgta6_storage_generation
+            : null;
+  const takeChanged =
+    typeof mod._playgta6_storage_take_changed === 'function'
+      ? mod._playgta6_storage_take_changed
+      : typeof mod.playgta6_storage_take_changed === 'function'
+        ? mod.playgta6_storage_take_changed
+        : mod.asm && typeof mod.asm.playgta6_storage_take_changed === 'function'
+          ? mod.asm.playgta6_storage_take_changed
+          : mod.asm && typeof mod.asm._playgta6_storage_take_changed === 'function'
+            ? mod.asm._playgta6_storage_take_changed
+            : null;
+  if (!getGeneration || !takeChanged) {
+    return null;
+  }
+  return { getGeneration, takeChanged };
+}
+
+function normalizeSaveSyncPath(rawPath) {
+  if (typeof rawPath !== 'string') {
+    return null;
+  }
+  const trimmed = rawPath.trim();
+  if (!trimmed || trimmed.includes('\\') || trimmed.includes('\0') || hasControlChar(trimmed)) {
+    return null;
+  }
+  const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  const rawSegments = withLeadingSlash.split('/');
+  const cleanSegments = [];
+  for (let i = 0; i < rawSegments.length; i += 1) {
+    const seg = rawSegments[i];
+    if (!seg) {
+      continue;
+    }
+    if (seg === '.' || seg === '..') {
+      return null;
+    }
+    cleanSegments.push(seg);
+  }
+  if (cleanSegments.length < 2 || cleanSegments[0] !== 'userdata') {
+    return null;
+  }
+  return `/${cleanSegments.join('/')}`;
+}
+
+function isTransientSaveEntryName(name) {
+  return (
+    name.startsWith('.tmp-') ||
+    name.startsWith('.new-') ||
+    name.startsWith('.old-')
+  );
+}
+
+function extractFsStatMtimeMs(st, fallbackNowMs) {
+  if (st && st.mtime instanceof Date) {
+    const t = st.mtime.getTime();
+    if (Number.isFinite(t) && t >= 0) {
+      return t;
+    }
+  } else if (st && typeof st.mtime === 'number' && Number.isFinite(st.mtime) && st.mtime >= 0) {
+    return st.mtime;
+  }
+  return fallbackNowMs;
+}
+
+/**
+ * Non-blocking browser savegame persistence controller (#663 / #1605).
+ *
+ * Polls `playgta6_storage_generation()` on a timer and on explicit flush requests
+ * (`visibilitychange` / `pagehide` / `beforeunload` / `onExit`), drains changed
+ * container directories via `playgta6_storage_take_changed()`, snapshots Emscripten
+ * MEMFS synchronously, and serializes writes/deletes into `UserdataStore` (IndexedDB).
+ */
+function createSaveSyncController(options = {}) {
+  const store =
+    options.userdataStore && typeof options.userdataStore === 'object'
+      ? options.userdataStore
+      : null;
+  const intervalMs =
+    typeof options.intervalMs === 'number' &&
+    Number.isFinite(options.intervalMs) &&
+    options.intervalMs > 0
+      ? Math.max(10, Math.floor(options.intervalMs))
+      : DEFAULT_SAVE_SYNC_INTERVAL_MS;
+  const reportFn = typeof options.reportFn === 'function' ? options.reportFn : null;
+  const setIntervalFn =
+    options.setIntervalFn !== undefined
+      ? options.setIntervalFn
+      : typeof setInterval === 'function'
+        ? (fn, ms) => setInterval(fn, ms)
+        : null;
+  const clearIntervalFn =
+    options.clearIntervalFn !== undefined
+      ? options.clearIntervalFn
+      : typeof clearInterval === 'function'
+        ? (id) => clearInterval(id)
+        : null;
+  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : () => Date.now();
+
+  let explicitFs = options.fs || options.FS || null;
+  const getFsFn = typeof options.getFS === 'function' ? options.getFS : null;
+  let attachedModule = options.module && typeof options.module === 'object' ? options.module : null;
+  const getModuleFn = typeof options.getModule === 'function' ? options.getModule : null;
+
+  let timerId = null;
+  let activeFlushPromise = null;
+  let lastPersistedGeneration = 0n;
+  let latestCapturedGeneration = 0n;
+  let queuedTargetGeneration = 0n;
+  const queuedSnapshots = new Map();
+  const retryPaths = new Set();
+
+  let persistedFiles = 0;
+  let deletedFiles = 0;
+  let flushCount = 0;
+  let errorCount = 0;
+  let lastFlushAtMs = null;
+
+  function resolveModule(modOverride) {
+    if (modOverride && typeof modOverride === 'object') {
+      return modOverride;
+    }
+    if (attachedModule && typeof attachedModule === 'object') {
+      return attachedModule;
+    }
+    if (getModuleFn) {
+      try {
+        const mod = getModuleFn();
+        if (mod && typeof mod === 'object') {
+          return mod;
+        }
+      } catch {
+        // Ignore getter errors.
+      }
+    }
+    return null;
+  }
+
+  function resolveFs(mod) {
+    if (explicitFs && typeof explicitFs === 'object') {
+      return explicitFs;
+    }
+    if (getFsFn) {
+      try {
+        const res = getFsFn();
+        if (res && typeof res === 'object') {
+          return res;
+        }
+      } catch {
+        // Ignore getter errors.
+      }
+    }
+    if (mod && mod.FS && typeof mod.FS === 'object') {
+      return mod.FS;
+    }
+    return null;
+  }
+
+  function isDirMode(fsObj, mode) {
+    if (typeof fsObj.isDir === 'function') {
+      return Boolean(fsObj.isDir(mode));
+    }
+    return typeof mode === 'number' && (mode & 0o170000) === 0o040000;
+  }
+
+  function isFileMode(fsObj, mode) {
+    if (typeof fsObj.isFile === 'function') {
+      return Boolean(fsObj.isFile(mode));
+    }
+    return typeof mode === 'number' && (mode & 0o170000) === 0o100000;
+  }
+
+  function snapshotTargetPath(fsObj, targetPath, fallbackNowMs) {
+    let st;
+    try {
+      st = fsObj.stat(targetPath);
+    } catch (err) {
+      if (isFsNotFoundError(err)) {
+        return { kind: 'deleted', path: targetPath };
+      }
+      return { kind: 'error', path: targetPath };
+    }
+    if (!st || typeof st !== 'object') {
+      return { kind: 'error', path: targetPath };
+    }
+    if (isFileMode(fsObj, st.mode)) {
+      try {
+        const raw = fsObj.readFile(targetPath);
+        return {
+          kind: 'file',
+          path: targetPath,
+          bytes: toUint8ArrayCopy(raw),
+          mtime: extractFsStatMtimeMs(st, fallbackNowMs),
+        };
+      } catch {
+        return { kind: 'error', path: targetPath };
+      }
+    }
+    if (!isDirMode(fsObj, st.mode)) {
+      return { kind: 'deleted', path: targetPath };
+    }
+
+    const files = [];
+    const visitedDirs = new Set();
+    let readErrors = 0;
+
+    function walk(dirPath, depth) {
+      if (depth > MAX_SAVE_SYNC_WALK_DEPTH || visitedDirs.has(dirPath)) {
+        return;
+      }
+      visitedDirs.add(dirPath);
+      let entries;
+      try {
+        entries = fsObj.readdir(dirPath);
+      } catch (err) {
+        if (!isFsNotFoundError(err)) {
+          readErrors += 1;
+        }
+        return;
+      }
+      if (!Array.isArray(entries)) {
+        return;
+      }
+      for (let i = 0; i < entries.length; i += 1) {
+        const name = entries[i];
+        if (
+          typeof name !== 'string' ||
+          name.length === 0 ||
+          name === '.' ||
+          name === '..' ||
+          isTransientSaveEntryName(name)
+        ) {
+          continue;
+        }
+        const candidatePath = normalizeSaveSyncPath(`${dirPath}/${name}`);
+        if (!candidatePath) {
+          continue;
+        }
+        let childStat;
+        try {
+          childStat = fsObj.stat(candidatePath);
+        } catch (err) {
+          if (!isFsNotFoundError(err)) {
+            readErrors += 1;
+          }
+          continue;
+        }
+        if (!childStat || typeof childStat !== 'object') {
+          continue;
+        }
+        if (isDirMode(fsObj, childStat.mode)) {
+          walk(candidatePath, depth + 1);
+        } else if (isFileMode(fsObj, childStat.mode)) {
+          try {
+            const raw = fsObj.readFile(candidatePath);
+            files.push({
+              path: candidatePath,
+              bytes: toUint8ArrayCopy(raw),
+              mtime: extractFsStatMtimeMs(childStat, fallbackNowMs),
+            });
+          } catch {
+            readErrors += 1;
+          }
+        }
+      }
+    }
+
+    walk(targetPath, 0);
+    files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    return {
+      kind: 'dir',
+      path: targetPath,
+      files,
+      readErrors,
+    };
+  }
+
+  function captureDirtySnapshotFromModule(modOverride) {
+    if (!store) {
+      return { captured: false };
+    }
+    const mod = resolveModule(modOverride);
+    const fsObj = resolveFs(mod);
+    const storageExports = resolveStorageExports(mod);
+    if (!mod || !fsObj || !storageExports) {
+      return { captured: false };
+    }
+
+    let rawGen;
+    try {
+      rawGen = storageExports.getGeneration();
+    } catch {
+      return { captured: false };
+    }
+    const gen = parseStorageGeneration(rawGen);
+    if (gen === null) {
+      return { captured: false };
+    }
+
+    const genAdvanced = gen !== latestCapturedGeneration;
+    if (!genAdvanced && retryPaths.size === 0) {
+      return { captured: false, gen };
+    }
+
+    const pathsToSnapshot = new Set();
+    if (retryPaths.size > 0) {
+      for (const retryPath of retryPaths) {
+        pathsToSnapshot.add(retryPath);
+      }
+      retryPaths.clear();
+    }
+
+    if (genAdvanced) {
+      let rawChangedPtr;
+      try {
+        rawChangedPtr = storageExports.takeChanged();
+      } catch {
+        for (const p of pathsToSnapshot) {
+          retryPaths.add(p);
+        }
+        return { captured: false, gen };
+      }
+      const changedText = readWasmCString(mod, rawChangedPtr);
+      if (changedText) {
+        const lines = changedText.split('\n');
+        for (let i = 0; i < lines.length; i += 1) {
+          const normalized = normalizeSaveSyncPath(lines[i]);
+          if (normalized) {
+            pathsToSnapshot.add(normalized);
+          }
+        }
+      }
+      latestCapturedGeneration = gen;
+      if (gen > queuedTargetGeneration) {
+        queuedTargetGeneration = gen;
+      }
+    }
+
+    const fallbackNow = nowFn();
+    for (const targetPath of pathsToSnapshot) {
+      const snap = snapshotTargetPath(fsObj, targetPath, fallbackNow);
+      queuedSnapshots.set(targetPath, snap);
+    }
+
+    return { captured: true, gen };
+  }
+
+  async function listExistingKeysWithPrefix(prefix) {
+    if (typeof store.listByPrefix === 'function') {
+      const listed = await store.listByPrefix(prefix);
+      return Array.isArray(listed) ? listed : [];
+    }
+    if (typeof store.listFiles === 'function') {
+      const all = await store.listFiles();
+      if (!Array.isArray(all)) {
+        return [];
+      }
+      const out = [];
+      for (let i = 0; i < all.length; i += 1) {
+        const item = all[i];
+        const key = typeof item === 'string' ? item : item && typeof item.path === 'string' ? item.path : null;
+        if (key && key.startsWith(prefix)) {
+          out.push(key);
+        }
+      }
+      return out;
+    }
+    return [];
+  }
+
+  async function hasExactStoredFile(filePath) {
+    if (typeof store.getMetadata === 'function') {
+      const meta = await store.getMetadata(filePath);
+      return Boolean(meta);
+    }
+    if (typeof store.getFile === 'function') {
+      const file = await store.getFile(filePath);
+      return Boolean(file);
+    }
+    if (typeof store.listFiles === 'function') {
+      const all = await store.listFiles();
+      if (Array.isArray(all)) {
+        for (let i = 0; i < all.length; i += 1) {
+          const item = all[i];
+          const key = typeof item === 'string' ? item : item && typeof item.path === 'string' ? item.path : null;
+          if (key === filePath) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  async function persistSnapshotBatch(batch) {
+    let savedCount = 0;
+    let deletedCount = 0;
+    const failedPaths = [];
+
+    for (let i = 0; i < batch.length; i += 1) {
+      const entry = batch[i];
+      if (!entry || !entry.path) {
+        continue;
+      }
+      if (entry.kind === 'error') {
+        failedPaths.push(entry.path);
+        continue;
+      }
+
+      try {
+        if (entry.kind === 'file') {
+          await store.saveFile(entry.path, entry.bytes, entry.mtime);
+          savedCount += 1;
+        } else if (entry.kind === 'dir') {
+          let entryFailed = entry.readErrors > 0;
+          const livePaths = new Set();
+          for (let j = 0; j < entry.files.length; j += 1) {
+            const file = entry.files[j];
+            livePaths.add(file.path);
+            try {
+              await store.saveFile(file.path, file.bytes, file.mtime);
+              savedCount += 1;
+            } catch {
+              entryFailed = true;
+            }
+          }
+          if (!entryFailed && typeof store.deleteFile === 'function') {
+            const prefix = `${entry.path}/`;
+            const existingKeys = await listExistingKeysWithPrefix(prefix);
+            for (let j = 0; j < existingKeys.length; j += 1) {
+              const key = existingKeys[j];
+              if (!livePaths.has(key)) {
+                await store.deleteFile(key);
+                deletedCount += 1;
+              }
+            }
+          }
+          if (entryFailed) {
+            failedPaths.push(entry.path);
+          }
+        } else if (entry.kind === 'deleted') {
+          const prefix = `${entry.path}/`;
+          if (typeof store.deletePrefix === 'function') {
+            const removed = await store.deletePrefix(prefix);
+            if (typeof removed === 'number' && Number.isFinite(removed) && removed > 0) {
+              deletedCount += removed;
+            }
+          } else if (typeof store.deleteFile === 'function') {
+            const existingKeys = await listExistingKeysWithPrefix(prefix);
+            for (let j = 0; j < existingKeys.length; j += 1) {
+              await store.deleteFile(existingKeys[j]);
+              deletedCount += 1;
+            }
+          }
+          if (typeof store.deleteFile === 'function' && (await hasExactStoredFile(entry.path))) {
+            await store.deleteFile(entry.path);
+            deletedCount += 1;
+          }
+        }
+      } catch {
+        failedPaths.push(entry.path);
+      }
+    }
+
+    return { savedCount, deletedCount, failedPaths };
+  }
+
+  function getStats() {
+    return {
+      active: timerId !== null,
+      lastPersistedGeneration: lastPersistedGeneration.toString(),
+      persistedFiles,
+      deletedFiles,
+      flushCount,
+      errorCount,
+      pendingPaths: queuedSnapshots.size + retryPaths.size,
+      lastFlushAtMs,
+    };
+  }
+
+  async function drainUntilClean() {
+    try {
+      while (true) {
+        captureDirtySnapshotFromModule();
+        if (queuedSnapshots.size === 0) {
+          if (queuedTargetGeneration > lastPersistedGeneration && retryPaths.size === 0) {
+            lastPersistedGeneration = queuedTargetGeneration;
+          }
+          break;
+        }
+        const batch = Array.from(queuedSnapshots.values());
+        const batchGen = queuedTargetGeneration;
+        queuedSnapshots.clear();
+
+        const res = await persistSnapshotBatch(batch);
+        lastFlushAtMs = nowFn();
+        flushCount += 1;
+        persistedFiles += res.savedCount;
+        deletedFiles += res.deletedCount;
+
+        if (res.failedPaths.length > 0) {
+          errorCount += res.failedPaths.length;
+          for (let i = 0; i < res.failedPaths.length; i += 1) {
+            retryPaths.add(res.failedPaths[i]);
+          }
+          break;
+        }
+
+        if (batchGen > lastPersistedGeneration) {
+          lastPersistedGeneration = batchGen;
+        }
+
+        if (reportFn && (res.savedCount > 0 || res.deletedCount > 0)) {
+          try {
+            const detail =
+              res.deletedCount > 0
+                ? `userdata persisted ${res.savedCount} files (${res.deletedCount} deleted), generation ${lastPersistedGeneration}`
+                : `userdata persisted ${res.savedCount} files, generation ${lastPersistedGeneration}`;
+            reportFn(detail);
+          } catch {
+            // Save sync telemetry must never break persistence.
+          }
+        }
+      }
+    } finally {
+      activeFlushPromise = null;
+    }
+    return getStats();
+  }
+
+  function pollAndPersist(pollOpts = {}) {
+    if (!store) {
+      return Promise.resolve(getStats());
+    }
+    if (pollOpts && pollOpts.module && typeof pollOpts.module === 'object') {
+      attachedModule = pollOpts.module;
+    }
+    // Always snapshot synchronously before awaiting so callers (including teardown/pagehide)
+    // capture the latest MEMFS bytes immediately and coalesce into the active drain loop.
+    captureDirtySnapshotFromModule(pollOpts && pollOpts.module);
+    if (activeFlushPromise) {
+      return activeFlushPromise;
+    }
+    if (
+      queuedSnapshots.size === 0 &&
+      retryPaths.size === 0 &&
+      queuedTargetGeneration <= lastPersistedGeneration
+    ) {
+      return Promise.resolve(getStats());
+    }
+    activeFlushPromise = drainUntilClean();
+    return activeFlushPromise;
+  }
+
+  function attachModule(mod) {
+    if (mod && typeof mod === 'object') {
+      attachedModule = mod;
+    }
+  }
+
+  function setFS(fsObj) {
+    explicitFs = fsObj && typeof fsObj === 'object' ? fsObj : null;
+  }
+
+  function clearTimer() {
+    if (timerId !== null) {
+      if (clearIntervalFn) {
+        try {
+          clearIntervalFn(timerId);
+        } catch {
+          // Ignore timer cleanup errors.
+        }
+      }
+      timerId = null;
+    }
+  }
+
+  function start(modOverride) {
+    if (!store) {
+      return false;
+    }
+    if (modOverride && typeof modOverride === 'object') {
+      attachedModule = modOverride;
+    }
+    if (timerId === null && setIntervalFn) {
+      timerId = setIntervalFn(() => {
+        pollAndPersist().catch(() => {});
+      }, intervalMs);
+    }
+    pollAndPersist().catch(() => {});
+    return true;
+  }
+
+  function stop() {
+    clearTimer();
+    if (!store) {
+      return Promise.resolve(getStats());
+    }
+    return pollAndPersist();
+  }
+
+  return {
+    enabled: Boolean(store),
+    start,
+    stop,
+    flush: pollAndPersist,
+    pollAndPersist,
+    attachModule,
+    setFS,
+    getStats,
+  };
+}
+
+/**
  * Build the Emscripten `createRuntimeModule(...)` configuration object with:
  * - `mainScriptUrlOrBlob` pinned to `dist/runtime.js` (never `loader.js`),
  * - `locateFile` resolving `runtime.wasm` / `runtime.worker.js` cleanly under `dist/`,
@@ -9874,6 +10571,83 @@ function buildRuntimeModuleConfig(options = {}) {
       return pipelineDumpSyncer.flush(flushOpts);
     } catch {
       return Promise.resolve(pipelineDumpSyncer.getStats());
+    }
+  };
+
+  const saveSyncController =
+    options.saveSyncController && typeof options.saveSyncController === 'object'
+      ? options.saveSyncController
+      : createSaveSyncController({
+          userdataStore: activeUserdataStore,
+          intervalMs: options.saveSyncIntervalMs,
+          reportFn: activeReportFn,
+          setIntervalFn: options.saveSyncSetIntervalFn,
+          clearIntervalFn: options.saveSyncClearIntervalFn,
+          nowFn: options.saveSyncNowFn,
+          getModule: () => boundModule,
+        });
+
+  let saveSyncControllerStarted = false;
+  const attachSaveSyncController = (mod) => {
+    if (!saveSyncController || !saveSyncController.enabled) {
+      return;
+    }
+    const targetMod = mod && typeof mod === 'object' ? mod : boundModule;
+    if (!targetMod || !targetMod.FS) {
+      return;
+    }
+    if (typeof saveSyncController.attachModule === 'function') {
+      try {
+        saveSyncController.attachModule(targetMod);
+      } catch {
+        // Ignore save sync attach errors.
+      }
+    }
+    if (saveSyncControllerStarted) {
+      return;
+    }
+    saveSyncControllerStarted = true;
+    try {
+      saveSyncController.start(targetMod);
+    } catch {
+      // Save sync startup must never block or crash runtime boot.
+    }
+  };
+
+  const stopSaveSyncController = () => {
+    if (!saveSyncController || !saveSyncController.enabled) {
+      return Promise.resolve(saveSyncController ? saveSyncController.getStats() : null);
+    }
+    if (boundModule && boundModule.FS && typeof saveSyncController.attachModule === 'function') {
+      try {
+        saveSyncController.attachModule(boundModule);
+      } catch {
+        // Ignore attach failures during teardown flush.
+      }
+    }
+    saveSyncControllerStarted = false;
+    try {
+      return saveSyncController.stop();
+    } catch {
+      return Promise.resolve(saveSyncController.getStats());
+    }
+  };
+
+  const flushUserdataInternal = (flushOpts) => {
+    if (!saveSyncController || !saveSyncController.enabled) {
+      return Promise.resolve(saveSyncController ? saveSyncController.getStats() : null);
+    }
+    if (boundModule && boundModule.FS && typeof saveSyncController.attachModule === 'function') {
+      try {
+        saveSyncController.attachModule(boundModule);
+      } catch {
+        // Ignore attach failures during explicit flush.
+      }
+    }
+    try {
+      return saveSyncController.flush(flushOpts);
+    } catch {
+      return Promise.resolve(saveSyncController.getStats());
     }
   };
 
@@ -10236,6 +11010,10 @@ function buildRuntimeModuleConfig(options = {}) {
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
     }
+    const saveDrainPromise = stopSaveSyncController();
+    if (saveDrainPromise && typeof saveDrainPromise.catch === 'function') {
+      saveDrainPromise.catch(() => {});
+    }
     stopPrewarmBridge({ save: false });
     stopInputBridge();
     audioRingController.destroy();
@@ -10334,6 +11112,7 @@ function buildRuntimeModuleConfig(options = {}) {
     }
     attachGuestMemoryToGpuWorker(mod);
     attachPipelineDumpSyncer(mod);
+    attachSaveSyncController(mod);
     attachInputBridge(mod);
     attachAudioRing(mod);
     try {
@@ -10348,10 +11127,14 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const onExit = function onPlayGta6RuntimeExit() {
-    // Snapshot and flush any pending MEMFS /pg6_dump files and warm list BEFORE clearing boundModule.
+    // Snapshot and flush any pending MEMFS /pg6_dump files, userdata saves, and warm list BEFORE clearing boundModule.
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
+    }
+    const saveDrainPromise = stopSaveSyncController();
+    if (saveDrainPromise && typeof saveDrainPromise.catch === 'function') {
+      saveDrainPromise.catch(() => {});
     }
     const prewarmSavePromise = stopPrewarmBridge({ save: true });
     if (prewarmSavePromise && typeof prewarmSavePromise.catch === 'function') {
@@ -10377,10 +11160,14 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const onAbort = function onPlayGta6RuntimeAbort(what) {
-    // Immediately flush MEMFS /pg6_dump BEFORE teardown clears boundModule.
+    // Immediately flush MEMFS /pg6_dump and userdata saves BEFORE teardown clears boundModule.
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
+    }
+    const saveDrainPromise = stopSaveSyncController();
+    if (saveDrainPromise && typeof saveDrainPromise.catch === 'function') {
+      saveDrainPromise.catch(() => {});
     }
     const whatText = what !== undefined && what !== null ? String(what) : '';
     if (whatText && isFaultRecordLine(whatText)) {
@@ -10484,6 +11271,11 @@ function buildRuntimeModuleConfig(options = {}) {
     flushPipelineDumps: (flushOpts) => flushPipelineDumpInternal(flushOpts),
     flushPipelineDump: (flushOpts) => flushPipelineDumpInternal(flushOpts),
     stopPipelineDumpSyncer,
+    saveSyncController,
+    getSaveSyncController: () => saveSyncController,
+    attachSaveSyncController,
+    flushUserdata: (flushOpts) => flushUserdataInternal(flushOpts),
+    stopSaveSyncController,
     getLastFaultRecord: () =>
       lastModuleFaultRecord ? cloneFaultRecord(lastModuleFaultRecord) : null,
     hostCallbacks: options.hostCallbacks || {
@@ -11466,6 +12258,41 @@ let configuredDumpEndpoint = undefined;
 let configuredDumpIntervalMs = undefined;
 let configuredDumpMaxConcurrentUploads = undefined;
 let activeCoordinatorPipelineDumpSyncer = null;
+let activeCoordinatorSaveSyncController = null;
+
+function flushActiveCoordinatorUserdata(options = {}) {
+  const flushOpts = options && typeof options === 'object' ? options : {};
+  if (
+    activeCoordinatorSaveSyncController &&
+    typeof activeCoordinatorSaveSyncController.flush === 'function'
+  ) {
+    try {
+      return Promise.resolve(activeCoordinatorSaveSyncController.flush(flushOpts));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+  if (
+    activeCoordinatorModuleConfig &&
+    typeof activeCoordinatorModuleConfig.flushUserdata === 'function'
+  ) {
+    try {
+      return Promise.resolve(activeCoordinatorModuleConfig.flushUserdata(flushOpts));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+  return Promise.resolve({
+    active: false,
+    lastPersistedGeneration: '0',
+    persistedFiles: 0,
+    deletedFiles: 0,
+    flushCount: 0,
+    errorCount: 0,
+    pendingPaths: 0,
+    lastFlushAtMs: null,
+  });
+}
 let activeGuestManifestSummary = null;
 let activeSideModuleProgressGetter = null;
 let pendingPreloadedWasmBinary = null;
@@ -12413,6 +13240,11 @@ function getLoaderStatus() {
       typeof activeCoordinatorPipelineDumpSyncer.getStats === 'function'
         ? activeCoordinatorPipelineDumpSyncer.getStats()
         : null,
+    saveSyncStats:
+      activeCoordinatorSaveSyncController &&
+      typeof activeCoordinatorSaveSyncController.getStats === 'function'
+        ? activeCoordinatorSaveSyncController.getStats()
+        : null,
     runtimeExports:
       activeCoordinatorModuleConfig &&
       typeof activeCoordinatorModuleConfig.getRuntimeExportsSummary === 'function'
@@ -12659,6 +13491,14 @@ async function tryBootWasmRuntime() {
         }
         activeCoordinatorPipelineDumpSyncer = null;
       }
+      if (activeCoordinatorSaveSyncController) {
+        try {
+          activeCoordinatorSaveSyncController.stop().catch(() => {});
+        } catch {
+          // Ignore save sync teardown errors from a previous runtime boot.
+        }
+        activeCoordinatorSaveSyncController = null;
+      }
       if (activeCoordinatorModuleConfig) {
         try {
           if (typeof activeCoordinatorModuleConfig.destroy === 'function') {
@@ -12676,6 +13516,9 @@ async function tryBootWasmRuntime() {
       if (typeof moduleConfig.getPipelineDumpSyncer === 'function') {
         activeCoordinatorPipelineDumpSyncer = moduleConfig.getPipelineDumpSyncer();
       }
+      if (typeof moduleConfig.getSaveSyncController === 'function') {
+        activeCoordinatorSaveSyncController = moduleConfig.getSaveSyncController();
+      }
       if (typeof moduleConfig.getSideModuleProgress === 'function') {
         activeSideModuleProgressGetter = moduleConfig.getSideModuleProgress;
       }
@@ -12691,6 +13534,9 @@ async function tryBootWasmRuntime() {
       activeCoordinatorRuntimeModule = runtimeMod;
       if (typeof moduleConfig.attachGuestMemory === 'function') {
         moduleConfig.attachGuestMemory(runtimeMod);
+      }
+      if (typeof moduleConfig.attachSaveSyncController === 'function') {
+        moduleConfig.attachSaveSyncController(runtimeMod);
       }
       if (typeof moduleConfig.attachInputBridge === 'function') {
         const attached = moduleConfig.attachInputBridge(runtimeMod);
@@ -12920,6 +13766,49 @@ if (typeof self !== 'undefined') {
         });
       return;
     }
+    if (
+      msg.type === FLUSH_USERDATA_MESSAGE_TYPE ||
+      msg.flushUserdata === true
+    ) {
+      Promise.resolve(flushActiveCoordinatorUserdata())
+        .then((stats) => {
+          if (postToMain) {
+            const payload = {
+              type: USERDATA_FLUSHED_MESSAGE_TYPE,
+              ok: true,
+              stats,
+              timestamp: Date.now(),
+            };
+            if (msg.id !== undefined) {
+              payload.id = msg.id;
+            }
+            try {
+              postToMain(payload);
+            } catch {
+              // Non-fatal userdata flush reply failure.
+            }
+          }
+        })
+        .catch((err) => {
+          if (postToMain) {
+            const payload = {
+              type: USERDATA_FLUSHED_MESSAGE_TYPE,
+              ok: false,
+              error: String(err),
+              timestamp: Date.now(),
+            };
+            if (msg.id !== undefined) {
+              payload.id = msg.id;
+            }
+            try {
+              postToMain(payload);
+            } catch {
+              // Non-fatal userdata flush error reply failure.
+            }
+          }
+        });
+      return;
+    }
     if (msg.type === 'request-last-fault-record') {
       if (postToMain) {
         const payload = {
@@ -13006,6 +13895,14 @@ if (typeof self !== 'undefined') {
             // Ignore pipeline dump syncer teardown errors.
           }
           activeCoordinatorPipelineDumpSyncer = null;
+        }
+        if (activeCoordinatorSaveSyncController) {
+          try {
+            activeCoordinatorSaveSyncController.stop().catch(() => {});
+          } catch {
+            // Ignore save sync teardown errors.
+          }
+          activeCoordinatorSaveSyncController = null;
         }
         coordinatorPthreadPool.closeTxPorts();
         coordinatorSharedWasmModules.clear();
@@ -13094,6 +13991,14 @@ if (typeof self !== 'undefined') {
         // Ignore pipeline dump syncer teardown errors when re-initializing workers.
       }
       activeCoordinatorPipelineDumpSyncer = null;
+    }
+    if (activeCoordinatorSaveSyncController) {
+      try {
+        activeCoordinatorSaveSyncController.stop().catch(() => {});
+      } catch {
+        // Ignore save sync teardown errors when re-initializing workers.
+      }
+      activeCoordinatorSaveSyncController = null;
     }
     inputSab = msg.inputSab || null;
     configuredDumpPipelines =
@@ -13368,12 +14273,19 @@ const exportedApi = {
   FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE,
   FLUSH_PIPELINE_DUMP_MESSAGE_TYPE,
   PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE,
+  FLUSH_USERDATA_MESSAGE_TYPE,
+  USERDATA_FLUSHED_MESSAGE_TYPE,
+  DEFAULT_SAVE_SYNC_INTERVAL_MS,
+  DEFAULT_SAVE_ROOT,
   isFaultRecordLine,
   parseFaultRecordLine,
   getLastFaultRecord,
   resetLastFaultRecord,
   flushPipelineDump: flushActiveCoordinatorPipelineDumps,
   flushPipelineDumps: flushActiveCoordinatorPipelineDumps,
+  flushUserdata: flushActiveCoordinatorUserdata,
+  readWasmCString,
+  createSaveSyncController,
   WGPU_CMD_POOL_MIN_BYTES,
   WGPU_CMD_POOL_MAX_BYTES,
   WGPU_CMD_POOL_MAX_BUFFERS,

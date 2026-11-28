@@ -823,6 +823,18 @@ namespace {
 bool g_relaunch_pending = false;
 std::string g_relaunch_args;  // last relaunch request, read by the browser loader through exports
 
+#ifdef __EMSCRIPTEN__
+// Align Emscripten MEMFS save root with web/workers/userdata.js (/userdata/ prefix) so restored
+// IndexedDB saves are immediately visible to xgamesave_local and changed paths stay under /userdata/.
+constexpr const char* kBrowserSaveDir = "/userdata/saves";
+
+void ensure_browser_save_dir() {
+    if (os::gdk::gamesave::save_dir() == os::gdk::gamesave::default_save_dir()) {
+        os::gdk::gamesave::set_save_dir(kBrowserSaveDir);
+    }
+}
+#endif
+
 std::string with_title_args(std::string base, const std::string& title_args) {
     if (!title_args.empty()) {
         base += ' ';
@@ -985,6 +997,9 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
         return load_file_via_httpfs(cfg, path, out, error);
     });
     os::win32::reset_relaunch_request();
+#ifdef __EMSCRIPTEN__
+    ensure_browser_save_dir();
+#endif
     ScopedGpuTextureClear gpu_texture_clear_guard;
     ScopedGpuTextureCopy gpu_texture_copy_guard;
     const guest::BootResult boot = guest::run_boot(program_boot.config);
@@ -1098,6 +1113,9 @@ WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg) {
     }
     boot_cfg.command_line = with_title_args("game.exe", cfg.title_args);
     os::win32::reset_relaunch_request();
+#ifdef __EMSCRIPTEN__
+    ensure_browser_save_dir();
+#endif
     ScopedGpuTextureClear gpu_texture_clear_guard;
     ScopedGpuTextureCopy gpu_texture_copy_guard;
     const guest::BootResult boot = guest::run_boot(boot_cfg);
